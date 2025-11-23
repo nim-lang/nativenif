@@ -391,10 +391,6 @@ proc genStmt(n: var Cursor; ctx: var GenContext) =
   else:
     genInst(n, ctx)
 
-proc isNumericType(t: Type): bool =
-  ## Check if type is numeric (int, uint, float)
-  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.FloatT}
-
 proc isIntegerType(t: Type): bool =
   ## Check if type is an integer type (int or uint)
   t.kind in {TypeKind.IntT, TypeKind.UIntT}
@@ -402,10 +398,6 @@ proc isIntegerType(t: Type): bool =
 proc isFloatType(t: Type): bool =
   ## Check if type is a floating point type
   t.kind == TypeKind.FloatT
-
-proc isPointerType(t: Type): bool =
-  ## Check if type is a pointer type (ptr or aptr)
-  t.kind in {TypeKind.PtrT, TypeKind.AptrT}
 
 proc canDoIntegerArithmetic(t: Type): bool =
   ## Check if type supports integer arithmetic operations (add, sub)
