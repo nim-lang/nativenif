@@ -85,9 +85,24 @@ type
     LoopI = (ord(LoopTagId), "loop")  ## loop structure
     StmtsI = (ord(StmtsTagId), "stmts")  ## statement block
     KillI = (ord(KillTagId), "kill")  ## kill variable
+    LockI = (ord(LockTagId), "lock")  ## atomic lock prefix
+    XchgI = (ord(XchgTagId), "xchg")  ## atomic exchange
+    CmpxchgI = (ord(CmpxchgTagId), "cmpxchg")  ## atomic compare and exchange
+    XaddI = (ord(XaddTagId), "xadd")  ## atomic exchange and add
+    Cmpxchg8bI = (ord(Cmpxchg8bTagId), "cmpxchg8b")  ## atomic compare and exchange 8 bytes
+    MfenceI = (ord(MfenceTagId), "mfence")  ## memory fence
+    SfenceI = (ord(SfenceTagId), "sfence")  ## store fence
+    LfenceI = (ord(LfenceTagId), "lfence")  ## load fence
+    PauseI = (ord(PauseTagId), "pause")  ## pause
+    ClflushI = (ord(ClflushTagId), "clflush")  ## cache line flush
+    ClflushoptI = (ord(ClflushoptTagId), "clflushopt")  ## optimized cache line flush
+    Prefetcht0I = (ord(Prefetcht0TagId), "prefetcht0")  ## prefetch t0
+    Prefetcht1I = (ord(Prefetcht1TagId), "prefetcht1")  ## prefetch t1
+    Prefetcht2I = (ord(Prefetcht2TagId), "prefetcht2")  ## prefetch t2
+    PrefetchntaI = (ord(PrefetchntaTagId), "prefetchnta")  ## prefetch non-temporal
 
 proc rawTagIsNifasmInst*(raw: TagEnum): bool {.inline.} =
-  raw in {MovTagId, LeaTagId, MovapdTagId, MovsdTagId, AddTagId, SubTagId, MulTagId, ImulTagId, DivTagId, IdivTagId, AddsdTagId, SubsdTagId, MulsdTagId, DivsdTagId, AndTagId, OrTagId, XorTagId, ShlTagId, ShrTagId, SalTagId, SarTagId, IncTagId, DecTagId, NegTagId, NotTagId, CmpTagId, TestTagId, SeteTagId, SetzTagId, SetneTagId, SetnzTagId, SetaTagId, SetnbeTagId, SetaeTagId, SetnbTagId, SetncTagId, SetbTagId, SetnaeTagId, SetcTagId, SetbeTagId, SetnaTagId, SetgTagId, SetnleTagId, SetgeTagId, SetnlTagId, SetlTagId, SetngeTagId, SetleTagId, SetngTagId, SetoTagId, SetsTagId, SetpTagId, JmpTagId, JeTagId, JzTagId, JneTagId, JnzTagId, JgTagId, JngTagId, JgeTagId, JngeTagId, JaTagId, JnaTagId, JaeTagId, JnaeTagId, JlTagId, JleTagId, JbTagId, JbeTagId, CallTagId, RetTagId, PushTagId, PopTagId, NopTagId, SyscallTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, KillTagId}
+  raw in {MovTagId, LeaTagId, MovapdTagId, MovsdTagId, AddTagId, SubTagId, MulTagId, ImulTagId, DivTagId, IdivTagId, AddsdTagId, SubsdTagId, MulsdTagId, DivsdTagId, AndTagId, OrTagId, XorTagId, ShlTagId, ShrTagId, SalTagId, SarTagId, IncTagId, DecTagId, NegTagId, NotTagId, CmpTagId, TestTagId, SeteTagId, SetzTagId, SetneTagId, SetnzTagId, SetaTagId, SetnbeTagId, SetaeTagId, SetnbTagId, SetncTagId, SetbTagId, SetnaeTagId, SetcTagId, SetbeTagId, SetnaTagId, SetgTagId, SetnleTagId, SetgeTagId, SetnlTagId, SetlTagId, SetngeTagId, SetleTagId, SetngTagId, SetoTagId, SetsTagId, SetpTagId, JmpTagId, JeTagId, JzTagId, JneTagId, JnzTagId, JgTagId, JngTagId, JgeTagId, JngeTagId, JaTagId, JnaTagId, JaeTagId, JnaeTagId, JlTagId, JleTagId, JbTagId, JbeTagId, CallTagId, RetTagId, PushTagId, PopTagId, NopTagId, SyscallTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, KillTagId, LockTagId, XchgTagId, CmpxchgTagId, XaddTagId, Cmpxchg8bTagId, MfenceTagId, SfenceTagId, LfenceTagId, PauseTagId, ClflushTagId, ClflushoptTagId, Prefetcht0TagId, Prefetcht1TagId, Prefetcht2TagId, PrefetchntaTagId}
 
 type
   NifasmType* = enum
