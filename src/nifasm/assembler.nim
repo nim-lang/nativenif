@@ -3,7 +3,7 @@ import std / [tables, streams, os]
 import "../../../nimony/src/lib" / [nifreader, nifstreams, nifcursors, bitabs, lineinfos]
 import tags, model
 import x86, elf
-import sem
+import sem, slots
 
 proc tag(n: Cursor): TagEnum = cast[TagEnum](n.tagId)
 
@@ -130,9 +130,6 @@ proc parseObjectBody(n: var Cursor; scope: Scope): Type =
       error("Expected field definition", n)
   inc n
   result = Type(kind: ObjectT, fields: fields, size: offset)
-
-proc alignedSize(t: Type): int =
-  (sizeOf(t) + 7) and not 7
 
 proc parseParams(n: var Cursor; scope: Scope): seq[Param] =
   # (params (param :name (reg) Type) ...)
@@ -287,9 +284,8 @@ type
     buf: Buffer
     procName: string
     clobbered: set[Register] # Registers clobbered in current flow
-    stackSize: int
+    slots: SlotManager
     ssizePatches: seq[int]
-    freeSlots: seq[tuple[offset, size: int]]
 
   Operand = object
     reg: Register
@@ -678,77 +674,7 @@ proc genInst(n: var Cursor; ctx: var GenContext) =
     let sym = Symbol(name: name, kind: skVar, typ: typ)
     if onStack:
        sym.onStack = true
-       # Try to reuse a free slot
-       let size = alignedSize(typ)
-       var foundSlot = -1
-       for i in 0..<ctx.freeSlots.len:
-         if ctx.freeSlots[i].size >= size:
-           foundSlot = i
-           break
-       
-       if foundSlot != -1:
-         let slot = ctx.freeSlots[foundSlot]
-         sym.offset = slot.offset
-         ctx.freeSlots.del(foundSlot)
-         # If the slot is larger, we could split it, but for now we just use it.
-         # Splitting logic:
-         if slot.size > size:
-           ctx.freeSlots.add((slot.offset - size, slot.size - size))
-           # Wait, offset is negative (e.g. -16). size is 8.
-           # Slot: offset -16, size 16 => range [-32, -16).
-           # Used: size 8.
-           # We can use [-24, -16) or [-32, -24).
-           # If we use `slot.offset` (-16), we use [-24, -16).
-           # Remaining is [-32, -24). Offset: -24. Size: 8.
-           # Actually offset grows downwards.
-           # slot.offset is top of slot (closest to 0).
-           # Wait, logic in `ctx.stackSize`: `sym.offset = -ctx.stackSize`.
-           # stackSize grows: 0 -> 8 -> 16.
-           # offsets: -8, -16.
-           # So `offset` is the *bottom* of the slot?
-           # Or top?
-           # If `stackSize` is 8. `sym.offset` = -8.
-           # If `stackSize` becomes 16. Next `sym.offset` = -16.
-           # So `offset` points to the start of the object in memory?
-           # x86 stack grows down. [rbp-8] is first qword.
-           # So `offset` is usually the address of the variable.
-           # So [-8] is occupied.
-           # If I have a slot of size 16 at -16. (occupies [-16, -32]?)
-           # No, `alignedSize` is usually just size.
-           # If `stackSize` increases by `alignedSize`.
-           # Let's look at pass2 init:
-           # `ctx.stackSize = 0`.
-           # `ctx.stackSize += alignedSize(typ)`.
-           # `sym.offset = -ctx.stackSize`.
-           # If typ size 8. stackSize = 8. offset = -8.
-           # If typ size 8. stackSize = 16. offset = -16.
-           # So `sym.offset` is the lower address.
-           # And the variable occupies [offset, offset + size).
-           # [-8, 0). [-16, -8).
-           # Yes.
-           # So if I have free slot (offset: -16, size: 16). Range [-16, 0).
-           # No, if I freed 2 vars of size 8.
-           # Freed var at -8 (size 8). Range [-8, 0).
-           # Freed var at -16 (size 8). Range [-16, -8).
-           # If I merge them -> (-16, 16). Range [-16, 0).
-           # If I reuse for size 8.
-           # Use offset -16? That covers [-16, -8).
-           # Remaining [-8, 0). Offset -8. Size 8.
-           # Correct?
-           # Let's trace:
-           # Free slot: `offset` = -16. `size` = 16.
-           # Range is [offset, offset + size). [-16, 0).
-           # Need size 8.
-           # If I use `sym.offset = slot.offset` (-16).
-           # `sym` uses [-16, -8).
-           # Remaining: [-8, 0).
-           # New free slot: `offset` = -8? (-16 + 8). `size` = 8 (16-8).
-           # Yes.
-           # So: `ctx.freeSlots.add((slot.offset + size, slot.size - size))`
-           
-       else:
-         ctx.stackSize += size
-         sym.offset = -ctx.stackSize
+       sym.offset = ctx.slots.allocSlot(typ)
     else:
        sym.reg = reg
        
@@ -766,9 +692,7 @@ proc genInst(n: var Cursor; ctx: var GenContext) =
     if sym == nil: error("Unknown variable to kill: " & name, n)
     
     if sym.onStack:
-      ctx.freeSlots.add((sym.offset, alignedSize(sym.typ)))
-      # Optional: merge free slots?
-      # For now just append.
+      ctx.slots.killSlot(sym.offset, sym.typ)
       
     # Remove from scope to ensure it's not used again
     ctx.scope.undefine(name)
@@ -1309,7 +1233,7 @@ proc pass2(n: var Cursor; ctx: var GenContext) =
           ctx.buf.defineLabel(LabelId(sym.offset))
           
           # Initialize stack context
-          ctx.stackSize = 0
+          ctx.slots = initSlotManager()
           ctx.ssizePatches = @[]
 
           # Add params to scope
@@ -1317,7 +1241,7 @@ proc pass2(n: var Cursor; ctx: var GenContext) =
           for param in sym.sig.params:
             if param.onStack:
               ctx.scope.define(Symbol(name: param.name, kind: skParam, typ: param.typ, onStack: true, offset: paramOffset))
-              paramOffset += alignedSize(param.typ)
+              paramOffset += slots.alignedSize(param.typ)
             else:
               ctx.scope.define(Symbol(name: param.name, kind: skParam, typ: param.typ, reg: param.reg))
 
@@ -1333,7 +1257,7 @@ proc pass2(n: var Cursor; ctx: var GenContext) =
           inc n
           
           # Patch ssize
-          let alignedStackSize = (ctx.stackSize + 15) and not 15
+          let alignedStackSize = (ctx.slots.stackSize + 15) and not 15
           for pos in ctx.ssizePatches:
             # Write int32 at pos
             if pos + 4 <= ctx.buf.data.len:
