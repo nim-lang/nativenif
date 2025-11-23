@@ -217,6 +217,31 @@ proc parseClobbers(n: var Cursor): set[Register] =
         error("Expected register in clobber list", n)
     inc n
 
+proc pass1Proc(n: var Cursor; scope: Scope) =
+  # (proc :Name (params ...) (result ...) (clobber ...) (body ...))
+  inc n
+  if n.kind != SymbolDef: error("Expected proc name", n)
+  let name = getSym(n)
+  inc n
+  
+  var sig = Signature(params: @[], result: @[], clobbers: {})
+  
+  # Parse params
+  if n.kind == ParLe and n.tag == ParamsTagId:
+    sig.params = parseParams(n, scope)
+  
+  # Parse result
+  if n.kind == ParLe and n.tag == ResultTagId:
+     var r = parseResult(n, scope)
+     sig.result = r
+  
+  # Parse clobber
+  if n.kind == ParLe and n.tag == ClobberTagId:
+    sig.clobbers = parseClobbers(n)
+    
+  let sym = Symbol(name: name, kind: skProc, sig: sig)
+  scope.define(sym)
+
 proc pass1(n: var Cursor; scope: Scope) =
   var n = n
   if n.kind == ParLe and n.tag == StmtsTagId:
@@ -240,28 +265,7 @@ proc pass1(n: var Cursor; scope: Scope) =
           inc n
         of ProcTagId:
           # (proc :Name (params ...) (result ...) (clobber ...) (body ...))
-          inc n
-          if n.kind != SymbolDef: error("Expected proc name", n)
-          let name = getSym(n)
-          inc n
-          
-          var sig = Signature(params: @[], result: @[], clobbers: {})
-          
-          # Parse params
-          if n.kind == ParLe and n.tag == ParamsTagId:
-            sig.params = parseParams(n, scope)
-          
-          # Parse result
-          if n.kind == ParLe and n.tag == ResultTagId:
-             var r = parseResult(n, scope)
-             sig.result = r
-          
-          # Parse clobber
-          if n.kind == ParLe and n.tag == ClobberTagId:
-            sig.clobbers = parseClobbers(n)
-            
-          let sym = Symbol(name: name, kind: skProc, sig: sig)
-          scope.define(sym)
+          pass1Proc(n, scope)
           
           n = start
           skip n
@@ -316,6 +320,59 @@ type
     label: LabelId
 
 proc genInst(n: var Cursor; ctx: var GenContext)
+
+proc pass2Proc(n: var Cursor; ctx: var GenContext) =
+  let oldScope = ctx.scope
+  ctx.scope = newScope(oldScope)
+  inc n
+  let name = getSym(n)
+  ctx.procName = name
+  
+  # Find/Create label for proc
+  let sym = oldScope.lookup(name)
+  if sym.offset == -1:
+     let lab = ctx.buf.createLabel()
+     sym.offset = int(lab)
+  ctx.buf.defineLabel(LabelId(sym.offset))
+  
+  # Initialize stack context
+  ctx.slots = initSlotManager()
+  ctx.ssizePatches = @[]
+
+  # Add params to scope
+  var paramOffset = 16 # RBP + 16 (skip RBP, RetAddr)
+  for param in sym.sig.params:
+    if param.onStack:
+      ctx.scope.define(Symbol(name: param.name, kind: skParam, typ: param.typ, onStack: true, offset: paramOffset))
+      paramOffset += slots.alignedSize(param.typ)
+    else:
+      ctx.scope.define(Symbol(name: param.name, kind: skParam, typ: param.typ, reg: param.reg))
+
+  inc n
+  while n.kind == ParLe and n.tag != StmtsTagId:
+    skip n
+  if n.kind == ParLe and n.tag == StmtsTagId:
+    inc n
+    while n.kind != ParRi:
+      genInst(n, ctx)
+    inc n
+  if n.kind != ParRi: error("Expected ) at end of proc", n)
+  inc n
+  
+  # Patch ssize
+  let alignedStackSize = (ctx.slots.stackSize + 15) and not 15
+  for pos in ctx.ssizePatches:
+    # Write int32 at pos
+    if pos + 4 <= ctx.buf.data.len:
+      ctx.buf.data[pos] = byte(alignedStackSize and 0xFF)
+      ctx.buf.data[pos+1] = byte((alignedStackSize shr 8) and 0xFF)
+      ctx.buf.data[pos+2] = byte((alignedStackSize shr 16) and 0xFF)
+      ctx.buf.data[pos+3] = byte((alignedStackSize shr 24) and 0xFF)
+    else:
+      # Should not happen if patched correctly
+      discard
+
+  ctx.scope = oldScope
 
 proc genStmt(n: var Cursor; ctx: var GenContext) =
   if n.kind == ParLe and n.tag == StmtsTagId:
@@ -1537,57 +1594,7 @@ proc pass2(n: var Cursor; ctx: var GenContext) =
       if n.kind == ParLe:
         case n.tag
         of ProcTagId:
-          let oldScope = ctx.scope
-          ctx.scope = newScope(oldScope)
-          inc n
-          let name = getSym(n)
-          ctx.procName = name
-          
-          # Find/Create label for proc
-          let sym = oldScope.lookup(name)
-          if sym.offset == -1:
-             let lab = ctx.buf.createLabel()
-             sym.offset = int(lab)
-          ctx.buf.defineLabel(LabelId(sym.offset))
-          
-          # Initialize stack context
-          ctx.slots = initSlotManager()
-          ctx.ssizePatches = @[]
-
-          # Add params to scope
-          var paramOffset = 16 # RBP + 16 (skip RBP, RetAddr)
-          for param in sym.sig.params:
-            if param.onStack:
-              ctx.scope.define(Symbol(name: param.name, kind: skParam, typ: param.typ, onStack: true, offset: paramOffset))
-              paramOffset += slots.alignedSize(param.typ)
-            else:
-              ctx.scope.define(Symbol(name: param.name, kind: skParam, typ: param.typ, reg: param.reg))
-
-          inc n
-          while n.kind == ParLe and n.tag != StmtsTagId:
-            skip n
-          if n.kind == ParLe and n.tag == StmtsTagId:
-            inc n
-            while n.kind != ParRi:
-              genInst(n, ctx)
-            inc n
-          if n.kind != ParRi: error("Expected ) at end of proc", n)
-          inc n
-          
-          # Patch ssize
-          let alignedStackSize = (ctx.slots.stackSize + 15) and not 15
-          for pos in ctx.ssizePatches:
-            # Write int32 at pos
-            if pos + 4 <= ctx.buf.data.len:
-              ctx.buf.data[pos] = byte(alignedStackSize and 0xFF)
-              ctx.buf.data[pos+1] = byte((alignedStackSize shr 8) and 0xFF)
-              ctx.buf.data[pos+2] = byte((alignedStackSize shr 16) and 0xFF)
-              ctx.buf.data[pos+3] = byte((alignedStackSize shr 24) and 0xFF)
-            else:
-              # Should not happen if patched correctly
-              discard
-
-          ctx.scope = oldScope
+          pass2Proc(n, ctx)
         of RodataTagId:
           inc n
           let name = getSym(n)
