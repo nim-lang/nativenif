@@ -69,6 +69,27 @@ proc parseRegister(n: var Cursor): Register =
   if n.kind != ParRi: error("Expected ) after register", n)
   inc n
 
+proc tagToRegister(t: TagEnum): Register =
+  ## Convert a TagEnum to a Register (for register binding tracking)
+  result = case t
+    of RaxTagId, R0TagId: RAX
+    of RcxTagId, R2TagId: RCX
+    of RdxTagId, R3TagId: RDX
+    of RbxTagId, R1TagId: RBX
+    of RspTagId, R7TagId: RSP
+    of RbpTagId, R6TagId: RBP
+    of RsiTagId, R4TagId: RSI
+    of RdiTagId, R5TagId: RDI
+    of R8TagId: R8
+    of R9TagId: R9
+    of R10TagId: R10
+    of R11TagId: R11
+    of R12TagId: R12
+    of R13TagId: R13
+    of R14TagId: R14
+    of R15TagId: R15
+    else: RAX  # Should not happen
+
 type
   LoadedModule = object
     buf: TokenBuf
@@ -88,6 +109,7 @@ type
     bssOffset: int  # Current offset in .bss section
     modules: Table[string, LoadedModule]  # Cache of loaded foreign modules
     baseDir: string  # Base directory for finding module files
+    regBindings: Table[Register, string]  # Maps registers to variable names they're bound to
 
   Operand = object
     reg: Register
@@ -518,6 +540,8 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   # Initialize stack context
   ctx.slots = initSlotManager()
   ctx.ssizePatches = @[]
+  # Clear register bindings at the start of each proc
+  ctx.regBindings = initTable[Register, string]()
 
   # Add params to scope
   var paramOffset = 16 # RBP + 16 (skip RBP, RetAddr)
@@ -527,6 +551,10 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
       paramOffset += slots.alignedSize(param.typ)
     else:
       ctx.scope.define(Symbol(name: param.name, kind: skParam, typ: param.typ, reg: param.reg))
+      # Track register binding for parameters
+      if param.reg != InvalidTagId:
+        let targetReg = tagToRegister(param.reg)
+        ctx.regBindings[targetReg] = param.name
 
   inc n
   while n.kind == ParLe and n.tag != StmtsTagId:
@@ -592,6 +620,10 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
     if rawTagIsNifasmReg(t):
       result.reg = parseRegister(n)
       result.typ = TypeInt64 # Explicit register usage is assumed to be Int64 compatible
+      # Check if this register is bound to a variable
+      if result.reg in ctx.regBindings:
+        error("Register " & $result.reg & " is bound to variable '" & 
+              ctx.regBindings[result.reg] & "', use the variable name instead", n)
     elif t == DotTagId:
       # (dot <base> <fieldname>)
       inc n
@@ -907,6 +939,10 @@ proc parseDest(n: var Cursor; ctx: var GenContext): Operand =
   if n.kind == ParLe and rawTagIsNifasmReg(n.tag):
     result.reg = parseRegister(n)
     result.typ = TypeInt64
+    # Check if this register is bound to a variable
+    if result.reg in ctx.regBindings:
+      error("Register " & $result.reg & " is bound to variable '" & 
+            ctx.regBindings[result.reg] & "', use the variable name instead", n)
   elif n.kind == Symbol:
     let name = getSym(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
@@ -1260,6 +1296,13 @@ proc genInst(n: var Cursor; ctx: var GenContext) =
        sym.offset = ctx.slots.allocSlot(typ)
     else:
        sym.reg = reg
+       # Check if register is already bound to another variable
+       let targetReg = tagToRegister(reg)
+       if targetReg in ctx.regBindings:
+         error("Register " & $targetReg & " is already bound to variable '" & 
+               ctx.regBindings[targetReg] & "', kill it first before reusing", n)
+       # Track the register binding
+       ctx.regBindings[targetReg] = name
 
     ctx.scope.define(sym)
 
@@ -1306,6 +1349,10 @@ proc genInst(n: var Cursor; ctx: var GenContext) =
 
     if sym.onStack:
       ctx.slots.killSlot(sym.offset, sym.typ)
+    elif sym.reg != InvalidTagId:
+      # Remove register binding when variable is killed
+      let targetReg = tagToRegister(sym.reg)
+      ctx.regBindings.del(targetReg)
 
     # Remove from scope to ensure it's not used again
     ctx.scope.undefine(name)
