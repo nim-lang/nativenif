@@ -2,7 +2,7 @@
 import std / [tables, streams, os]
 import "../../../nimony/src/lib" / [nifreader, nifstreams, nifcursors, bitabs, lineinfos, symparser]
 import tags, model, tagconv
-import buffers, x86, arm64, elf
+import buffers, x86, arm64, elf, macho
 import sem, slots
 
 proc tag(n: Cursor): TagEnum = cast[TagEnum](n.tagId)
@@ -3336,6 +3336,30 @@ proc writeElf(a: var GenContext; outfile: string) =
   let perms = {fpUserExec, fpGroupExec, fpOthersExec, fpUserRead, fpUserWrite}
   setFilePermissions(outfile, perms)
 
+proc writeMachO(a: var GenContext; outfile: string) =
+  x86.finalize(a.buf)
+  x86.finalize(a.bssBuf)
+  let code = a.buf.data
+  let baseAddr = 0x100000000.uint64  # macOS default base address
+  let pageSize = 0x1000.uint64
+
+  # Calculate sizes
+  let codeSize = code.len.uint64
+  let codeAlignedSize = (codeSize + pageSize - 1) and not (pageSize - 1)
+
+  # TEXT segment: code
+  let textVmaddr = baseAddr
+  let entryAddr = textVmaddr
+
+  # Determine CPU type based on architecture
+  let (cputype, cpusubtype) = case a.arch
+    of Arch.X64:
+      (CPU_TYPE_X86_64, CPU_SUBTYPE_X86_64_ALL)
+    of Arch.A64:
+      (CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL)
+
+  macho.writeMachO(code, a.bssOffset, entryAddr, cputype, cpusubtype, outfile)
+
 proc assemble*(filename, outfile: string) =
   var buf = parseFromFile(filename)
   var n = beginRead(buf)
@@ -3368,7 +3392,7 @@ proc assemble*(filename, outfile: string) =
   of Arch.X64:
     writeElf(ctx, outfile)
   of Arch.A64:
-    discard "todo"
+    writeMachO(ctx, outfile)
 
   # Close all module streams
   for module in ctx.modules.mvalues:
