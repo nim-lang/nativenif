@@ -183,8 +183,8 @@ proc rawTagIsNifasmExpr*(raw: TagEnum): bool {.inline.} =
   raw in {SsizeTagId, DotTagId, AtTagId, MemTagId, CastTagId}
 
 type
-  NifasmOther* = enum
-    NoOther
+  X64Flag* = enum
+    NoFlag
     SO = (ord(STagId), "s")  ## stack slot location tag
     OfO = (ord(OfTagId), "of")  ## overflow flag
     NoO = (ord(NoTagId), "no")  ## no overflow flag
@@ -197,7 +197,7 @@ type
     PfO = (ord(PfTagId), "pf")  ## parity flag
     NpO = (ord(NpTagId), "np")  ## not parity flag
 
-proc rawTagIsNifasmOther*(raw: TagEnum): bool {.inline.} =
+proc rawTagIsX64Flag*(raw: TagEnum): bool {.inline.} =
   raw in {STagId, OfTagId, NoTagId, ZfTagId, NzTagId, SfTagId, NsTagId, CfTagId, NcTagId, PfTagId, NpTagId}
 
 type

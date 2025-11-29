@@ -17,7 +17,7 @@
 | `(result D L T)`       | NifasmDecl                  | result value declaration |
 | `(clobber ...)`        | NifasmDecl                  | clobbered registers list |
 | `(var D L T)`          | NifasmDecl                  | variable declaration |
-| `(s)`                  | NifasmOther                 | stack slot location tag |
+| `(s)`                  | X64Flag                 | stack slot location tag |
 | `(ssize)`              | NifasmExpr                  | stack size expression |
 | `(mov D S)`            | X64Inst                  | move instruction |
 | `(lea D S)`            | X64Inst                  | load effective address |
@@ -193,13 +193,13 @@
 | `(xmm13)`            | X64Reg                   | register xmm13 |
 | `(xmm14)`            | X64Reg                   | register xmm14 |
 | `(xmm15)`            | X64Reg                   | register xmm15 |
-| `(of)`               | NifasmOther                 | overflow flag |
-| `(no)`               | NifasmOther                 | no overflow flag |
-| `(zf)`               | NifasmOther                 | zero flag |
-| `(nz)`               | NifasmOther                 | not zero flag |
-| `(sf)`               | NifasmOther                 | sign flag |
-| `(ns)`               | NifasmOther                 | not sign flag |
-| `(cf)`               | NifasmOther                 | carry flag |
-| `(nc)`               | NifasmOther                 | not carry flag |
-| `(pf)`               | NifasmOther                 | parity flag |
-| `(np)`               | NifasmOther                 | not parity flag |
+| `(of)`               | X64Flag                 | overflow flag |
+| `(no)`               | X64Flag                 | no overflow flag |
+| `(zf)`               | X64Flag                 | zero flag |
+| `(nz)`               | X64Flag                 | not zero flag |
+| `(sf)`               | X64Flag                 | sign flag |
+| `(ns)`               | X64Flag                 | not sign flag |
+| `(cf)`               | X64Flag                 | carry flag |
+| `(nc)`               | X64Flag                 | not carry flag |
+| `(pf)`               | X64Flag                 | parity flag |
+| `(np)`               | X64Flag                 | not parity flag |

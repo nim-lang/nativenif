@@ -7,7 +7,7 @@ proc toNimName(s: string; suffix: string): string =
 
 type
   EnumList = enum
-    X64Inst, NifasmType, NifasmDecl, NifasmExpr, NifasmOther, X64Reg
+    X64Inst, NifasmType, NifasmDecl, NifasmExpr, X64Flag, X64Reg
 
 proc toSuffix(e: EnumList): (string, string) =
   case e
@@ -15,7 +15,7 @@ proc toSuffix(e: EnumList): (string, string) =
   of NifasmType: ("T", "NoType")
   of NifasmDecl: ("D", "NoDecl")
   of NifasmExpr: ("X", "NoExpr")
-  of NifasmOther: ("O", "NoOther")
+  of X64Flag: ("O", "NoFlag")
   of X64Reg: ("R", "NoReg")
 
 proc shortcutToEnumList(shortcut: string): EnumList =
@@ -140,7 +140,7 @@ proc genTags(inp: File) =
 
   createDir "src/nifasm"
   writeTagsFile "src/nifasm/tags.nim", tags
-  # writeModel "src/nifasm/nifasm_model.nim", enumDecls, X64Inst, NifasmOther
+  # writeModel "src/nifasm/nifasm_model.nim", enumDecls, X64Inst, X64Flag
   # For now I'll just rely on tags.nim and manual casting or validation if needed,
   # or I can generate the model file if I decide to use it.
   # Let's generate the model file too, it's useful.
