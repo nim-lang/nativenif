@@ -1,0 +1,13 @@
+(stmts
+  (mov (rax) +1)
+  (mov (rdi) +1)
+  (lea (rsi) msg.0)
+  (mov (rdx) +12)
+  (syscall)
+  
+  (mov (rax) +60)
+  (mov (rdi) +0)
+  (syscall)
+  
+  (rodata :msg.0 "Hello World\0A")
+)

@@ -1,8 +1,7 @@
 # Nifasm - x86_64 Binary Assembler
 # A dependency-free x86_64 assembler that emits binary instruction bytes
 
-import std/strutils
-import elf
+import std/[strutils, tables]
 
 type
   # x86_64 64-bit general purpose registers
@@ -24,6 +23,7 @@ type
     scale*: int  # 1, 2, 4, or 8
     displacement*: int32
     hasIndex*: bool
+    useFsSegment*: bool  # Use FS segment register (for thread-local storage)
 
   # Label system for jump optimization
   LabelId* = distinct int
@@ -33,24 +33,24 @@ type
     id*: LabelId
     position*: int  # Position where label is defined
 
-  # Jump instruction entry for optimization
-  JumpEntry* = object
-    position*: int        # Position in buffer where jump instruction starts
+  # Relocation entry for optimization and patching
+  RelocEntry* = object
+    position*: int        # Position in buffer where instruction starts
     target*: LabelId      # Target label ID
-    instruction*: JumpType # Type of jump instruction
+    kind*: RelocKind      # Type of relocation/instruction
     originalSize*: int    # Original instruction size in bytes
 
-  # Types of jump instructions
-  JumpType* = enum
-    jtCall, jtJmp, jtJe, jtJne, jtJg, jtJl, jtJge, jtJle, jtJa, jtJb, jtJae, jtJbe
-
+  # Types of instructions requiring relocation/patching
+  RelocKind* = enum
+    rkCall, rkJmp, rkJe, rkJne, rkJg, rkJl, rkJge, rkJle, rkJa, rkJb, rkJae, rkJbe,
+    rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp, rkLea
 
   # Buffer for accumulating instruction bytes
   Buffer* = object
     data*: seq[byte]
-    jumps*: seq[JumpEntry]  # Track jump instructions for optimization
-    labels*: seq[LabelDef]  # Track label definitions
-    nextLabelId*: int       # Next available label ID
+    relocs*: seq[RelocEntry]  # Track instructions needing relocation
+    labels*: seq[LabelDef]    # Track label definitions
+    nextLabelId*: int         # Next available label ID
 
 # LabelId equality comparison
 proc `==`*(a, b: LabelId): bool =
@@ -60,7 +60,7 @@ proc `==`*(a, b: LabelId): bool =
 proc initBuffer*(): Buffer =
   result = Buffer(
     data: @[],
-    jumps: @[],
+    relocs: @[],
     labels: @[],
     nextLabelId: 0
   )
@@ -118,13 +118,13 @@ proc getLabelPosition*(buf: Buffer; label: LabelId): int =
       return labelDef.position
   raise newException(ValueError, "Label not found")
 
-# Jump optimization helper functions
-proc addJump*(buf: var Buffer; position: int; target: LabelId; instruction: JumpType; size: int) =
-  ## Add a jump entry to the buffer for later optimization
-  buf.jumps.add(JumpEntry(
+# Relocation helper functions
+proc addReloc*(buf: var Buffer; position: int; target: LabelId; kind: RelocKind; size: int) =
+  ## Add a relocation entry to the buffer
+  buf.relocs.add(RelocEntry(
     position: position,
     target: target,
-    instruction: instruction,
+    kind: kind,
     originalSize: size
   ))
 
@@ -132,12 +132,14 @@ proc getCurrentPosition*(buf: Buffer): int =
   ## Get the current position in the buffer
   buf.data.len
 
-proc calculateJumpDistance*(fromPos: int; toPos: int; instruction: JumpType = jtJmp): int =
-  ## Calculate the distance for a relative jump
+proc calculateRelocDistance*(fromPos: int; toPos: int; kind: RelocKind = rkJmp): int =
+  ## Calculate the distance for a relative instruction
   ## For x86-64, the distance is calculated from after the entire instruction
-  ## CALL/JMP: 1 byte opcode + 4 bytes displacement = 5 bytes total
-  ## Conditional jumps: 2 bytes opcode + 4 bytes displacement = 6 bytes total
-  let instructionSize = if instruction in {jtCall, jtJmp}: 5 else: 6
+  let instructionSize =
+    case kind
+    of rkCall, rkJmp: 5
+    of rkLea: 7
+    else: 6
   toPos - (fromPos + instructionSize)  # Distance from after the complete instruction
 
 proc canUseShortJump*(distance: int): bool =
@@ -167,7 +169,7 @@ proc encodeModRM*(mode: AddressingMode; reg: int; rm: int): byte =
 
 # SIB byte encoding
 proc encodeSIB*(scale: int; index: int; base: int): byte =
-  let scaleBits = 
+  let scaleBits =
     case scale
     of 1: 0b00
     of 2: 0b01
@@ -175,6 +177,44 @@ proc encodeSIB*(scale: int; index: int; base: int): byte =
     of 8: 0b11
     else: 0b00
   byte((scaleBits shl 6) or ((index and 0x07) shl 3) or (base and 0x07))
+
+proc emitMem(dest: var Buffer; reg: int; mem: MemoryOperand) =
+  # Emit segment prefix if needed (FS = 0x64 for thread-local storage)
+  if mem.useFsSegment:
+    dest.add(0x64)  # FS segment override prefix
+
+  # Emit ModRM (and SIB/Disp) for memory operand
+  var modb = 0
+  var rmb = int(mem.base) and 7
+  var sib = false
+  var dispSize = 0 # 0, 1, 4
+
+  if mem.hasIndex or mem.base == RSP or mem.base == R12:
+    sib = true
+    rmb = 4 # SIB follows
+
+  # Determine Mod and DispSize
+  if mem.displacement == 0 and (mem.base != RBP and mem.base != R13):
+    modb = 0b00 # Indirect
+  elif mem.displacement >= -128 and mem.displacement <= 127:
+    modb = 0b01 # Indirect + Disp8
+    dispSize = 1
+  else:
+    modb = 0b10 # Indirect + Disp32
+    dispSize = 4
+
+  dest.add(encodeModRM(AddressingMode(modb), reg, rmb))
+
+  if sib:
+    var index = 4 # None (RSP)
+    if mem.hasIndex:
+      index = int(mem.index)
+    dest.add(encodeSIB(mem.scale, index, int(mem.base)))
+
+  if dispSize == 1:
+    dest.add(byte(mem.displacement and 0xFF))
+  elif dispSize == 4:
+    dest.addt32(mem.displacement)
 
 # Core MOV instruction implementations
 proc emitMov*(dest: var Buffer; a, b: Register) =
@@ -189,6 +229,32 @@ proc emitMov*(dest: var Buffer; a, b: Register) =
 
   dest.add(0x89)  # MOV r/m64, r64 opcode
   dest.add(encodeModRM(amDirect, int(a), int(b)))
+
+proc emitMov*(dest: var Buffer; reg: Register; mem: MemoryOperand) =
+  ## Emit MOV instruction: MOV reg, mem (load)
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+
+  if rex.r or rex.b or rex.x or rex.w:
+    dest.add(encodeRex(rex))
+
+  dest.add(0x8B) # MOV r64, r/m64
+  dest.emitMem(int(reg), mem)
+
+proc emitMov*(dest: var Buffer; mem: MemoryOperand; reg: Register) =
+  ## Emit MOV instruction: MOV mem, reg (store)
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+
+  if rex.r or rex.b or rex.x or rex.w:
+    dest.add(encodeRex(rex))
+
+  dest.add(0x89) # MOV r/m64, r64
+  dest.emitMem(int(reg), mem)
 
 proc emitMovImmToReg*(dest: var Buffer; reg: Register; imm: int64) =
   ## Emit MOV instruction: MOV reg, imm
@@ -233,6 +299,32 @@ proc emitAdd*(dest: var Buffer; a, b: Register) =
   dest.add(0x01)  # ADD r/m64, r64 opcode
   dest.add(encodeModRM(amDirect, int(a), int(b)))
 
+proc emitAdd*(dest: var Buffer; reg: Register; mem: MemoryOperand) =
+  ## Emit ADD instruction: ADD reg, mem
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+
+  if rex.r or rex.b or rex.x or rex.w:
+    dest.add(encodeRex(rex))
+
+  dest.add(0x03) # ADD r64, r/m64
+  dest.emitMem(int(reg), mem)
+
+proc emitAdd*(dest: var Buffer; mem: MemoryOperand; reg: Register) =
+  ## Emit ADD instruction: ADD mem, reg
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+
+  if rex.r or rex.b or rex.x or rex.w:
+    dest.add(encodeRex(rex))
+
+  dest.add(0x01) # ADD r/m64, r64
+  dest.emitMem(int(reg), mem)
+
 proc emitSub*(dest: var Buffer; a, b: Register) =
   ## Emit SUB instruction: SUB a, b
   var rex = RexPrefix(w: true)
@@ -245,6 +337,32 @@ proc emitSub*(dest: var Buffer; a, b: Register) =
 
   dest.add(0x29)  # SUB r/m64, r64 opcode
   dest.add(encodeModRM(amDirect, int(a), int(b)))
+
+proc emitSub*(dest: var Buffer; reg: Register; mem: MemoryOperand) =
+  ## Emit SUB instruction: SUB reg, mem
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+
+  if rex.r or rex.b or rex.x or rex.w:
+    dest.add(encodeRex(rex))
+
+  dest.add(0x2B) # SUB r64, r/m64
+  dest.emitMem(int(reg), mem)
+
+proc emitSub*(dest: var Buffer; mem: MemoryOperand; reg: Register) =
+  ## Emit SUB instruction: SUB mem, reg
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+
+  if rex.r or rex.b or rex.x or rex.w:
+    dest.add(encodeRex(rex))
+
+  dest.add(0x29) # SUB r/m64, r64
+  dest.emitMem(int(reg), mem)
 
 proc emitImul*(dest: var Buffer; a, b: Register) =
   ## Emit IMUL instruction: IMUL a, b (signed multiply)
@@ -322,6 +440,15 @@ proc emitInc*(dest: var Buffer; reg: Register) =
   dest.add(0xFF)  # INC r/m64 opcode
   dest.add(encodeModRM(amDirect, 0, int(reg)))  # /0 extension
 
+proc emitInc*(dest: var Buffer; mem: MemoryOperand) =
+  ## Emit INC instruction: INC mem
+  var rex = RexPrefix(w: true)
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  if rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
+  dest.add(0xFF)
+  dest.emitMem(0, mem)
+
 proc emitDec*(dest: var Buffer; reg: Register) =
   ## Emit DEC instruction: DEC reg (decrement)
   var rex = RexPrefix(w: true)
@@ -333,6 +460,15 @@ proc emitDec*(dest: var Buffer; reg: Register) =
 
   dest.add(0xFF)  # DEC r/m64 opcode
   dest.add(encodeModRM(amDirect, 1, int(reg)))  # /1 extension
+
+proc emitDec*(dest: var Buffer; mem: MemoryOperand) =
+  ## Emit DEC instruction: DEC mem
+  var rex = RexPrefix(w: true)
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  if rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
+  dest.add(0xFF)
+  dest.emitMem(1, mem)
 
 proc emitNeg*(dest: var Buffer; reg: Register) =
   ## Emit NEG instruction: NEG reg (negate)
@@ -346,6 +482,15 @@ proc emitNeg*(dest: var Buffer; reg: Register) =
   dest.add(0xF7)  # NEG r/m64 opcode
   dest.add(encodeModRM(amDirect, 3, int(reg)))  # /3 extension
 
+proc emitNeg*(dest: var Buffer; mem: MemoryOperand) =
+  ## Emit NEG instruction: NEG mem
+  var rex = RexPrefix(w: true)
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  if rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
+  dest.add(0xF7)
+  dest.emitMem(3, mem)
+
 proc emitCmp*(dest: var Buffer; a, b: Register) =
   ## Emit CMP instruction: CMP a, b (compare)
   var rex = RexPrefix(w: true)
@@ -358,6 +503,32 @@ proc emitCmp*(dest: var Buffer; a, b: Register) =
 
   dest.add(0x39)  # CMP r/m64, r64 opcode
   dest.add(encodeModRM(amDirect, int(a), int(b)))
+
+proc emitCmp*(dest: var Buffer; reg: Register; mem: MemoryOperand) =
+  ## Emit CMP instruction: CMP reg, mem
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+
+  if rex.r or rex.b or rex.x or rex.w:
+    dest.add(encodeRex(rex))
+
+  dest.add(0x3B) # CMP r64, r/m64
+  dest.emitMem(int(reg), mem)
+
+proc emitCmp*(dest: var Buffer; mem: MemoryOperand; reg: Register) =
+  ## Emit CMP instruction: CMP mem, reg
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+
+  if rex.r or rex.b or rex.x or rex.w:
+    dest.add(encodeRex(rex))
+
+  dest.add(0x39) # CMP r/m64, r64
+  dest.emitMem(int(reg), mem)
 
 proc emitTest*(dest: var Buffer; a, b: Register) =
   ## Emit TEST instruction: TEST a, b (test)
@@ -601,6 +772,15 @@ proc emitNot*(dest: var Buffer; reg: Register) =
 
   dest.add(0xF7)  # NOT r/m64 opcode
   dest.add(encodeModRM(amDirect, 2, int(reg)))  # /2 extension
+
+proc emitNot*(dest: var Buffer; mem: MemoryOperand) =
+  ## Emit NOT instruction: NOT mem
+  var rex = RexPrefix(w: true)
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  if rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
+  dest.add(0xF7)
+  dest.emitMem(2, mem)
 
 proc emitBsf*(dest: var Buffer; destReg, srcReg: Register) =
   ## Emit BSF instruction: BSF destReg, srcReg (bit scan forward)
@@ -1090,6 +1270,19 @@ proc emitXchg*(dest: var Buffer; a, b: Register) =
   dest.add(0x87)  # XCHG r/m64, r64 opcode
   dest.add(encodeModRM(amDirect, int(a), int(b)))
 
+proc emitXchg*(dest: var Buffer; mem: MemoryOperand; reg: Register) =
+  ## Emit XCHG instruction: XCHG mem, reg
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+
+  if rex.r or rex.b or rex.x or rex.w:
+    dest.add(encodeRex(rex))
+
+  dest.add(0x87) # XCHG r/m64, r64
+  dest.emitMem(int(reg), mem)
+
 proc emitXadd*(dest: var Buffer; a, b: Register) =
   ## Emit XADD instruction: XADD a, b (exchange and add)
   var rex = RexPrefix(w: true)
@@ -1103,6 +1296,20 @@ proc emitXadd*(dest: var Buffer; a, b: Register) =
   dest.add(0x0F)  # Two-byte opcode prefix
   dest.add(0xC1)  # XADD r/m64, r64 opcode
   dest.add(encodeModRM(amDirect, int(a), int(b)))
+
+proc emitXadd*(dest: var Buffer; mem: MemoryOperand; reg: Register) =
+  ## Emit XADD instruction: XADD mem, reg
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+
+  if rex.r or rex.b or rex.x or rex.w:
+    dest.add(encodeRex(rex))
+
+  dest.add(0x0F)
+  dest.add(0xC1)
+  dest.emitMem(int(reg), mem)
 
 # Atomic compare and exchange
 proc emitCmpxchg*(dest: var Buffer; a, b: Register) =
@@ -1119,6 +1326,20 @@ proc emitCmpxchg*(dest: var Buffer; a, b: Register) =
   dest.add(0xB1)  # CMPXCHG r/m64, r64 opcode
   dest.add(encodeModRM(amDirect, int(a), int(b)))
 
+proc emitCmpxchg*(dest: var Buffer; mem: MemoryOperand; reg: Register) =
+  ## Emit CMPXCHG instruction: CMPXCHG mem, reg
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+
+  if rex.r or rex.b or rex.x or rex.w:
+    dest.add(encodeRex(rex))
+
+  dest.add(0x0F)
+  dest.add(0xB1)
+  dest.emitMem(int(reg), mem)
+
 # Atomic compare and exchange with 8-byte operand
 proc emitCmpxchg8b*(dest: var Buffer; reg: Register) =
   ## Emit CMPXCHG8B instruction: CMPXCHG8B reg (compare and exchange 8 bytes)
@@ -1132,6 +1353,20 @@ proc emitCmpxchg8b*(dest: var Buffer; reg: Register) =
   dest.add(0x0F)  # Two-byte opcode prefix
   dest.add(0xC7)  # CMPXCHG8B r/m64 opcode
   dest.add(encodeModRM(amDirect, 1, int(reg)))  # /1 extension
+
+proc emitCmpxchg8b*(dest: var Buffer; mem: MemoryOperand) =
+  ## Emit CMPXCHG8B instruction: CMPXCHG8B mem
+  ## Note: With REX.W this is actually CMPXCHG16B on 64-bit processors
+  var rex = RexPrefix(w: true)
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+
+  if rex.b or rex.x or rex.w:
+    dest.add(encodeRex(rex))
+
+  dest.add(0x0F)
+  dest.add(0xC7)
+  dest.emitMem(1, mem) # /1 extension
 
 # Atomic bit operations
 proc emitBtsAtomic*(dest: var Buffer; reg: Register; bit: int) =
@@ -1257,6 +1492,131 @@ proc emitPrefetchNta*(dest: var Buffer; reg: Register) =
   dest.add(encodeModRM(amDirect, 0, int(reg)))  # /0 extension
 
 
+# Conditional set instructions
+proc emitSetcc*(dest: var Buffer; code: byte; reg: Register) =
+  ## Emit SETcc reg (set byte if condition)
+  var rex = RexPrefix()
+  if needsRex(reg): rex.b = true
+  if rex.b: dest.add(encodeRex(rex))
+
+  dest.add(0x0F)
+  dest.add(code)
+  dest.add(encodeModRM(amDirect, 0, int(reg))) # /0 extension not used but format needs reg in r/m field
+
+proc emitSete*(dest: var Buffer; reg: Register) = dest.emitSetcc(0x94, reg)
+proc emitSetne*(dest: var Buffer; reg: Register) = dest.emitSetcc(0x95, reg)
+proc emitSetg*(dest: var Buffer; reg: Register) = dest.emitSetcc(0x9F, reg)
+proc emitSetge*(dest: var Buffer; reg: Register) = dest.emitSetcc(0x9D, reg)
+proc emitSetl*(dest: var Buffer; reg: Register) = dest.emitSetcc(0x9C, reg)
+proc emitSetle*(dest: var Buffer; reg: Register) = dest.emitSetcc(0x9E, reg)
+proc emitSeta*(dest: var Buffer; reg: Register) = dest.emitSetcc(0x97, reg)
+proc emitSetae*(dest: var Buffer; reg: Register) = dest.emitSetcc(0x93, reg)
+proc emitSetb*(dest: var Buffer; reg: Register) = dest.emitSetcc(0x92, reg)
+proc emitSetbe*(dest: var Buffer; reg: Register) = dest.emitSetcc(0x96, reg)
+proc emitSeto*(dest: var Buffer; reg: Register) = dest.emitSetcc(0x90, reg)
+proc emitSets*(dest: var Buffer; reg: Register) = dest.emitSetcc(0x98, reg)
+proc emitSetp*(dest: var Buffer; reg: Register) = dest.emitSetcc(0x9A, reg)
+
+# Conditional move instructions
+proc emitCmovcc*(dest: var Buffer; code: byte; destReg, srcReg: Register) =
+  ## Emit CMOVcc destReg, srcReg
+  var rex = RexPrefix(w: true)
+  if needsRex(destReg): rex.r = true
+  if needsRex(srcReg): rex.b = true
+
+  if rex.r or rex.b or rex.w:
+    dest.add(encodeRex(rex))
+
+  dest.add(0x0F)
+  dest.add(code)
+  dest.add(encodeModRM(amDirect, int(destReg), int(srcReg)))
+
+proc emitCmovcc*(dest: var Buffer; code: byte; destReg: Register; srcMem: MemoryOperand) =
+  ## Emit CMOVcc destReg, mem
+  var rex = RexPrefix(w: true)
+  if needsRex(destReg): rex.r = true
+  if needsRex(srcMem.base): rex.b = true
+  if srcMem.hasIndex and needsRex(srcMem.index): rex.x = true
+
+  if rex.r or rex.b or rex.x or rex.w:
+    dest.add(encodeRex(rex))
+
+  dest.add(0x0F)
+  dest.add(code)
+  dest.emitMem(int(destReg), srcMem)
+
+proc emitCmove*(dest: var Buffer; d, s: Register) = dest.emitCmovcc(0x44, d, s)
+proc emitCmove*(dest: var Buffer; d: Register; s: MemoryOperand) = dest.emitCmovcc(0x44, d, s)
+
+proc emitCmovne*(dest: var Buffer; d, s: Register) = dest.emitCmovcc(0x45, d, s)
+proc emitCmovne*(dest: var Buffer; d: Register; s: MemoryOperand) = dest.emitCmovcc(0x45, d, s)
+
+proc emitCmovg*(dest: var Buffer; d, s: Register) = dest.emitCmovcc(0x4F, d, s)
+proc emitCmovg*(dest: var Buffer; d: Register; s: MemoryOperand) = dest.emitCmovcc(0x4F, d, s)
+
+proc emitCmovge*(dest: var Buffer; d, s: Register) = dest.emitCmovcc(0x4D, d, s)
+proc emitCmovge*(dest: var Buffer; d: Register; s: MemoryOperand) = dest.emitCmovcc(0x4D, d, s)
+
+proc emitCmovl*(dest: var Buffer; d, s: Register) = dest.emitCmovcc(0x4C, d, s)
+proc emitCmovl*(dest: var Buffer; d: Register; s: MemoryOperand) = dest.emitCmovcc(0x4C, d, s)
+
+proc emitCmovle*(dest: var Buffer; d, s: Register) = dest.emitCmovcc(0x4E, d, s)
+proc emitCmovle*(dest: var Buffer; d: Register; s: MemoryOperand) = dest.emitCmovcc(0x4E, d, s)
+
+proc emitCmova*(dest: var Buffer; d, s: Register) = dest.emitCmovcc(0x47, d, s)
+proc emitCmova*(dest: var Buffer; d: Register; s: MemoryOperand) = dest.emitCmovcc(0x47, d, s)
+
+proc emitCmovae*(dest: var Buffer; d, s: Register) = dest.emitCmovcc(0x43, d, s)
+proc emitCmovae*(dest: var Buffer; d: Register; s: MemoryOperand) = dest.emitCmovcc(0x43, d, s)
+
+proc emitCmovb*(dest: var Buffer; d, s: Register) = dest.emitCmovcc(0x42, d, s)
+proc emitCmovb*(dest: var Buffer; d: Register; s: MemoryOperand) = dest.emitCmovcc(0x42, d, s)
+
+proc emitCmovbe*(dest: var Buffer; d, s: Register) = dest.emitCmovcc(0x46, d, s)
+proc emitCmovbe*(dest: var Buffer; d: Register; s: MemoryOperand) = dest.emitCmovcc(0x46, d, s)
+
+proc emitCmovo*(dest: var Buffer; d, s: Register) = dest.emitCmovcc(0x40, d, s)
+proc emitCmovo*(dest: var Buffer; d: Register; s: MemoryOperand) = dest.emitCmovcc(0x40, d, s)
+
+proc emitCmovno*(dest: var Buffer; d, s: Register) = dest.emitCmovcc(0x41, d, s)
+proc emitCmovno*(dest: var Buffer; d: Register; s: MemoryOperand) = dest.emitCmovcc(0x41, d, s)
+
+proc emitCmovs*(dest: var Buffer; d, s: Register) = dest.emitCmovcc(0x48, d, s)
+proc emitCmovs*(dest: var Buffer; d: Register; s: MemoryOperand) = dest.emitCmovcc(0x48, d, s)
+
+proc emitCmovns*(dest: var Buffer; d, s: Register) = dest.emitCmovcc(0x49, d, s)
+proc emitCmovns*(dest: var Buffer; d: Register; s: MemoryOperand) = dest.emitCmovcc(0x49, d, s)
+
+proc emitCmovp*(dest: var Buffer; d, s: Register) = dest.emitCmovcc(0x4A, d, s)
+proc emitCmovp*(dest: var Buffer; d: Register; s: MemoryOperand) = dest.emitCmovcc(0x4A, d, s)
+
+proc emitCmovnp*(dest: var Buffer; d, s: Register) = dest.emitCmovcc(0x4B, d, s)
+proc emitCmovnp*(dest: var Buffer; d: Register; s: MemoryOperand) = dest.emitCmovcc(0x4B, d, s)
+
+# Stack operations
+proc emitPush*(dest: var Buffer; reg: Register) =
+  ## Emit PUSH reg
+  var rex = RexPrefix()
+  if needsRex(reg): rex.b = true
+  if rex.b: dest.add(encodeRex(rex))
+  dest.add(byte(0x50 + (int(reg) and 7)))
+
+proc emitPush*(dest: var Buffer; imm: int32) =
+  ## Emit PUSH imm32
+  if imm >= -128 and imm <= 127:
+    dest.add(0x6A)
+    dest.add(byte(imm and 0xFF))
+  else:
+    dest.add(0x68)
+    dest.addt32(imm)
+
+proc emitPop*(dest: var Buffer; reg: Register) =
+  ## Emit POP reg
+  var rex = RexPrefix()
+  if needsRex(reg): rex.b = true
+  if rex.b: dest.add(encodeRex(rex))
+  dest.add(byte(0x58 + (int(reg) and 7)))
+
 # Control flow instructions
 proc emitRet*(dest: var Buffer) =
   ## Emit RET instruction
@@ -1266,15 +1626,15 @@ proc emitCall*(dest: var Buffer; target: LabelId) =
   ## Emit CALL instruction: CALL target (relative call)
   let pos = dest.getCurrentPosition()
   dest.add(0xE8)
-  dest.addt32(0)  # Placeholder, will be filled during optimization
-  dest.addJump(pos, target, jtCall, 5)  # 1 byte opcode + 4 bytes displacement
+  dest.addt32(0)  # Placeholder
+  dest.addReloc(pos, target, rkCall, 5)  # 1 byte opcode + 4 bytes displacement
 
 proc emitJmp*(dest: var Buffer; target: LabelId) =
   ## Emit JMP instruction: JMP target (relative jump)
   let pos = dest.getCurrentPosition()
   dest.add(0xE9)
-  dest.addt32(0)  # Placeholder, will be filled during optimization
-  dest.addJump(pos, target, jtJmp, 5)  # 1 byte opcode + 4 bytes displacement
+  dest.addt32(0)  # Placeholder
+  dest.addReloc(pos, target, rkJmp, 5)  # 1 byte opcode + 4 bytes displacement
 
 # Conditional jump instructions
 proc emitJe*(dest: var Buffer; target: LabelId) =
@@ -1282,80 +1642,128 @@ proc emitJe*(dest: var Buffer; target: LabelId) =
   let pos = dest.getCurrentPosition()
   dest.add(0x0F)
   dest.add(0x84)
-  dest.addt32(0)  # Placeholder, will be filled during optimization
-  dest.addJump(pos, target, jtJe, 6)  # 2 bytes opcode + 4 bytes displacement
+  dest.addt32(0)  # Placeholder
+  dest.addReloc(pos, target, rkJe, 6)  # 2 bytes opcode + 4 bytes displacement
 
 proc emitJne*(dest: var Buffer; target: LabelId) =
   ## Emit JNE instruction: JNE target (jump if not equal)
   let pos = dest.getCurrentPosition()
   dest.add(0x0F)
   dest.add(0x85)
-  dest.addt32(0)  # Placeholder, will be filled during optimization
-  dest.addJump(pos, target, jtJne, 6)  # 2 bytes opcode + 4 bytes displacement
+  dest.addt32(0)  # Placeholder
+  dest.addReloc(pos, target, rkJne, 6)  # 2 bytes opcode + 4 bytes displacement
 
 proc emitJg*(dest: var Buffer; target: LabelId) =
   ## Emit JG instruction: JG target (jump if greater)
   let pos = dest.getCurrentPosition()
   dest.add(0x0F)
   dest.add(0x8F)
-  dest.addt32(0)  # Placeholder, will be filled during optimization
-  dest.addJump(pos, target, jtJg, 6)  # 2 bytes opcode + 4 bytes displacement
+  dest.addt32(0)  # Placeholder
+  dest.addReloc(pos, target, rkJg, 6)  # 2 bytes opcode + 4 bytes displacement
 
 proc emitJl*(dest: var Buffer; target: LabelId) =
   ## Emit JL instruction: JL target (jump if less)
   let pos = dest.getCurrentPosition()
   dest.add(0x0F)
   dest.add(0x8C)
-  dest.addt32(0)  # Placeholder, will be filled during optimization
-  dest.addJump(pos, target, jtJl, 6)  # 2 bytes opcode + 4 bytes displacement
+  dest.addt32(0)  # Placeholder
+  dest.addReloc(pos, target, rkJl, 6)  # 2 bytes opcode + 4 bytes displacement
 
 proc emitJge*(dest: var Buffer; target: LabelId) =
   ## Emit JGE instruction: JGE target (jump if greater or equal)
   let pos = dest.getCurrentPosition()
   dest.add(0x0F)
   dest.add(0x8D)
-  dest.addt32(0)  # Placeholder, will be filled during optimization
-  dest.addJump(pos, target, jtJge, 6)  # 2 bytes opcode + 4 bytes displacement
+  dest.addt32(0)  # Placeholder
+  dest.addReloc(pos, target, rkJge, 6)  # 2 bytes opcode + 4 bytes displacement
 
 proc emitJle*(dest: var Buffer; target: LabelId) =
   ## Emit JLE instruction: JLE target (jump if less or equal)
   let pos = dest.getCurrentPosition()
   dest.add(0x0F)
   dest.add(0x8E)
-  dest.addt32(0)  # Placeholder, will be filled during optimization
-  dest.addJump(pos, target, jtJle, 6)  # 2 bytes opcode + 4 bytes displacement
+  dest.addt32(0)  # Placeholder
+  dest.addReloc(pos, target, rkJle, 6)  # 2 bytes opcode + 4 bytes displacement
 
 proc emitJa*(dest: var Buffer; target: LabelId) =
   ## Emit JA instruction: JA target (jump if above, unsigned)
   let pos = dest.getCurrentPosition()
   dest.add(0x0F)
   dest.add(0x87)
-  dest.addt32(0)  # Placeholder, will be filled during optimization
-  dest.addJump(pos, target, jtJa, 6)  # 2 bytes opcode + 4 bytes displacement
+  dest.addt32(0)  # Placeholder
+  dest.addReloc(pos, target, rkJa, 6)  # 2 bytes opcode + 4 bytes displacement
 
 proc emitJb*(dest: var Buffer; target: LabelId) =
   ## Emit JB instruction: JB target (jump if below, unsigned)
   let pos = dest.getCurrentPosition()
   dest.add(0x0F)
   dest.add(0x82)
-  dest.addt32(0)  # Placeholder, will be filled during optimization
-  dest.addJump(pos, target, jtJb, 6)  # 2 bytes opcode + 4 bytes displacement
+  dest.addt32(0)  # Placeholder
+  dest.addReloc(pos, target, rkJb, 6)  # 2 bytes opcode + 4 bytes displacement
 
 proc emitJae*(dest: var Buffer; target: LabelId) =
   ## Emit JAE instruction: JAE target (jump if above or equal, unsigned)
   let pos = dest.getCurrentPosition()
   dest.add(0x0F)
   dest.add(0x83)
-  dest.addt32(0)  # Placeholder, will be filled during optimization
-  dest.addJump(pos, target, jtJae, 6)  # 2 bytes opcode + 4 bytes displacement
+  dest.addt32(0)  # Placeholder
+  dest.addReloc(pos, target, rkJae, 6)  # 2 bytes opcode + 4 bytes displacement
 
 proc emitJbe*(dest: var Buffer; target: LabelId) =
   ## Emit JBE instruction: JBE target (jump if below or equal, unsigned)
   let pos = dest.getCurrentPosition()
   dest.add(0x0F)
   dest.add(0x86)
-  dest.addt32(0)  # Placeholder, will be filled during optimization
-  dest.addJump(pos, target, jtJbe, 6)  # 2 bytes opcode + 4 bytes displacement
+  dest.addt32(0)  # Placeholder
+  dest.addReloc(pos, target, rkJbe, 6)  # 2 bytes opcode + 4 bytes displacement
+
+proc emitJo*(dest: var Buffer; target: LabelId) =
+  ## Emit JO instruction: JO target (jump if overflow)
+  let pos = dest.getCurrentPosition()
+  dest.add(0x0F)
+  dest.add(0x80)
+  dest.addt32(0)  # Placeholder
+  dest.addReloc(pos, target, rkJo, 6)
+
+proc emitJno*(dest: var Buffer; target: LabelId) =
+  ## Emit JNO instruction: JNO target (jump if not overflow)
+  let pos = dest.getCurrentPosition()
+  dest.add(0x0F)
+  dest.add(0x81)
+  dest.addt32(0)  # Placeholder
+  dest.addReloc(pos, target, rkJno, 6)
+
+proc emitJs*(dest: var Buffer; target: LabelId) =
+  ## Emit JS instruction: JS target (jump if sign)
+  let pos = dest.getCurrentPosition()
+  dest.add(0x0F)
+  dest.add(0x88)
+  dest.addt32(0)  # Placeholder
+  dest.addReloc(pos, target, rkJs, 6)
+
+proc emitJns*(dest: var Buffer; target: LabelId) =
+  ## Emit JNS instruction: JNS target (jump if not sign)
+  let pos = dest.getCurrentPosition()
+  dest.add(0x0F)
+  dest.add(0x89)
+  dest.addt32(0)  # Placeholder
+  dest.addReloc(pos, target, rkJns, 6)
+
+proc emitJp*(dest: var Buffer; target: LabelId) =
+  ## Emit JP instruction: JP target (jump if parity)
+  let pos = dest.getCurrentPosition()
+  dest.add(0x0F)
+  dest.add(0x8A)
+  dest.addt32(0)  # Placeholder
+  dest.addReloc(pos, target, rkJp, 6)
+
+proc emitJnp*(dest: var Buffer; target: LabelId) =
+  ## Emit JNP instruction: JNP target (jump if not parity)
+  let pos = dest.getCurrentPosition()
+  dest.add(0x0F)
+  dest.add(0x8B)
+  dest.addt32(0)  # Placeholder
+  dest.addReloc(pos, target, rkJnp, 6)
 
 proc emitJmpReg*(dest: var Buffer; reg: Register) =
   ## Emit JMP instruction: JMP reg (indirect jump)
@@ -1383,6 +1791,16 @@ proc emitAnd*(dest: var Buffer; a, b: Register) =
   dest.add(0x21)  # AND r/m64, r64 opcode
   dest.add(encodeModRM(amDirect, int(a), int(b)))
 
+proc emitAnd*(dest: var Buffer; mem: MemoryOperand; reg: Register) =
+  ## Emit AND instruction: AND mem, reg
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  if rex.r or rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
+  dest.add(0x21)
+  dest.emitMem(int(reg), mem)
+
 proc emitOr*(dest: var Buffer; a, b: Register) =
   ## Emit OR instruction: OR a, b
   var rex = RexPrefix(w: true)
@@ -1396,6 +1814,16 @@ proc emitOr*(dest: var Buffer; a, b: Register) =
   dest.add(0x09)  # OR r/m64, r64 opcode
   dest.add(encodeModRM(amDirect, int(a), int(b)))
 
+proc emitOr*(dest: var Buffer; mem: MemoryOperand; reg: Register) =
+  ## Emit OR instruction: OR mem, reg
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  if rex.r or rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
+  dest.add(0x09)
+  dest.emitMem(int(reg), mem)
+
 proc emitXor*(dest: var Buffer; a, b: Register) =
   ## Emit XOR instruction: XOR a, b
   var rex = RexPrefix(w: true)
@@ -1408,6 +1836,16 @@ proc emitXor*(dest: var Buffer; a, b: Register) =
 
   dest.add(0x31)  # XOR r/m64, r64 opcode
   dest.add(encodeModRM(amDirect, int(a), int(b)))
+
+proc emitXor*(dest: var Buffer; mem: MemoryOperand; reg: Register) =
+  ## Emit XOR instruction: XOR mem, reg
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  if rex.r or rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
+  dest.add(0x31)
+  dest.emitMem(int(reg), mem)
 
 # Atomic arithmetic operations
 proc emitAddAtomic*(dest: var Buffer; a, b: Register) =
@@ -1436,7 +1874,7 @@ proc emitXorAtomic*(dest: var Buffer; a, b: Register) =
   dest.emitXor(a, b)
 
 # Atomic increment and decrement
-proc emitcAtomic*(dest: var Buffer; reg: Register) =
+proc emitIncAtomic*(dest: var Buffer; reg: Register) =
   ## Emit atomic INC instruction: LOCK INC reg (atomic increment)
   dest.emitLock()
   dest.emitInc(reg)
@@ -1458,34 +1896,49 @@ proc emitNop*(dest: var Buffer) =
   dest.add(0x90)
 
 # Jump optimization functions
-proc updateJumpDisplacements*(buf: var Buffer) =
-  ## Update all jump displacements based on current label positions
-  for jump in buf.jumps:
-    let currentPos = jump.position
-    let targetPos = buf.getLabelPosition(jump.target)
-    let distance = calculateJumpDistance(currentPos, targetPos, jump.instruction)
+proc updateRelocDisplacements*(buf: var Buffer) =
+  ## Update all relocation displacements based on current label positions
+  for reloc in buf.relocs:
+    let currentPos = reloc.position
+    let targetPos = buf.getLabelPosition(reloc.target)
+    let distance = calculateRelocDistance(currentPos, targetPos, reloc.kind)
 
     # Convert to signed 32-bit for proper encoding
     let signedDistance = int32(distance)
 
     # Check if we have enough space in the buffer
-    let requiredSize = 
-      case jump.instruction
-      of jtCall, jtJmp: currentPos + 5
+    let requiredSize =
+      case reloc.kind
+      of rkCall, rkJmp: currentPos + 5
+      of rkLea: currentPos + 7
       else: currentPos + 6
 
     if requiredSize > buf.data.len:
-      continue  # Skip this jump if buffer is too small
+      continue  # Skip this relocation if buffer is too small
+
+    if reloc.kind == rkLea:
+      # LEA instruction is 7 bytes: 48 8D 05 (ModRM=05) disp32
+      # distance is from end of instruction.
+      # RIP-relative: effective address = RIP + disp.
+      # RIP is address of next instruction.
+      # So distance calculation is correct (toPos - (currentPos + 7)).
+      discard
 
     # Update the displacement in the instruction
-    case jump.instruction
-    of jtCall:
+    case reloc.kind
+    of rkLea:
+      # LEA uses 32-bit displacement (little-endian) at offset 3
+      buf.data[currentPos + 3] = byte(signedDistance and 0xFF)
+      buf.data[currentPos + 4] = byte((signedDistance shr 8) and 0xFF)
+      buf.data[currentPos + 5] = byte((signedDistance shr 16) and 0xFF)
+      buf.data[currentPos + 6] = byte((signedDistance shr 24) and 0xFF)
+    of rkCall:
       # CALL uses 32-bit displacement (little-endian)
       buf.data[currentPos + 1] = byte(signedDistance and 0xFF)
       buf.data[currentPos + 2] = byte((signedDistance shr 8) and 0xFF)
       buf.data[currentPos + 3] = byte((signedDistance shr 16) and 0xFF)
       buf.data[currentPos + 4] = byte((signedDistance shr 24) and 0xFF)
-    of jtJmp:
+    of rkJmp:
       # JMP uses 32-bit displacement (little-endian)
       buf.data[currentPos + 1] = byte(signedDistance and 0xFF)
       buf.data[currentPos + 2] = byte((signedDistance shr 8) and 0xFF)
@@ -1506,10 +1959,10 @@ proc optimizeJumps*(buf: Buffer): Buffer =
   # Copy all data to new buffer
   optimized.data = buf.data
   optimized.labels = buf.labels
-  optimized.jumps = buf.jumps
+  optimized.relocs = buf.relocs
 
-  # Update all jump displacements in the new buffer
-  optimized.updateJumpDisplacements()
+  # Update all reloc displacements in the new buffer
+  optimized.updateRelocDisplacements()
 
   # Try to optimize jumps by creating a new buffer with shorter instructions
   var changed = true
@@ -1521,99 +1974,152 @@ proc optimizeJumps*(buf: Buffer): Buffer =
     inc(iterations)
 
     var newBuf = initBuffer()
-    var jumpIndex = 0
+    newBuf.labels = optimized.labels # Copy labels, will update positions
+
+    # Map label positions to indices for efficient update
+    var posToLabels = initTable[int, seq[int]]()
+    for idx, lab in optimized.labels:
+      if not posToLabels.hasKey(lab.position):
+        posToLabels[lab.position] = @[]
+      posToLabels[lab.position].add(idx)
+
+    var relocIndex = 0
     var i = 0
+    var currentNewPos = 0
 
     while i < optimized.data.len:
-      # Check if we're at a jump instruction
-      if jumpIndex < optimized.jumps.len and optimized.jumps[jumpIndex].position == i:
-        let jump = optimized.jumps[jumpIndex]
-        let targetPos = optimized.getLabelPosition(jump.target)
-        let distance = calculateJumpDistance(i, targetPos, jump.instruction)
+      # Update labels at this position
+      if posToLabels.hasKey(i):
+        for labIdx in posToLabels[i]:
+          newBuf.labels[labIdx].position = currentNewPos
+
+      # Check if we're at a reloc instruction
+      if relocIndex < optimized.relocs.len and optimized.relocs[relocIndex].position == i:
+        let reloc = optimized.relocs[relocIndex]
+        let targetPos = optimized.getLabelPosition(reloc.target)
+        let distance = calculateRelocDistance(i, targetPos, reloc.kind)
+
+        var addedBytes = 0
+        let originalSize =
+            case reloc.kind
+            of rkLea: 7
+            of rkCall, rkJmp: 5
+            else: 6
 
         # Check if we can use a short jump
-        if canUseShortJump(distance):
-          case jump.instruction
-          of jtCall:
+        if reloc.kind == rkLea:
+           # LEA is fixed size, copy original bytes
+           # The ModRM byte is at +2.
+           newBuf.data.add(0x48)
+           newBuf.data.add(0x8D)
+           newBuf.data.add(optimized.data[i+2])
+           newBuf.addt32(int32(distance))
+           addedBytes = 7
+
+           # Keep track of this relocation in the new buffer
+           newBuf.addReloc(currentNewPos, reloc.target, reloc.kind, reloc.originalSize)
+
+        elif canUseShortJump(distance):
+          case reloc.kind
+          of rkCall:
             # CALL doesn't have 8-bit form, emit as 32-bit
             newBuf.data.add(0xE8)  # CALL opcode
             newBuf.addt32(int32(distance))
-          of jtJmp:
+            addedBytes = 5
+            newBuf.addReloc(currentNewPos, reloc.target, reloc.kind, reloc.originalSize)
+          of rkJmp:
             # JMP with 8-bit displacement
             newBuf.data.add(0xEB)  # JMP rel8 opcode
             newBuf.data.add(byte(distance and 0xFF))
+            addedBytes = 2
             changed = true
+            # No need to track reloc for short jump
           else:
             # Conditional jumps with 8-bit displacement
-            let shortOpcode = 
-              case jump.instruction
-              of jtJe: 0x74
-              of jtJne: 0x75
-              of jtJg: 0x7F
-              of jtJl: 0x7C
-              of jtJge: 0x7D
-              of jtJle: 0x7E
-              of jtJa: 0x77
-              of jtJb: 0x72
-              of jtJae: 0x73
-              of jtJbe: 0x76
+            let shortOpcode =
+              case reloc.kind
+              of rkJe: 0x74
+              of rkJne: 0x75
+              of rkJg: 0x7F
+              of rkJl: 0x7C
+              of rkJge: 0x7D
+              of rkJle: 0x7E
+              of rkJa: 0x77
+              of rkJb: 0x72
+              of rkJae: 0x73
+              of rkJbe: 0x76
+              of rkJo: 0x70
+              of rkJno: 0x71
+              of rkJs: 0x78
+              of rkJns: 0x79
+              of rkJp: 0x7A
+              of rkJnp: 0x7B
               else: 0x74  # Default to JE
 
             newBuf.data.add(byte(shortOpcode))
             newBuf.data.add(byte(distance and 0xFF))
+            addedBytes = 2
             changed = true
         else:
           # Use 32-bit displacement
-          case jump.instruction
-          of jtCall:
+          case reloc.kind
+          of rkCall:
             newBuf.data.add(0xE8)  # CALL opcode
             newBuf.addt32(int32(distance))
-          of jtJmp:
+            addedBytes = 5
+            newBuf.addReloc(currentNewPos, reloc.target, reloc.kind, reloc.originalSize)
+          of rkJmp:
             newBuf.data.add(0xE9)  # JMP rel32 opcode
             newBuf.addt32(int32(distance))
+            addedBytes = 5
+            newBuf.addReloc(currentNewPos, reloc.target, reloc.kind, reloc.originalSize)
           else:
             # Conditional jumps with 32-bit displacement
             newBuf.data.add(0x0F)  # Two-byte opcode prefix
-            let longOpcode = 
-              case jump.instruction
-              of jtJe: 0x84
-              of jtJne: 0x85
-              of jtJg: 0x8F
-              of jtJl: 0x8C
-              of jtJge: 0x8D
-              of jtJle: 0x8E
-              of jtJa: 0x87
-              of jtJb: 0x82
-              of jtJae: 0x83
-              of jtJbe: 0x86
+            let longOpcode =
+              case reloc.kind
+              of rkJe: 0x84
+              of rkJne: 0x85
+              of rkJg: 0x8F
+              of rkJl: 0x8C
+              of rkJge: 0x8D
+              of rkJle: 0x8E
+              of rkJa: 0x87
+              of rkJb: 0x82
+              of rkJae: 0x83
+              of rkJbe: 0x86
+              of rkJo: 0x80
+              of rkJno: 0x81
+              of rkJs: 0x88
+              of rkJns: 0x89
+              of rkJp: 0x8A
+              of rkJnp: 0x8B
               else: 0x84  # Default to JE
             newBuf.data.add(byte(longOpcode))
             newBuf.addt32(int32(distance))
+            addedBytes = 6
+            newBuf.addReloc(currentNewPos, reloc.target, reloc.kind, reloc.originalSize)
 
         # Skip the original instruction bytes
-        let originalSize = 
-          case jump.instruction
-          of jtCall, jtJmp: 5
-          else: 6
         i += originalSize
-        inc(jumpIndex)
+        currentNewPos += addedBytes
+        inc(relocIndex)
       else:
-        # Copy non-jump instruction
+        # Copy non-reloc byte
         newBuf.data.add(optimized.data[i])
-        inc(i)
+        i += 1
+        currentNewPos += 1
+
+    # Update labels at the very end
+    if posToLabels.hasKey(i):
+      for labIdx in posToLabels[i]:
+        newBuf.labels[labIdx].position = currentNewPos
 
     # Update the optimized buffer
     optimized = newBuf
 
-    # Update jump positions for next iteration
-    var pos = 0
-    for j in 0..<optimized.jumps.len:
-      optimized.jumps[j].position = pos
-      let instructionSize = 
-        case optimized.jumps[j].instruction
-        of jtCall, jtJmp: 5
-        else: 6
-      pos += instructionSize
+    # Update displacements for next iteration
+    optimized.updateRelocDisplacements()
 
   return optimized
 
@@ -1621,3 +2127,25 @@ proc finalize*(buf: var Buffer) =
   ## Finalize the buffer by optimizing all jump instructions
   let optimized = buf.optimizeJumps()
   buf = optimized
+
+proc emitLea*(dest: var Buffer; reg: Register; target: LabelId) =
+  ## Emit LEA instruction: LEA reg, [RIP + target]
+  let pos = dest.getCurrentPosition()
+  dest.add(0x48) # REX.W
+  dest.add(0x8D) # LEA opcode
+  dest.add(encodeModRM(amIndirect, int(reg), 5)) # Mod=00, Reg=reg, RM=101 (RIP-rel)
+  dest.addt32(0) # Placeholder
+  dest.addReloc(pos, target, rkLea, 7)
+
+proc emitLea*(dest: var Buffer; reg: Register; mem: MemoryOperand) =
+  ## Emit LEA instruction: LEA reg, mem
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+
+  if rex.r or rex.b or rex.x or rex.w:
+    dest.add(encodeRex(rex))
+
+  dest.add(0x8D) # LEA r64, m
+  dest.emitMem(int(reg), mem)
