@@ -3273,6 +3273,8 @@ proc pass2(n: Cursor; ctx: var GenContext) =
       else:
         error("Expected instruction", n)
     inc n
+  else:
+    error("Expected stmts", n)
 
 proc writeElf(a: var GenContext; outfile: string) =
   x86.finalize(a.buf)
@@ -3355,7 +3357,14 @@ proc writeMachO(a: var GenContext; outfile: string) =
 
   macho.writeMachO(code, a.bssOffset, entryAddr, cputype, cpusubtype, outfile)
 
+proc createLiterals(data: openArray[(string, int)]): Literals =
+  result = default(Literals)
+  for i in 1 ..< data.len:
+    let t = result.tags.getOrIncl(data[i][0])
+    assert t.int == data[i][1]
+
 proc assemble*(filename, outfile: string) =
+  nifstreams.pool = createLiterals(TagData)
   var buf = parseFromFile(filename)
   var n = beginRead(buf)
 
