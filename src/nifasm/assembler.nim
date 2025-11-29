@@ -3364,7 +3364,11 @@ proc assemble*(filename, outfile: string) =
   ctx.bssBuf = x86.initBuffer()
   pass2(n, ctx)
 
-  writeElf(ctx, outfile)
+  case ctx.arch
+  of Arch.X64:
+    writeElf(ctx, outfile)
+  of Arch.A64:
+    discard "todo"
 
   # Close all module streams
   for module in ctx.modules.mvalues:

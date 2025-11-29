@@ -305,6 +305,15 @@ proc emitSvc*(dest: var Bytes; imm: uint16) =
   let instr = 0xD4000001'u32 or (uint32(imm) shl 5)
   dest.addUint32(instr)
 
+# ADR instruction (load address)
+proc emitAdr*(dest: var Buffer; rd: Register; target: LabelId) =
+  ## Emit ADR instruction: ADR rd, target (load address of label)
+  # ADR Xd, label: 0001 0000 00ii iiii iiii iiii iiii dddd
+  # The immediate will be patched later via relocation
+  let pos = dest.data.getCurrentPosition()
+  dest.data.addUint32(0x10000000'u32 or encodeReg(rd))  # Placeholder
+  dest.addReloc(pos, target, rkADR, 4)
+
 # Stack operations
 proc emitStp*(dest: var Bytes; rt1, rt2: Register; rn: Register; offset: int32) =
   ## Emit STP instruction: STP rt1, rt2, [rn, #offset]! (pre-index)
