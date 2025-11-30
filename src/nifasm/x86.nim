@@ -40,13 +40,13 @@ type
   # combine x86 and ARM64 instruction types here for this to work out.
   RelocKind* = enum
     rkCall, rkJmp, rkJe, rkJne, rkJg, rkJl, rkJge, rkJle, rkJa, rkJb, rkJae, rkJbe,
-    rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp, rkLea
+    rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp, rkLea, rkIatCall
     rkB, rkBL, rkBEQ, rkBNE, rkCBZ, rkCBNZ, rkTBZ, rkTBNZ, rkADR, rkADRP
 
   # Relocation entry for optimization and patching
   RelocEntry* = object
     position*: int        # Position in buffer where instruction starts
-    target*: LabelId      # Target label ID
+    target*: LabelId      # Target label ID (or IAT slot index for rkIatCall)
     kind*: RelocKind      # Type of relocation/instruction
     originalSize*: int    # Original instruction size in bytes
 
@@ -101,7 +101,7 @@ proc calculateRelocDistance*(fromPos: int; toPos: int; kind: RelocKind = rkJmp):
   ## For ARM64, the distance is calculated from the start of the instruction
   case kind
   of rkCall, rkJmp: toPos - (fromPos + 5)  # x86: distance from after the complete instruction
-  of rkLea: toPos - (fromPos + 7)
+  of rkLea, rkIatCall: toPos - (fromPos + 6)  # LEA and IAT call are 6 bytes: FF 15 [rip+disp32]
   of rkJe, rkJne, rkJg, rkJl, rkJge, rkJle, rkJa, rkJb, rkJae, rkJbe,
      rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp: toPos - (fromPos + 6)
   of rkB, rkBL, rkBEQ, rkBNE, rkCBZ, rkCBNZ, rkTBZ, rkTBNZ, rkADR, rkADRP:
@@ -1864,6 +1864,9 @@ proc emitNop*(dest: var Bytes) =
 proc updateRelocDisplacements*(buf: var Buffer) =
   ## Update all relocation displacements based on current label positions
   for reloc in buf.relocs:
+    # Skip IAT calls - they are patched later when IAT address is known
+    if reloc.kind == rkIatCall:
+      continue
     let currentPos = reloc.position
     let targetPos = buf.getLabelPosition(reloc.target)
     let distance = calculateRelocDistance(currentPos, targetPos, reloc.kind)
@@ -1876,7 +1879,7 @@ proc updateRelocDisplacements*(buf: var Buffer) =
       case reloc.kind
       of rkCall, rkJmp: currentPos + 5
       of rkLea: currentPos + 7
-      of rkJe, rkJne, rkJg, rkJl, rkJge, rkJle, rkJa, rkJb, rkJae, rkJbe,
+      of rkIatCall, rkJe, rkJne, rkJg, rkJl, rkJge, rkJle, rkJa, rkJb, rkJae, rkJbe,
          rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp:
         currentPos + 6
       of rkB, rkBL, rkBEQ, rkBNE, rkCBZ, rkCBNZ, rkTBZ, rkTBNZ, rkADR, rkADRP:
@@ -1884,6 +1887,15 @@ proc updateRelocDisplacements*(buf: var Buffer) =
 
     if requiredSize > buf.data.len:
       continue  # Skip this relocation if buffer is too small
+
+    if reloc.kind == rkIatCall:
+      # IAT call uses FF 15 [rip+disp32] - 6 bytes total
+      # The displacement is at offset 2-5
+      buf.data[currentPos + 2] = byte(signedDistance and 0xFF)
+      buf.data[currentPos + 3] = byte((signedDistance shr 8) and 0xFF)
+      buf.data[currentPos + 4] = byte((signedDistance shr 16) and 0xFF)
+      buf.data[currentPos + 5] = byte((signedDistance shr 24) and 0xFF)
+      continue
 
     if reloc.kind == rkLea:
       # LEA instruction is 7 bytes: 48 8D 05 (ModRM=05) disp32
@@ -1895,6 +1907,12 @@ proc updateRelocDisplacements*(buf: var Buffer) =
 
     # Update the displacement in the instruction
     case reloc.kind
+    of rkIatCall:
+      # IAT call: FF 15 [rip+disp32] - displacement at offset 2-5
+      buf.data[currentPos + 2] = byte(signedDistance and 0xFF)
+      buf.data[currentPos + 3] = byte((signedDistance shr 8) and 0xFF)
+      buf.data[currentPos + 4] = byte((signedDistance shr 16) and 0xFF)
+      buf.data[currentPos + 5] = byte((signedDistance shr 24) and 0xFF)
     of rkLea:
       # LEA uses 32-bit displacement (little-endian) at offset 3
       buf.data[currentPos + 3] = byte(signedDistance and 0xFF)
@@ -2052,21 +2070,40 @@ proc optimizeJumps*(buf: Buffer): Buffer =
       # Check if we're at a reloc instruction
       if relocIndex < optimized.relocs.len and optimized.relocs[relocIndex].position == i:
         let reloc = optimized.relocs[relocIndex]
+        var addedBytes = 0
+        # Skip IAT calls - they are patched later when IAT address is known
+        if reloc.kind == rkIatCall:
+          # Copy IAT call instruction as-is (6 bytes: FF 15 [rip+disp32])
+          for j in 0..<6:
+            if i + j < optimized.data.len:
+              newBuf.data.add(optimized.data[i + j])
+          addedBytes = 6
+          newBuf.addReloc(currentNewPos, reloc.target, reloc.kind, reloc.originalSize)
+          i += 6
+          currentNewPos += 6
+          inc(relocIndex)
+          continue
         let targetPos = optimized.getLabelPosition(reloc.target)
         let distance = calculateRelocDistance(i, targetPos, reloc.kind)
-
-        var addedBytes = 0
         let originalSize =
           case reloc.kind
           of rkLea: 7
-          of rkCall, rkJmp: 5
-          of rkJe, rkJne, rkJg, rkJl, rkJge, rkJle, rkJa, rkJb, rkJae, rkJbe,
+          of rkIatCall, rkJe, rkJne, rkJg, rkJl, rkJge, rkJle, rkJa, rkJb, rkJae, rkJbe,
              rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp: 6
+          of rkCall, rkJmp: 5
           of rkB, rkBL, rkBEQ, rkBNE, rkCBZ, rkCBNZ, rkTBZ, rkTBNZ, rkADR, rkADRP:
             4  # All ARM64 instructions are 4 bytes
 
         # Check if we can use a short jump
-        if reloc.kind == rkLea:
+        if reloc.kind == rkIatCall:
+          # IAT call is fixed size: FF 15 [rip+disp32]
+          newBuf.data.add(0xFF)  # CALL opcode
+          newBuf.data.add(0x15)  # ModRM: [rip+disp32]
+          newBuf.data.addt32(int32(distance))
+          addedBytes = 6
+          # Keep track of this relocation in the new buffer
+          newBuf.addReloc(currentNewPos, reloc.target, reloc.kind, reloc.originalSize)
+        elif reloc.kind == rkLea:
           # LEA is fixed size, copy original bytes
           # The ModRM byte is at +2.
           newBuf.data.add(0x48)
@@ -2146,6 +2183,13 @@ proc optimizeJumps*(buf: Buffer): Buffer =
             newBuf.data.addt32(int32(distance))
             addedBytes = 5
             newBuf.addReloc(currentNewPos, reloc.target, reloc.kind, reloc.originalSize)
+          of rkIatCall:
+            # IAT call: FF 15 [rip+disp32]
+            newBuf.data.add(0xFF)  # CALL opcode
+            newBuf.data.add(0x15)  # ModRM: [rip+disp32]
+            newBuf.data.addt32(int32(distance))
+            addedBytes = 6
+            newBuf.addReloc(currentNewPos, reloc.target, reloc.kind, reloc.originalSize)
           of rkJe, rkJne, rkJg, rkJl, rkJge, rkJle, rkJa, rkJb, rkJae, rkJbe,
              rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp, rkLea:
             # Conditional jumps with 32-bit displacement
@@ -2213,6 +2257,16 @@ proc emitLea*(dest: var Buffer; reg: Register; target: LabelId) =
   dest.data.add(encodeModRM(amIndirect, int(reg), 5)) # Mod=00, Reg=reg, RM=101 (RIP-rel)
   dest.data.addt32(0) # Placeholder
   dest.addReloc(pos, target, rkLea, 7)
+
+proc emitIatCall*(dest: var Buffer; iatSlot: int) =
+  ## Emit indirect call through IAT: CALL [rip+disp32] where disp32 points to IAT entry
+  ## The displacement will be patched later when IAT address is known
+  let pos = dest.data.getCurrentPosition()
+  dest.data.add(0xFF)  # CALL opcode
+  dest.data.add(0x15)  # ModRM: [rip+disp32]
+  dest.data.addt32(0)  # Placeholder displacement
+  # Use LabelId to store IAT slot index (will be converted to IAT RVA later)
+  dest.addReloc(pos, LabelId(iatSlot), rkIatCall, 6)
 
 proc emitLea*(dest: var Bytes; reg: Register; mem: MemoryOperand) =
   ## Emit LEA instruction: LEA reg, mem

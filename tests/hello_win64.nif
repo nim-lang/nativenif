@@ -1,0 +1,25 @@
+(stmts
+  (arch win_x64)
+  (imp "kernel32.dll")
+  (extproc :GetStdHandle.0 "GetStdHandle")
+  (extproc :WriteFile.0 "WriteFile")
+  (extproc :ExitProcess.0 "ExitProcess")
+
+  (mov (rcx) -11)
+  (call GetStdHandle.0)
+  (mov (rdi) (rax))
+
+  (sub (rsp) +32)
+  (mov (rcx) (rdi))
+  (lea (rdx) msg.0)
+  (mov (r8) +12)
+  (mov (r9) (rsp))
+  (push +0)
+  (call WriteFile.0)
+  (add (rsp) +40)
+
+  (mov (rcx) +0)
+  (call ExitProcess.0)
+
+  (rodata :msg.0 "Hello World\0A")
+)
