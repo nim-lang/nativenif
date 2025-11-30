@@ -2141,7 +2141,7 @@ proc optimizeJumps*(buf: Buffer): Buffer =
             changed = true
             # No need to track reloc for short jump
           of rkJe, rkJne, rkJg, rkJl, rkJge, rkJle, rkJa, rkJb, rkJae, rkJbe,
-             rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp, rkLea:
+             rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp:
             # Conditional jumps with 8-bit displacement
             let shortOpcode =
               case reloc.kind
@@ -2191,7 +2191,7 @@ proc optimizeJumps*(buf: Buffer): Buffer =
             addedBytes = 6
             newBuf.addReloc(currentNewPos, reloc.target, reloc.kind, reloc.originalSize)
           of rkJe, rkJne, rkJg, rkJl, rkJge, rkJle, rkJa, rkJb, rkJae, rkJbe,
-             rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp, rkLea:
+             rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp:
             # Conditional jumps with 32-bit displacement
             newBuf.data.add(0x0F)  # Two-byte opcode prefix
             let longOpcode =
@@ -2218,8 +2218,8 @@ proc optimizeJumps*(buf: Buffer): Buffer =
             addedBytes = 6
             newBuf.addReloc(currentNewPos, reloc.target, reloc.kind, reloc.originalSize)
           else:
-            # ARM64 relocations should be handled earlier, this should never be reached
-            raise newException(ValueError, "ARM64 relocation in x86 32-bit jump path: " & $reloc.kind)
+            # Unexpected relocation kind - should be handled earlier in the if-elif chain
+            raise newException(ValueError, "Unexpected relocation kind in jump optimization: " & $reloc.kind)
 
         # Skip the original instruction bytes
         i += originalSize
