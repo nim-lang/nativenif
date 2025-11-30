@@ -1,0 +1,18 @@
+import std/[os, osproc]
+
+
+proc exec(cmd: string; showProgress = false) =
+  if showProgress:
+    let exitCode = execShellCmd(cmd)
+    if exitCode != 0:
+      quit "FAILURE " & cmd & "\n"
+  else:
+    let (s, exitCode) = execCmdEx(cmd)
+    if exitCode != 0:
+      quit "FAILURE " & cmd & "\n" & s
+
+
+when defined(macosx):
+  exec "nim c -r src/nifasm/nifasm tests/hello_darwin.nif && tests/hello_darwin"
+else:
+  exec "nim c -r src/nifasm/nifasm tests/hello.nif && tests/hello"
