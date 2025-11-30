@@ -101,7 +101,8 @@ proc calculateRelocDistance*(fromPos: int; toPos: int; kind: RelocKind = rkJmp):
   ## For ARM64, the distance is calculated from the start of the instruction
   case kind
   of rkCall, rkJmp: toPos - (fromPos + 5)  # x86: distance from after the complete instruction
-  of rkLea, rkIatCall: toPos - (fromPos + 6)  # LEA and IAT call are 6 bytes: FF 15 [rip+disp32]
+  of rkLea: toPos - (fromPos + 7)  # LEA is 7 bytes: 48 8D xx disp32 (REX.W + opcode + ModRM + disp32)
+  of rkIatCall: toPos - (fromPos + 6)  # IAT call is 6 bytes: FF 15 disp32
   of rkJe, rkJne, rkJg, rkJl, rkJge, rkJle, rkJa, rkJb, rkJae, rkJbe,
      rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp: toPos - (fromPos + 6)
   of rkB, rkBL, rkBEQ, rkBNE, rkCBZ, rkCBNZ, rkTBZ, rkTBNZ, rkADR, rkADRP:
@@ -184,16 +185,19 @@ proc emitMem(dest: var Bytes; reg: int; mem: MemoryOperand) =
 # Core MOV instruction implementations
 proc emitMov*(dest: var Bytes; a, b: Register) =
   ## Emit MOV instruction: MOV a, b (move from b to a)
+  ## Opcode 0x89: MOV r/m64, r64 - reg field is source, r/m field is destination
   var rex = RexPrefix(w: true)
 
-  if needsRex(a): rex.r = true
-  if needsRex(b): rex.b = true
+  # For 0x89: r/m is dest (a), reg is source (b)
+  # REX.R extends reg (source), REX.B extends r/m (dest)
+  if needsRex(b): rex.r = true  # source register extension
+  if needsRex(a): rex.b = true  # destination register extension
 
   if rex.r or rex.b or rex.w:
     dest.add(encodeRex(rex))
 
   dest.add(0x89)  # MOV r/m64, r64 opcode
-  dest.add(encodeModRM(amDirect, int(a), int(b)))
+  dest.add(encodeModRM(amDirect, int(b), int(a)))  # reg=source(b), rm=dest(a)
 
 proc emitMov*(dest: var Bytes; reg: Register; mem: MemoryOperand) =
   ## Emit MOV instruction: MOV reg, mem (load)

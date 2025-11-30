@@ -1,6 +1,6 @@
 # PE (Portable Executable) binary format writer for Windows
 
-import std / [streams, os]
+import std / [streams]
 
 import buffers, x86
 
@@ -144,6 +144,7 @@ const
   IMAGE_SCN_CNT_CODE* = 0x00000020'u32
   IMAGE_SCN_CNT_INITIALIZED_DATA* = 0x00000040'u32
   IMAGE_SCN_CNT_UNINITIALIZED_DATA* = 0x00000080'u32
+  IMAGE_SCN_MEM_DISCARDABLE* = 0x02000000'u32
   IMAGE_SCN_MEM_EXECUTE* = 0x20000000'u32
   IMAGE_SCN_MEM_READ* = 0x40000000'u32
   IMAGE_SCN_MEM_WRITE* = 0x80000000'u32
@@ -254,10 +255,22 @@ proc writePE*(code: var x86.Buffer; bssSize: int; entryOffset: uint32;
 
   # DOS header size
   let dosHeaderSize = sizeof(IMAGE_DOS_HEADER).uint32
-  # DOS stub (minimal)
-  let dosStubSize = 0'u32  # We skip the DOS stub for simplicity
-  # PE signature
-  let peSignatureOffset = alignTo(dosHeaderSize + dosStubSize, 8)
+  # DOS stub - minimal stub that just exits (required for some PE loaders)
+  # The stub goes from offset 64 to 127, PE signature at 128 (0x80)
+  const dosStub: array[64, byte] = [
+    # Simple DOS stub: push cs; pop ds; mov dx, msg; mov ah, 9; int 21h; mov ax, 4c01h; int 21h
+    0x0E'u8, 0x1F, 0xBA, 0x0E, 0x00, 0xB4, 0x09, 0xCD,
+    0x21, 0xB8, 0x01, 0x4C, 0xCD, 0x21, 0x54, 0x68,
+    0x69, 0x73, 0x20, 0x70, 0x72, 0x6F, 0x67, 0x72,  # "This progr"
+    0x61, 0x6D, 0x20, 0x63, 0x61, 0x6E, 0x6E, 0x6F,  # "am canno"
+    0x74, 0x20, 0x62, 0x65, 0x20, 0x72, 0x75, 0x6E,  # "t be run"
+    0x20, 0x69, 0x6E, 0x20, 0x44, 0x4F, 0x53, 0x20,  # " in DOS "
+    0x6D, 0x6F, 0x64, 0x65, 0x2E, 0x0D, 0x0D, 0x0A,  # "mode.\r\r\n"
+    0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # "$" + padding
+  ]
+  let dosStubSize = uint32(dosStub.len)
+  # PE signature at offset 128 (0x80) - standard location
+  let peSignatureOffset = dosHeaderSize + dosStubSize
   let peSignatureSize = 4'u32
 
   # Headers after PE signature
@@ -270,6 +283,7 @@ proc writePE*(code: var x86.Buffer; bssSize: int; entryOffset: uint32;
     inc numSections  # .bss or .data
   if hasExtProcs:
     inc numSections  # .idata for imports
+  inc numSections  # .reloc for ASLR support
 
   let sectionHeadersSize = uint32(numSections) * sizeof(IMAGE_SECTION_HEADER).uint32
 
@@ -427,10 +441,41 @@ proc writePE*(code: var x86.Buffer; bssSize: int; entryOffset: uint32;
       currentIltOffset += 8
       currentIatOffset += 8
 
+  # Build .reloc section (minimal, for ASLR support)
+  # Since we use RIP-relative addressing, we don't have absolute references to relocate
+  # But Windows requires a valid .reloc section when DYNAMIC_BASE is set
+  # Format: Base Relocation Block(s)
+  #   - VirtualAddress (4 bytes): Page RVA
+  #   - SizeOfBlock (4 bytes): Size including header
+  #   - TypeOffset entries (2 bytes each)
+  const relocBlockSize = 12'u32  # 8 byte header + 2 padding entries (4 bytes)
+  var relocBytes: array[12, byte]
+  # Block header for page 0x1000 (.text section)
+  relocBytes[0] = byte(textRva and 0xFF)
+  relocBytes[1] = byte((textRva shr 8) and 0xFF)
+  relocBytes[2] = byte((textRva shr 16) and 0xFF)
+  relocBytes[3] = byte((textRva shr 24) and 0xFF)
+  # SizeOfBlock = 12
+  relocBytes[4] = byte(relocBlockSize and 0xFF)
+  relocBytes[5] = byte((relocBlockSize shr 8) and 0xFF)
+  relocBytes[6] = byte((relocBlockSize shr 16) and 0xFF)
+  relocBytes[7] = byte((relocBlockSize shr 24) and 0xFF)
+  # Two padding entries (type 0 = IMAGE_REL_BASED_ABSOLUTE, offset 0)
+  relocBytes[8] = 0
+  relocBytes[9] = 0
+  relocBytes[10] = 0
+  relocBytes[11] = 0
+
+  let relocSize = relocBlockSize
+  let relocRawSize = alignTo(relocSize, FILE_ALIGNMENT)
+
   # Calculate final image size
   var sizeOfImage = textRva + alignTo(textSize, SECTION_ALIGNMENT)
   if hasExtProcs:
     sizeOfImage = idataRva + alignTo(idataSize, SECTION_ALIGNMENT)
+  # Add .reloc section to image size
+  let relocRva = sizeOfImage
+  sizeOfImage = relocRva + alignTo(relocSize, SECTION_ALIGNMENT)
   if bssSize > 0:
     sizeOfImage += alignTo(uint32(bssSize), SECTION_ALIGNMENT)
 
@@ -452,6 +497,10 @@ proc writePE*(code: var x86.Buffer; bssSize: int; entryOffset: uint32;
     optHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].VirtualAddress = iatRva
     optHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].Size = iatSize
 
+  # Set base relocation directory
+  optHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress = relocRva
+  optHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size = relocSize
+
   # Create section headers
   var textSection = initSectionHeader(
     ".text",
@@ -464,43 +513,58 @@ proc writePE*(code: var x86.Buffer; bssSize: int; entryOffset: uint32;
 
   var idataSection: IMAGE_SECTION_HEADER
   var idataFileOffset = 0'u32
+  var idataRawSize = 0'u32
   if hasExtProcs:
     idataFileOffset = textFileOffset + textRawSize
+    idataRawSize = alignTo(idataSize, FILE_ALIGNMENT)
     idataSection = initSectionHeader(
       ".idata",
       idataSize,
       idataRva,
-      alignTo(idataSize, FILE_ALIGNMENT),
+      idataRawSize,
       idataFileOffset,
       IMAGE_SCN_CNT_INITIALIZED_DATA or IMAGE_SCN_MEM_READ or IMAGE_SCN_MEM_WRITE
     )
 
+  # .reloc section (comes after .idata or .text)
+  var relocFileOffset = textFileOffset + textRawSize
+  if hasExtProcs:
+    relocFileOffset = idataFileOffset + idataRawSize
+  var relocSection = initSectionHeader(
+    ".reloc",
+    relocSize,
+    relocRva,
+    relocRawSize,
+    relocFileOffset,
+    IMAGE_SCN_CNT_INITIALIZED_DATA or IMAGE_SCN_MEM_READ or IMAGE_SCN_MEM_DISCARDABLE
+  )
+
   # Write file
   var f = newFileStream(outfile, fmWrite)
+  if f == nil:
+    raise newException(IOError, "Failed to create file: " & outfile)
 
-  # DOS Header
-  f.write(dosHeader)
+  # DOS Header (use writeData for explicit binary write)
+  f.writeData(unsafeAddr dosHeader, sizeof(dosHeader))
 
-  # Padding to PE signature
-  let paddingToPe = int(peSignatureOffset - dosHeaderSize)
-  if paddingToPe > 0:
-    var zeros = newSeq[byte](paddingToPe)
-    f.writeData(unsafeAddr zeros[0], paddingToPe)
+  # DOS Stub
+  f.writeData(unsafeAddr dosStub[0], dosStub.len)
 
   # PE Signature
   var peSignature = IMAGE_NT_SIGNATURE
-  f.write(peSignature)
+  f.writeData(unsafeAddr peSignature, sizeof(peSignature))
 
   # File Header
-  f.write(fileHeader)
+  f.writeData(unsafeAddr fileHeader, sizeof(fileHeader))
 
   # Optional Header
-  f.write(optHeader)
+  f.writeData(unsafeAddr optHeader, sizeof(optHeader))
 
   # Section Headers
-  f.write(textSection)
+  f.writeData(unsafeAddr textSection, sizeof(textSection))
   if hasExtProcs:
-    f.write(idataSection)
+    f.writeData(unsafeAddr idataSection, sizeof(idataSection))
+  f.writeData(unsafeAddr relocSection, sizeof(relocSection))
 
   # Padding to first section
   let currentPos = peSignatureOffset + peSignatureSize + fileHeaderSize + optHeaderSize + sectionHeadersSize
@@ -553,6 +617,19 @@ proc writePE*(code: var x86.Buffer; bssSize: int; entryOffset: uint32;
   # .idata section
   if hasExtProcs and idataBytes.len > 0:
     f.writeData(unsafeAddr idataBytes[0], idataBytes.len)
+    # Padding for .idata
+    let idataPadding = int(idataRawSize) - idataBytes.len
+    if idataPadding > 0:
+      var zeros = newSeq[byte](idataPadding)
+      f.writeData(unsafeAddr zeros[0], idataPadding)
+
+  # .reloc section
+  f.writeData(unsafeAddr relocBytes[0], relocBytes.len)
+  # Padding for .reloc
+  let relocPadding = int(relocRawSize) - relocBytes.len
+  if relocPadding > 0:
+    var zeros = newSeq[byte](relocPadding)
+    f.writeData(unsafeAddr zeros[0], relocPadding)
 
   f.close()
 
