@@ -256,17 +256,19 @@ proc emitMovImmToReg32*(dest: var Bytes; reg: Register; imm: int32) =
 
 # Arithmetic instructions
 proc emitAdd*(dest: var Bytes; a, b: Register) =
-  ## Emit ADD instruction: ADD a, b
+  ## Emit ADD instruction: ADD a, b (a = a + b)
+  ## Opcode 0x01: ADD r/m64, r64 - reg field is source, r/m field is destination
   var rex = RexPrefix(w: true)
 
-  if needsRex(a): rex.r = true
-  if needsRex(b): rex.b = true
+  # For 0x01: r/m is dest (a), reg is source (b)
+  if needsRex(b): rex.r = true  # source register extension
+  if needsRex(a): rex.b = true  # destination register extension
 
   if rex.r or rex.b or rex.w:
     dest.add(encodeRex(rex))
 
   dest.add(0x01)  # ADD r/m64, r64 opcode
-  dest.add(encodeModRM(amDirect, int(a), int(b)))
+  dest.add(encodeModRM(amDirect, int(b), int(a)))  # reg=source(b), rm=dest(a)
 
 proc emitAdd*(dest: var Bytes; reg: Register; mem: MemoryOperand) =
   ## Emit ADD instruction: ADD reg, mem
@@ -295,17 +297,19 @@ proc emitAdd*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
   dest.emitMem(int(reg), mem)
 
 proc emitSub*(dest: var Bytes; a, b: Register) =
-  ## Emit SUB instruction: SUB a, b
+  ## Emit SUB instruction: SUB a, b (a = a - b)
+  ## Opcode 0x29: SUB r/m64, r64 - reg field is source, r/m field is destination
   var rex = RexPrefix(w: true)
 
-  if needsRex(a): rex.r = true
-  if needsRex(b): rex.b = true
+  # For 0x29: r/m is dest (a), reg is source (b)
+  if needsRex(b): rex.r = true  # source register extension
+  if needsRex(a): rex.b = true  # destination register extension
 
   if rex.r or rex.b or rex.w:
     dest.add(encodeRex(rex))
 
   dest.add(0x29)  # SUB r/m64, r64 opcode
-  dest.add(encodeModRM(amDirect, int(a), int(b)))
+  dest.add(encodeModRM(amDirect, int(b), int(a)))  # reg=source(b), rm=dest(a)
 
 proc emitSub*(dest: var Bytes; reg: Register; mem: MemoryOperand) =
   ## Emit SUB instruction: SUB reg, mem
@@ -334,18 +338,20 @@ proc emitSub*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
   dest.emitMem(int(reg), mem)
 
 proc emitImul*(dest: var Bytes; a, b: Register) =
-  ## Emit IMUL instruction: IMUL a, b (signed multiply)
+  ## Emit IMUL instruction: IMUL a, b (a = a * b, signed multiply)
+  ## Opcode 0x0F 0xAF: IMUL r64, r/m64 - reg field is destination, r/m field is source
   var rex = RexPrefix(w: true)
 
-  if needsRex(a): rex.r = true
-  if needsRex(b): rex.b = true
+  # For IMUL r64, r/m64: reg is dest (a), r/m is source (b)
+  if needsRex(a): rex.r = true  # destination register extension
+  if needsRex(b): rex.b = true  # source register extension
 
   if rex.r or rex.b or rex.w:
     dest.add(encodeRex(rex))
 
   dest.add(0x0F)  # Two-byte opcode prefix
-  dest.add(0xAF)  # IMUL r/m64, r64 opcode
-  dest.add(encodeModRM(amDirect, int(a), int(b)))
+  dest.add(0xAF)  # IMUL r64, r/m64 opcode
+  dest.add(encodeModRM(amDirect, int(a), int(b)))  # reg=dest(a), rm=source(b)
 
 proc emitImulImm*(dest: var Bytes; reg: Register; imm: int32) =
   ## Emit IMUL instruction: IMUL reg, reg, imm32
@@ -461,17 +467,19 @@ proc emitNeg*(dest: var Bytes; mem: MemoryOperand) =
   dest.emitMem(3, mem)
 
 proc emitCmp*(dest: var Bytes; a, b: Register) =
-  ## Emit CMP instruction: CMP a, b (compare)
+  ## Emit CMP instruction: CMP a, b (compare a with b, i.e., compute a - b and set flags)
+  ## Opcode 0x39: CMP r/m64, r64 - reg field is source, r/m field is destination
   var rex = RexPrefix(w: true)
 
-  if needsRex(a): rex.r = true
-  if needsRex(b): rex.b = true
+  # For 0x39: r/m is first operand (a), reg is second operand (b)
+  if needsRex(b): rex.r = true  # second operand register extension
+  if needsRex(a): rex.b = true  # first operand register extension
 
   if rex.r or rex.b or rex.w:
     dest.add(encodeRex(rex))
 
   dest.add(0x39)  # CMP r/m64, r64 opcode
-  dest.add(encodeModRM(amDirect, int(a), int(b)))
+  dest.add(encodeModRM(amDirect, int(b), int(a)))  # reg=b, rm=a
 
 proc emitCmp*(dest: var Bytes; reg: Register; mem: MemoryOperand) =
   ## Emit CMP instruction: CMP reg, mem
@@ -500,17 +508,20 @@ proc emitCmp*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
   dest.emitMem(int(reg), mem)
 
 proc emitTest*(dest: var Bytes; a, b: Register) =
-  ## Emit TEST instruction: TEST a, b (test)
+  ## Emit TEST instruction: TEST a, b (compute a AND b, set flags)
+  ## Opcode 0x85: TEST r/m64, r64 - reg field is source, r/m field is destination
+  ## Note: TEST is commutative, but we follow Intel convention
   var rex = RexPrefix(w: true)
 
-  if needsRex(a): rex.r = true
-  if needsRex(b): rex.b = true
+  # For 0x85: r/m is first operand (a), reg is second operand (b)
+  if needsRex(b): rex.r = true
+  if needsRex(a): rex.b = true
 
   if rex.r or rex.b or rex.w:
     dest.add(encodeRex(rex))
 
   dest.add(0x85)  # TEST r/m64, r64 opcode
-  dest.add(encodeModRM(amDirect, int(a), int(b)))
+  dest.add(encodeModRM(amDirect, int(b), int(a)))  # reg=b, rm=a
 
 # Arithmetic with immediate values
 proc emitAddImm*(dest: var Bytes; reg: Register; imm: int32) =
@@ -1228,16 +1239,19 @@ proc emitLock*(dest: var Bytes) =
 # Atomic exchange operations
 proc emitXchg*(dest: var Bytes; a, b: Register) =
   ## Emit XCHG instruction: XCHG a, b (exchange)
+  ## Opcode 0x87: XCHG r/m64, r64 - reg field is r64, r/m field is r/m64
+  ## Note: XCHG is commutative, but we follow Intel convention
   var rex = RexPrefix(w: true)
 
-  if needsRex(a): rex.r = true
-  if needsRex(b): rex.b = true
+  # For 0x87: r/m is first operand (a), reg is second operand (b)
+  if needsRex(b): rex.r = true
+  if needsRex(a): rex.b = true
 
   if rex.r or rex.b or rex.w:
     dest.add(encodeRex(rex))
 
   dest.add(0x87)  # XCHG r/m64, r64 opcode
-  dest.add(encodeModRM(amDirect, int(a), int(b)))
+  dest.add(encodeModRM(amDirect, int(b), int(a)))  # reg=b, rm=a
 
 proc emitXchg*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
   ## Emit XCHG instruction: XCHG mem, reg
@@ -1254,17 +1268,19 @@ proc emitXchg*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
 
 proc emitXadd*(dest: var Bytes; a, b: Register) =
   ## Emit XADD instruction: XADD a, b (exchange and add)
+  ## Opcode 0x0F 0xC1: XADD r/m64, r64 - reg field is source, r/m field is destination
   var rex = RexPrefix(w: true)
 
-  if needsRex(a): rex.r = true
-  if needsRex(b): rex.b = true
+  # For XADD: r/m is dest (a), reg is source (b)
+  if needsRex(b): rex.r = true  # source register extension
+  if needsRex(a): rex.b = true  # destination register extension
 
   if rex.r or rex.b or rex.w:
     dest.add(encodeRex(rex))
 
   dest.add(0x0F)  # Two-byte opcode prefix
   dest.add(0xC1)  # XADD r/m64, r64 opcode
-  dest.add(encodeModRM(amDirect, int(a), int(b)))
+  dest.add(encodeModRM(amDirect, int(b), int(a)))  # reg=source(b), rm=dest(a)
 
 proc emitXadd*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
   ## Emit XADD instruction: XADD mem, reg
@@ -1283,17 +1299,19 @@ proc emitXadd*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
 # Atomic compare and exchange
 proc emitCmpxchg*(dest: var Bytes; a, b: Register) =
   ## Emit CMPXCHG instruction: CMPXCHG a, b (compare and exchange)
+  ## Opcode 0x0F 0xB1: CMPXCHG r/m64, r64 - reg field is source, r/m field is destination
   var rex = RexPrefix(w: true)
 
-  if needsRex(a): rex.r = true
-  if needsRex(b): rex.b = true
+  # For CMPXCHG: r/m is dest (a), reg is source (b)
+  if needsRex(b): rex.r = true  # source register extension
+  if needsRex(a): rex.b = true  # destination register extension
 
   if rex.r or rex.b or rex.w:
     dest.add(encodeRex(rex))
 
   dest.add(0x0F)  # Two-byte opcode prefix
   dest.add(0xB1)  # CMPXCHG r/m64, r64 opcode
-  dest.add(encodeModRM(amDirect, int(a), int(b)))
+  dest.add(encodeModRM(amDirect, int(b), int(a)))  # reg=source(b), rm=dest(a)
 
 proc emitCmpxchg*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
   ## Emit CMPXCHG instruction: CMPXCHG mem, reg
@@ -1748,17 +1766,19 @@ proc emitJmpReg*(dest: var Bytes; reg: Register) =
 
 # Bit manipulation instructions
 proc emitAnd*(dest: var Bytes; a, b: Register) =
-  ## Emit AND instruction: AND a, b
+  ## Emit AND instruction: AND a, b (a = a AND b)
+  ## Opcode 0x21: AND r/m64, r64 - reg field is source, r/m field is destination
   var rex = RexPrefix(w: true)
 
-  if needsRex(a): rex.r = true
-  if needsRex(b): rex.b = true
+  # For 0x21: r/m is dest (a), reg is source (b)
+  if needsRex(b): rex.r = true  # source register extension
+  if needsRex(a): rex.b = true  # destination register extension
 
   if rex.r or rex.b or rex.w:
     dest.add(encodeRex(rex))
 
   dest.add(0x21)  # AND r/m64, r64 opcode
-  dest.add(encodeModRM(amDirect, int(a), int(b)))
+  dest.add(encodeModRM(amDirect, int(b), int(a)))  # reg=source(b), rm=dest(a)
 
 proc emitAnd*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
   ## Emit AND instruction: AND mem, reg
@@ -1771,17 +1791,19 @@ proc emitAnd*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
   dest.emitMem(int(reg), mem)
 
 proc emitOr*(dest: var Bytes; a, b: Register) =
-  ## Emit OR instruction: OR a, b
+  ## Emit OR instruction: OR a, b (a = a OR b)
+  ## Opcode 0x09: OR r/m64, r64 - reg field is source, r/m field is destination
   var rex = RexPrefix(w: true)
 
-  if needsRex(a): rex.r = true
-  if needsRex(b): rex.b = true
+  # For 0x09: r/m is dest (a), reg is source (b)
+  if needsRex(b): rex.r = true  # source register extension
+  if needsRex(a): rex.b = true  # destination register extension
 
   if rex.r or rex.b or rex.w:
     dest.add(encodeRex(rex))
 
   dest.add(0x09)  # OR r/m64, r64 opcode
-  dest.add(encodeModRM(amDirect, int(a), int(b)))
+  dest.add(encodeModRM(amDirect, int(b), int(a)))  # reg=source(b), rm=dest(a)
 
 proc emitOr*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
   ## Emit OR instruction: OR mem, reg
@@ -1794,17 +1816,19 @@ proc emitOr*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
   dest.emitMem(int(reg), mem)
 
 proc emitXor*(dest: var Bytes; a, b: Register) =
-  ## Emit XOR instruction: XOR a, b
+  ## Emit XOR instruction: XOR a, b (a = a XOR b)
+  ## Opcode 0x31: XOR r/m64, r64 - reg field is source, r/m field is destination
   var rex = RexPrefix(w: true)
 
-  if needsRex(a): rex.r = true
-  if needsRex(b): rex.b = true
+  # For 0x31: r/m is dest (a), reg is source (b)
+  if needsRex(b): rex.r = true  # source register extension
+  if needsRex(a): rex.b = true  # destination register extension
 
   if rex.r or rex.b or rex.w:
     dest.add(encodeRex(rex))
 
   dest.add(0x31)  # XOR r/m64, r64 opcode
-  dest.add(encodeModRM(amDirect, int(a), int(b)))
+  dest.add(encodeModRM(amDirect, int(b), int(a)))  # reg=source(b), rm=dest(a)
 
 proc emitXor*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
   ## Emit XOR instruction: XOR mem, reg
