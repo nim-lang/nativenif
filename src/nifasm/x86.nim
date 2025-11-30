@@ -1975,9 +1975,8 @@ proc updateRelocDisplacements*(buf: var Buffer) =
       buf.data[currentPos + 2] = byte((instr shr 16) and 0xFF)
       buf.data[currentPos + 3] = byte((instr shr 24) and 0xFF)
     of rkADR:
-      # ARM64 ADR: 21-bit signed immediate, offset in instructions
-      let offsetInInstructions = distance div 4
-      let imm21 = uint32(int32(offsetInInstructions) and 0x1FFFFF)
+      # ARM64 ADR: 21-bit signed immediate, byte offset from PC
+      let imm21 = uint32(int32(distance) and 0x1FFFFF)
       let baseInstr = uint32(buf.data[currentPos]) or
                       (uint32(buf.data[currentPos + 1]) shl 8) or
                       (uint32(buf.data[currentPos + 2]) shl 16) or

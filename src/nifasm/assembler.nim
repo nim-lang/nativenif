@@ -1,5 +1,5 @@
 
-import std / [tables, streams, os]
+import std / [tables, streams, os, osproc]
 import "../../../nimony/src/lib" / [nifreader, nifstreams, nifcursors, bitabs, lineinfos, symparser]
 import tags, model, tagconv
 import buffers, x86, arm64, elf, macho
@@ -904,7 +904,8 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
       inc n
     elif sym != nil and sym.kind == skRodata:
       if sym.offset == -1:
-        # Forward reference - create label now
+        # Forward reference - create label now but don't define it yet
+        # It will be defined when the rodata is actually written
         let labId = ctx.buf.createLabel()
         sym.offset = int(labId)
         result.label = labId
@@ -3230,16 +3231,16 @@ proc pass2(n: Cursor; ctx: var GenContext) =
           inc n
           let name = getSym(n)
           let sym = ctx.scope.lookup(name)
+          inc n
+          let s = getStr(n)
+          # Define label at the current position (where rodata will be written)
           if sym.offset == -1:
             # Forward reference - create label now
             let labId = ctx.buf.createLabel()
             sym.offset = int(labId)
-            ctx.buf.defineLabel(labId)
-          else:
-            # Reuse existing label (forward reference was already handled)
-            ctx.buf.defineLabel(LabelId(sym.offset))
-          inc n
-          let s = getStr(n)
+          # Define label at current position (before writing rodata)
+          ctx.buf.defineLabel(LabelId(sym.offset))
+          # Now write the rodata string
           for c in s: ctx.buf.data.add byte(c)
           inc n
           inc n
@@ -3383,6 +3384,12 @@ proc writeMachO(a: var GenContext; outfile: string) =
       (CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL)
 
   macho.writeMachO(code, a.bssOffset, entryAddr, cputype, cpusubtype, outfile)
+
+  # macOS arm64 requires code signing for all executables
+  when defined(macosx):
+    let codesignResult = execCmd("codesign -s - " & quoteShell(outfile))
+    if codesignResult != 0:
+      raise newException(OSError, "codesign failed with exit code " & $codesignResult)
 
 proc createLiterals(data: openArray[(string, int)]): Literals =
   result = default(Literals)
