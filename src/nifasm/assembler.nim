@@ -1939,8 +1939,15 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
       result.typ = Type(kind: UIntT, bits: 64)
       inc n
     elif sym != nil and sym.kind == skRodata:
+      if sym.offset == -1:
+        # Forward reference - create label now but don't define it yet
+        # It will be defined when the rodata is actually written
+        let labId = ctx.buf.createLabel()
+        sym.offset = int(labId)
+        result.label = labId
+      else:
+        result.label = LabelId(sym.offset)
       result.reg = RAX
-      result.label = LabelId(sym.offset)
       result.typ = Type(kind: UIntT, bits: 64) # Address of rodata
       inc n
     elif sym != nil and sym.kind == skGvar:
@@ -1948,8 +1955,14 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
       # For foreign symbols, we can't generate code, but we can typecheck
       if sym.isForeign:
         error("Cannot access foreign global variable '" & name & "' directly (must be linked)", n)
+      if sym.offset == -1:
+        # Forward reference - create label now
+        let labId = ctx.buf.createLabel()
+        sym.offset = int(labId)
+        result.label = labId
+      else:
+        result.label = LabelId(sym.offset)
       result.reg = RAX
-      result.label = LabelId(sym.offset)
       result.typ = Type(kind: UIntT, bits: 64) # Address of gvar
       inc n
     elif sym != nil and sym.kind == skTvar:
