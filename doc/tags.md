@@ -127,6 +127,7 @@
 | `(jb L)`               | X64Inst                  | jump if below |
 | `(jbe L)`              | X64Inst                  | jump if below or equal |
 | `(call T ...)`         | X64Inst                  | function call |
+| `(iat S)`              | X64Inst                  | indirect call through IAT (Import Address Table) |
 | `(ret)`                | X64Inst, A64Inst         | return instruction |
 | `(push O)`             | X64Inst                  | push to stack |
 | `(pop O)`              | X64Inst                  | pop from stack |
