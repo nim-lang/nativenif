@@ -2,6 +2,9 @@
 
 import std / [streams]
 
+when not defined(windows):
+  import std / os
+
 import buffers, x86
 
 type
