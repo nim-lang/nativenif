@@ -3585,7 +3585,7 @@ proc assemble*(filename, outfile: string) =
   of Arch.A64:
     writeMachO(ctx, outfile)
   of Arch.WinX64, Arch.WinA64:
-    writeExe(ctx, outfile)
+    writeExe(ctx, outfile.changeFileExt("exe"))
 
   # Close all module streams
   for module in ctx.modules.mvalues:
