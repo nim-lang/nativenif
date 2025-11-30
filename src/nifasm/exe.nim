@@ -2,7 +2,7 @@
 
 import std / [streams, os]
 
-import buffers
+import buffers, x86
 
 type
   # Import info for dynamic linking (same as macho.nim)
@@ -246,7 +246,7 @@ proc initSectionHeader*(
 proc alignTo(value, alignment: uint32): uint32 =
   (value + alignment - 1) and not (alignment - 1)
 
-proc writePE*(code: Bytes; bssSize: int; entryOffset: uint32;
+proc writePE*(code: var x86.Buffer; bssSize: int; entryOffset: uint32;
               machine: uint16; outfile: string;
               dynlink: DynLinkInfo = DynLinkInfo()) =
   ## Write a PE executable file
@@ -281,7 +281,7 @@ proc writePE*(code: Bytes; bssSize: int; entryOffset: uint32;
 
   # .text section
   let textRva = SECTION_ALIGNMENT
-  let textSize = uint32(code.len)
+  let textSize = uint32(code.data.len)
   let textRawSize = alignTo(textSize, FILE_ALIGNMENT)
   let textFileOffset = headersSize
 
@@ -509,10 +509,43 @@ proc writePE*(code: Bytes; bssSize: int; entryOffset: uint32;
     var zeros = newSeq[byte](paddingToText)
     f.writeData(unsafeAddr zeros[0], paddingToText)
 
+  # Patch IAT call relocations to point to IAT entries
+  if hasExtProcs:
+    # Create a mapping from IAT slot index to IAT entry RVA
+    var slotToRva: seq[uint32] = @[]
+    var iatSlotIndex = 0
+    for lib in dynlink.libs:
+      for ext in dynlink.extProcs:
+        if ext.libOrdinal == lib.ordinal:
+          let iatEntryRva = iatRva + uint32(iatSlotIndex * 8)
+          # Ensure slotToRva is large enough
+          while slotToRva.len <= ext.gotSlot:
+            slotToRva.add(0'u32)
+          slotToRva[ext.gotSlot] = iatEntryRva
+          inc iatSlotIndex
+      # Account for null terminator after each library's IAT entries
+      inc iatSlotIndex
+
+    # Patch IAT call relocations
+    for reloc in code.relocs:
+      if reloc.kind == rkIatCall:
+        let iatSlot = int(reloc.target)
+        if iatSlot < slotToRva.len:
+          let iatEntryRva = slotToRva[iatSlot]
+          # For RIP-relative addressing: disp = (IAT_RVA) - (call_inst_end_RVA)
+          let callInstEndRva = textRva + uint32(reloc.position + 6)
+          let disp32 = int32(iatEntryRva) - int32(callInstEndRva)
+
+          # Patch the displacement directly in the code buffer
+          code.data[reloc.position + 2] = byte(disp32 and 0xFF)
+          code.data[reloc.position + 3] = byte((disp32 shr 8) and 0xFF)
+          code.data[reloc.position + 4] = byte((disp32 shr 16) and 0xFF)
+          code.data[reloc.position + 5] = byte((disp32 shr 24) and 0xFF)
+
   # .text section
-  if code.len > 0:
-    f.writeData(code.rawData, code.len)
-    let textPadding = int(textRawSize) - code.len
+  if code.data.len > 0:
+    f.writeData(code.data.rawData, code.data.len)
+    let textPadding = int(textRawSize) - code.data.len
     if textPadding > 0:
       var zeros = newSeq[byte](textPadding)
       f.writeData(unsafeAddr zeros[0], textPadding)
