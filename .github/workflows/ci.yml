@@ -173,6 +173,12 @@ jobs:
           version: ${{ matrix.target.nim_branch }}
           architecture: ${{ matrix.target.cpu }}
 
+      - name: Checkout Nimony
+        uses: actions/checkout@v6
+        with:
+          path: nimony
+          repository: nim-lang/nimony
+
       - name: Run tester
         run: |
           cd nifasm
