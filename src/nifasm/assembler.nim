@@ -3092,7 +3092,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     skipParRi n, "pop"
 
   of SyscallX64:
+    inc n
     x86.emitSyscall(ctx.buf.data)
+    skipParRi n, "syscall"
   of LeaX64:
     inc n
     let dest = parseRegister(n) # LEA dest must be register
