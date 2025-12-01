@@ -3,7 +3,7 @@
 
 import std/[strutils, tables]
 
-import buffers, x86
+import buffers, relocs
 
 type
   # ARM64 64-bit general purpose registers

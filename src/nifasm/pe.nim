@@ -5,7 +5,7 @@ import std / [streams]
 when not defined(windows):
   import std / os
 
-import buffers, x86
+import buffers, relocs
 
 type
   # Import info for dynamic linking (same as macho.nim)
@@ -250,7 +250,7 @@ proc initSectionHeader*(
 proc alignTo(value, alignment: uint32): uint32 =
   (value + alignment - 1) and not (alignment - 1)
 
-proc writePE*(code: var x86.Buffer; bssSize: int; entryOffset: uint32;
+proc writePE*(code: var Buffer; bssSize: int; entryOffset: uint32;
               machine: uint16; outfile: string;
               dynlink: DynLinkInfo = DynLinkInfo()) =
   ## Write a PE executable file

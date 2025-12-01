@@ -2,7 +2,7 @@
 import std / [tables, streams, os, osproc]
 import "../../../nimony/src/lib" / [nifreader, nifstreams, nifcursors, bitabs, lineinfos, symparser]
 import instructions, model, tagconv
-import buffers, x86, arm64, elf, macho, pe
+import buffers, relocs, x86, arm64, elf, macho, pe
 import sem, slots
 
 proc tag(n: Cursor): TagEnum = cast[TagEnum](n.tagId)
@@ -145,8 +145,8 @@ type
 
   GenContext = object
     scope: Scope
-    buf: x86.Buffer  # Code buffer (.text section) for x64
-    bssBuf: x86.Buffer  # BSS buffer (.bss section) for zero-initialized global variables
+    buf: relocs.Buffer  # Code buffer (.text section) for x64
+    bssBuf: relocs.Buffer  # BSS buffer (.bss section) for zero-initialized global variables
     arch: Arch
     procName: string
     inCall: bool
@@ -171,7 +171,7 @@ type
     isMem: bool
     mem: x86.MemoryOperand
     isSsize: bool
-    label: x86.LabelId
+    label: LabelId
 
 proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type
 proc parseParams(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param]
@@ -1266,7 +1266,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
         sym.offset = int(labId)
         ctx.buf.defineLabel(labId)
       else:
-        ctx.buf.defineLabel(x86.LabelId(sym.offset))
+        ctx.buf.defineLabel(LabelId(sym.offset))
     else:
       error("Symbol is not a label", n)
     inc n
@@ -3635,8 +3635,8 @@ proc pass2(n: Cursor; ctx: var GenContext) =
     error("Expected stmts", n)
 
 proc writeElf(a: var GenContext; outfile: string) =
-  x86.finalize(a.buf)
-  x86.finalize(a.bssBuf)
+  finalize(a.buf)
+  finalize(a.bssBuf)
   let code = a.buf.data
   let baseAddr = 0x400000.uint64
   let headersSize = 64 + (56 * 2)  # ELF header + 2 program headers
@@ -3692,8 +3692,8 @@ proc writeElf(a: var GenContext; outfile: string) =
   setFilePermissions(outfile, perms)
 
 proc writeMachO(a: var GenContext; outfile: string) =
-  x86.finalize(a.buf)
-  x86.finalize(a.bssBuf)
+  finalize(a.buf)
+  finalize(a.bssBuf)
   let code = a.buf.data
   let baseAddr = 0x100000000.uint64  # macOS default base address
   let pageSize = 0x1000.uint64
@@ -3735,8 +3735,8 @@ proc writeMachO(a: var GenContext; outfile: string) =
       raise newException(OSError, "codesign failed with exit code " & $codesignResult)
 
 proc writeExe(a: var GenContext; outfile: string) =
-  x86.finalize(a.buf)
-  x86.finalize(a.bssBuf)
+  finalize(a.buf)
+  finalize(a.bssBuf)
 
   # Determine machine type based on architecture
   let machine =
@@ -3779,8 +3779,8 @@ proc assemble*(filename, outfile: string) =
   # Create a minimal ctx for pass1 (for foreign module loading)
   var ctx = GenContext(
     scope: scope,
-    buf: x86.initBuffer(),
-    bssBuf: x86.initBuffer(),
+    buf: initBuffer(),
+    bssBuf: initBuffer(),
     tlsOffset: 0,
     bssOffset: 0,
     modules: initTable[string, LoadedModule](),
@@ -3794,8 +3794,8 @@ proc assemble*(filename, outfile: string) =
   pass1(n1, scope, ctx)
 
   # Update ctx with proper buffers for pass2
-  ctx.buf = x86.initBuffer()
-  ctx.bssBuf = x86.initBuffer()
+  ctx.buf = initBuffer()
+  ctx.bssBuf = initBuffer()
   pass2(n, ctx)
 
   case ctx.arch
