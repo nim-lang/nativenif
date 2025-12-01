@@ -153,6 +153,7 @@ type
     AsrA64 = (ord(AsrTagId), "asr")  ## arithmetic shift right
     NegA64 = (ord(NegTagId), "neg")  ## negate
     CmpA64 = (ord(CmpTagId), "cmp")  ## compare
+    CallA64 = (ord(CallTagId), "call")  ## function call
     RetA64 = (ord(RetTagId), "ret")  ## return instruction
     NopA64 = (ord(NopTagId), "nop")  ## no operation
     SvcA64 = (ord(SvcTagId), "svc")  ## supervisor call (system call)
@@ -165,10 +166,15 @@ type
     BlA64 = (ord(BlTagId), "bl")  ## branch with link (function call)
     BeqA64 = (ord(BeqTagId), "beq")  ## branch if equal
     BneA64 = (ord(BneTagId), "bne")  ## branch if not equal
+    LabA64 = (ord(LabTagId), "lab")  ## label definition
+    IteA64 = (ord(IteTagId), "ite")  ## if-then-else structure
+    LoopA64 = (ord(LoopTagId), "loop")  ## loop structure
+    StmtsA64 = (ord(StmtsTagId), "stmts")  ## statement block
+    JtrueA64 = (ord(JtrueTagId), "jtrue")  ## set control flow variable(s) to true
     KillA64 = (ord(KillTagId), "kill")  ## kill variable
 
 proc rawTagIsA64Inst*(raw: TagEnum): bool {.inline.} =
-  raw in {MovTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, RetTagId, NopTagId, SvcTagId, AdrTagId, LdrTagId, StrTagId, StpTagId, LdpTagId, BTagId, BlTagId, BeqTagId, BneTagId, KillTagId}
+  raw in {MovTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, RetTagId, NopTagId, SvcTagId, AdrTagId, LdrTagId, StrTagId, StpTagId, LdpTagId, BTagId, BlTagId, BeqTagId, BneTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId}
 
 type
   NifasmType* = enum
