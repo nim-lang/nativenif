@@ -126,7 +126,7 @@
 | `(jle L)`              | X64Inst                  | jump if less or equal |
 | `(jb L)`               | X64Inst                  | jump if below |
 | `(jbe L)`              | X64Inst                  | jump if below or equal |
-| `(call T ...)`         | X64Inst                  | function call |
+| `(call T ...)`         | X64Inst, A64Inst         | function call |
 | `(iat S)`              | X64Inst                  | indirect call through IAT (Import Address Table) |
 | `(ret)`                | X64Inst, A64Inst         | return instruction |
 | `(push O)`             | X64Inst                  | push to stack |
@@ -143,12 +143,12 @@
 | `(bl L)`               | A64Inst                  | branch with link (function call) |
 | `(beq L)`              | A64Inst                  | branch if equal |
 | `(bne L)`              | A64Inst                  | branch if not equal |
-| `(lab L)`              | X64Inst                  | label definition |
-| `(ite ...)`            | X64Inst                  | if-then-else structure |
-| `(loop ...)`           | X64Inst                  | loop structure |
-| `(stmts ...)`          | X64Inst                  | statement block |
+| `(lab L)`              | X64Inst, A64Inst         | label definition |
+| `(ite ...)`            | X64Inst, A64Inst         | if-then-else structure |
+| `(loop ...)`           | X64Inst, A64Inst         | loop structure |
+| `(stmts ...)`          | X64Inst, A64Inst         | statement block |
 | `(cfvar D)`            | NifasmDecl                  | control flow variable declaration |
-| `(jtrue ...)`          | X64Inst                  | set control flow variable(s) to true |
+| `(jtrue ...)`          | X64Inst, A64Inst            | set control flow variable(s) to true |
 | `(dot B F)`            | NifasmExpr                  | field access |
 | `(at B I)`             | NifasmExpr                  | array index |
 | `(mem ...)`            | NifasmExpr                  | memory reference |

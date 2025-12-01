@@ -38,3 +38,10 @@ proc tagToA64Reg*(t: TagEnum): A64Reg {.inline.} =
   else:
     NoReg
 
+proc tagToNifasmDecl*(t: TagEnum): NifasmDecl {.inline.} =
+  ## Convert TagEnum to NifasmDecl. Returns NoDecl if not a valid NifasmDecl.
+  if rawTagIsNifasmDecl(t):
+    cast[NifasmDecl](t)
+  else:
+    NoDecl
+
