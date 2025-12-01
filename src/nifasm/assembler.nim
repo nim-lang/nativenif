@@ -2,7 +2,7 @@
 import std / [tables, streams, os, osproc]
 import "../../../nimony/src/lib" / [nifreader, nifstreams, nifcursors, bitabs, lineinfos, symparser]
 import instructions, model, tagconv
-import buffers, x86, arm64, elf, macho, exe
+import buffers, x86, arm64, elf, macho, pe
 import sem, slots
 
 proc tag(n: Cursor): TagEnum = cast[TagEnum](n.tagId)
@@ -3533,25 +3533,26 @@ proc writeExe(a: var GenContext; outfile: string) =
   x86.finalize(a.bssBuf)
 
   # Determine machine type based on architecture
-  let machine = case a.arch
+  let machine =
+    case a.arch
     of Arch.WinX64:
-      exe.IMAGE_FILE_MACHINE_AMD64
+      pe.IMAGE_FILE_MACHINE_AMD64
     of Arch.WinA64:
-      exe.IMAGE_FILE_MACHINE_ARM64
+      pe.IMAGE_FILE_MACHINE_ARM64
     else:
-      exe.IMAGE_FILE_MACHINE_AMD64
+      pe.IMAGE_FILE_MACHINE_AMD64
 
   # Build dynlink info for external procs
-  var dynlink: exe.DynLinkInfo
+  var dynlink: pe.DynLinkInfo
   for lib in a.imports:
-    dynlink.libs.add exe.ImportedLibInfo(name: lib.name, ordinal: lib.ordinal)
+    dynlink.libs.add pe.ImportedLibInfo(name: lib.name, ordinal: lib.ordinal)
   for ext in a.extProcs:
-    dynlink.extProcs.add exe.ExternalProcInfo(
+    dynlink.extProcs.add pe.ExternalProcInfo(
       name: ext.name, extName: ext.extName,
       libOrdinal: ext.libOrdinal, gotSlot: ext.gotSlot,
       callSites: ext.callSites)
 
-  exe.writePE(a.buf, a.bssOffset, 0'u32, machine, outfile, dynlink)
+  writePE(a.buf, a.bssOffset, 0'u32, machine, outfile, dynlink)
 
 proc createLiterals(data: openArray[(string, int)]): Literals =
   result = default(Literals)
