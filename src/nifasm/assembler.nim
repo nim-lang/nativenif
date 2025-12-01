@@ -1,7 +1,7 @@
 
 import std / [tables, streams, os, osproc]
 import "../../../nimony/src/lib" / [nifreader, nifstreams, nifcursors, bitabs, lineinfos, symparser]
-import tags, model, tagconv
+import instructions, model, tagconv
 import buffers, x86, arm64, elf, macho, exe
 import sem, slots
 

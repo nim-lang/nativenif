@@ -1,6 +1,6 @@
 
 import std / [tables]
-import tags, x86
+import instructions, x86
 
 type
   TypeKind* = enum
