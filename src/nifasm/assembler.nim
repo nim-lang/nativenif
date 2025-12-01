@@ -245,8 +245,9 @@ proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cu
     while n.kind != ParRi:
       if n.kind == ParLe:
         let start = n
-        case n.tag
-        of TypeTagId:
+        let declTag = tagToNifasmDecl(n.tag)
+        case declTag
+        of TypeD:
           inc n
           if n.kind != SymbolDef:
             skip n
@@ -266,7 +267,7 @@ proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cu
             scope.define(sym)
           if n.kind != ParRi: skip n
           inc n
-        of ProcTagId:
+        of ProcD:
           # Parse proc signature only (skip body)
           inc n
           if n.kind != SymbolDef:
@@ -280,17 +281,23 @@ proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cu
           var sig = Signature(params: @[], result: @[], clobbers: {})
 
           # Parse params
-          if n.kind == ParLe and n.tag == ParamsTagId:
-            sig.params = parseParams(n, scope, ctx)
+          if n.kind == ParLe:
+            let paramsDecl = tagToNifasmDecl(n.tag)
+            if paramsDecl == ParamsD:
+              sig.params = parseParams(n, scope, ctx)
 
           # Parse result
-          if n.kind == ParLe and n.tag == ResultTagId:
-            var r = parseResult(n, scope, ctx)
-            sig.result = r
+          if n.kind == ParLe:
+            let resultDecl = tagToNifasmDecl(n.tag)
+            if resultDecl == ResultD:
+              var r = parseResult(n, scope, ctx)
+              sig.result = r
 
           # Parse clobber
-          if n.kind == ParLe and n.tag == ClobberTagId:
-            sig.clobbers = parseClobbers(n)
+          if n.kind == ParLe:
+            let clobberDecl = tagToNifasmDecl(n.tag)
+            if clobberDecl == ClobberD:
+              sig.clobbers = parseClobbers(n)
 
           let sym = Symbol(name: basename, kind: skProc, sig: sig, isForeign: true)
           scope.define(sym)
@@ -298,7 +305,7 @@ proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cu
           # Skip body
           n = start
           skip n
-        of GvarTagId:
+        of GvarD:
           inc n
           if n.kind != SymbolDef:
             skip n
@@ -312,7 +319,7 @@ proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cu
           scope.define(sym)
           n = start
           skip n
-        of TvarTagId:
+        of TvarD:
           inc n
           if n.kind != SymbolDef:
             skip n
@@ -429,7 +436,7 @@ proc parseParams(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
   # (params (param :name (reg) Type) ...)
   inc n # params
   while n.kind != ParRi:
-    if n.kind == ParLe and n.tag == ParamTagId:
+    if n.kind == ParLe and tagToNifasmDecl(n.tag) == ParamD:
       inc n # param
       if n.kind != SymbolDef: error("Expected param name", n)
       let name = getSym(n)
@@ -469,7 +476,7 @@ proc parseParams(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
 
 proc parseResult(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
   # (result (ret :name (reg) Type) ...)
-  if n.kind == ParLe and n.tag == ResultTagId:
+  if n.kind == ParLe and tagToNifasmDecl(n.tag) == ResultD:
     inc n
     # if it's a block of results or a single declaration?
     # "result value declaration".
@@ -502,7 +509,7 @@ proc parseResult(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
 
 proc parseClobbers(n: var Cursor): set[x86.Register] =
   # (clobber (rax) (rbx) ...)
-  if n.kind == ParLe and n.tag == ClobberTagId:
+  if n.kind == ParLe and tagToNifasmDecl(n.tag) == ClobberD:
     inc n
     while n.kind != ParRi:
       if n.kind == ParLe and rawTagIsX64Reg(n.tag):
@@ -521,16 +528,15 @@ proc pass1Proc(n: var Cursor; scope: Scope; ctx: var GenContext) =
   var sig = Signature(params: @[], result: @[], clobbers: {})
 
   # Parse params
-  if n.kind == ParLe and n.tag == ParamsTagId:
+  if n.kind == ParLe and tagToNifasmDecl(n.tag) == ParamsD:
     sig.params = parseParams(n, scope, ctx)
 
   # Parse result
-  if n.kind == ParLe and n.tag == ResultTagId:
-    var r = parseResult(n, scope, ctx)
-    sig.result = r
+  if n.kind == ParLe and tagToNifasmDecl(n.tag) == ResultD:
+    sig.result = parseResult(n, scope, ctx)
 
   # Parse clobber
-  if n.kind == ParLe and n.tag == ClobberTagId:
+  if n.kind == ParLe and tagToNifasmDecl(n.tag) == ClobberD:
     sig.clobbers = parseClobbers(n)
 
   let sym = Symbol(name: name, kind: skProc, sig: sig)
@@ -564,8 +570,9 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext) =
     while n.kind != ParRi:
       if n.kind == ParLe:
         let start = n
-        case n.tag
-        of TypeTagId:
+        let declTag = tagToNifasmDecl(n.tag)
+        case declTag
+        of TypeD:
           inc n
           if n.kind != SymbolDef: error("Expected type name", n)
           let name = getSym(n)
@@ -580,13 +587,13 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext) =
             let typ = parseType(n, scope, ctx)
             scope.define(Symbol(name: name, kind: skType, typ: typ))
           skipParRi n
-        of ProcTagId:
+        of ProcD:
           # (proc :Name (params ...) (result ...) (clobber ...) (body ...))
           pass1Proc(n, scope, ctx)
 
           n = start
           skip n
-        of RodataTagId:
+        of RodataD:
           inc n
           if n.kind != SymbolDef: error("Expected rodata name", n)
           let name = getSym(n)
@@ -595,7 +602,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext) =
           scope.define(sym)
           n = start
           skip n
-        of GvarTagId:
+        of GvarD:
           inc n
           if n.kind != SymbolDef: error("Expected gvar name", n)
           let name = getSym(n)
@@ -604,7 +611,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext) =
           scope.define(Symbol(name: name, kind: skGvar, typ: typ))
           n = start
           skip n
-        of TvarTagId:
+        of TvarD:
           inc n
           if n.kind != SymbolDef: error("Expected tvar name", n)
           let name = getSym(n)
@@ -613,9 +620,9 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext) =
           scope.define(Symbol(name: name, kind: skTvar, typ: typ))
           n = start
           skip n
-        of ArchTagId:
+        of ArchD:
           handleArch(n, ctx)
-        of ImpTagId:
+        of ImpD:
           # (imp "libpath")
           inc n
           if n.kind != StringLit: error("Expected library path string", n)
@@ -630,7 +637,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext) =
           if not found:
             ctx.imports.add ImportedLib(name: libPath, ordinal: ctx.imports.len + 1)
           skipParRi n
-        of ExtprocTagId:
+        of ExtprocD:
           # (extproc :name "external_name")
           inc n
           if n.kind != SymbolDef: error("Expected extproc name", n)
@@ -1176,7 +1183,8 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     return
 
-  if n.tag == CfvarTagId:
+  let declTag = tagToNifasmDecl(n.tag)
+  if declTag == CfvarD:
     inc n
     if n.kind != SymbolDef: error("Expected cfvar name", n)
     let name = getSym(n)
@@ -1188,7 +1196,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     return
 
-  if n.tag == VarTagId:
+  if declTag == VarD:
     inc n
     if n.kind != SymbolDef: error("Expected var name", n)
     let name = getSym(n)
@@ -2318,7 +2326,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     return
 
-  if n.tag == CfvarTagId:
+  let declTag = tagToNifasmDecl(n.tag)
+  if declTag == CfvarD:
     # (cfvar :name.0)
     inc n
     if n.kind != SymbolDef: error("Expected cfvar name", n)
@@ -2335,7 +2344,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     return
 
-  if n.tag == VarTagId:
+  if declTag == VarD:
     inc n
     if n.kind != SymbolDef: error("Expected var name", n)
     let name = getSym(n)
@@ -3323,8 +3332,9 @@ proc pass2(n: Cursor; ctx: var GenContext) =
     while n.kind != ParRi:
       if n.kind == ParLe:
         let start = n
-        case n.tag
-        of ProcTagId:
+        let declTag = tagToNifasmDecl(n.tag)
+        case declTag
+        of ProcD:
           # Skip foreign procs - they're not code-generated
           inc n
           if n.kind != SymbolDef:
@@ -3338,7 +3348,7 @@ proc pass2(n: Cursor; ctx: var GenContext) =
           else:
             n = start
             pass2Proc(n, ctx)
-        of RodataTagId:
+        of RodataD:
           inc n
           let name = getSym(n)
           let sym = ctx.scope.lookup(name)
@@ -3355,7 +3365,7 @@ proc pass2(n: Cursor; ctx: var GenContext) =
           for c in s: ctx.buf.data.add byte(c)
           inc n
           inc n
-        of GvarTagId:
+        of GvarD:
           # Global variable declaration - goes in .bss section (zero-initialized writable memory)
           inc n
           let name = getSym(n)
@@ -3386,7 +3396,7 @@ proc pass2(n: Cursor; ctx: var GenContext) =
           ctx.bssOffset += size
 
           inc n # )
-        of TvarTagId:
+        of TvarD:
           # Thread local variable declaration
           inc n
           let name = getSym(n)
@@ -3405,9 +3415,9 @@ proc pass2(n: Cursor; ctx: var GenContext) =
           ctx.tlsOffset += size
 
           inc n # )
-        of ArchTagId:
+        of ArchD:
           handleArch(n, ctx)
-        of ImpTagId, ExtprocTagId:
+        of ImpD, ExtprocD:
           # Already handled in pass1, skip
           skip n
         else:
