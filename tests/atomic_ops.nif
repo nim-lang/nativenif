@@ -1,0 +1,78 @@
+(.nif24)
+(stmts
+  (arch x64)
+  (proc :_start
+    (params)
+    (result)
+    (clobber (rax) (rbx) (rcx) (rdx) (rbp) (rsi) (rdi))
+    (stmts
+      (push (rbp))
+      (mov (rbp) (rsp))
+      (sub (rsp) +32)
+
+      (var :counter.0 (s) (i +64))
+      (var :shadow.0 (s) (i +64))
+
+      (mov (rdi) +0)
+
+      (mov (rax) +5)
+      (mov counter.0 (rax))
+
+      (mov (rdx) -3)
+      (xadd counter.0 (rdx))
+
+      (mov (rax) counter.0)
+      (mov (rbx) +2)
+      (cmp (rax) (rbx))
+      (mov (rcx) +0)
+      (mov (rsi) +1)
+      (cmovne (rcx) (rsi))
+      (or (rdi) (rcx))
+
+      (mov (rbx) +5)
+      (mov (rcx) +0)
+      (cmp (rdx) (rbx))
+      (mov (rax) +2)
+      (cmovne (rcx) (rax))
+      (or (rdi) (rcx))
+
+      (mov (rax) counter.0)
+      (mov (rbx) +7)
+      (cmpxchg counter.0 (rbx))
+
+      (mov shadow.0 (rax))
+
+      (mov (rcx) +0)
+      (mov (rbx) +4)
+      (mov (rax) counter.0)
+      (cmp (rax) +7)
+      (cmovne (rcx) (rbx))
+      (or (rdi) (rcx))
+      (mov (rcx) +0)
+      (mov (rbx) +8)
+      (mov (rax) shadow.0)
+      (cmp (rax) +2)
+      (cmovne (rcx) (rbx))
+      (or (rdi) (rcx))
+
+      (mov (rax) +8)
+      (mov (rbx) +11)
+      (cmpxchg counter.0 (rbx))
+
+      (mov (rcx) +0)
+      (mov (rbx) +16)
+      (cmovz (rcx) (rbx))
+      (or (rdi) (rcx))
+
+      (mov (rax) counter.0)
+      (mov (rcx) +0)
+      (mov (rbx) +7)
+      (cmp (rax) (rbx))
+      (cmovne (rcx) (rbx))
+      (or (rdi) (rcx))
+
+      (mov (rax) +60)
+      (syscall)
+    )
+  )
+)

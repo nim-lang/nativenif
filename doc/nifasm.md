@@ -114,6 +114,20 @@ For example:
 )
 ```
 
+Return values are declared in a proc's `(result ...)` section and must be bound at
+each call site as well. Use another `mov` inside the `call` block with the
+result name as the source and a register-backed destination (plain registers or
+register-allocated variables). Stack slots are rejected and every result must be
+bound exactly once. If the destination register differs from the callee's return
+register, `nifasm` inserts the move automatically:
+
+```
+(call foo.0
+  (mov arg.0 +56)
+  (mov ret.0 myResult)
+)
+```
+
 Within a `call` the named arguments are put into the scope and have to be used to make parameter passing explicit and checkable! It is checked that every argument is assigned a value and only once.
 
 

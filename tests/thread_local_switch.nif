@@ -1,0 +1,75 @@
+(.nif24)
+(stmts
+  (arch x64)
+  (tvar :tlsCounter.0 (i +64))
+  (tvar :tlsFlag.0 (i +64))
+  (gvar :tlsBlock.0 (array (i +64) +2))
+  (proc :_start
+    (params)
+    (result)
+    (clobber (rax) (rbx) (rcx) (rdx) (rsi) (rdi))
+    (stmts
+      (push (rbp))
+      (mov (rbp) (rsp))
+      (sub (rsp) +32)
+
+      (mov (rdx) +0)
+
+      (lea (rsi) tlsBlock.0)
+      (mov (rax) +158)
+      (mov (rdi) +4098)
+      (syscall)
+
+      (mov (rax) +5)
+      (mov tlsCounter.0 (rax))
+      (mov (rax) +1)
+      (mov tlsFlag.0 (rax))
+
+      (mov (rax) tlsCounter.0)
+      (add (rax) tlsFlag.0)
+      (mov (rcx) +0)
+      (mov (rbx) +1)
+      (cmp (rax) +6)
+      (cmovne (rcx) (rbx))
+      (or (rdx) (rcx))
+
+      (lea (rsi) (rsp))
+      (mov (rax) +158)
+      (mov (rdi) +4098)
+      (syscall)
+
+      (mov (rax) +10)
+      (mov tlsCounter.0 (rax))
+      (mov (rax) -3)
+      (mov tlsFlag.0 (rax))
+
+      (mov (rax) tlsCounter.0)
+      (add (rax) tlsFlag.0)
+      (mov (rcx) +0)
+      (mov (rbx) +2)
+      (cmp (rax) +7)
+      (cmovne (rcx) (rbx))
+      (or (rdx) (rcx))
+
+      (lea (rsi) tlsBlock.0)
+      (mov (rax) +158)
+      (mov (rdi) +4098)
+      (syscall)
+
+      (mov (rax) tlsCounter.0)
+      (add (rax) tlsFlag.0)
+      (mov (rcx) +0)
+      (mov (rbx) +4)
+      (cmp (rax) +6)
+      (cmovne (rcx) (rbx))
+      (or (rdx) (rcx))
+
+      (add (rsp) +32)
+      (pop (rbp))
+
+      (mov (rdi) (rdx))
+      (mov (rax) +60)
+      (syscall)
+    )
+  )
+)

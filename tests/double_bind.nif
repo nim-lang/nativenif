@@ -1,0 +1,16 @@
+(.nif24)
+(stmts
+  (proc :test_double_bind.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      (var :x.0 (rax) (i +64))
+
+      (var :y.0 (rax) (i +64))
+
+      (mov x.0 +60)
+      (syscall)
+    )
+  )
+)

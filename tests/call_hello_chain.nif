@@ -1,0 +1,55 @@
+(.nif24)
+(stmts
+  (proc :main.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      (var :status.0 (rcx) (i +64))
+
+      (call relay.0
+        (mov ret.0 status.0)
+      )
+
+      (mov (rax) +60)
+      (mov (rdi) status.0)
+      (syscall)
+    )
+  )
+
+  (proc :relay.0
+    (params)
+    (result
+      (:ret.0 (rbx) (i +64))
+    )
+    (clobber)
+    (stmts
+      (call printHello.0
+        (mov ret.0 (rbx))
+      )
+      (ret)
+    )
+  )
+
+  (proc :printHello.0
+    (params)
+    (result
+      (:ret.0 (rax) (i +64))
+    )
+    (clobber
+      (rdi) (rsi) (rdx)
+    )
+    (stmts
+      (mov (rax) +1)
+      (mov (rdi) +1)
+      (lea (rsi) msg.0)
+      (mov (rdx) +20)
+      (syscall)
+
+      (mov (rax) +0)
+      (ret)
+    )
+  )
+
+  (rodata :msg.0 "Hello through calls\0A")
+)

@@ -1,0 +1,27 @@
+(.nif24)
+(stmts
+  (proc :callee.0
+    (params)
+    (result
+      (:ret.0 (rax) (i +64))
+    )
+    (clobber)
+    (stmts
+      (mov (rax) +42)
+      (ret)
+    )
+  )
+  (proc :main.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      (var :tmp.0 (rbx) (i +64))
+      (call callee.0
+        (mov ret.0 tmp.0)
+      )
+      (mov (rax) tmp.0)
+      (ret)
+    )
+  )
+)

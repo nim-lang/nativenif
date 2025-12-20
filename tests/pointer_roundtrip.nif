@@ -1,0 +1,40 @@
+(.nif24)
+(stmts
+  (type :Pair (object
+    (fld :a (i +64))
+    (fld :b (i +64))
+  ))
+
+  (proc :main.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      (var :pair (s) Pair)
+
+      (mov (rbx) +77)
+      (mov (mem (dot pair :a)) (rbx))
+      (mov (rbx) +88)
+      (mov (mem (dot pair :b)) (rbx))
+
+      (lea (rax) pair)
+      (mov (rcx) (mem (dot (cast (ptr Pair) (rax)) :a)))
+      (mov (rdx) (mem (dot (cast (ptr Pair) (rax)) :b)))
+
+      (cmp (rcx) +77)
+      (jne fail)
+      (cmp (rdx) +88)
+      (jne fail)
+
+      (mov (rdi) +0)
+      (jmp exit)
+
+      (lab :fail)
+      (mov (rdi) +1)
+
+      (lab :exit)
+      (mov (rax) +60)
+      (syscall)
+    )
+  )
+)
