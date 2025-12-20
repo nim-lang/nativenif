@@ -1,0 +1,41 @@
+(.nif24)
+(stmts
+  (type :Point (object
+    (fld :x (i +64))
+    (fld :y (i +64))
+  ))
+
+  (proc :main.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      (var :p (s) Point)
+      (var :ptr.0 (rbx) (ptr Point))
+
+      (lea (rbx) p)
+      (mov (rcx) +41)
+      (mov (mem (dot ptr.0 :x)) (rcx))
+      (mov (rcx) +59)
+      (mov (mem (dot ptr.0 :y)) (rcx))
+
+      (mov (r8) (mem (dot p :x)))
+      (mov (r9) (mem (dot p :y)))
+
+      (cmp (r8) +41)
+      (jne fail)
+      (cmp (r9) +59)
+      (jne fail)
+
+      (mov (rdi) +0)
+      (jmp exit)
+
+      (lab :fail)
+      (mov (rdi) +1)
+
+      (lab :exit)
+      (mov (rax) +60)
+      (syscall)
+    )
+  )
+)

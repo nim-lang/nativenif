@@ -1,0 +1,19 @@
+(.nif24)
+(stmts
+  (proc :test_kill_reuse_types.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      (var :signed.0 (rax) (i +64))
+      (mov signed.0 +1)
+      (kill signed.0)
+      (var :unsigned.0 (rax) (u +64))
+      (mov unsigned.0 +2)
+      (kill unsigned.0)
+      (mov (rax) +60)
+      (mov (rdi) +0)
+      (syscall)
+    )
+  )
+)

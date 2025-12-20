@@ -1,0 +1,36 @@
+(.nif24)
+(stmts
+  (proc :main.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      (var :arr (s) (array (i +64) +3))
+      (var :arrptr.0 (rsi) (aptr (i +64)))
+
+      (mov (rbx) +1000)
+      (mov (mem (at arr +0)) (rbx))
+      (mov (rbx) +2000)
+      (mov (mem (at arr +1)) (rbx))
+      (mov (rbx) +3000)
+      (mov (mem (at arr +2)) (rbx))
+
+      (lea (rsi) arr)
+      (mov (rcx) +2)
+      (mov (r8) (mem (at arrptr.0 (rcx))))
+
+      (cmp (r8) +3000)
+      (jne fail)
+
+      (mov (rdi) +0)
+      (jmp exit)
+
+      (lab :fail)
+      (mov (rdi) +1)
+
+      (lab :exit)
+      (mov (rax) +60)
+      (syscall)
+    )
+  )
+)

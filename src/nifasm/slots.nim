@@ -13,7 +13,7 @@ proc initSlotManager*(): SlotManager =
   result.freeSlots = @[]
 
 proc alignedSize*(t: Type): int =
-  (sizeOf(t) + 7) and not 7
+  (asmSizeOf(t) + 7) and not 7
 
 proc allocSlot*(m: var SlotManager; t: Type): int =
   let size = alignedSize(t)

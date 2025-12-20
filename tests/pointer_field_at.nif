@@ -1,0 +1,52 @@
+(.nif24)
+(stmts
+  (type :Buffer (object
+    (fld :ptr (aptr (i +32)))
+    (fld :len (i +64))
+  ))
+
+  (proc :main.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      (var :arr (s) (array (i +32) +4))
+      (var :buf (s) Buffer)
+
+      (mov (rbx) +101)
+      (mov (mem (at arr +0)) (rbx))
+      (mov (rbx) +202)
+      (mov (mem (at arr +1)) (rbx))
+      (mov (rbx) +303)
+      (mov (mem (at arr +2)) (rbx))
+      (mov (rbx) +404)
+      (mov (mem (at arr +3)) (rbx))
+
+      (lea (rsi) arr)
+      (mov (mem (dot buf :ptr)) (rsi))
+      (mov (rbx) +4)
+      (mov (mem (dot buf :len)) (rbx))
+
+      (mov (rsi) +0)
+      (mov (rsi) (mem (dot buf :ptr)))
+      (mov (rcx) +3)
+      (mov (r8) (mem (at (cast (aptr (i +32)) (rsi)) (rcx))))
+      (mov (r9) (mem (dot buf :len)))
+
+      (cmp (r8) +404)
+      (jne fail)
+      (cmp (r9) +4)
+      (jne fail)
+
+      (mov (rdi) +0)
+      (jmp exit)
+
+      (lab :fail)
+      (mov (rdi) +1)
+
+      (lab :exit)
+      (mov (rax) +60)
+      (syscall)
+    )
+  )
+)
