@@ -1104,14 +1104,14 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
   else:
     error("Expected proc symbol, got " & $sym.kind, n)
 
-  # Build lookup tables
-  for param in callCtx.sig.params:
-    callCtx.paramLookup[param.name] = param
-  for res in callCtx.sig.result:
-    callCtx.resultLookup[res.name] = res
-
-  # Compute stack argument size
-  callCtx.stackArgSize = computeStackArgSize(callCtx.sig)
+  # Build lookup tables (only for internal procs with signatures)
+  if not callCtx.isExternal:
+    for param in callCtx.sig.params:
+      callCtx.paramLookup[param.name] = param
+    for res in callCtx.sig.result:
+      callCtx.resultLookup[res.name] = res
+    # Compute stack argument size
+    callCtx.stackArgSize = computeStackArgSize(callCtx.sig)
 
   # Push call context
   ctx.callStack.add callCtx
@@ -1121,15 +1121,22 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
   while n.kind != ParRi:
     genInstA64(n, ctx)
 
-  # Verify call was emitted
+  # Verify call was emitted and all bindings are done
   let currentCtx = ctx.callStack[^1]
   if not currentCtx.isExternal:
     for param in currentCtx.sig.params:
       if not param.onStack and param.name notin currentCtx.argsSet:
         error("Missing argument: " & param.name, n)
 
+    for res in currentCtx.sig.result:
+      if res.name notin currentCtx.resultsSet:
+        error("Missing result binding: " & res.name, n)
+
     if not currentCtx.callEmitted:
       error("Missing (call) or (extcall) in prepare block", n)
+  else:
+    if not currentCtx.callEmitted:
+      error("Missing (extcall) in prepare block", n)
 
   # Pop call context
   discard ctx.callStack.pop()
@@ -2396,14 +2403,14 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
   else:
     error("Expected proc symbol, got " & $sym.kind, n)
 
-  # Build lookup tables
-  for param in callCtx.sig.params:
-    callCtx.paramLookup[param.name] = param
-  for res in callCtx.sig.result:
-    callCtx.resultLookup[res.name] = res
-
-  # Compute stack argument size
-  callCtx.stackArgSize = computeStackArgSize(callCtx.sig)
+  # Build lookup tables (only for internal procs with signatures)
+  if not callCtx.isExternal:
+    for param in callCtx.sig.params:
+      callCtx.paramLookup[param.name] = param
+    for res in callCtx.sig.result:
+      callCtx.resultLookup[res.name] = res
+    # Compute stack argument size
+    callCtx.stackArgSize = computeStackArgSize(callCtx.sig)
 
   # Push call context
   ctx.callStack.add callCtx
@@ -2413,16 +2420,23 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
   while n.kind != ParRi:
     genInstX64(n, ctx)
 
-  # Verify all register arguments were set (stack args are tracked separately)
+  # Verify all bindings are done
   let currentCtx = ctx.callStack[^1]
   if not currentCtx.isExternal:
     for param in currentCtx.sig.params:
       if not param.onStack and param.name notin currentCtx.argsSet:
         error("Missing argument: " & param.name, n)
 
+    for res in currentCtx.sig.result:
+      if res.name notin currentCtx.resultsSet:
+        error("Missing result binding: " & res.name, n)
+
     # Verify call was emitted
     if not currentCtx.callEmitted:
       error("Missing (call) or (extcall) in prepare block", n)
+  else:
+    if not currentCtx.callEmitted:
+      error("Missing (extcall) in prepare block", n)
 
   # Pop call context
   discard ctx.callStack.pop()
