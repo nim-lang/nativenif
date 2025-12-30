@@ -180,16 +180,21 @@ type
     extProcs: seq[ExtProcInfo]  # External procs to bind
     gotSlotCount: int  # Number of GOT slots allocated
 
+  OperandKind = enum
+    okReg       # Register operand
+    okImm       # Immediate value
+    okMem       # Memory operand
+    okSsize     # Stack size placeholder (patched later)
+    okCsize     # Call stack argument size
+    okArg       # Argument reference in prepare block
+    okLabel     # Label reference
+
   Operand = object
-    reg: x86.Register
+    kind: OperandKind
     typ: Type
-    isImm: bool
+    reg: x86.Register
     immVal: int64
-    isMem: bool
     mem: x86.MemoryOperand
-    isSsize: bool
-    isCsize: bool  # For (csize) expression
-    isArg: bool    # For (arg name) expression - provides offset for stack args
     argName: string
     label: LabelId
 
@@ -785,13 +790,11 @@ proc tagToRegisterA64(t: TagEnum): arm64.Register =
 
 type
   OperandA64 = object
+    kind: OperandKind
     reg: arm64.Register
     typ: Type
-    isImm: bool
     immVal: int64
-    isMem: bool
     mem: arm64.MemoryOperand
-    isSsize: bool
     label: LabelId
 
 proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = nil): OperandA64 =
@@ -816,7 +819,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
         if objType.kind notin {TypeKind.ObjectT, TypeKind.UnionT}:
           error("Cannot access field of non-object/union type " & $objType, n)
         baseReg = baseOp.reg
-      elif baseOp.isMem and baseOp.typ.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
+      elif baseOp.kind == okMem and baseOp.typ.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
         objType = baseOp.typ
         baseReg = baseOp.mem.base
         baseOffset = baseOp.mem.offset
@@ -834,7 +837,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
           fieldOffset += asmSizeOf(ftype)
       if fieldType == nil:
         error("Field '" & fieldName & "' not found in " & $objType.kind, n)
-      result.isMem = true
+      result.kind = okMem
       result.mem = arm64.MemoryOperand(
         base: baseReg,
         offset: baseOffset + int32(fieldOffset),
@@ -855,27 +858,27 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
       if baseOp.typ.kind == TypeKind.AptrT:
         elemType = baseOp.typ.base
         baseReg = baseOp.reg
-      elif baseOp.isMem and baseOp.typ.kind == TypeKind.ArrayT:
+      elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.ArrayT:
         elemType = baseOp.typ.elem
         baseReg = baseOp.mem.base
         baseOffset = baseOp.mem.offset
       else:
         error("at requires aptr or stack array, got " & $baseOp.typ, n)
-      if indexOp.isImm:
+      if indexOp.kind == okImm:
         let offset = indexOp.immVal * asmSizeOf(elemType)
-        result.isMem = true
+        result.kind = okMem
         result.mem = arm64.MemoryOperand(
           base: baseReg,
           offset: baseOffset + int32(offset),
           hasIndex: false
         )
-      elif indexOp.isMem:
+      elif indexOp.kind == okMem:
         error("Array index cannot be memory operand", n)
       else:
         let elemSize = asmSizeOf(elemType)
         if elemSize notin [1, 2, 4, 8]:
           error("Element size " & $elemSize & " not supported for scaled indexing (must be 1, 2, 4, or 8)", n)
-        result.isMem = true
+        result.kind = okMem
         let shift = case elemSize
           of 1: 0
           of 2: 1
@@ -913,7 +916,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
       inc n
       if n.kind == ParLe and (n.tag == DotTagId or n.tag == AtTagId):
         var addrOp = parseOperandA64(n, ctx)
-        if not addrOp.isMem:
+        if addrOp.kind != okMem:
           error("mem requires address expression", n)
         if addrOp.typ.kind != TypeKind.PtrT:
           error("mem requires pointer type, got " & $addrOp.typ, n)
@@ -921,7 +924,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
         result.typ = addrOp.typ.base
       else:
         var baseOp = parseOperandA64(n, ctx)
-        if baseOp.isImm or baseOp.isMem:
+        if baseOp.kind == okImm or baseOp.kind == okMem:
           error("mem base must be a register", n)
         var offset: int32 = 0
         var hasIndex = false
@@ -948,7 +951,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
                   inc n
             else:
               error("Expected index register or offset in mem", n)
-        result.isMem = true
+        result.kind = okMem
         result.mem = arm64.MemoryOperand(
           base: baseOp.reg,
           index: indexReg,
@@ -959,14 +962,14 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
         result.typ = Type(kind: IntT, bits: 64)
       skipParRi n, "`mem` expression"
     elif t == SsizeTagId:
-      result.isSsize = true
+      result.kind = okSsize
       result.typ = Type(kind: IntT, bits: 64)
       inc n
       skipParRi n, "`ssize` expression"
     else:
       error("Unexpected operand tag: " & $t, n)
   elif n.kind == IntLit:
-    result.isImm = true
+    result.kind = okImm
     result.immVal = getInt(n)
     inc n
     if expectedType != nil and (expectedType.kind in {IntT, UIntT, FloatT}):
@@ -978,7 +981,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and (sym.kind == skVar or sym.kind == skParam):
       if sym.onStack:
-        result.isMem = true
+        result.kind = okMem
         result.mem = arm64.MemoryOperand(base: arm64.FP, offset: int32(sym.offset), hasIndex: false)
         result.typ = sym.typ
       elif sym.reg != InvalidTagId:
@@ -1016,7 +1019,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
       result.typ = Type(kind: UIntT, bits: 64)
       inc n
     elif sym != nil and sym.kind == skTvar:
-      result.isMem = true
+      result.kind = okMem
       result.mem = arm64.MemoryOperand(
         base: arm64.FP,
         offset: int32(sym.offset),
@@ -1038,7 +1041,7 @@ proc parseDestA64(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
       result.typ = Type(kind: IntT, bits: 64)
   elif n.kind == ParLe and (n.tag == MemTagId or n.tag == DotTagId or n.tag == AtTagId):
     let op = parseOperandA64(n, ctx)
-    if not op.isMem:
+    if op.kind != okMem:
       error("Expected memory destination", n)
     result = op
   elif n.kind == Symbol:
@@ -1046,7 +1049,7 @@ proc parseDestA64(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and sym.kind == skVar:
       if sym.onStack:
-        result.isMem = true
+        result.kind = okMem
         result.mem = arm64.MemoryOperand(base: arm64.FP, offset: int32(sym.offset), hasIndex: false)
         result.typ = sym.typ
       elif sym.reg != InvalidTagId:
@@ -1054,7 +1057,7 @@ proc parseDestA64(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
         result.typ = sym.typ
       inc n
     elif sym != nil and sym.kind == skTvar:
-      result.isMem = true
+      result.kind = okMem
       result.mem = arm64.MemoryOperand(
         base: arm64.FP,
         offset: int32(sym.offset),
@@ -1368,20 +1371,20 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
-    if dest.isMem:
-      if op.isImm:
+    if dest.kind == okMem:
+      if op.kind == okImm:
         error("Moving immediate to memory not fully supported yet for ARM64", n)
-      elif op.isSsize:
+      elif op.kind == okSsize:
         error("Moving ssize to memory not supported", n)
-      elif op.isMem:
+      elif op.kind == okMem:
         error("Cannot move memory to memory", n)
       else:
         arm64.emitStr(ctx.buf.data, op.reg, dest.mem.base, dest.mem.offset)
     else:
-      if op.isSsize:
+      if op.kind == okSsize:
         arm64.emitMovImm(ctx.buf.data, dest.reg, 0'u16)
         ctx.ssizePatches.add(ctx.buf.data.len - 2)
-      elif op.isImm:
+      elif op.kind == okImm:
         if op.immVal >= 0 and op.immVal <= 0xFFFF:
           arm64.emitMovImm(ctx.buf.data, dest.reg, uint16(op.immVal))
         elif op.immVal >= 0:
@@ -1389,7 +1392,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
           arm64.emitMovImm64(ctx.buf.data, dest.reg, uint64(op.immVal))
         else:
           error("Immediate value out of range", n)
-      elif op.isMem:
+      elif op.kind == okMem:
         arm64.emitLdr(ctx.buf.data, dest.reg, op.mem.base, op.mem.offset)
       else:
         arm64.emitMov(ctx.buf.data, dest.reg, op.reg)
@@ -1399,10 +1402,10 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
-    if dest.isMem: error("ADR destination must be register", n)
+    if dest.kind == okMem: error("ADR destination must be register", n)
     # Check if operand is a label: type should be UIntT and not immediate/memory
     # Labels/rodata/gvars set typ to UIntT and are not immediate or memory operands
-    if op.typ.kind != UIntT or op.isImm or op.isMem:
+    if op.typ.kind != UIntT or op.kind == okImm or op.kind == okMem:
       error("ADR source must be a label", n)
     arm64.emitAdr(ctx.buf, dest.reg, op.label)
     skipParRi n
@@ -1414,18 +1417,18 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     checkIntegerArithmetic(dest.typ, "add", start)
     checkIntegerArithmetic(op.typ, "add", start)
     checkCompatibleTypes(dest.typ, op.typ, "add", start)
-    if dest.isMem:
+    if dest.kind == okMem:
       error("ADD to memory not supported yet for ARM64", n)
     else:
-      if op.isSsize:
+      if op.kind == okSsize:
         arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, 0'u16)
         ctx.ssizePatches.add(ctx.buf.data.len - 2)
-      elif op.isImm:
+      elif op.kind == okImm:
         if op.immVal >= 0 and op.immVal <= 0xFFFF:
           arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.immVal))
         else:
           error("Immediate value too large for ADD (must fit in 16 bits)", n)
-      elif op.isMem:
+      elif op.kind == okMem:
         error("ADD from memory not supported yet", n)
       else:
         arm64.emitAdd(ctx.buf.data, dest.reg, dest.reg, op.reg)
@@ -1438,18 +1441,18 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     checkIntegerArithmetic(dest.typ, "sub", start)
     checkIntegerArithmetic(op.typ, "sub", start)
     checkCompatibleTypes(dest.typ, op.typ, "sub", start)
-    if dest.isMem:
+    if dest.kind == okMem:
       error("SUB to memory not supported yet for ARM64", n)
     else:
-      if op.isSsize:
+      if op.kind == okSsize:
         arm64.emitSubImm(ctx.buf.data, dest.reg, dest.reg, 0'u16)
         ctx.ssizePatches.add(ctx.buf.data.len - 2)
-      elif op.isImm:
+      elif op.kind == okImm:
         if op.immVal >= 0 and op.immVal <= 0xFFFF:
           arm64.emitSubImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.immVal))
         else:
           error("Immediate value too large for SUB (must fit in 16 bits)", n)
-      elif op.isMem:
+      elif op.kind == okMem:
         error("SUB from memory not supported yet", n)
       else:
         arm64.emitSub(ctx.buf.data, dest.reg, dest.reg, op.reg)
@@ -1461,9 +1464,9 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperandA64(n, ctx)
     checkIntegerType(dest.typ, "mul", start)
     checkIntegerType(op.typ, "mul", start)
-    if dest.isMem: error("MUL destination cannot be memory", n)
-    if op.isImm: error("MUL immediate not supported", n)
-    if op.isMem: error("MUL memory not supported yet", n)
+    if dest.kind == okMem: error("MUL destination cannot be memory", n)
+    if op.kind == okImm: error("MUL immediate not supported", n)
+    if op.kind == okMem: error("MUL memory not supported yet", n)
     arm64.emitMul(ctx.buf.data, dest.reg, dest.reg, op.reg)
     skipParRi n
 
@@ -1473,9 +1476,9 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperandA64(n, ctx)
     checkIntegerType(dest.typ, "sdiv", start)
     checkIntegerType(op.typ, "sdiv", start)
-    if dest.isMem: error("SDIV destination cannot be memory", n)
-    if op.isImm: error("SDIV immediate not supported", n)
-    if op.isMem: error("SDIV memory not supported yet", n)
+    if dest.kind == okMem: error("SDIV destination cannot be memory", n)
+    if op.kind == okImm: error("SDIV immediate not supported", n)
+    if op.kind == okMem: error("SDIV memory not supported yet", n)
     arm64.emitSdiv(ctx.buf.data, dest.reg, dest.reg, op.reg)
     skipParRi n
 
@@ -1485,9 +1488,9 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperandA64(n, ctx)
     checkIntegerType(dest.typ, "udiv", start)
     checkIntegerType(op.typ, "udiv", start)
-    if dest.isMem: error("UDIV destination cannot be memory", n)
-    if op.isImm: error("UDIV immediate not supported", n)
-    if op.isMem: error("UDIV memory not supported yet", n)
+    if dest.kind == okMem: error("UDIV destination cannot be memory", n)
+    if op.kind == okImm: error("UDIV immediate not supported", n)
+    if op.kind == okMem: error("UDIV memory not supported yet", n)
     arm64.emitUdiv(ctx.buf.data, dest.reg, dest.reg, op.reg)
     skipParRi n
 
@@ -1498,10 +1501,10 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseType(dest.typ, "and", start)
     checkBitwiseType(op.typ, "and", start)
     checkCompatibleTypes(dest.typ, op.typ, "and", start)
-    if dest.isMem: error("AND to memory not supported yet", n)
+    if dest.kind == okMem: error("AND to memory not supported yet", n)
     else:
-      if op.isImm: error("AND immediate not supported yet", n)
-      elif op.isMem: error("AND from memory not supported yet", n)
+      if op.kind == okImm: error("AND immediate not supported yet", n)
+      elif op.kind == okMem: error("AND from memory not supported yet", n)
       else:
         arm64.emitAnd(ctx.buf.data, dest.reg, dest.reg, op.reg)
     skipParRi n
@@ -1513,10 +1516,10 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseType(dest.typ, "orr", start)
     checkBitwiseType(op.typ, "orr", start)
     checkCompatibleTypes(dest.typ, op.typ, "orr", start)
-    if dest.isMem: error("ORR to memory not supported yet", n)
+    if dest.kind == okMem: error("ORR to memory not supported yet", n)
     else:
-      if op.isImm: error("ORR immediate not supported yet", n)
-      elif op.isMem: error("ORR from memory not supported yet", n)
+      if op.kind == okImm: error("ORR immediate not supported yet", n)
+      elif op.kind == okMem: error("ORR from memory not supported yet", n)
       else:
         arm64.emitOrr(ctx.buf.data, dest.reg, dest.reg, op.reg)
     skipParRi n
@@ -1528,10 +1531,10 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseType(dest.typ, "eor", start)
     checkBitwiseType(op.typ, "eor", start)
     checkCompatibleTypes(dest.typ, op.typ, "eor", start)
-    if dest.isMem: error("EOR to memory not supported yet", n)
+    if dest.kind == okMem: error("EOR to memory not supported yet", n)
     else:
-      if op.isImm: error("EOR immediate not supported yet", n)
-      elif op.isMem: error("EOR from memory not supported yet", n)
+      if op.kind == okImm: error("EOR immediate not supported yet", n)
+      elif op.kind == okMem: error("EOR from memory not supported yet", n)
       else:
         arm64.emitEor(ctx.buf.data, dest.reg, dest.reg, op.reg)
     skipParRi n
@@ -1541,8 +1544,8 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
     checkBitwiseType(dest.typ, "lsl", start)
-    if dest.isMem: error("Shift destination cannot be memory", n)
-    if op.isImm:
+    if dest.kind == okMem: error("Shift destination cannot be memory", n)
+    if op.kind == okImm:
       if op.immVal >= 0 and op.immVal <= 63:
         arm64.emitLslImm(ctx.buf.data, dest.reg, dest.reg, uint8(op.immVal))
       else:
@@ -1556,8 +1559,8 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
     checkBitwiseType(dest.typ, "lsr", start)
-    if dest.isMem: error("Shift destination cannot be memory", n)
-    if op.isImm:
+    if dest.kind == okMem: error("Shift destination cannot be memory", n)
+    if op.kind == okImm:
       if op.immVal >= 0 and op.immVal <= 63:
         arm64.emitLsrImm(ctx.buf.data, dest.reg, dest.reg, uint8(op.immVal))
       else:
@@ -1571,8 +1574,8 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
     checkBitwiseType(dest.typ, "asr", start)
-    if dest.isMem: error("Shift destination cannot be memory", n)
-    if op.isImm: error("ASR immediate not supported yet", n)
+    if dest.kind == okMem: error("Shift destination cannot be memory", n)
+    if op.kind == okImm: error("ASR immediate not supported yet", n)
     else:
       arm64.emitAsr(ctx.buf.data, dest.reg, dest.reg, op.reg)
     skipParRi n
@@ -1581,7 +1584,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let op = parseDestA64(n, ctx)
     checkIntegerArithmetic(op.typ, "neg", start)
-    if op.isMem: error("NEG memory not supported yet", n)
+    if op.kind == okMem: error("NEG memory not supported yet", n)
     arm64.emitNeg(ctx.buf.data, op.reg, op.reg)
     skipParRi n
 
@@ -1592,15 +1595,15 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     checkIntegerArithmetic(dest.typ, "cmp", start)
     checkIntegerArithmetic(op.typ, "cmp", start)
     checkCompatibleTypes(dest.typ, op.typ, "cmp", start)
-    if dest.isMem:
+    if dest.kind == okMem:
       error("CMP memory not supported yet", n)
     else:
-      if op.isImm:
+      if op.kind == okImm:
         if op.immVal >= 0 and op.immVal <= 0xFFFF:
           arm64.emitCmpImm(ctx.buf.data, dest.reg, uint16(op.immVal))
         else:
           error("Immediate value too large for CMP (must fit in 16 bits)", n)
-      elif op.isMem:
+      elif op.kind == okMem:
         error("CMP memory not supported yet", n)
       else:
         arm64.emitCmp(ctx.buf.data, dest.reg, op.reg)
@@ -1619,7 +1622,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of SvcA64:
     inc n
     let op = parseOperandA64(n, ctx)
-    if not op.isImm:
+    if op.kind != okImm:
       error("SVC requires immediate operand", n)
     if op.immVal < 0 or op.immVal > 0xFFFF:
       error("SVC immediate must be 0-65535", n)
@@ -1630,8 +1633,8 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
-    if dest.isMem: error("LDR destination must be register", n)
-    if op.isMem:
+    if dest.kind == okMem: error("LDR destination must be register", n)
+    if op.kind == okMem:
       ctx.buf.data.emitLdr(dest.reg, op.mem.base, op.mem.offset)
     else:
       error("LDR source must be memory", n)
@@ -1641,8 +1644,8 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
-    if not dest.isMem: error("STR destination must be memory", n)
-    if op.isMem: error("STR source cannot be memory", n)
+    if dest.kind != okMem: error("STR destination must be memory", n)
+    if op.kind == okMem: error("STR source cannot be memory", n)
     ctx.buf.data.emitStr(op.reg, dest.mem.base, dest.mem.offset)
     skipParRi n
 
@@ -1827,7 +1830,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
         objType = baseOp.typ.base
         if objType.kind notin {TypeKind.ObjectT, TypeKind.UnionT}:
           error("Cannot access field of non-object/union type " & $objType, n)
-        if baseOp.isMem:
+        if baseOp.kind == okMem:
           baseReg = baseOp.mem.base
           baseDisp = baseOp.mem.displacement
           baseHasIndex = baseOp.mem.hasIndex
@@ -1836,7 +1839,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
           useFsSegment = baseOp.mem.useFsSegment
         else:
           baseReg = baseOp.reg
-      elif baseOp.isMem and baseOp.typ.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
+      elif baseOp.kind == okMem and baseOp.typ.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
         # Base is a stack-allocated object or union
         objType = baseOp.typ
         baseReg = baseOp.mem.base
@@ -1869,7 +1872,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
         error("Field '" & fieldName & "' not found in " & $objType.kind, n)
 
       # Result is memory operand pointing to the field
-      result.isMem = true
+      result.kind = okMem
       result.mem = x86.MemoryOperand(
         base: baseReg,
         index: baseIndex,
@@ -1900,7 +1903,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
         # Base is an array pointer
         elemType = baseOp.typ.base
         baseReg = baseOp.reg
-      elif baseOp.isMem and baseOp.typ.kind == TypeKind.ArrayT:
+      elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.ArrayT:
         # Base is a stack-allocated array
         elemType = baseOp.typ.elem
         baseReg = baseOp.mem.base
@@ -1909,16 +1912,16 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
         error("at requires aptr or stack array, got " & $baseOp.typ, n)
 
       # Check if index is immediate or register
-      if indexOp.isImm:
+      if indexOp.kind == okImm:
         # Immediate index: compute offset directly
         let offset = indexOp.immVal * asmSizeOf(elemType)
-        result.isMem = true
+        result.kind = okMem
         result.mem = x86.MemoryOperand(
           base: baseReg,
           displacement: baseDisp + int32(offset),
           hasIndex: false
         )
-      elif indexOp.isMem:
+      elif indexOp.kind == okMem:
         error("Array index cannot be memory operand", n)
       else:
         # Register index: use scaled indexing
@@ -1926,7 +1929,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
         if elemSize notin [1, 2, 4, 8]:
           error("Element size " & $elemSize & " not supported for scaled indexing (must be 1, 2, 4, or 8)", n)
 
-        result.isMem = true
+        result.kind = okMem
         result.mem = x86.MemoryOperand(
           base: baseReg,
           index: indexOp.reg,
@@ -1966,7 +1969,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
       if n.kind == ParLe and (n.tag == DotTagId or n.tag == AtTagId):
         # Wrapped address expression: (mem (dot ...) or (mem (at ...))
         var addrOp = parseOperand(n, ctx)
-        if not addrOp.isMem:
+        if addrOp.kind != okMem:
           error("mem requires address expression", n)
 
         # Dereference the pointer type
@@ -1978,7 +1981,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
       else:
         # Explicit addressing: (mem base) or (mem base offset) or (mem base index scale [offset])
         var baseOp = parseOperand(n, ctx)
-        if baseOp.isImm or baseOp.isMem:
+        if baseOp.kind == okImm or baseOp.kind == okMem:
           error("mem base must be a register", n)
 
         var displacement: int32 = 0
@@ -2033,7 +2036,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
             else:
               error("Expected index register or offset in mem", n)
 
-        result.isMem = true
+        result.kind = okMem
         result.mem = x86.MemoryOperand(
           base: baseOp.reg,
           index: indexReg,
@@ -2046,7 +2049,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
 
       skipParRi n, "mem expression"
     elif t == SsizeTagId:
-      result.isSsize = true
+      result.kind = okSsize
       result.typ = Type(kind: IntT, bits: 64)
       inc n
       skipParRi n, "ssize expression"
@@ -2054,7 +2057,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
       # (csize) - call stack argument size
       if not ctx.inCall:
         error("(csize) can only be used inside a prepare block", n)
-      result.isCsize = true
+      result.kind = okCsize
       result.immVal = int64(ctx.currentCallStackArgSize)
       result.typ = Type(kind: IntT, bits: 64)
       inc n
@@ -2083,14 +2086,14 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
             if p.name == argName:
               break
             offset += slots.alignedSize(p.typ)
-        result.isArg = true
+        result.kind = okArg
         result.argName = argName
-        result.isImm = true
+        result.kind = okImm
         result.immVal = int64(offset)
         result.typ = param.typ
       else:
         # Register argument - return the register
-        result.isArg = true
+        result.kind = okArg
         result.argName = argName
         let paramRegTag = tagToX64Reg(param.reg)
         result.reg = case paramRegTag
@@ -2139,7 +2142,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
     else:
       error("Unexpected operand tag: " & $t, n)
   elif n.kind == IntLit:
-    result.isImm = true
+    result.kind = okImm
     result.immVal = getInt(n)
     inc n
     # Immediate type inference?
@@ -2153,7 +2156,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and (sym.kind == skVar or sym.kind == skParam):
       if sym.onStack:
-        result.isMem = true
+        result.kind = okMem
         result.mem = x86.MemoryOperand(base: RBP, displacement: int32(sym.offset))
         result.typ = sym.typ
       elif sym.reg != InvalidTagId:
@@ -2220,7 +2223,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
       # On x86-64 Linux, TLS variables are accessed via FS segment
       # The offset is stored in sym.offset (allocated in pass2)
       # Use RBP as base register (standard for offset-only addressing)
-      result.isMem = true
+      result.kind = okMem
       result.mem = x86.MemoryOperand(
         base: x86.RBP,  # RBP allows displacement-only addressing
         displacement: int32(sym.offset),
@@ -2270,7 +2273,7 @@ proc parseDest(n: var Cursor; ctx: var GenContext; expectedType: Type = nil): Op
 
     # Return the register for this argument
     let paramRegTag = tagToX64Reg(param.reg)
-    result.isArg = true
+    result.kind = okArg
     result.argName = argName
     result.reg = case paramRegTag
       of RaxR, R0R: x86.RAX
@@ -2286,7 +2289,7 @@ proc parseDest(n: var Cursor; ctx: var GenContext; expectedType: Type = nil): Op
     result.typ = param.typ
   elif n.kind == ParLe and (n.tag == MemTagId or n.tag == DotTagId or n.tag == AtTagId):
     let op = parseOperand(n, ctx)
-    if not op.isMem:
+    if op.kind != okMem:
       error("Expected memory destination", n)
     result = op
   elif n.kind in {Symbol, Ident}:
@@ -2294,7 +2297,7 @@ proc parseDest(n: var Cursor; ctx: var GenContext; expectedType: Type = nil): Op
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and sym.kind == skVar:
        if sym.onStack:
-         result.isMem = true
+         result.kind = okMem
          result.mem = x86.MemoryOperand(base: RBP, displacement: int32(sym.offset))
          result.typ = sym.typ
        elif sym.reg != InvalidTagId:
@@ -2324,7 +2327,7 @@ proc parseDest(n: var Cursor; ctx: var GenContext; expectedType: Type = nil): Op
        inc n
     elif sym != nil and sym.kind == skTvar:
        # Writing to thread local variable via FS segment
-       result.isMem = true
+       result.kind = okMem
        result.mem = x86.MemoryOperand(
          base: RBP,  # RBP allows displacement-only addressing
          displacement: int32(sym.offset),
@@ -2522,8 +2525,8 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
   let dest = parseDest(n, ctx)
   let op = parseOperand(n, ctx)
 
-  if dest.isMem:
-    if op.isImm:
+  if dest.kind == okMem:
+    if op.kind == okImm:
       # x86 supports mov r/m64, imm32 (sign extended)
       if op.immVal >= low(int32) and op.immVal <= high(int32):
         # We need emitMov(MemoryOperand, int32)
@@ -2538,27 +2541,27 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
         error("Moving immediate to memory not fully supported yet (requires emitMovImmToMem)", n)
       else:
         error("Immediate too large for memory move (must fit in 32 bits)", n)
-    elif op.isSsize:
+    elif op.kind == okSsize:
       # Similar issue, ssize is immediate 0 (patched).
       error("Moving ssize to memory not supported", n)
-    elif op.isMem:
+    elif op.kind == okMem:
       error("Cannot move memory to memory", n)
     else:
       x86.emitMov(ctx.buf.data, dest.mem, op.reg)
   else:
     # dest is reg
-    if op.isSsize:
+    if op.kind == okSsize:
       x86.emitMovImmToReg32(ctx.buf.data, dest.reg, 0)
       ctx.ssizePatches.add(ctx.buf.data.len - 4)
-    elif op.isCsize:
+    elif op.kind == okCsize:
       # csize is a known value - the stack argument size for the current call
       x86.emitMovImmToReg32(ctx.buf.data, dest.reg, int32(op.immVal))
-    elif op.isImm:
+    elif op.kind == okImm:
       if op.immVal >= low(int32) and op.immVal <= high(int32):
         x86.emitMovImmToReg32(ctx.buf.data, dest.reg, int32(op.immVal))
       else:
         x86.emitMovImmToReg(ctx.buf.data, dest.reg, op.immVal)
-    elif op.isMem:
+    elif op.kind == okMem:
       x86.emitMov(ctx.buf.data, dest.reg, op.mem)
     else:
       x86.emitMov(ctx.buf.data, dest.reg, op.reg)
@@ -2835,26 +2838,26 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkIntegerArithmetic(op.typ, "add", start)
     checkCompatibleTypes(dest.typ, op.typ, "add", start)
 
-    if dest.isMem:
-      if op.isImm or op.isCsize:
+    if dest.kind == okMem:
+      if op.kind == okImm or op.kind == okCsize:
         # ADD m64, imm32
         # Need emitAdd(MemoryOperand, int32)
         error("Adding immediate to memory not supported yet", n)
-      elif op.isSsize:
+      elif op.kind == okSsize:
         error("Adding ssize to memory not supported", n)
-      elif op.isMem:
+      elif op.kind == okMem:
         error("Cannot add memory to memory", n)
       else:
         x86.emitAdd(ctx.buf.data, dest.mem, op.reg)
     else:
-      if op.isSsize:
+      if op.kind == okSsize:
         x86.emitAddImm(ctx.buf.data, dest.reg, 0)
         ctx.ssizePatches.add(ctx.buf.data.len - 4)
-      elif op.isCsize:
+      elif op.kind == okCsize:
         x86.emitAddImm(ctx.buf.data, dest.reg, int32(op.immVal))
-      elif op.isImm:
+      elif op.kind == okImm:
         x86.emitAddImm(ctx.buf.data, dest.reg, int32(op.immVal))
-      elif op.isMem:
+      elif op.kind == okMem:
         x86.emitAdd(ctx.buf.data, dest.reg, op.mem)
       else:
         x86.emitAdd(ctx.buf.data, dest.reg, op.reg)
@@ -2870,24 +2873,24 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkIntegerArithmetic(op.typ, "sub", start)
     checkCompatibleTypes(dest.typ, op.typ, "sub", start)
 
-    if dest.isMem:
-      if op.isImm or op.isCsize:
+    if dest.kind == okMem:
+      if op.kind == okImm or op.kind == okCsize:
         error("Subtracting immediate from memory not supported yet", n)
-      elif op.isSsize:
+      elif op.kind == okSsize:
         error("Subtracting ssize from memory not supported", n)
-      elif op.isMem:
+      elif op.kind == okMem:
         error("Cannot subtract memory from memory", n)
       else:
         x86.emitSub(ctx.buf.data, dest.mem, op.reg)
     else:
-      if op.isSsize:
+      if op.kind == okSsize:
         x86.emitSubImm(ctx.buf.data, dest.reg, 0)
         ctx.ssizePatches.add(ctx.buf.data.len - 4)
-      elif op.isCsize:
+      elif op.kind == okCsize:
         x86.emitSubImm(ctx.buf.data, dest.reg, int32(op.immVal))
-      elif op.isImm:
+      elif op.kind == okImm:
         x86.emitSubImm(ctx.buf.data, dest.reg, int32(op.immVal))
-      elif op.isMem:
+      elif op.kind == okMem:
         x86.emitSub(ctx.buf.data, dest.reg, op.mem)
       else:
         x86.emitSub(ctx.buf.data, dest.reg, op.reg)
@@ -2897,8 +2900,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let op = parseOperand(n, ctx)
     checkIntegerType(op.typ, "mul", start)
-    if op.isImm: error("MUL immediate not supported", n)
-    if op.isMem: error("MUL memory not supported yet", n) # Need emitMul(mem)
+    if op.kind == okImm: error("MUL immediate not supported", n)
+    if op.kind == okMem: error("MUL memory not supported yet", n) # Need emitMul(mem)
     x86.emitMul(ctx.buf.data, op.reg)
     skipParRi n, "mul"
 
@@ -2910,10 +2913,10 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperand(n, ctx)
     checkIntegerType(dest.typ, "imul", start)
     checkIntegerType(op.typ, "imul", start)
-    if dest.isMem: error("IMUL destination cannot be memory", n)
-    if op.isImm:
+    if dest.kind == okMem: error("IMUL destination cannot be memory", n)
+    if op.kind == okImm:
       x86.emitImulImm(ctx.buf.data, dest.reg, int32(op.immVal))
-    elif op.isMem:
+    elif op.kind == okMem:
       error("IMUL memory source not supported yet", n) # Need emitImul(reg, mem)
     else:
       x86.emitImul(ctx.buf.data, dest.reg, op.reg)
@@ -2933,8 +2936,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
 
     let op = parseOperand(n, ctx)
     checkIntegerType(op.typ, "div", start)
-    if op.isImm: error("DIV immediate not supported", n)
-    if op.isMem: error("DIV memory not supported yet", n)
+    if op.kind == okImm: error("DIV immediate not supported", n)
+    if op.kind == okMem: error("DIV memory not supported yet", n)
     x86.emitDiv(ctx.buf.data, op.reg)
     skipParRi n, "div"
 
@@ -2952,8 +2955,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
 
     let op = parseOperand(n, ctx)
     checkIntegerType(op.typ, "idiv", start)
-    if op.isImm: error("IDIV immediate not supported", n)
-    if op.isMem: error("IDIV memory not supported yet", n)
+    if op.kind == okImm: error("IDIV immediate not supported", n)
+    if op.kind == okMem: error("IDIV memory not supported yet", n)
     x86.emitIdiv(ctx.buf.data, op.reg)
     skipParRi n, "idiv"
 
@@ -2965,12 +2968,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseType(dest.typ, "and", start)
     checkBitwiseType(op.typ, "and", start)
     checkCompatibleTypes(dest.typ, op.typ, "and", start)
-    if dest.isMem:
+    if dest.kind == okMem:
       error("AND to memory not supported yet", n)
     else:
-      if op.isImm:
+      if op.kind == okImm:
         x86.emitAndImm(ctx.buf.data, dest.reg, int32(op.immVal))
-      elif op.isMem:
+      elif op.kind == okMem:
         error("AND from memory not supported yet", n)
       else:
         x86.emitAnd(ctx.buf.data, dest.reg, op.reg)
@@ -2983,12 +2986,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseType(dest.typ, "or", start)
     checkBitwiseType(op.typ, "or", start)
     checkCompatibleTypes(dest.typ, op.typ, "or", start)
-    if dest.isMem:
+    if dest.kind == okMem:
       error("OR to memory not supported yet", n)
     else:
-      if op.isImm:
+      if op.kind == okImm:
         x86.emitOrImm(ctx.buf.data, dest.reg, int32(op.immVal))
-      elif op.isMem:
+      elif op.kind == okMem:
         error("OR from memory not supported yet", n)
       else:
         x86.emitOr(ctx.buf.data, dest.reg, op.reg)
@@ -3001,12 +3004,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseType(dest.typ, "xor", start)
     checkBitwiseType(op.typ, "xor", start)
     checkCompatibleTypes(dest.typ, op.typ, "xor", start)
-    if dest.isMem:
+    if dest.kind == okMem:
       error("XOR to memory not supported yet", n)
     else:
-      if op.isImm:
+      if op.kind == okImm:
         x86.emitXorImm(ctx.buf.data, dest.reg, int32(op.immVal))
-      elif op.isMem:
+      elif op.kind == okMem:
         error("XOR from memory not supported yet", n)
       else:
         x86.emitXor(ctx.buf.data, dest.reg, op.reg)
@@ -3017,8 +3020,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
     checkBitwiseType(dest.typ, "shl", start)
-    if dest.isMem: error("Shift destination cannot be memory", n)
-    if op.isImm:
+    if dest.kind == okMem: error("Shift destination cannot be memory", n)
+    if op.kind == okImm:
       x86.emitShl(ctx.buf.data, dest.reg, int(op.immVal))
     elif op.reg == RCX:
       # emitShlCl? x86.nim only has imm count support in emitShl currently?
@@ -3035,8 +3038,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
     checkBitwiseType(dest.typ, "shr", start)
-    if dest.isMem: error("Shift destination cannot be memory", n)
-    if op.isImm:
+    if dest.kind == okMem: error("Shift destination cannot be memory", n)
+    if op.kind == okImm:
       x86.emitShr(ctx.buf.data, dest.reg, int(op.immVal))
     else:
       error("Shift count must be immediate", n)
@@ -3047,8 +3050,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
     checkBitwiseType(dest.typ, "sar", start)
-    if dest.isMem: error("Shift destination cannot be memory", n)
-    if op.isImm:
+    if dest.kind == okMem: error("Shift destination cannot be memory", n)
+    if op.kind == okImm:
       x86.emitSar(ctx.buf.data, dest.reg, int(op.immVal))
     else:
       error("Shift count must be immediate", n)
@@ -3059,7 +3062,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let op = parseDest(n, ctx) # Dest/Src same
     checkIntegerArithmetic(op.typ, "inc", start)
-    if op.isMem: error("INC memory not supported yet", n)
+    if op.kind == okMem: error("INC memory not supported yet", n)
     x86.emitInc(ctx.buf.data, op.reg)
     skipParRi n, "inc"
 
@@ -3067,7 +3070,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let op = parseDest(n, ctx)
     checkIntegerArithmetic(op.typ, "dec", start)
-    if op.isMem: error("DEC memory not supported yet", n)
+    if op.kind == okMem: error("DEC memory not supported yet", n)
     x86.emitDec(ctx.buf.data, op.reg)
     skipParRi n, "dec"
 
@@ -3075,7 +3078,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let op = parseDest(n, ctx)
     checkIntegerArithmetic(op.typ, "neg", start)
-    if op.isMem: error("NEG memory not supported yet", n)
+    if op.kind == okMem: error("NEG memory not supported yet", n)
     x86.emitNeg(ctx.buf.data, op.reg)
     skipParRi n, "neg"
 
@@ -3083,7 +3086,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let op = parseDest(n, ctx)
     checkBitwiseType(op.typ, "not", start)
-    if op.isMem: error("NOT memory not supported yet", n)
+    if op.kind == okMem: error("NOT memory not supported yet", n)
     x86.emitNot(ctx.buf.data, op.reg)
     skipParRi n, "not"
 
@@ -3096,11 +3099,11 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkIntegerArithmetic(dest.typ, "cmp", start)
     checkIntegerArithmetic(op.typ, "cmp", start)
     checkCompatibleTypes(dest.typ, op.typ, "cmp", start)
-    if dest.isMem:
-      if op.isImm:
+    if dest.kind == okMem:
+      if op.kind == okImm:
         # CMP m64, imm32
         error("CMP memory, immediate not supported yet", n)
-      elif op.isMem:
+      elif op.kind == okMem:
         error("Cannot compare memory with memory", n)
       else:
         x86.emitCmp(ctx.buf.data, op.reg, dest.mem) # cmp reg, mem? No, cmp mem, reg.
@@ -3111,9 +3114,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         # If op1 is mem, op2 is reg.
         x86.emitCmp(ctx.buf.data, dest.mem, op.reg)
     else:
-      if op.isImm:
+      if op.kind == okImm:
         x86.emitCmpImm(ctx.buf.data, dest.reg, int32(op.immVal))
-      elif op.isMem:
+      elif op.kind == okMem:
         x86.emitCmp(ctx.buf.data, dest.reg, op.mem)
       else:
         x86.emitCmp(ctx.buf.data, dest.reg, op.reg)
@@ -3126,12 +3129,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseType(dest.typ, "test", start)
     checkBitwiseType(op.typ, "test", start)
     checkCompatibleTypes(dest.typ, op.typ, "test", start)
-    if dest.isMem:
+    if dest.kind == okMem:
       error("TEST memory not supported yet", n)
-    elif op.isImm:
+    elif op.kind == okImm:
       # emitTestImm
       error("TEST immediate not supported yet", n)
-    elif op.isMem:
+    elif op.kind == okMem:
       error("TEST with memory operand not supported yet", n)
     else:
       x86.emitTest(ctx.buf.data, dest.reg, op.reg)
@@ -3141,89 +3144,89 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
   of SeteX64, SetzX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSete(ctx.buf.data, dest.reg)
     skipParRi n, "sete"
 
   of SetneX64, SetnzX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSetne(ctx.buf.data, dest.reg)
     skipParRi n, "setne"
 
   of SetaX64, SetnbeX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSeta(ctx.buf.data, dest.reg)
     skipParRi n, "seta"
 
   of SetaeX64, SetnbX64, SetncX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSetae(ctx.buf.data, dest.reg)
     skipParRi n, "setae"
 
   of SetbX64, SetnaeX64, SetcX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSetb(ctx.buf.data, dest.reg)
     skipParRi n, "setb"
   of SetbeX64, SetnaX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSetbe(ctx.buf.data, dest.reg)
     skipParRi n, "setbe"
 
   of SetgX64, SetnleX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSetg(ctx.buf.data, dest.reg)
     skipParRi n, "setg"
 
   of SetgeX64, SetnlX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSetge(ctx.buf.data, dest.reg)
     skipParRi n, "setge"
   of SetlX64, SetngeX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSetl(ctx.buf.data, dest.reg)
     skipParRi n, "setl"
 
   of SetleX64, SetngX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSetle(ctx.buf.data, dest.reg)
     skipParRi n, "setle"
 
   of SetoX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSeto(ctx.buf.data, dest.reg)
     skipParRi n, "seto"
 
   of SetsX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSets(ctx.buf.data, dest.reg)
     skipParRi n, "sets"
 
   of SetpX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSetp(ctx.buf.data, dest.reg)
     skipParRi n, "setp"
   # Conditional moves
@@ -3231,9 +3234,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmove(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmove(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmove(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmove"
 
@@ -3241,9 +3244,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovne(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovne(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovne(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovne"
 
@@ -3251,9 +3254,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmova(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmova(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmova(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmova"
 
@@ -3261,9 +3264,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovae(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovae(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovae(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovae"
 
@@ -3271,9 +3274,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovb(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovb(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovb(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovb"
 
@@ -3281,9 +3284,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovbe(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovbe(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovbe(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovbe"
 
@@ -3291,9 +3294,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovg(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovg(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovg(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovg"
 
@@ -3301,9 +3304,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovge(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovge(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovge(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovge"
 
@@ -3311,9 +3314,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovl(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovl(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovl(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovl"
 
@@ -3321,9 +3324,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovle(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovle(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovle(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovle"
 
@@ -3331,9 +3334,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovo(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovo(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovo(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovo"
 
@@ -3341,9 +3344,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovs(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovs(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovs(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovs"
 
@@ -3351,9 +3354,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovp(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovp(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovp(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovp"
 
@@ -3361,9 +3364,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovnp(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovnp(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovnp(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovnp"
 
@@ -3371,9 +3374,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovns(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovns(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovns(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovns"
 
@@ -3381,18 +3384,18 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovno(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovno(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovno(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovno"
   # Stack
   of PushX64:
     inc n
     let op = parseOperand(n, ctx)
-    if op.isImm:
+    if op.kind == okImm:
       x86.emitPush(ctx.buf.data, int32(op.immVal))
-    elif op.isMem:
+    elif op.kind == okMem:
       error("PUSH memory not supported yet", n)
     else:
       x86.emitPush(ctx.buf.data, op.reg)
@@ -3401,7 +3404,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
   of PopX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem:
+    if dest.kind == okMem:
       error("POP memory not supported yet", n)
     else:
       x86.emitPop(ctx.buf.data, dest.reg)
@@ -3416,7 +3419,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let dest = parseRegister(n) # LEA dest must be register
     let op = parseOperand(n, ctx)
     # LEA reg, label (rip-rel) or LEA reg, mem
-    if op.isMem:
+    if op.kind == okMem:
       x86.emitLea(ctx.buf.data, dest, op.mem)
     else:
       x86.emitLea(ctx.buf, dest, op.label)
@@ -3424,7 +3427,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
   of JmpX64:
     inc n
     let op = parseOperand(n, ctx)
-    if op.isMem:
+    if op.kind == okMem:
       error("JMP memory not supported yet", n)
     elif op.label != LabelId(0) or op.typ.kind == UIntT: # Label check
       # op.label is set if it was a label operand
@@ -3578,7 +3581,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # x86: MOVSD xmm1, xmm2/m64
     # MOVSD xmm1/m64, xmm2
     # So one must be XMM.
-    if dest.isMem and op.isMem:
+    if dest.kind == okMem and op.kind == okMem:
       error("MOVSD memory to memory not supported", n)
     # We need to check if registers are XMM.
     # Currently parseRegister returns Register enum which is GPR.
@@ -3635,9 +3638,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       checkIntegerArithmetic(dest.typ, "lock add", start)
       checkIntegerArithmetic(op.typ, "lock add", start)
       checkCompatibleTypes(dest.typ, op.typ, "lock add", start)
-      if not dest.isMem: error("Atomic ADD requires memory destination", n)
-      if op.isImm: error("Atomic ADD immediate not supported yet", n)
-      if op.isMem: error("Atomic ADD memory source not supported", n)
+      if dest.kind != okMem: error("Atomic ADD requires memory destination", n)
+      if op.kind == okImm: error("Atomic ADD immediate not supported yet", n)
+      if op.kind == okMem: error("Atomic ADD memory source not supported", n)
       x86.emitLock(ctx.buf.data)
       x86.emitAdd(ctx.buf.data, dest.mem, op.reg)
       skipParRi n, "lock add"
@@ -3648,9 +3651,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       checkIntegerArithmetic(dest.typ, "lock sub", start)
       checkIntegerArithmetic(op.typ, "lock sub", start)
       checkCompatibleTypes(dest.typ, op.typ, "lock sub", start)
-      if not dest.isMem: error("Atomic SUB requires memory destination", n)
-      if op.isImm: error("Atomic SUB immediate not supported yet", n)
-      if op.isMem: error("Atomic SUB memory source not supported", n)
+      if dest.kind != okMem: error("Atomic SUB requires memory destination", n)
+      if op.kind == okImm: error("Atomic SUB immediate not supported yet", n)
+      if op.kind == okMem: error("Atomic SUB memory source not supported", n)
       x86.emitLock(ctx.buf.data)
       x86.emitSub(ctx.buf.data, dest.mem, op.reg)
       skipParRi n, "lock sub"
@@ -3661,9 +3664,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       checkBitwiseType(dest.typ, "lock and", start)
       checkBitwiseType(op.typ, "lock and", start)
       checkCompatibleTypes(dest.typ, op.typ, "lock and", start)
-      if not dest.isMem: error("Atomic AND requires memory destination", n)
-      if op.isImm: error("Atomic AND immediate not supported yet", n)
-      if op.isMem: error("Atomic AND memory source not supported", n)
+      if dest.kind != okMem: error("Atomic AND requires memory destination", n)
+      if op.kind == okImm: error("Atomic AND immediate not supported yet", n)
+      if op.kind == okMem: error("Atomic AND memory source not supported", n)
       x86.emitLock(ctx.buf.data)
       x86.emitAnd(ctx.buf.data, dest.mem, op.reg)
       skipParRi n, "lock and"
@@ -3674,9 +3677,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       checkBitwiseType(dest.typ, "lock or", start)
       checkBitwiseType(op.typ, "lock or", start)
       checkCompatibleTypes(dest.typ, op.typ, "lock or", start)
-      if not dest.isMem: error("Atomic OR requires memory destination", n)
-      if op.isImm: error("Atomic OR immediate not supported yet", n)
-      if op.isMem: error("Atomic OR memory source not supported", n)
+      if dest.kind != okMem: error("Atomic OR requires memory destination", n)
+      if op.kind == okImm: error("Atomic OR immediate not supported yet", n)
+      if op.kind == okMem: error("Atomic OR memory source not supported", n)
       x86.emitLock(ctx.buf.data)
       x86.emitOr(ctx.buf.data, dest.mem, op.reg)
       skipParRi n, "lock or"
@@ -3687,9 +3690,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       checkBitwiseType(dest.typ, "lock xor", start)
       checkBitwiseType(op.typ, "lock xor", start)
       checkCompatibleTypes(dest.typ, op.typ, "lock xor", start)
-      if not dest.isMem: error("Atomic XOR requires memory destination", n)
-      if op.isImm: error("Atomic XOR immediate not supported yet", n)
-      if op.isMem: error("Atomic XOR memory source not supported", n)
+      if dest.kind != okMem: error("Atomic XOR requires memory destination", n)
+      if op.kind == okImm: error("Atomic XOR immediate not supported yet", n)
+      if op.kind == okMem: error("Atomic XOR memory source not supported", n)
       x86.emitLock(ctx.buf.data)
       x86.emitXor(ctx.buf.data, dest.mem, op.reg)
       skipParRi n, "lock xor"
@@ -3697,7 +3700,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       inc n
       let dest = parseDest(n, ctx)
       checkIntegerArithmetic(dest.typ, "lock inc", start)
-      if not dest.isMem: error("Atomic INC requires memory destination", n)
+      if dest.kind != okMem: error("Atomic INC requires memory destination", n)
       x86.emitLock(ctx.buf.data)
       x86.emitInc(ctx.buf.data, dest.mem)
       skipParRi n, "lock inc"
@@ -3705,7 +3708,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       inc n
       let dest = parseDest(n, ctx)
       checkIntegerArithmetic(dest.typ, "lock dec", start)
-      if not dest.isMem: error("Atomic DEC requires memory destination", n)
+      if dest.kind != okMem: error("Atomic DEC requires memory destination", n)
       x86.emitLock(ctx.buf.data)
       x86.emitDec(ctx.buf.data, dest.mem)
       skipParRi n, "lock dec"
@@ -3713,7 +3716,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       inc n
       let dest = parseDest(n, ctx)
       checkBitwiseType(dest.typ, "lock not", start)
-      if not dest.isMem: error("Atomic NOT requires memory destination", n)
+      if dest.kind != okMem: error("Atomic NOT requires memory destination", n)
       x86.emitLock(ctx.buf.data)
       x86.emitNot(ctx.buf.data, dest.mem)
       skipParRi n, "lock not"
@@ -3721,7 +3724,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       inc n
       let dest = parseDest(n, ctx)
       checkIntegerArithmetic(dest.typ, "lock neg", start)
-      if not dest.isMem: error("Atomic NEG requires memory destination", n)
+      if dest.kind != okMem: error("Atomic NEG requires memory destination", n)
       x86.emitLock(ctx.buf.data)
       x86.emitNeg(ctx.buf.data, dest.mem)
       skipParRi n, "lock neg"
@@ -3738,13 +3741,13 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkIntegerType(dest.typ, "xchg", start)
     checkIntegerType(op.typ, "xchg", start)
     checkCompatibleTypes(dest.typ, op.typ, "xchg", start)
-    if dest.isMem:
-      if op.isImm: error("XCHG memory, immediate not supported", n)
-      if op.isMem: error("XCHG memory, memory not supported", n)
+    if dest.kind == okMem:
+      if op.kind == okImm: error("XCHG memory, immediate not supported", n)
+      if op.kind == okMem: error("XCHG memory, memory not supported", n)
       x86.emitXchg(ctx.buf.data, dest.mem, op.reg)
     else:
-      if op.isImm: error("XCHG reg, immediate not supported", n)
-      if op.isMem:
+      if op.kind == okImm: error("XCHG reg, immediate not supported", n)
+      if op.kind == okMem:
         x86.emitXchg(ctx.buf.data, op.mem, dest.reg)
       else:
         x86.emitXchg(ctx.buf.data, dest.reg, op.reg)
@@ -3756,13 +3759,13 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkIntegerType(dest.typ, "xadd", start)
     checkIntegerType(op.typ, "xadd", start)
     checkCompatibleTypes(dest.typ, op.typ, "xadd", start)
-    if dest.isMem:
-      if op.isImm: error("XADD memory, immediate not supported", n)
-      if op.isMem: error("XADD memory, memory not supported", n)
+    if dest.kind == okMem:
+      if op.kind == okImm: error("XADD memory, immediate not supported", n)
+      if op.kind == okMem: error("XADD memory, memory not supported", n)
       x86.emitXadd(ctx.buf.data, dest.mem, op.reg)
     else:
-      if op.isImm: error("XADD reg, immediate not supported", n)
-      if op.isMem: error("XADD reg, memory not supported (dest must be r/m, src must be r)", n)
+      if op.kind == okImm: error("XADD reg, immediate not supported", n)
+      if op.kind == okMem: error("XADD reg, memory not supported (dest must be r/m, src must be r)", n)
       x86.emitXadd(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "xadd"
   of CmpxchgX64:
@@ -3772,19 +3775,19 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkIntegerType(dest.typ, "cmpxchg", start)
     checkIntegerType(op.typ, "cmpxchg", start)
     checkCompatibleTypes(dest.typ, op.typ, "cmpxchg", start)
-    if dest.isMem:
-      if op.isImm: error("CMPXCHG memory, immediate not supported", n)
-      if op.isMem: error("CMPXCHG memory, memory not supported", n)
+    if dest.kind == okMem:
+      if op.kind == okImm: error("CMPXCHG memory, immediate not supported", n)
+      if op.kind == okMem: error("CMPXCHG memory, memory not supported", n)
       x86.emitCmpxchg(ctx.buf.data, dest.mem, op.reg)
     else:
-      if op.isImm: error("CMPXCHG reg, immediate not supported", n)
-      if op.isMem: error("CMPXCHG reg, memory not supported (dest must be r/m, src must be r)", n)
+      if op.kind == okImm: error("CMPXCHG reg, immediate not supported", n)
+      if op.kind == okMem: error("CMPXCHG reg, memory not supported (dest must be r/m, src must be r)", n)
       x86.emitCmpxchg(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmpxchg"
   of Cmpxchg8bX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem:
+    if dest.kind == okMem:
       x86.emitCmpxchg8b(ctx.buf.data, dest.mem)
     else:
       x86.emitCmpxchg8b(ctx.buf.data, dest.reg)
@@ -3809,7 +3812,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
   of ClflushX64:
     inc n
     let op = parseDest(n, ctx)
-    if op.isMem: error("CLFLUSH expects memory operand via register?", n)
+    if op.kind == okMem: error("CLFLUSH expects memory operand via register?", n)
     # emitClflush(Register). x86.nim takes Register. CLFLUSH m8. ModRM encodes address.
     # So it takes a register which holds the address? No, it takes an address.
     # x86.nim implementation: emitClflush(reg) -> 0F AE /7 (CLFLUSH m8).
