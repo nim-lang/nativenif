@@ -17,8 +17,9 @@
     (clobber)
     (stmts
       (var :tmp.0 (rbx) (i +64))
-      (call callee.0
-        (mov tmp.0 ret.0)
+      (prepare callee.0
+        (call)
+        (mov tmp.0 (res ret.0))
       )
       (mov (rax) tmp.0)
       (ret)

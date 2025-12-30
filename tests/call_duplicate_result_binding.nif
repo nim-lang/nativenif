@@ -16,9 +16,10 @@
     (result)
     (clobber)
     (stmts
-      (call callee.0
-        (mov (rbx) ret.0)
-        (mov (rcx) ret.0)
+      (prepare callee.0
+        (call)
+        (mov (rbx) (res ret.0))
+        (mov (rcx) (res ret.0))
       )
       (ret)
     )

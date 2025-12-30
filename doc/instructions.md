@@ -130,7 +130,8 @@
 | `(jle L)`              | X64Inst                  | jump if less or equal |
 | `(jb L)`               | X64Inst                  | jump if below |
 | `(jbe L)`              | X64Inst                  | jump if below or equal |
-| `(call T ...)`         | X64Inst, A64Inst         | function call |
+| `(call T ...)`         | X64Inst, A64Inst         | function call marker inside prepare |
+| `(extcall)`            | X64Inst, A64Inst         | external call marker inside prepare |
 | `(iat S)`              | X64Inst                  | indirect call through IAT (Import Address Table) |
 | `(ret)`                | X64Inst, A64Inst         | return instruction |
 | `(push O)`             | X64Inst                  | push to stack |

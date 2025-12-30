@@ -8,9 +8,10 @@
       (var :firstVal.0 (rbx) (i +64))
       (var :secondVal.0 (rcx) (i +64))
 
-      (call produceNumbers.0
-        (mov first.0 firstVal.0)
-        (mov second.0 secondVal.0)
+      (prepare produceNumbers.0
+        (call)
+        (mov firstVal.0 (res first.0))
+        (mov secondVal.0 (res second.0))
       )
 
       (cmp firstVal.0 +7)

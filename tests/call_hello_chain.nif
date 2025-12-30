@@ -7,8 +7,9 @@
     (stmts
       (var :status.0 (rcx) (i +64))
 
-      (call relay.0
-        (mov ret.0 status.0)
+      (prepare relay.0
+        (call)
+        (mov status.0 (res ret.0))
       )
 
       (mov (rax) +60)
@@ -24,8 +25,9 @@
     )
     (clobber)
     (stmts
-      (call printHello.0
-        (mov ret.0 (rbx))
+      (prepare printHello.0
+        (call)
+        (mov (rbx) (res ret.0))
       )
       (ret)
     )

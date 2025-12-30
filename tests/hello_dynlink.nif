@@ -6,8 +6,12 @@
   (mov (x0) +1)
   (adr (x1) msg.0)
   (mov (x2) +12)
-  (call write.0)
+  (prepare write.0
+    (extcall)
+  )
   (mov (x0) +0)
-  (call exit.0)
+  (prepare exit.0
+    (extcall)
+  )
   (rodata :msg.0 "Hello World\0A")
 )

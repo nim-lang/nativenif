@@ -1,5 +1,5 @@
 
-import std / [tables, streams, os, osproc]
+import std / [tables, sets, streams, os]
 import "../../../nimony/src/lib" / [nifreader, nifstreams, nifcursors, bitabs, lineinfos, symparser]
 import instructions, model, tagconv
 import buffers, relocs, x86, arm64, elf, macho, pe
@@ -146,16 +146,30 @@ type
     stubOffset: int  # Offset in stub section
     callSites: seq[int]  # Positions of BL instructions that call this proc
 
+  CallContext = object
+    ## Context for a `prepare` block - tracks call setup state
+    target: string              # Target proc/symbol name
+    sig: Signature              # Signature (from proc or proc type)
+    isExternal: bool            # True if calling external proc
+    extProcIdx: int             # Index into extProcs for external calls
+    paramLookup: Table[string, Param]   # Quick lookup for params
+    resultLookup: Table[string, Param]  # Quick lookup for results
+    argsSet: HashSet[string]    # Arguments that have been assigned
+    resultsSet: HashSet[string] # Results that have been bound
+    callEmitted: bool           # True after (call) or (extcall) is emitted
+    stackArgSize: int           # Computed size of stack arguments (csize)
+
   GenContext = object
     scope: Scope
     buf: relocs.Buffer  # Code buffer (.text section) for x64
     bssBuf: relocs.Buffer  # BSS buffer (.bss section) for zero-initialized global variables
     arch: Arch
     procName: string
-    inCall: bool
+    callStack: seq[CallContext] # Stack of active prepare blocks (replaces inCall)
     clobbered: set[x86.Register] # Registers clobbered in current flow (x64 only)
     slots: SlotManager
     ssizePatches: seq[int]
+    csizePatches: seq[(int, int)] # (position, callStackDepth) for csize patches
     tlsOffset: int  # Current TLS offset for thread-local variables
     bssOffset: int  # Current offset in .bss section
     modules: Table[string, LoadedModule]  # Cache of loaded foreign modules
@@ -174,13 +188,33 @@ type
     isMem: bool
     mem: x86.MemoryOperand
     isSsize: bool
+    isCsize: bool  # For (csize) expression
+    isArg: bool    # For (arg name) expression - provides offset for stack args
+    argName: string
     label: LabelId
+
+proc inCall(ctx: GenContext): bool {.inline.} =
+  ## Returns true if we're inside a prepare block
+  ctx.callStack.len > 0
+
+proc currentCallStackArgSize(ctx: GenContext): int =
+  ## Returns the stack argument size for the current call
+  if ctx.callStack.len > 0:
+    result = ctx.callStack[^1].stackArgSize
+
+proc computeStackArgSize(sig: Signature): int =
+  ## Compute total size needed for stack arguments
+  result = 0
+  for param in sig.params:
+    if param.onStack:
+      result += slots.alignedSize(param.typ)
 
 proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type
 proc parseParams(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param]
 proc parseResult(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param]
 proc parseClobbers(n: var Cursor): set[x86.Register]
 proc genStmt(n: var Cursor; ctx: var GenContext)
+proc genInstA64(n: var Cursor; ctx: var GenContext)
 proc checkIntegerArithmetic(t: Type; op: string; n: Cursor)
 proc checkIntegerType(t: Type; op: string; n: Cursor)
 proc checkBitwiseType(t: Type; op: string; n: Cursor)
@@ -1036,120 +1070,117 @@ proc parseDestA64(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
   if expectedType != nil and result.typ != nil:
     checkType(expectedType, result.typ, n)
 
-proc genCallA64(n: var Cursor; ctx: var GenContext) =
-  if ctx.inCall: error("Nested calls are not allowed", n)
-  ctx.inCall = true
-  defer: ctx.inCall = false
+proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
+  ## Handle (prepare target ... (call) ...) or (prepare target ... (extcall) ...)
+  ## The prepare block sets up a call context for type checking and argument tracking.
   let start = n
   inc n
-  if n.kind != Symbol: error("Expected proc symbol, got " & $n.kind, n)
+  if n.kind != Symbol: error("Expected proc symbol or type, got " & $n.kind, n)
   let name = getSym(n)
   let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
-  if sym == nil or sym.kind notin {skProc, skExtProc}: error("Unknown proc: " & name, n)
-  if sym.isForeign:
-    error("Cannot call foreign proc '" & name & "' (must be linked)", n)
-  let sig = sym.sig
-  var paramLookup = initTable[string, Param]()
-  var resultLookup = initTable[string, Param]()
-  for param in sig.params:
-    paramLookup[param.name] = param
-  for res in sig.result:
-    resultLookup[res.name] = res
-  # Handle external proc calls differently
-  if sym.kind == skExtProc:
-    inc n
-    # Skip argument handling for now - external procs use standard ABI
-    while n.kind == ParLe:
-      skip n
-    # Record the position of this BL instruction for later patching
-    let callPos = ctx.buf.data.len
-    # Find the extproc info and add this call site
-    for i in 0..<ctx.extProcs.len:
-      if ctx.extProcs[i].name == name:
-        ctx.extProcs[i].callSites.add callPos
+
+  var callCtx = CallContext(
+    target: name,
+    paramLookup: initTable[string, Param](),
+    resultLookup: initTable[string, Param](),
+    argsSet: initHashSet[string](),
+    resultsSet: initHashSet[string](),
+    callEmitted: false
+  )
+
+  if sym == nil:
+    error("Unknown symbol: " & name, n)
+  elif sym.kind == skProc:
+    if sym.isForeign:
+      error("Cannot call foreign proc '" & name & "' directly (use extcall)", n)
+    callCtx.sig = sym.sig
+    callCtx.isExternal = false
+  elif sym.kind == skExtProc:
+    callCtx.isExternal = true
+    for i, ext in ctx.extProcs:
+      if ext.name == name:
+        callCtx.extProcIdx = i
         break
-    # Emit placeholder BL (will be patched to point to stub)
-    ctx.buf.data.addUint32(0x94000000'u32)  # BL placeholder
-    skipParRi n, "call"
-    return
+  else:
+    error("Expected proc symbol, got " & $sym.kind, n)
+
+  # Build lookup tables
+  for param in callCtx.sig.params:
+    callCtx.paramLookup[param.name] = param
+  for res in callCtx.sig.result:
+    callCtx.resultLookup[res.name] = res
+
+  # Compute stack argument size
+  callCtx.stackArgSize = computeStackArgSize(callCtx.sig)
+
+  # Push call context
+  ctx.callStack.add callCtx
   inc n
-  var args: Table[string, OperandA64]
-  var resultBindings: Table[string, OperandA64]
-  while n.kind == ParLe:
-    if n.tag == MovTagId:
-      inc n
-      if n.kind != Symbol: error("Expected argument or result name", n)
-      let bindingName = getSym(n)
-      inc n
-      if bindingName in paramLookup:
-        if bindingName in args:
-          error("Duplicate argument: " & bindingName, n)
-        let val = parseOperandA64(n, ctx)
-        args[bindingName] = val
-      elif bindingName in resultLookup:
-        if bindingName in resultBindings:
-          error("Duplicate result binding: " & bindingName, n)
-        let dest = parseDestA64(n, ctx, resultLookup[bindingName].typ)
-        if dest.isMem:
-          error("Result '" & bindingName & "' must be bound to a register", n)
-        resultBindings[bindingName] = dest
-      else:
-        error("Unknown parameter or result name: " & bindingName, n)
-      skipParRi n, "argument"
-    else:
-      error("Expected (mov arg val) in call", n)
-  for param in sig.params:
-    if param.name notin args:
-      error("Missing argument: " & param.name, n)
-    let arg = args[param.name]
-    checkType(param.typ, arg.typ, start)
-    if param.onStack:
-      error("Stack parameters not yet supported in ARM64 call generation", n)
-    else:
-      var paramReg = arm64.X0
-      let paramRegTag = tagToA64Reg(param.reg)
-      case paramRegTag
-      of X0R: paramReg = arm64.X0
-      of X1R: paramReg = arm64.X1
-      of X2R: paramReg = arm64.X2
-      of X3R: paramReg = arm64.X3
-      of X4R: paramReg = arm64.X4
-      of X5R: paramReg = arm64.X5
-      of X6R: paramReg = arm64.X6
-      of X7R: paramReg = arm64.X7
-      else: discard
-      if arg.isSsize:
-        arm64.emitMovImm(ctx.buf.data, paramReg, 0'u16)
-        ctx.ssizePatches.add(ctx.buf.data.len - 2)
-      elif arg.isImm:
-        if arg.immVal >= 0 and arg.immVal <= 0xFFFF:
-          arm64.emitMovImm(ctx.buf.data, paramReg, uint16(arg.immVal))
-        else:
-          error("Immediate value too large for MOV (must fit in 16 bits)", n)
-      elif arg.isMem:
-        arm64.emitLdr(ctx.buf.data, paramReg, arg.mem.base, arg.mem.offset)
-      elif arg.reg != paramReg:
-        arm64.emitMov(ctx.buf.data, paramReg, arg.reg)
-  var boundResults: seq[(Param, OperandA64)] = @[]
-  for res in sig.result:
-    if res.reg == InvalidTagId:
-      error("Result must be returned in a register", start)
-    if res.name notin resultBindings:
-      error("Missing result binding: " & res.name, start)
-    boundResults.add (res, resultBindings[res.name])
+
+  # Process instructions inside prepare block
+  while n.kind != ParRi:
+    genInstA64(n, ctx)
+
+  # Verify call was emitted
+  let currentCtx = ctx.callStack[^1]
+  if not currentCtx.isExternal:
+    for param in currentCtx.sig.params:
+      if not param.onStack and param.name notin currentCtx.argsSet:
+        error("Missing argument: " & param.name, n)
+
+    if not currentCtx.callEmitted:
+      error("Missing (call) or (extcall) in prepare block", n)
+
+  # Pop call context
+  discard ctx.callStack.pop()
+  skipParRi n, "prepare"
+
+proc genCallMarkerA64(n: var Cursor; ctx: var GenContext) =
+  ## Handle (call) marker inside a prepare block - emits the actual call instruction
+  if not ctx.inCall:
+    error("(call) can only be used inside a prepare block", n)
+
+  var callCtx = addr ctx.callStack[^1]
+  if callCtx.callEmitted:
+    error("Multiple (call) instructions in prepare block", n)
+  if callCtx.isExternal:
+    error("Use (extcall) for external procs, not (call)", n)
+
+  let sym = lookupWithAutoImport(ctx, ctx.scope, callCtx.target, n)
+
   var labId: LabelId
   if sym.offset == -1:
     labId = ctx.buf.createLabel()
     sym.offset = int(labId)
   else:
     labId = LabelId(sym.offset)
+
   ctx.buf.emitBL(labId)
+  callCtx.callEmitted = true
+
+  inc n
   skipParRi n, "call"
 
-  #for (res, dest) in boundResults:
-  #  let resReg = tagToRegisterA64(res.reg)
-  #  if dest.reg != resReg:
-  #    arm64.emitMov(ctx.buf.data, dest.reg, resReg)
+proc genExtcallA64(n: var Cursor; ctx: var GenContext) =
+  ## Handle (extcall) marker inside a prepare block - emits external call
+  if not ctx.inCall:
+    error("(extcall) can only be used inside a prepare block", n)
+
+  var callCtx = addr ctx.callStack[^1]
+  if callCtx.callEmitted:
+    error("Multiple call instructions in prepare block", n)
+  if not callCtx.isExternal:
+    error("Use (call) for internal procs, not (extcall)", n)
+
+  # Record call site and emit BL (will be patched to point to stub)
+  let callPos = ctx.buf.data.len
+  ctx.extProcs[callCtx.extProcIdx].callSites.add callPos
+  ctx.buf.data.addUint32(0x94000000'u32)  # BL placeholder
+
+  callCtx.callEmitted = true
+
+  inc n
+  skipParRi n, "extcall"
 
 proc genIteA64(n: var Cursor; ctx: var GenContext) =
   inc n
@@ -1291,8 +1322,12 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     while n.kind != ParRi:
       genInstA64(n, ctx)
     skipParRi n
+  of PrepareA64:
+    genPrepareA64(n, ctx)
   of CallA64:
-    genCallA64(n, ctx)
+    genCallMarkerA64(n, ctx)
+  of ExtcallA64:
+    genExtcallA64(n, ctx)
   of IteA64:
     genIteA64(n, ctx)
   of LoopA64:
@@ -2008,7 +2043,92 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
       result.typ = Type(kind: IntT, bits: 64)
       inc n
       skipParRi n, "ssize expression"
+    elif t == CsizeTagId:
+      # (csize) - call stack argument size
+      if not ctx.inCall:
+        error("(csize) can only be used inside a prepare block", n)
+      result.isCsize = true
+      result.immVal = int64(ctx.currentCallStackArgSize)
+      result.typ = Type(kind: IntT, bits: 64)
       inc n
+      skipParRi n, "csize expression"
+    elif t == ArgTagId:
+      # (arg name) - argument reference in prepare block
+      if not ctx.inCall:
+        error("(arg ...) can only be used inside a prepare block", n)
+      inc n
+      if n.kind != Symbol: error("Expected argument name in (arg ...)", n)
+      let argName = getSym(n)
+      inc n
+      skipParRi n, "arg expression"
+
+      let callCtx = addr ctx.callStack[^1]
+      if argName notin callCtx.paramLookup:
+        error("Unknown argument: " & argName, n)
+
+      let param = callCtx.paramLookup[argName]
+      if param.onStack:
+        # Stack argument - return the offset as an immediate
+        # The offset is computed from the stack parameter declarations
+        var offset = 0
+        for p in callCtx.sig.params:
+          if p.onStack:
+            if p.name == argName:
+              break
+            offset += slots.alignedSize(p.typ)
+        result.isArg = true
+        result.argName = argName
+        result.isImm = true
+        result.immVal = int64(offset)
+        result.typ = param.typ
+      else:
+        # Register argument - return the register
+        result.isArg = true
+        result.argName = argName
+        let paramRegTag = tagToX64Reg(param.reg)
+        result.reg = case paramRegTag
+          of RaxR, R0R: x86.RAX
+          of RdiR, R5R: x86.RDI
+          of RsiR, R4R: x86.RSI
+          of RdxR, R3R: x86.RDX
+          of RcxR, R2R: x86.RCX
+          of R8R: x86.R8
+          of R9R: x86.R9
+          of R10R: x86.R10
+          of R11R: x86.R11
+          else: x86.RAX
+        result.typ = param.typ
+    elif t == ResTagId:
+      # (res name) - result reference in prepare block (after call)
+      if not ctx.inCall:
+        error("(res ...) can only be used inside a prepare block", n)
+      inc n
+      if n.kind != Symbol: error("Expected result name in (res ...)", n)
+      let resName = getSym(n)
+      inc n
+      skipParRi n, "res expression"
+
+      let callCtx = addr ctx.callStack[^1]
+      if not callCtx.callEmitted:
+        error("(res ...) can only be used after (call) or (extcall)", n)
+      if resName notin callCtx.resultLookup:
+        error("Unknown result: " & resName, n)
+      if resName in callCtx.resultsSet:
+        error("Result already bound: " & resName, n)
+      callCtx.resultsSet.incl(resName)
+
+      let res = callCtx.resultLookup[resName]
+      let resRegTag = tagToX64Reg(res.reg)
+      result.reg = case resRegTag
+        of RaxR, R0R: x86.RAX
+        of RdiR, R5R: x86.RDI
+        of RsiR, R4R: x86.RSI
+        of RdxR, R3R: x86.RDX
+        of RcxR, R2R: x86.RCX
+        of R8R: x86.R8
+        of R9R: x86.R9
+        else: x86.RAX
+      result.typ = res.typ
     else:
       error("Unexpected operand tag: " & $t, n)
   elif n.kind == IntLit:
@@ -2118,6 +2238,45 @@ proc parseDest(n: var Cursor; ctx: var GenContext; expectedType: Type = nil): Op
     if result.reg in ctx.regBindings:
       error("Register " & $result.reg & " is bound to variable '" &
             ctx.regBindings[result.reg] & "', use the variable name instead", n)
+  elif n.kind == ParLe and n.tag == ArgTagId:
+    # (arg name) as destination - for register arguments in prepare block
+    if not ctx.inCall:
+      error("(arg ...) can only be used inside a prepare block", n)
+    inc n
+    if n.kind != Symbol: error("Expected argument name in (arg ...)", n)
+    let argName = getSym(n)
+    inc n
+    skipParRi n, "arg destination"
+
+    var callCtx = addr ctx.callStack[^1]
+    if argName notin callCtx.paramLookup:
+      error("Unknown argument: " & argName, n)
+
+    let param = callCtx.paramLookup[argName]
+    if param.onStack:
+      error("Stack argument '" & argName & "' cannot be used directly as destination, use (mem (rsp) (arg " & argName & "))", n)
+
+    # Track that this argument is being set
+    if argName in callCtx.argsSet:
+      error("Argument already set: " & argName, n)
+    callCtx.argsSet.incl(argName)
+
+    # Return the register for this argument
+    let paramRegTag = tagToX64Reg(param.reg)
+    result.isArg = true
+    result.argName = argName
+    result.reg = case paramRegTag
+      of RaxR, R0R: x86.RAX
+      of RdiR, R5R: x86.RDI
+      of RsiR, R4R: x86.RSI
+      of RdxR, R3R: x86.RDX
+      of RcxR, R2R: x86.RCX
+      of R8R: x86.R8
+      of R9R: x86.R9
+      of R10R: x86.R10
+      of R11R: x86.R11
+      else: x86.RAX
+    result.typ = param.typ
   elif n.kind == ParLe and (n.tag == MemTagId or n.tag == DotTagId or n.tag == AtTagId):
     let op = parseOperand(n, ctx)
     if not op.isMem:
@@ -2200,125 +2359,90 @@ proc checkCompatibleTypes(t1, t2: Type; op: string; n: Cursor) =
   if not compatible(t1, t2):
     error("Operation '" & op & "' requires compatible types, got " & $t1 & " and " & $t2, n)
 
-proc genCallX64(n: var Cursor; ctx: var GenContext) =
-  if ctx.inCall: error("Nested calls are not allowed", n)
-  ctx.inCall = true
-  defer: ctx.inCall = false
-  # (call target (mov arg val) ...)
+proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
+  ## Handle (prepare target ... (call) ...) or (prepare target ... (extcall) ...)
+  ## The prepare block sets up a call context for type checking and argument tracking.
   let start = n
   inc n
-  if n.kind != Symbol: error("Expected proc symbol, got " & $n.kind, n)
+  if n.kind != Symbol: error("Expected proc symbol or type, got " & $n.kind, n)
   let name = getSym(n)
   let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
-  if sym == nil or sym.kind != skProc: error("Unknown proc: " & name & " (use 'iat' for external procs)", n)
-  if sym.isForeign:
-    error("Cannot call foreign proc '" & name & "' (must be linked)", n)
-  let sig = sym.sig
-  var paramLookup = initTable[string, Param]()
-  var resultLookup = initTable[string, Param]()
-  for param in sig.params:
-    paramLookup[param.name] = param
-  for res in sig.result:
-    resultLookup[res.name] = res
+
+  var callCtx = CallContext(
+    target: name,
+    paramLookup: initTable[string, Param](),
+    resultLookup: initTable[string, Param](),
+    argsSet: initHashSet[string](),
+    resultsSet: initHashSet[string](),
+    callEmitted: false
+  )
+
+  if sym == nil:
+    error("Unknown symbol: " & name, n)
+  elif sym.kind == skProc:
+    if sym.isForeign:
+      error("Cannot call foreign proc '" & name & "' directly (use extcall)", n)
+    callCtx.sig = sym.sig
+    callCtx.isExternal = false
+  elif sym.kind == skExtProc:
+    # External proc - find its info
+    callCtx.isExternal = true
+    for i, ext in ctx.extProcs:
+      if ext.name == name:
+        callCtx.extProcIdx = i
+        break
+    # External procs don't have full signatures in current design
+    # For now, we skip argument checking for external procs
+  else:
+    error("Expected proc symbol, got " & $sym.kind, n)
+
+  # Build lookup tables
+  for param in callCtx.sig.params:
+    callCtx.paramLookup[param.name] = param
+  for res in callCtx.sig.result:
+    callCtx.resultLookup[res.name] = res
+
+  # Compute stack argument size
+  callCtx.stackArgSize = computeStackArgSize(callCtx.sig)
+
+  # Push call context
+  ctx.callStack.add callCtx
   inc n
 
-  # Parse arguments and results
-  var args: Table[string, Operand]
-  var resultBindings: Table[string, Operand]
-  while n.kind == ParLe:
-    if tagToX64Inst(n.tag) == MovX64:
-      inc n # mov
-      if n.kind != Symbol: error("Expected argument or result name", n)
-      let bindingName = getSym(n)
-      inc n
-      if bindingName in paramLookup:
-        if bindingName in args:
-          error("Duplicate argument: " & bindingName, n)
-        let val = parseOperand(n, ctx)
-        args[bindingName] = val
-      elif bindingName in resultLookup:
-        if bindingName in resultBindings:
-          error("Duplicate result binding: " & bindingName, n)
-        let dest = parseDest(n, ctx, resultLookup[bindingName].typ)
-        if dest.isMem:
-          error("Result '" & bindingName & "' must be bound to a register", n)
-        resultBindings[bindingName] = dest
-      else:
-        error("Unknown call operand: " & bindingName, n)
-      skipParRi n, "argument"
-    else:
-      error("Expected (mov arg val) in call", n)
+  # Process instructions inside prepare block
+  while n.kind != ParRi:
+    genInstX64(n, ctx)
 
-    # Validate arguments against signature
-  for param in sig.params:
-    if param.name notin args:
-      error("Missing argument: " & param.name, n)
-    let arg = args[param.name]
-    checkType(param.typ, arg.typ, start)
+  # Verify all register arguments were set (stack args are tracked separately)
+  let currentCtx = ctx.callStack[^1]
+  if not currentCtx.isExternal:
+    for param in currentCtx.sig.params:
+      if not param.onStack and param.name notin currentCtx.argsSet:
+        error("Missing argument: " & param.name, n)
 
-    var paramReg: x86.Register = x86.RAX # Default
-    if param.onStack:
-      # Argument is on stack.
-      # We need to push or move to stack slot?
-      # nifasm is low level. Caller prepares arguments.
-      # If param is on stack, it is at [RSP + X] relative to caller?
-      # Wait, caller pushes args.
-      # So we need `push arg`.
-      # But nifasm uses `mov` syntax?
-      # If signature says (param :x (s) ...), call uses (mov :x val).
-      # We should emit `push val`?
-      # Or `mov [rsp+offset], val` (if we reserved space).
-      # Standard convention: PUSH args.
-      # But nifasm doesn't have PUSH in CallTagId logic.
-      # The order matters for PUSH.
-      # We iterate params.
-      # If we push, we must do it in reverse order (for C convention)?
-      # Or correct order?
-      # System V: stack args are pushed right-to-left.
-      # We have named args. We need to sort them or process in signature order?
-      # Signature order is likely declaration order.
-      # If we process in order, we might need to adjust.
-      # Let's assume we emit `mov` to register for reg params.
-      # For stack params, we should emit `push`?
-      # But `emitCall` does not handle pushing.
-      # If we need to push, we should do it.
-      # For now, let's error on stack params or implement push.
-      # x86 module needs emitPush.
-      error("Stack parameters not yet supported in call generation", n)
-    else:
-      let paramRegTag = tagToX64Reg(param.reg)
-      case paramRegTag
-      of RaxR, R0R: paramReg = x86.RAX
-      of RdiR, R5R: paramReg = x86.RDI
-      of RsiR, R4R: paramReg = x86.RSI
-      of RdxR, R3R: paramReg = x86.RDX
-      of RcxR, R2R: paramReg = x86.RCX
-      of R8R: paramReg = x86.R8
-      of R9R: paramReg = x86.R9
-      else: discard
+    # Verify call was emitted
+    if not currentCtx.callEmitted:
+      error("Missing (call) or (extcall) in prepare block", n)
 
-      if arg.isSsize:
-        x86.emitMovImmToReg32(ctx.buf.data, paramReg, 0)
-        ctx.ssizePatches.add(ctx.buf.data.len - 4)
-      elif arg.isImm:
-        x86.emitMovImmToReg(ctx.buf.data, paramReg, arg.immVal)
-      elif arg.isMem:
-        x86.emitMov(ctx.buf.data, paramReg, arg.mem)
-      elif arg.reg != paramReg:
-        x86.emitMov(ctx.buf.data, paramReg, arg.reg)
+  # Pop call context
+  discard ctx.callStack.pop()
+  skipParRi n, "prepare"
 
-  var boundResults: seq[(Param, Operand)] = @[]
-  for res in sig.result:
-    if res.reg == InvalidTagId:
-      error("Result must be returned in a register", start)
-    if res.name notin resultBindings:
-      error("Missing result binding: " & res.name, start)
-    boundResults.add (res, resultBindings[res.name])
+proc genCallMarkerX64(n: var Cursor; ctx: var GenContext) =
+  ## Handle (call) marker inside a prepare block - emits the actual call instruction
+  if not ctx.inCall:
+    error("(call) can only be used inside a prepare block", n)
+
+  var callCtx = addr ctx.callStack[^1]
+  if callCtx.callEmitted:
+    error("Multiple (call) instructions in prepare block", n)
+  if callCtx.isExternal:
+    error("Use (extcall) for external procs, not (call)", n)
+
+  let sym = lookupWithAutoImport(ctx, ctx.scope, callCtx.target, n)
 
   # Clobber registers
-  ctx.clobbered.incl(sig.clobbers)
-  for (_, dest) in boundResults:
-    ctx.clobbered.excl(dest.reg)
+  ctx.clobbered.incl(callCtx.sig.clobbers)
 
   var labId: LabelId
   if sym.offset == -1:
@@ -2328,7 +2452,31 @@ proc genCallX64(n: var Cursor; ctx: var GenContext) =
     labId = LabelId(sym.offset)
 
   ctx.buf.emitCall(labId)
+  callCtx.callEmitted = true
+
+  inc n
   skipParRi n, "call"
+
+proc genExtcallX64(n: var Cursor; ctx: var GenContext) =
+  ## Handle (extcall) marker inside a prepare block - emits external call via IAT
+  if not ctx.inCall:
+    error("(extcall) can only be used inside a prepare block", n)
+
+  var callCtx = addr ctx.callStack[^1]
+  if callCtx.callEmitted:
+    error("Multiple call instructions in prepare block", n)
+  if not callCtx.isExternal:
+    error("Use (call) for internal procs, not (extcall)", n)
+
+  # Record call site and emit IAT call
+  let callPos = ctx.buf.data.len
+  ctx.extProcs[callCtx.extProcIdx].callSites.add callPos
+  ctx.buf.emitIatCall(ctx.extProcs[callCtx.extProcIdx].gotSlot)
+
+  callCtx.callEmitted = true
+
+  inc n
+  skipParRi n, "extcall"
 
   #for (res, dest) in boundResults:
   #  let resReg = tagToRegister(res.reg)
@@ -2388,6 +2536,9 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
     if op.isSsize:
       x86.emitMovImmToReg32(ctx.buf.data, dest.reg, 0)
       ctx.ssizePatches.add(ctx.buf.data.len - 4)
+    elif op.isCsize:
+      # csize is a known value - the stack argument size for the current call
+      x86.emitMovImmToReg32(ctx.buf.data, dest.reg, int32(op.immVal))
     elif op.isImm:
       if op.immVal >= low(int32) and op.immVal <= high(int32):
         x86.emitMovImmToReg32(ctx.buf.data, dest.reg, int32(op.immVal))
@@ -2641,8 +2792,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     while n.kind != ParRi:
       genInstX64(n, ctx)
     inc n
+  of PrepareX64:
+    genPrepareX64(n, ctx)
   of CallX64:
-    genCallX64(n, ctx)
+    genCallMarkerX64(n, ctx)
+  of ExtcallX64:
+    genExtcallX64(n, ctx)
   of IatX64:
     genIatX64(n, ctx)
 
@@ -2667,7 +2822,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkCompatibleTypes(dest.typ, op.typ, "add", start)
 
     if dest.isMem:
-      if op.isImm:
+      if op.isImm or op.isCsize:
         # ADD m64, imm32
         # Need emitAdd(MemoryOperand, int32)
         error("Adding immediate to memory not supported yet", n)
@@ -2681,6 +2836,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       if op.isSsize:
         x86.emitAddImm(ctx.buf.data, dest.reg, 0)
         ctx.ssizePatches.add(ctx.buf.data.len - 4)
+      elif op.isCsize:
+        x86.emitAddImm(ctx.buf.data, dest.reg, int32(op.immVal))
       elif op.isImm:
         x86.emitAddImm(ctx.buf.data, dest.reg, int32(op.immVal))
       elif op.isMem:
@@ -2700,7 +2857,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkCompatibleTypes(dest.typ, op.typ, "sub", start)
 
     if dest.isMem:
-      if op.isImm:
+      if op.isImm or op.isCsize:
         error("Subtracting immediate from memory not supported yet", n)
       elif op.isSsize:
         error("Subtracting ssize from memory not supported", n)
@@ -2712,6 +2869,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       if op.isSsize:
         x86.emitSubImm(ctx.buf.data, dest.reg, 0)
         ctx.ssizePatches.add(ctx.buf.data.len - 4)
+      elif op.isCsize:
+        x86.emitSubImm(ctx.buf.data, dest.reg, int32(op.immVal))
       elif op.isImm:
         x86.emitSubImm(ctx.buf.data, dest.reg, int32(op.immVal))
       elif op.isMem:

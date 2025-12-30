@@ -16,8 +16,9 @@
     (result)
     (clobber)
     (stmts
-      (call callee.0
-        (mov arg.0 +1)
+      (prepare callee.0
+        (mov (arg arg.0) +1)
+        (call)
       )
       (ret)
     )
