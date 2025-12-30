@@ -61,7 +61,7 @@ The difference between `ptr` and `aptr` is that `ptr` points to a single element
 
 ## Registers
 
-Registers are typically not written directly, instead if they are used as local variables, a variable declaration attaches a name to the register. The assembler keeps track of the used registers and ensures that registers are not used inconsistently! For example, a register that is currently used for a local variable cannot be used as a function argument directly. Instead a `mov` instruction must be used regardless: `(mov arg.0 my.local)`. The assembler elides the instruction if the registers are the same.
+Registers are typically not written directly, instead if they are used as local variables, a variable declaration attaches a name to the register. The assembler keeps track of the used registers and ensures that registers are not used inconsistently! For example, a register that is currently used for a local variable cannot be used as a function argument directly. Instead an `mov` instruction must be used regardless: `(mov (arg arg.0) my.local)`. The assembler elides the instruction if the registers are the same.
 
 
 ## Stack slots
@@ -87,7 +87,7 @@ Note: The `(s)` tag is required for clarity - it explicitly separates storage lo
 In `nifasm` every callsite is type-checked, a proc declaration looks like:
 
 ```
-(proc :foo.0 
+(proc :foo.0
   (params
     (param :arg.0 (rax) (i +64))
     (param :arg.1 (rcx) (u +1))
@@ -104,30 +104,34 @@ In `nifasm` every callsite is type-checked, a proc declaration looks like:
 
 The `call` instruction differs more so from a traditional assembler than the other instructions. The reason is that `nifasm` checks for parameter passing consistencies. Every parameter must be named. This way the control over scheduling decisions remains, in other words it is possible to evaluate the expression that is passed to parameter 3 before the expression that is passed to parameter 1. This might not be overly useful, but machine code naturally allows for this flexibility.
 
+Before a call can be performed the arguments must be prepared.
+
 For example:
 
 ```
 
-(call foo.0
-  (mov arg.0 +56)
-  (mov arg.1 +1)
+(prepare foo.0
+  (mov (arg arg.0) +56)
+  (mov (arg arg.1) +1)
+  (call)
 )
 ```
 
 Return values are declared in a proc's `(result ...)` section and must be bound at
-each call site as well. Use another `mov` inside the `call` block with the
+each call site as well. Use a `resmov` inside the `call` block with the
 result name as the source and a register-backed destination (plain registers or
 register-allocated variables). Stack slots are rejected and every result must be
 bound exactly once.
 
 ```
-(call foo.0
-  (mov arg.0 +56)
-  (mov ret.0 myResult)
+(prepare foo.0
+  (mov (arg arg.0) +56)
+  (call)
+  (mov myResult (res ret.0))
 )
 ```
 
-Within a `call` the named arguments are put into the scope and have to be used to make parameter passing explicit and checkable! It is checked that every argument is assigned a value and only once.
+Within a `prepare` the named arguments can be accessed via the `(arg)` annotation and have to be used to make parameter passing explicit and checkable! It is checked that every argument is assigned a value and only once. After the `(call)` instruction which is always an empty marker the function result(s) can be accessed via the `(res)` annotation.
 
 
 ## Local variables
@@ -136,9 +140,10 @@ Since local variables are described precisely, it is possible to detect code gen
 
 ```
 (var :my.local (rdi) (i +64))
-(call foo.0
-  (mov arg.0 +56)
-  (mov arg.1 +1)
+(prepare foo.0
+  (mov (arg arg.0) +56)
+  (mov (arg arg.1) +1)
+  (call)
 )
 (use my.local) # bug detected: foo.0 clobbers register rdi!
 ```
@@ -305,7 +310,7 @@ To actually load from or store to this address, the `(mem ...)` construct must b
 
 (mov (rax) (mem (dot p :x)))   # loads p.x into rax
                                # lowered to: mov rax, [rdi+0]
-(mov (rbx) (mem (dot p :y)))   # loads p.y into rbx  
+(mov (rbx) (mem (dot p :y)))   # loads p.y into rbx
                                # lowered to: mov rbx, [rdi+8]
 
 # Address computation (without loading):
@@ -358,7 +363,7 @@ For cases where high-level constructs are insufficient (e.g., pointer arithmetic
 
 ```
 (mem <base> <offset>)                        # [base + offset]
-(mem <base> <index> <scale>)                 # [base + index * scale]  
+(mem <base> <index> <scale>)                 # [base + index * scale]
 (mem <base> <index> <scale> <offset>)        # [base + index * scale + offset]
 ```
 
@@ -479,7 +484,7 @@ These instructions move data if the condition is met. `dest` must be a register.
 - `(jnae <label>)` - Jump if not above or equal (unsigned)
 
 **Function calls and returns:**
-- `(call <target>)` - Call function (target can be label or register)
+- `(prepare <target> ... (call))` - Call function (target can be label or register)
 - `(ret)` - Return from function
 
 ### Stack operations
