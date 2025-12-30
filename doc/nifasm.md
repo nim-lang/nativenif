@@ -118,8 +118,7 @@ Return values are declared in a proc's `(result ...)` section and must be bound 
 each call site as well. Use another `mov` inside the `call` block with the
 result name as the source and a register-backed destination (plain registers or
 register-allocated variables). Stack slots are rejected and every result must be
-bound exactly once. If the destination register differs from the callee's return
-register, `nifasm` inserts the move automatically:
+bound exactly once.
 
 ```
 (call foo.0

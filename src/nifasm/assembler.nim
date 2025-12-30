@@ -41,8 +41,6 @@ proc getSym(n: Cursor): string =
   case n.kind
   of Symbol, SymbolDef:
     result = pool.syms[n.symId]
-  of Ident:
-    result = pool.strings[n.litId]
   else:
     error("Expected symbol", n)
 
@@ -370,7 +368,7 @@ proc lookupWithAutoImport(ctx: var GenContext; scope: Scope; name: string; n: Cu
       result = scope.lookup(basename)
 
 proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
-  if n.kind in {Symbol, SymbolDef, Ident}:
+  if n.kind == Symbol:
     let name = getSym(n)
     let sym = lookupWithAutoImport(ctx, scope, name, n)
     if sym == nil or sym.kind != skType:
@@ -488,7 +486,7 @@ proc parseResult(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
       if n.kind == ParLe:
         wrapped = true
         inc n
-      if n.kind notin {SymbolDef, Symbol}: error("Expected result name", n)
+      if n.kind != SymbolDef: error("Expected result definition", n)
       let name = getSym(n)
       inc n
       var reg = InvalidTagId
@@ -941,7 +939,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
       result.typ = expectedType
     else:
       result.typ = Type(kind: IntT, bits: 64)
-  elif n.kind in {Symbol, Ident}:
+  elif n.kind == Symbol:
     let name = getSym(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and (sym.kind == skVar or sym.kind == skParam):
@@ -1009,7 +1007,7 @@ proc parseDestA64(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
     if not op.isMem:
       error("Expected memory destination", n)
     result = op
-  elif n.kind in {Symbol, Ident}:
+  elif n.kind == Symbol:
     let name = getSym(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and sym.kind == skVar:
@@ -1148,10 +1146,10 @@ proc genCallA64(n: var Cursor; ctx: var GenContext) =
   ctx.buf.emitBL(labId)
   skipParRi n, "call"
 
-  for (res, dest) in boundResults:
-    let resReg = tagToRegisterA64(res.reg)
-    if dest.reg != resReg:
-      arm64.emitMov(ctx.buf.data, dest.reg, resReg)
+  #for (res, dest) in boundResults:
+  #  let resReg = tagToRegisterA64(res.reg)
+  #  if dest.reg != resReg:
+  #    arm64.emitMov(ctx.buf.data, dest.reg, resReg)
 
 proc genIteA64(n: var Cursor; ctx: var GenContext) =
   inc n
@@ -1655,7 +1653,7 @@ proc collectLabels(n: var Cursor; ctx: var GenContext; scope: Scope) =
     if n.tag == LabTagId:
       var tmp = n
       inc tmp
-      if tmp.kind in {SymbolDef, Symbol, Ident}:
+      if tmp.kind == SymbolDef:
         let name = getSym(tmp)
         var sym = scope.lookup(name)
         if sym == nil:
@@ -1711,7 +1709,7 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   var scan = n
   if scan.kind == ParLe and scan.tag == StmtsTagId:
     collectLabels(scan, ctx, ctx.scope)
-  if ctx.arch in {Arch.X64, Arch.WinX64}:
+  when false: # if ctx.arch in {Arch.X64, Arch.WinX64}:
     x86.emitPush(ctx.buf.data, RBP)
     x86.emitMov(ctx.buf.data, RBP, RSP)
     x86.emitSubImm(ctx.buf.data, RSP, 0)
@@ -2023,7 +2021,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
         result.typ = expectedType
     else:
         result.typ = Type(kind: IntT, bits: 64) # Default
-  elif n.kind in {Symbol, Ident}:
+  elif n.kind == Symbol:
     let name = getSym(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and (sym.kind == skVar or sym.kind == skParam):
@@ -2332,10 +2330,10 @@ proc genCallX64(n: var Cursor; ctx: var GenContext) =
   ctx.buf.emitCall(labId)
   skipParRi n, "call"
 
-  for (res, dest) in boundResults:
-    let resReg = tagToRegister(res.reg)
-    if dest.reg != resReg:
-      x86.emitMov(ctx.buf.data, dest.reg, resReg)
+  #for (res, dest) in boundResults:
+  #  let resReg = tagToRegister(res.reg)
+  #  if dest.reg != resReg:
+  #    x86.emitMov(ctx.buf.data, dest.reg, resReg)
 
 proc genIatX64(n: var Cursor; ctx: var GenContext) =
   # (iat symbol) - Indirect call through IAT for external procs
@@ -3354,7 +3352,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     skipParRi n, "nop"
   of RetX64:
     inc n
-    if ctx.procName.len > 0:
+    when false: # if ctx.procName.len > 0:
       x86.emitMov(ctx.buf.data, RSP, RBP)
       x86.emitPop(ctx.buf.data, RBP)
     x86.emitRet(ctx.buf.data)

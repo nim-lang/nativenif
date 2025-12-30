@@ -5,7 +5,7 @@
     (result)
     (clobber)
     (stmts
-      (var :arr (s) (array (i +64) +3))
+      (var :arr.0 (s) (array (i +64) +3))
       (var :arrptr.0 (rsi) (aptr (i +64)))
 
       (mov (rbx) +1000)
