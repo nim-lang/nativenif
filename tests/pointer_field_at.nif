@@ -1,8 +1,8 @@
 (.nif24)
 (stmts
-  (type :Buffer (object
-    (fld :ptr (aptr (i +32)))
-    (fld :len (i +64))
+  (type :Buffer.0 (object
+    (fld :ptr.0 (aptr (i +32)))
+    (fld :len.0 (i +64))
   ))
 
   (proc :main.0
@@ -10,41 +10,41 @@
     (result)
     (clobber)
     (stmts
-      (var :arr (s) (array (i +32) +4))
-      (var :buf (s) Buffer)
+      (var :arr.0 (s) (array (i +32) +4))
+      (var :buf.0 (s) Buffer.0)
 
       (mov (rbx) +101)
-      (mov (mem (at arr +0)) (rbx))
+      (mov (mem (at arr.0 +0)) (rbx))
       (mov (rbx) +202)
-      (mov (mem (at arr +1)) (rbx))
+      (mov (mem (at arr.0 +1)) (rbx))
       (mov (rbx) +303)
-      (mov (mem (at arr +2)) (rbx))
+      (mov (mem (at arr.0 +2)) (rbx))
       (mov (rbx) +404)
-      (mov (mem (at arr +3)) (rbx))
+      (mov (mem (at arr.0 +3)) (rbx))
 
-      (lea (rsi) arr)
-      (mov (mem (dot buf :ptr)) (rsi))
+      (lea (rsi) arr.0)
+      (mov (mem (dot buf.0 :ptr.0)) (rsi))
       (mov (rbx) +4)
-      (mov (mem (dot buf :len)) (rbx))
+      (mov (mem (dot buf.0 :len.0)) (rbx))
 
       (mov (rsi) +0)
-      (mov (rsi) (mem (dot buf :ptr)))
+      (mov (rsi) (mem (dot buf.0 :ptr.0)))
       (mov (rcx) +3)
       (mov (r8) (mem (at (cast (aptr (i +32)) (rsi)) (rcx))))
-      (mov (r9) (mem (dot buf :len)))
+      (mov (r9) (mem (dot buf.0 :len.0)))
 
       (cmp (r8) +404)
-      (jne fail)
+      (jne fail.0)
       (cmp (r9) +4)
-      (jne fail)
+      (jne fail.0)
 
       (mov (rdi) +0)
-      (jmp exit)
+      (jmp exit.0)
 
-      (lab :fail)
+      (lab :fail.0)
       (mov (rdi) +1)
 
-      (lab :exit)
+      (lab :exit.0)
       (mov (rax) +60)
       (syscall)
     )

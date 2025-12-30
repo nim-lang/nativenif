@@ -17,8 +17,8 @@
     (clobber)
     (stmts
       (call callee.0
-        (mov ret.0 (rbx))
-        (mov ret.0 (rcx))
+        (mov (rbx) ret.0)
+        (mov (rcx) ret.0)
       )
       (ret)
     )

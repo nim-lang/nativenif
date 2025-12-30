@@ -1,8 +1,8 @@
 (.nif24)
 (stmts
-  (type :Point (object
-    (fld :x (i +64))
-    (fld :y (i +64))
+  (type :Point.0 (object
+    (fld :x.0 (i +64))
+    (fld :y.0 (i +64))
   ))
 
   (proc :main.0
@@ -10,48 +10,48 @@
     (result)
     (clobber)
     (stmts
-      (var :p (s) Point)
-      (var :ptr.0 (rax) (ptr Point))
+      (var :p.0 (s) Point.0)
+      (var :ptr.0 (rax) (ptr Point.0))
 
       (mov (rbx) +10)
-      (mov (mem (dot p :x)) (rbx))
+      (mov (mem (dot p.0 :x.0)) (rbx))
       (mov (rbx) +20)
-      (mov (mem (dot p :y)) (rbx))
+      (mov (mem (dot p.0 :y.0)) (rbx))
 
-      (lea (rax) p)
-      (mov (rcx) (mem (dot ptr.0 :x)))
-      (mov (rdx) (mem (dot ptr.0 :y)))
+      (lea (rax) p.0)
+      (mov (rcx) (mem (dot ptr.0 :x.0)))
+      (mov (rdx) (mem (dot ptr.0 :y.0)))
       (kill ptr.0)
 
-      (var :arr (s) (array (i +32) +5))
+      (var :arr.0 (s) (array (i +32) +5))
       (var :arrptr.0 (rsi) (aptr (i +32)))
 
       (mov (rbx) +100)
-      (mov (mem (at arr +0)) (rbx))
+      (mov (mem (at arr.0 +0)) (rbx))
       (mov (rbx) +200)
       (mov (r9) +1)
-      (mov (mem (at arr (r9))) (rbx))
+      (mov (mem (at arr.0 (r9))) (rbx))
       (mov (rbx) +300)
-      (mov (mem (at arr +2)) (rbx))
+      (mov (mem (at arr.0 +2)) (rbx))
 
-      (lea (rsi) arr)
+      (lea (rsi) arr.0)
       (mov (r10) +2)
       (mov (r8) (mem (at arrptr.0 (r10))))
 
       (cmp (rcx) +10)
-      (jne fail)
+      (jne fail.0)
       (cmp (rdx) +20)
-      (jne fail)
+      (jne fail.0)
       (cmp (r8) +300)
-      (jne fail)
+      (jne fail.0)
 
       (mov (rdi) +0)
-      (jmp exit)
+      (jmp exit.0)
 
-      (lab :fail)
+      (lab :fail.0)
       (mov (rdi) +1)
 
-      (lab :exit)
+      (lab :exit.0)
       (mov (rax) +60)
       (syscall)
     )

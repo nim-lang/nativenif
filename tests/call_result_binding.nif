@@ -18,7 +18,7 @@
     (stmts
       (var :tmp.0 (rbx) (i +64))
       (call callee.0
-        (mov ret.0 tmp.0)
+        (mov tmp.0 ret.0)
       )
       (mov (rax) tmp.0)
       (ret)

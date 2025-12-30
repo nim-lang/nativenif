@@ -14,17 +14,17 @@
       )
 
       (cmp firstVal.0 +7)
-      (jne fail)
+      (jne fail.0)
       (cmp secondVal.0 +11)
-      (jne fail)
+      (jne fail.0)
 
       (mov (rdi) +0)
-      (jmp exit)
+      (jmp exit.0)
 
-      (lab :fail)
+      (lab :fail.0)
       (mov (rdi) +1)
 
-      (lab :exit)
+      (lab :exit.0)
       (mov (rax) +60)
       (syscall)
     )
