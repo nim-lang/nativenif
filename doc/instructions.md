@@ -20,6 +20,10 @@
 | `(arch x64/arm64)`     | NifasmDecl                  | architecture pragma |
 | `(s)`                  | X64Flag                 | stack slot location tag |
 | `(ssize)`              | NifasmExpr                  | stack size expression |
+| `(csize)`              | NifasmExpr                  | call stack size expression |
+| `(arg S)`              | NifasmExpr                  | argument reference in prepare block |
+| `(res S)`              | NifasmExpr                  | result reference in prepare block |
+| `(prepare S ...)`      | X64Inst, A64Inst            | prepare block for function call |
 | `(mov D S)`            | X64Inst, A64Inst         | move instruction |
 | `(lea D S)`            | X64Inst                  | load effective address |
 | `(movapd D S)`         | X64Inst                  | move aligned packed double |

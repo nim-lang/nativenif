@@ -100,6 +100,67 @@ In `nifasm` every callsite is type-checked, a proc declaration looks like:
 )
 ```
 
+### Stack parameters
+
+Parameters can also be passed on the stack instead of in registers. Use `(s)` or `(s +N)` instead of a register name to indicate a stack-passed parameter:
+
+```
+(proc :bar.0
+  (params
+    (param :arg.0 (rdi) (i +64))        # register parameter
+    (param :arg.1 (rsi) (i +64))        # register parameter
+    (param :arg.2 (s +8) (i +64))       # first stack param at base offset 8
+    (param :arg.3 (s) (i +64))          # next stack param (offset computed)
+    (param :arg.4 (s) Point)            # next stack param (offset computed)
+  )
+  (ret :ret.0 (rax) (i +64))
+  (clobber (r10))
+  (body ...)
+)
+```
+
+The `(s +N)` syntax specifies the base offset for the first stack parameter. Common values:
+- `(s +8)` - after return address (x86-64 without frame pointer)
+- `(s +16)` - after return address and saved rbp (x86-64 with frame pointer)
+
+Subsequent `(s)` parameters without an explicit offset are computed from:
+- The offset of the preceding `(s)` parameter
+- The size of the preceding parameter
+- Alignment requirements of the current parameter's type
+
+This is consistent with how `(s)` is used for local stack-allocated variables.
+
+### Accessing stack parameters in the proc body
+
+Within the proc body, stack parameters are accessed using `(mem <base> <name>)` where the base register is explicitly provided and the assembler uses the offset from the parameter declaration. The base register must be specified - no implicit register usage.
+
+```
+(proc :bar.0
+  (params
+    (param :arg.0 (rdi) (i +64))        # register parameter
+    (param :arg.1 (s +8) (i +64))       # stack param at offset 8
+    (param :arg.2 (s) (i +64))          # stack param at offset 16 (computed)
+  )
+  (ret :ret.0 (rax) (i +64))
+  (body
+    # Register parameter: use the variable name directly
+    (mov (rax) arg.0)
+
+    # Stack parameters: explicit base register + parameter name for offset
+    (mov (rbx) (mem (rsp) arg.1))       # load from [rsp + 8]
+    (mov (rcx) (mem (rsp) arg.2))       # load from [rsp + 16]
+
+    # With frame pointer (offsets would be declared differently):
+    (mov (rbx) (mem (rbp) arg.1))       # load from [rbp + offset_of_arg.1]
+
+    # To get the address of a stack parameter:
+    (lea (rdx) (mem (rsp) arg.1))       # compute rsp + 8 into rdx
+  )
+)
+```
+
+The parameter name provides the declared/computed offset, but the base register (`rsp`, `rbp`, or any other) must always be explicit. The parameter's type is preserved for type checking.
+
 ## Call instruction
 
 The `call` instruction differs more so from a traditional assembler than the other instructions. The reason is that `nifasm` checks for parameter passing consistencies. Every parameter must be named. This way the control over scheduling decisions remains, in other words it is possible to evaluate the expression that is passed to parameter 3 before the expression that is passed to parameter 1. This might not be overly useful, but machine code naturally allows for this flexibility.
@@ -109,7 +170,6 @@ Before a call can be performed the arguments must be prepared.
 For example:
 
 ```
-
 (prepare foo.0
   (mov (arg arg.0) +56)
   (mov (arg arg.1) +1)
@@ -117,11 +177,52 @@ For example:
 )
 ```
 
-Return values are declared in a proc's `(result ...)` section and must be bound at
-each call site as well. Use a `resmov` inside the `call` block with the
-result name as the source and a register-backed destination (plain registers or
-register-allocated variables). Stack slots are rejected and every result must be
-bound exactly once.
+### Stack arguments with `(csize)`
+
+When a proc has stack parameters, the caller must explicitly manage the stack. The `(csize)` builtin computes the total stack space required for the current call's stack arguments (analogous to `(ssize)` for function entry points).
+
+For register parameters, `(arg name)` refers to the register. For stack parameters, `(arg name)` provides only the computed offset - the base register must be explicit:
+
+```
+(prepare bar.0
+  (sub (rsp) (csize))                       # reserve stack space for args
+  (mov (arg arg.0) +56)                     # register arg: (arg arg.0) is the register
+  (mov (arg arg.1) +78)                     # register arg: (arg arg.1) is the register
+  (mov (mem (rsp) (arg arg.2)) +123)        # stack arg: explicit [rsp + offset]
+  (mov (mem (rsp) (arg arg.3)) +456)        # stack arg: explicit [rsp + offset]
+  (call)
+  (add (rsp) (csize))                       # explicit cleanup
+)
+```
+
+Alternatively, stack arguments can be set up using `push` with an `(arg)` annotation for type checking:
+
+```
+(prepare bar.0
+  (push (arg arg.3) +456)                   # push 456, annotated as arg.3
+  (push (arg arg.2) +123)                   # push 123, annotated as arg.2
+  (mov (arg arg.0) +56)                     # register arg
+  (mov (arg arg.1) +78)                     # register arg
+  (call)
+  (add (rsp) (csize))                       # explicit cleanup
+)
+```
+
+The `(arg name)` annotation in `(push (arg name) value)` is purely for type checking - it has no representation in the generated instruction. The assembler emits a plain `push` but verifies that:
+- The pushed value's type is compatible with the declared parameter type
+- Each stack argument is annotated exactly once
+
+The assembler verifies that:
+- Every register argument is assigned exactly once via `(mov (arg name) value)`
+- Every stack argument is annotated exactly once via `(push (arg name) value)` or assigned via `(mov (mem (rsp) (arg name)) value)`
+- The types of assigned values are compatible with the parameter types
+- Stack management is explicit - no implicit code is generated
+
+### Return values
+
+Return values are declared in a proc's `(ret ...)` section and must be bound at
+each call site as well. After the `(call)` marker, use `(res name)` to access
+the result value:
 
 ```
 (prepare foo.0
@@ -131,7 +232,11 @@ bound exactly once.
 )
 ```
 
-Within a `prepare` the named arguments can be accessed via the `(arg)` annotation and have to be used to make parameter passing explicit and checkable! It is checked that every argument is assigned a value and only once. After the `(call)` instruction which is always an empty marker the function result(s) can be accessed via the `(res)` annotation.
+Within a `prepare` block:
+- Before `(call)`: Named arguments are accessed via `(arg name)`
+- After `(call)`: Named results are accessed via `(res name)`
+
+It is checked that every argument is assigned a value exactly once, and every result is bound exactly once.
 
 
 ## Local variables
@@ -555,4 +660,30 @@ The number of available registers varies by platform: x86-64 provides 16 general
 | r7             | rsp       |
 | r8..r15        | already have the proper names |
 |----------------|-----------|
+
+
+## Reserved registers
+
+Some architectures have limited immediate value ranges for memory addressing. When an offset computed by the assembler exceeds the encodable limit, the assembler must use a scratch register to compute the address. To avoid conflicts with user code, nifasm reserves specific registers that **cannot be used in assembler code**:
+
+| Architecture | Reserved registers | Immediate limit | Reason |
+|--------------|-------------------|-----------------|--------|
+| x86-64 | (none) | ±2GB | 32-bit displacements are sufficient |
+| ARM64 | x16, x17 | ±4KB / ±512B | ABI reserves IP0/IP1 for linker veneers |
+| RISC-V | t0, t1 | ±2KB | Convention for linker/assembler scratch |
+
+**Why these registers?**
+
+On ARM64, the ABI already reserves `x16` (IP0) and `x17` (IP1) for linker-generated code (veneers for long branches, PLT entries). Any function call may corrupt these registers, so user code cannot rely on them across calls anyway. Nifasm exploits this by using them for internal address calculations.
+
+On RISC-V, `t0` and `t1` serve a similar conventional role for linker stubs, making them natural choices for assembler scratch use.
+
+**Implications for code generators:**
+
+- Do not allocate variables to reserved registers
+- Do not use reserved registers in instructions
+- The assembler will reject code that references reserved registers
+- This leaves the full set of remaining registers for the code generator's use
+
+The reserved registers are used transparently by the assembler when needed. User code does not need to account for large offsets - the assembler handles this automatically while preserving type checking.
 
