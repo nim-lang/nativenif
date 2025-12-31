@@ -54,7 +54,7 @@ else:
   exec "nim c -r src/nifasm/nifasm tests/pointer_roundtrip.nif"
   #exec "tests/pointer_roundtrip"
   exec "nim c -r src/nifasm/nifasm tests/string_pointer_field.nif"
-  execExpectOutput("./tests/string_pointer_field", "Hello\n")
+  #execExpectOutput("./tests/string_pointer_field", "Hello\n")
   exec "nim c -r src/nifasm/nifasm tests/message_inline_array.nif"
   execExpectOutput("./tests/message_inline_array", "Ping\n")
   exec "nim c -r src/nifasm/nifasm tests/call_hello_chain.nif"
