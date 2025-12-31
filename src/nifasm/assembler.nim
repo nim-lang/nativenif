@@ -16,7 +16,7 @@ proc infoStr(n: Cursor): string =
 
 proc error(msg: string; n: Cursor) =
   writeStackTrace()
-  let tagStr = if n.kind == ParLe: $tag(n) else: "-"
+  let tagStr = if n.kind != ParRi: toString(n, false) else: "-"
   quit "[Error] " & msg & " at " & infoStr(n) &
     " (kind=" & $n.kind & ", tag=" & tagStr & ")"
 
@@ -39,7 +39,7 @@ proc getInt(n: Cursor): int64 =
 
 proc getSym(n: Cursor): string =
   case n.kind
-  of Symbol, SymbolDef:
+  of Symbol:
     result = pool.syms[n.symId]
   else:
     error("Expected symbol", n)
@@ -235,7 +235,7 @@ proc parseObjectBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
     if n.kind == ParLe and n.tag == FldTagId:
       inc n
       if n.kind != SymbolDef: error("Expected field name", n)
-      let name = getSym(n)
+      let name = pool.syms[n.symId]
       inc n
       let ftype = parseType(n, scope, ctx)
       fields.add (name, ftype)
@@ -456,7 +456,7 @@ proc parseUnionBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
     if n.kind == ParLe and n.tag == FldTagId:
       inc n
       if n.kind != SymbolDef: error("Expected field name", n)
-      let name = getSym(n)
+      let name = pool.syms[n.symId]
       inc n
       let ftype = parseType(n, scope, ctx)
       fields.add (name, ftype)
@@ -488,7 +488,7 @@ proc parseParams(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
     if n.kind == ParLe and tagToNifasmDecl(n.tag) == ParamD:
       inc n # param
       if n.kind != SymbolDef: error("Expected param name", n)
-      let name = getSym(n)
+      let name = pool.syms[n.symId]
       inc n
 
       # (reg) or (s) location
@@ -526,7 +526,7 @@ proc parseResult(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
         wrapped = true
         inc n
       if n.kind != SymbolDef: error("Expected result definition", n)
-      let name = getSym(n)
+      let name = pool.syms[n.symId]
       inc n
       var reg = InvalidTagId
       if n.kind == ParLe:
@@ -560,7 +560,7 @@ proc pass1Proc(n: var Cursor; scope: Scope; ctx: var GenContext) =
   # (proc :Name (params ...) (result ...) (clobber ...) (body ...))
   inc n
   if n.kind != SymbolDef: error("Expected proc name", n)
-  let name = getSym(n)
+  let name = pool.syms[n.symId]
   inc n
 
   var sig = Signature(params: @[], result: @[], clobbers: {})
@@ -609,7 +609,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext) =
         of TypeD:
           inc n
           if n.kind != SymbolDef: error("Expected type name", n)
-          let name = getSym(n)
+          let name = pool.syms[n.symId]
           inc n
           if n.kind == ParLe and n.tag == ObjectTagId:
             let typ = parseObjectBody(n, scope, ctx)
@@ -630,7 +630,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext) =
         of RodataD:
           inc n
           if n.kind != SymbolDef: error("Expected rodata name", n)
-          let name = getSym(n)
+          let name = pool.syms[n.symId]
           var sym = Symbol(name: name, kind: skRodata)
           sym.offset = -1  # Mark as forward reference until defined
           scope.define(sym)
@@ -639,7 +639,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext) =
         of GvarD:
           inc n
           if n.kind != SymbolDef: error("Expected gvar name", n)
-          let name = getSym(n)
+          let name = pool.syms[n.symId]
           inc n # skip name
           let typ = parseType(n, scope, ctx)
           scope.define(Symbol(name: name, kind: skGvar, typ: typ))
@@ -648,7 +648,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext) =
         of TvarD:
           inc n
           if n.kind != SymbolDef: error("Expected tvar name", n)
-          let name = getSym(n)
+          let name = pool.syms[n.symId]
           inc n # skip name
           let typ = parseType(n, scope, ctx)
           scope.define(Symbol(name: name, kind: skTvar, typ: typ))
@@ -675,7 +675,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext) =
           # (extproc :name "external_name")
           inc n
           if n.kind != SymbolDef: error("Expected extproc name", n)
-          let name = getSym(n)
+          let name = pool.syms[n.symId]
           inc n
           if n.kind != StringLit: error("Expected external symbol name string", n)
           let extName = getStr(n)
@@ -807,7 +807,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
       # (dot <base> <fieldname>) - similar to x64
       inc n
       var baseOp = parseOperandA64(n, ctx)
-      if n.kind != Symbol and n.kind != SymbolDef:
+      if n.kind != Symbol:
         error("Expected field name in dot expression", n)
       let fieldName = getSym(n)
       inc n
@@ -1279,7 +1279,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of CfvarD:
     inc n
     if n.kind != SymbolDef: error("Expected cfvar name", n)
-    let name = getSym(n)
+    let name = pool.syms[n.symId]
     inc n
     let cfvarLabel = ctx.buf.createLabel()
     let sym = Symbol(name: name, kind: skCfvar, typ: Type(kind: BoolT), offset: int(cfvarLabel), used: false)
@@ -1290,7 +1290,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of VarD:
     inc n
     if n.kind != SymbolDef: error("Expected var name", n)
-    let name = getSym(n)
+    let name = pool.syms[n.symId]
     inc n
     var reg = InvalidTagId
     var onStack = false
@@ -1347,7 +1347,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of LabA64:
     inc n
     if n.kind != SymbolDef: error("Expected label name", n)
-    let name = getSym(n)
+    let name = pool.syms[n.symId]
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym == nil:
       let labId = ctx.buf.createLabel()
@@ -1697,7 +1697,7 @@ proc collectLabels(n: var Cursor; ctx: var GenContext; scope: Scope) =
       var tmp = n
       inc tmp
       if tmp.kind == SymbolDef:
-        let name = getSym(tmp)
+        let name = pool.syms[tmp.symId]
         var sym = scope.lookup(name)
         if sym == nil:
           let labId = ctx.buf.createLabel()
@@ -1717,7 +1717,9 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   ctx.scope = newScope(oldScope)
 
   inc n
-  let name = getSym(n)
+  if n.kind != SymbolDef:
+    error("Expected symbol definition", n)
+  let name = pool.syms[n.symId]
   ctx.procName = name
 
   # Find/Create label for proc
@@ -1794,7 +1796,7 @@ proc genStmt(n: var Cursor; ctx: var GenContext) =
   else:
     genInst(n, ctx)
 
-proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil): Operand =
+proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil; allowStackAddr: bool = false): Operand =
   if n.kind == ParLe:
     let t = n.tag
     if rawTagIsX64Reg(t):
@@ -1807,9 +1809,9 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
     elif t == DotTagId:
       # (dot <base> <fieldname>)
       inc n
-      var baseOp = parseOperand(n, ctx)
+      var baseOp = parseOperand(n, ctx, nil, allowStackAddr=true)
 
-      if n.kind != Symbol and n.kind != SymbolDef:
+      if n.kind != Symbol:
         error("Expected field name in dot expression", n)
       let fieldName = getSym(n)
       inc n
@@ -1885,7 +1887,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
     elif t == AtTagId:
       # (at <base> <index>)
       inc n
-      var baseOp = parseOperand(n, ctx)
+      var baseOp = parseOperand(n, ctx, nil, allowStackAddr=true)
       var indexOp = parseOperand(n, ctx)
 
       # Type check: index must be an integer
@@ -2150,15 +2152,28 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
     # Immediate type inference?
     # If expectedType is provided, try to match it.
     if expectedType != nil and (expectedType.kind in {IntT, UIntT, FloatT}):
-        result.typ = expectedType
+      result.typ = expectedType
     else:
-        result.typ = Type(kind: IntT, bits: 64) # Default
+      result.typ = Type(kind: IntT, bits: 64) # Default
   elif n.kind == Symbol:
     let name = getSym(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and (sym.kind == skVar or sym.kind == skParam):
       if sym.onStack:
-        error("Stack variable '" & name & "' cannot be used directly, use (mem (rsp) " & name & ")", n)
+        if allowStackAddr:
+          # Return memory operand for stack variable address (for lea, dot, at)
+          result.kind = okMem
+          result.mem = x86.MemoryOperand(
+            base: x86.RSP,
+            displacement: int32(sym.offset),
+            hasIndex: false
+          )
+          # Keep the original type - okMem already implies it's an address
+          result.typ = sym.typ
+          inc n
+          return
+        else:
+          error("Stack variable '" & name & "' cannot be used directly, use (mem (rsp) " & name & ")", n)
       elif sym.reg != InvalidTagId:
         let regTag = tagToX64Reg(sym.reg)
         result.reg = case regTag
@@ -2519,13 +2534,14 @@ proc genIatX64(n: var Cursor; ctx: var GenContext) =
   skipParRi n, "iat"
 
 proc genMovX64(n: var Cursor; ctx: var GenContext) =
+  let start = n
   inc n
   let dest = parseDest(n, ctx)
   let op = parseOperand(n, ctx)
 
   # Type checking
   if dest.typ != nil and op.typ != nil:
-    checkType(dest.typ, op.typ, n)
+    checkType(dest.typ, op.typ, start)
 
   if dest.kind == okMem:
     if op.kind == okImm:
@@ -2745,7 +2761,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # (cfvar :name.0)
     inc n
     if n.kind != SymbolDef: error("Expected cfvar name", n)
-    let name = getSym(n)
+    let name = pool.syms[n.symId]
     inc n
 
     # Control flow variables are always virtual (bool type, never materialized)
@@ -2760,7 +2776,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
   of VarD:
     inc n
     if n.kind != SymbolDef: error("Expected var name", n)
-    let name = getSym(n)
+    let name = pool.syms[n.symId]
     inc n
     var reg = InvalidTagId
     var onStack = false
@@ -3419,7 +3435,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
   of LeaX64:
     inc n
     let dest = parseRegister(n) # LEA dest must be register
-    let op = parseOperand(n, ctx)
+    let op = parseOperand(n, ctx, nil, allowStackAddr=true)
     # LEA reg, label (rip-rel) or LEA reg, mem
     if op.kind == okMem:
       x86.emitLea(ctx.buf.data, dest, op.mem)
@@ -3539,7 +3555,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # (lab :label)
     inc n
     if n.kind != SymbolDef: error("Expected label name", n)
-    let name = getSym(n)
+    let name = pool.syms[n.symId]
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     # Label might not be defined yet if this is inside a proc body?
     # No, Pass 1 handles types/procs. Labels are local to procs?
@@ -3875,7 +3891,7 @@ proc pass2(n: Cursor; ctx: var GenContext) =
           inc n
           if n.kind != SymbolDef:
             error("Expected symbol definition", n)
-          let name = getSym(n)
+          let name = pool.syms[n.symId]
           let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
           if sym != nil and sym.isForeign:
             # Skip foreign proc body
@@ -3886,7 +3902,8 @@ proc pass2(n: Cursor; ctx: var GenContext) =
             pass2Proc(n, ctx)
         of RodataD:
           inc n
-          let name = getSym(n)
+          if n.kind != SymbolDef: error("Expected symbol definition", n)
+          let name = pool.syms[n.symId]
           let sym = ctx.scope.lookup(name)
           inc n
           let s = getStr(n)
@@ -3904,7 +3921,8 @@ proc pass2(n: Cursor; ctx: var GenContext) =
         of GvarD:
           # Global variable declaration - goes in .bss section (zero-initialized writable memory)
           inc n
-          let name = getSym(n)
+          if n.kind != SymbolDef: error("Expected symbol definition", n)
+          let name = pool.syms[n.symId]
           let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
           if sym == nil: error("Global variable not found in scope: " & name, n)
           if sym.isForeign:
@@ -3935,7 +3953,8 @@ proc pass2(n: Cursor; ctx: var GenContext) =
         of TvarD:
           # Thread local variable declaration
           inc n
-          let name = getSym(n)
+          if n.kind != SymbolDef: error("Expected symbol definition", n)
+          let name = pool.syms[n.symId]
           let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
           if sym == nil: error("TLS variable not found in scope: " & name, n)
           if sym.isForeign:

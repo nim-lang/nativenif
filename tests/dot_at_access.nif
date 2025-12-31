@@ -14,17 +14,17 @@
       (var :ptr.0 (rax) (ptr Point.0))
 
       (mov (rbx) +10)
-      (mov (mem (dot p.0 :x.0)) (rbx))
+      (mov (mem (dot p.0 x.0)) (rbx))
       (mov (rbx) +20)
-      (mov (mem (dot p.0 :y.0)) (rbx))
+      (mov (mem (dot p.0 y.0)) (rbx))
 
       (lea (rax) p.0)
-      (mov (rcx) (mem (dot ptr.0 :x.0)))
-      (mov (rdx) (mem (dot ptr.0 :y.0)))
+      (mov (rcx) (mem (dot ptr.0 x.0)))
+      (mov (rdx) (mem (dot ptr.0 y.0)))
       (kill ptr.0)
 
-      (var :arr.0 (s) (array (i +32) +5))
-      (var :arrptr.0 (rsi) (aptr (i +32)))
+      (var :arr.0 (s) (array (i +64) +5))
+      (var :arrptr.0 (rsi) (aptr (i +64)))
 
       (mov (rbx) +100)
       (mov (mem (at arr.0 +0)) (rbx))
