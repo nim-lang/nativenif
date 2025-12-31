@@ -797,7 +797,7 @@ type
     mem: arm64.MemoryOperand
     label: LabelId
 
-proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = nil): OperandA64 =
+proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
   if n.kind == ParLe:
     let t = n.tag
     if rawTagIsA64Reg(t):
@@ -908,7 +908,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
     elif t == CastTagId:
       inc n
       let castType = parseType(n, ctx.scope, ctx)
-      var op = parseOperandA64(n, ctx, nil)
+      var op = parseOperandA64(n, ctx)
       op.typ = castType
       result = op
       skipParRi n, "`cast` expression"
@@ -971,11 +971,8 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
   elif n.kind == IntLit:
     result.kind = okImm
     result.immVal = getInt(n)
+    result.typ = Type(kind: IntLitT, bits: 64)
     inc n
-    if expectedType != nil and (expectedType.kind in {IntT, UIntT, FloatT}):
-      result.typ = expectedType
-    else:
-      result.typ = Type(kind: IntLitT, bits: 64) # Literal - compatible with IntT and UIntT
   elif n.kind == Symbol:
     let name = getSym(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
@@ -1035,13 +1032,10 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
   else:
     error("Unexpected operand kind", n)
 
-proc parseDestA64(n: var Cursor; ctx: var GenContext; expectedType: Type = nil): OperandA64 =
+proc parseDestA64(n: var Cursor; ctx: var GenContext): OperandA64 =
   if n.kind == ParLe and rawTagIsA64Reg(n.tag):
     result.reg = parseRegisterA64(n)
-    if expectedType != nil:
-      result.typ = expectedType
-    else:
-      result.typ = Type(kind: IntT, bits: 64)
+    result.typ = Type(kind: RegisterT, regBits: 64)
   elif n.kind == ParLe and (n.tag == MemTagId or n.tag == DotTagId or n.tag == AtTagId):
     let op = parseOperandA64(n, ctx)
     if op.kind != okMem:
@@ -1077,9 +1071,6 @@ proc parseDestA64(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
       error("Expected variable or register as destination", n)
   else:
     error("Expected destination", n)
-
-  if expectedType != nil and result.typ != nil:
-    checkType(expectedType, result.typ, n)
 
 proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
   ## Handle (prepare target ... (call) ...) or (prepare target ... (extcall) ...)
@@ -1808,7 +1799,7 @@ proc genStmt(n: var Cursor; ctx: var GenContext) =
   else:
     genInst(n, ctx)
 
-proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil): Operand =
+proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
   if n.kind == ParLe:
     let t = n.tag
     if rawTagIsX64Reg(t):
@@ -2010,7 +2001,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
       inc n
       let castType = parseType(n, ctx.scope, ctx)
       # Cast allows us to opt-out of type system, so we don't check against expectedType here
-      var op = parseOperand(n, ctx, nil)
+      var op = parseOperand(n, ctx)
       op.typ = castType
       result = op
       skipParRi n, "cast expression"
@@ -2206,13 +2197,8 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
   elif n.kind == IntLit:
     result.kind = okImm
     result.immVal = getInt(n)
+    result.typ = Type(kind: IntLitT, bits: 64)
     inc n
-    # Immediate type inference?
-    # If expectedType is provided, try to match it.
-    if expectedType != nil and (expectedType.kind in {IntT, UIntT, FloatT}):
-      result.typ = expectedType
-    else:
-      result.typ = Type(kind: IntLitT, bits: 64) # Literal - compatible with IntT and UIntT
   elif n.kind == Symbol:
     let name = getSym(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
@@ -2302,13 +2288,10 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
   else:
     error("Unexpected operand kind", n)
 
-proc parseDest(n: var Cursor; ctx: var GenContext; expectedType: Type = nil): Operand =
+proc parseDest(n: var Cursor; ctx: var GenContext): Operand =
   if n.kind == ParLe and rawTagIsX64Reg(n.tag):
     result.reg = parseRegister(n)
-    if expectedType != nil:
-      result.typ = expectedType
-    else:
-      result.typ = Type(kind: IntT, bits: 64)
+    result.typ = Type(kind: RegisterT, regBits: 64)
     # Check if this register is bound to a variable
     if result.reg in ctx.regBindings:
       error("Register " & $result.reg & " is bound to variable '" &
@@ -2408,9 +2391,6 @@ proc parseDest(n: var Cursor; ctx: var GenContext; expectedType: Type = nil): Op
        error("Expected variable or register as destination", n)
   else:
     error("Expected destination", n)
-
-  if expectedType != nil and result.typ != nil:
-    checkType(expectedType, result.typ, n)
 
 proc checkType(want, got: Type; n: Cursor) =
   if not compatible(want, got):
