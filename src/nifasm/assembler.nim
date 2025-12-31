@@ -4146,7 +4146,7 @@ proc writeMachO(a: var GenContext; outfile: string) =
       libOrdinal: ext.libOrdinal, gotSlot: ext.gotSlot,
       callSites: ext.callSites)
 
-  macho.writeMachO(code, a.bssOffset, entryAddr, cputype, cpusubtype, outfile, dynlink)
+  macho.writeMachO(code, a.bssOffset, cputype, cpusubtype, outfile, dynlink)
 
   # macOS arm64 requires code signing for all executables
   when defined(macosx):

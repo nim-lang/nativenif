@@ -266,7 +266,7 @@ proc generateBindInfo(extProcs: seq[ExternalProcInfo]; gotVmaddr: uint64; dataSe
   # BIND_OPCODE_DONE
   result.add(BIND_OPCODE_DONE)
 
-proc writeMachO*(code: Bytes; bssSize: int; entryAddr: uint64;
+proc writeMachO*(code: Bytes; bssSize: int;
                  cputype, cpusubtype: uint32; outfile: string;
                  dynlink: DynLinkInfo = DynLinkInfo()) =
   let pageSize = 0x4000.uint64  # 16KB page size for arm64 macOS
