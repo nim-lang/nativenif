@@ -20,6 +20,10 @@
 | `(arch x64/arm64)`     | NifasmDecl                  | architecture pragma |
 | `(s)`                  | X64Flag                 | stack slot location tag |
 | `(ssize)`              | NifasmExpr                  | stack size expression |
+| `(csize)`              | NifasmExpr                  | call stack size expression |
+| `(arg S)`              | NifasmExpr                  | argument reference in prepare block |
+| `(res S)`              | NifasmExpr                  | result reference in prepare block |
+| `(prepare S ...)`      | X64Inst, A64Inst            | prepare block for function call |
 | `(mov D S)`            | X64Inst, A64Inst         | move instruction |
 | `(lea D S)`            | X64Inst                  | load effective address |
 | `(movapd D S)`         | X64Inst                  | move aligned packed double |
@@ -126,7 +130,8 @@
 | `(jle L)`              | X64Inst                  | jump if less or equal |
 | `(jb L)`               | X64Inst                  | jump if below |
 | `(jbe L)`              | X64Inst                  | jump if below or equal |
-| `(call T ...)`         | X64Inst, A64Inst         | function call |
+| `(call T ...)`         | X64Inst, A64Inst         | function call marker inside prepare |
+| `(extcall)`            | X64Inst, A64Inst         | external call marker inside prepare |
 | `(iat S)`              | X64Inst                  | indirect call through IAT (Import Address Table) |
 | `(ret)`                | X64Inst, A64Inst         | return instruction |
 | `(push O)`             | X64Inst                  | push to stack |

@@ -1,0 +1,47 @@
+(.nif24)
+(stmts
+  (proc :main.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      (var :firstVal.0 (rbx) (i +64))
+      (var :secondVal.0 (rcx) (i +64))
+
+      (prepare produceNumbers.0
+        (call)
+        (mov firstVal.0 (res first.0))
+        (mov secondVal.0 (res second.0))
+      )
+
+      (cmp firstVal.0 +7)
+      (jne fail.0)
+      (cmp secondVal.0 +11)
+      (jne fail.0)
+
+      (mov (rdi) +0)
+      (jmp exit.0)
+
+      (lab :fail.0)
+      (mov (rdi) +1)
+
+      (lab :exit.0)
+      (mov (rax) +60)
+      (syscall)
+    )
+  )
+
+  (proc :produceNumbers.0
+    (params)
+    (result
+      (:first.0 (rax) (i +64))
+      (:second.0 (rdx) (i +64))
+    )
+    (clobber)
+    (stmts
+      (mov (rax) +7)
+      (mov (rdx) +11)
+      (ret)
+    )
+  )
+)

@@ -1,0 +1,19 @@
+(.nif24)
+(stmts
+  (proc :test_kill_reuse.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      (var :x.0 (rax) (i +64))
+      (mov x.0 +10)
+      (kill x.0)
+      (var :y.0 (rax) (i +64))
+      (mov y.0 +20)
+      (kill y.0)
+      (mov (rax) +60)
+      (mov (rdi) +0)
+      (syscall)
+    )
+  )
+)

@@ -1,5 +1,5 @@
 
-import std / [tables, streams, os, osproc]
+import std / [tables, sets, streams, os, osproc]
 import "../../../nimony/src/lib" / [nifreader, nifstreams, nifcursors, bitabs, lineinfos, symparser]
 import instructions, model, tagconv
 import buffers, relocs, x86, arm64, elf, macho, pe
@@ -16,7 +16,9 @@ proc infoStr(n: Cursor): string =
 
 proc error(msg: string; n: Cursor) =
   writeStackTrace()
-  quit "[Error] " & msg & " at " & infoStr(n)
+  let tagStr = if n.kind != ParRi: toString(n, false) else: "-"
+  quit "[Error] " & msg & " at " & infoStr(n) &
+    " (kind=" & $n.kind & ", tag=" & tagStr & ")"
 
 proc skipParRi(n: var Cursor) {.inline.} =
   if n.kind != ParRi: error("Expected )", n)
@@ -36,7 +38,8 @@ proc getInt(n: Cursor): int64 =
     error("Expected integer literal", n)
 
 proc getSym(n: Cursor): string =
-  if n.kind in {Symbol, SymbolDef}:
+  case n.kind
+  of Symbol:
     result = pool.syms[n.symId]
   else:
     error("Expected symbol", n)
@@ -48,8 +51,8 @@ proc getStr(n: Cursor): string =
     error("Expected string literal", n)
 
 proc isIntegerType(t: Type): bool =
-  ## Check if type is an integer type (int or uint)
-  t.kind in {TypeKind.IntT, TypeKind.UIntT}
+  ## Check if type is an integer type (int, uint, literal) or a register (which is untyped)
+  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.RegisterT}
 
 proc isFloatType(t: Type): bool =
   ## Check if type is a floating point type
@@ -57,12 +60,12 @@ proc isFloatType(t: Type): bool =
 
 proc canDoIntegerArithmetic(t: Type): bool =
   ## Check if type supports integer arithmetic operations (add, sub)
-  ## Includes integer types and array pointers (for pointer arithmetic)
-  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.AptrT}
+  ## Includes integer types, literals, array pointers (for pointer arithmetic), and registers
+  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.AptrT, TypeKind.RegisterT}
 
 proc canDoBitwiseOps(t: Type): bool =
-  ## Check if type supports bitwise operations
-  t.kind in {TypeKind.IntT, TypeKind.UIntT}
+  ## Check if type supports bitwise operations (including registers and literals)
+  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.RegisterT}
 
 
 proc parseRegister(n: var Cursor): x86.Register =
@@ -143,16 +146,30 @@ type
     stubOffset: int  # Offset in stub section
     callSites: seq[int]  # Positions of BL instructions that call this proc
 
+  CallContext = object
+    ## Context for a `prepare` block - tracks call setup state
+    target: string              # Target proc/symbol name
+    sig: Signature              # Signature (from proc or proc type)
+    isExternal: bool            # True if calling external proc
+    extProcIdx: int             # Index into extProcs for external calls
+    paramLookup: Table[string, Param]   # Quick lookup for params
+    resultLookup: Table[string, Param]  # Quick lookup for results
+    argsSet: HashSet[string]    # Arguments that have been assigned
+    resultsSet: HashSet[string] # Results that have been bound
+    callEmitted: bool           # True after (call) or (extcall) is emitted
+    stackArgSize: int           # Computed size of stack arguments (csize)
+
   GenContext = object
     scope: Scope
     buf: relocs.Buffer  # Code buffer (.text section) for x64
     bssBuf: relocs.Buffer  # BSS buffer (.bss section) for zero-initialized global variables
     arch: Arch
     procName: string
-    inCall: bool
+    callStack: seq[CallContext] # Stack of active prepare blocks (replaces inCall)
     clobbered: set[x86.Register] # Registers clobbered in current flow (x64 only)
     slots: SlotManager
     ssizePatches: seq[int]
+    csizePatches: seq[(int, int)] # (position, callStackDepth) for csize patches
     tlsOffset: int  # Current TLS offset for thread-local variables
     bssOffset: int  # Current offset in .bss section
     modules: Table[string, LoadedModule]  # Cache of loaded foreign modules
@@ -163,21 +180,46 @@ type
     extProcs: seq[ExtProcInfo]  # External procs to bind
     gotSlotCount: int  # Number of GOT slots allocated
 
+  OperandKind = enum
+    okReg       # Register operand
+    okImm       # Immediate value
+    okMem       # Memory operand
+    okSsize     # Stack size placeholder (patched later)
+    okCsize     # Call stack argument size
+    okArg       # Argument reference in prepare block
+    okLabel     # Label reference
+
   Operand = object
-    reg: x86.Register
+    kind: OperandKind
     typ: Type
-    isImm: bool
+    reg: x86.Register
     immVal: int64
-    isMem: bool
     mem: x86.MemoryOperand
-    isSsize: bool
+    argName: string
     label: LabelId
+
+proc inCall(ctx: GenContext): bool {.inline.} =
+  ## Returns true if we're inside a prepare block
+  ctx.callStack.len > 0
+
+proc currentCallStackArgSize(ctx: GenContext): int =
+  ## Returns the stack argument size for the current call
+  if ctx.callStack.len > 0:
+    result = ctx.callStack[^1].stackArgSize
+
+proc computeStackArgSize(sig: Signature): int =
+  ## Compute total size needed for stack arguments
+  result = 0
+  for param in sig.params:
+    if param.onStack:
+      result += slots.alignedSize(param.typ)
 
 proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type
 proc parseParams(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param]
 proc parseResult(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param]
 proc parseClobbers(n: var Cursor): set[x86.Register]
 proc genStmt(n: var Cursor; ctx: var GenContext)
+proc genInstA64(n: var Cursor; ctx: var GenContext)
 proc checkIntegerArithmetic(t: Type; op: string; n: Cursor)
 proc checkIntegerType(t: Type; op: string; n: Cursor)
 proc checkBitwiseType(t: Type; op: string; n: Cursor)
@@ -193,7 +235,7 @@ proc parseObjectBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
     if n.kind == ParLe and n.tag == FldTagId:
       inc n
       if n.kind != SymbolDef: error("Expected field name", n)
-      let name = getSym(n)
+      let name = pool.syms[n.symId]
       inc n
       let ftype = parseType(n, scope, ctx)
       fields.add (name, ftype)
@@ -217,6 +259,9 @@ proc parseObjectBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
   # Round up total size to be a multiple of the struct's alignment
   let finalSize = alignTo(offset, maxAlign)
   result = Type(kind: ObjectT, fields: fields, size: finalSize, align: maxAlign)
+
+proc isRegTag(locTag: TagEnum): bool =
+  rawTagIsX64Reg(locTag) or rawTagIsA64Reg(locTag)
 
 proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cursor) =
   ## Load a foreign module and add its symbols to the scope
@@ -398,7 +443,6 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
     else:
       error("Unknown type tag: " & $t, n)
     skipParRi n, "type"
-    inc n
   else:
     error("Expected type", n)
 
@@ -412,7 +456,7 @@ proc parseUnionBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
     if n.kind == ParLe and n.tag == FldTagId:
       inc n
       if n.kind != SymbolDef: error("Expected field name", n)
-      let name = getSym(n)
+      let name = pool.syms[n.symId]
       inc n
       let ftype = parseType(n, scope, ctx)
       fields.add (name, ftype)
@@ -444,7 +488,7 @@ proc parseParams(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
     if n.kind == ParLe and tagToNifasmDecl(n.tag) == ParamD:
       inc n # param
       if n.kind != SymbolDef: error("Expected param name", n)
-      let name = getSym(n)
+      let name = pool.syms[n.symId]
       inc n
 
       # (reg) or (s) location
@@ -476,27 +520,30 @@ proc parseResult(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
   # (result (ret :name (reg) Type) ...)
   if n.kind == ParLe and tagToNifasmDecl(n.tag) == ResultD:
     inc n
-    # if it's a block of results or a single declaration?
-    # "result value declaration".
-    # Usually return values are just (ret :name (loc) Type)
-    # Let's try parsing one.
-    if n.kind != SymbolDef: error("Expected result name", n)
-    let name = getSym(n)
-    inc n
-    var reg = InvalidTagId
-    if n.kind == ParLe:
-      let locTag = n.tag
-      if rawTagIsX64Reg(locTag):
-        reg = locTag
+    while n.kind != ParRi:
+      var wrapped = false
+      if n.kind == ParLe:
+        wrapped = true
         inc n
-        skipParRi n, "result location"
+      if n.kind != SymbolDef: error("Expected result definition", n)
+      let name = pool.syms[n.symId]
+      inc n
+      var reg = InvalidTagId
+      if n.kind == ParLe:
+        let locTag = n.tag
+        if isRegTag(locTag):
+          reg = locTag
+          inc n
+          skipParRi n, "result location"
+        else:
+          error "result must be a register", n
       else:
-        error "result must be a register", n
-    else:
-      error("Expected location", n)
-    let typ = parseType(n, scope, ctx)
-    result.add Param(name: name, typ: typ, reg: reg)
-    skipParRi n, "result declaration"
+        error("Expected location", n)
+      let typ = parseType(n, scope, ctx)
+      result.add Param(name: name, typ: typ, reg: reg)
+      if wrapped:
+        skipParRi n, "result declaration"
+    inc n
 
 proc parseClobbers(n: var Cursor): set[x86.Register] =
   # (clobber (rax) (rbx) ...)
@@ -513,7 +560,7 @@ proc pass1Proc(n: var Cursor; scope: Scope; ctx: var GenContext) =
   # (proc :Name (params ...) (result ...) (clobber ...) (body ...))
   inc n
   if n.kind != SymbolDef: error("Expected proc name", n)
-  let name = getSym(n)
+  let name = pool.syms[n.symId]
   inc n
 
   var sig = Signature(params: @[], result: @[], clobbers: {})
@@ -530,7 +577,7 @@ proc pass1Proc(n: var Cursor; scope: Scope; ctx: var GenContext) =
   if n.kind == ParLe and tagToNifasmDecl(n.tag) == ClobberD:
     sig.clobbers = parseClobbers(n)
 
-  let sym = Symbol(name: name, kind: skProc, sig: sig)
+  let sym = Symbol(name: name, kind: skProc, sig: sig, offset: -1)
   scope.define(sym)
 
 proc handleArch(n: var Cursor; ctx: var GenContext) =
@@ -562,7 +609,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext) =
         of TypeD:
           inc n
           if n.kind != SymbolDef: error("Expected type name", n)
-          let name = getSym(n)
+          let name = pool.syms[n.symId]
           inc n
           if n.kind == ParLe and n.tag == ObjectTagId:
             let typ = parseObjectBody(n, scope, ctx)
@@ -583,7 +630,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext) =
         of RodataD:
           inc n
           if n.kind != SymbolDef: error("Expected rodata name", n)
-          let name = getSym(n)
+          let name = pool.syms[n.symId]
           var sym = Symbol(name: name, kind: skRodata)
           sym.offset = -1  # Mark as forward reference until defined
           scope.define(sym)
@@ -592,7 +639,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext) =
         of GvarD:
           inc n
           if n.kind != SymbolDef: error("Expected gvar name", n)
-          let name = getSym(n)
+          let name = pool.syms[n.symId]
           inc n # skip name
           let typ = parseType(n, scope, ctx)
           scope.define(Symbol(name: name, kind: skGvar, typ: typ))
@@ -601,7 +648,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext) =
         of TvarD:
           inc n
           if n.kind != SymbolDef: error("Expected tvar name", n)
-          let name = getSym(n)
+          let name = pool.syms[n.symId]
           inc n # skip name
           let typ = parseType(n, scope, ctx)
           scope.define(Symbol(name: name, kind: skTvar, typ: typ))
@@ -628,7 +675,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext) =
           # (extproc :name "external_name")
           inc n
           if n.kind != SymbolDef: error("Expected extproc name", n)
-          let name = getSym(n)
+          let name = pool.syms[n.symId]
           inc n
           if n.kind != StringLit: error("Expected external symbol name string", n)
           let extName = getStr(n)
@@ -743,26 +790,24 @@ proc tagToRegisterA64(t: TagEnum): arm64.Register =
 
 type
   OperandA64 = object
+    kind: OperandKind
     reg: arm64.Register
     typ: Type
-    isImm: bool
     immVal: int64
-    isMem: bool
     mem: arm64.MemoryOperand
-    isSsize: bool
     label: LabelId
 
-proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = nil): OperandA64 =
+proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
   if n.kind == ParLe:
     let t = n.tag
     if rawTagIsA64Reg(t):
       result.reg = parseRegisterA64(n)
-      result.typ = Type(kind: IntT, bits: 64)
+      result.typ = Type(kind: RegisterT, regBits: 64) # Pure register - accepts any type
     elif t == DotTagId:
       # (dot <base> <fieldname>) - similar to x64
       inc n
       var baseOp = parseOperandA64(n, ctx)
-      if n.kind != Symbol and n.kind != SymbolDef:
+      if n.kind != Symbol:
         error("Expected field name in dot expression", n)
       let fieldName = getSym(n)
       inc n
@@ -774,7 +819,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
         if objType.kind notin {TypeKind.ObjectT, TypeKind.UnionT}:
           error("Cannot access field of non-object/union type " & $objType, n)
         baseReg = baseOp.reg
-      elif baseOp.isMem and baseOp.typ.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
+      elif baseOp.kind == okMem and baseOp.typ.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
         objType = baseOp.typ
         baseReg = baseOp.mem.base
         baseOffset = baseOp.mem.offset
@@ -792,7 +837,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
           fieldOffset += asmSizeOf(ftype)
       if fieldType == nil:
         error("Field '" & fieldName & "' not found in " & $objType.kind, n)
-      result.isMem = true
+      result.kind = okMem
       result.mem = arm64.MemoryOperand(
         base: baseReg,
         offset: baseOffset + int32(fieldOffset),
@@ -813,27 +858,27 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
       if baseOp.typ.kind == TypeKind.AptrT:
         elemType = baseOp.typ.base
         baseReg = baseOp.reg
-      elif baseOp.isMem and baseOp.typ.kind == TypeKind.ArrayT:
+      elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.ArrayT:
         elemType = baseOp.typ.elem
         baseReg = baseOp.mem.base
         baseOffset = baseOp.mem.offset
       else:
         error("at requires aptr or stack array, got " & $baseOp.typ, n)
-      if indexOp.isImm:
+      if indexOp.kind == okImm:
         let offset = indexOp.immVal * asmSizeOf(elemType)
-        result.isMem = true
+        result.kind = okMem
         result.mem = arm64.MemoryOperand(
           base: baseReg,
           offset: baseOffset + int32(offset),
           hasIndex: false
         )
-      elif indexOp.isMem:
+      elif indexOp.kind == okMem:
         error("Array index cannot be memory operand", n)
       else:
         let elemSize = asmSizeOf(elemType)
         if elemSize notin [1, 2, 4, 8]:
           error("Element size " & $elemSize & " not supported for scaled indexing (must be 1, 2, 4, or 8)", n)
-        result.isMem = true
+        result.kind = okMem
         let shift = case elemSize
           of 1: 0
           of 2: 1
@@ -863,7 +908,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
     elif t == CastTagId:
       inc n
       let castType = parseType(n, ctx.scope, ctx)
-      var op = parseOperandA64(n, ctx, nil)
+      var op = parseOperandA64(n, ctx)
       op.typ = castType
       result = op
       skipParRi n, "`cast` expression"
@@ -871,7 +916,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
       inc n
       if n.kind == ParLe and (n.tag == DotTagId or n.tag == AtTagId):
         var addrOp = parseOperandA64(n, ctx)
-        if not addrOp.isMem:
+        if addrOp.kind != okMem:
           error("mem requires address expression", n)
         if addrOp.typ.kind != TypeKind.PtrT:
           error("mem requires pointer type, got " & $addrOp.typ, n)
@@ -879,7 +924,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
         result.typ = addrOp.typ.base
       else:
         var baseOp = parseOperandA64(n, ctx)
-        if baseOp.isImm or baseOp.isMem:
+        if baseOp.kind == okImm or baseOp.kind == okMem:
           error("mem base must be a register", n)
         var offset: int32 = 0
         var hasIndex = false
@@ -906,7 +951,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
                   inc n
             else:
               error("Expected index register or offset in mem", n)
-        result.isMem = true
+        result.kind = okMem
         result.mem = arm64.MemoryOperand(
           base: baseOp.reg,
           index: indexReg,
@@ -917,28 +962,28 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
         result.typ = Type(kind: IntT, bits: 64)
       skipParRi n, "`mem` expression"
     elif t == SsizeTagId:
-      result.isSsize = true
+      result.kind = okSsize
       result.typ = Type(kind: IntT, bits: 64)
       inc n
       skipParRi n, "`ssize` expression"
     else:
       error("Unexpected operand tag: " & $t, n)
   elif n.kind == IntLit:
-    result.isImm = true
+    result.kind = okImm
     result.immVal = getInt(n)
+    result.typ = Type(kind: IntLitT, bits: 64)
     inc n
-    if expectedType != nil and (expectedType.kind in {IntT, UIntT, FloatT}):
-      result.typ = expectedType
-    else:
-      result.typ = Type(kind: IntT, bits: 64)
   elif n.kind == Symbol:
     let name = getSym(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and (sym.kind == skVar or sym.kind == skParam):
       if sym.onStack:
-        result.isMem = true
-        result.mem = arm64.MemoryOperand(base: arm64.FP, offset: int32(sym.offset), hasIndex: false)
-        result.typ = sym.typ
+        # Return StackOffT - operations like `add` will reject this at type check
+        result.kind = okMem
+        result.mem = arm64.MemoryOperand(base: arm64.SP, offset: int32(sym.offset))
+        result.typ = sym.typ  # Already StackOffT from declaration
+        inc n
+        return
       elif sym.reg != InvalidTagId:
         result.reg = tagToRegisterA64(sym.reg)
         result.typ = sym.typ
@@ -974,7 +1019,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
       result.typ = Type(kind: UIntT, bits: 64)
       inc n
     elif sym != nil and sym.kind == skTvar:
-      result.isMem = true
+      result.kind = okMem
       result.mem = arm64.MemoryOperand(
         base: arm64.FP,
         offset: int32(sym.offset),
@@ -990,21 +1035,31 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
 proc parseDestA64(n: var Cursor; ctx: var GenContext): OperandA64 =
   if n.kind == ParLe and rawTagIsA64Reg(n.tag):
     result.reg = parseRegisterA64(n)
-    result.typ = Type(kind: IntT, bits: 64)
+    result.typ = Type(kind: RegisterT, regBits: 64)
+  elif n.kind == ParLe and (n.tag == MemTagId or n.tag == DotTagId or n.tag == AtTagId):
+    let op = parseOperandA64(n, ctx)
+    if op.kind != okMem:
+      error("Expected memory destination", n)
+    result = op
   elif n.kind == Symbol:
     let name = getSym(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and sym.kind == skVar:
       if sym.onStack:
-        result.isMem = true
-        result.mem = arm64.MemoryOperand(base: arm64.FP, offset: int32(sym.offset), hasIndex: false)
-        result.typ = sym.typ
+        # Return StackOffT - operations like `add` will reject this at type check
+        result.kind = okMem
+        result.mem = arm64.MemoryOperand(base: arm64.SP, offset: int32(sym.offset))
+        result.typ = sym.typ  # Already StackOffT from declaration
+        inc n
+        return
       elif sym.reg != InvalidTagId:
         result.reg = tagToRegisterA64(sym.reg)
         result.typ = sym.typ
+      else:
+        error("Variable has no location", n)
       inc n
     elif sym != nil and sym.kind == skTvar:
-      result.isMem = true
+      result.kind = okMem
       result.mem = arm64.MemoryOperand(
         base: arm64.FP,
         offset: int32(sym.offset),
@@ -1017,89 +1072,124 @@ proc parseDestA64(n: var Cursor; ctx: var GenContext): OperandA64 =
   else:
     error("Expected destination", n)
 
-proc genCallA64(n: var Cursor; ctx: var GenContext) =
-  if ctx.inCall: error("Nested calls are not allowed", n)
-  ctx.inCall = true
-  defer: ctx.inCall = false
+proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
+  ## Handle (prepare target ... (call) ...) or (prepare target ... (extcall) ...)
+  ## The prepare block sets up a call context for type checking and argument tracking.
   let start = n
   inc n
-  if n.kind != Symbol: error("Expected proc symbol, got " & $n.kind, n)
+  if n.kind != Symbol: error("Expected proc symbol or type, got " & $n.kind, n)
   let name = getSym(n)
   let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
-  if sym == nil or sym.kind notin {skProc, skExtProc}: error("Unknown proc: " & name, n)
-  if sym.isForeign:
-    error("Cannot call foreign proc '" & name & "' (must be linked)", n)
-  # Handle external proc calls differently
-  if sym.kind == skExtProc:
-    inc n
-    # Skip argument handling for now - external procs use standard ABI
-    while n.kind == ParLe:
-      skip n
-    # Record the position of this BL instruction for later patching
-    let callPos = ctx.buf.data.len
-    # Find the extproc info and add this call site
-    for i in 0..<ctx.extProcs.len:
-      if ctx.extProcs[i].name == name:
-        ctx.extProcs[i].callSites.add callPos
+
+  var callCtx = CallContext(
+    target: name,
+    paramLookup: initTable[string, Param](),
+    resultLookup: initTable[string, Param](),
+    argsSet: initHashSet[string](),
+    resultsSet: initHashSet[string](),
+    callEmitted: false
+  )
+
+  if sym == nil:
+    error("Unknown symbol: " & name, n)
+  elif sym.kind == skProc:
+    if sym.isForeign:
+      error("Cannot call foreign proc '" & name & "' directly (use extcall)", n)
+    callCtx.sig = sym.sig
+    callCtx.isExternal = false
+  elif sym.kind == skExtProc:
+    callCtx.isExternal = true
+    for i, ext in ctx.extProcs:
+      if ext.name == name:
+        callCtx.extProcIdx = i
         break
-    # Emit placeholder BL (will be patched to point to stub)
-    ctx.buf.data.addUint32(0x94000000'u32)  # BL placeholder
-    skipParRi n, "call"
-    return
+  else:
+    error("Expected proc symbol, got " & $sym.kind, n)
+
+  # Build lookup tables (only for internal procs with signatures)
+  if not callCtx.isExternal:
+    for param in callCtx.sig.params:
+      callCtx.paramLookup[param.name] = param
+    for res in callCtx.sig.result:
+      callCtx.resultLookup[res.name] = res
+    # Compute stack argument size
+    callCtx.stackArgSize = computeStackArgSize(callCtx.sig)
+
+  # Push call context
+  ctx.callStack.add callCtx
   inc n
-  var args: Table[string, OperandA64]
-  while n.kind == ParLe:
-    if n.tag == MovTagId:
-      inc n
-      if n.kind != Symbol: error("Expected argument name", n)
-      let argName = getSym(n)
-      inc n
-      let val = parseOperandA64(n, ctx)
-      args[argName] = val
-      skipParRi n, "argument"
-    else:
-      error("Expected (mov arg val) in call", n)
-  let sig = sym.sig
-  for param in sig.params:
-    if param.name notin args:
-      error("Missing argument: " & param.name, n)
-    let arg = args[param.name]
-    checkType(param.typ, arg.typ, start)
-    if param.onStack:
-      error("Stack parameters not yet supported in ARM64 call generation", n)
-    else:
-      var paramReg = arm64.X0
-      let paramRegTag = tagToA64Reg(param.reg)
-      case paramRegTag
-      of X0R: paramReg = arm64.X0
-      of X1R: paramReg = arm64.X1
-      of X2R: paramReg = arm64.X2
-      of X3R: paramReg = arm64.X3
-      of X4R: paramReg = arm64.X4
-      of X5R: paramReg = arm64.X5
-      of X6R: paramReg = arm64.X6
-      of X7R: paramReg = arm64.X7
-      else: discard
-      if arg.isSsize:
-        arm64.emitMovImm(ctx.buf.data, paramReg, 0'u16)
-        ctx.ssizePatches.add(ctx.buf.data.len - 2)
-      elif arg.isImm:
-        if arg.immVal >= 0 and arg.immVal <= 0xFFFF:
-          arm64.emitMovImm(ctx.buf.data, paramReg, uint16(arg.immVal))
-        else:
-          error("Immediate value too large for MOV (must fit in 16 bits)", n)
-      elif arg.isMem:
-        arm64.emitLdr(ctx.buf.data, paramReg, arg.mem.base, arg.mem.offset)
-      elif arg.reg != paramReg:
-        arm64.emitMov(ctx.buf.data, paramReg, arg.reg)
+
+  # Process instructions inside prepare block
+  while n.kind != ParRi:
+    genInstA64(n, ctx)
+
+  # Verify call was emitted and all bindings are done
+  let currentCtx = ctx.callStack[^1]
+  if not currentCtx.isExternal:
+    for param in currentCtx.sig.params:
+      if not param.onStack and param.name notin currentCtx.argsSet:
+        error("Missing argument: " & param.name, n)
+
+    for res in currentCtx.sig.result:
+      if res.name notin currentCtx.resultsSet:
+        error("Missing result binding: " & res.name, n)
+
+    if not currentCtx.callEmitted:
+      error("Missing (call) or (extcall) in prepare block", n)
+  else:
+    if not currentCtx.callEmitted:
+      error("Missing (extcall) in prepare block", n)
+
+  # Pop call context
+  discard ctx.callStack.pop()
+  skipParRi n, "prepare"
+
+proc genCallMarkerA64(n: var Cursor; ctx: var GenContext) =
+  ## Handle (call) marker inside a prepare block - emits the actual call instruction
+  if not ctx.inCall:
+    error("(call) can only be used inside a prepare block", n)
+
+  var callCtx = addr ctx.callStack[^1]
+  if callCtx.callEmitted:
+    error("Multiple (call) instructions in prepare block", n)
+  if callCtx.isExternal:
+    error("Use (extcall) for external procs, not (call)", n)
+
+  let sym = lookupWithAutoImport(ctx, ctx.scope, callCtx.target, n)
+
   var labId: LabelId
   if sym.offset == -1:
     labId = ctx.buf.createLabel()
     sym.offset = int(labId)
   else:
     labId = LabelId(sym.offset)
+
   ctx.buf.emitBL(labId)
+  callCtx.callEmitted = true
+
+  inc n
   skipParRi n, "call"
+
+proc genExtcallA64(n: var Cursor; ctx: var GenContext) =
+  ## Handle (extcall) marker inside a prepare block - emits external call
+  if not ctx.inCall:
+    error("(extcall) can only be used inside a prepare block", n)
+
+  var callCtx = addr ctx.callStack[^1]
+  if callCtx.callEmitted:
+    error("Multiple call instructions in prepare block", n)
+  if not callCtx.isExternal:
+    error("Use (call) for internal procs, not (extcall)", n)
+
+  # Record call site and emit BL (will be patched to point to stub)
+  let callPos = ctx.buf.data.len
+  ctx.extProcs[callCtx.extProcIdx].callSites.add callPos
+  ctx.buf.data.addUint32(0x94000000'u32)  # BL placeholder
+
+  callCtx.callEmitted = true
+
+  inc n
+  skipParRi n, "extcall"
 
 proc genIteA64(n: var Cursor; ctx: var GenContext) =
   inc n
@@ -1190,7 +1280,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of CfvarD:
     inc n
     if n.kind != SymbolDef: error("Expected cfvar name", n)
-    let name = getSym(n)
+    let name = pool.syms[n.symId]
     inc n
     let cfvarLabel = ctx.buf.createLabel()
     let sym = Symbol(name: name, kind: skCfvar, typ: Type(kind: BoolT), offset: int(cfvarLabel), used: false)
@@ -1201,7 +1291,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of VarD:
     inc n
     if n.kind != SymbolDef: error("Expected var name", n)
-    let name = getSym(n)
+    let name = pool.syms[n.symId]
     inc n
     var reg = InvalidTagId
     var onStack = false
@@ -1219,11 +1309,12 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
         error("Expected location", n)
     else:
       error("Expected location", n)
-    let typ = parseType(n, ctx.scope, ctx)
-    let sym = Symbol(name: name, kind: skVar, typ: typ)
+    let baseTyp = parseType(n, ctx.scope, ctx)
+    let sym = Symbol(name: name, kind: skVar, typ: baseTyp)
     if onStack:
       sym.onStack = true
-      sym.offset = ctx.slots.allocSlot(typ)
+      sym.offset = ctx.slots.allocSlot(baseTyp)
+      sym.typ = Type(kind: StackOffT, offType: baseTyp)  # Wrap in StackOffT
     else:
       sym.reg = reg
     ctx.scope.define(sym)
@@ -1241,8 +1332,12 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     while n.kind != ParRi:
       genInstA64(n, ctx)
     skipParRi n
+  of PrepareA64:
+    genPrepareA64(n, ctx)
   of CallA64:
-    genCallA64(n, ctx)
+    genCallMarkerA64(n, ctx)
+  of ExtcallA64:
+    genExtcallA64(n, ctx)
   of IteA64:
     genIteA64(n, ctx)
   of LoopA64:
@@ -1254,7 +1349,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of LabA64:
     inc n
     if n.kind != SymbolDef: error("Expected label name", n)
-    let name = getSym(n)
+    let name = pool.syms[n.symId]
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym == nil:
       let labId = ctx.buf.createLabel()
@@ -1276,20 +1371,20 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
-    if dest.isMem:
-      if op.isImm:
+    if dest.kind == okMem:
+      if op.kind == okImm:
         error("Moving immediate to memory not fully supported yet for ARM64", n)
-      elif op.isSsize:
+      elif op.kind == okSsize:
         error("Moving ssize to memory not supported", n)
-      elif op.isMem:
+      elif op.kind == okMem:
         error("Cannot move memory to memory", n)
       else:
         arm64.emitStr(ctx.buf.data, op.reg, dest.mem.base, dest.mem.offset)
     else:
-      if op.isSsize:
+      if op.kind == okSsize:
         arm64.emitMovImm(ctx.buf.data, dest.reg, 0'u16)
         ctx.ssizePatches.add(ctx.buf.data.len - 2)
-      elif op.isImm:
+      elif op.kind == okImm:
         if op.immVal >= 0 and op.immVal <= 0xFFFF:
           arm64.emitMovImm(ctx.buf.data, dest.reg, uint16(op.immVal))
         elif op.immVal >= 0:
@@ -1297,7 +1392,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
           arm64.emitMovImm64(ctx.buf.data, dest.reg, uint64(op.immVal))
         else:
           error("Immediate value out of range", n)
-      elif op.isMem:
+      elif op.kind == okMem:
         arm64.emitLdr(ctx.buf.data, dest.reg, op.mem.base, op.mem.offset)
       else:
         arm64.emitMov(ctx.buf.data, dest.reg, op.reg)
@@ -1307,10 +1402,10 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
-    if dest.isMem: error("ADR destination must be register", n)
+    if dest.kind == okMem: error("ADR destination must be register", n)
     # Check if operand is a label: type should be UIntT and not immediate/memory
     # Labels/rodata/gvars set typ to UIntT and are not immediate or memory operands
-    if op.typ.kind != UIntT or op.isImm or op.isMem:
+    if op.typ.kind != UIntT or op.kind == okImm or op.kind == okMem:
       error("ADR source must be a label", n)
     arm64.emitAdr(ctx.buf, dest.reg, op.label)
     skipParRi n
@@ -1322,18 +1417,18 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     checkIntegerArithmetic(dest.typ, "add", start)
     checkIntegerArithmetic(op.typ, "add", start)
     checkCompatibleTypes(dest.typ, op.typ, "add", start)
-    if dest.isMem:
+    if dest.kind == okMem:
       error("ADD to memory not supported yet for ARM64", n)
     else:
-      if op.isSsize:
+      if op.kind == okSsize:
         arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, 0'u16)
         ctx.ssizePatches.add(ctx.buf.data.len - 2)
-      elif op.isImm:
+      elif op.kind == okImm:
         if op.immVal >= 0 and op.immVal <= 0xFFFF:
           arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.immVal))
         else:
           error("Immediate value too large for ADD (must fit in 16 bits)", n)
-      elif op.isMem:
+      elif op.kind == okMem:
         error("ADD from memory not supported yet", n)
       else:
         arm64.emitAdd(ctx.buf.data, dest.reg, dest.reg, op.reg)
@@ -1346,18 +1441,18 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     checkIntegerArithmetic(dest.typ, "sub", start)
     checkIntegerArithmetic(op.typ, "sub", start)
     checkCompatibleTypes(dest.typ, op.typ, "sub", start)
-    if dest.isMem:
+    if dest.kind == okMem:
       error("SUB to memory not supported yet for ARM64", n)
     else:
-      if op.isSsize:
+      if op.kind == okSsize:
         arm64.emitSubImm(ctx.buf.data, dest.reg, dest.reg, 0'u16)
         ctx.ssizePatches.add(ctx.buf.data.len - 2)
-      elif op.isImm:
+      elif op.kind == okImm:
         if op.immVal >= 0 and op.immVal <= 0xFFFF:
           arm64.emitSubImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.immVal))
         else:
           error("Immediate value too large for SUB (must fit in 16 bits)", n)
-      elif op.isMem:
+      elif op.kind == okMem:
         error("SUB from memory not supported yet", n)
       else:
         arm64.emitSub(ctx.buf.data, dest.reg, dest.reg, op.reg)
@@ -1369,9 +1464,9 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperandA64(n, ctx)
     checkIntegerType(dest.typ, "mul", start)
     checkIntegerType(op.typ, "mul", start)
-    if dest.isMem: error("MUL destination cannot be memory", n)
-    if op.isImm: error("MUL immediate not supported", n)
-    if op.isMem: error("MUL memory not supported yet", n)
+    if dest.kind == okMem: error("MUL destination cannot be memory", n)
+    if op.kind == okImm: error("MUL immediate not supported", n)
+    if op.kind == okMem: error("MUL memory not supported yet", n)
     arm64.emitMul(ctx.buf.data, dest.reg, dest.reg, op.reg)
     skipParRi n
 
@@ -1381,9 +1476,9 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperandA64(n, ctx)
     checkIntegerType(dest.typ, "sdiv", start)
     checkIntegerType(op.typ, "sdiv", start)
-    if dest.isMem: error("SDIV destination cannot be memory", n)
-    if op.isImm: error("SDIV immediate not supported", n)
-    if op.isMem: error("SDIV memory not supported yet", n)
+    if dest.kind == okMem: error("SDIV destination cannot be memory", n)
+    if op.kind == okImm: error("SDIV immediate not supported", n)
+    if op.kind == okMem: error("SDIV memory not supported yet", n)
     arm64.emitSdiv(ctx.buf.data, dest.reg, dest.reg, op.reg)
     skipParRi n
 
@@ -1393,9 +1488,9 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperandA64(n, ctx)
     checkIntegerType(dest.typ, "udiv", start)
     checkIntegerType(op.typ, "udiv", start)
-    if dest.isMem: error("UDIV destination cannot be memory", n)
-    if op.isImm: error("UDIV immediate not supported", n)
-    if op.isMem: error("UDIV memory not supported yet", n)
+    if dest.kind == okMem: error("UDIV destination cannot be memory", n)
+    if op.kind == okImm: error("UDIV immediate not supported", n)
+    if op.kind == okMem: error("UDIV memory not supported yet", n)
     arm64.emitUdiv(ctx.buf.data, dest.reg, dest.reg, op.reg)
     skipParRi n
 
@@ -1406,10 +1501,10 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseType(dest.typ, "and", start)
     checkBitwiseType(op.typ, "and", start)
     checkCompatibleTypes(dest.typ, op.typ, "and", start)
-    if dest.isMem: error("AND to memory not supported yet", n)
+    if dest.kind == okMem: error("AND to memory not supported yet", n)
     else:
-      if op.isImm: error("AND immediate not supported yet", n)
-      elif op.isMem: error("AND from memory not supported yet", n)
+      if op.kind == okImm: error("AND immediate not supported yet", n)
+      elif op.kind == okMem: error("AND from memory not supported yet", n)
       else:
         arm64.emitAnd(ctx.buf.data, dest.reg, dest.reg, op.reg)
     skipParRi n
@@ -1421,10 +1516,10 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseType(dest.typ, "orr", start)
     checkBitwiseType(op.typ, "orr", start)
     checkCompatibleTypes(dest.typ, op.typ, "orr", start)
-    if dest.isMem: error("ORR to memory not supported yet", n)
+    if dest.kind == okMem: error("ORR to memory not supported yet", n)
     else:
-      if op.isImm: error("ORR immediate not supported yet", n)
-      elif op.isMem: error("ORR from memory not supported yet", n)
+      if op.kind == okImm: error("ORR immediate not supported yet", n)
+      elif op.kind == okMem: error("ORR from memory not supported yet", n)
       else:
         arm64.emitOrr(ctx.buf.data, dest.reg, dest.reg, op.reg)
     skipParRi n
@@ -1436,10 +1531,10 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseType(dest.typ, "eor", start)
     checkBitwiseType(op.typ, "eor", start)
     checkCompatibleTypes(dest.typ, op.typ, "eor", start)
-    if dest.isMem: error("EOR to memory not supported yet", n)
+    if dest.kind == okMem: error("EOR to memory not supported yet", n)
     else:
-      if op.isImm: error("EOR immediate not supported yet", n)
-      elif op.isMem: error("EOR from memory not supported yet", n)
+      if op.kind == okImm: error("EOR immediate not supported yet", n)
+      elif op.kind == okMem: error("EOR from memory not supported yet", n)
       else:
         arm64.emitEor(ctx.buf.data, dest.reg, dest.reg, op.reg)
     skipParRi n
@@ -1449,8 +1544,8 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
     checkBitwiseType(dest.typ, "lsl", start)
-    if dest.isMem: error("Shift destination cannot be memory", n)
-    if op.isImm:
+    if dest.kind == okMem: error("Shift destination cannot be memory", n)
+    if op.kind == okImm:
       if op.immVal >= 0 and op.immVal <= 63:
         arm64.emitLslImm(ctx.buf.data, dest.reg, dest.reg, uint8(op.immVal))
       else:
@@ -1464,8 +1559,8 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
     checkBitwiseType(dest.typ, "lsr", start)
-    if dest.isMem: error("Shift destination cannot be memory", n)
-    if op.isImm:
+    if dest.kind == okMem: error("Shift destination cannot be memory", n)
+    if op.kind == okImm:
       if op.immVal >= 0 and op.immVal <= 63:
         arm64.emitLsrImm(ctx.buf.data, dest.reg, dest.reg, uint8(op.immVal))
       else:
@@ -1479,8 +1574,8 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
     checkBitwiseType(dest.typ, "asr", start)
-    if dest.isMem: error("Shift destination cannot be memory", n)
-    if op.isImm: error("ASR immediate not supported yet", n)
+    if dest.kind == okMem: error("Shift destination cannot be memory", n)
+    if op.kind == okImm: error("ASR immediate not supported yet", n)
     else:
       arm64.emitAsr(ctx.buf.data, dest.reg, dest.reg, op.reg)
     skipParRi n
@@ -1489,7 +1584,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let op = parseDestA64(n, ctx)
     checkIntegerArithmetic(op.typ, "neg", start)
-    if op.isMem: error("NEG memory not supported yet", n)
+    if op.kind == okMem: error("NEG memory not supported yet", n)
     arm64.emitNeg(ctx.buf.data, op.reg, op.reg)
     skipParRi n
 
@@ -1500,15 +1595,15 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     checkIntegerArithmetic(dest.typ, "cmp", start)
     checkIntegerArithmetic(op.typ, "cmp", start)
     checkCompatibleTypes(dest.typ, op.typ, "cmp", start)
-    if dest.isMem:
+    if dest.kind == okMem:
       error("CMP memory not supported yet", n)
     else:
-      if op.isImm:
+      if op.kind == okImm:
         if op.immVal >= 0 and op.immVal <= 0xFFFF:
           arm64.emitCmpImm(ctx.buf.data, dest.reg, uint16(op.immVal))
         else:
           error("Immediate value too large for CMP (must fit in 16 bits)", n)
-      elif op.isMem:
+      elif op.kind == okMem:
         error("CMP memory not supported yet", n)
       else:
         arm64.emitCmp(ctx.buf.data, dest.reg, op.reg)
@@ -1527,7 +1622,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of SvcA64:
     inc n
     let op = parseOperandA64(n, ctx)
-    if not op.isImm:
+    if op.kind != okImm:
       error("SVC requires immediate operand", n)
     if op.immVal < 0 or op.immVal > 0xFFFF:
       error("SVC immediate must be 0-65535", n)
@@ -1538,8 +1633,8 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
-    if dest.isMem: error("LDR destination must be register", n)
-    if op.isMem:
+    if dest.kind == okMem: error("LDR destination must be register", n)
+    if op.kind == okMem:
       ctx.buf.data.emitLdr(dest.reg, op.mem.base, op.mem.offset)
     else:
       error("LDR source must be memory", n)
@@ -1549,8 +1644,8 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
-    if not dest.isMem: error("STR destination must be memory", n)
-    if op.isMem: error("STR source cannot be memory", n)
+    if dest.kind != okMem: error("STR destination must be memory", n)
+    if op.kind == okMem: error("STR source cannot be memory", n)
     ctx.buf.data.emitStr(op.reg, dest.mem.base, dest.mem.offset)
     skipParRi n
 
@@ -1597,12 +1692,36 @@ proc genInst(n: var Cursor; ctx: var GenContext) =
   of Arch.A64, Arch.WinA64:
     genInstA64(n, ctx)
 
+proc collectLabels(n: var Cursor; ctx: var GenContext; scope: Scope) =
+  ## Pre-scan a cursor subtree and create placeholder symbols for labels.
+  if n.kind == ParLe:
+    if n.tag == LabTagId:
+      var tmp = n
+      inc tmp
+      if tmp.kind == SymbolDef:
+        let name = pool.syms[tmp.symId]
+        var sym = scope.lookup(name)
+        if sym == nil:
+          let labId = ctx.buf.createLabel()
+          sym = Symbol(name: name, kind: skLabel, offset: int(labId))
+          scope.define(sym)
+        elif sym.kind == skLabel and sym.offset == -1:
+          sym.offset = int(ctx.buf.createLabel())
+    inc n
+    while n.kind != ParRi:
+      collectLabels(n, ctx, scope)
+    inc n
+  else:
+    inc n
+
 proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   let oldScope = ctx.scope
   ctx.scope = newScope(oldScope)
 
   inc n
-  let name = getSym(n)
+  if n.kind != SymbolDef:
+    error("Expected symbol definition", n)
+  let name = pool.syms[n.symId]
   ctx.procName = name
 
   # Find/Create label for proc
@@ -1622,7 +1741,8 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   var paramOffset = 16 # RBP + 16 (skip RBP, RetAddr)
   for param in sym.sig.params:
     if param.onStack:
-      ctx.scope.define(Symbol(name: param.name, kind: skParam, typ: param.typ, onStack: true, offset: paramOffset))
+      let stackTyp = Type(kind: StackOffT, offType: param.typ)  # Wrap in StackOffT
+      ctx.scope.define(Symbol(name: param.name, kind: skParam, typ: stackTyp, onStack: true, offset: paramOffset))
       paramOffset += slots.alignedSize(param.typ)
     else:
       ctx.scope.define(Symbol(name: param.name, kind: skParam, typ: param.typ, reg: param.reg))
@@ -1634,6 +1754,14 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   inc n
   while n.kind == ParLe and n.tag != StmtsTagId:
     skip n
+  var scan = n
+  if scan.kind == ParLe and scan.tag == StmtsTagId:
+    collectLabels(scan, ctx, ctx.scope)
+  when false: # if ctx.arch in {Arch.X64, Arch.WinX64}:
+    x86.emitPush(ctx.buf.data, RBP)
+    x86.emitMov(ctx.buf.data, RBP, RSP)
+    x86.emitSubImm(ctx.buf.data, RSP, 0)
+    ctx.ssizePatches.add(ctx.buf.data.len - 4)
   if n.kind == ParLe and n.tag == StmtsTagId:
     inc n
     while n.kind != ParRi:
@@ -1671,44 +1799,80 @@ proc genStmt(n: var Cursor; ctx: var GenContext) =
   else:
     genInst(n, ctx)
 
-proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil): Operand =
+proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
   if n.kind == ParLe:
     let t = n.tag
     if rawTagIsX64Reg(t):
       result.reg = parseRegister(n)
-      result.typ = Type(kind: IntT, bits: 64) # Explicit register usage is assumed to be Int64 compatible
+      result.typ = Type(kind: RegisterT, regBits: 64) # Pure register - accepts any type
       # Check if this register is bound to a variable
       if result.reg in ctx.regBindings:
         error("Register " & $result.reg & " is bound to variable '" &
               ctx.regBindings[result.reg] & "', use the variable name instead", n)
     elif t == DotTagId:
-      # (dot <base> <fieldname>)
-      inc n
-      var baseOp = parseOperand(n, ctx)
-
-      if n.kind != Symbol and n.kind != SymbolDef:
-        error("Expected field name in dot expression", n)
-      let fieldName = getSym(n)
+      # (dot <base-reg> <stackvar> <fieldname>) for stack objects, or
+      # (dot <ptr-var> <fieldname>) for pointer variables
       inc n
 
-      # Type check: base must be a pointer to an object/union, or a stack variable with object/union type
       var objType: Type
       var baseReg: x86.Register
       var baseDisp: int32 = 0
+      var baseIndex: x86.Register
+      var baseScale = 1
+      var baseHasIndex = false
+      var useFsSegment = false
+      var fieldName: string
 
-      if baseOp.typ.kind == TypeKind.PtrT:
-        # Base is a pointer to an object or union
-        objType = baseOp.typ.base
-        if objType.kind notin {TypeKind.ObjectT, TypeKind.UnionT}:
-          error("Cannot access field of non-object/union type " & $objType, n)
-        baseReg = baseOp.reg
-      elif baseOp.isMem and baseOp.typ.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
-        # Base is a stack-allocated object or union
-        objType = baseOp.typ
-        baseReg = baseOp.mem.base
-        baseDisp = baseOp.mem.displacement
+      # Check if first arg is a register (explicit stack addressing)
+      if n.kind == ParLe and rawTagIsX64Reg(n.tag):
+        # (dot (base-reg) stackvar fieldname) - explicit stack object access
+        baseReg = parseRegister(n)
+
+        # Parse stack variable name for offset
+        if n.kind != Symbol:
+          error("Expected stack variable name in dot expression", n)
+        let stackVarName = getSym(n)
+        let stackSym = lookupWithAutoImport(ctx, ctx.scope, stackVarName, n)
+        if stackSym == nil or not stackSym.onStack:
+          error("Expected stack variable in dot, got: " & stackVarName, n)
+        # Unwrap StackOffT to get the base type
+        let baseTyp = if stackSym.typ.kind == StackOffT: stackSym.typ.offType else: stackSym.typ
+        if baseTyp.kind notin {TypeKind.ObjectT, TypeKind.UnionT}:
+          error("dot requires object/union type, got " & $baseTyp, n)
+        baseDisp = int32(stackSym.offset)
+        objType = baseTyp
+        inc n
+
+        # Parse field name
+        if n.kind != Symbol:
+          error("Expected field name in dot expression", n)
+        fieldName = getSym(n)
+        inc n
       else:
-        error("dot requires pointer to object/union or stack object/union, got " & $baseOp.typ, n)
+        # (dot ptr-var fieldname) - pointer variable access
+        var baseOp = parseOperand(n, ctx)
+
+        if n.kind != Symbol:
+          error("Expected field name in dot expression", n)
+        fieldName = getSym(n)
+        inc n
+
+        if baseOp.typ.kind == TypeKind.PtrT:
+          # Base is a pointer to an object or union
+          objType = baseOp.typ.base
+          if objType.kind notin {TypeKind.ObjectT, TypeKind.UnionT}:
+            error("Cannot access field of non-object/union type " & $objType, n)
+          if baseOp.kind == okMem:
+            baseReg = baseOp.mem.base
+            baseDisp = baseOp.mem.displacement
+            baseHasIndex = baseOp.mem.hasIndex
+            baseIndex = baseOp.mem.index
+            baseScale = baseOp.mem.scale
+            useFsSegment = baseOp.mem.useFsSegment
+          else:
+            baseReg = baseOp.reg
+        else:
+          error("dot requires (base-reg stackvar field) or (ptr-var field), got " & $baseOp.typ, n)
 
       # Find field in object/union type
       var fieldOffset = 0
@@ -1731,53 +1895,77 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
         error("Field '" & fieldName & "' not found in " & $objType.kind, n)
 
       # Result is memory operand pointing to the field
-      result.isMem = true
+      result.kind = okMem
       result.mem = x86.MemoryOperand(
         base: baseReg,
+        index: baseIndex,
+        scale: baseScale,
         displacement: baseDisp + int32(fieldOffset),
-        hasIndex: false
+        hasIndex: baseHasIndex,
+        useFsSegment: useFsSegment
       )
       result.typ = Type(kind: TypeKind.PtrT, base: fieldType)
 
       skipParRi n, "dot expression"
     elif t == AtTagId:
-      # (at <base> <index>)
+      # (at <base-reg> <stackvar> <index>) for stack arrays, or
+      # (at <aptr-var> <index>) for array pointer variables
       inc n
-      var baseOp = parseOperand(n, ctx)
-      var indexOp = parseOperand(n, ctx)
 
-      # Type check: index must be an integer
-      if indexOp.typ.kind notin {TypeKind.IntT, TypeKind.UIntT}:
-        error("Array index must be integer type, got " & $indexOp.typ, n)
-
-      # Type check: base must be aptr or stack array
       var elemType: Type
       var baseReg: x86.Register
       var baseDisp: int32 = 0
+      var indexOp: Operand
 
-      if baseOp.typ.kind == TypeKind.AptrT:
-        # Base is an array pointer
-        elemType = baseOp.typ.base
-        baseReg = baseOp.reg
-      elif baseOp.isMem and baseOp.typ.kind == TypeKind.ArrayT:
-        # Base is a stack-allocated array
-        elemType = baseOp.typ.elem
-        baseReg = baseOp.mem.base
-        baseDisp = baseOp.mem.displacement
+      # Check if first arg is a register (explicit stack addressing)
+      if n.kind == ParLe and rawTagIsX64Reg(n.tag):
+        # (at (base-reg) stackvar index) - explicit stack array access
+        baseReg = parseRegister(n)
+
+        # Parse stack variable name for offset
+        if n.kind != Symbol:
+          error("Expected stack variable name in at expression", n)
+        let stackVarName = getSym(n)
+        let stackSym = lookupWithAutoImport(ctx, ctx.scope, stackVarName, n)
+        if stackSym == nil or not stackSym.onStack:
+          error("Expected stack variable in at, got: " & stackVarName, n)
+        # Unwrap StackOffT to get the base type
+        let baseTyp = if stackSym.typ.kind == StackOffT: stackSym.typ.offType else: stackSym.typ
+        if baseTyp.kind != TypeKind.ArrayT:
+          error("at requires array type, got " & $baseTyp, n)
+        baseDisp = int32(stackSym.offset)
+        elemType = baseTyp.elem
+        inc n
+
+        # Parse index
+        indexOp = parseOperand(n, ctx)
       else:
-        error("at requires aptr or stack array, got " & $baseOp.typ, n)
+        # (at aptr-var index) - array pointer access
+        var baseOp = parseOperand(n, ctx)
+        indexOp = parseOperand(n, ctx)
+
+        if baseOp.typ.kind == TypeKind.AptrT:
+          # Base is an array pointer
+          elemType = baseOp.typ.base
+          baseReg = baseOp.reg
+        else:
+          error("at requires (base-reg stackvar index) or (aptr-var index), got " & $baseOp.typ, n)
+
+      # Type check: index must be an integer, literal, or register
+      if not isIntegerType(indexOp.typ):
+        error("Array index must be integer type, got " & $indexOp.typ, n)
 
       # Check if index is immediate or register
-      if indexOp.isImm:
+      if indexOp.kind == okImm:
         # Immediate index: compute offset directly
         let offset = indexOp.immVal * asmSizeOf(elemType)
-        result.isMem = true
+        result.kind = okMem
         result.mem = x86.MemoryOperand(
           base: baseReg,
           displacement: baseDisp + int32(offset),
           hasIndex: false
         )
-      elif indexOp.isMem:
+      elif indexOp.kind == okMem:
         error("Array index cannot be memory operand", n)
       else:
         # Register index: use scaled indexing
@@ -1785,7 +1973,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
         if elemSize notin [1, 2, 4, 8]:
           error("Element size " & $elemSize & " not supported for scaled indexing (must be 1, 2, 4, or 8)", n)
 
-        result.isMem = true
+        result.kind = okMem
         result.mem = x86.MemoryOperand(
           base: baseReg,
           index: indexOp.reg,
@@ -1813,7 +2001,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
       inc n
       let castType = parseType(n, ctx.scope, ctx)
       # Cast allows us to opt-out of type system, so we don't check against expectedType here
-      var op = parseOperand(n, ctx, nil)
+      var op = parseOperand(n, ctx)
       op.typ = castType
       result = op
       skipParRi n, "cast expression"
@@ -1825,7 +2013,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
       if n.kind == ParLe and (n.tag == DotTagId or n.tag == AtTagId):
         # Wrapped address expression: (mem (dot ...) or (mem (at ...))
         var addrOp = parseOperand(n, ctx)
-        if not addrOp.isMem:
+        if addrOp.kind != okMem:
           error("mem requires address expression", n)
 
         # Dereference the pointer type
@@ -1837,7 +2025,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
       else:
         # Explicit addressing: (mem base) or (mem base offset) or (mem base index scale [offset])
         var baseOp = parseOperand(n, ctx)
-        if baseOp.isImm or baseOp.isMem:
+        if baseOp.kind == okImm or baseOp.kind == okMem:
           error("mem base must be a register", n)
 
         var displacement: int32 = 0
@@ -1846,15 +2034,21 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
         var scale: int = 1
 
         # Check for offset
+        var stackVarType: Type = nil
         if n.kind == IntLit or n.kind == Symbol:
           if n.kind == IntLit:
             displacement = int32(getInt(n))
             inc n
           elif n.kind == Symbol:
-            # Could be index register
+            # Could be index register or stack variable (used as offset)
             let indexName = getSym(n)
             let indexSym = lookupWithAutoImport(ctx, ctx.scope, indexName, n)
-            if indexSym != nil and indexSym.kind == skVar and indexSym.reg != InvalidTagId:
+            if indexSym != nil and (indexSym.kind == skVar or indexSym.kind == skParam) and indexSym.onStack:
+              # Stack variable - use its offset as displacement and preserve type (unwrap StackOffT)
+              displacement = int32(indexSym.offset)
+              stackVarType = if indexSym.typ.kind == StackOffT: indexSym.typ.offType else: indexSym.typ
+              inc n
+            elif indexSym != nil and indexSym.kind == skVar and indexSym.reg != InvalidTagId:
               # This is the index register
               hasIndex = true
               let indexRegTag = tagToX64Reg(indexSym.reg)
@@ -1890,9 +2084,9 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
                   displacement = int32(getInt(n))
                   inc n
             else:
-              error("Expected index register or offset in mem", n)
+              error("Expected index register or stack variable in mem", n)
 
-        result.isMem = true
+        result.kind = okMem
         result.mem = x86.MemoryOperand(
           base: baseOp.reg,
           index: indexReg,
@@ -1900,37 +2094,122 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
           displacement: displacement,
           hasIndex: hasIndex
         )
-        # Type is unknown for explicit addressing
-        result.typ = Type(kind: IntT, bits: 64)  # Default assumption
+        # Preserve type from stack variable if available, otherwise default
+        if stackVarType != nil:
+          result.typ = stackVarType
+        else:
+          result.typ = Type(kind: IntT, bits: 64)  # Default assumption
 
       skipParRi n, "mem expression"
-      inc n
     elif t == SsizeTagId:
-      result.isSsize = true
+      result.kind = okSsize
       result.typ = Type(kind: IntT, bits: 64)
       inc n
       skipParRi n, "ssize expression"
+    elif t == CsizeTagId:
+      # (csize) - call stack argument size
+      if not ctx.inCall:
+        error("(csize) can only be used inside a prepare block", n)
+      result.kind = okCsize
+      result.immVal = int64(ctx.currentCallStackArgSize)
+      result.typ = Type(kind: IntT, bits: 64)
       inc n
+      skipParRi n, "csize expression"
+    elif t == ArgTagId:
+      # (arg name) - argument reference in prepare block
+      if not ctx.inCall:
+        error("(arg ...) can only be used inside a prepare block", n)
+      inc n
+      if n.kind != Symbol: error("Expected argument name in (arg ...)", n)
+      let argName = getSym(n)
+      inc n
+      skipParRi n, "arg expression"
+
+      let callCtx = addr ctx.callStack[^1]
+      if argName notin callCtx.paramLookup:
+        error("Unknown argument: " & argName, n)
+
+      let param = callCtx.paramLookup[argName]
+      if param.onStack:
+        # Stack argument - return the offset as an immediate
+        # The offset is computed from the stack parameter declarations
+        var offset = 0
+        for p in callCtx.sig.params:
+          if p.onStack:
+            if p.name == argName:
+              break
+            offset += slots.alignedSize(p.typ)
+        result.kind = okArg
+        result.argName = argName
+        result.kind = okImm
+        result.immVal = int64(offset)
+        result.typ = param.typ
+      else:
+        # Register argument - return the register
+        result.kind = okArg
+        result.argName = argName
+        let paramRegTag = tagToX64Reg(param.reg)
+        result.reg = case paramRegTag
+          of RaxR, R0R: x86.RAX
+          of RdiR, R5R: x86.RDI
+          of RsiR, R4R: x86.RSI
+          of RdxR, R3R: x86.RDX
+          of RcxR, R2R: x86.RCX
+          of R8R: x86.R8
+          of R9R: x86.R9
+          of R10R: x86.R10
+          of R11R: x86.R11
+          else: x86.RAX
+        result.typ = param.typ
+    elif t == ResTagId:
+      # (res name) - result reference in prepare block (after call)
+      if not ctx.inCall:
+        error("(res ...) can only be used inside a prepare block", n)
+      inc n
+      if n.kind != Symbol: error("Expected result name in (res ...)", n)
+      let resName = getSym(n)
+      inc n
+      skipParRi n, "res expression"
+
+      let callCtx = addr ctx.callStack[^1]
+      if not callCtx.callEmitted:
+        error("(res ...) can only be used after (call) or (extcall)", n)
+      if resName notin callCtx.resultLookup:
+        error("Unknown result: " & resName, n)
+      if resName in callCtx.resultsSet:
+        error("Result already bound: " & resName, n)
+      callCtx.resultsSet.incl(resName)
+
+      let res = callCtx.resultLookup[resName]
+      let resRegTag = tagToX64Reg(res.reg)
+      result.reg = case resRegTag
+        of RaxR, R0R: x86.RAX
+        of RdiR, R5R: x86.RDI
+        of RsiR, R4R: x86.RSI
+        of RdxR, R3R: x86.RDX
+        of RcxR, R2R: x86.RCX
+        of R8R: x86.R8
+        of R9R: x86.R9
+        else: x86.RAX
+      result.typ = res.typ
     else:
       error("Unexpected operand tag: " & $t, n)
   elif n.kind == IntLit:
-    result.isImm = true
+    result.kind = okImm
     result.immVal = getInt(n)
+    result.typ = Type(kind: IntLitT, bits: 64)
     inc n
-    # Immediate type inference?
-    # If expectedType is provided, try to match it.
-    if expectedType != nil and (expectedType.kind in {IntT, UIntT, FloatT}):
-        result.typ = expectedType
-    else:
-        result.typ = Type(kind: IntT, bits: 64) # Default
   elif n.kind == Symbol:
     let name = getSym(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and (sym.kind == skVar or sym.kind == skParam):
       if sym.onStack:
-        result.isMem = true
-        result.mem = x86.MemoryOperand(base: RBP, displacement: int32(sym.offset))
-        result.typ = sym.typ
+        # Return StackOffT - operations like `add` will reject this at type check
+        result.kind = okMem
+        result.mem = x86.MemoryOperand(base: x86.RSP, displacement: int32(sym.offset))
+        result.typ = sym.typ  # Already StackOffT from declaration
+        inc n
+        return
       elif sym.reg != InvalidTagId:
         let regTag = tagToX64Reg(sym.reg)
         result.reg = case regTag
@@ -1959,11 +2238,12 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
       result.typ = sym.typ
       inc n
     elif sym != nil and sym.kind == skLabel:
-      result.reg = RAX
+      result.kind = okLabel
       result.label = LabelId(sym.offset)
       result.typ = Type(kind: UIntT, bits: 64)
       inc n
     elif sym != nil and sym.kind == skRodata:
+      result.kind = okLabel
       if sym.offset == -1:
         # Forward reference - create label now but don't define it yet
         # It will be defined when the rodata is actually written
@@ -1972,12 +2252,12 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
         result.label = labId
       else:
         result.label = LabelId(sym.offset)
-      result.reg = RAX
       result.typ = Type(kind: UIntT, bits: 64) # Address of rodata
       inc n
     elif sym != nil and sym.kind == skGvar:
       # Global variable - return its address
       # For foreign symbols, we can't generate code, but we can typecheck
+      result.kind = okLabel
       if sym.isForeign:
         error("Cannot access foreign global variable '" & name & "' directly (must be linked)", n)
       if sym.offset == -1:
@@ -1987,7 +2267,6 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
         result.label = labId
       else:
         result.label = LabelId(sym.offset)
-      result.reg = RAX
       result.typ = Type(kind: UIntT, bits: 64) # Address of gvar
       inc n
     elif sym != nil and sym.kind == skTvar:
@@ -1995,7 +2274,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
       # On x86-64 Linux, TLS variables are accessed via FS segment
       # The offset is stored in sym.offset (allocated in pass2)
       # Use RBP as base register (standard for offset-only addressing)
-      result.isMem = true
+      result.kind = okMem
       result.mem = x86.MemoryOperand(
         base: x86.RBP,  # RBP allows displacement-only addressing
         displacement: int32(sym.offset),
@@ -2012,19 +2291,66 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
 proc parseDest(n: var Cursor; ctx: var GenContext): Operand =
   if n.kind == ParLe and rawTagIsX64Reg(n.tag):
     result.reg = parseRegister(n)
-    result.typ = Type(kind: IntT, bits: 64)
+    result.typ = Type(kind: RegisterT, regBits: 64)
     # Check if this register is bound to a variable
     if result.reg in ctx.regBindings:
       error("Register " & $result.reg & " is bound to variable '" &
             ctx.regBindings[result.reg] & "', use the variable name instead", n)
+  elif n.kind == ParLe and n.tag == ArgTagId:
+    # (arg name) as destination - for register arguments in prepare block
+    if not ctx.inCall:
+      error("(arg ...) can only be used inside a prepare block", n)
+    inc n
+    if n.kind != Symbol: error("Expected argument name in (arg ...)", n)
+    let argName = getSym(n)
+    inc n
+    skipParRi n, "arg destination"
+
+    var callCtx = addr ctx.callStack[^1]
+    if argName notin callCtx.paramLookup:
+      error("Unknown argument: " & argName, n)
+
+    let param = callCtx.paramLookup[argName]
+    if param.onStack:
+      error("Stack argument '" & argName & "' cannot be used directly as destination, use (mem (rsp) (arg " & argName & "))", n)
+
+    # Track that this argument is being set
+    if argName in callCtx.argsSet:
+      error("Argument already set: " & argName, n)
+    callCtx.argsSet.incl(argName)
+
+    # Return the register for this argument
+    let paramRegTag = tagToX64Reg(param.reg)
+    result.kind = okArg
+    result.argName = argName
+    result.reg = case paramRegTag
+      of RaxR, R0R: x86.RAX
+      of RdiR, R5R: x86.RDI
+      of RsiR, R4R: x86.RSI
+      of RdxR, R3R: x86.RDX
+      of RcxR, R2R: x86.RCX
+      of R8R: x86.R8
+      of R9R: x86.R9
+      of R10R: x86.R10
+      of R11R: x86.R11
+      else: x86.RAX
+    result.typ = param.typ
+  elif n.kind == ParLe and (n.tag == MemTagId or n.tag == DotTagId or n.tag == AtTagId):
+    let op = parseOperand(n, ctx)
+    if op.kind != okMem:
+      error("Expected memory destination", n)
+    result = op
   elif n.kind == Symbol:
     let name = getSym(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and sym.kind == skVar:
        if sym.onStack:
-         result.isMem = true
-         result.mem = x86.MemoryOperand(base: RBP, displacement: int32(sym.offset))
-         result.typ = sym.typ
+         # Return StackOffT - operations like `add` will reject this at type check
+         result.kind = okMem
+         result.mem = x86.MemoryOperand(base: x86.RSP, displacement: int32(sym.offset))
+         result.typ = sym.typ  # Already StackOffT from declaration
+         inc n
+         return
        elif sym.reg != InvalidTagId:
          result.reg = case sym.reg
             of RaxTagId, R0TagId: RAX
@@ -2052,7 +2378,7 @@ proc parseDest(n: var Cursor; ctx: var GenContext): Operand =
        inc n
     elif sym != nil and sym.kind == skTvar:
        # Writing to thread local variable via FS segment
-       result.isMem = true
+       result.kind = okMem
        result.mem = x86.MemoryOperand(
          base: RBP,  # RBP allows displacement-only addressing
          displacement: int32(sym.offset),
@@ -2091,96 +2417,97 @@ proc checkCompatibleTypes(t1, t2: Type; op: string; n: Cursor) =
   if not compatible(t1, t2):
     error("Operation '" & op & "' requires compatible types, got " & $t1 & " and " & $t2, n)
 
-proc genCallX64(n: var Cursor; ctx: var GenContext) =
-  if ctx.inCall: error("Nested calls are not allowed", n)
-  ctx.inCall = true
-  defer: ctx.inCall = false
-  # (call target (mov arg val) ...)
+proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
+  ## Handle (prepare target ... (call) ...) or (prepare target ... (extcall) ...)
+  ## The prepare block sets up a call context for type checking and argument tracking.
   let start = n
   inc n
-  if n.kind != Symbol: error("Expected proc symbol, got " & $n.kind, n)
+  if n.kind != Symbol: error("Expected proc symbol or type, got " & $n.kind, n)
   let name = getSym(n)
   let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
-  if sym == nil or sym.kind != skProc: error("Unknown proc: " & name & " (use 'iat' for external procs)", n)
-  if sym.isForeign:
-    error("Cannot call foreign proc '" & name & "' (must be linked)", n)
+
+  var callCtx = CallContext(
+    target: name,
+    paramLookup: initTable[string, Param](),
+    resultLookup: initTable[string, Param](),
+    argsSet: initHashSet[string](),
+    resultsSet: initHashSet[string](),
+    callEmitted: false
+  )
+
+  if sym == nil:
+    error("Unknown symbol: " & name, n)
+  elif sym.kind == skProc:
+    if sym.isForeign:
+      error("Cannot call foreign proc '" & name & "' directly (use extcall)", n)
+    callCtx.sig = sym.sig
+    callCtx.isExternal = false
+  elif sym.kind == skExtProc:
+    # External proc - find its info
+    callCtx.isExternal = true
+    for i, ext in ctx.extProcs:
+      if ext.name == name:
+        callCtx.extProcIdx = i
+        break
+    # External procs don't have full signatures in current design
+    # For now, we skip argument checking for external procs
+  else:
+    error("Expected proc symbol, got " & $sym.kind, n)
+
+  # Build lookup tables (only for internal procs with signatures)
+  if not callCtx.isExternal:
+    for param in callCtx.sig.params:
+      callCtx.paramLookup[param.name] = param
+    for res in callCtx.sig.result:
+      callCtx.resultLookup[res.name] = res
+    # Compute stack argument size
+    callCtx.stackArgSize = computeStackArgSize(callCtx.sig)
+
+  # Push call context
+  ctx.callStack.add callCtx
   inc n
 
-  # Parse arguments
-  var args: Table[string, Operand]
-  while n.kind == ParLe:
-    if tagToX64Inst(n.tag) == MovX64:
-      inc n # mov
-      if n.kind != Symbol: error("Expected argument name", n)
-      let argName = getSym(n)
-      inc n
-      let val = parseOperand(n, ctx)
-      args[argName] = val
-      skipParRi n, "argument"
-    else:
-      error("Expected (mov arg val) in call", n)
+  # Process instructions inside prepare block
+  while n.kind != ParRi:
+    genInstX64(n, ctx)
 
-  # Validate arguments against signature
-  let sig = sym.sig
-  for param in sig.params:
-    if param.name notin args:
-      error("Missing argument: " & param.name, n)
-    let arg = args[param.name]
-    checkType(param.typ, arg.typ, start)
+  # Verify all bindings are done
+  let currentCtx = ctx.callStack[^1]
+  if not currentCtx.isExternal:
+    for param in currentCtx.sig.params:
+      if not param.onStack and param.name notin currentCtx.argsSet:
+        error("Missing argument: " & param.name, n)
 
-    var paramReg: x86.Register = x86.RAX # Default
-    if param.onStack:
-      # Argument is on stack.
-      # We need to push or move to stack slot?
-      # nifasm is low level. Caller prepares arguments.
-      # If param is on stack, it is at [RSP + X] relative to caller?
-      # Wait, caller pushes args.
-      # So we need `push arg`.
-      # But nifasm uses `mov` syntax?
-      # If signature says (param :x (s) ...), call uses (mov :x val).
-      # We should emit `push val`?
-      # Or `mov [rsp+offset], val` (if we reserved space).
-      # Standard convention: PUSH args.
-      # But nifasm doesn't have PUSH in CallTagId logic.
-      # The order matters for PUSH.
-      # We iterate params.
-      # If we push, we must do it in reverse order (for C convention)?
-      # Or correct order?
-      # System V: stack args are pushed right-to-left.
-      # We have named args. We need to sort them or process in signature order?
-      # Signature order is likely declaration order.
-      # If we process in order, we might need to adjust.
-      # Let's assume we emit `mov` to register for reg params.
-      # For stack params, we should emit `push`?
-      # But `emitCall` does not handle pushing.
-      # If we need to push, we should do it.
-      # For now, let's error on stack params or implement push.
-      # x86 module needs emitPush.
-      error("Stack parameters not yet supported in call generation", n)
-    else:
-      let paramRegTag = tagToX64Reg(param.reg)
-      case paramRegTag
-      of RaxR, R0R: paramReg = x86.RAX
-      of RdiR, R5R: paramReg = x86.RDI
-      of RsiR, R4R: paramReg = x86.RSI
-      of RdxR, R3R: paramReg = x86.RDX
-      of RcxR, R2R: paramReg = x86.RCX
-      of R8R: paramReg = x86.R8
-      of R9R: paramReg = x86.R9
-      else: discard
+    for res in currentCtx.sig.result:
+      if res.name notin currentCtx.resultsSet:
+        error("Missing result binding: " & res.name, n)
 
-      if arg.isSsize:
-        x86.emitMovImmToReg32(ctx.buf.data, paramReg, 0)
-        ctx.ssizePatches.add(ctx.buf.data.len - 4)
-      elif arg.isImm:
-        x86.emitMovImmToReg(ctx.buf.data, paramReg, arg.immVal)
-      elif arg.isMem:
-        x86.emitMov(ctx.buf.data, paramReg, arg.mem)
-      elif arg.reg != paramReg:
-        x86.emitMov(ctx.buf.data, paramReg, arg.reg)
+    # Verify call was emitted
+    if not currentCtx.callEmitted:
+      error("Missing (call) or (extcall) in prepare block", n)
+  else:
+    if not currentCtx.callEmitted:
+      error("Missing (extcall) in prepare block", n)
+
+  # Pop call context
+  discard ctx.callStack.pop()
+  skipParRi n, "prepare"
+
+proc genCallMarkerX64(n: var Cursor; ctx: var GenContext) =
+  ## Handle (call) marker inside a prepare block - emits the actual call instruction
+  if not ctx.inCall:
+    error("(call) can only be used inside a prepare block", n)
+
+  var callCtx = addr ctx.callStack[^1]
+  if callCtx.callEmitted:
+    error("Multiple (call) instructions in prepare block", n)
+  if callCtx.isExternal:
+    error("Use (extcall) for external procs, not (call)", n)
+
+  let sym = lookupWithAutoImport(ctx, ctx.scope, callCtx.target, n)
 
   # Clobber registers
-  ctx.clobbered.incl(sig.clobbers)
+  ctx.clobbered.incl(callCtx.sig.clobbers)
 
   var labId: LabelId
   if sym.offset == -1:
@@ -2190,7 +2517,36 @@ proc genCallX64(n: var Cursor; ctx: var GenContext) =
     labId = LabelId(sym.offset)
 
   ctx.buf.emitCall(labId)
+  callCtx.callEmitted = true
+
+  inc n
   skipParRi n, "call"
+
+proc genExtcallX64(n: var Cursor; ctx: var GenContext) =
+  ## Handle (extcall) marker inside a prepare block - emits external call via IAT
+  if not ctx.inCall:
+    error("(extcall) can only be used inside a prepare block", n)
+
+  var callCtx = addr ctx.callStack[^1]
+  if callCtx.callEmitted:
+    error("Multiple call instructions in prepare block", n)
+  if not callCtx.isExternal:
+    error("Use (call) for internal procs, not (extcall)", n)
+
+  # Record call site and emit IAT call
+  let callPos = ctx.buf.data.len
+  ctx.extProcs[callCtx.extProcIdx].callSites.add callPos
+  ctx.buf.emitIatCall(ctx.extProcs[callCtx.extProcIdx].gotSlot)
+
+  callCtx.callEmitted = true
+
+  inc n
+  skipParRi n, "extcall"
+
+  #for (res, dest) in boundResults:
+  #  let resReg = tagToRegister(res.reg)
+  #  if dest.reg != resReg:
+  #    x86.emitMov(ctx.buf.data, dest.reg, resReg)
 
 proc genIatX64(n: var Cursor; ctx: var GenContext) =
   # (iat symbol) - Indirect call through IAT for external procs
@@ -2213,12 +2569,17 @@ proc genIatX64(n: var Cursor; ctx: var GenContext) =
   skipParRi n, "iat"
 
 proc genMovX64(n: var Cursor; ctx: var GenContext) =
+  let start = n
   inc n
   let dest = parseDest(n, ctx)
   let op = parseOperand(n, ctx)
 
-  if dest.isMem:
-    if op.isImm:
+  # Type checking
+  if dest.typ != nil and op.typ != nil:
+    checkType(dest.typ, op.typ, start)
+
+  if dest.kind == okMem:
+    if op.kind == okImm:
       # x86 supports mov r/m64, imm32 (sign extended)
       if op.immVal >= low(int32) and op.immVal <= high(int32):
         # We need emitMov(MemoryOperand, int32)
@@ -2233,24 +2594,27 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
         error("Moving immediate to memory not fully supported yet (requires emitMovImmToMem)", n)
       else:
         error("Immediate too large for memory move (must fit in 32 bits)", n)
-    elif op.isSsize:
+    elif op.kind == okSsize:
       # Similar issue, ssize is immediate 0 (patched).
       error("Moving ssize to memory not supported", n)
-    elif op.isMem:
+    elif op.kind == okMem:
       error("Cannot move memory to memory", n)
     else:
       x86.emitMov(ctx.buf.data, dest.mem, op.reg)
   else:
     # dest is reg
-    if op.isSsize:
+    if op.kind == okSsize:
       x86.emitMovImmToReg32(ctx.buf.data, dest.reg, 0)
       ctx.ssizePatches.add(ctx.buf.data.len - 4)
-    elif op.isImm:
+    elif op.kind == okCsize:
+      # csize is a known value - the stack argument size for the current call
+      x86.emitMovImmToReg32(ctx.buf.data, dest.reg, int32(op.immVal))
+    elif op.kind == okImm:
       if op.immVal >= low(int32) and op.immVal <= high(int32):
         x86.emitMovImmToReg32(ctx.buf.data, dest.reg, int32(op.immVal))
       else:
         x86.emitMovImmToReg(ctx.buf.data, dest.reg, op.immVal)
-    elif op.isMem:
+    elif op.kind == okMem:
       x86.emitMov(ctx.buf.data, dest.reg, op.mem)
     else:
       x86.emitMov(ctx.buf.data, dest.reg, op.reg)
@@ -2432,7 +2796,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # (cfvar :name.0)
     inc n
     if n.kind != SymbolDef: error("Expected cfvar name", n)
-    let name = getSym(n)
+    let name = pool.syms[n.symId]
     inc n
 
     # Control flow variables are always virtual (bool type, never materialized)
@@ -2447,7 +2811,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
   of VarD:
     inc n
     if n.kind != SymbolDef: error("Expected var name", n)
-    let name = getSym(n)
+    let name = pool.syms[n.symId]
     inc n
     var reg = InvalidTagId
     var onStack = false
@@ -2465,12 +2829,13 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         error("Expected location", n)
     else:
       error("Expected location", n)
-    let typ = parseType(n, ctx.scope, ctx)
+    let baseTyp = parseType(n, ctx.scope, ctx)
 
-    let sym = Symbol(name: name, kind: skVar, typ: typ)
+    let sym = Symbol(name: name, kind: skVar, typ: baseTyp)
     if onStack:
       sym.onStack = true
-      sym.offset = ctx.slots.allocSlot(typ)
+      sym.offset = ctx.slots.allocSlot(baseTyp)
+      sym.typ = Type(kind: StackOffT, offType: baseTyp)  # Wrap in StackOffT
     else:
       sym.reg = reg
       # Check if register is already bound to another variable
@@ -2498,8 +2863,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     while n.kind != ParRi:
       genInstX64(n, ctx)
     inc n
+  of PrepareX64:
+    genPrepareX64(n, ctx)
   of CallX64:
-    genCallX64(n, ctx)
+    genCallMarkerX64(n, ctx)
+  of ExtcallX64:
+    genExtcallX64(n, ctx)
   of IatX64:
     genIatX64(n, ctx)
 
@@ -2523,24 +2892,26 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkIntegerArithmetic(op.typ, "add", start)
     checkCompatibleTypes(dest.typ, op.typ, "add", start)
 
-    if dest.isMem:
-      if op.isImm:
+    if dest.kind == okMem:
+      if op.kind == okImm or op.kind == okCsize:
         # ADD m64, imm32
         # Need emitAdd(MemoryOperand, int32)
         error("Adding immediate to memory not supported yet", n)
-      elif op.isSsize:
+      elif op.kind == okSsize:
         error("Adding ssize to memory not supported", n)
-      elif op.isMem:
+      elif op.kind == okMem:
         error("Cannot add memory to memory", n)
       else:
         x86.emitAdd(ctx.buf.data, dest.mem, op.reg)
     else:
-      if op.isSsize:
+      if op.kind == okSsize:
         x86.emitAddImm(ctx.buf.data, dest.reg, 0)
         ctx.ssizePatches.add(ctx.buf.data.len - 4)
-      elif op.isImm:
+      elif op.kind == okCsize:
         x86.emitAddImm(ctx.buf.data, dest.reg, int32(op.immVal))
-      elif op.isMem:
+      elif op.kind == okImm:
+        x86.emitAddImm(ctx.buf.data, dest.reg, int32(op.immVal))
+      elif op.kind == okMem:
         x86.emitAdd(ctx.buf.data, dest.reg, op.mem)
       else:
         x86.emitAdd(ctx.buf.data, dest.reg, op.reg)
@@ -2556,22 +2927,24 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkIntegerArithmetic(op.typ, "sub", start)
     checkCompatibleTypes(dest.typ, op.typ, "sub", start)
 
-    if dest.isMem:
-      if op.isImm:
+    if dest.kind == okMem:
+      if op.kind == okImm or op.kind == okCsize:
         error("Subtracting immediate from memory not supported yet", n)
-      elif op.isSsize:
+      elif op.kind == okSsize:
         error("Subtracting ssize from memory not supported", n)
-      elif op.isMem:
+      elif op.kind == okMem:
         error("Cannot subtract memory from memory", n)
       else:
         x86.emitSub(ctx.buf.data, dest.mem, op.reg)
     else:
-      if op.isSsize:
+      if op.kind == okSsize:
         x86.emitSubImm(ctx.buf.data, dest.reg, 0)
         ctx.ssizePatches.add(ctx.buf.data.len - 4)
-      elif op.isImm:
+      elif op.kind == okCsize:
         x86.emitSubImm(ctx.buf.data, dest.reg, int32(op.immVal))
-      elif op.isMem:
+      elif op.kind == okImm:
+        x86.emitSubImm(ctx.buf.data, dest.reg, int32(op.immVal))
+      elif op.kind == okMem:
         x86.emitSub(ctx.buf.data, dest.reg, op.mem)
       else:
         x86.emitSub(ctx.buf.data, dest.reg, op.reg)
@@ -2581,8 +2954,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let op = parseOperand(n, ctx)
     checkIntegerType(op.typ, "mul", start)
-    if op.isImm: error("MUL immediate not supported", n)
-    if op.isMem: error("MUL memory not supported yet", n) # Need emitMul(mem)
+    if op.kind == okImm: error("MUL immediate not supported", n)
+    if op.kind == okMem: error("MUL memory not supported yet", n) # Need emitMul(mem)
     x86.emitMul(ctx.buf.data, op.reg)
     skipParRi n, "mul"
 
@@ -2594,10 +2967,10 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperand(n, ctx)
     checkIntegerType(dest.typ, "imul", start)
     checkIntegerType(op.typ, "imul", start)
-    if dest.isMem: error("IMUL destination cannot be memory", n)
-    if op.isImm:
+    if dest.kind == okMem: error("IMUL destination cannot be memory", n)
+    if op.kind == okImm:
       x86.emitImulImm(ctx.buf.data, dest.reg, int32(op.immVal))
-    elif op.isMem:
+    elif op.kind == okMem:
       error("IMUL memory source not supported yet", n) # Need emitImul(reg, mem)
     else:
       x86.emitImul(ctx.buf.data, dest.reg, op.reg)
@@ -2617,8 +2990,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
 
     let op = parseOperand(n, ctx)
     checkIntegerType(op.typ, "div", start)
-    if op.isImm: error("DIV immediate not supported", n)
-    if op.isMem: error("DIV memory not supported yet", n)
+    if op.kind == okImm: error("DIV immediate not supported", n)
+    if op.kind == okMem: error("DIV memory not supported yet", n)
     x86.emitDiv(ctx.buf.data, op.reg)
     skipParRi n, "div"
 
@@ -2636,8 +3009,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
 
     let op = parseOperand(n, ctx)
     checkIntegerType(op.typ, "idiv", start)
-    if op.isImm: error("IDIV immediate not supported", n)
-    if op.isMem: error("IDIV memory not supported yet", n)
+    if op.kind == okImm: error("IDIV immediate not supported", n)
+    if op.kind == okMem: error("IDIV memory not supported yet", n)
     x86.emitIdiv(ctx.buf.data, op.reg)
     skipParRi n, "idiv"
 
@@ -2649,12 +3022,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseType(dest.typ, "and", start)
     checkBitwiseType(op.typ, "and", start)
     checkCompatibleTypes(dest.typ, op.typ, "and", start)
-    if dest.isMem:
+    if dest.kind == okMem:
       error("AND to memory not supported yet", n)
     else:
-      if op.isImm:
+      if op.kind == okImm:
         x86.emitAndImm(ctx.buf.data, dest.reg, int32(op.immVal))
-      elif op.isMem:
+      elif op.kind == okMem:
         error("AND from memory not supported yet", n)
       else:
         x86.emitAnd(ctx.buf.data, dest.reg, op.reg)
@@ -2667,12 +3040,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseType(dest.typ, "or", start)
     checkBitwiseType(op.typ, "or", start)
     checkCompatibleTypes(dest.typ, op.typ, "or", start)
-    if dest.isMem:
+    if dest.kind == okMem:
       error("OR to memory not supported yet", n)
     else:
-      if op.isImm:
+      if op.kind == okImm:
         x86.emitOrImm(ctx.buf.data, dest.reg, int32(op.immVal))
-      elif op.isMem:
+      elif op.kind == okMem:
         error("OR from memory not supported yet", n)
       else:
         x86.emitOr(ctx.buf.data, dest.reg, op.reg)
@@ -2685,12 +3058,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseType(dest.typ, "xor", start)
     checkBitwiseType(op.typ, "xor", start)
     checkCompatibleTypes(dest.typ, op.typ, "xor", start)
-    if dest.isMem:
+    if dest.kind == okMem:
       error("XOR to memory not supported yet", n)
     else:
-      if op.isImm:
+      if op.kind == okImm:
         x86.emitXorImm(ctx.buf.data, dest.reg, int32(op.immVal))
-      elif op.isMem:
+      elif op.kind == okMem:
         error("XOR from memory not supported yet", n)
       else:
         x86.emitXor(ctx.buf.data, dest.reg, op.reg)
@@ -2701,8 +3074,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
     checkBitwiseType(dest.typ, "shl", start)
-    if dest.isMem: error("Shift destination cannot be memory", n)
-    if op.isImm:
+    if dest.kind == okMem: error("Shift destination cannot be memory", n)
+    if op.kind == okImm:
       x86.emitShl(ctx.buf.data, dest.reg, int(op.immVal))
     elif op.reg == RCX:
       # emitShlCl? x86.nim only has imm count support in emitShl currently?
@@ -2719,8 +3092,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
     checkBitwiseType(dest.typ, "shr", start)
-    if dest.isMem: error("Shift destination cannot be memory", n)
-    if op.isImm:
+    if dest.kind == okMem: error("Shift destination cannot be memory", n)
+    if op.kind == okImm:
       x86.emitShr(ctx.buf.data, dest.reg, int(op.immVal))
     else:
       error("Shift count must be immediate", n)
@@ -2731,8 +3104,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
     checkBitwiseType(dest.typ, "sar", start)
-    if dest.isMem: error("Shift destination cannot be memory", n)
-    if op.isImm:
+    if dest.kind == okMem: error("Shift destination cannot be memory", n)
+    if op.kind == okImm:
       x86.emitSar(ctx.buf.data, dest.reg, int(op.immVal))
     else:
       error("Shift count must be immediate", n)
@@ -2743,7 +3116,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let op = parseDest(n, ctx) # Dest/Src same
     checkIntegerArithmetic(op.typ, "inc", start)
-    if op.isMem: error("INC memory not supported yet", n)
+    if op.kind == okMem: error("INC memory not supported yet", n)
     x86.emitInc(ctx.buf.data, op.reg)
     skipParRi n, "inc"
 
@@ -2751,7 +3124,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let op = parseDest(n, ctx)
     checkIntegerArithmetic(op.typ, "dec", start)
-    if op.isMem: error("DEC memory not supported yet", n)
+    if op.kind == okMem: error("DEC memory not supported yet", n)
     x86.emitDec(ctx.buf.data, op.reg)
     skipParRi n, "dec"
 
@@ -2759,7 +3132,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let op = parseDest(n, ctx)
     checkIntegerArithmetic(op.typ, "neg", start)
-    if op.isMem: error("NEG memory not supported yet", n)
+    if op.kind == okMem: error("NEG memory not supported yet", n)
     x86.emitNeg(ctx.buf.data, op.reg)
     skipParRi n, "neg"
 
@@ -2767,7 +3140,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let op = parseDest(n, ctx)
     checkBitwiseType(op.typ, "not", start)
-    if op.isMem: error("NOT memory not supported yet", n)
+    if op.kind == okMem: error("NOT memory not supported yet", n)
     x86.emitNot(ctx.buf.data, op.reg)
     skipParRi n, "not"
 
@@ -2780,11 +3153,11 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkIntegerArithmetic(dest.typ, "cmp", start)
     checkIntegerArithmetic(op.typ, "cmp", start)
     checkCompatibleTypes(dest.typ, op.typ, "cmp", start)
-    if dest.isMem:
-      if op.isImm:
+    if dest.kind == okMem:
+      if op.kind == okImm:
         # CMP m64, imm32
         error("CMP memory, immediate not supported yet", n)
-      elif op.isMem:
+      elif op.kind == okMem:
         error("Cannot compare memory with memory", n)
       else:
         x86.emitCmp(ctx.buf.data, op.reg, dest.mem) # cmp reg, mem? No, cmp mem, reg.
@@ -2795,9 +3168,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         # If op1 is mem, op2 is reg.
         x86.emitCmp(ctx.buf.data, dest.mem, op.reg)
     else:
-      if op.isImm:
+      if op.kind == okImm:
         x86.emitCmpImm(ctx.buf.data, dest.reg, int32(op.immVal))
-      elif op.isMem:
+      elif op.kind == okMem:
         x86.emitCmp(ctx.buf.data, dest.reg, op.mem)
       else:
         x86.emitCmp(ctx.buf.data, dest.reg, op.reg)
@@ -2810,12 +3183,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseType(dest.typ, "test", start)
     checkBitwiseType(op.typ, "test", start)
     checkCompatibleTypes(dest.typ, op.typ, "test", start)
-    if dest.isMem:
+    if dest.kind == okMem:
       error("TEST memory not supported yet", n)
-    elif op.isImm:
+    elif op.kind == okImm:
       # emitTestImm
       error("TEST immediate not supported yet", n)
-    elif op.isMem:
+    elif op.kind == okMem:
       error("TEST with memory operand not supported yet", n)
     else:
       x86.emitTest(ctx.buf.data, dest.reg, op.reg)
@@ -2825,89 +3198,89 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
   of SeteX64, SetzX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSete(ctx.buf.data, dest.reg)
     skipParRi n, "sete"
 
   of SetneX64, SetnzX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSetne(ctx.buf.data, dest.reg)
     skipParRi n, "setne"
 
   of SetaX64, SetnbeX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSeta(ctx.buf.data, dest.reg)
     skipParRi n, "seta"
 
   of SetaeX64, SetnbX64, SetncX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSetae(ctx.buf.data, dest.reg)
     skipParRi n, "setae"
 
   of SetbX64, SetnaeX64, SetcX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSetb(ctx.buf.data, dest.reg)
     skipParRi n, "setb"
   of SetbeX64, SetnaX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSetbe(ctx.buf.data, dest.reg)
     skipParRi n, "setbe"
 
   of SetgX64, SetnleX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSetg(ctx.buf.data, dest.reg)
     skipParRi n, "setg"
 
   of SetgeX64, SetnlX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSetge(ctx.buf.data, dest.reg)
     skipParRi n, "setge"
   of SetlX64, SetngeX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSetl(ctx.buf.data, dest.reg)
     skipParRi n, "setl"
 
   of SetleX64, SetngX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSetle(ctx.buf.data, dest.reg)
     skipParRi n, "setle"
 
   of SetoX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSeto(ctx.buf.data, dest.reg)
     skipParRi n, "seto"
 
   of SetsX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSets(ctx.buf.data, dest.reg)
     skipParRi n, "sets"
 
   of SetpX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem: error("SETcc memory not supported yet", n)
+    if dest.kind == okMem: error("SETcc memory not supported yet", n)
     x86.emitSetp(ctx.buf.data, dest.reg)
     skipParRi n, "setp"
   # Conditional moves
@@ -2915,9 +3288,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmove(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmove(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmove(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmove"
 
@@ -2925,9 +3298,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovne(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovne(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovne(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovne"
 
@@ -2935,9 +3308,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmova(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmova(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmova(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmova"
 
@@ -2945,9 +3318,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovae(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovae(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovae(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovae"
 
@@ -2955,9 +3328,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovb(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovb(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovb(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovb"
 
@@ -2965,9 +3338,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovbe(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovbe(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovbe(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovbe"
 
@@ -2975,9 +3348,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovg(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovg(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovg(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovg"
 
@@ -2985,9 +3358,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovge(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovge(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovge(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovge"
 
@@ -2995,9 +3368,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovl(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovl(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovl(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovl"
 
@@ -3005,9 +3378,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovle(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovle(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovle(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovle"
 
@@ -3015,9 +3388,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovo(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovo(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovo(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovo"
 
@@ -3025,9 +3398,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovs(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovs(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovs(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovs"
 
@@ -3035,9 +3408,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovp(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovp(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovp(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovp"
 
@@ -3045,9 +3418,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovnp(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovnp(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovnp(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovnp"
 
@@ -3055,9 +3428,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovns(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovns(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovns(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovns"
 
@@ -3065,18 +3438,18 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    if dest.isMem: error("CMOV destination must be a register", n)
-    if op.isImm: error("CMOV immediate not supported", n)
-    if op.isMem: x86.emitCmovno(ctx.buf.data, dest.reg, op.mem)
+    if dest.kind == okMem: error("CMOV destination must be a register", n)
+    if op.kind == okImm: error("CMOV immediate not supported", n)
+    if op.kind == okMem: x86.emitCmovno(ctx.buf.data, dest.reg, op.mem)
     else: x86.emitCmovno(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmovno"
   # Stack
   of PushX64:
     inc n
     let op = parseOperand(n, ctx)
-    if op.isImm:
+    if op.kind == okImm:
       x86.emitPush(ctx.buf.data, int32(op.immVal))
-    elif op.isMem:
+    elif op.kind == okMem:
       error("PUSH memory not supported yet", n)
     else:
       x86.emitPush(ctx.buf.data, op.reg)
@@ -3085,7 +3458,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
   of PopX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem:
+    if dest.kind == okMem:
       error("POP memory not supported yet", n)
     else:
       x86.emitPop(ctx.buf.data, dest.reg)
@@ -3096,19 +3469,59 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     x86.emitSyscall(ctx.buf.data)
     skipParRi n, "syscall"
   of LeaX64:
+    # (lea dest-reg base-reg offset) or (lea dest-reg label)
     inc n
     let dest = parseRegister(n) # LEA dest must be register
-    let op = parseOperand(n, ctx)
-    # LEA reg, label (rip-rel) or LEA reg, mem
-    if op.isMem:
-      x86.emitLea(ctx.buf.data, dest, op.mem)
+
+    # Check if next is a label or register
+    if n.kind == ParLe and n.tag == LabTagId:
+      # (lea dest (lab label)) - RIP-relative address
+      inc n
+      if n.kind != Symbol: error("Expected label name", n)
+      let name = getSym(n)
+      let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+      if sym == nil or sym.kind != skLabel: error("Unknown label: " & name, n)
+      inc n
+      skipParRi n, "label usage"
+      x86.emitLea(ctx.buf, dest, LabelId(sym.offset))
+    elif n.kind == ParLe and rawTagIsX64Reg(n.tag):
+      # (lea dest base-reg offset) - explicit addressing
+      let baseReg = parseRegister(n)
+      var displacement: int32 = 0
+
+      # Parse offset - can be integer or stack variable name
+      if n.kind == IntLit:
+        displacement = int32(getInt(n))
+        inc n
+      elif n.kind == Symbol:
+        let offsetName = getSym(n)
+        let offsetSym = lookupWithAutoImport(ctx, ctx.scope, offsetName, n)
+        if offsetSym != nil and (offsetSym.kind == skVar or offsetSym.kind == skParam) and offsetSym.onStack:
+          displacement = int32(offsetSym.offset)
+        else:
+          error("Expected stack variable or integer offset in lea", n)
+        inc n
+      else:
+        error("Expected offset (integer or stack variable) in lea", n)
+
+      let mem = x86.MemoryOperand(
+        base: baseReg,
+        displacement: displacement,
+        hasIndex: false
+      )
+      x86.emitLea(ctx.buf.data, dest, mem)
     else:
-      x86.emitLea(ctx.buf, dest, op.label)
+      # Try parsing as a label operand (rodata, gvar, etc.)
+      let op = parseOperand(n, ctx)
+      if op.kind == okLabel:
+        x86.emitLea(ctx.buf, dest, op.label)
+      else:
+        error("lea requires (base-reg offset) or label", n)
     skipParRi n, "lea"
   of JmpX64:
     inc n
     let op = parseOperand(n, ctx)
-    if op.isMem:
+    if op.kind == okMem:
       error("JMP memory not supported yet", n)
     elif op.label != LabelId(0) or op.typ.kind == UIntT: # Label check
       # op.label is set if it was a label operand
@@ -3209,13 +3622,16 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     skipParRi n, "nop"
   of RetX64:
     inc n
+    when false: # if ctx.procName.len > 0:
+      x86.emitMov(ctx.buf.data, RSP, RBP)
+      x86.emitPop(ctx.buf.data, RBP)
     x86.emitRet(ctx.buf.data)
     skipParRi n, "ret"
   of LabX64:
     # (lab :label)
     inc n
     if n.kind != SymbolDef: error("Expected label name", n)
-    let name = getSym(n)
+    let name = pool.syms[n.symId]
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     # Label might not be defined yet if this is inside a proc body?
     # No, Pass 1 handles types/procs. Labels are local to procs?
@@ -3259,7 +3675,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # x86: MOVSD xmm1, xmm2/m64
     # MOVSD xmm1/m64, xmm2
     # So one must be XMM.
-    if dest.isMem and op.isMem:
+    if dest.kind == okMem and op.kind == okMem:
       error("MOVSD memory to memory not supported", n)
     # We need to check if registers are XMM.
     # Currently parseRegister returns Register enum which is GPR.
@@ -3316,9 +3732,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       checkIntegerArithmetic(dest.typ, "lock add", start)
       checkIntegerArithmetic(op.typ, "lock add", start)
       checkCompatibleTypes(dest.typ, op.typ, "lock add", start)
-      if not dest.isMem: error("Atomic ADD requires memory destination", n)
-      if op.isImm: error("Atomic ADD immediate not supported yet", n)
-      if op.isMem: error("Atomic ADD memory source not supported", n)
+      if dest.kind != okMem: error("Atomic ADD requires memory destination", n)
+      if op.kind == okImm: error("Atomic ADD immediate not supported yet", n)
+      if op.kind == okMem: error("Atomic ADD memory source not supported", n)
       x86.emitLock(ctx.buf.data)
       x86.emitAdd(ctx.buf.data, dest.mem, op.reg)
       skipParRi n, "lock add"
@@ -3329,9 +3745,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       checkIntegerArithmetic(dest.typ, "lock sub", start)
       checkIntegerArithmetic(op.typ, "lock sub", start)
       checkCompatibleTypes(dest.typ, op.typ, "lock sub", start)
-      if not dest.isMem: error("Atomic SUB requires memory destination", n)
-      if op.isImm: error("Atomic SUB immediate not supported yet", n)
-      if op.isMem: error("Atomic SUB memory source not supported", n)
+      if dest.kind != okMem: error("Atomic SUB requires memory destination", n)
+      if op.kind == okImm: error("Atomic SUB immediate not supported yet", n)
+      if op.kind == okMem: error("Atomic SUB memory source not supported", n)
       x86.emitLock(ctx.buf.data)
       x86.emitSub(ctx.buf.data, dest.mem, op.reg)
       skipParRi n, "lock sub"
@@ -3342,9 +3758,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       checkBitwiseType(dest.typ, "lock and", start)
       checkBitwiseType(op.typ, "lock and", start)
       checkCompatibleTypes(dest.typ, op.typ, "lock and", start)
-      if not dest.isMem: error("Atomic AND requires memory destination", n)
-      if op.isImm: error("Atomic AND immediate not supported yet", n)
-      if op.isMem: error("Atomic AND memory source not supported", n)
+      if dest.kind != okMem: error("Atomic AND requires memory destination", n)
+      if op.kind == okImm: error("Atomic AND immediate not supported yet", n)
+      if op.kind == okMem: error("Atomic AND memory source not supported", n)
       x86.emitLock(ctx.buf.data)
       x86.emitAnd(ctx.buf.data, dest.mem, op.reg)
       skipParRi n, "lock and"
@@ -3355,9 +3771,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       checkBitwiseType(dest.typ, "lock or", start)
       checkBitwiseType(op.typ, "lock or", start)
       checkCompatibleTypes(dest.typ, op.typ, "lock or", start)
-      if not dest.isMem: error("Atomic OR requires memory destination", n)
-      if op.isImm: error("Atomic OR immediate not supported yet", n)
-      if op.isMem: error("Atomic OR memory source not supported", n)
+      if dest.kind != okMem: error("Atomic OR requires memory destination", n)
+      if op.kind == okImm: error("Atomic OR immediate not supported yet", n)
+      if op.kind == okMem: error("Atomic OR memory source not supported", n)
       x86.emitLock(ctx.buf.data)
       x86.emitOr(ctx.buf.data, dest.mem, op.reg)
       skipParRi n, "lock or"
@@ -3368,9 +3784,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       checkBitwiseType(dest.typ, "lock xor", start)
       checkBitwiseType(op.typ, "lock xor", start)
       checkCompatibleTypes(dest.typ, op.typ, "lock xor", start)
-      if not dest.isMem: error("Atomic XOR requires memory destination", n)
-      if op.isImm: error("Atomic XOR immediate not supported yet", n)
-      if op.isMem: error("Atomic XOR memory source not supported", n)
+      if dest.kind != okMem: error("Atomic XOR requires memory destination", n)
+      if op.kind == okImm: error("Atomic XOR immediate not supported yet", n)
+      if op.kind == okMem: error("Atomic XOR memory source not supported", n)
       x86.emitLock(ctx.buf.data)
       x86.emitXor(ctx.buf.data, dest.mem, op.reg)
       skipParRi n, "lock xor"
@@ -3378,7 +3794,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       inc n
       let dest = parseDest(n, ctx)
       checkIntegerArithmetic(dest.typ, "lock inc", start)
-      if not dest.isMem: error("Atomic INC requires memory destination", n)
+      if dest.kind != okMem: error("Atomic INC requires memory destination", n)
       x86.emitLock(ctx.buf.data)
       x86.emitInc(ctx.buf.data, dest.mem)
       skipParRi n, "lock inc"
@@ -3386,7 +3802,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       inc n
       let dest = parseDest(n, ctx)
       checkIntegerArithmetic(dest.typ, "lock dec", start)
-      if not dest.isMem: error("Atomic DEC requires memory destination", n)
+      if dest.kind != okMem: error("Atomic DEC requires memory destination", n)
       x86.emitLock(ctx.buf.data)
       x86.emitDec(ctx.buf.data, dest.mem)
       skipParRi n, "lock dec"
@@ -3394,7 +3810,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       inc n
       let dest = parseDest(n, ctx)
       checkBitwiseType(dest.typ, "lock not", start)
-      if not dest.isMem: error("Atomic NOT requires memory destination", n)
+      if dest.kind != okMem: error("Atomic NOT requires memory destination", n)
       x86.emitLock(ctx.buf.data)
       x86.emitNot(ctx.buf.data, dest.mem)
       skipParRi n, "lock not"
@@ -3402,7 +3818,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       inc n
       let dest = parseDest(n, ctx)
       checkIntegerArithmetic(dest.typ, "lock neg", start)
-      if not dest.isMem: error("Atomic NEG requires memory destination", n)
+      if dest.kind != okMem: error("Atomic NEG requires memory destination", n)
       x86.emitLock(ctx.buf.data)
       x86.emitNeg(ctx.buf.data, dest.mem)
       skipParRi n, "lock neg"
@@ -3419,13 +3835,13 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkIntegerType(dest.typ, "xchg", start)
     checkIntegerType(op.typ, "xchg", start)
     checkCompatibleTypes(dest.typ, op.typ, "xchg", start)
-    if dest.isMem:
-      if op.isImm: error("XCHG memory, immediate not supported", n)
-      if op.isMem: error("XCHG memory, memory not supported", n)
+    if dest.kind == okMem:
+      if op.kind == okImm: error("XCHG memory, immediate not supported", n)
+      if op.kind == okMem: error("XCHG memory, memory not supported", n)
       x86.emitXchg(ctx.buf.data, dest.mem, op.reg)
     else:
-      if op.isImm: error("XCHG reg, immediate not supported", n)
-      if op.isMem:
+      if op.kind == okImm: error("XCHG reg, immediate not supported", n)
+      if op.kind == okMem:
         x86.emitXchg(ctx.buf.data, op.mem, dest.reg)
       else:
         x86.emitXchg(ctx.buf.data, dest.reg, op.reg)
@@ -3437,13 +3853,13 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkIntegerType(dest.typ, "xadd", start)
     checkIntegerType(op.typ, "xadd", start)
     checkCompatibleTypes(dest.typ, op.typ, "xadd", start)
-    if dest.isMem:
-      if op.isImm: error("XADD memory, immediate not supported", n)
-      if op.isMem: error("XADD memory, memory not supported", n)
+    if dest.kind == okMem:
+      if op.kind == okImm: error("XADD memory, immediate not supported", n)
+      if op.kind == okMem: error("XADD memory, memory not supported", n)
       x86.emitXadd(ctx.buf.data, dest.mem, op.reg)
     else:
-      if op.isImm: error("XADD reg, immediate not supported", n)
-      if op.isMem: error("XADD reg, memory not supported (dest must be r/m, src must be r)", n)
+      if op.kind == okImm: error("XADD reg, immediate not supported", n)
+      if op.kind == okMem: error("XADD reg, memory not supported (dest must be r/m, src must be r)", n)
       x86.emitXadd(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "xadd"
   of CmpxchgX64:
@@ -3453,19 +3869,19 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkIntegerType(dest.typ, "cmpxchg", start)
     checkIntegerType(op.typ, "cmpxchg", start)
     checkCompatibleTypes(dest.typ, op.typ, "cmpxchg", start)
-    if dest.isMem:
-      if op.isImm: error("CMPXCHG memory, immediate not supported", n)
-      if op.isMem: error("CMPXCHG memory, memory not supported", n)
+    if dest.kind == okMem:
+      if op.kind == okImm: error("CMPXCHG memory, immediate not supported", n)
+      if op.kind == okMem: error("CMPXCHG memory, memory not supported", n)
       x86.emitCmpxchg(ctx.buf.data, dest.mem, op.reg)
     else:
-      if op.isImm: error("CMPXCHG reg, immediate not supported", n)
-      if op.isMem: error("CMPXCHG reg, memory not supported (dest must be r/m, src must be r)", n)
+      if op.kind == okImm: error("CMPXCHG reg, immediate not supported", n)
+      if op.kind == okMem: error("CMPXCHG reg, memory not supported (dest must be r/m, src must be r)", n)
       x86.emitCmpxchg(ctx.buf.data, dest.reg, op.reg)
     skipParRi n, "cmpxchg"
   of Cmpxchg8bX64:
     inc n
     let dest = parseDest(n, ctx)
-    if dest.isMem:
+    if dest.kind == okMem:
       x86.emitCmpxchg8b(ctx.buf.data, dest.mem)
     else:
       x86.emitCmpxchg8b(ctx.buf.data, dest.reg)
@@ -3490,7 +3906,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
   of ClflushX64:
     inc n
     let op = parseDest(n, ctx)
-    if op.isMem: error("CLFLUSH expects memory operand via register?", n)
+    if op.kind == okMem: error("CLFLUSH expects memory operand via register?", n)
     # emitClflush(Register). x86.nim takes Register. CLFLUSH m8. ModRM encodes address.
     # So it takes a register which holds the address? No, it takes an address.
     # x86.nim implementation: emitClflush(reg) -> 0F AE /7 (CLFLUSH m8).
@@ -3542,12 +3958,16 @@ proc pass2(n: Cursor; ctx: var GenContext) =
         let start = n
         let declTag = tagToNifasmDecl(n.tag)
         case declTag
+        of TypeD:
+          # Types were fully handled in pass1; skip the definition body.
+          n = start
+          skip n
         of ProcD:
           # Skip foreign procs - they're not code-generated
           inc n
           if n.kind != SymbolDef:
             error("Expected symbol definition", n)
-          let name = getSym(n)
+          let name = pool.syms[n.symId]
           let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
           if sym != nil and sym.isForeign:
             # Skip foreign proc body
@@ -3558,7 +3978,8 @@ proc pass2(n: Cursor; ctx: var GenContext) =
             pass2Proc(n, ctx)
         of RodataD:
           inc n
-          let name = getSym(n)
+          if n.kind != SymbolDef: error("Expected symbol definition", n)
+          let name = pool.syms[n.symId]
           let sym = ctx.scope.lookup(name)
           inc n
           let s = getStr(n)
@@ -3576,7 +3997,8 @@ proc pass2(n: Cursor; ctx: var GenContext) =
         of GvarD:
           # Global variable declaration - goes in .bss section (zero-initialized writable memory)
           inc n
-          let name = getSym(n)
+          if n.kind != SymbolDef: error("Expected symbol definition", n)
+          let name = pool.syms[n.symId]
           let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
           if sym == nil: error("Global variable not found in scope: " & name, n)
           if sym.isForeign:
@@ -3607,7 +4029,8 @@ proc pass2(n: Cursor; ctx: var GenContext) =
         of TvarD:
           # Thread local variable declaration
           inc n
-          let name = getSym(n)
+          if n.kind != SymbolDef: error("Expected symbol definition", n)
+          let name = pool.syms[n.symId]
           let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
           if sym == nil: error("TLS variable not found in scope: " & name, n)
           if sym.isForeign:
@@ -3645,23 +4068,28 @@ proc writeElf(a: var GenContext; outfile: string) =
   let pageSize = 0x1000.uint64
 
   # Calculate addresses and sizes
-  let textOffset = headersSize.uint64
-  let textVaddr = baseAddr + textOffset
-  let textSize = code.len.uint64
-  let textAlignedSize = (textSize + pageSize - 1) and not (pageSize - 1)
+  # The LOAD segment must start at file offset 0 to include headers
+  # (some kernels like WSL require this for proper loading)
+  let textOffset = 0.uint64  # Include headers in LOAD segment
+  let textVaddr = baseAddr   # Segment starts at base address
+  let textFileSize = headersSize.uint64 + code.len.uint64  # Headers + code
+  let textMemSize = (textFileSize + pageSize - 1) and not (pageSize - 1)
+
+  # Entry point is after the headers
+  let entryAddr = baseAddr + headersSize.uint64
 
   # .bss section comes after .text in memory
-  let bssVaddr = textVaddr + textAlignedSize
+  let bssVaddr = textVaddr + textMemSize
   let bssSize = a.bssOffset.uint64
   let bssAlignedSize = if bssSize > 0: ((bssSize + pageSize - 1) and not (pageSize - 1)) else: 0.uint64
 
-  let entryAddr = textVaddr
   var ehdr = initHeader(entryAddr)
   ehdr.e_phnum = 2  # Two program headers: .text and .bss
   ehdr.e_phoff = 64  # Program headers start after ELF header
 
   # .text program header (executable, readable)
-  var textPhdr = initPhdr(textOffset, textVaddr, textSize, textAlignedSize, PF_R or PF_X)
+  # Starts at file offset 0, includes headers + code
+  var textPhdr = initPhdr(textOffset, textVaddr, textFileSize, textMemSize, PF_R or PF_X)
 
   # .bss program header (writable, readable, not executable)
   # p_filesz = 0 because .bss is not stored in the file (zero-initialized)
@@ -3682,7 +4110,7 @@ proc writeElf(a: var GenContext; outfile: string) =
   if code.len > 0:
     f.writeData(code.rawData, code.len)
     # Pad to page boundary
-    let padding = int(textAlignedSize - textSize)
+    let padding = int(textMemSize - textFileSize)
     if padding > 0:
       var zeros = newSeq[byte](padding)
       f.writeData(unsafeAddr zeros[0], padding)
@@ -3697,16 +4125,6 @@ proc writeMachO(a: var GenContext; outfile: string) =
   finalize(a.buf)
   finalize(a.bssBuf)
   let code = a.buf.data
-  let baseAddr = 0x100000000.uint64  # macOS default base address
-  let pageSize = 0x1000.uint64
-
-  # Calculate sizes
-  let codeSize = code.len.uint64
-  let codeAlignedSize = (codeSize + pageSize - 1) and not (pageSize - 1)
-
-  # TEXT segment: code
-  let textVmaddr = baseAddr
-  let entryAddr = textVmaddr
 
   # Determine CPU type based on architecture
   let (cputype, cpusubtype) = case a.arch
@@ -3728,7 +4146,7 @@ proc writeMachO(a: var GenContext; outfile: string) =
       libOrdinal: ext.libOrdinal, gotSlot: ext.gotSlot,
       callSites: ext.callSites)
 
-  macho.writeMachO(code, a.bssOffset, entryAddr, cputype, cpusubtype, outfile, dynlink)
+  macho.writeMachO(code, a.bssOffset, cputype, cpusubtype, outfile, dynlink)
 
   # macOS arm64 requires code signing for all executables
   when defined(macosx):

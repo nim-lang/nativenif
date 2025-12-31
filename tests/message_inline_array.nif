@@ -1,0 +1,49 @@
+(.nif24)
+(stmts
+  (type :View.0 (object
+    (fld :ptr.0 (aptr (i +8)))
+    (fld :len.0 (i +64))
+  ))
+
+  (proc :main.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      (var :data.0 (s) (array (i +8) +5))
+      (var :view.0 (s) View.0)
+
+      (mov (rbx) +80)
+      (mov (mem (at (rsp) data.0 +0)) (cast (i +8) (rbx)))
+
+      (mov (rbx) +105)
+      (mov (mem (at (rsp) data.0 +1)) (cast (i +8) (rbx)))
+
+      (mov (rcx) +2)
+      (mov (rbx) +110)
+      (mov (mem (at (rsp) data.0 (rcx))) (cast (i +8) (rbx)))
+
+      (mov (rcx) +3)
+      (mov (rbx) +103)
+      (mov (mem (at (rsp) data.0 (rcx))) (cast (i +8) (rbx)))
+
+      (mov (rbx) +10)
+      (mov (mem (at (rsp) data.0 +4)) (cast (i +8) (rbx)))
+
+      (lea (rsi) (rsp) data.0)
+      (mov (mem (dot (rsp) view.0 ptr.0)) (cast (aptr (i +8)) (rsi)))
+      (mov (rbx) +5)
+      (mov (mem (dot (rsp) view.0 len.0)) (rbx))
+
+      (mov (rax) +1)
+      (mov (rdi) +1)
+      (mov (rsi) (cast (i +64) (mem (dot (rsp) view.0 ptr.0))))
+      (mov (rdx) (mem (dot (rsp) view.0 len.0)))
+      (syscall)
+
+      (mov (rax) +60)
+      (mov (rdi) +0)
+      (syscall)
+    )
+  )
+)

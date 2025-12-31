@@ -5,6 +5,7 @@ import instructions
 type
   X64Inst* = enum
     NoX64Inst
+    PrepareX64 = (ord(PrepareTagId), "prepare")  ## prepare block for function call
     MovX64 = (ord(MovTagId), "mov")  ## move instruction
     LeaX64 = (ord(LeaTagId), "lea")  ## load effective address
     MovapdX64 = (ord(MovapdTagId), "movapd")  ## move aligned packed double
@@ -104,7 +105,8 @@ type
     JleX64 = (ord(JleTagId), "jle")  ## jump if less or equal
     JbX64 = (ord(JbTagId), "jb")  ## jump if below
     JbeX64 = (ord(JbeTagId), "jbe")  ## jump if below or equal
-    CallX64 = (ord(CallTagId), "call")  ## function call
+    CallX64 = (ord(CallTagId), "call")  ## function call marker inside prepare
+    ExtcallX64 = (ord(ExtcallTagId), "extcall")  ## external call marker inside prepare
     IatX64 = (ord(IatTagId), "iat")  ## indirect call through IAT (Import Address Table)
     RetX64 = (ord(RetTagId), "ret")  ## return instruction
     PushX64 = (ord(PushTagId), "push")  ## push to stack
@@ -134,11 +136,12 @@ type
     PrefetchntaX64 = (ord(PrefetchntaTagId), "prefetchnta")  ## prefetch non-temporal
 
 proc rawTagIsX64Inst*(raw: TagEnum): bool {.inline.} =
-  raw in {MovTagId, LeaTagId, MovapdTagId, MovsdTagId, AddTagId, SubTagId, MulTagId, ImulTagId, DivTagId, IdivTagId, AddsdTagId, SubsdTagId, MulsdTagId, DivsdTagId, AndTagId, OrTagId, XorTagId, ShlTagId, ShrTagId, SalTagId, SarTagId, IncTagId, DecTagId, NegTagId, NotTagId, CmpTagId, TestTagId, SeteTagId, SetzTagId, SetneTagId, SetnzTagId, SetaTagId, SetnbeTagId, SetaeTagId, SetnbTagId, SetncTagId, SetbTagId, SetnaeTagId, SetcTagId, SetbeTagId, SetnaTagId, SetgTagId, SetnleTagId, SetgeTagId, SetnlTagId, SetlTagId, SetngeTagId, SetleTagId, SetngTagId, SetoTagId, SetsTagId, SetpTagId, CmoveTagId, CmovzTagId, CmovneTagId, CmovnzTagId, CmovaTagId, CmovnbeTagId, CmovaeTagId, CmovnbTagId, CmovncTagId, CmovbTagId, CmovnaeTagId, CmovcTagId, CmovbeTagId, CmovnaTagId, CmovgTagId, CmovnleTagId, CmovgeTagId, CmovnlTagId, CmovlTagId, CmovngeTagId, CmovleTagId, CmovngTagId, CmovoTagId, CmovnoTagId, CmovsTagId, CmovnsTagId, CmovpTagId, CmovnpTagId, CmovpeTagId, CmovpoTagId, JmpTagId, JeTagId, JzTagId, JneTagId, JnzTagId, JgTagId, JngTagId, JgeTagId, JngeTagId, JaTagId, JnaTagId, JaeTagId, JnaeTagId, JlTagId, JleTagId, JbTagId, JbeTagId, CallTagId, IatTagId, RetTagId, PushTagId, PopTagId, NopTagId, SyscallTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, LockTagId, XchgTagId, CmpxchgTagId, XaddTagId, Cmpxchg8bTagId, MfenceTagId, SfenceTagId, LfenceTagId, PauseTagId, ClflushTagId, ClflushoptTagId, Prefetcht0TagId, Prefetcht1TagId, Prefetcht2TagId, PrefetchntaTagId}
+  raw in {PrepareTagId, MovTagId, LeaTagId, MovapdTagId, MovsdTagId, AddTagId, SubTagId, MulTagId, ImulTagId, DivTagId, IdivTagId, AddsdTagId, SubsdTagId, MulsdTagId, DivsdTagId, AndTagId, OrTagId, XorTagId, ShlTagId, ShrTagId, SalTagId, SarTagId, IncTagId, DecTagId, NegTagId, NotTagId, CmpTagId, TestTagId, SeteTagId, SetzTagId, SetneTagId, SetnzTagId, SetaTagId, SetnbeTagId, SetaeTagId, SetnbTagId, SetncTagId, SetbTagId, SetnaeTagId, SetcTagId, SetbeTagId, SetnaTagId, SetgTagId, SetnleTagId, SetgeTagId, SetnlTagId, SetlTagId, SetngeTagId, SetleTagId, SetngTagId, SetoTagId, SetsTagId, SetpTagId, CmoveTagId, CmovzTagId, CmovneTagId, CmovnzTagId, CmovaTagId, CmovnbeTagId, CmovaeTagId, CmovnbTagId, CmovncTagId, CmovbTagId, CmovnaeTagId, CmovcTagId, CmovbeTagId, CmovnaTagId, CmovgTagId, CmovnleTagId, CmovgeTagId, CmovnlTagId, CmovlTagId, CmovngeTagId, CmovleTagId, CmovngTagId, CmovoTagId, CmovnoTagId, CmovsTagId, CmovnsTagId, CmovpTagId, CmovnpTagId, CmovpeTagId, CmovpoTagId, JmpTagId, JeTagId, JzTagId, JneTagId, JnzTagId, JgTagId, JngTagId, JgeTagId, JngeTagId, JaTagId, JnaTagId, JaeTagId, JnaeTagId, JlTagId, JleTagId, JbTagId, JbeTagId, CallTagId, ExtcallTagId, IatTagId, RetTagId, PushTagId, PopTagId, NopTagId, SyscallTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, LockTagId, XchgTagId, CmpxchgTagId, XaddTagId, Cmpxchg8bTagId, MfenceTagId, SfenceTagId, LfenceTagId, PauseTagId, ClflushTagId, ClflushoptTagId, Prefetcht0TagId, Prefetcht1TagId, Prefetcht2TagId, PrefetchntaTagId}
 
 type
   A64Inst* = enum
     NoA64Inst
+    PrepareA64 = (ord(PrepareTagId), "prepare")  ## prepare block for function call
     MovA64 = (ord(MovTagId), "mov")  ## move instruction
     AddA64 = (ord(AddTagId), "add")  ## add instruction
     SubA64 = (ord(SubTagId), "sub")  ## subtract instruction
@@ -153,7 +156,8 @@ type
     AsrA64 = (ord(AsrTagId), "asr")  ## arithmetic shift right
     NegA64 = (ord(NegTagId), "neg")  ## negate
     CmpA64 = (ord(CmpTagId), "cmp")  ## compare
-    CallA64 = (ord(CallTagId), "call")  ## function call
+    CallA64 = (ord(CallTagId), "call")  ## function call marker inside prepare
+    ExtcallA64 = (ord(ExtcallTagId), "extcall")  ## external call marker inside prepare
     RetA64 = (ord(RetTagId), "ret")  ## return instruction
     NopA64 = (ord(NopTagId), "nop")  ## no operation
     SvcA64 = (ord(SvcTagId), "svc")  ## supervisor call (system call)
@@ -174,7 +178,7 @@ type
     KillA64 = (ord(KillTagId), "kill")  ## kill variable
 
 proc rawTagIsA64Inst*(raw: TagEnum): bool {.inline.} =
-  raw in {MovTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, RetTagId, NopTagId, SvcTagId, AdrTagId, LdrTagId, StrTagId, StpTagId, LdpTagId, BTagId, BlTagId, BeqTagId, BneTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId}
+  raw in {PrepareTagId, MovTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, SvcTagId, AdrTagId, LdrTagId, StrTagId, StpTagId, LdpTagId, BTagId, BlTagId, BeqTagId, BneTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId}
 
 type
   NifasmType* = enum
@@ -218,13 +222,16 @@ type
   NifasmExpr* = enum
     NoExpr
     SsizeX = (ord(SsizeTagId), "ssize")  ## stack size expression
+    CsizeX = (ord(CsizeTagId), "csize")  ## call stack size expression
+    ArgX = (ord(ArgTagId), "arg")  ## argument reference in prepare block
+    ResX = (ord(ResTagId), "res")  ## result reference in prepare block
     DotX = (ord(DotTagId), "dot")  ## field access
     AtX = (ord(AtTagId), "at")  ## array index
     MemX = (ord(MemTagId), "mem")  ## memory reference
     CastX = (ord(CastTagId), "cast")  ## type cast
 
 proc rawTagIsNifasmExpr*(raw: TagEnum): bool {.inline.} =
-  raw in {SsizeTagId, DotTagId, AtTagId, MemTagId, CastTagId}
+  raw in {SsizeTagId, CsizeTagId, ArgTagId, ResTagId, DotTagId, AtTagId, MemTagId, CastTagId}
 
 type
   X64Flag* = enum

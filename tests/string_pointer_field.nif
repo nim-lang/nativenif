@@ -1,0 +1,46 @@
+(.nif24)
+(stmts
+  (type :Buffer.0 (object
+    (fld :ptr.0 (aptr (i +8)))
+    (fld :len.0 (i +64))
+  ))
+
+  (proc :main.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      (var :data.0 (s) (array (i +8) +6))
+      (var :buf.0 (s) Buffer.0)
+
+      (mov (rbx) +72)
+      (mov (mem (at (rsp) data.0 +0)) (cast (i +8) (rbx)))
+      (mov (rbx) +101)
+      (mov (mem (at (rsp) data.0 +1)) (cast (i +8) (rbx)))
+      (mov (rbx) +108)
+      (mov (rcx) +2)
+      (mov (mem (at (rsp) data.0 (rcx))) (cast (i +8) (rbx)))
+      (mov (rbx) +108)
+      (mov (mem (at (rsp) data.0 +3)) (cast (i +8) (rbx)))
+      (mov (rbx) +111)
+      (mov (mem (at (rsp) data.0 +4)) (cast (i +8) (rbx)))
+      (mov (rbx) +10)
+      (mov (mem (at (rsp) data.0 +5)) (cast (i +8) (rbx)))
+
+      (lea (rsi) (rsp) data.0)
+      (mov (mem (dot (rsp) buf.0 ptr.0)) (cast (aptr (i +8)) (rsi)))
+      (mov (rbx) +6)
+      (mov (mem (dot (rsp) buf.0 len.0)) (rbx))
+
+      (mov (rax) +1)
+      (mov (rdi) +1)
+      (mov (rsi) (cast (i +64) (mem (dot (rsp) buf.0 ptr.0))))
+      (mov (rdx) (mem (dot (rsp) buf.0 len.0)))
+      (syscall)
+
+      (mov (rax) +60)
+      (mov (rdi) +0)
+      (syscall)
+    )
+  )
+)

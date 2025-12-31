@@ -1,0 +1,33 @@
+(.nif24)
+(stmts
+  (arch x64)
+  (tvar :tlsCounter.0 (i +64))
+  (tvar :tlsFlag.0 (i +64))
+  (gvar :tlsBlock.0 (array (i +64) +2))
+  (proc :_start
+    (params)
+    (result)
+    (clobber (rax) (rbx) (rcx) (rdx) (rsi) (rdi))
+    (stmts
+      (lea (rsi) tlsBlock.0)
+      (mov (rax) +158)
+      (mov (rdi) +4098)
+      (syscall)
+      (mov (rbp) +0)
+
+      (mov (rax) +7)
+      (mov tlsCounter.0 (rax))
+      (mov (rbx) +2)
+      (mov tlsFlag.0 (rbx))
+      (mov (rax) tlsCounter.0)
+      (add (rax) tlsFlag.0)
+      (mov (rdi) +0)
+      (mov (rcx) +1)
+      (cmp (rax) +9)
+      (cmovne (rdi) (rcx))
+
+      (mov (rax) +60)
+      (syscall)
+    )
+  )
+)
