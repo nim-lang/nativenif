@@ -1796,7 +1796,7 @@ proc genStmt(n: var Cursor; ctx: var GenContext) =
   else:
     genInst(n, ctx)
 
-proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil; allowStackAddr: bool = false): Operand =
+proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil): Operand =
   if n.kind == ParLe:
     let t = n.tag
     if rawTagIsX64Reg(t):
@@ -1807,16 +1807,10 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil; 
         error("Register " & $result.reg & " is bound to variable '" &
               ctx.regBindings[result.reg] & "', use the variable name instead", n)
     elif t == DotTagId:
-      # (dot <base> <fieldname>)
-      inc n
-      var baseOp = parseOperand(n, ctx, nil, allowStackAddr=true)
-
-      if n.kind != Symbol:
-        error("Expected field name in dot expression", n)
-      let fieldName = getSym(n)
+      # (dot <base-reg> <stackvar> <fieldname>) for stack objects, or
+      # (dot <ptr-var> <fieldname>) for pointer variables
       inc n
 
-      # Type check: base must be a pointer to an object/union, or a stack variable with object/union type
       var objType: Type
       var baseReg: x86.Register
       var baseDisp: int32 = 0
@@ -1824,32 +1818,56 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil; 
       var baseScale = 1
       var baseHasIndex = false
       var useFsSegment = false
+      var fieldName: string
 
-      if baseOp.typ.kind == TypeKind.PtrT:
-        # Base is a pointer to an object or union
-        objType = baseOp.typ.base
-        if objType.kind notin {TypeKind.ObjectT, TypeKind.UnionT}:
-          error("Cannot access field of non-object/union type " & $objType, n)
-        if baseOp.kind == okMem:
-          baseReg = baseOp.mem.base
-          baseDisp = baseOp.mem.displacement
-          baseHasIndex = baseOp.mem.hasIndex
-          baseIndex = baseOp.mem.index
-          baseScale = baseOp.mem.scale
-          useFsSegment = baseOp.mem.useFsSegment
-        else:
-          baseReg = baseOp.reg
-      elif baseOp.kind == okMem and baseOp.typ.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
-        # Base is a stack-allocated object or union
-        objType = baseOp.typ
-        baseReg = baseOp.mem.base
-        baseDisp = baseOp.mem.displacement
-        baseHasIndex = baseOp.mem.hasIndex
-        baseIndex = baseOp.mem.index
-        baseScale = baseOp.mem.scale
-        useFsSegment = baseOp.mem.useFsSegment
+      # Check if first arg is a register (explicit stack addressing)
+      if n.kind == ParLe and rawTagIsX64Reg(n.tag):
+        # (dot (base-reg) stackvar fieldname) - explicit stack object access
+        baseReg = parseRegister(n)
+
+        # Parse stack variable name for offset
+        if n.kind != Symbol:
+          error("Expected stack variable name in dot expression", n)
+        let stackVarName = getSym(n)
+        let stackSym = lookupWithAutoImport(ctx, ctx.scope, stackVarName, n)
+        if stackSym == nil or not stackSym.onStack:
+          error("Expected stack variable in dot, got: " & stackVarName, n)
+        if stackSym.typ.kind notin {TypeKind.ObjectT, TypeKind.UnionT}:
+          error("dot requires object/union type, got " & $stackSym.typ, n)
+        baseDisp = int32(stackSym.offset)
+        objType = stackSym.typ
+        inc n
+
+        # Parse field name
+        if n.kind != Symbol:
+          error("Expected field name in dot expression", n)
+        fieldName = getSym(n)
+        inc n
       else:
-        error("dot requires pointer to object/union or stack object/union, got " & $baseOp.typ, n)
+        # (dot ptr-var fieldname) - pointer variable access
+        var baseOp = parseOperand(n, ctx)
+
+        if n.kind != Symbol:
+          error("Expected field name in dot expression", n)
+        fieldName = getSym(n)
+        inc n
+
+        if baseOp.typ.kind == TypeKind.PtrT:
+          # Base is a pointer to an object or union
+          objType = baseOp.typ.base
+          if objType.kind notin {TypeKind.ObjectT, TypeKind.UnionT}:
+            error("Cannot access field of non-object/union type " & $objType, n)
+          if baseOp.kind == okMem:
+            baseReg = baseOp.mem.base
+            baseDisp = baseOp.mem.displacement
+            baseHasIndex = baseOp.mem.hasIndex
+            baseIndex = baseOp.mem.index
+            baseScale = baseOp.mem.scale
+            useFsSegment = baseOp.mem.useFsSegment
+          else:
+            baseReg = baseOp.reg
+        else:
+          error("dot requires (base-reg stackvar field) or (ptr-var field), got " & $baseOp.typ, n)
 
       # Find field in object/union type
       var fieldOffset = 0
@@ -1885,31 +1903,50 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil; 
 
       skipParRi n, "dot expression"
     elif t == AtTagId:
-      # (at <base> <index>)
+      # (at <base-reg> <stackvar> <index>) for stack arrays, or
+      # (at <aptr-var> <index>) for array pointer variables
       inc n
-      var baseOp = parseOperand(n, ctx, nil, allowStackAddr=true)
-      var indexOp = parseOperand(n, ctx)
+
+      var elemType: Type
+      var baseReg: x86.Register
+      var baseDisp: int32 = 0
+      var indexOp: Operand
+
+      # Check if first arg is a register (explicit stack addressing)
+      if n.kind == ParLe and rawTagIsX64Reg(n.tag):
+        # (at (base-reg) stackvar index) - explicit stack array access
+        baseReg = parseRegister(n)
+
+        # Parse stack variable name for offset
+        if n.kind != Symbol:
+          error("Expected stack variable name in at expression", n)
+        let stackVarName = getSym(n)
+        let stackSym = lookupWithAutoImport(ctx, ctx.scope, stackVarName, n)
+        if stackSym == nil or not stackSym.onStack:
+          error("Expected stack variable in at, got: " & stackVarName, n)
+        if stackSym.typ.kind != TypeKind.ArrayT:
+          error("at requires array type, got " & $stackSym.typ, n)
+        baseDisp = int32(stackSym.offset)
+        elemType = stackSym.typ.elem
+        inc n
+
+        # Parse index
+        indexOp = parseOperand(n, ctx)
+      else:
+        # (at aptr-var index) - array pointer access
+        var baseOp = parseOperand(n, ctx)
+        indexOp = parseOperand(n, ctx)
+
+        if baseOp.typ.kind == TypeKind.AptrT:
+          # Base is an array pointer
+          elemType = baseOp.typ.base
+          baseReg = baseOp.reg
+        else:
+          error("at requires (base-reg stackvar index) or (aptr-var index), got " & $baseOp.typ, n)
 
       # Type check: index must be an integer
       if indexOp.typ.kind notin {TypeKind.IntT, TypeKind.UIntT}:
         error("Array index must be integer type, got " & $indexOp.typ, n)
-
-      # Type check: base must be aptr or stack array
-      var elemType: Type
-      var baseReg: x86.Register
-      var baseDisp: int32 = 0
-
-      if baseOp.typ.kind == TypeKind.AptrT:
-        # Base is an array pointer
-        elemType = baseOp.typ.base
-        baseReg = baseOp.reg
-      elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.ArrayT:
-        # Base is a stack-allocated array
-        elemType = baseOp.typ.elem
-        baseReg = baseOp.mem.base
-        baseDisp = baseOp.mem.displacement
-      else:
-        error("at requires aptr or stack array, got " & $baseOp.typ, n)
 
       # Check if index is immediate or register
       if indexOp.kind == okImm:
@@ -1990,6 +2027,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil; 
         var scale: int = 1
 
         # Check for offset
+        var stackVarType: Type = nil
         if n.kind == IntLit or n.kind == Symbol:
           if n.kind == IntLit:
             displacement = int32(getInt(n))
@@ -1998,9 +2036,10 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil; 
             # Could be index register or stack variable (used as offset)
             let indexName = getSym(n)
             let indexSym = lookupWithAutoImport(ctx, ctx.scope, indexName, n)
-            if indexSym != nil and indexSym.kind == skVar and indexSym.onStack:
-              # Stack variable - use its offset as displacement
+            if indexSym != nil and (indexSym.kind == skVar or indexSym.kind == skParam) and indexSym.onStack:
+              # Stack variable - use its offset as displacement and preserve type
               displacement = int32(indexSym.offset)
+              stackVarType = indexSym.typ
               inc n
             elif indexSym != nil and indexSym.kind == skVar and indexSym.reg != InvalidTagId:
               # This is the index register
@@ -2048,8 +2087,11 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil; 
           displacement: displacement,
           hasIndex: hasIndex
         )
-        # Type is unknown for explicit addressing
-        result.typ = Type(kind: IntT, bits: 64)  # Default assumption
+        # Preserve type from stack variable if available, otherwise default
+        if stackVarType != nil:
+          result.typ = stackVarType
+        else:
+          result.typ = Type(kind: IntT, bits: 64)  # Default assumption
 
       skipParRi n, "mem expression"
     elif t == SsizeTagId:
@@ -2160,20 +2202,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil; 
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and (sym.kind == skVar or sym.kind == skParam):
       if sym.onStack:
-        if allowStackAddr:
-          # Return memory operand for stack variable address (for lea, dot, at)
-          result.kind = okMem
-          result.mem = x86.MemoryOperand(
-            base: x86.RSP,
-            displacement: int32(sym.offset),
-            hasIndex: false
-          )
-          # Keep the original type - okMem already implies it's an address
-          result.typ = sym.typ
-          inc n
-          return
-        else:
-          error("Stack variable '" & name & "' cannot be used directly, use (mem (rsp) " & name & ")", n)
+        error("Stack variable '" & name & "' cannot be used directly, use (lea) or (mem (rsp) " & name & ")", n)
       elif sym.reg != InvalidTagId:
         let regTag = tagToX64Reg(sym.reg)
         result.reg = case regTag
@@ -3433,14 +3462,54 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     x86.emitSyscall(ctx.buf.data)
     skipParRi n, "syscall"
   of LeaX64:
+    # (lea dest-reg base-reg offset) or (lea dest-reg label)
     inc n
     let dest = parseRegister(n) # LEA dest must be register
-    let op = parseOperand(n, ctx, nil, allowStackAddr=true)
-    # LEA reg, label (rip-rel) or LEA reg, mem
-    if op.kind == okMem:
-      x86.emitLea(ctx.buf.data, dest, op.mem)
+
+    # Check if next is a label or register
+    if n.kind == ParLe and n.tag == LabTagId:
+      # (lea dest (lab label)) - RIP-relative address
+      inc n
+      if n.kind != Symbol: error("Expected label name", n)
+      let name = getSym(n)
+      let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+      if sym == nil or sym.kind != skLabel: error("Unknown label: " & name, n)
+      inc n
+      skipParRi n, "label usage"
+      x86.emitLea(ctx.buf, dest, LabelId(sym.offset))
+    elif n.kind == ParLe and rawTagIsX64Reg(n.tag):
+      # (lea dest base-reg offset) - explicit addressing
+      let baseReg = parseRegister(n)
+      var displacement: int32 = 0
+
+      # Parse offset - can be integer or stack variable name
+      if n.kind == IntLit:
+        displacement = int32(getInt(n))
+        inc n
+      elif n.kind == Symbol:
+        let offsetName = getSym(n)
+        let offsetSym = lookupWithAutoImport(ctx, ctx.scope, offsetName, n)
+        if offsetSym != nil and (offsetSym.kind == skVar or offsetSym.kind == skParam) and offsetSym.onStack:
+          displacement = int32(offsetSym.offset)
+        else:
+          error("Expected stack variable or integer offset in lea", n)
+        inc n
+      else:
+        error("Expected offset (integer or stack variable) in lea", n)
+
+      let mem = x86.MemoryOperand(
+        base: baseReg,
+        displacement: displacement,
+        hasIndex: false
+      )
+      x86.emitLea(ctx.buf.data, dest, mem)
     else:
-      x86.emitLea(ctx.buf, dest, op.label)
+      # Try parsing as a label operand for backward compatibility
+      let op = parseOperand(n, ctx)
+      if op.label != LabelId(0):
+        x86.emitLea(ctx.buf, dest, op.label)
+      else:
+        error("lea requires (base-reg offset) or label", n)
     skipParRi n, "lea"
   of JmpX64:
     inc n

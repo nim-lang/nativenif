@@ -13,14 +13,14 @@
       (var :p.0 (s) Point.0)
       (var :ptr.0 (rbx) (ptr Point.0))
 
-      (lea (rbx) p.0)
+      (lea (rbx) (rsp) p.0)
       (mov (rcx) +41)
       (mov (mem (dot ptr.0 x.0)) (rcx))
       (mov (rcx) +59)
       (mov (mem (dot ptr.0 y.0)) (rcx))
 
-      (mov (r8) (mem (dot p.0 x.0)))
-      (mov (r9) (mem (dot p.0 y.0)))
+      (mov (r8) (mem (dot (rsp) p.0 x.0)))
+      (mov (r9) (mem (dot (rsp) p.0 y.0)))
 
       (cmp (r8) +41)
       (jne fail.0)

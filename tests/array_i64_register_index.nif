@@ -9,13 +9,13 @@
       (var :arrptr.0 (rsi) (aptr (i +64)))
 
       (mov (rbx) +1000)
-      (mov (mem (at arr.0 +0)) (rbx))
+      (mov (mem (at (rsp) arr.0 +0)) (rbx))
       (mov (rbx) +2000)
-      (mov (mem (at arr.0 +1)) (rbx))
+      (mov (mem (at (rsp) arr.0 +1)) (rbx))
       (mov (rbx) +3000)
-      (mov (mem (at arr.0 +2)) (rbx))
+      (mov (mem (at (rsp) arr.0 +2)) (rbx))
 
-      (lea (rsi) arr.0)
+      (lea (rsi) (rsp) arr.0)
       (mov (rcx) +2)
       (mov (r8) (mem (at arrptr.0 (rcx))))
 

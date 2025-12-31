@@ -13,13 +13,13 @@
       (var :pair.0 (s) Pair.0)
 
       (mov (rbx) +77)
-      (mov (mem (dot pair.0 :a.0)) (rbx))
+      (mov (mem (dot (rsp) pair.0 a.0)) (rbx))
       (mov (rbx) +88)
-      (mov (mem (dot pair.0 :b.0)) (rbx))
+      (mov (mem (dot (rsp) pair.0 b.0)) (rbx))
 
-      (lea (rax) pair.0)
-      (mov (rcx) (mem (dot (cast (ptr Pair.0) (rax)) :a.0)))
-      (mov (rdx) (mem (dot (cast (ptr Pair.0) (rax)) :b.0)))
+      (lea (rax) (rsp) pair.0)
+      (mov (rcx) (mem (dot (cast (ptr Pair.0) (rax)) a.0)))
+      (mov (rdx) (mem (dot (cast (ptr Pair.0) (rax)) b.0)))
 
       (cmp (rcx) +77)
       (jne fail.0)

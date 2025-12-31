@@ -14,11 +14,11 @@
       (var :arrptr.0 (rdi) (aptr Point.0))
 
       (mov (rbx) +7)
-      (mov (mem (dot (at points.0 +1) x.0)) (rbx))
+      (mov (mem (dot (at (rsp) points.0 +1) x.0)) (rbx))
       (mov (rbx) +9)
-      (mov (mem (dot (at points.0 +1) y.0)) (rbx))
+      (mov (mem (dot (at (rsp) points.0 +1) y.0)) (rbx))
 
-      (lea (rdi) points.0)
+      (lea (rdi) (rsp) points.0)
       (mov (r8) (mem (dot (at arrptr.0 +1) x.0)))
       (mov (r9) (mem (dot (at arrptr.0 +1) y.0)))
       (kill arrptr.0)
