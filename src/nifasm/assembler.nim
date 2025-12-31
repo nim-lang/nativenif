@@ -51,8 +51,8 @@ proc getStr(n: Cursor): string =
     error("Expected string literal", n)
 
 proc isIntegerType(t: Type): bool =
-  ## Check if type is an integer type (int or uint) or a register (which is untyped)
-  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.RegisterT}
+  ## Check if type is an integer type (int, uint, literal) or a register (which is untyped)
+  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.RegisterT}
 
 proc isFloatType(t: Type): bool =
   ## Check if type is a floating point type
@@ -60,12 +60,12 @@ proc isFloatType(t: Type): bool =
 
 proc canDoIntegerArithmetic(t: Type): bool =
   ## Check if type supports integer arithmetic operations (add, sub)
-  ## Includes integer types, array pointers (for pointer arithmetic), and registers
-  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.AptrT, TypeKind.RegisterT}
+  ## Includes integer types, literals, array pointers (for pointer arithmetic), and registers
+  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.AptrT, TypeKind.RegisterT}
 
 proc canDoBitwiseOps(t: Type): bool =
-  ## Check if type supports bitwise operations (including registers)
-  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.RegisterT}
+  ## Check if type supports bitwise operations (including registers and literals)
+  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.RegisterT}
 
 
 proc parseRegister(n: var Cursor): x86.Register =
@@ -975,7 +975,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
     if expectedType != nil and (expectedType.kind in {IntT, UIntT, FloatT}):
       result.typ = expectedType
     else:
-      result.typ = Type(kind: IntT, bits: 64)
+      result.typ = Type(kind: IntLitT, bits: 64) # Literal - compatible with IntT and UIntT
   elif n.kind == Symbol:
     let name = getSym(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
@@ -1960,8 +1960,8 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
         else:
           error("at requires (base-reg stackvar index) or (aptr-var index), got " & $baseOp.typ, n)
 
-      # Type check: index must be an integer or register
-      if indexOp.typ.kind notin {TypeKind.IntT, TypeKind.UIntT, TypeKind.RegisterT}:
+      # Type check: index must be an integer, literal, or register
+      if not isIntegerType(indexOp.typ):
         error("Array index must be integer type, got " & $indexOp.typ, n)
 
       # Check if index is immediate or register
@@ -2212,7 +2212,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
     if expectedType != nil and (expectedType.kind in {IntT, UIntT, FloatT}):
       result.typ = expectedType
     else:
-      result.typ = Type(kind: IntT, bits: 64) # Default
+      result.typ = Type(kind: IntLitT, bits: 64) # Literal - compatible with IntT and UIntT
   elif n.kind == Symbol:
     let name = getSym(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)

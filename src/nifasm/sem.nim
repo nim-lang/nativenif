@@ -6,12 +6,13 @@ type
   TypeKind* = enum
     ErrorT, VoidT, BoolT, IntT, UIntT, FloatT, PtrT, AptrT, ArrayT, ObjectT, UnionT,
     RegisterT,   # Pure register usage - accepts any type (effectively untyped)
-    StackOffT    # Stack offset - represents an offset from a base register
+    StackOffT,   # Stack offset - represents an offset from a base register
+    IntLitT      # Integer literal - compatible with both IntT and UIntT
 
   Type* = ref object
     case kind*: TypeKind
     of ErrorT, VoidT, BoolT: discard
-    of IntT, UIntT, FloatT: bits*: int
+    of IntT, UIntT, FloatT, IntLitT: bits*: int
     of PtrT, AptrT: base*: Type
     of ArrayT:
       elem*: Type
@@ -92,7 +93,7 @@ proc asmAlignOf*(t: Type): int =
   case t.kind
   of ErrorT, VoidT: 1
   of BoolT: 1
-  of IntT, UIntT, FloatT:
+  of IntT, UIntT, FloatT, IntLitT:
     let size = t.bits div 8
     # Alignment is typically the size, but capped at 8 for x86-64
     if size <= 8: size else: 8
@@ -110,7 +111,7 @@ proc asmSizeOf*(t: Type): int =
   case t.kind
   of ErrorT, VoidT: 0
   of BoolT: 1
-  of IntT, UIntT, FloatT: t.bits div 8
+  of IntT, UIntT, FloatT, IntLitT: t.bits div 8
   of PtrT, AptrT: 8 # x86-64
   of ArrayT: t.len.int * asmSizeOf(t.elem)
   of ObjectT, UnionT: t.size
@@ -125,6 +126,7 @@ proc `$`*(t: Type): string =
   of IntT: "(i " & $t.bits & ")"
   of UIntT: "(u " & $t.bits & ")"
   of FloatT: "(f " & $t.bits & ")"
+  of IntLitT: "(lit " & $t.bits & ")"
   of PtrT: "(ptr " & $t.base & ")"
   of AptrT: "(aptr " & $t.base & ")"
   of ArrayT: "(array " & $t.elem & " " & $t.len & ")"
@@ -146,7 +148,11 @@ proc compatible*(want, got: Type): bool =
   of ErrorT, VoidT, BoolT:
     result = got.kind == want.kind
   of IntT, UIntT:
-    result = got.kind in {IntT, UIntT} and want.bits == got.bits
+    # IntLitT is compatible with both IntT and UIntT of same size
+    result = (got.kind == want.kind or got.kind == IntLitT) and want.bits == got.bits
+  of IntLitT:
+    # Literal is compatible with IntT, UIntT, or another literal of same size
+    result = got.kind in {IntT, UIntT, IntLitT} and want.bits == got.bits
   of FloatT:
     result = got.kind == want.kind and want.bits == got.bits
   of PtrT, AptrT:
