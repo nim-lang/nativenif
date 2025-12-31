@@ -294,6 +294,15 @@ proc emitMul*(dest: var Bytes; reg: Register) =
   dest.add(0xF7)  # MUL r/m64 opcode
   dest.add(encodeModRM(amDirect, 4, int(reg)))  # /4 extension
 
+proc emitMul*(dest: var Bytes; mem: MemoryOperand) =
+  ## Emit MUL instruction: MUL mem (unsigned multiply)
+  var rex = RexPrefix(w: true)
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  if rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
+  dest.add(0xF7)  # MUL r/m64 opcode
+  dest.emitMem(4, mem)  # /4 extension
+
 proc emitDiv*(dest: var Bytes; reg: Register) =
   ## Emit DIV instruction: DIV reg (unsigned divide)
   var rex = RexPrefix(w: true)
@@ -306,6 +315,15 @@ proc emitDiv*(dest: var Bytes; reg: Register) =
   dest.add(0xF7)  # DIV r/m64 opcode
   dest.add(encodeModRM(amDirect, 6, int(reg)))  # /6 extension
 
+proc emitDiv*(dest: var Bytes; mem: MemoryOperand) =
+  ## Emit DIV instruction: DIV mem (unsigned divide)
+  var rex = RexPrefix(w: true)
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  if rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
+  dest.add(0xF7)  # DIV r/m64 opcode
+  dest.emitMem(6, mem)  # /6 extension
+
 proc emitIdiv*(dest: var Bytes; reg: Register) =
   ## Emit IDIV instruction: IDIV reg (signed divide)
   var rex = RexPrefix(w: true)
@@ -317,6 +335,15 @@ proc emitIdiv*(dest: var Bytes; reg: Register) =
 
   dest.add(0xF7)  # IDIV r/m64 opcode
   dest.add(encodeModRM(amDirect, 7, int(reg)))  # /7 extension
+
+proc emitIdiv*(dest: var Bytes; mem: MemoryOperand) =
+  ## Emit IDIV instruction: IDIV mem (signed divide)
+  var rex = RexPrefix(w: true)
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  if rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
+  dest.add(0xF7)  # IDIV r/m64 opcode
+  dest.emitMem(7, mem)  # /7 extension
 
 proc emitInc*(dest: var Bytes; reg: Register) =
   ## Emit INC instruction: INC reg (increment)

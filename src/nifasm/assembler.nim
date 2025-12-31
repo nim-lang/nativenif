@@ -2825,9 +2825,11 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let op = parseOperand(n, ctx)
     checkIntegerType(op.typ, "mul", start)
-    if op.kind == okImm: error("MUL immediate not supported", n)
-    if op.kind == okMem: error("MUL memory not supported yet", n) # Need emitMul(mem)
-    x86.emitMul(ctx.buf.data, op.reg)
+    if op.kind == okImm: error("MUL immediate not supported (use IMUL)", n)
+    elif op.kind == okMem:
+      x86.emitMul(ctx.buf.data, op.mem)
+    else:
+      x86.emitMul(ctx.buf.data, op.reg)
     skipParRi n, "mul"
 
   of ImulX64:
@@ -2862,8 +2864,10 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperand(n, ctx)
     checkIntegerType(op.typ, "div", start)
     if op.kind == okImm: error("DIV immediate not supported", n)
-    if op.kind == okMem: error("DIV memory not supported yet", n)
-    x86.emitDiv(ctx.buf.data, op.reg)
+    elif op.kind == okMem:
+      x86.emitDiv(ctx.buf.data, op.mem)
+    else:
+      x86.emitDiv(ctx.buf.data, op.reg)
     skipParRi n, "div"
 
   of IdivX64:
@@ -2881,8 +2885,10 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperand(n, ctx)
     checkIntegerType(op.typ, "idiv", start)
     if op.kind == okImm: error("IDIV immediate not supported", n)
-    if op.kind == okMem: error("IDIV memory not supported yet", n)
-    x86.emitIdiv(ctx.buf.data, op.reg)
+    elif op.kind == okMem:
+      x86.emitIdiv(ctx.buf.data, op.mem)
+    else:
+      x86.emitIdiv(ctx.buf.data, op.reg)
     skipParRi n, "idiv"
 
   # Bitwise
