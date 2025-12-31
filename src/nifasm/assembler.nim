@@ -981,7 +981,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and (sym.kind == skVar or sym.kind == skParam):
       if sym.onStack:
-        error("Stack variable '" & name & "' cannot be used directly, use (mem (fp) " & $sym.offset & ")", n)
+        error("Stack variable '" & name & "' cannot be used directly, use (mem (sp) " & name & ")", n)
       elif sym.reg != InvalidTagId:
         result.reg = tagToRegisterA64(sym.reg)
         result.typ = sym.typ
@@ -1047,7 +1047,7 @@ proc parseDestA64(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and sym.kind == skVar:
       if sym.onStack:
-        error("Stack variable '" & name & "' cannot be used directly, use (mem (fp) " & $sym.offset & ")", n)
+        error("Stack variable '" & name & "' cannot be used directly, use (mem (sp) " & name & ")", n)
       elif sym.reg != InvalidTagId:
         result.reg = tagToRegisterA64(sym.reg)
         result.typ = sym.typ
@@ -1993,10 +1993,14 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
             displacement = int32(getInt(n))
             inc n
           elif n.kind == Symbol:
-            # Could be index register
+            # Could be index register or stack variable (used as offset)
             let indexName = getSym(n)
             let indexSym = lookupWithAutoImport(ctx, ctx.scope, indexName, n)
-            if indexSym != nil and indexSym.kind == skVar and indexSym.reg != InvalidTagId:
+            if indexSym != nil and indexSym.kind == skVar and indexSym.onStack:
+              # Stack variable - use its offset as displacement
+              displacement = int32(indexSym.offset)
+              inc n
+            elif indexSym != nil and indexSym.kind == skVar and indexSym.reg != InvalidTagId:
               # This is the index register
               hasIndex = true
               let indexRegTag = tagToX64Reg(indexSym.reg)
@@ -2032,7 +2036,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
                   displacement = int32(getInt(n))
                   inc n
             else:
-              error("Expected index register or offset in mem", n)
+              error("Expected index register or stack variable in mem", n)
 
         result.kind = okMem
         result.mem = x86.MemoryOperand(
@@ -2154,7 +2158,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and (sym.kind == skVar or sym.kind == skParam):
       if sym.onStack:
-        error("Stack variable '" & name & "' cannot be used directly, use (mem (rbp) " & $sym.offset & ")", n)
+        error("Stack variable '" & name & "' cannot be used directly, use (mem (rsp) " & name & ")", n)
       elif sym.reg != InvalidTagId:
         let regTag = tagToX64Reg(sym.reg)
         result.reg = case regTag
@@ -2288,12 +2292,12 @@ proc parseDest(n: var Cursor; ctx: var GenContext; expectedType: Type = nil): Op
     if op.kind != okMem:
       error("Expected memory destination", n)
     result = op
-  elif n.kind in {Symbol, Ident}:
+  elif n.kind == Symbol:
     let name = getSym(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and sym.kind == skVar:
        if sym.onStack:
-         error("Stack variable '" & name & "' cannot be used directly, use (mem (rbp) " & $sym.offset & ")", n)
+         error("Stack variable '" & name & "' cannot be used directly, use (mem (rsp) " & name & ")", n)
        elif sym.reg != InvalidTagId:
          result.reg = case sym.reg
             of RaxTagId, R0TagId: RAX

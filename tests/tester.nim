@@ -30,38 +30,41 @@ when defined(macosx):
 elif defined(windows):
   exec "nim c -r src/nifasm/nifasm tests/hello_win64.nif"
   exec "./tests/hello_win64.exe"
-else:
-  exec "nim c -r src/nifasm/nifasm tests/hello.nif"
+
+exec "nim c -r src/nifasm/nifasm tests/hello.nif"
+exec "nim c -r src/nifasm/nifasm tests/thread_local_tls.nif"
+exec "nim c -r src/nifasm/nifasm tests/thread_local_switch.nif"
+exec "nim c -r src/nifasm/nifasm tests/atomic_ops.nif"
+exec "nim c -r src/nifasm/nifasm tests/unique_bind.nif"
+exec "nim c -r src/nifasm/nifasm tests/kill_reuse.nif"
+exec "nim c -r src/nifasm/nifasm tests/kill_reuse_multi.nif"
+exec "nim c -r src/nifasm/nifasm tests/kill_reuse_types.nif"
+exec "nim c -r src/nifasm/nifasm tests/dot_at_access.nif"
+exec "nim c -r src/nifasm/nifasm tests/nested_dot_at.nif"
+exec "nim c -r src/nifasm/nifasm tests/pointer_dot_store.nif"
+exec "nim c -r src/nifasm/nifasm tests/array_i64_register_index.nif"
+exec "nim c -r src/nifasm/nifasm tests/pointer_field_at.nif"
+exec "nim c -r src/nifasm/nifasm tests/pointer_roundtrip.nif"
+exec "nim c -r src/nifasm/nifasm tests/string_pointer_field.nif"
+exec "nim c -r src/nifasm/nifasm tests/message_inline_array.nif"
+exec "nim c -r src/nifasm/nifasm tests/call_hello_chain.nif"
+exec "nim c -r src/nifasm/nifasm tests/call_multi_result.nif"
+exec "nim c -r src/nifasm/nifasm tests/call_result_binding.nif"
+
+when defined(linux):
+  # binaries have been built for linux only:
   exec "tests/hello"
-  exec "nim c -r src/nifasm/nifasm tests/thread_local_tls.nif"
-  exec "nim c -r src/nifasm/nifasm tests/thread_local_switch.nif"
-  exec "nim c -r src/nifasm/nifasm tests/atomic_ops.nif"
   exec "tests/atomic_ops"
-  exec "nim c -r src/nifasm/nifasm tests/unique_bind.nif"
-  exec "nim c -r src/nifasm/nifasm tests/kill_reuse.nif"
-  exec "nim c -r src/nifasm/nifasm tests/kill_reuse_multi.nif"
-  exec "nim c -r src/nifasm/nifasm tests/kill_reuse_types.nif"
-  exec "nim c -r src/nifasm/nifasm tests/dot_at_access.nif"
   #exec "tests/dot_at_access"
-  exec "nim c -r src/nifasm/nifasm tests/nested_dot_at.nif"
   #exec "tests/nested_dot_at"
-  exec "nim c -r src/nifasm/nifasm tests/pointer_dot_store.nif"
   #exec "tests/pointer_dot_store"
-  exec "nim c -r src/nifasm/nifasm tests/array_i64_register_index.nif"
   #exec "tests/array_i64_register_index"
-  exec "nim c -r src/nifasm/nifasm tests/pointer_field_at.nif"
   #exec "tests/pointer_field_at"
-  exec "nim c -r src/nifasm/nifasm tests/pointer_roundtrip.nif"
   #exec "tests/pointer_roundtrip"
-  exec "nim c -r src/nifasm/nifasm tests/string_pointer_field.nif"
   #execExpectOutput("./tests/string_pointer_field", "Hello\n")
-  exec "nim c -r src/nifasm/nifasm tests/message_inline_array.nif"
   #execExpectOutput("./tests/message_inline_array", "Ping\n")
-  exec "nim c -r src/nifasm/nifasm tests/call_hello_chain.nif"
   #execExpectOutput("./tests/call_hello_chain", "Hello through calls\n")
-  exec "nim c -r src/nifasm/nifasm tests/call_multi_result.nif"
   exec "./tests/call_multi_result"
-  exec "nim c -r src/nifasm/nifasm tests/call_result_binding.nif"
 
 # Failing tests are not platform specific!
 execExpectFailure("nim c -r src/nifasm/nifasm tests/double_bind.nif", "Register RAX is already bound to variable 'x.0'")

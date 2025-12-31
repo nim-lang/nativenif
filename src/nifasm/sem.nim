@@ -123,23 +123,16 @@ proc `$`*(t: Type): string =
 
 proc compatible*(want, got: Type): bool =
   if want == got: return true
-  if want.kind == ErrorT or got.kind == ErrorT: return true # prevent cascading errors
-  if want.kind == VoidT and got.kind == VoidT: return true
-  if want.kind == BoolT and got.kind == BoolT: return true
-  if want.kind == IntT and got.kind == IntT: return want.bits == got.bits
-  if want.kind == UIntT and got.kind == UIntT: return want.bits == got.bits
-  if want.kind == FloatT and got.kind == FloatT: return want.bits == got.bits
-  if want.kind == PtrT and got.kind == PtrT: return compatible(want.base, got.base)
-  if want.kind == AptrT and got.kind == AptrT: return compatible(want.base, got.base)
-  if want.kind == ArrayT and got.kind == ArrayT:
-    return want.len == got.len and compatible(want.elem, got.elem)
-  # Object and union structural equivalence or name based?
-  # Using reference equality for now (assuming unique type objects per declaration)
-  # If we want structural:
-  if want.kind == ObjectT and got.kind == ObjectT:
-    # For now, just check size or ref equality
-    return want == got
-  if want.kind == UnionT and got.kind == UnionT:
-    # For now, just check size or ref equality
-    return want == got
-  return false
+  case want.kind
+  of ErrorT, VoidT, BoolT:
+    result = got.kind == want.kind
+  of IntT, UIntT:
+    result = got.kind in {IntT, UIntT} and want.bits == got.bits
+  of FloatT:
+    result = got.kind == want.kind and want.bits == got.bits
+  of PtrT, AptrT:
+    result = got.kind == want.kind and compatible(want.base, got.base)
+  of ArrayT:
+    result = got.kind == want.kind and want.len == got.len and compatible(want.elem, got.elem)
+  of ObjectT, UnionT:
+    result = false # used pointer equivalence for now
