@@ -69,8 +69,7 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/triple_bind.nif", "Register 
 execExpectFailure("nim c -r src/nifasm/nifasm tests/quadruple_bind.nif", "Register RAX is already bound to variable 'x.0'")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/kill_use_after_kill.nif", "Expected variable or register as destination")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/missing_result_binding.nif", "Missing result binding: ret.0")
-when false:
-  execExpectFailure("nim c -r src/nifasm/nifasm tests/stack_result_binding.nif", "Result 'ret.0' must be bound to a register")
-  execExpectFailure("nim c -r src/nifasm/nifasm tests/result_type_mismatch.nif", "Type mismatch:")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/stack_result_binding.nif", "Stack variable 'tmp.0' cannot be used directly")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/result_type_mismatch.nif", "Type mismatch:")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/call_missing_argument.nif", "Missing argument: arg.1")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/call_duplicate_result_binding.nif", "Result already bound: ret.0")

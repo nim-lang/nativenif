@@ -981,9 +981,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and (sym.kind == skVar or sym.kind == skParam):
       if sym.onStack:
-        result.kind = okMem
-        result.mem = arm64.MemoryOperand(base: arm64.FP, offset: int32(sym.offset), hasIndex: false)
-        result.typ = sym.typ
+        error("Stack variable '" & name & "' cannot be used directly, use (mem (fp) " & $sym.offset & ")", n)
       elif sym.reg != InvalidTagId:
         result.reg = tagToRegisterA64(sym.reg)
         result.typ = sym.typ
@@ -1049,12 +1047,12 @@ proc parseDestA64(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and sym.kind == skVar:
       if sym.onStack:
-        result.kind = okMem
-        result.mem = arm64.MemoryOperand(base: arm64.FP, offset: int32(sym.offset), hasIndex: false)
-        result.typ = sym.typ
+        error("Stack variable '" & name & "' cannot be used directly, use (mem (fp) " & $sym.offset & ")", n)
       elif sym.reg != InvalidTagId:
         result.reg = tagToRegisterA64(sym.reg)
         result.typ = sym.typ
+      else:
+        error("Variable has no location", n)
       inc n
     elif sym != nil and sym.kind == skTvar:
       result.kind = okMem
@@ -2156,9 +2154,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and (sym.kind == skVar or sym.kind == skParam):
       if sym.onStack:
-        result.kind = okMem
-        result.mem = x86.MemoryOperand(base: RBP, displacement: int32(sym.offset))
-        result.typ = sym.typ
+        error("Stack variable '" & name & "' cannot be used directly, use (mem (rbp) " & $sym.offset & ")", n)
       elif sym.reg != InvalidTagId:
         let regTag = tagToX64Reg(sym.reg)
         result.reg = case regTag
@@ -2297,9 +2293,7 @@ proc parseDest(n: var Cursor; ctx: var GenContext; expectedType: Type = nil): Op
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and sym.kind == skVar:
        if sym.onStack:
-         result.kind = okMem
-         result.mem = x86.MemoryOperand(base: RBP, displacement: int32(sym.offset))
-         result.typ = sym.typ
+         error("Stack variable '" & name & "' cannot be used directly, use (mem (rbp) " & $sym.offset & ")", n)
        elif sym.reg != InvalidTagId:
          result.reg = case sym.reg
             of RaxTagId, R0TagId: RAX
@@ -2524,6 +2518,10 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
   inc n
   let dest = parseDest(n, ctx)
   let op = parseOperand(n, ctx)
+
+  # Type checking
+  if dest.typ != nil and op.typ != nil:
+    checkType(dest.typ, op.typ, n)
 
   if dest.kind == okMem:
     if op.kind == okImm:
