@@ -68,39 +68,8 @@ proc canDoBitwiseOps(t: Type): bool =
   t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.RegisterT}
 
 
-proc parseRegister(n: var Cursor): x86.Register =
-  let regTag = tagToX64Reg(n.tag)
-  result =
-    case regTag
-    of RaxR, R0R: x86.RAX
-    of RcxR, R2R: x86.RCX
-    of RdxR, R3R: x86.RDX
-    of RbxR, R1R: x86.RBX
-    of RspR, R7R: x86.RSP
-    of RbpR, R6R: x86.RBP
-    of RsiR, R4R: x86.RSI
-    of RdiR, R5R: x86.RDI
-    of R8R: x86.R8
-    of R9R: x86.R9
-    of R10R: x86.R10
-    of R11R: x86.R11
-    of R12R: x86.R12
-    of R13R: x86.R13
-    of R14R: x86.R14
-    of R15R: x86.R15
-    # XMMs should be handled but return type prevents it?
-    # Register enum is GPR.
-    # We need to separate XMM parsing or expand Register enum?
-    # x86.nim has Register and XmmRegister.
-    # Let's keep this for GPRs.
-    else:
-      error("Expected GPR register, got: " & $n.tag, n)
-      x86.RAX
-  inc n
-  skipParRi n, "register"
-
-proc tagToRegister(t: TagEnum): x86.Register =
-  ## Convert a TagEnum to a Register (for register binding tracking)
+proc tagToRegister(t: TagEnum; n: Cursor): x86.Register =
+  ## Convert a TagEnum to an x86 Register (for register binding tracking)
   let regTag = tagToX64Reg(t)
   result =
     case regTag
@@ -120,7 +89,14 @@ proc tagToRegister(t: TagEnum): x86.Register =
     of R13R: x86.R13
     of R14R: x86.R14
     of R15R: x86.R15
-    else: x86.RAX  # Should not happen
+    else:
+      error("Expected GPR register, got: " & $t, n)
+      x86.RAX
+
+proc parseRegister(n: var Cursor): x86.Register =
+  result = tagToRegister(n.tag, n)
+  inc n
+  skipParRi n, "register"
 
 type
   LoadedModule = object
@@ -701,53 +677,10 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext) =
 
 proc genInstX64(n: var Cursor; ctx: var GenContext)
 
-proc parseRegisterA64(n: var Cursor): arm64.Register =
-  let regTag = tagToA64Reg(n.tag)
-  result =
-    case regTag
-    of X0R: arm64.X0
-    of X1R: arm64.X1
-    of X2R: arm64.X2
-    of X3R: arm64.X3
-    of X4R: arm64.X4
-    of X5R: arm64.X5
-    of X6R: arm64.X6
-    of X7R: arm64.X7
-    of X8R: arm64.X8
-    of X9R: arm64.X9
-    of X10R: arm64.X10
-    of X11R: arm64.X11
-    of X12R: arm64.X12
-    of X13R: arm64.X13
-    of X14R: arm64.X14
-    of X15R: arm64.X15
-    of X16R: arm64.X16
-    of X17R: arm64.X17
-    of X18R: arm64.X18
-    of X19R: arm64.X19
-    of X20R: arm64.X20
-    of X21R: arm64.X21
-    of X22R: arm64.X22
-    of X23R: arm64.X23
-    of X24R: arm64.X24
-    of X25R: arm64.X25
-    of X26R: arm64.X26
-    of X27R: arm64.X27
-    of X28R: arm64.X28
-    of X29R: arm64.X29
-    of X30R: arm64.X30
-    of SpR: arm64.SP
-    of LrR: arm64.LR
-    of FpR: arm64.FP
-    of XzrR: arm64.Register(31)  # XZR
-    else:
-      error("Expected ARM64 register, got: " & $n.tag, n)
-      arm64.X0
-  inc n
-  skipParRi n, "register"
-
-proc tagToRegisterA64(t: TagEnum): arm64.Register =
+proc tagToRegisterA64(t: TagEnum; n: Cursor): arm64.Register =
   ## Convert a TagEnum to an ARM64 Register (for register binding tracking)
+  ## Note: X16/X17 are reserved for assembler scratch use but allowed in direct
+  ## instructions (e.g., Darwin syscalls use X16 for syscall number).
   let regTag = tagToA64Reg(t)
   result =
     case regTag
@@ -786,7 +719,15 @@ proc tagToRegisterA64(t: TagEnum): arm64.Register =
     of LrR: arm64.LR
     of FpR: arm64.FP
     of XzrR: arm64.Register(31)
-    else: arm64.X0  # Should not happen
+    else:
+      error("Expected ARM64 register, got: " & $t, n)
+      arm64.X0
+
+proc parseRegisterA64(n: var Cursor): arm64.Register =
+  result = tagToRegisterA64(n.tag, n)
+  inc n
+  skipParRi n, "register"
+
 
 type
   OperandA64 = object
@@ -939,7 +880,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
             let indexSym = lookupWithAutoImport(ctx, ctx.scope, indexName, n)
             if indexSym != nil and indexSym.kind == skVar and indexSym.reg != InvalidTagId:
               hasIndex = true
-              indexReg = tagToRegisterA64(indexSym.reg)
+              indexReg = tagToRegisterA64(indexSym.reg, n)
               inc n
               if n.kind == IntLit:
                 shift = int(getInt(n))
@@ -985,7 +926,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
         inc n
         return
       elif sym.reg != InvalidTagId:
-        result.reg = tagToRegisterA64(sym.reg)
+        result.reg = tagToRegisterA64(sym.reg, n)
         result.typ = sym.typ
       inc n
     elif sym != nil and sym.kind == skLabel:
@@ -1053,7 +994,7 @@ proc parseDestA64(n: var Cursor; ctx: var GenContext): OperandA64 =
         inc n
         return
       elif sym.reg != InvalidTagId:
-        result.reg = tagToRegisterA64(sym.reg)
+        result.reg = tagToRegisterA64(sym.reg, n)
         result.typ = sym.typ
       else:
         error("Variable has no location", n)
@@ -1208,8 +1149,15 @@ proc genIteA64(n: var Cursor; ctx: var GenContext) =
     ctx.buf.defineLabel(LabelId(sym.offset))
   elif n.kind == ParLe:
     # Hardware condition - ARM64 uses flags from CMP
-    # For now, assume it's a comparison result
-    error("Hardware flags in ite not yet supported for ARM64", n)
+    let flagTag = tagToX64Flag(n.tag)
+    inc n
+    skipParRi n, "condition"
+
+    # Emit branch to else if condition is NOT met (inverted condition)
+    case flagTag
+    of ZfO: ctx.buf.emitBne(lElse)   # if ZF set wanted, jump to else if ZF clear
+    of NzO: ctx.buf.emitBeq(lElse)   # if ZF clear wanted, jump to else if ZF set
+    else: error("Unsupported ARM64 flag condition: " & $flagTag, n)
   else:
     error("Expected cfvar or flag condition in ite", n)
   genStmt(n, ctx)
@@ -1233,8 +1181,14 @@ proc genLoopA64(n: var Cursor; ctx: var GenContext) =
   let condTag = n.tag
   inc n
   skipParRi n, "condition"
-  # ARM64 loop conditions - for now assume BEQ/BNE
-  error("Loop conditions not yet fully supported for ARM64", n)
+
+  # ARM64 loop conditions - exit loop if condition is NOT met
+  let loopFlagTag = tagToX64Flag(condTag)
+  case loopFlagTag
+  of ZfO: ctx.buf.emitBne(lEnd)   # if ZF set wanted, exit if ZF clear
+  of NzO: ctx.buf.emitBeq(lEnd)   # if ZF clear wanted, exit if ZF set
+  else: error("Unsupported ARM64 loop condition: " & $loopFlagTag, n)
+
   genStmt(n, ctx)
   ctx.buf.emitB(lStart)
   ctx.buf.defineLabel(lEnd)
@@ -1298,6 +1252,12 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     if n.kind == ParLe:
       let locTag = n.tag
       if rawTagIsA64Reg(locTag):
+        # Check for reserved registers (x16/x17 are reserved for assembler scratch)
+        let regTag = tagToA64Reg(locTag)
+        if regTag == X16R:
+          error("Cannot bind variable to x16 (reserved for assembler use as IP0)", n)
+        elif regTag == X17R:
+          error("Cannot bind variable to x17 (reserved for assembler use as IP1)", n)
         reg = locTag
         inc n
         skipParRi n, "register location"
@@ -1748,7 +1708,7 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
       ctx.scope.define(Symbol(name: param.name, kind: skParam, typ: param.typ, reg: param.reg))
       # Track register binding for parameters
       if param.reg != InvalidTagId:
-        let targetReg = tagToRegister(param.reg)
+        let targetReg = tagToRegister(param.reg, n)
         ctx.regBindings[targetReg] = param.name
 
   inc n
@@ -1757,11 +1717,6 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   var scan = n
   if scan.kind == ParLe and scan.tag == StmtsTagId:
     collectLabels(scan, ctx, ctx.scope)
-  when false: # if ctx.arch in {Arch.X64, Arch.WinX64}:
-    x86.emitPush(ctx.buf.data, RBP)
-    x86.emitMov(ctx.buf.data, RBP, RSP)
-    x86.emitSubImm(ctx.buf.data, RSP, 0)
-    ctx.ssizePatches.add(ctx.buf.data.len - 4)
   if n.kind == ParLe and n.tag == StmtsTagId:
     inc n
     while n.kind != ParRi:
@@ -2051,25 +2006,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
             elif indexSym != nil and indexSym.kind == skVar and indexSym.reg != InvalidTagId:
               # This is the index register
               hasIndex = true
-              let indexRegTag = tagToX64Reg(indexSym.reg)
-              indexReg = case indexRegTag
-                of RaxR, R0R: RAX
-                of RcxR, R2R: RCX
-                of RdxR, R3R: RDX
-                of RbxR, R1R: RBX
-                of RspR, R7R: RSP
-                of RbpR, R6R: RBP
-                of RsiR, R4R: RSI
-                of RdiR, R5R: RDI
-                of R8R: R8
-                of R9R: R9
-                of R10R: R10
-                of R11R: R11
-                of R12R: R12
-                of R13R: R13
-                of R14R: R14
-                of R15R: R15
-                else: RAX
+              indexReg = tagToRegister(indexSym.reg, n)
               inc n
 
               # Check for scale
@@ -2148,18 +2085,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
         # Register argument - return the register
         result.kind = okArg
         result.argName = argName
-        let paramRegTag = tagToX64Reg(param.reg)
-        result.reg = case paramRegTag
-          of RaxR, R0R: x86.RAX
-          of RdiR, R5R: x86.RDI
-          of RsiR, R4R: x86.RSI
-          of RdxR, R3R: x86.RDX
-          of RcxR, R2R: x86.RCX
-          of R8R: x86.R8
-          of R9R: x86.R9
-          of R10R: x86.R10
-          of R11R: x86.R11
-          else: x86.RAX
+        result.reg = tagToRegister(param.reg, n)
         result.typ = param.typ
     elif t == ResTagId:
       # (res name) - result reference in prepare block (after call)
@@ -2181,16 +2107,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
       callCtx.resultsSet.incl(resName)
 
       let res = callCtx.resultLookup[resName]
-      let resRegTag = tagToX64Reg(res.reg)
-      result.reg = case resRegTag
-        of RaxR, R0R: x86.RAX
-        of RdiR, R5R: x86.RDI
-        of RsiR, R4R: x86.RSI
-        of RdxR, R3R: x86.RDX
-        of RcxR, R2R: x86.RCX
-        of R8R: x86.R8
-        of R9R: x86.R9
-        else: x86.RAX
+      result.reg = tagToRegister(res.reg, n)
       result.typ = res.typ
     else:
       error("Unexpected operand tag: " & $t, n)
@@ -2211,25 +2128,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
         inc n
         return
       elif sym.reg != InvalidTagId:
-        let regTag = tagToX64Reg(sym.reg)
-        result.reg = case regTag
-          of RaxR, R0R: RAX
-          of RcxR, R2R: RCX
-          of RdxR, R3R: RDX
-          of RbxR, R1R: RBX
-          of RspR, R7R: RSP
-          of RbpR, R6R: RBP
-          of RsiR, R4R: RSI
-          of RdiR, R5R: RDI
-          of R8R: R8
-          of R9R: R9
-          of R10R: R10
-          of R11R: R11
-          of R12R: R12
-          of R13R: R13
-          of R14R: R14
-          of R15R: R15
-          else: RAX
+        result.reg = tagToRegister(sym.reg, n)
 
         # Check if clobbered
         if result.reg in ctx.clobbered:
@@ -2320,20 +2219,9 @@ proc parseDest(n: var Cursor; ctx: var GenContext): Operand =
     callCtx.argsSet.incl(argName)
 
     # Return the register for this argument
-    let paramRegTag = tagToX64Reg(param.reg)
     result.kind = okArg
     result.argName = argName
-    result.reg = case paramRegTag
-      of RaxR, R0R: x86.RAX
-      of RdiR, R5R: x86.RDI
-      of RsiR, R4R: x86.RSI
-      of RdxR, R3R: x86.RDX
-      of RcxR, R2R: x86.RCX
-      of R8R: x86.R8
-      of R9R: x86.R9
-      of R10R: x86.R10
-      of R11R: x86.R11
-      else: x86.RAX
+    result.reg = tagToRegister(param.reg, n)
     result.typ = param.typ
   elif n.kind == ParLe and (n.tag == MemTagId or n.tag == DotTagId or n.tag == AtTagId):
     let op = parseOperand(n, ctx)
@@ -2352,24 +2240,7 @@ proc parseDest(n: var Cursor; ctx: var GenContext): Operand =
          inc n
          return
        elif sym.reg != InvalidTagId:
-         result.reg = case sym.reg
-            of RaxTagId, R0TagId: RAX
-            of RcxTagId, R2TagId: RCX
-            of RdxTagId, R3TagId: RDX
-            of RbxTagId, R1TagId: RBX
-            of RspTagId, R7TagId: RSP
-            of RbpTagId, R6TagId: RBP
-            of RsiTagId, R4TagId: RSI
-            of RdiTagId, R5TagId: RDI
-            of R8TagId: R8
-            of R9TagId: R9
-            of R10TagId: R10
-            of R11TagId: R11
-            of R12TagId: R12
-            of R13TagId: R13
-            of R14TagId: R14
-            of R15TagId: R15
-            else: RAX
+         result.reg = tagToRegister(sym.reg, n)
          result.typ = sym.typ
          # Writing to a register makes it valid (unclobbered)
          ctx.clobbered.excl(result.reg)
@@ -2776,7 +2647,7 @@ proc genKillX64(n: var Cursor; ctx: var GenContext) =
     ctx.slots.killSlot(sym.offset, sym.typ)
   elif sym.reg != InvalidTagId:
     # Remove register binding when variable is killed
-    let targetReg = tagToRegister(sym.reg)
+    let targetReg = tagToRegister(sym.reg, n)
     ctx.regBindings.del(targetReg)
 
   # Remove from scope to ensure it's not used again
@@ -2839,7 +2710,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     else:
       sym.reg = reg
       # Check if register is already bound to another variable
-      let targetReg = tagToRegister(reg)
+      let targetReg = tagToRegister(reg, n)
       if targetReg in ctx.regBindings:
         error("Register " & $targetReg & " is already bound to variable '" &
               ctx.regBindings[targetReg] & "', kill it first before reusing", n)
@@ -3622,9 +3493,6 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     skipParRi n, "nop"
   of RetX64:
     inc n
-    when false: # if ctx.procName.len > 0:
-      x86.emitMov(ctx.buf.data, RSP, RBP)
-      x86.emitPop(ctx.buf.data, RBP)
     x86.emitRet(ctx.buf.data)
     skipParRi n, "ret"
   of LabX64:
