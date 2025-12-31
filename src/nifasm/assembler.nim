@@ -701,52 +701,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext) =
 
 proc genInstX64(n: var Cursor; ctx: var GenContext)
 
-proc parseRegisterA64(n: var Cursor): arm64.Register =
-  let regTag = tagToA64Reg(n.tag)
-  result =
-    case regTag
-    of X0R: arm64.X0
-    of X1R: arm64.X1
-    of X2R: arm64.X2
-    of X3R: arm64.X3
-    of X4R: arm64.X4
-    of X5R: arm64.X5
-    of X6R: arm64.X6
-    of X7R: arm64.X7
-    of X8R: arm64.X8
-    of X9R: arm64.X9
-    of X10R: arm64.X10
-    of X11R: arm64.X11
-    of X12R: arm64.X12
-    of X13R: arm64.X13
-    of X14R: arm64.X14
-    of X15R: arm64.X15
-    of X16R: arm64.X16
-    of X17R: arm64.X17
-    of X18R: arm64.X18
-    of X19R: arm64.X19
-    of X20R: arm64.X20
-    of X21R: arm64.X21
-    of X22R: arm64.X22
-    of X23R: arm64.X23
-    of X24R: arm64.X24
-    of X25R: arm64.X25
-    of X26R: arm64.X26
-    of X27R: arm64.X27
-    of X28R: arm64.X28
-    of X29R: arm64.X29
-    of X30R: arm64.X30
-    of SpR: arm64.SP
-    of LrR: arm64.LR
-    of FpR: arm64.FP
-    of XzrR: arm64.Register(31)  # XZR
-    else:
-      error("Expected ARM64 register, got: " & $n.tag, n)
-      arm64.X0
-  inc n
-  skipParRi n, "register"
-
-proc tagToRegisterA64(t: TagEnum): arm64.Register =
+proc tagToRegisterA64(t: TagEnum; n: Cursor): arm64.Register =
   ## Convert a TagEnum to an ARM64 Register (for register binding tracking)
   let regTag = tagToA64Reg(t)
   result =
@@ -786,7 +741,15 @@ proc tagToRegisterA64(t: TagEnum): arm64.Register =
     of LrR: arm64.LR
     of FpR: arm64.FP
     of XzrR: arm64.Register(31)
-    else: arm64.X0  # Should not happen
+    else:
+      error("Expected ARM64 register, got: " & $t, n)
+      arm64.X0
+
+proc parseRegisterA64(n: var Cursor): arm64.Register =
+  result = tagToRegisterA64(n.tag, n)
+  inc n
+  skipParRi n, "register"
+
 
 type
   OperandA64 = object
@@ -939,7 +902,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
             let indexSym = lookupWithAutoImport(ctx, ctx.scope, indexName, n)
             if indexSym != nil and indexSym.kind == skVar and indexSym.reg != InvalidTagId:
               hasIndex = true
-              indexReg = tagToRegisterA64(indexSym.reg)
+              indexReg = tagToRegisterA64(indexSym.reg, n)
               inc n
               if n.kind == IntLit:
                 shift = int(getInt(n))
@@ -985,7 +948,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
         inc n
         return
       elif sym.reg != InvalidTagId:
-        result.reg = tagToRegisterA64(sym.reg)
+        result.reg = tagToRegisterA64(sym.reg, n)
         result.typ = sym.typ
       inc n
     elif sym != nil and sym.kind == skLabel:
@@ -1053,7 +1016,7 @@ proc parseDestA64(n: var Cursor; ctx: var GenContext): OperandA64 =
         inc n
         return
       elif sym.reg != InvalidTagId:
-        result.reg = tagToRegisterA64(sym.reg)
+        result.reg = tagToRegisterA64(sym.reg, n)
         result.typ = sym.typ
       else:
         error("Variable has no location", n)
