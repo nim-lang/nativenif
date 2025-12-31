@@ -679,6 +679,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext)
 
 proc tagToRegisterA64(t: TagEnum; n: Cursor): arm64.Register =
   ## Convert a TagEnum to an ARM64 Register (for register binding tracking)
+  ## Note: X16/X17 are reserved for assembler scratch use but allowed in direct
+  ## instructions (e.g., Darwin syscalls use X16 for syscall number).
   let regTag = tagToA64Reg(t)
   result =
     case regTag
@@ -698,12 +700,8 @@ proc tagToRegisterA64(t: TagEnum; n: Cursor): arm64.Register =
     of X13R: arm64.X13
     of X14R: arm64.X14
     of X15R: arm64.X15
-    of X16R:
-      error("Register x16 is reserved for assembler use (IP0)", n)
-      arm64.X16
-    of X17R:
-      error("Register x17 is reserved for assembler use (IP1)", n)
-      arm64.X17
+    of X16R: arm64.X16
+    of X17R: arm64.X17
     of X18R: arm64.X18
     of X19R: arm64.X19
     of X20R: arm64.X20
@@ -1254,6 +1252,12 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     if n.kind == ParLe:
       let locTag = n.tag
       if rawTagIsA64Reg(locTag):
+        # Check for reserved registers (x16/x17 are reserved for assembler scratch)
+        let regTag = tagToA64Reg(locTag)
+        if regTag == X16R:
+          error("Cannot bind variable to x16 (reserved for assembler use as IP0)", n)
+        elif regTag == X17R:
+          error("Cannot bind variable to x17 (reserved for assembler use as IP1)", n)
         reg = locTag
         inc n
         skipParRi n, "register location"
