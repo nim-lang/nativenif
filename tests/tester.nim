@@ -55,15 +55,15 @@ when defined(linux):
   # binaries have been built for linux only:
   exec "tests/hello"
   exec "tests/atomic_ops"
-  #exec "tests/dot_at_access"
-  #exec "tests/nested_dot_at"
-  #exec "tests/pointer_dot_store"
-  #exec "tests/array_i64_register_index"
-  #exec "tests/pointer_field_at"
-  #exec "tests/pointer_roundtrip"
-  #execExpectOutput("./tests/string_pointer_field", "Hello\n")
-  #execExpectOutput("./tests/message_inline_array", "Ping\n")
-  #execExpectOutput("./tests/call_hello_chain", "Hello through calls\n")
+  exec "tests/dot_at_access"
+  exec "tests/nested_dot_at"
+  exec "tests/pointer_dot_store"
+  exec "tests/array_i64_register_index"
+  exec "tests/pointer_field_at"
+  exec "tests/pointer_roundtrip"
+  execExpectOutput("./tests/string_pointer_field", "Hello\n")
+  execExpectOutput("./tests/message_inline_array", "Ping\n")
+  execExpectOutput("./tests/call_hello_chain", "Hello through calls\n")
   exec "./tests/call_multi_result"
 
 # Failing tests are not platform specific!
