@@ -4068,23 +4068,28 @@ proc writeElf(a: var GenContext; outfile: string) =
   let pageSize = 0x1000.uint64
 
   # Calculate addresses and sizes
-  let textOffset = headersSize.uint64
-  let textVaddr = baseAddr + textOffset
-  let textSize = code.len.uint64
-  let textAlignedSize = (textSize + pageSize - 1) and not (pageSize - 1)
+  # The LOAD segment must start at file offset 0 to include headers
+  # (some kernels like WSL require this for proper loading)
+  let textOffset = 0.uint64  # Include headers in LOAD segment
+  let textVaddr = baseAddr   # Segment starts at base address
+  let textFileSize = headersSize.uint64 + code.len.uint64  # Headers + code
+  let textMemSize = (textFileSize + pageSize - 1) and not (pageSize - 1)
+
+  # Entry point is after the headers
+  let entryAddr = baseAddr + headersSize.uint64
 
   # .bss section comes after .text in memory
-  let bssVaddr = textVaddr + textAlignedSize
+  let bssVaddr = textVaddr + textMemSize
   let bssSize = a.bssOffset.uint64
   let bssAlignedSize = if bssSize > 0: ((bssSize + pageSize - 1) and not (pageSize - 1)) else: 0.uint64
 
-  let entryAddr = textVaddr
   var ehdr = initHeader(entryAddr)
   ehdr.e_phnum = 2  # Two program headers: .text and .bss
   ehdr.e_phoff = 64  # Program headers start after ELF header
 
   # .text program header (executable, readable)
-  var textPhdr = initPhdr(textOffset, textVaddr, textSize, textAlignedSize, PF_R or PF_X)
+  # Starts at file offset 0, includes headers + code
+  var textPhdr = initPhdr(textOffset, textVaddr, textFileSize, textMemSize, PF_R or PF_X)
 
   # .bss program header (writable, readable, not executable)
   # p_filesz = 0 because .bss is not stored in the file (zero-initialized)
@@ -4105,7 +4110,7 @@ proc writeElf(a: var GenContext; outfile: string) =
   if code.len > 0:
     f.writeData(code.rawData, code.len)
     # Pad to page boundary
-    let padding = int(textAlignedSize - textSize)
+    let padding = int(textMemSize - textFileSize)
     if padding > 0:
       var zeros = newSeq[byte](padding)
       f.writeData(unsafeAddr zeros[0], padding)
@@ -4120,16 +4125,6 @@ proc writeMachO(a: var GenContext; outfile: string) =
   finalize(a.buf)
   finalize(a.bssBuf)
   let code = a.buf.data
-  let baseAddr = 0x100000000.uint64  # macOS default base address
-  let pageSize = 0x1000.uint64
-
-  # Calculate sizes
-  let codeSize = code.len.uint64
-  let codeAlignedSize = (codeSize + pageSize - 1) and not (pageSize - 1)
-
-  # TEXT segment: code
-  let textVmaddr = baseAddr
-  let entryAddr = textVmaddr
 
   # Determine CPU type based on architecture
   let (cputype, cpusubtype) = case a.arch
