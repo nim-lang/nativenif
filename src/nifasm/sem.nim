@@ -4,7 +4,9 @@ import instructions, x86
 
 type
   TypeKind* = enum
-    ErrorT, VoidT, BoolT, IntT, UIntT, FloatT, PtrT, AptrT, ArrayT, ObjectT, UnionT
+    ErrorT, VoidT, BoolT, IntT, UIntT, FloatT, PtrT, AptrT, ArrayT, ObjectT, UnionT,
+    RegisterT,   # Pure register usage - accepts any type (effectively untyped)
+    StackOffT    # Stack offset - represents an offset from a base register
 
   Type* = ref object
     case kind*: TypeKind
@@ -18,6 +20,10 @@ type
       fields*: seq[(string, Type)]
       size*: int
       align*: int
+    of RegisterT:
+      regBits*: int  # Size in bits (e.g., 64 for general purpose regs)
+    of StackOffT:
+      offType*: Type  # The underlying type at this stack location
 
   TypeDuo* = object
     want*, got*: Type
@@ -93,6 +99,8 @@ proc asmAlignOf*(t: Type): int =
   of PtrT, AptrT: 8 # x86-64 pointer alignment
   of ArrayT: asmAlignOf(t.elem)
   of ObjectT, UnionT: t.align
+  of RegisterT: t.regBits div 8
+  of StackOffT: asmAlignOf(t.offType)
 
 proc alignTo*(offset, alignment: int): int =
   ## Align offset up to the next multiple of alignment
@@ -106,6 +114,8 @@ proc asmSizeOf*(t: Type): int =
   of PtrT, AptrT: 8 # x86-64
   of ArrayT: t.len.int * asmSizeOf(t.elem)
   of ObjectT, UnionT: t.size
+  of RegisterT: t.regBits div 8
+  of StackOffT: asmSizeOf(t.offType)
 
 proc `$`*(t: Type): string =
   case t.kind
@@ -120,9 +130,18 @@ proc `$`*(t: Type): string =
   of ArrayT: "(array " & $t.elem & " " & $t.len & ")"
   of ObjectT: "object" # Simplified
   of UnionT: "union" # Simplified
+  of RegisterT: "(reg " & $t.regBits & ")"
+  of StackOffT: "(stackoff " & $t.offType & ")"
 
 proc compatible*(want, got: Type): bool =
   if want == got: return true
+  # RegisterT is lenient - accepts/provides any type that fits
+  if want.kind == RegisterT:
+    result = asmSizeOf(got) <= (want.regBits div 8)
+    return
+  if got.kind == RegisterT:
+    result = asmSizeOf(want) <= (got.regBits div 8)
+    return
   case want.kind
   of ErrorT, VoidT, BoolT:
     result = got.kind == want.kind
@@ -135,4 +154,9 @@ proc compatible*(want, got: Type): bool =
   of ArrayT:
     result = got.kind == want.kind and want.len == got.len and compatible(want.elem, got.elem)
   of ObjectT, UnionT:
-    result = false # used pointer equivalence for now
+    result = false # use pointer equivalence for now
+  of RegisterT:
+    discard # already handled above
+  of StackOffT:
+    # StackOffT is compatible if the underlying types are compatible
+    result = got.kind == StackOffT and compatible(want.offType, got.offType)

@@ -51,8 +51,8 @@ proc getStr(n: Cursor): string =
     error("Expected string literal", n)
 
 proc isIntegerType(t: Type): bool =
-  ## Check if type is an integer type (int or uint)
-  t.kind in {TypeKind.IntT, TypeKind.UIntT}
+  ## Check if type is an integer type (int or uint) or a register (which is untyped)
+  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.RegisterT}
 
 proc isFloatType(t: Type): bool =
   ## Check if type is a floating point type
@@ -60,12 +60,12 @@ proc isFloatType(t: Type): bool =
 
 proc canDoIntegerArithmetic(t: Type): bool =
   ## Check if type supports integer arithmetic operations (add, sub)
-  ## Includes integer types and array pointers (for pointer arithmetic)
-  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.AptrT}
+  ## Includes integer types, array pointers (for pointer arithmetic), and registers
+  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.AptrT, TypeKind.RegisterT}
 
 proc canDoBitwiseOps(t: Type): bool =
-  ## Check if type supports bitwise operations
-  t.kind in {TypeKind.IntT, TypeKind.UIntT}
+  ## Check if type supports bitwise operations (including registers)
+  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.RegisterT}
 
 
 proc parseRegister(n: var Cursor): x86.Register =
@@ -802,7 +802,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
     let t = n.tag
     if rawTagIsA64Reg(t):
       result.reg = parseRegisterA64(n)
-      result.typ = Type(kind: IntT, bits: 64)
+      result.typ = Type(kind: RegisterT, regBits: 64) # Pure register - accepts any type
     elif t == DotTagId:
       # (dot <base> <fieldname>) - similar to x64
       inc n
@@ -981,7 +981,12 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext; expectedType: Type = ni
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and (sym.kind == skVar or sym.kind == skParam):
       if sym.onStack:
-        error("Stack variable '" & name & "' cannot be used directly, use (mem (sp) " & name & ")", n)
+        # Return StackOffT - operations like `add` will reject this at type check
+        result.kind = okMem
+        result.mem = arm64.MemoryOperand(base: arm64.SP, offset: int32(sym.offset))
+        result.typ = sym.typ  # Already StackOffT from declaration
+        inc n
+        return
       elif sym.reg != InvalidTagId:
         result.reg = tagToRegisterA64(sym.reg)
         result.typ = sym.typ
@@ -1047,7 +1052,12 @@ proc parseDestA64(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and sym.kind == skVar:
       if sym.onStack:
-        error("Stack variable '" & name & "' cannot be used directly, use (mem (sp) " & name & ")", n)
+        # Return StackOffT - operations like `add` will reject this at type check
+        result.kind = okMem
+        result.mem = arm64.MemoryOperand(base: arm64.SP, offset: int32(sym.offset))
+        result.typ = sym.typ  # Already StackOffT from declaration
+        inc n
+        return
       elif sym.reg != InvalidTagId:
         result.reg = tagToRegisterA64(sym.reg)
         result.typ = sym.typ
@@ -1308,11 +1318,12 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
         error("Expected location", n)
     else:
       error("Expected location", n)
-    let typ = parseType(n, ctx.scope, ctx)
-    let sym = Symbol(name: name, kind: skVar, typ: typ)
+    let baseTyp = parseType(n, ctx.scope, ctx)
+    let sym = Symbol(name: name, kind: skVar, typ: baseTyp)
     if onStack:
       sym.onStack = true
-      sym.offset = ctx.slots.allocSlot(typ)
+      sym.offset = ctx.slots.allocSlot(baseTyp)
+      sym.typ = Type(kind: StackOffT, offType: baseTyp)  # Wrap in StackOffT
     else:
       sym.reg = reg
     ctx.scope.define(sym)
@@ -1739,7 +1750,8 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   var paramOffset = 16 # RBP + 16 (skip RBP, RetAddr)
   for param in sym.sig.params:
     if param.onStack:
-      ctx.scope.define(Symbol(name: param.name, kind: skParam, typ: param.typ, onStack: true, offset: paramOffset))
+      let stackTyp = Type(kind: StackOffT, offType: param.typ)  # Wrap in StackOffT
+      ctx.scope.define(Symbol(name: param.name, kind: skParam, typ: stackTyp, onStack: true, offset: paramOffset))
       paramOffset += slots.alignedSize(param.typ)
     else:
       ctx.scope.define(Symbol(name: param.name, kind: skParam, typ: param.typ, reg: param.reg))
@@ -1801,7 +1813,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
     let t = n.tag
     if rawTagIsX64Reg(t):
       result.reg = parseRegister(n)
-      result.typ = Type(kind: IntT, bits: 64) # Explicit register usage is assumed to be Int64 compatible
+      result.typ = Type(kind: RegisterT, regBits: 64) # Pure register - accepts any type
       # Check if this register is bound to a variable
       if result.reg in ctx.regBindings:
         error("Register " & $result.reg & " is bound to variable '" &
@@ -1832,10 +1844,12 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
         let stackSym = lookupWithAutoImport(ctx, ctx.scope, stackVarName, n)
         if stackSym == nil or not stackSym.onStack:
           error("Expected stack variable in dot, got: " & stackVarName, n)
-        if stackSym.typ.kind notin {TypeKind.ObjectT, TypeKind.UnionT}:
-          error("dot requires object/union type, got " & $stackSym.typ, n)
+        # Unwrap StackOffT to get the base type
+        let baseTyp = if stackSym.typ.kind == StackOffT: stackSym.typ.offType else: stackSym.typ
+        if baseTyp.kind notin {TypeKind.ObjectT, TypeKind.UnionT}:
+          error("dot requires object/union type, got " & $baseTyp, n)
         baseDisp = int32(stackSym.offset)
-        objType = stackSym.typ
+        objType = baseTyp
         inc n
 
         # Parse field name
@@ -1924,10 +1938,12 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
         let stackSym = lookupWithAutoImport(ctx, ctx.scope, stackVarName, n)
         if stackSym == nil or not stackSym.onStack:
           error("Expected stack variable in at, got: " & stackVarName, n)
-        if stackSym.typ.kind != TypeKind.ArrayT:
-          error("at requires array type, got " & $stackSym.typ, n)
+        # Unwrap StackOffT to get the base type
+        let baseTyp = if stackSym.typ.kind == StackOffT: stackSym.typ.offType else: stackSym.typ
+        if baseTyp.kind != TypeKind.ArrayT:
+          error("at requires array type, got " & $baseTyp, n)
         baseDisp = int32(stackSym.offset)
-        elemType = stackSym.typ.elem
+        elemType = baseTyp.elem
         inc n
 
         # Parse index
@@ -1944,8 +1960,8 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
         else:
           error("at requires (base-reg stackvar index) or (aptr-var index), got " & $baseOp.typ, n)
 
-      # Type check: index must be an integer
-      if indexOp.typ.kind notin {TypeKind.IntT, TypeKind.UIntT}:
+      # Type check: index must be an integer or register
+      if indexOp.typ.kind notin {TypeKind.IntT, TypeKind.UIntT, TypeKind.RegisterT}:
         error("Array index must be integer type, got " & $indexOp.typ, n)
 
       # Check if index is immediate or register
@@ -2037,9 +2053,9 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
             let indexName = getSym(n)
             let indexSym = lookupWithAutoImport(ctx, ctx.scope, indexName, n)
             if indexSym != nil and (indexSym.kind == skVar or indexSym.kind == skParam) and indexSym.onStack:
-              # Stack variable - use its offset as displacement and preserve type
+              # Stack variable - use its offset as displacement and preserve type (unwrap StackOffT)
               displacement = int32(indexSym.offset)
-              stackVarType = indexSym.typ
+              stackVarType = if indexSym.typ.kind == StackOffT: indexSym.typ.offType else: indexSym.typ
               inc n
             elif indexSym != nil and indexSym.kind == skVar and indexSym.reg != InvalidTagId:
               # This is the index register
@@ -2202,7 +2218,12 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and (sym.kind == skVar or sym.kind == skParam):
       if sym.onStack:
-        error("Stack variable '" & name & "' cannot be used directly, use (lea) or (mem (rsp) " & name & ")", n)
+        # Return StackOffT - operations like `add` will reject this at type check
+        result.kind = okMem
+        result.mem = x86.MemoryOperand(base: x86.RSP, displacement: int32(sym.offset))
+        result.typ = sym.typ  # Already StackOffT from declaration
+        inc n
+        return
       elif sym.reg != InvalidTagId:
         let regTag = tagToX64Reg(sym.reg)
         result.reg = case regTag
@@ -2231,11 +2252,12 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
       result.typ = sym.typ
       inc n
     elif sym != nil and sym.kind == skLabel:
-      result.reg = RAX
+      result.kind = okLabel
       result.label = LabelId(sym.offset)
       result.typ = Type(kind: UIntT, bits: 64)
       inc n
     elif sym != nil and sym.kind == skRodata:
+      result.kind = okLabel
       if sym.offset == -1:
         # Forward reference - create label now but don't define it yet
         # It will be defined when the rodata is actually written
@@ -2244,12 +2266,12 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
         result.label = labId
       else:
         result.label = LabelId(sym.offset)
-      result.reg = RAX
       result.typ = Type(kind: UIntT, bits: 64) # Address of rodata
       inc n
     elif sym != nil and sym.kind == skGvar:
       # Global variable - return its address
       # For foreign symbols, we can't generate code, but we can typecheck
+      result.kind = okLabel
       if sym.isForeign:
         error("Cannot access foreign global variable '" & name & "' directly (must be linked)", n)
       if sym.offset == -1:
@@ -2259,7 +2281,6 @@ proc parseOperand(n: var Cursor; ctx: var GenContext; expectedType: Type = nil):
         result.label = labId
       else:
         result.label = LabelId(sym.offset)
-      result.reg = RAX
       result.typ = Type(kind: UIntT, bits: 64) # Address of gvar
       inc n
     elif sym != nil and sym.kind == skTvar:
@@ -2341,7 +2362,12 @@ proc parseDest(n: var Cursor; ctx: var GenContext; expectedType: Type = nil): Op
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and sym.kind == skVar:
        if sym.onStack:
-         error("Stack variable '" & name & "' cannot be used directly, use (mem (rsp) " & name & ")", n)
+         # Return StackOffT - operations like `add` will reject this at type check
+         result.kind = okMem
+         result.mem = x86.MemoryOperand(base: x86.RSP, displacement: int32(sym.offset))
+         result.typ = sym.typ  # Already StackOffT from declaration
+         inc n
+         return
        elif sym.reg != InvalidTagId:
          result.reg = case sym.reg
             of RaxTagId, R0TagId: RAX
@@ -2823,12 +2849,13 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         error("Expected location", n)
     else:
       error("Expected location", n)
-    let typ = parseType(n, ctx.scope, ctx)
+    let baseTyp = parseType(n, ctx.scope, ctx)
 
-    let sym = Symbol(name: name, kind: skVar, typ: typ)
+    let sym = Symbol(name: name, kind: skVar, typ: baseTyp)
     if onStack:
       sym.onStack = true
-      sym.offset = ctx.slots.allocSlot(typ)
+      sym.offset = ctx.slots.allocSlot(baseTyp)
+      sym.typ = Type(kind: StackOffT, offType: baseTyp)  # Wrap in StackOffT
     else:
       sym.reg = reg
       # Check if register is already bound to another variable
@@ -3504,9 +3531,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       )
       x86.emitLea(ctx.buf.data, dest, mem)
     else:
-      # Try parsing as a label operand for backward compatibility
+      # Try parsing as a label operand (rodata, gvar, etc.)
       let op = parseOperand(n, ctx)
-      if op.label != LabelId(0):
+      if op.kind == okLabel:
         x86.emitLea(ctx.buf, dest, op.label)
       else:
         error("lea requires (base-reg offset) or label", n)

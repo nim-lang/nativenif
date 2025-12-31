@@ -33,7 +33,7 @@
       (cmovne (rcx) (rbx))
       (or (rdx) (rcx))
 
-      (lea (rsi) (rsp))
+      (lea (rsi) (rsp) +0)
       (mov (rax) +158)
       (mov (rdi) +4098)
       (syscall)
