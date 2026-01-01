@@ -206,6 +206,7 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type
 proc parseParams(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param]
 proc parseResult(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param]
 proc parseClobbers(n: var Cursor): set[x86.Register]
+proc parseUnionBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type
 proc genStmt(n: var Cursor; ctx: var GenContext)
 proc genInstA64(n: var Cursor; ctx: var GenContext)
 proc checkIntegerArithmetic(t: Type; op: string; n: Cursor)
@@ -300,7 +301,12 @@ proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cu
             let typ = parseObjectBody(n, scope, ctx)
             let sym = Symbol(name: basename, kind: skType, typ: typ, isForeign: true)
             scope.define(sym)
+          elif n.kind == ParLe and n.tag == UnionTagId:
+            let typ = parseUnionBody(n, scope, ctx)
+            let sym = Symbol(name: basename, kind: skType, typ: typ, isForeign: true)
+            scope.define(sym)
           else:
+            # Handles proc types and other types via parseType
             let typ = parseType(n, scope, ctx)
             let sym = Symbol(name: basename, kind: skType, typ: typ, isForeign: true)
             scope.define(sym)
@@ -427,6 +433,16 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
       let len = getInt(n)
       inc n
       result = Type(kind: ArrayT, elem: elem, len: len)
+    of ProcTagId:
+      # (proc (params ...) (result ...) (clobber ...))
+      var procTyp = Type(kind: ProcT, params: @[], results: @[], clobbers: {})
+      if n.kind == ParLe and tagToNifasmDecl(n.tag) == ParamsD:
+        procTyp.params = parseParams(n, scope, ctx)
+      if n.kind == ParLe and tagToNifasmDecl(n.tag) == ResultD:
+        procTyp.results = parseResult(n, scope, ctx)
+      if n.kind == ParLe and tagToNifasmDecl(n.tag) == ClobberD:
+        procTyp.clobbers = parseClobbers(n)
+      result = procTyp
     else:
       error("Unknown type tag: " & $t, n)
     skipParRi n, "type"
