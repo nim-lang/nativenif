@@ -122,17 +122,19 @@ type
     stubOffset: int  # Offset in stub section
     callSites: seq[int]  # Positions of BL instructions that call this proc
 
-  CallContext = object
-    ## Context for a `prepare` block - tracks call setup state
+  CallContextState = enum
+    Disabled, NormalCall, ExternalCall
+
+  CallContext = object          ## Context for a `prepare` block - tracks call setup state
+    state: CallContextState
+    callEmitted: bool           # True after (call) or (extcall) is emitted
     target: string              # Target proc/symbol name
     sig: Signature              # Signature (from proc or proc type)
-    isExternal: bool            # True if calling external proc
     extProcIdx: int             # Index into extProcs for external calls
     paramLookup: Table[string, Param]   # Quick lookup for params
     resultLookup: Table[string, Param]  # Quick lookup for results
     argsSet: HashSet[string]    # Arguments that have been assigned
     resultsSet: HashSet[string] # Results that have been bound
-    callEmitted: bool           # True after (call) or (extcall) is emitted
     stackArgSize: int           # Computed size of stack arguments (csize)
 
   GenContext = object
@@ -141,7 +143,7 @@ type
     bssBuf: relocs.Buffer  # BSS buffer (.bss section) for zero-initialized global variables
     arch: Arch
     procName: string
-    callStack: seq[CallContext] # Stack of active prepare blocks (replaces inCall)
+    callContext: CallContext # Current call context
     clobbered: set[x86.Register] # Registers clobbered in current flow (x64 only)
     slots: SlotManager
     ssizePatches: seq[int]
@@ -176,12 +178,7 @@ type
 
 proc inCall(ctx: GenContext): bool {.inline.} =
   ## Returns true if we're inside a prepare block
-  ctx.callStack.len > 0
-
-proc currentCallStackArgSize(ctx: GenContext): int =
-  ## Returns the stack argument size for the current call
-  if ctx.callStack.len > 0:
-    result = ctx.callStack[^1].stackArgSize
+  ctx.callContext.state != CallContextState.Disabled
 
 proc computeStackArgSize(sig: Signature): int =
   ## Compute total size needed for stack arguments
@@ -1022,7 +1019,10 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
   let name = getSym(n)
   let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
 
-  var callCtx = CallContext(
+  if ctx.callContext.state != CallContextState.Disabled:
+    error("Nested prepare blocks are not allowed", n)
+  ctx.callContext = CallContext(
+    state: CallContextState.NormalCall,
     target: name,
     paramLookup: initTable[string, Param](),
     resultLookup: initTable[string, Param](),
@@ -1036,28 +1036,25 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
   elif sym.kind == skProc:
     if sym.isForeign:
       error("Cannot call foreign proc '" & name & "' directly (use extcall)", n)
-    callCtx.sig = sym.sig
-    callCtx.isExternal = false
+    ctx.callContext.sig = sym.sig
   elif sym.kind == skExtProc:
-    callCtx.isExternal = true
+    ctx.callContext.state = CallContextState.ExternalCall
     for i, ext in ctx.extProcs:
       if ext.name == name:
-        callCtx.extProcIdx = i
+        ctx.callContext.extProcIdx = i
         break
   else:
     error("Expected proc symbol, got " & $sym.kind, n)
 
   # Build lookup tables (only for internal procs with signatures)
-  if not callCtx.isExternal:
-    for param in callCtx.sig.params:
-      callCtx.paramLookup[param.name] = param
-    for res in callCtx.sig.result:
-      callCtx.resultLookup[res.name] = res
+  if ctx.callContext.state == CallContextState.NormalCall:
+    for param in ctx.callContext.sig.params:
+      ctx.callContext.paramLookup[param.name] = param
+    for res in ctx.callContext.sig.result:
+      ctx.callContext.resultLookup[res.name] = res
     # Compute stack argument size
-    callCtx.stackArgSize = computeStackArgSize(callCtx.sig)
+    ctx.callContext.stackArgSize = computeStackArgSize(ctx.callContext.sig)
 
-  # Push call context
-  ctx.callStack.add callCtx
   inc n
 
   # Process instructions inside prepare block
@@ -1065,24 +1062,22 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
     genInstA64(n, ctx)
 
   # Verify call was emitted and all bindings are done
-  let currentCtx = ctx.callStack[^1]
-  if not currentCtx.isExternal:
-    for param in currentCtx.sig.params:
-      if not param.onStack and param.name notin currentCtx.argsSet:
+  if ctx.callContext.state == CallContextState.NormalCall:
+    for param in ctx.callContext.sig.params:
+      if not param.onStack and param.name notin ctx.callContext.argsSet:
         error("Missing argument: " & param.name, n)
 
-    for res in currentCtx.sig.result:
-      if res.name notin currentCtx.resultsSet:
+    for res in ctx.callContext.sig.result:
+      if res.name notin ctx.callContext.resultsSet:
         error("Missing result binding: " & res.name, n)
 
-    if not currentCtx.callEmitted:
+    if not ctx.callContext.callEmitted:
       error("Missing (call) or (extcall) in prepare block", n)
   else:
-    if not currentCtx.callEmitted:
+    if not ctx.callContext.callEmitted:
       error("Missing (extcall) in prepare block", n)
 
-  # Pop call context
-  discard ctx.callStack.pop()
+  ctx.callContext.state = CallContextState.Disabled
   skipParRi n, "prepare"
 
 proc genCallMarkerA64(n: var Cursor; ctx: var GenContext) =
@@ -1090,13 +1085,12 @@ proc genCallMarkerA64(n: var Cursor; ctx: var GenContext) =
   if not ctx.inCall:
     error("(call) can only be used inside a prepare block", n)
 
-  var callCtx = addr ctx.callStack[^1]
-  if callCtx.callEmitted:
+  if ctx.callContext.callEmitted:
     error("Multiple (call) instructions in prepare block", n)
-  if callCtx.isExternal:
+  if ctx.callContext.state == CallContextState.ExternalCall:
     error("Use (extcall) for external procs, not (call)", n)
 
-  let sym = lookupWithAutoImport(ctx, ctx.scope, callCtx.target, n)
+  let sym = lookupWithAutoImport(ctx, ctx.scope, ctx.callContext.target, n)
 
   var labId: LabelId
   if sym.offset == -1:
@@ -1106,7 +1100,7 @@ proc genCallMarkerA64(n: var Cursor; ctx: var GenContext) =
     labId = LabelId(sym.offset)
 
   ctx.buf.emitBL(labId)
-  callCtx.callEmitted = true
+  ctx.callContext.callEmitted = true
 
   inc n
   skipParRi n, "call"
@@ -1116,18 +1110,17 @@ proc genExtcallA64(n: var Cursor; ctx: var GenContext) =
   if not ctx.inCall:
     error("(extcall) can only be used inside a prepare block", n)
 
-  var callCtx = addr ctx.callStack[^1]
-  if callCtx.callEmitted:
+  if ctx.callContext.callEmitted:
     error("Multiple call instructions in prepare block", n)
-  if not callCtx.isExternal:
+  if ctx.callContext.state == CallContextState.NormalCall:
     error("Use (call) for internal procs, not (extcall)", n)
 
   # Record call site and emit BL (will be patched to point to stub)
   let callPos = ctx.buf.data.len
-  ctx.extProcs[callCtx.extProcIdx].callSites.add callPos
+  ctx.extProcs[ctx.callContext.extProcIdx].callSites.add callPos
   ctx.buf.data.addUint32(0x94000000'u32)  # BL placeholder
 
-  callCtx.callEmitted = true
+  ctx.callContext.callEmitted = true
 
   inc n
   skipParRi n, "extcall"
@@ -2048,7 +2041,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
       if not ctx.inCall:
         error("(csize) can only be used inside a prepare block", n)
       result.kind = okCsize
-      result.immVal = int64(ctx.currentCallStackArgSize)
+      result.immVal = int64(ctx.callContext.stackArgSize)
       result.typ = Type(kind: IntT, bits: 64)
       inc n
       skipParRi n, "csize expression"
@@ -2062,16 +2055,15 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
       inc n
       skipParRi n, "arg expression"
 
-      let callCtx = addr ctx.callStack[^1]
-      if argName notin callCtx.paramLookup:
+      if argName notin ctx.callContext.paramLookup:
         error("Unknown argument: " & argName, n)
 
-      let param = callCtx.paramLookup[argName]
+      let param = ctx.callContext.paramLookup[argName]
       if param.onStack:
         # Stack argument - return the offset as an immediate
         # The offset is computed from the stack parameter declarations
         var offset = 0
-        for p in callCtx.sig.params:
+        for p in ctx.callContext.sig.params:
           if p.onStack:
             if p.name == argName:
               break
@@ -2097,16 +2089,15 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
       inc n
       skipParRi n, "res expression"
 
-      let callCtx = addr ctx.callStack[^1]
-      if not callCtx.callEmitted:
+      if not ctx.callContext.callEmitted:
         error("(res ...) can only be used after (call) or (extcall)", n)
-      if resName notin callCtx.resultLookup:
+      if resName notin ctx.callContext.resultLookup:
         error("Unknown result: " & resName, n)
-      if resName in callCtx.resultsSet:
+      if resName in ctx.callContext.resultsSet:
         error("Result already bound: " & resName, n)
-      callCtx.resultsSet.incl(resName)
+      ctx.callContext.resultsSet.incl(resName)
 
-      let res = callCtx.resultLookup[resName]
+      let res = ctx.callContext.resultLookup[resName]
       result.reg = tagToRegister(res.reg, n)
       result.typ = res.typ
     else:
@@ -2205,18 +2196,17 @@ proc parseDest(n: var Cursor; ctx: var GenContext): Operand =
     inc n
     skipParRi n, "arg destination"
 
-    var callCtx = addr ctx.callStack[^1]
-    if argName notin callCtx.paramLookup:
+    if argName notin ctx.callContext.paramLookup:
       error("Unknown argument: " & argName, n)
 
-    let param = callCtx.paramLookup[argName]
+    let param = ctx.callContext.paramLookup[argName]
     if param.onStack:
       error("Stack argument '" & argName & "' cannot be used directly as destination, use (mem (rsp) (arg " & argName & "))", n)
 
     # Track that this argument is being set
-    if argName in callCtx.argsSet:
+    if argName in ctx.callContext.argsSet:
       error("Argument already set: " & argName, n)
-    callCtx.argsSet.incl(argName)
+    ctx.callContext.argsSet.incl(argName)
 
     # Return the register for this argument
     result.kind = okArg
@@ -2297,7 +2287,8 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
   let name = getSym(n)
   let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
 
-  var callCtx = CallContext(
+  ctx.callContext = CallContext(
+    state: CallContextState.NormalCall,
     target: name,
     paramLookup: initTable[string, Param](),
     resultLookup: initTable[string, Param](),
@@ -2311,14 +2302,14 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
   elif sym.kind == skProc:
     if sym.isForeign:
       error("Cannot call foreign proc '" & name & "' directly (use extcall)", n)
-    callCtx.sig = sym.sig
-    callCtx.isExternal = false
+    ctx.callContext.sig = sym.sig
+    ctx.callContext.state = CallContextState.NormalCall
   elif sym.kind == skExtProc:
     # External proc - find its info
-    callCtx.isExternal = true
+    ctx.callContext.state = CallContextState.ExternalCall
     for i, ext in ctx.extProcs:
       if ext.name == name:
-        callCtx.extProcIdx = i
+        ctx.callContext.extProcIdx = i
         break
     # External procs don't have full signatures in current design
     # For now, we skip argument checking for external procs
@@ -2326,16 +2317,14 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
     error("Expected proc symbol, got " & $sym.kind, n)
 
   # Build lookup tables (only for internal procs with signatures)
-  if not callCtx.isExternal:
-    for param in callCtx.sig.params:
-      callCtx.paramLookup[param.name] = param
-    for res in callCtx.sig.result:
-      callCtx.resultLookup[res.name] = res
+  if ctx.callContext.state == CallContextState.NormalCall:
+    for param in ctx.callContext.sig.params:
+      ctx.callContext.paramLookup[param.name] = param
+    for res in ctx.callContext.sig.result:
+      ctx.callContext.resultLookup[res.name] = res
     # Compute stack argument size
-    callCtx.stackArgSize = computeStackArgSize(callCtx.sig)
+    ctx.callContext.stackArgSize = computeStackArgSize(ctx.callContext.sig)
 
-  # Push call context
-  ctx.callStack.add callCtx
   inc n
 
   # Process instructions inside prepare block
@@ -2343,25 +2332,22 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
     genInstX64(n, ctx)
 
   # Verify all bindings are done
-  let currentCtx = ctx.callStack[^1]
-  if not currentCtx.isExternal:
-    for param in currentCtx.sig.params:
-      if not param.onStack and param.name notin currentCtx.argsSet:
+  if ctx.callContext.state == CallContextState.NormalCall:
+    for param in ctx.callContext.sig.params:
+      if not param.onStack and param.name notin ctx.callContext.argsSet:
         error("Missing argument: " & param.name, n)
 
-    for res in currentCtx.sig.result:
-      if res.name notin currentCtx.resultsSet:
+    for res in ctx.callContext.sig.result:
+      if res.name notin ctx.callContext.resultsSet:
         error("Missing result binding: " & res.name, n)
 
     # Verify call was emitted
-    if not currentCtx.callEmitted:
+    if not ctx.callContext.callEmitted:
       error("Missing (call) or (extcall) in prepare block", n)
   else:
-    if not currentCtx.callEmitted:
+    if not ctx.callContext.callEmitted:
       error("Missing (extcall) in prepare block", n)
-
-  # Pop call context
-  discard ctx.callStack.pop()
+  ctx.callContext.state = CallContextState.Disabled
   skipParRi n, "prepare"
 
 proc genCallMarkerX64(n: var Cursor; ctx: var GenContext) =
@@ -2369,16 +2355,15 @@ proc genCallMarkerX64(n: var Cursor; ctx: var GenContext) =
   if not ctx.inCall:
     error("(call) can only be used inside a prepare block", n)
 
-  var callCtx = addr ctx.callStack[^1]
-  if callCtx.callEmitted:
+  if ctx.callContext.callEmitted:
     error("Multiple (call) instructions in prepare block", n)
-  if callCtx.isExternal:
+  if ctx.callContext.state == CallContextState.ExternalCall:
     error("Use (extcall) for external procs, not (call)", n)
 
-  let sym = lookupWithAutoImport(ctx, ctx.scope, callCtx.target, n)
+  let sym = lookupWithAutoImport(ctx, ctx.scope, ctx.callContext.target, n)
 
   # Clobber registers
-  ctx.clobbered.incl(callCtx.sig.clobbers)
+  ctx.clobbered.incl(ctx.callContext.sig.clobbers)
 
   var labId: LabelId
   if sym.offset == -1:
@@ -2388,7 +2373,7 @@ proc genCallMarkerX64(n: var Cursor; ctx: var GenContext) =
     labId = LabelId(sym.offset)
 
   ctx.buf.emitCall(labId)
-  callCtx.callEmitted = true
+  ctx.callContext.callEmitted = true
 
   inc n
   skipParRi n, "call"
@@ -2398,18 +2383,17 @@ proc genExtcallX64(n: var Cursor; ctx: var GenContext) =
   if not ctx.inCall:
     error("(extcall) can only be used inside a prepare block", n)
 
-  var callCtx = addr ctx.callStack[^1]
-  if callCtx.callEmitted:
+  if ctx.callContext.callEmitted:
     error("Multiple call instructions in prepare block", n)
-  if not callCtx.isExternal:
+  if ctx.callContext.state == CallContextState.NormalCall:
     error("Use (call) for internal procs, not (extcall)", n)
 
   # Record call site and emit IAT call
   let callPos = ctx.buf.data.len
-  ctx.extProcs[callCtx.extProcIdx].callSites.add callPos
-  ctx.buf.emitIatCall(ctx.extProcs[callCtx.extProcIdx].gotSlot)
+  ctx.extProcs[ctx.callContext.extProcIdx].callSites.add callPos
+  ctx.buf.emitIatCall(ctx.extProcs[ctx.callContext.extProcIdx].gotSlot)
 
-  callCtx.callEmitted = true
+  ctx.callContext.callEmitted = true
 
   inc n
   skipParRi n, "extcall"
