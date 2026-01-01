@@ -463,8 +463,8 @@ proc lookupWithAutoImport(ctx: var GenContext; scope: Scope; name: string; n: Cu
       result = scope.lookup(basename)
 
   # Mark symbol as used for dependency tracking
-  if result != nil and result.fullName != "":
-    markSymbolUsed(ctx, result.fullName)
+  if result != nil:
+    markSymbolUsed(ctx, result.name)
 
 proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
   if n.kind == Symbol:
@@ -632,11 +632,7 @@ proc pass1Proc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: str
   # (proc :Name (params ...) (result ...) (clobber ...) (body ...))
   inc n
   if n.kind != SymbolDef: error("Expected proc name", n)
-  let fullName = pool.syms[n.symId]
-  # Only extract basename for foreign symbols (those with module suffix)
-  var name = fullName
-  if extractModule(fullName) != "":
-    extractBasename(name)
+  let name = pool.syms[n.symId]  # Full qualified name
   inc n
 
   var procTyp = Type(kind: ProcT, params: @[], results: @[], clobbers: {})
@@ -654,8 +650,7 @@ proc pass1Proc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: str
     procTyp.clobbers = parseClobbers(n)
 
   let sym = Symbol(name: name, kind: skProc, typ: procTyp, offset: -1,
-                   fullName: fullName, moduleName: moduleName, declStart: declStart,
-                   dedupKey: extractDedupKey(fullName))
+                   moduleName: moduleName, declStart: declStart)
   scope.define(sym)
 
 proc handleArch(n: var Cursor; ctx: var GenContext) =
@@ -688,23 +683,19 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
         of TypeD:
           inc n
           if n.kind != SymbolDef: error("Expected type name", n)
-          let fullName = pool.syms[n.symId]
-          # Only extract basename for foreign symbols (those with module suffix)
-          var name = fullName
-          if extractModule(fullName) != "":
-            extractBasename(name)
+          let name = pool.syms[n.symId]  # Full qualified name
           inc n
           if n.kind == ParLe and n.tag == ObjectTagId:
             let typ = parseObjectBody(n, scope, ctx)
-            scope.define(Symbol(name: name, kind: skType, typ: typ, fullName: fullName,
+            scope.define(Symbol(name: name, kind: skType, typ: typ,
                                 moduleName: moduleName, declStart: declStart))
           elif n.kind == ParLe and n.tag == UnionTagId:
             let typ = parseUnionBody(n, scope, ctx)
-            scope.define(Symbol(name: name, kind: skType, typ: typ, fullName: fullName,
+            scope.define(Symbol(name: name, kind: skType, typ: typ,
                                 moduleName: moduleName, declStart: declStart))
           else:
             let typ = parseType(n, scope, ctx)
-            scope.define(Symbol(name: name, kind: skType, typ: typ, fullName: fullName,
+            scope.define(Symbol(name: name, kind: skType, typ: typ,
                                 moduleName: moduleName, declStart: declStart))
           skipParRi n
         of ProcD:
@@ -716,12 +707,8 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
         of RodataD:
           inc n
           if n.kind != SymbolDef: error("Expected rodata name", n)
-          let fullName = pool.syms[n.symId]
-          # Only extract basename for foreign symbols (those with module suffix)
-          var name = fullName
-          if extractModule(fullName) != "":
-            extractBasename(name)
-          var sym = Symbol(name: name, kind: skRodata, fullName: fullName,
+          let name = pool.syms[n.symId]  # Full qualified name
+          var sym = Symbol(name: name, kind: skRodata,
                           moduleName: moduleName, declStart: declStart)
           sym.offset = -1  # Mark as forward reference until defined
           scope.define(sym)
@@ -730,28 +717,20 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
         of GvarD:
           inc n
           if n.kind != SymbolDef: error("Expected gvar name", n)
-          let fullName = pool.syms[n.symId]
-          # Only extract basename for foreign symbols (those with module suffix)
-          var name = fullName
-          if extractModule(fullName) != "":
-            extractBasename(name)
+          let name = pool.syms[n.symId]  # Full qualified name
           inc n # skip name
           let typ = parseType(n, scope, ctx)
-          scope.define(Symbol(name: name, kind: skGvar, typ: typ, fullName: fullName,
+          scope.define(Symbol(name: name, kind: skGvar, typ: typ,
                               moduleName: moduleName, declStart: declStart))
           n = start
           skip n
         of TvarD:
           inc n
           if n.kind != SymbolDef: error("Expected tvar name", n)
-          let fullName = pool.syms[n.symId]
-          # Only extract basename for foreign symbols (those with module suffix)
-          var name = fullName
-          if extractModule(fullName) != "":
-            extractBasename(name)
+          let name = pool.syms[n.symId]  # Full qualified name
           inc n # skip name
           let typ = parseType(n, scope, ctx)
-          scope.define(Symbol(name: name, kind: skTvar, typ: typ, fullName: fullName,
+          scope.define(Symbol(name: name, kind: skTvar, typ: typ,
                               moduleName: moduleName, declStart: declStart))
           n = start
           skip n
@@ -4159,9 +4138,9 @@ proc createLiterals(data: openArray[(string, int)]): Literals =
 
 proc generateSymbol(ctx: var GenContext; sym: Symbol) =
   ## Generate code for a single symbol on-demand
-  if sym.fullName in ctx.generatedSymbols:
+  if sym.name in ctx.generatedSymbols:
     return
-  ctx.generatedSymbols.incl sym.fullName
+  ctx.generatedSymbols.incl sym.name
 
   # Skip foreign symbols (they don't need code generation)
   if sym.isForeign:

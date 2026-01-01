@@ -1,6 +1,7 @@
 
 import std / [tables]
 import instructions, x86
+import "../../../nimony/src/lib" / [symparser]
 
 type
   TypeKind* = enum
@@ -56,8 +57,8 @@ type
 
     # Module system
     isForeign*: bool  # True if this symbol comes from a foreign module
-    fullName*: string # Full qualified name (foo.0.moduleSuffix)
-    dedupKey*: string # Deduplication key for generics (foo.0.key.mod -> key)
+    # name field stores the full qualified name (foo.0.moduleSuffix)
+    # Use symBasename() to get the lookup key
     isReachable*: bool # True if symbol is reachable from an entry point
     isEntryPoint*: bool # True if this is an entry point (exported)
     moduleName*: string # Module this symbol belongs to (for finding its TokenBuf)
@@ -77,17 +78,29 @@ proc newScope*(parent: Scope = nil): Scope =
   Scope(parent: parent, syms: initTable[string, Symbol]())
 
 proc lookup*(s: Scope; name: string): Symbol =
+  # Use basename for lookup (strips module suffix if present)
+  var key = name
+  extractBasename(key)
   var curr = s
   while curr != nil:
-    if name in curr.syms: return curr.syms[name]
+    if key in curr.syms: return curr.syms[key]
     curr = curr.parent
   return nil
 
+proc symBasename*(sym: Symbol): string =
+  ## Get the basename for scope lookup from a symbol's full name
+  result = sym.name
+  extractBasename(result)
+
 proc define*(s: Scope; sym: Symbol) =
-  s.syms[sym.name] = sym
+  # Use basename as the lookup key (strips module suffix if present)
+  s.syms[symBasename(sym)] = sym
 
 proc undefine*(s: Scope; name: string) =
-  s.syms.del(name)
+  # Use basename for undefine (strips module suffix if present)
+  var key = name
+  extractBasename(key)
+  s.syms.del(key)
 
 proc isOnStack*(t: Type): bool {.inline.} =
   ## Returns true if this type represents a stack location
