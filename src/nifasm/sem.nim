@@ -54,8 +54,14 @@ type
     # Control flow variable tracking
     used*: bool       # For cfvar: has it been used in an ite?
 
-    # Foreign module tracking
+    # Module system
     isForeign*: bool  # True if this symbol comes from a foreign module
+    fullName*: string # Full qualified name (foo.0.moduleSuffix)
+    dedupKey*: string # Deduplication key for generics (foo.0.key.mod -> key)
+    isReachable*: bool # True if symbol is reachable from an entry point
+    isEntryPoint*: bool # True if this is an entry point (exported)
+    moduleName*: string # Module this symbol belongs to (for finding its TokenBuf)
+    declStart*: int # Position in module's TokenBuf where declaration starts
 
     # External proc info (for skExtProc)
     libName*: string  # Library name (e.g. "libSystem.B.dylib")

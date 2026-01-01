@@ -28,6 +28,34 @@ proc skipParRi(n: var Cursor; context: string) {.inline.} =
   if n.kind != ParRi: error("Expected ) for " & context, n)
   inc n
 
+proc extractDedupKey*(s: string): string =
+  ## Extract deduplication key from symbol like "foo.0.key.moduleSuffix" -> "key"
+  ## For "foo.0.moduleSuffix" -> "" (no key)
+  ## For "foo.0" -> "" (local, no key)
+  # Count the dots and find positions
+  # Format: name.disamb.key.module or name.disamb.module or name.disamb
+  var dots: seq[int] = @[]
+  for i in 0..<s.len:
+    if s[i] == '.':
+      dots.add i
+
+  if dots.len < 2:
+    return ""  # Just "foo.0" - local symbol
+
+  if dots.len == 2:
+    # "foo.0.module" - no key, just module suffix
+    return ""
+
+  # dots.len >= 3: "foo.0.key.module" or more complex
+  # The key is between the second and third-to-last dot
+  # Actually: name.disamb.key.module
+  # dots[0] = after name, dots[1] = after disamb, dots[2] = after key
+  # So key is s[dots[1]+1 ..< dots[^1]]
+  if dots.len >= 3:
+    result = s[dots[1]+1 ..< dots[^1]]
+  else:
+    result = ""
+
 proc typeError(want, got: Type; n: Cursor) =
   error("Type mismatch: expected " & $want & ", got " & $got, n)
 
@@ -98,6 +126,8 @@ proc parseRegister(n: var Cursor): x86.Register =
   inc n
   skipParRi n, "register"
 
+const MainModuleName* = ""  # Special name for main module
+
 type
   LoadedModule = object
     buf: TokenBuf
@@ -155,6 +185,10 @@ type
     imports: seq[ImportedLib]  # Imported libraries
     extProcs: seq[ExtProcInfo]  # External procs to bind
     gotSlotCount: int  # Number of GOT slots allocated
+    # Module system / dead code elimination
+    pendingSymbols: seq[string]  # Symbols pending code generation
+    generatedSymbols: HashSet[string]  # Symbols already generated
+    dedupTable: Table[string, string]  # Maps dedup key to canonical symbol name
 
   OperandKind = enum
     okReg       # Register operand
@@ -177,6 +211,35 @@ type
 proc inCall(ctx: GenContext): bool {.inline.} =
   ## Returns true if we're inside a prepare block
   ctx.callContext.state != CallContextState.Disabled
+
+proc markSymbolUsed(ctx: var GenContext; fullName: string) =
+  ## Mark a symbol as used, adding it to pending list if not yet generated
+  ## Handles deduplication: if symbol has a dedup key and we've seen that key before,
+  ## the symbol is merged with the canonical one
+  if fullName in ctx.generatedSymbols:
+    return
+
+  let dedupKey = extractDedupKey(fullName)
+  if dedupKey != "":
+    # Check if we already have a canonical symbol for this key
+    if dedupKey in ctx.dedupTable:
+      # Already have this key, merge by using existing canonical
+      return
+    else:
+      # First occurrence of this key, register as canonical
+      ctx.dedupTable[dedupKey] = fullName
+
+  # Add to pending if not already there
+  if fullName notin ctx.generatedSymbols:
+    ctx.pendingSymbols.add fullName
+
+proc getCanonicalName(ctx: GenContext; fullName: string): string =
+  ## Get the canonical name for a symbol (for dedup merging)
+  let dedupKey = extractDedupKey(fullName)
+  if dedupKey != "" and dedupKey in ctx.dedupTable:
+    result = ctx.dedupTable[dedupKey]
+  else:
+    result = fullName
 
 proc findParam(t: Type; name: string): ptr Param =
   ## Find a parameter by name in a ProcT type
@@ -561,11 +624,15 @@ proc parseClobbers(n: var Cursor): set[x86.Register] =
         error("Expected register in clobber list", n)
     inc n
 
-proc pass1Proc(n: var Cursor; scope: Scope; ctx: var GenContext) =
+proc pass1Proc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string; declStart: int) =
   # (proc :Name (params ...) (result ...) (clobber ...) (body ...))
   inc n
   if n.kind != SymbolDef: error("Expected proc name", n)
-  let name = pool.syms[n.symId]
+  let fullName = pool.syms[n.symId]
+  # Only extract basename for foreign symbols (those with module suffix)
+  var name = fullName
+  if extractModule(fullName) != "":
+    extractBasename(name)
   inc n
 
   var procTyp = Type(kind: ProcT, params: @[], results: @[], clobbers: {})
@@ -582,7 +649,9 @@ proc pass1Proc(n: var Cursor; scope: Scope; ctx: var GenContext) =
   if n.kind == ParLe and tagToNifasmDecl(n.tag) == ClobberD:
     procTyp.clobbers = parseClobbers(n)
 
-  let sym = Symbol(name: name, kind: skProc, typ: procTyp, offset: -1)
+  let sym = Symbol(name: name, kind: skProc, typ: procTyp, offset: -1,
+                   fullName: fullName, moduleName: moduleName, declStart: declStart,
+                   dedupKey: extractDedupKey(fullName))
   scope.define(sym)
 
 proc handleArch(n: var Cursor; ctx: var GenContext) =
@@ -602,41 +671,54 @@ proc handleArch(n: var Cursor; ctx: var GenContext) =
   inc n
   skipParRi n
 
-proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext) =
+proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string; buf: var TokenBuf) =
   var n = n
   if n.kind == ParLe and n.tag == StmtsTagId:
     inc n
     while n.kind != ParRi:
       if n.kind == ParLe:
         let start = n
+        let declStart = cursorToPosition(buf, start)
         let declTag = tagToNifasmDecl(n.tag)
         case declTag
         of TypeD:
           inc n
           if n.kind != SymbolDef: error("Expected type name", n)
-          let name = pool.syms[n.symId]
+          let fullName = pool.syms[n.symId]
+          # Only extract basename for foreign symbols (those with module suffix)
+          var name = fullName
+          if extractModule(fullName) != "":
+            extractBasename(name)
           inc n
           if n.kind == ParLe and n.tag == ObjectTagId:
             let typ = parseObjectBody(n, scope, ctx)
-            scope.define(Symbol(name: name, kind: skType, typ: typ))
+            scope.define(Symbol(name: name, kind: skType, typ: typ, fullName: fullName,
+                                moduleName: moduleName, declStart: declStart))
           elif n.kind == ParLe and n.tag == UnionTagId:
             let typ = parseUnionBody(n, scope, ctx)
-            scope.define(Symbol(name: name, kind: skType, typ: typ))
+            scope.define(Symbol(name: name, kind: skType, typ: typ, fullName: fullName,
+                                moduleName: moduleName, declStart: declStart))
           else:
             let typ = parseType(n, scope, ctx)
-            scope.define(Symbol(name: name, kind: skType, typ: typ))
+            scope.define(Symbol(name: name, kind: skType, typ: typ, fullName: fullName,
+                                moduleName: moduleName, declStart: declStart))
           skipParRi n
         of ProcD:
           # (proc :Name (params ...) (result ...) (clobber ...) (body ...))
-          pass1Proc(n, scope, ctx)
+          pass1Proc(n, scope, ctx, moduleName, declStart)
 
           n = start
           skip n
         of RodataD:
           inc n
           if n.kind != SymbolDef: error("Expected rodata name", n)
-          let name = pool.syms[n.symId]
-          var sym = Symbol(name: name, kind: skRodata)
+          let fullName = pool.syms[n.symId]
+          # Only extract basename for foreign symbols (those with module suffix)
+          var name = fullName
+          if extractModule(fullName) != "":
+            extractBasename(name)
+          var sym = Symbol(name: name, kind: skRodata, fullName: fullName,
+                          moduleName: moduleName, declStart: declStart)
           sym.offset = -1  # Mark as forward reference until defined
           scope.define(sym)
           n = start
@@ -644,19 +726,29 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext) =
         of GvarD:
           inc n
           if n.kind != SymbolDef: error("Expected gvar name", n)
-          let name = pool.syms[n.symId]
+          let fullName = pool.syms[n.symId]
+          # Only extract basename for foreign symbols (those with module suffix)
+          var name = fullName
+          if extractModule(fullName) != "":
+            extractBasename(name)
           inc n # skip name
           let typ = parseType(n, scope, ctx)
-          scope.define(Symbol(name: name, kind: skGvar, typ: typ))
+          scope.define(Symbol(name: name, kind: skGvar, typ: typ, fullName: fullName,
+                              moduleName: moduleName, declStart: declStart))
           n = start
           skip n
         of TvarD:
           inc n
           if n.kind != SymbolDef: error("Expected tvar name", n)
-          let name = pool.syms[n.symId]
+          let fullName = pool.syms[n.symId]
+          # Only extract basename for foreign symbols (those with module suffix)
+          var name = fullName
+          if extractModule(fullName) != "":
+            extractBasename(name)
           inc n # skip name
           let typ = parseType(n, scope, ctx)
-          scope.define(Symbol(name: name, kind: skTvar, typ: typ))
+          scope.define(Symbol(name: name, kind: skTvar, typ: typ, fullName: fullName,
+                              moduleName: moduleName, declStart: declStart))
           n = start
           skip n
         of ArchD:
@@ -4064,7 +4156,6 @@ proc createLiterals(data: openArray[(string, int)]): Literals =
 proc assemble*(filename, outfile: string) =
   nifstreams.pool = createLiterals(TagData)
   var buf = parseFromFile(filename)
-  var n = beginRead(buf)
 
   # Extract base directory from filename
   let baseDir = filename.splitFile.dir
@@ -4082,15 +4173,23 @@ proc assemble*(filename, outfile: string) =
     baseDir: baseDir,
     imports: @[],
     extProcs: @[],
-    gotSlotCount: 0
+    gotSlotCount: 0,
+    pendingSymbols: @[],
+    generatedSymbols: initHashSet[string](),
+    dedupTable: initTable[string, string]()
   )
 
-  var n1 = n
-  pass1(n1, scope, ctx)
+  # Store main module
+  ctx.modules[MainModuleName] = LoadedModule(buf: move buf, loaded: true)
+
+  var n1 = beginRead(ctx.modules[MainModuleName].buf)
+  pass1(n1, scope, ctx, MainModuleName, ctx.modules[MainModuleName].buf)
 
   # Update ctx with proper buffers for pass2
   ctx.buf = initBuffer()
   ctx.bssBuf = initBuffer()
+
+  var n = beginRead(ctx.modules[MainModuleName].buf)
   pass2(n, ctx)
 
   case ctx.arch
@@ -4101,6 +4200,7 @@ proc assemble*(filename, outfile: string) =
   of Arch.WinX64, Arch.WinA64:
     writeExe(ctx, outfile.changeFileExt("exe"))
 
-  # Close all module streams
-  for module in ctx.modules.mvalues:
-    nifstreams.close(module.stream)
+  # Close all module streams (skip main module which has no stream)
+  for modname, module in ctx.modules.mpairs:
+    if modname != MainModuleName:
+      nifstreams.close(module.stream)
