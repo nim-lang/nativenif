@@ -1,0 +1,16 @@
+(.nif24)
+(stmts
+  (proc :main.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      (var :first.0 (s) TypeA.0.mod_select_a)
+      (var :second.0 (s) TypeB.0.mod_select_b)
+
+      (mov (rax) +60)
+      (mov (rdi) +0)
+      (syscall)
+    )
+  )
+)
