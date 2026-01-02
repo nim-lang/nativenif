@@ -1,0 +1,22 @@
+(stmts
+  (proc :main.0
+    (params)
+    (ret :ret.0 (rax) (i +64))
+    (body
+      # These should NOT be deduplicated (only 2 dots = no dedup key)
+      (prepare bar.0.moduleA
+        (mov (arg arg.0) +10)
+        (call)
+        (mov (rbx) (res ret.0))
+      )
+      (prepare bar.0.moduleB
+        (mov (arg arg.0) +20)
+        (call)
+        (mov (rcx) (res ret.0))
+      )
+      (mov (rax) +0)
+      (ret)
+    )
+  )
+)
+

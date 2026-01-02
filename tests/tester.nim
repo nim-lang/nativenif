@@ -50,6 +50,12 @@ exec "nim c -r src/nifasm/nifasm tests/message_inline_array.nif"
 exec "nim c -r src/nifasm/nifasm tests/call_hello_chain.nif"
 exec "nim c -r src/nifasm/nifasm tests/call_multi_result.nif"
 exec "nim c -r src/nifasm/nifasm tests/call_result_binding.nif"
+# Module system tests
+exec "nim c -r src/nifasm/nifasm tests/module_foreign.nif"
+exec "nim c -r src/nifasm/nifasm tests/module_type_import.nif"
+exec "nim c -r src/nifasm/nifasm tests/module_dedup.nif"
+exec "nim c -r src/nifasm/nifasm tests/module_dedup_nested.nif"
+exec "nim c -r src/nifasm/nifasm tests/module_no_dedup.nif"
 
 when defined(linux):
   # binaries have been built for linux only:

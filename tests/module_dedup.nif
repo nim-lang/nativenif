@@ -1,0 +1,25 @@
+(stmts
+  (proc :main.0
+    (params)
+    (ret :ret.0 (rax) (i +64))
+    (body
+      # Call the same generic instance from two different modules
+      # These should be deduplicated to a single instance
+      (prepare max.0.int64.moduleA
+        (mov (arg a.0) +10)
+        (mov (arg b.0) +20)
+        (call)
+        (mov (rbx) (res ret.0))
+      )
+      (prepare max.0.int64.moduleB
+        (mov (arg a.0) +30)
+        (mov (arg b.0) +40)
+        (call)
+        (mov (rcx) (res ret.0))
+      )
+      (mov (rax) +0)
+      (ret)
+    )
+  )
+)
+
