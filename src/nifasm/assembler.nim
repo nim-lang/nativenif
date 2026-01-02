@@ -28,6 +28,26 @@ proc skipParRi(n: var Cursor; context: string) {.inline.} =
   if n.kind != ParRi: error("Expected ) for " & context, n)
   inc n
 
+proc extractDedupKey*(s: string): string =
+  ## Extract deduplication key from symbol like "foo.0.key.moduleSuffix" -> "foo.0.key"
+  ## The dedup key is everything before the module suffix.
+  ## Deduplication only applies if there are more than 2 dots.
+  ## For "foo.0.moduleSuffix" (2 dots) -> "" (no dedup)
+  ## For "foo.0" (1 dot) -> "" (local, no dedup)
+  ## For "foo.0.key.moduleSuffix" (3 dots) -> "foo.0.key"
+  var dotCount = 0
+  var lastDotPos = -1
+  for i in 0..<s.len:
+    if s[i] == '.':
+      inc dotCount
+      lastDotPos = i
+
+  if dotCount <= 2:
+    return ""  # No deduplication for <= 2 dots
+
+  # More than 2 dots: dedup key is everything before the last dot (module suffix)
+  result = s[0 ..< lastDotPos]
+
 proc typeError(want, got: Type; n: Cursor) =
   error("Type mismatch: expected " & $want & ", got " & $got, n)
 
@@ -98,6 +118,8 @@ proc parseRegister(n: var Cursor): x86.Register =
   inc n
   skipParRi n, "register"
 
+const MainModuleName* = ""  # Special name for main module
+
 type
   LoadedModule = object
     buf: TokenBuf
@@ -122,17 +144,17 @@ type
     stubOffset: int  # Offset in stub section
     callSites: seq[int]  # Positions of BL instructions that call this proc
 
-  CallContext = object
-    ## Context for a `prepare` block - tracks call setup state
+  CallContextState = enum
+    Disabled, NormalCall, ExternalCall
+
+  CallContext = object          ## Context for a `prepare` block - tracks call setup state
+    state: CallContextState
+    callEmitted: bool           # True after (call) or (extcall) is emitted
     target: string              # Target proc/symbol name
-    sig: Signature              # Signature (from proc or proc type)
-    isExternal: bool            # True if calling external proc
+    typ: Type                   # ProcT type (contains params, results, clobbers)
     extProcIdx: int             # Index into extProcs for external calls
-    paramLookup: Table[string, Param]   # Quick lookup for params
-    resultLookup: Table[string, Param]  # Quick lookup for results
     argsSet: HashSet[string]    # Arguments that have been assigned
     resultsSet: HashSet[string] # Results that have been bound
-    callEmitted: bool           # True after (call) or (extcall) is emitted
     stackArgSize: int           # Computed size of stack arguments (csize)
 
   GenContext = object
@@ -141,7 +163,7 @@ type
     bssBuf: relocs.Buffer  # BSS buffer (.bss section) for zero-initialized global variables
     arch: Arch
     procName: string
-    callStack: seq[CallContext] # Stack of active prepare blocks (replaces inCall)
+    callContext: CallContext # Current call context
     clobbered: set[x86.Register] # Registers clobbered in current flow (x64 only)
     slots: SlotManager
     ssizePatches: seq[int]
@@ -155,6 +177,10 @@ type
     imports: seq[ImportedLib]  # Imported libraries
     extProcs: seq[ExtProcInfo]  # External procs to bind
     gotSlotCount: int  # Number of GOT slots allocated
+    # Module system / dead code elimination
+    pendingSymbols: seq[string]  # Symbols pending code generation
+    generatedSymbols: HashSet[string]  # Symbols already generated
+    dedupTable: Table[string, string]  # Maps dedup key to canonical symbol name
 
   OperandKind = enum
     okReg       # Register operand
@@ -176,24 +202,73 @@ type
 
 proc inCall(ctx: GenContext): bool {.inline.} =
   ## Returns true if we're inside a prepare block
-  ctx.callStack.len > 0
+  ctx.callContext.state != CallContextState.Disabled
 
-proc currentCallStackArgSize(ctx: GenContext): int =
-  ## Returns the stack argument size for the current call
-  if ctx.callStack.len > 0:
-    result = ctx.callStack[^1].stackArgSize
+proc markSymbolUsed(ctx: var GenContext; fullName: string) =
+  ## Mark a symbol as used, adding it to pending list if not yet generated
+  ## Only adds foreign symbols (those with module suffix) to pending list.
+  ## Main module symbols are handled by pass2.
+  ## Handles deduplication: if symbol has a dedup key and we've seen that key before,
+  ## the symbol is merged with the canonical one
+  if fullName in ctx.generatedSymbols:
+    return
 
-proc computeStackArgSize(sig: Signature): int =
+  # Only process foreign symbols (those with a module suffix)
+  let modName = extractModule(fullName)
+  if modName == "":
+    return  # Main module symbol, handled by pass2
+
+  let dedupKey = extractDedupKey(fullName)
+  if dedupKey != "":
+    # Check if we already have a canonical symbol for this key
+    if dedupKey in ctx.dedupTable:
+      # Already have this key, merge by using existing canonical
+      return
+    else:
+      # First occurrence of this key, register as canonical
+      ctx.dedupTable[dedupKey] = fullName
+
+  # Add to pending if not already there
+  if fullName notin ctx.generatedSymbols:
+    ctx.pendingSymbols.add fullName
+
+proc getCanonicalName(ctx: GenContext; fullName: string): string =
+  ## Get the canonical name for a symbol (for dedup merging)
+  let dedupKey = extractDedupKey(fullName)
+  if dedupKey != "" and dedupKey in ctx.dedupTable:
+    result = ctx.dedupTable[dedupKey]
+  else:
+    result = fullName
+
+proc findParam(t: Type; name: string): ptr Param =
+  ## Find a parameter by name in a ProcT type
+  assert t.kind == ProcT
+  for i in 0..<t.params.len:
+    if t.params[i].name == name:
+      return addr t.params[i]
+  nil
+
+proc findResult(t: Type; name: string): ptr Param =
+  ## Find a result by name in a ProcT type
+  assert t.kind == ProcT
+  for i in 0..<t.results.len:
+    if t.results[i].name == name:
+      return addr t.results[i]
+  nil
+
+proc computeStackArgSize(t: Type): int =
   ## Compute total size needed for stack arguments
+  assert t.kind == ProcT
   result = 0
-  for param in sig.params:
-    if param.onStack:
+  for param in t.params:
+    if param.typ.isOnStack:
       result += slots.alignedSize(param.typ)
 
 proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type
 proc parseParams(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param]
 proc parseResult(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param]
 proc parseClobbers(n: var Cursor): set[x86.Register]
+proc parseUnionBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type
 proc genStmt(n: var Cursor; ctx: var GenContext)
 proc genInstA64(n: var Cursor; ctx: var GenContext)
 proc checkIntegerArithmetic(t: Type; op: string; n: Cursor)
@@ -288,7 +363,12 @@ proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cu
             let typ = parseObjectBody(n, scope, ctx)
             let sym = Symbol(name: basename, kind: skType, typ: typ, isForeign: true)
             scope.define(sym)
+          elif n.kind == ParLe and n.tag == UnionTagId:
+            let typ = parseUnionBody(n, scope, ctx)
+            let sym = Symbol(name: basename, kind: skType, typ: typ, isForeign: true)
+            scope.define(sym)
           else:
+            # Handles proc types and other types via parseType
             let typ = parseType(n, scope, ctx)
             let sym = Symbol(name: basename, kind: skType, typ: typ, isForeign: true)
             scope.define(sym)
@@ -305,28 +385,27 @@ proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cu
           extractBasename(basename)
           inc n
 
-          var sig = Signature(params: @[], result: @[], clobbers: {})
+          var procTyp = Type(kind: ProcT, params: @[], results: @[], clobbers: {})
 
           # Parse params
           if n.kind == ParLe:
             let paramsDecl = tagToNifasmDecl(n.tag)
             if paramsDecl == ParamsD:
-              sig.params = parseParams(n, scope, ctx)
+              procTyp.params = parseParams(n, scope, ctx)
 
           # Parse result
           if n.kind == ParLe:
             let resultDecl = tagToNifasmDecl(n.tag)
             if resultDecl == ResultD:
-              var r = parseResult(n, scope, ctx)
-              sig.result = r
+              procTyp.results = parseResult(n, scope, ctx)
 
           # Parse clobber
           if n.kind == ParLe:
             let clobberDecl = tagToNifasmDecl(n.tag)
             if clobberDecl == ClobberD:
-              sig.clobbers = parseClobbers(n)
+              procTyp.clobbers = parseClobbers(n)
 
-          let sym = Symbol(name: basename, kind: skProc, sig: sig, isForeign: true)
+          let sym = Symbol(name: basename, kind: skProc, typ: procTyp, isForeign: true)
           scope.define(sym)
 
           # Skip body
@@ -369,7 +448,8 @@ proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cu
   ctx.modules[modname].loaded = true
 
 proc lookupWithAutoImport(ctx: var GenContext; scope: Scope; name: string; n: Cursor): Symbol =
-  ## Lookup a symbol, automatically loading foreign modules if needed
+  ## Lookup a symbol, automatically loading foreign modules if needed.
+  ## Also marks the symbol as used for dependency tracking.
   result = scope.lookup(name)
   if result == nil:
     # Check if this is a foreign symbol (has module suffix)
@@ -381,6 +461,10 @@ proc lookupWithAutoImport(ctx: var GenContext; scope: Scope; name: string; n: Cu
       var basename = name
       extractBasename(basename)
       result = scope.lookup(basename)
+
+  # Mark symbol as used for dependency tracking
+  if result != nil:
+    markSymbolUsed(ctx, result.name)
 
 proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
   if n.kind == Symbol:
@@ -416,6 +500,16 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
       let len = getInt(n)
       inc n
       result = Type(kind: ArrayT, elem: elem, len: len)
+    of ProcTagId:
+      # (proc (params ...) (result ...) (clobber ...))
+      var procTyp = Type(kind: ProcT, params: @[], results: @[], clobbers: {})
+      if n.kind == ParLe and tagToNifasmDecl(n.tag) == ParamsD:
+        procTyp.params = parseParams(n, scope, ctx)
+      if n.kind == ParLe and tagToNifasmDecl(n.tag) == ResultD:
+        procTyp.results = parseResult(n, scope, ctx)
+      if n.kind == ParLe and tagToNifasmDecl(n.tag) == ClobberD:
+        procTyp.clobbers = parseClobbers(n)
+      result = procTyp
     else:
       error("Unknown type tag: " & $t, n)
     skipParRi n, "type"
@@ -485,8 +579,10 @@ proc parseParams(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
       else:
         error("Expected location", n)
 
-      let typ = parseType(n, scope, ctx)
-      result.add Param(name: name, typ: typ, reg: reg, onStack: onStack)
+      var typ = parseType(n, scope, ctx)
+      if onStack:
+        typ = Type(kind: StackOffT, offType: typ)
+      result.add Param(name: name, typ: typ, reg: reg)
       skipParRi n, "param"
     else:
       error("Expected param declaration", n)
@@ -532,28 +628,29 @@ proc parseClobbers(n: var Cursor): set[x86.Register] =
         error("Expected register in clobber list", n)
     inc n
 
-proc pass1Proc(n: var Cursor; scope: Scope; ctx: var GenContext) =
+proc pass1Proc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string; declStart: int) =
   # (proc :Name (params ...) (result ...) (clobber ...) (body ...))
   inc n
   if n.kind != SymbolDef: error("Expected proc name", n)
-  let name = pool.syms[n.symId]
+  let name = pool.syms[n.symId]  # Full qualified name
   inc n
 
-  var sig = Signature(params: @[], result: @[], clobbers: {})
+  var procTyp = Type(kind: ProcT, params: @[], results: @[], clobbers: {})
 
   # Parse params
   if n.kind == ParLe and tagToNifasmDecl(n.tag) == ParamsD:
-    sig.params = parseParams(n, scope, ctx)
+    procTyp.params = parseParams(n, scope, ctx)
 
   # Parse result
   if n.kind == ParLe and tagToNifasmDecl(n.tag) == ResultD:
-    sig.result = parseResult(n, scope, ctx)
+    procTyp.results = parseResult(n, scope, ctx)
 
   # Parse clobber
   if n.kind == ParLe and tagToNifasmDecl(n.tag) == ClobberD:
-    sig.clobbers = parseClobbers(n)
+    procTyp.clobbers = parseClobbers(n)
 
-  let sym = Symbol(name: name, kind: skProc, sig: sig, offset: -1)
+  let sym = Symbol(name: name, kind: skProc, typ: procTyp, offset: -1,
+                   moduleName: moduleName, declStart: declStart)
   scope.define(sym)
 
 proc handleArch(n: var Cursor; ctx: var GenContext) =
@@ -573,41 +670,46 @@ proc handleArch(n: var Cursor; ctx: var GenContext) =
   inc n
   skipParRi n
 
-proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext) =
+proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string; buf: var TokenBuf) =
   var n = n
   if n.kind == ParLe and n.tag == StmtsTagId:
     inc n
     while n.kind != ParRi:
       if n.kind == ParLe:
         let start = n
+        let declStart = cursorToPosition(buf, start)
         let declTag = tagToNifasmDecl(n.tag)
         case declTag
         of TypeD:
           inc n
           if n.kind != SymbolDef: error("Expected type name", n)
-          let name = pool.syms[n.symId]
+          let name = pool.syms[n.symId]  # Full qualified name
           inc n
           if n.kind == ParLe and n.tag == ObjectTagId:
             let typ = parseObjectBody(n, scope, ctx)
-            scope.define(Symbol(name: name, kind: skType, typ: typ))
+            scope.define(Symbol(name: name, kind: skType, typ: typ,
+                                moduleName: moduleName, declStart: declStart))
           elif n.kind == ParLe and n.tag == UnionTagId:
             let typ = parseUnionBody(n, scope, ctx)
-            scope.define(Symbol(name: name, kind: skType, typ: typ))
+            scope.define(Symbol(name: name, kind: skType, typ: typ,
+                                moduleName: moduleName, declStart: declStart))
           else:
             let typ = parseType(n, scope, ctx)
-            scope.define(Symbol(name: name, kind: skType, typ: typ))
+            scope.define(Symbol(name: name, kind: skType, typ: typ,
+                                moduleName: moduleName, declStart: declStart))
           skipParRi n
         of ProcD:
           # (proc :Name (params ...) (result ...) (clobber ...) (body ...))
-          pass1Proc(n, scope, ctx)
+          pass1Proc(n, scope, ctx, moduleName, declStart)
 
           n = start
           skip n
         of RodataD:
           inc n
           if n.kind != SymbolDef: error("Expected rodata name", n)
-          let name = pool.syms[n.symId]
-          var sym = Symbol(name: name, kind: skRodata)
+          let name = pool.syms[n.symId]  # Full qualified name
+          var sym = Symbol(name: name, kind: skRodata,
+                          moduleName: moduleName, declStart: declStart)
           sym.offset = -1  # Mark as forward reference until defined
           scope.define(sym)
           n = start
@@ -615,19 +717,21 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext) =
         of GvarD:
           inc n
           if n.kind != SymbolDef: error("Expected gvar name", n)
-          let name = pool.syms[n.symId]
+          let name = pool.syms[n.symId]  # Full qualified name
           inc n # skip name
           let typ = parseType(n, scope, ctx)
-          scope.define(Symbol(name: name, kind: skGvar, typ: typ))
+          scope.define(Symbol(name: name, kind: skGvar, typ: typ,
+                              moduleName: moduleName, declStart: declStart))
           n = start
           skip n
         of TvarD:
           inc n
           if n.kind != SymbolDef: error("Expected tvar name", n)
-          let name = pool.syms[n.symId]
+          let name = pool.syms[n.symId]  # Full qualified name
           inc n # skip name
           let typ = parseType(n, scope, ctx)
-          scope.define(Symbol(name: name, kind: skTvar, typ: typ))
+          scope.define(Symbol(name: name, kind: skTvar, typ: typ,
+                              moduleName: moduleName, declStart: declStart))
           n = start
           skip n
         of ArchD:
@@ -918,7 +1022,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
     let name = getSym(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and (sym.kind == skVar or sym.kind == skParam):
-      if sym.onStack:
+      if sym.typ.isOnStack:
         # Return StackOffT - operations like `add` will reject this at type check
         result.kind = okMem
         result.mem = arm64.MemoryOperand(base: arm64.SP, offset: int32(sym.offset))
@@ -986,7 +1090,7 @@ proc parseDestA64(n: var Cursor; ctx: var GenContext): OperandA64 =
     let name = getSym(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and sym.kind == skVar:
-      if sym.onStack:
+      if sym.typ.isOnStack:
         # Return StackOffT - operations like `add` will reject this at type check
         result.kind = okMem
         result.mem = arm64.MemoryOperand(base: arm64.SP, offset: int32(sym.offset))
@@ -1022,10 +1126,11 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
   let name = getSym(n)
   let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
 
-  var callCtx = CallContext(
+  if ctx.callContext.state != CallContextState.Disabled:
+    error("Nested prepare blocks are not allowed", n)
+  ctx.callContext = CallContext(
+    state: CallContextState.NormalCall,
     target: name,
-    paramLookup: initTable[string, Param](),
-    resultLookup: initTable[string, Param](),
     argsSet: initHashSet[string](),
     resultsSet: initHashSet[string](),
     callEmitted: false
@@ -1036,28 +1141,20 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
   elif sym.kind == skProc:
     if sym.isForeign:
       error("Cannot call foreign proc '" & name & "' directly (use extcall)", n)
-    callCtx.sig = sym.sig
-    callCtx.isExternal = false
+    ctx.callContext.typ = sym.typ
   elif sym.kind == skExtProc:
-    callCtx.isExternal = true
+    ctx.callContext.state = CallContextState.ExternalCall
     for i, ext in ctx.extProcs:
       if ext.name == name:
-        callCtx.extProcIdx = i
+        ctx.callContext.extProcIdx = i
         break
   else:
     error("Expected proc symbol, got " & $sym.kind, n)
 
-  # Build lookup tables (only for internal procs with signatures)
-  if not callCtx.isExternal:
-    for param in callCtx.sig.params:
-      callCtx.paramLookup[param.name] = param
-    for res in callCtx.sig.result:
-      callCtx.resultLookup[res.name] = res
-    # Compute stack argument size
-    callCtx.stackArgSize = computeStackArgSize(callCtx.sig)
+  # Compute stack argument size (only for internal procs)
+  if ctx.callContext.state == CallContextState.NormalCall:
+    ctx.callContext.stackArgSize = computeStackArgSize(ctx.callContext.typ)
 
-  # Push call context
-  ctx.callStack.add callCtx
   inc n
 
   # Process instructions inside prepare block
@@ -1065,24 +1162,22 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
     genInstA64(n, ctx)
 
   # Verify call was emitted and all bindings are done
-  let currentCtx = ctx.callStack[^1]
-  if not currentCtx.isExternal:
-    for param in currentCtx.sig.params:
-      if not param.onStack and param.name notin currentCtx.argsSet:
+  if ctx.callContext.state == CallContextState.NormalCall:
+    for param in ctx.callContext.typ.params:
+      if not param.typ.isOnStack and param.name notin ctx.callContext.argsSet:
         error("Missing argument: " & param.name, n)
 
-    for res in currentCtx.sig.result:
-      if res.name notin currentCtx.resultsSet:
+    for res in ctx.callContext.typ.results:
+      if res.name notin ctx.callContext.resultsSet:
         error("Missing result binding: " & res.name, n)
 
-    if not currentCtx.callEmitted:
+    if not ctx.callContext.callEmitted:
       error("Missing (call) or (extcall) in prepare block", n)
   else:
-    if not currentCtx.callEmitted:
+    if not ctx.callContext.callEmitted:
       error("Missing (extcall) in prepare block", n)
 
-  # Pop call context
-  discard ctx.callStack.pop()
+  ctx.callContext.state = CallContextState.Disabled
   skipParRi n, "prepare"
 
 proc genCallMarkerA64(n: var Cursor; ctx: var GenContext) =
@@ -1090,13 +1185,12 @@ proc genCallMarkerA64(n: var Cursor; ctx: var GenContext) =
   if not ctx.inCall:
     error("(call) can only be used inside a prepare block", n)
 
-  var callCtx = addr ctx.callStack[^1]
-  if callCtx.callEmitted:
+  if ctx.callContext.callEmitted:
     error("Multiple (call) instructions in prepare block", n)
-  if callCtx.isExternal:
+  if ctx.callContext.state == CallContextState.ExternalCall:
     error("Use (extcall) for external procs, not (call)", n)
 
-  let sym = lookupWithAutoImport(ctx, ctx.scope, callCtx.target, n)
+  let sym = lookupWithAutoImport(ctx, ctx.scope, ctx.callContext.target, n)
 
   var labId: LabelId
   if sym.offset == -1:
@@ -1106,7 +1200,7 @@ proc genCallMarkerA64(n: var Cursor; ctx: var GenContext) =
     labId = LabelId(sym.offset)
 
   ctx.buf.emitBL(labId)
-  callCtx.callEmitted = true
+  ctx.callContext.callEmitted = true
 
   inc n
   skipParRi n, "call"
@@ -1116,18 +1210,17 @@ proc genExtcallA64(n: var Cursor; ctx: var GenContext) =
   if not ctx.inCall:
     error("(extcall) can only be used inside a prepare block", n)
 
-  var callCtx = addr ctx.callStack[^1]
-  if callCtx.callEmitted:
+  if ctx.callContext.callEmitted:
     error("Multiple call instructions in prepare block", n)
-  if not callCtx.isExternal:
+  if ctx.callContext.state == CallContextState.NormalCall:
     error("Use (call) for internal procs, not (extcall)", n)
 
   # Record call site and emit BL (will be patched to point to stub)
   let callPos = ctx.buf.data.len
-  ctx.extProcs[callCtx.extProcIdx].callSites.add callPos
+  ctx.extProcs[ctx.callContext.extProcIdx].callSites.add callPos
   ctx.buf.data.addUint32(0x94000000'u32)  # BL placeholder
 
-  callCtx.callEmitted = true
+  ctx.callContext.callEmitted = true
 
   inc n
   skipParRi n, "extcall"
@@ -1218,7 +1311,7 @@ proc genKillA64(n: var Cursor; ctx: var GenContext) =
   let name = getSym(n)
   let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
   if sym == nil: error("Unknown variable to kill: " & name, n)
-  if sym.onStack:
+  if sym.typ.isOnStack:
     ctx.slots.killSlot(sym.offset, sym.typ)
   ctx.scope.undefine(name)
   inc n
@@ -1270,12 +1363,12 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     else:
       error("Expected location", n)
     let baseTyp = parseType(n, ctx.scope, ctx)
-    let sym = Symbol(name: name, kind: skVar, typ: baseTyp)
+    let sym = Symbol(name: name, kind: skVar)
     if onStack:
-      sym.onStack = true
+      sym.typ = Type(kind: StackOffT, offType: baseTyp)
       sym.offset = ctx.slots.allocSlot(baseTyp)
-      sym.typ = Type(kind: StackOffT, offType: baseTyp)  # Wrap in StackOffT
     else:
+      sym.typ = baseTyp
       sym.reg = reg
     ctx.scope.define(sym)
     skipParRi n, "variable declaration"
@@ -1699,11 +1792,11 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
 
   # Add params to scope
   var paramOffset = 16 # RBP + 16 (skip RBP, RetAddr)
-  for param in sym.sig.params:
-    if param.onStack:
-      let stackTyp = Type(kind: StackOffT, offType: param.typ)  # Wrap in StackOffT
-      ctx.scope.define(Symbol(name: param.name, kind: skParam, typ: stackTyp, onStack: true, offset: paramOffset))
-      paramOffset += slots.alignedSize(param.typ)
+  for param in sym.typ.params:
+    if param.typ.isOnStack:
+      # param.typ is already StackOffT
+      ctx.scope.define(Symbol(name: param.name, kind: skParam, typ: param.typ, offset: paramOffset))
+      paramOffset += slots.alignedSize(param.typ.offType)
     else:
       ctx.scope.define(Symbol(name: param.name, kind: skParam, typ: param.typ, reg: param.reg))
       # Track register binding for parameters
@@ -1788,7 +1881,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
           error("Expected stack variable name in dot expression", n)
         let stackVarName = getSym(n)
         let stackSym = lookupWithAutoImport(ctx, ctx.scope, stackVarName, n)
-        if stackSym == nil or not stackSym.onStack:
+        if stackSym == nil or not stackSym.typ.isOnStack:
           error("Expected stack variable in dot, got: " & stackVarName, n)
         # Unwrap StackOffT to get the base type
         let baseTyp = if stackSym.typ.kind == StackOffT: stackSym.typ.offType else: stackSym.typ
@@ -1882,7 +1975,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
           error("Expected stack variable name in at expression", n)
         let stackVarName = getSym(n)
         let stackSym = lookupWithAutoImport(ctx, ctx.scope, stackVarName, n)
-        if stackSym == nil or not stackSym.onStack:
+        if stackSym == nil or not stackSym.typ.isOnStack:
           error("Expected stack variable in at, got: " & stackVarName, n)
         # Unwrap StackOffT to get the base type
         let baseTyp = if stackSym.typ.kind == StackOffT: stackSym.typ.offType else: stackSym.typ
@@ -1998,7 +2091,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
             # Could be index register or stack variable (used as offset)
             let indexName = getSym(n)
             let indexSym = lookupWithAutoImport(ctx, ctx.scope, indexName, n)
-            if indexSym != nil and (indexSym.kind == skVar or indexSym.kind == skParam) and indexSym.onStack:
+            if indexSym != nil and (indexSym.kind == skVar or indexSym.kind == skParam) and indexSym.typ.isOnStack:
               # Stack variable - use its offset as displacement and preserve type (unwrap StackOffT)
               displacement = int32(indexSym.offset)
               stackVarType = if indexSym.typ.kind == StackOffT: indexSym.typ.offType else: indexSym.typ
@@ -2048,7 +2141,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
       if not ctx.inCall:
         error("(csize) can only be used inside a prepare block", n)
       result.kind = okCsize
-      result.immVal = int64(ctx.currentCallStackArgSize)
+      result.immVal = int64(ctx.callContext.stackArgSize)
       result.typ = Type(kind: IntT, bits: 64)
       inc n
       skipParRi n, "csize expression"
@@ -2062,31 +2155,29 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
       inc n
       skipParRi n, "arg expression"
 
-      let callCtx = addr ctx.callStack[^1]
-      if argName notin callCtx.paramLookup:
+      let paramPtr = findParam(ctx.callContext.typ, argName)
+      if paramPtr == nil:
         error("Unknown argument: " & argName, n)
 
-      let param = callCtx.paramLookup[argName]
-      if param.onStack:
+      if paramPtr.typ.isOnStack:
         # Stack argument - return the offset as an immediate
         # The offset is computed from the stack parameter declarations
         var offset = 0
-        for p in callCtx.sig.params:
-          if p.onStack:
+        for p in ctx.callContext.typ.params:
+          if p.typ.isOnStack:
             if p.name == argName:
               break
             offset += slots.alignedSize(p.typ)
-        result.kind = okArg
-        result.argName = argName
         result.kind = okImm
+        result.argName = argName
         result.immVal = int64(offset)
-        result.typ = param.typ
+        result.typ = paramPtr.typ
       else:
         # Register argument - return the register
         result.kind = okArg
         result.argName = argName
-        result.reg = tagToRegister(param.reg, n)
-        result.typ = param.typ
+        result.reg = tagToRegister(paramPtr.reg, n)
+        result.typ = paramPtr.typ
     elif t == ResTagId:
       # (res name) - result reference in prepare block (after call)
       if not ctx.inCall:
@@ -2097,18 +2188,17 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
       inc n
       skipParRi n, "res expression"
 
-      let callCtx = addr ctx.callStack[^1]
-      if not callCtx.callEmitted:
+      if not ctx.callContext.callEmitted:
         error("(res ...) can only be used after (call) or (extcall)", n)
-      if resName notin callCtx.resultLookup:
+      let resPtr = findResult(ctx.callContext.typ, resName)
+      if resPtr == nil:
         error("Unknown result: " & resName, n)
-      if resName in callCtx.resultsSet:
+      if resName in ctx.callContext.resultsSet:
         error("Result already bound: " & resName, n)
-      callCtx.resultsSet.incl(resName)
+      ctx.callContext.resultsSet.incl(resName)
 
-      let res = callCtx.resultLookup[resName]
-      result.reg = tagToRegister(res.reg, n)
-      result.typ = res.typ
+      result.reg = tagToRegister(resPtr.reg, n)
+      result.typ = resPtr.typ
     else:
       error("Unexpected operand tag: " & $t, n)
   elif n.kind == IntLit:
@@ -2120,7 +2210,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
     let name = getSym(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and (sym.kind == skVar or sym.kind == skParam):
-      if sym.onStack:
+      if sym.typ.isOnStack:
         # Return StackOffT - operations like `add` will reject this at type check
         result.kind = okMem
         result.mem = x86.MemoryOperand(base: x86.RSP, displacement: int32(sym.offset))
@@ -2205,24 +2295,23 @@ proc parseDest(n: var Cursor; ctx: var GenContext): Operand =
     inc n
     skipParRi n, "arg destination"
 
-    var callCtx = addr ctx.callStack[^1]
-    if argName notin callCtx.paramLookup:
+    let paramPtr = findParam(ctx.callContext.typ, argName)
+    if paramPtr == nil:
       error("Unknown argument: " & argName, n)
 
-    let param = callCtx.paramLookup[argName]
-    if param.onStack:
+    if paramPtr.typ.isOnStack:
       error("Stack argument '" & argName & "' cannot be used directly as destination, use (mem (rsp) (arg " & argName & "))", n)
 
     # Track that this argument is being set
-    if argName in callCtx.argsSet:
+    if argName in ctx.callContext.argsSet:
       error("Argument already set: " & argName, n)
-    callCtx.argsSet.incl(argName)
+    ctx.callContext.argsSet.incl(argName)
 
     # Return the register for this argument
     result.kind = okArg
     result.argName = argName
-    result.reg = tagToRegister(param.reg, n)
-    result.typ = param.typ
+    result.reg = tagToRegister(paramPtr.reg, n)
+    result.typ = paramPtr.typ
   elif n.kind == ParLe and (n.tag == MemTagId or n.tag == DotTagId or n.tag == AtTagId):
     let op = parseOperand(n, ctx)
     if op.kind != okMem:
@@ -2232,7 +2321,7 @@ proc parseDest(n: var Cursor; ctx: var GenContext): Operand =
     let name = getSym(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym != nil and sym.kind == skVar:
-       if sym.onStack:
+       if sym.typ.isOnStack:
          # Return StackOffT - operations like `add` will reject this at type check
          result.kind = okMem
          result.mem = x86.MemoryOperand(base: x86.RSP, displacement: int32(sym.offset))
@@ -2297,10 +2386,9 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
   let name = getSym(n)
   let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
 
-  var callCtx = CallContext(
+  ctx.callContext = CallContext(
+    state: CallContextState.NormalCall,
     target: name,
-    paramLookup: initTable[string, Param](),
-    resultLookup: initTable[string, Param](),
     argsSet: initHashSet[string](),
     resultsSet: initHashSet[string](),
     callEmitted: false
@@ -2311,31 +2399,24 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
   elif sym.kind == skProc:
     if sym.isForeign:
       error("Cannot call foreign proc '" & name & "' directly (use extcall)", n)
-    callCtx.sig = sym.sig
-    callCtx.isExternal = false
+    ctx.callContext.typ = sym.typ
+    ctx.callContext.state = CallContextState.NormalCall
   elif sym.kind == skExtProc:
     # External proc - find its info
-    callCtx.isExternal = true
+    ctx.callContext.state = CallContextState.ExternalCall
     for i, ext in ctx.extProcs:
       if ext.name == name:
-        callCtx.extProcIdx = i
+        ctx.callContext.extProcIdx = i
         break
     # External procs don't have full signatures in current design
     # For now, we skip argument checking for external procs
   else:
     error("Expected proc symbol, got " & $sym.kind, n)
 
-  # Build lookup tables (only for internal procs with signatures)
-  if not callCtx.isExternal:
-    for param in callCtx.sig.params:
-      callCtx.paramLookup[param.name] = param
-    for res in callCtx.sig.result:
-      callCtx.resultLookup[res.name] = res
-    # Compute stack argument size
-    callCtx.stackArgSize = computeStackArgSize(callCtx.sig)
+  # Compute stack argument size (only for internal procs)
+  if ctx.callContext.state == CallContextState.NormalCall:
+    ctx.callContext.stackArgSize = computeStackArgSize(ctx.callContext.typ)
 
-  # Push call context
-  ctx.callStack.add callCtx
   inc n
 
   # Process instructions inside prepare block
@@ -2343,25 +2424,22 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
     genInstX64(n, ctx)
 
   # Verify all bindings are done
-  let currentCtx = ctx.callStack[^1]
-  if not currentCtx.isExternal:
-    for param in currentCtx.sig.params:
-      if not param.onStack and param.name notin currentCtx.argsSet:
+  if ctx.callContext.state == CallContextState.NormalCall:
+    for param in ctx.callContext.typ.params:
+      if not param.typ.isOnStack and param.name notin ctx.callContext.argsSet:
         error("Missing argument: " & param.name, n)
 
-    for res in currentCtx.sig.result:
-      if res.name notin currentCtx.resultsSet:
+    for res in ctx.callContext.typ.results:
+      if res.name notin ctx.callContext.resultsSet:
         error("Missing result binding: " & res.name, n)
 
     # Verify call was emitted
-    if not currentCtx.callEmitted:
+    if not ctx.callContext.callEmitted:
       error("Missing (call) or (extcall) in prepare block", n)
   else:
-    if not currentCtx.callEmitted:
+    if not ctx.callContext.callEmitted:
       error("Missing (extcall) in prepare block", n)
-
-  # Pop call context
-  discard ctx.callStack.pop()
+  ctx.callContext.state = CallContextState.Disabled
   skipParRi n, "prepare"
 
 proc genCallMarkerX64(n: var Cursor; ctx: var GenContext) =
@@ -2369,16 +2447,15 @@ proc genCallMarkerX64(n: var Cursor; ctx: var GenContext) =
   if not ctx.inCall:
     error("(call) can only be used inside a prepare block", n)
 
-  var callCtx = addr ctx.callStack[^1]
-  if callCtx.callEmitted:
+  if ctx.callContext.callEmitted:
     error("Multiple (call) instructions in prepare block", n)
-  if callCtx.isExternal:
+  if ctx.callContext.state == CallContextState.ExternalCall:
     error("Use (extcall) for external procs, not (call)", n)
 
-  let sym = lookupWithAutoImport(ctx, ctx.scope, callCtx.target, n)
+  let sym = lookupWithAutoImport(ctx, ctx.scope, ctx.callContext.target, n)
 
   # Clobber registers
-  ctx.clobbered.incl(callCtx.sig.clobbers)
+  ctx.clobbered.incl(ctx.callContext.typ.clobbers)
 
   var labId: LabelId
   if sym.offset == -1:
@@ -2388,7 +2465,7 @@ proc genCallMarkerX64(n: var Cursor; ctx: var GenContext) =
     labId = LabelId(sym.offset)
 
   ctx.buf.emitCall(labId)
-  callCtx.callEmitted = true
+  ctx.callContext.callEmitted = true
 
   inc n
   skipParRi n, "call"
@@ -2398,18 +2475,17 @@ proc genExtcallX64(n: var Cursor; ctx: var GenContext) =
   if not ctx.inCall:
     error("(extcall) can only be used inside a prepare block", n)
 
-  var callCtx = addr ctx.callStack[^1]
-  if callCtx.callEmitted:
+  if ctx.callContext.callEmitted:
     error("Multiple call instructions in prepare block", n)
-  if not callCtx.isExternal:
+  if ctx.callContext.state == CallContextState.NormalCall:
     error("Use (call) for internal procs, not (extcall)", n)
 
   # Record call site and emit IAT call
   let callPos = ctx.buf.data.len
-  ctx.extProcs[callCtx.extProcIdx].callSites.add callPos
-  ctx.buf.emitIatCall(ctx.extProcs[callCtx.extProcIdx].gotSlot)
+  ctx.extProcs[ctx.callContext.extProcIdx].callSites.add callPos
+  ctx.buf.emitIatCall(ctx.extProcs[ctx.callContext.extProcIdx].gotSlot)
 
-  callCtx.callEmitted = true
+  ctx.callContext.callEmitted = true
 
   inc n
   skipParRi n, "extcall"
@@ -2643,7 +2719,7 @@ proc genKillX64(n: var Cursor; ctx: var GenContext) =
   let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
   if sym == nil: error("Unknown variable to kill: " & name, n)
 
-  if sym.onStack:
+  if sym.typ.isOnStack:
     ctx.slots.killSlot(sym.offset, sym.typ)
   elif sym.reg != InvalidTagId:
     # Remove register binding when variable is killed
@@ -2702,12 +2778,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       error("Expected location", n)
     let baseTyp = parseType(n, ctx.scope, ctx)
 
-    let sym = Symbol(name: name, kind: skVar, typ: baseTyp)
+    let sym = Symbol(name: name, kind: skVar)
     if onStack:
-      sym.onStack = true
+      sym.typ = Type(kind: StackOffT, offType: baseTyp)
       sym.offset = ctx.slots.allocSlot(baseTyp)
-      sym.typ = Type(kind: StackOffT, offType: baseTyp)  # Wrap in StackOffT
     else:
+      sym.typ = baseTyp
       sym.reg = reg
       # Check if register is already bound to another variable
       let targetReg = tagToRegister(reg, n)
@@ -3373,7 +3449,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       elif n.kind == Symbol:
         let offsetName = getSym(n)
         let offsetSym = lookupWithAutoImport(ctx, ctx.scope, offsetName, n)
-        if offsetSym != nil and (offsetSym.kind == skVar or offsetSym.kind == skParam) and offsetSym.onStack:
+        if offsetSym != nil and (offsetSym.kind == skVar or offsetSym.kind == skParam) and offsetSym.typ.isOnStack:
           displacement = int32(offsetSym.offset)
         else:
           error("Expected stack variable or integer offset in lea", n)
@@ -4076,10 +4152,79 @@ proc createLiterals(data: openArray[(string, int)]): Literals =
     let t = result.tags.getOrIncl(data[i][0])
     assert t.int == data[i][1]
 
+proc generateSymbol(ctx: var GenContext; sym: Symbol) =
+  ## Generate code for a single symbol on-demand
+  if sym.name in ctx.generatedSymbols:
+    return
+  ctx.generatedSymbols.incl sym.name
+
+  # Skip foreign symbols (they don't need code generation)
+  if sym.isForeign:
+    return
+
+  # Get the module's TokenBuf
+  if sym.moduleName notin ctx.modules:
+    return  # Module not loaded, can't generate
+
+  var n = cursorAt(ctx.modules[sym.moduleName].buf, sym.declStart)
+  let declTag = tagToNifasmDecl(n.tag)
+
+  case sym.kind
+  of skProc:
+    if declTag == ProcD:
+      pass2Proc(n, ctx)
+  of skRodata:
+    if declTag == RodataD:
+      inc n  # rodata
+      inc n  # name (already have sym)
+      let s = getStr(n)
+      if sym.offset == -1:
+        let labId = ctx.buf.createLabel()
+        sym.offset = int(labId)
+      ctx.buf.defineLabel(LabelId(sym.offset))
+      for c in s: ctx.buf.data.add byte(c)
+  of skGvar:
+    if declTag == GvarD:
+      # Allocate space in .bss section
+      let size = slots.alignedSize(sym.typ)
+      let align = asmSizeOf(sym.typ)
+      if align > 1:
+        ctx.bssOffset = (ctx.bssOffset + align - 1) and not (align - 1)
+      let labId = ctx.bssBuf.createLabel()
+      sym.offset = int(labId)
+      ctx.bssBuf.defineLabel(labId)
+      ctx.bssOffset += size
+  of skTvar:
+    if declTag == TvarD:
+      let size = slots.alignedSize(sym.typ)
+      sym.offset = ctx.tlsOffset
+      ctx.tlsOffset += size
+  else:
+    discard  # Types and other symbols don't need code generation
+
+proc processReachableSymbols(ctx: var GenContext) =
+  ## Process all pending symbols until queue is empty
+  while ctx.pendingSymbols.len > 0:
+    let fullName = ctx.pendingSymbols.pop()
+    if fullName in ctx.generatedSymbols:
+      continue
+
+    # Handle deduplication
+    let canonicalName = getCanonicalName(ctx, fullName)
+    if canonicalName != fullName and canonicalName in ctx.generatedSymbols:
+      continue  # Already generated the canonical version
+
+    # Find the symbol
+    var baseName = fullName
+    if extractModule(fullName) != "":
+      extractBasename(baseName)
+    let sym = ctx.scope.lookup(baseName)
+    if sym != nil:
+      generateSymbol(ctx, sym)
+
 proc assemble*(filename, outfile: string) =
   nifstreams.pool = createLiterals(TagData)
   var buf = parseFromFile(filename)
-  var n = beginRead(buf)
 
   # Extract base directory from filename
   let baseDir = filename.splitFile.dir
@@ -4097,16 +4242,29 @@ proc assemble*(filename, outfile: string) =
     baseDir: baseDir,
     imports: @[],
     extProcs: @[],
-    gotSlotCount: 0
+    gotSlotCount: 0,
+    pendingSymbols: @[],
+    generatedSymbols: initHashSet[string](),
+    dedupTable: initTable[string, string]()
   )
 
-  var n1 = n
-  pass1(n1, scope, ctx)
+  # Store main module
+  ctx.modules[MainModuleName] = LoadedModule(buf: move buf, loaded: true)
+
+  var n1 = beginRead(ctx.modules[MainModuleName].buf)
+  pass1(n1, scope, ctx, MainModuleName, ctx.modules[MainModuleName].buf)
 
   # Update ctx with proper buffers for pass2
   ctx.buf = initBuffer()
   ctx.bssBuf = initBuffer()
+
+  # Generate code for main module (marks symbols as used via lookupWithAutoImport)
+  var n = beginRead(ctx.modules[MainModuleName].buf)
   pass2(n, ctx)
+
+  # Process any pending symbols from foreign modules (dead code elimination)
+  # This generates code only for symbols that were actually referenced
+  processReachableSymbols(ctx)
 
   case ctx.arch
   of Arch.X64:
@@ -4116,6 +4274,7 @@ proc assemble*(filename, outfile: string) =
   of Arch.WinX64, Arch.WinA64:
     writeExe(ctx, outfile.changeFileExt("exe"))
 
-  # Close all module streams
-  for module in ctx.modules.mvalues:
-    nifstreams.close(module.stream)
+  # Close all module streams (skip main module which has no stream)
+  for modname, module in ctx.modules.mpairs:
+    if modname != MainModuleName:
+      nifstreams.close(module.stream)

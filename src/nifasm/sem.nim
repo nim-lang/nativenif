@@ -1,13 +1,20 @@
 
 import std / [tables]
 import instructions, x86
+import "../../../nimony/src/lib" / [symparser]
 
 type
   TypeKind* = enum
     ErrorT, VoidT, BoolT, IntT, UIntT, FloatT, PtrT, AptrT, ArrayT, ObjectT, UnionT,
     RegisterT,   # Pure register usage - accepts any type (effectively untyped)
     StackOffT,   # Stack offset - represents an offset from a base register
-    IntLitT      # Integer literal - compatible with both IntT and UIntT
+    IntLitT,     # Integer literal - compatible with both IntT and UIntT
+    ProcT        # Procedure type
+
+  Param* = object
+    name*: string
+    typ*: Type      # If kind == StackOffT, param is on stack
+    reg*: TagEnum
 
   Type* = ref object
     case kind*: TypeKind
@@ -25,6 +32,10 @@ type
       regBits*: int  # Size in bits (e.g., 64 for general purpose regs)
     of StackOffT:
       offType*: Type  # The underlying type at this stack location
+    of ProcT:
+      params*: seq[Param]
+      results*: seq[Param]
+      clobbers*: set[Register]
 
   TypeDuo* = object
     want*, got*: Type
@@ -32,35 +43,26 @@ type
   SymKind* = enum
     skUnknown, skType, skVar, skParam, skProc, skLabel, skRodata, skGvar, skTvar, skCfvar, skExtProc
 
-  Param* = object
-    name*: string
-    typ*: Type
-    reg*: TagEnum
-    onStack*: bool
-
-  Signature* = ref object
-    params*: seq[Param]
-    result*: seq[Param]
-    clobbers*: set[Register]
-
   Symbol* = ref object
     name*: string
     kind*: SymKind
-    typ*: Type
+    typ*: Type        # For procs, this is ProcT; for vars/params, the data type (StackOffT if on stack)
     # Storage
     reg*: TagEnum     # For var/param in register (e.g. RaxTagId)
-    onStack*: bool    # True if (s)
     offset*: int      # Stack offset, label position, or field offset
     size*: int        # For stack slots
-
-    # Proc specific
-    sig*: Signature
 
     # Control flow variable tracking
     used*: bool       # For cfvar: has it been used in an ite?
 
-    # Foreign module tracking
+    # Module system
     isForeign*: bool  # True if this symbol comes from a foreign module
+    # name field stores the full qualified name (foo.0.moduleSuffix)
+    # Use symBasename() to get the lookup key
+    isReachable*: bool # True if symbol is reachable from an entry point
+    isEntryPoint*: bool # True if this is an entry point (exported)
+    moduleName*: string # Module this symbol belongs to (for finding its TokenBuf)
+    declStart*: int # Position in module's TokenBuf where declaration starts
 
     # External proc info (for skExtProc)
     libName*: string  # Library name (e.g. "libSystem.B.dylib")
@@ -76,17 +78,33 @@ proc newScope*(parent: Scope = nil): Scope =
   Scope(parent: parent, syms: initTable[string, Symbol]())
 
 proc lookup*(s: Scope; name: string): Symbol =
+  # Use basename for lookup (strips module suffix if present)
+  var key = name
+  extractBasename(key)
   var curr = s
   while curr != nil:
-    if name in curr.syms: return curr.syms[name]
+    if key in curr.syms: return curr.syms[key]
     curr = curr.parent
   return nil
 
+proc symBasename*(sym: Symbol): string =
+  ## Get the basename for scope lookup from a symbol's full name
+  result = sym.name
+  extractBasename(result)
+
 proc define*(s: Scope; sym: Symbol) =
-  s.syms[sym.name] = sym
+  # Use basename as the lookup key (strips module suffix if present)
+  s.syms[symBasename(sym)] = sym
 
 proc undefine*(s: Scope; name: string) =
-  s.syms.del(name)
+  # Use basename for undefine (strips module suffix if present)
+  var key = name
+  extractBasename(key)
+  s.syms.del(key)
+
+proc isOnStack*(t: Type): bool {.inline.} =
+  ## Returns true if this type represents a stack location
+  t != nil and t.kind == StackOffT
 
 proc asmAlignOf*(t: Type): int =
   ## Returns the alignment requirement of a type in bytes
@@ -102,6 +120,7 @@ proc asmAlignOf*(t: Type): int =
   of ObjectT, UnionT: t.align
   of RegisterT: t.regBits div 8
   of StackOffT: asmAlignOf(t.offType)
+  of ProcT: 8 # Function pointers are 8 bytes on x86-64
 
 proc alignTo*(offset, alignment: int): int =
   ## Align offset up to the next multiple of alignment
@@ -117,6 +136,7 @@ proc asmSizeOf*(t: Type): int =
   of ObjectT, UnionT: t.size
   of RegisterT: t.regBits div 8
   of StackOffT: asmSizeOf(t.offType)
+  of ProcT: 8 # Function pointers are 8 bytes on x86-64
 
 proc `$`*(t: Type): string =
   case t.kind
@@ -134,6 +154,7 @@ proc `$`*(t: Type): string =
   of UnionT: "union" # Simplified
   of RegisterT: "(reg " & $t.regBits & ")"
   of StackOffT: "(stackoff " & $t.offType & ")"
+  of ProcT: "(proc " & $t.params.len & " params)"
 
 proc compatible*(want, got: Type): bool =
   if want == got: return true
@@ -166,3 +187,13 @@ proc compatible*(want, got: Type): bool =
   of StackOffT:
     # StackOffT is compatible if the underlying types are compatible
     result = got.kind == StackOffT and compatible(want.offType, got.offType)
+  of ProcT:
+    # ProcT compatibility: same number of params/results and compatible types
+    if got.kind != ProcT: return false
+    if want.params.len != got.params.len: return false
+    if want.results.len != got.results.len: return false
+    for i in 0..<want.params.len:
+      if not compatible(want.params[i].typ, got.params[i].typ): return false
+    for i in 0..<want.results.len:
+      if not compatible(want.results[i].typ, got.results[i].typ): return false
+    result = true
