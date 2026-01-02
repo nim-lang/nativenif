@@ -47,6 +47,7 @@ exec "nim c -r src/nifasm/nifasm tests/pointer_field_at.nif"
 exec "nim c -r src/nifasm/nifasm tests/pointer_roundtrip.nif"
 exec "nim c -r src/nifasm/nifasm tests/string_pointer_field.nif"
 exec "nim c -r src/nifasm/nifasm tests/message_inline_array.nif"
+exec "nim c -r src/nifasm/nifasm tests/rep_movs_copy.nif"
 exec "nim c -r src/nifasm/nifasm tests/call_hello_chain.nif"
 exec "nim c -r src/nifasm/nifasm tests/call_multi_result.nif"
 exec "nim c -r src/nifasm/nifasm tests/call_result_binding.nif"
@@ -63,6 +64,7 @@ when defined(linux):
   exec "tests/pointer_roundtrip"
   execExpectOutput("./tests/string_pointer_field", "Hello\n")
   execExpectOutput("./tests/message_inline_array", "Ping\n")
+  execExpectOutput("./tests/rep_movs_copy", "Rep!\n")
   execExpectOutput("./tests/call_hello_chain", "Hello through calls\n")
   exec "./tests/call_multi_result"
 

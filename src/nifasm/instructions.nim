@@ -299,6 +299,10 @@ type
     NcTagId
     PfTagId
     NpTagId
+    RepmovsbTagId
+    RepmovswTagId
+    RepmovsdTagId
+    RepmovsqTagId
 const
   TagData*: array[TagEnum, (string, int)] = [
     ("InvalidTagId", 0),
@@ -597,5 +601,9 @@ const
     ("cf", 293),
     ("nc", 294),
     ("pf", 295),
-    ("np", 296)
+    ("np", 296),
+    ("repmovsb", 297),
+    ("repmovsw", 298),
+    ("repmovsd", 299),
+    ("repmovsq", 300)
   ]

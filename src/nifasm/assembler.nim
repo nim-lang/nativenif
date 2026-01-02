@@ -3497,6 +3497,22 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     x86.emitNop(ctx.buf.data)
     skipParRi n, "nop"
+  of RepmovsbX64:
+    inc n
+    x86.emitRepMovsb(ctx.buf.data)
+    skipParRi n, "repmovsb"
+  of RepmovswX64:
+    inc n
+    x86.emitRepMovsw(ctx.buf.data)
+    skipParRi n, "repmovsw"
+  of RepmovsdX64:
+    inc n
+    x86.emitRepMovsd(ctx.buf.data)
+    skipParRi n, "repmovsd"
+  of RepmovsqX64:
+    inc n
+    x86.emitRepMovsq(ctx.buf.data)
+    skipParRi n, "repmovsq"
   of RetX64:
     inc n
     x86.emitRet(ctx.buf.data)
