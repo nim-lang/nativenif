@@ -1,0 +1,18 @@
+(.nif24)
+(stmts
+  (type :Outer.0.mod_a (object
+    (fld :inner.0 Inner.0.mod_b)
+  ))
+
+  (proc :selectany.0.mod_a
+    (params)
+    (result
+      (:ret.0 (rax) (i +64))
+    )
+    (clobber)
+    (stmts
+      (mov (rax) +0)
+      (ret)
+    )
+  )
+)

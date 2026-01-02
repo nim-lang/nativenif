@@ -1,0 +1,18 @@
+(.nif24)
+(stmts
+  (type :TypeB.0.mod_select_b (object
+    (fld :value.0 (i +64))
+  ))
+
+  (proc :choose.0.mod_select_b
+    (params)
+    (result
+      (:ret.0 (rax) (i +64))
+    )
+    (clobber)
+    (stmts
+      (mov (rax) +0)
+      (ret)
+    )
+  )
+)

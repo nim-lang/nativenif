@@ -50,6 +50,9 @@ exec "nim c -r src/nifasm/nifasm tests/message_inline_array.nif"
 exec "nim c -r src/nifasm/nifasm tests/call_hello_chain.nif"
 exec "nim c -r src/nifasm/nifasm tests/call_multi_result.nif"
 exec "nim c -r src/nifasm/nifasm tests/call_result_binding.nif"
+exec "nim c -r src/nifasm/nifasm tests/module_chain.nif"
+exec "nim c -r src/nifasm/nifasm tests/module_chain_three.nif"
+exec "nim c -r src/nifasm/nifasm tests/module_selectany.nif"
 
 when defined(linux):
   # binaries have been built for linux only:
@@ -76,3 +79,6 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/stack_result_binding.nif", "
 execExpectFailure("nim c -r src/nifasm/nifasm tests/result_type_mismatch.nif", "Type mismatch:")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/call_missing_argument.nif", "Missing argument: arg.1")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/call_duplicate_result_binding.nif", "Result already bound: ret.0")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/module_missing.nif", "Foreign module file not found: no_such_mod")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/module_missing_symbol.nif", "Unknown type: Missing.0.mod_missing_symbol")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/module_gvar_access.nif", "Cannot access foreign global variable 'shared.0.mod_gvar'")
