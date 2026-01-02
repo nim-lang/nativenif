@@ -1,0 +1,23 @@
+(stmts
+  (proc :main.0
+    (params)
+    (ret :ret.0 (rax) (i +64))
+    (body
+      # Test nested generic instance deduplication
+      # key1.key2 should be the dedup key
+      (prepare foo.0.key1.key2.moduleX
+        (mov (arg arg.0) +100)
+        (call)
+        (mov (rbx) (res ret.0))
+      )
+      (prepare foo.0.key1.key2.moduleY
+        (mov (arg arg.0) +200)
+        (call)
+        (mov (rcx) (res ret.0))
+      )
+      (mov (rax) +0)
+      (ret)
+    )
+  )
+)
+

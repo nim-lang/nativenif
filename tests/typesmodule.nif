@@ -1,0 +1,7 @@
+(stmts
+  (type :Point.0.typesmodule (object
+    (fld :x (i +64))
+    (fld :y (i +64))
+  ))
+)
+

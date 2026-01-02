@@ -1,0 +1,22 @@
+(stmts
+  (proc :max.0.int64.moduleA
+    (params
+      (param :a.0 (rdi) (i +64))
+      (param :b.0 (rsi) (i +64))
+    )
+    (ret :ret.0 (rax) (i +64))
+    (body
+      (cmp (rdi) (rsi))
+      (ite (jg)
+        (stmts
+          (mov (rax) (rdi))
+        )
+        (stmts
+          (mov (rax) (rsi))
+        )
+      )
+      (ret)
+    )
+  )
+)
+
