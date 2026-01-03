@@ -1,0 +1,16 @@
+(stmts
+  (proc :main.0
+    (params)
+    (ret :ret.0 (rax) (i +64))
+    (body
+      # Call a function from a foreign module
+      (prepare foo.0.othermodule
+        (mov (arg arg.0) +42)
+        (call)
+        (mov (rax) (res ret.0))
+      )
+      (ret)
+    )
+  )
+)
+

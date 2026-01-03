@@ -205,18 +205,13 @@ proc inCall(ctx: GenContext): bool {.inline.} =
   ctx.callContext.state != CallContextState.Disabled
 
 proc markSymbolUsed(ctx: var GenContext; fullName: string) =
-  ## Mark a symbol as used, adding it to pending list if not yet generated
-  ## Only adds foreign symbols (those with module suffix) to pending list.
-  ## Main module symbols are handled by pass2.
+  ## Mark a symbol as used, adding it to pending list if not yet generated.
+  ## Both main module and foreign module symbols are subject to dead code elimination.
+  ## Only symbols that are actually referenced (via lookupWithAutoImport) are marked as used.
   ## Handles deduplication: if symbol has a dedup key and we've seen that key before,
   ## the symbol is merged with the canonical one
   if fullName in ctx.generatedSymbols:
     return
-
-  # Only process foreign symbols (those with a module suffix)
-  let modName = extractModule(fullName)
-  if modName == "":
-    return  # Main module symbol, handled by pass2
 
   let dedupKey = extractDedupKey(fullName)
   if dedupKey != "":
@@ -228,7 +223,7 @@ proc markSymbolUsed(ctx: var GenContext; fullName: string) =
       # First occurrence of this key, register as canonical
       ctx.dedupTable[dedupKey] = fullName
 
-  # Add to pending if not already there
+  # Add to pending if not already there (for both main module and foreign symbols)
   if fullName notin ctx.generatedSymbols:
     ctx.pendingSymbols.add fullName
 
@@ -347,6 +342,7 @@ proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cu
     while n.kind != ParRi:
       if n.kind == ParLe:
         let start = n
+        let declStart = cursorToPosition(ctx.modules[modname].buf, start)
         let declTag = tagToNifasmDecl(n.tag)
         case declTag
         of TypeD:
@@ -361,16 +357,19 @@ proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cu
           inc n
           if n.kind == ParLe and n.tag == ObjectTagId:
             let typ = parseObjectBody(n, scope, ctx)
-            let sym = Symbol(name: basename, kind: skType, typ: typ, isForeign: true)
+            let sym = Symbol(name: basename, kind: skType, typ: typ, isForeign: true,
+                            moduleName: modname, declStart: declStart)
             scope.define(sym)
           elif n.kind == ParLe and n.tag == UnionTagId:
             let typ = parseUnionBody(n, scope, ctx)
-            let sym = Symbol(name: basename, kind: skType, typ: typ, isForeign: true)
+            let sym = Symbol(name: basename, kind: skType, typ: typ, isForeign: true,
+                            moduleName: modname, declStart: declStart)
             scope.define(sym)
           else:
             # Handles proc types and other types via parseType
             let typ = parseType(n, scope, ctx)
-            let sym = Symbol(name: basename, kind: skType, typ: typ, isForeign: true)
+            let sym = Symbol(name: basename, kind: skType, typ: typ, isForeign: true,
+                            moduleName: modname, declStart: declStart)
             scope.define(sym)
           if n.kind != ParRi: skip n
           inc n
@@ -405,7 +404,8 @@ proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cu
             if clobberDecl == ClobberD:
               procTyp.clobbers = parseClobbers(n)
 
-          let sym = Symbol(name: basename, kind: skProc, typ: procTyp, isForeign: true)
+          let sym = Symbol(name: basename, kind: skProc, typ: procTyp, offset: -1,
+                          isForeign: true, moduleName: modname, declStart: declStart)
           scope.define(sym)
 
           # Skip body
@@ -421,7 +421,8 @@ proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cu
           extractBasename(basename)
           inc n
           let typ = parseType(n, scope, ctx)
-          let sym = Symbol(name: basename, kind: skGvar, typ: typ, isForeign: true)
+          let sym = Symbol(name: basename, kind: skGvar, typ: typ, isForeign: true,
+                          moduleName: modname, declStart: declStart)
           scope.define(sym)
           n = start
           skip n
@@ -435,7 +436,8 @@ proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cu
           extractBasename(basename)
           inc n
           let typ = parseType(n, scope, ctx)
-          let sym = Symbol(name: basename, kind: skTvar, typ: typ, isForeign: true)
+          let sym = Symbol(name: basename, kind: skTvar, typ: typ, isForeign: true,
+                          moduleName: modname, declStart: declStart)
           scope.define(sym)
           n = start
           skip n
@@ -450,17 +452,21 @@ proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cu
 proc lookupWithAutoImport(ctx: var GenContext; scope: Scope; name: string; n: Cursor): Symbol =
   ## Lookup a symbol, automatically loading foreign modules if needed.
   ## Also marks the symbol as used for dependency tracking.
-  result = scope.lookup(name)
-  if result == nil:
-    # Check if this is a foreign symbol (has module suffix)
-    let modname = extractModule(name)
-    if modname != "":
-      # Load the foreign module
-      loadForeignModule(ctx, modname, scope, n)
-      # Try lookup again (with basename)
-      var basename = name
-      extractBasename(basename)
-      result = scope.lookup(basename)
+  ##
+  ## Important: Symbols with module suffixes (e.g., `foo.0.mymodule`) are distinct
+  ## from local symbols (e.g., `foo.0`). When a module suffix is present, we only
+  ## look in the foreign module, not in the local scope.
+  let modname = extractModule(name)
+  if modname != "":
+    # This is a foreign symbol - load the foreign module and look up there
+    loadForeignModule(ctx, modname, scope, n)
+    # Look up by basename (module suffix already stripped by extractModule)
+    var basename = name
+    extractBasename(basename)
+    result = scope.lookup(basename)
+  else:
+    # This is a local symbol - look up in current scope
+    result = scope.lookup(name)
 
   # Mark symbol as used for dependency tracking
   if result != nil:
@@ -3916,6 +3922,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
 
 
 proc pass2(n: Cursor; ctx: var GenContext) =
+  ## Pass2: Generate code only for top-level instructions (entry point).
+  ## Declarations (procs, rodata, gvars, etc.) are NOT generated here,
+  ## EXCEPT for entry point procs (named `_start`).
+  ## Other declarations are only generated when referenced via lookupWithAutoImport,
+  ## which marks them as used and adds them to the pending list.
+  ## This enables dead code elimination for the main module.
   var n = n
   if n.kind == ParLe and n.tag == StmtsTagId:
     inc n
@@ -3929,7 +3941,7 @@ proc pass2(n: Cursor; ctx: var GenContext) =
           n = start
           skip n
         of ProcD:
-          # Skip foreign procs - they're not code-generated
+          # Check if this is an entry point proc (_start or main.0)
           inc n
           if n.kind != SymbolDef:
             error("Expected symbol definition", n)
@@ -3939,85 +3951,27 @@ proc pass2(n: Cursor; ctx: var GenContext) =
             # Skip foreign proc body
             n = start
             skip n
-          else:
+          elif name == "_start" or name == "main.0":
+            # Entry point proc - generate it immediately
             n = start
             pass2Proc(n, ctx)
-        of RodataD:
-          inc n
-          if n.kind != SymbolDef: error("Expected symbol definition", n)
-          let name = pool.syms[n.symId]
-          let sym = ctx.scope.lookup(name)
-          inc n
-          let s = getStr(n)
-          # Define label at the current position (where rodata will be written)
-          if sym.offset == -1:
-            # Forward reference - create label now
-            let labId = ctx.buf.createLabel()
-            sym.offset = int(labId)
-          # Define label at current position (before writing rodata)
-          ctx.buf.defineLabel(LabelId(sym.offset))
-          # Now write the rodata string
-          for c in s: ctx.buf.data.add byte(c)
-          inc n
-          inc n
-        of GvarD:
-          # Global variable declaration - goes in .bss section (zero-initialized writable memory)
-          inc n
-          if n.kind != SymbolDef: error("Expected symbol definition", n)
-          let name = pool.syms[n.symId]
-          let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
-          if sym == nil: error("Global variable not found in scope: " & name, n)
-          if sym.isForeign:
-            error("Cannot define foreign global variable '" & name & "'", n)
-          inc n
-          # Skip type (already parsed in pass1)
+          else:
+            # Regular proc - skip, will be generated if referenced
+            n = start
+            skip n
+        of RodataD, GvarD, TvarD:
+          # Declarations are NOT generated here - they are subject to dead code elimination.
+          # They will only be generated when referenced via lookupWithAutoImport.
+          # Skip the declaration body.
+          n = start
           skip n
-
-          # Allocate space in .bss section
-          let size = slots.alignedSize(sym.typ)
-          # Align bssOffset to the type's alignment
-          let align = asmSizeOf(sym.typ)
-          if align > 1:
-            ctx.bssOffset = (ctx.bssOffset + align - 1) and not (align - 1)
-
-          # Create a label for the global variable address
-          let labId = ctx.bssBuf.createLabel()
-          sym.offset = int(labId)
-          ctx.bssBuf.defineLabel(labId)
-
-          # Store the actual offset for later use in relocations
-          # The offset will be used when generating code that references this variable
-          # For now, we just track it in sym.offset as the label ID
-          # The actual memory offset is ctx.bssOffset
-          ctx.bssOffset += size
-
-          inc n # )
-        of TvarD:
-          # Thread local variable declaration
-          inc n
-          if n.kind != SymbolDef: error("Expected symbol definition", n)
-          let name = pool.syms[n.symId]
-          let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
-          if sym == nil: error("TLS variable not found in scope: " & name, n)
-          if sym.isForeign:
-            error("Cannot define foreign TLS variable '" & name & "'", n)
-          inc n
-          # Skip type (already parsed in pass1)
-          skip n
-
-          # Allocate TLS offset for this variable
-          # TLS offsets start from 0 and grow upward
-          let size = slots.alignedSize(sym.typ)
-          sym.offset = ctx.tlsOffset
-          ctx.tlsOffset += size
-
-          inc n # )
         of ArchD:
           handleArch(n, ctx)
         of ImpD, ExtprocD:
           # Already handled in pass1, skip
           skip n
         else:
+          # Top-level instructions (entry point) - generate these
           genInst(n, ctx)
       else:
         error("Expected instruction", n)
@@ -4258,12 +4212,13 @@ proc assemble*(filename, outfile: string) =
   ctx.buf = initBuffer()
   ctx.bssBuf = initBuffer()
 
-  # Generate code for main module (marks symbols as used via lookupWithAutoImport)
+  # Generate code for entry point (top-level instructions only)
+  # This marks symbols as used via lookupWithAutoImport when they are referenced
   var n = beginRead(ctx.modules[MainModuleName].buf)
   pass2(n, ctx)
 
-  # Process any pending symbols from foreign modules (dead code elimination)
-  # This generates code only for symbols that were actually referenced
+  # Process all pending symbols (both main module and foreign modules)
+  # This generates code only for symbols that were actually referenced (dead code elimination)
   processReachableSymbols(ctx)
 
   case ctx.arch

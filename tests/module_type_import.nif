@@ -1,0 +1,14 @@
+(stmts
+  (proc :main.0
+    (params)
+    (ret :ret.0 (rax) (i +64))
+    (body
+      # Use a type from a foreign module
+      (var :p (rdi) (ptr :Point.0.typesmodule))
+      (mov (rdi) +0)
+      (mov (rax) (mem (dot p :x)))
+      (ret)
+    )
+  )
+)
+

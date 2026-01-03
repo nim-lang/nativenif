@@ -687,3 +687,252 @@ On RISC-V, `t0` and `t1` serve a similar conventional role for linker stubs, mak
 
 The reserved registers are used transparently by the assembler when needed. User code does not need to account for large offsets - the assembler handles this automatically while preserving type checking.
 
+
+## Module System
+
+nifasm's module system is based on NIF's symbol syntactic structure, which uses module suffixes to identify symbols from different modules. This enables separate compilation, dead code elimination, and generic instance deduplication.
+
+### NIF Symbol Structure
+
+NIF symbols follow a structured naming convention that encodes module information:
+
+```
+<basename>.<id>.<dedup-key>.<module-suffix>
+```
+
+Where:
+- `<basename>` is the symbol's base name (e.g., `foo`, `bar`)
+- `<id>` is a unique identifier (typically `0` for the first occurrence)
+- `<dedup-key>` is an optional generic instance key (for deduplication)
+- `<module-suffix>` is the module name (empty for main module)
+
+**Examples:**
+- `foo.0` - Local symbol in the current module (no module suffix)
+- `bar.0.mymodule` - Symbol `bar.0` from module `mymodule`
+- `baz.0.key1.mymodule` - Generic instance with dedup key `baz.0.key1` from `mymodule`. Note how the dedup key is everything before the module suffix, not just the `key1` part!
+
+### Module Suffix Rules
+
+1. **Current Module**: Symbols without a module suffix belong to the **current module** being parsed. When parsing the main module file, symbols without suffixes belong to the main module. When parsing a foreign module file, symbols without suffixes belong to that foreign module.
+
+2. **Foreign Modules**: Foreign modules are introduced by using a symbol from them. These symbols have a different module suffix. The module suffix is everything after the last dot in a symbol name (if there are at least 2 dots). When a symbol has a module suffix, it explicitly identifies which module it belongs to, regardless of which file it's defined in.
+
+3. **Symbol Lookup**: Symbols with module suffixes and symbols without module suffixes are **different symbols**, not aliases:
+   - `foo.0` is a **local symbol** in the current module
+   - `foo.0.mymodule` is a **global symbol** from module `mymodule`
+   - These are distinct symbols - `foo.0` in module A is different from `foo.0` in module B, and both are different from `foo.0.mymodule`
+   - When looking up a symbol with a module suffix (e.g., `foo.0.mymodule`), nifasm:
+     1. Extracts the module name from the suffix
+     2. Loads that foreign module if needed
+     3. Looks up the basename (`foo.0`) in that module's scope
+   - Foreign symbols are stored in the scope using their basename (without module suffix) for lookup purposes
+
+### Foreign Module Loading
+
+Foreign modules are loaded **on-demand** when their symbols are first referenced:
+
+1. When a symbol lookup fails in the current scope, nifasm checks if the symbol name contains a module suffix
+2. If a module suffix is detected, nifasm attempts to load the foreign module:
+   - First tries `<module-name>.s.nif` (semchecked/semantic-checked version)
+   - Falls back to `<module-name>.nif` (plain version)
+   - Searches in the same directory as the main module file
+3. The foreign module's declarations (types, procs, globals) are parsed and added to the current scope
+4. Only the **signatures** are loaded initially - function bodies are parsed but not generated until needed
+
+**Example:**
+
+```nifasm
+# main.nif
+(stmts
+  (type :Point (object (fld :x (i +64)) (fld :y (i +64))))
+  (proc :main.0
+    (params)
+    (ret :ret.0 (rax) (i +64))
+    (body
+      (prepare foo.0.othermodule
+        (call)
+        (mov (rax) (res ret.0))
+      )
+    )
+  )
+)
+```
+
+```nifasm
+# othermodule.nif
+(stmts
+  (proc :foo.0.othermodule
+    (params)
+    (ret :ret.0 (rax) (i +64))
+    (body
+      (mov (rax) +42)
+      (ret)
+    )
+  )
+)
+```
+
+When `main.nif` references `foo.0.othermodule`, nifasm automatically loads `othermodule.nif`.
+
+### Dead Code Elimination
+
+The module system enables dead code elimination for both main module and foreign modules:
+
+1. **Entry Point**: The entry point can be either:
+   - Top-level instructions (not declarations) in the main module - these are generated immediately
+   - A proc named `_start` or `main.0` - these procs are generated immediately as the entry point
+   - If both exist, top-level instructions take precedence
+
+2. **Symbol Marking**: When symbols are referenced via `lookupWithAutoImport` (during code generation), they are marked as used and added to a pending list for code generation.
+
+3. **On-Demand Generation**: Both main module and foreign module symbols are subject to dead code elimination:
+   - Main module procs (except `_start`), rodata, gvars, etc. are only generated if they are referenced from the entry point or other reachable code
+   - Foreign module symbols are only generated if they are referenced
+
+4. **Lazy Code Generation**: After the entry point is processed, nifasm generates code for all pending symbols (both main module and foreign) that were actually referenced, following the dependency chain.
+
+This means unused functions, types, and globals from both the main module and foreign modules are never generated, reducing binary size.
+
+### Module File Resolution
+
+When loading a foreign module, nifasm searches for module files in the following order:
+
+1. `<base-dir>/<module-name>.s.nif` - Semchecked version (preferred)
+2. `<base-dir>/<module-name>.nif` - Plain version (fallback)
+
+Where `<base-dir>` is the directory containing the main module file being assembled.
+
+If neither file is found, nifasm reports an error: `"Foreign module file not found: <module-name>"`.
+
+
+## Generic Instance Deduplication
+
+nifasm automatically deduplicates generic instances across modules to avoid generating duplicate code for the same generic instantiation. This is based on extracting a deduplication key from the symbol's structure.
+
+### Deduplication Key Extraction
+
+A deduplication key is extracted from symbols with **more than 2 dots** in their name:
+
+- `foo.0` (1 dot) → No dedup key (local symbol)
+- `foo.0.mymodule` (2 dots) → No dedup key (module suffix only)
+- `foo.0.key1.mymodule` (3 dots) → Dedup key: `foo.0.key1`
+- `foo.0.key1.key2.othermodule` (4 dots) → Dedup key: `foo.0.key1.key2`
+
+The deduplication key is **everything before the last dot** (which is the module suffix).
+
+### Deduplication Process
+
+1. **First Occurrence**: When a symbol with a dedup key is first encountered:
+   - The dedup key is registered in the deduplication table
+   - The symbol's full name becomes the **canonical** name for that key
+   - The symbol is added to the pending list for code generation
+
+2. **Subsequent Occurrences**: When another symbol with the same dedup key is encountered:
+   - The deduplication table is checked
+   - If the key exists, the new symbol is **merged** with the canonical one
+   - The new symbol is **not** added to the pending list
+   - All references to the new symbol resolve to the canonical symbol
+
+3. **Code Generation**: Only the canonical symbol is generated, even if multiple modules reference the same generic instance.
+
+### Example: Generic Function Deduplication
+
+Consider a generic `max` function that is instantiated for `int64` in multiple modules:
+
+**Module A (`moduleA.nif`):**
+```nifasm
+(stmts
+  (proc :max.0.int64.moduleA
+    (params
+      (param :a.0 (rdi) (i +64))
+      (param :b.0 (rsi) (i +64))
+    )
+    (ret :ret.0 (rax) (i +64))
+    (body
+      (cmp (rdi) (rsi))
+      (ite (jg)
+        (stmts (mov (rax) (rdi)))
+        (stmts (mov (rax) (rsi)))
+      )
+      (ret)
+    )
+  )
+)
+```
+
+**Module B (`moduleB.nif`):**
+```nifasm
+(stmts
+  (proc :max.0.int64.moduleB
+    (params
+      (param :a.0 (rdi) (i +64))
+      (param :b.0 (rsi) (i +64))
+    )
+    (ret :ret.0 (rax) (i +64))
+    (body
+      (cmp (rdi) (rsi))
+      (ite (jg)
+        (stmts (mov (rax) (rdi)))
+        (stmts (mov (rax) (rsi)))
+      )
+      (ret)
+    )
+  )
+)
+```
+
+**Main Module (`main.nif`):**
+```nifasm
+(stmts
+  (proc :main.0
+    (params)
+    (ret :ret.0 (rax) (i +64))
+    (body
+      (prepare max.0.int64.moduleA
+        (mov (arg a.0) +10)
+        (mov (arg b.0) +20)
+        (call)
+        (mov (rbx) (res ret.0))
+      )
+      (prepare max.0.int64.moduleB
+        (mov (arg a.0) +30)
+        (mov (arg b.0) +40)
+        (call)
+        (mov (rcx) (res ret.0))
+      )
+      (mov (rax) +0)
+      (ret)
+    )
+  )
+)
+```
+
+**Deduplication Behavior:**
+
+1. When `max.0.int64.moduleA` is first referenced:
+   - Dedup key `max.0.int64` is extracted
+   - `max.0.int64.moduleA` becomes the canonical name
+   - Symbol is added to pending list
+
+2. When `max.0.int64.moduleB` is referenced:
+   - Same dedup key `max.0.int64` is extracted
+   - Key already exists in dedup table
+   - `max.0.int64.moduleB` is merged with `max.0.int64.moduleA`
+   - **Only one instance** of the function is generated (the canonical one)
+
+3. Both call sites resolve to the same generated function, avoiding code duplication.
+
+### Benefits
+
+1. **Code Size Reduction**: Generic instances are generated only once, even when used from multiple modules
+2. **Consistency**: All modules using the same generic instance get the same code
+3. **Automatic**: No manual intervention required - deduplication happens transparently
+4. **Link-Time Optimization**: Works across module boundaries without requiring whole-program analysis
+
+### Limitations
+
+- Deduplication only works for symbols with more than 2 dots (generic instances)
+- Local symbols (1 dot) and simple foreign symbols (2 dots) are not deduplicated
+- The canonical symbol is determined by the **first occurrence** encountered during assembly
+- Modules must be available at assembly time (not link time) for deduplication to work
+
