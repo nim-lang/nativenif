@@ -1,6 +1,6 @@
 
 import std / [tables]
-import instructions, x86
+import tags, x86
 import "../../../nimony/src/lib" / [symparser]
 
 type
