@@ -87,7 +87,7 @@
 | `(was STR)` | NjPragma | |
 | `(align X)` | NjPragma | |
 | `(bits X)`| NjPragma | |
-| `(it e X S S S?)` | NjStmt | if-then-else followed by optional `join` information |
+| `(ite X S S S?)` | NjStmt | if-then-else followed by optional `join` information |
 | `(itec X S S S?)` | NjStmt | if-then-else (that was a `case`) |
 | `(loop S X S S)` | NjStmt | `loop` components are (before-cond, cond, loop-body, after) |
 | `(v X INT_LIT)` | NjExpr | `versioned` locations |
