@@ -296,3 +296,7 @@
 | `(nc)`               | X64Flag                 | not carry flag |
 | `(pf)`               | X64Flag                 | parity flag |
 | `(np)`               | X64Flag                 | not parity flag |
+| `(repmovsb)`         | X64Inst                 | repeat move byte string |
+| `(repmovsw)`         | X64Inst                 | repeat move word string |
+| `(repmovsd)`         | X64Inst                 | repeat move doubleword string |
+| `(repmovsq)`         | X64Inst                 | repeat move quadword string |

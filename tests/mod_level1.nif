@@ -1,0 +1,6 @@
+(.nif24)
+(stmts
+  (type :Level1.0.mod_level1 (object
+    (fld :next.0 Level2.0.mod_level2)
+  ))
+)

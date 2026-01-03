@@ -1,0 +1,6 @@
+(.nif24)
+(stmts
+  (type :Level3.0.mod_level3 (object
+    (fld :value.0 (i +64))
+  ))
+)

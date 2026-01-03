@@ -1,0 +1,38 @@
+(.nif24)
+(stmts
+  (proc :main.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      (var :src.0 (s) (array (i +8) +5))
+      (var :dst.0 (s) (array (i +8) +5))
+
+      (mov (rbx) +82)
+      (mov (mem (at (rsp) src.0 +0)) (cast (i +8) (rbx)))
+      (mov (rbx) +101)
+      (mov (mem (at (rsp) src.0 +1)) (cast (i +8) (rbx)))
+      (mov (rbx) +112)
+      (mov (mem (at (rsp) src.0 +2)) (cast (i +8) (rbx)))
+      (mov (rbx) +33)
+      (mov (mem (at (rsp) src.0 +3)) (cast (i +8) (rbx)))
+      (mov (rbx) +10)
+      (mov (mem (at (rsp) src.0 +4)) (cast (i +8) (rbx)))
+
+      (lea (rsi) (rsp) src.0)
+      (lea (rdi) (rsp) dst.0)
+      (mov (rcx) +5)
+      (repmovsb)
+
+      (mov (rax) +1)
+      (mov (rdi) +1)
+      (lea (rsi) (rsp) dst.0)
+      (mov (rdx) +5)
+      (syscall)
+
+      (mov (rax) +60)
+      (mov (rdi) +0)
+      (syscall)
+    )
+  )
+)

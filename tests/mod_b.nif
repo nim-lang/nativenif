@@ -1,0 +1,6 @@
+(.nif24)
+(stmts
+  (type :Inner.0.mod_b (object
+    (fld :value.0 (i +64))
+  ))
+)
