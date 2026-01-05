@@ -1,6 +1,5 @@
 | Tag                    | Enums                       |   Description |
 |------------------------|-----------------------------|---------------|
-| `(suf LIT STR)`        | NjExpr                     | literal with suffix annotation |
 | `(at X X)`             | NjExpr | array indexing operation |
 | `(deref X)`            | NjExpr | pointer deref operation |
 | `(dot X Y)`            | NjExpr | object field selection |
