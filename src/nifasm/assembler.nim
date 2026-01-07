@@ -64,6 +64,12 @@ proc getSym(n: Cursor): string =
   else:
     error("Expected symbol", n)
 
+proc getSymDef(n: var Cursor): string =
+  if n.kind != SymbolDef:
+    error("Expected symbol definition", n)
+  result = pool.syms[n.symId]
+  inc n
+
 proc getStr(n: Cursor): string =
   if n.kind == StringLit:
     result = pool.strings[n.litId]
@@ -312,8 +318,7 @@ proc isRegTag(locTag: TagEnum): bool =
 proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cursor) =
   ## Load a foreign module and add its symbols to the scope
   if ctx.modules.hasKey(modname):
-    if ctx.modules[modname].loaded:
-      return  # Already loaded
+    discard
   else:
     # Try to find the module file
     # Look for modname.s.nif (semchecked) or modname.nif
@@ -350,11 +355,10 @@ proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cu
           if n.kind != SymbolDef:
             skip n
             continue
-          let name = getSym(n)
+          let name = getSymDef(n)
           # Extract basename (without module suffix) for lookup
           var basename = name
           extractBasename(basename)
-          inc n
           if n.kind == ParLe and n.tag == ObjectTagId:
             let typ = parseObjectBody(n, scope, ctx)
             let sym = Symbol(name: basename, kind: skType, typ: typ, isForeign: true,
@@ -379,10 +383,9 @@ proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cu
           if n.kind != SymbolDef:
             skip n
             continue
-          let name = getSym(n)
+          let name = getSymDef(n)
           var basename = name
           extractBasename(basename)
-          inc n
 
           var procTyp = Type(kind: ProcT, params: @[], results: @[], clobbers: {})
 
@@ -416,10 +419,9 @@ proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cu
           if n.kind != SymbolDef:
             skip n
             continue
-          let name = getSym(n)
+          let name = getSymDef(n)
           var basename = name
           extractBasename(basename)
-          inc n
           let typ = parseType(n, scope, ctx)
           let sym = Symbol(name: basename, kind: skGvar, typ: typ, isForeign: true,
                           moduleName: modname, declStart: declStart)
@@ -431,10 +433,9 @@ proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cu
           if n.kind != SymbolDef:
             skip n
             continue
-          let name = getSym(n)
+          let name = getSymDef(n)
           var basename = name
           extractBasename(basename)
-          inc n
           let typ = parseType(n, scope, ctx)
           let sym = Symbol(name: basename, kind: skTvar, typ: typ, isForeign: true,
                           moduleName: modname, declStart: declStart)
@@ -460,10 +461,8 @@ proc lookupWithAutoImport(ctx: var GenContext; scope: Scope; name: string; n: Cu
   if modname != "":
     # This is a foreign symbol - load the foreign module and look up there
     loadForeignModule(ctx, modname, scope, n)
-    # Look up by basename (module suffix already stripped by extractModule)
-    var basename = name
-    extractBasename(basename)
-    result = scope.lookup(basename)
+    # Look up by name (scope.lookup handles basenames and module suffixes)
+    result = scope.lookup(name)
   else:
     # This is a local symbol - look up in current scope
     result = scope.lookup(name)
