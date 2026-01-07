@@ -67,7 +67,7 @@ proc writeClassifier(f: File; e: EnumList; fields: seq[EnumField]) =
 proc writeModel(basename: string; data: EnumImpls; first, last: EnumList) =
   let f = open(basename, fmWrite)
   f.writeLine Header
-  f.writeLine "import instructions"
+  f.writeLine "import tags"
   for e in first..last:
     f.write "\ntype"
     f.write "\n  " & $e & "* = enum"
@@ -141,9 +141,9 @@ proc genTags(inp: File) =
       )
 
   createDir "src/nifasm"
-  writeTagsFile "src/nifasm/instructions.nim", tags
+  writeTagsFile "src/nifasm/tags.nim", tags
   # writeModel "src/nifasm/nifasm_model.nim", enumDecls, X64Inst, X64Flag
-  # For now I'll just rely on instructions.nim and manual casting or validation if needed,
+  # For now I'll just rely on tags.nim and manual casting or validation if needed,
   # or I can generate the model file if I decide to use it.
   # Let's generate the model file too, it's useful.
 
@@ -155,4 +155,3 @@ proc main =
   inp.close()
 
 main()
-
