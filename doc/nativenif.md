@@ -3,7 +3,7 @@
 `nativenif` is a toolchain to translate NIF code directly to machine code. No external tools are required, the system ships with an assembler and linker. Much complexity is avoided as the system is not based on ELF and DWARF but instead exploits NIF's many benefits.
 
 
-# `nnopt` - Native NIF Optimizer
+# `nativeopt` - Native NIF Optimizer
 
 The optimizer is based on NJVL. It consists of these passes (which are applied in this order):
 
@@ -13,9 +13,9 @@ The optimizer is based on NJVL. It consists of these passes (which are applied i
 4. Induction variable detection. This typically leads to the simplification of address computations.
 
 
-# `nngen` - Native NIF code generator
+# `nativegen` - Native NIF code generator
 
-The code generator's job is to translate the optimized NJVL to `nifasm` code. `nngen` is a pretty simple code generator but it has an advanced register allocation strategy that avoids the complexities of "spilling" and is generally aware of x86's benefits and quirks.
+The code generator's job is to translate the optimized NJVL to `nifasm` code. `nativegen` is a pretty simple code generator but it has an advanced register allocation strategy that avoids the complexities of "spilling" and is generally aware of x86's benefits and quirks.
 
 
 # `nifasm` - Native NIF assembler
