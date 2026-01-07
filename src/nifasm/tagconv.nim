@@ -44,4 +44,3 @@ proc tagToNifasmDecl*(t: TagEnum): NifasmDecl {.inline.} =
     cast[NifasmDecl](t)
   else:
     NoDecl
-

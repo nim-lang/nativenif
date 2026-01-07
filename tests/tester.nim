@@ -47,15 +47,21 @@ exec "nim c -r src/nifasm/nifasm tests/pointer_field_at.nif"
 exec "nim c -r src/nifasm/nifasm tests/pointer_roundtrip.nif"
 exec "nim c -r src/nifasm/nifasm tests/string_pointer_field.nif"
 exec "nim c -r src/nifasm/nifasm tests/message_inline_array.nif"
+exec "nim c -r src/nifasm/nifasm tests/rep_movs_copy.nif"
 exec "nim c -r src/nifasm/nifasm tests/call_hello_chain.nif"
 exec "nim c -r src/nifasm/nifasm tests/call_multi_result.nif"
 exec "nim c -r src/nifasm/nifasm tests/call_result_binding.nif"
+
 # Module system tests
+exec "nim c -r src/nifasm/nifasm tests/module_chain.nif"
+exec "nim c -r src/nifasm/nifasm tests/module_chain_three.nif"
+exec "nim c -r src/nifasm/nifasm tests/module_selectany.nif"
 exec "nim c -r src/nifasm/nifasm tests/module_foreign.nif"
 exec "nim c -r src/nifasm/nifasm tests/module_type_import.nif"
 exec "nim c -r src/nifasm/nifasm tests/module_dedup.nif"
 exec "nim c -r src/nifasm/nifasm tests/module_dedup_nested.nif"
 exec "nim c -r src/nifasm/nifasm tests/module_no_dedup.nif"
+
 
 when defined(linux):
   # binaries have been built for linux only:
@@ -69,6 +75,7 @@ when defined(linux):
   exec "tests/pointer_roundtrip"
   execExpectOutput("./tests/string_pointer_field", "Hello\n")
   execExpectOutput("./tests/message_inline_array", "Ping\n")
+  execExpectOutput("./tests/rep_movs_copy", "Rep!\n")
   execExpectOutput("./tests/call_hello_chain", "Hello through calls\n")
   exec "./tests/call_multi_result"
 
@@ -82,3 +89,6 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/stack_result_binding.nif", "
 execExpectFailure("nim c -r src/nifasm/nifasm tests/result_type_mismatch.nif", "Type mismatch:")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/call_missing_argument.nif", "Missing argument: arg.1")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/call_duplicate_result_binding.nif", "Result already bound: ret.0")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/module_missing.nif", "Foreign module file not found: no_such_mod")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/module_missing_symbol.nif", "Unknown type: Missing.0.mod_missing_symbol")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/module_gvar_access.nif", "Cannot access foreign global variable 'shared.0.mod_gvar'")

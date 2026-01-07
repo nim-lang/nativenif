@@ -1830,6 +1830,29 @@ proc emitNop*(dest: var Bytes) =
   ## Emit NOP instruction
   dest.add(0x90)
 
+# REP MOVS string copy instructions
+proc emitRepMovsb*(dest: var Bytes) =
+  ## Emit REP MOVSB instruction
+  dest.add(0xF3)
+  dest.add(0xA4)
+
+proc emitRepMovsw*(dest: var Bytes) =
+  ## Emit REP MOVSW instruction
+  dest.add(0xF3)
+  dest.add(0x66)
+  dest.add(0xA5)
+
+proc emitRepMovsd*(dest: var Bytes) =
+  ## Emit REP MOVSD instruction
+  dest.add(0xF3)
+  dest.add(0xA5)
+
+proc emitRepMovsq*(dest: var Bytes) =
+  ## Emit REP MOVSQ instruction
+  dest.add(0xF3)
+  dest.add(0x48)
+  dest.add(0xA5)
+
 
 proc emitLea*(dest: var Buffer; reg: Register; target: LabelId) =
   ## Emit LEA instruction: LEA reg, [RIP + target]
