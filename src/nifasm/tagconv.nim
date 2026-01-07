@@ -1,7 +1,7 @@
 ## Conversion functions from TagEnum to specific enum types
 ## These functions convert generic TagEnum values to architecture-specific enum types
 
-import instructions, model
+import tags, model
 
 proc tagToX64Inst*(t: TagEnum): X64Inst {.inline.} =
   ## Convert TagEnum to X64Inst. Returns NoX64Inst if not a valid X64Inst.
@@ -44,4 +44,3 @@ proc tagToNifasmDecl*(t: TagEnum): NifasmDecl {.inline.} =
     cast[NifasmDecl](t)
   else:
     NoDecl
-
