@@ -67,8 +67,9 @@ const
   EV_CURRENT = 1.byte
   ELFOSABI_SYSV = 0.byte # Or ELFOSABI_LINUX
 
-  ET_EXEC = 2.Elf64_Half
-  EM_X86_64 = 62.Elf64_Half
+  ET_EXEC* = 2.Elf64_Half
+  EM_X86_64* = 62.Elf64_Half
+  EM_AARCH64* = 183.Elf64_Half
 
   PT_LOAD = 1.Elf64_Word
   PF_X* = 1.Elf64_Word
@@ -85,7 +86,7 @@ const
   SHF_ALLOC = 2.Elf64_Xword
   SHF_EXECINSTR = 4.Elf64_Xword
 
-proc initHeader*(entry: uint64): Elf64_Ehdr =
+proc initHeader*(entry: uint64; machine: Elf64_Half): Elf64_Ehdr =
   result.e_ident[EI_MAG0] = ELFMAG0
   result.e_ident[EI_MAG1] = ELFMAG1
   result.e_ident[EI_MAG2] = ELFMAG2
@@ -97,7 +98,7 @@ proc initHeader*(entry: uint64): Elf64_Ehdr =
   result.e_ident[EI_ABIVERSION] = 0
 
   result.e_type = ET_EXEC
-  result.e_machine = EM_X86_64
+  result.e_machine = machine
   result.e_version = 1
   result.e_entry = entry
   result.e_phoff = 64 # Immediately after header
