@@ -1,0 +1,14 @@
+(stmts
+  (arch linux_arm64)
+  (mov (x8) +64)
+  (mov (x0) +1)
+  (adr (x1) msg.0)
+  (mov (x2) +12)
+  (svc +0)
+
+  (mov (x8) +93)
+  (mov (x0) +0)
+  (svc +0)
+
+  (rodata :msg.0 "Hello World\0A")
+)
