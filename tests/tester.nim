@@ -63,7 +63,7 @@ exec "nim c -r src/nifasm/nifasm tests/module_dedup_nested.nif"
 exec "nim c -r src/nifasm/nifasm tests/module_no_dedup.nif"
 
 
-when defined(linux):
+when defined(linux) and defined(amd64):
   # binaries have been built for linux only:
   exec "tests/hello"
   exec "tests/atomic_ops"

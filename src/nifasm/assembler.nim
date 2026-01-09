@@ -134,6 +134,7 @@ type
 
   Arch = enum
     X64        # Linux x86-64 (ELF)
+    LinuxA64   # Linux ARM64 (ELF)
     A64        # macOS ARM64 (Mach-O)
     WinX64     # Windows x86-64 (PE)
     WinA64     # Windows ARM64 (PE)
@@ -664,6 +665,8 @@ proc handleArch(n: var Cursor; ctx: var GenContext) =
   let arch = pool.strings[n.litId]
   if arch == "x64":
     ctx.arch = Arch.X64
+  elif arch == "linux_arm64":
+    ctx.arch = Arch.LinuxA64
   elif arch == "arm64":
     ctx.arch = Arch.A64
   elif arch == "win_x64":
@@ -1747,7 +1750,7 @@ proc genInst(n: var Cursor; ctx: var GenContext) =
   case ctx.arch
   of Arch.X64, Arch.WinX64:
     genInstX64(n, ctx)
-  of Arch.A64, Arch.WinA64:
+  of Arch.A64, Arch.WinA64, Arch.LinuxA64:
     genInstA64(n, ctx)
 
 proc collectLabels(n: var Cursor; ctx: var GenContext; scope: Scope) =
@@ -4002,7 +4005,13 @@ proc writeElf(a: var GenContext; outfile: string) =
   let bssSize = a.bssOffset.uint64
   let bssAlignedSize = if bssSize > 0: ((bssSize + pageSize - 1) and not (pageSize - 1)) else: 0.uint64
 
-  var ehdr = initHeader(entryAddr)
+  let machine = case a.arch
+    of Arch.X64, Arch.LinuxA64:
+      if a.arch == Arch.X64: EM_X86_64 else: EM_AARCH64
+    else:
+      EM_X86_64  # fallback
+
+  var ehdr = initHeader(entryAddr, machine)
   ehdr.e_phnum = 2  # Two program headers: .text and .bss
   ehdr.e_phoff = 64  # Program headers start after ELF header
 
@@ -4049,7 +4058,7 @@ proc writeMachO(a: var GenContext; outfile: string) =
   let (cputype, cpusubtype) = case a.arch
     of Arch.X64:
       (CPU_TYPE_X86_64, CPU_SUBTYPE_X86_64_ALL)
-    of Arch.A64:
+    of Arch.A64, Arch.LinuxA64:
       (CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL)
     of Arch.WinX64, Arch.WinA64:
       # Should not be called for Windows, but need to cover all cases
@@ -4221,7 +4230,7 @@ proc assemble*(filename, outfile: string) =
   processReachableSymbols(ctx)
 
   case ctx.arch
-  of Arch.X64:
+  of Arch.X64, Arch.LinuxA64:
     writeElf(ctx, outfile)
   of Arch.A64:
     writeMachO(ctx, outfile)
