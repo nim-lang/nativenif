@@ -88,7 +88,6 @@ type
     FT = (ord(FTagId), "f")  ## `float` builtin type
     CT = (ord(CTagId), "c")  ## `char` builtin type
     BoolT = (ord(BoolTagId), "bool")  ## `bool` builtin type
-    VoidT = (ord(VoidTagId), "void")  ## `void` return type
     PtrT = (ord(PtrTagId), "ptr")  ## `ptr` type contructor
     ArrayT = (ord(ArrayTagId), "array")  ## `array` type constructor
     FlexarrayT = (ord(FlexarrayTagId), "flexarray")  ## `flexarray` type constructor
@@ -96,7 +95,7 @@ type
     PointerT = (ord(PointerTagId), "pointer")  ## `pointer` type
 
 proc rawTagIsNjType*(raw: TagEnum): bool {.inline.} =
-  raw in {UnionTagId, ObjectTagId, ProctypeTagId, ITagId, UTagId, FTagId, CTagId, BoolTagId, VoidTagId, PtrTagId, ArrayTagId, FlexarrayTagId, AptrTagId, PointerTagId}
+  raw in {UnionTagId, ObjectTagId, ProctypeTagId, ITagId, UTagId, FTagId, CTagId, BoolTagId, PtrTagId, ArrayTagId, FlexarrayTagId, AptrTagId, PointerTagId}
 
 type
   NjOther* = enum

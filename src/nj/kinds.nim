@@ -63,6 +63,10 @@ proc skipParRi*(n: var Cursor; context: string) {.inline.} =
   if n.kind != ParRi: error("Expected ) for " & context, n)
   inc n
 
+proc firstSon*(n: Cursor): Cursor {.inline.} =
+  result = n
+  inc result
+
 type
   TypeDecl* = object
     name*, pragmas*, body*: Cursor

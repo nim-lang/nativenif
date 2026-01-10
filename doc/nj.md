@@ -66,7 +66,6 @@
 | `(f INTLIT)` | NjType | `float` builtin type |
 | `(c INTLIT)` | NjType | `char` builtin type |
 | `(bool)` | NjType | `bool` builtin type |
-| `(void)` | NjType | `void` return type |
 | `(ptr T)` | NjType | `ptr` type contructor |
 | `(array T X)` | NjType | `array` type constructor |
 | `(flexarray T)` | NjType | `flexarray` type constructor |

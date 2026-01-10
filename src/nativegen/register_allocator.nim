@@ -39,21 +39,13 @@ proc stealFrom*(c: var Context; current: SymId; loc: Location; weights: Table[Sy
         break
 
 proc allocRegsForProc(c: var Context; n: var Cursor; weights: Table[SymId, VarInfo]) =
-  # Step 2.
-  let k = t[n].kind
-  case k
-  of Empty, Ident, SymDef, Sym, IntLit, UIntLit, FloatLit, CharLit, StrLit, Err,
-     NilC, FalseC, TrueC, SizeofC, AlignofC, OffsetofC, InfC, NegInfC, NanC:
-    discard
-  of StmtsC, ScopeC:
-    c.openScope()
-    for ch in sons(t, n):
-      allocRegsForProc(c, t, ch, weights)
-    c.closeScope()
-  of VarC:
-    let v = asVarDecl(t, n)
-    assert t[v.name].kind == SymDef
-    let vn = t[v.name].litId
+  case n.stmtKind
+  of NoStmt:
+    error "statement expected, but got: ", n
+  of VarS:
+    let v = takeVarDecl(n)
+    assert v.name.kind == SymbolDef
+    let vn = v.name.symId
 
     var typ = typeToSlot(c, v.typ)
     let w = weights[vn]
@@ -73,28 +65,15 @@ proc allocRegsForProc(c: var Context; n: var Cursor; weights: Table[SymId, VarIn
     let hasValue = t[v.value].kind != Empty
     if hasValue:
       allocRegsForProc(c, t, v.value, weights)
-  of ParamC:
-    # XXX Params have dedicated in the stack anyway...
-    when false:
-      let v = asParamDecl(t, n)
-      assert t[v.name].kind == SymDef
-      let vn = t[v.name].litId
-  of AsgnC, AddrC, DerefC,  AtC, PatC, WhileC, EmitC,
-     ParC, AndC, OrC, NotC, NegC, OconstrC, AconstrC, KvC,
-     AddC, SubC, MulC, DivC, ModC, ShrC, ShlC, BitandC, BitorC, BitxorC, BitnotC,
-     EqC, NeqC, LeC, LtC, CastC, ConvC, RangeC, RangesC, IfC, ElifC, ElseC,
-     BreakC, CaseC, OfC, LabC, JmpC, RetC, ParamsC, CallC, OnErrC, DiscardC,
-     TryC, RaiseC:
-    for ch in sons(t, n):
-      allocRegsForProc(c, t, ch, weights)
-  of DotC, GvarC, TvarC, ConstC, ProcC, FldC,
-     UnionC, ObjectC, EfldC, EnumC, ProctypeC, AtomicC, RoC, RestrictC,
-     IntC, UIntC, FloatC, CharC, BoolC, VoidC, PtrC, ArrayC, FlexarrayC,
-     APtrC, TypeC, CdeclC, StdcallC, SafecallC, SyscallC, FastcallC, ThiscallC,
-     NoconvC, MemberC, AttrC, InlineC, NoinlineC, VarargsC, WasC, SelectanyC,
-     PragmasC, AlignC, BitsC, VectorC, ImpC, NodeclC, InclC, SufC, RaisesC, ErrsC,
-     StaticC, ErrC:
-    discard "do not traverse these"
+  of KillS:
+    discard
+  of IteS, ItecS, StmtsS, LoopS:
+    inc n
+    while n.kind != ParRi:
+      allocRegsForProc(c, n, weights)
+    inc n
+  else:
+    skip n
 
 proc allocateVars*(c: var Context; n: Cursor) =
   var na = n
