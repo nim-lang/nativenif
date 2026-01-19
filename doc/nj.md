@@ -30,6 +30,7 @@
 | `(mod T X X)`          | NjExpr | |
 | `(shr T X X)`          | NjExpr | |
 | `(shl T X X)`          | NjExpr | |
+| `(ashr T X X)`         | NjExpr | |
 | `(bitand T X X)`       | NjExpr | |
 | `(bitor T X X)`        | NjExpr | |
 | `(bitxor T X X)`       | NjExpr | |
@@ -104,7 +105,6 @@
 | `(ensures X)` | NjPragma | `ensures` pragma |
 | `(assume X)` | NjStmt | `assume` pragma/annotation |
 | `(assert X)` | NjStmt | `assert` pragma/annotation |
-| `(ashr T X X)` | NjExpr | |
 | `(baseobj T INTLIT X)` | NjExpr | object conversion to base type |
 | `(asm X+)` | NjStmt | `asm` statement |
 | `(packed)`   | NjPragma | `packed` pragma |
