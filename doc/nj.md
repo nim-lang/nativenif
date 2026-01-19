@@ -30,6 +30,7 @@
 | `(mod T X X)`          | NjExpr | |
 | `(shr T X X)`          | NjExpr | |
 | `(shl T X X)`          | NjExpr | |
+| `(ashr T X X)`         | NjExpr | |
 | `(bitand T X X)`       | NjExpr | |
 | `(bitor T X X)`        | NjExpr | |
 | `(bitxor T X X)`       | NjExpr | |
@@ -66,7 +67,6 @@
 | `(f INTLIT)` | NjType | `float` builtin type |
 | `(c INTLIT)` | NjType | `char` builtin type |
 | `(bool)` | NjType | `bool` builtin type |
-| `(void)` | NjType | `void` return type |
 | `(ptr T)` | NjType | `ptr` type contructor |
 | `(array T X)` | NjType | `array` type constructor |
 | `(flexarray T)` | NjType | `flexarray` type constructor |
@@ -105,7 +105,6 @@
 | `(ensures X)` | NjPragma | `ensures` pragma |
 | `(assume X)` | NjStmt | `assume` pragma/annotation |
 | `(assert X)` | NjStmt | `assert` pragma/annotation |
-| `(ashr T X X)` | NjExpr | |
 | `(baseobj T INTLIT X)` | NjExpr | object conversion to base type |
 | `(asm X+)` | NjStmt | `asm` statement |
 | `(packed)`   | NjPragma | `packed` pragma |

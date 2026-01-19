@@ -33,6 +33,7 @@ type
     ModTagId
     ShrTagId
     ShlTagId
+    AshrTagId
     BitandTagId
     BitorTagId
     BitxorTagId
@@ -69,7 +70,6 @@ type
     FTagId
     CTagId
     BoolTagId
-    VoidTagId
     PtrTagId
     ArrayTagId
     FlexarrayTagId
@@ -108,7 +108,6 @@ type
     EnsuresTagId
     AssumeTagId
     AssertTagId
-    AshrTagId
     BaseobjTagId
     AsmTagId
     PackedTagId
@@ -145,43 +144,43 @@ const
     ("mod", 28),
     ("shr", 29),
     ("shl", 30),
-    ("bitand", 31),
-    ("bitor", 32),
-    ("bitxor", 33),
-    ("bitnot", 34),
-    ("eq", 35),
-    ("neq", 36),
-    ("le", 37),
-    ("lt", 38),
-    ("cast", 39),
-    ("conv", 40),
-    ("call", 41),
-    ("gvar", 42),
-    ("tvar", 43),
-    ("var", 44),
-    ("param", 45),
-    ("const", 46),
-    ("result", 47),
-    ("fld", 48),
-    ("proc", 49),
-    ("type", 50),
-    ("store", 51),
-    ("keepovf", 52),
-    ("stmts", 53),
-    ("params", 54),
-    ("union", 55),
-    ("object", 56),
-    ("proctype", 57),
-    ("atomic", 58),
-    ("ro", 59),
-    ("restrict", 60),
-    ("cppref", 61),
-    ("i", 62),
-    ("u", 63),
-    ("f", 64),
-    ("c", 65),
-    ("bool", 66),
-    ("void", 67),
+    ("ashr", 31),
+    ("bitand", 32),
+    ("bitor", 33),
+    ("bitxor", 34),
+    ("bitnot", 35),
+    ("eq", 36),
+    ("neq", 37),
+    ("le", 38),
+    ("lt", 39),
+    ("cast", 40),
+    ("conv", 41),
+    ("call", 42),
+    ("gvar", 43),
+    ("tvar", 44),
+    ("var", 45),
+    ("param", 46),
+    ("const", 47),
+    ("result", 48),
+    ("fld", 49),
+    ("proc", 50),
+    ("type", 51),
+    ("store", 52),
+    ("keepovf", 53),
+    ("stmts", 54),
+    ("params", 55),
+    ("union", 56),
+    ("object", 57),
+    ("proctype", 58),
+    ("atomic", 59),
+    ("ro", 60),
+    ("restrict", 61),
+    ("cppref", 62),
+    ("i", 63),
+    ("u", 64),
+    ("f", 65),
+    ("c", 66),
+    ("bool", 67),
     ("ptr", 68),
     ("array", 69),
     ("flexarray", 70),
@@ -220,8 +219,7 @@ const
     ("ensures", 103),
     ("assume", 104),
     ("assert", 105),
-    ("ashr", 106),
-    ("baseobj", 107),
-    ("asm", 108),
-    ("packed", 109)
+    ("baseobj", 106),
+    ("asm", 107),
+    ("packed", 108)
   ]

@@ -32,6 +32,7 @@ type
     ModX = (ord(ModTagId), "mod")
     ShrX = (ord(ShrTagId), "shr")
     ShlX = (ord(ShlTagId), "shl")
+    AshrX = (ord(AshrTagId), "ashr")
     BitandX = (ord(BitandTagId), "bitand")
     BitorX = (ord(BitorTagId), "bitor")
     BitxorX = (ord(BitxorTagId), "bitxor")
@@ -43,11 +44,10 @@ type
     CastX = (ord(CastTagId), "cast")  ## `cast` operation
     ConvX = (ord(ConvTagId), "conv")  ## type conversion
     VX = (ord(VTagId), "v")  ## `versioned` locations
-    AshrX = (ord(AshrTagId), "ashr")
     BaseobjX = (ord(BaseobjTagId), "baseobj")  ## object conversion to base type
 
 proc rawTagIsNjExpr*(raw: TagEnum): bool {.inline.} =
-  raw in {AtTagId, DerefTagId, DotTagId, PatTagId, ParTagId, AddrTagId, NilTagId, InfTagId, NeginfTagId, NanTagId, FalseTagId, TrueTagId, NotTagId, NegTagId, SizeofTagId, AlignofTagId, OffsetofTagId, OconstrTagId, AconstrTagId, OvfTagId, AddTagId, SubTagId, MulTagId, DivTagId, ModTagId, ShrTagId, ShlTagId, BitandTagId, BitorTagId, BitxorTagId, BitnotTagId, EqTagId, NeqTagId, LeTagId, LtTagId, CastTagId, ConvTagId, VTagId, AshrTagId, BaseobjTagId}
+  raw in {AtTagId, DerefTagId, DotTagId, PatTagId, ParTagId, AddrTagId, NilTagId, InfTagId, NeginfTagId, NanTagId, FalseTagId, TrueTagId, NotTagId, NegTagId, SizeofTagId, AlignofTagId, OffsetofTagId, OconstrTagId, AconstrTagId, OvfTagId, AddTagId, SubTagId, MulTagId, DivTagId, ModTagId, ShrTagId, ShlTagId, AshrTagId, BitandTagId, BitorTagId, BitxorTagId, BitnotTagId, EqTagId, NeqTagId, LeTagId, LtTagId, CastTagId, ConvTagId, VTagId, BaseobjTagId}
 
 type
   NjStmt* = enum
@@ -88,7 +88,6 @@ type
     FT = (ord(FTagId), "f")  ## `float` builtin type
     CT = (ord(CTagId), "c")  ## `char` builtin type
     BoolT = (ord(BoolTagId), "bool")  ## `bool` builtin type
-    VoidT = (ord(VoidTagId), "void")  ## `void` return type
     PtrT = (ord(PtrTagId), "ptr")  ## `ptr` type contructor
     ArrayT = (ord(ArrayTagId), "array")  ## `array` type constructor
     FlexarrayT = (ord(FlexarrayTagId), "flexarray")  ## `flexarray` type constructor
@@ -96,7 +95,7 @@ type
     PointerT = (ord(PointerTagId), "pointer")  ## `pointer` type
 
 proc rawTagIsNjType*(raw: TagEnum): bool {.inline.} =
-  raw in {UnionTagId, ObjectTagId, ProctypeTagId, ITagId, UTagId, FTagId, CTagId, BoolTagId, VoidTagId, PtrTagId, ArrayTagId, FlexarrayTagId, AptrTagId, PointerTagId}
+  raw in {UnionTagId, ObjectTagId, ProctypeTagId, ITagId, UTagId, FTagId, CTagId, BoolTagId, PtrTagId, ArrayTagId, FlexarrayTagId, AptrTagId, PointerTagId}
 
 type
   NjOther* = enum

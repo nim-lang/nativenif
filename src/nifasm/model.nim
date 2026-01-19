@@ -375,3 +375,4 @@ type
 
 proc rawTagIsA64Reg*(raw: TagEnum): bool {.inline.} =
   raw >= X0TagId and raw <= XzrTagId
+
