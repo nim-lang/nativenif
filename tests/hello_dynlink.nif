@@ -1,17 +1,19 @@
+(.nif27)
 (stmts
-  (arch arm64)
-  (imp "/usr/lib/libSystem.B.dylib")
-  (extproc :write.0 "_write")
-  (extproc :exit.0 "_exit")
-  (mov (x0) +1)
-  (adr (x1) msg.0)
-  (mov (x2) +12)
-  (prepare write.0
-    (extcall)
-  )
-  (mov (x0) +0)
-  (prepare exit.0
-    (extcall)
-  )
-  (rodata :msg.0 "Hello World\0A")
-)
+ (arch arm64)
+ (imp "/usr/lib/libSystem.B.dylib")
+ (extproc :write.0 "_write")
+ (extproc :exit.0 "_exit")
+ (mov
+  (x0)1)
+ (adr
+  (x1)msg.0)
+ (mov
+  (x2)12)
+ (prepare write.0
+  (extcall))
+ (mov
+  (x0)0)
+ (prepare exit.0
+  (extcall))
+ (rodata :msg.0 "Hello World\0A"))

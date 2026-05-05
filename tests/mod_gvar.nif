@@ -1,4 +1,4 @@
-(.nif24)
+(.nif27)
 (stmts
-  (gvar :shared.0.mod_gvar (i +64))
-)
+ (gvar :shared.0.mod_gvar
+  (i 64)))

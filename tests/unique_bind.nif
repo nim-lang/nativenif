@@ -1,15 +1,18 @@
-(.nif24)
+(.nif27)
 (stmts
-  (proc :test_unique_bind.0
-    (params)
-    (result)
-    (clobber)
-    (stmts
-      (var :x.0 (rax) (i +64))
-      (var :y.0 (rbx) (i +64))
-      (var :z.0 (rcx) (i +64))
-      (mov x.0 +60)
-      (syscall)
-    )
-  )
-)
+ (proc :test_unique_bind.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (var :x.0
+    (rax)
+    (i 64))
+   (var :y.0
+    (rbx)
+    (i 64))
+   (var :z.0
+    (rcx)
+    (i 64))
+   (mov x.0 60)
+   (syscall))))

@@ -1,14 +1,17 @@
+(.nif27)
 (stmts
-  (proc :foo.0.othermodule
-    (params
-      (param :arg.0 (rdi) (i +64))
-    )
-    (ret :ret.0 (rax) (i +64))
-    (body
-      (mov (rax) (rdi))
-      (add (rax) +1)
-      (ret)
-    )
-  )
-)
-
+ (proc :foo.0.othermodule
+  (params
+   (param :arg.0
+    (rdi)
+    (i 64)))
+  (ret :ret.0
+   (rax)
+   (i 64))
+  (body
+   (mov
+    (rax)
+    (rdi))
+   (add
+    (rax)1)
+   (ret))))
