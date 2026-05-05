@@ -1,6 +1,5 @@
-(.nif24)
+(.nif27)
 (stmts
-  (type :Level2.0.mod_level2 (object
-    (fld :next.0 Level3.0.mod_level3)
-  ))
-)
+ (type :Level2.0.mod_level2
+  (object
+   (fld :next.0 Level3.0.mod_level3))))

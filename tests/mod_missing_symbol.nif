@@ -1,6 +1,6 @@
-(.nif24)
+(.nif27)
 (stmts
-  (type :Exists.0.mod_missing_symbol (object
-    (fld :value.0 (i +64))
-  ))
-)
+ (type :Exists.0.mod_missing_symbol
+  (object
+   (fld :value.0
+    (i 64)))))

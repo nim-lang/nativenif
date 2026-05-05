@@ -1,26 +1,24 @@
-(.nif24)
+(.nif27)
 (stmts
-  (proc :callee.0
-    (params
-      (param :arg.0 (rdi) (i +64))
-      (param :arg.1 (rsi) (i +64))
-    )
-    (result)
-    (clobber)
-    (stmts
-      (ret)
-    )
-  )
-  (proc :main.0
-    (params)
-    (result)
-    (clobber)
-    (stmts
-      (prepare callee.0
-        (mov (arg arg.0) +1)
-        (call)
-      )
-      (ret)
-    )
-  )
-)
+ (proc :callee.0
+  (params
+   (param :arg.0
+    (rdi)
+    (i 64))
+   (param :arg.1
+    (rsi)
+    (i 64)))
+  (result)
+  (clobber)
+  (stmts
+   (ret)))
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (prepare callee.0
+    (mov
+     (arg arg.0)1)
+    (call))
+   (ret))))
