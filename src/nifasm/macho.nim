@@ -268,14 +268,20 @@ proc generateBindInfo(extProcs: seq[ExternalProcInfo]; gotVmaddr: uint64; dataSe
 
 proc writeMachO*(code: Bytes; bssSize: int;
                  cputype, cpusubtype: uint32; outfile: string;
-                 dynlink: DynLinkInfo = DynLinkInfo()) =
+                 dynlink: DynLinkInfo = DynLinkInfo();
+                 gvarSites: seq[(int, int)] = @[]) =
   let pageSize = 0x4000.uint64  # 16KB page size for arm64 macOS
   let baseAddr = 0x100000000.uint64  # macOS default base address
 
   # Handle external procs - generate stubs and patch BL instructions
   var modifiedCode = code
   let hasExtProcs = dynlink.extProcs.len > 0
-  let stubsOffset = code.len  # Stubs go after original code
+  # Stubs are ARM64 instructions (ADRP/LDR/BR) and must be 4-byte aligned. A
+  # trailing rodata whose length is not a multiple of 4 (e.g. "hi\n") would
+  # otherwise leave the stub section misaligned, corrupting both the stub
+  # encodings and the BL targets computed from `stubsOffset`. Pad to align.
+  while (modifiedCode.len and 3) != 0: modifiedCode.add(0)
+  let stubsOffset = modifiedCode.len  # Stubs go after the (aligned) code
   let stubSize = 12  # ADRP + LDR + BR = 3 * 4 bytes
   let gotSize = if hasExtProcs: dynlink.extProcs.len * 8 else: 0
 
@@ -555,6 +561,34 @@ proc writeMachO*(code: Bytes; bssSize: int;
         modifiedCode[callSite + 1] = byte((blInstr shr 8) and 0xFF)
         modifiedCode[callSite + 2] = byte((blInstr shr 16) and 0xFF)
         modifiedCode[callSite + 3] = byte((blInstr shr 24) and 0xFF)
+
+  # Patch gvar adrp+add sites with the global's __DATA/.bss address. The .bss
+  # lives right after the GOT in __DATA; address is formed page-relative to the
+  # adrp's PC (placeholders carry the dest reg with zero immediates, so OR-in).
+  if gvarSites.len > 0:
+    let bssBaseVmaddr = dataVmaddr + uint64(gotSize)
+    for (pos, gvarOff) in gvarSites:
+      let gvarVmaddr = bssBaseVmaddr + uint64(gvarOff)
+      let adrpVmaddr = textSectionVmaddr + uint64(pos)
+      let pageDiff = int64(gvarVmaddr and not 0xFFF'u64) - int64(adrpVmaddr and not 0xFFF'u64)
+      let pageOff = gvarVmaddr and 0xFFF'u64
+      let adrpImm = pageDiff shr 12
+      let immlo = uint32(adrpImm and 0x03) shl 29
+      let immhi = uint32((adrpImm shr 2) and 0x7FFFF) shl 5
+      var adrp = uint32(modifiedCode[pos]) or (uint32(modifiedCode[pos+1]) shl 8) or
+                 (uint32(modifiedCode[pos+2]) shl 16) or (uint32(modifiedCode[pos+3]) shl 24)
+      adrp = adrp or immlo or immhi
+      modifiedCode[pos+0] = byte(adrp and 0xFF)
+      modifiedCode[pos+1] = byte((adrp shr 8) and 0xFF)
+      modifiedCode[pos+2] = byte((adrp shr 16) and 0xFF)
+      modifiedCode[pos+3] = byte((adrp shr 24) and 0xFF)
+      var add = uint32(modifiedCode[pos+4]) or (uint32(modifiedCode[pos+5]) shl 8) or
+                (uint32(modifiedCode[pos+6]) shl 16) or (uint32(modifiedCode[pos+7]) shl 24)
+      add = add or (uint32(pageOff and 0xFFF) shl 10)
+      modifiedCode[pos+4] = byte(add and 0xFF)
+      modifiedCode[pos+5] = byte((add shr 8) and 0xFF)
+      modifiedCode[pos+6] = byte((add shr 16) and 0xFF)
+      modifiedCode[pos+7] = byte((add shr 24) and 0xFF)
 
   # Write code (including stubs if any)
   if modifiedCode.len > 0:

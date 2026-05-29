@@ -147,6 +147,7 @@ type
     NoA64Inst
     PrepareA64 = (ord(PrepareTagId), "prepare")  ## prepare block for function call
     MovA64 = (ord(MovTagId), "mov")  ## move instruction
+    LeaA64 = (ord(LeaTagId), "lea")  ## load effective address
     AddA64 = (ord(AddTagId), "add")  ## add instruction
     SubA64 = (ord(SubTagId), "sub")  ## subtract instruction
     MulA64 = (ord(MulTagId), "mul")  ## unsigned multiply
@@ -174,6 +175,14 @@ type
     BlA64 = (ord(BlTagId), "bl")  ## branch with link (function call)
     BeqA64 = (ord(BeqTagId), "beq")  ## branch if equal
     BneA64 = (ord(BneTagId), "bne")  ## branch if not equal
+    BltA64 = (ord(BltTagId), "blt")  ## branch if less than (signed)
+    BleA64 = (ord(BleTagId), "ble")  ## branch if less or equal (signed)
+    BgtA64 = (ord(BgtTagId), "bgt")  ## branch if greater than (signed)
+    BgeA64 = (ord(BgeTagId), "bge")  ## branch if greater or equal (signed)
+    BloA64 = (ord(BloTagId), "blo")  ## branch if lower (unsigned <)
+    BlsA64 = (ord(BlsTagId), "bls")  ## branch if lower or same (unsigned <=)
+    BhiA64 = (ord(BhiTagId), "bhi")  ## branch if higher (unsigned >)
+    BhsA64 = (ord(BhsTagId), "bhs")  ## branch if higher or same (unsigned >=)
     LabA64 = (ord(LabTagId), "lab")  ## label definition
     IteA64 = (ord(IteTagId), "ite")  ## if-then-else structure
     LoopA64 = (ord(LoopTagId), "loop")  ## loop structure
@@ -182,7 +191,7 @@ type
     KillA64 = (ord(KillTagId), "kill")  ## kill variable
 
 proc rawTagIsA64Inst*(raw: TagEnum): bool {.inline.} =
-  raw in {PrepareTagId, MovTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, SvcTagId, AdrTagId, LdrTagId, StrTagId, StpTagId, LdpTagId, BTagId, BlTagId, BeqTagId, BneTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId}
+  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, SvcTagId, AdrTagId, LdrTagId, StrTagId, StpTagId, LdpTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId}
 
 type
   NifasmType* = enum
@@ -197,9 +206,16 @@ type
     ObjectT = (ord(ObjectTagId), "object")  ## object type definition
     UnionT = (ord(UnionTagId), "union")  ## union type definition
     FldT = (ord(FldTagId), "fld")  ## field definition
+    CT = (ord(CTagId), "c")  ## character type of N bits
+    VoidT = (ord(VoidTagId), "void")  ## void type
+    VarargsT = (ord(VarargsTagId), "varargs")  ## C varargs marker type
+    FlexarrayT = (ord(FlexarrayTagId), "flexarray")  ## flexible array member
+    EnumT = (ord(EnumTagId), "enum")  ## enum type (base type + fields)
+    EfldT = (ord(EfldTagId), "efld")  ## enum field declaration
+    ProctypeT = (ord(ProctypeTagId), "proctype")  ## procedure (function pointer) type
 
 proc rawTagIsNifasmType*(raw: TagEnum): bool {.inline.} =
-  raw >= BoolTagId and raw <= FldTagId and raw != TagEnum(8)
+  raw in {BoolTagId, ITagId, UTagId, FTagId, PtrTagId, AptrTagId, ArrayTagId, ObjectTagId, UnionTagId, FldTagId, CTagId, VoidTagId, VarargsTagId, FlexarrayTagId, EnumTagId, EfldTagId, ProctypeTagId}
 
 type
   NifasmDecl* = enum
@@ -375,3 +391,4 @@ type
 
 proc rawTagIsA64Reg*(raw: TagEnum): bool {.inline.} =
   raw >= X0TagId and raw <= XzrTagId
+

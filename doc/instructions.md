@@ -25,7 +25,7 @@
 | `(res S)`              | NifasmExpr                  | result reference in prepare block |
 | `(prepare S ...)`      | X64Inst, A64Inst            | prepare block for function call |
 | `(mov D S)`            | X64Inst, A64Inst         | move instruction |
-| `(lea D S)`            | X64Inst                  | load effective address |
+| `(lea D S)`            | X64Inst, A64Inst         | load effective address |
 | `(movapd D S)`         | X64Inst                  | move aligned packed double |
 | `(movsd D S)`          | X64Inst                  | move scalar double |
 | `(add D S)`            | X64Inst, A64Inst         | add instruction |
@@ -148,6 +148,14 @@
 | `(bl L)`               | A64Inst                  | branch with link (function call) |
 | `(beq L)`              | A64Inst                  | branch if equal |
 | `(bne L)`              | A64Inst                  | branch if not equal |
+| `(blt L)`              | A64Inst                  | branch if less than (signed) |
+| `(ble L)`              | A64Inst                  | branch if less or equal (signed) |
+| `(bgt L)`              | A64Inst                  | branch if greater than (signed) |
+| `(bge L)`              | A64Inst                  | branch if greater or equal (signed) |
+| `(blo L)`              | A64Inst                  | branch if lower (unsigned <) |
+| `(bls L)`              | A64Inst                  | branch if lower or same (unsigned <=) |
+| `(bhi L)`              | A64Inst                  | branch if higher (unsigned >) |
+| `(bhs L)`              | A64Inst                  | branch if higher or same (unsigned >=) |
 | `(lab L)`              | X64Inst, A64Inst         | label definition |
 | `(ite ...)`            | X64Inst, A64Inst         | if-then-else structure |
 | `(loop ...)`           | X64Inst, A64Inst         | loop structure |
@@ -300,3 +308,10 @@
 | `(repmovsw)`         | X64Inst                 | repeat move word string |
 | `(repmovsd)`         | X64Inst                 | repeat move doubleword string |
 | `(repmovsq)`         | X64Inst                 | repeat move quadword string |
+| `(c N)`              | NifasmType              | character type of N bits |
+| `(void)`             | NifasmType              | void type |
+| `(varargs)`          | NifasmType              | C varargs marker type |
+| `(flexarray T)`      | NifasmType              | flexible array member |
+| `(enum T ...)`       | NifasmType              | enum type (base type + fields) |
+| `(efld D N)`         | NifasmType              | enum field declaration |
+| `(proctype ...)`     | NifasmType              | procedure (function pointer) type |

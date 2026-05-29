@@ -175,6 +175,7 @@ type
     slots: SlotManager
     ssizePatches: seq[int]
     csizePatches: seq[(int, int)] # (position, callStackDepth) for csize patches
+    gvarSites: seq[(int, Symbol)] # (adrp position in .text, gvar symbol) for adrp+add patching
     tlsOffset: int  # Current TLS offset for thread-local variables
     bssOffset: int  # Current offset in .bss section
     modules: Table[string, LoadedModule]  # Cache of loaded foreign modules
@@ -279,17 +280,30 @@ proc checkBitwiseType(t: Type; op: string; n: Cursor)
 proc checkCompatibleTypes(t1, t2: Type; op: string; n: Cursor)
 proc checkType(want, got: Type; n: Cursor)
 
+proc atTypeStart(n: Cursor): bool {.inline.} =
+  ## True if `n` is positioned at the start of a `Type` (a named-type symbol or
+  ## a recognized type tag) — i.e. NOT at an Empty/pragmas slot. Used to make
+  ## NIFC's optional pragmas/base slots tolerant.
+  n.kind == Symbol or (n.kind == ParLe and rawTagIsNifasmType(n.tag))
+
 proc parseObjectBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
   var fields: seq[(string, Type)] = @[]
   var offset = 0
   var maxAlign = 1  # Track maximum alignment requirement
   inc n
+  # NIFC `ObjDecl ::= (object [Empty | Type-base] FieldDecl*)` — tolerate the
+  # optional inheritance/base slot (present in NIFC, absent in arkham output).
+  if n.kind != ParRi and not (n.kind == ParLe and n.tag == FldTagId):
+    skip n
   while n.kind != ParRi:
     if n.kind == ParLe and n.tag == FldTagId:
       inc n
       if n.kind != SymbolDef: error("Expected field name", n)
       let name = pool.syms[n.symId]
       inc n
+      # NIFC `FieldDecl ::= (fld SymbolDef FieldPragmas Type)` — tolerate the
+      # optional field-pragmas slot before the type.
+      if not atTypeStart(n): skip n
       let ftype = parseType(n, scope, ctx)
       fields.add (name, ftype)
 
@@ -516,8 +530,32 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
       if n.kind == ParLe and tagToNifasmDecl(n.tag) == ClobberD:
         procTyp.clobbers = parseClobbers(n)
       result = procTyp
+    of CTagId:
+      # NIFC character type `(c N)` — an N-bit integer for the machine.
+      result = Type(kind: IntT, bits: int(getInt(n)))
+      inc n
+    of VoidTagId:
+      result = Type(kind: VoidT)
+    of VarargsTagId:
+      # `(varargs)` — a zero-size variadic marker; modeled as void.
+      result = Type(kind: VoidT)
+    of FlexarrayTagId:
+      # `(flexarray T)` — flexible array member: a zero-length array of T.
+      let elem = parseType(n, scope, ctx)
+      result = Type(kind: ArrayT, elem: elem, len: 0)
+    of EnumTagId:
+      # `(enum BaseType EnumFieldDecl*)` — collapses to its base integer type
+      # for codegen; the `efld` children are consumed by the trailing skip.
+      result = parseType(n, scope, ctx)
+    of ProctypeTagId:
+      # `(proctype Empty Params Type ProcTypePragmas)` — a function pointer
+      # (8 bytes). Children are consumed by the trailing skip.
+      result = Type(kind: ProcT, params: @[], results: @[], clobbers: {})
     else:
       error("Unknown type tag: " & $t, n)
+    # Tolerate NIFC type qualifiers we don't model: IntQualifier (atomic/ro),
+    # PtrQualifier (atomic/ro/restrict) and the trailing (cppref) marker.
+    while n.kind != ParRi: skip n
     skipParRi n, "type"
   else:
     error("Expected type", n)
@@ -534,6 +572,7 @@ proc parseUnionBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
       if n.kind != SymbolDef: error("Expected field name", n)
       let name = pool.syms[n.symId]
       inc n
+      if not atTypeStart(n): skip n   # tolerate NIFC's FieldPragmas slot
       let ftype = parseType(n, scope, ctx)
       fields.add (name, ftype)
 
@@ -849,6 +888,9 @@ type
     immVal: int64
     mem: arm64.MemoryOperand
     label: LabelId
+    gvarSym: Symbol       # non-nil if this operand is a global (.bss) address;
+                          # its `.size` (the .bss byte offset) is read after all
+                          # symbols are processed, so forward refs resolve right
 
 proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
   if n.kind == ParLe:
@@ -874,6 +916,12 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
         baseReg = baseOp.reg
       elif baseOp.kind == okMem and baseOp.typ.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
         objType = baseOp.typ
+        baseReg = baseOp.mem.base
+        baseOffset = baseOp.mem.offset
+      elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.StackOffT and
+           baseOp.typ.offType.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
+        # a stack-resident object/union: unwrap the StackOffT to its object type
+        objType = baseOp.typ.offType
         baseReg = baseOp.mem.base
         baseOffset = baseOp.mem.offset
       else:
@@ -913,6 +961,12 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
         baseReg = baseOp.reg
       elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.ArrayT:
         elemType = baseOp.typ.elem
+        baseReg = baseOp.mem.base
+        baseOffset = baseOp.mem.offset
+      elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.StackOffT and
+           baseOp.typ.offType.kind == TypeKind.ArrayT:
+        # a stack-resident array: unwrap the StackOffT to its array type
+        elemType = baseOp.typ.offType.elem
         baseReg = baseOp.mem.base
         baseOffset = baseOp.mem.offset
       else:
@@ -1061,13 +1115,10 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
     elif sym != nil and sym.kind == skGvar:
       if sym.isForeign:
         error("Cannot access foreign global variable '" & name & "' directly (must be linked)", n)
-      if sym.offset == -1:
-        # Forward reference - create label now
-        let labId = ctx.buf.createLabel()
-        sym.offset = int(labId)
-        result.label = labId
-      else:
-        result.label = LabelId(sym.offset)
+      # On arm64 the global lives in __DATA/.bss; its address is formed with
+      # adrp+add at link time (see AdrA64 + writeMachO). Carry the symbol so its
+      # final .bss offset (`sym.size`) is read after all symbols are processed.
+      result.gvarSym = sym
       result.reg = arm64.X0
       result.typ = Type(kind: UIntT, bits: 64)
       inc n
@@ -1374,7 +1425,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let sym = Symbol(name: name, kind: skVar)
     if onStack:
       sym.typ = Type(kind: StackOffT, offType: baseTyp)
-      sym.offset = ctx.slots.allocSlot(baseTyp)
+      sym.offset = ctx.slots.allocSlotUp(baseTyp)
     else:
       sym.typ = baseTyp
       sym.reg = reg
@@ -1439,12 +1490,18 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
         error("Moving ssize to memory not supported", n)
       elif op.kind == okMem:
         error("Cannot move memory to memory", n)
+      elif dest.mem.hasIndex:
+        var base = dest.mem.base
+        if dest.mem.offset != 0:
+          arm64.emitAddImm(ctx.buf.data, arm64.X16, base, uint16(dest.mem.offset))
+          base = arm64.X16
+        arm64.emitStrReg(ctx.buf.data, op.reg, base, dest.mem.index, dest.mem.shift)
       else:
         arm64.emitStr(ctx.buf.data, op.reg, dest.mem.base, dest.mem.offset)
     else:
       if op.kind == okSsize:
         arm64.emitMovImm(ctx.buf.data, dest.reg, 0'u16)
-        ctx.ssizePatches.add(ctx.buf.data.len - 2)
+        ctx.ssizePatches.add(ctx.buf.data.len - 4)
       elif op.kind == okImm:
         if op.immVal >= 0 and op.immVal <= 0xFFFF:
           arm64.emitMovImm(ctx.buf.data, dest.reg, uint16(op.immVal))
@@ -1453,10 +1510,27 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
           arm64.emitMovImm64(ctx.buf.data, dest.reg, uint64(op.immVal))
         else:
           error("Immediate value out of range", n)
+      elif op.kind == okMem and op.mem.hasIndex:
+        var base = op.mem.base
+        if op.mem.offset != 0:
+          arm64.emitAddImm(ctx.buf.data, arm64.X16, base, uint16(op.mem.offset))
+          base = arm64.X16
+        arm64.emitLdrReg(ctx.buf.data, dest.reg, base, op.mem.index, op.mem.shift)
       elif op.kind == okMem:
         arm64.emitLdr(ctx.buf.data, dest.reg, op.mem.base, op.mem.offset)
       else:
         arm64.emitMov(ctx.buf.data, dest.reg, op.reg)
+    skipParRi n
+
+  of LeaA64:
+    # (lea reg <mem>): load the *address* of a stack var / field into `reg`
+    # (`add reg, base, #offset`), rather than the value at it.
+    inc n
+    let dest = parseDestA64(n, ctx)
+    let op = parseOperandA64(n, ctx)
+    if dest.kind == okMem: error("lea destination must be a register", n)
+    if op.kind != okMem: error("lea source must be a memory operand", n)
+    arm64.emitAddImm(ctx.buf.data, dest.reg, op.mem.base, uint16(op.mem.offset))
     skipParRi n
 
   of AdrA64:
@@ -1464,11 +1538,18 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
     if dest.kind == okMem: error("ADR destination must be register", n)
-    # Check if operand is a label: type should be UIntT and not immediate/memory
-    # Labels/rodata/gvars set typ to UIntT and are not immediate or memory operands
-    if op.typ.kind != UIntT or op.kind == okImm or op.kind == okMem:
-      error("ADR source must be a label", n)
-    arm64.emitAdr(ctx.buf, dest.reg, op.label)
+    if op.gvarSym != nil:
+      # Global in __DATA/.bss: form its address with adrp+add (PC-relative adr
+      # can't reach __DATA). Emit placeholders; writeMachO patches the page /
+      # page-offset once the __DATA layout is known.
+      let pos = ctx.buf.data.getCurrentPosition()
+      arm64.emitAdrpAddGvar(ctx.buf.data, dest.reg)
+      ctx.gvarSites.add (pos, op.gvarSym)
+    else:
+      # Check if operand is a label: type should be UIntT and not immediate/memory
+      if op.typ.kind != UIntT or op.kind == okImm or op.kind == okMem:
+        error("ADR source must be a label", n)
+      arm64.emitAdr(ctx.buf, dest.reg, op.label)
     skipParRi n
 
   of AddA64:
@@ -1483,7 +1564,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     else:
       if op.kind == okSsize:
         arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, 0'u16)
-        ctx.ssizePatches.add(ctx.buf.data.len - 2)
+        ctx.ssizePatches.add(ctx.buf.data.len - 4)
       elif op.kind == okImm:
         if op.immVal >= 0 and op.immVal <= 0xFFFF:
           arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.immVal))
@@ -1507,7 +1588,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     else:
       if op.kind == okSsize:
         arm64.emitSubImm(ctx.buf.data, dest.reg, dest.reg, 0'u16)
-        ctx.ssizePatches.add(ctx.buf.data.len - 2)
+        ctx.ssizePatches.add(ctx.buf.data.len - 4)
       elif op.kind == okImm:
         if op.immVal >= 0 and op.immVal <= 0xFFFF:
           arm64.emitSubImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.immVal))
@@ -1636,7 +1717,11 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperandA64(n, ctx)
     checkBitwiseType(dest.typ, "asr", start)
     if dest.kind == okMem: error("Shift destination cannot be memory", n)
-    if op.kind == okImm: error("ASR immediate not supported yet", n)
+    if op.kind == okImm:
+      if op.immVal >= 0 and op.immVal <= 63:
+        arm64.emitAsrImm(ctx.buf.data, dest.reg, dest.reg, uint8(op.immVal))
+      else:
+        error("Shift amount must be 0-63", n)
     else:
       arm64.emitAsr(ctx.buf.data, dest.reg, dest.reg, op.reg)
     skipParRi n
@@ -1737,11 +1822,83 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     arm64.emitBne(ctx.buf, op.label)
     skipParRi n
 
+  of BltA64:
+    inc n
+    let op = parseOperandA64(n, ctx)
+    if op.typ.kind != UIntT: error("Branch target must be label", n)
+    arm64.emitBlt(ctx.buf, op.label)
+    skipParRi n
+
+  of BleA64:
+    inc n
+    let op = parseOperandA64(n, ctx)
+    if op.typ.kind != UIntT: error("Branch target must be label", n)
+    arm64.emitBle(ctx.buf, op.label)
+    skipParRi n
+
+  of BgtA64:
+    inc n
+    let op = parseOperandA64(n, ctx)
+    if op.typ.kind != UIntT: error("Branch target must be label", n)
+    arm64.emitBgt(ctx.buf, op.label)
+    skipParRi n
+
+  of BgeA64:
+    inc n
+    let op = parseOperandA64(n, ctx)
+    if op.typ.kind != UIntT: error("Branch target must be label", n)
+    arm64.emitBge(ctx.buf, op.label)
+    skipParRi n
+
+  of BloA64:
+    inc n
+    let op = parseOperandA64(n, ctx)
+    if op.typ.kind != UIntT: error("Branch target must be label", n)
+    arm64.emitBlo(ctx.buf, op.label)
+    skipParRi n
+
+  of BlsA64:
+    inc n
+    let op = parseOperandA64(n, ctx)
+    if op.typ.kind != UIntT: error("Branch target must be label", n)
+    arm64.emitBls(ctx.buf, op.label)
+    skipParRi n
+
+  of BhiA64:
+    inc n
+    let op = parseOperandA64(n, ctx)
+    if op.typ.kind != UIntT: error("Branch target must be label", n)
+    arm64.emitBhi(ctx.buf, op.label)
+    skipParRi n
+
+  of BhsA64:
+    inc n
+    let op = parseOperandA64(n, ctx)
+    if op.typ.kind != UIntT: error("Branch target must be label", n)
+    arm64.emitBhs(ctx.buf, op.label)
+    skipParRi n
+
   of StpA64:
-    error("STP instruction not yet implemented", n)
+    # (stp (rt1) (rt2) (rn) offset) → STP rt1, rt2, [rn, #offset]!  (pre-index)
+    inc n
+    let rt1 = parseRegisterA64(n)
+    let rt2 = parseRegisterA64(n)
+    let rn = parseRegisterA64(n)
+    if n.kind != IntLit: error("stp expects an integer offset", n)
+    let off = int32(getInt(n)); inc n
+    arm64.emitStp(ctx.buf.data, rt1, rt2, rn, off)
+    skipParRi n
 
   of LdpA64:
-    error("LDP instruction not yet implemented", n)
+    # (ldp (rt1) (rt2) (rn) offset) → LDP rt1, rt2, [rn], #offset  (post-index)
+    inc n
+    let rt1 = parseRegisterA64(n)
+    let rt2 = parseRegisterA64(n)
+    let rn = parseRegisterA64(n)
+    if n.kind != IntLit: error("ldp expects an integer offset", n)
+    let off = int32(getInt(n)); inc n
+    arm64.emitLdp(ctx.buf.data, rt1, rt2, rn, off)
+    skipParRi n
 
   of NoA64Inst:
     error("Invalid ARM64 instruction", n)
@@ -1831,18 +1988,30 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
       if not cfvarSym.used:
         quit "[Error] Control flow variable '" & cfvarName & "' declared but never used in proc " & ctx.procName
 
-  # Patch ssize
+  # Patch ssize. On x86 the placeholder is a raw imm32 in the instruction; on
+  # AArch64 the immediate is a bit-field of a 32-bit instruction, so the patch
+  # rewrites that field (MOVZ imm16 at [20:5]; ADD/SUB imm12 at [21:10]).
   let alignedStackSize = (ctx.slots.stackSize + 15) and not 15
+  let isA64 = ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64}
+  let v = uint32(alignedStackSize)
   for pos in ctx.ssizePatches:
-    # Write int32 at pos
-    if pos + 4 <= ctx.buf.data.len:
-      ctx.buf.data[pos] = byte(alignedStackSize and 0xFF)
-      ctx.buf.data[pos+1] = byte((alignedStackSize shr 8) and 0xFF)
-      ctx.buf.data[pos+2] = byte((alignedStackSize shr 16) and 0xFF)
-      ctx.buf.data[pos+3] = byte((alignedStackSize shr 24) and 0xFF)
+    if pos + 4 > ctx.buf.data.len: continue
+    if isA64:
+      var instr = uint32(ctx.buf.data[pos]) or (uint32(ctx.buf.data[pos+1]) shl 8) or
+                  (uint32(ctx.buf.data[pos+2]) shl 16) or (uint32(ctx.buf.data[pos+3]) shl 24)
+      if (instr shr 24) == 0xD2'u32:        # MOVZ Xd, #imm16 → imm16 at [20:5]
+        instr = (instr and not (0xFFFF'u32 shl 5)) or ((v and 0xFFFF'u32) shl 5)
+      else:                                 # ADD/SUB Xd, Xn, #imm12 → imm12 at [21:10]
+        instr = (instr and not (0xFFF'u32 shl 10)) or ((v and 0xFFF'u32) shl 10)
+      ctx.buf.data[pos]   = byte(instr and 0xFF)
+      ctx.buf.data[pos+1] = byte((instr shr 8) and 0xFF)
+      ctx.buf.data[pos+2] = byte((instr shr 16) and 0xFF)
+      ctx.buf.data[pos+3] = byte((instr shr 24) and 0xFF)
     else:
-      # Should not happen if patched correctly
-      discard
+      ctx.buf.data[pos]   = byte(v and 0xFF)
+      ctx.buf.data[pos+1] = byte((v shr 8) and 0xFF)
+      ctx.buf.data[pos+2] = byte((v shr 16) and 0xFF)
+      ctx.buf.data[pos+3] = byte((v shr 24) and 0xFF)
 
   ctx.scope = oldScope
 
@@ -3954,9 +4123,12 @@ proc pass2(n: Cursor; ctx: var GenContext) =
             n = start
             skip n
           elif name == "_start" or name == "main.0":
-            # Entry point proc - generate it immediately
+            # Entry point proc - generate it immediately. Mark it generated so
+            # processReachableSymbols (which sees it in the pending list via the
+            # lookupWithAutoImport above) does not emit a duplicate copy.
             n = start
             pass2Proc(n, ctx)
+            ctx.generatedSymbols.incl name
           else:
             # Regular proc - skip, will be generated if referenced
             n = start
@@ -4074,7 +4246,9 @@ proc writeMachO(a: var GenContext; outfile: string) =
       libOrdinal: ext.libOrdinal, gotSlot: ext.gotSlot,
       callSites: ext.callSites)
 
-  macho.writeMachO(code, a.bssOffset, cputype, cpusubtype, outfile, dynlink)
+  var gsites: seq[(int, int)] = @[]   # resolve each global's final .bss offset now
+  for (pos, sym) in a.gvarSites: gsites.add (pos, sym.size)
+  macho.writeMachO(code, a.bssOffset, cputype, cpusubtype, outfile, dynlink, gsites)
 
   # macOS arm64 requires code signing for all executables
   when defined(macosx):
@@ -4154,6 +4328,7 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
         ctx.bssOffset = (ctx.bssOffset + align - 1) and not (align - 1)
       let labId = ctx.bssBuf.createLabel()
       sym.offset = int(labId)
+      sym.size = ctx.bssOffset      # byte offset within .bss (for arm64 adrp+add)
       ctx.bssBuf.defineLabel(labId)
       ctx.bssOffset += size
   of skTvar:
