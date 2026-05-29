@@ -48,8 +48,11 @@ proc encodeReg32(r: Register32): uint32 =
 proc emitMov*(dest: var Bytes; rd, rn: Register) =
   ## Emit MOV instruction: MOV rd, rn (alias for ORR rd, XZR, rn)
   # ORR Xd, XZR, Xm: 1010 1010 000m mmmm 0000 00nn nnnd dddd
+  # The Rn field (bits 9..5) must be XZR (31); leaving it 0 would make this
+  # `ORR Xd, X0, Xm` (i.e. `Xd = X0 | Xm`), not a plain move.
   let instr = 0xAA000000'u32 or
               (encodeReg(rn) shl 16) or
+              (0x1F'u32 shl 5) or
               (encodeReg(rd) shl 0)
   dest.addUint32(instr)
 
@@ -237,6 +240,15 @@ proc emitAsr*(dest: var Bytes; rd, rn, rm: Register) =
               encodeReg(rd)
   dest.addUint32(instr)
 
+proc emitAsrImm*(dest: var Bytes; rd, rn: Register; shift: uint8) =
+  ## Emit ASR rd, rn, #shift — SBFM Xd, Xn, #shift, #63 (sign-extending).
+  let instr = 0x93400000'u32 or
+              (uint32(shift) shl 16) or
+              (63'u32 shl 10) or
+              (encodeReg(rn) shl 5) or
+              encodeReg(rd)
+  dest.addUint32(instr)
+
 # Compare instructions
 proc emitCmp*(dest: var Bytes; rn, rm: Register) =
   ## Emit CMP instruction: CMP rn, rm (alias for SUBS XZR, rn, rm)
@@ -277,6 +289,20 @@ proc emitLdr*(dest: var Bytes; rt: Register; rn: Register; offset: int32) =
               encodeReg(rt)
   dest.addUint32(instr)
 
+proc emitLdrReg*(dest: var Bytes; rt, rn, rm: Register; shift: int) =
+  ## LDR rt, [rn, rm, LSL #shift] — register offset (shift 0 or 3 for 64-bit).
+  let s = if shift == 3: 1'u32 else: 0'u32
+  let instr = 0xF8606800'u32 or (s shl 12) or
+              (encodeReg(rm) shl 16) or (encodeReg(rn) shl 5) or encodeReg(rt)
+  dest.addUint32(instr)
+
+proc emitStrReg*(dest: var Bytes; rt, rn, rm: Register; shift: int) =
+  ## STR rt, [rn, rm, LSL #shift] — register offset (shift 0 or 3 for 64-bit).
+  let s = if shift == 3: 1'u32 else: 0'u32
+  let instr = 0xF8206800'u32 or (s shl 12) or
+              (encodeReg(rm) shl 16) or (encodeReg(rn) shl 5) or encodeReg(rt)
+  dest.addUint32(instr)
+
 proc emitStr*(dest: var Bytes; rt: Register; rn: Register; offset: int32) =
   ## Emit STR instruction: STR rt, [rn, #offset]
   ## Offset must be 8-byte aligned and in range [0, 32760]
@@ -315,6 +341,57 @@ proc emitBne*(dest: var Buffer; target: LabelId) =
   dest.data.addUint32(0x54000001'u32)  # Placeholder, condition=0001 (NE)
   dest.addReloc(pos, target, rkBNE, 4)
 
+# Signed ordering conditional branches. All B.cond share the imm19 patch
+# (rkBEQ); the condition code is baked into the placeholder.
+proc emitBlt*(dest: var Buffer; target: LabelId) =
+  ## BLT target (branch if signed less than)
+  let pos = dest.data.getCurrentPosition()
+  dest.data.addUint32(0x5400000B'u32)  # condition=1011 (LT)
+  dest.addReloc(pos, target, rkBEQ, 4)
+
+proc emitBle*(dest: var Buffer; target: LabelId) =
+  ## BLE target (branch if signed less or equal)
+  let pos = dest.data.getCurrentPosition()
+  dest.data.addUint32(0x5400000D'u32)  # condition=1101 (LE)
+  dest.addReloc(pos, target, rkBEQ, 4)
+
+proc emitBgt*(dest: var Buffer; target: LabelId) =
+  ## BGT target (branch if signed greater than)
+  let pos = dest.data.getCurrentPosition()
+  dest.data.addUint32(0x5400000C'u32)  # condition=1100 (GT)
+  dest.addReloc(pos, target, rkBEQ, 4)
+
+proc emitBge*(dest: var Buffer; target: LabelId) =
+  ## BGE target (branch if signed greater or equal)
+  let pos = dest.data.getCurrentPosition()
+  dest.data.addUint32(0x5400000A'u32)  # condition=1010 (GE)
+  dest.addReloc(pos, target, rkBEQ, 4)
+
+# Unsigned ordering conditional branches (same imm19 patch as the signed ones).
+proc emitBlo*(dest: var Buffer; target: LabelId) =
+  ## BLO target (branch if unsigned less than / carry clear)
+  let pos = dest.data.getCurrentPosition()
+  dest.data.addUint32(0x54000003'u32)  # condition=0011 (LO/CC)
+  dest.addReloc(pos, target, rkBEQ, 4)
+
+proc emitBls*(dest: var Buffer; target: LabelId) =
+  ## BLS target (branch if unsigned lower or same)
+  let pos = dest.data.getCurrentPosition()
+  dest.data.addUint32(0x54000009'u32)  # condition=1001 (LS)
+  dest.addReloc(pos, target, rkBEQ, 4)
+
+proc emitBhi*(dest: var Buffer; target: LabelId) =
+  ## BHI target (branch if unsigned higher)
+  let pos = dest.data.getCurrentPosition()
+  dest.data.addUint32(0x54000008'u32)  # condition=1000 (HI)
+  dest.addReloc(pos, target, rkBEQ, 4)
+
+proc emitBhs*(dest: var Buffer; target: LabelId) =
+  ## BHS target (branch if unsigned higher or same / carry set)
+  let pos = dest.data.getCurrentPosition()
+  dest.data.addUint32(0x54000002'u32)  # condition=0010 (HS/CS)
+  dest.addReloc(pos, target, rkBEQ, 4)
+
 proc emitRet*(dest: var Bytes) =
   ## Emit RET instruction: RET (return, defaults to X30/LR)
   # RET: 1101 0110 0101 1111 0000 0000 0001 1110
@@ -342,6 +419,12 @@ proc emitAdr*(dest: var Buffer; rd: Register; target: LabelId) =
   dest.addReloc(pos, target, rkADR, 4)
 
 # ADRP instruction (load page address)
+proc emitAdrpAddGvar*(dest: var Bytes; rd: Register) =
+  ## Placeholder `adrp rd, 0` + `add rd, rd, #0` for a __DATA/.bss global; the
+  ## page and page-offset immediates are patched at link time (writeMachO).
+  dest.addUint32(0x90000000'u32 or encodeReg(rd))                       # adrp rd, 0
+  dest.addUint32(0x91000000'u32 or (encodeReg(rd) shl 5) or encodeReg(rd))  # add rd, rd, #0
+
 proc emitAdrp*(dest: var Buffer; rd: Register; target: LabelId) =
   ## Emit ADRP instruction: ADRP rd, target (load page address of label)
   # ADRP Xd, label: 1001 0000 00ii iiii iiii iiii iiii dddd

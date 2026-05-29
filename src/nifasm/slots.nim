@@ -15,6 +15,14 @@ proc initSlotManager*(): SlotManager =
 proc alignedSize*(t: Type): int =
   (asmSizeOf(t) + 7) and not 7
 
+proc allocSlotUp*(m: var SlotManager; t: Type): int =
+  ## Positive, base-relative slot offset for architectures that address locals
+  ## upward from a stack pointer lowered by `sub sp, sp, #stackSize` (AArch64).
+  ## Offsets grow 0, 8, 16, … so they fit the unsigned-immediate LDR/STR forms.
+  let size = alignedSize(t)
+  result = m.stackSize
+  m.stackSize += size
+
 proc allocSlot*(m: var SlotManager; t: Type): int =
   let size = alignedSize(t)
   var foundSlot = -1
