@@ -21,6 +21,12 @@ type
     libs*: seq[ImportedLibInfo]
     extProcs*: seq[ExternalProcInfo]
 
+  TlvInfo* = object
+    ## Thread-local storage (macOS TLV) layout produced by the assembler.
+    descriptorOffsets*: seq[int]  # per tvar (descriptor index): byte offset in the per-thread region
+    threadData*: seq[byte]        # __thread_data init template dyld copies per thread
+    sites*: seq[(int, int)]       # (adrp position in .text, descriptor index) to patch with the descriptor address
+
   MachO_Header* = object
     magic*: uint32
     cputype*: uint32
@@ -148,6 +154,7 @@ const
   MH_NOUNDEFS* = 0x1'u32  # No undefined references
   MH_DYLDLINK* = 0x4'u32  # Dynamically linked
   MH_PIE* = 0x200000'u32  # Position-independent executable
+  MH_HAS_TLV_DESCRIPTORS* = 0x800000'u32  # Image has thread-local-variable descriptors dyld must set up
 
   LC_SEGMENT_64* = 0x19'u32
   LC_MAIN* = 0x80000028'u32
@@ -171,6 +178,13 @@ const
   # Section types for GOT
   S_NON_LAZY_SYMBOL_POINTERS* = 0x06'u32
   S_LAZY_SYMBOL_POINTERS* = 0x07'u32
+
+  # Section types for thread-local storage (macOS TLV)
+  S_THREAD_LOCAL_REGULAR* = 0x11'u32       # __thread_data: initialized TLV template
+  S_THREAD_LOCAL_ZEROFILL* = 0x12'u32      # __thread_bss: zero TLV template
+  S_THREAD_LOCAL_VARIABLES* = 0x13'u32     # __thread_vars: TLV descriptors
+
+  TlvBootstrapSym* = "__tlv_bootstrap"     # libSystem thunk dyld swaps into each descriptor
 
   # Bind opcodes for LC_DYLD_INFO_ONLY
   BIND_OPCODE_DONE* = 0x00'u8
@@ -237,45 +251,59 @@ proc initEntryPoint*(entryoff: uint64): MachO_EntryPoint =
 
 proc encodeReg(r: uint32): uint32 {.inline.} = r and 0x1F
 
-proc generateBindInfo(extProcs: seq[ExternalProcInfo]; gotVmaddr: uint64; dataSegmentIndex: int): seq[byte] =
-  ## Generate bind opcodes for external procs
+proc addPointerBind(result: var seq[byte]; libOrdinal: int; name: string;
+                    dataSegmentIndex: int; dataOffset: uint64) =
+  ## Emit one absolute-pointer bind of `name` (from dylib `libOrdinal`) at
+  ## `dataOffset` within the data segment.
+  result.add(BIND_OPCODE_SET_DYLIB_ORDINAL_IMM or uint8(libOrdinal and 0xF))
+  result.add(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM)
+  for c in name: result.add(byte(c))
+  result.add(0)
+  result.add(BIND_OPCODE_SET_TYPE_IMM or BIND_TYPE_POINTER)
+  result.add(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB or uint8(dataSegmentIndex))
+  var offset = dataOffset
+  while offset >= 0x80:
+    result.add(byte((offset and 0x7F) or 0x80))
+    offset = offset shr 7
+  result.add(byte(offset and 0x7F))
+  result.add(BIND_OPCODE_DO_BIND)
+
+proc generateBindInfo(extProcs: seq[ExternalProcInfo]; dataSegmentIndex: int;
+                      tlvDescriptorCount: int; tlvVarsDataOffset: uint64;
+                      tlvLibOrdinal: int): seq[byte] =
+  ## Generate bind opcodes: one per external proc (GOT slot) plus one per
+  ## thread-local descriptor thunk (bound to `__tlv_bootstrap`, which dyld then
+  ## overwrites with its own accessor while assigning the pthread key).
   result = @[]
-  var currentOffset = 0'u64
   for ext in extProcs:
-    # BIND_OPCODE_SET_DYLIB_ORDINAL_IMM (ordinal in low 4 bits)
-    result.add(BIND_OPCODE_SET_DYLIB_ORDINAL_IMM or uint8(ext.libOrdinal and 0xF))
-    # BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM (flags = 0)
-    result.add(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM)
-    # Symbol name (null terminated)
-    for c in ext.extName:
-      result.add(byte(c))
-    result.add(0)
-    # BIND_OPCODE_SET_TYPE_IMM (BIND_TYPE_POINTER = 1)
-    result.add(BIND_OPCODE_SET_TYPE_IMM or BIND_TYPE_POINTER)
-    # BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB
-    let gotOffset = uint64(ext.gotSlot * 8)
-    result.add(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB or uint8(dataSegmentIndex))
-    # ULEB128 encode the offset
-    var offset = gotOffset
-    while offset >= 0x80:
-      result.add(byte((offset and 0x7F) or 0x80))
-      offset = offset shr 7
-    result.add(byte(offset and 0x7F))
-    # BIND_OPCODE_DO_BIND
-    result.add(BIND_OPCODE_DO_BIND)
-  # BIND_OPCODE_DONE
+    addPointerBind(result, ext.libOrdinal, ext.extName, dataSegmentIndex,
+                   uint64(ext.gotSlot * 8))
+  for i in 0 ..< tlvDescriptorCount:
+    # The thunk is the first word of the 24-byte descriptor.
+    addPointerBind(result, tlvLibOrdinal, TlvBootstrapSym, dataSegmentIndex,
+                   tlvVarsDataOffset + uint64(i * 24))
   result.add(BIND_OPCODE_DONE)
 
 proc writeMachO*(code: Bytes; bssSize: int;
                  cputype, cpusubtype: uint32; outfile: string;
                  dynlink: DynLinkInfo = DynLinkInfo();
-                 gvarSites: seq[(int, int)] = @[]) =
+                 gvarSites: seq[(int, int)] = @[];
+                 tlv: TlvInfo = TlvInfo()) =
   let pageSize = 0x4000.uint64  # 16KB page size for arm64 macOS
   let baseAddr = 0x100000000.uint64  # macOS default base address
 
   # Handle external procs - generate stubs and patch BL instructions
   var modifiedCode = code
   let hasExtProcs = dynlink.extProcs.len > 0
+
+  # Thread-local storage (macOS TLV): N 24-byte descriptors in __thread_vars and
+  # an 8-byte-padded init template in __thread_data, both file-backed in __DATA.
+  let hasTlv = tlv.descriptorOffsets.len > 0
+  let nTlv = tlv.descriptorOffsets.len
+  let tvarsSize = nTlv * 24
+  var threadData = tlv.threadData
+  while (threadData.len and 7) != 0: threadData.add(0)
+  let tdataSize = threadData.len
   # Stubs are ARM64 instructions (ADRP/LDR/BR) and must be 4-byte aligned. A
   # trailing rodata whose length is not a multiple of 4 (e.g. "hi\n") would
   # otherwise leave the stub section misaligned, corrupting both the stub
@@ -299,9 +327,15 @@ proc writeMachO*(code: Bytes; bssSize: int;
   # Calculate load command sizes first (needed to determine code offset)
   let pageZeroSegSize = sizeof(MachO_Segment64)  # No sections in __PAGEZERO
   let textSegSize = sizeof(MachO_Segment64) + sizeof(MachO_Section64)
-  # DATA segment is needed if we have bss OR external procs (for GOT)
-  let needsData = bssSize > 0 or hasExtProcs
-  let dataSegSize = if needsData: sizeof(MachO_Segment64) + sizeof(MachO_Section64) else: 0
+  # DATA segment is needed for GOT (external procs), TLV descriptors/data, or bss.
+  # Its sections, in vm order: __got, __thread_vars, __thread_data, __bss.
+  let needsData = bssSize > 0 or hasExtProcs or hasTlv
+  var dataSectionCount = 0
+  if hasExtProcs: inc dataSectionCount   # __got
+  if hasTlv: inc dataSectionCount        # __thread_vars
+  if hasTlv: inc dataSectionCount        # __thread_data
+  if bssSize > 0: inc dataSectionCount   # __bss
+  let dataSegSize = if needsData: sizeof(MachO_Segment64) + dataSectionCount * sizeof(MachO_Section64) else: 0
   let linkeditSegSize = sizeof(MachO_Segment64)  # No sections in __LINKEDIT
   # LC_LOAD_DYLINKER: 12 bytes header + path string + padding to 8-byte boundary
   let dylinkerPathLen = DyldPath.len + 1  # +1 for null terminator
@@ -335,19 +369,35 @@ proc writeMachO*(code: Bytes; bssSize: int;
   let textVmaddr = baseAddr
   let textSectionVmaddr = textVmaddr + codeFileOffset  # Section starts after headers
 
-  # DATA segment: GOT + bss (zero-initialized)
+  # DATA segment byte layout (offsets within __DATA): __got, then the TLV
+  # descriptors and init template, then bss. The GOT + TLV region is file-backed
+  # (real bytes dyld binds/copies); bss is the zero-filled tail.
   let dataVmaddr = textVmaddr + textSegmentFileSize
   let gotVmaddr = dataVmaddr  # GOT at start of __DATA
-  let totalDataSize = gotSize + bssSize
+  let gotOff = 0
+  let tvarsOff = gotOff + gotSize          # 8-aligned: gotSize is a multiple of 8
+  let tdataOff = tvarsOff + tvarsSize       # 8-aligned: 24 * nTlv
+  let bssOff = tdataOff + tdataSize         # tdataSize padded to 8
+  # File-backed portion of __DATA. Without TLV we keep the historical layout
+  # (GOT/bss not file-backed: dyld binds the GOT, the loader zeroes bss). With
+  # TLV, the GOT + descriptors + init template are real file bytes; the file
+  # region is page-padded so __LINKEDIT stays page-aligned (its fileoff must be
+  # congruent with its page-aligned vmaddr).
+  let dataFileContentSize = if hasTlv: bssOff else: 0
+  let dataFileSize = int((uint64(dataFileContentSize) + pageSize - 1) and not (pageSize - 1))
+  let totalDataSize = bssOff + bssSize
   let dataSize = if totalDataSize > 0: ((totalDataSize.uint64 + pageSize - 1) and not (pageSize - 1)) else: 0.uint64
 
-  # __LINKEDIT segment comes after TEXT (and DATA if present)
+  # __LINKEDIT comes after TEXT and the file-backed part of DATA.
+  let dataFileoff = textSegmentFileSize
   let linkeditVmaddr = if hasData: dataVmaddr + dataSize else: textVmaddr + textSegmentFileSize
-  let linkeditFileoff = textSegmentFileSize
+  let linkeditFileoff = textSegmentFileSize + uint64(dataFileSize)
 
-  # Generate bind info if we have external procs
-  let bindInfo = if hasExtProcs:
-    generateBindInfo(dynlink.extProcs, gotVmaddr.uint64, 2)  # segment index 2 = __DATA
+  # Bind info: external-proc GOT slots plus each TLV descriptor's __tlv_bootstrap
+  # thunk. libSystem is the sole LC_LOAD_DYLIB, so its ordinal is 1.
+  let bindInfo = if hasExtProcs or hasTlv:
+    generateBindInfo(dynlink.extProcs, 2,  # segment index 2 = __DATA
+                     nTlv, uint64(tvarsOff), 1)
   else:
     @[]
 
@@ -370,23 +420,35 @@ proc writeMachO*(code: Bytes; bssSize: int;
   var textSection = initSection64("__text", "__TEXT", textSectionVmaddr, codeSize,
                                   uint32(codeFileOffset), 2, textSectionFlags)  # align 2^2 = 4
 
-  # Create DATA segment with __got section (if we have external procs) or __bss (if only bss)
+  # Create DATA segment and its sections (__got, __thread_vars, __thread_data,
+  # __bss — only those that are present), in vm order.
   var dataSegment: MachO_Segment64
-  var dataSection: MachO_Section64
+  var dataSections: seq[MachO_Section64] = @[]
 
   if hasData:
-    dataSegment = initSegment64("__DATA", dataVmaddr, dataSize, 0, 0,
+    dataSegment = initSegment64("__DATA", dataVmaddr, dataSize, dataFileoff, uint64(dataFileSize),
                                  VM_PROT_READ or VM_PROT_WRITE,
-                                 VM_PROT_READ or VM_PROT_WRITE, 1)
+                                 VM_PROT_READ or VM_PROT_WRITE, uint32(dataSectionCount))
 
     if hasExtProcs:
-      # __got section for non-lazy symbol pointers
-      dataSection = initSection64("__got", "__DATA", dataVmaddr, uint64(gotSize),
-                                  0, 3, S_NON_LAZY_SYMBOL_POINTERS)  # align 2^3 = 8
-    else:
-      # __bss section for zero-initialized data
-      dataSection = initSection64("__bss", "__DATA", dataVmaddr, dataSize.uint64,
-                                  0, 4, 0)
+      # __got: non-lazy symbol pointers (file-backed only when TLV forces a
+      # file-backed __DATA; otherwise dyld materializes it from bind info).
+      let gotFileOff = if hasTlv: uint32(dataFileoff + uint64(gotOff)) else: 0'u32
+      dataSections.add initSection64("__got", "__DATA", dataVmaddr + uint64(gotOff),
+                                     uint64(gotSize), gotFileOff, 3, S_NON_LAZY_SYMBOL_POINTERS)
+    if hasTlv:
+      # __thread_vars: the 24-byte TLV descriptors (file-backed).
+      dataSections.add initSection64("__thread_vars", "__DATA", dataVmaddr + uint64(tvarsOff),
+                                     uint64(tvarsSize), uint32(dataFileoff + uint64(tvarsOff)),
+                                     3, S_THREAD_LOCAL_VARIABLES)
+      # __thread_data: the per-thread init template dyld copies (file-backed).
+      dataSections.add initSection64("__thread_data", "__DATA", dataVmaddr + uint64(tdataOff),
+                                     uint64(tdataSize), uint32(dataFileoff + uint64(tdataOff)),
+                                     3, S_THREAD_LOCAL_REGULAR)
+    if bssSize > 0:
+      # __bss: zero-initialized tail (not file-backed).
+      dataSections.add initSection64("__bss", "__DATA", dataVmaddr + uint64(bssOff),
+                                     uint64(bssSize), 0, 4, 0)
 
   # Create __LINKEDIT segment
   var linkeditSegment = initSegment64("__LINKEDIT", linkeditVmaddr, linkeditVmsize,
@@ -399,7 +461,7 @@ proc writeMachO*(code: Bytes; bssSize: int;
   dyldInfo.cmdsize = uint32(sizeof(MachO_DyldInfo))
   dyldInfo.rebase_off = 0
   dyldInfo.rebase_size = 0
-  if hasExtProcs:
+  if bindInfo.len > 0:
     dyldInfo.bind_off = uint32(linkeditFileoff)
     dyldInfo.bind_size = uint32(bindInfo.len)
   else:
@@ -449,9 +511,12 @@ proc writeMachO*(code: Bytes; bssSize: int;
   let entryOff = codeFileOffset  # Entry point is at the start of __text section
   var entryPoint = initEntryPoint(entryOff)
 
-  # Create header with MH_DYLDLINK and MH_PIE flags
+  # Create header with MH_DYLDLINK and MH_PIE flags (plus the TLV-descriptors
+  # flag so dyld sets up thread-local storage before running the program).
+  var headerFlags = MH_DYLDLINK or MH_NOUNDEFS or MH_PIE
+  if hasTlv: headerFlags = headerFlags or MH_HAS_TLV_DESCRIPTORS
   var header = initMachOHeader(cputype, cpusubtype, ncmds, uint32(actualCmdsSize),
-                                MH_DYLDLINK or MH_NOUNDEFS or MH_PIE)
+                                headerFlags)
 
   var f = newFileStream(outfile, fmWrite)
 
@@ -468,7 +533,8 @@ proc writeMachO*(code: Bytes; bssSize: int;
   # Write DATA segment command (if needed)
   if hasData:
     f.write(dataSegment)
-    f.write(dataSection)
+    for s in dataSections:
+      f.write(s)
 
   # Write __LINKEDIT segment command
   f.write(linkeditSegment)
@@ -563,15 +629,43 @@ proc writeMachO*(code: Bytes; bssSize: int;
         modifiedCode[callSite + 3] = byte((blInstr shr 24) and 0xFF)
 
   # Patch gvar adrp+add sites with the global's __DATA/.bss address. The .bss
-  # lives right after the GOT in __DATA; address is formed page-relative to the
-  # adrp's PC (placeholders carry the dest reg with zero immediates, so OR-in).
+  # lives after the GOT and any TLV sections in __DATA; address is formed
+  # page-relative to the adrp's PC (placeholders carry the dest reg with zero
+  # immediates, so OR-in).
   if gvarSites.len > 0:
-    let bssBaseVmaddr = dataVmaddr + uint64(gotSize)
+    let bssBaseVmaddr = dataVmaddr + uint64(bssOff)
     for (pos, gvarOff) in gvarSites:
       let gvarVmaddr = bssBaseVmaddr + uint64(gvarOff)
       let adrpVmaddr = textSectionVmaddr + uint64(pos)
       let pageDiff = int64(gvarVmaddr and not 0xFFF'u64) - int64(adrpVmaddr and not 0xFFF'u64)
       let pageOff = gvarVmaddr and 0xFFF'u64
+      let adrpImm = pageDiff shr 12
+      let immlo = uint32(adrpImm and 0x03) shl 29
+      let immhi = uint32((adrpImm shr 2) and 0x7FFFF) shl 5
+      var adrp = uint32(modifiedCode[pos]) or (uint32(modifiedCode[pos+1]) shl 8) or
+                 (uint32(modifiedCode[pos+2]) shl 16) or (uint32(modifiedCode[pos+3]) shl 24)
+      adrp = adrp or immlo or immhi
+      modifiedCode[pos+0] = byte(adrp and 0xFF)
+      modifiedCode[pos+1] = byte((adrp shr 8) and 0xFF)
+      modifiedCode[pos+2] = byte((adrp shr 16) and 0xFF)
+      modifiedCode[pos+3] = byte((adrp shr 24) and 0xFF)
+      var add = uint32(modifiedCode[pos+4]) or (uint32(modifiedCode[pos+5]) shl 8) or
+                (uint32(modifiedCode[pos+6]) shl 16) or (uint32(modifiedCode[pos+7]) shl 24)
+      add = add or (uint32(pageOff and 0xFFF) shl 10)
+      modifiedCode[pos+4] = byte(add and 0xFF)
+      modifiedCode[pos+5] = byte((add shr 8) and 0xFF)
+      modifiedCode[pos+6] = byte((add shr 16) and 0xFF)
+      modifiedCode[pos+7] = byte((add shr 24) and 0xFF)
+
+  # Patch TLV adrp+add sites with the descriptor's __thread_vars address (same
+  # page-relative encoding as gvars; each descriptor is 24 bytes).
+  if tlv.sites.len > 0:
+    let tvarsBaseVmaddr = dataVmaddr + uint64(tvarsOff)
+    for (pos, descIdx) in tlv.sites:
+      let descVmaddr = tvarsBaseVmaddr + uint64(descIdx * 24)
+      let adrpVmaddr = textSectionVmaddr + uint64(pos)
+      let pageDiff = int64(descVmaddr and not 0xFFF'u64) - int64(adrpVmaddr and not 0xFFF'u64)
+      let pageOff = descVmaddr and 0xFFF'u64
       let adrpImm = pageDiff shr 12
       let immlo = uint32(adrpImm and 0x03) shl 29
       let immhi = uint32((adrpImm shr 2) and 0x7FFFF) shl 5
@@ -600,9 +694,27 @@ proc writeMachO*(code: Bytes; bssSize: int;
       var zeros = newSeq[byte](paddingToPage)
       f.writeData(unsafeAddr zeros[0], paddingToPage)
 
+  # Write the file-backed part of __DATA (GOT zeros, TLV descriptors, the
+  # __thread_data init template). Only present when TLV forces a file-backed
+  # __DATA; otherwise dataFileSize is 0 and the loader zero-fills __DATA.
+  if dataFileSize > 0:
+    var dataContent = newSeq[byte](dataFileSize)
+    # [gotOff..) stays zero (dyld binds the GOT slots).
+    # [tvarsOff..) the 24-byte descriptors: thunk=0 (bound to __tlv_bootstrap),
+    # key=0 (filled by dyld), offset=per-thread byte offset.
+    for i in 0 ..< nTlv:
+      let descBase = tvarsOff + i * 24
+      let off = uint64(tlv.descriptorOffsets[i])
+      for b in 0 ..< 8:
+        dataContent[descBase + 16 + b] = byte((off shr (8 * b)) and 0xFF)
+    # [tdataOff..) the init template.
+    for i, b in threadData:
+      dataContent[tdataOff + i] = b
+    f.writeData(unsafeAddr dataContent[0], dataContent.len)
+
   # Write __LINKEDIT content
   var linkeditData = newSeq[byte](linkeditFilesize.int)
-  if hasExtProcs and bindInfo.len > 0:
+  if bindInfo.len > 0:
     # Copy bind info
     for i, b in bindInfo:
       linkeditData[i] = b

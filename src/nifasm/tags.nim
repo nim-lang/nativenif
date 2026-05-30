@@ -318,6 +318,90 @@ type
     EnumTagId
     EfldTagId
     ProctypeTagId
+    LdaxrTagId
+    StlxrTagId
+    LdarTagId
+    StlrTagId
+    DmbTagId
+    ClrexTagId
+    D0TagId
+    D1TagId
+    D2TagId
+    D3TagId
+    D4TagId
+    D5TagId
+    D6TagId
+    D7TagId
+    D8TagId
+    D9TagId
+    D10TagId
+    D11TagId
+    D12TagId
+    D13TagId
+    D14TagId
+    D15TagId
+    D16TagId
+    D17TagId
+    D18TagId
+    D19TagId
+    D20TagId
+    D21TagId
+    D22TagId
+    D23TagId
+    D24TagId
+    D25TagId
+    D26TagId
+    D27TagId
+    D28TagId
+    D29TagId
+    D30TagId
+    D31TagId
+    S0TagId
+    S1TagId
+    S2TagId
+    S3TagId
+    S4TagId
+    S5TagId
+    S6TagId
+    S7TagId
+    S8TagId
+    S9TagId
+    S10TagId
+    S11TagId
+    S12TagId
+    S13TagId
+    S14TagId
+    S15TagId
+    S16TagId
+    S17TagId
+    S18TagId
+    S19TagId
+    S20TagId
+    S21TagId
+    S22TagId
+    S23TagId
+    S24TagId
+    S25TagId
+    S26TagId
+    S27TagId
+    S28TagId
+    S29TagId
+    S30TagId
+    S31TagId
+    FmovTagId
+    FaddTagId
+    FsubTagId
+    FmulTagId
+    FdivTagId
+    FnegTagId
+    FcmpTagId
+    FldrTagId
+    FstrTagId
+    ScvtfTagId
+    UcvtfTagId
+    FcvtzsTagId
+    FcvtzuTagId
+    FcvtTagId
 const
   TagData*: array[TagEnum, (string, int)] = [
     ("InvalidTagId", 0),
@@ -635,5 +719,89 @@ const
     ("flexarray", 312),
     ("enum", 313),
     ("efld", 314),
-    ("proctype", 315)
+    ("proctype", 315),
+    ("ldaxr", 316),
+    ("stlxr", 317),
+    ("ldar", 318),
+    ("stlr", 319),
+    ("dmb", 320),
+    ("clrex", 321),
+    ("d0", 322),
+    ("d1", 323),
+    ("d2", 324),
+    ("d3", 325),
+    ("d4", 326),
+    ("d5", 327),
+    ("d6", 328),
+    ("d7", 329),
+    ("d8", 330),
+    ("d9", 331),
+    ("d10", 332),
+    ("d11", 333),
+    ("d12", 334),
+    ("d13", 335),
+    ("d14", 336),
+    ("d15", 337),
+    ("d16", 338),
+    ("d17", 339),
+    ("d18", 340),
+    ("d19", 341),
+    ("d20", 342),
+    ("d21", 343),
+    ("d22", 344),
+    ("d23", 345),
+    ("d24", 346),
+    ("d25", 347),
+    ("d26", 348),
+    ("d27", 349),
+    ("d28", 350),
+    ("d29", 351),
+    ("d30", 352),
+    ("d31", 353),
+    ("s0", 354),
+    ("s1", 355),
+    ("s2", 356),
+    ("s3", 357),
+    ("s4", 358),
+    ("s5", 359),
+    ("s6", 360),
+    ("s7", 361),
+    ("s8", 362),
+    ("s9", 363),
+    ("s10", 364),
+    ("s11", 365),
+    ("s12", 366),
+    ("s13", 367),
+    ("s14", 368),
+    ("s15", 369),
+    ("s16", 370),
+    ("s17", 371),
+    ("s18", 372),
+    ("s19", 373),
+    ("s20", 374),
+    ("s21", 375),
+    ("s22", 376),
+    ("s23", 377),
+    ("s24", 378),
+    ("s25", 379),
+    ("s26", 380),
+    ("s27", 381),
+    ("s28", 382),
+    ("s29", 383),
+    ("s30", 384),
+    ("s31", 385),
+    ("fmov", 386),
+    ("fadd", 387),
+    ("fsub", 388),
+    ("fmul", 389),
+    ("fdiv", 390),
+    ("fneg", 391),
+    ("fcmp", 392),
+    ("fldr", 393),
+    ("fstr", 394),
+    ("scvtf", 395),
+    ("ucvtf", 396),
+    ("fcvtzs", 397),
+    ("fcvtzu", 398),
+    ("fcvt", 399)
   ]

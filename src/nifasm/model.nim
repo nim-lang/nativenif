@@ -189,9 +189,29 @@ type
     StmtsA64 = (ord(StmtsTagId), "stmts")  ## statement block
     JtrueA64 = (ord(JtrueTagId), "jtrue")  ## set control flow variable(s) to true
     KillA64 = (ord(KillTagId), "kill")  ## kill variable
+    LdaxrA64 = (ord(LdaxrTagId), "ldaxr")  ## load-acquire exclusive register
+    StlxrA64 = (ord(StlxrTagId), "stlxr")  ## store-release exclusive register (St = status)
+    LdarA64 = (ord(LdarTagId), "ldar")  ## load-acquire register
+    StlrA64 = (ord(StlrTagId), "stlr")  ## store-release register
+    DmbA64 = (ord(DmbTagId), "dmb")  ## data memory barrier (inner shareable)
+    ClrexA64 = (ord(ClrexTagId), "clrex")  ## clear exclusive monitor
+    FmovA64 = (ord(FmovTagId), "fmov")  ## fp move (reg-reg / gpr<->fp bitcast)
+    FaddA64 = (ord(FaddTagId), "fadd")  ## fp add (D = D + S)
+    FsubA64 = (ord(FsubTagId), "fsub")  ## fp subtract (D = D - S)
+    FmulA64 = (ord(FmulTagId), "fmul")  ## fp multiply (D = D * S)
+    FdivA64 = (ord(FdivTagId), "fdiv")  ## fp divide (D = D / S)
+    FnegA64 = (ord(FnegTagId), "fneg")  ## fp negate (D = -D)
+    FcmpA64 = (ord(FcmpTagId), "fcmp")  ## fp compare
+    FldrA64 = (ord(FldrTagId), "fldr")  ## fp load register
+    FstrA64 = (ord(FstrTagId), "fstr")  ## fp store register
+    ScvtfA64 = (ord(ScvtfTagId), "scvtf")  ## signed int -> fp convert
+    UcvtfA64 = (ord(UcvtfTagId), "ucvtf")  ## unsigned int -> fp convert
+    FcvtzsA64 = (ord(FcvtzsTagId), "fcvtzs")  ## fp -> signed int convert (toward zero)
+    FcvtzuA64 = (ord(FcvtzuTagId), "fcvtzu")  ## fp -> unsigned int convert (toward zero)
+    FcvtA64 = (ord(FcvtTagId), "fcvt")  ## fp precision convert (f32<->f64)
 
 proc rawTagIsA64Inst*(raw: TagEnum): bool {.inline.} =
-  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, SvcTagId, AdrTagId, LdrTagId, StrTagId, StpTagId, LdpTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId}
+  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, SvcTagId, AdrTagId, LdrTagId, StrTagId, StpTagId, LdpTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, LdaxrTagId, StlxrTagId, LdarTagId, StlrTagId, DmbTagId, ClrexTagId, FmovTagId, FaddTagId, FsubTagId, FmulTagId, FdivTagId, FnegTagId, FcmpTagId, FldrTagId, FstrTagId, ScvtfTagId, UcvtfTagId, FcvtzsTagId, FcvtzuTagId, FcvtTagId}
 
 type
   NifasmType* = enum
@@ -388,7 +408,71 @@ type
     LrR = (ord(LrTagId), "lr")  ## link register (alias for x30)
     FpR = (ord(FpTagId), "fp")  ## frame pointer (alias for x29)
     XzrR = (ord(XzrTagId), "xzr")  ## zero register
+    D0R = (ord(D0TagId), "d0")  ## fp register d0
+    D1R = (ord(D1TagId), "d1")  ## fp register d1
+    D2R = (ord(D2TagId), "d2")  ## fp register d2
+    D3R = (ord(D3TagId), "d3")  ## fp register d3
+    D4R = (ord(D4TagId), "d4")  ## fp register d4
+    D5R = (ord(D5TagId), "d5")  ## fp register d5
+    D6R = (ord(D6TagId), "d6")  ## fp register d6
+    D7R = (ord(D7TagId), "d7")  ## fp register d7
+    D8R = (ord(D8TagId), "d8")  ## fp register d8
+    D9R = (ord(D9TagId), "d9")  ## fp register d9
+    D10R = (ord(D10TagId), "d10")  ## fp register d10
+    D11R = (ord(D11TagId), "d11")  ## fp register d11
+    D12R = (ord(D12TagId), "d12")  ## fp register d12
+    D13R = (ord(D13TagId), "d13")  ## fp register d13
+    D14R = (ord(D14TagId), "d14")  ## fp register d14
+    D15R = (ord(D15TagId), "d15")  ## fp register d15
+    D16R = (ord(D16TagId), "d16")  ## fp register d16
+    D17R = (ord(D17TagId), "d17")  ## fp register d17
+    D18R = (ord(D18TagId), "d18")  ## fp register d18
+    D19R = (ord(D19TagId), "d19")  ## fp register d19
+    D20R = (ord(D20TagId), "d20")  ## fp register d20
+    D21R = (ord(D21TagId), "d21")  ## fp register d21
+    D22R = (ord(D22TagId), "d22")  ## fp register d22
+    D23R = (ord(D23TagId), "d23")  ## fp register d23
+    D24R = (ord(D24TagId), "d24")  ## fp register d24
+    D25R = (ord(D25TagId), "d25")  ## fp register d25
+    D26R = (ord(D26TagId), "d26")  ## fp register d26
+    D27R = (ord(D27TagId), "d27")  ## fp register d27
+    D28R = (ord(D28TagId), "d28")  ## fp register d28
+    D29R = (ord(D29TagId), "d29")  ## fp register d29
+    D30R = (ord(D30TagId), "d30")  ## fp register d30
+    D31R = (ord(D31TagId), "d31")  ## fp register d31
+    S0R = (ord(S0TagId), "s0")  ## fp register s0
+    S1R = (ord(S1TagId), "s1")  ## fp register s1
+    S2R = (ord(S2TagId), "s2")  ## fp register s2
+    S3R = (ord(S3TagId), "s3")  ## fp register s3
+    S4R = (ord(S4TagId), "s4")  ## fp register s4
+    S5R = (ord(S5TagId), "s5")  ## fp register s5
+    S6R = (ord(S6TagId), "s6")  ## fp register s6
+    S7R = (ord(S7TagId), "s7")  ## fp register s7
+    S8R = (ord(S8TagId), "s8")  ## fp register s8
+    S9R = (ord(S9TagId), "s9")  ## fp register s9
+    S10R = (ord(S10TagId), "s10")  ## fp register s10
+    S11R = (ord(S11TagId), "s11")  ## fp register s11
+    S12R = (ord(S12TagId), "s12")  ## fp register s12
+    S13R = (ord(S13TagId), "s13")  ## fp register s13
+    S14R = (ord(S14TagId), "s14")  ## fp register s14
+    S15R = (ord(S15TagId), "s15")  ## fp register s15
+    S16R = (ord(S16TagId), "s16")  ## fp register s16
+    S17R = (ord(S17TagId), "s17")  ## fp register s17
+    S18R = (ord(S18TagId), "s18")  ## fp register s18
+    S19R = (ord(S19TagId), "s19")  ## fp register s19
+    S20R = (ord(S20TagId), "s20")  ## fp register s20
+    S21R = (ord(S21TagId), "s21")  ## fp register s21
+    S22R = (ord(S22TagId), "s22")  ## fp register s22
+    S23R = (ord(S23TagId), "s23")  ## fp register s23
+    S24R = (ord(S24TagId), "s24")  ## fp register s24
+    S25R = (ord(S25TagId), "s25")  ## fp register s25
+    S26R = (ord(S26TagId), "s26")  ## fp register s26
+    S27R = (ord(S27TagId), "s27")  ## fp register s27
+    S28R = (ord(S28TagId), "s28")  ## fp register s28
+    S29R = (ord(S29TagId), "s29")  ## fp register s29
+    S30R = (ord(S30TagId), "s30")  ## fp register s30
+    S31R = (ord(S31TagId), "s31")  ## fp register s31
 
 proc rawTagIsA64Reg*(raw: TagEnum): bool {.inline.} =
-  raw >= X0TagId and raw <= XzrTagId
+  raw in {X0TagId, X1TagId, X2TagId, X3TagId, X4TagId, X5TagId, X6TagId, X7TagId, X8TagId, X9TagId, X10TagId, X11TagId, X12TagId, X13TagId, X14TagId, X15TagId, X16TagId, X17TagId, X18TagId, X19TagId, X20TagId, X21TagId, X22TagId, X23TagId, X24TagId, X25TagId, X26TagId, X27TagId, X28TagId, X29TagId, X30TagId, SpTagId, W0TagId, W1TagId, W2TagId, W3TagId, W4TagId, W5TagId, W6TagId, W7TagId, W8TagId, W9TagId, W10TagId, W11TagId, W12TagId, W13TagId, W14TagId, W15TagId, W16TagId, W17TagId, W18TagId, W19TagId, W20TagId, W21TagId, W22TagId, W23TagId, W24TagId, W25TagId, W26TagId, W27TagId, W28TagId, W29TagId, W30TagId, WspTagId, LrTagId, FpTagId, XzrTagId, D0TagId, D1TagId, D2TagId, D3TagId, D4TagId, D5TagId, D6TagId, D7TagId, D8TagId, D9TagId, D10TagId, D11TagId, D12TagId, D13TagId, D14TagId, D15TagId, D16TagId, D17TagId, D18TagId, D19TagId, D20TagId, D21TagId, D22TagId, D23TagId, D24TagId, D25TagId, D26TagId, D27TagId, D28TagId, D29TagId, D30TagId, D31TagId, S0TagId, S1TagId, S2TagId, S3TagId, S4TagId, S5TagId, S6TagId, S7TagId, S8TagId, S9TagId, S10TagId, S11TagId, S12TagId, S13TagId, S14TagId, S15TagId, S16TagId, S17TagId, S18TagId, S19TagId, S20TagId, S21TagId, S22TagId, S23TagId, S24TagId, S25TagId, S26TagId, S27TagId, S28TagId, S29TagId, S30TagId, S31TagId}
 

@@ -176,7 +176,10 @@ type
     ssizePatches: seq[int]
     csizePatches: seq[(int, int)] # (position, callStackDepth) for csize patches
     gvarSites: seq[(int, Symbol)] # (adrp position in .text, gvar symbol) for adrp+add patching
-    tlsOffset: int  # Current TLS offset for thread-local variables
+    tlvSites: seq[(int, Symbol)]  # (adrp position in .text, tvar symbol) for TLV descriptor adrp+add patching (arm64/macOS)
+    tlvSyms: seq[Symbol]          # thread-local vars in descriptor order (arm64/macOS); sym.offset = descriptor index, sym.size = byte offset within the per-thread region
+    tlvData: seq[byte]            # the __thread_data init template (concatenated per-thread initial values, arm64/macOS)
+    tlsOffset: int  # Current TLS offset for thread-local variables (x86)
     bssOffset: int  # Current offset in .bss section
     modules: Table[string, LoadedModule]  # Cache of loaded foreign modules
     baseDir: string  # Base directory for finding module files
@@ -879,6 +882,19 @@ proc parseRegisterA64(n: var Cursor): arm64.Register =
   inc n
   skipParRi n, "register"
 
+proc isA64FpRegTag(t: TagEnum): bool {.inline.} =
+  ## True for the double-precision fp register tags `(d0)`..`(d31)`.
+  ord(t) >= ord(D0TagId) and ord(t) <= ord(D31TagId)
+
+proc isA64FpRegOperand(n: Cursor): bool {.inline.} =
+  n.kind == ParLe and isA64FpRegTag(n.tag)
+
+proc parseFloatRegisterA64(n: var Cursor): arm64.FloatRegister =
+  if not isA64FpRegOperand(n): error("Expected fp register (dN)", n)
+  result = arm64.FloatRegister(ord(n.tag) - ord(D0TagId))
+  inc n
+  skipParRi n, "fp register"
+
 
 type
   OperandA64 = object
@@ -891,6 +907,9 @@ type
     gvarSym: Symbol       # non-nil if this operand is a global (.bss) address;
                           # its `.size` (the .bss byte offset) is read after all
                           # symbols are processed, so forward refs resolve right
+    tlvSym: Symbol        # non-nil if this operand is a thread-local var address
+                          # (arm64/macOS): `adr` lowers it to the TLV descriptor
+                          # call sequence, leaving the variable's address in x0
 
 proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
   if n.kind == ParLe:
@@ -1123,13 +1142,13 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       result.typ = Type(kind: UIntT, bits: 64)
       inc n
     elif sym != nil and sym.kind == skTvar:
-      result.kind = okMem
-      result.mem = arm64.MemoryOperand(
-        base: arm64.FP,
-        offset: int32(sym.offset),
-        hasIndex: false
-      )
-      result.typ = sym.typ
+      # Thread-local var (macOS/arm64): its address is obtained at run time via
+      # the TLV descriptor thunk. Carry the symbol; `adr` lowers the call
+      # sequence and leaves the variable's address in x0. It is not a plain
+      # memory operand, so it must not be loaded/stored directly.
+      result.kind = okLabel
+      result.tlvSym = sym
+      result.typ = Type(kind: UIntT, bits: 64)
       inc n
     else:
       error("Unknown or invalid symbol: " & name, n)
@@ -1163,14 +1182,10 @@ proc parseDestA64(n: var Cursor; ctx: var GenContext): OperandA64 =
         error("Variable has no location", n)
       inc n
     elif sym != nil and sym.kind == skTvar:
-      result.kind = okMem
-      result.mem = arm64.MemoryOperand(
-        base: arm64.FP,
-        offset: int32(sym.offset),
-        hasIndex: false
-      )
-      result.typ = sym.typ
-      inc n
+      # A thread-local var cannot be a direct destination on arm64/macOS: take its
+      # address with `(adr (x0) tv)` first, then store through `(mem (x0))`.
+      error("Cannot store directly to thread-local '" & name &
+            "'; use (adr (x0) " & name & ") then (mem (x0))", n)
     else:
       error("Expected variable or register as destination", n)
   else:
@@ -1505,11 +1520,10 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       elif op.kind == okImm:
         if op.immVal >= 0 and op.immVal <= 0xFFFF:
           arm64.emitMovImm(ctx.buf.data, dest.reg, uint16(op.immVal))
-        elif op.immVal >= 0:
-          # Use MOVZ + MOVK to load large immediate values
-          arm64.emitMovImm64(ctx.buf.data, dest.reg, uint64(op.immVal))
         else:
-          error("Immediate value out of range", n)
+          # MOVZ + MOVK loads the full 64-bit pattern, including negatives and
+          # the raw bit patterns of floating-point constants.
+          arm64.emitMovImm64(ctx.buf.data, dest.reg, cast[uint64](op.immVal))
       elif op.kind == okMem and op.mem.hasIndex:
         var base = op.mem.base
         if op.mem.offset != 0:
@@ -1538,7 +1552,22 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
     if dest.kind == okMem: error("ADR destination must be register", n)
-    if op.gvarSym != nil:
+    if op.tlvSym != nil:
+      # Thread-local variable (macOS/arm64): obtain its address through the TLV
+      # descriptor thunk. The descriptor lives in __DATA/__thread_vars; its first
+      # word is a function pointer that, called with the descriptor address in
+      # x0, returns the variable's address in x0 (preserving all other regs).
+      #   adrp x0, desc@PAGE ; add x0, x0, desc@PAGEOFF   (patched in writeMachO)
+      #   ldr  x16, [x0]                                   ; load the thunk
+      #   blr  x16                                         ; x0 = &var
+      let pos = ctx.buf.data.getCurrentPosition()
+      arm64.emitAdrpAddGvar(ctx.buf.data, arm64.X0)     # x0 = &descriptor
+      ctx.tlvSites.add (pos, op.tlvSym)
+      arm64.emitLdr(ctx.buf.data, arm64.X16, arm64.X0, 0'i32)
+      arm64.emitBlr(ctx.buf.data, arm64.X16)
+      if dest.reg != arm64.X0:
+        arm64.emitMov(ctx.buf.data, dest.reg, arm64.X0)
+    elif op.gvarSym != nil:
       # Global in __DATA/.bss: form its address with adrp+add (PC-relative adr
       # can't reach __DATA). Emit placeholders; writeMachO patches the page /
       # page-offset once the __DATA layout is known.
@@ -1794,6 +1823,127 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     if op.kind == okMem: error("STR source cannot be memory", n)
     ctx.buf.data.emitStr(op.reg, dest.mem.base, dest.mem.offset)
     skipParRi n
+
+  of LdaxrA64:
+    # (ldaxr Dt Sptr) — Dt ← exclusive-acquire load of [Sptr].
+    inc n
+    let rt = parseRegisterA64(n)
+    let rn = parseRegisterA64(n)
+    arm64.emitLdaxr(ctx.buf.data, rt, rn)
+    skipParRi n
+
+  of StlxrA64:
+    # (stlxr St Dval Sptr) — store-release-exclusive Dval to [Sptr]; St ← status.
+    inc n
+    let rs = parseRegisterA64(n)
+    let rt = parseRegisterA64(n)
+    let rn = parseRegisterA64(n)
+    arm64.emitStlxr(ctx.buf.data, rs, rt, rn)
+    skipParRi n
+
+  of LdarA64:
+    # (ldar Dt Sptr) — Dt ← acquire load of [Sptr].
+    inc n
+    let rt = parseRegisterA64(n)
+    let rn = parseRegisterA64(n)
+    arm64.emitLdar(ctx.buf.data, rt, rn)
+    skipParRi n
+
+  of StlrA64:
+    # (stlr Dval Sptr) — release store Dval to [Sptr].
+    inc n
+    let rt = parseRegisterA64(n)
+    let rn = parseRegisterA64(n)
+    arm64.emitStlr(ctx.buf.data, rt, rn)
+    skipParRi n
+
+  of DmbA64:
+    inc n
+    arm64.emitDmbIsh(ctx.buf.data)
+    skipParRi n
+
+  of ClrexA64:
+    inc n
+    arm64.emitClrex(ctx.buf.data)
+    skipParRi n
+
+  of FmovA64:
+    # (fmov D S): D=fp,S=fp → reg copy; D=fp,S=gpr / D=gpr,S=fp → bit move.
+    inc n
+    if isA64FpRegOperand(n):
+      let rd = parseFloatRegisterA64(n)
+      if isA64FpRegOperand(n):
+        arm64.emitFmov(ctx.buf.data, rd, parseFloatRegisterA64(n))
+      else:
+        arm64.emitFmovFromGpr(ctx.buf.data, rd, parseRegisterA64(n))
+    else:
+      let rd = parseRegisterA64(n)
+      arm64.emitFmovToGpr(ctx.buf.data, rd, parseFloatRegisterA64(n))
+    skipParRi n
+
+  of FaddA64, FsubA64, FmulA64, FdivA64:
+    # (fop D S) → D = D op S  (emitted as `fop Dd, Dd, Ds`).
+    inc n
+    let rd = parseFloatRegisterA64(n)
+    let rs = parseFloatRegisterA64(n)
+    case instTag
+    of FaddA64: arm64.emitFadd(ctx.buf.data, rd, rd, rs)
+    of FsubA64: arm64.emitFsub(ctx.buf.data, rd, rd, rs)
+    of FmulA64: arm64.emitFmul(ctx.buf.data, rd, rd, rs)
+    else:       arm64.emitFdiv(ctx.buf.data, rd, rd, rs)
+    skipParRi n
+
+  of FnegA64:
+    inc n
+    let rd = parseFloatRegisterA64(n)
+    arm64.emitFneg(ctx.buf.data, rd, rd)
+    skipParRi n
+
+  of FcmpA64:
+    inc n
+    let rn = parseFloatRegisterA64(n)
+    let rm = parseFloatRegisterA64(n)
+    arm64.emitFcmp(ctx.buf.data, rn, rm)
+    skipParRi n
+
+  of FldrA64:
+    # (fldr D <mem>) — load a double.
+    inc n
+    let rt = parseFloatRegisterA64(n)
+    let op = parseOperandA64(n, ctx)
+    if op.kind != okMem: error("FLDR source must be memory", n)
+    arm64.emitFldr(ctx.buf.data, rt, op.mem.base, op.mem.offset)
+    skipParRi n
+
+  of FstrA64:
+    # (fstr <mem> D) — store a double.
+    inc n
+    let dest = parseOperandA64(n, ctx)
+    if dest.kind != okMem: error("FSTR destination must be memory", n)
+    let rt = parseFloatRegisterA64(n)
+    arm64.emitFstr(ctx.buf.data, rt, dest.mem.base, dest.mem.offset)
+    skipParRi n
+
+  of ScvtfA64, UcvtfA64:
+    # (scvtf Dfp Sgpr) — int → double.
+    inc n
+    let rd = parseFloatRegisterA64(n)
+    let rn = parseRegisterA64(n)
+    if instTag == ScvtfA64: arm64.emitScvtf(ctx.buf.data, rd, rn)
+    else:                   arm64.emitUcvtf(ctx.buf.data, rd, rn)
+    skipParRi n
+
+  of FcvtzsA64, FcvtzuA64:
+    # (fcvtzs Dgpr Sfp) — double → int (toward zero).
+    inc n
+    let rd = parseRegisterA64(n)
+    let rn = parseFloatRegisterA64(n)
+    if instTag == FcvtzsA64: arm64.emitFcvtzs(ctx.buf.data, rd, rn)
+    else:                    arm64.emitFcvtzu(ctx.buf.data, rd, rn)
+    skipParRi n
+
+  of FcvtA64:
+    error("FCVT (single<->double precision) not supported yet", n)
 
   of BA64:
     inc n
@@ -4248,7 +4398,16 @@ proc writeMachO(a: var GenContext; outfile: string) =
 
   var gsites: seq[(int, int)] = @[]   # resolve each global's final .bss offset now
   for (pos, sym) in a.gvarSites: gsites.add (pos, sym.size)
-  macho.writeMachO(code, a.bssOffset, cputype, cpusubtype, outfile, dynlink, gsites)
+
+  # Thread-local storage (macOS TLV): one 24-byte descriptor per tvar, the
+  # __thread_data init template, and the adrp+add sites referencing each
+  # descriptor (carried by descriptor index).
+  var tlv: macho.TlvInfo
+  for sym in a.tlvSyms: tlv.descriptorOffsets.add sym.size
+  tlv.threadData = a.tlvData
+  for (pos, sym) in a.tlvSites: tlv.sites.add (pos, sym.offset)
+
+  macho.writeMachO(code, a.bssOffset, cputype, cpusubtype, outfile, dynlink, gsites, tlv)
 
   # macOS arm64 requires code signing for all executables
   when defined(macosx):
@@ -4334,8 +4493,28 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
   of skTvar:
     if declTag == TvarD:
       let size = slots.alignedSize(sym.typ)
-      sym.offset = ctx.tlsOffset
-      ctx.tlsOffset += size
+      case ctx.arch
+      of Arch.A64:
+        # macOS TLV: give the variable a descriptor index and a byte offset in
+        # the per-thread storage region, and bake a literal initializer (if any)
+        # into the __thread_data template dyld copies on first access per thread.
+        let align = max(asmSizeOf(sym.typ), 1)
+        while (ctx.tlvData.len mod align) != 0: ctx.tlvData.add 0
+        sym.offset = ctx.tlvSyms.len    # descriptor index
+        sym.size = ctx.tlvData.len      # byte offset within the per-thread region
+        ctx.tlvSyms.add sym
+        # Parse the optional initializer: (tvar :name type value?)
+        var dn = n
+        inc dn                          # tvar tag
+        discard getSymDef(dn)           # name (advances dn)
+        discard parseType(dn, ctx.scope, ctx)  # type (advances dn)
+        var initVal = 0'i64
+        if dn.kind == IntLit: initVal = getInt(dn)
+        for i in 0 ..< size:
+          ctx.tlvData.add byte((initVal shr (8 * i)) and 0xFF)
+      else:
+        sym.offset = ctx.tlsOffset
+        ctx.tlsOffset += size
   else:
     discard  # Types and other symbols don't need code generation
 
