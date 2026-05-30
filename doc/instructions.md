@@ -401,3 +401,5 @@
 | `(fcvt D S)`        | A64Inst                 | fp precision convert (f32<->f64) |
 | `(fstp D1 D2 S O)`  | A64Inst                 | fp store pair (pre-indexed) |
 | `(fldp D1 D2 S O)`  | A64Inst                 | fp load pair (post-indexed) |
+| `(ldrb D B I)`      | A64Inst                 | load byte (zero-extend), register offset [B,I] |
+| `(strb D B I)`      | A64Inst                 | store low byte, register offset [B,I] |

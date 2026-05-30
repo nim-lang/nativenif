@@ -1,0 +1,109 @@
+(.nif27)
+(stmts
+ (arch arm64)
+ (proc :sum10.0
+  (params
+   (param :p0.0
+    (x0)
+    (i 64))
+   (param :p1.0
+    (x1)
+    (i 64))
+   (param :p2.0
+    (x2)
+    (i 64))
+   (param :p3.0
+    (x3)
+    (i 64))
+   (param :p4.0
+    (x4)
+    (i 64))
+   (param :p5.0
+    (x5)
+    (i 64))
+   (param :p6.0
+    (x6)
+    (i 64))
+   (param :p7.0
+    (x7)
+    (i 64))
+   (param :p8.0
+    (s)
+    (i 64))
+   (param :p9.0
+    (s)
+    (i 64)))
+  (result
+   (:ret.0
+    (x0)
+    (i 64)))
+  (clobber)
+  (stmts
+   (mov
+    (x9)p8.0)
+   (mov
+    (x10)p9.0)
+   (add
+    (x7)
+    (x9))
+   (add
+    (x7)
+    (x10))
+   (mov
+    (x0)
+    (x7))
+   (ret)))
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (var :res.0
+    (x19)
+    (i 64))
+   (prepare sum10.0
+    (mov
+     (arg p0.0)0)
+    (mov
+     (arg p1.0)0)
+    (mov
+     (arg p2.0)0)
+    (mov
+     (arg p3.0)0)
+    (mov
+     (arg p4.0)0)
+    (mov
+     (arg p5.0)0)
+    (mov
+     (arg p6.0)0)
+    (mov
+     (arg p7.0)10)
+    (sub
+     (sp)
+     (csize))
+    (mov
+     (x9)30)
+    (mov
+     (mem
+      (sp)
+      (arg p8.0))
+     (x9))
+    (mov
+     (x9)2)
+    (mov
+     (mem
+      (sp)
+      (arg p9.0))
+     (x9))
+    (call)
+    (add
+     (sp)
+     (csize))
+    (mov res.0
+     (res ret.0)))
+   (sub res.0 42)
+   (mov
+    (x16)33554433)
+   (mov
+    (x0)res.0)
+   (svc 0))))

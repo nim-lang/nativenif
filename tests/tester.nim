@@ -27,6 +27,12 @@ proc execExpectOutput(cmd: string; expected: string) =
 when defined(macosx):
   exec "nim c -r src/nifasm/nifasm tests/hello_darwin.nif"
   exec "tests/hello_darwin"
+  # Declarative call ABI on AArch64 (macOS arm64). Each test exits with
+  # (computed - 42), i.e. 0 on success, so plain `exec` validates it.
+  exec "nim c -r src/nifasm/nifasm tests/call_a64_reg_args.nif"
+  exec "tests/call_a64_reg_args"
+  exec "nim c -r src/nifasm/nifasm tests/call_a64_stack_args.nif"
+  exec "tests/call_a64_stack_args"
 elif defined(windows):
   exec "nim c -r src/nifasm/nifasm tests/hello_win64.nif"
   exec "./tests/hello_win64.exe"
@@ -88,6 +94,7 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/missing_result_binding.nif",
 execExpectFailure("nim c -r src/nifasm/nifasm tests/stack_result_binding.nif", "Type mismatch: expected (stackoff")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/result_type_mismatch.nif", "Type mismatch:")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/call_missing_argument.nif", "Missing argument: arg.1")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/call_a64_missing_arg.nif", "Missing argument: arg.1")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/call_duplicate_result_binding.nif", "Result already bound: ret.0")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/module_missing.nif", "Foreign module file not found: no_such_mod")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/module_missing_symbol.nif", "Unknown type: Missing.0.mod_missing_symbol")

@@ -1,0 +1,29 @@
+(.nif27)
+(stmts
+ (arch arm64)
+ (proc :callee.0
+  (params
+   (param :arg.0
+    (x0)
+    (i 64))
+   (param :arg.1
+    (x1)
+    (i 64)))
+  (result)
+  (clobber)
+  (stmts
+   (ret)))
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (prepare callee.0
+    (mov
+     (arg arg.0)1)
+    (call))
+   (mov
+    (x16)33554433)
+   (mov
+    (x0)0)
+   (svc 0))))

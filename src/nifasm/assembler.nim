@@ -263,12 +263,15 @@ proc findResult(t: Type; name: string): ptr Param =
   nil
 
 proc computeStackArgSize(t: Type): int =
-  ## Compute total size needed for stack arguments
+  ## Compute total size needed for stack arguments. Rounded up to 16 bytes so a
+  ## caller can `sub sp, sp, #csize` and keep SP 16-byte aligned (required by
+  ## AArch64; harmless for x86-64 where the SysV ABI also wants 16-alignment).
   assert t.kind == ProcT
   result = 0
   for param in t.params:
     if param.typ.isOnStack:
       result += slots.alignedSize(param.typ)
+  result = (result + 15) and not 15
 
 proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type
 proc parseParams(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param]
@@ -614,7 +617,7 @@ proc parseParams(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
       var onStack = false
       if n.kind == ParLe:
         let locTag = n.tag
-        if rawTagIsX64Reg(locTag):
+        if rawTagIsX64Reg(locTag) or rawTagIsA64Reg(locTag):
           reg = locTag
           inc n
           skipParRi n, "param location"
@@ -672,6 +675,12 @@ proc parseClobbers(n: var Cursor): set[x86.Register] =
     while n.kind != ParRi:
       if n.kind == ParLe and rawTagIsX64Reg(n.tag):
         result.incl parseRegister(n)
+      elif n.kind == ParLe and rawTagIsA64Reg(n.tag):
+        # AArch64 clobbers describe the convention's caller-saved set. The
+        # interference model that consumes `clobbers` is x86-only (the A64 path
+        # resolves registers directly), so accept and skip them here.
+        inc n
+        skipParRi n, "clobber register"
       else:
         error("Expected register in clobber list", n)
     inc n
@@ -914,6 +923,7 @@ type
     typ: Type
     immVal: int64
     mem: arm64.MemoryOperand
+    argName: string       # set for okArg (call argument / result binding by name)
     label: LabelId
     gvarSym: Symbol       # non-nil if this operand is a global (.bss) address;
                           # its `.size` (the .bss byte offset) is read after all
@@ -1067,7 +1077,13 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
         var hasIndex = false
         var indexReg: arm64.Register = arm64.X0
         var shift: int = 0
-        if n.kind == IntLit or n.kind == Symbol:
+        if n.kind == ParLe and n.tag == ArgTagId:
+          # (mem (sp) (arg name)) - address of an outgoing stack argument slot
+          let argOff = parseOperandA64(n, ctx)
+          if argOff.kind != okImm:
+            error("(arg ...) in mem must denote a stack argument", n)
+          offset = int32(argOff.immVal)
+        elif n.kind == IntLit or n.kind == Symbol:
           if n.kind == IntLit:
             offset = int32(getInt(n))
             inc n
@@ -1103,6 +1119,64 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       result.typ = Type(kind: IntT, bits: 64)
       inc n
       skipParRi n, "`ssize` expression"
+    elif t == CsizeTagId:
+      # (csize) - total bytes reserved for outgoing stack arguments
+      if not ctx.inCall:
+        error("(csize) can only be used inside a prepare block", n)
+      result.kind = okCsize
+      result.immVal = int64(ctx.callContext.stackArgSize)
+      result.typ = Type(kind: IntT, bits: 64)
+      inc n
+      skipParRi n, "`csize` expression"
+    elif t == ArgTagId:
+      # (arg name) - argument reference inside a prepare block
+      if not ctx.inCall:
+        error("(arg ...) can only be used inside a prepare block", n)
+      inc n
+      if n.kind != Symbol: error("Expected argument name in (arg ...)", n)
+      let argName = getSym(n)
+      inc n
+      skipParRi n, "`arg` expression"
+      let paramPtr = findParam(ctx.callContext.typ, argName)
+      if paramPtr == nil:
+        error("Unknown argument: " & argName, n)
+      if paramPtr.typ.isOnStack:
+        # Stack argument used as an offset (e.g. inside (mem (sp) (arg name))).
+        # The offset is the running byte position among the stack-passed params.
+        var offset = 0
+        for p in ctx.callContext.typ.params:
+          if p.typ.isOnStack:
+            if p.name == argName:
+              break
+            offset += slots.alignedSize(p.typ)
+        result.kind = okImm
+        result.argName = argName
+        result.immVal = int64(offset)
+        result.typ = paramPtr.typ
+      else:
+        result.kind = okArg
+        result.argName = argName
+        result.reg = tagToRegisterA64(paramPtr.reg, n)
+        result.typ = paramPtr.typ
+    elif t == ResTagId:
+      # (res name) - result reference inside a prepare block (after the call)
+      if not ctx.inCall:
+        error("(res ...) can only be used inside a prepare block", n)
+      inc n
+      if n.kind != Symbol: error("Expected result name in (res ...)", n)
+      let resName = getSym(n)
+      inc n
+      skipParRi n, "`res` expression"
+      if not ctx.callContext.callEmitted:
+        error("(res ...) can only be used after (call) or (extcall)", n)
+      let resPtr = findResult(ctx.callContext.typ, resName)
+      if resPtr == nil:
+        error("Unknown result: " & resName, n)
+      if resName in ctx.callContext.resultsSet:
+        error("Result already bound: " & resName, n)
+      ctx.callContext.resultsSet.incl(resName)
+      result.reg = tagToRegisterA64(resPtr.reg, n)
+      result.typ = resPtr.typ
     else:
       error("Unexpected operand tag: " & $t, n)
   elif n.kind == IntLit:
@@ -1170,6 +1244,27 @@ proc parseDestA64(n: var Cursor; ctx: var GenContext): OperandA64 =
   if n.kind == ParLe and rawTagIsA64Reg(n.tag):
     result.reg = parseRegisterA64(n)
     result.typ = Type(kind: RegisterT, regBits: 64)
+  elif n.kind == ParLe and n.tag == ArgTagId:
+    # (arg name) as destination - binds a register argument inside a prepare block
+    if not ctx.inCall:
+      error("(arg ...) can only be used inside a prepare block", n)
+    inc n
+    if n.kind != Symbol: error("Expected argument name in (arg ...)", n)
+    let argName = getSym(n)
+    inc n
+    skipParRi n, "arg destination"
+    let paramPtr = findParam(ctx.callContext.typ, argName)
+    if paramPtr == nil:
+      error("Unknown argument: " & argName, n)
+    if paramPtr.typ.isOnStack:
+      error("Stack argument '" & argName & "' cannot be used directly as destination, use (mem (sp) (arg " & argName & "))", n)
+    if argName in ctx.callContext.argsSet:
+      error("Argument already set: " & argName, n)
+    ctx.callContext.argsSet.incl(argName)
+    result.kind = okArg
+    result.argName = argName
+    result.reg = tagToRegisterA64(paramPtr.reg, n)
+    result.typ = paramPtr.typ
   elif n.kind == ParLe and (n.tag == MemTagId or n.tag == DotTagId or n.tag == AtTagId):
     let op = parseOperandA64(n, ctx)
     if op.kind != okMem:
@@ -1178,7 +1273,7 @@ proc parseDestA64(n: var Cursor; ctx: var GenContext): OperandA64 =
   elif n.kind == Symbol:
     let name = getSym(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
-    if sym != nil and sym.kind == skVar:
+    if sym != nil and (sym.kind == skVar or sym.kind == skParam):
       if sym.typ.isOnStack:
         # Return StackOffT - operations like `add` will reject this at type check
         result.kind = okMem
@@ -1402,6 +1497,31 @@ proc genKillA64(n: var Cursor; ctx: var GenContext) =
   inc n
   skipParRi n
 
+proc memWidthOpc(typ: Type; isLoad: bool): tuple[size, opc: int] =
+  ## Access width (0=byte,1=half,2=word,3=dword) and the load/store `opc` for a
+  ## typed memory operand. A `(mem (dot …))` / `(mem (at …))` carries the field /
+  ## element type, so a narrow integer load sign-/zero-extends and a narrow store
+  ## writes only its low bits. Anything non-integer (pointer, raw `(mem reg)`,
+  ## stack slot) is a full 64-bit access.
+  var bits = 64
+  var signed = false
+  if typ != nil:
+    case typ.kind
+    of IntT: bits = typ.bits; signed = true       # `(i N)` (and `(c N)` chars)
+    of UIntT: bits = typ.bits
+    of BoolT: bits = 8
+    else: bits = 64                                # PtrT / StackOffT / raw mem
+  let size = case bits
+    of 8: 0
+    of 16: 1
+    of 32: 2
+    else: 3
+  let opc = if not isLoad: 0
+            elif size == 3: 1                      # 64-bit: plain load, no extend
+            elif signed: 2                         # LDRSB/LDRSH/LDRSW → 64-bit
+            else: 1                                # LDRB/LDRH/LDR(W) zero-extend
+  (size, opc)
+
 proc genInstA64(n: var Cursor; ctx: var GenContext) =
   if n.kind != ParLe: error("Expected instruction", n)
   let instTag = tagToA64Inst(n.tag)
@@ -1521,9 +1641,11 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
         if dest.mem.offset != 0:
           arm64.emitAddImm(ctx.buf.data, arm64.X16, base, uint16(dest.mem.offset))
           base = arm64.X16
-        arm64.emitStrReg(ctx.buf.data, op.reg, base, dest.mem.index, dest.mem.shift)
+        let (size, opc) = memWidthOpc(dest.typ, isLoad = false)
+        arm64.emitLoadStoreReg(ctx.buf.data, op.reg, base, dest.mem.index, size, opc, dest.mem.shift)
       else:
-        arm64.emitStr(ctx.buf.data, op.reg, dest.mem.base, dest.mem.offset)
+        let (size, opc) = memWidthOpc(dest.typ, isLoad = false)
+        arm64.emitLoadStoreUImm(ctx.buf.data, op.reg, dest.mem.base, dest.mem.offset, size, opc)
     else:
       if op.kind == okSsize:
         arm64.emitMovImm(ctx.buf.data, dest.reg, 0'u16)
@@ -1540,9 +1662,16 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
         if op.mem.offset != 0:
           arm64.emitAddImm(ctx.buf.data, arm64.X16, base, uint16(op.mem.offset))
           base = arm64.X16
-        arm64.emitLdrReg(ctx.buf.data, dest.reg, base, op.mem.index, op.mem.shift)
+        let (size, opc) = memWidthOpc(op.typ, isLoad = true)
+        arm64.emitLoadStoreReg(ctx.buf.data, dest.reg, base, op.mem.index, size, opc, op.mem.shift)
       elif op.kind == okMem:
-        arm64.emitLdr(ctx.buf.data, dest.reg, op.mem.base, op.mem.offset)
+        let (size, opc) = memWidthOpc(op.typ, isLoad = true)
+        arm64.emitLoadStoreUImm(ctx.buf.data, dest.reg, op.mem.base, op.mem.offset, size, opc)
+      elif dest.reg == op.reg:
+        # 64-bit register self-move is a no-op; elide it. This makes a result
+        # self-binding such as `(mov (x0) (res ret.0))` cost nothing, so callers
+        # can declaratively bind results to their natural register for free.
+        discard
       else:
         arm64.emitMov(ctx.buf.data, dest.reg, op.reg)
     skipParRi n
@@ -1605,7 +1734,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       if op.kind == okSsize:
         arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, 0'u16)
         ctx.ssizePatches.add(ctx.buf.data.len - 4)
-      elif op.kind == okImm:
+      elif op.kind == okImm or op.kind == okCsize:
         if op.immVal >= 0 and op.immVal <= 0xFFFF:
           arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.immVal))
         else:
@@ -1629,7 +1758,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       if op.kind == okSsize:
         arm64.emitSubImm(ctx.buf.data, dest.reg, dest.reg, 0'u16)
         ctx.ssizePatches.add(ctx.buf.data.len - 4)
-      elif op.kind == okImm:
+      elif op.kind == okImm or op.kind == okCsize:
         if op.immVal >= 0 and op.immVal <= 0xFFFF:
           arm64.emitSubImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.immVal))
         else:
@@ -1866,6 +1995,24 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let rt = parseRegisterA64(n)
     let rn = parseRegisterA64(n)
     arm64.emitStlr(ctx.buf.data, rt, rn)
+    skipParRi n
+
+  of LdrbA64:
+    # (ldrb Dt Bbase Iindex) — Dt ← zero-extended byte [Bbase + Iindex].
+    inc n
+    let rt = parseRegisterA64(n)
+    let rn = parseRegisterA64(n)
+    let rm = parseRegisterA64(n)
+    arm64.emitLdrbReg(ctx.buf.data, rt, rn, rm)
+    skipParRi n
+
+  of StrbA64:
+    # (strb Dval Bbase Iindex) — store low byte of Dval to [Bbase + Iindex].
+    inc n
+    let rt = parseRegisterA64(n)
+    let rn = parseRegisterA64(n)
+    let rm = parseRegisterA64(n)
+    arm64.emitStrbReg(ctx.buf.data, rt, rn, rm)
     skipParRi n
 
   of DmbA64:
@@ -2155,8 +2302,15 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   # Clear register bindings at the start of each proc
   ctx.regBindings = initTable[x86.Register, string]()
 
-  # Add params to scope
-  var paramOffset = 16 # RBP + 16 (skip RBP, RetAddr)
+  # Add params to scope.
+  #
+  # Stack-passed params live in the incoming argument area. On x86-64 that area
+  # sits above the saved RBP and return address (RBP+16). On AArch64 the return
+  # address is in LR (not on the stack) and the caller leaves SP pointing right
+  # at the first stack arg, so incoming stack params are addressed SP-relative
+  # from offset 0 (valid before the callee shifts SP).
+  let isA64Proc = ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64}
+  var paramOffset = if isA64Proc: 0 else: 16
   for param in sym.typ.params:
     if param.typ.isOnStack:
       # param.typ is already StackOffT
@@ -2164,8 +2318,9 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
       paramOffset += slots.alignedSize(param.typ.offType)
     else:
       ctx.scope.define(Symbol(name: param.name, kind: skParam, typ: param.typ, reg: param.reg))
-      # Track register binding for parameters
-      if param.reg != InvalidTagId:
+      # Track register binding for parameters (x86 only; the A64 path resolves
+      # param registers directly via tagToRegisterA64 and has no regBindings).
+      if not isA64Proc and param.reg != InvalidTagId:
         let targetReg = tagToRegister(param.reg, n)
         ctx.regBindings[targetReg] = param.name
 
