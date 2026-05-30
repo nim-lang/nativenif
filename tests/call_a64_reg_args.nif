@@ -1,0 +1,43 @@
+(.nif27)
+(stmts
+ (arch arm64)
+ (proc :addtwo.0
+  (params
+   (param :a.0
+    (x0)
+    (i 64))
+   (param :b.0
+    (x1)
+    (i 64)))
+  (result
+   (:ret.0
+    (x0)
+    (i 64)))
+  (clobber)
+  (stmts
+   (add
+    (x0)
+    (x1))
+   (ret)))
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (var :sum.0
+    (x9)
+    (i 64))
+   (prepare addtwo.0
+    (mov
+     (arg a.0)40)
+    (mov
+     (arg b.0)2)
+    (call)
+    (mov sum.0
+     (res ret.0)))
+   (sub sum.0 42)
+   (mov
+    (x16)33554433)
+   (mov
+    (x0)sum.0)
+   (svc 0))))

@@ -308,6 +308,37 @@ proc emitStrReg*(dest: var Bytes; rt, rn, rm: Register; shift: int) =
               (encodeReg(rm) shl 16) or (encodeReg(rn) shl 5) or encodeReg(rt)
   dest.addUint32(instr)
 
+proc emitLdrbReg*(dest: var Bytes; rt, rn, rm: Register) =
+  ## LDRB Wt, [Xn, Xm] — zero-extending byte load, register offset (no scaling).
+  dest.addUint32(0x38606800'u32 or
+                 (encodeReg(rm) shl 16) or (encodeReg(rn) shl 5) or encodeReg(rt))
+
+proc emitLoadStoreUImm*(dest: var Bytes; rt, rn: Register; offset: int32;
+                        size, opc: int) =
+  ## Sized load/store, unsigned-offset form `[rn, #offset]`. `size`: 0=byte,
+  ## 1=half, 2=word, 3=dword. `opc`: 0=store, 1=load(zero-ext), 2=load(sign-ext
+  ## to 64), 3=load(sign-ext to 32). The immediate is scaled by the access size.
+  let unit = 1'i32 shl size
+  if (offset mod unit) != 0 or offset < 0 or (offset div unit) > 4095:
+    raise newException(ValueError, "load/store offset out of range/alignment")
+  let sc = uint32(offset div unit)
+  let instr = 0x39000000'u32 or (uint32(size) shl 30) or (uint32(opc) shl 22) or
+              (sc shl 10) or (encodeReg(rn) shl 5) or encodeReg(rt)
+  dest.addUint32(instr)
+
+proc emitLoadStoreReg*(dest: var Bytes; rt, rn, rm: Register; size, opc, shift: int) =
+  ## Sized load/store, register-offset form `[rn, rm, LSL #shift]`. Same size/opc
+  ## coding as `emitLoadStoreUImm`. `shift>0` sets the scale (S) bit.
+  let s = if shift > 0: 1'u32 else: 0'u32
+  let instr = 0x38206800'u32 or (uint32(size) shl 30) or (uint32(opc) shl 22) or
+              (s shl 12) or (encodeReg(rm) shl 16) or (encodeReg(rn) shl 5) or encodeReg(rt)
+  dest.addUint32(instr)
+
+proc emitStrbReg*(dest: var Bytes; rt, rn, rm: Register) =
+  ## STRB Wt, [Xn, Xm] — store low byte, register offset (no scaling).
+  dest.addUint32(0x38206800'u32 or
+                 (encodeReg(rm) shl 16) or (encodeReg(rn) shl 5) or encodeReg(rt))
+
 proc emitStr*(dest: var Bytes; rt: Register; rn: Register; offset: int32) =
   ## Emit STR instruction: STR rt, [rn, #offset]
   ## Offset must be 8-byte aligned and in range [0, 32760]
