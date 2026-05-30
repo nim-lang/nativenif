@@ -14,6 +14,11 @@ type
     X24 = 24, X25 = 25, X26 = 26, X27 = 27, X28 = 28, X29 = 29, X30 = 30,
     SP = 31  # Stack pointer
 
+  # ARM64 scalar floating-point / SIMD registers (Dn = 64-bit double view of Vn)
+  FloatRegister* = enum
+    D0 = 0, D1, D2, D3, D4, D5, D6, D7, D8, D9, D10, D11, D12, D13, D14, D15,
+    D16, D17, D18, D19, D20, D21, D22, D23, D24, D25, D26, D27, D28, D29, D30, D31
+
   # ARM64 32-bit register variants
   Register32* = enum
     W0 = 0, W1 = 1, W2 = 2, W3 = 3, W4 = 4, W5 = 5, W6 = 6, W7 = 7,
@@ -439,6 +444,102 @@ proc emitBr*(dest: var Bytes; rn: Register) =
   # BR Xn: 1101 0110 0001 1111 0000 00nn nnn0 0000
   let instr = 0xD61F0000'u32 or (encodeReg(rn) shl 5)
   dest.addUint32(instr)
+
+proc emitBlr*(dest: var Bytes; rn: Register) =
+  ## Emit BLR instruction: BLR rn (branch-with-link to address in register).
+  ## Used for the macOS TLV thunk call (`blr x16`).
+  # BLR Xn: 1101 0110 0011 1111 0000 00nn nnn0 0000
+  let instr = 0xD63F0000'u32 or (encodeReg(rn) shl 5)
+  dest.addUint32(instr)
+
+# ── atomics (64-bit) ────────────────────────────────────────────────────────
+# Load-/store-exclusive + acquire/release ordered loads/stores, plus the
+# barrier/monitor-clear used to build the lock-free RMW loops arkham emits for
+# the GCC `__atomic_*` builtins. All operate on the full 64-bit register; the
+# pointer is `[Xn]` with no offset.
+
+proc emitLdaxr*(dest: var Bytes; rt, rn: Register) =
+  ## LDAXR Xt, [Xn] — load-acquire exclusive.
+  dest.addUint32(0xC85FFC00'u32 or (encodeReg(rn) shl 5) or encodeReg(rt))
+
+proc emitStlxr*(dest: var Bytes; rs, rt, rn: Register) =
+  ## STLXR Ws, Xt, [Xn] — store-release exclusive; Ws ← 0 on success, 1 on fail.
+  dest.addUint32(0xC800FC00'u32 or (encodeReg(rs) shl 16) or (encodeReg(rn) shl 5) or encodeReg(rt))
+
+proc emitLdar*(dest: var Bytes; rt, rn: Register) =
+  ## LDAR Xt, [Xn] — load-acquire (non-exclusive).
+  dest.addUint32(0xC8DFFC00'u32 or (encodeReg(rn) shl 5) or encodeReg(rt))
+
+proc emitStlr*(dest: var Bytes; rt, rn: Register) =
+  ## STLR Xt, [Xn] — store-release (non-exclusive).
+  dest.addUint32(0xC89FFC00'u32 or (encodeReg(rn) shl 5) or encodeReg(rt))
+
+proc emitDmbIsh*(dest: var Bytes) =
+  ## DMB ISH — data memory barrier, inner shareable domain.
+  dest.addUint32(0xD5033BBF'u32)
+
+proc emitClrex*(dest: var Bytes) =
+  ## CLREX — clear the local exclusive monitor.
+  dest.addUint32(0xD5033F5F'u32)
+
+# ── scalar double-precision floating point (ftype = 01) ─────────────────────
+# Dn is the 64-bit (double) view of Vn. Single-precision (Sn) is a future
+# addition; arkham emits doubles only for now.
+
+proc encodeFReg(r: FloatRegister): uint32 {.inline.} = uint32(ord(r)) and 0x1F
+
+proc emitFmov*(dest: var Bytes; rd, rn: FloatRegister) =       # FMOV Dd, Dn
+  dest.addUint32(0x1E604000'u32 or (encodeFReg(rn) shl 5) or encodeFReg(rd))
+
+proc emitFmovFromGpr*(dest: var Bytes; rd: FloatRegister; rn: Register) =  # FMOV Dd, Xn (bits)
+  dest.addUint32(0x9E670000'u32 or (encodeReg(rn) shl 5) or encodeFReg(rd))
+
+proc emitFmovToGpr*(dest: var Bytes; rd: Register; rn: FloatRegister) =    # FMOV Xd, Dn (bits)
+  dest.addUint32(0x9E660000'u32 or (encodeFReg(rn) shl 5) or encodeReg(rd))
+
+proc emitFadd*(dest: var Bytes; rd, rn, rm: FloatRegister) =   # FADD Dd, Dn, Dm
+  dest.addUint32(0x1E602800'u32 or (encodeFReg(rm) shl 16) or (encodeFReg(rn) shl 5) or encodeFReg(rd))
+
+proc emitFsub*(dest: var Bytes; rd, rn, rm: FloatRegister) =   # FSUB Dd, Dn, Dm
+  dest.addUint32(0x1E603800'u32 or (encodeFReg(rm) shl 16) or (encodeFReg(rn) shl 5) or encodeFReg(rd))
+
+proc emitFmul*(dest: var Bytes; rd, rn, rm: FloatRegister) =   # FMUL Dd, Dn, Dm
+  dest.addUint32(0x1E600800'u32 or (encodeFReg(rm) shl 16) or (encodeFReg(rn) shl 5) or encodeFReg(rd))
+
+proc emitFdiv*(dest: var Bytes; rd, rn, rm: FloatRegister) =   # FDIV Dd, Dn, Dm
+  dest.addUint32(0x1E601800'u32 or (encodeFReg(rm) shl 16) or (encodeFReg(rn) shl 5) or encodeFReg(rd))
+
+proc emitFneg*(dest: var Bytes; rd, rn: FloatRegister) =       # FNEG Dd, Dn
+  dest.addUint32(0x1E614000'u32 or (encodeFReg(rn) shl 5) or encodeFReg(rd))
+
+proc emitFcmp*(dest: var Bytes; rn, rm: FloatRegister) =       # FCMP Dn, Dm
+  dest.addUint32(0x1E602000'u32 or (encodeFReg(rm) shl 16) or (encodeFReg(rn) shl 5))
+
+proc emitScvtf*(dest: var Bytes; rd: FloatRegister; rn: Register) =  # SCVTF Dd, Xn
+  dest.addUint32(0x9E620000'u32 or (encodeReg(rn) shl 5) or encodeFReg(rd))
+
+proc emitUcvtf*(dest: var Bytes; rd: FloatRegister; rn: Register) =  # UCVTF Dd, Xn
+  dest.addUint32(0x9E630000'u32 or (encodeReg(rn) shl 5) or encodeFReg(rd))
+
+proc emitFcvtzs*(dest: var Bytes; rd: Register; rn: FloatRegister) =  # FCVTZS Xd, Dn
+  dest.addUint32(0x9E780000'u32 or (encodeFReg(rn) shl 5) or encodeReg(rd))
+
+proc emitFcvtzu*(dest: var Bytes; rd: Register; rn: FloatRegister) =  # FCVTZU Xd, Dn
+  dest.addUint32(0x9E790000'u32 or (encodeFReg(rn) shl 5) or encodeReg(rd))
+
+proc emitFldr*(dest: var Bytes; rt: FloatRegister; rn: Register; offset: int32) =
+  ## LDR Dt, [Xn, #offset] — load a double (unsigned offset, scaled by 8).
+  let scaled = offset div 8
+  if (offset and 7) != 0 or scaled < 0 or scaled > 0xFFF:
+    raise newException(ValueError, "FP LDR offset out of range")
+  dest.addUint32(0xFD400000'u32 or (uint32(scaled) shl 10) or (encodeReg(rn) shl 5) or encodeFReg(rt))
+
+proc emitFstr*(dest: var Bytes; rt: FloatRegister; rn: Register; offset: int32) =
+  ## STR Dt, [Xn, #offset] — store a double (unsigned offset, scaled by 8).
+  let scaled = offset div 8
+  if (offset and 7) != 0 or scaled < 0 or scaled > 0xFFF:
+    raise newException(ValueError, "FP STR offset out of range")
+  dest.addUint32(0xFD000000'u32 or (uint32(scaled) shl 10) or (encodeReg(rn) shl 5) or encodeFReg(rt))
 
 # Stack operations
 proc emitStp*(dest: var Bytes; rt1, rt2: Register; rn: Register; offset: int32) =

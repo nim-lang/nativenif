@@ -315,3 +315,87 @@
 | `(enum T ...)`       | NifasmType              | enum type (base type + fields) |
 | `(efld D N)`         | NifasmType              | enum field declaration |
 | `(proctype ...)`     | NifasmType              | procedure (function pointer) type |
+| `(ldaxr D S)`        | A64Inst                 | load-acquire exclusive register |
+| `(stlxr St D S)`     | A64Inst                 | store-release exclusive register (St = status) |
+| `(ldar D S)`         | A64Inst                 | load-acquire register |
+| `(stlr D S)`         | A64Inst                 | store-release register |
+| `(dmb)`              | A64Inst                 | data memory barrier (inner shareable) |
+| `(clrex)`            | A64Inst                 | clear exclusive monitor |
+| `(d0)`             | A64Reg                   | fp register d0 |
+| `(d1)`             | A64Reg                   | fp register d1 |
+| `(d2)`             | A64Reg                   | fp register d2 |
+| `(d3)`             | A64Reg                   | fp register d3 |
+| `(d4)`             | A64Reg                   | fp register d4 |
+| `(d5)`             | A64Reg                   | fp register d5 |
+| `(d6)`             | A64Reg                   | fp register d6 |
+| `(d7)`             | A64Reg                   | fp register d7 |
+| `(d8)`             | A64Reg                   | fp register d8 |
+| `(d9)`             | A64Reg                   | fp register d9 |
+| `(d10)`            | A64Reg                   | fp register d10 |
+| `(d11)`            | A64Reg                   | fp register d11 |
+| `(d12)`            | A64Reg                   | fp register d12 |
+| `(d13)`            | A64Reg                   | fp register d13 |
+| `(d14)`            | A64Reg                   | fp register d14 |
+| `(d15)`            | A64Reg                   | fp register d15 |
+| `(d16)`            | A64Reg                   | fp register d16 |
+| `(d17)`            | A64Reg                   | fp register d17 |
+| `(d18)`            | A64Reg                   | fp register d18 |
+| `(d19)`            | A64Reg                   | fp register d19 |
+| `(d20)`            | A64Reg                   | fp register d20 |
+| `(d21)`            | A64Reg                   | fp register d21 |
+| `(d22)`            | A64Reg                   | fp register d22 |
+| `(d23)`            | A64Reg                   | fp register d23 |
+| `(d24)`            | A64Reg                   | fp register d24 |
+| `(d25)`            | A64Reg                   | fp register d25 |
+| `(d26)`            | A64Reg                   | fp register d26 |
+| `(d27)`            | A64Reg                   | fp register d27 |
+| `(d28)`            | A64Reg                   | fp register d28 |
+| `(d29)`            | A64Reg                   | fp register d29 |
+| `(d30)`            | A64Reg                   | fp register d30 |
+| `(d31)`            | A64Reg                   | fp register d31 |
+| `(s0)`             | A64Reg                   | fp register s0 |
+| `(s1)`             | A64Reg                   | fp register s1 |
+| `(s2)`             | A64Reg                   | fp register s2 |
+| `(s3)`             | A64Reg                   | fp register s3 |
+| `(s4)`             | A64Reg                   | fp register s4 |
+| `(s5)`             | A64Reg                   | fp register s5 |
+| `(s6)`             | A64Reg                   | fp register s6 |
+| `(s7)`             | A64Reg                   | fp register s7 |
+| `(s8)`             | A64Reg                   | fp register s8 |
+| `(s9)`             | A64Reg                   | fp register s9 |
+| `(s10)`            | A64Reg                   | fp register s10 |
+| `(s11)`            | A64Reg                   | fp register s11 |
+| `(s12)`            | A64Reg                   | fp register s12 |
+| `(s13)`            | A64Reg                   | fp register s13 |
+| `(s14)`            | A64Reg                   | fp register s14 |
+| `(s15)`            | A64Reg                   | fp register s15 |
+| `(s16)`            | A64Reg                   | fp register s16 |
+| `(s17)`            | A64Reg                   | fp register s17 |
+| `(s18)`            | A64Reg                   | fp register s18 |
+| `(s19)`            | A64Reg                   | fp register s19 |
+| `(s20)`            | A64Reg                   | fp register s20 |
+| `(s21)`            | A64Reg                   | fp register s21 |
+| `(s22)`            | A64Reg                   | fp register s22 |
+| `(s23)`            | A64Reg                   | fp register s23 |
+| `(s24)`            | A64Reg                   | fp register s24 |
+| `(s25)`            | A64Reg                   | fp register s25 |
+| `(s26)`            | A64Reg                   | fp register s26 |
+| `(s27)`            | A64Reg                   | fp register s27 |
+| `(s28)`            | A64Reg                   | fp register s28 |
+| `(s29)`            | A64Reg                   | fp register s29 |
+| `(s30)`            | A64Reg                   | fp register s30 |
+| `(s31)`            | A64Reg                   | fp register s31 |
+| `(fmov D S)`        | A64Inst                 | fp move (reg-reg / gpr<->fp bitcast) |
+| `(fadd D S)`        | A64Inst                 | fp add (D = D + S) |
+| `(fsub D S)`        | A64Inst                 | fp subtract (D = D - S) |
+| `(fmul D S)`        | A64Inst                 | fp multiply (D = D * S) |
+| `(fdiv D S)`        | A64Inst                 | fp divide (D = D / S) |
+| `(fneg D)`          | A64Inst                 | fp negate (D = -D) |
+| `(fcmp D S)`        | A64Inst                 | fp compare |
+| `(fldr D S)`        | A64Inst                 | fp load register |
+| `(fstr D S)`        | A64Inst                 | fp store register |
+| `(scvtf D S)`       | A64Inst                 | signed int -> fp convert |
+| `(ucvtf D S)`       | A64Inst                 | unsigned int -> fp convert |
+| `(fcvtzs D S)`      | A64Inst                 | fp -> signed int convert (toward zero) |
+| `(fcvtzu D S)`      | A64Inst                 | fp -> unsigned int convert (toward zero) |
+| `(fcvt D S)`        | A64Inst                 | fp precision convert (f32<->f64) |
