@@ -399,3 +399,5 @@
 | `(fcvtzs D S)`      | A64Inst                 | fp -> signed int convert (toward zero) |
 | `(fcvtzu D S)`      | A64Inst                 | fp -> unsigned int convert (toward zero) |
 | `(fcvt D S)`        | A64Inst                 | fp precision convert (f32<->f64) |
+| `(fstp D1 D2 S O)`  | A64Inst                 | fp store pair (pre-indexed) |
+| `(fldp D1 D2 S O)`  | A64Inst                 | fp load pair (post-indexed) |
