@@ -488,58 +488,95 @@ proc emitClrex*(dest: var Bytes) =
 
 proc encodeFReg(r: FloatRegister): uint32 {.inline.} = uint32(ord(r)) and 0x1F
 
-proc emitFmov*(dest: var Bytes; rd, rn: FloatRegister) =       # FMOV Dd, Dn
-  dest.addUint32(0x1E604000'u32 or (encodeFReg(rn) shl 5) or encodeFReg(rd))
+# The scalar FP data-processing forms differ between double (ftype = 01) and
+# single (ftype = 00) only in bit 22; the encoders below take the double base
+# and clear it for single precision.
+const FtypeBit = 0x00400000'u32           # bit 22 set = double
+const FmovGprMask = 0x80400000'u32        # gpr<->fp also clears sf (bit 31) for single
 
-proc emitFmovFromGpr*(dest: var Bytes; rd: FloatRegister; rn: Register) =  # FMOV Dd, Xn (bits)
-  dest.addUint32(0x9E670000'u32 or (encodeReg(rn) shl 5) or encodeFReg(rd))
+proc fp2(base: uint32; single: bool): uint32 {.inline.} =
+  if single: base and not FtypeBit else: base
 
-proc emitFmovToGpr*(dest: var Bytes; rd: Register; rn: FloatRegister) =    # FMOV Xd, Dn (bits)
-  dest.addUint32(0x9E660000'u32 or (encodeFReg(rn) shl 5) or encodeReg(rd))
+proc emitFmov*(dest: var Bytes; rd, rn: FloatRegister; single = false) =   # FMOV d/s reg copy
+  dest.addUint32(fp2(0x1E604000'u32, single) or (encodeFReg(rn) shl 5) or encodeFReg(rd))
 
-proc emitFadd*(dest: var Bytes; rd, rn, rm: FloatRegister) =   # FADD Dd, Dn, Dm
-  dest.addUint32(0x1E602800'u32 or (encodeFReg(rm) shl 16) or (encodeFReg(rn) shl 5) or encodeFReg(rd))
+proc emitFmovFromGpr*(dest: var Bytes; rd: FloatRegister; rn: Register; single = false) =  # FMOV Dd/Sd, Xn/Wn (bits)
+  let base = if single: 0x9E670000'u32 and not FmovGprMask else: 0x9E670000'u32
+  dest.addUint32(base or (encodeReg(rn) shl 5) or encodeFReg(rd))
 
-proc emitFsub*(dest: var Bytes; rd, rn, rm: FloatRegister) =   # FSUB Dd, Dn, Dm
-  dest.addUint32(0x1E603800'u32 or (encodeFReg(rm) shl 16) or (encodeFReg(rn) shl 5) or encodeFReg(rd))
+proc emitFmovToGpr*(dest: var Bytes; rd: Register; rn: FloatRegister; single = false) =    # FMOV Xd/Wd, Dn/Sn (bits)
+  let base = if single: 0x9E660000'u32 and not FmovGprMask else: 0x9E660000'u32
+  dest.addUint32(base or (encodeFReg(rn) shl 5) or encodeReg(rd))
 
-proc emitFmul*(dest: var Bytes; rd, rn, rm: FloatRegister) =   # FMUL Dd, Dn, Dm
-  dest.addUint32(0x1E600800'u32 or (encodeFReg(rm) shl 16) or (encodeFReg(rn) shl 5) or encodeFReg(rd))
+proc emitFadd*(dest: var Bytes; rd, rn, rm: FloatRegister; single = false) =
+  dest.addUint32(fp2(0x1E602800'u32, single) or (encodeFReg(rm) shl 16) or (encodeFReg(rn) shl 5) or encodeFReg(rd))
 
-proc emitFdiv*(dest: var Bytes; rd, rn, rm: FloatRegister) =   # FDIV Dd, Dn, Dm
-  dest.addUint32(0x1E601800'u32 or (encodeFReg(rm) shl 16) or (encodeFReg(rn) shl 5) or encodeFReg(rd))
+proc emitFsub*(dest: var Bytes; rd, rn, rm: FloatRegister; single = false) =
+  dest.addUint32(fp2(0x1E603800'u32, single) or (encodeFReg(rm) shl 16) or (encodeFReg(rn) shl 5) or encodeFReg(rd))
 
-proc emitFneg*(dest: var Bytes; rd, rn: FloatRegister) =       # FNEG Dd, Dn
-  dest.addUint32(0x1E614000'u32 or (encodeFReg(rn) shl 5) or encodeFReg(rd))
+proc emitFmul*(dest: var Bytes; rd, rn, rm: FloatRegister; single = false) =
+  dest.addUint32(fp2(0x1E600800'u32, single) or (encodeFReg(rm) shl 16) or (encodeFReg(rn) shl 5) or encodeFReg(rd))
 
-proc emitFcmp*(dest: var Bytes; rn, rm: FloatRegister) =       # FCMP Dn, Dm
-  dest.addUint32(0x1E602000'u32 or (encodeFReg(rm) shl 16) or (encodeFReg(rn) shl 5))
+proc emitFdiv*(dest: var Bytes; rd, rn, rm: FloatRegister; single = false) =
+  dest.addUint32(fp2(0x1E601800'u32, single) or (encodeFReg(rm) shl 16) or (encodeFReg(rn) shl 5) or encodeFReg(rd))
 
-proc emitScvtf*(dest: var Bytes; rd: FloatRegister; rn: Register) =  # SCVTF Dd, Xn
-  dest.addUint32(0x9E620000'u32 or (encodeReg(rn) shl 5) or encodeFReg(rd))
+proc emitFneg*(dest: var Bytes; rd, rn: FloatRegister; single = false) =
+  dest.addUint32(fp2(0x1E614000'u32, single) or (encodeFReg(rn) shl 5) or encodeFReg(rd))
 
-proc emitUcvtf*(dest: var Bytes; rd: FloatRegister; rn: Register) =  # UCVTF Dd, Xn
-  dest.addUint32(0x9E630000'u32 or (encodeReg(rn) shl 5) or encodeFReg(rd))
+proc emitFcmp*(dest: var Bytes; rn, rm: FloatRegister; single = false) =
+  dest.addUint32(fp2(0x1E602000'u32, single) or (encodeFReg(rm) shl 16) or (encodeFReg(rn) shl 5))
 
-proc emitFcvtzs*(dest: var Bytes; rd: Register; rn: FloatRegister) =  # FCVTZS Xd, Dn
-  dest.addUint32(0x9E780000'u32 or (encodeFReg(rn) shl 5) or encodeReg(rd))
+proc emitScvtf*(dest: var Bytes; rd: FloatRegister; rn: Register; single = false) =  # SCVTF Dd/Sd, Xn
+  dest.addUint32(fp2(0x9E620000'u32, single) or (encodeReg(rn) shl 5) or encodeFReg(rd))
 
-proc emitFcvtzu*(dest: var Bytes; rd: Register; rn: FloatRegister) =  # FCVTZU Xd, Dn
-  dest.addUint32(0x9E790000'u32 or (encodeFReg(rn) shl 5) or encodeReg(rd))
+proc emitUcvtf*(dest: var Bytes; rd: FloatRegister; rn: Register; single = false) =  # UCVTF Dd/Sd, Xn
+  dest.addUint32(fp2(0x9E630000'u32, single) or (encodeReg(rn) shl 5) or encodeFReg(rd))
 
-proc emitFldr*(dest: var Bytes; rt: FloatRegister; rn: Register; offset: int32) =
-  ## LDR Dt, [Xn, #offset] — load a double (unsigned offset, scaled by 8).
-  let scaled = offset div 8
-  if (offset and 7) != 0 or scaled < 0 or scaled > 0xFFF:
+proc emitFcvtzs*(dest: var Bytes; rd: Register; rn: FloatRegister; single = false) =  # FCVTZS Xd, Dn/Sn
+  dest.addUint32(fp2(0x9E780000'u32, single) or (encodeFReg(rn) shl 5) or encodeReg(rd))
+
+proc emitFcvtzu*(dest: var Bytes; rd: Register; rn: FloatRegister; single = false) =  # FCVTZU Xd, Dn/Sn
+  dest.addUint32(fp2(0x9E790000'u32, single) or (encodeFReg(rn) shl 5) or encodeReg(rd))
+
+proc emitFcvtToSingle*(dest: var Bytes; rd, rn: FloatRegister) =   # FCVT Sd, Dn (double→single)
+  dest.addUint32(0x1E624000'u32 or (encodeFReg(rn) shl 5) or encodeFReg(rd))
+
+proc emitFcvtToDouble*(dest: var Bytes; rd, rn: FloatRegister) =   # FCVT Dd, Sn (single→double)
+  dest.addUint32(0x1E22C000'u32 or (encodeFReg(rn) shl 5) or encodeFReg(rd))
+
+proc emitFldr*(dest: var Bytes; rt: FloatRegister; rn: Register; offset: int32; single = false) =
+  ## LDR Dt/St, [Xn, #offset] — load a double/single (unsigned offset, scaled).
+  let scale = if single: 4 else: 8
+  let scaled = offset div scale
+  if (offset mod scale) != 0 or scaled < 0 or scaled > 0xFFF:
     raise newException(ValueError, "FP LDR offset out of range")
-  dest.addUint32(0xFD400000'u32 or (uint32(scaled) shl 10) or (encodeReg(rn) shl 5) or encodeFReg(rt))
+  let base = if single: 0xBD400000'u32 else: 0xFD400000'u32
+  dest.addUint32(base or (uint32(scaled) shl 10) or (encodeReg(rn) shl 5) or encodeFReg(rt))
 
-proc emitFstr*(dest: var Bytes; rt: FloatRegister; rn: Register; offset: int32) =
-  ## STR Dt, [Xn, #offset] — store a double (unsigned offset, scaled by 8).
-  let scaled = offset div 8
-  if (offset and 7) != 0 or scaled < 0 or scaled > 0xFFF:
+proc emitFstr*(dest: var Bytes; rt: FloatRegister; rn: Register; offset: int32; single = false) =
+  ## STR Dt/St, [Xn, #offset] — store a double/single (unsigned offset, scaled).
+  let scale = if single: 4 else: 8
+  let scaled = offset div scale
+  if (offset mod scale) != 0 or scaled < 0 or scaled > 0xFFF:
     raise newException(ValueError, "FP STR offset out of range")
-  dest.addUint32(0xFD000000'u32 or (uint32(scaled) shl 10) or (encodeReg(rn) shl 5) or encodeFReg(rt))
+  let base = if single: 0xBD000000'u32 else: 0xFD000000'u32
+  dest.addUint32(base or (uint32(scaled) shl 10) or (encodeReg(rn) shl 5) or encodeFReg(rt))
+
+proc emitFstpPre*(dest: var Bytes; rt1, rt2: FloatRegister; rn: Register; offset: int32) =
+  ## STP Dt1, Dt2, [Xn, #offset]! — pre-indexed store pair of doubles.
+  let scaled = offset div 8
+  if (offset and 7) != 0 or scaled < -64 or scaled > 63:
+    raise newException(ValueError, "FP STP offset out of range")
+  dest.addUint32(0x6D800000'u32 or ((uint32(scaled) and 0x7F) shl 15) or
+                 (encodeFReg(rt2) shl 10) or (encodeReg(rn) shl 5) or encodeFReg(rt1))
+
+proc emitFldpPost*(dest: var Bytes; rt1, rt2: FloatRegister; rn: Register; offset: int32) =
+  ## LDP Dt1, Dt2, [Xn], #offset — post-indexed load pair of doubles.
+  let scaled = offset div 8
+  if (offset and 7) != 0 or scaled < -64 or scaled > 63:
+    raise newException(ValueError, "FP LDP offset out of range")
+  dest.addUint32(0x6CC00000'u32 or ((uint32(scaled) and 0x7F) shl 15) or
+                 (encodeFReg(rt2) shl 10) or (encodeReg(rn) shl 5) or encodeFReg(rt1))
 
 # Stack operations
 proc emitStp*(dest: var Bytes; rt1, rt2: Register; rn: Register; offset: int32) =

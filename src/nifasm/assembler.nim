@@ -882,16 +882,27 @@ proc parseRegisterA64(n: var Cursor): arm64.Register =
   inc n
   skipParRi n, "register"
 
-proc isA64FpRegTag(t: TagEnum): bool {.inline.} =
-  ## True for the double-precision fp register tags `(d0)`..`(d31)`.
+proc isA64DoubleRegTag(t: TagEnum): bool {.inline.} =
   ord(t) >= ord(D0TagId) and ord(t) <= ord(D31TagId)
+
+proc isA64SingleRegTag(t: TagEnum): bool {.inline.} =
+  ord(t) >= ord(S0TagId) and ord(t) <= ord(S31TagId)
+
+proc isA64FpRegTag(t: TagEnum): bool {.inline.} =
+  ## True for any scalar fp register tag `(d0)`..`(d31)` / `(s0)`..`(s31)`.
+  isA64DoubleRegTag(t) or isA64SingleRegTag(t)
 
 proc isA64FpRegOperand(n: Cursor): bool {.inline.} =
   n.kind == ParLe and isA64FpRegTag(n.tag)
 
+proc isA64SingleOperand(n: Cursor): bool {.inline.} =
+  ## Whether the fp register operand `n` is single-precision `(sN)`.
+  n.kind == ParLe and isA64SingleRegTag(n.tag)
+
 proc parseFloatRegisterA64(n: var Cursor): arm64.FloatRegister =
-  if not isA64FpRegOperand(n): error("Expected fp register (dN)", n)
-  result = arm64.FloatRegister(ord(n.tag) - ord(D0TagId))
+  if not isA64FpRegOperand(n): error("Expected fp register (dN/sN)", n)
+  let base = if isA64SingleRegTag(n.tag): ord(S0TagId) else: ord(D0TagId)
+  result = arm64.FloatRegister(ord(n.tag) - base)
   inc n
   skipParRi n, "fp register"
 
@@ -1869,81 +1880,98 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
 
   of FmovA64:
     # (fmov D S): D=fp,S=fp → reg copy; D=fp,S=gpr / D=gpr,S=fp → bit move.
+    # The size (s/d) comes from whichever operand is an fp register.
     inc n
     if isA64FpRegOperand(n):
+      let single = isA64SingleOperand(n)
       let rd = parseFloatRegisterA64(n)
       if isA64FpRegOperand(n):
-        arm64.emitFmov(ctx.buf.data, rd, parseFloatRegisterA64(n))
+        arm64.emitFmov(ctx.buf.data, rd, parseFloatRegisterA64(n), single)
       else:
-        arm64.emitFmovFromGpr(ctx.buf.data, rd, parseRegisterA64(n))
+        arm64.emitFmovFromGpr(ctx.buf.data, rd, parseRegisterA64(n), single)
     else:
       let rd = parseRegisterA64(n)
-      arm64.emitFmovToGpr(ctx.buf.data, rd, parseFloatRegisterA64(n))
+      let single = isA64SingleOperand(n)
+      arm64.emitFmovToGpr(ctx.buf.data, rd, parseFloatRegisterA64(n), single)
     skipParRi n
 
   of FaddA64, FsubA64, FmulA64, FdivA64:
     # (fop D S) → D = D op S  (emitted as `fop Dd, Dd, Ds`).
     inc n
+    let single = isA64SingleOperand(n)
     let rd = parseFloatRegisterA64(n)
     let rs = parseFloatRegisterA64(n)
     case instTag
-    of FaddA64: arm64.emitFadd(ctx.buf.data, rd, rd, rs)
-    of FsubA64: arm64.emitFsub(ctx.buf.data, rd, rd, rs)
-    of FmulA64: arm64.emitFmul(ctx.buf.data, rd, rd, rs)
-    else:       arm64.emitFdiv(ctx.buf.data, rd, rd, rs)
+    of FaddA64: arm64.emitFadd(ctx.buf.data, rd, rd, rs, single)
+    of FsubA64: arm64.emitFsub(ctx.buf.data, rd, rd, rs, single)
+    of FmulA64: arm64.emitFmul(ctx.buf.data, rd, rd, rs, single)
+    else:       arm64.emitFdiv(ctx.buf.data, rd, rd, rs, single)
     skipParRi n
 
   of FnegA64:
     inc n
+    let single = isA64SingleOperand(n)
     let rd = parseFloatRegisterA64(n)
-    arm64.emitFneg(ctx.buf.data, rd, rd)
+    arm64.emitFneg(ctx.buf.data, rd, rd, single)
     skipParRi n
 
   of FcmpA64:
     inc n
+    let single = isA64SingleOperand(n)
     let rn = parseFloatRegisterA64(n)
     let rm = parseFloatRegisterA64(n)
-    arm64.emitFcmp(ctx.buf.data, rn, rm)
+    arm64.emitFcmp(ctx.buf.data, rn, rm, single)
     skipParRi n
 
   of FldrA64:
-    # (fldr D <mem>) — load a double.
+    # (fldr D <mem>) — load a double/single.
     inc n
+    let single = isA64SingleOperand(n)
     let rt = parseFloatRegisterA64(n)
     let op = parseOperandA64(n, ctx)
     if op.kind != okMem: error("FLDR source must be memory", n)
-    arm64.emitFldr(ctx.buf.data, rt, op.mem.base, op.mem.offset)
+    arm64.emitFldr(ctx.buf.data, rt, op.mem.base, op.mem.offset, single)
     skipParRi n
 
   of FstrA64:
-    # (fstr <mem> D) — store a double.
+    # (fstr <mem> D) — store a double/single.
     inc n
     let dest = parseOperandA64(n, ctx)
     if dest.kind != okMem: error("FSTR destination must be memory", n)
+    let single = isA64SingleOperand(n)
     let rt = parseFloatRegisterA64(n)
-    arm64.emitFstr(ctx.buf.data, rt, dest.mem.base, dest.mem.offset)
+    arm64.emitFstr(ctx.buf.data, rt, dest.mem.base, dest.mem.offset, single)
     skipParRi n
 
   of ScvtfA64, UcvtfA64:
-    # (scvtf Dfp Sgpr) — int → double.
+    # (scvtf Dfp Sgpr) — int → double/single.
     inc n
+    let single = isA64SingleOperand(n)
     let rd = parseFloatRegisterA64(n)
     let rn = parseRegisterA64(n)
-    if instTag == ScvtfA64: arm64.emitScvtf(ctx.buf.data, rd, rn)
-    else:                   arm64.emitUcvtf(ctx.buf.data, rd, rn)
+    if instTag == ScvtfA64: arm64.emitScvtf(ctx.buf.data, rd, rn, single)
+    else:                   arm64.emitUcvtf(ctx.buf.data, rd, rn, single)
     skipParRi n
 
   of FcvtzsA64, FcvtzuA64:
-    # (fcvtzs Dgpr Sfp) — double → int (toward zero).
+    # (fcvtzs Dgpr Sfp) — double/single → int (toward zero).
     inc n
     let rd = parseRegisterA64(n)
+    let single = isA64SingleOperand(n)
     let rn = parseFloatRegisterA64(n)
-    if instTag == FcvtzsA64: arm64.emitFcvtzs(ctx.buf.data, rd, rn)
-    else:                    arm64.emitFcvtzu(ctx.buf.data, rd, rn)
+    if instTag == FcvtzsA64: arm64.emitFcvtzs(ctx.buf.data, rd, rn, single)
+    else:                    arm64.emitFcvtzu(ctx.buf.data, rd, rn, single)
     skipParRi n
 
   of FcvtA64:
-    error("FCVT (single<->double precision) not supported yet", n)
+    # (fcvt Ddst Ssrc) — precision convert; direction from the operand sizes.
+    inc n
+    let dstSingle = isA64SingleOperand(n)
+    let rd = parseFloatRegisterA64(n)
+    let rn = parseFloatRegisterA64(n)
+    if dstSingle: arm64.emitFcvtToSingle(ctx.buf.data, rd, rn)  # double → single
+    else:         arm64.emitFcvtToDouble(ctx.buf.data, rd, rn)  # single → double
+    skipParRi n
 
   of BA64:
     inc n
@@ -2048,6 +2076,28 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     if n.kind != IntLit: error("ldp expects an integer offset", n)
     let off = int32(getInt(n)); inc n
     arm64.emitLdp(ctx.buf.data, rt1, rt2, rn, off)
+    skipParRi n
+
+  of FstpA64:
+    # (fstp (dt1) (dt2) (rn) offset) → STP Dt1, Dt2, [Xn, #offset]!  (pre-index)
+    inc n
+    let rt1 = parseFloatRegisterA64(n)
+    let rt2 = parseFloatRegisterA64(n)
+    let rn = parseRegisterA64(n)
+    if n.kind != IntLit: error("fstp expects an integer offset", n)
+    let off = int32(getInt(n)); inc n
+    arm64.emitFstpPre(ctx.buf.data, rt1, rt2, rn, off)
+    skipParRi n
+
+  of FldpA64:
+    # (fldp (dt1) (dt2) (rn) offset) → LDP Dt1, Dt2, [Xn], #offset  (post-index)
+    inc n
+    let rt1 = parseFloatRegisterA64(n)
+    let rt2 = parseFloatRegisterA64(n)
+    let rn = parseRegisterA64(n)
+    if n.kind != IntLit: error("fldp expects an integer offset", n)
+    let off = int32(getInt(n)); inc n
+    arm64.emitFldpPost(ctx.buf.data, rt1, rt2, rn, off)
     skipParRi n
 
   of NoA64Inst:
