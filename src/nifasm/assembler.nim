@@ -4074,7 +4074,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       )
       x86.emitLea(ctx.buf.data, dest, mem)
     else:
-      # Try parsing as a label operand (rodata, gvar, etc.)
+      # Try parsing as a label operand (rodata, gvar, etc.) or an addressing
+      # expression — `(at …)` / `(dot …)` / `(mem …)` all parse to an `okMem`
+      # operand carrying a full base+index*scale+displacement, which `lea`
+      # materializes as an address (matching the AArch64 backend, whose `lea`
+      # accepts the same forms). This is how arkham takes the address of an array
+      # element or aggregate field on x86-64.
       let op = parseOperand(n, ctx)
       if op.gvarSym != nil:
         # Global in .bss (a different segment): emit a placeholder RIP-relative lea
@@ -4083,8 +4088,10 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         ctx.gvarSites.add (pos, op.gvarSym)
       elif op.kind == okLabel:
         x86.emitLea(ctx.buf, dest, op.label)
+      elif op.kind == okMem:
+        x86.emitLea(ctx.buf.data, dest, op.mem)
       else:
-        error("lea requires (base-reg offset) or label", n)
+        error("lea requires an address expression (base-reg offset, mem, dot, at, or label)", n)
     skipParRi n, "lea"
   of JmpX64:
     inc n
