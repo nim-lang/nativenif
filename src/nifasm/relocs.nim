@@ -475,6 +475,16 @@ proc optimizeJumps*(buf: Buffer): Buffer =
   return optimized
 
 proc finalize*(buf: var Buffer) =
-  ## Finalize the buffer by optimizing all jump instructions
-  let optimized = buf.optimizeJumps()
-  buf = optimized
+  ## Finalize the buffer by patching all jump/branch displacements.
+  ##
+  ## NOTE: the rel32→rel8 jump-shortening optimizer (`optimizeJumps`) is
+  ## currently DISABLED because it is incorrect: when it shrinks a jump it wrote
+  ## the displacement from `calculateRelocDistance` using the *long-form* size
+  ## (+5/+6) and the *pre-shortening* buffer positions, and short jumps were not
+  ## re-tracked as relocations, so their 1-byte displacement was never corrected
+  ## after the layout settled. That produced wrong rel8 offsets (taken
+  ## conditional jumps landed mid-instruction → SIGILL/SIGSEGV). `rel32` forms
+  ## are always valid, and `updateRelocDisplacements` patches them correctly from
+  ## the final label positions, so we use those directly. Re-enable a corrected
+  ## (size-aware, fixpoint) optimizer here later.
+  buf.updateRelocDisplacements()
