@@ -40,6 +40,21 @@
 | `(subsd D S)`          | X64Inst                  | subtract scalar double |
 | `(mulsd D S)`          | X64Inst                  | multiply scalar double |
 | `(divsd D S)`          | X64Inst                  | divide scalar double |
+| `(movss D S)`          | X64Inst                  | move scalar single |
+| `(addss D S)`          | X64Inst                  | add scalar single |
+| `(subss D S)`          | X64Inst                  | subtract scalar single |
+| `(mulss D S)`          | X64Inst                  | multiply scalar single |
+| `(divss D S)`          | X64Inst                  | divide scalar single |
+| `(cvtsi2sd D S)`       | X64Inst                  | int -> scalar double convert |
+| `(cvtsi2ss D S)`       | X64Inst                  | int -> scalar single convert |
+| `(cvttsd2si D S)`      | X64Inst                  | scalar double -> int convert (truncating) |
+| `(cvttss2si D S)`      | X64Inst                  | scalar single -> int convert (truncating) |
+| `(cvtsd2ss D S)`       | X64Inst                  | scalar double -> scalar single convert |
+| `(cvtss2sd D S)`       | X64Inst                  | scalar single -> scalar double convert |
+| `(comisd D S)`         | X64Inst                  | compare scalar double, set EFLAGS |
+| `(comiss D S)`         | X64Inst                  | compare scalar single, set EFLAGS |
+| `(movfq D S)`          | X64Inst                  | move 64 bits between gpr and xmm |
+| `(movfd D S)`          | X64Inst                  | move 32 bits between gpr and xmm |
 | `(and D S)`            | X64Inst, A64Inst         | bitwise and |
 | `(or D S)`             | X64Inst                  | bitwise or |
 | `(orr D S)`            | A64Inst                  | bitwise or |

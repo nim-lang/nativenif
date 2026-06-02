@@ -133,6 +133,17 @@ proc parseRegister(n: var Cursor): x86.Register =
   inc n
   skipParRi n, "register"
 
+proc isXmmTag(n: Cursor): bool {.inline.} =
+  n.kind == ParLe and n.tag >= Xmm0TagId and n.tag <= Xmm15TagId
+
+proc parseXmm(n: var Cursor): x86.XmmRegister =
+  ## Parse an `(xmmN)` SSE register operand (N in 0..15).
+  if not isXmmTag(n):
+    error("expected xmm register", n)
+  result = x86.XmmRegister(ord(n.tag) - ord(Xmm0TagId))
+  inc n
+  skipParRi n, "xmm register"
+
 const MainModuleName* = ""  # Special name for main module
 
 type
@@ -219,6 +230,8 @@ type
     mem: x86.MemoryOperand
     argName: string
     label: LabelId
+    gvarSym: Symbol           # non-nil when the operand is a global's address; the
+                              # ELF backend patches its `lea` against the .bss segment
 
 proc inCall(ctx: GenContext): bool {.inline.} =
   ## Returns true if we're inside a prepare block
@@ -2630,7 +2643,17 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
 
         # Check for offset
         var stackVarType: Type = nil
-        if n.kind == IntLit or n.kind == Symbol:
+        if n.kind == ParLe and n.tag == ArgTagId:
+          # (mem (rsp) (arg name)) — an outgoing stack-argument slot. The arg's
+          # byte offset within the reserved area becomes the displacement.
+          var an = n; inc an                  # peek the arg name before consuming
+          let argName = if an.kind == Symbol: getSym(an) else: ""
+          let argOff = parseOperand(n, ctx)
+          if argOff.kind != okImm:
+            error("(arg ...) in mem must denote a stack argument", n)
+          displacement = int32(argOff.immVal)
+          if argName.len > 0: ctx.callContext.argsSet.incl argName
+        elif n.kind == IntLit or n.kind == Symbol:
           if n.kind == IntLit:
             displacement = int32(getInt(n))
             inc n
@@ -2803,6 +2826,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
         result.label = labId
       else:
         result.label = LabelId(sym.offset)
+      result.gvarSym = sym                       # carry the symbol so `lea` can patch
       result.typ = Type(kind: UIntT, bits: 64) # Address of gvar
       inc n
     elif sym != nil and sym.kind == skTvar:
@@ -3062,15 +3086,34 @@ proc genIatX64(n: var Cursor; ctx: var GenContext) =
   ctx.buf.emitIatCall(iatSlot)
   skipParRi n, "iat"
 
+proc intMemAccess(typ: Type): tuple[bits: int; signed: bool] =
+  ## A typed memory operand's access width + signedness, so a sub-word field /
+  ## element load sign-/zero-extends and a narrow store writes only its low bits.
+  ## Pointers / raw `(mem reg)` / stack slots are full 64-bit accesses.
+  if typ == nil: return (64, false)
+  case typ.kind
+  of IntT: (typ.bits, true)
+  of UIntT: (typ.bits, false)
+  of BoolT: (8, false)
+  else: (64, false)
+
 proc genMovX64(n: var Cursor; ctx: var GenContext) =
   let start = n
   inc n
   let dest = parseDest(n, ctx)
   let op = parseOperand(n, ctx)
 
-  # Type checking
+  # Type checking. A *sized* integer mem↔reg move legitimately differs in width:
+  # a load into a 64-bit register sign-/zero-extends a narrower field/element, and
+  # a store writes only the register's low bits. So when exactly one side is memory
+  # and both are integer-like, any width pairing is accepted (the sized emit below
+  # handles extension/truncation); other moves keep the strict check.
   if dest.typ != nil and op.typ != nil:
-    checkType(dest.typ, op.typ, start)
+    proc isIntLike(t: Type): bool = t.kind in {IntT, UIntT, BoolT, IntLitT}
+    let sizedMemReg = (dest.kind == okMem) != (op.kind == okMem) and
+                      isIntLike(dest.typ) and isIntLike(op.typ)
+    if not sizedMemReg:
+      checkType(dest.typ, op.typ, start)
 
   if dest.kind == okMem:
     if op.kind == okImm:
@@ -3094,7 +3137,8 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
     elif op.kind == okMem:
       error("Cannot move memory to memory", n)
     else:
-      x86.emitMov(ctx.buf.data, dest.mem, op.reg)
+      let (bits, _) = intMemAccess(dest.typ)     # sized store: don't clobber neighbors
+      x86.emitMovToMemSized(ctx.buf.data, dest.mem, op.reg, bits)
   else:
     # dest is reg
     if op.kind == okSsize:
@@ -3109,7 +3153,8 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
       else:
         x86.emitMovImmToReg(ctx.buf.data, dest.reg, op.immVal)
     elif op.kind == okMem:
-      x86.emitMov(ctx.buf.data, dest.reg, op.mem)
+      let (bits, signed) = intMemAccess(op.typ)  # sized load: sign-/zero-extend sub-word
+      x86.emitLoadExt(ctx.buf.data, dest.reg, op.mem, bits, signed)
     else:
       x86.emitMov(ctx.buf.data, dest.reg, op.reg)
   skipParRi n, "mov"
@@ -3479,15 +3524,16 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     skipParRi n, "rdx"
 
-    inc n # (rax)
-    if n.kind != ParLe or n.tag != RaxTagId: error("Expected (rax) for idiv", n)
+    if n.kind != ParLe or n.tag != RaxTagId: error("Expected (rax) for div", n)
     inc n
     skipParRi n, "rax"
 
     let op = parseOperand(n, ctx)
     checkIntegerType(op.typ, "div", start)
     if op.kind == okImm: error("DIV immediate not supported", n)
-    elif op.kind == okMem:
+    # Unsigned divide needs the high half of the dividend (RDX) zeroed.
+    x86.emitXor(ctx.buf.data, x86.RDX, x86.RDX)
+    if op.kind == okMem:
       x86.emitDiv(ctx.buf.data, op.mem)
     else:
       x86.emitDiv(ctx.buf.data, op.reg)
@@ -3500,7 +3546,6 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     skipParRi n, "idiv"
 
-    inc n # (rax)
     if n.kind != ParLe or n.tag != RaxTagId: error("Expected (rax) for idiv", n)
     inc n
     skipParRi n, "rax"
@@ -3508,7 +3553,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperand(n, ctx)
     checkIntegerType(op.typ, "idiv", start)
     if op.kind == okImm: error("IDIV immediate not supported", n)
-    elif op.kind == okMem:
+    # Signed divide needs RAX sign-extended into RDX:RAX first.
+    x86.emitCqo(ctx.buf.data)
+    if op.kind == okMem:
       x86.emitIdiv(ctx.buf.data, op.mem)
     else:
       x86.emitIdiv(ctx.buf.data, op.reg)
@@ -4029,7 +4076,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     else:
       # Try parsing as a label operand (rodata, gvar, etc.)
       let op = parseOperand(n, ctx)
-      if op.kind == okLabel:
+      if op.gvarSym != nil:
+        # Global in .bss (a different segment): emit a placeholder RIP-relative lea
+        # and record the site; writeElf patches the disp32 against the .bss vaddr.
+        let pos = x86.emitLeaRipPlaceholder(ctx.buf, dest)
+        ctx.gvarSites.add (pos, op.gvarSym)
+      elif op.kind == okLabel:
         x86.emitLea(ctx.buf, dest, op.label)
       else:
         error("lea requires (base-reg offset) or label", n)
@@ -4196,58 +4248,93 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # For now, placeholder error or implement if x86 supports it
     error("MOVAPD not supported yet", n)
     skipParRi n, "movapd"
-  of MovsdX64:
+  of MovsdX64, MovssX64:
+    # `(movsd D S)`: a scalar-float move where one side may be memory:
+    #   (movsd (xmmD) (xmmS))   reg→reg ;  (movsd (xmmD) (mem …))  load
+    #   (movsd (mem …) (xmmS))  store
+    let isD = instTag == MovsdX64
     inc n
-    let dest = parseDest(n, ctx)
-    let op = parseOperand(n, ctx)
-    # Dest must be XMM? Or Mem?
-    # x86: MOVSD xmm1, xmm2/m64
-    # MOVSD xmm1/m64, xmm2
-    # So one must be XMM.
-    if dest.kind == okMem and op.kind == okMem:
-      error("MOVSD memory to memory not supported", n)
-    # We need to check if registers are XMM.
-    # Currently parseRegister returns Register enum which is GPR.
-    # We need XmmRegister support.
-    # Let's assume we add XMM support to parseRegister or use a variant.
-    error("MOVSD not fully supported yet (needs XMM register parsing)", n)
+    if isXmmTag(n):
+      let d = parseXmm(n)
+      if isXmmTag(n):
+        let s = parseXmm(n)
+        if isD: x86.emitMovsd(ctx.buf.data, d, s)
+        else:   x86.emitMovss(ctx.buf.data, d, s)
+      else:
+        let s = parseOperand(n, ctx)
+        if s.kind != okMem: error("movsd/movss source must be xmm or memory", n)
+        if isD: x86.emitMovsdLoad(ctx.buf.data, d, s.mem)
+        else:   x86.emitMovssLoad(ctx.buf.data, d, s.mem)
+    else:
+      let d = parseOperand(n, ctx)
+      if d.kind != okMem: error("movsd/movss destination must be xmm or memory", n)
+      let s = parseXmm(n)
+      if isD: x86.emitMovsdStore(ctx.buf.data, d.mem, s)
+      else:   x86.emitMovssStore(ctx.buf.data, d.mem, s)
     skipParRi n, "movsd"
 
-  of AddsdX64:
+  of AddsdX64, AddssX64, SubsdX64, SubssX64,
+     MulsdX64, MulssX64, DivsdX64, DivssX64, Cvtsd2ssX64, Cvtss2sdX64,
+     ComisdX64, ComissX64:
+    # Scalar SSE op on two XMM registers: `(op (xmmD) (xmmS))` → dest = dest op src
+    # (or just sets EFLAGS for comisd/comiss).
+    let it = instTag
     inc n
-    let dest = parseDest(n, ctx)
-    let op = parseOperand(n, ctx)
-    checkFloatType(dest.typ, "addsd", start)
-    checkFloatType(op.typ, "addsd", start)
-    error("Scalar double precision arithmetic not fully supported yet", n)
-    skipParRi n, "addsd"
+    let d = parseXmm(n)
+    let s = parseXmm(n)
+    case it
+    of AddsdX64:   x86.emitAddsd(ctx.buf.data, d, s)
+    of AddssX64:   x86.emitAddss(ctx.buf.data, d, s)
+    of SubsdX64:   x86.emitSubsd(ctx.buf.data, d, s)
+    of SubssX64:   x86.emitSubss(ctx.buf.data, d, s)
+    of MulsdX64:   x86.emitMulsd(ctx.buf.data, d, s)
+    of MulssX64:   x86.emitMulss(ctx.buf.data, d, s)
+    of DivsdX64:   x86.emitDivsd(ctx.buf.data, d, s)
+    of DivssX64:   x86.emitDivss(ctx.buf.data, d, s)
+    of Cvtsd2ssX64: x86.emitCvtsd2ss(ctx.buf.data, d, s)
+    of Cvtss2sdX64: x86.emitCvtss2sd(ctx.buf.data, d, s)
+    of ComisdX64:  x86.emitComisd(ctx.buf.data, d, s)
+    of ComissX64:  x86.emitComiss(ctx.buf.data, d, s)
+    else: discard
+    skipParRi n, "sse op"
 
-  of SubsdX64:
+  of Cvtsi2sdX64, Cvtsi2ssX64:
+    # int -> float: `(cvtsi2sd (xmmD) gprS)`; the GPR source may be a named local.
+    let it = instTag
     inc n
-    let dest = parseDest(n, ctx)
-    let op = parseOperand(n, ctx)
-    checkFloatType(dest.typ, "subsd", start)
-    checkFloatType(op.typ, "subsd", start)
-    error("Scalar double precision arithmetic not fully supported yet", n)
-    skipParRi n, "subsd"
+    let d = parseXmm(n)
+    let s = parseOperand(n, ctx).reg
+    if it == Cvtsi2sdX64: x86.emitCvtsi2sd(ctx.buf.data, d, s)
+    else:                 x86.emitCvtsi2ss(ctx.buf.data, d, s)
+    skipParRi n, "cvtsi2"
 
-  of MulsdX64:
+  of Cvttsd2siX64, Cvttss2siX64:
+    # float -> int (truncating): `(cvttsd2si gprD (xmmS))`; GPR dest may be a local.
+    let it = instTag
     inc n
-    let dest = parseDest(n, ctx)
-    let op = parseOperand(n, ctx)
-    checkFloatType(dest.typ, "mulsd", start)
-    checkFloatType(op.typ, "mulsd", start)
-    error("Scalar double precision arithmetic not fully supported yet", n)
-    skipParRi n, "mulsd"
+    let d = parseDest(n, ctx).reg
+    let s = parseXmm(n)
+    if it == Cvttsd2siX64: x86.emitCvttsd2si(ctx.buf.data, d, s)
+    else:                  x86.emitCvttss2si(ctx.buf.data, d, s)
+    skipParRi n, "cvtt2si"
 
-  of DivsdX64:
+  of MovfqX64, MovfdX64:
+    # Bit-transfer between a GPR and an XMM register; direction by operand kinds.
+    # `(movfq (xmmD) gprS)` = gpr→xmm; `(movfq gprD (xmmS))` = xmm→gpr. The GPR
+    # side may be a raw register or a named local.
+    let it = instTag
     inc n
-    let dest = parseDest(n, ctx)
-    let op = parseOperand(n, ctx)
-    checkFloatType(dest.typ, "divsd", start)
-    checkFloatType(op.typ, "divsd", start)
-    error("Scalar double precision arithmetic not fully supported yet", n)
-    skipParRi n, "divsd"
+    if isXmmTag(n):
+      let d = parseXmm(n)
+      let s = parseOperand(n, ctx).reg
+      if it == MovfqX64: x86.emitMovqGprToXmm(ctx.buf.data, d, s)
+      else:              x86.emitMovdGprToXmm(ctx.buf.data, d, s)
+    else:
+      let d = parseDest(n, ctx).reg
+      let s = parseXmm(n)
+      if it == MovfqX64: x86.emitMovqXmmToGpr(ctx.buf.data, d, s)
+      else:              x86.emitMovdXmmToGpr(ctx.buf.data, d, s)
+    skipParRi n, "movf"
 
   of LockX64:
     inc n
@@ -4351,10 +4438,32 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       x86.emitLock(ctx.buf.data)
       x86.emitNeg(ctx.buf.data, dest.mem)
       skipParRi n, "lock neg"
+    of XaddX64:
+      # `lock xadd [mem], reg` — atomic exchange-and-add; reg receives the old value.
+      inc n
+      let dest = parseDest(n, ctx)
+      let op = parseOperand(n, ctx)
+      if dest.kind != okMem: error("Atomic XADD requires memory destination", n)
+      if op.kind != okReg: error("Atomic XADD source must be a register", n)
+      x86.emitLock(ctx.buf.data)
+      x86.emitXadd(ctx.buf.data, dest.mem, op.reg)
+      skipParRi n, "lock xadd"
+    of CmpxchgX64:
+      # `lock cmpxchg [mem], reg` — compares RAX with [mem]; on equal stores reg,
+      # else loads [mem] into RAX. ZF reflects success.
+      inc n
+      let dest = parseDest(n, ctx)
+      let op = parseOperand(n, ctx)
+      if dest.kind != okMem: error("Atomic CMPXCHG requires memory destination", n)
+      if op.kind != okReg: error("Atomic CMPXCHG source must be a register", n)
+      x86.emitLock(ctx.buf.data)
+      x86.emitCmpxchg(ctx.buf.data, dest.mem, op.reg)
+      skipParRi n, "lock cmpxchg"
     else:
        error("Unsupported instruction for LOCK prefix: " & $innerInstTag, n)
 
-    inc n
+    # Each inner branch already consumed the inner instruction (including its
+    # closing `)`), so `n` is now at the `(lock …)` form's own closing paren.
     skipParRi n, "locked instruction"
 
   of XchgX64:
@@ -4542,7 +4651,7 @@ proc pass2(n: Cursor; ctx: var GenContext) =
 proc writeElf(a: var GenContext; outfile: string) =
   finalize(a.buf)
   finalize(a.bssBuf)
-  let code = a.buf.data
+  var code = a.buf.data
   let baseAddr = 0x400000.uint64
   let headersSize = 64 + (56 * 2)  # ELF header + 2 program headers
   let pageSize = 0x1000.uint64
@@ -4561,6 +4670,18 @@ proc writeElf(a: var GenContext; outfile: string) =
   # .bss section comes after .text in memory
   let bssVaddr = textVaddr + textMemSize
   let bssSize = a.bssOffset.uint64
+
+  # Patch each global's RIP-relative `lea` (in .text) now that both segments'
+  # virtual addresses are known: `lea` is 7 bytes with a disp32 at offset +3, and
+  # RIP points at the next instruction (+7). The gvar's .bss byte offset is `sym.size`.
+  for (pos, sym) in a.gvarSites:
+    let leaVaddr = textVaddr + headersSize.uint64 + pos.uint64
+    let targetVaddr = bssVaddr + sym.size.uint64
+    let disp = int32(int64(targetVaddr) - int64(leaVaddr + 7))
+    code[pos + 3] = byte(disp and 0xFF)
+    code[pos + 4] = byte((disp shr 8) and 0xFF)
+    code[pos + 5] = byte((disp shr 16) and 0xFF)
+    code[pos + 6] = byte((disp shr 24) and 0xFF)
   let bssAlignedSize = if bssSize > 0: ((bssSize + pageSize - 1) and not (pageSize - 1)) else: 0.uint64
 
   let machine = case a.arch
@@ -4805,6 +4926,28 @@ proc assemble*(filename, outfile: string) =
 
   var n1 = beginRead(ctx.modules[MainModuleName].buf)
   pass1(n1, scope, ctx, MainModuleName, ctx.modules[MainModuleName].buf)
+
+  # x86-64: a thread-local is read/written as `FS:[sym.offset]` with the
+  # displacement baked at the *reference* site (no relocation), so every tvar's
+  # offset must be fixed before any code is generated — otherwise a reference
+  # compiled before the tvar's lazy `generateSymbol` would capture the default 0.
+  # (macOS/A64 resolves tvars through relocated descriptors and allocates lazily.)
+  if ctx.arch == Arch.X64:
+    var tn = beginRead(ctx.modules[MainModuleName].buf)
+    if tn.kind == ParLe and tn.tag == StmtsTagId:
+      inc tn
+      while tn.kind != ParRi:
+        if tn.kind == ParLe and tagToNifasmDecl(tn.tag) == TvarD:
+          let start = tn
+          inc tn                              # tvar tag
+          if tn.kind == SymbolDef:
+            let sym = scope.lookup(pool.syms[tn.symId])
+            if sym != nil and sym.kind == skTvar and sym.name notin ctx.generatedSymbols:
+              sym.offset = ctx.tlsOffset
+              ctx.tlsOffset += slots.alignedSize(sym.typ)
+              ctx.generatedSymbols.incl sym.name   # don't re-allocate in generateSymbol
+          tn = start
+        skip tn
 
   # Update ctx with proper buffers for pass2
   ctx.buf = initBuffer()

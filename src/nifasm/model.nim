@@ -20,6 +20,21 @@ type
     SubsdX64 = (ord(SubsdTagId), "subsd")  ## subtract scalar double
     MulsdX64 = (ord(MulsdTagId), "mulsd")  ## multiply scalar double
     DivsdX64 = (ord(DivsdTagId), "divsd")  ## divide scalar double
+    MovssX64 = (ord(MovssTagId), "movss")  ## move scalar single
+    AddssX64 = (ord(AddssTagId), "addss")  ## add scalar single
+    SubssX64 = (ord(SubssTagId), "subss")  ## subtract scalar single
+    MulssX64 = (ord(MulssTagId), "mulss")  ## multiply scalar single
+    DivssX64 = (ord(DivssTagId), "divss")  ## divide scalar single
+    Cvtsi2sdX64 = (ord(Cvtsi2sdTagId), "cvtsi2sd")  ## int -> scalar double convert
+    Cvtsi2ssX64 = (ord(Cvtsi2ssTagId), "cvtsi2ss")  ## int -> scalar single convert
+    Cvttsd2siX64 = (ord(Cvttsd2siTagId), "cvttsd2si")  ## scalar double -> int convert (truncating)
+    Cvttss2siX64 = (ord(Cvttss2siTagId), "cvttss2si")  ## scalar single -> int convert (truncating)
+    Cvtsd2ssX64 = (ord(Cvtsd2ssTagId), "cvtsd2ss")  ## scalar double -> scalar single convert
+    Cvtss2sdX64 = (ord(Cvtss2sdTagId), "cvtss2sd")  ## scalar single -> scalar double convert
+    ComisdX64 = (ord(ComisdTagId), "comisd")  ## compare scalar double, set EFLAGS
+    ComissX64 = (ord(ComissTagId), "comiss")  ## compare scalar single, set EFLAGS
+    MovfqX64 = (ord(MovfqTagId), "movfq")  ## move 64 bits between gpr and xmm
+    MovfdX64 = (ord(MovfdTagId), "movfd")  ## move 32 bits between gpr and xmm
     AndX64 = (ord(AndTagId), "and")  ## bitwise and
     OrX64 = (ord(OrTagId), "or")  ## bitwise or
     XorX64 = (ord(XorTagId), "xor")  ## bitwise xor
@@ -140,7 +155,7 @@ type
     RepmovsqX64 = (ord(RepmovsqTagId), "repmovsq")  ## repeat move quadword string
 
 proc rawTagIsX64Inst*(raw: TagEnum): bool {.inline.} =
-  raw in {PrepareTagId, MovTagId, LeaTagId, MovapdTagId, MovsdTagId, AddTagId, SubTagId, MulTagId, ImulTagId, DivTagId, IdivTagId, AddsdTagId, SubsdTagId, MulsdTagId, DivsdTagId, AndTagId, OrTagId, XorTagId, ShlTagId, ShrTagId, SalTagId, SarTagId, IncTagId, DecTagId, NegTagId, NotTagId, CmpTagId, TestTagId, SeteTagId, SetzTagId, SetneTagId, SetnzTagId, SetaTagId, SetnbeTagId, SetaeTagId, SetnbTagId, SetncTagId, SetbTagId, SetnaeTagId, SetcTagId, SetbeTagId, SetnaTagId, SetgTagId, SetnleTagId, SetgeTagId, SetnlTagId, SetlTagId, SetngeTagId, SetleTagId, SetngTagId, SetoTagId, SetsTagId, SetpTagId, CmoveTagId, CmovzTagId, CmovneTagId, CmovnzTagId, CmovaTagId, CmovnbeTagId, CmovaeTagId, CmovnbTagId, CmovncTagId, CmovbTagId, CmovnaeTagId, CmovcTagId, CmovbeTagId, CmovnaTagId, CmovgTagId, CmovnleTagId, CmovgeTagId, CmovnlTagId, CmovlTagId, CmovngeTagId, CmovleTagId, CmovngTagId, CmovoTagId, CmovnoTagId, CmovsTagId, CmovnsTagId, CmovpTagId, CmovnpTagId, CmovpeTagId, CmovpoTagId, JmpTagId, JeTagId, JzTagId, JneTagId, JnzTagId, JgTagId, JngTagId, JgeTagId, JngeTagId, JaTagId, JnaTagId, JaeTagId, JnaeTagId, JlTagId, JleTagId, JbTagId, JbeTagId, CallTagId, ExtcallTagId, IatTagId, RetTagId, PushTagId, PopTagId, NopTagId, SyscallTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, LockTagId, XchgTagId, CmpxchgTagId, XaddTagId, Cmpxchg8bTagId, MfenceTagId, SfenceTagId, LfenceTagId, PauseTagId, ClflushTagId, ClflushoptTagId, Prefetcht0TagId, Prefetcht1TagId, Prefetcht2TagId, PrefetchntaTagId, RepmovsbTagId, RepmovswTagId, RepmovsdTagId, RepmovsqTagId}
+  raw in {PrepareTagId, MovTagId, LeaTagId, MovapdTagId, MovsdTagId, AddTagId, SubTagId, MulTagId, ImulTagId, DivTagId, IdivTagId, AddsdTagId, SubsdTagId, MulsdTagId, DivsdTagId, MovssTagId, AddssTagId, SubssTagId, MulssTagId, DivssTagId, Cvtsi2sdTagId, Cvtsi2ssTagId, Cvttsd2siTagId, Cvttss2siTagId, Cvtsd2ssTagId, Cvtss2sdTagId, ComisdTagId, ComissTagId, MovfqTagId, MovfdTagId, AndTagId, OrTagId, XorTagId, ShlTagId, ShrTagId, SalTagId, SarTagId, IncTagId, DecTagId, NegTagId, NotTagId, CmpTagId, TestTagId, SeteTagId, SetzTagId, SetneTagId, SetnzTagId, SetaTagId, SetnbeTagId, SetaeTagId, SetnbTagId, SetncTagId, SetbTagId, SetnaeTagId, SetcTagId, SetbeTagId, SetnaTagId, SetgTagId, SetnleTagId, SetgeTagId, SetnlTagId, SetlTagId, SetngeTagId, SetleTagId, SetngTagId, SetoTagId, SetsTagId, SetpTagId, CmoveTagId, CmovzTagId, CmovneTagId, CmovnzTagId, CmovaTagId, CmovnbeTagId, CmovaeTagId, CmovnbTagId, CmovncTagId, CmovbTagId, CmovnaeTagId, CmovcTagId, CmovbeTagId, CmovnaTagId, CmovgTagId, CmovnleTagId, CmovgeTagId, CmovnlTagId, CmovlTagId, CmovngeTagId, CmovleTagId, CmovngTagId, CmovoTagId, CmovnoTagId, CmovsTagId, CmovnsTagId, CmovpTagId, CmovnpTagId, CmovpeTagId, CmovpoTagId, JmpTagId, JeTagId, JzTagId, JneTagId, JnzTagId, JgTagId, JngTagId, JgeTagId, JngeTagId, JaTagId, JnaTagId, JaeTagId, JnaeTagId, JlTagId, JleTagId, JbTagId, JbeTagId, CallTagId, ExtcallTagId, IatTagId, RetTagId, PushTagId, PopTagId, NopTagId, SyscallTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, LockTagId, XchgTagId, CmpxchgTagId, XaddTagId, Cmpxchg8bTagId, MfenceTagId, SfenceTagId, LfenceTagId, PauseTagId, ClflushTagId, ClflushoptTagId, Prefetcht0TagId, Prefetcht1TagId, Prefetcht2TagId, PrefetchntaTagId, RepmovsbTagId, RepmovswTagId, RepmovsdTagId, RepmovsqTagId}
 
 type
   A64Inst* = enum
