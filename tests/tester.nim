@@ -24,12 +24,11 @@ proc execExpectOutput(cmd: string; expected: string) =
   if s != expected:
     quit "UNEXPECTED OUTPUT " & cmd & "\nExpected:\n" & expected & "\nGot:\n" & s
 
-const arkhamKnownUnsupported = [
-  # Documented v0 TODOs that still `raiseAssert` in arkham's x86-64 backend: the
-  # float-in-call-signature ABI, by-value aggregates, and addr-of-param. A
-  # failure here is tolerated (the feature is unimplemented); a failure anywhere
-  # else is a hard error. When one of these starts passing, drop it from the list.
-  "fpcall", "fpderef", "fpfunc", "fpparamspill"]
+const arkhamKnownUnsupported: seq[string] = @[]
+  # Documented v0 TODOs that still `raiseAssert` in arkham's x86-64 backend.
+  # Empty: the x64 backend now implements the full input corpus (the
+  # float-in-call-signature ABI landed last). Any failure is a hard error. If a
+  # new unimplemented feature is added, list its test stems here.
 
 proc arkhamTests() =
   ## Each `tests/arkham/*.c.nif` is hand-written NIFC: arkham generates asm-NIF,

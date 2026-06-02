@@ -1230,10 +1230,16 @@ proc genCall(g: var CodeGen; c: var Cursor) =
       # bare `(prepare f (call))` (the callee's signature is empty). The scalar
       # result lands in rax (read by the CallC path in `genInto`).
       var idx = 0
+      var fidx = 0
       var sealedHere: set[Reg] = {}
       while c.hasMore:
         if g.isFloatExpr(c):
-          raiseAssert "arkham x64 v0: float argument in a non-declarative call"
+          # A float argument goes in xmm{fidx}. The float arg registers (xmm0–7)
+          # are disjoint from the GPR scratch pool and from the xmm scratch temps
+          # (xmm8–15) a later float arg's evaluation uses, so no sealing is needed.
+          assert fidx < g.md.floatArgRegs.len, "arkham x64 v0: >8 float args (stack TODO)"
+          g.genIntoF(c, g.md.floatArgRegs[fidx], g.floatBits(c))
+          inc fidx
         elif c.kind == Symbol and g.varType.hasKey(symName(c)):
           let vn = symName(c)
           let tn = g.varType[vn]
@@ -1596,6 +1602,8 @@ proc genStmt(g: var CodeGen; c: var Cursor) =
             assert c.kind == Symbol, "arkham x64 v0: aggregate ret value must be a local"
             g.structToRegs(symName(c), g.retAggrName, x64RetRegs)
             inc c
+          elif g.retIsFloat:
+            g.genIntoF(c, FloatRet, g.retFloatBits)   # float result in xmm0
           else:
             g.genInto(c, RAX)
       g.framePop()                            # restore callee-saved before returning
@@ -1758,6 +1766,7 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor; declarative: bool) =
   inc c                                       # name → params slot
   if c.kind != TagLit: return                 # no parameters
   var idx = if g.retIndirect: 1 else: 0       # rdi = hidden result ptr for a >16B return
+  var fidx = 0                                # float params consume xmm0–7, not GPRs
   c.into:
     while c.hasMore:
       var nm = ""
@@ -1784,6 +1793,20 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor; declarative: bool) =
         g.varType[nm] = tn
         g.movReg(loc.r, g.md.intArgRegs[idx])
         inc idx
+      elif loc.kind == InFReg:
+        # Float parameter: in a leaf proc it stays in its incoming xmm{fidx}; if the
+        # allocator gave it a (callee-saved-equivalent) home, move it there. SysV has
+        # no callee-saved xmm, so a float crossing a call instead spills (next branch).
+        g.fmovF(loc.f, g.md.floatArgRegs[fidx], loc.typ.size * 8)
+        inc fidx
+      elif loc.kind == NamedStack and loc.typ.kind == AFloat:
+        # An address-taken / spilled float param: declare its `(s) (f N)` slot and
+        # spill the incoming xmm arg register into it so `addr`/loads/stores work.
+        assert fidx < g.md.floatArgRegs.len, "arkham x64 v0: >8 float params (stack TODO)"
+        let bits = loc.typ.size * 8
+        g.emFloatStackVar(nm, bits)
+        g.emFloatScalarStore(nm, g.md.floatArgRegs[fidx], bits)
+        inc fidx
       elif idx < g.md.intArgRegs.len:           # register-passed scalar parameter
         let argReg = g.md.intArgRegs[idx]
         if loc.kind == InReg and loc.r == argReg:
@@ -1967,6 +1990,9 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     if rc.kind == Symbol and slotOf(g.prog, rc).kind == AMem:
       g.retAggrName = symName(rc)
       g.retIndirect = aggrByteSize(g.prog, g.retAggrName) > g.md.aggrByRefThreshold
+    elif rc.kind == TagLit and rc.typeKind == FT:
+      g.retIsFloat = true                       # float return → xmm0
+      g.retFloatBits = if slotOf(g.prog, rc).size == 4: 32 else: 64
   let preseal = if g.retIndirect: {RBX} else: {}
   g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64Machine, preseal)
   if g.retIndirect:
