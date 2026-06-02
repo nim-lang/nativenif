@@ -3373,7 +3373,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let sym = Symbol(name: name, kind: skVar)
     if onStack:
       sym.typ = Type(kind: StackOffT, offType: baseTyp)
-      sym.offset = ctx.slots.allocSlot(baseTyp)
+      # Positive, base-relative offsets (like AArch64): the code generator lowers
+      # rsp by a 16-aligned `sub rsp, (ssize)` so the slots sit ABOVE rsp, where a
+      # `call`'s pushed return address (and any callee pushes) can't reach them. A
+      # red-zone (negative-offset) slot whose address escapes into a call would be
+      # clobbered by that call. No frame pointer is needed.
+      sym.offset = ctx.slots.allocSlotUp(baseTyp)
     else:
       sym.typ = baseTyp
       sym.reg = reg

@@ -29,9 +29,7 @@ const arkhamKnownUnsupported = [
   # float-in-call-signature ABI, by-value aggregates, and addr-of-param. A
   # failure here is tolerated (the feature is unimplemented); a failure anywhere
   # else is a hard error. When one of these starts passing, drop it from the list.
-  "addrparam", "fpcall", "fpderef", "fpfunc", "fpparamspill",
-  "structasgn", "structcopy", "structparam", "structparam_big",
-  "structret", "structret_big"]
+  "fpcall", "fpderef", "fpfunc", "fpparamspill"]
 
 proc arkhamTests() =
   ## Each `tests/arkham/*.c.nif` is hand-written NIFC: arkham generates asm-NIF,

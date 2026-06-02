@@ -269,7 +269,15 @@ proc emAccessAddr(g: var CodeGen; n: var Cursor; tmps: var seq[Reg]) =
     let loc = g.ra.locationOfSym(nm)
     case loc.kind
     of NamedStack: (g.ab.reg RSP; g.ab.sym nm)   # a stack var: rsp + slot offset
-    of InReg: g.emReg loc.r                        # a pointer in a register
+    of InReg:
+      if g.varType.hasKey(nm):
+        # a by-reference aggregate: the register holds a pointer; type it with a
+        # cast so a `(dot …)` / `(at …)` can compute the field/element offset.
+        g.ab.tree CastX:
+          g.ab.ptrType: g.ab.sym g.varType[nm]
+          g.emReg loc.r
+      else:
+        g.emReg loc.r                              # a plain pointer in a register
     else: raiseAssert "arkham x64 v0: unsupported lvalue base: " & nm
   of TagLit:
     case n.exprKind
@@ -1084,6 +1092,62 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
   else:
     raiseAssert "arkham x64 v0: unsupported mem intrinsic: " & builtin
 
+# ── by-value aggregate marshalling (SysV) ────────────────────────────────────
+# A ≤16-byte aggregate of full 8-byte fields travels in 1–2 GPRs (word i ↔ the
+# field at byte offset 8·i); a >16-byte aggregate is passed/returned by reference
+# (a pointer). This is self-consistent arkham↔arkham — NOT strict SysV, which
+# would pass a >16B argument as a stack copy (MEMORY class) and return it via a
+# hidden pointer in the first integer arg. A ≤16B result travels in rax:rdx.
+
+const x64RetRegs = [RAX, RDX]   # SysV ≤16B aggregate result: rax (word 0), rdx (word 1)
+
+proc emStackAddr(g: var CodeGen; dest: Reg; name: string) =   # dest ← &stackvar
+  g.ab.tree LeaX64: (g.emReg dest; g.ab.reg RSP; g.ab.sym name)
+
+proc emPtrFieldMem(g: var CodeGen; ptrReg: Reg; typeName, field: string) =
+  ## `(mem (dot (cast (ptr T) reg) field))` — a field through a register holding a
+  ## pointer to the aggregate (a >16B by-ref param / the indirect-result buffer).
+  ## The cast types the bare register so nifasm can compute the field offset.
+  g.ab.tree MemX:
+    g.ab.tree DotX:
+      g.ab.tree CastX:
+        g.ab.ptrType: g.ab.sym typeName
+        g.emReg ptrReg
+      g.ab.sym field
+
+proc emAggrFieldMem(g: var CodeGen; base, field: string) =
+  ## Field memory operand for aggregate `base`: a `(s)` stack struct → direct dot;
+  ## a pointer in a register (a by-ref param) → through the pointer.
+  let loc = g.ra.locationOfSym(base)
+  case loc.kind
+  of NamedStack: g.emFieldMem(base, field)
+  of InReg:      g.emPtrFieldMem(loc.r, g.varType[base], field)
+  else: raiseAssert "arkham x64 v0: aggregate base neither stack nor pointer: " & base
+
+proc structToRegs(g: var CodeGen; varName, typeName: string; regs: openArray[Reg]) =
+  ## aggregate → regs[i] (one GPR per 8-byte word).
+  let lay = aggrLayout(g.prog, typeName)
+  for i in 0 ..< aggrWordCount(g.prog, typeName):
+    let fn = fieldAtOffset(lay, i * 8)
+    if fn.len == 0: raiseAssert "arkham x64 v0: sub-word-packed aggregate ABI unsupported"
+    g.ab.tree MovX64: (g.emReg regs[i]; g.emAggrFieldMem(varName, fn))
+
+proc regsToStruct(g: var CodeGen; varName, typeName: string; regs: openArray[Reg]) =
+  ## regs[i] → aggregate (one GPR per 8-byte word).
+  let lay = aggrLayout(g.prog, typeName)
+  for i in 0 ..< aggrWordCount(g.prog, typeName):
+    let fn = fieldAtOffset(lay, i * 8)
+    if fn.len == 0: raiseAssert "arkham x64 v0: sub-word-packed aggregate ABI unsupported"
+    g.ab.tree MovX64: (g.emAggrFieldMem(varName, fn); g.emReg regs[i])
+
+proc copyStructThroughPtr(g: var CodeGen; srcVar, typeName: string; ptrReg: Reg) =
+  ## field-wise copy of aggregate `srcVar` → the memory `ptrReg` points at.
+  for f in aggrLayout(g.prog, typeName):
+    let t = g.borrowTmp()
+    g.ab.tree MovX64: (g.emReg t; g.emAggrFieldMem(srcVar, f.name))
+    g.ab.tree MovX64: (g.emPtrFieldMem(ptrReg, typeName, f.name); g.emReg t)
+    g.giveBack t
+
 proc genCall(g: var CodeGen; c: var Cursor) =
   ## `(call f arg…)`. The C `exit` extern lowers to the Linux exit syscall; a
   ## declarative user proc uses the SysV register ABI via a `(prepare …)` block
@@ -1162,7 +1226,78 @@ proc genCall(g: var CodeGen; c: var Cursor) =
             g.ab.tree ResX: g.ab.sym "ret.0"
       g.ra.unseal sealedHere
     else:
-      raiseAssert "arkham x64 v0: unsupported call target: " & fsym
+      # Non-declarative ABI: marshal args by hand (aggregates / by-ref), then a
+      # bare `(prepare f (call))` (the callee's signature is empty). The scalar
+      # result lands in rax (read by the CallC path in `genInto`).
+      var idx = 0
+      var sealedHere: set[Reg] = {}
+      while c.hasMore:
+        if g.isFloatExpr(c):
+          raiseAssert "arkham x64 v0: float argument in a non-declarative call"
+        elif c.kind == Symbol and g.varType.hasKey(symName(c)):
+          let vn = symName(c)
+          let tn = g.varType[vn]
+          if aggrByteSize(g.prog, tn) > g.md.aggrByRefThreshold:
+            # >16B → by reference: pass a pointer to it in the next arg reg.
+            assert idx < g.md.intArgRegs.len, "arkham x64 v0: >6 args (stack TODO)"
+            let ar = g.md.intArgRegs[idx]
+            let loc = g.ra.locationOfSym(vn)
+            case loc.kind
+            of NamedStack: g.emStackAddr(ar, vn)        # lea ar, &vn
+            of InReg: g.movReg(ar, loc.r)               # already a pointer
+            else: raiseAssert "arkham x64 v0: by-ref arg neither stack nor pointer: " & vn
+            g.ra.seal ar; sealedHere.incl ar
+            inc idx
+          else:
+            # ≤16B → by value: marshal its words into the next GPR(s).
+            let nw = aggrWordCount(g.prog, tn)
+            assert idx + nw <= g.md.intArgRegs.len, "arkham x64 v0: aggregate arg exceeds GPRs"
+            g.structToRegs(vn, tn, g.md.intArgRegs[idx ..< idx + nw])
+            for k in 0 ..< nw:
+              g.ra.seal g.md.intArgRegs[idx + k]; sealedHere.incl g.md.intArgRegs[idx + k]
+            idx += nw
+          inc c
+        else:
+          assert idx < g.md.intArgRegs.len, "arkham x64 v0: >6 integer args (stack TODO)"
+          let ar = g.md.intArgRegs[idx]
+          g.genInto(c, ar)
+          g.ra.seal ar; sealedHere.incl ar
+          inc idx
+      g.ab.tree PrepareX64:
+        g.ab.sym tgt.asmName
+        g.ab.keyword CallX64
+      g.ra.unseal sealedHere
+
+# ── whole-aggregate copy (struct assignment / copy-init) ─────────────────────
+
+proc byteCopyConst(g: var CodeGen; dst, src: Reg; size: int) =
+  ## `dst[0..<size] ← src[0..<size]`, `size` a compile-time constant (the same
+  ## inline byte loop as `memcpy`). Used for whole-aggregate assignment / copy-
+  ## init; `dst`/`src` stay live. No calls inside, so RAX/RCX (not in the
+  ## allocator pool, and never an `aggrAddr` result) are free scratch for the
+  ## byte value / loop counter.
+  let loop = g.freshLabel()
+  let done = g.freshLabel()
+  g.movImm(RCX, 0)                              # i = 0
+  g.emLab(loop)
+  g.ab.tree CmpX64: (g.emReg RCX; g.ab.intLit size)
+  g.emJcc(JaeX64, done)                         # i >= size (unsigned) → done
+  g.emLoadByte(RAX, src, RCX)                   # b = src[i]
+  g.emStoreByte(dst, RCX, RAX)                  # dst[i] = b
+  g.binImm(AddX64, RCX, 1)
+  g.emJmp(loop)
+  g.emLab(done)
+
+proc aggrAddr(g: var CodeGen; c: var Cursor): (Reg, bool) =
+  ## Address of an aggregate lvalue (consumes it). A by-reference aggregate param
+  ## (InReg) already *is* the address; otherwise borrow a temp and `genAddr`.
+  if c.kind == Symbol:
+    let loc = g.ra.locationOfSym(symName(c))
+    if loc.kind == InReg:
+      result = (loc.r, false); inc c; return
+  let r = g.borrowTmp()
+  g.genAddr(c, r)
+  result = (r, true)
 
 # ── statements ─────────────────────────────────────────────────────────────────
 
@@ -1215,7 +1350,27 @@ proc genVarDecl(g: var CodeGen; c: var Cursor) =
                     g.emReg r
                   if owns: g.giveBack r
                   while c.hasMore: skip c      # optional inherited-depth INTLIT
-          else:                               # aggregate copy-init → byte copy (TODO)
+          elif c.kind == TagLit and c.exprKind == CallC:
+            # receive an aggregate return value into this var's slot.
+            assert tc.kind == Symbol, "arkham x64 v0: call-returned aggregate needs a named type"
+            let typeName = symName(tc)
+            if aggrByteSize(g.prog, typeName) > g.md.aggrByRefThreshold:
+              # >16B: hand the callee a pointer to this var via rdi; it writes there.
+              g.emStackAddr(RDI, name)
+              g.genCall(c)
+            else:
+              g.genCall(c)                     # result in rax:rdx
+              g.regsToStruct(name, typeName, x64RetRegs)
+          elif c.kind == Symbol or
+               (c.kind == TagLit and c.exprKind in {DotC, AtC, DerefC}):
+            # init from another aggregate lvalue → whole-struct byte copy
+            let dst = g.borrowTmp()
+            g.emStackAddr(dst, name)
+            let (srcA, srcT) = g.aggrAddr(c)
+            g.byteCopyConst(dst, srcA, loc.typ.size)
+            if srcT: g.giveBack srcA
+            g.giveBack dst
+          else:
             raiseAssert "arkham x64 v0: aggregate copy-initializer not supported: " & name
       else:                                   # a spilled / address-taken scalar
         g.emScalarStackVar(name)              # (var :name (s) (i 64))
@@ -1230,8 +1385,15 @@ proc genVarDecl(g: var CodeGen; c: var Cursor) =
 
 proc genAsgn(g: var CodeGen; c: var Cursor) =
   c.into:
-    let l = g.asLvalue(c)                      # consumes the lvalue
-    if l.slot.kind == AFloat:                  # float target (register or spilled)
+    let slot = g.exprSlot(c)                   # peek the lvalue's type (no consume)
+    if slot.kind == AMem:                      # whole-aggregate copy (any size)
+      let (dstA, dstT) = g.aggrAddr(c)         # &lvalue (consumes it)
+      let (srcA, srcT) = g.aggrAddr(c)         # &rvalue (an aggregate lvalue)
+      g.byteCopyConst(dstA, srcA, slot.size)
+      if srcT: g.giveBack srcA
+      if dstT: g.giveBack dstA
+    elif slot.kind == AFloat:                  # float target (register or spilled)
+      let l = g.asLvalue(c)
       let bits = l.slot.size * 8
       if l.kind == lvFReg:
         g.genIntoF(c, l.f, bits)
@@ -1241,10 +1403,9 @@ proc genAsgn(g: var CodeGen; c: var Cursor) =
         g.emitStoreF(l, f, bits)
         g.giveBackF f
     else:
+      let l = g.asLvalue(c)                    # consumes the lvalue
       case l.kind
       of lvReg: g.genInto(c, l.r)
-      of lvAggrVar:
-        raiseAssert "arkham x64 v0: assignment target of kind " & $l.kind
       else:                                    # memory target: RHS → reg → store
         let (r, owns) = g.forceReg(g.genVal(c))  # (imm→mem isn't supported by nifasm)
         g.emitStore(l, r)
@@ -1423,7 +1584,20 @@ proc genStmt(g: var CodeGen; c: var Cursor) =
       g.emSyscall()
     else:
       c.into:
-        if c.hasMore and c.kind != DotToken: g.genInto(c, RAX)
+        if c.hasMore and c.kind != DotToken:
+          if g.retIndirect:
+            # >16B: copy the result into the caller's buffer (parked in rbx) and
+            # return its address in rax (SysV: the hidden pointer is also returned).
+            assert c.kind == Symbol, "arkham x64 v0: aggregate ret value must be a local"
+            g.copyStructThroughPtr(symName(c), g.retAggrName, g.indirectReg)
+            g.movReg(RAX, g.indirectReg)
+            inc c
+          elif g.retAggrName.len > 0:         # ≤16B aggregate → rax:rdx
+            assert c.kind == Symbol, "arkham x64 v0: aggregate ret value must be a local"
+            g.structToRegs(symName(c), g.retAggrName, x64RetRegs)
+            inc c
+          else:
+            g.genInto(c, RAX)
       g.framePop()                            # restore callee-saved before returning
       g.ab.keyword RetX64
   else:
@@ -1498,6 +1672,28 @@ proc genType(g: var CodeGen; name: string; decl: Cursor) =
       g.ab.symDef name
       g.genTypeBody(c)
 
+proc numIncomingArgRegs(g: var CodeGen; decl: Cursor): int =
+  ## How many leading integer arg registers carry incoming values: a hidden
+  ## result pointer (>16B return) + one per scalar / by-ref-aggregate param + one
+  ## per 8-byte word of a ≤16B by-value aggregate param. These hold live values on
+  ## entry, so they're excluded from the clobber set (a clobbered register can't
+  ## be read — and a named local bound to one would be rejected).
+  result = if g.retIndirect: 1 else: 0
+  var c = decl
+  inc c; inc c                                # head → name → params
+  if c.kind != TagLit: return
+  c.into:
+    while c.hasMore:
+      var tn = ""
+      c.into:                                 # (param :name pragmas type)
+        inc c; skip c                         # name, pragmas
+        if c.kind == Symbol and slotOf(g.prog, c).kind == AMem: tn = symName(c)
+        while c.hasMore: skip c
+      if tn.len > 0:
+        if aggrByteSize(g.prog, tn) > g.md.aggrByRefThreshold: inc result
+        else: result += aggrWordCount(g.prog, tn)
+      else: inc result
+
 proc emitSignature(g: var CodeGen; decl: Cursor; declarative: bool) =
   ## `(params)/(result)/(clobber)`. Declarative procs state the SysV register ABI
   ## — positional `p.i` params in rdi/rsi/… and an rax result — so nifasm
@@ -1543,12 +1739,13 @@ proc emitSignature(g: var CodeGen; decl: Cursor; declarative: bool) =
   # listing them would make the body unable to read its own params. The caller
   # already accounts for the arg/result registers via the ABI.
   var paramRegs: set[Reg] = {}
-  for i in 0 ..< min(numParams, g.md.intArgRegs.len): paramRegs.incl g.md.intArgRegs[i]
+  for i in 0 ..< min(g.numIncomingArgRegs(decl), g.md.intArgRegs.len):
+    paramRegs.incl g.md.intArgRegs[i]
   g.ab.tree ClobberD:
     for r in x64ClobbersGpr:
       if r notin paramRegs: g.ab.reg r
 
-proc emitParamMoves(g: var CodeGen; decl: Cursor) =
+proc emitParamMoves(g: var CodeGen; decl: Cursor; declarative: bool) =
   ## Settle each register-passed parameter into its allocated home. A param the
   ## allocator left in its incoming arg register becomes the named local `p.i`
   ## (x64 refers to a bound register by name); one the allocator relocated to a
@@ -1560,28 +1757,59 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
   inc c                                       # proc head → name
   inc c                                       # name → params slot
   if c.kind != TagLit: return                 # no parameters
-  var idx = 0
+  var idx = if g.retIndirect: 1 else: 0       # rdi = hidden result ptr for a >16B return
   c.into:
     while c.hasMore:
       var nm = ""
+      var tn = ""                             # non-empty → an aggregate param type
+      var typeCur = c
       c.into:                                 # (param :name pragmas type)
         nm = symName(c); inc c
         skip c                                # pragmas
         g.symType[nm] = c                     # record the param's type for getType
-        if c.kind == Symbol and slotOf(g.prog, c).kind == AMem:
-          raiseAssert "arkham x64 v0: aggregate parameter not supported: " & nm
+        typeCur = c
+        if c.kind == Symbol and slotOf(g.prog, c).kind == AMem: tn = symName(c)
         while c.hasMore: skip c
-      if idx < g.md.intArgRegs.len:           # register-passed parameter
+      let loc = g.ra.locationOfSym(nm)
+      if tn.len > 0 and loc.kind == NamedStack:
+        # ≤16B by-value aggregate: declare its `(s)` home, fill from its GPR word(s).
+        g.varType[nm] = tn
+        g.emStackVar(nm, tn)
+        let nw = aggrWordCount(g.prog, tn)
+        g.regsToStruct(nm, tn, g.md.intArgRegs[idx ..< idx + nw])
+        idx += nw
+      elif tn.len > 0 and loc.kind == InReg:
+        # >16B by-reference aggregate: a pointer homed like a scalar; field
+        # accesses route through it (recorded in varType).
+        g.varType[nm] = tn
+        g.movReg(loc.r, g.md.intArgRegs[idx])
+        inc idx
+      elif idx < g.md.intArgRegs.len:           # register-passed scalar parameter
         let argReg = g.md.intArgRegs[idx]
-        let loc = g.ra.locationOfSym(nm)
         if loc.kind == InReg and loc.r == argReg:
-          g.regLocal[argReg] = paramName(idx)   # stays in its arg reg → named local
+          if declarative:
+            g.regLocal[argReg] = paramName(idx) # the signature binds it as `pN.0`
+          else:
+            # no signature binding (empty params) → bind the param's own name to
+            # its arg register so the body can refer to it by name.
+            g.emRegLocalVar(nm, argReg, typeCur)
+            g.regLocal[argReg] = nm
         elif loc.kind == InReg:
           g.movReg(loc.r, argReg)               # relocated to a callee-saved home (raw)
+        elif loc.kind == NamedStack and loc.typ.kind != AFloat:
+          # an address-taken scalar param: declare its `(s)` slot and spill the
+          # incoming argument register into it so `addr`/loads/stores work. In the
+          # declarative path the arg reg is bound to `pN.0`, so the value must be
+          # referenced by that name (a raw `(reg)` is rejected as "bound"); in the
+          # non-declarative path there is no binding, so the raw register is used.
+          g.emScalarStackVar(nm)                # (var :nm (s) (i 64))
+          g.ab.tree MovX64:
+            g.emStackMem(nm)
+            if declarative: g.ab.sym paramName(idx) else: g.ab.reg argReg
         else:
           raiseAssert "arkham x64 v0: spilled / float parameter: " & nm
+        inc idx
       # else: stack-passed (7th+) — loaded by emitStackParamLoadsX64.
-      inc idx
 
 # ── stack frame: callee-saved save/restore + incoming stack parameters ───────
 # x86-64 has no pair store, so each used callee-saved GPR is a single `push`/`pop`.
@@ -1614,6 +1842,11 @@ proc framePush(g: var CodeGen) =
     g.ab.tree PushX64: g.ab.reg r                          # raw push
 
 proc framePop(g: var CodeGen) =
+  # Release the nifasm-managed `(s)` slot region first (reverse of the prologue,
+  # which lowered rsp by the pad then the `(ssize)` block), then the alignment pad
+  # and the callee-saved registers.
+  if g.ra.hasStackVars:
+    g.ab.tree AddX64: g.ab.reg RSP; g.ab.keyword SsizeX
   if g.framePad > 0: g.binImm(AddX64, RSP, g.framePad.int64)
   for i in countdown(g.frameRegs.high, 0):
     g.ab.tree PopX64: g.ab.reg g.frameRegs[i]             # raw pop, reverse order
@@ -1725,19 +1958,36 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.isEntryProc = info.isEntry
   g.regLocal = initTable[Reg, string]()       # per-proc named-local bindings
   g.scopeLocals = @[]
-  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64Machine)
+  # Aggregate return convention (before allocation): a named object ≤16B → rax:rdx;
+  # >16B → a hidden pointer the caller passes in rdi, parked in a callee-saved reg
+  # (rbx) for the proc's lifetime and written through on `ret`.
+  block:
+    var rc = info.decl
+    inc rc; inc rc; skip rc                    # head → name → params, skip → ret type
+    if rc.kind == Symbol and slotOf(g.prog, rc).kind == AMem:
+      g.retAggrName = symName(rc)
+      g.retIndirect = aggrByteSize(g.prog, g.retAggrName) > g.md.aggrByRefThreshold
+  let preseal = if g.retIndirect: {RBX} else: {}
+  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64Machine, preseal)
+  if g.retIndirect:
+    g.indirectReg = RBX
+    g.ra.usedCallee.incl RBX                   # saved/restored like any callee reg
   g.initFreeTmp()
   g.computeFrameX64(info.isEntry, an.hasCall)
+  let declarative = isDeclarativeAbi(g.prog, info.decl)
   g.ab.tree ProcD:
     g.ab.symDef info.asmName
-    g.emitSignature(info.decl, isDeclarativeAbi(g.prog, info.decl))
+    g.emitSignature(info.decl, declarative)
     g.ab.tree StmtsX64:
       g.enterScope()                          # the proc body's scope
       g.framePush()                           # save the used callee-saved GPRs
       g.emitStackParamLoadsX64(info.decl)      # incoming 7th+ args → their reg homes
       if g.framePad > 0:                      # 16-byte alignment for outgoing calls
         g.binImm(SubX64, RSP, g.framePad.int64)
-      g.emitParamMoves(info.decl)             # settle register params
+      if g.ra.hasStackVars:                   # reserve nifasm-managed `(s)` slots so
+        g.ab.tree SubX64: g.ab.reg RSP; g.ab.keyword SsizeX  # they sit above rsp (call-safe)
+      if g.retIndirect: g.movReg(g.indirectReg, RDI)   # park the hidden result ptr
+      g.emitParamMoves(info.decl, declarative)         # settle register params
       if info.isEntry and g.tvars.len > 0:
         g.emitTlsSetup()                      # set FS base + thread-local initializers
       if info.isEntry: g.emitGlobalInits()    # run module-level var initializers
