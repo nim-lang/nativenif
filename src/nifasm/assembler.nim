@@ -51,6 +51,15 @@ proc extractDedupKey*(s: string): string =
 proc typeError(want, got: Type; n: Cursor) =
   error("Type mismatch: expected " & $want & ", got " & $got, n)
 
+proc movCompatible(want, got: Type): bool =
+  ## Type rule for `mov`: strict compatibility, OR a *widening* integer move —
+  ## a smaller integer into a larger register (a safe extending move/load).
+  ## Narrowing or a kind change (int↔ptr/float) is still rejected.
+  if compatible(want, got): return true
+  if want.kind in {IntT, UIntT} and got.kind in {IntT, UIntT, IntLitT}:
+    return got.bits <= want.bits
+  result = false
+
 proc getInt(n: Cursor): int64 =
   if n.kind == IntLit:
     result = pool.integers[n.intId]
@@ -1629,6 +1638,12 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
+    # Type-check the move (consistent with x64's mov and ARM64's add/sub): a
+    # named local carries its declared type, so e.g. narrowing `(mov i8local
+    # i64val)` is rejected, while a widening `(mov i64local i8field)` (extending
+    # load) is allowed. Raw registers are RegisterT (compatible with anything).
+    if dest.typ != nil and op.typ != nil and not movCompatible(dest.typ, op.typ):
+      typeError(dest.typ, op.typ, start)
     if dest.kind == okMem:
       if op.kind == okImm:
         error("Moving immediate to memory not fully supported yet for ARM64", n)
@@ -3954,9 +3969,25 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     x86.emitSyscall(ctx.buf.data)
     skipParRi n, "syscall"
   of LeaX64:
-    # (lea dest-reg base-reg offset) or (lea dest-reg label)
+    # (lea dest base-reg offset) or (lea dest label). The destination is a
+    # register or a named register local. `lea` *defines* its destination, so a
+    # raw register node is accepted whether or not it is bound (unlike a use,
+    # which parseDest would reject); a named local resolves to its register.
     inc n
-    let dest = parseRegister(n) # LEA dest must be register
+    var dest: x86.Register
+    if n.kind == Symbol:
+      let name = getSym(n)
+      let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+      if sym != nil and sym.kind == skVar and sym.reg != InvalidTagId:
+        dest = tagToRegister(sym.reg, n)
+        ctx.clobbered.excl(dest)            # writing it makes it valid again
+        inc n
+      else:
+        error("lea destination must be a register or register-bound local", n)
+    elif n.kind == ParLe and rawTagIsX64Reg(n.tag):
+      dest = parseRegister(n)
+    else:
+      error("lea destination must be a register", n)
 
     # Check if next is a label or register
     if n.kind == ParLe and n.tag == LabTagId:
