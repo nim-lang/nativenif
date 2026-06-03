@@ -74,17 +74,25 @@ proc closeScope(c: var Context) =
     # a scope "has a call" if any inner scope did
     c.scopes[^1].hasCall = true
 
-template stmtList(c: var Context; n: var Cursor; body: untyped) =
-  ## Walk a statement list (`stmts`/`scope` body), tracking the end position of
-  ## each child statement in a fresh `stmtEnd` frame — this is the granularity at
-  ## which a local's coarse `freeAfter` is recorded. Independent of variable
-  ## scoping above (a `stmts` is a statement list but not a variable scope).
-  c.stmtEnd.add 0
+template iterStmts(c: var Context; n: var Cursor; body: untyped) =
+  ## Walk a statement list, recording each child statement's end position in the
+  ## *current* scope frame (`stmtEnd[^1]`) — the granularity of a local's coarse
+  ## `freeAfter`. A `stmts` is NOT a variable scope, so it shares the enclosing
+  ## scope's frame; only `scope` / the proc body push one (`scopeFrame`). This is
+  ## what keeps `freeAfter` measured at the variable's *scope* level: a use after a
+  ## sibling `(stmts)` has closed is legal (a `stmts` does not bound lifetime) and
+  ## is handled correctly, instead of indexing a popped frame.
   n.into:
     while n.hasMore:
       var e = n; skip e                   # end position of this child statement
       c.stmtEnd[^1] = posOf(c, e)
       body
+
+template scopeFrame(c: var Context; body: untyped) =
+  ## Push the `stmtEnd` frame for a variable scope (a `scope`, or the proc body) —
+  ## the unit `freeAfter`/`frameIdx` are measured in, one per `openScope`.
+  c.stmtEnd.add 0
+  body
   discard c.stmtEnd.pop()
 
 proc analyse(c: var Context; n: var Cursor)
@@ -118,8 +126,10 @@ proc analyse(c: var Context; n: var Cursor) =
       # each use counts; uses inside loops count `LoopWeight`× per nesting level
       inc e.weight, 1 + c.inLoops * LoopWeight
       # extend the (coarse) live range to the end of the enclosing statement at the
-      # variable's OWN scope level — so a use nested in an `if`/`while` keeps it live
-      # until after that whole construct (a single, post-dominating free point).
+      # variable's OWN scope level — so a use nested in an `if`/`while`, or after a
+      # sibling `(stmts)` has closed, keeps it live until after that construct (a
+      # single, post-dominating free point). `frameIdx` indexes the variable's
+      # *scope* frame (not a `(stmts)` frame), so it is always a live frame here.
       e.freeAfter = max(e.freeAfter, c.stmtEnd[e.frameIdx])
       if (c.inAddr + c.inArrayIndex) > 0:
         # arrays / address-taken locals cannot live in a register
@@ -161,10 +171,11 @@ proc analyse(c: var Context; n: var Cursor) =
         analyseChildren(c, n)           # generic expression: recurse
     of ScopeS:                          # a variable scope AND a statement list
       c.openScope()
-      stmtList(c, n): analyse(c, n)
+      scopeFrame(c):
+        iterStmts(c, n): analyse(c, n)
       c.closeScope()
-    of StmtsS:                          # a statement list only (not a fresh scope)
-      stmtList(c, n): analyse(c, n)
+    of StmtsS:                          # statement grouping only — shares the scope frame
+      iterStmts(c, n): analyse(c, n)
     of CallS:
       analyseChildren(c, n)
       c.scopes[^1].hasCall = true
@@ -217,7 +228,8 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
     analyseParams(c, n)                 # params
     skip n                              # return type
     skip n                              # pragmas
-    analyse(c, n)                       # body
+    scopeFrame(c):                      # the proc-body scope frame (its `stmts`
+      iterStmts(c, n): analyse(c, n)    # shares it rather than pushing its own)
   c.res.hasCall = c.scopes[0].hasCall
   c.closeScope()                        # propagate AllRegs to the body's locals
   result = ensureMove c.res

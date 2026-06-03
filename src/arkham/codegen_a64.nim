@@ -1032,7 +1032,7 @@ proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
     g.movImm(dest, intVal(c)); inc c
   of StrLit:
     let nm = "msg." & $g.rodata.len
-    g.rodata.add (nm, strVal(c))
+    if not g.ab.planning: g.rodata.add (nm, strVal(c))   # plan pass emits no rodata
     g.emAdr(dest, nm); inc c
   of Symbol:
     let l = g.asLoc(c)
@@ -1438,7 +1438,7 @@ proc freshLabel(g: var CodeGen): string =
   # trailing `.<digits>`, so put the counter *before* the suffix ("L0.0", …)
   # to keep basenames ("L0", "L1") distinct.
   result = "L" & $g.labelCount & ".0"
-  inc g.labelCount
+  if not g.ab.planning: inc g.labelCount   # plan pass emits no labels → don't burn names
 
 proc emLab(g: var CodeGen; name: string) =
   g.ab.tree LabA64: g.ab.symDef name        # (lab :L)
@@ -2320,8 +2320,9 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   # verbatim. Identical walk + identical register decisions ⇒ the emit pass is
   # byte-identical to a single inline-borrow pass — which is what makes the
   # spill-on-exhaustion path (a deep expression spills instead of asserting) sound.
-  let labelSnapshot = g.labelCount
-  let rodataSnapshot = g.rodata.len
+  # The plan pass no longer touches `labelCount`/`rodata` (see `freshLabel` / the
+  # StrLit case), so no snapshot/restore of those is needed — the emit pass numbers
+  # labels exactly as a single pass would.
   let sealedSnapshot = g.ra.sealed
   g.borrowLog.setLen 0; g.borrowLogF.setLen 0
   g.borrowIdx = 0; g.borrowIdxF = 0
@@ -2331,8 +2332,6 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   # Reset the per-proc emission state the plan pass dirtied, so the emit pass
   # reproduces a single-pass result. (The `ret*`/frame fields were fixed above and
   # stay constant across the two passes.)
-  g.labelCount = labelSnapshot
-  g.rodata.setLen rodataSnapshot
   g.ra.sealed = sealedSnapshot
   g.varType.clear()
   g.symType.clear()

@@ -227,8 +227,11 @@ proc emJcc(g: var CodeGen; tag: X64Inst; name: string) =
 proc emSyscall(g: var CodeGen) = g.ab.keyword SyscallX64
 
 proc freshLabel(g: var CodeGen): string =
+  ## The plan pass emits no labels (all `ab` writes no-op), so it must not consume
+  ## label names either — only the emit pass advances the counter. Both passes then
+  ## walk identically and the emit pass numbers labels exactly as a single pass would.
   result = "L" & $g.labelCount & ".0"
-  inc g.labelCount
+  if not g.ab.planning: inc g.labelCount
 
 # ── expressions ──────────────────────────────────────────────────────────────
 
@@ -1047,7 +1050,8 @@ proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
     g.place(g.genVal(c), dest)               # literal / register-resident local
   of StrLit:                                 # string literal → rodata + RIP-relative lea
     let nm = "msg." & $g.rodata.len
-    g.rodata.add (nm, strVal(c)); inc c
+    if not g.ab.planning: g.rodata.add (nm, strVal(c))   # plan pass emits no rodata
+    inc c
     g.ab.tree LeaX64:
       g.emReg dest
       g.ab.sym nm                            # `(lea dest msg.N)` → nifasm RIP-relative
@@ -2521,8 +2525,9 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   # walk and its register decisions are identical, the emit pass reproduces the
   # exact bytes a single inline-borrow pass would have — provably byte-identical.
   # (Spill-on-exhaustion and control-flow/cmov planning build on this seam.)
-  let labelSnapshot = g.labelCount
-  let rodataSnapshot = g.rodata.len
+  # The plan pass no longer touches `labelCount`/`rodata` (see `freshLabel` /
+  # the StrLit case), so the emit pass numbers labels exactly as a single pass
+  # would — no snapshot/restore of those is needed.
   let sealedSnapshot = g.ra.sealed
   # A codegen-time steal evicts a local by mutating `g.ra.locs` mid-walk; snapshot
   # it so the emit pass starts from the same allocation the plan pass saw and
@@ -2538,8 +2543,6 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   # Reset the per-proc emission state the plan pass dirtied, so the emit pass
   # reproduces a single-pass result. (The `ret*`/frame fields were fixed in setup
   # above and stay constant across the two passes.)
-  g.labelCount = labelSnapshot
-  g.rodata.setLen rodataSnapshot
   g.ra.sealed = sealedSnapshot
   g.varType.clear()
   g.symType.clear()
