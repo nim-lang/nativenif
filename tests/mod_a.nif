@@ -1,9 +1,10 @@
 (.nif27)
+(.indexat 234              )
 (stmts
- (type :Outer.0.mod_a
+ (type :Outer.0.
   (object
    (fld :inner.0 Inner.0.mod_b)))
- (proc :selectany.0.mod_a
+ (proc :selectany.0.
   (params)
   (result
    (:ret.0
@@ -13,4 +14,6 @@
   (stmts
    (mov
     (rax)0)
-   (ret))))
+   (ret))))(.index
+ (x Outer.0. 44)
+ (x selectany.0. 61))

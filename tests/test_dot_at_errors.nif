@@ -1,65 +1,62 @@
-(.nif24)
+(.nif27)
+(.indexat 1227             )
 (stmts
-  (type :Point (object 
-    (fld :x (i +64))
-    (fld :y (i +64))
-  ))
-  
-  (proc :test_invalid_dot.0
-    (params)
-    (result)
-    (clobber)
-    (stmts
-      # Error: trying to use dot on an integer
-      (var :notptr.0 (rax) (i +64))
-      (mov (rax) +42)
-      
-      # This should error: can't access field of non-pointer
-      (mov (rbx) (mem (dot notptr.0 :x)))
-      
-      (ret)
-    )
-  )
-  
-  (proc :test_invalid_at.0
-    (params)
-    (result)
-    (clobber)
-    (stmts
-      # Error: trying to use at on non-array/non-aptr
-      (var :notarr.0 (rax) (i +64))
-      (mov (rax) +42)
-      
-      # This should error: can't index non-array
-      (mov (rbx) (mem (at notarr.0 +0)))
-      
-      (ret)
-    )
-  )
-  
-  (proc :test_wrong_field.0
-    (params)
-    (result)
-    (clobber)
-    (stmts
-      (var :p (rax) (ptr Point))
-      
-      # This should error: Point doesn't have field :z
-      (mov (rbx) (mem (dot p :z)))
-      
-      (ret)
-    )
-  )
-  
-  (proc :main.0
-    (params)
-    (result)
-    (clobber)
-    (stmts
-      (mov (rax) +60)
-      (mov (rdi) +0)
-      (syscall)
-    )
-  )
-)
-
+ (type :Point
+  (object
+   (fld :x
+    (i \2B64))
+   (fld :y
+    (i \2B64))))
+ (proc :test_invalid_dot.0
+  (params)
+  (result)
+  (clobber)
+  (stmts <unknown token> Error <unknown token> trying to use dot on an integer
+   (var :notptr.0
+    (rax)
+    (i \2B64))
+   (mov
+    (rax)\2B42)<unknown token> This should error <unknown token> can <unknown token> access field of non-pointer
+   (mov
+    (rbx)
+    (mem
+     (dot notptr.0 :x)))
+   (ret)))
+ (proc :test_invalid_at.0
+  (params)
+  (result)
+  (clobber)
+  (stmts <unknown token> Error <unknown token> trying to use at on non-array/non-aptr
+   (var :notarr.0
+    (rax)
+    (i \2B64))
+   (mov
+    (rax)\2B42)<unknown token> This should error <unknown token> can <unknown token> index non-array
+   (mov
+    (rbx)
+    (mem
+     (at notarr.0 \2B0)))
+   (ret)))
+ (proc :test_wrong_field.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (var :p
+    (rax)
+    (ptr Point))<unknown token> This should error <unknown token> Point doesn <unknown token> have field :z
+   (mov
+    (rbx)
+    (mem
+     (dot p :z)))
+   (ret)))
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (mov
+    (rax)\2B60)
+   (mov
+    (rdi)\2B0)
+   (syscall))))(.index)

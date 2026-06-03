@@ -1,4 +1,5 @@
 (.nif27)
+(.indexat 1341             )
 (stmts
  (arch arm64)
  (proc :sum10.0
@@ -106,4 +107,4 @@
     (x16)33554433)
    (mov
     (x0)res.0)
-   (svc 0))))
+   (svc 0))))(.index)

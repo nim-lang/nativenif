@@ -1,47 +1,33 @@
-(.nif24)
+(.nif27)
+(.indexat 795              )
 (stmts
-  (proc :main.0
-    (params)
-    (result)
-    (clobber)
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts <unknown token> Test control flow variable
+   (cfvar :tmp.0)<unknown token> Set RAX to 0
+   (mov
+    (rax)\2B0)<unknown token> Compare RAX with 0
+   (cmp
+    (rax)\2B0)<unknown token> If zero, set tmp to true and jump
+   (ite
+    (zf)
     (stmts
-      # Test control flow variable
-      (cfvar :tmp.0)
-      
-      # Set RAX to 0
-      (mov (rax) +0)
-      
-      # Compare RAX with 0
-      (cmp (rax) +0)
-      
-      # If zero, set tmp to true and jump
-      (ite (zf)
-        (stmts
-          (jtrue tmp.0)
-        )
-        (stmts)
-      )
-      
-      # This should be skipped if jtrue was executed
-      (mov (rax) +99)
-      
-      # Now check cfvar
-      (ite tmp.0
-        (stmts
-          # tmp was set, so RAX should be 0
-          (mov (rax) +42)
-        )
-        (stmts
-          # tmp was not set, RAX would be 99
-          (mov (rax) +1)
-        )
-      )
-      
-      # Exit with status in RAX
-      (mov (rdi) (rax))
-      (mov (rax) +60)
-      (syscall)
-    )
-  )
-)
-
+     (jtrue tmp.0))
+    (stmts))<unknown token> This should be skipped if jtrue was executed
+   (mov
+    (rax)\2B99)<unknown token> Now check cfvar
+   (ite tmp.0
+    (stmts <unknown token> tmp was set, so RAX should be 0
+     (mov
+      (rax)\2B42))
+    (stmts <unknown token> tmp was not set, RAX would be 99
+     (mov
+      (rax)\2B1)))<unknown token> Exit with status in RAX
+   (mov
+    (rdi)
+    (rax))
+   (mov
+    (rax)\2B60)
+   (syscall))))(.index)

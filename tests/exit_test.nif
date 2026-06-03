@@ -1,8 +1,9 @@
 (.nif27)
+(.indexat 107              )
 (stmts
  (arch arm64)
  (mov
   (x16)33554433)
  (mov
   (x0)42)
- (svc 0))
+ (svc 0))(.index)

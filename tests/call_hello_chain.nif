@@ -1,4 +1,5 @@
 (.nif27)
+(.indexat 747              )
 (stmts
  (proc :main.0
   (params)
@@ -54,4 +55,4 @@
    (mov
     (rax)0)
    (ret)))
- (rodata :msg.0 "Hello through calls\0A"))
+ (rodata :msg.0 "Hello through calls\0A"))(.index)

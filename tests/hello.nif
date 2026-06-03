@@ -1,4 +1,5 @@
 (.nif27)
+(.indexat 203              )
 (stmts
  (mov
   (rax)1)
@@ -14,4 +15,4 @@
  (mov
   (rdi)0)
  (syscall)
- (rodata :msg.0 "Hello World\0A"))
+ (rodata :msg.0 "Hello World\0A"))(.index)

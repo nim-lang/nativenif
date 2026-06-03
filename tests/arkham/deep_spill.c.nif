@@ -1,4 +1,38 @@
 (.nif27)
+(.indexat 648              )
 (stmts
- (proc :main.0 (params) (i 32) (pragmas (exportc "main")) (stmts
-   (ret (sub (i 64) 200 (sub (i 64) 17 (sub (i 64) 33 (sub (i 64) 8 (sub (i 64) 91 (sub (i 64) 4 (sub (i 64) 60 (sub (i 64) 7 (sub (i 64) 25 (sub (i 64) 9 (sub (i 64) 50 (sub (i 64) 3 (sub (i 64) 19 (sub (i 64) 11 5))))))))))))))))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (ret
+    (sub
+     (i 64)200
+     (sub
+      (i 64)17
+      (sub
+       (i 64)33
+       (sub
+        (i 64)8
+        (sub
+         (i 64)91
+         (sub
+          (i 64)4
+          (sub
+           (i 64)60
+           (sub
+            (i 64)7
+            (sub
+             (i 64)25
+             (sub
+              (i 64)9
+              (sub
+               (i 64)50
+               (sub
+                (i 64)3
+                (sub
+                 (i 64)19
+                 (sub
+                  (i 64)11 5))))))))))))))))))(.index)

@@ -1,4 +1,22 @@
 (.nif27)
+(.indexat 238              )
 (stmts
- (type :Color.0.mod_xlib . (enum (i 32) (efld :Red.0.mod_xlib 0) (efld :Green.0.mod_xlib 1) (efld :Blue.0.mod_xlib 2)))
- (type :Point.0.mod_xlib . (object . (fld :px.0.mod_xlib . (i 64)) (fld :py.0.mod_xlib . (i 64)))))
+ (type :Color.0. .
+  (enum
+   (i 32)
+   (efld :Red.0. 0)
+   (efld :Green.0. 1)
+   (efld :Blue.0. 2)))
+ (type :Point.0. .
+  (object .
+   (fld :px.0. .
+    (i 64))
+   (fld :py.0. .
+    (i 64)))))(.index
+ (h Color.0. 44)
+ (x Red.0. 37)
+ (x Green.0. 20)
+ (x Blue.0. 22)
+ (h Point.0. 23)
+ (h px.0. 31)
+ (h py.0. 29))

@@ -1,4 +1,5 @@
 (.nif27)
+(.indexat 221              )
 (stmts
  (proc :bar.0.moduleB
   (params
@@ -14,4 +15,5 @@
     (rdi))
    (add
     (rax)200)
-   (ret))))
+   (ret))))(.index
+ (x bar.0.moduleB 44))

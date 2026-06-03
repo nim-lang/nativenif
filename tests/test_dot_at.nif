@@ -1,44 +1,78 @@
-(.nif24)
+(.nif27)
+(.indexat 950              )
 (stmts
-  (type :Point (object
-    (fld :x (i +64))
-    (fld :y (i +64))
-  ))
-
-  (proc :main.0
-    (params)
-    (result)
-    (clobber)
-    (stmts
-      (var :p (s) Point)
-      (var :ptr.0 (rax) (ptr Point))
-
-      (mov (rbx) +10)
-      (mov (mem (dot p x)) (rbx))
-      (mov (rbx) +20)
-      (mov (mem (dot p y)) (rbx))
-
-      (lea (rax) p)
-      (mov (rcx) (mem (dot ptr.0 x)))
-      (mov (rdx) (mem (dot ptr.0 y)))
-
-      (var :arr (s) (array (i +32) +5))
-      (var :arrptr.0 (rsi) (aptr (i +32)))
-
-      (mov (rbx) +100)
-      (mov (mem (at arr +0)) (rbx))
-      (mov (rbx) +200)
-      (mov (rcx) +1)
-      (mov (mem (at arr (rcx))) (rbx))
-
-      (lea (rsi) arr)
-      (mov (rcx) +2)
-      (mov (r8) (mem (at arrptr.0 (rcx))))
-
-      (mov (rax) +60)
-      (mov (rdi) +0)
-      (syscall)
-    )
-  )
-)
-
+ (type :Point
+  (object
+   (fld :x
+    (i \2B64))
+   (fld :y
+    (i \2B64))))
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (var :p
+    (s)Point)
+   (var :ptr.0
+    (rax)
+    (ptr Point))
+   (mov
+    (rbx)\2B10)
+   (mov
+    (mem
+     (dot p x))
+    (rbx))
+   (mov
+    (rbx)\2B20)
+   (mov
+    (mem
+     (dot p y))
+    (rbx))
+   (lea
+    (rax)p)
+   (mov
+    (rcx)
+    (mem
+     (dot ptr.0 x)))
+   (mov
+    (rdx)
+    (mem
+     (dot ptr.0 y)))
+   (var :arr
+    (s)
+    (array
+     (i \2B32)\2B5))
+   (var :arrptr.0
+    (rsi)
+    (aptr
+     (i \2B32)))
+   (mov
+    (rbx)\2B100)
+   (mov
+    (mem
+     (at arr \2B0))
+    (rbx))
+   (mov
+    (rbx)\2B200)
+   (mov
+    (rcx)\2B1)
+   (mov
+    (mem
+     (at arr
+      (rcx)))
+    (rbx))
+   (lea
+    (rsi)arr)
+   (mov
+    (rcx)\2B2)
+   (mov
+    (r8)
+    (mem
+     (at arrptr.0
+      (rcx))))
+   (mov
+    (rax)\2B60)
+   (mov
+    (rdi)\2B0)
+   (syscall))))(.index)

@@ -1,4 +1,5 @@
 (.nif27)
+(.indexat 214              )
 (stmts
  (arch linux_arm64)
  (mov
@@ -15,4 +16,4 @@
  (mov
   (x0)0)
  (svc 0)
- (rodata :msg.0 "Hello World\0A"))
+ (rodata :msg.0 "Hello World\0A"))(.index)

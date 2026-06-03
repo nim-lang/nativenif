@@ -1,6 +1,7 @@
 (.nif27)
+(.indexat 222              )
 (stmts
- (proc :foo.0.key1.key2.moduleY
+ (proc :foo.0.key1.key2.
   (params
    (param :arg.0
     (rdi)
@@ -14,4 +15,5 @@
     (rdi))
    (add
     (rax)2)
-   (ret))))
+   (ret))))(.index
+ (x foo.0.key1.key2. 44))

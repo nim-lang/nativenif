@@ -1,4 +1,5 @@
 (.nif27)
+(.indexat 525              )
 (stmts
  (arch win_x64)
  (imp "kernel32.dll")
@@ -34,4 +35,4 @@
  (mov
   (rcx)0)
  (iat ExitProcess.0)
- (rodata :msg.0 "Hello World\0A"))
+ (rodata :msg.0 "Hello World\0A"))(.index)

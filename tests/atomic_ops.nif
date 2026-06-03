@@ -1,4 +1,5 @@
 (.nif27)
+(.indexat 1747             )
 (stmts
  (arch x64)
  (proc :_start
@@ -157,4 +158,4 @@
     (rcx))
    (mov
     (rax)60)
-   (syscall))))
+   (syscall))))(.index)

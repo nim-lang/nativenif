@@ -1,4 +1,5 @@
 (.nif27)
+(.indexat 347              )
 (stmts
  (proc :callee.0
   (params)
@@ -24,4 +25,4 @@
     (mov
      (rcx)
      (res ret.0)))
-   (ret))))
+   (ret))))(.index)

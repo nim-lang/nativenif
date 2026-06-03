@@ -1,30 +1,25 @@
-(.nif24)
+(.nif27)
+(.indexat 455              )
 (stmts
-  (proc :main.0
-    (params)
-    (result)
-    (clobber)
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts <unknown token> Invalid <unknown token> cfvar declared but never used
+   (cfvar :tmp.0)
+   (cfvar :unused.0)
+   (mov
+    (rax)\2B0)<unknown token> Only tmp.0 is used, unused.0 is never used
+   (ite tmp.0
     (stmts
-      # Invalid: cfvar declared but never used
-      (cfvar :tmp.0)
-      (cfvar :unused.0)
-      
-      (mov (rax) +0)
-      
-      # Only tmp.0 is used, unused.0 is never used
-      (ite tmp.0
-        (stmts
-          (mov (rax) +42)
-        )
-        (stmts
-          (mov (rax) +1)
-        )
-      )
-      
-      (mov (rdi) (rax))
-      (mov (rax) +60)
-      (syscall)
-    )
-  )
-)
-
+     (mov
+      (rax)\2B42))
+    (stmts
+     (mov
+      (rax)\2B1)))
+   (mov
+    (rdi)
+    (rax))
+   (mov
+    (rax)\2B60)
+   (syscall))))(.index)

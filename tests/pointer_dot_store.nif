@@ -1,4 +1,5 @@
 (.nif27)
+(.indexat 742              )
 (stmts
  (type :Point.0
   (object
@@ -56,4 +57,4 @@
    (lab :exit.0)
    (mov
     (rax)60)
-   (syscall))))
+   (syscall))))(.index)

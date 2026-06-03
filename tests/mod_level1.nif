@@ -1,5 +1,7 @@
 (.nif27)
+(.indexat 112              )
 (stmts
- (type :Level1.0.mod_level1
+ (type :Level1.0.
   (object
-   (fld :next.0 Level2.0.mod_level2))))
+   (fld :next.0 Level2.0.mod_level2))))(.index
+ (x Level1.0. 44))

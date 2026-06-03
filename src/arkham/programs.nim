@@ -303,8 +303,14 @@ proc getDecl(p: var Program; m: Module; name: string): Cursor =
     m.r.jumpTo(m.index[name])
     var buf = createTokenBuf(64, nil, p.tags)
     parse(m.r, buf)                           # exactly one `(type …)` tree
+    # Take the cursor on the LOCAL buffer *before* moving it into `declBufs`
+    # (the nifc/nimony pattern, see nifmodules.getDeclOrNil): `beginRead`
+    # installs the buffer's ref-counted cursor owner, which then travels with
+    # the buffer when `declBufs` later grows and relocates its elements.
+    # Doing `beginRead` on the already-stored seq element instead corrupts the
+    # heap once a second decl forces the seq to reallocate.
+    result = beginRead(buf)
     m.declBufs.add ensureMove(buf)
-    result = m.declBufs[^1].beginRead()
   else:
     result = m.wholeTypes[name]
   m.decls[name] = result

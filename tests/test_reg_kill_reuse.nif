@@ -1,27 +1,24 @@
-(.nif24)
+(.nif27)
+(.indexat 515              )
 (stmts
-  (proc :test_kill_reuse.0
-    (params)
-    (result)
-    (clobber)
-    (stmts
-      # Bind rax to x
-      (var :x.0 (rax) (i +64))
-      (mov x.0 +10)
-      
-      # Kill x, freeing up rax
-      (kill x.0)
-      
-      # Now we can bind rax to y (this should succeed)
-      (var :y.0 (rax) (i +64))
-      (mov y.0 +20)
-      
-      # Now we can also use rax directly after killing y
-      (kill y.0)
-      (mov (rax) +60)
-      (mov (rdi) +0)
-      (syscall)
-    )
-  )
-)
-
+ (proc :test_kill_reuse.0
+  (params)
+  (result)
+  (clobber)
+  (stmts <unknown token> Bind rax to x
+   (var :x.0
+    (rax)
+    (i \2B64))
+   (mov x.0 \2B10)<unknown token> Kill x, freeing up rax
+   (kill x.0)<unknown token> Now we can bind rax to y
+   (this should succeed)
+   (var :y.0
+    (rax)
+    (i \2B64))
+   (mov y.0 \2B20)<unknown token> Now we can also use rax directly after killing y
+   (kill y.0)
+   (mov
+    (rax)\2B60)
+   (mov
+    (rdi)\2B0)
+   (syscall))))(.index)

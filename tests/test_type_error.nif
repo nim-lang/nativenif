@@ -1,22 +1,25 @@
-(.nif24)
+(.nif27)
+(.indexat 485              )
 (stmts
-  (proc :main.0
-    (params)
-    (result)
-    (clobber)
-    (stmts
-      # Invalid: trying to do bitwise AND on a pointer
-      (var :ptr.0 (rax) (ptr (i +32)))
-      (var :mask.0 (rbx) (i +64))
-      (mov (rbx) +0xFF)
-      
-      # This should error: can't do bitwise AND on pointer
-      (and (rax) (rbx))
-      
-      (mov (rax) +60)
-      (mov (rdi) +0)
-      (syscall)
-    )
-  )
-)
-
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts <unknown token> Invalid <unknown token> trying to do bitwise AND on a pointer
+   (var :ptr.0
+    (rax)
+    (ptr
+     (i \2B32)))
+   (var :mask.0
+    (rbx)
+    (i \2B64))
+   (mov
+    (rbx)\2B0xFF)<unknown token> This should error <unknown token> can <unknown token> do bitwise AND on pointer
+   (and
+    (rax)
+    (rbx))
+   (mov
+    (rax)\2B60)
+   (mov
+    (rdi)\2B0)
+   (syscall))))(.index)

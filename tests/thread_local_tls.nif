@@ -1,4 +1,5 @@
 (.nif27)
+(.indexat 664              )
 (stmts
  (arch x64)
  (tvar :tlsCounter.0
@@ -51,4 +52,4 @@
     (rcx))
    (mov
     (rax)60)
-   (syscall))))
+   (syscall))))(.index)
