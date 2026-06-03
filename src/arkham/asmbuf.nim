@@ -97,11 +97,13 @@ proc uintType*(a: var AsmBuf; bits: int) = a.tree UT: a.intLit bits
 proc charType*(a: var AsmBuf; bits: int) = a.tree CT: a.intLit bits
 proc floatType*(a: var AsmBuf; bits: int) = a.tree FT: a.intLit bits
 proc boolType*(a: var AsmBuf) = a.keyword BoolT
+proc voidType*(a: var AsmBuf) = a.keyword VoidT
 
 template objectType*(a: var AsmBuf; body: untyped) = a.tree ObjectT: body
 template ptrType*(a: var AsmBuf; body: untyped) = a.tree PtrT: body
 template aptrType*(a: var AsmBuf; body: untyped) = a.tree AptrT: body
 template arrayType*(a: var AsmBuf; body: untyped) = a.tree ArrayT: body
+template flexarrayType*(a: var AsmBuf; body: untyped) = a.tree FlexarrayT: body
 template fldDef*(a: var AsmBuf; name: string; body: untyped) =
   a.openS($FldT)
   a.symDef name

@@ -944,6 +944,9 @@ proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
     of CallC:
       g.genCall(c)
       g.movReg(dest, RAX)
+    of TrueC: g.movImm(dest, 1); skip c       # boolean / nil literals → immediate
+    of FalseC: g.movImm(dest, 0); skip c
+    of NilC: g.movImm(dest, 0); skip c
     else: raiseAssert "arkham x64 v0: expression not supported: " & $c.exprKind
   else: raiseAssert "arkham x64 v0: operand not supported: " & $c.kind
   if protect: g.liveAccums.excl dest
@@ -1375,7 +1378,11 @@ proc genCall(g: var CodeGen; c: var Cursor) =
   ## marshalling can't clobber it.
   c.into:
     let fsym = symName(c); inc c
-    assert g.callTarget.hasKey(fsym), "arkham x64 v0: unknown call target: " & fsym
+    if not g.callTarget.hasKey(fsym):
+      # A call into another module: resolve its signature from the owning
+      # module's embedded index and cache it. nifasm auto-imports the foreign
+      # `<module>.s.nif` and links the definition.
+      g.callTarget[fsym] = foreignCallTarget(g.prog, fsym)
     let tgt = g.callTarget[fsym]
     let sysNr = if tgt.extern: linuxSyscallNr(g.externCName(tgt.asmName)) else: -1
     if tgt.atomic.len > 0:                     # GCC `__atomic_*` builtin → inline
@@ -1806,6 +1813,7 @@ proc genStmt(g: var CodeGen; c: var Cursor) =
       c.into:
         if c.hasMore and c.kind != DotToken: g.genInto(c, RDI)  # exit code → rdi
         else: g.movImm(RDI, 0)
+        while c.hasMore: skip c                # void `(ret .)` → drop the `.`
       g.movImm(RAX, 60)
       g.emSyscall()
     else:
@@ -1826,6 +1834,7 @@ proc genStmt(g: var CodeGen; c: var Cursor) =
             g.genIntoF(c, FloatRet, g.retFloatBits)   # float result in xmm0
           else:
             g.genInto(c, RAX)
+        while c.hasMore: skip c               # void `(ret .)` → drop the `.`
       g.killFrameRegLocals()                  # release locals bound to popped regs
       g.framePop()                            # restore callee-saved before returning
       g.ab.keyword RetX64
@@ -1835,6 +1844,16 @@ proc genStmt(g: var CodeGen; c: var Cursor) =
 # ── type + proc + module emission ───────────────────────────────────────────
 # genTypeBody/genType emit nifasm `NifasmType` tags (arch-neutral). TODO: share
 # with codegen_a64 by lifting these into codegen_common.
+
+proc genPointee(g: var CodeGen; c: var Cursor) =
+  ## Emit a pointer's pointee / element type. A *named* type is referenced by
+  ## symbol rather than inlined: this breaks the infinite recursion of
+  ## self-referential types (a `(ptr T)` field inside `T`) and lets nifasm
+  ## resolve — and auto-import across modules — the type declaration by name.
+  if c.kind == Symbol:
+    g.ab.sym symName(c); inc c
+  else:
+    g.genTypeBody(c)
 
 proc genTypeBody(g: var CodeGen; c: var Cursor) =
   ## Translate a NIFC type at `c` into asm-NIF, advancing past it. Named types
@@ -1862,9 +1881,24 @@ proc genTypeBody(g: var CodeGen; c: var Cursor) =
       g.ab.floatType(if t.kind == IntLit: int(intVal(t)) else: 64); skip c
     of BoolT:
       g.ab.boolType(); skip c
+    of VoidT:
+      g.ab.voidType(); skip c
     of PtrT:
       g.ab.ptrType:
-        c.into: g.genTypeBody(c)              # pointee
+        c.into: g.genPointee(c)               # pointee (named → by-reference)
+    of AptrT:                                 # pointer to (array of) — a scalar ptr
+      g.ab.aptrType:
+        c.into: g.genPointee(c)               # element type (named → by-reference)
+    of FlexarrayT:                            # variable-length array tail (last fld)
+      g.ab.flexarrayType:
+        c.into: g.genTypeBody(c)              # element type
+    of ProctypeT:
+      # A function pointer: 8 bytes, ABI-identical to a plain pointer. Emit an
+      # opaque `(ptr (void))` and do NOT descend into the param/result types —
+      # those routinely refer back to the enclosing aggregate (closures,
+      # continuations), which would otherwise recurse forever.
+      g.ab.ptrType: g.ab.voidType()
+      skip c
     of ArrayT:
       c.into:
         g.ab.arrayType:
@@ -2305,19 +2339,34 @@ proc genGlobal(g: var CodeGen; name: string; decl: Cursor) =
   ## `(gvar :name <type>)` — a zero-initialized `.bss` global (also `const`); any
   ## initializer is run at program entry by `emitGlobalInits`.
   var c = decl
+  let isConst = c.stmtKind == ConstS
   c.into:                                       # (gvar SymbolDef VarPragmas Type Value?)
     inc c                                       # name
     skip c                                      # pragmas
-    g.ab.open NifasmDecl.GvarD
-    g.ab.symDef name
-    g.genTypeBody(c)                            # type
-    g.ab.close()
+    let typeCur = c
+    skip c                                      # type
+    let hasValue = c.hasMore and c.kind != DotToken
+    if isConst and hasValue:
+      # A compile-time constant: lay it out as a read-only data blob (no `.bss`
+      # slot, no entry-time initialiser — see `emitGlobalInits`, which skips it).
+      var bytes = ""
+      constToBytes(g.prog, typeCur, c, bytes)
+      g.ab.tree RodataD:
+        g.ab.symDef name
+        g.ab.str bytes
+    else:
+      g.ab.open NifasmDecl.GvarD
+      g.ab.symDef name
+      var tc2 = typeCur
+      g.genTypeBody(tc2)                         # type
+      g.ab.close()
     while c.hasMore: skip c                      # value (initialized at entry)
 
 proc emitGlobalInits(g: var CodeGen) =
   ## At program entry, store each global's initializer (if any) into its slot.
   for name, decl in g.globals:
     var c = decl
+    if c.stmtKind == ConstS: continue           # emitted as a rodata data blob
     c.into:
       inc c; skip c                             # name, pragmas
       let gslot = slotOf(g.prog, c)             # the global's declared type

@@ -322,6 +322,110 @@ type
 proc retIsVoid*(t: Cursor): bool {.inline.} =
   t.kind == DotToken or (t.kind == TagLit and t.typeKind == VoidT)
 
+# ── static constant data layout (shared) ───────────────────────────────────
+# Lower a NIFC compile-time constant (`scalar` / `(oconstr …)` / `(aconstr …)` /
+# string) to the raw little-endian bytes of its in-memory representation, so a
+# backend can emit it as one read-only `(rodata …)` blob instead of zeroing
+# `.bss` and running an initialiser at entry. Arch-neutral: the layout follows
+# the same `typeSizeAlign` the ABI uses.
+
+proc constLitBits(c: Cursor): uint64 =
+  ## Raw bits of a scalar literal, unwrapping `(suf value "type")` / `(par …)`.
+  var v = c
+  while v.kind == TagLit and v.exprKind in {SufC, ParC}:
+    inc v                                    # descend to the wrapped value
+  case v.kind
+  of IntLit:   result = cast[uint64](intVal(v))
+  of UIntLit:  result = uintVal(v)
+  of CharLit:  result = uint64(ord(charLit(v)))
+  of FloatLit: result = cast[uint64](floatVal(v))
+  of TagLit:
+    case v.exprKind
+    of TrueC:  result = 1'u64
+    of FalseC: result = 0'u64
+    of NilC:   result = 0'u64
+    of NegC:   (inc v; result = cast[uint64](-cast[int64](constLitBits(v))))
+    else: raiseAssert "arkham const: unsupported scalar " & $v.exprKind
+  else: raiseAssert "arkham const: unsupported literal kind " & $v.kind
+
+proc appendLE(buf: var string; bits: uint64; size: int) =
+  for i in 0 ..< size: buf.add char((bits shr (8 * i)) and 0xFF'u64)
+
+proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string) =
+  ## Append the in-memory bytes of constant `val` (of NIFC type `typ`) to `buf`.
+  let rt = resolveType(p, typ)
+  if rt.kind != TagLit: raiseAssert "arkham const: unresolved type"
+  case rt.typeKind
+  of IT, UT, CT, BoolT, FT, EnumT:
+    let (sz, _) = typeSizeAlign(p, rt)
+    appendLE(buf, constLitBits(val), sz)
+  of PtrT, AptrT, ProctypeT:
+    appendLE(buf, constLitBits(val), 8)      # nil only (address relocs: TODO)
+  of FlexarrayT:
+    var et = rt; inc et                      # element type
+    if val.kind == StrLit:
+      buf.add strVal(val)
+    else:
+      var vc = val                           # (aconstr T elem*)
+      vc.into:
+        skip vc                              # the constructed type
+        while vc.hasMore: (constToBytes(p, et, vc, buf); skip vc)
+  of ArrayT:
+    var et = rt; inc et                      # element type
+    let elemType = et
+    skip et                                  # past element type → length
+    let n = if et.kind == IntLit: int(intVal(et)) else: 0
+    let (esz, _) = typeSizeAlign(p, elemType)
+    var count = 0
+    var vc = val                             # (aconstr T elem*)
+    vc.into:
+      skip vc                                # the constructed type
+      while vc.hasMore: (constToBytes(p, elemType, vc, buf); skip vc; inc count)
+    for k in count ..< n:                    # zero-fill trailing elements
+      for i in 0 ..< esz: buf.add '\0'
+  of ObjectT:
+    # Match each `(oconstr … (kv field value) …)` value to a type field
+    # *positionally* (hexer emits constructor fields in declaration order). This
+    # avoids decoding field-name symbols, which sidesteps the foreign-module
+    # string-pool of a cross-module type (the value literals live in *our* pool;
+    # the type only supplies sizes/offsets via `typeSizeAlign`). A trailing
+    # `flexarray` field (size 0) appends its bytes past the fixed part.
+    let startLen = buf.len
+    var vals: seq[Cursor] = @[]
+    var vc = val
+    vc.into:
+      skip vc                                # the constructed type
+      while vc.hasMore:
+        vc.into:                             # (kv field value)
+          inc vc                             # skip field name (atom → no pool)
+          vals.add vc
+          while vc.hasMore: skip vc
+    var oc = rt
+    var off = 0
+    var maxAl = 1
+    var fi = 0
+    oc.into:
+      skip oc                                # base / inheritance
+      while oc.hasMore:
+        oc.into:                             # (fld :name pragmas type)
+          inc oc                             # skip field name (atom → no pool)
+          skip oc                            # field pragmas
+          let ftype = oc
+          let (fsz, fal) = typeSizeAlign(p, oc)
+          skip oc
+          off = align(off, fal)
+          if fal > maxAl: maxAl = fal
+          while buf.len < startLen + off: buf.add '\0'   # pad to field offset
+          if fi < vals.len:
+            constToBytes(p, ftype, vals[fi], buf)
+          else:
+            for i in 0 ..< fsz: buf.add '\0'
+          inc fi
+          off += fsz
+    while (buf.len - startLen) < align(off, maxAl): buf.add '\0'  # tail padding
+  else:
+    raiseAssert "arkham const: unsupported const type " & $rt.typeKind
+
 proc paramName*(idx: int): string {.inline.} =
   ## The asm-NIF symbol for positional call parameter `idx`. nifasm's scope keys
   ## symbols by NIF *basename* (the part before the `.<counter>` suffix), so the

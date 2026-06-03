@@ -165,8 +165,25 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool): Program =
                    tvars: initTable[string, Cursor](),
                    loaded: initTable[string, Module](),
                    scheme: splitModulePath(inputPath), tags: tags)
+  assert buf.beginRead().stmtKind == StmtsS, "NIFC top level must be (stmts …)"
+  # Pass 1: register every type declaration. Procs (pass 2) resolve their
+  # param/return types via `isDeclarativeAbi`, and a proc may reference a type
+  # declared *later* in the module (e.g. a tuple-instance returned by a helper),
+  # so all types must be in `typeDecls` before any proc is processed.
+  var ct = buf.beginRead()
+  ct.into:
+    while ct.hasMore:
+      if ct.stmtKind == TypeS:
+        let typeStart = ct
+        var tc = ct
+        tc.into:
+          let nm = symName(tc)
+          result.typeDecls[nm] = typeStart
+          result.mainTypeList.add (nm, typeStart)
+          while tc.hasMore: skip tc           # drain so `into` stays balanced
+      skip ct
+  # Pass 2: globals, thread-locals and procs.
   var c = buf.beginRead()
-  assert c.stmtKind == StmtsS, "NIFC top level must be (stmts …)"
   c.into:
     while c.hasMore:
       if c.stmtKind in {GvarS, TvarS, ConstS}:
@@ -178,15 +195,6 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool): Program =
           if isTvar: result.tvars[nm] = gStart   # thread-local (macOS TLV)
           else: result.globals[nm] = gStart      # ordinary .bss global / const
           while gc.hasMore: skip gc           # drain so `into` stays balanced
-        skip c
-      elif c.stmtKind == TypeS:
-        let typeStart = c
-        var tc = c
-        tc.into:
-          let nm = symName(tc)
-          result.typeDecls[nm] = typeStart
-          result.mainTypeList.add (nm, typeStart)
-          while tc.hasMore: skip tc           # drain so `into` stays balanced
         skip c
       elif c.stmtKind == ProcS:
         let procStart = c
@@ -310,6 +318,14 @@ proc lookupType*(p: var Program; name: string): Cursor =
   let s = splitSymName(name)
   if s.module.len == 0:
     raiseAssert "arkham: unknown type " & name
+  # A reference qualified with our OWN module suffix denotes a local type whose
+  # decl `collect` registered under its unqualified (local) name. De-qualify and
+  # retry locally rather than (wrongly) trying to load ourselves as a foreign
+  # module — generic-instance names like `t.0.I….<self>.<self>` are the case.
+  if s.module == p.scheme.name:
+    let localName = name[0 ..< name.len - s.module.len]
+    if p.typeDecls.hasKey(localName): return p.typeDecls[localName]
+    raiseAssert "arkham: unknown local type " & name
   let m = loadModule(p, s.module)
   if not hasDecl(m, name):
     raiseAssert "arkham: type " & name & " not found in module " & s.module
@@ -317,6 +333,32 @@ proc lookupType*(p: var Program; name: string): Cursor =
   p.typeDecls[name] = d
   p.requestedForeign.add (name, d)
   result = d
+
+proc foreignCallTarget*(p: var Program; name: string): CallTarget =
+  ## Resolve a cross-module proc reference to a callable target by loading its
+  ## declaration from the owning module's embedded index. The asm symbol is the
+  ## fully-qualified NIF name; nifasm auto-imports `<module>.s.nif` and links it.
+  let s = splitSymName(name)
+  assert s.module.len > 0 and s.module != p.scheme.name,
+    "arkham: not a foreign proc: " & name
+  let m = loadModule(p, s.module)
+  assert hasDecl(m, name), "arkham: foreign proc not found: " & name
+  let declCur = getDecl(p, m, name)
+  var d = declCur
+  var retFloat = false
+  var retType: Cursor
+  var importcN, exportcN = ""
+  d.into:
+    inc d                                     # name
+    skip d                                    # params
+    retType = d
+    retFloat = d.kind == TagLit and d.typeKind == FT
+    skip d                                    # return type
+    parsePragmas(d, importcN, exportcN)
+    while d.hasMore: skip d                    # body
+  result = CallTarget(asmName: name, extern: false, retFloat: retFloat,
+                      retType: retType,
+                      declarative: isDeclarativeAbi(p, declCur))
 
 # ── named-type resolution ───────────────────────────────────────────────────
 
@@ -373,7 +415,16 @@ proc typeSizeAlign*(p: var Program; c: Cursor): (int, int) =
       let bytes = (if bits > 0: bits else: 64) div 8
       result = (bytes, bytes)
     of BoolT: result = (1, 1)
+    of VoidT: result = (0, 1)
     of PtrT, AptrT, ProctypeT: result = (8, 8)
+    of FlexarrayT:
+      # A flexible array member contributes no fixed size; its alignment is that
+      # of the element type (so the enclosing struct's tail is aligned for it).
+      var t = c
+      t.into:
+        let (_, eal) = typeSizeAlign(p, t); skip t
+        while t.hasMore: skip t               # consume any trailing qualifiers
+        result = (0, eal)
     of ObjectT: result = objSizeAlign(p, c)
     of EnumT:                                 # collapses to its base integer type
       var t = c
