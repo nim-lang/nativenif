@@ -1,0 +1,22 @@
+(.nif24)
+(stmts
+  (proc :main.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      # Invalid: trying to do bitwise AND on a pointer
+      (var :ptr.0 (rax) (ptr (i +32)))
+      (var :mask.0 (rbx) (i +64))
+      (mov (rbx) +0xFF)
+      
+      # This should error: can't do bitwise AND on pointer
+      (and (rax) (rbx))
+      
+      (mov (rax) +60)
+      (mov (rdi) +0)
+      (syscall)
+    )
+  )
+)
+

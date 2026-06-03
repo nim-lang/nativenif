@@ -1,0 +1,27 @@
+(.nif24)
+(stmts
+  (proc :test_kill_reuse.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      # Bind rax to x
+      (var :x.0 (rax) (i +64))
+      (mov x.0 +10)
+      
+      # Kill x, freeing up rax
+      (kill x.0)
+      
+      # Now we can bind rax to y (this should succeed)
+      (var :y.0 (rax) (i +64))
+      (mov y.0 +20)
+      
+      # Now we can also use rax directly after killing y
+      (kill y.0)
+      (mov (rax) +60)
+      (mov (rdi) +0)
+      (syscall)
+    )
+  )
+)
+

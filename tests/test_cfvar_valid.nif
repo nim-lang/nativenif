@@ -1,0 +1,39 @@
+(.nif24)
+(stmts
+  (proc :main.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      # Valid: cfvar declared and used exactly once
+      (cfvar :tmp.0)
+      
+      (mov (rax) +0)
+      (cmp (rax) +0)
+      
+      (ite (zf)
+        (stmts
+          (jtrue tmp.0)
+        )
+        (stmts)
+      )
+      
+      (mov (rax) +99)
+      
+      # cfvar used exactly once here
+      (ite tmp.0
+        (stmts
+          (mov (rax) +42)
+        )
+        (stmts
+          (mov (rax) +1)
+        )
+      )
+      
+      (mov (rdi) (rax))
+      (mov (rax) +60)
+      (syscall)
+    )
+  )
+)
+

@@ -1,0 +1,19 @@
+(.nif24)
+(stmts
+  (proc :test_direct_use.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      # Bind rax to x
+      (var :x.0 (rax) (i +64))
+      
+      # ERROR: Trying to use (rax) directly when it's bound to x.0
+      (mov (rax) +42)
+      
+      (mov (rax) +60)
+      (syscall)
+    )
+  )
+)
+

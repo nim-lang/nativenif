@@ -1,0 +1,70 @@
+(.nif24)
+(stmts
+  # Define a union type with multiple fields of different sizes
+  (type :Value (union
+    (fld :i (i +64))     # 64-bit integer (8 bytes)
+    (fld :f (f +64))     # 64-bit float (8 bytes)
+    (fld :small (i +32)) # 32-bit integer (4 bytes)
+  ))
+  
+  # Another union with different sized fields to test size computation
+  (type :Data (union
+    (fld :byte (i +8))    # 1 byte
+    (fld :word (i +16))   # 2 bytes
+    (fld :dword (i +32))  # 4 bytes
+    (fld :qword (i +64))  # 8 bytes - this is the max, so union size is 8
+  ))
+  
+  (proc :main.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      # Test 1: Stack-allocated union
+      (var :v (s) Value)   # Union size should be 8 (max of all fields)
+      (var :d (s) Data)    # Union size should be 8 (max field size)
+      
+      # Write to one field as integer
+      (mov (rax) +42)
+      (mov (mem (dot v :i)) (rax))  # Write v.i = 42
+      
+      # Read from another field (accessing same memory as different type)
+      (mov (rbx) (mem (dot v :f)))  # Read v.f (same memory, interpreted as float)
+      
+      # Write to small field
+      (mov (rcx) +100)
+      (mov (mem (dot v :small)) (ecx))  # Write v.small = 100 (32-bit)
+      
+      # Verify all fields share same memory location (offset 0)
+      (mov (r8) (mem (dot v :i)))   # Should read modified value
+      
+      # Test 2: Union via pointer
+      (var :ptr.0 (rdi) (ptr Value))
+      (lea (rdi) v)  # Point to v
+      
+      # Access via pointer
+      (mov (r9) +999)
+      (mov (mem (dot ptr.0 :i)) (r9))  # ptr->i = 999
+      
+      # Verify via stack variable
+      (mov (r10) (mem (dot v :i)))  # v.i should be 999
+      
+      # Test 3: Smaller union
+      (mov (rax) +0x1234567890ABCDEF)
+      (mov (mem (dot d :qword)) (rax))  # Write 8 bytes
+      
+      # Read as smaller sizes (accessing parts of the same memory)
+      (mov (rbx) (mem (dot d :byte)))   # Read 1 byte
+      (mov (rcx) (mem (dot d :word)))   # Read 2 bytes
+      (mov (rdx) (mem (dot d :dword)))  # Read 4 bytes
+      
+      # Exit
+      (mov (rax) +60)
+      (mov (rdi) +0)
+      (syscall)
+    )
+  )
+)
+
+
+

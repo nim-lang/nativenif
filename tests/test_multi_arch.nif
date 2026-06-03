@@ -1,0 +1,53 @@
+(.nif24)
+(stmts
+  # Architecture-independent type definition
+  (type :Point (object
+    (fld :x (i +64))
+    (fld :y (i +64))
+  ))
+  
+  # x86-64 implementation
+  (machine x86_64
+    (proc :add_coords.x64
+      (params
+        (param :px (rdi) (i +64))
+        (param :py (rsi) (i +64))
+      )
+      (result (result :r (rax) (i +64)))
+      (clobber)
+      (stmts
+        (mov (rax) px)
+        (add (rax) py)
+        (ret)
+      )
+    )
+    
+    (proc :main.x64
+      (params)
+      (result)
+      (clobber)
+      (stmts
+        (mov (rax) +60)
+        (mov (rdi) +0)
+        (syscall)
+      )
+    )
+  )
+  
+  # ARM64 implementation (registers only - full codegen not implemented yet)
+  (machine arm64
+    (proc :add_coords.arm64
+      (params
+        (param :px (x0) (i +64))
+        (param :py (x1) (i +64))
+      )
+      (result (result :r (x0) (i +64)))
+      (clobber)
+      (stmts
+        # ARM64 instructions would go here when implemented
+        # For now, this demonstrates the architecture context is working
+      )
+    )
+  )
+)
+

@@ -1,0 +1,39 @@
+(.nif24)
+(stmts
+  (proc :main.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      # Invalid: cfvar used twice
+      (cfvar :tmp.0)
+      
+      (mov (rax) +0)
+      
+      # First use
+      (ite tmp.0
+        (stmts
+          (mov (rax) +42)
+        )
+        (stmts
+          (mov (rax) +1)
+        )
+      )
+      
+      # Second use - should error
+      (ite tmp.0
+        (stmts
+          (mov (rax) +99)
+        )
+        (stmts
+          (mov (rax) +2)
+        )
+      )
+      
+      (mov (rdi) (rax))
+      (mov (rax) +60)
+      (syscall)
+    )
+  )
+)
+

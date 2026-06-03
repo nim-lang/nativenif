@@ -1,0 +1,38 @@
+(.nif24)
+(stmts
+  (proc :main.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      # Valid: integer arithmetic
+      (var :x.0 (rax) (i +64))
+      (var :y.0 (rbx) (i +64))
+      (mov (rax) +10)
+      (mov (rbx) +5)
+      (add (rax) (rbx))  # OK: i64 + i64
+      (sub (rax) (rbx))  # OK: i64 - i64
+      
+      # Valid: pointer arithmetic with aptr
+      (var :arr.0 (rsi) (aptr (i +32)))
+      (var :offset.0 (rcx) (i +64))
+      (mov (rcx) +4)
+      (add (rsi) (rcx))  # OK: aptr + i64 for pointer arithmetic
+      
+      # Valid: bitwise operations on integers
+      (and (rax) (rbx))  # OK: i64 & i64
+      (or (rax) (rbx))   # OK: i64 | i64
+      (xor (rax) (rbx))  # OK: i64 ^ i64
+      (shl (rax) +2)     # OK: i64 << 2
+      
+      # Valid: comparison operations
+      (cmp (rax) (rbx))  # OK: compare i64 with i64
+      
+      # Exit
+      (mov (rax) +60)
+      (mov (rdi) +0)
+      (syscall)
+    )
+  )
+)
+

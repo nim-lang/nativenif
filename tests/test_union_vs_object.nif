@@ -1,0 +1,74 @@
+(.nif24)
+(stmts
+  # Object: fields are laid out sequentially
+  # Total size = sum of all field sizes = 8 + 4 + 2 + 1 = 15 bytes (or aligned)
+  (type :MyObject (object
+    (fld :a (i +64))  # offset 0, size 8
+    (fld :b (i +32))  # offset 8, size 4
+    (fld :c (i +16))  # offset 12, size 2
+    (fld :d (i +8))   # offset 14, size 1
+  ))
+  
+  # Union: fields overlay each other at offset 0
+  # Total size = max of all field sizes = max(8, 4, 2, 1) = 8 bytes
+  (type :MyUnion (union
+    (fld :a (i +64))  # offset 0, size 8
+    (fld :b (i +32))  # offset 0, size 4
+    (fld :c (i +16))  # offset 0, size 2
+    (fld :d (i +8))   # offset 0, size 1
+  ))
+  
+  (proc :main.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      # Allocate both on stack
+      (var :obj (s) MyObject)  # Size = 15 bytes (sum)
+      (var :uni (s) MyUnion)   # Size = 8 bytes (max)
+      
+      # Object: each field is at a different offset
+      (mov (rax) +0x1111111111111111)
+      (mov (mem (dot obj :a)) (rax))    # Write 8 bytes at offset 0
+      
+      (mov (rbx) +0x22222222)
+      (mov (mem (dot obj :b)) (ebx))    # Write 4 bytes at offset 8
+      
+      (mov (rcx) +0x3333)
+      (mov (mem (dot obj :c)) (cx))     # Write 2 bytes at offset 12
+      
+      (mov (rdx) +0x44)
+      (mov (mem (dot obj :d)) (dl))     # Write 1 byte at offset 14
+      
+      # Verify fields are independent
+      (mov (r8) (mem (dot obj :a)))     # Should still be 0x1111...
+      (mov (r9) (mem (dot obj :b)))     # Should be 0x2222...
+      
+      # Union: all fields share the same memory location
+      (mov (rax) +0x1111111111111111)
+      (mov (mem (dot uni :a)) (rax))    # Write 8 bytes at offset 0
+      
+      (mov (rbx) +0x22222222)
+      (mov (mem (dot uni :b)) (ebx))    # Write 4 bytes at offset 0 (overwrites lower 4 bytes)
+      
+      # Verify fields overlap
+      (mov (r8) (mem (dot uni :a)))     # Should be modified by previous write
+      # Lower 4 bytes should be 0x22222222, upper 4 bytes should be from previous write
+      
+      # Write to smallest field
+      (mov (rcx) +0x99)
+      (mov (mem (dot uni :d)) (cl))     # Write 1 byte at offset 0
+      
+      # Verify it modified the same location
+      (mov (r9) (mem (dot uni :a)))     # Lowest byte should now be 0x99
+      
+      # Exit
+      (mov (rax) +60)
+      (mov (rdi) +0)
+      (syscall)
+    )
+  )
+)
+
+
+

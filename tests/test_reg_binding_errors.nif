@@ -1,0 +1,19 @@
+(.nif24)
+(stmts
+  (proc :test_double_bind.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      # Bind rax to x
+      (var :x.0 (rax) (i +64))
+      
+      # ERROR: Trying to bind rax to y when it's already bound to x
+      (var :y.0 (rax) (i +64))
+      
+      (mov (rax) +60)
+      (syscall)
+    )
+  )
+)
+

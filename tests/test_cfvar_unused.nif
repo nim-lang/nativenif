@@ -1,0 +1,30 @@
+(.nif24)
+(stmts
+  (proc :main.0
+    (params)
+    (result)
+    (clobber)
+    (stmts
+      # Invalid: cfvar declared but never used
+      (cfvar :tmp.0)
+      (cfvar :unused.0)
+      
+      (mov (rax) +0)
+      
+      # Only tmp.0 is used, unused.0 is never used
+      (ite tmp.0
+        (stmts
+          (mov (rax) +42)
+        )
+        (stmts
+          (mov (rax) +1)
+        )
+      )
+      
+      (mov (rdi) (rax))
+      (mov (rax) +60)
+      (syscall)
+    )
+  )
+)
+
