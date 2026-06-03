@@ -448,13 +448,16 @@ proc forceReg(g: var CodeGen; v: Val): tuple[r: Reg, owns: bool] =
     let t = g.borrowTmp(); g.emitLoad(v.mem, t); (t, true)
   else: raiseAssert "arkham x64 v0: cannot force a value of kind " & $v.kind & " into a register"
 
+const StagingCandidates = [RAX, RDI, RSI, RDX, RCX, R8, R9]
+
 proc pickStaging(g: var CodeGen; avoid: Reg = NoReg): Reg =
   ## A transient compute register for a spill: the first non-sealed caller-saved
   ## GPR that is neither the scratch pool (r10/r11, exhausted at a spill) nor a
-  ## local home (those are callee-saved), and is not `avoid`. Clobbering it
-  ## transiently is safe.
-  for r in [RAX, RDI, RSI, RDX, RCX, R8, R9]:
-    if r != avoid and not g.ra.isSealed(r): return r
+  ## local home (those are callee-saved), is not a live expression accumulator
+  ## (`liveAccums` — e.g. rax holding the return value while a deep right operand
+  ## spills), and is not `avoid`. Clobbering it transiently is then safe.
+  for r in StagingCandidates:
+    if r != avoid and not g.ra.isSealed(r) and r notin g.liveAccums: return r
   raiseAssert "arkham x64: no staging register available for a spill"
 
 proc spillComputed(g: var CodeGen; c: var Cursor): Val =
@@ -469,7 +472,7 @@ proc spillComputed(g: var CodeGen; c: var Cursor): Val =
   ## fresh staging reg per level), so spill nesting no longer cascades and this
   ## path is reached only at isolated spill points (the divisor / the lighter
   ## operand of an SU swap), never recursively.
-  let slotName = "spill." & $g.spillCount; inc g.spillCount
+  let slotName = spillName(g.spillCount); inc g.spillCount
   g.ra.hasStackVars = true
   let stage = g.pickStaging()
   g.ra.seal stage
@@ -609,7 +612,7 @@ proc spillOperandAround(g: var CodeGen; c: var Cursor; dest: Reg; op: X64Inst) =
   ## here, after the recursion has fully unwound (so it never nests → one reg covers
   ## any depth). Evaluation order a-before-b is preserved (correct for impure
   ## operands too). `c` is consumed past the right operand.
-  let slotA = "spill." & $g.spillCount; inc g.spillCount
+  let slotA = spillName(g.spillCount); inc g.spillCount
   g.ra.hasStackVars = true
   let slotLv = Lvalue(kind: lvStackScalar, name: slotA,
                       slot: AsmSlot(kind: AInt, size: 8, align: 8))
@@ -879,6 +882,15 @@ proc genCoerce(g: var CodeGen; c: var Cursor; dest: Reg; isCast: bool) =
     while c.hasMore: skip c
 
 proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
+  # While `dest` holds the value being built, a deep sub-operand may exhaust the
+  # scratch pool and spill — its transient staging register must not clobber
+  # `dest`. The scratch pool (r10/r11) is never a staging candidate, but a caller-
+  # saved accumulator (rax = the return value, or a call-argument register) IS, and
+  # is no named local — so record it as a live accumulator for the duration.
+  # Save/restore (not unconditional excl) so a nested `genInto` into the same reg
+  # (SU swap / operandInReg) keeps it protected.
+  let protect = dest in StagingCandidates and dest notin g.liveAccums
+  if protect: g.liveAccums.incl dest
   case c.kind
   of IntLit, Symbol:
     g.place(g.genVal(c), dest)               # literal / register-resident local
@@ -934,6 +946,7 @@ proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
       g.movReg(dest, RAX)
     else: raiseAssert "arkham x64 v0: expression not supported: " & $c.exprKind
   else: raiseAssert "arkham x64 v0: operand not supported: " & $c.kind
+  if protect: g.liveAccums.excl dest
 
 proc genAddr(g: var CodeGen; c: var Cursor; dest: Reg) =
   ## `dest ← &lvalue`. Parse the addressing mode once, then form the address.

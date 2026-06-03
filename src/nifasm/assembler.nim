@@ -4685,17 +4685,39 @@ proc writeElf(a: var GenContext; outfile: string) =
   let bssVaddr = textVaddr + textMemSize
   let bssSize = a.bssOffset.uint64
 
-  # Patch each global's RIP-relative `lea` (in .text) now that both segments'
-  # virtual addresses are known: `lea` is 7 bytes with a disp32 at offset +3, and
-  # RIP points at the next instruction (+7). The gvar's .bss byte offset is `sym.size`.
+  # Patch each global's address into the placeholder instruction(s) now that both
+  # segments' virtual addresses are known. The gvar's .bss byte offset is `sym.size`.
   for (pos, sym) in a.gvarSites:
-    let leaVaddr = textVaddr + headersSize.uint64 + pos.uint64
+    let instrVaddr = textVaddr + headersSize.uint64 + pos.uint64
     let targetVaddr = bssVaddr + sym.size.uint64
-    let disp = int32(int64(targetVaddr) - int64(leaVaddr + 7))
-    code[pos + 3] = byte(disp and 0xFF)
-    code[pos + 4] = byte((disp shr 8) and 0xFF)
-    code[pos + 5] = byte((disp shr 16) and 0xFF)
-    code[pos + 6] = byte((disp shr 24) and 0xFF)
+    if a.arch == Arch.LinuxA64:
+      # AArch64: a PC-relative `adrp rd, page` + `add rd, rd, #pageoff` pair (the
+      # placeholder carries the dest reg with zero immediates, so OR them in). Same
+      # encoding as the Mach-O backend's gvar patch.
+      let pageDiff = int64(targetVaddr and not 0xFFF'u64) -
+                     int64(instrVaddr and not 0xFFF'u64)
+      let pageOff = targetVaddr and 0xFFF'u64
+      let adrpImm = pageDiff shr 12
+      let immlo = uint32(adrpImm and 0x03) shl 29
+      let immhi = uint32((adrpImm shr 2) and 0x7FFFF) shl 5
+      var adrp = uint32(code[pos]) or (uint32(code[pos+1]) shl 8) or
+                 (uint32(code[pos+2]) shl 16) or (uint32(code[pos+3]) shl 24)
+      adrp = adrp or immlo or immhi
+      code[pos+0] = byte(adrp and 0xFF);          code[pos+1] = byte((adrp shr 8) and 0xFF)
+      code[pos+2] = byte((adrp shr 16) and 0xFF); code[pos+3] = byte((adrp shr 24) and 0xFF)
+      var add = uint32(code[pos+4]) or (uint32(code[pos+5]) shl 8) or
+                (uint32(code[pos+6]) shl 16) or (uint32(code[pos+7]) shl 24)
+      add = add or (uint32(pageOff and 0xFFF) shl 10)
+      code[pos+4] = byte(add and 0xFF);           code[pos+5] = byte((add shr 8) and 0xFF)
+      code[pos+6] = byte((add shr 16) and 0xFF);  code[pos+7] = byte((add shr 24) and 0xFF)
+    else:
+      # x86-64: a RIP-relative `lea` — 7 bytes with a disp32 at offset +3; RIP points
+      # at the next instruction (+7).
+      let disp = int32(int64(targetVaddr) - int64(instrVaddr + 7))
+      code[pos + 3] = byte(disp and 0xFF)
+      code[pos + 4] = byte((disp shr 8) and 0xFF)
+      code[pos + 5] = byte((disp shr 16) and 0xFF)
+      code[pos + 6] = byte((disp shr 24) and 0xFF)
   let bssAlignedSize = if bssSize > 0: ((bssSize + pageSize - 1) and not (pageSize - 1)) else: 0.uint64
 
   let machine = case a.arch
@@ -4709,8 +4731,13 @@ proc writeElf(a: var GenContext; outfile: string) =
   ehdr.e_phoff = 64  # Program headers start after ELF header
 
   # .text program header (executable, readable)
-  # Starts at file offset 0, includes headers + code
-  var textPhdr = initPhdr(textOffset, textVaddr, textFileSize, textMemSize, PF_R or PF_X)
+  # Starts at file offset 0, includes headers + code. `p_filesz == p_memsz`
+  # (both the page-aligned `textMemSize`): the page padding is written to the file
+  # below, so the segment has NO zero-fill tail. A non-writable PT_LOAD whose
+  # `memsz > filesz` (a bss tail in an R+X segment) is rejected by stricter loaders
+  # such as qemu-user ("PT_LOAD with non-writable bss"); real bss lives in the
+  # separate writable `bssPhdr`.
+  var textPhdr = initPhdr(textOffset, textVaddr, textMemSize, textMemSize, PF_R or PF_X)
 
   # .bss program header (writable, readable, not executable)
   # p_filesz = 0 because .bss is not stored in the file (zero-initialized)

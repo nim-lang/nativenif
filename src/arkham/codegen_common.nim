@@ -54,6 +54,17 @@ type
     retAggrName*: string                     ## current proc's aggregate return type (or "")
     retIndirect*: bool                       ## return type is >16B (x8 indirect result)
     isEntryProc*: bool                       ## the proc currently emitted is the entry
+    a64Linux*: bool                          ## a64 backend: target Linux/ELF (svc-based
+                                             ## syscalls, no Darwin TLV/dyld) instead of
+                                             ## the default Darwin/Mach-O — lets the arm64
+                                             ## output run under qemu-aarch64 on Linux
+    liveAccums*: set[Reg]                     ## arg/return registers currently holding an
+                                             ## in-flight expression accumulator (a genInto
+                                             ## target that is *not* a named local, so absent
+                                             ## from `regLocal`). A spill's transient staging
+                                             ## register must avoid these — else it clobbers
+                                             ## the value being built (e.g. x0 = the return
+                                             ## value while a deep right-operand spills).
     indirectReg*: Reg                        ## callee-saved reg holding the x8 dest pointer
     varType*: Table[string, string]          ## aggregate var/param name → its type name
     symType*: Table[string, Cursor]          ## local/param name → its NIFC type cursor (for getType)
@@ -317,6 +328,15 @@ proc paramName*(idx: int): string {.inline.} =
   ## counter cannot disambiguate — `p.0` and `p.1` would both reduce to basename
   ## `p` and collide. Each param therefore gets a distinct basename `pN`.
   result = "p" & $idx & ".0"
+
+proc spillName*(n: int): string {.inline.} =
+  ## The asm-NIF symbol for spill slot `n`. Like `paramName`, this must give each
+  ## slot a distinct *basename* (`spill0`, `spill1`, …): nifasm's scope keys stack
+  ## symbols by NIF basename (the part before the `.<counter>` suffix), so the
+  ## counter cannot disambiguate — `spill.0` and `spill.1` would both reduce to
+  ## basename `spill` and ALIAS the same stack slot (a value stored to one is read
+  ## back from the other). Hence `spillN.0`, not `spill.N`.
+  result = "spill" & $n & ".0"
 
 proc operandInReg*(g: var CodeGen; operand: Cursor; dest: Reg): bool =
   ## Does the (peeked, not consumed) `operand` resolve to a register-resident

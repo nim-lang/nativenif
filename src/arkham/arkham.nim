@@ -36,6 +36,7 @@ proc run(input, output, arch: string) =
   let code = case arch
              of "x64", "x86_64", "amd64": generateX64(buf, input, tags)
              of "arm64", "aarch64", "": generateA64(buf, input, tags)
+             of "linux_arm64", "linux_aarch64": generateA64(buf, input, tags, linux = true)
              else: quit("arkham: unknown --arch:" & arch, QuitFailure)
   writeFile(output, code)
 

@@ -86,6 +86,61 @@ proc arkhamTests() =
   echo passed, " / ", total - skipped, " arkham tests successful (",
        skipped, " known-unsupported skipped)"
 
+# Tests whose arm64 codegen relies on Darwin-only facilities (TLV thread-locals),
+# so they cannot run in the static Linux/ELF `linux_arm64` mode under qemu.
+const arkhamLinuxA64Unsupported = ["tvar", "tvar_param"]
+
+proc arkhamQemuTests() =
+  ## Cross-validate the AArch64 backend on Linux: emit each `tests/arkham/*.c.nif`
+  ## as `linux_arm64` (static ELF, svc syscalls), assemble with nifasm, and run it
+  ## under `qemu-aarch64`, checking exit code + stdout against the same fixtures the
+  ## native pass uses. This lets the arm64 path be exercised end-to-end on an x86-64
+  ## Linux host (the Darwin/Mach-O binaries can only run on macOS). Skipped silently
+  ## when qemu is not installed.
+  let qemu = findExe("qemu-aarch64")
+  if qemu.len == 0:
+    echo "qemu-aarch64 not found — skipping linux_arm64 run tests " &
+         "(install: sudo apt-get install qemu-user)"
+    return
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasm = ("src" / "nifasm" / "nifasm").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham" / "nimcache"
+  createDir workDir
+  for file in walkFiles("tests" / "arkham" / "mod_*.c.nif"):
+    let name = extractFilename(file)[0 ..< extractFilename(file).len - ".c.nif".len]
+    exec quoteShell(arkham) & " -a:linux_arm64 -o:" &
+         quoteShell(workDir / (name & ".s.nif")) & " " & quoteShell(file)
+  var total, passed, skipped = 0
+  for file in walkFiles("tests" / "arkham" / "*.c.nif"):
+    let base = extractFilename(file)
+    if base.startsWith("mod_"): continue
+    let name = base[0 ..< base.len - ".c.nif".len]
+    if name in arkhamLinuxA64Unsupported: (inc skipped; continue)
+    inc total
+    let stem = file[0 ..< file.len - ".c.nif".len]
+    let asmNif = workDir / (name & ".la64.nif")
+    let exe = workDir / (name & ".la64.out")
+    let (ao, ac) = execCmdEx(quoteShell(arkham) & " -a:linux_arm64 -o:" &
+                             quoteShell(asmNif) & " " & quoteShell(file))
+    if ac != 0: quit "FAILURE arkham (linux_arm64 codegen) " & file & "\n" & ao
+    let (no, nc) = execCmdEx(quoteShell(nifasm) & " -o:" & quoteShell(exe) & " " &
+                             quoteShell(asmNif))
+    if nc != 0: quit "FAILURE nifasm (linux_arm64 assemble) " & file & "\n" & no
+    let (po, pc) = execCmdEx(quoteShell(qemu) & " " & quoteShell(exe))
+    let ecFile = stem & ".exitcode"
+    let expectedCode = if fileExists(ecFile): parseInt(readFile(ecFile).strip) else: 0
+    if pc != expectedCode:
+      quit "FAILURE (qemu linux_arm64) exitcode " & $expectedCode & " but got " &
+           $pc & " for " & file & "\n" & po
+    let outFile = stem & ".output"
+    let expectedOut = if fileExists(outFile): readFile(outFile).strip else: ""
+    if po.strip != expectedOut:
+      quit "FAILURE (qemu linux_arm64) output mismatch for " & file &
+           " (expected:\n" & expectedOut & "\ngot:\n" & po.strip & "\n)"
+    inc passed
+  echo passed, " / ", total, " arkham linux_arm64 (qemu) tests successful (",
+       skipped, " Darwin-only skipped)"
+
 when defined(macosx):
   exec "nim c -r src/nifasm/nifasm tests/hello_darwin.nif"
   exec "tests/hello_darwin"
@@ -166,3 +221,9 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/module_gvar_access.nif", "Ca
 # AArch64/Darwin on macOS), so we run them only where the binaries execute.
 when (defined(linux) and defined(amd64)) or (defined(macosx) and defined(arm64)):
   arkhamTests()
+
+# Additionally exercise the AArch64 backend on an x86-64 Linux host by emitting the
+# `linux_arm64` ELF variant and running it under qemu-aarch64 (no-op if qemu is
+# absent). Gives the arm64 path end-to-end coverage without a macOS machine.
+when defined(linux) and defined(amd64):
+  arkhamQemuTests()

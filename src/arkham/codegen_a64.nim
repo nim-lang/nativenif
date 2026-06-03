@@ -27,6 +27,33 @@ import codegen_common
 
 const DarwinLibSystem = "/usr/lib/libSystem.B.dylib"
 
+# Linux/AArch64 syscall numbers (asm-generic unistd, used by arm64). When the
+# backend targets Linux (`g.a64Linux`), an `importc`'d libc function with one of
+# these names lowers to a raw `svc #0` (number in x8, args x0–x5) instead of a
+# Darwin dynamic `extcall`, so nifasm's static ELF backend can serve it without a
+# dynamic linker — mirroring the x86-64 backend's `LinuxSyscalls`. Numbers differ
+# from x86-64: e.g. write=64 (not 1), exit=93 (not 60).
+const
+  LinuxA64ExitNr = 93
+  LinuxA64Syscalls = {
+    "read": 63, "write": 64, "openat": 56, "close": 57, "exit": LinuxA64ExitNr,
+    "exit_group": 94}
+
+proc linuxA64SyscallNr(name: string): int =
+  for (n, nr) in LinuxA64Syscalls:
+    if n == name: return nr
+  result = -1
+
+proc externCName(g: var CodeGen; asmName: string): string =
+  ## The C name an extern asm-symbol resolves to (Darwin `_`-prefix stripped), for
+  ## matching against the syscall table on Linux.
+  for ex in g.prog.externOrder:
+    if ex.asmName == asmName:
+      result = ex.extName
+      if result.len > 0 and result[0] == '_': result = result[1 .. ^1]
+      return
+  result = ""
+
 # The `CodeGen` state object and the NIFC type/lvalue analysis live in
 # `codegen_common`; this module is the AArch64 instruction-selection backend.
 
@@ -130,27 +157,46 @@ proc framePushBytes(g: CodeGen): int =
 
 # ── scratch register pool (volatile temps not held by a local) ──────────────
 
-proc borrowTmp(g: var CodeGen): Reg =
-  for r in IntTempRegs:
+proc tryBorrowTmp(g: var CodeGen): Reg =
+  ## Like `borrowTmp` but returns `NoReg` when the scratch pool is exhausted
+  ## (instead of failing). The caller then spills the value to a stack slot, so
+  ## register allocation never fails. The reg-or-`NoReg` outcome is recorded by the
+  ## planning pass and replayed verbatim by the emit pass (see `genProc`), keeping
+  ## the two walks byte-identical.
+  if not g.ab.planning:                          # emit pass: replay the planned decision
+    result = g.borrowLog[g.borrowIdx]; inc g.borrowIdx
+    return
+  for r in g.md.intTempRegs:                      # plan pass: real pool allocation
     if r in g.freeTmp and not g.ra.isSealed(r):
       excl g.freeTmp, r
+      g.borrowLog.add r
       return r
-  raiseAssert "arkham v1: out of scratch registers"
+  g.borrowLog.add NoReg                           # exhausted → caller spills (cannot fail)
+  result = NoReg
+
+proc borrowTmp(g: var CodeGen): Reg =
+  result = g.tryBorrowTmp()
+  if result == NoReg:
+    raiseAssert "arkham v1: out of scratch registers"  # sites not yet spill-aware
 
 proc giveBack(g: var CodeGen; r: Reg) =
-  if r in IntTempRegs: g.freeTmp.incl r
+  if r in g.md.intTempRegs: g.freeTmp.incl r       # a staging/arg reg is a no-op
 
 # ── SIMD/FP scratch pool + emit helpers (double precision) ──────────────────
 
 proc borrowFTmp(g: var CodeGen): FReg =
-  for f in FloatTempRegs:
+  if not g.ab.planning:                            # emit pass: replay the planned decision
+    result = g.borrowLogF[g.borrowIdxF]; inc g.borrowIdxF
+    return
+  for f in g.md.floatTempRegs:                      # plan pass: real pool allocation
     if f in g.freeFTmp:
       excl g.freeFTmp, f
+      g.borrowLogF.add f
       return f
-  raiseAssert "arkham v1: out of SIMD scratch registers"
+  raiseAssert "arkham v1: out of SIMD scratch registers"  # 16 FP temps: spill is a TODO
 
 proc giveBackF(g: var CodeGen; f: FReg) =
-  if f in FloatTempRegs: g.freeFTmp.incl f
+  if f in g.md.floatTempRegs: g.freeFTmp.incl f
 
 # `bits` (32 or 64) selects the s/d register view; nifasm reads the operand tag
 # to pick single- vs double-precision encodings.
@@ -202,6 +248,7 @@ proc genFReg(g: var CodeGen; c: var Cursor; bits: int): tuple[f: FReg, temp: boo
 proc structToRegs(g: var CodeGen; varName, typeName: string; firstArg: int)
 proc regsToStruct(g: var CodeGen; varName, typeName: string; firstArg: int)
 proc aggrAddr(g: var CodeGen; c: var Cursor): tuple[r: Reg, temp: bool]
+proc emitLoad(g: var CodeGen; l: Lvalue; dest: Reg)
 proc byteCopyConst(g: var CodeGen; dst, src: Reg; size: int)
 
 proc emFieldMem(g: var CodeGen; base, field: string) =
@@ -315,41 +362,102 @@ proc emFloatScalarStore(g: var CodeGen; name: string; src: FReg; bits: int) =
   ## `[slot] ← src` — store to a spilled float's `(s)` var.
   g.ab.tree FstrA64: (g.ab.sym name; g.emFReg(src, bits))
 
+proc pickStaging(g: var CodeGen; avoid: Reg = NoReg): Reg =
+  ## A transient compute register for a spill: the first caller-saved arg register
+  ## (x0–x7) that is not `avoid`, not sealed, not a named local's home, and not a
+  ## live expression accumulator. arkham never register-allocates a *local* to an
+  ## arg register (locals go to x9–x15 / x19–x28); a leaf-proc *param* there is in
+  ## `regLocal`, and a genInto target (the return value x0, or a call argument) is
+  ## in `liveAccums` — so an x0–x7 outside all three holds nothing live and is safe
+  ## to clobber transiently. (The scratch pool x9–x15 is exhausted when this runs.)
+  for r in IntArgRegs:
+    if r != avoid and not g.ra.isSealed(r) and not g.regLocal.hasKey(r) and
+       r notin g.liveAccums: return r
+  raiseAssert "arkham a64: no staging register available for a spill"
+
 proc forceReg(g: var CodeGen; v: Val): tuple[r: Reg, owns: bool] =
-  ## Ensure `v` is in a register (an immediate is loaded into a fresh temp).
+  ## Ensure `v` is in a register. An immediate / spilled memory operand is
+  ## materialized into a fresh scratch temp — or, when the pool is exhausted, a
+  ## transient staging register (so this never fails). `owns` is true for any
+  ## register this borrows; `giveBack` is a no-op for a staging reg.
   case v.kind
   of vkReg: (v.r, v.ownsR)
   of vkImm:
-    let t = g.borrowTmp(); g.movImm(t, v.imm); (t, true)
+    let t = g.tryBorrowTmp()
+    let r = if t == NoReg: g.pickStaging() else: t
+    g.movImm(r, v.imm); (r, true)
+  of vkMem:
+    let t = g.tryBorrowTmp()
+    let r = if t == NoReg: g.pickStaging() else: t
+    g.emitLoad(v.mem, r); (r, true)
   else: raiseAssert "arkham: cannot force a value of kind " & $v.kind & " into a register"
 
 proc place(g: var CodeGen; v: Val; dest: Reg) =
-  ## Materialize `v` into `dest`, releasing any owned scratch it occupied.
+  ## Materialize `v` into `dest`, releasing any owned scratch it occupied. Placing
+  ## into a known register never needs a scratch temp (so it is always total).
   case v.kind
   of vkImm: g.movImm(dest, v.imm)
   of vkReg:
     g.movReg(dest, v.r)
     if v.ownsR and v.r != dest: g.giveBack v.r
+  of vkMem:
+    g.emitLoad(v.mem, dest)
   else: raiseAssert "arkham: cannot place a value of kind " & $v.kind
+
+proc spillComputed(g: var CodeGen; c: var Cursor): Val =
+  ## The scratch pool is exhausted: materialize `c`'s value into a fresh `(s)` slot
+  ## via a transient staging register, and hand it back as a `vkMem` operand (which
+  ## every `Val` consumer — `forceReg`/`place`/genBin's combine — already loads).
+  ## This is what makes register allocation total: a deep expression spills instead
+  ## of failing. The staging reg is sealed across the recursive eval so the inner
+  ## walk (itself total — genBin's exhausted path reuses `dest` rather than pinning
+  ## a register per level) can't clobber the value being built, so spill nesting
+  ## does not cascade.
+  let slotName = spillName(g.spillCount); inc g.spillCount
+  g.ra.hasStackVars = true
+  let stage = g.pickStaging()
+  g.ra.seal stage
+  g.emScalarStackVar(slotName)                  # (var :spill.N (s) (i 64))
+  g.genInto(c, stage)                           # compute the value into the staging reg
+  g.emScalarStore(slotName, stage)              # store it to the slot
+  g.ra.unseal {stage}
+  result = Val(kind: vkMem, mem: Lvalue(kind: lvStackScalar, name: slotName,
+              slot: AsmSlot(kind: AInt, size: 8, align: 8)))
 
 proc genVal(g: var CodeGen; c: var Cursor): Val =
   ## The dont-care evaluator: produce `c`'s value where it naturally lives — a
-  ## literal as an immediate, a register-resident local in place — materializing
-  ## a computed value into a freshly borrowed scratch register (owned by the
-  ## returned descriptor). The counterpart of `genInto(…, dest)`.
+  ## literal as an immediate, a register-resident local in place, a memory lvalue
+  ## as a `vkMem` (loaded on demand) — materializing any *computed* value into a
+  ## scratch register, or (when the pool is exhausted) a spill slot. The
+  ## counterpart of `genInto(…, dest)`.
   case c.kind
   of IntLit:
     result = Val(kind: vkImm, imm: intVal(c)); inc c
   of Symbol:
-    let loc = g.ra.locationOfSym(symName(c))
-    if loc.kind == InReg:
-      result = Val(kind: vkReg, r: loc.r, ownsR: false); inc c
-    else:
-      let t = g.borrowTmp(); g.genInto(c, t)   # a global/etc → loaded into a scratch
+    let l = g.asLvalue(c)
+    case l.kind
+    of lvReg: result = Val(kind: vkReg, r: l.r, ownsR: false)
+    of lvStackScalar: result = Val(kind: vkMem, mem: l)
+    of lvGlobal, lvTvar:                        # load through its address into a scratch
+      let t = g.borrowTmp(); g.emitLoad(l, t)
       result = Val(kind: vkReg, r: t, ownsR: true)
+    else: raiseAssert "arkham v1: operand of kind " & $l.kind
+  of TagLit:
+    case c.exprKind
+    of DotC, AtC, DerefC:                       # a memory lvalue used as a value
+      result = Val(kind: vkMem, mem: g.asLvalue(c))
+    else:
+      let t = g.tryBorrowTmp()                  # a computed value → a scratch reg…
+      if t == NoReg: result = g.spillComputed(c)  # …or a spill slot if exhausted
+      else:
+        g.genInto(c, t)
+        result = Val(kind: vkReg, r: t, ownsR: true)
   else:
-    let t = g.borrowTmp(); g.genInto(c, t)     # a computed value → a scratch reg
-    result = Val(kind: vkReg, r: t, ownsR: true)
+    let t = g.tryBorrowTmp()
+    if t == NoReg: result = g.spillComputed(c)
+    else:
+      g.genInto(c, t)
+      result = Val(kind: vkReg, r: t, ownsR: true)
 
 proc genReg(g: var CodeGen; c: var Cursor): tuple[r: Reg, temp: bool] =
   ## `forceReg(genVal …)`: evaluate `c` into *some* register — a register-
@@ -357,35 +465,164 @@ proc genReg(g: var CodeGen; c: var Cursor): tuple[r: Reg, temp: bool] =
   let (r, owns) = g.forceReg(g.genVal(c))
   result = (r, owns)
 
+proc commutativeOp(op: A64Inst): bool {.inline.} =
+  ## Integer ops for which `a op b == b op a`, so Sethi–Ullman may evaluate the
+  ## heavier operand first and fold the lighter one. (sub/shifts/div are
+  ## position-sensitive and stay in source order.)
+  op in {AddA64, MulA64, AndA64, OrrA64, EorA64}
+
+const SuCallWeight = 1000          # a call dominates demand → sorts first
+
+proc suWeight(c: Cursor): int =
+  ## Sethi–Ullman register label of the subtree at `c`: an estimate of how many
+  ## registers evaluating it needs, used to decide which operand of a commutative
+  ## op to evaluate first. Reads a *copy* of the cursor (never advances `c`). Only
+  ## the integer arithmetic/logic tree is modeled precisely; memory loads and
+  ## anything unmodeled count as leaves (weight 1); a call gets a large weight.
+  var c = c
+  if c.kind != TagLit:
+    return 1                                   # IntLit / Symbol / StrLit leaf
+  case c.exprKind
+  of AddC, SubC, MulC, BitandC, BitorC, BitxorC, ShlC, ShrC, DivC, ModC:
+    var la = 1
+    var lb = 1
+    c.into:
+      skip c                                   # result type
+      la = suWeight(c); skip c                 # left
+      lb = suWeight(c); skip c                 # right
+    result = if la == lb: la + 1 else: max(la, lb)
+  of NegC, BitnotC, ConvC, CastC:
+    var w = 1
+    c.into:
+      skip c                                   # type child
+      if c.hasMore: w = suWeight(c)
+      while c.hasMore: skip c                  # operand (+ trailing tokens)
+    result = max(w, 1)
+  of NotC:                                     # boolean not has NO type child
+    var w = 1
+    c.into:
+      if c.hasMore: w = suWeight(c)
+      while c.hasMore: skip c
+    result = max(w, 1)
+  of CallC:
+    result = SuCallWeight
+  else:
+    result = 1                                 # Dot/At/Deref/Addr/comparisons/…
+
+proc hasCall(c: Cursor): bool =
+  ## True if the subtree at `c` contains a call (atomics lower through the call
+  ## path too). Reordering two *pure* operands is observation-preserving; a call
+  ## anywhere disables the Sethi–Ullman swap. Reads a copy of the cursor.
+  var c = c
+  if c.kind != TagLit: return false
+  if c.exprKind == CallC: return true
+  result = false
+  c.into:
+    while c.hasMore:
+      if not result and hasCall(c): result = true
+      skip c
+
+proc refsReg(g: var CodeGen; c: Cursor; r: Reg): bool =
+  ## Does evaluating the subtree at `c` read register `r`? True when any symbol
+  ## in it is register-resident with home `r`. Keeps the operand swap sound:
+  ## evaluating the heavy operand into `dest` first must not clobber a register
+  ## the light operand still needs. Reads a copy of the cursor.
+  var c = c
+  if c.kind == Symbol:
+    let loc = g.ra.locationOfSym(symName(c))
+    return loc.kind == InReg and loc.r == r
+  if c.kind != TagLit: return false
+  result = false
+  c.into:
+    while c.hasMore:
+      if not result and g.refsReg(c, r): result = true
+      skip c
+
+proc isComputedOperand(c: Cursor): bool =
+  ## Mirrors `genVal`: the operand kinds it materializes into a fresh register
+  ## (and would spill on pool exhaustion), as opposed to those it reads in place
+  ## (literal, register/stack local, memory lvalue). genBin intercepts these so a
+  ## deep right operand spills without pinning `dest`.
+  case c.kind
+  of IntLit, Symbol: false
+  of TagLit: c.exprKind notin {DotC, AtC, DerefC}
+  else: true
+
+proc spillOperandAround(g: var CodeGen; c: var Cursor; dest: Reg; op: A64Inst) =
+  ## Pool-exhausted evaluation of genBin's right operand that keeps register
+  ## allocation TOTAL. The left operand is already in `dest`; spill it to a fresh
+  ## slot so `dest` is free, evaluate the (possibly deep) right operand into `dest`
+  ## — the recursion reuses `dest`, never pinning a register per nesting level —
+  ## then reassemble `dest = a op b` with a single transient staging reg taken only
+  ## here, after the recursion has fully unwound (so it never nests → one reg covers
+  ## any depth). Evaluation order a-before-b is preserved. `c` is consumed past the
+  ## right operand.
+  let slotA = spillName(g.spillCount); inc g.spillCount
+  g.ra.hasStackVars = true
+  let slotLv = Lvalue(kind: lvStackScalar, name: slotA,
+                      slot: AsmSlot(kind: AInt, size: 8, align: 8))
+  g.emScalarStackVar(slotA)
+  g.emScalarStore(slotA, dest)                # store a → slotA (free dest)
+  g.genInto(c, dest)                          # b → dest (recursion reuses dest)
+  let s = g.pickStaging(avoid = dest)         # transient; recursion done → never nests
+  g.movReg(s, dest)                           # s = b
+  g.emitLoad(slotLv, dest)                    # dest = a (reload)
+  g.binReg(op, dest, s)                       # dest = a op b
+
 proc genBin(g: var CodeGen; c: var Cursor; dest: Reg;
             signedOp: A64Inst; unsignedOp = NoA64Inst) =
-  ## `(op Type a b)` → `dest = a op b`, computing `a` straight into `dest`. For
-  ## ops whose instruction depends on signedness (div, shr) pass both variants.
+  ## `(op Type a b)` → `dest = a op b`. Normally `a` is computed into `dest`, then
+  ## the right operand `b` is folded as an immediate / loaded register. For a
+  ## commutative op whose RIGHT operand needs strictly more registers than the left
+  ## (Sethi–Ullman), the operands are swapped: the heavier one is evaluated into
+  ## `dest` first and the lighter folded after — so a right-nested chain like
+  ## `1+(2+(4+…))` collapses into `dest` with no scratch temp (and never spills).
+  ## The swap is taken only when both operands are pure (no call) and the light
+  ## operand does not read `dest`. If `b` lives in `dest`, it is saved before `a`
+  ## overwrites it. When `b` is a computed operand that must occupy a register and
+  ## the scratch pool is exhausted, `spillOperandAround` spills `a`, evaluates `b`
+  ## into the freed `dest`, and reassembles — so even a deep NON-commutative
+  ## right-nest allocates with O(1) live registers and O(depth) slots. Register
+  ## allocation is total.
   c.into:
     let op = if unsignedOp != NoA64Inst and not isSignedType(c): unsignedOp
              else: signedOp
-    skip c                                  # the result type
-    # The right operand is a descriptor (immediate folds into `op dest, #imm`;
-    # a register is used in place). If it lives in `dest`, evaluating `a` into
-    # `dest` would clobber it, so save it to a scratch first.
-    var bPeek = c
-    skip bPeek
-    var b: Val
-    if g.operandInReg(bPeek, dest):
+    skip c                                  # result type; c at a
+    var aPeek = c
+    var bPeek = c; skip bPeek                # bPeek at b
+    var other: Val                          # the operand folded into dest last
+    var combined = false                    # the spill path emits its own combine
+    if commutativeOp(op) and suWeight(bPeek) > suWeight(aPeek) and
+       not hasCall(aPeek) and not hasCall(bPeek) and not g.refsReg(aPeek, dest):
+      g.genInto(bPeek, dest)                # heavier operand (b) → dest first
+      other = g.genVal(c)                   # lighter operand (a) folded after (c at a)
+      skip c                                # consume b in the real cursor
+    elif g.operandInReg(bPeek, dest):
       let saved = g.borrowTmp()
       g.movReg(saved, dest)                 # preserve b before `a` clobbers dest
       g.genInto(c, dest)                    # a → dest
       skip c                                # consume b
-      b = Val(kind: vkReg, r: saved, ownsR: true)
+      other = Val(kind: vkReg, r: saved, ownsR: true)
     else:
-      g.genInto(c, dest)                    # a → dest
-      b = g.genVal(c)                       # b stays where it naturally lives
-    if op in {AddA64, SubA64} and b.kind == vkImm and b.imm >= 0 and b.imm <= 0xFFFF:
-      g.binImm(op, dest, b.imm)             # dest op= small immediate
-    else:
-      let (br, owns) = g.forceReg(b)
-      g.binReg(op, dest, br)                # dest op= b
-      if owns: g.giveBack br
+      g.genInto(c, dest)                    # a → dest; c now at b
+      if isComputedOperand(c):              # b must be materialized into a register
+        let t = g.tryBorrowTmp()
+        if t == NoReg:                       # pool exhausted → total spill path
+          g.spillOperandAround(c, dest, op)
+          combined = true
+        else:
+          g.genInto(c, t)                    # b → scratch temp
+          other = Val(kind: vkReg, r: t, ownsR: true)
+      else:
+        other = g.genVal(c)                  # b is a leaf / memory / in-place value
+    if not combined:
+      if op in {AddA64, SubA64} and other.kind == vkImm and
+         other.imm >= 0 and other.imm <= 0xFFFF:
+        g.binImm(op, dest, other.imm)        # dest op= small immediate
+      else:
+        let (br, owns) = g.forceReg(other)
+        g.binReg(op, dest, br)               # dest op= b
+        if owns: g.giveBack br
 
 proc genMod(g: var CodeGen; c: var Cursor; dest: Reg) =
   ## `(mod Type a b)` → `dest = a - (a div b)*b` (nifasm has no `msub`).
@@ -755,6 +992,14 @@ proc genIntoF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
     raiseAssert "arkham v1: float operand not supported: " & $c.kind
 
 proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
+  # While `dest` holds the value being built, a deep sub-operand may exhaust the
+  # scratch pool and spill — its transient staging register must not clobber
+  # `dest`. Pool temps (x9–x15) are never staging candidates, but an arg/return
+  # register IS, and is not in `regLocal` (it is no named local) — so record it as
+  # a live accumulator for the duration. Save/restore (not unconditional excl) so a
+  # nested `genInto` into the same reg (SU swap / operandInReg) keeps it protected.
+  let protect = dest in {R0..R7} and dest notin g.liveAccums
+  if protect: g.liveAccums.incl dest
   case c.kind
   of IntLit:
     g.movImm(dest, intVal(c)); inc c
@@ -800,6 +1045,7 @@ proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
     else: raiseAssert "arkham v1: expression not supported: " & $c.exprKind
   else:
     raiseAssert "arkham v1: operand not supported: " & $c.kind
+  if protect: g.liveAccums.excl dest
 
 proc genAddr(g: var CodeGen; c: var Cursor; dest: Reg) =
   ## `dest ← &lvalue`, with `c` positioned at the lvalue. Parse the addressing
@@ -818,10 +1064,23 @@ proc genCall(g: var CodeGen; c: var Cursor) =
     let fsym = symName(c); inc c
     assert g.callTarget.hasKey(fsym), "arkham v1: unknown call target: " & fsym
     let tgt = g.callTarget[fsym]
+    let sysNr = if g.a64Linux and tgt.extern: linuxA64SyscallNr(g.externCName(tgt.asmName))
+                else: -1
     if tgt.atomic.len > 0:                     # GCC `__atomic_*` builtin → inline
       g.genAtomic(c, tgt.atomic)               # consumes the args; result in x0
     elif tgt.memIntrin.len > 0:                # C mem* intrinsic → inline byte loop
       g.genMemIntrin(c, tgt.memIntrin)         # consumes the args; result in x0
+    elif sysNr >= 0:
+      # Linux: lower an `importc`'d libc syscall to `svc #0` — args in x0–x5, the
+      # number in x8, result in x0 (read by the `CallC` path in `genInto`; discarded
+      # at statement level). nifasm's ELF backend is static, so the kernel serves it
+      # directly (no dynamic linker / PLT), exactly like the x86-64 backend.
+      var idx = 0
+      while c.hasMore:
+        assert idx < IntArgRegs.len, "arkham v1: syscall with too many arguments"
+        g.genInto(c, IntArgRegs[idx]); inc idx
+      g.movImm(R8, sysNr.int64)                # x8 = syscall number
+      g.ab.tree SvcA64: g.ab.intLit 0
     elif tgt.declarative:
       # Declarative call: bind each scalar argument to its positional param `p{i}`
       # and the result to `ret.0`, so nifasm cross-checks the ABI. The `(mov (arg
@@ -1730,6 +1989,15 @@ proc genStmt(g: var CodeGen; c: var Cursor) =
       while c.hasMore: genStmt(g, c)
     g.exitScope()
   of RetS:
+    if g.isEntryProc and g.a64Linux:
+      # The Linux ELF entry must terminate the process: place the exit code in x0
+      # and invoke the `exit` syscall (there is no C runtime to return to).
+      c.into:
+        if c.hasMore and c.kind != DotToken: g.genInto(c, IntRet)
+        else: g.movImm(IntRet, 0)
+      g.movImm(R8, LinuxA64ExitNr.int64)           # x8 = exit
+      g.ab.tree SvcA64: g.ab.intLit 0
+      return
     # (ret e?): place the value in x0 (or x0:x1 for a ≤16B aggregate), restore
     # the frame, then return.
     c.into:
@@ -1761,9 +2029,9 @@ proc genStmt(g: var CodeGen; c: var Cursor) =
 
 proc initFreeTmp(g: var CodeGen) =
   g.freeTmp = {}
-  for r in IntTempRegs: g.freeTmp.incl r
+  for r in g.md.intTempRegs: g.freeTmp.incl r
   g.freeFTmp = {}
-  for f in FloatTempRegs: g.freeFTmp.incl f
+  for f in g.md.floatTempRegs: g.freeFTmp.incl f
   for name, pos in g.ra.symPos:               # locals occupying a volatile reg
     let loc = g.ra.locs[pos]
     if loc.kind == InReg: g.freeTmp.excl loc.r
@@ -1936,37 +2204,11 @@ proc emitSignature(g: var CodeGen; decl: Cursor; declarative: bool) =
 
 proc emitGlobalInits(g: var CodeGen)
 
-proc genProc(g: var CodeGen; info: ProcInfo) =
-  let an = analyseProc(g.buf[], info.decl, g.tvarNames)
-  g.varType = initTable[string, string]()     # per-proc (symbol names recycle)
-  g.symType = initTable[string, Cursor]()
-  g.regLocal = initTable[Reg, string]()        # per-proc named-local bindings
-  g.scopeLocals = @[]
-  # Determine the aggregate return convention BEFORE allocation: a named object
-  # ≤16B → x0[:x1]; >16B → x8 indirect result (callee writes through the caller-
-  # supplied pointer, which we park in x19 for the proc's lifetime).
-  g.retAggrName = ""
-  g.retIndirect = false
-  g.retIsFloat = false
-  g.indirectReg = NoReg
-  block:
-    var rc = info.decl
-    inc rc; inc rc; skip rc                   # head → name → params, skip → return type
-    # A named *aggregate* return uses the x0[:x1] / x8 ABI; a named enum/scalar
-    # return resolves to a scalar and stays in x0 (handled by the default path).
-    if rc.kind == Symbol and slotOf(g.prog, rc).kind == AMem:
-      g.retAggrName = symName(rc)
-      g.retIndirect = aggrByteSize(g.prog, g.retAggrName) > 16
-    elif rc.kind == TagLit and rc.typeKind == FT:
-      g.retIsFloat = true                     # float return → v0
-      g.retFloatBits = if slotOf(g.prog, rc).size == 4: 32 else: 64
-  let preseal = if g.retIndirect: {R19} else: {}
-  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, aarch64Machine, preseal)
-  if g.retIndirect:
-    g.indirectReg = R19
-    g.ra.usedCallee.incl R19                  # saved/restored like any callee reg
-  g.initFreeTmp()
-  g.computeFrame(an.hasCall)
+proc emitProcBody(g: var CodeGen; info: ProcInfo) =
+  ## Emit one proc's `(proc …)` (signature + body). Run twice by `genProc`: once
+  ## in planning mode (emission suppressed, scratch decisions recorded), once for
+  ## real (decisions replayed). Reads the per-proc `ret*`/frame state set up by
+  ## `genProc`; touches only state `genProc` resets between the two passes.
   g.ab.tree ProcD:
     g.ab.symDef info.asmName                  # "main.0" for the entry
     g.emitSignature(info.decl, isDeclarativeAbi(g.prog, info.decl))
@@ -1991,11 +2233,81 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
       g.exitScope()                           # `kill` the proc's register locals
       # Fallthrough epilogue: a void proc whose body has no explicit `(ret)`
       # must still restore the frame and return (unreachable dead code after an
-      # explicit `ret`, harmless).
-      if g.ra.hasStackVars:
-        g.ab.tree AddA64: g.emReg SP; g.ab.keyword SsizeX
-      if g.hasFrame: framePop(g)
-      g.ab.keyword RetA64
+      # explicit `ret`, harmless). The Linux entry exits the process instead, since
+      # there is no C runtime to return to.
+      if info.isEntry and g.a64Linux:
+        g.movImm(IntRet, 0)
+        g.movImm(R8, LinuxA64ExitNr.int64)
+        g.ab.tree SvcA64: g.ab.intLit 0
+      else:
+        if g.ra.hasStackVars:
+          g.ab.tree AddA64: g.emReg SP; g.ab.keyword SsizeX
+        if g.hasFrame: framePop(g)
+        g.ab.keyword RetA64
+
+proc genProc(g: var CodeGen; info: ProcInfo) =
+  let an = analyseProc(g.buf[], info.decl, g.tvarNames)
+  g.varType = initTable[string, string]()     # per-proc (symbol names recycle)
+  g.symType = initTable[string, Cursor]()
+  g.regLocal = initTable[Reg, string]()        # per-proc named-local bindings
+  g.scopeLocals = @[]
+  g.spillCount = 0
+  # Determine the aggregate return convention BEFORE allocation: a named object
+  # ≤16B → x0[:x1]; >16B → x8 indirect result (callee writes through the caller-
+  # supplied pointer, which we park in x19 for the proc's lifetime).
+  g.retAggrName = ""
+  g.retIndirect = false
+  g.retIsFloat = false
+  g.indirectReg = NoReg
+  g.isEntryProc = info.isEntry
+  block:
+    var rc = info.decl
+    inc rc; inc rc; skip rc                   # head → name → params, skip → return type
+    # A named *aggregate* return uses the x0[:x1] / x8 ABI; a named enum/scalar
+    # return resolves to a scalar and stays in x0 (handled by the default path).
+    if rc.kind == Symbol and slotOf(g.prog, rc).kind == AMem:
+      g.retAggrName = symName(rc)
+      g.retIndirect = aggrByteSize(g.prog, g.retAggrName) > 16
+    elif rc.kind == TagLit and rc.typeKind == FT:
+      g.retIsFloat = true                     # float return → v0
+      g.retFloatBits = if slotOf(g.prog, rc).size == 4: 32 else: 64
+  let preseal = if g.retIndirect: {R19} else: {}
+  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, aarch64Machine, preseal)
+  if g.retIndirect:
+    g.indirectReg = R19
+    g.ra.usedCallee.incl R19                  # saved/restored like any callee reg
+  g.initFreeTmp()
+  g.computeFrame(an.hasCall)
+  # Single walk, two modes (see x64's `genProc`). The plan pass runs `emitProcBody`
+  # with emission suppressed (`ab.planning`), recording every scratch borrow (and
+  # spill-on-exhaustion) decision in `borrowLog`/`borrowLogF` with the real pool +
+  # ABI seals while no bytes are produced; the emit pass replays those decisions
+  # verbatim. Identical walk + identical register decisions ⇒ the emit pass is
+  # byte-identical to a single inline-borrow pass — which is what makes the
+  # spill-on-exhaustion path (a deep expression spills instead of asserting) sound.
+  let labelSnapshot = g.labelCount
+  let rodataSnapshot = g.rodata.len
+  let sealedSnapshot = g.ra.sealed
+  g.borrowLog.setLen 0; g.borrowLogF.setLen 0
+  g.borrowIdx = 0; g.borrowIdxF = 0
+  g.ab.planning = true
+  g.emitProcBody(info)
+  g.ab.planning = false
+  # Reset the per-proc emission state the plan pass dirtied, so the emit pass
+  # reproduces a single-pass result. (The `ret*`/frame fields were fixed above and
+  # stay constant across the two passes.)
+  g.labelCount = labelSnapshot
+  g.rodata.setLen rodataSnapshot
+  g.ra.sealed = sealedSnapshot
+  g.varType.clear()
+  g.symType.clear()
+  g.regLocal.clear()
+  g.scopeLocals = @[]
+  g.loopEnds = @[]
+  g.initFreeTmp()
+  g.borrowIdx = 0; g.borrowIdxF = 0
+  g.spillCount = 0
+  g.emitProcBody(info)                         # emit for real, replaying the plan
 
 # ── driver ──────────────────────────────────────────────────────────────────
 
@@ -2072,26 +2384,33 @@ proc emitGlobalInits(g: var CodeGen) =
           g.giveBack v
       while c.hasMore: skip c
 
-proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool): string =
-  ## Compile a parsed NIFC module to AArch64 / Darwin asm-NIF text. `inputPath`
-  ## and `tags` let the program model load *other* modules on demand to resolve
-  ## cross-module symbols (`Foo.0.othermod`).
-  var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: aarch64Machine)
+proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
+                  linux = false): string =
+  ## Compile a parsed NIFC module to AArch64 asm-NIF text — Darwin/Mach-O by
+  ## default, or Linux/ELF when `linux` (svc-based syscalls, static, no dyld/TLV),
+  ## which `nifasm`'s `linux_arm64` target assembles to a qemu-runnable ELF.
+  ## `inputPath` and `tags` let the program model load *other* modules on demand
+  ## to resolve cross-module symbols (`Foo.0.othermod`).
+  var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: aarch64Machine,
+                  a64Linux: linux)
   g.prog = collect(buf, inputPath, tags)
   g.callTarget = g.prog.callTarget
   g.globals = g.prog.globals
   g.tvars = g.prog.tvars
   for nm in g.tvars.keys: g.tvarNames.incl nm
   g.ab.tree StmtsA64:
-    g.ab.tree ArchD: g.ab.ident "arm64"
-    # Thread-local vars resolve their TLV descriptor thunk against libSystem
-    # (`__tlv_bootstrap`), so the dylib must be loaded even without extern calls.
-    if g.prog.needsLibSystem or g.tvars.len > 0:
-      g.ab.tree ImpD: g.ab.str DarwinLibSystem
-    for ex in g.prog.externOrder:
-      g.ab.tree ExtprocD:
-        g.ab.symDef ex.asmName
-        g.ab.str ex.extName
+    g.ab.tree ArchD: g.ab.ident (if linux: "linux_arm64" else: "arm64")
+    if not linux:
+      # Darwin: thread-local vars resolve their TLV descriptor thunk against
+      # libSystem (`__tlv_bootstrap`), so the dylib must be loaded even without
+      # extern calls. Each extern is a dynamic import. (On Linux all externs lower
+      # to `svc` syscalls — the static ELF needs no imports.)
+      if g.prog.needsLibSystem or g.tvars.len > 0:
+        g.ab.tree ImpD: g.ab.str DarwinLibSystem
+      for ex in g.prog.externOrder:
+        g.ab.tree ExtprocD:
+          g.ab.symDef ex.asmName
+          g.ab.str ex.extName
     for (name, decl) in g.prog.mainTypeList:
       g.genType(name, decl)
     for name, decl in g.prog.globals:
