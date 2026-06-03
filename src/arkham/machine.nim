@@ -83,4 +83,7 @@ proc `$`*(loc: Location): string =
   of InFReg: regName(loc.f)
   of OnStack: "[fp," & $loc.offset & "]"
   of NamedStack: "&" & loc.name
+  of Mem: "[mem]"
+  of Glob: "@" & loc.name
+  of Tvar: "%fs:" & loc.name
   of Imm: "#" & $loc.ival

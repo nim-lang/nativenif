@@ -248,7 +248,8 @@ proc genFReg(g: var CodeGen; c: var Cursor; bits: int): tuple[f: FReg, temp: boo
 proc structToRegs(g: var CodeGen; varName, typeName: string; firstArg: int)
 proc regsToStruct(g: var CodeGen; varName, typeName: string; firstArg: int)
 proc aggrAddr(g: var CodeGen; c: var Cursor): tuple[r: Reg, temp: bool]
-proc emitLoad(g: var CodeGen; l: Lvalue; dest: Reg)
+proc emitLoad(g: var CodeGen; loc: Location; dest: Reg)
+proc gen(g: var CodeGen; c: var Cursor; dest: var Location)
 proc byteCopyConst(g: var CodeGen; dst, src: Reg; size: int)
 
 proc emFieldMem(g: var CodeGen; base, field: string) =
@@ -375,39 +376,39 @@ proc pickStaging(g: var CodeGen; avoid: Reg = NoReg): Reg =
        r notin g.liveAccums: return r
   raiseAssert "arkham a64: no staging register available for a spill"
 
-proc forceReg(g: var CodeGen; v: Val): tuple[r: Reg, owns: bool] =
+proc forceReg(g: var CodeGen; v: Location): tuple[r: Reg, owns: bool] =
   ## Ensure `v` is in a register. An immediate / spilled memory operand is
   ## materialized into a fresh scratch temp — or, when the pool is exhausted, a
   ## transient staging register (so this never fails). `owns` is true for any
   ## register this borrows; `giveBack` is a no-op for a staging reg.
   case v.kind
-  of vkReg: (v.r, v.ownsR)
-  of vkImm:
+  of InReg: (v.r, v.owns)
+  of Imm:
     let t = g.tryBorrowTmp()
     let r = if t == NoReg: g.pickStaging() else: t
-    g.movImm(r, v.imm); (r, true)
-  of vkMem:
+    g.movImm(r, v.ival); (r, true)
+  of NamedStack, Mem, Glob, Tvar:
     let t = g.tryBorrowTmp()
     let r = if t == NoReg: g.pickStaging() else: t
-    g.emitLoad(v.mem, r); (r, true)
+    g.emitLoad(v, r); (r, true)
   else: raiseAssert "arkham: cannot force a value of kind " & $v.kind & " into a register"
 
-proc place(g: var CodeGen; v: Val; dest: Reg) =
+proc place(g: var CodeGen; v: Location; dest: Reg) =
   ## Materialize `v` into `dest`, releasing any owned scratch it occupied. Placing
   ## into a known register never needs a scratch temp (so it is always total).
   case v.kind
-  of vkImm: g.movImm(dest, v.imm)
-  of vkReg:
+  of Imm: g.movImm(dest, v.ival)
+  of InReg:
     g.movReg(dest, v.r)
-    if v.ownsR and v.r != dest: g.giveBack v.r
-  of vkMem:
-    g.emitLoad(v.mem, dest)
+    if v.owns and v.r != dest: g.giveBack v.r
+  of NamedStack, Mem, Glob, Tvar:
+    g.emitLoad(v, dest)
   else: raiseAssert "arkham: cannot place a value of kind " & $v.kind
 
-proc spillComputed(g: var CodeGen; c: var Cursor): Val =
+proc spillComputed(g: var CodeGen; c: var Cursor): Location =
   ## The scratch pool is exhausted: materialize `c`'s value into a fresh `(s)` slot
-  ## via a transient staging register, and hand it back as a `vkMem` operand (which
-  ## every `Val` consumer — `forceReg`/`place`/genBin's combine — already loads).
+  ## via a transient staging register, and hand it back as a `NamedStack` operand
+  ## (which every consumer — `forceReg`/`place`/genBin's combine — already loads).
   ## This is what makes register allocation total: a deep expression spills instead
   ## of failing. The staging reg is sealed across the recursive eval so the inner
   ## walk (itself total — genBin's exhausted path reuses `dest` rather than pinning
@@ -421,43 +422,46 @@ proc spillComputed(g: var CodeGen; c: var Cursor): Val =
   g.genInto(c, stage)                           # compute the value into the staging reg
   g.emScalarStore(slotName, stage)              # store it to the slot
   g.ra.unseal {stage}
-  result = Val(kind: vkMem, mem: Lvalue(kind: lvStackScalar, name: slotName,
-              slot: AsmSlot(kind: AInt, size: 8, align: 8)))
+  result = namedStackLoc(slotName, AsmSlot(kind: AInt, size: 8, align: 8))
 
-proc genVal(g: var CodeGen; c: var Cursor): Val =
+const ScalarSlot = AsmSlot(kind: AInt, size: 8, align: 8)
+  ## Placeholder slot for a register/immediate dont-care result: no consumer of an
+  ## `InReg`/`Imm` value reads `.typ` (the old `Val` carried no type).
+
+proc genVal(g: var CodeGen; c: var Cursor): Location =
   ## The dont-care evaluator: produce `c`'s value where it naturally lives — a
-  ## literal as an immediate, a register-resident local in place, a memory lvalue
-  ## as a `vkMem` (loaded on demand) — materializing any *computed* value into a
-  ## scratch register, or (when the pool is exhausted) a spill slot. The
-  ## counterpart of `genInto(…, dest)`.
+  ## literal as an `Imm`, a register-resident local in place (`InReg`, not owned),
+  ## a memory lvalue as a foldable `NamedStack`/`Mem` (loaded on demand) —
+  ## materializing any *computed* value into a scratch register (`InReg`, owned),
+  ## or (when the pool is exhausted) a spill slot. The counterpart of `gen(…, dest)`.
   case c.kind
   of IntLit:
-    result = Val(kind: vkImm, imm: intVal(c)); inc c
+    result = immLoc(intVal(c), ScalarSlot); inc c
   of Symbol:
-    let l = g.asLvalue(c)
-    case l.kind
-    of lvReg: result = Val(kind: vkReg, r: l.r, ownsR: false)
-    of lvStackScalar: result = Val(kind: vkMem, mem: l)
-    of lvGlobal, lvTvar:                        # load through its address into a scratch
-      let t = g.borrowTmp(); g.emitLoad(l, t)
-      result = Val(kind: vkReg, r: t, ownsR: true)
-    else: raiseAssert "arkham v1: operand of kind " & $l.kind
+    let loc = g.asLoc(c)
+    case loc.kind
+    of InReg: result = regLoc(loc.r, loc.typ, owns = false)
+    of NamedStack: result = loc                 # foldable spilled scalar in place
+    of Glob, Tvar:                              # load through its address into a scratch
+      let t = g.borrowTmp(); g.emitLoad(loc, t)
+      result = regLoc(t, loc.typ, owns = true)
+    else: raiseAssert "arkham v1: operand of kind " & $loc.kind
   of TagLit:
     case c.exprKind
     of DotC, AtC, DerefC:                       # a memory lvalue used as a value
-      result = Val(kind: vkMem, mem: g.asLvalue(c))
+      result = g.asLoc(c)                        # a foldable `Mem` operand
     else:
       let t = g.tryBorrowTmp()                  # a computed value → a scratch reg…
       if t == NoReg: result = g.spillComputed(c)  # …or a spill slot if exhausted
       else:
         g.genInto(c, t)
-        result = Val(kind: vkReg, r: t, ownsR: true)
+        result = regLoc(t, ScalarSlot, owns = true)
   else:
     let t = g.tryBorrowTmp()
     if t == NoReg: result = g.spillComputed(c)
     else:
       g.genInto(c, t)
-      result = Val(kind: vkReg, r: t, ownsR: true)
+      result = regLoc(t, ScalarSlot, owns = true)
 
 proc genReg(g: var CodeGen; c: var Cursor): tuple[r: Reg, temp: bool] =
   ## `forceReg(genVal …)`: evaluate `c` into *some* register — a register-
@@ -559,14 +563,13 @@ proc spillOperandAround(g: var CodeGen; c: var Cursor; dest: Reg; op: A64Inst) =
   ## right operand.
   let slotA = spillName(g.spillCount); inc g.spillCount
   g.ra.hasStackVars = true
-  let slotLv = Lvalue(kind: lvStackScalar, name: slotA,
-                      slot: AsmSlot(kind: AInt, size: 8, align: 8))
+  let slotLoc = namedStackLoc(slotA, AsmSlot(kind: AInt, size: 8, align: 8))
   g.emScalarStackVar(slotA)
   g.emScalarStore(slotA, dest)                # store a → slotA (free dest)
   g.genInto(c, dest)                          # b → dest (recursion reuses dest)
   let s = g.pickStaging(avoid = dest)         # transient; recursion done → never nests
   g.movReg(s, dest)                           # s = b
-  g.emitLoad(slotLv, dest)                    # dest = a (reload)
+  g.emitLoad(slotLoc, dest)                   # dest = a (reload)
   g.binReg(op, dest, s)                       # dest = a op b
 
 proc genBin(g: var CodeGen; c: var Cursor; dest: Reg;
@@ -590,7 +593,7 @@ proc genBin(g: var CodeGen; c: var Cursor; dest: Reg;
     skip c                                  # result type; c at a
     var aPeek = c
     var bPeek = c; skip bPeek                # bPeek at b
-    var other: Val                          # the operand folded into dest last
+    var other: Location                     # the operand folded into dest last
     var combined = false                    # the spill path emits its own combine
     if commutativeOp(op) and suWeight(bPeek) > suWeight(aPeek) and
        not hasCall(aPeek) and not hasCall(bPeek) and not g.refsReg(aPeek, dest):
@@ -602,7 +605,7 @@ proc genBin(g: var CodeGen; c: var Cursor; dest: Reg;
       g.movReg(saved, dest)                 # preserve b before `a` clobbers dest
       g.genInto(c, dest)                    # a → dest
       skip c                                # consume b
-      other = Val(kind: vkReg, r: saved, ownsR: true)
+      other = regLoc(saved, ScalarSlot, owns = true)
     else:
       g.genInto(c, dest)                    # a → dest; c now at b
       if isComputedOperand(c):              # b must be materialized into a register
@@ -612,13 +615,13 @@ proc genBin(g: var CodeGen; c: var Cursor; dest: Reg;
           combined = true
         else:
           g.genInto(c, t)                    # b → scratch temp
-          other = Val(kind: vkReg, r: t, ownsR: true)
+          other = regLoc(t, ScalarSlot, owns = true)
       else:
         other = g.genVal(c)                  # b is a leaf / memory / in-place value
     if not combined:
-      if op in {AddA64, SubA64} and other.kind == vkImm and
-         other.imm >= 0 and other.imm <= 0xFFFF:
-        g.binImm(op, dest, other.imm)        # dest op= small immediate
+      if op in {AddA64, SubA64} and other.kind == Imm and
+         other.ival >= 0 and other.ival <= 0xFFFF:
+        g.binImm(op, dest, other.ival)       # dest op= small immediate
       else:
         let (br, owns) = g.forceReg(other)
         g.binReg(op, dest, br)               # dest op= b
@@ -683,9 +686,9 @@ proc extendTo(g: var CodeGen; dest: Reg; width: int; signed: bool) =
   let down = if signed: "asr" else: "lsr"
   g.ab.splice &"(lsl ({d}) {sh}) ({down} ({d}) {sh})"
 
-proc derefPtr(g: var CodeGen; l: Lvalue): tuple[r: Reg, temp: bool] =
-  ## Recompute the pointer of a captured `(deref p)` lvalue into a register.
-  var p = l.cur
+proc derefPtrCur(g: var CodeGen; nn: Cursor): tuple[r: Reg, temp: bool] =
+  ## Recompute the pointer of a `(deref p)` cursor into a register.
+  var p = nn
   var pr = NoReg
   var pt = false
   p.into:
@@ -693,155 +696,179 @@ proc derefPtr(g: var CodeGen; l: Lvalue): tuple[r: Reg, temp: bool] =
     while p.hasMore: skip p                  # (cppref)?
   result = (pr, pt)
 
-proc emitLoad(g: var CodeGen; l: Lvalue; dest: Reg) =
-  ## `dest ← <lvalue>` (integer/pointer). One switch over every addressing mode.
-  case l.kind
-  of lvReg: g.movReg(dest, l.r)
-  of lvStackScalar: g.emScalarLoad(dest, l.name)
-  of lvGlobal:
-    let tmp = g.borrowTmp(); g.emAdr(tmp, l.name)
+proc dotBaseField(cur: Cursor): (string, string) =
+  ## Base symbol + field name of a `(dot base field …)` cursor — the a64 address
+  ## helpers key the aggregate base by name (single-level). Reads a copy of `cur`.
+  var c = cur
+  var base = ""
+  var field = ""
+  c.into:
+    if c.kind == Symbol: base = symName(c)
+    skip c                                   # base subtree
+    field = symName(c); inc c
+    while c.hasMore: skip c                   # depth selector
+  (base, field)
+
+proc emitLoad(g: var CodeGen; loc: Location; dest: Reg) =
+  ## `dest ← <scalar Location>` (integer/pointer). One switch over every kind.
+  case loc.kind
+  of InReg: g.movReg(dest, loc.r)
+  of NamedStack: g.emScalarLoad(dest, loc.name)
+  of Glob:
+    let tmp = g.borrowTmp(); g.emAdr(tmp, loc.name)
     g.ab.tree MovA64:
       g.emReg dest
       g.ab.tree MemX: g.emReg tmp
     g.giveBack tmp
-  of lvTvar:
-    g.genTlvAddr(l.name, dest)               # dest ← &var
+  of Tvar:
+    g.genTlvAddr(loc.name, dest)             # dest ← &var
     g.ab.tree MovA64:
       g.emReg dest
       g.ab.tree MemX: g.emReg dest            # dest ← [dest]
-  of lvField:
-    g.ab.tree MovA64:
-      g.emReg dest
-      g.emAggrFieldMem(l.base, l.field)
-  of lvElem:
-    var a = l.cur
-    g.ab.tree MovA64:
-      g.emReg dest
-      g.ab.tree MemX: g.emAt(a)
-  of lvDeref:
-    let (pr, pt) = g.derefPtr(l)
-    g.ab.tree MovA64:
-      g.emReg dest
-      g.ab.tree MemX: g.emReg pr
-    if pt: g.giveBack pr
-  of lvFReg: raiseAssert "arkham: integer load from a float local"
-  of lvAggrVar: raiseAssert "arkham: scalar load from an aggregate: " & l.name
+  of Mem:
+    var nn = loc.cur
+    case nn.exprKind
+    of DotC:
+      let (base, field) = dotBaseField(nn)
+      g.ab.tree MovA64:
+        g.emReg dest
+        g.emAggrFieldMem(base, field)
+    of AtC:
+      g.ab.tree MovA64:
+        g.emReg dest
+        g.ab.tree MemX: g.emAt(nn)
+    of DerefC:
+      let (pr, pt) = g.derefPtrCur(nn)
+      g.ab.tree MovA64:
+        g.emReg dest
+        g.ab.tree MemX: g.emReg pr
+      if pt: g.giveBack pr
+    else: raiseAssert "arkham: emitLoad on Mem expr " & $nn.exprKind
+  else: raiseAssert "arkham: integer load from location kind " & $loc.kind
 
-proc emitLoadF(g: var CodeGen; l: Lvalue; dest: FReg; bits: int) =
-  ## `dest ← <lvalue>` (float). `bits` is the contextual precision (s/d view).
-  case l.kind
-  of lvFReg: g.fmovF(dest, l.f, bits)
-  of lvStackScalar: g.emFloatScalarLoad(dest, l.name, bits)
-  of lvGlobal:
-    let tmp = g.borrowTmp(); g.emAdr(tmp, l.name)
+proc emitLoadF(g: var CodeGen; loc: Location; dest: FReg; bits: int) =
+  ## `dest ← <float Location>`. `bits` is the contextual precision (s/d view).
+  case loc.kind
+  of InFReg: g.fmovF(dest, loc.f, bits)
+  of NamedStack: g.emFloatScalarLoad(dest, loc.name, bits)
+  of Glob:
+    let tmp = g.borrowTmp(); g.emAdr(tmp, loc.name)
     g.emFLoad(dest, tmp, bits)
     g.giveBack tmp
-  of lvField:
-    g.ab.tree FldrA64:
-      g.emFReg(dest, bits)
-      g.emAggrFieldMem(l.base, l.field)
-  of lvElem:
-    var a = l.cur
-    g.ab.tree FldrA64:
-      g.emFReg(dest, bits)
-      g.ab.tree MemX: g.emAt(a)
-  of lvDeref:
-    let (pr, pt) = g.derefPtr(l)
-    g.emFLoad(dest, pr, bits)
-    if pt: g.giveBack pr
-  of lvReg: raiseAssert "arkham: float load from an integer local"
-  of lvTvar: raiseAssert "arkham v1: float thread-local load unsupported"
-  of lvAggrVar: raiseAssert "arkham: scalar load from an aggregate: " & l.name
+  of Mem:
+    var nn = loc.cur
+    case nn.exprKind
+    of DotC:
+      let (base, field) = dotBaseField(nn)
+      g.ab.tree FldrA64:
+        g.emFReg(dest, bits)
+        g.emAggrFieldMem(base, field)
+    of AtC:
+      g.ab.tree FldrA64:
+        g.emFReg(dest, bits)
+        g.ab.tree MemX: g.emAt(nn)
+    of DerefC:
+      let (pr, pt) = g.derefPtrCur(nn)
+      g.emFLoad(dest, pr, bits)
+      if pt: g.giveBack pr
+    else: raiseAssert "arkham: float load on Mem expr " & $nn.exprKind
+  else: raiseAssert "arkham: float load from location kind " & $loc.kind
 
-proc emitStore(g: var CodeGen; l: Lvalue; src: Reg) =
-  ## `<lvalue> ← src` (integer/pointer). `src` already holds the value, so for a
-  ## deref/tvar destination the address can be (re)computed safely afterwards.
-  case l.kind
-  of lvReg: g.movReg(l.r, src)
-  of lvStackScalar: g.emScalarStore(l.name, src)
-  of lvGlobal:
-    let tmp = g.borrowTmp(); g.emAdr(tmp, l.name)
+proc emitStore(g: var CodeGen; loc: Location; src: Reg) =
+  ## `<scalar Location> ← src` (integer/pointer). `src` already holds the value, so
+  ## for a deref/tvar destination the address can be (re)computed safely afterwards.
+  case loc.kind
+  of InReg: g.movReg(loc.r, src)
+  of NamedStack: g.emScalarStore(loc.name, src)
+  of Glob:
+    let tmp = g.borrowTmp(); g.emAdr(tmp, loc.name)
     g.ab.tree MovA64:
       g.ab.tree MemX: g.emReg tmp
       g.emReg src
     g.giveBack tmp
-  of lvTvar:
-    g.genTlvAddr(l.name, IntRet)             # x0 ← &var (clobbers x0/lr, not src)
+  of Tvar:
+    g.genTlvAddr(loc.name, IntRet)           # x0 ← &var (clobbers x0/lr, not src)
     g.ab.tree MovA64:
       g.ab.tree MemX: g.emReg IntRet
       g.emReg src
-  of lvField:
-    g.ab.tree MovA64:
-      g.emAggrFieldMem(l.base, l.field)
-      g.emReg src
-  of lvElem:
-    var a = l.cur
-    g.ab.tree MovA64:
-      g.ab.tree MemX: g.emAt(a)
-      g.emReg src
-  of lvDeref:
-    let (pr, pt) = g.derefPtr(l)
-    g.ab.tree MovA64:
-      g.ab.tree MemX: g.emReg pr
-      g.emReg src
-    if pt: g.giveBack pr
-  of lvFReg: raiseAssert "arkham: integer store to a float local"
-  of lvAggrVar: raiseAssert "arkham: scalar store to an aggregate: " & l.name
+  of Mem:
+    var nn = loc.cur
+    case nn.exprKind
+    of DotC:
+      let (base, field) = dotBaseField(nn)
+      g.ab.tree MovA64:
+        g.emAggrFieldMem(base, field)
+        g.emReg src
+    of AtC:
+      g.ab.tree MovA64:
+        g.ab.tree MemX: g.emAt(nn)
+        g.emReg src
+    of DerefC:
+      let (pr, pt) = g.derefPtrCur(nn)
+      g.ab.tree MovA64:
+        g.ab.tree MemX: g.emReg pr
+        g.emReg src
+      if pt: g.giveBack pr
+    else: raiseAssert "arkham: emitStore on Mem expr " & $nn.exprKind
+  else: raiseAssert "arkham: integer store to location kind " & $loc.kind
 
-proc emitStoreF(g: var CodeGen; l: Lvalue; src: FReg; bits: int) =
-  ## `<lvalue> ← src` (float).
-  case l.kind
-  of lvFReg: g.fmovF(l.f, src, bits)
-  of lvStackScalar: g.emFloatScalarStore(l.name, src, bits)
-  of lvGlobal:
-    let tmp = g.borrowTmp(); g.emAdr(tmp, l.name)
+proc emitStoreF(g: var CodeGen; loc: Location; src: FReg; bits: int) =
+  ## `<float Location> ← src`.
+  case loc.kind
+  of InFReg: g.fmovF(loc.f, src, bits)
+  of NamedStack: g.emFloatScalarStore(loc.name, src, bits)
+  of Glob:
+    let tmp = g.borrowTmp(); g.emAdr(tmp, loc.name)
     g.emFStore(src, tmp, bits)
     g.giveBack tmp
-  of lvField:
-    g.ab.tree FstrA64:
-      g.emAggrFieldMem(l.base, l.field)
-      g.emFReg(src, bits)
-  of lvElem:
-    var a = l.cur
-    g.ab.tree FstrA64:
-      g.ab.tree MemX: g.emAt(a)
-      g.emFReg(src, bits)
-  of lvDeref:
-    let (pr, pt) = g.derefPtr(l)
-    g.emFStore(src, pr, bits)
-    if pt: g.giveBack pr
-  of lvReg: raiseAssert "arkham: float store to an integer local"
-  of lvTvar: raiseAssert "arkham v1: float thread-local store unsupported"
-  of lvAggrVar: raiseAssert "arkham: scalar store to an aggregate: " & l.name
+  of Mem:
+    var nn = loc.cur
+    case nn.exprKind
+    of DotC:
+      let (base, field) = dotBaseField(nn)
+      g.ab.tree FstrA64:
+        g.emAggrFieldMem(base, field)
+        g.emFReg(src, bits)
+    of AtC:
+      g.ab.tree FstrA64:
+        g.ab.tree MemX: g.emAt(nn)
+        g.emFReg(src, bits)
+    of DerefC:
+      let (pr, pt) = g.derefPtrCur(nn)
+      g.emFStore(src, pr, bits)
+      if pt: g.giveBack pr
+    else: raiseAssert "arkham: float store on Mem expr " & $nn.exprKind
+  else: raiseAssert "arkham: float store to location kind " & $loc.kind
 
-proc emitAddr(g: var CodeGen; l: Lvalue; dest: Reg) =
-  ## `dest ← &<lvalue>`. The address counterpart to the load/store family — one
-  ## switch over every addressing mode. (Register-resident scalars are spilled
-  ## when address-taken, and by-reference aggregates are intercepted by
-  ## `aggrAddr`, so those never reach here.)
-  case l.kind
-  of lvTvar: g.genTlvAddr(l.name, dest)
-  of lvGlobal: g.emAdr(dest, l.name)
-  of lvStackScalar, lvAggrVar:
+proc emitAddr(g: var CodeGen; loc: Location; dest: Reg) =
+  ## `dest ← &<Location>`. The address counterpart to the load/store family.
+  ## (Register-resident scalars are spilled when address-taken, and by-reference
+  ## aggregates are intercepted by `aggrAddr`, so those never reach here.)
+  case loc.kind
+  of Tvar: g.genTlvAddr(loc.name, dest)
+  of Glob: g.emAdr(dest, loc.name)
+  of NamedStack:
     g.ab.tree LeaA64:
       g.emReg dest
-      g.ab.sym l.name
-  of lvField:
-    g.ab.tree LeaA64:
-      g.emReg dest
-      g.emAggrDot(l.base, l.field)
-  of lvElem:
-    var a = l.cur
-    g.ab.tree LeaA64:
-      g.emReg dest
-      g.emAt(a)
-  of lvDeref:                                  # &(deref p) == p
-    var p = l.cur
-    p.into:
-      g.genInto(p, dest)
-      while p.hasMore: skip p
-  of lvReg: raiseAssert "arkham: cannot take the address of a register-resident value"
-  of lvFReg: raiseAssert "arkham: cannot take the address of a float register value"
+      g.ab.sym loc.name
+  of Mem:
+    var nn = loc.cur
+    case nn.exprKind
+    of DotC:
+      let (base, field) = dotBaseField(nn)
+      g.ab.tree LeaA64:
+        g.emReg dest
+        g.emAggrDot(base, field)
+    of AtC:
+      g.ab.tree LeaA64:
+        g.emReg dest
+        g.emAt(nn)
+    of DerefC:                                # &(deref p) == p
+      nn.into:
+        g.genInto(nn, dest)
+        while nn.hasMore: skip nn
+    else: raiseAssert "arkham: address-of Mem expr " & $nn.exprKind
+  else: raiseAssert "arkham: cannot take the address of location kind " & $loc.kind
 
 proc genCoerce(g: var CodeGen; c: var Cursor; dest: Reg; isCast: bool) =
   ## Shared lowering for `(conv Type Expr)` / `(cast Type Expr)`. Both evaluate
@@ -963,7 +990,7 @@ proc genIntoF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
     g.giveBack tmp
     inc c
   of Symbol:
-    let l = g.asLvalue(c)
+    let l = g.asLoc(c)
     g.emitLoadF(l, dest, bits)
   of TagLit:
     case c.exprKind
@@ -982,11 +1009,11 @@ proc genIntoF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
       g.genCall(c)                            # float result lands in v0 …
       g.fmovF(dest, FloatRet, bits)           # … move it to the destination
     of DotC:                                  # float struct field: dest ← [base+off]
-      let l = g.asLvalue(c); g.emitLoadF(l, dest, bits)
+      let l = g.asLoc(c); g.emitLoadF(l, dest, bits)
     of AtC:                                   # float array element: dest ← arr[idx]
-      let l = g.asLvalue(c); g.emitLoadF(l, dest, bits)
+      let l = g.asLoc(c); g.emitLoadF(l, dest, bits)
     of DerefC:                                # `(deref p)` → dest ← [p]
-      let l = g.asLvalue(c); g.emitLoadF(l, dest, bits)
+      let l = g.asLoc(c); g.emitLoadF(l, dest, bits)
     else: raiseAssert "arkham v1: float expression not supported: " & $c.exprKind
   else:
     raiseAssert "arkham v1: float operand not supported: " & $c.kind
@@ -1008,7 +1035,7 @@ proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
     g.rodata.add (nm, strVal(c))
     g.emAdr(dest, nm); inc c
   of Symbol:
-    let l = g.asLvalue(c)
+    let l = g.asLoc(c)
     g.emitLoad(l, dest)
   of TagLit:
     case c.exprKind
@@ -1033,15 +1060,15 @@ proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
       g.genCall(c)                          # result lands in x0 …
       g.movReg(dest, IntRet)                # … move it to the destination
     of DotC:                                # field load: dest ← [base+offset]
-      let l = g.asLvalue(c); g.emitLoad(l, dest)
+      let l = g.asLoc(c); g.emitLoad(l, dest)
     of DerefC:                              # `(deref p)` → dest ← [p]
-      let l = g.asLvalue(c); g.emitLoad(l, dest)
+      let l = g.asLoc(c); g.emitLoad(l, dest)
     of AddrC:                               # `(addr lvalue)` → dest ← &lvalue
       c.into:
         g.genAddr(c, dest)
         while c.hasMore: skip c             # (cppref)?
     of AtC:                                 # `(at arr idx)` → dest ← arr[idx]
-      let l = g.asLvalue(c); g.emitLoad(l, dest)
+      let l = g.asLoc(c); g.emitLoad(l, dest)
     else: raiseAssert "arkham v1: expression not supported: " & $c.exprKind
   else:
     raiseAssert "arkham v1: operand not supported: " & $c.kind
@@ -1050,7 +1077,7 @@ proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
 proc genAddr(g: var CodeGen; c: var Cursor; dest: Reg) =
   ## `dest ← &lvalue`, with `c` positioned at the lvalue. Parse the addressing
   ## mode once, then let `emitAddr` form the address.
-  let l = g.asLvalue(c)
+  let l = g.asLoc(c)
   g.emitAddr(l, dest)
 
 # ── calls ────────────────────────────────────────────────────────────────────
@@ -1935,11 +1962,31 @@ proc byteCopyConst(g: var CodeGen; dst, src: Reg; size: int) =
   g.emLab(done)
   g.giveBack b; g.giveBack i
 
+proc gen(g: var CodeGen; c: var Cursor; dest: var Location) =
+  ## The single value/destination entry point. `dest` says where `c`'s value must
+  ## go: a concrete `InReg`/`InFReg` register, a memory location to store at, or
+  ## `Undef` — the dont-care target, filled in (via `var`) with where it landed.
+  case dest.kind
+  of InReg: g.genInto(c, dest.r)
+  of InFReg: g.genIntoF(c, dest.f, dest.typ.size * 8)
+  of Undef: dest = g.genVal(c)
+  of NamedStack, Mem, Glob, Tvar:
+    let bits = dest.typ.size * 8
+    if dest.typ.isFloat:
+      let (fr, ft) = g.genFReg(c, bits)
+      g.emitStoreF(dest, fr, bits)
+      if ft: g.giveBackF fr
+    else:
+      let (rr, rt) = g.genReg(c)
+      g.emitStore(dest, rr)
+      if rt: g.giveBack rr
+  else: raiseAssert "arkham a64: gen() cannot target dest kind " & $dest.kind
+
 proc genAsgn(g: var CodeGen; c: var Cursor) =
-  ## `(asgn lvalue rvalue)`. The lvalue's type (via `getType`/`exprSlot`) decides
-  ## float vs integer — uniformly, with no per-form special-casing; the lvalue's
-  ## *shape* decides only the address operand (register / global / dot / deref /
-  ## at). A float lvalue stores with `fstr`, an integer one with `mov`.
+  ## `(asgn lvalue rvalue)`. The lvalue's type decides float vs integer; its shape
+  ## decides the address operand. An aggregate is a whole-buffer copy; every scalar
+  ## and float store goes through the unified `gen`, selecting register vs memory
+  ## vs the float path purely from the destination `Location`.
   c.into:
     let slot = g.exprSlot(c)                # the lvalue's type → float / int / aggregate
     if slot.kind == AMem:                   # whole-aggregate copy (any size)
@@ -1949,20 +1996,8 @@ proc genAsgn(g: var CodeGen; c: var Cursor) =
       if srcT: g.giveBack srcA
       if dstT: g.giveBack dstA
     else:
-      let l = g.asLvalue(c)              # classify + consume lvalue; c → rvalue
-      let bits = if slot.size == 4: 32 else: 64
-      case l.kind
-      of lvReg: g.genInto(c, l.r)           # compute the rhs straight into the home reg
-      of lvFReg: g.genIntoF(c, l.f, bits)
-      else:                                 # a memory destination: one store pair
-        if slot.kind == AFloat:
-          let (fr, ft) = g.genFReg(c, bits)
-          g.emitStoreF(l, fr, bits)
-          if ft: g.giveBackF fr
-        else:
-          let (rr, rt) = g.genReg(c)
-          g.emitStore(l, rr)
-          if rt: g.giveBack rr
+      var dst = g.asLoc(c)                  # classify + consume lvalue; c → rvalue
+      g.gen(c, dst)                          # rhs → destination (scalar / float)
 
 proc genStmt(g: var CodeGen; c: var Cursor) =
   case c.stmtKind

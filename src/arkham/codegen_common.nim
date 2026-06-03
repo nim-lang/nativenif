@@ -7,7 +7,7 @@
 
 ## Architecture-neutral front-end shared by the per-target backends
 ## (`codegen_a64`, `codegen_x64`). Holds the `CodeGen` state object, the NIFC
-## type/lvalue analysis (`getType` / `exprSlot` / `asLvalue` and friends) and
+## type/lvalue analysis (`getType` / `exprSlot` / `asLoc` and friends) and
 ## the type predicates. None of this emits instructions — instruction selection
 ## and the machine frame live in the backends. The `md` field carries the
 ## target `MachineDesc` so the backends drive the (shared) register allocator
@@ -19,6 +19,12 @@ import slots, machinedesc, analyser, register_allocator, programs
 import asmbuf
 
 type
+  StealEvent* = object
+    victim*: string      ## NIFC name of the evicted register-local
+    slot*: string        ## the stack slot it was moved to (distinct basename)
+    reg*: Reg            ## the register freed for scratch
+    typ*: AsmSlot        ## the victim's slot type (for the stack-slot decl)
+
   CodeGen* = object
     ab*: AsmBuf
     ra*: RegAlloc
@@ -71,6 +77,11 @@ type
     regLocal*: Table[Reg, string]            ## reg → the named local currently bound to it
                                              ## (x64 named-locals: emit the name, not `(reg)`)
     scopeLocals*: seq[seq[tuple[name: string, reg: Reg]]]  ## per-scope register locals to `kill`
+    stealEvents*: Table[int, StealEvent]     ## borrow-log index → a codegen-time
+                                             ## register steal (evict a live local
+                                             ## to a stack slot); recorded in the
+                                             ## plan pass, replayed (with the spill
+                                             ## store) in the emit pass.
 
 # ── type predicates ─────────────────────────────────────────────────────────
 
@@ -124,7 +135,7 @@ type
 proc lookupSym*(g: var CodeGen; nm: string): SymInfo =
   ## The one place a module-level symbol resolves to its kind + declaration:
   ## a main-module global/tvar/proc, or a cross-module symbol loaded lazily from
-  ## its owning module's index. Callers (`getType`/`srcWidthSigned`/`asLvalue`/
+  ## its owning module's index. Callers (`getType`/`srcWidthSigned`/`asLoc`/
   ## `genVal`) classify on the result rather than re-deciding local-vs-foreign.
   if g.globals.hasKey(nm): return SymInfo(cat: scGlobal, decl: g.globals[nm])
   if g.tvars.hasKey(nm): return SymInfo(cat: scTvar, decl: g.tvars[nm])
@@ -204,6 +215,7 @@ proc exprSlot*(g: var CodeGen; c: Cursor): AsmSlot =
     case c.exprKind
     of AddrC, NilC: AsmSlot(kind: AUInt, size: 8, align: 8)          # &lvalue / nil → a pointer
     of TrueC, FalseC: AsmSlot(kind: AUInt, size: 1, align: 1)        # a bool
+    of SizeofC, AlignofC: AsmSlot(kind: AInt, size: 8, align: 8)     # an integer constant
     of SufC, ParC:                                                   # wrappers → the inner value
       var t = c; inc t
       g.exprSlot(t)
@@ -249,44 +261,23 @@ proc srcWidthSigned*(g: var CodeGen; c: Cursor): tuple[width: int, signed: bool]
     else: return (64, true)
   else: return (64, true)
 
-# ── unified lvalue model (addressing modes) ─────────────────────────────────
-# A single descriptor for "where a scalar value lives", parsed once from a NIFC
-# lvalue cursor and consumed by one load/store family — the analogue of TCC's
-# `SValue` + `load()`/`store()`. This collapses the per-form (symbol / global /
-# thread-local / field / element / deref) × per-direction (load / store) × int/
-# float matrix that used to be spread across genInto / genIntoF / genAsgn.
+# ── unified location model (addressing modes + computed values) ─────────────
+# `Location` (machinedesc) is THE descriptor for "where a value lives, or should
+# go" — a register, a stack slot, a global/thread-local, a foldable memory operand
+# (`Mem`, carrying the lvalue subtree to re-emit), an immediate, or `Undef` (the
+# dont-care target). It is the analogue of TCC's `SValue`, shared by the register
+# allocator (long-lived storage) and the backends (just-computed values + lvalue
+# destinations). `asLoc` parses a NIFC lvalue cursor into one; `genVal` produces a
+# computed value as one; the `gen`/load-store family consume it. This replaces the
+# former separate `Lvalue` + `Val` descriptors that flowed through codegen.
 
-type
-  LvalKind* = enum
-    lvReg          ## scalar in a GPR (register-resident local)
-    lvFReg         ## scalar in a SIMD register (float local)
-    lvGlobal       ## module-level global: address via `(adr name)`
-    lvTvar         ## thread-local: address via the macOS TLV thunk
-    lvStackScalar  ## spilled scalar `(s)` slot, addressed by name
-    lvAggrVar      ## aggregate stack var (only an address; no scalar load/store)
-    lvField        ## `(dot base field)` memory operand
-    lvElem         ## `(at arr idx)` — re-emitted from the captured cursor
-    lvDeref        ## `(deref p)` — pointer recomputed from the captured cursor
-
-  Lvalue* = object
-    slot*: AsmSlot               ## float-ness / width (caller picks int vs float path)
-    n*: Cursor                   ## the original NIFC lvalue subtree. A backend can
-                                 ## re-emit it recursively as a nifasm memory operand
-                                 ## (`(dot …)`/`(at …)`/`(deref …)`), letting nifasm
-                                 ## collapse the whole access chain to `base+offset` —
-                                 ## the flat `base`/`field` fields are a legacy shortcut.
-    case kind*: LvalKind
-    of lvReg: r*: Reg
-    of lvFReg: f*: FReg
-    of lvGlobal, lvTvar, lvStackScalar, lvAggrVar: name*: string
-    of lvField: base*, field*: string
-    of lvElem, lvDeref: cur*: Cursor
-
-proc asLvalue*(g: var CodeGen; c: var Cursor): Lvalue =
-  ## Classify and consume an lvalue (Symbol / dot / at / deref). The slot records
-  ## float-ness/width for the caller. Scalar callers (genInto/genIntoF/genAsgn)
-  ## use the load/store family; `emitAddr` additionally handles `lvAggrVar` (an
-  ## aggregate stack var — only its address is meaningful).
+proc asLoc*(g: var CodeGen; c: var Cursor): Location =
+  ## Classify and consume an lvalue (Symbol / dot / at / deref) into a `Location`.
+  ## `typ` records float-ness/width for the caller. A `Mem` captures the lvalue
+  ## subtree (`cur`) so a backend re-emits it as a `(dot …)`/`(at …)`/`(deref …)`
+  ## operand; a `NamedStack` is addressed by the *location's* name, not the
+  ## variable's (a codegen-time steal renames an evicted register-local's slot to
+  ## `evictN.0`; for an un-evicted local the two coincide).
   let slot = g.exprSlot(c)
   let nCur = c                                 # capture the subtree before consuming
   case c.kind
@@ -294,68 +285,23 @@ proc asLvalue*(g: var CodeGen; c: var Cursor): Lvalue =
     let nm = symName(c); inc c
     let si = g.lookupSym(nm)
     case si.cat
-    of scTvar: result = Lvalue(kind: lvTvar, name: nm, slot: slot)
-    of scGlobal: result = Lvalue(kind: lvGlobal, name: nm, slot: slot)
+    of scTvar: result = tvarLoc(nm, slot)
+    of scGlobal: result = globLoc(nm, slot)
     of scProc:
-      # A proc as a value is its address, not an lvalue; `genVal` emits the
-      # `lea` and never routes a proc here.
+      # A proc as a value is its address, not an lvalue; `genVal` emits the `lea`.
       raiseAssert "arkham: proc used as an lvalue: " & nm
     of scNone:
       let loc = g.ra.locationOfSym(nm)
       case loc.kind
-      of InReg: result = Lvalue(kind: lvReg, r: loc.r, slot: slot)
-      of InFReg: result = Lvalue(kind: lvFReg, f: loc.f, slot: slot)
-      of NamedStack:
-        if loc.typ.kind == AMem:
-          result = Lvalue(kind: lvAggrVar, name: nm, slot: slot)
-        else:
-          result = Lvalue(kind: lvStackScalar, name: nm, slot: slot)
-      else: raiseAssert "arkham v1: symbol is not an lvalue: " & nm
+      of InReg: result = regLoc(loc.r, slot)
+      of InFReg: result = fregLoc(loc.f, slot)
+      of NamedStack: result = namedStackLoc(loc.name, slot)  # aggregate or scalar; `typ` tells apart
+      else: raiseAssert "arkham: symbol is not an lvalue: " & nm
   of TagLit:
     case c.exprKind
-    of DotC:
-      var base, field = ""
-      c.into:
-        if c.kind == Symbol: base = symName(c)  # flat shortcut: only a single-level base
-        skip c                                  # base subtree (may itself be (dot …)/(at …))
-        field = symName(c); inc c
-        while c.hasMore: skip c              # depth / access selector
-      result = Lvalue(kind: lvField, base: base, field: field, slot: slot)
-    of AtC:
-      result = Lvalue(kind: lvElem, cur: c, slot: slot); skip c
-    of DerefC:
-      result = Lvalue(kind: lvDeref, cur: c, slot: slot); skip c
-    else: raiseAssert "arkham v1: not an lvalue: " & $c.exprKind
-  else: raiseAssert "arkham v1: not an lvalue: " & $c.kind
-  result.n = nCur
-
-# ── value descriptors ───────────────────────────────────────────────────────
-# Where a just-computed scalar lives (TCC's `SValue`). Expression codegen
-# returns a `Val` from the dont-care evaluator `genVal`, so a literal stays an
-# immediate and a register-resident local stays in place — values are only
-# committed to a specific register when something forces it (`forceReg`/`place`).
-# `vkMem` carries an `Lvalue` so an x86 ALU op can fold the operand
-# (`add dst, [mem]`) instead of loading it first.
-
-type
-  ValKind* = enum
-    vkNone       ## no value / dont-care target
-    vkImm        ## a known integer immediate
-    vkReg        ## integer/pointer in a GPR; `ownsR` → a borrowed temp to release
-    vkFReg       ## float in a SIMD register; `ownsF` → a borrowed temp to release
-    vkMem        ## a memory operand (an `Lvalue`)
-
-  Val* = object
-    case kind*: ValKind
-    of vkNone: discard
-    of vkImm: imm*: int64
-    of vkReg:
-      r*: Reg
-      ownsR*: bool
-    of vkFReg:
-      f*: FReg
-      ownsF*: bool
-    of vkMem: mem*: Lvalue
+    of DotC, AtC, DerefC: (result = memLoc(nCur, slot); skip c)
+    else: raiseAssert "arkham: not an lvalue: " & $c.exprKind
+  else: raiseAssert "arkham: not an lvalue: " & $c.kind
 
 proc retIsVoid*(t: Cursor): bool {.inline.} =
   t.kind == DotToken or (t.kind == TagLit and t.typeKind == VoidT)

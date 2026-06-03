@@ -22,6 +22,7 @@
 ## calling convention by populating a `MachineDesc`.
 
 import slots
+import nifcore   # `Cursor`: a `Mem` location captures the lvalue subtree to re-emit
 
 type
   Reg* = enum   ## abstract GPR slot; a backend maps it to a hardware register
@@ -54,30 +55,52 @@ type
     InReg          ## value in a GPR
     InFReg         ## value in an FP/SIMD register
     OnStack        ## value in a frame slot at `offset` (from the frame base)
-    NamedStack     ## an aggregate stack var managed by nifasm, addressed by name
+    NamedStack     ## a stack var/slot managed by nifasm, addressed by `name`
+                   ## (aggregate, spilled scalar, or synthetic spill — no cursor)
+    Mem            ## a foldable memory operand: the lvalue subtree `cur`
+                   ## (`(dot …)`/`(at …)`/`(deref …)`) re-emitted on demand so
+                   ## nifasm collapses the access chain to `base+offset`
+    Glob           ## a module-level global addressed by `name` (RIP-relative)
+    Tvar           ## a thread-local addressed by `name` (FS/TLV)
     Imm            ## a known immediate (constant / target hint)
 
   Location* = object
+    ## The one descriptor for "where a value lives, or should go" — long-lived
+    ## storage (the allocator's output) and just-computed values (the codegen's
+    ## dont-care result) share it. `owns` marks a register the codegen borrowed
+    ## as scratch and must hand back (vs. a register-resident local, which it
+    ## must not); it is meaningless for the non-register kinds.
     typ*: AsmSlot
+    owns*: bool
     case kind*: LocKind
     of Undef: discard
     of InReg: r*: Reg
     of InFReg: f*: FReg
     of OnStack: offset*: int
-    of NamedStack: name*: string
+    of NamedStack, Glob, Tvar: name*: string
+    of Mem: cur*: Cursor
     of Imm: ival*: int64
 
-const
-  dontCare* = Location(kind: Undef)
+template dontCare*: Location =
+  ## The "fill me in" target for the dont-care evaluator. A template (not a
+  ## `const`) because `Location` now embeds a `Cursor`, which has no static
+  ## representation — but `Undef` carries none, so this is a cheap literal.
+  Location(kind: Undef)
 
-proc regLoc*(r: Reg; typ: AsmSlot): Location {.inline.} =
-  Location(kind: InReg, r: r, typ: typ)
-proc fregLoc*(f: FReg; typ: AsmSlot): Location {.inline.} =
-  Location(kind: InFReg, f: f, typ: typ)
+proc regLoc*(r: Reg; typ: AsmSlot; owns = false): Location {.inline.} =
+  Location(kind: InReg, r: r, typ: typ, owns: owns)
+proc fregLoc*(f: FReg; typ: AsmSlot; owns = false): Location {.inline.} =
+  Location(kind: InFReg, f: f, typ: typ, owns: owns)
 proc stackLoc*(offset: int; typ: AsmSlot): Location {.inline.} =
   Location(kind: OnStack, offset: offset, typ: typ)
 proc namedStackLoc*(name: string; typ: AsmSlot): Location {.inline.} =
   Location(kind: NamedStack, name: name, typ: typ)
+proc globLoc*(name: string; typ: AsmSlot): Location {.inline.} =
+  Location(kind: Glob, name: name, typ: typ)
+proc tvarLoc*(name: string; typ: AsmSlot): Location {.inline.} =
+  Location(kind: Tvar, name: name, typ: typ)
+proc memLoc*(cur: Cursor; typ: AsmSlot): Location {.inline.} =
+  Location(kind: Mem, cur: cur, typ: typ)
 proc immLoc*(ival: int64; typ: AsmSlot): Location {.inline.} =
   Location(kind: Imm, ival: ival, typ: typ)
 

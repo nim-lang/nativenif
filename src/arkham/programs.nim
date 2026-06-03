@@ -474,17 +474,25 @@ proc aggrByteSize*(p: var Program; typeName: string): int =
 
 proc fieldType*(p: var Program; objType: Cursor; field: string): Cursor =
   ## The structural type cursor of `field` in a resolved `(object …)` type.
+  ## An inherited field (the NIFC `(dot base field depth)` selector counts the
+  ## base levels) is resolved by recursing into the object's base type.
   assert objType.kind == TagLit and objType.typeKind == ObjectT,
     "arkham: field access requires an object type"
   var oc = objType
+  var baseType: Cursor
+  var hasBase = false
   oc.into:
-    skip oc                                   # base / inheritance
+    baseType = oc                             # base / inheritance (a type, or `.`)
+    hasBase = oc.kind != DotToken
+    skip oc
     while oc.hasMore:
       oc.into:                                # (fld :name pragmas type)
         let fn = symName(oc); inc oc
         skip oc                               # field-pragmas
         result = oc; skip oc                  # field type (a copy)
         if fn == field: return
+  if hasBase:                                 # not here → look in the inherited base
+    return fieldType(p, resolveType(p, baseType), field)
   raiseAssert "arkham: field '" & field & "' not found"
 
 proc innerType*(p: var Program; t: Cursor): Cursor =
