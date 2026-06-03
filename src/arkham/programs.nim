@@ -70,6 +70,10 @@ type
     scheme: SplittedModulePath              ## path template (dir/<module>.ext)
     tags: TagPool                           ## shared tag pool for parsing foreign modules
     loaded: Table[string, Module]           ## module suffix → loaded foreign module
+    procPtr*: Cursor                        ## a synthesized `(proctype)` — the code-pointer
+                                            ## type of a proc used as a value. A nifcore
+                                            ## Cursor keeps its own backing alive (refcounted
+                                            ## owner), so no separate buffer must be stored.
 
   TypeEnv* = Table[string, Cursor]          ## a type-symbol table
 
@@ -141,6 +145,11 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool): Program =
                    tvars: initTable[string, Cursor](),
                    loaded: initTable[string, Module](),
                    scheme: splitModulePath(inputPath), tags: tags)
+  block:
+    # A standalone `(proctype)` parsed against the shared tag pool; its cursor
+    # outlives this buffer (the owner refcount keeps the data alive).
+    var ptBuf = parseFromBuffer("(proctype)", "", sharedTags = tags)
+    result.procPtr = beginRead(ptBuf)
   assert buf.beginRead().stmtKind == StmtsS, "NIFC top level must be (stmts …)"
   # Pass 1: register every type declaration. Procs (pass 2) resolve their
   # param/return types via `isDeclarativeAbi`, and a proc may reference a type
@@ -306,6 +315,22 @@ proc lookupType*(p: var Program; name: string): Cursor =
   p.typeDecls[name] = d
   p.requestedForeign.add (name, d)
   result = d
+
+proc lookupForeignDecl*(p: var Program; name: string; found: var bool): Cursor =
+  ## The top-level declaration (`gvar|var|const|tvar|proc|type :name …`) for a
+  ## cross-module symbol, loaded from the owning module's embedded index (same
+  ## scheme as `lookupType`). Sets `found=false` for an unqualified name, a
+  ## reference to our own module, or a symbol absent from the foreign module —
+  ## so a single call classifies "local vs foreign" without a separate probe.
+  ## A resolved decl is recorded in `requestedForeign` so nifasm links it.
+  found = false
+  let s = splitSymName(name)
+  if s.module.len == 0 or s.module == p.scheme.name: return
+  let m = loadModule(p, s.module)
+  if not hasDecl(m, name): return
+  result = getDecl(p, m, name)
+  p.requestedForeign.add (name, result)
+  found = true
 
 proc foreignCallTarget*(p: var Program; name: string): CallTarget =
   ## Resolve a cross-module proc reference to a callable target by loading its

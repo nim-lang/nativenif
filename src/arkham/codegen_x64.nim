@@ -196,6 +196,9 @@ proc framePop(g: var CodeGen)
 proc killFrameRegLocals(g: var CodeGen)
 proc genIntoF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int)
 proc emitLoadF(g: var CodeGen; l: Lvalue; dest: FReg; bits: int)
+proc genConstr(g: var CodeGen; c: var Cursor; dstPtr: Reg)
+proc genStore(g: var CodeGen; c: var Cursor; dst: Lvalue)
+proc addrOfLvalue(g: var CodeGen; l: Lvalue): (Reg, bool)
 
 # ── named local variables (nifasm type-checks them; raw scratch stays `(reg)`) ─
 
@@ -283,6 +286,8 @@ proc fieldOffset(g: var CodeGen; base, field: string): int =
     if fi.name == field: return fi.off
   raiseAssert "arkham x64: field not found: " & base & "." & field
 
+proc emGlobalAddr(g: var CodeGen; dest: Reg; name: string)
+
 proc emAccessAddr(g: var CodeGen; n: var Cursor; tmps: var seq[Reg]) =
   ## Recursively re-emit the NIFC lvalue subtree `n` as a nifasm address
   ## expression, letting nifasm collapse the whole chain to `base+offset` from the
@@ -304,7 +309,21 @@ proc emAccessAddr(g: var CodeGen; n: var Cursor; tmps: var seq[Reg]) =
           g.emReg loc.r
       else:
         g.emReg loc.r                              # a plain pointer in a register
-    else: raiseAssert "arkham x64 v0: unsupported lvalue base: " & nm
+    else:
+      # A global aggregate (this module or foreign): materialize its address in
+      # a temp and type it as `(ptr <type>)` so a `(dot …)`/`(at …)` can offset.
+      let si = g.lookupSym(nm)
+      if si.cat == scGlobal:
+        let r = g.borrowTmp(); tmps.add r
+        g.emGlobalAddr(r, nm)
+        var d = si.decl
+        inc d; skip d; skip d                      # enter (gvar …): name, pragmas → type
+        g.ab.tree CastX:
+          g.ab.ptrType:
+            if d.kind == Symbol: g.ab.sym symName(d)
+            else: g.genTypeBody(d)
+          g.emReg r
+      else: raiseAssert "arkham x64 v0: unsupported lvalue base: " & nm
   of TagLit:
     case n.exprKind
     of DotC:
@@ -494,7 +513,17 @@ proc genVal(g: var CodeGen; c: var Cursor): Val =
   case c.kind
   of IntLit:
     result = Val(kind: vkImm, imm: intVal(c)); inc c
+  of UIntLit:
+    result = Val(kind: vkImm, imm: cast[int64](uintVal(c))); inc c
+  of CharLit:
+    result = Val(kind: vkImm, imm: int64(ord(charLit(c)))); inc c
   of Symbol:
+    let si = g.lookupSym(symName(c))
+    if si.cat == scProc:                        # proc as a value → its code address
+      let t = g.borrowTmp()
+      g.ab.tree LeaX64: (g.emReg t; g.ab.sym si.asmName)
+      inc c
+      return Val(kind: vkReg, r: t, ownsR: true)
     let l = g.asLvalue(c)
     case l.kind
     of lvReg: result = Val(kind: vkReg, r: l.r, ownsR: false)
@@ -892,7 +921,7 @@ proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
   let protect = dest in StagingCandidates and dest notin g.liveAccums
   if protect: g.liveAccums.incl dest
   case c.kind
-  of IntLit, Symbol:
+  of IntLit, UIntLit, CharLit, Symbol:
     g.place(g.genVal(c), dest)               # literal / register-resident local
   of StrLit:                                 # string literal → rodata + RIP-relative lea
     let nm = "msg." & $g.rodata.len
@@ -947,6 +976,10 @@ proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
     of TrueC: g.movImm(dest, 1); skip c       # boolean / nil literals → immediate
     of FalseC: g.movImm(dest, 0); skip c
     of NilC: g.movImm(dest, 0); skip c
+    of SufC, ParC:                            # `(suf v "type")` / `(par v)` wrap one value
+      c.into:
+        g.genInto(c, dest)
+        while c.hasMore: skip c                # the type suffix / trailing tokens
     else: raiseAssert "arkham x64 v0: expression not supported: " & $c.exprKind
   else: raiseAssert "arkham x64 v0: operand not supported: " & $c.kind
   if protect: g.liveAccums.excl dest
@@ -1327,6 +1360,14 @@ const x64RetRegs = [RAX, RDX]   # SysV ≤16B aggregate result: rax (word 0), rd
 proc emStackAddr(g: var CodeGen; dest: Reg; name: string) =   # dest ← &stackvar
   g.ab.tree LeaX64: (g.emReg dest; g.ab.reg RSP; g.ab.sym name)
 
+proc freshAggrTemp(g: var CodeGen; typeName: string): string =
+  ## Declare a fresh nifasm-managed aggregate stack slot `(var :ctmp.N (s) T)`
+  ## and return its name — a place to materialize an inline constructor whose
+  ## result an aggregate-by-value ABI then reads from memory.
+  result = "ctmp." & $g.spillCount & ".0"; inc g.spillCount
+  g.emStackVar(result, typeName)
+  g.varType[result] = typeName
+
 proc emPtrFieldMem(g: var CodeGen; ptrReg: Reg; typeName, field: string) =
   ## `(mem (dot (cast (ptr T) reg) field))` — a field through a register holding a
   ## pointer to the aggregate (a >16B by-ref param / the indirect-result buffer).
@@ -1345,7 +1386,32 @@ proc emAggrFieldMem(g: var CodeGen; base, field: string) =
   case loc.kind
   of NamedStack: g.emFieldMem(base, field)
   of InReg:      g.emPtrFieldMem(loc.r, g.varType[base], field)
-  else: raiseAssert "arkham x64 v0: aggregate base neither stack nor pointer: " & base
+  else:
+    # a synthetic nifasm `(s)` slot (e.g. a constructor temp) is rsp-relative by
+    # name, just like a `NamedStack` var — the allocator simply doesn't track it.
+    if g.varType.hasKey(base): g.emFieldMem(base, field)
+    else: raiseAssert "arkham x64 v0: aggregate base neither stack nor pointer: " & base
+
+proc genConstr(g: var CodeGen; c: var Cursor; dstPtr: Reg) =
+  ## The single destination-passing constructor emitter: materialize
+  ## `(oconstr T (kv field value)*)` into the aggregate `dstPtr` points at,
+  ## storing each field at its offset. The constructed type is read from the
+  ## constructor itself, so every caller (var-init, assignment, call argument)
+  ## just supplies a destination address. Consumes `c`.
+  assert c.exprKind == OconstrC,
+    "arkham x64 v0: runtime (aconstr …) not supported (constant arrays go to rodata)"
+  var tc = c; inc tc                           # the constructed type symbol
+  let typeName = symName(tc)
+  c.into:
+    skip c                                     # the constructed type
+    while c.hasMore:
+      assert c.substructureKind == KvU, "arkham x64 v0: oconstr expects (kv …)"
+      c.into:
+        let field = symName(c); inc c
+        let (r, owns) = g.forceReg(g.genVal(c))
+        g.ab.tree MovX64: (g.emPtrFieldMem(dstPtr, typeName, field); g.emReg r)
+        if owns: g.giveBack r
+        while c.hasMore: skip c                 # optional inherited-depth INTLIT
 
 proc structToRegs(g: var CodeGen; varName, typeName: string; regs: openArray[Reg]) =
   ## aggregate → regs[i] (one GPR per 8-byte word).
@@ -1490,6 +1556,29 @@ proc genCall(g: var CodeGen; c: var Cursor) =
               g.ra.seal g.md.intArgRegs[idx + k]; sealedHere.incl g.md.intArgRegs[idx + k]
             idx += nw
           inc c
+        elif c.kind == TagLit and c.exprKind in {OconstrC, AconstrC}:
+          # An inline aggregate constructor: build it into a temp slot, then
+          # marshal that temp like any aggregate var (by value in GPRs, or by
+          # reference) — no constructor-specific ABI logic.
+          var tc = c; inc tc                    # the constructed type
+          let tn = symName(tc)
+          let tmpName = g.freshAggrTemp(tn)
+          let p = g.borrowTmp(); g.emStackAddr(p, tmpName)
+          g.genConstr(c, p)                     # consumes the constructor
+          g.giveBack p
+          if aggrByteSize(g.prog, tn) > g.md.aggrByRefThreshold:
+            assert idx < g.md.intArgRegs.len, "arkham x64 v0: >6 args (stack TODO)"
+            let ar = g.md.intArgRegs[idx]
+            g.emStackAddr(ar, tmpName)
+            g.ra.seal ar; sealedHere.incl ar
+            inc idx
+          else:
+            let nw = aggrWordCount(g.prog, tn)
+            assert idx + nw <= g.md.intArgRegs.len, "arkham x64 v0: aggregate arg exceeds GPRs"
+            g.structToRegs(tmpName, tn, g.md.intArgRegs[idx ..< idx + nw])
+            for k in 0 ..< nw:
+              g.ra.seal g.md.intArgRegs[idx + k]; sealedHere.incl g.md.intArgRegs[idx + k]
+            idx += nw
         else:
           assert idx < g.md.intArgRegs.len, "arkham x64 v0: >6 integer args (stack TODO)"
           let ar = g.md.intArgRegs[idx]
@@ -1532,6 +1621,44 @@ proc aggrAddr(g: var CodeGen; c: var Cursor): (Reg, bool) =
   g.genAddr(c, r)
   result = (r, true)
 
+proc addrOfLvalue(g: var CodeGen; l: Lvalue): (Reg, bool) =
+  ## `&l` in a register. A by-reference aggregate (its register already holds the
+  ## address) is returned as-is; everything else borrows a temp via `emitAddr`.
+  if l.kind == lvReg: return (l.r, false)
+  let r = g.borrowTmp()
+  g.emitAddr(l, r)
+  result = (r, true)
+
+proc genStore(g: var CodeGen; c: var Cursor; dst: Lvalue) =
+  ## Destination-passing store: emit expression `c` so its value lands at `dst`,
+  ## consuming `c`. This is the single place an rvalue is committed to a location
+  ## — a constructor builds itself in place, an aggregate lvalue is copied, a
+  ## float/scalar is stored. Callers (`genAsgn`, var-init) just hand it a `dst`.
+  case dst.slot.kind
+  of AMem:                                     # aggregate destination
+    let (dp, downs) = g.addrOfLvalue(dst)
+    if c.kind == TagLit and c.exprKind in {OconstrC, AconstrC}:
+      g.genConstr(c, dp)                        # build the aggregate in place
+    else:                                       # copy from another aggregate lvalue
+      let (sp, sowns) = g.aggrAddr(c)
+      g.byteCopyConst(dp, sp, dst.slot.size)
+      if sowns: g.giveBack sp
+    if downs: g.giveBack dp
+  of AFloat:
+    let bits = dst.slot.size * 8
+    if dst.kind == lvFReg:
+      g.genIntoF(c, dst.f, bits)
+    else:
+      let f = g.borrowFTmp()
+      g.genIntoF(c, f, bits); g.emitStoreF(dst, f, bits); g.giveBackF f
+  else:                                         # scalar int / pointer
+    if dst.kind == lvReg:
+      g.genInto(c, dst.r)
+    else:
+      let (r, owns) = g.forceReg(g.genVal(c))   # imm→mem isn't supported by nifasm
+      g.emitStore(dst, r)
+      if owns: g.giveBack r
+
 # ── statements ─────────────────────────────────────────────────────────────────
 
 proc genStmt(g: var CodeGen; c: var Cursor)
@@ -1570,21 +1697,9 @@ proc genVarDecl(g: var CodeGen; c: var Cursor) =
         g.ab.close()
         if tc.kind == Symbol: g.varType[name] = symName(tc)  # object field-offset lookups
         if c.hasMore and c.kind != DotToken:
-          if c.kind == TagLit and c.exprKind == OconstrC:
-            c.into:                           # (oconstr Type (kv Field Value)*)
-              skip c                          # the constructed type
-              while c.hasMore:
-                assert c.substructureKind == KvU, "arkham x64 v0: oconstr expects (kv …)"
-                c.into:
-                  let field = symName(c); inc c
-                  let (r, owns) = g.forceReg(g.genVal(c))
-                  g.ab.tree MovX64:           # store directly (synthetic field, no cursor)
-                    g.emFieldMem(name, field)
-                    g.emReg r
-                  if owns: g.giveBack r
-                  while c.hasMore: skip c      # optional inherited-depth INTLIT
-          elif c.kind == TagLit and c.exprKind == CallC:
-            # receive an aggregate return value into this var's slot.
+          if c.kind == TagLit and c.exprKind == CallC:
+            # receive an aggregate return value into this var's slot (the callee
+            # writes it, so this can't go through the generic `genStore`).
             assert tc.kind == Symbol, "arkham x64 v0: call-returned aggregate needs a named type"
             let typeName = symName(tc)
             if aggrByteSize(g.prog, typeName) > g.md.aggrByRefThreshold:
@@ -1594,17 +1709,8 @@ proc genVarDecl(g: var CodeGen; c: var Cursor) =
             else:
               g.genCall(c)                     # result in rax:rdx
               g.regsToStruct(name, typeName, x64RetRegs)
-          elif c.kind == Symbol or
-               (c.kind == TagLit and c.exprKind in {DotC, AtC, DerefC}):
-            # init from another aggregate lvalue → whole-struct byte copy
-            let dst = g.borrowTmp()
-            g.emStackAddr(dst, name)
-            let (srcA, srcT) = g.aggrAddr(c)
-            g.byteCopyConst(dst, srcA, loc.typ.size)
-            if srcT: g.giveBack srcA
-            g.giveBack dst
-          else:
-            raiseAssert "arkham x64 v0: aggregate copy-initializer not supported: " & name
+          else:                                # construct in place / copy from an lvalue
+            g.genStore(c, Lvalue(kind: lvAggrVar, name: name, slot: loc.typ))
       else:                                   # a spilled / address-taken scalar
         g.emScalarStackVar(name)              # (var :name (s) (i 64))
         if c.hasMore and c.kind != DotToken:
@@ -1618,31 +1724,8 @@ proc genVarDecl(g: var CodeGen; c: var Cursor) =
 
 proc genAsgn(g: var CodeGen; c: var Cursor) =
   c.into:
-    let slot = g.exprSlot(c)                   # peek the lvalue's type (no consume)
-    if slot.kind == AMem:                      # whole-aggregate copy (any size)
-      let (dstA, dstT) = g.aggrAddr(c)         # &lvalue (consumes it)
-      let (srcA, srcT) = g.aggrAddr(c)         # &rvalue (an aggregate lvalue)
-      g.byteCopyConst(dstA, srcA, slot.size)
-      if srcT: g.giveBack srcA
-      if dstT: g.giveBack dstA
-    elif slot.kind == AFloat:                  # float target (register or spilled)
-      let l = g.asLvalue(c)
-      let bits = l.slot.size * 8
-      if l.kind == lvFReg:
-        g.genIntoF(c, l.f, bits)
-      else:
-        let f = g.borrowFTmp()
-        g.genIntoF(c, f, bits)
-        g.emitStoreF(l, f, bits)
-        g.giveBackF f
-    else:
-      let l = g.asLvalue(c)                    # consumes the lvalue
-      case l.kind
-      of lvReg: g.genInto(c, l.r)
-      else:                                    # memory target: RHS → reg → store
-        let (r, owns) = g.forceReg(g.genVal(c))  # (imm→mem isn't supported by nifasm)
-        g.emitStore(l, r)
-        if owns: g.giveBack r
+    let dst = g.asLvalue(c)                     # lhs → the destination location ("fills")
+    g.genStore(c, dst)                          # rhs value into it ("binds")
     while c.hasMore: skip c
 
 proc genWhile(g: var CodeGen; c: var Cursor) =
@@ -1784,6 +1867,8 @@ proc genCase(g: var CodeGen; c: var Cursor) =
   g.emLab(lEnd)
 
 proc genStmt(g: var CodeGen; c: var Cursor) =
+  if c.kind == DotToken:                       # an empty statement (e.g. `(stmts .)`)
+    inc c; return
   case c.stmtKind
   of ScopeS:                                  # only `scope` is a fresh scope
     g.enterScope()                            # register locals here `kill` at close

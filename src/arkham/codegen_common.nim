@@ -110,6 +110,33 @@ proc isPtrType*(c: Cursor): bool =
 
 # ── structural type / slot analysis ─────────────────────────────────────────
 
+type
+  SymCat* = enum
+    scNone                      ## not a module-level symbol (a function-local)
+    scGlobal                    ## ordinary .bss/.data global or const
+    scTvar                      ## thread-local (macOS TLV)
+    scProc                      ## a proc — as a value it is its code address
+  SymInfo* = object
+    cat*: SymCat
+    decl*: Cursor               ## scGlobal/scTvar: the `(gvar|tvar|const :name pragmas type …)`
+    asmName*: string            ## scProc: the asm symbol whose address the proc denotes
+
+proc lookupSym*(g: var CodeGen; nm: string): SymInfo =
+  ## The one place a module-level symbol resolves to its kind + declaration:
+  ## a main-module global/tvar/proc, or a cross-module symbol loaded lazily from
+  ## its owning module's index. Callers (`getType`/`srcWidthSigned`/`asLvalue`/
+  ## `genVal`) classify on the result rather than re-deciding local-vs-foreign.
+  if g.globals.hasKey(nm): return SymInfo(cat: scGlobal, decl: g.globals[nm])
+  if g.tvars.hasKey(nm): return SymInfo(cat: scTvar, decl: g.tvars[nm])
+  if g.callTarget.hasKey(nm): return SymInfo(cat: scProc, asmName: g.callTarget[nm].asmName)
+  var found = false
+  let d = lookupForeignDecl(g.prog, nm, found)
+  if found:
+    case d.stmtKind
+    of ProcS: return SymInfo(cat: scProc, asmName: nm)   # foreign proc: its fully-qualified NIF name
+    of TvarS: return SymInfo(cat: scTvar, decl: d)
+    else: return SymInfo(cat: scGlobal, decl: d)
+
 proc getType*(g: var CodeGen; c: Cursor): Cursor =
   ## The structural NIFC type cursor of expression `c` (arkham's analog of
   ## `typenav.getType`). Symbols resolve through `symType` / the global/tvar
@@ -120,19 +147,20 @@ proc getType*(g: var CodeGen; c: Cursor): Cursor =
   of Symbol:
     let nm = symName(c)
     if g.symType.hasKey(nm): return g.symType[nm]
-    var decl: Cursor
-    if g.globals.hasKey(nm): decl = g.globals[nm]
-    elif g.tvars.hasKey(nm): decl = g.tvars[nm]
-    else: raiseAssert "arkham: getType — unknown symbol " & nm
-    var d = decl
-    d.into:
-      inc d; skip d                           # name, pragmas
-      result = d                              # the declared type (a copy)
-      while d.hasMore: skip d
+    let si = g.lookupSym(nm)
+    case si.cat
+    of scProc: result = g.prog.procPtr        # a proc as a value → its code-pointer type
+    of scGlobal, scTvar:
+      var d = si.decl
+      d.into:
+        inc d; skip d                         # name, pragmas
+        result = d                            # the declared type (a copy)
+        while d.hasMore: skip d
+    of scNone: raiseAssert "arkham: getType — unknown symbol " & nm
   of TagLit:
     case c.exprKind
     of AddC, SubC, MulC, DivC, ModC, ShlC, ShrC, BitandC, BitorC, BitxorC,
-       BitnotC, NegC, NotC, ConvC, CastC:
+       BitnotC, NegC, NotC, ConvC, CastC, OconstrC, AconstrC:
       var t = c
       t.into:
         result = t                            # the carried result/target type
@@ -173,7 +201,12 @@ proc exprSlot*(g: var CodeGen; c: Cursor): AsmSlot =
   of StrLit: AsmSlot(kind: AUInt, size: 8, align: 8)      # a pointer
   of Symbol: slotOf(g.prog, g.getType(c))
   of TagLit:
-    if c.exprKind == AddrC: AsmSlot(kind: AUInt, size: 8, align: 8)  # &lvalue → a pointer
+    case c.exprKind
+    of AddrC, NilC: AsmSlot(kind: AUInt, size: 8, align: 8)          # &lvalue / nil → a pointer
+    of TrueC, FalseC: AsmSlot(kind: AUInt, size: 1, align: 1)        # a bool
+    of SufC, ParC:                                                   # wrappers → the inner value
+      var t = c; inc t
+      g.exprSlot(t)
     else: slotOf(g.prog, g.getType(c))
   else: AsmSlot(kind: AMem)
 
@@ -197,14 +230,15 @@ proc srcWidthSigned*(g: var CodeGen; c: Cursor): tuple[width: int, signed: bool]
     let loc = g.ra.locationOfSym(nm)
     if loc.kind != Undef:
       return slotWidthSigned(loc.typ)        # a local/param: the allocator knows it
-    var decl: Cursor                          # a global / thread-local: read its decl type
-    if g.globals.hasKey(nm): decl = g.globals[nm]
-    elif g.tvars.hasKey(nm): decl = g.tvars[nm]
-    else: return (64, true)
-    var d = decl
-    d.into:
-      inc d; skip d                           # name, pragmas
-      return slotWidthSigned(slotOf(g.prog, d))
+    let si = g.lookupSym(nm)                   # a global / thread-local: read its decl type
+    case si.cat
+    of scProc: return (64, true)               # a code pointer
+    of scGlobal, scTvar:
+      var d = si.decl
+      d.into:
+        inc d; skip d                          # name, pragmas
+        return slotWidthSigned(slotOf(g.prog, d))
+    of scNone: return (64, true)
   of TagLit:
     case c.exprKind
     of AddC, SubC, MulC, DivC, ModC, ShlC, ShrC,
@@ -258,11 +292,15 @@ proc asLvalue*(g: var CodeGen; c: var Cursor): Lvalue =
   case c.kind
   of Symbol:
     let nm = symName(c); inc c
-    if g.tvars.hasKey(nm):
-      result = Lvalue(kind: lvTvar, name: nm, slot: slot)
-    elif g.globals.hasKey(nm):
-      result = Lvalue(kind: lvGlobal, name: nm, slot: slot)
-    else:
+    let si = g.lookupSym(nm)
+    case si.cat
+    of scTvar: result = Lvalue(kind: lvTvar, name: nm, slot: slot)
+    of scGlobal: result = Lvalue(kind: lvGlobal, name: nm, slot: slot)
+    of scProc:
+      # A proc as a value is its address, not an lvalue; `genVal` emits the
+      # `lea` and never routes a proc here.
+      raiseAssert "arkham: proc used as an lvalue: " & nm
+    of scNone:
       let loc = g.ra.locationOfSym(nm)
       case loc.kind
       of InReg: result = Lvalue(kind: lvReg, r: loc.r, slot: slot)
