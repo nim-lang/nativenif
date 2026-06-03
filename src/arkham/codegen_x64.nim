@@ -41,12 +41,25 @@ proc initFreeTmp(g: var CodeGen) =
     if loc.kind == InReg: g.freeTmp.excl loc.r
     elif loc.kind == InFReg: g.freeFTmp.excl loc.f
 
-proc borrowTmp(g: var CodeGen): Reg =
-  for r in g.md.intTempRegs:
+proc tryBorrowTmp(g: var CodeGen): Reg =
+  ## Like `borrowTmp` but returns `NoReg` when the scratch pool is exhausted
+  ## (instead of failing). The caller then spills the value to a stack slot. The
+  ## reg-or-`NoReg` outcome is recorded/replayed like any borrow decision.
+  if not g.ab.planning:                          # emit pass: replay the planned decision
+    result = g.borrowLog[g.borrowIdx]; inc g.borrowIdx
+    return
+  for r in g.md.intTempRegs:                      # plan pass: real pool allocation
     if r in g.freeTmp and not g.ra.isSealed(r):
       excl g.freeTmp, r
+      g.borrowLog.add r
       return r
-  raiseAssert "arkham x64 v0: out of scratch registers"
+  g.borrowLog.add NoReg                           # exhausted → caller spills (cannot fail)
+  result = NoReg
+
+proc borrowTmp(g: var CodeGen): Reg =
+  result = g.tryBorrowTmp()
+  if result == NoReg:
+    raiseAssert "arkham x64 v0: out of scratch registers"  # sites not yet spill-aware
 
 proc giveBack(g: var CodeGen; r: Reg) {.inline.} =
   if r != NoReg: g.freeTmp.incl r
@@ -61,11 +74,15 @@ const FloatRet = F0    # xmm0: SysV scalar-float return + first float argument
 proc emFReg(g: var CodeGen; f: FReg) {.inline.} = g.ab.xmmReg f
 
 proc borrowFTmp(g: var CodeGen): FReg =
-  for f in g.md.floatTempRegs:
+  if not g.ab.planning:                          # emit pass: replay the planned decision
+    result = g.borrowLogF[g.borrowIdxF]; inc g.borrowIdxF
+    return
+  for f in g.md.floatTempRegs:                    # plan pass: real pool allocation
     if f in g.freeFTmp:
       excl g.freeFTmp, f
+      g.borrowLogF.add f
       return f
-  raiseAssert "arkham x64 v0: out of SIMD scratch registers"
+  raiseAssert "arkham x64 v0: out of SIMD scratch registers"  # M2: spill instead of failing
 
 proc giveBackF(g: var CodeGen; f: FReg) {.inline.} =
   if f in g.md.floatTempRegs: g.freeFTmp.incl f
@@ -308,8 +325,15 @@ proc emAccessAddr(g: var CodeGen; n: var Cursor; tmps: var seq[Reg]) =
   else: raiseAssert "arkham x64 v0: not an lvalue: " & $n.kind
 
 proc emMemOperand(g: var CodeGen; l: Lvalue): seq[Reg] =
-  ## Emit `(mem <addr>)` for `l` by re-emitting `l.n`; returns temps to free.
+  ## Emit `(mem <addr>)` for `l`; returns temps to free. A by-name stack slot is
+  ## emitted directly (`(mem (rsp) name)`) — this covers both spilled locals and
+  ## synthetic spill slots (which carry no NIFC cursor); other lvalues re-emit the
+  ## captured subtree `l.n`. (Byte-identical to the old `l.n` route for a stack
+  ## var, whose `emAccessAddr` Symbol/NamedStack branch produced the same operand.)
   result = @[]
+  if l.kind in {lvStackScalar, lvAggrVar}:
+    g.emStackMem(l.name)
+    return
   var nn = l.n
   g.ab.tree MemX:
     g.emAccessAddr(nn, result)
@@ -415,11 +439,46 @@ proc forceReg(g: var CodeGen; v: Val): tuple[r: Reg, owns: bool] =
     let t = g.borrowTmp(); g.emitLoad(v.mem, t); (t, true)
   else: raiseAssert "arkham x64 v0: cannot force a value of kind " & $v.kind & " into a register"
 
+proc pickStaging(g: var CodeGen; avoid: Reg = NoReg): Reg =
+  ## A transient compute register for a spill: the first non-sealed caller-saved
+  ## GPR that is neither the scratch pool (r10/r11, exhausted at a spill) nor a
+  ## local home (those are callee-saved), and is not `avoid`. Clobbering it
+  ## transiently is safe.
+  for r in [RAX, RDI, RSI, RDX, RCX, R8, R9]:
+    if r != avoid and not g.ra.isSealed(r): return r
+  raiseAssert "arkham x64: no staging register available for a spill"
+
+proc spillComputed(g: var CodeGen; c: var Cursor): Val =
+  ## The scratch pool is exhausted: materialize `c`'s value into a fresh `(s)` slot
+  ## via a transient staging register, and hand it back as a *foldable memory
+  ## operand* (`vkMem`) — which every `Val` consumer (`binMem`/`place`/`forceReg`)
+  ## already handles. This is what makes register allocation total: a deep
+  ## expression spills instead of failing. The staging reg is sealed across the
+  ## recursive eval so the inner walk can't clobber the value being built; that
+  ## inner `genInto` is itself total (genBin's pool-exhausted path spills its left
+  ## operand and reuses the staging reg as its own `dest` rather than consuming a
+  ## fresh staging reg per level), so spill nesting no longer cascades and this
+  ## path is reached only at isolated spill points (the divisor / the lighter
+  ## operand of an SU swap), never recursively.
+  let slotName = "spill." & $g.spillCount; inc g.spillCount
+  g.ra.hasStackVars = true
+  let stage = g.pickStaging()
+  g.ra.seal stage
+  g.emScalarStackVar(slotName)                  # (var :spill.N (s) (i 64))
+  g.genInto(c, stage)                           # compute the value into the staging reg
+  g.ab.tree MovX64:                             # store it to the slot
+    g.emStackMem(slotName)
+    g.emReg stage
+  g.ra.unseal {stage}
+  result = Val(kind: vkMem, mem: Lvalue(kind: lvStackScalar, name: slotName,
+              slot: AsmSlot(kind: AInt, size: 8, align: 8)))
+
 proc genVal(g: var CodeGen; c: var Cursor): Val =
   ## The dont-care evaluator: produce `c`'s value wherever it naturally lives — a
   ## literal as an immediate, a register-resident local in place, a memory operand
-  ## as a foldable `vkMem` — materializing any *computed* value into a freshly
-  ## borrowed scratch register. The counterpart of `genInto(…, dest)`.
+  ## as a foldable `vkMem` — materializing any *computed* value into a scratch
+  ## register, or (when the pool is exhausted) a spill slot. The counterpart of
+  ## `genInto(…, dest)`.
   case c.kind
   of IntLit:
     result = Val(kind: vkImm, imm: intVal(c)); inc c
@@ -437,41 +496,180 @@ proc genVal(g: var CodeGen; c: var Cursor): Val =
     of DotC, AtC, DerefC:                       # a memory lvalue used as a value
       result = Val(kind: vkMem, mem: g.asLvalue(c))
     else:
-      let t = g.borrowTmp()                    # a computed value → a scratch reg
+      let t = g.tryBorrowTmp()                  # a computed value → a scratch reg…
+      if t == NoReg: result = g.spillComputed(c)  # …or a spill slot if exhausted
+      else:
+        g.genInto(c, t)
+        result = Val(kind: vkReg, r: t, ownsR: true)
+  else:
+    let t = g.tryBorrowTmp()
+    if t == NoReg: result = g.spillComputed(c)
+    else:
       g.genInto(c, t)
       result = Val(kind: vkReg, r: t, ownsR: true)
+
+proc commutativeOp(op: X64Inst): bool {.inline.} =
+  ## Integer ops for which `a op b == b op a`, so Sethi–Ullman may evaluate the
+  ## heavier operand first and fold the lighter one. (sub/shl/shr/div/mod are
+  ## position-sensitive and stay in source order.)
+  op in {AddX64, ImulX64, AndX64, OrX64, XorX64}
+
+const SuCallWeight = 1000          # a call dominates demand → sorts first
+
+proc suWeight(c: Cursor): int =
+  ## Sethi–Ullman register label of the subtree at `c`: an estimate of how many
+  ## registers evaluating it needs, used to decide which operand of a commutative
+  ## op to evaluate first. Reads a *copy* of the cursor (never advances `c`). Only
+  ## the integer arithmetic/logic tree is modeled precisely; memory loads and
+  ## anything unmodeled count as leaves (weight 1); a call gets a large weight.
+  var c = c
+  if c.kind != TagLit:
+    return 1                                   # IntLit / Symbol / StrLit leaf
+  case c.exprKind
+  of AddC, SubC, MulC, BitandC, BitorC, BitxorC, ShlC, ShrC, DivC, ModC:
+    var la = 1
+    var lb = 1
+    c.into:
+      skip c                                   # result type
+      la = suWeight(c); skip c                 # left
+      lb = suWeight(c); skip c                 # right
+    result = if la == lb: la + 1 else: max(la, lb)
+  of NegC, BitnotC, ConvC, CastC:
+    var w = 1
+    c.into:
+      skip c                                   # type child
+      if c.hasMore: w = suWeight(c)
+      while c.hasMore: skip c                  # operand (+ trailing tokens)
+    result = max(w, 1)
+  of NotC:                                     # boolean not has NO type child
+    var w = 1
+    c.into:
+      if c.hasMore: w = suWeight(c)
+      while c.hasMore: skip c
+    result = max(w, 1)
+  of CallC:
+    result = SuCallWeight
   else:
-    let t = g.borrowTmp()
-    g.genInto(c, t)
-    result = Val(kind: vkReg, r: t, ownsR: true)
+    result = 1                                 # Dot/At/Deref/Addr/comparisons/…
+
+proc hasCall(c: Cursor): bool =
+  ## True if the subtree at `c` contains a call (atomics lower through the call
+  ## path too). Reordering two *pure* operands is observation-preserving; a call
+  ## anywhere disables the Sethi–Ullman swap. Reads a copy of the cursor.
+  var c = c
+  if c.kind != TagLit: return false
+  if c.exprKind == CallC: return true
+  result = false
+  c.into:
+    while c.hasMore:
+      if not result and hasCall(c): result = true
+      skip c
+
+proc refsReg(g: var CodeGen; c: Cursor; r: Reg): bool =
+  ## Does evaluating the subtree at `c` read register `r`? True when any symbol
+  ## in it is register-resident with home `r`. Keeps the operand swap sound:
+  ## evaluating the heavy operand into `dest` first must not clobber a register
+  ## the light operand still needs. Reads a copy of the cursor.
+  var c = c
+  if c.kind == Symbol:
+    let loc = g.ra.locationOfSym(symName(c))
+    return loc.kind == InReg and loc.r == r
+  if c.kind != TagLit: return false
+  result = false
+  c.into:
+    while c.hasMore:
+      if not result and g.refsReg(c, r): result = true
+      skip c
+
+proc isComputedOperand(c: Cursor): bool =
+  ## Mirrors `genVal`: the operand kinds it materializes into a fresh register
+  ## (and would spill on pool exhaustion), as opposed to those it reads in place
+  ## (literal, register/stack local, memory lvalue). genBin intercepts these so a
+  ## deep right operand spills without pinning `dest`.
+  case c.kind
+  of IntLit, Symbol: false
+  of TagLit: c.exprKind notin {DotC, AtC, DerefC}
+  else: true
+
+proc spillOperandAround(g: var CodeGen; c: var Cursor; dest: Reg; op: X64Inst) =
+  ## Pool-exhausted evaluation of genBin's right operand that keeps register
+  ## allocation TOTAL. The left operand is already in `dest`; spill it to a fresh
+  ## slot so `dest` is free, evaluate the (possibly deep) right operand into `dest`
+  ## — the recursion reuses `dest`, never pinning a register per nesting level —
+  ## then reassemble `dest = a op b` with a single transient staging reg taken only
+  ## here, after the recursion has fully unwound (so it never nests → one reg covers
+  ## any depth). Evaluation order a-before-b is preserved (correct for impure
+  ## operands too). `c` is consumed past the right operand.
+  let slotA = "spill." & $g.spillCount; inc g.spillCount
+  g.ra.hasStackVars = true
+  let slotLv = Lvalue(kind: lvStackScalar, name: slotA,
+                      slot: AsmSlot(kind: AInt, size: 8, align: 8))
+  g.emScalarStackVar(slotA)
+  g.ab.tree MovX64:                            # store a → slotA (free dest)
+    g.emStackMem(slotA)
+    g.emReg dest
+  g.genInto(c, dest)                           # b → dest (recursion reuses dest)
+  let s = g.pickStaging(avoid = dest)          # transient; recursion done → never nests
+  g.movReg(s, dest)                            # s = b
+  g.emitLoad(slotLv, dest)                     # dest = a (reload)
+  g.binReg(op, dest, s)                        # dest = a op b
 
 proc genBin(g: var CodeGen; c: var Cursor; dest: Reg; op: X64Inst; immOk: bool) =
-  ## `dest = a op b` in x86's destructive form: `a` into `dest`, then `dest op= b`.
-  ## The right operand is a descriptor, so an immediate folds into `op dest, imm`
-  ## and a register is used in place. If `b` lives in `dest`, it is saved before
-  ## `a` overwrites it (correct for commutative and non-commutative ops alike).
+  ## `dest = a op b` in x86's destructive form: normally `a` into `dest`, then
+  ## `dest op= b`, with `b` folded as an immediate / memory / register operand.
+  ## For a commutative op whose RIGHT operand needs strictly more registers than
+  ## the left (Sethi–Ullman), the operands are swapped: the heavier one is
+  ## evaluated into `dest` first and the lighter folded after — so a right-nested
+  ## chain like `1+(2+(4+…))` collapses into `dest` with no scratch temp (and
+  ## therefore never spills). The swap is taken only when both operands are pure
+  ## (no call, so reordering is observation-preserving) and the light operand does
+  ## not read `dest` (which the heavy evaluation overwrites first). If instead `b`
+  ## lives in `dest`, it is saved before `a` overwrites it.
+  ##
+  ## When `b` is a computed operand that must occupy a register and the scratch
+  ## pool is exhausted, `spillOperandAround` takes over: it spills the just-computed
+  ## `a` (in `dest`) to a slot, evaluates `b` into the freed `dest`, and reassembles
+  ## — so even a deep NON-commutative right-nest (`a-(b-(c-…))`, which SU can't
+  ## reorder) allocates with O(1) live registers and O(depth) slots instead of
+  ## asserting. Register allocation is total.
   c.into:
-    skip c                                    # result type
-    var bPeek = c                             # peek b before `a` overwrites dest
-    skip bPeek
-    var b: Val
-    if g.operandInReg(bPeek, dest):
+    skip c                                    # result type; c at a
+    var aPeek = c
+    var bPeek = c; skip bPeek                  # bPeek at b
+    var other: Val                            # the operand folded into dest last
+    var combined = false                      # the spill path emits its own combine
+    if commutativeOp(op) and suWeight(bPeek) > suWeight(aPeek) and
+       not hasCall(aPeek) and not hasCall(bPeek) and not g.refsReg(aPeek, dest):
+      g.genInto(bPeek, dest)                   # heavier operand (b) → dest first
+      other = g.genVal(c)                      # lighter operand (a) folded after
+      skip c                                   # consume b in the real cursor
+    elif g.operandInReg(bPeek, dest):
       let saved = g.borrowTmp()
       g.movReg(saved, dest)                   # preserve b before `a` clobbers dest
       g.genInto(c, dest)                      # a → dest
       skip c                                  # consume b
-      b = Val(kind: vkReg, r: saved, ownsR: true)
+      other = Val(kind: vkReg, r: saved, ownsR: true)
     else:
-      g.genInto(c, dest)                      # a → dest
-      b = g.genVal(c)                         # b stays where it naturally lives
-    if immOk and b.kind == vkImm and b.imm >= 0 and b.imm <= 0xFFFF:
-      g.binImm(op, dest, b.imm)
-    elif b.kind == vkMem:
-      g.binMem(op, dest, b.mem)               # fold the memory operand: op dest, [mem]
-    else:
-      let (br, owns) = g.forceReg(b)
-      g.binReg(op, dest, br)
-      if owns: g.giveBack br
+      g.genInto(c, dest)                      # a → dest; c now at b
+      if isComputedOperand(c):                # b must be materialized into a register
+        let t = g.tryBorrowTmp()
+        if t == NoReg:                         # pool exhausted → total spill path
+          g.spillOperandAround(c, dest, op)
+          combined = true
+        else:
+          g.genInto(c, t)                      # b → scratch temp
+          other = Val(kind: vkReg, r: t, ownsR: true)
+      else:
+        other = g.genVal(c)                    # b is a leaf / memory / in-place value
+    if not combined:
+      if immOk and other.kind == vkImm and other.imm >= 0 and other.imm <= 0xFFFF:
+        g.binImm(op, dest, other.imm)
+      elif other.kind == vkMem:
+        g.binMem(op, dest, other.mem)         # fold the memory operand: op dest, [mem]
+      else:
+        let (br, owns) = g.forceReg(other)
+        g.binReg(op, dest, br)
+        if owns: g.giveBack br
 
 proc materializeCond(g: var CodeGen; c: var Cursor; dest: Reg) =
   ## A comparison/logic used as a 0/1 value: assume true, jump over the reset.
@@ -1969,38 +2167,11 @@ proc emitTlsSetup(g: var CodeGen) =
           g.giveBack r
       while c.hasMore: skip c
 
-proc genProc(g: var CodeGen; info: ProcInfo) =
-  # Unlike A64 (where a thread-local goes through a TLV-descriptor thunk call), x64
-  # reads/writes a tvar directly as an FS-segment operand — no call — so tvar
-  # accesses must NOT mark the proc non-leaf. Hence the empty tvar set here.
-  let an = analyseProc(info.decl)
-  g.varType = initTable[string, string]()
-  g.symType = initTable[string, Cursor]()
-  g.retAggrName = ""; g.retIndirect = false; g.retIsFloat = false
-  g.indirectReg = NoReg
-  g.isEntryProc = info.isEntry
-  g.regLocal = initTable[Reg, string]()       # per-proc named-local bindings
-  g.scopeLocals = @[]
-  # Aggregate return convention (before allocation): a named object ≤16B → rax:rdx;
-  # >16B → a hidden pointer the caller passes in rdi, parked in a callee-saved reg
-  # (rbx) for the proc's lifetime and written through on `ret`.
-  block:
-    var rc = info.decl
-    inc rc; inc rc; skip rc                    # head → name → params, skip → ret type
-    if rc.kind == Symbol and slotOf(g.prog, rc).kind == AMem:
-      g.retAggrName = symName(rc)
-      g.retIndirect = aggrByteSize(g.prog, g.retAggrName) > g.md.aggrByRefThreshold
-    elif rc.kind == TagLit and rc.typeKind == FT:
-      g.retIsFloat = true                       # float return → xmm0
-      g.retFloatBits = if slotOf(g.prog, rc).size == 4: 32 else: 64
-  let preseal = if g.retIndirect: {RBX} else: {}
-  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64Machine, preseal)
-  if g.retIndirect:
-    g.indirectReg = RBX
-    g.ra.usedCallee.incl RBX                   # saved/restored like any callee reg
-  g.initFreeTmp()
-  g.computeFrameX64(info.isEntry, an.hasCall)
-  let declarative = isDeclarativeAbi(g.prog, info.decl)
+proc emitProcBody(g: var CodeGen; info: ProcInfo; declarative: bool) =
+  ## Emit one proc's `(proc …)` (signature + body). Run twice by `genProc`: once
+  ## in planning mode (emission suppressed, scratch decisions recorded), once for
+  ## real (decisions replayed). Reads the per-proc `ret*`/frame state set up by
+  ## `genProc`; touches only state `genProc` resets between the two passes.
   g.ab.tree ProcD:
     g.ab.symDef info.asmName
     g.emitSignature(info.decl, declarative)
@@ -2030,6 +2201,70 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
       else:
         g.framePop()
         g.ab.keyword RetX64
+
+proc genProc(g: var CodeGen; info: ProcInfo) =
+  # Unlike A64 (where a thread-local goes through a TLV-descriptor thunk call), x64
+  # reads/writes a tvar directly as an FS-segment operand — no call — so tvar
+  # accesses must NOT mark the proc non-leaf. Hence the empty tvar set here.
+  let an = analyseProc(info.decl)
+  g.varType.clear()                           # reuse the backing storage across procs
+  g.symType.clear()
+  g.retAggrName = ""; g.retIndirect = false; g.retIsFloat = false
+  g.indirectReg = NoReg
+  g.isEntryProc = info.isEntry
+  g.regLocal.clear()                          # per-proc named-local bindings
+  g.scopeLocals = @[]
+  g.spillCount = 0
+  # Aggregate return convention (before allocation): a named object ≤16B → rax:rdx;
+  # >16B → a hidden pointer the caller passes in rdi, parked in a callee-saved reg
+  # (rbx) for the proc's lifetime and written through on `ret`.
+  block:
+    var rc = info.decl
+    inc rc; inc rc; skip rc                    # head → name → params, skip → ret type
+    if rc.kind == Symbol and slotOf(g.prog, rc).kind == AMem:
+      g.retAggrName = symName(rc)
+      g.retIndirect = aggrByteSize(g.prog, g.retAggrName) > g.md.aggrByRefThreshold
+    elif rc.kind == TagLit and rc.typeKind == FT:
+      g.retIsFloat = true                       # float return → xmm0
+      g.retFloatBits = if slotOf(g.prog, rc).size == 4: 32 else: 64
+  let preseal = if g.retIndirect: {RBX} else: {}
+  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64Machine, preseal)
+  if g.retIndirect:
+    g.indirectReg = RBX
+    g.ra.usedCallee.incl RBX                   # saved/restored like any callee reg
+  g.initFreeTmp()
+  g.computeFrameX64(info.isEntry, an.hasCall)
+  let declarative = isDeclarativeAbi(g.prog, info.decl)
+  # Single walk, two modes. The plan pass runs `emitProcBody` with emission
+  # suppressed (`ab.planning`), so every scratch borrow is decided and recorded
+  # in `borrowLog`/`borrowLogF` (with the real pool + ABI seals) while no bytes
+  # are produced; the emit pass replays those decisions verbatim. Because the
+  # walk and its register decisions are identical, the emit pass reproduces the
+  # exact bytes a single inline-borrow pass would have — provably byte-identical.
+  # (Spill-on-exhaustion and control-flow/cmov planning build on this seam.)
+  let labelSnapshot = g.labelCount
+  let rodataSnapshot = g.rodata.len
+  let sealedSnapshot = g.ra.sealed
+  g.borrowLog.setLen 0; g.borrowLogF.setLen 0
+  g.borrowIdx = 0; g.borrowIdxF = 0
+  g.ab.planning = true
+  g.emitProcBody(info, declarative)
+  g.ab.planning = false
+  # Reset the per-proc emission state the plan pass dirtied, so the emit pass
+  # reproduces a single-pass result. (The `ret*`/frame fields were fixed in setup
+  # above and stay constant across the two passes.)
+  g.labelCount = labelSnapshot
+  g.rodata.setLen rodataSnapshot
+  g.ra.sealed = sealedSnapshot
+  g.varType.clear()
+  g.symType.clear()
+  g.regLocal.clear()
+  g.scopeLocals = @[]
+  g.loopEnds = @[]
+  g.initFreeTmp()
+  g.borrowIdx = 0; g.borrowIdxF = 0
+  g.spillCount = 0
+  g.emitProcBody(info, declarative)            # emit for real, replaying the plan
 
 proc genGlobal(g: var CodeGen; name: string; decl: Cursor) =
   ## `(gvar :name <type>)` — a zero-initialized `.bss` global (also `const`); any

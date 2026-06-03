@@ -27,6 +27,11 @@ type
     buf: TokenBuf
     ids: Table[string, TagId]   ## spelling → interned tag id (cache)
     renderReg*: proc (r: Reg): string {.nimcall.}  ## GPR slot → arch spelling shim
+    planning*: bool             ## when true, all writes no-op: the codegen walk
+                                ## runs once to plan register allocation (recording
+                                ## borrow decisions, deciding spills) with emission
+                                ## suppressed, then again for real. Every `tree`
+                                ## body still executes — only the bytes are dropped.
 
 proc initAsmBuf*(): AsmBuf =
   ## Defaults the register shim to AArch64 spellings; the x86-64 backend
@@ -35,10 +40,13 @@ proc initAsmBuf*(): AsmBuf =
          renderReg: regName)
 
 proc openS(a: var AsmBuf; spelling: string) {.inline.} =
+  if a.planning: return
   a.buf.openTag a.ids.mgetOrPut(spelling, a.buf.tags.registerTag(spelling))
 
 proc open*[T: enum](a: var AsmBuf; t: T) {.inline.} = a.openS($t)
-proc close*(a: var AsmBuf) {.inline.} = a.buf.closeTag()
+proc close*(a: var AsmBuf) {.inline.} =
+  if a.planning: return
+  a.buf.closeTag()
 
 template tree*[T: enum](a: var AsmBuf; t: T; body: untyped) =
   ## Open a tagged node named after the enum value's spelling (`$t`), run
@@ -73,11 +81,11 @@ proc xmmReg*(a: var AsmBuf; f: FReg) {.inline.} =
   ## precision is carried by the instruction (movss vs movsd), not the register.
   a.openS("xmm" & $ord(f)); a.close()
 
-proc sym*(a: var AsmBuf; s: string) {.inline.} = a.buf.addSymUse s     # use
-proc symDef*(a: var AsmBuf; s: string) {.inline.} = a.buf.addSymDef s  # :def
-proc str*(a: var AsmBuf; s: string) {.inline.} = a.buf.addStrLit s
-proc intLit*(a: var AsmBuf; v: int64) {.inline.} = a.buf.addIntLit v
-proc ident*(a: var AsmBuf; s: string) {.inline.} = a.buf.addIdent s
+proc sym*(a: var AsmBuf; s: string) {.inline.} = (if not a.planning: a.buf.addSymUse s)     # use
+proc symDef*(a: var AsmBuf; s: string) {.inline.} = (if not a.planning: a.buf.addSymDef s)  # :def
+proc str*(a: var AsmBuf; s: string) {.inline.} = (if not a.planning: a.buf.addStrLit s)
+proc intLit*(a: var AsmBuf; v: int64) {.inline.} = (if not a.planning: a.buf.addIntLit v)
+proc ident*(a: var AsmBuf; s: string) {.inline.} = (if not a.planning: a.buf.addIdent s)
 
 # ── type emission (NifasmType tags) ─────────────────────────────────────────
 # Kept here (not in codegen) because nifasm's NifasmType shares spellings with
@@ -116,6 +124,7 @@ proc splice*(a: var AsmBuf; nifText: string) =
   ## spellings (`(fadd (d0) (d1) (d2))`, `(x9)`, …) — i.e. exactly what `render`
   ## would have produced via the enum builder. Parsing shares the buffer's pool
   ## and tag namespace, so splicing is a bulk copy (no re-interning).
+  if a.planning: return
   var frag = parseFromBuffer("(stmts " & nifText & ")", "arkham.inline",
                              sizeHint = 32, sharedPool = a.buf.pool,
                              sharedTags = a.buf.tags)

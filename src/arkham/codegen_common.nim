@@ -31,6 +31,17 @@ type
     tvarNames*: HashSet[string]              ## tvar names, for the per-proc analyser
     freeTmp*: set[Reg]                       ## volatile temps free for scratch
     freeFTmp*: set[FReg]                     ## volatile SIMD/FP temps free for scratch
+    borrowLog*: seq[Reg]                     ## scratch-register decisions recorded in
+                                             ## walk order by the planning pass; replayed
+                                             ## verbatim by the emit pass (single walk,
+                                             ## two modes — see `genProc`)
+    borrowLogF*: seq[FReg]                   ## ditto for SIMD scratch
+    borrowIdx*, borrowIdxF*: int             ## replay cursors into the logs above
+    spillCount*: int                         ## fresh-spill-slot counter (per proc): when
+                                             ## the scratch pool is exhausted, a computed
+                                             ## value is materialized into an `(s)` slot
+                                             ## `spill.N` instead of a register — so register
+                                             ## allocation never fails
     retIsFloat*: bool                        ## current proc returns a float (in v0)
     retFloatBits*: int                       ## width (32/64) of the float return type
     rodata*: seq[(string, string)]           ## module-level string literals
