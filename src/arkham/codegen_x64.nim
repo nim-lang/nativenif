@@ -193,6 +193,7 @@ proc emitStore(g: var CodeGen; l: Lvalue; src: Reg)
 proc genTypeBody(g: var CodeGen; c: var Cursor)
 proc emitGlobalInits(g: var CodeGen)
 proc framePop(g: var CodeGen)
+proc killFrameRegLocals(g: var CodeGen)
 proc genIntoF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int)
 proc emitLoadF(g: var CodeGen; l: Lvalue; dest: FReg; bits: int)
 
@@ -201,6 +202,12 @@ proc emitLoadF(g: var CodeGen; l: Lvalue; dest: FReg; bits: int)
 proc emRegLocalVar(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   ## Declare `(var :name (reg) type)` and bind `r` to `name` for the rest of its
   ## scope, so subsequent uses emit the typed name instead of `(reg)`.
+  # If `r` still holds an earlier, now-dead local (the allocator early-freed it at
+  # its last use and reassigned the register here), `kill` that binding first —
+  # nifasm forbids binding a still-live register. The kill lands at this rebind,
+  # past the dead var's coarse free point, hence on its post-dominating path.
+  if g.regLocal.hasKey(r):
+    g.ab.tree KillX64: g.ab.sym g.regLocal[r]
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
   g.ab.reg r                                   # the concrete register (the binding)
@@ -223,10 +230,12 @@ proc enterScope(g: var CodeGen) = g.scopeLocals.add @[]
 proc exitScope(g: var CodeGen) =
   ## `kill` each register local declared in the closing scope so the allocator's
   ## register reuse in a sibling scope rebinds cleanly (nifasm forbids binding a
-  ## still-live register).
+  ## still-live register). Skip any whose register was already rebound to a later
+  ## local (already killed at that rebind).
   for it in g.scopeLocals.pop():
-    g.ab.tree KillX64: g.ab.sym it.name
-    g.regLocal.del it.reg
+    if g.regLocal.getOrDefault(it.reg, "") == it.name:
+      g.ab.tree KillX64: g.ab.sym it.name
+      g.regLocal.del it.reg
 
 # ── stack-slot declarations + memory operands (x86 addressing) ───────────────
 # nifasm keeps field names / element types, so a memory operand stays symbolic:
@@ -1804,6 +1813,7 @@ proc genStmt(g: var CodeGen; c: var Cursor) =
             g.genIntoF(c, FloatRet, g.retFloatBits)   # float result in xmm0
           else:
             g.genInto(c, RAX)
+      g.killFrameRegLocals()                  # release locals bound to popped regs
       g.framePop()                            # restore callee-saved before returning
       g.ab.keyword RetX64
   else:
@@ -2062,6 +2072,18 @@ proc framePush(g: var CodeGen) =
   for r in g.frameRegs:
     g.ab.tree PushX64: g.ab.reg r                          # raw push
 
+proc killFrameRegLocals(g: var CodeGen) =
+  ## Before an explicit-`ret` `framePop`, release any register-local bound to a
+  ## callee-saved register the epilogue is about to `pop` raw — nifasm forbids a
+  ## raw use of a still-bound register, and at a return every local is dead. The
+  ## binding is dropped so the trailing `exitScope` does not double-kill it.
+  ## (A second `ret` reached on another path that needs the same callee register
+  ## bound is the pre-existing multi-`ret` limitation — out of scope here.)
+  for r in g.frameRegs:
+    if g.regLocal.hasKey(r):
+      g.ab.tree KillX64: g.ab.sym g.regLocal[r]
+      g.regLocal.del r
+
 proc framePop(g: var CodeGen) =
   # Release the nifasm-managed `(s)` slot region first (reverse of the prologue,
   # which lowered rsp by the pad then the `(ssize)` block), then the alignment pad
@@ -2206,7 +2228,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   # Unlike A64 (where a thread-local goes through a TLV-descriptor thunk call), x64
   # reads/writes a tvar directly as an FS-segment operand — no call — so tvar
   # accesses must NOT mark the proc non-leaf. Hence the empty tvar set here.
-  let an = analyseProc(info.decl)
+  let an = analyseProc(g.buf[], info.decl)
   g.varType.clear()                           # reuse the backing storage across procs
   g.symType.clear()
   g.retAggrName = ""; g.retIndirect = false; g.retIsFloat = false

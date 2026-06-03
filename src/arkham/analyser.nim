@@ -27,6 +27,14 @@ type
     defs*, usages*: int        ## how often the variable is defined / used
     weight*: int               ## usages, but loop bodies count `LoopWeight`×
     props*: VarProps
+    freeAfter*: int            ## token position after which the variable is dead:
+                               ## the end of the statement (at the var's own scope
+                               ## level) containing its last use. A single, coarse,
+                               ## post-dominating free point — so a use inside an
+                               ## `if`/`while` frees after the whole construct.
+    frameIdx*: int             ## index of the var's declaring scope frame
+    declInLoop*: bool          ## declared inside a loop → not early-freed (a later
+                               ## loop-body decl could reuse the reg across the back-edge)
 
   ProcAnalysis* = object
     vars*: Table[string, VarInfo]
@@ -40,12 +48,21 @@ type
     inLoops, inAddr, inAsgnTarget, inArrayIndex: int
     res: ProcAnalysis
     scopes: seq[Scope]
+    stmtEnd: seq[int]          ## per open scope frame: end position of the
+                               ## statement it is currently processing
+    buf: ptr TokenBuf          ## for cursor → token-position mapping
     tvars: HashSet[string]     ## thread-local var names: a reference acts like a call
 
 const
   LoopWeight = 3   ## assume a loop body runs ~3× for weighting purposes
 
+proc posOf(c: Context; cur: Cursor): int {.inline.} =
+  cursorToPosition(c.buf[], cur)
+
 proc openScope(c: var Context) =
+  ## A *variable* scope (for `AllRegs`/`hasCall`). Only a `scope` (and the proc's
+  ## outermost) opens one — a `stmts` is a statement list within the current
+  ## scope, NOT a fresh scope (matching the register allocator).
   c.scopes.add Scope()
 
 proc closeScope(c: var Context) =
@@ -56,6 +73,19 @@ proc closeScope(c: var Context) =
   elif c.scopes.len > 0:
     # a scope "has a call" if any inner scope did
     c.scopes[^1].hasCall = true
+
+template stmtList(c: var Context; n: var Cursor; body: untyped) =
+  ## Walk a statement list (`stmts`/`scope` body), tracking the end position of
+  ## each child statement in a fresh `stmtEnd` frame — this is the granularity at
+  ## which a local's coarse `freeAfter` is recorded. Independent of variable
+  ## scoping above (a `stmts` is a statement list but not a variable scope).
+  c.stmtEnd.add 0
+  n.into:
+    while n.hasMore:
+      var e = n; skip e                   # end position of this child statement
+      c.stmtEnd[^1] = posOf(c, e)
+      body
+  discard c.stmtEnd.pop()
 
 proc analyse(c: var Context; n: var Cursor)
 
@@ -71,7 +101,8 @@ proc analyseVarDecl(c: var Context; n: var Cursor) =
     skip n                       # pragmas
     skip n                       # type
     let hasValue = n.kind != DotToken
-    c.res.vars[vn] = VarInfo(defs: ord(hasValue))
+    c.res.vars[vn] = VarInfo(defs: ord(hasValue), freeAfter: c.stmtEnd[^1],
+                             frameIdx: c.stmtEnd.high, declInLoop: c.inLoops > 0)
     c.scopes[^1].vars.add vn
     if hasValue: analyse(c, n)   # analyse the initializer
     else: inc n                  # consume the `.`
@@ -86,6 +117,10 @@ proc analyse(c: var Context; n: var Cursor) =
       else: inc e.usages
       # each use counts; uses inside loops count `LoopWeight`× per nesting level
       inc e.weight, 1 + c.inLoops * LoopWeight
+      # extend the (coarse) live range to the end of the enclosing statement at the
+      # variable's OWN scope level — so a use nested in an `if`/`while` keeps it live
+      # until after that whole construct (a single, post-dominating free point).
+      e.freeAfter = max(e.freeAfter, c.stmtEnd[e.frameIdx])
       if (c.inAddr + c.inArrayIndex) > 0:
         # arrays / address-taken locals cannot live in a register
         e.props.incl AddrTaken
@@ -124,11 +159,12 @@ proc analyse(c: var Context; n: var Cursor) =
         else: skip n
       else:
         analyseChildren(c, n)           # generic expression: recurse
-    of StmtsS, ScopeS:
+    of ScopeS:                          # a variable scope AND a statement list
       c.openScope()
-      n.into:
-        while n.hasMore: analyse(c, n)
+      stmtList(c, n): analyse(c, n)
       c.closeScope()
+    of StmtsS:                          # a statement list only (not a fresh scope)
+      stmtList(c, n): analyse(c, n)
     of CallS:
       analyseChildren(c, n)
       c.scopes[^1].hasCall = true
@@ -160,16 +196,20 @@ proc analyseParams(c: var Context; params: var Cursor) =
       params.into:                      # (param …)
         assert params.kind == SymbolDef
         let vn = symName(params); inc params
-        c.res.vars[vn] = VarInfo(defs: 1)   # a parameter always has a value
+        # Params are never early-freed (the allocator manages them separately), so
+        # pin their live range to the whole proc.
+        c.res.vars[vn] = VarInfo(defs: 1, freeAfter: high(int))
         c.scopes[^1].vars.add vn
         while params.hasMore: skip params   # pragmas, type
         # (rest consumed by into epilogue)
 
-proc analyseProc*(procDecl: Cursor; tvars: HashSet[string] = initHashSet[string]()): ProcAnalysis =
+proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
+                  tvars: HashSet[string] = initHashSet[string]()): ProcAnalysis =
   ## `procDecl` is at a `(proc name params rettype pragmas body)`. `tvars` names
-  ## the module's thread-locals so their uses force a call-like analysis.
-  var c = Context(tvars: tvars)
-  c.scopes.add Scope()                  # the always-present outermost scope
+  ## the module's thread-locals so their uses force a call-like analysis. `buf` is
+  ## the buffer `procDecl` points into (for cursor → position mapping).
+  var c = Context(tvars: tvars, buf: addr buf)
+  c.openScope()                         # the always-present outermost scope
   var n = procDecl
   assert n.stmtKind == ProcS
   n.into:
@@ -179,4 +219,5 @@ proc analyseProc*(procDecl: Cursor; tvars: HashSet[string] = initHashSet[string]
     skip n                              # pragmas
     analyse(c, n)                       # body
   c.res.hasCall = c.scopes[0].hasCall
+  c.closeScope()                        # propagate AllRegs to the body's locals
   result = ensureMove c.res

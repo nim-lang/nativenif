@@ -109,6 +109,18 @@ proc framePop(g: var CodeGen) =
     i -= 2
   g.emPair(LdpA64, FP, LR, 16)
 
+proc killFrameRegLocals(g: var CodeGen) =
+  ## Before an explicit-`ret` `framePop`, release any register-local bound to a
+  ## callee-saved register the epilogue restores raw — nifasm forbids a raw use of
+  ## a still-bound register, and at a return every local is dead. The binding is
+  ## dropped so the trailing `exitScope` does not double-kill it. (A second `ret`
+  ## on another path needing the same callee register bound is the pre-existing
+  ## multi-`ret` limitation — out of scope here.)
+  for r in g.frameRegs:
+    if g.regLocal.hasKey(r):
+      g.ab.tree KillA64: g.ab.sym g.regLocal[r]
+      g.regLocal.del r
+
 proc framePushBytes(g: CodeGen): int =
   ## Bytes `framePush` lowers SP by: the fp/lr pair plus each saved callee-saved
   ## GPR / SIMD pair (16 bytes apiece). Used to address incoming stack arguments
@@ -1023,6 +1035,11 @@ proc emRegLocalVar(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   ## `(var :name (reg) type)` + bind `r` to `name` for its scope. arkham keeps
   ## scalars 64-bit in registers (width/signedness via explicit extends), so an
   ## int/uint/bool/char local is declared `(i 64)`; a pointer keeps `(ptr T)`.
+  # If `r` still holds an earlier, now-dead local (the allocator early-freed it at
+  # its last use and reassigned the register here), `kill` that binding first —
+  # nifasm forbids binding a still-live register.
+  if g.regLocal.hasKey(r):
+    g.ab.tree KillA64: g.ab.sym g.regLocal[r]
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
   g.ab.reg r
@@ -1038,9 +1055,12 @@ proc emRegLocalVar(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
 proc enterScope(g: var CodeGen) = g.scopeLocals.add @[]
 
 proc exitScope(g: var CodeGen) =
+  ## Skip any local whose register was already rebound to a later one (already
+  ## killed at that rebind via emRegLocalVar).
   for it in g.scopeLocals.pop():
-    g.ab.tree KillA64: g.ab.sym it.name
-    g.regLocal.del it.reg
+    if g.regLocal.getOrDefault(it.reg, "") == it.name:
+      g.ab.tree KillA64: g.ab.sym it.name
+      g.regLocal.del it.reg
 
 proc genVarDecl(g: var CodeGen; c: var Cursor) =
   ## `(var :name pragmas type value)`. Scalars land in their allocated register;
@@ -1729,6 +1749,7 @@ proc genStmt(g: var CodeGen; c: var Cursor) =
           g.genIntoF(c, FloatRet, g.retFloatBits)   # float result in v0
         else:
           g.genInto(c, IntRet)
+    g.killFrameRegLocals()                    # release locals bound to restored regs
     if g.ra.hasStackVars:                     # release nifasm-managed slots
       g.ab.tree AddA64: g.emReg SP; g.ab.keyword SsizeX
     if g.hasFrame: framePop(g)
@@ -1916,7 +1937,7 @@ proc emitSignature(g: var CodeGen; decl: Cursor; declarative: bool) =
 proc emitGlobalInits(g: var CodeGen)
 
 proc genProc(g: var CodeGen; info: ProcInfo) =
-  let an = analyseProc(info.decl, g.tvarNames)
+  let an = analyseProc(g.buf[], info.decl, g.tvarNames)
   g.varType = initTable[string, string]()     # per-proc (symbol names recycle)
   g.symType = initTable[string, Cursor]()
   g.regLocal = initTable[Reg, string]()        # per-proc named-local bindings

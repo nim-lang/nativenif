@@ -25,7 +25,7 @@
 ## reuse it); the union of callee-saved registers ever used drives the
 ## prologue/epilogue.
 
-import std / [tables, assertions]
+import std / [tables, sets, assertions]
 import nifcore, nifcdecl, slots, machinedesc, analyser, programs
 
 type
@@ -52,6 +52,10 @@ type
     freeCalleeF: set[FReg]            ## callee-saved SIMD pool (v8–v15)
     scopeVars: seq[seq[string]]       ## register-eligible locals per open scope
                                       ## (steal candidates; freed by current loc)
+    pendingFree: seq[tuple[pos: int; name: string]]  ## locals to free at their
+                                      ## coarse `freeAfter` position (last-use end)
+    freedSyms: HashSet[string]        ## locals already early-freed: skipped by
+                                      ## `trySteal` (dead) and `closeScope` (no re-free)
 
 proc posOf(b: Builder; c: Cursor): int {.inline.} =
   cursorToPosition(b.buf[], c)
@@ -121,12 +125,31 @@ proc weightOf(b: Builder; name: string): int {.inline.} =
 
 # ── scope-based walk that allocates locals ──────────────────────────────────
 
+proc flushFree(b: var Builder; curpos: int) =
+  ## Return to the pool the registers of locals whose coarse last-use end position
+  ## (`freeAfter`) has been passed, so a later local in the same scope can reuse
+  ## them — the early-free that keeps live ranges short. Freed by the var's
+  ## *current* location (an evicted var frees nothing). Idempotent w.r.t.
+  ## `closeScope`, which skips already-freed names.
+  var i = 0
+  while i < b.pendingFree.len:
+    if b.pendingFree[i].pos <= curpos:
+      let name = b.pendingFree[i].name
+      let loc = b.ra.locs[b.ra.symPos[name]]
+      if loc.kind == InReg: b.giveBack loc.r
+      elif loc.kind == InFReg: b.giveBackF loc.f
+      b.freedSyms.incl name
+      b.pendingFree.del i              # swap-remove; order is irrelevant
+    else: inc i
+
 proc openScope(b: var Builder) = b.scopeVars.add @[]
 proc closeScope(b: var Builder) =
   ## Return registers to the pool, keyed by each var's *current* location —
   ## so a var that was evicted to the stack (its reg stolen by a hotter one)
   ## frees nothing, and the thief frees the register when its own scope ends.
+  ## Already early-freed vars are skipped (their reg may now belong to a reuser).
   for v in b.scopeVars.pop():
+    if v in b.freedSyms: continue
     let loc = b.ra.locs[b.ra.symPos[v]]
     if loc.kind == InReg: b.giveBack loc.r
     elif loc.kind == InFReg: b.giveBackF loc.f
@@ -148,6 +171,7 @@ proc trySteal(b: var Builder; curName: string; curSlot: AsmSlot;
   var bestReg = NoReg
   for scope in b.scopeVars:
     for v in scope:
+      if v in b.freedSyms: continue             # already dead (early-freed)
       let vloc = b.ra.locs[b.ra.symPos[v]]
       if vloc.kind != InReg: continue
       if vloc.r in b.ra.sealed: continue        # pinned to an in-flight ABI call
@@ -194,6 +218,12 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
         b.ra.hasStackVars = true
       b.record(pos, name, loc)
       b.scopeVars[^1].add name
+      # Register the coarse early-free, unless declared in a loop (a later loop-body
+      # decl could reuse the reg across the back-edge). Stored by name so the flush
+      # frees the var's *current* reg (it may have been evicted to the stack).
+      let vi = b.an.vars.getOrDefault(name)
+      if loc.kind == InReg and not vi.declInLoop:
+        b.pendingFree.add (pos: vi.freeAfter, name: name)
 
 proc walk(b: var Builder; n: var Cursor) =
   case n.stmtKind
@@ -204,11 +234,15 @@ proc walk(b: var Builder; n: var Cursor) =
   of ScopeS:                                 # only a `scope` opens a fresh scope
     openScope(b)
     n.into:
-      while n.hasMore: walk(b, n)
+      while n.hasMore:
+        walk(b, n)
+        flushFree(b, b.posOf(n))             # free locals dead as of this boundary
     closeScope(b)
   of StmtsS:                                  # a statement list — NOT a fresh scope
     n.into:
-      while n.hasMore: walk(b, n)
+      while n.hasMore:
+        walk(b, n)
+        flushFree(b, b.posOf(n))
   else:
     if n.kind == TagLit:
       n.into:

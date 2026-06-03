@@ -2891,7 +2891,9 @@ proc parseDest(n: var Cursor; ctx: var GenContext): Operand =
   elif n.kind == Symbol:
     let name = getSym(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
-    if sym != nil and sym.kind == skVar:
+    # A param (skParam) is bound to a register / stack slot exactly like a var, so
+    # it is a valid destination too (mirrors parseDestA64 and the source paths).
+    if sym != nil and (sym.kind == skVar or sym.kind == skParam):
        if sym.typ.isOnStack:
          # Return StackOffT - operations like `add` will reject this at type check
          result.kind = okMem
