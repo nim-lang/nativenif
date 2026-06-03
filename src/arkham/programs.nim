@@ -44,21 +44,16 @@ type
     isEntry*: bool
 
   Module = ref object
-    ## A loaded foreign module. Buffers are owned here so the cursors into them
-    ## stay valid for the program's lifetime. Two modes:
-    ##  * **indexed** — the `.nif` carries a `.indexat`/`.index` (real hexer
-    ##    output): keep the reader open and parse just the *one* requested
-    ##    declaration by `jumpTo`-ing its indexed byte offset (lazy, O(1) per
-    ##    symbol — system.nim is 438 KB, we never parse it whole).
-    ##  * **whole-file** — no index (e.g. hand-written tests): parse the file
-    ##    once and index its top-level type decls by scanning.
-    hasIndex: bool
-    r: Reader                               ## open reader (indexed mode: lazy jumps)
-    index: Table[string, int]               ## symbol → absolute byte offset (indexed)
-    decls: Table[string, Cursor]            ## parsed-decl cache (both modes)
-    declBufs: seq[TokenBuf]                 ## per-decl buffers, kept alive (indexed)
-    wholeBuf: TokenBuf                      ## whole-file buffer (fallback)
-    wholeTypes: Table[string, Cursor]       ## all `(type …)` decls (fallback)
+    ## A loaded foreign module. Every NIF module carries a `.indexat`/`.index`
+    ## (hexer output, and `nimony/tools/reindex.nim` ensures even hand-written
+    ## test fixtures have one): we keep the reader open and parse just the *one*
+    ## requested declaration by `jumpTo`-ing its indexed byte offset (lazy, O(1)
+    ## per symbol — system.nim is 438 KB, we never parse it whole). Buffers are
+    ## owned here so the cursors into them stay valid for the program's lifetime.
+    r: Reader                               ## open reader (lazy per-symbol jumps)
+    index: Table[string, int]               ## symbol → absolute byte offset
+    decls: Table[string, Cursor]            ## parsed-decl cache
+    declBufs: seq[TokenBuf]                 ## per-decl buffers, kept alive
 
   Program* = object
     externOrder*: seq[Extern]               ## extproc decls, in order (main module)
@@ -77,25 +72,6 @@ type
     loaded: Table[string, Module]           ## module suffix → loaded foreign module
 
   TypeEnv* = Table[string, Cursor]          ## a type-symbol table
-
-# ── pass 0: index a module's top-level type declarations ────────────────────
-
-proc indexTypes(buf: var TokenBuf): Table[string, Cursor] =
-  ## Map every top-level `(type :name …)` in `buf` to its declaration cursor.
-  result = initTable[string, Cursor]()
-  var c = buf.beginRead()
-  if c.stmtKind != StmtsS: return
-  c.into:
-    while c.hasMore:
-      if c.stmtKind == TypeS:
-        let typeStart = c
-        var tc = c
-        tc.into:
-          result[symName(tc)] = typeStart
-          while tc.hasMore: skip tc           # drain so `into` stays balanced
-        skip c
-      else:
-        skip c
 
 # ── pass 0: collect the main module's top-level declarations ────────────────
 
@@ -270,49 +246,40 @@ proc readEmbeddedIndex(r: var Reader): Table[string, int] =
 
 proc loadModule(p: var Program; suffix: string): Module =
   ## Load (and cache) the foreign module identified by `suffix`. Its file is
-  ## `<dir-of-main>/<suffix><ext-of-main>` (the same scheme nifc uses). An
-  ## embedded `.indexat` index enables lazy per-symbol parsing; otherwise the
-  ## whole file is parsed once and its type decls indexed by scanning.
+  ## `<dir-of-main>/<suffix><ext-of-main>` (the same scheme nifc uses). The file
+  ## must carry an embedded `.indexat` index (run `nimony/tools/reindex.nim` on
+  ## hand-written fixtures); we keep the reader open for lazy per-symbol jumps.
   if p.loaded.hasKey(suffix): return p.loaded[suffix]
   var sc = p.scheme
   sc.name = suffix
   let path = $sc
   let m = Module()
   m.r = nifreader.open(path)                  # reads directives → sets `.indexat`
-  if indexStartsAt(m.r) > 0:
-    m.hasIndex = true
-    m.index = readEmbeddedIndex(m.r)
-  else:
-    m.hasIndex = false
-    m.wholeBuf = parseFromFile(path, sharedTags = p.tags)
-    m.wholeTypes = indexTypes(m.wholeBuf)
+  if indexStartsAt(m.r) <= 0:
+    raiseAssert "arkham: module has no embedded index (reindex it): " & path
+  m.index = readEmbeddedIndex(m.r)
   p.loaded[suffix] = m
   result = m
 
 proc hasDecl(m: Module; name: string): bool =
-  m.decls.hasKey(name) or
-    (if m.hasIndex: m.index.hasKey(name) else: m.wholeTypes.hasKey(name))
+  m.decls.hasKey(name) or m.index.hasKey(name)
 
 proc getDecl(p: var Program; m: Module; name: string): Cursor =
-  ## The declaration cursor for `name` (precondition: `hasDecl`). In indexed
-  ## mode this `jumpTo`s the symbol's byte offset and parses just that one tree
-  ## into its own buffer (kept alive in `declBufs`); in whole-file mode it
-  ## returns the pre-scanned cursor. Cached either way.
+  ## The declaration cursor for `name` (precondition: `hasDecl`). `jumpTo`s the
+  ## symbol's byte offset and parses just that one tree into its own buffer
+  ## (kept alive in `declBufs`). Cached.
   if m.decls.hasKey(name): return m.decls[name]
-  if m.hasIndex:
-    m.r.jumpTo(m.index[name])
-    var buf = createTokenBuf(64, nil, p.tags)
-    parse(m.r, buf)                           # exactly one `(type …)` tree
-    # Take the cursor on the LOCAL buffer *before* moving it into `declBufs`
-    # (the nifc/nimony pattern, see nifmodules.getDeclOrNil): `beginRead`
-    # installs the buffer's ref-counted cursor owner, which then travels with
-    # the buffer when `declBufs` later grows and relocates its elements.
-    # Doing `beginRead` on the already-stored seq element instead corrupts the
-    # heap once a second decl forces the seq to reallocate.
-    result = beginRead(buf)
-    m.declBufs.add ensureMove(buf)
-  else:
-    result = m.wholeTypes[name]
+  m.r.jumpTo(m.index[name])
+  var buf = createTokenBuf(64, nil, p.tags)
+  parse(m.r, buf)                             # exactly one `(type …)` tree
+  # Take the cursor on the LOCAL buffer *before* moving it into `declBufs`
+  # (the nifc/nimony pattern, see nifmodules.getDeclOrNil): `beginRead`
+  # installs the buffer's ref-counted cursor owner, which then travels with
+  # the buffer when `declBufs` later grows and relocates its elements.
+  # Doing `beginRead` on the already-stored seq element instead corrupts the
+  # heap once a second decl forces the seq to reallocate.
+  result = beginRead(buf)
+  m.declBufs.add ensureMove(buf)
   m.decls[name] = result
 
 proc lookupType*(p: var Program; name: string): Cursor =
