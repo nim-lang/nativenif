@@ -20,7 +20,7 @@
 
 import std / [tables, assertions]
 import nifcore, nifcdecl, nifcoreparse
-import slots
+import slots, nifmodules
 import "../../../nimony/src/lib" / [symparser, nifreader, stringviews]
 
 type
@@ -45,18 +45,6 @@ type
     decl*: Cursor            ## the `(proc …)` declaration
     isEntry*: bool
 
-  Module = ref object
-    ## A loaded foreign module. Every NIF module carries a `.indexat`/`.index`
-    ## (hexer output, and `nimony/tools/reindex.nim` ensures even hand-written
-    ## test fixtures have one): we keep the reader open and parse just the *one*
-    ## requested declaration by `jumpTo`-ing its indexed byte offset (lazy, O(1)
-    ## per symbol — system.nim is 438 KB, we never parse it whole). Buffers are
-    ## owned here so the cursors into them stay valid for the program's lifetime.
-    r: Reader                               ## open reader (lazy per-symbol jumps)
-    index: Table[string, int]               ## symbol → absolute byte offset
-    decls: Table[string, Cursor]            ## parsed-decl cache
-    declBufs: seq[TokenBuf]                 ## per-decl buffers, kept alive
-
   Program* = object
     externOrder*: seq[Extern]               ## extproc decls, in order (main module)
     callTarget*: Table[string, CallTarget]  ## NIFC proc symbol → how to call it
@@ -71,7 +59,7 @@ type
     # ── cross-module machinery ──
     scheme: SplittedModulePath              ## path template (dir/<module>.ext)
     tags: TagPool                           ## shared tag pool for parsing foreign modules
-    loaded: Table[string, Module]           ## module suffix → loaded foreign module
+    loaded: Table[string, ForeignModule]    ## module suffix → loaded foreign module
     procPtr*: Cursor                        ## a synthesized `(proctype)` — the code-pointer
                                             ## type of a proc used as a value. A nifcore
                                             ## Cursor keeps its own backing alive (refcounted
@@ -150,7 +138,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool): Program =
                    typeDecls: initTable[string, Cursor](),
                    globals: initTable[string, Cursor](),
                    tvars: initTable[string, Cursor](),
-                   loaded: initTable[string, Module](),
+                   loaded: initTable[string, ForeignModule](),
                    scheme: splitModulePath(inputPath), tags: tags)
   block:
     # A standalone `(proctype)` parsed against the shared tag pool; its cursor
@@ -231,72 +219,21 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool): Program =
 
 # ── cross-module type lookup (lazy foreign-module loading) ──────────────────
 
-proc readEmbeddedIndex(r: var Reader): Table[string, int] =
-  ## Read the embedded `(.index (h sym Δoff) (x sym Δoff) …)` section located by
-  ## the `.indexat` directive, returning `symbol → absolute byte offset`. Offsets
-  ## are stored delta-encoded (cumulative); `h`=hidden, `x`=exported (we keep
-  ## both). Mirrors `nifindexes.readEmbeddedIndex`, but over the nifcore reader.
-  result = initTable[string, int]()
-  let indexPos = indexStartsAt(r)
-  if indexPos <= 0: return
-  r.jumpTo(indexPos)
-  var prev = 0
-  var t = default(ExpandedToken)
-  next(r, t)                                  # `(.index`
-  if not (t.tk == ParLe and t.data == ".index"): return
-  next(r, t)
-  while t.tk != EofToken and t.tk != ParRi:
-    if t.tk == ParLe:                         # entry: `(h sym Δoff)` / `(x sym Δoff)`
-      next(r, t)                              # the symbol
-      var key = ""
-      if t.tk == Symbol: key = decodeStr(r, t)
-      next(r, t)                              # the (delta) offset
-      if t.tk == IntLit:
-        let off = int(decodeInt t) + prev
-        if key.len > 0: result[key] = off
-        prev = off
-      next(r, t)                              # closing `)`
-      if t.tk == ParRi: next(r, t)
-    else:
-      next(r, t)
-
-proc loadModule(p: var Program; suffix: string): Module =
+proc loadModule(p: var Program; suffix: string): ForeignModule =
   ## Load (and cache) the foreign module identified by `suffix`. Its file is
   ## `<dir-of-main>/<suffix><ext-of-main>` (the same scheme nifc uses). The file
   ## must carry an embedded `.indexat` index (run `nimony/tools/reindex.nim` on
-  ## hand-written fixtures); we keep the reader open for lazy per-symbol jumps.
+  ## hand-written fixtures); the shared `nifmodules` loader keeps the reader open
+  ## for lazy per-symbol jumps.
   if p.loaded.hasKey(suffix): return p.loaded[suffix]
   var sc = p.scheme
   sc.name = suffix
   let path = $sc
-  let m = Module()
-  m.r = nifreader.open(path)                  # reads directives → sets `.indexat`
-  if indexStartsAt(m.r) <= 0:
+  let m = openForeignModule(path)
+  if not m.hasEmbeddedIndex:
     raiseAssert "arkham: module has no embedded index (reindex it): " & path
-  m.index = readEmbeddedIndex(m.r)
   p.loaded[suffix] = m
   result = m
-
-proc hasDecl(m: Module; name: string): bool =
-  m.decls.hasKey(name) or m.index.hasKey(name)
-
-proc getDecl(p: var Program; m: Module; name: string): Cursor =
-  ## The declaration cursor for `name` (precondition: `hasDecl`). `jumpTo`s the
-  ## symbol's byte offset and parses just that one tree into its own buffer
-  ## (kept alive in `declBufs`). Cached.
-  if m.decls.hasKey(name): return m.decls[name]
-  m.r.jumpTo(m.index[name])
-  var buf = createTokenBuf(64, nil, p.tags)
-  parse(m.r, buf)                             # exactly one `(type …)` tree
-  # Take the cursor on the LOCAL buffer *before* moving it into `declBufs`
-  # (the nifc/nimony pattern, see nifmodules.getDeclOrNil): `beginRead`
-  # installs the buffer's ref-counted cursor owner, which then travels with
-  # the buffer when `declBufs` later grows and relocates its elements.
-  # Doing `beginRead` on the already-stored seq element instead corrupts the
-  # heap once a second decl forces the seq to reallocate.
-  result = beginRead(buf)
-  m.declBufs.add ensureMove(buf)
-  m.decls[name] = result
 
 proc lookupType*(p: var Program; name: string): Cursor =
   ## The `(type :name …)` declaration for `name`, resolving across modules. A
@@ -318,7 +255,7 @@ proc lookupType*(p: var Program; name: string): Cursor =
   let m = loadModule(p, s.module)
   if not hasDecl(m, name):
     raiseAssert "arkham: type " & name & " not found in module " & s.module
-  let d = getDecl(p, m, name)
+  let d = getDecl(m, name, p.tags)
   p.typeDecls[name] = d
   p.requestedForeign.add (name, d)
   result = d
@@ -335,7 +272,7 @@ proc lookupForeignDecl*(p: var Program; name: string; found: var bool): Cursor =
   if s.module.len == 0 or s.module == p.scheme.name: return
   let m = loadModule(p, s.module)
   if not hasDecl(m, name): return
-  result = getDecl(p, m, name)
+  result = getDecl(m, name, p.tags)
   p.requestedForeign.add (name, result)
   found = true
 
@@ -348,7 +285,7 @@ proc foreignCallTarget*(p: var Program; name: string): CallTarget =
     "arkham: not a foreign proc: " & name
   let m = loadModule(p, s.module)
   assert hasDecl(m, name), "arkham: foreign proc not found: " & name
-  let declCur = getDecl(p, m, name)
+  let declCur = getDecl(m, name, p.tags)
   var d = declCur
   var retFloat = false
   var retType: Cursor
