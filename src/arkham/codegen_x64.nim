@@ -22,6 +22,11 @@ import nifcore, nifcdecl
 import slots, machinedesc, analyser, register_allocator, programs
 import asmbuf, codegen_common, machine_x64
 
+const TlsBlockName = "arkham.tls.0"
+  ## The static block FS points at (see `emitTlsSetup`); a tvar lives at
+  ## `FS:[offset]`, i.e. `&arkham.tls.0 + offset`. Distinct basename so nifasm's
+  ## scope keys it uniquely.
+
 # ── scratch register pool ────────────────────────────────────────────────────
 
 proc emReg(g: var CodeGen; r: Reg) {.inline.} =
@@ -497,6 +502,22 @@ proc emitAddrLoc(g: var CodeGen; loc: Location; dest: Reg) =
   of NamedStack:                              # (lea dest (rsp) name)
     g.ab.tree LeaX64: (g.emReg dest; g.ab.reg RSP; g.ab.sym loc.name)
   of Glob: g.emGlobalAddr(dest, loc.name)     # &global → RIP-relative lea
+  of Tvar:
+    # &threadvar = FS base + the tvar's offset. nifasm owns the offset; arkham owns
+    # the FS base — the static block `arkham.tls.0` it points FS at (emitTlsSetup),
+    # i.e. the base of the TLS array. A single `lea dest, (base) tvar` folds the
+    # offset nifasm knows into the lea displacement: one scratch register, and no
+    # pointer arithmetic (a tvar's address is a single-element `ptr`, on which
+    # nifasm — by design — forbids `add`/`sub`).
+    if loc.name notin g.tvarNames:
+      raiseAssert "arkham x64: address-of a foreign thread-local (module-system TODO): " & loc.name
+    let base = g.borrowTmp()
+    g.emGlobalAddr(base, TlsBlockName)                    # base ← &arkham.tls.0 (FS base)
+    g.ab.tree LeaX64:                                     # dest ← base + tvar.offset = &tvar
+      g.emReg dest
+      g.emReg base
+      g.ab.sym loc.name
+    g.giveBack base
   of Mem:
     var nn = loc.cur
     if nn.kind == TagLit and nn.exprKind == DerefC:   # &(deref p) == p
@@ -2393,7 +2414,6 @@ proc emitStackParamLoadsX64(g: var CodeGen; decl: Cursor) =
 # per-thread == per-process. Non-zero literal initializers are stored at entry
 # (the block is zero-filled); nifasm bakes no x64 TLS init template.
 
-const TlsBlockName = "arkham.tls.0"  # distinct basename so nifasm's scope keys it uniquely
 const ArchSetFs = 0x1002             # arch_prctl(2) subfunction
 const ArchPrctlNr = 158              # Linux x86-64 syscall number
 

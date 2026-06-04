@@ -4066,10 +4066,16 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       elif n.kind == Symbol:
         let offsetName = getSym(n)
         let offsetSym = lookupWithAutoImport(ctx, ctx.scope, offsetName, n)
-        if offsetSym != nil and (offsetSym.kind == skVar or offsetSym.kind == skParam) and offsetSym.typ.isOnStack:
+        if offsetSym != nil and offsetSym.kind == skTvar:
+          # `lea dest, (fsbase) tvar` ⇒ dest = fsbase + tvar.offset = &tvar. A
+          # thread-local has no link-time address (it lives at FS_base + offset);
+          # nifasm owns the offset, the caller supplies the FS-base register, and
+          # the offset folds into the lea displacement — no pointer arithmetic.
+          displacement = int32(offsetSym.offset)
+        elif offsetSym != nil and (offsetSym.kind == skVar or offsetSym.kind == skParam) and offsetSym.typ.isOnStack:
           displacement = int32(offsetSym.offset)
         else:
-          error("Expected stack variable or integer offset in lea", n)
+          error("Expected stack variable, thread-local, or integer offset in lea", n)
         inc n
       else:
         error("Expected offset (integer or stack variable) in lea", n)

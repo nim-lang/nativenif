@@ -88,7 +88,7 @@ proc arkhamTests() =
 
 # Tests whose arm64 codegen relies on Darwin-only facilities (TLV thread-locals),
 # so they cannot run in the static Linux/ELF `linux_arm64` mode under qemu.
-const arkhamLinuxA64Unsupported = ["tvar", "tvar_param"]
+const arkhamLinuxA64Unsupported = ["tvar", "tvar_param", "tvar_addr"]
 
 proc arkhamQemuTests() =
   ## Cross-validate the AArch64 backend on Linux: emit each `tests/arkham/*.c.nif`
