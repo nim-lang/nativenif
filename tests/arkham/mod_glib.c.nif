@@ -1,0 +1,9 @@
+(.nif27)
+(.indexat 108              )
+(stmts
+ (gvar :counter.0. .
+  (i 64)100)
+ (const :tag.0. .
+  (i 64)5))(.index
+ (h counter.0. 44)
+ (h tag.0. 34))
