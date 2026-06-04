@@ -103,8 +103,14 @@ proc allocStorage(b: var Builder; slot: AsmSlot; props: VarProps): Location =
     return b.spill(slot)
   var r: Reg
   if AllRegs in props:
-    r = b.takeReg(b.freeVol, b.md.intTempRegs)
-    if r == NoReg: r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
+    # A call-free local could legally live in a caller-saved volatile, but the
+    # integer temp pool (r10/r11 on x86-64) IS codegen's scratch pool for
+    # addressing/staging — handing those two to long-lived locals starves scratch
+    # and forces per-use eviction (reload on every reference). So prefer a
+    # callee-saved home (one prologue push/pop, then resident) and only fall back
+    # to a volatile temp when the callee-saved pool is exhausted.
+    r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
+    if r == NoReg: r = b.takeReg(b.freeVol, b.md.intTempRegs)
   else:
     # may be live across a call → must be callee-saved (or stack)
     r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)

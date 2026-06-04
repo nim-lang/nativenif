@@ -151,10 +151,15 @@ proc analyse(c: var Context; n: var Cursor) =
           inc c.inArrayIndex
           analyse(c, n)                 # the array/base
           dec c.inArrayIndex
-          let oldA = c.inAddr; let oldT = c.inAsgnTarget
-          c.inAddr = 0; c.inAsgnTarget = 0
+          # The index is a pure value at ANY nesting depth — it is read into a
+          # register, never address-taken. Reset the whole addressing context
+          # (incl. `inArrayIndex`, which is still set when this `(at)` is itself the
+          # base of an enclosing `(at)`, e.g. the inner index of `a[i][j]`), else a
+          # local used as a nested index gets wrongly forced onto the stack.
+          let oldA = c.inAddr; let oldT = c.inAsgnTarget; let oldX = c.inArrayIndex
+          c.inAddr = 0; c.inAsgnTarget = 0; c.inArrayIndex = 0
           analyse(c, n)                 # the index
-          c.inAddr = oldA; c.inAsgnTarget = oldT
+          c.inAddr = oldA; c.inAsgnTarget = oldT; c.inArrayIndex = oldX
       of AddrC:
         n.into:
           inc c.inAddr

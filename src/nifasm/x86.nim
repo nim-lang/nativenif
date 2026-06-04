@@ -335,12 +335,18 @@ proc emitImul*(dest: var Bytes; a, b: Register) =
   dest.add(encodeModRM(amDirect, int(a), int(b)))  # reg=dest(a), rm=source(b)
 
 proc emitImulImm*(dest: var Bytes; reg: Register; imm: int32) =
-  ## Emit IMUL instruction: IMUL reg, reg, imm32
+  ## Emit IMUL instruction: IMUL reg, reg, imm32 (opcode 0x69 /r id).
+  ## ModRM.reg is the destination, ModRM.rm the source — both are `reg` here, so an
+  ## extended register (r8–r15) needs BOTH REX.R (reg/dest field) and REX.B (rm/src
+  ## field). Setting only REX.B drops the destination's high bit → e.g. r11 decodes
+  ## as rbx, silently clobbering it.
   var rex = RexPrefix(w: true)
 
-  if needsRex(reg): rex.b = true
+  if needsRex(reg):
+    rex.r = true
+    rex.b = true
 
-  if rex.b or rex.w:
+  if rex.r or rex.b or rex.w:
     dest.add(encodeRex(rex))
 
   dest.add(0x69)  # IMUL r64, r/m64, imm32 opcode
