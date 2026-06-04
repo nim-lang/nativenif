@@ -1,0 +1,17 @@
+(.nif27)
+(.indexat 350              )
+(stmts
+ (proc :test_direct_use.0
+  (params)
+  (result)
+  (clobber)
+  (stmts <unknown token> Bind rax to x
+   (var :x.0
+    (rax)
+    (i \2B64))<unknown token> ERROR <unknown token> Trying to use
+   (rax)directly when it <unknown token> bound to x.0
+   (mov
+    (rax)\2B42)
+   (mov
+    (rax)\2B60)
+   (syscall))))(.index)

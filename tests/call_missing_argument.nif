@@ -1,4 +1,5 @@
 (.nif27)
+(.indexat 324              )
 (stmts
  (proc :callee.0
   (params
@@ -21,4 +22,4 @@
     (mov
      (arg arg.0)1)
     (call))
-   (ret))))
+   (ret))))(.index)

@@ -1,0 +1,22 @@
+(.nif27)
+(.indexat 563              )
+(stmts
+ (proc :test_param_binding.0
+  (params
+   (param :x.0
+    (rax)
+    (i \2B64))
+   (param :y.0
+    (rbx)
+    (i \2B64)))
+  (result)
+  (clobber)
+  (stmts <unknown token> Parameters are already bound to registers <unknown token> Using the parameter name is OK
+   (mov
+    (rcx)x.0)<unknown token> ✓ OK <unknown token> use parameter by name <unknown token> ERROR <unknown token> Cannot use
+   (rax)directly because it <unknown token> bound to parameter x.0
+   (mov
+    (rax)\2B42)
+   (mov
+    (rax)\2B60)
+   (syscall))))(.index)

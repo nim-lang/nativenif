@@ -1,6 +1,8 @@
 (.nif27)
+(.indexat 104              )
 (stmts
- (type :Exists.0.mod_missing_symbol
+ (type :Exists.0.
   (object
    (fld :value.0
-    (i 64)))))
+    (i 64)))))(.index
+ (x Exists.0. 44))

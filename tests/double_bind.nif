@@ -1,4 +1,5 @@
 (.nif27)
+(.indexat 216              )
 (stmts
  (proc :test_double_bind.0
   (params)
@@ -12,4 +13,4 @@
     (rax)
     (i 64))
    (mov x.0 60)
-   (syscall))))
+   (syscall))))(.index)

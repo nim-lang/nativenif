@@ -1,6 +1,6 @@
 
 import std / [tables, sets, streams, os, osproc]
-import "../../../nimony/src/lib" / [nifreader, nifstreams, nifcursors, bitabs, lineinfos, symparser]
+import "../../../nimony/src/lib" / [nifreader, nifstreams, nifcursors, nifindexes, bitabs, lineinfos, symparser]
 import tags, model, tagconv
 import buffers, relocs, x86, arm64, elf, macho, pe
 import sem, slots
@@ -66,17 +66,23 @@ proc getInt(n: Cursor): int64 =
   else:
     error("Expected integer literal", n)
 
+template symName(n: Cursor): string =
+  ## The symbol's fully-qualified name. The NIF reader already completes the
+  ## self-module trailing-dot compression (using each module's own suffix, set
+  ## from its filename), so the interned string is module-correct as-is.
+  pool.syms[n.symId]
+
 proc getSym(n: Cursor): string =
   case n.kind
   of Symbol:
-    result = pool.syms[n.symId]
+    result = symName(n)
   else:
     error("Expected symbol", n)
 
 proc getSymDef(n: var Cursor): string =
   if n.kind != SymbolDef:
     error("Expected symbol definition", n)
-  result = pool.syms[n.symId]
+  result = symName(n)
   inc n
 
 proc getStr(n: Cursor): string =
@@ -147,9 +153,19 @@ proc parseXmm(n: var Cursor): x86.XmmRegister =
 const MainModuleName* = ""  # Special name for main module
 
 type
-  LoadedModule = object
-    buf: TokenBuf
-    stream: nifstreams.Stream
+  LoadedModule = ref object
+    ## A loaded module. The MAIN module is parsed whole into `buf` (local symbols
+    ## carry a `declStart` position into it). A FOREIGN module is opened lazily:
+    ## only its embedded NIF `.index` (symbol → byte offset) is read up front; its
+    ## declarations are parsed one at a time on demand, by following a referenced
+    ## name to its indexed offset (nominal typing). Each lazily-parsed decl tree is
+    ## kept alive in `declBufs` so the Cursors into it stay valid.
+    ## (A `ref` so a handle stays valid even if `ctx.modules` rehashes while a
+    ## decl body recursively pulls in further foreign modules.)
+    buf: TokenBuf                          # whole-module tree (main module only)
+    stream: nifstreams.Stream              # kept open for lazy per-symbol jumps
+    index: Table[string, NifIndexEntry]    # qualified symbol → byte offset
+    declBufs: seq[TokenBuf]                # lazily-parsed foreign decl trees
     loaded: bool  # True if already loaded into scope
 
   Arch = enum
@@ -183,9 +199,15 @@ type
     argsSet: HashSet[string]    # Arguments that have been assigned
     resultsSet: HashSet[string] # Results that have been bound
     stackArgSize: int           # Computed size of stack arguments (csize)
+    indirect: bool              # Target is a function-pointer variable: `typ` is its
+                                # proctype signature and `(call)` is an indirect call
+                                # through the loaded pointer (vs a direct `call rel32`)
 
   GenContext = object
-    scope: Scope
+    scope: Scope        # Current (possibly proc-local) lexical scope
+    rootScope: Scope    # Module/global scope; foreign symbols are defined here so
+                        # they persist past the proc that first referenced them
+                        # (processReachableSymbols looks them up to emit bodies).
     buf: relocs.Buffer  # Code buffer (.text section) for x64
     bssBuf: relocs.Buffer  # BSS buffer (.bss section) for zero-initialized global variables
     arch: Arch
@@ -203,6 +225,8 @@ type
     bssOffset: int  # Current offset in .bss section
     modules: Table[string, LoadedModule]  # Cache of loaded foreign modules
     baseDir: string  # Base directory for finding module files
+    thisModule: string  # The module being assembled (symbol suffix of the main file);
+                        # a `name.0.<thisModule>` reference is local, not foreign
     regBindings: Table[x86.Register, string]  # Maps registers to variable names they're bound to (x64 only)
     # Dynamic linking
     imports: seq[ImportedLib]  # Imported libraries
@@ -212,6 +236,18 @@ type
     pendingSymbols: seq[string]  # Symbols pending code generation
     generatedSymbols: HashSet[string]  # Symbols already generated
     dedupTable: Table[string, string]  # Maps dedup key to canonical symbol name
+    # Thread-local storage (x86-64). nifasm owns the unified per-thread block
+    # `arkham.tls.0` (sized for ALL bundled modules' tvars) and synthesizes the
+    # entry prologue that points FS at it (`arch_prctl`). Nim thread-locals have no
+    # initializers, so the block is just zeroed `.bss`.
+    tlsBlockSym: Symbol          # the synthetic `arkham.tls.0` gvar (FS base block)
+    entrySym: Symbol             # the entry proc (`_start`/`main.0`) — prologue jumps here
+    tlsEntryOffset: int          # .text offset of the synthesized FS-setup prologue, or -1
+    # A gvar with a compile-time constant scalar initializer is laid out as static
+    # data: arkham emits its bits as the gvar value, and these are written into the
+    # (writable) `.bss` image on disk so the slot starts with that value (correct in
+    # a bundle, where a foreign module's entry-time initializer never runs).
+    bssInits: seq[tuple[off: int64, val: int64, size: int]]  # (.bss byte offset, value, size)
 
   OperandKind = enum
     okReg       # Register operand
@@ -296,6 +332,7 @@ proc computeStackArgSize(t: Type): int =
   result = (result + 15) and not 15
 
 proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type
+proc parsePtrType(kind: TypeKind; n: var Cursor; scope: Scope; ctx: var GenContext): Type
 proc parseParams(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param]
 proc parseResult(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param]
 proc parseClobbers(n: var Cursor): set[x86.Register]
@@ -327,7 +364,7 @@ proc parseObjectBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
     if n.kind == ParLe and n.tag == FldTagId:
       inc n
       if n.kind != SymbolDef: error("Expected field name", n)
-      let name = pool.syms[n.symId]
+      let name = symName(n)
       inc n
       # NIFC `FieldDecl ::= (fld SymbolDef FieldPragmas Type)` — tolerate the
       # optional field-pragmas slot before the type.
@@ -358,154 +395,126 @@ proc parseObjectBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
 proc isRegTag(locTag: TagEnum): bool =
   rawTagIsX64Reg(locTag) or rawTagIsA64Reg(locTag)
 
-proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cursor) =
-  ## Load a foreign module and add its symbols to the scope
+proc openForeignModule(ctx: var GenContext; modname: string; n: Cursor) =
+  ## Open a foreign module for LAZY, on-demand symbol resolution: read just its
+  ## embedded NIF `.index` (symbol → byte offset) and keep the stream open. The
+  ## module's declarations are NOT parsed here — `resolveForeignSym` parses each
+  ## one only when its name is actually followed (nominal typing). Idempotent.
   if ctx.modules.hasKey(modname):
-    discard
+    return
+  var modfile = ""
+  let semchecked = ctx.baseDir / modname & ".s.nif"
+  let plain = ctx.baseDir / modname & ".nif"
+  if fileExists(semchecked):
+    modfile = semchecked
+  elif fileExists(plain):
+    modfile = plain
   else:
-    # Try to find the module file
-    # Look for modname.s.nif (semchecked) or modname.nif
-    var modfile = ""
-    let semchecked = ctx.baseDir / modname & ".s.nif"
-    let plain = ctx.baseDir / modname & ".nif"
+    error("Foreign module file not found: " & modname & " (tried: " & semchecked & ", " & plain & ")", n)
+    return
+  var stream = nifstreams.open(modfile)
+  discard processDirectives(stream.r)
+  let m = LoadedModule(stream: stream, loaded: true)
+  m.index = readEmbeddedIndex(stream)
+  if m.index.len == 0:
+    error("Foreign module has no embedded NIF index (reindex it): " & modfile, n)
+  ctx.modules[modname] = m
 
-    if fileExists(semchecked):
-      modfile = semchecked
-    elif fileExists(plain):
-      modfile = plain
+proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Scope; n: Cursor): Symbol =
+  ## Resolve ONE foreign declaration by following its qualified name through the
+  ## module's embedded index: jump to the indexed byte offset, parse just that
+  ## decl, define it in `scope`, and return it. A decl's body pulls in further
+  ## declarations the same lazy way, on demand — so forward and self/mutually-
+  ## recursive references resolve naturally regardless of file order (a pointer
+  ## pointee stays nominal via `parsePtrType`; only a by-value reference forces a
+  ## follow). The parsed tree is retained in `declBufs` to keep its Cursors valid.
+  let m = ctx.modules[modname]            # ref: stable across table growth
+  if not m.index.hasKey(fullName): return nil
+  let off = m.index[fullName].offset
+  m.stream.r.jumpTo(off)
+  var buf = fromStream(m.stream)          # exactly one balanced decl tree
+  var c = beginRead(buf)
+  let declTag = tagToNifasmDecl(c.tag)
+  case declTag
+  of TypeD:
+    inc c                                 # type tag
+    if c.kind != SymbolDef: return nil
+    discard getSymDef(c)                  # advance past the name
+    # Define a placeholder BEFORE parsing the body so a self/mutually-recursive
+    # by-value reference inside it (e.g. a proctype field whose result names this
+    # very type) resolves to this symbol instead of recursing back into here. The
+    # placeholder is filled in place, so the captured reference observes the
+    # resolved type.
+    result = Symbol(name: fullName, kind: skType, typ: Type(kind: ErrorT),
+                    isForeign: true, moduleName: modname, declStart: off)
+    ctx.rootScope.define(result)
+    var parsed: Type
+    if c.kind == ParLe and c.tag == ObjectTagId:
+      parsed = parseObjectBody(c, scope, ctx)
+    elif c.kind == ParLe and c.tag == UnionTagId:
+      parsed = parseUnionBody(c, scope, ctx)
     else:
-      error("Foreign module file not found: " & modname & " (tried: " & semchecked & ", " & plain & ")", n)
-      return
-
-    # Open and parse the module
-    var stream = nifstreams.open(modfile)
-    discard processDirectives(stream.r)
-    let buf = fromStream(stream)
-    ctx.modules[modname] = LoadedModule(buf: buf, stream: stream, loaded: false)
-
-  # Parse the module's declarations
-  var n = beginRead(ctx.modules[modname].buf)
-  if n.kind == ParLe and n.tag == StmtsTagId:
-    inc n
-    while n.kind != ParRi:
-      if n.kind == ParLe:
-        let start = n
-        let declStart = cursorToPosition(ctx.modules[modname].buf, start)
-        let declTag = tagToNifasmDecl(n.tag)
-        case declTag
-        of TypeD:
-          inc n
-          if n.kind != SymbolDef:
-            skip n
-            continue
-          let name = getSymDef(n)
-          # Extract basename (without module suffix) for lookup
-          var basename = name
-          extractBasename(basename)
-          if n.kind == ParLe and n.tag == ObjectTagId:
-            let typ = parseObjectBody(n, scope, ctx)
-            let sym = Symbol(name: basename, kind: skType, typ: typ, isForeign: true,
-                            moduleName: modname, declStart: declStart)
-            scope.define(sym)
-          elif n.kind == ParLe and n.tag == UnionTagId:
-            let typ = parseUnionBody(n, scope, ctx)
-            let sym = Symbol(name: basename, kind: skType, typ: typ, isForeign: true,
-                            moduleName: modname, declStart: declStart)
-            scope.define(sym)
-          else:
-            # Handles proc types and other types via parseType
-            let typ = parseType(n, scope, ctx)
-            let sym = Symbol(name: basename, kind: skType, typ: typ, isForeign: true,
-                            moduleName: modname, declStart: declStart)
-            scope.define(sym)
-          if n.kind != ParRi: skip n
-          inc n
-        of ProcD:
-          # Parse proc signature only (skip body)
-          inc n
-          if n.kind != SymbolDef:
-            skip n
-            continue
-          let name = getSymDef(n)
-          var basename = name
-          extractBasename(basename)
-
-          var procTyp = Type(kind: ProcT, params: @[], results: @[], clobbers: {})
-
-          # Parse params
-          if n.kind == ParLe:
-            let paramsDecl = tagToNifasmDecl(n.tag)
-            if paramsDecl == ParamsD:
-              procTyp.params = parseParams(n, scope, ctx)
-
-          # Parse result
-          if n.kind == ParLe:
-            let resultDecl = tagToNifasmDecl(n.tag)
-            if resultDecl == ResultD:
-              procTyp.results = parseResult(n, scope, ctx)
-
-          # Parse clobber
-          if n.kind == ParLe:
-            let clobberDecl = tagToNifasmDecl(n.tag)
-            if clobberDecl == ClobberD:
-              procTyp.clobbers = parseClobbers(n)
-
-          let sym = Symbol(name: basename, kind: skProc, typ: procTyp, offset: -1,
-                          isForeign: true, moduleName: modname, declStart: declStart)
-          scope.define(sym)
-
-          # Skip body
-          n = start
-          skip n
-        of GvarD:
-          inc n
-          if n.kind != SymbolDef:
-            skip n
-            continue
-          let name = getSymDef(n)
-          var basename = name
-          extractBasename(basename)
-          let typ = parseType(n, scope, ctx)
-          let sym = Symbol(name: basename, kind: skGvar, typ: typ, isForeign: true,
-                          moduleName: modname, declStart: declStart)
-          scope.define(sym)
-          n = start
-          skip n
-        of TvarD:
-          inc n
-          if n.kind != SymbolDef:
-            skip n
-            continue
-          let name = getSymDef(n)
-          var basename = name
-          extractBasename(basename)
-          let typ = parseType(n, scope, ctx)
-          let sym = Symbol(name: basename, kind: skTvar, typ: typ, isForeign: true,
-                          moduleName: modname, declStart: declStart)
-          scope.define(sym)
-          n = start
-          skip n
-        else:
-          skip n
-      else:
-        skip n
-    inc n
-
-  ctx.modules[modname].loaded = true
+      parsed = parseType(c, scope, ctx)
+    result.typ[] = parsed[]
+  of ProcD:
+    inc c
+    if c.kind != SymbolDef: return nil
+    discard getSymDef(c)
+    var procTyp = Type(kind: ProcT, params: @[], results: @[], clobbers: {})
+    if c.kind == ParLe and tagToNifasmDecl(c.tag) == ParamsD:
+      procTyp.params = parseParams(c, scope, ctx)
+    if c.kind == ParLe and tagToNifasmDecl(c.tag) == ResultD:
+      procTyp.results = parseResult(c, scope, ctx)
+    if c.kind == ParLe and tagToNifasmDecl(c.tag) == ClobberD:
+      procTyp.clobbers = parseClobbers(c)
+    result = Symbol(name: fullName, kind: skProc, typ: procTyp, offset: -1,
+                    isForeign: true, moduleName: modname, declStart: off)
+    ctx.rootScope.define(result)
+  of GvarD:
+    inc c
+    if c.kind != SymbolDef: return nil
+    discard getSymDef(c)
+    let typ = parseType(c, scope, ctx)
+    result = Symbol(name: fullName, kind: skGvar, typ: typ, isForeign: true,
+                    moduleName: modname, declStart: off)
+    ctx.rootScope.define(result)
+  of TvarD:
+    inc c
+    if c.kind != SymbolDef: return nil
+    discard getSymDef(c)
+    let typ = parseType(c, scope, ctx)
+    result = Symbol(name: fullName, kind: skTvar, typ: typ, isForeign: true,
+                    moduleName: modname, declStart: off)
+    ctx.rootScope.define(result)
+  of RodataD:
+    # A foreign read-only data blob (e.g. a string literal, or a gvar with a
+    # constant-scalar initializer laid out as static data — see arkham genGlobal).
+    inc c
+    if c.kind != SymbolDef: return nil
+    result = Symbol(name: fullName, kind: skRodata, offset: -1, isForeign: true,
+                    moduleName: modname, declStart: off)
+    ctx.rootScope.define(result)
+  else:
+    return nil
+  m.declBufs.add ensureMove(buf)
 
 proc lookupWithAutoImport(ctx: var GenContext; scope: Scope; name: string; n: Cursor): Symbol =
-  ## Lookup a symbol, automatically loading foreign modules if needed.
+  ## Lookup a symbol, lazily opening + following names into foreign modules.
   ## Also marks the symbol as used for dependency tracking.
   ##
   ## Important: Symbols with module suffixes (e.g., `foo.0.mymodule`) are distinct
   ## from local symbols (e.g., `foo.0`). When a module suffix is present, we only
   ## look in the foreign module, not in the local scope.
   let modname = extractModule(name)
-  if modname != "":
-    # This is a foreign symbol - load the foreign module and look up there
-    loadForeignModule(ctx, modname, scope, n)
-    # Look up by name (scope.lookup handles basenames and module suffixes)
+  if modname != "" and modname != ctx.thisModule:
+    # Foreign symbol: open the module's index, then resolve this one decl lazily
+    # if it isn't already in scope. (A `…0.<thisModule>` suffix names *this*
+    # module's own symbol — arkham emits self-module globals fully qualified — so
+    # it must NOT be treated as foreign, which would shadow the local definition.)
+    openForeignModule(ctx, modname, n)
     result = scope.lookup(name)
+    if result == nil:
+      result = resolveForeignSym(ctx, modname, name, scope, n)
   else:
     # This is a local symbol - look up in current scope
     result = scope.lookup(name)
@@ -513,6 +522,44 @@ proc lookupWithAutoImport(ctx: var GenContext; scope: Scope; name: string; n: Cu
   # Mark symbol as used for dependency tracking
   if result != nil:
     markSymbolUsed(ctx, result.name)
+
+proc parsePtrType(kind: TypeKind; n: var Cursor; scope: Scope; ctx: var GenContext): Type =
+  ## Parse the pointee of a `(ptr X)` / `(aptr X)`. A pointer is 8 bytes whatever
+  ## it points at, so a bare-symbol pointee carries its qualified NAME in
+  ## `baseName` — this is its nominal identity (used for strict, name-based
+  ## pointer compatibility, see `compatible`) and, when the type is not yet
+  ## defined, the handle for resolving it lazily on first structural access (see
+  ## `resolvedBase`). An already-defined symbol also resolves `base` eagerly; a
+  ## genuine forward reference (pointee declared later in the still-loading
+  ## module, e.g. `(ptr Rtti)`) leaves `base` nil until forced. A structural
+  ## pointee (`(ptr (i 32))`) has no name and is resolved eagerly.
+  var base: Type = nil
+  var baseName = ""
+  if n.kind == Symbol:
+    baseName = getSym(n)
+    let sym = scope.lookup(baseName)
+    inc n
+    if sym != nil and sym.kind == skType:
+      base = sym.typ          # resolved eagerly, but keep baseName (nominal id)
+  else:
+    base = parseType(n, scope, ctx)
+  # Construct with a literal discriminator (Nim can't prove a runtime one safe).
+  if kind == AptrT:
+    result = Type(kind: AptrT, base: base, baseName: baseName)
+  else:
+    result = Type(kind: PtrT, base: base, baseName: baseName)
+
+proc resolvedBase(t: Type; ctx: var GenContext; n: Cursor): Type =
+  ## Return a pointer/aptr's pointee, resolving & memoizing a lazily-recorded
+  ## forward reference (see `parsePtrType`) on first use. By the time any field
+  ## or element access runs, the pointee's declaration has been parsed, so the
+  ## lookup — which also auto-imports the owning module if needed — succeeds.
+  if t.base == nil and t.baseName.len > 0:
+    let sym = lookupWithAutoImport(ctx, ctx.scope, t.baseName, n)
+    if sym == nil or sym.kind != skType:
+      error("Unknown type: " & t.baseName, n)
+    t.base = sym.typ
+  result = t.base
 
 proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
   if n.kind == Symbol:
@@ -524,6 +571,13 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
     inc n
   elif n.kind == ParLe:
     let t = n.tag
+    # Inline aggregate types (e.g. an array of anonymous objects, or a field
+    # whose type is spelled out in place) — parseObjectBody/parseUnionBody each
+    # consume the whole `(object …)`/`(union …)` tree, so return directly.
+    if t == ObjectTagId:
+      return parseObjectBody(n, scope, ctx)
+    elif t == UnionTagId:
+      return parseUnionBody(n, scope, ctx)
     inc n
     case t
     of BoolTagId:
@@ -538,11 +592,9 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
       result = Type(kind: FloatT, bits: int(getInt(n)))
       inc n
     of PtrTagId:
-      let base = parseType(n, scope, ctx)
-      result = Type(kind: PtrT, base: base)
+      result = parsePtrType(PtrT, n, scope, ctx)
     of AptrTagId:
-      let base = parseType(n, scope, ctx)
-      result = Type(kind: AptrT, base: base)
+      result = parsePtrType(AptrT, n, scope, ctx)
     of ArrayTagId:
       let elem = parseType(n, scope, ctx)
       let len = getInt(n)
@@ -576,9 +628,20 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
       # for codegen; the `efld` children are consumed by the trailing skip.
       result = parseType(n, scope, ctx)
     of ProctypeTagId:
-      # `(proctype Empty Params Type ProcTypePragmas)` — a function pointer
-      # (8 bytes). Children are consumed by the trailing skip.
-      result = Type(kind: ProcT, params: @[], results: @[], clobbers: {})
+      # `(proctype (params …) (result …)? (clobber …)?)` — a function pointer
+      # (8 bytes; see `asmSizeOf`). arkham emits the full ABI signature (not an
+      # opaque pointer) so an indirect `(prepare <fnptr> … (call))` resolves its
+      # args/result against this, exactly like a direct call to a proc.
+      var ptParams: seq[Param] = @[]
+      var ptResults: seq[Param] = @[]
+      var ptClobbers: set[x86.Register] = {}
+      if n.kind == ParLe and tagToNifasmDecl(n.tag) == ParamsD:
+        ptParams = parseParams(n, scope, ctx)
+      if n.kind == ParLe and tagToNifasmDecl(n.tag) == ResultD:
+        ptResults = parseResult(n, scope, ctx)
+      if n.kind == ParLe and tagToNifasmDecl(n.tag) == ClobberD:
+        ptClobbers = parseClobbers(n)
+      result = Type(kind: ProcT, params: ptParams, results: ptResults, clobbers: ptClobbers)
     else:
       error("Unknown type tag: " & $t, n)
     # Tolerate NIFC type qualifiers we don't model: IntQualifier (atomic/ro),
@@ -598,7 +661,7 @@ proc parseUnionBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
     if n.kind == ParLe and n.tag == FldTagId:
       inc n
       if n.kind != SymbolDef: error("Expected field name", n)
-      let name = pool.syms[n.symId]
+      let name = symName(n)
       inc n
       if not atTypeStart(n): skip n   # tolerate NIFC's FieldPragmas slot
       let ftype = parseType(n, scope, ctx)
@@ -631,7 +694,7 @@ proc parseParams(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
     if n.kind == ParLe and tagToNifasmDecl(n.tag) == ParamD:
       inc n # param
       if n.kind != SymbolDef: error("Expected param name", n)
-      let name = pool.syms[n.symId]
+      let name = symName(n)
       inc n
 
       # (reg) or (s) location
@@ -671,7 +734,7 @@ proc parseResult(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
         wrapped = true
         inc n
       if n.kind != SymbolDef: error("Expected result definition", n)
-      let name = pool.syms[n.symId]
+      let name = symName(n)
       inc n
       var reg = InvalidTagId
       if n.kind == ParLe:
@@ -711,7 +774,7 @@ proc pass1Proc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: str
   # (proc :Name (params ...) (result ...) (clobber ...) (body ...))
   inc n
   if n.kind != SymbolDef: error("Expected proc name", n)
-  let name = pool.syms[n.symId]  # Full qualified name
+  let name = symName(n)  # Full qualified name
   inc n
 
   var procTyp = Type(kind: ProcT, params: @[], results: @[], clobbers: {})
@@ -764,7 +827,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
         of TypeD:
           inc n
           if n.kind != SymbolDef: error("Expected type name", n)
-          let name = pool.syms[n.symId]  # Full qualified name
+          let name = symName(n)  # Full qualified name
           inc n
           if n.kind == ParLe and n.tag == ObjectTagId:
             let typ = parseObjectBody(n, scope, ctx)
@@ -788,7 +851,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
         of RodataD:
           inc n
           if n.kind != SymbolDef: error("Expected rodata name", n)
-          let name = pool.syms[n.symId]  # Full qualified name
+          let name = symName(n)  # Full qualified name
           var sym = Symbol(name: name, kind: skRodata,
                           moduleName: moduleName, declStart: declStart)
           sym.offset = -1  # Mark as forward reference until defined
@@ -798,7 +861,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
         of GvarD:
           inc n
           if n.kind != SymbolDef: error("Expected gvar name", n)
-          let name = pool.syms[n.symId]  # Full qualified name
+          let name = symName(n)  # Full qualified name
           inc n # skip name
           let typ = parseType(n, scope, ctx)
           scope.define(Symbol(name: name, kind: skGvar, typ: typ,
@@ -808,7 +871,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
         of TvarD:
           inc n
           if n.kind != SymbolDef: error("Expected tvar name", n)
-          let name = pool.syms[n.symId]  # Full qualified name
+          let name = symName(n)  # Full qualified name
           inc n # skip name
           let typ = parseType(n, scope, ctx)
           scope.define(Symbol(name: name, kind: skTvar, typ: typ,
@@ -836,7 +899,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
           # (extproc :name "external_name")
           inc n
           if n.kind != SymbolDef: error("Expected extproc name", n)
-          let name = pool.syms[n.symId]
+          let name = symName(n)
           inc n
           if n.kind != StringLit: error("Expected external symbol name string", n)
           let extName = getStr(n)
@@ -972,7 +1035,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       var baseReg: arm64.Register
       var baseOffset: int32 = 0
       if baseOp.typ.kind == TypeKind.PtrT:
-        objType = baseOp.typ.base
+        objType = resolvedBase(baseOp.typ, ctx, n)
         if objType.kind notin {TypeKind.ObjectT, TypeKind.UnionT}:
           error("Cannot access field of non-object/union type " & $objType, n)
         baseReg = baseOp.reg
@@ -1019,7 +1082,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       var baseReg: arm64.Register
       var baseOffset: int32 = 0
       if baseOp.typ.kind == TypeKind.AptrT:
-        elemType = baseOp.typ.base
+        elemType = resolvedBase(baseOp.typ, ctx, n)
         baseReg = baseOp.reg
       elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.ArrayT:
         elemType = baseOp.typ.elem
@@ -1090,7 +1153,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
         if addrOp.typ.kind != TypeKind.PtrT:
           error("mem requires pointer type, got " & $addrOp.typ, n)
         result = addrOp
-        result.typ = addrOp.typ.base
+        result.typ = resolvedBase(addrOp.typ, ctx, n)
       else:
         var baseOp = parseOperandA64(n, ctx)
         if baseOp.kind == okImm or baseOp.kind == okMem:
@@ -1239,8 +1302,8 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       result.typ = Type(kind: UIntT, bits: 64)
       inc n
     elif sym != nil and sym.kind == skGvar:
-      if sym.isForeign:
-        error("Cannot access foreign global variable '" & name & "' directly (must be linked)", n)
+      # A foreign global is bundled into this same image (see generateSymbol), so
+      # it is accessed exactly like a local one — no external linking step.
       # On arm64 the global lives in __DATA/.bss; its address is formed with
       # adrp+add at link time (see AdrA64 + writeMachO). Carry the symbol so its
       # final .bss offset (`sym.size`) is read after all symbols are processed.
@@ -1256,6 +1319,19 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       result.kind = okLabel
       result.tlvSym = sym
       result.typ = Type(kind: UIntT, bits: 64)
+      inc n
+    elif sym != nil and sym.kind == skProc:
+      # A proc used as a value → its code address: `(adr reg proc)` materializes a
+      # function pointer. Same label the proc's definition / a direct `(call)` binds,
+      # so it resolves to the proc's entry (in __TEXT, reachable by ADR/PC-relative).
+      result.kind = okLabel
+      if sym.offset == -1:
+        let labId = ctx.buf.createLabel()
+        sym.offset = int(labId)
+        result.label = labId
+      else:
+        result.label = LabelId(sym.offset)
+      result.typ = Type(kind: UIntT, bits: 64)   # a code pointer
       inc n
     else:
       error("Unknown or invalid symbol: " & name, n)
@@ -1341,9 +1417,15 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
   if sym == nil:
     error("Unknown symbol: " & name, n)
   elif sym.kind == skProc:
-    if sym.isForeign:
-      error("Cannot call foreign proc '" & name & "' directly (use extcall)", n)
+    # A foreign proc is bundled into this image and called directly (see
+    # generateSymbol); only genuine `extproc` externals use the IAT/extcall path.
     ctx.callContext.typ = sym.typ
+  elif sym.kind in {skGvar, skTvar, skVar, skParam} and sym.typ.kind == ProcT:
+    # Indirect call through a function-pointer variable: its proctype IS the
+    # signature, so arg/result checking and stack layout proceed exactly as for a
+    # direct call; only `(call)` differs (it loads the pointer and calls through it).
+    ctx.callContext.typ = sym.typ
+    ctx.callContext.indirect = true
   elif sym.kind == skExtProc:
     ctx.callContext.state = CallContextState.ExternalCall
     for i, ext in ctx.extProcs:
@@ -1393,6 +1475,26 @@ proc genCallMarkerA64(n: var Cursor; ctx: var GenContext) =
     error("Use (extcall) for external procs, not (call)", n)
 
   let sym = lookupWithAutoImport(ctx, ctx.scope, ctx.callContext.target, n)
+
+  if ctx.callContext.indirect:
+    # Indirect call through a function-pointer variable: load the pointer into x16
+    # (IP0 — caller-saved, not an argument register, so the prepared args in x0–x7
+    # are untouched) and `blr` through it. A global's address is formed with adrp+add
+    # (recorded as a gvar site and patched once the data layout is known), exactly
+    # like a `(lea reg gvar)`; then the pointer value is loaded and called.
+    if sym.kind == skGvar:
+      let pos = ctx.buf.data.getCurrentPosition()
+      arm64.emitAdrpAddGvar(ctx.buf.data, arm64.X16)            # x16 = &fnptr
+      ctx.gvarSites.add (pos, sym)
+      arm64.emitLdr(ctx.buf.data, arm64.X16, arm64.X16, 0'i32)  # x16 = fnptr
+    else:
+      error("Indirect call through unsupported function-pointer location: " &
+            $sym.kind, n)
+    arm64.emitBlr(ctx.buf.data, arm64.X16)
+    ctx.callContext.callEmitted = true
+    inc n
+    skipParRi n, "call"
+    return
 
   var labId: LabelId
   if sym.offset == -1:
@@ -1554,7 +1656,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of CfvarD:
     inc n
     if n.kind != SymbolDef: error("Expected cfvar name", n)
-    let name = pool.syms[n.symId]
+    let name = symName(n)
     inc n
     let cfvarLabel = ctx.buf.createLabel()
     let sym = Symbol(name: name, kind: skCfvar, typ: Type(kind: BoolT), offset: int(cfvarLabel), used: false)
@@ -1565,7 +1667,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of VarD:
     inc n
     if n.kind != SymbolDef: error("Expected var name", n)
-    let name = pool.syms[n.symId]
+    let name = symName(n)
     inc n
     var reg = InvalidTagId
     var onStack = false
@@ -1629,7 +1731,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of LabA64:
     inc n
     if n.kind != SymbolDef: error("Expected label name", n)
-    let name = pool.syms[n.symId]
+    let name = symName(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym == nil:
       let labId = ctx.buf.createLabel()
@@ -2292,7 +2394,7 @@ proc collectLabels(n: var Cursor; ctx: var GenContext; scope: Scope) =
       var tmp = n
       inc tmp
       if tmp.kind == SymbolDef:
-        let name = pool.syms[tmp.symId]
+        let name = symName(tmp)
         var sym = scope.lookup(name)
         if sym == nil:
           let labId = ctx.buf.createLabel()
@@ -2314,7 +2416,7 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   inc n
   if n.kind != SymbolDef:
     error("Expected symbol definition", n)
-  let name = pool.syms[n.symId]
+  let name = symName(n)
   ctx.procName = name
 
   # Find/Create label for proc
@@ -2329,6 +2431,9 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   ctx.ssizePatches = @[]
   # Clear register bindings at the start of each proc
   ctx.regBindings = initTable[x86.Register, string]()
+  # Each proc is a fresh control flow: no registers are clobbered on entry.
+  # (Matters now that proc bodies are emitted back-to-back when bundling.)
+  ctx.clobbered = {}
 
   # Add params to scope.
   #
@@ -2467,7 +2572,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
 
         if baseOp.typ.kind == TypeKind.PtrT:
           # Base is a pointer to an object or union
-          objType = baseOp.typ.base
+          objType = resolvedBase(baseOp.typ, ctx, n)
           if objType.kind notin {TypeKind.ObjectT, TypeKind.UnionT}:
             error("Cannot access field of non-object/union type " & $objType, n)
           if baseOp.kind == okMem:
@@ -2554,7 +2659,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
 
         if baseOp.typ.kind == TypeKind.AptrT:
           # Base is an array pointer
-          elemType = baseOp.typ.base
+          elemType = resolvedBase(baseOp.typ, ctx, n)
           baseReg = baseOp.reg
         else:
           error("at requires (base-reg stackvar index) or (aptr-var index), got " & $baseOp.typ, n)
@@ -2629,7 +2734,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
           error("mem requires pointer type, got " & $addrOp.typ, n)
 
         result = addrOp
-        result.typ = addrOp.typ.base  # Dereference: ptr T -> T
+        result.typ = resolvedBase(addrOp.typ, ctx, n)  # Dereference: ptr T -> T
       else:
         # Explicit addressing: (mem base) or (mem base offset) or (mem base index scale [offset])
         var baseOp = parseOperand(n, ctx)
@@ -2814,11 +2919,9 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
       result.typ = Type(kind: UIntT, bits: 64) # Address of rodata
       inc n
     elif sym != nil and sym.kind == skGvar:
-      # Global variable - return its address
-      # For foreign symbols, we can't generate code, but we can typecheck
+      # Global variable - return its address. A foreign global is bundled into
+      # this same image (see generateSymbol) and accessed like a local one.
       result.kind = okLabel
-      if sym.isForeign:
-        error("Cannot access foreign global variable '" & name & "' directly (must be linked)", n)
       if sym.offset == -1:
         # Forward reference - create label now
         let labId = ctx.buf.createLabel()
@@ -2842,6 +2945,19 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
         useFsSegment: true  # Use FS segment register
       )
       result.typ = sym.typ
+      inc n
+    elif sym != nil and sym.kind == skProc:
+      # A proc used as a value → its code address (RIP-relative): `lea reg, proc`
+      # materializes a function pointer. Same label the proc's definition / a
+      # direct `(call)` binds, so it resolves to the proc's entry.
+      result.kind = okLabel
+      if sym.offset == -1:
+        let labId = ctx.buf.createLabel()
+        sym.offset = int(labId)
+        result.label = labId
+      else:
+        result.label = LabelId(sym.offset)
+      result.typ = Type(kind: UIntT, bits: 64)   # a code pointer
       inc n
     else:
       error("Unknown or invalid symbol: " & name, n)
@@ -2891,7 +3007,9 @@ proc parseDest(n: var Cursor; ctx: var GenContext): Operand =
   elif n.kind == Symbol:
     let name = getSym(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
-    if sym != nil and sym.kind == skVar:
+    # A param (skParam) is bound to a register / stack slot exactly like a var, so
+    # it is a valid destination too (mirrors parseDestA64 and the source paths).
+    if sym != nil and (sym.kind == skVar or sym.kind == skParam):
        if sym.typ.isOnStack:
          # Return StackOffT - operations like `add` will reject this at type check
          result.kind = okMem
@@ -2968,10 +3086,17 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
   if sym == nil:
     error("Unknown symbol: " & name, n)
   elif sym.kind == skProc:
-    if sym.isForeign:
-      error("Cannot call foreign proc '" & name & "' directly (use extcall)", n)
+    # A foreign proc is bundled into this image and called directly (see
+    # generateSymbol); only genuine `extproc` externals use the extcall path.
     ctx.callContext.typ = sym.typ
     ctx.callContext.state = CallContextState.NormalCall
+  elif sym.kind in {skGvar, skTvar, skVar, skParam} and sym.typ.kind == ProcT:
+    # Indirect call through a function-pointer variable: its proctype IS the
+    # signature, so arg/result checking and stack layout proceed exactly as for a
+    # direct call; only `(call)` differs (it loads the pointer and calls it).
+    ctx.callContext.typ = sym.typ
+    ctx.callContext.state = CallContextState.NormalCall
+    ctx.callContext.indirect = true
   elif sym.kind == skExtProc:
     # External proc - find its info
     ctx.callContext.state = CallContextState.ExternalCall
@@ -3014,7 +3139,9 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
   skipParRi n, "prepare"
 
 proc genCallMarkerX64(n: var Cursor; ctx: var GenContext) =
-  ## Handle (call) marker inside a prepare block - emits the actual call instruction
+  ## `(call)` inside a `prepare` block emits the actual call: a direct `call rel32`
+  ## to the prepared proc, or — when the prepare target is a function-pointer
+  ## variable — an indirect call that loads the pointer and `call`s through it.
   if not ctx.inCall:
     error("(call) can only be used inside a prepare block", n)
 
@@ -3028,17 +3155,25 @@ proc genCallMarkerX64(n: var Cursor; ctx: var GenContext) =
   # Clobber registers
   ctx.clobbered.incl(ctx.callContext.typ.clobbers)
 
-  var labId: LabelId
-  if sym.offset == -1:
-    labId = ctx.buf.createLabel()
-    sym.offset = int(labId)
+  if ctx.callContext.indirect:
+    # Load the function pointer from its variable into rax — which the call
+    # clobbers anyway and where a scalar result then lands — and call through it.
+    # The gvar's RIP-relative address is recorded as a site and patched by writeElf,
+    # exactly like a `(lea reg gvar)`.
+    let pos = x86.emitLeaRipPlaceholder(ctx.buf, x86.RAX)               # lea rax, [rip+fnptr]
+    ctx.gvarSites.add (pos, sym)
+    x86.emitMov(ctx.buf.data, x86.RAX, x86.MemoryOperand(base: x86.RAX)) # mov rax, [rax]
+    x86.emitCallReg(ctx.buf.data, x86.RAX)                              # call rax
   else:
-    labId = LabelId(sym.offset)
-
-  ctx.buf.emitCall(labId)
+    var labId: LabelId
+    if sym.offset == -1:
+      labId = ctx.buf.createLabel()
+      sym.offset = int(labId)
+    else:
+      labId = LabelId(sym.offset)
+    ctx.buf.emitCall(labId)
   ctx.callContext.callEmitted = true
-
-  inc n
+  inc n                   # past the `(call` head
   skipParRi n, "call"
 
 proc genExtcallX64(n: var Cursor; ctx: var GenContext) =
@@ -3335,7 +3470,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # (cfvar :name.0)
     inc n
     if n.kind != SymbolDef: error("Expected cfvar name", n)
-    let name = pool.syms[n.symId]
+    let name = symName(n)
     inc n
 
     # Control flow variables are always virtual (bool type, never materialized)
@@ -3350,7 +3485,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
   of VarD:
     inc n
     if n.kind != SymbolDef: error("Expected var name", n)
-    let name = pool.syms[n.symId]
+    let name = symName(n)
     inc n
     var reg = InvalidTagId
     var onStack = false
@@ -3373,7 +3508,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let sym = Symbol(name: name, kind: skVar)
     if onStack:
       sym.typ = Type(kind: StackOffT, offType: baseTyp)
-      sym.offset = ctx.slots.allocSlot(baseTyp)
+      # Positive, base-relative offsets (like AArch64): the code generator lowers
+      # rsp by a 16-aligned `sub rsp, (ssize)` so the slots sit ABOVE rsp, where a
+      # `call`'s pushed return address (and any callee pushes) can't reach them. A
+      # red-zone (negative-offset) slot whose address escapes into a call would be
+      # clobbered by that call. No frame pointer is needed.
+      sym.offset = ctx.slots.allocSlotUp(baseTyp)
     else:
       sym.typ = baseTyp
       sym.reg = reg
@@ -4059,10 +4199,16 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       elif n.kind == Symbol:
         let offsetName = getSym(n)
         let offsetSym = lookupWithAutoImport(ctx, ctx.scope, offsetName, n)
-        if offsetSym != nil and (offsetSym.kind == skVar or offsetSym.kind == skParam) and offsetSym.typ.isOnStack:
+        if offsetSym != nil and offsetSym.kind == skTvar:
+          # `lea dest, (fsbase) tvar` ⇒ dest = fsbase + tvar.offset = &tvar. A
+          # thread-local has no link-time address (it lives at FS_base + offset);
+          # nifasm owns the offset, the caller supplies the FS-base register, and
+          # the offset folds into the lea displacement — no pointer arithmetic.
+          displacement = int32(offsetSym.offset)
+        elif offsetSym != nil and (offsetSym.kind == skVar or offsetSym.kind == skParam) and offsetSym.typ.isOnStack:
           displacement = int32(offsetSym.offset)
         else:
-          error("Expected stack variable or integer offset in lea", n)
+          error("Expected stack variable, thread-local, or integer offset in lea", n)
         inc n
       else:
         error("Expected offset (integer or stack variable) in lea", n)
@@ -4074,7 +4220,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       )
       x86.emitLea(ctx.buf.data, dest, mem)
     else:
-      # Try parsing as a label operand (rodata, gvar, etc.)
+      # Try parsing as a label operand (rodata, gvar, etc.) or an addressing
+      # expression — `(at …)` / `(dot …)` / `(mem …)` all parse to an `okMem`
+      # operand carrying a full base+index*scale+displacement, which `lea`
+      # materializes as an address (matching the AArch64 backend, whose `lea`
+      # accepts the same forms). This is how arkham takes the address of an array
+      # element or aggregate field on x86-64.
       let op = parseOperand(n, ctx)
       if op.gvarSym != nil:
         # Global in .bss (a different segment): emit a placeholder RIP-relative lea
@@ -4083,8 +4234,10 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         ctx.gvarSites.add (pos, op.gvarSym)
       elif op.kind == okLabel:
         x86.emitLea(ctx.buf, dest, op.label)
+      elif op.kind == okMem:
+        x86.emitLea(ctx.buf.data, dest, op.mem)
       else:
-        error("lea requires (base-reg offset) or label", n)
+        error("lea requires an address expression (base-reg offset, mem, dot, at, or label)", n)
     skipParRi n, "lea"
   of JmpX64:
     inc n
@@ -4212,7 +4365,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # (lab :label)
     inc n
     if n.kind != SymbolDef: error("Expected label name", n)
-    let name = pool.syms[n.symId]
+    let name = symName(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     # Label might not be defined yet if this is inside a proc body?
     # No, Pass 1 handles types/procs. Labels are local to procs?
@@ -4611,7 +4764,7 @@ proc pass2(n: Cursor; ctx: var GenContext) =
           inc n
           if n.kind != SymbolDef:
             error("Expected symbol definition", n)
-          let name = pool.syms[n.symId]
+          let name = symName(n)
           let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
           if sym != nil and sym.isForeign:
             # Skip foreign proc body
@@ -4624,6 +4777,7 @@ proc pass2(n: Cursor; ctx: var GenContext) =
             n = start
             pass2Proc(n, ctx)
             ctx.generatedSymbols.incl name
+            ctx.entrySym = sym             # the FS-setup prologue jumps here
           else:
             # Regular proc - skip, will be generated if referenced
             n = start
@@ -4664,24 +4818,49 @@ proc writeElf(a: var GenContext; outfile: string) =
   let textFileSize = headersSize.uint64 + code.len.uint64  # Headers + code
   let textMemSize = (textFileSize + pageSize - 1) and not (pageSize - 1)
 
-  # Entry point is after the headers
-  let entryAddr = baseAddr + headersSize.uint64
+  # Entry point is after the headers. When nifasm synthesized a TLS-setup prologue
+  # (see setupTls) it becomes the real entry — it sets the FS base then jumps to the
+  # program's entry proc; otherwise the entry is the first byte of code (offset 0).
+  let entryOff = if a.tlsEntryOffset >= 0: a.tlsEntryOffset.uint64 else: 0'u64
+  let entryAddr = baseAddr + headersSize.uint64 + entryOff
 
   # .bss section comes after .text in memory
   let bssVaddr = textVaddr + textMemSize
   let bssSize = a.bssOffset.uint64
 
-  # Patch each global's RIP-relative `lea` (in .text) now that both segments'
-  # virtual addresses are known: `lea` is 7 bytes with a disp32 at offset +3, and
-  # RIP points at the next instruction (+7). The gvar's .bss byte offset is `sym.size`.
+  # Patch each global's address into the placeholder instruction(s) now that both
+  # segments' virtual addresses are known. The gvar's .bss byte offset is `sym.size`.
   for (pos, sym) in a.gvarSites:
-    let leaVaddr = textVaddr + headersSize.uint64 + pos.uint64
+    let instrVaddr = textVaddr + headersSize.uint64 + pos.uint64
     let targetVaddr = bssVaddr + sym.size.uint64
-    let disp = int32(int64(targetVaddr) - int64(leaVaddr + 7))
-    code[pos + 3] = byte(disp and 0xFF)
-    code[pos + 4] = byte((disp shr 8) and 0xFF)
-    code[pos + 5] = byte((disp shr 16) and 0xFF)
-    code[pos + 6] = byte((disp shr 24) and 0xFF)
+    if a.arch == Arch.LinuxA64:
+      # AArch64: a PC-relative `adrp rd, page` + `add rd, rd, #pageoff` pair (the
+      # placeholder carries the dest reg with zero immediates, so OR them in). Same
+      # encoding as the Mach-O backend's gvar patch.
+      let pageDiff = int64(targetVaddr and not 0xFFF'u64) -
+                     int64(instrVaddr and not 0xFFF'u64)
+      let pageOff = targetVaddr and 0xFFF'u64
+      let adrpImm = pageDiff shr 12
+      let immlo = uint32(adrpImm and 0x03) shl 29
+      let immhi = uint32((adrpImm shr 2) and 0x7FFFF) shl 5
+      var adrp = uint32(code[pos]) or (uint32(code[pos+1]) shl 8) or
+                 (uint32(code[pos+2]) shl 16) or (uint32(code[pos+3]) shl 24)
+      adrp = adrp or immlo or immhi
+      code[pos+0] = byte(adrp and 0xFF);          code[pos+1] = byte((adrp shr 8) and 0xFF)
+      code[pos+2] = byte((adrp shr 16) and 0xFF); code[pos+3] = byte((adrp shr 24) and 0xFF)
+      var add = uint32(code[pos+4]) or (uint32(code[pos+5]) shl 8) or
+                (uint32(code[pos+6]) shl 16) or (uint32(code[pos+7]) shl 24)
+      add = add or (uint32(pageOff and 0xFFF) shl 10)
+      code[pos+4] = byte(add and 0xFF);           code[pos+5] = byte((add shr 8) and 0xFF)
+      code[pos+6] = byte((add shr 16) and 0xFF);  code[pos+7] = byte((add shr 24) and 0xFF)
+    else:
+      # x86-64: a RIP-relative `lea` — 7 bytes with a disp32 at offset +3; RIP points
+      # at the next instruction (+7).
+      let disp = int32(int64(targetVaddr) - int64(instrVaddr + 7))
+      code[pos + 3] = byte(disp and 0xFF)
+      code[pos + 4] = byte((disp shr 8) and 0xFF)
+      code[pos + 5] = byte((disp shr 16) and 0xFF)
+      code[pos + 6] = byte((disp shr 24) and 0xFF)
   let bssAlignedSize = if bssSize > 0: ((bssSize + pageSize - 1) and not (pageSize - 1)) else: 0.uint64
 
   let machine = case a.arch
@@ -4695,13 +4874,30 @@ proc writeElf(a: var GenContext; outfile: string) =
   ehdr.e_phoff = 64  # Program headers start after ELF header
 
   # .text program header (executable, readable)
-  # Starts at file offset 0, includes headers + code
-  var textPhdr = initPhdr(textOffset, textVaddr, textFileSize, textMemSize, PF_R or PF_X)
+  # Starts at file offset 0, includes headers + code. `p_filesz == p_memsz`
+  # (both the page-aligned `textMemSize`): the page padding is written to the file
+  # below, so the segment has NO zero-fill tail. A non-writable PT_LOAD whose
+  # `memsz > filesz` (a bss tail in an R+X segment) is rejected by stricter loaders
+  # such as qemu-user ("PT_LOAD with non-writable bss"); real bss lives in the
+  # separate writable `bssPhdr`.
+  var textPhdr = initPhdr(textOffset, textVaddr, textMemSize, textMemSize, PF_R or PF_X)
 
-  # .bss program header (writable, readable, not executable)
-  # p_filesz = 0 because .bss is not stored in the file (zero-initialized)
-  # p_memsz = actual size needed in memory
-  var bssPhdr = initPhdr(0, bssVaddr, 0, bssAlignedSize, PF_R or PF_W)
+  # .bss program header (writable, readable, not executable). Normally `.bss` is
+  # zero-initialized by the loader (p_filesz = 0). When some gvars have constant
+  # static initializers (`a.bssInits` — e.g. `stdout = 1`), the segment is instead
+  # file-backed: an on-disk image holds those bytes (the rest zero), so the slots
+  # start with their values without any entry-time init code (correct in a bundle).
+  var bssImage: seq[byte]
+  if a.bssInits.len > 0 and bssSize > 0:
+    bssImage = newSeq[byte](bssSize.int)
+    for it in a.bssInits:
+      for i in 0 ..< it.size:
+        if it.off.int + i < bssImage.len:
+          bssImage[it.off.int + i] = byte((it.val shr (8 * i)) and 0xFF)
+  # The bss content (if any) is written right after the .text segment in the file.
+  let bssFileOff = if bssImage.len > 0: textMemSize else: 0'u64
+  let bssFileSz = if bssImage.len > 0: bssSize else: 0'u64
+  var bssPhdr = initPhdr(bssFileOff, bssVaddr, bssFileSz, bssAlignedSize, PF_R or PF_W)
 
   var f = newFileStream(outfile, fmWrite)
   defer: f.close()
@@ -4722,8 +4918,10 @@ proc writeElf(a: var GenContext; outfile: string) =
       var zeros = newSeq[byte](padding)
       f.writeData(unsafeAddr zeros[0], padding)
 
-  # .bss section is not written to file (it's zero-initialized by the loader)
-  # The loader will allocate the memory and zero it
+  # Write the initialized .bss image (constant static initializers), if any. The
+  # remaining memsz beyond bssSize is zero-filled by the loader.
+  if bssImage.len > 0:
+    f.writeData(unsafeAddr bssImage[0], bssImage.len)
 
   let perms = {fpUserExec, fpGroupExec, fpOthersExec, fpUserRead, fpUserWrite}
   setFilePermissions(outfile, perms)
@@ -4764,7 +4962,8 @@ proc writeMachO(a: var GenContext; outfile: string) =
   tlv.threadData = a.tlvData
   for (pos, sym) in a.tlvSites: tlv.sites.add (pos, sym.offset)
 
-  macho.writeMachO(code, a.bssOffset, cputype, cpusubtype, outfile, dynlink, gsites, tlv)
+  macho.writeMachO(code, a.bssOffset, cputype, cpusubtype, outfile, dynlink, gsites, tlv,
+                   a.bssInits)
 
   # macOS arm64 requires code signing for all executables
   when defined(macosx):
@@ -4805,20 +5004,27 @@ proc createLiterals(data: openArray[(string, int)]): Literals =
     assert t.int == data[i][1]
 
 proc generateSymbol(ctx: var GenContext; sym: Symbol) =
-  ## Generate code for a single symbol on-demand
+  ## Generate code for a single reachable symbol on-demand. nifasm is the linker:
+  ## a reachable FOREIGN symbol is bundled into this same output (its body/storage
+  ## emitted, cross-module references resolved as ordinary direct relocations) —
+  ## exactly like a local symbol, only the declaration is read from the foreign
+  ## module's stream (at its indexed byte offset) instead of the main TokenBuf.
   if sym.name in ctx.generatedSymbols:
     return
   ctx.generatedSymbols.incl sym.name
 
-  # Skip foreign symbols (they don't need code generation)
-  if sym.isForeign:
-    return
-
-  # Get the module's TokenBuf
   if sym.moduleName notin ctx.modules:
     return  # Module not loaded, can't generate
 
-  var n = cursorAt(ctx.modules[sym.moduleName].buf, sym.declStart)
+  let m = ctx.modules[sym.moduleName]
+  var declBuf: TokenBuf
+  var n: Cursor
+  if sym.isForeign:
+    m.stream.r.jumpTo(sym.declStart)
+    declBuf = fromStream(m.stream)        # exactly one balanced decl tree
+    n = beginRead(declBuf)
+  else:
+    n = cursorAt(m.buf, sym.declStart)
   let declTag = tagToNifasmDecl(n.tag)
 
   case sym.kind
@@ -4846,6 +5052,16 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
       sym.offset = int(labId)
       sym.size = ctx.bssOffset      # byte offset within .bss (for arm64 adrp+add)
       ctx.bssBuf.defineLabel(labId)
+      # A constant-scalar initializer (arkham emits its bits as the gvar's value
+      # in `(gvar :name type value?)`): record it so writeElf writes the value into
+      # the (writable) .bss image.
+      var dn = n
+      inc dn                                    # gvar tag
+      discard getSymDef(dn)                     # name
+      discard parseType(dn, ctx.scope, ctx)     # type
+      if dn.kind == IntLit:
+        ctx.bssInits.add (off: sym.size.int64, val: getInt(dn),
+                          size: asmSizeOf(sym.typ))
       ctx.bssOffset += size
   of skTvar:
     if declTag == TvarD:
@@ -4887,13 +5103,36 @@ proc processReachableSymbols(ctx: var GenContext) =
     if canonicalName != fullName and canonicalName in ctx.generatedSymbols:
       continue  # Already generated the canonical version
 
-    # Find the symbol
-    var baseName = fullName
-    if extractModule(fullName) != "":
-      extractBasename(baseName)
-    let sym = ctx.scope.lookup(baseName)
+    # Find the symbol by its full qualified name (nominal identity).
+    let sym = ctx.scope.lookup(fullName)
     if sym != nil:
       generateSymbol(ctx, sym)
+
+proc setupTls(ctx: var GenContext) =
+  ## nifasm owns the per-thread TLS. After every bundled tvar has an FS offset
+  ## (`ctx.tlsOffset`), reserve the unified `arkham.tls.0` block in `.bss` (sized
+  ## for all modules' tvars) and synthesize the entry prologue that points FS at it
+  ## via `arch_prctl(ARCH_SET_FS, &arkham.tls.0)`, then jumps to the real entry.
+  ## Nim thread-locals have no initializers, so the block is just zeroed `.bss`.
+  ## x86-64 only (AArch64 TLS uses a different mechanism, not yet implemented).
+  const ArchSetFs = 0x1002      # arch_prctl(2) ARCH_SET_FS
+  const ArchPrctlNr = 158       # x86-64 syscall number for arch_prctl
+  if ctx.arch != Arch.X64 or ctx.tlsOffset == 0: return
+  if ctx.tlsBlockSym == nil or ctx.entrySym == nil: return
+  # Reserve the per-thread block in .bss (16-byte aligned); its address is the FS
+  # base, and every tvar lives at `FS:[its offset]` within it.
+  ctx.bssOffset = (ctx.bssOffset + 15) and not 15
+  ctx.tlsBlockSym.size = ctx.bssOffset
+  ctx.bssOffset += (ctx.tlsOffset + 15) and not 15
+  # Synthesize the FS-setup prologue at the end of .text — it becomes the ELF entry
+  # (see writeElf) and tail-jumps to the program's real entry proc.
+  ctx.tlsEntryOffset = ctx.buf.data.len
+  let pos = x86.emitLeaRipPlaceholder(ctx.buf, x86.RSI)     # lea rsi, [rip+arkham.tls.0]
+  ctx.gvarSites.add (pos, ctx.tlsBlockSym)
+  x86.emitMovImmToReg(ctx.buf.data, x86.RDI, ArchSetFs)
+  x86.emitMovImmToReg(ctx.buf.data, x86.RAX, ArchPrctlNr)
+  x86.emitSyscall(ctx.buf.data)                             # arch_prctl(ARCH_SET_FS, &block)
+  x86.emitJmp(ctx.buf, LabelId(ctx.entrySym.offset))        # → real entry
 
 proc assemble*(filename, outfile: string) =
   nifstreams.pool = createLiterals(TagData)
@@ -4901,28 +5140,43 @@ proc assemble*(filename, outfile: string) =
 
   # Extract base directory from filename
   let baseDir = filename.splitFile.dir
+  # The module being assembled — its symbol suffix (e.g. `foo.s.nif` → "foo"), so a
+  # `name.0.foo` reference resolves to a local definition instead of a foreign import.
+  let thisModule = extractModuleSuffix(filename)
 
   var scope = newScope()
 
   # Create a minimal ctx for pass1 (for foreign module loading)
   var ctx = GenContext(
     scope: scope,
+    rootScope: scope,
     buf: initBuffer(),
     bssBuf: initBuffer(),
     tlsOffset: 0,
     bssOffset: 0,
     modules: initTable[string, LoadedModule](),
     baseDir: baseDir,
+    thisModule: thisModule,
     imports: @[],
     extProcs: @[],
     gotSlotCount: 0,
     pendingSymbols: @[],
     generatedSymbols: initHashSet[string](),
-    dedupTable: initTable[string, string]()
+    dedupTable: initTable[string, string](),
+    tlsEntryOffset: -1
   )
 
   # Store main module
   ctx.modules[MainModuleName] = LoadedModule(buf: move buf, loaded: true)
+
+  # The unified per-thread TLS block is owned by nifasm, not any single module
+  # (arkham only references it for `&tvar`/`FS:[off]`). Define it up front so those
+  # references resolve; it's pre-marked generated (nifasm sizes + allocates it in
+  # `setupTls` once all bundled tvars are known) and FS is set in the entry prologue.
+  ctx.tlsBlockSym = Symbol(name: "arkham.tls.0", kind: skGvar,
+                           typ: Type(kind: UIntT, bits: 8), offset: -1)
+  scope.define(ctx.tlsBlockSym)
+  ctx.generatedSymbols.incl "arkham.tls.0"
 
   var n1 = beginRead(ctx.modules[MainModuleName].buf)
   pass1(n1, scope, ctx, MainModuleName, ctx.modules[MainModuleName].buf)
@@ -4941,7 +5195,7 @@ proc assemble*(filename, outfile: string) =
           let start = tn
           inc tn                              # tvar tag
           if tn.kind == SymbolDef:
-            let sym = scope.lookup(pool.syms[tn.symId])
+            let sym = scope.lookup(symName(tn))
             if sym != nil and sym.kind == skTvar and sym.name notin ctx.generatedSymbols:
               sym.offset = ctx.tlsOffset
               ctx.tlsOffset += slots.alignedSize(sym.typ)
@@ -4961,6 +5215,10 @@ proc assemble*(filename, outfile: string) =
   # Process all pending symbols (both main module and foreign modules)
   # This generates code only for symbols that were actually referenced (dead code elimination)
   processReachableSymbols(ctx)
+
+  # Now that every bundled tvar has an FS offset, reserve the unified TLS block and
+  # synthesize the entry prologue that sets the FS base (x86-64).
+  setupTls(ctx)
 
   case ctx.arch
   of Arch.X64, Arch.LinuxA64:

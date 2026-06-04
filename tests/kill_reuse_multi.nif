@@ -1,4 +1,5 @@
 (.nif27)
+(.indexat 403              )
 (stmts
  (proc :test_kill_reuse_multi.0
   (params)
@@ -26,4 +27,4 @@
    (mov w.0 60)
    (mov
     (rdi)0)
-   (syscall))))
+   (syscall))))(.index)

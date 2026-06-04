@@ -1,6 +1,8 @@
 (.nif27)
+(.indexat 104              )
 (stmts
- (type :Level3.0.mod_level3
+ (type :Level3.0.
   (object
    (fld :value.0
-    (i 64)))))
+    (i 64)))))(.index
+ (x Level3.0. 44))

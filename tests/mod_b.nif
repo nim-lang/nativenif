@@ -1,6 +1,8 @@
 (.nif27)
+(.indexat 103              )
 (stmts
- (type :Inner.0.mod_b
+ (type :Inner.0.
   (object
    (fld :value.0
-    (i 64)))))
+    (i 64)))))(.index
+ (x Inner.0. 44))

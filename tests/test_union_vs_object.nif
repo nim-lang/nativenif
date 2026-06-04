@@ -1,0 +1,100 @@
+(.nif27)
+(.indexat 2875             )
+(stmts <unknown token> Object <unknown token> fields are laid out sequentially <unknown token> Total size = sum of all field sizes = 8 \2B 4 \2B 2 \2B 1 = 15 bytes
+ (or aligned)
+ (type :MyObject
+  (object
+   (fld :a
+    (i \2B64))<unknown token> offset 0 , size 8
+   (fld :b
+    (i \2B32))<unknown token> offset 8 , size 4
+   (fld :c
+    (i \2B16))<unknown token> offset 12 , size 2
+   (fld :d
+    (i \2B8))<unknown token> offset 14 , size 1))<unknown token> Union <unknown token> fields overlay each other at offset 0 <unknown token> Total size = max of all field sizes = max
+ (8, 4 , 2 , 1)= 8 bytes
+ (type :MyUnion
+  (union
+   (fld :a
+    (i \2B64))<unknown token> offset 0 , size 8
+   (fld :b
+    (i \2B32))<unknown token> offset 0 , size 4
+   (fld :c
+    (i \2B16))<unknown token> offset 0 , size 2
+   (fld :d
+    (i \2B8))<unknown token> offset 0 , size 1))
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts <unknown token> Allocate both on stack
+   (var :obj
+    (s)MyObject)<unknown token> Size = 15 bytes
+   (sum)
+   (var :uni
+    (s)MyUnion)<unknown token> Size = 8 bytes
+   (max)<unknown token> Object <unknown token> each field is at a different offset
+   (mov
+    (rax)\2B0x1111111111111111)
+   (mov
+    (mem
+     (dot obj :a))
+    (rax))<unknown token> Write 8 bytes at offset 0
+   (mov
+    (rbx)\2B0x22222222)
+   (mov
+    (mem
+     (dot obj :b))
+    (ebx))<unknown token> Write 4 bytes at offset 8
+   (mov
+    (rcx)\2B0x3333)
+   (mov
+    (mem
+     (dot obj :c))
+    (cx))<unknown token> Write 2 bytes at offset 12
+   (mov
+    (rdx)\2B0x44)
+   (mov
+    (mem
+     (dot obj :d))
+    (dl))<unknown token> Write 1 byte at offset 14 <unknown token> Verify fields are independent
+   (mov
+    (r8)
+    (mem
+     (dot obj :a)))<unknown token> Should still be 0 x1111...
+   (mov
+    (r9)
+    (mem
+     (dot obj :b)))<unknown token> Should be 0 x2222... <unknown token> Union <unknown token> all fields share the same memory location
+   (mov
+    (rax)\2B0x1111111111111111)
+   (mov
+    (mem
+     (dot uni :a))
+    (rax))<unknown token> Write 8 bytes at offset 0
+   (mov
+    (rbx)\2B0x22222222)
+   (mov
+    (mem
+     (dot uni :b))
+    (ebx))<unknown token> Write 4 bytes at offset 0
+   (overwrites lower 4 bytes)<unknown token> Verify fields overlap
+   (mov
+    (r8)
+    (mem
+     (dot uni :a)))<unknown token> Should be modified by previous write <unknown token> Lower 4 bytes should be 0 x22222222, upper 4 bytes should be from previous write <unknown token> Write to smallest field
+   (mov
+    (rcx)\2B0x99)
+   (mov
+    (mem
+     (dot uni :d))
+    (cl))<unknown token> Write 1 byte at offset 0 <unknown token> Verify it modified the same location
+   (mov
+    (r9)
+    (mem
+     (dot uni :a)))<unknown token> Lowest byte should now be 0 x99 <unknown token> Exit
+   (mov
+    (rax)\2B60)
+   (mov
+    (rdi)\2B0)
+   (syscall))))(.index)

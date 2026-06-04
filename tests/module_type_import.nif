@@ -1,4 +1,5 @@
 (.nif27)
+(.indexat 275              )
 (stmts
  (proc :main.0
   (params)
@@ -15,4 +16,5 @@
     (rax)
     (mem
      (dot p :x)))
-   (ret))))
+   (ret))))(.index
+ (x Point.0.typesmodule 166))

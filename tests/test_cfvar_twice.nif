@@ -1,0 +1,31 @@
+(.nif27)
+(.indexat 537              )
+(stmts
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts <unknown token> Invalid <unknown token> cfvar used twice
+   (cfvar :tmp.0)
+   (mov
+    (rax)\2B0)<unknown token> First use
+   (ite tmp.0
+    (stmts
+     (mov
+      (rax)\2B42))
+    (stmts
+     (mov
+      (rax)\2B1)))<unknown token> Second use <unknown token> should error
+   (ite tmp.0
+    (stmts
+     (mov
+      (rax)\2B99))
+    (stmts
+     (mov
+      (rax)\2B2)))
+   (mov
+    (rdi)
+    (rax))
+   (mov
+    (rax)\2B60)
+   (syscall))))(.index)

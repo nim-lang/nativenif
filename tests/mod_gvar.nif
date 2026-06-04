@@ -1,4 +1,6 @@
 (.nif27)
+(.indexat 73               )
 (stmts
- (gvar :shared.0.mod_gvar
-  (i 64)))
+ (gvar :shared.0.
+  (i 64)))(.index
+ (x shared.0. 44))

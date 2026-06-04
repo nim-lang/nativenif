@@ -1,4 +1,5 @@
 (.nif27)
+(.indexat 706              )
 (stmts
  (proc :main.0
   (params)
@@ -46,4 +47,4 @@
     (rax)7)
    (mov
     (rdx)11)
-   (ret))))
+   (ret))))(.index)

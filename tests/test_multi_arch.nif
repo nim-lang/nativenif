@@ -1,0 +1,55 @@
+(.nif27)
+(.indexat 1085             )
+(stmts <unknown token> Architecture-independent type definition
+ (type :Point
+  (object
+   (fld :x
+    (i \2B64))
+   (fld :y
+    (i \2B64))))<unknown token> x86-64 implementation
+ (machine x86_64
+  (proc :add_coords.x64
+   (params
+    (param :px
+     (rdi)
+     (i \2B64))
+    (param :py
+     (rsi)
+     (i \2B64)))
+   (result
+    (result :r
+     (rax)
+     (i \2B64)))
+   (clobber)
+   (stmts
+    (mov
+     (rax)px)
+    (add
+     (rax)py)
+    (ret)))
+  (proc :main.x64
+   (params)
+   (result)
+   (clobber)
+   (stmts
+    (mov
+     (rax)\2B60)
+    (mov
+     (rdi)\2B0)
+    (syscall))))<unknown token> ARM64 implementation
+ (registers only <unknown token> full codegen not implemented yet)
+ (machine arm64
+  (proc :add_coords.arm64
+   (params
+    (param :px
+     (x0)
+     (i \2B64))
+    (param :py
+     (x1)
+     (i \2B64)))
+   (result
+    (result :r
+     (x0)
+     (i \2B64)))
+   (clobber)
+   (stmts <unknown token> ARM64 instructions would go here when implemented <unknown token> For now, this demonstrates the architecture context is working))))(.index)

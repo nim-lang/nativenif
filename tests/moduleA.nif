@@ -1,6 +1,7 @@
 (.nif27)
+(.indexat 345              )
 (stmts
- (proc :max.0.int64.moduleA
+ (proc :max.0.int64.
   (params
    (param :a.0
     (rdi)
@@ -25,4 +26,5 @@
      (mov
       (rax)
       (rsi))))
-   (ret))))
+   (ret))))(.index
+ (x max.0.int64. 44))

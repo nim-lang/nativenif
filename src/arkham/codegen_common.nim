@@ -1,0 +1,461 @@
+#
+#           Arkham — shared front-end for the native code generators
+#        (c) Copyright 2026 Andreas Rumpf
+#
+#    See the file "license.txt", included in this distribution.
+#
+
+## Architecture-neutral front-end shared by the per-target backends
+## (`codegen_a64`, `codegen_x64`). Holds the `CodeGen` state object, the NIFC
+## type/lvalue analysis (`getType` / `exprSlot` / `asLoc` and friends) and
+## the type predicates. None of this emits instructions — instruction selection
+## and the machine frame live in the backends. The `md` field carries the
+## target `MachineDesc` so the backends drive the (shared) register allocator
+## and scratch pools from it.
+
+import std / [tables, sets, assertions]
+import nifcore, nifcdecl
+import slots, machinedesc, analyser, register_allocator, programs
+import asmbuf
+
+type
+  StealEvent* = object
+    victim*: string      ## NIFC name of the evicted register-local
+    slot*: string        ## the stack slot it was moved to (distinct basename)
+    reg*: Reg            ## the register freed for scratch
+    typ*: AsmSlot        ## the victim's slot type (for the stack-slot decl)
+
+  CodeGen* = object
+    ab*: AsmBuf
+    ra*: RegAlloc
+    buf*: ptr TokenBuf
+    md*: MachineDesc                         ## target register file + ABI
+    prog*: Program                           ## the whole program (cross-module type env)
+    callTarget*: Table[string, CallTarget]
+    globals*: Table[string, Cursor]          ## global var name → its decl cursor
+    tvars*: Table[string, Cursor]            ## thread-local var name → its decl cursor (macOS TLV)
+    tvarNames*: HashSet[string]              ## tvar names, for the per-proc analyser
+    freeTmp*: set[Reg]                       ## volatile temps free for scratch
+    freeFTmp*: set[FReg]                     ## volatile SIMD/FP temps free for scratch
+    borrowLog*: seq[Reg]                     ## scratch-register decisions recorded in
+                                             ## walk order by the planning pass; replayed
+                                             ## verbatim by the emit pass (single walk,
+                                             ## two modes — see `genProc`)
+    borrowLogF*: seq[FReg]                   ## ditto for SIMD scratch
+    borrowIdx*, borrowIdxF*: int             ## replay cursors into the logs above
+    spillCount*: int                         ## fresh-spill-slot counter (per proc): when
+                                             ## the scratch pool is exhausted, a computed
+                                             ## value is materialized into an `(s)` slot
+                                             ## `spill.N` instead of a register — so register
+                                             ## allocation never fails
+    retIsFloat*: bool                        ## current proc returns a float (in v0)
+    retFloatBits*: int                       ## width (32/64) of the float return type
+    rodata*: seq[(string, string)]           ## module-level string literals
+    hasFrame*: bool                          ## current proc needs a stack frame
+    frameRegs*: seq[Reg]                     ## callee-saved GPRs to save (even count)
+    frameFRegs*: seq[FReg]                   ## callee-saved SIMD regs to save (even count)
+    framePad*: int                           ## x64: extra prologue `sub rsp` for 16-byte call alignment
+    labelCount*: int                         ## fresh-label counter
+    loopEnds*: seq[string]                   ## stack of enclosing-loop end labels (for `break`)
+    retAggrName*: string                     ## current proc's aggregate return type (or "")
+    retIndirect*: bool                       ## return type is >16B (x8 indirect result)
+    isEntryProc*: bool                       ## the proc currently emitted is the entry
+    a64Linux*: bool                          ## a64 backend: target Linux/ELF (svc-based
+                                             ## syscalls, no Darwin TLV/dyld) instead of
+                                             ## the default Darwin/Mach-O — lets the arm64
+                                             ## output run under qemu-aarch64 on Linux
+    liveAccums*: set[Reg]                     ## arg/return registers currently holding an
+                                             ## in-flight expression accumulator (a genInto
+                                             ## target that is *not* a named local, so absent
+                                             ## from `regLocal`). A spill's transient staging
+                                             ## register must avoid these — else it clobbers
+                                             ## the value being built (e.g. x0 = the return
+                                             ## value while a deep right-operand spills).
+    indirectReg*: Reg                        ## callee-saved reg holding the x8 dest pointer
+    varType*: Table[string, string]          ## aggregate var/param name → its type name
+    symType*: Table[string, Cursor]          ## local/param name → its NIFC type cursor (for getType)
+    regLocal*: Table[Reg, string]            ## reg → the named local currently bound to it
+                                             ## (x64 named-locals: emit the name, not `(reg)`)
+    scopeLocals*: seq[seq[tuple[name: string, reg: Reg]]]  ## per-scope register locals to `kill`
+    stealEvents*: Table[int, StealEvent]     ## borrow-log index → a codegen-time
+                                             ## register steal (evict a live local
+                                             ## to a stack slot); recorded in the
+                                             ## plan pass, replayed (with the spill
+                                             ## store) in the emit pass.
+
+# ── type predicates ─────────────────────────────────────────────────────────
+
+proc isSignedType*(c: Cursor): bool =
+  ## NIFC arithmetic carries its result type as the first child; treat it as
+  ## signed unless it is an unsigned/char integer. (A `case` disambiguates the
+  ## NifcType enum members, which share spellings with nifasm's NifasmType.)
+  if c.kind != TagLit: return true
+  case c.typeKind
+  of UT, CT: false
+  else: true
+
+proc intTypeWidth*(c: Cursor): int =
+  ## Bit width of an integer/char type; 64 for pointer/bool/other (register width).
+  if c.kind != TagLit: return 64
+  case c.typeKind
+  of IT, UT, CT:
+    var t = c; inc t
+    if t.kind == IntLit and intVal(t) > 0: int(intVal(t)) else: 64
+  else: 64
+
+proc slotWidthSigned*(s: AsmSlot): tuple[width: int, signed: bool] =
+  ## A scalar slot's significant bit width and signedness (for extension).
+  case s.kind
+  of AInt:  (s.size * 8, true)
+  of AUInt: (s.size * 8, false)
+  of ABool: (8, false)
+  else:     (64, true)                      # float/aggregate: no widening extend
+
+proc isPtrType*(c: Cursor): bool =
+  ## A `case` (not an `in {…}` set) so the discriminant type picks nifcdecl's
+  ## `NifcType.PtrT`, not nifasm's same-spelled `NifasmType` member.
+  if c.kind != TagLit: return false
+  case c.typeKind
+  of PtrT, AptrT, ProctypeT: true
+  else: false
+
+# ── structural type / slot analysis ─────────────────────────────────────────
+
+type
+  SymCat* = enum
+    scNone                      ## not a module-level symbol (a function-local)
+    scGlobal                    ## ordinary .bss/.data global or const
+    scTvar                      ## thread-local (macOS TLV)
+    scProc                      ## a proc — as a value it is its code address
+  SymInfo* = object
+    cat*: SymCat
+    decl*: Cursor               ## scGlobal/scTvar: the `(gvar|tvar|const :name pragmas type …)`
+    asmName*: string            ## scProc: the asm symbol whose address the proc denotes
+
+proc lookupSym*(g: var CodeGen; nm: string): SymInfo =
+  ## The one place a module-level symbol resolves to its kind + declaration:
+  ## a main-module global/tvar/proc, or a cross-module symbol loaded lazily from
+  ## its owning module's index. Callers (`getType`/`srcWidthSigned`/`asLoc`/
+  ## `genVal`) classify on the result rather than re-deciding local-vs-foreign.
+  if g.globals.hasKey(nm): return SymInfo(cat: scGlobal, decl: g.globals[nm])
+  if g.tvars.hasKey(nm): return SymInfo(cat: scTvar, decl: g.tvars[nm])
+  if g.callTarget.hasKey(nm): return SymInfo(cat: scProc, asmName: g.callTarget[nm].asmName)
+  var found = false
+  let d = lookupForeignDecl(g.prog, nm, found)
+  if found:
+    case d.stmtKind
+    of ProcS: return SymInfo(cat: scProc, asmName: nm)   # foreign proc: its fully-qualified NIF name
+    of TvarS: return SymInfo(cat: scTvar, decl: d)
+    else: return SymInfo(cat: scGlobal, decl: d)
+
+proc getType*(g: var CodeGen; c: Cursor): Cursor =
+  ## The structural NIFC type cursor of expression `c` (arkham's analog of
+  ## `typenav.getType`). Symbols resolve through `symType` / the global/tvar
+  ## decls; `dot`/`at`/`deref` navigate into the base's object/array/pointer
+  ## type; typed nodes (arith, conv, cast, call) read their carried type. This is
+  ## the single source of truth for "is this float?" — no per-form special cases.
+  case c.kind
+  of Symbol:
+    let nm = symName(c)
+    if g.symType.hasKey(nm): return g.symType[nm]
+    let si = g.lookupSym(nm)
+    case si.cat
+    of scProc: result = g.prog.procPtr        # a proc as a value → its code-pointer type
+    of scGlobal, scTvar:
+      var d = si.decl
+      d.into:
+        inc d; skip d                         # name, pragmas
+        result = d                            # the declared type (a copy)
+        while d.hasMore: skip d
+    of scNone: raiseAssert "arkham: getType — unknown symbol " & nm
+  of TagLit:
+    case c.exprKind
+    of AddC, SubC, MulC, DivC, ModC, ShlC, ShrC, BitandC, BitorC, BitxorC,
+       BitnotC, NegC, NotC, ConvC, CastC, OconstrC, AconstrC:
+      var t = c
+      t.into:
+        result = t                            # the carried result/target type
+        while t.hasMore: skip t
+    of DotC:
+      var t = c
+      t.into:
+        let objTy = resolveType(g.prog, g.getType(t)); skip t  # past the base subtree
+        result = fieldType(g.prog, objTy, symName(t)); inc t
+        while t.hasMore: skip t
+    of AtC, PatC:
+      # `(at array idx)` indexes an array, `(pat ptr idx)` a pointer; either way
+      # the result is the element/pointee type, which `innerType` yields for
+      # `array`/`ptr`/`aptr` alike.
+      var t = c
+      t.into:
+        let arrTy = resolveType(g.prog, g.getType(t)); skip t  # past the base subtree
+        result = innerType(g.prog, arrTy)
+        while t.hasMore: skip t
+    of DerefC:
+      var t = c
+      t.into:
+        let ptrTy = resolveType(g.prog, g.getType(t))          # pointer type
+        result = innerType(g.prog, ptrTy)
+        while t.hasMore: skip t
+    of CallC:
+      var t = c
+      t.into:
+        result = g.callTarget.getOrDefault(symName(t)).retType
+        while t.hasMore: skip t
+    else: raiseAssert "arkham: getType — unsupported expression " & $c.exprKind
+  else: raiseAssert "arkham: getType — literal has no stored type"
+
+proc exprSlot*(g: var CodeGen; c: Cursor): AsmSlot =
+  ## The classified slot of any expression — `getType` for structural forms,
+  ## with literals/`addr` (which carry no type cursor) handled directly.
+  case c.kind
+  of FloatLit: AsmSlot(kind: AFloat, size: 8, align: 8)   # default f64; width refined by context
+  of IntLit, UIntLit: AsmSlot(kind: AInt, size: 8, align: 8)
+  of CharLit: AsmSlot(kind: AUInt, size: 1, align: 1)
+  of StrLit: AsmSlot(kind: AUInt, size: 8, align: 8)      # a pointer
+  of Symbol: slotOf(g.prog, g.getType(c))
+  of TagLit:
+    case c.exprKind
+    of AddrC, NilC: AsmSlot(kind: AUInt, size: 8, align: 8)          # &lvalue / nil → a pointer
+    of TrueC, FalseC: AsmSlot(kind: AUInt, size: 1, align: 1)        # a bool
+    of SizeofC, AlignofC: AsmSlot(kind: AInt, size: 8, align: 8)     # an integer constant
+    of SufC, ParC:                                                   # wrappers → the inner value
+      var t = c; inc t
+      g.exprSlot(t)
+    else: slotOf(g.prog, g.getType(c))
+  else: AsmSlot(kind: AMem)
+
+proc isFloatExpr*(g: var CodeGen; c: Cursor): bool =
+  ## Whether `c` has floating-point type (so it flows through the SIMD path).
+  g.exprSlot(c).kind == AFloat
+
+proc floatBits*(g: var CodeGen; c: Cursor): int =
+  ## Bit width (32 or 64) of a float expression; 64 when undeterminable (e.g. a
+  ## bare literal — the caller's context width should be used instead).
+  if g.exprSlot(c).size == 4: 32 else: 64
+
+proc srcWidthSigned*(g: var CodeGen; c: Cursor): tuple[width: int, signed: bool] =
+  ## Best-effort source scalar (bit width, signedness) of the expression at `c`,
+  ## *without* consuming it — used to pick sign- vs zero-extension when a
+  ## conversion *widens*. Unknown → (64, true): treated as full register width,
+  ## i.e. no widening extension is applied (the pre-source-aware behaviour).
+  case c.kind
+  of Symbol:
+    let nm = symName(c)
+    let loc = g.ra.locationOfSym(nm)
+    if loc.kind != Undef:
+      return slotWidthSigned(loc.typ)        # a local/param: the allocator knows it
+    let si = g.lookupSym(nm)                   # a global / thread-local: read its decl type
+    case si.cat
+    of scProc: return (64, true)               # a code pointer
+    of scGlobal, scTvar:
+      var d = si.decl
+      d.into:
+        inc d; skip d                          # name, pragmas
+        return slotWidthSigned(slotOf(g.prog, d))
+    of scNone: return (64, true)
+  of TagLit:
+    case c.exprKind
+    of AddC, SubC, MulC, DivC, ModC, ShlC, ShrC,
+       BitandC, BitorC, BitxorC, BitnotC, NegC, ConvC, CastC:
+      var t = c                               # these carry their result type first
+      t.into:
+        return slotWidthSigned(slotOf(g.prog, t))
+    else: return (64, true)
+  else: return (64, true)
+
+# ── unified location model (addressing modes + computed values) ─────────────
+# `Location` (machinedesc) is THE descriptor for "where a value lives, or should
+# go" — a register, a stack slot, a global/thread-local, a foldable memory operand
+# (`Mem`, carrying the lvalue subtree to re-emit), an immediate, or `Undef` (the
+# dont-care target). It is shared by the register
+# allocator (long-lived storage) and the backends (just-computed values + lvalue
+# destinations). `asLoc` parses a NIFC lvalue cursor into one; `genVal` produces a
+# computed value as one; the `gen`/load-store family consume it. This replaces the
+# former separate `Lvalue` + `Val` descriptors that flowed through codegen.
+
+proc asLoc*(g: var CodeGen; c: var Cursor): Location =
+  ## Classify and consume an lvalue (Symbol / dot / at / deref) into a `Location`.
+  ## `typ` records float-ness/width for the caller. A `Mem` captures the lvalue
+  ## subtree (`cur`) so a backend re-emits it as a `(dot …)`/`(at …)`/`(deref …)`
+  ## operand; a `NamedStack` is addressed by the *location's* name, not the
+  ## variable's (a codegen-time steal renames an evicted register-local's slot to
+  ## `evictN.0`; for an un-evicted local the two coincide).
+  let slot = g.exprSlot(c)
+  let nCur = c                                 # capture the subtree before consuming
+  case c.kind
+  of Symbol:
+    let nm = symName(c); inc c
+    let si = g.lookupSym(nm)
+    case si.cat
+    of scTvar: result = tvarLoc(nm, slot)
+    of scGlobal: result = globLoc(nm, slot)
+    of scProc:
+      # A proc as a value is its address, not an lvalue; `genVal` emits the `lea`.
+      raiseAssert "arkham: proc used as an lvalue: " & nm
+    of scNone:
+      let loc = g.ra.locationOfSym(nm)
+      case loc.kind
+      of InReg: result = regLoc(loc.r, slot)
+      of InFReg: result = fregLoc(loc.f, slot)
+      of NamedStack: result = namedStackLoc(loc.name, slot)  # aggregate or scalar; `typ` tells apart
+      else: raiseAssert "arkham: symbol is not an lvalue: " & nm
+  of TagLit:
+    case c.exprKind
+    of DotC, AtC, DerefC: (result = memLoc(nCur, slot); skip c)
+    else: raiseAssert "arkham: not an lvalue: " & $c.exprKind
+  else: raiseAssert "arkham: not an lvalue: " & $c.kind
+
+proc retIsVoid*(t: Cursor): bool {.inline.} =
+  t.kind == DotToken or (t.kind == TagLit and t.typeKind == VoidT)
+
+# ── static constant data layout (shared) ───────────────────────────────────
+# Lower a NIFC compile-time constant (`scalar` / `(oconstr …)` / `(aconstr …)` /
+# string) to the raw little-endian bytes of its in-memory representation, so a
+# backend can emit it as one read-only `(rodata …)` blob instead of zeroing
+# `.bss` and running an initialiser at entry. Arch-neutral: the layout follows
+# the same `typeSizeAlign` the ABI uses.
+
+proc constLitBits*(c: Cursor): uint64 =
+  ## Raw bits of a scalar literal, unwrapping `(suf value "type")` / `(par …)` and
+  ## value-preserving reinterprets `(cast Type value)` / `(conv Type value)` — e.g.
+  ## `cast[ptr CFile](1)` (a fd encoded as a pointer) collapses to the bits of `1`.
+  var v = c
+  while v.kind == TagLit and v.exprKind in {SufC, ParC, CastC, ConvC}:
+    if v.exprKind in {CastC, ConvC}: (inc v; skip v)   # past the tag + target type
+    else: inc v                                        # descend to the wrapped value
+  case v.kind
+  of IntLit:   result = cast[uint64](intVal(v))
+  of UIntLit:  result = uintVal(v)
+  of CharLit:  result = uint64(ord(charLit(v)))
+  of FloatLit: result = cast[uint64](floatVal(v))
+  of TagLit:
+    case v.exprKind
+    of TrueC:  result = 1'u64
+    of FalseC: result = 0'u64
+    of NilC:   result = 0'u64
+    of NegC:   (inc v; result = cast[uint64](-cast[int64](constLitBits(v))))
+    else: raiseAssert "arkham const: unsupported scalar " & $v.exprKind
+  else: raiseAssert "arkham const: unsupported literal kind " & $v.kind
+
+proc isConstScalarInit*(c: Cursor): bool =
+  ## Whether an initializer is a compile-time-constant SCALAR — a literal, a
+  ## bool/nil literal, or a (negate / cast / conv / suf / par) wrapping one. Such a
+  ## gvar initializer can be laid out as static data (see the backend `genGlobal`),
+  ## so it is correct even for a FOREIGN module's gvar in a bundle, where the
+  ## module's entry-time initializer code never runs. (Aggregate constructors and
+  ## address-of initializers — which need a relocation — are NOT covered here.)
+  var v = c
+  while v.kind == TagLit and v.exprKind in {SufC, ParC, CastC, ConvC, NegC}:
+    if v.exprKind in {CastC, ConvC}: (inc v; skip v)   # past the tag + target type
+    else: inc v                                        # descend to the wrapped value
+  case v.kind
+  of IntLit, UIntLit, CharLit, FloatLit: true
+  of TagLit: v.exprKind in {TrueC, FalseC, NilC}
+  else: false
+
+proc appendLE(buf: var string; bits: uint64; size: int) =
+  for i in 0 ..< size: buf.add char((bits shr (8 * i)) and 0xFF'u64)
+
+proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string) =
+  ## Append the in-memory bytes of constant `val` (of NIFC type `typ`) to `buf`.
+  let rt = resolveType(p, typ)
+  if rt.kind != TagLit: raiseAssert "arkham const: unresolved type"
+  case rt.typeKind
+  of IT, UT, CT, BoolT, FT, EnumT:
+    let (sz, _) = typeSizeAlign(p, rt)
+    appendLE(buf, constLitBits(val), sz)
+  of PtrT, AptrT, ProctypeT:
+    appendLE(buf, constLitBits(val), 8)      # nil only (address relocs: TODO)
+  of FlexarrayT:
+    var et = rt; inc et                      # element type
+    if val.kind == StrLit:
+      buf.add strVal(val)
+    else:
+      var vc = val                           # (aconstr T elem*)
+      vc.into:
+        skip vc                              # the constructed type
+        while vc.hasMore: (constToBytes(p, et, vc, buf); skip vc)
+  of ArrayT:
+    var et = rt; inc et                      # element type
+    let elemType = et
+    skip et                                  # past element type → length
+    let n = if et.kind == IntLit: int(intVal(et)) else: 0
+    let (esz, _) = typeSizeAlign(p, elemType)
+    var count = 0
+    var vc = val                             # (aconstr T elem*)
+    vc.into:
+      skip vc                                # the constructed type
+      while vc.hasMore: (constToBytes(p, elemType, vc, buf); skip vc; inc count)
+    for k in count ..< n:                    # zero-fill trailing elements
+      for i in 0 ..< esz: buf.add '\0'
+  of ObjectT:
+    # Match each `(oconstr … (kv field value) …)` value to a type field
+    # *positionally* (hexer emits constructor fields in declaration order). This
+    # avoids decoding field-name symbols, which sidesteps the foreign-module
+    # string-pool of a cross-module type (the value literals live in *our* pool;
+    # the type only supplies sizes/offsets via `typeSizeAlign`). A trailing
+    # `flexarray` field (size 0) appends its bytes past the fixed part.
+    let startLen = buf.len
+    var vals: seq[Cursor] = @[]
+    var vc = val
+    vc.into:
+      skip vc                                # the constructed type
+      while vc.hasMore:
+        vc.into:                             # (kv field value)
+          inc vc                             # skip field name (atom → no pool)
+          vals.add vc
+          while vc.hasMore: skip vc
+    var oc = rt
+    var off = 0
+    var maxAl = 1
+    var fi = 0
+    oc.into:
+      skip oc                                # base / inheritance
+      while oc.hasMore:
+        oc.into:                             # (fld :name pragmas type)
+          inc oc                             # skip field name (atom → no pool)
+          skip oc                            # field pragmas
+          let ftype = oc
+          let (fsz, fal) = typeSizeAlign(p, oc)
+          skip oc
+          off = align(off, fal)
+          if fal > maxAl: maxAl = fal
+          while buf.len < startLen + off: buf.add '\0'   # pad to field offset
+          if fi < vals.len:
+            constToBytes(p, ftype, vals[fi], buf)
+          else:
+            for i in 0 ..< fsz: buf.add '\0'
+          inc fi
+          off += fsz
+    while (buf.len - startLen) < align(off, maxAl): buf.add '\0'  # tail padding
+  else:
+    raiseAssert "arkham const: unsupported const type " & $rt.typeKind
+
+proc paramName*(idx: int): string {.inline.} =
+  ## The asm-NIF symbol for positional call parameter `idx`. nifasm's scope keys
+  ## symbols by NIF *basename* (the part before the `.<counter>` suffix), so the
+  ## counter cannot disambiguate — `p.0` and `p.1` would both reduce to basename
+  ## `p` and collide. Each param therefore gets a distinct basename `pN`.
+  result = "p" & $idx & ".0"
+
+proc spillName*(n: int): string {.inline.} =
+  ## The asm-NIF symbol for spill slot `n`. Like `paramName`, this must give each
+  ## slot a distinct *basename* (`spill0`, `spill1`, …): nifasm's scope keys stack
+  ## symbols by NIF basename (the part before the `.<counter>` suffix), so the
+  ## counter cannot disambiguate — `spill.0` and `spill.1` would both reduce to
+  ## basename `spill` and ALIAS the same stack slot (a value stored to one is read
+  ## back from the other). Hence `spillN.0`, not `spill.N`.
+  result = "spill" & $n & ".0"
+
+proc operandInReg*(g: var CodeGen; operand: Cursor; dest: Reg): bool =
+  ## Does the (peeked, not consumed) `operand` resolve to a register-resident
+  ## local whose home register is `dest`? The accumulator codegen evaluates a
+  ## binary op's left operand into `dest`; if the *right* operand lives in `dest`
+  ## that would clobber it before use, so the caller must save it first. Only
+  ## a bare register symbol can alias — a literal has no register, and a nested
+  ## expression is materialized into a fresh scratch (never a live local's home).
+  result = false
+  if operand.kind == Symbol:
+    let loc = g.ra.locationOfSym(symName(operand))
+    result = loc.kind == InReg and loc.r == dest

@@ -1,10 +1,11 @@
 (.nif27)
+(.indexat 228              )
 (stmts
- (type :TypeB.0.mod_select_b
+ (type :TypeB.0.
   (object
    (fld :value.0
     (i 64))))
- (proc :choose.0.mod_select_b
+ (proc :choose.0.
   (params)
   (result
    (:ret.0
@@ -14,4 +15,6 @@
   (stmts
    (mov
     (rax)0)
-   (ret))))
+   (ret))))(.index
+ (x TypeB.0. 44)
+ (x choose.0. 58))
