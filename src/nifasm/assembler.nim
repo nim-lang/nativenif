@@ -1320,6 +1320,19 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       result.tlvSym = sym
       result.typ = Type(kind: UIntT, bits: 64)
       inc n
+    elif sym != nil and sym.kind == skProc:
+      # A proc used as a value → its code address: `(adr reg proc)` materializes a
+      # function pointer. Same label the proc's definition / a direct `(call)` binds,
+      # so it resolves to the proc's entry (in __TEXT, reachable by ADR/PC-relative).
+      result.kind = okLabel
+      if sym.offset == -1:
+        let labId = ctx.buf.createLabel()
+        sym.offset = int(labId)
+        result.label = labId
+      else:
+        result.label = LabelId(sym.offset)
+      result.typ = Type(kind: UIntT, bits: 64)   # a code pointer
+      inc n
     else:
       error("Unknown or invalid symbol: " & name, n)
   else:
@@ -1407,6 +1420,12 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
     # A foreign proc is bundled into this image and called directly (see
     # generateSymbol); only genuine `extproc` externals use the IAT/extcall path.
     ctx.callContext.typ = sym.typ
+  elif sym.kind in {skGvar, skTvar, skVar, skParam} and sym.typ.kind == ProcT:
+    # Indirect call through a function-pointer variable: its proctype IS the
+    # signature, so arg/result checking and stack layout proceed exactly as for a
+    # direct call; only `(call)` differs (it loads the pointer and calls through it).
+    ctx.callContext.typ = sym.typ
+    ctx.callContext.indirect = true
   elif sym.kind == skExtProc:
     ctx.callContext.state = CallContextState.ExternalCall
     for i, ext in ctx.extProcs:
@@ -1456,6 +1475,26 @@ proc genCallMarkerA64(n: var Cursor; ctx: var GenContext) =
     error("Use (extcall) for external procs, not (call)", n)
 
   let sym = lookupWithAutoImport(ctx, ctx.scope, ctx.callContext.target, n)
+
+  if ctx.callContext.indirect:
+    # Indirect call through a function-pointer variable: load the pointer into x16
+    # (IP0 — caller-saved, not an argument register, so the prepared args in x0–x7
+    # are untouched) and `blr` through it. A global's address is formed with adrp+add
+    # (recorded as a gvar site and patched once the data layout is known), exactly
+    # like a `(lea reg gvar)`; then the pointer value is loaded and called.
+    if sym.kind == skGvar:
+      let pos = ctx.buf.data.getCurrentPosition()
+      arm64.emitAdrpAddGvar(ctx.buf.data, arm64.X16)            # x16 = &fnptr
+      ctx.gvarSites.add (pos, sym)
+      arm64.emitLdr(ctx.buf.data, arm64.X16, arm64.X16, 0'i32)  # x16 = fnptr
+    else:
+      error("Indirect call through unsupported function-pointer location: " &
+            $sym.kind, n)
+    arm64.emitBlr(ctx.buf.data, arm64.X16)
+    ctx.callContext.callEmitted = true
+    inc n
+    skipParRi n, "call"
+    return
 
   var labId: LabelId
   if sym.offset == -1:

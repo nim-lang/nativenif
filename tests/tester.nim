@@ -86,11 +86,12 @@ proc arkhamTests() =
   echo passed, " / ", total - skipped, " arkham tests successful (",
        skipped, " known-unsupported skipped)"
 
-# Tests not run under the static Linux/ELF `linux_arm64` qemu path: the tvar*
-# cases rely on Darwin-only TLV thread-locals; `patidx` (`(pat …)` pointer
-# indexing) and `indirect_call` (function-pointer calls) are implemented so far
-# only in the x86-64 backend (arm64: TODO).
-const arkhamLinuxA64Unsupported = ["tvar_addr", "patidx", "indirect_call"]
+# Every `tests/arkham/*.c.nif` now runs end-to-end under the static Linux/ELF
+# `linux_arm64` qemu path — the arm64 backend reached x86-64 feature parity
+# (function-pointer calls, `(pat …)` pointer indexing, and thread-locals as
+# single-threaded `.bss` globals). List a test's stem here if a new arm64-only
+# TODO is introduced.
+const arkhamLinuxA64Unsupported: seq[string] = @[]
 
 proc arkhamQemuTests() =
   ## Cross-validate the AArch64 backend on Linux: emit each `tests/arkham/*.c.nif`

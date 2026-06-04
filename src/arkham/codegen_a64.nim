@@ -251,6 +251,10 @@ proc aggrAddr(g: var CodeGen; c: var Cursor): tuple[r: Reg, temp: bool]
 proc emitLoad(g: var CodeGen; loc: Location; dest: Reg)
 proc gen(g: var CodeGen; c: var Cursor; dest: var Location)
 proc byteCopyConst(g: var CodeGen; dst, src: Reg; size: int)
+proc genTypeBody(g: var CodeGen; c: var Cursor)
+proc genProctypeSig(g: var CodeGen; c: var Cursor)
+proc indirectRetType(g: var CodeGen; gvarDecl: Cursor): Cursor
+proc emitPatAddr(g: var CodeGen; c: var Cursor; dest: Reg)
 
 proc emFieldMem(g: var CodeGen; base, field: string) =
   ## `(mem (dot base field))` — nifasm resolves the field offset from the
@@ -437,7 +441,17 @@ proc genVal(g: var CodeGen; c: var Cursor): Location =
   case c.kind
   of IntLit:
     result = immLoc(intVal(c), ScalarSlot); inc c
+  of UIntLit:
+    result = immLoc(cast[int64](uintVal(c)), ScalarSlot); inc c
+  of CharLit:
+    result = immLoc(int64(ord(charLit(c))), ScalarSlot); inc c
   of Symbol:
+    let si = g.lookupSym(symName(c))
+    if si.cat == scProc:                        # proc as a value → its code address
+      let t = g.borrowTmp()
+      g.emAdr(t, si.asmName)
+      inc c
+      return regLoc(t, ScalarSlot, owns = true)
     let loc = g.asLoc(c)
     case loc.kind
     of InReg: result = regLoc(loc.r, loc.typ, owns = false)
@@ -450,6 +464,9 @@ proc genVal(g: var CodeGen; c: var Cursor): Location =
     case c.exprKind
     of DotC, AtC, DerefC:                       # a memory lvalue used as a value
       result = g.asLoc(c)                        # a foldable `Mem` operand
+    of PatC:                                     # pointer indexing → eager element load
+      let t = g.borrowTmp(); g.genInto(c, t)
+      result = regLoc(t, ScalarSlot, owns = true)
     else:
       let t = g.tryBorrowTmp()                  # a computed value → a scratch reg…
       if t == NoReg: result = g.spillComputed(c)  # …or a spill slot if exhausted
@@ -721,10 +738,21 @@ proc emitLoad(g: var CodeGen; loc: Location; dest: Reg) =
       g.ab.tree MemX: g.emReg tmp
     g.giveBack tmp
   of Tvar:
-    g.genTlvAddr(loc.name, dest)             # dest ← &var
-    g.ab.tree MovA64:
-      g.emReg dest
-      g.ab.tree MemX: g.emReg dest            # dest ← [dest]
+    if g.a64Linux:
+      # Static-ELF Linux is single-threaded (per-thread == per-process), so a
+      # thread-local lives at a fixed `.bss` address like a global — `adr`+load,
+      # no TLV thunk (which is Darwin-only). nifasm declares the tvar as a gvar
+      # (see `genTvar`), so the symbol resolves via adrp+add.
+      let tmp = g.borrowTmp(); g.emAdr(tmp, loc.name)
+      g.ab.tree MovA64:
+        g.emReg dest
+        g.ab.tree MemX: g.emReg tmp
+      g.giveBack tmp
+    else:
+      g.genTlvAddr(loc.name, dest)             # dest ← &var
+      g.ab.tree MovA64:
+        g.emReg dest
+        g.ab.tree MemX: g.emReg dest            # dest ← [dest]
   of Mem:
     var nn = loc.cur
     case nn.exprKind
@@ -787,10 +815,18 @@ proc emitStore(g: var CodeGen; loc: Location; src: Reg) =
       g.emReg src
     g.giveBack tmp
   of Tvar:
-    g.genTlvAddr(loc.name, IntRet)           # x0 ← &var (clobbers x0/lr, not src)
-    g.ab.tree MovA64:
-      g.ab.tree MemX: g.emReg IntRet
-      g.emReg src
+    if g.a64Linux:
+      # Single-threaded static ELF: store through the tvar's fixed `.bss` address.
+      let tmp = g.borrowTmp(); g.emAdr(tmp, loc.name)
+      g.ab.tree MovA64:
+        g.ab.tree MemX: g.emReg tmp
+        g.emReg src
+      g.giveBack tmp
+    else:
+      g.genTlvAddr(loc.name, IntRet)           # x0 ← &var (clobbers x0/lr, not src)
+      g.ab.tree MovA64:
+        g.ab.tree MemX: g.emReg IntRet
+        g.emReg src
   of Mem:
     var nn = loc.cur
     case nn.exprKind
@@ -845,7 +881,11 @@ proc emitAddr(g: var CodeGen; loc: Location; dest: Reg) =
   ## (Register-resident scalars are spilled when address-taken, and by-reference
   ## aggregates are intercepted by `aggrAddr`, so those never reach here.)
   case loc.kind
-  of Tvar: g.genTlvAddr(loc.name, dest)
+  of Tvar:
+    # Linux: a tvar's address is its fixed `.bss` address (adrp+add, like a global);
+    # Darwin: obtained at run time via the TLV descriptor thunk.
+    if g.a64Linux: g.emAdr(dest, loc.name)
+    else: g.genTlvAddr(loc.name, dest)
   of Glob: g.emAdr(dest, loc.name)
   of NamedStack:
     g.ab.tree LeaA64:
@@ -1018,6 +1058,42 @@ proc genIntoF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
   else:
     raiseAssert "arkham v1: float operand not supported: " & $c.kind
 
+proc emitPatAddr(g: var CodeGen; c: var Cursor; dest: Reg) =
+  ## `dest ← &(pat base idx)` — pointer indexing. Unlike `dot`/`at`/`deref` (whose
+  ## bases fold into a single nifasm memory operand), a `pat` base is a pointer
+  ## *value* that must live in a register: an array/flexarray field decays to its
+  ## address, a real pointer is loaded. Base (and a non-immediate index) are
+  ## materialized into registers *before* the `lea` opens, so no helper instruction
+  ## lands inside its operand tree; the `lea dest, (at (cast (aptr elem) base) idx)`
+  ## then lets nifasm stride the index by the element size.
+  c.into:
+    let baseTy = resolveType(g.prog, g.getType(c))
+    var elem = innerType(g.prog, baseTy)
+    let baseReg = g.borrowTmp()
+    if baseTy.typeKind in {NifcType.ArrayT, NifcType.FlexarrayT}:
+      g.genAddr(c, baseReg)                     # decay: baseReg ← &field
+    else:
+      g.genInto(c, baseReg)                     # baseReg ← the pointer value
+    var idxImm = false
+    var idxV = 0'i64
+    var idxReg = NoReg
+    if c.kind == IntLit: (idxImm = true; idxV = intVal(c); inc c)
+    elif c.kind == UIntLit: (idxImm = true; idxV = cast[int64](uintVal(c)); inc c)
+    else: (idxReg = g.borrowTmp(); g.genInto(c, idxReg))
+    g.ab.tree LeaA64:
+      g.emReg dest
+      g.ab.tree AtX:
+        g.ab.tree CastX:
+          g.ab.aptrType:
+            if elem.kind == Symbol: g.ab.sym symName(elem)
+            else: g.genTypeBody(elem)
+          g.emReg baseReg
+        if idxImm: g.ab.intLit idxV
+        else: g.emReg idxReg
+    if idxReg != NoReg: g.giveBack idxReg
+    g.giveBack baseReg
+    while c.hasMore: skip c
+
 proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
   # While `dest` holds the value being built, a deep sub-operand may exhaust the
   # scratch pool and spill — its transient staging register must not clobber
@@ -1030,6 +1106,10 @@ proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
   case c.kind
   of IntLit:
     g.movImm(dest, intVal(c)); inc c
+  of UIntLit:
+    g.movImm(dest, cast[int64](uintVal(c))); inc c
+  of CharLit:
+    g.movImm(dest, int64(ord(charLit(c)))); inc c
   of StrLit:
     let nm = "msg." & $g.rodata.len
     if not g.ab.planning: g.rodata.add (nm, strVal(c))   # plan pass emits no rodata
@@ -1069,6 +1149,16 @@ proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
         while c.hasMore: skip c             # (cppref)?
     of AtC:                                 # `(at arr idx)` → dest ← arr[idx]
       let l = g.asLoc(c); g.emitLoad(l, dest)
+    of PatC:                                 # pointer index: &elem into dest, then load
+      g.emitPatAddr(c, dest)
+      g.ab.tree MovA64: (g.emReg dest; g.ab.tree MemX: g.emReg dest)
+    of SufC, ParC:                            # `(suf v "type")` / `(par v)` wrap one value
+      c.into:
+        g.genInto(c, dest)
+        while c.hasMore: skip c               # the type suffix / trailing tokens
+    of TrueC: g.movImm(dest, 1); skip c       # boolean / nil literals → immediate
+    of FalseC: g.movImm(dest, 0); skip c
+    of NilC: g.movImm(dest, 0); skip c
     else: raiseAssert "arkham v1: expression not supported: " & $c.exprKind
   else:
     raiseAssert "arkham v1: operand not supported: " & $c.kind
@@ -1076,11 +1166,77 @@ proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
 
 proc genAddr(g: var CodeGen; c: var Cursor; dest: Reg) =
   ## `dest ← &lvalue`, with `c` positioned at the lvalue. Parse the addressing
-  ## mode once, then let `emitAddr` form the address.
-  let l = g.asLoc(c)
-  g.emitAddr(l, dest)
+  ## mode once, then let `emitAddr` form the address. `pat` (pointer indexing)
+  ## can't fold into a single memory operand — its base pointer needs a register —
+  ## so it is formed eagerly by `emitPatAddr`.
+  if c.kind == TagLit and c.exprKind == PatC:
+    g.emitPatAddr(c, dest)
+  else:
+    let l = g.asLoc(c)
+    g.emitAddr(l, dest)
 
 # ── calls ────────────────────────────────────────────────────────────────────
+
+proc indirectRetType(g: var CodeGen; gvarDecl: Cursor): Cursor =
+  ## The return-type cursor of a function-pointer variable's proctype, for the
+  ## declarative call path's `retIsVoid`/result handling. NIFC's
+  ## `(proctype Empty Params RetType Pragmas)` always carries the RetType node — a
+  ## `.` (DotToken, `retIsVoid`-true) / `(void)` for a void proc — so it is simply
+  ## the third child.
+  var d = gvarDecl
+  result = gvarDecl                             # overwritten below (always a proctype here)
+  d.into:
+    inc d; skip d                               # name, pragmas
+    let pt = resolveType(g.prog, d)             # the (proctype …) body
+    assert pt.kind == TagLit and pt.typeKind == ProctypeT,
+           "arkham a64: indirect call through a non-proctype value"
+    var q = pt                                  # consume a copy; `result` keeps a cursor
+    q.into:
+      skip q                                    # Empty (the proc-name slot)
+      skip q                                    # Params
+      result = q                                # RetType (`.` / `(void)` / a real type)
+      while q.hasMore: skip q                   # drain RetType + Pragmas
+    while d.hasMore: skip d
+
+proc genProctypeSig(g: var CodeGen; c: var Cursor) =
+  ## Lower a NIFC `(proctype Empty Params [RetType] Pragmas)` to a concrete asm-NIF
+  ## signature `(proctype (params (param :pN.0 <reg|s> T)…) (result (res :ret.0 (x0)
+  ## T))? (clobber …))` — the AAPCS64 assignment, identical in shape to a
+  ## declarative proc's signature (`emitSignature`), so nifasm can resolve an
+  ## *indirect* `(prepare …)` call through a function pointer against it. A function
+  ## pointer is still 8 bytes (nifasm sizes `ProcT` as a pointer); the signature is
+  ## metadata for call sites.
+  g.ab.proctypeType:
+    c.into:
+      skip c                                    # the Empty slot (a proc has its name here)
+      g.ab.tree ParamsD:
+        if c.kind == TagLit:                    # (params (param …) …)
+          var idx = 0
+          c.into:
+            while c.hasMore:
+              c.into:                           # (param :name pragmas type)
+                inc c                           # name → positional pN.0
+                skip c                          # pragmas
+                g.ab.tree ParamD:
+                  g.ab.symDef paramName(idx)
+                  if idx < IntArgRegs.len: g.emReg IntArgRegs[idx]
+                  else: g.ab.keyword SO         # 9th+ → stack-passed
+                  g.genTypeBody(c)              # param type (consumes it)
+                while c.hasMore: skip c
+              inc idx
+        else:
+          skip c
+      g.ab.tree ResultD:
+        # The RetType is always the node after Params (a `.`/`(void)` for void).
+        if retIsVoid(c):
+          skip c                                # consume the void `.`/`(void)` node
+        else:
+          g.ab.symDef "ret.0"
+          g.emReg IntRet
+          g.genTypeBody(c)                      # consumes the return type
+      while c.hasMore: skip c                    # pragmas
+    g.ab.tree ClobberD:
+      for r in ConvClobbersGpr: g.emReg r
 
 proc genCall(g: var CodeGen; c: var Cursor) =
   ## `(call f arg…)` — internal `(call)` or external `(extcall)`. Integer/
@@ -1089,7 +1245,21 @@ proc genCall(g: var CodeGen; c: var Cursor) =
   ## during marshalling can't clobber it. The result lands in x0.
   c.into:
     let fsym = symName(c); inc c
-    assert g.callTarget.hasKey(fsym), "arkham v1: unknown call target: " & fsym
+    if not g.callTarget.hasKey(fsym):
+      let si = g.lookupSym(fsym)
+      if si.cat in {scGlobal, scTvar}:
+        # The callee is a *variable* holding a function pointer. Its proctype is a
+        # full signature, so it has the same typing as a direct call and goes
+        # through the SAME declarative `(prepare …)` path — only the call
+        # instruction differs (nifasm emits an indirect call when the prepare
+        # target is a function-pointer variable).
+        g.callTarget[fsym] = CallTarget(declarative: true, indirect: true,
+                                        asmName: fsym, retType: g.indirectRetType(si.decl))
+      else:
+        # A call into another module: resolve its signature from the owning
+        # module's embedded index and cache it. nifasm auto-imports the foreign
+        # `<module>.s.nif` and links the definition.
+        g.callTarget[fsym] = foreignCallTarget(g.prog, fsym)
     let tgt = g.callTarget[fsym]
     let sysNr = if g.a64Linux and tgt.extern: linuxA64SyscallNr(g.externCName(tgt.asmName))
                 else: -1
@@ -1250,9 +1420,22 @@ proc genTypeBody(g: var CodeGen; c: var Cursor) =
       g.ab.floatType(if t.kind == IntLit: int(intVal(t)) else: 64); skip c
     of BoolT:
       g.ab.boolType(); skip c
+    of VoidT:
+      g.ab.voidType(); skip c
     of PtrT:
       g.ab.ptrType:
         c.into: g.genTypeBody(c)            # pointee
+    of AptrT:                               # pointer to (array of) — a scalar ptr
+      g.ab.aptrType:
+        c.into: g.genTypeBody(c)            # element type
+    of FlexarrayT:                          # variable-length array tail (last fld)
+      g.ab.flexarrayType:
+        c.into: g.genTypeBody(c)            # element type
+    of ProctypeT:
+      # A function pointer (8 bytes). Emit its full ABI signature — not an opaque
+      # `(ptr (void))` — so nifasm can type-check and resolve an indirect call
+      # `(prepare <fnptr> … (call))` against it.
+      g.genProctypeSig(c)
     of ArrayT:
       c.into:                               # NIFC `(array Type Expr)`
         g.ab.arrayType:
@@ -2030,6 +2213,7 @@ proc genStmt(g: var CodeGen; c: var Cursor) =
       c.into:
         if c.hasMore and c.kind != DotToken: g.genInto(c, IntRet)
         else: g.movImm(IntRet, 0)
+        while c.hasMore: skip c                     # void `(ret .)` → drop the `.`
       g.movImm(R8, LinuxA64ExitNr.int64)           # x8 = exit
       g.ab.tree SvcA64: g.ab.intLit 0
       return
@@ -2052,6 +2236,7 @@ proc genStmt(g: var CodeGen; c: var Cursor) =
           g.genIntoF(c, FloatRet, g.retFloatBits)   # float result in v0
         else:
           g.genInto(c, IntRet)
+      while c.hasMore: skip c                   # void `(ret .)` → drop the `.`
     g.killFrameRegLocals()                    # release locals bound to restored regs
     if g.ra.hasStackVars:                     # release nifasm-managed slots
       g.ab.tree AddA64: g.emReg SP; g.ab.keyword SsizeX
@@ -2357,17 +2542,35 @@ proc genType(g: var CodeGen; name: string; decl: Cursor) =
       g.genTypeBody(c)
 
 proc genGlobal(g: var CodeGen; name: string; decl: Cursor) =
-  ## Emit `(gvar :name <type>)` — a zero-initialized `.bss` global (also used
-  ## for `const`; any initializer is run at entry by `emitGlobalInits`).
+  ## Emit a top-level `const`/`gvar`. A true `const` with a value becomes a
+  ## read-only `.text` data blob; a `gvar` with a compile-time-constant SCALAR
+  ## initializer is laid out as static `.bss`-image data (so it is correct even for
+  ## a FOREIGN module's gvar in a bundle, whose entry-time `emitGlobalInits` never
+  ## runs — and for a `var` later mutated). Any other (runtime) initializer is a
+  ## zeroed slot filled at entry by `emitGlobalInits`.
   var c = decl
+  let isConst = c.stmtKind == ConstS
   c.into:                                     # (gvar SymbolDef VarPragmas Type Value?)
     inc c                                     # name
     skip c                                    # pragmas
-    g.ab.open NifasmDecl.GvarD
-    g.ab.symDef name
-    g.genTypeBody(c)                          # type
-    g.ab.close()
-    while c.hasMore: skip c                   # value (initialized at entry)
+    let typeCur = c
+    skip c                                    # type
+    let hasValue = c.hasMore and c.kind != DotToken
+    if isConst and hasValue:
+      var bytes = ""
+      constToBytes(g.prog, typeCur, c, bytes)
+      g.ab.tree RodataD:
+        g.ab.symDef name
+        g.ab.str bytes
+    else:
+      g.ab.open NifasmDecl.GvarD
+      g.ab.symDef name
+      var tc2 = typeCur
+      g.genTypeBody(tc2)                       # type
+      if hasValue and isConstScalarInit(c):
+        g.ab.intLit cast[int64](constLitBits(c))
+      g.ab.close()
+    while c.hasMore: skip c                   # value (runtime inits done at entry)
 
 proc genTvar(g: var CodeGen; name: string; decl: Cursor) =
   ## Emit `(tvar :name <type> <intlit>?)` — a macOS thread-local variable. A
@@ -2378,6 +2581,23 @@ proc genTvar(g: var CodeGen; name: string; decl: Cursor) =
   c.into:                                     # (tvar SymbolDef VarPragmas Type Value?)
     inc c                                     # name
     skip c                                    # pragmas
+    if g.a64Linux:
+      # Static-ELF Linux is single-threaded (per-thread == per-process): emit the
+      # thread-local as a plain `.bss` global (no Darwin TLV template). Its access
+      # routes through the global adrp+add path; a compile-time-constant scalar
+      # initializer is baked as static `.bss`-image data (correct cross-module),
+      # any other initializer is stored at entry by `emitGlobalInits`.
+      let typeCur = c
+      skip c                                  # type
+      g.ab.open NifasmDecl.GvarD
+      g.ab.symDef name
+      var tc2 = typeCur
+      g.genTypeBody(tc2)                       # type
+      if c.hasMore and c.kind != DotToken and isConstScalarInit(c):
+        g.ab.intLit cast[int64](constLitBits(c))
+      g.ab.close()
+      while c.hasMore: skip c                 # value (runtime inits done at entry)
+      return
     g.ab.open NifasmDecl.TvarD
     g.ab.symDef name
     g.genTypeBody(c)                          # type
@@ -2390,14 +2610,18 @@ proc genTvar(g: var CodeGen; name: string; decl: Cursor) =
 
 proc emitGlobalInits(g: var CodeGen) =
   ## At program entry, store each global's initializer (if any) into its slot.
-  for name, decl in g.globals:
+  ## On Linux the thread-locals are `.bss` globals too (see `genTvar`), so their
+  ## literal initializers are stored here as well — the block is otherwise zeroed.
+  template storeInit(name: string; decl: Cursor) =
     var c = decl
     c.into:
       inc c; skip c                           # name, pragmas
       let gslot = slotOf(g.prog, c)           # the global's declared type
       let gbits = if gslot.size == 4: 32 else: 64
       skip c                                   # type
-      if c.hasMore and c.kind != DotToken:
+      # A constant-scalar initializer was laid out as static data (see genGlobal /
+      # genTvar), so there is no entry-time store to emit for it.
+      if c.hasMore and c.kind != DotToken and not isConstScalarInit(c):
         if gslot.kind == AFloat:               # float global: store via fstr
           let fv = g.borrowFTmp()
           g.genIntoF(c, fv, gbits)
@@ -2417,6 +2641,11 @@ proc emitGlobalInits(g: var CodeGen) =
           g.giveBack p
           g.giveBack v
       while c.hasMore: skip c
+  for name, decl in g.globals:
+    if decl.stmtKind == ConstS: continue        # emitted as a rodata data blob
+    storeInit(name, decl)
+  if g.a64Linux:
+    for name, decl in g.tvars: storeInit(name, decl)
 
 proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                   linux = false): string =
