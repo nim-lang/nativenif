@@ -322,6 +322,19 @@ proc emScalarStackVar(g: var CodeGen; name: string) =
   g.ab.intType(64)
   g.ab.close()
 
+proc emTypedStackVar(g: var CodeGen; name: string; t: Cursor) =
+  ## `(var :name (s) T)` with `T` the value's actual NIFC type. Use this (not the
+  ## generic `(i 64)` slot) for a homed/spilled scalar whose type matters to
+  ## nifasm — e.g. a pointer param that the body later derefs, where an `(i 64)`
+  ## slot would both reject the typed store and forbid the deref (nifasm is strict).
+  g.ab.open NifasmDecl.VarD
+  g.ab.symDef name
+  g.ab.keyword SO
+  var tc = t
+  if tc.kind == Symbol: g.ab.sym symName(tc)
+  else: g.genTypeBody(tc)
+  g.ab.close()
+
 proc emStackMem(g: var CodeGen; name: string) =       # (mem (rsp) name)
   g.ab.tree MemX:
     g.ab.reg RSP
@@ -360,12 +373,59 @@ proc loadOperandReg(g: var CodeGen; v: Location; tmps: var seq[Reg]): Reg =
   else: result = g.pickStaging()
   g.place(v, result)
 
-proc emAccessAddr(g: var CodeGen; n: var Cursor; tmps: var seq[Reg]) =
-  ## Recursively re-emit the NIFC lvalue subtree `n` as a nifasm address
-  ## expression, letting nifasm collapse the whole chain to `base+offset` from the
-  ## declared types. Borrowed temps (deref pointers, computed array indices) are
-  ## pushed onto `tmps` for the caller to free after the instruction. A stack var
-  ## contributes `(rsp) name`; a pointer in a register contributes the register.
+proc prematAccess(g: var CodeGen; n: var Cursor; tmps: var seq[Reg]; regs: var seq[Reg]) =
+  ## PASS 1 of address emission. Walk the NIFC lvalue subtree `n` and materialize
+  ## every embedded VALUE — a deref'd pointer, a computed array index, a global's
+  ## address — into a register NOW, emitting the load as an ordinary preceding
+  ## statement (this runs at statement level, before the consuming instruction tree
+  ## is opened). Registers are appended to `regs` in traversal order; `emAccessAddr`
+  ## (pass 2) consumes them in that exact order, so no helper instruction ever lands
+  ## *inside* the address operand tree (which would be corrupt asm-NIF — a `(dot
+  ## (mov …) …)`). Borrowed scratch is pushed to `tmps` for the caller to free
+  ## after pass 2. `n` is fully advanced (over its own copy at the call site).
+  case n.kind
+  of Symbol:
+    let nm = symName(n); inc n
+    let loc = g.ra.locationOfSym(nm)
+    if loc.kind notin {NamedStack, InReg}:
+      # A global aggregate base: materialize its address into a register. (The
+      # address lives only for the one load/store/cmp this operand feeds, so a
+      # transient caller-saved staging register is safe when the pool is empty.)
+      let si = g.lookupSym(nm)
+      if si.cat != scGlobal:
+        raiseAssert "arkham x64 v0: unsupported lvalue base: " & nm
+      var r = g.tryBorrowTmp()
+      if r != NoReg: tmps.add r
+      else: r = g.pickStaging()
+      g.emGlobalAddr(r, nm)
+      regs.add r
+  of TagLit:
+    case n.exprKind
+    of DotC:
+      n.into:
+        g.prematAccess(n, tmps, regs)            # base (recursive)
+        skip n                                   # field name
+        while n.hasMore: skip n                  # depth selector
+    of AtC:
+      n.into:
+        g.prematAccess(n, tmps, regs)            # array base (recursive)
+        if n.kind == IntLit: inc n               # immediate index stays inline
+        else: regs.add g.loadOperandReg(g.genVal(n), tmps)  # computed index → reg
+        while n.hasMore: skip n
+    of DerefC:
+      n.into:
+        regs.add g.loadOperandReg(g.genVal(n), tmps)  # the pointer → a register
+        while n.hasMore: skip n                  # (cppref)?
+    else: raiseAssert "arkham x64 v0: not an lvalue: " & $n.exprKind
+  else: raiseAssert "arkham x64 v0: not an lvalue: " & $n.kind
+
+proc emAccessAddr(g: var CodeGen; n: var Cursor; regs: openArray[Reg]; ri: var int) =
+  ## PASS 2: re-emit the lvalue subtree `n` as a nifasm address expression so
+  ## nifasm collapses the chain to `base+offset` (+ index*scale) from the declared
+  ## types. Emits ONLY register / stack-symbol / immediate leaves — every embedded
+  ## value was already loaded into a register by `prematAccess`, consumed here from
+  ## `regs` (same traversal order) — so this pass emits no instruction of its own.
+  ## A stack var contributes `(rsp) name`; a register-resident pointer its register.
   case n.kind
   of Symbol:
     let nm = symName(n); inc n
@@ -382,61 +442,70 @@ proc emAccessAddr(g: var CodeGen; n: var Cursor; tmps: var seq[Reg]) =
       else:
         g.emReg loc.r                              # a plain pointer in a register
     else:
-      # A global aggregate (this module or foreign): materialize its address in
-      # a temp and type it as `(ptr <type>)` so a `(dot …)`/`(at …)` can offset.
+      # global aggregate: its address was materialized into regs[ri] by pass 1.
+      let r = regs[ri]; inc ri
       let si = g.lookupSym(nm)
-      if si.cat == scGlobal:
-        # The global's address only needs to live for the single load/store/cmp
-        # instruction this operand feeds (no calls in between), so when the
-        # scratch pool is exhausted a transient caller-saved staging register is
-        # safe — keeping a global-indexed access total under register pressure.
-        var r = g.tryBorrowTmp()
-        if r != NoReg: tmps.add r
-        else: r = g.pickStaging()
-        g.emGlobalAddr(r, nm)
-        var d = si.decl
-        inc d; skip d; skip d                      # enter (gvar …): name, pragmas → type
-        g.ab.tree CastX:
-          g.ab.ptrType:
-            if d.kind == Symbol: g.ab.sym symName(d)
-            else: g.genTypeBody(d)
-          g.emReg r
-      else: raiseAssert "arkham x64 v0: unsupported lvalue base: " & nm
+      var d = si.decl
+      inc d; skip d; skip d                        # enter (gvar …): name, pragmas → type
+      g.ab.tree CastX:
+        g.ab.ptrType:
+          if d.kind == Symbol: g.ab.sym symName(d)
+          else: g.genTypeBody(d)
+        g.emReg r
   of TagLit:
     case n.exprKind
     of DotC:
       g.ab.tree DotX:
         n.into:
-          g.emAccessAddr(n, tmps)                # base (recursive)
+          g.emAccessAddr(n, regs, ri)            # base (recursive)
           let field = symName(n); inc n          # field name (offset is nifasm's job)
           g.ab.sym field                         # nifasm sizes the access by field type
           while n.hasMore: skip n                # depth selector
     of AtC:
       g.ab.tree AtX:
         n.into:
-          g.emAccessAddr(n, tmps)                # array base (recursive)
+          g.emAccessAddr(n, regs, ri)            # array base (recursive)
           if n.kind == IntLit: (g.ab.intLit intVal(n); inc n)
-          else:
-            g.emReg g.loadOperandReg(g.genVal(n), tmps)
+          else: (g.emReg regs[ri]; inc ri; skip n)  # pre-loaded computed index
           while n.hasMore: skip n
     of DerefC:
+      # The deref'd pointer is in a register (pre-loaded). Type it as `(ptr
+      # Pointee)` so an enclosing `(dot …)`/`(at …)` can compute the field/element
+      # offset (a bare register carries no pointee type — nifasm couldn't size the
+      # access). `getType` yields the pointee (its `fieldType` handles inheritance).
+      var pointee = g.getType(n)                  # deref result = the pointee type
       n.into:
-        g.emReg g.loadOperandReg(g.genVal(n), tmps)  # the pointer → a register
-        while n.hasMore: skip n                  # (cppref)?
+        g.ab.tree CastX:
+          g.ab.ptrType:
+            if pointee.kind == Symbol: g.ab.sym symName(pointee)
+            else: g.genTypeBody(pointee)
+          g.emReg regs[ri]; inc ri                # the pointer (pre-loaded)
+        skip n                                    # skip the pointer value subtree
+        while n.hasMore: skip n                   # (cppref)?
     else: raiseAssert "arkham x64 v0: not an lvalue: " & $n.exprKind
   else: raiseAssert "arkham x64 v0: not an lvalue: " & $n.kind
 
-proc emMemOperandLoc(g: var CodeGen; loc: Location): seq[Reg] =
-  ## `(mem <addr>)` for a memory `Location` (a `Val`-of-old `vkMem`). `NamedStack`
-  ## is a by-name slot (spilled local or synthetic spill — no cursor) → `(mem (rsp)
-  ## name)`; `Mem` re-emits its captured lvalue subtree so nifasm folds the chain.
+proc prematLoc(g: var CodeGen; loc: Location; tmps: var seq[Reg]): seq[Reg] =
+  ## Pre-materialize the values embedded in a memory operand's access chain (see
+  ## `prematAccess`), as statements emitted BEFORE the consuming instruction tree.
+  ## A `NamedStack` (spilled scalar / synthetic spill) has no chain → no work.
+  ## Call this first, then emit the operand with the returned registers via
+  ## `emMemOperandLoc` / `emAccessAddr`, and free `tmps` afterwards.
   result = @[]
+  if loc.kind == Mem:
+    var c = loc.cur
+    g.prematAccess(c, tmps, result)
+
+proc emMemOperandLoc(g: var CodeGen; loc: Location; regs: openArray[Reg]; ri: var int) =
+  ## `(mem <addr>)` for a memory `Location`. `NamedStack` is a by-name slot →
+  ## `(mem (rsp) name)`; `Mem` re-emits its lvalue subtree (pass 2) so nifasm folds
+  ## the chain. Embedded values were pre-loaded by `prematLoc`/`prematAccess`.
   case loc.kind
   of NamedStack: g.emStackMem(loc.name)
   of Mem:
     var nn = loc.cur
     g.ab.tree MemX:
-      g.emAccessAddr(nn, result)
+      g.emAccessAddr(nn, regs, ri)
   else: raiseAssert "arkham x64: emMemOperandLoc on non-memory location " & $loc.kind
 
 proc emitLoadLoc(g: var CodeGen; loc: Location; dest: Reg) =
@@ -454,9 +523,11 @@ proc emitLoadLoc(g: var CodeGen; loc: Location; dest: Reg) =
       g.ab.tree MemX: g.emReg dest                # dest ← [dest]
   of NamedStack, Mem:                             # rsp slot / folded access chain
     var tmps: seq[Reg]
+    let regs = g.prematLoc(loc, tmps)             # load embedded values FIRST
+    var ri = 0
     g.ab.tree MovX64:
       g.emReg dest
-      tmps = g.emMemOperandLoc(loc)
+      g.emMemOperandLoc(loc, regs, ri)
     for t in tmps: g.giveBack t
   else: raiseAssert "arkham x64: emitLoadLoc on location kind " & $loc.kind
 
@@ -477,8 +548,10 @@ proc emitStoreLoc(g: var CodeGen; loc: Location; src: Reg) =
     g.giveBack p
   of NamedStack, Mem:
     var tmps: seq[Reg]
+    let regs = g.prematLoc(loc, tmps)             # load embedded values FIRST
+    var ri = 0
     g.ab.tree MovX64:
-      tmps = g.emMemOperandLoc(loc)
+      g.emMemOperandLoc(loc, regs, ri)
       g.emReg src
     for t in tmps: g.giveBack t
   else: raiseAssert "arkham x64: emitStoreLoc on location kind " & $loc.kind
@@ -492,9 +565,11 @@ proc emGlobalAddr(g: var CodeGen; dest: Reg; name: string) =
 proc binMem(g: var CodeGen; op: X64Inst; dest: Reg; loc: Location) =
   ## `dest op= <memory operand>` — x86 folds a memory source into the ALU op.
   var tmps: seq[Reg]
+  let regs = g.prematLoc(loc, tmps)             # load embedded values FIRST
+  var ri = 0
   g.ab.tree op:
     g.emReg dest
-    tmps = g.emMemOperandLoc(loc)
+    g.emMemOperandLoc(loc, regs, ri)
   for t in tmps: g.giveBack t
 
 proc emitAddrLoc(g: var CodeGen; loc: Location; dest: Reg) =
@@ -527,9 +602,13 @@ proc emitAddrLoc(g: var CodeGen; loc: Location; dest: Reg) =
         while nn.hasMore: skip nn
     else:                                     # &(dot …)/&arr[idx] — re-emit the chain
       var tmps: seq[Reg] = @[]                # nifasm computes base+offset (+ index scale)
+      var pre = nn                            # pass 1 walks a copy; pass 2 walks `nn`
+      var regs: seq[Reg] = @[]
+      g.prematAccess(pre, tmps, regs)          # load embedded values FIRST
+      var ri = 0
       g.ab.tree LeaX64:
         g.emReg dest
-        g.emAccessAddr(nn, tmps)
+        g.emAccessAddr(nn, regs, ri)
       for t in tmps: g.giveBack t
   else: raiseAssert "arkham x64: emitAddrLoc on location kind " & $loc.kind
 
@@ -549,9 +628,11 @@ proc emitLoadFLoc(g: var CodeGen; loc: Location; dest: FReg; bits: int) =
   of Mem:
     let op = if bits == 32: MovssX64 else: MovsdX64
     var tmps: seq[Reg]
+    let regs = g.prematLoc(loc, tmps)             # load embedded values FIRST
+    var ri = 0
     g.ab.tree op:
       g.emFReg dest
-      tmps = g.emMemOperandLoc(loc)
+      g.emMemOperandLoc(loc, regs, ri)
     for t in tmps: g.giveBack t
   else: raiseAssert "arkham x64: emitLoadFLoc on location kind " & $loc.kind
 
@@ -563,8 +644,10 @@ proc emitStoreFLoc(g: var CodeGen; loc: Location; src: FReg; bits: int) =
   of Mem:
     let op = if bits == 32: MovssX64 else: MovsdX64
     var tmps: seq[Reg]
+    let regs = g.prematLoc(loc, tmps)             # load embedded values FIRST
+    var ri = 0
     g.ab.tree op:
-      tmps = g.emMemOperandLoc(loc)
+      g.emMemOperandLoc(loc, regs, ri)
       g.emFReg src
     for t in tmps: g.giveBack t
   else: raiseAssert "arkham x64: emitStoreFLoc on location kind " & $loc.kind
@@ -592,14 +675,38 @@ proc forceReg(g: var CodeGen; v: Location): tuple[r: Reg, owns: bool] =
 
 const StagingCandidates = [RAX, RDI, RSI, RDX, RCX, R8, R9]
 
+proc releaseStaleName(g: var CodeGen; r: Reg) =
+  ## A register about to be reused as raw scratch/staging must carry no stale
+  ## named-local binding. A dead parameter often lingers in `regLocal` under its
+  ## signature name `pN.0` (with its original type); `emReg` would then wrongly
+  ## emit that typed name for the new value (e.g. `(mov p1.0 <ptr>)` where p1.0 is
+  ## the i64 `start` param → nifasm strict-type mismatch). `(kill)` the binding and
+  ## drop it so `emReg` falls back to the raw `(reg)` tag (untyped scratch).
+  if r != NoReg and g.regLocal.hasKey(r):
+    if not g.ab.planning: g.ab.tree KillX64: g.ab.sym g.regLocal[r]
+    g.regLocal.del r
+
+proc regHoldsLiveLocal(g: var CodeGen; r: Reg): bool =
+  ## True if a local/param is currently allocated to register `r` (per the
+  ## allocator's view). A *param* can sit in a caller-saved arg register (e.g.
+  ## `p0.0` in rdi), so staging must not clobber it just because it's caller-saved.
+  for name, pos in g.ra.symPos:
+    let loc = g.ra.locs[pos]
+    if loc.kind == InReg and loc.r == r: return true
+
 proc pickStaging(g: var CodeGen; avoid: Reg = NoReg): Reg =
   ## A transient compute register for a spill: the first non-sealed caller-saved
-  ## GPR that is neither the scratch pool (r10/r11, exhausted at a spill) nor a
-  ## local home (those are callee-saved), is not a live expression accumulator
-  ## (`liveAccums` — e.g. rax holding the return value while a deep right operand
-  ## spills), and is not `avoid`. Clobbering it transiently is then safe.
+  ## GPR that is not the scratch pool (r10/r11, exhausted at a spill), not a live
+  ## local/param home (a param may live in its caller-saved arg register), not a
+  ## live expression accumulator (`liveAccums` — e.g. rax holding the return value
+  ## while a deep right operand spills), and not `avoid`. Clobbering it transiently
+  ## is then safe; any stale (dead-param) name binding on it is released first so
+  ## `emReg` emits the raw `(reg)` rather than the dead param's typed name.
   for r in StagingCandidates:
-    if r != avoid and not g.ra.isSealed(r) and r notin g.liveAccums: return r
+    if r != avoid and not g.ra.isSealed(r) and r notin g.liveAccums and
+       not g.regHoldsLiveLocal(r):
+      g.releaseStaleName(r)
+      return r
   raiseAssert "arkham x64: no staging register available for a spill"
 
 proc spillComputed(g: var CodeGen; c: var Cursor): Location =
@@ -1240,6 +1347,8 @@ proc emitCmpBranch(g: var CodeGen; c: var Cursor; toLabel: string; whenTrue: boo
       # a spilled/memory `b` into a fresh temp here was the source of the scratch-
       # pool exhaustion on deep conditions.
       var bTmps: seq[Reg] = @[]
+      let bRegs = g.prematLoc(bv, bTmps)        # load any embedded values FIRST
+      var bri = 0
       g.ab.tree CmpX64:
         g.emReg ar
         if bv.kind == Imm and bv.ival >= 0 and bv.ival <= 0xFFFF:
@@ -1248,7 +1357,7 @@ proc emitCmpBranch(g: var CodeGen; c: var Cursor; toLabel: string; whenTrue: boo
           g.emReg bv.r
           if bv.owns: bTmps.add bv.r
         elif bv.kind in {NamedStack, Mem}:
-          bTmps = g.emMemOperandLoc(bv)           # cmp ar, [mem] — folded, no extra reg
+          g.emMemOperandLoc(bv, bRegs, bri)       # cmp ar, [mem] — folded, no extra reg
         else:                                     # large/negative immediate → load it
           let (t, owns) = g.forceReg(bv)
           g.emReg t
@@ -2452,10 +2561,16 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor; declarative: bool) =
           # declarative path the arg reg is bound to `pN.0`, so the value must be
           # referenced by that name (a raw `(reg)` is rejected as "bound"); in the
           # non-declarative path there is no binding, so the raw register is used.
-          g.emScalarStackVar(nm)                # (var :nm (s) (i 64))
+          # Type the slot with the param's real type (e.g. a pointer) — a generic
+          # `(i 64)` slot would reject the typed store and forbid a later deref.
+          g.emTypedStackVar(nm, typeCur)        # (var :nm (s) <param type>)
           g.ab.tree MovX64:
             g.emStackMem(nm)
             if declarative: g.ab.sym paramName(idx) else: g.ab.reg argReg
+          # The param now lives in its stack slot; release the arg-register binding
+          # so the now-free register can be reused (else a later raw `(reg)` use is
+          # rejected as still bound to `pN.0`). Mirrors the relocate branch above.
+          if declarative: g.ab.tree KillX64: g.ab.sym paramName(idx)
         else:
           raiseAssert "arkham x64 v0: spilled / float parameter: " & nm
         inc idx
