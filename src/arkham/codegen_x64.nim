@@ -127,7 +127,14 @@ proc borrowTmp(g: var CodeGen): Reg =
       raiseAssert "arkham x64 v0: out of registers (no local to steal for scratch)"
 
 proc giveBack(g: var CodeGen; r: Reg) {.inline.} =
-  if r != NoReg: g.freeTmp.incl r
+  ## Release a transient register obtained during premat / value evaluation. A
+  ## staging register (caller-saved, sealed while it held an address/index so a
+  ## sibling pick couldn't reuse it) is unsealed; a real scratch-pool register
+  ## (R10/R11) is also returned to the pool. Unsealing a never-sealed reg is a
+  ## harmless no-op.
+  if r == NoReg: return
+  g.ra.unseal {r}
+  if r in g.md.intTempRegs: g.freeTmp.incl r
 
 # ── SSE / floating-point scratch pool + emit helpers ─────────────────────────
 # x86-64 floats live in xmm0..xmm15 (the FReg slots F0..F15). The register operand
@@ -380,8 +387,30 @@ proc loadOperandReg(g: var CodeGen; v: Location; tmps: var seq[Reg]): Reg =
     return v.r
   result = g.tryBorrowTmp()
   if result != NoReg: tmps.add result
-  else: result = g.pickStaging()
+  else:
+    result = g.pickStaging()
+    g.ra.seal result          # hold it so a sibling base/index pick can't reuse it
+    tmps.add result           # `giveBack` unseals it after the operand is consumed
   g.place(v, result)
+
+proc atNeedsScratch(g: var CodeGen; atNode: Cursor): bool =
+  ## Does this `(at base idx)` level need an explicit scratch register? x86 can fold
+  ## `base + idx*scale` into one operand only for scale ∈ {1,2,4,8} and a single
+  ## index; a register index whose element stride is anything else (a multi-
+  ## dimensional array's outer dimension, stride = the inner array's size) cannot
+  ## fold, so arkham hands nifasm a scratch and nifasm computes `base + idx*stride`
+  ## into it (the `(at base idx scratch)` 3-operand form). An immediate index always
+  ## folds to a displacement → never needs one. This is the x86 SIB rule; the arm64
+  ## backend's analogue always returns true (it materializes every indexed address).
+  let stride = typeSizeAlign(g.prog, resolveType(g.prog, g.getType(atNode)))[0]
+  if stride in [1, 2, 4, 8]: return false
+  var n = atNode
+  var idxIsReg = false
+  n.into:
+    skip n                                      # the array base
+    idxIsReg = n.kind != IntLit                 # a non-literal index lives in a register
+    while n.hasMore: skip n
+  result = idxIsReg
 
 proc prematAccess(g: var CodeGen; n: var Cursor; tmps: var seq[Reg]; regs: var seq[Reg]) =
   ## PASS 1 of address emission. Walk the NIFC lvalue subtree `n` and materialize
@@ -406,7 +435,10 @@ proc prematAccess(g: var CodeGen; n: var Cursor; tmps: var seq[Reg]; regs: var s
         raiseAssert "arkham x64 v0: unsupported lvalue base: " & nm
       var r = g.tryBorrowTmp()
       if r != NoReg: tmps.add r
-      else: r = g.pickStaging()
+      else:
+        r = g.pickStaging()
+        g.ra.seal r             # hold the base addr so the index pick can't reuse it
+        tmps.add r              # `giveBack` unseals it after the operand is consumed
       g.emGlobalAddr(r, nm)
       regs.add r
   of TagLit:
@@ -417,10 +449,19 @@ proc prematAccess(g: var CodeGen; n: var Cursor; tmps: var seq[Reg]; regs: var s
         skip n                                   # field name
         while n.hasMore: skip n                  # depth selector
     of AtC:
+      let needsScratch = g.atNeedsScratch(n)
       n.into:
         g.prematAccess(n, tmps, regs)            # array base (recursive)
         if n.kind == IntLit: inc n               # immediate index stays inline
         else: regs.add g.loadOperandReg(g.genVal(n), tmps)  # computed index → reg
+        if needsScratch:                         # non-scale stride: supply a scratch reg
+          var s = g.tryBorrowTmp()               # nifasm computes base+idx*stride into it
+          if s != NoReg: tmps.add s
+          else:
+            s = g.pickStaging()
+            g.ra.seal s
+            tmps.add s
+          regs.add s
         while n.hasMore: skip n
     of DerefC:
       n.into:
@@ -472,11 +513,14 @@ proc emAccessAddr(g: var CodeGen; n: var Cursor; regs: openArray[Reg]; ri: var i
           g.ab.sym field                         # nifasm sizes the access by field type
           while n.hasMore: skip n                # depth selector
     of AtC:
+      let needsScratch = g.atNeedsScratch(n)
       g.ab.tree AtX:
         n.into:
           g.emAccessAddr(n, regs, ri)            # array base (recursive)
           if n.kind == IntLit: (g.ab.intLit intVal(n); inc n)
           else: (g.emReg regs[ri]; inc ri; skip n)  # pre-loaded computed index
+          if needsScratch:                       # 3rd operand: arkham-supplied scratch
+            g.emReg regs[ri]; inc ri             #   nifasm computes base+idx*stride into it
           while n.hasMore: skip n
     of DerefC:
       # The deref'd pointer is in a register (pre-loaded). Type it as `(ptr
@@ -1245,8 +1289,19 @@ proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
   let protect = dest in StagingCandidates and dest notin g.liveAccums
   if protect: g.liveAccums.incl dest
   case c.kind
-  of IntLit, UIntLit, CharLit, Symbol:
-    g.place(g.genVal(c), dest)               # literal / register-resident local
+  of IntLit, UIntLit, CharLit:
+    g.place(g.genVal(c), dest)               # literal → immediate
+  of Symbol:
+    # A symbol's value loads straight into `dest`: `emitLoadLoc` reuses `dest` as
+    # the address scratch for a global/tvar, so this needs NO extra scratch register
+    # (unlike routing through `genVal`, which borrows a fresh temp). That keeps a
+    # struct copy whose source is `(deref globalPtr)` total when both scratch
+    # registers already hold the copy's dest/src addresses.
+    let si = g.lookupSym(symName(c))
+    if si.cat == scProc:
+      g.place(g.genVal(c), dest)             # a proc value is its code address (lea)
+    else:
+      g.emitLoadLoc(g.asLoc(c), dest)
   of StrLit:                                 # string literal → rodata + RIP-relative lea
     let nm = "msg." & $g.rodata.len
     if not g.ab.planning: g.rodata.add (nm, strVal(c))   # plan pass emits no rodata
@@ -1371,28 +1426,30 @@ proc emitCmpBranch(g: var CodeGen; c: var Cursor; toLabel: string; whenTrue: boo
       # steal during `b` cannot evict it (it may be a register-local).
       let arWasSealed = g.ra.isSealed(ar)
       g.ra.seal ar
-      let bv = g.genVal(c)
-      if not arWasSealed: g.ra.unseal {ar}
-      # `b` need not occupy a register: x86 `cmp` folds an immediate or a memory
-      # operand directly (`cmp ar, imm` / `cmp ar, [mem]`), like `binMem`. Forcing
-      # a spilled/memory `b` into a fresh temp here was the source of the scratch-
-      # pool exhaustion on deep conditions.
+      var bv = g.genVal(c)
       var bTmps: seq[Reg] = @[]
+      # `b` need not occupy a register: x86 `cmp` folds a small immediate or a
+      # memory operand directly (`cmp ar, imm` / `cmp ar, [mem]`), like `binMem`.
+      # But a large/negative immediate that `cmp` can't take inline must be loaded
+      # into a register BEFORE the `(cmp …)` tree opens — emitting the load `(mov)`
+      # *inside* the tree would corrupt it into a `(cmp ar (mov …))` operand. `ar`
+      # stays sealed across this load so the borrowed temp can't be `ar`.
+      if bv.kind == Imm and not (bv.ival >= 0 and bv.ival <= 0xFFFF):
+        let (t, owns) = g.forceReg(bv)
+        if owns: bTmps.add t
+        bv = regLoc(t, ScalarSlot, owns = false)
+      if not arWasSealed: g.ra.unseal {ar}
       let bRegs = g.prematLoc(bv, bTmps)        # load any embedded values FIRST
       var bri = 0
       g.ab.tree CmpX64:
         g.emReg ar
-        if bv.kind == Imm and bv.ival >= 0 and bv.ival <= 0xFFFF:
+        if bv.kind == Imm:
           g.ab.intLit bv.ival
         elif bv.kind == InReg:
           g.emReg bv.r
           if bv.owns: bTmps.add bv.r
-        elif bv.kind in {NamedStack, Mem}:
+        else:                                     # NamedStack/Mem
           g.emMemOperandLoc(bv, bRegs, bri)       # cmp ar, [mem] — folded, no extra reg
-        else:                                     # large/negative immediate → load it
-          let (t, owns) = g.forceReg(bv)
-          g.emReg t
-          if owns: bTmps.add t
       for t in bTmps: g.giveBack t
       if aOwns: g.giveBack ar
   g.emJcc(tag, toLabel)

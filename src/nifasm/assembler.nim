@@ -1059,59 +1059,98 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       )
       result.typ = Type(kind: TypeKind.PtrT, base: fieldType)
     elif t == AtTagId:
-      # (at <base> <index>)
-      inc n
-      var baseOp = parseOperandA64(n, ctx)
-      var indexOp = parseOperandA64(n, ctx)
-      if not isIntegerType(indexOp.typ):
-        error("Array index must be integer type, got " & $indexOp.typ, n)
-      var elemType: Type
-      var baseReg: arm64.Register
-      var baseOffset: int32 = 0
-      if baseOp.typ.kind == TypeKind.AptrT:
-        elemType = resolvedBase(baseOp.typ, ctx, n)
-        baseReg = baseOp.reg
-      elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.ArrayT:
-        elemType = baseOp.typ.elem
-        baseReg = baseOp.mem.base
-        baseOffset = baseOp.mem.offset
-      elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.StackOffT and
-           baseOp.typ.offType.kind == TypeKind.ArrayT:
-        # a stack-resident array: unwrap the StackOffT to its array type
-        elemType = baseOp.typ.offType.elem
-        baseReg = baseOp.mem.base
-        baseOffset = baseOp.mem.offset
-      else:
-        error("at requires aptr or stack array, got " & $baseOp.typ, n)
-      if indexOp.kind == okImm:
-        let offset = indexOp.immVal * asmSizeOf(elemType)
-        result.kind = okMem
-        result.mem = arm64.MemoryOperand(
-          base: baseReg,
-          offset: baseOffset + int32(offset),
-          hasIndex: false
-        )
-      elif indexOp.kind == okMem:
-        error("Array index cannot be memory operand", n)
-      else:
-        let elemSize = asmSizeOf(elemType)
-        if elemSize notin [1, 2, 4, 8]:
-          error("Element size " & $elemSize & " not supported for scaled indexing (must be 1, 2, 4, or 8)", n)
-        result.kind = okMem
-        let shift = case elemSize
-          of 1: 0
-          of 2: 1
-          of 4: 2
-          of 8: 3
-          else: 0
-        result.mem = arm64.MemoryOperand(
-          base: baseReg,
-          index: indexOp.reg,
-          shift: shift,
-          offset: baseOffset,
-          hasIndex: true
-        )
-      result.typ = Type(kind: TypeKind.PtrT, base: elemType)
+      # (at <base> <index>) folds to an LDR/STR scaled-index operand, or
+      # (at <base> <index> <scratch-reg>): the element stride isn't an LDR scale
+      # (a multi-dimensional array's outer dimension), so arkham hands us a scratch
+      # register and WE compute `base + index*stride` into it — the stride comes
+      # from the element type (typed layer), the scratch from arkham (regalloc).
+      # `into` bounds the node so the optional third operand reads safely.
+      into n:
+        var baseOp = parseOperandA64(n, ctx)
+        var indexOp = parseOperandA64(n, ctx)
+        if not isIntegerType(indexOp.typ):
+          error("Array index must be integer type, got " & $indexOp.typ, n)
+        var elemType: Type
+        var baseReg: arm64.Register
+        var baseOffset: int32 = 0
+        var baseIndex: arm64.Register
+        var baseShift: int = 0
+        var baseHasIndex = false
+        if baseOp.typ.kind == TypeKind.AptrT:
+          elemType = resolvedBase(baseOp.typ, ctx, n)
+          baseReg = baseOp.reg
+        elif baseOp.typ.kind == TypeKind.PtrT and
+             resolvedBase(baseOp.typ, ctx, n).kind == TypeKind.ArrayT:
+          # (at <base> index) where <base> is a pointer-to-array address
+          # `(cast (ptr (array elem N)) base)` — how arkham reaches a global array
+          # or a deref'd array field. A nested `(at …)` base carries its own base
+          # register + offset (+ a folded index), all folded on here.
+          elemType = resolvedBase(baseOp.typ, ctx, n).elem
+          if baseOp.kind == okMem:
+            baseReg = baseOp.mem.base
+            baseOffset = baseOp.mem.offset
+            baseIndex = baseOp.mem.index
+            baseShift = baseOp.mem.shift
+            baseHasIndex = baseOp.mem.hasIndex
+          else:
+            baseReg = baseOp.reg
+        elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.ArrayT:
+          elemType = baseOp.typ.elem
+          baseReg = baseOp.mem.base
+          baseOffset = baseOp.mem.offset
+        elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.StackOffT and
+             baseOp.typ.offType.kind == TypeKind.ArrayT:
+          # a stack-resident array: unwrap the StackOffT to its array type
+          elemType = baseOp.typ.offType.elem
+          baseReg = baseOp.mem.base
+          baseOffset = baseOp.mem.offset
+        else:
+          error("at requires aptr, pointer-to-array, or stack array, got " & $baseOp.typ, n)
+
+        var hasScratch = false
+        var scratchReg: arm64.Register
+        if n.hasMore and n.kind == TagLit and rawTagIsA64Reg(n.tag):
+          scratchReg = parseRegisterA64(n)
+          hasScratch = true
+
+        if hasScratch:
+          # scratch = base + index*stride. arkham only emits this for a register
+          # index, so indexOp is in a register; reuse scratch for the stride const.
+          if indexOp.kind != okReg:
+            error("at: 3-operand form expects a register index", n)
+          if baseHasIndex:
+            error("at: 3-operand form cannot extend a base that already has an index", n)
+          let stride = asmSizeOf(elemType)
+          arm64.emitMovImm64(ctx.buf.data, scratchReg, uint64(stride))
+          arm64.emitMul(ctx.buf.data, scratchReg, indexOp.reg, scratchReg) # scratch = idx*stride
+          arm64.emitAdd(ctx.buf.data, scratchReg, baseReg, scratchReg)     # scratch = base + that
+          result.kind = okMem
+          result.mem = arm64.MemoryOperand(base: scratchReg, offset: baseOffset, hasIndex: false)
+        elif indexOp.kind == okImm:
+          let offset = indexOp.immVal * asmSizeOf(elemType)
+          result.kind = okMem
+          result.mem = arm64.MemoryOperand(
+            base: baseReg, index: baseIndex, shift: baseShift,
+            offset: baseOffset + int32(offset), hasIndex: baseHasIndex)
+        elif indexOp.kind == okMem:
+          error("Array index cannot be memory operand", n)
+        else:
+          if baseHasIndex:
+            error("at: two register indices cannot fold into one memory operand", n)
+          let elemSize = asmSizeOf(elemType)
+          if elemSize notin [1, 2, 4, 8]:
+            error("Element size " & $elemSize & " not a scale and no scratch supplied", n)
+          let shift = case elemSize
+            of 1: 0
+            of 2: 1
+            of 4: 2
+            of 8: 3
+            else: 0
+          result.kind = okMem
+          result.mem = arm64.MemoryOperand(
+            base: baseReg, index: indexOp.reg, shift: shift, offset: baseOffset, hasIndex: true)
+        result.typ = Type(kind: TypeKind.PtrT, base: elemType)
+        while n.hasMore: skip n
     elif t == LabTagId:
       inc n
       if n.kind != Symbol: error("Expected label usage", n)
@@ -2527,81 +2566,119 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
       result.typ = Type(kind: TypeKind.PtrT, base: fieldType)
 
     elif t == AtTagId:
-      # (at <base-reg> <stackvar> <index>) for stack arrays, or
-      # (at <aptr-var> <index>) for array pointer variables
-      inc n
+      # (at <base-reg> <stackvar> <index>)            stack array, OR
+      # (at <aptr-or-ptr-to-array> <index>)           folds to base+index*scale, OR
+      # (at <base> <index> <scratch-reg>)             3-operand form: the element
+      #   stride isn't a legal SIB scale (a multi-dimensional array's outer
+      #   dimension), so arkham hands us a scratch register and WE compute the
+      #   address `base + index*stride` into it — keeping the size arithmetic in
+      #   the typed layer (we know the stride) and the register allocation in
+      #   arkham (it owns the scratch). `into` bounds the node so the optional
+      #   third operand is read without running into the following sibling.
+      into n:
+        var elemType: Type
+        var baseReg: x86.Register
+        var baseDisp: int32 = 0
+        var baseIndex: x86.Register
+        var baseScale: int = 0
+        var baseHasIndex = false
+        var indexOp: Operand
 
-      var elemType: Type
-      var baseReg: x86.Register
-      var baseDisp: int32 = 0
-      var indexOp: Operand
-
-      # Check if first arg is a register (explicit stack addressing)
-      if n.kind == TagLit and rawTagIsX64Reg(n.tag):
-        # (at (base-reg) stackvar index) - explicit stack array access
-        baseReg = parseRegister(n)
-
-        # Parse stack variable name for offset
-        if n.kind != Symbol:
-          error("Expected stack variable name in at expression", n)
-        let stackVarName = getSym(n)
-        let stackSym = lookupWithAutoImport(ctx, ctx.scope, stackVarName, n)
-        if stackSym == nil or not stackSym.typ.isOnStack:
-          error("Expected stack variable in at, got: " & stackVarName, n)
-        # Unwrap StackOffT to get the base type
-        let baseTyp = if stackSym.typ.kind == StackOffT: stackSym.typ.offType else: stackSym.typ
-        if baseTyp.kind != TypeKind.ArrayT:
-          error("at requires array type, got " & $baseTyp, n)
-        baseDisp = int32(stackSym.offset)
-        elemType = baseTyp.elem
-        inc n
-
-        # Parse index
-        indexOp = parseOperand(n, ctx)
-      else:
-        # (at aptr-var index) - array pointer access
-        var baseOp = parseOperand(n, ctx)
-        indexOp = parseOperand(n, ctx)
-
-        if baseOp.typ.kind == TypeKind.AptrT:
-          # Base is an array pointer
-          elemType = resolvedBase(baseOp.typ, ctx, n)
-          baseReg = baseOp.reg
+        if n.kind == TagLit and rawTagIsX64Reg(n.tag):
+          # (at (base-reg) stackvar index) - explicit stack array access
+          baseReg = parseRegister(n)
+          if n.kind != Symbol:
+            error("Expected stack variable name in at expression", n)
+          let stackVarName = getSym(n)
+          let stackSym = lookupWithAutoImport(ctx, ctx.scope, stackVarName, n)
+          if stackSym == nil or not stackSym.typ.isOnStack:
+            error("Expected stack variable in at, got: " & stackVarName, n)
+          let baseTyp = if stackSym.typ.kind == StackOffT: stackSym.typ.offType else: stackSym.typ
+          if baseTyp.kind != TypeKind.ArrayT:
+            error("at requires array type, got " & $baseTyp, n)
+          baseDisp = int32(stackSym.offset)
+          elemType = baseTyp.elem
+          inc n
+          indexOp = parseOperand(n, ctx)
         else:
-          error("at requires (base-reg stackvar index) or (aptr-var index), got " & $baseOp.typ, n)
+          # (at <base> index) where <base> is an array-pointer variable (`aptr`) or
+          # a pointer-to-array address `(cast (ptr (array elem N)) base)` — how
+          # arkham reaches a global array or a deref'd array field. A nested `(at …)`
+          # base carries its own base register + displacement (+ index), folded on.
+          var baseOp = parseOperand(n, ctx)
+          indexOp = parseOperand(n, ctx)
+          if baseOp.typ.kind == TypeKind.AptrT:
+            elemType = resolvedBase(baseOp.typ, ctx, n)
+            baseReg = baseOp.reg
+          elif baseOp.typ.kind == TypeKind.PtrT and
+               resolvedBase(baseOp.typ, ctx, n).kind == TypeKind.ArrayT:
+            elemType = resolvedBase(baseOp.typ, ctx, n).elem
+            if baseOp.kind == okMem:
+              baseReg = baseOp.mem.base
+              baseDisp = baseOp.mem.displacement
+              baseIndex = baseOp.mem.index
+              baseScale = baseOp.mem.scale
+              baseHasIndex = baseOp.mem.hasIndex
+            else:
+              baseReg = baseOp.reg
+          else:
+            error("at requires (base-reg stackvar index) or a pointer-to-array base, got " & $baseOp.typ, n)
 
-      # Type check: index must be an integer, literal, or register
-      if not isIntegerType(indexOp.typ):
-        error("Array index must be integer type, got " & $indexOp.typ, n)
+        if not isIntegerType(indexOp.typ):
+          error("Array index must be integer type, got " & $indexOp.typ, n)
 
-      # Check if index is immediate or register
-      if indexOp.kind == okImm:
-        # Immediate index: compute offset directly
-        let offset = indexOp.immVal * asmSizeOf(elemType)
-        result.kind = okMem
-        result.mem = x86.MemoryOperand(
-          base: baseReg,
-          displacement: baseDisp + int32(offset),
-          hasIndex: false
-        )
-      elif indexOp.kind == okMem:
-        error("Array index cannot be memory operand", n)
-      else:
-        # Register index: use scaled indexing
-        let elemSize = asmSizeOf(elemType)
-        if elemSize notin [1, 2, 4, 8]:
-          error("Element size " & $elemSize & " not supported for scaled indexing (must be 1, 2, 4, or 8)", n)
+        # Optional third operand: an arkham-supplied scratch register for a stride
+        # that can't be a SIB scale.
+        var hasScratch = false
+        var scratchReg: x86.Register
+        if n.hasMore and n.kind == TagLit and rawTagIsX64Reg(n.tag):
+          scratchReg = parseRegister(n)
+          hasScratch = true
 
-        result.kind = okMem
-        result.mem = x86.MemoryOperand(
-          base: baseReg,
-          index: indexOp.reg,
-          scale: elemSize,
-          displacement: baseDisp,
-          hasIndex: true
-        )
+        if hasScratch:
+          # Compute `scratch = baseAddr + index*stride` ourselves (stride from the
+          # element type). arkham only emits this for a register index, so indexOp
+          # is in a register. base+disp (and a power-of-two-free stride) collapse via
+          # one `imul` + one `lea`; a base that already holds an index would need a
+          # second index slot we don't have (a deeper mixed-stride nest — not emitted
+          # by the current arkham).
+          if indexOp.kind != okReg:
+            error("at: 3-operand form expects a register index", n)
+          if baseHasIndex:
+            error("at: 3-operand form cannot extend a base that already has an index", n)
+          let stride = asmSizeOf(elemType)
+          x86.emitMov(ctx.buf.data, scratchReg, indexOp.reg)        # scratch = index
+          x86.emitImulImm(ctx.buf.data, scratchReg, int32(stride))  # scratch *= stride
+          x86.emitLea(ctx.buf.data, scratchReg,                     # scratch = base + disp + scratch
+            x86.MemoryOperand(base: baseReg, index: scratchReg, scale: 1,
+                              displacement: baseDisp, hasIndex: true))
+          result.kind = okMem
+          result.mem = x86.MemoryOperand(base: scratchReg, displacement: 0, hasIndex: false)
+        elif indexOp.kind == okImm:
+          # Immediate index: fold into the displacement (any stride).
+          let offset = indexOp.immVal * asmSizeOf(elemType)
+          result.kind = okMem
+          result.mem = x86.MemoryOperand(
+            base: baseReg, index: baseIndex, scale: baseScale,
+            displacement: baseDisp + int32(offset), hasIndex: baseHasIndex)
+        elif indexOp.kind == okMem:
+          error("Array index cannot be memory operand", n)
+        else:
+          # Register index folded as a SIB scale. arkham only emits the 2-operand
+          # form when the stride is a legal scale and the base has no index, so these
+          # are invariants here (kept as asserts).
+          if baseHasIndex:
+            error("at: two register indices cannot fold into one memory operand", n)
+          let elemSize = asmSizeOf(elemType)
+          if elemSize notin [1, 2, 4, 8]:
+            error("Element size " & $elemSize & " not a SIB scale and no scratch supplied", n)
+          result.kind = okMem
+          result.mem = x86.MemoryOperand(
+            base: baseReg, index: indexOp.reg, scale: elemSize,
+            displacement: baseDisp, hasIndex: true)
 
-      result.typ = Type(kind: TypeKind.PtrT, base: elemType)
+        result.typ = Type(kind: TypeKind.PtrT, base: elemType)
+        while n.hasMore: skip n
 
     elif t == LabTagId:
       inc n

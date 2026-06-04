@@ -302,27 +302,6 @@ proc emAggrDot(g: var CodeGen; base, field: string) =
       g.ab.sym field
   else: raiseAssert "arkham: aggregate base neither stack nor pointer: " & base
 
-proc emAt(g: var CodeGen; c: var Cursor) =
-  ## Consume a NIFC `(at arr idx)` and emit the asm `(at arrvar idx)` operand —
-  ## nifasm scales the index by the element size from `arr`'s array type. `arr`
-  ## is a stack-array var; `idx` is an immediate or a register value.
-  var arr: string
-  var idxImm = false
-  var idxV = 0'i64
-  var ir = NoReg
-  var it = false
-  c.into:
-    arr = symName(c); inc c                 # the array var
-    if c.kind == IntLit:
-      idxImm = true; idxV = intVal(c); inc c
-    else:
-      let (r, t) = g.genReg(c); ir = r; it = t
-    while c.hasMore: skip c
-  g.ab.tree AtX:
-    g.ab.sym arr
-    if idxImm: g.ab.intLit idxV else: g.emReg ir
-  if it: g.giveBack ir
-
 proc emStackVar(g: var CodeGen; name, typeName: string) =
   ## Declare a nifasm-managed stack slot `(var :name (s) typeName)`.
   g.ab.open NifasmDecl.VarD
@@ -726,6 +705,196 @@ proc dotBaseField(cur: Cursor): (string, string) =
     while c.hasMore: skip c                   # depth selector
   (base, field)
 
+# ── indexed/global/nested array address emission (premat-before-tree two-pass) ─
+# A memory operand tree (`(mem (at …))`) is emitted inside an already-open asm-NIF
+# tree, so any helper instruction needed to form an embedded value — a global's
+# address, a computed index, a stride scratch — must be emitted BEFORE that tree
+# opens, or it would land *inside* the operand and corrupt the asm-NIF. The two
+# passes split exactly that concern: `prematAccess` (pass 1) materializes every
+# embedded value into a register as a preceding statement; `emAccessAddr` (pass 2)
+# re-emits the address tree consuming those registers in the same traversal order.
+# Mirrors the x86-64 backend (codegen_x64); the nifasm A64 `(at)` parser folds the
+# resulting `base + idx*scale` / `(at base idx scratch)` from the element type.
+
+proc emGlobalAddr(g: var CodeGen; dest: Reg; name: string) =
+  ## `dest ← &global` — adrp+add (nifasm resolves the gvar to its `.bss`/`.data`
+  ## address). AArch64 has no typed PC-relative memory operand, so a global is
+  ## always accessed by first materializing its address.
+  g.emAdr(dest, name)
+
+proc loadOperandReg(g: var CodeGen; v: Location; tmps: var seq[Reg]): Reg =
+  ## Materialize `v` into a register for a single memory-operand instruction. The
+  ## register is transient — it lives only for the one access this operand feeds,
+  ## with no calls in between — so a caller-saved staging register is safe when the
+  ## scratch pool is exhausted, keeping indexed/global access total under pressure.
+  if v.kind == InReg:
+    if v.owns: tmps.add v.r
+    return v.r
+  result = g.tryBorrowTmp()
+  if result != NoReg: tmps.add result
+  else:
+    result = g.pickStaging()
+    g.ra.seal result          # hold it so a sibling base/index pick can't reuse it
+    tmps.add result           # `giveBack` is a no-op for staging; `unseal` below
+  g.place(v, result)
+
+proc atNeedsScratch(g: var CodeGen; atNode: Cursor): bool =
+  ## Does this `(at base idx)` level need an explicit scratch register? AArch64 (like
+  ## x86) folds `base + idx*scale` into one LDR/STR operand only for a scale of
+  ## 1/2/4/8 and a single index; a register index whose element stride is anything
+  ## else (a multi-dimensional array's outer dimension, stride = the inner array's
+  ## size) cannot fold, so arkham hands nifasm a scratch and nifasm computes
+  ## `base + idx*stride` into it (the `(at base idx scratch)` 3-operand form). An
+  ## immediate index always folds to a displacement → never needs one.
+  let stride = typeSizeAlign(g.prog, resolveType(g.prog, g.getType(atNode)))[0]
+  if stride in [1, 2, 4, 8]: return false
+  var n = atNode
+  var idxIsReg = false
+  n.into:
+    skip n                                      # the array base
+    idxIsReg = n.kind != IntLit                 # a non-literal index lives in a register
+    while n.hasMore: skip n
+  result = idxIsReg
+
+proc prematAccess(g: var CodeGen; n: var Cursor; tmps: var seq[Reg]; regs: var seq[Reg]) =
+  ## PASS 1 of address emission. Walk the NIFC lvalue subtree `n` and materialize
+  ## every embedded VALUE — a deref'd pointer, a computed array index, a global's
+  ## address, a non-scale stride's scratch — into a register NOW, emitting the load
+  ## as an ordinary preceding statement (this runs at statement level, before the
+  ## consuming instruction tree opens). Registers are appended to `regs` in traversal
+  ## order; `emAccessAddr` (pass 2) consumes them in that exact order. Borrowed
+  ## scratch is pushed to `tmps` for the caller to free after pass 2. `n` is fully
+  ## advanced (over its own copy at the call site).
+  case n.kind
+  of Symbol:
+    let nm = symName(n); inc n
+    let loc = g.ra.locationOfSym(nm)
+    if loc.kind notin {NamedStack, InReg}:
+      # A global aggregate base: materialize its address into a register. (It lives
+      # only for the one access this operand feeds, so a transient caller-saved
+      # staging register is safe when the pool is empty.)
+      let si = g.lookupSym(nm)
+      if si.cat != scGlobal:
+        raiseAssert "arkham a64 v0: unsupported lvalue base: " & nm
+      var r = g.tryBorrowTmp()
+      if r != NoReg: tmps.add r
+      else:
+        r = g.pickStaging()
+        g.ra.seal r             # hold the base addr so the index pick can't reuse it
+        tmps.add r
+      g.emGlobalAddr(r, nm)
+      regs.add r
+  of TagLit:
+    case n.exprKind
+    of DotC:
+      n.into:
+        g.prematAccess(n, tmps, regs)            # base (recursive)
+        skip n                                   # field name
+        while n.hasMore: skip n                  # depth selector
+    of AtC:
+      let needsScratch = g.atNeedsScratch(n)
+      n.into:
+        g.prematAccess(n, tmps, regs)            # array base (recursive)
+        if n.kind == IntLit: inc n               # immediate index stays inline
+        else: regs.add g.loadOperandReg(g.genVal(n), tmps)  # computed index → reg
+        if needsScratch:                         # non-scale stride: supply a scratch reg
+          var s = g.tryBorrowTmp()               # nifasm computes base+idx*stride into it
+          if s != NoReg: tmps.add s
+          else:
+            s = g.pickStaging()
+            g.ra.seal s
+            tmps.add s
+          regs.add s
+        while n.hasMore: skip n
+    of DerefC:
+      n.into:
+        regs.add g.loadOperandReg(g.genVal(n), tmps)  # the pointer → a register
+        while n.hasMore: skip n                  # (cppref)?
+    else: raiseAssert "arkham a64 v0: not an lvalue: " & $n.exprKind
+  else: raiseAssert "arkham a64 v0: not an lvalue: " & $n.kind
+
+proc emAccessAddr(g: var CodeGen; n: var Cursor; regs: openArray[Reg]; ri: var int) =
+  ## PASS 2: re-emit the lvalue subtree `n` as an asm-NIF address expression so
+  ## nifasm collapses the chain to `base+offset` (+ index*scale) from the declared
+  ## types. Emits ONLY register / stack-symbol / immediate leaves — every embedded
+  ## value was already loaded into a register by `prematAccess`, consumed here from
+  ## `regs` (same traversal order) — so this pass emits no instruction of its own.
+  ## A stack var contributes its bare name; a register-resident pointer its register.
+  case n.kind
+  of Symbol:
+    let nm = symName(n); inc n
+    let loc = g.ra.locationOfSym(nm)
+    case loc.kind
+    of NamedStack: g.ab.sym nm                   # a stack var: nifasm resolves to sp+off
+    of InReg:
+      if g.varType.hasKey(nm):
+        # a by-reference aggregate: the register holds a pointer; type it with a
+        # cast so a `(dot …)` / `(at …)` can compute the field/element offset.
+        g.ab.tree CastX:
+          g.ab.ptrType: g.ab.sym g.varType[nm]
+          g.emReg loc.r
+      else:
+        g.emReg loc.r                              # a plain pointer in a register
+    else:
+      # global aggregate: its address was materialized into regs[ri] by pass 1.
+      let r = regs[ri]; inc ri
+      let si = g.lookupSym(nm)
+      var d = si.decl
+      inc d; skip d; skip d                        # enter (gvar …): name, pragmas → type
+      g.ab.tree CastX:
+        g.ab.ptrType:
+          if d.kind == Symbol: g.ab.sym symName(d)
+          else: g.genTypeBody(d)
+        g.emReg r
+  of TagLit:
+    case n.exprKind
+    of DotC:
+      g.ab.tree DotX:
+        n.into:
+          g.emAccessAddr(n, regs, ri)            # base (recursive)
+          let field = symName(n); inc n          # field name (offset is nifasm's job)
+          g.ab.sym field
+          while n.hasMore: skip n                # depth selector
+    of AtC:
+      let needsScratch = g.atNeedsScratch(n)
+      g.ab.tree AtX:
+        n.into:
+          g.emAccessAddr(n, regs, ri)            # array base (recursive)
+          if n.kind == IntLit: (g.ab.intLit intVal(n); inc n)
+          else: (g.emReg regs[ri]; inc ri; skip n)  # pre-loaded computed index
+          if needsScratch:                       # 3rd operand: arkham-supplied scratch
+            g.emReg regs[ri]; inc ri             #   nifasm computes base+idx*stride into it
+          while n.hasMore: skip n
+    of DerefC:
+      # The deref'd pointer is in a register (pre-loaded). Type it as `(ptr Pointee)`
+      # so an enclosing `(dot …)`/`(at …)` can compute the field/element offset.
+      var pointee = g.getType(n)                  # deref result = the pointee type
+      n.into:
+        g.ab.tree CastX:
+          g.ab.ptrType:
+            if pointee.kind == Symbol: g.ab.sym symName(pointee)
+            else: g.genTypeBody(pointee)
+          g.emReg regs[ri]; inc ri                # the pointer (pre-loaded)
+        skip n                                    # skip the pointer value subtree
+        while n.hasMore: skip n                   # (cppref)?
+    else: raiseAssert "arkham a64 v0: not an lvalue: " & $n.exprKind
+  else: raiseAssert "arkham a64 v0: not an lvalue: " & $n.kind
+
+proc prematAt(g: var CodeGen; nn: Cursor; tmps: var seq[Reg]): seq[Reg] =
+  ## Pre-materialize the values embedded in an `(at …)` access chain (pass 1), as
+  ## statements emitted BEFORE the consuming instruction tree. Returns the registers
+  ## for `emAccessAddr`; free `tmps` (and `unseal` any sealed staging) afterwards.
+  result = @[]
+  var c = nn
+  g.prematAccess(c, tmps, result)
+
+proc freeAtTmps(g: var CodeGen; tmps: seq[Reg]) =
+  ## Release scratch borrowed by `prematAt` after pass 2 — unseal a staging reg
+  ## held across the operand, and return real pool temps.
+  for t in tmps:
+    g.ra.unseal {t}
+    g.giveBack t
+
 proc emitLoad(g: var CodeGen; loc: Location; dest: Reg) =
   ## `dest ← <scalar Location>` (integer/pointer). One switch over every kind.
   case loc.kind
@@ -762,9 +931,13 @@ proc emitLoad(g: var CodeGen; loc: Location; dest: Reg) =
         g.emReg dest
         g.emAggrFieldMem(base, field)
     of AtC:
+      var tmps: seq[Reg]
+      let regs = g.prematAt(nn, tmps)            # materialize embedded values FIRST
+      var ri = 0
       g.ab.tree MovA64:
         g.emReg dest
-        g.ab.tree MemX: g.emAt(nn)
+        g.ab.tree MemX: g.emAccessAddr(nn, regs, ri)
+      g.freeAtTmps(tmps)
     of DerefC:
       let (pr, pt) = g.derefPtrCur(nn)
       g.ab.tree MovA64:
@@ -792,9 +965,13 @@ proc emitLoadF(g: var CodeGen; loc: Location; dest: FReg; bits: int) =
         g.emFReg(dest, bits)
         g.emAggrFieldMem(base, field)
     of AtC:
+      var tmps: seq[Reg]
+      let regs = g.prematAt(nn, tmps)            # materialize embedded values FIRST
+      var ri = 0
       g.ab.tree FldrA64:
         g.emFReg(dest, bits)
-        g.ab.tree MemX: g.emAt(nn)
+        g.ab.tree MemX: g.emAccessAddr(nn, regs, ri)
+      g.freeAtTmps(tmps)
     of DerefC:
       let (pr, pt) = g.derefPtrCur(nn)
       g.emFLoad(dest, pr, bits)
@@ -836,9 +1013,13 @@ proc emitStore(g: var CodeGen; loc: Location; src: Reg) =
         g.emAggrFieldMem(base, field)
         g.emReg src
     of AtC:
+      var tmps: seq[Reg]
+      let regs = g.prematAt(nn, tmps)            # materialize embedded values FIRST
+      var ri = 0
       g.ab.tree MovA64:
-        g.ab.tree MemX: g.emAt(nn)
+        g.ab.tree MemX: g.emAccessAddr(nn, regs, ri)
         g.emReg src
+      g.freeAtTmps(tmps)
     of DerefC:
       let (pr, pt) = g.derefPtrCur(nn)
       g.ab.tree MovA64:
@@ -866,9 +1047,13 @@ proc emitStoreF(g: var CodeGen; loc: Location; src: FReg; bits: int) =
         g.emAggrFieldMem(base, field)
         g.emFReg(src, bits)
     of AtC:
+      var tmps: seq[Reg]
+      let regs = g.prematAt(nn, tmps)            # materialize embedded values FIRST
+      var ri = 0
       g.ab.tree FstrA64:
-        g.ab.tree MemX: g.emAt(nn)
+        g.ab.tree MemX: g.emAccessAddr(nn, regs, ri)
         g.emFReg(src, bits)
+      g.freeAtTmps(tmps)
     of DerefC:
       let (pr, pt) = g.derefPtrCur(nn)
       g.emFStore(src, pr, bits)
@@ -900,9 +1085,13 @@ proc emitAddr(g: var CodeGen; loc: Location; dest: Reg) =
         g.emReg dest
         g.emAggrDot(base, field)
     of AtC:
+      var tmps: seq[Reg]
+      let regs = g.prematAt(nn, tmps)            # materialize embedded values FIRST
+      var ri = 0
       g.ab.tree LeaA64:
         g.emReg dest
-        g.emAt(nn)
+        g.emAccessAddr(nn, regs, ri)
+      g.freeAtTmps(tmps)
     of DerefC:                                # &(deref p) == p
       nn.into:
         g.genInto(nn, dest)

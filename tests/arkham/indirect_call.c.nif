@@ -1,0 +1,37 @@
+(.nif27)
+(.indexat 538              )
+(stmts
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (gvar :acc.0 .
+  (i 64)0)
+ (gvar :fp.0 .
+  (proctype .
+   (params
+    (param :x.0 .
+     (i 64))).
+   (pragmas
+    (nimcall))).)
+ (proc :bump.0
+  (params
+   (param :n.0 .
+    (i 64)))
+  (void)
+  (pragmas)
+  (stmts
+   (asgn acc.0 n.0)
+   (ret .)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (asgn fp.0 bump.0)
+   (call fp.0 42)
+   (call exit.c acc.0))))(.index)

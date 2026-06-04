@@ -86,12 +86,17 @@ proc arkhamTests() =
   echo passed, " / ", total - skipped, " arkham tests successful (",
        skipped, " known-unsupported skipped)"
 
-# Every `tests/arkham/*.c.nif` now runs end-to-end under the static Linux/ELF
-# `linux_arm64` qemu path — the arm64 backend reached x86-64 feature parity
-# (function-pointer calls, `(pat …)` pointer indexing, and thread-locals as
-# single-threaded `.bss` globals). List a test's stem here if a new arm64-only
-# TODO is introduced.
+# Most `tests/arkham/*.c.nif` run end-to-end under the static Linux/ELF
+# `linux_arm64` qemu path — the arm64 backend reached x86-64 feature parity for
+# function-pointer calls, `(pat …)` pointer indexing, and thread-locals. List a
+# test's stem here if a new arm64-only TODO is introduced.
 const arkhamLinuxA64Unsupported: seq[string] = @[]
+  # The arm64 backend reached parity with x86-64 on global / multi-dimensional array
+  # addressing: codegen_a64 now uses the same premat-before-tree two-pass
+  # (`prematAccess`/`emAccessAddr`) as x86-64 to materialize a global base, a computed
+  # index, and a non-scale stride's scratch into registers *before* the operand tree
+  # opens, then re-emits `(at base idx [scratch])` for nifasm to fold. Add a test's
+  # stem here if a new arm64-only TODO is introduced.
 
 proc arkhamQemuTests() =
   ## Cross-validate the AArch64 backend on Linux: emit each `tests/arkham/*.c.nif`
