@@ -86,12 +86,19 @@ proc arkhamTests() =
   echo passed, " / ", total - skipped, " arkham tests successful (",
        skipped, " known-unsupported skipped)"
 
-# Every `tests/arkham/*.c.nif` now runs end-to-end under the static Linux/ELF
-# `linux_arm64` qemu path — the arm64 backend reached x86-64 feature parity
-# (function-pointer calls, `(pat …)` pointer indexing, and thread-locals as
-# single-threaded `.bss` globals). List a test's stem here if a new arm64-only
-# TODO is introduced.
-const arkhamLinuxA64Unsupported: seq[string] = @[]
+# Most `tests/arkham/*.c.nif` run end-to-end under the static Linux/ELF
+# `linux_arm64` qemu path — the arm64 backend reached x86-64 feature parity for
+# function-pointer calls, `(pat …)` pointer indexing, and thread-locals. List a
+# test's stem here if a new arm64-only TODO is introduced.
+const arkhamLinuxA64Unsupported: seq[string] = @["array2d"]
+  # `array2d` needs global / multi-dimensional array addressing. The x86-64 backend
+  # lowers a non-foldable index via a 3-operand `(at base idx scratch)` — arkham
+  # supplies the scratch register, nifasm computes `base + idx*stride` from the
+  # element type. The arm64 `emAt` still only handles a stack-array *symbol* base; a
+  # global / nested-`(at …)` base must be materialized into a register first, but
+  # `emAt` runs inside an already-open operand tree, so that needs the x64
+  # premat-before-tree two-pass ported to codegen_a64 (the nifasm A64 `(at)` parser
+  # already accepts the 3-operand form). See memory `pystone-benchmark-arkham-fixes`.
 
 proc arkhamQemuTests() =
   ## Cross-validate the AArch64 backend on Linux: emit each `tests/arkham/*.c.nif`

@@ -306,6 +306,13 @@ proc emAt(g: var CodeGen; c: var Cursor) =
   ## Consume a NIFC `(at arr idx)` and emit the asm `(at arrvar idx)` operand —
   ## nifasm scales the index by the element size from `arr`'s array type. `arr`
   ## is a stack-array var; `idx` is an immediate or a register value.
+  # TODO(arm64 multi-dim / global arrays): this only handles a stack-array symbol
+  # base. Global-array and nested-`(at …)` bases need their address materialized
+  # into a register, but `emAt` runs *inside* an already-open operand tree (e.g.
+  # `g.ab.tree MemX: g.emAt(nn)`), so the materializing `(adr)`/`(lea)` would land
+  # mid-tree. Supporting them needs the x86-64 premat-before-tree two-pass ported
+  # to this backend (then add the 3-operand `(at base idx scratch)` like x64 — the
+  # nifasm A64 `(at)` parser already accepts it). See `pystone-benchmark-arkham-fixes`.
   var arr: string
   var idxImm = false
   var idxV = 0'i64
