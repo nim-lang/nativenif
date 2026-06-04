@@ -1,7 +1,7 @@
 # Nifasm - Relocation System
 # A system for tracking and managing relocations in the instruction stream
 
-import std/[tables]
+import std/[tables, algorithm]
 import buffers
 
 type
@@ -253,238 +253,161 @@ proc updateRelocDisplacements*(buf: var Buffer) =
       buf.data[currentPos + 3] = byte((instr shr 24) and 0xFF)
 
 proc canUseShortJump(distance: int): bool {.inline.} =
-  ## Check if a jump can use 8-bit displacement
+  ## Whether a displacement fits x86's signed 8-bit (rel8) jump form.
   distance >= -128 and distance <= 127
 
-proc optimizeJumps*(buf: Buffer): Buffer =
-  ## Optimize all jump instructions by creating a new optimized buffer
-  var optimized = Buffer()
+proc isShrinkableX64(kind: RelocKind): bool {.inline.} =
+  ## x86 `jmp rel32` (5B) and the `0F 8x` conditional jumps (6B) have a 2-byte
+  ## rel8 form; `call` has no rel8 form, and `lea`/IAT-call/all ARM64 forms are
+  ## fixed size — so only these shrink.
+  kind in {rkJmp, rkJe, rkJne, rkJg, rkJl, rkJge, rkJle, rkJa, rkJb, rkJae, rkJbe,
+           rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp}
 
-  # Copy all data to new buffer
-  optimized.data = buf.data
-  optimized.labels = buf.labels
-  optimized.relocs = buf.relocs
+proc longSizeOf(kind: RelocKind): int {.inline.} =
+  case kind
+  of rkCall, rkJmp: 5
+  of rkLea: 7
+  of rkIatCall: 6
+  of rkJe, rkJne, rkJg, rkJl, rkJge, rkJle, rkJa, rkJb, rkJae, rkJbe,
+     rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp: 6
+  of rkB, rkBL, rkBEQ, rkBNE, rkCBZ, rkCBNZ, rkTBZ, rkTBNZ, rkADR, rkADRP: 4
 
-  # Update all reloc displacements in the new buffer
-  optimized.updateRelocDisplacements()
+proc shortJccOpcode(kind: RelocKind): byte =
+  case kind
+  of rkJe: 0x74
+  of rkJne: 0x75
+  of rkJg: 0x7F
+  of rkJl: 0x7C
+  of rkJge: 0x7D
+  of rkJle: 0x7E
+  of rkJa: 0x77
+  of rkJb: 0x72
+  of rkJae: 0x73
+  of rkJbe: 0x76
+  of rkJo: 0x70
+  of rkJno: 0x71
+  of rkJs: 0x78
+  of rkJns: 0x79
+  of rkJp: 0x7A
+  of rkJnp: 0x7B
+  else: 0x74  # unreachable (guarded by isShrinkableX64)
 
-  # Try to optimize jumps by creating a new buffer with shorter instructions
+proc shortenX64Jumps*(buf: var Buffer): seq[int] =
+  ## Shrink x86 `jmp`/`jcc rel32` to `rel8` wherever the displacement fits a signed
+  ## byte, rewriting `buf` in place. Returns an old→new byte-position map (length
+  ## `buf.data.len + 1`, indexed by *original* offset) so the caller can remap any
+  ## external code offsets it tracks — gvar/`lea` patch sites and the synthesized
+  ## TLS-prologue entry — to the shortened layout.
+  ##
+  ## This is branch relaxation run *optimistically*: every shrinkable jump starts
+  ## SHORT (the most compact possible layout), and we GROW back to long only the
+  ## jumps whose displacement genuinely overflows rel8. Growing pushes later code
+  ## apart, which can force further jumps to grow — so we iterate to a fixpoint.
+  ## Growing is monotonic (a jump only ever goes short→long, never back), so it
+  ## converges, and the result is *optimal*: the minimal set of long jumps, hence
+  ## the maximal set of short ones. (The opposite, start-long-and-shrink, is also
+  ## sound but suboptimal — it misses mutually-enabling pairs that each only fit
+  ## once the other is short.) Each pass recomputes the layout in O(n log n) via a
+  ## prefix-sum of the bytes saved so far + a binary search, so a big module costs
+  ## O(passes · n log n) with passes typically 1–3.
+  ##
+  ## The final displacements are computed from the converged position map, so the
+  ## emitted bytes are exact. Short jumps are patched inline and dropped from the
+  ## reloc list; long forms are re-tracked at their new positions for
+  ## `updateRelocDisplacements` to patch from the final labels.
+  ##
+  ## x86-only: `call`/`lea`/IAT-call and every ARM64 form keep their size. Intended
+  ## for the static-ELF x64 path (no IAT call-site bookkeeping to invalidate).
+  let oldLen = buf.data.len
+
+  # Relocs in ascending position order — the layout/rebuild walks depend on it.
+  var relocs = buf.relocs
+  relocs.sort(proc (a, b: RelocEntry): int = cmp(a.position, b.position))
+
+  # Old label position by id, for distance evaluation and final displacements.
+  var labelPos = initTable[int, int]()
+  for ld in buf.labels: labelPos[int(ld.id)] = ld.position
+
+  # Every shrinkable jump starts short; non-shrinkable relocs are permanently long.
+  var isShort = newSeq[bool](relocs.len)
+  for i in 0 ..< relocs.len:
+    isShort[i] = isShrinkableX64(relocs[i].kind)
+
+  # Old reloc positions in ascending order (== relocs order, already sorted), for
+  # the per-pass binary search.
+  var relocPositions = newSeq[int](relocs.len)
+  for i in 0 ..< relocs.len: relocPositions[i] = relocs[i].position
+
+  # ── fixpoint: grow every short jump that overflows rel8, until none do ──
   var changed = true
-  var iterations = 0
-  const maxIterations = 10
-
-  while changed and iterations < maxIterations:
+  while changed:
     changed = false
-    inc(iterations)
+    # Prefix savings: savPrefix[k] = bytes removed by relocs[0 ..< k] (those before
+    # index k). newPos(p) = p − savings of all relocs at an old position < p, found
+    # by binary-searching `relocPositions` for the count below p.
+    var savPrefix = newSeq[int](relocs.len + 1)
+    for i in 0 ..< relocs.len:
+      savPrefix[i + 1] = savPrefix[i] +
+        (if isShort[i]: longSizeOf(relocs[i].kind) - 2 else: 0)
+    proc newPos(p: int): int =
+      let below = lowerBound(relocPositions, p)   # # of relocs with position < p
+      p - savPrefix[below]
+    for i in 0 ..< relocs.len:
+      if not isShort[i]: continue
+      let dist = newPos(labelPos[int(relocs[i].target)]) -
+                 (newPos(relocs[i].position) + 2)   # rel8 measured from 2-byte end
+      if not canUseShortJump(dist):
+        isShort[i] = false                          # overflow → grow back to long
+        changed = true
 
-    var newBuf = Buffer()
-    newBuf.labels = optimized.labels # Copy labels, will update positions
+  # ── pass A: the old→new position map for the converged decisions ──
+  result = newSeq[int](oldLen + 1)
+  var newLen = 0
+  var oldI = 0
+  var ri = 0
+  while oldI < oldLen:
+    result[oldI] = newLen
+    if ri < relocs.len and relocs[ri].position == oldI:
+      newLen += (if isShort[ri]: 2 else: longSizeOf(relocs[ri].kind))
+      oldI += relocs[ri].originalSize
+      inc ri
+    else:
+      newLen += 1
+      oldI += 1
+  result[oldLen] = newLen
 
-    # Map label positions to indices for efficient update
-    var posToLabels = initTable[int, seq[int]]()
-    for idx, lab in optimized.labels:
-      if not posToLabels.hasKey(lab.position):
-        posToLabels[lab.position] = @[]
-      posToLabels[lab.position].add(idx)
-
-    var relocIndex = 0
-    var i = 0
-    var currentNewPos = 0
-
-    while i < optimized.data.len:
-      # Update labels at this position
-      if posToLabels.hasKey(i):
-        for labIdx in posToLabels[i]:
-          newBuf.labels[labIdx].position = currentNewPos
-
-      # Check if we're at a reloc instruction
-      if relocIndex < optimized.relocs.len and optimized.relocs[relocIndex].position == i:
-        let reloc = optimized.relocs[relocIndex]
-        var addedBytes = 0
-        # Skip IAT calls - they are patched later when IAT address is known
-        if reloc.kind == rkIatCall:
-          # Copy IAT call instruction as-is (6 bytes: FF 15 [rip+disp32])
-          for j in 0..<6:
-            if i + j < optimized.data.len:
-              newBuf.data.add(optimized.data[i + j])
-          addedBytes = 6
-          newBuf.addReloc(currentNewPos, reloc.target, reloc.kind, reloc.originalSize)
-          i += 6
-          currentNewPos += 6
-          inc(relocIndex)
-          continue
-        let targetPos = optimized.getLabelPosition(reloc.target)
-        let distance = calculateRelocDistance(i, targetPos, reloc.kind)
-        let originalSize =
-          case reloc.kind
-          of rkLea: 7
-          of rkIatCall, rkJe, rkJne, rkJg, rkJl, rkJge, rkJle, rkJa, rkJb, rkJae, rkJbe,
-             rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp: 6
-          of rkCall, rkJmp: 5
-          of rkB, rkBL, rkBEQ, rkBNE, rkCBZ, rkCBNZ, rkTBZ, rkTBNZ, rkADR, rkADRP:
-            4  # All ARM64 instructions are 4 bytes
-
-        # Check if we can use a short jump
-        if reloc.kind == rkIatCall:
-          # IAT call is fixed size: FF 15 [rip+disp32]
-          newBuf.data.add(0xFF)  # CALL opcode
-          newBuf.data.add(0x15)  # ModRM: [rip+disp32]
-          newBuf.data.addt32(int32(distance))
-          addedBytes = 6
-          # Keep track of this relocation in the new buffer
-          newBuf.addReloc(currentNewPos, reloc.target, reloc.kind, reloc.originalSize)
-        elif reloc.kind == rkLea:
-          # LEA is fixed size, copy original bytes
-          # The ModRM byte is at +2.
-          newBuf.data.add(0x48)
-          newBuf.data.add(0x8D)
-          newBuf.data.add(optimized.data[i+2])
-          newBuf.data.addt32(int32(distance))
-          addedBytes = 7
-
-          # Keep track of this relocation in the new buffer
-          newBuf.addReloc(currentNewPos, reloc.target, reloc.kind, reloc.originalSize)
-
-        elif reloc.kind in {rkB, rkBL, rkBEQ, rkBNE, rkCBZ, rkCBNZ, rkTBZ, rkTBNZ, rkADR, rkADRP}:
-          # ARM64 instructions are fixed size (4 bytes), copy as-is
-          newBuf.data.add(optimized.data[i])
-          newBuf.data.add(optimized.data[i + 1])
-          newBuf.data.add(optimized.data[i + 2])
-          newBuf.data.add(optimized.data[i + 3])
-          addedBytes = 4
-          # Keep track of this relocation in the new buffer
-          newBuf.addReloc(currentNewPos, reloc.target, reloc.kind, reloc.originalSize)
-
-        elif canUseShortJump(distance):
-          case reloc.kind
-          of rkCall:
-            # CALL doesn't have 8-bit form, emit as 32-bit
-            newBuf.data.add(0xE8)  # CALL opcode
-            newBuf.data.addt32(int32(distance))
-            addedBytes = 5
-            newBuf.addReloc(currentNewPos, reloc.target, reloc.kind, reloc.originalSize)
-          of rkJmp:
-            # JMP with 8-bit displacement
-            newBuf.data.add(0xEB)  # JMP rel8 opcode
-            newBuf.data.add(byte(distance and 0xFF))
-            addedBytes = 2
-            changed = true
-            # No need to track reloc for short jump
-          of rkJe, rkJne, rkJg, rkJl, rkJge, rkJle, rkJa, rkJb, rkJae, rkJbe,
-             rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp:
-            # Conditional jumps with 8-bit displacement
-            let shortOpcode =
-              case reloc.kind
-              of rkJe: 0x74
-              of rkJne: 0x75
-              of rkJg: 0x7F
-              of rkJl: 0x7C
-              of rkJge: 0x7D
-              of rkJle: 0x7E
-              of rkJa: 0x77
-              of rkJb: 0x72
-              of rkJae: 0x73
-              of rkJbe: 0x76
-              of rkJo: 0x70
-              of rkJno: 0x71
-              of rkJs: 0x78
-              of rkJns: 0x79
-              of rkJp: 0x7A
-              of rkJnp: 0x7B
-              else: 0x74  # Default to JE
-
-            newBuf.data.add(byte(shortOpcode))
-            newBuf.data.add(byte(distance and 0xFF))
-            addedBytes = 2
-            changed = true
-          else:
-            # ARM64 relocations should be handled earlier, this should never be reached
-            raise newException(ValueError, "ARM64 relocation in x86 short jump path: " & $reloc.kind)
-        else:
-          # Use 32-bit displacement
-          case reloc.kind
-          of rkCall:
-            newBuf.data.add(0xE8)  # CALL opcode
-            newBuf.data.addt32(int32(distance))
-            addedBytes = 5
-            newBuf.addReloc(currentNewPos, reloc.target, reloc.kind, reloc.originalSize)
-          of rkJmp:
-            newBuf.data.add(0xE9)  # JMP rel32 opcode
-            newBuf.data.addt32(int32(distance))
-            addedBytes = 5
-            newBuf.addReloc(currentNewPos, reloc.target, reloc.kind, reloc.originalSize)
-          of rkIatCall:
-            # IAT call: FF 15 [rip+disp32]
-            newBuf.data.add(0xFF)  # CALL opcode
-            newBuf.data.add(0x15)  # ModRM: [rip+disp32]
-            newBuf.data.addt32(int32(distance))
-            addedBytes = 6
-            newBuf.addReloc(currentNewPos, reloc.target, reloc.kind, reloc.originalSize)
-          of rkJe, rkJne, rkJg, rkJl, rkJge, rkJle, rkJa, rkJb, rkJae, rkJbe,
-             rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp:
-            # Conditional jumps with 32-bit displacement
-            newBuf.data.add(0x0F)  # Two-byte opcode prefix
-            let longOpcode =
-              case reloc.kind
-              of rkJe: 0x84
-              of rkJne: 0x85
-              of rkJg: 0x8F
-              of rkJl: 0x8C
-              of rkJge: 0x8D
-              of rkJle: 0x8E
-              of rkJa: 0x87
-              of rkJb: 0x82
-              of rkJae: 0x83
-              of rkJbe: 0x86
-              of rkJo: 0x80
-              of rkJno: 0x81
-              of rkJs: 0x88
-              of rkJns: 0x89
-              of rkJp: 0x8A
-              of rkJnp: 0x8B
-              else: 0x84  # Default to JE
-            newBuf.data.add(byte(longOpcode))
-            newBuf.data.addt32(int32(distance))
-            addedBytes = 6
-            newBuf.addReloc(currentNewPos, reloc.target, reloc.kind, reloc.originalSize)
-          else:
-            # Unexpected relocation kind - should be handled earlier in the if-elif chain
-            raise newException(ValueError, "Unexpected relocation kind in jump optimization: " & $reloc.kind)
-
-        # Skip the original instruction bytes
-        i += originalSize
-        currentNewPos += addedBytes
-        inc(relocIndex)
+  # ── pass B: rebuild the bytes; patch short jumps, re-track long relocs ──
+  var newData = initBytes()
+  var newRelocs: seq[RelocEntry] = @[]
+  oldI = 0
+  ri = 0
+  while oldI < oldLen:
+    if ri < relocs.len and relocs[ri].position == oldI:
+      let r = relocs[ri]
+      if isShrinkableX64(r.kind) and isShort[ri]:
+        let newSelf = result[r.position]
+        let newTgt = result[labelPos[int(r.target)]]
+        let disp = newTgt - (newSelf + 2)
+        newData.add(if r.kind == rkJmp: 0xEB'u8 else: shortJccOpcode(r.kind))
+        newData.add(byte(disp and 0xFF))
       else:
-        # Copy non-reloc byte
-        newBuf.data.add(optimized.data[i])
-        i += 1
-        currentNewPos += 1
+        for j in 0 ..< r.originalSize: newData.add buf.data[oldI + j]
+        newRelocs.add RelocEntry(position: result[r.position], target: r.target,
+                                 kind: r.kind, originalSize: r.originalSize)
+      oldI += r.originalSize
+      inc ri
+    else:
+      newData.add buf.data[oldI]
+      inc oldI
 
-    # Update labels at the very end
-    if posToLabels.hasKey(i):
-      for labIdx in posToLabels[i]:
-        newBuf.labels[labIdx].position = currentNewPos
-
-    # Update the optimized buffer
-    optimized = newBuf
-
-    # Update displacements for next iteration
-    optimized.updateRelocDisplacements()
-
-  return optimized
+  for k in 0 ..< buf.labels.len:
+    buf.labels[k].position = result[buf.labels[k].position]
+  buf.data = newData
+  buf.relocs = newRelocs
 
 proc finalize*(buf: var Buffer) =
-  ## Finalize the buffer by patching all jump/branch displacements.
-  ##
-  ## NOTE: the rel32→rel8 jump-shortening optimizer (`optimizeJumps`) is
-  ## currently DISABLED because it is incorrect: when it shrinks a jump it wrote
-  ## the displacement from `calculateRelocDistance` using the *long-form* size
-  ## (+5/+6) and the *pre-shortening* buffer positions, and short jumps were not
-  ## re-tracked as relocations, so their 1-byte displacement was never corrected
-  ## after the layout settled. That produced wrong rel8 offsets (taken
-  ## conditional jumps landed mid-instruction → SIGILL/SIGSEGV). `rel32` forms
-  ## are always valid, and `updateRelocDisplacements` patches them correctly from
-  ## the final label positions, so we use those directly. Re-enable a corrected
-  ## (size-aware, fixpoint) optimizer here later.
+  ## Patch every remaining (long-form) jump/branch/lea displacement from the final
+  ## label positions. The rel32→rel8 shortener (`shortenX64Jumps`) — when the
+  ## backend runs it — rewrites the buffer and patches the short jumps inline
+  ## *before* this, leaving only the long forms it re-tracked for us to patch here.
   buf.updateRelocDisplacements()

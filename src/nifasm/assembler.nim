@@ -4655,6 +4655,16 @@ proc pass2(n: Cursor; ctx: var GenContext) =
     error("Expected stmts", n)
 
 proc writeElf(a: var GenContext; outfile: string) =
+  # Shorten x86 rel32 jumps to rel8 where they fit (static-ELF x64 only: no IAT
+  # call-site bookkeeping to invalidate, and AArch64 forms are fixed-size). This
+  # relays out `.text`, so remap every code byte-offset we still need afterwards:
+  # the gvar `lea`/`adrp` patch sites and the synthesized TLS-prologue entry.
+  if a.arch == Arch.X64:
+    let posMap = shortenX64Jumps(a.buf)
+    for k in 0 ..< a.gvarSites.len:
+      a.gvarSites[k] = (posMap[a.gvarSites[k][0]], a.gvarSites[k][1])
+    if a.tlsEntryOffset >= 0:
+      a.tlsEntryOffset = posMap[a.tlsEntryOffset]
   finalize(a.buf)
   finalize(a.bssBuf)
   var code = a.buf.data
