@@ -134,6 +134,9 @@ proc splice*(a: var AsmBuf; nifText: string) =
       a.buf.addSubtree c
       skip c
 
-proc render*(a: var AsmBuf): string =
-  ## Serialize to NIF text (with the `(.nif27)` header) for nifasm.
-  "(.nif27)\n" & toString(a.buf)
+proc render*(a: var AsmBuf; dottedSuffix = ""): string =
+  ## Serialize to a full NIF module for nifasm: `(.nif27)` header, body, and a
+  ## trailing embedded `(.index …)` (so nifasm resolves cross-module symbols
+  ## lazily by their indexed byte offset). `dottedSuffix` (e.g. `.mymod`)
+  ## compresses self-module symbol suffixes to a trailing dot.
+  toModuleString(a.buf, dottedSuffix)

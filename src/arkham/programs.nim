@@ -140,6 +140,11 @@ proc isDeclarativeAbi*(p: var Program; decl: Cursor): bool =
     while c.hasMore: skip c                   # return type, pragmas, body
   result = true
 
+proc thisModuleSuffix*(p: Program): string =
+  ## The main module's NIF symbol suffix (e.g. `sysvq0asl`), used to compress
+  ## self-module symbol suffixes when serializing the embedded-index output.
+  p.scheme.name
+
 proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool): Program =
   result = Program(callTarget: initTable[string, CallTarget](),
                    typeDecls: initTable[string, Cursor](),

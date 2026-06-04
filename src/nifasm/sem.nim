@@ -20,7 +20,16 @@ type
     case kind*: TypeKind
     of ErrorT, VoidT, BoolT: discard
     of IntT, UIntT, FloatT, IntLitT: bits*: int
-    of PtrT, AptrT: base*: Type
+    of PtrT, AptrT:
+      base*: Type
+      baseName*: string  ## The pointee's qualified type name (its nominal
+                         ## identity), for a symbol pointee — empty for a
+                         ## structural one (`(ptr (i 32))`). Used for strict,
+                         ## name-based pointer compatibility. When `base` is nil
+                         ## the type isn't defined yet (a forward reference, e.g.
+                         ## a pointer whose pointee is declared later in the same
+                         ## still-loading module); it is then resolved & memoized
+                         ## into `base` on first structural use.
     of ArrayT:
       elem*: Type
       len*: int64
@@ -147,8 +156,8 @@ proc `$`*(t: Type): string =
   of UIntT: "(u " & $t.bits & ")"
   of FloatT: "(f " & $t.bits & ")"
   of IntLitT: "(lit " & $t.bits & ")"
-  of PtrT: "(ptr " & $t.base & ")"
-  of AptrT: "(aptr " & $t.base & ")"
+  of PtrT: "(ptr " & (if t.base != nil: $t.base else: t.baseName) & ")"
+  of AptrT: "(aptr " & (if t.base != nil: $t.base else: t.baseName) & ")"
   of ArrayT: "(array " & $t.elem & " " & $t.len & ")"
   of ObjectT: "object" # Simplified
   of UnionT: "union" # Simplified
@@ -177,7 +186,16 @@ proc compatible*(want, got: Type): bool =
   of FloatT:
     result = got.kind == want.kind and want.bits == got.bits
   of PtrT, AptrT:
-    result = got.kind == want.kind and compatible(want.base, got.base)
+    if got.kind != want.kind:
+      result = false
+    elif want.base != nil and got.base != nil:
+      # Both pointees structurally resolved — compare structurally.
+      result = compatible(want.base, got.base)
+    else:
+      # A lazily-recorded pointee isn't structurally available, but NIFC types are
+      # nominal: a pointer's pointee identity is its qualified type NAME, so compare
+      # those (strict — NOT a blanket "any same-kind pointer is compatible").
+      result = want.baseName == got.baseName
   of ArrayT:
     result = got.kind == want.kind and want.len == got.len and compatible(want.elem, got.elem)
   of ObjectT, UnionT:

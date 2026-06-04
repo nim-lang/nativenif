@@ -1,6 +1,6 @@
 
 import std / [tables, sets, streams, os, osproc]
-import "../../../nimony/src/lib" / [nifreader, nifstreams, nifcursors, bitabs, lineinfos, symparser]
+import "../../../nimony/src/lib" / [nifreader, nifstreams, nifcursors, nifindexes, bitabs, lineinfos, symparser]
 import tags, model, tagconv
 import buffers, relocs, x86, arm64, elf, macho, pe
 import sem, slots
@@ -147,9 +147,19 @@ proc parseXmm(n: var Cursor): x86.XmmRegister =
 const MainModuleName* = ""  # Special name for main module
 
 type
-  LoadedModule = object
-    buf: TokenBuf
-    stream: nifstreams.Stream
+  LoadedModule = ref object
+    ## A loaded module. The MAIN module is parsed whole into `buf` (local symbols
+    ## carry a `declStart` position into it). A FOREIGN module is opened lazily:
+    ## only its embedded NIF `.index` (symbol → byte offset) is read up front; its
+    ## declarations are parsed one at a time on demand, by following a referenced
+    ## name to its indexed offset (nominal typing). Each lazily-parsed decl tree is
+    ## kept alive in `declBufs` so the Cursors into it stay valid.
+    ## (A `ref` so a handle stays valid even if `ctx.modules` rehashes while a
+    ## decl body recursively pulls in further foreign modules.)
+    buf: TokenBuf                          # whole-module tree (main module only)
+    stream: nifstreams.Stream              # kept open for lazy per-symbol jumps
+    index: Table[string, NifIndexEntry]    # qualified symbol → byte offset
+    declBufs: seq[TokenBuf]                # lazily-parsed foreign decl trees
     loaded: bool  # True if already loaded into scope
 
   Arch = enum
@@ -301,6 +311,7 @@ proc computeStackArgSize(t: Type): int =
   result = (result + 15) and not 15
 
 proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type
+proc parsePtrType(kind: TypeKind; n: var Cursor; scope: Scope; ctx: var GenContext): Type
 proc parseParams(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param]
 proc parseResult(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param]
 proc parseClobbers(n: var Cursor): set[x86.Register]
@@ -363,148 +374,105 @@ proc parseObjectBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
 proc isRegTag(locTag: TagEnum): bool =
   rawTagIsX64Reg(locTag) or rawTagIsA64Reg(locTag)
 
-proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cursor) =
-  ## Load a foreign module and add its symbols to the scope. Parsed exactly once:
-  ## a module is registered (`loaded:false`) *before* its declarations are parsed,
-  ## so a re-entrant call — whether the module is already fully loaded or currently
-  ## mid-parse (a cyclic/self foreign reference, e.g. a proc param whose type lives
-  ## in the same module) — returns here instead of re-parsing, which both avoids
-  ## redundant work and breaks the import cycle that otherwise recurses forever.
+proc openForeignModule(ctx: var GenContext; modname: string; n: Cursor) =
+  ## Open a foreign module for LAZY, on-demand symbol resolution: read just its
+  ## embedded NIF `.index` (symbol → byte offset) and keep the stream open. The
+  ## module's declarations are NOT parsed here — `resolveForeignSym` parses each
+  ## one only when its name is actually followed (nominal typing). Idempotent.
   if ctx.modules.hasKey(modname):
     return
-  block:
-    # Try to find the module file
-    # Look for modname.s.nif (semchecked) or modname.nif
-    var modfile = ""
-    let semchecked = ctx.baseDir / modname & ".s.nif"
-    let plain = ctx.baseDir / modname & ".nif"
+  var modfile = ""
+  let semchecked = ctx.baseDir / modname & ".s.nif"
+  let plain = ctx.baseDir / modname & ".nif"
+  if fileExists(semchecked):
+    modfile = semchecked
+  elif fileExists(plain):
+    modfile = plain
+  else:
+    error("Foreign module file not found: " & modname & " (tried: " & semchecked & ", " & plain & ")", n)
+    return
+  var stream = nifstreams.open(modfile)
+  discard processDirectives(stream.r)
+  let m = LoadedModule(stream: stream, loaded: true)
+  m.index = readEmbeddedIndex(stream)
+  if m.index.len == 0:
+    error("Foreign module has no embedded NIF index (reindex it): " & modfile, n)
+  ctx.modules[modname] = m
 
-    if fileExists(semchecked):
-      modfile = semchecked
-    elif fileExists(plain):
-      modfile = plain
+proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Scope; n: Cursor): Symbol =
+  ## Resolve ONE foreign declaration by following its qualified name through the
+  ## module's embedded index: jump to the indexed byte offset, parse just that
+  ## decl, define it in `scope`, and return it. A decl's body pulls in further
+  ## declarations the same lazy way, on demand — so forward and self/mutually-
+  ## recursive references resolve naturally regardless of file order (a pointer
+  ## pointee stays nominal via `parsePtrType`; only a by-value reference forces a
+  ## follow). The parsed tree is retained in `declBufs` to keep its Cursors valid.
+  let m = ctx.modules[modname]            # ref: stable across table growth
+  if not m.index.hasKey(fullName): return nil
+  let off = m.index[fullName].offset
+  m.stream.r.jumpTo(off)
+  var buf = fromStream(m.stream)          # exactly one balanced decl tree
+  var c = beginRead(buf)
+  let declTag = tagToNifasmDecl(c.tag)
+  var basename = fullName
+  extractBasename(basename)
+  case declTag
+  of TypeD:
+    inc c                                 # type tag
+    if c.kind != SymbolDef: return nil
+    discard getSymDef(c)                  # advance past the name
+    # Define a placeholder BEFORE parsing the body so a self/mutually-recursive
+    # by-value reference inside it (e.g. a proctype field whose result names this
+    # very type) resolves to this symbol instead of recursing back into here. The
+    # placeholder is filled in place, so the captured reference observes the
+    # resolved type.
+    result = Symbol(name: basename, kind: skType, typ: Type(kind: ErrorT),
+                    isForeign: true, moduleName: modname, declStart: off)
+    scope.define(result)
+    var parsed: Type
+    if c.kind == ParLe and c.tag == ObjectTagId:
+      parsed = parseObjectBody(c, scope, ctx)
+    elif c.kind == ParLe and c.tag == UnionTagId:
+      parsed = parseUnionBody(c, scope, ctx)
     else:
-      error("Foreign module file not found: " & modname & " (tried: " & semchecked & ", " & plain & ")", n)
-      return
-
-    # Open and parse the module
-    var stream = nifstreams.open(modfile)
-    discard processDirectives(stream.r)
-    let buf = fromStream(stream)
-    ctx.modules[modname] = LoadedModule(buf: buf, stream: stream, loaded: false)
-
-  # Parse the module's declarations
-  var n = beginRead(ctx.modules[modname].buf)
-  if n.kind == ParLe and n.tag == StmtsTagId:
-    inc n
-    while n.kind != ParRi:
-      if n.kind == ParLe:
-        let start = n
-        let declStart = cursorToPosition(ctx.modules[modname].buf, start)
-        let declTag = tagToNifasmDecl(n.tag)
-        case declTag
-        of TypeD:
-          inc n
-          if n.kind != SymbolDef:
-            skip n
-            continue
-          let name = getSymDef(n)
-          # Extract basename (without module suffix) for lookup
-          var basename = name
-          extractBasename(basename)
-          if n.kind == ParLe and n.tag == ObjectTagId:
-            let typ = parseObjectBody(n, scope, ctx)
-            let sym = Symbol(name: basename, kind: skType, typ: typ, isForeign: true,
-                            moduleName: modname, declStart: declStart)
-            scope.define(sym)
-          elif n.kind == ParLe and n.tag == UnionTagId:
-            let typ = parseUnionBody(n, scope, ctx)
-            let sym = Symbol(name: basename, kind: skType, typ: typ, isForeign: true,
-                            moduleName: modname, declStart: declStart)
-            scope.define(sym)
-          else:
-            # Handles proc types and other types via parseType
-            let typ = parseType(n, scope, ctx)
-            let sym = Symbol(name: basename, kind: skType, typ: typ, isForeign: true,
-                            moduleName: modname, declStart: declStart)
-            scope.define(sym)
-          if n.kind != ParRi: skip n
-          inc n
-        of ProcD:
-          # Parse proc signature only (skip body)
-          inc n
-          if n.kind != SymbolDef:
-            skip n
-            continue
-          let name = getSymDef(n)
-          var basename = name
-          extractBasename(basename)
-
-          var procTyp = Type(kind: ProcT, params: @[], results: @[], clobbers: {})
-
-          # Parse params
-          if n.kind == ParLe:
-            let paramsDecl = tagToNifasmDecl(n.tag)
-            if paramsDecl == ParamsD:
-              procTyp.params = parseParams(n, scope, ctx)
-
-          # Parse result
-          if n.kind == ParLe:
-            let resultDecl = tagToNifasmDecl(n.tag)
-            if resultDecl == ResultD:
-              procTyp.results = parseResult(n, scope, ctx)
-
-          # Parse clobber
-          if n.kind == ParLe:
-            let clobberDecl = tagToNifasmDecl(n.tag)
-            if clobberDecl == ClobberD:
-              procTyp.clobbers = parseClobbers(n)
-
-          let sym = Symbol(name: basename, kind: skProc, typ: procTyp, offset: -1,
-                          isForeign: true, moduleName: modname, declStart: declStart)
-          scope.define(sym)
-
-          # Skip body
-          n = start
-          skip n
-        of GvarD:
-          inc n
-          if n.kind != SymbolDef:
-            skip n
-            continue
-          let name = getSymDef(n)
-          var basename = name
-          extractBasename(basename)
-          let typ = parseType(n, scope, ctx)
-          let sym = Symbol(name: basename, kind: skGvar, typ: typ, isForeign: true,
-                          moduleName: modname, declStart: declStart)
-          scope.define(sym)
-          n = start
-          skip n
-        of TvarD:
-          inc n
-          if n.kind != SymbolDef:
-            skip n
-            continue
-          let name = getSymDef(n)
-          var basename = name
-          extractBasename(basename)
-          let typ = parseType(n, scope, ctx)
-          let sym = Symbol(name: basename, kind: skTvar, typ: typ, isForeign: true,
-                          moduleName: modname, declStart: declStart)
-          scope.define(sym)
-          n = start
-          skip n
-        else:
-          skip n
-      else:
-        skip n
-    inc n
-
-  ctx.modules[modname].loaded = true
+      parsed = parseType(c, scope, ctx)
+    result.typ[] = parsed[]
+  of ProcD:
+    inc c
+    if c.kind != SymbolDef: return nil
+    discard getSymDef(c)
+    var procTyp = Type(kind: ProcT, params: @[], results: @[], clobbers: {})
+    if c.kind == ParLe and tagToNifasmDecl(c.tag) == ParamsD:
+      procTyp.params = parseParams(c, scope, ctx)
+    if c.kind == ParLe and tagToNifasmDecl(c.tag) == ResultD:
+      procTyp.results = parseResult(c, scope, ctx)
+    if c.kind == ParLe and tagToNifasmDecl(c.tag) == ClobberD:
+      procTyp.clobbers = parseClobbers(c)
+    result = Symbol(name: basename, kind: skProc, typ: procTyp, offset: -1,
+                    isForeign: true, moduleName: modname, declStart: off)
+    scope.define(result)
+  of GvarD:
+    inc c
+    if c.kind != SymbolDef: return nil
+    discard getSymDef(c)
+    let typ = parseType(c, scope, ctx)
+    result = Symbol(name: basename, kind: skGvar, typ: typ, isForeign: true,
+                    moduleName: modname, declStart: off)
+    scope.define(result)
+  of TvarD:
+    inc c
+    if c.kind != SymbolDef: return nil
+    discard getSymDef(c)
+    let typ = parseType(c, scope, ctx)
+    result = Symbol(name: basename, kind: skTvar, typ: typ, isForeign: true,
+                    moduleName: modname, declStart: off)
+    scope.define(result)
+  else:
+    return nil
+  m.declBufs.add ensureMove(buf)
 
 proc lookupWithAutoImport(ctx: var GenContext; scope: Scope; name: string; n: Cursor): Symbol =
-  ## Lookup a symbol, automatically loading foreign modules if needed.
+  ## Lookup a symbol, lazily opening + following names into foreign modules.
   ## Also marks the symbol as used for dependency tracking.
   ##
   ## Important: Symbols with module suffixes (e.g., `foo.0.mymodule`) are distinct
@@ -512,13 +480,14 @@ proc lookupWithAutoImport(ctx: var GenContext; scope: Scope; name: string; n: Cu
   ## look in the foreign module, not in the local scope.
   let modname = extractModule(name)
   if modname != "" and modname != ctx.thisModule:
-    # This is a foreign symbol - load the foreign module and look up there.
-    # (A `…0.<thisModule>` suffix names *this* module's own symbol — arkham emits
-    # self-module globals fully qualified — so it must NOT be auto-imported as
-    # foreign, which would shadow the local definition with a link-only stub.)
-    loadForeignModule(ctx, modname, scope, n)
-    # Look up by name (scope.lookup handles basenames and module suffixes)
+    # Foreign symbol: open the module's index, then resolve this one decl lazily
+    # if it isn't already in scope. (A `…0.<thisModule>` suffix names *this*
+    # module's own symbol — arkham emits self-module globals fully qualified — so
+    # it must NOT be treated as foreign, which would shadow the local definition.)
+    openForeignModule(ctx, modname, n)
     result = scope.lookup(name)
+    if result == nil:
+      result = resolveForeignSym(ctx, modname, name, scope, n)
   else:
     # This is a local symbol - look up in current scope
     result = scope.lookup(name)
@@ -526,6 +495,44 @@ proc lookupWithAutoImport(ctx: var GenContext; scope: Scope; name: string; n: Cu
   # Mark symbol as used for dependency tracking
   if result != nil:
     markSymbolUsed(ctx, result.name)
+
+proc parsePtrType(kind: TypeKind; n: var Cursor; scope: Scope; ctx: var GenContext): Type =
+  ## Parse the pointee of a `(ptr X)` / `(aptr X)`. A pointer is 8 bytes whatever
+  ## it points at, so a bare-symbol pointee carries its qualified NAME in
+  ## `baseName` — this is its nominal identity (used for strict, name-based
+  ## pointer compatibility, see `compatible`) and, when the type is not yet
+  ## defined, the handle for resolving it lazily on first structural access (see
+  ## `resolvedBase`). An already-defined symbol also resolves `base` eagerly; a
+  ## genuine forward reference (pointee declared later in the still-loading
+  ## module, e.g. `(ptr Rtti)`) leaves `base` nil until forced. A structural
+  ## pointee (`(ptr (i 32))`) has no name and is resolved eagerly.
+  var base: Type = nil
+  var baseName = ""
+  if n.kind == Symbol:
+    baseName = getSym(n)
+    let sym = scope.lookup(baseName)
+    inc n
+    if sym != nil and sym.kind == skType:
+      base = sym.typ          # resolved eagerly, but keep baseName (nominal id)
+  else:
+    base = parseType(n, scope, ctx)
+  # Construct with a literal discriminator (Nim can't prove a runtime one safe).
+  if kind == AptrT:
+    result = Type(kind: AptrT, base: base, baseName: baseName)
+  else:
+    result = Type(kind: PtrT, base: base, baseName: baseName)
+
+proc resolvedBase(t: Type; ctx: var GenContext; n: Cursor): Type =
+  ## Return a pointer/aptr's pointee, resolving & memoizing a lazily-recorded
+  ## forward reference (see `parsePtrType`) on first use. By the time any field
+  ## or element access runs, the pointee's declaration has been parsed, so the
+  ## lookup — which also auto-imports the owning module if needed — succeeds.
+  if t.base == nil and t.baseName.len > 0:
+    let sym = lookupWithAutoImport(ctx, ctx.scope, t.baseName, n)
+    if sym == nil or sym.kind != skType:
+      error("Unknown type: " & t.baseName, n)
+    t.base = sym.typ
+  result = t.base
 
 proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
   if n.kind == Symbol:
@@ -537,6 +544,13 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
     inc n
   elif n.kind == ParLe:
     let t = n.tag
+    # Inline aggregate types (e.g. an array of anonymous objects, or a field
+    # whose type is spelled out in place) — parseObjectBody/parseUnionBody each
+    # consume the whole `(object …)`/`(union …)` tree, so return directly.
+    if t == ObjectTagId:
+      return parseObjectBody(n, scope, ctx)
+    elif t == UnionTagId:
+      return parseUnionBody(n, scope, ctx)
     inc n
     case t
     of BoolTagId:
@@ -551,11 +565,9 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
       result = Type(kind: FloatT, bits: int(getInt(n)))
       inc n
     of PtrTagId:
-      let base = parseType(n, scope, ctx)
-      result = Type(kind: PtrT, base: base)
+      result = parsePtrType(PtrT, n, scope, ctx)
     of AptrTagId:
-      let base = parseType(n, scope, ctx)
-      result = Type(kind: AptrT, base: base)
+      result = parsePtrType(AptrT, n, scope, ctx)
     of ArrayTagId:
       let elem = parseType(n, scope, ctx)
       let len = getInt(n)
@@ -996,7 +1008,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       var baseReg: arm64.Register
       var baseOffset: int32 = 0
       if baseOp.typ.kind == TypeKind.PtrT:
-        objType = baseOp.typ.base
+        objType = resolvedBase(baseOp.typ, ctx, n)
         if objType.kind notin {TypeKind.ObjectT, TypeKind.UnionT}:
           error("Cannot access field of non-object/union type " & $objType, n)
         baseReg = baseOp.reg
@@ -1043,7 +1055,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       var baseReg: arm64.Register
       var baseOffset: int32 = 0
       if baseOp.typ.kind == TypeKind.AptrT:
-        elemType = baseOp.typ.base
+        elemType = resolvedBase(baseOp.typ, ctx, n)
         baseReg = baseOp.reg
       elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.ArrayT:
         elemType = baseOp.typ.elem
@@ -1114,7 +1126,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
         if addrOp.typ.kind != TypeKind.PtrT:
           error("mem requires pointer type, got " & $addrOp.typ, n)
         result = addrOp
-        result.typ = addrOp.typ.base
+        result.typ = resolvedBase(addrOp.typ, ctx, n)
       else:
         var baseOp = parseOperandA64(n, ctx)
         if baseOp.kind == okImm or baseOp.kind == okMem:
@@ -2491,7 +2503,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
 
         if baseOp.typ.kind == TypeKind.PtrT:
           # Base is a pointer to an object or union
-          objType = baseOp.typ.base
+          objType = resolvedBase(baseOp.typ, ctx, n)
           if objType.kind notin {TypeKind.ObjectT, TypeKind.UnionT}:
             error("Cannot access field of non-object/union type " & $objType, n)
           if baseOp.kind == okMem:
@@ -2578,7 +2590,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
 
         if baseOp.typ.kind == TypeKind.AptrT:
           # Base is an array pointer
-          elemType = baseOp.typ.base
+          elemType = resolvedBase(baseOp.typ, ctx, n)
           baseReg = baseOp.reg
         else:
           error("at requires (base-reg stackvar index) or (aptr-var index), got " & $baseOp.typ, n)
@@ -2653,7 +2665,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
           error("mem requires pointer type, got " & $addrOp.typ, n)
 
         result = addrOp
-        result.typ = addrOp.typ.base  # Dereference: ptr T -> T
+        result.typ = resolvedBase(addrOp.typ, ctx, n)  # Dereference: ptr T -> T
       else:
         # Explicit addressing: (mem base) or (mem base offset) or (mem base index scale [offset])
         var baseOp = parseOperand(n, ctx)

@@ -2462,4 +2462,4 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       g.ab.tree RodataD:
         g.ab.symDef nm
         g.ab.str bytes
-  result = g.ab.render()
+  result = g.ab.render("." & g.prog.thisModuleSuffix)
