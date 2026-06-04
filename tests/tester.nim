@@ -90,15 +90,13 @@ proc arkhamTests() =
 # `linux_arm64` qemu path — the arm64 backend reached x86-64 feature parity for
 # function-pointer calls, `(pat …)` pointer indexing, and thread-locals. List a
 # test's stem here if a new arm64-only TODO is introduced.
-const arkhamLinuxA64Unsupported: seq[string] = @["array2d"]
-  # `array2d` needs global / multi-dimensional array addressing. The x86-64 backend
-  # lowers a non-foldable index via a 3-operand `(at base idx scratch)` — arkham
-  # supplies the scratch register, nifasm computes `base + idx*stride` from the
-  # element type. The arm64 `emAt` still only handles a stack-array *symbol* base; a
-  # global / nested-`(at …)` base must be materialized into a register first, but
-  # `emAt` runs inside an already-open operand tree, so that needs the x64
-  # premat-before-tree two-pass ported to codegen_a64 (the nifasm A64 `(at)` parser
-  # already accepts the 3-operand form). See memory `pystone-benchmark-arkham-fixes`.
+const arkhamLinuxA64Unsupported: seq[string] = @[]
+  # The arm64 backend reached parity with x86-64 on global / multi-dimensional array
+  # addressing: codegen_a64 now uses the same premat-before-tree two-pass
+  # (`prematAccess`/`emAccessAddr`) as x86-64 to materialize a global base, a computed
+  # index, and a non-scale stride's scratch into registers *before* the operand tree
+  # opens, then re-emits `(at base idx [scratch])` for nifasm to fold. Add a test's
+  # stem here if a new arm64-only TODO is introduced.
 
 proc arkhamQemuTests() =
   ## Cross-validate the AArch64 backend on Linux: emit each `tests/arkham/*.c.nif`

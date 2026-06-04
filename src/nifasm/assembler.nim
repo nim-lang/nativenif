@@ -1073,9 +1073,27 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
         var elemType: Type
         var baseReg: arm64.Register
         var baseOffset: int32 = 0
+        var baseIndex: arm64.Register
+        var baseShift: int = 0
+        var baseHasIndex = false
         if baseOp.typ.kind == TypeKind.AptrT:
           elemType = resolvedBase(baseOp.typ, ctx, n)
           baseReg = baseOp.reg
+        elif baseOp.typ.kind == TypeKind.PtrT and
+             resolvedBase(baseOp.typ, ctx, n).kind == TypeKind.ArrayT:
+          # (at <base> index) where <base> is a pointer-to-array address
+          # `(cast (ptr (array elem N)) base)` — how arkham reaches a global array
+          # or a deref'd array field. A nested `(at …)` base carries its own base
+          # register + offset (+ a folded index), all folded on here.
+          elemType = resolvedBase(baseOp.typ, ctx, n).elem
+          if baseOp.kind == okMem:
+            baseReg = baseOp.mem.base
+            baseOffset = baseOp.mem.offset
+            baseIndex = baseOp.mem.index
+            baseShift = baseOp.mem.shift
+            baseHasIndex = baseOp.mem.hasIndex
+          else:
+            baseReg = baseOp.reg
         elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.ArrayT:
           elemType = baseOp.typ.elem
           baseReg = baseOp.mem.base
@@ -1087,7 +1105,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
           baseReg = baseOp.mem.base
           baseOffset = baseOp.mem.offset
         else:
-          error("at requires aptr or stack array, got " & $baseOp.typ, n)
+          error("at requires aptr, pointer-to-array, or stack array, got " & $baseOp.typ, n)
 
         var hasScratch = false
         var scratchReg: arm64.Register
@@ -1100,6 +1118,8 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
           # index, so indexOp is in a register; reuse scratch for the stride const.
           if indexOp.kind != okReg:
             error("at: 3-operand form expects a register index", n)
+          if baseHasIndex:
+            error("at: 3-operand form cannot extend a base that already has an index", n)
           let stride = asmSizeOf(elemType)
           arm64.emitMovImm64(ctx.buf.data, scratchReg, uint64(stride))
           arm64.emitMul(ctx.buf.data, scratchReg, indexOp.reg, scratchReg) # scratch = idx*stride
@@ -1110,10 +1130,13 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
           let offset = indexOp.immVal * asmSizeOf(elemType)
           result.kind = okMem
           result.mem = arm64.MemoryOperand(
-            base: baseReg, offset: baseOffset + int32(offset), hasIndex: false)
+            base: baseReg, index: baseIndex, shift: baseShift,
+            offset: baseOffset + int32(offset), hasIndex: baseHasIndex)
         elif indexOp.kind == okMem:
           error("Array index cannot be memory operand", n)
         else:
+          if baseHasIndex:
+            error("at: two register indices cannot fold into one memory operand", n)
           let elemSize = asmSizeOf(elemType)
           if elemSize notin [1, 2, 4, 8]:
             error("Element size " & $elemSize & " not a scale and no scratch supplied", n)
