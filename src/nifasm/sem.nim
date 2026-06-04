@@ -87,29 +87,25 @@ proc newScope*(parent: Scope = nil): Scope =
   Scope(parent: parent, syms: initTable[string, Symbol]())
 
 proc lookup*(s: Scope; name: string): Symbol =
-  # Use basename for lookup (strips module suffix if present)
-  var key = name
-  extractBasename(key)
+  # NIF symbols are nominal: the key is the FULL qualified name (with module
+  # suffix). Self-module trailing-dot compression is expanded before lookup, so
+  # `foo.0.modA` and `foo.0.modB` are distinct — there is no "basename clash".
   var curr = s
   while curr != nil:
-    if key in curr.syms: return curr.syms[key]
+    if name in curr.syms: return curr.syms[name]
     curr = curr.parent
   return nil
 
 proc symBasename*(sym: Symbol): string =
-  ## Get the basename for scope lookup from a symbol's full name
+  ## Get the basename (identifier without version/module) of a symbol's name.
   result = sym.name
   extractBasename(result)
 
 proc define*(s: Scope; sym: Symbol) =
-  # Use basename as the lookup key (strips module suffix if present)
-  s.syms[symBasename(sym)] = sym
+  s.syms[sym.name] = sym
 
 proc undefine*(s: Scope; name: string) =
-  # Use basename for undefine (strips module suffix if present)
-  var key = name
-  extractBasename(key)
-  s.syms.del(key)
+  s.syms.del(name)
 
 proc isOnStack*(t: Type): bool {.inline.} =
   ## Returns true if this type represents a stack location

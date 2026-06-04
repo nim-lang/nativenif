@@ -217,7 +217,9 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/call_a64_missing_arg.nif", "
 execExpectFailure("nim c -r src/nifasm/nifasm tests/call_duplicate_result_binding.nif", "Result already bound: ret.0")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/module_missing.nif", "Foreign module file not found: no_such_mod")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/module_missing_symbol.nif", "Unknown type: Missing.0.mod_missing_symbol")
-execExpectFailure("nim c -r src/nifasm/nifasm tests/module_gvar_access.nif", "Cannot access foreign global variable 'shared.0.mod_gvar'")
+# A foreign global is now bundled into the same image and accessed directly
+# (nifasm links the whole program in one invocation), so this succeeds.
+exec "nim c -r src/nifasm/nifasm tests/module_gvar_access.nif"
 
 # arkham native-codegen tests: arkham emits the host arch (x86-64 on Linux,
 # AArch64/Darwin on macOS), so we run them only where the binaries execute.

@@ -66,17 +66,23 @@ proc getInt(n: Cursor): int64 =
   else:
     error("Expected integer literal", n)
 
+template symName(n: Cursor): string =
+  ## The symbol's fully-qualified name. The NIF reader already completes the
+  ## self-module trailing-dot compression (using each module's own suffix, set
+  ## from its filename), so the interned string is module-correct as-is.
+  pool.syms[n.symId]
+
 proc getSym(n: Cursor): string =
   case n.kind
   of Symbol:
-    result = pool.syms[n.symId]
+    result = symName(n)
   else:
     error("Expected symbol", n)
 
 proc getSymDef(n: var Cursor): string =
   if n.kind != SymbolDef:
     error("Expected symbol definition", n)
-  result = pool.syms[n.symId]
+  result = symName(n)
   inc n
 
 proc getStr(n: Cursor): string =
@@ -198,7 +204,10 @@ type
                                 # through the loaded pointer (vs a direct `call rel32`)
 
   GenContext = object
-    scope: Scope
+    scope: Scope        # Current (possibly proc-local) lexical scope
+    rootScope: Scope    # Module/global scope; foreign symbols are defined here so
+                        # they persist past the proc that first referenced them
+                        # (processReachableSymbols looks them up to emit bodies).
     buf: relocs.Buffer  # Code buffer (.text section) for x64
     bssBuf: relocs.Buffer  # BSS buffer (.bss section) for zero-initialized global variables
     arch: Arch
@@ -343,7 +352,7 @@ proc parseObjectBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
     if n.kind == ParLe and n.tag == FldTagId:
       inc n
       if n.kind != SymbolDef: error("Expected field name", n)
-      let name = pool.syms[n.symId]
+      let name = symName(n)
       inc n
       # NIFC `FieldDecl ::= (fld SymbolDef FieldPragmas Type)` — tolerate the
       # optional field-pragmas slot before the type.
@@ -414,8 +423,6 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
   var buf = fromStream(m.stream)          # exactly one balanced decl tree
   var c = beginRead(buf)
   let declTag = tagToNifasmDecl(c.tag)
-  var basename = fullName
-  extractBasename(basename)
   case declTag
   of TypeD:
     inc c                                 # type tag
@@ -426,9 +433,9 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
     # very type) resolves to this symbol instead of recursing back into here. The
     # placeholder is filled in place, so the captured reference observes the
     # resolved type.
-    result = Symbol(name: basename, kind: skType, typ: Type(kind: ErrorT),
+    result = Symbol(name: fullName, kind: skType, typ: Type(kind: ErrorT),
                     isForeign: true, moduleName: modname, declStart: off)
-    scope.define(result)
+    ctx.rootScope.define(result)
     var parsed: Type
     if c.kind == ParLe and c.tag == ObjectTagId:
       parsed = parseObjectBody(c, scope, ctx)
@@ -448,25 +455,25 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
       procTyp.results = parseResult(c, scope, ctx)
     if c.kind == ParLe and tagToNifasmDecl(c.tag) == ClobberD:
       procTyp.clobbers = parseClobbers(c)
-    result = Symbol(name: basename, kind: skProc, typ: procTyp, offset: -1,
+    result = Symbol(name: fullName, kind: skProc, typ: procTyp, offset: -1,
                     isForeign: true, moduleName: modname, declStart: off)
-    scope.define(result)
+    ctx.rootScope.define(result)
   of GvarD:
     inc c
     if c.kind != SymbolDef: return nil
     discard getSymDef(c)
     let typ = parseType(c, scope, ctx)
-    result = Symbol(name: basename, kind: skGvar, typ: typ, isForeign: true,
+    result = Symbol(name: fullName, kind: skGvar, typ: typ, isForeign: true,
                     moduleName: modname, declStart: off)
-    scope.define(result)
+    ctx.rootScope.define(result)
   of TvarD:
     inc c
     if c.kind != SymbolDef: return nil
     discard getSymDef(c)
     let typ = parseType(c, scope, ctx)
-    result = Symbol(name: basename, kind: skTvar, typ: typ, isForeign: true,
+    result = Symbol(name: fullName, kind: skTvar, typ: typ, isForeign: true,
                     moduleName: modname, declStart: off)
-    scope.define(result)
+    ctx.rootScope.define(result)
   else:
     return nil
   m.declBufs.add ensureMove(buf)
@@ -634,7 +641,7 @@ proc parseUnionBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
     if n.kind == ParLe and n.tag == FldTagId:
       inc n
       if n.kind != SymbolDef: error("Expected field name", n)
-      let name = pool.syms[n.symId]
+      let name = symName(n)
       inc n
       if not atTypeStart(n): skip n   # tolerate NIFC's FieldPragmas slot
       let ftype = parseType(n, scope, ctx)
@@ -667,7 +674,7 @@ proc parseParams(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
     if n.kind == ParLe and tagToNifasmDecl(n.tag) == ParamD:
       inc n # param
       if n.kind != SymbolDef: error("Expected param name", n)
-      let name = pool.syms[n.symId]
+      let name = symName(n)
       inc n
 
       # (reg) or (s) location
@@ -707,7 +714,7 @@ proc parseResult(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
         wrapped = true
         inc n
       if n.kind != SymbolDef: error("Expected result definition", n)
-      let name = pool.syms[n.symId]
+      let name = symName(n)
       inc n
       var reg = InvalidTagId
       if n.kind == ParLe:
@@ -747,7 +754,7 @@ proc pass1Proc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: str
   # (proc :Name (params ...) (result ...) (clobber ...) (body ...))
   inc n
   if n.kind != SymbolDef: error("Expected proc name", n)
-  let name = pool.syms[n.symId]  # Full qualified name
+  let name = symName(n)  # Full qualified name
   inc n
 
   var procTyp = Type(kind: ProcT, params: @[], results: @[], clobbers: {})
@@ -800,7 +807,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
         of TypeD:
           inc n
           if n.kind != SymbolDef: error("Expected type name", n)
-          let name = pool.syms[n.symId]  # Full qualified name
+          let name = symName(n)  # Full qualified name
           inc n
           if n.kind == ParLe and n.tag == ObjectTagId:
             let typ = parseObjectBody(n, scope, ctx)
@@ -824,7 +831,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
         of RodataD:
           inc n
           if n.kind != SymbolDef: error("Expected rodata name", n)
-          let name = pool.syms[n.symId]  # Full qualified name
+          let name = symName(n)  # Full qualified name
           var sym = Symbol(name: name, kind: skRodata,
                           moduleName: moduleName, declStart: declStart)
           sym.offset = -1  # Mark as forward reference until defined
@@ -834,7 +841,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
         of GvarD:
           inc n
           if n.kind != SymbolDef: error("Expected gvar name", n)
-          let name = pool.syms[n.symId]  # Full qualified name
+          let name = symName(n)  # Full qualified name
           inc n # skip name
           let typ = parseType(n, scope, ctx)
           scope.define(Symbol(name: name, kind: skGvar, typ: typ,
@@ -844,7 +851,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
         of TvarD:
           inc n
           if n.kind != SymbolDef: error("Expected tvar name", n)
-          let name = pool.syms[n.symId]  # Full qualified name
+          let name = symName(n)  # Full qualified name
           inc n # skip name
           let typ = parseType(n, scope, ctx)
           scope.define(Symbol(name: name, kind: skTvar, typ: typ,
@@ -872,7 +879,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
           # (extproc :name "external_name")
           inc n
           if n.kind != SymbolDef: error("Expected extproc name", n)
-          let name = pool.syms[n.symId]
+          let name = symName(n)
           inc n
           if n.kind != StringLit: error("Expected external symbol name string", n)
           let extName = getStr(n)
@@ -1275,8 +1282,8 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       result.typ = Type(kind: UIntT, bits: 64)
       inc n
     elif sym != nil and sym.kind == skGvar:
-      if sym.isForeign:
-        error("Cannot access foreign global variable '" & name & "' directly (must be linked)", n)
+      # A foreign global is bundled into this same image (see generateSymbol), so
+      # it is accessed exactly like a local one — no external linking step.
       # On arm64 the global lives in __DATA/.bss; its address is formed with
       # adrp+add at link time (see AdrA64 + writeMachO). Carry the symbol so its
       # final .bss offset (`sym.size`) is read after all symbols are processed.
@@ -1377,8 +1384,8 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
   if sym == nil:
     error("Unknown symbol: " & name, n)
   elif sym.kind == skProc:
-    if sym.isForeign:
-      error("Cannot call foreign proc '" & name & "' directly (use extcall)", n)
+    # A foreign proc is bundled into this image and called directly (see
+    # generateSymbol); only genuine `extproc` externals use the IAT/extcall path.
     ctx.callContext.typ = sym.typ
   elif sym.kind == skExtProc:
     ctx.callContext.state = CallContextState.ExternalCall
@@ -1590,7 +1597,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of CfvarD:
     inc n
     if n.kind != SymbolDef: error("Expected cfvar name", n)
-    let name = pool.syms[n.symId]
+    let name = symName(n)
     inc n
     let cfvarLabel = ctx.buf.createLabel()
     let sym = Symbol(name: name, kind: skCfvar, typ: Type(kind: BoolT), offset: int(cfvarLabel), used: false)
@@ -1601,7 +1608,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of VarD:
     inc n
     if n.kind != SymbolDef: error("Expected var name", n)
-    let name = pool.syms[n.symId]
+    let name = symName(n)
     inc n
     var reg = InvalidTagId
     var onStack = false
@@ -1665,7 +1672,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of LabA64:
     inc n
     if n.kind != SymbolDef: error("Expected label name", n)
-    let name = pool.syms[n.symId]
+    let name = symName(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym == nil:
       let labId = ctx.buf.createLabel()
@@ -2328,7 +2335,7 @@ proc collectLabels(n: var Cursor; ctx: var GenContext; scope: Scope) =
       var tmp = n
       inc tmp
       if tmp.kind == SymbolDef:
-        let name = pool.syms[tmp.symId]
+        let name = symName(tmp)
         var sym = scope.lookup(name)
         if sym == nil:
           let labId = ctx.buf.createLabel()
@@ -2350,7 +2357,7 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   inc n
   if n.kind != SymbolDef:
     error("Expected symbol definition", n)
-  let name = pool.syms[n.symId]
+  let name = symName(n)
   ctx.procName = name
 
   # Find/Create label for proc
@@ -2365,6 +2372,9 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   ctx.ssizePatches = @[]
   # Clear register bindings at the start of each proc
   ctx.regBindings = initTable[x86.Register, string]()
+  # Each proc is a fresh control flow: no registers are clobbered on entry.
+  # (Matters now that proc bodies are emitted back-to-back when bundling.)
+  ctx.clobbered = {}
 
   # Add params to scope.
   #
@@ -2850,11 +2860,9 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
       result.typ = Type(kind: UIntT, bits: 64) # Address of rodata
       inc n
     elif sym != nil and sym.kind == skGvar:
-      # Global variable - return its address
-      # For foreign symbols, we can't generate code, but we can typecheck
+      # Global variable - return its address. A foreign global is bundled into
+      # this same image (see generateSymbol) and accessed like a local one.
       result.kind = okLabel
-      if sym.isForeign:
-        error("Cannot access foreign global variable '" & name & "' directly (must be linked)", n)
       if sym.offset == -1:
         # Forward reference - create label now
         let labId = ctx.buf.createLabel()
@@ -3019,8 +3027,8 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
   if sym == nil:
     error("Unknown symbol: " & name, n)
   elif sym.kind == skProc:
-    if sym.isForeign:
-      error("Cannot call foreign proc '" & name & "' directly (use extcall)", n)
+    # A foreign proc is bundled into this image and called directly (see
+    # generateSymbol); only genuine `extproc` externals use the extcall path.
     ctx.callContext.typ = sym.typ
     ctx.callContext.state = CallContextState.NormalCall
   elif sym.kind in {skGvar, skTvar, skVar, skParam} and sym.typ.kind == ProcT:
@@ -3403,7 +3411,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # (cfvar :name.0)
     inc n
     if n.kind != SymbolDef: error("Expected cfvar name", n)
-    let name = pool.syms[n.symId]
+    let name = symName(n)
     inc n
 
     # Control flow variables are always virtual (bool type, never materialized)
@@ -3418,7 +3426,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
   of VarD:
     inc n
     if n.kind != SymbolDef: error("Expected var name", n)
-    let name = pool.syms[n.symId]
+    let name = symName(n)
     inc n
     var reg = InvalidTagId
     var onStack = false
@@ -4298,7 +4306,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # (lab :label)
     inc n
     if n.kind != SymbolDef: error("Expected label name", n)
-    let name = pool.syms[n.symId]
+    let name = symName(n)
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     # Label might not be defined yet if this is inside a proc body?
     # No, Pass 1 handles types/procs. Labels are local to procs?
@@ -4697,7 +4705,7 @@ proc pass2(n: Cursor; ctx: var GenContext) =
           inc n
           if n.kind != SymbolDef:
             error("Expected symbol definition", n)
-          let name = pool.syms[n.symId]
+          let name = symName(n)
           let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
           if sym != nil and sym.isForeign:
             # Skip foreign proc body
@@ -4918,20 +4926,27 @@ proc createLiterals(data: openArray[(string, int)]): Literals =
     assert t.int == data[i][1]
 
 proc generateSymbol(ctx: var GenContext; sym: Symbol) =
-  ## Generate code for a single symbol on-demand
+  ## Generate code for a single reachable symbol on-demand. nifasm is the linker:
+  ## a reachable FOREIGN symbol is bundled into this same output (its body/storage
+  ## emitted, cross-module references resolved as ordinary direct relocations) —
+  ## exactly like a local symbol, only the declaration is read from the foreign
+  ## module's stream (at its indexed byte offset) instead of the main TokenBuf.
   if sym.name in ctx.generatedSymbols:
     return
   ctx.generatedSymbols.incl sym.name
 
-  # Skip foreign symbols (they don't need code generation)
-  if sym.isForeign:
-    return
-
-  # Get the module's TokenBuf
   if sym.moduleName notin ctx.modules:
     return  # Module not loaded, can't generate
 
-  var n = cursorAt(ctx.modules[sym.moduleName].buf, sym.declStart)
+  let m = ctx.modules[sym.moduleName]
+  var declBuf: TokenBuf
+  var n: Cursor
+  if sym.isForeign:
+    m.stream.r.jumpTo(sym.declStart)
+    declBuf = fromStream(m.stream)        # exactly one balanced decl tree
+    n = beginRead(declBuf)
+  else:
+    n = cursorAt(m.buf, sym.declStart)
   let declTag = tagToNifasmDecl(n.tag)
 
   case sym.kind
@@ -5000,11 +5015,8 @@ proc processReachableSymbols(ctx: var GenContext) =
     if canonicalName != fullName and canonicalName in ctx.generatedSymbols:
       continue  # Already generated the canonical version
 
-    # Find the symbol
-    var baseName = fullName
-    if extractModule(fullName) != "":
-      extractBasename(baseName)
-    let sym = ctx.scope.lookup(baseName)
+    # Find the symbol by its full qualified name (nominal identity).
+    let sym = ctx.scope.lookup(fullName)
     if sym != nil:
       generateSymbol(ctx, sym)
 
@@ -5023,6 +5035,7 @@ proc assemble*(filename, outfile: string) =
   # Create a minimal ctx for pass1 (for foreign module loading)
   var ctx = GenContext(
     scope: scope,
+    rootScope: scope,
     buf: initBuffer(),
     bssBuf: initBuffer(),
     tlsOffset: 0,
@@ -5058,7 +5071,7 @@ proc assemble*(filename, outfile: string) =
           let start = tn
           inc tn                              # tvar tag
           if tn.kind == SymbolDef:
-            let sym = scope.lookup(pool.syms[tn.symId])
+            let sym = scope.lookup(symName(tn))
             if sym != nil and sym.kind == skTvar and sym.name notin ctx.generatedSymbols:
               sym.offset = ctx.tlsOffset
               ctx.tlsOffset += slots.alignedSize(sym.typ)
