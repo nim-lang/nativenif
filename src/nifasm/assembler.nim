@@ -4962,7 +4962,8 @@ proc writeMachO(a: var GenContext; outfile: string) =
   tlv.threadData = a.tlvData
   for (pos, sym) in a.tlvSites: tlv.sites.add (pos, sym.offset)
 
-  macho.writeMachO(code, a.bssOffset, cputype, cpusubtype, outfile, dynlink, gsites, tlv)
+  macho.writeMachO(code, a.bssOffset, cputype, cpusubtype, outfile, dynlink, gsites, tlv,
+                   a.bssInits)
 
   # macOS arm64 requires code signing for all executables
   when defined(macosx):

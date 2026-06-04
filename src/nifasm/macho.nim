@@ -288,7 +288,8 @@ proc writeMachO*(code: Bytes; bssSize: int;
                  cputype, cpusubtype: uint32; outfile: string;
                  dynlink: DynLinkInfo = DynLinkInfo();
                  gvarSites: seq[(int, int)] = @[];
-                 tlv: TlvInfo = TlvInfo()) =
+                 tlv: TlvInfo = TlvInfo();
+                 bssInits: seq[tuple[off: int64, val: int64, size: int]] = @[]) =
   let pageSize = 0x4000.uint64  # 16KB page size for arm64 macOS
   let baseAddr = 0x100000000.uint64  # macOS default base address
 
@@ -299,6 +300,10 @@ proc writeMachO*(code: Bytes; bssSize: int;
   # Thread-local storage (macOS TLV): N 24-byte descriptors in __thread_vars and
   # an 8-byte-padded init template in __thread_data, both file-backed in __DATA.
   let hasTlv = tlv.descriptorOffsets.len > 0
+  # A gvar with a compile-time constant initializer (e.g. `g = 41.0`) needs its
+  # bytes on disk; a plain zero-fill `__bss` would start it at 0. When present,
+  # the bss region becomes file-backed and we write the init bytes below.
+  let hasBssInits = bssInits.len > 0
   let nTlv = tlv.descriptorOffsets.len
   let tvarsSize = nTlv * 24
   var threadData = tlv.threadData
@@ -383,7 +388,13 @@ proc writeMachO*(code: Bytes; bssSize: int;
   # TLV, the GOT + descriptors + init template are real file bytes; the file
   # region is page-padded so __LINKEDIT stays page-aligned (its fileoff must be
   # congruent with its page-aligned vmaddr).
-  let dataFileContentSize = if hasTlv: bssOff else: 0
+  # bss is file-backed (covering the whole __DATA content) when some gvars carry
+  # static initializers; otherwise the historical layout applies (file-backed
+  # GOT+TLV when TLV is present, fully zero-filled __DATA otherwise).
+  let dataFileContentSize =
+    if hasBssInits: bssOff + bssSize
+    elif hasTlv: bssOff
+    else: 0
   let dataFileSize = int((uint64(dataFileContentSize) + pageSize - 1) and not (pageSize - 1))
   let totalDataSize = bssOff + bssSize
   let dataSize = if totalDataSize > 0: ((totalDataSize.uint64 + pageSize - 1) and not (pageSize - 1)) else: 0.uint64
@@ -433,7 +444,7 @@ proc writeMachO*(code: Bytes; bssSize: int;
     if hasExtProcs:
       # __got: non-lazy symbol pointers (file-backed only when TLV forces a
       # file-backed __DATA; otherwise dyld materializes it from bind info).
-      let gotFileOff = if hasTlv: uint32(dataFileoff + uint64(gotOff)) else: 0'u32
+      let gotFileOff = if hasTlv or hasBssInits: uint32(dataFileoff + uint64(gotOff)) else: 0'u32
       dataSections.add initSection64("__got", "__DATA", dataVmaddr + uint64(gotOff),
                                      uint64(gotSize), gotFileOff, 3, S_NON_LAZY_SYMBOL_POINTERS)
     if hasTlv:
@@ -446,9 +457,14 @@ proc writeMachO*(code: Bytes; bssSize: int;
                                      uint64(tdataSize), uint32(dataFileoff + uint64(tdataOff)),
                                      3, S_THREAD_LOCAL_REGULAR)
     if bssSize > 0:
-      # __bss: zero-initialized tail (not file-backed).
-      dataSections.add initSection64("__bss", "__DATA", dataVmaddr + uint64(bssOff),
-                                     uint64(bssSize), 0, 4, 0)
+      # Globals region: zero-fill `__bss` (file offset 0) normally; a file-backed
+      # `__data` carrying the init bytes when some gvars have static initializers.
+      if hasBssInits:
+        dataSections.add initSection64("__data", "__DATA", dataVmaddr + uint64(bssOff),
+                                       uint64(bssSize), uint32(dataFileoff + uint64(bssOff)), 4, 0)
+      else:
+        dataSections.add initSection64("__bss", "__DATA", dataVmaddr + uint64(bssOff),
+                                       uint64(bssSize), 0, 4, 0)
 
   # Create __LINKEDIT segment
   var linkeditSegment = initSegment64("__LINKEDIT", linkeditVmaddr, linkeditVmsize,
@@ -710,6 +726,12 @@ proc writeMachO*(code: Bytes; bssSize: int;
     # [tdataOff..) the init template.
     for i, b in threadData:
       dataContent[tdataOff + i] = b
+    # [bssOff..) constant static initializers; the rest of the region stays zero.
+    for it in bssInits:
+      for b in 0 ..< it.size:
+        let idx = bssOff + it.off.int + b
+        if idx < dataContent.len:
+          dataContent[idx] = byte((it.val shr (8 * b)) and 0xFF)
     f.writeData(unsafeAddr dataContent[0], dataContent.len)
 
   # Write __LINKEDIT content
