@@ -68,6 +68,7 @@ proc tryBorrowTmp(g: var CodeGen): Reg =
 const StealOrder = [R10, R11, RBX, R12, R13, R14, R15]
 
 proc emScalarStackVar(g: var CodeGen; name: string)
+proc emTypedStackVar(g: var CodeGen; name: string; t: Cursor)
 proc emStackMem(g: var CodeGen; name: string)
 
 proc stealReg(g: var CodeGen; logIdx: int): Reg =
@@ -96,7 +97,16 @@ proc stealReg(g: var CodeGen; logIdx: int): Reg =
   else:
     if logIdx notin g.stealEvents: return NoReg
     let ev = g.stealEvents[logIdx]
-    g.emScalarStackVar(ev.slot)                    # (var :evictN.0 (s) (i 64))
+    # Type the eviction slot like the register local it evicts: a pointer keeps
+    # its `(ptr T)` (else nifasm's strict store/reload rejects the typed value and
+    # later deref/field access is illegal); other scalars stay the 64-bit `(i 64)`
+    # form (matching emRegLocalVar — a logical i8/u8 would mismatch a 64-bit mov).
+    if g.symType.hasKey(ev.victim) and
+       isPtrType(resolveType(g.prog, g.symType[ev.victim])):
+      var tc = g.symType[ev.victim]
+      g.emTypedStackVar(ev.slot, tc)               # (var :evictN.0 (s) (ptr …))
+    else:
+      g.emScalarStackVar(ev.slot)                  # (var :evictN.0 (s) (i 64))
     g.ab.tree MovX64:                              # store the victim's live value
       g.emStackMem(ev.slot)
       g.emReg ev.reg                               # bound to `victim` ⇒ emits its name
@@ -1158,6 +1168,27 @@ proc genCoerce(g: var CodeGen; c: var Cursor; dest: Reg; isCast: bool) =
       while c.hasMore: skip c
       return
     let (srcW, srcSigned) = g.srcWidthSigned(c)
+    if targetPtr and g.regLocal.hasKey(dest):
+      # `dest` is a typed (pointer) named local, and the value is an integer
+      # expression reinterpreted as a pointer — NIFC encodes pointer arithmetic
+      # the way Nim does, as `(cast ptr (add (u 64) …))`. Emitting the integer ops
+      # directly on the pointer-typed name would be rejected by nifasm (`ptr` has
+      # no arithmetic), so compute the integer value in an untyped scratch register
+      # and then move it into the pointer local — the cast is a bit reinterpret.
+      let nm = g.regLocal.getOrDefault(dest, "")   # the destination local's name
+      let s = g.borrowTmp()
+      g.genInto(c, s)
+      if srcW < 64: g.extendTo(s, srcW, signed = false)
+      # Store into the destination's CURRENT home, re-resolved by name: evaluating
+      # the RHS above may have evicted `dest` (this very destination local) to a
+      # spill slot to free a scratch register, in which case writing the captured
+      # `dest` register would be lost and the stale slot read back. `nm == ""` means
+      # `dest` is a plain scratch (no eviction possible) — write it directly.
+      if nm.len > 0: g.emitStoreLoc(g.ra.locationOfSym(nm), s)
+      else: g.movReg(dest, s)
+      g.giveBack s
+      while c.hasMore: skip c
+      return
     g.genInto(c, dest)                        # value → dest
     if targetPtr:
       if srcW < 64: g.extendTo(dest, srcW, signed = false)   # int→ptr: zero-extend
@@ -1687,6 +1718,9 @@ proc freshAggrTemp(g: var CodeGen; typeName: string): string =
   ## and return its name — a place to materialize an inline constructor whose
   ## result an aggregate-by-value ABI then reads from memory.
   result = "ctmp." & $g.spillCount & ".0"; inc g.spillCount
+  g.ra.hasStackVars = true   # ensure the proc reserves its `(s)` slot region (ssize);
+                             # without this an aggregate-temp-only proc skips the
+                             # `sub rsp, ssize` and the slot overlaps the return address
   g.emStackVar(result, typeName)
   g.varType[result] = typeName
 
@@ -2660,29 +2694,11 @@ proc emitStackParamLoadsX64(g: var CodeGen; decl: Cursor) =
 
 # ── thread-local storage ─────────────────────────────────────────────────────
 # nifasm accesses an x86-64 thread-local as `FS:[off]` (it resolves a tvar symbol
-# to a displacement-only FS-segment memory operand). The kernel zeroes the FS base
-# at process entry, so arkham points it at a static `.bss` block via
-# `arch_prctl(ARCH_SET_FS, &block)` in the entry prologue. Single-threaded, so
-# per-thread == per-process. Non-zero literal initializers are stored at entry
-# (the block is zero-filled); nifasm bakes no x64 TLS init template.
-
-const ArchSetFs = 0x1002             # arch_prctl(2) subfunction
-const ArchPrctlNr = 158              # Linux x86-64 syscall number
-
-proc tlsBlockSize(g: var CodeGen): int =
-  ## Total bytes the FS block must cover: the sum of each tvar's aligned size,
-  ## matching nifasm's sequential `tlsOffset += alignedSize` allocation (summing
-  ## over *all* tvars is an upper bound on its reachable subset).
-  result = 0
-  for name, decl in g.tvars:
-    var c = decl
-    c.into:
-      inc c; skip c                              # name, pragmas
-      let s = slotOf(g.prog, c)
-      let a = max(s.align, 1)
-      result += (s.size + a - 1) and not (a - 1)
-      while c.hasMore: skip c
-  if result < 16: result = 16                     # keep the block 16-byte sized/aligned
+# to a displacement-only FS-segment memory operand). nifasm (the linker) owns the
+# unified per-thread block `arkham.tls.0` across all bundled modules and points FS
+# at it via `arch_prctl(ARCH_SET_FS, &block)` in the entry prologue it synthesizes;
+# arkham only references the block for `&tvar`. Nim thread-locals have no
+# initializers, so the block is plain zeroed `.bss`.
 
 proc genTvar(g: var CodeGen; name: string; decl: Cursor) =
   ## Emit `(tvar :name <type> <intlit>?)`. nifasm allocates the FS offset; the
@@ -2701,26 +2717,6 @@ proc genTvar(g: var CodeGen; name: string; decl: Cursor) =
     g.ab.close()
     while c.hasMore: skip c
 
-proc emitTlsSetup(g: var CodeGen) =
-  ## Entry prologue: point FS at the TLS block, then run literal initializers.
-  g.emGlobalAddr(RSI, TlsBlockName)               # rsi ← &block
-  g.movImm(RDI, ArchSetFs)
-  g.movImm(RAX, ArchPrctlNr)
-  g.emSyscall()                                   # arch_prctl(ARCH_SET_FS, &block)
-  for name, decl in g.tvars:
-    var c = decl
-    c.into:
-      inc c; skip c; skip c                       # name, pragmas, type
-      if c.hasMore and c.kind == IntLit:
-        let v = intVal(c)
-        if v != 0:
-          let r = g.borrowTmp()
-          g.movImm(r, v)
-          g.ab.tree MovX64:                       # FS:[off] ← r  (tvar symbol resolves to mem)
-            g.ab.sym name
-            g.emReg r
-          g.giveBack r
-      while c.hasMore: skip c
 
 proc emitProcBody(g: var CodeGen; info: ProcInfo; declarative: bool) =
   ## Emit one proc's `(proc …)` (signature + body). Run twice by `genProc`: once
@@ -2740,8 +2736,9 @@ proc emitProcBody(g: var CodeGen; info: ProcInfo; declarative: bool) =
         g.ab.tree SubX64: g.ab.reg RSP; g.ab.keyword SsizeX  # they sit above rsp (call-safe)
       if g.retIndirect: g.movReg(g.indirectReg, RDI)   # park the hidden result ptr
       g.emitParamMoves(info.decl, declarative)         # settle register params
-      if info.isEntry and g.tvars.len > 0:
-        g.emitTlsSetup()                      # set FS base + thread-local initializers
+      # The thread-local FS base is set up by nifasm (the linker owns the unified
+      # `arkham.tls.0` block across all bundled modules); see the entry prologue it
+      # synthesizes. arkham just references the block for `&tvar` / `FS:[off]`.
       if info.isEntry: g.emitGlobalInits()    # run module-level var initializers
       var c = info.decl
       c.into:
@@ -2838,8 +2835,8 @@ proc genGlobal(g: var CodeGen; name: string; decl: Cursor) =
     skip c                                      # type
     let hasValue = c.hasMore and c.kind != DotToken
     if isConst and hasValue:
-      # A compile-time constant: lay it out as a read-only data blob (no `.bss`
-      # slot, no entry-time initialiser — see `emitGlobalInits`, which skips it).
+      # A true `const`: a read-only data blob in `.text` (no `.bss`, no entry-time
+      # init — emitGlobalInits skips ConstS).
       var bytes = ""
       constToBytes(g.prog, typeCur, c, bytes)
       g.ab.tree RodataD:
@@ -2850,8 +2847,16 @@ proc genGlobal(g: var CodeGen; name: string; decl: Cursor) =
       g.ab.symDef name
       var tc2 = typeCur
       g.genTypeBody(tc2)                         # type
+      # A compile-time constant SCALAR initializer is laid out as *static data*:
+      # emit the constant's bits as the gvar's value, so nifasm initializes the
+      # (writable) `.bss` slot from the on-disk image. Correct even for a foreign
+      # module's gvar in a bundle (its entry-time `emitGlobalInits` never runs) and
+      # for a `var` later mutated (a read-only rodata blob would fault). Other
+      # (runtime) initializers are still stored at entry by `emitGlobalInits`.
+      if hasValue and isConstScalarInit(c):
+        g.ab.intLit cast[int64](constLitBits(c))
       g.ab.close()
-    while c.hasMore: skip c                      # value (initialized at entry)
+    while c.hasMore: skip c                      # value (also handled at entry, if runtime)
 
 proc emitGlobalInits(g: var CodeGen) =
   ## At program entry, store each global's initializer (if any) into its slot.
@@ -2862,7 +2867,9 @@ proc emitGlobalInits(g: var CodeGen) =
       inc c; skip c                             # name, pragmas
       let gslot = slotOf(g.prog, c)             # the global's declared type
       skip c                                    # type
-      if c.hasMore and c.kind != DotToken:
+      # A constant-scalar initializer was laid out as static data (see genGlobal),
+      # so there is no entry-time store to emit for it here.
+      if c.hasMore and c.kind != DotToken and not isConstScalarInit(c):
         if gslot.kind == AFloat:                 # float global → movss/movsd [&g], xmm
           let gbits = if gslot.size == 4: 32 else: 64
           let fv = g.borrowFTmp()
@@ -2902,14 +2909,9 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool): string =
       g.genType(name, decl)
     for name, decl in g.prog.globals:
       g.genGlobal(name, decl)
-    if g.tvars.len > 0:
-      # The static FS-segment block backing all thread-locals (see `emitTlsSetup`).
-      g.ab.open NifasmDecl.GvarD
-      g.ab.symDef TlsBlockName
-      g.ab.arrayType:
-        g.ab.uintType(8)
-        g.ab.intLit g.tlsBlockSize()
-      g.ab.close()
+    # `arkham.tls.0` (the per-thread block FS points at) is owned and emitted by
+    # nifasm, the linker — one unified block sized for ALL bundled modules' tvars,
+    # plus the entry-prologue `arch_prctl` that sets FS. arkham only references it.
     for name, decl in g.prog.tvars:
       g.genTvar(name, decl)
     for info in g.prog.procs:

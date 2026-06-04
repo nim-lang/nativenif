@@ -236,6 +236,18 @@ type
     pendingSymbols: seq[string]  # Symbols pending code generation
     generatedSymbols: HashSet[string]  # Symbols already generated
     dedupTable: Table[string, string]  # Maps dedup key to canonical symbol name
+    # Thread-local storage (x86-64). nifasm owns the unified per-thread block
+    # `arkham.tls.0` (sized for ALL bundled modules' tvars) and synthesizes the
+    # entry prologue that points FS at it (`arch_prctl`). Nim thread-locals have no
+    # initializers, so the block is just zeroed `.bss`.
+    tlsBlockSym: Symbol          # the synthetic `arkham.tls.0` gvar (FS base block)
+    entrySym: Symbol             # the entry proc (`_start`/`main.0`) — prologue jumps here
+    tlsEntryOffset: int          # .text offset of the synthesized FS-setup prologue, or -1
+    # A gvar with a compile-time constant scalar initializer is laid out as static
+    # data: arkham emits its bits as the gvar value, and these are written into the
+    # (writable) `.bss` image on disk so the slot starts with that value (correct in
+    # a bundle, where a foreign module's entry-time initializer never runs).
+    bssInits: seq[tuple[off: int64, val: int64, size: int]]  # (.bss byte offset, value, size)
 
   OperandKind = enum
     okReg       # Register operand
@@ -472,6 +484,14 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
     discard getSymDef(c)
     let typ = parseType(c, scope, ctx)
     result = Symbol(name: fullName, kind: skTvar, typ: typ, isForeign: true,
+                    moduleName: modname, declStart: off)
+    ctx.rootScope.define(result)
+  of RodataD:
+    # A foreign read-only data blob (e.g. a string literal, or a gvar with a
+    # constant-scalar initializer laid out as static data — see arkham genGlobal).
+    inc c
+    if c.kind != SymbolDef: return nil
+    result = Symbol(name: fullName, kind: skRodata, offset: -1, isForeign: true,
                     moduleName: modname, declStart: off)
     ctx.rootScope.define(result)
   else:
@@ -4718,6 +4738,7 @@ proc pass2(n: Cursor; ctx: var GenContext) =
             n = start
             pass2Proc(n, ctx)
             ctx.generatedSymbols.incl name
+            ctx.entrySym = sym             # the FS-setup prologue jumps here
           else:
             # Regular proc - skip, will be generated if referenced
             n = start
@@ -4758,8 +4779,11 @@ proc writeElf(a: var GenContext; outfile: string) =
   let textFileSize = headersSize.uint64 + code.len.uint64  # Headers + code
   let textMemSize = (textFileSize + pageSize - 1) and not (pageSize - 1)
 
-  # Entry point is after the headers
-  let entryAddr = baseAddr + headersSize.uint64
+  # Entry point is after the headers. When nifasm synthesized a TLS-setup prologue
+  # (see setupTls) it becomes the real entry — it sets the FS base then jumps to the
+  # program's entry proc; otherwise the entry is the first byte of code (offset 0).
+  let entryOff = if a.tlsEntryOffset >= 0: a.tlsEntryOffset.uint64 else: 0'u64
+  let entryAddr = baseAddr + headersSize.uint64 + entryOff
 
   # .bss section comes after .text in memory
   let bssVaddr = textVaddr + textMemSize
@@ -4819,10 +4843,22 @@ proc writeElf(a: var GenContext; outfile: string) =
   # separate writable `bssPhdr`.
   var textPhdr = initPhdr(textOffset, textVaddr, textMemSize, textMemSize, PF_R or PF_X)
 
-  # .bss program header (writable, readable, not executable)
-  # p_filesz = 0 because .bss is not stored in the file (zero-initialized)
-  # p_memsz = actual size needed in memory
-  var bssPhdr = initPhdr(0, bssVaddr, 0, bssAlignedSize, PF_R or PF_W)
+  # .bss program header (writable, readable, not executable). Normally `.bss` is
+  # zero-initialized by the loader (p_filesz = 0). When some gvars have constant
+  # static initializers (`a.bssInits` — e.g. `stdout = 1`), the segment is instead
+  # file-backed: an on-disk image holds those bytes (the rest zero), so the slots
+  # start with their values without any entry-time init code (correct in a bundle).
+  var bssImage: seq[byte]
+  if a.bssInits.len > 0 and bssSize > 0:
+    bssImage = newSeq[byte](bssSize.int)
+    for it in a.bssInits:
+      for i in 0 ..< it.size:
+        if it.off.int + i < bssImage.len:
+          bssImage[it.off.int + i] = byte((it.val shr (8 * i)) and 0xFF)
+  # The bss content (if any) is written right after the .text segment in the file.
+  let bssFileOff = if bssImage.len > 0: textMemSize else: 0'u64
+  let bssFileSz = if bssImage.len > 0: bssSize else: 0'u64
+  var bssPhdr = initPhdr(bssFileOff, bssVaddr, bssFileSz, bssAlignedSize, PF_R or PF_W)
 
   var f = newFileStream(outfile, fmWrite)
   defer: f.close()
@@ -4843,8 +4879,10 @@ proc writeElf(a: var GenContext; outfile: string) =
       var zeros = newSeq[byte](padding)
       f.writeData(unsafeAddr zeros[0], padding)
 
-  # .bss section is not written to file (it's zero-initialized by the loader)
-  # The loader will allocate the memory and zero it
+  # Write the initialized .bss image (constant static initializers), if any. The
+  # remaining memsz beyond bssSize is zero-filled by the loader.
+  if bssImage.len > 0:
+    f.writeData(unsafeAddr bssImage[0], bssImage.len)
 
   let perms = {fpUserExec, fpGroupExec, fpOthersExec, fpUserRead, fpUserWrite}
   setFilePermissions(outfile, perms)
@@ -4974,6 +5012,16 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
       sym.offset = int(labId)
       sym.size = ctx.bssOffset      # byte offset within .bss (for arm64 adrp+add)
       ctx.bssBuf.defineLabel(labId)
+      # A constant-scalar initializer (arkham emits its bits as the gvar's value
+      # in `(gvar :name type value?)`): record it so writeElf writes the value into
+      # the (writable) .bss image.
+      var dn = n
+      inc dn                                    # gvar tag
+      discard getSymDef(dn)                     # name
+      discard parseType(dn, ctx.scope, ctx)     # type
+      if dn.kind == IntLit:
+        ctx.bssInits.add (off: sym.size.int64, val: getInt(dn),
+                          size: asmSizeOf(sym.typ))
       ctx.bssOffset += size
   of skTvar:
     if declTag == TvarD:
@@ -5020,6 +5068,32 @@ proc processReachableSymbols(ctx: var GenContext) =
     if sym != nil:
       generateSymbol(ctx, sym)
 
+proc setupTls(ctx: var GenContext) =
+  ## nifasm owns the per-thread TLS. After every bundled tvar has an FS offset
+  ## (`ctx.tlsOffset`), reserve the unified `arkham.tls.0` block in `.bss` (sized
+  ## for all modules' tvars) and synthesize the entry prologue that points FS at it
+  ## via `arch_prctl(ARCH_SET_FS, &arkham.tls.0)`, then jumps to the real entry.
+  ## Nim thread-locals have no initializers, so the block is just zeroed `.bss`.
+  ## x86-64 only (AArch64 TLS uses a different mechanism, not yet implemented).
+  const ArchSetFs = 0x1002      # arch_prctl(2) ARCH_SET_FS
+  const ArchPrctlNr = 158       # x86-64 syscall number for arch_prctl
+  if ctx.arch != Arch.X64 or ctx.tlsOffset == 0: return
+  if ctx.tlsBlockSym == nil or ctx.entrySym == nil: return
+  # Reserve the per-thread block in .bss (16-byte aligned); its address is the FS
+  # base, and every tvar lives at `FS:[its offset]` within it.
+  ctx.bssOffset = (ctx.bssOffset + 15) and not 15
+  ctx.tlsBlockSym.size = ctx.bssOffset
+  ctx.bssOffset += (ctx.tlsOffset + 15) and not 15
+  # Synthesize the FS-setup prologue at the end of .text — it becomes the ELF entry
+  # (see writeElf) and tail-jumps to the program's real entry proc.
+  ctx.tlsEntryOffset = ctx.buf.data.len
+  let pos = x86.emitLeaRipPlaceholder(ctx.buf, x86.RSI)     # lea rsi, [rip+arkham.tls.0]
+  ctx.gvarSites.add (pos, ctx.tlsBlockSym)
+  x86.emitMovImmToReg(ctx.buf.data, x86.RDI, ArchSetFs)
+  x86.emitMovImmToReg(ctx.buf.data, x86.RAX, ArchPrctlNr)
+  x86.emitSyscall(ctx.buf.data)                             # arch_prctl(ARCH_SET_FS, &block)
+  x86.emitJmp(ctx.buf, LabelId(ctx.entrySym.offset))        # → real entry
+
 proc assemble*(filename, outfile: string) =
   nifstreams.pool = createLiterals(TagData)
   var buf = parseFromFile(filename)
@@ -5048,11 +5122,21 @@ proc assemble*(filename, outfile: string) =
     gotSlotCount: 0,
     pendingSymbols: @[],
     generatedSymbols: initHashSet[string](),
-    dedupTable: initTable[string, string]()
+    dedupTable: initTable[string, string](),
+    tlsEntryOffset: -1
   )
 
   # Store main module
   ctx.modules[MainModuleName] = LoadedModule(buf: move buf, loaded: true)
+
+  # The unified per-thread TLS block is owned by nifasm, not any single module
+  # (arkham only references it for `&tvar`/`FS:[off]`). Define it up front so those
+  # references resolve; it's pre-marked generated (nifasm sizes + allocates it in
+  # `setupTls` once all bundled tvars are known) and FS is set in the entry prologue.
+  ctx.tlsBlockSym = Symbol(name: "arkham.tls.0", kind: skGvar,
+                           typ: Type(kind: UIntT, bits: 8), offset: -1)
+  scope.define(ctx.tlsBlockSym)
+  ctx.generatedSymbols.incl "arkham.tls.0"
 
   var n1 = beginRead(ctx.modules[MainModuleName].buf)
   pass1(n1, scope, ctx, MainModuleName, ctx.modules[MainModuleName].buf)
@@ -5091,6 +5175,10 @@ proc assemble*(filename, outfile: string) =
   # Process all pending symbols (both main module and foreign modules)
   # This generates code only for symbols that were actually referenced (dead code elimination)
   processReachableSymbols(ctx)
+
+  # Now that every bundled tvar has an FS offset, reserve the unified TLS block and
+  # synthesize the entry prologue that sets the FS base (x86-64).
+  setupTls(ctx)
 
   case ctx.arch
   of Arch.X64, Arch.LinuxA64:

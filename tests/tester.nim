@@ -90,7 +90,7 @@ proc arkhamTests() =
 # cases rely on Darwin-only TLV thread-locals; `patidx` (`(pat …)` pointer
 # indexing) and `indirect_call` (function-pointer calls) are implemented so far
 # only in the x86-64 backend (arm64: TODO).
-const arkhamLinuxA64Unsupported = ["tvar", "tvar_param", "tvar_addr", "patidx", "indirect_call"]
+const arkhamLinuxA64Unsupported = ["tvar_addr", "patidx", "indirect_call"]
 
 proc arkhamQemuTests() =
   ## Cross-validate the AArch64 backend on Linux: emit each `tests/arkham/*.c.nif`

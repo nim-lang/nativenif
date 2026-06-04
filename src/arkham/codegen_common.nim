@@ -316,11 +316,14 @@ proc retIsVoid*(t: Cursor): bool {.inline.} =
 # `.bss` and running an initialiser at entry. Arch-neutral: the layout follows
 # the same `typeSizeAlign` the ABI uses.
 
-proc constLitBits(c: Cursor): uint64 =
-  ## Raw bits of a scalar literal, unwrapping `(suf value "type")` / `(par …)`.
+proc constLitBits*(c: Cursor): uint64 =
+  ## Raw bits of a scalar literal, unwrapping `(suf value "type")` / `(par …)` and
+  ## value-preserving reinterprets `(cast Type value)` / `(conv Type value)` — e.g.
+  ## `cast[ptr CFile](1)` (a fd encoded as a pointer) collapses to the bits of `1`.
   var v = c
-  while v.kind == TagLit and v.exprKind in {SufC, ParC}:
-    inc v                                    # descend to the wrapped value
+  while v.kind == TagLit and v.exprKind in {SufC, ParC, CastC, ConvC}:
+    if v.exprKind in {CastC, ConvC}: (inc v; skip v)   # past the tag + target type
+    else: inc v                                        # descend to the wrapped value
   case v.kind
   of IntLit:   result = cast[uint64](intVal(v))
   of UIntLit:  result = uintVal(v)
@@ -334,6 +337,22 @@ proc constLitBits(c: Cursor): uint64 =
     of NegC:   (inc v; result = cast[uint64](-cast[int64](constLitBits(v))))
     else: raiseAssert "arkham const: unsupported scalar " & $v.exprKind
   else: raiseAssert "arkham const: unsupported literal kind " & $v.kind
+
+proc isConstScalarInit*(c: Cursor): bool =
+  ## Whether an initializer is a compile-time-constant SCALAR — a literal, a
+  ## bool/nil literal, or a (negate / cast / conv / suf / par) wrapping one. Such a
+  ## gvar initializer can be laid out as static data (see the backend `genGlobal`),
+  ## so it is correct even for a FOREIGN module's gvar in a bundle, where the
+  ## module's entry-time initializer code never runs. (Aggregate constructors and
+  ## address-of initializers — which need a relocation — are NOT covered here.)
+  var v = c
+  while v.kind == TagLit and v.exprKind in {SufC, ParC, CastC, ConvC, NegC}:
+    if v.exprKind in {CastC, ConvC}: (inc v; skip v)   # past the tag + target type
+    else: inc v                                        # descend to the wrapped value
+  case v.kind
+  of IntLit, UIntLit, CharLit, FloatLit: true
+  of TagLit: v.exprKind in {TrueC, FalseC, NilC}
+  else: false
 
 proc appendLE(buf: var string; bits: uint64; size: int) =
   for i in 0 ..< size: buf.add char((bits shr (8 * i)) and 0xFF'u64)
