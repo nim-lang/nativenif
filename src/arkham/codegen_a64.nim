@@ -1781,8 +1781,8 @@ proc emitCondJump(g: var CodeGen; c: var Cursor; toLabel: string; whenTrue: bool
   if t: g.giveBack r
 
 proc materializeCond(g: var CodeGen; c: var Cursor; dest: Reg) =
-  ## Spill a pending condition into `dest` as a `0`/`1` boolean — TCC's `gv()`
-  ## on a `VT_CMP` value. The compare itself (and short-circuit `&&`/`||`) is
+  ## Spill a pending condition into `dest` as a `0`/`1` boolean.
+  ## The compare itself (and short-circuit `and`/`or`) is
   ## shared with the branch path via `emitCondJump`: assume true, jump over the
   ## reset when the condition holds, otherwise fall through to `dest ← 0`.
   let lEnd = g.freshLabel()

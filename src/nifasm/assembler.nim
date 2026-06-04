@@ -183,6 +183,9 @@ type
     argsSet: HashSet[string]    # Arguments that have been assigned
     resultsSet: HashSet[string] # Results that have been bound
     stackArgSize: int           # Computed size of stack arguments (csize)
+    indirect: bool              # Target is a function-pointer variable: `typ` is its
+                                # proctype signature and `(call)` is an indirect call
+                                # through the loaded pointer (vs a direct `call rel32`)
 
   GenContext = object
     scope: Scope
@@ -203,6 +206,8 @@ type
     bssOffset: int  # Current offset in .bss section
     modules: Table[string, LoadedModule]  # Cache of loaded foreign modules
     baseDir: string  # Base directory for finding module files
+    thisModule: string  # The module being assembled (symbol suffix of the main file);
+                        # a `name.0.<thisModule>` reference is local, not foreign
     regBindings: Table[x86.Register, string]  # Maps registers to variable names they're bound to (x64 only)
     # Dynamic linking
     imports: seq[ImportedLib]  # Imported libraries
@@ -359,10 +364,15 @@ proc isRegTag(locTag: TagEnum): bool =
   rawTagIsX64Reg(locTag) or rawTagIsA64Reg(locTag)
 
 proc loadForeignModule(ctx: var GenContext; modname: string; scope: Scope; n: Cursor) =
-  ## Load a foreign module and add its symbols to the scope
+  ## Load a foreign module and add its symbols to the scope. Parsed exactly once:
+  ## a module is registered (`loaded:false`) *before* its declarations are parsed,
+  ## so a re-entrant call — whether the module is already fully loaded or currently
+  ## mid-parse (a cyclic/self foreign reference, e.g. a proc param whose type lives
+  ## in the same module) — returns here instead of re-parsing, which both avoids
+  ## redundant work and breaks the import cycle that otherwise recurses forever.
   if ctx.modules.hasKey(modname):
-    discard
-  else:
+    return
+  block:
     # Try to find the module file
     # Look for modname.s.nif (semchecked) or modname.nif
     var modfile = ""
@@ -501,8 +511,11 @@ proc lookupWithAutoImport(ctx: var GenContext; scope: Scope; name: string; n: Cu
   ## from local symbols (e.g., `foo.0`). When a module suffix is present, we only
   ## look in the foreign module, not in the local scope.
   let modname = extractModule(name)
-  if modname != "":
-    # This is a foreign symbol - load the foreign module and look up there
+  if modname != "" and modname != ctx.thisModule:
+    # This is a foreign symbol - load the foreign module and look up there.
+    # (A `…0.<thisModule>` suffix names *this* module's own symbol — arkham emits
+    # self-module globals fully qualified — so it must NOT be auto-imported as
+    # foreign, which would shadow the local definition with a link-only stub.)
     loadForeignModule(ctx, modname, scope, n)
     # Look up by name (scope.lookup handles basenames and module suffixes)
     result = scope.lookup(name)
@@ -576,9 +589,20 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
       # for codegen; the `efld` children are consumed by the trailing skip.
       result = parseType(n, scope, ctx)
     of ProctypeTagId:
-      # `(proctype Empty Params Type ProcTypePragmas)` — a function pointer
-      # (8 bytes). Children are consumed by the trailing skip.
-      result = Type(kind: ProcT, params: @[], results: @[], clobbers: {})
+      # `(proctype (params …) (result …)? (clobber …)?)` — a function pointer
+      # (8 bytes; see `asmSizeOf`). arkham emits the full ABI signature (not an
+      # opaque pointer) so an indirect `(prepare <fnptr> … (call))` resolves its
+      # args/result against this, exactly like a direct call to a proc.
+      var ptParams: seq[Param] = @[]
+      var ptResults: seq[Param] = @[]
+      var ptClobbers: set[x86.Register] = {}
+      if n.kind == ParLe and tagToNifasmDecl(n.tag) == ParamsD:
+        ptParams = parseParams(n, scope, ctx)
+      if n.kind == ParLe and tagToNifasmDecl(n.tag) == ResultD:
+        ptResults = parseResult(n, scope, ctx)
+      if n.kind == ParLe and tagToNifasmDecl(n.tag) == ClobberD:
+        ptClobbers = parseClobbers(n)
+      result = Type(kind: ProcT, params: ptParams, results: ptResults, clobbers: ptClobbers)
     else:
       error("Unknown type tag: " & $t, n)
     # Tolerate NIFC type qualifiers we don't model: IntQualifier (atomic/ro),
@@ -2843,6 +2867,19 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
       )
       result.typ = sym.typ
       inc n
+    elif sym != nil and sym.kind == skProc:
+      # A proc used as a value → its code address (RIP-relative): `lea reg, proc`
+      # materializes a function pointer. Same label the proc's definition / a
+      # direct `(call)` binds, so it resolves to the proc's entry.
+      result.kind = okLabel
+      if sym.offset == -1:
+        let labId = ctx.buf.createLabel()
+        sym.offset = int(labId)
+        result.label = labId
+      else:
+        result.label = LabelId(sym.offset)
+      result.typ = Type(kind: UIntT, bits: 64)   # a code pointer
+      inc n
     else:
       error("Unknown or invalid symbol: " & name, n)
   else:
@@ -2974,6 +3011,13 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
       error("Cannot call foreign proc '" & name & "' directly (use extcall)", n)
     ctx.callContext.typ = sym.typ
     ctx.callContext.state = CallContextState.NormalCall
+  elif sym.kind in {skGvar, skTvar, skVar, skParam} and sym.typ.kind == ProcT:
+    # Indirect call through a function-pointer variable: its proctype IS the
+    # signature, so arg/result checking and stack layout proceed exactly as for a
+    # direct call; only `(call)` differs (it loads the pointer and calls it).
+    ctx.callContext.typ = sym.typ
+    ctx.callContext.state = CallContextState.NormalCall
+    ctx.callContext.indirect = true
   elif sym.kind == skExtProc:
     # External proc - find its info
     ctx.callContext.state = CallContextState.ExternalCall
@@ -3016,7 +3060,9 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
   skipParRi n, "prepare"
 
 proc genCallMarkerX64(n: var Cursor; ctx: var GenContext) =
-  ## Handle (call) marker inside a prepare block - emits the actual call instruction
+  ## `(call)` inside a `prepare` block emits the actual call: a direct `call rel32`
+  ## to the prepared proc, or — when the prepare target is a function-pointer
+  ## variable — an indirect call that loads the pointer and `call`s through it.
   if not ctx.inCall:
     error("(call) can only be used inside a prepare block", n)
 
@@ -3030,17 +3076,25 @@ proc genCallMarkerX64(n: var Cursor; ctx: var GenContext) =
   # Clobber registers
   ctx.clobbered.incl(ctx.callContext.typ.clobbers)
 
-  var labId: LabelId
-  if sym.offset == -1:
-    labId = ctx.buf.createLabel()
-    sym.offset = int(labId)
+  if ctx.callContext.indirect:
+    # Load the function pointer from its variable into rax — which the call
+    # clobbers anyway and where a scalar result then lands — and call through it.
+    # The gvar's RIP-relative address is recorded as a site and patched by writeElf,
+    # exactly like a `(lea reg gvar)`.
+    let pos = x86.emitLeaRipPlaceholder(ctx.buf, x86.RAX)               # lea rax, [rip+fnptr]
+    ctx.gvarSites.add (pos, sym)
+    x86.emitMov(ctx.buf.data, x86.RAX, x86.MemoryOperand(base: x86.RAX)) # mov rax, [rax]
+    x86.emitCallReg(ctx.buf.data, x86.RAX)                              # call rax
   else:
-    labId = LabelId(sym.offset)
-
-  ctx.buf.emitCall(labId)
+    var labId: LabelId
+    if sym.offset == -1:
+      labId = ctx.buf.createLabel()
+      sym.offset = int(labId)
+    else:
+      labId = LabelId(sym.offset)
+    ctx.buf.emitCall(labId)
   ctx.callContext.callEmitted = true
-
-  inc n
+  inc n                   # past the `(call` head
   skipParRi n, "call"
 
 proc genExtcallX64(n: var Cursor; ctx: var GenContext) =
@@ -4948,6 +5002,9 @@ proc assemble*(filename, outfile: string) =
 
   # Extract base directory from filename
   let baseDir = filename.splitFile.dir
+  # The module being assembled — its symbol suffix (e.g. `foo.s.nif` → "foo"), so a
+  # `name.0.foo` reference resolves to a local definition instead of a foreign import.
+  let thisModule = extractModuleSuffix(filename)
 
   var scope = newScope()
 
@@ -4960,6 +5017,7 @@ proc assemble*(filename, outfile: string) =
     bssOffset: 0,
     modules: initTable[string, LoadedModule](),
     baseDir: baseDir,
+    thisModule: thisModule,
     imports: @[],
     extProcs: @[],
     gotSlotCount: 0,

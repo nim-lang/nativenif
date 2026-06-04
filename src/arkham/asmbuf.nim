@@ -104,6 +104,7 @@ template ptrType*(a: var AsmBuf; body: untyped) = a.tree PtrT: body
 template aptrType*(a: var AsmBuf; body: untyped) = a.tree AptrT: body
 template arrayType*(a: var AsmBuf; body: untyped) = a.tree ArrayT: body
 template flexarrayType*(a: var AsmBuf; body: untyped) = a.tree FlexarrayT: body
+template proctypeType*(a: var AsmBuf; body: untyped) = a.tree ProctypeT: body
 template fldDef*(a: var AsmBuf; name: string; body: untyped) =
   a.openS($FldT)
   a.symDef name
@@ -116,9 +117,6 @@ template fldDef*(a: var AsmBuf; name: string; body: untyped) =
 # consumes, parsed and spliced straight into the buffer. Operands are filled in
 # by the caller with ordinary string building (`regName r`, `$bits`, …) — e.g.
 #   g.ab.splice "(fmov (" & regName tmp & ") (d0)) (lsr (x0) (x0) 32)"
-# This is the analogue of TCC's inline-asm escape hatch, but with zero new
-# grammar and no runtime/helper-call dependency (the bytes stay inline, so the
-# linker/DCE story is unchanged).
 
 proc splice*(a: var AsmBuf; nifText: string) =
   ## Parse one or more sibling asm-NIF nodes from `nifText` and append them to

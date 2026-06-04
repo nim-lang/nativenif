@@ -182,7 +182,10 @@ proc getType*(g: var CodeGen; c: Cursor): Cursor =
         let objTy = resolveType(g.prog, g.getType(t)); skip t  # past the base subtree
         result = fieldType(g.prog, objTy, symName(t)); inc t
         while t.hasMore: skip t
-    of AtC:
+    of AtC, PatC:
+      # `(at array idx)` indexes an array, `(pat ptr idx)` a pointer; either way
+      # the result is the element/pointee type, which `innerType` yields for
+      # `array`/`ptr`/`aptr` alike.
       var t = c
       t.into:
         let arrTy = resolveType(g.prog, g.getType(t)); skip t  # past the base subtree
@@ -265,7 +268,7 @@ proc srcWidthSigned*(g: var CodeGen; c: Cursor): tuple[width: int, signed: bool]
 # `Location` (machinedesc) is THE descriptor for "where a value lives, or should
 # go" — a register, a stack slot, a global/thread-local, a foldable memory operand
 # (`Mem`, carrying the lvalue subtree to re-emit), an immediate, or `Undef` (the
-# dont-care target). It is the analogue of TCC's `SValue`, shared by the register
+# dont-care target). It is shared by the register
 # allocator (long-lived storage) and the backends (just-computed values + lvalue
 # destinations). `asLoc` parses a NIFC lvalue cursor into one; `genVal` produces a
 # computed value as one; the `gen`/load-store family consume it. This replaces the

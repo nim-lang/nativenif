@@ -1551,6 +1551,18 @@ proc emitJmpReg*(dest: var Bytes; reg: Register) =
   dest.add(0xFF)  # JMP r/m64 opcode
   dest.add(encodeModRM(amDirect, 4, int(reg)))  # /4 extension
 
+proc emitCallReg*(dest: var Bytes; reg: Register) =
+  ## Emit CALL instruction: CALL reg (indirect call through register)
+  var rex = RexPrefix()
+
+  if needsRex(reg): rex.b = true
+
+  if rex.b:
+    dest.add(encodeRex(rex))
+
+  dest.add(0xFF)  # CALL r/m64 opcode
+  dest.add(encodeModRM(amDirect, 2, int(reg)))  # /2 extension
+
 # Bit manipulation instructions
 proc emitAnd*(dest: var Bytes; a, b: Register) =
   ## Emit AND instruction: AND a, b (a = a AND b)

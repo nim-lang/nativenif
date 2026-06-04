@@ -37,6 +37,8 @@ type
     declarative*: bool       ## true → emit/use nifasm's declarative call ABI
                              ## (typed params + `(arg)`/`(res)` cross-checking);
                              ## false → manual marshalling (floats/aggregates/…)
+    indirect*: bool          ## true → call *through* a function-pointer variable
+                             ## (`asmName` is the gvar/tvar holding the pointer)
 
   ProcInfo* = object
     asmName*: string         ## the proc's asm-NIF name (entry → "main.0")
@@ -496,10 +498,11 @@ proc fieldType*(p: var Program; objType: Cursor; field: string): Cursor =
   raiseAssert "arkham: field '" & field & "' not found"
 
 proc innerType*(p: var Program; t: Cursor): Cursor =
-  ## The element/pointee type of a resolved `(ptr T)` / `(aptr T)` / `(array T …)`.
+  ## The element/pointee type of a resolved `(ptr T)` / `(aptr T)` / `(array T …)`
+  ## / `(flexarray T)` — in each the first child is the element/pointee type.
   assert t.kind == TagLit, "arkham: expected a pointer/array type"
   case t.typeKind
-  of PtrT, AptrT, ArrayT:
+  of PtrT, AptrT, ArrayT, FlexarrayT:
     var tc = t
     tc.into:
       result = tc; skip tc                    # the pointee / element type

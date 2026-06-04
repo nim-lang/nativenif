@@ -246,6 +246,7 @@ proc genCall(g: var CodeGen; c: var Cursor)
 proc genAddr(g: var CodeGen; c: var Cursor; dest: Reg)
 proc emitCondJump(g: var CodeGen; c: var Cursor; toLabel: string; whenTrue: bool)
 proc genVal(g: var CodeGen; c: var Cursor): Location
+proc emitPatAddr(g: var CodeGen; c: var Cursor; dest: Reg)
 proc forceReg(g: var CodeGen; v: Location): tuple[r: Reg, owns: bool]
 proc genTypeBody(g: var CodeGen; c: var Cursor)
 proc emitGlobalInits(g: var CodeGen)
@@ -662,6 +663,9 @@ proc genVal(g: var CodeGen; c: var Cursor): Location =
     case c.exprKind
     of DotC, AtC, DerefC:                       # a memory lvalue used as a value
       result = g.asLoc(c)                        # a foldable `Mem` operand
+    of PatC:                                     # pointer indexing → eager element load
+      let t = g.borrowTmp(); g.genInto(c, t)
+      result = regLoc(t, ScalarSlot, owns = true)
     else:
       let t = g.tryBorrowTmp()                  # a computed value → a scratch reg…
       if t == NoReg: result = g.spillComputed(c)  # …or a spill slot if exhausted
@@ -1056,6 +1060,42 @@ proc genCoerce(g: var CodeGen; c: var Cursor; dest: Reg; isCast: bool) =
       g.extendTo(dest, targetW, signed = targetSigned)
     while c.hasMore: skip c
 
+proc emitPatAddr(g: var CodeGen; c: var Cursor; dest: Reg) =
+  ## `dest ← &(pat base idx)` — pointer indexing. Unlike `dot`/`at`/`deref` (whose
+  ## bases fold into a single nifasm memory operand), a `pat` base is a pointer
+  ## *value* that must live in a register: an array/flexarray field decays to its
+  ## address, a real pointer is loaded. Base (and a non-immediate index) are
+  ## materialized into registers *before* the `lea` opens, so no helper instruction
+  ## lands inside its operand tree; the `lea dest, (at (cast (aptr elem) base) idx)`
+  ## then lets nifasm stride the index by the element size.
+  c.into:
+    let baseTy = resolveType(g.prog, g.getType(c))
+    var elem = innerType(g.prog, baseTy)
+    let baseReg = g.borrowTmp()
+    if baseTy.typeKind in {NifcType.ArrayT, NifcType.FlexarrayT}:
+      g.genAddr(c, baseReg)                     # decay: baseReg ← &field
+    else:
+      g.genInto(c, baseReg)                     # baseReg ← the pointer value
+    var idxImm = false
+    var idxV = 0'i64
+    var idxReg = NoReg
+    if c.kind == IntLit: (idxImm = true; idxV = intVal(c); inc c)
+    elif c.kind == UIntLit: (idxImm = true; idxV = cast[int64](uintVal(c)); inc c)
+    else: (idxReg = g.borrowTmp(); g.genInto(c, idxReg))
+    g.ab.tree LeaX64:
+      g.emReg dest
+      g.ab.tree AtX:
+        g.ab.tree CastX:
+          g.ab.aptrType:
+            if elem.kind == Symbol: g.ab.sym symName(elem)
+            else: g.genTypeBody(elem)
+          g.emReg baseReg
+        if idxImm: g.ab.intLit idxV
+        else: g.emReg idxReg
+    if idxReg != NoReg: g.giveBack idxReg
+    g.giveBack baseReg
+    while c.hasMore: skip c
+
 proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
   # While `dest` holds the value being built, a deep sub-operand may exhaust the
   # scratch pool and spill — its transient staging register must not clobber
@@ -1113,6 +1153,9 @@ proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
     of CastC: g.genCoerce(c, dest, isCast = true)
     of DotC, AtC, DerefC:                     # field / element / pointer load: dest ← [mem]
       g.place(g.genVal(c), dest)
+    of PatC:                                  # pointer index: &elem into dest, then load in place
+      g.emitPatAddr(c, dest)
+      g.ab.tree MovX64: (g.emReg dest; g.ab.tree MemX: g.emReg dest)
     of AddrC:                                 # (addr lvalue) → dest ← &lvalue
       c.into:
         g.genAddr(c, dest)
@@ -1137,8 +1180,13 @@ proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
 
 proc genAddr(g: var CodeGen; c: var Cursor; dest: Reg) =
   ## `dest ← &lvalue`. Parse the addressing mode once, then form the address.
-  let loc = g.asLoc(c)
-  g.emitAddrLoc(loc, dest)
+  ## `pat` (pointer indexing) can't fold into a single memory operand — its base
+  ## pointer needs a register — so it is formed eagerly by `emitPatAddr`.
+  if c.kind == TagLit and c.exprKind == PatC:
+    g.emitPatAddr(c, dest)
+  else:
+    let loc = g.asLoc(c)
+    g.emitAddrLoc(loc, dest)
 
 # ── conditions / branches ────────────────────────────────────────────────────
 
@@ -1602,6 +1650,27 @@ proc copyStructThroughPtr(g: var CodeGen; srcVar, typeName: string; ptrReg: Reg)
     g.ab.tree MovX64: (g.emPtrFieldMem(ptrReg, typeName, f.name); g.emReg t)
     g.giveBack t
 
+proc indirectRetType(g: var CodeGen; gvarDecl: Cursor): Cursor =
+  ## The return-type cursor of a function-pointer variable's proctype, for the
+  ## declarative call path's `retIsVoid`/result handling. NIFC's
+  ## `(proctype Empty Params RetType Pragmas)` always carries the RetType node — a
+  ## `.` (DotToken, `retIsVoid`-true) / `(void)` for a void proc — so it is simply
+  ## the third child.
+  var d = gvarDecl
+  result = gvarDecl                             # overwritten below (always a proctype here)
+  d.into:
+    inc d; skip d                               # name, pragmas
+    let pt = resolveType(g.prog, d)             # the (proctype …) body
+    assert pt.kind == TagLit and pt.typeKind == ProctypeT,
+           "arkham: indirect call through a non-proctype value"
+    var q = pt                                  # consume a copy; `result` keeps a cursor
+    q.into:
+      skip q                                    # Empty (the proc-name slot)
+      skip q                                    # Params
+      result = q                                # RetType (`.` / `(void)` / a real type)
+      while q.hasMore: skip q                   # drain RetType + Pragmas
+    while d.hasMore: skip d
+
 proc genCall(g: var CodeGen; c: var Cursor) =
   ## `(call f arg…)`. The C `exit` extern lowers to the Linux exit syscall; a
   ## declarative user proc uses the SysV register ABI via a `(prepare …)` block
@@ -1610,10 +1679,20 @@ proc genCall(g: var CodeGen; c: var Cursor) =
   c.into:
     let fsym = symName(c); inc c
     if not g.callTarget.hasKey(fsym):
-      # A call into another module: resolve its signature from the owning
-      # module's embedded index and cache it. nifasm auto-imports the foreign
-      # `<module>.s.nif` and links the definition.
-      g.callTarget[fsym] = foreignCallTarget(g.prog, fsym)
+      let si = g.lookupSym(fsym)
+      if si.cat in {scGlobal, scTvar}:
+        # The callee is a *variable* holding a function pointer. Its proctype is a
+        # full signature, so it has the same typing as a direct call and goes
+        # through the SAME declarative `(prepare …)` path — only the call
+        # instruction differs (nifasm emits an indirect `call` when the prepare
+        # target is a function-pointer variable).
+        g.callTarget[fsym] = CallTarget(declarative: true, indirect: true,
+                                        asmName: fsym, retType: g.indirectRetType(si.decl))
+      else:
+        # A call into another module: resolve its signature from the owning
+        # module's embedded index and cache it. nifasm auto-imports the foreign
+        # `<module>.s.nif` and links the definition.
+        g.callTarget[fsym] = foreignCallTarget(g.prog, fsym)
     let tgt = g.callTarget[fsym]
     let sysNr = if tgt.extern: linuxSyscallNr(g.externCName(tgt.asmName)) else: -1
     if tgt.atomic.len > 0:                     # GCC `__atomic_*` builtin → inline
@@ -2090,6 +2169,55 @@ proc genPointee(g: var CodeGen; c: var Cursor) =
   else:
     g.genTypeBody(c)
 
+proc genProctypeSig(g: var CodeGen; c: var Cursor) =
+  ## Lower a NIFC `(proctype Empty Params [RetType] Pragmas)` to a concrete asm-NIF
+  ## signature `(proctype (params (param :pN.0 <reg|s> T)…) (result (res :ret.0 (rax)
+  ## T))? (clobber …))` — the SysV ABI assignment, identical in shape to a
+  ## declarative proc's signature, so nifasm can resolve an *indirect* `(prepare …)`
+  ## call through a function pointer against it. A function pointer is still 8 bytes
+  ## (nifasm sizes `ProcT` as a pointer); the signature is metadata for call sites.
+  ## Param/result types are emitted BY REFERENCE (`genPointee`) for named types so a
+  ## self-referential closure/continuation signature can't recurse forever.
+  var numParams = 0
+  g.ab.proctypeType:
+    c.into:
+      skip c                                    # the Empty slot (a proc has its name here)
+      g.ab.tree ParamsD:
+        if c.kind == TagLit:                    # (params (param …) …)
+          var idx = 0
+          c.into:
+            while c.hasMore:
+              c.into:                           # (param :name pragmas type)
+                inc c                           # name → positional pN.0
+                skip c                          # pragmas
+                g.ab.tree ParamD:
+                  g.ab.symDef paramName(idx)
+                  if idx < g.md.intArgRegs.len: g.ab.reg g.md.intArgRegs[idx]
+                  else: g.ab.keyword SO         # 7th+ → stack-passed
+                  g.genPointee(c)               # param type (named → by-reference)
+                while c.hasMore: skip c
+              inc idx
+          numParams = idx
+        else:
+          skip c
+      g.ab.tree ResultD:
+        # The RetType is always the node after Params (a `.`/`(void)` for void).
+        if retIsVoid(c):
+          skip c                                # consume the void `.`/`(void)` node
+        else:
+          g.ab.symDef "ret.0"
+          g.ab.reg RAX
+          g.genPointee(c)                       # consumes the return type
+      while c.hasMore: skip c                    # pragmas
+      # The clobber excludes the parameter registers — they hold live args on entry,
+      # so listing them would (as for a direct call's signature) make a callee unable
+      # to read its own params. Mirrors `emitSignature`.
+      var paramRegs: set[Reg] = {}
+      for i in 0 ..< min(numParams, g.md.intArgRegs.len): paramRegs.incl g.md.intArgRegs[i]
+      g.ab.tree ClobberD:
+        for r in x64ClobbersGpr:
+          if r notin paramRegs: g.ab.reg r
+
 proc genTypeBody(g: var CodeGen; c: var Cursor) =
   ## Translate a NIFC type at `c` into asm-NIF, advancing past it. Named types
   ## are inlined; object field pragmas are dropped. v0: int/uint/bool/ptr + objects.
@@ -2128,12 +2256,12 @@ proc genTypeBody(g: var CodeGen; c: var Cursor) =
       g.ab.flexarrayType:
         c.into: g.genTypeBody(c)              # element type
     of ProctypeT:
-      # A function pointer: 8 bytes, ABI-identical to a plain pointer. Emit an
-      # opaque `(ptr (void))` and do NOT descend into the param/result types —
-      # those routinely refer back to the enclosing aggregate (closures,
-      # continuations), which would otherwise recurse forever.
-      g.ab.ptrType: g.ab.voidType()
-      skip c
+      # A function pointer (8 bytes). Emit its full ABI signature — not an opaque
+      # `(ptr (void))` — so nifasm can type-check and resolve an indirect call
+      # `(prepare <fnptr> … (call))` against it. Recursion through self-referential
+      # closure/continuation param types is broken by `genProctypeSig`'s
+      # by-reference (`genPointee`) type emission.
+      g.genProctypeSig(c)
     of ArrayT:
       c.into:
         g.ab.arrayType:
@@ -2308,7 +2436,16 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor; declarative: bool) =
             g.emRegLocalVar(nm, argReg, typeCur)
             g.regLocal[argReg] = nm
         elif loc.kind == InReg:
-          g.movReg(loc.r, argReg)               # relocated to a callee-saved home (raw)
+          # Relocated to a callee-saved home. In the declarative path the signature
+          # binds argReg to `pN.0`, so the relocation move must *read* it by name
+          # (a raw `(reg)` use of a bound register is rejected); the binding is then
+          # killed so the now-dead arg register is free for reuse. The
+          # non-declarative path has no binding, so it moves the raw register.
+          if declarative:
+            g.ab.tree MovX64: (g.emReg loc.r; g.ab.sym paramName(idx))
+            g.ab.tree KillX64: g.ab.sym paramName(idx)
+          else:
+            g.movReg(loc.r, argReg)
         elif loc.kind == NamedStack and loc.typ.kind != AFloat:
           # an address-taken scalar param: declare its `(s)` slot and spill the
           # incoming argument register into it so `addr`/loads/stores work. In the
