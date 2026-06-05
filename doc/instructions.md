@@ -418,3 +418,5 @@
 | `(fldp D1 D2 S O)`  | A64Inst                 | fp load pair (post-indexed) |
 | `(ldrb D B I)`      | A64Inst                 | load byte (zero-extend), register offset [B,I] |
 | `(strb D B I)`      | A64Inst                 | store low byte, register offset [B,I] |
+| `(rebind D T S)`    | X64Inst, A64Inst        | bind a phys reg to a typed name, killing its prior tenant |
+| `(withreg D T S ...)` | X64Inst, A64Inst      | block-scoped rebind; auto-killed at block end |

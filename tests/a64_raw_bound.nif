@@ -1,0 +1,16 @@
+(.nif27)
+(.index)
+(stmts
+ (arch arm64)
+ (proc :test_a64_raw_bound.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (var :x.0
+    (x19)
+    (i 64))
+   (mov x.0 60)
+   (mov
+    (x19)40)
+   (ret))))(.index)

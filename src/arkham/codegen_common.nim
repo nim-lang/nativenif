@@ -86,7 +86,29 @@ type
     symType*: Table[string, Cursor]          ## local/param name → its NIFC type cursor (for getType)
     regLocal*: Table[Reg, string]            ## reg → the named local currently bound to it
                                              ## (x64 named-locals: emit the name, not `(reg)`)
+    boundTemps*: set[Reg]                    ## x64: registers whose `regLocal` entry is a
+                                             ## transient scratch temp `(rebind …)`'d by
+                                             ## `bindTemp`, NOT a steal-able local. `stealReg`
+                                             ## / `evictFixedReg` skip these (a temp is not a
+                                             ## local to spill); released by `unbindTemp`.
+    tmpBindCount*: int                       ## x64: per-proc fresh-name counter for scratch
+                                             ## register bindings (`tmpN.0`). Bumped in BOTH
+                                             ## passes so the names replay identically, like
+                                             ## `spillCount`.
     scopeLocals*: seq[seq[tuple[name: string, reg: Reg]]]  ## per-scope register locals to `kill`
+    fregLocal*: Table[FReg, string]          ## the SIMD twin of `regLocal`: xmm reg → the
+                                             ## named float local/scratch currently bound to it
+                                             ## (`emFReg` emits the name, not `(xmmN)`). Covers
+                                             ## both float register locals (InFReg, declared via
+                                             ## `emFRegLocalVar`) and scratch temps (`bindFTmp`).
+                                             ## Only the xmm8–15 scratch pool is tracked; the
+                                             ## xmm0–7 arg/return/staging regs stay raw.
+    boundFTmps*: set[FReg]                    ## SIMD twin of `boundTemps`: xmm regs whose
+                                             ## `fregLocal` entry is a transient scratch temp,
+                                             ## released by `unbindFTmp`.
+    ftmpBindCount*: int                       ## per-proc fresh-name counter for float scratch
+                                             ## bindings (`ftmpN.0`); bumped in BOTH passes.
+    scopeFLocals*: seq[seq[tuple[name: string, f: FReg]]]  ## per-scope float register locals to `kill`
     stealEvents*: Table[int, StealEvent]     ## borrow-log index → a codegen-time
                                              ## register steal (evict a live local
                                              ## to a stack slot); recorded in the
@@ -227,7 +249,19 @@ proc getType*(g: var CodeGen; c: Cursor): Cursor =
       t.into:
         result = g.callTarget.getOrDefault(symName(t)).retType
         while t.hasMore: skip t
+    of NilC: result = g.prog.voidPtr          # nil → a generic pointer type
+    of AddrC:                                 # &lvalue → (ptr <type-of-lvalue>)
+      var t = c; inc t
+      result = g.prog.ptrTypeOf(g.getType(t))
+    of SufC, ParC:                            # wrappers → the inner value's type
+      var t = c; inc t
+      result = g.getType(t)
     else: raiseAssert "arkham: getType — unsupported expression " & $c.exprKind
+  of IntLit:   result = g.prog.intType        # a bare literal's natural type
+  of UIntLit:  result = g.prog.uintType
+  of CharLit:  result = g.prog.charType
+  of FloatLit: result = g.prog.floatType
+  of StrLit:   result = g.prog.voidPtr        # a string literal is a pointer
   else: raiseAssert "arkham: getType — literal has no stored type"
 
 proc exprSlot*(g: var CodeGen; c: Cursor): AsmSlot =
@@ -327,7 +361,7 @@ proc asLoc*(g: var CodeGen; c: var Cursor): Location =
       else: raiseAssert "arkham: symbol is not an lvalue: " & nm
   of TagLit:
     case c.exprKind
-    of DotC, AtC, DerefC: (result = memLoc(nCur, slot); skip c)
+    of DotC, AtC, DerefC, PatC: (result = memLoc(nCur, slot); skip c)
     else: raiseAssert "arkham: not an lvalue: " & $c.exprKind
   else: raiseAssert "arkham: not an lvalue: " & $c.kind
 
@@ -454,6 +488,12 @@ proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string) =
     var maxAl = 1
     var fi = 0
     oc.into:
+      # An object *constant* of an inherited type would need the base's fields
+      # laid out first (positionally matched against the leading oconstr values),
+      # like objSizeAlign/aggrLayout do for runtime layout. Not yet implemented —
+      # fail loudly rather than emit silently-misaligned bytes.
+      if oc.kind == Symbol:
+        raiseAssert "arkham: object constant of an inherited type not yet supported"
       skip oc                                # base / inheritance
       while oc.hasMore:
         oc.into:                             # (fld :name pragmas type)
