@@ -86,6 +86,15 @@ type
     symType*: Table[string, Cursor]          ## local/param name → its NIFC type cursor (for getType)
     regLocal*: Table[Reg, string]            ## reg → the named local currently bound to it
                                              ## (x64 named-locals: emit the name, not `(reg)`)
+    boundTemps*: set[Reg]                    ## x64: registers whose `regLocal` entry is a
+                                             ## transient scratch temp `(rebind …)`'d by
+                                             ## `bindTemp`, NOT a steal-able local. `stealReg`
+                                             ## / `evictFixedReg` skip these (a temp is not a
+                                             ## local to spill); released by `unbindTemp`.
+    tmpBindCount*: int                       ## x64: per-proc fresh-name counter for scratch
+                                             ## register bindings (`tmpN.0`). Bumped in BOTH
+                                             ## passes so the names replay identically, like
+                                             ## `spillCount`.
     scopeLocals*: seq[seq[tuple[name: string, reg: Reg]]]  ## per-scope register locals to `kill`
     stealEvents*: Table[int, StealEvent]     ## borrow-log index → a codegen-time
                                              ## register steal (evict a live local

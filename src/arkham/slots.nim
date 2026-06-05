@@ -22,6 +22,13 @@ type
   AsmSlot* = object
     kind*: AsmTypeKind
     size*, align*, offset*: int   # offset only meaningful for fields/slots
+    typ*: Cursor                  # the NIFC type this slot was classified from, when
+                                  # known (a `typeToSlot` result carries it). Lets a
+                                  # scratch register be `(rebind …)`'d to its concrete
+                                  # type — incl. a pointer's pointee — rather than a
+                                  # lenient raw `(reg)`. `cursorIsNil` for a manually
+                                  # built dont-care slot (an int/register placeholder),
+                                  # where the binder falls back to `(i 64)`.
 
   VarProp* = enum
     AddrTaken   # address taken (or an array): cannot live in a register
@@ -86,17 +93,20 @@ proc scalarSlot(kind: AsmTypeKind; bits: int): AsmSlot =
 
 proc typeToSlot*(c: Cursor): AsmSlot =
   ## Classify a NIFC type at `c`. Aggregates and unknowns become `AMem`
-  ## (passed/kept by reference) for now.
+  ## (passed/kept by reference) for now. The classified slot retains `c` in `.typ`
+  ## so a scratch register holding a value of this type can be `(rebind …)`'d to its
+  ## concrete NIFC type (see `bindTemp`).
   case c.typeKind
-  of IT:   scalarSlot(AInt,  typeBits(c))
-  of UT:   scalarSlot(AUInt, typeBits(c))
-  of CT:   scalarSlot(AUInt, max(8, typeBits(c)))   # char: at least 1 byte
-  of FT:   scalarSlot(AFloat, typeBits(c))
-  of BoolT: AsmSlot(kind: ABool, size: 1, align: 1)
+  of IT:   result = scalarSlot(AInt,  typeBits(c))
+  of UT:   result = scalarSlot(AUInt, typeBits(c))
+  of CT:   result = scalarSlot(AUInt, max(8, typeBits(c)))   # char: at least 1 byte
+  of FT:   result = scalarSlot(AFloat, typeBits(c))
+  of BoolT: result = AsmSlot(kind: ABool, size: 1, align: 1)
   of PtrT, AptrT, ProctypeT:
-    AsmSlot(kind: AUInt, size: 8, align: 8)          # an address
+    result = AsmSlot(kind: AUInt, size: 8, align: 8)          # an address
   else:
-    AsmSlot(kind: AMem, size: 0, align: 1)           # object/array/union/void/…
+    result = AsmSlot(kind: AMem, size: 0, align: 1)           # object/array/union/void/…
+  result.typ = c
 
 # ── aggregate layout descriptors ────────────────────────────────────────────
 # The name-resolving size/layout queries (`typeSizeAlign`, `aggrLayout`, …) live

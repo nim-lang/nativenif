@@ -419,9 +419,10 @@ proc spillComputed(g: var CodeGen; c: var Cursor): Location =
   g.ra.unseal {stage}
   result = namedStackLoc(slotName, AsmSlot(kind: AInt, size: 8, align: 8))
 
-const ScalarSlot = AsmSlot(kind: AInt, size: 8, align: 8)
+let ScalarSlot = AsmSlot(kind: AInt, size: 8, align: 8)
   ## Placeholder slot for a register/immediate dont-care result: no consumer of an
-  ## `InReg`/`Imm` value reads `.typ` (the old `Val` carried no type).
+  ## `InReg`/`Imm` value reads `.typ` (the old `Val` carried no type). A `let` (not
+  ## `const`) because `AsmSlot` now holds a `Cursor`, which is not a compile-time value.
 
 proc genVal(g: var CodeGen; c: var Cursor): Location =
   ## The dont-care evaluator: produce `c`'s value where it naturally lives — a

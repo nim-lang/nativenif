@@ -421,6 +421,8 @@ type
     FldpTagId
     LdrbTagId
     StrbTagId
+    RebindTagId
+    WithregTagId
 const
   TagData*: array[TagEnum, (string, int)] = [
     ("InvalidTagId", 0),
@@ -841,5 +843,7 @@ const
     ("fstp", 415),
     ("fldp", 416),
     ("ldrb", 417),
-    ("strb", 418)
+    ("strb", 418),
+    ("rebind", 419),
+    ("withreg", 420)
   ]

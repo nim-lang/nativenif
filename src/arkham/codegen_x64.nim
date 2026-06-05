@@ -29,12 +29,34 @@ const TlsBlockName = "arkham.tls.0"
 
 # ── scratch register pool ────────────────────────────────────────────────────
 
+let ScalarSlot = AsmSlot(kind: AInt, size: 8, align: 8)
+  ## The placeholder slot for a register/immediate dont-care result: the old `Val`
+  ## carried no type at all, and no consumer of an `InReg`/`Imm` value reads `.typ`.
+  ## As a scratch-binding type it carries no cursor, so `bindTemp` falls back to
+  ## `(i 64)`. A `let` (not `const`) because `AsmSlot` now holds a `Cursor`.
+
+proc bindTemp(g: var CodeGen; r: Reg; typ: AsmSlot)
+proc unbindTemp(g: var CodeGen; r: Reg)
+
 proc emReg(g: var CodeGen; r: Reg) {.inline.} =
   ## A value register operand. If `r` currently hosts a named local, emit the
   ## local's *name* (a typed symbol nifasm type-checks); otherwise the raw `(reg)`
   ## tag (a transient scratch register).
   if g.regLocal.hasKey(r): g.ab.sym g.regLocal[r]
-  else: g.ab.reg r
+  else:
+    # The volatile scratch pool (r10/r11) is the ONLY register class the allocator
+    # hands out for arbitrary computed values; every such hand-out — pool, steal, and
+    # staging — is now `bindTemp`'d to a checked name (see `borrowTmp`/`pickStaging`/
+    # the spill paths), so a *raw* pool register reaching here means an unbound scratch
+    # slipped past the binder: the silent-clobber hole this work closes. Every OTHER
+    # register has an irreducible structural raw use and is allowed: rax/rdi/rsi/rdx/
+    # r8/r9 are the syscall + call-argument / return ABI registers; rcx is the 4th call
+    # arg; rsp/rbp are the frame/segment bases; rbx/r12–r15 are callee-saved param
+    # homes. (The fixed rcx/rdx/rsi/r8 scratch *inside* the self-contained atomics /
+    # mem* / byte-copy loops is nonetheless bound there, for extra checker coverage.)
+    assert r notin g.md.intTempRegs,
+      "arkham x64: unbound scratch-pool register reached emReg: " & x64RegName(r)
+    g.ab.reg r
 
 proc initFreeTmp(g: var CodeGen) =
   g.freeTmp = {}
@@ -46,26 +68,28 @@ proc initFreeTmp(g: var CodeGen) =
     if loc.kind == InReg: g.freeTmp.excl loc.r
     elif loc.kind == InFReg: g.freeFTmp.excl loc.f
 
-proc tryBorrowTmp(g: var CodeGen): Reg =
+proc tryBorrowTmp(g: var CodeGen; typ: AsmSlot = ScalarSlot): Reg =
   ## Like `borrowTmp` but returns `NoReg` when the scratch pool is exhausted
   ## (instead of failing). The caller then spills the value to a stack slot. The
-  ## reg-or-`NoReg` outcome is recorded/replayed like any borrow decision.
+  ## reg-or-`NoReg` outcome is recorded/replayed like any borrow decision. A real
+  ## register is `bindTemp`'d to a typed name (`typ`) so `emReg` emits a checked
+  ## symbol; the caller releases it via `freeTemp`/`giveBack`.
+  result = NoReg
   if not g.ab.planning:                          # emit pass: replay the planned decision
     result = g.borrowLog[g.borrowIdx]; inc g.borrowIdx
-    return
-  for r in g.md.intTempRegs:                      # plan pass: real pool allocation
-    if r in g.freeTmp and not g.ra.isSealed(r) and not g.regLocal.hasKey(r):
-      # `not regLocal.hasKey`: a volatile temp can be a register-local's home (the
-      # allocator falls back to r10/r11 when callee-saved is exhausted). Handing
-      # that register out as scratch would clobber the live local AND make `emReg`
-      # emit its typed name where raw scratch is expected (e.g. an `(at)` 3rd
-      # operand → nifasm sees a Symbol, not a reg). Skip it; the caller then steals
-      # a bound local properly or falls back to a clean caller-saved staging reg.
-      excl g.freeTmp, r
-      g.borrowLog.add r
-      return r
-  g.borrowLog.add NoReg                           # exhausted → caller spills (cannot fail)
-  result = NoReg
+  else:
+    for r in g.md.intTempRegs:                    # plan pass: real pool allocation
+      if r in g.freeTmp and not g.ra.isSealed(r) and not g.regLocal.hasKey(r):
+        # `not regLocal.hasKey`: a volatile temp can be a register-local's home (the
+        # allocator falls back to r10/r11 when callee-saved is exhausted). Handing
+        # that register out as scratch would clobber the live local. Skip it; the
+        # caller then steals a bound local properly or falls back to a clean
+        # caller-saved staging reg.
+        excl g.freeTmp, r
+        result = r
+        break
+    g.borrowLog.add result                        # the chosen reg, or NoReg (exhausted)
+  if result != NoReg: g.bindTemp(result, typ)     # typed name ⇒ emReg emits a symbol
 
 # Order in which a codegen-time steal looks for a victim register-local: prefer
 # volatile temps (R10/R11 — call-free locals the allocator put there, the common
@@ -134,7 +158,8 @@ proc stealReg(g: var CodeGen; logIdx: int): Reg =
   if g.ab.planning:
     var vreg = NoReg
     for r in StealOrder:
-      if g.regLocal.hasKey(r) and not g.ra.isSealed(r) and r notin g.liveAccums:
+      if g.regLocal.hasKey(r) and r notin g.boundTemps and
+         not g.ra.isSealed(r) and r notin g.liveAccums:
         vreg = r; break
     if vreg == NoReg: return NoReg                 # nothing safe to steal
     g.stealEvents[logIdx] = g.recordEviction(vreg)
@@ -157,13 +182,13 @@ proc evictFixedReg(g: var CodeGen; r: Reg) =
   ## register pinned to an in-flight ABI call (sealed) is left to its owner.
   let key = g.fixedEvictSeq; inc g.fixedEvictSeq
   if g.ab.planning:
-    if not g.regLocal.hasKey(r) or g.ra.isSealed(r): return
+    if not g.regLocal.hasKey(r) or r in g.boundTemps or g.ra.isSealed(r): return
     g.fixedEvicts[key] = g.recordEviction(r)
   else:
     if key in g.fixedEvicts: g.replayEviction(g.fixedEvicts[key])
 
-proc borrowTmp(g: var CodeGen): Reg =
-  result = g.tryBorrowTmp()
+proc borrowTmp(g: var CodeGen; typ: AsmSlot = ScalarSlot): Reg =
+  result = g.tryBorrowTmp(typ)                    # binds on a pool hit
   if result == NoReg:
     # The plan pass just logged `NoReg` (it is at `borrowLog.len-1`); the emit
     # pass replayed it (`borrowIdx-1`). Steal at that same logical position.
@@ -185,14 +210,16 @@ proc borrowTmp(g: var CodeGen): Reg =
       if result == NoReg:
         raiseAssert "arkham x64 v0: out of registers (no local to steal for scratch)"
       g.ra.seal result
+    g.bindTemp(result, typ)                        # steal / staging-fallback reg → typed name
 
 proc giveBack(g: var CodeGen; r: Reg) {.inline.} =
-  ## Release a transient register obtained during premat / value evaluation. A
-  ## staging register (caller-saved, sealed while it held an address/index so a
-  ## sibling pick couldn't reuse it) is unsealed; a real scratch-pool register
-  ## (R10/R11) is also returned to the pool. Unsealing a never-sealed reg is a
-  ## harmless no-op.
+  ## Release a transient register obtained during premat / value evaluation. Its
+  ## scratch binding (`bindTemp`) is `(kill)`'d first; then a staging register
+  ## (caller-saved, sealed while it held an address/index so a sibling pick couldn't
+  ## reuse it) is unsealed; a real scratch-pool register (R10/R11) is also returned to
+  ## the pool. Unbinding/unsealing a reg that carries neither is a harmless no-op.
   if r == NoReg: return
+  g.unbindTemp(r)
   g.ra.unseal {r}
   if r in g.md.intTempRegs: g.freeTmp.incl r
 
@@ -460,6 +487,52 @@ proc emTypedStackVar(g: var CodeGen; name: string; t: Cursor) =
   else: g.genTypeBody(tc)
   g.ab.close()
 
+proc emBindType(g: var CodeGen; typ: AsmSlot) =
+  ## Emit the NIFC type for a scratch binding: the slot's own type when known, else
+  ## the generic `(i 64)` (a register/immediate dont-care placeholder carries no
+  ## cursor). Mirrors `emTypedStackVar`'s type emission.
+  if cursorIsNil(typ.typ):
+    g.ab.intType(64)
+  else:
+    var tc = typ.typ
+    if tc.kind == Symbol: g.ab.sym symName(tc)
+    else: g.genTypeBody(tc)
+
+proc bindTemp(g: var CodeGen; r: Reg; typ: AsmSlot) =
+  ## Give scratch register `r` a typed nifasm name `tmpN.0` via `(rebind …)`, so every
+  ## later `emReg r` emits a checked symbol rather than a raw `(reg)` the binding
+  ## checker can't see. The name counter bumps in BOTH passes (so names replay
+  ## identically); the `(rebind …)` tree auto-no-ops in the plan pass. `boundTemps`
+  ## records that `r`'s `regLocal` entry is a temp, NOT a steal-able local, so
+  ## `stealReg`/`evictFixedReg` leave it alone. Released by `unbindTemp`.
+  let name = "tmp" & $g.tmpBindCount & ".0"; inc g.tmpBindCount
+  g.ab.tree RebindX64:
+    g.ab.symDef name
+    g.emBindType(typ)
+    g.ab.reg r
+  g.regLocal[r] = name
+  g.boundTemps.incl r
+
+proc unbindTemp(g: var CodeGen; r: Reg) =
+  ## Release a scratch binding made by `bindTemp`: `(kill)` the name and drop the
+  ## `regLocal`/`boundTemps` entries. A no-op when `r` carries no temp binding (so it
+  ## is safe on every `giveBack`, whether or not the reg was a bound temp).
+  if r in g.boundTemps:
+    g.ab.tree KillX64: g.ab.sym g.regLocal[r]
+    g.regLocal.del r
+    g.boundTemps.excl r
+
+template withFixed(g: var CodeGen; r: Reg; body: untyped) =
+  ## Bracket a hardcoded use of a fixed ABI/ISA register `r` (atomics, mem*,
+  ## byte-copy, the aggregate-result pointer) with a typed binding, so its `emReg`
+  ## operands inside `body` are checked names instead of a raw `(reg)` that bypasses
+  ## nifasm's binder. Like `bindTemp`/`unbindTemp` it is zero machine code. The bind
+  ## kills `r`'s prior tenant, so a later raw use of a value wrongly left there
+  ## becomes a build error rather than a silent clobber.
+  g.bindTemp(r, ScalarSlot)
+  body
+  g.unbindTemp(r)
+
 proc emStackMem(g: var CodeGen; name: string) =       # (mem (rsp) name)
   g.ab.tree MemX:
     g.ab.reg RSP
@@ -498,6 +571,7 @@ proc loadOperandReg(g: var CodeGen; v: Location; tmps: var seq[Reg]): Reg =
   else:
     result = g.pickStaging()
     g.ra.seal result          # hold it so a sibling base/index pick can't reuse it
+    g.bindTemp(result, v.typ) # checked name for the held value (`giveBack` unbinds)
     tmps.add result           # `giveBack` unseals it after the operand is consumed
   g.place(v, result)
 
@@ -546,6 +620,7 @@ proc prematAccess(g: var CodeGen; n: var Cursor; tmps: var seq[Reg]; regs: var s
       else:
         r = g.pickStaging()
         g.ra.seal r             # hold the base addr so the index pick can't reuse it
+        g.bindTemp(r, ScalarSlot)  # the global's address (a base; `giveBack` unbinds)
         tmps.add r              # `giveBack` unseals it after the operand is consumed
       g.emGlobalAddr(r, nm)
       regs.add r
@@ -568,6 +643,7 @@ proc prematAccess(g: var CodeGen; n: var Cursor; tmps: var seq[Reg]; regs: var s
           else:
             s = g.pickStaging()
             g.ra.seal s
+            g.bindTemp(s, ScalarSlot)  # `(at)` stride scratch (`giveBack` unbinds)
             tmps.add s
           regs.add s
         while n.hasMore: skip n
@@ -900,7 +976,9 @@ proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg =
   ## plan and emit passes return the same register from the same state.
   for r in StagingCandidates:
     if r != avoid and not g.ra.isSealed(r) and r notin g.liveAccums and
-       not g.regHoldsLiveLocal(r):
+       r notin g.boundTemps and not g.regHoldsLiveLocal(r):
+      # `r notin boundTemps`: a register holding a live scratch temp (`bindTemp`'d)
+      # must not be handed out as staging — that would clobber the temp's value.
       g.releaseStaleName(r)
       return r
   return NoReg
@@ -949,17 +1027,15 @@ proc spillComputed(g: var CodeGen; c: var Cursor): Location =
   g.ra.hasStackVars = true
   let stage = g.pickStaging()
   g.ra.seal stage
+  g.bindTemp(stage, ScalarSlot)                 # checked name for the staging value
   g.emScalarStackVar(slotName)                  # (var :spill.N (s) (i 64))
   g.genInto(c, stage)                           # compute the value into the staging reg
   g.ab.tree MovX64:                             # store it to the slot
     g.emStackMem(slotName)
     g.emReg stage
-  g.ra.unseal {stage}
+  g.giveBack(stage)                             # unbind + unseal
   result = namedStackLoc(slotName, AsmSlot(kind: AInt, size: 8, align: 8))
 
-const ScalarSlot = AsmSlot(kind: AInt, size: 8, align: 8)
-  ## The placeholder slot for a register/immediate dont-care result: the old `Val`
-  ## carried no type at all, and no consumer of an `InReg`/`Imm` value reads `.typ`.
 
 proc genVal(g: var CodeGen; c: var Cursor): Location =
   ## The dont-care evaluator: produce `c`'s value wherever it naturally lives — a
@@ -1174,9 +1250,11 @@ proc spillOperandAround(g: var CodeGen; c: var Cursor; dest: Reg; op: X64Inst) =
     g.emReg dest
   g.genInto(c, dest)                           # b → dest (recursion reuses dest)
   let s = g.pickStaging(avoid = dest)          # transient; recursion done → never nests
+  g.bindTemp(s, ScalarSlot)                    # checked name for `b` while it is live
   g.movReg(s, dest)                            # s = b
   g.emitLoadLoc(slotLoc, dest)                 # dest = a (reload)
   g.binReg(op, dest, s)                        # dest = a op b
+  g.unbindTemp(s)
 
 proc genBinReg(g: var CodeGen; c: var Cursor; dest: Reg; op: X64Inst; immOk: bool) =
   ## `dest = a op b` into a REGISTER accumulator, x86's destructive form: `a` into
@@ -1313,10 +1391,14 @@ proc genDivMod(g: var CodeGen; c: var Cursor; dest: Reg; signed, wantRemainder: 
     var divisor = needsReg(ScalarSlot)         # "a register, your choice" for the divisor
     g.gen(c, divisor)                          # divisor → that register (idiv has no imm form)
     g.ra.unseal {RAX}
-    g.ab.tree (if signed: IdivX64 else: DivX64):
+    let op = if signed: IdivX64 else: DivX64
+    # The divisor is a checked name either way now — a register-local via its own
+    # binding, a borrowed temp via `bindTemp`'s `(rebind …)`. `emReg` emits that name,
+    # so the idiv operand is never a raw `(reg)`.
+    g.ab.tree op:
       g.ab.reg RDX                             # (rdx): high half of the dividend
       g.ab.reg RAX                             # (rax): low half
-      g.emReg divisor.r
+      g.emReg divisor.r                        # divisor, by its bound name
     g.freeTemp(divisor)
   g.movReg(dest, if wantRemainder: RDX else: RAX)
 
@@ -1504,7 +1586,7 @@ proc genCoerce(g: var CodeGen; c: var Cursor; dest: Reg; isCast: bool) =
       while c.hasMore: skip c
       return
     let (srcW, srcSigned) = g.srcWidthSigned(c)
-    if targetPtr and g.regLocal.hasKey(dest):
+    if targetPtr and g.regLocal.hasKey(dest) and dest notin g.boundTemps:
       # `dest` is a typed (pointer) named local, and the value is an integer
       # expression reinterpreted as a pointer — NIFC encodes pointer arithmetic
       # the way Nim does, as `(cast ptr (add (u 64) …))`. Emitting the integer ops
@@ -1847,7 +1929,7 @@ proc emMemAt(g: var CodeGen; p: Reg) =        # `(mem p)` — dereference the po
 proc genAtomicXadd(g: var CodeGen; pReg, val: Reg; returnNew, sub: bool) =
   ## `lock xadd [p], val` (val ← old). For `sub`, negate val first so memory is
   ## decremented. `returnNew` recomputes old±delta into rax; otherwise returns old.
-  if returnNew: g.movReg(RDX, val)            # save the original delta (non-pool scratch)
+  if returnNew: g.bindTemp(RDX, ScalarSlot); g.movReg(RDX, val)  # save the original delta
   if sub:
     g.ab.tree NegX64: g.emReg val             # val ← -val
   g.ab.tree LockX64:
@@ -1857,6 +1939,7 @@ proc genAtomicXadd(g: var CodeGen; pReg, val: Reg; returnNew, sub: bool) =
   if returnNew:
     let op = if sub: SubX64 else: AddX64
     g.ab.tree op: g.emReg val; g.emReg RDX     # new = old ± delta
+    g.unbindTemp(RDX)
   g.movReg(RAX, val)
 
 proc genAtomicLoopRmw(g: var CodeGen; pReg, val: Reg; op: X64Inst) =
@@ -1865,14 +1948,15 @@ proc genAtomicLoopRmw(g: var CodeGen; pReg, val: Reg; op: X64Inst) =
   ## cmpxchg. Result (old) ends up in rax.
   let lab = g.freshLabel()
   g.ab.tree MovX64: (g.emReg RAX; g.emMemAt pReg)   # rax = [p]
-  g.emLab(lab)
-  g.movReg(RDX, RAX)
-  g.ab.tree op: g.emReg RDX; g.emReg val             # rdx = rax op val (the new value)
-  g.ab.tree LockX64:
-    g.ab.tree CmpxchgX64:
-      g.emMemAt pReg
-      g.emReg RDX                                     # if [p]==rax: [p]=rdx else rax=[p]
-  g.emJcc(JneX64, lab)                                # retry until cmpxchg succeeds
+  g.withFixed(RDX):
+    g.emLab(lab)
+    g.movReg(RDX, RAX)
+    g.ab.tree op: g.emReg RDX; g.emReg val           # rdx = rax op val (the new value)
+    g.ab.tree LockX64:
+      g.ab.tree CmpxchgX64:
+        g.emMemAt pReg
+        g.emReg RDX                                   # if [p]==rax: [p]=rdx else rax=[p]
+    g.emJcc(JneX64, lab)                              # retry until cmpxchg succeeds
 
 proc genAtomic(g: var CodeGen; c: var Cursor; builtin: string) =
   ## Lower one `__atomic_*` builtin; `c` is at the first argument. Result → rax.
@@ -1889,8 +1973,9 @@ proc genAtomic(g: var CodeGen; c: var Cursor; builtin: string) =
     g.freeTemp(p)
   of "__atomic_clear":                          # (ptr, memorder) → void; *ptr = 0
     let p = g.genReg(c); skip c
-    g.movImm(RDX, 0)
-    g.ab.tree MovX64: (g.emMemAt p.r; g.emReg RDX)
+    g.withFixed(RDX):
+      g.movImm(RDX, 0)
+      g.ab.tree MovX64: (g.emMemAt p.r; g.emReg RDX)
     g.freeTemp(p)
   of "__atomic_thread_fence":                   # (memorder) → void
     skip c
@@ -1922,18 +2007,20 @@ proc genAtomic(g: var CodeGen; c: var Cursor; builtin: string) =
     g.freeTemp(p)
   of "__atomic_test_and_set":                   # (ptr, memorder) → bool (old != 0)
     let p = g.genReg(c); skip c
-    g.movImm(RDX, 1)
-    g.ab.tree XchgX64: (g.emMemAt p.r; g.emReg RDX)   # rdx ← old; [p] = 1
     let lSkip = g.freshLabel()
-    g.movImm(RAX, 0)
-    g.ab.tree CmpX64: (g.emReg RDX; g.ab.intLit 0)
-    g.emJcc(JeX64, lSkip)
+    g.withFixed(RDX):
+      g.movImm(RDX, 1)
+      g.ab.tree XchgX64: (g.emMemAt p.r; g.emReg RDX)   # rdx ← old; [p] = 1
+      g.movImm(RAX, 0)
+      g.ab.tree CmpX64: (g.emReg RDX; g.ab.intLit 0)
+      g.emJcc(JeX64, lSkip)
     g.movImm(RAX, 1)
     g.emLab(lSkip)
     g.freeTemp(p)
   of "__atomic_compare_exchange_n":             # (ptr, exp_ptr, des, weak, succ, fail) → bool
     let p = g.genReg(c)
     let ep = g.genReg(c)
+    g.bindTemp(RCX, ScalarSlot)
     g.genInto(c, RCX)                            # desired → rcx (non-pool scratch)
     skip c; skip c; skip c                       # weak, success order, failure order
     g.ab.tree MovX64: (g.emReg RAX; g.emMemAt ep.r)   # rax = *exp (the comparand)
@@ -1941,6 +2028,7 @@ proc genAtomic(g: var CodeGen; c: var Cursor; builtin: string) =
       g.ab.tree CmpxchgX64:
         g.emMemAt p.r
         g.emReg RCX                              # if [p]==rax: [p]=rcx,ZF=1 else rax=[p],ZF=0
+    g.unbindTemp(RCX)
     let lFail = g.freshLabel()
     let lDone = g.freshLabel()
     g.emJcc(JneX64, lFail)
@@ -1986,7 +2074,10 @@ proc emCmpReg(g: var CodeGen; a, b: Reg) =
 
 proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
   ## Lower one `mem*` intrinsic call. `c` is at the first argument; this consumes
-  ## all of them. Result → RAX.
+  ## all of them. Result → RAX. The source/count/index scratch (rsi/rdx/rcx) is bound
+  ## to checked names for the whole sequence; the dest pointer (rdi) and the byte/
+  ## result (rax) stay raw — they are the irreducible arg/return-ABI registers.
+  g.bindTemp(RSI, ScalarSlot); g.bindTemp(RDX, ScalarSlot); g.bindTemp(RCX, ScalarSlot)
   case builtin
   of "memcpy":                                 # (dst, src, n) → dst
     g.genInto(c, RDI); g.genInto(c, RSI); g.genInto(c, RDX)   # dst, src, n
@@ -2046,6 +2137,7 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
     g.movReg(RAX, RDI)
   of "memcmp":                                 # (a, b, n) → first byte difference
     g.genInto(c, RDI); g.genInto(c, RSI); g.genInto(c, RDX)   # pa, pb, n
+    g.bindTemp(R8, ScalarSlot)                 # the second byte (held across the loop)
     let loop = g.freshLabel()
     let diff = g.freshLabel()
     let equal = g.freshLabel()
@@ -2066,8 +2158,10 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
     g.emLab(equal)
     g.movImm(RAX, 0)
     g.emLab(done)
+    g.unbindTemp(R8)
   else:
     raiseAssert "arkham x64 v0: unsupported mem intrinsic: " & builtin
+  g.unbindTemp(RCX); g.unbindTemp(RDX); g.unbindTemp(RSI)
 
 # ── by-value aggregate marshalling (SysV) ────────────────────────────────────
 # A ≤16-byte aggregate of full 8-byte fields travels in 1–2 GPRs (word i ↔ the
@@ -2359,17 +2453,18 @@ proc byteCopyConst(g: var CodeGen; dst, src: Reg; size: int) =
   ## proc it can hold a live parameter: evict it first so the loop counter can't
   ## destroy it. (`dst`/`src` are `aggrAddr` temps, never RAX/RCX.)
   g.evictFixedReg(RCX)
-  let loop = g.freshLabel()
-  let done = g.freshLabel()
-  g.movImm(RCX, 0)                              # i = 0
-  g.emLab(loop)
-  g.ab.tree CmpX64: (g.emReg RCX; g.ab.intLit size)
-  g.emJcc(JaeX64, done)                         # i >= size (unsigned) → done
-  g.emLoadByte(RAX, src, RCX)                   # b = src[i]
-  g.emStoreByte(dst, RCX, RAX)                  # dst[i] = b
-  g.binImm(AddX64, RCX, 1)
-  g.emJmp(loop)
-  g.emLab(done)
+  g.withFixed(RCX):                             # loop counter → a checked name
+    let loop = g.freshLabel()
+    let done = g.freshLabel()
+    g.movImm(RCX, 0)                            # i = 0
+    g.emLab(loop)
+    g.ab.tree CmpX64: (g.emReg RCX; g.ab.intLit size)
+    g.emJcc(JaeX64, done)                       # i >= size (unsigned) → done
+    g.emLoadByte(RAX, src, RCX)                 # b = src[i]
+    g.emStoreByte(dst, RCX, RAX)                # dst[i] = b
+    g.binImm(AddX64, RCX, 1)
+    g.emJmp(loop)
+    g.emLab(done)
 
 proc aggrAddr(g: var CodeGen; c: var Cursor): (Reg, bool) =
   ## Address of an aggregate lvalue (consumes it). A by-reference aggregate param
@@ -3104,8 +3199,10 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.indirectReg = NoReg
   g.isEntryProc = info.isEntry
   g.regLocal.clear()                          # per-proc named-local bindings
+  g.boundTemps = {}                           # per-proc scratch-temp bindings
   g.scopeLocals = @[]
   g.spillCount = 0
+  g.tmpBindCount = 0
   # Aggregate return convention (before allocation): a named object ≤16B → rax:rdx;
   # >16B → a hidden pointer the caller passes in rdi, parked in a callee-saved reg
   # (rbx) for the proc's lifetime and written through on `ret`.
@@ -3156,12 +3253,14 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.varType.clear()
   g.symType.clear()
   g.regLocal.clear()
+  g.boundTemps = {}
   g.scopeLocals = @[]
   g.loopEnds = @[]
   g.initFreeTmp()
   g.borrowIdx = 0; g.borrowIdxF = 0
   g.fixedEvictSeq = 0                          # replay the same eviction sequence
   g.spillCount = 0
+  g.tmpBindCount = 0
   g.emitProcBody(info, declarative)            # emit for real, replaying the plan
 
 proc genGlobal(g: var CodeGen; name: string; decl: Cursor) =

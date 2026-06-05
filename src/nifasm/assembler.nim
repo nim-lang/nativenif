@@ -2634,6 +2634,15 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
         if n.hasMore and n.kind == TagLit and rawTagIsX64Reg(n.tag):
           scratchReg = parseRegister(n)
           hasScratch = true
+        elif n.hasMore and n.kind == Symbol:
+          # arkham may pass the scratch as a `rebind`-bound temp name rather than a
+          # raw `(reg)`; resolve it to its register (a raw `(reg)` for a bound reg is
+          # itself rejected elsewhere, so the name is the only legal spelling).
+          let scratchOp = parseOperand(n, ctx)
+          if scratchOp.kind != okReg:
+            error("at: scratch operand must be a register", n)
+          scratchReg = scratchOp.reg
+          hasScratch = true
 
         if hasScratch:
           # Compute `scratch = baseAddr + index*stride` ourselves (stride from the
@@ -3431,6 +3440,78 @@ proc genKillX64(n: var Cursor; ctx: var GenContext) =
 
   inc n
 
+proc checkFixedRegFree(ctx: GenContext; reg: x86.Register; insn: string; n: Cursor) =
+  ## A fixed-register instruction (`idiv`/`div` write RDX:RAX) is about to clobber
+  ## `reg`. If a live variable is still bound to it, that is a code-generator bug —
+  ## the clobber would silently destroy the value. Reject it: the value must be moved
+  ## (or the binding `kill`ed / `rebind`ed) first. Without this the raw `(rdx)`/`(rax)`
+  ## operands bypass `parseOperand`'s binding check, which is how a live parameter
+  ## sitting in RDX/RCX used to be miscompiled in silence.
+  if reg in ctx.regBindings:
+    error(insn & " clobbers " & $reg & ", still bound to variable '" &
+          ctx.regBindings[reg] & "' — move/kill it first", n)
+
+proc bindRegX64(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
+                reg: x86.Register) =
+  ## Bind physical register `reg` to the typed name `name`, *killing its prior
+  ## tenant first*: the previous binding's name is undefined, so a later use of a
+  ## value wrongly left in that register becomes an "Unknown variable" error rather
+  ## than a silent clobber. This is the "(re)bind implies a kill (of the prior
+  ## tenant)" rule shared by `rebind` and `withreg`.
+  if reg in ctx.regBindings:
+    ctx.scope.undefine(ctx.regBindings[reg])
+    ctx.regBindings.del(reg)
+  let sym = Symbol(name: name, kind: skVar, typ: typ)
+  sym.reg = regTag
+  ctx.regBindings[reg] = name
+  ctx.scope.define(sym)
+
+proc parseRebindHeader(n: var Cursor; ctx: var GenContext):
+                       tuple[name: string; typ: Type; regTag: TagEnum; reg: x86.Register] =
+  ## Parse `:name TYPE (reg)` (the cursor is past the rebind/withreg tag, inside the
+  ## node) and establish the binding. Shared by `rebind` and `withreg`.
+  if n.kind != SymbolDef: error("Expected name for rebind/withreg", n)
+  result.name = symName(n); inc n
+  result.typ = parseType(n, ctx.scope, ctx)
+  if n.kind != TagLit or not rawTagIsX64Reg(n.tag):
+    error("Expected a register for rebind/withreg", n)
+  result.regTag = n.tag
+  result.reg = tagToRegister(result.regTag, n)
+  inc n
+  bindRegX64(ctx, result.name, result.typ, result.regTag, result.reg)
+
+proc genRebindX64(n: var Cursor; ctx: var GenContext) =
+  ## `(rebind :name TYPE (reg))` — bind `reg` to `name`, killing its prior tenant.
+  ## The binding lives until an explicit `kill`, the next `rebind` of `reg`, or the
+  ## end of the proc (`regBindings` is reset per proc — the auto-kill backstop).
+  into n:
+    discard parseRebindHeader(n, ctx)
+
+proc genWithregX64(n: var Cursor; ctx: var GenContext) =
+  ## `(withreg :name TYPE (reg) body…)` — a block-scoped `rebind`: the binding is
+  ## auto-killed at the end of the body (its own implied kill), in addition to
+  ## killing `reg`'s prior tenant on entry.
+  into n:
+    let h = parseRebindHeader(n, ctx)
+    while n.hasMore: genInstX64(n, ctx)
+    if ctx.regBindings.getOrDefault(h.reg, "") == h.name:
+      ctx.regBindings.del(h.reg)
+    ctx.scope.undefine(h.name)
+
+proc leaRegBase(n: var Cursor; ctx: var GenContext; baseReg: var x86.Register): bool =
+  ## Detect and consume a `lea` base register: a raw `(reg)` tag, or a
+  ## register-bound local name (a `rebind`'d scratch temp now reaches `lea` by name,
+  ## not as a raw reg). Leaves `n` untouched and returns false for any other operand
+  ## (label / gvar / mem / dot / at — handled by `parseOperand` instead).
+  if n.kind == TagLit and rawTagIsX64Reg(n.tag):
+    baseReg = parseRegister(n); return true
+  if n.kind == Symbol:
+    let s = lookupWithAutoImport(ctx, ctx.scope, getSym(n), n)
+    if s != nil and (s.kind == skVar or s.kind == skParam) and
+       not s.typ.isOnStack and s.reg != InvalidTagId:
+      baseReg = tagToRegister(s.reg, n); inc n; return true
+  return false
+
 proc genInstX64(n: var Cursor; ctx: var GenContext) =
   if n.kind != TagLit: error("Expected instruction", n)
   let instTag = tagToX64Inst(n.tag)
@@ -3527,6 +3608,10 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     genJtrueX64(n, ctx)
   of KillX64:
     genKillX64(n, ctx)
+  of RebindX64:
+    genRebindX64(n, ctx)
+  of WithregX64:
+    genWithregX64(n, ctx)
   of AddX64:
     inc n
     let dest = parseDest(n, ctx)
@@ -3621,9 +3706,11 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # (div (rdx) (rax) src)
     inc n # (rdx)
     if n.kind != TagLit or n.tag != RdxTagId: error("Expected (rdx) for div", n)
+    checkFixedRegFree(ctx, x86.RDX, "div", n)
     inc n
 
     if n.kind != TagLit or n.tag != RaxTagId: error("Expected (rax) for div", n)
+    checkFixedRegFree(ctx, x86.RAX, "div", n)
     inc n
 
     let op = parseOperand(n, ctx)
@@ -3640,9 +3727,11 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # (idiv (rdx) (rax) src)
     inc n # (rdx)
     if n.kind != TagLit or n.tag != RdxTagId: error("Expected (rdx) for idiv", n)
+    checkFixedRegFree(ctx, x86.RDX, "idiv", n)
     inc n
 
     if n.kind != TagLit or n.tag != RaxTagId: error("Expected (rax) for idiv", n)
+    checkFixedRegFree(ctx, x86.RAX, "idiv", n)
     inc n
 
     let op = parseOperand(n, ctx)
@@ -4102,6 +4191,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       error("lea destination must be a register", n)
 
     # Check if next is a label or register
+    var baseReg: x86.Register
     if n.kind == TagLit and n.tag == LabTagId:
       # (lea dest (lab label)) - RIP-relative address
       inc n
@@ -4111,9 +4201,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       if sym == nil or sym.kind != skLabel: error("Unknown label: " & name, n)
       inc n
       x86.emitLea(ctx.buf, dest, LabelId(sym.offset))
-    elif n.kind == TagLit and rawTagIsX64Reg(n.tag):
-      # (lea dest base-reg offset) - explicit addressing
-      let baseReg = parseRegister(n)
+    elif leaRegBase(n, ctx, baseReg):
+      # (lea dest base-reg offset) - explicit addressing. `base-reg` is a raw `(reg)`
+      # or a register-bound local name (a `rebind`'d scratch temp).
       var displacement: int32 = 0
 
       # Parse offset - can be integer or stack variable name
