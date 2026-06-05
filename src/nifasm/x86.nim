@@ -334,6 +334,22 @@ proc emitImul*(dest: var Bytes; a, b: Register) =
   dest.add(0xAF)  # IMUL r64, r/m64 opcode
   dest.add(encodeModRM(amDirect, int(a), int(b)))  # reg=dest(a), rm=source(b)
 
+proc emitImul*(dest: var Bytes; reg: Register; mem: MemoryOperand) =
+  ## Emit IMUL reg, mem (reg = reg * mem, signed): IMUL r64, r/m64 — same
+  ## `0F AF /r` opcode as the register form, with the source folded from memory.
+  emitSegPrefix(dest, mem)
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.r = true                 # dest (ModRM.reg)
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+
+  if rex.r or rex.b or rex.x or rex.w:
+    dest.add(encodeRex(rex))
+
+  dest.add(0x0F)  # Two-byte opcode prefix
+  dest.add(0xAF)  # IMUL r64, r/m64 opcode
+  dest.emitMem(int(reg), mem)                     # reg=dest, r/m=memory source
+
 proc emitImulImm*(dest: var Bytes; reg: Register; imm: int32) =
   ## Emit IMUL instruction: IMUL reg, reg, imm32 (opcode 0x69 /r id).
   ## ModRM.reg is the destination, ModRM.rm the source — both are `reg` here, so an
@@ -628,6 +644,27 @@ proc emitCmpImm*(dest: var Bytes; reg: Register; imm: int32) =
   dest.add(0x81)  # CMP r/m64, imm32 opcode
   dest.add(encodeModRM(amDirect, 7, int(reg)))  # /7 extension
   dest.addt32(imm)
+
+proc emitAluImmMem(dest: var Bytes; ext: int; mem: MemoryOperand; imm: int32) =
+  ## `<alu> r/m64, imm32` with a MEMORY destination (opcode 0x81). `ext` is the
+  ## ModRM.reg opcode-extension digit (ADD=0, OR=1, AND=4, SUB=5, XOR=6) — the same
+  ## group-1 encoding as the register-immediate forms, but the r/m field addresses
+  ## memory. Lets an ALU op run in place on a stack slot (`add [rsp+n], imm`).
+  emitSegPrefix(dest, mem)
+  var rex = RexPrefix(w: true)
+  if needsRex(mem.base): rex.b = true            # ext (0..6) needs no REX.R
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  if rex.b or rex.x or rex.w:
+    dest.add(encodeRex(rex))
+  dest.add(0x81)
+  dest.emitMem(ext, mem)                         # reg field = opcode extension
+  dest.addt32(imm)
+
+proc emitAddImm*(dest: var Bytes; mem: MemoryOperand; imm: int32) = emitAluImmMem(dest, 0, mem, imm)
+proc emitSubImm*(dest: var Bytes; mem: MemoryOperand; imm: int32) = emitAluImmMem(dest, 5, mem, imm)
+proc emitAndImm*(dest: var Bytes; mem: MemoryOperand; imm: int32) = emitAluImmMem(dest, 4, mem, imm)
+proc emitOrImm*(dest: var Bytes; mem: MemoryOperand; imm: int32)  = emitAluImmMem(dest, 1, mem, imm)
+proc emitXorImm*(dest: var Bytes; mem: MemoryOperand; imm: int32) = emitAluImmMem(dest, 6, mem, imm)
 
 # Shift operations
 proc emitShl*(dest: var Bytes; reg: Register; count: int) =

@@ -52,6 +52,18 @@ type
 type
   LocKind* = enum
     Undef          ## the dontCare target (fill me in)
+    NeedsReg       ## a destination *constraint*: the value must end up in a GPR,
+                   ## but the callee chooses which one (allocating lazily, or
+                   ## reusing the register a value already occupies). Like `Undef`,
+                   ## it is filled in (via `var`) with the concrete `InReg` it
+                   ## resolved to. Never produced as a value — only passed as a
+                   ## `gen(…, dest)` target, so value-`case`s need not handle it.
+    RegOrImm       ## a destination *constraint*: the value must end up in a GPR OR
+                   ## a (small) immediate — but NOT a memory operand. This is the
+                   ## operand-B constraint of an ALU op whose destination is memory:
+                   ## x86 allows at most one memory operand, so `b` of `op [mem], b`
+                   ## must be reg/imm (a memory `b` is loaded first). Filled in (via
+                   ## `var`) with the concrete `InReg`/`Imm`. Destination-only.
     InReg          ## value in a GPR
     InFReg         ## value in an FP/SIMD register
     OnStack        ## value in a frame slot at `offset` (from the frame base)
@@ -67,13 +79,14 @@ type
   Location* = object
     ## The one descriptor for "where a value lives, or should go" — long-lived
     ## storage (the allocator's output) and just-computed values (the codegen's
-    ## dont-care result) share it. `owns` marks a register the codegen borrowed
-    ## as scratch and must hand back (vs. a register-resident local, which it
-    ## must not); it is meaningless for the non-register kinds.
+    ## dont-care result) share it. `isTemp` marks a register the codegen borrowed
+    ## as scratch and must hand back (vs. a register-resident local, which it must
+    ## not); `freeTemp` releases it and no-ops on every persistent location. It is
+    ## meaningless for the non-register kinds.
     typ*: AsmSlot
-    owns*: bool
+    isTemp*: bool
     case kind*: LocKind
-    of Undef: discard
+    of Undef, NeedsReg, RegOrImm: discard
     of InReg: r*: Reg
     of InFReg: f*: FReg
     of OnStack: offset*: int
@@ -87,10 +100,24 @@ template dontCare*: Location =
   ## representation — but `Undef` carries none, so this is a cheap literal.
   Location(kind: Undef)
 
-proc regLoc*(r: Reg; typ: AsmSlot; owns = false): Location {.inline.} =
-  Location(kind: InReg, r: r, typ: typ, owns: owns)
-proc fregLoc*(f: FReg; typ: AsmSlot; owns = false): Location {.inline.} =
-  Location(kind: InFReg, f: f, typ: typ, owns: owns)
+proc needsReg*(typ: AsmSlot): Location {.inline.} =
+  ## A "must be a GPR, your choice" destination: the callee resolves it to a
+  ## concrete `InReg` (reusing a register-resident value in place, or allocating
+  ## scratch) and writes that back through `dest`. Lets binary/unary operations
+  ## thread a flexible register constraint instead of pre-committing one via an
+  ## eager `borrowTmp`.
+  Location(kind: NeedsReg, typ: typ)
+
+proc regOrImm*(typ: AsmSlot): Location {.inline.} =
+  ## A "must be a GPR or an immediate, not memory" destination — the operand-B
+  ## constraint for an ALU op with a memory destination (one memory operand max).
+  ## Resolved to a concrete `InReg`/`Imm` and written back through `dest`.
+  Location(kind: RegOrImm, typ: typ)
+
+proc regLoc*(r: Reg; typ: AsmSlot; isTemp = false): Location {.inline.} =
+  Location(kind: InReg, r: r, typ: typ, isTemp: isTemp)
+proc fregLoc*(f: FReg; typ: AsmSlot; isTemp = false): Location {.inline.} =
+  Location(kind: InFReg, f: f, typ: typ, isTemp: isTemp)
 proc stackLoc*(offset: int; typ: AsmSlot): Location {.inline.} =
   Location(kind: OnStack, offset: offset, typ: typ)
 proc namedStackLoc*(name: string; typ: AsmSlot): Location {.inline.} =

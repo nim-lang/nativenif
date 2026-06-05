@@ -243,8 +243,8 @@ proc genAtomic(g: var CodeGen; c: var Cursor; builtin: string)
 proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string)
 proc genAddr(g: var CodeGen; c: var Cursor; dest: Reg)
 proc materializeCond(g: var CodeGen; c: var Cursor; dest: Reg)
-proc genReg(g: var CodeGen; c: var Cursor): tuple[r: Reg, temp: bool]
-proc genFReg(g: var CodeGen; c: var Cursor; bits: int): tuple[f: FReg, temp: bool]
+proc genReg(g: var CodeGen; c: var Cursor): Location
+proc genFReg(g: var CodeGen; c: var Cursor; bits: int): Location
 proc structToRegs(g: var CodeGen; varName, typeName: string; firstArg: int)
 proc regsToStruct(g: var CodeGen; varName, typeName: string; firstArg: int)
 proc aggrAddr(g: var CodeGen; c: var Cursor): tuple[r: Reg, temp: bool]
@@ -359,22 +359,34 @@ proc pickStaging(g: var CodeGen; avoid: Reg = NoReg): Reg =
        r notin g.liveAccums: return r
   raiseAssert "arkham a64: no staging register available for a spill"
 
-proc forceReg(g: var CodeGen; v: Location): tuple[r: Reg, owns: bool] =
-  ## Ensure `v` is in a register. An immediate / spilled memory operand is
-  ## materialized into a fresh scratch temp — or, when the pool is exhausted, a
-  ## transient staging register (so this never fails). `owns` is true for any
-  ## register this borrows; `giveBack` is a no-op for a staging reg.
-  case v.kind
-  of InReg: (v.r, v.owns)
+proc forceReg(g: var CodeGen; dest: var Location) =
+  ## Ensure `dest` is in a register, mutating it IN PLACE. An immediate / spilled
+  ## memory operand is materialized into a fresh scratch temp — or, when the pool is
+  ## exhausted, a transient staging register (so this never fails). The temp is
+  ## marked `isTemp` so a later `freeTemp` releases it (a no-op for a staging reg or
+  ## any persistent location); a value already in a register is left untouched.
+  case dest.kind
+  of InReg: discard
   of Imm:
     let t = g.tryBorrowTmp()
     let r = if t == NoReg: g.pickStaging() else: t
-    g.movImm(r, v.ival); (r, true)
+    g.movImm(r, dest.ival); dest = regLoc(r, dest.typ, isTemp = true)
   of NamedStack, Mem, Glob, Tvar:
     let t = g.tryBorrowTmp()
     let r = if t == NoReg: g.pickStaging() else: t
-    g.emitLoad(v, r); (r, true)
-  else: raiseAssert "arkham: cannot force a value of kind " & $v.kind & " into a register"
+    g.emitLoad(dest, r); dest = regLoc(r, dest.typ, isTemp = true)
+  else: raiseAssert "arkham: cannot force a value of kind " & $dest.kind & " into a register"
+
+proc freeTemp(g: var CodeGen; loc: Location) {.inline.} =
+  ## Release `loc`'s register iff it is a borrowed temp; a no-op on every persistent
+  ## location (register-resident local, stack slot, immediate, …) — like vmgen's
+  ## `freeTemp`. The single release point replacing the old `if owns: giveBack`.
+  ## Handles both GPR (`InReg`) and SIMD (`InFReg`) temps.
+  if loc.isTemp:
+    case loc.kind
+    of InReg: g.giveBack loc.r
+    of InFReg: g.giveBackF loc.f
+    else: discard
 
 proc place(g: var CodeGen; v: Location; dest: Reg) =
   ## Materialize `v` into `dest`, releasing any owned scratch it occupied. Placing
@@ -383,7 +395,7 @@ proc place(g: var CodeGen; v: Location; dest: Reg) =
   of Imm: g.movImm(dest, v.ival)
   of InReg:
     g.movReg(dest, v.r)
-    if v.owns and v.r != dest: g.giveBack v.r
+    if v.isTemp and v.r != dest: g.giveBack v.r
   of NamedStack, Mem, Glob, Tvar:
     g.emitLoad(v, dest)
   else: raiseAssert "arkham: cannot place a value of kind " & $v.kind
@@ -430,14 +442,14 @@ proc genVal(g: var CodeGen; c: var Cursor): Location =
       let t = g.borrowTmp()
       g.emAdr(t, si.asmName)
       inc c
-      return regLoc(t, ScalarSlot, owns = true)
+      return regLoc(t, ScalarSlot, isTemp = true)
     let loc = g.asLoc(c)
     case loc.kind
-    of InReg: result = regLoc(loc.r, loc.typ, owns = false)
+    of InReg: result = regLoc(loc.r, loc.typ, isTemp = false)
     of NamedStack: result = loc                 # foldable spilled scalar in place
     of Glob, Tvar:                              # load through its address into a scratch
       let t = g.borrowTmp(); g.emitLoad(loc, t)
-      result = regLoc(t, loc.typ, owns = true)
+      result = regLoc(t, loc.typ, isTemp = true)
     else: raiseAssert "arkham v1: operand of kind " & $loc.kind
   of TagLit:
     case c.exprKind
@@ -445,25 +457,26 @@ proc genVal(g: var CodeGen; c: var Cursor): Location =
       result = g.asLoc(c)                        # a foldable `Mem` operand
     of PatC:                                     # pointer indexing → eager element load
       let t = g.borrowTmp(); g.genInto(c, t)
-      result = regLoc(t, ScalarSlot, owns = true)
+      result = regLoc(t, ScalarSlot, isTemp = true)
     else:
       let t = g.tryBorrowTmp()                  # a computed value → a scratch reg…
       if t == NoReg: result = g.spillComputed(c)  # …or a spill slot if exhausted
       else:
         g.genInto(c, t)
-        result = regLoc(t, ScalarSlot, owns = true)
+        result = regLoc(t, ScalarSlot, isTemp = true)
   else:
     let t = g.tryBorrowTmp()
     if t == NoReg: result = g.spillComputed(c)
     else:
       g.genInto(c, t)
-      result = regLoc(t, ScalarSlot, owns = true)
+      result = regLoc(t, ScalarSlot, isTemp = true)
 
-proc genReg(g: var CodeGen; c: var Cursor): tuple[r: Reg, temp: bool] =
-  ## `forceReg(genVal …)`: evaluate `c` into *some* register — a register-
-  ## resident symbol in place, else a borrowed scratch the caller must `giveBack`.
-  let (r, owns) = g.forceReg(g.genVal(c))
-  result = (r, owns)
+proc genReg(g: var CodeGen; c: var Cursor): Location =
+  ## Evaluate `c` into *some* register via the `NeedsReg` constraint — `gen` writes
+  ## back the concrete `InReg`: a register-resident symbol in place, else a borrowed
+  ## scratch (`isTemp`) the caller releases with `freeTemp`. `.r` is the register.
+  result = needsReg(ScalarSlot)
+  g.gen(c, result)
 
 proc commutativeOp(op: A64Inst): bool {.inline.} =
   ## Integer ops for which `a op b == b op a`, so Sethi–Ullman may evaluate the
@@ -601,7 +614,7 @@ proc genBin(g: var CodeGen; c: var Cursor; dest: Reg;
       g.movReg(saved, dest)                 # preserve b before `a` clobbers dest
       g.genInto(c, dest)                    # a → dest
       skip c                                # consume b
-      other = regLoc(saved, ScalarSlot, owns = true)
+      other = regLoc(saved, ScalarSlot, isTemp = true)
     else:
       g.genInto(c, dest)                    # a → dest; c now at b
       if isComputedOperand(c):              # b must be materialized into a register
@@ -611,7 +624,7 @@ proc genBin(g: var CodeGen; c: var Cursor; dest: Reg;
           combined = true
         else:
           g.genInto(c, t)                    # b → scratch temp
-          other = regLoc(t, ScalarSlot, owns = true)
+          other = regLoc(t, ScalarSlot, isTemp = true)
       else:
         other = g.genVal(c)                  # b is a leaf / memory / in-place value
     if not combined:
@@ -619,9 +632,9 @@ proc genBin(g: var CodeGen; c: var Cursor; dest: Reg;
          other.ival >= 0 and other.ival <= 0xFFFF:
         g.binImm(op, dest, other.ival)       # dest op= small immediate
       else:
-        let (br, owns) = g.forceReg(other)
-        g.binReg(op, dest, br)               # dest op= b
-        if owns: g.giveBack br
+        g.forceReg(other)
+        g.binReg(op, dest, other.r)          # dest op= b
+        g.freeTemp(other)
 
 proc genMod(g: var CodeGen; c: var Cursor; dest: Reg) =
   ## `(mod Type a b)` → `dest = a - (a div b)*b` (nifasm has no `msub`).
@@ -638,7 +651,7 @@ proc genMod(g: var CodeGen; c: var Cursor; dest: Reg) =
     var br: Reg
     var bt = false
     if bSaved != NoReg: (br = bSaved; skip c)   # br = b (saved); consume b
-    else: (let t = g.genReg(c); br = t.r; bt = t.temp)  # br = b
+    else: (let t = g.genReg(c); br = t.r; bt = t.isTemp)  # br = b
     let q = g.borrowTmp()
     g.movReg(q, dest)                       # q = a
     g.binReg(if signed: SdivA64 else: UdivA64, q, br)  # q = a div b
@@ -666,10 +679,10 @@ proc genBitnot(g: var CodeGen; c: var Cursor; dest: Reg) =
 proc genNot(g: var CodeGen; c: var Cursor; dest: Reg) =
   ## boolean `(not a)` → `dest = 1 - a` (a ∈ {0,1}); no result-type child.
   c.into:
-    let (br, bt) = g.genReg(c)
+    let b = g.genReg(c)
     g.movImm(dest, 1)
-    g.binReg(SubA64, dest, br)
-    if bt: g.giveBack br
+    g.binReg(SubA64, dest, b.r)
+    g.freeTemp(b)
 
 proc extendTo(g: var CodeGen; dest: Reg; width: int; signed: bool) =
   ## Normalize the low `width` bits of `dest` to its full 64-bit register form
@@ -688,7 +701,7 @@ proc derefPtrCur(g: var CodeGen; nn: Cursor): tuple[r: Reg, temp: bool] =
   var pr = NoReg
   var pt = false
   p.into:
-    let (r, t) = g.genReg(p); pr = r; pt = t
+    let rl = g.genReg(p); pr = rl.r; pt = rl.isTemp
     while p.hasMore: skip p                  # (cppref)?
   result = (pr, pt)
 
@@ -728,7 +741,7 @@ proc loadOperandReg(g: var CodeGen; v: Location; tmps: var seq[Reg]): Reg =
   ## with no calls in between — so a caller-saved staging register is safe when the
   ## scratch pool is exhausted, keeping indexed/global access total under pressure.
   if v.kind == InReg:
-    if v.owns: tmps.add v.r
+    if v.isTemp: tmps.add v.r
     return v.r
   result = g.tryBorrowTmp()
   if result != NoReg: tmps.add result
@@ -1155,9 +1168,9 @@ proc genFBin(g: var CodeGen; c: var Cursor; dest: FReg; op: A64Inst; bits: int) 
   c.into:
     skip c                                    # result float type
     g.genIntoF(c, dest, bits)                  # a → dest
-    let (fr, ft) = g.genFReg(c, bits)          # b → fp temp
-    g.fbin(op, dest, fr, bits)
-    if ft: g.giveBackF fr
+    let fr = g.genFReg(c, bits)                # b → fp temp
+    g.fbin(op, dest, fr.f, bits)
+    g.freeTemp(fr)
 
 proc genConvToF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
   ## `(conv (f N) Expr)` — produce a `bits`-wide float in `dest`: int→float
@@ -1169,9 +1182,9 @@ proc genConvToF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
       if srcBits == bits:
         g.genIntoF(c, dest, bits)              # same precision: copy
       else:
-        let (sf, st) = g.genFReg(c, srcBits)
-        g.emFcvt(dest, sf, bits, srcBits)      # precision convert
-        if st: g.giveBackF sf
+        let sf = g.genFReg(c, srcBits)
+        g.emFcvt(dest, sf.f, bits, srcBits)    # precision convert
+        g.freeTemp(sf)
     else:
       let (srcW, srcSigned) = g.srcWidthSigned(c)
       let tmp = g.borrowTmp()
@@ -1195,16 +1208,18 @@ proc genCastToF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
       g.giveBack tmp
     while c.hasMore: skip c
 
-proc genFReg(g: var CodeGen; c: var Cursor; bits: int): tuple[f: FReg, temp: bool] =
-  ## Evaluate the float expression `c` into *some* SIMD register (a symbol's home
-  ## register in place, or a borrowed scratch the caller must `giveBackF`).
+proc genFReg(g: var CodeGen; c: var Cursor; bits: int): Location =
+  ## Evaluate the float expression `c` into *some* SIMD register, returned as an
+  ## `InFReg` `Location`: a symbol's home register in place (`isTemp = false`), or a
+  ## borrowed scratch (`isTemp = true`) the caller releases with `freeTemp`. `.f` is
+  ## the register.
   if c.kind == Symbol:
     let loc = g.ra.locationOfSym(symName(c))
     if loc.kind == InFReg:
-      result = (loc.f, false); inc c; return
+      result = fregLoc(loc.f, loc.typ); inc c; return
   let f = g.borrowFTmp()
   g.genIntoF(c, f, bits)
-  result = (f, true)
+  result = fregLoc(f, AsmSlot(kind: AFloat, size: bits div 8, align: bits div 8), isTemp = true)
 
 proc genIntoF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
   ## Evaluate a `bits`-wide float expression into the SIMD register `dest`.
@@ -1574,11 +1589,11 @@ proc genOconstr(g: var CodeGen; c: var Cursor; destVar: string) =
       assert c.substructureKind == KvU, "arkham v1: oconstr expects (kv …) pairs"
       c.into:                               # (kv Field Value [InheritDepth])
         let field = symName(c); inc c
-        let (rr, rt) = g.genReg(c)          # value → register
+        let rr = g.genReg(c)                # value → register
         g.ab.tree MovA64:
           g.emAggrFieldMem(destVar, field)
-          g.emReg rr
-        if rt: g.giveBack rr
+          g.emReg rr.r
+        g.freeTemp(rr)
         while c.hasMore: skip c             # optional inherited-object INTLIT
 
 proc genTypeBody(g: var CodeGen; c: var Cursor) =
@@ -1848,9 +1863,9 @@ proc genAtomicRmw(g: var CodeGen; pReg, val: Reg; isXchg: bool;
 proc genAtomicCmpXchg(g: var CodeGen; c: var Cursor) =
   ## `__atomic_compare_exchange_n(ptr, expected_ptr, desired, weak, succ, fail)`.
   ## Returns 1 on success, 0 on failure; on failure *expected is updated.
-  let (pReg, pT) = g.genReg(c)
-  let (expPtr, expT) = g.genReg(c)
-  let (des, desT) = g.genReg(c)
+  let pReg = g.genReg(c)
+  let expPtr = g.genReg(c)
+  let des = g.genReg(c)
   skip c; skip c; skip c                    # weak, success order, failure order
   let xExp = g.borrowTmp()
   let xOld = g.borrowTmp()
@@ -1858,7 +1873,7 @@ proc genAtomicCmpXchg(g: var CodeGen; c: var Cursor) =
   let loop = g.freshLabel()
   let lFail = g.freshLabel()
   let lDone = g.freshLabel()
-  let (p, ep, d) = (regName pReg, regName expPtr, regName des)
+  let (p, ep, d) = (regName pReg.r, regName expPtr.r, regName des.r)
   let (exp, old, st, ret) = (regName xExp, regName xOld,
                              regName xStatus, regName IntRet)
   g.ab.splice(
@@ -1872,30 +1887,30 @@ proc genAtomicCmpXchg(g: var CodeGen; c: var Cursor) =
     &"(stlr ({old}) ({ep})) " &                    # *expected = actual old value
     &"(mov ({ret}) 0) (lab :{lDone})")
   g.giveBack xStatus; g.giveBack xOld; g.giveBack xExp
-  if desT: g.giveBack des
-  if expT: g.giveBack expPtr
-  if pT: g.giveBack pReg
+  g.freeTemp(des)
+  g.freeTemp(expPtr)
+  g.freeTemp(pReg)
 
 proc genAtomic(g: var CodeGen; c: var Cursor; builtin: string) =
   ## Lower one `__atomic_*` builtin call. `c` is positioned at the first
   ## argument; this consumes all of them. Result (if any) lands in x0.
   case builtin
   of "__atomic_load_n":                      # (ptr, memorder) → *ptr
-    let (pReg, pT) = g.genReg(c); skip c
-    g.emLdar(IntRet, pReg)
-    if pT: g.giveBack pReg
+    let pReg = g.genReg(c); skip c
+    g.emLdar(IntRet, pReg.r)
+    g.freeTemp(pReg)
   of "__atomic_store_n":                     # (ptr, val, memorder) → void
-    let (pReg, pT) = g.genReg(c)
-    let (val, valT) = g.genReg(c); skip c
-    g.emStlr(val, pReg)
-    if valT: g.giveBack val
-    if pT: g.giveBack pReg
+    let pReg = g.genReg(c)
+    let val = g.genReg(c); skip c
+    g.emStlr(val.r, pReg.r)
+    g.freeTemp(val)
+    g.freeTemp(pReg)
   of "__atomic_clear":                       # (ptr, memorder) → void; *ptr = 0
-    let (pReg, pT) = g.genReg(c); skip c
+    let pReg = g.genReg(c); skip c
     let z = g.borrowTmp(); g.movImm(z, 0)
-    g.emStlr(z, pReg)
+    g.emStlr(z, pReg.r)
     g.giveBack z
-    if pT: g.giveBack pReg
+    g.freeTemp(pReg)
   of "__atomic_thread_fence":                # (memorder) → void
     skip c
     g.ab.keyword DmbA64
@@ -1905,30 +1920,30 @@ proc genAtomic(g: var CodeGen; c: var Cursor; builtin: string) =
      "__atomic_fetch_add", "__atomic_fetch_sub",
      "__atomic_fetch_and", "__atomic_fetch_or", "__atomic_fetch_xor",
      "__atomic_add_fetch", "__atomic_sub_fetch":
-    let (pReg, pT) = g.genReg(c)
-    let (val, valT) = g.genReg(c); skip c    # ptr, val, memorder
+    let pReg = g.genReg(c)
+    let val = g.genReg(c); skip c            # ptr, val, memorder
     case builtin
-    of "__atomic_exchange_n":  g.genAtomicRmw(pReg, val, true, NoA64Inst, false)
-    of "__atomic_fetch_add":   g.genAtomicRmw(pReg, val, false, AddA64, false)
-    of "__atomic_fetch_sub":   g.genAtomicRmw(pReg, val, false, SubA64, false)
-    of "__atomic_fetch_and":   g.genAtomicRmw(pReg, val, false, AndA64, false)
-    of "__atomic_fetch_or":    g.genAtomicRmw(pReg, val, false, OrrA64, false)
-    of "__atomic_fetch_xor":   g.genAtomicRmw(pReg, val, false, EorA64, false)
-    of "__atomic_add_fetch":   g.genAtomicRmw(pReg, val, false, AddA64, true)
-    of "__atomic_sub_fetch":   g.genAtomicRmw(pReg, val, false, SubA64, true)
+    of "__atomic_exchange_n":  g.genAtomicRmw(pReg.r, val.r, true, NoA64Inst, false)
+    of "__atomic_fetch_add":   g.genAtomicRmw(pReg.r, val.r, false, AddA64, false)
+    of "__atomic_fetch_sub":   g.genAtomicRmw(pReg.r, val.r, false, SubA64, false)
+    of "__atomic_fetch_and":   g.genAtomicRmw(pReg.r, val.r, false, AndA64, false)
+    of "__atomic_fetch_or":    g.genAtomicRmw(pReg.r, val.r, false, OrrA64, false)
+    of "__atomic_fetch_xor":   g.genAtomicRmw(pReg.r, val.r, false, EorA64, false)
+    of "__atomic_add_fetch":   g.genAtomicRmw(pReg.r, val.r, false, AddA64, true)
+    of "__atomic_sub_fetch":   g.genAtomicRmw(pReg.r, val.r, false, SubA64, true)
     else: discard
-    if valT: g.giveBack val
-    if pT: g.giveBack pReg
+    g.freeTemp(val)
+    g.freeTemp(pReg)
   of "__atomic_test_and_set":                # (ptr, memorder) → bool (old != 0)
-    let (pReg, pT) = g.genReg(c); skip c
+    let pReg = g.genReg(c); skip c
     let one = g.borrowTmp(); g.movImm(one, 1)
-    g.genAtomicRmw(pReg, one, true, NoA64Inst, false)  # x0 = old
+    g.genAtomicRmw(pReg.r, one, true, NoA64Inst, false)  # x0 = old
     let xOld = g.borrowTmp(); g.movReg(xOld, IntRet)
     let lSkip = g.freshLabel()
     let (old, ret) = (regName xOld, regName IntRet)
     g.ab.splice &"(mov ({ret}) 0) (cmp ({old}) 0) (beq {lSkip}) (mov ({ret}) 1) (lab :{lSkip})"
     g.giveBack xOld; g.giveBack one
-    if pT: g.giveBack pReg
+    g.freeTemp(pReg)
   of "__atomic_compare_exchange_n":
     g.genAtomicCmpXchg(c)
   else:
@@ -1945,9 +1960,10 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
   ## all of them.
   case builtin
   of "memcpy":                                 # (dst, src, n) → dst
-    let (dst, dstT) = g.genReg(c)
-    let (src, srcT) = g.genReg(c)
-    let (n, nT) = g.genReg(c)
+    let dstL = g.genReg(c)
+    let srcL = g.genReg(c)
+    let nL = g.genReg(c)
+    let (dst, src, n) = (dstL.r, srcL.r, nL.r)
     let i = g.borrowTmp()
     let b = g.borrowTmp()
     let loop = g.freshLabel()
@@ -1963,13 +1979,12 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
     g.emLab(done)
     g.movReg(IntRet, dst)                       # memcpy returns dest
     g.giveBack b; g.giveBack i
-    if nT: g.giveBack n
-    if srcT: g.giveBack src
-    if dstT: g.giveBack dst
+    g.freeTemp(nL); g.freeTemp(srcL); g.freeTemp(dstL)
   of "memmove":                                # (dst, src, n) → dst; overlap-safe
-    let (dst, dstT) = g.genReg(c)
-    let (src, srcT) = g.genReg(c)
-    let (n, nT) = g.genReg(c)
+    let dstL = g.genReg(c)
+    let srcL = g.genReg(c)
+    let nL = g.genReg(c)
+    let (dst, src, n) = (dstL.r, srcL.r, nL.r)
     let i = g.borrowTmp()
     let b = g.borrowTmp()
     let fwd = g.freshLabel()
@@ -2000,13 +2015,12 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
     g.emLab(done)
     g.movReg(IntRet, dst)
     g.giveBack b; g.giveBack i
-    if nT: g.giveBack n
-    if srcT: g.giveBack src
-    if dstT: g.giveBack dst
+    g.freeTemp(nL); g.freeTemp(srcL); g.freeTemp(dstL)
   of "memset":                                 # (dst, val, n) → dst
-    let (dst, dstT) = g.genReg(c)
-    let (val, valT) = g.genReg(c)
-    let (n, nT) = g.genReg(c)
+    let dstL = g.genReg(c)
+    let valL = g.genReg(c)
+    let nL = g.genReg(c)
+    let (dst, val, n) = (dstL.r, valL.r, nL.r)
     let i = g.borrowTmp()
     let loop = g.freshLabel()
     let done = g.freshLabel()
@@ -2020,13 +2034,12 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
     g.emLab(done)
     g.movReg(IntRet, dst)
     g.giveBack i
-    if nT: g.giveBack n
-    if valT: g.giveBack val
-    if dstT: g.giveBack dst
+    g.freeTemp(nL); g.freeTemp(valL); g.freeTemp(dstL)
   of "memcmp":                                 # (a, b, n) → first byte difference
-    let (pa, paT) = g.genReg(c)
-    let (pb, pbT) = g.genReg(c)
-    let (n, nT) = g.genReg(c)
+    let paL = g.genReg(c)
+    let pbL = g.genReg(c)
+    let nL = g.genReg(c)
+    let (pa, pb, n) = (paL.r, pbL.r, nL.r)
     let i = g.borrowTmp()
     let ba = g.borrowTmp()
     let bb = g.borrowTmp()
@@ -2052,9 +2065,7 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
     g.movImm(IntRet, 0)
     g.emLab(done)
     g.giveBack bb; g.giveBack ba; g.giveBack i
-    if nT: g.giveBack n
-    if pbT: g.giveBack pb
-    if paT: g.giveBack pa
+    g.freeTemp(nL); g.freeTemp(pbL); g.freeTemp(paL)
   else:
     raiseAssert "arkham: unsupported mem intrinsic: " & builtin
 
@@ -2077,11 +2088,11 @@ proc emitCmpBranch(g: var CodeGen; c: var Cursor; toLabel: string; whenTrue: boo
         of LeC:  (if whenTrue: BlsA64 else: BhiA64)
         else: raiseAssert "arkham v1: float condition not supported: " & $ek
       let fbits = g.floatBits(c)
-      let (fa, fat) = g.genFReg(c, fbits)
-      let (fb, fbt) = g.genFReg(c, fbits)
-      g.ab.tree FcmpA64: g.emFReg(fa, fbits); g.emFReg(fb, fbits)
-      if fbt: g.giveBackF fb
-      if fat: g.giveBackF fa
+      let fa = g.genFReg(c, fbits)
+      let fb = g.genFReg(c, fbits)
+      g.ab.tree FcmpA64: g.emFReg(fa.f, fbits); g.emFReg(fb.f, fbits)
+      g.freeTemp(fb)
+      g.freeTemp(fa)
     else:
       var signed = true
       if c.kind == Symbol and g.ra.locationOfSym(symName(c)).typ.kind == AUInt:
@@ -2098,7 +2109,7 @@ proc emitCmpBranch(g: var CodeGen; c: var Cursor; toLabel: string; whenTrue: boo
       let a = g.genReg(c)
       var bImm = false
       var bImmV = 0'i64
-      var b = (r: NoReg, temp: false)
+      var b = regLoc(NoReg, ScalarSlot)         # filled below unless `b` is a small imm
       if c.kind == IntLit and intVal(c) >= 0 and intVal(c) <= 0xFFFF:
         bImm = true; bImmV = intVal(c); inc c
       else:
@@ -2106,8 +2117,8 @@ proc emitCmpBranch(g: var CodeGen; c: var Cursor; toLabel: string; whenTrue: boo
       g.ab.tree CmpA64:
         g.emReg a.r
         if bImm: g.ab.intLit bImmV else: g.emReg b.r
-      if not bImm and b.temp: g.giveBack b.r
-      if a.temp: g.giveBack a.r
+      if not bImm: g.freeTemp(b)
+      g.freeTemp(a)
   g.emBr(tag, toLabel)
 
 proc emitCondJump(g: var CodeGen; c: var Cursor; toLabel: string; whenTrue: bool) =
@@ -2147,10 +2158,10 @@ proc emitCondJump(g: var CodeGen; c: var Cursor; toLabel: string; whenTrue: bool
       return
     else: discard
   # a plain boolean value: branch on `v != 0` / `v == 0`
-  let (r, t) = g.genReg(c)
-  g.ab.tree CmpA64: (g.emReg r; g.ab.intLit 0)
+  let v = g.genReg(c)
+  g.ab.tree CmpA64: (g.emReg v.r; g.ab.intLit 0)
   g.emBr(if whenTrue: BneA64 else: BeqA64, toLabel)
-  if t: g.giveBack r
+  g.freeTemp(v)
 
 proc materializeCond(g: var CodeGen; c: var Cursor; dest: Reg) =
   ## Spill a pending condition into `dest` as a `0`/`1` boolean.
@@ -2212,20 +2223,6 @@ proc genBreak(g: var CodeGen; c: var Cursor) =
 
 # ── case statement ──────────────────────────────────────────────────────────
 
-proc branchImm(c: var Cursor): int64 =
-  ## Read a NIFC `BranchValue` (Number | CharLiteral | (true) | (false)) and
-  ## advance past it. Symbol branch values (enum consts) are unsupported in v1.
-  case c.kind
-  of IntLit:  result = intVal(c); inc c
-  of UIntLit: result = cast[int64](uintVal(c)); inc c
-  of CharLit: result = int64(ord(charLit(c))); inc c
-  of TagLit:
-    case c.exprKind
-    of TrueC:  result = 1; skip c
-    of FalseC: result = 0; skip c
-    else: raiseAssert "arkham v1: unsupported case branch value: " & $c.exprKind
-  else: raiseAssert "arkham v1: unsupported case branch value kind: " & $c.kind
-
 proc cmpImm(g: var CodeGen; selReg: Reg; v: int64) =
   ## `cmp selReg, #v` — immediate when it fits, otherwise via a scratch register.
   if v >= 0 and v <= 0xFFFF:
@@ -2266,7 +2263,8 @@ proc genCase(g: var CodeGen; c: var Cursor) =
     var signed = true
     if c.kind == Symbol and g.ra.locationOfSym(symName(c)).typ.kind == AUInt:
       signed = false
-    let (selReg, selTemp) = g.genReg(c)     # selector value, live across all tests
+    let sel = g.genReg(c)                    # selector value, live across all tests
+    let selReg = sel.r
     # Pass 1: emit the comparison tests; remember each body's StmtList cursor.
     var bodies: seq[(string, Cursor)] = @[]
     var elseBody = c                        # placeholder; overwritten if an `else` exists
@@ -2289,7 +2287,7 @@ proc genCase(g: var CodeGen; c: var Cursor) =
         hasElse = true
         skip c
       else: skip c
-    if selTemp: g.giveBack selReg
+    g.freeTemp(sel)
     # No match falls through here: run the else body (if any), then skip bodies.
     if hasElse:
       elseBody.into:
@@ -2342,16 +2340,28 @@ proc gen(g: var CodeGen; c: var Cursor; dest: var Location) =
   of InReg: g.genInto(c, dest.r)
   of InFReg: g.genIntoF(c, dest.f, dest.typ.size * 8)
   of Undef: dest = g.genVal(c)
+  of NeedsReg:
+    # "must be a register, my choice": evaluate where the value naturally lives,
+    # then ensure it occupies a register (a register-resident local stays in place;
+    # anything else is materialized into scratch). The concrete `InReg`, carrying its
+    # `isTemp` flag, is written back so the caller knows whether to `freeTemp`.
+    dest = g.genVal(c)
+    g.forceReg(dest)
+  of RegOrImm:
+    # "a GPR or an immediate, not memory" — a memory operand is loaded into a temp.
+    # (Not yet used by the a64 backend; handled for enum-totality / future use.)
+    dest = g.genVal(c)
+    if dest.kind notin {Imm, InReg}: g.forceReg(dest)
   of NamedStack, Mem, Glob, Tvar:
     let bits = dest.typ.size * 8
     if dest.typ.isFloat:
-      let (fr, ft) = g.genFReg(c, bits)
-      g.emitStoreF(dest, fr, bits)
-      if ft: g.giveBackF fr
+      let fr = g.genFReg(c, bits)
+      g.emitStoreF(dest, fr.f, bits)
+      g.freeTemp(fr)
     else:
-      let (rr, rt) = g.genReg(c)
-      g.emitStore(dest, rr)
-      if rt: g.giveBack rr
+      let rr = g.genReg(c)
+      g.emitStore(dest, rr.r)
+      g.freeTemp(rr)
   else: raiseAssert "arkham a64: gen() cannot target dest kind " & $dest.kind
 
 proc genAsgn(g: var CodeGen; c: var Cursor) =
