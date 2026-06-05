@@ -119,6 +119,13 @@ proc isPtrType*(c: Cursor): bool =
   of PtrT, AptrT, ProctypeT: true
   else: false
 
+proc aggrByRef*(g: var CodeGen; typeName: string): bool {.inline.} =
+  ## SysV/AAPCS: an aggregate larger than the by-value threshold is passed AND
+  ## returned by reference (a hidden pointer) instead of in registers — the single
+  ## predicate behind every "by-ref vs by-value" branch (call marshalling, a
+  ## call-returned-aggregate var, param moves, incoming-arg-reg counting).
+  aggrByteSize(g.prog, typeName) > g.md.aggrByRefThreshold
+
 # ── structural type / slot analysis ─────────────────────────────────────────
 
 type
