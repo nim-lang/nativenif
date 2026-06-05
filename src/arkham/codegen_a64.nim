@@ -59,11 +59,41 @@ proc externCName(g: var CodeGen; asmName: string): string =
 
 # ── low-level emit helpers ──────────────────────────────────────────────────
 
+let ScalarSlot = AsmSlot(kind: AInt, size: 8, align: 8)
+  ## Placeholder slot for a register/immediate dont-care result: no consumer of an
+  ## `InReg`/`Imm` value reads `.typ` (the old `Val` carried no type). As a scratch
+  ## binding type it carries no cursor, so `bindTemp` falls back to `(i 64)`. A `let`
+  ## (not `const`) because `AsmSlot` now holds a `Cursor`, not a compile-time value.
+
+proc bindTemp(g: var CodeGen; r: Reg; typ: AsmSlot)
+proc unbindTemp(g: var CodeGen; r: Reg)
+
 proc emReg(g: var CodeGen; r: Reg) {.inline.} =
-  ## A value GPR operand: a named register local → its typed name; otherwise the
-  ## raw `(xN)` tag (transient scratch, params, etc.).
+  ## A value GPR operand: a register currently hosting a named local / param /
+  ## `rebind`-bound scratch → its checked name (which nifasm type-checks and resolves
+  ## back to the register); otherwise the raw `(xN)` tag.
   if g.regLocal.hasKey(r): g.ab.sym g.regLocal[r]
-  else: g.ab.reg r
+  else:
+    # The volatile scratch pool (x9–x15) is the only register class the allocator
+    # hands out for arbitrary computed values, and every such hand-out is `bindTemp`'d
+    # to a checked name (see `tryBorrowTmp`), so a *raw* pool register reaching here
+    # means an unbound scratch slipped past the binder — the silent-clobber hole this
+    # work closes. Every OTHER register has an irreducible structural raw use and is
+    # allowed: x0–x7 are arg/return + syscall registers, x8 the indirect result, x16/
+    # x17 assembler veneers, x19–x28 callee-saved param/local homes (saved raw by
+    # stp/ldp), fp/lr/sp the frame.
+    assert r notin g.md.intTempRegs,
+      "arkham a64: unbound scratch-pool register reached emReg: " & regName(r)
+    g.ab.reg r
+
+proc emOp(g: CodeGen; r: Reg): string =
+  ## The asm-NIF operand spelling of register `r` for a `splice`d text fragment — the
+  ## text-path counterpart of `emReg` (`emReg` can't be used because `splice` consumes
+  ## a string): a bound register by its checked name (no parens), an unbound register
+  ## as the raw `(xN)` tag. Used by the inline-asm lowerings (extend, atomics) whose
+  ## operands may be `rebind`-bound scratch or register-locals.
+  if g.regLocal.hasKey(r): g.regLocal[r]
+  else: "(" & regName(r) & ")"
 
 proc movImm(g: var CodeGen; d: Reg; v: int64) =
   g.ab.tree MovA64: g.emReg d; g.ab.intLit v
@@ -157,30 +187,37 @@ proc framePushBytes(g: CodeGen): int =
 
 # ── scratch register pool (volatile temps not held by a local) ──────────────
 
-proc tryBorrowTmp(g: var CodeGen): Reg =
+proc tryBorrowTmp(g: var CodeGen; typ: AsmSlot = ScalarSlot): Reg =
   ## Like `borrowTmp` but returns `NoReg` when the scratch pool is exhausted
   ## (instead of failing). The caller then spills the value to a stack slot, so
   ## register allocation never fails. The reg-or-`NoReg` outcome is recorded by the
   ## planning pass and replayed verbatim by the emit pass (see `genProc`), keeping
-  ## the two walks byte-identical.
+  ## the two walks byte-identical. A real register is `bindTemp`'d to a typed name
+  ## (`typ`) so every later `emReg` of it emits a checked symbol rather than a raw
+  ## `(xN)`; the caller releases it (and the binding) via `giveBack`.
+  result = NoReg
   if not g.ab.planning:                          # emit pass: replay the planned decision
     result = g.borrowLog[g.borrowIdx]; inc g.borrowIdx
-    return
-  for r in g.md.intTempRegs:                      # plan pass: real pool allocation
-    if r in g.freeTmp and not g.ra.isSealed(r):
-      excl g.freeTmp, r
-      g.borrowLog.add r
-      return r
-  g.borrowLog.add NoReg                           # exhausted → caller spills (cannot fail)
-  result = NoReg
+  else:
+    for r in g.md.intTempRegs:                    # plan pass: real pool allocation
+      if r in g.freeTmp and not g.ra.isSealed(r):
+        excl g.freeTmp, r
+        result = r
+        break
+    g.borrowLog.add result                        # the chosen reg, or NoReg (exhausted)
+  if result != NoReg: g.bindTemp(result, typ)     # typed name ⇒ emReg emits a symbol
 
-proc borrowTmp(g: var CodeGen): Reg =
-  result = g.tryBorrowTmp()
+proc borrowTmp(g: var CodeGen; typ: AsmSlot = ScalarSlot): Reg =
+  result = g.tryBorrowTmp(typ)                    # binds on a pool hit
   if result == NoReg:
     raiseAssert "arkham v1: out of scratch registers"  # sites not yet spill-aware
 
 proc giveBack(g: var CodeGen; r: Reg) =
-  if r in g.md.intTempRegs: g.freeTmp.incl r       # a staging/arg reg is a no-op
+  ## Release a scratch register: drop its `bindTemp` binding (a `(kill)`, no machine
+  ## code) and return a pool register to the pool. A no-op for a staging/arg register
+  ## (not a pool member, never bound here).
+  g.unbindTemp(r)
+  if r in g.md.intTempRegs: g.freeTmp.incl r
 
 # ── SIMD/FP scratch pool + emit helpers (double precision) ──────────────────
 
@@ -227,11 +264,11 @@ proc emFcvt(g: var CodeGen; d, s: FReg; dstBits, srcBits: int) =  # fcvt: precis
 proc emFLoad(g: var CodeGen; d: FReg; addrReg: Reg; bits: int) =  # fldr dD/sD, [addrReg]
   g.ab.tree FldrA64:
     g.emFReg(d, bits)
-    g.ab.tree MemX: g.ab.reg addrReg
+    g.ab.tree MemX: g.emReg addrReg          # name when the pointer is a bound temp
 
 proc emFStore(g: var CodeGen; d: FReg; addrReg: Reg; bits: int) = # fstr dD/sD, [addrReg]
   g.ab.tree FstrA64:
-    g.ab.tree MemX: g.ab.reg addrReg
+    g.ab.tree MemX: g.emReg addrReg          # name when the pointer is a bound temp
     g.emFReg(d, bits)
 
 # ── expressions: target-into-register ───────────────────────────────────────
@@ -329,6 +366,41 @@ proc emScalarStore(g: var CodeGen; name: string; src: Reg) =
   ## `[slot] ← src` — store to a spilled scalar's `(s)` var.
   g.ab.tree MovA64: (g.ab.sym name; g.emReg src)
 
+proc emBindType(g: var CodeGen; typ: AsmSlot) =
+  ## Emit the NIFC type for a scratch binding: the slot's own type when known, else
+  ## the generic `(i 64)` (a register/immediate dont-care placeholder carries no
+  ## cursor). Mirrors `emScalarStackVar`'s type emission.
+  if cursorIsNil(typ.typ):
+    g.ab.intType(64)
+  else:
+    var tc = typ.typ
+    if tc.kind == Symbol: g.ab.sym symName(tc)
+    else: g.genTypeBody(tc)
+
+proc bindTemp(g: var CodeGen; r: Reg; typ: AsmSlot) =
+  ## Give scratch register `r` a typed nifasm name `tmpN.0` via `(rebind …)`, so every
+  ## later `emReg r` emits a checked symbol rather than a raw `(xN)` the binding
+  ## checker can't see. The name counter bumps in BOTH passes (so names replay
+  ## identically); the `(rebind …)` tree auto-no-ops in the plan pass (zero machine
+  ## code — pure nifasm bookkeeping). `boundTemps` records that `r`'s `regLocal` entry
+  ## is a transient temp; released by `unbindTemp`.
+  let name = "tmp" & $g.tmpBindCount & ".0"; inc g.tmpBindCount
+  g.ab.tree RebindA64:
+    g.ab.symDef name
+    g.emBindType(typ)
+    g.ab.reg r
+  g.regLocal[r] = name
+  g.boundTemps.incl r
+
+proc unbindTemp(g: var CodeGen; r: Reg) =
+  ## Release a scratch binding made by `bindTemp`: `(kill)` the name and drop the
+  ## `regLocal`/`boundTemps` entries. A no-op when `r` carries no temp binding (so it
+  ## is safe on every `giveBack`, whether or not the reg was a bound temp).
+  if r in g.boundTemps:
+    g.ab.tree KillA64: g.ab.sym g.regLocal[r]
+    g.regLocal.del r
+    g.boundTemps.excl r
+
 proc emFloatStackVar(g: var CodeGen; name: string; bits: int) =
   ## Declare a spilled float scalar's stack slot `(var :name (s) (f N))`. nifasm
   ## sizes/aligns the slot and resolves the bare symbol to `[sp,#off]`.
@@ -418,11 +490,6 @@ proc spillComputed(g: var CodeGen; c: var Cursor): Location =
   g.emScalarStore(slotName, stage)              # store it to the slot
   g.ra.unseal {stage}
   result = namedStackLoc(slotName, AsmSlot(kind: AInt, size: 8, align: 8))
-
-let ScalarSlot = AsmSlot(kind: AInt, size: 8, align: 8)
-  ## Placeholder slot for a register/immediate dont-care result: no consumer of an
-  ## `InReg`/`Imm` value reads `.typ` (the old `Val` carried no type). A `let` (not
-  ## `const`) because `AsmSlot` now holds a `Cursor`, which is not a compile-time value.
 
 proc genVal(g: var CodeGen; c: var Cursor): Location =
   ## The dont-care evaluator: produce `c`'s value where it naturally lives — a
@@ -691,10 +758,10 @@ proc extendTo(g: var CodeGen; dest: Reg; width: int; signed: bool) =
   ## use the `lsl #(64-w); asr|lsr #(64-w)` shift pair (immediate shifts), written
   ## here as an inline asm-NIF fragment.
   if width <= 0 or width >= 64: return
-  let d = regName(dest)
+  let d = g.emOp(dest)                       # bound name or raw `(xN)` (parens included)
   let sh = 64 - width
   let down = if signed: "asr" else: "lsr"
-  g.ab.splice &"(lsl ({d}) {sh}) ({down} ({d}) {sh})"
+  g.ab.splice &"(lsl {d} {sh}) ({down} {d} {sh})"
 
 proc derefPtrCur(g: var CodeGen; nn: Cursor): tuple[r: Reg, temp: bool] =
   ## Recompute the pointer of a `(deref p)` cursor into a register.
@@ -1424,7 +1491,7 @@ proc genProctypeSig(g: var CodeGen; c: var Cursor) =
                 skip c                          # pragmas
                 g.ab.tree ParamD:
                   g.ab.symDef paramName(idx)
-                  if idx < IntArgRegs.len: g.emReg IntArgRegs[idx]
+                  if idx < IntArgRegs.len: g.ab.reg IntArgRegs[idx]  # raw reg *location*
                   else: g.ab.keyword SO         # 9th+ → stack-passed
                   g.genTypeBody(c)              # param type (consumes it)
                 while c.hasMore: skip c
@@ -1437,11 +1504,11 @@ proc genProctypeSig(g: var CodeGen; c: var Cursor) =
           skip c                                # consume the void `.`/`(void)` node
         else:
           g.ab.symDef "ret.0"
-          g.emReg IntRet
+          g.ab.reg IntRet                       # raw reg *location* of the result
           g.genTypeBody(c)                      # consumes the return type
       while c.hasMore: skip c                    # pragmas
     g.ab.tree ClobberD:
-      for r in ConvClobbersGpr: g.emReg r
+      for r in ConvClobbersGpr: g.ab.reg r   # a clobber *declaration*: raw reg locations
 
 proc genCall(g: var CodeGen; c: var Cursor) =
   ## `(call f arg…)` — internal `(call)` or external `(extcall)`. Integer/
@@ -1848,16 +1915,16 @@ proc genAtomicRmw(g: var CodeGen; pReg, val: Reg; isXchg: bool;
   let xNew = g.borrowTmp()
   let xStatus = g.borrowTmp()
   let loop = g.freshLabel()
-  let (p, v, old, neu, st) = (regName pReg, regName val,
-                              regName xOld, regName xNew, regName xStatus)
+  let (p, v, old, neu, st) = (g.emOp pReg, g.emOp val,
+                              g.emOp xOld, g.emOp xNew, g.emOp xStatus)
   let update =                              # new ← val (xchg) | old op val (rmw)
-    if isXchg: &"(mov ({neu}) ({v}))"
-    else:      &"(mov ({neu}) ({old})) ({op} ({neu}) ({v}))"
+    if isXchg: &"(mov {neu} {v})"
+    else:      &"(mov {neu} {old}) ({op} {neu} {v})"
   g.ab.splice &"(lab :{loop}) " &
-              &"(ldaxr ({old}) ({p})) " &
+              &"(ldaxr {old} {p}) " &
               update & " " &
-              &"(stlxr ({st}) ({neu}) ({p})) " &
-              &"(cmp ({st}) 0) (bne {loop})"   # retry on store-exclusive failure
+              &"(stlxr {st} {neu} {p}) " &
+              &"(cmp {st} 0) (bne {loop})"   # retry on store-exclusive failure
   g.movReg(IntRet, if returnNew: xNew else: xOld)
   g.giveBack xStatus; g.giveBack xNew; g.giveBack xOld
 
@@ -1874,19 +1941,19 @@ proc genAtomicCmpXchg(g: var CodeGen; c: var Cursor) =
   let loop = g.freshLabel()
   let lFail = g.freshLabel()
   let lDone = g.freshLabel()
-  let (p, ep, d) = (regName pReg.r, regName expPtr.r, regName des.r)
-  let (exp, old, st, ret) = (regName xExp, regName xOld,
-                             regName xStatus, regName IntRet)
+  let (p, ep, d) = (g.emOp pReg.r, g.emOp expPtr.r, g.emOp des.r)
+  let (exp, old, st, ret) = (g.emOp xExp, g.emOp xOld,
+                             g.emOp xStatus, g.emOp IntRet)
   g.ab.splice(
-    &"(ldar ({exp}) ({ep})) " &              # expected = *expected_ptr
-    &"(lab :{loop}) (ldaxr ({old}) ({p})) " &
-    &"(cmp ({old}) ({exp})) (bne {lFail}) " &      # mismatch → fail
-    &"(stlxr ({st}) ({d}) ({p})) " &
-    &"(cmp ({st}) 0) (bne {loop}) " &              # store-exclusive lost → retry
-    &"(mov ({ret}) 1) (b {lDone}) " &
+    &"(ldar {exp} {ep}) " &                  # expected = *expected_ptr
+    &"(lab :{loop}) (ldaxr {old} {p}) " &
+    &"(cmp {old} {exp}) (bne {lFail}) " &          # mismatch → fail
+    &"(stlxr {st} {d} {p}) " &
+    &"(cmp {st} 0) (bne {loop}) " &                # store-exclusive lost → retry
+    &"(mov {ret} 1) (b {lDone}) " &
     &"(lab :{lFail}) (clrex) " &                   # drop the exclusive reservation
-    &"(stlr ({old}) ({ep})) " &                    # *expected = actual old value
-    &"(mov ({ret}) 0) (lab :{lDone})")
+    &"(stlr {old} {ep}) " &                        # *expected = actual old value
+    &"(mov {ret} 0) (lab :{lDone})")
   g.giveBack xStatus; g.giveBack xOld; g.giveBack xExp
   g.freeTemp(des)
   g.freeTemp(expPtr)
@@ -1941,8 +2008,8 @@ proc genAtomic(g: var CodeGen; c: var Cursor; builtin: string) =
     g.genAtomicRmw(pReg.r, one, true, NoA64Inst, false)  # x0 = old
     let xOld = g.borrowTmp(); g.movReg(xOld, IntRet)
     let lSkip = g.freshLabel()
-    let (old, ret) = (regName xOld, regName IntRet)
-    g.ab.splice &"(mov ({ret}) 0) (cmp ({old}) 0) (beq {lSkip}) (mov ({ret}) 1) (lab :{lSkip})"
+    let (old, ret) = (g.emOp xOld, g.emOp IntRet)
+    g.ab.splice &"(mov {ret} 0) (cmp {old} 0) (beq {lSkip}) (mov {ret} 1) (lab :{lSkip})"
     g.giveBack xOld; g.giveBack one
     g.freeTemp(pReg)
   of "__atomic_compare_exchange_n":
@@ -2609,7 +2676,7 @@ proc emitSignature(g: var CodeGen; decl: Cursor; declarative: bool) =
                 g.ab.tree ParamD:
                   g.ab.symDef paramName(idx)
                   if idx < IntArgRegs.len:
-                    g.emReg IntArgRegs[idx]   # x0–x7
+                    g.ab.reg IntArgRegs[idx]  # x0–x7: raw reg *location*
                   else:
                     g.ab.keyword SO           # 9th+ → stack-passed `(s)`
                   g.genTypeBody(c)            # the param type (consumes it)
@@ -2622,14 +2689,14 @@ proc emitSignature(g: var CodeGen; decl: Cursor; declarative: bool) =
           skip c                              # void → empty (result)
         else:
           g.ab.symDef "ret.0"
-          g.emReg IntRet
+          g.ab.reg IntRet                     # raw reg *location* of the result
           g.genTypeBody(c)                    # the result type (consumes it)
       while c.hasMore: skip c                 # pragmas, body
   else:
     g.ab.keyword ParamsD
     g.ab.keyword ResultD
   g.ab.tree ClobberD:
-    for r in ConvClobbersGpr: g.emReg r
+    for r in ConvClobbersGpr: g.ab.reg r     # a clobber *declaration*: raw reg locations
 
 proc emitGlobalInits(g: var CodeGen)
 
