@@ -1726,6 +1726,14 @@ proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
   # (SU swap / operandInReg) keeps it protected.
   let protect = dest in StagingCandidates and dest notin g.liveAccums
   if protect: g.liveAccums.incl dest
+  # Protect a register-local *home* (a callee-saved RBX/R12–R15) from a codegen-time
+  # *steal* during the build of its own value: the result lands in `dest`, so an
+  # initializer/rvalue whose scratch demand evicts `dest` mid-build would make the
+  # final write target a stale, evicted register. `liveAccums` only guards arg/return
+  # regs; `stealReg` can still evict a callee-saved home, so seal it here. Save/restore
+  # so a nested `genInto` into the same reg keeps it sealed.
+  let sealHome = g.regLocal.hasKey(dest) and not g.ra.isSealed(dest)
+  if sealHome: g.ra.seal dest
   case c.kind
   of IntLit, UIntLit, CharLit:
     g.place(g.genVal(c), dest)               # literal → immediate
@@ -1803,6 +1811,7 @@ proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
         while c.hasMore: skip c
     else: raiseAssert "arkham x64 v0: expression not supported: " & $c.exprKind
   else: raiseAssert "arkham x64 v0: operand not supported: " & $c.kind
+  if sealHome: g.ra.unseal {dest}
   if protect: g.liveAccums.excl dest
 
 proc genAddr(g: var CodeGen; c: var Cursor; dest: var Location) =

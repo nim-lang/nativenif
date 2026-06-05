@@ -67,6 +67,15 @@ let ScalarSlot = AsmSlot(kind: AInt, size: 8, align: 8)
 
 proc bindTemp(g: var CodeGen; r: Reg; typ: AsmSlot)
 proc unbindTemp(g: var CodeGen; r: Reg)
+proc stealReg(g: var CodeGen; logIdx: int): Reg
+proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg
+
+# Order in which a codegen-time steal looks for a victim register-local: prefer
+# the volatile temp pool (x9–x15 — call-free locals the allocator put there once
+# the callee-saved pool was full, the common case), then callee-saved (x19–x28).
+# Fixed order ⇒ the plan and emit passes pick the same victim deterministically.
+const StealOrder = [R9, R10, R11, R12, R13, R14, R15,
+                    R19, R20, R21, R22, R23, R24, R25, R26, R27, R28]
 
 proc emReg(g: var CodeGen; r: Reg) {.inline.} =
   ## A value GPR operand: a register currently hosting a named local / param /
@@ -210,13 +219,36 @@ proc tryBorrowTmp(g: var CodeGen; typ: AsmSlot = ScalarSlot): Reg =
 proc borrowTmp(g: var CodeGen; typ: AsmSlot = ScalarSlot): Reg =
   result = g.tryBorrowTmp(typ)                    # binds on a pool hit
   if result == NoReg:
-    raiseAssert "arkham v1: out of scratch registers"  # sites not yet spill-aware
+    # Pool empty. Mirror x64's `borrowTmp`: evict a register-bound local to a stack
+    # slot and reuse its register (`stealReg`), so a scratch-needing site (a global
+    # address load, an atomic, a function-pointer call) never refuses to compile
+    # just because the pool is full of locals. The steal decision is logged at the
+    # same `borrowLog` position the plan pass recorded `NoReg` and replayed (with the
+    # spill store) by the emit pass, keeping the two walks byte-consistent.
+    let idx = if g.ab.planning: g.borrowLog.len - 1 else: g.borrowIdx - 1
+    result = g.stealReg(idx)
+    if result == NoReg:
+      # Pool empty AND no register-bound local to evict (e.g. the locals live in
+      # callee-saved homes the steal order can still reach, but all are sealed/live —
+      # or an early scratch need precedes every local decl). Fall back to a transient
+      # caller-saved staging register, exactly as a spill's `pickStaging` does: a
+      # clobberable scratch, sealed for the temp's lifetime so a nested borrow can't
+      # reuse it (`giveBack` unseals). The pick is a deterministic function of the
+      # per-pass-identical state, so plan and emit agree without a borrow-log entry.
+      result = g.pickStagingScratch()
+      if result == NoReg:
+        raiseAssert "arkham a64: out of registers (no local to steal for scratch)"
+      g.ra.seal result
+    g.bindTemp(result, typ)                        # steal / staging-fallback reg → typed name
 
 proc giveBack(g: var CodeGen; r: Reg) =
   ## Release a scratch register: drop its `bindTemp` binding (a `(kill)`, no machine
-  ## code) and return a pool register to the pool. A no-op for a staging/arg register
-  ## (not a pool member, never bound here).
+  ## code), unseal a staging-fallback register held across the borrow, and return a
+  ## pool register to the pool. A no-op for a plain staging/arg register (not a pool
+  ## member, never bound here).
+  if r == NoReg: return
   g.unbindTemp(r)
+  g.ra.unseal {r}
   if r in g.md.intTempRegs: g.freeTmp.incl r
 
 # ── SIMD/FP scratch pool + emit helpers (double precision) ──────────────────
@@ -244,10 +276,13 @@ proc unbindFTmp(g: var CodeGen; f: FReg) =
     g.fregLocal.del f
     g.boundFTmps.excl f
 
-proc borrowFTmp(g: var CodeGen; bits: int): FReg =
-  ## A SIMD scratch register from the pool, `bindFTmp`'d to a typed `ftmpN.0` name so
-  ## `emFReg` emits a checked symbol. `bits` is the value's precision (for the binding
-  ## type). Released via `giveBackF`. (16 FP temps; spill-on-exhaustion is a TODO.)
+proc tryBorrowFTmp(g: var CodeGen; bits: int): FReg =
+  ## Like `borrowFTmp` but returns `NoFReg` when the SIMD scratch pool is exhausted
+  ## (instead of failing), so the caller can spill to a float stack slot — the float
+  ## analogue of `tryBorrowTmp`. The reg-or-`NoFReg` outcome is recorded/replayed
+  ## through `borrowLogF` like any borrow decision. A real register is `bindFTmp`'d to
+  ## a typed name so `emFReg` emits a checked symbol; the caller releases it via
+  ## `giveBackF`.
   result = NoFReg
   if not g.ab.planning:                            # emit pass: replay the planned decision
     result = g.borrowLogF[g.borrowIdxF]; inc g.borrowIdxF
@@ -257,10 +292,18 @@ proc borrowFTmp(g: var CodeGen; bits: int): FReg =
         excl g.freeFTmp, f
         result = f
         break
-    if result == NoFReg:
-      raiseAssert "arkham v1: out of SIMD scratch registers"
-    g.borrowLogF.add result
-  g.bindFTmp(result, bits)                          # typed name ⇒ emFReg emits a symbol
+    g.borrowLogF.add result                         # the chosen reg, or NoFReg (exhausted)
+  if result != NoFReg: g.bindFTmp(result, bits)     # typed name ⇒ emFReg emits a symbol
+
+proc borrowFTmp(g: var CodeGen; bits: int): FReg =
+  ## A SIMD scratch register from the pool, `bindFTmp`'d to a typed `ftmpN.0` name so
+  ## `emFReg` emits a checked symbol. Asserts on exhaustion: callers that use this
+  ## (rather than `tryBorrowFTmp` + a spill path) only ever need one or two transient
+  ## temps whose deep sub-expressions recurse through the now-total `genFBin`, so the
+  ## pool cannot be empty at the borrow point in practice.
+  result = g.tryBorrowFTmp(bits)
+  if result == NoFReg:
+    raiseAssert "arkham a64 v0: out of SIMD scratch registers"
 
 proc giveBackF(g: var CodeGen; f: FReg) =
   g.unbindFTmp(f)                                  # release the scratch binding (if any)
@@ -401,6 +444,19 @@ proc emScalarStackVar(g: var CodeGen; name: string) =
   g.ab.intType(64)
   g.ab.close()
 
+proc emTypedStackVar(g: var CodeGen; name: string; t: Cursor) =
+  ## `(var :name (s) T)` with `T` the value's actual NIFC type. Use this (not the
+  ## generic `(i 64)` slot) for an evicted scalar whose type matters to nifasm — e.g.
+  ## a pointer local that the body later derefs, where an `(i 64)` slot would both
+  ## reject the typed store and forbid the deref (nifasm is strict). Mirrors x64.
+  g.ab.open NifasmDecl.VarD
+  g.ab.symDef name
+  g.ab.keyword SO
+  var tc = t
+  if tc.kind == Symbol: g.ab.sym symName(tc)
+  else: g.genTypeBody(tc)
+  g.ab.close()
+
 proc emScalarLoad(g: var CodeGen; dest: Reg; name: string) =
   ## `dest ← [slot]` — load a spilled scalar (nifasm resolves the `(s)` var to
   ## `[sp,#off]`).
@@ -462,18 +518,123 @@ proc emFloatScalarStore(g: var CodeGen; name: string; src: FReg; bits: int) =
   ## `[slot] ← src` — store to a spilled float's `(s)` var.
   g.ab.tree FstrA64: (g.ab.sym name; g.emFReg(src, bits))
 
-proc pickStaging(g: var CodeGen; avoid: Reg = NoReg): Reg =
-  ## A transient compute register for a spill: the first caller-saved arg register
-  ## (x0–x7) that is not `avoid`, not sealed, not a named local's home, and not a
-  ## live expression accumulator. arkham never register-allocates a *local* to an
-  ## arg register (locals go to x9–x15 / x19–x28); a leaf-proc *param* there is in
-  ## `regLocal`, and a genInto target (the return value x0, or a call argument) is
-  ## in `liveAccums` — so an x0–x7 outside all three holds nothing live and is safe
-  ## to clobber transiently. (The scratch pool x9–x15 is exhausted when this runs.)
+proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg =
+  ## The first caller-saved arg register (x0–x7) that is not `avoid`, not sealed, not
+  ## a named local's home, not a bound scratch temp, and not a live expression
+  ## accumulator. arkham never register-allocates a *local* to an arg register (locals
+  ## go to x9–x15 / x19–x28); a leaf-proc *param* there is in `regLocal`, and a genInto
+  ## target (the return value x0, or a call argument) is in `liveAccums` — so an x0–x7
+  ## outside all three holds nothing live and is safe to clobber transiently. Returns
+  ## `NoReg` when none is free (the genuinely-out-of-registers case). The scan order is
+  ## fixed, so the plan and emit passes return the same register from the same state.
+  ## (The scratch pool x9–x15 is exhausted by the time this runs.)
   for r in IntArgRegs:
     if r != avoid and not g.ra.isSealed(r) and not g.regLocal.hasKey(r) and
-       r notin g.liveAccums: return r
-  raiseAssert "arkham a64: no staging register available for a spill"
+       r notin g.liveAccums and r notin g.boundTemps:
+      return r
+  return NoReg
+
+proc pickStaging(g: var CodeGen; avoid: Reg = NoReg): Reg =
+  ## A transient compute register for a spill (see `pickStagingScratch`).
+  result = g.pickStagingScratch(avoid)
+  if result == NoReg:
+    raiseAssert "arkham a64: no staging register available for a spill"
+
+const FloatStagingCandidates = {F0, F1, F2, F3, F4, F5, F6, F7}
+  ## The SIMD registers `pickFStaging` may hand out as a float spill's transient
+  ## staging reg (v0–v7 — disjoint from the v16–v31 scratch pool). A `genIntoF`
+  ## accumulator that lands in one of these (a float-arg-register target) is an
+  ## in-flight value with no named-local binding, so it is added to `sealedF` for
+  ## its lifetime — the SIMD analogue of `liveAccums` guarding a GPR accumulator.
+
+proc regHoldsLiveFLoc(g: var CodeGen; f: FReg): bool =
+  ## True if a float local/param currently lives in SIMD register `f` (per the
+  ## allocator's view). A leaf-proc float param sits in its incoming arg register
+  ## (v0–v7), so the float staging pick must not clobber it.
+  for name, pos in g.ra.symPos:
+    let loc = g.ra.locs[pos]
+    if loc.kind == InFReg and loc.f == f: return true
+
+proc pickFStaging(g: var CodeGen; avoid: FReg = NoFReg): FReg =
+  ## The float analogue of `pickStagingScratch`: the first SIMD arg register (v0–v7)
+  ## that is not the scratch pool (v16–v31, exhausted by the time we get here), not an
+  ## in-flight float arg / held staging reg (`sealedF`), not a live float local/param
+  ## home, and not `avoid`. Clobbering it transiently is then safe. The scan order is
+  ## fixed, so the plan and emit passes return the same register from the same state.
+  ## `NoFReg` only when every v0–v7 is occupied — the genuinely-out-of-float-regs case.
+  for f in g.md.floatArgRegs:
+    if f != avoid and f notin g.sealedF and not g.regHoldsLiveFLoc(f):
+      return f
+  return NoFReg
+
+# ── codegen-time register steal (evict a live local to a stack slot) ─────────
+# The exact mirror of x64's steal machinery: when the scratch pool is exhausted
+# at a `borrowTmp`, evict a register-bound local to a nifasm `(s)` slot and hand
+# its register over as scratch — recorded in the plan pass, replayed (with the
+# spill store) in the emit pass, keyed by the borrow-log index so both passes
+# stay byte-consistent. `recordEviction` emits no machine code (it only mutates
+# the allocator's view, which `genProc` snapshot/restores); `replayEviction` does.
+
+proc localNameInReg(g: var CodeGen; r: Reg): string =
+  ## The allocator's name (the `symPos` key) of the local currently homed in reg
+  ## `r`, or "". The *allocator* identity — distinct from `regLocal[r]`, the nifasm
+  ## *binding* name, which for a declarative param is the signature alias `pN.0`.
+  for name, pos in g.ra.symPos:
+    if g.ra.locs[pos].kind == InReg and g.ra.locs[pos].r == r: return name
+  result = ""
+
+proc recordEviction(g: var CodeGen; r: Reg): StealEvent =
+  ## Plan-pass: evict the register-local currently in `r` to a fresh stack slot,
+  ## mutating the allocator's view so every later `locationOfSym(victim)` reads the
+  ## slot (`g.ra.locs` is snapshot/restored across the two passes). Returns the event
+  ## for the caller to record. Caller guarantees `regLocal.hasKey(r)`.
+  let bindName = g.regLocal[r]                    # nifasm binding (maybe a pN.0 alias)
+  var victim = g.localNameInReg(r)                # allocator name (symPos key)
+  if victim.len == 0: victim = bindName           # they coincide for a non-param local
+  let typ = g.ra.locationOfSym(victim).typ
+  let slot = "evict" & $g.spillCount & ".0"; inc g.spillCount
+  g.ra.locs[g.ra.symPos[victim]] = namedStackLoc(slot, typ)
+  g.ra.hasStackVars = true
+  g.regLocal.del r
+  result = StealEvent(victim: victim, bindName: bindName, slot: slot, reg: r, typ: typ)
+
+proc replayEviction(g: var CodeGen; ev: StealEvent) =
+  ## Emit-pass: re-apply a recorded eviction — declare the slot, store the victim's
+  ## live value, kill its register binding, repoint its location to the slot. A
+  ## pointer keeps its `(ptr T)` slot type (else nifasm's strict store/reload rejects
+  ## the typed value and a later deref is illegal); other scalars stay `(i 64)`.
+  if g.symType.hasKey(ev.victim) and
+     isPtrType(resolveType(g.prog, g.symType[ev.victim])):
+    var tc = g.symType[ev.victim]
+    g.emTypedStackVar(ev.slot, tc)               # (var :evictN.0 (s) (ptr …))
+  else:
+    g.emScalarStackVar(ev.slot)                  # (var :evictN.0 (s) (i 64))
+  g.emScalarStore(ev.slot, ev.reg)               # store the victim's live (bound) value
+  if g.regLocal.getOrDefault(ev.reg, "") == ev.bindName:
+    g.ab.tree KillA64: g.ab.sym ev.bindName      # release the register binding
+  g.ra.locs[g.ra.symPos[ev.victim]] = namedStackLoc(ev.slot, ev.typ)
+  g.regLocal.del ev.reg
+
+proc stealReg(g: var CodeGen; logIdx: int): Reg =
+  ## `freeTmp` is exhausted. Evict a register-bound local that is *not* in flight
+  ## (not sealed, not a live accumulator, not a bound scratch temp) and hand its
+  ## register over as scratch. Recorded in the plan pass, replayed in the emit pass,
+  ## keyed by `logIdx` so both passes stay byte-consistent. Returns `NoReg` when
+  ## nothing is safe to steal.
+  if g.ab.planning:
+    var vreg = NoReg
+    for r in StealOrder:
+      if g.regLocal.hasKey(r) and r notin g.boundTemps and
+         not g.ra.isSealed(r) and r notin g.liveAccums:
+        vreg = r; break
+    if vreg == NoReg: return NoReg                 # nothing safe to steal
+    g.stealEvents[logIdx] = g.recordEviction(vreg)
+    result = vreg
+  else:
+    if logIdx notin g.stealEvents: return NoReg
+    let ev = g.stealEvents[logIdx]
+    g.replayEviction(ev)
+    result = ev.reg
 
 proc forceReg(g: var CodeGen; dest: var Location) =
   ## Ensure `dest` is in a register, mutating it IN PLACE. An immediate / spilled
@@ -484,13 +645,11 @@ proc forceReg(g: var CodeGen; dest: var Location) =
   case dest.kind
   of InReg: discard
   of Imm:
-    let t = g.tryBorrowTmp()
-    let r = if t == NoReg: g.pickStaging() else: t
-    g.movImm(r, dest.ival); dest = regLoc(r, dest.typ, isTemp = true)
+    let t = g.borrowTmp()                       # total: pool / steal / sealed staging
+    g.movImm(t, dest.ival); dest = regLoc(t, dest.typ, isTemp = true)
   of NamedStack, Mem, Glob, Tvar:
-    let t = g.tryBorrowTmp()
-    let r = if t == NoReg: g.pickStaging() else: t
-    g.emitLoad(dest, r); dest = regLoc(r, dest.typ, isTemp = true)
+    let t = g.borrowTmp()
+    g.emitLoad(dest, t); dest = regLoc(t, dest.typ, isTemp = true)
   else: raiseAssert "arkham: cannot force a value of kind " & $dest.kind & " into a register"
 
 proc freeTemp(g: var CodeGen; loc: Location) {.inline.} =
@@ -1275,14 +1434,52 @@ proc genCast(g: var CodeGen; c: var Cursor; dest: Reg) =
 # register views and single/double instructions. A bare literal has no inherent
 # width, so it adopts the contextual `bits`.
 
+proc spillFOperandAround(g: var CodeGen; c: var Cursor; dest: FReg;
+                         op: A64Inst; bits: int) =
+  ## Pool-exhausted evaluation of genFBin's right operand, keeping float register
+  ## allocation TOTAL — the SIMD mirror of `spillOperandAround`. `a` is already in
+  ## `dest`; spill it to a fresh `(s) (f N)` slot so `dest` is free, evaluate the
+  ## (possibly deep) right operand into `dest` — the recursion reuses `dest`, never
+  ## pinning a SIMD temp per nesting level — then reassemble `dest = a op b` with a
+  ## single transient staging v-register (v0–v7) taken only here, after the recursion
+  ## has fully unwound (so it never nests → one reg covers any depth). Operand order
+  ## a-before-b is preserved and `a op b` is computed (not `b op a`), so this is
+  ## correct for the non-commutative `fsub`/`fdiv` too. `c` is consumed past `b`.
+  let slotA = spillName(g.spillCount); inc g.spillCount
+  g.ra.hasStackVars = true
+  g.emFloatStackVar(slotA, bits)               # (var :spill.N (s) (f N))
+  g.emFloatScalarStore(slotA, dest, bits)      # [slotA] = a  (free dest)
+  g.genIntoF(c, dest, bits)                     # b → dest (recursion reuses dest)
+  let s = g.pickFStaging(avoid = dest)          # transient; recursion done → never nests
+  if s == NoFReg:
+    raiseAssert "arkham a64: no SIMD staging register available for a float spill"
+  g.emFloatScalarLoad(s, slotA, bits)           # s = a (reload)
+  g.fbin(op, s, dest, bits)                      # s = a op b   (correct operand order)
+  g.fmovF(dest, s, bits)                         # dest = a op b
+
 proc genFBin(g: var CodeGen; c: var Cursor; dest: FReg; op: A64Inst; bits: int) =
-  ## `(op (f N) a b)` → `dest = a op b` (fadd/fsub/fmul/fdiv).
+  ## `(op (f N) a b)` → `dest = a op b` (fadd/fsub/fmul/fdiv). `a` goes into `dest`;
+  ## `b` is folded in place (a float local), evaluated into a borrowed SIMD temp, or —
+  ## when the scratch pool is exhausted — spilled via `spillFOperandAround`, which
+  ## keeps allocation total for arbitrarily deep right-nested float expressions.
   c.into:
     skip c                                    # result float type
     g.genIntoF(c, dest, bits)                  # a → dest
-    let fr = g.genFReg(c, bits)                # b → fp temp
-    g.fbin(op, dest, fr.f, bits)
-    g.freeTemp(fr)
+    var inPlace = NoFReg                        # b an in-place float local? fold directly
+    if c.kind == Symbol:
+      let loc = g.ra.locationOfSym(symName(c))
+      if loc.kind == InFReg: inPlace = loc.f
+    if inPlace != NoFReg:
+      g.fbin(op, dest, inPlace, bits)
+      inc c                                    # consume b
+    else:
+      let fr = g.tryBorrowFTmp(bits)            # b → a SIMD scratch temp …
+      if fr == NoFReg:
+        g.spillFOperandAround(c, dest, op, bits)   # … or spill (total)
+      else:
+        g.genIntoF(c, fr, bits)
+        g.fbin(op, dest, fr, bits)
+        g.giveBackF fr
 
 proc genConvToF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
   ## `(conv (f N) Expr)` — produce a `bits`-wide float in `dest`: int→float
@@ -1335,6 +1532,16 @@ proc genFReg(g: var CodeGen; c: var Cursor; bits: int): Location =
 
 proc genIntoF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
   ## Evaluate a `bits`-wide float expression into the SIMD register `dest`.
+  # While `dest` holds the value being built, a deep sub-operand may exhaust the SIMD
+  # scratch pool and spill — its transient `pickFStaging` register must not clobber
+  # `dest`. The v16–v31 pool is never a staging candidate, but a v0–v7 accumulator
+  # (a float-arg-register target) IS and is no named local, so record it in `sealedF`
+  # for the duration. Save/restore via `protect` so a nested `genIntoF` into the same
+  # reg keeps it protected exactly once.
+  let protect = dest in FloatStagingCandidates and dest notin g.sealedF
+  if protect: g.sealedF.incl dest
+  defer:
+    if protect: g.sealedF.excl dest
   case c.kind
   of FloatLit:
     let tmp = g.borrowTmp()                     # materialize the bit pattern via a GPR
@@ -1419,6 +1626,15 @@ proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
   # nested `genInto` into the same reg (SU swap / operandInReg) keeps it protected.
   let protect = dest in {R0..R7} and dest notin g.liveAccums
   if protect: g.liveAccums.incl dest
+  # Protect a register-local *home* (x9–x28) from a codegen-time *steal* during the
+  # build of its own value: the result lands in `dest`, so an initializer/rvalue
+  # whose scratch demand (e.g. an arm64 atomic LL/SC loop) would otherwise evict
+  # `dest` must not — else the final write would target a stale, evicted register.
+  # `liveAccums` only guards arg/return regs; a steal can still evict a callee-saved
+  # home, so seal it here. Save/restore (not unconditional unseal) so a nested
+  # `genInto` into the same reg keeps it sealed.
+  let sealHome = g.regLocal.hasKey(dest) and not g.ra.isSealed(dest)
+  if sealHome: g.ra.seal dest
   case c.kind
   of IntLit:
     g.movImm(dest, intVal(c)); inc c
@@ -1478,6 +1694,7 @@ proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
     else: raiseAssert "arkham v1: expression not supported: " & $c.exprKind
   else:
     raiseAssert "arkham v1: operand not supported: " & $c.kind
+  if sealHome: g.ra.unseal {dest}
   if protect: g.liveAccums.excl dest
 
 proc genAddr(g: var CodeGen; c: var Cursor; dest: Reg) =
@@ -1646,12 +1863,18 @@ proc genCall(g: var CodeGen; c: var Cursor) =
       var idx = 0
       var fidx = 0
       var sealedHere: set[Reg] = {}
+      var sealedFHere: set[FReg] = {}
       while c.hasMore:
         if g.isFloatExpr(c):
-          # A float argument goes in v{fidx}. v0–v7 are disjoint from the GPR
-          # scratch pool (v16–v31), so no sealing is needed to protect it.
+          # A float argument goes in v{fidx}. v0–v7 are disjoint from the GPR scratch
+          # pool (v16–v31), but a *later* float argument that spills (genFBin's
+          # `spillFOperandAround`) takes its transient reload register from v0–v7 via
+          # `pickFStaging` — so seal each marshalled float arg in `sealedF` to keep
+          # that pick from clobbering it (the SIMD analogue of sealing GPR args).
           assert fidx < FloatArgRegs.len, "arkham v1: >8 float args (stack passing TODO)"
-          g.genIntoF(c, FloatArgRegs[fidx], g.floatBits(c))
+          let fr = FloatArgRegs[fidx]
+          g.genIntoF(c, fr, g.floatBits(c))
+          g.sealedF.incl fr; sealedFHere.incl fr
           inc fidx
         elif c.kind == Symbol and g.varType.hasKey(symName(c)):
           let vn = symName(c)
@@ -1689,6 +1912,7 @@ proc genCall(g: var CodeGen; c: var Cursor) =
         g.ab.sym tgt.asmName
         g.ab.keyword (if tgt.extern: ExtcallA64 else: CallA64)
       g.ra.unseal sealedHere
+      g.sealedF = g.sealedF - sealedFHere
 
 # ── statements ──────────────────────────────────────────────────────────────
 
@@ -2813,6 +3037,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.scopeLocals = @[]
   g.fregLocal.clear()                          # per-proc float named-local bindings
   g.boundFTmps = {}
+  g.boundTemps = {}                            # per-proc scratch-temp bindings
   g.scopeFLocals = @[]
   g.ftmpBindCount = 0
   g.spillCount = 0
@@ -2853,11 +3078,17 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   # StrLit case), so no snapshot/restore of those is needed — the emit pass numbers
   # labels exactly as a single pass would.
   let sealedSnapshot = g.ra.sealed
+  # A codegen-time steal evicts a local by mutating `g.ra.locs` mid-walk; snapshot it
+  # so the emit pass starts from the same allocation the plan pass saw and re-applies
+  # the (identically replayed) evictions itself.
+  let locsSnapshot = g.ra.locs
+  g.stealEvents.clear()
   g.borrowLog.setLen 0; g.borrowLogF.setLen 0
   g.borrowIdx = 0; g.borrowIdxF = 0
   g.ab.planning = true
   g.emitProcBody(info)
   g.ab.planning = false
+  g.ra.locs = locsSnapshot                     # undo plan-pass evictions for the emit pass
   # Reset the per-proc emission state the plan pass dirtied, so the emit pass
   # reproduces a single-pass result. (The `ret*`/frame fields were fixed above and
   # stay constant across the two passes.)
@@ -2868,6 +3099,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.scopeLocals = @[]
   g.fregLocal.clear()
   g.boundFTmps = {}
+  g.boundTemps = {}
   g.scopeFLocals = @[]
   g.ftmpBindCount = 0
   g.loopEnds = @[]
