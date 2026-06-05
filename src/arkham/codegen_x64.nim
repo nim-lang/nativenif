@@ -1542,6 +1542,20 @@ proc genAddr(g: var CodeGen; c: var Cursor; dest: var Location) =
 
 # ── conditions / branches ────────────────────────────────────────────────────
 
+proc cmpJccTag(ek: NifcExpr; whenTrue, signed: bool): X64Inst =
+  ## The `jcc` opcode for a NIFC comparison `ek`, taken when the condition is
+  ## `whenTrue`. `signed` selects signed vs unsigned ordering for `<`/`<=`; a float
+  ## compare passes `signed = false`, since `comisd` sets CF/ZF like an unsigned
+  ## compare (so ordered `<`/`<=` map to below / below-or-equal).
+  case ek
+  of EqC:  (if whenTrue: JeX64 else: JneX64)
+  of NeqC: (if whenTrue: JneX64 else: JeX64)
+  of LtC:  (if whenTrue: (if signed: JlX64 else: JbX64)
+            else:        (if signed: JgeX64 else: JaeX64))
+  of LeC:  (if whenTrue: (if signed: JleX64 else: JbeX64)
+            else:        (if signed: JgX64 else: JaX64))
+  else: raiseAssert "arkham x64 v0: condition not supported: " & $ek
+
 proc emitCmpBranch(g: var CodeGen; c: var Cursor; toLabel: string; whenTrue: bool) =
   ## `c` is a comparison `(op a b)` (NO type child): `cmp a, b` then a `jcc` to
   ## `toLabel` when the condition is true/false. Ordering signedness comes from
@@ -1550,17 +1564,11 @@ proc emitCmpBranch(g: var CodeGen; c: var Cursor; toLabel: string; whenTrue: boo
   var tag: X64Inst
   c.into:
     if g.isFloatExpr(c):
-      # `comisd a, b` sets CF/ZF like an unsigned compare, so ordered </<= map to
-      # the below/below-or-equal conditions (NaN makes them spuriously true, but
-      # NIFC's compares assume non-NaN, matching the A64 backend).
+      # `comisd a, b` sets CF/ZF like an unsigned compare (NaN makes </<= spuriously
+      # true, but NIFC's compares assume non-NaN, matching the A64 backend) — so the
+      # tag is the unsigned one (`signed = false`).
       let fbits = g.floatBits(c)
-      tag =
-        case ek
-        of EqC:  (if whenTrue: JeX64 else: JneX64)
-        of NeqC: (if whenTrue: JneX64 else: JeX64)
-        of LtC:  (if whenTrue: JbX64 else: JaeX64)
-        of LeC:  (if whenTrue: JbeX64 else: JaX64)
-        else: raiseAssert "arkham x64 v0: float condition not supported: " & $ek
+      tag = cmpJccTag(ek, whenTrue, signed = false)
       let fa = g.genFReg(c, fbits)
       let fb = g.genFReg(c, fbits)
       let op = if fbits == 32: ComissX64 else: ComisdX64
@@ -1571,15 +1579,7 @@ proc emitCmpBranch(g: var CodeGen; c: var Cursor; toLabel: string; whenTrue: boo
       var signed = true
       if c.kind == Symbol and g.ra.locationOfSym(symName(c)).typ.kind == AUInt:
         signed = false
-      tag =
-        case ek
-        of EqC:  (if whenTrue: JeX64 else: JneX64)
-        of NeqC: (if whenTrue: JneX64 else: JeX64)
-        of LtC:  (if whenTrue: (if signed: JlX64 else: JbX64)
-                  else:        (if signed: JgeX64 else: JaeX64))
-        of LeC:  (if whenTrue: (if signed: JleX64 else: JbeX64)
-                  else:        (if signed: JgX64 else: JaX64))
-        else: raiseAssert "arkham x64 v0: condition not supported: " & $ek
+      tag = cmpJccTag(ek, whenTrue, signed)
       var av = g.genVal(c); g.forceReg(av)        # a must be in a register for cmp
       let ar = av.r
       # `a` is now live in `ar` across `b`'s evaluation; seal it so a scratch
