@@ -96,6 +96,19 @@ type
                                              ## passes so the names replay identically, like
                                              ## `spillCount`.
     scopeLocals*: seq[seq[tuple[name: string, reg: Reg]]]  ## per-scope register locals to `kill`
+    fregLocal*: Table[FReg, string]          ## the SIMD twin of `regLocal`: xmm reg → the
+                                             ## named float local/scratch currently bound to it
+                                             ## (`emFReg` emits the name, not `(xmmN)`). Covers
+                                             ## both float register locals (InFReg, declared via
+                                             ## `emFRegLocalVar`) and scratch temps (`bindFTmp`).
+                                             ## Only the xmm8–15 scratch pool is tracked; the
+                                             ## xmm0–7 arg/return/staging regs stay raw.
+    boundFTmps*: set[FReg]                    ## SIMD twin of `boundTemps`: xmm regs whose
+                                             ## `fregLocal` entry is a transient scratch temp,
+                                             ## released by `unbindFTmp`.
+    ftmpBindCount*: int                       ## per-proc fresh-name counter for float scratch
+                                             ## bindings (`ftmpN.0`); bumped in BOTH passes.
+    scopeFLocals*: seq[seq[tuple[name: string, f: FReg]]]  ## per-scope float register locals to `kill`
     stealEvents*: Table[int, StealEvent]     ## borrow-log index → a codegen-time
                                              ## register steal (evict a live local
                                              ## to a stack slot); recorded in the

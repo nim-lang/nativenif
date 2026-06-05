@@ -175,8 +175,17 @@ proc parseRegister(n: var Cursor): x86.Register =
 proc isXmmTag(n: Cursor): bool {.inline.} =
   n.kind == TagLit and n.tag >= Xmm0TagId and n.tag <= Xmm15TagId
 
+proc isXmmTagEnum(t: TagEnum): bool {.inline.} =
+  t >= Xmm0TagId and t <= Xmm15TagId
+
+proc tagToXmm(t: TagEnum): x86.XmmRegister {.inline.} =
+  x86.XmmRegister(ord(t) - ord(Xmm0TagId))
+
 proc parseXmm(n: var Cursor): x86.XmmRegister =
-  ## Parse an `(xmmN)` SSE register operand (N in 0..15).
+  ## Parse a *raw* `(xmmN)` SSE register operand (N in 0..15). Used only where a
+  ## bare register is required (the `rebind`/`withreg` target). Operand reads in the
+  ## scalar-float instructions go through `parseXmmOperand`, which also accepts a
+  ## bound name and rejects a raw use of a bound register.
   if not isXmmTag(n):
     error("expected xmm register", n)
   result = x86.XmmRegister(ord(n.tag) - ord(Xmm0TagId))
@@ -268,6 +277,16 @@ type
                         # which physical x-register currently hosts which variable name. A
                         # raw `(xN)` use of a bound register is rejected (use the name);
                         # `rebind`/`withreg` (re)bind it, killing the prior tenant.
+    xmmBindings: Table[x86.XmmRegister, string]  # SSE/float counterpart of `regBindings`
+                        # (x64 only): which xmm register currently hosts which float
+                        # variable name. A raw `(xmmN)` use of a bound register is rejected;
+                        # `rebind`/`withreg` with a float type (re)bind it. Reset per proc.
+    a64FRegBindings: Table[arm64.FloatRegister, string]  # SIMD/fp counterpart of
+                        # `a64RegBindings` (arm64 only): which v-register currently hosts
+                        # which float variable name. A raw `(dN)`/`(sN)` use of a bound
+                        # register is rejected; `rebind`/`withreg` with a float type
+                        # (re)bind it. The precision (s/d) is recovered from the bound
+                        # symbol's type. Reset per proc.
     # Dynamic linking
     imports: seq[ImportedLib]  # Imported libraries
     extProcs: seq[ExtProcInfo]  # External procs to bind
@@ -1008,6 +1027,57 @@ proc parseFloatRegisterA64(n: var Cursor): arm64.FloatRegister =
   result = arm64.FloatRegister(ord(n.tag) - base)
   inc n
 
+proc tagToFloatRegA64(t: TagEnum): arm64.FloatRegister {.inline.} =
+  let base = if isA64SingleRegTag(t): ord(S0TagId) else: ord(D0TagId)
+  result = arm64.FloatRegister(ord(t) - base)
+
+proc fpSymReg(ctx: GenContext; n: Cursor): Symbol =
+  ## If `n` is a `Symbol` naming a float local bound to a v-register, return its
+  ## symbol; else nil. Float locals are never foreign, so a plain scope lookup suffices.
+  if n.kind == Symbol:
+    let sym = ctx.scope.lookup(getSym(n))
+    if sym != nil and sym.reg != InvalidTagId and isA64FpRegTag(sym.reg):
+      return sym
+  return nil
+
+proc isA64FpOperand(n: Cursor; ctx: GenContext): bool =
+  ## True if `n` denotes an fp register operand — a raw `(dN)`/`(sN)` tag or a `Symbol`
+  ## naming a float local bound to a v-register. The float handlers dispatch on this
+  ## (reg-vs-mem / fmov direction) so a bound float local emitted as its name is
+  ## recognized as a register operand.
+  isA64FpRegOperand(n) or fpSymReg(ctx, n) != nil
+
+proc isA64FpSingle(n: Cursor; ctx: GenContext): bool =
+  ## Single-precision (`s` view)? For a raw tag, the `(sN)` form; for a bound float
+  ## symbol, the recorded type is `(f 32)`. nifasm reads the operand's precision here
+  ## to choose single- vs double-precision encodings — so a *named* float operand must
+  ## recover it from the binding rather than the (absent) tag.
+  if isA64FpRegOperand(n): return isA64SingleRegTag(n.tag)
+  let sym = fpSymReg(ctx, n)
+  result = sym != nil and sym.typ.kind == FloatT and sym.typ.bits == 32
+
+proc parseFloatOperandA64(n: var Cursor; ctx: var GenContext): arm64.FloatRegister =
+  ## Binding-aware fp register *operand*: a raw `(dN)`/`(sN)` tag is accepted only if
+  ## the register is not bound (a bound register must be named so the binding checker
+  ## sees the use); a `Symbol` is resolved to the v-register its float local is bound
+  ## to. The SIMD twin of `parseGprA64` — turns a raw use of a still-live bound float
+  ## register into a build error instead of a silent clobber.
+  if isA64FpRegOperand(n):
+    result = tagToFloatRegA64(n.tag)
+    if result in ctx.a64FRegBindings:
+      error("Register " & $result & " is bound to variable '" &
+            ctx.a64FRegBindings[result] & "', use the variable name instead", n)
+    inc n
+  elif n.kind == Symbol:
+    let sym = lookupWithAutoImport(ctx, ctx.scope, getSym(n), n)
+    if sym == nil: error("Unknown symbol: " & getSym(n), n)
+    if sym.reg == InvalidTagId or not isA64FpRegTag(sym.reg):
+      error("Expected float register variable, got: " & getSym(n), n)
+    result = tagToFloatRegA64(sym.reg)
+    inc n
+  else:
+    error("Expected fp register (dN/sN) or float variable", n)
+
 
 type
   OperandA64 = object
@@ -1698,7 +1768,10 @@ proc genKillA64(n: var Cursor; ctx: var GenContext) =
   if sym.typ.isOnStack:
     ctx.slots.killSlot(sym.offset, sym.typ)
   elif sym.reg != InvalidTagId:
-    ctx.a64RegBindings.del(tagToRegisterA64(sym.reg, n))
+    if isA64FpRegTag(sym.reg):
+      ctx.a64FRegBindings.del(tagToFloatRegA64(sym.reg))
+    else:
+      ctx.a64RegBindings.del(tagToRegisterA64(sym.reg, n))
   ctx.scope.undefine(name)
   inc n
 
@@ -1717,20 +1790,43 @@ proc bindRegA64(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
   ctx.a64RegBindings[reg] = name
   ctx.scope.define(sym)
 
+proc bindFRegA64(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
+                 reg: arm64.FloatRegister) =
+  ## The SIMD twin of `bindRegA64`: bind v-register `reg` to the typed float name
+  ## `name`, killing its prior tenant first. The binding's type carries the precision
+  ## (`(f 32)`/`(f 64)`) so a *named* use recovers s/d. Used for float register locals
+  ## and float scratch temps.
+  if reg in ctx.a64FRegBindings:
+    ctx.scope.undefine(ctx.a64FRegBindings[reg])
+    ctx.a64FRegBindings.del(reg)
+  let sym = Symbol(name: name, kind: skVar, typ: typ)
+  sym.reg = regTag
+  ctx.a64FRegBindings[reg] = name
+  ctx.scope.define(sym)
+
 proc parseRebindHeaderA64(n: var Cursor; ctx: var GenContext):
-                          tuple[name: string; reg: arm64.Register] =
+                          tuple[name: string; isFp: bool; reg: arm64.Register;
+                                freg: arm64.FloatRegister] =
   ## Parse `:name TYPE (reg)` (cursor past the rebind/withreg tag, inside the node)
-  ## and establish the binding. Shared by `rebind` and `withreg`.
+  ## and establish the binding. Shared by `rebind` and `withreg`. The register may be
+  ## a GPR (`(xN)`) or — for a float binding — a v-register (`(dN)`/`(sN)`).
   if n.kind != SymbolDef: error("Expected name for rebind/withreg", n)
   let name = symName(n); inc n
   let typ = parseType(n, ctx.scope, ctx)
-  if n.kind != TagLit or not rawTagIsA64Reg(n.tag):
+  if isA64FpRegOperand(n):
+    let regTag = n.tag
+    let freg = tagToFloatRegA64(regTag)
+    inc n
+    bindFRegA64(ctx, name, typ, regTag, freg)
+    result = (name, true, arm64.Register(0), freg)
+  elif n.kind == TagLit and rawTagIsA64Reg(n.tag):
+    let regTag = n.tag
+    let reg = tagToRegisterA64(regTag, n)
+    inc n
+    bindRegA64(ctx, name, typ, regTag, reg)
+    result = (name, false, reg, arm64.FloatRegister(0))
+  else:
     error("Expected a register for rebind/withreg", n)
-  let regTag = n.tag
-  let reg = tagToRegisterA64(regTag, n)
-  inc n
-  bindRegA64(ctx, name, typ, regTag, reg)
-  result = (name, reg)
 
 proc genRebindA64(n: var Cursor; ctx: var GenContext) =
   ## `(rebind :name TYPE (reg))` — bind `reg` to `name`, killing its prior tenant. The
@@ -1745,7 +1841,10 @@ proc genWithregA64(n: var Cursor; ctx: var GenContext) =
   into n:
     let h = parseRebindHeaderA64(n, ctx)
     while n.hasMore: genInstA64(n, ctx)
-    if ctx.a64RegBindings.getOrDefault(h.reg, "") == h.name:
+    if h.isFp:
+      if ctx.a64FRegBindings.getOrDefault(h.freg, "") == h.name:
+        ctx.a64FRegBindings.del(h.freg)
+    elif ctx.a64RegBindings.getOrDefault(h.reg, "") == h.name:
       ctx.a64RegBindings.del(h.reg)
     ctx.scope.undefine(h.name)
 
@@ -2271,24 +2370,24 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     # (fmov D S): D=fp,S=fp → reg copy; D=fp,S=gpr / D=gpr,S=fp → bit move.
     # The size (s/d) comes from whichever operand is an fp register.
     inc n
-    if isA64FpRegOperand(n):
-      let single = isA64SingleOperand(n)
-      let rd = parseFloatRegisterA64(n)
-      if isA64FpRegOperand(n):
-        arm64.emitFmov(ctx.buf.data, rd, parseFloatRegisterA64(n), single)
+    if isA64FpOperand(n, ctx):
+      let single = isA64FpSingle(n, ctx)
+      let rd = parseFloatOperandA64(n, ctx)
+      if isA64FpOperand(n, ctx):
+        arm64.emitFmov(ctx.buf.data, rd, parseFloatOperandA64(n, ctx), single)
       else:
         arm64.emitFmovFromGpr(ctx.buf.data, rd, parseRegisterA64(n), single)
     else:
       let rd = parseRegisterA64(n)
-      let single = isA64SingleOperand(n)
-      arm64.emitFmovToGpr(ctx.buf.data, rd, parseFloatRegisterA64(n), single)
+      let single = isA64FpSingle(n, ctx)
+      arm64.emitFmovToGpr(ctx.buf.data, rd, parseFloatOperandA64(n, ctx), single)
 
   of FaddA64, FsubA64, FmulA64, FdivA64:
     # (fop D S) → D = D op S  (emitted as `fop Dd, Dd, Ds`).
     inc n
-    let single = isA64SingleOperand(n)
-    let rd = parseFloatRegisterA64(n)
-    let rs = parseFloatRegisterA64(n)
+    let single = isA64FpSingle(n, ctx)
+    let rd = parseFloatOperandA64(n, ctx)
+    let rs = parseFloatOperandA64(n, ctx)
     case instTag
     of FaddA64: arm64.emitFadd(ctx.buf.data, rd, rd, rs, single)
     of FsubA64: arm64.emitFsub(ctx.buf.data, rd, rd, rs, single)
@@ -2297,22 +2396,22 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
 
   of FnegA64:
     inc n
-    let single = isA64SingleOperand(n)
-    let rd = parseFloatRegisterA64(n)
+    let single = isA64FpSingle(n, ctx)
+    let rd = parseFloatOperandA64(n, ctx)
     arm64.emitFneg(ctx.buf.data, rd, rd, single)
 
   of FcmpA64:
     inc n
-    let single = isA64SingleOperand(n)
-    let rn = parseFloatRegisterA64(n)
-    let rm = parseFloatRegisterA64(n)
+    let single = isA64FpSingle(n, ctx)
+    let rn = parseFloatOperandA64(n, ctx)
+    let rm = parseFloatOperandA64(n, ctx)
     arm64.emitFcmp(ctx.buf.data, rn, rm, single)
 
   of FldrA64:
     # (fldr D <mem>) — load a double/single.
     inc n
-    let single = isA64SingleOperand(n)
-    let rt = parseFloatRegisterA64(n)
+    let single = isA64FpSingle(n, ctx)
+    let rt = parseFloatOperandA64(n, ctx)
     let op = parseOperandA64(n, ctx)
     if op.kind != okMem: error("FLDR source must be memory", n)
     arm64.emitFldr(ctx.buf.data, rt, op.mem.base, op.mem.offset, single)
@@ -2322,15 +2421,15 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseOperandA64(n, ctx)
     if dest.kind != okMem: error("FSTR destination must be memory", n)
-    let single = isA64SingleOperand(n)
-    let rt = parseFloatRegisterA64(n)
+    let single = isA64FpSingle(n, ctx)
+    let rt = parseFloatOperandA64(n, ctx)
     arm64.emitFstr(ctx.buf.data, rt, dest.mem.base, dest.mem.offset, single)
 
   of ScvtfA64, UcvtfA64:
     # (scvtf Dfp Sgpr) — int → double/single.
     inc n
-    let single = isA64SingleOperand(n)
-    let rd = parseFloatRegisterA64(n)
+    let single = isA64FpSingle(n, ctx)
+    let rd = parseFloatOperandA64(n, ctx)
     let rn = parseRegisterA64(n)
     if instTag == ScvtfA64: arm64.emitScvtf(ctx.buf.data, rd, rn, single)
     else:                   arm64.emitUcvtf(ctx.buf.data, rd, rn, single)
@@ -2339,17 +2438,17 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     # (fcvtzs Dgpr Sfp) — double/single → int (toward zero).
     inc n
     let rd = parseRegisterA64(n)
-    let single = isA64SingleOperand(n)
-    let rn = parseFloatRegisterA64(n)
+    let single = isA64FpSingle(n, ctx)
+    let rn = parseFloatOperandA64(n, ctx)
     if instTag == FcvtzsA64: arm64.emitFcvtzs(ctx.buf.data, rd, rn, single)
     else:                    arm64.emitFcvtzu(ctx.buf.data, rd, rn, single)
 
   of FcvtA64:
     # (fcvt Ddst Ssrc) — precision convert; direction from the operand sizes.
     inc n
-    let dstSingle = isA64SingleOperand(n)
-    let rd = parseFloatRegisterA64(n)
-    let rn = parseFloatRegisterA64(n)
+    let dstSingle = isA64FpSingle(n, ctx)
+    let rd = parseFloatOperandA64(n, ctx)
+    let rn = parseFloatOperandA64(n, ctx)
     if dstSingle: arm64.emitFcvtToSingle(ctx.buf.data, rd, rn)  # double → single
     else:         arm64.emitFcvtToDouble(ctx.buf.data, rd, rn)  # single → double
 
@@ -2520,6 +2619,8 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
     # Clear register bindings at the start of each proc
     ctx.regBindings = initTable[x86.Register, string]()
     ctx.a64RegBindings = initTable[arm64.Register, string]()
+    ctx.xmmBindings = initTable[x86.XmmRegister, string]()
+    ctx.a64FRegBindings = initTable[arm64.FloatRegister, string]()
     # Each proc is a fresh control flow: no registers are clobbered on entry.
     # (Matters now that proc bodies are emitted back-to-back when bundling.)
     ctx.clobbered = {}
@@ -3193,6 +3294,40 @@ proc checkFloatType(t: Type; op: string; n: Cursor) =
   if not isFloatType(t):
     error("Operation '" & op & "' requires floating point type, got " & $t, n)
 
+proc isXmmOperand(n: Cursor; ctx: GenContext): bool =
+  ## True if `n` denotes an xmm register operand — a raw `(xmmN)` tag or a `Symbol`
+  ## naming a float local bound to an xmm register. The float instruction handlers
+  ## dispatch on this (reg form vs memory form / movfq direction) so a bound float
+  ## local, emitted as its name, is recognized as a register operand.
+  if isXmmTag(n): return true
+  if n.kind == Symbol:
+    let sym = ctx.scope.lookup(getSym(n))   # float locals are never foreign
+    result = sym != nil and sym.reg != InvalidTagId and isXmmTagEnum(sym.reg)
+
+proc parseXmmOperand(n: var Cursor; ctx: var GenContext): x86.XmmRegister =
+  ## Parse an SSE register *operand* in a scalar-float instruction. The SIMD twin
+  ## of `parseOperand`'s register arm: a raw `(xmmN)` tag is accepted only if the
+  ## register is not bound (a bound register must be named, so the binding checker
+  ## sees the use); a `Symbol` is resolved to the xmm register its float local is
+  ## bound to. This is how a raw use of a value still live in a bound xmm register
+  ## becomes a build error instead of a silent clobber.
+  if isXmmTag(n):
+    result = tagToXmm(n.tag)
+    if result in ctx.xmmBindings:
+      error("Register " & $result & " is bound to variable '" &
+            ctx.xmmBindings[result] & "', use the variable name instead", n)
+    inc n
+  elif n.kind == Symbol:
+    let sym = lookupWithAutoImport(ctx, ctx.scope, getSym(n), n)
+    if sym == nil:
+      error("Unknown symbol: " & getSym(n), n)
+    if sym.reg == InvalidTagId or not isXmmTagEnum(sym.reg):
+      error("Expected float register variable, got: " & getSym(n), n)
+    result = tagToXmm(sym.reg)
+    inc n
+  else:
+    error("expected xmm register or float variable", n)
+
 proc checkBitwiseType(t: Type; op: string; n: Cursor) =
   if not canDoBitwiseOps(t):
     error("Operation '" & op & "' requires integer type, got " & $t, n)
@@ -3577,8 +3712,10 @@ proc genKillX64(n: var Cursor; ctx: var GenContext) =
     ctx.slots.killSlot(sym.offset, sym.typ)
   elif sym.reg != InvalidTagId:
     # Remove register binding when variable is killed
-    let targetReg = tagToRegister(sym.reg, n)
-    ctx.regBindings.del(targetReg)
+    if isXmmTagEnum(sym.reg):
+      ctx.xmmBindings.del(tagToXmm(sym.reg))
+    else:
+      ctx.regBindings.del(tagToRegister(sym.reg, n))
 
   # Remove from scope to ensure it's not used again
   ctx.scope.undefine(name)
@@ -3611,19 +3748,41 @@ proc bindRegX64(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
   ctx.regBindings[reg] = name
   ctx.scope.define(sym)
 
+proc bindXmmX64(ctx: var GenContext; name: string; typ: Type; xmmTag: TagEnum;
+                xmm: x86.XmmRegister) =
+  ## The SIMD twin of `bindRegX64`: bind xmm register `xmm` to the typed float name
+  ## `name`, killing its prior tenant first. Used for float register locals and
+  ## float scratch temps.
+  if xmm in ctx.xmmBindings:
+    ctx.scope.undefine(ctx.xmmBindings[xmm])
+    ctx.xmmBindings.del(xmm)
+  let sym = Symbol(name: name, kind: skVar, typ: typ)
+  sym.reg = xmmTag
+  ctx.xmmBindings[xmm] = name
+  ctx.scope.define(sym)
+
 proc parseRebindHeader(n: var Cursor; ctx: var GenContext):
-                       tuple[name: string; typ: Type; regTag: TagEnum; reg: x86.Register] =
+                       tuple[name: string; typ: Type; isXmm: bool;
+                             regTag: TagEnum; reg: x86.Register; xmm: x86.XmmRegister] =
   ## Parse `:name TYPE (reg)` (the cursor is past the rebind/withreg tag, inside the
-  ## node) and establish the binding. Shared by `rebind` and `withreg`.
+  ## node) and establish the binding. Shared by `rebind` and `withreg`. The register
+  ## may be a GPR (`(rN)`) or — for a float binding — an xmm register (`(xmmN)`).
   if n.kind != SymbolDef: error("Expected name for rebind/withreg", n)
   result.name = symName(n); inc n
   result.typ = parseType(n, ctx.scope, ctx)
-  if n.kind != TagLit or not rawTagIsX64Reg(n.tag):
+  if isXmmTag(n):
+    result.isXmm = true
+    result.regTag = n.tag
+    result.xmm = tagToXmm(result.regTag)
+    inc n
+    bindXmmX64(ctx, result.name, result.typ, result.regTag, result.xmm)
+  elif n.kind == TagLit and rawTagIsX64Reg(n.tag):
+    result.regTag = n.tag
+    result.reg = tagToRegister(result.regTag, n)
+    inc n
+    bindRegX64(ctx, result.name, result.typ, result.regTag, result.reg)
+  else:
     error("Expected a register for rebind/withreg", n)
-  result.regTag = n.tag
-  result.reg = tagToRegister(result.regTag, n)
-  inc n
-  bindRegX64(ctx, result.name, result.typ, result.regTag, result.reg)
 
 proc genRebindX64(n: var Cursor; ctx: var GenContext) =
   ## `(rebind :name TYPE (reg))` — bind `reg` to `name`, killing its prior tenant.
@@ -3639,7 +3798,10 @@ proc genWithregX64(n: var Cursor; ctx: var GenContext) =
   into n:
     let h = parseRebindHeader(n, ctx)
     while n.hasMore: genInstX64(n, ctx)
-    if ctx.regBindings.getOrDefault(h.reg, "") == h.name:
+    if h.isXmm:
+      if ctx.xmmBindings.getOrDefault(h.xmm, "") == h.name:
+        ctx.xmmBindings.del(h.xmm)
+    elif ctx.regBindings.getOrDefault(h.reg, "") == h.name:
       ctx.regBindings.del(h.reg)
     ctx.scope.undefine(h.name)
 
@@ -4542,10 +4704,10 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     #   (movsd (mem …) (xmmS))  store
     let isD = instTag == MovsdX64
     inc n
-    if isXmmTag(n):
-      let d = parseXmm(n)
-      if isXmmTag(n):
-        let s = parseXmm(n)
+    if isXmmOperand(n, ctx):
+      let d = parseXmmOperand(n, ctx)
+      if isXmmOperand(n, ctx):
+        let s = parseXmmOperand(n, ctx)
         if isD: x86.emitMovsd(ctx.buf.data, d, s)
         else:   x86.emitMovss(ctx.buf.data, d, s)
       else:
@@ -4556,7 +4718,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     else:
       let d = parseOperand(n, ctx)
       if d.kind != okMem: error("movsd/movss destination must be xmm or memory", n)
-      let s = parseXmm(n)
+      let s = parseXmmOperand(n, ctx)
       if isD: x86.emitMovsdStore(ctx.buf.data, d.mem, s)
       else:   x86.emitMovssStore(ctx.buf.data, d.mem, s)
 
@@ -4567,8 +4729,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # (or just sets EFLAGS for comisd/comiss).
     let it = instTag
     inc n
-    let d = parseXmm(n)
-    let s = parseXmm(n)
+    let d = parseXmmOperand(n, ctx)
+    let s = parseXmmOperand(n, ctx)
     case it
     of AddsdX64:   x86.emitAddsd(ctx.buf.data, d, s)
     of AddssX64:   x86.emitAddss(ctx.buf.data, d, s)
@@ -4588,7 +4750,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # int -> float: `(cvtsi2sd (xmmD) gprS)`; the GPR source may be a named local.
     let it = instTag
     inc n
-    let d = parseXmm(n)
+    let d = parseXmmOperand(n, ctx)
     let s = parseOperand(n, ctx).reg
     if it == Cvtsi2sdX64: x86.emitCvtsi2sd(ctx.buf.data, d, s)
     else:                 x86.emitCvtsi2ss(ctx.buf.data, d, s)
@@ -4598,7 +4760,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let it = instTag
     inc n
     let d = parseDest(n, ctx).reg
-    let s = parseXmm(n)
+    let s = parseXmmOperand(n, ctx)
     if it == Cvttsd2siX64: x86.emitCvttsd2si(ctx.buf.data, d, s)
     else:                  x86.emitCvttss2si(ctx.buf.data, d, s)
 
@@ -4608,14 +4770,14 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # side may be a raw register or a named local.
     let it = instTag
     inc n
-    if isXmmTag(n):
-      let d = parseXmm(n)
+    if isXmmOperand(n, ctx):
+      let d = parseXmmOperand(n, ctx)
       let s = parseOperand(n, ctx).reg
       if it == MovfqX64: x86.emitMovqGprToXmm(ctx.buf.data, d, s)
       else:              x86.emitMovdGprToXmm(ctx.buf.data, d, s)
     else:
       let d = parseDest(n, ctx).reg
-      let s = parseXmm(n)
+      let s = parseXmmOperand(n, ctx)
       if it == MovfqX64: x86.emitMovqXmmToGpr(ctx.buf.data, d, s)
       else:              x86.emitMovdXmmToGpr(ctx.buf.data, d, s)
 

@@ -244,23 +244,65 @@ proc wantReg(g: var CodeGen; dest: var Location): Reg =
 
 const FloatRet = F0    # xmm0: SysV scalar-float return + first float argument
 
-proc emFReg(g: var CodeGen; f: FReg) {.inline.} = g.ab.xmmReg f
+proc bindFTmp(g: var CodeGen; f: FReg)
+proc unbindFTmp(g: var CodeGen; f: FReg)
+
+proc emFReg(g: var CodeGen; f: FReg) {.inline.} =
+  ## A float value register operand. If `f` currently hosts a named float local /
+  ## scratch temp, emit its *name* (a typed symbol nifasm checks); otherwise the raw
+  ## `(xmmN)` tag. The SIMD twin of `emReg`: the xmm8–15 scratch pool is the only
+  ## register class the allocator hands out for arbitrary computed floats, and every
+  ## such hand-out — pool temp (`bindFTmp`) and register-local (`emFRegLocalVar`) —
+  ## is bound, so a *raw* pool register reaching here is an unbound scratch slipping
+  ## past the binder. The xmm0–7 arg/return/staging registers have structural raw
+  ## uses (ABI float args, the float return, a spill's transient `pickFStaging`).
+  if g.fregLocal.hasKey(f): g.ab.sym g.fregLocal[f]
+  else:
+    assert f notin g.md.floatTempRegs,
+      "arkham x64: unbound float scratch-pool register reached emFReg: xmm" & $ord(f)
+    g.ab.xmmReg f
+
+proc bindFTmp(g: var CodeGen; f: FReg) =
+  ## Give scratch xmm register `f` a typed nifasm name `ftmpN.0` via `(rebind …)`, so
+  ## every later `emFReg f` emits a checked symbol the binding checker sees rather than
+  ## a raw `(xmmN)`. The SIMD twin of `bindTemp`: the name counter bumps in BOTH passes
+  ## (names replay identically) and the `(rebind …)` tree auto-no-ops in the plan pass.
+  ## The precision is a generic `(f 64)` — the operand carries no width to nifasm (the
+  ## instruction tag selects movss/movsd), so the binding type is just a placeholder.
+  let name = "ftmp" & $g.ftmpBindCount & ".0"; inc g.ftmpBindCount
+  g.ab.tree RebindX64:
+    g.ab.symDef name
+    g.ab.floatType(64)
+    g.ab.xmmReg f
+  g.fregLocal[f] = name
+  g.boundFTmps.incl f
+
+proc unbindFTmp(g: var CodeGen; f: FReg) =
+  ## Release a scratch binding made by `bindFTmp`: `(kill)` the name and drop the
+  ## `fregLocal`/`boundFTmps` entries. A no-op when `f` carries no temp binding.
+  if f in g.boundFTmps:
+    g.ab.tree KillX64: g.ab.sym g.fregLocal[f]
+    g.fregLocal.del f
+    g.boundFTmps.excl f
 
 proc tryBorrowFTmp(g: var CodeGen): FReg =
   ## Like `borrowFTmp` but returns `NoFReg` when the SIMD scratch pool is
   ## exhausted (instead of failing), so the caller can spill to a float stack
   ## slot — the float analogue of `tryBorrowTmp`. The reg-or-`NoFReg` outcome is
-  ## recorded/replayed through `borrowLogF` like any borrow decision.
+  ## recorded/replayed through `borrowLogF` like any borrow decision. A real register
+  ## is `bindFTmp`'d to a typed name so `emFReg` emits a checked symbol; the caller
+  ## releases it via `giveBackF`.
+  result = NoFReg
   if not g.ab.planning:                          # emit pass: replay the planned decision
     result = g.borrowLogF[g.borrowIdxF]; inc g.borrowIdxF
-    return
-  for f in g.md.floatTempRegs:                    # plan pass: real pool allocation
-    if f in g.freeFTmp:
-      excl g.freeFTmp, f
-      g.borrowLogF.add f
-      return f
-  g.borrowLogF.add NoFReg                         # exhausted → caller spills (cannot fail)
-  result = NoFReg
+  else:
+    for f in g.md.floatTempRegs:                  # plan pass: real pool allocation
+      if f in g.freeFTmp:
+        excl g.freeFTmp, f
+        result = f
+        break
+    g.borrowLogF.add result                       # the chosen reg, or NoFReg (exhausted)
+  if result != NoFReg: g.bindFTmp(result)         # typed name ⇒ emFReg emits a symbol
 
 proc borrowFTmp(g: var CodeGen): FReg =
   ## A SIMD scratch register from the pool. Asserts on exhaustion: callers that
@@ -272,6 +314,7 @@ proc borrowFTmp(g: var CodeGen): FReg =
     raiseAssert "arkham x64 v0: out of SIMD scratch registers"
 
 proc giveBackF(g: var CodeGen; f: FReg) {.inline.} =
+  g.unbindFTmp(f)                                 # release the scratch binding (if any)
   if f in g.md.floatTempRegs: g.freeFTmp.incl f
 
 proc fmovF(g: var CodeGen; d, s: FReg; bits: int) =                # movss/movsd d, s
@@ -438,7 +481,23 @@ proc emRegLocalVar(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   g.freeTmp.excl r                               # a local's home is no longer scratch
   g.scopeLocals[^1].add (name: name, reg: r)
 
-proc enterScope(g: var CodeGen) = g.scopeLocals.add @[]
+proc emFRegLocalVar(g: var CodeGen; name: string; f: FReg; bits: int) =
+  ## Declare a float register local: bind xmm `f` to `name` via `(rebind …)` for the
+  ## rest of its scope, so subsequent uses emit the typed name instead of `(xmmN)`.
+  ## The SIMD twin of `emRegLocalVar`. `rebind` kills `f`'s prior tenant itself (an
+  ## earlier, now-dead local the allocator reassigned the register to), so no manual
+  ## kill is needed first.
+  g.ab.tree RebindX64:
+    g.ab.symDef name
+    g.ab.floatType(bits)
+    g.ab.xmmReg f
+  g.fregLocal[f] = name
+  g.freeFTmp.excl f                              # a local's home is no longer scratch
+  g.scopeFLocals[^1].add (name: name, f: f)
+
+proc enterScope(g: var CodeGen) =
+  g.scopeLocals.add @[]
+  g.scopeFLocals.add @[]
 
 proc exitScope(g: var CodeGen) =
   ## `kill` each register local declared in the closing scope so the allocator's
@@ -449,6 +508,10 @@ proc exitScope(g: var CodeGen) =
     if g.regLocal.getOrDefault(it.reg, "") == it.name:
       g.ab.tree KillX64: g.ab.sym it.name
       g.regLocal.del it.reg
+  for it in g.scopeFLocals.pop():
+    if g.fregLocal.getOrDefault(it.f, "") == it.name:
+      g.ab.tree KillX64: g.ab.sym it.name
+      g.fregLocal.del it.f
 
 # ── stack-slot declarations + memory operands (x86 addressing) ───────────────
 # nifasm keeps field names / element types, so a memory operand stays symbolic:
@@ -2513,6 +2576,7 @@ proc genVarDecl(g: var CodeGen; c: var Cursor) =
       if c.hasMore and c.kind != DotToken:
         var d = loc; g.gen(c, d)              # init value → the local's register
     of InFReg:                                # float local in an xmm register
+      g.emFRegLocalVar(name, loc.f, loc.typ.size * 8)  # (rebind :name (f bits) (xmmN))
       if c.hasMore and c.kind != DotToken:
         var d = loc; g.gen(c, d)
     of NamedStack:
@@ -3201,8 +3265,12 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.regLocal.clear()                          # per-proc named-local bindings
   g.boundTemps = {}                           # per-proc scratch-temp bindings
   g.scopeLocals = @[]
+  g.fregLocal.clear()                         # per-proc float named-local bindings
+  g.boundFTmps = {}
+  g.scopeFLocals = @[]
   g.spillCount = 0
   g.tmpBindCount = 0
+  g.ftmpBindCount = 0
   # Aggregate return convention (before allocation): a named object ≤16B → rax:rdx;
   # >16B → a hidden pointer the caller passes in rdi, parked in a callee-saved reg
   # (rbx) for the proc's lifetime and written through on `ret`.
@@ -3255,12 +3323,16 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.regLocal.clear()
   g.boundTemps = {}
   g.scopeLocals = @[]
+  g.fregLocal.clear()
+  g.boundFTmps = {}
+  g.scopeFLocals = @[]
   g.loopEnds = @[]
   g.initFreeTmp()
   g.borrowIdx = 0; g.borrowIdxF = 0
   g.fixedEvictSeq = 0                          # replay the same eviction sequence
   g.spillCount = 0
   g.tmpBindCount = 0
+  g.ftmpBindCount = 0
   g.emitProcBody(info, declarative)            # emit for real, replaying the plan
 
 proc genGlobal(g: var CodeGen; name: string; decl: Cursor) =

@@ -1,0 +1,15 @@
+(.nif27)
+(.index)
+(stmts
+ (proc :test_xmm_raw_bound.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (rebind :f.0
+    (f 64)
+    (xmm8))
+   (addsd
+    (xmm8)
+    (xmm8))
+   (ret))))(.index)

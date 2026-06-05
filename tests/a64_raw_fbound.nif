@@ -1,0 +1,16 @@
+(.nif27)
+(.index)
+(stmts
+ (arch arm64)
+ (proc :test_a64_raw_fbound.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (rebind :f.0
+    (f 64)
+    (d8))
+   (fadd
+    (d8)
+    (d8))
+   (ret))))(.index)

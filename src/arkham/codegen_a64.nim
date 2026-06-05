@@ -221,23 +221,67 @@ proc giveBack(g: var CodeGen; r: Reg) =
 
 # ── SIMD/FP scratch pool + emit helpers (double precision) ──────────────────
 
-proc borrowFTmp(g: var CodeGen): FReg =
+proc bindFTmp(g: var CodeGen; f: FReg; bits: int) =
+  ## Give scratch v-register `f` a typed nifasm name `ftmpN.0` via `(rebind …)`, so
+  ## every later `emFReg f` emits a checked symbol the binding checker sees rather than
+  ## a raw `(dN)`/`(sN)`. The SIMD twin of `bindTemp`; the name counter bumps in BOTH
+  ## passes (names replay identically) and the `(rebind …)` tree auto-no-ops in the plan
+  ## pass. The binding type `(f bits)` carries the precision so a *named* use recovers
+  ## s/d (unlike x64, the arm64 operand encodes precision).
+  let name = "ftmp" & $g.ftmpBindCount & ".0"; inc g.ftmpBindCount
+  g.ab.tree RebindA64:
+    g.ab.symDef name
+    g.ab.floatType(bits)
+    g.ab.freg(f, bits)
+  g.fregLocal[f] = name
+  g.boundFTmps.incl f
+
+proc unbindFTmp(g: var CodeGen; f: FReg) =
+  ## Release a scratch binding made by `bindFTmp`: `(kill)` the name and drop the
+  ## `fregLocal`/`boundFTmps` entries. A no-op when `f` carries no temp binding.
+  if f in g.boundFTmps:
+    g.ab.tree KillA64: g.ab.sym g.fregLocal[f]
+    g.fregLocal.del f
+    g.boundFTmps.excl f
+
+proc borrowFTmp(g: var CodeGen; bits: int): FReg =
+  ## A SIMD scratch register from the pool, `bindFTmp`'d to a typed `ftmpN.0` name so
+  ## `emFReg` emits a checked symbol. `bits` is the value's precision (for the binding
+  ## type). Released via `giveBackF`. (16 FP temps; spill-on-exhaustion is a TODO.)
+  result = NoFReg
   if not g.ab.planning:                            # emit pass: replay the planned decision
     result = g.borrowLogF[g.borrowIdxF]; inc g.borrowIdxF
-    return
-  for f in g.md.floatTempRegs:                      # plan pass: real pool allocation
-    if f in g.freeFTmp:
-      excl g.freeFTmp, f
-      g.borrowLogF.add f
-      return f
-  raiseAssert "arkham v1: out of SIMD scratch registers"  # 16 FP temps: spill is a TODO
+  else:
+    for f in g.md.floatTempRegs:                    # plan pass: real pool allocation
+      if f in g.freeFTmp:
+        excl g.freeFTmp, f
+        result = f
+        break
+    if result == NoFReg:
+      raiseAssert "arkham v1: out of SIMD scratch registers"
+    g.borrowLogF.add result
+  g.bindFTmp(result, bits)                          # typed name ⇒ emFReg emits a symbol
 
 proc giveBackF(g: var CodeGen; f: FReg) =
+  g.unbindFTmp(f)                                  # release the scratch binding (if any)
   if f in g.md.floatTempRegs: g.freeFTmp.incl f
 
 # `bits` (32 or 64) selects the s/d register view; nifasm reads the operand tag
 # to pick single- vs double-precision encodings.
-proc emFReg(g: var CodeGen; f: FReg; bits: int) {.inline.} = g.ab.freg(f, bits)
+proc emFReg(g: var CodeGen; f: FReg; bits: int) {.inline.} =
+  ## A float value operand: a v-register hosting a named float local / scratch temp →
+  ## its checked name (nifasm recovers the precision from the binding's type);
+  ## otherwise the raw `(dN)`/`(sN)` tag. The SIMD twin of `emReg`: the v16–v31 scratch
+  ## pool is the only register class the allocator hands out for arbitrary computed
+  ## floats, and every such hand-out is bound (`bindFTmp` / `emFRegLocalVar`), so a raw
+  ## pool register reaching here is an unbound scratch slipping past the binder. The
+  ## v0–v7 arg/return registers and v8–v15 callee-saved homes (saved raw by fstp/fldp)
+  ## keep their structural raw uses.
+  if g.fregLocal.hasKey(f): g.ab.sym g.fregLocal[f]
+  else:
+    assert f notin g.md.floatTempRegs,
+      "arkham a64: unbound float scratch-pool register reached emFReg: " & regName(f)
+    g.ab.freg(f, bits)
 
 proc fmovF(g: var CodeGen; d, s: FReg; bits: int) =
   if d == s: return
@@ -1198,7 +1242,7 @@ proc genCoerce(g: var CodeGen; c: var Cursor; dest: Reg; isCast: bool) =
     if g.isFloatExpr(c):
       # float source → integer/pointer target (`dest` is a GPR).
       let fbits = g.floatBits(c)
-      let f = g.borrowFTmp()
+      let f = g.borrowFTmp(fbits)
       g.genIntoF(c, f, fbits)
       if isCast:
         g.fmovToGpr(dest, f, fbits)           # reinterpret the float's bits
@@ -1285,7 +1329,7 @@ proc genFReg(g: var CodeGen; c: var Cursor; bits: int): Location =
     let loc = g.ra.locationOfSym(symName(c))
     if loc.kind == InFReg:
       result = fregLoc(loc.f, loc.typ); inc c; return
-  let f = g.borrowFTmp()
+  let f = g.borrowFTmp(bits)
   g.genIntoF(c, f, bits)
   result = fregLoc(f, AsmSlot(kind: AFloat, size: bits div 8, align: bits div 8), isTemp = true)
 
@@ -1793,7 +1837,22 @@ proc emRegLocalVar(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   g.regLocal[r] = name
   g.scopeLocals[^1].add (name: name, reg: r)
 
-proc enterScope(g: var CodeGen) = g.scopeLocals.add @[]
+proc emFRegLocalVar(g: var CodeGen; name: string; f: FReg; bits: int) =
+  ## Declare a float register local: bind v-register `f` to `name` via `(rebind …)` for
+  ## the rest of its scope, so subsequent uses emit the typed name instead of a raw
+  ## `(dN)`/`(sN)`. The SIMD twin of `emRegLocalVar`. `rebind` kills `f`'s prior tenant
+  ## itself, so no manual prior-kill is needed.
+  g.ab.tree RebindA64:
+    g.ab.symDef name
+    g.ab.floatType(bits)
+    g.ab.freg(f, bits)
+  g.fregLocal[f] = name
+  g.freeFTmp.excl f                             # a local's home is no longer scratch
+  g.scopeFLocals[^1].add (name: name, f: f)
+
+proc enterScope(g: var CodeGen) =
+  g.scopeLocals.add @[]
+  g.scopeFLocals.add @[]
 
 proc exitScope(g: var CodeGen) =
   ## Skip any local whose register was already rebound to a later one (already
@@ -1802,6 +1861,10 @@ proc exitScope(g: var CodeGen) =
     if g.regLocal.getOrDefault(it.reg, "") == it.name:
       g.ab.tree KillA64: g.ab.sym it.name
       g.regLocal.del it.reg
+  for it in g.scopeFLocals.pop():
+    if g.fregLocal.getOrDefault(it.f, "") == it.name:
+      g.ab.tree KillA64: g.ab.sym it.name
+      g.fregLocal.del it.f
 
 proc genVarDecl(g: var CodeGen; c: var Cursor) =
   ## `(var :name pragmas type value)`. Scalars land in their allocated register;
@@ -1823,7 +1886,7 @@ proc genVarDecl(g: var CodeGen; c: var Cursor) =
         g.emFloatStackVar(name, bits)
         if c.kind == DotToken: inc c          # no initializer
         else:
-          let f = g.borrowFTmp()
+          let f = g.borrowFTmp(bits)
           g.genIntoF(c, f, bits)
           g.emFloatScalarStore(name, f, bits)
           g.giveBackF f
@@ -1871,6 +1934,7 @@ proc genVarDecl(g: var CodeGen; c: var Cursor) =
       if c.kind == DotToken: inc c          # no initializer
       else: g.genInto(c, loc.r)
     of InFReg:
+      g.emFRegLocalVar(name, loc.f, loc.typ.size * 8)  # (rebind :name (f bits) (dN))
       if c.kind == DotToken: inc c          # no initializer
       else: g.genIntoF(c, loc.f, loc.typ.size * 8)   # float local
     else: raiseAssert "arkham v1: stack-resident local: " & name
@@ -2747,6 +2811,10 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.symType = initTable[string, Cursor]()
   g.regLocal = initTable[Reg, string]()        # per-proc named-local bindings
   g.scopeLocals = @[]
+  g.fregLocal.clear()                          # per-proc float named-local bindings
+  g.boundFTmps = {}
+  g.scopeFLocals = @[]
+  g.ftmpBindCount = 0
   g.spillCount = 0
   # Determine the aggregate return convention BEFORE allocation: a named object
   # ≤16B → x0[:x1]; >16B → x8 indirect result (callee writes through the caller-
@@ -2798,6 +2866,10 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.symType.clear()
   g.regLocal.clear()
   g.scopeLocals = @[]
+  g.fregLocal.clear()
+  g.boundFTmps = {}
+  g.scopeFLocals = @[]
+  g.ftmpBindCount = 0
   g.loopEnds = @[]
   g.initFreeTmp()
   g.borrowIdx = 0; g.borrowIdxF = 0
@@ -2899,7 +2971,7 @@ proc emitGlobalInits(g: var CodeGen) =
       # genTvar), so there is no entry-time store to emit for it.
       if c.hasMore and c.kind != DotToken and not isConstScalarInit(c):
         if gslot.kind == AFloat:               # float global: store via fstr
-          let fv = g.borrowFTmp()
+          let fv = g.borrowFTmp(gbits)
           g.genIntoF(c, fv, gbits)
           let p = g.borrowTmp()
           g.emAdr(p, name)
