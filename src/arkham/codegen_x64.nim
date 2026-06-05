@@ -78,6 +78,52 @@ proc emTypedStackVar(g: var CodeGen; name: string; t: Cursor)
 proc emStackMem(g: var CodeGen; name: string)
 proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg
 
+proc localNameInReg(g: var CodeGen; r: Reg): string =
+  ## The allocator's name (the `symPos` key) of the local currently homed in reg
+  ## `r`, or "". This is the *allocator* identity — distinct from `regLocal[r]`, the
+  ## nifasm *binding* name, which for a declarative param is the signature alias
+  ## `pN.0` rather than the param's own name.
+  for name, pos in g.ra.symPos:
+    if g.ra.locs[pos].kind == InReg and g.ra.locs[pos].r == r: return name
+  result = ""
+
+proc recordEviction(g: var CodeGen; r: Reg): StealEvent =
+  ## Plan-pass: evict the register-local currently in `r` to a fresh stack slot,
+  ## mutating the allocator's view so every later `locationOfSym(victim)` reads the
+  ## slot (`g.ra.locs` is snapshot/restored across the two passes). Returns the
+  ## event for the caller to record in its replay table. Caller guarantees
+  ## `regLocal.hasKey(r)`.
+  let bindName = g.regLocal[r]                    # nifasm binding (maybe a pN.0 alias)
+  var victim = g.localNameInReg(r)                # allocator name (symPos key)
+  if victim.len == 0: victim = bindName           # they coincide for a non-param local
+  let typ = g.ra.locationOfSym(victim).typ
+  let slot = "evict" & $g.spillCount & ".0"; inc g.spillCount
+  g.ra.locs[g.ra.symPos[victim]] = namedStackLoc(slot, typ)
+  g.ra.hasStackVars = true
+  g.regLocal.del r
+  result = StealEvent(victim: victim, bindName: bindName, slot: slot, reg: r, typ: typ)
+
+proc replayEviction(g: var CodeGen; ev: StealEvent) =
+  ## Emit-pass: re-apply a recorded eviction — declare the slot, store the victim's
+  ## live value, kill its register binding, repoint its location to the slot.
+  # Type the eviction slot like the register local it evicts: a pointer keeps its
+  # `(ptr T)` (else nifasm's strict store/reload rejects the typed value and later
+  # deref/field access is illegal); other scalars stay the 64-bit `(i 64)` form
+  # (matching emRegLocalVar — a logical i8/u8 would mismatch a 64-bit mov).
+  if g.symType.hasKey(ev.victim) and
+     isPtrType(resolveType(g.prog, g.symType[ev.victim])):
+    var tc = g.symType[ev.victim]
+    g.emTypedStackVar(ev.slot, tc)               # (var :evictN.0 (s) (ptr …))
+  else:
+    g.emScalarStackVar(ev.slot)                  # (var :evictN.0 (s) (i 64))
+  g.ab.tree MovX64:                              # store the victim's live value
+    g.emStackMem(ev.slot)
+    g.emReg ev.reg                               # bound ⇒ emits its binding name
+  if g.regLocal.getOrDefault(ev.reg, "") == ev.bindName:
+    g.ab.tree KillX64: g.ab.sym ev.bindName      # release the register binding
+  g.ra.locs[g.ra.symPos[ev.victim]] = namedStackLoc(ev.slot, ev.typ)
+  g.regLocal.del ev.reg
+
 proc stealReg(g: var CodeGen; logIdx: int): Reg =
   ## `freeTmp` is exhausted. Evict a register-bound local that is *not* in flight
   ## (not sealed, not a live accumulator) to a fresh stack slot and hand its
@@ -87,41 +133,34 @@ proc stealReg(g: var CodeGen; logIdx: int): Reg =
   ## pass, keyed by the borrow-log index, so both passes stay byte-consistent.
   if g.ab.planning:
     var vreg = NoReg
-    var victim = ""
     for r in StealOrder:
       if g.regLocal.hasKey(r) and not g.ra.isSealed(r) and r notin g.liveAccums:
-        vreg = r; victim = g.regLocal[r]; break
+        vreg = r; break
     if vreg == NoReg: return NoReg                 # nothing safe to steal
-    let typ = g.ra.locationOfSym(victim).typ
-    let slot = "evict" & $g.spillCount & ".0"; inc g.spillCount
-    g.stealEvents[logIdx] = StealEvent(victim: victim, slot: slot, reg: vreg, typ: typ)
-    # Evict in the allocator's view so every later `locationOfSym(victim)` reads
-    # the stack slot. (`g.ra.locs` is snapshot/restored across the two passes.)
-    g.ra.locs[g.ra.symPos[victim]] = namedStackLoc(slot, typ)
-    g.ra.hasStackVars = true
-    g.regLocal.del vreg
+    g.stealEvents[logIdx] = g.recordEviction(vreg)
     result = vreg
   else:
     if logIdx notin g.stealEvents: return NoReg
     let ev = g.stealEvents[logIdx]
-    # Type the eviction slot like the register local it evicts: a pointer keeps
-    # its `(ptr T)` (else nifasm's strict store/reload rejects the typed value and
-    # later deref/field access is illegal); other scalars stay the 64-bit `(i 64)`
-    # form (matching emRegLocalVar — a logical i8/u8 would mismatch a 64-bit mov).
-    if g.symType.hasKey(ev.victim) and
-       isPtrType(resolveType(g.prog, g.symType[ev.victim])):
-      var tc = g.symType[ev.victim]
-      g.emTypedStackVar(ev.slot, tc)               # (var :evictN.0 (s) (ptr …))
-    else:
-      g.emScalarStackVar(ev.slot)                  # (var :evictN.0 (s) (i 64))
-    g.ab.tree MovX64:                              # store the victim's live value
-      g.emStackMem(ev.slot)
-      g.emReg ev.reg                               # bound to `victim` ⇒ emits its name
-    if g.regLocal.getOrDefault(ev.reg, "") == ev.victim:
-      g.ab.tree KillX64: g.ab.sym ev.victim        # release the register binding
-    g.ra.locs[g.ra.symPos[ev.victim]] = namedStackLoc(ev.slot, ev.typ)
-    g.regLocal.del ev.reg
+    g.replayEviction(ev)
     result = ev.reg
+
+proc evictFixedReg(g: var CodeGen; r: Reg) =
+  ## A fixed-physical-register instruction is about to clobber `r` (idiv → RDX,
+  ## byteCopyConst → RCX): registers the ISA forces an instruction to overwrite,
+  ## which — in a leaf proc — can still hold a live parameter (params occupy their
+  ## ABI arg registers RDI/RSI/RDX/RCX/R8/R9). If so, evict that local to a stack
+  ## slot here, for the rest of the proc, so the clobber cannot destroy it — the
+  ## *targeted* analogue of `stealReg` (which frees *some* pooled reg for scratch).
+  ## Decided in the plan pass, replayed (with the spill store) in the emit pass,
+  ## keyed by call order (`fixedEvictSeq`) since the two passes walk identically. A
+  ## register pinned to an in-flight ABI call (sealed) is left to its owner.
+  let key = g.fixedEvictSeq; inc g.fixedEvictSeq
+  if g.ab.planning:
+    if not g.regLocal.hasKey(r) or g.ra.isSealed(r): return
+    g.fixedEvicts[key] = g.recordEviction(r)
+  else:
+    if key in g.fixedEvicts: g.replayEviction(g.fixedEvicts[key])
 
 proc borrowTmp(g: var CodeGen): Reg =
   result = g.tryBorrowTmp()
@@ -1263,7 +1302,10 @@ proc genDivMod(g: var CodeGen; c: var Cursor; dest: Reg; signed, wantRemainder: 
   ## remainder → RDX. nifasm's `(idiv|div (rdx)(rax) src)` emits the cqo / xor-rdx
   ## itself. RAX/RDX are never live locals (not in the allocator's pool), so
   ## clobbering them is safe; the divisor lives in a borrowed temp (idiv has no
-  ## immediate form).
+  ## immediate form). RAX is never a local home, but RDX is an ABI arg register, so
+  ## in a leaf proc it may hold a live parameter — evict it before `cqo`/idiv writes
+  ## RDX. (A no-op once nothing live remains there: a second div sees RDX free.)
+  g.evictFixedReg(RDX)
   c.into:
     skip c                                    # result type
     g.genInto(c, RAX)                          # dividend → rax
@@ -1633,6 +1675,20 @@ proc genAddr(g: var CodeGen; c: var Cursor; dest: var Location) =
 
 # ── conditions / branches ────────────────────────────────────────────────────
 
+proc cmpOperandUnsigned(g: var CodeGen; c: Cursor): bool =
+  ## Does comparison/`case` operand `c` carry an unsigned (or char) type? This
+  ## drives the unsigned-vs-signed condition code. A bare signed literal is
+  ## ambiguous (→ false, let the other operand decide); a `UIntLit`/`CharLit` is
+  ## unsigned; every other operand is typed through `getType` — so unsigned
+  ## *fields*, array elements, derefs, casts, computed expressions, and an unsigned
+  ## symbol in *either* operand position are all detected, not just a bare unsigned
+  ## symbol in the first position (the old check missed all of these → a wrong
+  ## signed compare, e.g. `5 < UINT64_MAX` computed as `5 < -1`).
+  case c.kind
+  of UIntLit, CharLit: result = true
+  of IntLit: result = false
+  else: result = not isSignedType(resolveType(g.prog, g.getType(c)))
+
 proc cmpJccTag(ek: NifcExpr; whenTrue, signed: bool): X64Inst =
   ## The `jcc` opcode for a NIFC comparison `ek`, taken when the condition is
   ## `whenTrue`. `signed` selects signed vs unsigned ordering for `<`/`<=`; a float
@@ -1667,10 +1723,12 @@ proc emitCmpBranch(g: var CodeGen; c: var Cursor; toLabel: string; whenTrue: boo
       g.freeTemp(fb)
       g.freeTemp(fa)
     else:
-      var signed = true
-      if c.kind == Symbol and g.ra.locationOfSym(symName(c)).typ.kind == AUInt:
-        signed = false
-      tag = cmpJccTag(ek, whenTrue, signed)
+      # Unsigned if EITHER operand has an unsigned/char type (a comparison is
+      # unsigned as a whole; a literal on one side is ambiguous and defers to the
+      # other). Peek both before consuming `a`.
+      var bPeek = c; skip bPeek
+      let unsigned = g.cmpOperandUnsigned(c) or g.cmpOperandUnsigned(bPeek)
+      tag = cmpJccTag(ek, whenTrue, signed = not unsigned)
       var av = g.genVal(c); g.forceReg(av)        # a must be in a register for cmp
       let ar = av.r
       # `a` is now live in `ar` across `b`'s evaluation; seal it so a scratch
@@ -2296,9 +2354,11 @@ proc genCall(g: var CodeGen; c: var Cursor) =
 proc byteCopyConst(g: var CodeGen; dst, src: Reg; size: int) =
   ## `dst[0..<size] ← src[0..<size]`, `size` a compile-time constant (the same
   ## inline byte loop as `memcpy`). Used for whole-aggregate assignment / copy-
-  ## init; `dst`/`src` stay live. No calls inside, so RAX/RCX (not in the
-  ## allocator pool, and never an `aggrAddr` result) are free scratch for the
-  ## byte value / loop counter.
+  ## init; `dst`/`src` stay live. RAX (never a local home) and RCX are free scratch
+  ## for the byte value / loop counter — but RCX is an ABI arg register, so in a leaf
+  ## proc it can hold a live parameter: evict it first so the loop counter can't
+  ## destroy it. (`dst`/`src` are `aggrAddr` temps, never RAX/RCX.)
+  g.evictFixedReg(RCX)
   let loop = g.freshLabel()
   let done = g.freshLabel()
   g.movImm(RCX, 0)                              # i = 0
@@ -2497,9 +2557,7 @@ proc genCase(g: var CodeGen; c: var Cursor) =
   ## to `else` (or the end). NIFC `case` has no fall-through, so bodies end in a jmp.
   let lEnd = g.freshLabel()
   c.into:
-    var signed = true
-    if c.kind == Symbol and g.ra.locationOfSym(symName(c)).typ.kind == AUInt:
-      signed = false
+    let signed = not g.cmpOperandUnsigned(c)          # selector type drives test signedness
     var sel = g.genVal(c); g.forceReg(sel)            # selector, live across all tests
     let selReg = sel.r
     var bodies: seq[(string, Cursor)] = @[]
@@ -3084,6 +3142,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   # re-applies the (identically replayed) evictions itself.
   let locsSnapshot = g.ra.locs
   g.stealEvents.clear()
+  g.fixedEvicts.clear(); g.fixedEvictSeq = 0
   g.borrowLog.setLen 0; g.borrowLogF.setLen 0
   g.borrowIdx = 0; g.borrowIdxF = 0
   g.ab.planning = true
@@ -3101,6 +3160,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.loopEnds = @[]
   g.initFreeTmp()
   g.borrowIdx = 0; g.borrowIdxF = 0
+  g.fixedEvictSeq = 0                          # replay the same eviction sequence
   g.spillCount = 0
   g.emitProcBody(info, declarative)            # emit for real, replaying the plan
 
