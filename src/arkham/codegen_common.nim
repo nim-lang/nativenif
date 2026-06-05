@@ -64,6 +64,13 @@ type
                                              ## syscalls, no Darwin TLV/dyld) instead of
                                              ## the default Darwin/Mach-O — lets the arm64
                                              ## output run under qemu-aarch64 on Linux
+    sealedF*: set[FReg]                       ## SIMD arg registers (xmm0–7) pinned to an
+                                              ## in-flight value: a float arg being marshalled
+                                              ## into xmmN, or a transient float staging reg
+                                              ## (`pickFStaging`) held across a sibling
+                                              ## evaluation. A later float spill's staging
+                                              ## pick must avoid these — the float analogue of
+                                              ## `sealed`/`liveAccums` on the GPR side.
     liveAccums*: set[Reg]                     ## arg/return registers currently holding an
                                              ## in-flight expression accumulator (a genInto
                                              ## target that is *not* a named local, so absent

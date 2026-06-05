@@ -180,7 +180,11 @@ const FloatRet = F0    # xmm0: SysV scalar-float return + first float argument
 
 proc emFReg(g: var CodeGen; f: FReg) {.inline.} = g.ab.xmmReg f
 
-proc borrowFTmp(g: var CodeGen): FReg =
+proc tryBorrowFTmp(g: var CodeGen): FReg =
+  ## Like `borrowFTmp` but returns `NoFReg` when the SIMD scratch pool is
+  ## exhausted (instead of failing), so the caller can spill to a float stack
+  ## slot — the float analogue of `tryBorrowTmp`. The reg-or-`NoFReg` outcome is
+  ## recorded/replayed through `borrowLogF` like any borrow decision.
   if not g.ab.planning:                          # emit pass: replay the planned decision
     result = g.borrowLogF[g.borrowIdxF]; inc g.borrowIdxF
     return
@@ -189,7 +193,17 @@ proc borrowFTmp(g: var CodeGen): FReg =
       excl g.freeFTmp, f
       g.borrowLogF.add f
       return f
-  raiseAssert "arkham x64 v0: out of SIMD scratch registers"  # M2: spill instead of failing
+  g.borrowLogF.add NoFReg                         # exhausted → caller spills (cannot fail)
+  result = NoFReg
+
+proc borrowFTmp(g: var CodeGen): FReg =
+  ## A SIMD scratch register from the pool. Asserts on exhaustion: callers that
+  ## use this (rather than `tryBorrowFTmp` + a spill path) only ever need one or
+  ## two transient temps whose deep sub-expressions recurse through the now-total
+  ## `genFBin`, so the pool cannot be empty at the borrow point in practice.
+  result = g.tryBorrowFTmp()
+  if result == NoFReg:
+    raiseAssert "arkham x64 v0: out of SIMD scratch registers"
 
 proc giveBackF(g: var CodeGen; f: FReg) {.inline.} =
   if f in g.md.floatTempRegs: g.freeFTmp.incl f
@@ -809,6 +823,13 @@ proc freeTemp(g: var CodeGen; loc: Location) {.inline.} =
 
 const StagingCandidates = [RAX, RDI, RSI, RDX, RCX, R8, R9]
 
+const FloatStagingCandidates = {F0, F1, F2, F3, F4, F5, F6, F7}
+  ## The SIMD registers `pickFStaging` may hand out as a float spill's transient
+  ## staging reg (xmm0–7 — disjoint from the xmm8–15 scratch pool). A `genIntoF`
+  ## accumulator that lands in one of these (a float-arg-register target) is an
+  ## in-flight value with no named-local binding, so it is added to `sealedF` for
+  ## its lifetime — the SIMD analogue of `liveAccums` guarding a GPR accumulator.
+
 proc releaseStaleName(g: var CodeGen; r: Reg) =
   ## A register about to be reused as raw scratch/staging must carry no stale
   ## named-local binding. A dead parameter often lingers in `regLocal` under its
@@ -850,6 +871,27 @@ proc pickStaging(g: var CodeGen; avoid: Reg = NoReg): Reg =
   result = g.pickStagingScratch(avoid)
   if result == NoReg:
     raiseAssert "arkham x64: no staging register available for a spill"
+
+proc regHoldsLiveFLoc(g: var CodeGen; f: FReg): bool =
+  ## True if a float local/param currently lives in SIMD register `f` (per the
+  ## allocator's view). A leaf-proc float param sits in its incoming arg register
+  ## (xmm0–7), so the float staging pick must not clobber it.
+  for name, pos in g.ra.symPos:
+    let loc = g.ra.locs[pos]
+    if loc.kind == InFReg and loc.f == f: return true
+
+proc pickFStaging(g: var CodeGen; avoid: FReg = NoFReg): FReg =
+  ## The float analogue of `pickStagingScratch`: the first SIMD arg register
+  ## (xmm0–7) that is not the scratch pool (xmm8–15, exhausted by the time we get
+  ## here), not an in-flight float arg / held staging reg (`sealedF`), not a live
+  ## float local/param home, and not `avoid`. Clobbering it transiently is then
+  ## safe. The scan order is fixed, so the plan and emit passes return the same
+  ## register from the same state. `NoFReg` only when every xmm0–7 is occupied —
+  ## the genuinely-out-of-float-registers case.
+  for f in g.md.floatArgRegs:
+    if f != avoid and f notin g.sealedF and not g.regHoldsLiveFLoc(f):
+      return f
+  return NoFReg
 
 proc spillComputed(g: var CodeGen; c: var Cursor): Location =
   ## The scratch pool is exhausted: materialize `c`'s value into a fresh `(s)` slot
@@ -1255,14 +1297,53 @@ proc genFReg(g: var CodeGen; c: var Cursor; bits: int): Location =
   g.genIntoF(c, f, bits)
   result = fregLoc(f, AsmSlot(kind: AFloat, size: bits div 8, align: bits div 8), isTemp = true)
 
+proc spillFOperandAround(g: var CodeGen; c: var Cursor; dest: FReg;
+                         op32, op64: X64Inst; bits: int) =
+  ## Pool-exhausted evaluation of genFBin's right operand, keeping float register
+  ## allocation TOTAL — the SIMD mirror of `spillOperandAround`. `a` is already in
+  ## `dest`; spill it to a fresh `(s) (f N)` slot so `dest` is free, evaluate the
+  ## (possibly deep) right operand into `dest` — the recursion reuses `dest`, never
+  ## pinning a SIMD temp per nesting level — then reassemble `dest = a op b` with a
+  ## single transient staging xmm (xmm0–7) taken only here, after the recursion has
+  ## fully unwound (so it never nests → one reg covers any depth). Operand order
+  ## a-before-b is preserved, and `a op b` is computed (not `b op a`), so this is
+  ## correct for the non-commutative `sub`/`div` too. `c` is consumed past `b`.
+  let slotA = spillName(g.spillCount); inc g.spillCount
+  g.ra.hasStackVars = true
+  g.emFloatStackVar(slotA, bits)               # (var :spill.N (s) (f N))
+  g.emFloatScalarStore(slotA, dest, bits)      # [slotA] = a  (free dest)
+  g.genIntoF(c, dest, bits)                     # b → dest (recursion reuses dest)
+  let s = g.pickFStaging(avoid = dest)          # transient; recursion done → never nests
+  if s == NoFReg:
+    raiseAssert "arkham x64: no SIMD staging register available for a float spill"
+  g.emFloatScalarLoad(s, slotA, bits)           # s = a (reload)
+  g.fbin(op32, op64, s, dest, bits)             # s = a op b   (correct operand order)
+  g.fmovF(dest, s, bits)                        # dest = a op b
+
 proc genFBin(g: var CodeGen; c: var Cursor; dest: FReg; op32, op64: X64Inst; bits: int) =
   ## `(op (f N) a b)` → `dest = a op b` (addss/sd, subss/sd, mulss/sd, divss/sd).
+  ## `a` goes into `dest`; `b` is folded in place (a float local), evaluated into a
+  ## borrowed SIMD temp, or — when the scratch pool is exhausted — spilled via
+  ## `spillFOperandAround`, which keeps allocation total for arbitrarily deep
+  ## right-nested float expressions (the SIMD analogue of `genBinReg`).
   c.into:
     skip c                                    # result float type
     g.genIntoF(c, dest, bits)                  # a → dest
-    let fr = g.genFReg(c, bits)                # b → fp temp (or in place)
-    g.fbin(op32, op64, dest, fr.f, bits)
-    g.freeTemp(fr)
+    var inPlace = NoFReg                        # b an in-place float local? fold directly
+    if c.kind == Symbol:
+      let loc = g.ra.locationOfSym(symName(c))
+      if loc.kind == InFReg: inPlace = loc.f
+    if inPlace != NoFReg:
+      g.fbin(op32, op64, dest, inPlace, bits)
+      inc c                                    # consume b
+    else:
+      let fr = g.tryBorrowFTmp()               # b → a SIMD scratch temp …
+      if fr == NoFReg:
+        g.spillFOperandAround(c, dest, op32, op64, bits)   # … or spill (total)
+      else:
+        g.genIntoF(c, fr, bits)
+        g.fbin(op32, op64, dest, fr, bits)
+        g.giveBackF fr
 
 proc genConvToF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
   ## `(conv (f N) Expr)` — int→float (cvtsi2ss/sd) or float→float (cvt precision).
@@ -1301,6 +1382,16 @@ proc genCastToF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
 
 proc genIntoF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
   ## Evaluate a `bits`-wide float expression into the SIMD register `dest`.
+  # While `dest` holds the value being built, a deep sub-operand may exhaust the
+  # SIMD scratch pool and spill — its transient `pickFStaging` register must not
+  # clobber `dest`. The xmm8–15 pool is never a staging candidate, but an xmm0–7
+  # accumulator (a float-arg-register target) IS and is no named local, so record
+  # it in `sealedF` for the duration. Save/restore via the `protect` flag so a
+  # nested `genIntoF` into the same reg keeps it protected exactly once.
+  let protect = dest in FloatStagingCandidates and dest notin g.sealedF
+  if protect: g.sealedF.incl dest
+  defer:
+    if protect: g.sealedF.excl dest
   case c.kind
   of FloatLit:
     let tmp = g.borrowTmp()                     # materialize the bit pattern via a GPR
@@ -2160,13 +2251,18 @@ proc genCall(g: var CodeGen; c: var Cursor) =
       var idx = 0
       var fidx = 0
       var sealedHere: set[Reg] = {}
+      var sealedFHere: set[FReg] = {}
       while c.hasMore:
         if g.isFloatExpr(c):
-          # A float argument goes in xmm{fidx}. The float arg registers (xmm0–7)
-          # are disjoint from the GPR scratch pool and from the xmm scratch temps
-          # (xmm8–15) a later float arg's evaluation uses, so no sealing is needed.
+          # A float argument goes in xmm{fidx}. Float-arg evaluation normally
+          # scratches only xmm8–15 (disjoint from xmm0–7), but a *deep* float arg
+          # can spill via `spillFOperandAround`, whose `pickFStaging` reaches into
+          # xmm0–7 — so seal each placed arg to keep a later arg's spill from
+          # clobbering it (the SIMD analogue of sealing the GPR arg registers).
           assert fidx < g.md.floatArgRegs.len, "arkham x64 v0: >8 float args (stack TODO)"
-          g.genIntoF(c, g.md.floatArgRegs[fidx], g.floatBits(c))
+          let fr = g.md.floatArgRegs[fidx]
+          g.genIntoF(c, fr, g.floatBits(c))
+          g.sealedF.incl fr; sealedFHere.incl fr
           inc fidx
         elif c.kind == Symbol and g.varType.hasKey(symName(c)):
           let vn = symName(c)
@@ -2193,6 +2289,7 @@ proc genCall(g: var CodeGen; c: var Cursor) =
         g.ab.sym tgt.asmName
         g.ab.keyword CallX64
       g.ra.unseal sealedHere
+      g.sealedF = g.sealedF - sealedFHere
 
 # ── whole-aggregate copy (struct assignment / copy-init) ─────────────────────
 
