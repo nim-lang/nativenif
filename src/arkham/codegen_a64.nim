@@ -244,7 +244,7 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string)
 proc genAddr(g: var CodeGen; c: var Cursor; dest: Reg)
 proc materializeCond(g: var CodeGen; c: var Cursor; dest: Reg)
 proc genReg(g: var CodeGen; c: var Cursor): Location
-proc genFReg(g: var CodeGen; c: var Cursor; bits: int): tuple[f: FReg, temp: bool]
+proc genFReg(g: var CodeGen; c: var Cursor; bits: int): Location
 proc structToRegs(g: var CodeGen; varName, typeName: string; firstArg: int)
 proc regsToStruct(g: var CodeGen; varName, typeName: string; firstArg: int)
 proc aggrAddr(g: var CodeGen; c: var Cursor): tuple[r: Reg, temp: bool]
@@ -381,7 +381,12 @@ proc freeTemp(g: var CodeGen; loc: Location) {.inline.} =
   ## Release `loc`'s register iff it is a borrowed temp; a no-op on every persistent
   ## location (register-resident local, stack slot, immediate, …) — like vmgen's
   ## `freeTemp`. The single release point replacing the old `if owns: giveBack`.
-  if loc.kind == InReg and loc.isTemp: g.giveBack loc.r
+  ## Handles both GPR (`InReg`) and SIMD (`InFReg`) temps.
+  if loc.isTemp:
+    case loc.kind
+    of InReg: g.giveBack loc.r
+    of InFReg: g.giveBackF loc.f
+    else: discard
 
 proc place(g: var CodeGen; v: Location; dest: Reg) =
   ## Materialize `v` into `dest`, releasing any owned scratch it occupied. Placing
@@ -467,11 +472,11 @@ proc genVal(g: var CodeGen; c: var Cursor): Location =
       result = regLoc(t, ScalarSlot, isTemp = true)
 
 proc genReg(g: var CodeGen; c: var Cursor): Location =
-  ## `forceReg(genVal …)`: evaluate `c` into *some* register and return its
-  ## `Location` — a register-resident symbol in place, else a borrowed scratch
-  ## (`isTemp`) the caller releases with `freeTemp`. `.r` is the register.
-  result = g.genVal(c)
-  g.forceReg(result)
+  ## Evaluate `c` into *some* register via the `NeedsReg` constraint — `gen` writes
+  ## back the concrete `InReg`: a register-resident symbol in place, else a borrowed
+  ## scratch (`isTemp`) the caller releases with `freeTemp`. `.r` is the register.
+  result = needsReg(ScalarSlot)
+  g.gen(c, result)
 
 proc commutativeOp(op: A64Inst): bool {.inline.} =
   ## Integer ops for which `a op b == b op a`, so Sethi–Ullman may evaluate the
@@ -1163,9 +1168,9 @@ proc genFBin(g: var CodeGen; c: var Cursor; dest: FReg; op: A64Inst; bits: int) 
   c.into:
     skip c                                    # result float type
     g.genIntoF(c, dest, bits)                  # a → dest
-    let (fr, ft) = g.genFReg(c, bits)          # b → fp temp
-    g.fbin(op, dest, fr, bits)
-    if ft: g.giveBackF fr
+    let fr = g.genFReg(c, bits)                # b → fp temp
+    g.fbin(op, dest, fr.f, bits)
+    g.freeTemp(fr)
 
 proc genConvToF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
   ## `(conv (f N) Expr)` — produce a `bits`-wide float in `dest`: int→float
@@ -1177,9 +1182,9 @@ proc genConvToF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
       if srcBits == bits:
         g.genIntoF(c, dest, bits)              # same precision: copy
       else:
-        let (sf, st) = g.genFReg(c, srcBits)
-        g.emFcvt(dest, sf, bits, srcBits)      # precision convert
-        if st: g.giveBackF sf
+        let sf = g.genFReg(c, srcBits)
+        g.emFcvt(dest, sf.f, bits, srcBits)    # precision convert
+        g.freeTemp(sf)
     else:
       let (srcW, srcSigned) = g.srcWidthSigned(c)
       let tmp = g.borrowTmp()
@@ -1203,16 +1208,18 @@ proc genCastToF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
       g.giveBack tmp
     while c.hasMore: skip c
 
-proc genFReg(g: var CodeGen; c: var Cursor; bits: int): tuple[f: FReg, temp: bool] =
-  ## Evaluate the float expression `c` into *some* SIMD register (a symbol's home
-  ## register in place, or a borrowed scratch the caller must `giveBackF`).
+proc genFReg(g: var CodeGen; c: var Cursor; bits: int): Location =
+  ## Evaluate the float expression `c` into *some* SIMD register, returned as an
+  ## `InFReg` `Location`: a symbol's home register in place (`isTemp = false`), or a
+  ## borrowed scratch (`isTemp = true`) the caller releases with `freeTemp`. `.f` is
+  ## the register.
   if c.kind == Symbol:
     let loc = g.ra.locationOfSym(symName(c))
     if loc.kind == InFReg:
-      result = (loc.f, false); inc c; return
+      result = fregLoc(loc.f, loc.typ); inc c; return
   let f = g.borrowFTmp()
   g.genIntoF(c, f, bits)
-  result = (f, true)
+  result = fregLoc(f, AsmSlot(kind: AFloat, size: bits div 8, align: bits div 8), isTemp = true)
 
 proc genIntoF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
   ## Evaluate a `bits`-wide float expression into the SIMD register `dest`.
@@ -2081,11 +2088,11 @@ proc emitCmpBranch(g: var CodeGen; c: var Cursor; toLabel: string; whenTrue: boo
         of LeC:  (if whenTrue: BlsA64 else: BhiA64)
         else: raiseAssert "arkham v1: float condition not supported: " & $ek
       let fbits = g.floatBits(c)
-      let (fa, fat) = g.genFReg(c, fbits)
-      let (fb, fbt) = g.genFReg(c, fbits)
-      g.ab.tree FcmpA64: g.emFReg(fa, fbits); g.emFReg(fb, fbits)
-      if fbt: g.giveBackF fb
-      if fat: g.giveBackF fa
+      let fa = g.genFReg(c, fbits)
+      let fb = g.genFReg(c, fbits)
+      g.ab.tree FcmpA64: g.emFReg(fa.f, fbits); g.emFReg(fb.f, fbits)
+      g.freeTemp(fb)
+      g.freeTemp(fa)
     else:
       var signed = true
       if c.kind == Symbol and g.ra.locationOfSym(symName(c)).typ.kind == AUInt:
@@ -2348,9 +2355,9 @@ proc gen(g: var CodeGen; c: var Cursor; dest: var Location) =
   of NamedStack, Mem, Glob, Tvar:
     let bits = dest.typ.size * 8
     if dest.typ.isFloat:
-      let (fr, ft) = g.genFReg(c, bits)
-      g.emitStoreF(dest, fr, bits)
-      if ft: g.giveBackF fr
+      let fr = g.genFReg(c, bits)
+      g.emitStoreF(dest, fr.f, bits)
+      g.freeTemp(fr)
     else:
       let rr = g.genReg(c)
       g.emitStore(dest, rr.r)
