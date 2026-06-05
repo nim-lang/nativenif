@@ -138,6 +138,15 @@ proc canDoIntegerArithmetic(t: Type): bool =
   ## Includes integer types, literals, array pointers (for pointer arithmetic), and registers
   t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.AptrT, TypeKind.RegisterT}
 
+proc canCompare(t: Type): bool =
+  ## Check if a type may be a `cmp` operand. A superset of integer arithmetic:
+  ## any pointer (a comparison, not arithmetic) and — crucially — `bool`, since a
+  ## bool is a 0/1 integer and `cmp reg, 0` is the canonical "if bool" test. This is
+  ## deliberately SEPARATE from `canDoIntegerArithmetic` (which add/sub share and
+  ## must stay strict — adding/subtracting bools is nonsense).
+  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT,
+             TypeKind.PtrT, TypeKind.AptrT, TypeKind.RegisterT, TypeKind.BoolT}
+
 proc canDoBitwiseOps(t: Type): bool =
   ## Check if type supports bitwise operations (including registers and literals)
   t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.RegisterT}
@@ -3286,6 +3295,10 @@ proc checkIntegerArithmetic(t: Type; op: string; n: Cursor) =
   if not canDoIntegerArithmetic(t):
     error("Operation '" & op & "' requires integer or pointer type, got " & $t, n)
 
+proc checkComparable(t: Type; op: string; n: Cursor) =
+  if not canCompare(t):
+    error("Operation '" & op & "' requires a comparable type, got " & $t, n)
+
 proc checkIntegerType(t: Type; op: string; n: Cursor) =
   if not isIntegerType(t):
     error("Operation '" & op & "' requires integer type, got " & $t, n)
@@ -4191,9 +4204,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx) # Actually just operand 1
     let op = parseOperand(n, ctx)
-    # Comparisons work on integers and pointers
-    checkIntegerArithmetic(dest.typ, "cmp", start)
-    checkIntegerArithmetic(op.typ, "cmp", start)
+    # Comparisons work on integers, pointers, and bool (the "if bool" test).
+    checkComparable(dest.typ, "cmp", start)
+    checkComparable(op.typ, "cmp", start)
     checkCompatibleTypes(dest.typ, op.typ, "cmp", start)
     if dest.kind == okMem:
       if op.kind == okImm:

@@ -249,7 +249,19 @@ proc getType*(g: var CodeGen; c: Cursor): Cursor =
       t.into:
         result = g.callTarget.getOrDefault(symName(t)).retType
         while t.hasMore: skip t
+    of NilC: result = g.prog.voidPtr          # nil → a generic pointer type
+    of AddrC:                                 # &lvalue → (ptr <type-of-lvalue>)
+      var t = c; inc t
+      result = g.prog.ptrTypeOf(g.getType(t))
+    of SufC, ParC:                            # wrappers → the inner value's type
+      var t = c; inc t
+      result = g.getType(t)
     else: raiseAssert "arkham: getType — unsupported expression " & $c.exprKind
+  of IntLit:   result = g.prog.intType        # a bare literal's natural type
+  of UIntLit:  result = g.prog.uintType
+  of CharLit:  result = g.prog.charType
+  of FloatLit: result = g.prog.floatType
+  of StrLit:   result = g.prog.voidPtr        # a string literal is a pointer
   else: raiseAssert "arkham: getType — literal has no stored type"
 
 proc exprSlot*(g: var CodeGen; c: Cursor): AsmSlot =
@@ -349,7 +361,7 @@ proc asLoc*(g: var CodeGen; c: var Cursor): Location =
       else: raiseAssert "arkham: symbol is not an lvalue: " & nm
   of TagLit:
     case c.exprKind
-    of DotC, AtC, DerefC: (result = memLoc(nCur, slot); skip c)
+    of DotC, AtC, DerefC, PatC: (result = memLoc(nCur, slot); skip c)
     else: raiseAssert "arkham: not an lvalue: " & $c.exprKind
   else: raiseAssert "arkham: not an lvalue: " & $c.kind
 

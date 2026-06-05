@@ -64,6 +64,12 @@ type
                                             ## type of a proc used as a value. A nifcore
                                             ## Cursor keeps its own backing alive (refcounted
                                             ## owner), so no separate buffer must be stored.
+    voidPtr*: Cursor                        ## a synthesized `(ptr (void))` — the structural
+                                            ## type of a `nil` literal (a generic pointer).
+    intType*: Cursor                        ## synthesized `(i 64)` — type of a bare IntLit
+    uintType*: Cursor                       ## synthesized `(u 64)` — type of a bare UIntLit
+    charType*: Cursor                       ## synthesized `(c 8)`  — type of a bare CharLit
+    floatType*: Cursor                      ## synthesized `(f 64)` — type of a bare FloatLit
 
   TypeEnv* = Table[string, Cursor]          ## a type-symbol table
 
@@ -133,6 +139,20 @@ proc thisModuleSuffix*(p: Program): string =
   ## self-module symbol suffixes when serializing the embedded-index output.
   p.scheme.name
 
+proc ptrTypeOf*(p: Program; elem: Cursor): Cursor =
+  ## Synthesize the type of `(addr lvalue)`: a `(ptr <elem>)` whose pointee is a
+  ## copy of the element type `elem`. The new buffer SHARES `elem`'s literals and
+  ## tag pools, so any symbol / literal ids the copied subtree carries stay valid
+  ## (cross-pool copies would corrupt them). The returned cursor keeps its backing
+  ## alive via the refcounted owner (the same idiom as `procPtr`). Mirrors
+  ## `nifc/typenav.getTypeImpl`'s `AddrC` case — a pointer is not just 8 bytes, it
+  ## carries the pointee type so `(deref (addr x))` / `(pat (addr x) i)` navigate.
+  var buf = createTokenBuf(8, sharedPool = elem.pool, sharedTags = elem.tags)
+  buf.openTag registerTag(elem.tags, "ptr")
+  buf.addSubtree elem
+  buf.closeTag()
+  result = beginRead(buf)
+
 proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool): Program =
   result = Program(callTarget: initTable[string, CallTarget](),
                    typeDecls: initTable[string, Cursor](),
@@ -145,6 +165,16 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool): Program =
     # outlives this buffer (the owner refcount keeps the data alive).
     var ptBuf = parseFromBuffer("(proctype)", "", sharedTags = tags)
     result.procPtr = beginRead(ptBuf)
+    var npBuf = parseFromBuffer("(ptr (void))", "", sharedTags = tags)
+    result.voidPtr = beginRead(npBuf)
+    var itBuf = parseFromBuffer("(i 64)", "", sharedTags = tags)
+    result.intType = beginRead(itBuf)
+    var utBuf = parseFromBuffer("(u 64)", "", sharedTags = tags)
+    result.uintType = beginRead(utBuf)
+    var ctBuf = parseFromBuffer("(c 8)", "", sharedTags = tags)
+    result.charType = beginRead(ctBuf)
+    var ftBuf = parseFromBuffer("(f 64)", "", sharedTags = tags)
+    result.floatType = beginRead(ftBuf)
   assert buf.beginRead().stmtKind == StmtsS, "NIFC top level must be (stmts …)"
   # Pass 1: register every type declaration. Procs (pass 2) resolve their
   # param/return types via `isDeclarativeAbi`, and a proc may reference a type
@@ -203,7 +233,12 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool): Program =
                                                 retFloat: retFloat, retType: retType)
           result.needsLibSystem = true
         else:
-          let entry = exportcN.len > 0
+          # The program entry is the C `main` (`exportc "main"`). Every OTHER
+          # exported proc (`exportc "nimStrDestroy"`, …) is an ordinary proc whose
+          # C name is irrelevant to this self-contained image — it must keep its
+          # NIF name `pname` so cross-module calls (e.g. `=destroy.2.<mod>`) resolve.
+          # (The old `exportcN.len > 0` test wrongly renamed all of them to `main.0`.)
+          let entry = exportcN == "main"
           let asmN = if entry: "main.0" else: pname
           result.callTarget[pname] = CallTarget(asmName: asmN, extern: false,
                                                 retFloat: retFloat, retType: retType,

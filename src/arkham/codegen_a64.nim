@@ -196,7 +196,7 @@ proc framePushBytes(g: CodeGen): int =
 
 # ── scratch register pool (volatile temps not held by a local) ──────────────
 
-proc tryBorrowTmp(g: var CodeGen; typ: AsmSlot = ScalarSlot): Reg =
+proc tryBorrowTmp(g: var CodeGen; typ: AsmSlot): Reg =
   ## Like `borrowTmp` but returns `NoReg` when the scratch pool is exhausted
   ## (instead of failing). The caller then spills the value to a stack slot, so
   ## register allocation never fails. The reg-or-`NoReg` outcome is recorded by the
@@ -216,7 +216,7 @@ proc tryBorrowTmp(g: var CodeGen; typ: AsmSlot = ScalarSlot): Reg =
     g.borrowLog.add result                        # the chosen reg, or NoReg (exhausted)
   if result != NoReg: g.bindTemp(result, typ)     # typed name ⇒ emReg emits a symbol
 
-proc borrowTmp(g: var CodeGen; typ: AsmSlot = ScalarSlot): Reg =
+proc borrowTmp(g: var CodeGen; typ: AsmSlot): Reg =
   result = g.tryBorrowTmp(typ)                    # binds on a pool hit
   if result == NoReg:
     # Pool empty. Mirror x64's `borrowTmp`: evict a register-bound local to a stack
@@ -654,10 +654,10 @@ proc forceReg(g: var CodeGen; dest: var Location) =
   case dest.kind
   of InReg: discard
   of Imm:
-    let t = g.borrowTmp()                       # total: pool / steal / sealed staging
+    let t = g.borrowTmp(ScalarSlot)                       # total: pool / steal / sealed staging
     g.movImm(t, dest.ival); dest = regLoc(t, dest.typ, isTemp = true)
   of NamedStack, Mem, Glob, Tvar:
-    let t = g.borrowTmp()
+    let t = g.borrowTmp(ScalarSlot)
     g.emitLoad(dest, t); dest = regLoc(t, dest.typ, isTemp = true)
   else: raiseAssert "arkham: cannot force a value of kind " & $dest.kind & " into a register"
 
@@ -719,7 +719,7 @@ proc genVal(g: var CodeGen; c: var Cursor): Location =
   of Symbol:
     let si = g.lookupSym(symName(c))
     if si.cat == scProc:                        # proc as a value → its code address
-      let t = g.borrowTmp()
+      let t = g.borrowTmp(ScalarSlot)
       g.emAdr(t, si.asmName)
       inc c
       return regLoc(t, ScalarSlot, isTemp = true)
@@ -728,7 +728,7 @@ proc genVal(g: var CodeGen; c: var Cursor): Location =
     of InReg: result = regLoc(loc.r, loc.typ, isTemp = false)
     of NamedStack: result = loc                 # foldable spilled scalar in place
     of Glob, Tvar:                              # load through its address into a scratch
-      let t = g.borrowTmp(); g.emitLoad(loc, t)
+      let t = g.borrowTmp(ScalarSlot); g.emitLoad(loc, t)
       result = regLoc(t, loc.typ, isTemp = true)
     else: raiseAssert "arkham v1: operand of kind " & $loc.kind
   of TagLit:
@@ -736,16 +736,16 @@ proc genVal(g: var CodeGen; c: var Cursor): Location =
     of DotC, AtC, DerefC:                       # a memory lvalue used as a value
       result = g.asLoc(c)                        # a foldable `Mem` operand
     of PatC:                                     # pointer indexing → eager element load
-      let t = g.borrowTmp(); g.genInto(c, t)
+      let t = g.borrowTmp(ScalarSlot); g.genInto(c, t)
       result = regLoc(t, ScalarSlot, isTemp = true)
     else:
-      let t = g.tryBorrowTmp()                  # a computed value → a scratch reg…
+      let t = g.tryBorrowTmp(ScalarSlot)                  # a computed value → a scratch reg…
       if t == NoReg: result = g.spillComputed(c)  # …or a spill slot if exhausted
       else:
         g.genInto(c, t)
         result = regLoc(t, ScalarSlot, isTemp = true)
   else:
-    let t = g.tryBorrowTmp()
+    let t = g.tryBorrowTmp(ScalarSlot)
     if t == NoReg: result = g.spillComputed(c)
     else:
       g.genInto(c, t)
@@ -890,7 +890,7 @@ proc genBin(g: var CodeGen; c: var Cursor; dest: Reg;
       other = g.genVal(c)                   # lighter operand (a) folded after (c at a)
       skip c                                # consume b in the real cursor
     elif g.operandInReg(bPeek, dest):
-      let saved = g.borrowTmp()
+      let saved = g.borrowTmp(ScalarSlot)
       g.movReg(saved, dest)                 # preserve b before `a` clobbers dest
       g.genInto(c, dest)                    # a → dest
       skip c                                # consume b
@@ -898,7 +898,7 @@ proc genBin(g: var CodeGen; c: var Cursor; dest: Reg;
     else:
       g.genInto(c, dest)                    # a → dest; c now at b
       if isComputedOperand(c):              # b must be materialized into a register
-        let t = g.tryBorrowTmp()
+        let t = g.tryBorrowTmp(ScalarSlot)
         if t == NoReg:                       # pool exhausted → total spill path
           g.spillOperandAround(c, dest, op)
           combined = true
@@ -925,14 +925,14 @@ proc genMod(g: var CodeGen; c: var Cursor; dest: Reg) =
     skip bPeek
     var bSaved = NoReg
     if g.operandInReg(bPeek, dest):
-      bSaved = g.borrowTmp()
+      bSaved = g.borrowTmp(ScalarSlot)
       g.movReg(bSaved, dest)
     g.genInto(c, dest)                      # dest = a
     var br: Reg
     var bt = false
     if bSaved != NoReg: (br = bSaved; skip c)   # br = b (saved); consume b
     else: (let t = g.genReg(c); br = t.r; bt = t.isTemp)  # br = b
-    let q = g.borrowTmp()
+    let q = g.borrowTmp(ScalarSlot)
     g.movReg(q, dest)                       # q = a
     g.binReg(if signed: SdivA64 else: UdivA64, q, br)  # q = a div b
     g.binReg(MulA64, q, br)                 # q = (a div b)*b
@@ -1023,7 +1023,7 @@ proc loadOperandReg(g: var CodeGen; v: Location; tmps: var seq[Reg]): Reg =
   if v.kind == InReg:
     if v.isTemp: tmps.add v.r
     return v.r
-  result = g.tryBorrowTmp()
+  result = g.tryBorrowTmp(ScalarSlot)
   if result != NoReg: tmps.add result
   else:
     result = g.pickStaging()
@@ -1069,7 +1069,7 @@ proc prematAccess(g: var CodeGen; n: var Cursor; tmps: var seq[Reg]; regs: var s
       let si = g.lookupSym(nm)
       if si.cat != scGlobal:
         raiseAssert "arkham a64 v0: unsupported lvalue base: " & nm
-      var r = g.tryBorrowTmp()
+      var r = g.tryBorrowTmp(ScalarSlot)
       if r != NoReg: tmps.add r
       else:
         r = g.pickStaging()
@@ -1091,7 +1091,7 @@ proc prematAccess(g: var CodeGen; n: var Cursor; tmps: var seq[Reg]; regs: var s
         if n.kind == IntLit: inc n               # immediate index stays inline
         else: regs.add g.loadOperandReg(g.genVal(n), tmps)  # computed index → reg
         if needsScratch:                         # non-scale stride: supply a scratch reg
-          var s = g.tryBorrowTmp()               # nifasm computes base+idx*stride into it
+          var s = g.tryBorrowTmp(ScalarSlot)               # nifasm computes base+idx*stride into it
           if s != NoReg: tmps.add s
           else:
             s = g.pickStaging()
@@ -1194,7 +1194,7 @@ proc emitLoad(g: var CodeGen; loc: Location; dest: Reg) =
   of InReg: g.movReg(dest, loc.r)
   of NamedStack: g.emScalarLoad(dest, loc.name)
   of Glob:
-    let tmp = g.borrowTmp(); g.emAdr(tmp, loc.name)
+    let tmp = g.borrowTmp(ScalarSlot); g.emAdr(tmp, loc.name)
     g.ab.tree MovA64:
       g.emReg dest
       g.ab.tree MemX: g.emReg tmp
@@ -1205,7 +1205,7 @@ proc emitLoad(g: var CodeGen; loc: Location; dest: Reg) =
       # thread-local lives at a fixed `.bss` address like a global — `adr`+load,
       # no TLV thunk (which is Darwin-only). nifasm declares the tvar as a gvar
       # (see `genTvar`), so the symbol resolves via adrp+add.
-      let tmp = g.borrowTmp(); g.emAdr(tmp, loc.name)
+      let tmp = g.borrowTmp(ScalarSlot); g.emAdr(tmp, loc.name)
       g.ab.tree MovA64:
         g.emReg dest
         g.ab.tree MemX: g.emReg tmp
@@ -1246,7 +1246,7 @@ proc emitLoadF(g: var CodeGen; loc: Location; dest: FReg; bits: int) =
   of InFReg: g.fmovF(dest, loc.f, bits)
   of NamedStack: g.emFloatScalarLoad(dest, loc.name, bits)
   of Glob:
-    let tmp = g.borrowTmp(); g.emAdr(tmp, loc.name)
+    let tmp = g.borrowTmp(ScalarSlot); g.emAdr(tmp, loc.name)
     g.emFLoad(dest, tmp, bits)
     g.giveBack tmp
   of Mem:
@@ -1279,7 +1279,7 @@ proc emitStore(g: var CodeGen; loc: Location; src: Reg) =
   of InReg: g.movReg(loc.r, src)
   of NamedStack: g.emScalarStore(loc.name, src)
   of Glob:
-    let tmp = g.borrowTmp(); g.emAdr(tmp, loc.name)
+    let tmp = g.borrowTmp(ScalarSlot); g.emAdr(tmp, loc.name)
     g.ab.tree MovA64:
       g.ab.tree MemX: g.emReg tmp
       g.emReg src
@@ -1287,7 +1287,7 @@ proc emitStore(g: var CodeGen; loc: Location; src: Reg) =
   of Tvar:
     if g.a64Linux:
       # Single-threaded static ELF: store through the tvar's fixed `.bss` address.
-      let tmp = g.borrowTmp(); g.emAdr(tmp, loc.name)
+      let tmp = g.borrowTmp(ScalarSlot); g.emAdr(tmp, loc.name)
       g.ab.tree MovA64:
         g.ab.tree MemX: g.emReg tmp
         g.emReg src
@@ -1328,7 +1328,7 @@ proc emitStoreF(g: var CodeGen; loc: Location; src: FReg; bits: int) =
   of InFReg: g.fmovF(loc.f, src, bits)
   of NamedStack: g.emFloatScalarStore(loc.name, src, bits)
   of Glob:
-    let tmp = g.borrowTmp(); g.emAdr(tmp, loc.name)
+    let tmp = g.borrowTmp(ScalarSlot); g.emAdr(tmp, loc.name)
     g.emFStore(src, tmp, bits)
     g.giveBack tmp
   of Mem:
@@ -1505,7 +1505,7 @@ proc genConvToF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
         g.freeTemp(sf)
     else:
       let (srcW, srcSigned) = g.srcWidthSigned(c)
-      let tmp = g.borrowTmp()
+      let tmp = g.borrowTmp(ScalarSlot)
       g.genInto(c, tmp)                          # int value → GPR
       g.extendTo(tmp, srcW, srcSigned)           # normalize to its full int value
       g.fcvtI2F(if srcSigned: ScvtfA64 else: UcvtfA64, dest, tmp, bits)
@@ -1520,7 +1520,7 @@ proc genCastToF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
     if g.isFloatExpr(c):
       g.genIntoF(c, dest, bits)
     else:
-      let tmp = g.borrowTmp()
+      let tmp = g.borrowTmp(ScalarSlot)
       g.genInto(c, tmp)                          # integer bit pattern → GPR
       g.fmovFromGpr(dest, tmp, bits)             # reinterpret as float
       g.giveBack tmp
@@ -1553,7 +1553,7 @@ proc genIntoF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
     if protect: g.sealedF.excl dest
   case c.kind
   of FloatLit:
-    let tmp = g.borrowTmp()                     # materialize the bit pattern via a GPR
+    let tmp = g.borrowTmp(ScalarSlot)                     # materialize the bit pattern via a GPR
     if bits == 32:
       g.movImm(tmp, int64(cast[uint32](float32(floatVal(c)))))
     else:
@@ -1601,7 +1601,7 @@ proc emitPatAddr(g: var CodeGen; c: var Cursor; dest: Reg) =
   c.into:
     let baseTy = resolveType(g.prog, g.getType(c))
     var elem = innerType(g.prog, baseTy)
-    let baseReg = g.borrowTmp()
+    let baseReg = g.borrowTmp(ScalarSlot)
     if baseTy.typeKind in {NifcType.ArrayT, NifcType.FlexarrayT}:
       g.genAddr(c, baseReg)                     # decay: baseReg ← &field
     else:
@@ -1611,7 +1611,7 @@ proc emitPatAddr(g: var CodeGen; c: var Cursor; dest: Reg) =
     var idxReg = NoReg
     if c.kind == IntLit: (idxImm = true; idxV = intVal(c); inc c)
     elif c.kind == UIntLit: (idxImm = true; idxV = cast[int64](uintVal(c)); inc c)
-    else: (idxReg = g.borrowTmp(); g.genInto(c, idxReg))
+    else: (idxReg = g.borrowTmp(ScalarSlot); g.genInto(c, idxReg))
     g.ab.tree LeaA64:
       g.emReg dest
       g.ab.tree AtX:
@@ -1847,7 +1847,7 @@ proc genCall(g: var CodeGen; c: var Cursor) =
               g.emReg IntArgRegs[idx]
             g.ra.seal IntArgRegs[idx]; sealedHere.incl IntArgRegs[idx]
           else:
-            let t = g.borrowTmp()
+            let t = g.borrowTmp(ScalarSlot)
             g.genInto(c, t)
             g.ra.seal t; sealedHere.incl t
             stackTmps.add t; stackArgIdx.add idx
@@ -2045,7 +2045,7 @@ proc copyStructThroughPtr(g: var CodeGen; srcVar, typeName: string; ptrReg: Reg)
   ## Field-wise copy of the aggregate `srcVar` to the memory `ptrReg` points at
   ## (any layout — sub-word fields are fine, it copies per field).
   for f in aggrLayout(g.prog, typeName):
-    let tmp = g.borrowTmp()
+    let tmp = g.borrowTmp(ScalarSlot)
     g.ab.tree MovA64: (g.emReg tmp; g.emAggrFieldMem(srcVar, f.name))
     g.ab.tree MovA64: (g.emPtrFieldMem(ptrReg, typeName, f.name); g.emReg tmp)
     g.giveBack tmp
@@ -2132,7 +2132,7 @@ proc genVarDecl(g: var CodeGen; c: var Cursor) =
         g.emScalarStackVar(name)
         if c.kind == DotToken: inc c          # no initializer
         else:
-          let tmp = g.borrowTmp()
+          let tmp = g.borrowTmp(ScalarSlot)
           g.genInto(c, tmp)
           g.emScalarStore(name, tmp)
           g.giveBack tmp
@@ -2159,7 +2159,7 @@ proc genVarDecl(g: var CodeGen; c: var Cursor) =
             g.regsToStruct(name, typeName, 0)
         else:                                 # copy-init from another aggregate: `var b = a`
           assert typeName.len > 0, "arkham v1: aggregate copy-init needs a named type: " & name
-          let dstA = g.borrowTmp()
+          let dstA = g.borrowTmp(ScalarSlot)
           g.ab.tree LeaA64: (g.emReg dstA; g.ab.sym name)
           let (srcA, srcT) = g.aggrAddr(c)
           g.byteCopyConst(dstA, srcA, aggrByteSize(g.prog, typeName))
@@ -2211,9 +2211,9 @@ proc genAtomicRmw(g: var CodeGen; pReg, val: Reg; isXchg: bool;
                   op: A64Inst; returnNew: bool) =
   ## `loop: ldaxr old,[p]; new = old op val (or val for xchg); stlxr st,new,
   ## [p]; cbnz st,loop`. Result (old or new) → x0. `pReg`/`val` stay live.
-  let xOld = g.borrowTmp()
-  let xNew = g.borrowTmp()
-  let xStatus = g.borrowTmp()
+  let xOld = g.borrowTmp(ScalarSlot)
+  let xNew = g.borrowTmp(ScalarSlot)
+  let xStatus = g.borrowTmp(ScalarSlot)
   let loop = g.freshLabel()
   let (p, v, old, neu, st) = (g.emOp pReg, g.emOp val,
                               g.emOp xOld, g.emOp xNew, g.emOp xStatus)
@@ -2235,9 +2235,9 @@ proc genAtomicCmpXchg(g: var CodeGen; c: var Cursor) =
   let expPtr = g.genReg(c)
   let des = g.genReg(c)
   skip c; skip c; skip c                    # weak, success order, failure order
-  let xExp = g.borrowTmp()
-  let xOld = g.borrowTmp()
-  let xStatus = g.borrowTmp()
+  let xExp = g.borrowTmp(ScalarSlot)
+  let xOld = g.borrowTmp(ScalarSlot)
+  let xStatus = g.borrowTmp(ScalarSlot)
   let loop = g.freshLabel()
   let lFail = g.freshLabel()
   let lDone = g.freshLabel()
@@ -2275,7 +2275,7 @@ proc genAtomic(g: var CodeGen; c: var Cursor; builtin: string) =
     g.freeTemp(pReg)
   of "__atomic_clear":                       # (ptr, memorder) → void; *ptr = 0
     let pReg = g.genReg(c); skip c
-    let z = g.borrowTmp(); g.movImm(z, 0)
+    let z = g.borrowTmp(ScalarSlot); g.movImm(z, 0)
     g.emStlr(z, pReg.r)
     g.giveBack z
     g.freeTemp(pReg)
@@ -2304,9 +2304,9 @@ proc genAtomic(g: var CodeGen; c: var Cursor; builtin: string) =
     g.freeTemp(pReg)
   of "__atomic_test_and_set":                # (ptr, memorder) → bool (old != 0)
     let pReg = g.genReg(c); skip c
-    let one = g.borrowTmp(); g.movImm(one, 1)
+    let one = g.borrowTmp(ScalarSlot); g.movImm(one, 1)
     g.genAtomicRmw(pReg.r, one, true, NoA64Inst, false)  # x0 = old
-    let xOld = g.borrowTmp(); g.movReg(xOld, IntRet)
+    let xOld = g.borrowTmp(ScalarSlot); g.movReg(xOld, IntRet)
     let lSkip = g.freshLabel()
     let (old, ret) = (g.emOp xOld, g.emOp IntRet)
     g.ab.splice &"(mov {ret} 0) (cmp {old} 0) (beq {lSkip}) (mov {ret} 1) (lab :{lSkip})"
@@ -2332,8 +2332,8 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
     let srcL = g.genReg(c)
     let nL = g.genReg(c)
     let (dst, src, n) = (dstL.r, srcL.r, nL.r)
-    let i = g.borrowTmp()
-    let b = g.borrowTmp()
+    let i = g.borrowTmp(ScalarSlot)
+    let b = g.borrowTmp(ScalarSlot)
     let loop = g.freshLabel()
     let done = g.freshLabel()
     g.movImm(i, 0)
@@ -2353,8 +2353,8 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
     let srcL = g.genReg(c)
     let nL = g.genReg(c)
     let (dst, src, n) = (dstL.r, srcL.r, nL.r)
-    let i = g.borrowTmp()
-    let b = g.borrowTmp()
+    let i = g.borrowTmp(ScalarSlot)
+    let b = g.borrowTmp(ScalarSlot)
     let fwd = g.freshLabel()
     let bwd = g.freshLabel()
     let fwdLoop = g.freshLabel()
@@ -2389,7 +2389,7 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
     let valL = g.genReg(c)
     let nL = g.genReg(c)
     let (dst, val, n) = (dstL.r, valL.r, nL.r)
-    let i = g.borrowTmp()
+    let i = g.borrowTmp(ScalarSlot)
     let loop = g.freshLabel()
     let done = g.freshLabel()
     g.movImm(i, 0)
@@ -2408,9 +2408,9 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
     let pbL = g.genReg(c)
     let nL = g.genReg(c)
     let (pa, pb, n) = (paL.r, pbL.r, nL.r)
-    let i = g.borrowTmp()
-    let ba = g.borrowTmp()
-    let bb = g.borrowTmp()
+    let i = g.borrowTmp(ScalarSlot)
+    let ba = g.borrowTmp(ScalarSlot)
+    let bb = g.borrowTmp(ScalarSlot)
     let loop = g.freshLabel()
     let diff = g.freshLabel()
     let equal = g.freshLabel()
@@ -2607,7 +2607,7 @@ proc cmpImm(g: var CodeGen; selReg: Reg; v: int64) =
   if v >= 0 and v <= 0xFFFF:
     g.ab.tree CmpA64: g.emReg selReg; g.ab.intLit v
   else:
-    let tmp = g.borrowTmp()
+    let tmp = g.borrowTmp(ScalarSlot)
     g.movImm(tmp, v)
     g.ab.tree CmpA64: g.emReg selReg; g.emReg tmp
     g.giveBack tmp
@@ -2686,7 +2686,7 @@ proc aggrAddr(g: var CodeGen; c: var Cursor): tuple[r: Reg, temp: bool] =
     let loc = g.ra.locationOfSym(symName(c))
     if loc.kind == InReg:
       result = (loc.r, false); inc c; return
-  let r = g.borrowTmp()
+  let r = g.borrowTmp(ScalarSlot)
   g.genAddr(c, r)
   result = (r, true)
 
@@ -2694,8 +2694,8 @@ proc byteCopyConst(g: var CodeGen; dst, src: Reg; size: int) =
   ## `dst[0..<size] ← src[0..<size]` — the same inline byte loop as `memcpy`
   ## (register-offset ldrb/strb), with `size` a compile-time constant. Used for
   ## whole-aggregate assignment / copy-init; `dst`/`src` stay live.
-  let i = g.borrowTmp()
-  let b = g.borrowTmp()
+  let i = g.borrowTmp(ScalarSlot)
+  let b = g.borrowTmp(ScalarSlot)
   let loop = g.freshLabel()
   let done = g.freshLabel()
   g.movImm(i, 0)
@@ -3220,15 +3220,15 @@ proc emitGlobalInits(g: var CodeGen) =
         if gslot.kind == AFloat:               # float global: store via fstr
           let fv = g.borrowFTmp(gbits)
           g.genIntoF(c, fv, gbits)
-          let p = g.borrowTmp()
+          let p = g.borrowTmp(ScalarSlot)
           g.emAdr(p, name)
           g.emFStore(fv, p, gbits)
           g.giveBack p
           g.giveBackF fv
         else:
-          let v = g.borrowTmp()
+          let v = g.borrowTmp(ScalarSlot)
           g.genInto(c, v)                       # evaluate initializer
-          let p = g.borrowTmp()
+          let p = g.borrowTmp(ScalarSlot)
           g.emAdr(p, name)
           g.ab.tree MovA64:
             g.ab.tree MemX: g.emReg p

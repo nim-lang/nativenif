@@ -171,14 +171,20 @@ proc compatible*(want, got: Type): bool =
     result = asmSizeOf(want) <= (got.regBits div 8)
     return
   case want.kind
-  of ErrorT, VoidT, BoolT:
+  of ErrorT, VoidT:
     result = got.kind == want.kind
+  of BoolT:
+    # A bool is a 0/1 integer: an integer LITERAL (e.g. the `0` in the canonical
+    # `cmp boolReg, 0` "if bool" test) is compatible with it. Still strict against
+    # sized int/uint/ptr/etc. — only the literal adapts.
+    result = got.kind == BoolT or got.kind == IntLitT
   of IntT, UIntT:
     # IntLitT is compatible with both IntT and UIntT of same size
     result = (got.kind == want.kind or got.kind == IntLitT) and want.bits == got.bits
   of IntLitT:
-    # Literal is compatible with IntT, UIntT, or another literal of same size
-    result = got.kind in {IntT, UIntT, IntLitT} and want.bits == got.bits
+    # Literal is compatible with IntT, UIntT, or another literal of same size, and
+    # with bool (the `cmp boolReg, 0` test, operands either order).
+    result = got.kind in {IntT, UIntT, IntLitT, BoolT} and (got.kind == BoolT or want.bits == got.bits)
   of FloatT:
     result = got.kind == want.kind and want.bits == got.bits
   of PtrT, AptrT:

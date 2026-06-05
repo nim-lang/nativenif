@@ -68,7 +68,7 @@ proc initFreeTmp(g: var CodeGen) =
     if loc.kind == InReg: g.freeTmp.excl loc.r
     elif loc.kind == InFReg: g.freeFTmp.excl loc.f
 
-proc tryBorrowTmp(g: var CodeGen; typ: AsmSlot = ScalarSlot): Reg =
+proc tryBorrowTmp(g: var CodeGen; typ: AsmSlot): Reg =
   ## Like `borrowTmp` but returns `NoReg` when the scratch pool is exhausted
   ## (instead of failing). The caller then spills the value to a stack slot. The
   ## reg-or-`NoReg` outcome is recorded/replayed like any borrow decision. A real
@@ -192,7 +192,7 @@ proc evictFixedReg(g: var CodeGen; r: Reg) =
   else:
     if key in g.fixedEvicts: g.replayEviction(g.fixedEvicts[key])
 
-proc borrowTmp(g: var CodeGen; typ: AsmSlot = ScalarSlot): Reg =
+proc borrowTmp(g: var CodeGen; typ: AsmSlot): Reg =
   result = g.tryBorrowTmp(typ)                    # binds on a pool hit
   if result == NoReg:
     # The plan pass just logged `NoReg` (it is at `borrowLog.len-1`); the emit
@@ -238,7 +238,7 @@ proc wantReg(g: var CodeGen; dest: var Location): Reg =
   case dest.kind
   of InReg: result = dest.r
   of NeedsReg:
-    result = g.borrowTmp()
+    result = g.borrowTmp(ScalarSlot)
     dest = regLoc(result, dest.typ, isTemp = true)
   else: raiseAssert "arkham x64: wantReg cannot resolve dest kind " & $dest.kind
 
@@ -634,7 +634,7 @@ proc loadOperandReg(g: var CodeGen; v: Location; tmps: var seq[Reg]): Reg =
   if v.kind == InReg:
     if v.isTemp: tmps.add v.r
     return v.r
-  result = g.tryBorrowTmp()
+  result = g.tryBorrowTmp(v.typ)   # bind the scratch to the value's PRECISE type
   if result != NoReg: tmps.add result
   else:
     result = g.pickStaging()
@@ -683,7 +683,7 @@ proc prematAccess(g: var CodeGen; n: var Cursor; tmps: var seq[Reg]; regs: var s
       let si = g.lookupSym(nm)
       if si.cat != scGlobal:
         raiseAssert "arkham x64 v0: unsupported lvalue base: " & nm
-      var r = g.tryBorrowTmp()
+      var r = g.tryBorrowTmp(ScalarSlot)
       if r != NoReg: tmps.add r
       else:
         r = g.pickStaging()
@@ -706,7 +706,7 @@ proc prematAccess(g: var CodeGen; n: var Cursor; tmps: var seq[Reg]; regs: var s
         if n.kind == IntLit: inc n               # immediate index stays inline
         else: regs.add g.loadOperandReg(g.genVal(n), tmps)  # computed index → reg
         if needsScratch:                         # non-scale stride: supply a scratch reg
-          var s = g.tryBorrowTmp()               # nifasm computes base+idx*stride into it
+          var s = g.tryBorrowTmp(ScalarSlot)               # nifasm computes base+idx*stride into it
           if s != NoReg: tmps.add s
           else:
             s = g.pickStaging()
@@ -719,6 +719,33 @@ proc prematAccess(g: var CodeGen; n: var Cursor; tmps: var seq[Reg]; regs: var s
       n.into:
         regs.add g.loadOperandReg(g.genVal(n), tmps)  # the pointer → a register
         while n.hasMore: skip n                  # (cppref)?
+    of PatC:
+      # `(pat base idx)` — pointer indexing. Unlike `at`, the base is a pointer
+      # VALUE (a cast/add expression, not an lvalue chain): evaluate it into a
+      # register here (an array/flexarray field decays to its address). The element
+      # type is carried into pass 2 as a `(cast (aptr elem) base)`, so nifasm strides
+      # the index by the element size — pat is `at` over a typed pointer base.
+      let needsScratch = g.atNeedsScratch(n)
+      n.into:
+        let baseTy = resolveType(g.prog, g.getType(n))
+        if baseTy.typeKind in {NifcType.ArrayT, NifcType.FlexarrayT}:
+          var r = g.tryBorrowTmp(ScalarSlot)
+          if r != NoReg: tmps.add r
+          else:
+            r = g.pickStaging(); g.ra.seal r; g.bindTemp(r, ScalarSlot); tmps.add r
+          var bd = regLoc(r, ScalarSlot); g.genAddr(n, bd)   # base ← &field
+          regs.add r
+        else:
+          regs.add g.loadOperandReg(g.genVal(n), tmps)       # base ← the pointer value
+        if n.kind == IntLit: inc n               # immediate index stays inline
+        else: regs.add g.loadOperandReg(g.genVal(n), tmps)   # computed index → reg
+        if needsScratch:                         # non-scale stride: supply a scratch reg
+          var s = g.tryBorrowTmp(ScalarSlot)
+          if s != NoReg: tmps.add s
+          else:
+            s = g.pickStaging(); g.ra.seal s; g.bindTemp(s, ScalarSlot); tmps.add s
+          regs.add s
+        while n.hasMore: skip n
     else: raiseAssert "arkham x64 v0: not an lvalue: " & $n.exprKind
   else: raiseAssert "arkham x64 v0: not an lvalue: " & $n.kind
 
@@ -788,6 +815,24 @@ proc emAccessAddr(g: var CodeGen; n: var Cursor; regs: openArray[Reg]; ri: var i
           g.emReg regs[ri]; inc ri                # the pointer (pre-loaded)
         skip n                                    # skip the pointer value subtree
         while n.hasMore: skip n                   # (cppref)?
+    of PatC:
+      # `(pat base idx)` → `(at (cast (aptr elem) base) idx)`: the base pointer was
+      # pre-loaded into a register; emit it as a typed `aptr` so nifasm strides the
+      # index by the element size (mirrors `emitPatAddr`'s lea operand).
+      let needsScratch = g.atNeedsScratch(n)
+      g.ab.tree AtX:
+        n.into:
+          var elem = innerType(g.prog, resolveType(g.prog, g.getType(n)))
+          g.ab.tree CastX:
+            g.ab.aptrType:
+              if elem.kind == Symbol: g.ab.sym symName(elem)
+              else: g.genTypeBody(elem)
+            g.emReg regs[ri]; inc ri              # the base pointer (pre-loaded)
+          skip n                                   # skip the base value subtree
+          if n.kind == IntLit: (g.ab.intLit intVal(n); inc n)
+          else: (g.emReg regs[ri]; inc ri; skip n) # pre-loaded computed index
+          if needsScratch: (g.emReg regs[ri]; inc ri)
+          while n.hasMore: skip n
     else: raiseAssert "arkham x64 v0: not an lvalue: " & $n.exprKind
   else: raiseAssert "arkham x64 v0: not an lvalue: " & $n.kind
 
@@ -847,7 +892,7 @@ proc scalarMemMov(g: var CodeGen; loc: Location; reg: Reg; load: bool) =
         g.emReg reg
         g.ab.tree MemX: g.emReg reg
     else:                                          # &g into a temp, then store
-      let p = g.borrowTmp()
+      let p = g.borrowTmp(ScalarSlot)
       g.emGlobalAddr(p, loc.name)
       g.ab.tree MovX64:
         g.ab.tree MemX: g.emReg p
@@ -913,7 +958,7 @@ proc emitAddrLoc(g: var CodeGen; loc: Location; dest: Reg) =
     # nifasm — by design — forbids `add`/`sub`).
     if loc.name notin g.tvarNames:
       raiseAssert "arkham x64: address-of a foreign thread-local (module-system TODO): " & loc.name
-    let base = g.borrowTmp()
+    let base = g.borrowTmp(ScalarSlot)
     g.emGlobalAddr(base, TlsBlockName)                    # base ← &arkham.tls.0 (FS base)
     g.ab.tree LeaX64:                                     # dest ← base + tvar.offset = &tvar
       g.emReg dest
@@ -937,7 +982,7 @@ proc addrOfLoc(g: var CodeGen; loc: Location): (Reg, bool) =
   ## `&loc` in a register. A register-resident value already IS its address (a
   ## by-reference aggregate param) and is returned as-is; else borrow a temp.
   if loc.kind == InReg: return (loc.r, false)
-  let r = g.borrowTmp()
+  let r = g.borrowTmp(ScalarSlot)
   g.emitAddrLoc(loc, r)
   result = (r, true)
 
@@ -986,10 +1031,10 @@ proc forceReg(g: var CodeGen; dest: var Location) =
   case dest.kind
   of InReg: discard
   of Imm:
-    let t = g.borrowTmp(); g.movImm(t, dest.ival)
+    let t = g.borrowTmp(dest.typ); g.movImm(t, dest.ival)
     dest = regLoc(t, dest.typ, isTemp = true)
   of NamedStack, Mem:
-    let t = g.borrowTmp(); g.emitLoadLoc(dest, t)
+    let t = g.borrowTmp(dest.typ); g.emitLoadLoc(dest, t)   # precise type (e.g. a ptr field)
     dest = regLoc(t, dest.typ, isTemp = true)
   else: raiseAssert "arkham x64 v0: cannot force a value of kind " & $dest.kind & " into a register"
 
@@ -1096,16 +1141,18 @@ proc spillComputed(g: var CodeGen; c: var Cursor): Location =
   ## operand of an SU swap), never recursively.
   let slotName = spillName(g.spillCount); inc g.spillCount
   g.ra.hasStackVars = true
+  let slot = g.exprSlot(c)                       # the value's PRECISE type/slot (incl. ptr pointee)
   let stage = g.pickStaging()
   g.ra.seal stage
-  g.bindTemp(stage, ScalarSlot)                 # checked name for the staging value
-  g.emScalarStackVar(slotName)                  # (var :spill.N (s) (i 64))
-  g.genInto(c, stage)                           # compute the value into the staging reg
-  g.ab.tree MovX64:                             # store it to the slot
+  g.bindTemp(stage, slot)                        # checked name, typed by the value
+  if cursorIsNil(slot.typ): g.emScalarStackVar(slotName)   # (var :spill.N (s) (i 64))
+  else: g.emTypedStackVar(slotName, slot.typ)              # (var :spill.N (s) <real type>)
+  g.genInto(c, stage)                            # compute the value into the staging reg
+  g.ab.tree MovX64:                              # store it to the slot
     g.emStackMem(slotName)
     g.emReg stage
-  g.giveBack(stage)                             # unbind + unseal
-  result = namedStackLoc(slotName, AsmSlot(kind: AInt, size: 8, align: 8))
+  g.giveBack(stage)                              # unbind + unseal
+  result = namedStackLoc(slotName, slot)
 
 
 proc genVal(g: var CodeGen; c: var Cursor): Location =
@@ -1124,7 +1171,7 @@ proc genVal(g: var CodeGen; c: var Cursor): Location =
   of Symbol:
     let si = g.lookupSym(symName(c))
     if si.cat == scProc:                        # proc as a value → its code address
-      let t = g.borrowTmp()
+      let t = g.borrowTmp(ScalarSlot)
       g.ab.tree LeaX64: (g.emReg t; g.ab.sym si.asmName)
       inc c
       return regLoc(t, ScalarSlot, isTemp = true)
@@ -1133,7 +1180,7 @@ proc genVal(g: var CodeGen; c: var Cursor): Location =
     of InReg: result = regLoc(loc.r, loc.typ, isTemp = false)
     of NamedStack: result = loc                 # foldable spilled scalar in place
     of Glob, Tvar:                              # load through its address into a scratch
-      let t = g.borrowTmp(); g.emitLoadLoc(loc, t)
+      let t = g.borrowTmp(loc.typ); g.emitLoadLoc(loc, t)   # precise type (e.g. a ptr global)
       result = regLoc(t, loc.typ, isTemp = true)
     else: raiseAssert "arkham x64 v0: operand of kind " & $loc.kind
   of TagLit:
@@ -1141,16 +1188,16 @@ proc genVal(g: var CodeGen; c: var Cursor): Location =
     of DotC, AtC, DerefC:                       # a memory lvalue used as a value
       result = g.asLoc(c)                        # a foldable `Mem` operand
     of PatC:                                     # pointer indexing → eager element load
-      let t = g.borrowTmp(); g.genInto(c, t)
+      let t = g.borrowTmp(ScalarSlot); g.genInto(c, t)
       result = regLoc(t, ScalarSlot, isTemp = true)
     else:
-      let t = g.tryBorrowTmp()                  # a computed value → a scratch reg…
+      let t = g.tryBorrowTmp(ScalarSlot)                  # a computed value → a scratch reg…
       if t == NoReg: result = g.spillComputed(c)  # …or a spill slot if exhausted
       else:
         g.genInto(c, t)
         result = regLoc(t, ScalarSlot, isTemp = true)
   else:
-    let t = g.tryBorrowTmp()
+    let t = g.tryBorrowTmp(ScalarSlot)
     if t == NoReg: result = g.spillComputed(c)
     else:
       g.genInto(c, t)
@@ -1366,7 +1413,7 @@ proc genBinReg(g: var CodeGen; c: var Cursor; dest: Reg; op: X64Inst; immOk: boo
       other = g.genVal(c)                      # lighter operand (a) folded after
       skip c                                   # consume b in the real cursor
     elif g.operandInReg(bPeek, dest):
-      let saved = g.borrowTmp()
+      let saved = g.borrowTmp(ScalarSlot)
       g.movReg(saved, dest)                   # preserve b before `a` clobbers dest
       g.genInto(c, dest)                      # a → dest
       skip c                                  # consume b
@@ -1374,7 +1421,7 @@ proc genBinReg(g: var CodeGen; c: var Cursor; dest: Reg; op: X64Inst; immOk: boo
     else:
       g.genInto(c, dest)                      # a → dest; c now at b
       if g.isComputedOperand(c):              # b must be materialized into a register
-        let t = g.tryBorrowTmp()
+        let t = g.tryBorrowTmp(ScalarSlot)
         if t == NoReg:                         # pool exhausted → total spill path
           g.spillOperandAround(c, dest, op)
           combined = true
@@ -1554,7 +1601,7 @@ proc genConvToF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
         g.freeTemp(sf)
     else:
       let (srcW, srcSigned) = g.srcWidthSigned(c)
-      let tmp = g.borrowTmp()
+      let tmp = g.borrowTmp(ScalarSlot)
       g.genInto(c, tmp)                          # int value → GPR
       g.extendTo(tmp, srcW, srcSigned)           # normalize to its full int value
       g.fcvtI2F(dest, tmp, bits)                 # cvtsi2ss/sd (signed; u64 edge: TODO)
@@ -1569,7 +1616,7 @@ proc genCastToF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
     if g.isFloatExpr(c):
       g.genIntoF(c, dest, bits)
     else:
-      let tmp = g.borrowTmp()
+      let tmp = g.borrowTmp(ScalarSlot)
       g.genInto(c, tmp)                          # integer bit pattern → GPR
       g.fmovFromGpr(dest, tmp, bits)             # reinterpret as float
       g.giveBack tmp
@@ -1589,7 +1636,7 @@ proc genIntoF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
     if protect: g.sealedF.excl dest
   case c.kind
   of FloatLit:
-    let tmp = g.borrowTmp()                     # materialize the bit pattern via a GPR
+    let tmp = g.borrowTmp(ScalarSlot)                     # materialize the bit pattern via a GPR
     if bits == 32:
       g.movImm(tmp, int64(cast[uint32](float32(floatVal(c)))))
     else:
@@ -1612,7 +1659,7 @@ proc genIntoF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
         skip c                                # result type
         let sf = g.genFReg(c, bits)
         let zero = g.borrowFTmp()
-        let z = g.borrowTmp(); g.movImm(z, 0)
+        let z = g.borrowTmp(ScalarSlot); g.movImm(z, 0)
         g.fmovFromGpr(zero, z, bits); g.giveBack z   # zero ← +0.0
         g.fbin(SubssX64, SubsdX64, zero, sf.f, bits) # 0 - x
         g.fmovF(dest, zero, bits)
@@ -1658,23 +1705,31 @@ proc genCoerce(g: var CodeGen; c: var Cursor; dest: Reg; isCast: bool) =
       return
     let (srcW, srcSigned) = g.srcWidthSigned(c)
     if targetPtr and g.regLocal.hasKey(dest) and dest notin g.boundTemps:
-      # `dest` is a typed (pointer) named local, and the value is an integer
-      # expression reinterpreted as a pointer — NIFC encodes pointer arithmetic
-      # the way Nim does, as `(cast ptr (add (u 64) …))`. Emitting the integer ops
-      # directly on the pointer-typed name would be rejected by nifasm (`ptr` has
-      # no arithmetic), so compute the integer value in an untyped scratch register
-      # and then move it into the pointer local — the cast is a bit reinterpret.
+      # `dest` is a typed (pointer) named local. The NIFC value is `(cast (ptr T) X)`
+      # — either an integer expression reinterpreted as a pointer (NIFC encodes Nim
+      # pointer arithmetic as `(cast ptr (add (u 64) …))`) or another pointer of a
+      # different pointee. arkham must PRESERVE that cast (never strip or invent one):
+      # compute `X` into a precisely-typed scratch, then store it reinterpreted to the
+      # target via the nifasm operand `(cast (ptr T) s)` — which is exactly the cast
+      # the NIFC already carries (parseOperand types the operand as the cast type).
       let nm = g.regLocal.getOrDefault(dest, "")   # the destination local's name
-      let s = g.borrowTmp()
+      let srcSlot = g.exprSlot(c)                  # the source's PRECISE type/slot
+      let s = g.borrowTmp(srcSlot)
       g.genInto(c, s)
-      if srcW < 64: g.extendTo(s, srcW, signed = false)
+      if srcSlot.kind in {AInt, AUInt} and srcSlot.size < 8:
+        g.extendTo(s, srcSlot.size * 8, signed = false)  # narrow int→ptr: zero-extend
       # Store into the destination's CURRENT home, re-resolved by name: evaluating
       # the RHS above may have evicted `dest` (this very destination local) to a
-      # spill slot to free a scratch register, in which case writing the captured
-      # `dest` register would be lost and the stale slot read back. `nm == ""` means
-      # `dest` is a plain scratch (no eviction possible) — write it directly.
-      if nm.len > 0: g.emitStoreLoc(g.ra.locationOfSym(nm), s)
-      else: g.movReg(dest, s)
+      # spill slot. `nm == ""` means `dest` is a plain scratch (no eviction possible).
+      var tcc = tc                                 # the target (ptr …) type to render
+      let dl = if nm.len > 0: g.ra.locationOfSym(nm) else: regLoc(dest, slotOf(g.prog, tc))
+      g.ab.tree MovX64:
+        case dl.kind
+        of NamedStack: g.emStackMem(dl.name)
+        else: g.emReg dl.r
+        g.ab.tree CastX:                           # (cast (ptr T) s) — the NIFC cast, preserved
+          g.genTypeBody(tcc)
+          g.emReg s
       g.giveBack s
       while c.hasMore: skip c
       return
@@ -1698,7 +1753,7 @@ proc emitPatAddr(g: var CodeGen; c: var Cursor; dest: Reg) =
   c.into:
     let baseTy = resolveType(g.prog, g.getType(c))
     var elem = innerType(g.prog, baseTy)
-    let baseReg = g.borrowTmp()
+    let baseReg = g.borrowTmp(ScalarSlot)
     if baseTy.typeKind in {NifcType.ArrayT, NifcType.FlexarrayT}:
       var bd = regLoc(baseReg, ScalarSlot)      # decay into the pre-borrowed base reg
       g.genAddr(c, bd)                           # baseReg ← &field
@@ -1709,7 +1764,7 @@ proc emitPatAddr(g: var CodeGen; c: var Cursor; dest: Reg) =
     var idxReg = NoReg
     if c.kind == IntLit: (idxImm = true; idxV = intVal(c); inc c)
     elif c.kind == UIntLit: (idxImm = true; idxV = cast[int64](uintVal(c)); inc c)
-    else: (idxReg = g.borrowTmp(); g.genInto(c, idxReg))
+    else: (idxReg = g.borrowTmp(ScalarSlot); g.genInto(c, idxReg))
     g.ab.tree LeaX64:
       g.emReg dest
       g.ab.tree AtX:
@@ -2303,6 +2358,7 @@ proc genConstr(g: var CodeGen; c: var Cursor; dstPtr: Reg) =
     "arkham x64 v0: runtime (aconstr …) not supported (constant arrays go to rodata)"
   var tc = c; inc tc                           # the constructed type symbol
   let typeName = symName(tc)
+  let objTy = resolveType(g.prog, tc)          # the (object …) body, for field types
   c.into:
     skip c                                     # the constructed type
     while c.hasMore:
@@ -2310,7 +2366,20 @@ proc genConstr(g: var CodeGen; c: var Cursor; dstPtr: Reg) =
       c.into:
         let field = symName(c); inc c
         var v = g.genVal(c); g.forceReg(v)
-        g.ab.tree MovX64: (g.emPtrFieldMem(dstPtr, typeName, field); g.emReg v.r)
+        # The store must respect nifasm's strong typing: a scalar value (an
+        # immediate / address computed in a GPR, e.g. `nil`→0 or `(addr const)`)
+        # going into a POINTER field is reinterpreted with a `(cast (ptr …) reg)`
+        # so the field's declared pointee type is preserved (a bare i64 register
+        # into a `(ptr T)` field is rejected). Non-pointer fields store directly.
+        var fty = resolveType(g.prog, fieldType(g.prog, objTy, field))
+        g.ab.tree MovX64:
+          g.emPtrFieldMem(dstPtr, typeName, field)
+          if isPtrType(fty):
+            g.ab.tree CastX:
+              g.genTypeBody(fty)
+              g.emReg v.r
+          else:
+            g.emReg v.r
         g.freeTemp(v)
         while c.hasMore: skip c                 # optional inherited-depth INTLIT
 
@@ -2362,7 +2431,7 @@ proc regsToStruct(g: var CodeGen; varName, typeName: string; regs: openArray[Reg
 proc copyStructThroughPtr(g: var CodeGen; srcVar, typeName: string; ptrReg: Reg) =
   ## field-wise copy of aggregate `srcVar` → the memory `ptrReg` points at.
   for f in aggrLayout(g.prog, typeName):
-    let t = g.borrowTmp()
+    let t = g.borrowTmp(ScalarSlot)
     g.ab.tree MovX64: (g.emReg t; g.emAggrFieldMem(srcVar, f.name))
     g.ab.tree MovX64: (g.emPtrFieldMem(ptrReg, typeName, f.name); g.emReg t)
     g.giveBack t
@@ -2463,7 +2532,7 @@ proc genCall(g: var CodeGen; c: var Cursor) =
             if a.kind == Symbol and
                g.ra.locationOfSym(symName(a)).kind in {NamedStack, OnStack}:
               raiseAssert "arkham x64 v0: rsp-relative local as a stack call argument"
-            let t = g.borrowTmp()
+            let t = g.borrowTmp(ScalarSlot)
             g.genInto(a, t)
             g.ab.tree MovX64:
               g.ab.tree MemX:
@@ -2510,7 +2579,7 @@ proc genCall(g: var CodeGen; c: var Cursor) =
           var tc = c; inc tc                    # the constructed type
           let tn = symName(tc)
           let tmpName = g.freshAggrTemp(tn)
-          let p = g.borrowTmp(); g.emStackAddr(p, tmpName)
+          let p = g.borrowTmp(ScalarSlot); g.emStackAddr(p, tmpName)
           g.genConstr(c, p)                     # consumes the constructor
           g.giveBack p
           g.marshalAggrArg(tmpName, tn, idx, sealedHere)
@@ -2707,7 +2776,7 @@ proc cmpImm(g: var CodeGen; selReg: Reg; v: int64) =
   if v >= 0 and v <= 0xFFFF:
     g.ab.tree CmpX64: (g.emReg selReg; g.ab.intLit v)
   else:
-    let tmp = g.borrowTmp()
+    let tmp = g.borrowTmp(ScalarSlot)
     g.movImm(tmp, v)
     g.ab.tree CmpX64: (g.emReg selReg; g.emReg tmp)
     g.giveBack tmp
@@ -3409,7 +3478,7 @@ proc emitGlobalInits(g: var CodeGen) =
           let gbits = if gslot.size == 4: 32 else: 64
           let fv = g.borrowFTmp()
           g.genIntoF(c, fv, gbits)
-          let p = g.borrowTmp()
+          let p = g.borrowTmp(ScalarSlot)
           g.emGlobalAddr(p, name)
           let op = if gbits == 32: MovssX64 else: MovsdX64
           g.ab.tree op:
@@ -3418,9 +3487,9 @@ proc emitGlobalInits(g: var CodeGen) =
           g.giveBack p
           g.giveBackF fv
         else:
-          let v = g.borrowTmp()
+          let v = g.borrowTmp(ScalarSlot)
           g.genInto(c, v)                          # evaluate the initializer
-          let p = g.borrowTmp()
+          let p = g.borrowTmp(ScalarSlot)
           g.emGlobalAddr(p, name)
           g.ab.tree MovX64:
             g.ab.tree MemX: g.emReg p
