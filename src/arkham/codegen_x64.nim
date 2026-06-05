@@ -1693,11 +1693,13 @@ proc linuxSyscallNr(name: string): int =
 # Inside a sequence there are no calls, so RAX/RCX/RDX (not in the allocator pool)
 # are free scratch; the result lands in RAX (the integer return register).
 
-proc genReg(g: var CodeGen; c: var Cursor): tuple[r: Reg, owns: bool] =
-  var d = dontCare                            # dont-care: gen writes back where it landed
-  g.gen(c, d)
-  g.forceReg(d)
-  (d.r, d.isTemp)
+proc genReg(g: var CodeGen; c: var Cursor): Location =
+  ## Evaluate `c` into *some* register and return its `Location` — a register-
+  ## resident value in place, else a borrowed scratch (`isTemp = true`) the caller
+  ## releases with `freeTemp`. `.r` is the register.
+  result = dontCare                           # dont-care: gen writes back where it landed
+  g.gen(c, result)
+  g.forceReg(result)
 
 proc emMemAt(g: var CodeGen; p: Reg) =        # `(mem p)` — dereference the pointer in p
   g.ab.tree MemX: g.emReg p
@@ -1736,79 +1738,79 @@ proc genAtomic(g: var CodeGen; c: var Cursor; builtin: string) =
   ## Lower one `__atomic_*` builtin; `c` is at the first argument. Result → rax.
   case builtin
   of "__atomic_load_n":                        # (ptr, memorder) → *ptr
-    let (p, pT) = g.genReg(c); skip c
-    g.ab.tree MovX64: (g.emReg RAX; g.emMemAt p)
-    if pT: g.giveBack p
+    let p = g.genReg(c); skip c
+    g.ab.tree MovX64: (g.emReg RAX; g.emMemAt p.r)
+    g.freeTemp(p)
   of "__atomic_store_n":                        # (ptr, val, memorder) → void
-    let (p, pT) = g.genReg(c)
-    let (v, vT) = g.genReg(c); skip c
-    g.ab.tree MovX64: (g.emMemAt p; g.emReg v)
-    if vT: g.giveBack v
-    if pT: g.giveBack p
+    let p = g.genReg(c)
+    let v = g.genReg(c); skip c
+    g.ab.tree MovX64: (g.emMemAt p.r; g.emReg v.r)
+    g.freeTemp(v)
+    g.freeTemp(p)
   of "__atomic_clear":                          # (ptr, memorder) → void; *ptr = 0
-    let (p, pT) = g.genReg(c); skip c
+    let p = g.genReg(c); skip c
     g.movImm(RDX, 0)
-    g.ab.tree MovX64: (g.emMemAt p; g.emReg RDX)
-    if pT: g.giveBack p
+    g.ab.tree MovX64: (g.emMemAt p.r; g.emReg RDX)
+    g.freeTemp(p)
   of "__atomic_thread_fence":                   # (memorder) → void
     skip c
     g.ab.keyword MfenceX64
   of "__atomic_signal_fence":                   # (memorder) → void; compiler barrier only
     skip c
   of "__atomic_exchange_n":                     # (ptr, val, memorder) → old
-    let (p, pT) = g.genReg(c)
-    let (v, vT) = g.genReg(c); skip c
-    g.ab.tree XchgX64: (g.emMemAt p; g.emReg v)  # v ↔ [p] (implicitly locked); v ← old
-    g.movReg(RAX, v)
-    if vT: g.giveBack v
-    if pT: g.giveBack p
+    let p = g.genReg(c)
+    let v = g.genReg(c); skip c
+    g.ab.tree XchgX64: (g.emMemAt p.r; g.emReg v.r)  # v ↔ [p] (locked); v ← old
+    g.movReg(RAX, v.r)
+    g.freeTemp(v)
+    g.freeTemp(p)
   of "__atomic_fetch_add", "__atomic_fetch_sub",
      "__atomic_add_fetch", "__atomic_sub_fetch",
      "__atomic_fetch_and", "__atomic_fetch_or", "__atomic_fetch_xor":
-    let (p, pT) = g.genReg(c)
-    let (v, vT) = g.genReg(c); skip c
+    let p = g.genReg(c)
+    let v = g.genReg(c); skip c
     case builtin
-    of "__atomic_fetch_add": g.genAtomicXadd(p, v, returnNew = false, sub = false)
-    of "__atomic_fetch_sub": g.genAtomicXadd(p, v, returnNew = false, sub = true)
-    of "__atomic_add_fetch": g.genAtomicXadd(p, v, returnNew = true, sub = false)
-    of "__atomic_sub_fetch": g.genAtomicXadd(p, v, returnNew = true, sub = true)
-    of "__atomic_fetch_and": g.genAtomicLoopRmw(p, v, AndX64)
-    of "__atomic_fetch_or":  g.genAtomicLoopRmw(p, v, OrX64)
-    of "__atomic_fetch_xor": g.genAtomicLoopRmw(p, v, XorX64)
+    of "__atomic_fetch_add": g.genAtomicXadd(p.r, v.r, returnNew = false, sub = false)
+    of "__atomic_fetch_sub": g.genAtomicXadd(p.r, v.r, returnNew = false, sub = true)
+    of "__atomic_add_fetch": g.genAtomicXadd(p.r, v.r, returnNew = true, sub = false)
+    of "__atomic_sub_fetch": g.genAtomicXadd(p.r, v.r, returnNew = true, sub = true)
+    of "__atomic_fetch_and": g.genAtomicLoopRmw(p.r, v.r, AndX64)
+    of "__atomic_fetch_or":  g.genAtomicLoopRmw(p.r, v.r, OrX64)
+    of "__atomic_fetch_xor": g.genAtomicLoopRmw(p.r, v.r, XorX64)
     else: discard
-    if vT: g.giveBack v
-    if pT: g.giveBack p
+    g.freeTemp(v)
+    g.freeTemp(p)
   of "__atomic_test_and_set":                   # (ptr, memorder) → bool (old != 0)
-    let (p, pT) = g.genReg(c); skip c
+    let p = g.genReg(c); skip c
     g.movImm(RDX, 1)
-    g.ab.tree XchgX64: (g.emMemAt p; g.emReg RDX)   # rdx ← old; [p] = 1
+    g.ab.tree XchgX64: (g.emMemAt p.r; g.emReg RDX)   # rdx ← old; [p] = 1
     let lSkip = g.freshLabel()
     g.movImm(RAX, 0)
     g.ab.tree CmpX64: (g.emReg RDX; g.ab.intLit 0)
     g.emJcc(JeX64, lSkip)
     g.movImm(RAX, 1)
     g.emLab(lSkip)
-    if pT: g.giveBack p
+    g.freeTemp(p)
   of "__atomic_compare_exchange_n":             # (ptr, exp_ptr, des, weak, succ, fail) → bool
-    let (p, pT) = g.genReg(c)
-    let (ep, eT) = g.genReg(c)
+    let p = g.genReg(c)
+    let ep = g.genReg(c)
     g.genInto(c, RCX)                            # desired → rcx (non-pool scratch)
     skip c; skip c; skip c                       # weak, success order, failure order
-    g.ab.tree MovX64: (g.emReg RAX; g.emMemAt ep)   # rax = *exp (the comparand)
+    g.ab.tree MovX64: (g.emReg RAX; g.emMemAt ep.r)   # rax = *exp (the comparand)
     g.ab.tree LockX64:
       g.ab.tree CmpxchgX64:
-        g.emMemAt p
+        g.emMemAt p.r
         g.emReg RCX                              # if [p]==rax: [p]=rcx,ZF=1 else rax=[p],ZF=0
     let lFail = g.freshLabel()
     let lDone = g.freshLabel()
     g.emJcc(JneX64, lFail)
     g.movImm(RAX, 1); g.emJmp(lDone)             # success → 1
     g.emLab(lFail)
-    g.ab.tree MovX64: (g.emMemAt ep; g.emReg RAX)   # *exp = actual old value (rax)
+    g.ab.tree MovX64: (g.emMemAt ep.r; g.emReg RAX)   # *exp = actual old value (rax)
     g.movImm(RAX, 0)                             # failure → 0
     g.emLab(lDone)
-    if eT: g.giveBack ep
-    if pT: g.giveBack p
+    g.freeTemp(ep)
+    g.freeTemp(p)
   else:
     raiseAssert "arkham x64 v0: unsupported atomic builtin: " & builtin
 

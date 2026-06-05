@@ -243,7 +243,7 @@ proc genAtomic(g: var CodeGen; c: var Cursor; builtin: string)
 proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string)
 proc genAddr(g: var CodeGen; c: var Cursor; dest: Reg)
 proc materializeCond(g: var CodeGen; c: var Cursor; dest: Reg)
-proc genReg(g: var CodeGen; c: var Cursor): tuple[r: Reg, temp: bool]
+proc genReg(g: var CodeGen; c: var Cursor): Location
 proc genFReg(g: var CodeGen; c: var Cursor; bits: int): tuple[f: FReg, temp: bool]
 proc structToRegs(g: var CodeGen; varName, typeName: string; firstArg: int)
 proc regsToStruct(g: var CodeGen; varName, typeName: string; firstArg: int)
@@ -466,11 +466,12 @@ proc genVal(g: var CodeGen; c: var Cursor): Location =
       g.genInto(c, t)
       result = regLoc(t, ScalarSlot, isTemp = true)
 
-proc genReg(g: var CodeGen; c: var Cursor): tuple[r: Reg, temp: bool] =
-  ## `forceReg(genVal …)`: evaluate `c` into *some* register — a register-
-  ## resident symbol in place, else a borrowed scratch the caller must `giveBack`.
-  var d = g.genVal(c); g.forceReg(d)
-  result = (d.r, d.isTemp)
+proc genReg(g: var CodeGen; c: var Cursor): Location =
+  ## `forceReg(genVal …)`: evaluate `c` into *some* register and return its
+  ## `Location` — a register-resident symbol in place, else a borrowed scratch
+  ## (`isTemp`) the caller releases with `freeTemp`. `.r` is the register.
+  result = g.genVal(c)
+  g.forceReg(result)
 
 proc commutativeOp(op: A64Inst): bool {.inline.} =
   ## Integer ops for which `a op b == b op a`, so Sethi–Ullman may evaluate the
@@ -645,7 +646,7 @@ proc genMod(g: var CodeGen; c: var Cursor; dest: Reg) =
     var br: Reg
     var bt = false
     if bSaved != NoReg: (br = bSaved; skip c)   # br = b (saved); consume b
-    else: (let t = g.genReg(c); br = t.r; bt = t.temp)  # br = b
+    else: (let t = g.genReg(c); br = t.r; bt = t.isTemp)  # br = b
     let q = g.borrowTmp()
     g.movReg(q, dest)                       # q = a
     g.binReg(if signed: SdivA64 else: UdivA64, q, br)  # q = a div b
@@ -673,10 +674,10 @@ proc genBitnot(g: var CodeGen; c: var Cursor; dest: Reg) =
 proc genNot(g: var CodeGen; c: var Cursor; dest: Reg) =
   ## boolean `(not a)` → `dest = 1 - a` (a ∈ {0,1}); no result-type child.
   c.into:
-    let (br, bt) = g.genReg(c)
+    let b = g.genReg(c)
     g.movImm(dest, 1)
-    g.binReg(SubA64, dest, br)
-    if bt: g.giveBack br
+    g.binReg(SubA64, dest, b.r)
+    g.freeTemp(b)
 
 proc extendTo(g: var CodeGen; dest: Reg; width: int; signed: bool) =
   ## Normalize the low `width` bits of `dest` to its full 64-bit register form
@@ -695,7 +696,7 @@ proc derefPtrCur(g: var CodeGen; nn: Cursor): tuple[r: Reg, temp: bool] =
   var pr = NoReg
   var pt = false
   p.into:
-    let (r, t) = g.genReg(p); pr = r; pt = t
+    let rl = g.genReg(p); pr = rl.r; pt = rl.isTemp
     while p.hasMore: skip p                  # (cppref)?
   result = (pr, pt)
 
@@ -1581,11 +1582,11 @@ proc genOconstr(g: var CodeGen; c: var Cursor; destVar: string) =
       assert c.substructureKind == KvU, "arkham v1: oconstr expects (kv …) pairs"
       c.into:                               # (kv Field Value [InheritDepth])
         let field = symName(c); inc c
-        let (rr, rt) = g.genReg(c)          # value → register
+        let rr = g.genReg(c)                # value → register
         g.ab.tree MovA64:
           g.emAggrFieldMem(destVar, field)
-          g.emReg rr
-        if rt: g.giveBack rr
+          g.emReg rr.r
+        g.freeTemp(rr)
         while c.hasMore: skip c             # optional inherited-object INTLIT
 
 proc genTypeBody(g: var CodeGen; c: var Cursor) =
@@ -1855,9 +1856,9 @@ proc genAtomicRmw(g: var CodeGen; pReg, val: Reg; isXchg: bool;
 proc genAtomicCmpXchg(g: var CodeGen; c: var Cursor) =
   ## `__atomic_compare_exchange_n(ptr, expected_ptr, desired, weak, succ, fail)`.
   ## Returns 1 on success, 0 on failure; on failure *expected is updated.
-  let (pReg, pT) = g.genReg(c)
-  let (expPtr, expT) = g.genReg(c)
-  let (des, desT) = g.genReg(c)
+  let pReg = g.genReg(c)
+  let expPtr = g.genReg(c)
+  let des = g.genReg(c)
   skip c; skip c; skip c                    # weak, success order, failure order
   let xExp = g.borrowTmp()
   let xOld = g.borrowTmp()
@@ -1865,7 +1866,7 @@ proc genAtomicCmpXchg(g: var CodeGen; c: var Cursor) =
   let loop = g.freshLabel()
   let lFail = g.freshLabel()
   let lDone = g.freshLabel()
-  let (p, ep, d) = (regName pReg, regName expPtr, regName des)
+  let (p, ep, d) = (regName pReg.r, regName expPtr.r, regName des.r)
   let (exp, old, st, ret) = (regName xExp, regName xOld,
                              regName xStatus, regName IntRet)
   g.ab.splice(
@@ -1879,30 +1880,30 @@ proc genAtomicCmpXchg(g: var CodeGen; c: var Cursor) =
     &"(stlr ({old}) ({ep})) " &                    # *expected = actual old value
     &"(mov ({ret}) 0) (lab :{lDone})")
   g.giveBack xStatus; g.giveBack xOld; g.giveBack xExp
-  if desT: g.giveBack des
-  if expT: g.giveBack expPtr
-  if pT: g.giveBack pReg
+  g.freeTemp(des)
+  g.freeTemp(expPtr)
+  g.freeTemp(pReg)
 
 proc genAtomic(g: var CodeGen; c: var Cursor; builtin: string) =
   ## Lower one `__atomic_*` builtin call. `c` is positioned at the first
   ## argument; this consumes all of them. Result (if any) lands in x0.
   case builtin
   of "__atomic_load_n":                      # (ptr, memorder) → *ptr
-    let (pReg, pT) = g.genReg(c); skip c
-    g.emLdar(IntRet, pReg)
-    if pT: g.giveBack pReg
+    let pReg = g.genReg(c); skip c
+    g.emLdar(IntRet, pReg.r)
+    g.freeTemp(pReg)
   of "__atomic_store_n":                     # (ptr, val, memorder) → void
-    let (pReg, pT) = g.genReg(c)
-    let (val, valT) = g.genReg(c); skip c
-    g.emStlr(val, pReg)
-    if valT: g.giveBack val
-    if pT: g.giveBack pReg
+    let pReg = g.genReg(c)
+    let val = g.genReg(c); skip c
+    g.emStlr(val.r, pReg.r)
+    g.freeTemp(val)
+    g.freeTemp(pReg)
   of "__atomic_clear":                       # (ptr, memorder) → void; *ptr = 0
-    let (pReg, pT) = g.genReg(c); skip c
+    let pReg = g.genReg(c); skip c
     let z = g.borrowTmp(); g.movImm(z, 0)
-    g.emStlr(z, pReg)
+    g.emStlr(z, pReg.r)
     g.giveBack z
-    if pT: g.giveBack pReg
+    g.freeTemp(pReg)
   of "__atomic_thread_fence":                # (memorder) → void
     skip c
     g.ab.keyword DmbA64
@@ -1912,30 +1913,30 @@ proc genAtomic(g: var CodeGen; c: var Cursor; builtin: string) =
      "__atomic_fetch_add", "__atomic_fetch_sub",
      "__atomic_fetch_and", "__atomic_fetch_or", "__atomic_fetch_xor",
      "__atomic_add_fetch", "__atomic_sub_fetch":
-    let (pReg, pT) = g.genReg(c)
-    let (val, valT) = g.genReg(c); skip c    # ptr, val, memorder
+    let pReg = g.genReg(c)
+    let val = g.genReg(c); skip c            # ptr, val, memorder
     case builtin
-    of "__atomic_exchange_n":  g.genAtomicRmw(pReg, val, true, NoA64Inst, false)
-    of "__atomic_fetch_add":   g.genAtomicRmw(pReg, val, false, AddA64, false)
-    of "__atomic_fetch_sub":   g.genAtomicRmw(pReg, val, false, SubA64, false)
-    of "__atomic_fetch_and":   g.genAtomicRmw(pReg, val, false, AndA64, false)
-    of "__atomic_fetch_or":    g.genAtomicRmw(pReg, val, false, OrrA64, false)
-    of "__atomic_fetch_xor":   g.genAtomicRmw(pReg, val, false, EorA64, false)
-    of "__atomic_add_fetch":   g.genAtomicRmw(pReg, val, false, AddA64, true)
-    of "__atomic_sub_fetch":   g.genAtomicRmw(pReg, val, false, SubA64, true)
+    of "__atomic_exchange_n":  g.genAtomicRmw(pReg.r, val.r, true, NoA64Inst, false)
+    of "__atomic_fetch_add":   g.genAtomicRmw(pReg.r, val.r, false, AddA64, false)
+    of "__atomic_fetch_sub":   g.genAtomicRmw(pReg.r, val.r, false, SubA64, false)
+    of "__atomic_fetch_and":   g.genAtomicRmw(pReg.r, val.r, false, AndA64, false)
+    of "__atomic_fetch_or":    g.genAtomicRmw(pReg.r, val.r, false, OrrA64, false)
+    of "__atomic_fetch_xor":   g.genAtomicRmw(pReg.r, val.r, false, EorA64, false)
+    of "__atomic_add_fetch":   g.genAtomicRmw(pReg.r, val.r, false, AddA64, true)
+    of "__atomic_sub_fetch":   g.genAtomicRmw(pReg.r, val.r, false, SubA64, true)
     else: discard
-    if valT: g.giveBack val
-    if pT: g.giveBack pReg
+    g.freeTemp(val)
+    g.freeTemp(pReg)
   of "__atomic_test_and_set":                # (ptr, memorder) → bool (old != 0)
-    let (pReg, pT) = g.genReg(c); skip c
+    let pReg = g.genReg(c); skip c
     let one = g.borrowTmp(); g.movImm(one, 1)
-    g.genAtomicRmw(pReg, one, true, NoA64Inst, false)  # x0 = old
+    g.genAtomicRmw(pReg.r, one, true, NoA64Inst, false)  # x0 = old
     let xOld = g.borrowTmp(); g.movReg(xOld, IntRet)
     let lSkip = g.freshLabel()
     let (old, ret) = (regName xOld, regName IntRet)
     g.ab.splice &"(mov ({ret}) 0) (cmp ({old}) 0) (beq {lSkip}) (mov ({ret}) 1) (lab :{lSkip})"
     g.giveBack xOld; g.giveBack one
-    if pT: g.giveBack pReg
+    g.freeTemp(pReg)
   of "__atomic_compare_exchange_n":
     g.genAtomicCmpXchg(c)
   else:
@@ -1952,9 +1953,10 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
   ## all of them.
   case builtin
   of "memcpy":                                 # (dst, src, n) → dst
-    let (dst, dstT) = g.genReg(c)
-    let (src, srcT) = g.genReg(c)
-    let (n, nT) = g.genReg(c)
+    let dstL = g.genReg(c)
+    let srcL = g.genReg(c)
+    let nL = g.genReg(c)
+    let (dst, src, n) = (dstL.r, srcL.r, nL.r)
     let i = g.borrowTmp()
     let b = g.borrowTmp()
     let loop = g.freshLabel()
@@ -1970,13 +1972,12 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
     g.emLab(done)
     g.movReg(IntRet, dst)                       # memcpy returns dest
     g.giveBack b; g.giveBack i
-    if nT: g.giveBack n
-    if srcT: g.giveBack src
-    if dstT: g.giveBack dst
+    g.freeTemp(nL); g.freeTemp(srcL); g.freeTemp(dstL)
   of "memmove":                                # (dst, src, n) → dst; overlap-safe
-    let (dst, dstT) = g.genReg(c)
-    let (src, srcT) = g.genReg(c)
-    let (n, nT) = g.genReg(c)
+    let dstL = g.genReg(c)
+    let srcL = g.genReg(c)
+    let nL = g.genReg(c)
+    let (dst, src, n) = (dstL.r, srcL.r, nL.r)
     let i = g.borrowTmp()
     let b = g.borrowTmp()
     let fwd = g.freshLabel()
@@ -2007,13 +2008,12 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
     g.emLab(done)
     g.movReg(IntRet, dst)
     g.giveBack b; g.giveBack i
-    if nT: g.giveBack n
-    if srcT: g.giveBack src
-    if dstT: g.giveBack dst
+    g.freeTemp(nL); g.freeTemp(srcL); g.freeTemp(dstL)
   of "memset":                                 # (dst, val, n) → dst
-    let (dst, dstT) = g.genReg(c)
-    let (val, valT) = g.genReg(c)
-    let (n, nT) = g.genReg(c)
+    let dstL = g.genReg(c)
+    let valL = g.genReg(c)
+    let nL = g.genReg(c)
+    let (dst, val, n) = (dstL.r, valL.r, nL.r)
     let i = g.borrowTmp()
     let loop = g.freshLabel()
     let done = g.freshLabel()
@@ -2027,13 +2027,12 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
     g.emLab(done)
     g.movReg(IntRet, dst)
     g.giveBack i
-    if nT: g.giveBack n
-    if valT: g.giveBack val
-    if dstT: g.giveBack dst
+    g.freeTemp(nL); g.freeTemp(valL); g.freeTemp(dstL)
   of "memcmp":                                 # (a, b, n) → first byte difference
-    let (pa, paT) = g.genReg(c)
-    let (pb, pbT) = g.genReg(c)
-    let (n, nT) = g.genReg(c)
+    let paL = g.genReg(c)
+    let pbL = g.genReg(c)
+    let nL = g.genReg(c)
+    let (pa, pb, n) = (paL.r, pbL.r, nL.r)
     let i = g.borrowTmp()
     let ba = g.borrowTmp()
     let bb = g.borrowTmp()
@@ -2059,9 +2058,7 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
     g.movImm(IntRet, 0)
     g.emLab(done)
     g.giveBack bb; g.giveBack ba; g.giveBack i
-    if nT: g.giveBack n
-    if pbT: g.giveBack pb
-    if paT: g.giveBack pa
+    g.freeTemp(nL); g.freeTemp(pbL); g.freeTemp(paL)
   else:
     raiseAssert "arkham: unsupported mem intrinsic: " & builtin
 
@@ -2105,7 +2102,7 @@ proc emitCmpBranch(g: var CodeGen; c: var Cursor; toLabel: string; whenTrue: boo
       let a = g.genReg(c)
       var bImm = false
       var bImmV = 0'i64
-      var b = (r: NoReg, temp: false)
+      var b = regLoc(NoReg, ScalarSlot)         # filled below unless `b` is a small imm
       if c.kind == IntLit and intVal(c) >= 0 and intVal(c) <= 0xFFFF:
         bImm = true; bImmV = intVal(c); inc c
       else:
@@ -2113,8 +2110,8 @@ proc emitCmpBranch(g: var CodeGen; c: var Cursor; toLabel: string; whenTrue: boo
       g.ab.tree CmpA64:
         g.emReg a.r
         if bImm: g.ab.intLit bImmV else: g.emReg b.r
-      if not bImm and b.temp: g.giveBack b.r
-      if a.temp: g.giveBack a.r
+      if not bImm: g.freeTemp(b)
+      g.freeTemp(a)
   g.emBr(tag, toLabel)
 
 proc emitCondJump(g: var CodeGen; c: var Cursor; toLabel: string; whenTrue: bool) =
@@ -2154,10 +2151,10 @@ proc emitCondJump(g: var CodeGen; c: var Cursor; toLabel: string; whenTrue: bool
       return
     else: discard
   # a plain boolean value: branch on `v != 0` / `v == 0`
-  let (r, t) = g.genReg(c)
-  g.ab.tree CmpA64: (g.emReg r; g.ab.intLit 0)
+  let v = g.genReg(c)
+  g.ab.tree CmpA64: (g.emReg v.r; g.ab.intLit 0)
   g.emBr(if whenTrue: BneA64 else: BeqA64, toLabel)
-  if t: g.giveBack r
+  g.freeTemp(v)
 
 proc materializeCond(g: var CodeGen; c: var Cursor; dest: Reg) =
   ## Spill a pending condition into `dest` as a `0`/`1` boolean.
@@ -2259,7 +2256,8 @@ proc genCase(g: var CodeGen; c: var Cursor) =
     var signed = true
     if c.kind == Symbol and g.ra.locationOfSym(symName(c)).typ.kind == AUInt:
       signed = false
-    let (selReg, selTemp) = g.genReg(c)     # selector value, live across all tests
+    let sel = g.genReg(c)                    # selector value, live across all tests
+    let selReg = sel.r
     # Pass 1: emit the comparison tests; remember each body's StmtList cursor.
     var bodies: seq[(string, Cursor)] = @[]
     var elseBody = c                        # placeholder; overwritten if an `else` exists
@@ -2282,7 +2280,7 @@ proc genCase(g: var CodeGen; c: var Cursor) =
         hasElse = true
         skip c
       else: skip c
-    if selTemp: g.giveBack selReg
+    g.freeTemp(sel)
     # No match falls through here: run the else body (if any), then skip bodies.
     if hasElse:
       elseBody.into:
@@ -2354,9 +2352,9 @@ proc gen(g: var CodeGen; c: var Cursor; dest: var Location) =
       g.emitStoreF(dest, fr, bits)
       if ft: g.giveBackF fr
     else:
-      let (rr, rt) = g.genReg(c)
-      g.emitStore(dest, rr)
-      if rt: g.giveBack rr
+      let rr = g.genReg(c)
+      g.emitStore(dest, rr.r)
+      g.freeTemp(rr)
   else: raiseAssert "arkham a64: gen() cannot target dest kind " & $dest.kind
 
 proc genAsgn(g: var CodeGen; c: var Cursor) =
