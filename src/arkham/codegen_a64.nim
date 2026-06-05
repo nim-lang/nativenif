@@ -518,6 +518,9 @@ proc emFloatScalarStore(g: var CodeGen; name: string; src: FReg; bits: int) =
   ## `[slot] ← src` — store to a spilled float's `(s)` var.
   g.ab.tree FstrA64: (g.ab.sym name; g.emFReg(src, bits))
 
+# MODEL: the `pickStaging` action in proofs/arkham_bindings.tla — only ever returns a
+# register with no live owner (the `Free` guard); staging on an occupied reg breaks
+# NoSharedRegister. Change this ⇒ re-check that action.
 proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg =
   ## The first caller-saved arg register (x0–x7) that is not `avoid`, not sealed, not
   ## a named local's home, not a bound scratch temp, and not a live expression
@@ -615,6 +618,9 @@ proc replayEviction(g: var CodeGen; ev: StealEvent) =
   g.ra.locs[g.ra.symPos[ev.victim]] = namedStackLoc(ev.slot, ev.typ)
   g.regLocal.del ev.reg
 
+# MODEL: the `steal` action in proofs/arkham_bindings.tla — the evicted victim must move
+# to a stack slot (loc→Stack, binding cleared) or LiveLocalsHaveHomes / RegisterBindingsMatchLoc
+# break. Change this ⇒ re-check that action.
 proc stealReg(g: var CodeGen; logIdx: int): Reg =
   ## `freeTmp` is exhausted. Evict a register-bound local that is *not* in flight
   ## (not sealed, not a live accumulator, not a bound scratch temp) and hand its
@@ -636,6 +642,9 @@ proc stealReg(g: var CodeGen; logIdx: int): Reg =
     g.replayEviction(ev)
     result = ev.reg
 
+# MODEL: a staging register handed out for a *held* value must be tracked, not raw (see
+# proofs/arkham_bindings.tla NoSharedRegister) — hence the total `borrowTmp` below, not a
+# bare `pickStaging`; two raw staging values would otherwise collide on one register.
 proc forceReg(g: var CodeGen; dest: var Location) =
   ## Ensure `dest` is in a register, mutating it IN PLACE. An immediate / spilled
   ## memory operand is materialized into a fresh scratch temp — or, when the pool is
@@ -1617,6 +1626,9 @@ proc emitPatAddr(g: var CodeGen; c: var Cursor; dest: Reg) =
     g.giveBack baseReg
     while c.hasMore: skip c
 
+# MODEL: the init-home seal in proofs/arkham_bindings.tla (`beginInit` seals the home;
+# ValueConsistency). The `sealHome` below protects a register-local home while its own
+# value is built — without it a steal evicts the home and the write lands in a stale reg.
 proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
   # While `dest` holds the value being built, a deep sub-operand may exhaust the
   # scratch pool and spill — its transient staging register must not clobber
@@ -3029,6 +3041,9 @@ proc emitProcBody(g: var CodeGen; info: ProcInfo) =
         if g.hasFrame: framePop(g)
         g.ab.keyword RetA64
 
+# MODEL: the `StartEmit` per-proc reset in proofs/arkham_bindings.tla. The two-pass seam
+# below must reset every per-proc table (regLocal/boundTemps/freeTmp + the ra.locs snapshot)
+# or RegisterBindingsMatchLoc and replay completeness break.
 proc genProc(g: var CodeGen; info: ProcInfo) =
   let an = analyseProc(g.buf[], info.decl, g.tvarNames)
   g.varType = initTable[string, string]()     # per-proc (symbol names recycle)

@@ -148,6 +148,9 @@ proc replayEviction(g: var CodeGen; ev: StealEvent) =
   g.ra.locs[g.ra.symPos[ev.victim]] = namedStackLoc(ev.slot, ev.typ)
   g.regLocal.del ev.reg
 
+# MODEL: the `steal` action in proofs/arkham_bindings.tla — the evicted victim must move
+# to a stack slot (loc→Stack, binding cleared) or LiveLocalsHaveHomes / RegisterBindingsMatchLoc
+# break. Change this ⇒ re-check that action.
 proc stealReg(g: var CodeGen; logIdx: int): Reg =
   ## `freeTmp` is exhausted. Evict a register-bound local that is *not* in flight
   ## (not sealed, not a live accumulator) to a fresh stack slot and hand its
@@ -170,6 +173,8 @@ proc stealReg(g: var CodeGen; logIdx: int): Reg =
     g.replayEviction(ev)
     result = ev.reg
 
+# MODEL: the `fixedUse` action in proofs/arkham_bindings.tla — a fixed-register clobber must
+# evict a live local first (loc→Stack) and never a sealed in-flight value.
 proc evictFixedReg(g: var CodeGen; r: Reg) =
   ## A fixed-physical-register instruction is about to clobber `r` (idiv → RDX,
   ## byteCopyConst → RCX): registers the ISA forces an instruction to overwrite,
@@ -1027,6 +1032,9 @@ proc regHoldsLiveLocal(g: var CodeGen; r: Reg): bool =
     let loc = g.ra.locs[pos]
     if loc.kind == InReg and loc.r == r: return true
 
+# MODEL: the `pickStaging` action in proofs/arkham_bindings.tla — only ever returns a
+# register with no live owner (the `Free` guard); staging on an occupied reg breaks
+# NoSharedRegister. Change this ⇒ re-check that action.
 proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg =
   ## The first non-sealed caller-saved GPR that is not the scratch pool (r10/r11,
   ## exhausted by the time we get here), not a live local/param home (a param may
@@ -1716,6 +1724,9 @@ proc emitPatAddr(g: var CodeGen; c: var Cursor; dest: Reg) =
     g.giveBack baseReg
     while c.hasMore: skip c
 
+# MODEL: the init-home seal in proofs/arkham_bindings.tla (`beginInit` seals the home;
+# ValueConsistency). The `sealHome` below protects a register-local home while its own
+# value is built — without it a steal evicts the home and the write lands in a stale reg.
 proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
   # While `dest` holds the value being built, a deep sub-operand may exhaust the
   # scratch pool and spill — its transient staging register must not clobber
@@ -3261,6 +3272,9 @@ proc emitProcBody(g: var CodeGen; info: ProcInfo; declarative: bool) =
         g.framePop()
         g.ab.keyword RetX64
 
+# MODEL: the `StartEmit` per-proc reset in proofs/arkham_bindings.tla. The two-pass seam
+# below must reset every per-proc table (regLocal/boundTemps/freeTmp + the ra.locs snapshot)
+# or RegisterBindingsMatchLoc and replay completeness break.
 proc genProc(g: var CodeGen; info: ProcInfo) =
   # Unlike A64 (where a thread-local goes through a TLV-descriptor thunk call), x64
   # reads/writes a tvar directly as an FS-segment operand — no call — so tvar
