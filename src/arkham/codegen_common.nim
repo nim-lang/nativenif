@@ -20,7 +20,10 @@ import asmbuf
 
 type
   StealEvent* = object
-    victim*: string      ## NIFC name of the evicted register-local
+    victim*: string      ## the evicted local's *allocator* name (its `symPos` key)
+    bindName*: string    ## its nifasm *binding* name — usually == `victim`, but a
+                         ## declarative param's arg register is bound to the signature
+                         ## alias `pN.0`, which is what must be `kill`ed
     slot*: string        ## the stack slot it was moved to (distinct basename)
     reg*: Reg            ## the register freed for scratch
     typ*: AsmSlot        ## the victim's slot type (for the stack-slot decl)
@@ -89,6 +92,14 @@ type
                                              ## to a stack slot); recorded in the
                                              ## plan pass, replayed (with the spill
                                              ## store) in the emit pass.
+    fixedEvicts*: Table[int, StealEvent]     ## call-order index → an eviction forced
+                                             ## by a fixed-physical-register
+                                             ## instruction about to clobber a reg
+                                             ## that still holds a live local (idiv →
+                                             ## RDX, byteCopyConst → RCX). Same
+                                             ## plan-record / emit-replay model as
+                                             ## `stealEvents`, keyed by `fixedEvictSeq`.
+    fixedEvictSeq*: int                      ## replay counter into `fixedEvicts`
 
 # ── type predicates ─────────────────────────────────────────────────────────
 

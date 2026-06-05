@@ -2069,6 +2069,18 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
   else:
     raiseAssert "arkham: unsupported mem intrinsic: " & builtin
 
+proc cmpOperandUnsigned(g: var CodeGen; c: Cursor): bool =
+  ## Does comparison/`case` operand `c` carry an unsigned (or char) type? Drives the
+  ## unsigned-vs-signed condition code. A bare signed literal is ambiguous (→ false,
+  ## let the other operand decide); `UIntLit`/`CharLit` are unsigned; every other
+  ## operand is typed through `getType` — so unsigned fields, array elements, derefs,
+  ## casts, computed expressions, and an unsigned symbol in *either* operand position
+  ## are detected, not just a bare unsigned symbol in the first position.
+  case c.kind
+  of UIntLit, CharLit: result = true
+  of IntLit: result = false
+  else: result = not isSignedType(resolveType(g.prog, g.getType(c)))
+
 proc emitCmpBranch(g: var CodeGen; c: var Cursor; toLabel: string; whenTrue: bool) =
   ## `c` is a comparison `(op a b)` (NO type child). Emit `cmp a, b` and branch
   ## to `toLabel` when the condition is true/false. Ordering signedness comes
@@ -2094,9 +2106,8 @@ proc emitCmpBranch(g: var CodeGen; c: var Cursor; toLabel: string; whenTrue: boo
       g.freeTemp(fb)
       g.freeTemp(fa)
     else:
-      var signed = true
-      if c.kind == Symbol and g.ra.locationOfSym(symName(c)).typ.kind == AUInt:
-        signed = false
+      var bPeek = c; skip bPeek                   # unsigned if EITHER operand is
+      let signed = not (g.cmpOperandUnsigned(c) or g.cmpOperandUnsigned(bPeek))
       tag =
         case ek
         of EqC:  (if whenTrue: BeqA64 else: BneA64)
@@ -2260,9 +2271,7 @@ proc genCase(g: var CodeGen; c: var Cursor) =
   let lEnd = g.freshLabel()
   c.into:
     # Selector signedness drives ordered range comparisons.
-    var signed = true
-    if c.kind == Symbol and g.ra.locationOfSym(symName(c)).typ.kind == AUInt:
-      signed = false
+    let signed = not g.cmpOperandUnsigned(c)
     let sel = g.genReg(c)                    # selector value, live across all tests
     let selReg = sel.r
     # Pass 1: emit the comparison tests; remember each body's StmtList cursor.
