@@ -3034,8 +3034,15 @@ proc genTypeBody(g: var CodeGen; c: var Cursor) =
           else: raiseAssert "arkham x64 v0: array length must be a literal"
     of ObjectT:
       c.into:
-        skip c                                # inheritance (`.`)
+        # Inheritance: a Symbol base is emitted by reference (so nifasm resolves
+        # it and lays the base out first); a `.` means no base. Keeping the base
+        # lets nifasm compute inherited-field offsets — the `(cast (ptr Derived)
+        # x).baseField` idiom (Nim's allocator) depends on it.
+        var baseName = ""
+        if c.kind == Symbol: baseName = symName(c)
+        skip c                                # inheritance slot (`.` or base sym)
         g.ab.objectType:
+          if baseName.len > 0: g.ab.sym baseName
           while c.hasMore:
             c.into:                           # (fld :name pragmas type)
               let fn = symName(c); inc c

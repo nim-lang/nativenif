@@ -2002,8 +2002,15 @@ proc genTypeBody(g: var CodeGen; c: var Cursor) =
         while c.hasMore: skip c             # efld members
     of ObjectT:
       c.into:
-        skip c                              # inheritance (`.`)
+        # Inheritance: a Symbol base is emitted by reference (nifasm resolves it
+        # and lays the base out first); a `.` means no base. Preserving it lets
+        # nifasm compute inherited-field offsets for the `(cast (ptr Derived)
+        # x).baseField` idiom.
+        var baseName = ""
+        if c.kind == Symbol: baseName = symName(c)
+        skip c                              # inheritance slot (`.` or base sym)
         g.ab.objectType:
+          if baseName.len > 0: g.ab.sym baseName
           while c.hasMore:
             c.into:                         # (fld :name pragmas type)
               let fn = symName(c); inc c

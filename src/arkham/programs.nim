@@ -366,7 +366,11 @@ proc objSizeAlign(p: var Program; bodyc: Cursor): (int, int) =
   var off = 0
   var maxAl = 1
   oc.into:
-    skip oc                                   # base / inheritance
+    if oc.kind == Symbol:                      # inherited base: laid out FIRST,
+      let (bsz, bal) = typeSizeAlign(p, oc)    # so own fields start at sizeof(base)
+      off = bsz
+      if bal > maxAl: maxAl = bal
+    skip oc                                    # base / inheritance slot
     while oc.hasMore:
       oc.into:                                # (fld :name pragmas type)
         inc oc; skip oc                       # name, field-pragmas
@@ -504,7 +508,10 @@ proc aggrLayout*(p: var Program; typeName: string): seq[FieldInfo] =
   var oc = body
   var off = 0
   oc.into:
-    skip oc                                   # base / inheritance
+    if oc.kind == Symbol:                     # inherited base: its fields come
+      result = aggrLayout(p, symName(oc))     # first, at their base offsets (the
+      off = aggrByteSize(p, symName(oc))      # base sits at offset 0 in derived)
+    skip oc                                   # base / inheritance slot
     while oc.hasMore:
       oc.into:                                # (fld :name pragmas type)
         let fn = symName(oc); inc oc

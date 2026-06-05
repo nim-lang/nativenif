@@ -422,9 +422,28 @@ proc atTypeStart(n: Cursor): bool =
 proc parseObjectBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
   # NIFC `ObjDecl ::= (object [Empty | Type-base] FieldDecl*)` — the `fields`
   # iterator tolerates the optional inheritance/base slot for us.
-  var flds: seq[(string, Type)] = @[]
+  var flds: seq[(string, Type, int)] = @[]
   var offset = 0
   var maxAlign = 1  # Track maximum alignment requirement
+
+  # Inheritance: a leading base-type Symbol contributes ITS fields first (at
+  # their own base offsets) and its full size as the starting offset for this
+  # object's own fields. This mirrors NIFC's object layout — typenav.typeOfField
+  # searches the base recursively for an inherited field, and nimony's sizeof
+  # lays the base out before the own fields, so derived fields begin exactly at
+  # `sizeof(Base)` (base tail-padding included). arkham emits the base as the
+  # first child of `(object …)`; a `.`/no slot means no inheritance.
+  var baseC = n                   # a copy; `n` is walked by `fields(n)` below
+  into baseC:
+    if baseC.kind == Symbol:
+      let baseType = parseType(baseC, scope, ctx)
+      if baseType.kind != ObjectT:
+        error("object base type must be an object", baseC)
+      flds = baseType.fields      # inherited fields keep their base offsets
+      offset = baseType.size      # own fields start after the complete base
+      maxAlign = baseType.align
+    while baseC.hasMore: skip baseC  # drain the field children (read via `n`)
+
   for fc in fields(n):
     if not atTag(fc, FldTagId): error("Expected field definition", fc)
     var f = fc
@@ -436,11 +455,11 @@ proc parseObjectBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
     let name = symName(nameC)
     var typC = fr.typ
     let ftype = parseType(typC, scope, ctx)
-    flds.add (name, ftype)
 
-    # Align field to its natural alignment
+    # Align field to its natural alignment, then record its offset.
     let fieldAlign = asmAlignOf(ftype)
     offset = alignTo(offset, fieldAlign)
+    flds.add (name, ftype, offset)
 
     # Track maximum alignment for the struct
     if fieldAlign > maxAlign:
@@ -717,7 +736,7 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
 
 
 proc parseUnionBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
-  var flds: seq[(string, Type)] = @[]
+  var flds: seq[(string, Type, int)] = @[]
   var maxSize = 0
   var maxAlign = 1  # Track maximum alignment requirement
   for fc in fields(n):
@@ -729,7 +748,7 @@ proc parseUnionBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
     let name = symName(nameC)
     var typC = fr.typ
     let ftype = parseType(typC, scope, ctx)
-    flds.add (name, ftype)
+    flds.add (name, ftype, 0)            # union: every field overlays at offset 0
 
     let size = asmSizeOf(ftype)
     let fieldAlign = asmAlignOf(ftype)
@@ -1145,14 +1164,13 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
         error("dot requires pointer to object/union or stack object/union, got " & $baseOp.typ, n)
       var fieldOffset = 0
       var fieldType: Type = nil
-      for (fname, ftype) in objType.fields:
-        if objType.kind == TypeKind.ObjectT:
-          fieldOffset = alignTo(fieldOffset, asmAlignOf(ftype))
+      # Offsets are precomputed in parseObjectBody/parseUnionBody (inherited
+      # fields carry their base offsets), so a plain name lookup suffices.
+      for (fname, ftype, foff) in objType.fields:
         if fname == fieldName:
           fieldType = ftype
+          fieldOffset = foff
           break
-        if objType.kind == TypeKind.ObjectT:
-          fieldOffset += asmSizeOf(ftype)
       if fieldType == nil:
         error("Field '" & fieldName & "' not found in " & $objType.kind, n)
       result.kind = okMem
@@ -2788,22 +2806,17 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
         else:
           error("dot requires (base-reg stackvar field) or (ptr-var field), got " & $baseOp.typ, n)
 
-      # Find field in object/union type
+      # Find field in object/union type. Offsets are precomputed in
+      # parseObjectBody/parseUnionBody — inherited (base) fields carry their base
+      # offsets, own fields start at sizeof(base), unions are all 0 — so a plain
+      # name lookup yields the right displacement.
       var fieldOffset = 0
       var fieldType: Type = nil
-      for (fname, ftype) in objType.fields:
-        # For unions, all fields are at offset 0
-        if objType.kind == TypeKind.ObjectT:
-          # Align to field's natural alignment
-          fieldOffset = alignTo(fieldOffset, asmAlignOf(ftype))
-
+      for (fname, ftype, foff) in objType.fields:
         if fname == fieldName:
           fieldType = ftype
+          fieldOffset = foff
           break
-
-        # For objects, move past this field
-        if objType.kind == TypeKind.ObjectT:
-          fieldOffset += asmSizeOf(ftype)
 
       if fieldType == nil:
         error("Field '" & fieldName & "' not found in " & $objType.kind, n)

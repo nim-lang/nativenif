@@ -488,6 +488,12 @@ proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string) =
     var maxAl = 1
     var fi = 0
     oc.into:
+      # An object *constant* of an inherited type would need the base's fields
+      # laid out first (positionally matched against the leading oconstr values),
+      # like objSizeAlign/aggrLayout do for runtime layout. Not yet implemented —
+      # fail loudly rather than emit silently-misaligned bytes.
+      if oc.kind == Symbol:
+        raiseAssert "arkham: object constant of an inherited type not yet supported"
       skip oc                                # base / inheritance
       while oc.hasMore:
         oc.into:                             # (fld :name pragmas type)

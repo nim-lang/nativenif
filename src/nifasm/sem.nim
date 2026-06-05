@@ -34,7 +34,11 @@ type
       elem*: Type
       len*: int64
     of ObjectT, UnionT:
-      fields*: seq[(string, Type)]
+      fields*: seq[(string, Type, int)]  ## name, type, byte offset within the
+                                         ## object/union. Inherited fields (from a
+                                         ## base object) appear first, carrying
+                                         ## their base offsets; own fields follow,
+                                         ## starting at `sizeof(base)`.
       size*: int
       align*: int
     of RegisterT:
