@@ -359,22 +359,29 @@ proc pickStaging(g: var CodeGen; avoid: Reg = NoReg): Reg =
        r notin g.liveAccums: return r
   raiseAssert "arkham a64: no staging register available for a spill"
 
-proc forceReg(g: var CodeGen; v: Location): tuple[r: Reg, owns: bool] =
-  ## Ensure `v` is in a register. An immediate / spilled memory operand is
-  ## materialized into a fresh scratch temp — or, when the pool is exhausted, a
-  ## transient staging register (so this never fails). `owns` is true for any
-  ## register this borrows; `giveBack` is a no-op for a staging reg.
-  case v.kind
-  of InReg: (v.r, v.owns)
+proc forceReg(g: var CodeGen; dest: var Location) =
+  ## Ensure `dest` is in a register, mutating it IN PLACE. An immediate / spilled
+  ## memory operand is materialized into a fresh scratch temp — or, when the pool is
+  ## exhausted, a transient staging register (so this never fails). The temp is
+  ## marked `isTemp` so a later `freeTemp` releases it (a no-op for a staging reg or
+  ## any persistent location); a value already in a register is left untouched.
+  case dest.kind
+  of InReg: discard
   of Imm:
     let t = g.tryBorrowTmp()
     let r = if t == NoReg: g.pickStaging() else: t
-    g.movImm(r, v.ival); (r, true)
+    g.movImm(r, dest.ival); dest = regLoc(r, dest.typ, isTemp = true)
   of NamedStack, Mem, Glob, Tvar:
     let t = g.tryBorrowTmp()
     let r = if t == NoReg: g.pickStaging() else: t
-    g.emitLoad(v, r); (r, true)
-  else: raiseAssert "arkham: cannot force a value of kind " & $v.kind & " into a register"
+    g.emitLoad(dest, r); dest = regLoc(r, dest.typ, isTemp = true)
+  else: raiseAssert "arkham: cannot force a value of kind " & $dest.kind & " into a register"
+
+proc freeTemp(g: var CodeGen; loc: Location) {.inline.} =
+  ## Release `loc`'s register iff it is a borrowed temp; a no-op on every persistent
+  ## location (register-resident local, stack slot, immediate, …) — like vmgen's
+  ## `freeTemp`. The single release point replacing the old `if owns: giveBack`.
+  if loc.kind == InReg and loc.isTemp: g.giveBack loc.r
 
 proc place(g: var CodeGen; v: Location; dest: Reg) =
   ## Materialize `v` into `dest`, releasing any owned scratch it occupied. Placing
@@ -383,7 +390,7 @@ proc place(g: var CodeGen; v: Location; dest: Reg) =
   of Imm: g.movImm(dest, v.ival)
   of InReg:
     g.movReg(dest, v.r)
-    if v.owns and v.r != dest: g.giveBack v.r
+    if v.isTemp and v.r != dest: g.giveBack v.r
   of NamedStack, Mem, Glob, Tvar:
     g.emitLoad(v, dest)
   else: raiseAssert "arkham: cannot place a value of kind " & $v.kind
@@ -430,14 +437,14 @@ proc genVal(g: var CodeGen; c: var Cursor): Location =
       let t = g.borrowTmp()
       g.emAdr(t, si.asmName)
       inc c
-      return regLoc(t, ScalarSlot, owns = true)
+      return regLoc(t, ScalarSlot, isTemp = true)
     let loc = g.asLoc(c)
     case loc.kind
-    of InReg: result = regLoc(loc.r, loc.typ, owns = false)
+    of InReg: result = regLoc(loc.r, loc.typ, isTemp = false)
     of NamedStack: result = loc                 # foldable spilled scalar in place
     of Glob, Tvar:                              # load through its address into a scratch
       let t = g.borrowTmp(); g.emitLoad(loc, t)
-      result = regLoc(t, loc.typ, owns = true)
+      result = regLoc(t, loc.typ, isTemp = true)
     else: raiseAssert "arkham v1: operand of kind " & $loc.kind
   of TagLit:
     case c.exprKind
@@ -445,25 +452,25 @@ proc genVal(g: var CodeGen; c: var Cursor): Location =
       result = g.asLoc(c)                        # a foldable `Mem` operand
     of PatC:                                     # pointer indexing → eager element load
       let t = g.borrowTmp(); g.genInto(c, t)
-      result = regLoc(t, ScalarSlot, owns = true)
+      result = regLoc(t, ScalarSlot, isTemp = true)
     else:
       let t = g.tryBorrowTmp()                  # a computed value → a scratch reg…
       if t == NoReg: result = g.spillComputed(c)  # …or a spill slot if exhausted
       else:
         g.genInto(c, t)
-        result = regLoc(t, ScalarSlot, owns = true)
+        result = regLoc(t, ScalarSlot, isTemp = true)
   else:
     let t = g.tryBorrowTmp()
     if t == NoReg: result = g.spillComputed(c)
     else:
       g.genInto(c, t)
-      result = regLoc(t, ScalarSlot, owns = true)
+      result = regLoc(t, ScalarSlot, isTemp = true)
 
 proc genReg(g: var CodeGen; c: var Cursor): tuple[r: Reg, temp: bool] =
   ## `forceReg(genVal …)`: evaluate `c` into *some* register — a register-
   ## resident symbol in place, else a borrowed scratch the caller must `giveBack`.
-  let (r, owns) = g.forceReg(g.genVal(c))
-  result = (r, owns)
+  var d = g.genVal(c); g.forceReg(d)
+  result = (d.r, d.isTemp)
 
 proc commutativeOp(op: A64Inst): bool {.inline.} =
   ## Integer ops for which `a op b == b op a`, so Sethi–Ullman may evaluate the
@@ -601,7 +608,7 @@ proc genBin(g: var CodeGen; c: var Cursor; dest: Reg;
       g.movReg(saved, dest)                 # preserve b before `a` clobbers dest
       g.genInto(c, dest)                    # a → dest
       skip c                                # consume b
-      other = regLoc(saved, ScalarSlot, owns = true)
+      other = regLoc(saved, ScalarSlot, isTemp = true)
     else:
       g.genInto(c, dest)                    # a → dest; c now at b
       if isComputedOperand(c):              # b must be materialized into a register
@@ -611,7 +618,7 @@ proc genBin(g: var CodeGen; c: var Cursor; dest: Reg;
           combined = true
         else:
           g.genInto(c, t)                    # b → scratch temp
-          other = regLoc(t, ScalarSlot, owns = true)
+          other = regLoc(t, ScalarSlot, isTemp = true)
       else:
         other = g.genVal(c)                  # b is a leaf / memory / in-place value
     if not combined:
@@ -619,9 +626,9 @@ proc genBin(g: var CodeGen; c: var Cursor; dest: Reg;
          other.ival >= 0 and other.ival <= 0xFFFF:
         g.binImm(op, dest, other.ival)       # dest op= small immediate
       else:
-        let (br, owns) = g.forceReg(other)
-        g.binReg(op, dest, br)               # dest op= b
-        if owns: g.giveBack br
+        g.forceReg(other)
+        g.binReg(op, dest, other.r)          # dest op= b
+        g.freeTemp(other)
 
 proc genMod(g: var CodeGen; c: var Cursor; dest: Reg) =
   ## `(mod Type a b)` → `dest = a - (a div b)*b` (nifasm has no `msub`).
@@ -728,7 +735,7 @@ proc loadOperandReg(g: var CodeGen; v: Location; tmps: var seq[Reg]): Reg =
   ## with no calls in between — so a caller-saved staging register is safe when the
   ## scratch pool is exhausted, keeping indexed/global access total under pressure.
   if v.kind == InReg:
-    if v.owns: tmps.add v.r
+    if v.isTemp: tmps.add v.r
     return v.r
   result = g.tryBorrowTmp()
   if result != NoReg: tmps.add result
@@ -2212,20 +2219,6 @@ proc genBreak(g: var CodeGen; c: var Cursor) =
 
 # ── case statement ──────────────────────────────────────────────────────────
 
-proc branchImm(c: var Cursor): int64 =
-  ## Read a NIFC `BranchValue` (Number | CharLiteral | (true) | (false)) and
-  ## advance past it. Symbol branch values (enum consts) are unsupported in v1.
-  case c.kind
-  of IntLit:  result = intVal(c); inc c
-  of UIntLit: result = cast[int64](uintVal(c)); inc c
-  of CharLit: result = int64(ord(charLit(c))); inc c
-  of TagLit:
-    case c.exprKind
-    of TrueC:  result = 1; skip c
-    of FalseC: result = 0; skip c
-    else: raiseAssert "arkham v1: unsupported case branch value: " & $c.exprKind
-  else: raiseAssert "arkham v1: unsupported case branch value kind: " & $c.kind
-
 proc cmpImm(g: var CodeGen; selReg: Reg; v: int64) =
   ## `cmp selReg, #v` — immediate when it fits, otherwise via a scratch register.
   if v >= 0 and v <= 0xFFFF:
@@ -2342,6 +2335,18 @@ proc gen(g: var CodeGen; c: var Cursor; dest: var Location) =
   of InReg: g.genInto(c, dest.r)
   of InFReg: g.genIntoF(c, dest.f, dest.typ.size * 8)
   of Undef: dest = g.genVal(c)
+  of NeedsReg:
+    # "must be a register, my choice": evaluate where the value naturally lives,
+    # then ensure it occupies a register (a register-resident local stays in place;
+    # anything else is materialized into scratch). The concrete `InReg`, carrying its
+    # `isTemp` flag, is written back so the caller knows whether to `freeTemp`.
+    dest = g.genVal(c)
+    g.forceReg(dest)
+  of RegOrImm:
+    # "a GPR or an immediate, not memory" — a memory operand is loaded into a temp.
+    # (Not yet used by the a64 backend; handled for enum-totality / future use.)
+    dest = g.genVal(c)
+    if dest.kind notin {Imm, InReg}: g.forceReg(dest)
   of NamedStack, Mem, Glob, Tvar:
     let bits = dest.typ.size * 8
     if dest.typ.isFloat:

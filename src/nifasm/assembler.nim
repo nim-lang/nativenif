@@ -3539,9 +3539,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
 
     if dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
-        # ADD m64, imm32
-        # Need emitAdd(MemoryOperand, int32)
-        error("Adding immediate to memory not supported yet", n)
+        x86.emitAddImm(ctx.buf.data, dest.mem, int32(op.immVal))  # ADD m64, imm32
       elif op.kind == okSsize:
         error("Adding ssize to memory not supported", n)
       elif op.kind == okMem:
@@ -3573,7 +3571,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
 
     if dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
-        error("Subtracting immediate from memory not supported yet", n)
+        x86.emitSubImm(ctx.buf.data, dest.mem, int32(op.immVal))  # SUB m64, imm32
       elif op.kind == okSsize:
         error("Subtracting ssize from memory not supported", n)
       elif op.kind == okMem:
@@ -3615,7 +3613,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     if op.kind == okImm:
       x86.emitImulImm(ctx.buf.data, dest.reg, int32(op.immVal))
     elif op.kind == okMem:
-      error("IMUL memory source not supported yet", n) # Need emitImul(reg, mem)
+      x86.emitImul(ctx.buf.data, dest.reg, op.mem)
     else:
       x86.emitImul(ctx.buf.data, dest.reg, op.reg)
 
@@ -3666,7 +3664,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseType(op.typ, "and", start)
     checkCompatibleTypes(dest.typ, op.typ, "and", start)
     if dest.kind == okMem:
-      error("AND to memory not supported yet", n)
+      if op.kind == okImm or op.kind == okCsize:
+        x86.emitAndImm(ctx.buf.data, dest.mem, int32(op.immVal))  # AND m64, imm32
+      elif op.kind == okMem:
+        error("Cannot AND memory to memory", n)
+      else:
+        x86.emitAnd(ctx.buf.data, dest.mem, op.reg)
     else:
       if op.kind == okImm:
         x86.emitAndImm(ctx.buf.data, dest.reg, int32(op.immVal))
@@ -3683,7 +3686,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseType(op.typ, "or", start)
     checkCompatibleTypes(dest.typ, op.typ, "or", start)
     if dest.kind == okMem:
-      error("OR to memory not supported yet", n)
+      if op.kind == okImm or op.kind == okCsize:
+        x86.emitOrImm(ctx.buf.data, dest.mem, int32(op.immVal))   # OR m64, imm32
+      elif op.kind == okMem:
+        error("Cannot OR memory to memory", n)
+      else:
+        x86.emitOr(ctx.buf.data, dest.mem, op.reg)
     else:
       if op.kind == okImm:
         x86.emitOrImm(ctx.buf.data, dest.reg, int32(op.immVal))
@@ -3700,7 +3708,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseType(op.typ, "xor", start)
     checkCompatibleTypes(dest.typ, op.typ, "xor", start)
     if dest.kind == okMem:
-      error("XOR to memory not supported yet", n)
+      if op.kind == okImm or op.kind == okCsize:
+        x86.emitXorImm(ctx.buf.data, dest.mem, int32(op.immVal))  # XOR m64, imm32
+      elif op.kind == okMem:
+        error("Cannot XOR memory to memory", n)
+      else:
+        x86.emitXor(ctx.buf.data, dest.mem, op.reg)
     else:
       if op.kind == okImm:
         x86.emitXorImm(ctx.buf.data, dest.reg, int32(op.immVal))

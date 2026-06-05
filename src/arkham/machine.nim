@@ -79,6 +79,8 @@ proc regName*(f: FReg): string =
 proc `$`*(loc: Location): string =
   case loc.kind
   of Undef: "undef"
+  of NeedsReg: "needsreg"
+  of RegOrImm: "regorimm"
   of InReg: regName(loc.r)
   of InFReg: regName(loc.f)
   of OnStack: "[fp," & $loc.offset & "]"

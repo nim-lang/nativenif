@@ -338,6 +338,24 @@ proc constLitBits*(c: Cursor): uint64 =
     else: raiseAssert "arkham const: unsupported scalar " & $v.exprKind
   else: raiseAssert "arkham const: unsupported literal kind " & $v.kind
 
+proc branchImm*(c: var Cursor): int64 =
+  ## A NIFC `BranchValue` for a `case`: a Number / CharLiteral / `(true)` / `(false)`
+  ## or a typed/wrapped constant `(suf 3 +Enum)` / `(cast …)` / `(neg …)`. Advance
+  ## past it. (Symbol branch values — enum consts — are not yet supported.) Shared
+  ## by both backends; wrapped forms unwrap through `constLitBits`.
+  case c.kind
+  of IntLit:  result = intVal(c); inc c
+  of UIntLit: result = cast[int64](uintVal(c)); inc c
+  of CharLit: result = int64(ord(charLit(c))); inc c
+  of TagLit:
+    case c.exprKind
+    of TrueC:  result = 1; skip c
+    of FalseC: result = 0; skip c
+    of SufC, ParC, CastC, ConvC, NegC:                  # typed/wrapped enum-or-int
+      result = cast[int64](constLitBits(c)); skip c     # `(suf 3 +Enum)` → 3
+    else: raiseAssert "arkham: unsupported case branch value: " & $c.exprKind
+  else: raiseAssert "arkham: unsupported case branch value kind: " & $c.kind
+
 proc isConstScalarInit*(c: Cursor): bool =
   ## Whether an initializer is a compile-time-constant SCALAR — a literal, a
   ## bool/nil literal, or a (negate / cast / conv / suf / par) wrapping one. Such a
