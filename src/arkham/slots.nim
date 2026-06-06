@@ -20,7 +20,10 @@ type
     AMem           # aggregate / by-reference (object, array, union, void)
 
   AsmSlot* = object
-    kind*: AsmTypeKind
+    cls*: AsmTypeKind             # the value class — read via the `kind` accessor below,
+                                  # never directly. `typ` is meant to be the source of
+                                  # truth; `cls` is the cached projection of it until every
+                                  # slot reliably carries a `typ` (see `kind`).
     size*, align*, offset*: int   # offset only meaningful for fields/slots
     typ*: Cursor                  # the NIFC type this slot was classified from, when
                                   # known (a `typeToSlot` result carries it). Lets a
@@ -35,6 +38,13 @@ type
     IsDisjoint  # only `obj.f` used, never `obj` itself
     AllRegs     # used only in a call-free region: any (volatile) register is fine
   VarProps* = set[VarProp]
+
+proc kind*(s: AsmSlot): AsmTypeKind {.inline.} =
+  ## The value class of this slot. An accessor (not a field) on purpose: the goal
+  ## is that every slot carries a `typ` and this becomes `typeToSlot(s.typ).kind`,
+  ## at which point `cls` disappears. Until then it returns the cached `cls` so the
+  ## switch is a one-line change here rather than at the ~50 read sites.
+  s.cls
 
 proc align*(address, alignment: int): int {.inline.} =
   (address + (alignment - 1)) and not (alignment - 1)
@@ -89,7 +99,7 @@ proc typeBits*(c: Cursor): int =
 proc scalarSlot(kind: AsmTypeKind; bits: int): AsmSlot =
   # `(i -1)` etc. (platform int) → assume 64-bit for now.
   let sz = if bits > 0: (bits + 7) div 8 else: 8
-  result = AsmSlot(kind: kind, size: sz, align: min(sz, 8))
+  result = AsmSlot(cls: kind, size: sz, align: min(sz, 8))
 
 proc typeToSlot*(c: Cursor): AsmSlot =
   ## Classify a NIFC type at `c`. Aggregates and unknowns become `AMem`
@@ -101,11 +111,11 @@ proc typeToSlot*(c: Cursor): AsmSlot =
   of UT:   result = scalarSlot(AUInt, typeBits(c))
   of CT:   result = scalarSlot(AUInt, max(8, typeBits(c)))   # char: at least 1 byte
   of FT:   result = scalarSlot(AFloat, typeBits(c))
-  of BoolT: result = AsmSlot(kind: ABool, size: 1, align: 1)
+  of BoolT: result = AsmSlot(cls: ABool, size: 1, align: 1)
   of PtrT, AptrT, ProctypeT:
-    result = AsmSlot(kind: AUInt, size: 8, align: 8)          # an address
+    result = AsmSlot(cls: AUInt, size: 8, align: 8)           # an address
   else:
-    result = AsmSlot(kind: AMem, size: 0, align: 1)           # object/array/union/void/…
+    result = AsmSlot(cls: AMem, size: 0, align: 1)            # object/array/union/void/…
   result.typ = c
 
 # ── aggregate layout descriptors ────────────────────────────────────────────

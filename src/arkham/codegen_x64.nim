@@ -29,7 +29,7 @@ const TlsBlockName = "arkham.tls.0"
 
 # ── scratch register pool ────────────────────────────────────────────────────
 
-let ScalarSlot = AsmSlot(kind: AInt, size: 8, align: 8)
+let ScalarSlot = AsmSlot(cls: AInt, size: 8, align: 8)
   ## The placeholder slot for a register/immediate dont-care result: the old `Val`
   ## carried no type at all, and no consumer of an `InReg`/`Imm` value reads `.typ`.
   ## As a scratch-binding type it carries no cursor, so `bindTemp` falls back to
@@ -1510,7 +1510,7 @@ proc spillOperandAround(g: var CodeGen; c: var Cursor; dest: Reg; op: X64Inst) =
   ## operands too). `c` is consumed past the right operand.
   let slotA = spillName(g.spillCount); inc g.spillCount
   g.ra.hasStackVars = true
-  let slotLoc = namedStackLoc(slotA, AsmSlot(kind: AInt, size: 8, align: 8))
+  let slotLoc = namedStackLoc(slotA, AsmSlot(cls: AInt, size: 8, align: 8))
   g.emScalarStackVar(slotA)
   g.ab.tree MovX64:                            # store a → slotA (free dest)
     g.emStackMem(slotA)
@@ -1693,7 +1693,7 @@ proc genFReg(g: var CodeGen; c: var Cursor; bits: int): Location =
       return fregLoc(loc.f, loc.typ)
   let f = g.borrowFTmp()
   g.genIntoF(c, f, bits)
-  result = fregLoc(f, AsmSlot(kind: AFloat, size: bits div 8, align: bits div 8), isTemp = true)
+  result = fregLoc(f, AsmSlot(cls: AFloat, size: bits div 8, align: bits div 8), isTemp = true)
 
 proc spillFOperandAround(g: var CodeGen; c: var Cursor; dest: FReg;
                          op32, op64: X64Inst; bits: int) =

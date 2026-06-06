@@ -278,22 +278,22 @@ proc exprSlot*(g: var CodeGen; c: Cursor): AsmSlot =
   ## The classified slot of any expression — `getType` for structural forms,
   ## with literals/`addr` (which carry no type cursor) handled directly.
   case c.kind
-  of FloatLit: AsmSlot(kind: AFloat, size: 8, align: 8)   # default f64; width refined by context
-  of IntLit, UIntLit: AsmSlot(kind: AInt, size: 8, align: 8)
-  of CharLit: AsmSlot(kind: AUInt, size: 1, align: 1)
-  of StrLit: AsmSlot(kind: AUInt, size: 8, align: 8)      # a pointer
+  of FloatLit: AsmSlot(cls: AFloat, size: 8, align: 8)   # default f64; width refined by context
+  of IntLit, UIntLit: AsmSlot(cls: AInt, size: 8, align: 8)
+  of CharLit: AsmSlot(cls: AUInt, size: 1, align: 1)
+  of StrLit: AsmSlot(cls: AUInt, size: 8, align: 8)      # a pointer
   of Symbol: slotOf(g.prog, g.getType(c))
   of TagLit:
     case c.exprKind
     of AddrC: slotOf(g.prog, g.getType(c))                           # &lvalue → precise (ptr <elem>)
-    of NilC: AsmSlot(kind: AUInt, size: 8, align: 8)                 # nil → a generic pointer
-    of TrueC, FalseC: AsmSlot(kind: AUInt, size: 1, align: 1)        # a bool
-    of SizeofC, AlignofC: AsmSlot(kind: AInt, size: 8, align: 8)     # an integer constant
+    of NilC: AsmSlot(cls: AUInt, size: 8, align: 8)                 # nil → a generic pointer
+    of TrueC, FalseC: AsmSlot(cls: AUInt, size: 1, align: 1)        # a bool
+    of SizeofC, AlignofC: AsmSlot(cls: AInt, size: 8, align: 8)     # an integer constant
     of SufC, ParC:                                                   # wrappers → the inner value
       var t = c; inc t
       g.exprSlot(t)
     else: slotOf(g.prog, g.getType(c))
-  else: AsmSlot(kind: AMem)
+  else: AsmSlot(cls: AMem)
 
 proc tryConstFold*(g: var CodeGen; c: Cursor): (bool, int64) =
   ## Evaluate a compile-time-constant INTEGER expression to its value WITHOUT

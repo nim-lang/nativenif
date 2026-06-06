@@ -524,7 +524,7 @@ proc slotOf*(p: var Program; c: Cursor): AsmSlot =
     result = slotOf(p, base)                   # base may itself be a named type
   of ObjectT, UnionT, ArrayT:
     let (sz, al) = typeSizeAlign(p, r)
-    result = AsmSlot(kind: AMem, size: sz, align: al)
+    result = AsmSlot(cls: AMem, size: sz, align: al, typ: r)  # carry the type, like every other path
   else:
     result = typeToSlot(r)                      # scalars, ptr, void, …
 

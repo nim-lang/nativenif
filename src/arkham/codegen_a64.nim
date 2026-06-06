@@ -39,7 +39,7 @@ const DarwinLibSystem = "/usr/lib/libSystem.B.dylib"
 
 # ── low-level emit helpers ──────────────────────────────────────────────────
 
-let ScalarSlot = AsmSlot(kind: AInt, size: 8, align: 8)
+let ScalarSlot = AsmSlot(cls: AInt, size: 8, align: 8)
   ## Placeholder slot for a register/immediate dont-care result: no consumer of an
   ## `InReg`/`Imm` value reads `.typ` (the old `Val` carried no type). As a scratch
   ## binding type it carries no cursor, so `bindTemp` falls back to `(i 64)`. A `let`
@@ -686,7 +686,7 @@ proc spillComputed(g: var CodeGen; c: var Cursor): Location =
   g.genInto(c, stage)                           # compute the value into the staging reg
   g.emScalarStore(slotName, stage)              # store it to the slot
   g.ra.unseal {stage}
-  result = namedStackLoc(slotName, AsmSlot(kind: AInt, size: 8, align: 8))
+  result = namedStackLoc(slotName, AsmSlot(cls: AInt, size: 8, align: 8))
 
 proc genVal(g: var CodeGen; c: var Cursor): Location =
   ## The dont-care evaluator: produce `c`'s value where it naturally lives — a
@@ -844,7 +844,7 @@ proc spillOperandAround(g: var CodeGen; c: var Cursor; dest: Reg; op: A64Inst) =
   ## right operand.
   let slotA = spillName(g.spillCount); inc g.spillCount
   g.ra.hasStackVars = true
-  let slotLoc = namedStackLoc(slotA, AsmSlot(kind: AInt, size: 8, align: 8))
+  let slotLoc = namedStackLoc(slotA, AsmSlot(cls: AInt, size: 8, align: 8))
   g.emScalarStackVar(slotA)
   g.emScalarStore(slotA, dest)                # store a → slotA (free dest)
   g.genInto(c, dest)                          # b → dest (recursion reuses dest)
@@ -1597,7 +1597,7 @@ proc genFReg(g: var CodeGen; c: var Cursor; bits: int): Location =
       result = fregLoc(loc.f, loc.typ); inc c; return
   let f = g.borrowFTmp(bits)
   g.genIntoF(c, f, bits)
-  result = fregLoc(f, AsmSlot(kind: AFloat, size: bits div 8, align: bits div 8), isTemp = true)
+  result = fregLoc(f, AsmSlot(cls: AFloat, size: bits div 8, align: bits div 8), isTemp = true)
 
 proc genIntoF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int) =
   ## Evaluate a `bits`-wide float expression into the SIMD register `dest`.
