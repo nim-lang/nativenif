@@ -27,6 +27,9 @@ type
     slot*: string        ## the stack slot it was moved to (distinct basename)
     reg*: Reg            ## the register freed for scratch
     typ*: AsmSlot        ## the victim's slot type (for the stack-slot decl)
+    live*: bool          ## did the register hold the victim's live value? (false for a
+                         ## FUTURE local whose home reg — reused from a just-dead local —
+                         ## is stolen before its own decl: nothing of the victim to save)
 
   CodeGen* = object
     ab*: AsmBuf
@@ -275,7 +278,8 @@ proc exprSlot*(g: var CodeGen; c: Cursor): AsmSlot =
   of Symbol: slotOf(g.prog, g.getType(c))
   of TagLit:
     case c.exprKind
-    of AddrC, NilC: AsmSlot(kind: AUInt, size: 8, align: 8)          # &lvalue / nil → a pointer
+    of AddrC: slotOf(g.prog, g.getType(c))                           # &lvalue → precise (ptr <elem>)
+    of NilC: AsmSlot(kind: AUInt, size: 8, align: 8)                 # nil → a generic pointer
     of TrueC, FalseC: AsmSlot(kind: AUInt, size: 1, align: 1)        # a bool
     of SizeofC, AlignofC: AsmSlot(kind: AInt, size: 8, align: 8)     # an integer constant
     of SufC, ParC:                                                   # wrappers → the inner value

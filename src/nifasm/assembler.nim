@@ -250,6 +250,10 @@ type
     indirect: bool              # Target is a function-pointer variable: `typ` is its
                                 # proctype signature and `(call)` is an indirect call
                                 # through the loaded pointer (vs a direct `call rel32`)
+    isSyscall: bool             # Target is a `syproc`: the invocation marker is
+                                # `(syscall)`/`(svc)` (inlined kernel trap, no `call`),
+                                # and `syscallNr` is loaded into rax/x8 before it
+    syscallNr: int
 
   GenContext = object
     scope: Scope        # Current (possibly proc-local) lexical scope
@@ -573,6 +577,26 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
     result = Symbol(name: fullName, kind: skRodata, offset: -1, isForeign: true,
                     moduleName: modname)
     ctx.rootScope.define(result)
+  of SyprocD:
+    # A foreign syscall (arkham emits each used syscall's `(syproc …)` in the module
+    # that declares the `importc`; another module that calls it resolves it here).
+    # Mirrors `pass1Syproc`: proctype (params/result/clobber) + number in `offset`.
+    inc c
+    if c.kind != SymbolDef: return nil
+    discard getSymDef(c)
+    var procTyp = Type(kind: ProcT, params: @[], results: @[], clobbers: {})
+    block:
+      let sig = takeSig(c)
+      if sig.hasParams:
+        var p = sig.params; procTyp.params = parseParams(p, scope, ctx)
+      if sig.hasResult:
+        var r = sig.res; procTyp.results = parseResult(r, scope, ctx)
+      if sig.hasClobber:
+        var cl = sig.clobber; procTyp.clobbers = parseClobbers(cl)
+    let sysNr = if c.kind == IntLit: int(getInt(c)) else: 0
+    result = Symbol(name: fullName, kind: skSysProc, typ: procTyp, offset: sysNr,
+                    isForeign: true, moduleName: modname)
+    ctx.rootScope.define(result)
   else:
     return nil
 
@@ -858,6 +882,34 @@ proc pass1Proc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: str
                    moduleName: moduleName, declStart: declStart)
   scope.define(sym)
 
+proc pass1Syproc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string; declStart: int) =
+  # (syproc :Name (params ...) (result ...) (clobber ...) NR) — a Linux syscall with a
+  # full proctype: params bound to the syscall ABI registers (so an `(arg pN)` binding
+  # in a `(prepare …)` lands in the right register, e.g. x86-64 arg4 → r10), a result in
+  # the kernel's return register, and the registers the syscall instruction clobbers
+  # (x86-64: rcx, r11). It has no code/address; the number is kept in `offset` and the
+  # `(syscall)`/`(svc)` marker reads it. See genSyscallMarker*.
+  inc n
+  if n.kind != SymbolDef: error("Expected syproc name", n)
+  let name = symName(n)
+  inc n
+
+  var procTyp = Type(kind: ProcT, params: @[], results: @[], clobbers: {})
+  let sig = takeSig(n)
+  if sig.hasParams:
+    var p = sig.params; procTyp.params = parseParams(p, scope, ctx)
+  if sig.hasResult:
+    var r = sig.res; procTyp.results = parseResult(r, scope, ctx)
+  if sig.hasClobber:
+    var cl = sig.clobber; procTyp.clobbers = parseClobbers(cl)
+
+  if n.kind != IntLit: error("Expected syscall number in syproc", n)
+  let sysNr = int(getInt(n))
+
+  let sym = Symbol(name: name, kind: skSysProc, typ: procTyp, offset: sysNr,
+                   moduleName: moduleName, declStart: declStart)
+  scope.define(sym)
+
 proc handleArch(n: var Cursor; ctx: var GenContext) =
   inc n
   if n.kind != Ident: error("Expected architecture symbol", n)
@@ -975,6 +1027,12 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
           scope.define(sym)
           # Track for code generation
           ctx.extProcs.add ExtProcInfo(name: name, extName: extName, libOrdinal: libOrdinal, gotSlot: gotSlot, stubOffset: -1)
+        of SyprocD:
+          # (syproc :name (params ...) (result ...) (clobber ...) NR) — defines a
+          # syscall's proctype + number; emits no code (see genSyscallMarker*).
+          pass1Syproc(n, scope, ctx, moduleName, declStart)
+          n = start
+          skip n
         else:
           skip n
       else:
@@ -1590,6 +1648,13 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
     # A foreign proc is bundled into this image and called directly (see
     # generateSymbol); only genuine `extproc` externals use the IAT/extcall path.
     ctx.callContext.typ = sym.typ
+  elif sym.kind == skSysProc:
+    # A Linux syscall with a full proctype: args land in the syscall ABI registers
+    # the proctype names (x0–x5); the invocation marker is `(svc 0)`, which
+    # `genSyscallMarkerA64` turns into `mov x8,NR; svc 0`. No `bl`/address.
+    ctx.callContext.typ = sym.typ
+    ctx.callContext.isSyscall = true
+    ctx.callContext.syscallNr = sym.offset
   elif sym.kind in {skGvar, skTvar, skVar, skParam} and sym.typ.kind == ProcT:
     # Indirect call through a function-pointer variable: its proctype IS the
     # signature, so arg/result checking and stack layout proceed exactly as for a
@@ -1684,6 +1749,21 @@ proc genCallMarkerA64(n: var Cursor; ctx: var GenContext) =
   ctx.callContext.callEmitted = true
 
   inc n
+
+proc genSyscallMarkerA64(n: var Cursor; ctx: var GenContext) =
+  ## `(svc 0)` inside a `(prepare <syproc> …)` block: the syscall counterpart of
+  ## `(call)`. The args are already in x0–x5 (the syproc's params); this loads the
+  ## number into x8 and traps. Unlike a `bl`, a Linux/AArch64 `svc` preserves every
+  ## register except x0 (the result), so only x0 is marked clobbered.
+  if ctx.callContext.callEmitted:
+    error("Multiple call/syscall instructions in prepare block", n)
+  into n:                                # `(svc 0)` — consume and ignore the immediate
+    skip n
+    while n.hasMore: skip n
+  arm64.emitMovImm64(ctx.buf.data, arm64.X8, uint64(ctx.callContext.syscallNr))
+  arm64.emitSvc(ctx.buf.data, 0'u16)
+  ctx.clobberedA64.incl arm64.X0
+  ctx.callContext.callEmitted = true
 
 proc genExtcallA64(n: var Cursor; ctx: var GenContext) =
   ## Handle (extcall) marker inside a prepare block - emits external call
@@ -1812,6 +1892,7 @@ proc bindRegA64(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
   if reg in ctx.a64RegBindings:
     ctx.scope.undefine(ctx.a64RegBindings[reg])
     ctx.a64RegBindings.del(reg)
+  ctx.clobberedA64.excl(reg)   # a fresh binding abandons a prior call's clobber (see bindRegX64)
   let sym = Symbol(name: name, kind: skVar, typ: typ)
   sym.reg = regTag
   ctx.a64RegBindings[reg] = name
@@ -1962,7 +2043,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of NoDecl:
     discard "handle via `case instTag`"
   of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD,
-     ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD:
+     ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD:
     raiseAssert("Unhandled declaration tag: " & $declTag)
 
   case instTag
@@ -2313,13 +2394,16 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     arm64.emitNop(ctx.buf.data)
 
   of SvcA64:
-    inc n
-    let op = parseOperandA64(n, ctx)
-    if op.kind != okImm:
-      error("SVC requires immediate operand", n)
-    if op.immVal < 0 or op.immVal > 0xFFFF:
-      error("SVC immediate must be 0-65535", n)
-    arm64.emitSvc(ctx.buf.data, uint16(op.immVal))
+    if ctx.inCall and ctx.callContext.isSyscall:
+      genSyscallMarkerA64(n, ctx)   # `(svc)` as the prepare invocation marker
+    else:
+      inc n
+      let op = parseOperandA64(n, ctx)
+      if op.kind != okImm:
+        error("SVC requires immediate operand", n)
+      if op.immVal < 0 or op.immVal > 0xFFFF:
+        error("SVC immediate must be 0-65535", n)
+      arm64.emitSvc(ctx.buf.data, uint16(op.immVal))  # a raw `svc` (e.g. entry exit)
 
   of LdrA64:
     inc n
@@ -3059,9 +3143,19 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
             displacement: displacement,
             hasIndex: hasIndex
           )
-          # Preserve type from stack variable if available, otherwise default
+          # Preserve type from stack variable if available; else, when the base register
+          # holds a pointer whose pointee is ITSELF a pointer, the access is that pointee
+          # (a nominal pointer type must round-trip precisely — e.g. storing a typed
+          # pointer value through `(mem ptrReg)`). A SCALAR pointee (int/uint/bool/float)
+          # or a function pointer keeps the generic 8-byte access: arkham computes
+          # integers in 64-bit registers, and the `mov` sized-access rule already handles
+          # narrow scalar field loads/stores — so a precise sub-word mem type here would
+          # only spuriously clash with a 64-bit accumulator in an `or`/`and`/`add` fold.
           if stackVarType != nil:
             result.typ = stackVarType
+          elif baseOp.typ != nil and baseOp.typ.kind in {TypeKind.PtrT, TypeKind.AptrT} and
+               resolvedBase(baseOp.typ, ctx, n).kind in {TypeKind.PtrT, TypeKind.AptrT}:
+            result.typ = resolvedBase(baseOp.typ, ctx, n)  # ptr (ptr T) -> (ptr T)
           else:
             result.typ = Type(kind: IntT, bits: 64)  # Default assumption
     elif t == SsizeTagId:
@@ -3363,6 +3457,17 @@ proc checkCompatibleTypes(t1, t2: Type; op: string; n: Cursor) =
   if not compatible(t1, t2):
     error("Operation '" & op & "' requires compatible types, got " & $t1 & " and " & $t2, n)
 
+proc checkCmpCompatible(t1, t2: Type; n: Cursor) =
+  ## Compatibility rule for `cmp` — looser than arithmetic. Two SIZED integers of
+  ## ANY width/signedness compare fine (x86 `cmp` runs at register width; a `u32`
+  ## value vs an `i64` constant is a perfectly valid comparison — arkham computes
+  ## integers in 64-bit registers). Pointers stay strict (governed by `compatible`:
+  ## ptr-vs-ptr or ptr-vs-literal only), so an int-vs-pointer mixup is still caught.
+  if compatible(t1, t2): return
+  const intish = {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.BoolT}
+  if t1.kind in intish and t2.kind in intish: return
+  error("Operation 'cmp' requires compatible types, got " & $t1 & " and " & $t2, n)
+
 proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
   ## Handle (prepare target ... (call) ...) or (prepare target ... (extcall) ...)
   ## The prepare block sets up a call context for type checking and argument tracking.
@@ -3387,6 +3492,16 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
     # generateSymbol); only genuine `extproc` externals use the extcall path.
     ctx.callContext.typ = sym.typ
     ctx.callContext.state = CallContextState.NormalCall
+  elif sym.kind == skSysProc:
+    # A Linux syscall with a full proctype: arg/result checking and register
+    # assignment proceed exactly as for a direct call (args land in the syscall
+    # ABI registers the proctype names, e.g. arg4 → r10), but the invocation
+    # marker is `(syscall)` — `genSyscallMarkerX64` inlines `mov rax,NR; syscall`
+    # and applies the proctype's clobbers. No `call`/address is involved.
+    ctx.callContext.typ = sym.typ
+    ctx.callContext.state = CallContextState.NormalCall
+    ctx.callContext.isSyscall = true
+    ctx.callContext.syscallNr = sym.offset
   elif sym.kind in {skGvar, skTvar, skVar, skParam} and sym.typ.kind == ProcT:
     # Indirect call through a function-pointer variable: its proctype IS the
     # signature, so arg/result checking and stack layout proceed exactly as for a
@@ -3472,6 +3587,20 @@ proc genCallMarkerX64(n: var Cursor; ctx: var GenContext) =
   ctx.callContext.callEmitted = true
   inc n                   # past the `(call` head
 
+proc genSyscallMarkerX64(n: var Cursor; ctx: var GenContext) =
+  ## `(syscall)` inside a `(prepare <syproc> …)` block: the syscall counterpart of
+  ## `(call)`. The args are already in the syscall ABI registers (the syproc's
+  ## params), so this just loads the number into rax and traps into the kernel,
+  ## then marks rcx/r11 clobbered (the registers the `syscall` instruction
+  ## destroys, declared as the syproc's `(clobber …)`). The result is in rax.
+  if ctx.callContext.callEmitted:
+    error("Multiple call/syscall instructions in prepare block", n)
+  x86.emitMovImmToReg(ctx.buf.data, x86.RAX, int64(ctx.callContext.syscallNr))
+  x86.emitSyscall(ctx.buf.data)
+  ctx.clobbered.incl(ctx.callContext.typ.clobbers)
+  ctx.callContext.callEmitted = true
+  inc n                   # past the `(syscall)` head
+
 proc genExtcallX64(n: var Cursor; ctx: var GenContext) =
   ## Handle (extcall) marker inside a prepare block - emits external call via IAT
   if not ctx.inCall:
@@ -3532,16 +3661,22 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
   let dest = parseDest(n, ctx)
   let op = parseOperand(n, ctx)
 
-  # Type checking. A *sized* integer mem↔reg move legitimately differs in width:
-  # a load into a 64-bit register sign-/zero-extends a narrower field/element, and
-  # a store writes only the register's low bits. So when exactly one side is memory
-  # and both are integer-like, any width pairing is accepted (the sized emit below
-  # handles extension/truncation); other moves keep the strict check.
+  # Type checking. A *sized* integer mem↔reg move legitimately differs in width: a load
+  # into a 64-bit register sign-/zero-extends a narrower field/element, and a store
+  # writes only the register's low bits — so when exactly one side is memory and both
+  # are integer-like, any width pairing is accepted (the sized emit below handles it).
+  # A WIDENING reg↔reg integer move is likewise fine — a `u32` value into an `i64`
+  # scratch, in arkham's uniform 64-bit-register integer model. Narrowing reg↔reg, a
+  # kind change (the i64↔ptr family), and stack-slot result binding all stay strict.
   if dest.typ != nil and op.typ != nil:
     proc isIntLike(t: Type): bool = t.kind in {IntT, UIntT, BoolT, IntLitT}
     let sizedMemReg = (dest.kind == okMem) != (op.kind == okMem) and
                       isIntLike(dest.typ) and isIntLike(op.typ)
-    if not sizedMemReg:
+    let wideningRegReg = dest.kind != okMem and op.kind != okMem and
+                         dest.typ.kind in {IntT, UIntT} and
+                         op.typ.kind in {IntT, UIntT, IntLitT} and
+                         op.typ.bits <= dest.typ.bits
+    if not sizedMemReg and not wideningRegReg:
       checkType(dest.typ, op.typ, start)
 
   if dest.kind == okMem:
@@ -3769,6 +3904,11 @@ proc bindRegX64(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
   if reg in ctx.regBindings:
     ctx.scope.undefine(ctx.regBindings[reg])
     ctx.regBindings.del(reg)
+  # Establishing a fresh binding abandons whatever a prior call left in `reg`: arkham
+  # only rebinds-at-borrow right before writing the scratch, so the register's stale
+  # clobbered status no longer applies (it would otherwise reject a scratch temp that
+  # happens to reuse a caller-saved register clobbered by an earlier call).
+  ctx.clobbered.excl(reg)
   let sym = Symbol(name: name, kind: skVar, typ: typ)
   sym.reg = regTag
   ctx.regBindings[reg] = name
@@ -3913,7 +4053,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     return
   of NoDecl:
     discard "continue with case instTag"
-  of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD:
+  of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD:
     error("Unexpected declaration: " & $declTag, n)
 
   case instTag
@@ -4096,7 +4236,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       if op.kind == okImm:
         x86.emitAndImm(ctx.buf.data, dest.reg, int32(op.immVal))
       elif op.kind == okMem:
-        error("AND from memory not supported yet", n)
+        x86.emitAndMem(ctx.buf.data, dest.reg, op.mem)   # and reg, [mem]
       else:
         x86.emitAnd(ctx.buf.data, dest.reg, op.reg)
 
@@ -4118,7 +4258,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       if op.kind == okImm:
         x86.emitOrImm(ctx.buf.data, dest.reg, int32(op.immVal))
       elif op.kind == okMem:
-        error("OR from memory not supported yet", n)
+        x86.emitOrMem(ctx.buf.data, dest.reg, op.mem)    # or reg, [mem]
       else:
         x86.emitOr(ctx.buf.data, dest.reg, op.reg)
 
@@ -4140,7 +4280,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       if op.kind == okImm:
         x86.emitXorImm(ctx.buf.data, dest.reg, int32(op.immVal))
       elif op.kind == okMem:
-        error("XOR from memory not supported yet", n)
+        x86.emitXorMem(ctx.buf.data, dest.reg, op.mem)   # xor reg, [mem]
       else:
         x86.emitXor(ctx.buf.data, dest.reg, op.reg)
 
@@ -4152,12 +4292,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     if dest.kind == okMem: error("Shift destination cannot be memory", n)
     if op.kind == okImm:
       x86.emitShl(ctx.buf.data, dest.reg, int(op.immVal))
-    elif op.reg == RCX:
-      # emitShlCl? x86.nim only has imm count support in emitShl currently?
-      # Need to check x86.nim for CL support or add it.
-      # Existing emitShl takes `count: int`.
-      # We need `emitShlCl(reg)`.
-      error("Shift by CL not supported yet in x86 backend", n)
+    elif op.kind == okReg and op.reg == RCX:
+      x86.emitShlCl(ctx.buf.data, dest.reg)        # shl dest, cl
     else:
       error("Shift count must be immediate or CL", n)
 
@@ -4169,8 +4305,10 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     if dest.kind == okMem: error("Shift destination cannot be memory", n)
     if op.kind == okImm:
       x86.emitShr(ctx.buf.data, dest.reg, int(op.immVal))
+    elif op.kind == okReg and op.reg == RCX:
+      x86.emitShrCl(ctx.buf.data, dest.reg)        # shr dest, cl
     else:
-      error("Shift count must be immediate", n)
+      error("Shift count must be immediate or CL", n)
 
   of SarX64:
     inc n
@@ -4180,8 +4318,10 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     if dest.kind == okMem: error("Shift destination cannot be memory", n)
     if op.kind == okImm:
       x86.emitSar(ctx.buf.data, dest.reg, int(op.immVal))
+    elif op.kind == okReg and op.reg == RCX:
+      x86.emitSarCl(ctx.buf.data, dest.reg)        # sar dest, cl
     else:
-      error("Shift count must be immediate", n)
+      error("Shift count must be immediate or CL", n)
 
   # Unary
   of IncX64:
@@ -4220,7 +4360,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # Comparisons work on integers, pointers, and bool (the "if bool" test).
     checkComparable(dest.typ, "cmp", start)
     checkComparable(op.typ, "cmp", start)
-    checkCompatibleTypes(dest.typ, op.typ, "cmp", start)
+    checkCmpCompatible(dest.typ, op.typ, start)
     if dest.kind == okMem:
       if op.kind == okImm:
         # CMP m64, imm32
@@ -4500,8 +4640,11 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       x86.emitPop(ctx.buf.data, dest.reg)
 
   of SyscallX64:
-    inc n
-    x86.emitSyscall(ctx.buf.data)
+    if ctx.inCall and ctx.callContext.isSyscall:
+      genSyscallMarkerX64(n, ctx)   # `(syscall)` as the prepare invocation marker
+    else:
+      inc n
+      x86.emitSyscall(ctx.buf.data)  # a raw `syscall` (e.g. the entry's exit path)
   of LeaX64:
     # (lea dest base-reg offset) or (lea dest label). The destination is a
     # register or a named register local. `lea` *defines* its destination, so a
@@ -5079,8 +5222,9 @@ proc pass2(n: Cursor; ctx: var GenContext) =
           skip n
         of ArchD:
           handleArch(n, ctx)
-        of ImpD, ExtprocD:
-          # Already handled in pass1, skip
+        of ImpD, ExtprocD, SyprocD:
+          # Already handled in pass1, skip. A syproc emits no code: it is a
+          # syscall's proctype + number, consulted by the `(syscall)`/`(svc)` marker.
           skip n
         else:
           # Top-level instructions (entry point) - generate these

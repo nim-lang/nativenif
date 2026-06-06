@@ -277,9 +277,10 @@ type
     TvarD = (ord(TvarTagId), "tvar")  ## thread local variable
     ImpD = (ord(ImpTagId), "imp")  ## import dynamic library
     ExtprocD = (ord(ExtprocTagId), "extproc")  ## external proc from imported library
+    SyprocD = (ord(SyprocTagId), "syproc")  ## system-call proc declaration (proctype + clobbers + number)
 
 proc rawTagIsNifasmDecl*(raw: TagEnum): bool {.inline.} =
-  raw in {TypeTagId, ProcTagId, ParamsTagId, ParamTagId, ResultTagId, ClobberTagId, VarTagId, ArchTagId, CfvarTagId, RodataTagId, GvarTagId, TvarTagId, ImpTagId, ExtprocTagId}
+  raw in {TypeTagId, ProcTagId, ParamsTagId, ParamTagId, ResultTagId, ClobberTagId, VarTagId, ArchTagId, CfvarTagId, RodataTagId, GvarTagId, TvarTagId, ImpTagId, ExtprocTagId, SyprocTagId}
 
 type
   NifasmExpr* = enum

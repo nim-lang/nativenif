@@ -27,32 +27,12 @@ import codegen_common
 
 const DarwinLibSystem = "/usr/lib/libSystem.B.dylib"
 
-# Linux/AArch64 syscall numbers (asm-generic unistd, used by arm64). When the
-# backend targets Linux (`g.a64Linux`), an `importc`'d libc function with one of
-# these names lowers to a raw `svc #0` (number in x8, args x0–x5) instead of a
-# Darwin dynamic `extcall`, so nifasm's static ELF backend can serve it without a
-# dynamic linker — mirroring the x86-64 backend's `LinuxSyscalls`. Numbers differ
-# from x86-64: e.g. write=64 (not 1), exit=93 (not 60).
-const
-  LinuxA64ExitNr = 93
-  LinuxA64Syscalls = {
-    "read": 63, "write": 64, "openat": 56, "close": 57, "exit": LinuxA64ExitNr,
-    "exit_group": 94}
-
-proc linuxA64SyscallNr(name: string): int =
-  for (n, nr) in LinuxA64Syscalls:
-    if n == name: return nr
-  result = -1
-
-proc externCName(g: var CodeGen; asmName: string): string =
-  ## The C name an extern asm-symbol resolves to (Darwin `_`-prefix stripped), for
-  ## matching against the syscall table on Linux.
-  for ex in g.prog.externOrder:
-    if ex.asmName == asmName:
-      result = ex.extName
-      if result.len > 0 and result[0] == '_': result = result[1 .. ^1]
-      return
-  result = ""
+# When the backend targets Linux (`g.a64Linux`), an `importc`'d libc function
+# recognised as a syscall (see `programs.collect` / `LinuxSyscalls`) is emitted as
+# a `(syproc …)` and invoked inline via a `(svc 0)` marker (number in x8, args
+# x0–x5, result x0) instead of a Darwin dynamic `extcall`, so nifasm's static ELF
+# backend serves it without a dynamic linker. `LinuxA64ExitNr` and the table live
+# in `programs`; AArch64 uses the asm-generic unistd numbers (write=64 not 1).
 
 # The `CodeGen` state object and the NIFC type/lvalue analysis live in
 # `codegen_common`; this module is the AArch64 instruction-selection backend.
@@ -596,23 +576,29 @@ proc recordEviction(g: var CodeGen; r: Reg): StealEvent =
   if victim.len == 0: victim = bindName           # they coincide for a non-param local
   let typ = g.ra.locationOfSym(victim).typ
   let slot = "evict" & $g.spillCount & ".0"; inc g.spillCount
+  # Live IFF the victim is already materialized (a declared local / settled param —
+  # `symType` covers both); a future local whose reused home reg is stolen before its
+  # own decl has nothing of its own to save (see the x64 twin for the full rationale).
+  let live = g.symType.hasKey(victim)
   g.ra.locs[g.ra.symPos[victim]] = namedStackLoc(slot, typ)
   g.ra.hasStackVars = true
   g.regLocal.del r
-  result = StealEvent(victim: victim, bindName: bindName, slot: slot, reg: r, typ: typ)
+  result = StealEvent(victim: victim, bindName: bindName, slot: slot, reg: r, typ: typ, live: live)
 
 proc replayEviction(g: var CodeGen; ev: StealEvent) =
   ## Emit-pass: re-apply a recorded eviction — declare the slot, store the victim's
   ## live value, kill its register binding, repoint its location to the slot. A
   ## pointer keeps its `(ptr T)` slot type (else nifasm's strict store/reload rejects
   ## the typed value and a later deref is illegal); other scalars stay `(i 64)`.
-  if g.symType.hasKey(ev.victim) and
-     isPtrType(resolveType(g.prog, g.symType[ev.victim])):
-    var tc = g.symType[ev.victim]
+  # Type from the PLAN-recorded `ev.typ` (not a re-query of mutable `symType`, which is
+  # unset for a victim evicted before its decl → would wrongly pick `(i 64)` for a ptr).
+  if not cursorIsNil(ev.typ.typ) and isPtrType(resolveType(g.prog, ev.typ.typ)):
+    var tc = ev.typ.typ
     g.emTypedStackVar(ev.slot, tc)               # (var :evictN.0 (s) (ptr …))
   else:
     g.emScalarStackVar(ev.slot)                  # (var :evictN.0 (s) (i 64))
-  g.emScalarStore(ev.slot, ev.reg)               # store the victim's live (bound) value
+  if ev.live:                                    # only a materialized victim has a value
+    g.emScalarStore(ev.slot, ev.reg)             # store the victim's live (bound) value
   if g.regLocal.getOrDefault(ev.reg, "") == ev.bindName:
     g.ab.tree KillA64: g.ab.sym ev.bindName      # release the register binding
   g.ra.locs[g.ra.symPos[ev.victim]] = namedStackLoc(ev.slot, ev.typ)
@@ -1392,6 +1378,66 @@ proc emitAddr(g: var CodeGen; loc: Location; dest: Reg) =
     else: raiseAssert "arkham: address-of Mem expr " & $nn.exprKind
   else: raiseAssert "arkham: cannot take the address of location kind " & $loc.kind
 
+proc rebindLocalAs(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
+  ## Re-establish register `r`'s binding to the named local `name`, retyped to
+  ## `typeCur`, via a zero-machine-code `(rebind …)`. `rebind` auto-kills the transient
+  ## tenant `r` currently carries, so no manual `kill` is needed. The scope already
+  ## tracks `name` (declared by `emRegLocalVar`), so `scopeLocals` is NOT touched. Type
+  ## emission mirrors `emRegLocalVar`: a pointer keeps its precise `(ptr …)`, every
+  ## other scalar is the generic `(i 64)` register form.
+  g.ab.tree RebindA64:
+    g.ab.symDef name
+    if isPtrType(resolveType(g.prog, typeCur)):
+      var t = typeCur
+      g.genTypeBody(t)
+    else:
+      g.ab.intType(64)
+    g.ab.reg r
+  g.regLocal[r] = name
+  g.boundTemps.excl r
+
+proc coerceThroughCast(g: var CodeGen; tc: Cursor; c: var Cursor; srcSlot: AsmSlot; dest: Reg) =
+  ## Re-represent a coercion `(cast/conv tc <source at c>)` into `dest` — the ONE
+  ## mechanism for every coercion whose source and target differ in representation
+  ## (int↔ptr, ptr↔int, ptr↔ptr). arkham computes addresses as untyped values in GPRs
+  ## while nifasm is strictly nominal, so the only real work is a *reinterpret* of
+  ## `dest`'s bits from the SOURCE type to `tc` (plus a real zero-extend when a narrow
+  ## int becomes a pointer). nifasm `rebind` IS that reinterpret — a checked, named,
+  ## zero-machine-code retype — so the value is computed straight into `dest` and its
+  ## binding flipped across the cast, with NO runtime `mov`:
+  ##   rebind dest → source type  (free) · genInto source → dest · rebind dest → tc (free)
+  ## Consumes the source at `c`. The x64 twin in codegen_x64.nim — keep them in sync.
+  ##
+  ## In-place is unsafe only when the SOURCE reads `dest` (a pointer self-update
+  ## `p = cast[ptr T](add … p …)`), because rebinding `dest` to the source type kills
+  ## the binding the source needs; `refsReg` is the same self-clobber check genBin's
+  ## operand-swap uses. That (and a raw, unbound register, which has no binding to flip)
+  ## falls back to a scratch register + a single `(cast tc s)` store. A named-local
+  ## `dest` is sealed by the enclosing `genInto`, so the source can't evict it.
+  let destName = if g.regLocal.hasKey(dest): g.regLocal[dest] else: ""
+  let isTemp = dest in g.boundTemps
+  let isLocal = destName.len > 0 and not isTemp
+  let selfRef = isLocal and g.refsReg(c, dest)
+  if (isLocal or isTemp) and not selfRef:
+    g.bindTemp(dest, srcSlot)                     # view dest as the SOURCE type (free)
+    g.genInto(c, dest)                            # source value → dest, types match
+    if isPtrType(tc) and srcSlot.kind in {AInt, AUInt} and srcSlot.size < 8:
+      g.extendTo(dest, srcSlot.size * 8, signed = false)
+    if isLocal: g.rebindLocalAs(destName, dest, tc)   # restore the named local, retyped (free)
+    else: g.bindTemp(dest, slotOf(g.prog, tc))        # a temp: retype to the target (free)
+  else:
+    let s = g.borrowTmp(srcSlot)
+    g.genInto(c, s)
+    if isPtrType(tc) and srcSlot.kind in {AInt, AUInt} and srcSlot.size < 8:
+      g.extendTo(s, srcSlot.size * 8, signed = false)
+    var tcc = tc
+    g.ab.tree MovA64:
+      g.emReg dest
+      g.ab.tree CastX:                             # the NIFC cast, preserved
+        g.genTypeBody(tcc)
+        g.emReg s
+    g.giveBack s
+
 proc genCoerce(g: var CodeGen; c: var Cursor; dest: Reg; isCast: bool) =
   ## Shared lowering for `(conv Type Expr)` / `(cast Type Expr)`. Both evaluate
   ## `Expr` and re-represent it in `Type`'s 64-bit register form. The choice of
@@ -1407,6 +1453,8 @@ proc genCoerce(g: var CodeGen; c: var Cursor; dest: Reg; isCast: bool) =
     let targetW = intTypeWidth(tc)
     let targetPtr = isPtrType(tc)
     skip c                                    # target type
+    let srcSlot2 = g.exprSlot(c)
+    let srcIsPtr = not cursorIsNil(srcSlot2.typ) and isPtrType(resolveType(g.prog, srcSlot2.typ))
     if g.isFloatExpr(c):
       # float source → integer/pointer target (`dest` is a GPR).
       let fbits = g.floatBits(c)
@@ -1419,12 +1467,18 @@ proc genCoerce(g: var CodeGen; c: var Cursor; dest: Reg; isCast: bool) =
         if targetW < 64 and not targetPtr:
           g.extendTo(dest, targetW, signed = targetSigned)
       g.giveBackF f
+    elif targetPtr or srcIsPtr:
+      # Any coercion that crosses representations — int→ptr (NIFC encodes pointer
+      # arithmetic as `(cast ptr (add (u 64) …))`), ptr→int, or ptr→ptr — reinterprets
+      # through the preserved NIFC cast. `coerceThroughCast` is the (rebind-based)
+      # mechanism; mirrors the x64 backend.
+      g.coerceThroughCast(tc, c, srcSlot2, dest)
+      if not targetPtr and targetW < 64:           # ptr→narrow int: extend the result
+        g.extendTo(dest, targetW, signed = targetSigned)
     else:
       let (srcW, srcSigned) = g.srcWidthSigned(c)
       g.genInto(c, dest)                      # value → dest
-      if targetPtr:
-        if srcW < 64: g.extendTo(dest, srcW, signed = false)   # int→ptr: zero-extend
-      elif srcW < targetW:                    # widening int→int
+      if srcW < targetW:                      # widening int→int
         g.extendTo(dest, srcW, signed = (not isCast) and srcSigned)
       else:                                   # narrowing or equal width
         g.extendTo(dest, targetW, signed = targetSigned)
@@ -1599,10 +1653,16 @@ proc emitPatAddr(g: var CodeGen; c: var Cursor; dest: Reg) =
   ## lands inside its operand tree; the `lea dest, (at (cast (aptr elem) base) idx)`
   ## then lets nifasm stride the index by the element size.
   c.into:
-    let baseTy = resolveType(g.prog, g.getType(c))
+    let baseTyC = g.getType(c)
+    let baseTy = resolveType(g.prog, baseTyC)
     var elem = innerType(g.prog, baseTy)
-    let baseReg = g.borrowTmp(ScalarSlot)
-    if baseTy.typeKind in {NifcType.ArrayT, NifcType.FlexarrayT}:
+    let isArr = baseTy.typeKind in {NifcType.ArrayT, NifcType.FlexarrayT}
+    # A real pointer base now lives in a precisely-typed slot (see genVarDecl), so the
+    # base reg must match it on load: type it by the base's own pointer type. An
+    # array/flexarray decays to its address via genAddr (lenient), so a generic slot is
+    # fine there. Mirrors x64's emitPatAddr.
+    let baseReg = g.borrowTmp(if isArr: ScalarSlot else: slotOf(g.prog, baseTyC))
+    if isArr:
       g.genAddr(c, baseReg)                     # decay: baseReg ← &field
     else:
       g.genInto(c, baseReg)                     # baseReg ← the pointer value
@@ -1783,6 +1843,42 @@ proc genProctypeSig(g: var CodeGen; c: var Cursor) =
     g.ab.tree ClobberD:
       for r in ConvClobbersGpr: g.ab.reg r   # a clobber *declaration*: raw reg locations
 
+proc emitSyprocA64(g: var CodeGen; sp: SyscallProc) =
+  ## Emit a `(syproc :name (params …) (result …)? NR)` decl for a Linux syscall:
+  ## params in the syscall ABI registers (x0–x5, identical to AAPCS64's arg regs),
+  ## result in x0, and the AArch64 syscall number. A `svc` preserves every register
+  ## but x0, so no `(clobber …)` is emitted (the `(svc)` marker marks x0 itself).
+  ## Invoked inline at call sites via the `(svc 0)` marker; emits no code.
+  var c = sp.decl
+  c.into:
+    inc c                                        # name
+    var pc = c; skip c                           # params slot; c → return type
+    g.ab.tree SyprocD:
+      g.ab.symDef sp.asmName
+      var idx = 0
+      g.ab.tree ParamsD:
+        if pc.kind == TagLit:                    # (params (param …) …)
+          pc.into:
+            while pc.hasMore:
+              pc.into:                           # (param :name pragmas type)
+                inc pc                           # name → positional pN.0
+                skip pc                          # pragmas
+                if idx >= IntArgRegs.len:
+                  raiseAssert "arkham a64: syscall with too many arguments"
+                g.ab.tree ParamD:
+                  g.ab.symDef paramName(idx)
+                  g.ab.reg IntArgRegs[idx]
+                  g.genTypeBody(pc)
+                while pc.hasMore: skip pc
+              inc idx
+      g.ab.tree ResultD:                         # c at the return type
+        if not retIsVoid(c):
+          g.ab.symDef "ret.0"
+          g.ab.reg IntRet
+          g.genTypeBody(c)
+      g.ab.intLit sp.sysNrA64.int64
+    while c.hasMore: skip c                       # drain the importc decl's pragmas + body
+
 proc genCall(g: var CodeGen; c: var Cursor) =
   ## `(call f arg…)` — internal `(call)` or external `(extcall)`. Integer/
   ## pointer args go straight into x0,x1,… left-to-right (no nested calls — the
@@ -1806,23 +1902,10 @@ proc genCall(g: var CodeGen; c: var Cursor) =
         # `<module>.s.nif` and links the definition.
         g.callTarget[fsym] = foreignCallTarget(g.prog, fsym)
     let tgt = g.callTarget[fsym]
-    let sysNr = if g.a64Linux and tgt.extern: linuxA64SyscallNr(g.externCName(tgt.asmName))
-                else: -1
     if tgt.atomic.len > 0:                     # GCC `__atomic_*` builtin → inline
       g.genAtomic(c, tgt.atomic)               # consumes the args; result in x0
     elif tgt.memIntrin.len > 0:                # C mem* intrinsic → inline byte loop
       g.genMemIntrin(c, tgt.memIntrin)         # consumes the args; result in x0
-    elif sysNr >= 0:
-      # Linux: lower an `importc`'d libc syscall to `svc #0` — args in x0–x5, the
-      # number in x8, result in x0 (read by the `CallC` path in `genInto`; discarded
-      # at statement level). nifasm's ELF backend is static, so the kernel serves it
-      # directly (no dynamic linker / PLT), exactly like the x86-64 backend.
-      var idx = 0
-      while c.hasMore:
-        assert idx < IntArgRegs.len, "arkham v1: syscall with too many arguments"
-        g.genInto(c, IntArgRegs[idx]); inc idx
-      g.movImm(R8, sysNr.int64)                # x8 = syscall number
-      g.ab.tree SvcA64: g.ab.intLit 0
     elif tgt.declarative:
       # Declarative call: bind each scalar argument to its positional param `p{i}`
       # and the result to `ret.0`, so nifasm cross-checks the ABI. The `(mov (arg
@@ -1862,7 +1945,10 @@ proc genCall(g: var CodeGen; c: var Cursor) =
                 g.emReg SP
                 g.ab.tree ArgX: g.ab.sym paramName(stackArgIdx[k])
               g.emReg stackTmps[k]
-        g.ab.keyword CallA64
+        if tgt.syscall:
+          g.ab.tree SvcA64: g.ab.intLit 0       # `(svc)`: kernel trap, no `bl`
+        else:
+          g.ab.keyword CallA64
         if stackTmps.len > 0:
           g.ab.tree AddA64: g.emReg SP; g.ab.keyword CsizeX
         if not retIsVoid(tgt.retType):
@@ -2134,12 +2220,17 @@ proc genVarDecl(g: var CodeGen; c: var Cursor) =
           g.emFloatScalarStore(name, f, bits)
           g.giveBackF f
       elif loc.typ.kind != AMem:
-        # spilled integer/pointer scalar: a nifasm `(s)` (i 64) slot + a store of
-        # its initializer (computed into a scratch register first).
-        g.emScalarStackVar(name)
+        # spilled integer/pointer scalar: a nifasm `(s)` slot + a store of its
+        # initializer (computed into a scratch register first). A pointer's slot must
+        # carry its PRECISE type — nifasm is strict, so a generic `(i 64)` slot would
+        # reject the now precisely-typed store (`coerceThroughCast` types the value) and
+        # forbid a later deref. Integers keep the 8-byte `(i 64)` slot. Mirrors x64.
+        let isPtr = isPtrType(resolveType(g.prog, typeCur))
+        if isPtr: g.emTypedStackVar(name, typeCur)
+        else: g.emScalarStackVar(name)
         if c.kind == DotToken: inc c          # no initializer
         else:
-          let tmp = g.borrowTmp(ScalarSlot)
+          let tmp = g.borrowTmp(if isPtr: slotOf(g.prog, typeCur) else: ScalarSlot)
           g.genInto(c, tmp)
           g.emScalarStore(name, tmp)
           g.giveBack tmp
@@ -3282,6 +3373,8 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       g.genGlobal(name, decl)
     for name, decl in g.prog.tvars:
       g.genTvar(name, decl)
+    for sp in g.prog.syscalls:                  # one `(syproc …)` per used syscall
+      g.emitSyprocA64(sp)
     for info in g.prog.procs:
       genProc(g, info)
     # NOTE: foreign types are NOT emitted here. arkham loads other modules only to
