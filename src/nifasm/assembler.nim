@@ -1421,21 +1421,19 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
             offset: offset,
             hasIndex: hasIndex
           )
-          # When the base register holds a pointer, the access is its pointee (mirror
-          # of the x64 `mem` handler): a SUB-WORD scalar pointee (`(ptr (u 8))` etc.)
-          # MUST size the load so `memWidthOpc` emits ldrb/ldrh — else `(mem (cast
-          # (ptr (u 8)) reg))` over-reads 8 bytes (the SSO `s[i]` char read). A 64-bit
-          # scalar / float / fn-pointer pointee stays the generic 8-byte access; a
-          # pointer pointee round-trips nominally.
+          # The deref of `(ptr T)` has type T (mirror of the x64 `mem` handler).
+          # `memWidthOpc` then sizes it: a sub-word int/bool loads narrow (ldrb/ldrh —
+          # else `(mem (cast (ptr (u 8)) reg))` over-reads 8 bytes, the SSO `s[i]` char
+          # read; a 64-bit pointee is already 8 bytes), a pointer round-trips nominally.
+          # Anything not a GPR-loadable scalar/pointer — a float (wrong register file), a
+          # proctype (a `(ptr proc)` deref is a code address), an aggregate, or an
+          # over-wide (>8-byte) integer — can't be a single-register access → reads as a word.
           if baseOp.typ != nil and baseOp.typ.kind in {TypeKind.PtrT, TypeKind.AptrT}:
             let pointee = resolvedBase(baseOp.typ, ctx, n)
-            if pointee.kind in {TypeKind.PtrT, TypeKind.AptrT}:
-              result.typ = pointee
-            elif pointee.kind in {TypeKind.IntT, TypeKind.UIntT} and pointee.bits in {8, 16, 32} or
-                 pointee.kind == TypeKind.BoolT:
-              result.typ = pointee
-            else:
-              result.typ = Type(kind: IntT, bits: 64)
+            result.typ =
+              if pointee.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.BoolT,
+                                  TypeKind.PtrT, TypeKind.AptrT} and asmSizeOf(pointee) <= 8: pointee
+              else: Type(kind: IntT, bits: 64)
           else:
             result.typ = Type(kind: IntT, bits: 64)
     elif t == SsizeTagId:
@@ -3170,33 +3168,24 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
             displacement: displacement,
             hasIndex: hasIndex
           )
-          # Preserve type from stack variable if available; else, when the base register
-          # holds a pointer whose pointee is ITSELF a pointer, the access is that pointee
-          # (a nominal pointer type must round-trip precisely — e.g. storing a typed
-          # pointer value through `(mem ptrReg)`). A SCALAR pointee (int/uint/bool/float)
-          # or a function pointer keeps the generic 8-byte access: arkham computes
-          # integers in 64-bit registers, and the `mov` sized-access rule already handles
-          # narrow scalar field loads/stores — so a precise sub-word mem type here would
-          # only spuriously clash with a 64-bit accumulator in an `or`/`and`/`add` fold.
+          # The deref of `(ptr T)` has type T (a stack var contributes its own type).
+          # `memWidthOpc`/`intMemAccess` then size the access: a sub-word int/bool loads
+          # narrow (movzx/movsx — e.g. the SSO `(ptr (u 8))` slen byte; a 64-bit pointee
+          # is already 8 bytes), a pointer round-trips nominally. Anything that isn't a
+          # GPR-loadable scalar/pointer — a float (wrong register file), a proctype (a
+          # `(ptr proc)` deref is a code ADDRESS, not a proc value), an aggregate, or an
+          # over-wide (>8-byte) integer — can't be a single-register access, so it reads
+          # as a plain machine word.
           if stackVarType != nil:
             result.typ = stackVarType
           elif baseOp.typ != nil and baseOp.typ.kind in {TypeKind.PtrT, TypeKind.AptrT}:
             let pointee = resolvedBase(baseOp.typ, ctx, n)
-            if pointee.kind in {TypeKind.PtrT, TypeKind.AptrT}:
-              result.typ = pointee                     # ptr (ptr T) -> (ptr T): nominal round-trip
-            elif pointee.kind in {TypeKind.IntT, TypeKind.UIntT} and pointee.bits in {8, 16, 32} or
-                 pointee.kind == TypeKind.BoolT:
-              # A SUB-WORD scalar pointee MUST size the access — else a `(ptr (u 8))`
-              # deref (e.g. the SSO string's slen byte) over-reads 8 bytes. `intMemAccess`
-              # then emits the right movzx/movsx; the sized mem↔reg `mov` rule (and the
-              # bitwise/cmp width tolerance) accept the narrow mem against a 64-bit reg.
-              result.typ = pointee
-            else:
-              # 64-bit scalar / float / fn-pointer pointee: a generic 8-byte access is
-              # correct and avoids a spurious sub-word clash in an or/and/add fold.
-              result.typ = Type(kind: IntT, bits: 64)
+            result.typ =
+              if pointee.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.BoolT,
+                                  TypeKind.PtrT, TypeKind.AptrT} and asmSizeOf(pointee) <= 8: pointee
+              else: Type(kind: IntT, bits: 64)
           else:
-            result.typ = Type(kind: IntT, bits: 64)  # Default assumption
+            result.typ = Type(kind: IntT, bits: 64)  # not a pointer base → a machine word
     elif t == SsizeTagId:
       result.kind = okSsize
       result.typ = Type(kind: IntT, bits: 64)
