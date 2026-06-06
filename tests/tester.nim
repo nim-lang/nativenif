@@ -166,6 +166,8 @@ exec "nim c -r src/nifasm/nifasm tests/hello.nif"
 exec "nim c -r src/nifasm/nifasm tests/thread_local_tls.nif"
 exec "nim c -r src/nifasm/nifasm tests/thread_local_switch.nif"
 exec "nim c -r src/nifasm/nifasm tests/atomic_ops.nif"
+exec "nim c -r src/nifasm/nifasm tests/bitops_rotate_scan.nif"
+exec "nim c -r src/nifasm/nifasm tests/bitops_bittest.nif"
 exec "nim c -r src/nifasm/nifasm tests/unique_bind.nif"
 exec "nim c -r src/nifasm/nifasm tests/kill_reuse.nif"
 exec "nim c -r src/nifasm/nifasm tests/kill_reuse_multi.nif"
@@ -198,6 +200,10 @@ when defined(linux) and defined(amd64):
   # binaries have been built for linux only:
   exec "tests/hello"
   exec "tests/atomic_ops"
+  # The new x86-64 bit instructions (rol/ror/rcl/rcr/bsf/bsr/bt/bts/btr/btc):
+  # both binaries compute their checks and exit 0 only when every result matches.
+  exec "tests/bitops_rotate_scan"
+  exec "tests/bitops_bittest"
   exec "tests/dot_at_access"
   exec "tests/nested_dot_at"
   exec "tests/pointer_dot_store"

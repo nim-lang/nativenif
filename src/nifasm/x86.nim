@@ -1323,10 +1323,12 @@ proc emitPrefetchNta*(dest: var Bytes; reg: Register) =
 
 # Conditional set instructions
 proc emitSetcc*(dest: var Bytes; code: byte; reg: Register) =
-  ## Emit SETcc reg (set byte if condition)
+  ## Emit SETcc reg (set byte if condition). The destination is an r/m8: to
+  ## address SPL/BPL/SIL/DIL (reg 4..7) rather than the legacy AH/CH/DH/BH, a
+  ## REX prefix MUST be present, so emit a (possibly bare) REX for any reg >= 4.
   var rex = RexPrefix()
   if needsRex(reg): rex.b = true
-  if rex.b: dest.add(encodeRex(rex))
+  if int(reg) >= 4: dest.add(encodeRex(rex))
 
   dest.add(0x0F)
   dest.add(code)

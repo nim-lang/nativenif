@@ -4376,6 +4376,51 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     if op.kind == okMem: error("NOT memory not supported yet", n)
     x86.emitNot(ctx.buf.data, op.reg)
 
+  # Rotates: `(rol D S)` etc. D is a register, S an immediate count (the CL
+  # form has no emitter yet). Mirrors the shift dispatch above.
+  of RolX64, RorX64, RclX64, RcrX64:
+    let name = $instTag
+    inc n
+    let dest = parseDest(n, ctx)
+    let op = parseOperand(n, ctx)
+    checkBitwiseType(dest.typ, name, start)
+    if dest.kind == okMem: error("Rotate destination cannot be memory", n)
+    if op.kind != okImm: error("Rotate count must be immediate", n)
+    let count = int(op.immVal)
+    case instTag
+    of RolX64: x86.emitRol(ctx.buf.data, dest.reg, count)
+    of RorX64: x86.emitRor(ctx.buf.data, dest.reg, count)
+    of RclX64: x86.emitRcl(ctx.buf.data, dest.reg, count)
+    else:      x86.emitRcr(ctx.buf.data, dest.reg, count)
+
+  # Bit scan: `(bsf D S)` / `(bsr D S)` — D and S are both registers.
+  of BsfX64, BsrX64:
+    inc n
+    let dest = parseDest(n, ctx)
+    let op = parseOperand(n, ctx)
+    checkBitwiseType(dest.typ, $instTag, start)
+    if dest.kind != okReg: error("Bit-scan destination must be a register", n)
+    if op.kind != okReg: error("Bit-scan source must be a register", n)
+    if instTag == BsfX64:
+      x86.emitBsf(ctx.buf.data, dest.reg, op.reg)
+    else:
+      x86.emitBsr(ctx.buf.data, dest.reg, op.reg)
+
+  # Bit test family: `(bt D S)` etc. D is a register, S an immediate bit index.
+  of BtX64, BtsX64, BtrX64, BtcX64:
+    inc n
+    let dest = parseDest(n, ctx)
+    let op = parseOperand(n, ctx)
+    checkBitwiseType(dest.typ, $instTag, start)
+    if dest.kind != okReg: error("Bit-test destination must be a register", n)
+    if op.kind != okImm: error("Bit-test bit index must be immediate", n)
+    let bit = int(op.immVal)
+    case instTag
+    of BtX64:  x86.emitBt(ctx.buf.data, dest.reg, bit)
+    of BtsX64: x86.emitBts(ctx.buf.data, dest.reg, bit)
+    of BtrX64: x86.emitBtr(ctx.buf.data, dest.reg, bit)
+    else:      x86.emitBtc(ctx.buf.data, dest.reg, bit)
+
   # Comparison
   of CmpX64:
     inc n
