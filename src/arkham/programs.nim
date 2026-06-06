@@ -202,7 +202,14 @@ proc ptrTypeOf*(p: Program; elem: Cursor): Cursor =
   buf.closeTag()
   result = beginRead(buf)
 
-proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool): Program =
+proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
+              darwin = false): Program =
+  ## `darwin` selects the Mach-O target, which links dynamically against
+  ## libSystem (dyld + PLT). Unlike the static-ELF Linux target, an `importc`'d
+  ## libc name there resolves through the dynamic linker, so it must go through
+  ## the normal extern path rather than being lowered to a raw kernel trap —
+  ## Darwin's syscall numbers and `svc #0x80` convention differ from Linux's, and
+  ## raw syscalls are unstable ABI on macOS. See the syscall branch below.
   result = Program(callTarget: initTable[string, CallTarget](),
                    typeDecls: initTable[string, Cursor](),
                    globals: initTable[string, Cursor](),
@@ -284,7 +291,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool): Program =
           # genBitBuiltin. (nimony's `firstSetBit`/`countTrailingZeroBits` reach
           # `ctz64` ⇒ `__builtin_ctzll` ⇒ a single `bsf`.)
           result.callTarget[pname] = CallTarget(bitBuiltin: importcN, retType: retType)
-        elif importcN.len > 0 and lookupSyscall(importcN).found:
+        elif not darwin and importcN.len > 0 and lookupSyscall(importcN).found:
           # A Linux syscall: lowered to a raw kernel trap (no libc, no PLT). Emitted
           # as a `(syproc …)` whose proctype puts args in the syscall ABI registers
           # and declares the kernel's clobbers; calls go through the declarative

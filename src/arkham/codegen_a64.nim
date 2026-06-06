@@ -3398,7 +3398,7 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## to resolve cross-module symbols (`Foo.0.othermod`).
   var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: aarch64Machine,
                   a64Linux: linux)
-  g.prog = collect(buf, inputPath, tags)
+  g.prog = collect(buf, inputPath, tags, darwin = not linux)
   g.callTarget = g.prog.callTarget
   g.globals = g.prog.globals
   g.tvars = g.prog.tvars
