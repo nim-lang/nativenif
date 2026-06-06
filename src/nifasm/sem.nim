@@ -54,7 +54,9 @@ type
     want*, got*: Type
 
   SymKind* = enum
-    skUnknown, skType, skVar, skParam, skProc, skLabel, skRodata, skGvar, skTvar, skCfvar, skExtProc
+    skUnknown, skType, skVar, skParam, skProc, skLabel, skRodata, skGvar, skTvar, skCfvar, skExtProc,
+    skSysProc   ## a Linux syscall: a proctype (params in syscall ABI regs, result, clobbers)
+                ## plus a syscall number (stored in `offset`); invoked inline via `(syscall)`/`(svc)`
 
   Symbol* = ref object
     name*: string
@@ -183,16 +185,28 @@ proc compatible*(want, got: Type): bool =
     # sized int/uint/ptr/etc. — only the literal adapts.
     result = got.kind == BoolT or got.kind == IntLitT
   of IntT, UIntT:
-    # IntLitT is compatible with both IntT and UIntT of same size
-    result = (got.kind == want.kind or got.kind == IntLitT) and want.bits == got.bits
+    # Same-WIDTH integers are interchangeable regardless of signedness: the bits are
+    # identical, and every operation where signedness matters (idiv/div, sar/shr, the
+    # ordered compares) selects signed-vs-unsigned by its INSTRUCTION, not by the operand
+    # type. So `i64`↔`u64` (e.g. `or i64, u64`) and an integer literal of the same width
+    # all match. (Sub-word width still matters: it sets the access/extend size.)
+    result = got.kind in {IntT, UIntT, IntLitT} and want.bits == got.bits
   of IntLitT:
-    # Literal is compatible with IntT, UIntT, or another literal of same size, and
-    # with bool (the `cmp boolReg, 0` test, operands either order).
-    result = got.kind in {IntT, UIntT, IntLitT, BoolT} and (got.kind == BoolT or want.bits == got.bits)
+    # Literal is compatible with IntT, UIntT, or another literal of same size, with
+    # bool (the `cmp boolReg, 0` test, operands either order), and with a pointer (the
+    # `cmp ptr, 0` / nil test — only the *literal* adapts; a sized int reg stays
+    # strictly incompatible with a pointer). See the PtrT/AptrT arm for the mirror.
+    result = (got.kind in {IntT, UIntT, IntLitT, BoolT} and (got.kind == BoolT or want.bits == got.bits)) or
+             got.kind in {PtrT, AptrT}
   of FloatT:
     result = got.kind == want.kind and want.bits == got.bits
   of PtrT, AptrT:
-    if got.kind != want.kind:
+    if got.kind == IntLitT:
+      # An integer LITERAL (in practice `0` = nil) is compatible with a pointer: the
+      # universal `cmp ptr, 0` null test / `mov ptr, 0` nil init. Only the literal
+      # adapts — a sized int reg vs a pointer is still rejected (strict typing).
+      result = true
+    elif got.kind != want.kind:
       result = false
     elif want.base != nil and got.base != nil:
       # Both pointees structurally resolved — compare structurally.

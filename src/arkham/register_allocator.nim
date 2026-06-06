@@ -285,7 +285,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
         else:
           # `effSlot` is the in-register value: the scalar itself, or (by-ref) a
           # pointer to the aggregate copy.
-          let effSlot = if aggrByRef: AsmSlot(kind: AUInt, size: 8, align: 8) else: slot
+          let effSlot = if aggrByRef: AsmSlot(cls: AUInt, size: 8, align: 8) else: slot
           let props = b.an.vars.getOrDefault(name).props
           var loc: Location
           if effSlot.isFloat:

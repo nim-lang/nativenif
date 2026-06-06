@@ -165,6 +165,19 @@ proc analyse(c: var Context; n: var Cursor) =
           inc c.inAddr
           while n.hasMore: analyse(c, n)
           dec c.inAddr
+      of DerefC:
+        # `(deref p)` READS the pointer `p` as a value (into a register) — even
+        # inside `(addr …)`/index/assignment context: `&((*p).field)`, `(*p)[i]`,
+        # and `*p = v` all only LOAD `p`, never take the address of the variable
+        # `p`. So clear the addressing context for the operand; otherwise a hot
+        # pointer local (e.g. a TLSF chunk cursor `c`) is wrongly marked AddrTaken
+        # and spilled to the stack instead of getting a register. Mirrors the
+        # `(at …)` index reset above.
+        n.into:
+          let oldA = c.inAddr; let oldT = c.inAsgnTarget; let oldX = c.inArrayIndex
+          c.inAddr = 0; c.inAsgnTarget = 0; c.inArrayIndex = 0
+          while n.hasMore: analyse(c, n)
+          c.inAddr = oldA; c.inAsgnTarget = oldT; c.inArrayIndex = oldX
       of NoExpr:
         # `elif`/`else`/`of` carry a condition and a statement body — recurse so
         # uses and calls inside `if`/`case` branches are seen. Other NoExpr nodes

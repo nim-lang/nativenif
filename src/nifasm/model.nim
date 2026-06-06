@@ -46,6 +46,16 @@ type
     DecX64 = (ord(DecTagId), "dec")  ## decrement
     NegX64 = (ord(NegTagId), "neg")  ## negate
     NotX64 = (ord(NotTagId), "not")  ## bitwise not
+    RolX64 = (ord(RolTagId), "rol")  ## rotate left
+    RorX64 = (ord(RorTagId), "ror")  ## rotate right
+    RclX64 = (ord(RclTagId), "rcl")  ## rotate left through carry
+    RcrX64 = (ord(RcrTagId), "rcr")  ## rotate right through carry
+    BsfX64 = (ord(BsfTagId), "bsf")  ## bit scan forward
+    BsrX64 = (ord(BsrTagId), "bsr")  ## bit scan reverse
+    BtX64 = (ord(BtTagId), "bt")  ## bit test
+    BtsX64 = (ord(BtsTagId), "bts")  ## bit test and set
+    BtrX64 = (ord(BtrTagId), "btr")  ## bit test and reset
+    BtcX64 = (ord(BtcTagId), "btc")  ## bit test and complement
     CmpX64 = (ord(CmpTagId), "cmp")  ## compare
     TestX64 = (ord(TestTagId), "test")  ## test
     SeteX64 = (ord(SeteTagId), "sete")  ## set byte if equal
@@ -157,7 +167,7 @@ type
     WithregX64 = (ord(WithregTagId), "withreg")  ## block-scoped rebind; auto-killed at block end
 
 proc rawTagIsX64Inst*(raw: TagEnum): bool {.inline.} =
-  raw in {PrepareTagId, MovTagId, LeaTagId, MovapdTagId, MovsdTagId, AddTagId, SubTagId, MulTagId, ImulTagId, DivTagId, IdivTagId, AddsdTagId, SubsdTagId, MulsdTagId, DivsdTagId, MovssTagId, AddssTagId, SubssTagId, MulssTagId, DivssTagId, Cvtsi2sdTagId, Cvtsi2ssTagId, Cvttsd2siTagId, Cvttss2siTagId, Cvtsd2ssTagId, Cvtss2sdTagId, ComisdTagId, ComissTagId, MovfqTagId, MovfdTagId, AndTagId, OrTagId, XorTagId, ShlTagId, ShrTagId, SalTagId, SarTagId, IncTagId, DecTagId, NegTagId, NotTagId, CmpTagId, TestTagId, SeteTagId, SetzTagId, SetneTagId, SetnzTagId, SetaTagId, SetnbeTagId, SetaeTagId, SetnbTagId, SetncTagId, SetbTagId, SetnaeTagId, SetcTagId, SetbeTagId, SetnaTagId, SetgTagId, SetnleTagId, SetgeTagId, SetnlTagId, SetlTagId, SetngeTagId, SetleTagId, SetngTagId, SetoTagId, SetsTagId, SetpTagId, CmoveTagId, CmovzTagId, CmovneTagId, CmovnzTagId, CmovaTagId, CmovnbeTagId, CmovaeTagId, CmovnbTagId, CmovncTagId, CmovbTagId, CmovnaeTagId, CmovcTagId, CmovbeTagId, CmovnaTagId, CmovgTagId, CmovnleTagId, CmovgeTagId, CmovnlTagId, CmovlTagId, CmovngeTagId, CmovleTagId, CmovngTagId, CmovoTagId, CmovnoTagId, CmovsTagId, CmovnsTagId, CmovpTagId, CmovnpTagId, CmovpeTagId, CmovpoTagId, JmpTagId, JeTagId, JzTagId, JneTagId, JnzTagId, JgTagId, JngTagId, JgeTagId, JngeTagId, JaTagId, JnaTagId, JaeTagId, JnaeTagId, JlTagId, JleTagId, JbTagId, JbeTagId, CallTagId, ExtcallTagId, IatTagId, RetTagId, PushTagId, PopTagId, NopTagId, SyscallTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, LockTagId, XchgTagId, CmpxchgTagId, XaddTagId, Cmpxchg8bTagId, MfenceTagId, SfenceTagId, LfenceTagId, PauseTagId, ClflushTagId, ClflushoptTagId, Prefetcht0TagId, Prefetcht1TagId, Prefetcht2TagId, PrefetchntaTagId, RepmovsbTagId, RepmovswTagId, RepmovsdTagId, RepmovsqTagId, RebindTagId, WithregTagId}
+  raw in {PrepareTagId, MovTagId, LeaTagId, MovapdTagId, MovsdTagId, AddTagId, SubTagId, MulTagId, ImulTagId, DivTagId, IdivTagId, AddsdTagId, SubsdTagId, MulsdTagId, DivsdTagId, MovssTagId, AddssTagId, SubssTagId, MulssTagId, DivssTagId, Cvtsi2sdTagId, Cvtsi2ssTagId, Cvttsd2siTagId, Cvttss2siTagId, Cvtsd2ssTagId, Cvtss2sdTagId, ComisdTagId, ComissTagId, MovfqTagId, MovfdTagId, AndTagId, OrTagId, XorTagId, ShlTagId, ShrTagId, SalTagId, SarTagId, IncTagId, DecTagId, NegTagId, NotTagId, RolTagId, RorTagId, RclTagId, RcrTagId, BsfTagId, BsrTagId, BtTagId, BtsTagId, BtrTagId, BtcTagId, CmpTagId, TestTagId, SeteTagId, SetzTagId, SetneTagId, SetnzTagId, SetaTagId, SetnbeTagId, SetaeTagId, SetnbTagId, SetncTagId, SetbTagId, SetnaeTagId, SetcTagId, SetbeTagId, SetnaTagId, SetgTagId, SetnleTagId, SetgeTagId, SetnlTagId, SetlTagId, SetngeTagId, SetleTagId, SetngTagId, SetoTagId, SetsTagId, SetpTagId, CmoveTagId, CmovzTagId, CmovneTagId, CmovnzTagId, CmovaTagId, CmovnbeTagId, CmovaeTagId, CmovnbTagId, CmovncTagId, CmovbTagId, CmovnaeTagId, CmovcTagId, CmovbeTagId, CmovnaTagId, CmovgTagId, CmovnleTagId, CmovgeTagId, CmovnlTagId, CmovlTagId, CmovngeTagId, CmovleTagId, CmovngTagId, CmovoTagId, CmovnoTagId, CmovsTagId, CmovnsTagId, CmovpTagId, CmovnpTagId, CmovpeTagId, CmovpoTagId, JmpTagId, JeTagId, JzTagId, JneTagId, JnzTagId, JgTagId, JngTagId, JgeTagId, JngeTagId, JaTagId, JnaTagId, JaeTagId, JnaeTagId, JlTagId, JleTagId, JbTagId, JbeTagId, CallTagId, ExtcallTagId, IatTagId, RetTagId, PushTagId, PopTagId, NopTagId, SyscallTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, LockTagId, XchgTagId, CmpxchgTagId, XaddTagId, Cmpxchg8bTagId, MfenceTagId, SfenceTagId, LfenceTagId, PauseTagId, ClflushTagId, ClflushoptTagId, Prefetcht0TagId, Prefetcht1TagId, Prefetcht2TagId, PrefetchntaTagId, RepmovsbTagId, RepmovswTagId, RepmovsdTagId, RepmovsqTagId, RebindTagId, WithregTagId}
 
 type
   A64Inst* = enum
@@ -277,9 +287,10 @@ type
     TvarD = (ord(TvarTagId), "tvar")  ## thread local variable
     ImpD = (ord(ImpTagId), "imp")  ## import dynamic library
     ExtprocD = (ord(ExtprocTagId), "extproc")  ## external proc from imported library
+    SyprocD = (ord(SyprocTagId), "syproc")  ## system-call proc declaration (proctype + clobbers + number)
 
 proc rawTagIsNifasmDecl*(raw: TagEnum): bool {.inline.} =
-  raw in {TypeTagId, ProcTagId, ParamsTagId, ParamTagId, ResultTagId, ClobberTagId, VarTagId, ArchTagId, CfvarTagId, RodataTagId, GvarTagId, TvarTagId, ImpTagId, ExtprocTagId}
+  raw in {TypeTagId, ProcTagId, ParamsTagId, ParamTagId, ResultTagId, ClobberTagId, VarTagId, ArchTagId, CfvarTagId, RodataTagId, GvarTagId, TvarTagId, ImpTagId, ExtprocTagId, SyprocTagId}
 
 type
   NifasmExpr* = enum

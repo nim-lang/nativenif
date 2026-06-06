@@ -1,5 +1,5 @@
 (.nif27)
-(.indexat 617              )
+(.indexat 648              )
 (stmts
  (type :Vec3.0 .
   (object .
@@ -37,5 +37,7 @@
      (kv x.0 40)
      (kv y.0 2)
      (kv z.0 99)))
-   (call exit.c
-    (call useBig.0 b.0)))))(.index)
+   (var :r.0 .
+    (i 64)
+    (call useBig.0 b.0))
+   (call exit.c r.0))))(.index)

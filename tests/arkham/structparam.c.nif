@@ -1,5 +1,5 @@
 (.nif27)
-(.indexat 577              )
+(.indexat 608              )
 (stmts
  (type :Point.0 .
   (object .
@@ -34,5 +34,7 @@
     (oconstr Point.0
      (kv px.0 40)
      (kv py.0 2)))
-   (call exit.c
-    (call sum.0 q.0)))))(.index)
+   (var :r.0 .
+    (i 64)
+    (call sum.0 q.0))
+   (call exit.c r.0))))(.index)

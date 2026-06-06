@@ -13,6 +13,8 @@ Usage:
 
 Options:
   --output:file, -o:file    specify output file name (default: file)
+  --symmap                  dump each generated proc's virtual address to stderr
+                            (the static ELF carries no symbol table)
   --help, -h                show this help
   --version, -v             show version
 """
@@ -20,6 +22,7 @@ Options:
 proc handleCmdLine() =
   var filename = ""
   var outfile = ""
+  var symMap = false
   for kind, key, val in getopt():
     case kind
     of cmdArgument:
@@ -27,6 +30,7 @@ proc handleCmdLine() =
     of cmdLongOption, cmdShortOption:
       case key.normalize
       of "output", "o": outfile = val
+      of "symmap": symMap = true
       of "help", "h": quit(Usage, QuitSuccess)
       of "version", "v": quit(Version, QuitSuccess)
     of cmdEnd: assert false
@@ -34,7 +38,7 @@ proc handleCmdLine() =
   if filename.len == 0: quit(Usage, QuitSuccess)
   if outfile.len == 0: outfile = filename.changeFileExt("")
 
-  assemble(filename, outfile)
+  assemble(filename, outfile, symMap = symMap)
 
 when isMainModule:
   handleCmdLine()

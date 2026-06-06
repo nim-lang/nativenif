@@ -71,6 +71,16 @@
 | `(dec O)`              | X64Inst                  | decrement |
 | `(neg O)`              | X64Inst, A64Inst         | negate |
 | `(not O)`              | X64Inst                  | bitwise not |
+| `(rol D S)`            | X64Inst                  | rotate left |
+| `(ror D S)`            | X64Inst                  | rotate right |
+| `(rcl D S)`            | X64Inst                  | rotate left through carry |
+| `(rcr D S)`            | X64Inst                  | rotate right through carry |
+| `(bsf D S)`            | X64Inst                  | bit scan forward |
+| `(bsr D S)`            | X64Inst                  | bit scan reverse |
+| `(bt D S)`             | X64Inst                  | bit test |
+| `(bts D S)`            | X64Inst                  | bit test and set |
+| `(btr D S)`            | X64Inst                  | bit test and reset |
+| `(btc D S)`            | X64Inst                  | bit test and complement |
 | `(cmp D S)`            | X64Inst, A64Inst         | compare |
 | `(test D S)`           | X64Inst                  | test |
 | `(sete D)`             | X64Inst                  | set byte if equal |
@@ -185,6 +195,7 @@
 | `(tvar D L T)`         | NifasmDecl                  | thread local variable |
 | `(imp S)`              | NifasmDecl                  | import dynamic library |
 | `(extproc D S)`        | NifasmDecl                  | external proc from imported library |
+| `(syproc D ...)`       | NifasmDecl                  | system-call proc declaration (proctype + clobbers + number) |
 | `(kill S)`             | X64Inst, A64Inst            | kill variable |
 | `(cast T E)`         | NifasmExpr                  | type cast |
 | `(lock I)`             | X64Inst                  | atomic lock prefix |

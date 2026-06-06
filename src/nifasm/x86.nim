@@ -735,6 +735,19 @@ proc emitSar*(dest: var Bytes; reg: Register; count: int) =
     dest.add(encodeModRM(amDirect, 7, int(reg)))  # /7 extension
     dest.add(byte(count))
 
+proc emitShiftCl(dest: var Bytes; reg: Register; ext: int) =
+  ## Shift `reg` by the count in CL: `D3 /ext` (REX.W for 64-bit). `ext` selects the
+  ## operation (4=shl/sal, 5=shr, 7=sar). The count lives in CL by ISA mandate.
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.b = true
+  if rex.b or rex.w: dest.add(encodeRex(rex))
+  dest.add(0xD3)
+  dest.add(encodeModRM(amDirect, ext, int(reg)))
+
+proc emitShlCl*(dest: var Bytes; reg: Register) = emitShiftCl(dest, reg, 4)
+proc emitShrCl*(dest: var Bytes; reg: Register) = emitShiftCl(dest, reg, 5)
+proc emitSarCl*(dest: var Bytes; reg: Register) = emitShiftCl(dest, reg, 7)
+
 # Rotate operations
 proc emitRol*(dest: var Bytes; reg: Register; count: int) =
   ## Emit ROL instruction: ROL reg, count (rotate left)
@@ -1310,10 +1323,12 @@ proc emitPrefetchNta*(dest: var Bytes; reg: Register) =
 
 # Conditional set instructions
 proc emitSetcc*(dest: var Bytes; code: byte; reg: Register) =
-  ## Emit SETcc reg (set byte if condition)
+  ## Emit SETcc reg (set byte if condition). The destination is an r/m8: to
+  ## address SPL/BPL/SIL/DIL (reg 4..7) rather than the legacy AH/CH/DH/BH, a
+  ## REX prefix MUST be present, so emit a (possibly bare) REX for any reg >= 4.
   var rex = RexPrefix()
   if needsRex(reg): rex.b = true
-  if rex.b: dest.add(encodeRex(rex))
+  if int(reg) >= 4: dest.add(encodeRex(rex))
 
   dest.add(0x0F)
   dest.add(code)
@@ -1683,6 +1698,39 @@ proc emitXor*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
   if mem.hasIndex and needsRex(mem.index): rex.x = true
   if rex.r or rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
   dest.add(0x31)
+  dest.emitMem(int(reg), mem)
+
+# reg-destination, memory-SOURCE forms (`OP reg, [mem]`): the `0x0B/0x23/0x33`
+# opcodes (reg field = destination). Mirror `emitAdd(reg, mem)`; used when arkham
+# folds a memory operand as the source of an `and`/`or`/`xor`.
+proc emitAndMem*(dest: var Bytes; reg: Register; mem: MemoryOperand) =
+  emitSegPrefix(dest, mem)
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  if rex.r or rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
+  dest.add(0x23)
+  dest.emitMem(int(reg), mem)
+
+proc emitOrMem*(dest: var Bytes; reg: Register; mem: MemoryOperand) =
+  emitSegPrefix(dest, mem)
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  if rex.r or rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
+  dest.add(0x0B)
+  dest.emitMem(int(reg), mem)
+
+proc emitXorMem*(dest: var Bytes; reg: Register; mem: MemoryOperand) =
+  emitSegPrefix(dest, mem)
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  if rex.r or rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
+  dest.add(0x33)
   dest.emitMem(int(reg), mem)
 
 # Atomic arithmetic operations

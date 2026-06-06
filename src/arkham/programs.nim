@@ -30,8 +30,15 @@ type
   CallTarget* = object
     asmName*: string         ## the asm-NIF symbol to call
     extern*: bool            ## true → (extcall), false → (call)
+    syscall*: bool           ## true → a Linux syscall: emitted as a `(syproc …)` and
+                             ## invoked inline via `(syscall)`/`(svc)` (no libc, no PLT)
+    sysNr*: int              ## x86-64 Linux syscall number (when `syscall`)
+    sysNrA64*: int           ## AArch64 Linux syscall number (when `syscall`); `-1` if
+                             ## the name has no syscall on that arch
     atomic*: string          ## non-empty → a GCC `__atomic_*` builtin lowered inline
     memIntrin*: string       ## non-empty → a mem* intrinsic (memcpy/…) lowered inline
+    bitBuiltin*: string      ## non-empty → a GCC bit builtin (`__builtin_ctzll`, …)
+                             ## lowered inline to a native bit instruction (bsf/bsr/…)
     retFloat*: bool          ## true → returns a float (in v0)
     retType*: Cursor         ## the proc's return-type cursor (for `getType`)
     declarative*: bool       ## true → emit/use nifasm's declarative call ABI
@@ -45,10 +52,17 @@ type
     decl*: Cursor            ## the `(proc …)` declaration
     isEntry*: bool
 
+  SyscallProc* = object
+    asmName*: string         ## the `(syproc …)` symbol name (e.g. "mmap.0")
+    decl*: Cursor            ## the importc proc decl (source of params + return type)
+    sysNr*: int              ## x86-64 number
+    sysNrA64*: int           ## AArch64 number (`-1` if none on that arch)
+
   Program* = object
     externOrder*: seq[Extern]               ## extproc decls, in order (main module)
     callTarget*: Table[string, CallTarget]  ## NIFC proc symbol → how to call it
     procs*: seq[ProcInfo]                   ## internal procs to emit (entry first)
+    syscalls*: seq[SyscallProc]             ## syscalls used → one `(syproc …)` decl each
     globals*: Table[string, Cursor]         ## global (gvar/const) var name → its decl cursor
     tvars*: Table[string, Cursor]           ## thread-local var name → its decl cursor (macOS TLV)
     typeDecls*: TypeEnv                     ## resolved type env: main + requested foreign
@@ -72,6 +86,41 @@ type
     floatType*: Cursor                      ## synthesized `(f 64)` — type of a bare FloatLit
 
   TypeEnv* = Table[string, Cursor]          ## a type-symbol table
+
+# ── Linux syscall table (shared) ────────────────────────────────────────────
+# nifasm's ELF backend is static (no dynamic linker / PLT), so an `importc`'d libc
+# call can't reach a shared object — arkham instead recognises these names and
+# lowers them to a raw Linux syscall (emitted as a `(syproc …)` with the syscall
+# ABI register assignment + the kernel's clobbers, invoked inline via the
+# `(syscall)`/`(svc)` marker). One table, two columns: the x86-64 number and the
+# AArch64 (asm-generic unistd) number, which differ (write=1 vs 64, exit=60 vs 93).
+# `-1` in a column means "no syscall of this name on that arch" (e.g. x86-64 has
+# `open`, AArch64 only `openat`). To teach arkham a new syscall, add one row here.
+const LinuxSyscalls* = {
+  "read":       (0,   63),
+  "write":      (1,   64),
+  "open":       (2,   -1),
+  "openat":     (-1,  56),
+  "close":      (3,   57),
+  "mmap":       (9,   222),
+  "munmap":     (11,  215),
+  "exit":       (60,  93),
+  "exit_group": (231, 94),
+  # `abort` is a libc function, not a syscall. For now we lower it to the `exit`
+  # syscall so a libc-free build links and terminates (it takes no args, so the exit
+  # code is whatever is in the syscall's code register — abort is a cold error path).
+  "abort":      (60,  93)}
+
+const
+  LinuxX64ExitNr* = 60
+  LinuxA64ExitNr* = 93
+
+proc lookupSyscall*(name: string): tuple[found: bool, x64, a64: int] =
+  ## Resolve libc `name` to its (x86-64, AArch64) syscall numbers, or `found=false`
+  ## if arkham does not lower it (the call then goes through the normal extern path).
+  for (n, nr) in LinuxSyscalls:
+    if n == name: return (true, nr[0], nr[1])
+  result = (false, -1, -1)
 
 # ── pass 0: collect the main module's top-level declarations ────────────────
 
@@ -153,7 +202,14 @@ proc ptrTypeOf*(p: Program; elem: Cursor): Cursor =
   buf.closeTag()
   result = beginRead(buf)
 
-proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool): Program =
+proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
+              darwin = false): Program =
+  ## `darwin` selects the Mach-O target, which links dynamically against
+  ## libSystem (dyld + PLT). Unlike the static-ELF Linux target, an `importc`'d
+  ## libc name there resolves through the dynamic linker, so it must go through
+  ## the normal extern path rather than being lowered to a raw kernel trap —
+  ## Darwin's syscall numbers and `svc #0x80` convention differ from Linux's, and
+  ## raw syscalls are unstable ABI on macOS. See the syscall branch below.
   result = Program(callTarget: initTable[string, CallTarget](),
                    typeDecls: initTable[string, Cursor](),
                    globals: initTable[string, Cursor](),
@@ -226,6 +282,41 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool): Program =
         elif importcN in ["memcpy", "memmove", "memset", "memcmp"]:
           # C mem* intrinsic: lowered inline (no libc dependency) — see genMemIntrin.
           result.callTarget[pname] = CallTarget(memIntrin: importcN, retType: retType)
+        elif importcN in ["__builtin_ctzll", "__builtin_ctz",
+                          "__builtin_clzll", "__builtin_clz",
+                          "__builtin_popcountll", "__builtin_popcount",
+                          "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64"]:
+          # GCC bit builtin (count-trailing/leading-zeros, popcount, byte-swap):
+          # lowered inline to a native bit instruction — no libc/extproc. See
+          # genBitBuiltin. (nimony's `firstSetBit`/`countTrailingZeroBits` reach
+          # `ctz64` ⇒ `__builtin_ctzll` ⇒ a single `bsf`.)
+          result.callTarget[pname] = CallTarget(bitBuiltin: importcN, retType: retType)
+        elif not darwin and importcN.len > 0 and lookupSyscall(importcN).found:
+          # A Linux syscall: lowered to a raw kernel trap (no libc, no PLT). Emitted
+          # as a `(syproc …)` whose proctype puts args in the syscall ABI registers
+          # and declares the kernel's clobbers; calls go through the declarative
+          # `(prepare …)` path with a `(syscall)`/`(svc)` marker. See genCall.
+          let (_, x64Nr, a64Nr) = lookupSyscall(importcN)
+          # Name the syproc as a proper SELF-MODULE symbol `<name>.sys.<thisModule>`:
+          # nifasm resolves cross-module symbols by full module-qualified name (the render
+          # compresses the suffix to a trailing dot and nifasm completes it back), so a
+          # basename-only `mmap.sys` would be unresolvable from another bundled module that
+          # calls it. Keying on the C `importcN` (not the proc's own `pname`) also collapses
+          # aliases — e.g. both `die` and `exit` (`importc "exit"`) → one syproc. The `.sys.`
+          # disambiguator is RESERVED: nimony proc disambiguators are always numeric, so a
+          # synthesized syproc can never collide with a real proc of the same base name
+          # (e.g. the `write` syscall syproc vs syncio's own `write.0` proc).
+          let asmN = importcN & ".sys." & thisModuleSuffix(result)
+          result.callTarget[pname] = CallTarget(asmName: asmN, extern: false,
+                                                syscall: true, sysNr: x64Nr, sysNrA64: a64Nr,
+                                                declarative: true, retType: retType)
+          # Record one syproc decl per distinct syscall symbol.
+          var already = false
+          for sp in result.syscalls:
+            if sp.asmName == asmN: already = true; break
+          if not already:
+            result.syscalls.add SyscallProc(asmName: asmN, decl: procStart,
+                                            sysNr: x64Nr, sysNrA64: a64Nr)
         elif importcN.len > 0:
           let asmN = importcN & ".0"
           result.externOrder.add Extern(asmName: asmN, extName: "_" & importcN)
@@ -440,7 +531,7 @@ proc slotOf*(p: var Program; c: Cursor): AsmSlot =
     result = slotOf(p, base)                   # base may itself be a named type
   of ObjectT, UnionT, ArrayT:
     let (sz, al) = typeSizeAlign(p, r)
-    result = AsmSlot(kind: AMem, size: sz, align: al)
+    result = AsmSlot(cls: AMem, size: sz, align: al, typ: r)  # carry the type, like every other path
   else:
     result = typeToSlot(r)                      # scalars, ptr, void, …
 

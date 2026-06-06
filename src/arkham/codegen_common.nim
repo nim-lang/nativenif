@@ -27,6 +27,9 @@ type
     slot*: string        ## the stack slot it was moved to (distinct basename)
     reg*: Reg            ## the register freed for scratch
     typ*: AsmSlot        ## the victim's slot type (for the stack-slot decl)
+    live*: bool          ## did the register hold the victim's live value? (false for a
+                         ## FUTURE local whose home reg — reused from a just-dead local —
+                         ## is stolen before its own decl: nothing of the victim to save)
 
   CodeGen* = object
     ab*: AsmBuf
@@ -86,6 +89,13 @@ type
     symType*: Table[string, Cursor]          ## local/param name → its NIFC type cursor (for getType)
     regLocal*: Table[Reg, string]            ## reg → the named local currently bound to it
                                              ## (x64 named-locals: emit the name, not `(reg)`)
+    aliasToDecl*: Table[string, string]      ## param ABI alias `pN.0` → the param's own decl
+                                             ## name (its `symPos` key). A register-passed
+                                             ## param binds its arg reg to the signature alias
+                                             ## `pN.0`, which is NOT a `symPos` key; this lets
+                                             ## `recordEviction` recover the decl name from the
+                                             ## point-in-time `regLocal[r]` with no `ra.locs`
+                                             ## reverse scan. Populated at the param prologue.
     boundTemps*: set[Reg]                    ## x64: registers whose `regLocal` entry is a
                                              ## transient scratch temp `(rebind …)`'d by
                                              ## `bindTemp`, NOT a steal-able local. `stealReg`
@@ -268,21 +278,64 @@ proc exprSlot*(g: var CodeGen; c: Cursor): AsmSlot =
   ## The classified slot of any expression — `getType` for structural forms,
   ## with literals/`addr` (which carry no type cursor) handled directly.
   case c.kind
-  of FloatLit: AsmSlot(kind: AFloat, size: 8, align: 8)   # default f64; width refined by context
-  of IntLit, UIntLit: AsmSlot(kind: AInt, size: 8, align: 8)
-  of CharLit: AsmSlot(kind: AUInt, size: 1, align: 1)
-  of StrLit: AsmSlot(kind: AUInt, size: 8, align: 8)      # a pointer
+  of FloatLit: AsmSlot(cls: AFloat, size: 8, align: 8)   # default f64; width refined by context
+  of IntLit, UIntLit: AsmSlot(cls: AInt, size: 8, align: 8)
+  of CharLit: AsmSlot(cls: AUInt, size: 1, align: 1)
+  of StrLit: AsmSlot(cls: AUInt, size: 8, align: 8)      # a pointer
   of Symbol: slotOf(g.prog, g.getType(c))
   of TagLit:
     case c.exprKind
-    of AddrC, NilC: AsmSlot(kind: AUInt, size: 8, align: 8)          # &lvalue / nil → a pointer
-    of TrueC, FalseC: AsmSlot(kind: AUInt, size: 1, align: 1)        # a bool
-    of SizeofC, AlignofC: AsmSlot(kind: AInt, size: 8, align: 8)     # an integer constant
+    of AddrC: slotOf(g.prog, g.getType(c))                           # &lvalue → precise (ptr <elem>)
+    of NilC: AsmSlot(cls: AUInt, size: 8, align: 8)                 # nil → a generic pointer
+    of TrueC, FalseC: AsmSlot(cls: AUInt, size: 1, align: 1)        # a bool
+    of SizeofC, AlignofC: AsmSlot(cls: AInt, size: 8, align: 8)     # an integer constant
     of SufC, ParC:                                                   # wrappers → the inner value
       var t = c; inc t
       g.exprSlot(t)
     else: slotOf(g.prog, g.getType(c))
-  else: AsmSlot(kind: AMem)
+  else: AsmSlot(cls: AMem)
+
+proc tryConstFold*(g: var CodeGen; c: Cursor): (bool, int64) =
+  ## Evaluate a compile-time-constant INTEGER expression to its value WITHOUT
+  ## advancing the cursor or emitting anything: a literal, `sizeof`/`alignof`, or
+  ## any `+ - * and or xor shl` over such (recursively). The caller materializes
+  ## the result as a single lazy `Imm` Location — one immediate, foldable into the
+  ## consuming `cmp`/`add`/… — instead of the runtime mov/sub sequence a tree-walk
+  ## would emit (e.g. `SmallChunkSize - sizeof(SmallChunk)` → `0xFC0`, not a
+  ## load-load-subtract). Returns (false, 0) for anything not a pure int constant.
+  case c.kind
+  of IntLit:  return (true, intVal(c))
+  of UIntLit: return (true, cast[int64](uintVal(c)))
+  of CharLit: return (true, int64(ord(charLit(c))))
+  of TagLit:
+    case c.exprKind
+    of TrueC:        return (true, 1)
+    of FalseC, NilC: return (true, 0)
+    of SufC, ParC:                               # `(suf v "type")` / `(par v)`
+      var t = c; inc t
+      return g.tryConstFold(t)
+    of SizeofC:
+      var t = c; inc t
+      return (true, typeSizeAlign(g.prog, t)[0].int64)
+    of AlignofC:
+      var t = c; inc t
+      return (true, typeSizeAlign(g.prog, t)[1].int64)
+    of AddC, SubC, MulC, BitandC, BitorC, BitxorC, ShlC:
+      var t = c; inc t; skip t                   # past the result type → operand a
+      let (okA, va) = g.tryConstFold(t); skip t  # → operand b
+      let (okB, vb) = g.tryConstFold(t)
+      if not (okA and okB): return (false, 0)
+      case c.exprKind
+      of AddC:    return (true, va + vb)
+      of SubC:    return (true, va - vb)
+      of MulC:    return (true, va * vb)
+      of BitandC: return (true, va and vb)
+      of BitorC:  return (true, va or vb)
+      of BitxorC: return (true, va xor vb)
+      of ShlC:    return (true, (if vb >= 0 and vb < 64: va shl vb else: 0))
+      else:       return (false, 0)
+    else: return (false, 0)
+  else: return (false, 0)
 
 proc isFloatExpr*(g: var CodeGen; c: Cursor): bool =
   ## Whether `c` has floating-point type (so it flows through the SIMD path).
