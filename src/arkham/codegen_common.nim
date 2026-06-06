@@ -89,6 +89,13 @@ type
     symType*: Table[string, Cursor]          ## local/param name → its NIFC type cursor (for getType)
     regLocal*: Table[Reg, string]            ## reg → the named local currently bound to it
                                              ## (x64 named-locals: emit the name, not `(reg)`)
+    aliasToDecl*: Table[string, string]      ## param ABI alias `pN.0` → the param's own decl
+                                             ## name (its `symPos` key). A register-passed
+                                             ## param binds its arg reg to the signature alias
+                                             ## `pN.0`, which is NOT a `symPos` key; this lets
+                                             ## `recordEviction` recover the decl name from the
+                                             ## point-in-time `regLocal[r]` with no `ra.locs`
+                                             ## reverse scan. Populated at the param prologue.
     boundTemps*: set[Reg]                    ## x64: registers whose `regLocal` entry is a
                                              ## transient scratch temp `(rebind …)`'d by
                                              ## `bindTemp`, NOT a steal-able local. `stealReg`

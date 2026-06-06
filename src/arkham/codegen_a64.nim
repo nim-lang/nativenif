@@ -559,22 +559,20 @@ proc pickFStaging(g: var CodeGen; avoid: FReg = NoFReg): FReg =
 # stay byte-consistent. `recordEviction` emits no machine code (it only mutates
 # the allocator's view, which `genProc` snapshot/restores); `replayEviction` does.
 
-proc localNameInReg(g: var CodeGen; r: Reg): string =
-  ## The allocator's name (the `symPos` key) of the local currently homed in reg
-  ## `r`, or "". The *allocator* identity — distinct from `regLocal[r]`, the nifasm
-  ## *binding* name, which for a declarative param is the signature alias `pN.0`.
-  for name, pos in g.ra.symPos:
-    if g.ra.locs[pos].kind == InReg and g.ra.locs[pos].r == r: return name
-  result = ""
-
 proc recordEviction(g: var CodeGen; r: Reg): StealEvent =
   ## Plan-pass: evict the register-local currently in `r` to a fresh stack slot,
   ## mutating the allocator's view so every later `locationOfSym(victim)` reads the
   ## slot (`g.ra.locs` is snapshot/restored across the two passes). Returns the event
   ## for the caller to record. Caller guarantees `regLocal.hasKey(r)`.
-  let bindName = g.regLocal[r]                    # nifasm binding (maybe a pN.0 alias)
-  var victim = g.localNameInReg(r)                # allocator name (symPos key)
-  if victim.len == 0: victim = bindName           # they coincide for a non-param local
+  let bindName = g.regLocal[r]                    # the local CURRENTLY homed in `r`
+  # `regLocal` is the point-in-time tenant map (set at the local's `(var … (reg))`,
+  # cleared on kill), so it names the *right* local — `ra.locs` is a static per-symbol
+  # map where two locals with disjoint live ranges legitimately share a register, so a
+  # reverse scan over it couldn't disambiguate. On a64 a register-passed param's value is
+  # moved into its allocated home (no `pN.0` alias binding), so `bindName` is always the
+  # decl name (`symPos` key); `aliasToDecl` (empty on a64) is the x64 param-alias hook.
+  # See the x64 twin for the rawAlloc `c: ptr SmallChunk` vs `ptr BigChunk` case.
+  let victim = g.aliasToDecl.getOrDefault(bindName, bindName)
   let typ = g.ra.locationOfSym(victim).typ
   let slot = "evict" & $g.spillCount & ".0"; inc g.spillCount
   # Live IFF the victim is already materialized (a declared local / settled param —
@@ -1769,8 +1767,27 @@ proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
     of AtC:                                 # `(at arr idx)` → dest ← arr[idx]
       let l = g.asLoc(c); g.emitLoad(l, dest)
     of PatC:                                 # pointer index: &elem into dest, then load
+      # Peek the element type BEFORE emitPatAddr consumes the cursor. A SUB-WORD
+      # scalar element (char / u8 / u16 / u32 / bool) must be loaded at its own width:
+      # a plain `(mem dest)` is sized by dest's 8-byte slot and OVER-READS. Wrap the
+      # deref in `(cast (ptr elem) dest)` so nifasm emits the right ldrb/ldrh. A
+      # 64-bit / pointer element keeps the plain 8-byte deref. Mirrors the x64 twin.
+      var probe = c
+      inc probe                                 # step to the base (do not consume c)
+      let elem = innerType(g.prog, resolveType(g.prog, g.getType(probe)))
+      let eslot = slotOf(g.prog, elem)
       g.emitPatAddr(c, dest)
-      g.ab.tree MovA64: (g.emReg dest; g.ab.tree MemX: g.emReg dest)
+      if eslot.kind in {AInt, AUInt, ABool} and eslot.size < 8:
+        g.ab.tree MovA64:
+          g.emReg dest
+          g.ab.tree MemX:
+            g.ab.tree CastX:
+              g.ab.ptrType:
+                if elem.kind == Symbol: g.ab.sym symName(elem)
+                else: (var et = elem; g.genTypeBody(et))
+              g.emReg dest
+      else:
+        g.ab.tree MovA64: (g.emReg dest; g.ab.tree MemX: g.emReg dest)
     of SufC, ParC:                            # `(suf v "type")` / `(par v)` wrap one value
       c.into:
         g.genInto(c, dest)
@@ -3178,6 +3195,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.varType = initTable[string, string]()     # per-proc (symbol names recycle)
   g.symType = initTable[string, Cursor]()
   g.regLocal = initTable[Reg, string]()        # per-proc named-local bindings
+  g.aliasToDecl = initTable[string, string]()  # per-proc param ABI alias → decl name
   g.scopeLocals = @[]
   g.fregLocal.clear()                          # per-proc float named-local bindings
   g.boundFTmps = {}

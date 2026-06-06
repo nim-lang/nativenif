@@ -102,24 +102,24 @@ proc emTypedStackVar(g: var CodeGen; name: string; t: Cursor)
 proc emStackMem(g: var CodeGen; name: string)
 proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg
 
-proc localNameInReg(g: var CodeGen; r: Reg): string =
-  ## The allocator's name (the `symPos` key) of the local currently homed in reg
-  ## `r`, or "". This is the *allocator* identity — distinct from `regLocal[r]`, the
-  ## nifasm *binding* name, which for a declarative param is the signature alias
-  ## `pN.0` rather than the param's own name.
-  for name, pos in g.ra.symPos:
-    if g.ra.locs[pos].kind == InReg and g.ra.locs[pos].r == r: return name
-  result = ""
-
 proc recordEviction(g: var CodeGen; r: Reg): StealEvent =
   ## Plan-pass: evict the register-local currently in `r` to a fresh stack slot,
   ## mutating the allocator's view so every later `locationOfSym(victim)` reads the
   ## slot (`g.ra.locs` is snapshot/restored across the two passes). Returns the
   ## event for the caller to record in its replay table. Caller guarantees
   ## `regLocal.hasKey(r)`.
-  let bindName = g.regLocal[r]                    # nifasm binding (maybe a pN.0 alias)
-  var victim = g.localNameInReg(r)                # allocator name (symPos key)
-  if victim.len == 0: victim = bindName           # they coincide for a non-param local
+  let bindName = g.regLocal[r]                    # the local CURRENTLY homed in `r`
+  # Resolve `bindName` to its `symPos` key (the name `ra.locs` is keyed by). `regLocal`
+  # is the point-in-time tenant map (set at the local's `(var … (reg))`, cleared on kill),
+  # so it already names the *right* local — crucial because `ra.locs` is a static,
+  # per-symbol map where two locals with disjoint live ranges legitimately share a
+  # register (the allocator frees it at scope close and reassigns it — e.g. rawAlloc's
+  # small-path `c: ptr SmallChunk` and big-path `c: ptr BigChunk` in the other `if` arm,
+  # both `InReg(r)`). A reverse scan over `ra.locs` couldn't tell which is the tenant here.
+  # For a register-passed param `bindName` is the ABI alias `pN.0` (not a `symPos` key);
+  # `aliasToDecl` maps it back to the param's decl name. Otherwise the binding name IS the
+  # decl name.
+  let victim = g.aliasToDecl.getOrDefault(bindName, bindName)
   let typ = g.ra.locationOfSym(victim).typ
   let slot = "evict" & $g.spillCount & ".0"; inc g.spillCount
   # The victim has a live value to save IFF it is already materialized — a declared
@@ -2008,8 +2008,28 @@ proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
     of DotC, AtC, DerefC:                     # field / element / pointer load: dest ← [mem]
       g.place(g.genVal(c), dest)
     of PatC:                                  # pointer index: &elem into dest, then load in place
+      # Peek the element type BEFORE emitPatAddr consumes the cursor. A SUB-WORD
+      # scalar element (char / u8 / u16 / u32 / bool) must be loaded at its own
+      # width: a plain `(mem dest)` is sized by dest's 8-byte slot and OVER-READS
+      # (e.g. `s[0]` on an SSO string returned the 8 packed bytes, not the char).
+      # Wrap the deref in `(cast (ptr elem) dest)` so nifasm emits the right
+      # movzx/movsx. A 64-bit / pointer element keeps the plain 8-byte deref.
+      var probe = c
+      inc probe                                 # step to the base (do not consume c)
+      let elem = innerType(g.prog, resolveType(g.prog, g.getType(probe)))
+      let eslot = slotOf(g.prog, elem)
       g.emitPatAddr(c, dest)
-      g.ab.tree MovX64: (g.emReg dest; g.ab.tree MemX: g.emReg dest)
+      if eslot.kind in {AInt, AUInt, ABool} and eslot.size < 8:
+        g.ab.tree MovX64:
+          g.emReg dest
+          g.ab.tree MemX:
+            g.ab.tree CastX:
+              g.ab.ptrType:
+                if elem.kind == Symbol: g.ab.sym symName(elem)
+                else: (var et = elem; g.genTypeBody(et))
+              g.emReg dest
+      else:
+        g.ab.tree MovX64: (g.emReg dest; g.ab.tree MemX: g.emReg dest)
     of AddrC:                                 # (addr lvalue) → dest ← &lvalue
       c.into:
         var ad = regLoc(dest, ScalarSlot)     # into the fixed genInto target
@@ -3377,6 +3397,7 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor; declarative: bool) =
         if loc.kind == InReg and loc.r == argReg:
           if declarative:
             g.regLocal[argReg] = paramName(idx) # the signature binds it as `pN.0`
+            g.aliasToDecl[paramName(idx)] = nm  # so recordEviction recovers the decl name
           else:
             # no signature binding (empty params) → bind the param's own name to
             # its arg register so the body can refer to it by name.
@@ -3572,6 +3593,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.indirectReg = NoReg
   g.isEntryProc = info.isEntry
   g.regLocal.clear()                          # per-proc named-local bindings
+  g.aliasToDecl.clear()                       # per-proc param ABI alias → decl name
   g.boundTemps = {}                           # per-proc scratch-temp bindings
   g.scopeLocals = @[]
   g.fregLocal.clear()                         # per-proc float named-local bindings

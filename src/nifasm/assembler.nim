@@ -1421,7 +1421,23 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
             offset: offset,
             hasIndex: hasIndex
           )
-          result.typ = Type(kind: IntT, bits: 64)
+          # When the base register holds a pointer, the access is its pointee (mirror
+          # of the x64 `mem` handler): a SUB-WORD scalar pointee (`(ptr (u 8))` etc.)
+          # MUST size the load so `memWidthOpc` emits ldrb/ldrh — else `(mem (cast
+          # (ptr (u 8)) reg))` over-reads 8 bytes (the SSO `s[i]` char read). A 64-bit
+          # scalar / float / fn-pointer pointee stays the generic 8-byte access; a
+          # pointer pointee round-trips nominally.
+          if baseOp.typ != nil and baseOp.typ.kind in {TypeKind.PtrT, TypeKind.AptrT}:
+            let pointee = resolvedBase(baseOp.typ, ctx, n)
+            if pointee.kind in {TypeKind.PtrT, TypeKind.AptrT}:
+              result.typ = pointee
+            elif pointee.kind in {TypeKind.IntT, TypeKind.UIntT} and pointee.bits in {8, 16, 32} or
+                 pointee.kind == TypeKind.BoolT:
+              result.typ = pointee
+            else:
+              result.typ = Type(kind: IntT, bits: 64)
+          else:
+            result.typ = Type(kind: IntT, bits: 64)
     elif t == SsizeTagId:
       result.kind = okSsize
       result.typ = Type(kind: IntT, bits: 64)
