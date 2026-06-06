@@ -75,11 +75,23 @@ proc extractDedupKey*(s: string): string =
 proc typeError(want, got: Type; n: Cursor) =
   error("Type mismatch: expected " & $want & ", got " & $got, n)
 
+proc addrWidthMove(a, b: Type): bool {.inline.} =
+  ## A function pointer (`ProcT`) is just an 8-byte code address — moving it to/from a
+  ## general register, a data pointer, or another function pointer is a plain address
+  ## move (loading an indirect-call target, or storing a function's address into a
+  ## fn-ptr slot). Register-width like a `ptr`, so accept it in either direction. (This
+  ## is why `(mem (cast (ptr proc) reg))` types as the `proc` pointee with no carve-out:
+  ## the compatibility lives here, not in the type derivation.)
+  if a == nil or b == nil: return false
+  const AddrLike = {ProcT, PtrT, AptrT, IntT, UIntT}
+  (a.kind == ProcT and b.kind in AddrLike) or (b.kind == ProcT and a.kind in AddrLike)
+
 proc movCompatible(want, got: Type): bool =
   ## Type rule for `mov`: strict compatibility, OR a *widening* integer move —
   ## a smaller integer into a larger register (a safe extending move/load).
   ## Narrowing or a kind change (int↔ptr/float) is still rejected.
   if compatible(want, got): return true
+  if addrWidthMove(want, got): return true
   # A `mov` to/from a stack slot named directly (`(mov stackvar value)` stores,
   # `(mov reg stackvar)` loads) targets the slot's *content* type, so re-check against
   # the unwrapped element type on either side. (Previously the register operand was
@@ -1421,19 +1433,12 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
             offset: offset,
             hasIndex: hasIndex
           )
-          # The deref of `(ptr T)` has type T (mirror of the x64 `mem` handler).
-          # `memWidthOpc` then sizes it: a sub-word int/bool loads narrow (ldrb/ldrh —
-          # else `(mem (cast (ptr (u 8)) reg))` over-reads 8 bytes, the SSO `s[i]` char
-          # read; a 64-bit pointee is already 8 bytes), a pointer round-trips nominally.
-          # Anything not a GPR-loadable scalar/pointer — a float (wrong register file), a
-          # proctype (a `(ptr proc)` deref is a code address), an aggregate, or an
-          # over-wide (>8-byte) integer — can't be a single-register access → reads as a word.
+          # The deref of `(ptr T)` has type T — no special cases (mirror of the x64 `mem`
+          # handler). `memWidthOpc` sizes it from T (a sub-word int/bool → a narrow ldrb/
+          # ldrh, e.g. the SSO `(ptr (u 8))` `s[i]` char read; everything ≥8 bytes → a
+          # word); `movCompatible` decides whether T can move to/from the chosen register.
           if baseOp.typ != nil and baseOp.typ.kind in {TypeKind.PtrT, TypeKind.AptrT}:
-            let pointee = resolvedBase(baseOp.typ, ctx, n)
-            result.typ =
-              if pointee.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.BoolT,
-                                  TypeKind.PtrT, TypeKind.AptrT} and asmSizeOf(pointee) <= 8: pointee
-              else: Type(kind: IntT, bits: 64)
+            result.typ = resolvedBase(baseOp.typ, ctx, n)
           else:
             result.typ = Type(kind: IntT, bits: 64)
     elif t == SsizeTagId:
@@ -3168,24 +3173,17 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
             displacement: displacement,
             hasIndex: hasIndex
           )
-          # The deref of `(ptr T)` has type T (a stack var contributes its own type).
-          # `memWidthOpc`/`intMemAccess` then size the access: a sub-word int/bool loads
-          # narrow (movzx/movsx — e.g. the SSO `(ptr (u 8))` slen byte; a 64-bit pointee
-          # is already 8 bytes), a pointer round-trips nominally. Anything that isn't a
-          # GPR-loadable scalar/pointer — a float (wrong register file), a proctype (a
-          # `(ptr proc)` deref is a code ADDRESS, not a proc value), an aggregate, or an
-          # over-wide (>8-byte) integer — can't be a single-register access, so it reads
-          # as a plain machine word.
+          # The deref of `(ptr T)` has type T — no special cases (a stack var contributes
+          # its own type). `memWidthOpc`/`intMemAccess` size it from T (a sub-word int/bool
+          # → a narrow movzx/movsx, e.g. the SSO `(ptr (u 8))` slen byte; everything ≥8
+          # bytes → a word); `movCompatible` decides whether T can move to/from the chosen
+          # register. A bare register base (no pointer type) is a plain machine word.
           if stackVarType != nil:
             result.typ = stackVarType
           elif baseOp.typ != nil and baseOp.typ.kind in {TypeKind.PtrT, TypeKind.AptrT}:
-            let pointee = resolvedBase(baseOp.typ, ctx, n)
-            result.typ =
-              if pointee.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.BoolT,
-                                  TypeKind.PtrT, TypeKind.AptrT} and asmSizeOf(pointee) <= 8: pointee
-              else: Type(kind: IntT, bits: 64)
+            result.typ = resolvedBase(baseOp.typ, ctx, n)
           else:
-            result.typ = Type(kind: IntT, bits: 64)  # not a pointer base → a machine word
+            result.typ = Type(kind: IntT, bits: 64)
     elif t == SsizeTagId:
       result.kind = okSsize
       result.typ = Type(kind: IntT, bits: 64)
@@ -3718,7 +3716,7 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
                          dest.typ.kind in {IntT, UIntT} and
                          op.typ.kind in {IntT, UIntT, IntLitT} and
                          op.typ.bits <= dest.typ.bits
-    if not sizedMemReg and not wideningRegReg:
+    if not sizedMemReg and not wideningRegReg and not addrWidthMove(dest.typ, op.typ):
       checkType(dest.typ, op.typ, start)
 
   if dest.kind == okMem:
