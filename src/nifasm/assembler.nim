@@ -272,6 +272,7 @@ type
     buf: relocs.Buffer  # Code buffer (.text section) for x64
     bssBuf: relocs.Buffer  # BSS buffer (.bss section) for zero-initialized global variables
     arch: Arch
+    symMap: bool        # `--symmap`: dump each generated proc's vaddr to stderr
     procName: string
     callContext: CallContext # Current call context
     clobbered: set[x86.Register] # Registers clobbered in current flow (x64 only)
@@ -5332,9 +5333,9 @@ proc writeElf(a: var GenContext; outfile: string) =
       a.tlsEntryOffset = posMap[a.tlsEntryOffset]
   finalize(a.buf)
   finalize(a.bssBuf)
-  # Debug: `NIFASM_SYMMAP=1` dumps every generated proc's virtual address (the ELF
+  # `--symmap`: dump every generated proc's virtual address to stderr (the ELF
   # carries no symbol table), so a disassembler can locate a function by name.
-  if existsEnv("NIFASM_SYMMAP"):
+  if a.symMap:
     var labelPos = initTable[int, int]()
     for ld in a.buf.labels: labelPos[int(ld.id)] = ld.position
     let hdrBytes = 64 + 56 * 2
@@ -5662,7 +5663,7 @@ proc setupTls(ctx: var GenContext) =
   x86.emitSyscall(ctx.buf.data)                             # arch_prctl(ARCH_SET_FS, &block)
   x86.emitJmp(ctx.buf, LabelId(ctx.entrySym.offset))        # → real entry
 
-proc assemble*(filename, outfile: string) =
+proc assemble*(filename, outfile: string; symMap = false) =
   var buf = parseFromFile(filename, sharedTags = asmTags)
 
   # Extract base directory from filename
@@ -5690,7 +5691,8 @@ proc assemble*(filename, outfile: string) =
     pendingSymbols: @[],
     generatedSymbols: initHashSet[string](),
     dedupTable: initTable[string, string](),
-    tlsEntryOffset: -1
+    tlsEntryOffset: -1,
+    symMap: symMap
   )
 
   # Store main module. `beginRead` BEFORE the move forces the buffer's
