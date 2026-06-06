@@ -37,6 +37,8 @@ type
                              ## the name has no syscall on that arch
     atomic*: string          ## non-empty → a GCC `__atomic_*` builtin lowered inline
     memIntrin*: string       ## non-empty → a mem* intrinsic (memcpy/…) lowered inline
+    bitBuiltin*: string      ## non-empty → a GCC bit builtin (`__builtin_ctzll`, …)
+                             ## lowered inline to a native bit instruction (bsf/bsr/…)
     retFloat*: bool          ## true → returns a float (in v0)
     retType*: Cursor         ## the proc's return-type cursor (for `getType`)
     declarative*: bool       ## true → emit/use nifasm's declarative call ABI
@@ -273,6 +275,15 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool): Program =
         elif importcN in ["memcpy", "memmove", "memset", "memcmp"]:
           # C mem* intrinsic: lowered inline (no libc dependency) — see genMemIntrin.
           result.callTarget[pname] = CallTarget(memIntrin: importcN, retType: retType)
+        elif importcN in ["__builtin_ctzll", "__builtin_ctz",
+                          "__builtin_clzll", "__builtin_clz",
+                          "__builtin_popcountll", "__builtin_popcount",
+                          "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64"]:
+          # GCC bit builtin (count-trailing/leading-zeros, popcount, byte-swap):
+          # lowered inline to a native bit instruction — no libc/extproc. See
+          # genBitBuiltin. (nimony's `firstSetBit`/`countTrailingZeroBits` reach
+          # `ctz64` ⇒ `__builtin_ctzll` ⇒ a single `bsf`.)
+          result.callTarget[pname] = CallTarget(bitBuiltin: importcN, retType: retType)
         elif importcN.len > 0 and lookupSyscall(importcN).found:
           # A Linux syscall: lowered to a raw kernel trap (no libc, no PLT). Emitted
           # as a `(syproc …)` whose proctype puts args in the syscall ABI registers

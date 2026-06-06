@@ -1906,6 +1906,8 @@ proc genCall(g: var CodeGen; c: var Cursor) =
       g.genAtomic(c, tgt.atomic)               # consumes the args; result in x0
     elif tgt.memIntrin.len > 0:                # C mem* intrinsic → inline byte loop
       g.genMemIntrin(c, tgt.memIntrin)         # consumes the args; result in x0
+    elif tgt.bitBuiltin.len > 0:               # GCC bit builtin: needs rbit/clz (unwired)
+      raiseAssert "arkham arm64 v0: bit builtin not yet implemented: " & tgt.bitBuiltin
     elif tgt.declarative:
       # Declarative call: bind each scalar argument to its positional param `p{i}`
       # and the result to `ret.0`, so nifasm cross-checks the ABI. The `(mov (arg

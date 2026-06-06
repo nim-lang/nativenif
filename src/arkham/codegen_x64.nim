@@ -2596,6 +2596,21 @@ proc indirectRetType(g: var CodeGen; gvarDecl: Cursor): Cursor =
       while q.hasMore: skip q                   # drain RetType + Pragmas
     while d.hasMore: skip d
 
+proc genBitBuiltin(g: var CodeGen; c: var Cursor; builtin: string) =
+  ## Lower a GCC bit builtin; `c` is at the single integer argument (consumed).
+  ## Result → RAX (the call-return register the surrounding expression reads).
+  let v = g.genReg(c)                          # x → temp reg; advances c past the arg
+  case builtin
+  of "__builtin_ctzll", "__builtin_ctz":
+    # count trailing zeros == index of the least-significant set bit == BSF.
+    # (x == 0 is UB in C and is never reached: nimony callers guard the zero case.)
+    g.ab.tree BsfX64: (g.emReg RAX; g.emReg v.r)
+  else:
+    # clz/popcount/bswap have no consumer in the current corpus; lower them when one
+    # appears (clz ⇒ `63 - bsr`, popcount ⇒ `popcnt`, bswap ⇒ `bswap`).
+    raiseAssert "arkham x64 v0: bit builtin not yet implemented: " & builtin
+  g.freeTemp(v)
+
 proc genCall(g: var CodeGen; c: var Cursor) =
   ## `(call f arg…)`. The C `exit` extern lowers to the Linux exit syscall; a
   ## declarative user proc uses the SysV register ABI via a `(prepare …)` block
@@ -2623,6 +2638,8 @@ proc genCall(g: var CodeGen; c: var Cursor) =
       g.genAtomic(c, tgt.atomic)               # consumes the args; result in rax
     elif tgt.memIntrin.len > 0:                # C mem* intrinsic → inline byte loop
       g.genMemIntrin(c, tgt.memIntrin)         # consumes the args; result in rax
+    elif tgt.bitBuiltin.len > 0:               # GCC bit builtin (ctz/…) → inline bsf/…
+      g.genBitBuiltin(c, tgt.bitBuiltin)       # consumes the arg; result in rax
     elif tgt.declarative and not tgt.extern:
       var sealedHere: set[Reg] = {}
       var argCurs: seq[Cursor] = @[]           # one cursor per argument expression
