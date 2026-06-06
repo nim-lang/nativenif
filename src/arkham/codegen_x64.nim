@@ -1248,6 +1248,13 @@ proc genVal(g: var CodeGen; c: var Cursor): Location =
   ## a memory operand as a foldable `NamedStack`/`Mem` — materializing any
   ## *computed* value into a scratch register (`InReg`, owned), or (when the pool
   ## is exhausted) a spill slot. The counterpart of `gen(…, InReg dest)`.
+  # A compile-time-constant expression collapses to one lazy `Imm` — never emitted,
+  # folded into the consuming instruction (see `tryConstFold`).
+  block:
+    let (isConst, cv) = g.tryConstFold(c)
+    if isConst:
+      skip c
+      return immLoc(cv, ScalarSlot)
   case c.kind
   of IntLit:
     result = immLoc(intVal(c), ScalarSlot); inc c
@@ -1923,6 +1930,13 @@ proc emitPatAddr(g: var CodeGen; c: var Cursor; dest: Reg) =
 # ValueConsistency). The `sealHome` below protects a register-local home while its own
 # value is built — without it a steal evicts the home and the write lands in a stale reg.
 proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
+  # A compile-time-constant expression is a single `mov dest, imm` — fold it here
+  # (before any seal/accumulator bookkeeping, so the early return needs no cleanup)
+  # rather than walking the tree into runtime arithmetic (see `tryConstFold`).
+  block:
+    let (isConst, cv) = g.tryConstFold(c)
+    if isConst:
+      g.movImm(dest, cv); skip c; return
   # While `dest` holds the value being built, a deep sub-operand may exhaust the
   # scratch pool and spill — its transient staging register must not clobber
   # `dest`. The scratch pool (r10/r11) is never a staging candidate, but a caller-

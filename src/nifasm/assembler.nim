@@ -1,5 +1,5 @@
 
-import std / [tables, sets, streams, os, osproc]
+import std / [tables, sets, streams, os, osproc, strutils, algorithm]
 import nifcore, nifcoreparse, nifmodules
 import "../../../nimony/src/lib" / [nifreader, symparser]
 import tags, model, tagconv
@@ -3163,9 +3163,21 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
           # only spuriously clash with a 64-bit accumulator in an `or`/`and`/`add` fold.
           if stackVarType != nil:
             result.typ = stackVarType
-          elif baseOp.typ != nil and baseOp.typ.kind in {TypeKind.PtrT, TypeKind.AptrT} and
-               resolvedBase(baseOp.typ, ctx, n).kind in {TypeKind.PtrT, TypeKind.AptrT}:
-            result.typ = resolvedBase(baseOp.typ, ctx, n)  # ptr (ptr T) -> (ptr T)
+          elif baseOp.typ != nil and baseOp.typ.kind in {TypeKind.PtrT, TypeKind.AptrT}:
+            let pointee = resolvedBase(baseOp.typ, ctx, n)
+            if pointee.kind in {TypeKind.PtrT, TypeKind.AptrT}:
+              result.typ = pointee                     # ptr (ptr T) -> (ptr T): nominal round-trip
+            elif pointee.kind in {TypeKind.IntT, TypeKind.UIntT} and pointee.bits in {8, 16, 32} or
+                 pointee.kind == TypeKind.BoolT:
+              # A SUB-WORD scalar pointee MUST size the access — else a `(ptr (u 8))`
+              # deref (e.g. the SSO string's slen byte) over-reads 8 bytes. `intMemAccess`
+              # then emits the right movzx/movsx; the sized mem↔reg `mov` rule (and the
+              # bitwise/cmp width tolerance) accept the narrow mem against a 64-bit reg.
+              result.typ = pointee
+            else:
+              # 64-bit scalar / float / fn-pointer pointee: a generic 8-byte access is
+              # correct and avoids a spurious sub-word clash in an or/and/add fold.
+              result.typ = Type(kind: IntT, bits: 64)
           else:
             result.typ = Type(kind: IntT, bits: 64)  # Default assumption
     elif t == SsizeTagId:
@@ -3743,8 +3755,12 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
     elif op.kind == okMem:
       let (bits, signed) = intMemAccess(op.typ)  # sized load: sign-/zero-extend sub-word
       x86.emitLoadExt(ctx.buf.data, dest.reg, op.mem, bits, signed)
-    else:
+    elif dest.reg != op.reg:
       x86.emitMov(ctx.buf.data, dest.reg, op.reg)
+    # else: a redundant same-register move — elide it. The declarative-call
+    # `(arg …)`/`(res …)` markers resolve to a fixed ABI register, so a value
+    # already in that register marshals to `(mov (arg pN) (rN))` == `mov rN,rN`.
+    # arkham's own `movReg` elides d==s; this mirrors it for the marshalling path.
 
 proc genIteX64(n: var Cursor; ctx: var GenContext) =
   inc n
@@ -5316,6 +5332,18 @@ proc writeElf(a: var GenContext; outfile: string) =
       a.tlsEntryOffset = posMap[a.tlsEntryOffset]
   finalize(a.buf)
   finalize(a.bssBuf)
+  # Debug: `NIFASM_SYMMAP=1` dumps every generated proc's virtual address (the ELF
+  # carries no symbol table), so a disassembler can locate a function by name.
+  if existsEnv("NIFASM_SYMMAP"):
+    var labelPos = initTable[int, int]()
+    for ld in a.buf.labels: labelPos[int(ld.id)] = ld.position
+    let hdrBytes = 64 + 56 * 2
+    var rows: seq[(int, string)]
+    for name, sym in a.rootScope.syms:
+      if sym.kind == skProc and labelPos.hasKey(sym.offset):
+        rows.add (0x400000 + hdrBytes + labelPos[sym.offset], name)
+    rows.sort(proc (x, y: (int, string)): int = cmp(x[0], y[0]))
+    for (va, name) in rows: stderr.writeLine "0x" & toHex(va, 6) & "  " & name
   var code = a.buf.data
   let baseAddr = 0x400000.uint64
   let headersSize = 64 + (56 * 2)  # ELF header + 2 program headers

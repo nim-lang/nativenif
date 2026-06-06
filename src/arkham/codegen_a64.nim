@@ -356,6 +356,7 @@ proc emitLoad(g: var CodeGen; loc: Location; dest: Reg)
 proc gen(g: var CodeGen; c: var Cursor; dest: var Location)
 proc byteCopyConst(g: var CodeGen; dst, src: Reg; size: int)
 proc genTypeBody(g: var CodeGen; c: var Cursor)
+proc genPointee(g: var CodeGen; c: var Cursor)
 proc genProctypeSig(g: var CodeGen; c: var Cursor)
 proc indirectRetType(g: var CodeGen; gvarDecl: Cursor): Cursor
 proc emitPatAddr(g: var CodeGen; c: var Cursor; dest: Reg)
@@ -695,6 +696,13 @@ proc genVal(g: var CodeGen; c: var Cursor): Location =
   ## a memory lvalue as a foldable `NamedStack`/`Mem` (loaded on demand) —
   ## materializing any *computed* value into a scratch register (`InReg`, owned),
   ## or (when the pool is exhausted) a spill slot. The counterpart of `gen(…, dest)`.
+  # A compile-time-constant expression collapses to one lazy `Imm` — never emitted,
+  # folded into the consuming instruction (see `tryConstFold`).
+  block:
+    let (isConst, cv) = g.tryConstFold(c)
+    if isConst:
+      skip c
+      return immLoc(cv, ScalarSlot)
   case c.kind
   of IntLit:
     result = immLoc(intVal(c), ScalarSlot); inc c
@@ -1690,6 +1698,13 @@ proc emitPatAddr(g: var CodeGen; c: var Cursor; dest: Reg) =
 # ValueConsistency). The `sealHome` below protects a register-local home while its own
 # value is built — without it a steal evicts the home and the write lands in a stale reg.
 proc genInto(g: var CodeGen; c: var Cursor; dest: Reg) =
+  # A compile-time-constant expression is a single `mov dest, imm` — fold it here
+  # (before any seal/accumulator bookkeeping, so the early return needs no cleanup)
+  # rather than walking the tree into runtime arithmetic (see `tryConstFold`).
+  block:
+    let (isConst, cv) = g.tryConstFold(c)
+    if isConst:
+      g.movImm(dest, cv); skip c; return
   # While `dest` holds the value being built, a deep sub-operand may exhaust the
   # scratch pool and spill — its transient staging register must not clobber
   # `dest`. Pool temps (x9–x15) are never staging candidates, but an arg/return
@@ -1826,7 +1841,8 @@ proc genProctypeSig(g: var CodeGen; c: var Cursor) =
                   g.ab.symDef paramName(idx)
                   if idx < IntArgRegs.len: g.ab.reg IntArgRegs[idx]  # raw reg *location*
                   else: g.ab.keyword SO         # 9th+ → stack-passed
-                  g.genTypeBody(c)              # param type (consumes it)
+                  g.genPointee(c)              # param type BY REFERENCE (named → sym);
+                                               # a self-referential closure sig can't recurse
                 while c.hasMore: skip c
               inc idx
         else:
@@ -1838,7 +1854,7 @@ proc genProctypeSig(g: var CodeGen; c: var Cursor) =
         else:
           g.ab.symDef "ret.0"
           g.ab.reg IntRet                       # raw reg *location* of the result
-          g.genTypeBody(c)                      # consumes the return type
+          g.genPointee(c)                       # return type BY REFERENCE (named → sym)
       while c.hasMore: skip c                    # pragmas
     g.ab.tree ClobberD:
       for r in ConvClobbersGpr: g.ab.reg r   # a clobber *declaration*: raw reg locations
@@ -2032,6 +2048,17 @@ proc genOconstr(g: var CodeGen; c: var Cursor; destVar: string) =
         g.freeTemp(rr)
         while c.hasMore: skip c             # optional inherited-object INTLIT
 
+proc genPointee(g: var CodeGen; c: var Cursor) =
+  ## Emit a pointer's pointee / element type. A *named* type is referenced by
+  ## symbol rather than inlined: this breaks the infinite recursion of
+  ## self-referential types (a `(ptr T)` field inside `T`, e.g. the TLSF
+  ## `SmallChunk`/`AvlNode`) and lets nifasm resolve — and auto-import across
+  ## modules — the type declaration by name. Mirrors the x64 backend.
+  if c.kind == Symbol:
+    g.ab.sym symName(c); inc c
+  else:
+    g.genTypeBody(c)
+
 proc genTypeBody(g: var CodeGen; c: var Cursor) =
   ## Translate a NIFC type at `c` into asm-NIF, advancing `c` past it. Named
   ## types are inlined (resolved against `typeDecls`); object field pragmas are
@@ -2064,10 +2091,10 @@ proc genTypeBody(g: var CodeGen; c: var Cursor) =
       g.ab.voidType(); skip c
     of PtrT:
       g.ab.ptrType:
-        c.into: g.genTypeBody(c)            # pointee
+        c.into: g.genPointee(c)             # pointee (named → by-reference)
     of AptrT:                               # pointer to (array of) — a scalar ptr
       g.ab.aptrType:
-        c.into: g.genTypeBody(c)            # element type
+        c.into: g.genPointee(c)             # element type (named → by-reference)
     of FlexarrayT:                          # variable-length array tail (last fld)
       g.ab.flexarrayType:
         c.into: g.genTypeBody(c)            # element type
@@ -2859,6 +2886,8 @@ proc genAsgn(g: var CodeGen; c: var Cursor) =
       g.gen(c, dst)                          # rhs → destination (scalar / float)
 
 proc genStmt(g: var CodeGen; c: var Cursor) =
+  if c.kind == DotToken:                       # an empty statement (e.g. `(stmts .)`)
+    inc c; return
   case c.stmtKind
   of StmtsS:
     c.into:
