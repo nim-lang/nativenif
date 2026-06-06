@@ -1157,17 +1157,25 @@ proc spillComputed(g: var CodeGen; c: var Cursor): Location =
   let slotName = spillName(g.spillCount); inc g.spillCount
   g.ra.hasStackVars = true
   let slot = g.exprSlot(c)                       # the value's PRECISE type/slot (incl. ptr pointee)
+  # A POINTER needs its precise type end to end (the staging reg, the slot, and a later
+  # deref are all strict ptr→ptr). An INTEGER lives 64-bit in a register — arkham
+  # realizes its sub-word width via explicit extends, never by a narrowing `mov` — so
+  # typing the staging reg `(i 32)` here would make the inner `genInto` emit a rejected
+  # narrowing `(mov i32 i64)`. Keep integers at `(i 64)` (the sized mem↔reg rule still
+  # truncates the store / extends the load). Mirrors genVarDecl's spilled-scalar branch.
+  let isPtr = not cursorIsNil(slot.typ) and isPtrType(resolveType(g.prog, slot.typ))
+  let regSlot = if isPtr: slot else: ScalarSlot
   let stage = g.pickStaging()
   g.ra.seal stage
-  g.bindTemp(stage, slot)                        # checked name, typed by the value
-  if cursorIsNil(slot.typ): g.emScalarStackVar(slotName)   # (var :spill.N (s) (i 64))
-  else: g.emTypedStackVar(slotName, slot.typ)              # (var :spill.N (s) <real type>)
+  g.bindTemp(stage, regSlot)                     # checked name, ptr-precise / i64 for ints
+  if isPtr: g.emTypedStackVar(slotName, slot.typ)         # (var :spill.N (s) (ptr …))
+  else: g.emScalarStackVar(slotName)                      # (var :spill.N (s) (i 64))
   g.genInto(c, stage)                            # compute the value into the staging reg
   g.ab.tree MovX64:                              # store it to the slot
     g.emStackMem(slotName)
     g.emReg stage
   g.giveBack(stage)                              # unbind + unseal
-  result = namedStackLoc(slotName, slot)
+  result = namedStackLoc(slotName, regSlot)
 
 
 proc rebindLocalAs(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
@@ -2213,6 +2221,18 @@ proc genAtomicLoopRmw(g: var CodeGen; pReg, val: Reg; op: X64Inst) =
         g.emReg RDX                                   # if [p]==rax: [p]=rdx else rax=[p]
     g.emJcc(JneX64, lab)                              # retry until cmpxchg succeeds
 
+proc genAtomicValReg(g: var CodeGen; c: var Cursor; pointee: Cursor): Reg =
+  ## The value operand of an atomic store/exchange, materialized into a scratch reg
+  ## typed for the precisely-typed memory location it lands in. The authoritative type
+  ## is the POINTER's `pointee` (= `[p]`'s type), NOT the value expression's own slot
+  ## (which is i64/intlit for `nil`, a `0`, or a computed address): a POINTER pointee
+  ## keeps its precise `(ptr …)` type (the `(mem p)` operand is ptr-typed and nifasm is
+  ## strict — a generic i64 reg would be rejected), an INTEGER stays i64 (arkham's
+  ## 64-bit-int model; sub-word width via extends). Consumes `c`; caller `giveBack`s.
+  let isPtr = not cursorIsNil(pointee) and isPtrType(resolveType(g.prog, pointee))
+  result = g.borrowTmp(if isPtr: slotOf(g.prog, pointee) else: ScalarSlot)
+  g.genInto(c, result)
+
 proc genAtomic(g: var CodeGen; c: var Cursor; builtin: string) =
   ## Lower one `__atomic_*` builtin; `c` is at the first argument. Result → rax.
   case builtin
@@ -2221,10 +2241,11 @@ proc genAtomic(g: var CodeGen; c: var Cursor; builtin: string) =
     g.ab.tree MovX64: (g.emReg RAX; g.emMemAt p.r)
     g.freeTemp(p)
   of "__atomic_store_n":                        # (ptr, val, memorder) → void
+    let pointee = innerType(g.prog, resolveType(g.prog, g.getType(c)))
     let p = g.genReg(c)
-    let v = g.genReg(c); skip c
-    g.ab.tree MovX64: (g.emMemAt p.r; g.emReg v.r)
-    g.freeTemp(v)
+    let v = g.genAtomicValReg(c, pointee); skip c   # typed by [p]'s pointee
+    g.ab.tree MovX64: (g.emMemAt p.r; g.emReg v)
+    g.giveBack v
     g.freeTemp(p)
   of "__atomic_clear":                          # (ptr, memorder) → void; *ptr = 0
     let p = g.genReg(c); skip c
@@ -2238,11 +2259,12 @@ proc genAtomic(g: var CodeGen; c: var Cursor; builtin: string) =
   of "__atomic_signal_fence":                   # (memorder) → void; compiler barrier only
     skip c
   of "__atomic_exchange_n":                     # (ptr, val, memorder) → old
+    let pointee = innerType(g.prog, resolveType(g.prog, g.getType(c)))
     let p = g.genReg(c)
-    let v = g.genReg(c); skip c
-    g.ab.tree XchgX64: (g.emMemAt p.r; g.emReg v.r)  # v ↔ [p] (locked); v ← old
-    g.movReg(RAX, v.r)
-    g.freeTemp(v)
+    let v = g.genAtomicValReg(c, pointee); skip c    # typed by [p]'s pointee
+    g.ab.tree XchgX64: (g.emMemAt p.r; g.emReg v)    # v ↔ [p] (locked); v ← old
+    g.movReg(RAX, v)
+    g.giveBack v
     g.freeTemp(p)
   of "__atomic_fetch_add", "__atomic_fetch_sub",
      "__atomic_add_fetch", "__atomic_sub_fetch",

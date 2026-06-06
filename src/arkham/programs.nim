@@ -103,7 +103,11 @@ const LinuxSyscalls* = {
   "mmap":       (9,   222),
   "munmap":     (11,  215),
   "exit":       (60,  93),
-  "exit_group": (231, 94)}
+  "exit_group": (231, 94),
+  # `abort` is a libc function, not a syscall. For now we lower it to the `exit`
+  # syscall so a libc-free build links and terminates (it takes no args, so the exit
+  # code is whatever is in the syscall's code register — abort is a cold error path).
+  "abort":      (60,  93)}
 
 const
   LinuxX64ExitNr* = 60
@@ -275,13 +279,16 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool): Program =
           # and declares the kernel's clobbers; calls go through the declarative
           # `(prepare …)` path with a `(syscall)`/`(svc)` marker. See genCall.
           let (_, x64Nr, a64Nr) = lookupSyscall(importcN)
-          # Name the syproc as a proper SELF-MODULE symbol `<name>.0.<thisModule>`: nifasm
-          # resolves cross-module symbols by full module-qualified name (the render
+          # Name the syproc as a proper SELF-MODULE symbol `<name>.sys.<thisModule>`:
+          # nifasm resolves cross-module symbols by full module-qualified name (the render
           # compresses the suffix to a trailing dot and nifasm completes it back), so a
-          # basename-only `mmap.0` would be unresolvable from another bundled module that
-          # calls it. Keying on the C `importcN` (not the proc's own `pname`) also
-          # collapses aliases — e.g. both `die` and `exit` (`importc "exit"`) → one syproc.
-          let asmN = importcN & ".0." & thisModuleSuffix(result)
+          # basename-only `mmap.sys` would be unresolvable from another bundled module that
+          # calls it. Keying on the C `importcN` (not the proc's own `pname`) also collapses
+          # aliases — e.g. both `die` and `exit` (`importc "exit"`) → one syproc. The `.sys.`
+          # disambiguator is RESERVED: nimony proc disambiguators are always numeric, so a
+          # synthesized syproc can never collide with a real proc of the same base name
+          # (e.g. the `write` syscall syproc vs syncio's own `write.0` proc).
+          let asmN = importcN & ".sys." & thisModuleSuffix(result)
           result.callTarget[pname] = CallTarget(asmName: asmN, extern: false,
                                                 syscall: true, sysNr: x64Nr, sysNrA64: a64Nr,
                                                 declarative: true, retType: retType)

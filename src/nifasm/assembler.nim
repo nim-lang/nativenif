@@ -151,6 +151,15 @@ proc canDoBitwiseOps(t: Type): bool =
   ## Check if type supports bitwise operations (including registers and literals)
   t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.RegisterT}
 
+proc canExchange(t: Type): bool =
+  ## Check if a type may be an `xchg` operand: any register-sized scalar — integer
+  ## OR pointer. `xchg` swaps 8 bytes irrespective of the logical type, and an atomic
+  ## pointer exchange (lock-free list head swap) is a legitimate, common use. Like
+  ## `canCompare`, this is SEPARATE from the arithmetic check (which stays strict);
+  ## unlike it, `bool` is excluded (swapping a bool through a pointer is nonsense).
+  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT,
+             TypeKind.PtrT, TypeKind.AptrT, TypeKind.RegisterT}
+
 
 proc tagToRegister(t: TagEnum; n: Cursor): x86.Register =
   ## Convert a TagEnum to an x86 Register (for register binding tracking)
@@ -415,6 +424,7 @@ proc checkIntegerArithmetic(t: Type; op: string; n: Cursor)
 proc checkIntegerType(t: Type; op: string; n: Cursor)
 proc checkBitwiseType(t: Type; op: string; n: Cursor)
 proc checkCompatibleTypes(t1, t2: Type; op: string; n: Cursor)
+proc checkBitwiseCompatible(t1, t2: Type; op: string; n: Cursor)
 proc checkType(want, got: Type; n: Cursor)
 
 proc atTypeStart(n: Cursor): bool =
@@ -2280,7 +2290,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperandA64(n, ctx)
     checkBitwiseType(dest.typ, "and", start)
     checkBitwiseType(op.typ, "and", start)
-    checkCompatibleTypes(dest.typ, op.typ, "and", start)
+    checkBitwiseCompatible(dest.typ, op.typ, "and", start)
     if dest.kind == okMem: error("AND to memory not supported yet", n)
     else:
       if op.kind == okImm: error("AND immediate not supported yet", n)
@@ -3410,6 +3420,10 @@ proc checkIntegerType(t: Type; op: string; n: Cursor) =
   if not isIntegerType(t):
     error("Operation '" & op & "' requires integer type, got " & $t, n)
 
+proc checkExchangeType(t: Type; op: string; n: Cursor) =
+  if not canExchange(t):
+    error("Operation '" & op & "' requires an integer or pointer type, got " & $t, n)
+
 proc checkFloatType(t: Type; op: string; n: Cursor) =
   if not isFloatType(t):
     error("Operation '" & op & "' requires floating point type, got " & $t, n)
@@ -3467,6 +3481,16 @@ proc checkCmpCompatible(t1, t2: Type; n: Cursor) =
   const intish = {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.BoolT}
   if t1.kind in intish and t2.kind in intish: return
   error("Operation 'cmp' requires compatible types, got " & $t1 & " and " & $t2, n)
+
+proc checkBitwiseCompatible(t1, t2: Type; op: string; n: Cursor) =
+  ## Compatibility rule for `and`/`or`/`xor` — looser than arithmetic, like `cmp`. Two
+  ## SIZED integers of ANY width/signedness combine fine: x86 bitwise ops run at
+  ## register width and arkham canonicalizes integers in 64-bit registers, so e.g.
+  ## `i64 and u32` is valid. Non-integer kinds (pointers) stay strict via `compatible`.
+  if compatible(t1, t2): return
+  const intish = {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.BoolT}
+  if t1.kind in intish and t2.kind in intish: return
+  error("Operation '" & op & "' requires compatible types, got " & $t1 & " and " & $t2, n)
 
 proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
   ## Handle (prepare target ... (call) ...) or (prepare target ... (extcall) ...)
@@ -4224,7 +4248,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperand(n, ctx)
     checkBitwiseType(dest.typ, "and", start)
     checkBitwiseType(op.typ, "and", start)
-    checkCompatibleTypes(dest.typ, op.typ, "and", start)
+    checkBitwiseCompatible(dest.typ, op.typ, "and", start)
     if dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
         x86.emitAndImm(ctx.buf.data, dest.mem, int32(op.immVal))  # AND m64, imm32
@@ -4246,7 +4270,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperand(n, ctx)
     checkBitwiseType(dest.typ, "or", start)
     checkBitwiseType(op.typ, "or", start)
-    checkCompatibleTypes(dest.typ, op.typ, "or", start)
+    checkBitwiseCompatible(dest.typ, op.typ, "or", start)
     if dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
         x86.emitOrImm(ctx.buf.data, dest.mem, int32(op.immVal))   # OR m64, imm32
@@ -4268,7 +4292,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperand(n, ctx)
     checkBitwiseType(dest.typ, "xor", start)
     checkBitwiseType(op.typ, "xor", start)
-    checkCompatibleTypes(dest.typ, op.typ, "xor", start)
+    checkBitwiseCompatible(dest.typ, op.typ, "xor", start)
     if dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
         x86.emitXorImm(ctx.buf.data, dest.mem, int32(op.immVal))  # XOR m64, imm32
@@ -5072,8 +5096,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    checkIntegerType(dest.typ, "xchg", start)
-    checkIntegerType(op.typ, "xchg", start)
+    checkExchangeType(dest.typ, "xchg", start)    # int OR pointer (atomic ptr swap)
+    checkExchangeType(op.typ, "xchg", start)
     checkCompatibleTypes(dest.typ, op.typ, "xchg", start)
     if dest.kind == okMem:
       if op.kind == okImm: error("XCHG memory, immediate not supported", n)
