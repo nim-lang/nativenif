@@ -4255,10 +4255,11 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
       case loc.kind
       of InReg: g.place2(v, loc.r)                       # dest-passed ⇒ usually a no-op
       of NamedStack:
-        if v.kind == InReg: g.emitStoreLoc(loc, v.r)
-        elif v.kind == Imm:
-          let t = g.borrowTmp(ScalarSlot); g.movImm(t, v.ival)
-          g.emitStoreLoc(loc, t); g.giveBack t
+        # A stack-homed scalar: the allocator computed the initializer into a register
+        # (needsReg); store it to the `(s)` slot and release the temp.
+        if v.kind == InReg:
+          g.emitStoreLoc(loc, v.r)
+          if v.isTemp: g.unbindTemp(v.r)
         else: raiseAssert "arkham x64n: stack var init " & $v.kind
       else: discard
     while cc.hasMore: skip cc

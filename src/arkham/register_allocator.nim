@@ -481,9 +481,12 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
     of DerefC, DotC, AtC, PatC:
       # An addressing expr in VALUE position → load `[addr]` into a register. The
       # embedded base/index values are placed by allocLvalue2; the load lands in a
-      # fresh temp (or the dest-passed home / arg reg).
+      # fresh temp (or the dest-passed home / arg reg). A `NeedsReg`/`RegOrImm` dest
+      # carries the precise type (e.g. `(aptr u8)`) — keep it so a store to a typed
+      # slot type-checks (a generic i64 temp would mismatch).
       case dest.kind
-      of Undef, NeedsReg, RegOrImm: dest = b.reserveTmp(ScalarSlot)
+      of NeedsReg, RegOrImm: dest = b.reserveTmp(dest.typ)
+      of Undef: dest = b.reserveTmp(ScalarSlot)
       else: discard
       if dest.kind != InReg: b.ra.exprUnsupported = true
       let resDest = dest
@@ -492,9 +495,10 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
       return
     of AddrC:
       # `(addr lvalue)` → a pointer in a register. Place any embedded base/index
-      # values of the lvalue; the result address lands in dest.
+      # values of the lvalue; the result address lands in dest (typed precisely).
       case dest.kind
-      of Undef, NeedsReg, RegOrImm: dest = b.reserveTmp(ScalarSlot)
+      of NeedsReg, RegOrImm: dest = b.reserveTmp(dest.typ)
+      of Undef: dest = b.reserveTmp(ScalarSlot)
       else: discard
       if dest.kind != InReg: b.ra.exprUnsupported = true
       let resDest = dest
@@ -551,14 +555,19 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
       let vi = b.an.vars.getOrDefault(name)
       if loc.kind == InReg and not vi.declInLoop:
         b.pendingFree.add (pos: vi.freeAfter, name: name)
-      if b.allocExprs:
-        if loc.kind != InReg: b.ra.exprUnsupported = true   # stack-homed var: v1 emitter gap
-        if hasValue:
+      if b.allocExprs and hasValue:
+        if loc.kind == InReg:
           # Destination-passing: allocate the initializer to compute directly into the
-          # local's home. The home is already taken from the pool (above), so the
-          # initializer's transient temps draw from what remains — matching execution.
+          # local's register home. The home is already taken from the pool (above), so
+          # the initializer's transient temps draw from what remains — matching execution.
           var d = loc
           allocValue(b, valCur, d)
+        else:
+          # A stack-homed scalar (spilled / address-taken): compute the initializer into
+          # a register, then the emitter stores it to the `(s)` slot (genVarDecl2).
+          var d = needsReg(slot)
+          allocValue(b, valCur, d)
+          b.releaseTmp(d)
 
 proc walk(b: var Builder; n: var Cursor) =
   case n.stmtKind
