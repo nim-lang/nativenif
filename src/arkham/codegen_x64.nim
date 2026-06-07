@@ -3690,23 +3690,33 @@ proc smallCmpImm(c: Cursor): bool =
   else: true
 
 proc condModeled2(g: var CodeGen; c: Cursor): bool =
-  ## A branch condition the new emitter handles: a single comparison
-  ## (`eq`/`neq`/`lt`/`le`) over modeled, fold-able operands, or a plain modeled
-  ## boolean value. `and`/`or`/`not` short-circuit forms stay with legacy for now.
-  if c.kind == TagLit and c.exprKind in {EqC, NeqC, LtC, LeC}:
-    var ok = true
-    var cc = c
-    cc.into:
-      if cc.hasMore:
-        if not (g.valModeled2(cc) and smallCmpImm(cc)): ok = false
-        skip cc
-      if cc.hasMore:
-        if not (g.valModeled2(cc) and smallCmpImm(cc)): ok = false
-        skip cc
-      while cc.hasMore: skip cc
-    ok
-  else:
-    g.valModeled2(c)
+  ## A branch condition the new emitter handles: a comparison (`eq`/`neq`/`lt`/`le`)
+  ## over modeled, fold-able operands; an `and`/`or`/`not` short-circuit tree over
+  ## modeled sub-conditions; or a plain modeled boolean value.
+  if c.kind == TagLit:
+    case c.exprKind
+    of EqC, NeqC, LtC, LeC:
+      var ok = true
+      var cc = c
+      cc.into:
+        if cc.hasMore:
+          if not (g.valModeled2(cc) and smallCmpImm(cc)): ok = false
+          skip cc
+        if cc.hasMore:
+          if not (g.valModeled2(cc) and smallCmpImm(cc)): ok = false
+          skip cc
+        while cc.hasMore: skip cc
+      return ok
+    of AndC, OrC, NotC:
+      var ok = true
+      var cc = c
+      cc.into:
+        while cc.hasMore:
+          if not g.condModeled2(cc): ok = false
+          skip cc
+      return ok
+    else: discard
+  g.valModeled2(c)
 
 proc divModModeled2(g: var CodeGen; c: Cursor): bool =
   ## A `(div|mod T a b)` the new emitter handles: integer operands that are
@@ -3799,6 +3809,7 @@ proc stmtModeled2(g: var CodeGen; c: Cursor): bool =
         else: ok = false
         skip cc
     ok
+  of BreakS: true                                       # a jump to the loop-exit label
   else: false
 
 proc procModeled2(g: var CodeGen; decl: Cursor): bool =
@@ -3997,9 +4008,41 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
     while cc.hasMore: skip cc
 
 proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
-  ## Emit a branch test: `cmp`/`jcc` for a comparison `(op a b)`, or `test`-style
-  ## `cmp v, 0` for a plain boolean value, jumping to `toLabel` when the condition
-  ## holds (`whenTrue`). Operand locations were pre-assigned by `allocCond`.
+  ## Emit a branch test, jumping to `toLabel` when the condition holds (`whenTrue`):
+  ## a short-circuit `and`/`or`/`not` tree, a `cmp`/`jcc` for a comparison `(op a b)`,
+  ## or `cmp v, 0` for a plain boolean value. Operand locations were pre-assigned by
+  ## `allocCond`; the short-circuit forms mirror the legacy `emitCondJump`.
+  if c.kind == TagLit and c.exprKind in {AndC, OrC, NotC}:
+    let ek = c.exprKind
+    var aC, bC: Cursor
+    block:
+      var cc = c
+      cc.into:
+        if cc.hasMore: (aC = cc; skip cc)
+        if cc.hasMore: (bC = cc; skip cc)
+        while cc.hasMore: skip cc
+    case ek
+    of NotC:
+      g.emitCond2(aC, toLabel, not whenTrue)
+    of AndC:
+      if whenTrue:
+        let lSkip = g.freshLabel()
+        g.emitCond2(aC, lSkip, false)                  # a false ⇒ whole `and` false: skip
+        g.emitCond2(bC, toLabel, true)
+        g.emLab(lSkip)
+      else:
+        g.emitCond2(aC, toLabel, false)                # either false ⇒ jump
+        g.emitCond2(bC, toLabel, false)
+    else:                                              # OrC
+      if whenTrue:
+        g.emitCond2(aC, toLabel, true)                 # either true ⇒ jump
+        g.emitCond2(bC, toLabel, true)
+      else:
+        let lSkip = g.freshLabel()
+        g.emitCond2(aC, lSkip, true)                   # a true ⇒ whole `or` true: skip
+        g.emitCond2(bC, toLabel, false)
+        g.emLab(lSkip)
+    return
   if c.kind == TagLit and c.exprKind in {EqC, NeqC, LtC, LeC}:
     let ek = c.exprKind
     var aC, bC: Cursor
@@ -4047,6 +4090,9 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
     g.exitScope()
   of VarS: g.genVarDecl2(c)
   of CallS: g.emitCall2(c)
+  of BreakS:
+    assert g.loopEnds.len > 0, "arkham x64n: `break` outside a loop"
+    g.emJmp(g.loopEnds[^1])
   of AsgnS:
     var cc = c
     cc.into:

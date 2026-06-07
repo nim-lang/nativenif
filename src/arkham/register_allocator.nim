@@ -341,9 +341,13 @@ proc allocCond(b: var Builder; n: var Cursor) =
   ## lhs — and `b` wherever it lies (a small immediate / register, folded by the
   ## emitter); the comparison yields flags, so no result location is recorded. A
   ## plain boolean value is forced into a register (the emitter tests it `!= 0`).
-  ## `and`/`or`/`not` short-circuit forms stay with the legacy emitter for now
-  ## (the backend's `condModeled2` gate keeps them off the new path).
-  if n.kind == TagLit and n.exprKind in {EqC, NeqC, LtC, LeC}:
+  ## `and`/`or`/`not` short-circuit trees recurse (each sub-condition's operands
+  ## are allocated and freed in turn — single-use temps, so linear allocation
+  ## matches the conditional emit order).
+  if n.kind == TagLit and n.exprKind in {AndC, OrC, NotC}:
+    n.into:
+      while n.hasMore: allocCond(b, n)
+  elif n.kind == TagLit and n.exprKind in {EqC, NeqC, LtC, LeC}:
     var lDest = needsReg(ScalarSlot)
     var rDest = dontCare
     n.into:
