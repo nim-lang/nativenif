@@ -3752,7 +3752,10 @@ proc stmtModeled2(g: var CodeGen; c: Cursor): bool =
       if s.kind in {AMem, AFloat} or not s.inRegClass: ok = false
       skip cc                                            # type
       if ok and cc.hasMore and cc.kind != DotToken:
-        if not (g.valModeled2(cc) or g.callModeled2(cc) or g.divModModeled2(cc)): ok = false
+        # var-init is alias-safe for a comparison-as-value (a fresh home can't be an
+        # operand) so `condModeled2` is allowed here, but NOT in asgn-rhs / call-args.
+        if not (g.valModeled2(cc) or g.callModeled2(cc) or g.divModModeled2(cc) or
+                g.condModeled2(cc)): ok = false
       while cc.hasMore: skip cc
     ok
   of RetS:
@@ -3760,7 +3763,8 @@ proc stmtModeled2(g: var CodeGen; c: Cursor): bool =
     var cc = c
     cc.into:
       if cc.hasMore and cc.kind != DotToken:
-        if not (g.valModeled2(cc) or g.callModeled2(cc) or g.divModModeled2(cc)): ok = false
+        if not (g.valModeled2(cc) or g.callModeled2(cc) or g.divModModeled2(cc) or
+                g.condModeled2(cc)): ok = false          # ret value: rax never an operand
       while cc.hasMore: skip cc
     ok
   of CallS: g.callModeled2(c)
@@ -3850,6 +3854,8 @@ proc place2(g: var CodeGen; src: Location; dest: Reg) =
   else: raiseAssert "arkham x64n: place2 src " & $src.kind
 
 proc emitValue2(g: var CodeGen; c: Cursor)
+proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool)
+proc emitCondValue2(g: var CodeGen; c: Cursor)
 
 proc emitBin2(g: var CodeGen; c: Cursor) =
   ## Emit a binary-arith node into its precomputed result register, replaying the
@@ -3975,6 +3981,7 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
     case c.exprKind
     of AddC, SubC, MulC, BitandC, BitorC, BitxorC, ShlC, ShrC: g.emitBin2(c)
     of DivC, ModC: g.emitDivMod2(c)
+    of EqC, NeqC, LtC, LeC, AndC, OrC, NotC: g.emitCondValue2(c)
     of CallC: g.emitCall2(c)
     else: raiseAssert "arkham x64n: emitValue2 expr " & $c.exprKind
   else: raiseAssert "arkham x64n: emitValue2 kind " & $c.kind
@@ -4075,6 +4082,20 @@ proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
     g.ab.tree CmpX64: (g.emReg v.r; g.ab.intLit 0)
     g.emJcc(if whenTrue: JneX64 else: JeX64, toLabel)
     if v.isTemp: g.unbindTemp(v.r)
+
+proc emitCondValue2(g: var CodeGen; c: Cursor) =
+  ## A comparison / and/or/not used as a 0/1 VALUE: assume 1, then clear to 0 unless
+  ## the condition holds (mirrors legacy `materializeCond`). The result register
+  ## (`locs[pos]`) is a fresh home / rax in the gated positions — never a comparison
+  ## operand — so writing `1` into it before the `cmp` cannot clobber an operand.
+  let res = g.ra.locs[cursorToPosition(g.buf[], c)]
+  assert res.kind == InReg, "arkham x64n: cond-value result " & $res.kind
+  if res.isTemp: g.bindTemp(res.r, res.typ)            # consumer unbinds (rare dontCare dest)
+  let lEnd = g.freshLabel()
+  g.movImm(res.r, 1)
+  g.emitCond2(c, lEnd, whenTrue = true)                # cond true ⇒ jump over the reset
+  g.movImm(res.r, 0)
+  g.emLab(lEnd)
 
 proc genStmt2(g: var CodeGen; c: Cursor) =
   case c.stmtKind

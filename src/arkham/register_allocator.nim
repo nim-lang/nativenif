@@ -418,6 +418,19 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
       allocBin(b, n, dest); return           # records locs[pos] itself
     of DivC, ModC:
       allocDivMod(b, n, dest); return        # records locs[pos] itself
+    of EqC, NeqC, LtC, LeC, AndC, OrC, NotC:
+      # A comparison / and/or/not used as a 0/1 VALUE: the result needs a register;
+      # the operands are placed by allocCond. The backend gates this to alias-safe
+      # positions (var-init / ret), so a fixed `dest` (a fresh home / rax) never
+      # aliases an operand — the emitter writes it directly.
+      case dest.kind
+      of Undef, NeedsReg, RegOrImm: dest = b.reserveTmp(ScalarSlot)
+      else: discard
+      if dest.kind != InReg: b.ra.exprUnsupported = true
+      let resDest = dest
+      allocCond(b, n)                        # places operands; advances past the cond
+      b.ra.locs[pos] = resDest
+      return
     of CallC:
       allocCall(b, n, dest); return          # records locs[pos] itself
     else:
