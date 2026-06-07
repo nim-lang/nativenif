@@ -60,6 +60,7 @@ const
     arch: Arm64,
     intRetReg: R0,
     divRemReg: NoReg,                # aarch64 sdiv/msub use ordinary scratch — no fixed reg
+    shiftCountReg: NoReg,            # aarch64 shifts take any register
     intArgRegs: @IntArgRegs,
     floatArgRegs: @FloatArgRegs,
     intTempRegs: @IntTempRegs,

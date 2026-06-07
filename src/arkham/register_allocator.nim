@@ -274,17 +274,26 @@ proc resolveDest(b: var Builder; dest: var Location; natural: Location) =
 
 proc allocValue(b: var Builder; n: var Cursor; dest: var Location)
 
+proc regOccupied(b: var Builder; reg: Reg): bool
+
 proc allocBin(b: var Builder; n: var Cursor; dest: var Location) =
   ## Binary-arith node: left into a register, right wherever it lies (a memory
   ## operand stays folded — `foldB`); the result honours `dest` (destination-
   ## passing) or reuses the left register in place (x86 destructive 2-operand RMW).
   let pos = b.posOf(n)
+  let ek = n.exprKind                        # the op (a variable shift needs the count in cl)
   var lDest = needsReg(ScalarSlot)
   var rDest = dontCare
   n.into:
     skip n                                   # result type
     allocValue(b, n, lDest)                  # left → a register
-    allocValue(b, n, rDest)                  # right → wherever (may fold)
+    if ek in {ShlC, ShrC} and b.md.shiftCountReg != NoReg and
+       n.kind notin {IntLit, UIntLit, CharLit}:
+      # x86 variable shift: the count must be in cl. Bail if cl (rcx) holds a live
+      # symbol (a 4th arg-reg param) — the new path cannot evict it.
+      if b.regOccupied(b.md.shiftCountReg): b.ra.exprUnsupported = true
+      rDest = regLoc(b.md.shiftCountReg, ScalarSlot)
+    allocValue(b, n, rDest)                  # right → wherever (may fold) / cl for var shift
   # Result placement. A fixed dest (the var/store target, or an InReg the caller
   # pinned) is kept — destination-passing computes straight into it. Otherwise the
   # left operand's register is reused IN PLACE only when it is a *dead temp* (x86
@@ -399,17 +408,19 @@ proc allocLvalue2(b: var Builder; n: var Cursor) =
   else:
     inc n
 
-proc divRemOccupied(b: var Builder): bool =
-  ## Is the x86 idiv-clobbered remainder register (rdx) the persistent home of some
-  ## symbol? Only a 3rd+ integer parameter of a leaf proc lands there (locals draw
-  ## from the temp/callee pools, never rdx). Conservative: a now-dead param still
-  ## shows its home, so this may bail a div to legacy that was in fact safe — fine
-  ## for v1 (correctness over coverage; legacy reactively evicts rdx anyway).
-  if b.md.divRemReg == NoReg: return false
+proc regOccupied(b: var Builder; reg: Reg): bool =
+  ## Is fixed register `reg` the persistent home of some symbol? Used to bail a
+  ## fixed-register instruction (idiv→rdx, variable shift→rcx) to legacy when the
+  ## register holds a live param (only a 3rd/4th arg-reg param of a leaf proc lands
+  ## there; locals draw from the temp/callee pools). Conservative: a now-dead param
+  ## still shows its home, so this may bail a safe case — fine (legacy evicts it).
+  if reg == NoReg: return false
   for name, pos in b.ra.symPos:
     let loc = b.ra.locs[pos]
-    if loc.kind == InReg and loc.r == b.md.divRemReg: return true
+    if loc.kind == InReg and loc.r == reg: return true
   false
+
+proc divRemOccupied(b: var Builder): bool {.inline.} = b.regOccupied(b.md.divRemReg)
 
 proc allocDivMod(b: var Builder; n: var Cursor; dest: var Location) =
   ## x86 `idiv`/`div`: dividend → rax, divisor → a register (no immediate form),

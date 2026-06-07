@@ -51,6 +51,8 @@ type
     divRemReg*: Reg                  ## x86 idiv's clobbered high-half / remainder reg
                                      ## (rdx = R2); `NoReg` on ISAs without the constraint
                                      ## (arm64 sdiv/msub use ordinary scratch)
+    shiftCountReg*: Reg              ## x86 variable-shift count register (cl ⊂ rcx = R1);
+                                     ## `NoReg` on ISAs where any reg works (arm64)
     intArgRegs*: seq[Reg]            ## integer/pointer argument registers, ABI order
     floatArgRegs*: seq[FReg]         ## float argument registers, ABI order
     intTempRegs*: seq[Reg]           ## caller-saved scratch (call-free locals)

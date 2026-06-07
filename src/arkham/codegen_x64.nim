@@ -3706,14 +3706,20 @@ proc valModeled2(g: var CodeGen; c: Cursor): bool =
         while cc.hasMore: skip cc
       ok
     of CastC, ConvC:
-      # A pure pointer reinterpret (no width change): the target must be a pointer
-      # type, the inner a modeled value. Int-widening casts: later slice.
+      # int↔int (widen/narrow) or ptr↔ptr (reinterpret). FLOAT source/target is the
+      # float family; MIXED int↔ptr needs the rebind-retype `coerceThroughCast` — both
+      # gated out here (legacy handles them) so the new path never miscompiles a type.
       var ok = true
       var cc = c
       cc.into:
-        if not isPtrType(resolveType(g.prog, cc)): ok = false   # target type
-        skip cc
-        if ok and cc.hasMore: (if not g.valModeled2(cc): ok = false); skip cc   # inner
+        let tgtPtr = isPtrType(resolveType(g.prog, cc))
+        if slotOf(g.prog, cc).kind == AFloat: ok = false        # float target: later
+        skip cc                                                 # target type
+        if ok and cc.hasMore:
+          if g.isFloatExpr(cc): ok = false                      # float source: later
+          elif isPtrType(resolveType(g.prog, g.getType(cc))) != tgtPtr: ok = false  # int↔ptr: later
+          elif not g.valModeled2(cc): ok = false
+          skip cc
         while cc.hasMore: skip cc
       ok
     else: false
@@ -4269,22 +4275,35 @@ proc emitAddr2(g: var CodeGen; c: Cursor) =
     g.unbindLvalTemps2(lv)                               # release embedded base/index temps
 
 proc emitCast2(g: var CodeGen; c: Cursor) =
-  ## A pointer cast / conv (gated to pure reinterprets): the inner value was placed in
-  ## the cast's result location (dest-passing), so just emit it — the type change is
-  ## free. `res.r != inner.r` only when the inner could not dest-pass; then move it.
-  var inner: Cursor
+  ## `(conv|cast Type inner)` over integer/pointer (no float source/target — gated out):
+  ## the inner computes into the result register (dest-passing); then re-represent it in
+  ## the target's 64-bit register form. A pointer target is a reinterpret (only a narrow
+  ## int source gets zero-extended); an integer target widens (sign per conv/source, zero
+  ## per cast) or narrows/truncates to the target width.
+  let isCast = c.exprKind == CastC
+  var tc, inner: Cursor
   block:
     var cc = c
     cc.into:
-      skip cc                                            # target type
+      tc = resolveType(g.prog, cc); skip cc              # target type
       inner = cc; skip cc
       while cc.hasMore: skip cc
   g.emitValue2(inner)
   let res = g.ra.locs[cursorToPosition(g.buf[], c)]
+  if res.kind != InReg: return
   let iv = g.ra.locs[cursorToPosition(g.buf[], inner)]
-  if res.kind == InReg and iv.kind == InReg and res.r != iv.r:
-    if res.isTemp: g.bindTemp(res.r, res.typ)
-    g.place2(iv, res.r)
+  if res.isTemp and (iv.kind != InReg or iv.r != res.r): g.bindTemp(res.r, res.typ)
+  if iv.kind == InReg and iv.r != res.r: g.movReg(res.r, iv.r)
+  elif iv.kind == Imm: g.movImm(res.r, iv.ival)
+  let (srcW, srcSigned) = g.srcWidthSigned(inner)
+  if isPtrType(tc):
+    if srcW < 64: g.extendTo(res.r, srcW, signed = false)   # int→ptr: zero-extend narrow
+  else:
+    let targetW = intTypeWidth(tc)
+    if srcW < targetW:
+      g.extendTo(res.r, srcW, signed = (not isCast) and srcSigned)   # widen
+    else:
+      g.extendTo(res.r, targetW, signed = isSignedType(tc))          # narrow / equal
 
 proc genVarDecl2(g: var CodeGen; c: Cursor) =
   var cc = c
@@ -4369,12 +4388,17 @@ proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
     let aLoc = g.ra.locs[cursorToPosition(g.buf[], aC)]
     let bLoc = g.ra.locs[cursorToPosition(g.buf[], bC)]
     assert aLoc.kind == InReg, "arkham x64n: cmp lhs " & $aLoc.kind
-    g.ab.tree CmpX64:
-      g.emReg aLoc.r
-      case bLoc.kind
-      of Imm: g.ab.intLit bLoc.ival
-      of InReg: g.emReg bLoc.r
-      else: raiseAssert "arkham x64n: cmp rhs " & $bLoc.kind
+    case bLoc.kind
+    of Imm:
+      g.ab.tree CmpX64: (g.emReg aLoc.r; g.ab.intLit bLoc.ival)
+    of InReg:
+      g.ab.tree CmpX64: (g.emReg aLoc.r; g.emReg bLoc.r)
+    of NamedStack, Mem:                                 # fold a memory operand: cmp reg, [mem]
+      g.withMemOperand(bLoc):
+        g.ab.tree CmpX64:
+          g.emReg aLoc.r
+          g.emMemOperandLoc(bLoc, regs, ri)
+    else: raiseAssert "arkham x64n: cmp rhs " & $bLoc.kind
     g.emJcc(tag, toLabel)
     if bLoc.kind == InReg and bLoc.isTemp: g.unbindTemp(bLoc.r)
     if aLoc.kind == InReg and aLoc.isTemp: g.unbindTemp(aLoc.r)
@@ -4531,6 +4555,31 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool) =
         g.framePop()
         g.ab.keyword RetX64
 
+proc recordVarType(g: var CodeGen; c: Cursor) =
+  ## `(param :nm . type)` / `(var :nm pragmas type …)` → record `symType[nm] = type`.
+  var cc = c
+  cc.into:
+    if cc.kind == SymbolDef:
+      let nm = symName(cc); inc cc
+      skip cc                                    # pragmas
+      g.symType[nm] = cc                         # type
+    while cc.hasMore: skip cc
+
+proc recordSymTypes(g: var CodeGen; c: Cursor) =
+  ## Pre-pass: populate `symType` for every local var decl so `getType` works during
+  ## gating (`procModeled2`), before emission fills them in incrementally. Recurses
+  ## statement containers; nested proc/type decls are allocated separately.
+  if c.kind != TagLit: return
+  case c.stmtKind
+  of VarS, GvarS, TvarS, ConstS: g.recordVarType(c)
+  of ProcS, TypeS: discard
+  else:
+    var cc = c
+    cc.into:
+      while cc.hasMore:
+        g.recordSymTypes(cc)
+        skip cc
+
 # MODEL: the `StartEmit` per-proc reset in proofs/arkham_bindings.tla. The two-pass seam
 # below must reset every per-proc table (regLocal/boundTemps/freeTmp + the ra.locs snapshot)
 # or RegisterBindingsMatchLoc and replay completeness break.
@@ -4568,6 +4617,19 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
       g.retIsFloat = true                       # float return → xmm0
       g.retFloatBits = if slotOf(g.prog, rc).size == 4: 32 else: 64
   let preseal = if g.retIndirect: {RBX} else: {}
+  block:                                          # pre-fill symType so getType works in the gate
+    var pc = info.decl
+    pc.into:
+      inc pc                                      # name
+      if pc.kind == TagLit:                       # (params …)
+        var p = pc
+        p.into:
+          while p.hasMore: (g.recordVarType(p); skip p)
+      skip pc                                      # params
+      skip pc                                      # ret type
+      skip pc                                      # pragmas
+      if pc.stmtKind == StmtsS: g.recordSymTypes(pc)
+      while pc.hasMore: skip pc                    # drain (body + any trailing)
   var useNew = procModeled2(g, info.decl)        # value-core rewrite: pure-emit this proc?
   g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64Machine, preseal, allocExprs = useNew)
   if useNew and g.ra.exprUnsupported:
