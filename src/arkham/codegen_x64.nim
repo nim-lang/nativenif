@@ -3649,6 +3649,16 @@ proc lvalModeled2(g: var CodeGen; c: Cursor): bool =
         if cc.hasMore: (if not g.valModeled2(cc): ok = false); skip cc    # pointer
         while cc.hasMore: skip cc
       ok
+    of AtC:
+      var ok = true
+      var cc = c
+      cc.into:
+        if cc.hasMore: (if not g.lvalModeled2(cc): ok = false); skip cc   # array base
+        if cc.hasMore:
+          if cc.kind notin {IntLit, UIntLit}: ok = false                 # immediate index (slice 2)
+          skip cc
+        while cc.hasMore: skip cc
+      ok
     else: false
   else: false
 
@@ -3668,7 +3678,7 @@ proc valModeled2(g: var CodeGen; c: Cursor): bool =
         if cc.hasMore: (if not g.valModeled2(cc): ok = false); skip cc   # rhs
         while cc.hasMore: skip cc
       ok
-    of DerefC, DotC: g.lvalModeled2(c)                  # addressing read: load [addr]
+    of DerefC, DotC, AtC: g.lvalModeled2(c)             # addressing read: load [addr]
     of AddrC:
       var ok = true
       var cc = c
@@ -4023,7 +4033,7 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
     of AddC, SubC, MulC, BitandC, BitorC, BitxorC, ShlC, ShrC: g.emitBin2(c)
     of DivC, ModC: g.emitDivMod2(c)
     of EqC, NeqC, LtC, LeC, AndC, OrC, NotC: g.emitCondValue2(c)
-    of DerefC, DotC: g.emitMemLoad2(c)
+    of DerefC, DotC, AtC: g.emitMemLoad2(c)
     of AddrC: g.emitAddr2(c)
     of CallC: g.emitCall2(c)
     else: raiseAssert "arkham x64n: emitValue2 expr " & $c.exprKind
@@ -4046,6 +4056,17 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
         cc.into:
           g.emLvalAddr2(cc); skip cc                    # base (stack var or deref)
           g.ab.sym symName(cc); skip cc                 # field name
+          while cc.hasMore: skip cc
+    of AtC:
+      g.ab.tree AtX:
+        var cc = c
+        cc.into:
+          g.emLvalAddr2(cc); skip cc                    # base (stack array)
+          case cc.kind                                  # immediate index (nifasm scales it)
+          of IntLit: g.ab.intLit intVal(cc)
+          of UIntLit: g.ab.intLit cast[int64](uintVal(cc))
+          else: raiseAssert "arkham x64n: at index not immediate"
+          skip cc
           while cc.hasMore: skip cc
     of DerefC:
       var pointee = g.getType(c)                        # deref result = the pointee type
@@ -4076,6 +4097,11 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
       var cc = c
       cc.into:
         g.emitValue2(cc)                                # the pointer → its register
+        while cc.hasMore: skip cc
+    of AtC:
+      var cc = c
+      cc.into:
+        g.prematLval2(cc)                               # base; immediate index needs none
         while cc.hasMore: skip cc
     else: discard
 
