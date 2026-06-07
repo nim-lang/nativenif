@@ -470,7 +470,10 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
   of CharLit:
     b.resolveDest(dest, immLoc(int64(ord(charLit(n))), ScalarSlot)); inc n
   of Symbol:
-    b.resolveDest(dest, b.symLoc(symName(n))); inc n
+    let natural = b.symLoc(symName(n))
+    if natural.kind == Undef: b.forceRegDest(dest)   # a global/tvar: load into a register
+    else: b.resolveDest(dest, natural)               # a function-local: its home
+    inc n
   of StrLit:
     b.forceRegDest(dest); inc n                # string literal → a reg (lea of rodata)
   of TagLit:

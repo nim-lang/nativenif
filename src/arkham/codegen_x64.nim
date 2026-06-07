@@ -3676,7 +3676,7 @@ proc valModeled2(g: var CodeGen; c: Cursor): bool =
   ## Is value `c` within the new emitter's coverage? (Reads a copy; consumes nothing.)
   case c.kind
   of IntLit, UIntLit, CharLit, StrLit: true
-  of Symbol: g.lookupSym(symName(c)).cat == scNone     # a function-local only (no global/proc)
+  of Symbol: g.lookupSym(symName(c)).cat in {scNone, scGlobal, scTvar}  # local or global read (not proc)
   of TagLit:
     case c.exprKind
     of TrueC, FalseC, NilC, SizeofC: true              # compile-time / immediate leaves
@@ -4054,7 +4054,7 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
   # under a `NeedsReg` constraint) must bind that register so `emReg` emits a
   # checked name, not a raw r10/r11. The consuming op (`emitBin2`/`emitCond2`)
   # unbinds it when it folds the operand. Computed nodes bind their own result.
-  if dst.kind == InReg and dst.isTemp and c.kind in {IntLit, UIntLit, CharLit, Symbol}:
+  if dst.kind == InReg and dst.isTemp and c.kind in {IntLit, UIntLit, CharLit}:
     g.bindTemp(dst.r, dst.typ)
   case c.kind
   of IntLit:
@@ -4064,7 +4064,16 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
   of CharLit:
     if dst.kind == InReg: g.movImm(dst.r, int64(ord(charLit(c))))
   of Symbol:
-    if dst.kind == InReg: g.place2(g.ra.locationOfSym(symName(c)), dst.r)
+    if dst.kind == InReg:
+      let home = g.ra.locationOfSym(symName(c))
+      if home.kind != Undef:                            # a function-local
+        if dst.isTemp: g.bindTemp(dst.r, dst.typ)        # stack-homed local → loaded into a temp
+        g.place2(home, dst.r)
+      else:                                             # a module-level global / tvar: load it
+        var cc = c
+        let loc = g.asLoc(cc)                            # Glob/Tvar with the global's precise type
+        if dst.isTemp: g.bindTemp(dst.r, loc.typ)        # type the temp as the global (precision)
+        g.place2(loc, dst.r)
   of StrLit:                                            # string literal → rodata + RIP lea
     if dst.kind == InReg:
       let nm = "msg." & $g.rodata.len
