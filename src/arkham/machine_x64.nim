@@ -56,6 +56,8 @@ const
   ##    AArch64 where x0–x7 are kept out of the temp pool)
   ##  * float: xmm0–7 args/return (unused by the v0 scalar path)
   x64Machine* = MachineDesc(
+    arch: X86,
+    intRetReg: RAX,
     intArgRegs: @[RDI, RSI, RDX, RCX, R8, R9],
     floatArgRegs: @[F0, F1, F2, F3, F4, F5, F6, F7],
     intTempRegs: @[R10, R11],

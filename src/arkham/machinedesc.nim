@@ -35,10 +35,19 @@ type
     F16, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27, F28, F29, F30, F31,
     NoFReg
 
+  TargetArch* = enum
+    ## Which ISA the `MachineDesc` describes. The register allocator is otherwise
+    ## arch-neutral, but a few instruction-selection quirks (x86's destructive
+    ## 2-operand RMW, `div` clobbering RDX, variable shift via RCX) are handled by
+    ## `if md.arch == X86` branches in the expression walk rather than a callback.
+    X86, Arm64
+
   MachineDesc* = object
     ## A target's register file + calling convention, as the allocator needs it.
     ## All registers are slots from a *subset* of `Reg`/`FReg` (a narrower ISA
     ## like x86-64 leaves the high slots unused).
+    arch*: TargetArch                ## the ISA, for the few arch-specific walk branches
+    intRetReg*: Reg                  ## integer/pointer return register (rax / x0 = R0)
     intArgRegs*: seq[Reg]            ## integer/pointer argument registers, ABI order
     floatArgRegs*: seq[FReg]         ## float argument registers, ABI order
     intTempRegs*: seq[Reg]           ## caller-saved scratch (call-free locals)

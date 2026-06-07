@@ -3617,6 +3617,319 @@ proc emitProcBody(g: var CodeGen; info: ProcInfo; declarative: bool) =
         g.framePop()
         g.ab.keyword RetX64
 
+# ── value-core rewrite: the PURE emitter (consumes precomputed locs/aux) ───────
+# Single-pass: the register allocator (allocExprs=true) has already assigned every
+# value position a Location in `g.ra.locs` (+ `aux`); this code only emits bytes,
+# making NO register decisions — so there is no plan/replay seam. See
+# `codegen2_design.md`. Coverage so far: leaf integer procs (params/locals/ret,
+# integer leaves + binary arithmetic). A proc that uses anything else routes to the
+# legacy reactive `emitProcBody` (per-proc opt-in via `procModeled2`). As coverage
+# grows the legacy path shrinks, then deletes.
+
+proc valModeled2(g: var CodeGen; c: Cursor): bool =
+  ## Is value `c` within the new emitter's coverage? (Reads a copy; consumes nothing.)
+  case c.kind
+  of IntLit, UIntLit, CharLit: true
+  of Symbol: g.lookupSym(symName(c)).cat == scNone     # a function-local only (no global/proc)
+  of TagLit:
+    case c.exprKind
+    of AddC, SubC, MulC, BitandC, BitorC, BitxorC, ShlC, ShrC:
+      var ok = true
+      var cc = c
+      cc.into:
+        skip cc                                          # result type
+        if cc.hasMore: (if not g.valModeled2(cc): ok = false); skip cc   # lhs
+        if cc.hasMore: (if not g.valModeled2(cc): ok = false); skip cc   # rhs
+        while cc.hasMore: skip cc
+      ok
+    else: false
+  else: false
+
+proc callModeled2(g: var CodeGen; c: Cursor): bool =
+  ## Is this `(call …)` within the new emitter's coverage? A declarative direct or
+  ## syscall target (NOT indirect / atomic / mem* / bit-builtin), a scalar-or-void
+  ## result, and ≤(#arg regs) scalar args with no nested call (`valModeled2` rejects
+  ## CallC, so an arg cannot itself be a call ⇒ nothing lives across the call).
+  if c.kind != TagLit or c.exprKind != CallC: return false
+  var ok = true
+  var fc = c
+  fc.into:
+    if fc.kind != Symbol:
+      ok = false
+    else:
+      let fsym = symName(fc); inc fc
+      if not g.callTarget.hasKey(fsym):                  # resolve + cache (mirrors genCall)
+        let si = g.lookupSym(fsym)
+        if si.cat in {scGlobal, scTvar}:
+          g.callTarget[fsym] = CallTarget(declarative: true, indirect: true,
+            asmName: fsym, retType: g.indirectRetType(si.decl))
+        else:
+          g.callTarget[fsym] = foreignCallTarget(g.prog, fsym)
+      let tgt = g.callTarget[fsym]
+      if not (tgt.declarative and not tgt.extern and tgt.atomic.len == 0 and
+              tgt.memIntrin.len == 0 and tgt.bitBuiltin.len == 0 and not tgt.indirect):
+        ok = false
+      if (not retIsVoid(tgt.retType)) and
+         slotOf(g.prog, tgt.retType).kind notin {AInt, AUInt, ABool}:
+        ok = false                                       # float / aggregate result: v1 gap
+      var argc = 0
+      while fc.hasMore:
+        if not g.valModeled2(fc): ok = false             # scalar-int args, no nested call
+        inc argc; skip fc
+      if argc > g.md.intArgRegs.len: ok = false          # 7th+ (stack) args: v1 gap
+  ok
+
+proc stmtModeled2(g: var CodeGen; c: Cursor): bool =
+  case c.stmtKind
+  of StmtsS, ScopeS:
+    var ok = true
+    var cc = c
+    cc.into:
+      while cc.hasMore:
+        if not g.stmtModeled2(cc): ok = false
+        skip cc
+    ok
+  of VarS:
+    var ok = true
+    var cc = c
+    cc.into:
+      skip cc; skip cc                                   # name, pragmas
+      let s = slotOf(g.prog, cc)
+      if s.kind in {AMem, AFloat} or not s.inRegClass: ok = false
+      skip cc                                            # type
+      if ok and cc.hasMore and cc.kind != DotToken:
+        if not (g.valModeled2(cc) or g.callModeled2(cc)): ok = false
+      while cc.hasMore: skip cc
+    ok
+  of RetS:
+    var ok = true
+    var cc = c
+    cc.into:
+      if cc.hasMore and cc.kind != DotToken:
+        if not (g.valModeled2(cc) or g.callModeled2(cc)): ok = false
+      while cc.hasMore: skip cc
+    ok
+  of CallS: g.callModeled2(c)
+  else: false
+
+proc procModeled2(g: var CodeGen; decl: Cursor): bool =
+  ## Conservative: the new emitter handles this whole proc (scalar-int params, a
+  ## scalar-int/void return, and a body of var/ret over integer arithmetic).
+  var ok = true
+  var c = decl
+  c.into:
+    inc c                                                # name
+    if c.kind == TagLit:                                 # (params …)
+      var p = c
+      p.into:
+        while p.hasMore:
+          var pp = p
+          pp.into:
+            skip pp; skip pp                             # name, pragmas
+            let s = slotOf(g.prog, pp)
+            if s.kind in {AMem, AFloat} or not s.inRegClass: ok = false
+            while pp.hasMore: skip pp
+          skip p
+    skip c                                               # params
+    if not (c.kind == DotToken or
+            (c.kind == TagLit and c.typeKind in {NifcType.IT, NifcType.UT, NifcType.CT})):
+      ok = false                                         # scalar-int or void return only
+    skip c                                               # return type
+    skip c                                               # pragmas
+    if ok:
+      ok = (c.stmtKind == StmtsS) and g.stmtModeled2(c)
+    while c.hasMore: skip c
+  result = ok
+
+proc place2(g: var CodeGen; src: Location; dest: Reg) =
+  ## Materialize `src` into register `dest` (no-op when it is already there).
+  case src.kind
+  of InReg: (if src.r != dest: g.movReg(dest, src.r))
+  of Imm: g.movImm(dest, src.ival)
+  of NamedStack, Mem, Glob, Tvar: g.emitLoadLoc(src, dest)
+  else: raiseAssert "arkham x64n: place2 src " & $src.kind
+
+proc emitValue2(g: var CodeGen; c: Cursor)
+
+proc emitBin2(g: var CodeGen; c: Cursor) =
+  ## Emit a binary-arith node into its precomputed result register, replaying the
+  ## allocator's operand placement (`aux.foldB` ⇒ the rhs stays a memory operand).
+  let pos = cursorToPosition(g.buf[], c)
+  let res = g.ra.locs[pos]
+  let (op, immOk, isBin) = binArithOp(c)
+  assert isBin, "arkham x64n: emitBin2 on a non-bin node"
+  var lhsC, rhsC: Cursor
+  block:
+    var cc = c
+    cc.into:
+      skip cc                                            # result type
+      lhsC = cc; skip cc
+      rhsC = cc; skip cc
+      while cc.hasMore: skip cc
+  g.emitValue2(lhsC)                                     # materialize sub-results first
+  g.emitValue2(rhsC)
+  let lhsLoc = g.ra.locs[cursorToPosition(g.buf[], lhsC)]
+  let rhsLoc = g.ra.locs[cursorToPosition(g.buf[], rhsC)]
+  assert res.kind == InReg, "arkham x64n: bin result " & $res.kind
+  let rD = res.r
+  let reusedLhs = lhsLoc.kind == InReg and lhsLoc.r == rD   # in-place RMW on the left temp
+  if res.isTemp and not reusedLhs: g.bindTemp(rD, res.typ)
+  g.place2(lhsLoc, rD)                                   # dest := lhs
+  case rhsLoc.kind                                       # dest op= rhs
+  of Imm: g.binImm(op, rD, rhsLoc.ival)
+  of InReg: g.binReg(op, rD, rhsLoc.r)
+  of NamedStack, Mem: g.binMem(op, rD, rhsLoc)
+  else: raiseAssert "arkham x64n: bin rhs " & $rhsLoc.kind
+  if rhsLoc.kind == InReg and rhsLoc.isTemp: g.unbindTemp(rhsLoc.r)
+  if lhsLoc.kind == InReg and lhsLoc.isTemp and not reusedLhs: g.unbindTemp(lhsLoc.r)
+
+proc emitCall2(g: var CodeGen; c: Cursor) =
+  ## Emit a modeled call: each argument is already placed in its ABI register by the
+  ## allocator, so materialize it there and bind it (`(mov (arg pN) reg)`); then the
+  ## `(call)`/`(syscall)`; then move the result (rax) to its destination
+  ## (`locs[posOf c]` — a dest-passed home, or rax for a discarded/result-in-rax).
+  let pos = cursorToPosition(g.buf[], c)
+  let resLoc = g.ra.locs[pos]
+  var argCurs: seq[Cursor] = @[]
+  var asmName = ""
+  var isSyscall = false
+  var hasResult = false
+  block:
+    var fc = c
+    fc.into:
+      let fsym = symName(fc); inc fc
+      let tgt = g.callTarget[fsym]                  # resolved during gating (callModeled2)
+      asmName = tgt.asmName
+      isSyscall = tgt.syscall
+      hasResult = not retIsVoid(tgt.retType)
+      while fc.hasMore: (argCurs.add fc; skip fc)
+  g.ab.tree PrepareX64:
+    g.ab.sym asmName
+    for idx in 0 ..< argCurs.len:
+      g.emitValue2(argCurs[idx])                    # compute into its arg register
+      let aloc = g.ra.locs[cursorToPosition(g.buf[], argCurs[idx])]
+      g.ab.tree MovX64:
+        g.ab.tree ArgX: g.ab.sym paramName(idx)
+        g.emReg aloc.r                              # InReg(argReg) by construction
+    if isSyscall: g.emSyscall()
+    else: g.ab.keyword CallX64
+    if hasResult:
+      g.ab.tree MovX64:
+        g.emReg RAX
+        g.ab.tree ResX: g.ab.sym "ret.0"
+  if hasResult and resLoc.kind == InReg and resLoc.r != RAX:
+    g.movReg(resLoc.r, RAX)
+
+proc emitValue2(g: var CodeGen; c: Cursor) =
+  ## Ensure `c`'s value is materialized at its precomputed `locs[pos]`. A leaf whose
+  ## location is a register is moved there (the allocator placed it via destination-
+  ## passing / a `NeedsReg` reservation); a leaf left as `Imm` / in its own home stays
+  ## put (the consumer folds or reads it). A computed node runs its op into its result.
+  let dst = g.ra.locs[cursorToPosition(g.buf[], c)]
+  case c.kind
+  of IntLit:
+    if dst.kind == InReg: g.movImm(dst.r, intVal(c))
+  of UIntLit:
+    if dst.kind == InReg: g.movImm(dst.r, cast[int64](uintVal(c)))
+  of CharLit:
+    if dst.kind == InReg: g.movImm(dst.r, int64(ord(charLit(c))))
+  of Symbol:
+    if dst.kind == InReg: g.place2(g.ra.locationOfSym(symName(c)), dst.r)
+  of TagLit:
+    case c.exprKind
+    of AddC, SubC, MulC, BitandC, BitorC, BitxorC, ShlC, ShrC: g.emitBin2(c)
+    of CallC: g.emitCall2(c)
+    else: raiseAssert "arkham x64n: emitValue2 expr " & $c.exprKind
+  else: raiseAssert "arkham x64n: emitValue2 kind " & $c.kind
+
+proc genVarDecl2(g: var CodeGen; c: Cursor) =
+  var cc = c
+  cc.into:
+    let nm = symName(cc); inc cc
+    skip cc                                              # pragmas
+    let typeCur = cc; skip cc                            # type
+    let loc = g.ra.locationOfSym(nm)
+    let hasVal = cc.hasMore and cc.kind != DotToken
+    case loc.kind
+    of InReg: g.emRegLocalVar(nm, loc.r, typeCur)
+    of NamedStack: g.emTypedStackVar(nm, typeCur)
+    else: raiseAssert "arkham x64n: var home " & $loc.kind
+    if hasVal:
+      let valC = cc
+      g.emitValue2(valC)
+      let v = g.ra.locs[cursorToPosition(g.buf[], valC)]
+      case loc.kind
+      of InReg: g.place2(v, loc.r)                       # dest-passed ⇒ usually a no-op
+      of NamedStack:
+        if v.kind == InReg: g.emitStoreLoc(loc, v.r)
+        elif v.kind == Imm:
+          let t = g.borrowTmp(ScalarSlot); g.movImm(t, v.ival)
+          g.emitStoreLoc(loc, t); g.giveBack t
+        else: raiseAssert "arkham x64n: stack var init " & $v.kind
+      else: discard
+    while cc.hasMore: skip cc
+
+proc genStmt2(g: var CodeGen; c: Cursor) =
+  case c.stmtKind
+  of StmtsS:
+    var cc = c
+    cc.into:
+      while cc.hasMore: (g.genStmt2(cc); skip cc)
+  of ScopeS:
+    g.enterScope()
+    var cc = c
+    cc.into:
+      while cc.hasMore: (g.genStmt2(cc); skip cc)
+    g.exitScope()
+  of VarS: g.genVarDecl2(c)
+  of CallS: g.emitCall2(c)
+  of RetS:
+    var cc = c
+    cc.into:
+      let hasVal = cc.hasMore and cc.kind != DotToken
+      if g.isEntryProc:
+        # the Linux entry terminates the process: return value → exit code in rdi.
+        if hasVal:
+          g.emitValue2(cc)
+          g.place2(g.ra.locs[cursorToPosition(g.buf[], cc)], RDI)
+        else: g.movImm(RDI, 0)
+        g.movImm(RAX, LinuxX64ExitNr); g.emSyscall()
+      elif hasVal:
+        g.emitValue2(cc)
+        g.place2(g.ra.locs[cursorToPosition(g.buf[], cc)], g.md.intRetReg)
+        # epilogue (framePop + ret) is emitted by emitProcBody2's terminator
+      while cc.hasMore: skip cc
+  else: raiseAssert "arkham x64n: genStmt2 " & $c.stmtKind
+
+proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool) =
+  ## The pure-emitter twin of `emitProcBody`, run ONCE (no plan pass). Reuses the
+  ## shared signature / frame / param-settling / scope machinery; only the value
+  ## core (`genStmt2`/`emitValue2`) differs.
+  g.ab.tree ProcD:
+    g.ab.symDef info.asmName
+    g.emitSignature(info.decl, declarative)
+    g.ab.tree StmtsX64:
+      g.enterScope()
+      g.framePush()
+      g.emitStackParamLoadsX64(info.decl)
+      if g.framePad > 0: g.binImm(SubX64, RSP, g.framePad.int64)
+      if g.ra.hasStackVars:
+        g.ab.tree SubX64: (g.ab.reg RSP; g.ab.keyword SsizeX)
+      if g.retIndirect: g.movReg(g.indirectReg, RDI)
+      g.emitParamMoves(info.decl, declarative)
+      if info.isEntry: g.emitGlobalInits()
+      var c = info.decl
+      c.into:
+        inc c; skip c; skip c; skip c                    # name, params, ret, pragmas
+        if c.stmtKind == StmtsS: g.genStmt2(c)
+        while c.hasMore: skip c
+      g.exitScope()
+      if info.isEntry:
+        g.movImm(RAX, 60); g.movImm(RDI, 0); g.emSyscall()
+      else:
+        g.framePop()
+        g.ab.keyword RetX64
+
 # MODEL: the `StartEmit` per-proc reset in proofs/arkham_bindings.tla. The two-pass seam
 # below must reset every per-proc table (regLocal/boundTemps/freeTmp + the ra.locs snapshot)
 # or RegisterBindingsMatchLoc and replay completeness break.
@@ -3653,13 +3966,43 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
       g.retIsFloat = true                       # float return → xmm0
       g.retFloatBits = if slotOf(g.prog, rc).size == 4: 32 else: 64
   let preseal = if g.retIndirect: {RBX} else: {}
-  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64Machine, preseal)
+  var useNew = procModeled2(g, info.decl)        # value-core rewrite: pure-emit this proc?
+  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64Machine, preseal, allocExprs = useNew)
+  if useNew and g.ra.exprUnsupported:
+    # The expr walk produced a spill / memory-homed result the v1 pure emitter does not
+    # handle yet — fall back to the legacy reactive path (re-allocate without expr locs,
+    # whose pool/usedCallee/hasStackVars state the legacy emitter depends on).
+    useNew = false
+    g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64Machine, preseal)
+  when defined(arkhamDumpLocs):
+    block:
+      let dbg = allocateProc(g.buf[], info.decl, an, g.prog, x64Machine, preseal, allocExprs = true)
+      stderr.writeLine "=== allocValue locs ==="
+      for pos in 0 ..< dbg.locs.len:
+        let l = dbg.locs[pos]
+        if l.kind == Undef: continue
+        var s = "  pos " & $pos & " : " & $l.kind
+        case l.kind
+        of InReg: s.add " r=" & $l.r
+        of Imm: s.add " imm=" & $l.ival
+        of NamedStack, Glob, Tvar: s.add " " & l.name
+        else: discard
+        if dbg.aux.hasKey(pos): s.add "   [foldB=" & $dbg.aux[pos].foldB & "]"
+        stderr.writeLine s
   if g.retIndirect:
     g.indirectReg = RBX
     g.ra.usedCallee.incl RBX                   # saved/restored like any callee reg
   g.initFreeTmp()
   g.computeFrameX64(info.isEntry, an.hasCall)
   let declarative = isDeclarativeAbi(g.prog, info.decl)
+  if useNew:
+    # Pure-emit path: the allocator already assigned every value position; emit once.
+    g.ab.planning = false
+    g.regLocal.clear(); g.aliasToDecl.clear(); g.boundTemps = {}; g.scopeLocals = @[]
+    g.fregLocal.clear(); g.boundFTmps = {}; g.scopeFLocals = @[]
+    g.spillCount = 0; g.tmpBindCount = 0; g.ftmpBindCount = 0
+    g.emitProcBody2(info, declarative)
+    return
   # Single walk, two modes. The plan pass runs `emitProcBody` with emission
   # suppressed (`ab.planning`), so every scratch borrow is decided and recorded
   # in `borrowLog`/`borrowLogF` (with the real pool + ABI seals) while no bytes

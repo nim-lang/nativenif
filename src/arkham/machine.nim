@@ -57,6 +57,8 @@ const
   ## The AArch64 / AAPCS64 register file and calling convention, as the
   ## arch-neutral register allocator consumes it.
   aarch64Machine* = MachineDesc(
+    arch: Arm64,
+    intRetReg: R0,
     intArgRegs: @IntArgRegs,
     floatArgRegs: @FloatArgRegs,
     intTempRegs: @IntTempRegs,

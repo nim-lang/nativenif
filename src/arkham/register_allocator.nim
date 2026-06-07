@@ -29,8 +29,30 @@ import std / [tables, sets, assertions]
 import nifcore, nifcdecl, slots, machinedesc, analyser, programs
 
 type
+  ExprAux* = object
+    ## Per-expression-position selection decisions the pure emitter must replay
+    ## that don't fit in the result `Location` (kept in `RegAlloc.aux`, sparse —
+    ## only ops with arch constraints get an entry). Part of the value-core
+    ## rewrite (see `codegen2_design.md`): once the allocator assigns every value
+    ## position a result `Location` (in `locs`) plus this aux, codegen becomes a
+    ## pure consumer and the plan/replay seam goes away.
+    scratch*: seq[Reg]                ## extra GPRs reserved for this op (idiv RDX, a
+                                      ## non-pow2 stride temp, an address scratch…)
+    fscratch*: seq[FReg]              ## extra SIMD scratch reserved for this op
+    swapped*: bool                    ## operands evaluated in swapped (Sethi–Ullman) order
+    foldB*: bool                      ## operand B stays a folded memory operand (no load)
+
   RegAlloc* = object
-    locs*: seq[Location]              ## indexed by cursorToPosition
+    locs*: seq[Location]              ## indexed by cursorToPosition. Currently filled
+                                      ## for symbol defs; the rewrite fills it for EVERY
+                                      ## value-producing position (its result location).
+    aux*: Table[int, ExprAux]         ## pos → per-op selection aux (see `ExprAux`)
+    exprUnsupported*: bool             ## value-core rewrite (transition gate): the expr
+                                      ## walk produced something the v1 pure emitter does
+                                      ## not handle yet — a temp spill, or a memory-homed
+                                      ## result/var. The backend then routes this proc to
+                                      ## the legacy reactive emitter. Shrinks to never-set
+                                      ## as the new emitter's coverage grows.
     symPos*: Table[string, int]       ## local/param name → its def position
     usedCallee*: set[Reg]             ## callee-saved GPRs to save in prologue
     usedCalleeF*: set[FReg]           ## callee-saved SIMD regs (v8–v15) to save in prologue
@@ -56,6 +78,13 @@ type
                                       ## coarse `freeAfter` position (last-use end)
     freedSyms: HashSet[string]        ## locals already early-freed: skipped by
                                       ## `trySteal` (dead) and `closeScope` (no re-free)
+    allocExprs: bool                  ## value-core rewrite: also assign `locs[pos]` for
+                                      ## expressions (not just var defs). Off by default so
+                                      ## the legacy reactive emitter sees the unchanged
+                                      ## (symbol-only) `locs`; the new pure emitter turns it
+                                      ## on. See `codegen2_design.md` / `allocValue`.
+    tmpSpills: int                    ## fresh expression-temp spill-slot counter (when the
+                                      ## scratch pool is exhausted during the expr walk)
 
 proc posOf(b: Builder; c: Cursor): int {.inline.} =
   cursorToPosition(b.buf[], c)
@@ -195,6 +224,135 @@ proc trySteal(b: var Builder; curName: string; curSlot: AsmSlot;
   if bestReg in b.md.intCalleeSavedSet: b.ra.usedCallee.incl bestReg
   result = regLoc(bestReg, curSlot)
 
+# ── expression allocation (value-core rewrite; gated by `allocExprs`) ──────────
+# Mirrors codegen's genVal/gen DECISIONS, recording each value position's result
+# Location in `ra.locs` (+ `ra.aux`) instead of emitting; the pure emitter reads
+# them back. See `codegen2_design.md`. Currently: integer leaves + binary
+# arithmetic. TODO: div/mod (RDX clobber), calls, addressing, floats,
+# Sethi–Ullman reorder, totality spill. Arch quirks go behind `b.md.arch == X86`.
+
+let ScalarSlot = AsmSlot(cls: AInt, size: 8, align: 8)
+
+proc sameReg(a, c: Location): bool {.inline.} =
+  a.kind == InReg and c.kind == InReg and a.r == c.r
+
+proc reserveTmp(b: var Builder; slot: AsmSlot): Location =
+  ## A scratch GPR for a computed expression temporary: the volatile temp pool
+  ## first, then callee-saved, then a nifasm-managed spill slot when both are
+  ## empty (so allocation is total — the emitter sees a foldable `NamedStack`).
+  var r = b.takeReg(b.freeVol, b.md.intTempRegs)
+  if r == NoReg:
+    r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
+    if r == NoReg:
+      let nm = "etmp" & $b.tmpSpills & ".0"; inc b.tmpSpills
+      b.ra.hasStackVars = true
+      b.ra.exprUnsupported = true              # v1 pure emitter has no spill path yet
+      return namedStackLoc(nm, slot)
+    if r in b.md.intCalleeSavedSet: b.ra.usedCallee.incl r
+  result = regLoc(r, slot, isTemp = true)
+
+proc releaseTmp(b: var Builder; loc: Location) {.inline.} =
+  if loc.kind == InReg and loc.isTemp: b.giveBack loc.r
+
+proc symLoc(b: var Builder; name: string): Location =
+  ## A symbol reference reads where the symbol is stored. A module-level
+  ## global/proc is not in `symPos`; the emitter resolves those (Glob / `lea`), so
+  ## return `dontCare` and let it.
+  let p = b.ra.symPos.getOrDefault(name, -1)
+  if p >= 0: b.ra.locs[p] else: dontCare
+
+proc resolveDest(b: var Builder; dest: var Location; natural: Location) =
+  ## Resolve a *leaf* destination constraint against the value's `natural`
+  ## location (an immediate / a symbol's home).
+  case dest.kind
+  of Undef: dest = natural
+  of NeedsReg:
+    dest = (if natural.kind == InReg: natural else: b.reserveTmp(natural.typ))
+  of RegOrImm:
+    dest = (if natural.kind in {InReg, Imm}: natural else: b.reserveTmp(natural.typ))
+  else: discard                              # fixed InReg/InFReg/NamedStack/…: keep
+
+proc allocValue(b: var Builder; n: var Cursor; dest: var Location)
+
+proc allocBin(b: var Builder; n: var Cursor; dest: var Location) =
+  ## Binary-arith node: left into a register, right wherever it lies (a memory
+  ## operand stays folded — `foldB`); the result honours `dest` (destination-
+  ## passing) or reuses the left register in place (x86 destructive 2-operand RMW).
+  let pos = b.posOf(n)
+  var lDest = needsReg(ScalarSlot)
+  var rDest = dontCare
+  n.into:
+    skip n                                   # result type
+    allocValue(b, n, lDest)                  # left → a register
+    allocValue(b, n, rDest)                  # right → wherever (may fold)
+  # Result placement. A fixed dest (the var/store target, or an InReg the caller
+  # pinned) is kept — destination-passing computes straight into it. Otherwise the
+  # left operand's register is reused IN PLACE only when it is a *dead temp* (x86
+  # RMW `dest := dest op rhs`); a live local's home is never grabbed (it would
+  # clobber the local), and a fresh temp is taken while `rDest` is still held so it
+  # can't land on the rhs register (which would break a non-commutative `sub`).
+  case dest.kind
+  of Undef, NeedsReg, RegOrImm:
+    if lDest.kind == InReg and lDest.isTemp: dest = lDest
+    else: dest = b.reserveTmp(ScalarSlot)
+  else: discard
+  if dest.kind != InReg: b.ra.exprUnsupported = true   # memory-result binop: v1 emitter gap
+  b.releaseTmp(rDest)
+  if not sameReg(dest, lDest): b.releaseTmp(lDest)
+  b.ra.aux[pos] = ExprAux(foldB: rDest.kind in {NamedStack, Mem})
+  b.ra.locs[pos] = dest
+
+proc allocCall(b: var Builder; n: var Cursor; dest: var Location) =
+  ## A call: each argument is allocated into its ABI argument register, the result
+  ## into the return register (or a destination-passed home). The v1 emitter only
+  ## handles ≤(#arg regs) scalar args with no value live across the call — the
+  ## backend's `procModeled2`/`callModeled2` gate enforces the rest (syscall vs
+  ## direct, no nested calls / aggregates / floats), so here we just place.
+  let pos = b.posOf(n)
+  var argIdx = 0
+  n.into:
+    skip n                                     # callee symbol
+    while n.hasMore:
+      if argIdx < b.md.intArgRegs.len:
+        var ad = regLoc(b.md.intArgRegs[argIdx], ScalarSlot)
+        allocValue(b, n, ad)
+      else:
+        b.ra.exprUnsupported = true            # 7th+ arg (stack) — v1 emitter gap
+        var ad = dontCare
+        allocValue(b, n, ad)
+      inc argIdx
+  case dest.kind
+  of Undef, NeedsReg, RegOrImm:
+    dest = regLoc(b.md.intRetReg, ScalarSlot, isTemp = true)   # result in rax
+  else: discard                                # fixed dest: emitter moves rax → it
+  b.ra.locs[pos] = dest
+
+proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
+  let pos = b.posOf(n)
+  case n.kind
+  of IntLit:
+    b.resolveDest(dest, immLoc(intVal(n), ScalarSlot)); inc n
+  of UIntLit:
+    b.resolveDest(dest, immLoc(cast[int64](uintVal(n)), ScalarSlot)); inc n
+  of CharLit:
+    b.resolveDest(dest, immLoc(int64(ord(charLit(n))), ScalarSlot)); inc n
+  of Symbol:
+    b.resolveDest(dest, b.symLoc(symName(n))); inc n
+  of TagLit:
+    case n.exprKind
+    of AddC, SubC, MulC, BitandC, BitorC, BitxorC, ShlC, ShrC:
+      allocBin(b, n, dest); return           # records locs[pos] itself
+    of CallC:
+      allocCall(b, n, dest); return          # records locs[pos] itself
+    else:
+      # not modeled yet: reserve a register for the result and skip the subtree
+      # (the legacy emitter still handles these forms; no var decls nest inside
+      # an expression, so skipping is safe for declaration discovery).
+      b.resolveDest(dest, b.reserveTmp(ScalarSlot)); skip n
+  else:
+    inc n
+  b.ra.locs[pos] = dest
+
 proc allocVarDecl(b: var Builder; n: var Cursor) =
   n.into:
     let pos = b.posOf(n)
@@ -202,7 +360,9 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
     let name = symName(n); inc n
     skip n                                   # pragmas
     let slot = slotOf(b.prog[], n); skip n  # type (resolves named types)
-    if n.hasMore: skip n                     # value (analysed in pass 1)
+    var valCur = n                           # remember the initializer (for allocExprs)
+    let hasValue = n.hasMore
+    if hasValue: skip n                       # value (analysed in pass 1)
     if slot.kind == AMem:
       # an aggregate (object/array/named type): a nifasm-managed `(s)` stack
       # var, addressed by name — arkham does not register-allocate it. (No
@@ -230,6 +390,14 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
       let vi = b.an.vars.getOrDefault(name)
       if loc.kind == InReg and not vi.declInLoop:
         b.pendingFree.add (pos: vi.freeAfter, name: name)
+      if b.allocExprs:
+        if loc.kind != InReg: b.ra.exprUnsupported = true   # stack-homed var: v1 emitter gap
+        if hasValue:
+          # Destination-passing: allocate the initializer to compute directly into the
+          # local's home. The home is already taken from the pool (above), so the
+          # initializer's transient temps draw from what remains — matching execution.
+          var d = loc
+          allocValue(b, valCur, d)
 
 proc walk(b: var Builder; n: var Cursor) =
   case n.stmtKind
@@ -249,6 +417,25 @@ proc walk(b: var Builder; n: var Cursor) =
       while n.hasMore:
         walk(b, n)
         flushFree(b, b.posOf(n))
+  of RetS:
+    if b.allocExprs:
+      n.into:
+        if n.hasMore and n.kind != DotToken:
+          var d = regLoc(b.md.intRetReg, ScalarSlot)   # return value → the ABI ret reg
+          allocValue(b, n, d)
+        else:
+          while n.hasMore: skip n              # void return
+    else:
+      skip n
+  of CallS:
+    if b.allocExprs:
+      var d = dontCare                         # a statement call: result unused
+      allocValue(b, n, d)
+    else:
+      if n.kind == TagLit:
+        n.into:
+          while n.hasMore: walk(b, n)
+      else: inc n
   else:
     if n.kind == TagLit:
       n.into:
@@ -352,13 +539,17 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
 
 proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
                    prog: var Program; md: MachineDesc;
-                   presealed: set[Reg] = {}): RegAlloc =
+                   presealed: set[Reg] = {}; allocExprs = false): RegAlloc =
   ## Allocate storage for the params and locals of `procDecl`. `md` describes the
   ## target register file + ABI. `presealed` registers are reserved for the whole
   ## proc (never allocated/stolen). `prog` is taken by `var` because resolving a
-  ## cross-module type may load a module.
-  var b = Builder(buf: addr buf, an: addr an, prog: addr prog, md: md)
+  ## cross-module type may load a module. `allocExprs` (value-core rewrite) also
+  ## assigns `locs[pos]` to expressions — off by default so the legacy reactive
+  ## emitter sees the unchanged symbol-only `locs`.
+  var b = Builder(buf: addr buf, an: addr an, prog: addr prog, md: md,
+                  allocExprs: allocExprs)
   b.ra.locs = newSeq[Location](buf.len)
+  b.ra.aux = initTable[int, ExprAux]()
   b.ra.symPos = initTable[string, int]()
   b.ra.sealed = presealed
   for r in md.intTempRegs: b.freeVol.incl r
