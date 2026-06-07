@@ -3708,6 +3708,21 @@ proc condModeled2(g: var CodeGen; c: Cursor): bool =
   else:
     g.valModeled2(c)
 
+proc divModModeled2(g: var CodeGen; c: Cursor): bool =
+  ## A `(div|mod T a b)` the new emitter handles: integer operands that are
+  ## themselves modeled and not a nested div / call — so rax/rdx stay single-use
+  ## (no value live across the idiv). The allocator additionally bails (to legacy)
+  ## when rdx is a live parameter home (`divRemOccupied`).
+  if c.kind != TagLit or c.exprKind notin {DivC, ModC}: return false
+  var ok = true
+  var cc = c
+  cc.into:
+    skip cc                                             # result type
+    if cc.hasMore: (if not g.valModeled2(cc): ok = false); skip cc
+    if cc.hasMore: (if not g.valModeled2(cc): ok = false); skip cc
+    while cc.hasMore: skip cc
+  ok
+
 proc stmtModeled2(g: var CodeGen; c: Cursor): bool =
   case c.stmtKind
   of StmtsS, ScopeS:
@@ -3727,7 +3742,7 @@ proc stmtModeled2(g: var CodeGen; c: Cursor): bool =
       if s.kind in {AMem, AFloat} or not s.inRegClass: ok = false
       skip cc                                            # type
       if ok and cc.hasMore and cc.kind != DotToken:
-        if not (g.valModeled2(cc) or g.callModeled2(cc)): ok = false
+        if not (g.valModeled2(cc) or g.callModeled2(cc) or g.divModModeled2(cc)): ok = false
       while cc.hasMore: skip cc
     ok
   of RetS:
@@ -3735,7 +3750,7 @@ proc stmtModeled2(g: var CodeGen; c: Cursor): bool =
     var cc = c
     cc.into:
       if cc.hasMore and cc.kind != DotToken:
-        if not (g.valModeled2(cc) or g.callModeled2(cc)): ok = false
+        if not (g.valModeled2(cc) or g.callModeled2(cc) or g.divModModeled2(cc)): ok = false
       while cc.hasMore: skip cc
     ok
   of CallS: g.callModeled2(c)
@@ -3746,7 +3761,7 @@ proc stmtModeled2(g: var CodeGen; c: Cursor): bool =
       if cc.kind != Symbol: ok = false                  # complex lvalue → legacy
       elif g.lookupSym(symName(cc)).cat != scNone: ok = false  # a function-local only
       skip cc                                            # lhs
-      if cc.hasMore and not (g.valModeled2(cc) or g.callModeled2(cc)): ok = false
+      if cc.hasMore and not (g.valModeled2(cc) or g.callModeled2(cc) or g.divModModeled2(cc)): ok = false
       while cc.hasMore: skip cc
     ok
   of WhileS:
@@ -3894,6 +3909,36 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
   if hasResult and resLoc.kind == InReg and resLoc.r != RAX:
     g.movReg(resLoc.r, RAX)
 
+proc emitDivMod2(g: var CodeGen; c: Cursor) =
+  ## Emit x86 `idiv`/`div`: the allocator pinned the dividend to rax and the divisor
+  ## to a register; nifasm's `(idiv|div (rdx)(rax) src)` emits the cqo / rdx-zero
+  ## itself. The result (rax quotient / rdx remainder) is moved to its home if the
+  ## allocator did not place it there directly.
+  let pos = cursorToPosition(g.buf[], c)
+  let res = g.ra.locs[pos]
+  let wantRem = c.exprKind == ModC
+  var tc, divC, dvsC: Cursor
+  block:
+    var cc = c
+    cc.into:
+      tc = cc; skip cc                                  # result type
+      divC = cc; skip cc                                # dividend
+      dvsC = cc; skip cc                                # divisor
+      while cc.hasMore: skip cc
+  let signed = isSignedType(resolveType(g.prog, tc))
+  g.emitValue2(divC)                                    # dividend → rax (pinned)
+  g.emitValue2(dvsC)                                    # divisor → its register
+  let dvsLoc = g.ra.locs[cursorToPosition(g.buf[], dvsC)]
+  assert dvsLoc.kind == InReg, "arkham x64n: idiv divisor " & $dvsLoc.kind
+  let op = if signed: IdivX64 else: DivX64
+  g.ab.tree op:
+    g.ab.reg g.md.divRemReg                             # (rdx): high half / remainder
+    g.ab.reg g.md.intRetReg                             # (rax): low half / quotient
+    g.emReg dvsLoc.r                                    # divisor, by its bound name
+  if dvsLoc.isTemp: g.unbindTemp(dvsLoc.r)
+  let resReg = if wantRem: g.md.divRemReg else: g.md.intRetReg
+  if res.kind == InReg and res.r != resReg: g.movReg(res.r, resReg)
+
 proc emitValue2(g: var CodeGen; c: Cursor) =
   ## Ensure `c`'s value is materialized at its precomputed `locs[pos]`. A leaf whose
   ## location is a register is moved there (the allocator placed it via destination-
@@ -3918,6 +3963,7 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
   of TagLit:
     case c.exprKind
     of AddC, SubC, MulC, BitandC, BitorC, BitxorC, ShlC, ShrC: g.emitBin2(c)
+    of DivC, ModC: g.emitDivMod2(c)
     of CallC: g.emitCall2(c)
     else: raiseAssert "arkham x64n: emitValue2 expr " & $c.exprKind
   else: raiseAssert "arkham x64n: emitValue2 kind " & $c.kind

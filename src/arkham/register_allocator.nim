@@ -357,6 +357,46 @@ proc allocCond(b: var Builder; n: var Cursor) =
     allocValue(b, n, d)
     b.releaseTmp(d)
 
+proc divRemOccupied(b: var Builder): bool =
+  ## Is the x86 idiv-clobbered remainder register (rdx) the persistent home of some
+  ## symbol? Only a 3rd+ integer parameter of a leaf proc lands there (locals draw
+  ## from the temp/callee pools, never rdx). Conservative: a now-dead param still
+  ## shows its home, so this may bail a div to legacy that was in fact safe — fine
+  ## for v1 (correctness over coverage; legacy reactively evicts rdx anyway).
+  if b.md.divRemReg == NoReg: return false
+  for name, pos in b.ra.symPos:
+    let loc = b.ra.locs[pos]
+    if loc.kind == InReg and loc.r == b.md.divRemReg: return true
+  false
+
+proc allocDivMod(b: var Builder; n: var Cursor; dest: var Location) =
+  ## x86 `idiv`/`div`: dividend → rax, divisor → a register (no immediate form),
+  ## quotient → rax, remainder → rdx (clobbered). Modeled only when rdx is free
+  ## (`divRemOccupied`) — else bail to legacy, which reactively evicts rdx. The
+  ## result register (rax quotient or rdx remainder) is moved to `dest`, or `dest`
+  ## is left as that register when the caller pinned none.
+  let pos = b.posOf(n)
+  let wantRem = n.exprKind == ModC
+  if b.divRemOccupied(): b.ra.exprUnsupported = true
+  var aDest = regLoc(b.md.intRetReg, ScalarSlot)    # dividend → rax (fixed)
+  var dDest = needsReg(ScalarSlot)                   # divisor → some register
+  n.into:
+    skip n                                           # result type
+    allocValue(b, n, aDest)
+    allocValue(b, n, dDest)
+    while n.hasMore: skip n
+  # The divisor must not alias rax (the dividend) or rdx (clobbered). `reserveTmp`
+  # never hands those out; a symbol divisor homed there (a param) would — bail.
+  if dDest.kind == InReg and (dDest.r == b.md.intRetReg or dDest.r == b.md.divRemReg):
+    b.ra.exprUnsupported = true
+  b.releaseTmp(dDest)
+  let resReg = if wantRem: b.md.divRemReg else: b.md.intRetReg
+  case dest.kind
+  of Undef, NeedsReg, RegOrImm:
+    dest = regLoc(resReg, ScalarSlot, isTemp = true)
+  else: discard                                      # fixed dest: emitter moves result → it
+  b.ra.locs[pos] = dest
+
 proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
   let pos = b.posOf(n)
   case n.kind
@@ -372,6 +412,8 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
     case n.exprKind
     of AddC, SubC, MulC, BitandC, BitorC, BitxorC, ShlC, ShrC:
       allocBin(b, n, dest); return           # records locs[pos] itself
+    of DivC, ModC:
+      allocDivMod(b, n, dest); return        # records locs[pos] itself
     of CallC:
       allocCall(b, n, dest); return          # records locs[pos] itself
     else:

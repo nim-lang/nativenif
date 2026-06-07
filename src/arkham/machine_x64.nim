@@ -58,6 +58,7 @@ const
   x64Machine* = MachineDesc(
     arch: X86,
     intRetReg: RAX,
+    divRemReg: RDX,                  # idiv clobbers rdx (remainder / sign-extend high half)
     intArgRegs: @[RDI, RSI, RDX, RCX, R8, R9],
     floatArgRegs: @[F0, F1, F2, F3, F4, F5, F6, F7],
     intTempRegs: @[R10, R11],

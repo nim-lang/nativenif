@@ -48,6 +48,9 @@ type
     ## like x86-64 leaves the high slots unused).
     arch*: TargetArch                ## the ISA, for the few arch-specific walk branches
     intRetReg*: Reg                  ## integer/pointer return register (rax / x0 = R0)
+    divRemReg*: Reg                  ## x86 idiv's clobbered high-half / remainder reg
+                                     ## (rdx = R2); `NoReg` on ISAs without the constraint
+                                     ## (arm64 sdiv/msub use ordinary scratch)
     intArgRegs*: seq[Reg]            ## integer/pointer argument registers, ABI order
     floatArgRegs*: seq[FReg]         ## float argument registers, ABI order
     intTempRegs*: seq[Reg]           ## caller-saved scratch (call-free locals)

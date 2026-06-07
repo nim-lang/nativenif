@@ -59,6 +59,7 @@ const
   aarch64Machine* = MachineDesc(
     arch: Arm64,
     intRetReg: R0,
+    divRemReg: NoReg,                # aarch64 sdiv/msub use ordinary scratch — no fixed reg
     intArgRegs: @IntArgRegs,
     floatArgRegs: @FloatArgRegs,
     intTempRegs: @IntTempRegs,
