@@ -3626,6 +3626,32 @@ proc emitProcBody(g: var CodeGen; info: ProcInfo; declarative: bool) =
 # legacy reactive `emitProcBody` (per-proc opt-in via `procModeled2`). As coverage
 # grows the legacy path shrinks, then deletes.
 
+proc valModeled2(g: var CodeGen; c: Cursor): bool
+proc lvalModeled2(g: var CodeGen; c: Cursor): bool =
+  ## Is lvalue `c` an addressing target the v1 slice can emit (a load / store / addr)?
+  ## A function-local base symbol (stack var or reg pointer), a `dot` field over such
+  ## a base or a `deref`, or a pointer `deref` of a modeled value. (at/pat: later.)
+  case c.kind
+  of Symbol: g.lookupSym(symName(c)).cat == scNone     # a function-local base
+  of TagLit:
+    case c.exprKind
+    of DotC:
+      var ok = true
+      var cc = c
+      cc.into:
+        if cc.hasMore: (if not g.lvalModeled2(cc): ok = false); skip cc   # base
+        while cc.hasMore: skip cc
+      ok
+    of DerefC:
+      var ok = true
+      var cc = c
+      cc.into:
+        if cc.hasMore: (if not g.valModeled2(cc): ok = false); skip cc    # pointer
+        while cc.hasMore: skip cc
+      ok
+    else: false
+  else: false
+
 proc valModeled2(g: var CodeGen; c: Cursor): bool =
   ## Is value `c` within the new emitter's coverage? (Reads a copy; consumes nothing.)
   case c.kind
@@ -3640,6 +3666,14 @@ proc valModeled2(g: var CodeGen; c: Cursor): bool =
         skip cc                                          # result type
         if cc.hasMore: (if not g.valModeled2(cc): ok = false); skip cc   # lhs
         if cc.hasMore: (if not g.valModeled2(cc): ok = false); skip cc   # rhs
+        while cc.hasMore: skip cc
+      ok
+    of DerefC, DotC: g.lvalModeled2(c)                  # addressing read: load [addr]
+    of AddrC:
+      var ok = true
+      var cc = c
+      cc.into:
+        if cc.hasMore: (if not g.lvalModeled2(cc): ok = false)
         while cc.hasMore: skip cc
       ok
     else: false
@@ -3749,9 +3783,13 @@ proc stmtModeled2(g: var CodeGen; c: Cursor): bool =
     cc.into:
       skip cc; skip cc                                   # name, pragmas
       let s = slotOf(g.prog, cc)
-      if s.kind in {AMem, AFloat} or not s.inRegClass: ok = false
       skip cc                                            # type
-      if ok and cc.hasMore and cc.kind != DotToken:
+      let hasInit = cc.hasMore and cc.kind != DotToken
+      if s.kind == AFloat: ok = false                    # floats: later
+      elif s.kind == AMem:
+        if hasInit: ok = false                           # aggregate initializer: later slice
+      elif not s.inRegClass: ok = false
+      if ok and hasInit:
         # var-init is alias-safe for a comparison-as-value (a fresh home can't be an
         # operand) so `condModeled2` is allowed here, but NOT in asgn-rhs / call-args.
         if not (g.valModeled2(cc) or g.callModeled2(cc) or g.divModModeled2(cc) or
@@ -3772,8 +3810,9 @@ proc stmtModeled2(g: var CodeGen; c: Cursor): bool =
     var ok = true
     var cc = c
     cc.into:
-      if cc.kind != Symbol: ok = false                  # complex lvalue → legacy
-      elif g.lookupSym(symName(cc)).cat != scNone: ok = false  # a function-local only
+      if cc.kind == Symbol:
+        if g.lookupSym(symName(cc)).cat != scNone: ok = false  # a function-local only
+      elif not g.lvalModeled2(cc): ok = false           # complex lvalue (dot/deref store)
       skip cc                                            # lhs
       if cc.hasMore and not (g.valModeled2(cc) or g.callModeled2(cc) or g.divModModeled2(cc)): ok = false
       while cc.hasMore: skip cc
@@ -3856,6 +3895,8 @@ proc place2(g: var CodeGen; src: Location; dest: Reg) =
 proc emitValue2(g: var CodeGen; c: Cursor)
 proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool)
 proc emitCondValue2(g: var CodeGen; c: Cursor)
+proc emitMemLoad2(g: var CodeGen; c: Cursor)
+proc emitAddr2(g: var CodeGen; c: Cursor)
 
 proc emitBin2(g: var CodeGen; c: Cursor) =
   ## Emit a binary-arith node into its precomputed result register, replaying the
@@ -3982,9 +4023,102 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
     of AddC, SubC, MulC, BitandC, BitorC, BitxorC, ShlC, ShrC: g.emitBin2(c)
     of DivC, ModC: g.emitDivMod2(c)
     of EqC, NeqC, LtC, LeC, AndC, OrC, NotC: g.emitCondValue2(c)
+    of DerefC, DotC: g.emitMemLoad2(c)
+    of AddrC: g.emitAddr2(c)
     of CallC: g.emitCall2(c)
     else: raiseAssert "arkham x64n: emitValue2 expr " & $c.exprKind
   else: raiseAssert "arkham x64n: emitValue2 kind " & $c.kind
+
+proc emLvalAddr2(g: var CodeGen; c: Cursor) =
+  ## Emit the nifasm address sub-tree for lvalue `c` (the operand of a `(mem …)` /
+  ## `(lea …)`), reading any embedded value register from its pre-allocated `locs`.
+  ## v1 slice: a stack-var base (`(rsp) name`), a `dot` field over such a base or a
+  ## `deref`, and a pointer `deref` (`(cast (ptr pointee) ptrReg)`).
+  case c.kind
+  of Symbol:                                            # a stack-var base
+    g.ab.reg RSP
+    g.ab.sym symName(c)
+  of TagLit:
+    case c.exprKind
+    of DotC:
+      g.ab.tree DotX:
+        var cc = c
+        cc.into:
+          g.emLvalAddr2(cc); skip cc                    # base (stack var or deref)
+          g.ab.sym symName(cc); skip cc                 # field name
+          while cc.hasMore: skip cc
+    of DerefC:
+      var pointee = g.getType(c)                        # deref result = the pointee type
+      var cc = c
+      cc.into:
+        let pReg = g.ra.locs[cursorToPosition(g.buf[], cc)]
+        g.ab.tree CastX:
+          g.ab.ptrType:
+            if pointee.kind == Symbol: g.ab.sym symName(pointee)
+            else: g.genTypeBody(pointee)
+          g.emReg pReg.r                                # the pointer, by its bound name
+        while cc.hasMore: skip cc
+    else: raiseAssert "arkham x64n: emLvalAddr2 expr " & $c.exprKind
+  else: raiseAssert "arkham x64n: emLvalAddr2 kind " & $c.kind
+
+proc prematLval2(g: var CodeGen; c: Cursor) =
+  ## Materialize an lvalue's embedded values (a `deref` pointer, an index) into their
+  ## allocated registers BEFORE the consuming `(mem …)` / `(lea …)` tree opens (an
+  ## emit-inside-the-tree would corrupt it). For a symbol base this is a no-op.
+  if c.kind == TagLit:
+    case c.exprKind
+    of DotC:
+      var cc = c
+      cc.into:
+        g.prematLval2(cc)
+        while cc.hasMore: skip cc
+    of DerefC:
+      var cc = c
+      cc.into:
+        g.emitValue2(cc)                                # the pointer → its register
+        while cc.hasMore: skip cc
+    else: discard
+
+proc emitMemLoad2(g: var CodeGen; c: Cursor) =
+  ## Load the scalar at lvalue `c` into its pre-allocated result register:
+  ## `mov res, (mem <addr>)`.
+  let res = g.ra.locs[cursorToPosition(g.buf[], c)]
+  assert res.kind == InReg, "arkham x64n: mem-load result " & $res.kind
+  g.prematLval2(c)
+  if res.isTemp: g.bindTemp(res.r, res.typ)             # consumer unbinds
+  g.ab.tree MovX64:
+    g.emReg res.r
+    g.ab.tree MemX: g.emLvalAddr2(c)
+
+proc emitAddr2(g: var CodeGen; c: Cursor) =
+  ## `(addr lvalue)` → a pointer in the result register. `&(deref p) == p` (identity);
+  ## otherwise `lea res, <addr-of-lvalue>`.
+  let res = g.ra.locs[cursorToPosition(g.buf[], c)]
+  assert res.kind == InReg, "arkham x64n: addr result " & $res.kind
+  var lv: Cursor
+  block:
+    var cc = c
+    cc.into:
+      lv = cc; skip cc
+      while cc.hasMore: skip cc
+  if lv.kind == TagLit and lv.exprKind == DerefC:
+    # &(deref p) == p — produce the pointer directly into res
+    var p: Cursor
+    block:
+      var dd = lv
+      dd.into:
+        p = dd; skip dd
+        while dd.hasMore: skip dd
+    g.emitValue2(p)
+    let pLoc = g.ra.locs[cursorToPosition(g.buf[], p)]
+    if res.isTemp: g.bindTemp(res.r, res.typ)
+    g.place2(pLoc, res.r)
+  else:
+    g.prematLval2(lv)
+    if res.isTemp: g.bindTemp(res.r, res.typ)
+    g.ab.tree LeaX64:
+      g.emReg res.r
+      g.emLvalAddr2(lv)
 
 proc genVarDecl2(g: var CodeGen; c: Cursor) =
   var cc = c
@@ -3997,7 +4131,9 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
     let hasVal = cc.hasMore and cc.kind != DotToken
     case loc.kind
     of InReg: g.emRegLocalVar(nm, loc.r, typeCur)
-    of NamedStack: g.emTypedStackVar(nm, typeCur)
+    of NamedStack:
+      g.emTypedStackVar(nm, typeCur)
+      if typeCur.kind == Symbol: g.varType[nm] = symName(typeCur)  # aggregate field layout
     else: raiseAssert "arkham x64n: var home " & $loc.kind
     if hasVal:
       let valC = cc
@@ -4117,10 +4253,26 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
   of AsgnS:
     var cc = c
     cc.into:
-      let dst = g.ra.locationOfSym(symName(cc)); skip cc   # reg-homed local lvalue
-      g.emitValue2(cc)                                      # rhs computed into dst home
-      let v = g.ra.locs[cursorToPosition(g.buf[], cc)]
-      g.place2(v, dst.r)                                    # dest-passed ⇒ usually a no-op
+      if cc.kind == Symbol:
+        let dst = g.ra.locationOfSym(symName(cc)); skip cc # reg-homed local lvalue
+        g.emitValue2(cc)                                    # rhs computed into dst home
+        let v = g.ra.locs[cursorToPosition(g.buf[], cc)]
+        g.place2(v, dst.r)                                  # dest-passed ⇒ usually a no-op
+      else:
+        # A memory store through a complex lvalue (dot/deref): materialize the lvalue's
+        # embedded base regs, compute the rhs (reg / imm), then `mov (mem <addr>), rhs`.
+        let lhs = cc
+        g.prematLval2(lhs)
+        skip cc                                             # past the whole lhs subtree
+        g.emitValue2(cc)                                    # rhs value
+        let v = g.ra.locs[cursorToPosition(g.buf[], cc)]
+        g.ab.tree MovX64:
+          g.ab.tree MemX: g.emLvalAddr2(lhs)
+          case v.kind
+          of Imm: g.ab.intLit v.ival
+          of InReg: g.emReg v.r
+          else: raiseAssert "arkham x64n: store rhs " & $v.kind
+        if v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
       while cc.hasMore: skip cc
   of WhileS:
     let lStart = g.freshLabel()

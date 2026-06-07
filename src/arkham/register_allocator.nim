@@ -361,6 +361,31 @@ proc allocCond(b: var Builder; n: var Cursor) =
     allocValue(b, n, d)
     b.releaseTmp(d)
 
+proc allocLvalue2(b: var Builder; n: var Cursor) =
+  ## Walk an lvalue subtree (the target of a load / store / `addr`), allocating its
+  ## embedded VALUES — a `deref`'s pointer, a computed index — into registers (their
+  ## homes, recorded in `locs`); stack-var / field names and immediate indices need
+  ## no allocation. Advances `n` past the whole lvalue. v1 slice: stack-var field
+  ## access (`dot`) and pointer `deref` of a symbol; `at`/`pat`/computed bases bail.
+  case n.kind
+  of Symbol:
+    inc n                                    # a stack-var / pointer base name — no alloc
+  of TagLit:
+    case n.exprKind
+    of DotC:
+      n.into:
+        allocLvalue2(b, n)                   # base (a stack var, or a `deref`)
+        while n.hasMore: skip n              # field name (+ any extras)
+    of DerefC:
+      n.into:
+        var d = needsReg(ScalarSlot)
+        allocValue(b, n, d)                  # the pointer → a register (its home)
+        while n.hasMore: skip n
+    else:
+      b.ra.exprUnsupported = true; skip n    # at/pat/computed base: later slice
+  else:
+    inc n
+
 proc divRemOccupied(b: var Builder): bool =
   ## Is the x86 idiv-clobbered remainder register (rdx) the persistent home of some
   ## symbol? Only a 3rd+ integer parameter of a leaf proc lands there (locals draw
@@ -429,6 +454,31 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
       if dest.kind != InReg: b.ra.exprUnsupported = true
       let resDest = dest
       allocCond(b, n)                        # places operands; advances past the cond
+      b.ra.locs[pos] = resDest
+      return
+    of DerefC, DotC:
+      # An addressing expr in VALUE position → load `[addr]` into a register. The
+      # embedded base/index values are placed by allocLvalue2; the load lands in a
+      # fresh temp (or the dest-passed home / arg reg).
+      case dest.kind
+      of Undef, NeedsReg, RegOrImm: dest = b.reserveTmp(ScalarSlot)
+      else: discard
+      if dest.kind != InReg: b.ra.exprUnsupported = true
+      let resDest = dest
+      allocLvalue2(b, n)                      # embedded base/index regs; advances past
+      b.ra.locs[pos] = resDest
+      return
+    of AddrC:
+      # `(addr lvalue)` → a pointer in a register. Place any embedded base/index
+      # values of the lvalue; the result address lands in dest.
+      case dest.kind
+      of Undef, NeedsReg, RegOrImm: dest = b.reserveTmp(ScalarSlot)
+      else: discard
+      if dest.kind != InReg: b.ra.exprUnsupported = true
+      let resDest = dest
+      n.into:
+        allocLvalue2(b, n)
+        while n.hasMore: skip n
       b.ra.locs[pos] = resDest
       return
     of CallC:
@@ -528,17 +578,21 @@ proc walk(b: var Builder; n: var Cursor) =
   of AsgnS:
     if b.allocExprs:
       n.into:
-        # The lhs is the destination; the rhs computes directly into its home
-        # (destination-passing). Only a register-homed local lvalue is modeled;
-        # a stack home or a complex lvalue (dot/at/deref) bails to legacy.
-        var dest = dontCare
         if n.kind == Symbol:
-          dest = b.symLoc(symName(n))
+          # A register-homed local lvalue: destination-passing — the rhs computes
+          # directly into the lhs home.
+          var dest = b.symLoc(symName(n))
           if dest.kind != InReg: b.ra.exprUnsupported = true
+          skip n                               # lhs (not a value-read)
+          allocValue(b, n, dest)               # rhs → the lhs home
         else:
-          b.ra.exprUnsupported = true
-        skip n                                 # lhs (not a value-read)
-        allocValue(b, n, dest)                 # rhs → the lhs home
+          # A memory store through a complex lvalue (dot/deref): place the lvalue's
+          # embedded base/index regs, then the rhs into a REGISTER (nifasm has no
+          # immediate-to-memory `mov`, so an immediate is loaded into a temp first).
+          allocLvalue2(b, n)                   # lhs address operands; advances past lhs
+          var rdest = needsReg(ScalarSlot)
+          allocValue(b, n, rdest)              # rhs value → a register
+          b.releaseTmp(rdest)
         while n.hasMore: skip n
     else:
       n.into:
