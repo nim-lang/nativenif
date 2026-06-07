@@ -439,6 +439,16 @@ proc allocDivMod(b: var Builder; n: var Cursor; dest: var Location) =
   else: discard                                      # fixed dest: emitter moves result → it
   b.ra.locs[pos] = dest
 
+proc forceRegDest(b: var Builder; dest: var Location) =
+  ## Ensure a value's `dest` is a register: a `NeedsReg`/`RegOrImm` constraint becomes
+  ## a fresh temp typed as requested; `Undef`/`dontCare` a generic scalar temp; a fixed
+  ## reg is kept. A spilled temp (pool exhausted) marks the proc exprUnsupported.
+  case dest.kind
+  of NeedsReg, RegOrImm: dest = b.reserveTmp(dest.typ)
+  of Undef: dest = b.reserveTmp(ScalarSlot)
+  else: discard
+  if dest.kind != InReg: b.ra.exprUnsupported = true
+
 proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
   let pos = b.posOf(n)
   case n.kind
@@ -450,6 +460,8 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
     b.resolveDest(dest, immLoc(int64(ord(charLit(n))), ScalarSlot)); inc n
   of Symbol:
     b.resolveDest(dest, b.symLoc(symName(n))); inc n
+  of StrLit:
+    b.forceRegDest(dest); inc n                # string literal → a reg (lea of rodata)
   of TagLit:
     case n.exprKind
     of AddC, SubC, MulC, BitandC, BitorC, BitxorC, ShlC, ShrC:
@@ -509,6 +521,34 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
       return
     of CallC:
       allocCall(b, n, dest); return          # records locs[pos] itself
+    of NegC, BitnotC:
+      # Unary in-place op (`(neg T x)` / `(bitnot T x)`): the operand computes into the
+      # result register; the emitter applies neg/not in place.
+      b.forceRegDest(dest)
+      var res = dest
+      n.into:
+        skip n                               # result type
+        allocValue(b, n, res)                # operand → res (in place)
+        while n.hasMore: skip n
+      b.ra.locs[pos] = res
+      return
+    of SufC, ParC:
+      # Wrapper `(suf v "type")` / `(par v)`: unwrap; `dest` passes through to the value.
+      n.into:
+        allocValue(b, n, dest)
+        while n.hasMore: skip n
+      b.ra.locs[pos] = dest
+      return
+    of TrueC:
+      b.resolveDest(dest, immLoc(1, ScalarSlot)); skip n
+    of FalseC, NilC:
+      b.resolveDest(dest, immLoc(0, ScalarSlot)); skip n
+    of SizeofC:
+      var t = n; var sz = 0'i64
+      t.into:
+        sz = typeSizeAlign(b.prog[], t)[0].int64
+        while t.hasMore: skip t
+      b.resolveDest(dest, immLoc(sz, ScalarSlot)); skip n
     else:
       # not modeled yet: reserve a register for the result and skip the subtree
       # (the legacy emitter still handles these forms; no var decls nest inside

@@ -3675,10 +3675,19 @@ proc lvalModeled2(g: var CodeGen; c: Cursor): bool =
 proc valModeled2(g: var CodeGen; c: Cursor): bool =
   ## Is value `c` within the new emitter's coverage? (Reads a copy; consumes nothing.)
   case c.kind
-  of IntLit, UIntLit, CharLit: true
+  of IntLit, UIntLit, CharLit, StrLit: true
   of Symbol: g.lookupSym(symName(c)).cat == scNone     # a function-local only (no global/proc)
   of TagLit:
     case c.exprKind
+    of TrueC, FalseC, NilC, SizeofC: true              # compile-time / immediate leaves
+    of NegC, BitnotC, SufC, ParC:                      # unary in-place / wrapper
+      var ok = true
+      var cc = c
+      cc.into:
+        if c.exprKind in {NegC, BitnotC}: skip cc       # result type
+        if cc.hasMore: (if not g.valModeled2(cc): ok = false); skip cc
+        while cc.hasMore: skip cc
+      ok
     of AddC, SubC, MulC, BitandC, BitorC, BitxorC, ShlC, ShrC:
       var ok = true
       var cc = c
@@ -4050,6 +4059,12 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
     if dst.kind == InReg: g.movImm(dst.r, int64(ord(charLit(c))))
   of Symbol:
     if dst.kind == InReg: g.place2(g.ra.locationOfSym(symName(c)), dst.r)
+  of StrLit:                                            # string literal → rodata + RIP lea
+    if dst.kind == InReg:
+      let nm = "msg." & $g.rodata.len
+      g.rodata.add (nm, strVal(c))
+      if dst.isTemp: g.bindTemp(dst.r, dst.typ)
+      g.ab.tree LeaX64: (g.emReg dst.r; g.ab.sym nm)
   of TagLit:
     case c.exprKind
     of AddC, SubC, MulC, BitandC, BitorC, BitxorC, ShlC, ShrC: g.emitBin2(c)
@@ -4059,6 +4074,44 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
     of AddrC: g.emitAddr2(c)
     of CastC, ConvC: g.emitCast2(c)
     of CallC: g.emitCall2(c)
+    of NegC, BitnotC:                                   # unary in-place: operand in res, then op
+      var inner: Cursor
+      block:
+        var cc = c
+        cc.into:
+          skip cc                                       # result type
+          inner = cc; skip cc
+          while cc.hasMore: skip cc
+      g.emitValue2(inner)
+      let res = g.ra.locs[cursorToPosition(g.buf[], c)]
+      let iv = g.ra.locs[cursorToPosition(g.buf[], inner)]
+      if res.kind == InReg:
+        if res.isTemp and (iv.kind != InReg or iv.r != res.r): g.bindTemp(res.r, res.typ)
+        if iv.kind == InReg and iv.r != res.r: g.movReg(res.r, iv.r)
+        if c.exprKind == NegC:
+          g.ab.tree NegX64: g.emReg res.r
+        else:
+          g.ab.tree NotX64: g.emReg res.r
+    of SufC, ParC:                                      # wrapper → the inner value
+      var inner: Cursor
+      block:
+        var cc = c
+        cc.into:
+          inner = cc; skip cc
+          while cc.hasMore: skip cc
+      g.emitValue2(inner)
+    of TrueC:
+      if dst.kind == InReg: (if dst.isTemp: g.bindTemp(dst.r, dst.typ)); g.movImm(dst.r, 1)
+    of FalseC, NilC:
+      if dst.kind == InReg: (if dst.isTemp: g.bindTemp(dst.r, dst.typ)); g.movImm(dst.r, 0)
+    of SizeofC:
+      if dst.kind == InReg:
+        var t = c; var sz = 0'i64
+        t.into:
+          sz = typeSizeAlign(g.prog, t)[0].int64
+          while t.hasMore: skip t
+        if dst.isTemp: g.bindTemp(dst.r, dst.typ)
+        g.movImm(dst.r, sz)
     else: raiseAssert "arkham x64n: emitValue2 expr " & $c.exprKind
   else: raiseAssert "arkham x64n: emitValue2 kind " & $c.kind
 
