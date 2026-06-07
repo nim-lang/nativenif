@@ -3659,6 +3659,16 @@ proc lvalModeled2(g: var CodeGen; c: Cursor): bool =
           skip cc
         while cc.hasMore: skip cc
       ok
+    of PatC:
+      var ok = true
+      var cc = c
+      cc.into:
+        if cc.hasMore: (if not g.valModeled2(cc): ok = false); skip cc    # pointer
+        if cc.hasMore:
+          if cc.kind notin {IntLit, UIntLit}: ok = false                 # immediate index (slice 3)
+          skip cc
+        while cc.hasMore: skip cc
+      ok
     else: false
   else: false
 
@@ -3678,12 +3688,23 @@ proc valModeled2(g: var CodeGen; c: Cursor): bool =
         if cc.hasMore: (if not g.valModeled2(cc): ok = false); skip cc   # rhs
         while cc.hasMore: skip cc
       ok
-    of DerefC, DotC, AtC: g.lvalModeled2(c)             # addressing read: load [addr]
+    of DerefC, DotC, AtC, PatC: g.lvalModeled2(c)       # addressing read: load [addr]
     of AddrC:
       var ok = true
       var cc = c
       cc.into:
         if cc.hasMore: (if not g.lvalModeled2(cc): ok = false)
+        while cc.hasMore: skip cc
+      ok
+    of CastC, ConvC:
+      # A pure pointer reinterpret (no width change): the target must be a pointer
+      # type, the inner a modeled value. Int-widening casts: later slice.
+      var ok = true
+      var cc = c
+      cc.into:
+        if not isPtrType(resolveType(g.prog, cc)): ok = false   # target type
+        skip cc
+        if ok and cc.hasMore: (if not g.valModeled2(cc): ok = false); skip cc   # inner
         while cc.hasMore: skip cc
       ok
     else: false
@@ -3907,6 +3928,7 @@ proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool)
 proc emitCondValue2(g: var CodeGen; c: Cursor)
 proc emitMemLoad2(g: var CodeGen; c: Cursor)
 proc emitAddr2(g: var CodeGen; c: Cursor)
+proc emitCast2(g: var CodeGen; c: Cursor)
 
 proc emitBin2(g: var CodeGen; c: Cursor) =
   ## Emit a binary-arith node into its precomputed result register, replaying the
@@ -4033,8 +4055,9 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
     of AddC, SubC, MulC, BitandC, BitorC, BitxorC, ShlC, ShrC: g.emitBin2(c)
     of DivC, ModC: g.emitDivMod2(c)
     of EqC, NeqC, LtC, LeC, AndC, OrC, NotC: g.emitCondValue2(c)
-    of DerefC, DotC, AtC: g.emitMemLoad2(c)
+    of DerefC, DotC, AtC, PatC: g.emitMemLoad2(c)
     of AddrC: g.emitAddr2(c)
+    of CastC, ConvC: g.emitCast2(c)
     of CallC: g.emitCall2(c)
     else: raiseAssert "arkham x64n: emitValue2 expr " & $c.exprKind
   else: raiseAssert "arkham x64n: emitValue2 kind " & $c.kind
@@ -4079,6 +4102,24 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
             else: g.genTypeBody(pointee)
           g.emReg pReg.r                                # the pointer, by its bound name
         while cc.hasMore: skip cc
+    of PatC:                                            # pointer index: (at (cast (aptr E) p) idx)
+      var elem = g.getType(c)                           # element / pointee type
+      g.ab.tree AtX:
+        var cc = c
+        cc.into:
+          let pReg = g.ra.locs[cursorToPosition(g.buf[], cc)]
+          g.ab.tree CastX:
+            g.ab.aptrType:
+              if elem.kind == Symbol: g.ab.sym symName(elem)
+              else: g.genTypeBody(elem)
+            g.emReg pReg.r                              # the pointer, by its bound name
+          skip cc                                       # past pointer
+          case cc.kind                                  # immediate index
+          of IntLit: g.ab.intLit intVal(cc)
+          of UIntLit: g.ab.intLit cast[int64](uintVal(cc))
+          else: raiseAssert "arkham x64n: pat index not immediate"
+          skip cc
+          while cc.hasMore: skip cc
     else: raiseAssert "arkham x64n: emLvalAddr2 expr " & $c.exprKind
   else: raiseAssert "arkham x64n: emLvalAddr2 kind " & $c.kind
 
@@ -4103,6 +4144,31 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
       cc.into:
         g.prematLval2(cc)                               # base; immediate index needs none
         while cc.hasMore: skip cc
+    of PatC:
+      var cc = c
+      cc.into:
+        g.emitValue2(cc)                                # the pointer → its register
+        while cc.hasMore: skip cc
+    else: discard
+
+proc unbindLvalTemps2(g: var CodeGen; c: Cursor) =
+  ## Release any scratch temp an lvalue's embedded value was loaded into (e.g. a
+  ## stack-homed pointer reloaded for a `deref`/`pat`), AFTER the consuming
+  ## (mem …)/(lea …) instruction. A reg-homed base sits in its own home (not a temp)
+  ## ⇒ no-op. The load/store RESULT temp is separate (the consumer unbinds it).
+  if c.kind == TagLit:
+    case c.exprKind
+    of DotC, AtC:
+      var cc = c
+      cc.into:
+        g.unbindLvalTemps2(cc)                          # base
+        while cc.hasMore: skip cc
+    of DerefC, PatC:
+      var cc = c
+      cc.into:
+        let ploc = g.ra.locs[cursorToPosition(g.buf[], cc)]
+        if ploc.kind == InReg and ploc.isTemp: g.unbindTemp(ploc.r)
+        while cc.hasMore: skip cc
     else: discard
 
 proc emitMemLoad2(g: var CodeGen; c: Cursor) =
@@ -4115,6 +4181,7 @@ proc emitMemLoad2(g: var CodeGen; c: Cursor) =
   g.ab.tree MovX64:
     g.emReg res.r
     g.ab.tree MemX: g.emLvalAddr2(c)
+  g.unbindLvalTemps2(c)                                  # release embedded base/index temps
 
 proc emitAddr2(g: var CodeGen; c: Cursor) =
   ## `(addr lvalue)` → a pointer in the result register. `&(deref p) == p` (identity);
@@ -4139,12 +4206,32 @@ proc emitAddr2(g: var CodeGen; c: Cursor) =
     let pLoc = g.ra.locs[cursorToPosition(g.buf[], p)]
     if res.isTemp: g.bindTemp(res.r, res.typ)
     g.place2(pLoc, res.r)
+    if pLoc.kind == InReg and pLoc.isTemp and pLoc.r != res.r: g.unbindTemp(pLoc.r)
   else:
     g.prematLval2(lv)
     if res.isTemp: g.bindTemp(res.r, res.typ)
     g.ab.tree LeaX64:
       g.emReg res.r
       g.emLvalAddr2(lv)
+    g.unbindLvalTemps2(lv)                               # release embedded base/index temps
+
+proc emitCast2(g: var CodeGen; c: Cursor) =
+  ## A pointer cast / conv (gated to pure reinterprets): the inner value was placed in
+  ## the cast's result location (dest-passing), so just emit it — the type change is
+  ## free. `res.r != inner.r` only when the inner could not dest-pass; then move it.
+  var inner: Cursor
+  block:
+    var cc = c
+    cc.into:
+      skip cc                                            # target type
+      inner = cc; skip cc
+      while cc.hasMore: skip cc
+  g.emitValue2(inner)
+  let res = g.ra.locs[cursorToPosition(g.buf[], c)]
+  let iv = g.ra.locs[cursorToPosition(g.buf[], inner)]
+  if res.kind == InReg and iv.kind == InReg and res.r != iv.r:
+    if res.isTemp: g.bindTemp(res.r, res.typ)
+    g.place2(iv, res.r)
 
 proc genVarDecl2(g: var CodeGen; c: Cursor) =
   var cc = c
@@ -4299,6 +4386,7 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
           of InReg: g.emReg v.r
           else: raiseAssert "arkham x64n: store rhs " & $v.kind
         if v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
+        g.unbindLvalTemps2(lhs)                          # release embedded base/index temps
       while cc.hasMore: skip cc
   of WhileS:
     let lStart = g.freshLabel()

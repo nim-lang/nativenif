@@ -387,8 +387,15 @@ proc allocLvalue2(b: var Builder; n: var Cursor) =
         if n.kind in {IntLit, UIntLit}: skip n   # immediate index — folds, no scratch
         else: (b.ra.exprUnsupported = true; skip n)  # register index: later slice
         while n.hasMore: skip n
+    of PatC:
+      n.into:
+        var d = needsReg(ScalarSlot)
+        allocValue(b, n, d)                  # the pointer → a register (its home)
+        if n.kind in {IntLit, UIntLit}: skip n   # immediate index
+        else: (b.ra.exprUnsupported = true; skip n)  # register index: later slice
+        while n.hasMore: skip n
     else:
-      b.ra.exprUnsupported = true; skip n    # pat / computed base: later slice
+      b.ra.exprUnsupported = true; skip n    # computed base: later slice
   else:
     inc n
 
@@ -462,7 +469,16 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
       allocCond(b, n)                        # places operands; advances past the cond
       b.ra.locs[pos] = resDest
       return
-    of DerefC, DotC, AtC:
+    of CastC, ConvC:
+      # A pointer cast/conv (gated to pure reinterprets — no width change): the inner
+      # value computes straight into `dest`; the type change is free.
+      n.into:
+        skip n                                 # target type
+        allocValue(b, n, dest)                 # inner → dest (identity)
+        while n.hasMore: skip n
+      b.ra.locs[pos] = dest
+      return
+    of DerefC, DotC, AtC, PatC:
       # An addressing expr in VALUE position → load `[addr]` into a register. The
       # embedded base/index values are placed by allocLvalue2; the load lands in a
       # fresh temp (or the dest-passed home / arg reg).
