@@ -3773,6 +3773,29 @@ proc smallCmpImm(c: Cursor): bool =
   of UIntLit: (let v = cast[int64](uintVal(c)); v >= 0 and v <= 0xFFFF)
   else: true
 
+proc caseBranchValSmall(c: Cursor): bool =
+  ## A `case` BranchValue the new emitter's range tests can fold into `cmp` without a
+  ## scratch register — a small non-negative integer/char literal (same window as
+  ## `smallCmpImm`). Symbol enum consts / wrapped forms bail the proc to legacy.
+  case c.kind
+  of IntLit: (let v = intVal(c); v >= 0 and v <= 0xFFFF)
+  of UIntLit: (let v = cast[int64](uintVal(c)); v >= 0 and v <= 0xFFFF)
+  of CharLit: (let v = int64(ord(charLit(c))); v >= 0 and v <= 0xFFFF)
+  else: false
+
+proc caseRangeModeled(c: Cursor): bool =
+  ## A BranchRange of a `case` `of`: `(range lo hi)` of small literals, or a single
+  ## small literal. (Avoids `branchImm`, which asserts on unsupported forms.)
+  if c.kind == TagLit and c.substructureKind == RangeU:
+    var ok = true
+    var cc = c
+    cc.into:
+      while cc.hasMore:
+        if not caseBranchValSmall(cc): ok = false
+        skip cc
+    ok
+  else: caseBranchValSmall(c)
+
 proc condModeled2(g: var CodeGen; c: Cursor): bool =
   ## A branch condition the new emitter handles: a comparison (`eq`/`neq`/`lt`/`le`)
   ## over modeled, fold-able operands; an `and`/`or`/`not` short-circuit tree over
@@ -3903,6 +3926,38 @@ proc stmtModeled2(g: var CodeGen; c: Cursor): bool =
         skip cc
     ok
   of BreakS: true                                       # a jump to the loop-exit label
+  of CaseS:
+    var ok = true
+    var cc = c
+    cc.into:
+      if cc.hasMore:                                     # selector
+        if not g.valModeled2(cc): ok = false
+        skip cc
+      while cc.hasMore:
+        case cc.substructureKind
+        of OfU:
+          var branch = cc
+          branch.into:
+            if branch.substructureKind == RangesU:
+              var ranges = branch
+              ranges.into:
+                while ranges.hasMore:
+                  if not caseRangeModeled(ranges): ok = false   # small-imm bounds only
+                  skip ranges
+            else: ok = false
+            skip branch                                  # past (ranges …)
+            while branch.hasMore:
+              if not g.stmtModeled2(branch): ok = false  # branch body
+              skip branch
+        of ElseU:
+          var eb = cc
+          eb.into:
+            while eb.hasMore:
+              if not g.stmtModeled2(eb): ok = false
+              skip eb
+        else: ok = false
+        skip cc
+    ok
   else: false
 
 proc procModeled2(g: var CodeGen; decl: Cursor): bool =
@@ -4459,6 +4514,25 @@ proc emitCondValue2(g: var CodeGen; c: Cursor) =
   g.movImm(res.r, 0)
   g.emLab(lEnd)
 
+proc emitCaseTest2(g: var CodeGen; selReg: Reg; c: var Cursor; lBody: string; signed: bool) =
+  ## One `case` BranchRange against `selReg`; jump to `lBody` on a match. The gate
+  ## (`caseRangeModeled`) guarantees small-immediate bounds, so every `cmp` folds the
+  ## bound inline (no scratch register — the pure emitter cannot borrow one).
+  if c.kind == TagLit and c.substructureKind == RangeU:
+    c.into:
+      let lo = branchImm(c)
+      let hi = branchImm(c)
+      let lSkip = g.freshLabel()                        # match iff lo <= sel <= hi
+      g.ab.tree CmpX64: (g.emReg selReg; g.ab.intLit lo)
+      g.emJcc(if signed: JlX64 else: JbX64, lSkip)
+      g.ab.tree CmpX64: (g.emReg selReg; g.ab.intLit hi)
+      g.emJcc(if signed: JgX64 else: JaX64, lSkip)
+      g.emJmp(lBody)
+      g.emLab(lSkip)
+  else:
+    g.ab.tree CmpX64: (g.emReg selReg; g.ab.intLit branchImm(c))
+    g.emJcc(JeX64, lBody)
+
 proc genStmt2(g: var CodeGen; c: Cursor) =
   case c.stmtKind
   of StmtsS:
@@ -4580,6 +4654,48 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         g.place2(g.ra.locs[cursorToPosition(g.buf[], cc)], g.md.intRetReg)
         # epilogue (framePop + ret) is emitted by emitProcBody2's terminator
       while cc.hasMore: skip cc
+  of CaseS:
+    # `(case Expr (of (ranges BranchRange+) StmtList)* (else StmtList)?)`. Mirrors the
+    # legacy genCase: selector → a register live across ALL range tests; a non-match
+    # falls through to else (or the end); bodies are emitted AFTER the test chain, so
+    # each ends in a jmp to lEnd. (NIFC `case` has no fall-through.)
+    let lEnd = g.freshLabel()
+    var cc = c
+    cc.into:
+      let selC = cc
+      let signed = not g.cmpOperandUnsigned(selC)
+      g.emitValue2(cc); skip cc                          # selector → its register
+      let selLoc = g.ra.locs[cursorToPosition(g.buf[], selC)]
+      assert selLoc.kind == InReg, "arkham x64n: case selector " & $selLoc.kind
+      let selReg = selLoc.r
+      var bodies: seq[(string, Cursor)] = @[]
+      var elseBody = cc
+      var hasElse = false
+      while cc.hasMore:                                   # emit every of-branch test chain
+        case cc.substructureKind
+        of OfU:
+          let lBody = g.freshLabel()
+          var branch = cc
+          skip cc
+          branch.into:
+            branch.into:                                  # into (ranges …)
+              while branch.hasMore: g.emitCaseTest2(selReg, branch, lBody, signed)
+            bodies.add (lBody, branch)                    # branch now at the body stmts
+            skip branch                                   # drain past the body
+        of ElseU:
+          elseBody = cc; hasElse = true; skip cc
+        else: skip cc
+      if selLoc.isTemp: g.unbindTemp(selReg)              # selector dead after the tests
+      if hasElse:
+        var e = elseBody
+        e.into:
+          while e.hasMore: (g.genStmt2(e); skip e)
+      g.emJmp(lEnd)
+      for (lBody, bc) in bodies:
+        g.emLab(lBody)
+        g.genStmt2(bc)                                    # body (a stmts node)
+        g.emJmp(lEnd)
+    g.emLab(lEnd)
   else: raiseAssert "arkham x64n: genStmt2 " & $c.stmtKind
 
 proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool) =

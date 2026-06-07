@@ -735,6 +735,25 @@ proc walk(b: var Builder; n: var Cursor) =
     else:
       n.into:
         while n.hasMore: walk(b, n)
+  of CaseS:
+    if b.allocExprs:
+      n.into:
+        var sel = needsReg(ScalarSlot)
+        allocValue(b, n, sel)                  # selector → a register (live across all tests)
+        while n.hasMore:
+          case n.substructureKind
+          of OfU:
+            n.into:
+              skip n                            # (ranges …) — immediate bounds, no alloc
+              while n.hasMore: walk(b, n)       # branch body
+          of ElseU:
+            n.into:
+              while n.hasMore: walk(b, n)
+          else: skip n
+        b.releaseTmp(sel)                       # the selector is dead after the tests
+    else:
+      n.into:
+        while n.hasMore: walk(b, n)
   else:
     if n.kind == TagLit:
       n.into:
