@@ -394,14 +394,18 @@ proc allocLvalue2(b: var Builder; n: var Cursor) =
       n.into:
         allocLvalue2(b, n)                   # base (a stack array, or a deref)
         if n.kind in {IntLit, UIntLit}: skip n   # immediate index — folds, no scratch
-        else: (b.ra.exprUnsupported = true; skip n)  # register index: later slice
+        else:
+          var idx = needsReg(ScalarSlot)
+          allocValue(b, n, idx)             # register index → a register (folds via scale)
         while n.hasMore: skip n
     of PatC:
       n.into:
         var d = needsReg(ScalarSlot)
         allocValue(b, n, d)                  # the pointer → a register (its home)
         if n.kind in {IntLit, UIntLit}: skip n   # immediate index
-        else: (b.ra.exprUnsupported = true; skip n)  # register index: later slice
+        else:
+          var idx = needsReg(ScalarSlot)
+          allocValue(b, n, idx)             # register index → a register (folds via scale)
         while n.hasMore: skip n
     else:
       b.ra.exprUnsupported = true; skip n    # computed base: later slice

@@ -3655,7 +3655,9 @@ proc lvalModeled2(g: var CodeGen; c: Cursor): bool =
       cc.into:
         if cc.hasMore: (if not g.lvalModeled2(cc): ok = false); skip cc   # array base
         if cc.hasMore:
-          if cc.kind notin {IntLit, UIntLit}: ok = false                 # immediate index (slice 2)
+          if cc.kind notin {IntLit, UIntLit}:                            # register index
+            if not g.valModeled2(cc): ok = false
+            elif g.atNeedsScratch(c): ok = false                         # non-pow2 stride: later slice
           skip cc
         while cc.hasMore: skip cc
       ok
@@ -3665,7 +3667,9 @@ proc lvalModeled2(g: var CodeGen; c: Cursor): bool =
       cc.into:
         if cc.hasMore: (if not g.valModeled2(cc): ok = false); skip cc    # pointer
         if cc.hasMore:
-          if cc.kind notin {IntLit, UIntLit}: ok = false                 # immediate index (slice 3)
+          if cc.kind notin {IntLit, UIntLit}:                            # register index
+            if not g.valModeled2(cc): ok = false
+            elif g.atNeedsScratch(c): ok = false                         # non-pow2 stride: later slice
           skip cc
         while cc.hasMore: skip cc
       ok
@@ -4153,10 +4157,11 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
         var cc = c
         cc.into:
           g.emLvalAddr2(cc); skip cc                    # base (stack array)
-          case cc.kind                                  # immediate index (nifasm scales it)
+          case cc.kind                                  # index (nifasm scales it)
           of IntLit: g.ab.intLit intVal(cc)
           of UIntLit: g.ab.intLit cast[int64](uintVal(cc))
-          else: raiseAssert "arkham x64n: at index not immediate"
+          else:                                         # register index (pre-loaded by premat)
+            g.emReg g.ra.locs[cursorToPosition(g.buf[], cc)].r
           skip cc
           while cc.hasMore: skip cc
     of DerefC:
@@ -4182,10 +4187,11 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
               else: g.genTypeBody(elem)
             g.emReg pReg.r                              # the pointer, by its bound name
           skip cc                                       # past pointer
-          case cc.kind                                  # immediate index
+          case cc.kind                                  # index
           of IntLit: g.ab.intLit intVal(cc)
           of UIntLit: g.ab.intLit cast[int64](uintVal(cc))
-          else: raiseAssert "arkham x64n: pat index not immediate"
+          else:                                         # register index (pre-loaded by premat)
+            g.emReg g.ra.locs[cursorToPosition(g.buf[], cc)].r
           skip cc
           while cc.hasMore: skip cc
     else: raiseAssert "arkham x64n: emLvalAddr2 expr " & $c.exprKind
@@ -4210,12 +4216,14 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
     of AtC:
       var cc = c
       cc.into:
-        g.prematLval2(cc)                               # base; immediate index needs none
+        g.prematLval2(cc); skip cc                      # base
+        if cc.kind notin {IntLit, UIntLit}: g.emitValue2(cc)  # register index → its reg
         while cc.hasMore: skip cc
     of PatC:
       var cc = c
       cc.into:
-        g.emitValue2(cc)                                # the pointer → its register
+        g.emitValue2(cc); skip cc                       # the pointer → its register
+        if cc.kind notin {IntLit, UIntLit}: g.emitValue2(cc)  # register index → its reg
         while cc.hasMore: skip cc
     else: discard
 
@@ -4226,16 +4234,34 @@ proc unbindLvalTemps2(g: var CodeGen; c: Cursor) =
   ## ⇒ no-op. The load/store RESULT temp is separate (the consumer unbinds it).
   if c.kind == TagLit:
     case c.exprKind
-    of DotC, AtC:
+    of DotC:
       var cc = c
       cc.into:
         g.unbindLvalTemps2(cc)                          # base
         while cc.hasMore: skip cc
-    of DerefC, PatC:
+    of AtC:
+      var cc = c
+      cc.into:
+        g.unbindLvalTemps2(cc); skip cc                 # base
+        if cc.kind notin {IntLit, UIntLit}:             # register index temp
+          let il = g.ra.locs[cursorToPosition(g.buf[], cc)]
+          if il.kind == InReg and il.isTemp: g.unbindTemp(il.r)
+        while cc.hasMore: skip cc
+    of DerefC:
       var cc = c
       cc.into:
         let ploc = g.ra.locs[cursorToPosition(g.buf[], cc)]
         if ploc.kind == InReg and ploc.isTemp: g.unbindTemp(ploc.r)
+        while cc.hasMore: skip cc
+    of PatC:
+      var cc = c
+      cc.into:
+        let ploc = g.ra.locs[cursorToPosition(g.buf[], cc)]
+        if ploc.kind == InReg and ploc.isTemp: g.unbindTemp(ploc.r)
+        skip cc                                          # pointer
+        if cc.kind notin {IntLit, UIntLit}:             # register index temp
+          let il = g.ra.locs[cursorToPosition(g.buf[], cc)]
+          if il.kind == InReg and il.isTemp: g.unbindTemp(il.r)
         while cc.hasMore: skip cc
     else: discard
 

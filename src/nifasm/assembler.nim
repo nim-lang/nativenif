@@ -2190,7 +2190,14 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperandA64(n, ctx)
     if dest.kind == okMem: error("lea destination must be a register", n)
     if op.kind != okMem: error("lea source must be a memory operand", n)
-    arm64.emitAddImm(ctx.buf.data, dest.reg, op.mem.base, uint16(op.mem.offset))
+    if op.mem.hasIndex:
+      # `add dest, base, index, lsl #shift` (+ displacement) — an indexed address
+      # (e.g. `(at base regIdx)`) folds its index into the computed pointer.
+      arm64.emitAddShifted(ctx.buf.data, dest.reg, op.mem.base, op.mem.index, uint8(op.mem.shift))
+      if op.mem.offset != 0:
+        arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.mem.offset))
+    else:
+      arm64.emitAddImm(ctx.buf.data, dest.reg, op.mem.base, uint16(op.mem.offset))
 
   of AdrA64:
     inc n
