@@ -610,12 +610,24 @@ proc walk(b: var Builder; n: var Cursor) =
     if b.allocExprs:
       n.into:
         if n.kind == Symbol:
-          # A register-homed local lvalue: destination-passing — the rhs computes
-          # directly into the lhs home.
-          var dest = b.symLoc(symName(n))
-          if dest.kind != InReg: b.ra.exprUnsupported = true
+          let home = b.symLoc(symName(n))
           skip n                               # lhs (not a value-read)
-          allocValue(b, n, dest)               # rhs → the lhs home
+          if home.kind == InReg:
+            # A register-homed local: destination-passing — the rhs computes directly
+            # into the lhs home.
+            var dest = home
+            allocValue(b, n, dest)
+          elif home.kind == NamedStack and home.typ.kind != AMem:
+            # A stack-homed scalar local: compute the rhs into a register; the emitter
+            # stores it to the `(s)` slot. (An aggregate `(s)` slot needs a struct
+            # copy, not a scalar mov — bail to legacy.)
+            var d = needsReg(home.typ)
+            allocValue(b, n, d)
+            b.releaseTmp(d)
+          else:
+            b.ra.exprUnsupported = true        # aggregate / other lvalue store: legacy
+            var t = dontCare
+            allocValue(b, n, t)
         else:
           # A memory store through a complex lvalue (dot/deref): place the lvalue's
           # embedded base/index regs, then the rhs into a REGISTER (nifasm has no

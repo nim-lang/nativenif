@@ -4368,10 +4368,17 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
     var cc = c
     cc.into:
       if cc.kind == Symbol:
-        let dst = g.ra.locationOfSym(symName(cc)); skip cc # reg-homed local lvalue
-        g.emitValue2(cc)                                    # rhs computed into dst home
+        let dst = g.ra.locationOfSym(symName(cc)); skip cc # local lvalue (reg or `(s)` slot)
+        g.emitValue2(cc)                                    # rhs computed into a reg / dst home
         let v = g.ra.locs[cursorToPosition(g.buf[], cc)]
-        g.place2(v, dst.r)                                  # dest-passed ⇒ usually a no-op
+        case dst.kind
+        of InReg: g.place2(v, dst.r)                        # dest-passed ⇒ usually a no-op
+        of NamedStack:                                      # stack-homed scalar: store + free
+          if v.kind == InReg:
+            g.emitStoreLoc(dst, v.r)
+            if v.isTemp: g.unbindTemp(v.r)
+          else: raiseAssert "arkham x64n: stack asgn rhs " & $v.kind
+        else: raiseAssert "arkham x64n: asgn lhs home " & $dst.kind
       else:
         # A memory store through a complex lvalue (dot/deref): materialize the lvalue's
         # embedded base regs, compute the rhs (reg / imm), then `mov (mem <addr>), rhs`.
