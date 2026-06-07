@@ -3857,7 +3857,7 @@ proc stmtModeled2(g: var CodeGen; c: Cursor): bool =
     var cc = c
     cc.into:
       if cc.kind == Symbol:
-        if g.lookupSym(symName(cc)).cat != scNone: ok = false  # a function-local only
+        if g.lookupSym(symName(cc)).cat notin {scNone, scGlobal, scTvar}: ok = false  # local or global store
       elif not g.lvalModeled2(cc): ok = false           # complex lvalue (dot/deref store)
       skip cc                                            # lhs
       if cc.hasMore and not (g.valModeled2(cc) or g.callModeled2(cc) or g.divModModeled2(cc)): ok = false
@@ -4454,6 +4454,8 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
     var cc = c
     cc.into:
       if cc.kind == Symbol:
+        let asgnPos = cursorToPosition(g.buf[], c)
+        let lhsCur = cc                                     # captured for asLoc (global/tvar)
         let dst = g.ra.locationOfSym(symName(cc)); skip cc # local lvalue (reg or `(s)` slot)
         g.emitValue2(cc)                                    # rhs computed into a reg / dst home
         let v = g.ra.locs[cursorToPosition(g.buf[], cc)]
@@ -4464,6 +4466,25 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
             g.emitStoreLoc(dst, v.r)
             if v.isTemp: g.unbindTemp(v.r)
           else: raiseAssert "arkham x64n: stack asgn rhs " & $v.kind
+        of Undef:                                           # a module-level global / tvar store
+          assert v.kind == InReg, "arkham x64n: global store rhs " & $v.kind
+          var lc = lhsCur
+          let loc = g.asLoc(lc)                             # Glob/Tvar with precise type
+          case loc.kind
+          of Tvar:                                          # nifasm resolves FS:[off]
+            g.ab.tree MovX64:
+              g.ab.sym loc.name
+              g.emReg v.r
+          of Glob:                                          # &g into the address temp, then store
+            let addrT = g.ra.aux[asgnPos].scratch[0]
+            g.bindTemp(addrT, loc.typ)
+            g.emGlobalAddr(addrT, loc.name)
+            g.ab.tree MovX64:
+              g.ab.tree MemX: g.emReg addrT
+              g.emReg v.r
+            g.unbindTemp(addrT)
+          else: raiseAssert "arkham x64n: global store loc " & $loc.kind
+          if v.isTemp: g.unbindTemp(v.r)
         else: raiseAssert "arkham x64n: asgn lhs home " & $dst.kind
       else:
         # A memory store through a complex lvalue (dot/deref): materialize the lvalue's

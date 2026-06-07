@@ -662,6 +662,7 @@ proc walk(b: var Builder; n: var Cursor) =
       else: inc n
   of AsgnS:
     if b.allocExprs:
+      let asgnPos = b.posOf(n)
       n.into:
         if n.kind == Symbol:
           let home = b.symLoc(symName(n))
@@ -678,8 +679,20 @@ proc walk(b: var Builder; n: var Cursor) =
             var d = needsReg(home.typ)
             allocValue(b, n, d)
             b.releaseTmp(d)
+          elif home.kind == Undef:
+            # A module-level global / tvar store: the rhs into a register, plus an
+            # address scratch temp (a Glob is `&g` then `mov [addr], v`; a Tvar resolves
+            # to FS:[off] and ignores it). The address temp is recorded in `aux` for the
+            # emitter, held across the rhs so it can't be reused.
+            let addrT = b.reserveTmp(ScalarSlot)
+            var d = needsReg(ScalarSlot)
+            allocValue(b, n, d)
+            b.releaseTmp(d)
+            b.releaseTmp(addrT)
+            if addrT.kind == InReg: b.ra.aux[asgnPos] = ExprAux(scratch: @[addrT.r])
+            else: b.ra.exprUnsupported = true
           else:
-            b.ra.exprUnsupported = true        # aggregate / other lvalue store: legacy
+            b.ra.exprUnsupported = true        # aggregate `(s)` store: legacy
             var t = dontCare
             allocValue(b, n, t)
         else:
