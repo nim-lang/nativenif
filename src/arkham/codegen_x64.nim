@@ -3679,6 +3679,35 @@ proc callModeled2(g: var CodeGen; c: Cursor): bool =
       if argc > g.md.intArgRegs.len: ok = false          # 7th+ (stack) args: v1 gap
   ok
 
+proc smallCmpImm(c: Cursor): bool =
+  ## A comparison operand the `cmp` emitter can fold inline without a scratch
+  ## register — a small non-negative immediate (or any non-immediate operand,
+  ## which folds as a register / memory). A wide/negative immediate would need a
+  ## pre-load the v1 allocator does not reserve, so it bails the proc to legacy.
+  case c.kind
+  of IntLit: (let v = intVal(c); v >= 0 and v <= 0xFFFF)
+  of UIntLit: (let v = cast[int64](uintVal(c)); v >= 0 and v <= 0xFFFF)
+  else: true
+
+proc condModeled2(g: var CodeGen; c: Cursor): bool =
+  ## A branch condition the new emitter handles: a single comparison
+  ## (`eq`/`neq`/`lt`/`le`) over modeled, fold-able operands, or a plain modeled
+  ## boolean value. `and`/`or`/`not` short-circuit forms stay with legacy for now.
+  if c.kind == TagLit and c.exprKind in {EqC, NeqC, LtC, LeC}:
+    var ok = true
+    var cc = c
+    cc.into:
+      if cc.hasMore:
+        if not (g.valModeled2(cc) and smallCmpImm(cc)): ok = false
+        skip cc
+      if cc.hasMore:
+        if not (g.valModeled2(cc) and smallCmpImm(cc)): ok = false
+        skip cc
+      while cc.hasMore: skip cc
+    ok
+  else:
+    g.valModeled2(c)
+
 proc stmtModeled2(g: var CodeGen; c: Cursor): bool =
   case c.stmtKind
   of StmtsS, ScopeS:
@@ -3710,6 +3739,51 @@ proc stmtModeled2(g: var CodeGen; c: Cursor): bool =
       while cc.hasMore: skip cc
     ok
   of CallS: g.callModeled2(c)
+  of AsgnS:
+    var ok = true
+    var cc = c
+    cc.into:
+      if cc.kind != Symbol: ok = false                  # complex lvalue → legacy
+      elif g.lookupSym(symName(cc)).cat != scNone: ok = false  # a function-local only
+      skip cc                                            # lhs
+      if cc.hasMore and not (g.valModeled2(cc) or g.callModeled2(cc)): ok = false
+      while cc.hasMore: skip cc
+    ok
+  of WhileS:
+    var ok = true
+    var cc = c
+    cc.into:
+      if cc.hasMore:
+        if not g.condModeled2(cc): ok = false
+        skip cc
+      while cc.hasMore:
+        if not g.stmtModeled2(cc): ok = false
+        skip cc
+    ok
+  of IfS:
+    var ok = true
+    var cc = c
+    cc.into:
+      while cc.hasMore:
+        case cc.substructureKind
+        of ElifU:
+          var bc = cc
+          bc.into:
+            if bc.hasMore:
+              if not g.condModeled2(bc): ok = false
+              skip bc
+            while bc.hasMore:
+              if not g.stmtModeled2(bc): ok = false
+              skip bc
+        of ElseU:
+          var bc = cc
+          bc.into:
+            while bc.hasMore:
+              if not g.stmtModeled2(bc): ok = false
+              skip bc
+        else: ok = false
+        skip cc
+    ok
   else: false
 
 proc procModeled2(g: var CodeGen; decl: Cursor): bool =
@@ -3826,6 +3900,12 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
   ## passing / a `NeedsReg` reservation); a leaf left as `Imm` / in its own home stays
   ## put (the consumer folds or reads it). A computed node runs its op into its result.
   let dst = g.ra.locs[cursorToPosition(g.buf[], c)]
+  # A leaf the allocator forced into a *scratch temp* (e.g. an immediate operand
+  # under a `NeedsReg` constraint) must bind that register so `emReg` emits a
+  # checked name, not a raw r10/r11. The consuming op (`emitBin2`/`emitCond2`)
+  # unbinds it when it folds the operand. Computed nodes bind their own result.
+  if dst.kind == InReg and dst.isTemp and c.kind in {IntLit, UIntLit, CharLit, Symbol}:
+    g.bindTemp(dst.r, dst.typ)
   case c.kind
   of IntLit:
     if dst.kind == InReg: g.movImm(dst.r, intVal(c))
@@ -3848,6 +3928,7 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
     let nm = symName(cc); inc cc
     skip cc                                              # pragmas
     let typeCur = cc; skip cc                            # type
+    g.symType[nm] = typeCur                              # record the type for getType (conds)
     let loc = g.ra.locationOfSym(nm)
     let hasVal = cc.hasMore and cc.kind != DotToken
     case loc.kind
@@ -3869,6 +3950,43 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
       else: discard
     while cc.hasMore: skip cc
 
+proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
+  ## Emit a branch test: `cmp`/`jcc` for a comparison `(op a b)`, or `test`-style
+  ## `cmp v, 0` for a plain boolean value, jumping to `toLabel` when the condition
+  ## holds (`whenTrue`). Operand locations were pre-assigned by `allocCond`.
+  if c.kind == TagLit and c.exprKind in {EqC, NeqC, LtC, LeC}:
+    let ek = c.exprKind
+    var aC, bC: Cursor
+    block:
+      var cc = c
+      cc.into:
+        aC = cc; skip cc
+        bC = cc; skip cc
+        while cc.hasMore: skip cc
+    let unsigned = g.cmpOperandUnsigned(aC) or g.cmpOperandUnsigned(bC)
+    let tag = cmpJccTag(ek, whenTrue, signed = not unsigned)
+    g.emitValue2(aC)                                     # materialize operands
+    g.emitValue2(bC)
+    let aLoc = g.ra.locs[cursorToPosition(g.buf[], aC)]
+    let bLoc = g.ra.locs[cursorToPosition(g.buf[], bC)]
+    assert aLoc.kind == InReg, "arkham x64n: cmp lhs " & $aLoc.kind
+    g.ab.tree CmpX64:
+      g.emReg aLoc.r
+      case bLoc.kind
+      of Imm: g.ab.intLit bLoc.ival
+      of InReg: g.emReg bLoc.r
+      else: raiseAssert "arkham x64n: cmp rhs " & $bLoc.kind
+    g.emJcc(tag, toLabel)
+    if bLoc.kind == InReg and bLoc.isTemp: g.unbindTemp(bLoc.r)
+    if aLoc.kind == InReg and aLoc.isTemp: g.unbindTemp(aLoc.r)
+  else:
+    g.emitValue2(c)
+    let v = g.ra.locs[cursorToPosition(g.buf[], c)]
+    assert v.kind == InReg, "arkham x64n: bool cond " & $v.kind
+    g.ab.tree CmpX64: (g.emReg v.r; g.ab.intLit 0)
+    g.emJcc(if whenTrue: JneX64 else: JeX64, toLabel)
+    if v.isTemp: g.unbindTemp(v.r)
+
 proc genStmt2(g: var CodeGen; c: Cursor) =
   case c.stmtKind
   of StmtsS:
@@ -3883,6 +4001,49 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
     g.exitScope()
   of VarS: g.genVarDecl2(c)
   of CallS: g.emitCall2(c)
+  of AsgnS:
+    var cc = c
+    cc.into:
+      let dst = g.ra.locationOfSym(symName(cc)); skip cc   # reg-homed local lvalue
+      g.emitValue2(cc)                                      # rhs computed into dst home
+      let v = g.ra.locs[cursorToPosition(g.buf[], cc)]
+      g.place2(v, dst.r)                                    # dest-passed ⇒ usually a no-op
+      while cc.hasMore: skip cc
+  of WhileS:
+    let lStart = g.freshLabel()
+    let lEnd = g.freshLabel()
+    g.loopEnds.add lEnd
+    var cc = c
+    cc.into:
+      let condC = cc; skip cc
+      g.emLab(lStart)
+      g.emitCond2(condC, lEnd, whenTrue = false)
+      while cc.hasMore: (g.genStmt2(cc); skip cc)
+      g.emJmp(lStart)
+    g.emLab(lEnd)
+    discard g.loopEnds.pop()
+  of IfS:
+    let lEnd = g.freshLabel()
+    var cc = c
+    cc.into:
+      while cc.hasMore:
+        case cc.substructureKind
+        of ElifU:
+          let lNext = g.freshLabel()
+          var bc = cc
+          bc.into:
+            let condC = bc; skip bc
+            g.emitCond2(condC, lNext, whenTrue = false)
+            while bc.hasMore: (g.genStmt2(bc); skip bc)
+            g.emJmp(lEnd)
+          g.emLab(lNext)
+        of ElseU:
+          var bc = cc
+          bc.into:
+            while bc.hasMore: (g.genStmt2(bc); skip bc)
+        else: discard
+        skip cc
+    g.emLab(lEnd)
   of RetS:
     var cc = c
     cc.into:
@@ -3953,6 +4114,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.spillCount = 0
   g.tmpBindCount = 0
   g.ftmpBindCount = 0
+  g.loopEnds = @[]                            # per-proc loop-exit label stack (while/break)
   # Aggregate return convention (before allocation): a named object ≤16B → rax:rdx;
   # >16B → a hidden pointer the caller passes in rdi, parked in a callee-saved reg
   # (rbx) for the proc's lifetime and written through on `ret`.
@@ -3974,6 +4136,8 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     # whose pool/usedCallee/hasStackVars state the legacy emitter depends on).
     useNew = false
     g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64Machine, preseal)
+  when defined(arkhamTracePath):
+    stderr.writeLine "[arkham] " & info.asmName & ": " & (if useNew: "NEW" else: "legacy")
   when defined(arkhamDumpLocs):
     block:
       let dbg = allocateProc(g.buf[], info.decl, an, g.prog, x64Machine, preseal, allocExprs = true)

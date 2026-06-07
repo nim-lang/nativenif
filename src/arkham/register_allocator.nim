@@ -297,6 +297,14 @@ proc allocBin(b: var Builder; n: var Cursor; dest: var Location) =
     else: dest = b.reserveTmp(ScalarSlot)
   else: discard
   if dest.kind != InReg: b.ra.exprUnsupported = true   # memory-result binop: v1 emitter gap
+  # Destination-passing hazard: a *fixed* dest (an asgn/store target) that aliases
+  # the rhs register would be clobbered when the emitter places lhs into dest before
+  # the op (`dest := lhs; dest op= rhs`). Safe when dest == lhs (in-place RMW). Bail
+  # to the legacy reactive path otherwise. (Var-decl inits never hit this — a fresh
+  # home can't alias a still-live operand — so only `s = a - s`-shaped asgns do.)
+  if dest.kind == InReg and rDest.kind == InReg and dest.r == rDest.r and
+     not sameReg(dest, lDest):
+    b.ra.exprUnsupported = true
   b.releaseTmp(rDest)
   if not sameReg(dest, lDest): b.releaseTmp(lDest)
   b.ra.aux[pos] = ExprAux(foldB: rDest.kind in {NamedStack, Mem})
@@ -326,6 +334,28 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location) =
     dest = regLoc(b.md.intRetReg, ScalarSlot, isTemp = true)   # result in rax
   else: discard                                # fixed dest: emitter moves rax → it
   b.ra.locs[pos] = dest
+
+proc allocCond(b: var Builder; n: var Cursor) =
+  ## Allocate operand homes for a branch condition (`if`/`while`). A comparison
+  ## `(op a b)` (no type child) puts `a` in a register — `cmp` needs a register
+  ## lhs — and `b` wherever it lies (a small immediate / register, folded by the
+  ## emitter); the comparison yields flags, so no result location is recorded. A
+  ## plain boolean value is forced into a register (the emitter tests it `!= 0`).
+  ## `and`/`or`/`not` short-circuit forms stay with the legacy emitter for now
+  ## (the backend's `condModeled2` gate keeps them off the new path).
+  if n.kind == TagLit and n.exprKind in {EqC, NeqC, LtC, LeC}:
+    var lDest = needsReg(ScalarSlot)
+    var rDest = dontCare
+    n.into:
+      allocValue(b, n, lDest)                  # left → a register
+      allocValue(b, n, rDest)                  # right → reg / imm (folded)
+      while n.hasMore: skip n
+    b.releaseTmp(rDest)
+    b.releaseTmp(lDest)
+  else:
+    var d = needsReg(ScalarSlot)
+    allocValue(b, n, d)
+    b.releaseTmp(d)
 
 proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
   let pos = b.posOf(n)
@@ -436,6 +466,48 @@ proc walk(b: var Builder; n: var Cursor) =
         n.into:
           while n.hasMore: walk(b, n)
       else: inc n
+  of AsgnS:
+    if b.allocExprs:
+      n.into:
+        # The lhs is the destination; the rhs computes directly into its home
+        # (destination-passing). Only a register-homed local lvalue is modeled;
+        # a stack home or a complex lvalue (dot/at/deref) bails to legacy.
+        var dest = dontCare
+        if n.kind == Symbol:
+          dest = b.symLoc(symName(n))
+          if dest.kind != InReg: b.ra.exprUnsupported = true
+        else:
+          b.ra.exprUnsupported = true
+        skip n                                 # lhs (not a value-read)
+        allocValue(b, n, dest)                 # rhs → the lhs home
+        while n.hasMore: skip n
+    else:
+      n.into:
+        while n.hasMore: walk(b, n)
+  of WhileS:
+    if b.allocExprs:
+      n.into:
+        allocCond(b, n)                        # loop condition
+        while n.hasMore: walk(b, n)            # body (a `(stmts …)` node)
+    else:
+      n.into:
+        while n.hasMore: walk(b, n)
+  of IfS:
+    if b.allocExprs:
+      n.into:
+        while n.hasMore:
+          case n.substructureKind
+          of ElifU:
+            n.into:
+              allocCond(b, n)
+              while n.hasMore: walk(b, n)       # branch body
+          of ElseU:
+            n.into:
+              while n.hasMore: walk(b, n)
+          else: skip n
+    else:
+      n.into:
+        while n.hasMore: walk(b, n)
   else:
     if n.kind == TagLit:
       n.into:
