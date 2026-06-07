@@ -2574,25 +2574,48 @@ proc structToRegs(g: var CodeGen; varName, typeName: string; regs: openArray[Reg
   ## aggregate → regs[i] (one GPR per 8-byte word).
   g.transferAggrWords(varName, typeName, regs, toRegs = true)
 
+proc aggrIsGlobal(g: var CodeGen; name: string): bool {.inline.} =
+  ## True when `name` is a module-level global aggregate (RIP-relative), as opposed
+  ## to a stack var / by-ref param / synthetic temp. Globals are not in `varType`
+  ## and the register allocator has no slot for them (`Undef`), so they must be
+  ## addressed via `emGlobalAddr`, not `emStackAddr` / the rsp-relative field forms.
+  not g.varType.hasKey(name) and g.ra.locationOfSym(name).kind == Undef
+
 proc marshalAggrArg(g: var CodeGen; name, tn: string; idx: var int; sealedHere: var set[Reg]) =
-  ## Marshal an aggregate call argument — a named var OR an inline-constructor temp,
-  ## both addressed by `name` — into the SysV integer arg registers. By reference
-  ## (`aggrByRef`): a pointer to it in one reg (a by-ref param is already that pointer
-  ## → `mov`; a stack var / temp → `lea`). Otherwise by value: its `nw` words via
-  ## `structToRegs`. Each consumed arg register is sealed into `sealedHere` and `idx`
-  ## advanced. Shared by both aggregate-argument branches of `genCall`.
+  ## Marshal an aggregate call argument — a named var, a module-level global, OR an
+  ## inline-constructor temp, all addressed by `name` — into the SysV integer arg
+  ## registers. By reference (`aggrByRef`): a pointer to it in one reg (a by-ref param
+  ## is already that pointer → `mov`; a stack var / temp → `lea`; a global →
+  ## RIP-relative `lea`). Otherwise by value: its `nw` words, read from a stack var via
+  ## `structToRegs` or from a global through its address. Each consumed arg register is
+  ## sealed into `sealedHere` and `idx` advanced. Shared by both aggregate-argument
+  ## branches of `genCall`.
   if g.aggrByRef(tn):
     assert idx < g.md.intArgRegs.len, "arkham x64 v0: >6 args (stack TODO)"
     let ar = g.md.intArgRegs[idx]
     let loc = g.ra.locationOfSym(name)
     if loc.kind == InReg: g.movReg(ar, loc.r)   # already a pointer (by-ref param)
+    elif g.aggrIsGlobal(name): g.emGlobalAddr(ar, name)  # &global → RIP-relative lea
     else: g.emStackAddr(ar, name)               # stack var / constructor temp → lea
     g.ra.seal ar; sealedHere.incl ar
     inc idx
   else:
     let nw = aggrWordCount(g.prog, tn)
     assert idx + nw <= g.md.intArgRegs.len, "arkham x64 v0: aggregate arg exceeds GPRs"
-    g.structToRegs(name, tn, g.md.intArgRegs[idx ..< idx + nw])
+    let argRegs = g.md.intArgRegs[idx ..< idx + nw]
+    if g.aggrIsGlobal(name):
+      # A global aggregate by value: lea its address once, then read each 8-byte word
+      # through that pointer (the rsp-relative field forms `structToRegs` uses cannot
+      # address a global).
+      let base = g.borrowTmp(ScalarSlot); g.emGlobalAddr(base, name)
+      let lay = aggrLayout(g.prog, tn)
+      for i in 0 ..< nw:
+        let fn = fieldAtOffset(lay, i * 8)
+        if fn.len == 0: raiseAssert "arkham x64 v0: sub-word-packed aggregate ABI unsupported"
+        g.ab.tree MovX64: (g.emReg argRegs[i]; g.emPtrFieldMem(base, tn, fn))
+      g.giveBack base
+    else:
+      g.structToRegs(name, tn, argRegs)
     for k in 0 ..< nw:
       g.ra.seal g.md.intArgRegs[idx + k]; sealedHere.incl g.md.intArgRegs[idx + k]
     idx += nw
@@ -2644,6 +2667,21 @@ proc genBitBuiltin(g: var CodeGen; c: var Cursor; builtin: string) =
     # appears (clz ⇒ `63 - bsr`, popcount ⇒ `popcnt`, bswap ⇒ `bswap`).
     raiseAssert "arkham x64 v0: bit builtin not yet implemented: " & builtin
   g.freeTemp(v)
+
+proc aggrLvalueType(g: var CodeGen; nm: string): string =
+  ## The named aggregate type of an aggregate-typed lvalue symbol — a local/temp
+  ## stack var or by-ref param (tracked in `varType`) OR a module-level global/tvar
+  ## (read from its decl) — or "" if `nm` is not a (named) aggregate. Lets `genCall`
+  ## marshal a global aggregate by value just like a local one.
+  if g.varType.hasKey(nm): return g.varType[nm]
+  let si = g.lookupSym(nm)
+  if si.cat in {scGlobal, scTvar}:
+    var d = si.decl
+    d.into:
+      inc d; skip d                              # name, pragmas
+      if d.kind == Symbol and slotOf(g.prog, resolveType(g.prog, d)).kind == AMem:
+        result = symName(d)                      # the global's named aggregate type
+      while d.hasMore: skip d                    # drain type (+ initializer)
 
 proc genCall(g: var CodeGen; c: var Cursor) =
   ## `(call f arg…)`. The C `exit` extern lowers to the Linux exit syscall; a
@@ -2746,9 +2784,9 @@ proc genCall(g: var CodeGen; c: var Cursor) =
           g.genIntoF(c, fr, g.floatBits(c))
           g.sealedF.incl fr; sealedFHere.incl fr
           inc fidx
-        elif c.kind == Symbol and g.varType.hasKey(symName(c)):
+        elif c.kind == Symbol and g.aggrLvalueType(symName(c)).len > 0:
           let vn = symName(c)
-          g.marshalAggrArg(vn, g.varType[vn], idx, sealedHere)
+          g.marshalAggrArg(vn, g.aggrLvalueType(vn), idx, sealedHere)
           inc c
         elif c.kind == TagLit and c.exprKind in {OconstrC, AconstrC}:
           # An inline aggregate constructor: build it into a temp slot, then
@@ -3725,6 +3763,8 @@ proc emitGlobalInits(g: var CodeGen) =
             g.emFReg fv
           g.giveBack p
           g.giveBackF fv
+        elif gslot.kind == AMem:                 # aggregate global (e.g. a `string`):
+          g.genStore(c, globLoc(name, gslot))    # build/copy in place at &global
         else:
           let v = g.borrowTmp(ScalarSlot)
           g.genInto(c, v)                          # evaluate the initializer
