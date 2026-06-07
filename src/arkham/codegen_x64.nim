@@ -3706,7 +3706,10 @@ proc valModeled2(g: var CodeGen; c: Cursor): bool =
       var ok = true
       var cc = c
       cc.into:
-        if cc.hasMore: (if not g.lvalModeled2(cc): ok = false)
+        if cc.hasMore:
+          if cc.kind == Symbol and g.lookupSym(symName(cc)).cat == scGlobal:
+            discard                                       # &global → RIP-relative lea
+          elif not g.lvalModeled2(cc): ok = false
         while cc.hasMore: skip cc
       ok
     of CastC, ConvC:
@@ -4356,6 +4359,12 @@ proc emitAddr2(g: var CodeGen; c: Cursor) =
     if res.isTemp: g.bindTemp(res.r, res.typ)
     g.place2(pLoc, res.r)
     if pLoc.kind == InReg and pLoc.isTemp and pLoc.r != res.r: g.unbindTemp(pLoc.r)
+  elif lv.kind == Symbol and g.lookupSym(symName(lv)).cat == scGlobal:
+    # &global — RIP-relative lea (no stack base / embedded value to materialize)
+    if res.isTemp: g.bindTemp(res.r, res.typ)
+    var lc = lv
+    let loc = g.asLoc(lc)                                # Glob with the global's precise type
+    g.emitAddrLoc(loc, res.r)
   else:
     g.prematLval2(lv)
     if res.isTemp: g.bindTemp(res.r, res.typ)
