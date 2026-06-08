@@ -5032,16 +5032,17 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
       skip pc                                      # pragmas
       if pc.stmtKind == StmtsS: g.recordSymTypes(pc)
       while pc.hasMore: skip pc                    # drain (body + any trailing)
-  var useNew = procModeled2(g, info.decl)        # value-core rewrite: pure-emit this proc?
+  # THE FLIP (value-core rewrite): the new pure-emit path is now the ONLY path. The
+  # `procModeled2` gate and the `exprUnsupported`→legacy fallback are gone — every proc
+  # is allocated with `allocExprs=true` and emitted by `emitProcBody2`. Constructs the
+  # new path does not yet handle raiseAssert / miscompile; the tests that exercise them
+  # are quarantined in `arkhamKnownUnsupported` (tester) until their family is ported.
+  # The legacy reactive core (`emitProcBody`/`gen…`) stays in-tree (still reached by
+  # `emitGlobalInits`) until that too is ported and the whole seam is deleted.
+  const useNew = true
   g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64Machine, preseal, allocExprs = useNew)
-  if useNew and g.ra.exprUnsupported:
-    # The expr walk produced a spill / memory-homed result the v1 pure emitter does not
-    # handle yet — fall back to the legacy reactive path (re-allocate without expr locs,
-    # whose pool/usedCallee/hasStackVars state the legacy emitter depends on).
-    useNew = false
-    g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64Machine, preseal)
   when defined(arkhamTracePath):
-    stderr.writeLine "[arkham] " & info.asmName & ": " & (if useNew: "NEW" else: "legacy")
+    stderr.writeLine "[arkham] " & info.asmName & ": NEW"
   when defined(arkhamDumpLocs):
     block:
       let dbg = allocateProc(g.buf[], info.decl, an, g.prog, x64Machine, preseal, allocExprs = true)
