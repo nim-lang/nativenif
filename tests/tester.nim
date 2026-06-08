@@ -34,8 +34,6 @@ const arkhamKnownUnsupported: seq[string] = @[
   #
   # atomics / mem intrinsics (fixed-register sequences — port genAtomic/genMemIntrin):
   "atomic", "atomic2", "atomic_cas", "memcmp", "memcpy", "memmove", "memset",
-  # indirect (fn-ptr) calls:
-  "indirect_call",
   # register-pressure spill totality (the pure emitter has no spill path yet) —
   # incl. >8 float args (stack) and deep float expression trees:
   "deep_spill", "deep_spill_call", "ideep", "fparg_spill", "fpdeep",

@@ -4306,11 +4306,16 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
       if home.kind != Undef:                            # a function-local
         if dst.isTemp: g.bindTemp(dst.r, dst.typ)        # stack-homed local → loaded into a temp
         g.place2(home, dst.r)
-      else:                                             # a module-level global / tvar: load it
-        var cc = c
-        let loc = g.asLoc(cc)                            # Glob/Tvar with the global's precise type
-        if dst.isTemp: g.bindTemp(dst.r, loc.typ)        # type the temp as the global (precision)
-        g.place2(loc, dst.r)
+      else:
+        let si = g.lookupSym(symName(c))
+        if si.cat == scProc:                             # a proc as a value → its code pointer
+          if dst.isTemp: g.bindTemp(dst.r, dst.typ)
+          g.ab.tree LeaX64: (g.emReg dst.r; g.ab.sym si.asmName)  # RIP-relative &proc
+        else:                                            # a module-level global / tvar: load it
+          var cc = c
+          let loc = g.asLoc(cc)                          # Glob/Tvar with the global's precise type
+          if dst.isTemp: g.bindTemp(dst.r, loc.typ)      # type the temp as the global (precision)
+          g.place2(loc, dst.r)
   of StrLit:                                            # string literal → rodata + RIP lea
     if dst.kind == InReg:
       let nm = "msg." & $g.rodata.len
