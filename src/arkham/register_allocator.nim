@@ -278,6 +278,28 @@ proc reserveFTmp(b: var Builder; slot: AsmSlot): Location =
 proc releaseFTmp(b: var Builder; loc: Location) {.inline.} =
   if loc.kind == InFReg and loc.isTemp: b.giveBackF loc.f
 
+proc symLoc(b: var Builder; name: string): Location
+
+proc isFloatVal(b: var Builder; n: Cursor): bool =
+  ## Best-effort: does value `n` have float type? (For routing a conversion's operand
+  ## to the SIMD vs GPR side without a full `getType`.) A float literal; a symbol homed
+  ## in an xmm (a float local/param); a float-typed arith / conversion (its type child
+  ## is `(f N)`); a wrapper over such. A float global (home Undef) is not detected — but
+  ## those are gated out anyway.
+  case n.kind
+  of FloatLit: true
+  of Symbol: b.symLoc(symName(n)).kind == InFReg
+  of TagLit:
+    case n.exprKind
+    of AddC, SubC, MulC, DivC, NegC, ConvC, CastC:
+      var t = n; inc t                          # tag → type child (result/target type)
+      slotOf(b.prog[], t).kind == AFloat
+    of SufC, ParC:
+      var t = n; inc t
+      b.isFloatVal(t)
+    else: false
+  else: false
+
 proc symLoc(b: var Builder; name: string): Location =
   ## A symbol reference reads where the symbol is stored. A module-level
   ## global/proc is not in `symPos`; the emitter resolves those (Glob / `lea`), so
@@ -407,6 +429,30 @@ proc allocFValue(b: var Builder; n: var Cursor; dest: var Location) =
     case n.exprKind
     of AddC, SubC, MulC, DivC:
       allocFBin(b, n, dest); return              # records locs[pos] itself
+    of ConvC:
+      # A conversion whose RESULT is float. An INT source is `cvtsi2sd` (the operand
+      # in a GPR temp the emitter extends first); a FLOAT source is a precision /
+      # copy convert. (`cast`-to-float bit-reinterpret is deferred to legacy.)
+      if dest.kind != InFReg:
+        dest = b.reserveFTmp(if dest.typ.kind == AFloat: dest.typ else: floatSlot(64))
+      let resDest = dest
+      var srcF = false
+      block:
+        var t = n; inc t; skip t                 # tag, target type → source expr
+        srcF = b.isFloatVal(t)
+      n.into:
+        skip n                                   # target float type
+        if srcF:
+          b.ra.exprUnsupported = true            # float→float precision: deferred to legacy
+          var fd = resDest
+          allocFValue(b, n, fd)
+        else:
+          var gd = needsReg(ScalarSlot)          # int operand → a GPR temp
+          allocValue(b, n, gd)
+          b.releaseTmp(gd)
+        while n.hasMore: skip n
+      b.ra.locs[pos] = resDest
+      return
     of SufC, ParC:                               # `(suf v "type")` / `(par v)` wrapper
       n.into:
         allocFValue(b, n, dest)
@@ -603,13 +649,31 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
       b.ra.locs[pos] = resDest
       return
     of CastC, ConvC:
-      # A pointer cast/conv (gated to pure reinterprets — no width change): the inner
-      # value computes straight into `dest`; the type change is free.
-      n.into:
-        skip n                                 # target type
-        allocValue(b, n, dest)                 # inner → dest (identity)
-        while n.hasMore: skip n
-      b.ra.locs[pos] = dest
+      # A conversion whose RESULT is integer/pointer. A FLOAT source (`conv`) is
+      # `cvttsd2si`: the operand goes to an xmm, the int result to `dest` (a GPR).
+      # Otherwise an int↔int / ptr reinterpret computes straight into `dest`
+      # (identity); the emitter re-represents in place.
+      var srcF = false
+      block:
+        var t = n; inc t; skip t               # tag, target type → source expr
+        srcF = b.isFloatVal(t)
+      if srcF:
+        if n.exprKind != ConvC: b.ra.exprUnsupported = true  # float-bit reinterpret cast: legacy
+        b.forceRegDest(dest)                   # int result in a GPR
+        let resDest = dest
+        n.into:
+          skip n                               # target type
+          var fd = dontCare                    # operand → an xmm (home or temp)
+          allocFValue(b, n, fd)
+          b.releaseFTmp(fd)
+          while n.hasMore: skip n
+        b.ra.locs[pos] = resDest
+      else:
+        n.into:
+          skip n                               # target type
+          allocValue(b, n, dest)               # inner → dest (identity)
+          while n.hasMore: skip n
+        b.ra.locs[pos] = dest
       return
     of DerefC, DotC, AtC, PatC:
       # An addressing expr in VALUE position → load `[addr]` into a register. The

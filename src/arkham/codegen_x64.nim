@@ -3627,6 +3627,7 @@ proc emitProcBody(g: var CodeGen; info: ProcInfo; declarative: bool) =
 # grows the legacy path shrinks, then deletes.
 
 proc valModeled2(g: var CodeGen; c: Cursor): bool
+proc fvalModeled2(g: var CodeGen; c: Cursor): bool
 proc lvalModeled2(g: var CodeGen; c: Cursor): bool =
   ## Is lvalue `c` an addressing target the v1 slice can emit (a load / store / addr)?
   ## A function-local base symbol (stack var or reg pointer), a `dot` field over such
@@ -3713,17 +3714,23 @@ proc valModeled2(g: var CodeGen; c: Cursor): bool =
         while cc.hasMore: skip cc
       ok
     of CastC, ConvC:
-      # int↔int (widen/narrow) or ptr↔ptr (reinterpret). FLOAT source/target is the
-      # float family; MIXED int↔ptr needs the rebind-retype `coerceThroughCast` — both
-      # gated out here (legacy handles them) so the new path never miscompiles a type.
+      # int↔int (widen/narrow), ptr↔ptr (reinterpret), or a FLOAT→int `conv`
+      # (cvttsd2si). A float TARGET is the float family (fvalModeled2); a float→int
+      # `cast` (movq) and MIXED int↔ptr need legacy — gated out so the new path never
+      # miscompiles a type.
       var ok = true
       var cc = c
       cc.into:
         let tgtPtr = isPtrType(resolveType(g.prog, cc))
-        if slotOf(g.prog, cc).kind == AFloat: ok = false        # float target: later
+        let tgtFloat = slotOf(g.prog, cc).kind == AFloat
         skip cc                                                 # target type
-        if ok and cc.hasMore:
-          if g.isFloatExpr(cc): ok = false                      # float source: later
+        if tgtFloat: ok = false                                 # float TARGET → fvalModeled2
+        elif cc.hasMore:
+          if g.isFloatExpr(cc):
+            # float SOURCE → int target: `conv` = cvttsd2si (NEW); a `cast` (movq) or a
+            # pointer target are deferred to legacy.
+            if c.exprKind != ConvC or tgtPtr: ok = false
+            elif not g.fvalModeled2(cc): ok = false
           elif isPtrType(resolveType(g.prog, g.getType(cc))) != tgtPtr: ok = false  # int↔ptr: later
           elif not g.valModeled2(cc): ok = false
           skip cc
@@ -3749,6 +3756,19 @@ proc fvalModeled2(g: var CodeGen; c: Cursor): bool =
         skip cc                                           # result float type
         if cc.hasMore: (if not g.fvalModeled2(cc): ok = false); skip cc   # lhs
         if cc.hasMore: (if not g.fvalModeled2(cc): ok = false); skip cc   # rhs
+        while cc.hasMore: skip cc
+      ok
+    of ConvC:
+      # conversion TO float: an INT source is cvtsi2sd (NEW). A float source (precision
+      # convert) and a `cast` bit-reinterpret are deferred to legacy.
+      var ok = true
+      var cc = c
+      cc.into:
+        skip cc                                  # target float type
+        if cc.hasMore:
+          if g.isFloatExpr(cc): ok = false       # float→float precision: later
+          elif not g.valModeled2(cc): ok = false # int→float
+          skip cc
         while cc.hasMore: skip cc
       ok
     of SufC, ParC:
@@ -4294,6 +4314,7 @@ proc emitFValue2(g: var CodeGen; c: Cursor) =
   of TagLit:
     case c.exprKind
     of AddC, SubC, MulC, DivC: g.emitFBin2(c)
+    of ConvC, CastC: g.emitCast2(c)                       # conversion TO float (emitCast2 handles InFReg)
     of SufC, ParC:
       var inner: Cursor
       block:
@@ -4500,9 +4521,37 @@ proc emitCast2(g: var CodeGen; c: Cursor) =
       tc = resolveType(g.prog, cc); skip cc              # target type
       inner = cc; skip cc
       while cc.hasMore: skip cc
-  g.emitValue2(inner)
   let res = g.ra.locs[cursorToPosition(g.buf[], c)]
-  if res.kind != InReg: return
+  if res.kind == InFReg:
+    # conversion TO float (`conv (f N) inner`): int source → cvtsi2sd (operand in a
+    # GPR temp, extended to its source width first); float source → precision convert.
+    let dstBits = if res.typ.size == 4: 32 else: 64
+    if g.isFloatExpr(inner):
+      g.emitFValue2(inner)                              # operand → res (dest-passed)
+      g.emFcvt(res.f, res.f, dstBits, g.floatBits(inner))
+    else:
+      g.emitValue2(inner)
+      let iv = g.ra.locs[cursorToPosition(g.buf[], inner)]
+      assert iv.kind == InReg, "arkham x64n: int→float operand " & $iv.kind
+      let (srcW, srcSigned) = g.srcWidthSigned(inner)
+      g.extendTo(iv.r, srcW, srcSigned)                 # normalize to the full int value
+      g.fcvtI2F(res.f, iv.r, dstBits)
+      if iv.isTemp: g.unbindTemp(iv.r)
+    return
+  if g.isFloatExpr(inner):
+    # FLOAT source → int/ptr target: cvttsd2si (truncate toward zero), then a narrow
+    # integer target gets extended. The operand was placed in an xmm by the allocator.
+    g.emitFValue2(inner)
+    let fv = g.ra.locs[cursorToPosition(g.buf[], inner)]
+    assert fv.kind == InFReg, "arkham x64n: float→int operand " & $fv.kind
+    if res.isTemp: g.bindTemp(res.r, res.typ)
+    g.fcvtF2I(res.r, fv.f, (if fv.typ.size == 4: 32 else: 64))
+    if not isPtrType(tc):
+      let targetW = intTypeWidth(tc)
+      if targetW < 64: g.extendTo(res.r, targetW, signed = isSignedType(tc))
+    if fv.isTemp: g.unbindFTmp(fv.f)
+    return
+  g.emitValue2(inner)
   let iv = g.ra.locs[cursorToPosition(g.buf[], inner)]
   if res.isTemp and (iv.kind != InReg or iv.r != res.r): g.bindTemp(res.r, res.typ)
   if iv.kind == InReg and iv.r != res.r: g.movReg(res.r, iv.r)
