@@ -4107,12 +4107,21 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
   let rD = res.r
   let reusedLhs = lhsLoc.kind == InReg and lhsLoc.r == rD   # in-place RMW on the left temp
   if res.isTemp and not reusedLhs: g.bindTemp(rD, res.typ)
-  g.place2(lhsLoc, rD)                                   # dest := lhs
-  case rhsLoc.kind                                       # dest op= rhs
-  of Imm: g.binImm(op, rD, rhsLoc.ival)
-  of InReg: g.binReg(op, rD, rhsLoc.r)
-  of NamedStack, Mem: g.binMem(op, rD, rhsLoc)
-  else: raiseAssert "arkham x64n: bin rhs " & $rhsLoc.kind
+  let aliasRhs = g.ra.aux.getOrDefault(pos).aliasRhs
+  if aliasRhs:
+    # `dest` already holds the rhs value (it aliases the rhs register). A commutative
+    # op folds straight in (`dest op= lhs`); `sub` computes `dest -= lhs` then negates.
+    assert lhsLoc.kind == InReg, "arkham x64n: aliasRhs lhs " & $lhsLoc.kind
+    g.binReg(op, rD, lhsLoc.r)                           # dest := rhs op lhs
+    if op == SubX64:
+      g.ab.tree NegX64: g.emReg rD                       # dest := lhs - rhs
+  else:
+    g.place2(lhsLoc, rD)                                 # dest := lhs
+    case rhsLoc.kind                                     # dest op= rhs
+    of Imm: g.binImm(op, rD, rhsLoc.ival)
+    of InReg: g.binReg(op, rD, rhsLoc.r)
+    of NamedStack, Mem: g.binMem(op, rD, rhsLoc)
+    else: raiseAssert "arkham x64n: bin rhs " & $rhsLoc.kind
   if rhsLoc.kind == InReg and rhsLoc.isTemp: g.unbindTemp(rhsLoc.r)
   if lhsLoc.kind == InReg and lhsLoc.isTemp and not reusedLhs: g.unbindTemp(lhsLoc.r)
 
@@ -4588,12 +4597,22 @@ proc emitAddr2(g: var CodeGen; c: Cursor) =
     if res.isTemp: g.bindTemp(res.r, res.typ)
     g.place2(pLoc, res.r)
     if pLoc.kind == InReg and pLoc.isTemp and pLoc.r != res.r: g.unbindTemp(pLoc.r)
-  elif lv.kind == Symbol and g.lookupSym(symName(lv)).cat == scGlobal:
-    # &global — RIP-relative lea (no stack base / embedded value to materialize)
+  elif lv.kind == Symbol and g.lookupSym(symName(lv)).cat in {scGlobal, scTvar}:
+    # &global / &threadvar (no stack base / embedded value to materialize).
     if res.isTemp: g.bindTemp(res.r, res.typ)
     var lc = lv
-    let loc = g.asLoc(lc)                                # Glob with the global's precise type
-    g.emitAddrLoc(loc, res.r)
+    let loc = g.asLoc(lc)                                # Glob/Tvar with the global's precise type
+    case loc.kind
+    of Glob: g.emGlobalAddr(res.r, loc.name)            # &global → RIP-relative lea
+    of Tvar:
+      # &threadvar = FS base + the tvar's offset. Reuse `res` as the base scratch:
+      # `lea res, &arkham.tls.0` then `lea res, (res) tvar` folds nifasm's offset in
+      # (no extra register — mirrors emitAddrLoc's Tvar arm without a borrowed temp).
+      if loc.name notin g.tvarNames:
+        raiseAssert "arkham x64: address-of a foreign thread-local (module-system TODO): " & loc.name
+      g.emGlobalAddr(res.r, TlsBlockName)
+      g.ab.tree LeaX64: (g.emReg res.r; g.emReg res.r; g.ab.sym loc.name)
+    else: g.emitAddrLoc(loc, res.r)
   else:
     g.prematLval2(lv)
     if res.isTemp: g.bindTemp(res.r, res.typ)

@@ -43,9 +43,6 @@ const arkhamKnownUnsupported: seq[string] = @[
   # register-pressure spill totality (the pure emitter has no spill path yet) —
   # incl. >8 float args (stack) and deep float expression trees:
   "deep_spill", "deep_spill_call", "ideep", "fparg_spill", "fpdeep",
-  # asgn whose rhs reads the lhs as a non-first operand (`x = y - x`) — destination-
-  # passing aliasing the guard bails; addr-of-tvar:
-  "aliasbin", "tvar_addr",
 ]
 
 proc arkhamTests() =

@@ -41,6 +41,8 @@ type
     fscratch*: seq[FReg]              ## extra SIMD scratch reserved for this op
     swapped*: bool                    ## operands evaluated in swapped (Sethi–Ullman) order
     foldB*: bool                      ## operand B stays a folded memory operand (no load)
+    aliasRhs*: bool                   ## dest register aliases the rhs operand: the emitter
+                                      ## must not place lhs into dest first (`s = a - s`)
 
   RegAlloc* = object
     locs*: seq[Location]              ## indexed by cursorToPosition. Currently filled
@@ -361,15 +363,18 @@ proc allocBin(b: var Builder; n: var Cursor; dest: var Location) =
   if dest.kind != InReg: b.ra.exprUnsupported = true   # memory-result binop: v1 emitter gap
   # Destination-passing hazard: a *fixed* dest (an asgn/store target) that aliases
   # the rhs register would be clobbered when the emitter places lhs into dest before
-  # the op (`dest := lhs; dest op= rhs`). Safe when dest == lhs (in-place RMW). Bail
-  # to the legacy reactive path otherwise. (Var-decl inits never hit this — a fresh
-  # home can't alias a still-live operand — so only `s = a - s`-shaped asgns do.)
-  if dest.kind == InReg and rDest.kind == InReg and dest.r == rDest.r and
-     not sameReg(dest, lDest):
-    b.ra.exprUnsupported = true
+  # the op (`dest := lhs; dest op= rhs`). Safe when dest == lhs (in-place RMW). For a
+  # commutative op the emitter folds it to `dest op= lhs` (no lhs move); for `sub` it
+  # computes `dest := dest - lhs; neg dest`. (Var-decl inits never hit this — a fresh
+  # home can't alias a still-live operand — so only `s = a - s`-shaped asgns do.) A
+  # variable shift can't be rewritten this way (the count needs cl), so it still bails.
+  let aliasRhs = dest.kind == InReg and rDest.kind == InReg and dest.r == rDest.r and
+                 not sameReg(dest, lDest)
+  if aliasRhs and ek in {ShlC, ShrC}: b.ra.exprUnsupported = true
   b.releaseTmp(rDest)
   if not sameReg(dest, lDest): b.releaseTmp(lDest)
-  b.ra.aux[pos] = ExprAux(foldB: rDest.kind in {NamedStack, Mem})
+  b.ra.aux[pos] = ExprAux(foldB: rDest.kind in {NamedStack, Mem},
+                          aliasRhs: aliasRhs and ek notin {ShlC, ShrC})
   b.ra.locs[pos] = dest
 
 proc allocFBin(b: var Builder; n: var Cursor; dest: var Location) =
