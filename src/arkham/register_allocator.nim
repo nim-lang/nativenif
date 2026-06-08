@@ -87,6 +87,8 @@ type
                                       ## scratch pool is exhausted during the expr walk)
     retFloatBits: int                 ## value-core rewrite: 0 = the proc returns int/void;
                                       ## 32/64 = a float return (the value goes to xmm0)
+    retIndirect: bool                 ## the proc returns a >16B aggregate via a hidden
+                                      ## result pointer (rdi in, parked in a callee-saved reg)
 
 proc posOf(b: Builder; c: Cursor): int {.inline.} =
   cursorToPosition(b.buf[], c)
@@ -323,7 +325,7 @@ proc resolveDest(b: var Builder; dest: var Location; natural: Location) =
 proc allocValue(b: var Builder; n: var Cursor; dest: var Location)
 proc allocFValue(b: var Builder; n: var Cursor; dest: var Location)
 proc allocLvalue2(b: var Builder; n: var Cursor)
-proc allocCall(b: var Builder; n: var Cursor; dest: var Location)
+proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = false)
 
 proc regOccupied(b: var Builder; reg: Reg): bool
 
@@ -491,13 +493,13 @@ proc allocFValue(b: var Builder; n: var Cursor; dest: var Location) =
     b.ra.exprUnsupported = true; inc n
     b.ra.locs[pos] = dest
 
-proc allocCall(b: var Builder; n: var Cursor; dest: var Location) =
+proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = false) =
   ## A call: each scalar/pointer argument is allocated into its ABI integer argument
   ## register (rdi…r9), each float argument into its SIMD argument register (xmm0–7);
   ## the result lands in the return register (rax, or xmm0 for a float result) or a
   ## destination-passed home. Aggregate args / >N args still bail (exprUnsupported).
   let pos = b.posOf(n)
-  var intIdx = 0
+  var intIdx = if hiddenPtr: 1 else: 0         # rdi reserved for a >16B aggregate result ptr
   var fIdx = 0
   n.into:
     skip n                                     # callee symbol
@@ -846,11 +848,12 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
           var vc = valCur
           allocConstr(b, vc)                   # constructor: place each field's value
         elif valCur.kind == TagLit and valCur.exprKind == CallC:
-          # a call-returned aggregate: place the call's args; a ≤16B result arrives in
-          # rax:rdx (the emitter writes it into the slot via regsToStruct).
+          # a call-returned aggregate: place the call's args. A ≤16B result arrives in
+          # rax:rdx (emitter → regsToStruct); a >16B result is written through a hidden
+          # pointer the caller passes in rdi (emitter → emStackAddr), shifting args.
           var vc = valCur
           var d = dontCare
-          allocCall(b, vc, d)
+          allocCall(b, vc, d, hiddenPtr = slot.size > b.md.aggrByRefThreshold)
         elif valCur.kind == Symbol:
           # aggregate copy-init (`var b = a`): one scratch GPR carries each word from
           # the source slot to the destination slot.
@@ -932,7 +935,14 @@ proc walk(b: var Builder; n: var Cursor) =
             allocFValue(b, n, d)
           elif n.kind == Symbol and b.symLoc(symName(n)).kind == NamedStack and
                b.symLoc(symName(n)).typ.kind == AMem:
-            skip n                                       # aggregate return: regsToRegs from the slot
+            # aggregate return: ≤16B → structToRegs (no temp); >16B → copyStructThroughPtr
+            # through the hidden result pointer, which needs one word-transfer scratch.
+            if b.retIndirect:
+              let rp = b.posOf(n)
+              let t = b.reserveTmp(ScalarSlot); b.releaseTmp(t)
+              if t.kind == InReg: b.ra.aux[rp] = ExprAux(scratch: @[t.r])
+              else: b.ra.exprUnsupported = true
+            skip n
           else:
             var d = regLoc(b.md.intRetReg, ScalarSlot)   # return value → the ABI ret reg
             allocValue(b, n, d)
@@ -1191,6 +1201,9 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
     if n.kind == TagLit:                      # a float return goes to xmm0 (value-core)
       let rtSlot = slotOf(prog, n)
       if rtSlot.isFloat: b.retFloatBits = rtSlot.size * 8
+    elif n.kind == Symbol:                    # a named-type return; >16B aggregate → hidden ptr
+      let rtSlot = slotOf(prog, n)
+      if rtSlot.kind == AMem and rtSlot.size > md.aggrByRefThreshold: b.retIndirect = true
     skip n                                   # return type
     skip n                                   # pragmas
     walk(b, n)                               # body

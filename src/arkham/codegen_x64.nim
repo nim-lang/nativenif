@@ -4142,7 +4142,9 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
   let tgt = g.callTarget[fsym]
   let isSyscall = tgt.syscall
   let hasResult = not retIsVoid(tgt.retType)
-  let resultIsFloat = hasResult and slotOf(g.prog, tgt.retType).kind == AFloat
+  let resSlot = if hasResult: slotOf(g.prog, tgt.retType) else: AsmSlot(cls: AInt, size: 8, align: 8)
+  let resultIsFloat = hasResult and resSlot.kind == AFloat
+  let resultByRef = hasResult and resSlot.kind == AMem and resSlot.size > g.md.aggrByRefThreshold
   if tgt.declarative:
     g.ab.tree PrepareX64:
       g.ab.sym tgt.asmName
@@ -4166,7 +4168,7 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
     # (by-value ≤16B) or passed as a pointer (by-ref). The intIdx/fIdx counting mirrors
     # allocCall so an aggregate's register range matches. (No reactive sealing; like the
     # declarative path this relies on hexer's un-nesting leaving args simple.)
-    var intIdx = 0
+    var intIdx = if resultByRef: 1 else: 0               # rdi = hidden result ptr (set by the caller)
     for idx in 0 ..< argCurs.len:
       let a = argCurs[idx]
       var aggrSz = -1
@@ -4675,6 +4677,16 @@ proc genAggrCopy2(g: var CodeGen; dstVar, srcVar, typeName: string; tmp: Reg) =
     g.ab.tree MovX64: (g.emAggrFieldMem(dstVar, fn); g.emReg tmp)
   g.unbindTemp(tmp)
 
+proc copyStructThroughPtr2(g: var CodeGen; srcVar, typeName: string; ptrReg, tmp: Reg) =
+  ## Field-wise copy `srcVar` → the memory `ptrReg` points at, through the allocator-
+  ## provided scratch `tmp` (the >16B aggregate hidden-result-pointer return). The
+  ## pure-emit twin of `copyStructThroughPtr`.
+  g.bindTemp(tmp, ScalarSlot)
+  for f in aggrLayout(g.prog, typeName):
+    g.ab.tree MovX64: (g.emReg tmp; g.emAggrFieldMem(srcVar, f.name))
+    g.ab.tree MovX64: (g.emPtrFieldMem(ptrReg, typeName, f.name); g.emReg tmp)
+  g.unbindTemp(tmp)
+
 proc genConstr2(g: var CodeGen; c: Cursor; dstVar: string) =
   ## Emit `(oconstr T (kv field value)*)` into the stack aggregate `dstVar`: each
   ## value was placed in a register temp by the allocator (a SIMD temp for a float
@@ -4737,10 +4749,12 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
         g.genAggrCopy2(nm, symName(valC), g.varType[nm], g.ra.aux[declPos].scratch[0])
       elif valC.kind == TagLit and valC.exprKind == CallC:  # call-returned aggregate
         let tn = g.varType[nm]
-        if g.aggrByRef(tn):
-          raiseAssert "arkham x64n: >16B aggregate call result (by-ref) not yet supported"
-        g.emitCall2(valC)                                # ≤16B result in rax:rdx
-        g.regsToStruct(nm, tn, x64RetRegs)
+        if g.aggrByRef(tn):                              # >16B: pass &var as the hidden result ptr
+          g.emStackAddr(RDI, nm)
+          g.emitCall2(valC)                              # the callee writes through rdi
+        else:
+          g.emitCall2(valC)                              # ≤16B result in rax:rdx
+          g.regsToStruct(nm, tn, x64RetRegs)
       else: raiseAssert "arkham x64n: aggregate var init " & $valC.exprKind
     elif hasVal:
       let valC = cc
@@ -5025,9 +5039,12 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         else: g.movImm(RDI, 0)
         g.movImm(RAX, LinuxX64ExitNr); g.emSyscall()
       elif g.retAggrName.len > 0:                          # aggregate return
-        if g.retIndirect:
-          raiseAssert "arkham x64n: >16B aggregate return (hidden ptr) not yet supported"
-        g.structToRegs(symName(cc), g.retAggrName, x64RetRegs)  # ≤16B → rax:rdx
+        if g.retIndirect:                                  # >16B: copy through the hidden ptr
+          let tmp = g.ra.aux[cursorToPosition(g.buf[], cc)].scratch[0]
+          g.copyStructThroughPtr2(symName(cc), g.retAggrName, g.indirectReg, tmp)
+          g.movReg(RAX, g.indirectReg)                     # SysV: return the buffer pointer in rax
+        else:
+          g.structToRegs(symName(cc), g.retAggrName, x64RetRegs)  # ≤16B → rax:rdx
       elif hasVal:
         g.emitValue2(cc)
         let v = g.ra.locs[cursorToPosition(g.buf[], cc)]
