@@ -4404,9 +4404,17 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
   ## v1 slice: a stack-var base (`(rsp) name`), a `dot` field over such a base or a
   ## `deref`, and a pointer `deref` (`(cast (ptr pointee) ptrReg)`).
   case c.kind
-  of Symbol:                                            # a stack-var base
-    g.ab.reg RSP
-    g.ab.sym symName(c)
+  of Symbol:
+    let loc = g.ra.locationOfSym(symName(c))
+    if loc.kind == InReg and g.varType.hasKey(symName(c)):
+      # a >16B by-reference aggregate param: a pointer in a register — type it via
+      # `(cast (ptr T) reg)` so the enclosing dot/at can compute the field offset.
+      g.ab.tree CastX:
+        g.ab.ptrType: g.ab.sym g.varType[symName(c)]
+        g.emReg loc.r
+    else:                                               # a `(s)` stack-var base
+      g.ab.reg RSP
+      g.ab.sym symName(c)
   of TagLit:
     case c.exprKind
     of DotC:
