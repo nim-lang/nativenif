@@ -4317,10 +4317,15 @@ proc emitFValue2(g: var CodeGen; c: Cursor) =
     g.unbindTemp(gpr)
   of Symbol:
     let home = g.ra.locationOfSym(symName(c))
-    assert home.kind == InFReg, "arkham x64n: float symbol home " & $home.kind
-    if home.f != dst.f:
+    case home.kind
+    of InFReg:
+      if home.f != dst.f:
+        if dst.isTemp: g.bindFTmp(dst.f)
+        g.fmovF(dst.f, home.f, bits)
+    of NamedStack:                                       # spilled float: load from its slot
       if dst.isTemp: g.bindFTmp(dst.f)
-      g.fmovF(dst.f, home.f, bits)
+      g.emFloatScalarLoad(dst.f, home.name, bits)
+    else: raiseAssert "arkham x64n: float symbol home " & $home.kind
   of TagLit:
     case c.exprKind
     of AddC, SubC, MulC, DivC: g.emitFBin2(c)
@@ -4538,11 +4543,13 @@ proc emitCast2(g: var CodeGen; c: Cursor) =
     let dstBits = if res.typ.size == 4: 32 else: 64
     if g.isFloatExpr(inner):
       g.emitFValue2(inner)                              # operand → res (dest-passed)
+      if res.isTemp: g.bindFTmp(res.f)                  # (consumer unbinds; rare — float→float deferred)
       g.emFcvt(res.f, res.f, dstBits, g.floatBits(inner))
     else:
       g.emitValue2(inner)
       let iv = g.ra.locs[cursorToPosition(g.buf[], inner)]
       assert iv.kind == InReg, "arkham x64n: int→float operand " & $iv.kind
+      if res.isTemp: g.bindFTmp(res.f)                  # spilled-float result temp; consumer unbinds
       let (srcW, srcSigned) = g.srcWidthSigned(inner)
       g.extendTo(iv.r, srcW, srcSigned)                 # normalize to the full int value
       g.fcvtI2F(res.f, iv.r, dstBits)
@@ -4603,10 +4610,14 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
           g.fmovF(loc.f, v.f, loc.typ.size * 8)
       of NamedStack:
         # A stack-homed scalar: the allocator computed the initializer into a register
-        # (needsReg); store it to the `(s)` slot and release the temp.
+        # (an integer GPR, or a SIMD temp for a spilled float); store it to the `(s)`
+        # slot and release the temp.
         if v.kind == InReg:
           g.emitStoreLoc(loc, v.r)
           if v.isTemp: g.unbindTemp(v.r)
+        elif v.kind == InFReg:                           # spilled float init
+          g.emFloatScalarStore(nm, v.f, loc.typ.size * 8)
+          if v.isTemp: g.unbindFTmp(v.f)
         else: raiseAssert "arkham x64n: stack var init " & $v.kind
       else: discard
     while cc.hasMore: skip cc

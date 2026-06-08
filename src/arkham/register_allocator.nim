@@ -288,7 +288,9 @@ proc isFloatVal(b: var Builder; n: Cursor): bool =
   ## those are gated out anyway.
   case n.kind
   of FloatLit: true
-  of Symbol: b.symLoc(symName(n)).kind == InFReg
+  of Symbol:
+    let h = b.symLoc(symName(n))
+    h.kind == InFReg or (h.kind == NamedStack and h.typ.isFloat)
   of TagLit:
     case n.exprKind
     of AddC, SubC, MulC, DivC, NegC, ConvC, CastC:
@@ -415,12 +417,16 @@ proc allocFValue(b: var Builder; n: var Cursor; dest: var Location) =
     inc n
   of Symbol:
     let home = b.symLoc(symName(n))
-    if home.kind == InFReg:
+    case home.kind
+    of InFReg:
       if dest.kind != InFReg: dest = home        # Undef dest: use the home in place
       # else keep the caller's dest; the emitter moves home → dest
+    of NamedStack:
+      # a spilled / address-taken float `(s)` slot: load it into a SIMD register
+      # (the emitter reads the home from locationOfSym and emits a movsd from the slot).
+      if dest.kind != InFReg: dest = b.reserveFTmp(home.typ)
     else:
-      # a spilled / address-taken float, or a module-level float: the v1 pure
-      # emitter cannot load those yet — route the proc to legacy.
+      # a module-level float global / tvar: not yet handled by the pure emitter.
       if dest.kind != InFReg: dest = b.reserveFTmp(floatSlot(64))
       b.ra.exprUnsupported = true
     b.ra.locs[pos] = dest
@@ -798,13 +804,16 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
         b.pendingFree.add (pos: vi.freeAfter, name: name)
       if b.allocExprs and hasValue:
         if slot.isFloat:
-          # A float local: its register home (xmm) receives the float initializer
-          # directly (destination-passing). A spilled float home routes to legacy.
+          # A float local: a register home (xmm) receives the initializer directly
+          # (destination-passing); a spilled / address-taken float `(s)` slot gets it
+          # computed into a SIMD temp the emitter then stores.
           if loc.kind == InFReg:
             var d = loc
             allocFValue(b, valCur, d)
           else:
-            b.ra.exprUnsupported = true
+            var d = b.reserveFTmp(slot)
+            allocFValue(b, valCur, d)
+            b.releaseFTmp(d)
         elif loc.kind == InReg:
           # Destination-passing: allocate the initializer to compute directly into the
           # local's register home. The home is already taken from the pool (above), so
