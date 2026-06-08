@@ -1141,9 +1141,15 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
             loc = b.spill(effSlot)
           elif intIdx < b.md.intArgRegs.len:
             let arg = b.md.intArgRegs[intIdx]
+            # A leaf param would normally stay in its arg register, but if that
+            # register is a fixed-instruction scratch the body clobbers (rdx for
+            # div/mod, rcx for a variable shift), it must move to a callee-saved
+            # home that survives the clobber. Treat it like a cross-call param.
+            let clobbered = (arg == b.md.divRemReg and b.an.clobbersDivReg) or
+                            (arg == b.md.shiftCountReg and b.an.clobbersShiftReg)
             if AddrTaken in props and not aggrByRef:
               loc = b.spill(effSlot)           # address taken → must be on the stack
-            elif hasCall or aggrByRef:
+            elif hasCall or aggrByRef or clobbered:
               # Live across a call (the incoming arg reg is volatile), or a by-ref
               # pointer that must survive repeated field loads in the body: give
               # it a callee-saved home so the prologue can `mov home, argReg`.

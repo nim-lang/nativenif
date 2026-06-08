@@ -39,6 +39,10 @@ type
   ProcAnalysis* = object
     vars*: Table[string, VarInfo]
     hasCall*: bool
+    clobbersDivReg*: bool       ## body contains a div/mod → rdx is clobbered, so a
+                                ## leaf param must not be homed there (x86-64 only)
+    clobbersShiftReg*: bool     ## body contains a variable shift → rcx (cl) is
+                                ## clobbered, so a leaf param must not be homed there
 
   Scope = object
     vars: seq[string]
@@ -185,6 +189,18 @@ proc analyse(c: var Context; n: var Cursor) =
         case n.substructureKind
         of ElifU, ElseU, OfU: analyseChildren(c, n)
         else: skip n
+      of DivC, ModC:
+        c.res.clobbersDivReg = true     # idiv/div clobbers rdx
+        analyseChildren(c, n)
+      of ShlC, ShrC:
+        # A *variable* shift needs the count in cl, clobbering rcx; a constant shift
+        # does not. The count is the second operand (after the result type).
+        var probe = n; probe.into:
+          skip probe                    # result type
+          skip probe                    # value
+          if probe.kind notin {IntLit, UIntLit, CharLit}: c.res.clobbersShiftReg = true
+          while probe.hasMore: skip probe
+        analyseChildren(c, n)
       else:
         analyseChildren(c, n)           # generic expression: recurse
     of ScopeS:                          # a variable scope AND a statement list
