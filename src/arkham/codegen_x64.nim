@@ -5096,29 +5096,40 @@ proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
       return
     let unsigned = g.cmpOperandUnsigned(aC) or g.cmpOperandUnsigned(bC)
     let tag = cmpJccTag(ek, whenTrue, signed = not unsigned)
-    g.emitValue2(aC)                                     # materialize the lhs (into a reg)
+    let aLoc0 = g.ra.locs[cursorToPosition(g.buf[], aC)]
     let bLoc0 = g.ra.locs[cursorToPosition(g.buf[], bC)]
-    if bLoc0.kind != Mem: g.emitValue2(bC)               # rhs: a folded memory load stays put
+    if aLoc0.kind != Mem: g.emitValue2(aC)               # lhs: a folded memory load stays put
+    if bLoc0.kind != Mem: g.emitValue2(bC)               # rhs: ditto
     let aLoc = g.ra.locs[cursorToPosition(g.buf[], aC)]
     let bLoc = g.ra.locs[cursorToPosition(g.buf[], bC)]
-    assert aLoc.kind == InReg, "arkham x64n: cmp lhs " & $aLoc.kind
-    case bLoc.kind
-    of Imm:
-      g.ab.tree CmpX64: (g.emReg aLoc.r; g.ab.intLit bLoc.ival)
-    of InReg:
-      g.ab.tree CmpX64: (g.emReg aLoc.r; g.emReg bLoc.r)
-    of NamedStack:                                      # spilled scalar slot: cmp reg, [rsp+slot]
-      g.withMemOperand(bLoc):                            #   (no access chain → no borrowTmp)
+    if aLoc.kind == Mem:                                 # left folded: cmp [addr], rreg/imm
+      g.prematLval2(aC)
+      g.ab.tree CmpX64:
+        g.ab.tree MemX: g.emLvalAddr2(aC)
+        case bLoc.kind
+        of Imm: g.ab.intLit bLoc.ival
+        of InReg: g.emReg bLoc.r
+        else: raiseAssert "arkham x64n: cmp(memlhs) rhs " & $bLoc.kind
+      g.unbindLvalTemps2(aC)
+    else:
+      assert aLoc.kind == InReg, "arkham x64n: cmp lhs " & $aLoc.kind
+      case bLoc.kind
+      of Imm:
+        g.ab.tree CmpX64: (g.emReg aLoc.r; g.ab.intLit bLoc.ival)
+      of InReg:
+        g.ab.tree CmpX64: (g.emReg aLoc.r; g.emReg bLoc.r)
+      of NamedStack:                                     # spilled scalar slot: cmp reg, [rsp+slot]
+        g.withMemOperand(bLoc):                          #   (no access chain → no borrowTmp)
+          g.ab.tree CmpX64:
+            g.emReg aLoc.r
+            g.emMemOperandLoc(bLoc, regs, ri)
+      of Mem:                                            # folded memory load: cmp reg, [addr]
+        g.prematLval2(bC)
         g.ab.tree CmpX64:
           g.emReg aLoc.r
-          g.emMemOperandLoc(bLoc, regs, ri)
-    of Mem:                                              # folded memory load: cmp reg, [addr]
-      g.prematLval2(bC)
-      g.ab.tree CmpX64:
-        g.emReg aLoc.r
-        g.ab.tree MemX: g.emLvalAddr2(bC)
-      g.unbindLvalTemps2(bC)
-    else: raiseAssert "arkham x64n: cmp rhs " & $bLoc.kind
+          g.ab.tree MemX: g.emLvalAddr2(bC)
+        g.unbindLvalTemps2(bC)
+      else: raiseAssert "arkham x64n: cmp rhs " & $bLoc.kind
     g.emJcc(tag, toLabel)
     if bLoc.kind == InReg and bLoc.isTemp: g.unbindTemp(bLoc.r)
     if aLoc.kind == InReg and aLoc.isTemp: g.unbindTemp(aLoc.r)

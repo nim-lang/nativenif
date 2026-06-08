@@ -694,24 +694,47 @@ proc allocCond(b: var Builder; n: var Cursor) =
       b.releaseFTmp(rDest)
       b.releaseFTmp(lDest)
     else:
-      var lDest = needsReg(ScalarSlot)
-      n.into:
-        allocValue(b, n, lDest)                # left → a register
-        if isMemLeaf(n):
-          # right is a memory load → fold it as `cmp lreg, [mem]` (no held register).
-          # Its address regs are placed here and die with the compare.
-          let rPos = b.posOf(n)
-          var rc = n
-          allocLvalue2(b, rc)
+      var lhsC, rhsC: Cursor
+      block:
+        var cc = n
+        cc.into:
+          lhsC = cc; skip cc                   # comparison has NO type child
+          rhsC = cc; skip cc
+          while cc.hasMore: skip cc
+      if isMemLeaf(lhsC) and not isMemLeaf(rhsC):
+        # left is a memory load, right is not → fold the LEFT as `cmp [mem], rreg/imm`
+        # (x86 allows a memory destination); the right goes to a reg or immediate (only
+        # one memory operand). Avoids loading the left into a held register.
+        n.into:
+          let lPos = b.posOf(n)
+          var lc = n
+          allocLvalue2(b, lc)
           releaseLvalTemps(b, n)
-          b.ra.locs[rPos] = memLoc(n, ScalarSlot)
+          b.ra.locs[lPos] = memLoc(n, ScalarSlot)
           skip n
-        else:
-          var rDest = dontCare
-          allocValue(b, n, rDest)              # right → reg / imm (folded)
+          var rDest = regOrImm(ScalarSlot)
+          allocValue(b, n, rDest)              # right → reg / imm (not memory)
           b.releaseTmp(rDest)
-        while n.hasMore: skip n
-      b.releaseTmp(lDest)
+          while n.hasMore: skip n
+      else:
+        var lDest = needsReg(ScalarSlot)
+        n.into:
+          allocValue(b, n, lDest)              # left → a register
+          if isMemLeaf(n):
+            # right is a memory load → fold it as `cmp lreg, [mem]` (no held register).
+            # Its address regs are placed here and die with the compare.
+            let rPos = b.posOf(n)
+            var rc = n
+            allocLvalue2(b, rc)
+            releaseLvalTemps(b, n)
+            b.ra.locs[rPos] = memLoc(n, ScalarSlot)
+            skip n
+          else:
+            var rDest = dontCare
+            allocValue(b, n, rDest)            # right → reg / imm (folded)
+            b.releaseTmp(rDest)
+          while n.hasMore: skip n
+        b.releaseTmp(lDest)
   else:
     var d = needsReg(ScalarSlot)
     allocValue(b, n, d)
