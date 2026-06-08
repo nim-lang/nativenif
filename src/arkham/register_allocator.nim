@@ -322,6 +322,7 @@ proc resolveDest(b: var Builder; dest: var Location; natural: Location) =
 
 proc allocValue(b: var Builder; n: var Cursor; dest: var Location)
 proc allocFValue(b: var Builder; n: var Cursor; dest: var Location)
+proc allocLvalue2(b: var Builder; n: var Cursor)
 
 proc regOccupied(b: var Builder; reg: Reg): bool
 
@@ -457,6 +458,15 @@ proc allocFValue(b: var Builder; n: var Cursor; dest: var Location) =
           allocValue(b, n, gd)
           b.releaseTmp(gd)
         while n.hasMore: skip n
+      b.ra.locs[pos] = resDest
+      return
+    of DerefC, DotC, AtC, PatC:
+      # A float lvalue in value position → load `[addr]` into an xmm. The embedded
+      # base/index values are placed by allocLvalue2; the result lands in `dest`.
+      if dest.kind != InFReg:
+        dest = b.reserveFTmp(if dest.typ.kind == AFloat: dest.typ else: floatSlot(64))
+      let resDest = dest
+      allocLvalue2(b, n)                          # embedded base/index regs; advances past
       b.ra.locs[pos] = resDest
       return
     of SufC, ParC:                               # `(suf v "type")` / `(par v)` wrapper
@@ -914,13 +924,19 @@ proc walk(b: var Builder; n: var Cursor) =
             var t = dontCare
             allocValue(b, n, t)
         else:
-          # A memory store through a complex lvalue (dot/deref): place the lvalue's
-          # embedded base/index regs, then the rhs into a REGISTER (nifasm has no
+          # A memory store through a complex lvalue (dot/deref/at): place the lvalue's
+          # embedded base/index regs, then the rhs into a register. A FLOAT rhs goes to
+          # an xmm (movsd to memory); an integer rhs to a GPR (nifasm has no
           # immediate-to-memory `mov`, so an immediate is loaded into a temp first).
           allocLvalue2(b, n)                   # lhs address operands; advances past lhs
-          var rdest = needsReg(ScalarSlot)
-          allocValue(b, n, rdest)              # rhs value → a register
-          b.releaseTmp(rdest)
+          if b.isFloatVal(n):
+            var rdest = dontCare
+            allocFValue(b, n, rdest)           # rhs float value → an xmm
+            b.releaseFTmp(rdest)
+          else:
+            var rdest = needsReg(ScalarSlot)
+            allocValue(b, n, rdest)            # rhs value → a register
+            b.releaseTmp(rdest)
         while n.hasMore: skip n
     else:
       n.into:

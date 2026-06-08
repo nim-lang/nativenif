@@ -36,10 +36,9 @@ const arkhamKnownUnsupported: seq[string] = @[
   "oconstr", "structasgn", "structasgn_liveparam", "structcopy", "structinit_liveparam",
   "structparam", "structparam_big", "structret", "structret_big", "array2d",
   # float CALLS (a float param/return makes a proc non-declarative → emitCall2's
-  # declarative-only path can't reach it; needs the manual-marshal path) + float
-  # addressing (float field/array-elem/deref/spill-arg):
-  "fpfunc", "fpcall", "fparith2", "fpcmp2", "fpasgn", "fparray", "fpfield", "fpderef",
-  "addrfloat", "div_floatparam", "fparg_spill", "fpparamspill", "fpdeep",
+  # declarative-only path can't reach it; needs the manual-marshal path):
+  "fpfunc", "fpcall", "fparith2", "fpcmp2", "fpasgn", "fpderef",
+  "div_floatparam", "fparg_spill", "fpparamspill", "fpdeep",
   # atomics / mem intrinsics (fixed-register sequences — port genAtomic/genMemIntrin):
   "atomic", "atomic2", "atomic_cas", "memcmp", "memcpy", "memmove", "memset",
   # indirect (fn-ptr) calls + 7th+ stack args:

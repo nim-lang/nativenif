@@ -4077,6 +4077,7 @@ proc place2(g: var CodeGen; src: Location; dest: Reg) =
 
 proc emitValue2(g: var CodeGen; c: Cursor)
 proc emitFValue2(g: var CodeGen; c: Cursor)
+proc emitFMemLoad2(g: var CodeGen; c: Cursor)
 proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool)
 proc emitCondValue2(g: var CodeGen; c: Cursor)
 proc emitMemLoad2(g: var CodeGen; c: Cursor)
@@ -4337,6 +4338,7 @@ proc emitFValue2(g: var CodeGen; c: Cursor) =
     case c.exprKind
     of AddC, SubC, MulC, DivC: g.emitFBin2(c)
     of ConvC, CastC: g.emitCast2(c)                       # conversion TO float (emitCast2 handles InFReg)
+    of DerefC, DotC, AtC, PatC: g.emitFMemLoad2(c)        # float lvalue load → movsd res, [addr]
     of SufC, ParC:
       var inner: Cursor
       block:
@@ -4490,6 +4492,19 @@ proc emitMemLoad2(g: var CodeGen; c: Cursor) =
     g.emReg res.r
     g.ab.tree MemX: g.emLvalAddr2(c)
   g.unbindLvalTemps2(c)                                  # release embedded base/index temps
+
+proc emitFMemLoad2(g: var CodeGen; c: Cursor) =
+  ## Load the FLOAT scalar at lvalue `c` into its pre-allocated xmm result:
+  ## `movsd res, (mem <addr>)` (movss for f32). The SIMD twin of `emitMemLoad2`.
+  let res = g.ra.locs[cursorToPosition(g.buf[], c)]
+  assert res.kind == InFReg, "arkham x64n: float mem-load result " & $res.kind
+  let bits = if res.typ.size == 4: 32 else: 64
+  g.prematLval2(c)
+  if res.isTemp: g.bindFTmp(res.f)                        # consumer unbinds
+  g.ab.tree (if bits == 32: MovssX64 else: MovsdX64):
+    g.emFReg res.f
+    g.ab.tree MemX: g.emLvalAddr2(c)
+  g.unbindLvalTemps2(c)                                   # release embedded base/index temps
 
 proc emitAddr2(g: var CodeGen; c: Cursor) =
   ## `(addr lvalue)` → a pointer in the result register. `&(deref p) == p` (identity);
@@ -4813,20 +4828,28 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
           if v.isTemp: g.unbindTemp(v.r)
         else: raiseAssert "arkham x64n: asgn lhs home " & $dst.kind
       else:
-        # A memory store through a complex lvalue (dot/deref): materialize the lvalue's
-        # embedded base regs, compute the rhs (reg / imm), then `mov (mem <addr>), rhs`.
+        # A memory store through a complex lvalue (dot/deref/at): materialize the lvalue's
+        # embedded base regs, compute the rhs, then `mov (mem <addr>), rhs` — `movsd` for a
+        # float rhs (in an xmm), else `mov` for an integer/immediate rhs.
         let lhs = cc
         g.prematLval2(lhs)
         skip cc                                             # past the whole lhs subtree
         g.emitValue2(cc)                                    # rhs value
         let v = g.ra.locs[cursorToPosition(g.buf[], cc)]
-        g.ab.tree MovX64:
-          g.ab.tree MemX: g.emLvalAddr2(lhs)
-          case v.kind
-          of Imm: g.ab.intLit v.ival
-          of InReg: g.emReg v.r
-          else: raiseAssert "arkham x64n: store rhs " & $v.kind
-        if v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
+        if v.kind == InFReg:                                # float store
+          let bits = if v.typ.size == 4: 32 else: 64
+          g.ab.tree (if bits == 32: MovssX64 else: MovsdX64):
+            g.ab.tree MemX: g.emLvalAddr2(lhs)
+            g.emFReg v.f
+          if v.isTemp: g.unbindFTmp(v.f)
+        else:
+          g.ab.tree MovX64:
+            g.ab.tree MemX: g.emLvalAddr2(lhs)
+            case v.kind
+            of Imm: g.ab.intLit v.ival
+            of InReg: g.emReg v.r
+            else: raiseAssert "arkham x64n: store rhs " & $v.kind
+          if v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
         g.unbindLvalTemps2(lhs)                          # release embedded base/index temps
       while cc.hasMore: skip cc
   of WhileS:
