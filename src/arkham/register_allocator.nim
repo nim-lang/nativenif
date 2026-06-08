@@ -439,6 +439,44 @@ proc allocFBin(b: var Builder; n: var Cursor; dest: var Location) =
   ## passed (the gate restricts float ops to var-init / ret), so `dest` is never a
   ## standalone temp.
   let pos = b.posOf(n)
+  let ek = n.exprKind
+  # Peek operands to decide a Sethi–Ullman swap (the SIMD twin of `allocBin`): when
+  # the left operand is a foldable float leaf (a local read) and the right is a
+  # computed subtree, evaluate the right first straight into the result register,
+  # then fold the left — collapsing a right-nested commutative chain to O(1) live
+  # xmm registers. Restricted to commutative ops (add/mul): float `sub`/`div` would
+  # need a sign-flip the simple fold can't express.
+  var lhsC, rhsC: Cursor
+  var fslotPeek = floatSlot(64)
+  block:
+    var cc = n
+    cc.into:
+      fslotPeek = slotOf(b.prog[], cc); skip cc # result float type
+      lhsC = cc; skip cc
+      rhsC = cc; skip cc
+      while cc.hasMore: skip cc                  # drain the copy
+  proc foldableFloatLeaf(b: var Builder; c: Cursor): bool =
+    c.kind == Symbol and b.symLoc(symName(c)).kind in {InFReg, NamedStack}
+  let lHome = (if lhsC.kind == Symbol: b.symLoc(symName(lhsC)) else: dontCare)
+  let swap = ek in {AddC, MulC} and b.foldableFloatLeaf(lhsC) and
+             not b.foldableFloatLeaf(rhsC) and
+             not (dest.kind == InFReg and lHome.kind == InFReg and lHome.f == dest.f)
+  if swap:
+    var acc = dest
+    if acc.kind != InFReg: acc = b.reserveFTmp(fslotPeek)
+    n.into:
+      skip n                                    # result float type
+      skip n                                    # left (folded after)
+      allocFValue(b, n, acc)                    # right → the accumulator register
+      while n.hasMore: skip n
+    var fsc: seq[FReg] = @[]                     # an fscratch to load a spilled left
+    if lHome.kind == NamedStack:
+      let lt = b.reserveFTmp(fslotPeek); b.releaseFTmp(lt)
+      if lt.kind == InFReg: fsc = @[lt.f]
+      else: b.ra.exprUnsupported = true
+    b.ra.aux[pos] = ExprAux(swapped: true, fscratch: fsc)
+    b.ra.locs[pos] = acc
+    return
   var fslot = floatSlot(64)
   n.into:
     fslot = slotOf(b.prog[], n); skip n        # result float type → its precise slot

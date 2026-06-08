@@ -25,16 +25,11 @@ proc execExpectOutput(cmd: string; expected: string) =
     quit "UNEXPECTED OUTPUT " & cmd & "\nExpected:\n" & expected & "\nGot:\n" & s
 
 const arkhamKnownUnsupported: seq[string] = @[
-  # value-core rewrite — THE FLIP: the x86-64 backend now emits EVERY proc through
-  # the new pure-emit path (no `procModeled2` gate, no legacy fallback). These stems
-  # exercise constructs the new path does not handle yet, so they are quarantined
-  # until their family is ported. Grouped by the missing feature. (arm64 still runs
-  # them via its own legacy codegen — see arkhamLinuxA64Unsupported, which stays
-  # empty — so the features keep regression coverage there.)
-  #
-  # register-pressure spill totality — >8 float args (stack) and deep float
-  # expression trees (the integer cases now route through the Sethi–Ullman reorder):
-  "fparg_spill", "fpdeep",
+  # value-core rewrite — THE FLIP: the x86-64 backend emits EVERY proc through the
+  # new pure-emit path (no `procModeled2` gate, no legacy fallback). The whole
+  # corpus now routes through it cleanly — register-pressure totality for deep
+  # right-nested expression trees is handled by the Sethi–Ullman reorder in
+  # allocBin/allocFBin (no quarantine remains).
 ]
 
 proc arkhamTests() =

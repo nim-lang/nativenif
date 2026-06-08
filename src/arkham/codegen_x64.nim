@@ -4479,6 +4479,21 @@ proc emitFBin2(g: var CodeGen; c: Cursor) =
       lhsC = cc; skip cc
       rhsC = cc; skip cc
       while cc.hasMore: skip cc
+  let aux = g.ra.aux.getOrDefault(pos)
+  if aux.swapped:
+    # Sethi–Ullman: the rhs was evaluated first into the result register; the leaf
+    # float lhs (a local read) folds after. Commutative only, so `res op= lhs`.
+    g.emitFValue2(rhsC)                                  # rhs → res (binds res if a temp)
+    let lhome = g.ra.locationOfSym(symName(lhsC))
+    if lhome.kind == InFReg:
+      g.fbin(op32, op64, res.f, lhome.f, bits)
+    else:                                                # spilled: load into the fscratch, fold
+      let lt = aux.fscratch[0]
+      g.bindFTmp(lt)
+      g.emFloatScalarLoad(lt, lhome.name, bits)
+      g.fbin(op32, op64, res.f, lt, bits)
+      g.unbindFTmp(lt)
+    return
   g.emitFValue2(lhsC)                                    # a → res (== result reg)
   let rhsLoc = g.ra.locs[cursorToPosition(g.buf[], rhsC)]
   if rhsLoc.kind == InFReg and not rhsLoc.isTemp:        # in-place float local: fold directly
