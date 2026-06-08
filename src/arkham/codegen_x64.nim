@@ -4117,41 +4117,68 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
   if lhsLoc.kind == InReg and lhsLoc.isTemp and not reusedLhs: g.unbindTemp(lhsLoc.r)
 
 proc emitCall2(g: var CodeGen; c: Cursor) =
-  ## Emit a modeled call: each argument is already placed in its ABI register by the
-  ## allocator, so materialize it there and bind it (`(mov (arg pN) reg)`); then the
-  ## `(call)`/`(syscall)`; then move the result (rax) to its destination
-  ## (`locs[posOf c]` — a dest-passed home, or rax for a discarded/result-in-rax).
+  ## Emit a call. The allocator placed each argument in its ABI register (integer →
+  ## rdi…r9, float → xmm0–7) and the result in rax / xmm0 (or a dest-passed home).
+  ## Two ABIs: the DECLARATIVE one (all-scalar-int params) binds each arg via
+  ## `(arg pN)` inside the prepare and reads `(res ret.0)`; the NON-DECLARATIVE one
+  ## (float param/return — and later aggregates) evaluates args into raw ABI registers
+  ## and emits a bare `(prepare f (call))`, reading the result from rax / xmm0 raw.
   let pos = cursorToPosition(g.buf[], c)
   let resLoc = g.ra.locs[pos]
   var argCurs: seq[Cursor] = @[]
-  var asmName = ""
-  var isSyscall = false
-  var hasResult = false
+  var fsym = ""
   block:
     var fc = c
     fc.into:
-      let fsym = symName(fc); inc fc
-      let tgt = g.callTarget[fsym]                  # resolved during gating (callModeled2)
-      asmName = tgt.asmName
-      isSyscall = tgt.syscall
-      hasResult = not retIsVoid(tgt.retType)
+      fsym = symName(fc); inc fc
       while fc.hasMore: (argCurs.add fc; skip fc)
-  g.ab.tree PrepareX64:
-    g.ab.sym asmName
+  if not g.callTarget.hasKey(fsym):                 # resolve + cache (post-flip: no gate prepass)
+    let si = g.lookupSym(fsym)
+    if si.cat in {scGlobal, scTvar}:
+      g.callTarget[fsym] = CallTarget(declarative: true, indirect: true,
+        asmName: fsym, retType: g.indirectRetType(si.decl))
+    else:
+      g.callTarget[fsym] = foreignCallTarget(g.prog, fsym)
+  let tgt = g.callTarget[fsym]
+  let isSyscall = tgt.syscall
+  let hasResult = not retIsVoid(tgt.retType)
+  let resultIsFloat = hasResult and slotOf(g.prog, tgt.retType).kind == AFloat
+  if tgt.declarative:
+    g.ab.tree PrepareX64:
+      g.ab.sym tgt.asmName
+      for idx in 0 ..< argCurs.len:
+        g.emitValue2(argCurs[idx])                  # compute into its (integer) arg register
+        let aloc = g.ra.locs[cursorToPosition(g.buf[], argCurs[idx])]
+        g.ab.tree MovX64:
+          g.ab.tree ArgX: g.ab.sym paramName(idx)
+          g.emReg aloc.r                            # InReg(argReg) by construction
+      if isSyscall: g.emSyscall()
+      else: g.ab.keyword CallX64
+      if hasResult:
+        g.ab.tree MovX64:
+          g.emReg RAX
+          g.ab.tree ResX: g.ab.sym "ret.0"
+    if hasResult and resLoc.kind == InReg and resLoc.r != RAX:
+      g.movReg(resLoc.r, RAX)
+  else:
+    # Non-declarative: each arg is evaluated straight into its raw ABI register (float →
+    # xmm{n}, integer → the GPR). (No reactive sealing; like the declarative path this
+    # relies on hexer's un-nesting leaving args simple — an arg whose source is another
+    # arg register would need a parallel-move shuffle, not yet handled.)
     for idx in 0 ..< argCurs.len:
-      g.emitValue2(argCurs[idx])                    # compute into its arg register
-      let aloc = g.ra.locs[cursorToPosition(g.buf[], argCurs[idx])]
-      g.ab.tree MovX64:
-        g.ab.tree ArgX: g.ab.sym paramName(idx)
-        g.emReg aloc.r                              # InReg(argReg) by construction
-    if isSyscall: g.emSyscall()
-    else: g.ab.keyword CallX64
+      g.emitValue2(argCurs[idx])
+    g.ab.tree PrepareX64:
+      g.ab.sym tgt.asmName
+      if isSyscall: g.emSyscall()
+      else: g.ab.keyword CallX64
     if hasResult:
-      g.ab.tree MovX64:
-        g.emReg RAX
-        g.ab.tree ResX: g.ab.sym "ret.0"
-  if hasResult and resLoc.kind == InReg and resLoc.r != RAX:
-    g.movReg(resLoc.r, RAX)
+      if resultIsFloat:
+        if resLoc.kind == InFReg:
+          if resLoc.isTemp: g.bindFTmp(resLoc.f)
+          if resLoc.f != FloatRet:
+            g.fmovF(resLoc.f, FloatRet, (if resLoc.typ.size == 4: 32 else: 64))
+      elif resLoc.kind == InReg and resLoc.r != RAX:
+        g.movReg(resLoc.r, RAX)
 
 proc emitDivMod2(g: var CodeGen; c: Cursor) =
   ## Emit x86 `idiv`/`div`: the allocator pinned the dividend to rax and the divisor
@@ -4338,6 +4365,7 @@ proc emitFValue2(g: var CodeGen; c: Cursor) =
     case c.exprKind
     of AddC, SubC, MulC, DivC: g.emitFBin2(c)
     of ConvC, CastC: g.emitCast2(c)                       # conversion TO float (emitCast2 handles InFReg)
+    of CallC: g.emitCall2(c)                              # float-result call → xmm0 → res
     of DerefC, DotC, AtC, PatC: g.emitFMemLoad2(c)        # float lvalue load → movsd res, [addr]
     of SufC, ParC:
       var inner: Cursor

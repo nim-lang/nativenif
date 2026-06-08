@@ -35,18 +35,15 @@ const arkhamKnownUnsupported: seq[string] = @[
   # aggregates (oconstr/aconstr, struct copy/asgn, by-val ≤16B / by-ref >16B params+returns):
   "oconstr", "structasgn", "structasgn_liveparam", "structcopy", "structinit_liveparam",
   "structparam", "structparam_big", "structret", "structret_big", "array2d",
-  # float CALLS (a float param/return makes a proc non-declarative → emitCall2's
-  # declarative-only path can't reach it; needs the manual-marshal path):
-  "fpfunc", "fpcall", "fparith2", "fpcmp2", "fpasgn", "fpderef",
-  "div_floatparam", "fparg_spill", "fpparamspill", "fpdeep",
   # atomics / mem intrinsics (fixed-register sequences — port genAtomic/genMemIntrin):
   "atomic", "atomic2", "atomic_cas", "memcmp", "memcpy", "memmove", "memset",
   # indirect (fn-ptr) calls + 7th+ stack args:
   "indirect_call", "call_stack_args",
   # idiv/idiv-mod when rdx is a live param home (allocator bails → no legacy now):
   "divparam", "modparam",
-  # register-pressure spill totality (the pure emitter has no spill path yet):
-  "deep_spill", "deep_spill_call", "ideep",
+  # register-pressure spill totality (the pure emitter has no spill path yet) —
+  # incl. >8 float args (stack) and deep float expression trees:
+  "deep_spill", "deep_spill_call", "ideep", "fparg_spill", "fpdeep",
   # asgn whose rhs reads the lhs as a non-first operand (`x = y - x`) — destination-
   # passing aliasing the guard bails; addr-of-tvar:
   "aliasbin", "tvar_addr",

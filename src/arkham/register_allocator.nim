@@ -323,6 +323,7 @@ proc resolveDest(b: var Builder; dest: var Location; natural: Location) =
 proc allocValue(b: var Builder; n: var Cursor; dest: var Location)
 proc allocFValue(b: var Builder; n: var Cursor; dest: var Location)
 proc allocLvalue2(b: var Builder; n: var Cursor)
+proc allocCall(b: var Builder; n: var Cursor; dest: var Location)
 
 proc regOccupied(b: var Builder; reg: Reg): bool
 
@@ -469,6 +470,12 @@ proc allocFValue(b: var Builder; n: var Cursor; dest: var Location) =
       allocLvalue2(b, n)                          # embedded base/index regs; advances past
       b.ra.locs[pos] = resDest
       return
+    of CallC:
+      # A float-result call: the result arrives in xmm0; `dest` (the float home / a
+      # SIMD temp) receives it. allocCall places the args (float → xmm0–7).
+      if dest.kind != InFReg:
+        dest = b.reserveFTmp(if dest.typ.kind == AFloat: dest.typ else: floatSlot(64))
+      allocCall(b, n, dest); return              # records locs[pos] itself
     of SufC, ParC:                               # `(suf v "type")` / `(par v)` wrapper
       n.into:
         allocFValue(b, n, dest)
@@ -485,28 +492,39 @@ proc allocFValue(b: var Builder; n: var Cursor; dest: var Location) =
     b.ra.locs[pos] = dest
 
 proc allocCall(b: var Builder; n: var Cursor; dest: var Location) =
-  ## A call: each argument is allocated into its ABI argument register, the result
-  ## into the return register (or a destination-passed home). The v1 emitter only
-  ## handles ≤(#arg regs) scalar args with no value live across the call — the
-  ## backend's `procModeled2`/`callModeled2` gate enforces the rest (syscall vs
-  ## direct, no nested calls / aggregates / floats), so here we just place.
+  ## A call: each scalar/pointer argument is allocated into its ABI integer argument
+  ## register (rdi…r9), each float argument into its SIMD argument register (xmm0–7);
+  ## the result lands in the return register (rax, or xmm0 for a float result) or a
+  ## destination-passed home. Aggregate args / >N args still bail (exprUnsupported).
   let pos = b.posOf(n)
-  var argIdx = 0
+  var intIdx = 0
+  var fIdx = 0
   n.into:
     skip n                                     # callee symbol
     while n.hasMore:
-      if argIdx < b.md.intArgRegs.len:
-        var ad = regLoc(b.md.intArgRegs[argIdx], ScalarSlot)
+      if b.isFloatVal(n):                       # float argument → xmm{fIdx}
+        if fIdx < b.md.floatArgRegs.len:
+          var ad = fregLoc(b.md.floatArgRegs[fIdx], floatSlot(64))
+          allocFValue(b, n, ad)
+        else:
+          b.ra.exprUnsupported = true           # >8 float args (stack) — gap
+          var ad = dontCare
+          allocFValue(b, n, ad)
+        inc fIdx
+      elif intIdx < b.md.intArgRegs.len:        # integer/pointer argument → rdi…r9
+        var ad = regLoc(b.md.intArgRegs[intIdx], ScalarSlot)
         allocValue(b, n, ad)
+        inc intIdx
       else:
-        b.ra.exprUnsupported = true            # 7th+ arg (stack) — v1 emitter gap
+        b.ra.exprUnsupported = true            # 7th+ integer arg (stack) — gap
         var ad = dontCare
         allocValue(b, n, ad)
-      inc argIdx
+        inc intIdx
   case dest.kind
   of Undef, NeedsReg, RegOrImm:
-    dest = regLoc(b.md.intRetReg, ScalarSlot, isTemp = true)   # result in rax
-  else: discard                                # fixed dest: emitter moves rax → it
+    dest = regLoc(b.md.intRetReg, ScalarSlot, isTemp = true)   # int result in rax
+  else: discard                                # fixed dest (InReg / InFReg): emitter moves the
+                                               # result (rax / xmm0) into it
   b.ra.locs[pos] = dest
 
 proc allocCond(b: var Builder; n: var Cursor) =
