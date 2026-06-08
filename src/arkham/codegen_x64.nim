@@ -5099,6 +5099,7 @@ proc emitCaseTest2(g: var CodeGen; selReg: Reg; c: var Cursor; lBody: string; si
     g.emJcc(JeX64, lBody)
 
 proc genStmt2(g: var CodeGen; c: Cursor) =
+  if c.kind == DotToken: return                 # an empty statement (e.g. `(stmts .)`)
   case c.stmtKind
   of StmtsS:
     var cc = c
