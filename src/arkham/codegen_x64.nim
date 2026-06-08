@@ -4162,11 +4162,31 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
       g.movReg(resLoc.r, RAX)
   else:
     # Non-declarative: each arg is evaluated straight into its raw ABI register (float →
-    # xmm{n}, integer → the GPR). (No reactive sealing; like the declarative path this
-    # relies on hexer's un-nesting leaving args simple — an arg whose source is another
-    # arg register would need a parallel-move shuffle, not yet handled.)
+    # xmm{n}, integer → the GPR); an aggregate arg is marshalled into consecutive GPRs
+    # (by-value ≤16B) or passed as a pointer (by-ref). The intIdx/fIdx counting mirrors
+    # allocCall so an aggregate's register range matches. (No reactive sealing; like the
+    # declarative path this relies on hexer's un-nesting leaving args simple.)
+    var intIdx = 0
     for idx in 0 ..< argCurs.len:
-      g.emitValue2(argCurs[idx])
+      let a = argCurs[idx]
+      var aggrSz = -1
+      if a.kind == Symbol:
+        let h = g.ra.locationOfSym(symName(a))
+        if h.kind == NamedStack and h.typ.kind == AMem: aggrSz = h.typ.size
+      if aggrSz >= 0:
+        let tn = g.varType[symName(a)]
+        if aggrSz <= g.md.aggrByRefThreshold:             # by-value: words → GPRs
+          let words = (aggrSz + 7) div 8
+          g.structToRegs(symName(a), tn, g.md.intArgRegs[intIdx ..< intIdx + words])
+          intIdx += words
+        else:                                             # by-reference: &arg → one GPR
+          g.emStackAddr(g.md.intArgRegs[intIdx], symName(a))
+          inc intIdx
+      elif g.isFloatExpr(a):
+        g.emitValue2(a)                                   # → its xmm arg register
+      else:
+        g.emitValue2(a)                                   # → its GPR arg register
+        inc intIdx
     g.ab.tree PrepareX64:
       g.ab.sym tgt.asmName
       if isSyscall: g.emSyscall()
@@ -4707,6 +4727,12 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
         g.genConstr2(valC, nm)
       elif valC.kind == Symbol:                          # copy-init `var b = a`
         g.genAggrCopy2(nm, symName(valC), g.varType[nm], g.ra.aux[declPos].scratch[0])
+      elif valC.kind == TagLit and valC.exprKind == CallC:  # call-returned aggregate
+        let tn = g.varType[nm]
+        if g.aggrByRef(tn):
+          raiseAssert "arkham x64n: >16B aggregate call result (by-ref) not yet supported"
+        g.emitCall2(valC)                                # ≤16B result in rax:rdx
+        g.regsToStruct(nm, tn, x64RetRegs)
       else: raiseAssert "arkham x64n: aggregate var init " & $valC.exprKind
     elif hasVal:
       let valC = cc
@@ -4990,6 +5016,10 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
           g.place2(g.ra.locs[cursorToPosition(g.buf[], cc)], RDI)
         else: g.movImm(RDI, 0)
         g.movImm(RAX, LinuxX64ExitNr); g.emSyscall()
+      elif g.retAggrName.len > 0:                          # aggregate return
+        if g.retIndirect:
+          raiseAssert "arkham x64n: >16B aggregate return (hidden ptr) not yet supported"
+        g.structToRegs(symName(cc), g.retAggrName, x64RetRegs)  # ≤16B → rax:rdx
       elif hasVal:
         g.emitValue2(cc)
         let v = g.ra.locs[cursorToPosition(g.buf[], cc)]

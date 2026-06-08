@@ -502,7 +502,19 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location) =
   n.into:
     skip n                                     # callee symbol
     while n.hasMore:
-      if b.isFloatVal(n):                       # float argument → xmm{fIdx}
+      # An aggregate argument (a struct var): by-value ≤threshold consumes ceil(size/8)
+      # integer arg registers (the emitter marshals its words); by-reference (>threshold)
+      # consumes one (a pointer). No per-value allocation — the emitter reads the slot.
+      var aggrSz = -1
+      if n.kind == Symbol:
+        let h = b.symLoc(symName(n))
+        if h.kind == NamedStack and h.typ.kind == AMem: aggrSz = h.typ.size
+      if aggrSz >= 0:
+        let words = if aggrSz <= b.md.aggrByRefThreshold: (aggrSz + 7) div 8 else: 1
+        if intIdx + words > b.md.intArgRegs.len: b.ra.exprUnsupported = true
+        intIdx += words
+        skip n
+      elif b.isFloatVal(n):                     # float argument → xmm{fIdx}
         if fIdx < b.md.floatArgRegs.len:
           var ad = fregLoc(b.md.floatArgRegs[fIdx], floatSlot(64))
           allocFValue(b, n, ad)
@@ -833,6 +845,12 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
         if valCur.kind == TagLit and valCur.exprKind == OconstrC:
           var vc = valCur
           allocConstr(b, vc)                   # constructor: place each field's value
+        elif valCur.kind == TagLit and valCur.exprKind == CallC:
+          # a call-returned aggregate: place the call's args; a ≤16B result arrives in
+          # rax:rdx (the emitter writes it into the slot via regsToStruct).
+          var vc = valCur
+          var d = dontCare
+          allocCall(b, vc, d)
         elif valCur.kind == Symbol:
           # aggregate copy-init (`var b = a`): one scratch GPR carries each word from
           # the source slot to the destination slot.
@@ -840,7 +858,6 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
           if t.kind == InReg: b.ra.aux[pos] = ExprAux(scratch: @[t.r])
           else: b.ra.exprUnsupported = true
         else:
-          # call-returned aggregate: later slice
           b.ra.exprUnsupported = true
     else:
       let props = b.an.vars.getOrDefault(name).props
@@ -913,6 +930,9 @@ proc walk(b: var Builder; n: var Cursor) =
           if b.retFloatBits > 0:
             var d = fregLoc(b.md.floatArgRegs[0], floatSlot(b.retFloatBits))  # → xmm0
             allocFValue(b, n, d)
+          elif n.kind == Symbol and b.symLoc(symName(n)).kind == NamedStack and
+               b.symLoc(symName(n)).typ.kind == AMem:
+            skip n                                       # aggregate return: regsToRegs from the slot
           else:
             var d = regLoc(b.md.intRetReg, ScalarSlot)   # return value → the ABI ret reg
             allocValue(b, n, d)
