@@ -3948,14 +3948,21 @@ proc stmtModeled2(g: var CodeGen; c: Cursor): bool =
   of CallS: g.callModeled2(c)
   of AsgnS:
     var ok = true
+    var floatLhs = false
     var cc = c
     cc.into:
       if cc.kind == Symbol:
         if g.lookupSym(symName(cc)).cat notin {scNone, scGlobal, scTvar}: ok = false  # local or global store
-        elif g.isFloatExpr(cc): ok = false              # float-var store: later slice
+        elif g.isFloatExpr(cc):
+          # A float store: only a LOCAL float (a float global store is a later slice).
+          if g.lookupSym(symName(cc)).cat != scNone: ok = false
+          else: floatLhs = true
       elif not g.lvalModeled2(cc): ok = false           # complex lvalue (dot/deref store)
       skip cc                                            # lhs
-      if cc.hasMore and not (g.valModeled2(cc) or g.callModeled2(cc) or g.divModModeled2(cc)): ok = false
+      if cc.hasMore:
+        if floatLhs:
+          if not g.fvalModeled2(cc): ok = false
+        elif not (g.valModeled2(cc) or g.callModeled2(cc) or g.divModModeled2(cc)): ok = false
       while cc.hasMore: skip cc
     ok
   of WhileS:
@@ -4774,10 +4781,16 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         let v = g.ra.locs[cursorToPosition(g.buf[], cc)]
         case dst.kind
         of InReg: g.place2(v, dst.r)                        # dest-passed ⇒ usually a no-op
+        of InFReg:                                          # float reg home: rhs dest-passed
+          if v.kind == InFReg and v.f != dst.f:
+            g.fmovF(dst.f, v.f, dst.typ.size * 8)
         of NamedStack:                                      # stack-homed scalar: store + free
           if v.kind == InReg:
             g.emitStoreLoc(dst, v.r)
             if v.isTemp: g.unbindTemp(v.r)
+          elif v.kind == InFReg:                            # spilled float: store to its slot
+            g.emFloatScalarStore(dst.name, v.f, dst.typ.size * 8)
+            if v.isTemp: g.unbindFTmp(v.f)
           else: raiseAssert "arkham x64n: stack asgn rhs " & $v.kind
         of Undef:                                           # a module-level global / tvar store
           assert v.kind == InReg, "arkham x64n: global store rhs " & $v.kind

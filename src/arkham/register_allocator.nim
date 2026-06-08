@@ -875,7 +875,17 @@ proc walk(b: var Builder; n: var Cursor) =
         if n.kind == Symbol:
           let home = b.symLoc(symName(n))
           skip n                               # lhs (not a value-read)
-          if home.kind == InReg:
+          if home.kind == InFReg:
+            # A register-homed FLOAT local: the rhs computes directly into its xmm.
+            var dest = home
+            allocFValue(b, n, dest)
+          elif home.kind == NamedStack and home.typ.isFloat:
+            # A spilled float local: compute the rhs into a SIMD temp; the emitter
+            # stores it to the `(s) (f N)` slot.
+            var d = b.reserveFTmp(home.typ)
+            allocFValue(b, n, d)
+            b.releaseFTmp(d)
+          elif home.kind == InReg:
             # A register-homed local: destination-passing — the rhs computes directly
             # into the lhs home.
             var dest = home
