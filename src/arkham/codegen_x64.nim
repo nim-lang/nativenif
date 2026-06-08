@@ -5124,9 +5124,12 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         let lhsCur = cc                                     # captured for asLoc (global/tvar)
         let dst = g.ra.locationOfSym(symName(cc)); skip cc # local lvalue (reg or `(s)` slot)
         if dst.kind == NamedStack and dst.typ.kind == AMem:
-          # whole-aggregate assignment `b = a` (rhs is another aggregate lvalue)
-          g.genAggrCopy2(symName(lhsCur), symName(cc), g.varType[symName(lhsCur)],
-                         g.ra.aux[asgnPos].scratch[0])
+          if cc.kind == TagLit and cc.exprKind == OconstrC:
+            g.genConstr2(cc, symName(lhsCur))              # `b = T(field: …)`: build in place
+          else:
+            # whole-aggregate assignment `b = a` (rhs is another aggregate lvalue)
+            g.genAggrCopy2(symName(lhsCur), symName(cc), g.varType[symName(lhsCur)],
+                           g.ra.aux[asgnPos].scratch[0])
         else:
           g.emitValue2(cc)                                  # rhs computed into a reg / dst home
           let v = g.ra.locs[cursorToPosition(g.buf[], cc)]

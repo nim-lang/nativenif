@@ -1166,6 +1166,12 @@ proc walk(b: var Builder; n: var Cursor) =
             b.releaseTmp(addrT)
             if addrT.kind == InReg: b.ra.aux[asgnPos] = ExprAux(scratch: @[addrT.r])
             else: b.ra.exprUnsupported = true
+          elif home.kind == NamedStack and home.typ.kind == AMem and
+               n.kind == TagLit and n.exprKind == OconstrC:
+            # Aggregate constructor-assignment `b = T(field: …)`: place each field's
+            # value (the emitter stores it into `b`'s slot via genConstr2 — no copy
+            # scratch needed). Mirrors allocVarDecl's aggregate-init path.
+            allocConstr(b, n)                    # advances past the oconstr
           elif home.kind == NamedStack and home.typ.kind == AMem and n.kind == Symbol:
             # Whole-aggregate assignment `b = a` (both aggregate lvalues): a word-transfer
             # scratch GPR carries each 8-byte word from the source slot to `b`.
