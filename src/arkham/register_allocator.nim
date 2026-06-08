@@ -91,6 +91,8 @@ type
                                       ## 32/64 = a float return (the value goes to xmm0)
     retIndirect: bool                 ## the proc returns a >16B aggregate via a hidden
                                       ## result pointer (rdi in, parked in a callee-saved reg)
+    atScratch: HashSet[int]           ## value-core: `(at …)` positions needing a scratch GPR
+                                      ## (non-SIB element stride); sized by the codegen
 
 proc posOf(b: Builder; c: Cursor): int {.inline.} =
   cursorToPosition(b.buf[], c)
@@ -326,7 +328,7 @@ proc resolveDest(b: var Builder; dest: var Location; natural: Location) =
 
 proc allocValue(b: var Builder; n: var Cursor; dest: var Location)
 proc allocFValue(b: var Builder; n: var Cursor; dest: var Location)
-proc allocLvalue2(b: var Builder; n: var Cursor)
+proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = false)
 proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = false)
 
 proc regOccupied(b: var Builder; reg: Reg): bool
@@ -588,20 +590,36 @@ proc allocCond(b: var Builder; n: var Cursor) =
     allocValue(b, n, d)
     b.releaseTmp(d)
 
-proc allocLvalue2(b: var Builder; n: var Cursor) =
+proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = false) =
   ## Walk an lvalue subtree (the target of a load / store / `addr`), allocating its
   ## embedded VALUES — a `deref`'s pointer, a computed index — into registers (their
   ## homes, recorded in `locs`); stack-var / field names and immediate indices need
   ## no allocation. Advances `n` past the whole lvalue. v1 slice: stack-var field
-  ## access (`dot`) and pointer `deref` of a symbol; `at`/`pat`/computed bases bail.
+  ## access (`dot`) and pointer `deref` of a symbol; module-level global aggregate
+  ## bases (`(at M …)`).
+  ##
+  ## A global aggregate base needs its address materialized into a register before
+  ## the operand. `globBase` (passed by the consumer) names that register: for a
+  ## LOAD / `addr` it is the access *result* register (free until the load lands, so
+  ## reused — no extra temp, normal lifecycle); for a STORE it is a scratch the
+  ## caller reserved and holds across the rhs. A `dontCare` (e.g. a float load whose
+  ## result is an xmm) reserves an own GPR temp instead.
   case n.kind
   of Symbol:
-    inc n                                    # a stack-var / pointer base name — no alloc
+    let nm = symName(n)
+    if b.symLoc(nm).kind == Undef:           # a module-level global aggregate base
+      let pos = b.posOf(n)
+      if globBase.kind == InReg: b.ra.locs[pos] = globBase
+      else:
+        let t = b.reserveTmp(ScalarSlot)     # fallback (float load): own GPR temp
+        if t.kind == InReg: b.ra.locs[pos] = t
+        else: b.ra.exprUnsupported = true
+    inc n                                    # stack-var / pointer / global base name
   of TagLit:
     case n.exprKind
     of DotC:
       n.into:
-        allocLvalue2(b, n)                   # base (a stack var, or a `deref`)
+        allocLvalue2(b, n, globBase, isStore) # base (a stack var, deref, or global)
         while n.hasMore: skip n              # field name (+ any extras)
     of DerefC:
       n.into:
@@ -609,13 +627,24 @@ proc allocLvalue2(b: var Builder; n: var Cursor) =
         allocValue(b, n, d)                  # the pointer → a register (its home)
         while n.hasMore: skip n
     of AtC:
+      let atPos = b.posOf(n)
       n.into:
-        allocLvalue2(b, n)                   # base (a stack array, or a deref)
+        allocLvalue2(b, n, globBase, isStore) # base (stack array, deref, or global)
         if n.kind in {IntLit, UIntLit}: skip n   # immediate index — folds, no scratch
         else:
           var idx = needsReg(ScalarSlot)
           allocValue(b, n, idx)             # register index → a register (folds via scale)
         while n.hasMore: skip n
+      if atPos in b.atScratch:
+        # Non-SIB element stride: reserve a scratch GPR for nifasm's 3-operand `(at
+        # base idx scratch)`, recorded in aux. A LOAD consumes it within its own mov,
+        # so release it now (transient — the reg is reused by later siblings). A STORE
+        # consumes it only after the rhs, so hold it; releaseAtScratch frees it then.
+        let t = b.reserveTmp(ScalarSlot)
+        if t.kind == InReg:
+          b.ra.aux[atPos] = ExprAux(scratch: @[t.r])
+          if not isStore: b.releaseTmp(t)
+        else: b.ra.exprUnsupported = true
     of PatC:
       n.into:
         var d = needsReg(ScalarSlot)
@@ -629,6 +658,46 @@ proc allocLvalue2(b: var Builder; n: var Cursor) =
       b.ra.exprUnsupported = true; skip n    # computed base: later slice
   else:
     inc n
+
+proc lvalueGlobalBase(b: var Builder; n: Cursor): bool =
+  ## Does the lvalue chain `n` (a `dot`/`at` over a symbol) bottom out at a
+  ## module-level global aggregate? Such a base needs its address materialized into
+  ## a scratch register. A `deref`/`pat` base is a pointer VALUE, not a global
+  ## lvalue, so it stops the search. Read-only (never advances the caller's cursor).
+  var c = n
+  case c.kind
+  of Symbol: result = b.symLoc(symName(c)).kind == Undef
+  of TagLit:
+    case c.exprKind
+    of DotC, AtC:
+      var cc = c
+      cc.into:
+        result = lvalueGlobalBase(b, cc)
+        while cc.hasMore: skip cc
+    else: result = false
+  else: result = false
+
+proc releaseAtScratch(b: var Builder; n: Cursor) =
+  ## Release the `(at …)` scratch GPRs an `isStore` allocLvalue2 reserved and held
+  ## (so the rhs couldn't grab them). Called after the rhs is allocated. Walks the
+  ## lvalue chain; each at level's scratch (if any) is recorded in `aux[atPos]`.
+  var c = n
+  if c.kind == TagLit:
+    case c.exprKind
+    of DotC:
+      var cc = c
+      cc.into:
+        releaseAtScratch(b, cc)
+        while cc.hasMore: skip cc
+    of AtC:
+      let atPos = b.posOf(c)
+      var cc = c
+      cc.into:
+        releaseAtScratch(b, cc)              # base (recurse before this level)
+        while cc.hasMore: skip cc
+      if b.ra.aux.hasKey(atPos) and b.ra.aux[atPos].scratch.len > 0:
+        b.giveBack b.ra.aux[atPos].scratch[0]
+    else: discard
 
 proc regOccupied(b: var Builder; reg: Reg): bool =
   ## Is fixed register `reg` the persistent home of some symbol? Used to bail a
@@ -756,8 +825,8 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
       else: discard
       if dest.kind != InReg: b.ra.exprUnsupported = true
       let resDest = dest
-      allocLvalue2(b, n)                      # embedded base/index regs; advances past
-      b.ra.locs[pos] = resDest
+      allocLvalue2(b, n, resDest)             # embedded base/index regs; a global base
+      b.ra.locs[pos] = resDest                #   reuses resDest (free until the load lands)
       return
     of AddrC:
       # `(addr lvalue)` → a pointer in a register. Place any embedded base/index
@@ -769,7 +838,7 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
       if dest.kind != InReg: b.ra.exprUnsupported = true
       let resDest = dest
       n.into:
-        allocLvalue2(b, n)
+        allocLvalue2(b, n, resDest)          # a global base reuses resDest (the lea dest)
         while n.hasMore: skip n
       b.ra.locs[pos] = resDest
       return
@@ -1021,7 +1090,13 @@ proc walk(b: var Builder; n: var Cursor) =
           # embedded base/index regs, then the rhs into a register. A FLOAT rhs goes to
           # an xmm (movsd to memory); an integer rhs to a GPR (nifasm has no
           # immediate-to-memory `mov`, so an immediate is loaded into a temp first).
-          allocLvalue2(b, n)                   # lhs address operands; advances past lhs
+          # A global aggregate base needs an address scratch, reserved before the lhs
+          # and held across the rhs (so the rhs can't grab it), then recorded in `aux`.
+          let hasGlob = lvalueGlobalBase(b, n)
+          var scratch = dontCare
+          if hasGlob: scratch = b.reserveTmp(ScalarSlot)
+          let lhsCopy = n                        # for releaseAtScratch after the rhs
+          allocLvalue2(b, n, scratch, isStore = true)  # lhs operands; advances past lhs
           if b.isFloatVal(n):
             var rdest = dontCare
             allocFValue(b, n, rdest)           # rhs float value → an xmm
@@ -1030,6 +1105,11 @@ proc walk(b: var Builder; n: var Cursor) =
             var rdest = needsReg(ScalarSlot)
             allocValue(b, n, rdest)            # rhs value → a register
             b.releaseTmp(rdest)
+          releaseAtScratch(b, lhsCopy)           # free the held `(at)` scratch GPRs
+          if hasGlob:
+            b.releaseTmp(scratch)
+            if scratch.kind == InReg: b.ra.aux[asgnPos] = ExprAux(scratch: @[scratch.r])
+            else: b.ra.exprUnsupported = true
         while n.hasMore: skip n
     else:
       n.into:
@@ -1186,15 +1266,18 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
 
 proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
                    prog: var Program; md: MachineDesc;
-                   presealed: set[Reg] = {}; allocExprs = false): RegAlloc =
+                   presealed: set[Reg] = {}; allocExprs = false;
+                   atScratch: HashSet[int] = initHashSet[int]()): RegAlloc =
   ## Allocate storage for the params and locals of `procDecl`. `md` describes the
   ## target register file + ABI. `presealed` registers are reserved for the whole
   ## proc (never allocated/stolen). `prog` is taken by `var` because resolving a
   ## cross-module type may load a module. `allocExprs` (value-core rewrite) also
   ## assigns `locs[pos]` to expressions — off by default so the legacy reactive
-  ## emitter sees the unchanged symbol-only `locs`.
+  ## emitter sees the unchanged symbol-only `locs`. `atScratch` lists the `(at …)`
+  ## positions (computed by the codegen, which can size strides) that need a scratch
+  ## GPR for a non-SIB element stride.
   var b = Builder(buf: addr buf, an: addr an, prog: addr prog, md: md,
-                  allocExprs: allocExprs)
+                  allocExprs: allocExprs, atScratch: atScratch)
   b.ra.locs = newSeq[Location](buf.len)
   b.ra.aux = initTable[int, ExprAux]()
   b.ra.symPos = initTable[string, int]()

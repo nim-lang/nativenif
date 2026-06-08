@@ -32,8 +32,6 @@ const arkhamKnownUnsupported: seq[string] = @[
   # them via its own legacy codegen — see arkhamLinuxA64Unsupported, which stays
   # empty — so the features keep regression coverage there.)
   #
-  # 2-D global-array addressing (`(at (at M r) c)` over a module-level array):
-  "array2d",
   # atomics / mem intrinsics (fixed-register sequences — port genAtomic/genMemIntrin):
   "atomic", "atomic2", "atomic_cas", "memcmp", "memcpy", "memmove", "memset",
   # indirect (fn-ptr) calls + 7th+ stack args:

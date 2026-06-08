@@ -671,6 +671,36 @@ proc atNeedsScratch(g: var CodeGen; atNode: Cursor): bool =
     while n.hasMore: skip n
   result = idxIsReg
 
+proc atGlobalRooted(g: var CodeGen; n: Cursor): bool =
+  ## Does this `dot`/`at` lvalue chain bottom out at a module-level global aggregate?
+  ## Only then can the value-core scratch pre-pass size the element stride via
+  ## `getType` (a local base's type isn't in `symType` during the pre-pass). A
+  ## `deref`/`pat` base is a pointer value, not a global lvalue, so it stops here.
+  var c = n
+  case c.kind
+  of Symbol: result = g.lookupSym(symName(c)).cat == scGlobal
+  of TagLit:
+    case c.exprKind
+    of DotC, AtC:
+      var cc = c
+      cc.into:
+        result = g.atGlobalRooted(cc)
+        while cc.hasMore: skip cc
+    else: result = false
+  else: result = false
+
+proc collectAtScratch(g: var CodeGen; n: Cursor; res: var HashSet[int]) =
+  ## Pre-pass (value core): record every global-rooted `(at …)` position whose
+  ## element stride is not a SIB scale, so the allocator reserves it a scratch GPR
+  ## (`(at base idx scratch)` 3-operand form). Walks `n`'s whole subtree.
+  var c = n
+  if c.kind == TagLit:
+    if c.exprKind == AtC and g.atGlobalRooted(c) and g.atNeedsScratch(c):
+      res.incl cursorToPosition(g.buf[], c)
+    var cc = c
+    cc.into:
+      while cc.hasMore: (g.collectAtScratch(cc, res); skip cc)
+
 proc prematAccess(g: var CodeGen; n: var Cursor; tmps: var seq[Reg]; regs: var seq[Reg]) =
   ## PASS 1 of address emission. Walk the NIFC lvalue subtree `n` and materialize
   ## every embedded VALUE — a deref'd pointer, a computed array index, a global's
@@ -4416,16 +4446,30 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
   ## `deref`, and a pointer `deref` (`(cast (ptr pointee) ptrReg)`).
   case c.kind
   of Symbol:
-    let loc = g.ra.locationOfSym(symName(c))
-    if loc.kind == InReg and g.varType.hasKey(symName(c)):
+    let nm = symName(c)
+    let loc = g.ra.locationOfSym(nm)
+    if loc.kind == Undef:
+      # a module-level global aggregate base: its address is in the pre-assigned base
+      # register (materialized by prematLval2). Type it `(cast (ptr globalType) reg)`
+      # so the enclosing dot/at can compute the field/element offset.
+      let baseReg = g.ra.locs[cursorToPosition(g.buf[], c)]
+      let si = g.lookupSym(nm)
+      var d = si.decl
+      inc d; skip d; skip d                             # (gvar …): name, pragmas → type
+      g.ab.tree CastX:
+        g.ab.ptrType:
+          if d.kind == Symbol: g.ab.sym symName(d)
+          else: g.genTypeBody(d)
+        g.emReg baseReg.r
+    elif loc.kind == InReg and g.varType.hasKey(nm):
       # a >16B by-reference aggregate param: a pointer in a register — type it via
       # `(cast (ptr T) reg)` so the enclosing dot/at can compute the field offset.
       g.ab.tree CastX:
-        g.ab.ptrType: g.ab.sym g.varType[symName(c)]
+        g.ab.ptrType: g.ab.sym g.varType[nm]
         g.emReg loc.r
     else:                                               # a `(s)` stack-var base
       g.ab.reg RSP
-      g.ab.sym symName(c)
+      g.ab.sym nm
   of TagLit:
     case c.exprKind
     of DotC:
@@ -4436,6 +4480,7 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
           g.ab.sym symName(cc); skip cc                 # field name
           while cc.hasMore: skip cc
     of AtC:
+      let atPos = cursorToPosition(g.buf[], c)
       g.ab.tree AtX:
         var cc = c
         cc.into:
@@ -4446,6 +4491,8 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
           else:                                         # register index (pre-loaded by premat)
             g.emReg g.ra.locs[cursorToPosition(g.buf[], cc)].r
           skip cc
+          if g.ra.aux.hasKey(atPos) and g.ra.aux[atPos].scratch.len > 0:
+            g.emReg g.ra.aux[atPos].scratch[0]          # 3-operand form: non-SIB stride scratch
           while cc.hasMore: skip cc
     of DerefC:
       var pointee = g.getType(c)                        # deref result = the pointee type
@@ -4481,9 +4528,18 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
   else: raiseAssert "arkham x64n: emLvalAddr2 kind " & $c.kind
 
 proc prematLval2(g: var CodeGen; c: Cursor) =
-  ## Materialize an lvalue's embedded values (a `deref` pointer, an index) into their
-  ## allocated registers BEFORE the consuming `(mem …)` / `(lea …)` tree opens (an
-  ## emit-inside-the-tree would corrupt it). For a symbol base this is a no-op.
+  ## Materialize an lvalue's embedded values (a `deref` pointer, an index, a global
+  ## base's address) into their allocated registers BEFORE the consuming `(mem …)` /
+  ## `(lea …)` tree opens (an emit-inside-the-tree would corrupt it). For a stack /
+  ## register-pointer symbol base this is a no-op.
+  if c.kind == Symbol:
+    # A module-level global aggregate base: `lea baseReg, &global`. The base register
+    # (the access result for a load/addr, or a store scratch) was assigned by the
+    # allocator and is already bound by the caller — see emitMemLoad2 / emitAddr2.
+    let loc = g.ra.locs[cursorToPosition(g.buf[], c)]
+    if loc.kind == InReg and g.ra.locationOfSym(symName(c)).kind == Undef:
+      g.emGlobalAddr(loc.r, symName(c))
+    return
   if c.kind == TagLit:
     case c.exprKind
     of DotC:
@@ -4497,11 +4553,15 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
         g.emitValue2(cc)                                # the pointer → its register
         while cc.hasMore: skip cc
     of AtC:
+      let atPos = cursorToPosition(g.buf[], c)
       var cc = c
       cc.into:
         g.prematLval2(cc); skip cc                      # base
         if cc.kind notin {IntLit, UIntLit}: g.emitValue2(cc)  # register index → its reg
         while cc.hasMore: skip cc
+      if g.ra.aux.hasKey(atPos) and g.ra.aux[atPos].scratch.len > 0:
+        # bind the non-SIB stride scratch so `(at … scratch)` names a checked temp
+        g.bindTemp(g.ra.aux[atPos].scratch[0], AsmSlot(cls: AInt, size: 8, align: 8))
     of PatC:
       var cc = c
       cc.into:
@@ -4523,6 +4583,7 @@ proc unbindLvalTemps2(g: var CodeGen; c: Cursor) =
         g.unbindLvalTemps2(cc)                          # base
         while cc.hasMore: skip cc
     of AtC:
+      let atPos = cursorToPosition(g.buf[], c)
       var cc = c
       cc.into:
         g.unbindLvalTemps2(cc); skip cc                 # base
@@ -4530,6 +4591,8 @@ proc unbindLvalTemps2(g: var CodeGen; c: Cursor) =
           let il = g.ra.locs[cursorToPosition(g.buf[], cc)]
           if il.kind == InReg and il.isTemp: g.unbindTemp(il.r)
         while cc.hasMore: skip cc
+      if g.ra.aux.hasKey(atPos) and g.ra.aux[atPos].scratch.len > 0:
+        g.unbindTemp(g.ra.aux[atPos].scratch[0])        # the non-SIB stride scratch
     of DerefC:
       var cc = c
       cc.into:
@@ -4553,8 +4616,8 @@ proc emitMemLoad2(g: var CodeGen; c: Cursor) =
   ## `mov res, (mem <addr>)`.
   let res = g.ra.locs[cursorToPosition(g.buf[], c)]
   assert res.kind == InReg, "arkham x64n: mem-load result " & $res.kind
-  g.prematLval2(c)
-  if res.isTemp: g.bindTemp(res.r, res.typ)             # consumer unbinds
+  if res.isTemp: g.bindTemp(res.r, res.typ)             # bind first: a global base leas &g
+  g.prematLval2(c)                                       #   into res before the (mem …) tree
   g.ab.tree MovX64:
     g.emReg res.r
     g.ab.tree MemX: g.emLvalAddr2(c)
@@ -4614,8 +4677,8 @@ proc emitAddr2(g: var CodeGen; c: Cursor) =
       g.ab.tree LeaX64: (g.emReg res.r; g.emReg res.r; g.ab.sym loc.name)
     else: g.emitAddrLoc(loc, res.r)
   else:
-    g.prematLval2(lv)
-    if res.isTemp: g.bindTemp(res.r, res.typ)
+    if res.isTemp: g.bindTemp(res.r, res.typ)           # bind first: a global base leas &g
+    g.prematLval2(lv)                                    #   into res before the (lea …) tree
     g.ab.tree LeaX64:
       g.emReg res.r
       g.emLvalAddr2(lv)
@@ -4942,8 +5005,8 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
   of AsgnS:
     var cc = c
     cc.into:
+      let asgnPos = cursorToPosition(g.buf[], c)
       if cc.kind == Symbol:
-        let asgnPos = cursorToPosition(g.buf[], c)
         let lhsCur = cc                                     # captured for asLoc (global/tvar)
         let dst = g.ra.locationOfSym(symName(cc)); skip cc # local lvalue (reg or `(s)` slot)
         if dst.kind == NamedStack and dst.typ.kind == AMem:
@@ -4991,6 +5054,11 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         # embedded base regs, compute the rhs, then `mov (mem <addr>), rhs` — `movsd` for a
         # float rhs (in an xmm), else `mov` for an integer/immediate rhs.
         let lhs = cc
+        # A global aggregate base reserved an address scratch (aux); bind it so
+        # prematLval2's `lea scratch, &g` emits a checked name. The allocator held it
+        # across the rhs, so it survives until the store below (unbound after).
+        let globScratch = if g.ra.aux.hasKey(asgnPos): g.ra.aux[asgnPos].scratch[0] else: NoReg
+        if globScratch != NoReg: g.bindTemp(globScratch, AsmSlot(cls: AInt, size: 8, align: 8))
         g.prematLval2(lhs)
         skip cc                                             # past the whole lhs subtree
         g.emitValue2(cc)                                    # rhs value
@@ -5009,6 +5077,7 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
             of InReg: g.emReg v.r
             else: raiseAssert "arkham x64n: store rhs " & $v.kind
           if v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
+        if globScratch != NoReg: g.unbindTemp(globScratch)
         g.unbindLvalTemps2(lhs)                          # release embedded base/index temps
       while cc.hasMore: skip cc
   of WhileS:
@@ -5229,7 +5298,10 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   # The legacy reactive core (`emitProcBody`/`gen…`) stays in-tree (still reached by
   # `emitGlobalInits`) until that too is ported and the whole seam is deleted.
   const useNew = true
-  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64Machine, preseal, allocExprs = useNew)
+  var atScratch = initHashSet[int]()
+  if useNew: g.collectAtScratch(info.decl, atScratch)   # global-rooted non-SIB `(at)` strides
+  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64Machine, preseal,
+                      allocExprs = useNew, atScratch = atScratch)
   when defined(arkhamTracePath):
     stderr.writeLine "[arkham] " & info.asmName & ": NEW"
   when defined(arkhamDumpLocs):
