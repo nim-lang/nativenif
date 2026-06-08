@@ -3732,6 +3732,35 @@ proc valModeled2(g: var CodeGen; c: Cursor): bool =
     else: false
   else: false
 
+proc fvalModeled2(g: var CodeGen; c: Cursor): bool =
+  ## A FLOAT value the new emitter handles (slice 1): a float literal, a float
+  ## local/param read (in an xmm register — a spilled float bails via
+  ## `exprUnsupported` at allocation), or a float add/sub/mul/div over modeled
+  ## float operands. A float global / nested call / conversion is still legacy.
+  case c.kind
+  of FloatLit: true
+  of Symbol: g.lookupSym(symName(c)).cat == scNone        # a function-local float
+  of TagLit:
+    case c.exprKind
+    of AddC, SubC, MulC, DivC:
+      var ok = true
+      var cc = c
+      cc.into:
+        skip cc                                           # result float type
+        if cc.hasMore: (if not g.fvalModeled2(cc): ok = false); skip cc   # lhs
+        if cc.hasMore: (if not g.fvalModeled2(cc): ok = false); skip cc   # rhs
+        while cc.hasMore: skip cc
+      ok
+    of SufC, ParC:
+      var ok = true
+      var cc = c
+      cc.into:
+        if cc.hasMore: (if not g.fvalModeled2(cc): ok = false); skip cc
+        while cc.hasMore: skip cc
+      ok
+    else: false
+  else: false
+
 proc callModeled2(g: var CodeGen; c: Cursor): bool =
   ## Is this `(call …)` within the new emitter's coverage? A declarative direct or
   ## syscall target (NOT indirect / atomic / mem* / bit-builtin), a scalar-or-void
@@ -3861,11 +3890,14 @@ proc stmtModeled2(g: var CodeGen; c: Cursor): bool =
       let s = slotOf(g.prog, cc)
       skip cc                                            # type
       let hasInit = cc.hasMore and cc.kind != DotToken
-      if s.kind == AFloat: ok = false                    # floats: later
+      if s.kind == AFloat:
+        # A float local (slice 1): its register home receives a modeled float init;
+        # a spilled float home routes to legacy via `exprUnsupported` at allocation.
+        if hasInit and not g.fvalModeled2(cc): ok = false
       elif s.kind == AMem:
         if hasInit: ok = false                           # aggregate initializer: later slice
       elif not s.inRegClass: ok = false
-      if ok and hasInit:
+      elif ok and hasInit:
         # var-init is alias-safe for a comparison-as-value (a fresh home can't be an
         # operand) so `condModeled2` is allowed here, but NOT in asgn-rhs / call-args.
         if not (g.valModeled2(cc) or g.callModeled2(cc) or g.divModModeled2(cc) or
@@ -3877,8 +3909,10 @@ proc stmtModeled2(g: var CodeGen; c: Cursor): bool =
     var cc = c
     cc.into:
       if cc.hasMore and cc.kind != DotToken:
-        if not (g.valModeled2(cc) or g.callModeled2(cc) or g.divModModeled2(cc) or
-                g.condModeled2(cc)): ok = false          # ret value: rax never an operand
+        if g.isFloatExpr(cc):
+          if not g.fvalModeled2(cc): ok = false          # float return → xmm0
+        elif not (g.valModeled2(cc) or g.callModeled2(cc) or g.divModModeled2(cc) or
+                g.condModeled2(cc)): ok = false           # ret value: rax never an operand
       while cc.hasMore: skip cc
     ok
   of CallS: g.callModeled2(c)
@@ -3888,6 +3922,7 @@ proc stmtModeled2(g: var CodeGen; c: Cursor): bool =
     cc.into:
       if cc.kind == Symbol:
         if g.lookupSym(symName(cc)).cat notin {scNone, scGlobal, scTvar}: ok = false  # local or global store
+        elif g.isFloatExpr(cc): ok = false              # float-var store: later slice
       elif not g.lvalModeled2(cc): ok = false           # complex lvalue (dot/deref store)
       skip cc                                            # lhs
       if cc.hasMore and not (g.valModeled2(cc) or g.callModeled2(cc) or g.divModModeled2(cc)): ok = false
@@ -3978,13 +4013,16 @@ proc procModeled2(g: var CodeGen; decl: Cursor): bool =
           pp.into:
             skip pp; skip pp                             # name, pragmas
             let s = slotOf(g.prog, pp)
-            if s.kind in {AMem, AFloat} or not s.inRegClass: ok = false
+            # A float param is allowed (slice 1): in a leaf proc it stays in its xmm
+            # arg register; if it spills (non-leaf / address-taken) the body's read
+            # routes the proc to legacy via `exprUnsupported`.
+            if s.kind == AMem or not s.inRegClass: ok = false
             while pp.hasMore: skip pp
           skip p
     skip c                                               # params
     if not (c.kind == DotToken or
-            (c.kind == TagLit and c.typeKind in {NifcType.IT, NifcType.UT, NifcType.CT})):
-      ok = false                                         # scalar-int or void return only
+            (c.kind == TagLit and c.typeKind in {NifcType.IT, NifcType.UT, NifcType.CT, NifcType.FT})):
+      ok = false                                         # scalar-int / float / void return only
     skip c                                               # return type
     skip c                                               # pragmas
     if ok:
@@ -4001,6 +4039,7 @@ proc place2(g: var CodeGen; src: Location; dest: Reg) =
   else: raiseAssert "arkham x64n: place2 src " & $src.kind
 
 proc emitValue2(g: var CodeGen; c: Cursor)
+proc emitFValue2(g: var CodeGen; c: Cursor)
 proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool)
 proc emitCondValue2(g: var CodeGen; c: Cursor)
 proc emitMemLoad2(g: var CodeGen; c: Cursor)
@@ -4112,6 +4151,8 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
   ## passing / a `NeedsReg` reservation); a leaf left as `Imm` / in its own home stays
   ## put (the consumer folds or reads it). A computed node runs its op into its result.
   let dst = g.ra.locs[cursorToPosition(g.buf[], c)]
+  if dst.kind == InFReg:                                 # a float value → the SIMD path
+    g.emitFValue2(c); return
   # A leaf the allocator forced into a *scratch temp* (e.g. an immediate operand
   # under a `NeedsReg` constraint) must bind that register so `emReg` emits a
   # checked name, not a raw r10/r11. The consuming op (`emitBin2`/`emitCond2`)
@@ -4191,6 +4232,78 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
         g.movImm(dst.r, sz)
     else: raiseAssert "arkham x64n: emitValue2 expr " & $c.exprKind
   else: raiseAssert "arkham x64n: emitValue2 kind " & $c.kind
+
+proc fbinOps(ek: NifcExpr): (X64Inst, X64Inst) =
+  ## (32-bit, 64-bit) SSE instruction pair for a float binary-arith node.
+  case ek
+  of AddC: (AddssX64, AddsdX64)
+  of SubC: (SubssX64, SubsdX64)
+  of MulC: (MulssX64, MulsdX64)
+  of DivC: (DivssX64, DivsdX64)
+  else: raiseAssert "arkham x64n: fbinOps " & $ek
+
+proc emitFBin2(g: var CodeGen; c: Cursor) =
+  ## Emit a float binary-arith node (the SIMD twin of `emitBin2`). `a` is
+  ## materialized straight into the precomputed result register (`locs[pos]`, a
+  ## destination-passed xmm); `b` either folds in place (a float local already in a
+  ## register) or is materialized into its SIMD temp; then `res = res op b`.
+  let pos = cursorToPosition(g.buf[], c)
+  let res = g.ra.locs[pos]
+  assert res.kind == InFReg, "arkham x64n: float bin result " & $res.kind
+  let (op32, op64) = fbinOps(c.exprKind)
+  let bits = if res.typ.size == 4: 32 else: 64
+  var lhsC, rhsC: Cursor
+  block:
+    var cc = c
+    cc.into:
+      skip cc                                            # result float type
+      lhsC = cc; skip cc
+      rhsC = cc; skip cc
+      while cc.hasMore: skip cc
+  g.emitFValue2(lhsC)                                    # a → res (== result reg)
+  let rhsLoc = g.ra.locs[cursorToPosition(g.buf[], rhsC)]
+  if rhsLoc.kind == InFReg and not rhsLoc.isTemp:        # in-place float local: fold directly
+    g.fbin(op32, op64, res.f, rhsLoc.f, bits)
+  else:
+    g.emitFValue2(rhsC)                                  # b → its SIMD temp
+    g.fbin(op32, op64, res.f, rhsLoc.f, bits)
+    if rhsLoc.isTemp: g.unbindFTmp(rhsLoc.f)
+
+proc emitFValue2(g: var CodeGen; c: Cursor) =
+  ## Ensure `c`'s FLOAT value is materialized at its precomputed `locs[pos]` (an
+  ## xmm register). The SIMD twin of `emitValue2`; mirrors `genIntoF`.
+  let pos = cursorToPosition(g.buf[], c)
+  let dst = g.ra.locs[pos]
+  assert dst.kind == InFReg, "arkham x64n: emitFValue2 dst " & $dst.kind
+  let bits = if dst.typ.size == 4: 32 else: 64
+  case c.kind
+  of FloatLit:
+    if dst.isTemp: g.bindFTmp(dst.f)
+    let gpr = g.ra.aux[pos].scratch[0]                   # scratch GPR for the bit pattern
+    g.bindTemp(gpr, AsmSlot(cls: AInt, size: 8, align: 8))
+    if bits == 32: g.movImm(gpr, int64(cast[uint32](float32(floatVal(c)))))
+    else: g.movImm(gpr, cast[int64](floatVal(c)))
+    g.fmovFromGpr(dst.f, gpr, bits)
+    g.unbindTemp(gpr)
+  of Symbol:
+    let home = g.ra.locationOfSym(symName(c))
+    assert home.kind == InFReg, "arkham x64n: float symbol home " & $home.kind
+    if home.f != dst.f:
+      if dst.isTemp: g.bindFTmp(dst.f)
+      g.fmovF(dst.f, home.f, bits)
+  of TagLit:
+    case c.exprKind
+    of AddC, SubC, MulC, DivC: g.emitFBin2(c)
+    of SufC, ParC:
+      var inner: Cursor
+      block:
+        var cc = c
+        cc.into:
+          inner = cc; skip cc
+          while cc.hasMore: skip cc
+      g.emitFValue2(inner)
+    else: raiseAssert "arkham x64n: emitFValue2 expr " & $c.exprKind
+  else: raiseAssert "arkham x64n: emitFValue2 kind " & $c.kind
 
 proc emLvalAddr2(g: var CodeGen; c: Cursor) =
   ## Emit the nifasm address sub-tree for lvalue `c` (the operand of a `(mem …)` /
@@ -4415,6 +4528,7 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
     let hasVal = cc.hasMore and cc.kind != DotToken
     case loc.kind
     of InReg: g.emRegLocalVar(nm, loc.r, typeCur)
+    of InFReg: g.emFRegLocalVar(nm, loc.f, loc.typ.size * 8)   # float local in an xmm
     of NamedStack:
       g.emTypedStackVar(nm, typeCur)
       if typeCur.kind == Symbol: g.varType[nm] = symName(typeCur)  # aggregate field layout
@@ -4425,6 +4539,9 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
       let v = g.ra.locs[cursorToPosition(g.buf[], valC)]
       case loc.kind
       of InReg: g.place2(v, loc.r)                       # dest-passed ⇒ usually a no-op
+      of InFReg:                                         # float: dest-passed into loc.f
+        if v.kind == InFReg and v.f != loc.f:
+          g.fmovF(loc.f, v.f, loc.typ.size * 8)
       of NamedStack:
         # A stack-homed scalar: the allocator computed the initializer into a register
         # (needsReg); store it to the `(s)` slot and release the temp.
@@ -4660,7 +4777,11 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         g.movImm(RAX, LinuxX64ExitNr); g.emSyscall()
       elif hasVal:
         g.emitValue2(cc)
-        g.place2(g.ra.locs[cursorToPosition(g.buf[], cc)], g.md.intRetReg)
+        let v = g.ra.locs[cursorToPosition(g.buf[], cc)]
+        if v.kind == InFReg:                              # float return → xmm0
+          if v.f != FloatRet: g.fmovF(FloatRet, v.f, v.typ.size * 8)
+        else:
+          g.place2(v, g.md.intRetReg)
         # epilogue (framePop + ret) is emitted by emitProcBody2's terminator
       while cc.hasMore: skip cc
   of CaseS:

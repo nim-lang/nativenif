@@ -1,0 +1,45 @@
+(.nif27)
+(.indexat 652              )
+(stmts
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :fcompute.0
+  (params
+   (param :a.0 .
+    (f 64))
+   (param :b.0 .
+    (f 64))
+   (param :c.0 .
+    (f 64)))
+  (f 64).
+  (stmts
+   (var :t.0 .
+    (f 64)
+    (mul
+     (f 64)a.0 b.0))
+   (var :u.0 .
+    (f 64)
+    (sub
+     (f 64)t.0 c.0))
+   (ret
+    (add
+     (f 64)u.0 t.0))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :r.0 .
+    (f 64)
+    (call fcompute.0 3.0 4.0 2.0))
+   (var :ri.0 .
+    (i 64)
+    (conv
+     (i 64)r.0))
+   (call exit.c ri.0))))(.index)

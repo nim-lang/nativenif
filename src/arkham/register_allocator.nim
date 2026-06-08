@@ -85,6 +85,8 @@ type
                                       ## on. See `codegen2_design.md` / `allocValue`.
     tmpSpills: int                    ## fresh expression-temp spill-slot counter (when the
                                       ## scratch pool is exhausted during the expr walk)
+    retFloatBits: int                 ## value-core rewrite: 0 = the proc returns int/void;
+                                      ## 32/64 = a float return (the value goes to xmm0)
 
 proc posOf(b: Builder; c: Cursor): int {.inline.} =
   cursorToPosition(b.buf[], c)
@@ -233,6 +235,9 @@ proc trySteal(b: var Builder; curName: string; curSlot: AsmSlot;
 
 let ScalarSlot = AsmSlot(cls: AInt, size: 8, align: 8)
 
+proc floatSlot(bits: int): AsmSlot {.inline.} =
+  AsmSlot(cls: AFloat, size: bits div 8, align: bits div 8)
+
 proc sameReg(a, c: Location): bool {.inline.} =
   a.kind == InReg and c.kind == InReg and a.r == c.r
 
@@ -254,6 +259,25 @@ proc reserveTmp(b: var Builder; slot: AsmSlot): Location =
 proc releaseTmp(b: var Builder; loc: Location) {.inline.} =
   if loc.kind == InReg and loc.isTemp: b.giveBack loc.r
 
+proc reserveFTmp(b: var Builder; slot: AsmSlot): Location =
+  ## A scratch SIMD register for a computed float temporary — the SIMD twin of
+  ## `reserveTmp`: the volatile float pool (xmm8–15) first, then callee-saved
+  ## (empty on x86-64), then a spill slot which marks the proc `exprUnsupported`
+  ## (the v1 pure emitter has no float spill path yet).
+  var f = b.takeFReg(b.freeVolF, b.md.floatTempRegs)
+  if f == NoFReg:
+    f = b.takeFReg(b.freeCalleeF, b.md.floatCalleeSaved)
+    if f == NoFReg:
+      let nm = "ftmp" & $b.tmpSpills & ".0"; inc b.tmpSpills
+      b.ra.hasStackVars = true
+      b.ra.exprUnsupported = true
+      return namedStackLoc(nm, slot)
+    if f in b.md.floatCalleeSavedSet: b.ra.usedCalleeF.incl f
+  result = fregLoc(f, slot, isTemp = true)
+
+proc releaseFTmp(b: var Builder; loc: Location) {.inline.} =
+  if loc.kind == InFReg and loc.isTemp: b.giveBackF loc.f
+
 proc symLoc(b: var Builder; name: string): Location =
   ## A symbol reference reads where the symbol is stored. A module-level
   ## global/proc is not in `symPos`; the emitter resolves those (Glob / `lea`), so
@@ -273,6 +297,7 @@ proc resolveDest(b: var Builder; dest: var Location; natural: Location) =
   else: discard                              # fixed InReg/InFReg/NamedStack/…: keep
 
 proc allocValue(b: var Builder; n: var Cursor; dest: var Location)
+proc allocFValue(b: var Builder; n: var Cursor; dest: var Location)
 
 proc regOccupied(b: var Builder; reg: Reg): bool
 
@@ -318,6 +343,84 @@ proc allocBin(b: var Builder; n: var Cursor; dest: var Location) =
   if not sameReg(dest, lDest): b.releaseTmp(lDest)
   b.ra.aux[pos] = ExprAux(foldB: rDest.kind in {NamedStack, Mem})
   b.ra.locs[pos] = dest
+
+proc allocFBin(b: var Builder; n: var Cursor; dest: var Location) =
+  ## Float binary arith `(op (f N) a b)` (add/sub/mul/div) — the SIMD twin of
+  ## `allocBin`. SSE is destructive 2-operand, so `a` computes straight into the
+  ## result register `dest` (resolved to a concrete xmm here) and the op is
+  ## `dest := dest op b`; `b` folds in place when it is a float local already in a
+  ## register, else it draws a fresh SIMD temp. The result is always destination-
+  ## passed (the gate restricts float ops to var-init / ret), so `dest` is never a
+  ## standalone temp.
+  let pos = b.posOf(n)
+  var fslot = floatSlot(64)
+  n.into:
+    fslot = slotOf(b.prog[], n); skip n        # result float type → its precise slot
+    if dest.kind != InFReg: dest = b.reserveFTmp(fslot)
+    var lDest = dest                            # a → the result register (destructive)
+    allocFValue(b, n, lDest)
+    # b: fold an in-place float local, else a fresh SIMD temp the emitter releases.
+    if n.kind == Symbol and b.symLoc(symName(n)).kind == InFReg:
+      var rDest = b.symLoc(symName(n))
+      # Destination-passing hazard: folding `b` from a register that is also `dest`
+      # would compute `dest op dest` (after `a` clobbered `dest`). Bail to legacy
+      # (whose latent same-reg behaviour is the proven path) rather than miscompile.
+      if dest.kind == InFReg and rDest.f == dest.f: b.ra.exprUnsupported = true
+      allocFValue(b, n, rDest)
+    else:
+      var rDest = b.reserveFTmp(fslot)
+      allocFValue(b, n, rDest)
+      b.releaseFTmp(rDest)
+    while n.hasMore: skip n
+  b.ra.locs[pos] = dest
+
+proc allocFValue(b: var Builder; n: var Cursor; dest: var Location) =
+  ## Float value (the SIMD twin of `allocValue` / mirrors codegen's `genIntoF`):
+  ## the result lands in an xmm register (`dest`, resolved to a concrete InFReg).
+  ## Slice 1: float literal, float local read, float add/sub/mul/div.
+  let pos = b.posOf(n)
+  case n.kind
+  of FloatLit:
+    if dest.kind != InFReg:
+      dest = b.reserveFTmp(if dest.typ.kind == AFloat: dest.typ else: floatSlot(64))
+    # The bit pattern is materialized through a scratch GPR (fmovq/d xmm ← gpr);
+    # reserve one and record it for the emitter (single-use → released at once).
+    let g = b.reserveTmp(ScalarSlot)
+    b.releaseTmp(g)
+    if g.kind == InReg: b.ra.aux[pos] = ExprAux(scratch: @[g.r])
+    else: b.ra.exprUnsupported = true
+    b.ra.locs[pos] = dest
+    inc n
+  of Symbol:
+    let home = b.symLoc(symName(n))
+    if home.kind == InFReg:
+      if dest.kind != InFReg: dest = home        # Undef dest: use the home in place
+      # else keep the caller's dest; the emitter moves home → dest
+    else:
+      # a spilled / address-taken float, or a module-level float: the v1 pure
+      # emitter cannot load those yet — route the proc to legacy.
+      if dest.kind != InFReg: dest = b.reserveFTmp(floatSlot(64))
+      b.ra.exprUnsupported = true
+    b.ra.locs[pos] = dest
+    inc n
+  of TagLit:
+    case n.exprKind
+    of AddC, SubC, MulC, DivC:
+      allocFBin(b, n, dest); return              # records locs[pos] itself
+    of SufC, ParC:                               # `(suf v "type")` / `(par v)` wrapper
+      n.into:
+        allocFValue(b, n, dest)
+        while n.hasMore: skip n
+      b.ra.locs[pos] = dest
+      return
+    else:
+      if dest.kind != InFReg: dest = b.reserveFTmp(floatSlot(64))
+      b.ra.exprUnsupported = true; skip n
+      b.ra.locs[pos] = dest
+  else:
+    if dest.kind != InFReg: dest = b.reserveFTmp(floatSlot(64))
+    b.ra.exprUnsupported = true; inc n
+    b.ra.locs[pos] = dest
 
 proc allocCall(b: var Builder; n: var Cursor; dest: var Location) =
   ## A call: each argument is allocated into its ABI argument register, the result
@@ -614,7 +717,15 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
       if loc.kind == InReg and not vi.declInLoop:
         b.pendingFree.add (pos: vi.freeAfter, name: name)
       if b.allocExprs and hasValue:
-        if loc.kind == InReg:
+        if slot.isFloat:
+          # A float local: its register home (xmm) receives the float initializer
+          # directly (destination-passing). A spilled float home routes to legacy.
+          if loc.kind == InFReg:
+            var d = loc
+            allocFValue(b, valCur, d)
+          else:
+            b.ra.exprUnsupported = true
+        elif loc.kind == InReg:
           # Destination-passing: allocate the initializer to compute directly into the
           # local's register home. The home is already taken from the pool (above), so
           # the initializer's transient temps draw from what remains — matching execution.
@@ -649,8 +760,12 @@ proc walk(b: var Builder; n: var Cursor) =
     if b.allocExprs:
       n.into:
         if n.hasMore and n.kind != DotToken:
-          var d = regLoc(b.md.intRetReg, ScalarSlot)   # return value → the ABI ret reg
-          allocValue(b, n, d)
+          if b.retFloatBits > 0:
+            var d = fregLoc(b.md.floatArgRegs[0], floatSlot(b.retFloatBits))  # → xmm0
+            allocFValue(b, n, d)
+          else:
+            var d = regLoc(b.md.intRetReg, ScalarSlot)   # return value → the ABI ret reg
+            allocValue(b, n, d)
         else:
           while n.hasMore: skip n              # void return
     else:
@@ -880,6 +995,9 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
   n.into:
     inc n                                    # name
     allocParams(b, n, an.hasCall)            # params
+    if n.kind == TagLit:                      # a float return goes to xmm0 (value-core)
+      let rtSlot = slotOf(prog, n)
+      if rtSlot.isFloat: b.retFloatBits = rtSlot.size * 8
     skip n                                   # return type
     skip n                                   # pragmas
     walk(b, n)                               # body
