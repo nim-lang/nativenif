@@ -4168,6 +4168,47 @@ proc emitMemIntrin2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
   g.bindTemp(RSI, s); g.bindTemp(RDX, s); g.bindTemp(RCX, s)
   g.genMemIntrinBody(builtin)
 
+proc emitAtomic2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
+  ## Value-core `__atomic_*` builtin: allocCall placed the args in the ABI integer
+  ## registers (ptr→rdi, val/exp→rsi, des→rdx, …), so emit them, then the inline
+  ## lock-prefixed sequence using those registers (the register-parameterized
+  ## `genAtomicXadd`/`genAtomicLoopRmw` helpers, shared with the legacy path).
+  ## Result → rax (moved to its home by emitCall2). Pointer args stay raw ABI regs.
+  for a in argCurs: g.emitValue2(a)                  # → rdi / rsi / rdx / …
+  case builtin
+  of "__atomic_load_n":                              # (ptr, mo) → *ptr
+    g.ab.tree MovX64: (g.emReg RAX; g.emMemAt RDI)
+  of "__atomic_store_n":                             # (ptr, val, mo) → void
+    g.ab.tree MovX64: (g.emMemAt RDI; g.emReg RSI)
+  of "__atomic_fetch_add": g.genAtomicXadd(RDI, RSI, returnNew = false, sub = false)
+  of "__atomic_fetch_sub": g.genAtomicXadd(RDI, RSI, returnNew = false, sub = true)
+  of "__atomic_add_fetch": g.genAtomicXadd(RDI, RSI, returnNew = true, sub = false)
+  of "__atomic_sub_fetch": g.genAtomicXadd(RDI, RSI, returnNew = true, sub = true)
+  of "__atomic_fetch_and": g.genAtomicLoopRmw(RDI, RSI, AndX64)
+  of "__atomic_fetch_or":  g.genAtomicLoopRmw(RDI, RSI, OrX64)
+  of "__atomic_fetch_xor": g.genAtomicLoopRmw(RDI, RSI, XorX64)
+  of "__atomic_exchange_n":                          # (ptr, val, mo) → old
+    g.ab.tree XchgX64: (g.emMemAt RDI; g.emReg RSI)  # rsi ↔ [rdi] (locked); rsi ← old
+    g.movReg(RAX, RSI)
+  of "__atomic_thread_fence": g.ab.keyword MfenceX64
+  of "__atomic_signal_fence": discard                # compiler barrier only
+  of "__atomic_compare_exchange_n":                  # (ptr, exp_ptr, des, weak, succ, fail) → bool
+    g.ab.tree MovX64: (g.emReg RAX; g.emMemAt RSI)   # rax = *exp (the comparand)
+    g.ab.tree LockX64:
+      g.ab.tree CmpxchgX64:
+        g.emMemAt RDI
+        g.emReg RDX                                  # if [rdi]==rax: [rdi]=rdx,ZF=1 else rax=[rdi]
+    let lFail = g.freshLabel()
+    let lDone = g.freshLabel()
+    g.emJcc(JneX64, lFail)
+    g.movImm(RAX, 1); g.emJmp(lDone)                 # success → 1
+    g.emLab(lFail)
+    g.ab.tree MovX64: (g.emMemAt RSI; g.emReg RAX)   # *exp = actual old value (rax)
+    g.movImm(RAX, 0)                                 # failure → 0
+    g.emLab(lDone)
+  else:
+    raiseAssert "arkham x64n: unsupported atomic builtin: " & builtin
+
 proc emitCall2(g: var CodeGen; c: Cursor) =
   ## Emit a call. The allocator placed each argument in its ABI register (integer →
   ## rdi…r9, float → xmm0–7) and the result in rax / xmm0 (or a dest-passed home).
@@ -4194,6 +4235,10 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
   let tgt = g.callTarget[fsym]
   if tgt.memIntrin.len > 0:                          # C mem* intrinsic → inline loop
     g.emitMemIntrin2(argCurs, tgt.memIntrin)
+    if resLoc.kind == InReg and resLoc.r != RAX: g.movReg(resLoc.r, RAX)
+    return
+  if tgt.atomic.len > 0:                             # __atomic_* builtin → inline sequence
+    g.emitAtomic2(argCurs, tgt.atomic)
     if resLoc.kind == InReg and resLoc.r != RAX: g.movReg(resLoc.r, RAX)
     return
   let isSyscall = tgt.syscall

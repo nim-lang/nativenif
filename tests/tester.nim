@@ -32,8 +32,6 @@ const arkhamKnownUnsupported: seq[string] = @[
   # them via its own legacy codegen — see arkhamLinuxA64Unsupported, which stays
   # empty — so the features keep regression coverage there.)
   #
-  # atomics (fixed-register sequences — port genAtomic):
-  "atomic", "atomic2", "atomic_cas",
   # register-pressure spill totality (the pure emitter has no spill path yet) —
   # incl. >8 float args (stack) and deep float expression trees:
   "deep_spill", "deep_spill_call", "ideep", "fparg_spill", "fpdeep",
