@@ -5320,6 +5320,16 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         g.genStmt2(bc)                                    # body (a stmts node)
         g.emJmp(lEnd)
     g.emLab(lEnd)
+  of LabS:                                                # `(lab :name)` — a goto target
+    var cc = c
+    cc.into:
+      g.emLab(symName(cc)); skip cc
+      while cc.hasMore: skip cc
+  of JmpS:                                                # `(jmp name)` — unconditional goto
+    var cc = c
+    cc.into:
+      g.emJmp(symName(cc)); skip cc
+      while cc.hasMore: skip cc
   else: raiseAssert "arkham x64n: genStmt2 " & $c.stmtKind
 
 proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool) =
