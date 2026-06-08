@@ -793,6 +793,26 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
     inc n
   b.ra.locs[pos] = dest
 
+proc allocConstr(b: var Builder; n: var Cursor) =
+  ## `(oconstr T (kv field value)+)` — allocate each field's value into a register
+  ## (a SIMD temp for a float field) the emitter then stores to the field. Each is
+  ## single-use (store + free), so the temps recycle. Advances `n` past the oconstr.
+  n.into:
+    skip n                                     # the constructed type
+    while n.hasMore:
+      n.into:                                  # (kv field value [depth])
+        skip n                                 # field name
+        if n.hasMore:
+          if b.isFloatVal(n):
+            var d = dontCare
+            allocFValue(b, n, d)
+            b.releaseFTmp(d)
+          else:
+            var d = needsReg(ScalarSlot)
+            allocValue(b, n, d)
+            b.releaseTmp(d)
+        while n.hasMore: skip n                 # optional inherited-depth INTLIT
+
 proc allocVarDecl(b: var Builder; n: var Cursor) =
   n.into:
     let pos = b.posOf(n)
@@ -809,6 +829,13 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
       # early `return` here: that would skip the `into` epilogue and desync.)
       b.record(pos, name, namedStackLoc(name, slot))
       b.ra.hasStackVars = true
+      if b.allocExprs and hasValue:
+        if valCur.kind == TagLit and valCur.exprKind == OconstrC:
+          var vc = valCur
+          allocConstr(b, vc)                   # constructor: place each field's value
+        else:
+          # aggregate copy-init (`var b = a`) / call-returned aggregate: later slice
+          b.ra.exprUnsupported = true
     else:
       let props = b.an.vars.getOrDefault(name).props
       var loc = b.allocStorage(slot, props)

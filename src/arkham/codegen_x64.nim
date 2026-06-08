@@ -4633,6 +4633,41 @@ proc emitCast2(g: var CodeGen; c: Cursor) =
     else:
       g.extendTo(res.r, targetW, signed = isSignedType(tc))          # narrow / equal
 
+proc genConstr2(g: var CodeGen; c: Cursor; dstVar: string) =
+  ## Emit `(oconstr T (kv field value)*)` into the stack aggregate `dstVar`: each
+  ## value was placed in a register temp by the allocator (a SIMD temp for a float
+  ## field); store it at the field's offset. A scalar going into a POINTER field is
+  ## reinterpreted via `(cast (ptr …) reg)` for nifasm's strict typing.
+  var tc = c; inc tc                                    # the constructed type symbol
+  let objTy = resolveType(g.prog, tc)
+  var cc = c
+  cc.into:
+    skip cc                                             # the constructed type
+    while cc.hasMore:
+      var kv = cc
+      kv.into:
+        let field = symName(kv); inc kv
+        let valC = kv
+        g.emitValue2(valC)
+        let v = g.ra.locs[cursorToPosition(g.buf[], valC)]
+        if v.kind == InFReg:                            # float field
+          let bits = if v.typ.size == 4: 32 else: 64
+          g.ab.tree (if bits == 32: MovssX64 else: MovsdX64):
+            g.emAggrFieldMem(dstVar, field)
+            g.emFReg v.f
+          if v.isTemp: g.unbindFTmp(v.f)
+        else:
+          var fty = resolveType(g.prog, fieldType(g.prog, objTy, field))
+          g.ab.tree MovX64:
+            g.emAggrFieldMem(dstVar, field)
+            if isPtrType(fty):
+              g.ab.tree CastX: (g.genTypeBody(fty); g.emReg v.r)
+            else:
+              g.emReg v.r
+          if v.isTemp: g.unbindTemp(v.r)
+        while kv.hasMore: skip kv                        # optional inherited-depth INTLIT
+      skip cc
+
 proc genVarDecl2(g: var CodeGen; c: Cursor) =
   var cc = c
   cc.into:
@@ -4649,7 +4684,14 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
       g.emTypedStackVar(nm, typeCur)
       if typeCur.kind == Symbol: g.varType[nm] = symName(typeCur)  # aggregate field layout
     else: raiseAssert "arkham x64n: var home " & $loc.kind
-    if hasVal:
+    if hasVal and loc.kind == NamedStack and loc.typ.kind == AMem:
+      # An aggregate var with an initializer: a constructor builds it field-by-field
+      # into the slot (copy-init / call-returned aggregate are later slices).
+      let valC = cc
+      if valC.kind == TagLit and valC.exprKind == OconstrC:
+        g.genConstr2(valC, nm)
+      else: raiseAssert "arkham x64n: aggregate var init " & $valC.exprKind
+    elif hasVal:
       let valC = cc
       g.emitValue2(valC)
       let v = g.ra.locs[cursorToPosition(g.buf[], valC)]
