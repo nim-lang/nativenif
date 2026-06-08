@@ -4188,11 +4188,19 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
     g.ab.tree PrepareX64:
       g.ab.sym tgt.asmName
       for idx in 0 ..< argCurs.len:
-        g.emitValue2(argCurs[idx])                  # compute into its (integer) arg register
+        g.emitValue2(argCurs[idx])                  # compute into its arg reg / a scratch
         let aloc = g.ra.locs[cursorToPosition(g.buf[], argCurs[idx])]
-        g.ab.tree MovX64:
-          g.ab.tree ArgX: g.ab.sym paramName(idx)
-          g.emReg aloc.r                            # InReg(argReg) by construction
+        if idx < g.md.intArgRegs.len:                # register arg → rdi…r9
+          g.ab.tree MovX64:
+            g.ab.tree ArgX: g.ab.sym paramName(idx)
+            g.emReg aloc.r
+        else:                                        # 7th+ stack arg → (mem (rsp) (arg pN))
+          g.ab.tree MovX64:                          #   (its value is in a scratch temp,
+            g.ab.tree MemX:                          #    bound by emitValue2 — we unbind it)
+              g.ab.reg RSP
+              g.ab.tree ArgX: g.ab.sym paramName(idx)
+            g.emReg aloc.r
+          if aloc.kind == InReg and aloc.isTemp: g.unbindTemp(aloc.r)
       if isSyscall: g.emSyscall()
       else: g.ab.keyword CallX64
       if hasResult:

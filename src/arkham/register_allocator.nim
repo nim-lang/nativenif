@@ -537,9 +537,12 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
         allocValue(b, n, ad)
         inc intIdx
       else:
-        b.ra.exprUnsupported = true            # 7th+ integer arg (stack) — gap
-        var ad = dontCare
+        # 7th+ integer arg → caller stack. Compute into a scratch register; the
+        # emitter stores it to the outgoing slot `(mem (rsp) (arg pN))`. The temp is
+        # dead after that store, so release it (each stack arg reuses it in turn).
+        var ad = needsReg(ScalarSlot)
         allocValue(b, n, ad)
+        b.releaseTmp(ad)
         inc intIdx
   case dest.kind
   of Undef, NeedsReg, RegOrImm:
