@@ -354,6 +354,17 @@ proc symInReg(b: var Builder; n: Cursor; reg: Reg): bool {.inline.} =
   ## swap whose rhs-into-dest evaluation would clobber a lhs homed in dest.)
   n.kind == Symbol and (let h = b.symLoc(symName(n)); h.kind == InReg and h.r == reg)
 
+proc isMemLeaf(n: Cursor): bool {.inline.} =
+  ## A foldable memory-load operand: a `dot`/`deref`/`at`/`pat` addressing chain in
+  ## value position. The emitter folds it as `op reg, [mem]` (emLvalAddr2) instead of
+  ## loading it into a held register, so in a Sethi–Ullman swap the load happens AFTER
+  ## the computed sibling — never pinning a register across it (and one fewer mov).
+  ## Operands are pure (hexer un-nests calls) so reordering the load is observation-
+  ## preserving. A memory-load operand of a typed op has the op's width (NIFC widens
+  ## via an explicit `conv`, which is not a mem leaf), so the `op reg, [mem]` fold is
+  ## always size-consistent.
+  n.kind == TagLit and n.exprKind in {DotC, DerefC, AtC, PatC}
+
 proc allocBin(b: var Builder; n: var Cursor; dest: var Location) =
   ## Binary-arith node. When the left operand is a foldable leaf and the right is a
   ## computed (register-needing) subtree, a **Sethi–Ullman swap** evaluates the
@@ -373,8 +384,10 @@ proc allocBin(b: var Builder; n: var Cursor; dest: var Location) =
       lhsC = cc; skip cc
       rhsC = cc; skip cc
       while cc.hasMore: skip cc              # drain the copy (into asserts rem == 0)
+  let lhsMem = isMemLeaf(lhsC)
   let swap = ek notin {ShlC, ShrC} and (commutativeExpr(ek) or ek == SubC) and
-             b.isFoldableLeaf(lhsC) and not b.isFoldableLeaf(rhsC) and
+             (b.isFoldableLeaf(lhsC) or lhsMem) and
+             not (b.isFoldableLeaf(rhsC) or isMemLeaf(rhsC)) and
              not (dest.kind == InReg and b.symInReg(lhsC, dest.r))
   if swap:
     var acc = dest
@@ -385,7 +398,16 @@ proc allocBin(b: var Builder; n: var Cursor; dest: var Location) =
       allocValue(b, n, acc)                  # right → the accumulator register
       while n.hasMore: skip n
     var lLoc = dontCare                       # left folds as its own operand (no temp)
-    block:
+    if lhsMem:
+      # The left is a memory load: place its address regs AFTER the right subtree (so
+      # they don't pin a register across it), record a `Mem` location (the emitter
+      # folds it via emLvalAddr2), then free the address temps — they die with the fold.
+      var lc = lhsC
+      allocLvalue2(b, lc)
+      releaseLvalTemps(b, lhsC)
+      lLoc = memLoc(lhsC, ScalarSlot)
+      b.ra.locs[b.posOf(lhsC)] = lLoc
+    else:
       var lc = lhsC
       allocValue(b, lc, lLoc)
     b.ra.aux[pos] = ExprAux(swapped: true, foldB: lLoc.kind in {NamedStack, Mem})

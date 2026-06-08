@@ -4116,6 +4116,7 @@ proc emitCondValue2(g: var CodeGen; c: Cursor)
 proc emitMemLoad2(g: var CodeGen; c: Cursor)
 proc emitAddr2(g: var CodeGen; c: Cursor)
 proc emitCast2(g: var CodeGen; c: Cursor)
+proc binMemLval2(g: var CodeGen; op: X64Inst; dest: Reg; c: Cursor)
 
 proc emitBin2(g: var CodeGen; c: Cursor) =
   ## Emit a binary-arith node into its precomputed result register, replaying the
@@ -4147,7 +4148,8 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
     case lhsLoc.kind                                     # rD := rD <foldOp> lhs
     of Imm: g.binImm(foldOp, rD, lhsLoc.ival)
     of InReg: g.binReg(foldOp, rD, lhsLoc.r)
-    of NamedStack, Mem: g.binMem(foldOp, rD, lhsLoc)
+    of NamedStack: g.binMem(foldOp, rD, lhsLoc)          # spilled scalar slot (no access chain)
+    of Mem: g.binMemLval2(foldOp, rD, lhsC)              # folded memory load: op rD, [addr]
     else: raiseAssert "arkham x64n: bin(swapped) lhs " & $lhsLoc.kind
     return
   g.emitValue2(lhsC)                                     # materialize sub-results first
@@ -4730,6 +4732,16 @@ proc emitMemLoad2(g: var CodeGen; c: Cursor) =
     g.emReg res.r
     g.ab.tree MemX: g.emLvalAddr2(c)
   g.unbindLvalTemps2(c)                                  # release embedded base/index temps
+
+proc binMemLval2(g: var CodeGen; op: X64Inst; dest: Reg; c: Cursor) =
+  ## `dest op= [<lvalue c>]` — fold a memory-load operand into an ALU op via the
+  ## value-core address machinery (prematLval2 / emLvalAddr2 / unbindLvalTemps2), no
+  ## borrowTmp. The mirror of emitMemLoad2 with an ALU op in place of the load `mov`.
+  g.prematLval2(c)
+  g.ab.tree op:
+    g.emReg dest
+    g.ab.tree MemX: g.emLvalAddr2(c)
+  g.unbindLvalTemps2(c)
 
 proc emitFMemLoad2(g: var CodeGen; c: Cursor) =
   ## Load the FLOAT scalar at lvalue `c` into its pre-allocated xmm result:
