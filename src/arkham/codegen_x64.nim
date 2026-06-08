@@ -3857,13 +3857,23 @@ proc condModeled2(g: var CodeGen; c: Cursor): bool =
     of EqC, NeqC, LtC, LeC:
       var ok = true
       var cc = c
+      var isFloat = false
+      block:
+        var fc = c
+        fc.into:
+          isFloat = fc.hasMore and g.isFloatExpr(fc)
+          while fc.hasMore: skip fc
       cc.into:
-        if cc.hasMore:
-          if not (g.valModeled2(cc) and smallCmpImm(cc)): ok = false
-          skip cc
-        if cc.hasMore:
-          if not (g.valModeled2(cc) and smallCmpImm(cc)): ok = false
-          skip cc
+        if isFloat:                                       # float compare → comisd, no imm fold
+          if cc.hasMore: (if not g.fvalModeled2(cc): ok = false); skip cc
+          if cc.hasMore: (if not g.fvalModeled2(cc): ok = false); skip cc
+        else:
+          if cc.hasMore:
+            if not (g.valModeled2(cc) and smallCmpImm(cc)): ok = false
+            skip cc
+          if cc.hasMore:
+            if not (g.valModeled2(cc) and smallCmpImm(cc)): ok = false
+            skip cc
         while cc.hasMore: skip cc
       return ok
     of AndC, OrC, NotC:
@@ -4646,6 +4656,23 @@ proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
         aC = cc; skip cc
         bC = cc; skip cc
         while cc.hasMore: skip cc
+    if g.isFloatExpr(aC):
+      # FLOAT comparison: `comisd a, b` (comiss for f32) sets CF/ZF like an unsigned
+      # compare (NIFC assumes non-NaN), so the jcc tag is the unsigned one. Both
+      # operands were placed in xmm registers by the allocator.
+      let fbits = g.floatBits(aC)
+      let tag = cmpJccTag(ek, whenTrue, signed = false)
+      g.emitFValue2(aC)
+      g.emitFValue2(bC)
+      let aLoc = g.ra.locs[cursorToPosition(g.buf[], aC)]
+      let bLoc = g.ra.locs[cursorToPosition(g.buf[], bC)]
+      assert aLoc.kind == InFReg and bLoc.kind == InFReg, "arkham x64n: float cmp operands"
+      g.ab.tree (if fbits == 32: ComissX64 else: ComisdX64):
+        g.emFReg aLoc.f; g.emFReg bLoc.f
+      g.emJcc(tag, toLabel)
+      if bLoc.isTemp: g.unbindFTmp(bLoc.f)
+      if aLoc.isTemp: g.unbindFTmp(aLoc.f)
+      return
     let unsigned = g.cmpOperandUnsigned(aC) or g.cmpOperandUnsigned(bC)
     let tag = cmpJccTag(ek, whenTrue, signed = not unsigned)
     g.emitValue2(aC)                                     # materialize operands

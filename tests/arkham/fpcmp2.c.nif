@@ -1,0 +1,36 @@
+(.nif27)
+(.indexat 510              )
+(stmts
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :fcmp.0
+  (params
+   (param :x.0 .
+    (f 64))
+   (param :y.0 .
+    (f 64)))
+  (i 64).
+  (stmts
+   (if
+    (elif
+     (lt x.0 y.0)
+     (stmts
+      (ret 11)))
+    (else
+     (stmts
+      (ret 22))))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :r.0 .
+    (i 64)
+    (call fcmp.0 2.5 7.5))
+   (call exit.c r.0))))(.index)

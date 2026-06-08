@@ -506,14 +506,30 @@ proc allocCond(b: var Builder; n: var Cursor) =
     n.into:
       while n.hasMore: allocCond(b, n)
   elif n.kind == TagLit and n.exprKind in {EqC, NeqC, LtC, LeC}:
-    var lDest = needsReg(ScalarSlot)
-    var rDest = dontCare
-    n.into:
-      allocValue(b, n, lDest)                  # left → a register
-      allocValue(b, n, rDest)                  # right → reg / imm (folded)
-      while n.hasMore: skip n
-    b.releaseTmp(rDest)
-    b.releaseTmp(lDest)
+    var fcmp = false
+    block:
+      var t = n; inc t                         # tag → first operand (no type child)
+      fcmp = b.isFloatVal(t)
+    if fcmp:
+      # A FLOAT comparison `(op a b)`: both operands go to xmm registers (`comisd`
+      # has no GPR/immediate operand). The compare yields flags only — no result loc.
+      var lDest = dontCare
+      var rDest = dontCare
+      n.into:
+        allocFValue(b, n, lDest)
+        allocFValue(b, n, rDest)
+        while n.hasMore: skip n
+      b.releaseFTmp(rDest)
+      b.releaseFTmp(lDest)
+    else:
+      var lDest = needsReg(ScalarSlot)
+      var rDest = dontCare
+      n.into:
+        allocValue(b, n, lDest)                # left → a register
+        allocValue(b, n, rDest)                # right → reg / imm (folded)
+        while n.hasMore: skip n
+      b.releaseTmp(rDest)
+      b.releaseTmp(lDest)
   else:
     var d = needsReg(ScalarSlot)
     allocValue(b, n, d)
