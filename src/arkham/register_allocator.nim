@@ -26,7 +26,7 @@
 ## prologue/epilogue.
 
 import std / [tables, sets, assertions]
-import nifcore, nifcdecl, slots, machinedesc, analyser, programs
+import nifcore, nifcdecl, slots, machinedesc, analyser, programs, typenav
 
 type
   ExprAux* = object
@@ -70,6 +70,9 @@ type
     buf: ptr TokenBuf
     an: ptr ProcAnalysis
     prog: ptr Program                 ## program (for cross-module type resolution / sizing)
+    tc: TypeCtx                       ## shared NIFC type navigator (`getType`/`exprSlot`) —
+                                      ## the same one the emitter uses, so the allocator no
+                                      ## longer hand-rolls per-form type dispatch
     md: MachineDesc                   ## target register file + ABI (arch-neutral driver)
     freeVol, freeCallee: set[Reg]
     freeVolF: set[FReg]               ## caller-saved SIMD/FP scratch pool (v16–v31)
@@ -232,6 +235,51 @@ proc trySteal(b: var Builder; curName: string; curSlot: AsmSlot;
   if bestReg in b.md.intCalleeSavedSet: b.ra.usedCallee.incl bestReg
   result = regLoc(bestReg, curSlot)
 
+proc stealForTmp(b: var Builder; slot: AsmSlot): Location =
+  ## The GPR pool is empty while a *computed temporary* needs a register. A temp
+  ## is needed right now, so it outranks any live local: evict the lowest-weight
+  ## live local holding a non-sealed GPR to its stack home and hand the temp that
+  ## register. The eviction is a uniform single-home rewrite of `ra.locs` (one
+  ## home per symbol) — sound across every control-flow path, so it can't recur
+  ## the cross-branch reactive-eviction bug. `dontCare` if nothing is stealable.
+  var bestW = high(int)
+  var bestV = ""
+  for scope in b.scopeVars:
+    for v in scope:
+      if v in b.freedSyms: continue
+      let vloc = b.ra.locs[b.ra.symPos[v]]
+      if vloc.kind != InReg: continue
+      if vloc.r in b.ra.sealed: continue        # pinned to an in-flight ABI call
+      let vw = b.weightOf(v)
+      if vw < bestW: bestW = vw; bestV = v
+  if bestV.len == 0: return dontCare
+  let vpos = b.ra.symPos[bestV]
+  let r = b.ra.locs[vpos].r
+  b.ra.locs[vpos] = namedStackLoc(bestV, b.ra.locs[vpos].typ)
+  b.ra.hasStackVars = true
+  if r in b.md.intCalleeSavedSet: b.ra.usedCallee.incl r
+  result = regLoc(r, slot, isTemp = true)
+
+proc stealFForTmp(b: var Builder; slot: AsmSlot): Location =
+  ## SIMD twin of `stealForTmp`: evict the lowest-weight float-register local to
+  ## its stack home and give a computed float temporary that register.
+  var bestW = high(int)
+  var bestV = ""
+  for scope in b.scopeVars:
+    for v in scope:
+      if v in b.freedSyms: continue
+      let vloc = b.ra.locs[b.ra.symPos[v]]
+      if vloc.kind != InFReg: continue
+      let vw = b.weightOf(v)
+      if vw < bestW: bestW = vw; bestV = v
+  if bestV.len == 0: return dontCare
+  let vpos = b.ra.symPos[bestV]
+  let f = b.ra.locs[vpos].f
+  b.ra.locs[vpos] = namedStackLoc(bestV, b.ra.locs[vpos].typ)
+  b.ra.hasStackVars = true
+  if f in b.md.floatCalleeSavedSet: b.ra.usedCalleeF.incl f
+  result = fregLoc(f, slot, isTemp = true)
+
 # ── expression allocation (value-core rewrite; gated by `allocExprs`) ──────────
 # Mirrors codegen's genVal/gen DECISIONS, recording each value position's result
 # Location in `ra.locs` (+ `ra.aux`) instead of emitting; the pure emitter reads
@@ -255,9 +303,16 @@ proc reserveTmp(b: var Builder; slot: AsmSlot): Location =
   if r == NoReg:
     r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
     if r == NoReg:
+      # pool exhausted: steal a register from the coldest live local (the
+      # discussed design — undo a local's register assignment, demote it to its
+      # stack home). Total and branch-safe by the single-home rewrite.
+      let stolen = b.stealForTmp(slot)
+      if stolen.kind == InReg: return stolen
+      # genuinely nothing stealable (all GPRs sealed / already on stack): the
+      # last-ditch memory temp, which the v1 pure emitter can't consume yet.
       let nm = "etmp" & $b.tmpSpills & ".0"; inc b.tmpSpills
       b.ra.hasStackVars = true
-      b.ra.exprUnsupported = true              # v1 pure emitter has no spill path yet
+      b.ra.exprUnsupported = true
       return namedStackLoc(nm, slot)
     if r in b.md.intCalleeSavedSet: b.ra.usedCallee.incl r
   result = regLoc(r, slot, isTemp = true)
@@ -274,6 +329,8 @@ proc reserveFTmp(b: var Builder; slot: AsmSlot): Location =
   if f == NoFReg:
     f = b.takeFReg(b.freeCalleeF, b.md.floatCalleeSaved)
     if f == NoFReg:
+      let stolen = b.stealFForTmp(slot)
+      if stolen.kind == InFReg: return stolen
       let nm = "ftmp" & $b.tmpSpills & ".0"; inc b.tmpSpills
       b.ra.hasStackVars = true
       b.ra.exprUnsupported = true
@@ -287,26 +344,10 @@ proc releaseFTmp(b: var Builder; loc: Location) {.inline.} =
 proc symLoc(b: var Builder; name: string): Location
 
 proc isFloatVal(b: var Builder; n: Cursor): bool =
-  ## Best-effort: does value `n` have float type? (For routing a conversion's operand
-  ## to the SIMD vs GPR side without a full `getType`.) A float literal; a symbol homed
-  ## in an xmm (a float local/param); a float-typed arith / conversion (its type child
-  ## is `(f N)`); a wrapper over such. A float global (home Undef) is not detected — but
-  ## those are gated out anyway.
-  case n.kind
-  of FloatLit: true
-  of Symbol:
-    let h = b.symLoc(symName(n))
-    h.kind == InFReg or (h.kind == NamedStack and h.typ.isFloat)
-  of TagLit:
-    case n.exprKind
-    of AddC, SubC, MulC, DivC, NegC, ConvC, CastC:
-      var t = n; inc t                          # tag → type child (result/target type)
-      slotOf(b.prog[], t).kind == AFloat
-    of SufC, ParC:
-      var t = n; inc t
-      b.isFloatVal(t)
-    else: false
-  else: false
+  ## Does value `n` have float type? One call to the shared type navigator — the
+  ## SAME classification the emitter uses — replacing the old best-effort form-ladder
+  ## (which missed float globals and re-derived types by hand).
+  b.tc.exprSlot(n).cls == AFloat
 
 proc symLoc(b: var Builder; name: string): Location =
   ## A symbol reference reads where the symbol is stored. A module-level
@@ -330,6 +371,8 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location)
 proc allocFValue(b: var Builder; n: var Cursor; dest: var Location)
 proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = false)
 proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = false)
+proc allocConstr(b: var Builder; n: var Cursor)
+proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int)
 proc releaseLvalTemps(b: var Builder; n: Cursor)
 
 proc regOccupied(b: var Builder; reg: Reg): bool
@@ -412,6 +455,7 @@ proc allocBin(b: var Builder; n: var Cursor; dest: var Location) =
       allocValue(b, lc, lLoc)
     b.ra.aux[pos] = ExprAux(swapped: true, foldB: lLoc.kind in {NamedStack, Mem})
     b.ra.locs[pos] = acc
+    dest = acc            # propagate the result reg to the caller's var so it can free it
     return
   var lDest = needsReg(ScalarSlot)
   var rDest = dontCare
@@ -499,6 +543,7 @@ proc allocFBin(b: var Builder; n: var Cursor; dest: var Location) =
       else: b.ra.exprUnsupported = true
     b.ra.aux[pos] = ExprAux(swapped: true, fscratch: fsc)
     b.ra.locs[pos] = acc
+    dest = acc            # propagate the result reg to the caller's var so it can free it
     return
   var fslot = floatSlot(64)
   n.into:
@@ -625,19 +670,25 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
   n.into:
     skip n                                     # callee symbol
     while n.hasMore:
-      # An aggregate argument (a struct var): by-value ≤threshold consumes ceil(size/8)
-      # integer arg registers (the emitter marshals its words); by-reference (>threshold)
-      # consumes one (a pointer). No per-value allocation — the emitter reads the slot.
-      var aggrSz = -1
-      if n.kind == Symbol:
-        let h = b.symLoc(symName(n))
-        if h.kind == NamedStack and h.typ.kind == AMem: aggrSz = h.typ.size
-      if aggrSz >= 0:
-        let words = if aggrSz <= b.md.aggrByRefThreshold: (aggrSz + 7) div 8 else: 1
+      # The argument's ABI class is just its type — one `exprSlot`, the SAME navigator
+      # the emitter uses. No per-form ladder: a struct var and an `(oconstr …)`/`(aconstr …)`
+      # are both `AMem` and share this branch; only *building* the value differs, and that
+      # is `allocStore`'s job, not the call's.
+      let argSlot = b.tc.exprSlot(n)
+      if argSlot.cls == AMem:
+        # An aggregate argument: by-value ≤threshold consumes ceil(size/8) integer arg
+        # registers (the emitter marshals its words); by-reference (>threshold) consumes
+        # one (a pointer). A symbol is read in place; a constructor is built into a
+        # synthetic temp through the one general store path.
+        let words = if argSlot.size <= b.md.aggrByRefThreshold: (argSlot.size + 7) div 8 else: 1
         if intIdx + words > b.md.intArgRegs.len: b.ra.exprUnsupported = true
+        if n.kind == Symbol:
+          skip n                                # no per-value allocation — emitter reads the slot
+        else:                                   # oconstr/aconstr: build into a synthetic aggregate temp
+          b.ra.hasStackVars = true
+          allocStore(b, n, namedStackLoc("", argSlot), b.posOf(n))  # advances n
         intIdx += words
-        skip n
-      elif b.isFloatVal(n):                     # float argument → xmm{fIdx}
+      elif argSlot.cls == AFloat:               # float argument → xmm{fIdx}
         if fIdx < b.md.floatArgRegs.len:
           var ad = fregLoc(b.md.floatArgRegs[fIdx], floatSlot(64))
           allocFValue(b, n, ad)
@@ -707,13 +758,19 @@ proc allocCond(b: var Builder; n: var Cursor) =
         # one memory operand). Avoids loading the left into a held register.
         n.into:
           let lPos = b.posOf(n)
+          let lhsLval = n                      # release its base/index temps AFTER the rhs
           var lc = n
           allocLvalue2(b, lc)
-          releaseLvalTemps(b, n)
           b.ra.locs[lPos] = memLoc(n, ScalarSlot)
           skip n
           var rDest = regOrImm(ScalarSlot)
           allocValue(b, n, rDest)              # right → reg / imm (not memory)
+          # The emitter materializes the rhs value FIRST, then the lhs mem-base
+          # pointer (prematLval2 in the cmp-[mem],rreg path). So the lhs base temps
+          # must stay LIVE across the rhs allocation — otherwise the rhs reuses the
+          # lhs base's register and the later base materialization clobbers the rhs
+          # value (a wrong / mistyped cmp operand).
+          releaseLvalTemps(b, lhsLval)
           b.releaseTmp(rDest)
           while n.hasMore: skip n
       else:
@@ -1004,6 +1061,27 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
     of AddrC:
       # `(addr lvalue)` → a pointer in a register. Place any embedded base/index
       # values of the lvalue; the result address lands in dest (typed precisely).
+      #
+      # IDENTITY `&(deref p)` == p: when p is a register-homed symbol and the
+      # destination is a transient temp (not a fixed home that we must move into),
+      # the address result simply IS p's register — no temp, no copy, no spill. It is
+      # kept NON-temp so a consuming binop won't reuse it in place (allocBin reuses
+      # only dead temps), leaving p intact across the use.
+      var identityHome = dontCare
+      if dest.kind in {NeedsReg, RegOrImm, Undef}:
+        var inner = n; inc inner
+        if inner.kind == TagLit and inner.exprKind == DerefC:
+          var p = inner; inc p
+          if p.kind == Symbol and b.symLoc(symName(p)).kind == InReg:
+            identityHome = b.symLoc(symName(p))
+      if identityHome.kind == InReg:
+        n.into:
+          let lvCopy = n
+          allocLvalue2(b, n)                 # place p (sets locs[p]); no result temp
+          releaseLvalTemps(b, lvCopy)
+          while n.hasMore: skip n
+        b.ra.locs[pos] = identityHome
+        return
       case dest.kind
       of NeedsReg, RegOrImm: dest = b.reserveTmp(dest.typ)
       of Undef: dest = b.reserveTmp(ScalarSlot)
@@ -1076,6 +1154,83 @@ proc allocConstr(b: var Builder; n: var Cursor) =
             b.releaseTmp(d)
         while n.hasMore: skip n                 # optional inherited-depth INTLIT
 
+proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
+  ## Allocator twin of the emitter's `genStore2`: place the homes/temps needed to
+  ## store value `n` into `dst`, advancing `n` past the value. The ONE path every
+  ## caller (var-init, asgn, return value, call argument) routes through — an
+  ## aggregate dispatches like the emitter (oconstr/aconstr build, symbol copy, call
+  ## result); a scalar/float computes into its register home (destination-passing) or
+  ## a temp the emitter stores; a global reserves an address scratch. Scratch temps
+  ## land in `aux[auxPos]`.
+  if dst.kind == NamedStack and dst.typ.kind == AMem:    # aggregate destination
+    if n.kind == TagLit and n.exprKind == OconstrC:
+      allocConstr(b, n)                                  # object: place each field value
+    elif n.kind == TagLit and n.exprKind == AconstrC:
+      b.ra.exprUnsupported = true; skip n                # array constructor: one place (TODO)
+    elif n.kind == TagLit and n.exprKind == CallC:       # call-returned aggregate
+      var d = dontCare
+      allocCall(b, n, d, hiddenPtr = dst.typ.size > b.md.aggrByRefThreshold)
+    elif n.kind == Symbol:                               # whole-aggregate copy
+      skip n
+      let t = b.reserveTmp(ScalarSlot); b.releaseTmp(t)  # one word-transfer scratch
+      if t.kind == InReg: b.ra.aux[auxPos] = ExprAux(scratch: @[t.r])
+      else: b.ra.exprUnsupported = true
+    else:
+      b.ra.exprUnsupported = true; skip n
+  elif dst.kind == Undef:                                # module-level global / threadvar
+    let addrT = b.reserveTmp(ScalarSlot)                 # &g address temp (Tvar ignores it)
+    var d = needsReg(ScalarSlot)
+    allocValue(b, n, d)
+    b.releaseTmp(d)
+    b.releaseTmp(addrT)
+    if addrT.kind == InReg: b.ra.aux[auxPos] = ExprAux(scratch: @[addrT.r])
+    else: b.ra.exprUnsupported = true
+  elif dst.kind == InFReg:                               # float register home: dest-passing
+    var d = dst
+    allocFValue(b, n, d)
+  elif dst.kind == InReg:                                # scalar register home: dest-passing
+    var d = dst
+    allocValue(b, n, d)
+  elif dst.kind == NamedStack:                           # spilled scalar / float `(s)` slot
+    if dst.typ.isFloat:
+      var d = b.reserveFTmp(dst.typ)
+      allocFValue(b, n, d)
+      b.releaseFTmp(d)
+    else:
+      var d = needsReg(dst.typ)
+      allocValue(b, n, d)
+      b.releaseTmp(d)
+  elif dst.kind == Mem:                                  # store through a complex lvalue (dot/deref/at)
+    # Place the lvalue's embedded base/index regs, then the rhs. An AGGREGATE constructor
+    # builds field-by-field into the address (placed like a slot store); a FLOAT rhs goes
+    # to an xmm; an integer rhs to a register. A global aggregate base needs an address
+    # scratch, reserved before the lhs and held across the rhs, then recorded in `aux`.
+    let lhsCur = dst.cur
+    let hasGlob = lvalueGlobalBase(b, lhsCur)
+    var scratch = dontCare
+    if hasGlob: scratch = b.reserveTmp(ScalarSlot)
+    var lc = lhsCur
+    allocLvalue2(b, lc, scratch, isStore = true)         # lhs operands (on a copy)
+    if n.kind == TagLit and n.exprKind == OconstrC:
+      allocConstr(b, n)                                  # build through the lvalue address
+    elif n.kind == TagLit and n.exprKind == AconstrC:
+      b.ra.exprUnsupported = true; skip n
+    elif b.isFloatVal(n):
+      var rdest = dontCare
+      allocFValue(b, n, rdest)
+      b.releaseFTmp(rdest)
+    else:
+      var rdest = needsReg(ScalarSlot)
+      allocValue(b, n, rdest)
+      b.releaseTmp(rdest)
+    releaseLvalTemps(b, lhsCur)                          # free the held index/pointer + `(at)` scratch
+    if hasGlob:
+      b.releaseTmp(scratch)
+      if scratch.kind == InReg: b.ra.aux[auxPos] = ExprAux(scratch: @[scratch.r])
+      else: b.ra.exprUnsupported = true
+  else:
+    b.ra.exprUnsupported = true; skip n
+
 proc allocVarDecl(b: var Builder; n: var Cursor) =
   n.into:
     let pos = b.posOf(n)
@@ -1093,24 +1248,8 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
       b.record(pos, name, namedStackLoc(name, slot))
       b.ra.hasStackVars = true
       if b.allocExprs and hasValue:
-        if valCur.kind == TagLit and valCur.exprKind == OconstrC:
-          var vc = valCur
-          allocConstr(b, vc)                   # constructor: place each field's value
-        elif valCur.kind == TagLit and valCur.exprKind == CallC:
-          # a call-returned aggregate: place the call's args. A ≤16B result arrives in
-          # rax:rdx (emitter → regsToStruct); a >16B result is written through a hidden
-          # pointer the caller passes in rdi (emitter → emStackAddr), shifting args.
-          var vc = valCur
-          var d = dontCare
-          allocCall(b, vc, d, hiddenPtr = slot.size > b.md.aggrByRefThreshold)
-        elif valCur.kind == Symbol:
-          # aggregate copy-init (`var b = a`): one scratch GPR carries each word from
-          # the source slot to the destination slot.
-          let t = b.reserveTmp(ScalarSlot); b.releaseTmp(t)
-          if t.kind == InReg: b.ra.aux[pos] = ExprAux(scratch: @[t.r])
-          else: b.ra.exprUnsupported = true
-        else:
-          b.ra.exprUnsupported = true
+        var vc = valCur
+        allocStore(b, vc, namedStackLoc(name, slot), pos)   # the one general store path
     else:
       let props = b.an.vars.getOrDefault(name).props
       var loc = b.allocStorage(slot, props)
@@ -1133,29 +1272,8 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
       if loc.kind == InReg and not vi.declInLoop:
         b.pendingFree.add (pos: vi.freeAfter, name: name)
       if b.allocExprs and hasValue:
-        if slot.isFloat:
-          # A float local: a register home (xmm) receives the initializer directly
-          # (destination-passing); a spilled / address-taken float `(s)` slot gets it
-          # computed into a SIMD temp the emitter then stores.
-          if loc.kind == InFReg:
-            var d = loc
-            allocFValue(b, valCur, d)
-          else:
-            var d = b.reserveFTmp(slot)
-            allocFValue(b, valCur, d)
-            b.releaseFTmp(d)
-        elif loc.kind == InReg:
-          # Destination-passing: allocate the initializer to compute directly into the
-          # local's register home. The home is already taken from the pool (above), so
-          # the initializer's transient temps draw from what remains — matching execution.
-          var d = loc
-          allocValue(b, valCur, d)
-        else:
-          # A stack-homed scalar (spilled / address-taken): compute the initializer into
-          # a register, then the emitter stores it to the `(s)` slot (genVarDecl2).
-          var d = needsReg(slot)
-          allocValue(b, valCur, d)
-          b.releaseTmp(d)
+        var vc = valCur
+        allocStore(b, vc, loc, pos)            # the one general store path
 
 proc walk(b: var Builder; n: var Cursor) =
   case n.stmtKind
@@ -1178,23 +1296,22 @@ proc walk(b: var Builder; n: var Cursor) =
   of RetS:
     if b.allocExprs:
       n.into:
+        let retPos = b.posOf(n)
         if n.hasMore and n.kind != DotToken:
-          if b.retFloatBits > 0:
-            var d = fregLoc(b.md.floatArgRegs[0], floatSlot(b.retFloatBits))  # → xmm0
-            allocFValue(b, n, d)
+          if b.retFloatBits > 0:                         # float result → xmm0 (general store)
+            allocStore(b, n, fregLoc(b.md.floatArgRegs[0], floatSlot(b.retFloatBits)), retPos)
           elif n.kind == Symbol and b.symLoc(symName(n)).kind == NamedStack and
                b.symLoc(symName(n)).typ.kind == AMem:
-            # aggregate return: ≤16B → structToRegs (no temp); >16B → copyStructThroughPtr
-            # through the hidden result pointer, which needs one word-transfer scratch.
+            # An aggregate return marshals OUT (≤16B → structToRegs; >16B → through the
+            # hidden result pointer, needing one word-transfer scratch) — the inverse of a
+            # store-into-destination, so it stays here rather than in `allocStore`.
             if b.retIndirect:
-              let rp = b.posOf(n)
               let t = b.reserveTmp(ScalarSlot); b.releaseTmp(t)
-              if t.kind == InReg: b.ra.aux[rp] = ExprAux(scratch: @[t.r])
+              if t.kind == InReg: b.ra.aux[retPos] = ExprAux(scratch: @[t.r])
               else: b.ra.exprUnsupported = true
             skip n
-          else:
-            var d = regLoc(b.md.intRetReg, ScalarSlot)   # return value → the ABI ret reg
-            allocValue(b, n, d)
+          else:                                          # scalar/pointer result → ret reg
+            allocStore(b, n, regLoc(b.md.intRetReg, ScalarSlot), retPos)
         else:
           while n.hasMore: skip n              # void return
     else:
@@ -1213,88 +1330,14 @@ proc walk(b: var Builder; n: var Cursor) =
       let asgnPos = b.posOf(n)
       n.into:
         if n.kind == Symbol:
-          let home = b.symLoc(symName(n))
-          skip n                               # lhs (not a value-read)
-          if home.kind == InFReg:
-            # A register-homed FLOAT local: the rhs computes directly into its xmm.
-            var dest = home
-            allocFValue(b, n, dest)
-          elif home.kind == NamedStack and home.typ.isFloat:
-            # A spilled float local: compute the rhs into a SIMD temp; the emitter
-            # stores it to the `(s) (f N)` slot.
-            var d = b.reserveFTmp(home.typ)
-            allocFValue(b, n, d)
-            b.releaseFTmp(d)
-          elif home.kind == InReg:
-            # A register-homed local: destination-passing — the rhs computes directly
-            # into the lhs home.
-            var dest = home
-            allocValue(b, n, dest)
-          elif home.kind == NamedStack and home.typ.kind != AMem:
-            # A stack-homed scalar local: compute the rhs into a register; the emitter
-            # stores it to the `(s)` slot. (An aggregate `(s)` slot needs a struct
-            # copy, not a scalar mov — bail to legacy.)
-            var d = needsReg(home.typ)
-            allocValue(b, n, d)
-            b.releaseTmp(d)
-          elif home.kind == Undef:
-            # A module-level global / tvar store: the rhs into a register, plus an
-            # address scratch temp (a Glob is `&g` then `mov [addr], v`; a Tvar resolves
-            # to FS:[off] and ignores it). The address temp is recorded in `aux` for the
-            # emitter, held across the rhs so it can't be reused.
-            let addrT = b.reserveTmp(ScalarSlot)
-            var d = needsReg(ScalarSlot)
-            allocValue(b, n, d)
-            b.releaseTmp(d)
-            b.releaseTmp(addrT)
-            if addrT.kind == InReg: b.ra.aux[asgnPos] = ExprAux(scratch: @[addrT.r])
-            else: b.ra.exprUnsupported = true
-          elif home.kind == NamedStack and home.typ.kind == AMem and
-               n.kind == TagLit and n.exprKind == OconstrC:
-            # Aggregate constructor-assignment `b = T(field: …)`: place each field's
-            # value (the emitter stores it into `b`'s slot via genConstr2 — no copy
-            # scratch needed). Mirrors allocVarDecl's aggregate-init path.
-            allocConstr(b, n)                    # advances past the oconstr
-          elif home.kind == NamedStack and home.typ.kind == AMem and n.kind == Symbol:
-            # Whole-aggregate assignment `b = a` (both aggregate lvalues): a word-transfer
-            # scratch GPR carries each 8-byte word from the source slot to `b`.
-            skip n                               # rhs aggregate symbol (no value alloc)
-            let t = b.reserveTmp(ScalarSlot); b.releaseTmp(t)
-            if t.kind == InReg: b.ra.aux[asgnPos] = ExprAux(scratch: @[t.r])
-            else: b.ra.exprUnsupported = true
-          else:
-            b.ra.exprUnsupported = true        # aggregate constructor-asgn / other: later
-            var t = dontCare
-            allocValue(b, n, t)
+          let dst = b.symLoc(symName(n))         # local home; a global / tvar → Undef
+          skip n                                 # lhs (not a value-read)
+          allocStore(b, n, dst, asgnPos)         # the one general store path
         else:
-          # A memory store through a complex lvalue (dot/deref/at): place the lvalue's
-          # embedded base/index regs, then the rhs into a register. A FLOAT rhs goes to
-          # an xmm (movsd to memory); an integer rhs to a GPR (nifasm has no
-          # immediate-to-memory `mov`, so an immediate is loaded into a temp first).
-          # A global aggregate base needs an address scratch, reserved before the lhs
-          # and held across the rhs (so the rhs can't grab it), then recorded in `aux`.
-          let hasGlob = lvalueGlobalBase(b, n)
-          var scratch = dontCare
-          if hasGlob: scratch = b.reserveTmp(ScalarSlot)
-          let lhsCopy = n                        # for releaseLvalTemps after the rhs
-          allocLvalue2(b, n, scratch, isStore = true)  # lhs operands; advances past lhs
-          if n.kind == TagLit and n.exprKind == OconstrC:
-            # aggregate constructor stored through the lvalue (`n->chunks[0] = (p, sz)`):
-            # place each field's value; the emitter builds field-by-field into the address.
-            allocConstr(b, n)
-          elif b.isFloatVal(n):
-            var rdest = dontCare
-            allocFValue(b, n, rdest)           # rhs float value → an xmm
-            b.releaseFTmp(rdest)
-          else:
-            var rdest = needsReg(ScalarSlot)
-            allocValue(b, n, rdest)            # rhs value → a register
-            b.releaseTmp(rdest)
-          releaseLvalTemps(b, lhsCopy)           # free the held index/pointer + `(at)` scratch temps
-          if hasGlob:
-            b.releaseTmp(scratch)
-            if scratch.kind == InReg: b.ra.aux[asgnPos] = ExprAux(scratch: @[scratch.r])
-            else: b.ra.exprUnsupported = true
+          # A memory store through a complex lvalue (dot/deref/at).
+          let lhsCur = n
+          skip n                                 # advance past the lhs to the rhs
+          allocStore(b, n, memLoc(lhsCur, ScalarSlot), asgnPos)  # the one general store path
         while n.hasMore: skip n
     else:
       n.into:
@@ -1450,7 +1493,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
           b.record(pos, name, loc)
 
 proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
-                   prog: var Program; md: MachineDesc;
+                   prog: var Program; md: MachineDesc; tc: TypeCtx;
                    presealed: set[Reg] = {}; allocExprs = false;
                    atScratch: HashSet[int] = initHashSet[int]()): RegAlloc =
   ## Allocate storage for the params and locals of `procDecl`. `md` describes the
@@ -1461,7 +1504,7 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
   ## emitter sees the unchanged symbol-only `locs`. `atScratch` lists the `(at …)`
   ## positions (computed by the codegen, which can size strides) that need a scratch
   ## GPR for a non-SIB element stride.
-  var b = Builder(buf: addr buf, an: addr an, prog: addr prog, md: md,
+  var b = Builder(buf: addr buf, an: addr an, prog: addr prog, tc: tc, md: md,
                   allocExprs: allocExprs, atScratch: atScratch)
   b.ra.locs = newSeq[Location](buf.len)
   b.ra.aux = initTable[int, ExprAux]()

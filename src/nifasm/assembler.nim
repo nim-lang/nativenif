@@ -4459,8 +4459,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkCmpCompatible(dest.typ, op.typ, start)
     if dest.kind == okMem:
       if op.kind == okImm:
-        # CMP m64, imm32
-        error("CMP memory, immediate not supported yet", n)
+        x86.emitCmpImm(ctx.buf.data, dest.mem, int32(op.immVal))  # CMP m64, imm32 (81 /7)
       elif op.kind == okMem:
         error("Cannot compare memory with memory", n)
       else:
