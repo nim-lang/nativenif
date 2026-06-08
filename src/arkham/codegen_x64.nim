@@ -2413,15 +2413,14 @@ proc emStoreByte(g: var CodeGen; base, idx, src: Reg) =
 proc emCmpReg(g: var CodeGen; a, b: Reg) =
   g.ab.tree CmpX64: (g.emReg a; g.emReg b)
 
-proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
-  ## Lower one `mem*` intrinsic call. `c` is at the first argument; this consumes
-  ## all of them. Result → RAX. The source/count/index scratch (rsi/rdx/rcx) is bound
-  ## to checked names for the whole sequence; the dest pointer (rdi) and the byte/
-  ## result (rax) stay raw — they are the irreducible arg/return-ABI registers.
-  g.bindTemp(RSI, ScalarSlot); g.bindTemp(RDX, ScalarSlot); g.bindTemp(RCX, ScalarSlot)
+proc genMemIntrinBody(g: var CodeGen; builtin: string) =
+  ## The inline `mem*` loop, assuming the args are already loaded (dst→rdi,
+  ## src/val→rsi, n→rdx) and rsi/rdx/rcx are bound to checked names. Result → RAX.
+  ## Shared by the legacy `genMemIntrin` (reactive `genInto` arg-load) and the
+  ## value-core `emitMemIntrin2` (args placed by `emitValue2` into the ABI regs).
+  ## The dest pointer (rdi) and the byte/result (rax) stay raw — irreducible ABI regs.
   case builtin
   of "memcpy":                                 # (dst, src, n) → dst
-    g.genInto(c, RDI); g.genInto(c, RSI); g.genInto(c, RDX)   # dst, src, n
     let loop = g.freshLabel()
     let done = g.freshLabel()
     g.movImm(RCX, 0)                           # i = 0
@@ -2435,7 +2434,6 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
     g.emLab(done)
     g.movReg(RAX, RDI)                         # memcpy returns dest
   of "memmove":                                # (dst, src, n) → dst; overlap-safe
-    g.genInto(c, RDI); g.genInto(c, RSI); g.genInto(c, RDX)   # dst, src, n
     let fwd = g.freshLabel()
     let bwd = g.freshLabel()
     let done = g.freshLabel()
@@ -2464,7 +2462,6 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
     g.emLab(done)
     g.movReg(RAX, RDI)
   of "memset":                                 # (dst, val, n) → dst
-    g.genInto(c, RDI); g.genInto(c, RSI); g.genInto(c, RDX)   # dst, val, n
     let loop = g.freshLabel()
     let done = g.freshLabel()
     g.movImm(RCX, 0)                           # i = 0
@@ -2477,7 +2474,6 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
     g.emLab(done)
     g.movReg(RAX, RDI)
   of "memcmp":                                 # (a, b, n) → first byte difference
-    g.genInto(c, RDI); g.genInto(c, RSI); g.genInto(c, RDX)   # pa, pb, n
     g.bindTemp(R8, ScalarSlot)                 # the second byte (held across the loop)
     let loop = g.freshLabel()
     let diff = g.freshLabel()
@@ -2503,6 +2499,13 @@ proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
   else:
     raiseAssert "arkham x64 v0: unsupported mem intrinsic: " & builtin
   g.unbindTemp(RCX); g.unbindTemp(RDX); g.unbindTemp(RSI)
+
+proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string) =
+  ## Legacy reactive path: bind the scratch, evaluate the 3 args via `genInto` into
+  ## rdi/rsi/rdx, then run the inline loop. `c` is at the first arg; consumes all.
+  g.bindTemp(RSI, ScalarSlot); g.bindTemp(RDX, ScalarSlot); g.bindTemp(RCX, ScalarSlot)
+  g.genInto(c, RDI); g.genInto(c, RSI); g.genInto(c, RDX)   # dst, src/val, n
+  g.genMemIntrinBody(builtin)
 
 # ── by-value aggregate marshalling (SysV) ────────────────────────────────────
 # A ≤16-byte aggregate of full 8-byte fields travels in 1–2 GPRs (word i ↔ the
@@ -4155,6 +4158,16 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
   if rhsLoc.kind == InReg and rhsLoc.isTemp: g.unbindTemp(rhsLoc.r)
   if lhsLoc.kind == InReg and lhsLoc.isTemp and not reusedLhs: g.unbindTemp(lhsLoc.r)
 
+proc emitMemIntrin2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
+  ## Value-core `mem*` intrinsic: allocCall placed the 3 args in rdi/rsi/rdx (a
+  ## normal int-arg call), so just emit them, bind the loop scratch (rsi/rdx/rcx),
+  ## and run the shared inline loop. Result → rax (moved to its home by emitCall2).
+  let s = AsmSlot(cls: AInt, size: 8, align: 8)
+  for idx in 0 ..< min(3, argCurs.len):
+    g.emitValue2(argCurs[idx])                  # → rdi / rsi / rdx
+  g.bindTemp(RSI, s); g.bindTemp(RDX, s); g.bindTemp(RCX, s)
+  g.genMemIntrinBody(builtin)
+
 proc emitCall2(g: var CodeGen; c: Cursor) =
   ## Emit a call. The allocator placed each argument in its ABI register (integer →
   ## rdi…r9, float → xmm0–7) and the result in rax / xmm0 (or a dest-passed home).
@@ -4179,6 +4192,10 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
     else:
       g.callTarget[fsym] = foreignCallTarget(g.prog, fsym)
   let tgt = g.callTarget[fsym]
+  if tgt.memIntrin.len > 0:                          # C mem* intrinsic → inline loop
+    g.emitMemIntrin2(argCurs, tgt.memIntrin)
+    if resLoc.kind == InReg and resLoc.r != RAX: g.movReg(resLoc.r, RAX)
+    return
   let isSyscall = tgt.syscall
   let hasResult = not retIsVoid(tgt.retType)
   let resSlot = if hasResult: slotOf(g.prog, tgt.retType) else: AsmSlot(cls: AInt, size: 8, align: 8)
