@@ -4807,6 +4807,11 @@ proc emitCast2(g: var CodeGen; c: Cursor) =
       inner = cc; skip cc
       while cc.hasMore: skip cc
   let res = g.ra.locs[cursorToPosition(g.buf[], c)]
+  if res.kind == Imm:
+    # An identity int↔int / ptr-reinterpret cast over a folded immediate: the
+    # allocator left the value as an `Imm` (the consumer folds it), so nothing to
+    # emit — re-representing a constant is a no-op at this width.
+    return
   if res.kind == InFReg:
     # conversion TO float (`conv (f N) inner`): int source → cvtsi2sd (operand in a
     # GPR temp, extended to its source width first); float source → precision convert.
