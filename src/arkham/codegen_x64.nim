@@ -5448,6 +5448,10 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     g.regLocal.clear(); g.aliasToDecl.clear(); g.boundTemps = {}; g.scopeLocals = @[]
     g.fregLocal.clear(); g.boundFTmps = {}; g.scopeFLocals = @[]
     g.spillCount = 0; g.tmpBindCount = 0; g.ftmpBindCount = 0
+    when defined(arkhamDbgProc):
+      block:
+        var pc = info.decl; inc pc
+        stderr.writeLine "DBG emit proc " & symName(pc)
     g.emitProcBody2(info, declarative)
     return
   # Single walk, two modes. The plan pass runs `emitProcBody` with emission

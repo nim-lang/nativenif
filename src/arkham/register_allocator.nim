@@ -330,6 +330,7 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location)
 proc allocFValue(b: var Builder; n: var Cursor; dest: var Location)
 proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = false)
 proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = false)
+proc releaseLvalTemps(b: var Builder; n: Cursor)
 
 proc regOccupied(b: var Builder; reg: Reg): bool
 
@@ -565,7 +566,9 @@ proc allocFValue(b: var Builder; n: var Cursor; dest: var Location) =
       if dest.kind != InFReg:
         dest = b.reserveFTmp(if dest.typ.kind == AFloat: dest.typ else: floatSlot(64))
       let resDest = dest
+      let lvCopy = n                               # for releaseLvalTemps after the load
       allocLvalue2(b, n)                          # embedded base/index regs; advances past
+      releaseLvalTemps(b, lvCopy)                  # index/pointer temps die with the load
       b.ra.locs[pos] = resDest
       return
     of CallC:
@@ -729,13 +732,12 @@ proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = 
         while n.hasMore: skip n
       if atPos in b.atScratch:
         # Non-SIB element stride: reserve a scratch GPR for nifasm's 3-operand `(at
-        # base idx scratch)`, recorded in aux. A LOAD consumes it within its own mov,
-        # so release it now (transient — the reg is reused by later siblings). A STORE
-        # consumes it only after the rhs, so hold it; releaseAtScratch frees it then.
+        # base idx scratch)`, recorded in aux. Held until the access has consumed the
+        # address; `releaseLvalTemps` frees it (uniformly for load and store, alongside
+        # the index/pointer temps) so there is no double-free.
         let t = b.reserveTmp(ScalarSlot)
         if t.kind == InReg:
           b.ra.aux[atPos] = ExprAux(scratch: @[t.r])
-          if not isStore: b.releaseTmp(t)
         else: b.ra.exprUnsupported = true
     of PatC:
       n.into:
@@ -769,27 +771,49 @@ proc lvalueGlobalBase(b: var Builder; n: Cursor): bool =
     else: result = false
   else: result = false
 
-proc releaseAtScratch(b: var Builder; n: Cursor) =
-  ## Release the `(at …)` scratch GPRs an `isStore` allocLvalue2 reserved and held
-  ## (so the rhs couldn't grab them). Called after the rhs is allocated. Walks the
-  ## lvalue chain; each at level's scratch (if any) is recorded in `aux[atPos]`.
+proc releaseLvalTemps(b: var Builder; n: Cursor) =
+  ## Release the scratch GPRs an lvalue's address computation reserved: a computed
+  ## index (`at`/`pat`), a computed pointer (`deref`/`pat`), and a non-SIB-stride
+  ## `(at …)` scratch (`aux[atPos]`). These are dead once the load/store that
+  ## addresses through them has consumed the address — pinning them for the rest of
+  ## the proc exhausts the pool over many accesses. Called by the LOAD consumer right
+  ## after `allocLvalue2`, and by the STORE path after the rhs (where they had to be
+  ## held). `releaseTmp` is a no-op on a symbol's home (non-temp), so a pointer/index
+  ## that is just a param/local read frees nothing; a GLOBAL base reuses the access
+  ## *result* register and sits at a Symbol position — not recursed — so it survives.
   var c = n
-  if c.kind == TagLit:
-    case c.exprKind
-    of DotC:
-      var cc = c
-      cc.into:
-        releaseAtScratch(b, cc)
-        while cc.hasMore: skip cc
-    of AtC:
-      let atPos = b.posOf(c)
-      var cc = c
-      cc.into:
-        releaseAtScratch(b, cc)              # base (recurse before this level)
-        while cc.hasMore: skip cc
-      if b.ra.aux.hasKey(atPos) and b.ra.aux[atPos].scratch.len > 0:
-        b.giveBack b.ra.aux[atPos].scratch[0]
-    else: discard
+  if c.kind != TagLit: return
+  case c.exprKind
+  of DotC:
+    var cc = c
+    cc.into:
+      releaseLvalTemps(b, cc)                 # base
+      while cc.hasMore: skip cc
+  of DerefC:
+    var cc = c
+    cc.into:
+      b.releaseTmp(b.ra.locs[b.posOf(cc)])    # the pointer value
+      while cc.hasMore: skip cc
+  of AtC:
+    let atPos = b.posOf(c)
+    var cc = c
+    cc.into:
+      releaseLvalTemps(b, cc)                 # base (by-value: does not advance cc)
+      skip cc                                 # → the index operand
+      if cc.kind notin {IntLit, UIntLit}:
+        b.releaseTmp(b.ra.locs[b.posOf(cc)])  # the computed index
+      while cc.hasMore: skip cc
+    if b.ra.aux.hasKey(atPos) and b.ra.aux[atPos].scratch.len > 0:
+      b.giveBack b.ra.aux[atPos].scratch[0]
+  of PatC:
+    var cc = c
+    cc.into:
+      b.releaseTmp(b.ra.locs[b.posOf(cc)])    # the pointer value
+      skip cc
+      if cc.kind notin {IntLit, UIntLit}:
+        b.releaseTmp(b.ra.locs[b.posOf(cc)])  # the computed index
+      while cc.hasMore: skip cc
+  else: discard
 
 proc regOccupied(b: var Builder; reg: Reg): bool =
   ## Is fixed register `reg` the persistent home of some symbol? Used to bail a
@@ -917,7 +941,9 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
       else: discard
       if dest.kind != InReg: b.ra.exprUnsupported = true
       let resDest = dest
+      let lvCopy = n                          # for releaseLvalTemps after the load
       allocLvalue2(b, n, resDest)             # embedded base/index regs; a global base
+      releaseLvalTemps(b, lvCopy)             # index/pointer temps die with the load
       b.ra.locs[pos] = resDest                #   reuses resDest (free until the load lands)
       return
     of AddrC:
@@ -930,7 +956,9 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
       if dest.kind != InReg: b.ra.exprUnsupported = true
       let resDest = dest
       n.into:
+        let lvCopy = n                       # the lvalue inside (addr …)
         allocLvalue2(b, n, resDest)          # a global base reuses resDest (the lea dest)
+        releaseLvalTemps(b, lvCopy)          # index/pointer temps die with the address calc
         while n.hasMore: skip n
       b.ra.locs[pos] = resDest
       return
@@ -1193,7 +1221,7 @@ proc walk(b: var Builder; n: var Cursor) =
           let hasGlob = lvalueGlobalBase(b, n)
           var scratch = dontCare
           if hasGlob: scratch = b.reserveTmp(ScalarSlot)
-          let lhsCopy = n                        # for releaseAtScratch after the rhs
+          let lhsCopy = n                        # for releaseLvalTemps after the rhs
           allocLvalue2(b, n, scratch, isStore = true)  # lhs operands; advances past lhs
           if b.isFloatVal(n):
             var rdest = dontCare
@@ -1203,7 +1231,7 @@ proc walk(b: var Builder; n: var Cursor) =
             var rdest = needsReg(ScalarSlot)
             allocValue(b, n, rdest)            # rhs value → a register
             b.releaseTmp(rdest)
-          releaseAtScratch(b, lhsCopy)           # free the held `(at)` scratch GPRs
+          releaseLvalTemps(b, lhsCopy)           # free the held index/pointer + `(at)` scratch temps
           if hasGlob:
             b.releaseTmp(scratch)
             if scratch.kind == InReg: b.ra.aux[asgnPos] = ExprAux(scratch: @[scratch.r])
