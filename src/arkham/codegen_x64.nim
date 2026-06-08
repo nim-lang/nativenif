@@ -4894,6 +4894,52 @@ proc copyStructThroughPtr2(g: var CodeGen; srcVar, typeName: string; ptrReg, tmp
     g.ab.tree MovX64: (g.emPtrFieldMem(ptrReg, typeName, f.name); g.emReg tmp)
   g.unbindTemp(tmp)
 
+proc emLvalFieldMem(g: var CodeGen; lhs: Cursor; field: string) =
+  ## `(mem (dot <lvalue address> field))` — a field within the aggregate addressed by
+  ## the lvalue `lhs` (a `dot`/`at`/`deref` chain). The lvalue's embedded value
+  ## registers must already be materialized (`prematLval2`).
+  g.ab.tree MemX:
+    g.ab.tree DotX:
+      g.emLvalAddr2(lhs)
+      g.ab.sym field
+
+proc genConstrIntoLval2(g: var CodeGen; c: Cursor; lhs: Cursor) =
+  ## Emit `(oconstr T (kv field value)*)` straight into the memory aggregate addressed
+  ## by lvalue `lhs` (e.g. `n->chunks[0] = (p, size)`). The address-targeted twin of
+  ## `genConstr2`: materialize the lvalue's embedded regs once, then store each field
+  ## value at `(dot <lhs> field)`. A pointer field is reinterpreted via `(cast (ptr …))`.
+  var tc = c; inc tc                                    # the constructed type symbol
+  let objTy = resolveType(g.prog, tc)
+  g.prematLval2(lhs)                                     # the lvalue's base/index regs, once
+  var cc = c
+  cc.into:
+    skip cc                                             # the constructed type
+    while cc.hasMore:
+      var kv = cc
+      kv.into:
+        let field = symName(kv); inc kv
+        let valC = kv
+        g.emitValue2(valC)
+        let v = g.ra.locs[cursorToPosition(g.buf[], valC)]
+        if v.kind == InFReg:                            # float field
+          let bits = if v.typ.size == 4: 32 else: 64
+          g.ab.tree (if bits == 32: MovssX64 else: MovsdX64):
+            g.emLvalFieldMem(lhs, field)
+            g.emFReg v.f
+          if v.isTemp: g.unbindFTmp(v.f)
+        else:
+          var fty = resolveType(g.prog, fieldType(g.prog, objTy, field))
+          g.ab.tree MovX64:
+            g.emLvalFieldMem(lhs, field)
+            if isPtrType(fty):
+              g.ab.tree CastX: (g.genTypeBody(fty); g.emReg v.r)
+            else:
+              g.emReg v.r
+          if v.isTemp: g.unbindTemp(v.r)
+        while kv.hasMore: skip kv                        # optional inherited-depth INTLIT
+      skip cc
+  g.unbindLvalTemps2(lhs)                                # release the lvalue's base/index temps
+
 proc genConstr2(g: var CodeGen; c: Cursor; dstVar: string) =
   ## Emit `(oconstr T (kv field value)*)` into the stack aggregate `dstVar`: each
   ## value was placed in a register temp by the allocator (a SIMD temp for a float
@@ -5195,26 +5241,32 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         # across the rhs, so it survives until the store below (unbound after).
         let globScratch = if g.ra.aux.hasKey(asgnPos): g.ra.aux[asgnPos].scratch[0] else: NoReg
         if globScratch != NoReg: g.bindTemp(globScratch, AsmSlot(cls: AInt, size: 8, align: 8))
-        g.prematLval2(lhs)
-        skip cc                                             # past the whole lhs subtree
-        g.emitValue2(cc)                                    # rhs value
-        let v = g.ra.locs[cursorToPosition(g.buf[], cc)]
-        if v.kind == InFReg:                                # float store
-          let bits = if v.typ.size == 4: 32 else: 64
-          g.ab.tree (if bits == 32: MovssX64 else: MovsdX64):
-            g.ab.tree MemX: g.emLvalAddr2(lhs)
-            g.emFReg v.f
-          if v.isTemp: g.unbindFTmp(v.f)
+        var rhsCur = lhs
+        skip rhsCur                                         # past the lhs → the rhs value
+        if rhsCur.kind == TagLit and rhsCur.exprKind == OconstrC:
+          # aggregate constructor stored through the lvalue (`n->chunks[0] = (p, sz)`):
+          # build it field-by-field directly into the addressed memory.
+          g.genConstrIntoLval2(rhsCur, lhs)                 # does its own premat/unbind
         else:
-          g.ab.tree MovX64:
-            g.ab.tree MemX: g.emLvalAddr2(lhs)
-            case v.kind
-            of Imm: g.ab.intLit v.ival
-            of InReg: g.emReg v.r
-            else: raiseAssert "arkham x64n: store rhs " & $v.kind
-          if v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
+          g.prematLval2(lhs)
+          g.emitValue2(rhsCur)                              # rhs value
+          let v = g.ra.locs[cursorToPosition(g.buf[], rhsCur)]
+          if v.kind == InFReg:                              # float store
+            let bits = if v.typ.size == 4: 32 else: 64
+            g.ab.tree (if bits == 32: MovssX64 else: MovsdX64):
+              g.ab.tree MemX: g.emLvalAddr2(lhs)
+              g.emFReg v.f
+            if v.isTemp: g.unbindFTmp(v.f)
+          else:
+            g.ab.tree MovX64:
+              g.ab.tree MemX: g.emLvalAddr2(lhs)
+              case v.kind
+              of Imm: g.ab.intLit v.ival
+              of InReg: g.emReg v.r
+              else: raiseAssert "arkham x64n: store rhs " & $v.kind
+            if v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
+          g.unbindLvalTemps2(lhs)                          # release embedded base/index temps
         if globScratch != NoReg: g.unbindTemp(globScratch)
-        g.unbindLvalTemps2(lhs)                          # release embedded base/index temps
       while cc.hasMore: skip cc
   of WhileS:
     let lStart = g.freshLabel()

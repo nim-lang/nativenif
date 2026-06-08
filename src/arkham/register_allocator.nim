@@ -1255,7 +1255,11 @@ proc walk(b: var Builder; n: var Cursor) =
           if hasGlob: scratch = b.reserveTmp(ScalarSlot)
           let lhsCopy = n                        # for releaseLvalTemps after the rhs
           allocLvalue2(b, n, scratch, isStore = true)  # lhs operands; advances past lhs
-          if b.isFloatVal(n):
+          if n.kind == TagLit and n.exprKind == OconstrC:
+            # aggregate constructor stored through the lvalue (`n->chunks[0] = (p, sz)`):
+            # place each field's value; the emitter builds field-by-field into the address.
+            allocConstr(b, n)
+          elif b.isFloatVal(n):
             var rdest = dontCare
             allocFValue(b, n, rdest)           # rhs float value → an xmm
             b.releaseFTmp(rdest)
