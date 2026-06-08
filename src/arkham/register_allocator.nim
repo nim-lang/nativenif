@@ -695,12 +695,22 @@ proc allocCond(b: var Builder; n: var Cursor) =
       b.releaseFTmp(lDest)
     else:
       var lDest = needsReg(ScalarSlot)
-      var rDest = dontCare
       n.into:
         allocValue(b, n, lDest)                # left → a register
-        allocValue(b, n, rDest)                # right → reg / imm (folded)
+        if isMemLeaf(n):
+          # right is a memory load → fold it as `cmp lreg, [mem]` (no held register).
+          # Its address regs are placed here and die with the compare.
+          let rPos = b.posOf(n)
+          var rc = n
+          allocLvalue2(b, rc)
+          releaseLvalTemps(b, n)
+          b.ra.locs[rPos] = memLoc(n, ScalarSlot)
+          skip n
+        else:
+          var rDest = dontCare
+          allocValue(b, n, rDest)              # right → reg / imm (folded)
+          b.releaseTmp(rDest)
         while n.hasMore: skip n
-      b.releaseTmp(rDest)
       b.releaseTmp(lDest)
   else:
     var d = needsReg(ScalarSlot)
