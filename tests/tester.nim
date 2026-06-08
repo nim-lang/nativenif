@@ -32,9 +32,9 @@ const arkhamKnownUnsupported: seq[string] = @[
   # them via its own legacy codegen — see arkhamLinuxA64Unsupported, which stays
   # empty — so the features keep regression coverage there.)
   #
-  # register-pressure spill totality (the pure emitter has no spill path yet) —
-  # incl. >8 float args (stack) and deep float expression trees:
-  "deep_spill", "deep_spill_call", "ideep", "fparg_spill", "fpdeep",
+  # register-pressure spill totality — >8 float args (stack) and deep float
+  # expression trees (the integer cases now route through the Sethi–Ullman reorder):
+  "fparg_spill", "fpdeep",
 ]
 
 proc arkhamTests() =

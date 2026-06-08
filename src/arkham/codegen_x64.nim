@@ -4132,6 +4132,24 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
       lhsC = cc; skip cc
       rhsC = cc; skip cc
       while cc.hasMore: skip cc
+  let aux = g.ra.aux.getOrDefault(pos)
+  if aux.swapped:
+    # Sethi–Ullman: the rhs was evaluated first into the result register; the leaf
+    # lhs folds after. Commutative → `dest op= lhs`; `sub` → `neg dest; dest += lhs`
+    # (`a - b == -(b) + a`, with `b` already in dest).
+    assert res.kind == InReg, "arkham x64n: bin(swapped) result " & $res.kind
+    let rD = res.r
+    g.emitValue2(rhsC)                                   # rhs → rD (it binds rD if a temp)
+    let lhsLoc = g.ra.locs[cursorToPosition(g.buf[], lhsC)]
+    let foldOp = if op == SubX64: AddX64 else: op        # sub folds as add (after neg)
+    if op == SubX64:
+      g.ab.tree NegX64: g.emReg rD                       # rD := -rhs
+    case lhsLoc.kind                                     # rD := rD <foldOp> lhs
+    of Imm: g.binImm(foldOp, rD, lhsLoc.ival)
+    of InReg: g.binReg(foldOp, rD, lhsLoc.r)
+    of NamedStack, Mem: g.binMem(foldOp, rD, lhsLoc)
+    else: raiseAssert "arkham x64n: bin(swapped) lhs " & $lhsLoc.kind
+    return
   g.emitValue2(lhsC)                                     # materialize sub-results first
   g.emitValue2(rhsC)
   let lhsLoc = g.ra.locs[cursorToPosition(g.buf[], lhsC)]
@@ -4140,7 +4158,7 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
   let rD = res.r
   let reusedLhs = lhsLoc.kind == InReg and lhsLoc.r == rD   # in-place RMW on the left temp
   if res.isTemp and not reusedLhs: g.bindTemp(rD, res.typ)
-  let aliasRhs = g.ra.aux.getOrDefault(pos).aliasRhs
+  let aliasRhs = aux.aliasRhs
   if aliasRhs:
     # `dest` already holds the rhs value (it aliases the rhs register). A commutative
     # op folds straight in (`dest op= lhs`); `sub` computes `dest -= lhs` then negates.

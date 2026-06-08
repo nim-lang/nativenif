@@ -333,12 +333,63 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
 
 proc regOccupied(b: var Builder; reg: Reg): bool
 
+proc isFoldableLeaf(b: var Builder; n: Cursor): bool =
+  ## A value needing NO register held across a sibling subtree: an immediate, or a
+  ## function-local symbol read (folds as its reg / stack home operand). A computed
+  ## expr, a string literal, or a global (each needs a load into a temp) is not.
+  case n.kind
+  of IntLit, UIntLit, CharLit: true
+  of Symbol: b.symLoc(symName(n)).kind in {InReg, NamedStack}
+  else: false
+
+proc commutativeExpr(ek: NifcExpr): bool {.inline.} =
+  ## Integer ops for which `a op b == b op a` (so the heavier operand may be
+  ## evaluated first and the lighter one folded after). `sub` is handled too — via a
+  ## `neg` after the swap — but is NOT commutative, so it is listed separately.
+  ek in {AddC, MulC, BitandC, BitorC, BitxorC}
+
+proc symInReg(b: var Builder; n: Cursor; reg: Reg): bool {.inline.} =
+  ## Is `n` a symbol whose home register is `reg`? (Used to forbid a Sethi–Ullman
+  ## swap whose rhs-into-dest evaluation would clobber a lhs homed in dest.)
+  n.kind == Symbol and (let h = b.symLoc(symName(n)); h.kind == InReg and h.r == reg)
+
 proc allocBin(b: var Builder; n: var Cursor; dest: var Location) =
-  ## Binary-arith node: left into a register, right wherever it lies (a memory
-  ## operand stays folded — `foldB`); the result honours `dest` (destination-
-  ## passing) or reuses the left register in place (x86 destructive 2-operand RMW).
+  ## Binary-arith node. When the left operand is a foldable leaf and the right is a
+  ## computed (register-needing) subtree, a **Sethi–Ullman swap** evaluates the
+  ## right operand *first*, straight into the result register, then folds the leaf
+  ## left operand — so a right-nested chain (`a-(b-(c-…))`, `x0+(x1+(x2+…))`)
+  ## collapses to O(1) live registers and never exhausts the pool. For `sub` the
+  ## swap is completed with a `neg` (`a-b == -(b)+a`). Otherwise the original
+  ## left-into-register / right-folded order is kept.
   let pos = b.posOf(n)
   let ek = n.exprKind                        # the op (a variable shift needs the count in cl)
+  # Peek both operands to decide a Sethi–Ullman swap.
+  var lhsC, rhsC: Cursor
+  block:
+    var cc = n
+    cc.into:
+      skip cc                                # result type
+      lhsC = cc; skip cc
+      rhsC = cc; skip cc
+      while cc.hasMore: skip cc              # drain the copy (into asserts rem == 0)
+  let swap = ek notin {ShlC, ShrC} and (commutativeExpr(ek) or ek == SubC) and
+             b.isFoldableLeaf(lhsC) and not b.isFoldableLeaf(rhsC) and
+             not (dest.kind == InReg and b.symInReg(lhsC, dest.r))
+  if swap:
+    var acc = dest
+    if acc.kind != InReg: acc = b.reserveTmp(ScalarSlot)
+    n.into:
+      skip n                                 # result type
+      skip n                                 # left (folded after — see below)
+      allocValue(b, n, acc)                  # right → the accumulator register
+      while n.hasMore: skip n
+    var lLoc = dontCare                       # left folds as its own operand (no temp)
+    block:
+      var lc = lhsC
+      allocValue(b, lc, lLoc)
+    b.ra.aux[pos] = ExprAux(swapped: true, foldB: lLoc.kind in {NamedStack, Mem})
+    b.ra.locs[pos] = acc
+    return
   var lDest = needsReg(ScalarSlot)
   var rDest = dontCare
   n.into:
