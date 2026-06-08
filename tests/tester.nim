@@ -32,9 +32,8 @@ const arkhamKnownUnsupported: seq[string] = @[
   # them via its own legacy codegen — see arkhamLinuxA64Unsupported, which stays
   # empty — so the features keep regression coverage there.)
   #
-  # aggregates — struct copy/asgn, by-val ≤16B / by-ref >16B params+returns,
-  # 2-D global-array addressing (constructors/oconstr now land in the new path):
-  "structasgn", "structasgn_liveparam", "structcopy", "structinit_liveparam",
+  # aggregates — by-val ≤16B / by-ref >16B params+returns, 2-D global-array
+  # addressing (oconstr + struct copy/asgn now land in the new path):
   "structparam", "structparam_big", "structret", "structret_big", "array2d",
   # atomics / mem intrinsics (fixed-register sequences — port genAtomic/genMemIntrin):
   "atomic", "atomic2", "atomic_cas", "memcmp", "memcpy", "memmove", "memset",

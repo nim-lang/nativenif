@@ -4633,6 +4633,20 @@ proc emitCast2(g: var CodeGen; c: Cursor) =
     else:
       g.extendTo(res.r, targetW, signed = isSignedType(tc))          # narrow / equal
 
+proc genAggrCopy2(g: var CodeGen; dstVar, srcVar, typeName: string; tmp: Reg) =
+  ## Whole-aggregate copy `dstVar ← srcVar`, one 8-byte word at a time through the
+  ## allocator-provided scratch GPR `tmp`. Both operands address by name via
+  ## emAggrFieldMem (a stack `(s)` slot's dot form, or a by-ref param's pointer).
+  let lay = aggrLayout(g.prog, typeName)
+  let words = (aggrByteSize(g.prog, typeName) + 7) div 8   # real size (not the ≤16B ABI count)
+  g.bindTemp(tmp, ScalarSlot)
+  for i in 0 ..< words:
+    let fn = fieldAtOffset(lay, i * 8)
+    if fn.len == 0: raiseAssert "arkham x64n: sub-word-packed aggregate copy unsupported"
+    g.ab.tree MovX64: (g.emReg tmp; g.emAggrFieldMem(srcVar, fn))
+    g.ab.tree MovX64: (g.emAggrFieldMem(dstVar, fn); g.emReg tmp)
+  g.unbindTemp(tmp)
+
 proc genConstr2(g: var CodeGen; c: Cursor; dstVar: string) =
   ## Emit `(oconstr T (kv field value)*)` into the stack aggregate `dstVar`: each
   ## value was placed in a register temp by the allocator (a SIMD temp for a float
@@ -4671,6 +4685,7 @@ proc genConstr2(g: var CodeGen; c: Cursor; dstVar: string) =
 proc genVarDecl2(g: var CodeGen; c: Cursor) =
   var cc = c
   cc.into:
+    let declPos = cursorToPosition(g.buf[], cc)         # SymbolDef pos (aux key, matches allocVarDecl)
     let nm = symName(cc); inc cc
     skip cc                                              # pragmas
     let typeCur = cc; skip cc                            # type
@@ -4690,6 +4705,8 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
       let valC = cc
       if valC.kind == TagLit and valC.exprKind == OconstrC:
         g.genConstr2(valC, nm)
+      elif valC.kind == Symbol:                          # copy-init `var b = a`
+        g.genAggrCopy2(nm, symName(valC), g.varType[nm], g.ra.aux[declPos].scratch[0])
       else: raiseAssert "arkham x64n: aggregate var init " & $valC.exprKind
     elif hasVal:
       let valC = cc
@@ -4862,41 +4879,46 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         let asgnPos = cursorToPosition(g.buf[], c)
         let lhsCur = cc                                     # captured for asLoc (global/tvar)
         let dst = g.ra.locationOfSym(symName(cc)); skip cc # local lvalue (reg or `(s)` slot)
-        g.emitValue2(cc)                                    # rhs computed into a reg / dst home
-        let v = g.ra.locs[cursorToPosition(g.buf[], cc)]
-        case dst.kind
-        of InReg: g.place2(v, dst.r)                        # dest-passed ⇒ usually a no-op
-        of InFReg:                                          # float reg home: rhs dest-passed
-          if v.kind == InFReg and v.f != dst.f:
-            g.fmovF(dst.f, v.f, dst.typ.size * 8)
-        of NamedStack:                                      # stack-homed scalar: store + free
-          if v.kind == InReg:
-            g.emitStoreLoc(dst, v.r)
+        if dst.kind == NamedStack and dst.typ.kind == AMem:
+          # whole-aggregate assignment `b = a` (rhs is another aggregate lvalue)
+          g.genAggrCopy2(symName(lhsCur), symName(cc), g.varType[symName(lhsCur)],
+                         g.ra.aux[asgnPos].scratch[0])
+        else:
+          g.emitValue2(cc)                                  # rhs computed into a reg / dst home
+          let v = g.ra.locs[cursorToPosition(g.buf[], cc)]
+          case dst.kind
+          of InReg: g.place2(v, dst.r)                      # dest-passed ⇒ usually a no-op
+          of InFReg:                                        # float reg home: rhs dest-passed
+            if v.kind == InFReg and v.f != dst.f:
+              g.fmovF(dst.f, v.f, dst.typ.size * 8)
+          of NamedStack:                                    # stack-homed scalar: store + free
+            if v.kind == InReg:
+              g.emitStoreLoc(dst, v.r)
+              if v.isTemp: g.unbindTemp(v.r)
+            elif v.kind == InFReg:                          # spilled float: store to its slot
+              g.emFloatScalarStore(dst.name, v.f, dst.typ.size * 8)
+              if v.isTemp: g.unbindFTmp(v.f)
+            else: raiseAssert "arkham x64n: stack asgn rhs " & $v.kind
+          of Undef:                                         # a module-level global / tvar store
+            assert v.kind == InReg, "arkham x64n: global store rhs " & $v.kind
+            var lc = lhsCur
+            let loc = g.asLoc(lc)                           # Glob/Tvar with precise type
+            case loc.kind
+            of Tvar:                                        # nifasm resolves FS:[off]
+              g.ab.tree MovX64:
+                g.ab.sym loc.name
+                g.emReg v.r
+            of Glob:                                        # &g into the address temp, then store
+              let addrT = g.ra.aux[asgnPos].scratch[0]
+              g.bindTemp(addrT, loc.typ)
+              g.emGlobalAddr(addrT, loc.name)
+              g.ab.tree MovX64:
+                g.ab.tree MemX: g.emReg addrT
+                g.emReg v.r
+              g.unbindTemp(addrT)
+            else: raiseAssert "arkham x64n: global store loc " & $loc.kind
             if v.isTemp: g.unbindTemp(v.r)
-          elif v.kind == InFReg:                            # spilled float: store to its slot
-            g.emFloatScalarStore(dst.name, v.f, dst.typ.size * 8)
-            if v.isTemp: g.unbindFTmp(v.f)
-          else: raiseAssert "arkham x64n: stack asgn rhs " & $v.kind
-        of Undef:                                           # a module-level global / tvar store
-          assert v.kind == InReg, "arkham x64n: global store rhs " & $v.kind
-          var lc = lhsCur
-          let loc = g.asLoc(lc)                             # Glob/Tvar with precise type
-          case loc.kind
-          of Tvar:                                          # nifasm resolves FS:[off]
-            g.ab.tree MovX64:
-              g.ab.sym loc.name
-              g.emReg v.r
-          of Glob:                                          # &g into the address temp, then store
-            let addrT = g.ra.aux[asgnPos].scratch[0]
-            g.bindTemp(addrT, loc.typ)
-            g.emGlobalAddr(addrT, loc.name)
-            g.ab.tree MovX64:
-              g.ab.tree MemX: g.emReg addrT
-              g.emReg v.r
-            g.unbindTemp(addrT)
-          else: raiseAssert "arkham x64n: global store loc " & $loc.kind
-          if v.isTemp: g.unbindTemp(v.r)
-        else: raiseAssert "arkham x64n: asgn lhs home " & $dst.kind
+          else: raiseAssert "arkham x64n: asgn lhs home " & $dst.kind
       else:
         # A memory store through a complex lvalue (dot/deref/at): materialize the lvalue's
         # embedded base regs, compute the rhs, then `mov (mem <addr>), rhs` — `movsd` for a

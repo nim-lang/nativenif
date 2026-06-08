@@ -833,8 +833,14 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
         if valCur.kind == TagLit and valCur.exprKind == OconstrC:
           var vc = valCur
           allocConstr(b, vc)                   # constructor: place each field's value
+        elif valCur.kind == Symbol:
+          # aggregate copy-init (`var b = a`): one scratch GPR carries each word from
+          # the source slot to the destination slot.
+          let t = b.reserveTmp(ScalarSlot); b.releaseTmp(t)
+          if t.kind == InReg: b.ra.aux[pos] = ExprAux(scratch: @[t.r])
+          else: b.ra.exprUnsupported = true
         else:
-          # aggregate copy-init (`var b = a`) / call-returned aggregate: later slice
+          # call-returned aggregate: later slice
           b.ra.exprUnsupported = true
     else:
       let props = b.an.vars.getOrDefault(name).props
@@ -964,8 +970,15 @@ proc walk(b: var Builder; n: var Cursor) =
             b.releaseTmp(addrT)
             if addrT.kind == InReg: b.ra.aux[asgnPos] = ExprAux(scratch: @[addrT.r])
             else: b.ra.exprUnsupported = true
+          elif home.kind == NamedStack and home.typ.kind == AMem and n.kind == Symbol:
+            # Whole-aggregate assignment `b = a` (both aggregate lvalues): a word-transfer
+            # scratch GPR carries each 8-byte word from the source slot to `b`.
+            skip n                               # rhs aggregate symbol (no value alloc)
+            let t = b.reserveTmp(ScalarSlot); b.releaseTmp(t)
+            if t.kind == InReg: b.ra.aux[asgnPos] = ExprAux(scratch: @[t.r])
+            else: b.ra.exprUnsupported = true
           else:
-            b.ra.exprUnsupported = true        # aggregate `(s)` store: legacy
+            b.ra.exprUnsupported = true        # aggregate constructor-asgn / other: later
             var t = dontCare
             allocValue(b, n, t)
         else:
