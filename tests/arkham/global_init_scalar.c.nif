@@ -1,0 +1,21 @@
+(.nif27)
+(.indexat 294              )
+(stmts
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (gvar :g.0 .
+  (i 64)
+  (add
+   (i 64)40 2))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (call exit.c g.0))))(.index)

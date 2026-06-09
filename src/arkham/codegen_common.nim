@@ -143,6 +143,10 @@ type
                                              ## plan-record / emit-replay model as
                                              ## `stealEvents`, keyed by `fixedEvictSeq`.
     fixedEvictSeq*: int                      ## replay counter into `fixedEvicts`
+    hasGlobalInits*: bool                     ## the module has runtime (non-static) global
+                                             ## initializers, emitted as a synthetic init
+                                             ## proc the entry calls (see `buildGlobalInitProc`)
+    globalInitSym*: string                    ## the synthetic init proc's asm-NIF symbol
 
 # ── type predicates ─────────────────────────────────────────────────────────
 

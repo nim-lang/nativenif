@@ -437,7 +437,6 @@ proc genVal(g: var CodeGen; c: var Cursor): Location
 proc emitPatAddr(g: var CodeGen; c: var Cursor; dest: Reg)
 proc forceReg(g: var CodeGen; dest: var Location)
 proc genTypeBody(g: var CodeGen; c: var Cursor)
-proc emitGlobalInits(g: var CodeGen)
 proc framePop(g: var CodeGen)
 proc killFrameRegLocals(g: var CodeGen)
 proc genIntoF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int)
@@ -5098,7 +5097,28 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
     elif rhs.kind == Symbol:                             # copy-init / copy-asgn `dst = a`
       g.genAggrCopy2(dstVar, symName(rhs), tn, g.ra.aux[auxPos].scratch[0])
     else: raiseAssert "arkham x64n: aggregate store rhs " & $rhs.exprKind
-  elif dst.kind in {Glob, Tvar}:                         # module-level global / threadvar
+  elif dst.kind in {Glob, Tvar} and dst.typ.kind == AFloat:  # float global / threadvar
+    g.emitValue2(rhs)                                    # rhs → an xmm
+    let fv = g.ra.locs[cursorToPosition(g.buf[], rhs)]
+    assert fv.kind == InFReg, "arkham x64n: float global store rhs " & $fv.kind
+    let gbits = if dst.typ.size == 4: 32 else: 64
+    let op = if gbits == 32: MovssX64 else: MovsdX64
+    case dst.kind
+    of Glob:                                             # &g into the address temp, then movss/movsd
+      let addrT = g.ra.aux[auxPos].scratch[0]
+      var pSlot = ScalarSlot                             # type it `(ptr (f N))` (nifasm is strict)
+      if not cursorIsNil(dst.typ.typ): pSlot = typeToSlot(g.prog.ptrTypeOf(dst.typ.typ))
+      g.bindTemp(addrT, pSlot)
+      g.emGlobalAddr(addrT, dst.name)
+      g.ab.tree op:
+        g.ab.tree MemX: g.emReg addrT
+        g.emFReg fv.f
+      g.unbindTemp(addrT)
+    else: raiseAssert "arkham x64n: float threadvar store not supported"
+    if fv.isTemp: g.unbindFTmp(fv.f)
+  elif dst.kind in {Glob, Tvar} and dst.typ.kind == AMem:
+    raiseAssert "arkham x64n: aggregate global initializer not supported on the value-core path"
+  elif dst.kind in {Glob, Tvar}:                         # scalar/pointer global / threadvar
     g.emitValue2(rhs)
     var v = g.ra.locs[cursorToPosition(g.buf[], rhs)]
     var glbStaging = NoReg
@@ -5116,7 +5136,12 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
         g.emReg v.r
     of Glob:                                             # &g into the address temp, then store
       let addrT = g.ra.aux[auxPos].scratch[0]
-      g.bindTemp(addrT, dst.typ)
+      # Type the address temp as `(ptr <globalType>)` so the `(mem p)` deref carries the
+      # global's PRECISE type — a typed-pointer value into a pointer global would
+      # otherwise mismatch a generic mem (nifasm is strict; see `scalarMemMov`).
+      var pSlot = ScalarSlot
+      if not cursorIsNil(dst.typ.typ): pSlot = typeToSlot(g.prog.ptrTypeOf(dst.typ.typ))
+      g.bindTemp(addrT, pSlot)
       g.emGlobalAddr(addrT, dst.name)
       g.ab.tree MovX64:
         g.ab.tree MemX: g.emReg addrT
@@ -5562,7 +5587,10 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool) =
         g.ab.tree SubX64: (g.ab.reg RSP; g.ab.keyword SsizeX)
       if g.retIndirect: g.movReg(g.indirectReg, RDI)
       g.emitParamMoves(info.decl, declarative)
-      if info.isEntry: g.emitGlobalInits()
+      if info.isEntry and g.hasGlobalInits:              # run runtime global inits at startup
+        g.ab.tree PrepareX64:
+          g.ab.sym g.globalInitSym
+          g.ab.keyword CallX64
       # Declare the totality spill slots the allocator synthesized (`etmp`/`ftmp`):
       # a value position the register pool couldn't hold is produced into its slot
       # via a staging register (`produceIntoMem2`/`produceIntoFMem2`). A pointer slot
@@ -5694,7 +5722,9 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     g.indirectReg = RBX
     g.ra.usedCallee.incl RBX                   # saved/restored like any callee reg
   g.initFreeTmp()
-  g.computeFrameX64(info.isEntry, an.hasCall)
+  # The entry injects a `call` to the synthetic global-init proc, so it makes a call
+  # even when its own body does not — keep rsp 16-aligned for that call.
+  g.computeFrameX64(info.isEntry, an.hasCall or (info.isEntry and g.hasGlobalInits))
   let declarative = isDeclarativeAbi(g.prog, info.decl)
   # Pure-emit path: the allocator already assigned every value position; emit once.
   g.ab.planning = false
@@ -5742,43 +5772,46 @@ proc genGlobal(g: var CodeGen; name: string; decl: Cursor) =
       g.ab.close()
     while c.hasMore: skip c                      # value (also handled at entry, if runtime)
 
-proc emitGlobalInits(g: var CodeGen) =
-  ## At program entry, store each global's initializer (if any) into its slot.
+proc buildGlobalInitProc(g: var CodeGen; initBuf: var TokenBuf) =
+  ## Lower each global's RUNTIME initializer into a synthetic `(proc … (stmts (asgn
+  ## g e) …))` so it routes through the ordinary value-core pipeline (allocateProc +
+  ## emitProcBody2) — no special-case emitter. The entry calls this proc at startup
+  ## (see `emitProcBody2`). Const-scalar initializers are laid out as static data by
+  ## `genGlobal` and are skipped here, so a module with none gets no init proc.
+  ##
+  ## `initBuf` shares the input buffer's pool + tag pool, so each `(asgn …)`'s symbol
+  ## use re-interns to the SAME `SymId` and the copied initializer subtree is a bulk
+  ## `copyMem`. Built into a separate buffer (not the input) so `cursorToPosition`
+  ## keys the allocator/emitter location map by position WITHIN `initBuf`.
+  var inits: seq[(string, Cursor)] = @[]
   for name, decl in g.globals:
     var c = decl
     if c.stmtKind == ConstS: continue           # emitted as a rodata data blob
     c.into:
       inc c; skip c                             # name, pragmas
-      let gslot = slotOf(g.prog, c)             # the global's declared type
       skip c                                    # type
       # A constant-scalar initializer was laid out as static data (see genGlobal),
       # so there is no entry-time store to emit for it here.
       if c.hasMore and c.kind != DotToken and not isConstScalarInit(c):
-        if gslot.kind == AFloat:                 # float global → movss/movsd [&g], xmm
-          let gbits = if gslot.size == 4: 32 else: 64
-          let fv = g.borrowFTmp()
-          g.genIntoF(c, fv, gbits)
-          let p = g.borrowTmp(ScalarSlot)
-          g.emGlobalAddr(p, name)
-          let op = if gbits == 32: MovssX64 else: MovsdX64
-          g.ab.tree op:
-            g.ab.tree MemX: g.emReg p
-            g.emFReg fv
-          g.giveBack p
-          g.giveBackF fv
-        elif gslot.kind == AMem:                 # aggregate global (e.g. a `string`):
-          g.genStore(c, globLoc(name, gslot))    # build/copy in place at &global
-        else:
-          let v = g.borrowTmp(ScalarSlot)
-          g.genInto(c, v)                          # evaluate the initializer
-          let p = g.borrowTmp(ScalarSlot)
-          g.emGlobalAddr(p, name)
-          g.ab.tree MovX64:
-            g.ab.tree MemX: g.emReg p
-            g.emReg v
-          g.giveBack p
-          g.giveBack v
+        inits.add (name, c)
       while c.hasMore: skip c
+  if inits.len == 0: return
+  g.hasGlobalInits = true
+  g.globalInitSym = "arkhamGlobalInit.0"
+  template tag(e): TagId = TagId(uint32(ord(e)))
+  initBuf.openTag tag(ProcS)
+  initBuf.addSymDef g.globalInitSym
+  initBuf.openTag tag(ParamsT); initBuf.closeTag()       # (params)
+  initBuf.addDotToken()                                  # void return
+  initBuf.openTag tag(PragmasU); initBuf.closeTag()      # (pragmas)
+  initBuf.openTag tag(StmtsS)
+  for (name, initCur) in inits:
+    initBuf.openTag tag(AsgnS)
+    initBuf.addSymUse name                               # the global lvalue
+    initBuf.addSubtree initCur                           # its initializer expression
+    initBuf.closeTag()
+  initBuf.closeTag()                                     # stmts
+  initBuf.closeTag()                                     # proc
 
 proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool): string =
   ## Compile a parsed NIFC module to x86-64 / Linux asm-NIF text.
@@ -5789,6 +5822,11 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool): string =
   g.globals = g.prog.globals
   g.tvars = g.prog.tvars
   for nm in g.tvars.keys: g.tvarNames.incl nm
+  # Build the synthetic global-init proc (if any runtime initializers exist) BEFORE
+  # the proc loop, so the entry proc's frame/body account for the startup `call`.
+  # `initBuf` must outlive `genProc` below; it shares `buf`'s pool + tag pool.
+  var initBuf = createTokenBuf(64, buf.pool, buf.tags)
+  g.buildGlobalInitProc(initBuf)
   g.ab.tree StmtsX64:
     g.ab.tree ArchD: g.ab.ident "x64"
     for (name, decl) in g.prog.mainTypeList:
@@ -5804,6 +5842,12 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool): string =
       g.emitSyproc(sp)
     for info in g.prog.procs:
       genProc(g, info)
+    if g.hasGlobalInits:                         # emit the synthetic init proc itself
+      let savedBuf = g.buf
+      g.buf = addr initBuf
+      var ic = initBuf.beginRead()
+      genProc(g, ProcInfo(asmName: g.globalInitSym, decl: ic, isEntry: false))
+      g.buf = savedBuf
     for (nm, bytes) in g.rodata:
       g.ab.tree RodataD:
         g.ab.symDef nm

@@ -1200,13 +1200,25 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
     else:
       b.ra.exprUnsupported = true; skip n
   elif dst.kind == Undef:                                # module-level global / threadvar
-    let addrT = b.reserveTmp(ScalarSlot)                 # &g address temp (Tvar ignores it)
-    var d = needsReg(ScalarSlot)
-    allocValue(b, n, d)
-    b.releaseTmp(d)
-    b.releaseTmp(addrT)
-    if addrT.kind == InReg: b.ra.aux[auxPos] = ExprAux(scratch: @[addrT.r])
-    else: b.ra.exprUnsupported = true
+    # The emitter resolves the destination to a `Glob`/`Tvar` with a precise slot; the
+    # allocator only needs the right scratch. A float global stores `movss/movsd [&g], xmm`
+    # (the rhs goes to an xmm); a scalar/pointer global stores through a GPR. An aggregate
+    # global initializer (a `(s)`-built oconstr/array) is not handled on this path.
+    if n.kind == TagLit and n.exprKind in {OconstrC, AconstrC}:
+      b.ra.exprUnsupported = true; skip n
+    else:
+      let addrT = b.reserveTmp(ScalarSlot)               # &g address temp (Tvar ignores it)
+      if b.isFloatVal(n):
+        var d = dontCare
+        allocFValue(b, n, d)
+        b.releaseFTmp(d)
+      else:
+        var d = needsReg(ScalarSlot)
+        allocValue(b, n, d)
+        b.releaseTmp(d)
+      b.releaseTmp(addrT)
+      if addrT.kind == InReg: b.ra.aux[auxPos] = ExprAux(scratch: @[addrT.r])
+      else: b.ra.exprUnsupported = true
   elif dst.kind == InFReg:                               # float register home: dest-passing
     var d = dst
     allocFValue(b, n, d)
