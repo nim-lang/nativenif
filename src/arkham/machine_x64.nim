@@ -67,6 +67,10 @@ const
                                      # GPR the emitter can grab to make mem←mem / spilled
                                      # value-position produce-into total, so the allocator's
                                      # `etmp` fallback is always emittable.
+    intLocalTempRegs: @[],           # NO volatile int reg may home a local on x86-64: R10 is
+                                     # the emitter's staging scratch (and R11 the bridge), so a
+                                     # local there starves the emitter. Call-free locals that
+                                     # exhaust the callee-saved pool spill instead.
     intCalleeSaved: @[RBX, R12, R13, R14, R15],
     floatTempRegs: @[F8, F9, F10, F11, F12, F13, F14],   # F15 RESERVED as the float
                                                          # staging bridge (FloatStagingBridge)

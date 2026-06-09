@@ -9,10 +9,16 @@
 ##
 ## For every local we record how often it is defined/used (weighted so that
 ## uses inside loops count more) and whether its address is taken. We also
-## track, per scope, whether it contains a call: variables confined to a
-## call-free scope may use volatile (caller-saved) registers (`AllRegs`),
-## while variables live across a call must go to callee-saved registers or
-## the stack. The register allocator consumes this.
+## decide, per local, whether it may use a volatile (caller-saved) register
+## (`AllRegs`): it may iff *no call point lies within its live range*. A call
+## clobbers caller-saved registers only at the call, so the constraint on a
+## value is an interval test — does the value's live range contain a call? —
+## not a whole-scope one. A local whose range ends before the first call, or
+## starts after the last, is call-free even if the scope has calls elsewhere.
+## Loop-carried locals (`declInLoop`) are live across the back-edge, so we use
+## their enclosing loop's span as the interval (any call in the loop crosses).
+## Locals live across a call go to callee-saved registers or the stack. The
+## register allocator consumes this.
 ##
 ## Ported from `src/wip/native/analyser.nim` to the nifcore cursor API; keyed
 ## by symbol *name* (nifcore has no stable SymId for inline-short symbols).
@@ -35,6 +41,14 @@ type
     frameIdx*: int             ## index of the var's declaring scope frame
     declInLoop*: bool          ## declared inside a loop → not early-freed (a later
                                ## loop-body decl could reuse the reg across the back-edge)
+    liveStart*: int            ## token position of the var's declaration: the start of
+                               ## its (coarse) live range, paired with `freeAfter` as the
+                               ## end. A call strictly after `liveStart` and at/before
+                               ## `freeAfter` crosses the range.
+    loopLo*, loopHi*: int      ## for `declInLoop` vars: span of the innermost enclosing
+                               ## loop, used as the live interval instead of
+                               ## `(liveStart, freeAfter]` (the value is carried across the
+                               ## back-edge, so any call in the loop crosses it)
 
   ProcAnalysis* = object
     vars*: Table[string, VarInfo]
@@ -44,14 +58,15 @@ type
     clobbersShiftReg*: bool     ## body contains a variable shift → rcx (cl) is
                                 ## clobbered, so a leaf param must not be homed there
 
-  Scope = object
-    vars: seq[string]
-    hasCall: bool
-
   Context = object
     inLoops, inAddr, inAsgnTarget, inArrayIndex: int
     res: ProcAnalysis
-    scopes: seq[Scope]
+    callPositions: seq[int]    ## token position of every call point (incl. tvar thunk
+                               ## accesses) — the points where caller-saved regs die. A
+                               ## local may use `AllRegs` iff none of these fall in its
+                               ## live interval. Recorded in source order; scanned linearly.
+    loopStack: seq[tuple[lo, hi: int]]  ## spans of the enclosing loops (`WhileS`), so a
+                               ## var declared in a loop can record its loop's extent
     stmtEnd: seq[int]          ## per open scope frame: end position of the
                                ## statement it is currently processing
     buf: ptr TokenBuf          ## for cursor → token-position mapping
@@ -62,21 +77,6 @@ const
 
 proc posOf(c: Context; cur: Cursor): int {.inline.} =
   cursorToPosition(c.buf[], cur)
-
-proc openScope(c: var Context) =
-  ## A *variable* scope (for `AllRegs`/`hasCall`). Only a `scope` (and the proc's
-  ## outermost) opens one — a `stmts` is a statement list within the current
-  ## scope, NOT a fresh scope (matching the register allocator).
-  c.scopes.add Scope()
-
-proc closeScope(c: var Context) =
-  let finished = c.scopes.pop()
-  if not finished.hasCall:
-    for v in finished.vars:
-      c.res.vars[v].props.incl AllRegs
-  elif c.scopes.len > 0:
-    # a scope "has a call" if any inner scope did
-    c.scopes[^1].hasCall = true
 
 template iterStmts(c: var Context; n: var Cursor; body: untyped) =
   ## Walk a statement list, recording each child statement's end position in the
@@ -107,15 +107,18 @@ proc analyseChildren(c: var Context; n: var Cursor) =
 
 proc analyseVarDecl(c: var Context; n: var Cursor) =
   ## `(var :name pragmas type value)` (also gvar/tvar/const).
+  let declPos = posOf(c, n)
   n.into:
     assert n.kind == SymbolDef
     let vn = symName(n); inc n
     skip n                       # pragmas
     skip n                       # type
     let hasValue = n.kind != DotToken
-    c.res.vars[vn] = VarInfo(defs: ord(hasValue), freeAfter: c.stmtEnd[^1],
-                             frameIdx: c.stmtEnd.high, declInLoop: c.inLoops > 0)
-    c.scopes[^1].vars.add vn
+    let inLoop = c.inLoops > 0
+    var vi = VarInfo(defs: ord(hasValue), freeAfter: c.stmtEnd[^1],
+                     frameIdx: c.stmtEnd.high, declInLoop: inLoop, liveStart: declPos)
+    if inLoop: (vi.loopLo = c.loopStack[^1].lo; vi.loopHi = c.loopStack[^1].hi)
+    c.res.vars[vn] = vi
     if hasValue: analyse(c, n)   # analyse the initializer
     else: inc n                  # consume the `.`
 
@@ -140,9 +143,9 @@ proc analyse(c: var Context; n: var Cursor) =
         e.props.incl AddrTaken
     elif vn in c.tvars:
       # A thread-local access lowers to the TLV thunk call (clobbers x0/lr), so
-      # treat it like a call: the proc needs a frame and its locals/params must
-      # avoid the volatile argument registers.
-      c.scopes[^1].hasCall = true
+      # treat it like a call point: locals live across it must avoid the volatile
+      # argument registers.
+      c.callPositions.add posOf(c, n)
     inc n
   of IntLit, UIntLit, FloatLit, CharLit, StrLit, Ident, SymbolDef, DotToken:
     inc n
@@ -203,16 +206,14 @@ proc analyse(c: var Context; n: var Cursor) =
         analyseChildren(c, n)
       else:
         analyseChildren(c, n)           # generic expression: recurse
-    of ScopeS:                          # a variable scope AND a statement list
-      c.openScope()
+    of ScopeS:                          # a variable scope: its own `stmtEnd` frame
       scopeFrame(c):
         iterStmts(c, n): analyse(c, n)
-      c.closeScope()
     of StmtsS:                          # statement grouping only — shares the scope frame
       iterStmts(c, n): analyse(c, n)
     of CallS:
+      c.callPositions.add posOf(c, n)
       analyseChildren(c, n)
-      c.scopes[^1].hasCall = true
     of VarS, GvarS, TvarS, ConstS:
       analyseVarDecl(c, n)
     of AsgnS:
@@ -224,10 +225,13 @@ proc analyse(c: var Context; n: var Cursor) =
     of ProcS, TypeS:
       skip n                            # nested decls: not our locals
     of WhileS:
+      var e = n; skip e               # span of the whole loop, for declInLoop vars
+      c.loopStack.add (lo: posOf(c, n), hi: posOf(c, e))
       n.into:
         inc c.inLoops
         while n.hasMore: analyse(c, n)
         dec c.inLoops
+      discard c.loopStack.pop()
     else:
       analyseChildren(c, n)             # if/case/ret/... : recurse
   else:
@@ -242,9 +246,10 @@ proc analyseParams(c: var Context; params: var Cursor) =
         assert params.kind == SymbolDef
         let vn = symName(params); inc params
         # Params are never early-freed (the allocator manages them separately), so
-        # pin their live range to the whole proc.
+        # pin their live range to the whole proc. `freeAfter == high(int)` also marks
+        # them as params for the `AllRegs` finalize, which skips them (allocParams
+        # decides their homes from the proc-level `hasCall`, not `AllRegs`).
         c.res.vars[vn] = VarInfo(defs: 1, freeAfter: high(int))
-        c.scopes[^1].vars.add vn
         while params.hasMore: skip params   # pragmas, type
         # (rest consumed by into epilogue)
 
@@ -254,7 +259,6 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
   ## the module's thread-locals so their uses force a call-like analysis. `buf` is
   ## the buffer `procDecl` points into (for cursor → position mapping).
   var c = Context(tvars: tvars, buf: addr buf)
-  c.openScope()                         # the always-present outermost scope
   var n = procDecl
   assert n.stmtKind == ProcS
   n.into:
@@ -264,6 +268,19 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
     skip n                              # pragmas
     scopeFrame(c):                      # the proc-body scope frame (its `stmts`
       iterStmts(c, n): analyse(c, n)    # shares it rather than pushing its own)
-  c.res.hasCall = c.scopes[0].hasCall
-  c.closeScope()                        # propagate AllRegs to the body's locals
+  c.res.hasCall = c.callPositions.len > 0
+  # Grant `AllRegs` (volatile/caller-saved eligible) to every local whose live
+  # interval contains no call point. The interval is `(liveStart, freeAfter]`
+  # for ordinary locals, or the enclosing-loop span for loop-carried ones. The
+  # check is conservative: `freeAfter` over-approximates the range end and a
+  # call within it denies `AllRegs`, so a missed-but-live-across-call case is
+  # impossible (the unsafe direction). Params (`freeAfter == high`) are skipped.
+  for name, vi in mpairs c.res.vars:
+    if vi.freeAfter == high(int): continue
+    let lo = if vi.declInLoop: vi.loopLo else: vi.liveStart
+    let hi = if vi.declInLoop: vi.loopHi else: vi.freeAfter
+    var crosses = false
+    for p in c.callPositions:
+      if p > lo and p <= hi: (crosses = true; break)
+    if not crosses: vi.props.incl AllRegs
   result = ensureMove c.res

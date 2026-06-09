@@ -133,31 +133,32 @@ proc spill(b: var Builder; slot: AsmSlot): Location =
 proc allocStorage(b: var Builder; slot: AsmSlot; props: VarProps): Location =
   ## Decide where one local/param lives. Records reg use for scope freeing.
   if slot.isFloat:
-    # Floats in a call-free region use caller-saved scratch (v16–v31); those
-    # live across a call use callee-saved (v8–v15), saved in the prologue.
-    # Address-taken floats fall back to a (codegen-unsupported) slot.
+    # A float local lives only in a callee-saved register (saved in the prologue),
+    # or it spills. The volatile float pool (v16–v31 on arm64, xmm8–15 on x64) is
+    # reserved as the emitter's expression scratch — handing it to a long-lived
+    # local starves that scratch (`out of SIMD scratch` on arm64, an unbound-pool
+    # register reaching `emFReg` on x64). Unlike the integer side, there is no spare
+    # volatile pool to lend out: every volatile xmm is needed to evaluate float
+    # trees. So `AllRegs` is moot for floats. On x86-64 there are NO callee-saved
+    # xmm regs at all (SysV), so a float local always spills there — exactly the
+    # behavior before precise `AllRegs`, when the empty callee pool forced a spill.
     if AddrTaken in props: return b.spill(slot)
-    var f: FReg
-    if AllRegs in props:
-      f = b.takeFReg(b.freeVolF, b.md.floatTempRegs)
-      if f == NoFReg: f = b.takeFReg(b.freeCalleeF, b.md.floatCalleeSaved)
-    else:
-      f = b.takeFReg(b.freeCalleeF, b.md.floatCalleeSaved)
+    let f = b.takeFReg(b.freeCalleeF, b.md.floatCalleeSaved)
     if f == NoFReg: return b.spill(slot)
-    if f in b.md.floatCalleeSavedSet: b.ra.usedCalleeF.incl f
+    b.ra.usedCalleeF.incl f
     return fregLoc(f, slot)
   if AddrTaken in props or not slot.inRegClass:
     return b.spill(slot)
   var r: Reg
   if AllRegs in props:
-    # A call-free local could legally live in a caller-saved volatile, but the
-    # integer temp pool (r10/r11 on x86-64) IS codegen's scratch pool for
-    # addressing/staging — handing those two to long-lived locals starves scratch
-    # and forces per-use eviction (reload on every reference). So prefer a
-    # callee-saved home (one prologue push/pop, then resident) and only fall back
-    # to a volatile temp when the callee-saved pool is exhausted.
+    # A call-free local could legally live in a caller-saved volatile. Prefer a
+    # callee-saved home (one prologue push/pop, then resident); fall back to a
+    # volatile temp only from `intLocalTempRegs` — the subset of the scratch pool
+    # the target can spare as a local home (empty on x86-64, where R10/R11 are the
+    # emitter's own staging scratch; the full pool on AArch64). When that subset is
+    # empty or exhausted, spill rather than steal the emitter's scratch.
     r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
-    if r == NoReg: r = b.takeReg(b.freeVol, b.md.intTempRegs)
+    if r == NoReg: r = b.takeReg(b.freeVol, b.md.intLocalTempRegs)
   else:
     # may be live across a call → must be callee-saved (or stack)
     r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)

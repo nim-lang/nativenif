@@ -56,6 +56,12 @@ type
     intArgRegs*: seq[Reg]            ## integer/pointer argument registers, ABI order
     floatArgRegs*: seq[FReg]         ## float argument registers, ABI order
     intTempRegs*: seq[Reg]           ## caller-saved scratch (call-free locals)
+    intLocalTempRegs*: seq[Reg]      ## subset of `intTempRegs` a call-free local may be
+                                     ## *homed* in; the rest of `intTempRegs` stays
+                                     ## reserved as emitter scratch. Empty on x86-64 (its
+                                     ## only temp reg, R10, is the staging scratch — a
+                                     ## local there starves the emitter); the full temp
+                                     ## pool on AArch64 (7 volatile regs, scratch to spare)
     intCalleeSaved*: seq[Reg]        ## callee-saved (locals live across a call)
     floatTempRegs*: seq[FReg]        ## caller-saved FP scratch
     floatCalleeSaved*: seq[FReg]     ## callee-saved FP regs
