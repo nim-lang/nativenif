@@ -69,144 +69,39 @@ proc initFreeTmp(g: var CodeGen) =
     elif loc.kind == InFReg: g.freeFTmp.excl loc.f
 
 proc tryBorrowTmp(g: var CodeGen; typ: AsmSlot): Reg =
-  ## Like `borrowTmp` but returns `NoReg` when the scratch pool is exhausted
-  ## (instead of failing). The caller then spills the value to a stack slot. The
-  ## reg-or-`NoReg` outcome is recorded/replayed like any borrow decision. A real
-  ## register is `bindTemp`'d to a typed name (`typ`) so `emReg` emits a checked
+  ## Like `borrowTmp` but returns `NoReg` when the scratch pool is exhausted (instead
+  ## of failing). The caller then bridges through a staging register. Single-pass: the
+  ## value-core emits once (no plan/replay seam), so this allocates the pool directly.
+  ## A real register is `bindTemp`'d to a typed name (`typ`) so `emReg` emits a checked
   ## symbol; the caller releases it via `freeTemp`/`giveBack`.
   result = NoReg
-  if not g.ab.planning:                          # emit pass: replay the planned decision
-    result = g.borrowLog[g.borrowIdx]; inc g.borrowIdx
-  else:
-    for r in g.md.intTempRegs:                    # plan pass: real pool allocation
-      if r in g.freeTmp and not g.ra.isSealed(r) and not g.regLocal.hasKey(r):
-        # `not regLocal.hasKey`: a volatile temp can be a register-local's home (the
-        # allocator falls back to r10/r11 when callee-saved is exhausted). Handing
-        # that register out as scratch would clobber the live local. Skip it; the
-        # caller then steals a bound local properly or falls back to a clean
-        # caller-saved staging reg.
-        excl g.freeTmp, r
-        result = r
-        break
-    g.borrowLog.add result                        # the chosen reg, or NoReg (exhausted)
+  for r in g.md.intTempRegs:
+    if r in g.freeTmp and not g.ra.isSealed(r) and not g.regLocal.hasKey(r):
+      # `not regLocal.hasKey`: a volatile temp can be a register-local's home (the
+      # allocator falls back to r10/r11 when callee-saved is exhausted). Handing that
+      # register out as scratch would clobber the live local; skip it (the caller then
+      # bridges through a clean caller-saved staging reg).
+      excl g.freeTmp, r
+      result = r
+      break
   if result != NoReg: g.bindTemp(result, typ)     # typed name ⇒ emReg emits a symbol
-
-# Order in which a codegen-time steal looks for a victim register-local: prefer
-# volatile temps (R10/R11 — call-free locals the allocator put there, the common
-# case), then callee-saved. Fixed order ⇒ the plan and emit passes pick the same
-# victim deterministically.
-const StealOrder = [R10, R11, RBX, R12, R13, R14, R15]
 
 proc emScalarStackVar(g: var CodeGen; name: string)
 proc emTypedStackVar(g: var CodeGen; name: string; t: Cursor)
 proc emStackMem(g: var CodeGen; name: string)
 proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg
 
-proc recordEviction(g: var CodeGen; r: Reg): StealEvent =
-  ## Plan-pass: evict the register-local currently in `r` to a fresh stack slot,
-  ## mutating the allocator's view so every later `locationOfSym(victim)` reads the
-  ## slot (`g.ra.locs` is snapshot/restored across the two passes). Returns the
-  ## event for the caller to record in its replay table. Caller guarantees
-  ## `regLocal.hasKey(r)`.
-  let bindName = g.regLocal[r]                    # the local CURRENTLY homed in `r`
-  # Resolve `bindName` to its `symPos` key (the name `ra.locs` is keyed by). `regLocal`
-  # is the point-in-time tenant map (set at the local's `(var … (reg))`, cleared on kill),
-  # so it already names the *right* local — crucial because `ra.locs` is a static,
-  # per-symbol map where two locals with disjoint live ranges legitimately share a
-  # register (the allocator frees it at scope close and reassigns it — e.g. rawAlloc's
-  # small-path `c: ptr SmallChunk` and big-path `c: ptr BigChunk` in the other `if` arm,
-  # both `InReg(r)`). A reverse scan over `ra.locs` couldn't tell which is the tenant here.
-  # For a register-passed param `bindName` is the ABI alias `pN.0` (not a `symPos` key);
-  # `aliasToDecl` maps it back to the param's decl name. Otherwise the binding name IS the
-  # decl name.
-  let victim = g.aliasToDecl.getOrDefault(bindName, bindName)
-  let typ = g.ra.locationOfSym(victim).typ
-  let slot = "evict" & $g.spillCount & ".0"; inc g.spillCount
-  # The victim has a live value to save IFF it is already materialized — a declared
-  # local or a settled param (`symType` is populated for both, in walk order, so this
-  # is identical in plan and emit). A future local whose home register was reused from a
-  # just-dead local and stolen *before* its own decl has nothing of its own here, and the
-  # register's stale binding (`bindName`) belongs to that dead tenant — saving it would
-  # write a different type into the victim's slot. Recorded so replay matches.
-  let live = g.symType.hasKey(victim)
-  g.ra.locs[g.ra.symPos[victim]] = namedStackLoc(slot, typ)
-  g.ra.hasStackVars = true
-  g.regLocal.del r
-  result = StealEvent(victim: victim, bindName: bindName, slot: slot, reg: r, typ: typ, live: live)
-
-proc replayEviction(g: var CodeGen; ev: StealEvent) =
-  ## Emit-pass: re-apply a recorded eviction — declare the slot, store the victim's
-  ## live value, kill its register binding, repoint its location to the slot.
-  # Type the eviction slot from the PLAN-recorded slot type (`ev.typ`), not a re-query
-  # of the mutable `symType` (which is unset when the victim was evicted before its own
-  # decl → it would wrongly fall back to `(i 64)` for a pointer). A pointer keeps its
-  # `(ptr T)` (else nifasm's strict store/reload rejects the typed value and later
-  # deref/field access is illegal); other scalars stay the 64-bit `(i 64)` form.
-  if not cursorIsNil(ev.typ.typ) and isPtrType(resolveType(g.prog, ev.typ.typ)):
-    var tc = ev.typ.typ
-    g.emTypedStackVar(ev.slot, tc)               # (var :evictN.0 (s) (ptr …))
-  else:
-    g.emScalarStackVar(ev.slot)                  # (var :evictN.0 (s) (i 64))
-  if ev.live:                                    # only a materialized victim has a value
-    g.ab.tree MovX64:                            # store the victim's live value
-      g.emStackMem(ev.slot)
-      g.emReg ev.reg                             # bound ⇒ emits its binding name
-  if g.regLocal.getOrDefault(ev.reg, "") == ev.bindName:
-    g.ab.tree KillX64: g.ab.sym ev.bindName      # release the register binding
-  g.ra.locs[g.ra.symPos[ev.victim]] = namedStackLoc(ev.slot, ev.typ)
-  g.regLocal.del ev.reg
-
-# MODEL: the `steal` action in proofs/arkham_bindings.tla — the evicted victim must move
-# to a stack slot (loc→Stack, binding cleared) or LiveLocalsHaveHomes / RegisterBindingsMatchLoc
-# break. Change this ⇒ re-check that action.
-proc stealReg(g: var CodeGen; logIdx: int): Reg =
-  ## `freeTmp` is exhausted. Evict a register-bound local that is *not* in flight
-  ## (not sealed, not a live accumulator) to a fresh stack slot and hand its
-  ## register over as scratch — the codegen-side analogue of the allocator's
-  ## `trySteal`, but driven by codegen's own scratch demand. The eviction is
-  ## decided in the plan pass and replayed (with the spill store) in the emit
-  ## pass, keyed by the borrow-log index, so both passes stay byte-consistent.
-  if g.ab.planning:
-    var vreg = NoReg
-    for r in StealOrder:
-      if g.regLocal.hasKey(r) and r notin g.boundTemps and
-         not g.ra.isSealed(r) and r notin g.liveAccums:
-        vreg = r; break
-    if vreg == NoReg: return NoReg                 # nothing safe to steal
-    g.stealEvents[logIdx] = g.recordEviction(vreg)
-    result = vreg
-  else:
-    if logIdx notin g.stealEvents: return NoReg
-    let ev = g.stealEvents[logIdx]
-    g.replayEviction(ev)
-    result = ev.reg
-
-# MODEL: the `fixedUse` action in proofs/arkham_bindings.tla — a fixed-register clobber must
-# evict a live local first (loc→Stack) and never a sealed in-flight value.
 proc borrowTmp(g: var CodeGen; typ: AsmSlot): Reg =
   result = g.tryBorrowTmp(typ)                    # binds on a pool hit
   if result == NoReg:
-    # The plan pass just logged `NoReg` (it is at `borrowLog.len-1`); the emit
-    # pass replayed it (`borrowIdx-1`). Steal at that same logical position.
-    let idx = if g.ab.planning: g.borrowLog.len - 1 else: g.borrowIdx - 1
-    result = g.stealReg(idx)
+    # Pool exhausted: bridge through a free caller-saved staging register (the value
+    # core's totality mechanism — the reserved R11 bridge is always pickable). Sealing
+    # stops a nested borrow from reusing it; `giveBack` unseals.
+    result = g.pickStagingScratch()
     if result == NoReg:
-      # Pool empty AND no register-bound local to evict. This happens when the
-      # allocator reserved the volatile temps (r10/r11) for locals that are not
-      # yet bound at this point in the walk (e.g. an early global-store whose
-      # scratch need precedes every local's decl, so `regLocal` is empty) — the
-      # reserved register isn't in `regLocal`, so `stealReg` can't see it. Fall
-      # back to a free caller-saved register, exactly as a spill's `pickStaging`
-      # does: a transient, clobberable scratch. The pick is a deterministic
-      # function of the per-pass-identical state (sealed / liveAccums / live
-      # locals), so the plan and emit passes agree without a borrow-log entry —
-      # `stealReg` recorded no `stealEvent`, so both passes reach this fallback.
-      # Sealing stops a nested borrow from reusing it; `giveBack` unseals.
-      result = g.pickStagingScratch()
-      if result == NoReg:
-        raiseAssert "arkham x64 v0: out of registers (no local to steal for scratch)"
-      g.ra.seal result
-    g.bindTemp(result, typ)                        # steal / staging-fallback reg → typed name
+      raiseAssert "arkham x64n: out of registers (no staging reg for scratch)"
+    g.ra.seal result
+    g.bindTemp(result, typ)                        # staging reg → typed name
 
 proc giveBack(g: var CodeGen; r: Reg) {.inline.} =
   ## Release a transient register obtained during premat / value evaluation. Its
@@ -247,8 +142,7 @@ proc emFReg(g: var CodeGen; f: FReg) {.inline.} =
 proc bindFTmp(g: var CodeGen; f: FReg) =
   ## Give scratch xmm register `f` a typed nifasm name `ftmpN.0` via `(rebind …)`, so
   ## every later `emFReg f` emits a checked symbol the binding checker sees rather than
-  ## a raw `(xmmN)`. The SIMD twin of `bindTemp`: the name counter bumps in BOTH passes
-  ## (names replay identically) and the `(rebind …)` tree auto-no-ops in the plan pass.
+  ## a raw `(xmmN)`. The SIMD twin of `bindTemp`.
   ## The precision is a generic `(f 64)` — the operand carries no width to nifasm (the
   ## instruction tag selects movss/movsd), so the binding type is just a placeholder.
   let name = "ftmp" & $g.ftmpBindCount & ".0"; inc g.ftmpBindCount
@@ -353,11 +247,8 @@ proc emJcc(g: var CodeGen; tag: X64Inst; name: string) =
 proc emSyscall(g: var CodeGen) = g.ab.keyword SyscallX64
 
 proc freshLabel(g: var CodeGen): string =
-  ## The plan pass emits no labels (all `ab` writes no-op), so it must not consume
-  ## label names either — only the emit pass advances the counter. Both passes then
-  ## walk identically and the emit pass numbers labels exactly as a single pass would.
   result = "L" & $g.labelCount & ".0"
-  if not g.ab.planning: inc g.labelCount
+  inc g.labelCount
 
 # ── expressions ──────────────────────────────────────────────────────────────
 
@@ -502,10 +393,8 @@ proc emBindType(g: var CodeGen; typ: AsmSlot) =
 proc bindTemp(g: var CodeGen; r: Reg; typ: AsmSlot) =
   ## Give scratch register `r` a typed nifasm name `tmpN.0` via `(rebind …)`, so every
   ## later `emReg r` emits a checked symbol rather than a raw `(reg)` the binding
-  ## checker can't see. The name counter bumps in BOTH passes (so names replay
-  ## identically); the `(rebind …)` tree auto-no-ops in the plan pass. `boundTemps`
-  ## records that `r`'s `regLocal` entry is a temp, NOT a steal-able local, so
-  ## `stealReg`/`evictFixedReg` leave it alone. Released by `unbindTemp`.
+  ## checker can't see. `boundTemps` records that `r`'s `regLocal` entry is a temp, not
+  ## a named local. Released by `unbindTemp`.
   let name = "tmp" & $g.tmpBindCount & ".0"; inc g.tmpBindCount
   g.ab.tree RebindX64:
     g.ab.symDef name
@@ -936,13 +825,6 @@ const FloatStagingBridge = F15
   ## free for `pickFStaging` to hand out, making `produceIntoFMem2` total (the SIMD
   ## twin of R11 in `StagingCandidates`).
 
-const FloatStagingCandidates = {F0, F1, F2, F3, F4, F5, F6, F7}
-  ## The SIMD registers `pickFStaging` may hand out as a float spill's transient
-  ## staging reg (xmm0–7 — disjoint from the xmm8–15 scratch pool). A `genIntoF`
-  ## accumulator that lands in one of these (a float-arg-register target) is an
-  ## in-flight value with no named-local binding, so it is added to `sealedF` for
-  ## its lifetime — the SIMD analogue of `liveAccums` guarding a GPR accumulator.
-
 proc releaseStaleName(g: var CodeGen; r: Reg) =
   ## A register about to be reused as raw scratch/staging must carry no stale
   ## named-local binding. A dead parameter often lingers in `regLocal` under its
@@ -951,7 +833,7 @@ proc releaseStaleName(g: var CodeGen; r: Reg) =
   ## the i64 `start` param → nifasm strict-type mismatch). `(kill)` the binding and
   ## drop it so `emReg` falls back to the raw `(reg)` tag (untyped scratch).
   if r != NoReg and g.regLocal.hasKey(r):
-    if not g.ab.planning: g.ab.tree KillX64: g.ab.sym g.regLocal[r]
+    g.ab.tree KillX64: g.ab.sym g.regLocal[r]
     g.regLocal.del r
 
 proc regHoldsLiveLocal(g: var CodeGen; r: Reg): bool =
@@ -973,8 +855,7 @@ proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg =
   ## spills), and not `avoid`. Clobbering it transiently is then safe; any stale
   ## (dead-param) name binding on it is released first so `emReg` emits the raw
   ## `(reg)` rather than the dead param's typed name. Returns `NoReg` when none is
-  ## free (the genuinely-out-of-registers case). The scan order is fixed, so the
-  ## plan and emit passes return the same register from the same state.
+  ## free (the genuinely-out-of-registers case).
   for r in StagingCandidates:
     if r != avoid and not g.ra.isSealed(r) and r notin g.liveAccums and
        r notin g.boundTemps and not g.regHoldsLiveLocal(r):
@@ -1002,9 +883,7 @@ proc pickFStaging(g: var CodeGen; avoid: FReg = NoFReg): FReg =
   ## The float analogue of `pickStagingScratch`: the first SIMD arg register
   ## (xmm0–7) that is not the scratch pool (xmm8–15, exhausted by the time we get
   ## here), not an in-flight float arg / held staging reg (`sealedF`), not a live
-  ## float local/param home, and not `avoid`. Clobbering it transiently is then
-  ## safe. The scan order is fixed, so the plan and emit passes return the same
-  ## register from the same state.
+  ## float local/param home, and not `avoid`. Clobbering it transiently is then safe.
   ## `FloatStagingBridge` (xmm15) is tried FIRST and is the RESERVED float bridge:
   ## it is kept out of the allocator's float temp pool (`floatTempRegs`), so it is
   ## never a live float local/temp home — always pickable. That guarantees
@@ -1035,8 +914,6 @@ proc rebindLocalAs(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   g.regLocal[r] = name
   g.boundTemps.excl r
 
-const SuCallWeight = 1000          # a call dominates demand → sorts first
-
 proc hasCall(c: Cursor): bool =
   ## True if the subtree at `c` contains a call (atomics lower through the call
   ## path too). Reordering two *pure* operands is observation-preserving; a call
@@ -1049,10 +926,6 @@ proc hasCall(c: Cursor): bool =
     while c.hasMore:
       if not result and hasCall(c): result = true
       skip c
-
-# Ops with a memory-DESTINATION encoding (`op [mem], reg/imm`): x86 has these for
-# add/sub/and/or/xor, but NOT imul or the shifts (they require a register dest).
-const MemDestOps = {AddX64, SubX64, AndX64, OrX64, XorX64}
 
 # ── conditions / branches ────────────────────────────────────────────────────
 
@@ -1656,7 +1529,6 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor; declarative: bool) =
         if loc.kind == InReg and loc.r == argReg:
           if declarative:
             g.regLocal[argReg] = paramName(idx) # the signature binds it as `pN.0`
-            g.aliasToDecl[paramName(idx)] = nm  # so recordEviction recovers the decl name
           else:
             # no signature binding (empty params) → bind the param's own name to
             # its arg register so the body can refer to it by name.
@@ -1847,7 +1719,7 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
   ## allocator's operand placement (`aux.foldB` ⇒ the rhs stays a memory operand).
   let pos = cursorToPosition(g.buf[], c)
   let res = g.ra.locs[pos]
-  let (op, immOk, isBin) = binArithOp(c)
+  let (op, _, isBin) = binArithOp(c)
   assert isBin, "arkham x64n: emitBin2 on a non-bin node"
   var lhsC, rhsC: Cursor
   block:
