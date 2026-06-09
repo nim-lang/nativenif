@@ -60,6 +60,13 @@ type
     usedCalleeF*: set[FReg]           ## callee-saved SIMD regs (v8–v15) to save in prologue
     frameSize*: int                   ## bytes of stack frame for spilled slots
     hasStackVars*: bool               ## proc has nifasm-managed `(s)` aggregate vars
+    spillTemps*: seq[tuple[name: string; typ: AsmSlot; isFloat: bool]]
+                                      ## value-core totality: `etmp`/`ftmp` slots the
+                                      ## allocator synthesized when the register pool
+                                      ## was exhausted (reserveTmp/reserveFTmp). The
+                                      ## emitter DECLARES each `(var :etmpN.0 (s) T)`
+                                      ## in the prologue and PRODUCES the spilled value
+                                      ## position into it via a staging register.
     sealed*: set[Reg]                 ## registers pinned to an in-flight ABI
                                       ## call (args being marshalled, x8 result,
                                       ## values live through the call): never
@@ -308,12 +315,14 @@ proc reserveTmp(b: var Builder; slot: AsmSlot): Location =
       # stack home). Total and branch-safe by the single-home rewrite.
       let stolen = b.stealForTmp(slot)
       if stolen.kind == InReg: return stolen
-      # genuinely nothing stealable (all GPRs sealed / already on stack): the
-      # last-ditch memory temp, which the v1 pure emitter can't consume yet.
+      # genuinely nothing stealable (all GPRs sealed / already on stack): a last-ditch
+      # `(s)` spill slot. The emitter declares it (`spillTemps`) and PRODUCES the value
+      # position into it through a staging register (`produceIntoMem2`) — `isTemp` marks
+      # it as a produce-into slot, distinct from a symbol's stack home left for folding.
       let nm = "etmp" & $b.tmpSpills & ".0"; inc b.tmpSpills
       b.ra.hasStackVars = true
-      b.ra.exprUnsupported = true
-      return namedStackLoc(nm, slot)
+      b.ra.spillTemps.add (name: nm, typ: slot, isFloat: false)
+      return namedStackLoc(nm, slot, isTemp = true)
     if r in b.md.intCalleeSavedSet: b.ra.usedCallee.incl r
   result = regLoc(r, slot, isTemp = true)
 
@@ -331,10 +340,14 @@ proc reserveFTmp(b: var Builder; slot: AsmSlot): Location =
     if f == NoFReg:
       let stolen = b.stealFForTmp(slot)
       if stolen.kind == InFReg: return stolen
-      let nm = "ftmp" & $b.tmpSpills & ".0"; inc b.tmpSpills
+      # `eftmp` (NOT `ftmp`): the emitter's `bindFTmp` scratch names are `ftmpN.0`, so a
+      # spill slot named `ftmpN.0` would COLLIDE (a `(var (s))` decl vs a `(rebind)` reg
+      # binding under the same symbol). The int side is already disambiguated (`etmp`
+      # spill vs `tmp` bind); mirror it for floats.
+      let nm = "eftmp" & $b.tmpSpills & ".0"; inc b.tmpSpills
       b.ra.hasStackVars = true
-      b.ra.exprUnsupported = true
-      return namedStackLoc(nm, slot)
+      b.ra.spillTemps.add (name: nm, typ: slot, isFloat: true)
+      return namedStackLoc(nm, slot, isTemp = true)
     if f in b.md.floatCalleeSavedSet: b.ra.usedCalleeF.incl f
   result = fregLoc(f, slot, isTemp = true)
 

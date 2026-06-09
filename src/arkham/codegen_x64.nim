@@ -1096,7 +1096,19 @@ proc freeTemp(g: var CodeGen; loc: Location) {.inline.} =
     of InFReg: g.giveBackF loc.f
     else: discard
 
-const StagingCandidates = [RAX, RDI, RSI, RDX, RCX, R8, R9]
+const StagingCandidates = [R11, RAX, RDI, RSI, RDX, RCX, R8, R9]
+  ## Registers `pickStagingScratch` may hand out as a transient compute register for a
+  ## spill / mem←mem bridge. R11 is FIRST and is the RESERVED bridge: it is kept out of
+  ## the allocator's temp pool (`intTempRegs`), so it is never a live local/temp home —
+  ## always pickable. That guarantees `pickStaging` never fails, which is what makes the
+  ## value-core `produceIntoMem2` total (every spilled value position has a staging reg).
+  ## The ABI caller-saved regs follow as extra staging slots for nested staging (each
+  ## guarded by `liveAccums`/`regHoldsLiveLocal`/`sealed` so a live value is never hit).
+
+const FloatStagingBridge = F15
+  ## The reserved float staging bridge — kept out of `floatTempRegs` so it is always
+  ## free for `pickFStaging` to hand out, making `produceIntoFMem2` total (the SIMD
+  ## twin of R11 in `StagingCandidates`).
 
 const FloatStagingCandidates = {F0, F1, F2, F3, F4, F5, F6, F7}
   ## The SIMD registers `pickFStaging` may hand out as a float spill's transient
@@ -1166,8 +1178,14 @@ proc pickFStaging(g: var CodeGen; avoid: FReg = NoFReg): FReg =
   ## here), not an in-flight float arg / held staging reg (`sealedF`), not a live
   ## float local/param home, and not `avoid`. Clobbering it transiently is then
   ## safe. The scan order is fixed, so the plan and emit passes return the same
-  ## register from the same state. `NoFReg` only when every xmm0–7 is occupied —
-  ## the genuinely-out-of-float-registers case.
+  ## register from the same state.
+  ## `FloatStagingBridge` (xmm15) is tried FIRST and is the RESERVED float bridge:
+  ## it is kept out of the allocator's float temp pool (`floatTempRegs`), so it is
+  ## never a live float local/temp home — always pickable. That guarantees
+  ## `pickFStaging` never fails, making `produceIntoFMem2` total (every spilled float
+  ## value position has a staging xmm). The arg registers follow for nested staging.
+  if FloatStagingBridge != avoid and FloatStagingBridge notin g.sealedF:
+    return FloatStagingBridge
   for f in g.md.floatArgRegs:
     if f != avoid and f notin g.sealedF and not g.regHoldsLiveFLoc(f):
       return f
@@ -4447,14 +4465,42 @@ proc emitDivMod2(g: var CodeGen; c: Cursor) =
   let resReg = if wantRem: g.md.divRemReg else: g.md.intRetReg
   if res.kind == InReg and res.r != resReg: g.movReg(res.r, resReg)
 
+proc produceIntoMem2(g: var CodeGen; c: Cursor; pos: int; dst: Location) =
+  ## Totality bridge (the value-core analogue of legacy `spillComputed`): the allocator
+  ## spilled this value position to an `(s)` slot (`etmpN.0`) because the register pool
+  ## was exhausted. Materialize the value into a transient staging register — the
+  ## reserved staging bridge guarantees one is always free — then store it to the slot.
+  ## The trick that makes EVERY node kind produce-into-memory through ONE path: override
+  ## `locs[pos]` to the staging register and recurse through `emitValue2`, so a leaf,
+  ## bin, call, load, cast … each emits into the register exactly as for a normal
+  ## register result. `locs[pos]` is restored to the slot before returning so any
+  ## consumer (a binop folding a spilled operand, `storeScalar2`) reads the memory form.
+  when defined(arkhamDbgSpill):
+    stderr.writeLine "DBG produceIntoMem2 slot=" & dst.name
+  # The staging reg is NOT sealed across the recursion: `emitBin2` evaluates BOTH
+  # operands first and only writes the result reg at the (post-order, sequential)
+  # combine, where the recursion binds it (`boundTemps` then protects it). So a deep
+  # right-nested spilled chain reuses the SAME bridge register level-by-level — one
+  # always-free bridge makes produce-into total at ANY depth. (Sealing it here would
+  # reserve one reg per nesting level and exhaust the staging pool on deep chains.)
+  let s = g.pickStaging()                # total: the reserved bridge is always pickable
+  g.ra.locs[pos] = regLoc(s, dst.typ, isTemp = true)
+  g.emitValue2(c)                        # the node now sees an InReg dst → produces into s
+  g.ra.locs[pos] = dst                   # restore the slot location for the consumer
+  g.emitStoreLoc(dst, s)                 # spill the produced value to its `(s)` slot
+  g.giveBack s                           # unbind the staging name
+
 proc emitValue2(g: var CodeGen; c: Cursor) =
   ## Ensure `c`'s value is materialized at its precomputed `locs[pos]`. A leaf whose
   ## location is a register is moved there (the allocator placed it via destination-
   ## passing / a `NeedsReg` reservation); a leaf left as `Imm` / in its own home stays
   ## put (the consumer folds or reads it). A computed node runs its op into its result.
-  let dst = g.ra.locs[cursorToPosition(g.buf[], c)]
+  let pos = cursorToPosition(g.buf[], c)
+  let dst = g.ra.locs[pos]
   if dst.kind == InFReg:                                 # a float value → the SIMD path
     g.emitFValue2(c); return
+  if dst.kind == NamedStack and dst.isTemp:              # spilled (etmp) result → produce-into
+    g.produceIntoMem2(c, pos, dst); return
   # A leaf the allocator forced into a *scratch temp* (e.g. an immediate operand
   # under a `NeedsReg` constraint) must bind that register so `emReg` emits a
   # checked name, not a raw r10/r11. The consuming op (`emitBin2`/`emitCond2`)
@@ -4549,6 +4595,20 @@ proc fbinOps(ek: NifcExpr): (X64Inst, X64Inst) =
   of DivC: (DivssX64, DivsdX64)
   else: raiseAssert "arkham x64n: fbinOps " & $ek
 
+proc ensureFAccum(g: var CodeGen; resF: FReg; loc: Location; bits: int) =
+  ## Make the destructive-SSE accumulator `resF` hold the value just produced at
+  ## `loc`. Normally the allocator fixed the producing operand's dest to the result
+  ## register, so `loc` IS `resF` and this is a no-op; but when `resF` is a produce-into
+  ## staging register (a spilled bin RESULT) the allocator placed the operand in its own
+  ## location — move/load it in (the float analogue of the integer `place2`).
+  case loc.kind
+  of InFReg:
+    if loc.f != resF:
+      g.fmovF(resF, loc.f, bits)
+      if loc.isTemp: g.unbindFTmp(loc.f)
+  of NamedStack: g.emFloatScalarLoad(resF, loc.name, bits)
+  else: raiseAssert "arkham x64n: float accumulator source " & $loc.kind
+
 proc emitFBin2(g: var CodeGen; c: Cursor) =
   ## Emit a float binary-arith node (the SIMD twin of `emitBin2`). `a` is
   ## materialized straight into the precomputed result register (`locs[pos]`, a
@@ -4572,6 +4632,7 @@ proc emitFBin2(g: var CodeGen; c: Cursor) =
     # Sethi–Ullman: the rhs was evaluated first into the result register; the leaf
     # float lhs (a local read) folds after. Commutative only, so `res op= lhs`.
     g.emitFValue2(rhsC)                                  # rhs → res (binds res if a temp)
+    g.ensureFAccum(res.f, g.ra.locs[cursorToPosition(g.buf[], rhsC)], bits)
     let lhome = g.ra.locationOfSym(symName(lhsC))
     if lhome.kind == InFReg:
       g.fbin(op32, op64, res.f, lhome.f, bits)
@@ -4583,19 +4644,57 @@ proc emitFBin2(g: var CodeGen; c: Cursor) =
       g.unbindFTmp(lt)
     return
   g.emitFValue2(lhsC)                                    # a → res (== result reg)
+  g.ensureFAccum(res.f, g.ra.locs[cursorToPosition(g.buf[], lhsC)], bits)
   let rhsLoc = g.ra.locs[cursorToPosition(g.buf[], rhsC)]
   if rhsLoc.kind == InFReg and not rhsLoc.isTemp:        # in-place float local: fold directly
     g.fbin(op32, op64, res.f, rhsLoc.f, bits)
+  elif rhsLoc.kind == NamedStack:                        # spilled rhs (ftmp): produce, then fold
+    g.emitFValue2(rhsC)                                  # b → its `(s)(f N)` slot
+    let fs = g.pickFStaging(avoid = res.f)               # a staging xmm to load it back
+    if fs == NoFReg: raiseAssert "arkham x64n: no staging xmm for a spilled float operand"
+    g.sealedF.incl fs
+    g.emFloatScalarLoad(fs, rhsLoc.name, bits)
+    g.fbin(op32, op64, res.f, fs, bits)
+    g.sealedF.excl fs
   else:
     g.emitFValue2(rhsC)                                  # b → its SIMD temp
     g.fbin(op32, op64, res.f, rhsLoc.f, bits)
     if rhsLoc.isTemp: g.unbindFTmp(rhsLoc.f)
+
+proc produceIntoFMem2(g: var CodeGen; c: Cursor; pos: int; dst: Location) =
+  ## The SIMD twin of `produceIntoMem2`: the allocator spilled this FLOAT value
+  ## position to an `(s)(f N)` slot (`eftmpN.0`). Materialize it into a staging xmm
+  ## (the reserved float bridge), store it to the slot, and restore `locs[pos]` so a
+  ## consumer reads the memory form.
+  ## NB unlike the integer twin, the staging xmm IS sealed across the recursion: SSE is
+  ## destructive 2-operand, so `emitFBin2` writes the result reg (`res`) with the lhs
+  ## BEFORE evaluating the rhs — `res` is live across the rhs subtree and must be held.
+  ## So a deep right-nested *non-foldable* float chain reserves one xmm per level and is
+  ## bounded by the staging pool (the bridge xmm15 + the 8 arg regs ⇒ depth ≤ 9). That
+  ## covers every realistic float expression (real code hits zero float spills; a
+  ## balanced tree nests only O(log n)); a pathological deeper chain asserts LOUDLY in
+  ## `pickFStaging` (never a silent miscompile). The integer path is unbounded because
+  ## `emitBin2` evaluates both operands first and writes the result reg last.
+  when defined(arkhamDbgSpill):
+    stderr.writeLine "DBG produceIntoFMem2 slot=" & dst.name
+  let bits = dst.typ.size * 8
+  let fs = g.pickFStaging()              # the reserved float bridge (xmm15) is tried first
+  if fs == NoFReg: raiseAssert "arkham x64n: no staging xmm for a spilled float result (deep float nest > staging pool)"
+  g.sealedF.incl fs
+  g.ra.locs[pos] = fregLoc(fs, dst.typ, isTemp = true)
+  g.emitFValue2(c)                       # produces into the staging xmm
+  g.ra.locs[pos] = dst
+  g.emitStoreFLoc(dst, fs, bits)
+  g.unbindFTmp(fs)                       # release the staging name (the recursion bound it)
+  g.sealedF.excl fs
 
 proc emitFValue2(g: var CodeGen; c: Cursor) =
   ## Ensure `c`'s FLOAT value is materialized at its precomputed `locs[pos]` (an
   ## xmm register). The SIMD twin of `emitValue2`; mirrors `genIntoF`.
   let pos = cursorToPosition(g.buf[], c)
   let dst = g.ra.locs[pos]
+  if dst.kind == NamedStack and dst.isTemp:              # spilled (ftmp) result → produce-into
+    g.produceIntoFMem2(c, pos, dst); return
   assert dst.kind == InFReg, "arkham x64n: emitFValue2 dst " & $dst.kind
   let bits = if dst.typ.size == 4: 32 else: 64
   case c.kind
@@ -5720,6 +5819,18 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool) =
       if g.retIndirect: g.movReg(g.indirectReg, RDI)
       g.emitParamMoves(info.decl, declarative)
       if info.isEntry: g.emitGlobalInits()
+      # Declare the totality spill slots the allocator synthesized (`etmp`/`ftmp`):
+      # a value position the register pool couldn't hold is produced into its slot
+      # via a staging register (`produceIntoMem2`/`produceIntoFMem2`). A pointer slot
+      # keeps its precise `(ptr T)` type so a later deref/cmp through it type-checks;
+      # an integer slot is the generic `(s)(i 64)` (sized mem↔reg moves truncate/extend).
+      for st in g.ra.spillTemps:
+        if st.isFloat:
+          g.emFloatStackVar(st.name, st.typ.size * 8)
+        elif not cursorIsNil(st.typ.typ) and isPtrType(resolveType(g.prog, st.typ.typ)):
+          g.emTypedStackVar(st.name, st.typ.typ)
+        else:
+          g.emScalarStackVar(st.name)
       var c = info.decl
       c.into:
         inc c; skip c; skip c; skip c                    # name, params, ret, pragmas

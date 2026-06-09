@@ -134,8 +134,12 @@ proc fregLoc*(f: FReg; typ: AsmSlot; isTemp = false): Location {.inline.} =
   Location(kind: InFReg, f: f, typ: typ, isTemp: isTemp)
 proc stackLoc*(offset: int; typ: AsmSlot): Location {.inline.} =
   Location(kind: OnStack, offset: offset, typ: typ)
-proc namedStackLoc*(name: string; typ: AsmSlot): Location {.inline.} =
-  Location(kind: NamedStack, name: name, typ: typ)
+proc namedStackLoc*(name: string; typ: AsmSlot; isTemp = false): Location {.inline.} =
+  ## `isTemp` marks a *spill-temp* slot (an `etmp`/`ftmp` synthesized when the
+  ## register pool was exhausted) — a value position the emitter must PRODUCE into
+  ## (via a staging register), as opposed to a symbol's stack home left in place for
+  ## folding. The emitter (`produceIntoMem2`) keys on it.
+  Location(kind: NamedStack, name: name, typ: typ, isTemp: isTemp)
 proc globLoc*(name: string; typ: AsmSlot): Location {.inline.} =
   Location(kind: Glob, name: name, typ: typ)
 proc tvarLoc*(name: string; typ: AsmSlot): Location {.inline.} =
