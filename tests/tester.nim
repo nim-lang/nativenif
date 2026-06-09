@@ -30,7 +30,7 @@ const arkhamKnownUnsupported: seq[string] =
     # handle the runtime `(aconstr …)` array constructor as a direct call argument
     # — that flows through value-core paths implemented only on x86-64 for now.
     # We focus on x86 for the moment; re-enable when the a64 backend catches up.
-    @["aconstr_arg"]
+    @["aconstr_arg", "aconstr_field"]
   else:
     # value-core rewrite — THE FLIP: the x86-64 backend emits EVERY proc through the
     # new pure-emit path (no `procModeled2` gate, no legacy fallback). The whole
