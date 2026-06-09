@@ -66,6 +66,8 @@ type
     framePad*: int                           ## x64: extra prologue `sub rsp` for 16-byte call alignment
     labelCount*: int                         ## fresh-label counter
     loopEnds*: seq[string]                   ## stack of enclosing-loop end labels (for `break`)
+    retLabel2*: string                       ## value-core: shared epilogue label a mid-proc `ret` jumps to
+    retLabelUsed2*: bool                     ## value-core: a `ret` jumped to retLabel2 ⇒ emit the label
     retAggrName*: string                     ## current proc's aggregate return type (or "")
     retIndirect*: bool                       ## return type is >16B (x8 indirect result)
     isEntryProc*: bool                       ## the proc currently emitted is the entry

@@ -1067,7 +1067,15 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
       if dest.kind != InReg: b.ra.exprUnsupported = true
       let resDest = dest
       let lvCopy = n                          # for releaseLvalTemps after the load
+      # A destination-passed FIXED register (a register-homed local's home) is NOT a temp
+      # taken out of the pool, so the index/base allocation below could `stealForTmp` it —
+      # stealing the very register this load's result lands in, aliasing the result with one
+      # of its own indices (different types ⇒ a `(mov res[ptr], (mem (at … res[i64])))` that
+      # nifasm rejects). Seal it across the address allocation so the steal picks another.
+      let sealedHere = resDest.isTemp == false and resDest.r notin b.ra.sealed
+      if sealedHere: b.ra.sealed.incl resDest.r
       allocLvalue2(b, n, resDest)             # embedded base/index regs; a global base
+      if sealedHere: b.ra.sealed.excl resDest.r
       releaseLvalTemps(b, lvCopy)             # index/pointer temps die with the load
       b.ra.locs[pos] = resDest                #   reuses resDest (free until the load lands)
       return

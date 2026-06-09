@@ -4313,6 +4313,21 @@ proc emitAtomic2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
   else:
     raiseAssert "arkham x64n: unsupported atomic builtin: " & builtin
 
+proc emitBitBuiltin2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
+  ## Value-core GCC bit builtin: allocCall placed the single integer argument in rdi
+  ## (a normal int-arg call), so emit it, then the inline scan. Result → rax (moved to
+  ## its home by emitCall2). The legacy twin is `genBitBuiltin`.
+  g.emitValue2(argCurs[0])                            # → rdi
+  let aloc = g.ra.locs[cursorToPosition(g.buf[], argCurs[0])]
+  let ar = if aloc.kind == InReg: aloc.r else: RDI
+  case builtin
+  of "__builtin_ctzll", "__builtin_ctz":
+    # count trailing zeros == index of the least-significant set bit == BSF.
+    # (x == 0 is UB in C and never reached: nimony callers guard the zero case.)
+    g.ab.tree BsfX64: (g.emReg RAX; g.emReg ar)
+  else:
+    raiseAssert "arkham x64n: bit builtin not yet implemented: " & builtin
+
 proc emitCall2(g: var CodeGen; c: Cursor) =
   ## Emit a call. The allocator placed each argument in its ABI register (integer →
   ## rdi…r9, float → xmm0–7) and the result in rax / xmm0 (or a dest-passed home).
@@ -4345,6 +4360,11 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
     g.emitAtomic2(argCurs, tgt.atomic)
     if resLoc.kind == InReg and resLoc.r != RAX: g.movReg(resLoc.r, RAX)
     return
+  if tgt.bitBuiltin.len > 0:                          # GCC bit builtin (ctz/…) → inline bsf/…
+    g.emitBitBuiltin2(argCurs, tgt.bitBuiltin)
+    if resLoc.kind == InReg and resLoc.isTemp: g.bindTemp(resLoc.r, AsmSlot(cls: AInt, size: 8, align: 8))
+    if resLoc.kind == InReg and resLoc.r != RAX: g.movReg(resLoc.r, RAX)
+    return
   let isSyscall = tgt.syscall
   let hasResult = not retIsVoid(tgt.retType)
   let resSlot = if hasResult: slotOf(g.prog, tgt.retType) else: AsmSlot(cls: AInt, size: 8, align: 8)
@@ -4373,8 +4393,11 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
         g.ab.tree MovX64:
           g.emReg RAX
           g.ab.tree ResX: g.ab.sym "ret.0"
-    if hasResult and resLoc.kind == InReg and resLoc.r != RAX:
-      g.movReg(resLoc.r, RAX)
+    if hasResult and resLoc.kind == InReg:
+      # rebind a reused dead-local reg to the NAVIGATED return type (a scalar result only —
+      # an aggregate-by-value return spans rax:rdx and is consumed word-by-word, not as a reg).
+      if resLoc.isTemp and resSlot.kind != AMem: g.bindTemp(resLoc.r, resSlot)
+      if resLoc.r != RAX: g.movReg(resLoc.r, RAX)
   else:
     # Non-declarative: each arg is evaluated straight into its raw ABI register (float →
     # xmm{n}, integer → the GPR); an aggregate arg is marshalled into consecutive GPRs
@@ -4432,8 +4455,10 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
           if resLoc.isTemp: g.bindFTmp(resLoc.f)
           if resLoc.f != FloatRet:
             g.fmovF(resLoc.f, FloatRet, (if resLoc.typ.size == 4: 32 else: 64))
-      elif resLoc.kind == InReg and resLoc.r != RAX:
-        g.movReg(resLoc.r, RAX)
+      elif resLoc.kind == InReg:
+        # scalar result only — an aggregate-by-value return spans rax:rdx (consumed word-by-word).
+        if resLoc.isTemp and resSlot.kind != AMem: g.bindTemp(resLoc.r, resSlot)
+        if resLoc.r != RAX: g.movReg(resLoc.r, RAX)
 
 proc emitDivMod2(g: var CodeGen; c: Cursor) =
   ## Emit x86 `idiv`/`div`: the allocator pinned the dividend to rax and the divisor
@@ -4463,7 +4488,9 @@ proc emitDivMod2(g: var CodeGen; c: Cursor) =
     g.emReg dvsLoc.r                                    # divisor, by its bound name
   if dvsLoc.isTemp: g.unbindTemp(dvsLoc.r)
   let resReg = if wantRem: g.md.divRemReg else: g.md.intRetReg
-  if res.kind == InReg and res.r != resReg: g.movReg(res.r, resReg)
+  if res.kind == InReg:
+    if res.isTemp: g.bindTemp(res.r, res.typ)  # rebind a reused dead-local reg to the result type
+    if res.r != resReg: g.movReg(res.r, resReg)
 
 proc produceIntoMem2(g: var CodeGen; c: Cursor; pos: int; dst: Location) =
   ## Totality bridge (the value-core analogue of legacy `spillComputed`): the allocator
@@ -5464,6 +5491,22 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
       g.unbindLvalTemps2(lhs)                             # release embedded base/index temps
     if globScratch != NoReg: g.unbindTemp(globScratch)
   else:                                                  # scalar / float home (reg or `(s)` slot)
+    # A COMPUTED rhs whose result the allocator destination-passed into a register that is
+    # NOT this store's own home (e.g. the var was register-allocated but then EVICTED to the
+    # stack, so its initializer's value still lands in the old register as a transient). That
+    # register may carry a stale binding from an earlier, now-dead register-local: the emitter
+    # only kills such a binding when ANOTHER register-homed local reuses the register (via
+    # `emRegLocalVar`), never when a value temp does. Kill it here so the transient emits as a
+    # clean raw register, not under the dead local's (wrongly-typed) name. A Symbol rhs reading
+    # the live bound local itself is excluded.
+    let vPre = g.ra.locs[cursorToPosition(g.buf[], rhs)]
+    if vPre.kind == InReg and not vPre.isTemp and
+       not (dst.kind == InReg and dst.r == vPre.r) and
+       g.regLocal.hasKey(vPre.r) and
+       not (rhs.kind == Symbol and symName(rhs) == g.regLocal[vPre.r]):
+      g.ab.tree KillX64: g.ab.sym g.regLocal[vPre.r]
+      g.regLocal.del vPre.r
+      g.boundTemps.excl vPre.r
     g.emitValue2(rhs)
     let v = g.ra.locs[cursorToPosition(g.buf[], rhs)]
     g.storeScalar2(dst, v)
@@ -5732,21 +5775,25 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
           g.place2(g.ra.locs[cursorToPosition(g.buf[], cc)], RDI)
         else: g.movImm(RDI, 0)
         g.movImm(RAX, LinuxX64ExitNr); g.emSyscall()
-      elif g.retAggrName.len > 0:                          # aggregate return
-        if g.retIndirect:                                  # >16B: copy through the hidden ptr
-          let tmp = g.ra.aux[cursorToPosition(g.buf[], cc)].scratch[0]
-          g.copyStructThroughPtr2(symName(cc), g.retAggrName, g.indirectReg, tmp)
-          g.movReg(RAX, g.indirectReg)                     # SysV: return the buffer pointer in rax
-        else:
-          g.structToRegs(symName(cc), g.retAggrName, x64RetRegs)  # ≤16B → rax:rdx
-      elif hasVal:                                        # scalar / float result → ret reg
-        let retPos = cursorToPosition(g.buf[], cc)
-        if g.retIsFloat:
-          let fb = g.retFloatBits
-          g.genStore2(cc, fregLoc(FloatRet, AsmSlot(cls: AFloat, size: fb div 8, align: fb div 8)), retPos)
-        else:
-          g.genStore2(cc, regLoc(g.md.intRetReg, ScalarSlot), retPos)
-        # epilogue (framePop + ret) is emitted by emitProcBody2's terminator
+      else:
+        if g.retAggrName.len > 0:                          # aggregate return
+          if g.retIndirect:                                # >16B: copy through the hidden ptr
+            let tmp = g.ra.aux[cursorToPosition(g.buf[], cc)].scratch[0]
+            g.copyStructThroughPtr2(symName(cc), g.retAggrName, g.indirectReg, tmp)
+            g.movReg(RAX, g.indirectReg)                   # SysV: return the buffer pointer in rax
+          else:
+            g.structToRegs(symName(cc), g.retAggrName, x64RetRegs)  # ≤16B → rax:rdx
+        elif hasVal:                                       # scalar / float result → ret reg
+          let retPos = cursorToPosition(g.buf[], cc)
+          if g.retIsFloat:
+            let fb = g.retFloatBits
+            g.genStore2(cc, fregLoc(FloatRet, AsmSlot(cls: AFloat, size: fb div 8, align: fb div 8)), retPos)
+          else:
+            g.genStore2(cc, regLoc(g.md.intRetReg, ScalarSlot), retPos)
+        # The epilogue (framePop + ret) is emitted ONCE at the proc tail by
+        # emitProcBody2; a `ret` that is NOT the tail must jump there rather than fall
+        # through into the following statements (e.g. a mid-proc `if cond: return x`).
+        g.emJmp(g.retLabel2); g.retLabelUsed2 = true
       while cc.hasMore: skip cc
   of CaseS:
     # `(case Expr (of (ranges BranchRange+) StmtList)* (else StmtList)?)`. Mirrors the
@@ -5831,12 +5878,15 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool) =
           g.emTypedStackVar(st.name, st.typ.typ)
         else:
           g.emScalarStackVar(st.name)
+      g.retLabel2 = g.freshLabel()                       # shared epilogue for mid-proc `ret`
+      g.retLabelUsed2 = false
       var c = info.decl
       c.into:
         inc c; skip c; skip c; skip c                    # name, params, ret, pragmas
         if c.stmtKind == StmtsS: g.genStmt2(c)
         while c.hasMore: skip c
       g.exitScope()
+      if g.retLabelUsed2: g.emLab(g.retLabel2)           # a non-tail `ret` lands here
       if info.isEntry:
         g.movImm(RAX, 60); g.movImm(RDI, 0); g.emSyscall()
       else:
