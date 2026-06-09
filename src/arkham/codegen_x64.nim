@@ -438,10 +438,8 @@ proc emitPatAddr(g: var CodeGen; c: var Cursor; dest: Reg)
 proc forceReg(g: var CodeGen; dest: var Location)
 proc genTypeBody(g: var CodeGen; c: var Cursor)
 proc framePop(g: var CodeGen)
-proc killFrameRegLocals(g: var CodeGen)
 proc genIntoF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int)
 proc genConstr(g: var CodeGen; c: var Cursor; dstPtr: Reg)
-proc genStore(g: var CodeGen; c: var Cursor; dst: Location)
 proc pickStaging(g: var CodeGen; avoid: Reg = NoReg): Reg
 proc place(g: var CodeGen; v: Location; dest: Reg)
 proc genBin(g: var CodeGen; c: var Cursor; destLoc: var Location; op: X64Inst; immOk: bool)
@@ -626,11 +624,6 @@ proc emFieldMem(g: var CodeGen; base, field: string) =   # (mem (dot (rsp) base 
       g.ab.sym base
       g.ab.sym field
 
-proc fieldOffset(g: var CodeGen; base, field: string): int =
-  for fi in aggrLayout(g.prog, g.varType[base]):
-    if fi.name == field: return fi.off
-  raiseAssert "arkham x64: field not found: " & base & "." & field
-
 proc emGlobalAddr(g: var CodeGen; dest: Reg; name: string)
 
 proc loadOperandReg(g: var CodeGen; v: Location; tmps: var seq[Reg]): Reg =
@@ -669,24 +662,6 @@ proc atNeedsScratch(g: var CodeGen; atNode: Cursor): bool =
     idxIsReg = n.kind != IntLit                 # a non-literal index lives in a register
     while n.hasMore: skip n
   result = idxIsReg
-
-proc atGlobalRooted(g: var CodeGen; n: Cursor): bool =
-  ## Does this `dot`/`at` lvalue chain bottom out at a module-level global aggregate?
-  ## Only then can the value-core scratch pre-pass size the element stride via
-  ## `getType` (a local base's type isn't in `symType` during the pre-pass). A
-  ## `deref`/`pat` base is a pointer value, not a global lvalue, so it stops here.
-  var c = n
-  case c.kind
-  of Symbol: result = g.lookupSym(symName(c)).cat == scGlobal
-  of TagLit:
-    case c.exprKind
-    of DotC, AtC:
-      var cc = c
-      cc.into:
-        result = g.atGlobalRooted(cc)
-        while cc.hasMore: skip cc
-    else: result = false
-  else: result = false
 
 proc collectAtScratch(g: var CodeGen; n: Cursor; res: var HashSet[int]) =
   ## Pre-pass (value core): record every `(at …)` position whose element stride is
@@ -1023,14 +998,6 @@ proc emitAddrLoc(g: var CodeGen; loc: Location; dest: Reg) =
           g.emReg dest
           g.emAccessAddr(nn, regs, ri)         # `nn` (pass 2) re-walks the chain
   else: raiseAssert "arkham x64: emitAddrLoc on location kind " & $loc.kind
-
-proc addrOfLoc(g: var CodeGen; loc: Location): (Reg, bool) =
-  ## `&loc` in a register. A register-resident value already IS its address (a
-  ## by-reference aggregate param) and is returned as-is; else borrow a temp.
-  if loc.kind == InReg: return (loc.r, false)
-  let r = g.borrowTmp(ScalarSlot)
-  g.emitAddrLoc(loc, r)
-  result = (r, true)
 
 proc floatMemMov(g: var CodeGen; loc: Location; reg: FReg; bits: int; load: bool) =
   ## The one SIMD scalar memory move, both directions: `load` → `reg ← <loc>`; else
@@ -2700,14 +2667,6 @@ proc regsToStruct(g: var CodeGen; varName, typeName: string; regs: openArray[Reg
   ## regs[i] → aggregate (one GPR per 8-byte word).
   g.transferAggrWords(varName, typeName, regs, toRegs = false)
 
-proc copyStructThroughPtr(g: var CodeGen; srcVar, typeName: string; ptrReg: Reg) =
-  ## field-wise copy of aggregate `srcVar` → the memory `ptrReg` points at.
-  for f in aggrLayout(g.prog, typeName):
-    let t = g.borrowTmp(ScalarSlot)
-    g.ab.tree MovX64: (g.emReg t; g.emAggrFieldMem(srcVar, f.name))
-    g.ab.tree MovX64: (g.emPtrFieldMem(ptrReg, typeName, f.name); g.emReg t)
-    g.giveBack t
-
 proc indirectRetType(g: var CodeGen; gvarDecl: Cursor): Cursor =
   ## The return-type cursor of a function-pointer variable's proctype, for the
   ## declarative call path's `retIsVoid`/result handling. NIFC's
@@ -2888,60 +2847,6 @@ proc genCall(g: var CodeGen; c: var Cursor) =
       g.sealedF = g.sealedF - sealedFHere
 
 # ── whole-aggregate copy (struct assignment / copy-init) ─────────────────────
-
-proc byteCopyConst(g: var CodeGen; dst, src: Reg; size: int) =
-  ## `dst[0..<size] ← src[0..<size]`, `size` a compile-time constant (the same
-  ## inline byte loop as `memcpy`). Used for whole-aggregate assignment / copy-
-  ## init; `dst`/`src` stay live. RAX (never a local home) and RCX are free scratch
-  ## for the byte value / loop counter — but RCX is an ABI arg register, so in a leaf
-  ## proc it can hold a live parameter: evict it first so the loop counter can't
-  ## destroy it. (`dst`/`src` are `aggrAddr` temps, never RAX/RCX.)
-  g.evictFixedReg(RCX)
-  g.withFixed(RCX):                             # loop counter → a checked name
-    let loop = g.freshLabel()
-    let done = g.freshLabel()
-    g.movImm(RCX, 0)                            # i = 0
-    g.emLab(loop)
-    g.ab.tree CmpX64: (g.emReg RCX; g.ab.intLit size)
-    g.emJcc(JaeX64, done)                       # i >= size (unsigned) → done
-    g.emLoadByte(RAX, src, RCX)                 # b = src[i]
-    g.emStoreByte(dst, RCX, RAX)                # dst[i] = b
-    g.binImm(AddX64, RCX, 1)
-    g.emJmp(loop)
-    g.emLab(done)
-
-proc aggrAddr(g: var CodeGen; c: var Cursor): (Reg, bool) =
-  ## Address of an aggregate lvalue (consumes it). A by-reference aggregate param
-  ## (InReg) already *is* the address; otherwise borrow a temp and `genAddr`.
-  if c.kind == Symbol:
-    let loc = g.ra.locationOfSym(symName(c))
-    if loc.kind == InReg:
-      result = (loc.r, false); inc c; return
-  var d = needsReg(ScalarSlot)                  # let genAddr pick the address register
-  g.genAddr(c, d)
-  result = (d.r, d.isTemp)
-
-proc genStore(g: var CodeGen; c: var Cursor; dst: Location) =
-  ## Destination-passing store: emit expression `c` so its value lands at `dst`,
-  ## consuming `c`. An aggregate is built/copied in place; every scalar and float
-  ## store goes through the unified `gen`, which selects register vs memory vs the
-  ## float path purely from `dst`'s kind/type. Callers (`genAsgn`, var-init) just
-  ## hand it a `dst`.
-  if dst.typ.kind == AMem:                       # aggregate destination
-    let (dp, downs) = g.addrOfLoc(dst)
-    if c.kind == TagLit and c.exprKind in {OconstrC, AconstrC}:
-      g.genConstr(c, dp)                          # build the aggregate in place
-    else:                                         # copy from another aggregate lvalue
-      let (sp, sowns) = g.aggrAddr(c)
-      g.byteCopyConst(dp, sp, dst.typ.size)
-      if sowns: g.giveBack sp
-    if downs: g.giveBack dp
-  else:                                           # scalar / float → the one entry point
-    var d = dst; g.gen(c, d)
-
-# ── type + proc + module emission ───────────────────────────────────────────
-# genTypeBody/genType emit nifasm `NifasmType` tags (arch-neutral). TODO: share
-# with codegen_a64 by lifting these into codegen_common.
 
 proc genPointee(g: var CodeGen; c: var Cursor) =
   ## Emit a pointer's pointee / element type. A *named* type is referenced by
@@ -3312,18 +3217,6 @@ proc framePush(g: var CodeGen) =
   for r in g.frameRegs:
     g.ab.tree PushX64: g.ab.reg r                          # raw push
 
-proc killFrameRegLocals(g: var CodeGen) =
-  ## Before an explicit-`ret` `framePop`, release any register-local bound to a
-  ## callee-saved register the epilogue is about to `pop` raw — nifasm forbids a
-  ## raw use of a still-bound register, and at a return every local is dead. The
-  ## binding is dropped so the trailing `exitScope` does not double-kill it.
-  ## (A second `ret` reached on another path that needs the same callee register
-  ## bound is the pre-existing multi-`ret` limitation — out of scope here.)
-  for r in g.frameRegs:
-    if g.regLocal.hasKey(r):
-      g.ab.tree KillX64: g.ab.sym g.regLocal[r]
-      g.regLocal.del r
-
 proc framePop(g: var CodeGen) =
   # Release the nifasm-managed `(s)` slot region first (reverse of the prologue,
   # which lowered rsp by the pad then the `(ssize)` block), then the alignment pad
@@ -3395,450 +3288,10 @@ proc genTvar(g: var CodeGen; name: string; decl: Cursor) =
 # value position a Location in `g.ra.locs` (+ `aux`); this code only emits bytes,
 # making NO register decisions — so there is no plan/replay seam. See
 # `codegen2_design.md`. Every proc body is emitted through this path (`genProc` →
-# `emitProcBody2`); the old reactive statement emitter has been deleted. The only
-# remaining use of the legacy `gen…` expression emitter is `emitGlobalInits`
-# (entry-time global-variable initializers), pending its port to this path.
-
-proc valModeled2(g: var CodeGen; c: Cursor): bool
-proc fvalModeled2(g: var CodeGen; c: Cursor): bool
-proc lvalModeled2(g: var CodeGen; c: Cursor): bool =
-  ## Is lvalue `c` an addressing target the v1 slice can emit (a load / store / addr)?
-  ## A function-local base symbol (stack var or reg pointer), a `dot` field over such
-  ## a base or a `deref`, or a pointer `deref` of a modeled value. (at/pat: later.)
-  case c.kind
-  of Symbol: g.lookupSym(symName(c)).cat == scNone     # a function-local base
-  of TagLit:
-    case c.exprKind
-    of DotC:
-      var ok = true
-      var cc = c
-      cc.into:
-        if cc.hasMore: (if not g.lvalModeled2(cc): ok = false); skip cc   # base
-        while cc.hasMore: skip cc
-      ok
-    of DerefC:
-      var ok = true
-      var cc = c
-      cc.into:
-        if cc.hasMore: (if not g.valModeled2(cc): ok = false); skip cc    # pointer
-        while cc.hasMore: skip cc
-      ok
-    of AtC:
-      var ok = true
-      var cc = c
-      cc.into:
-        if cc.hasMore: (if not g.lvalModeled2(cc): ok = false); skip cc   # array base
-        if cc.hasMore:
-          if cc.kind notin {IntLit, UIntLit}:                            # register index
-            if not g.valModeled2(cc): ok = false
-            elif g.atNeedsScratch(c): ok = false                         # non-pow2 stride: later slice
-          skip cc
-        while cc.hasMore: skip cc
-      ok
-    of PatC:
-      var ok = true
-      var cc = c
-      cc.into:
-        if cc.hasMore: (if not g.valModeled2(cc): ok = false); skip cc    # pointer
-        if cc.hasMore:
-          if cc.kind notin {IntLit, UIntLit}:                            # register index
-            if not g.valModeled2(cc): ok = false
-            elif g.atNeedsScratch(c): ok = false                         # non-pow2 stride: later slice
-          skip cc
-        while cc.hasMore: skip cc
-      ok
-    else: false
-  else: false
-
-proc valModeled2(g: var CodeGen; c: Cursor): bool =
-  ## Is value `c` within the new emitter's coverage? (Reads a copy; consumes nothing.)
-  case c.kind
-  of IntLit, UIntLit, CharLit, StrLit: true
-  of Symbol: g.lookupSym(symName(c)).cat in {scNone, scGlobal, scTvar}  # local or global read (not proc)
-  of TagLit:
-    case c.exprKind
-    of TrueC, FalseC, NilC, SizeofC: true              # compile-time / immediate leaves
-    of NegC, BitnotC, SufC, ParC:                      # unary in-place / wrapper
-      var ok = true
-      var cc = c
-      cc.into:
-        if c.exprKind in {NegC, BitnotC}: skip cc       # result type
-        if cc.hasMore: (if not g.valModeled2(cc): ok = false); skip cc
-        while cc.hasMore: skip cc
-      ok
-    of AddC, SubC, MulC, BitandC, BitorC, BitxorC, ShlC, ShrC:
-      var ok = true
-      var cc = c
-      cc.into:
-        skip cc                                          # result type
-        if cc.hasMore: (if not g.valModeled2(cc): ok = false); skip cc   # lhs
-        if cc.hasMore: (if not g.valModeled2(cc): ok = false); skip cc   # rhs
-        while cc.hasMore: skip cc
-      ok
-    of DerefC, DotC, AtC, PatC: g.lvalModeled2(c)       # addressing read: load [addr]
-    of AddrC:
-      var ok = true
-      var cc = c
-      cc.into:
-        if cc.hasMore:
-          if cc.kind == Symbol and g.lookupSym(symName(cc)).cat == scGlobal:
-            discard                                       # &global → RIP-relative lea
-          elif not g.lvalModeled2(cc): ok = false
-        while cc.hasMore: skip cc
-      ok
-    of CastC, ConvC:
-      # int↔int (widen/narrow), ptr↔ptr (reinterpret), or a FLOAT→int `conv`
-      # (cvttsd2si). A float TARGET is the float family (fvalModeled2); a float→int
-      # `cast` (movq) and MIXED int↔ptr need legacy — gated out so the new path never
-      # miscompiles a type.
-      var ok = true
-      var cc = c
-      cc.into:
-        let tgtPtr = isPtrType(resolveType(g.prog, cc))
-        let tgtFloat = slotOf(g.prog, cc).kind == AFloat
-        skip cc                                                 # target type
-        if tgtFloat: ok = false                                 # float TARGET → fvalModeled2
-        elif cc.hasMore:
-          if g.isFloatExpr(cc):
-            # float SOURCE → int target: `conv` = cvttsd2si (NEW); a `cast` (movq) or a
-            # pointer target are deferred to legacy.
-            if c.exprKind != ConvC or tgtPtr: ok = false
-            elif not g.fvalModeled2(cc): ok = false
-          elif isPtrType(resolveType(g.prog, g.getType(cc))) != tgtPtr: ok = false  # int↔ptr: later
-          elif not g.valModeled2(cc): ok = false
-          skip cc
-        while cc.hasMore: skip cc
-      ok
-    else: false
-  else: false
-
-proc fvalModeled2(g: var CodeGen; c: Cursor): bool =
-  ## A FLOAT value the new emitter handles (slice 1): a float literal, a float
-  ## local/param read (in an xmm register — a spilled float bails via
-  ## `exprUnsupported` at allocation), or a float add/sub/mul/div over modeled
-  ## float operands. A float global / nested call / conversion is still legacy.
-  case c.kind
-  of FloatLit: true
-  of Symbol: g.lookupSym(symName(c)).cat == scNone        # a function-local float
-  of TagLit:
-    case c.exprKind
-    of AddC, SubC, MulC, DivC:
-      var ok = true
-      var cc = c
-      cc.into:
-        skip cc                                           # result float type
-        if cc.hasMore: (if not g.fvalModeled2(cc): ok = false); skip cc   # lhs
-        if cc.hasMore: (if not g.fvalModeled2(cc): ok = false); skip cc   # rhs
-        while cc.hasMore: skip cc
-      ok
-    of ConvC:
-      # conversion TO float: an INT source is cvtsi2sd (NEW). A float source (precision
-      # convert) and a `cast` bit-reinterpret are deferred to legacy.
-      var ok = true
-      var cc = c
-      cc.into:
-        skip cc                                  # target float type
-        if cc.hasMore:
-          if g.isFloatExpr(cc): ok = false       # float→float precision: later
-          elif not g.valModeled2(cc): ok = false # int→float
-          skip cc
-        while cc.hasMore: skip cc
-      ok
-    of SufC, ParC:
-      var ok = true
-      var cc = c
-      cc.into:
-        if cc.hasMore: (if not g.fvalModeled2(cc): ok = false); skip cc
-        while cc.hasMore: skip cc
-      ok
-    else: false
-  else: false
-
-proc callModeled2(g: var CodeGen; c: Cursor): bool =
-  ## Is this `(call …)` within the new emitter's coverage? A declarative direct or
-  ## syscall target (NOT indirect / atomic / mem* / bit-builtin), a scalar-or-void
-  ## result, and ≤(#arg regs) scalar args with no nested call (`valModeled2` rejects
-  ## CallC, so an arg cannot itself be a call ⇒ nothing lives across the call).
-  if c.kind != TagLit or c.exprKind != CallC: return false
-  var ok = true
-  var fc = c
-  fc.into:
-    if fc.kind != Symbol:
-      ok = false
-    else:
-      let fsym = symName(fc); inc fc
-      if not g.callTarget.hasKey(fsym):                  # resolve + cache (mirrors genCall)
-        let si = g.lookupSym(fsym)
-        if si.cat in {scGlobal, scTvar}:
-          g.callTarget[fsym] = CallTarget(declarative: true, indirect: true,
-            asmName: fsym, retType: g.indirectRetType(si.decl))
-        else:
-          g.callTarget[fsym] = foreignCallTarget(g.prog, fsym)
-      let tgt = g.callTarget[fsym]
-      if not (tgt.declarative and not tgt.extern and tgt.atomic.len == 0 and
-              tgt.memIntrin.len == 0 and tgt.bitBuiltin.len == 0 and not tgt.indirect):
-        ok = false
-      if (not retIsVoid(tgt.retType)) and
-         slotOf(g.prog, tgt.retType).kind notin {AInt, AUInt, ABool}:
-        ok = false                                       # float / aggregate result: v1 gap
-      var argc = 0
-      while fc.hasMore:
-        if not g.valModeled2(fc): ok = false             # scalar-int args, no nested call
-        inc argc; skip fc
-      if argc > g.md.intArgRegs.len: ok = false          # 7th+ (stack) args: v1 gap
-  ok
-
-proc smallCmpImm(c: Cursor): bool =
-  ## A comparison operand the `cmp` emitter can fold inline without a scratch
-  ## register — a small non-negative immediate (or any non-immediate operand,
-  ## which folds as a register / memory). A wide/negative immediate would need a
-  ## pre-load the v1 allocator does not reserve, so it bails the proc to legacy.
-  case c.kind
-  of IntLit: (let v = intVal(c); v >= 0 and v <= 0xFFFF)
-  of UIntLit: (let v = cast[int64](uintVal(c)); v >= 0 and v <= 0xFFFF)
-  else: true
-
-proc caseBranchValSmall(c: Cursor): bool =
-  ## A `case` BranchValue the new emitter's range tests can fold into `cmp` without a
-  ## scratch register — a small non-negative integer/char literal (same window as
-  ## `smallCmpImm`). Symbol enum consts / wrapped forms bail the proc to legacy.
-  case c.kind
-  of IntLit: (let v = intVal(c); v >= 0 and v <= 0xFFFF)
-  of UIntLit: (let v = cast[int64](uintVal(c)); v >= 0 and v <= 0xFFFF)
-  of CharLit: (let v = int64(ord(charLit(c))); v >= 0 and v <= 0xFFFF)
-  else: false
-
-proc caseRangeModeled(c: Cursor): bool =
-  ## A BranchRange of a `case` `of`: `(range lo hi)` of small literals, or a single
-  ## small literal. (Avoids `branchImm`, which asserts on unsupported forms.)
-  if c.kind == TagLit and c.substructureKind == RangeU:
-    var ok = true
-    var cc = c
-    cc.into:
-      while cc.hasMore:
-        if not caseBranchValSmall(cc): ok = false
-        skip cc
-    ok
-  else: caseBranchValSmall(c)
-
-proc condModeled2(g: var CodeGen; c: Cursor): bool =
-  ## A branch condition the new emitter handles: a comparison (`eq`/`neq`/`lt`/`le`)
-  ## over modeled, fold-able operands; an `and`/`or`/`not` short-circuit tree over
-  ## modeled sub-conditions; or a plain modeled boolean value.
-  if c.kind == TagLit:
-    case c.exprKind
-    of EqC, NeqC, LtC, LeC:
-      var ok = true
-      var cc = c
-      var isFloat = false
-      block:
-        var fc = c
-        fc.into:
-          isFloat = fc.hasMore and g.isFloatExpr(fc)
-          while fc.hasMore: skip fc
-      cc.into:
-        if isFloat:                                       # float compare → comisd, no imm fold
-          if cc.hasMore: (if not g.fvalModeled2(cc): ok = false); skip cc
-          if cc.hasMore: (if not g.fvalModeled2(cc): ok = false); skip cc
-        else:
-          if cc.hasMore:
-            if not (g.valModeled2(cc) and smallCmpImm(cc)): ok = false
-            skip cc
-          if cc.hasMore:
-            if not (g.valModeled2(cc) and smallCmpImm(cc)): ok = false
-            skip cc
-        while cc.hasMore: skip cc
-      return ok
-    of AndC, OrC, NotC:
-      var ok = true
-      var cc = c
-      cc.into:
-        while cc.hasMore:
-          if not g.condModeled2(cc): ok = false
-          skip cc
-      return ok
-    else: discard
-  g.valModeled2(c)
-
-proc divModModeled2(g: var CodeGen; c: Cursor): bool =
-  ## A `(div|mod T a b)` the new emitter handles: integer operands that are
-  ## themselves modeled and not a nested div / call — so rax/rdx stay single-use
-  ## (no value live across the idiv). The allocator additionally bails (to legacy)
-  ## when rdx is a live parameter home (`divRemOccupied`).
-  if c.kind != TagLit or c.exprKind notin {DivC, ModC}: return false
-  var ok = true
-  var cc = c
-  cc.into:
-    skip cc                                             # result type
-    if cc.hasMore: (if not g.valModeled2(cc): ok = false); skip cc
-    if cc.hasMore: (if not g.valModeled2(cc): ok = false); skip cc
-    while cc.hasMore: skip cc
-  ok
-
-proc stmtModeled2(g: var CodeGen; c: Cursor): bool =
-  case c.stmtKind
-  of StmtsS, ScopeS:
-    var ok = true
-    var cc = c
-    cc.into:
-      while cc.hasMore:
-        if not g.stmtModeled2(cc): ok = false
-        skip cc
-    ok
-  of VarS:
-    var ok = true
-    var cc = c
-    cc.into:
-      skip cc; skip cc                                   # name, pragmas
-      let s = slotOf(g.prog, cc)
-      skip cc                                            # type
-      let hasInit = cc.hasMore and cc.kind != DotToken
-      if s.kind == AFloat:
-        # A float local (slice 1): its register home receives a modeled float init;
-        # a spilled float home routes to legacy via `exprUnsupported` at allocation.
-        if hasInit and not g.fvalModeled2(cc): ok = false
-      elif s.kind == AMem:
-        if hasInit: ok = false                           # aggregate initializer: later slice
-      elif not s.inRegClass: ok = false
-      elif ok and hasInit:
-        # var-init is alias-safe for a comparison-as-value (a fresh home can't be an
-        # operand) so `condModeled2` is allowed here, but NOT in asgn-rhs / call-args.
-        if not (g.valModeled2(cc) or g.callModeled2(cc) or g.divModModeled2(cc) or
-                g.condModeled2(cc)): ok = false
-      while cc.hasMore: skip cc
-    ok
-  of RetS:
-    var ok = true
-    var cc = c
-    cc.into:
-      if cc.hasMore and cc.kind != DotToken:
-        if g.isFloatExpr(cc):
-          if not g.fvalModeled2(cc): ok = false          # float return → xmm0
-        elif not (g.valModeled2(cc) or g.callModeled2(cc) or g.divModModeled2(cc) or
-                g.condModeled2(cc)): ok = false           # ret value: rax never an operand
-      while cc.hasMore: skip cc
-    ok
-  of CallS: g.callModeled2(c)
-  of AsgnS:
-    var ok = true
-    var floatLhs = false
-    var cc = c
-    cc.into:
-      if cc.kind == Symbol:
-        if g.lookupSym(symName(cc)).cat notin {scNone, scGlobal, scTvar}: ok = false  # local or global store
-        elif g.isFloatExpr(cc):
-          # A float store: only a LOCAL float (a float global store is a later slice).
-          if g.lookupSym(symName(cc)).cat != scNone: ok = false
-          else: floatLhs = true
-      elif not g.lvalModeled2(cc): ok = false           # complex lvalue (dot/deref store)
-      skip cc                                            # lhs
-      if cc.hasMore:
-        if floatLhs:
-          if not g.fvalModeled2(cc): ok = false
-        elif not (g.valModeled2(cc) or g.callModeled2(cc) or g.divModModeled2(cc)): ok = false
-      while cc.hasMore: skip cc
-    ok
-  of WhileS:
-    var ok = true
-    var cc = c
-    cc.into:
-      if cc.hasMore:
-        if not g.condModeled2(cc): ok = false
-        skip cc
-      while cc.hasMore:
-        if not g.stmtModeled2(cc): ok = false
-        skip cc
-    ok
-  of IfS:
-    var ok = true
-    var cc = c
-    cc.into:
-      while cc.hasMore:
-        case cc.substructureKind
-        of ElifU:
-          var bc = cc
-          bc.into:
-            if bc.hasMore:
-              if not g.condModeled2(bc): ok = false
-              skip bc
-            while bc.hasMore:
-              if not g.stmtModeled2(bc): ok = false
-              skip bc
-        of ElseU:
-          var bc = cc
-          bc.into:
-            while bc.hasMore:
-              if not g.stmtModeled2(bc): ok = false
-              skip bc
-        else: ok = false
-        skip cc
-    ok
-  of BreakS: true                                       # a jump to the loop-exit label
-  of CaseS:
-    var ok = true
-    var cc = c
-    cc.into:
-      if cc.hasMore:                                     # selector
-        if not g.valModeled2(cc): ok = false
-        skip cc
-      while cc.hasMore:
-        case cc.substructureKind
-        of OfU:
-          var branch = cc
-          branch.into:
-            if branch.substructureKind == RangesU:
-              var ranges = branch
-              ranges.into:
-                while ranges.hasMore:
-                  if not caseRangeModeled(ranges): ok = false   # small-imm bounds only
-                  skip ranges
-            else: ok = false
-            skip branch                                  # past (ranges …)
-            while branch.hasMore:
-              if not g.stmtModeled2(branch): ok = false  # branch body
-              skip branch
-        of ElseU:
-          var eb = cc
-          eb.into:
-            while eb.hasMore:
-              if not g.stmtModeled2(eb): ok = false
-              skip eb
-        else: ok = false
-        skip cc
-    ok
-  else: false
-
-proc procModeled2(g: var CodeGen; decl: Cursor): bool =
-  ## Conservative: the new emitter handles this whole proc (scalar-int params, a
-  ## scalar-int/void return, and a body of var/ret over integer arithmetic).
-  var ok = true
-  var c = decl
-  c.into:
-    inc c                                                # name
-    if c.kind == TagLit:                                 # (params …)
-      var p = c
-      p.into:
-        while p.hasMore:
-          var pp = p
-          pp.into:
-            skip pp; skip pp                             # name, pragmas
-            let s = slotOf(g.prog, pp)
-            # A float param is allowed (slice 1): in a leaf proc it stays in its xmm
-            # arg register; if it spills (non-leaf / address-taken) the body's read
-            # routes the proc to legacy via `exprUnsupported`.
-            if s.kind == AMem or not s.inRegClass: ok = false
-            while pp.hasMore: skip pp
-          skip p
-    skip c                                               # params
-    if not (c.kind == DotToken or
-            (c.kind == TagLit and c.typeKind in {NifcType.IT, NifcType.UT, NifcType.CT, NifcType.FT})):
-      ok = false                                         # scalar-int / float / void return only
-    skip c                                               # return type
-    skip c                                               # pragmas
-    if ok:
-      ok = (c.stmtKind == StmtsS) and g.stmtModeled2(c)
-    while c.hasMore: skip c
-  result = ok
+# `emitProcBody2`); the old reactive statement emitter and the `procModeled2` gate it
+# fed have been deleted. The legacy `gen…` expression emitter survives only for the
+# sub-computations the value-core addressing/cast helpers still delegate (index/base
+# values in `emitAddrLoc`/`prematAccess`, `coerceThroughCast`).
 
 proc place2(g: var CodeGen; src: Location; dest: Reg) =
   ## Materialize `src` into register `dest` (no-op when it is already there).
