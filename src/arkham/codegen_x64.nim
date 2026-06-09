@@ -440,6 +440,16 @@ proc emFieldMem(g: var CodeGen; base, field: string) =   # (mem (dot (rsp) base 
       g.ab.sym base
       g.ab.sym field
 
+proc emAggrElemMem(g: var CodeGen; base: string; idx: int) =  # (mem (at (rsp) base idx))
+  ## Element `idx` of the stack array `base`; nifasm folds the constant `idx*elemSize`
+  ## into the displacement (an immediate index needs no stride scratch) and sizes the
+  ## access from the array's element type.
+  g.ab.tree MemX:
+    g.ab.tree AtX:
+      g.ab.reg RSP
+      g.ab.sym base
+      g.ab.intLit idx
+
 proc emGlobalAddr(g: var CodeGen; dest: Reg; name: string)
 
 proc loadOperandReg(g: var CodeGen; v: Location; tmps: var seq[Reg]): Reg =
@@ -2813,6 +2823,48 @@ proc genConstrIntoLval2(g: var CodeGen; c: Cursor; lhs: Cursor) =
       skip cc
   g.unbindLvalTemps2(lhs)                                # release the lvalue's base/index temps
 
+proc emLvalElemMem(g: var CodeGen; lhs: Cursor; idx: int) =
+  ## `(mem (at <lvalue address> idx))` — element `idx` of the array addressed by `lhs`.
+  ## The lvalue's embedded value registers must already be materialized (`prematLval2`).
+  g.ab.tree MemX:
+    g.ab.tree AtX:
+      g.emLvalAddr2(lhs)
+      g.ab.intLit idx
+
+proc genAconstrIntoLval2(g: var CodeGen; c: Cursor; lhs: Cursor) =
+  ## Emit `(aconstr ArrayT e0 e1 …)` straight into the array addressed by lvalue `lhs`.
+  ## The address-targeted twin of `genAconstr2` (cf. `genConstrIntoLval2` for objects).
+  var tc = c; inc tc                                    # the array type
+  let et = resolveType(g.prog, innerType(g.prog, resolveType(g.prog, tc)))
+  let etIsPtr = isPtrType(et)
+  g.prematLval2(lhs)                                     # the lvalue's base/index regs, once
+  var cc = c
+  cc.into:
+    skip cc                                             # the array type
+    var i = 0
+    while cc.hasMore:
+      let valC = cc
+      g.emitValue2(valC)
+      let v = g.ra.locs[cursorToPosition(g.buf[], valC)]
+      if v.kind == InFReg:                              # float element
+        let bits = if v.typ.size == 4: 32 else: 64
+        g.ab.tree (if bits == 32: MovssX64 else: MovsdX64):
+          g.emLvalElemMem(lhs, i)
+          g.emFReg v.f
+        if v.isTemp: g.unbindFTmp(v.f)
+      else:
+        var etc = et
+        g.ab.tree MovX64:
+          g.emLvalElemMem(lhs, i)
+          if etIsPtr:
+            g.ab.tree CastX: (g.genTypeBody(etc); g.emReg v.r)
+          else:
+            g.emReg v.r
+        if v.isTemp: g.unbindTemp(v.r)
+      inc i
+      skip cc
+  g.unbindLvalTemps2(lhs)                                # release the lvalue's base/index temps
+
 proc genConstr2(g: var CodeGen; c: Cursor; dstVar: string) =
   ## Emit `(oconstr T (kv field value)*)` into the stack aggregate `dstVar`: each
   ## value was placed in a register temp by the allocator (a SIMD temp for a float
@@ -2846,6 +2898,40 @@ proc genConstr2(g: var CodeGen; c: Cursor; dstVar: string) =
               g.emReg v.r
           if v.isTemp: g.unbindTemp(v.r)
         while kv.hasMore: skip kv                        # optional inherited-depth INTLIT
+      skip cc
+
+proc genAconstr2(g: var CodeGen; c: Cursor; dstVar: string) =
+  ## Emit `(aconstr ArrayT e0 e1 …)` into the stack array `dstVar`: store each (bare)
+  ## element value at `(mem (at (rsp) dstVar i))`. The array twin of `genConstr2`;
+  ## nifasm sizes each store from the array's element type. A pointer element is
+  ## reinterpreted via `(cast (ptr …) reg)` for nifasm's strict typing.
+  var tc = c; inc tc                                    # the array type
+  let et = resolveType(g.prog, innerType(g.prog, resolveType(g.prog, tc)))
+  let etIsPtr = isPtrType(et)
+  var cc = c
+  cc.into:
+    skip cc                                             # the array type
+    var i = 0
+    while cc.hasMore:
+      let valC = cc
+      g.emitValue2(valC)
+      let v = g.ra.locs[cursorToPosition(g.buf[], valC)]
+      if v.kind == InFReg:                              # float element
+        let bits = if v.typ.size == 4: 32 else: 64
+        g.ab.tree (if bits == 32: MovssX64 else: MovsdX64):
+          g.emAggrElemMem(dstVar, i)
+          g.emFReg v.f
+        if v.isTemp: g.unbindFTmp(v.f)
+      else:
+        var etc = et
+        g.ab.tree MovX64:
+          g.emAggrElemMem(dstVar, i)
+          if etIsPtr:
+            g.ab.tree CastX: (g.genTypeBody(etc); g.emReg v.r)
+          else:
+            g.emReg v.r
+        if v.isTemp: g.unbindTemp(v.r)
+      inc i
       skip cc
 
 proc storeScalar2(g: var CodeGen; dst, v: Location) =
@@ -2910,11 +2996,7 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
     if rhs.kind == TagLit and rhs.exprKind == OconstrC:
       g.genConstr2(rhs, dstVar)                          # build object field-by-field
     elif rhs.kind == TagLit and rhs.exprKind == AconstrC:
-      # An array constructor builds element-by-element here — the SAME single place an
-      # object constructor does. (Not yet emitted by the corpus: constant arrays go to
-      # rodata; a runtime `(aconstr …)` lands here when one appears, NOT in a per-caller
-      # branch.)
-      raiseAssert "arkham x64n: runtime (aconstr …) not yet supported"
+      g.genAconstr2(rhs, dstVar)                          # build array element-by-element
     elif rhs.kind == TagLit and rhs.exprKind == CallC:   # call-returned aggregate
       if g.aggrByRef(tn):                                # >16B: pass &dst as the hidden result ptr
         g.emStackAddr(RDI, dstVar)
@@ -2987,7 +3069,7 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
     if rhs.kind == TagLit and rhs.exprKind == OconstrC:
       g.genConstrIntoLval2(rhs, lhs)                      # build field-by-field into the address
     elif rhs.kind == TagLit and rhs.exprKind == AconstrC:
-      raiseAssert "arkham x64n: runtime (aconstr …) not yet supported"
+      g.genAconstrIntoLval2(rhs, lhs)                     # build array element-by-element
     else:
       g.prematLval2(lhs)
       g.emitValue2(rhs)                                   # rhs value

@@ -1,0 +1,37 @@
+(.nif27)
+(.indexat 585              )
+(stmts
+ (type :IntArr3.0 .
+  (array
+   (i 64)3))
+ (type :Holder.0 .
+  (object .
+   (fld :arr.0 . IntArr3.0)))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :h.0 . Holder.0 .)
+   (asgn
+    (dot h.0 arr.0)
+    (aconstr IntArr3.0 20 15 7))
+   (call exit.c
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (at
+       (dot h.0 arr.0)0)
+      (at
+       (dot h.0 arr.0)1))
+     (at
+      (dot h.0 arr.0)2))))))(.index)

@@ -1176,6 +1176,22 @@ proc allocConstr(b: var Builder; n: var Cursor) =
             b.releaseTmp(d)
         while n.hasMore: skip n                 # optional inherited-depth INTLIT
 
+proc allocAconstr(b: var Builder; n: var Cursor) =
+  ## `(aconstr ArrayT e0 e1 …)` — allocate each (bare) element value into a register
+  ## (a SIMD temp for a float element); each is single-use (store + free), so the temps
+  ## recycle. Advances `n` past the aconstr. The array twin of `allocConstr`.
+  n.into:
+    skip n                                     # the array type
+    while n.hasMore:
+      if b.isFloatVal(n):
+        var d = dontCare
+        allocFValue(b, n, d)
+        b.releaseFTmp(d)
+      else:
+        var d = needsReg(ScalarSlot)
+        allocValue(b, n, d)
+        b.releaseTmp(d)
+
 proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
   ## Allocator twin of the emitter's `genStore2`: place the homes/temps needed to
   ## store value `n` into `dst`, advancing `n` past the value. The ONE path every
@@ -1188,7 +1204,7 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
     if n.kind == TagLit and n.exprKind == OconstrC:
       allocConstr(b, n)                                  # object: place each field value
     elif n.kind == TagLit and n.exprKind == AconstrC:
-      b.ra.exprUnsupported = true; skip n                # array constructor: one place (TODO)
+      allocAconstr(b, n)                                 # array: place each element value
     elif n.kind == TagLit and n.exprKind == CallC:       # call-returned aggregate
       var d = dontCare
       allocCall(b, n, d, hiddenPtr = dst.typ.size > b.md.aggrByRefThreshold)
@@ -1248,7 +1264,7 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
     if n.kind == TagLit and n.exprKind == OconstrC:
       allocConstr(b, n)                                  # build through the lvalue address
     elif n.kind == TagLit and n.exprKind == AconstrC:
-      b.ra.exprUnsupported = true; skip n
+      allocAconstr(b, n)                                 # build array through the lvalue address
     elif b.isFloatVal(n):
       var rdest = dontCare
       allocFValue(b, n, rdest)

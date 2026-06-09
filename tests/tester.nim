@@ -92,7 +92,14 @@ proc arkhamTests() =
 # `linux_arm64` qemu path — the arm64 backend reached x86-64 feature parity for
 # function-pointer calls, `(pat …)` pointer indexing, and thread-locals. List a
 # test's stem here if a new arm64-only TODO is introduced.
-const arkhamLinuxA64Unsupported: seq[string] = @[]
+const arkhamLinuxA64Unsupported: seq[string] = @[
+  # Runtime `(aconstr …)` array constructor: the a64 backend (still the reactive
+  # emitter) handles it for a var-init (`aconstr_init`), but not yet as a direct call
+  # argument or into a complex lvalue — those flow through the value-core paths
+  # implemented only on x86-64 for now. Re-enable when a64 catches up.
+  "aconstr_arg",
+  "aconstr_field",
+]
   # The arm64 backend reached parity with x86-64 on global / multi-dimensional array
   # addressing: codegen_a64 now uses the same premat-before-tree two-pass
   # (`prematAccess`/`emAccessAddr`) as x86-64 to materialize a global base, a computed

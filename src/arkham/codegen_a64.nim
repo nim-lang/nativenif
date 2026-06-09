@@ -370,6 +370,15 @@ proc emFieldMem(g: var CodeGen; base, field: string) =
       g.ab.sym base
       g.ab.sym field
 
+proc emAggrElemMem(g: var CodeGen; base: string; idx: int) =
+  ## `(mem (at base idx))` — element `idx` of the array stack var `base`; nifasm folds
+  ## the constant `idx*elemSize` into the load/store offset and sizes it from the
+  ## array's element type (an immediate index needs no stride scratch).
+  g.ab.tree MemX:
+    g.ab.tree AtX:
+      g.ab.sym base
+      g.ab.intLit idx
+
 proc emPtrFieldMem(g: var CodeGen; ptrReg: Reg; typeName, field: string) =
   ## `(mem (dot (cast (ptr T) (xN)) field))` — field access through a register
   ## holding a pointer to the aggregate (for >16B by-ref / x8-indirect). The
@@ -2095,6 +2104,21 @@ proc genOconstr(g: var CodeGen; c: var Cursor; destVar: string) =
         g.freeTemp(rr)
         while c.hasMore: skip c             # optional inherited-object INTLIT
 
+proc genAconstr(g: var CodeGen; c: var Cursor; destVar: string) =
+  ## `(aconstr ArrayType e0 e1 …)` → store each (bare) element value into the array
+  ## stack var `destVar` (element-wise; no temporary copy). The array twin of
+  ## `genOconstr`; nifasm sizes each store from the array's element type.
+  c.into:
+    skip c                                  # the constructed array type
+    var i = 0
+    while c.hasMore:
+      let rr = g.genReg(c)                  # element value → register
+      g.ab.tree MovA64:
+        g.emAggrElemMem(destVar, i)
+        g.emReg rr.r
+      g.freeTemp(rr)
+      inc i
+
 proc genPointee(g: var CodeGen; c: var Cursor) =
   ## Emit a pointer's pointee / element type. A *named* type is referenced by
   ## symbol rather than inlined: this breaks the infinite recursion of
@@ -2322,6 +2346,7 @@ proc genVarDecl(g: var CodeGen; c: var Cursor) =
         if typeName.len > 0: g.varType[name] = typeName
         if c.kind == DotToken: inc c          # no initializer
         elif c.exprKind == OconstrC: g.genOconstr(c, name)
+        elif c.exprKind == AconstrC: g.genAconstr(c, name)   # build array element-by-element
         elif c.exprKind == CallC:             # receive an aggregate return
           assert typeName.len > 0, "arkham v1: call-returned aggregate needs a named type"
           if aggrByteSize(g.prog, typeName) > 16:
