@@ -107,6 +107,16 @@ proc emitAdd*(dest: var Bytes; rd, rn, rm: Register) =
               encodeReg(rd)
   dest.addUint32(instr)
 
+proc emitAddShifted*(dest: var Bytes; rd, rn, rm: Register; shift: uint8) =
+  ## Emit ADD (shifted register): ADD rd, rn, rm, LSL #shift
+  # Same encoding as emitAdd with the imm6 shift-amount field (bits 10-15) set.
+  let instr = 0x8B000000'u32 or
+              (encodeReg(rm) shl 16) or
+              ((uint32(shift) and 0x3F) shl 10) or
+              (encodeReg(rn) shl 5) or
+              encodeReg(rd)
+  dest.addUint32(instr)
+
 # ADD immediate
 proc emitAddImm*(dest: var Bytes; rd, rn: Register; imm: uint16) =
   ## Emit ADD instruction: ADD rd, rn, #imm

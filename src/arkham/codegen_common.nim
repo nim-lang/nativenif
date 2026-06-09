@@ -17,6 +17,9 @@ import std / [tables, sets, assertions]
 import nifcore, nifcdecl
 import slots, machinedesc, analyser, register_allocator, programs
 import asmbuf
+import typenav
+export typenav   # SymCat / SymInfo / getType / exprSlot moved here; re-export so
+                 # the backends' `g.lookupSym(...).cat` etc. keep resolving
 
 type
   StealEvent* = object
@@ -63,6 +66,8 @@ type
     framePad*: int                           ## x64: extra prologue `sub rsp` for 16-byte call alignment
     labelCount*: int                         ## fresh-label counter
     loopEnds*: seq[string]                   ## stack of enclosing-loop end labels (for `break`)
+    retLabel2*: string                       ## value-core: shared epilogue label a mid-proc `ret` jumps to
+    retLabelUsed2*: bool                     ## value-core: a `ret` jumped to retLabel2 ⇒ emit the label
     retAggrName*: string                     ## current proc's aggregate return type (or "")
     retIndirect*: bool                       ## return type is >16B (x8 indirect result)
     isEntryProc*: bool                       ## the proc currently emitted is the entry
@@ -119,6 +124,12 @@ type
     ftmpBindCount*: int                       ## per-proc fresh-name counter for float scratch
                                              ## bindings (`ftmpN.0`); bumped in BOTH passes.
     scopeFLocals*: seq[seq[tuple[name: string, f: FReg]]]  ## per-scope float register locals to `kill`
+    savedHomes*: Table[int, Location]        ## value-core pure path: a deref/at/pat base or
+                                             ## index whose local was demoted to its stack home
+                                             ## by a `stealForTmp` is loaded into a transient
+                                             ## staging reg for the lval emission; its original
+                                             ## `NamedStack`/`Mem` home is parked here (keyed by
+                                             ## value position) and restored by `unbindLvalTemps2`.
     stealEvents*: Table[int, StealEvent]     ## borrow-log index → a codegen-time
                                              ## register steal (evict a live local
                                              ## to a stack slot); recorded in the
@@ -132,6 +143,10 @@ type
                                              ## plan-record / emit-replay model as
                                              ## `stealEvents`, keyed by `fixedEvictSeq`.
     fixedEvictSeq*: int                      ## replay counter into `fixedEvicts`
+    hasGlobalInits*: bool                     ## the module has runtime (non-static) global
+                                             ## initializers, emitted as a synthetic init
+                                             ## proc the entry calls (see `buildGlobalInitProc`)
+    globalInitSym*: string                    ## the synthetic init proc's asm-NIF symbol
 
 # ── type predicates ─────────────────────────────────────────────────────────
 
@@ -178,122 +193,21 @@ proc aggrByRef*(g: var CodeGen; typeName: string): bool {.inline.} =
 
 # ── structural type / slot analysis ─────────────────────────────────────────
 
-type
-  SymCat* = enum
-    scNone                      ## not a module-level symbol (a function-local)
-    scGlobal                    ## ordinary .bss/.data global or const
-    scTvar                      ## thread-local (macOS TLV)
-    scProc                      ## a proc — as a value it is its code address
-  SymInfo* = object
-    cat*: SymCat
-    decl*: Cursor               ## scGlobal/scTvar: the `(gvar|tvar|const :name pragmas type …)`
-    asmName*: string            ## scProc: the asm symbol whose address the proc denotes
+proc typeCtx*(g: var CodeGen): TypeCtx {.inline.} =
+  ## A `TypeCtx` view over this `CodeGen`'s symbol tables, so `getType` / `exprSlot`
+  ## (which now live in `typenav`, below both the allocator and the emitter) read
+  ## the same storage. The fields are stable for the lifetime of the call.
+  TypeCtx(prog: addr g.prog, callTarget: addr g.callTarget,
+          globals: addr g.globals, tvars: addr g.tvars, symType: addr g.symType)
 
-proc lookupSym*(g: var CodeGen; nm: string): SymInfo =
-  ## The one place a module-level symbol resolves to its kind + declaration:
-  ## a main-module global/tvar/proc, or a cross-module symbol loaded lazily from
-  ## its owning module's index. Callers (`getType`/`srcWidthSigned`/`asLoc`/
-  ## `genVal`) classify on the result rather than re-deciding local-vs-foreign.
-  if g.globals.hasKey(nm): return SymInfo(cat: scGlobal, decl: g.globals[nm])
-  if g.tvars.hasKey(nm): return SymInfo(cat: scTvar, decl: g.tvars[nm])
-  if g.callTarget.hasKey(nm): return SymInfo(cat: scProc, asmName: g.callTarget[nm].asmName)
-  var found = false
-  let d = lookupForeignDecl(g.prog, nm, found)
-  if found:
-    case d.stmtKind
-    of ProcS: return SymInfo(cat: scProc, asmName: nm)   # foreign proc: its fully-qualified NIF name
-    of TvarS: return SymInfo(cat: scTvar, decl: d)
-    else: return SymInfo(cat: scGlobal, decl: d)
+proc lookupSym*(g: var CodeGen; nm: string): SymInfo {.inline.} =
+  g.typeCtx.lookupSym(nm)
 
-proc getType*(g: var CodeGen; c: Cursor): Cursor =
-  ## The structural NIFC type cursor of expression `c` (arkham's analog of
-  ## `typenav.getType`). Symbols resolve through `symType` / the global/tvar
-  ## decls; `dot`/`at`/`deref` navigate into the base's object/array/pointer
-  ## type; typed nodes (arith, conv, cast, call) read their carried type. This is
-  ## the single source of truth for "is this float?" — no per-form special cases.
-  case c.kind
-  of Symbol:
-    let nm = symName(c)
-    if g.symType.hasKey(nm): return g.symType[nm]
-    let si = g.lookupSym(nm)
-    case si.cat
-    of scProc: result = g.prog.procPtr        # a proc as a value → its code-pointer type
-    of scGlobal, scTvar:
-      var d = si.decl
-      d.into:
-        inc d; skip d                         # name, pragmas
-        result = d                            # the declared type (a copy)
-        while d.hasMore: skip d
-    of scNone: raiseAssert "arkham: getType — unknown symbol " & nm
-  of TagLit:
-    case c.exprKind
-    of AddC, SubC, MulC, DivC, ModC, ShlC, ShrC, BitandC, BitorC, BitxorC,
-       BitnotC, NegC, NotC, ConvC, CastC, OconstrC, AconstrC:
-      var t = c
-      t.into:
-        result = t                            # the carried result/target type
-        while t.hasMore: skip t
-    of DotC:
-      var t = c
-      t.into:
-        let objTy = resolveType(g.prog, g.getType(t)); skip t  # past the base subtree
-        result = fieldType(g.prog, objTy, symName(t)); inc t
-        while t.hasMore: skip t
-    of AtC, PatC:
-      # `(at array idx)` indexes an array, `(pat ptr idx)` a pointer; either way
-      # the result is the element/pointee type, which `innerType` yields for
-      # `array`/`ptr`/`aptr` alike.
-      var t = c
-      t.into:
-        let arrTy = resolveType(g.prog, g.getType(t)); skip t  # past the base subtree
-        result = innerType(g.prog, arrTy)
-        while t.hasMore: skip t
-    of DerefC:
-      var t = c
-      t.into:
-        let ptrTy = resolveType(g.prog, g.getType(t))          # pointer type
-        result = innerType(g.prog, ptrTy)
-        while t.hasMore: skip t
-    of CallC:
-      var t = c
-      t.into:
-        result = g.callTarget.getOrDefault(symName(t)).retType
-        while t.hasMore: skip t
-    of NilC: result = g.prog.voidPtr          # nil → a generic pointer type
-    of AddrC:                                 # &lvalue → (ptr <type-of-lvalue>)
-      var t = c; inc t
-      result = g.prog.ptrTypeOf(g.getType(t))
-    of SufC, ParC:                            # wrappers → the inner value's type
-      var t = c; inc t
-      result = g.getType(t)
-    else: raiseAssert "arkham: getType — unsupported expression " & $c.exprKind
-  of IntLit:   result = g.prog.intType        # a bare literal's natural type
-  of UIntLit:  result = g.prog.uintType
-  of CharLit:  result = g.prog.charType
-  of FloatLit: result = g.prog.floatType
-  of StrLit:   result = g.prog.voidPtr        # a string literal is a pointer
-  else: raiseAssert "arkham: getType — literal has no stored type"
+proc getType*(g: var CodeGen; c: Cursor): Cursor {.inline.} =
+  g.typeCtx.getType(c)
 
-proc exprSlot*(g: var CodeGen; c: Cursor): AsmSlot =
-  ## The classified slot of any expression — `getType` for structural forms,
-  ## with literals/`addr` (which carry no type cursor) handled directly.
-  case c.kind
-  of FloatLit: AsmSlot(cls: AFloat, size: 8, align: 8)   # default f64; width refined by context
-  of IntLit, UIntLit: AsmSlot(cls: AInt, size: 8, align: 8)
-  of CharLit: AsmSlot(cls: AUInt, size: 1, align: 1)
-  of StrLit: AsmSlot(cls: AUInt, size: 8, align: 8)      # a pointer
-  of Symbol: slotOf(g.prog, g.getType(c))
-  of TagLit:
-    case c.exprKind
-    of AddrC: slotOf(g.prog, g.getType(c))                           # &lvalue → precise (ptr <elem>)
-    of NilC: AsmSlot(cls: AUInt, size: 8, align: 8)                 # nil → a generic pointer
-    of TrueC, FalseC: AsmSlot(cls: AUInt, size: 1, align: 1)        # a bool
-    of SizeofC, AlignofC: AsmSlot(cls: AInt, size: 8, align: 8)     # an integer constant
-    of SufC, ParC:                                                   # wrappers → the inner value
-      var t = c; inc t
-      g.exprSlot(t)
-    else: slotOf(g.prog, g.getType(c))
-  else: AsmSlot(cls: AMem)
+proc exprSlot*(g: var CodeGen; c: Cursor): AsmSlot {.inline.} =
+  g.typeCtx.exprSlot(c)
 
 proc tryConstFold*(g: var CodeGen; c: Cursor): (bool, int64) =
   ## Evaluate a compile-time-constant INTEGER expression to its value WITHOUT

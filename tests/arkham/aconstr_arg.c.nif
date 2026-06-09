@@ -1,0 +1,37 @@
+(.nif27)
+(.indexat 548              )
+(stmts
+ (type :IntArr3.0 .
+  (array
+   (i 64)3))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :sum3.0
+  (params
+   (param :p.0 . IntArr3.0))
+  (i 64).
+  (stmts
+   (ret
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (at p.0 0)
+      (at p.0 1))
+     (at p.0 2)))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :s.0 .
+    (i 64)
+    (call sum3.0
+     (aconstr IntArr3.0 20 15 7)))
+   (call exit.c s.0))))(.index)

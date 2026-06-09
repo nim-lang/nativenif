@@ -56,11 +56,25 @@ const
   ##    AArch64 where x0–x7 are kept out of the temp pool)
   ##  * float: xmm0–7 args/return (unused by the v0 scalar path)
   x64Machine* = MachineDesc(
+    arch: X86,
+    intRetReg: RAX,
+    divRemReg: RDX,                  # idiv clobbers rdx (remainder / sign-extend high half)
+    shiftCountReg: RCX,              # x86 variable shift count must be in cl (rcx)
     intArgRegs: @[RDI, RSI, RDX, RCX, R8, R9],
     floatArgRegs: @[F0, F1, F2, F3, F4, F5, F6, F7],
-    intTempRegs: @[R10, R11],
+    intTempRegs: @[R10],             # R11 is RESERVED as the staging bridge (see
+                                     # StagingCandidates): an always-free caller-saved
+                                     # GPR the emitter can grab to make mem←mem / spilled
+                                     # value-position produce-into total, so the allocator's
+                                     # `etmp` fallback is always emittable.
+    intLocalTempRegs: @[],           # NO volatile int reg may home a local on x86-64: R10 is
+                                     # the emitter's staging scratch (and R11 the bridge), so a
+                                     # local there starves the emitter. Call-free locals that
+                                     # exhaust the callee-saved pool spill instead.
     intCalleeSaved: @[RBX, R12, R13, R14, R15],
-    floatTempRegs: @[F8, F9, F10, F11, F12, F13, F14, F15],
+    floatTempRegs: @[F8, F9, F10, F11, F12, F13, F14],   # F15 RESERVED as the float
+                                                         # staging bridge (FloatStagingBridge)
+                                                         # — the SIMD twin of R11.
     floatCalleeSaved: @[],
     intCalleeSavedSet: {RBX, R12, R13, R14, R15},
     floatCalleeSavedSet: {},

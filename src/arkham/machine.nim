@@ -57,9 +57,15 @@ const
   ## The AArch64 / AAPCS64 register file and calling convention, as the
   ## arch-neutral register allocator consumes it.
   aarch64Machine* = MachineDesc(
+    arch: Arm64,
+    intRetReg: R0,
+    divRemReg: NoReg,                # aarch64 sdiv/msub use ordinary scratch — no fixed reg
+    shiftCountReg: NoReg,            # aarch64 shifts take any register
     intArgRegs: @IntArgRegs,
     floatArgRegs: @FloatArgRegs,
     intTempRegs: @IntTempRegs,
+    intLocalTempRegs: @IntTempRegs,  # AArch64 has 7 volatile int regs — scratch to spare,
+                                     # so a call-free local may be homed in the temp pool
     intCalleeSaved: @IntCalleeSaved,
     floatTempRegs: @FloatTempRegs,
     floatCalleeSaved: @FloatCalleeSaved,

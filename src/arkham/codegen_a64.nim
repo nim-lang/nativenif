@@ -343,6 +343,7 @@ proc emFStore(g: var CodeGen; d: FReg; addrReg: Reg; bits: int) = # fstr dD/sD, 
 proc genInto(g: var CodeGen; c: var Cursor; dest: Reg)
 proc genIntoF(g: var CodeGen; c: var Cursor; dest: FReg; bits: int)
 proc genCall(g: var CodeGen; c: var Cursor)
+proc genOconstr(g: var CodeGen; c: var Cursor; destVar: string)
 proc genAtomic(g: var CodeGen; c: var Cursor; builtin: string)
 proc genMemIntrin(g: var CodeGen; c: var Cursor; builtin: string)
 proc genAddr(g: var CodeGen; c: var Cursor; dest: Reg)
@@ -369,6 +370,15 @@ proc emFieldMem(g: var CodeGen; base, field: string) =
       g.ab.sym base
       g.ab.sym field
 
+proc emAggrElemMem(g: var CodeGen; base: string; idx: int) =
+  ## `(mem (at base idx))` — element `idx` of the array stack var `base`; nifasm folds
+  ## the constant `idx*elemSize` into the load/store offset and sizes it from the
+  ## array's element type (an immediate index needs no stride scratch).
+  g.ab.tree MemX:
+    g.ab.tree AtX:
+      g.ab.sym base
+      g.ab.intLit idx
+
 proc emPtrFieldMem(g: var CodeGen; ptrReg: Reg; typeName, field: string) =
   ## `(mem (dot (cast (ptr T) (xN)) field))` — field access through a register
   ## holding a pointer to the aggregate (for >16B by-ref / x8-indirect). The
@@ -388,7 +398,11 @@ proc emAggrFieldMem(g: var CodeGen; base, field: string) =
   case loc.kind
   of NamedStack: g.emFieldMem(base, field)
   of InReg:      g.emPtrFieldMem(loc.r, g.varType[base], field)
-  else: raiseAssert "arkham: aggregate base neither stack nor pointer: " & base
+  else:
+    # a synthetic nifasm `(s)` slot (e.g. an inline-constructor arg temp) is addressed
+    # by name like a `NamedStack` var — the allocator just doesn't track it.
+    if g.varType.hasKey(base): g.emFieldMem(base, field)
+    else: raiseAssert "arkham: aggregate base neither stack nor pointer: " & base
 
 proc emAggrDot(g: var CodeGen; base, field: string) =
   ## The `(dot …)` operand alone (no `mem` wrapper), location-aware — for `lea`
@@ -2035,6 +2049,31 @@ proc genCall(g: var CodeGen; c: var Cursor) =
               g.ra.seal IntArgRegs[idx + k]; sealedHere.incl IntArgRegs[idx + k]
             idx += nw
           inc c
+        elif c.kind == TagLit and c.exprKind == OconstrC:
+          # an aggregate constructor passed directly as an argument: build it into a
+          # synthetic stack temp, then marshal like a symbol aggregate (>16B by-ref
+          # pointer in one reg, else its words by value).
+          var tcur = c; inc tcur
+          let tn = symName(tcur)
+          let tmpName = "octmp" & $cursorToPosition(g.buf[], c) & ".0"
+          g.emTypedStackVar(tmpName, tcur)
+          g.varType[tmpName] = tn
+          g.genOconstr(c, tmpName)                    # build into slot; advances c
+          let sz = aggrByteSize(g.prog, tn)
+          if sz > 16:
+            assert idx < IntArgRegs.len, "arkham v1: >8 args (stack passing TODO)"
+            g.ab.tree LeaA64:
+              g.emReg IntArgRegs[idx]
+              g.ab.sym tmpName
+            g.ra.seal IntArgRegs[idx]; sealedHere.incl IntArgRegs[idx]
+            inc idx
+          else:
+            let nw = aggrWordCount(g.prog, tn)
+            assert idx + nw <= IntArgRegs.len, "arkham v1: aggregate arg exceeds GPRs"
+            g.structToRegs(tmpName, tn, idx)
+            for k in 0 ..< nw:
+              g.ra.seal IntArgRegs[idx + k]; sealedHere.incl IntArgRegs[idx + k]
+            idx += nw
         else:
           assert idx < IntArgRegs.len, "arkham v1: >8 integer args (stack passing TODO)"
           let ar = IntArgRegs[idx]
@@ -2064,6 +2103,21 @@ proc genOconstr(g: var CodeGen; c: var Cursor; destVar: string) =
           g.emReg rr.r
         g.freeTemp(rr)
         while c.hasMore: skip c             # optional inherited-object INTLIT
+
+proc genAconstr(g: var CodeGen; c: var Cursor; destVar: string) =
+  ## `(aconstr ArrayType e0 e1 …)` → store each (bare) element value into the array
+  ## stack var `destVar` (element-wise; no temporary copy). The array twin of
+  ## `genOconstr`; nifasm sizes each store from the array's element type.
+  c.into:
+    skip c                                  # the constructed array type
+    var i = 0
+    while c.hasMore:
+      let rr = g.genReg(c)                  # element value → register
+      g.ab.tree MovA64:
+        g.emAggrElemMem(destVar, i)
+        g.emReg rr.r
+      g.freeTemp(rr)
+      inc i
 
 proc genPointee(g: var CodeGen; c: var Cursor) =
   ## Emit a pointer's pointee / element type. A *named* type is referenced by
@@ -2292,6 +2346,7 @@ proc genVarDecl(g: var CodeGen; c: var Cursor) =
         if typeName.len > 0: g.varType[name] = typeName
         if c.kind == DotToken: inc c          # no initializer
         elif c.exprKind == OconstrC: g.genOconstr(c, name)
+        elif c.exprKind == AconstrC: g.genAconstr(c, name)   # build array element-by-element
         elif c.exprKind == CallC:             # receive an aggregate return
           assert typeName.len > 0, "arkham v1: call-returned aggregate needs a named type"
           if aggrByteSize(g.prog, typeName) > 16:
@@ -3223,7 +3278,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
       g.retIsFloat = true                     # float return → v0
       g.retFloatBits = if slotOf(g.prog, rc).size == 4: 32 else: 64
   let preseal = if g.retIndirect: {R19} else: {}
-  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, aarch64Machine, preseal)
+  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, aarch64Machine, g.typeCtx, preseal)
   if g.retIndirect:
     g.indirectReg = R19
     g.ra.usedCallee.incl R19                  # saved/restored like any callee reg

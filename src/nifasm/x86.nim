@@ -660,6 +660,7 @@ proc emitAluImmMem(dest: var Bytes; ext: int; mem: MemoryOperand; imm: int32) =
   dest.emitMem(ext, mem)                         # reg field = opcode extension
   dest.addt32(imm)
 
+proc emitCmpImm*(dest: var Bytes; mem: MemoryOperand; imm: int32) = emitAluImmMem(dest, 7, mem, imm)
 proc emitAddImm*(dest: var Bytes; mem: MemoryOperand; imm: int32) = emitAluImmMem(dest, 0, mem, imm)
 proc emitSubImm*(dest: var Bytes; mem: MemoryOperand; imm: int32) = emitAluImmMem(dest, 5, mem, imm)
 proc emitAndImm*(dest: var Bytes; mem: MemoryOperand; imm: int32) = emitAluImmMem(dest, 4, mem, imm)

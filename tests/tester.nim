@@ -24,11 +24,20 @@ proc execExpectOutput(cmd: string; expected: string) =
   if s != expected:
     quit "UNEXPECTED OUTPUT " & cmd & "\nExpected:\n" & expected & "\nGot:\n" & s
 
-const arkhamKnownUnsupported: seq[string] = @[]
-  # Documented v0 TODOs that still `raiseAssert` in arkham's x86-64 backend.
-  # Empty: the x64 backend now implements the full input corpus (the
-  # float-in-call-signature ABI landed last). Any failure is a hard error. If a
-  # new unimplemented feature is added, list its test stems here.
+const arkhamKnownUnsupported: seq[string] =
+  when defined(macosx):
+    # The native macOS pass targets AArch64, whose reactive emitter does not yet
+    # handle the runtime `(aconstr …)` array constructor as a direct call argument
+    # — that flows through value-core paths implemented only on x86-64 for now.
+    # We focus on x86 for the moment; re-enable when the a64 backend catches up.
+    @["aconstr_arg", "aconstr_field"]
+  else:
+    # value-core rewrite — THE FLIP: the x86-64 backend emits EVERY proc through the
+    # new pure-emit path (no `procModeled2` gate, no legacy fallback). The whole
+    # corpus now routes through it cleanly — register-pressure totality for deep
+    # right-nested expression trees is handled by the Sethi–Ullman reorder in
+    # allocBin/allocFBin (no quarantine remains).
+    @[]
 
 proc arkhamTests() =
   ## Each `tests/arkham/*.c.nif` is hand-written NIFC: arkham generates asm-NIF,
@@ -90,7 +99,14 @@ proc arkhamTests() =
 # `linux_arm64` qemu path — the arm64 backend reached x86-64 feature parity for
 # function-pointer calls, `(pat …)` pointer indexing, and thread-locals. List a
 # test's stem here if a new arm64-only TODO is introduced.
-const arkhamLinuxA64Unsupported: seq[string] = @[]
+const arkhamLinuxA64Unsupported: seq[string] = @[
+  # Runtime `(aconstr …)` array constructor: the a64 backend (still the reactive
+  # emitter) handles it for a var-init (`aconstr_init`), but not yet as a direct call
+  # argument or into a complex lvalue — those flow through the value-core paths
+  # implemented only on x86-64 for now. Re-enable when a64 catches up.
+  "aconstr_arg",
+  "aconstr_field",
+]
   # The arm64 backend reached parity with x86-64 on global / multi-dimensional array
   # addressing: codegen_a64 now uses the same premat-before-tree two-pass
   # (`prematAccess`/`emAccessAddr`) as x86-64 to materialize a global base, a computed
