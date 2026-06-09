@@ -2940,273 +2940,6 @@ proc genStore(g: var CodeGen; c: var Cursor; dst: Location) =
   else:                                           # scalar / float → the one entry point
     var d = dst; g.gen(c, d)
 
-# ── statements ─────────────────────────────────────────────────────────────────
-
-proc genStmt(g: var CodeGen; c: var Cursor)
-
-proc genVarDecl(g: var CodeGen; c: var Cursor) =
-  c.into:
-    let name = symName(c); inc c
-    skip c                                    # pragmas
-    g.symType[name] = c                       # record the type for getType
-    let typeCur = c
-    skip c                                    # type
-    let loc = g.ra.locationOfSym(name)
-    case loc.kind
-    of InReg:
-      g.emRegLocalVar(name, loc.r, typeCur)   # (var :name (reg) type) — typed for nifasm
-      if c.hasMore and c.kind != DotToken:
-        var d = loc; g.gen(c, d)              # init value → the local's register
-    of InFReg:                                # float local in an xmm register
-      g.emFRegLocalVar(name, loc.f, loc.typ.size * 8)  # (rebind :name (f bits) (xmmN))
-      if c.hasMore and c.kind != DotToken:
-        var d = loc; g.gen(c, d)
-    of NamedStack:
-      if loc.typ.kind == AFloat:              # a spilled float scalar
-        let bits = loc.typ.size * 8
-        g.emFloatStackVar(name, bits)
-        if c.hasMore and c.kind != DotToken:
-          let f = g.borrowFTmp()
-          g.genIntoF(c, f, bits)
-          g.emFloatScalarStore(name, f, bits)
-          g.giveBackF f
-      elif loc.typ.kind == AMem:              # an aggregate stack object
-        g.ab.open NifasmDecl.VarD             # (var :name (s) <type>)
-        g.ab.symDef name
-        g.ab.keyword SO
-        var tc = typeCur                      # named type ref, or inline structural type
-        if tc.kind == Symbol: g.ab.sym symName(tc)
-        else: g.genTypeBody(tc)               # e.g. an inline `(array (i N) len)`
-        g.ab.close()
-        if tc.kind == Symbol: g.varType[name] = symName(tc)  # object field-offset lookups
-        if c.hasMore and c.kind != DotToken:
-          if c.kind == TagLit and c.exprKind == CallC:
-            # receive an aggregate return value into this var's slot (the callee
-            # writes it, so this can't go through the generic `genStore`).
-            assert tc.kind == Symbol, "arkham x64 v0: call-returned aggregate needs a named type"
-            let typeName = symName(tc)
-            if g.aggrByRef(typeName):
-              # >16B: hand the callee a pointer to this var via rdi; it writes there.
-              g.emStackAddr(RDI, name)
-              g.genCall(c)
-            else:
-              g.genCall(c)                     # result in rax:rdx
-              g.regsToStruct(name, typeName, x64RetRegs)
-          else:                                # construct in place / copy from an lvalue
-            g.genStore(c, namedStackLoc(name, loc.typ))
-      else:                                   # a spilled / address-taken scalar
-        # A pointer's slot must carry its PRECISE type: nifasm is strict, so a later
-        # load `(mov ptrTmp (mem name))` / deref of a generic `(i 64)` slot is rejected
-        # (the value's precise type doesn't match an i64 slot). Integers keep the
-        # generic 8-byte slot (the sized mem↔reg rule tolerates width differences).
-        if isPtrType(resolveType(g.prog, typeCur)):
-          g.emTypedStackVar(name, typeCur)    # (var :name (s) (ptr …))
-        else:
-          g.emScalarStackVar(name)            # (var :name (s) (i 64))
-        if c.hasMore and c.kind != DotToken:
-          var d = loc; g.gen(c, d)            # init value → the slot (NamedStack store)
-    else: raiseAssert "arkham x64 v0: local '" & name & "' has location " & $loc.kind
-    while c.hasMore: skip c
-
-proc genAsgn(g: var CodeGen; c: var Cursor) =
-  c.into:
-    let dst = g.asLoc(c)                        # lhs → the destination location ("fills")
-    g.genStore(c, dst)                          # rhs value into it ("binds")
-    while c.hasMore: skip c
-
-proc genWhile(g: var CodeGen; c: var Cursor) =
-  let lStart = g.freshLabel()
-  let lEnd = g.freshLabel()
-  g.loopEnds.add lEnd
-  c.into:
-    let condStart = c
-    skip c                                    # `c` → first body statement
-    g.emLab(lStart)
-    var cond = condStart
-    g.emitCondJump(cond, lEnd, whenTrue = false)
-    while c.hasMore: genStmt(g, c)
-    g.emJmp(lStart)
-  g.emLab(lEnd)
-  discard g.loopEnds.pop()
-
-proc genBreak(g: var CodeGen; c: var Cursor) =
-  assert g.loopEnds.len > 0, "arkham x64 v0: `break` outside a loop"
-  g.emJmp(g.loopEnds[^1])
-  skip c
-
-# ── if / case ────────────────────────────────────────────────────────────────
-
-proc genActionStmts(g: var CodeGen; c: var Cursor) =
-  ## The body of an `(elif … body)` / `(else body)` / case branch — a `(stmts …)`
-  ## list (not a fresh scope) or a single statement.
-  if c.stmtKind == StmtsS:
-    c.into:
-      while c.hasMore: genStmt(g, c)
-  else:
-    genStmt(g, c)
-
-proc emitChain(g: var CodeGen; c: var Cursor; lEnd: string) =
-  if not c.hasMore: return
-  case c.substructureKind
-  of ElifU:
-    var branch = c
-    skip c                                    # `c` → the rest of the chain
-    let lNext = g.freshLabel()
-    branch.into:
-      g.emitCondJump(branch, lNext, whenTrue = false)
-      g.genActionStmts(branch)
-      g.emJmp(lEnd)
-    g.emLab(lNext)
-    g.emitChain(c, lEnd)
-  of ElseU:
-    c.into:
-      g.genActionStmts(c)
-  else:
-    skip c
-
-proc genIf(g: var CodeGen; c: var Cursor) =
-  let lEnd = g.freshLabel()
-  c.into:
-    g.emitChain(c, lEnd)
-  g.emLab(lEnd)
-
-
-proc cmpImm(g: var CodeGen; selReg: Reg; v: int64) =
-  ## `cmp selReg, v` — immediate when small, else via a scratch register.
-  if v >= 0 and v <= 0xFFFF:
-    g.ab.tree CmpX64: (g.emReg selReg; g.ab.intLit v)
-  else:
-    let tmp = g.borrowTmp(ScalarSlot)
-    g.movImm(tmp, v)
-    g.ab.tree CmpX64: (g.emReg selReg; g.emReg tmp)
-    g.giveBack tmp
-
-proc emitRangeTest(g: var CodeGen; selReg: Reg; c: var Cursor;
-                   lBody: string; signed: bool) =
-  ## One `BranchRange` against `selReg`; jump to `lBody` on a match.
-  if c.kind == TagLit and c.substructureKind == RangeU:
-    c.into:
-      let lo = branchImm(c)
-      let hi = branchImm(c)
-      let lSkip = g.freshLabel()              # match iff lo <= sel <= hi
-      g.cmpImm(selReg, lo)
-      g.emJcc(if signed: JlX64 else: JbX64, lSkip)
-      g.cmpImm(selReg, hi)
-      g.emJcc(if signed: JgX64 else: JaX64, lSkip)
-      g.emJmp(lBody)
-      g.emLab(lSkip)
-  else:
-    g.cmpImm(selReg, branchImm(c))
-    g.emJcc(JeX64, lBody)
-
-proc genCase(g: var CodeGen; c: var Cursor) =
-  ## `(case Expr (of (ranges BranchRange+) StmtList)* (else StmtList)?)`. Selector
-  ## → a register; each branch's tests jump to its body; a non-match falls through
-  ## to `else` (or the end). NIFC `case` has no fall-through, so bodies end in a jmp.
-  let lEnd = g.freshLabel()
-  c.into:
-    let signed = not g.cmpOperandUnsigned(c)          # selector type drives test signedness
-    var sel = g.genVal(c); g.forceReg(sel)            # selector, live across all tests
-    let selReg = sel.r
-    var bodies: seq[(string, Cursor)] = @[]
-    var elseBody = c
-    var hasElse = false
-    while c.hasMore:
-      case c.substructureKind
-      of OfU:
-        let lBody = g.freshLabel()
-        var branch = c
-        skip c
-        branch.into:                          # branch → (ranges …) then StmtList
-          assert branch.substructureKind == RangesU, "arkham x64: case `of` needs `ranges`"
-          branch.into:
-            while branch.hasMore:
-              g.emitRangeTest(selReg, branch, lBody, signed)
-          bodies.add (lBody, branch)
-          skip branch
-      of ElseU:
-        elseBody = c; hasElse = true; skip c
-      else: skip c
-    g.freeTemp(sel)
-    if hasElse:
-      elseBody.into:
-        g.genActionStmts(elseBody)
-    g.emJmp(lEnd)
-    for (lBody, bc) in bodies:
-      g.emLab(lBody)
-      var body = bc
-      g.genActionStmts(body)
-      g.emJmp(lEnd)
-  g.emLab(lEnd)
-
-proc genStmt(g: var CodeGen; c: var Cursor) =
-  if c.kind == DotToken:                       # an empty statement (e.g. `(stmts .)`)
-    inc c; return
-  case c.stmtKind
-  of ScopeS:                                  # only `scope` is a fresh scope
-    g.enterScope()                            # register locals here `kill` at close
-    c.into:
-      while c.hasMore: genStmt(g, c)
-    g.exitScope()
-  of StmtsS:                                  # a statement list — not a fresh scope
-    c.into:
-      while c.hasMore: genStmt(g, c)
-  of VarS, GvarS, TvarS, ConstS:
-    genVarDecl(g, c)
-  of CallS:
-    genCall(g, c)
-  of AsgnS:
-    genAsgn(g, c)
-  of WhileS:
-    genWhile(g, c)
-  of IfS:
-    genIf(g, c)
-  of CaseS:
-    genCase(g, c)
-  of BreakS:
-    genBreak(g, c)
-  of RetS:
-    # The Linux entry must terminate the process; a normal proc returns in rax.
-    if g.isEntryProc:
-      c.into:
-        if c.hasMore and c.kind != DotToken: g.genInto(c, RDI)  # exit code → rdi
-        else: g.movImm(RDI, 0)
-        while c.hasMore: skip c                # void `(ret .)` → drop the `.`
-      g.movImm(RAX, LinuxX64ExitNr)
-      g.emSyscall()
-    else:
-      c.into:
-        if c.hasMore and c.kind != DotToken:
-          if g.retIndirect:
-            # >16B: copy the result into the caller's buffer (parked in rbx) and
-            # return its address in rax (SysV: the hidden pointer is also returned).
-            assert c.kind == Symbol, "arkham x64 v0: aggregate ret value must be a local"
-            g.copyStructThroughPtr(symName(c), g.retAggrName, g.indirectReg)
-            g.movReg(RAX, g.indirectReg)
-            inc c
-          elif g.retAggrName.len > 0:         # ≤16B aggregate → rax:rdx
-            assert c.kind == Symbol, "arkham x64 v0: aggregate ret value must be a local"
-            g.structToRegs(symName(c), g.retAggrName, x64RetRegs)
-            inc c
-          elif g.retIsFloat:
-            g.genIntoF(c, FloatRet, g.retFloatBits)   # float result in xmm0
-          else:
-            g.genInto(c, RAX)
-        while c.hasMore: skip c               # void `(ret .)` → drop the `.`
-      g.killFrameRegLocals()                  # release locals bound to popped regs
-      g.framePop()                            # restore callee-saved before returning
-      g.ab.keyword RetX64
-  of LabS:                                    # `(lab :name)` — a goto target
-    c.into:
-      g.emLab(symName(c)); inc c
-      while c.hasMore: skip c
-  of JmpS:                                     # `(jmp name)` — unconditional goto
-    c.into:
-      g.emJmp(symName(c)); inc c
-      while c.hasMore: skip c
-  else:
-    raiseAssert "arkham x64 v0: statement not supported: " & $c.stmtKind
-
 # ── type + proc + module emission ───────────────────────────────────────────
 # genTypeBody/genType emit nifasm `NifasmType` tags (arch-neutral). TODO: share
 # with codegen_a64 by lifting these into codegen_common.
@@ -3658,50 +3391,14 @@ proc genTvar(g: var CodeGen; name: string; decl: Cursor) =
     while c.hasMore: skip c
 
 
-proc emitProcBody(g: var CodeGen; info: ProcInfo; declarative: bool) =
-  ## Emit one proc's `(proc …)` (signature + body). Run twice by `genProc`: once
-  ## in planning mode (emission suppressed, scratch decisions recorded), once for
-  ## real (decisions replayed). Reads the per-proc `ret*`/frame state set up by
-  ## `genProc`; touches only state `genProc` resets between the two passes.
-  g.ab.tree ProcD:
-    g.ab.symDef info.asmName
-    g.emitSignature(info.decl, declarative)
-    g.ab.tree StmtsX64:
-      g.enterScope()                          # the proc body's scope
-      g.framePush()                           # save the used callee-saved GPRs
-      g.emitStackParamLoadsX64(info.decl)      # incoming 7th+ args → their reg homes
-      if g.framePad > 0:                      # 16-byte alignment for outgoing calls
-        g.binImm(SubX64, RSP, g.framePad.int64)
-      if g.ra.hasStackVars:                   # reserve nifasm-managed `(s)` slots so
-        g.ab.tree SubX64: g.ab.reg RSP; g.ab.keyword SsizeX  # they sit above rsp (call-safe)
-      if g.retIndirect: g.movReg(g.indirectReg, RDI)   # park the hidden result ptr
-      g.emitParamMoves(info.decl, declarative)         # settle register params
-      # The thread-local FS base is set up by nifasm (the linker owns the unified
-      # `arkham.tls.0` block across all bundled modules); see the entry prologue it
-      # synthesizes. arkham just references the block for `&tvar` / `FS:[off]`.
-      if info.isEntry: g.emitGlobalInits()    # run module-level var initializers
-      var c = info.decl
-      c.into:
-        inc c; skip c; skip c; skip c         # name, params, return type, pragmas
-        if c.stmtKind == StmtsS:
-          genStmt(g, c)
-      g.exitScope()                           # `kill` the proc's register locals
-      # Fallthrough terminator: the entry exits the process; a normal proc
-      # restores its frame and returns.
-      if info.isEntry:
-        g.movImm(RAX, 60); g.movImm(RDI, 0); g.emSyscall()
-      else:
-        g.framePop()
-        g.ab.keyword RetX64
-
-# ── value-core rewrite: the PURE emitter (consumes precomputed locs/aux) ───────
+# ── value-core: the PURE emitter (consumes precomputed locs/aux) ──────────────
 # Single-pass: the register allocator (allocExprs=true) has already assigned every
 # value position a Location in `g.ra.locs` (+ `aux`); this code only emits bytes,
 # making NO register decisions — so there is no plan/replay seam. See
-# `codegen2_design.md`. Coverage so far: leaf integer procs (params/locals/ret,
-# integer leaves + binary arithmetic). A proc that uses anything else routes to the
-# legacy reactive `emitProcBody` (per-proc opt-in via `procModeled2`). As coverage
-# grows the legacy path shrinks, then deletes.
+# `codegen2_design.md`. Every proc body is emitted through this path (`genProc` →
+# `emitProcBody2`); the old reactive statement emitter has been deleted. The only
+# remaining use of the legacy `gen…` expression emitter is `emitGlobalInits`
+# (entry-time global-variable initializers), pending its port to this path.
 
 proc valModeled2(g: var CodeGen; c: Cursor): bool
 proc fvalModeled2(g: var CodeGen; c: Cursor): bool
@@ -5968,18 +5665,14 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
       skip pc                                      # pragmas
       if pc.stmtKind == StmtsS: g.recordSymTypes(pc)
       while pc.hasMore: skip pc                    # drain (body + any trailing)
-  # THE FLIP (value-core rewrite): the new pure-emit path is now the ONLY path. The
-  # `procModeled2` gate and the `exprUnsupported`→legacy fallback are gone — every proc
-  # is allocated with `allocExprs=true` and emitted by `emitProcBody2`. Constructs the
-  # new path does not yet handle raiseAssert / miscompile; the tests that exercise them
-  # are quarantined in `arkhamKnownUnsupported` (tester) until their family is ported.
-  # The legacy reactive core (`emitProcBody`/`gen…`) stays in-tree (still reached by
-  # `emitGlobalInits`) until that too is ported and the whole seam is deleted.
-  const useNew = true
+  # The pure-emit path is the ONLY path: every proc is allocated with
+  # `allocExprs=true` and emitted by `emitProcBody2`. The legacy reactive proc-body
+  # emitter (`emitProcBody`/`genStmt`/…) has been deleted; only the `gen…` expression
+  # emitter survives, used by `emitGlobalInits` until that too is ported.
   var atScratch = initHashSet[int]()
-  if useNew: g.collectAtScratch(info.decl, atScratch)   # global-rooted non-SIB `(at)` strides
+  g.collectAtScratch(info.decl, atScratch)   # global-rooted non-SIB `(at)` strides
   g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64Machine, g.typeCtx, preseal,
-                      allocExprs = useNew, atScratch = atScratch)
+                      allocExprs = true, atScratch = atScratch)
   when defined(arkhamTracePath):
     stderr.writeLine "[arkham] " & info.asmName & ": NEW"
   when defined(arkhamDumpLocs):
@@ -6003,61 +5696,16 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.initFreeTmp()
   g.computeFrameX64(info.isEntry, an.hasCall)
   let declarative = isDeclarativeAbi(g.prog, info.decl)
-  if useNew:
-    # Pure-emit path: the allocator already assigned every value position; emit once.
-    g.ab.planning = false
-    g.regLocal.clear(); g.aliasToDecl.clear(); g.boundTemps = {}; g.scopeLocals = @[]
-    g.fregLocal.clear(); g.boundFTmps = {}; g.scopeFLocals = @[]; g.savedHomes.clear()
-    g.spillCount = 0; g.tmpBindCount = 0; g.ftmpBindCount = 0
-    when defined(arkhamDbgProc):
-      block:
-        var pc = info.decl; inc pc
-        stderr.writeLine "DBG emit proc " & symName(pc)
-    g.emitProcBody2(info, declarative)
-    return
-  # Single walk, two modes. The plan pass runs `emitProcBody` with emission
-  # suppressed (`ab.planning`), so every scratch borrow is decided and recorded
-  # in `borrowLog`/`borrowLogF` (with the real pool + ABI seals) while no bytes
-  # are produced; the emit pass replays those decisions verbatim. Because the
-  # walk and its register decisions are identical, the emit pass reproduces the
-  # exact bytes a single inline-borrow pass would have — provably byte-identical.
-  # (Spill-on-exhaustion and control-flow/cmov planning build on this seam.)
-  # The plan pass no longer touches `labelCount`/`rodata` (see `freshLabel` /
-  # the StrLit case), so the emit pass numbers labels exactly as a single pass
-  # would — no snapshot/restore of those is needed.
-  let sealedSnapshot = g.ra.sealed
-  # A codegen-time steal evicts a local by mutating `g.ra.locs` mid-walk; snapshot
-  # it so the emit pass starts from the same allocation the plan pass saw and
-  # re-applies the (identically replayed) evictions itself.
-  let locsSnapshot = g.ra.locs
-  g.stealEvents.clear()
-  g.fixedEvicts.clear(); g.fixedEvictSeq = 0
-  g.borrowLog.setLen 0; g.borrowLogF.setLen 0
-  g.borrowIdx = 0; g.borrowIdxF = 0
-  g.ab.planning = true
-  g.emitProcBody(info, declarative)
+  # Pure-emit path: the allocator already assigned every value position; emit once.
   g.ab.planning = false
-  g.ra.locs = locsSnapshot                     # undo plan-pass evictions for the emit pass
-  # Reset the per-proc emission state the plan pass dirtied, so the emit pass
-  # reproduces a single-pass result. (The `ret*`/frame fields were fixed in setup
-  # above and stay constant across the two passes.)
-  g.ra.sealed = sealedSnapshot
-  g.varType.clear()
-  g.symType.clear()
-  g.regLocal.clear()
-  g.boundTemps = {}
-  g.scopeLocals = @[]
-  g.fregLocal.clear()
-  g.boundFTmps = {}
-  g.scopeFLocals = @[]
-  g.loopEnds = @[]
-  g.initFreeTmp()
-  g.borrowIdx = 0; g.borrowIdxF = 0
-  g.fixedEvictSeq = 0                          # replay the same eviction sequence
-  g.spillCount = 0
-  g.tmpBindCount = 0
-  g.ftmpBindCount = 0
-  g.emitProcBody(info, declarative)            # emit for real, replaying the plan
+  g.regLocal.clear(); g.aliasToDecl.clear(); g.boundTemps = {}; g.scopeLocals = @[]
+  g.fregLocal.clear(); g.boundFTmps = {}; g.scopeFLocals = @[]; g.savedHomes.clear()
+  g.spillCount = 0; g.tmpBindCount = 0; g.ftmpBindCount = 0
+  when defined(arkhamDbgProc):
+    block:
+      var pc = info.decl; inc pc
+      stderr.writeLine "DBG emit proc " & symName(pc)
+  g.emitProcBody2(info, declarative)
 
 proc genGlobal(g: var CodeGen; name: string; decl: Cursor) =
   ## `(gvar :name <type>)` — a zero-initialized `.bss` global (also `const`); any
