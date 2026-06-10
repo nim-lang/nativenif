@@ -973,6 +973,30 @@ proc allocDivMod(b: var Builder; n: var Cursor; dest: var Location) =
   else: discard                                      # fixed dest: emitter moves result → it
   b.ra.locs[pos] = dest
 
+proc allocDivModRisc(b: var Builder; n: var Cursor; dest: var Location) =
+  ## RISC `div`/`mod` (`md.divRemReg == NoReg`, e.g. AArch64 sdiv/udiv): no fixed
+  ## register, no immediate/memory divisor form. Both operands take registers; the
+  ## result reuses the dividend's register when it is a dead temp (a 2-operand
+  ## `sdiv dest, dest, divisor`), else a fresh temp. `mod` is lowered by the emitter
+  ## to `dest - (dest div b)*b` using a staging-bridge quotient temp — no extra
+  ## allocator scratch is reserved.
+  let pos = b.posOf(n)
+  var lDest = needsReg(ScalarSlot)            # dividend → a register (becomes dest)
+  var rDest = needsReg(ScalarSlot)            # divisor → a register (no imm/mem form)
+  n.into:
+    skip n                                    # result type
+    allocValue(b, n, lDest)
+    allocValue(b, n, rDest)
+    while n.hasMore: skip n
+  b.releaseTmp(rDest)
+  case dest.kind
+  of Undef, NeedsReg, RegOrImm:
+    if lDest.kind == InReg and lDest.isTemp: dest = lDest
+    else: dest = b.reserveTmp(ScalarSlot)
+  else: discard
+  if not sameReg(dest, lDest): b.releaseTmp(lDest)
+  b.ra.locs[pos] = dest
+
 proc forceRegDest(b: var Builder; dest: var Location) =
   ## Ensure a value's `dest` is a register: a `NeedsReg`/`RegOrImm` constraint becomes
   ## a fresh temp typed as requested (keeping the precise type, so a store to a typed
@@ -1005,6 +1029,8 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
     of AddC, SubC, MulC, BitandC, BitorC, BitxorC, ShlC, ShrC:
       allocBin(b, n, dest); return           # records locs[pos] itself
     of DivC, ModC:
+      if b.md.divRemReg == NoReg:
+        allocDivModRisc(b, n, dest); return  # RISC: plain ALU, no fixed regs
       allocDivMod(b, n, dest); return        # records locs[pos] itself
     of EqC, NeqC, LtC, LeC, AndC, OrC, NotC:
       # A comparison / and/or/not used as a 0/1 VALUE: the result needs a register;

@@ -22,18 +22,6 @@ export typenav   # SymCat / SymInfo / getType / exprSlot moved here; re-export s
                  # the backends' `g.lookupSym(...).cat` etc. keep resolving
 
 type
-  StealEvent* = object
-    victim*: string      ## the evicted local's *allocator* name (its `symPos` key)
-    bindName*: string    ## its nifasm *binding* name — usually == `victim`, but a
-                         ## declarative param's arg register is bound to the signature
-                         ## alias `pN.0`, which is what must be `kill`ed
-    slot*: string        ## the stack slot it was moved to (distinct basename)
-    reg*: Reg            ## the register freed for scratch
-    typ*: AsmSlot        ## the victim's slot type (for the stack-slot decl)
-    live*: bool          ## did the register hold the victim's live value? (false for a
-                         ## FUTURE local whose home reg — reused from a just-dead local —
-                         ## is stolen before its own decl: nothing of the victim to save)
-
   CodeGen* = object
     ab*: AsmBuf
     ra*: RegAlloc
@@ -46,12 +34,6 @@ type
     tvarNames*: HashSet[string]              ## tvar names, for the per-proc analyser
     freeTmp*: set[Reg]                       ## volatile temps free for scratch
     freeFTmp*: set[FReg]                     ## volatile SIMD/FP temps free for scratch
-    borrowLog*: seq[Reg]                     ## scratch-register decisions recorded in
-                                             ## walk order by the planning pass; replayed
-                                             ## verbatim by the emit pass (single walk,
-                                             ## two modes — see `genProc`)
-    borrowLogF*: seq[FReg]                   ## ditto for SIMD scratch
-    borrowIdx*, borrowIdxF*: int             ## replay cursors into the logs above
     spillCount*: int                         ## fresh-spill-slot counter (per proc): when
                                              ## the scratch pool is exhausted, a computed
                                              ## value is materialized into an `(s)` slot
@@ -130,19 +112,6 @@ type
                                              ## staging reg for the lval emission; its original
                                              ## `NamedStack`/`Mem` home is parked here (keyed by
                                              ## value position) and restored by `unbindLvalTemps2`.
-    stealEvents*: Table[int, StealEvent]     ## borrow-log index → a codegen-time
-                                             ## register steal (evict a live local
-                                             ## to a stack slot); recorded in the
-                                             ## plan pass, replayed (with the spill
-                                             ## store) in the emit pass.
-    fixedEvicts*: Table[int, StealEvent]     ## call-order index → an eviction forced
-                                             ## by a fixed-physical-register
-                                             ## instruction about to clobber a reg
-                                             ## that still holds a live local (idiv →
-                                             ## RDX, byteCopyConst → RCX). Same
-                                             ## plan-record / emit-replay model as
-                                             ## `stealEvents`, keyed by `fixedEvictSeq`.
-    fixedEvictSeq*: int                      ## replay counter into `fixedEvicts`
     hasGlobalInits*: bool                     ## the module has runtime (non-static) global
                                              ## initializers, emitted as a synthetic init
                                              ## proc the entry calls (see `buildGlobalInitProc`)
