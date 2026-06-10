@@ -1880,20 +1880,22 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
           g.structToRegs(vn, tn, intIdx)
           intIdx += nw
       elif a.kind == TagLit and a.exprKind in {OconstrC, AconstrC}:
-        # An aggregate CONSTRUCTOR passed directly as an argument: build it into a
-        # synthetic stack temp through the general genStore2 (oconstr field-by-field /
-        # aconstr element-by-element), then marshal that temp by the ordinary aggregate
-        # ABI — >16B by reference (a pointer in one GPR), else its words by value.
+        # An aggregate CONSTRUCTOR value argument: build it into a synthetic aggregate
+        # temp through the general `genStore2` (the same path a var-init / asgn uses),
+        # then marshal that temp by the ordinary aggregate ABI (by-reference &temp → one
+        # GPR, or by-value words → x{n}). The allocator already placed the element-value
+        # temps via `allocStore` into an unnamed slot; we name + declare it here. Mirrors
+        # the x64 non-declarative path.
         var tcur = a; inc tcur                            # the constructed type
         let tn = symName(tcur)
         let tmpName = "octmp" & $g.posOf(a) & ".0"
-        g.emTypedStackVar(tmpName, tcur)
-        g.varType[tmpName] = tn
+        g.emTypedStackVar(tmpName, tcur)                  # declare the slot
+        g.varType[tmpName] = tn                           # so emAggrFieldMem/structToRegs resolve it
         g.genStore2(a, namedStackLoc(tmpName, slotOf(g.prog, tcur)), g.posOf(a))
-        if aggrByteSize(g.prog, tn) > 16:
+        if aggrByteSize(g.prog, tn) > 16:                 # by-reference: &temp → one GPR
           g.ab.tree LeaA64: (g.emReg IntArgRegs[intIdx]; g.ab.sym tmpName)
           inc intIdx
-        else:
+        else:                                             # by-value: words → GPRs
           let nw = aggrWordCount(g.prog, tn)
           g.structToRegs(tmpName, tn, intIdx)
           intIdx += nw
@@ -2044,16 +2046,26 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
   let dst = g.ra.locs[pos]
   if dst.kind == InFReg:
     g.emitFValue2(c); return
+  if dst.kind in {NamedStack, Mem} and dst.isTemp:
+    # A value position the allocator spilled to a fresh `(s)` slot (`etmpN.0`) because
+    # the register pool was exhausted — produce it into the bridge and store it. This
+    # covers EVERY node kind uniformly (a leaf symbol/literal *as well as* a computed
+    # node), mirroring x64: a spilled leaf operand must still be evaluated and stored,
+    # otherwise the slot is read uninitialized by the consumer.
+    g.produceIntoMem2(c, pos, dst)
+    return
   if dst.kind in {NamedStack, Mem, Glob, Tvar, Imm}:
-    # An `isTemp` NamedStack is a produce-into spill slot the allocator handed this
-    # position when the register pool was exhausted (`reserveTmp`). Its value — a
-    # computed result OR a leaf the allocator forced into a register (a symbol read,
-    # a literal) that then spilled — must be PRODUCED into the slot via the staging
-    # bridge; the slot is otherwise empty. A non-temp NamedStack/Mem/Glob/Tvar/Imm is a
-    # leaf left in place (a resident local's home, a global, a folded immediate / lvalue)
-    # the consumer reads directly — nothing to materialize.
-    if dst.kind == NamedStack and dst.isTemp:
-      g.produceIntoMem2(c, pos, dst)
+    # A leaf the allocator left in place (folded immediate / a resident local /
+    # global / foldable lvalue): nothing to materialize — the consumer reads it.
+    if c.kind == TagLit and c.exprKind in {AddC, SubC, MulC, DivC, ModC, ShlC, ShrC,
+        BitandC, BitorC, BitxorC, NegC, BitnotC, NotC, EqC, NeqC, LtC, LeC, AndC, OrC,
+        DerefC, DotC, AtC, PatC, AddrC, CastC, ConvC, CallC}:
+      # A computed node whose result was spilled to a non-temp NamedStack/Mem slot
+      # (dest-passed into a real local's home). (The isTemp spill case is handled by
+      # the `dst.isTemp` produce-into block above, for every node kind.)
+      if dst.kind in {NamedStack, Mem}:
+        g.produceIntoMem2(c, pos, dst)
+        return
     return
   if dst.kind == InReg and dst.isTemp and c.kind in {IntLit, UIntLit, CharLit}:
     g.bindTemp(dst.r, dst.typ)

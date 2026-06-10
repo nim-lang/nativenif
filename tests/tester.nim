@@ -25,19 +25,12 @@ proc execExpectOutput(cmd: string; expected: string) =
     quit "UNEXPECTED OUTPUT " & cmd & "\nExpected:\n" & expected & "\nGot:\n" & s
 
 const arkhamKnownUnsupported: seq[string] =
-  when defined(macosx):
-    # The native macOS pass targets AArch64, whose reactive emitter does not yet
-    # handle the runtime `(aconstr …)` array constructor as a direct call argument
-    # — that flows through value-core paths implemented only on x86-64 for now.
-    # We focus on x86 for the moment; re-enable when the a64 backend catches up.
-    @["aconstr_arg", "aconstr_field"]
-  else:
-    # value-core rewrite — THE FLIP: the x86-64 backend emits EVERY proc through the
-    # new pure-emit path (no `procModeled2` gate, no legacy fallback). The whole
-    # corpus now routes through it cleanly — register-pressure totality for deep
-    # right-nested expression trees is handled by the Sethi–Ullman reorder in
-    # allocBin/allocFBin (no quarantine remains).
-    @[]
+  # Both backends now route the whole corpus through the value-core pure-emit path:
+  # register-pressure totality for deep right-nested expression trees (the Sethi–Ullman
+  # reorder in allocBin/allocFBin, plus the produce-into-memory spill bridge) and the
+  # runtime `(aconstr …)`/`(oconstr …)` constructor as a direct call argument are both
+  # handled on x86-64 AND AArch64. No quarantine remains.
+  @[]
 
 proc arkhamTests() =
   ## Each `tests/arkham/*.c.nif` is hand-written NIFC: arkham generates asm-NIF,
