@@ -1879,6 +1879,24 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
           let nw = aggrWordCount(g.prog, tn)
           g.structToRegs(vn, tn, intIdx)
           intIdx += nw
+      elif a.kind == TagLit and a.exprKind in {OconstrC, AconstrC}:
+        # An aggregate CONSTRUCTOR passed directly as an argument: build it into a
+        # synthetic stack temp through the general genStore2 (oconstr field-by-field /
+        # aconstr element-by-element), then marshal that temp by the ordinary aggregate
+        # ABI — >16B by reference (a pointer in one GPR), else its words by value.
+        var tcur = a; inc tcur                            # the constructed type
+        let tn = symName(tcur)
+        let tmpName = "octmp" & $g.posOf(a) & ".0"
+        g.emTypedStackVar(tmpName, tcur)
+        g.varType[tmpName] = tn
+        g.genStore2(a, namedStackLoc(tmpName, slotOf(g.prog, tcur)), g.posOf(a))
+        if aggrByteSize(g.prog, tn) > 16:
+          g.ab.tree LeaA64: (g.emReg IntArgRegs[intIdx]; g.ab.sym tmpName)
+          inc intIdx
+        else:
+          let nw = aggrWordCount(g.prog, tn)
+          g.structToRegs(tmpName, tn, intIdx)
+          intIdx += nw
       else:
         g.emitValue2(a)
         inc intIdx
@@ -2027,15 +2045,15 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
   if dst.kind == InFReg:
     g.emitFValue2(c); return
   if dst.kind in {NamedStack, Mem, Glob, Tvar, Imm}:
-    # A leaf the allocator left in place (folded immediate / a resident local /
-    # global / foldable lvalue): nothing to materialize — the consumer reads it.
-    if c.kind == TagLit and c.exprKind in {AddC, SubC, MulC, DivC, ModC, ShlC, ShrC,
-        BitandC, BitorC, BitxorC, NegC, BitnotC, NotC, EqC, NeqC, LtC, LeC, AndC, OrC,
-        DerefC, DotC, AtC, PatC, AddrC, CastC, ConvC, CallC}:
-      # A computed node whose result was spilled to a NamedStack/Mem slot.
-      if dst.kind in {NamedStack, Mem}:
-        g.produceIntoMem2(c, pos, dst)
-        return
+    # An `isTemp` NamedStack is a produce-into spill slot the allocator handed this
+    # position when the register pool was exhausted (`reserveTmp`). Its value — a
+    # computed result OR a leaf the allocator forced into a register (a symbol read,
+    # a literal) that then spilled — must be PRODUCED into the slot via the staging
+    # bridge; the slot is otherwise empty. A non-temp NamedStack/Mem/Glob/Tvar/Imm is a
+    # leaf left in place (a resident local's home, a global, a folded immediate / lvalue)
+    # the consumer reads directly — nothing to materialize.
+    if dst.kind == NamedStack and dst.isTemp:
+      g.produceIntoMem2(c, pos, dst)
     return
   if dst.kind == InReg and dst.isTemp and c.kind in {IntLit, UIntLit, CharLit}:
     g.bindTemp(dst.r, dst.typ)
