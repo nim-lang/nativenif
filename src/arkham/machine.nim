@@ -30,16 +30,32 @@ const
   ## need to survive a call. (x0–x7 are also volatile but reserved here for
   ## arg/return shuffling; x16/x17/x18 are reserved by the platform.)
   IntTempRegs* = [R9, R10, R11, R12, R13, R14, R15]
+  ## The pure-emit value core reserves the two integer bridges out of the pool.
+  IntTempRegsN* = [R9, R10, R11, R12, R13]
   ## Callee-saved: for values that must survive a call.
   IntCalleeSaved* = [R19, R20, R21, R22, R23, R24, R25, R26, R27, R28]
   ## Caller-saved set clobbered across any call (incl. an extcall).
   IntCallerSaved* = {R0..R17}
+
+  ## Emitter "staging bridge" registers — reserved OUT of the allocator's temp
+  ## pools (the pure-emit value core's analogue of x86-64's r11/xmm15). They are
+  ## never assigned to a value position, so the emitter can always draw a free
+  ## transient for: a folded memory operand a64's 3-operand ALU must first load,
+  ## a global/tvar address temp, and a produce-into-memory spill. Two integer
+  ## bridges are needed because a `cmp` whose BOTH operands spilled to the stack
+  ## must load each into a register (a64 has no memory-operand compare).
+  IntBridgeRegs* = [R14, R15]
+  FloatBridgeReg* = F31
+
   ## Caller-saved SIMD/FP scratch: v16–v31 are fully caller-saved (and v0–v7
   ## are argument/return registers, also caller-saved). arkham keeps float
   ## values in these; a float that must survive a call (v8–v15 callee-saved)
   ## is not yet supported.
   FloatTempRegs* = [F16, F17, F18, F19, F20, F21, F22, F23,
                     F24, F25, F26, F27, F28, F29, F30, F31]
+  ## The pure-emit value core reserves v31 out of the pool as the float bridge.
+  FloatTempRegsN* = [F16, F17, F18, F19, F20, F21, F22, F23,
+                     F24, F25, F26, F27, F28, F29, F30]
   ## Callee-saved (low 64 bits of v8–v15) — reserved for a future FP frame.
   FloatCalleeSaved* = [F8, F9, F10, F11, F12, F13, F14, F15]
 
@@ -68,6 +84,26 @@ const
                                      # so a call-free local may be homed in the temp pool
     intCalleeSaved: @IntCalleeSaved,
     floatTempRegs: @FloatTempRegs,
+    floatCalleeSaved: @FloatCalleeSaved,
+    intCalleeSavedSet: {R19..R28},
+    floatCalleeSavedSet: {F8..F15},
+    aggrByRefThreshold: 16)
+
+  ## The machine description for the NEW pure-emit value core (`genProc2`): identical
+  ## to `aarch64Machine` except the two integer bridges (x14/x15) and the float bridge
+  ## (v31) are withheld from the allocator's temp pools, so the emitter can always draw
+  ## a free transient (see `IntBridgeRegs`/`FloatBridgeReg`).
+  aarch64MachineN* = MachineDesc(
+    arch: Arm64,
+    intRetReg: R0,
+    divRemReg: NoReg,
+    shiftCountReg: NoReg,
+    intArgRegs: @IntArgRegs,
+    floatArgRegs: @FloatArgRegs,
+    intTempRegs: @IntTempRegsN,
+    intLocalTempRegs: @IntTempRegsN,
+    intCalleeSaved: @IntCalleeSaved,
+    floatTempRegs: @FloatTempRegsN,
     floatCalleeSaved: @FloatCalleeSaved,
     intCalleeSavedSet: {R19..R28},
     floatCalleeSavedSet: {F8..F15},

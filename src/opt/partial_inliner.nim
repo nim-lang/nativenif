@@ -101,7 +101,7 @@ proc trProcDecl(c: var Context; dest: var TokenBuf; n: var Cursor) =
   let decl = n
   c.typeCache.openScope()
   dest.add n
-  var r = takeRoutinen, SkipExclBody)
+  var r = takeRoutine(n, SkipExclBody)
   let oldThisRoutine = c.thisRoutine
   c.thisRoutine = r.name.symId
   copyTree dest, r.name
@@ -537,7 +537,7 @@ proc shouldInlineCall(c: var Context; n: Cursor; routine: var Routine): InlineMo
         routine = asRoutine(s.decl)
         if routine.kind in {ProcY, FuncY, ConverterY}:
           # Check explicit .inline pragma first
-          if shouldInlineRoutineroutine.pragmas):
+          if shouldInlineRoutine(routine.pragmas):
             result = FullInline
           else:
             # Check weight-based heuristic
@@ -703,7 +703,7 @@ proc mapParamToLocal(c: var InlineContext; dest: var TokenBuf; args: var Cursor;
   let p = params
   let r = takeLocal(params, SkipFinalParRi)
   if r.typ.typeKind == VarargsT: params = p
-  if isCompileTimeTyper.typ):
+  if isCompileTimeType(r.typ):
     skip args # ignore compile-time parameters for inlining purposes
   else:
     let info = args.info
@@ -716,12 +716,12 @@ proc mapParamToLocal(c: var InlineContext; dest: var TokenBuf; args: var Cursor;
       if typeIsBig(r.typ, c.c.ptrSize) and not constructsValue(args):
         c.newVars[id] = VarReplacement(sym: freshId, needsDeref: true)
         copyIntoKind dest, PtrT, info:
-          dest.copyTreer.typ)
+          dest.copyTree(r.typ)
         copyIntoKind dest, AddrX, info:
           tr c.c[], dest, args
       else:
         c.newVars[id] = VarReplacement(sym: freshId, needsDeref: false)
-        dest.copyTreer.typ)
+        dest.copyTree(r.typ)
         tr c.c[], dest, args
 
 proc doPartialInline(outer: var Context; dest: var TokenBuf; procCall: var Cursor;

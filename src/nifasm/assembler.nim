@@ -5422,20 +5422,10 @@ proc writeElf(a: var GenContext; outfile: string) =
   ehdr.e_phnum = 2  # Two program headers: .text and .bss
   ehdr.e_phoff = 64  # Program headers start after ELF header
 
-  # .text program header (executable, readable)
-  # Starts at file offset 0, includes headers + code. `p_filesz == p_memsz`
-  # (both the page-aligned `textMemSize`): the page padding is written to the file
-  # below, so the segment has NO zero-fill tail. A non-writable PT_LOAD whose
-  # `memsz > filesz` (a bss tail in an R+X segment) is rejected by stricter loaders
-  # such as qemu-user ("PT_LOAD with non-writable bss"); real bss lives in the
-  # separate writable `bssPhdr`.
-  var textPhdr = initPhdr(textOffset, textVaddr, textMemSize, textMemSize, PF_R or PF_X)
-
-  # .bss program header (writable, readable, not executable). Normally `.bss` is
-  # zero-initialized by the loader (p_filesz = 0). When some gvars have constant
-  # static initializers (`a.bssInits` — e.g. `stdout = 1`), the segment is instead
-  # file-backed: an on-disk image holds those bytes (the rest zero), so the slots
-  # start with their values without any entry-time init code (correct in a bundle).
+  # Build the initialized .bss image (constant static initializers — e.g. `stdout = 1`,
+  # or a gvar's compile-time value) FIRST, so the single LOAD segment below can size its
+  # file/mem extents to cover it. The on-disk image holds those bytes (the rest zero),
+  # so the slots start initialized with no entry-time code (correct in a bundle).
   var bssImage: seq[byte]
   if a.bssInits.len > 0 and bssSize > 0:
     bssImage = newSeq[byte](bssSize.int)
@@ -5443,10 +5433,22 @@ proc writeElf(a: var GenContext; outfile: string) =
       for i in 0 ..< it.size:
         if it.off.int + i < bssImage.len:
           bssImage[it.off.int + i] = byte((it.val shr (8 * i)) and 0xFF)
-  # The bss content (if any) is written right after the .text segment in the file.
-  let bssFileOff = if bssImage.len > 0: textMemSize else: 0'u64
   let bssFileSz = if bssImage.len > 0: bssSize else: 0'u64
-  var bssPhdr = initPhdr(bssFileOff, bssVaddr, bssFileSz, bssAlignedSize, PF_R or PF_W)
+
+  # ONE PT_LOAD covering headers + code AND the data/bss. Two separate PT_LOADs (an R+X
+  # text and an R+W bss) load fine under qemu-user, but the real Linux kernel maps the
+  # whole range with the *data* segment's permissions, leaving the code page non-
+  # executable (instruction-abort at the entry — every globals test SIGSEGVs on real
+  # AArch64). A single contiguous segment — the shape a gvar-less program (e.g. `hello`)
+  # already loads correctly — avoids it. R+X when there is no writable data, else R+W+X
+  # (writable, so the kernel accepts the `memsz > filesz` zero-fill bss tail).
+  let segFileSz = textMemSize + bssFileSz
+  let segMemSz = textMemSize + bssAlignedSize
+  let segFlags = if bssAlignedSize > 0: PF_R or PF_W or PF_X else: PF_R or PF_X
+  var textPhdr = initPhdr(textOffset, textVaddr, segFileSz, segMemSz, segFlags)
+  # Second header kept empty (e_phnum stays 2 ⇒ header size unchanged): a
+  # zero-filesz/zero-memsz PT_LOAD the kernel ignores (mirrors the gvar-less layout).
+  var bssPhdr = initPhdr(0'u64, bssVaddr, 0'u64, 0'u64, PF_R or PF_W)
 
   var f = newFileStream(outfile, fmWrite)
   defer: f.close()
