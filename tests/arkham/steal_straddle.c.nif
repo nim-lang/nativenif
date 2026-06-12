@@ -1,0 +1,63 @@
+(.nif27)
+(.indexat 919              )
+(stmts
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :h0.0 .
+    (i 64)10)
+   (var :h1.0 .
+    (i 64)20)
+   (var :h2.0 .
+    (i 64)30)
+   (var :h3.0 .
+    (i 64)40)
+   (var :h4.0 .
+    (i 64)80)
+   (var :s2.0 .
+    (i 64)
+    (add
+     (i 64)
+     (mul
+      (i 64)h0.0 h1.0)
+     (mul
+      (i 64)h2.0 h3.0)))
+   (var :s2b.0 .
+    (i 64)
+    (add
+     (i 64)
+     (mul
+      (i 64)h0.0 h1.0)
+     (mul
+      (i 64)h2.0 h3.0)))
+   (var :r.0 .
+    (i 64)
+    (div
+     (i 64)h4.0 8))
+   (var :s3.0 .
+    (i 64)
+    (add
+     (i 64)h0.0
+     (add
+      (i 64)h1.0
+      (add
+       (i 64)h2.0 h3.0))))
+   (call exit.c
+    (mod
+     (i 64)
+     (add
+      (i 64)r.0
+      (add
+       (i 64)s2.0
+       (add
+        (i 64)s2b.0 s3.0)))256)))))(.index)

@@ -32,6 +32,16 @@ const arkhamKnownUnsupported: seq[string] =
   # handled on x86-64 AND AArch64. No quarantine remains.
   @[]
 
+const arkhamDarwinUnsupported: seq[string] =
+  # The hand-written NIFC fixture bakes in a Linux flag constant that has a
+  # different numeric value on macOS, so the call genuinely fails on Darwin.
+  @[
+    # `mmap_anon` passes `flags = 34` (MAP_PRIVATE | MAP_ANONYMOUS where
+    # MAP_ANONYMOUS == 0x20 on Linux). On macOS MAP_ANON == 0x1000, so 34 is
+    # MAP_PRIVATE plus an unsupported bit and mmap returns MAP_FAILED.
+    "mmap_anon",
+  ]
+
 proc arkhamTests() =
   ## Each `tests/arkham/*.c.nif` is hand-written NIFC: arkham generates asm-NIF,
   ## nifasm assembles+links it to a native executable, and we check the run's exit
@@ -56,9 +66,11 @@ proc arkhamTests() =
   for file in walkFiles("tests" / "arkham" / "*.c.nif"):
     let base = extractFilename(file)
     if base.startsWith("mod_"): continue   # foreign helper, not standalone
+    let name = base[0 ..< base.len - ".c.nif".len]
+    when defined(macosx):
+      if name in arkhamDarwinUnsupported: continue  # Linux-only flag constant
     inc total
     let stem = file[0 ..< file.len - ".c.nif".len]
-    let name = base[0 ..< base.len - ".c.nif".len]
     let known = name in arkhamKnownUnsupported
     let asmNif = workDir / (name & ".asm.nif")
     let exe = workDir / (name & ".out")
