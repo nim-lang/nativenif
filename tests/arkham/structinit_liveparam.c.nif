@@ -1,0 +1,48 @@
+(.nif27)
+(.indexat 711              )
+(stmts
+ (type :Vec3.0 .
+  (object .
+   (fld :x.0 .
+    (i 64))
+   (fld :y.0 .
+    (i 64))
+   (fld :z.0 .
+    (i 64))))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :foo.0
+  (params
+   (param :a.0 .
+    (i 64))
+   (param :b.0 .
+    (i 64))
+   (param :c.0 .
+    (i 64))
+   (param :d.0 .
+    (i 64)))
+  (i 64).
+  (stmts
+   (var :p.0 . Vec3.0 .)
+   (asgn
+    (dot p.0 x.0)a.0)
+   (var :q.0 . Vec3.0 p.0)
+   (ret
+    (add
+     (i 64)
+     (dot q.0 x.0)d.0))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :r.0 .
+    (i 64)
+    (call foo.0 40 0 0 5))
+   (call exit.c r.0))))(.index)

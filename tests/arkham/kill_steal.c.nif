@@ -1,0 +1,75 @@
+(.nif27)
+(.indexat 1215             )
+(stmts
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :a0.0 .
+    (i 64)1)
+   (var :a1.0 .
+    (i 64)2)
+   (var :a2.0 .
+    (i 64)3)
+   (var :a3.0 .
+    (i 64)4)
+   (var :a4.0 .
+    (i 64)5)
+   (var :a5.0 .
+    (i 64)6)
+   (var :a6.0 .
+    (i 64)7)
+   (var :a7.0 .
+    (i 64)8)
+   (var :a8.0 .
+    (i 64)9)
+   (var :a9.0 .
+    (i 64)10)
+   (call exit.c
+    (add
+     (i 64)
+     (add
+      (i 64)a0.0
+      (add
+       (i 64)a1.0
+       (add
+        (i 64)a2.0
+        (add
+         (i 64)a3.0
+         (add
+          (i 64)a4.0
+          (add
+           (i 64)a5.0
+           (add
+            (i 64)a6.0
+            (add
+             (i 64)a7.0
+             (add
+              (i 64)a8.0 a9.0)))))))))
+     (add
+      (i 64)a0.0
+      (add
+       (i 64)a1.0
+       (add
+        (i 64)a2.0
+        (add
+         (i 64)a3.0
+         (add
+          (i 64)a4.0
+          (add
+           (i 64)a5.0
+           (add
+            (i 64)a6.0
+            (add
+             (i 64)a7.0
+             (add
+              (i 64)a8.0 a9.0))))))))))))))(.index)
