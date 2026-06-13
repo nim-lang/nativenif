@@ -1150,6 +1150,10 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
       b.resolveDest(dest, immLoc(1, ScalarSlot)); skip n
     of FalseC, NilC:
       b.resolveDest(dest, immLoc(0, ScalarSlot)); skip n
+    of OvfC:
+      # The overflow flag — always false (arkham uses wrapping arithmetic, see the
+      # `keepovf`/emitValue2 handling), so the `(if (ovf) …)` handlers are dead.
+      b.resolveDest(dest, immLoc(0, ScalarSlot)); skip n
     of SizeofC:
       var t = n; var sz = 0'i64
       t.into:
@@ -1181,14 +1185,22 @@ proc allocSingleUse(b: var Builder; n: var Cursor) =
 proc allocConstr(b: var Builder; n: var Cursor) =
   ## `(oconstr T (kv field value)+)` — allocate each field's value into a register
   ## (a SIMD temp for a float field) the emitter then stores to the field. Each is
-  ## single-use (store + free), so the temps recycle. Advances `n` past the oconstr.
+  ## single-use (store + free), so the temps recycle. A field whose value is itself
+  ## an aggregate (a nested `oconstr`/`aconstr`) is allocated through the general
+  ## `allocStore` (which recurses into `allocConstr`), exactly like an aggregate call
+  ## argument — the emitter builds it into a temp and copies it through the field
+  ## pointer. Advances `n` past the oconstr.
   n.into:
     skip n                                     # the constructed type
     while n.hasMore:
       n.into:                                  # (kv field value [depth])
         skip n                                 # field name
         if n.hasMore:
-          b.allocSingleUse(n)
+          if b.tc.exprSlot(n).cls == AMem:
+            b.ra.hasStackVars = true
+            allocStore(b, n, namedStackLoc("", b.tc.exprSlot(n)), b.posOf(n))
+          else:
+            b.allocSingleUse(n)
         while n.hasMore: skip n                 # optional inherited-depth INTLIT
 
 proc allocAconstr(b: var Builder; n: var Cursor) =
@@ -1219,6 +1231,15 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
     elif n.kind == Symbol:                               # whole-aggregate copy
       skip n
       b.auxScratch(auxPos, "an aggregate copy")          # one word-transfer scratch
+    elif n.kind == TagLit and n.exprKind in {DotC, DerefC, AtC, PatC}:
+      # whole-aggregate copy from a memory lvalue (an array element / field / deref,
+      # e.g. `$`'s `NegTen[i]`): allocate the lvalue's embedded base/index/stride regs,
+      # then release them (the index/pointer/stride temps die with the copy, exactly
+      # like the scalar mem-load path). The word-transfer register is picked at emit
+      # time (a sealed staging reg, so it can't collide) — no aux reservation here.
+      let lvCopy = n
+      allocLvalue2(b, n)                                 # advances n past the lvalue
+      releaseLvalTemps(b, lvCopy)
     else:
       raiseAssert "arkham: aggregate store rhs not supported: " & $n.exprKind
   elif dst.kind == Undef:                                # module-level global / threadvar
@@ -1379,6 +1400,25 @@ proc walk(b: var Builder; n: var Cursor) =
           let lhsCur = n
           skip n                                 # advance past the lhs to the rhs
           allocStore(b, n, memLoc(lhsCur, ScalarSlot), asgnPos)  # the one general store path
+        while n.hasMore: skip n
+    else:
+      n.into:
+        while n.hasMore: walk(b, n)
+  of KeepovfS:
+    # `(keepovf (op type a b) dest)` — overflow-checked arithmetic store. arkham
+    # uses wrapping arithmetic (the overflow flag is ignored), so allocate it like
+    # an `asgn` whose rhs is the op and whose lhs is `dest` (the SECOND child).
+    if b.allocExprs:
+      let kPos = b.posOf(n)
+      n.into:
+        var opCur = n                          # the (op …) value
+        skip n                                 # advance to dest
+        if n.kind == Symbol:
+          let dst = b.symLoc(symName(n)); skip n
+          allocStore(b, opCur, dst, kPos)
+        else:
+          let lhsCur = n; skip n
+          allocStore(b, opCur, memLoc(lhsCur, ScalarSlot), kPos)
         while n.hasMore: skip n
     else:
       n.into:

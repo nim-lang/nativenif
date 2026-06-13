@@ -56,12 +56,12 @@ proc arkhamTests() =
   let workDir = "tests" / "arkham" / "nimcache"
   createDir workDir
   # Foreign helper modules (`mod_*.c.nif`) are not standalone tests: compile each
-  # to `<workDir>/<name>.s.nif` so nifasm can auto-import it when a cross-module
-  # test references its symbols (e.g. `Foo.0.mod_xlib` → loads `mod_xlib.s.nif`).
+  # to `<workDir>/<name>.asm.nif` so nifasm can auto-import it when a cross-module
+  # test references its symbols (e.g. `Foo.0.mod_xlib` → loads `mod_xlib.asm.nif`).
   for file in walkFiles("tests" / "arkham" / "mod_*.c.nif"):
     let name = extractFilename(file)[0 ..< extractFilename(file).len - ".c.nif".len]
     exec quoteShell(arkham) & " -a:" & arch & " -o:" &
-         quoteShell(workDir / (name & ".s.nif")) & " " & quoteShell(file)
+         quoteShell(workDir / (name & ".asm.nif")) & " " & quoteShell(file)
   var total, passed, skipped = 0
   for file in walkFiles("tests" / "arkham" / "*.c.nif"):
     let base = extractFilename(file)
@@ -138,7 +138,7 @@ proc arkhamQemuTests() =
   for file in walkFiles("tests" / "arkham" / "mod_*.c.nif"):
     let name = extractFilename(file)[0 ..< extractFilename(file).len - ".c.nif".len]
     exec quoteShell(arkham) & " -a:linux_arm64 -o:" &
-         quoteShell(workDir / (name & ".s.nif")) & " " & quoteShell(file)
+         quoteShell(workDir / (name & ".asm.nif")) & " " & quoteShell(file)
   var total, passed, skipped = 0
   for file in walkFiles("tests" / "arkham" / "*.c.nif"):
     let base = extractFilename(file)

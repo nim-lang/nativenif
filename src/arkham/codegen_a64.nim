@@ -2834,6 +2834,12 @@ proc genGlobal(g: var CodeGen; name: string; decl: Cursor) =
       g.genTypeBody(tc2)                       # type
       if hasValue and isConstScalarInit(c):
         g.ab.intLit cast[int64](constLitBits(c))
+      elif hasValue:
+        # Static-ADDRESS initializer (function-pointer hook etc.) — emit the
+        # symbol so nifasm bakes its resolved address into the slot.
+        let addrSym = constAddrSym(c)
+        if addrSym.len > 0:
+          g.ab.sym addrSym
       g.ab.close()
     while c.hasMore: skip c                   # value (runtime inits done at entry)
 
@@ -2886,7 +2892,8 @@ proc buildGlobalInitProc(g: var CodeGen; initBuf: var TokenBuf) =
     c.into:
       inc c; skip c                             # name, pragmas
       skip c                                    # type
-      if c.hasMore and c.kind != DotToken and not isConstScalarInit(c):
+      if c.hasMore and c.kind != DotToken and not isConstScalarInit(c) and
+         constAddrSym(c).len == 0:
         inits.add (name, c)
       while c.hasMore: skip c
   if inits.len == 0: return
@@ -2958,7 +2965,7 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     # NOTE: foreign types are NOT emitted here. arkham loads other modules only to
     # resolve their layout for *its own* codegen (sizing, field offsets, ABI). The
     # actual cross-module linking is nifasm's job: a module-suffixed symbol like
-    # `Foo.0.othermod` makes nifasm auto-import `othermod.s.nif` (which arkham
+    # `Foo.0.othermod` makes nifasm auto-import `othermod.asm.nif` (which arkham
     # produced when it compiled that module). Emitting the decl inline is ignored.
     for (nm, bytes) in g.rodata:
       g.ab.tree RodataD:
