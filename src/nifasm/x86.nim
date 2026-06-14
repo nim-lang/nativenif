@@ -1551,20 +1551,20 @@ proc emitJbe*(dest: var Buffer; target: LabelId) =
   dest.addReloc(pos, target, rkJbe, 6)  # 2 bytes opcode + 4 bytes displacement
 
 proc emitJo*(dest: var Buffer; target: LabelId) =
-  ## Emit JO instruction: JO target (jump if overflow)
+  ## Emit JO instruction: JO target (jump if overflow, OF=1)
   let pos = dest.data.getCurrentPosition()
   dest.data.add(0x0F)
   dest.data.add(0x80)
   dest.data.addt32(0)  # Placeholder
-  dest.addReloc(pos, target, rkJo, 6)
+  dest.addReloc(pos, target, rkJo, 6)  # 2 bytes opcode + 4 bytes displacement
 
 proc emitJno*(dest: var Buffer; target: LabelId) =
-  ## Emit JNO instruction: JNO target (jump if not overflow)
+  ## Emit JNO instruction: JNO target (jump if not overflow, OF=0)
   let pos = dest.data.getCurrentPosition()
   dest.data.add(0x0F)
   dest.data.add(0x81)
   dest.data.addt32(0)  # Placeholder
-  dest.addReloc(pos, target, rkJno, 6)
+  dest.addReloc(pos, target, rkJno, 6)  # 2 bytes opcode + 4 bytes displacement
 
 proc emitJs*(dest: var Buffer; target: LabelId) =
   ## Emit JS instruction: JS target (jump if sign)

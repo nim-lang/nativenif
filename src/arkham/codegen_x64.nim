@@ -1874,10 +1874,12 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
     of FalseC, NilC:
       if dst.kind == InReg: (if dst.isTemp: g.bindTemp(dst.r, dst.typ)); g.movImm(dst.r, 0)
     of OvfC:
-      # The overflow flag. arkham uses wrapping arithmetic and does not track it, so
-      # it is always false (the `(if (ovf) …)` overflow handlers are dead). Matches
-      # the `keepovf` lowering.
-      if dst.kind == InReg: (if dst.isTemp: g.bindTemp(dst.r, dst.typ)); g.movImm(dst.r, 0)
+      # `(ovf)` reads the hardware overflow flag of the immediately preceding `keepovf`
+      # and is valid ONLY as an if/ite condition (handled in `emitCond2`, lowered to
+      # `jo`/`jb`). It has no value-position lowering — materializing it into a register
+      # here would need a `seto` and, more importantly, would mean a flag-clobbering
+      # instruction ran between the keepovf and its read. Reject it loudly.
+      raiseAssert "arkham x64n: (ovf) is only valid as an if/ite condition right after keepovf"
     of SizeofC:
       if dst.kind == InReg:
         var t = c; var sz = 0'i64
@@ -3025,6 +3027,16 @@ proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
   ## a short-circuit `and`/`or`/`not` tree, a `cmp`/`jcc` for a comparison `(op a b)`,
   ## or `cmp v, 0` for a plain boolean value. Operand locations were pre-assigned by
   ## `allocCond`; the short-circuit forms mirror the legacy `emitCondJump`.
+  if c.kind == TagLit and c.exprKind == OvfC:
+    # The overflow flag of the immediately preceding `keepovf` (read straight from the
+    # hardware flag — no operand, no register). A signed op overflows iff OF is set
+    # (`jo`); an unsigned op overflows iff CF is set (`jb`). `g.ovfSigned` was recorded
+    # by the keepovf. Nothing flag-clobbering may sit between (the spec guarantees it).
+    let tag =
+      if g.ovfSigned: (if whenTrue: JoX64 else: JnoX64)
+      else:           (if whenTrue: JbX64 else: JaeX64)
+    g.emJcc(tag, toLabel)
+    return
   if c.kind == TagLit and c.exprKind in {AndC, OrC, NotC}:
     let ek = c.exprKind
     var aC, bC: Cursor
@@ -3341,14 +3353,27 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
       g.emJmp(symName(cc)); skip cc
       while cc.hasMore: skip cc
   of KeepovfS:
-    # `(keepovf (op type a b) dest)` — an overflow-checked arithmetic store. arkham
-    # uses wrapping arithmetic (the overflow flag is not modelled), emitting the
-    # plain `dest = a op b` through the general store path, like AsgnS but with the
-    # value (the op) FIRST and the destination second.
+    # `(keepovf (op type a b) dest)` — an overflow-checked arithmetic store: emit the
+    # plain `dest = a op b` (like AsgnS, value FIRST), which leaves the hardware
+    # overflow/carry flag set; the `(ovf)` test that MUST immediately follow reads it
+    # (see emitCond2). The result store is a flag-preserving `mov`, so the flag is
+    # still live at the test. Record the op's signedness so that test picks `jo` (OF,
+    # signed) vs `jb` (CF, unsigned).
     var cc = c
     cc.into:
       let kPos = cursorToPosition(g.buf[], c)
       var opCur = cc                                        # the (op …) value
+      block:
+        var opTy = opCur; inc opTy                          # past the op tag → its result type
+        g.ovfSigned = isSignedType(opTy)
+        # The hardware OF/CF reflects overflow at the OP's width, but arkham keeps int
+        # locals in 64-bit registers, so a sub-64-bit `keepovf` would need a narrow op
+        # (or a sign-extend/compare) for its `(ovf)` to be correct. Native-width (`int`
+        # = `(i -1)`, and `(i 64)`/`(u 64)`) is exact; reject narrower widths loudly
+        # rather than silently miss overflow.
+        if intTypeWidth(opTy) < 64:
+          raiseAssert "arkham x64n: keepovf for sub-64-bit type not yet supported " &
+                      "(width " & $intTypeWidth(opTy) & ")"
       skip cc                                               # advance to dest
       if cc.kind == Symbol:
         let lhsCur = cc

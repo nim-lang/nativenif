@@ -4938,6 +4938,16 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
     x86.emitJbe(ctx.buf, op.label)
+  of JoX64:
+    inc n
+    let op = parseOperand(n, ctx)
+    if op.typ.kind != UIntT: error("Jump target must be label", n)
+    x86.emitJo(ctx.buf, op.label)
+  of JnoX64:
+    inc n
+    let op = parseOperand(n, ctx)
+    if op.typ.kind != UIntT: error("Jump target must be label", n)
+    x86.emitJno(ctx.buf, op.label)
   of JngX64:
     inc n
     let op = parseOperand(n, ctx)

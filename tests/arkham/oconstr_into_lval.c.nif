@@ -1,0 +1,37 @@
+(.nif27)
+(.indexat 581              )
+(stmts
+ (type :Point.0 .
+  (object .
+   (fld :px.0 .
+    (i 64))
+   (fld :py.0 .
+    (i 64))))
+ (type :PointArr2.0 .
+  (array Point.0 2))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :arr.0 . PointArr2.0 .)
+   (asgn
+    (at arr.0 1)
+    (oconstr Point.0
+     (kv px.0 40)
+     (kv py.0 2)))
+   (call exit.c
+    (add
+     (i 64)
+     (dot
+      (at arr.0 1)px.0)
+     (dot
+      (at arr.0 1)py.0))))))(.index)
