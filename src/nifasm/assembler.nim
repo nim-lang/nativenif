@@ -383,6 +383,13 @@ type
     # layout, so record (rodata label id, byte offset within the blob, target
     # symbol) and bake the resolved address into `code` in `writeElf`.
     rodataSymInits: seq[tuple[labelId: int, blobOff: int, sym: Symbol, size: int]]
+    # Mach-O counterpart of `rodataSymInits` for a `dataConst` blob (one that lives
+    # in writable __DATA, not __TEXT): the blob is rebased by dyld, so we record the
+    # owning const, the byte offset of the pointer field within it, and the target
+    # symbol. At `writeMachO` time these become (`__DATA` field offset, target vaddr)
+    # pairs: the target's preferred vaddr is baked in and a dyld rebase opcode slides
+    # it. Targets in __TEXT and __DATA are both supported.
+    rodataRebases: seq[tuple[owner: Symbol, blobOff: int, target: Symbol]]
 
   OperandKind = enum
     okReg       # Register operand
@@ -1069,6 +1076,20 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
           var sym = Symbol(name: name, kind: skRodata,
                           moduleName: moduleName, declStart: declStart)
           sym.offset = -1  # Mark as forward reference until defined
+          # A `(rodata :name "bytes" (reloc off sym)*)` whose blob carries
+          # symbol-pointer fields cannot live in read-only __TEXT on a PIE image:
+          # the absolute target vaddr baked in would be stale under the ASLR slide.
+          # Flag it so the Mach-O backend places it in writable __DATA and emits a
+          # dyld rebase for each pointer field (see writeMachO). Arch-independent
+          # flag; only the macOS path acts on it.
+          block:
+            var probe = start
+            into probe:        # bound the cursor to this rodata's children
+              skip probe       # name
+              skip probe       # bytes string literal
+              if probe.hasMore:  # one or more trailing (reloc ...) children
+                sym.dataConst = true
+              while probe.hasMore: skip probe   # drain so `into` sees rem == 0
           scope.define(sym)
           n = start
           skip n
@@ -1638,7 +1659,13 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       result.typ = Type(kind: UIntT, bits: 64)
       inc n
     elif sym != nil and sym.kind == skRodata:
-      if sym.offset == -1:
+      if ctx.arch == Arch.A64 and sym.dataConst:
+        # A `dataConst` blob lives in writable __DATA (it is rebased at load), so
+        # its address is formed like a global's — adrp+add through the gvar path —
+        # not as a PC-relative __TEXT label. `sym.size` becomes its __DATA offset
+        # once its body is laid out (generateSymbol).
+        result.gvarSym = sym
+      elif sym.offset == -1:
         # Forward reference - create label now but don't define it yet
         # It will be defined when the rodata is actually written
         let labId = ctx.buf.createLabel()
@@ -5673,8 +5700,30 @@ proc writeMachO(a: var GenContext; outfile: string) =
   tlv.threadData = a.tlvData
   for (pos, sym) in a.tlvSites: tlv.sites.add (pos, sym.offset)
 
+  # Symbol-pointer fields of `dataConst` blobs (now in __DATA): resolve each to its
+  # target's preferred vaddr and a dyld rebase. A target in __TEXT (a plain rodata
+  # const or a proc) is located by its finalized label position; a target itself in
+  # __DATA (another data const, or a gvar) by its `.bss`/__DATA offset.
+  var labelPos = initTable[int, int]()
+  for ld in a.buf.labels: labelPos[int(ld.id)] = ld.position
+  var rebases: seq[macho.RodataRebase] = @[]
+  for it in a.rodataRebases:
+    let fieldOff = it.owner.size + it.blobOff
+    case it.target.kind
+    of skProc, skRodata:
+      if it.target.kind == skRodata and it.target.dataConst:
+        rebases.add macho.RodataRebase(fieldOff: fieldOff, targetInData: true,
+                                       targetOff: it.target.size)
+      elif labelPos.hasKey(it.target.offset):
+        rebases.add macho.RodataRebase(fieldOff: fieldOff, targetInData: false,
+                                       targetOff: labelPos[it.target.offset])
+    of skGvar:
+      rebases.add macho.RodataRebase(fieldOff: fieldOff, targetInData: true,
+                                     targetOff: it.target.size)
+    else: discard
+
   macho.writeMachO(code, a.bssOffset, cputype, cpusubtype, outfile, dynlink, gsites, tlv,
-                   a.bssInits)
+                   a.bssInits, rebases)
 
   # macOS arm64 requires code signing for all executables
   when defined(macosx):
@@ -5736,29 +5785,57 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
       pass2Proc(n, ctx)
   of skRodata:
     if declTag == RodataD:
-      if sym.offset == -1:
-        let labId = ctx.buf.createLabel()
-        sym.offset = int(labId)
-      ctx.buf.defineLabel(LabelId(sym.offset))
-      var rc = n                              # (rodata :name "str" (reloc off sym)*)
-      into rc:
-        skip rc                               # name (already have sym)
-        let s = getStr(rc); skip rc
-        for ch in s: ctx.buf.data.add byte(ch)
-        # Optional `(reloc off sym)` children: a field of this blob holds the
-        # address of another symbol (vtable/RTTI). Mark the target reachable and
-        # record the site so `writeElf` bakes its vaddr into the blob (in `.text`).
-        while rc.hasMore:
-          var relc = rc
-          into relc:
-            let blobOff = getInt(relc); skip relc
-            let tname = getSym(relc)
-            let tsym = lookupWithAutoImport(ctx, ctx.scope, tname, relc)
-            skip relc                         # past the target symbol
-            if tsym != nil:
-              ctx.rodataSymInits.add (labelId: sym.offset, blobOff: blobOff.int,
-                                      sym: tsym, size: 8)
-          skip rc
+      if ctx.arch == Arch.A64 and sym.dataConst:
+        # Mach-O: a const whose fields are symbol addresses must be rebased by dyld,
+        # which can only write a *writable* segment — so place it in __DATA (the .bss
+        # image, like a statically-initialized gvar) rather than read-only __TEXT.
+        # Its bytes go into the data image; each pointer field is recorded for a dyld
+        # rebase (writeMachO bakes the preferred target vaddr and slides it at load).
+        var rc = n                            # (rodata :name "str" (reloc off sym)*)
+        into rc:
+          skip rc                             # name (already have sym)
+          let s = getStr(rc); skip rc
+          # 8-align: pointer fields must be aligned for the load and for dyld's rebase.
+          ctx.bssOffset = (ctx.bssOffset + 7) and not 7
+          sym.size = ctx.bssOffset            # __DATA byte offset (for adrp+add)
+          for i, ch in s:
+            if ch != '\0':                    # zero bytes are already zero in the image
+              ctx.bssInits.add (off: int64(sym.size + i), val: int64(ch), size: 1)
+          ctx.bssOffset += s.len
+          while rc.hasMore:
+            var relc = rc
+            into relc:
+              let blobOff = getInt(relc); skip relc
+              let tname = getSym(relc)
+              let tsym = lookupWithAutoImport(ctx, ctx.scope, tname, relc)
+              skip relc                       # past the target symbol
+              if tsym != nil:
+                ctx.rodataRebases.add (owner: sym, blobOff: blobOff.int, target: tsym)
+            skip rc
+      else:
+        if sym.offset == -1:
+          let labId = ctx.buf.createLabel()
+          sym.offset = int(labId)
+        ctx.buf.defineLabel(LabelId(sym.offset))
+        var rc = n                            # (rodata :name "str" (reloc off sym)*)
+        into rc:
+          skip rc                             # name (already have sym)
+          let s = getStr(rc); skip rc
+          for ch in s: ctx.buf.data.add byte(ch)
+          # Optional `(reloc off sym)` children: a field of this blob holds the
+          # address of another symbol (vtable/RTTI). Mark the target reachable and
+          # record the site so `writeElf` bakes its vaddr into the blob (in `.text`).
+          while rc.hasMore:
+            var relc = rc
+            into relc:
+              let blobOff = getInt(relc); skip relc
+              let tname = getSym(relc)
+              let tsym = lookupWithAutoImport(ctx, ctx.scope, tname, relc)
+              skip relc                       # past the target symbol
+              if tsym != nil:
+                ctx.rodataSymInits.add (labelId: sym.offset, blobOff: blobOff.int,
+                                        sym: tsym, size: 8)
+            skip rc
   of skGvar:
     if declTag == GvarD:
       # Allocate space in .bss section
