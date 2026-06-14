@@ -2522,27 +2522,6 @@ proc copyStructThroughPtr2(g: var CodeGen; srcVar, typeName: string; ptrReg, tmp
     g.ab.tree MovX64: (g.emPtrFieldMem(ptrReg, typeName, f.name); g.emReg tmp)
     g.unbindTemp(tmp)
 
-proc emAggrBaseAddr(g: var CodeGen; base: string; reg: Reg) =
-  ## Address of aggregate `base` (a stack `(s)` slot, or a pointer held in a register
-  ## for a by-ref param) → `reg`. The base for computing a field address.
-  let loc = g.ra.locationOfSym(base)
-  if loc.kind == InReg: g.movReg(reg, loc.r)
-  else: g.emStackAddr(reg, base)
-
-proc emLvalAddrIntoReg(g: var CodeGen; lhs: Cursor; reg: Reg) =
-  ## Address of lvalue `lhs` → `reg`. `&(deref p)` is just `p`; any other lvalue
-  ## `lea`s its address tree.
-  if lhs.kind == TagLit and lhs.exprKind == DerefC:
-    var cc = lhs; inc cc
-    g.emitValue2(cc)
-    let pr = g.ra.locs[cursorToPosition(g.buf[], cc)]
-    if pr.kind == InReg: g.movReg(reg, pr.r)
-    else: g.emitLoadLoc(pr, reg)
-  else:
-    g.prematLval2(lhs)
-    g.ab.tree LeaX64: (g.emReg reg; g.emLvalAddr2(lhs))
-    g.unbindLvalTemps2(lhs)
-
 proc emWordThroughPtr(g: var CodeGen; p: Reg; idx: int) =
   ## `(mem (at (cast (aptr (u 64)) p) idx))` — the `idx`-th 8-byte word at `[p]`, typed
   ## `(u 64)`. nifasm scales `idx` by 8, so this is raw `[p + idx*8]` access that
@@ -2642,58 +2621,93 @@ proc genAggrCopyFromLval2(g: var CodeGen; dstVar: string; srcLval: Cursor;
   g.unbindLvalTemps2(srcLval)
   for r in boundBases: g.unbindTemp(r)
 
-template constrFieldStores(g: var CodeGen; c: Cursor; destOp, baseAddrInto: untyped) =
-  ## The ONE field-store loop behind `genConstr2`/`genConstrIntoLval2`: walk
-  ## `(oconstr T (kv field value)*)`, emit each value (placed in a register temp by
-  ## the allocator — a SIMD temp for a float field) and store it at the destination
-  ## operand `destOp(field)` emits. A scalar going into a POINTER field is
-  ## reinterpreted via `(cast (ptr …) reg)` for nifasm's strict typing. A field whose
-  ## value is itself an inline aggregate (a nested `oconstr`) is built into a temp and
-  ## copied through the field pointer (`baseAddrInto(reg)` emits the aggregate's base
-  ## address; the field offset is added).
-  block:
-    var tc = c; inc tc                                  # the constructed type symbol
-    let typeName = symName(tc)
-    let objTy = resolveType(g.prog, tc)
-    let lay = aggrLayout(g.prog, typeName)
-    var cc = c
-    cc.into:
-      skip cc                                           # the constructed type
-      while cc.hasMore:
-        var kv = cc
-        kv.into:
-          let field = symName(kv); inc kv
-          let valC = kv
-          if g.exprSlot(valC).kind == AMem:             # nested aggregate field
-            var fo = 0
-            for fi in lay:
-              if fi.name == field: (fo = fi.off; break)
-            let fty = fieldType(g.prog, objTy, field)    # the field's declared (nominal) type
-            let fptr = g.pickStagingSealed("a nested-aggregate-field pointer")
-            baseAddrInto(fptr)                           # the parent aggregate's base address
-            if fo > 0: g.binImm(AddX64, fptr, fo.int64)  # + field offset
-            g.genNestedAggrField(valC, fty, fptr)
-            g.giveBack fptr
+proc emFieldOperand(g: var CodeGen; dst: Location) =
+  ## The `(mem (dot <base> field))` operand for a `Field` destination, dispatching on
+  ## how its base aggregate is addressed (a pointer register / a named stack slot / an
+  ## lvalue subtree). nifasm sizes the access from the field's declared type.
+  if dst.baseReg != NoReg:      g.emPtrFieldMem(dst.baseReg, dst.aggrType, dst.field)
+  elif dst.baseName.len > 0:    g.emAggrFieldMem(dst.baseName, dst.field)
+  else:                         g.emLvalFieldMem(dst.baseLval, dst.field)
+
+proc emFieldAddr(g: var CodeGen; dst: Location; into: Reg) =
+  ## `&(base.field)` → `into`: just `lea` over the field's own memory operand, so the
+  ## three base forms need no special handling. The recursion base for a nested
+  ## aggregate field.
+  g.ab.tree LeaX64: (g.emReg into; g.emFieldOperand(dst))
+
+proc fieldTypeByName(g: var CodeGen; typeName, field: string): Cursor =
+  ## The declared (nominal) type cursor of `typeName.field` — resolves the object body
+  ## from the type's decl like `fieldSlotByName`.
+  var d = lookupType(g.prog, typeName)
+  d.into:
+    inc d; skip d                              # name, type-pragmas → the body
+    result = fieldType(g.prog, d, field)
+    while d.hasMore: skip d
+
+proc genFieldStore2(g: var CodeGen; dst: Location; valC: Cursor) =
+  ## Store value `valC` into the aggregate-field destination `dst` — the `Field` case
+  ## of `genStore2`, and the ONE per-field store behind `genConstr2`. A scalar/float/
+  ## pointer field emits its value and moves it into the field operand (a POINTER field
+  ## reinterprets a scalar register via `(cast (ptr …) reg)` for nifasm's strict
+  ## typing); a nested aggregate field recurses (`genNestedAggrField` builds/copies the
+  ## value into the field's address). No per-field special-casing at the call site.
+  if dst.typ.kind == AMem:                              # nested aggregate field
+    let ftyCur = g.fieldTypeByName(dst.aggrType, dst.field)
+    let fptr = g.pickStagingSealed("a nested-aggregate-field pointer")
+    g.emFieldAddr(dst, fptr)
+    g.genNestedAggrField(valC, ftyCur, fptr)
+    g.giveBack fptr
+  else:                                                 # scalar / float / pointer field
+    g.emitValue2(valC)
+    let v = g.ra.locs[cursorToPosition(g.buf[], valC)]
+    if v.kind == InFReg:                                # float field
+      let bits = if v.typ.size == 4: 32 else: 64
+      g.ab.tree (if bits == 32: MovssX64 else: MovsdX64):
+        g.emFieldOperand(dst)
+        g.emFReg v.f
+      if v.isTemp: g.unbindFTmp(v.f)
+    else:
+      var fty = resolveType(g.prog, g.fieldTypeByName(dst.aggrType, dst.field))
+      g.ab.tree MovX64:
+        g.emFieldOperand(dst)
+        case v.kind
+        of Imm: g.ab.intLit v.ival
+        of InReg:
+          if isPtrType(fty):
+            g.ab.tree CastX:
+              g.genTypeBody(fty)
+              g.emReg v.r
           else:
-            g.emitValue2(valC)
-            let v = g.ra.locs[cursorToPosition(g.buf[], valC)]
-            if v.kind == InFReg:                          # float field
-              let bits = if v.typ.size == 4: 32 else: 64
-              g.ab.tree (if bits == 32: MovssX64 else: MovsdX64):
-                destOp(field)
-                g.emFReg v.f
-              if v.isTemp: g.unbindFTmp(v.f)
-            else:
-              var fty = resolveType(g.prog, fieldType(g.prog, objTy, field))
-              g.ab.tree MovX64:
-                destOp(field)
-                if isPtrType(fty):
-                  g.ab.tree CastX: (g.genTypeBody(fty); g.emReg v.r)
-                else:
-                  g.emReg v.r
-              if v.isTemp: g.unbindTemp(v.r)
-          while kv.hasMore: skip kv                      # optional inherited-depth INTLIT
-        skip cc
+            g.emReg v.r
+        else: raiseAssert "arkham x64n: constr field rhs " & $v.kind
+      if v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
+
+proc constrFieldStores(g: var CodeGen; c: Cursor; base: Location) =
+  ## The ONE field-store loop behind `genConstr2`/`genConstrIntoLval2`/nested fields:
+  ## walk `(oconstr T (kv field value)*)` and store each value into its field via the
+  ## uniform `genFieldStore2`. `base` names the destination aggregate — a stack slot
+  ## (`NamedStack`), a pointer in a register (`InReg`), or an lvalue subtree (`Mem`,
+  ## pre-materialized by the caller).
+  var tc = c; inc tc                                    # the constructed type symbol
+  let typeName = symName(tc)
+  var cc = c
+  cc.into:
+    skip cc                                             # the constructed type
+    while cc.hasMore:
+      var kv = cc
+      kv.into:
+        let field = symName(kv); inc kv
+        let valC = kv
+        let fSlot = g.fieldSlotByName(typeName, field)
+        let fdst =
+          case base.kind
+          of NamedStack: fieldLoc(typeName, field, base.name, fSlot)
+          of InReg:      fieldLocReg(typeName, field, base.r, fSlot)
+          of Mem:        fieldLocLval(typeName, field, base.cur, fSlot)
+          else: raiseAssert "arkham x64n: bad oconstr base " & $base.kind
+        g.genStore2(valC, fdst, cursorToPosition(g.buf[], valC))
+        while kv.hasMore: skip kv                       # optional inherited-depth INTLIT
+      skip cc
 
 proc genConstrIntoLval2(g: var CodeGen; c: Cursor; lhs: Cursor) =
   ## Emit `(oconstr T (kv field value)*)` straight into the memory aggregate addressed
@@ -2701,9 +2715,7 @@ proc genConstrIntoLval2(g: var CodeGen; c: Cursor; lhs: Cursor) =
   ## `genConstr2`: materialize the lvalue's embedded regs once, then store each field
   ## value at `(dot <lhs> field)`.
   g.prematLval2(lhs)                                     # the lvalue's base/index regs, once
-  template dest(field) = g.emLvalFieldMem(lhs, field)
-  template baseAddr(reg) = g.emLvalAddrIntoReg(lhs, reg)
-  g.constrFieldStores(c, dest, baseAddr)
+  g.constrFieldStores(c, memLoc(lhs, ScalarSlot))        # base = the lvalue subtree
   g.unbindLvalTemps2(lhs)                                # release the lvalue's base/index temps
 
 proc emLvalElemMem(g: var CodeGen; lhs: Cursor; idx: int) =
@@ -2762,9 +2774,7 @@ proc genConstr2(g: var CodeGen; c: Cursor; dstVar: string) =
   ## Emit `(oconstr T (kv field value)*)` into the stack aggregate `dstVar`: each
   ## value was placed in a register temp by the allocator (a SIMD temp for a float
   ## field); store it at the field's offset.
-  template dest(field) = g.emAggrFieldMem(dstVar, field)
-  template baseAddr(reg) = g.emAggrBaseAddr(dstVar, reg)
-  g.constrFieldStores(c, dest, baseAddr)
+  g.constrFieldStores(c, namedStackLoc(dstVar, ScalarSlot))   # base = the stack slot
 
 proc genAconstr2(g: var CodeGen; c: Cursor; dstVar: string) =
   ## Emit `(aconstr ArrayT e0 e1 …)` into the stack array `dstVar`: store each (bare)
@@ -2967,6 +2977,8 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
         elif v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
       g.unbindLvalTemps2(lhs)                             # release embedded base/index temps
     if globScratch != NoReg: g.unbindTemp(globScratch)
+  elif dst.kind == Field:                                # a field within an aggregate
+    g.genFieldStore2(dst, rhs)
   else:                                                  # scalar / float home (reg or `(s)` slot)
     # A COMPUTED rhs whose result the allocator destination-passed into a register that is
     # NOT this store's own home (e.g. the var was register-allocated but then EVICTED to the

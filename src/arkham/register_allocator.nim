@@ -1185,22 +1185,18 @@ proc allocSingleUse(b: var Builder; n: var Cursor) =
 proc allocConstr(b: var Builder; n: var Cursor) =
   ## `(oconstr T (kv field value)+)` — allocate each field's value into a register
   ## (a SIMD temp for a float field) the emitter then stores to the field. Each is
-  ## single-use (store + free), so the temps recycle. A field whose value is itself
-  ## an aggregate (a nested `oconstr`/`aconstr`) is allocated through the general
-  ## `allocStore` (which recurses into `allocConstr`), exactly like an aggregate call
-  ## argument — the emitter builds it into a temp and copies it through the field
-  ## pointer. Advances `n` past the oconstr.
+  ## single-use (store + free), so the temps recycle. Every field — scalar, float, or
+  ## a nested aggregate (`oconstr`/`aconstr`) — routes through the ONE `allocStore` as a
+  ## `Field` destination, exactly like any other store; `allocStore`'s `Field` case
+  ## dispatches on the field's slot (a nested aggregate recurses into `allocConstr`).
+  ## Advances `n` past the oconstr.
   n.into:
     skip n                                     # the constructed type
     while n.hasMore:
       n.into:                                  # (kv field value [depth])
         skip n                                 # field name
         if n.hasMore:
-          if b.tc.exprSlot(n).cls == AMem:
-            b.ra.hasStackVars = true
-            allocStore(b, n, namedStackLoc("", b.tc.exprSlot(n)), b.posOf(n))
-          else:
-            b.allocSingleUse(n)
+          allocStore(b, n, fieldLoc("", "", "", b.tc.exprSlot(n)), b.posOf(n))
         while n.hasMore: skip n                 # optional inherited-depth INTLIT
 
 proc allocAconstr(b: var Builder; n: var Cursor) =
@@ -1270,6 +1266,15 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
       var d = needsReg(dst.typ)
       allocValue(b, n, d)
       b.releaseTmp(d)
+  elif dst.kind == Field:                                # a field within an aggregate
+    # Mirror the emitter's `genFieldStore2`: a nested aggregate field builds into a
+    # synthetic temp (the emitter copies it through the field address); a scalar/float
+    # field's value goes into a single-use temp the emitter stores to the field operand.
+    if dst.typ.kind == AMem:
+      b.ra.hasStackVars = true
+      allocStore(b, n, namedStackLoc("", dst.typ), b.posOf(n))
+    else:
+      b.allocSingleUse(n)
   elif dst.kind == Mem:                                  # store through a complex lvalue (dot/deref/at)
     # Place the lvalue's embedded base/index regs, then the rhs. An AGGREGATE constructor
     # builds field-by-field into the address (placed like a slot store); a FLOAT rhs goes

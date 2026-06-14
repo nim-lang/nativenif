@@ -1260,11 +1260,27 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       var objType: Type
       var baseReg: arm64.Register
       var baseOffset: int32 = 0
+      var baseIndex: arm64.Register
+      var baseShift = 0
+      var baseHasIndex = false
       if baseOp.typ.kind == TypeKind.PtrT:
         objType = resolvedBase(baseOp.typ, ctx, n)
         if objType.kind notin {TypeKind.ObjectT, TypeKind.UnionT}:
           error("Cannot access field of non-object/union type " & $objType, n)
-        baseReg = baseOp.reg
+        if baseOp.kind == okMem:
+          # The base is itself a memory lvalue — a NESTED access whose result type the
+          # `(dot …)`/`(at …)` rule tagged `PtrT(fieldType)` (an embedded sub-object/
+          # element sits AT base+offset, not behind a loaded pointer). Fold the field
+          # offset onto the inner base+offset (+index) instead of treating the inner
+          # base register as the pointer — otherwise `(dot (dot o inner) a)` and
+          # `(dot (at arr i) f)` lose the inner displacement. Mirrors the x64 parser.
+          baseReg = baseOp.mem.base
+          baseOffset = baseOp.mem.offset
+          baseIndex = baseOp.mem.index
+          baseShift = baseOp.mem.shift
+          baseHasIndex = baseOp.mem.hasIndex
+        else:
+          baseReg = baseOp.reg
       elif baseOp.kind == okMem and baseOp.typ.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
         objType = baseOp.typ
         baseReg = baseOp.mem.base
@@ -1292,7 +1308,9 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       result.mem = arm64.MemoryOperand(
         base: baseReg,
         offset: baseOffset + int32(fieldOffset),
-        hasIndex: false
+        hasIndex: baseHasIndex,
+        index: baseIndex,
+        shift: baseShift
       )
       result.typ = Type(kind: TypeKind.PtrT, base: fieldType)
     elif t == AtTagId:

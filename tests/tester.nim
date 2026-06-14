@@ -105,12 +105,12 @@ proc arkhamTests() =
 # function-pointer calls, `(pat …)` pointer indexing, and thread-locals. List a
 # test's stem here if a new arm64-only TODO is introduced.
 const arkhamLinuxA64Unsupported: seq[string] = @[
-  # Runtime `(aconstr …)` array constructor: the a64 backend (still the reactive
-  # emitter) handles it for a var-init (`aconstr_init`), but not yet as a direct call
-  # argument or into a complex lvalue — those flow through the value-core paths
-  # implemented only on x86-64 for now. Re-enable when a64 catches up.
-  "aconstr_arg",
-  "aconstr_field",
+  # (empty) The a64 backend now reaches x86-64 parity on every arkham test, including
+  # the value-core aggregate paths: object/array constructors as a var-init, a call
+  # argument, or into a complex lvalue, plus NESTED aggregate fields. The last
+  # blocker was a nifasm a64 bug — `parseOperandA64`'s `(dot …)` dropped the inner
+  # displacement of a memory-lvalue base, so chained access (`(dot (dot o inner) a)`,
+  # `(at (dot h arr) i)`) computed the wrong address; now folded like the x64 parser.
 ]
   # The arm64 backend reached parity with x86-64 on global / multi-dimensional array
   # addressing: codegen_a64 now uses the same premat-before-tree two-pass

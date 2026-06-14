@@ -128,6 +128,9 @@ proc `$`*(loc: Location): string =
   of OnStack: "[fp," & $loc.offset & "]"
   of NamedStack: "&" & loc.name
   of Mem: "[mem]"
+  of Field:
+    (if loc.baseReg == NoReg: "&" & loc.baseName else: "[" & regName(loc.baseReg) & "]") &
+      "." & loc.field
   of Glob: "@" & loc.name
   of Tvar: "%fs:" & loc.name
   of Imm: "#" & $loc.ival

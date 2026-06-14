@@ -2279,36 +2279,129 @@ proc emLvalElemMem(g: var CodeGen; lhs: Cursor; idx: int) =
       g.emLvalAddr2(lhs)
       g.ab.intLit idx
 
-template constrFieldStores(g: var CodeGen; c: Cursor; destOp: untyped) =
-  block:
-    var tc = c; inc tc
-    let objTy = resolveType(g.prog, tc)
-    var cc = c
-    cc.into:
+proc fieldSlotByName(g: var CodeGen; typeName, field: string): AsmSlot =
+  ## The asm slot of `typeName.field` (so a `Field` destination carries the field's
+  ## slot — a nested aggregate field has an `AMem` slot). Resolves the object body
+  ## from the type's decl.
+  var d = lookupType(g.prog, typeName)
+  d.into:
+    inc d; skip d                              # name, type-pragmas → the body
+    result = slotOf(g.prog, fieldType(g.prog, d, field))
+    while d.hasMore: skip d
+
+proc fieldTypeByName(g: var CodeGen; typeName, field: string): Cursor =
+  ## The declared (nominal) type cursor of `typeName.field`.
+  var d = lookupType(g.prog, typeName)
+  d.into:
+    inc d; skip d                              # name, type-pragmas → the body
+    result = fieldType(g.prog, d, field)
+    while d.hasMore: skip d
+
+proc emFieldOperand(g: var CodeGen; dst: Location) =
+  ## The `(mem (dot <base> field))` operand for a `Field` destination, dispatching on
+  ## how its base aggregate is addressed (a pointer reg / a named stack slot / an
+  ## lvalue subtree). nifasm sizes the access from the field's declared type.
+  if dst.baseReg != NoReg:    g.emPtrFieldMem(dst.baseReg, dst.aggrType, dst.field)
+  elif dst.baseName.len > 0:  g.emAggrFieldMem(dst.baseName, dst.field)
+  else:                       g.emLvalFieldMem(dst.baseLval, dst.field)
+
+proc emFieldDot(g: var CodeGen; dst: Location) =
+  ## The bare `(dot <base> field)` ADDRESS tree (no `(mem …)` wrapper) — what a64's
+  ## `lea` takes (unlike x86, which leas a memory operand).
+  if dst.baseReg != NoReg:
+    g.ab.tree DotX:
+      g.ab.tree CastX:
+        g.ab.ptrType: g.ab.sym dst.aggrType
+        g.emReg dst.baseReg
+      g.ab.sym dst.field
+  elif dst.baseName.len > 0:
+    g.emAggrDot(dst.baseName, dst.field)
+  else:
+    g.ab.tree DotX:
+      g.emLvalAddr2(dst.baseLval)
+      g.ab.sym dst.field
+
+proc emFieldAddr(g: var CodeGen; dst: Location; into: Reg) =
+  ## `&(base.field)` → `into`: `lea` over the field's address tree.
+  g.ab.tree LeaA64: (g.emReg into; g.emFieldDot(dst))
+
+proc genNestedAggrField(g: var CodeGen; dst: Location; valC, fty: Cursor) =
+  ## Materialize an aggregate field value `valC` (a nested `oconstr`/`aconstr`, an
+  ## aggregate symbol, …) of declared field type `fty` into the sub-aggregate at field
+  ## `dst`: build it into a synthetic temp through the general `genStore2` (which
+  ## recurses for deeper nesting) WITHOUT holding a bridge, then copy that temp through
+  ## the field address. Computing the field pointer AFTER the recursive build keeps only
+  ## two bridges live at once (the field ptr + the word-transfer temp), so nesting is
+  ## not depth-bounded by the bridge count.
+  if fty.kind != Symbol:
+    raiseAssert "arkham a64n: nested aggregate field of non-nominal type"
+  let ntn = symName(fty)
+  let pos = g.posOf(valC)
+  let tmpName = "nctmp" & $pos & ".0"
+  g.emTypedStackVar(tmpName, fty)
+  g.varType[tmpName] = ntn
+  g.genStore2(valC, namedStackLoc(tmpName, slotOf(g.prog, fty)), pos)   # build (no bridge held)
+  let fptr = g.takeBridge()
+  g.emFieldAddr(dst, fptr)
+  let tmp = g.takeBridge(avoid = fptr)
+  for f in aggrLayout(g.prog, ntn):
+    g.ab.tree MovA64: (g.emReg tmp; g.emAggrFieldMem(tmpName, f.name))
+    g.ab.tree MovA64: (g.emPtrFieldMem(fptr, ntn, f.name); g.emReg tmp)
+  g.dropBridge tmp
+  g.dropBridge fptr
+
+proc genFieldStore2(g: var CodeGen; dst: Location; valC: Cursor) =
+  ## Store value `valC` into the aggregate-field destination `dst` — the `Field` case of
+  ## `genStore2`, and the ONE per-field store behind `genConstr2`. A scalar/float/pointer
+  ## field emits its value into the field operand (a POINTER field reinterprets a scalar
+  ## via `(cast (ptr …) reg)` for nifasm's strict typing); a nested aggregate field
+  ## recurses through `genNestedAggrField`. No per-field special-casing at the call site.
+  if dst.typ.kind == AMem:                              # nested aggregate field
+    let ftyCur = g.fieldTypeByName(dst.aggrType, dst.field)
+    g.genNestedAggrField(dst, valC, ftyCur)
+  else:                                                 # scalar / float / pointer field
+    g.emitValue2(valC)
+    let v = g.ra.locs[g.posOf(valC)]
+    if v.kind == InFReg:                                # float field
+      let bits = if v.typ.size == 4: 32 else: 64
+      g.ab.tree FstrA64: (g.emFieldOperand(dst); g.emFReg(v.f, bits))
+      if v.isTemp: g.unbindFTmp(v.f)
+    else:
+      var fty = resolveType(g.prog, g.fieldTypeByName(dst.aggrType, dst.field))
+      g.ab.tree MovA64:
+        g.emFieldOperand(dst)
+        if isPtrType(fty):
+          g.ab.tree CastX:
+            g.genTypeBody(fty)
+            g.emReg v.r
+        else: g.emReg v.r
+      if v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
+
+proc constrFieldStores(g: var CodeGen; c: Cursor; base: Location) =
+  ## The ONE field-store loop behind `genConstr2`/`genConstrIntoLval2`/nested fields:
+  ## walk `(oconstr T (kv field value)*)` and store each value into its field via the
+  ## uniform `genStore2`. `base` names the destination aggregate — a stack slot
+  ## (`NamedStack`) or an lvalue subtree (`Mem`, pre-materialized by the caller).
+  var tc = c; inc tc                                    # the constructed type symbol
+  let typeName = symName(tc)
+  var cc = c
+  cc.into:
+    skip cc                                             # the constructed type
+    while cc.hasMore:
+      var kv = cc
+      kv.into:
+        let field = symName(kv); inc kv
+        let valC = kv
+        let fSlot = g.fieldSlotByName(typeName, field)
+        let fdst =
+          case base.kind
+          of NamedStack: fieldLoc(typeName, field, base.name, fSlot)
+          of InReg:      fieldLocReg(typeName, field, base.r, fSlot)
+          of Mem:        fieldLocLval(typeName, field, base.cur, fSlot)
+          else: raiseAssert "arkham a64n: bad oconstr base " & $base.kind
+        g.genStore2(valC, fdst, g.posOf(valC))
+        while kv.hasMore: skip kv                       # optional inherited-depth INTLIT
       skip cc
-      while cc.hasMore:
-        var kv = cc
-        kv.into:
-          let field = symName(kv); inc kv
-          let valC = kv
-          g.emitValue2(valC)
-          let v = g.ra.locs[g.posOf(valC)]
-          if v.kind == InFReg:
-            let bits = if v.typ.size == 4: 32 else: 64
-            g.ab.tree FstrA64: (destOp(field); g.emFReg(v.f, bits))
-            if v.isTemp: g.unbindFTmp(v.f)
-          else:
-            var fty = resolveType(g.prog, fieldType(g.prog, objTy, field))
-            g.ab.tree MovA64:
-              destOp(field)
-              if isPtrType(fty):
-                g.ab.tree CastX:
-                  g.genTypeBody(fty)
-                  g.emReg v.r
-              else: g.emReg v.r
-            if v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
-          while kv.hasMore: skip kv
-        skip cc
 
 template aconstrElemStores(g: var CodeGen; c: Cursor; destOp: untyped) =
   block:
@@ -2341,8 +2434,7 @@ template aconstrElemStores(g: var CodeGen; c: Cursor; destOp: untyped) =
         skip cc
 
 proc genConstr2(g: var CodeGen; c: Cursor; dstVar: string) =
-  template dest(field) = g.emAggrFieldMem(dstVar, field)
-  g.constrFieldStores(c, dest)
+  g.constrFieldStores(c, namedStackLoc(dstVar, ScalarSlot))   # base = the stack slot
 
 proc genAconstr2(g: var CodeGen; c: Cursor; dstVar: string) =
   template dest(i) = g.emAggrElemMem(dstVar, i)
@@ -2350,8 +2442,7 @@ proc genAconstr2(g: var CodeGen; c: Cursor; dstVar: string) =
 
 proc genConstrIntoLval2(g: var CodeGen; c: Cursor; lhs: Cursor) =
   g.prematLval2(lhs)
-  template dest(field) = g.emLvalFieldMem(lhs, field)
-  g.constrFieldStores(c, dest)
+  g.constrFieldStores(c, memLoc(lhs, ScalarSlot))            # base = the lvalue subtree
   g.unbindLvalTemps2(lhs)
 
 proc genAconstrIntoLval2(g: var CodeGen; c: Cursor; lhs: Cursor) =
@@ -2440,6 +2531,8 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
         elif v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
       g.unbindLvalTemps2(lhs)
     if globScratch != NoReg: g.unbindTemp(globScratch)
+  elif dst.kind == Field:                                    # a field within an aggregate
+    g.genFieldStore2(dst, rhs)
   else:                                                      # scalar / float register or `(s)` slot
     g.emitValue2(rhs)
     let v = g.ra.locs[g.posOf(rhs)]
