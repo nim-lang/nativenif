@@ -1,0 +1,30 @@
+(.nif27)
+(.indexat 453              )
+(stmts
+ (type :T.0 .
+  (object .
+   (fld :v.0 .
+    (i 64))))
+ (gvar :gobj.0 . T.0 .)
+ (gvar :gp.0 .
+  (ptr T.0).)
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (asgn gp.0
+    (addr gobj.0))
+   (asgn
+    (dot gobj.0 v.0 0)42)
+   (call exit.c
+    (dot
+     (deref gp.0)v.0 0)))))(.index)

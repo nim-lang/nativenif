@@ -486,7 +486,11 @@ proc parseObjectBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
   # first child of `(object …)`; a `.`/no slot means no inheritance.
   var baseC = n                   # a copy; `n` is walked by `fields(n)` below
   into baseC:
-    if baseC.kind == Symbol:
+    # `baseC.hasMore` guards an EMPTY object body `(object)` — arkham emits a baseless
+    # object with no base slot (the base is only present when there IS one), so a
+    # fieldless `ref object` is just `(object)` with zero children; without this guard
+    # `baseC.kind` reads past the end. A 0-field object is a valid 0-byte type.
+    if baseC.hasMore and baseC.kind == Symbol:
       let baseType = parseType(baseC, scope, ctx)
       if baseType.kind != ObjectT:
         error("object base type must be an object", baseC)
@@ -1407,7 +1411,13 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
           let stride = asmSizeOf(elemType)
           arm64.emitMovImm64(ctx.buf.data, scratchReg, uint64(stride))
           arm64.emitMul(ctx.buf.data, scratchReg, indexOp.reg, scratchReg) # scratch = idx*stride
-          arm64.emitAdd(ctx.buf.data, scratchReg, baseReg, scratchReg)     # scratch = base + that
+          # scratch = base + that. A SP base (a stack array) needs the EXTENDED-register
+          # ADD — the shifted-register `emitAdd` would read register 31 as XZR, not SP,
+          # zeroing the base (→ a wild address). Other bases use the plain register ADD.
+          if baseReg == arm64.SP:
+            arm64.emitAddExtended(ctx.buf.data, scratchReg, baseReg, scratchReg)
+          else:
+            arm64.emitAdd(ctx.buf.data, scratchReg, baseReg, scratchReg)
           result.kind = okMem
           result.mem = arm64.MemoryOperand(base: scratchReg, offset: baseOffset, hasIndex: false)
         elif indexOp.kind == okImm:
@@ -2268,8 +2278,13 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     if op.kind != okMem: error("lea source must be a memory operand", n)
     if op.mem.hasIndex:
       # `add dest, base, index, lsl #shift` (+ displacement) — an indexed address
-      # (e.g. `(at base regIdx)`) folds its index into the computed pointer.
-      arm64.emitAddShifted(ctx.buf.data, dest.reg, op.mem.base, op.mem.index, uint8(op.mem.shift))
+      # (e.g. `(at base regIdx)`) folds its index into the computed pointer. A SP base
+      # (a stack array) needs the EXTENDED-register ADD (the shifted form reads reg 31
+      # as XZR, not SP); a normal base uses the shifted form (which allows shift 0..63).
+      if op.mem.base == arm64.SP:
+        arm64.emitAddExtended(ctx.buf.data, dest.reg, op.mem.base, op.mem.index, uint8(op.mem.shift))
+      else:
+        arm64.emitAddShifted(ctx.buf.data, dest.reg, op.mem.base, op.mem.index, uint8(op.mem.shift))
       if op.mem.offset != 0:
         arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.mem.offset))
     else:

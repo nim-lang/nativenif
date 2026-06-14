@@ -1,0 +1,38 @@
+(.nif27)
+(.indexat 575              )
+(stmts
+ (type :Pair.0 .
+  (object .
+   (fld :a.0 .
+    (i 32))
+   (fld :b.0 .
+    (i 32))))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :mk.0
+  (params)Pair.0
+  (pragmas)
+  (stmts
+   (ret
+    (oconstr Pair.0
+     (kv a.0 40)
+     (kv b.0 2)))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :p.0 . Pair.0
+    (call mk.0))
+   (var :q.0 . Pair.0 p.0)
+   (call exit.c
+    (add
+     (i 32)
+     (dot q.0 a.0 0)
+     (dot q.0 b.0 0))))))(.index)

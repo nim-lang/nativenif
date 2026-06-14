@@ -127,6 +127,22 @@ proc emitAddImm*(dest: var Bytes; rd, rn: Register; imm: uint16) =
               encodeReg(rd)
   dest.addUint32(instr)
 
+proc emitAddExtended*(dest: var Bytes; rd, rn, rm: Register; shift: uint8 = 0) =
+  ## Emit ADD (extended register): ADD rd, rn|SP, rm, UXTX #shift.
+  ## Unlike the shifted-register ADD (`emitAdd`/`emitAddShifted`), the extended form
+  ## accepts the stack pointer as `rn` — register 31 there means SP, not XZR — so it is
+  ## the only way to compute `dest = SP + rm` (e.g. the address of a stack array element
+  ## with a register index). `UXTX #shift` is a full 64-bit add with an optional LSL
+  ## (shift 0..4). ADD Xd, Xn|SP, Xm, UXTX #shift:
+  ##   1000 1011 001m mmmm 011s ss nn nnnd dddd   (option=011=UXTX, imm3=shift)
+  let instr = 0x8B200000'u32 or
+              (encodeReg(rm) shl 16) or
+              (0b011'u32 shl 13) or
+              ((uint32(shift) and 0x7) shl 10) or
+              (encodeReg(rn) shl 5) or
+              encodeReg(rd)
+  dest.addUint32(instr)
+
 # SUB instruction - register - register
 proc emitSub*(dest: var Bytes; rd, rn, rm: Register) =
   ## Emit SUB instruction: SUB rd, rn, rm

@@ -1,0 +1,28 @@
+(.nif27)
+(.indexat 427              )
+(stmts
+ (type :E.0 .
+  (object .))
+ (type :Wrap.0 .
+  (object .
+   (fld :x.0 .
+    (i 64))
+   (fld :e.0 . E.0)))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :w.0 . Wrap.0 .)
+   (asgn
+    (dot w.0 x.0 0)42)
+   (call exit.c
+    (dot w.0 x.0 0)))))(.index)

@@ -1,0 +1,90 @@
+(.nif27)
+(.indexat 1517             )
+(stmts
+ (type :Pair.0 .
+  (object .
+   (fld :a.0 .
+    (i 64))
+   (fld :b.0 .
+    (i 64))))
+ (type :Big.0 .
+  (object .
+   (fld :a.0 .
+    (i 64))
+   (fld :b.0 .
+    (i 64))
+   (fld :c.0 .
+    (i 64))))
+ (gvar :g_oc.0 . Pair.0 .)
+ (gvar :g_cp.0 . Pair.0 .)
+ (gvar :g_sm.0 . Pair.0 .)
+ (gvar :g_bg.0 . Big.0 .)
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :mk.0
+  (params)Pair.0
+  (pragmas)
+  (stmts
+   (ret
+    (oconstr Pair.0
+     (kv a.0 8)
+     (kv b.0 2)))))
+ (proc :mkBig.0
+  (params)Big.0
+  (pragmas)
+  (stmts
+   (ret
+    (oconstr Big.0
+     (kv a.0 5)
+     (kv b.0 6)
+     (kv c.0 7)))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (asgn g_oc.0
+    (oconstr Pair.0
+     (kv a.0 3)
+     (kv b.0 4)))
+   (var :loc.0 . Pair.0
+    (oconstr Pair.0
+     (kv a.0 3)
+     (kv b.0 4)))
+   (asgn g_cp.0 loc.0)
+   (asgn g_sm.0
+    (call mk.0))
+   (asgn g_bg.0
+    (call mkBig.0))
+   (call exit.c
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (add
+       (i 64)
+       (add
+        (i 64)
+        (add
+         (i 64)
+         (add
+          (i 64)
+          (add
+           (i 64)
+           (add
+            (i 64)
+            (dot g_oc.0 a.0 0)
+            (dot g_oc.0 b.0 0))
+           (dot g_cp.0 a.0 0))
+          (dot g_cp.0 b.0 0))
+         (dot g_sm.0 a.0 0))
+        (dot g_sm.0 b.0 0))
+       (dot g_bg.0 a.0 0))
+      (dot g_bg.0 b.0 0))
+     (dot g_bg.0 c.0 0))))))(.index)
