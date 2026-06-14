@@ -116,6 +116,10 @@ type
                                              ## initializers, emitted as a synthetic init
                                              ## proc the entry calls (see `buildGlobalInitProc`)
     globalInitSym*: string                    ## the synthetic init proc's asm-NIF symbol
+    ovfSigned*: bool                          ## signedness of the most recent `keepovf` op, so
+                                             ## the `(ovf)` test that immediately follows it picks
+                                             ## the right hardware-flag branch (`jo`/`jno` for a
+                                             ## signed op, `jb`/`jae` = CF for an unsigned op)
 
 # ── type predicates ─────────────────────────────────────────────────────────
 

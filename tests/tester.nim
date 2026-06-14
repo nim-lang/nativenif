@@ -105,7 +105,11 @@ proc arkhamTests() =
 # function-pointer calls, `(pat …)` pointer indexing, and thread-locals. List a
 # test's stem here if a new arm64-only TODO is introduced.
 const arkhamLinuxA64Unsupported: seq[string] = @[
-  # (empty) The a64 backend now reaches x86-64 parity on every arkham test, including
+  # Overflow checking (`keepovf`/`(ovf)`) is x86-only for now: it lowers to a branch on
+  # the hardware overflow flag (`jo`/`jb`), and the a64 backend has no `keepovf`/`(ovf)`
+  # codegen yet (it would need flag-setting `adds`/`subs` + a `cset`/`b.vs` capture).
+  "overflow_check",
+  # The a64 backend otherwise reaches x86-64 parity on every arkham test, including
   # the value-core aggregate paths: object/array constructors as a var-init, a call
   # argument, or into a complex lvalue, plus NESTED aggregate fields. The last
   # blocker was a nifasm a64 bug — `parseOperandA64`'s `(dot …)` dropped the inner
