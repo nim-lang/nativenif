@@ -40,6 +40,9 @@ const arkhamDarwinUnsupported: seq[string] =
     # MAP_ANONYMOUS == 0x20 on Linux). On macOS MAP_ANON == 0x1000, so 34 is
     # MAP_PRIVATE plus an unsupported bit and mmap returns MAP_FAILED.
     "mmap_anon",
+    # macOS's native arch is arm64, which has no `keepovf`/`(ovf)` codegen yet
+    # (overflow checking is x86-only for now — see arkhamLinuxA64Unsupported).
+    "overflow_check",
   ]
 
 proc arkhamTests() =
