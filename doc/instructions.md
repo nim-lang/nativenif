@@ -200,6 +200,7 @@
 | `(syproc D ...)`       | NifasmDecl                  | system-call proc declaration (proctype + clobbers + number) |
 | `(kill S)`             | X64Inst, A64Inst            | kill variable |
 | `(cast T E)`         | NifasmExpr                  | type cast |
+| `(reloc O S)`          | NifasmExpr                  | rodata relocation: bake symbol S's address at byte offset O |
 | `(lock I)`             | X64Inst                  | atomic lock prefix |
 | `(xchg D S)`           | X64Inst                  | atomic exchange |
 | `(cmpxchg D S)`        | X64Inst                  | atomic compare and exchange |

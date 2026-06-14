@@ -100,6 +100,7 @@ proc boolType*(a: var AsmBuf) = a.keyword BoolT
 proc voidType*(a: var AsmBuf) = a.keyword VoidT
 
 template objectType*(a: var AsmBuf; body: untyped) = a.tree ObjectT: body
+template unionType*(a: var AsmBuf; body: untyped) = a.tree UnionT: body
 template ptrType*(a: var AsmBuf; body: untyped) = a.tree PtrT: body
 template aptrType*(a: var AsmBuf; body: untyped) = a.tree AptrT: body
 template arrayType*(a: var AsmBuf; body: untyped) = a.tree ArrayT: body

@@ -390,8 +390,16 @@ proc constAddrSym*(c: Cursor): string =
 proc appendLE(buf: var string; bits: uint64; size: int) =
   for i in 0 ..< size: buf.add char((bits shr (8 * i)) and 0xFF'u64)
 
-proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string) =
+proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string;
+                   relocs: var seq[(int, string)]) =
   ## Append the in-memory bytes of constant `val` (of NIFC type `typ`) to `buf`.
+  ## A pointer/proc field whose value is a *symbol address* (e.g. a vtable/RTTI
+  ## const pointing at another const or a proc — `(cast (ptr …) Foo.0.vt)`) cannot
+  ## be baked at compile time; record `(blob-offset, symbol-name)` in `relocs` and
+  ## reserve 8 placeholder bytes. The backend emits these as `(reloc off sym)`
+  ## children of the `(rodata …)` blob and nifasm bakes the resolved address into
+  ## `.text` in `writeElf`. `relocs` offsets are relative to the blob start, so the
+  ## top-level caller must pass a `buf` that begins empty (the blob).
   let rt = resolveType(p, typ)
   if rt.kind != TagLit: raiseAssert "arkham const: unresolved type"
   case rt.typeKind
@@ -399,7 +407,12 @@ proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string) =
     let (sz, _) = typeSizeAlign(p, rt)
     appendLE(buf, constLitBits(val), sz)
   of PtrT, AptrT, ProctypeT:
-    appendLE(buf, constLitBits(val), 8)      # nil only (address relocs: TODO)
+    let addrSym = constAddrSym(val)
+    if addrSym.len > 0:
+      relocs.add (buf.len, addrSym)          # link-time address (baked by nifasm)
+      for i in 0 ..< 8: buf.add '\0'         # placeholder reserved for the address
+    else:
+      appendLE(buf, constLitBits(val), 8)    # nil / integer-encoded address
   of FlexarrayT:
     var et = rt; inc et                      # element type
     if val.kind == StrLit:
@@ -408,7 +421,7 @@ proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string) =
       var vc = val                           # (aconstr T elem*)
       vc.into:
         skip vc                              # the constructed type
-        while vc.hasMore: (constToBytes(p, et, vc, buf); skip vc)
+        while vc.hasMore: (constToBytes(p, et, vc, buf, relocs); skip vc)
   of ArrayT:
     var et = rt; inc et                      # element type
     let elemType = et
@@ -419,7 +432,7 @@ proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string) =
     var vc = val                             # (aconstr T elem*)
     vc.into:
       skip vc                                # the constructed type
-      while vc.hasMore: (constToBytes(p, elemType, vc, buf); skip vc; inc count)
+      while vc.hasMore: (constToBytes(p, elemType, vc, buf, relocs); skip vc; inc count)
     for k in count ..< n:                    # zero-fill trailing elements
       for i in 0 ..< esz: buf.add '\0'
   of ObjectT:
@@ -462,7 +475,7 @@ proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string) =
           if fal > maxAl: maxAl = fal
           while buf.len < startLen + off: buf.add '\0'   # pad to field offset
           if fi < vals.len:
-            constToBytes(p, ftype, vals[fi], buf)
+            constToBytes(p, ftype, vals[fi], buf, relocs)
           else:
             for i in 0 ..< fsz: buf.add '\0'
           inc fi

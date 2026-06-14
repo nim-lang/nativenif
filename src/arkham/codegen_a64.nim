@@ -657,11 +657,18 @@ proc genTypeBody(g: var CodeGen; c: var Cursor) =
         g.ab.objectType:
           if baseName.len > 0: g.ab.sym baseName
           while c.hasMore:
-            c.into:                         # (fld :name pragmas type)
-              let fn = symName(c); inc c
-              skip c                        # field pragmas (dropped)
-              g.ab.fldDef(fn):
-                g.genTypeBody(c)            # field type
+            if c.kind == TagLit and c.typeKind == UnionT:
+              # An object VARIANT's union part: `(union (object …branch)+)`. Branches
+              # overlap (nifasm lays the union out as max branch size); emit through.
+              g.ab.unionType:
+                c.into:
+                  while c.hasMore: g.genTypeBody(c)
+            else:
+              c.into:                       # (fld :name pragmas type)
+                let fn = symName(c); inc c
+                skip c                      # field pragmas (dropped)
+                g.ab.fldDef(fn):
+                  g.genTypeBody(c)          # field type
     else:
       raiseAssert "arkham v1: type not supported: " & $c.typeKind
   else:
@@ -1019,8 +1026,21 @@ proc place2(g: var CodeGen; src: Location; dest: Reg) =
   of Imm: g.movImm(dest, src.ival)
   of NamedStack: g.emScalarLoad(dest, src.name)
   of Glob:
+    # `dest = &g` then `dest = [dest]`. The deref must be typed `(ptr <globalType>)` so
+    # it yields the global's PRECISE type: `dest` is bound to the *value* type, so a bare
+    # `(mem dest)` drops a pointer level — harmless for a scalar global, but a POINTER
+    # global would then load `object` where `(ptr object)` is wanted (nifasm is strict).
+    # Cast the address in the deref rather than spend a scarce bridge (mirrors the x64
+    # `scalarMemMov` Glob-load fix).
     g.emAdr(dest, src.name)
-    g.ab.tree MovA64: (g.emReg dest; g.ab.tree MemX: g.emReg dest)
+    g.ab.tree MovA64:
+      g.emReg dest
+      g.ab.tree MemX:
+        if not cursorIsNil(src.typ.typ):
+          var pt = g.prog.ptrTypeOf(src.typ.typ)
+          g.ab.tree CastX: (g.genTypeBody(pt); g.emReg dest)
+        else:
+          g.emReg dest
   of Tvar:
     if g.a64Linux: g.emAdr(dest, src.name)
     else: g.genTlvAddr(src.name, dest)
@@ -2916,10 +2936,15 @@ proc genGlobal(g: var CodeGen; name: string; decl: Cursor) =
     let hasValue = c.hasMore and c.kind != DotToken
     if isConst and hasValue:
       var bytes = ""
-      constToBytes(g.prog, typeCur, c, bytes)
+      var relocs: seq[(int, string)] = @[]
+      constToBytes(g.prog, typeCur, c, bytes, relocs)
       g.ab.tree RodataD:
         g.ab.symDef name
         g.ab.str bytes
+        for (off, sym) in relocs:               # symbol-address fields (vtable/RTTI)
+          g.ab.tree RelocX:
+            g.ab.intLit off
+            g.ab.sym sym
     else:
       g.ab.open NifasmDecl.GvarD
       g.ab.symDef name

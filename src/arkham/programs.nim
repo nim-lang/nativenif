@@ -458,6 +458,20 @@ proc resolveType*(p: var Program; c: Cursor): Cursor =
 
 proc typeSizeAlign*(p: var Program; c: Cursor): (int, int)
 
+proc unionSizeAlign(p: var Program; unionc: Cursor): (int, int) =
+  ## A union's branches OVERLAP: size = max(branch size), align = max(branch align).
+  ## NIFC object-variant branches are `(object …)` nodes (sized via `objSizeAlign`).
+  var uc = unionc
+  var maxSz = 0
+  var maxAl = 1
+  uc.into:
+    while uc.hasMore:
+      let (bsz, bal) = typeSizeAlign(p, uc)   # each branch is an (object …)
+      if bsz > maxSz: maxSz = bsz
+      if bal > maxAl: maxAl = bal
+      skip uc
+  result = (align(maxSz, maxAl), maxAl)
+
 proc objSizeAlign(p: var Program; bodyc: Cursor): (int, int) =
   var oc = bodyc
   var off = 0
@@ -469,12 +483,18 @@ proc objSizeAlign(p: var Program; bodyc: Cursor): (int, int) =
       if bal > maxAl: maxAl = bal
     skip oc                                    # base / inheritance slot
     while oc.hasMore:
-      oc.into:                                # (fld :name pragmas type)
-        inc oc; skip oc                       # name, field-pragmas
-        let (fsz, fal) = typeSizeAlign(p, oc)
-        skip oc                               # consume the field type
-        off = align(off, fal) + fsz
-        if fal > maxAl: maxAl = fal
+      if oc.kind == TagLit and oc.typeKind == UnionT:   # an object VARIANT's union part
+        let (usz, ual) = unionSizeAlign(p, oc)
+        off = align(off, ual) + usz
+        if ual > maxAl: maxAl = ual
+        skip oc
+      else:
+        oc.into:                              # (fld :name pragmas type)
+          inc oc; skip oc                     # name, field-pragmas
+          let (fsz, fal) = typeSizeAlign(p, oc)
+          skip oc                             # consume the field type
+          off = align(off, fal) + fsz
+          if fal > maxAl: maxAl = fal
   result = (align(off, maxAl), maxAl)
 
 proc typeSizeAlign*(p: var Program; c: Cursor): (int, int) =
@@ -504,6 +524,7 @@ proc typeSizeAlign*(p: var Program; c: Cursor): (int, int) =
         while t.hasMore: skip t               # consume any trailing qualifiers
         result = (0, eal)
     of ObjectT: result = objSizeAlign(p, c)
+    of UnionT: result = unionSizeAlign(p, c)
     of EnumT:                                 # collapses to its base integer type
       var t = c
       t.into:
@@ -566,11 +587,28 @@ proc fieldType*(p: var Program; objType: Cursor; field: string): Cursor =
     hasBase = oc.kind != DotToken
     skip oc
     while oc.hasMore:
-      oc.into:                                # (fld :name pragmas type)
-        let fn = symName(oc); inc oc
-        skip oc                               # field-pragmas
-        result = oc; skip oc                  # field type (a copy)
-        if fn == field: return
+      if oc.kind == TagLit and oc.typeKind == UnionT:
+        # An object VARIANT: search each `(union (object …branch)+)` branch's fields.
+        var u = oc
+        u.into:
+          while u.hasMore:                    # each branch is an (object . fld*)
+            var br = u
+            br.into:
+              skip br                          # branch base slot (`.`)
+              while br.hasMore:
+                br.into:                       # (fld :name pragmas type)
+                  let fn = symName(br); inc br
+                  skip br                       # field-pragmas
+                  result = br; skip br
+                  if fn == field: return
+            skip u
+        skip oc
+      else:
+        oc.into:                              # (fld :name pragmas type)
+          let fn = symName(oc); inc oc
+          skip oc                             # field-pragmas
+          result = oc; skip oc                # field type (a copy)
+          if fn == field: return
   if hasBase:                                 # not here → look in the inherited base
     return fieldType(p, resolveType(p, baseType), field)
   raiseAssert "arkham: field '" & field & "' not found"
