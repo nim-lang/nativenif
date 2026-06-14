@@ -305,9 +305,10 @@ type
     AtX = (ord(AtTagId), "at")  ## array index
     MemX = (ord(MemTagId), "mem")  ## memory reference
     CastX = (ord(CastTagId), "cast")  ## type cast
+    RelocX = (ord(RelocTagId), "reloc")  ## rodata relocation: bake symbol S's address at byte offset O
 
 proc rawTagIsNifasmExpr*(raw: TagEnum): bool {.inline.} =
-  raw in {SsizeTagId, CsizeTagId, ArgTagId, ResTagId, DotTagId, AtTagId, MemTagId, CastTagId}
+  raw in {SsizeTagId, CsizeTagId, ArgTagId, ResTagId, DotTagId, AtTagId, MemTagId, CastTagId, RelocTagId}
 
 type
   X64Flag* = enum

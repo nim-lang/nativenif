@@ -360,6 +360,12 @@ type
     # address into the `.bss` image in `writeElf` (after `finalize`). Without this
     # the slot stays zero and an indirect `call` through it jumps to address 0.
     bssSymInits: seq[tuple[off: int64, sym: Symbol, size: int]]  # (.bss byte offset, target symbol, size)
+    # A `const` read-only data blob (e.g. a vtable/RTTI table) with fields that are
+    # *symbol addresses* (a pointer to another const, or a proc address). The blob
+    # lives in `.text` at its rodata label; the target's vaddr isn't known until
+    # layout, so record (rodata label id, byte offset within the blob, target
+    # symbol) and bake the resolved address into `code` in `writeElf`.
+    rodataSymInits: seq[tuple[labelId: int, blobOff: int, sym: Symbol, size: int]]
 
   OperandKind = enum
     okReg       # Register operand
@@ -490,7 +496,19 @@ proc parseObjectBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
     while baseC.hasMore: skip baseC  # drain the field children (read via `n`)
 
   for fc in fields(n):
-    if not atTag(fc, FldTagId): error("Expected field definition", fc)
+    if atTag(fc, UnionTagId):
+      # An object VARIANT's union part: a region of `max(branchSize)` bytes whose
+      # branches overlap. Place it at the next aligned offset and rebase the union's
+      # (branch-local) field offsets onto it, then advance past the whole region.
+      var u = fc
+      let ut = parseUnionBody(u, scope, ctx)
+      offset = alignTo(offset, ut.align)
+      for (fn, ft, foff) in ut.fields:
+        flds.add (fn, ft, offset + foff)
+      if ut.align > maxAlign: maxAlign = ut.align
+      offset += ut.size
+      continue
+    if not atTag(fc, FldTagId): error("Expected field definition or union", fc)
     var f = fc
     # NIFC `FieldDecl ::= (fld SymbolDef FieldPragmas Type)` — takeField
     # tolerates the optional field-pragmas slot before the type.
@@ -817,30 +835,36 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
 
 
 proc parseUnionBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
+  ## A union's members OVERLAP (max size, shared base). NIFC object VARIANTS spell each
+  ## branch as a nested `(object …)` whose fields are SEQUENTIAL — so a branch's fields
+  ## keep their intra-branch offsets and only branches overlap. A bare `(fld …)` member
+  ## (a flat union) sits at offset 0. Offsets are relative to the union's base; the
+  ## enclosing `parseObjectBody` rebases them.
   var flds: seq[(string, Type, int)] = @[]
   var maxSize = 0
   var maxAlign = 1  # Track maximum alignment requirement
-  for fc in fields(n):
-    if not atTag(fc, FldTagId): error("Expected field definition", fc)
-    var f = fc
-    let fr = takeField(f, atTypeStart)   # tolerates NIFC's FieldPragmas slot
-    var nameC = fr.name
-    if nameC.kind != SymbolDef: error("Expected field name", nameC)
-    let name = symName(nameC)
-    var typC = fr.typ
-    let ftype = parseType(typC, scope, ctx)
-    flds.add (name, ftype, 0)            # union: every field overlays at offset 0
-
-    let size = asmSizeOf(ftype)
-    let fieldAlign = asmAlignOf(ftype)
-
-    # Union size is the maximum of all field sizes
-    if size > maxSize:
-      maxSize = size
-
-    # Track maximum alignment
-    if fieldAlign > maxAlign:
-      maxAlign = fieldAlign
+  var c = n
+  into c:
+    while c.hasMore:
+      if atTag(c, ObjectTagId):                # a variant branch: sequential fields
+        var b = c
+        let bt = parseObjectBody(b, scope, ctx)  # 0-based branch field offsets + size
+        for f in bt.fields: flds.add f
+        if bt.size > maxSize: maxSize = bt.size
+        if bt.align > maxAlign: maxAlign = bt.align
+        skip c
+      elif atTag(c, FldTagId):                 # a flat union member at offset 0
+        var f = c
+        let fr = takeField(f, atTypeStart)     # tolerates NIFC's FieldPragmas slot
+        if fr.name.kind != SymbolDef: error("Expected field name", fr.name)
+        var typC = fr.typ
+        let ftype = parseType(typC, scope, ctx)
+        flds.add (symName(fr.name), ftype, 0)
+        if asmSizeOf(ftype) > maxSize: maxSize = asmSizeOf(ftype)
+        if asmAlignOf(ftype) > maxAlign: maxAlign = asmAlignOf(ftype)
+        skip c
+      else:
+        error("union member must be an object branch or a field", c)
   skip n # advance past the whole (union …) node
 
   # Round up size to be a multiple of the union's alignment
@@ -5472,6 +5496,28 @@ proc writeElf(a: var GenContext; outfile: string) =
       code[pos + 4] = byte((disp shr 8) and 0xFF)
       code[pos + 5] = byte((disp shr 16) and 0xFF)
       code[pos + 6] = byte((disp shr 24) and 0xFF)
+  # Bake rodata symbol-address relocations (e.g. a vtable/RTTI const whose fields
+  # are addresses of other consts or procs). The blob lives in `.text` at its
+  # rodata label; write the resolved target vaddr into `code` at `label + blobOff`.
+  # Same target-vaddr arithmetic as `bssSymInits`: a proc/rodata label sits at
+  # `baseAddr + headers + labelPos`, a gvar at `bssVaddr + its .bss off`.
+  if a.rodataSymInits.len > 0:
+    var labelPos = initTable[int, int]()
+    for ld in a.buf.labels: labelPos[int(ld.id)] = ld.position
+    for it in a.rodataSymInits:
+      if not labelPos.hasKey(it.labelId): continue
+      let sitePos = labelPos[it.labelId] + it.blobOff
+      var targetVaddr = 0'u64
+      case it.sym.kind
+      of skProc, skRodata:
+        if labelPos.hasKey(it.sym.offset):
+          targetVaddr = baseAddr + headersSize.uint64 + labelPos[it.sym.offset].uint64
+      of skGvar:
+        targetVaddr = bssVaddr + it.sym.size.uint64
+      else: discard
+      for i in 0 ..< it.size:
+        if sitePos + i < code.len:
+          code[sitePos + i] = byte((targetVaddr shr (8 * i)) and 0xFF)
   let bssAlignedSize = if bssSize > 0: ((bssSize + pageSize - 1) and not (pageSize - 1)) else: 0.uint64
 
   let machine = case a.arch
@@ -5656,14 +5702,29 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
       pass2Proc(n, ctx)
   of skRodata:
     if declTag == RodataD:
-      inc n  # rodata
-      inc n  # name (already have sym)
-      let s = getStr(n)
       if sym.offset == -1:
         let labId = ctx.buf.createLabel()
         sym.offset = int(labId)
       ctx.buf.defineLabel(LabelId(sym.offset))
-      for c in s: ctx.buf.data.add byte(c)
+      var rc = n                              # (rodata :name "str" (reloc off sym)*)
+      into rc:
+        skip rc                               # name (already have sym)
+        let s = getStr(rc); skip rc
+        for ch in s: ctx.buf.data.add byte(ch)
+        # Optional `(reloc off sym)` children: a field of this blob holds the
+        # address of another symbol (vtable/RTTI). Mark the target reachable and
+        # record the site so `writeElf` bakes its vaddr into the blob (in `.text`).
+        while rc.hasMore:
+          var relc = rc
+          into relc:
+            let blobOff = getInt(relc); skip relc
+            let tname = getSym(relc)
+            let tsym = lookupWithAutoImport(ctx, ctx.scope, tname, relc)
+            skip relc                         # past the target symbol
+            if tsym != nil:
+              ctx.rodataSymInits.add (labelId: sym.offset, blobOff: blobOff.int,
+                                      sym: tsym, size: 8)
+          skip rc
   of skGvar:
     if declTag == GvarD:
       # Allocate space in .bss section

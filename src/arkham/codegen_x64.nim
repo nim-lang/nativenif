@@ -459,11 +459,22 @@ proc scalarMemMov(g: var CodeGen; loc: Location; reg: Reg; load: bool) =
       if load: (g.emReg reg; g.ab.sym loc.name)
       else:    (g.ab.sym loc.name; g.emReg reg)
   of Glob:
-    if load:                                       # &g into reg, then deref it
-      g.emGlobalAddr(reg, loc.name)
+    if load:                                       # &g into a typed staging temp, then deref
+      # The address temp is `(ptr <globalType>)` so the `(mem p)` deref yields the
+      # global's PRECISE type. Reusing `reg` (bound to the *value* type) as the address
+      # drops a pointer level — harmless for a scalar global (`addrWidthMove` tolerates
+      # it), but a POINTER global would then load `object` where `(ptr object)` is wanted
+      # (nifasm is strict). Mirror the store branch below.
+      var pSlot = ScalarSlot
+      if not cursorIsNil(loc.typ.typ):
+        pSlot = typeToSlot(g.prog.ptrTypeOf(loc.typ.typ))
+      let p = g.pickStagingSealed("a global load address")
+      g.bindTemp(p, pSlot)
+      g.emGlobalAddr(p, loc.name)
       g.ab.tree MovX64:
         g.emReg reg
-        g.ab.tree MemX: g.emReg reg
+        g.ab.tree MemX: g.emReg p
+      g.giveBack p
     else:                                          # &g into a staging temp, then store
       # Type the address temp as `(ptr <globalType>)` so the `(mem p)` deref carries
       # the global's PRECISE type — a store of a typed pointer value into a pointer
@@ -1136,11 +1147,20 @@ proc genTypeBody(g: var CodeGen; c: var Cursor) =
         g.ab.objectType:
           if baseName.len > 0: g.ab.sym baseName
           while c.hasMore:
-            c.into:                           # (fld :name pragmas type)
-              let fn = symName(c); inc c
-              skip c                          # field pragmas (dropped)
-              g.ab.fldDef(fn):
-                g.genTypeBody(c)
+            if c.kind == TagLit and c.typeKind == UnionT:
+              # An object VARIANT's union part: `(union (object …branch)+)`. Each branch
+              # is an object whose fields are sequential; branches overlap (nifasm lays
+              # the union out as max branch size). Emit it through — `genTypeBody`
+              # recurses on each branch object.
+              g.ab.unionType:
+                c.into:
+                  while c.hasMore: g.genTypeBody(c)
+            else:
+              c.into:                         # (fld :name pragmas type)
+                let fn = symName(c); inc c
+                skip c                        # field pragmas (dropped)
+                g.ab.fldDef(fn):
+                  g.genTypeBody(c)
     of EnumT:                                 # an enum is just its base integer type
       c.into:
         g.genTypeBody(c)                      # (enum <base> (efld …)…) → <base>
@@ -3565,10 +3585,15 @@ proc genGlobal(g: var CodeGen; name: string; decl: Cursor) =
       # A true `const`: a read-only data blob in `.text` (no `.bss`, no entry-time
       # init — emitGlobalInits skips ConstS).
       var bytes = ""
-      constToBytes(g.prog, typeCur, c, bytes)
+      var relocs: seq[(int, string)] = @[]
+      constToBytes(g.prog, typeCur, c, bytes, relocs)
       g.ab.tree RodataD:
         g.ab.symDef name
         g.ab.str bytes
+        for (off, sym) in relocs:               # symbol-address fields (vtable/RTTI)
+          g.ab.tree RelocX:
+            g.ab.intLit off
+            g.ab.sym sym
     else:
       g.ab.open NifasmDecl.GvarD
       g.ab.symDef name
