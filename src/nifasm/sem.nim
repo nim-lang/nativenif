@@ -66,6 +66,9 @@ type
     reg*: TagEnum     # For var/param in register (e.g. RaxTagId)
     offset*: int      # Stack offset, label position, or field offset
     size*: int        # For stack slots
+    dataConst*: bool  # skRodata only: this `const` blob has symbol-pointer fields
+                      # (`(reloc ...)`), so it must live in writable __DATA and be
+                      # rebased by dyld at load (Mach-O). Plain consts stay in __TEXT.
 
     # Control flow variable tracking
     used*: bool       # For cfvar: has it been used in an ite?

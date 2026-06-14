@@ -27,6 +27,14 @@ type
     threadData*: seq[byte]        # __thread_data init template dyld copies per thread
     sites*: seq[(int, int)]       # (adrp position in .text, descriptor index) to patch with the descriptor address
 
+  RodataRebase* = object
+    ## One symbol-pointer field of a `dataConst` blob in __DATA. `fieldOff` is the
+    ## pointer's byte offset within the .bss/__DATA region. The stored value is the
+    ## target's preferred (un-slid) vaddr, which dyld then rebases by the load slide.
+    fieldOff*: int          # byte offset of the 8-byte pointer within the __DATA region
+    targetInData*: bool     # true: target lives in __DATA at `targetOff`; false: in __TEXT
+    targetOff*: int         # __DATA region offset, or __TEXT code offset, of the target
+
   MachO_Header* = object
     magic*: uint32
     cputype*: uint32
@@ -195,6 +203,15 @@ const
   BIND_OPCODE_DO_BIND* = 0x90'u8
   BIND_TYPE_POINTER* = 1'u8
 
+  # Rebase opcodes for LC_DYLD_INFO_ONLY. A rebase tells dyld to add the load slide
+  # to an absolute pointer stored in a writable segment — exactly what a `const`
+  # whose value is the address of another symbol needs on a PIE image.
+  REBASE_OPCODE_DONE* = 0x00'u8
+  REBASE_OPCODE_SET_TYPE_IMM* = 0x10'u8
+  REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB* = 0x20'u8
+  REBASE_OPCODE_DO_REBASE_IMM_TIMES* = 0x50'u8
+  REBASE_TYPE_POINTER* = 1'u8
+
 proc initMachOHeader*(cputype, cpusubtype: uint32; ncmds, sizeofcmds: uint32; flags: uint32 = 0): MachO_Header =
   result.magic = MH_MAGIC_64
   result.cputype = cputype
@@ -284,12 +301,33 @@ proc generateBindInfo(extProcs: seq[ExternalProcInfo]; dataSegmentIndex: int;
                    tlvVarsDataOffset + uint64(i * 24))
   result.add(BIND_OPCODE_DONE)
 
+proc generateRebaseInfo(rebases: seq[RodataRebase]; dataSegmentIndex: int;
+                        bssOff: uint64): seq[byte] =
+  ## Emit one pointer rebase per `dataConst` symbol-pointer field. Each entry sets
+  ## the segment+offset (within __DATA) of the 8-byte pointer and asks dyld to add
+  ## the load slide to it. Offsets are relative to the __DATA segment start, so the
+  ## field's __DATA-region offset is biased by `bssOff` (where the region sits in
+  ## the segment, after the GOT/TLV sections).
+  result = @[]
+  if rebases.len == 0: return
+  result.add(REBASE_OPCODE_SET_TYPE_IMM or REBASE_TYPE_POINTER)
+  for rb in rebases:
+    result.add(REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB or uint8(dataSegmentIndex and 0xF))
+    var off = bssOff + uint64(rb.fieldOff)
+    while off >= 0x80:
+      result.add(byte((off and 0x7F) or 0x80))
+      off = off shr 7
+    result.add(byte(off and 0x7F))
+    result.add(REBASE_OPCODE_DO_REBASE_IMM_TIMES or 1'u8)
+  result.add(REBASE_OPCODE_DONE)
+
 proc writeMachO*(code: Bytes; bssSize: int;
                  cputype, cpusubtype: uint32; outfile: string;
                  dynlink: DynLinkInfo = DynLinkInfo();
                  gvarSites: seq[(int, int)] = @[];
                  tlv: TlvInfo = TlvInfo();
-                 bssInits: seq[tuple[off: int64, val: int64, size: int]] = @[]) =
+                 bssInits: seq[tuple[off: int64, val: int64, size: int]] = @[];
+                 rebases: seq[RodataRebase] = @[]) =
   let pageSize = 0x4000.uint64  # 16KB page size for arm64 macOS
   let baseAddr = 0x100000000.uint64  # macOS default base address
 
@@ -302,8 +340,10 @@ proc writeMachO*(code: Bytes; bssSize: int;
   let hasTlv = tlv.descriptorOffsets.len > 0
   # A gvar with a compile-time constant initializer (e.g. `g = 41.0`) needs its
   # bytes on disk; a plain zero-fill `__bss` would start it at 0. When present,
-  # the bss region becomes file-backed and we write the init bytes below.
-  let hasBssInits = bssInits.len > 0
+  # the bss region becomes file-backed and we write the init bytes below. A
+  # `dataConst` rebase also needs a file-backed slot: dyld adds the slide to the
+  # preferred vaddr we write there, so that vaddr must be real on-disk bytes.
+  let hasBssInits = bssInits.len > 0 or rebases.len > 0
   let nTlv = tlv.descriptorOffsets.len
   let tvarsSize = nTlv * 24
   var threadData = tlv.threadData
@@ -404,6 +444,10 @@ proc writeMachO*(code: Bytes; bssSize: int;
   let linkeditVmaddr = if hasData: dataVmaddr + dataSize else: textVmaddr + textSegmentFileSize
   let linkeditFileoff = textSegmentFileSize + uint64(dataFileSize)
 
+  # Rebase info: one entry per `dataConst` symbol-pointer field (segment 2 = __DATA),
+  # so dyld slides the preferred target vaddr we bake into each slot.
+  let rebaseInfo = generateRebaseInfo(rebases, 2, uint64(bssOff))
+
   # Bind info: external-proc GOT slots plus each TLV descriptor's __tlv_bootstrap
   # thunk. libSystem is the sole LC_LOAD_DYLIB, so its ordinal is 1.
   let bindInfo = if hasExtProcs or hasTlv:
@@ -412,8 +456,10 @@ proc writeMachO*(code: Bytes; bssSize: int;
   else:
     @[]
 
-  # Linkedit contains: bind info + string table (1 byte null terminator)
-  let linkeditFilesize = (if bindInfo.len > 0: uint64(bindInfo.len) + 8 else: 32.uint64)
+  # Linkedit contains: rebase info + bind info + string table (1 byte null term).
+  let linkeditFilesize = (if rebaseInfo.len + bindInfo.len > 0:
+                            uint64(rebaseInfo.len + bindInfo.len) + 8
+                          else: 32.uint64)
   let linkeditVmsize = (linkeditFilesize + pageSize - 1) and not (pageSize - 1)
 
   # Create __PAGEZERO segment (reserves low memory, no file content)
@@ -471,14 +517,18 @@ proc writeMachO*(code: Bytes; bssSize: int;
                                        linkeditFileoff, linkeditFilesize,
                                        VM_PROT_READ, VM_PROT_READ, 0)
 
-  # Create LC_DYLD_INFO_ONLY
+  # Create LC_DYLD_INFO_ONLY. Linkedit layout: [rebase][bind][string table].
   var dyldInfo: MachO_DyldInfo
   dyldInfo.cmd = LC_DYLD_INFO_ONLY
   dyldInfo.cmdsize = uint32(sizeof(MachO_DyldInfo))
-  dyldInfo.rebase_off = 0
-  dyldInfo.rebase_size = 0
+  if rebaseInfo.len > 0:
+    dyldInfo.rebase_off = uint32(linkeditFileoff)
+    dyldInfo.rebase_size = uint32(rebaseInfo.len)
+  else:
+    dyldInfo.rebase_off = 0
+    dyldInfo.rebase_size = 0
   if bindInfo.len > 0:
-    dyldInfo.bind_off = uint32(linkeditFileoff)
+    dyldInfo.bind_off = uint32(linkeditFileoff + uint64(rebaseInfo.len))
     dyldInfo.bind_size = uint32(bindInfo.len)
   else:
     dyldInfo.bind_off = 0
@@ -494,7 +544,7 @@ proc writeMachO*(code: Bytes; bssSize: int;
   var symtab: MachO_Symtab
   symtab.cmd = LC_SYMTAB
   symtab.cmdsize = uint32(sizeof(MachO_Symtab))
-  let symtabOffset = linkeditFileoff + uint64(bindInfo.len)
+  let symtabOffset = linkeditFileoff + uint64(rebaseInfo.len + bindInfo.len)
   symtab.symoff = uint32(symtabOffset)
   symtab.nsyms = 0
   symtab.stroff = uint32(symtabOffset)
@@ -732,14 +782,27 @@ proc writeMachO*(code: Bytes; bssSize: int;
         let idx = bssOff + it.off.int + b
         if idx < dataContent.len:
           dataContent[idx] = byte((it.val shr (8 * b)) and 0xFF)
+    # `dataConst` symbol-pointer fields: store the target's PREFERRED (un-slid)
+    # vaddr; the matching rebase opcode makes dyld add the load slide at runtime.
+    # A target in __TEXT sits at `textSectionVmaddr + code offset`; one in __DATA at
+    # `dataVmaddr + bssOff + region offset`.
+    for rb in rebases:
+      let targetVaddr =
+        if rb.targetInData: dataVmaddr + uint64(bssOff) + uint64(rb.targetOff)
+        else: textSectionVmaddr + uint64(rb.targetOff)
+      let ptrIdx = bssOff + rb.fieldOff
+      for b in 0 ..< 8:
+        if ptrIdx + b < dataContent.len:
+          dataContent[ptrIdx + b] = byte((targetVaddr shr (8 * b)) and 0xFF)
     f.writeData(unsafeAddr dataContent[0], dataContent.len)
 
-  # Write __LINKEDIT content
+  # Write __LINKEDIT content: rebase info, then bind info, then the (empty) string
+  # table — matching the dyld_info offsets computed above.
   var linkeditData = newSeq[byte](linkeditFilesize.int)
-  if bindInfo.len > 0:
-    # Copy bind info
-    for i, b in bindInfo:
-      linkeditData[i] = b
+  for i, b in rebaseInfo:
+    linkeditData[i] = b
+  for i, b in bindInfo:
+    linkeditData[rebaseInfo.len + i] = b
   # Add null terminator for empty string table at the end
   linkeditData[^1] = 0
   f.writeData(unsafeAddr linkeditData[0], linkeditData.len)

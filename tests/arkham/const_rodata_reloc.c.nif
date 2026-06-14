@@ -1,0 +1,26 @@
+(.nif27)
+(.indexat 365              )
+(stmts
+ (const :cval.0 .
+  (i 32)42)
+ (const :cptr.0 .
+  (ptr
+   (i 32))
+  (cast
+   (ptr
+    (i 32))cval.0))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (call exit.c
+    (deref cptr.0)))))(.index)

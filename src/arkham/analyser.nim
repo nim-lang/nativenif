@@ -186,11 +186,15 @@ proc analyse(c: var Context; n: var Cursor) =
           while n.hasMore: analyse(c, n)
           c.inAddr = oldA; c.inAsgnTarget = oldT; c.inArrayIndex = oldX
       of NoExpr:
-        # `elif`/`else`/`of` carry a condition and a statement body — recurse so
-        # uses and calls inside `if`/`case` branches are seen. Other NoExpr nodes
-        # (types, etc.) carry no locals and are skipped.
+        # `elif`/`else`/`of` carry a condition and a statement body, and a `kv` carries
+        # an `(oconstr …)` field VALUE — recurse so uses and calls inside `if`/`case`
+        # branches AND object-constructor fields are seen. Missing the `kv` value made an
+        # oconstr field that reads a pre-computed temp (e.g. `Error(left: x1, right: x2)`
+        # where `x1`/`x2` are `=dup` results) invisible to liveness, so the temp was
+        # freed at its def and its register reused by the next field's temp → both fields
+        # ended up the same value. Other NoExpr nodes (types, etc.) carry no locals.
         case n.substructureKind
-        of ElifU, ElseU, OfU: analyseChildren(c, n)
+        of ElifU, ElseU, OfU, KvU: analyseChildren(c, n)
         else: skip n
       of DivC, ModC:
         c.res.clobbersDivReg = true     # idiv/div clobbers rdx

@@ -297,6 +297,7 @@ proc rawTagIsNifasmDecl*(raw: TagEnum): bool {.inline.} =
 type
   NifasmExpr* = enum
     NoExpr
+    AlignX = (ord(AlignTagId), "align")  ## stack-slot alignment annotation (child of `(s)`)
     SsizeX = (ord(SsizeTagId), "ssize")  ## stack size expression
     CsizeX = (ord(CsizeTagId), "csize")  ## call stack size expression
     ArgX = (ord(ArgTagId), "arg")  ## argument reference in prepare block
@@ -308,7 +309,7 @@ type
     RelocX = (ord(RelocTagId), "reloc")  ## rodata relocation: bake symbol S's address at byte offset O
 
 proc rawTagIsNifasmExpr*(raw: TagEnum): bool {.inline.} =
-  raw in {SsizeTagId, CsizeTagId, ArgTagId, ResTagId, DotTagId, AtTagId, MemTagId, CastTagId, RelocTagId}
+  raw in {AlignTagId, SsizeTagId, CsizeTagId, ArgTagId, ResTagId, DotTagId, AtTagId, MemTagId, CastTagId, RelocTagId}
 
 type
   X64Flag* = enum

@@ -1,0 +1,40 @@
+(.nif27)
+(.indexat 580              )
+(stmts
+ (type :S.0 .
+  (object .
+   (fld :x.0 .
+    (i 64))
+   (fld :y.0 .
+    (i 64))
+   (fld :z.0 .
+    (i 64))))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :a.0 .
+    (array S.0 3).)
+   (asgn
+    (dot
+     (at a.0 2)x.0 0)42)
+   (var :p.0 .
+    (aptr S.0)
+    (cast
+     (aptr S.0)
+     (addr
+      (at a.0 0))))
+   (var :i.0 .
+    (i 64)2)
+   (call exit.c
+    (dot
+     (pat p.0 i.0)x.0 0)))))(.index)

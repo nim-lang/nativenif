@@ -1,0 +1,54 @@
+(.nif27)
+(.indexat 870              )
+(stmts
+ (type :Base.0 .
+  (object .
+   (fld :h.0 .
+    (i 64))))
+ (type :Derived.0 .
+  (object Base.0
+   (fld :x.0 .
+    (i 64))))
+ (type :Mid.0 .
+  (object Base.0
+   (fld :m.0 .
+    (i 64))))
+ (type :Deep.0 .
+  (object Mid.0
+   (fld :d.0 .
+    (i 64))))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :a.0 . Derived.0
+    (oconstr Derived.0 5
+     (kv x.0 15)))
+   (var :b.0 . Deep.0
+    (oconstr Deep.0
+     (oconstr Mid.0 1
+      (kv m.0 6))
+     (kv d.0 15)))
+   (call exit.c
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (dot a.0 h.0 0)
+      (dot a.0 x.0 0))
+     (add
+      (i 64)
+      (add
+       (i 64)
+       (dot b.0 h.0 0)
+       (dot b.0 m.0 0))
+      (dot b.0 d.0 0)))))))(.index)

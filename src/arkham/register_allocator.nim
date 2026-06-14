@@ -95,6 +95,10 @@ type
                                       ## 32/64 = a float return (the value goes to xmm0)
     retIndirect: bool                 ## the proc returns a >16B aggregate via a hidden
                                       ## result pointer (rdi in, parked in a callee-saved reg)
+    retAggr: bool                     ## the proc returns an aggregate (≤16B in regs OR
+                                      ## >16B via the hidden ptr) — drives the `RetS` marshal
+    retAggrSlot: AsmSlot              ## the aggregate return type's slot (AMem); used to
+                                      ## allocate an inline `(ret (oconstr …))` value
     atScratch: HashSet[int]           ## value-core: `(at …)` positions needing a scratch GPR
                                       ## (non-SIB element stride); sized by the codegen
 
@@ -855,6 +859,7 @@ proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = 
           b.ra.aux[atPos] = ExprAux(scratch: @[t.r])
         else: raiseAssert "arkham: out of registers for an index stride scratch"
     of PatC:
+      let patPos = b.posOf(n)
       n.into:
         var d = needsReg(ScalarSlot)
         allocValue(b, n, d)                  # the pointer → a register (its home)
@@ -863,6 +868,14 @@ proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = 
           var idx = needsReg(ScalarSlot)
           allocValue(b, n, idx)             # register index → a register (folds via scale)
         while n.hasMore: skip n
+      if patPos in b.atScratch:
+        # Non-SIB pointer-element stride: reserve a scratch GPR for nifasm's 3-operand
+        # `(at (cast (aptr E) p) idx scratch)`, just like the `AtC` case. Freed by
+        # `releaseLvalTemps` alongside the pointer/index temps.
+        let t = b.reserveTmp(ScalarSlot)
+        if t.kind == InReg:
+          b.ra.aux[patPos] = ExprAux(scratch: @[t.r])
+        else: raiseAssert "arkham: out of registers for a pat stride scratch"
     else:
       raiseAssert "arkham: computed lvalue base not supported: " & $n.exprKind
   else:
@@ -1193,11 +1206,16 @@ proc allocConstr(b: var Builder; n: var Cursor) =
   n.into:
     skip n                                     # the constructed type
     while n.hasMore:
-      n.into:                                  # (kv field value [depth])
-        skip n                                 # field name
-        if n.hasMore:
-          allocStore(b, n, fieldLoc("", "", "", b.tc.exprSlot(n)), b.posOf(n))
-        while n.hasMore: skip n                 # optional inherited-depth INTLIT
+      if n.kind == TagLit and n.exprKind == OconstrC:
+        allocConstr(b, n)                       # nested inherited-base sub-object
+      elif n.substructureKind == KvU:
+        n.into:                                # (kv field value [depth])
+          skip n                               # field name
+          if n.hasMore:
+            allocStore(b, n, fieldLoc("", "", "", b.tc.exprSlot(n)), b.posOf(n))
+          while n.hasMore: skip n              # optional inherited-depth INTLIT
+      else:                                    # leading bare inherited-base value (vtable ptr)
+        allocStore(b, n, fieldLoc("", "", "", b.tc.exprSlot(n)), b.posOf(n))
 
 proc allocAconstr(b: var Builder; n: var Cursor) =
   ## `(aconstr ArrayT e0 e1 …)` — allocate each (bare) element value into a register
@@ -1240,11 +1258,38 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
       raiseAssert "arkham: aggregate store rhs not supported: " & $n.exprKind
   elif dst.kind == Undef:                                # module-level global / threadvar
     # The emitter resolves the destination to a `Glob`/`Tvar` with a precise slot; the
-    # allocator only needs the right scratch. A float global stores `movss/movsd [&g], xmm`
-    # (the rhs goes to an xmm); a scalar/pointer global stores through a GPR. An aggregate
-    # global initializer (a `(s)`-built oconstr/array) is not handled on this path.
-    if n.kind == TagLit and n.exprKind in {OconstrC, AconstrC}:
-      raiseAssert "arkham: aggregate global initializer not supported"
+    # allocator only needs the right scratch. The destination type is unknown here, so
+    # classify by the RHS: an AGGREGATE store builds/copies through the global's address
+    # (the emitter's `Glob`+`AMem` branch), a scalar/float stores `[&g] ← reg/xmm`.
+    if b.tc.exprSlot(n).kind == AMem:                    # aggregate global store
+      let rhsSlot = b.tc.exprSlot(n)
+      if n.kind == TagLit and n.exprKind == CallC and
+         rhsSlot.size > b.md.aggrByRefThreshold:
+        # >16B call result: &g goes straight into rdi (the hidden result ptr) — no
+        # address temp; allocCall accounts for the hidden pointer argument.
+        var d = dontCare
+        allocCall(b, n, d, hiddenPtr = true)
+      else:
+        let addrT = b.reserveTmp(ScalarSlot)             # &g address temp (held across rhs)
+        var copyTmp = dontCare
+        if n.kind == TagLit and n.exprKind == OconstrC:
+          allocConstr(b, n)                              # build field-by-field through &g
+        elif n.kind == TagLit and n.exprKind == AconstrC:
+          allocAconstr(b, n)
+        elif n.kind == TagLit and n.exprKind == CallC:   # ≤16B result in rax:rdx
+          var d = dontCare
+          allocCall(b, n, d, hiddenPtr = false)
+        elif n.kind == Symbol:                           # whole-aggregate copy g = a
+          skip n
+          copyTmp = b.reserveTmp(ScalarSlot)             # the field word-transfer scratch
+        else:
+          raiseAssert "arkham: aggregate global store rhs not supported: " & $n.exprKind
+        if copyTmp.kind == InReg: b.releaseTmp(copyTmp)
+        b.releaseTmp(addrT)
+        if addrT.kind != InReg: raiseAssert "arkham: out of registers for a global address"
+        var sc = @[addrT.r]
+        if copyTmp.kind == InReg: sc.add copyTmp.r
+        b.ra.aux[auxPos] = ExprAux(scratch: sc)
     else:
       let addrT = b.reserveTmp(ScalarSlot)               # &g address temp (Tvar ignores it)
       b.allocSingleUse(n)
@@ -1275,6 +1320,24 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
       allocStore(b, n, namedStackLoc("", dst.typ), b.posOf(n))
     else:
       b.allocSingleUse(n)
+  elif dst.kind == Mem and b.tc.exprSlot(dst.cur).kind == AMem and n.kind == Symbol:
+    # A whole-aggregate copy `arr[i] = x` through a complex lvalue: the lhs embedded
+    # base/index regs (held for the address `lea`), an address temp, and a field-copy
+    # temp. (The non-global lvalue case — a global aggregate base would also need its
+    # address scratch; not yet combined.)
+    let lhsCur = dst.cur
+    if lvalueGlobalBase(b, lhsCur):
+      raiseAssert "arkham: aggregate copy into a global-based lvalue not yet supported"
+    var lc = lhsCur
+    allocLvalue2(b, lc, dontCare, isStore = true)        # lhs embedded regs (held for the lea)
+    let addrT = b.reserveTmp(ScalarSlot)
+    skip n                                               # the source symbol
+    let copyTmp = b.reserveTmp(ScalarSlot)
+    releaseLvalTemps(b, lhsCur)
+    b.releaseTmp(copyTmp); b.releaseTmp(addrT)
+    if addrT.kind != InReg or copyTmp.kind != InReg:
+      raiseAssert "arkham: out of registers for an aggregate lvalue copy"
+    b.ra.aux[auxPos] = ExprAux(scratch: @[addrT.r, copyTmp.r])
   elif dst.kind == Mem:                                  # store through a complex lvalue (dot/deref/at)
     # Place the lvalue's embedded base/index regs, then the rhs. An AGGREGATE constructor
     # builds field-by-field into the address (placed like a slot store); a FLOAT rhs goes
@@ -1369,14 +1432,22 @@ proc walk(b: var Builder; n: var Cursor) =
         if n.hasMore and n.kind != DotToken:
           if b.retFloatBits > 0:                         # float result → xmm0 (general store)
             allocStore(b, n, fregLoc(b.md.floatArgRegs[0], floatSlot(b.retFloatBits)), retPos)
-          elif n.kind == Symbol and b.symLoc(symName(n)).kind == NamedStack and
-               b.symLoc(symName(n)).typ.kind == AMem:
+          elif b.retAggr:
             # An aggregate return marshals OUT (≤16B → structToRegs; >16B → through the
             # hidden result pointer, needing one word-transfer scratch) — the inverse of a
             # store-into-destination, so it stays here rather than in `allocStore`.
-            if b.retIndirect:
-              b.auxScratch(retPos, "an aggregate return")
-            skip n
+            if n.kind == Symbol:                         # a named local aggregate
+              if b.retIndirect:
+                b.auxScratch(retPos, "an aggregate return")
+              skip n
+            else:
+              # An inline aggregate VALUE returned by value (`(ret (oconstr …))` /
+              # memory lvalue): allocate its field-value temps like a store into a
+              # synthetic aggregate slot, plus the >16B word-transfer scratch.
+              b.ra.hasStackVars = true
+              allocStore(b, n, namedStackLoc("", b.retAggrSlot), retPos)
+              if b.retIndirect:
+                b.auxScratch(retPos, "an aggregate return")
           else:                                          # scalar/pointer result → ret reg
             allocStore(b, n, regLoc(b.md.intRetReg, ScalarSlot), retPos)
         else:
@@ -1609,9 +1680,12 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
     if n.kind == TagLit:                      # a float return goes to xmm0 (value-core)
       let rtSlot = slotOf(prog, n)
       if rtSlot.isFloat: b.retFloatBits = rtSlot.size * 8
-    elif n.kind == Symbol:                    # a named-type return; >16B aggregate → hidden ptr
+    elif n.kind == Symbol:                    # a named-type return; aggregate → regs / hidden ptr
       let rtSlot = slotOf(prog, n)
-      if rtSlot.kind == AMem and rtSlot.size > md.aggrByRefThreshold: b.retIndirect = true
+      if rtSlot.kind == AMem:
+        b.retAggr = true
+        b.retAggrSlot = rtSlot
+        if rtSlot.size > md.aggrByRefThreshold: b.retIndirect = true
     skip n                                   # return type
     skip n                                   # pragmas
     walk(b, n)                               # body
