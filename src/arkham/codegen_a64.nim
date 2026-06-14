@@ -333,16 +333,36 @@ proc emScalarStackVar(g: var CodeGen; name: string) =
   g.ab.close()
 
 proc emTypedStackVar(g: var CodeGen; name: string; t: Cursor) =
-  ## `(var :name (s) T)` with `T` the value's actual NIFC type. Use this (not the
-  ## generic `(i 64)` slot) for an evicted scalar whose type matters to nifasm — e.g.
-  ## a pointer local that the body later derefs, where an `(i 64)` slot would both
-  ## reject the typed store and forbid the deref (nifasm is strict). Mirrors x64.
+  ## The ONE local-variable stack-slot emitter — `(var :name (s) <slot type>)`,
+  ## dispatching on the value class so callers need no per-form ladder (genVarDecl2
+  ## mirrors x64's single call). The slot type is NOT always the real type: a64 spills
+  ## every integer/bool/char scalar to a forced `(i 64)` (arkham keeps scalars 64-bit
+  ## in registers and the `ldr/str` accessors are 64-bit, so a narrow slot would
+  ## mis-size the access). A POINTER keeps its real `(ptr T)` type (the body may deref
+  ## it); a FLOAT its `(f N)`; an aggregate its real type plus the `(s (align N))`
+  ## stack-slot alignment. This backend-specific scalar rule lives here, not in the
+  ## caller — that is the whole point of routing through one proc.
+  let slot = slotOf(g.prog, t)
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
-  g.ab.keyword SO
-  var tc = t
-  if tc.kind == Symbol: g.ab.sym symName(tc)
-  else: g.genTypeBody(tc)
+  let sa = stackSlotAlign(g.prog, t)
+  if sa > 8:                                  # over-aligned slot → `(s (align N))`
+    g.ab.tree X64Flag.SO:
+      g.ab.tree AlignX: g.ab.intLit sa.int64
+  else:
+    g.ab.keyword SO                           # ordinary 8-granular slot → `(s)`
+  case slot.kind
+  of AFloat:
+    g.ab.floatType(slot.size * 8)             # `(f N)` — typed fp slot
+  of AMem:
+    var tc = t                                # aggregate: its real type (align applied above)
+    if tc.kind == Symbol: g.ab.sym symName(tc) else: g.genTypeBody(tc)
+  else:                                       # int / uint / bool / char / pointer
+    if isPtrType(resolveType(g.prog, t)):
+      var tc = t                              # pointer: real `(ptr T)` so the body can deref
+      if tc.kind == Symbol: g.ab.sym symName(tc) else: g.genTypeBody(tc)
+    else:
+      g.ab.intType(64)                        # scalar: forced 8-byte slot (64-bit access)
   g.ab.close()
 
 proc emScalarLoad(g: var CodeGen; dest: Reg; name: string) =
@@ -1945,55 +1965,40 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
       if g.isFloatExpr(a):
         g.emitFValue2(a)
         inc fIdx
-      elif a.kind == Symbol and g.varType.hasKey(symName(a)):
-        let vn = symName(a); let tn = g.varType[vn]
-        if aggrByteSize(g.prog, tn) > 16:
-          let loc = g.ra.locationOfSym(vn)
-          case loc.kind
-          of NamedStack:
-            g.ab.tree LeaA64: (g.emReg IntArgRegs[intIdx]; g.ab.sym vn)
-          of InReg: g.movReg(IntArgRegs[intIdx], loc.r)
-          else: raiseAssert "arkham a64n: by-ref arg neither stack nor pointer: " & vn
-          inc intIdx
-        else:
-          let nw = aggrWordCount(g.prog, tn)
-          g.structToRegs(vn, tn, intIdx)
-          intIdx += nw
-      elif a.kind == Symbol and g.lookupSym(symName(a)).cat in {scGlobal, scTvar} and
-           g.exprSlot(a).kind == AMem:
-        # A GLOBAL aggregate passed BY VALUE (`equalStrings(s, "")` where `s` is a
-        # global `string`): the global is a `.bss` label, not a stack slot, so the
-        # `varType` branch above doesn't fire — read its words straight out of the
-        # global. ≤16B → words into x{n}; >16B → &global as one ptr arg. Mirrors x64.
-        if g.lookupSym(symName(a)).cat != scGlobal:
-          raiseAssert "arkham a64: aggregate threadvar passed by value not supported"
-        let tn = symName(g.getType(a))
-        if aggrByteSize(g.prog, tn) > 16:                 # by-reference: &global → one GPR
-          g.emGlobalAddr(IntArgRegs[intIdx], symName(a))
-          inc intIdx
-        else:                                             # by-value: words → GPRs
-          let nw = aggrWordCount(g.prog, tn)
-          g.globalToRegs(symName(a), tn, intIdx)
-          intIdx += nw
-      elif a.kind == TagLit and a.exprKind in {OconstrC, AconstrC}:
-        # An aggregate CONSTRUCTOR value argument: build it into a synthetic aggregate
-        # temp through the general `genStore2` (the same path a var-init / asgn uses),
-        # then marshal that temp by the ordinary aggregate ABI (by-reference &temp → one
-        # GPR, or by-value words → x{n}). The allocator already placed the element-value
-        # temps via `allocStore` into an unnamed slot; we name + declare it here. Mirrors
-        # the x64 non-declarative path.
-        var tcur = a; inc tcur                            # the constructed type
+      elif g.exprSlot(a).kind == AMem:
+        # ── The ONE aggregate-argument path (chibicc lesson; see codegen_x64). ──
+        # The "where do the bytes come from" dispatch lives here ONCE: a local/by-ref
+        # symbol home, a global read in place, or any computed aggregate (oconstr/
+        # aconstr/lvalue) built into a temp via the ONE general `genStore2`. The ABI
+        # marshalling below is form-blind — driven only by the type's size.
+        let tcur = g.getType(a)
+        if tcur.kind != Symbol:
+          raiseAssert "arkham a64: aggregate call-arg of non-nominal type"
         let tn = symName(tcur)
-        let tmpName = "octmp" & $g.posOf(a) & ".0"
-        g.emTypedStackVar(tmpName, tcur)                  # declare the slot
-        g.varType[tmpName] = tn                           # so emAggrFieldMem/structToRegs resolve it
-        g.genStore2(a, namedStackLoc(tmpName, slotOf(g.prog, tcur)), g.posOf(a))
-        if aggrByteSize(g.prog, tn) > 16:                 # by-reference: &temp → one GPR
-          g.ab.tree LeaA64: (g.emReg IntArgRegs[intIdx]; g.ab.sym tmpName)
+        let sz = aggrByteSize(g.prog, tn)
+        var home = ""                                     # a named home (stack / by-ref param / temp)
+        var isGlobal = false                              # else "" + isGlobal ⇒ read &global in place
+        if a.kind == Symbol:
+          case g.lookupSym(symName(a)).cat
+          of scGlobal: isGlobal = true
+          of scTvar: raiseAssert "arkham a64: aggregate threadvar passed by value not supported"
+          else: home = symName(a)                         # local stack slot OR by-ref param (InReg)
+        else:                                             # oconstr/aconstr/lvalue: build into a temp
+          let pos = g.posOf(a)                            # via the ONE general `genStore2`
+          home = "aggtmp" & $pos & ".0"
+          g.emTypedStackVar(home, tcur)                   # declare the slot
+          g.varType[home] = tn                            # so emAggrFieldMem/structToRegs resolve it
+          g.genStore2(a, namedStackLoc(home, g.exprSlot(a)), pos)
+        if sz > 16:                                       # by-reference: address → one GPR
+          if isGlobal: g.emGlobalAddr(IntArgRegs[intIdx], symName(a))
+          elif g.ra.locationOfSym(home).kind == InReg:    # by-ref param: pointer already in a reg
+            g.movReg(IntArgRegs[intIdx], g.ra.locationOfSym(home).r)
+          else: g.ab.tree LeaA64: (g.emReg IntArgRegs[intIdx]; g.ab.sym home)
           inc intIdx
-        else:                                             # by-value: words → GPRs
+        else:                                             # by-value: words → x{n}
           let nw = aggrWordCount(g.prog, tn)
-          g.structToRegs(tmpName, tn, intIdx)
+          if isGlobal: g.globalToRegs(symName(a), tn, intIdx)
+          else: g.structToRegs(home, tn, intIdx)
           intIdx += nw
       else:
         g.emitValue2(a)
@@ -2715,17 +2720,9 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
     of InReg: g.emRegLocalVar(nm, loc.r, typeCur)
     of InFReg: g.emFRegLocalVar(nm, loc.f, loc.typ.size * 8)
     of NamedStack:
-      if loc.typ.kind == AMem:
-        g.ab.open NifasmDecl.VarD
-        g.ab.symDef nm
-        g.ab.keyword SO
-        var tc = typeCur
-        if tc.kind == Symbol: g.ab.sym symName(tc) else: g.genTypeBody(tc)
-        g.ab.close()
-        if typeCur.kind == Symbol: g.varType[nm] = symName(typeCur)
-      elif loc.typ.kind == AFloat: g.emFloatStackVar(nm, loc.typ.size * 8)
-      elif isPtrType(resolveType(g.prog, typeCur)): g.emTypedStackVar(nm, typeCur)
-      else: g.emScalarStackVar(nm)
+      g.emTypedStackVar(nm, typeCur)                         # one route; dispatches on slot class
+      if loc.typ.kind == AMem and typeCur.kind == Symbol:
+        g.varType[nm] = symName(typeCur)                     # aggregate field layout
     else: raiseAssert "arkham a64n: var home " & $loc.kind
     if hasVal: g.genStore2(cc, loc, declPos)
     while cc.hasMore: skip cc

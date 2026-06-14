@@ -114,6 +114,23 @@ proc getInt(n: Cursor): int64 =
   else:
     error("Expected integer literal", n)
 
+proc parseSlotAlign(n: var Cursor): int =
+  ## `n` is positioned at a `(s …)` stack-slot location. Read its optional
+  ## `(align N)` child — the STACK-slot alignment, kept DISTINCT from the type's
+  ## natural alignment (which drives struct-field layout) — and advance `n` PAST the
+  ## whole `(s …)` node onto the slot's type. No annotation ⇒ the default 8-byte
+  ## slot granularity. This is the one place stack-slot alignment enters nifasm; the
+  ## codegen (arkham) decides the policy and emits the annotation.
+  result = 8
+  n.into:                                  # enter (s); body is empty or one (align N)
+    while n.hasMore:
+      if n.kind == TagLit and n.tag == AlignTagId:
+        n.into:
+          result = int(getInt(n)); inc n   # the alignment integer
+          while n.hasMore: skip n
+      else:
+        skip n                             # tolerate/ignore any other child
+
 proc normScalarBits(bits: int64): int =
   ## NIFC encodes the architecture-width `int`/`uint`/`char` (and other
   ## native-word scalars) as a NON-POSITIVE bit count — `(i -1)` is the platform
@@ -2121,6 +2138,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     var reg = InvalidTagId
     var onStack = false
+    var slotAlign = 8
     if n.kind == TagLit:
       let locTag = n.tag
       if rawTagIsA64Reg(locTag):
@@ -2134,7 +2152,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
         inc n
       elif locTag == STagId:
         onStack = true
-        inc n
+        slotAlign = parseSlotAlign(n)         # reads (s (align N)); advances past (s …)
       else:
         error("Expected location", n)
     else:
@@ -2143,7 +2161,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let sym = Symbol(name: name, kind: skVar)
     if onStack:
       sym.typ = Type(kind: StackOffT, offType: baseTyp)
-      sym.offset = ctx.slots.allocSlotUp(baseTyp)
+      sym.offset = ctx.slots.allocSlotUp(baseTyp, slotAlign)
     else:
       sym.typ = baseTyp
       sym.reg = reg
@@ -4156,6 +4174,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     var reg = InvalidTagId
     var onStack = false
+    var slotAlign = 8
     if n.kind == TagLit:
       let locTag = n.tag
       if rawTagIsX64Reg(locTag):
@@ -4163,7 +4182,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         inc n
       elif locTag == STagId:
         onStack = true
-        inc n
+        slotAlign = parseSlotAlign(n)         # reads (s (align N)); advances past (s …)
       else:
         error("Expected location", n)
     else:
@@ -4178,7 +4197,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       # `call`'s pushed return address (and any callee pushes) can't reach them. A
       # red-zone (negative-offset) slot whose address escapes into a call would be
       # clobbered by that call. No frame pointer is needed.
-      sym.offset = ctx.slots.allocSlotUp(baseTyp)
+      sym.offset = ctx.slots.allocSlotUp(baseTyp, slotAlign)
     else:
       sym.typ = baseTyp
       sym.reg = reg

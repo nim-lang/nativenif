@@ -333,7 +333,12 @@ proc emTypedStackVar(g: var CodeGen; name: string; t: Cursor) =
   ## slot would both reject the typed store and forbid the deref (nifasm is strict).
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
-  g.ab.keyword SO
+  let sa = stackSlotAlign(g.prog, t)
+  if sa > 8:                                  # over-aligned slot → `(s (align N))`
+    g.ab.tree X64Flag.SO:
+      g.ab.tree AlignX: g.ab.intLit sa.int64
+  else:
+    g.ab.keyword SO                           # ordinary 8-granular slot → `(s)`
   var tc = t
   if tc.kind == Symbol: g.ab.sym symName(tc)
   else: g.genTypeBody(tc)
@@ -1701,78 +1706,42 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
     var intIdx = if resultByRef: 1 else: 0               # rdi = hidden result ptr (set by the caller)
     for idx in 0 ..< argCurs.len:
       let a = argCurs[idx]
-      var aggrSz = -1
-      if a.kind == Symbol:
-        let h = g.ra.locationOfSym(symName(a))
-        if h.kind == NamedStack and h.typ.kind == AMem: aggrSz = h.typ.size
-      if aggrSz >= 0:
-        let tn = g.varType[symName(a)]
-        if aggrSz <= g.md.aggrByRefThreshold:             # by-value: words → GPRs
-          let words = (aggrSz + 7) div 8
-          g.structToRegs(symName(a), tn, g.md.intArgRegs[intIdx ..< intIdx + words])
-          intIdx += words
-        else:                                             # by-reference: &arg → one GPR
-          g.emStackAddr(g.md.intArgRegs[intIdx], symName(a))
-          inc intIdx
-      elif a.kind == Symbol and g.lookupSym(symName(a)).cat in {scGlobal, scTvar} and
-           g.exprSlot(a).kind == AMem:
-        # A GLOBAL aggregate passed BY VALUE (`equalStrings(s, "")` where `s` is a
-        # global `string`): the global is RIP-relative, not a stack slot, so the
-        # NamedStack branch above doesn't fire — read its words straight out of the
-        # global. ≤16B → words into consecutive GPRs; >16B → &global as one ptr arg.
-        if g.lookupSym(symName(a)).cat != scGlobal:
-          raiseAssert "arkham x64: aggregate threadvar passed by value not supported"
-        let tn = symName(g.getType(a))
-        let sz = aggrByteSize(g.prog, tn)
-        if sz <= g.md.aggrByRefThreshold:                 # by-value: words → GPRs
-          let words = (sz + 7) div 8
-          g.globalToRegs(symName(a), tn, g.md.intArgRegs[intIdx ..< intIdx + words])
-          intIdx += words
-        else:                                             # by-reference: &global → one GPR
-          g.emGlobalAddr(g.md.intArgRegs[intIdx], symName(a))
-          inc intIdx
-      elif a.kind == TagLit and a.exprKind in {OconstrC, AconstrC}:
-        # An aggregate CONSTRUCTOR value argument: nothing call-specific — build it into
-        # a synthetic aggregate temp through the general `genStore2` (the same path a
-        # var-init / asgn aggregate uses), then marshal that temp by the ordinary
-        # aggregate ABI (by-value words → GPRs, or by-reference pointer → one GPR). An
-        # `aconstr` flows through the SAME path — no new branch here.
-        var tcur = a; inc tcur                            # the constructed type
-        let tn = symName(tcur)
-        let tmpName = "octmp" & $cursorToPosition(g.buf[], a) & ".0"
-        g.emTypedStackVar(tmpName, tcur)                  # declare the slot
-        g.varType[tmpName] = tn                           # so emAggrFieldMem/structToRegs resolve it
-        g.genStore2(a, namedStackLoc(tmpName, slotOf(g.prog, tcur)), cursorToPosition(g.buf[], a))
-        let sz = aggrByteSize(g.prog, tn)
-        if sz <= g.md.aggrByRefThreshold:                 # by-value: words → GPRs
-          let words = (sz + 7) div 8
-          g.structToRegs(tmpName, tn, g.md.intArgRegs[intIdx ..< intIdx + words])
-          intIdx += words
-        else:                                             # by-reference: &temp → one GPR
-          g.emStackAddr(g.md.intArgRegs[intIdx], tmpName)
-          inc intIdx
-      elif a.kind == TagLit and a.exprKind in {AtC, DotC, DerefC, PatC} and
-           g.exprSlot(a).kind == AMem:
-        # An aggregate MEMORY-LVALUE argument (array element / field / deref — e.g.
-        # a `string` read out of a const table in `$`): build it into a synthetic
-        # temp through the general store path (genAggrCopyFromLval2), then marshal
-        # that temp by the ordinary aggregate ABI. Mirrors the constructor case.
+      if g.exprSlot(a).kind == AMem:
+        # ── The ONE aggregate-argument path (mirrors allocCall's single AMem branch). ──
+        # The chibicc lesson: the "where do the bytes come from" dispatch lives here
+        # ONCE (a named stack home, or a global read in place), and the ABI marshalling
+        # below is form-blind — driven purely by the TYPE's size. A local, a global, an
+        # `(oconstr/aconstr …)`, and an aggregate lvalue (`(at/dot/deref …)`) differ only
+        # in how the bytes are reached; once reached they marshal identically. New source
+        # forms extend `aggrArgHome`, not the marshaller — no special case per call kind.
         let tcur = g.getType(a)
         if tcur.kind != Symbol:
-          raiseAssert "arkham x64: aggregate lvalue call-arg of non-nominal type"
+          raiseAssert "arkham x64: aggregate call-arg of non-nominal type"
         let tn = symName(tcur)
-        let pos = cursorToPosition(g.buf[], a)
-        let tmpName = "lvtmp" & $pos & ".0"
-        g.emTypedStackVar(tmpName, tcur)                  # declare the slot
-        g.varType[tmpName] = tn
-        g.genStore2(a, namedStackLoc(tmpName, g.exprSlot(a)), pos)
         let sz = aggrByteSize(g.prog, tn)
+        var home = ""                                     # a named stack slot, or "" ⇒ read &global
+        if a.kind == Symbol:
+          if g.ra.locationOfSym(symName(a)).kind == NamedStack:
+            home = symName(a)                             # a local: its slot is already addressable
+          elif g.lookupSym(symName(a)).cat == scGlobal:
+            discard                                       # a global: read through &global (home == "")
+          else:
+            raiseAssert "arkham x64: aggregate symbol arg neither local nor global: " & symName(a)
+        else:                                             # oconstr/aconstr/lvalue: build into a temp
+          let pos = cursorToPosition(g.buf[], a)          # via the ONE general `genStore2`
+          home = "aggtmp" & $pos & ".0"
+          g.emTypedStackVar(home, tcur)                   # declare the slot
+          g.varType[home] = tn                            # so emAggrFieldMem/structToRegs resolve it
+          g.genStore2(a, namedStackLoc(home, g.exprSlot(a)), pos)
         if sz <= g.md.aggrByRefThreshold:                 # by-value: words → GPRs
           let words = (sz + 7) div 8
-          g.structToRegs(tmpName, tn, g.md.intArgRegs[intIdx ..< intIdx + words])
+          let regs = g.md.intArgRegs[intIdx ..< intIdx + words]
+          if home.len > 0: g.structToRegs(home, tn, regs)
+          else: g.globalToRegs(symName(a), tn, regs)
           intIdx += words
-        else:                                             # by-reference: &temp → one GPR
-          g.emStackAddr(g.md.intArgRegs[intIdx], tmpName)
+        else:                                             # by-reference: &arg → one GPR
+          if home.len > 0: g.emStackAddr(g.md.intArgRegs[intIdx], home)
+          else: g.emGlobalAddr(g.md.intArgRegs[intIdx], symName(a))
           inc intIdx
       elif g.isFloatExpr(a):
         g.emitValue2(a)                                   # → its xmm arg register

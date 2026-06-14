@@ -19,6 +19,7 @@
 | `(var D L T)`          | NifasmDecl                  | variable declaration |
 | `(arch x64/arm64)`     | NifasmDecl                  | architecture pragma |
 | `(s)`                  | X64Flag                 | stack slot location tag |
+| `(align N)`            | NifasmExpr                  | stack-slot alignment annotation (child of `(s)`) |
 | `(ssize)`              | NifasmExpr                  | stack size expression |
 | `(csize)`              | NifasmExpr                  | call stack size expression |
 | `(arg S)`              | NifasmExpr                  | argument reference in prepare block |

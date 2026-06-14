@@ -540,6 +540,19 @@ proc typeSizeAlign*(p: var Program; c: Cursor): (int, int) =
     else: raiseAssert "arkham: cannot size type " & $c.typeKind
   else: raiseAssert "arkham: malformed type for sizing"
 
+proc stackSlotAlign*(p: var Program; c: Cursor): int =
+  ## The STACK-slot alignment for a local of type `c`. Starts from the type's natural
+  ## alignment, then applies the AMD64 SysV rule (psABI p.14): an array whose total
+  ## size is ≥ 16 bytes is aligned to at least 16. This is a STACK-LAYOUT property
+  ## ONLY — the type's own alignment (`typeSizeAlign`, which drives struct-field
+  ## offsets) is deliberately left element-based and unchanged. Emitted as the
+  ## `(s (align N))` annotation; nifasm honours it when allocating the slot.
+  let (sz, al) = typeSizeAlign(p, c)
+  result = al
+  let r = resolveType(p, c)
+  if r.kind == TagLit and r.typeKind == ArrayT and sz >= 16:
+    result = max(16, al)
+
 proc slotOf*(p: var Program; c: Cursor): AsmSlot =
   ## Classify a type cursor into an `AsmSlot`, resolving named types (across
   ## modules) first. A named `enum`/scalar typedef becomes its underlying scalar
