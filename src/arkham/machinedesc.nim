@@ -92,6 +92,16 @@ type
     Mem            ## a foldable memory operand: the lvalue subtree `cur`
                    ## (`(dot …)`/`(at …)`/`(deref …)`) re-emitted on demand so
                    ## nifasm collapses the access chain to `base+offset`
+    Field          ## a field `field` (of aggregate type `aggrType`) WITHIN an
+                   ## aggregate destination, addressed either by the stack slot
+                   ## named `baseName` (when `baseReg == NoReg`) or via a pointer
+                   ## to the aggregate held in `baseReg`. `typ` is the field's
+                   ## slot, so a store into it dispatches scalar/float/aggregate
+                   ## like any other destination — and a nested aggregate field
+                   ## recurses (a `(dot base field)` re-resolved to a `Field`
+                   ## whose base is the field's address). This is what lets the
+                   ## one `genStore2`/`allocStore` path build an `oconstr`
+                   ## field-by-field with no per-field special-casing.
     Glob           ## a module-level global addressed by `name` (RIP-relative)
     Tvar           ## a thread-local addressed by `name` (FS/TLV)
     Imm            ## a known immediate (constant / target hint)
@@ -112,6 +122,13 @@ type
     of OnStack: offset*: int
     of NamedStack, Glob, Tvar: name*: string
     of Mem: cur*: Cursor
+    of Field:
+      field*: string         ## the member name
+      aggrType*: string      ## the enclosing aggregate's nominal type name
+      baseReg*: Reg          ## the base, in priority order: `baseReg != NoReg` ⇒ a
+      baseName*: string      ## pointer to the aggregate; else `baseName.len > 0` ⇒
+      baseLval*: Cursor      ## a stack slot of that name; else `baseLval` is the
+                             ## lvalue subtree whose address is the aggregate
     of Imm: ival*: int64
 
 template dontCare*: Location =
@@ -152,6 +169,20 @@ proc tvarLoc*(name: string; typ: AsmSlot): Location {.inline.} =
   Location(kind: Tvar, name: name, typ: typ)
 proc memLoc*(cur: Cursor; typ: AsmSlot): Location {.inline.} =
   Location(kind: Mem, cur: cur, typ: typ)
+proc fieldLoc*(aggrType, field, baseName: string; typ: AsmSlot): Location {.inline.} =
+  ## Field `field` of a stack-slot aggregate named `baseName` (the genConstr2 base).
+  Location(kind: Field, aggrType: aggrType, field: field, baseReg: NoReg,
+           baseName: baseName, typ: typ)
+proc fieldLocReg*(aggrType, field: string; baseReg: Reg; typ: AsmSlot): Location {.inline.} =
+  ## Field `field` of an aggregate whose address is held in `baseReg` (a by-ref
+  ## param / hidden-result buffer / a nested field's computed address).
+  Location(kind: Field, aggrType: aggrType, field: field, baseReg: baseReg,
+           baseName: "", typ: typ)
+proc fieldLocLval*(aggrType, field: string; baseLval: Cursor; typ: AsmSlot): Location {.inline.} =
+  ## Field `field` of an aggregate addressed by the lvalue subtree `baseLval` (the
+  ## genConstrIntoLval2 base — its embedded temps must be pre-materialized).
+  Location(kind: Field, aggrType: aggrType, field: field, baseReg: NoReg,
+           baseName: "", baseLval: baseLval, typ: typ)
 proc immLoc*(ival: int64; typ: AsmSlot): Location {.inline.} =
   Location(kind: Imm, ival: ival, typ: typ)
 

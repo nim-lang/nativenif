@@ -76,15 +76,17 @@ proc typeError(want, got: Type; n: Cursor) =
   error("Type mismatch: expected " & $want & ", got " & $got, n)
 
 proc addrWidthMove(a, b: Type): bool {.inline.} =
-  ## A function pointer (`ProcT`) is just an 8-byte code address — moving it to/from a
-  ## general register, a data pointer, or another function pointer is a plain address
-  ## move (loading an indirect-call target, or storing a function's address into a
-  ## fn-ptr slot). Register-width like a `ptr`, so accept it in either direction. (This
-  ## is why `(mem (cast (ptr proc) reg))` types as the `proc` pointee with no carve-out:
-  ## the compatibility lives here, not in the type derivation.)
+  ## A pointer — a function pointer (`ProcT`), a data pointer (`PtrT`/`AptrT`) — is an
+  ## 8-byte address. Moving it to/from a general 64-bit register, an integer, or
+  ## another pointer is a plain address move: loading an indirect-call target or a
+  ## pointer field, storing a function's address into a fn-ptr slot, or — pervasive in
+  ## arkham's value core — holding a pointer value in a generic `i64` scalar register.
+  ## All representationally identical (8 bytes), so accept it in either direction. (A
+  ## genuinely narrowing access stays caught by the sized memory-access path.)
   if a == nil or b == nil: return false
+  const PtrLike = {ProcT, PtrT, AptrT}
   const AddrLike = {ProcT, PtrT, AptrT, IntT, UIntT}
-  (a.kind == ProcT and b.kind in AddrLike) or (b.kind == ProcT and a.kind in AddrLike)
+  (a.kind in PtrLike and b.kind in AddrLike) or (b.kind in PtrLike and a.kind in AddrLike)
 
 proc movCompatible(want, got: Type): bool =
   ## Type rule for `mov`: strict compatibility, OR a *widening* integer move —
@@ -111,6 +113,16 @@ proc getInt(n: Cursor): int64 =
     result = n.intVal
   else:
     error("Expected integer literal", n)
+
+proc normScalarBits(bits: int64): int =
+  ## NIFC encodes the architecture-width `int`/`uint`/`char` (and other
+  ## native-word scalars) as a NON-POSITIVE bit count — `(i -1)` is the platform
+  ## `int`. arkham resolves this to the word size (`slots.scalarSlot`: `bits <= 0`
+  ## ⇒ 8 bytes); nifasm must agree or a `(i -1)` field is sized 0 and every later
+  ## field's offset collapses (e.g. a ref payload's hidden header `(fld :r (i -1))`
+  ## would put the real first field at offset 0, so `obj.field` reads the header).
+  ## x86-64 / AArch64 are both 64-bit, so the native word is 64 bits.
+  if bits > 0: int(bits) else: 64
 
 template symName(n: Cursor): string =
   ## The symbol's fully-qualified name. The NIF reader already completes the
@@ -342,6 +354,12 @@ type
     # (writable) `.bss` image on disk so the slot starts with that value (correct in
     # a bundle, where a foreign module's entry-time initializer never runs).
     bssInits: seq[tuple[off: int64, val: int64, size: int]]  # (.bss byte offset, value, size)
+    # A gvar whose initializer is a *symbol address* (e.g. a function-pointer hook
+    # like `gExitFlush = nimNoopFlush`): the target's absolute vaddr isn't known
+    # until layout, so record (slot offset, target symbol) and bake the resolved
+    # address into the `.bss` image in `writeElf` (after `finalize`). Without this
+    # the slot stays zero and an indirect `call` through it jumps to address 0.
+    bssSymInits: seq[tuple[off: int64, sym: Symbol, size: int]]  # (.bss byte offset, target symbol, size)
 
   OperandKind = enum
     okReg       # Register operand
@@ -511,14 +529,14 @@ proc openForeignModule(ctx: var GenContext; modname: string; n: Cursor) =
   if ctx.modules.hasKey(modname):
     return
   var modfile = ""
-  let semchecked = ctx.baseDir / modname & ".s.nif"
+  let asmnif = ctx.baseDir / modname & ".asm.nif"
   let plain = ctx.baseDir / modname & ".nif"
-  if fileExists(semchecked):
-    modfile = semchecked
+  if fileExists(asmnif):
+    modfile = asmnif
   elif fileExists(plain):
     modfile = plain
   else:
-    error("Foreign module file not found: " & modname & " (tried: " & semchecked & ", " & plain & ")", n)
+    error("Foreign module file not found: " & modname & " (tried: " & asmnif & ", " & plain & ")", n)
     return
   let fm = nifmodules.openForeignModule(modfile)
   if not fm.hasEmbeddedIndex:
@@ -592,6 +610,22 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
     result = Symbol(name: fullName, kind: skTvar, typ: typ, isForeign: true,
                     moduleName: modname)
     ctx.rootScope.define(result)
+    # x86-64 bakes a thread-local's FS displacement at every *reference* site (no
+    # relocation), so the offset must be fixed BEFORE the first reference. A
+    # reference resolves the symbol through here first, so allocate the FS offset
+    # eagerly now — exactly like the main-module tvar pre-pass — and mark it
+    # generated so `generateSymbol` does not re-allocate (which would advance
+    # `tlsOffset` twice and hand out two offsets for the same tvar). The main-module
+    # pre-pass only walks the main buffer, so foreign-module tvars (e.g. the stdlib
+    # allocator's thread-local `MemRegion`) would otherwise keep the default offset 0
+    # until their lazy `generateSymbol`, baking offset 0 into any earlier reference
+    # and the real offset into later ones — a size field then aliases what a pointer
+    # field should be. (macOS/A64 relocates tvars through descriptors and allocates
+    # lazily in `generateSymbol`, so leave that path untouched.)
+    if ctx.arch == Arch.X64 and result.name notin ctx.generatedSymbols:
+      result.offset = ctx.tlsOffset
+      ctx.tlsOffset += slots.alignedSize(typ)
+      ctx.generatedSymbols.incl result.name
   of RodataD:
     # A foreign read-only data blob (e.g. a string literal, or a gvar with a
     # constant-scalar initializer laid out as static data — see arkham genGlobal).
@@ -710,13 +744,13 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
     of BoolTagId:
       result = Type(kind: BoolT)
     of ITagId:
-      result = Type(kind: IntT, bits: int(getInt(n)))
+      result = Type(kind: IntT, bits: normScalarBits(getInt(n)))
       inc n
     of UTagId:
-      result = Type(kind: UIntT, bits: int(getInt(n)))
+      result = Type(kind: UIntT, bits: normScalarBits(getInt(n)))
       inc n
     of FTagId:
-      result = Type(kind: FloatT, bits: int(getInt(n)))
+      result = Type(kind: FloatT, bits: normScalarBits(getInt(n)))
       inc n
     of PtrTagId:
       result = parsePtrType(PtrT, n, scope, ctx)
@@ -740,7 +774,7 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
       result = procTyp
     of CTagId:
       # NIFC character type `(c N)` — an N-bit integer for the machine.
-      result = Type(kind: IntT, bits: int(getInt(n)))
+      result = Type(kind: IntT, bits: normScalarBits(getInt(n)))
       inc n
     of VoidTagId:
       result = Type(kind: VoidT)
@@ -1226,11 +1260,27 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       var objType: Type
       var baseReg: arm64.Register
       var baseOffset: int32 = 0
+      var baseIndex: arm64.Register
+      var baseShift = 0
+      var baseHasIndex = false
       if baseOp.typ.kind == TypeKind.PtrT:
         objType = resolvedBase(baseOp.typ, ctx, n)
         if objType.kind notin {TypeKind.ObjectT, TypeKind.UnionT}:
           error("Cannot access field of non-object/union type " & $objType, n)
-        baseReg = baseOp.reg
+        if baseOp.kind == okMem:
+          # The base is itself a memory lvalue — a NESTED access whose result type the
+          # `(dot …)`/`(at …)` rule tagged `PtrT(fieldType)` (an embedded sub-object/
+          # element sits AT base+offset, not behind a loaded pointer). Fold the field
+          # offset onto the inner base+offset (+index) instead of treating the inner
+          # base register as the pointer — otherwise `(dot (dot o inner) a)` and
+          # `(dot (at arr i) f)` lose the inner displacement. Mirrors the x64 parser.
+          baseReg = baseOp.mem.base
+          baseOffset = baseOp.mem.offset
+          baseIndex = baseOp.mem.index
+          baseShift = baseOp.mem.shift
+          baseHasIndex = baseOp.mem.hasIndex
+        else:
+          baseReg = baseOp.reg
       elif baseOp.kind == okMem and baseOp.typ.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
         objType = baseOp.typ
         baseReg = baseOp.mem.base
@@ -1258,7 +1308,9 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       result.mem = arm64.MemoryOperand(
         base: baseReg,
         offset: baseOffset + int32(fieldOffset),
-        hasIndex: false
+        hasIndex: baseHasIndex,
+        index: baseIndex,
+        shift: baseShift
       )
       result.typ = Type(kind: TypeKind.PtrT, base: fieldType)
     elif t == AtTagId:
@@ -5427,12 +5479,30 @@ proc writeElf(a: var GenContext; outfile: string) =
   # file/mem extents to cover it. The on-disk image holds those bytes (the rest zero),
   # so the slots start initialized with no entry-time code (correct in a bundle).
   var bssImage: seq[byte]
-  if a.bssInits.len > 0 and bssSize > 0:
+  if (a.bssInits.len > 0 or a.bssSymInits.len > 0) and bssSize > 0:
     bssImage = newSeq[byte](bssSize.int)
     for it in a.bssInits:
       for i in 0 ..< it.size:
         if it.off.int + i < bssImage.len:
           bssImage[it.off.int + i] = byte((it.val shr (8 * i)) and 0xFF)
+    # Bake symbol-address initializers (function-pointer hooks etc.). The target's
+    # absolute vaddr is known now that `.text` is finalized: a proc/rodata label
+    # sits at `baseAddr + headers + labelPos`; a gvar at `bssVaddr + its .bss off`.
+    if a.bssSymInits.len > 0:
+      var labelPos = initTable[int, int]()
+      for ld in a.buf.labels: labelPos[int(ld.id)] = ld.position
+      for it in a.bssSymInits:
+        var targetVaddr = 0'u64
+        case it.sym.kind
+        of skProc, skRodata:
+          if labelPos.hasKey(it.sym.offset):
+            targetVaddr = baseAddr + headersSize.uint64 + labelPos[it.sym.offset].uint64
+        of skGvar:
+          targetVaddr = bssVaddr + it.sym.size.uint64
+        else: discard
+        for i in 0 ..< it.size:
+          if it.off.int + i < bssImage.len:
+            bssImage[it.off.int + i] = byte((targetVaddr shr (8 * i)) and 0xFF)
   let bssFileSz = if bssImage.len > 0: bssSize else: 0'u64
 
   # ONE PT_LOAD covering headers + code AND the data/bss. Two separate PT_LOADs (an R+X
@@ -5604,6 +5674,15 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
       if lc.hasVal and lc.val.kind == IntLit:
         ctx.bssInits.add (off: sym.size.int64, val: getInt(lc.val),
                           size: asmSizeOf(sym.typ))
+      elif lc.hasVal and lc.val.kind == Symbol:
+        # Symbol-address initializer (a function-pointer hook, or a gvar pointing
+        # at another global). Resolve+mark the target (so its body/storage is
+        # generated) and record the slot for address baking in writeElf.
+        let initName = getSym(lc.val)
+        let initSym = lookupWithAutoImport(ctx, ctx.scope, initName, lc.val)
+        if initSym != nil:
+          ctx.bssSymInits.add (off: sym.size.int64, sym: initSym,
+                               size: asmSizeOf(sym.typ))
       ctx.bssOffset += size
   of skTvar:
     if declTag == TvarD:
@@ -5679,7 +5758,7 @@ proc assemble*(filename, outfile: string; symMap = false) =
 
   # Extract base directory from filename
   let baseDir = filename.splitFile.dir
-  # The module being assembled — its symbol suffix (e.g. `foo.s.nif` → "foo"), so a
+  # The module being assembled — its symbol suffix (e.g. `foo.asm.nif` → "foo"), so a
   # `name.0.foo` reference resolves to a local definition instead of a foreign import.
   let thisModule = extractModuleSuffix(filename)
 

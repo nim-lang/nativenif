@@ -56,12 +56,12 @@ proc arkhamTests() =
   let workDir = "tests" / "arkham" / "nimcache"
   createDir workDir
   # Foreign helper modules (`mod_*.c.nif`) are not standalone tests: compile each
-  # to `<workDir>/<name>.s.nif` so nifasm can auto-import it when a cross-module
-  # test references its symbols (e.g. `Foo.0.mod_xlib` → loads `mod_xlib.s.nif`).
+  # to `<workDir>/<name>.asm.nif` so nifasm can auto-import it when a cross-module
+  # test references its symbols (e.g. `Foo.0.mod_xlib` → loads `mod_xlib.asm.nif`).
   for file in walkFiles("tests" / "arkham" / "mod_*.c.nif"):
     let name = extractFilename(file)[0 ..< extractFilename(file).len - ".c.nif".len]
     exec quoteShell(arkham) & " -a:" & arch & " -o:" &
-         quoteShell(workDir / (name & ".s.nif")) & " " & quoteShell(file)
+         quoteShell(workDir / (name & ".asm.nif")) & " " & quoteShell(file)
   var total, passed, skipped = 0
   for file in walkFiles("tests" / "arkham" / "*.c.nif"):
     let base = extractFilename(file)
@@ -105,12 +105,12 @@ proc arkhamTests() =
 # function-pointer calls, `(pat …)` pointer indexing, and thread-locals. List a
 # test's stem here if a new arm64-only TODO is introduced.
 const arkhamLinuxA64Unsupported: seq[string] = @[
-  # Runtime `(aconstr …)` array constructor: the a64 backend (still the reactive
-  # emitter) handles it for a var-init (`aconstr_init`), but not yet as a direct call
-  # argument or into a complex lvalue — those flow through the value-core paths
-  # implemented only on x86-64 for now. Re-enable when a64 catches up.
-  "aconstr_arg",
-  "aconstr_field",
+  # (empty) The a64 backend now reaches x86-64 parity on every arkham test, including
+  # the value-core aggregate paths: object/array constructors as a var-init, a call
+  # argument, or into a complex lvalue, plus NESTED aggregate fields. The last
+  # blocker was a nifasm a64 bug — `parseOperandA64`'s `(dot …)` dropped the inner
+  # displacement of a memory-lvalue base, so chained access (`(dot (dot o inner) a)`,
+  # `(at (dot h arr) i)`) computed the wrong address; now folded like the x64 parser.
 ]
   # The arm64 backend reached parity with x86-64 on global / multi-dimensional array
   # addressing: codegen_a64 now uses the same premat-before-tree two-pass
@@ -138,7 +138,7 @@ proc arkhamQemuTests() =
   for file in walkFiles("tests" / "arkham" / "mod_*.c.nif"):
     let name = extractFilename(file)[0 ..< extractFilename(file).len - ".c.nif".len]
     exec quoteShell(arkham) & " -a:linux_arm64 -o:" &
-         quoteShell(workDir / (name & ".s.nif")) & " " & quoteShell(file)
+         quoteShell(workDir / (name & ".asm.nif")) & " " & quoteShell(file)
   var total, passed, skipped = 0
   for file in walkFiles("tests" / "arkham" / "*.c.nif"):
     let base = extractFilename(file)

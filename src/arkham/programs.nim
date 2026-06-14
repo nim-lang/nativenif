@@ -106,6 +106,12 @@ const LinuxSyscalls* = {
   "munmap":     (11,  215),
   "exit":       (60,  93),
   "exit_group": (231, 94),
+  # libc `_exit(status)` terminates the process — map it to the `exit_group` syscall
+  # (its glibc implementation), so a libc-free build's `cExit` links.
+  "_exit":      (231, 94),
+  # `cAbort`/`cExit` raise via `kill(getpid(), SIGABRT)` in the libc-free build.
+  "getpid":     (39,  172),
+  "kill":       (62,  129),
   # `abort` is a libc function, not a syscall. For now we lower it to the `exit`
   # syscall so a libc-free build links and terminates (it takes no args, so the exit
   # code is whatever is in the syscall's code register — abort is a cold error path).
@@ -405,7 +411,7 @@ proc lookupForeignDecl*(p: var Program; name: string; found: var bool): Cursor =
 proc foreignCallTarget*(p: var Program; name: string): CallTarget =
   ## Resolve a cross-module proc reference to a callable target by loading its
   ## declaration from the owning module's embedded index. The asm symbol is the
-  ## fully-qualified NIF name; nifasm auto-imports `<module>.s.nif` and links it.
+  ## fully-qualified NIF name; nifasm auto-imports `<module>.asm.nif` and links it.
   let s = splitSymName(name)
   assert s.module.len > 0 and s.module != p.scheme.name,
     "arkham: not a foreign proc: " & name

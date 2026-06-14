@@ -367,6 +367,22 @@ proc isConstScalarInit*(c: Cursor): bool =
   of TagLit: v.exprKind in {TrueC, FalseC, NilC}
   else: false
 
+proc constAddrSym*(c: Cursor): string =
+  ## If `c` is a static-ADDRESS initializer — a bare symbol naming a proc or
+  ## global (a link-time constant address), possibly wrapped in the same
+  ## conv/cast/par peels as `isConstScalarInit` — return that symbol's name; else
+  ## "". A function-pointer hook (`var gExitFlush = nimNoopFlush`) is the canonical
+  ## case. The backend `genGlobal` emits it as the gvar's value and nifasm bakes
+  ## the resolved address into the `.bss` slot (see nifasm `bssSymInits`), so it is
+  ## correct even for a FOREIGN module's gvar in a bundle whose entry-time
+  ## initializer code never runs — unlike the runtime `(asgn)` path.
+  result = ""
+  var v = c
+  while v.kind == TagLit and v.exprKind in {SufC, ParC, CastC, ConvC}:
+    if v.exprKind in {CastC, ConvC}: (inc v; skip v)
+    else: inc v
+  if v.kind == Symbol: result = symName(v)
+
 proc appendLE(buf: var string; bits: uint64; size: int) =
   for i in 0 ..< size: buf.add char((bits shr (8 * i)) and 0xFF'u64)
 

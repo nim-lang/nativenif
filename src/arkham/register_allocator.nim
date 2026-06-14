@@ -1150,6 +1150,10 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
       b.resolveDest(dest, immLoc(1, ScalarSlot)); skip n
     of FalseC, NilC:
       b.resolveDest(dest, immLoc(0, ScalarSlot)); skip n
+    of OvfC:
+      # The overflow flag — always false (arkham uses wrapping arithmetic, see the
+      # `keepovf`/emitValue2 handling), so the `(if (ovf) …)` handlers are dead.
+      b.resolveDest(dest, immLoc(0, ScalarSlot)); skip n
     of SizeofC:
       var t = n; var sz = 0'i64
       t.into:
@@ -1181,14 +1185,18 @@ proc allocSingleUse(b: var Builder; n: var Cursor) =
 proc allocConstr(b: var Builder; n: var Cursor) =
   ## `(oconstr T (kv field value)+)` — allocate each field's value into a register
   ## (a SIMD temp for a float field) the emitter then stores to the field. Each is
-  ## single-use (store + free), so the temps recycle. Advances `n` past the oconstr.
+  ## single-use (store + free), so the temps recycle. Every field — scalar, float, or
+  ## a nested aggregate (`oconstr`/`aconstr`) — routes through the ONE `allocStore` as a
+  ## `Field` destination, exactly like any other store; `allocStore`'s `Field` case
+  ## dispatches on the field's slot (a nested aggregate recurses into `allocConstr`).
+  ## Advances `n` past the oconstr.
   n.into:
     skip n                                     # the constructed type
     while n.hasMore:
       n.into:                                  # (kv field value [depth])
         skip n                                 # field name
         if n.hasMore:
-          b.allocSingleUse(n)
+          allocStore(b, n, fieldLoc("", "", "", b.tc.exprSlot(n)), b.posOf(n))
         while n.hasMore: skip n                 # optional inherited-depth INTLIT
 
 proc allocAconstr(b: var Builder; n: var Cursor) =
@@ -1219,6 +1227,15 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
     elif n.kind == Symbol:                               # whole-aggregate copy
       skip n
       b.auxScratch(auxPos, "an aggregate copy")          # one word-transfer scratch
+    elif n.kind == TagLit and n.exprKind in {DotC, DerefC, AtC, PatC}:
+      # whole-aggregate copy from a memory lvalue (an array element / field / deref,
+      # e.g. `$`'s `NegTen[i]`): allocate the lvalue's embedded base/index/stride regs,
+      # then release them (the index/pointer/stride temps die with the copy, exactly
+      # like the scalar mem-load path). The word-transfer register is picked at emit
+      # time (a sealed staging reg, so it can't collide) — no aux reservation here.
+      let lvCopy = n
+      allocLvalue2(b, n)                                 # advances n past the lvalue
+      releaseLvalTemps(b, lvCopy)
     else:
       raiseAssert "arkham: aggregate store rhs not supported: " & $n.exprKind
   elif dst.kind == Undef:                                # module-level global / threadvar
@@ -1249,6 +1266,15 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
       var d = needsReg(dst.typ)
       allocValue(b, n, d)
       b.releaseTmp(d)
+  elif dst.kind == Field:                                # a field within an aggregate
+    # Mirror the emitter's `genFieldStore2`: a nested aggregate field builds into a
+    # synthetic temp (the emitter copies it through the field address); a scalar/float
+    # field's value goes into a single-use temp the emitter stores to the field operand.
+    if dst.typ.kind == AMem:
+      b.ra.hasStackVars = true
+      allocStore(b, n, namedStackLoc("", dst.typ), b.posOf(n))
+    else:
+      b.allocSingleUse(n)
   elif dst.kind == Mem:                                  # store through a complex lvalue (dot/deref/at)
     # Place the lvalue's embedded base/index regs, then the rhs. An AGGREGATE constructor
     # builds field-by-field into the address (placed like a slot store); a FLOAT rhs goes
@@ -1379,6 +1405,25 @@ proc walk(b: var Builder; n: var Cursor) =
           let lhsCur = n
           skip n                                 # advance past the lhs to the rhs
           allocStore(b, n, memLoc(lhsCur, ScalarSlot), asgnPos)  # the one general store path
+        while n.hasMore: skip n
+    else:
+      n.into:
+        while n.hasMore: walk(b, n)
+  of KeepovfS:
+    # `(keepovf (op type a b) dest)` — overflow-checked arithmetic store. arkham
+    # uses wrapping arithmetic (the overflow flag is ignored), so allocate it like
+    # an `asgn` whose rhs is the op and whose lhs is `dest` (the SECOND child).
+    if b.allocExprs:
+      let kPos = b.posOf(n)
+      n.into:
+        var opCur = n                          # the (op …) value
+        skip n                                 # advance to dest
+        if n.kind == Symbol:
+          let dst = b.symLoc(symName(n)); skip n
+          allocStore(b, opCur, dst, kPos)
+        else:
+          let lhsCur = n; skip n
+          allocStore(b, opCur, memLoc(lhsCur, ScalarSlot), kPos)
         while n.hasMore: skip n
     else:
       n.into:
