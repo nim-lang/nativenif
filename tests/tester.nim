@@ -33,7 +33,7 @@ const arkhamKnownUnsupported: seq[string] =
   @[]
 
 const arkhamDarwinUnsupported: seq[string] =
-  # The hand-written NIFC fixture bakes in a Linux flag constant that has a
+  # The hand-written Leng fixture bakes in a Linux flag constant that has a
   # different numeric value on macOS, so the call genuinely fails on Darwin.
   @[
     # `mmap_anon` passes `flags = 34` (MAP_PRIVATE | MAP_ANONYMOUS where
@@ -46,7 +46,7 @@ const arkhamDarwinUnsupported: seq[string] =
   ]
 
 proc arkhamTests() =
-  ## Each `tests/arkham/*.c.nif` is hand-written NIFC: arkham generates asm-NIF,
+  ## Each `tests/arkham/*.c.nif` is hand-written Leng: arkham generates asm-NIF,
   ## nifasm assembles+links it to a native executable, and we check the run's exit
   ## code (`<stem>.exitcode`, default 0) and stdout (`<stem>.output`, default
   ## empty). The target arch follows the host so the binaries actually run here:

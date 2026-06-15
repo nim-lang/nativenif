@@ -1,12 +1,12 @@
 #
-#           Arkham — x86-64 / System V (Linux) code generator for NIFC
+#           Arkham — x86-64 / System V (Linux) code generator for Leng
 #        (c) Copyright 2026 Andreas Rumpf
 #
 #    See the file "license.txt", included in this distribution.
 #
 
 ## Pass 3 (x86-64 backend). A first, scalar-integer code generator: it shares the
-## front-end (`codegen_common`: the `CodeGen` state, the NIFC type/lvalue
+## front-end (`codegen_common`: the `CodeGen` state, the Leng type/lvalue
 ## analysis) and the (arch-neutral) register allocator with the AArch64 backend,
 ## and emits System V / Linux asm-NIF that `nifasm` assembles+links to an ELF
 ## executable. Process exit is lowered to the Linux `exit` syscall (rax=60), so
@@ -327,7 +327,7 @@ proc emScalarStackVar(g: var CodeGen; name: string) =
   g.ab.close()
 
 proc emTypedStackVar(g: var CodeGen; name: string; t: Cursor) =
-  ## `(var :name (s) T)` with `T` the value's actual NIFC type. Use this (not the
+  ## `(var :name (s) T)` with `T` the value's actual Leng type. Use this (not the
   ## generic `(i 64)` slot) for a homed/spilled scalar whose type matters to
   ## nifasm — e.g. a pointer param that the body later derefs, where an `(i 64)`
   ## slot would both reject the typed store and forbid the deref (nifasm is strict).
@@ -345,7 +345,7 @@ proc emTypedStackVar(g: var CodeGen; name: string; t: Cursor) =
   g.ab.close()
 
 proc emBindType(g: var CodeGen; typ: AsmSlot) =
-  ## Emit the NIFC type for a scratch binding: the slot's own type when known, else
+  ## Emit the Leng type for a scratch binding: the slot's own type when known, else
   ## the generic `(i 64)` (a register/immediate dont-care placeholder carries no
   ## cursor). Mirrors `emTypedStackVar`'s type emission.
   if cursorIsNil(typ.typ):
@@ -718,8 +718,8 @@ proc cmpOperandUnsigned(g: var CodeGen; c: Cursor): bool =
   of IntLit: result = false
   else: result = not isSignedType(resolveType(g.prog, g.getType(c)))
 
-proc cmpJccTag(ek: NifcExpr; whenTrue, signed: bool): X64Inst =
-  ## The `jcc` opcode for a NIFC comparison `ek`, taken when the condition is
+proc cmpJccTag(ek: LengExpr; whenTrue, signed: bool): X64Inst =
+  ## The `jcc` opcode for a Leng comparison `ek`, taken when the condition is
   ## `whenTrue`. `signed` selects signed vs unsigned ordering for `<`/`<=`; a float
   ## compare passes `signed = false`, since `comisd` sets CF/ZF like an unsigned
   ## compare (so ordered `<`/`<=` map to below / below-or-equal).
@@ -1006,7 +1006,7 @@ proc globalToRegs(g: var CodeGen; name, typeName: string; regs: openArray[Reg]) 
 
 proc indirectRetType(g: var CodeGen; gvarDecl: Cursor): Cursor =
   ## The return-type cursor of a function-pointer variable's proctype, for the
-  ## declarative call path's `retIsVoid`/result handling. NIFC's
+  ## declarative call path's `retIsVoid`/result handling. Leng's
   ## `(proctype Empty Params RetType Pragmas)` always carries the RetType node — a
   ## `.` (DotToken, `retIsVoid`-true) / `(void)` for a void proc — so it is simply
   ## the third child.
@@ -1126,7 +1126,7 @@ proc emitSyproc(g: var CodeGen; sp: SyscallProc) =
     while c.hasMore: skip c                       # drain the importc decl's pragmas + body
 
 proc genProctypeSig(g: var CodeGen; c: var Cursor) =
-  ## Lower a NIFC `(proctype Empty Params [RetType] Pragmas)` to a concrete asm-NIF
+  ## Lower a Leng `(proctype Empty Params [RetType] Pragmas)` to a concrete asm-NIF
   ## signature `(proctype (params (param :pN.0 <reg|s> T)…) (result (res :ret.0 (rax)
   ## T))? (clobber …))` — the SysV ABI assignment, identical in shape to a
   ## declarative proc's signature, so nifasm can resolve an *indirect* `(prepare …)`
@@ -1144,7 +1144,7 @@ proc genProctypeSig(g: var CodeGen; c: var Cursor) =
       g.emitAbiClobber(numParams)               # mirrors `emitSignature`
 
 proc genTypeBody(g: var CodeGen; c: var Cursor) =
-  ## Translate a NIFC type at `c` into asm-NIF, advancing past it. Named types
+  ## Translate a Leng type at `c` into asm-NIF, advancing past it. Named types
   ## are inlined; object field pragmas are dropped. v0: int/uint/bool/ptr + objects.
   case c.kind
   of Symbol:
@@ -2024,7 +2024,7 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
     else: raiseAssert "arkham x64n: emitValue2 expr " & $c.exprKind
   else: raiseAssert "arkham x64n: emitValue2 kind " & $c.kind
 
-proc fbinOps(ek: NifcExpr): (X64Inst, X64Inst) =
+proc fbinOps(ek: LengExpr): (X64Inst, X64Inst) =
   ## (32-bit, 64-bit) SSE instruction pair for a float binary-arith node.
   case ek
   of AddC: (AddssX64, AddsdX64)
@@ -2421,7 +2421,7 @@ proc emitMemLoad2(g: var CodeGen; c: Cursor) =
   let res = g.ra.locs[cursorToPosition(g.buf[], c)]
   assert res.kind == InReg, "arkham x64n: mem-load result " & $res.kind
   let cty = resolveType(g.prog, g.getType(c))
-  if cty.typeKind in {NifcType.ArrayT, NifcType.FlexarrayT}:
+  if cty.typeKind in {LengType.ArrayT, LengType.FlexarrayT}:
     # An array / flexible-array-member lvalue (e.g. a chunk's `data[]`) DECAYS to its
     # address: `lea res, <addr>`, not a value load. `lea` is type-lenient, so a generic
     # slot suffices; a consuming `(pat …)`/`(at …)` casts the base to the element pointer.
@@ -2925,7 +2925,7 @@ proc constrFieldStores(g: var CodeGen; c: Cursor; base: Location) =
   ## each resolves to its offset-0-relative slot in the derived aggregate); or a
   ## leading BARE value (the inherited base's positional initializer, in practice the
   ## RTTI/vtable header pointer at offset 0 — `aggrLayout` lists base fields first, so
-  ## it fills the next positional field). This mirrors the nifc C backend's oconstr.
+  ## it fills the next positional field). This mirrors the leng C backend's oconstr.
   var tc = c; inc tc                                    # the constructed type symbol
   let typeName = symName(tc)
   var cc = c
@@ -3427,7 +3427,7 @@ proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
         while cc.hasMore: skip cc
     if g.isFloatExpr(aC):
       # FLOAT comparison: `comisd a, b` (comiss for f32) sets CF/ZF like an unsigned
-      # compare (NIFC assumes non-NaN), so the jcc tag is the unsigned one. Both
+      # compare (Leng assumes non-NaN), so the jcc tag is the unsigned one. Both
       # operands were placed in xmm registers by the allocator.
       let fbits = g.floatBits(aC)
       let tag = cmpJccTag(ek, whenTrue, signed = false)
@@ -3674,7 +3674,7 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
     # `(case Expr (of (ranges BranchRange+) StmtList)* (else StmtList)?)`. Mirrors the
     # legacy genCase: selector → a register live across ALL range tests; a non-match
     # falls through to else (or the end); bodies are emitted AFTER the test chain, so
-    # each ends in a jmp to lEnd. (NIFC `case` has no fall-through.)
+    # each ends in a jmp to lEnd. (Leng `case` has no fall-through.)
     let lEnd = g.freshLabel()
     var cc = c
     cc.into:
@@ -4010,7 +4010,7 @@ proc buildGlobalInitProc(g: var CodeGen; initBuf: var TokenBuf) =
   initBuf.closeTag()                                     # proc
 
 proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool): string =
-  ## Compile a parsed NIFC module to x86-64 / Linux asm-NIF text.
+  ## Compile a parsed Leng module to x86-64 / Linux asm-NIF text.
   var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: x64Machine)
   g.ab.renderReg = x64RegName                 # render register slots as x86 names
   g.prog = collect(buf, inputPath, tags)

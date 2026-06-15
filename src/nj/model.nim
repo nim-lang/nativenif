@@ -80,7 +80,7 @@ proc rawTagIsNjStmt*(raw: TagEnum): bool {.inline.} =
 type
   NjType* = enum
     NoType
-    UnionT = (ord(UnionTagId), "union")  ## first one is Nifc union declaration, second one is Nimony union pragma
+    UnionT = (ord(UnionTagId), "union")  ## first one is Leng union declaration, second one is Nimony union pragma
     ObjectT = (ord(ObjectTagId), "object")  ## object type declaration
     ProctypeT = (ord(ProctypeTagId), "proctype")  ## proc type declaration
     IT = (ord(ITagId), "i")  ## `int` builtin type
@@ -115,10 +115,10 @@ proc rawTagIsNjOther*(raw: TagEnum): bool {.inline.} =
 type
   NjTypeQualifier* = enum
     NoQual
-    AtomicQ = (ord(AtomicTagId), "atomic")  ## `atomic` type qualifier for NIFC
-    RoQ = (ord(RoTagId), "ro")  ## `readonly` (= `const`) type qualifier for NIFC
-    RestrictQ = (ord(RestrictTagId), "restrict")  ## type qualifier for NIFC
-    CpprefQ = (ord(CpprefTagId), "cppref")  ## type qualifier for NIFC that provides a C++ reference
+    AtomicQ = (ord(AtomicTagId), "atomic")  ## `atomic` type qualifier for Leng
+    RoQ = (ord(RoTagId), "ro")  ## `readonly` (= `const`) type qualifier for Leng
+    RestrictQ = (ord(RestrictTagId), "restrict")  ## type qualifier for Leng
+    CpprefQ = (ord(CpprefTagId), "cppref")  ## type qualifier for Leng that provides a C++ reference
 
 proc rawTagIsNjTypeQualifier*(raw: TagEnum): bool {.inline.} =
   raw >= AtomicTagId and raw <= CpprefTagId

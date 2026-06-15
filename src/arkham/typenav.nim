@@ -1,5 +1,5 @@
 #
-#           Arkham — NIFC type navigation (shared)
+#           Arkham — Leng type navigation (shared)
 #        (c) Copyright 2026 Andreas Rumpf
 #
 #    See the file "license.txt", included in this distribution.
@@ -38,7 +38,7 @@ type
     callTarget*: ptr Table[string, CallTarget] ## call name → signature (for a call's result type)
     globals*: ptr Table[string, Cursor]        ## global var name → its decl cursor
     tvars*: ptr Table[string, Cursor]          ## thread-local var name → its decl cursor
-    symType*: ptr Table[string, Cursor]        ## local/param name → its NIFC type cursor
+    symType*: ptr Table[string, Cursor]        ## local/param name → its Leng type cursor
 
 proc lookupSym*(tc: TypeCtx; nm: string): SymInfo =
   ## The one place a module-level symbol resolves to its kind + declaration:
@@ -57,7 +57,7 @@ proc lookupSym*(tc: TypeCtx; nm: string): SymInfo =
     else: return SymInfo(cat: scGlobal, decl: d)
 
 proc getType*(tc: TypeCtx; c: Cursor): Cursor =
-  ## The structural NIFC type cursor of expression `c` (arkham's analog of
+  ## The structural Leng type cursor of expression `c` (arkham's analog of
   ## `typenav.getType`). Symbols resolve through `symType` / the global/tvar
   ## decls; `dot`/`at`/`deref` navigate into the base's object/array/pointer
   ## type; typed nodes (arith, conv, cast, call) read their carried type. This is

@@ -215,7 +215,7 @@ proc compatible*(want, got: Type): bool =
       # Both pointees structurally resolved — compare structurally.
       result = compatible(want.base, got.base)
     else:
-      # A lazily-recorded pointee isn't structurally available, but NIFC types are
+      # A lazily-recorded pointee isn't structurally available, but Leng types are
       # nominal: a pointer's pointee identity is its qualified type NAME, so compare
       # those (strict — NOT a blanket "any same-kind pointer is compatible").
       result = want.baseName == got.baseName

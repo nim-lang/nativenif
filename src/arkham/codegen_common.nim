@@ -6,7 +6,7 @@
 #
 
 ## Architecture-neutral front-end shared by the per-target backends
-## (`codegen_a64`, `codegen_x64`). Holds the `CodeGen` state object, the NIFC
+## (`codegen_a64`, `codegen_x64`). Holds the `CodeGen` state object, the Leng
 ## type/lvalue analysis (`getType` / `exprSlot` / `asLoc` and friends) and
 ## the type predicates. None of this emits instructions — instruction selection
 ## and the machine frame live in the backends. The `md` field carries the
@@ -73,7 +73,7 @@ type
                                              ## value while a deep right-operand spills).
     indirectReg*: Reg                        ## callee-saved reg holding the x8 dest pointer
     varType*: Table[string, string]          ## aggregate var/param name → its type name
-    symType*: Table[string, Cursor]          ## local/param name → its NIFC type cursor (for getType)
+    symType*: Table[string, Cursor]          ## local/param name → its Leng type cursor (for getType)
     regLocal*: Table[Reg, string]            ## reg → the named local currently bound to it
                                              ## (x64 named-locals: emit the name, not `(reg)`)
     aliasToDecl*: Table[string, string]      ## param ABI alias `pN.0` → the param's own decl
@@ -124,9 +124,9 @@ type
 # ── type predicates ─────────────────────────────────────────────────────────
 
 proc isSignedType*(c: Cursor): bool =
-  ## NIFC arithmetic carries its result type as the first child; treat it as
+  ## Leng arithmetic carries its result type as the first child; treat it as
   ## signed unless it is an unsigned/char integer. (A `case` disambiguates the
-  ## NifcType enum members, which share spellings with nifasm's NifasmType.)
+  ## LengType enum members, which share spellings with nifasm's NifasmType.)
   if c.kind != TagLit: return true
   case c.typeKind
   of UT, CT: false
@@ -151,7 +151,7 @@ proc slotWidthSigned*(s: AsmSlot): tuple[width: int, signed: bool] =
 
 proc isPtrType*(c: Cursor): bool =
   ## A `case` (not an `in {…}` set) so the discriminant type picks nifcdecl's
-  ## `NifcType.PtrT`, not nifasm's same-spelled `NifasmType` member.
+  ## `LengType.PtrT`, not nifasm's same-spelled `NifasmType` member.
   if c.kind != TagLit: return false
   case c.typeKind
   of PtrT, AptrT, ProctypeT: true
@@ -269,7 +269,7 @@ proc srcWidthSigned*(g: var CodeGen; c: Cursor): tuple[width: int, signed: bool]
 # (`Mem`, carrying the lvalue subtree to re-emit), an immediate, or `Undef` (the
 # dont-care target). It is shared by the register
 # allocator (long-lived storage) and the backends (just-computed values + lvalue
-# destinations). `asLoc` parses a NIFC lvalue cursor into one; `genVal` produces a
+# destinations). `asLoc` parses a Leng lvalue cursor into one; `genVal` produces a
 # computed value as one; the `gen`/load-store family consume it. This replaces the
 # former separate `Lvalue` + `Val` descriptors that flowed through codegen.
 
@@ -309,7 +309,7 @@ proc retIsVoid*(t: Cursor): bool {.inline.} =
   t.kind == DotToken or (t.kind == TagLit and t.typeKind == VoidT)
 
 # ── static constant data layout (shared) ───────────────────────────────────
-# Lower a NIFC compile-time constant (`scalar` / `(oconstr …)` / `(aconstr …)` /
+# Lower a Leng compile-time constant (`scalar` / `(oconstr …)` / `(aconstr …)` /
 # string) to the raw little-endian bytes of its in-memory representation, so a
 # backend can emit it as one read-only `(rodata …)` blob instead of zeroing
 # `.bss` and running an initialiser at entry. Arch-neutral: the layout follows
@@ -338,7 +338,7 @@ proc constLitBits*(c: Cursor): uint64 =
   else: raiseAssert "arkham const: unsupported literal kind " & $v.kind
 
 proc branchImm*(c: var Cursor): int64 =
-  ## A NIFC `BranchValue` for a `case`: a Number / CharLiteral / `(true)` / `(false)`
+  ## A Leng `BranchValue` for a `case`: a Number / CharLiteral / `(true)` / `(false)`
   ## or a typed/wrapped constant `(suf 3 +Enum)` / `(cast …)` / `(neg …)`. Advance
   ## past it. (Symbol branch values — enum consts — are not yet supported.) Shared
   ## by both backends; wrapped forms unwrap through `constLitBits`.
@@ -392,7 +392,7 @@ proc appendLE(buf: var string; bits: uint64; size: int) =
 
 proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string;
                    relocs: var seq[(int, string)]) =
-  ## Append the in-memory bytes of constant `val` (of NIFC type `typ`) to `buf`.
+  ## Append the in-memory bytes of constant `val` (of Leng type `typ`) to `buf`.
   ## A pointer/proc field whose value is a *symbol address* (e.g. a vtable/RTTI
   ## const pointing at another const or a proc — `(cast (ptr …) Foo.0.vt)`) cannot
   ## be baked at compile time; record `(blob-offset, symbol-name)` in `relocs` and
