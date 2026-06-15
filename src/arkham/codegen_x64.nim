@@ -1492,6 +1492,9 @@ proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool)
 proc emitCondValue2(g: var CodeGen; c: Cursor)
 proc emitMemLoad2(g: var CodeGen; c: Cursor)
 proc emitAddr2(g: var CodeGen; c: Cursor)
+proc aggrAddrInto(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind: bool)
+proc bindLvalGlobalBases(g: var CodeGen; c: Cursor; bound: var seq[Reg])
+proc marshalAggrFromAddr(g: var CodeGen; addrReg: Reg; typeName: string; regs: openArray[Reg])
 proc emitCast2(g: var CodeGen; c: Cursor)
 proc genConstr2(g: var CodeGen; c: Cursor; dstVar: string)
 proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int)
@@ -1820,30 +1823,43 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
           raiseAssert "arkham x64: aggregate call-arg of non-nominal type"
         let tn = symName(tcur)
         let sz = aggrByteSize(g.prog, tn)
-        var home = ""                                     # a named stack slot, or "" ⇒ read &global
-        if a.kind == Symbol:
-          if g.ra.locationOfSym(symName(a)).kind == NamedStack:
-            home = symName(a)                             # a local: its slot is already addressable
-          elif g.lookupSym(symName(a)).cat == scGlobal:
-            discard                                       # a global: read through &global (home == "")
+        let words = (sz + 7) div 8
+        if a.kind == TagLit and a.exprKind in {DotC, DerefC, AtC, PatC}:
+          # An aggregate LVALUE argument: take its ADDRESS (`aggrAddrInto` = `gen_addr`)
+          # and marshal STRAIGHT from there — no copy into a temp (the seam that coupled
+          # the old call path to `genStore2`). The allocator reserved one address scratch.
+          let srcAddr = g.ra.aux[cursorToPosition(g.buf[], a)].scratch[^1]
+          g.aggrAddrInto(a, srcAddr, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = true)
+          if sz <= g.md.aggrByRefThreshold:
+            g.marshalAggrFromAddr(srcAddr, tn, g.md.intArgRegs[intIdx ..< intIdx + words])
+            intIdx += words
           else:
-            raiseAssert "arkham x64: aggregate symbol arg neither local nor global: " & symName(a)
-        else:                                             # oconstr/aconstr/lvalue: build into a temp
-          let pos = cursorToPosition(g.buf[], a)          # via the ONE general `genStore2`
-          home = "aggtmp" & $pos & ".0"
-          g.emTypedStackVar(home, tcur)                   # declare the slot
-          g.varType[home] = tn                            # so emAggrFieldMem/structToRegs resolve it
-          g.genStore2(a, namedStackLoc(home, g.exprSlot(a)), pos)
-        if sz <= g.md.aggrByRefThreshold:                 # by-value: words → GPRs
-          let words = (sz + 7) div 8
-          let regs = g.md.intArgRegs[intIdx ..< intIdx + words]
-          if home.len > 0: g.structToRegs(home, tn, regs)
-          else: g.globalToRegs(symName(a), tn, regs)
-          intIdx += words
-        else:                                             # by-reference: &arg → one GPR
-          if home.len > 0: g.emStackAddr(g.md.intArgRegs[intIdx], home)
-          else: g.emGlobalAddr(g.md.intArgRegs[intIdx], symName(a))
-          inc intIdx
+            g.movReg(g.md.intArgRegs[intIdx], srcAddr); inc intIdx
+          g.unbindTemp(srcAddr)
+        else:
+          var home = ""                                   # a named stack slot, or "" ⇒ read &global
+          if a.kind == Symbol:
+            if g.ra.locationOfSym(symName(a)).kind == NamedStack:
+              home = symName(a)                           # a local: its slot is already addressable
+            elif g.lookupSym(symName(a)).cat == scGlobal:
+              discard                                     # a global: read through &global (home == "")
+            else:
+              raiseAssert "arkham x64: aggregate symbol arg neither local nor global: " & symName(a)
+          else:                                           # oconstr/aconstr: build into a temp
+            let pos = cursorToPosition(g.buf[], a)
+            home = "aggtmp" & $pos & ".0"
+            g.emTypedStackVar(home, tcur)
+            g.varType[home] = tn
+            g.genStore2(a, namedStackLoc(home, g.exprSlot(a)), pos)
+          if sz <= g.md.aggrByRefThreshold:               # by-value: words → GPRs
+            let regs = g.md.intArgRegs[intIdx ..< intIdx + words]
+            if home.len > 0: g.structToRegs(home, tn, regs)
+            else: g.globalToRegs(symName(a), tn, regs)
+            intIdx += words
+          else:                                           # by-reference: &arg → one GPR
+            if home.len > 0: g.emStackAddr(g.md.intArgRegs[intIdx], home)
+            else: g.emGlobalAddr(g.md.intArgRegs[intIdx], symName(a))
+            inc intIdx
       elif g.isFloatExpr(a):
         g.emitValue2(a)                                   # → its xmm arg register
       else:
@@ -2464,29 +2480,18 @@ proc emitFMemLoad2(g: var CodeGen; c: Cursor) =
     g.ab.tree MemX: g.emLvalAddr2(c)
   g.unbindLvalTemps2(c)                                   # release embedded base/index temps
 
-proc emitAddr2(g: var CodeGen; c: Cursor) =
-  ## `(addr lvalue)` → a pointer in the result register. `&(deref p) == p` (identity);
-  ## otherwise `lea res, <addr-of-lvalue>`.
-  var res = g.ra.locs[cursorToPosition(g.buf[], c)]
-  # A result whose home is a stolen-victim local (demoted to its stack slot) is
-  # computed into a transient staging reg and stored back afterwards.
-  var addrStaging = NoReg
-  let memRes = res
-  if res.kind in {NamedStack, Mem}:
-    addrStaging = g.pickStagingSealed("an addr result")
-    res = regLoc(addrStaging, res.typ)
-  else:
-    assert res.kind == InReg, "arkham x64n: addr result " & $res.kind
-  let aslot = g.exprSlot(c)         # the precise `(ptr T)` result type, so the temp is
-                                    # ptr-typed (a generic i64 would mismatch a ptr compare/store)
-  var lv: Cursor
-  block:
-    var cc = c
-    cc.into:
-      lv = cc; skip cc
-      while cc.hasMore: skip cc
+proc aggrAddrInto(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind: bool) =
+  ## THE address-of any lvalue into register `dest` (chibicc's `gen_addr`): `&(deref p)`
+  ## is `p` itself; a global/threadvar leas its absolute address; a `baseobj` is the inner
+  ## lvalue's address (base sub-object at offset 0), retyped; anything else leas the
+  ## `emLvalAddr2` subtree. `doBind` names a fresh temp `dest` (ptr-typed via `aslot`,
+  ## except a deref carries the pointer's own nominal type). The single source of truth
+  ## for "where does this aggregate/lvalue live", shared by `(addr …)`, the aggregate
+  ## marshalling, and the aggregate copy.
   if lv.kind == TagLit and lv.exprKind == DerefC:
-    # &(deref p) == p — produce the pointer directly into res
+    # &(deref p) == p — produce the pointer directly into dest. Carry p's own (named,
+    # unresolved) pointer type, not `aslot`'s structural spelling, so a peer `ptr Named`
+    # in a later compare/store matches.
     var p: Cursor
     block:
       var dd = lv
@@ -2495,17 +2500,13 @@ proc emitAddr2(g: var CodeGen; c: Cursor) =
         while dd.hasMore: skip dd
     g.emitValue2(p)
     let pLoc = g.ra.locs[cursorToPosition(g.buf[], p)]
-    # &(deref p) == p — the result IS p, so carry p's own (named, unresolved) pointer
-    # type. `aslot` (via ptrTypeOf∘resolveType) would spell the pointee structurally
-    # (`ptr object`), mismatching a peer `ptr Named` in a compare/store.
-    if res.isTemp:
-      g.bindTemp(res.r, AsmSlot(cls: AUInt, size: 8, align: 8, typ: g.getType(p)))
-    g.place2(pLoc, res.r)
-    if pLoc.kind == InReg and pLoc.isTemp and pLoc.r != res.r: g.unbindTemp(pLoc.r)
+    if doBind:
+      g.bindTemp(dest, AsmSlot(cls: AUInt, size: 8, align: 8, typ: g.getType(p)))
+    g.place2(pLoc, dest)
+    if pLoc.kind == InReg and pLoc.isTemp and pLoc.r != dest: g.unbindTemp(pLoc.r)
   elif lv.kind == TagLit and lv.exprKind == BaseobjC:
-    # `&(baseobj BaseT depth inner)`: the base sub-object is at offset 0, so the address
-    # is `&inner` retyped to `(ptr BaseT)` (= `aslot`). A `(deref p)` inner is just `p`;
-    # any other inner leas its (transparent) address.
+    # `&(baseobj BaseT depth inner)`: base sub-object at offset 0, so the address is
+    # `&inner` retyped to `(ptr BaseT)`.
     var inner: Cursor
     block:
       var bc = lv
@@ -2522,37 +2523,65 @@ proc emitAddr2(g: var CodeGen; c: Cursor) =
           while dd.hasMore: skip dd
       g.emitValue2(p)
       let pLoc = g.ra.locs[cursorToPosition(g.buf[], p)]
-      if res.isTemp: g.bindTemp(res.r, aslot)             # (ptr BaseT)
-      g.place2(pLoc, res.r)
-      if pLoc.kind == InReg and pLoc.isTemp and pLoc.r != res.r: g.unbindTemp(pLoc.r)
+      if doBind: g.bindTemp(dest, aslot)                  # (ptr BaseT)
+      g.place2(pLoc, dest)
+      if pLoc.kind == InReg and pLoc.isTemp and pLoc.r != dest: g.unbindTemp(pLoc.r)
     else:
-      if res.isTemp: g.bindTemp(res.r, aslot)
+      if doBind: g.bindTemp(dest, aslot)
       g.prematLval2(inner)
-      g.ab.tree LeaX64: (g.emReg res.r; g.emLvalAddr2(inner))
+      g.ab.tree LeaX64: (g.emReg dest; g.emLvalAddr2(inner))
       g.unbindLvalTemps2(inner)
   elif lv.kind == Symbol and g.lookupSym(symName(lv)).cat in {scGlobal, scTvar}:
     # &global / &threadvar (no stack base / embedded value to materialize).
-    if res.isTemp: g.bindTemp(res.r, aslot)
+    if doBind: g.bindTemp(dest, aslot)
     var lc = lv
     let loc = g.asLoc(lc)                                # Glob/Tvar with the global's precise type
     case loc.kind
-    of Glob: g.emGlobalAddr(res.r, loc.name)            # &global → RIP-relative lea
+    of Glob: g.emGlobalAddr(dest, loc.name)             # &global → RIP-relative lea
     of Tvar:
-      # &threadvar = FS base + the tvar's offset. Reuse `res` as the base scratch:
-      # `lea res, &arkham.tls.0` then `lea res, (res) tvar` folds nifasm's offset in
-      # (no extra register — mirrors emitAddrLoc's Tvar arm without a borrowed temp).
       if loc.name notin g.tvarNames:
         raiseAssert "arkham x64: address-of a foreign thread-local (module-system TODO): " & loc.name
-      g.emGlobalAddr(res.r, TlsBlockName)
-      g.ab.tree LeaX64: (g.emReg res.r; g.emReg res.r; g.ab.sym loc.name)
-    else: raiseAssert "arkham x64n: &sym resolved to " & $loc.kind  # scGlobal/scTvar ⇒ Glob/Tvar only
+      g.emGlobalAddr(dest, TlsBlockName)                # &threadvar = FS base + offset (folded)
+      g.ab.tree LeaX64: (g.emReg dest; g.emReg dest; g.ab.sym loc.name)
+    else: raiseAssert "arkham x64n: &sym resolved to " & $loc.kind
+  elif lv.kind == Symbol:                               # a LOCAL aggregate var
+    let home = g.ra.locationOfSym(symName(lv))
+    if doBind: g.bindTemp(dest, aslot)
+    case home.kind
+    of NamedStack: g.emStackAddr(dest, home.name)       # &local stack slot
+    of InReg: g.movReg(dest, home.r)                    # by-ref aggregate param: reg holds &it
+    else: raiseAssert "arkham x64n: aggrAddr of local " & symName(lv) & " home " & $home.kind
   else:
-    if res.isTemp: g.bindTemp(res.r, aslot)           # bind first: a global base leas &g
-    g.prematLval2(lv)                                    #   into res before the (lea …) tree
+    if doBind: g.bindTemp(dest, aslot)                  # bind first: a global base leas &g into dest
+    var bound: seq[Reg] = @[]
+    g.bindLvalGlobalBases(lv, bound)                    # bind any UNBOUND global-base reg first
+    g.prematLval2(lv)
     g.ab.tree LeaX64:
-      g.emReg res.r
+      g.emReg dest
       g.emLvalAddr2(lv)
-    g.unbindLvalTemps2(lv)                               # release embedded base/index temps
+    g.unbindLvalTemps2(lv)
+    for r in bound: g.unbindTemp(r)
+
+proc emitAddr2(g: var CodeGen; c: Cursor) =
+  ## `(addr lvalue)` → a pointer in the result register, via the shared `aggrAddrInto`.
+  var res = g.ra.locs[cursorToPosition(g.buf[], c)]
+  # A result whose home is a stolen-victim local (demoted to its stack slot) is
+  # computed into a transient staging reg and stored back afterwards.
+  var addrStaging = NoReg
+  let memRes = res
+  if res.kind in {NamedStack, Mem}:
+    addrStaging = g.pickStagingSealed("an addr result")
+    res = regLoc(addrStaging, res.typ)
+  else:
+    assert res.kind == InReg, "arkham x64n: addr result " & $res.kind
+  let aslot = g.exprSlot(c)         # the precise `(ptr T)` result type
+  var lv: Cursor
+  block:
+    var cc = c
+    cc.into:
+      lv = cc; skip cc
+      while cc.hasMore: skip cc
+  g.aggrAddrInto(lv, res.r, aslot, doBind = res.isTemp)
   if addrStaging != NoReg:                               # store the pointer to its stack home
     g.emitStoreLoc(memRes, addrStaging)
     g.giveBack addrStaging
@@ -2711,16 +2740,41 @@ proc genAggrCopy2(g: var CodeGen; dstVar, srcVar, typeName: string; tmp: Reg) =
     g.ab.tree MovX64: (g.emAggrFieldMem(dstVar, f.name); g.emReg tmp)
     g.unbindTemp(tmp)
 
+proc emByteAtImm(g: var CodeGen; p: Reg; off: int) =
+  ## `(mem (at (cast (aptr (u 8)) p) off))` — the byte at `[p + off]` (immediate offset).
+  g.ab.tree MemX:
+    g.ab.tree AtX:
+      g.ab.tree CastX:
+        g.ab.aptrType: g.ab.uintType(8)
+        g.emReg p
+      g.ab.intLit off.int64
+
+proc copyAggr(g: var CodeGen; dst, src: Reg; size: int; tmp: Reg) =
+  ## THE one aggregate memcpy (a struct/array `store`, chibicc-style): copy `size` bytes
+  ## from `[src]` to `[dst]` through the bound scratch `tmp` — 8-byte words for the
+  ## aligned bulk, then a sized byte tail. Layout-agnostic and byte-accurate, so it is
+  ## TOTAL for any aggregate regardless of field packing; both ends are just an address
+  ## in a register. nifasm's sized mem↔reg move extends a byte load / truncates a byte
+  ## store, so `tmp` stays a plain `(u 64)`. (`dst`, `src`, `tmp` are bound by the caller.)
+  let words = size div 8
+  for i in 0 ..< words:
+    g.ab.tree MovX64: (g.emReg tmp; g.emWordThroughPtr(src, i))
+    g.ab.tree MovX64: (g.emWordThroughPtr(dst, i); g.emReg tmp)
+  for b in 0 ..< (size - words * 8):                     # sub-word tail, byte by byte
+    let off = words * 8 + b
+    g.ab.tree MovX64: (g.emReg tmp; g.emByteAtImm(src, off))
+    g.ab.tree MovX64: (g.emByteAtImm(dst, off); g.emReg tmp)
+
 proc copyStructThroughPtr2(g: var CodeGen; srcVar, typeName: string; ptrReg, tmp: Reg) =
-  ## Field-wise copy `srcVar` → the memory `ptrReg` points at, through the allocator-
-  ## provided scratch `tmp` (the >16B aggregate hidden-result-pointer return). The
-  ## scratch is typed per field so a pointer field keeps its `(ptr T)` type. The
-  ## pure-emit twin of `copyStructThroughPtr`.
-  for f in aggrLayout(g.prog, typeName):
-    g.bindTemp(tmp, g.fieldSlotByName(typeName, f.name))
-    g.ab.tree MovX64: (g.emReg tmp; g.emAggrFieldMem(srcVar, f.name))
-    g.ab.tree MovX64: (g.emPtrFieldMem(ptrReg, typeName, f.name); g.emReg tmp)
-    g.unbindTemp(tmp)
+  ## Copy `srcVar` → the memory `ptrReg` points at, through scratch `tmp` (the >16B
+  ## aggregate hidden-result-pointer return). Leas the source's address into one staging
+  ## register and funnels through the one `copyAggr`.
+  let sp = g.pickStagingSealed("a struct-through-ptr source pointer")
+  g.emStackAddr(sp, srcVar)
+  g.bindTemp(tmp, AsmSlot(cls: AUInt, size: 8, align: 8))
+  g.copyAggr(ptrReg, sp, aggrByteSize(g.prog, typeName), tmp)
+  g.unbindTemp(tmp)
+  g.giveBack sp
 
 proc emWordThroughPtr(g: var CodeGen; p: Reg; idx: int) =
   ## `(mem (at (cast (aptr (u 64)) p) idx))` — the `idx`-th 8-byte word at `[p]`, typed
@@ -2763,21 +2817,28 @@ proc regsToStructThroughPtr(g: var CodeGen; ptrReg: Reg; typeName: string;
       let fn = fieldAtOffset(aggrLayout(g.prog, typeName), i * 8)
       g.ab.tree MovX64: (g.emPtrFieldMem(ptrReg, typeName, fn); g.emReg regs[i])
 
+proc marshalAggrFromAddr(g: var CodeGen; addrReg: Reg; typeName: string;
+                         regs: openArray[Reg]) =
+  ## `regs ← [addrReg]` — load a ≤16B aggregate at `[addrReg]` into the by-value ABI
+  ## argument registers (a FULL eightbyte as a raw `(u 64)` word, a trailing PARTIAL via
+  ## the field-typed access). The reverse of `regsToStructThroughPtr`; lets an aggregate
+  ## CALL ARGUMENT marshal straight from its address (`aggrAddrInto`) with no copy temp.
+  let byteSize = aggrByteSize(g.prog, typeName)
+  for i in 0 ..< aggrWordCount(g.prog, typeName):
+    if byteSize - i * 8 >= 8:
+      g.ab.tree MovX64: (g.emReg regs[i]; g.emWordThroughPtr(addrReg, i))
+    else:
+      let fn = fieldAtOffset(aggrLayout(g.prog, typeName), i * 8)
+      g.ab.tree MovX64: (g.emReg regs[i]; g.emPtrFieldMem(addrReg, typeName, fn))
+
 proc flatCopyToPtr(g: var CodeGen; srcVar: string; sizeBytes: int; dstPtr, tmp: Reg) =
-  ## Flat 8-byte-word copy of the `sizeBytes`-byte aggregate stack slot `srcVar` into
-  ## `[dstPtr]`, through scratch `tmp`. Layout-agnostic — copies raw words by offset,
-  ## so it handles multi-word and packed fields that the field-by-field copy cannot
-  ## (the old emitter's `byteCopyConst`). The stack temp is word-padded, so copying
-  ## the rounded-up word count never reads past its slot; `sizeBytes` must be a
-  ## multiple of 8 for the destination (every Nim object is word-aligned/sized here).
-  if sizeBytes mod 8 != 0:
-    raiseAssert "arkham x64n: flat aggregate copy of non-word-multiple size " & $sizeBytes
+  ## Copy the `sizeBytes`-byte aggregate stack slot `srcVar` into `[dstPtr]`, through
+  ## scratch `tmp`. Leas the source's address into one staging register and funnels
+  ## through the one `copyAggr` (word bulk + byte tail — any size, layout-agnostic).
   let srcPtr = g.pickStagingSealed("a flat-copy source pointer")
   g.emStackAddr(srcPtr, srcVar)
   g.bindTemp(tmp, AsmSlot(cls: AUInt, size: 8, align: 8))
-  for i in 0 ..< (sizeBytes div 8):
-    g.ab.tree MovX64: (g.emReg tmp; g.emWordThroughPtr(srcPtr, i))
-    g.ab.tree MovX64: (g.emWordThroughPtr(dstPtr, i); g.emReg tmp)
+  g.copyAggr(dstPtr, srcPtr, sizeBytes, tmp)
   g.unbindTemp(tmp)
   g.giveBack srcPtr
 
@@ -2817,7 +2878,10 @@ proc bindLvalGlobalBases(g: var CodeGen; c: Cursor; bound: var seq[Reg]) =
   ## BASE (first child) of a dot/at/deref — not the index/field.
   if c.kind == Symbol:
     let loc = g.ra.locs[cursorToPosition(g.buf[], c)]
-    if loc.kind == InReg and loc.isTemp and g.ra.locationOfSym(symName(c)).kind == Undef:
+    if loc.kind == InReg and loc.isTemp and loc.r notin g.boundTemps and
+       g.ra.locationOfSym(symName(c)).kind == Undef:
+      # only an UNBOUND base reg (else the caller already bound it — e.g. `emitAddr2`
+      # reuses its bound result reg for the global base; rebinding would clobber it).
       g.bindTemp(loc.r, ScalarSlot)
       bound.add loc.r
   elif c.kind == TagLit and c.exprKind in {AtC, DotC, DerefC, PatC}:
@@ -2825,31 +2889,6 @@ proc bindLvalGlobalBases(g: var CodeGen; c: Cursor; bound: var seq[Reg]) =
     cc.into:
       g.bindLvalGlobalBases(cc, bound); skip cc          # the base only
       while cc.hasMore: skip cc
-
-proc genAggrCopyFromLval2(g: var CodeGen; dstVar: string; srcLval: Cursor;
-                          typeName: string) =
-  ## Whole-aggregate copy `dstVar ← <memory lvalue>` (an array element / field /
-  ## deref source, e.g. `$`'s `NegTen[i]`), word by word. The lvalue's embedded
-  ## value registers (index, deref pointer, `(at)` stride scratch) are materialized
-  ## once via `prematLval2`; the per-word `emLvalFieldMem` re-emits the element
-  ## address (nifasm folds it). The word-transfer register is a sealed staging reg
-  ## picked AFTER `prematLval2` so it never collides with the lvalue's own scratch
-  ## (the reserved R11 bridge guarantees one is free). The memory-lvalue twin of
-  ## `genAggrCopy2`.
-  var boundBases: seq[Reg] = @[]
-  g.bindLvalGlobalBases(srcLval, boundBases)             # bind global base regs first
-  g.prematLval2(srcLval)
-  let tmp = g.pickStagingSealed("an aggregate lvalue-copy word")
-  let lay = aggrLayout(g.prog, typeName)
-  let words = (aggrByteSize(g.prog, typeName) + 7) div 8
-  for i in 0 ..< words:
-    let fn = fieldAtOffset(lay, i * 8)
-    if fn.len == 0: raiseAssert "arkham x64n: sub-word-packed aggregate copy unsupported"
-    g.ab.tree MovX64: (g.emReg tmp; g.emLvalFieldMem(srcLval, fn))
-    g.ab.tree MovX64: (g.emAggrFieldMem(dstVar, fn); g.emReg tmp)
-  g.giveBack tmp
-  g.unbindLvalTemps2(srcLval)
-  for r in boundBases: g.unbindTemp(r)
 
 proc emFieldOperand(g: var CodeGen; dst: Location) =
   ## The `(mem (dot <base> field))` operand for a `Field` destination, dispatching on
@@ -3098,21 +3137,51 @@ proc storeScalar2(g: var CodeGen; dst, v: Location) =
       else: raiseAssert "arkham x64n: scalar store rhs " & $v.kind
   else: raiseAssert "arkham x64n: scalar store dst " & $dst.kind
 
+proc aggrAddrLoc(g: var CodeGen; loc: Location; dest: Reg) =
+  ## Address of an aggregate DESTINATION location into the (bound) `dest` — the dst twin
+  ## of `aggrAddrInto`: a named stack slot / global leas its address; a complex lvalue
+  ## (`Mem`) routes through `aggrAddrInto` on its captured subtree.
+  case loc.kind
+  of NamedStack: g.emStackAddr(dest, loc.name)
+  of Glob: g.emGlobalAddr(dest, loc.name)
+  of Mem: g.aggrAddrInto(loc.cur, dest, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)
+  else: raiseAssert "arkham x64n: aggrAddrLoc of " & $loc.kind
+
+proc isAggrCopySrc(c: Cursor): bool =
+  ## An aggregate-valued source that is COPIED (not produced): a symbol or a memory lvalue.
+  c.kind == Symbol or (c.kind == TagLit and c.exprKind in {DotC, DerefC, AtC, PatC})
+
+proc dstAggrInfo(g: var CodeGen; dst: Location): (bool, int) =
+  ## (is `dst` an aggregate location?, its byte size). Tvar aggregates are unsupported.
+  case dst.kind
+  of NamedStack, Glob: (dst.typ.kind == AMem, dst.typ.size)
+  of Mem:
+    let s = g.exprSlot(dst.cur)
+    (s.kind == AMem, s.size)
+  else: (false, 0)
+
+proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size, auxPos: int) =
+  ## THE whole-aggregate copy `dst = rhs` (chibicc's struct `store`): reduce BOTH sides to
+  ## an address in a register (`aggrAddrLoc`/`aggrAddrInto` — the one `gen_addr`), then
+  ## `copyAggr`. ONE path for every (destination form × source form); the allocator
+  ## reserved `[dstAddr, srcAddr, copyTmp]`.
+  let a = g.ra.aux[auxPos].scratch
+  g.bindTemp(a[0], ScalarSlot); g.aggrAddrLoc(dst, a[0])         # &dst
+  g.bindTemp(a[1], ScalarSlot)
+  g.aggrAddrInto(rhs, a[1], AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)  # &rhs
+  g.bindTemp(a[2], AsmSlot(cls: AUInt, size: 8, align: 8))
+  g.copyAggr(a[0], a[1], size, a[2])
+  g.unbindTemp(a[2]); g.unbindTemp(a[1]); g.unbindTemp(a[0])
+
 proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
-  ## The general destination-passing store of the value core: emit expression `rhs`
-  ## so its value lands at `dst` — the resolved location of an lvalue (a var's home,
-  ## a global/tvar, or a synthetic aggregate temp). This is the one place every
-  ## caller (var-init, asgn, return value, call argument) routes through, so NONE
-  ## special-cases a constructor:
-  ## - an AGGREGATE destination builds the value in place through a SINGLE dispatch —
-  ##   `oconstr`/`aconstr` field-by-field, a symbol by whole-aggregate copy, a call by
-  ##   its result ABI;
-  ## - a GLOBAL/threadvar destination stores through the address temp the allocator
-  ##   recorded (a `Glob` needs `&g`; a `Tvar` resolves to `FS:[off]`);
-  ## - a scalar/float destination (register or spilled `(s)` slot) goes through the
-  ##   unified `storeScalar2`.
-  ## `auxPos` keys any scratch the allocator reserved (an aggregate-copy word temp; a
-  ## global's address temp).
+  ## The general destination-passing store of the value core. An aggregate COPY (symbol /
+  ## lvalue source) goes through the ONE `genAggrCopyStore` regardless of destination form;
+  ## constructors/calls/baseobj PRODUCE into the destination per-form; a scalar/float
+  ## destination goes through `storeScalar2`.
+  let (dstAggr, aggrSize) = g.dstAggrInfo(dst)
+  if dstAggr and isAggrCopySrc(rhs):                     # the ONE whole-aggregate copy path
+    g.genAggrCopyStore(rhs, dst, aggrSize, auxPos)
+    return
   if dst.kind == NamedStack and dst.typ.kind == AMem:    # aggregate destination (a slot var)
     let dstVar = dst.name
     let tn = g.varType[dstVar]
@@ -3127,10 +3196,6 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
       else:
         g.emitCall2(rhs)                                 # ≤16B result in rax:rdx
         g.regsToStruct(dstVar, tn, x64RetRegs)
-    elif rhs.kind == Symbol:                             # copy-init / copy-asgn `dst = a`
-      g.genAggrCopy2(dstVar, symName(rhs), tn, g.ra.aux[auxPos].scratch[0])
-    elif rhs.kind == TagLit and rhs.exprKind in {DotC, DerefC, AtC, PatC}:
-      g.genAggrCopyFromLval2(dstVar, rhs, tn)   # copy from a memory lvalue
     elif rhs.kind == TagLit and rhs.exprKind == BaseobjC:
       g.genBaseobj2(rhs, dst)                   # object→base slice
     else: raiseAssert "arkham x64n: aggregate store rhs " & $rhs.exprKind
@@ -3180,10 +3245,6 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
         g.emitCall2(rhs)
         g.emGlobalAddr(addrT, dst.name)                   # lea AFTER the call (rax:rdx kept)
         g.regsToStructThroughPtr(addrT, symName(g.getType(rhs)), x64RetRegs)
-      elif rhs.kind == Symbol:                            # whole-aggregate copy g = a
-        g.emGlobalAddr(addrT, dst.name)
-        g.copyStructThroughPtr2(symName(rhs), symName(g.getType(rhs)), addrT,
-                                g.ra.aux[auxPos].scratch[1])
       else: raiseAssert "arkham x64n: aggregate global store rhs " & $rhs.exprKind
       g.unbindTemp(addrT)
   elif dst.kind in {Glob, Tvar}:                         # scalar/pointer global / threadvar
@@ -3216,45 +3277,9 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
     else: discard
     if glbStaging != NoReg: g.giveBack glbStaging
     elif v.isTemp: g.unbindTemp(v.r)
-  elif dst.kind == Mem and rhs.kind == Symbol and g.exprSlot(dst.cur).kind == AMem:
-    # A whole-aggregate copy `arr[i] = x` THROUGH a complex lvalue: lea the lvalue's
-    # address into a pointer scratch, then field-copy the aggregate through it — the
-    # complex-lvalue twin of the global-aggregate symbol copy. (A constructor rhs builds
-    # in place field-by-field below; a call/lvalue-source rhs is not yet handled here.)
-    let lhs = dst.cur
-    let tn = symName(g.getType(lhs))
-    let addrT = g.ra.aux[auxPos].scratch[0]
-    g.bindTemp(addrT, ScalarSlot)
-    g.prematLval2(lhs)
-    g.ab.tree LeaX64: (g.emReg addrT; g.emLvalAddr2(lhs))
-    g.unbindLvalTemps2(lhs)
-    g.copyStructThroughPtr2(symName(rhs), tn, addrT, g.ra.aux[auxPos].scratch[1])
-    g.unbindTemp(addrT)
-  elif dst.kind == Mem and g.exprSlot(dst.cur).kind == AMem and
-       rhs.kind == TagLit and rhs.exprKind in {DotC, DerefC, AtC, PatC}:
-    # Whole-aggregate copy `dst[i] = src[j]` between TWO memory lvalues (e.g. seq `@`'s
-    # `result.data[i] = a[x]` over an object element). Bridge through a synthetic temp:
-    # copy the source lvalue into it (`genAggrCopyFromLval2`), then flat-copy the temp
-    # through the lhs address. Each phase is self-contained, so the two lvalues' embedded
-    # temps never need to be live together.
-    let lhs = dst.cur
-    let tnCur = g.getType(lhs)
-    let tn = symName(tnCur)
-    let pos = cursorToPosition(g.buf[], rhs)
-    let tmpVar = "lvtmp" & $pos & ".0"
-    g.emTypedStackVar(tmpVar, tnCur)
-    g.varType[tmpVar] = tn
-    g.genAggrCopyFromLval2(tmpVar, rhs, tn)               # src lvalue → temp
-    let addrT = g.ra.aux[auxPos].scratch[0]
-    g.bindTemp(addrT, ScalarSlot)
-    g.prematLval2(lhs)
-    g.ab.tree LeaX64: (g.emReg addrT; g.emLvalAddr2(lhs))  # &lhs
-    g.unbindLvalTemps2(lhs)
-    let scratch = g.pickStagingSealed("an lval-to-lval aggregate copy word")
-    g.flatCopyToPtr(tmpVar, aggrByteSize(g.prog, tn), addrT, scratch)  # temp → lhs
-    g.giveBack scratch
-    g.unbindTemp(addrT)
   elif dst.kind == Mem:                                  # store through a complex lvalue (dot/deref/at)
+    # (A whole-aggregate copy through an `Mem` lvalue went through `genAggrCopyStore` at
+    # the top; here the rhs PRODUCES into the address — a constructor or a scalar/float.)
     let lhs = dst.cur
     # A global aggregate base reserved an address scratch (aux); bind it so prematLval2's
     # `lea scratch, &g` emits a checked name. The allocator held it across the rhs.

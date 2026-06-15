@@ -704,6 +704,25 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
           raiseAssert "arkham: aggregate call argument exceeds the register arguments"
         if n.kind == Symbol:
           skip n                                # no per-value allocation — emitter reads the slot
+        elif n.kind == TagLit and n.exprKind in {DotC, DerefC, AtC, PatC}:
+          # An aggregate LVALUE arg: the emitter marshals STRAIGHT from its address (no
+          # copy temp). Reserve the address scratch FIRST (held), so it can't alias one of
+          # the lvalue's embedded base/index regs (which `aggrAddrInto` materializes before
+          # the `lea` writes the address scratch).
+          let addrT = b.reserveTmp(ScalarSlot)
+          let rc = n
+          allocLvalue2(b, n)                    # advances n past the lvalue (embedded regs)
+          releaseLvalTemps(b, rc)
+          b.releaseTmp(addrT)
+          if addrT.kind != InReg:
+            raiseAssert "arkham: out of registers for an aggregate-arg address"
+          # APPEND the address scratch (read as the last element by the emitter): a non-SIB
+          # `(at …)`/`(pat …)` arg already stored its stride scratch at `aux[pos].scratch[0]`
+          # (same position — `posOf(rc)` IS the at's position), which must not be clobbered.
+          if b.ra.aux.hasKey(b.posOf(rc)):
+            b.ra.aux[b.posOf(rc)].scratch.add addrT.r
+          else:
+            b.ra.aux[b.posOf(rc)] = ExprAux(scratch: @[addrT.r])
         else:                                   # oconstr/aconstr: build into a synthetic aggregate temp
           b.ra.hasStackVars = true
           allocStore(b, n, namedStackLoc("", argSlot), b.posOf(n))  # advances n
@@ -1255,14 +1274,54 @@ proc allocAconstr(b: var Builder; n: var Cursor) =
       else:
         b.allocSingleUse(n)
 
+proc isAggrCopySrc(c: Cursor): bool =
+  ## An aggregate-valued source that is COPIED (not produced): a symbol or a memory lvalue.
+  c.kind == Symbol or (c.kind == TagLit and c.exprKind in {DotC, DerefC, AtC, PatC})
+
+proc allocAggrCopy(b: var Builder; n: var Cursor; dstIsMem: bool; dstCur: Cursor;
+                   auxPos: int) =
+  ## Allocator twin of `genAggrCopyStore`: the ONE whole-aggregate copy reservation for
+  ## every (destination × source) form. Reserve the three held scratches the emitter's
+  ## `aggrAddrLoc`/`aggrAddrInto`/`copyAggr` consume — `[dstAddr, srcAddr, copyTmp]` — then
+  ## place each lvalue's embedded base/index regs transiently (a `Mem` destination and a
+  ## memory-lvalue source; freed after their address is leas'd, so they never co-live). A
+  ## bare symbol needs none. The dst/src stride-scratch aux live at THEIR own positions
+  ## (≠ auxPos), so they never collide with these. Advances `n` past the source.
+  let dstAddr = b.reserveTmp(ScalarSlot)
+  let srcAddr = b.reserveTmp(ScalarSlot)
+  let copyTmp = b.reserveTmp(ScalarSlot)
+  if dstIsMem:
+    var dc = dstCur
+    allocLvalue2(b, dc, dontCare, isStore = true)
+    releaseLvalTemps(b, dstCur)
+    b.ra.hasStackVars = true
+  if n.kind == TagLit and n.exprKind in {DotC, DerefC, AtC, PatC}:
+    let rc = n
+    allocLvalue2(b, n)                                   # advances n past the lvalue
+    releaseLvalTemps(b, rc)
+  else:
+    skip n                                               # a bare symbol
+  b.releaseTmp(copyTmp); b.releaseTmp(srcAddr); b.releaseTmp(dstAddr)
+  if dstAddr.kind != InReg or srcAddr.kind != InReg or copyTmp.kind != InReg:
+    raiseAssert "arkham: out of registers for an aggregate copy"
+  b.ra.aux[auxPos] = ExprAux(scratch: @[dstAddr.r, srcAddr.r, copyTmp.r])
+
 proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
-  ## Allocator twin of the emitter's `genStore2`: place the homes/temps needed to
-  ## store value `n` into `dst`, advancing `n` past the value. The ONE path every
-  ## caller (var-init, asgn, return value, call argument) routes through — an
-  ## aggregate dispatches like the emitter (oconstr/aconstr build, symbol copy, call
-  ## result); a scalar/float computes into its register home (destination-passing) or
-  ## a temp the emitter stores; a global reserves an address scratch. Scratch temps
-  ## land in `aux[auxPos]`.
+  ## Allocator twin of the emitter's `genStore2`. A whole-aggregate COPY (symbol/lvalue
+  ## source into an aggregate destination) goes through the ONE `allocAggrCopy`;
+  ## constructors/calls/baseobj PRODUCE into the destination; a scalar/float computes into
+  ## its register home or a temp. Scratch temps land in `aux[auxPos]`.
+  block:                                                 # the ONE whole-aggregate copy path
+    let dstAggr =
+      case dst.kind
+      of NamedStack, Glob: dst.typ.kind == AMem
+      of Mem: b.tc.exprSlot(dst.cur).kind == AMem
+      of Undef: b.tc.exprSlot(n).kind == AMem            # module-level global: classify by rhs
+      else: false                                        # Field recurses via its own branch
+    if dstAggr and isAggrCopySrc(n):
+      allocAggrCopy(b, n, dst.kind == Mem,
+                    (if dst.kind == Mem: dst.cur else: default(Cursor)), auxPos)
+      return
   if dst.kind == NamedStack and dst.typ.kind == AMem:    # aggregate destination
     if n.kind == TagLit and n.exprKind == OconstrC:
       allocConstr(b, n)                                  # object: place each field value
@@ -1271,9 +1330,6 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
     elif n.kind == TagLit and n.exprKind == CallC:       # call-returned aggregate
       var d = dontCare
       allocCall(b, n, d, hiddenPtr = dst.typ.size > b.md.aggrByRefThreshold)
-    elif n.kind == Symbol:                               # whole-aggregate copy
-      skip n
-      b.auxScratch(auxPos, "an aggregate copy")          # one word-transfer scratch
     elif n.kind == TagLit and n.exprKind == BaseobjC:    # object→base slice
       # Build the (derived) inner value into a temp like a nested aggregate (recurse);
       # the base-prefix copy scratch is picked at emit (a sealed staging reg), no aux.
@@ -1282,15 +1338,6 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
         skip n                                           # depth
         allocStore(b, n, namedStackLoc("", b.tc.exprSlot(n)), b.posOf(n))
         while n.hasMore: skip n
-    elif n.kind == TagLit and n.exprKind in {DotC, DerefC, AtC, PatC}:
-      # whole-aggregate copy from a memory lvalue (an array element / field / deref,
-      # e.g. `$`'s `NegTen[i]`): allocate the lvalue's embedded base/index/stride regs,
-      # then release them (the index/pointer/stride temps die with the copy, exactly
-      # like the scalar mem-load path). The word-transfer register is picked at emit
-      # time (a sealed staging reg, so it can't collide) — no aux reservation here.
-      let lvCopy = n
-      allocLvalue2(b, n)                                 # advances n past the lvalue
-      releaseLvalTemps(b, lvCopy)
     else:
       raiseAssert "arkham: aggregate store rhs not supported: " & $n.exprKind
   elif dst.kind == Undef:                                # module-level global / threadvar
@@ -1308,7 +1355,6 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
         allocCall(b, n, d, hiddenPtr = true)
       else:
         let addrT = b.reserveTmp(ScalarSlot)             # &g address temp (held across rhs)
-        var copyTmp = dontCare
         if n.kind == TagLit and n.exprKind == OconstrC:
           allocConstr(b, n)                              # build field-by-field through &g
         elif n.kind == TagLit and n.exprKind == AconstrC:
@@ -1316,17 +1362,11 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
         elif n.kind == TagLit and n.exprKind == CallC:   # ≤16B result in rax:rdx
           var d = dontCare
           allocCall(b, n, d, hiddenPtr = false)
-        elif n.kind == Symbol:                           # whole-aggregate copy g = a
-          skip n
-          copyTmp = b.reserveTmp(ScalarSlot)             # the field word-transfer scratch
         else:
           raiseAssert "arkham: aggregate global store rhs not supported: " & $n.exprKind
-        if copyTmp.kind == InReg: b.releaseTmp(copyTmp)
         b.releaseTmp(addrT)
         if addrT.kind != InReg: raiseAssert "arkham: out of registers for a global address"
-        var sc = @[addrT.r]
-        if copyTmp.kind == InReg: sc.add copyTmp.r
-        b.ra.aux[auxPos] = ExprAux(scratch: sc)
+        b.ra.aux[auxPos] = ExprAux(scratch: @[addrT.r])
     else:
       let addrT = b.reserveTmp(ScalarSlot)               # &g address temp (Tvar ignores it)
       b.allocSingleUse(n)
@@ -1357,46 +1397,6 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
       allocStore(b, n, namedStackLoc("", dst.typ), b.posOf(n))
     else:
       b.allocSingleUse(n)
-  elif dst.kind == Mem and b.tc.exprSlot(dst.cur).kind == AMem and n.kind == Symbol:
-    # A whole-aggregate copy `arr[i] = x` through a complex lvalue: the lhs embedded
-    # base/index regs (held for the address `lea`), an address temp, and a field-copy
-    # temp. (The non-global lvalue case — a global aggregate base would also need its
-    # address scratch; not yet combined.)
-    let lhsCur = dst.cur
-    if lvalueGlobalBase(b, lhsCur):
-      raiseAssert "arkham: aggregate copy into a global-based lvalue not yet supported"
-    var lc = lhsCur
-    allocLvalue2(b, lc, dontCare, isStore = true)        # lhs embedded regs (held for the lea)
-    let addrT = b.reserveTmp(ScalarSlot)
-    skip n                                               # the source symbol
-    let copyTmp = b.reserveTmp(ScalarSlot)
-    releaseLvalTemps(b, lhsCur)
-    b.releaseTmp(copyTmp); b.releaseTmp(addrT)
-    if addrT.kind != InReg or copyTmp.kind != InReg:
-      raiseAssert "arkham: out of registers for an aggregate lvalue copy"
-    b.ra.aux[auxPos] = ExprAux(scratch: @[addrT.r, copyTmp.r])
-  elif dst.kind == Mem and b.tc.exprSlot(dst.cur).kind == AMem and
-       n.kind == TagLit and n.exprKind in {DotC, DerefC, AtC, PatC}:
-    # A whole-aggregate copy `dst[i] = src[j]` between TWO memory lvalues. The emitter
-    # bridges through a synthetic temp in two self-contained phases (src→temp, temp→lhs),
-    # so the two lvalues' embedded temps need NOT be live together: allocate the source
-    # lvalue's temps (freed after its copy), then the lhs lvalue's temps + the address
-    # scratch. The word-transfer registers are picked at emit (sealed staging regs).
-    let lhsCur = dst.cur
-    if lvalueGlobalBase(b, lhsCur):
-      raiseAssert "arkham: aggregate copy into a global-based lvalue not yet supported"
-    b.ra.hasStackVars = true                              # the bridge temp
-    let rhsCur = n
-    allocLvalue2(b, n, isStore = false)                  # source lvalue regs (advances n)
-    releaseLvalTemps(b, rhsCur)                           # freed after the src→temp copy
-    var lc = lhsCur
-    allocLvalue2(b, lc, dontCare, isStore = true)        # lhs embedded regs (held for the lea)
-    let addrT = b.reserveTmp(ScalarSlot)
-    releaseLvalTemps(b, lhsCur)
-    b.releaseTmp(addrT)
-    if addrT.kind != InReg:
-      raiseAssert "arkham: out of registers for an aggregate lvalue copy"
-    b.ra.aux[auxPos] = ExprAux(scratch: @[addrT.r])
   elif dst.kind == Mem:                                  # store through a complex lvalue (dot/deref/at)
     # Place the lvalue's embedded base/index regs, then the rhs. An AGGREGATE constructor
     # builds field-by-field into the address (placed like a slot store); a FLOAT rhs goes
