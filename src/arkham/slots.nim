@@ -1,11 +1,11 @@
 #
-#           Arkham — native AArch64 code generator for NIFC
+#           Arkham — native AArch64 code generator for Leng
 #        (c) Copyright 2026 Andreas Rumpf
 #
 #    See the file "license.txt", included in this distribution.
 #
 
-## Machine-agnostic type/size classification: maps a NIFC type cursor to an
+## Machine-agnostic type/size classification: maps a Leng type cursor to an
 ## `AsmSlot` (kind + size + align). Drives register-class and width decisions
 ## in the register allocator and code generator.
 
@@ -25,7 +25,7 @@ type
                                   # truth; `cls` is the cached projection of it until every
                                   # slot reliably carries a `typ` (see `kind`).
     size*, align*, offset*: int   # offset only meaningful for fields/slots
-    typ*: Cursor                  # the NIFC type this slot was classified from, when
+    typ*: Cursor                  # the Leng type this slot was classified from, when
                                   # known (a `typeToSlot` result carries it). Lets a
                                   # scratch register be `(rebind …)`'d to its concrete
                                   # type — incl. a pointer's pointee — rather than a
@@ -102,10 +102,10 @@ proc scalarSlot(kind: AsmTypeKind; bits: int): AsmSlot =
   result = AsmSlot(cls: kind, size: sz, align: min(sz, 8))
 
 proc typeToSlot*(c: Cursor): AsmSlot =
-  ## Classify a NIFC type at `c`. Aggregates and unknowns become `AMem`
+  ## Classify a Leng type at `c`. Aggregates and unknowns become `AMem`
   ## (passed/kept by reference) for now. The classified slot retains `c` in `.typ`
   ## so a scratch register holding a value of this type can be `(rebind …)`'d to its
-  ## concrete NIFC type (see `bindTemp`).
+  ## concrete Leng type (see `bindTemp`).
   case c.typeKind
   of IT:   result = scalarSlot(AInt,  typeBits(c))
   of UT:   result = scalarSlot(AUInt, typeBits(c))

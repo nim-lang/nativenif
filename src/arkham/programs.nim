@@ -1,12 +1,12 @@
 #
-#           Arkham — native AArch64 code generator for NIFC
+#           Arkham — native AArch64 code generator for Leng
 #        (c) Copyright 2026 Andreas Rumpf
 #
 #    See the file "license.txt", included in this distribution.
 #
 
 ## arkham's *program* model over the nifcore API — the nifcore analog of
-## nimony's `programs.nim` (and nifc's `nifmodules.nim`). A NIFC name can refer
+## nimony's `programs.nim` (and leng's `nifmodules.nim`). A Leng name can refer
 ## to a declaration in **another module**: a mangled symbol like
 ## `Color.0.othermod` carries its defining module's suffix (`othermod`). This
 ## module manages that — it scans the main module's top level (`collect`) and
@@ -60,7 +60,7 @@ type
 
   Program* = object
     externOrder*: seq[Extern]               ## extproc decls, in order (main module)
-    callTarget*: Table[string, CallTarget]  ## NIFC proc symbol → how to call it
+    callTarget*: Table[string, CallTarget]  ## Leng proc symbol → how to call it
     procs*: seq[ProcInfo]                   ## internal procs to emit (entry first)
     syscalls*: seq[SyscallProc]             ## syscalls used → one `(syproc …)` decl each
     globals*: Table[string, Cursor]         ## global (gvar/const) var name → its decl cursor
@@ -200,7 +200,7 @@ proc ptrTypeOf*(p: Program; elem: Cursor): Cursor =
   ## tag pools, so any symbol / literal ids the copied subtree carries stay valid
   ## (cross-pool copies would corrupt them). The returned cursor keeps its backing
   ## alive via the refcounted owner (the same idiom as `procPtr`). Mirrors
-  ## `nifc/typenav.getTypeImpl`'s `AddrC` case — a pointer is not just 8 bytes, it
+  ## `leng/typenav.getTypeImpl`'s `AddrC` case — a pointer is not just 8 bytes, it
   ## carries the pointee type so `(deref (addr x))` / `(pat (addr x) i)` navigate.
   var buf = createTokenBuf(8, sharedPool = elem.pool, sharedTags = elem.tags)
   buf.openTag registerTag(elem.tags, "ptr")
@@ -237,7 +237,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     result.charType = beginRead(ctBuf)
     var ftBuf = parseFromBuffer("(f 64)", "", sharedTags = tags)
     result.floatType = beginRead(ftBuf)
-  assert buf.beginRead().stmtKind == StmtsS, "NIFC top level must be (stmts …)"
+  assert buf.beginRead().stmtKind == StmtsS, "Leng top level must be (stmts …)"
   # Pass 1: register every type declaration. Procs (pass 2) resolve their
   # param/return types via `isDeclarativeAbi`, and a proc may reference a type
   # declared *later* in the module (e.g. a tuple-instance returned by a helper),
@@ -353,7 +353,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
 
 proc loadModule(p: var Program; suffix: string): ForeignModule =
   ## Load (and cache) the foreign module identified by `suffix`. Its file is
-  ## `<dir-of-main>/<suffix><ext-of-main>` (the same scheme nifc uses). The file
+  ## `<dir-of-main>/<suffix><ext-of-main>` (the same scheme leng uses). The file
   ## must carry an embedded `.indexat` index (run `nimony/tools/reindex.nim` on
   ## hand-written fixtures); the shared `nifmodules` loader keeps the reader open
   ## for lazy per-symbol jumps.
@@ -460,7 +460,7 @@ proc typeSizeAlign*(p: var Program; c: Cursor): (int, int)
 
 proc unionSizeAlign(p: var Program; unionc: Cursor): (int, int) =
   ## A union's branches OVERLAP: size = max(branch size), align = max(branch align).
-  ## NIFC object-variant branches are `(object …)` nodes (sized via `objSizeAlign`).
+  ## Leng object-variant branches are `(object …)` nodes (sized via `objSizeAlign`).
   var uc = unionc
   var maxSz = 0
   var maxAl = 1
@@ -498,7 +498,7 @@ proc objSizeAlign(p: var Program; bodyc: Cursor): (int, int) =
   result = (align(off, maxAl), maxAl)
 
 proc typeSizeAlign*(p: var Program; c: Cursor): (int, int) =
-  ## Size and alignment (bytes) of a NIFC type, mirroring nifasm's layout.
+  ## Size and alignment (bytes) of a Leng type, mirroring nifasm's layout.
   case c.kind
   of Symbol:
     var d = lookupType(p, symName(c))
@@ -588,7 +588,7 @@ proc aggrByteSize*(p: var Program; typeName: string): int =
 
 proc fieldType*(p: var Program; objType: Cursor; field: string): Cursor =
   ## The structural type cursor of `field` in a resolved `(object …)` type.
-  ## An inherited field (the NIFC `(dot base field depth)` selector counts the
+  ## An inherited field (the Leng `(dot base field depth)` selector counts the
   ## base levels) is resolved by recursing into the object's base type.
   assert objType.kind == TagLit and objType.typeKind == ObjectT,
     "arkham: field access requires an object type"

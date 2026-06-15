@@ -156,7 +156,7 @@ proc takeTypeDecl*(c: var Cursor): TypeDecl =
 iterator fields*(c: Cursor): Cursor =
   ## `c` at an `(object …)`/`(union …)` node. Yields a cursor at each `(fld …)`
   ## child, tolerating (and skipping) a leading non-`fld` slot — the optional
-  ## NIFC inheritance/base type carried only by `object`. Does not mutate `c`.
+  ## Leng inheritance/base type carried only by `object`. Does not mutate `c`.
   var c = c
   into c:
     # `(object [Empty | Type-base] FieldDecl*)` — skip a leading non-field slot.
@@ -174,7 +174,7 @@ type
 
 proc takeField*(c: var Cursor; atTypeStart: proc (c: Cursor): bool {.nimcall.}): Field =
   ## `c` at a `(fld …)` node. Captures the name and type, tolerating the
-  ## optional NIFC `FieldPragmas` slot before the type (detected via the
+  ## optional Leng `FieldPragmas` slot before the type (detected via the
   ## caller-supplied `atTypeStart`, which knows the type grammar). Advances `c`
   ## past the node.
   result = Field()

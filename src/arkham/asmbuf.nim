@@ -1,5 +1,5 @@
 #
-#           Arkham — native AArch64 code generator for NIFC
+#           Arkham — native AArch64 code generator for Leng
 #        (c) Copyright 2026 Andreas Rumpf
 #
 #    See the file "license.txt", included in this distribution.
@@ -89,7 +89,7 @@ proc ident*(a: var AsmBuf; s: string) {.inline.} = (if not a.planning: a.buf.add
 
 # ── type emission (NifasmType tags) ─────────────────────────────────────────
 # Kept here (not in codegen) because nifasm's NifasmType shares spellings with
-# nimony's NifcType — referencing the nifasm enum values is unambiguous only in
+# nimony's LengType — referencing the nifasm enum values is unambiguous only in
 # this module, which doesn't import nifcdecl.
 
 proc intType*(a: var AsmBuf; bits: int) = a.tree IT: a.intLit bits
