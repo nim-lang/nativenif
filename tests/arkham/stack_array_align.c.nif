@@ -1,0 +1,39 @@
+(.nif27)
+(.indexat 563              )
+(stmts
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :small.0 .
+    (array
+     (i 64)1).)
+   (var :big.0 .
+    (array
+     (i 64)2).)
+   (asgn
+    (at small.0 0)1)
+   (asgn
+    (at big.0 0)2)
+   (var :m.0 .
+    (i 64)
+    (bitand
+     (i 64)
+     (cast
+      (i 64)
+      (addr big.0))15))
+   (if
+    (elif
+     (eq m.0 0)
+     (stmts
+      (call exit.c 42))))
+   (call exit.c 7))))(.index)

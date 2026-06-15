@@ -1,0 +1,48 @@
+(.nif27)
+(.indexat 660              )
+(stmts
+ (type :Row.0 .
+  (array
+   (i 64)2))
+ (type :Mat.0 .
+  (array Row.0 2))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :m.0 . Mat.0 .)
+   (asgn
+    (at
+     (at m.0 0)0)1)
+   (asgn
+    (at
+     (at m.0 0)1)2)
+   (asgn
+    (at
+     (at m.0 1)0)3)
+   (asgn
+    (at
+     (at m.0 1)1)4)
+   (var :i.0 .
+    (i 64)1)
+   (var :j.0 .
+    (i 64)1)
+   (var :k.0 .
+    (i 64)0)
+   (call exit.c
+    (add
+     (i 64)
+     (at
+      (at m.0 i.0)j.0)
+     (at
+      (at m.0 i.0)k.0))))))
+(.index)
