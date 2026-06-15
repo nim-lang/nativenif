@@ -1885,15 +1885,19 @@ proc genCallMarkerA64(n: var Cursor; ctx: var GenContext) =
     # are untouched) and `blr` through it. A global's address is formed with adrp+add
     # (recorded as a gvar site and patched once the data layout is known), exactly
     # like a `(lea reg gvar)`; then the pointer value is loaded and called.
-    if sym.kind == skGvar:
+    if sym.kind in {skVar, skParam} and sym.reg != InvalidTagId:
+      # A function pointer held directly in a REGISTER (vtable-method load / reg-resident
+      # `var f: proc`): the register holds the code address itself → `blr reg`, no load.
+      arm64.emitBlr(ctx.buf.data, tagToRegisterA64(sym.reg, n))
+    elif sym.kind == skGvar:
       let pos = ctx.buf.data.getCurrentPosition()
       arm64.emitAdrpAddGvar(ctx.buf.data, arm64.X16)            # x16 = &fnptr
       ctx.gvarSites.add (pos, sym)
       arm64.emitLdr(ctx.buf.data, arm64.X16, arm64.X16, 0'i32)  # x16 = fnptr
+      arm64.emitBlr(ctx.buf.data, arm64.X16)
     else:
       error("Indirect call through unsupported function-pointer location: " &
             $sym.kind, n)
-    arm64.emitBlr(ctx.buf.data, arm64.X16)
     ctx.callContext.callEmitted = true
     inc n
     return
@@ -3751,14 +3755,19 @@ proc genCallMarkerX64(n: var Cursor; ctx: var GenContext) =
   ctx.clobbered.incl(ctx.callContext.typ.clobbers)
 
   if ctx.callContext.indirect:
-    # Load the function pointer from its variable into rax — which the call
-    # clobbers anyway and where a scalar result then lands — and call through it.
-    # The gvar's RIP-relative address is recorded as a site and patched by writeElf,
-    # exactly like a `(lea reg gvar)`.
-    let pos = x86.emitLeaRipPlaceholder(ctx.buf, x86.RAX)               # lea rax, [rip+fnptr]
-    ctx.gvarSites.add (pos, sym)
-    x86.emitMov(ctx.buf.data, x86.RAX, x86.MemoryOperand(base: x86.RAX)) # mov rax, [rax]
-    x86.emitCallReg(ctx.buf.data, x86.RAX)                              # call rax
+    if sym.kind in {skVar, skParam} and sym.reg != InvalidTagId:
+      # A function pointer held directly in a REGISTER (e.g. arkham's vtable-method load,
+      # or a reg-resident `var f: proc`): the register holds the code address itself, so
+      # `call reg` — no load. (The register is caller-saved/non-arg per the proctype's
+      # clobber, so the prepared args in rdi…r9 are untouched.)
+      x86.emitCallReg(ctx.buf.data, tagToRegister(sym.reg, n))
+    else:
+      # A function pointer stored in a GLOBAL: form its RIP-relative address (recorded as
+      # a site, patched by writeElf like a `(lea reg gvar)`), load the pointer, call it.
+      let pos = x86.emitLeaRipPlaceholder(ctx.buf, x86.RAX)               # lea rax, [rip+fnptr]
+      ctx.gvarSites.add (pos, sym)
+      x86.emitMov(ctx.buf.data, x86.RAX, x86.MemoryOperand(base: x86.RAX)) # mov rax, [rax]
+      x86.emitCallReg(ctx.buf.data, x86.RAX)                              # call rax
   else:
     var labId: LabelId
     if sym.offset == -1:

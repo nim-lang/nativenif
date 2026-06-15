@@ -677,7 +677,17 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
   var intIdx = if hiddenPtr: 1 else: 0         # rdi reserved for a >16B aggregate result ptr
   var fIdx = 0
   n.into:
-    skip n                                     # callee symbol
+    # An INDIRECT call's target is a fn-ptr EXPRESSION (vtable/method-table load), not a
+    # symbol: allocate it into a register HELD across the args + the call (the emitter
+    # declares a proctype var bound to it and `prepare`s through that). A direct call's
+    # symbol callee is just skipped.
+    let indirect = n.kind != Symbol
+    var fnptrTd: Location
+    if indirect:
+      fnptrTd = needsReg(ScalarSlot)
+      allocValue(b, n, fnptrTd)                # fn-ptr target → a held register (advances n)
+    else:
+      skip n                                   # callee symbol
     while n.hasMore:
       # The argument's ABI class is just its type — one `exprSlot`, the SAME navigator
       # the emitter uses. No per-form ladder: a struct var and an `(oconstr …)`/`(aconstr …)`
@@ -716,6 +726,7 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
         allocValue(b, n, ad)
         b.releaseTmp(ad)
         inc intIdx
+    if indirect: b.releaseTmp(fnptrTd)         # the held fn-ptr target reg, dead after the call
   case dest.kind
   of Undef, NeedsReg, RegOrImm:
     dest = regLoc(b.md.intRetReg, ScalarSlot, isTemp = true)   # int result in rax
@@ -876,6 +887,12 @@ proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = 
         if t.kind == InReg:
           b.ra.aux[patPos] = ExprAux(scratch: @[t.r])
         else: raiseAssert "arkham: out of registers for a pat stride scratch"
+    of BaseobjC:                             # `(baseobj BaseT depth lvalue)` — transparent base
+      n.into:
+        skip n                               # base type
+        skip n                               # depth
+        allocLvalue2(b, n, globBase, isStore)  # the inner lvalue (its embedded values)
+        while n.hasMore: skip n
     else:
       raiseAssert "arkham: computed lvalue base not supported: " & $n.exprKind
   else:
@@ -940,6 +957,12 @@ proc releaseLvalTemps(b: var Builder; n: Cursor) =
       skip cc
       if cc.kind notin {IntLit, UIntLit}:
         b.releaseTmp(b.ra.locs[b.posOf(cc)])  # the computed index
+      while cc.hasMore: skip cc
+  of BaseobjC:                               # transparent: free the inner lvalue's temps
+    var cc = c
+    cc.into:
+      skip cc; skip cc                       # base type, depth
+      releaseLvalTemps(b, cc)                # the inner lvalue
       while cc.hasMore: skip cc
   else: discard
 
@@ -1220,11 +1243,17 @@ proc allocConstr(b: var Builder; n: var Cursor) =
 proc allocAconstr(b: var Builder; n: var Cursor) =
   ## `(aconstr ArrayT e0 e1 …)` — allocate each (bare) element value into a register
   ## (a SIMD temp for a float element); each is single-use (store + free), so the temps
-  ## recycle. Advances `n` past the aconstr. The array twin of `allocConstr`.
+  ## recycle. A nested AGGREGATE element (an inner array/object constructor) routes
+  ## through `allocStore` as an aggregate `Field` destination, exactly like a nested
+  ## `oconstr` field (`allocConstr`) — so it recurses. Advances `n` past the aconstr.
+  ## The array twin of `allocConstr`.
   n.into:
     skip n                                     # the array type
     while n.hasMore:
-      b.allocSingleUse(n)
+      if b.tc.exprSlot(n).kind == AMem:        # aggregate element: build into the element address
+        allocStore(b, n, fieldLoc("", "", "", b.tc.exprSlot(n)), b.posOf(n))
+      else:
+        b.allocSingleUse(n)
 
 proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
   ## Allocator twin of the emitter's `genStore2`: place the homes/temps needed to
@@ -1245,6 +1274,14 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
     elif n.kind == Symbol:                               # whole-aggregate copy
       skip n
       b.auxScratch(auxPos, "an aggregate copy")          # one word-transfer scratch
+    elif n.kind == TagLit and n.exprKind == BaseobjC:    # object→base slice
+      # Build the (derived) inner value into a temp like a nested aggregate (recurse);
+      # the base-prefix copy scratch is picked at emit (a sealed staging reg), no aux.
+      n.into:
+        skip n                                           # base type
+        skip n                                           # depth
+        allocStore(b, n, namedStackLoc("", b.tc.exprSlot(n)), b.posOf(n))
+        while n.hasMore: skip n
     elif n.kind == TagLit and n.exprKind in {DotC, DerefC, AtC, PatC}:
       # whole-aggregate copy from a memory lvalue (an array element / field / deref,
       # e.g. `$`'s `NegTen[i]`): allocate the lvalue's embedded base/index/stride regs,
@@ -1338,6 +1375,28 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
     if addrT.kind != InReg or copyTmp.kind != InReg:
       raiseAssert "arkham: out of registers for an aggregate lvalue copy"
     b.ra.aux[auxPos] = ExprAux(scratch: @[addrT.r, copyTmp.r])
+  elif dst.kind == Mem and b.tc.exprSlot(dst.cur).kind == AMem and
+       n.kind == TagLit and n.exprKind in {DotC, DerefC, AtC, PatC}:
+    # A whole-aggregate copy `dst[i] = src[j]` between TWO memory lvalues. The emitter
+    # bridges through a synthetic temp in two self-contained phases (src→temp, temp→lhs),
+    # so the two lvalues' embedded temps need NOT be live together: allocate the source
+    # lvalue's temps (freed after its copy), then the lhs lvalue's temps + the address
+    # scratch. The word-transfer registers are picked at emit (sealed staging regs).
+    let lhsCur = dst.cur
+    if lvalueGlobalBase(b, lhsCur):
+      raiseAssert "arkham: aggregate copy into a global-based lvalue not yet supported"
+    b.ra.hasStackVars = true                              # the bridge temp
+    let rhsCur = n
+    allocLvalue2(b, n, isStore = false)                  # source lvalue regs (advances n)
+    releaseLvalTemps(b, rhsCur)                           # freed after the src→temp copy
+    var lc = lhsCur
+    allocLvalue2(b, lc, dontCare, isStore = true)        # lhs embedded regs (held for the lea)
+    let addrT = b.reserveTmp(ScalarSlot)
+    releaseLvalTemps(b, lhsCur)
+    b.releaseTmp(addrT)
+    if addrT.kind != InReg:
+      raiseAssert "arkham: out of registers for an aggregate lvalue copy"
+    b.ra.aux[auxPos] = ExprAux(scratch: @[addrT.r])
   elif dst.kind == Mem:                                  # store through a complex lvalue (dot/deref/at)
     # Place the lvalue's embedded base/index regs, then the rhs. An AGGREGATE constructor
     # builds field-by-field into the address (placed like a slot store); a FLOAT rhs goes

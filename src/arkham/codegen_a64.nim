@@ -1272,6 +1272,26 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
           if g.ra.aux.hasKey(patPos) and g.ra.aux[patPos].scratch.len > 0:
             g.emReg g.ra.aux[patPos].scratch[0]           # non-scale stride scratch
           while cc.hasMore: skip cc
+    of BaseobjC:
+      # `(baseobj BaseType depth lvalue)` — object→base view. Base sub-object at offset 0,
+      # so the ADDRESS is the inner lvalue's, only the TYPE narrows. A `(deref p)` inner
+      # re-emits as `(cast (ptr BaseType) p)`; any other inner is transparent (nifasm
+      # flattens inherited fields).
+      var cc = c
+      cc.into:
+        let baseTy = cc; skip cc                          # base type (a Symbol)
+        skip cc                                           # depth
+        if cc.kind == TagLit and cc.exprKind == DerefC:
+          var dc = cc
+          dc.into:
+            let pReg = g.ra.locs[g.posOf(dc)]
+            g.ab.tree CastX:
+              g.ab.ptrType: g.ab.sym symName(baseTy)
+              g.emReg pReg.r
+            while dc.hasMore: skip dc
+        else:
+          g.emLvalAddr2(cc)                               # transparent
+        while cc.hasMore: skip cc
     else: raiseAssert "arkham a64n: emLvalAddr2 expr " & $c.exprKind
   else: raiseAssert "arkham a64n: emLvalAddr2 kind " & $c.kind
 
@@ -1324,6 +1344,12 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
         while cc.hasMore: skip cc
       if g.ra.aux.hasKey(patPos) and g.ra.aux[patPos].scratch.len > 0:
         g.bindTemp(g.ra.aux[patPos].scratch[0], ScalarSlot)
+    of BaseobjC:                                          # transparent: materialize inner lvalue
+      var cc = c
+      cc.into:
+        skip cc; skip cc                                 # base type, depth
+        g.prematLval2(cc)
+        while cc.hasMore: skip cc
     else: discard
 
 proc unbindLvalTemps2(g: var CodeGen; c: Cursor) =
@@ -1374,6 +1400,12 @@ proc unbindLvalTemps2(g: var CodeGen; c: Cursor) =
         while cc.hasMore: skip cc
       if g.ra.aux.hasKey(patPos) and g.ra.aux[patPos].scratch.len > 0:
         g.unbindTemp(g.ra.aux[patPos].scratch[0])
+    of BaseobjC:                                          # transparent: release inner lvalue
+      var cc = c
+      cc.into:
+        skip cc; skip cc                                 # base type, depth
+        g.unbindLvalTemps2(cc)
+        while cc.hasMore: skip cc
     else: discard
 
 # ── memory loads / address-of ────────────────────────────────────────────────
@@ -1439,6 +1471,33 @@ proc emitAddr2(g: var CodeGen; c: Cursor) =
       g.bindTemp(res.r, AsmSlot(cls: AUInt, size: 8, align: 8, typ: g.getType(p)))
     g.place2(pLoc, res.r)
     if pLoc.kind == InReg and pLoc.isTemp and pLoc.r != res.r: g.unbindTemp(pLoc.r)
+  elif lv.kind == TagLit and lv.exprKind == BaseobjC:
+    # `&(baseobj BaseT depth inner)`: base sub-object at offset 0, so the address is
+    # `&inner` retyped to `(ptr BaseT)` (= `aslot`). A `(deref p)` inner is just `p`.
+    var inner: Cursor
+    block:
+      var bc = lv
+      bc.into:
+        skip bc; skip bc                                  # base type, depth
+        inner = bc
+        while bc.hasMore: skip bc
+    if inner.kind == TagLit and inner.exprKind == DerefC:
+      var p: Cursor
+      block:
+        var dd = inner
+        dd.into:
+          p = dd; skip dd
+          while dd.hasMore: skip dd
+      g.emitValue2(p)
+      let pLoc = g.ra.locs[g.posOf(p)]
+      if res.isTemp: g.bindTemp(res.r, aslot)
+      g.place2(pLoc, res.r)
+      if pLoc.kind == InReg and pLoc.isTemp and pLoc.r != res.r: g.unbindTemp(pLoc.r)
+    else:
+      if res.isTemp: g.bindTemp(res.r, aslot)
+      g.prematLval2(inner)
+      g.ab.tree LeaA64: (g.emReg res.r; g.emLvalAddr2(inner))
+      g.unbindLvalTemps2(inner)
   elif lv.kind == Symbol and g.lookupSym(symName(lv)).cat in {scGlobal, scTvar}:
     if res.isTemp: g.bindTemp(res.r, aslot)
     var lc = lv
@@ -1880,6 +1939,61 @@ proc emitAtomic2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
       &"(lab :{lFail}) (clrex) (stlr {old} {ep}) (mov {ret} 0) (lab :{lDone})")
   else: raiseAssert "arkham a64n: unsupported atomic builtin: " & builtin
 
+proc proctypeOfTarget(g: var CodeGen; targetCur: Cursor): Cursor =
+  ## The resolved proctype body of an indirect call target (a `(cast Proctype fnptr)`
+  ## function-pointer expression), for ABI queries.
+  var ptType = targetCur
+  if targetCur.kind == TagLit and targetCur.exprKind in {CastC, ConvC}:
+    ptType = targetCur; inc ptType                       # the cast's target type
+  result = resolveType(g.prog, ptType)
+  assert result.kind == TagLit and result.typeKind == ProctypeT,
+    "arkham a64n: indirect call target is not a proctype"
+
+proc emitIndirectCall2(g: var CodeGen; c, targetCur: Cursor; argCurs: seq[Cursor];
+                       resLoc: Location; pos: int) =
+  ## Indirect call through a function-pointer EXPRESSION (vtable/method-table load). A
+  ## `(cast Proctype …)` binds its register as a PROCTYPE-typed temp, whose `regLocal`
+  ## name is a ProcT symbol nifasm accepts as a `(prepare …)` indirect target. Declarative
+  ## ABI, register args only (≤8); float/aggregate/stack-arg indirect calls deferred.
+  let proctype = g.proctypeOfTarget(targetCur)
+  if not isDeclarativeAbi(g.prog, proctype):
+    raiseAssert "arkham a64n: non-declarative indirect call not yet supported"
+  if argCurs.len > IntArgRegs.len:
+    raiseAssert "arkham a64n: indirect call with stack arguments not yet supported"
+  var retType = proctype
+  block:
+    var q = proctype
+    q.into:
+      skip q; skip q                                     # the Empty (name) slot, the params
+      retType = q
+      while q.hasMore: skip q
+  let hasResult = not retIsVoid(retType)
+  let resSlot = if hasResult: slotOf(g.prog, retType) else: ScalarSlot
+  g.emitValue2(targetCur)                                # fn-ptr → its (held) register, proctype-bound
+  let tloc = g.ra.locs[g.posOf(targetCur)]
+  assert tloc.kind == InReg, "arkham a64n: indirect call target loc " & $tloc.kind
+  let fnptrReg = tloc.r
+  assert g.regLocal.hasKey(fnptrReg), "arkham a64n: indirect call target not bound to a name"
+  let fpVar = g.regLocal[fnptrReg]
+  g.ab.tree PrepareA64:
+    g.ab.sym fpVar
+    for idx in 0 ..< argCurs.len:
+      g.emitValue2(argCurs[idx])
+      let aloc = g.ra.locs[g.posOf(argCurs[idx])]
+      if aloc.kind == InReg and aloc.isTemp: g.unbindTemp(aloc.r)
+      g.ab.tree MovA64:
+        g.ab.tree ArgX: g.ab.sym paramName(idx)
+        g.ab.reg aloc.r
+    g.ab.keyword CallA64
+    if hasResult:
+      g.ab.tree MovA64:
+        g.emReg IntRet
+        g.ab.tree ResX: g.ab.sym "ret.0"
+  if tloc.isTemp: g.unbindTemp(fnptrReg)
+  if hasResult and resLoc.kind == InReg and resLoc.r != IntRet:
+    if resLoc.isTemp and resSlot.kind != AMem: g.bindTemp(resLoc.r, resSlot)
+    g.movReg(resLoc.r, IntRet)
+
 proc emitCall2(g: var CodeGen; c: Cursor) =
   ## Emit a call. The allocator placed each argument in its ABI register and the
   ## result in x0 / v0 (or a dest-passed home).
@@ -1887,11 +2001,19 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
   let resLoc = g.ra.locs[pos]
   var argCurs: seq[Cursor] = @[]
   var fsym = ""
+  var targetCur: Cursor
+  var indirect = false
   block:
     var fc = c
     fc.into:
-      fsym = symName(fc); inc fc
+      targetCur = fc
+      indirect = fc.kind != Symbol
+      if not indirect: fsym = symName(fc)
+      skip fc
       while fc.hasMore: (argCurs.add fc; skip fc)
+  if indirect:                                      # call through a fn-ptr expression (vtable)
+    g.emitIndirectCall2(c, targetCur, argCurs, resLoc, pos)
+    return
   if not g.callTarget.hasKey(fsym):
     let si = g.lookupSym(fsym)
     if si.cat in {scGlobal, scTvar}:
@@ -2393,6 +2515,40 @@ proc emLvalElemMem(g: var CodeGen; lhs: Cursor; idx: int) =
       g.emLvalAddr2(lhs)
       g.ab.intLit idx
 
+proc emAggrElemAt(g: var CodeGen; base: string; idx: int) =
+  ## Bare `(at base idx)` ADDRESS tree (no `(mem …)` wrapper) — what a64's `lea` takes
+  ## to compute `&base[idx]`. The element twin of `emAggrDot`.
+  g.ab.tree AtX:
+    g.ab.sym base
+    g.ab.intLit idx
+
+proc emLvalElemAt(g: var CodeGen; lhs: Cursor; idx: int) =
+  ## Bare `(at <lvalue address> idx)` address tree — for `lea` of an lvalue element.
+  g.ab.tree AtX:
+    g.emLvalAddr2(lhs)
+    g.ab.intLit idx
+
+proc emPtrElemMem(g: var CodeGen; p: Reg; elemTy: Cursor; idx: int) =
+  ## `(mem (at (cast (aptr ElemTy) p) idx))` — element `idx` of an array at `[p]`;
+  ## nifasm scales by the element size. The array twin of `emPtrFieldMem`.
+  var et = elemTy
+  g.ab.tree MemX:
+    g.ab.tree AtX:
+      g.ab.tree CastX:
+        g.ab.aptrType: g.genTypeBody(et)
+        g.emReg p
+      g.ab.intLit idx.int64
+
+proc emPtrElemAt(g: var CodeGen; p: Reg; elemTy: Cursor; idx: int) =
+  ## Bare `(at (cast (aptr ElemTy) p) idx)` address tree — for `lea` of an element
+  ## through a pointer base (e.g. a global's address).
+  var et = elemTy
+  g.ab.tree AtX:
+    g.ab.tree CastX:
+      g.ab.aptrType: g.genTypeBody(et)
+      g.emReg p
+    g.ab.intLit idx.int64
+
 proc fieldSlotByName(g: var CodeGen; typeName, field: string): AsmSlot =
   ## The asm slot of `typeName.field` (so a `Field` destination carries the field's
   ## slot — a nested aggregate field has an `AMem` slot). Resolves the object body
@@ -2531,10 +2687,12 @@ proc constrFieldStores(g: var CodeGen; c: Cursor; base: Location) =
         inc posIdx
       skip cc
 
-template aconstrElemStores(g: var CodeGen; c: Cursor; destOp: untyped) =
+template aconstrElemStores(g: var CodeGen; c: Cursor; destOp, addrOp: untyped) =
   block:
     var tc = c; inc tc
-    let et = resolveType(g.prog, innerType(g.prog, resolveType(g.prog, tc)))
+    let elemTyRaw = innerType(g.prog, resolveType(g.prog, tc))  # nominal element type
+    let elemSlot = slotOf(g.prog, elemTyRaw)
+    let et = resolveType(g.prog, elemTyRaw)
     let etIsPtr = isPtrType(et)
     var cc = c
     cc.into:
@@ -2542,6 +2700,24 @@ template aconstrElemStores(g: var CodeGen; c: Cursor; destOp: untyped) =
       var i = 0
       while cc.hasMore:
         let valC = cc
+        if elemSlot.kind == AMem:                       # nested aggregate element
+          let ntn = symName(elemTyRaw)
+          let pos = g.posOf(valC)
+          let tmpName = "nctmp" & $pos & ".0"
+          g.emTypedStackVar(tmpName, elemTyRaw)
+          g.varType[tmpName] = ntn
+          g.genStore2(valC, namedStackLoc(tmpName, elemSlot), pos)  # build (no bridge held)
+          let eptr = g.takeBridge()
+          g.ab.tree LeaA64: (g.emReg eptr; addrOp(i))   # &element[i]
+          let tmp = g.takeBridge(avoid = eptr)
+          for f in aggrLayout(g.prog, ntn):             # copy field-by-field (objects)
+            g.ab.tree MovA64: (g.emReg tmp; g.emAggrFieldMem(tmpName, f.name))
+            g.ab.tree MovA64: (g.emPtrFieldMem(eptr, ntn, f.name); g.emReg tmp)
+          g.dropBridge tmp
+          g.dropBridge eptr
+          inc i
+          skip cc
+          continue
         g.emitValue2(valC)
         let v = g.ra.locs[g.posOf(valC)]
         if v.kind == InFReg:
@@ -2566,7 +2742,8 @@ proc genConstr2(g: var CodeGen; c: Cursor; dstVar: string) =
 
 proc genAconstr2(g: var CodeGen; c: Cursor; dstVar: string) =
   template dest(i) = g.emAggrElemMem(dstVar, i)
-  g.aconstrElemStores(c, dest)
+  template elemAddr(i) = g.emAggrElemAt(dstVar, i)
+  g.aconstrElemStores(c, dest, elemAddr)
 
 proc genConstrIntoLval2(g: var CodeGen; c: Cursor; lhs: Cursor) =
   g.prematLval2(lhs)
@@ -2576,8 +2753,33 @@ proc genConstrIntoLval2(g: var CodeGen; c: Cursor; lhs: Cursor) =
 proc genAconstrIntoLval2(g: var CodeGen; c: Cursor; lhs: Cursor) =
   g.prematLval2(lhs)
   template dest(i) = g.emLvalElemMem(lhs, i)
-  g.aconstrElemStores(c, dest)
+  template elemAddr(i) = g.emLvalElemAt(lhs, i)
+  g.aconstrElemStores(c, dest, elemAddr)
   g.unbindLvalTemps2(lhs)
+
+proc genBaseobj2(g: var CodeGen; c: Cursor; dst: Location) =
+  ## `(baseobj BaseType depth value)` — an object→base up-conversion (slicing). The base
+  ## sub-object is laid out FIRST (offset 0), so the base view is the value's prefix: build
+  ## the (derived) `value` into a synthetic temp, then copy the BaseType fields into the
+  ## aggregate destination `dst`. Mirror of the x64 path (a64 copies field-by-field).
+  assert dst.kind == NamedStack, "arkham a64n: baseobj into " & $dst.kind
+  var cc = c
+  cc.into:
+    let baseTy = cc; skip cc                              # base type (a Symbol)
+    skip cc                                               # depth — ignored
+    let valC = cc
+    let pos = g.posOf(valC)
+    let derivedTy = g.getType(valC)
+    let dtmp = "botmp" & $pos & ".0"
+    g.emTypedStackVar(dtmp, derivedTy)
+    g.varType[dtmp] = symName(derivedTy)
+    g.genStore2(valC, namedStackLoc(dtmp, g.exprSlot(valC)), pos)  # build derived
+    let s = g.takeBridge()
+    for f in aggrLayout(g.prog, symName(baseTy)):         # copy the base prefix
+      g.ab.tree MovA64: (g.emReg s; g.emAggrFieldMem(dtmp, f.name))
+      g.ab.tree MovA64: (g.emAggrFieldMem(dst.name, f.name); g.emReg s)
+    g.dropBridge s
+    while cc.hasMore: skip cc
 
 proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
   ## The general destination-passing store: emit `rhs` so its value lands at `dst`.
@@ -2595,6 +2797,8 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
         g.regsToStruct(dstVar, tn, 0)
     elif rhs.kind == Symbol:
       g.genAggrCopy2(dstVar, symName(rhs), tn, g.ra.aux[auxPos].scratch[0])
+    elif rhs.kind == TagLit and rhs.exprKind == BaseobjC:
+      g.genBaseobj2(rhs, dst)                              # object→base slice
     else: raiseAssert "arkham a64n: aggregate store rhs " & $rhs.exprKind
   elif dst.kind in {Glob, Tvar} and dst.typ.kind == AMem:
     # Aggregate store into a GLOBAL: address it into a pointer scratch and build/copy
@@ -2613,6 +2817,13 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
       if rhs.kind == TagLit and rhs.exprKind == OconstrC:
         g.emAdr(addrT, dst.name)
         g.constrFieldStores(rhs, regLoc(addrT, dst.typ))
+      elif rhs.kind == TagLit and rhs.exprKind == AconstrC:
+        g.emAdr(addrT, dst.name)
+        var atc = rhs; inc atc                            # the array type
+        let elemTy = innerType(g.prog, resolveType(g.prog, atc))
+        template dest(i) = g.emPtrElemMem(addrT, elemTy, i)  # element i through &g
+        template elemAddr(i) = g.emPtrElemAt(addrT, elemTy, i)
+        g.aconstrElemStores(rhs, dest, elemAddr)
       elif rhs.kind == TagLit and rhs.exprKind == CallC:  # ≤16B result in x0:x1
         g.emitCall2(rhs)
         g.emAdr(addrT, dst.name)
@@ -2651,6 +2862,39 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
     g.ab.tree LeaA64: (g.emReg addrT; g.emLvalAddr2(lhs))
     g.unbindLvalTemps2(lhs)
     g.copyStructThroughPtr2(symName(rhs), tn, addrT, g.ra.aux[auxPos].scratch[1])
+    g.unbindTemp(addrT)
+  elif dst.kind == Mem and g.exprSlot(dst.cur).kind == AMem and
+       rhs.kind == TagLit and rhs.exprKind in {DotC, DerefC, AtC, PatC}:
+    # Whole-aggregate copy `dst[i] = src[j]` between TWO memory lvalues (e.g. seq `@`'s
+    # `result.data[i] = a[x]`). Bridge through a synthetic temp in two self-contained
+    # phases (src lvalue → temp, then temp → lhs address), so the two lvalues' embedded
+    # temps never need to be live together; each field moves through a staging bridge.
+    let lhs = dst.cur
+    let tnCur = g.getType(lhs)
+    let tn = symName(tnCur)
+    let pos = g.posOf(rhs)
+    let tmpVar = "lvtmp" & $pos & ".0"
+    g.emTypedStackVar(tmpVar, tnCur)
+    g.varType[tmpVar] = tn
+    g.prematLval2(rhs)                                     # src lvalue → temp
+    block:
+      let s = g.takeBridge()
+      for f in aggrLayout(g.prog, tn):
+        g.ab.tree MovA64: (g.emReg s; g.emLvalFieldMem(rhs, f.name))
+        g.ab.tree MovA64: (g.emAggrFieldMem(tmpVar, f.name); g.emReg s)
+      g.dropBridge s
+    g.unbindLvalTemps2(rhs)
+    let addrT = g.ra.aux[auxPos].scratch[0]                # temp → lhs through its address
+    g.bindTemp(addrT, ScalarSlot)
+    g.prematLval2(lhs)
+    g.ab.tree LeaA64: (g.emReg addrT; g.emLvalAddr2(lhs))
+    g.unbindLvalTemps2(lhs)
+    block:
+      let s = g.takeBridge()
+      for f in aggrLayout(g.prog, tn):
+        g.ab.tree MovA64: (g.emReg s; g.emAggrFieldMem(tmpVar, f.name))
+        g.ab.tree MovA64: (g.emPtrFieldMem(addrT, tn, f.name); g.emReg s)
+      g.dropBridge s
     g.unbindTemp(addrT)
   elif dst.kind == Mem:                                      # store through complex lvalue
     let lhs = dst.cur
@@ -2954,17 +3198,41 @@ proc atNeedsScratch(g: var CodeGen; atNode: Cursor): bool =
     while n.hasMore: skip n
   result = idxIsReg
 
-proc collectAtScratch2(g: var CodeGen; n: Cursor; res: var HashSet[int]) =
-  ## Mirror of x64's collectAtScratch: record every `(at …)` position whose element
-  ## stride is not a fold scale, so the allocator reserves it a scratch GPR for the
-  ## `(at base idx scratch)` 3-operand form. Walks the whole subtree.
+proc atIndexIsReg(g: var CodeGen; atNode: Cursor): bool =
+  ## Whether the index of an `(at base idx)` / `(pat ptr idx)` lives in a register (any
+  ## non-literal) rather than an immediate that folds to a displacement.
+  var n = atNode
+  result = false
+  n.into:
+    skip n                                       # the array base (at) / pointer (pat)
+    if n.hasMore: result = n.kind notin {IntLit, UIntLit}
+    while n.hasMore: skip n
+
+proc collectAtScratch2(g: var CodeGen; n: Cursor; res: var HashSet[int]; asBase = false) =
+  ## Mirror of x64's collectAtScratch: record every `(at …)` position needing a scratch
+  ## GPR for the `(at base idx scratch)` 3-operand form. Two reasons: a non-fold-scale
+  ## element stride, OR (like x86) an access that is the BASE of an enclosing `at`/`pat`
+  ## with a register index — AArch64 LDR/STR also takes only ONE index register, so a
+  ## nested `a[i][j]` must materialize the inner `a[i]` into a clean base first
+  ## (`asBase`; an immediate inner index already folds to a clean displacement). Walks
+  ## the whole subtree.
   var c = n
   if c.kind == TagLit:
-    if c.exprKind in {AtC, PatC} and g.atNeedsScratch(c):  # `pat` strides like `at`
+    if c.exprKind in {AtC, PatC} and
+       (g.atNeedsScratch(c) or (asBase and g.atIndexIsReg(c))):  # `pat` strides like `at`
       res.incl g.posOf(c)
     var cc = c
+    var firstChild = true
     cc.into:
-      while cc.hasMore: (g.collectAtScratch2(cc, res); skip cc)
+      while cc.hasMore:
+        let childAsBase =
+          if not firstChild: false
+          elif c.exprKind == AtC: true            # the indexed aggregate base
+          elif c.exprKind == DotC: asBase         # passthrough offset base
+          else: false                             # a `pat` pointer is a clean value-reg base
+        g.collectAtScratch2(cc, res, childAsBase)
+        firstChild = false
+        skip cc
 
 proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool) =
   g.ab.tree ProcD:

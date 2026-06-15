@@ -117,6 +117,9 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
     of SufC, ParC:                            # wrappers → the inner value's type
       var t = c; inc t
       result = tc.getType(t)
+    of BaseobjC:                              # `(baseobj BaseType depth value)` → the base type
+      var t = c; inc t                        # → the base type (first child)
+      result = t
     else: raiseAssert "arkham: getType — unsupported expression " & $c.exprKind
   of IntLit:   result = tc.prog[].intType     # a bare literal's natural type
   of UIntLit:  result = tc.prog[].uintType
