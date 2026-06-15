@@ -1,5 +1,5 @@
 #
-#           Arkham — native AArch64 code generator for NIFC
+#           Arkham — native AArch64 code generator for Leng
 #        (c) Copyright 2026 Andreas Rumpf
 #
 #    See the file "license.txt", included in this distribution.
@@ -71,7 +71,7 @@ type
     buf: ptr TokenBuf
     an: ptr ProcAnalysis
     prog: ptr Program                 ## program (for cross-module type resolution / sizing)
-    tc: TypeCtx                       ## shared NIFC type navigator (`getType`/`exprSlot`) —
+    tc: TypeCtx                       ## shared Leng type navigator (`getType`/`exprSlot`) —
                                       ## the same one the emitter uses, so the allocator no
                                       ## longer hand-rolls per-form type dispatch
     md: MachineDesc                   ## target register file + ABI (arch-neutral driver)
@@ -399,7 +399,7 @@ proc isFoldableLeaf(b: var Builder; n: Cursor): bool =
   of Symbol: b.symLoc(symName(n)).kind in {InReg, NamedStack}
   else: false
 
-proc commutativeExpr(ek: NifcExpr): bool {.inline.} =
+proc commutativeExpr(ek: LengExpr): bool {.inline.} =
   ## Integer ops for which `a op b == b op a` (so the heavier operand may be
   ## evaluated first and the lighter one folded after). `sub` is handled too — via a
   ## `neg` after the swap — but is NOT commutative, so it is listed separately.
@@ -416,7 +416,7 @@ proc isMemLeaf(n: Cursor): bool {.inline.} =
   ## loading it into a held register, so in a Sethi–Ullman swap the load happens AFTER
   ## the computed sibling — never pinning a register across it (and one fewer mov).
   ## Operands are pure (hexer un-nests calls) so reordering the load is observation-
-  ## preserving. A memory-load operand of a typed op has the op's width (NIFC widens
+  ## preserving. A memory-load operand of a typed op has the op's width (Leng widens
   ## via an explicit `conv`, which is not a mem leaf), so the `op reg, [mem]` fold is
   ## always size-consistent.
   n.kind == TagLit and n.exprKind in {DotC, DerefC, AtC, PatC}

@@ -81,7 +81,7 @@ proc getDecl*(m: ForeignModule; name: string; tags: TagPool): Cursor =
   var buf = createTokenBuf(64, nil, tags)
   parse(m.r, buf)                             # exactly one balanced decl tree
   # Take the cursor on the LOCAL buffer *before* moving it into `declBufs`
-  # (the nifc/nimony pattern, see nifmodules.getDeclOrNil): `beginRead` installs
+  # (the leng/nimony pattern, see nifmodules.getDeclOrNil): `beginRead` installs
   # the buffer's ref-counted cursor owner, which then travels with the buffer
   # when `declBufs` later grows and relocates its elements. Doing `beginRead` on
   # the already-stored seq element instead corrupts the heap once a second decl

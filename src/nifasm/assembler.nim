@@ -9,7 +9,7 @@ import decls
 
 proc createAsmTagPool(): TagPool =
   ## A `nifcore` tag pool seeded so each asm-NIF tag's `TagId` equals its
-  ## `TagEnum` ordinal — the same scheme arkham uses (`nifcdecl.createNifcTagPool`).
+  ## `TagEnum` ordinal — the same scheme arkham uses (`nifcdecl.createLengTagPool`).
   ## `cursorTagId` then decodes by ordinal via `cast[TagEnum](…)`. Shared across
   ## the main module and every lazily-parsed foreign decl so ordinals line up.
   result = newTagPool()
@@ -132,7 +132,7 @@ proc parseSlotAlign(n: var Cursor): int =
         skip n                             # tolerate/ignore any other child
 
 proc normScalarBits(bits: int64): int =
-  ## NIFC encodes the architecture-width `int`/`uint`/`char` (and other
+  ## Leng encodes the architecture-width `int`/`uint`/`char` (and other
   ## native-word scalars) as a NON-POSITIVE bit count — `(i -1)` is the platform
   ## `int`. arkham resolves this to the word size (`slots.scalarSlot`: `bits <= 0`
   ## ⇒ 8 bytes); nifasm must agree or a `(i -1)` field is sized 0 and every later
@@ -491,11 +491,11 @@ proc checkType(want, got: Type; n: Cursor)
 proc atTypeStart(n: Cursor): bool =
   ## True if `n` is positioned at the start of a `Type` (a named-type symbol or
   ## a recognized type tag) — i.e. NOT at an Empty/pragmas slot. Used to make
-  ## NIFC's optional pragmas/base slots tolerant.
+  ## Leng's optional pragmas/base slots tolerant.
   n.kind == Symbol or (n.kind == TagLit and rawTagIsNifasmType(n.tag))
 
 proc parseObjectBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
-  # NIFC `ObjDecl ::= (object [Empty | Type-base] FieldDecl*)` — the `fields`
+  # Leng `ObjDecl ::= (object [Empty | Type-base] FieldDecl*)` — the `fields`
   # iterator tolerates the optional inheritance/base slot for us.
   var flds: seq[(string, Type, int)] = @[]
   var offset = 0
@@ -503,7 +503,7 @@ proc parseObjectBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
 
   # Inheritance: a leading base-type Symbol contributes ITS fields first (at
   # their own base offsets) and its full size as the starting offset for this
-  # object's own fields. This mirrors NIFC's object layout — typenav.typeOfField
+  # object's own fields. This mirrors Leng's object layout — typenav.typeOfField
   # searches the base recursively for an inherited field, and nimony's sizeof
   # lays the base out before the own fields, so derived fields begin exactly at
   # `sizeof(Base)` (base tail-padding included). arkham emits the base as the
@@ -538,7 +538,7 @@ proc parseObjectBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
       continue
     if not atTag(fc, FldTagId): error("Expected field definition or union", fc)
     var f = fc
-    # NIFC `FieldDecl ::= (fld SymbolDef FieldPragmas Type)` — takeField
+    # Leng `FieldDecl ::= (fld SymbolDef FieldPragmas Type)` — takeField
     # tolerates the optional field-pragmas slot before the type.
     let fr = takeField(f, atTypeStart)
     var nameC = fr.name
@@ -819,7 +819,7 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
         var cl = sig.clobber; procTyp.clobbers = parseClobbers(cl)
       result = procTyp
     of CTagId:
-      # NIFC character type `(c N)` — an N-bit integer for the machine.
+      # Leng character type `(c N)` — an N-bit integer for the machine.
       result = Type(kind: IntT, bits: normScalarBits(getInt(n)))
       inc n
     of VoidTagId:
@@ -853,7 +853,7 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
       result = Type(kind: ProcT, params: ptParams, results: ptResults, clobbers: ptClobbers)
     else:
       error("Unknown type tag: " & $t, n)
-    # Jump to the precomputed node end: this consumes any NIFC type qualifiers we
+    # Jump to the precomputed node end: this consumes any Leng type qualifiers we
     # don't model (IntQualifier atomic/ro, PtrQualifier atomic/ro/restrict, the
     # trailing (cppref) marker) and lands exactly past the whole type node —
     # rem-independent, unlike a `while hasMore` walk over a manually-entered node.
@@ -863,7 +863,7 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
 
 
 proc parseUnionBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
-  ## A union's members OVERLAP (max size, shared base). NIFC object VARIANTS spell each
+  ## A union's members OVERLAP (max size, shared base). Leng object VARIANTS spell each
   ## branch as a nested `(object …)` whose fields are SEQUENTIAL — so a branch's fields
   ## keep their intra-branch offsets and only branches overlap. A bare `(fld …)` member
   ## (a flat union) sits at offset 0. Offsets are relative to the union's base; the
@@ -883,7 +883,7 @@ proc parseUnionBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
         skip c
       elif atTag(c, FldTagId):                 # a flat union member at offset 0
         var f = c
-        let fr = takeField(f, atTypeStart)     # tolerates NIFC's FieldPragmas slot
+        let fr = takeField(f, atTypeStart)     # tolerates Leng's FieldPragmas slot
         if fr.name.kind != SymbolDef: error("Expected field name", fr.name)
         var typC = fr.typ
         let ftype = parseType(typC, scope, ctx)

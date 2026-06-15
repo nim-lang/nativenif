@@ -1,11 +1,11 @@
 #
-#           Arkham — native AArch64 code generator for NIFC
+#           Arkham — native AArch64 code generator for Leng
 #        (c) Copyright 2026 Andreas Rumpf
 #
 #    See the file "license.txt", included in this distribution.
 #
 
-## Pass 3: code generation. Walks a NIFC module, runs the analyser + register
+## Pass 3: code generation. Walks a Leng module, runs the analyser + register
 ## allocator per proc, and emits typed AArch64 / Darwin asm-NIF that `nifasm`
 ## type-checks, assembles and links.
 ##
@@ -34,7 +34,7 @@ const DarwinLibSystem = "/usr/lib/libSystem.B.dylib"
 # backend serves it without a dynamic linker. `LinuxA64ExitNr` and the table live
 # in `programs`; AArch64 uses the asm-generic unistd numbers (write=64 not 1).
 
-# The `CodeGen` state object and the NIFC type/lvalue analysis live in
+# The `CodeGen` state object and the Leng type/lvalue analysis live in
 # `codegen_common`; this module is the AArch64 instruction-selection backend.
 
 # ── low-level emit helpers ──────────────────────────────────────────────────
@@ -375,7 +375,7 @@ proc emScalarStore(g: var CodeGen; name: string; src: Reg) =
   g.ab.tree MovA64: (g.ab.sym name; g.emReg src)
 
 proc emBindType(g: var CodeGen; typ: AsmSlot) =
-  ## Emit the NIFC type for a scratch binding: the slot's own type when known, else
+  ## Emit the Leng type for a scratch binding: the slot's own type when known, else
   ## the generic `(i 64)` (a register/immediate dont-care placeholder carries no
   ## cursor). Mirrors `emScalarStackVar`'s type emission.
   if cursorIsNil(typ.typ):
@@ -503,7 +503,7 @@ proc rebindLocalAs(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
 
 proc indirectRetType(g: var CodeGen; gvarDecl: Cursor): Cursor =
   ## The return-type cursor of a function-pointer variable's proctype, for the
-  ## declarative call path's `retIsVoid`/result handling. NIFC's
+  ## declarative call path's `retIsVoid`/result handling. Leng's
   ## `(proctype Empty Params RetType Pragmas)` always carries the RetType node — a
   ## `.` (DotToken, `retIsVoid`-true) / `(void)` for a void proc — so it is simply
   ## the third child.
@@ -523,7 +523,7 @@ proc indirectRetType(g: var CodeGen; gvarDecl: Cursor): Cursor =
     while d.hasMore: skip d
 
 proc genProctypeSig(g: var CodeGen; c: var Cursor) =
-  ## Lower a NIFC `(proctype Empty Params [RetType] Pragmas)` to a concrete asm-NIF
+  ## Lower a Leng `(proctype Empty Params [RetType] Pragmas)` to a concrete asm-NIF
   ## signature `(proctype (params (param :pN.0 <reg|s> T)…) (result (res :ret.0 (x0)
   ## T))? (clobber …))` — the AAPCS64 assignment, identical in shape to a
   ## declarative proc's signature (`emitSignature`), so nifasm can resolve an
@@ -613,7 +613,7 @@ proc genPointee(g: var CodeGen; c: var Cursor) =
     g.genTypeBody(c)
 
 proc genTypeBody(g: var CodeGen; c: var Cursor) =
-  ## Translate a NIFC type at `c` into asm-NIF, advancing `c` past it. Named
+  ## Translate a Leng type at `c` into asm-NIF, advancing `c` past it. Named
   ## types are inlined (resolved against `typeDecls`); object field pragmas are
   ## dropped. v1: int/uint/bool/ptr scalars and objects.
   case c.kind
@@ -657,7 +657,7 @@ proc genTypeBody(g: var CodeGen; c: var Cursor) =
       # `(prepare <fnptr> … (call))` against it.
       g.genProctypeSig(c)
     of ArrayT:
-      c.into:                               # NIFC `(array Type Expr)`
+      c.into:                               # Leng `(array Type Expr)`
         g.ab.arrayType:
           g.genTypeBody(c)                  # element type
           if c.kind == IntLit:
@@ -665,7 +665,7 @@ proc genTypeBody(g: var CodeGen; c: var Cursor) =
           else:
             raiseAssert "arkham v1: array length must be a literal"
     of EnumT:
-      c.into:                               # NIFC `(enum BaseType efld*)`
+      c.into:                               # Leng `(enum BaseType efld*)`
         g.genTypeBody(c)                    # collapse to the base integer type
         while c.hasMore: skip c             # efld members
     of ObjectT:
@@ -1383,7 +1383,7 @@ proc emitMemLoad2(g: var CodeGen; c: Cursor) =
   let res = g.ra.locs[g.posOf(c)]
   assert res.kind == InReg, "arkham a64n: mem-load result " & $res.kind
   let cty = resolveType(g.prog, g.getType(c))
-  if cty.typeKind in {NifcType.ArrayT, NifcType.FlexarrayT}:
+  if cty.typeKind in {LengType.ArrayT, LengType.FlexarrayT}:
     if res.isTemp: g.bindTemp(res.r, ScalarSlot)          # array lvalue DECAYS to its address
     g.prematLval2(c)
     g.ab.tree LeaA64: (g.emReg res.r; g.emLvalAddr2(c))
@@ -1598,7 +1598,7 @@ proc emitMod2(g: var CodeGen; c: Cursor) =
 
 # ── float arithmetic ─────────────────────────────────────────────────────────
 
-proc fbinA64Op(ek: NifcExpr): A64Inst =
+proc fbinA64Op(ek: LengExpr): A64Inst =
   case ek
   of AddC: FaddA64
   of SubC: FsubA64
@@ -2501,7 +2501,7 @@ proc constrFieldStores(g: var CodeGen; c: Cursor; base: Location) =
   ## INHERITED base sub-object — recurse, storing the base's fields BY NAME into the
   ## same destination, since nifasm flattens inherited fields); or a leading BARE
   ## value (the inherited base's positional initializer — the RTTI/vtable header at
-  ## offset 0; `aggrLayout` lists base fields first). Mirrors the nifc C backend.
+  ## offset 0; `aggrLayout` lists base fields first). Mirrors the leng C backend.
   var tc = c; inc tc                                    # the constructed type symbol
   let typeName = symName(tc)
   var cc = c
@@ -3187,7 +3187,7 @@ proc buildGlobalInitProc(g: var CodeGen; initBuf: var TokenBuf) =
 
 proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                   linux = false): string =
-  ## Compile a parsed NIFC module to AArch64 asm-NIF text — Darwin/Mach-O by
+  ## Compile a parsed Leng module to AArch64 asm-NIF text — Darwin/Mach-O by
   ## default, or Linux/ELF when `linux` (svc-based syscalls, static, no dyld/TLV),
   ## which `nifasm`'s `linux_arm64` target assembles to a qemu-runnable ELF.
   ## `inputPath` and `tags` let the program model load *other* modules on demand

@@ -1,22 +1,22 @@
 #
-#           Arkham — native AArch64 code generator for NIFC
+#           Arkham — native AArch64 code generator for Leng
 #        (c) Copyright 2026 Andreas Rumpf
 #
 #    See the file "license.txt", included in this distribution.
 #
 
-## arkham translates a single NIFC `.c.nif` file into typed `nifasm` NIF
+## arkham translates a single Leng `.c.nif` file into typed `nifasm` NIF
 ## (AArch64 / Darwin), which `nifasm` then type-checks, assembles and links.
 
 import std / [parseopt, syncio, strutils]
 import nifcoreparse              # parseFromFile + nifcore
-import nifcdecl                  # createNifcTagPool
+import lengdecl                  # createLengTagPool
 import codegen_a64               # AArch64 / Darwin backend
 import codegen_x64               # x86-64 / Linux backend
 
 const
   Version = "0.1.0"
-  Usage = """arkham — native code generator for NIFC """ & Version & """
+  Usage = """arkham — native code generator for Leng """ & Version & """
 
 Usage:
   arkham [options] file.c.nif
@@ -31,7 +31,7 @@ proc run(input, output, arch: string) =
   # One shared tag pool across the main module and any foreign modules the
   # program model loads on demand, so tag ordinals (hence stmtKind/typeKind
   # decoding) line up across modules.
-  let tags = createNifcTagPool()
+  let tags = createLengTagPool()
   var buf = parseFromFile(input, sharedTags = tags)
   let code = case arch
              of "x64", "x86_64", "amd64": generateX64(buf, input, tags)
