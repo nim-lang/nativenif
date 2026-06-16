@@ -1,0 +1,15 @@
+(.nif27)
+(.index)
+(stmts
+ (arch arm64)
+ (proc :test_a64_at_scratch_base_collision.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (lea
+    (x12)
+    (at
+     (cast
+      (aptr (i 64))(x14))(x13)(x14)))
+   (ret))))(.index)

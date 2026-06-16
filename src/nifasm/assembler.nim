@@ -49,8 +49,16 @@ proc infoStr(n: Cursor): string =
 
 proc error(msg: string; n: Cursor) =
   writeStackTrace()
-  quit "[Error] " & msg & " at " & infoStr(n) &
-    " (kind=" & $n.kind & ", tag=" & nodeRepr(n) & ")"
+  # `n` may be DRAINED — an error raised after an `into`-bounded scope has consumed
+  # all its children (e.g. an `(at base index scratch)` disjointness check fires only
+  # after the scratch is parsed) leaves the cursor past its last token, where `.kind`
+  # / `rawLineInfo` would trip nifcore's `load` assert (`c.p != nil and c.rem > 0`).
+  # Guard the position read so the diagnostic prints cleanly instead of crashing.
+  if not cursorIsNil(n) and n.hasMore:
+    quit "[Error] " & msg & " at " & infoStr(n) &
+      " (kind=" & $n.kind & ", tag=" & nodeRepr(n) & ")"
+  else:
+    quit "[Error] " & msg
 
 proc extractDedupKey*(s: string): string =
   ## Extract deduplication key from symbol like "foo.0.key.moduleSuffix" -> "foo.0.key"
@@ -1446,9 +1454,24 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
             error("at: 3-operand form expects a register index", n)
           if baseHasIndex:
             error("at: 3-operand form cannot extend a base that already has an index", n)
+          # Disjointness: `scratch==base` is fatal — `emitMul(scratch, index, X16)`
+          # writes scratch (== base) before `emitAdd(scratch, base, scratch)` reads the
+          # base, dropping it (→ a wild address). This is the arkham "Bug J" class; flag
+          # it at assemble time. `scratch==index` IS allowed here (the X16 stride trick
+          # keeps the index intact through the multiply — see the note below).
+          if scratchReg == baseReg:
+            error("at: 3-operand stride scratch aliases the base register (" &
+                  $baseReg & ") — the base is clobbered before use (codegen bug)", n)
           let stride = asmSizeOf(elemType)
-          arm64.emitMovImm64(ctx.buf.data, scratchReg, uint64(stride))
-          arm64.emitMul(ctx.buf.data, scratchReg, indexOp.reg, scratchReg) # scratch = idx*stride
+          # The stride constant goes into the RESERVED assembler scratch X16, NOT the
+          # output `scratchReg`: arkham may hand a scratch that ALIASES the index (x86
+          # tolerates `scratch==idx`, and under register pressure it can be the only free
+          # register). Materializing the stride into `scratchReg` first would clobber the
+          # index before the multiply; X16 keeps the index intact, so `scratch==idx` stays
+          # correct (`scratch = idx*stride` reads idx, writes scratch). X16/X17 are never
+          # allocated by arkham, so this can't collide with base/index/scratch.
+          arm64.emitMovImm64(ctx.buf.data, arm64.X16, uint64(stride))
+          arm64.emitMul(ctx.buf.data, scratchReg, indexOp.reg, arm64.X16) # scratch = idx*stride
           # scratch = base + that. A SP base (a stack array) needs the EXTENDED-register
           # ADD — the shifted-register `emitAdd` would read register 31 as XZR, not SP,
           # zeroing the base (→ a wild address). Other bases use the plain register ADD.
@@ -1469,6 +1492,12 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
         else:
           if baseHasIndex:
             error("at: two register indices cannot fold into one memory operand", n)
+          # Disjointness: base and index of the folded `[base + index<<shift]` are two
+          # distinct live values (array address vs element index); aliasing them is a
+          # codegen bug, so flag it rather than emit a silently-wrong address.
+          if indexOp.reg == baseReg:
+            error("at: array base and index occupy the same register (" &
+                  $baseReg & ") — distinct values aliased (codegen bug)", n)
           let elemSize = asmSizeOf(elemType)
           if elemSize notin [1, 2, 4, 8]:
             error("Element size " & $elemSize & " not a scale and no scratch supplied", n)
@@ -3184,6 +3213,16 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
             error("at: 3-operand form expects a register index", n)
           if baseHasIndex:
             error("at: 3-operand form cannot extend a base that already has an index", n)
+          # Disjointness: the stride scratch must not alias the base register. The
+          # `mov scratch,index` below clobbers `scratch` before the `lea` reads `base`,
+          # so `scratch==base` silently drops the base (→ a wild address). This is the
+          # arkham allocation bug class ("Bug J") that used to surface only as an
+          # ASLR-only runtime segfault; flag it at assemble time. `scratch==index` is
+          # fine (the mov is then a no-op) and is intentionally allowed (under register
+          # pressure it can be the only free choice).
+          if scratchReg == baseReg:
+            error("at: 3-operand stride scratch aliases the base register (" &
+                  $baseReg & ") — the base is clobbered before use (codegen bug)", n)
           let stride = asmSizeOf(elemType)
           x86.emitMov(ctx.buf.data, scratchReg, indexOp.reg)        # scratch = index
           x86.emitImulImm(ctx.buf.data, scratchReg, int32(stride))  # scratch *= stride
@@ -3207,6 +3246,13 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
           # are invariants here (kept as asserts).
           if baseHasIndex:
             error("at: two register indices cannot fold into one memory operand", n)
+          # Disjointness: in the folded SIB `[base + index*scale]`, base and index are
+          # two distinct live values (an array address and an element index); aliasing
+          # them computes `base + base*scale` (a codegen bug). Flag it rather than emit
+          # a silently-wrong address.
+          if indexOp.reg == baseReg:
+            error("at: array base and index occupy the same register (" &
+                  $baseReg & ") — distinct values aliased (codegen bug)", n)
           let elemSize = asmSizeOf(elemType)
           if elemSize notin [1, 2, 4, 8]:
             error("Element size " & $elemSize & " not a SIB scale and no scratch supplied", n)

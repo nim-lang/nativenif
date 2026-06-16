@@ -1186,11 +1186,29 @@ proc storeFReg2(g: var CodeGen; dst: Location; src: FReg; bits: int) =
 
 # ── lvalue addressing (mirrors x64 emLvalAddr2/prematLval2/unbindLvalTemps2) ──
 
+proc followHome(g: var CodeGen; pos: int): Location =
+  ## Resolve a Symbol use-site snapshot (`locs[pos]`) to the local's CURRENT home.
+  ## A snapshot tagged `homeSym` (see `Location.homeSym`) named the local's register
+  ## home when the use was allocated; a later `stealForTmp` may have demoted the local
+  ## to its stack slot (e.g. to free the register for an `(at)` stride scratch), moving
+  ## the symbol's *def* home but leaving this use-site copy stale. Follow it: if the home
+  ## left the snapshot register, return — and re-sync `locs[pos]` to — the current home
+  ## (its stack slot, which `reloadMemBase2` then loads into a fresh bridge ≠ the scratch).
+  ## A no-op when the local kept its register, so non-stolen snapshots and plain temps are
+  ## unaffected. Replaces the allocator's old `resyncAddrLocs` tree-walk — a steal is now
+  ## the single source of truth, resolved lazily at use.
+  result = g.ra.locs[pos]
+  if result.kind == InReg and result.homeSym.len > 0:
+    let cur = g.ra.locationOfSym(result.homeSym)
+    if cur.kind != Undef and not (cur.kind == InReg and cur.r == result.r):
+      result = cur
+      g.ra.locs[pos] = cur
+
 proc reloadMemBase2(g: var CodeGen; pos: int) =
   ## A deref/at/pat base or register index the allocator spilled (NamedStack/Mem)
   ## must be in a register for `[reg]` addressing: load it into a bridge, repoint
   ## its location, and park the home so `restoreMemBase2` puts it back.
-  let loc = g.ra.locs[pos]
+  let loc = g.followHome(pos)             # a stolen register-home → its current (stack) home
   if loc.kind notin {NamedStack, Mem}: return
   let s = g.takeBridge(loc.typ)
   g.place2(loc, s)
@@ -1202,6 +1220,19 @@ proc restoreMemBase2(g: var CodeGen; pos: int) =
     g.dropBridge g.ra.locs[pos].r
     g.ra.locs[pos] = g.savedHomes[pos]
     g.savedHomes.del pos
+
+proc prematAddrVal2(g: var CodeGen; c: Cursor) =
+  ## Materialize an lvalue base/index value `c` into a register for the enclosing
+  ## `(mem …)`. `followHome` FIRST re-points a stolen register-home snapshot at its
+  ## current (stack) home — so the `emitValue2` below does NOT load the value back into
+  ## the snapshot register (which a `stealForTmp` may have handed to the `(at)` stride
+  ## scratch); `reloadMemBase2` then brings that stack home into a fresh bridge ≠ the
+  ## scratch. Scoped to the lvalue tree (NOT general `emitValue2`), exactly like the old
+  ## `resyncAddrLocs`: a plain operand snapshot keeps its reg-promise.
+  let pos = g.posOf(c)
+  discard g.followHome(pos)
+  g.emitValue2(c)
+  g.reloadMemBase2(pos)
 
 proc emLvalAddr2(g: var CodeGen; c: Cursor) =
   ## Emit the nifasm address sub-tree for lvalue `c` (operand of a `(mem …)`/`(lea
@@ -1326,8 +1357,7 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
     of DerefC:
       var cc = c
       cc.into:
-        g.emitValue2(cc)
-        g.reloadMemBase2(g.posOf(cc))
+        g.prematAddrVal2(cc)                              # the pointer → its reg (follow steals)
         while cc.hasMore: skip cc
     of AtC:
       let atPos = g.posOf(c)
@@ -1335,8 +1365,7 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
       cc.into:
         g.prematLval2(cc); skip cc                        # base
         if cc.kind notin {IntLit, UIntLit}:
-          g.emitValue2(cc)
-          g.reloadMemBase2(g.posOf(cc))
+          g.prematAddrVal2(cc)                            # follow steals
         while cc.hasMore: skip cc
       if g.ra.aux.hasKey(atPos) and g.ra.aux[atPos].scratch.len > 0:
         g.bindTemp(g.ra.aux[atPos].scratch[0], ScalarSlot)
@@ -1344,12 +1373,10 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
       let patPos = g.posOf(c)
       var cc = c
       cc.into:
-        g.emitValue2(cc)
-        g.reloadMemBase2(g.posOf(cc))
+        g.prematAddrVal2(cc)                              # the pointer → its reg (follow steals)
         skip cc
         if cc.kind notin {IntLit, UIntLit}:
-          g.emitValue2(cc)
-          g.reloadMemBase2(g.posOf(cc))
+          g.prematAddrVal2(cc)                            # follow steals
         while cc.hasMore: skip cc
       if g.ra.aux.hasKey(patPos) and g.ra.aux[patPos].scratch.len > 0:
         g.bindTemp(g.ra.aux[patPos].scratch[0], ScalarSlot)
@@ -2875,14 +2902,17 @@ proc dstAggrInfo(g: var CodeGen; dst: Location): (bool, int) =
 proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size, auxPos: int) =
   ## THE whole-aggregate copy `dst = rhs`: reduce BOTH sides to an address in a register
   ## (`aggrAddrLoc`/`aggrAddrInto`), then `copyAggr`. The allocator reserved
-  ## `[dstAddr, srcAddr, copyTmp]`.
+  ## `[dstAddr, srcAddr]`; the per-field transfer register is a staging bridge (x14/x15),
+  ## taken here — both addresses are already in `a[0]`/`a[1]`, so a bridge is free — sparing
+  ## a pool GPR so the copy fits under high register pressure.
   let a = g.ra.aux[auxPos].scratch
   g.bindTemp(a[0], ScalarSlot); g.aggrAddrLoc(dst, a[0])         # &dst
   g.bindTemp(a[1], ScalarSlot)
   g.aggrAddrInto(rhs, a[1], AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)  # &rhs
-  g.bindTemp(a[2], AsmSlot(cls: AUInt, size: 8, align: 8))
-  g.copyAggr(a[0], a[1], size, a[2])
-  g.unbindTemp(a[2]); g.unbindTemp(a[1]); g.unbindTemp(a[0])
+  let tmp = g.takeBridge(AsmSlot(cls: AUInt, size: 8, align: 8))
+  g.copyAggr(a[0], a[1], size, tmp)
+  g.dropBridge tmp
+  g.unbindTemp(a[1]); g.unbindTemp(a[0])
 
 proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
   ## The general destination-passing store: emit `rhs` so its value lands at `dst`. An

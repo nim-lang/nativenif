@@ -1935,6 +1935,24 @@ proc produceIntoMem2(g: var CodeGen; c: Cursor; pos: int; dst: Location) =
   g.emitStoreLoc(dst, s)                 # spill the produced value to its `(s)` slot
   g.giveBack s                           # unbind the staging name
 
+proc followHome(g: var CodeGen; pos: int): Location =
+  ## Resolve a Symbol use-site snapshot (`locs[pos]`) to the local's CURRENT home.
+  ## A snapshot tagged `homeSym` (see `Location.homeSym`) named the local's register
+  ## home when the use was allocated; a later `stealForTmp` may have demoted the local
+  ## to its stack slot (e.g. to free the register for an `(at)` stride scratch), moving
+  ## the symbol's *def* home but leaving this use-site copy stale. Follow it: if the home
+  ## left the snapshot register, return — and re-sync `locs[pos]` to — the current home
+  ## (its stack slot, which `reloadMemBase2` then loads into a fresh staging reg ≠ the
+  ## scratch). A no-op when the local kept its register, so non-stolen snapshots and plain
+  ## temps are unaffected. Replaces the allocator's old `resyncAddrLocs` tree-walk —
+  ## a steal is now the single source of truth, resolved lazily at use.
+  result = g.ra.locs[pos]
+  if result.kind == InReg and result.homeSym.len > 0:
+    let cur = g.ra.locationOfSym(result.homeSym)
+    if cur.kind != Undef and not (cur.kind == InReg and cur.r == result.r):
+      result = cur
+      g.ra.locs[pos] = cur
+
 proc emitValue2(g: var CodeGen; c: Cursor) =
   ## Ensure `c`'s value is materialized at its precomputed `locs[pos]`. A leaf whose
   ## location is a register is moved there (the allocator placed it via destination-
@@ -2302,7 +2320,7 @@ proc reloadMemBase2(g: var CodeGen; pos: int) =
   ## point its location at that reg for the lval emission, and park the original home
   ## in `savedHomes` so `restoreMemBase2` (via `unbindLvalTemps2`) puts it back — the
   ## local keeps its stack home for its other uses.
-  let loc = g.ra.locs[pos]
+  let loc = g.followHome(pos)              # a stolen register-home → its current (stack) home
   if loc.kind notin {NamedStack, Mem}: return
   let s = g.pickStagingSealed("a memory address base/index")
   g.emitLoadLoc(loc, s)
@@ -2315,6 +2333,19 @@ proc restoreMemBase2(g: var CodeGen; pos: int) =
     g.giveBack g.ra.locs[pos].r
     g.ra.locs[pos] = g.savedHomes[pos]
     g.savedHomes.del pos
+
+proc prematAddrVal2(g: var CodeGen; c: Cursor) =
+  ## Materialize an lvalue base/index value `c` into a register for the enclosing
+  ## `(mem …)`. `followHome` FIRST re-points a stolen register-home snapshot at its
+  ## current (stack) home — so the `emitValue2` below does NOT load the value back into
+  ## the snapshot register (which a `stealForTmp` may have handed to the `(at)` stride
+  ## scratch); `reloadMemBase2` then brings that stack home into a fresh staging reg ≠
+  ## the scratch. Scoped to the lvalue tree (NOT general `emitValue2`), exactly like the
+  ## old `resyncAddrLocs`: a plain operand snapshot keeps its reg-promise.
+  let pos = cursorToPosition(g.buf[], c)
+  discard g.followHome(pos)
+  g.emitValue2(c)
+  g.reloadMemBase2(pos)
 
 proc prematLval2(g: var CodeGen; c: Cursor) =
   ## Materialize an lvalue's embedded values (a `deref` pointer, an index, a global
@@ -2339,30 +2370,34 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
     of DerefC:
       var cc = c
       cc.into:
-        g.emitValue2(cc)                                # the pointer → its register
-        g.reloadMemBase2(cursorToPosition(g.buf[], cc))  # demoted (stolen) pointer → staging reg
+        g.prematAddrVal2(cc)                            # the pointer → its register (follow steals)
         while cc.hasMore: skip cc
     of AtC:
       let atPos = cursorToPosition(g.buf[], c)
+      if g.ra.aux.hasKey(atPos) and g.ra.aux[atPos].scratch.len > 0:
+        # Bind the non-SIB stride scratch FIRST (names a checked temp for `(at … scratch)`).
+        # It MUST precede the base/index materialization: a demoted (stolen) base/index is
+        # reloaded by `reloadMemBase2` into a staging reg via `pickStagingScratch`, which
+        # avoids `boundTemps` — binding the scratch now keeps that reload off the scratch's
+        # register (else base/idx staging could land on the scratch and alias it).
+        g.bindTemp(g.ra.aux[atPos].scratch[0], AsmSlot(cls: AInt, size: 8, align: 8))
       var cc = c
       cc.into:
         g.prematLval2(cc); skip cc                      # base
         if cc.kind notin {IntLit, UIntLit}:             # register index → its reg
-          g.emitValue2(cc)
-          g.reloadMemBase2(cursorToPosition(g.buf[], cc))  # demoted (stolen) index → staging reg
+          g.prematAddrVal2(cc)                          # follow steals
         while cc.hasMore: skip cc
-      if g.ra.aux.hasKey(atPos) and g.ra.aux[atPos].scratch.len > 0:
-        # bind the non-SIB stride scratch so `(at … scratch)` names a checked temp
-        g.bindTemp(g.ra.aux[atPos].scratch[0], AsmSlot(cls: AInt, size: 8, align: 8))
     of PatC:
+      let patPos = cursorToPosition(g.buf[], c)
+      if g.ra.aux.hasKey(patPos) and g.ra.aux[patPos].scratch.len > 0:
+        # Bind the stride scratch FIRST (same reload-collision guard as AtC).
+        g.bindTemp(g.ra.aux[patPos].scratch[0], AsmSlot(cls: AInt, size: 8, align: 8))
       var cc = c
       cc.into:
-        g.emitValue2(cc)                                # the pointer → its register
-        g.reloadMemBase2(cursorToPosition(g.buf[], cc))  # demoted (stolen) pointer → staging reg
+        g.prematAddrVal2(cc)                            # the pointer → its register (follow steals)
         skip cc
         if cc.kind notin {IntLit, UIntLit}:             # register index → its reg
-          g.emitValue2(cc)
-          g.reloadMemBase2(cursorToPosition(g.buf[], cc))  # demoted (stolen) index → staging reg
+          g.prematAddrVal2(cc)                          # follow steals
         while cc.hasMore: skip cc
     of BaseobjC:                                        # transparent: materialize the inner lvalue
       var cc = c
@@ -2406,6 +2441,7 @@ proc unbindLvalTemps2(g: var CodeGen; c: Cursor) =
         if ploc.kind == InReg and ploc.isTemp: g.unbindTemp(ploc.r)
         while cc.hasMore: skip cc
     of PatC:
+      let patPos = cursorToPosition(g.buf[], c)
       var cc = c
       cc.into:
         let pPos = cursorToPosition(g.buf[], cc)
@@ -2419,6 +2455,8 @@ proc unbindLvalTemps2(g: var CodeGen; c: Cursor) =
           let il = g.ra.locs[idxPos]
           if il.kind == InReg and il.isTemp: g.unbindTemp(il.r)
         while cc.hasMore: skip cc
+      if g.ra.aux.hasKey(patPos) and g.ra.aux[patPos].scratch.len > 0:
+        g.unbindTemp(g.ra.aux[patPos].scratch[0])        # the non-SIB stride scratch
     of BaseobjC:                                        # transparent: release the inner lvalue
       var cc = c
       cc.into:
@@ -3161,14 +3199,18 @@ proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size, auxPos: 
   ## THE whole-aggregate copy `dst = rhs`: reduce BOTH sides to
   ## an address in a register (`aggrAddrLoc`/`aggrAddrInto` — the one `gen_addr`), then
   ## `copyAggr`. ONE path for every (destination form × source form); the allocator
-  ## reserved `[dstAddr, srcAddr, copyTmp]`.
+  ## reserved `[dstAddr, srcAddr]`. The per-field transfer register is the staging bridge
+  ## (R11), picked here — both addresses are already in `a[0]`/`a[1]`, so the bridge is
+  ## free — sparing a pool GPR so the copy fits under high register pressure.
   let a = g.ra.aux[auxPos].scratch
   g.bindTemp(a[0], ScalarSlot); g.aggrAddrLoc(dst, a[0])         # &dst
   g.bindTemp(a[1], ScalarSlot)
   g.aggrAddrInto(rhs, a[1], AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)  # &rhs
-  g.bindTemp(a[2], AsmSlot(cls: AUInt, size: 8, align: 8))
-  g.copyAggr(a[0], a[1], size, a[2])
-  g.unbindTemp(a[2]); g.unbindTemp(a[1]); g.unbindTemp(a[0])
+  let tmp = g.pickStagingSealed("an aggregate-copy transfer register")
+  g.bindTemp(tmp, AsmSlot(cls: AUInt, size: 8, align: 8))
+  g.copyAggr(a[0], a[1], size, tmp)
+  g.giveBack tmp                                                 # unbinds + unseals the bridge
+  g.unbindTemp(a[1]); g.unbindTemp(a[0])
 
 proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
   ## The general destination-passing store of the value core. An aggregate COPY (symbol /

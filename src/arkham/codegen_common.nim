@@ -385,6 +385,15 @@ proc constAddrSym*(c: Cursor): string =
   while v.kind == TagLit and v.exprKind in {SufC, ParC, CastC, ConvC}:
     if v.exprKind in {CastC, ConvC}: (inc v; skip v)
     else: inc v
+  # An explicit address-of a global/const/proc symbol — `(addr strlit.0)` is the
+  # canonical case (a string literal's `more` field points at the data const). The
+  # symbol's address is a link-time constant, so it bakes as a reloc exactly like a
+  # bare symbol. Peel the `(addr …)` then any further conv/cast/par wrappers.
+  if v.kind == TagLit and v.exprKind == AddrC:
+    inc v                                              # past the (addr tag
+    while v.kind == TagLit and v.exprKind in {SufC, ParC, CastC, ConvC}:
+      if v.exprKind in {CastC, ConvC}: (inc v; skip v)
+      else: inc v
   if v.kind == Symbol: result = symName(v)
 
 proc appendLE(buf: var string; bits: uint64; size: int) =

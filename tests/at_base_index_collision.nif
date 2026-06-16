@@ -1,0 +1,14 @@
+(.nif27)
+(.index)
+(stmts
+ (proc :test_at_base_index_collision.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (lea
+    (r12)
+    (at
+     (cast
+      (aptr (i 64))(r14))(r14)))
+   (ret))))(.index)

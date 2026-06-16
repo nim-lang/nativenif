@@ -263,6 +263,17 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_raw_fbound.nif", "Regist
 # Call-safety: a value living in a caller-saved register (x9) is destroyed by a
 # `(call)`; reading it afterward must be rejected (a callee-saved x19 home would survive).
 execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_clobber_after_call.nif", "in register X9 which was clobbered by a call")
+# `(at)` operand disjointness: an arkham register-allocation bug can hand the same
+# physical register for two operands of one address computation, producing a silently
+# wrong address (the "Bug J" class — caught before only as an ASLR-only runtime SEGV).
+# nifasm now flags these at assemble time. Two distinct collisions, both arches:
+#   * 3-operand `(at base index scratch)` where scratch == base: the `mov scratch,index`
+#     clobbers the base before the address is formed (scratch == index stays legal).
+#   * folded `(at base index)` SIB where base == index: two distinct live values aliased.
+execExpectFailure("nim c -r src/nifasm/nifasm tests/at_scratch_base_collision.nif", "stride scratch aliases the base register (R14)")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_at_scratch_base_collision.nif", "stride scratch aliases the base register (X14)")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/at_base_index_collision.nif", "array base and index occupy the same register (R14)")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_at_base_index_collision.nif", "array base and index occupy the same register (X14)")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/missing_result_binding.nif", "Missing result binding: ret.0")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/stack_result_binding.nif", "Type mismatch: expected (stackoff")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/result_type_mismatch.nif", "Type mismatch:")

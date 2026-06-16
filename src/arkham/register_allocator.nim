@@ -834,6 +834,29 @@ proc allocCond(b: var Builder; n: var Cursor) =
     allocValue(b, n, d)
     b.releaseTmp(d)
 
+proc reserveAtScratch(b: var Builder; atPos: int; idxReg: Reg) =
+  ## Reserve the GPR for nifasm's 3-operand `(at base idx scratch)` non-SIB stride form
+  ## (recorded in `aux[atPos]`). The hard invariant is scratch ≠ BASE (`scratch = base +
+  ## idx*stride` aliases catastrophically otherwise). `reserveTmp` reaches the scratch
+  ## under pressure by `stealForTmp`-ing a register-homed local — possibly THIS lvalue's
+  ## base. That is safe WITHOUT any `locs` reconciliation here: the stolen base's use-site
+  ## snapshot is tagged `homeSym` (see `Location.homeSym`), so at emit `followHome` resolves
+  ## it to the local's CURRENT (now stack) home and `reloadMemBase2` brings it back in a
+  ## fresh staging reg ≠ the scratch. A steal is thus the single source of truth.
+  ##
+  ## scratch == INDEX is permitted: x86 tolerates it (`mov scratch,idx` is a no-op, then
+  ## `idx*stride`, then `base+scratch`), and under real pressure (e.g.
+  ## `removeChunkFromMatrix2`: only R0 free, nothing stealable) it is the ONLY option, so
+  ## forbidding it would spill the scratch to memory — illegal for a stride register. The
+  ## AArch64 assembler computes the stride into a reserved scratch (X16) precisely so
+  ## scratch==idx stays correct there too. (`idxReg` is accepted for documentation/future
+  ## tuning; the reservation itself only needs the base invariant, met by `followHome`.)
+  discard idxReg
+  let t = b.reserveTmp(ScalarSlot)
+  if t.kind == InReg:
+    b.ra.aux[atPos] = ExprAux(scratch: @[t.r])
+  else: raiseAssert "arkham: out of registers for an index stride scratch"
+
 proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = false) =
   ## Walk an lvalue subtree (the target of a load / store / `addr`), allocating its
   ## embedded VALUES — a `deref`'s pointer, a computed index — into registers (their
@@ -872,24 +895,20 @@ proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = 
         while n.hasMore: skip n
     of AtC:
       let atPos = b.posOf(n)
+      var idxReg = NoReg                        # the register index (if any)
       n.into:
         allocLvalue2(b, n, globBase, isStore) # base (stack array, deref, or global)
         if n.kind in {IntLit, UIntLit}: skip n   # immediate index — folds, no scratch
         else:
           var idx = needsReg(ScalarSlot)
           allocValue(b, n, idx)             # register index → a register (folds via scale)
+          if idx.kind == InReg: idxReg = idx.r
         while n.hasMore: skip n
       if atPos in b.atScratch:
-        # Non-SIB element stride: reserve a scratch GPR for nifasm's 3-operand `(at
-        # base idx scratch)`, recorded in aux. Held until the access has consumed the
-        # address; `releaseLvalTemps` frees it (uniformly for load and store, alongside
-        # the index/pointer temps) so there is no double-free.
-        let t = b.reserveTmp(ScalarSlot)
-        if t.kind == InReg:
-          b.ra.aux[atPos] = ExprAux(scratch: @[t.r])
-        else: raiseAssert "arkham: out of registers for an index stride scratch"
+        reserveAtScratch(b, atPos, idxReg)
     of PatC:
       let patPos = b.posOf(n)
+      var idxReg = NoReg
       n.into:
         var d = needsReg(ScalarSlot)
         allocValue(b, n, d)                  # the pointer → a register (its home)
@@ -897,15 +916,10 @@ proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = 
         else:
           var idx = needsReg(ScalarSlot)
           allocValue(b, n, idx)             # register index → a register (folds via scale)
+          if idx.kind == InReg: idxReg = idx.r
         while n.hasMore: skip n
       if patPos in b.atScratch:
-        # Non-SIB pointer-element stride: reserve a scratch GPR for nifasm's 3-operand
-        # `(at (cast (aptr E) p) idx scratch)`, just like the `AtC` case. Freed by
-        # `releaseLvalTemps` alongside the pointer/index temps.
-        let t = b.reserveTmp(ScalarSlot)
-        if t.kind == InReg:
-          b.ra.aux[patPos] = ExprAux(scratch: @[t.r])
-        else: raiseAssert "arkham: out of registers for a pat stride scratch"
+        reserveAtScratch(b, patPos, idxReg)
     of BaseobjC:                             # `(baseobj BaseT depth lvalue)` — transparent base
       n.into:
         skip n                               # base type
@@ -1076,6 +1090,11 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
     let natural = b.symLoc(symName(n))
     if natural.kind == Undef: b.forceRegDest(dest)   # a global/tvar: load into a register
     else: b.resolveDest(dest, natural)               # a function-local: its home
+    if dest.kind == InReg and natural.kind == InReg and dest.r == natural.r:
+      # This snapshot reads the local straight from its register home — tag it so the
+      # emitter can follow a later `stealForTmp` that demotes the local (e.g. to free
+      # the register for an `(at)` stride scratch). See `Location.homeSym`.
+      dest.homeSym = symName(n)
     inc n
   of StrLit:
     b.forceRegDest(dest); inc n                # string literal → a reg (lea of rodata)
@@ -1170,6 +1189,11 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
           allocLvalue2(b, n)                 # place p (sets locs[p]); no result temp
           releaseLvalTemps(b, lvCopy)
           while n.hasMore: skip n
+        # The address IS p's register; reflect that in `dest` so a wrapping consumer
+        # (e.g. `(cast (ptr T) (addr (deref p)))`) reads the resolved location and not
+        # the still-`NeedsReg` constraint it passed in (every allocValue path leaves
+        # `dest` = the resolved location on return — this identity path must too).
+        dest = identityHome
         b.ra.locs[pos] = identityHome
         return
       b.forceRegDest(dest)
@@ -1281,20 +1305,23 @@ proc isAggrCopySrc(c: Cursor): bool =
 proc allocAggrCopy(b: var Builder; n: var Cursor; dstIsMem: bool; dstCur: Cursor;
                    auxPos: int) =
   ## Allocator twin of `genAggrCopyStore`: the ONE whole-aggregate copy reservation for
-  ## every (destination × source) form. Reserve the three held scratches the emitter's
-  ## `aggrAddrLoc`/`aggrAddrInto`/`copyAggr` consume — `[dstAddr, srcAddr, copyTmp]` — then
-  ## place each lvalue's embedded base/index regs transiently (a `Mem` destination and a
+  ## every (destination × source) form. Reserve the two held address scratches the
+  ## emitter's `aggrAddrLoc`/`aggrAddrInto` consume — `[dstAddr, srcAddr]` — then place
+  ## each lvalue's embedded base/index regs transiently (a `Mem` destination and a
   ## memory-lvalue source; freed after their address is leas'd, so they never co-live). A
   ## bare symbol needs none. The dst/src stride-scratch aux live at THEIR own positions
   ## (≠ auxPos), so they never collide with these. Advances `n` past the source.
   ##
-  ## Register-pressure ordering: `copyTmp` (the per-field copy register) is live ONLY
-  ## during the final copy loop, and `srcAddr` only from the source onward — so neither
-  ## is held while the DST lvalue address is computed, and `copyTmp` during NEITHER
-  ## lvalue. Reserving them as late as possible (instead of all three up front) keeps the
-  ## peak simultaneous hold at `addr + addr + base/index/stride`, not `+ copyTmp` too —
-  ## the difference between fitting the small scratch pool and an out-of-registers assert
-  ## when a non-SIB element stride (an aggregate-element `at`/`pat`) needs its own GPR.
+  ## The per-field copy register is NOT reserved from the pool: it is the always-available
+  ## staging bridge (R11 / x14–x15), picked at emit (`genAggrCopyStore`) — live only during
+  ## the final copy loop, after both addresses are already in `dstAddr`/`srcAddr`, so the
+  ## bridge is free then. This keeps the whole-aggregate copy's pool need at TWO GPRs (not
+  ## three), so it still fits when a proc with several register-homed live params crosses an
+  ## aggregate copy (e.g. a setter `[]=(addr deepLvalue, key, Obj(…, field: aggrCopy))`).
+  ##
+  ## Register-pressure ordering: `srcAddr` is reserved only from the source onward, so it is
+  ## not held while the DST lvalue address is computed — keeping the peak simultaneous hold
+  ## at `dstAddr + base/index/stride` then `dstAddr + srcAddr`, never both lvalues' temps.
   let dstAddr = b.reserveTmp(ScalarSlot)
   if dstIsMem:
     var dc = dstCur
@@ -1308,11 +1335,10 @@ proc allocAggrCopy(b: var Builder; n: var Cursor; dstIsMem: bool; dstCur: Cursor
     releaseLvalTemps(b, rc)
   else:
     skip n                                               # a bare symbol
-  let copyTmp = b.reserveTmp(ScalarSlot)                 # only live during the copy loop
-  b.releaseTmp(copyTmp); b.releaseTmp(srcAddr); b.releaseTmp(dstAddr)
-  if dstAddr.kind != InReg or srcAddr.kind != InReg or copyTmp.kind != InReg:
+  b.releaseTmp(srcAddr); b.releaseTmp(dstAddr)
+  if dstAddr.kind != InReg or srcAddr.kind != InReg:
     raiseAssert "arkham: out of registers for an aggregate copy"
-  b.ra.aux[auxPos] = ExprAux(scratch: @[dstAddr.r, srcAddr.r, copyTmp.r])
+  b.ra.aux[auxPos] = ExprAux(scratch: @[dstAddr.r, srcAddr.r])
 
 proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
   ## Allocator twin of the emitter's `genStore2`. A whole-aggregate COPY (symbol/lvalue
