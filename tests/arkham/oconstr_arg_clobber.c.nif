@@ -1,0 +1,46 @@
+(.nif27)
+(.indexat 732              )
+(stmts
+ (type :Inner.0 .
+  (object .
+   (fld :p.0 .
+    (i 64))
+   (fld :q.0 .
+    (i 64))))
+ (type :Box.0 .
+  (object .
+   (fld :a.0 . Inner.0)
+   (fld :b.0 . Inner.0)))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :sink.0
+  (params
+   (param :tag.0 .
+    (i 64))
+   (param :box.0 . Box.0))
+  (i 64)
+  (pragmas)
+  (stmts
+   (ret tag.0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :iv.0 . Inner.0
+    (oconstr Inner.0
+     (kv p.0 10)
+     (kv q.0 20)))
+   (var :r.0 .
+    (i 64)
+    (call sink.0 42
+     (oconstr Box.0
+      (kv a.0 iv.0)
+      (kv b.0 iv.0))))
+   (call exit.c r.0))))(.index)

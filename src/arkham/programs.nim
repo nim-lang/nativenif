@@ -651,6 +651,11 @@ proc aggrLayout*(p: var Program; typeName: string): seq[FieldInfo] =
   d.into:
     inc d; skip d                             # name, type-pragmas
     body = d; skip d                          # the body
+  if body.kind == Symbol:
+    # a DISTINCT type / type alias (`(type :Wrap . Inner)`) — its body is the underlying
+    # nominal type, with the SAME layout. Resolve through to it (mirrors `aggrByteSize`,
+    # which already resolves via `typeSizeAlign`). Handles chains of distincts.
+    return aggrLayout(p, symName(body))
   assert body.kind == TagLit and body.typeKind == ObjectT,
     "arkham: aggregate ABI requires an object type: " & typeName
   var oc = body

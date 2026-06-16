@@ -1783,11 +1783,23 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
     # Non-declarative: each arg is evaluated straight into its raw ABI register (float →
     # xmm{n}, integer → the GPR); an aggregate arg is marshalled into consecutive GPRs
     # (by-value ≤16B) or passed as a pointer (by-ref). The intIdx/fIdx counting mirrors
-    # allocCall so an aggregate's register range matches. (No reactive sealing; like the
-    # declarative path this relies on hexer's un-nesting leaving args simple.)
+    # allocCall so an aggregate's register range matches.
+    #
+    # A committed argument register must survive while LATER args are evaluated. Hexer
+    # un-nests CALL args (so no arg is itself a call), but it does NOT un-nest an
+    # `(oconstr …)`/`(aconstr …)` argument — that aggregate is BUILT inline here, and the
+    # build copies sub-aggregate fields through a staging register (`pickStaging…` /
+    # `copyStructThroughPtr2`). Without protection that pick can grab an arg register
+    # already holding an earlier argument (e.g. rdi = `&seq` for `s.add Thing(...)`),
+    # clobbering it before the call. Sealing each committed arg reg into `liveAccums`
+    # (the documented "arg/return reg holding an in-flight value" set the staging picker
+    # avoids) makes the later build route around it.
     var intIdx = if resultByRef: 1 else: 0               # rdi = hidden result ptr (set by the caller)
+    var sealedArgs: set[Reg] = {}
+    if resultByRef: (g.liveAccums.incl g.md.intArgRegs[0]; sealedArgs.incl g.md.intArgRegs[0])
     for idx in 0 ..< argCurs.len:
       let a = argCurs[idx]
+      let intIdx0 = intIdx                               # arg's committed GPRs = [intIdx0, intIdx)
       if g.exprSlot(a).kind == AMem:
         # ── The ONE aggregate-argument path (mirrors allocCall's single AMem branch). ──
         # ONCE (a named stack home, or a global read in place), and the ABI marshalling
@@ -1815,9 +1827,13 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
           g.unbindTemp(srcAddr)
         else:
           var home = ""                                   # a named stack slot, or "" ⇒ read &global
+          var ptrReg = NoReg                              # a by-ref param: pointer to the aggregate in a reg
           if a.kind == Symbol:
-            if g.ra.locationOfSym(symName(a)).kind == NamedStack:
+            let sloc = g.ra.locationOfSym(symName(a))
+            if sloc.kind == NamedStack:
               home = symName(a)                           # a local: its slot is already addressable
+            elif sloc.kind == InReg:
+              ptrReg = sloc.r                             # a >16B by-ref param: its pointer is already in a reg
             elif g.lookupSym(symName(a)).cat == scGlobal:
               discard                                     # a global: read through &global (home == "")
             else:
@@ -1830,11 +1846,13 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
             g.genStore2(a, namedStackLoc(home, g.exprSlot(a)), pos)
           if sz <= g.md.aggrByRefThreshold:               # by-value: words → GPRs
             let regs = g.md.intArgRegs[intIdx ..< intIdx + words]
-            if home.len > 0: g.structToRegs(home, tn, regs)
+            if ptrReg != NoReg: g.marshalAggrFromAddr(ptrReg, tn, regs)
+            elif home.len > 0: g.structToRegs(home, tn, regs)
             else: g.globalToRegs(symName(a), tn, regs)
             intIdx += words
           else:                                           # by-reference: &arg → one GPR
-            if home.len > 0: g.emStackAddr(g.md.intArgRegs[intIdx], home)
+            if ptrReg != NoReg: g.movReg(g.md.intArgRegs[intIdx], ptrReg)
+            elif home.len > 0: g.emStackAddr(g.md.intArgRegs[intIdx], home)
             else: g.emGlobalAddr(g.md.intArgRegs[intIdx], symName(a))
             inc intIdx
       elif g.isFloatExpr(a):
@@ -1842,10 +1860,13 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
       else:
         g.emitValue2(a)                                   # → its GPR arg register
         inc intIdx
+      for k in intIdx0 ..< intIdx:                        # protect this arg's regs from a later arg's build
+        g.liveAccums.incl g.md.intArgRegs[k]; sealedArgs.incl g.md.intArgRegs[k]
     g.ab.tree PrepareX64:
       g.ab.sym tgt.asmName
       if isSyscall: g.emSyscall()
       else: g.ab.keyword CallX64
+    g.liveAccums = g.liveAccums - sealedArgs              # the call consumed them; unseal
     if hasResult:
       if resultIsFloat:
         if resLoc.kind == InFReg:
@@ -3157,6 +3178,17 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
   let (dstAggr, aggrSize) = g.dstAggrInfo(dst)
   if dstAggr and isAggrCopySrc(rhs):                     # the ONE whole-aggregate copy path
     g.genAggrCopyStore(rhs, dst, aggrSize, auxPos)
+    return
+  if rhs.kind == TagLit and rhs.exprKind in {ConvC, CastC} and
+     g.exprSlot(rhs).kind == AMem:
+    # A distinct / representation-preserving conversion of an AGGREGATE (`Path(s)` for
+    # `Path = distinct string`) is byte-transparent — store its underlying operand into
+    # the same destination (allocator twin in `allocStore`).
+    var inner = rhs
+    inner.into:
+      skip inner                                         # the target type
+      g.genStore2(inner, dst, auxPos)                    # the operand → same dest
+      while inner.hasMore: skip inner
     return
   if dst.kind == NamedStack and dst.typ.kind == AMem:    # aggregate destination (a slot var)
     let dstVar = dst.name

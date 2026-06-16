@@ -313,7 +313,15 @@ proc emAggrDot(g: var CodeGen; base, field: string) =
         g.ab.ptrType: g.ab.sym g.varType[base]
         g.emReg loc.r
       g.ab.sym field
-  else: raiseAssert "arkham: aggregate base neither stack nor pointer: " & base
+  else:
+    # a synthetic nifasm `(s)` slot (e.g. an inline-constructor arg temp) is addressed
+    # by name like a `NamedStack` var — the allocator just doesn't track it. Mirrors
+    # `emAggrFieldMem`'s fallback (this is its no-`mem`-wrapper address-of-field twin).
+    if g.varType.hasKey(base):
+      g.ab.tree DotX:
+        g.ab.sym base
+        g.ab.sym field
+    else: raiseAssert "arkham: aggregate base neither stack nor pointer: " & base
 
 proc emStackVar(g: var CodeGen; name, typeName: string) =
   ## Declare a nifasm-managed stack slot `(var :name (s) typeName)`.
@@ -2883,6 +2891,17 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
   let (dstAggr, aggrSize) = g.dstAggrInfo(dst)
   if dstAggr and isAggrCopySrc(rhs):                         # the ONE whole-aggregate copy path
     g.genAggrCopyStore(rhs, dst, aggrSize, auxPos)
+    return
+  if rhs.kind == TagLit and rhs.exprKind in {ConvC, CastC} and
+     g.exprSlot(rhs).kind == AMem:
+    # A distinct / representation-preserving conversion of an AGGREGATE (`Path(s)` for
+    # `Path = distinct string`) is byte-transparent — store its underlying operand into
+    # the same destination (allocator twin in `allocStore`).
+    var inner = rhs
+    inner.into:
+      skip inner                                             # the target type
+      g.genStore2(inner, dst, auxPos)                        # the operand → same dest
+      while inner.hasMore: skip inner
     return
   if dst.kind == NamedStack and dst.typ.kind == AMem:        # aggregate destination
     let dstVar = dst.name

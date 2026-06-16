@@ -1287,20 +1287,28 @@ proc allocAggrCopy(b: var Builder; n: var Cursor; dstIsMem: bool; dstCur: Cursor
   ## memory-lvalue source; freed after their address is leas'd, so they never co-live). A
   ## bare symbol needs none. The dst/src stride-scratch aux live at THEIR own positions
   ## (≠ auxPos), so they never collide with these. Advances `n` past the source.
+  ##
+  ## Register-pressure ordering: `copyTmp` (the per-field copy register) is live ONLY
+  ## during the final copy loop, and `srcAddr` only from the source onward — so neither
+  ## is held while the DST lvalue address is computed, and `copyTmp` during NEITHER
+  ## lvalue. Reserving them as late as possible (instead of all three up front) keeps the
+  ## peak simultaneous hold at `addr + addr + base/index/stride`, not `+ copyTmp` too —
+  ## the difference between fitting the small scratch pool and an out-of-registers assert
+  ## when a non-SIB element stride (an aggregate-element `at`/`pat`) needs its own GPR.
   let dstAddr = b.reserveTmp(ScalarSlot)
-  let srcAddr = b.reserveTmp(ScalarSlot)
-  let copyTmp = b.reserveTmp(ScalarSlot)
   if dstIsMem:
     var dc = dstCur
     allocLvalue2(b, dc, dontCare, isStore = true)
     releaseLvalTemps(b, dstCur)
     b.ra.hasStackVars = true
+  let srcAddr = b.reserveTmp(ScalarSlot)
   if n.kind == TagLit and n.exprKind in {DotC, DerefC, AtC, PatC}:
     let rc = n
     allocLvalue2(b, n)                                   # advances n past the lvalue
     releaseLvalTemps(b, rc)
   else:
     skip n                                               # a bare symbol
+  let copyTmp = b.reserveTmp(ScalarSlot)                 # only live during the copy loop
   b.releaseTmp(copyTmp); b.releaseTmp(srcAddr); b.releaseTmp(dstAddr)
   if dstAddr.kind != InReg or srcAddr.kind != InReg or copyTmp.kind != InReg:
     raiseAssert "arkham: out of registers for an aggregate copy"
@@ -1322,6 +1330,17 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
       allocAggrCopy(b, n, dst.kind == Mem,
                     (if dst.kind == Mem: dst.cur else: default(Cursor)), auxPos)
       return
+  if n.kind == TagLit and n.exprKind in {ConvC, CastC} and
+     b.tc.exprSlot(n).kind == AMem:
+    # A distinct / representation-preserving conversion of an AGGREGATE (e.g. `Path(s)`
+    # for `Path = distinct string`) is a no-op at the byte level — allocate/store the
+    # underlying operand into the same destination. (A scalar conv has a non-AMem slot
+    # and is handled by the scalar paths below.)
+    n.into:
+      skip n                                             # the target type
+      allocStore(b, n, dst, auxPos)                      # the operand → same dest (advances n)
+      while n.hasMore: skip n
+    return
   if dst.kind == NamedStack and dst.typ.kind == AMem:    # aggregate destination
     if n.kind == TagLit and n.exprKind == OconstrC:
       allocConstr(b, n)                                  # object: place each field value
