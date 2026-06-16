@@ -1,0 +1,55 @@
+(.nif27)
+(.indexat 860              )
+(stmts
+ (type :Base.0 .
+  (object .
+   (fld :tag.0 .
+    (i 64))))
+ (type :Derived.0 .
+  (object Base.0
+   (fld :extra.0 .
+    (i 64))))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :getTag.0
+  (params
+   (param :p.0 .
+    (ptr Base.0)))
+  (i 64).
+  (stmts
+   (ret
+    (dot
+     (deref p.0)tag.0))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :d.0 . Derived.0
+    (oconstr Derived.0
+     (kv tag.0 7)
+     (kv extra.0 99)))
+   (var :p.0 .
+    (ptr Derived.0)
+    (addr d.0))
+   (var :x1.0 .
+    (i 64)
+    (call getTag.0
+     (addr
+      (baseobj Base.0 1
+       (deref p.0)))))
+   (var :x2.0 .
+    (i 64)
+    (dot
+     (baseobj Base.0 1
+      (deref p.0))tag.0))
+   (call exit.c
+    (add
+     (i 64)x1.0 x2.0)))))
+(.index)
