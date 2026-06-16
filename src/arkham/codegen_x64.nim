@@ -1667,62 +1667,6 @@ proc proctypeOfTarget(g: var CodeGen; targetCur: Cursor): Cursor =
   assert result.kind == TagLit and result.typeKind == ProctypeT,
     "arkham x64n: indirect call target is not a proctype"
 
-proc emitIndirectCall2(g: var CodeGen; c, targetCur: Cursor; argCurs: seq[Cursor];
-                       resLoc: Location; pos: int) =
-  ## Indirect call through a function-pointer EXPRESSION (a vtable/method-table load,
-  ## not a symbol). nifasm's `(prepare …)` needs a NAMED ProcT symbol, so: evaluate the
-  ## fn-ptr into its (held) register, declare a proctype-typed reg var bound to it, then
-  ## run the ordinary DECLARATIVE prepare through that var name (`pN.0`/`ret.0` match
-  ## `genProctypeSig`'s signature). Declarative ABI only (scalar/ptr params + scalar/void
-  ## result); float/aggregate-in-signature indirect calls are not yet supported.
-  let proctype = g.proctypeOfTarget(targetCur)
-  if not isDeclarativeAbi(g.prog, proctype):
-    raiseAssert "arkham x64n: non-declarative indirect call not yet supported"
-  var retType = proctype                                 # the proctype's return type (3rd child)
-  block:
-    var q = proctype
-    q.into:
-      skip q; skip q                                     # the Empty (name) slot, the params
-      retType = q
-      while q.hasMore: skip q
-  let hasResult = not retIsVoid(retType)
-  let resSlot = if hasResult: slotOf(g.prog, retType) else: AsmSlot(cls: AInt, size: 8, align: 8)
-  # 1. evaluate the fn-ptr target into its allocator-assigned (held) register. A `(cast
-  #    Proctype …)` binds that register as a PROCTYPE-typed temp (isPtrType ⊇ ProctypeT),
-  #    so its `regLocal` name is already a ProcT symbol nifasm accepts as a `(prepare …)`
-  #    indirect-call target — no separate var decl needed.
-  g.emitValue2(targetCur)
-  let tloc = g.ra.locs[cursorToPosition(g.buf[], targetCur)]
-  assert tloc.kind == InReg, "arkham x64n: indirect call target loc " & $tloc.kind
-  let fnptrReg = tloc.r
-  assert g.regLocal.hasKey(fnptrReg), "arkham x64n: indirect call target not bound to a name"
-  let fpVar = g.regLocal[fnptrReg]
-  # 2. the ordinary declarative prepare, through the proctype-bound register.
-  g.ab.tree PrepareX64:
-    g.ab.sym fpVar
-    for idx in 0 ..< argCurs.len:
-      g.emitValue2(argCurs[idx])
-      let aloc = g.ra.locs[cursorToPosition(g.buf[], argCurs[idx])]
-      if idx < g.md.intArgRegs.len:
-        g.ab.tree MovX64:
-          g.ab.tree ArgX: g.ab.sym paramName(idx)
-          g.emReg aloc.r
-      else:
-        g.ab.tree MovX64:
-          g.ab.tree MemX: (g.ab.reg RSP; g.ab.tree ArgX: g.ab.sym paramName(idx))
-          g.emReg aloc.r
-        if aloc.kind == InReg and aloc.isTemp: g.unbindTemp(aloc.r)
-    g.ab.keyword CallX64
-    if hasResult:
-      g.ab.tree MovX64:
-        g.emReg RAX
-        g.ab.tree ResX: g.ab.sym "ret.0"
-  # 3. release the fn-ptr register (its proctype temp is dead after the call).
-  if tloc.isTemp: g.unbindTemp(fnptrReg)
-  if hasResult and resLoc.kind == InReg:
-    if resLoc.isTemp and resSlot.kind != AMem: g.bindTemp(resLoc.r, resSlot)
-    if resLoc.r != RAX: g.movReg(resLoc.r, RAX)
-
 proc emitCall2(g: var CodeGen; c: Cursor) =
   ## Emit a call. The allocator placed each argument in its ABI register (integer →
   ## rdi…r9, float → xmm0–7) and the result in rax / xmm0 (or a dest-passed home).
@@ -1730,6 +1674,13 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
   ## `(arg pN)` inside the prepare and reads `(res ret.0)`; the NON-DECLARATIVE one
   ## (float param/return — and later aggregates) evaluates args into raw ABI registers
   ## and emits a bare `(prepare f (call))`, reading the result from rax / xmm0 raw.
+  ##
+  ## A STATIC call (target is a symbol) and an INDIRECT call (target is a fn-ptr
+  ## expression, e.g. a vtable load) share this one path: both use the SysV ABI, so
+  ## both run the same marshalling loop below. They differ only in how the `(prepare …)`
+  ## symbol and the ABI signature are obtained — a cached `CallTarget` for a symbol, or
+  ## one synthesized from the proctype with the fn-ptr evaluated into a (held,
+  ## proctype-bound) register whose `regLocal` name nifasm accepts as the target.
   let pos = cursorToPosition(g.buf[], c)
   let resLoc = g.ra.locs[pos]
   var argCurs: seq[Cursor] = @[]
@@ -1744,30 +1695,55 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
       if not indirect: fsym = symName(fc)
       skip fc
       while fc.hasMore: (argCurs.add fc; skip fc)
-  if indirect:                                      # call through a fn-ptr expression (vtable)
-    g.emitIndirectCall2(c, targetCur, argCurs, resLoc, pos)
-    return
-  if not g.callTarget.hasKey(fsym):                 # resolve + cache (post-flip: no gate prepass)
-    let si = g.lookupSym(fsym)
-    if si.cat in {scGlobal, scTvar}:
-      g.callTarget[fsym] = CallTarget(declarative: true, indirect: true,
-        asmName: fsym, retType: g.indirectRetType(si.decl))
-    else:
-      g.callTarget[fsym] = foreignCallTarget(g.prog, fsym)
-  let tgt = g.callTarget[fsym]
-  if tgt.memIntrin.len > 0:                          # C mem* intrinsic → inline loop
-    g.emitMemIntrin2(argCurs, tgt.memIntrin)
-    if resLoc.kind == InReg and resLoc.r != RAX: g.movReg(resLoc.r, RAX)
-    return
-  if tgt.atomic.len > 0:                             # __atomic_* builtin → inline sequence
-    g.emitAtomic2(argCurs, tgt.atomic)
-    if resLoc.kind == InReg and resLoc.r != RAX: g.movReg(resLoc.r, RAX)
-    return
-  if tgt.bitBuiltin.len > 0:                          # GCC bit builtin (ctz/…) → inline bsf/…
-    g.emitBitBuiltin2(argCurs, tgt.bitBuiltin)
-    if resLoc.kind == InReg and resLoc.isTemp: g.bindTemp(resLoc.r, AsmSlot(cls: AInt, size: 8, align: 8))
-    if resLoc.kind == InReg and resLoc.r != RAX: g.movReg(resLoc.r, RAX)
-    return
+
+  # Resolve the ABI description (`tgt`) and the `(prepare …)` symbol uniformly.
+  var tgt: CallTarget
+  var fnptrReg = NoReg                               # indirect: the fn-ptr's held register
+  var fnptrTemp = false
+  if indirect:                                       # target is a fn-ptr expression
+    let proctype = g.proctypeOfTarget(targetCur)
+    if not isDeclarativeAbi(g.prog, proctype):
+      raiseAssert "arkham x64n: non-declarative indirect call not yet supported"
+    var retType = proctype                           # the proctype's return type (3rd child)
+    block:
+      var q = proctype
+      q.into:
+        skip q; skip q                               # the Empty (name) slot, the params
+        retType = q
+        while q.hasMore: skip q
+    # Evaluate the fn-ptr into its allocator-assigned (held) register. A `(cast Proctype
+    # …)` binds that register as a PROCTYPE-typed temp (isPtrType ⊇ ProctypeT), so its
+    # `regLocal` name is already a ProcT symbol nifasm accepts as a `(prepare …)` target
+    # — no separate var decl needed. It stays bound across arg evaluation below.
+    g.emitValue2(targetCur)
+    let tloc = g.ra.locs[cursorToPosition(g.buf[], targetCur)]
+    assert tloc.kind == InReg, "arkham x64n: indirect call target loc " & $tloc.kind
+    fnptrReg = tloc.r
+    fnptrTemp = tloc.isTemp
+    assert g.regLocal.hasKey(fnptrReg), "arkham x64n: indirect call target not bound to a name"
+    tgt = CallTarget(declarative: true, asmName: g.regLocal[fnptrReg], retType: retType)
+  else:
+    if not g.callTarget.hasKey(fsym):               # resolve + cache (post-flip: no gate prepass)
+      let si = g.lookupSym(fsym)
+      if si.cat in {scGlobal, scTvar}:
+        g.callTarget[fsym] = CallTarget(declarative: true, indirect: true,
+          asmName: fsym, retType: g.indirectRetType(si.decl))
+      else:
+        g.callTarget[fsym] = foreignCallTarget(g.prog, fsym)
+    tgt = g.callTarget[fsym]
+    if tgt.memIntrin.len > 0:                        # C mem* intrinsic → inline loop
+      g.emitMemIntrin2(argCurs, tgt.memIntrin)
+      if resLoc.kind == InReg and resLoc.r != RAX: g.movReg(resLoc.r, RAX)
+      return
+    if tgt.atomic.len > 0:                           # __atomic_* builtin → inline sequence
+      g.emitAtomic2(argCurs, tgt.atomic)
+      if resLoc.kind == InReg and resLoc.r != RAX: g.movReg(resLoc.r, RAX)
+      return
+    if tgt.bitBuiltin.len > 0:                        # GCC bit builtin (ctz/…) → inline bsf/…
+      g.emitBitBuiltin2(argCurs, tgt.bitBuiltin)
+      if resLoc.kind == InReg and resLoc.isTemp: g.bindTemp(resLoc.r, AsmSlot(cls: AInt, size: 8, align: 8))
+      if resLoc.kind == InReg and resLoc.r != RAX: g.movReg(resLoc.r, RAX)
+      return
   let isSyscall = tgt.syscall
   let hasResult = not retIsVoid(tgt.retType)
   let resSlot = if hasResult: slotOf(g.prog, tgt.retType) else: AsmSlot(cls: AInt, size: 8, align: 8)
@@ -1796,6 +1772,8 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
         g.ab.tree MovX64:
           g.emReg RAX
           g.ab.tree ResX: g.ab.sym "ret.0"
+    # release the fn-ptr register (indirect only): its proctype temp is dead post-call.
+    if indirect and fnptrTemp: g.unbindTemp(fnptrReg)
     if hasResult and resLoc.kind == InReg:
       # rebind a reused dead-local reg to the NAVIGATED return type (a scalar result only —
       # an aggregate-by-value return spans rax:rdx and is consumed word-by-word, not as a reg).
