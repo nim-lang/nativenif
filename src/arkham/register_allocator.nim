@@ -1689,7 +1689,13 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
             # div/mod, rcx for a variable shift), it must move to a callee-saved
             # home that survives the clobber. Treat it like a cross-call param.
             let clobbered = (arg == b.md.divRemReg and b.an.clobbersDivReg) or
-                            (arg == b.md.shiftCountReg and b.an.clobbersShiftReg)
+                            (arg == b.md.shiftCountReg and b.an.clobbersShiftReg) or
+                            # AArch64: x0 is BOTH arg0 and the return register. A param homed
+                            # in x0 that the result expression reads off the projection spine
+                            # is clobbered by a sibling sub-result landing in the accumulator
+                            # before that read — give it a callee-saved home. (No-op on x86-64,
+                            # where intRetReg=rax is never an arg register.)
+                            (arg == b.md.intRetReg and b.an.arg0RetConflict)
             if AddrTaken in props and not aggrByRef:
               loc = b.spill(effSlot)           # address taken → must be on the stack
             elif hasCall or aggrByRef or clobbered:

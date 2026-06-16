@@ -1,0 +1,70 @@
+(.nif27)
+(.indexat 1128             )
+(stmts
+ (type :Inner.0 .
+  (object .
+   (fld :p.0 .
+    (i 64))
+   (fld :q.0 .
+    (i 64))))
+ (type :Box.0 .
+  (object .
+   (fld :a.0 . Inner.0)
+   (fld :b.0 . Inner.0)))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :sink.0
+  (params
+   (param :dst.0 .
+    (ptr
+     (i 64)))
+   (param :box.0 . Box.0))
+  (i 64)
+  (pragmas)
+  (stmts
+   (ret
+    (add
+     (i 64)
+     (deref dst.0)
+     (add
+      (i 64)
+      (add
+       (i 64)
+       (dot
+        (dot box.0 a.0 0)p.0 0)
+       (dot
+        (dot box.0 a.0 0)q.0 0))
+      (add
+       (i 64)
+       (dot
+        (dot box.0 b.0 0)p.0 0)
+       (dot
+        (dot box.0 b.0 0)q.0 0)))))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :t.0 .
+    (i 64)2)
+   (var :bx.0 . Box.0
+    (oconstr Box.0
+     (kv a.0
+      (oconstr Inner.0
+       (kv p.0 10)
+       (kv q.0 20)))
+     (kv b.0
+      (oconstr Inner.0
+       (kv p.0 10)
+       (kv q.0 20)))))
+   (var :r.0 .
+    (i 64)
+    (call sink.0
+     (addr t.0)bx.0))
+   (call exit.c r.0))))(.index)

@@ -57,9 +57,21 @@ type
                                 ## leaf param must not be homed there (x86-64 only)
     clobbersShiftReg*: bool     ## body contains a variable shift → rcx (cl) is
                                 ## clobbered, so a leaf param must not be homed there
+    arg0RetConflict*: bool      ## the FIRST integer/pointer param is read in a `(ret …)`
+                                ## value OFF the leftmost-projection spine — i.e. behind a
+                                ## binop / call / indexed access, where a sibling sub-result
+                                ## may be evaluated into the accumulator first. On AArch64
+                                ## arg0 == the return register (x0), so such a param is
+                                ## clobbered before its use unless relocated to callee-saved.
+                                ## A pure `p` / `(deref p)` / `(dot p f)` / `(cast _ p)` chain
+                                ## reads the param FIRST and is safe (the common getter); only
+                                ## off-spine reads set this. Consumed by `allocParams` (gated
+                                ## on `arg == intRetReg`, so a no-op on x86-64 where ret≠arg0).
 
   Context = object
     inLoops, inAddr, inAsgnTarget, inArrayIndex: int
+    arg0Name: string           ## name of the FIRST integer/pointer param (the one homed in
+                               ## the return register on AArch64); "" if none / aggregate
     res: ProcAnalysis
     callPositions: seq[int]    ## token position of every call point (incl. tvar thunk
                                ## accesses) — the points where caller-saved regs die. A
@@ -121,6 +133,41 @@ proc analyseVarDecl(c: var Context; n: var Cursor) =
     c.res.vars[vn] = vi
     if hasValue: analyse(c, n)   # analyse the initializer
     else: inc n                  # consume the `.`
+
+proc resultSpineWalk(c: var Context; n: var Cursor; onSpine: bool) =
+  ## Walk a `(ret …)` value to find whether `arg0Name` is read OFF the leftmost-projection
+  ## spine. The spine is the chain of value-preserving projections from the ret root —
+  ## `deref`, `dot` (its base), `cast`/`conv` (its operand) — which the emitter evaluates
+  ## FIRST, so a param read there is consumed before any sibling can clobber its register.
+  ## Any other node (binop, call, indexed `at`/`pat`, constructor …) evaluates siblings
+  ## that may land in the accumulator before the param is read → off-spine. (Read-only:
+  ## advances `n` past the subtree but records nothing in `vars`.)
+  case n.kind
+  of Symbol:
+    if c.arg0Name.len > 0 and symName(n) == c.arg0Name and not onSpine:
+      c.res.arg0RetConflict = true
+    inc n
+  of TagLit:
+    if n.stmtKind == NoStmt:
+      case n.exprKind
+      of DerefC:                        # `(deref p)` — its pointer operand stays on-spine
+        n.into:
+          var first = true
+          while n.hasMore: (resultSpineWalk(c, n, onSpine and first); first = false)
+      of DotC:                          # `(dot base field [depth])` — only `base` is a value
+        n.into:
+          if n.hasMore: resultSpineWalk(c, n, onSpine)   # base keeps the spine
+          while n.hasMore: skip n                          # field name + optional depth
+      of CastC, ConvC:                  # `(cast/conv Type operand)` — operand keeps the spine
+        n.into:
+          if n.hasMore: skip n                             # the target type
+          if n.hasMore: resultSpineWalk(c, n, onSpine)     # the operand keeps the spine
+          while n.hasMore: skip n
+      else:                             # binop / call / at / pat / oconstr / … : all off-spine
+        n.into:
+          while n.hasMore: resultSpineWalk(c, n, false)
+    else: skip n
+  else: inc n
 
 proc analyse(c: var Context; n: var Cursor) =
   case n.kind
@@ -226,6 +273,12 @@ proc analyse(c: var Context; n: var Cursor) =
         analyse(c, n)                   # the lvalue
         dec c.inAsgnTarget
         analyse(c, n)                   # the rvalue
+    of RetS:
+      if c.arg0Name.len > 0 and not c.res.arg0RetConflict:
+        var probe = n                   # read-only spine scan (separate cursor)
+        probe.into:
+          while probe.hasMore: resultSpineWalk(c, probe, onSpine = true)
+      analyseChildren(c, n)             # normal usage/liveness accounting
     of ProcS, TypeS:
       skip n                            # nested decls: not our locals
     of WhileS:
@@ -244,11 +297,15 @@ proc analyse(c: var Context; n: var Cursor) =
 proc analyseParams(c: var Context; params: var Cursor) =
   ## `(params (param :name pragmas type) …)` or a DotToken.
   if params.kind != TagLit: return
+  var first = true
   params.into:
     while params.hasMore:
       params.into:                      # (param …)
         assert params.kind == SymbolDef
         let vn = symName(params); inc params
+        if first:
+          c.arg0Name = vn               # the first param — homed in x0 (== ret reg) on a64
+          first = false
         # Params are never early-freed (the allocator manages them separately), so
         # pin their live range to the whole proc. `freeAfter == high(int)` also marks
         # them as params for the `AllRegs` finalize, which skips them (allocParams
