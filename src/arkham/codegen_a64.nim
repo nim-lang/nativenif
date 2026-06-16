@@ -1459,7 +1459,7 @@ proc bindLvalGlobalBases(g: var CodeGen; c: Cursor; bound: var seq[Reg]) =
       while cc.hasMore: skip cc
 
 proc aggrAddrInto(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind: bool) =
-  ## THE address-of any lvalue into register `dest` (chibicc's `gen_addr`): `&(deref p)`
+  ## THE address-of any lvalue into register `dest`: `&(deref p)`
   ## is `p`; a global/threadvar leas its absolute address; a `baseobj` is the inner
   ## lvalue's address (base at offset 0); anything else leas the `emLvalAddr2` subtree.
   ## `doBind` names a fresh temp `dest`. Shared by `(addr …)` / aggregate marshalling /
@@ -2112,7 +2112,6 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
         g.emitFValue2(a)
         inc fIdx
       elif g.exprSlot(a).kind == AMem:
-        # ── The ONE aggregate-argument path (chibicc lesson; see codegen_x64). ──
         # The "where do the bytes come from" dispatch lives here ONCE: a local/by-ref
         # symbol home, a global read in place, or any computed aggregate (oconstr/
         # aconstr/lvalue) built into a temp via the ONE general `genStore2`. The ABI

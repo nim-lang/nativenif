@@ -1790,7 +1790,6 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
       let a = argCurs[idx]
       if g.exprSlot(a).kind == AMem:
         # ── The ONE aggregate-argument path (mirrors allocCall's single AMem branch). ──
-        # The chibicc lesson: the "where do the bytes come from" dispatch lives here
         # ONCE (a named stack home, or a global read in place), and the ABI marshalling
         # below is form-blind — driven purely by the TYPE's size. A local, a global, an
         # `(oconstr/aconstr …)`, and an aggregate lvalue (`(at/dot/deref …)`) differ only
@@ -2459,7 +2458,7 @@ proc emitFMemLoad2(g: var CodeGen; c: Cursor) =
   g.unbindLvalTemps2(c)                                   # release embedded base/index temps
 
 proc aggrAddrInto(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind: bool) =
-  ## THE address-of any lvalue into register `dest` (chibicc's `gen_addr`): `&(deref p)`
+  ## THE address-of any lvalue into register `dest`: `&(deref p)`
   ## is `p` itself; a global/threadvar leas its absolute address; a `baseobj` is the inner
   ## lvalue's address (base sub-object at offset 0), retyped; anything else leas the
   ## `emLvalAddr2` subtree. `doBind` names a fresh temp `dest` (ptr-typed via `aslot`,
@@ -2728,10 +2727,9 @@ proc emByteAtImm(g: var CodeGen; p: Reg; off: int) =
       g.ab.intLit off.int64
 
 proc copyAggr(g: var CodeGen; dst, src: Reg; size: int; tmp: Reg) =
-  ## THE one aggregate memcpy (a struct/array `store`, chibicc-style): copy `size` bytes
-  ## from `[src]` to `[dst]` through the bound scratch `tmp` — 8-byte words for the
-  ## aligned bulk, then a sized byte tail. Layout-agnostic and byte-accurate, so it is
-  ## TOTAL for any aggregate regardless of field packing; both ends are just an address
+  ## copy `size` bytes from `[src]` to `[dst]` through the bound scratch `tmp` — 8-byte
+  ## words for the aligned bulk, then a sized byte tail. Layout-agnostic and byte-accurate,
+  ## so it is TOTAL for any aggregate regardless of field packing; both ends are just an address
   ## in a register. nifasm's sized mem↔reg move extends a byte load / truncates a byte
   ## store, so `tmp` stays a plain `(u 64)`. (`dst`, `src`, `tmp` are bound by the caller.)
   let words = size div 8
@@ -3139,7 +3137,7 @@ proc dstAggrInfo(g: var CodeGen; dst: Location): (bool, int) =
   else: (false, 0)
 
 proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size, auxPos: int) =
-  ## THE whole-aggregate copy `dst = rhs` (chibicc's struct `store`): reduce BOTH sides to
+  ## THE whole-aggregate copy `dst = rhs`: reduce BOTH sides to
   ## an address in a register (`aggrAddrLoc`/`aggrAddrInto` — the one `gen_addr`), then
   ## `copyAggr`. ONE path for every (destination form × source form); the allocator
   ## reserved `[dstAddr, srcAddr, copyTmp]`.
