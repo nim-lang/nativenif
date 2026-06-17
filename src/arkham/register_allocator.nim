@@ -49,7 +49,12 @@ type
                                       ## for symbol defs; the rewrite fills it for EVERY
                                       ## value-producing position (its result location).
     aux*: Table[int, ExprAux]         ## pos → per-op selection aux (see `ExprAux`)
-    symPos*: Table[string, int]       ## local/param name → its def position
+    symPos*: Table[string, int]       ## local/param name → its def position. This IS the
+                                      ## local→cursor-pos mapping: every local read resolves
+                                      ## through `locs[symPos[name]]` (the emitter late-binds via
+                                      ## `locationOfSym`), so undoing a local's register is a
+                                      ## single-point rewrite that every use sees — no scattered
+                                      ## snapshots to reconcile.
     usedCallee*: set[Reg]             ## callee-saved GPRs to save in prologue
     usedCalleeF*: set[FReg]           ## callee-saved SIMD regs (v8–v15) to save in prologue
     frameSize*: int                   ## bytes of stack frame for spilled slots
@@ -89,14 +94,6 @@ type
                                       ## the legacy reactive emitter sees the unchanged
                                       ## (symbol-only) `locs`; the new pure emitter turns it
                                       ## on. See `codegen2_design.md` / `allocValue`.
-    declPass: bool                    ## two-pass split: `true` during PASS A (locals + ABI
-                                      ## homes only — `allocVarDecl`/`allocParams` ALLOCATE).
-                                      ## `false` during PASS B (the expression walk — those
-                                      ## same decls READ their frozen home and merely OCCUPY
-                                      ## its register so temps fit in the gaps). Locals are
-                                      ## thus placed once, globally, before any use-site
-                                      ## snapshot is recorded, so a local home never moves
-                                      ## under a use — the steal/follow-home hazard is gone.
     tmpSpills: int                    ## fresh expression-temp spill-slot counter (when the
                                       ## scratch pool is exhausted during the expr walk)
     retFloatBits: int                 ## value-core rewrite: 0 = the proc returns int/void;
@@ -109,20 +106,6 @@ type
                                       ## allocate an inline `(ret (oconstr …))` value
     atScratch: HashSet[int]           ## value-core: `(at …)` positions needing a scratch GPR
                                       ## (non-SIB element stride); sized by the codegen
-    forceSpill: HashSet[string]       ## PASS A must stack-home these locals so PASS B frees a
-                                      ## callee-saved register for a *survivor* scratch (a &g /
-                                      ## aggregate-arg address that must outlive a call or stay
-                                      ## off the R11 bridge — unlike a stride/aggr-copy scratch,
-                                      ## which comes from emit-time staging). Grown by
-                                      ## `reserveHeldScratch` when the callee-saved pool is empty;
-                                      ## carried across a re-run. Decided in PASS A *before* any
-                                      ## use snapshot, so it needs no `followHome` reconciliation
-                                      ## (the two-pass-clean form of the old reactive steal).
-    needRerun: bool                   ## a `reserveHeldScratch` marked a victim → restart both passes.
-
-  RerunAlloc = object of CatchableError
-    ## raised by `reserveHeldScratch` to abort + restart allocation with one more local
-    ## forced onto the stack (freeing a callee-saved register for a survivor scratch).
 
 proc posOf(b: Builder; c: Cursor): int {.inline.} =
   cursorToPosition(b.buf[], c)
@@ -194,18 +177,6 @@ proc giveBackF(b: var Builder; f: FReg) {.inline.} =
   if f in b.md.floatCalleeSavedSet: b.freeCalleeF.incl f
   elif f != NoFReg: b.freeVolF.incl f
 
-proc occupyReg(b: var Builder; r: Reg) {.inline.} =
-  ## PASS B: mark `r` as held by a now-live local (read from its frozen pass-A
-  ## home), so the temp allocator won't hand it to an expression temporary while
-  ## the local is live. The inverse of `giveBack`; a no-op for a register the
-  ## target keeps out of the temp pools anyway (e.g. a leaf param's arg reg).
-  if r in b.md.intCalleeSavedSet: b.freeCallee.excl r
-  elif r != NoReg: b.freeVol.excl r
-
-proc occupyFReg(b: var Builder; f: FReg) {.inline.} =
-  if f in b.md.floatCalleeSavedSet: b.freeCalleeF.excl f
-  elif f != NoFReg: b.freeVolF.excl f
-
 proc weightOf(b: Builder; name: string): int {.inline.} =
   b.an.vars.getOrDefault(name).weight
 
@@ -248,8 +219,8 @@ proc coldestVictim(b: var Builder; maxW: int; calleeOnly, wantFloat: bool): stri
   ## The lowest-weight live register-resident local (weight strictly below `maxW`)
   ## whose register may be stolen: a non-sealed GPR (`calleeOnly` restricts to the
   ## callee-saved set) or — `wantFloat` — a SIMD register. The victim-selection
-  ## policy behind `trySteal` (local-vs-local, PASS A only). "" when nothing is
-  ## stealable.
+  ## policy behind the local→memory undo (`trySteal` / `reserveHeldScratch`). "" when
+  ## nothing is stealable.
   var bestW = maxW
   result = ""
   for scope in b.scopeVars:
@@ -267,10 +238,11 @@ proc coldestVictim(b: var Builder; maxW: int; calleeOnly, wantFloat: bool): stri
         bestW = vw; result = v
 
 proc demoteToStack(b: var Builder; victim: string) =
-  ## Evict `victim` to a nifasm-managed `(s)` slot, addressed by its own name
-  ## (offsets are nifasm's job). A uniform single-home rewrite of `ra.locs` (one
-  ## home per symbol) — sound across every control-flow path, so it can't recur
-  ## the cross-branch reactive-eviction bug.
+  ## Undo `victim`'s optimistic register assignment: move it to a nifasm-managed `(s)`
+  ## slot addressed by its own name (offsets are nifasm's job). A single-point rewrite
+  ## of `locs[symPos[victim]]` — and because every use reads through `symPos` (the
+  ## emitter late-binds via `locationOfSym`), every use, walked or not, sees the new
+  ## home. Sound across every control-flow path: the home is memory everywhere.
   let vpos = b.ra.symPos[victim]
   b.ra.locs[vpos] = namedStackLoc(victim, b.ra.locs[vpos].typ)
   b.ra.hasStackVars = true
@@ -290,14 +262,13 @@ proc trySteal(b: var Builder; curName: string; curSlot: AsmSlot;
   if bestReg in b.md.intCalleeSavedSet: b.ra.usedCallee.incl bestReg
   result = regLoc(bestReg, curSlot)
 
-# NB the temp-vs-local steal (`stealForTmp`/`stealFForTmp`) is GONE. In the
-# two-pass split a temporary never evicts a live local: locals are placed in
-# PASS A and frozen, so the temp pool already excludes every live-local register
-# (PASS B `occupyReg`s them). When the remaining pool is empty, a temp spills to
-# its OWN slot (see `reserveTmp` below) — single-use, so the spill is uniform and
-# branch-safe, and no use-site snapshot of a local can ever go stale. This is
-# what retires `homeSym`/`followHome` + the anti-steal sealing. Local-vs-local
-# eviction (`trySteal`) stays — it runs only in PASS A, before any use snapshot.
+# A computed temporary NEVER steals a live local. codegen.c proves ~2 registers
+# suffice for all computation; temps draw from the volatile/callee-saved scratch the
+# pool still has free, and when none is free they spill to their OWN `(s)` slot
+# (`reserveTmp` below) — single-use, branch-safe, no local touched. The ONLY undo of a
+# register assignment is local→memory (`trySteal` / `reserveHeldScratch`), decided while
+# allocating locals; that is the whole "we optimistically gave a local a register, then
+# found we have too many, so we undo it" story, and it can never collide with a temp.
 
 # ── expression allocation (value-core rewrite; gated by `allocExprs`) ──────────
 # Mirrors codegen's genVal/gen DECISIONS, recording each value position's result
@@ -322,12 +293,12 @@ proc reserveTmp(b: var Builder; slot: AsmSlot): Location =
   if r == NoReg:
     r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
     if r == NoReg:
-      # pool exhausted (every free reg holds a live local): spill THIS temp to its
-      # own `(s)` slot. A temp is single-use, so the spill is a local, uniform, and
-      # branch-safe transformation — no local is touched. The emitter declares it
-      # (`spillTemps`) and PRODUCES the value position into it through a staging
-      # register (`produceIntoMem2`); `isTemp` marks it a produce-into slot, distinct
-      # from a symbol's stack home left for folding.
+      # pool exhausted (every free reg holds a live local): spill THIS temp to its own
+      # `(s)` slot. A temp is single-use, so the spill is local, uniform and branch-safe
+      # — NO live local is touched (temps never steal locals). The emitter declares it
+      # (`spillTemps`) and PRODUCES the value position into it through a staging register
+      # (`produceIntoMem2`); `isTemp` marks it a produce-into slot, distinct from a
+      # symbol's stack home left for folding.
       let nm = "etmp" & $b.tmpSpills & ".0"; inc b.tmpSpills
       b.ra.hasStackVars = true
       b.ra.spillTemps.add (name: nm, typ: slot, isFloat: false)
@@ -342,19 +313,22 @@ proc reserveHeldScratch(b: var Builder; what: string): Location =
   ## A SURVIVOR scratch: a register that must outlive a call and/or stay off the R11
   ## staging bridge (a &global / aggregate-arg address marshalled THROUGH the bridge,
   ## or held across a ≤16B-result call) — so it cannot come from caller-saved emit-time
-  ## staging (the stride/aggr-copy answer); it must be a pool register (callee-saved on
-  ## x64). When the pool is empty (locals hold every callee-saved reg) we cannot steal
-  ## one mid-pass (that desyncs a use snapshot — the bug class the two-pass split removed);
-  ## instead mark the coldest live local for spilling and RESTART both passes with it
-  ## pre-spilled — decided before PASS B records anything, so no `followHome` is needed.
-  result = b.reserveTmp(ScalarSlot)
-  if result.kind == InReg: return
-  let victim = b.coldestVictim(high(int), calleeOnly = false, wantFloat = false)
+  ## staging (the stride/aggr-copy answer); it must be a CALLEE-SAVED pool register.
+  ## Take a free callee-saved reg, else UNDO a local's optimistic assignment: demote the
+  ## coldest callee-saved-homed local to memory and take its register (the same local→
+  ## memory undo as `trySteal`, sound by the single-home rewrite). Only a genuine
+  ## no-callee-saved-local-left case is fatal.
+  var r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
+  if r != NoReg:
+    b.ra.usedCallee.incl r
+    return regLoc(r, ScalarSlot, isTemp = true)
+  let victim = b.coldestVictim(high(int), calleeOnly = true, wantFloat = false)
   if victim.len == 0:
     raiseAssert "arkham: out of registers for " & what & " (nothing to spill)"
-  b.forceSpill.incl victim
-  b.needRerun = true
-  raise newException(RerunAlloc, what)
+  r = b.ra.locs[b.ra.symPos[victim]].r
+  b.demoteToStack(victim)
+  b.ra.usedCallee.incl r
+  result = regLoc(r, ScalarSlot, isTemp = true)
 
 proc reserveFTmp(b: var Builder; slot: AsmSlot): Location =
   ## A scratch SIMD register for a computed float temporary — the SIMD twin of
@@ -869,11 +843,10 @@ proc allocCond(b: var Builder; n: var Cursor) =
 proc reserveAtScratch(b: var Builder; atPos: int; idxReg: Reg) =
   ## Reserve the GPR for nifasm's 3-operand `(at base idx scratch)` non-SIB stride form
   ## (recorded in `aux[atPos]`). The hard invariant is scratch ≠ BASE (`scratch = base +
-  ## idx*stride` aliases catastrophically otherwise). In the two-pass split this holds by
-  ## construction: the base is a frozen local (PASS A), so PASS B has already `occupy`d its
-  ## register — `reserveTmp` draws from the remaining pool and can never hand out the base
-  ## register (and never evicts a local, so the base can't move under us). nifasm also flags
-  ## a scratch==base collision at assemble time (`at_scratch_base_collision`).
+  ## idx*stride` aliases catastrophically otherwise). It holds because the base is a live
+  ## local whose register is out of the pool, so `reserveTmp` (which draws from the
+  ## remaining pool and never evicts a local) can never hand out the base register. nifasm
+  ## also flags a scratch==base collision at assemble time (`at_scratch_base_collision`).
   ##
   ## scratch == INDEX is permitted: x86 tolerates it (`mov scratch,idx` is a no-op, then
   ## `idx*stride`, then `base+scratch`), and under real pressure it is the ONLY option, so
@@ -1180,11 +1153,11 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
       b.forceRegDest(dest)
       let resDest = dest
       let lvCopy = n                          # for releaseLvalTemps after the load
-      # A destination-passed FIXED register (a register-homed local's home) is NOT a temp
-      # taken out of the pool, so the index/base allocation below could `stealForTmp` it —
-      # stealing the very register this load's result lands in, aliasing the result with one
-      # of its own indices (different types ⇒ a `(mov res[ptr], (mem (at … res[i64])))` that
-      # nifasm rejects). Seal it across the address allocation so the steal picks another.
+      # A destination-passed FIXED register (an arg reg / a register-homed local's home) is
+      # NOT a temp taken out of the pool, so the index/base allocation below could `reserveTmp`
+      # it — landing this load's result on the same register as one of its own indices
+      # (different types ⇒ a `(mov res[ptr], (mem (at … res[i64])))` that nifasm rejects).
+      # Seal it across the address allocation so the index temp picks another.
       let sealedHere = resDest.isTemp == false and resDest.r notin b.ra.sealed
       if sealedHere: b.ra.sealed.incl resDest.r
       allocLvalue2(b, n, resDest)             # embedded base/index regs; a global base
@@ -1505,23 +1478,7 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
     var valCur = n                           # remember the initializer (for allocExprs)
     let hasValue = n.hasMore and n.kind != DotToken   # `.` = explicitly uninitialized
     if n.hasMore: skip n                      # value (analysed in pass 1)
-    if not b.declPass:
-      # PASS B: the local's home was decided (and frozen) in PASS A. Read it back,
-      # OCCUPY its register so an expression temp can't land on a live local, mirror
-      # the scope-free bookkeeping (so the register is reclaimed for temps / a sibling
-      # local at the var's last use), then allocate the initializer's temps through the
-      # one general store path. No (re)allocation, no `trySteal` — locals never move here.
-      let loc = b.ra.locs[pos]
-      if loc.kind == InReg: b.occupyReg(loc.r)
-      elif loc.kind == InFReg: b.occupyFReg(loc.f)
-      b.scopeVars[^1].add name
-      let vi = b.an.vars.getOrDefault(name)
-      if loc.kind in {InReg, InFReg} and not vi.declInLoop:
-        b.pendingFree.add (pos: vi.freeAfter, name: name)
-      if hasValue:
-        var vc = valCur
-        allocStore(b, vc, loc, pos)          # the one general store path
-    elif slot.kind == AMem:
+    if slot.kind == AMem:
       # an aggregate (object/array/named type): a nifasm-managed `(s)` stack
       # var, addressed by name — arkham does not register-allocate it. (No
       # early `return` here: that would skip the `into` epilogue and desync.)
@@ -1532,11 +1489,11 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
         allocStore(b, vc, namedStackLoc(name, slot), pos)   # the one general store path
     else:
       let props = b.an.vars.getOrDefault(name).props
-      # A PASS-B `reserveHeldScratch` that ran out of callee-saved registers for a survivor
-      # scratch marked this local for spilling (`forceSpill`) and restarted; honour it by
-      # stack-homing the local here, freeing its register for that scratch on this re-run.
-      var loc = (if name in b.forceSpill: b.spill(slot) else: b.allocStorage(slot, props))
-      if name notin b.forceSpill and loc.kind == OnStack and AddrTaken notin props and
+      # Optimistically give the local a register; demote a colder one to memory if the
+      # register class is full (`trySteal`, the only undo). A spilled / address-taken
+      # scalar lives in a nifasm-managed `(s)` slot addressed by name.
+      var loc = b.allocStorage(slot, props)
+      if loc.kind == OnStack and AddrTaken notin props and
          slot.inRegClass and not slot.isFloat:
         loc = b.trySteal(name, slot, props, loc)  # hot var evicts a colder one
       if loc.kind == OnStack:
@@ -1806,22 +1763,10 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
             b.ra.hasStackVars = true
           b.record(pos, name, loc)
 
-proc occupyParams(b: var Builder; params: var Cursor) =
-  ## PASS B: walk the params, reading each one's frozen PASS-A home and OCCUPYing
-  ## its register so the temp allocator excludes it (the read twin of `allocParams`).
-  ## Advances `params` past the `(params …)` list.
-  if params.kind != TagLit: return
-  params.into:
-    while params.hasMore:
-      params.into:
-        let loc = b.ra.locs[b.posOf(params)]   # set by allocParams in PASS A
-        if loc.kind == InReg: b.occupyReg(loc.r)
-        elif loc.kind == InFReg: b.occupyFReg(loc.f)
-        while params.hasMore: skip params
-
 proc seedPools(b: var Builder) =
-  ## (Re)fill the four register pools to their full target capacity. Called at the
-  ## start of each pass; PASS B then `occupy`s the registers locals/params hold.
+  ## Fill the four register pools to their full target capacity. As locals are
+  ## declared and params placed, their registers leave the pool; temps draw from
+  ## what remains.
   b.freeVol = {}; b.freeCallee = {}; b.freeVolF = {}; b.freeCalleeF = {}
   for r in b.md.intTempRegs: b.freeVol.incl r
   for r in b.md.intCalleeSaved: b.freeCallee.incl r
@@ -1833,19 +1778,21 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
                    presealed: set[Reg] = {}; allocExprs = false;
                    atScratch: HashSet[int] = initHashSet[int]()): RegAlloc =
   ## Allocate storage for the params, locals and (when `allocExprs`) the expression
-  ## temporaries of `procDecl`, in TWO passes over the tree:
-  ##
-  ##   PASS A — locals + ABI homes. A decls-only walk places every parameter and
-  ##   local in an immutable home (register or stack), using the analyser's global
-  ##   liveness; `trySteal` may demote a colder local to give a hotter one a register,
-  ##   but only here, before any use-site is recorded, so it can never desync a read.
-  ##
-  ##   PASS B — temps + ABI marshalling, over the now-frozen local background. The
-  ##   expression walk allocates single-use temporaries from whatever registers a
-  ##   live local does NOT hold (each decl `occupy`s its home as PASS B reaches it),
-  ##   spilling a temp to its own slot when the pool empties. A temp never evicts a
-  ##   local, so no local home moves under a use — the whole steal/follow-home /
-  ##   anti-steal-sealing hazard class is gone by construction.
+  ## temporaries of `procDecl` in a SINGLE walk over the tree. The model (codegen.c +
+  ## optimistic locals):
+  ##   * Expression temporaries and addressing scratch draw from the volatile/callee-
+  ##     saved registers the pool still has free, and spill to their OWN `(s)` slot when
+  ##     none is free. A temp NEVER takes a live local's register — codegen.c shows ~2
+  ##     registers suffice for all computation, so a temp is always servable.
+  ##   * LOCALS are assigned to registers OPTIMISTICALLY as they are declared. The only
+  ##     undo of a register assignment is local→memory: when we find we have too many
+  ##     locals for a register (a hotter local arrives, or a survivor scratch needs a
+  ##     callee-saved reg), `trySteal`/`reserveHeldScratch` demote a colder local with
+  ##     `demoteToStack` — a single-point `locs[symPos[name]]` rewrite that every use
+  ##     sees (the emitter late-binds local reads via `locationOfSym`). Sound across all
+  ##     control flow because the demoted local lives in memory everywhere.
+  ## Because temps and locals never contend for the same register, there is no temp-vs-
+  ## local collision class to reason about — the simple, effective solution.
   ##
   ## `md` describes the target register file + ABI. `presealed` registers are
   ## reserved for the whole proc. `prog` is `var` because resolving a cross-module
@@ -1853,60 +1800,33 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
   ## non-SIB stride scratch GPR.
   var b = Builder(buf: addr buf, an: addr an, prog: addr prog, tc: tc, md: md,
                   atScratch: atScratch)
-
-  template walkProc(isDeclPass: bool) =
-    ## One pass over `(proc name params rettype pragmas body)`. PASS A allocates the
-    ## decls; PASS B reads them and allocates the expression temps + ABI.
-    b.declPass = isDeclPass
-    b.allocExprs = (allocExprs and not isDeclPass)   # expr alloc only in PASS B
-    b.ra.sealed = presealed
-    b.scopeVars = @[]; b.pendingFree = @[]; b.freedSyms = initHashSet[string]()
-    b.tmpSpills = 0
-    b.seedPools()
-    var n = procDecl
-    assert n.stmtKind == ProcS
-    b.openScope()
-    n.into:
-      inc n                                  # name
-      if isDeclPass: allocParams(b, n, an.hasCall)
-      else: occupyParams(b, n)
-      if n.kind == TagLit:                    # a float return goes to xmm0 (value-core)
-        let rtSlot = slotOf(prog, n)
-        if rtSlot.isFloat: b.retFloatBits = rtSlot.size * 8
-      elif n.kind == Symbol:                  # named-type return; aggregate → regs / hidden ptr
-        let rtSlot = slotOf(prog, n)
-        if rtSlot.kind == AMem:
-          b.retAggr = true
-          b.retAggrSlot = rtSlot
-          if rtSlot.size > md.aggrByRefThreshold: b.retIndirect = true
-      skip n                                  # return type
-      skip n                                  # pragmas
-      walk(b, n)                              # body
-    b.closeScope()
-
-  # Restart loop: a PASS-B `reserveHeldScratch` that exhausts the callee-saved pool for a
-  # survivor scratch records a victim local in `forceSpill` and raises `RerunAlloc`; we then
-  # rebuild from scratch with that local pre-spilled (PASS A honours `forceSpill`). `forceSpill`
-  # grows by one each round and a spilled local is no longer a steal/spill candidate, so this
-  # converges in ≤ #locals rounds. In practice it never fires (the arc corpus is OOR-free).
-  var rounds = 0
-  while true:
-    b.ra = RegAlloc(locs: newSeq[Location](buf.len),
-                    aux: initTable[int, ExprAux](),
-                    symPos: initTable[string, int]())
-    b.needRerun = false
-    try:
-      walkProc(isDeclPass = true)             # PASS A: locals + params (immutable)
-      if allocExprs:
-        walkProc(isDeclPass = false)          # PASS B: temps + ABI over the frozen locals
-      break
-    except RerunAlloc:
-      inc rounds
-      when defined(arkhamDbgRerun):
-        stderr.writeLine "[arkham] pass-A spill restart #" & $rounds & " forceSpill=" & $b.forceSpill
-      if rounds > buf.len:                     # defensive: cannot exceed #decls
-        raiseAssert "arkham: register allocation failed to converge"
-      # `b.forceSpill` carried the new victim; loop and rebuild.
+  b.allocExprs = allocExprs
+  b.ra = RegAlloc(locs: newSeq[Location](buf.len),
+                  aux: initTable[int, ExprAux](),
+                  symPos: initTable[string, int]())
+  b.ra.sealed = presealed
+  b.scopeVars = @[]; b.pendingFree = @[]; b.freedSyms = initHashSet[string]()
+  b.tmpSpills = 0
+  b.seedPools()
+  var n = procDecl
+  assert n.stmtKind == ProcS
+  b.openScope()
+  n.into:
+    inc n                                    # name
+    allocParams(b, n, an.hasCall)
+    if n.kind == TagLit:                      # a float return goes to xmm0 (value-core)
+      let rtSlot = slotOf(prog, n)
+      if rtSlot.isFloat: b.retFloatBits = rtSlot.size * 8
+    elif n.kind == Symbol:                    # named-type return; aggregate → regs / hidden ptr
+      let rtSlot = slotOf(prog, n)
+      if rtSlot.kind == AMem:
+        b.retAggr = true
+        b.retAggrSlot = rtSlot
+        if rtSlot.size > md.aggrByRefThreshold: b.retIndirect = true
+    skip n                                    # return type
+    skip n                                    # pragmas
+    walk(b, n)                                # body
+  b.closeScope()
   result = ensureMove b.ra
 
 # ── lookup API (used by codegen) ────────────────────────────────────────────
