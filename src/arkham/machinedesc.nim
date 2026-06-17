@@ -119,14 +119,6 @@ type
     of Undef, NeedsReg, RegOrImm: discard
     of InReg:
       r*: Reg
-      homeSym*: string       ## "" = a genuine temp / computed value. Non-empty = this
-                             ## register snapshot IS the live home of local `homeSym`,
-                             ## captured when the use was allocated. A later `stealForTmp`
-                             ## may demote that local to its stack slot (re-pointing the
-                             ## symbol's *def* home), leaving this use-site snapshot stale;
-                             ## the emitter follows `homeSym` via `locationOfSym` at use
-                             ## (`followHome`) so a steal is the single source of truth —
-                             ## no allocator-side `locs` reconciliation walk needed.
     of InFReg: f*: FReg
     of OnStack: offset*: int
     of NamedStack, Glob, Tvar: name*: string

@@ -1658,12 +1658,20 @@ proc emitBitBuiltin2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
     raiseAssert "arkham x64n: bit builtin not yet implemented: " & builtin
 
 proc proctypeOfTarget(g: var CodeGen; targetCur: Cursor): Cursor =
-  ## The resolved proctype body of an indirect call target (a `(cast Proctype fnptr)`
-  ## function-pointer expression), for ABI queries.
-  var ptType = targetCur
+  ## The resolved proctype body of an indirect call target, for ABI queries. Two target
+  ## shapes: a `(cast Proctype fnptr)` (vtable load) carries the proctype as its cast
+  ## TARGET TYPE; any other fn-ptr EXPRESSION (e.g. a closure's `(dot clo fld.0)` proc
+  ## field) carries it as the expression's TYPE — so resolve `getType(expr)`, not the
+  ## expression itself. A `(ptr proctype)` field type is peeled to the proctype body.
+  var ptType: Cursor
   if targetCur.kind == TagLit and targetCur.exprKind in {CastC, ConvC}:
     ptType = targetCur; inc ptType                       # the cast's target type
+  else:
+    ptType = g.getType(targetCur)                        # the fn-ptr expression's type
   result = resolveType(g.prog, ptType)
+  if result.kind == TagLit and result.typeKind != ProctypeT:
+    var inner = result; inc inner                        # peel `(ptr proctype)` → proctype
+    result = resolveType(g.prog, inner)
   assert result.kind == TagLit and result.typeKind == ProctypeT,
     "arkham x64n: indirect call target is not a proctype"
 
@@ -1934,24 +1942,6 @@ proc produceIntoMem2(g: var CodeGen; c: Cursor; pos: int; dst: Location) =
   g.ra.locs[pos] = dst                   # restore the slot location for the consumer
   g.emitStoreLoc(dst, s)                 # spill the produced value to its `(s)` slot
   g.giveBack s                           # unbind the staging name
-
-proc followHome(g: var CodeGen; pos: int): Location =
-  ## Resolve a Symbol use-site snapshot (`locs[pos]`) to the local's CURRENT home.
-  ## A snapshot tagged `homeSym` (see `Location.homeSym`) named the local's register
-  ## home when the use was allocated; a later `stealForTmp` may have demoted the local
-  ## to its stack slot (e.g. to free the register for an `(at)` stride scratch), moving
-  ## the symbol's *def* home but leaving this use-site copy stale. Follow it: if the home
-  ## left the snapshot register, return — and re-sync `locs[pos]` to — the current home
-  ## (its stack slot, which `reloadMemBase2` then loads into a fresh staging reg ≠ the
-  ## scratch). A no-op when the local kept its register, so non-stolen snapshots and plain
-  ## temps are unaffected. Replaces the allocator's old `resyncAddrLocs` tree-walk —
-  ## a steal is now the single source of truth, resolved lazily at use.
-  result = g.ra.locs[pos]
-  if result.kind == InReg and result.homeSym.len > 0:
-    let cur = g.ra.locationOfSym(result.homeSym)
-    if cur.kind != Undef and not (cur.kind == InReg and cur.r == result.r):
-      result = cur
-      g.ra.locs[pos] = cur
 
 proc emitValue2(g: var CodeGen; c: Cursor) =
   ## Ensure `c`'s value is materialized at its precomputed `locs[pos]`. A leaf whose
@@ -2253,8 +2243,8 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
           else:                                         # register index (pre-loaded by premat)
             g.emReg g.ra.locs[cursorToPosition(g.buf[], cc)].r
           skip cc
-          if g.ra.aux.hasKey(atPos) and g.ra.aux[atPos].scratch.len > 0:
-            g.emReg g.ra.aux[atPos].scratch[0]          # 3-operand form: non-SIB stride scratch
+          if g.lvalStride.hasKey(atPos):
+            g.emReg g.lvalStride[atPos]                 # 3-operand form: non-SIB stride scratch
           while cc.hasMore: skip cc
     of DerefC:
       var pointee = g.getType(c)                        # deref result = the pointee type
@@ -2286,8 +2276,8 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
           else:                                         # register index (pre-loaded by premat)
             g.emReg g.ra.locs[cursorToPosition(g.buf[], cc)].r
           skip cc
-          if g.ra.aux.hasKey(patPos) and g.ra.aux[patPos].scratch.len > 0:
-            g.emReg g.ra.aux[patPos].scratch[0]         # 3-operand form: non-SIB stride scratch
+          if g.lvalStride.hasKey(patPos):
+            g.emReg g.lvalStride[patPos]                # 3-operand form: non-SIB stride scratch
           while cc.hasMore: skip cc
     of BaseobjC:
       # `(baseobj BaseType depth lvalue)` — an object→base view. The base sub-object is at
@@ -2314,13 +2304,13 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
   else: raiseAssert "arkham x64n: emLvalAddr2 kind " & $c.kind
 
 proc reloadMemBase2(g: var CodeGen; pos: int) =
-  ## A `deref`/`pat`/`at` pointer base or register index whose local was demoted to
-  ## its stack home by a `stealForTmp` arrives here as a `NamedStack`/`Mem` location,
-  ## but `[reg]` addressing needs it in a register. Load it into a sealed staging reg,
-  ## point its location at that reg for the lval emission, and park the original home
-  ## in `savedHomes` so `restoreMemBase2` (via `unbindLvalTemps2`) puts it back — the
-  ## local keeps its stack home for its other uses.
-  let loc = g.followHome(pos)              # a stolen register-home → its current (stack) home
+  ## A `deref`/`pat`/`at` pointer base or register index the allocator left in a
+  ## `NamedStack`/`Mem` home (a genuinely spilled pointer) must be in a register for
+  ## `[reg]` addressing. Load it into a sealed staging reg, point its location at that
+  ## reg for the lval emission, and park the original home in `savedHomes` so
+  ## `restoreMemBase2` (via `unbindLvalTemps2`) puts it back. (A register-homed base is
+  ## the common case and returns immediately — no steal can move it under us anymore.)
+  let loc = g.ra.locs[pos]
   if loc.kind notin {NamedStack, Mem}: return
   let s = g.pickStagingSealed("a memory address base/index")
   g.emitLoadLoc(loc, s)
@@ -2334,16 +2324,37 @@ proc restoreMemBase2(g: var CodeGen; pos: int) =
     g.ra.locs[pos] = g.savedHomes[pos]
     g.savedHomes.del pos
 
+proc takeLvalStride(g: var CodeGen; c: Cursor; atPos: int) =
+  ## Reserve the non-SIB `(at/pat base idx scratch)` stride scratch from the emit-time
+  ## STAGING set (the always-free R11 bridge + free caller-saved), NOT a pool register
+  ## the allocator handed out — so it cannot starve when register-homed locals fill the
+  ## pool (the x64 trepro `out of registers for an index stride scratch` case). Sealed +
+  ## bound BEFORE the base/index are materialized, so their (possibly spilled) reloads
+  ## via `pickStagingScratch` pick OTHER staging regs and never alias the scratch (the
+  ## Bug-J disjointness invariant — nifasm also rejects scratch==base at assemble time).
+  ## A nested `(at (at …) …)` nests fine: each level seals its own scratch, so the inner
+  ## level's pick avoids the outer's. Released by `dropLvalStride` after the `(mem …)`.
+  if not g.atNeedsScratch(c): return
+  let s = g.pickStagingScratch()
+  if s == NoReg: raiseAssert "arkham x64: no staging register for an (at) stride scratch"
+  g.ra.seal s
+  g.bindTemp(s, AsmSlot(cls: AInt, size: 8, align: 8))
+  g.lvalStride[atPos] = s
+
+proc dropLvalStride(g: var CodeGen; atPos: int) =
+  ## Release a `takeLvalStride` scratch after the consuming `(mem …)`/`(lea …)`.
+  if g.lvalStride.hasKey(atPos):
+    let s = g.lvalStride[atPos]
+    g.unbindTemp(s)
+    g.ra.unseal s
+    g.lvalStride.del atPos
+
 proc prematAddrVal2(g: var CodeGen; c: Cursor) =
   ## Materialize an lvalue base/index value `c` into a register for the enclosing
-  ## `(mem …)`. `followHome` FIRST re-points a stolen register-home snapshot at its
-  ## current (stack) home — so the `emitValue2` below does NOT load the value back into
-  ## the snapshot register (which a `stealForTmp` may have handed to the `(at)` stride
-  ## scratch); `reloadMemBase2` then brings that stack home into a fresh staging reg ≠
-  ## the scratch. Scoped to the lvalue tree (NOT general `emitValue2`), exactly like the
-  ## old `resyncAddrLocs`: a plain operand snapshot keeps its reg-promise.
+  ## `(mem …)`. A register-homed base materializes in place; a genuinely spilled base
+  ## (`NamedStack`/`Mem`) is brought into a staging reg by `reloadMemBase2`. Scoped to
+  ## the lvalue tree (NOT general `emitValue2`).
   let pos = cursorToPosition(g.buf[], c)
-  discard g.followHome(pos)
   g.emitValue2(c)
   g.reloadMemBase2(pos)
 
@@ -2374,13 +2385,7 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
         while cc.hasMore: skip cc
     of AtC:
       let atPos = cursorToPosition(g.buf[], c)
-      if g.ra.aux.hasKey(atPos) and g.ra.aux[atPos].scratch.len > 0:
-        # Bind the non-SIB stride scratch FIRST (names a checked temp for `(at … scratch)`).
-        # It MUST precede the base/index materialization: a demoted (stolen) base/index is
-        # reloaded by `reloadMemBase2` into a staging reg via `pickStagingScratch`, which
-        # avoids `boundTemps` — binding the scratch now keeps that reload off the scratch's
-        # register (else base/idx staging could land on the scratch and alias it).
-        g.bindTemp(g.ra.aux[atPos].scratch[0], AsmSlot(cls: AInt, size: 8, align: 8))
+      g.takeLvalStride(c, atPos)                        # non-SIB stride scratch ← emit-time staging
       var cc = c
       cc.into:
         g.prematLval2(cc); skip cc                      # base
@@ -2389,9 +2394,7 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
         while cc.hasMore: skip cc
     of PatC:
       let patPos = cursorToPosition(g.buf[], c)
-      if g.ra.aux.hasKey(patPos) and g.ra.aux[patPos].scratch.len > 0:
-        # Bind the stride scratch FIRST (same reload-collision guard as AtC).
-        g.bindTemp(g.ra.aux[patPos].scratch[0], AsmSlot(cls: AInt, size: 8, align: 8))
+      g.takeLvalStride(c, patPos)                       # non-SIB stride scratch ← emit-time staging
       var cc = c
       cc.into:
         g.prematAddrVal2(cc)                            # the pointer → its register (follow steals)
@@ -2430,8 +2433,7 @@ proc unbindLvalTemps2(g: var CodeGen; c: Cursor) =
           let il = g.ra.locs[idxPos]
           if il.kind == InReg and il.isTemp: g.unbindTemp(il.r)
         while cc.hasMore: skip cc
-      if g.ra.aux.hasKey(atPos) and g.ra.aux[atPos].scratch.len > 0:
-        g.unbindTemp(g.ra.aux[atPos].scratch[0])        # the non-SIB stride scratch
+      g.dropLvalStride(atPos)                            # the non-SIB stride scratch
     of DerefC:
       var cc = c
       cc.into:
@@ -2455,8 +2457,7 @@ proc unbindLvalTemps2(g: var CodeGen; c: Cursor) =
           let il = g.ra.locs[idxPos]
           if il.kind == InReg and il.isTemp: g.unbindTemp(il.r)
         while cc.hasMore: skip cc
-      if g.ra.aux.hasKey(patPos) and g.ra.aux[patPos].scratch.len > 0:
-        g.unbindTemp(g.ra.aux[patPos].scratch[0])        # the non-SIB stride scratch
+      g.dropLvalStride(patPos)                            # the non-SIB stride scratch
     of BaseobjC:                                        # transparent: release the inner lvalue
       var cc = c
       cc.into:
@@ -3196,21 +3197,23 @@ proc dstAggrInfo(g: var CodeGen; dst: Location): (bool, int) =
   else: (false, 0)
 
 proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size, auxPos: int) =
-  ## THE whole-aggregate copy `dst = rhs`: reduce BOTH sides to
-  ## an address in a register (`aggrAddrLoc`/`aggrAddrInto` — the one `gen_addr`), then
-  ## `copyAggr`. ONE path for every (destination form × source form); the allocator
-  ## reserved `[dstAddr, srcAddr]`. The per-field transfer register is the staging bridge
-  ## (R11), picked here — both addresses are already in `a[0]`/`a[1]`, so the bridge is
-  ## free — sparing a pool GPR so the copy fits under high register pressure.
-  let a = g.ra.aux[auxPos].scratch
-  g.bindTemp(a[0], ScalarSlot); g.aggrAddrLoc(dst, a[0])         # &dst
-  g.bindTemp(a[1], ScalarSlot)
-  g.aggrAddrInto(rhs, a[1], AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)  # &rhs
+  ## THE whole-aggregate copy `dst = rhs`: reduce BOTH sides to an address in a register
+  ## (`aggrAddrLoc`/`aggrAddrInto` — the one `gen_addr`), then `copyAggr`. ONE path for
+  ## every (destination form × source form). All three working registers — the two
+  ## addresses and the per-field transfer reg — come from the emit-time STAGING set (the
+  ## R11 bridge + free caller-saved), NOT the allocator pool, so the copy never starves
+  ## when register-homed locals fill the pool. Each is sealed before the next is picked
+  ## (and before address computation, which may itself stage), so they stay disjoint.
+  let dstAddr = g.pickStagingSealed("an aggregate-copy dst address")
+  g.bindTemp(dstAddr, ScalarSlot); g.aggrAddrLoc(dst, dstAddr)   # &dst
+  let srcAddr = g.pickStagingSealed("an aggregate-copy src address")
+  g.bindTemp(srcAddr, ScalarSlot)
+  g.aggrAddrInto(rhs, srcAddr, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)  # &rhs
   let tmp = g.pickStagingSealed("an aggregate-copy transfer register")
   g.bindTemp(tmp, AsmSlot(cls: AUInt, size: 8, align: 8))
-  g.copyAggr(a[0], a[1], size, tmp)
+  g.copyAggr(dstAddr, srcAddr, size, tmp)
   g.giveBack tmp                                                 # unbinds + unseals the bridge
-  g.unbindTemp(a[1]); g.unbindTemp(a[0])
+  g.giveBack srcAddr; g.giveBack dstAddr                         # unbind + unseal
 
 proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
   ## The general destination-passing store of the value core. An aggregate COPY (symbol /
@@ -3988,6 +3991,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.ab.planning = false
   g.regLocal.clear(); g.aliasToDecl.clear(); g.boundTemps = {}; g.scopeLocals = @[]
   g.fregLocal.clear(); g.boundFTmps = {}; g.scopeFLocals = @[]; g.savedHomes.clear()
+  g.lvalStride.clear()
   g.tmpBindCount = 0; g.ftmpBindCount = 0
   when defined(arkhamDbgProc):
     block:

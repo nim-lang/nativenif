@@ -108,7 +108,20 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
     of CallC:
       var t = c
       t.into:
-        result = tc.callTarget[].getOrDefault(symName(t)).retType
+        let callee = symName(t)
+        if tc.callTarget[].hasKey(callee):
+          result = tc.callTarget[][callee].retType
+        else:
+          # A foreign call whose target the emitter hasn't lazily cached yet (allocation
+          # runs before the call is emitted): resolve its return type from the owning
+          # module now and cache it (the emitter reuses the entry). Needed e.g. for a
+          # global var initialized by a cross-module call (`var s = newStringStream()`).
+          if isForeignSym(tc.prog[], callee):
+            let ct = foreignCallTarget(tc.prog[], callee)
+            tc.callTarget[][callee] = ct
+            result = ct.retType
+          else:
+            result = tc.callTarget[].getOrDefault(callee).retType
         while t.hasMore: skip t
     of NilC: result = tc.prog[].voidPtr       # nil → a generic pointer type
     of AddrC:                                 # &lvalue → (ptr <type-of-lvalue>)

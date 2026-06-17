@@ -408,6 +408,12 @@ proc lookupForeignDecl*(p: var Program; name: string; found: var bool): Cursor =
   p.requestedForeign.add (name, result)
   found = true
 
+proc isForeignSym*(p: Program; name: string): bool =
+  ## True if `name`'s qualified module is a DIFFERENT module than the one being
+  ## compiled (so it must be resolved via its owning module, not the local tables).
+  let s = splitSymName(name)
+  s.module.len > 0 and s.module != p.scheme.name
+
 proc foreignCallTarget*(p: var Program; name: string): CallTarget =
   ## Resolve a cross-module proc reference to a callable target by loading its
   ## declaration from the owning module's embedded index. The asm symbol is the

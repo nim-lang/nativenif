@@ -4340,7 +4340,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
 
     if dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
-        x86.emitAddImm(ctx.buf.data, dest.mem, int32(op.immVal))  # ADD m64, imm32
+        x86.emitAddImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)  # ADD m, imm (sized)
       elif op.kind == okSsize:
         error("Adding ssize to memory not supported", n)
       elif op.kind == okMem:
@@ -4372,7 +4372,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
 
     if dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
-        x86.emitSubImm(ctx.buf.data, dest.mem, int32(op.immVal))  # SUB m64, imm32
+        x86.emitSubImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)  # SUB m, imm (sized)
       elif op.kind == okSsize:
         error("Subtracting ssize from memory not supported", n)
       elif op.kind == okMem:
@@ -4470,7 +4470,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseCompatible(dest.typ, op.typ, "and", start)
     if dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
-        x86.emitAndImm(ctx.buf.data, dest.mem, int32(op.immVal))  # AND m64, imm32
+        x86.emitAndImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)  # AND m, imm (sized)
       elif op.kind == okMem:
         error("Cannot AND memory to memory", n)
       else:
@@ -4492,7 +4492,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseCompatible(dest.typ, op.typ, "or", start)
     if dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
-        x86.emitOrImm(ctx.buf.data, dest.mem, int32(op.immVal))   # OR m64, imm32
+        x86.emitOrImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)   # OR m, imm (sized)
       elif op.kind == okMem:
         error("Cannot OR memory to memory", n)
       else:
@@ -4514,7 +4514,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseCompatible(dest.typ, op.typ, "xor", start)
     if dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
-        x86.emitXorImm(ctx.buf.data, dest.mem, int32(op.immVal))  # XOR m64, imm32
+        x86.emitXorImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)  # XOR m, imm (sized)
       elif op.kind == okMem:
         error("Cannot XOR memory to memory", n)
       else:
@@ -4651,7 +4651,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkCmpCompatible(dest.typ, op.typ, start)
     if dest.kind == okMem:
       if op.kind == okImm:
-        x86.emitCmpImm(ctx.buf.data, dest.mem, int32(op.immVal))  # CMP m64, imm32 (81 /7)
+        x86.emitCmpImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)  # CMP m, imm (sized)
       elif op.kind == okMem:
         error("Cannot compare memory with memory", n)
       else:

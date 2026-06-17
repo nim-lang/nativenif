@@ -1186,29 +1186,12 @@ proc storeFReg2(g: var CodeGen; dst: Location; src: FReg; bits: int) =
 
 # ── lvalue addressing (mirrors x64 emLvalAddr2/prematLval2/unbindLvalTemps2) ──
 
-proc followHome(g: var CodeGen; pos: int): Location =
-  ## Resolve a Symbol use-site snapshot (`locs[pos]`) to the local's CURRENT home.
-  ## A snapshot tagged `homeSym` (see `Location.homeSym`) named the local's register
-  ## home when the use was allocated; a later `stealForTmp` may have demoted the local
-  ## to its stack slot (e.g. to free the register for an `(at)` stride scratch), moving
-  ## the symbol's *def* home but leaving this use-site copy stale. Follow it: if the home
-  ## left the snapshot register, return — and re-sync `locs[pos]` to — the current home
-  ## (its stack slot, which `reloadMemBase2` then loads into a fresh bridge ≠ the scratch).
-  ## A no-op when the local kept its register, so non-stolen snapshots and plain temps are
-  ## unaffected. Replaces the allocator's old `resyncAddrLocs` tree-walk — a steal is now
-  ## the single source of truth, resolved lazily at use.
-  result = g.ra.locs[pos]
-  if result.kind == InReg and result.homeSym.len > 0:
-    let cur = g.ra.locationOfSym(result.homeSym)
-    if cur.kind != Undef and not (cur.kind == InReg and cur.r == result.r):
-      result = cur
-      g.ra.locs[pos] = cur
-
 proc reloadMemBase2(g: var CodeGen; pos: int) =
   ## A deref/at/pat base or register index the allocator spilled (NamedStack/Mem)
   ## must be in a register for `[reg]` addressing: load it into a bridge, repoint
-  ## its location, and park the home so `restoreMemBase2` puts it back.
-  let loc = g.followHome(pos)             # a stolen register-home → its current (stack) home
+  ## its location, and park the home so `restoreMemBase2` puts it back. (A register-
+  ## homed base returns immediately — no steal can move it under us anymore.)
+  let loc = g.ra.locs[pos]
   if loc.kind notin {NamedStack, Mem}: return
   let s = g.takeBridge(loc.typ)
   g.place2(loc, s)
@@ -1223,14 +1206,10 @@ proc restoreMemBase2(g: var CodeGen; pos: int) =
 
 proc prematAddrVal2(g: var CodeGen; c: Cursor) =
   ## Materialize an lvalue base/index value `c` into a register for the enclosing
-  ## `(mem …)`. `followHome` FIRST re-points a stolen register-home snapshot at its
-  ## current (stack) home — so the `emitValue2` below does NOT load the value back into
-  ## the snapshot register (which a `stealForTmp` may have handed to the `(at)` stride
-  ## scratch); `reloadMemBase2` then brings that stack home into a fresh bridge ≠ the
-  ## scratch. Scoped to the lvalue tree (NOT general `emitValue2`), exactly like the old
-  ## `resyncAddrLocs`: a plain operand snapshot keeps its reg-promise.
+  ## `(mem …)`. A register-homed base materializes in place; a genuinely spilled base
+  ## (`NamedStack`/`Mem`) is brought into a bridge by `reloadMemBase2`. Scoped to the
+  ## lvalue tree (NOT general `emitValue2`).
   let pos = g.posOf(c)
-  discard g.followHome(pos)
   g.emitValue2(c)
   g.reloadMemBase2(pos)
 
@@ -2011,12 +1990,20 @@ proc emitAtomic2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
   else: raiseAssert "arkham a64n: unsupported atomic builtin: " & builtin
 
 proc proctypeOfTarget(g: var CodeGen; targetCur: Cursor): Cursor =
-  ## The resolved proctype body of an indirect call target (a `(cast Proctype fnptr)`
-  ## function-pointer expression), for ABI queries.
-  var ptType = targetCur
+  ## The resolved proctype body of an indirect call target, for ABI queries. Two target
+  ## shapes: a `(cast Proctype fnptr)` (vtable load) carries the proctype as its cast
+  ## TARGET TYPE; any other fn-ptr EXPRESSION (e.g. a closure's `(dot clo fld.0)` proc
+  ## field) carries it as the expression's TYPE — so resolve `getType(expr)`, not the
+  ## expression itself. A `(ptr proctype)` field type is peeled to the proctype body.
+  var ptType: Cursor
   if targetCur.kind == TagLit and targetCur.exprKind in {CastC, ConvC}:
     ptType = targetCur; inc ptType                       # the cast's target type
+  else:
+    ptType = g.getType(targetCur)                        # the fn-ptr expression's type
   result = resolveType(g.prog, ptType)
+  if result.kind == TagLit and result.typeKind != ProctypeT:
+    var inner = result; inc inner                        # peel `(ptr proctype)` → proctype
+    result = resolveType(g.prog, inner)
   assert result.kind == TagLit and result.typeKind == ProctypeT,
     "arkham a64n: indirect call target is not a proctype"
 

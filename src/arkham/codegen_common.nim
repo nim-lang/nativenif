@@ -107,11 +107,19 @@ type
                                              ## bindings (`ftmpN.0`); bumped in BOTH passes.
     scopeFLocals*: seq[seq[tuple[name: string, f: FReg]]]  ## per-scope float register locals to `kill`
     savedHomes*: Table[int, Location]        ## value-core pure path: a deref/at/pat base or
-                                             ## index whose local was demoted to its stack home
-                                             ## by a `stealForTmp` is loaded into a transient
-                                             ## staging reg for the lval emission; its original
-                                             ## `NamedStack`/`Mem` home is parked here (keyed by
-                                             ## value position) and restored by `unbindLvalTemps2`.
+                                             ## index left in its stack home by the allocator is
+                                             ## loaded into a transient staging reg for the lval
+                                             ## emission; its original `NamedStack`/`Mem` home is
+                                             ## parked here (keyed by value position) and restored
+                                             ## by `unbindLvalTemps2`.
+    lvalStride*: Table[int, Reg]             ## x64: the non-SIB `(at/pat base idx scratch)` stride
+                                             ## scratch is picked from the emit-time STAGING set
+                                             ## (the always-free R11 bridge + free caller-saved),
+                                             ## NOT reserved by the allocator from the local-
+                                             ## competing temp pool — so it never starves under
+                                             ## register pressure. Keyed by the at/pat position,
+                                             ## populated in `prematLval2`, consumed by
+                                             ## `emLvalAddr2`, released by `unbindLvalTemps2`.
     hasGlobalInits*: bool                     ## the module has runtime (non-static) global
                                              ## initializers, emitted as a synthetic init
                                              ## proc the entry calls (see `buildGlobalInitProc`)
