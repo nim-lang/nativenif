@@ -120,6 +120,12 @@ type
                                              ## register pressure. Keyed by the at/pat position,
                                              ## populated in `prematLval2`, consumed by
                                              ## `emLvalAddr2`, released by `unbindLvalTemps2`.
+    lvalGlobBase*: Table[int, Reg]           ## x64: the address of a module-level global
+                                             ## aggregate base used in a transient LOAD (e.g. a
+                                             ## float field read whose result is an xmm, so the
+                                             ## GPR address can't be the result reg). Sourced from
+                                             ## emit-time STAGING (R11 bridge), NOT a survivor pool
+                                             ## reg — same lifecycle/rationale as `lvalStride`.
     hasGlobalInits*: bool                     ## the module has runtime (non-static) global
                                              ## initializers, emitted as a synthetic init
                                              ## proc the entry calls (see `buildGlobalInitProc`)
@@ -325,17 +331,27 @@ proc retIsVoid*(t: Cursor): bool {.inline.} =
 
 proc constLitBits*(c: Cursor): uint64 =
   ## Raw bits of a scalar literal, unwrapping `(suf value "type")` / `(par …)` and
-  ## value-preserving reinterprets `(cast Type value)` / `(conv Type value)` — e.g.
-  ## `cast[ptr CFile](1)` (a fd encoded as a pointer) collapses to the bits of `1`.
+  ## reinterprets `(cast Type value)` (e.g. `cast[ptr CFile](1)` collapses to the bits
+  ## of `1`). A `(conv Type value)` is value-preserving for a same-class conversion, but
+  ## a class-CHANGING conversion — int↔float — is a NUMERIC conversion (`(conv (f 64) 123)`
+  ## ⇒ the bits of `123.0`, NOT of the integer `123`), so the outermost conv's target
+  ## class is tracked and applied to the base literal.
   var v = c
+  var convTargetFloat = -1                             # -1 unknown / 0 int-class / 1 float-class
   while v.kind == TagLit and v.exprKind in {SufC, ParC, CastC, ConvC}:
-    if v.exprKind in {CastC, ConvC}: (inc v; skip v)   # past the tag + target type
-    else: inc v                                        # descend to the wrapped value
+    if v.exprKind == ConvC:
+      var t = v; inc t                                 # → target type
+      if convTargetFloat < 0:                          # remember the OUTERMOST conv's target class
+        convTargetFloat = (if t.kind == TagLit and t.typeKind == FT: 1 else: 0)
+      skip t; v = t                                    # → the wrapped value
+    elif v.exprKind == CastC: (inc v; skip v)          # bit-reinterpret: past tag + target type
+    else: inc v                                        # suf/par: descend to the wrapped value
+  var rawFloat = false
   case v.kind
   of IntLit:   result = cast[uint64](intVal(v))
   of UIntLit:  result = uintVal(v)
   of CharLit:  result = uint64(ord(charLit(v)))
-  of FloatLit: result = cast[uint64](floatVal(v))
+  of FloatLit: (result = cast[uint64](floatVal(v)); rawFloat = true)
   of TagLit:
     case v.exprKind
     of TrueC:  result = 1'u64
@@ -344,6 +360,11 @@ proc constLitBits*(c: Cursor): uint64 =
     of NegC:   (inc v; result = cast[uint64](-cast[int64](constLitBits(v))))
     else: raiseAssert "arkham const: unsupported scalar " & $v.exprKind
   else: raiseAssert "arkham const: unsupported literal kind " & $v.kind
+  # Apply a class-changing int↔float conversion against the base literal's class.
+  if convTargetFloat == 1 and not rawFloat:
+    result = cast[uint64](float64(cast[int64](result)))   # int → float (123 ⇒ 123.0)
+  elif convTargetFloat == 0 and rawFloat:
+    result = cast[uint64](int64(cast[float64](result)))   # float → int (truncating)
 
 proc branchImm*(c: var Cursor): int64 =
   ## A Leng `BranchValue` for a `case`: a Number / CharLiteral / `(true)` / `(false)`

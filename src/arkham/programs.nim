@@ -84,6 +84,7 @@ type
     uintType*: Cursor                       ## synthesized `(u 64)` — type of a bare UIntLit
     charType*: Cursor                       ## synthesized `(c 8)`  — type of a bare CharLit
     floatType*: Cursor                      ## synthesized `(f 64)` — type of a bare FloatLit
+    boolType*: Cursor                       ## synthesized `(bool)` — type of a `(true)`/`(false)` literal
 
   TypeEnv* = Table[string, Cursor]          ## a type-symbol table
 
@@ -237,6 +238,8 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     result.charType = beginRead(ctBuf)
     var ftBuf = parseFromBuffer("(f 64)", "", sharedTags = tags)
     result.floatType = beginRead(ftBuf)
+    var btBuf = parseFromBuffer("(bool)", "", sharedTags = tags)
+    result.boolType = beginRead(btBuf)
   assert buf.beginRead().stmtKind == StmtsS, "Leng top level must be (stmts …)"
   # Pass 1: register every type declaration. Procs (pass 2) resolve their
   # param/return types via `isDeclarativeAbi`, and a proc may reference a type

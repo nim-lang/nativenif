@@ -602,8 +602,10 @@ proc allocFValue(b: var Builder; n: var Cursor; dest: var Location) =
   of FloatLit:
     if dest.kind != InFReg:
       dest = b.reserveFTmp(if dest.typ.kind == AFloat: dest.typ else: floatSlot(64))
-    # The bit pattern is materialized through a scratch GPR (fmovq/d xmm ← gpr).
-    b.auxScratch(pos, "a float literal")
+    # The bit pattern is materialized through a scratch GPR (fmovq/d xmm ← gpr); the
+    # emitter draws that GPR from its staging set (x64 R11 bridge / a64 takeBridge) —
+    # it is purely transient (load-imm → fmov → release), never a survivor that needs
+    # an allocator-pool register, so no `auxScratch` is reserved here.
     b.ra.locs[pos] = dest
     inc n
   of Symbol:
@@ -617,14 +619,28 @@ proc allocFValue(b: var Builder; n: var Cursor; dest: var Location) =
       # (the emitter reads the home from locationOfSym and emits a movsd from the slot).
       if dest.kind != InFReg: dest = b.reserveFTmp(home.typ)
     else:
-      # a module-level float global / tvar read: not handled by the emitter yet.
-      raiseAssert "arkham: float global/threadvar read not supported yet"
+      # a module-level float global / tvar read: load it into a SIMD register
+      # (the emitter resolves the global address and emits a movss/movsd).
+      if dest.kind != InFReg: dest = b.reserveFTmp(b.tc.exprSlot(n))
     b.ra.locs[pos] = dest
     inc n
   of TagLit:
     case n.exprKind
     of AddC, SubC, MulC, DivC:
       allocFBin(b, n, dest); return              # records locs[pos] itself
+    of NegC:
+      # float negation `(neg (f N) x)`: the operand lands in the result xmm, the
+      # emitter flips its sign in place. Mirrors the float-unary shape used by a64.
+      if dest.kind != InFReg:
+        dest = b.reserveFTmp(if dest.typ.kind == AFloat: dest.typ else: floatSlot(64))
+      let resDest = dest
+      n.into:
+        skip n                                   # result float type
+        var fd = resDest
+        allocFValue(b, n, fd)                    # operand → the accumulator xmm
+        while n.hasMore: skip n
+      b.ra.locs[pos] = resDest
+      return
     of ConvC:
       # A conversion whose RESULT is float. An INT source is `cvtsi2sd` (the operand
       # in a GPR temp the emitter extends first); a FLOAT source is a precision /
@@ -880,8 +896,14 @@ proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = 
     if b.symLoc(nm).kind == Undef:           # a module-level global aggregate base
       let pos = b.posOf(n)
       if globBase.kind == InReg: b.ra.locs[pos] = globBase
+      elif b.md.arch == X86 and not isStore:
+        # A transient global base for a LOAD (e.g. a float field read whose result is an
+        # xmm, so the GPR address can't be the result reg): the emitter sources the
+        # address from emit-time STAGING (the R11 bridge), so reserve no survivor pool
+        # register here — leave the position unresolved as the marker.
+        b.ra.locs[pos] = dontCare
       else:
-        let t = b.reserveHeldScratch("a global base address")  # float load: own GPR temp
+        let t = b.reserveHeldScratch("a global base address")  # survivor (held across rhs / a64)
         b.ra.locs[pos] = t
     inc n                                    # stack-var / pointer / global base name
   of TagLit:

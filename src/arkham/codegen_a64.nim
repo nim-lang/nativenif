@@ -2456,7 +2456,10 @@ proc emitFValue2(g: var CodeGen; c: Cursor) =
     g.fmovFromGpr(dst.f, gpr, bits)
     g.dropBridge gpr
   of Symbol:
-    let home = g.ra.locationOfSym(symName(c))
+    var home = g.ra.locationOfSym(symName(c))
+    if home.kind == Undef:                               # a module-level float global / tvar
+      var cc = c
+      home = g.asLoc(cc)                                 # Glob/Tvar with the float slot
     if dst.isTemp: g.bindFTmp(dst.f, bits)
     g.placeF2(home, dst.f, bits)
   of TagLit:

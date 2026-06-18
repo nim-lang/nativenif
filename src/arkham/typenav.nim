@@ -79,7 +79,7 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
   of TagLit:
     case c.exprKind
     of AddC, SubC, MulC, DivC, ModC, ShlC, ShrC, BitandC, BitorC, BitxorC,
-       BitnotC, NegC, NotC, ConvC, CastC, OconstrC, AconstrC:
+       BitnotC, NegC, ConvC, CastC, OconstrC, AconstrC:
       var t = c
       t.into:
         result = t                            # the carried result/target type
@@ -124,6 +124,9 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
             result = tc.callTarget[].getOrDefault(callee).retType
         while t.hasMore: skip t
     of NilC: result = tc.prog[].voidPtr       # nil → a generic pointer type
+    of TrueC, FalseC,                         # bool literals & bool-valued operators
+       EqC, NeqC, LtC, LeC, AndC, OrC, NotC, OvfC:   # `(not operand)` carries NO type child
+      result = tc.prog[].boolType
     of AddrC:                                 # &lvalue → (ptr <type-of-lvalue>)
       var t = c; inc t
       result = tc.prog[].ptrTypeOf(tc.getType(t))
