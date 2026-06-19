@@ -43,7 +43,20 @@ const arkhamDarwinUnsupported: seq[string] =
     # macOS's native arch is arm64, which has no `keepovf`/`(ovf)` codegen yet
     # (overflow checking is x86-only for now — see arkhamLinuxA64Unsupported).
     "overflow_check",
+    # `futex` is a Linux syscall lowered to a raw kernel trap (svc/syscall); macOS has
+    # no `futex` symbol, so it's Linux-only here. The Darwin equivalent is exercised by
+    # `ulock_wake` (just as `std/private/syslocks` selects `futex` vs `__ulock_wake`
+    # with a `when defined(linux)`/`elif defined(osx)` split). Mirror it: this pair is
+    # one logical test, each half skipped on the platform it doesn't target.
+    "futex_wake",
   ]
+
+const arkhamOsxOnly: seq[string] =
+  # The Darwin counterpart of the Linux-only `futex_wake` (see arkhamDarwinUnsupported):
+  # `ulock_wake` calls `__ulock_wake`, the real libSystem symbol `syslocks` uses on
+  # macOS. It links only against libSystem, so it's skipped on Linux (native x64 and
+  # the linux_arm64 qemu path), where the symbol doesn't exist.
+  @["ulock_wake"]
 
 proc arkhamTests() =
   ## Each `tests/arkham/*.c.nif` is hand-written Leng: arkham generates asm-NIF,
@@ -71,7 +84,9 @@ proc arkhamTests() =
     if base.startsWith("mod_"): continue   # foreign helper, not standalone
     let name = base[0 ..< base.len - ".c.nif".len]
     when defined(macosx):
-      if name in arkhamDarwinUnsupported: continue  # Linux-only flag constant
+      if name in arkhamDarwinUnsupported: continue  # Linux-only flag constant / symbol
+    else:
+      if name in arkhamOsxOnly: continue            # macOS-only libSystem symbol
     inc total
     let stem = file[0 ..< file.len - ".c.nif".len]
     let known = name in arkhamKnownUnsupported
@@ -151,7 +166,8 @@ proc arkhamQemuTests() =
     let base = extractFilename(file)
     if base.startsWith("mod_"): continue
     let name = base[0 ..< base.len - ".c.nif".len]
-    if name in arkhamLinuxA64Unsupported: (inc skipped; continue)
+    if name in arkhamLinuxA64Unsupported or name in arkhamOsxOnly:
+      (inc skipped; continue)                        # arm64-TODO or macOS-only symbol
     inc total
     let stem = file[0 ..< file.len - ".c.nif".len]
     let asmNif = workDir / (name & ".la64.nif")
