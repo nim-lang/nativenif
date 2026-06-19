@@ -701,11 +701,11 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
   var intIdx = if hiddenPtr: 1 else: 0         # rdi reserved for a >16B aggregate result ptr
   var fIdx = 0
   n.into:
-    # An INDIRECT call's target is a fn-ptr EXPRESSION (vtable/method-table load), not a
-    # symbol: allocate it into a register HELD across the args + the call (the emitter
-    # declares a proctype var bound to it and `prepare`s through that). A direct call's
-    # symbol callee is just skipped.
-    let indirect = n.kind != Symbol
+    # An INDIRECT call's target is a fn-ptr EXPRESSION (vtable/method-table load), or a
+    # Symbol naming a proc-typed LOCAL/param (a fn-ptr value): allocate it into a register
+    # HELD across the args + the call (the emitter declares a proctype var bound to it and
+    # `prepare`s through that). A direct call's proc-decl symbol is just skipped.
+    let indirect = isIndirectCallTarget(b.tc, n)
     var fnptrTd: Location
     if indirect:
       fnptrTd = needsReg(ScalarSlot)
@@ -1247,8 +1247,12 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
       return
     of TrueC:
       b.resolveDest(dest, immLoc(1, ScalarSlot)); skip n
-    of FalseC, NilC:
+    of FalseC:
       b.resolveDest(dest, immLoc(0, ScalarSlot)); skip n
+    of NilC:
+      # nil is a 0 of the `(nil)` type (a null pointer), NOT an `(i 64)` 0: carry the
+      # nil slot so the emitter binds the register / emits the immediate as `(nil)`.
+      b.resolveDest(dest, immLoc(0, b.tc.exprSlot(n))); skip n
     of OvfC:
       # The overflow flag — always false (arkham uses wrapping arithmetic, see the
       # `keepovf`/emitValue2 handling), so the `(if (ovf) …)` handlers are dead.

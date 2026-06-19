@@ -333,6 +333,11 @@ proc emTypedStackVar(g: var CodeGen; name: string; t: Cursor) =
   ## slot would both reject the typed store and forbid the deref (nifasm is strict).
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
+  if isNilValue(t):                          # a spilled nil → `(s) (nil)` (8-byte, align 8)
+    g.ab.keyword SO
+    g.ab.nilValue()
+    g.ab.close()
+    return
   let sa = stackSlotAlign(g.prog, t)
   if sa > 8:                                  # over-aligned slot → `(s (align N))`
     g.ab.tree X64Flag.SO:
@@ -348,7 +353,9 @@ proc emBindType(g: var CodeGen; typ: AsmSlot) =
   ## Emit the Leng type for a scratch binding: the slot's own type when known, else
   ## the generic `(i 64)` (a register/immediate dont-care placeholder carries no
   ## cursor). Mirrors `emTypedStackVar`'s type emission.
-  if cursorIsNil(typ.typ):
+  if isNilSlot(typ):
+    g.ab.nilValue()                  # `(nil)` — a null pointer, not an `(i 64)` 0
+  elif cursorIsNil(typ.typ):
     g.ab.intType(64)
   else:
     var tc = typ.typ
@@ -1510,11 +1517,23 @@ proc genTvar(g: var CodeGen; name: string; decl: Cursor) =
 # `emitProcBody2`); the old reactive emitter and the `procModeled2` gate it fed
 # have been deleted entirely.
 
+proc emImm(g: var CodeGen; loc: Location) =
+  ## Emit an immediate VALUE operand: `(nil)` for a null pointer, else the integer.
+  if isNilImm(loc): g.ab.nilValue()
+  else: g.ab.intLit loc.ival
+
+proc placeImm(g: var CodeGen; dest: Reg; loc: Location) =
+  ## `mov dest, <imm>` — emits `(mov dest (nil))` for a nil so the register binds to
+  ## the `(nil)` type, else the ordinary `movImm`.
+  if isNilImm(loc):
+    g.ab.tree MovX64: (g.emReg dest; g.ab.nilValue())
+  else: g.movImm(dest, loc.ival)
+
 proc place2(g: var CodeGen; src: Location; dest: Reg) =
   ## Materialize `src` into register `dest` (no-op when it is already there).
   case src.kind
   of InReg: (if src.r != dest: g.movReg(dest, src.r))
-  of Imm: g.movImm(dest, src.ival)
+  of Imm: g.placeImm(dest, src)
   of NamedStack, Mem, Glob, Tvar: g.emitLoadLoc(src, dest)
   else: raiseAssert "arkham x64n: place2 src " & $src.kind
 
@@ -1751,7 +1770,7 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
     var fc = c
     fc.into:
       targetCur = fc
-      indirect = fc.kind != Symbol
+      indirect = isIndirectCallTarget(g.typeCtx, fc)   # incl. a proc-typed local/param
       if not indirect: fsym = symName(fc)
       skip fc
       while fc.hasMore: (argCurs.add fc; skip fc)
@@ -2086,8 +2105,14 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
       g.emitValue2(inner)
     of TrueC:
       if dst.kind == InReg: (if dst.isTemp: g.bindTemp(dst.r, dst.typ)); g.movImm(dst.r, 1)
-    of FalseC, NilC:
+    of FalseC:
       if dst.kind == InReg: (if dst.isTemp: g.bindTemp(dst.r, dst.typ)); g.movImm(dst.r, 0)
+    of NilC:
+      # The null pointer: bind the register to the `(nil)` type and move `(nil)` into it
+      # (not an `(i 64)` 0), so a later `cmp nilReg, ptr` type-checks (see `compatible`).
+      if dst.kind == InReg:
+        if dst.isTemp: g.bindTemp(dst.r, dst.typ)
+        g.ab.tree MovX64: (g.emReg dst.r; g.ab.nilValue())
     of OvfC:
       # `(ovf)` reads the hardware overflow flag of the immediately preceding `keepovf`
       # and is valid ONLY as an if/ite condition (handled in `emitCond2`, lowered to
@@ -2849,7 +2874,7 @@ proc emitCast2(g: var CodeGen; c: Cursor) =
     elif iv.kind == Imm:
       if kindChange: retypeCastRes()
       elif res2.isTemp: g.bindTemp(res2.r, res2.typ)
-      g.movImm(res2.r, iv.ival)
+      g.placeImm(res2.r, iv)
   let (srcW, srcSigned) = g.srcWidthSigned(inner)
   if kindChange:
     # int↔ptr / ptr↔ptr is a pure reinterpret; a narrow int source going into a pointer
@@ -3090,7 +3115,7 @@ proc genFieldStore2(g: var CodeGen; dst: Location; valC: Cursor) =
       g.ab.tree MovX64:
         g.emFieldOperand(dst)
         case v.kind
-        of Imm: g.ab.intLit v.ival
+        of Imm: g.emImm(v)
         of InReg:
           if isPtrType(fty):
             g.ab.tree CastX:
@@ -3506,7 +3531,7 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
         g.ab.tree MovX64:
           g.ab.tree MemX: g.emLvalAddr2(lhs)
           case v.kind
-          of Imm: g.ab.intLit v.ival
+          of Imm: g.emImm(v)
           of InReg:
             if dstPtr:
               g.ab.tree CastX:
@@ -3671,7 +3696,7 @@ proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
       g.ab.tree CmpX64:
         g.ab.tree MemX: g.emLvalAddr2(aC)
         case bLoc.kind
-        of Imm: g.ab.intLit bLoc.ival
+        of Imm: g.emImm(bLoc)
         of InReg: g.emReg bLoc.r
         of NamedStack: g.emReg rhsStaging
         else: raiseAssert "arkham x64n: cmp(memlhs) rhs " & $bLoc.kind
@@ -3682,7 +3707,7 @@ proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
       assert aLoc.kind == InReg, "arkham x64n: cmp lhs " & $aLoc.kind
       case bLoc.kind
       of Imm:
-        g.ab.tree CmpX64: (g.emReg aLoc.r; g.ab.intLit bLoc.ival)
+        g.ab.tree CmpX64: (g.emReg aLoc.r; g.emImm(bLoc))
       of InReg:
         g.ab.tree CmpX64: (g.emReg aLoc.r; g.emReg bLoc.r)
       of NamedStack:                                     # spilled scalar slot: cmp reg, [rsp+slot]
@@ -3986,8 +4011,9 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool) =
       for st in g.ra.spillTemps:
         if st.isFloat:
           g.emFloatStackVar(st.name, st.typ.size * 8)
-        elif not cursorIsNil(st.typ.typ) and isPtrType(resolveType(g.prog, st.typ.typ)):
-          g.emTypedStackVar(st.name, st.typ.typ)
+        elif isNilSlot(st.typ) or
+             (not cursorIsNil(st.typ.typ) and isPtrType(resolveType(g.prog, st.typ.typ))):
+          g.emTypedStackVar(st.name, st.typ.typ)   # `(nil)` / `(ptr T)` slot keeps its type
         else:
           g.emScalarStackVar(st.name)
       g.retLabel2 = g.freshLabel()                       # shared epilogue for mid-proc `ret`

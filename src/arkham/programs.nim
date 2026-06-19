@@ -80,6 +80,9 @@ type
                                             ## owner), so no separate buffer must be stored.
     voidPtr*: Cursor                        ## a synthesized `(ptr (void))` — the structural
                                             ## type of a `nil` literal (a generic pointer).
+    nilLit*: Cursor                         ## a synthesized Leng `(nil)` — the slot `typ` of
+                                            ## a nil value, so its register binds to the asm
+                                            ## `(nil)` type (not `(i 64)`) and emits `(nil)`.
     intType*: Cursor                        ## synthesized `(i 64)` — type of a bare IntLit
     uintType*: Cursor                       ## synthesized `(u 64)` — type of a bare UIntLit
     charType*: Cursor                       ## synthesized `(c 8)`  — type of a bare CharLit
@@ -235,6 +238,8 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     result.procPtr = beginRead(ptBuf)
     var npBuf = parseFromBuffer("(ptr (void))", "", sharedTags = tags)
     result.voidPtr = beginRead(npBuf)
+    var nilBuf = parseFromBuffer("(nil)", "", sharedTags = tags)
+    result.nilLit = beginRead(nilBuf)
     var itBuf = parseFromBuffer("(i 64)", "", sharedTags = tags)
     result.intType = beginRead(itBuf)
     var utBuf = parseFromBuffer("(u 64)", "", sharedTags = tags)

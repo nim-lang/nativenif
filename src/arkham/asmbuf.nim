@@ -98,6 +98,11 @@ proc charType*(a: var AsmBuf; bits: int) = a.tree CT: a.intLit bits
 proc floatType*(a: var AsmBuf; bits: int) = a.tree FT: a.intLit bits
 proc boolType*(a: var AsmBuf) = a.keyword BoolT
 proc voidType*(a: var AsmBuf) = a.keyword VoidT
+proc nilValue*(a: var AsmBuf) = a.keyword NilT
+  ## `(nil)` — the null pointer. Serves DOUBLE duty: as a value operand
+  ## (`(mov r (nil))`, `(cmp r (nil))`) and as a register-binding TYPE
+  ## (`(rebind :t (nil) …)`). nifasm reads it as a 0 immediate of the `nil`
+  ## type (compatible with any pointer, never a sized integer).
 
 template objectType*(a: var AsmBuf; body: untyped) = a.tree ObjectT: body
 template unionType*(a: var AsmBuf; body: untyped) = a.tree UnionT: body

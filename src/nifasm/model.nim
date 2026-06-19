@@ -252,6 +252,7 @@ type
   NifasmType* = enum
     NoType
     BoolT = (ord(BoolTagId), "bool")  ## boolean type
+    NilT = (ord(NilTagId), "nil")  ## nil: the null-pointer value/type, compatible with any pointer
     IT = (ord(ITagId), "i")  ## signed integer type of N bits
     UT = (ord(UTagId), "u")  ## unsigned integer type of N bits
     FT = (ord(FTagId), "f")  ## float type of N bits
@@ -270,7 +271,7 @@ type
     ProctypeT = (ord(ProctypeTagId), "proctype")  ## procedure (function pointer) type
 
 proc rawTagIsNifasmType*(raw: TagEnum): bool {.inline.} =
-  raw in {BoolTagId, ITagId, UTagId, FTagId, PtrTagId, AptrTagId, ArrayTagId, ObjectTagId, UnionTagId, FldTagId, CTagId, VoidTagId, VarargsTagId, FlexarrayTagId, EnumTagId, EfldTagId, ProctypeTagId}
+  raw in {BoolTagId, NilTagId, ITagId, UTagId, FTagId, PtrTagId, AptrTagId, ArrayTagId, ObjectTagId, UnionTagId, FldTagId, CTagId, VoidTagId, VarargsTagId, FlexarrayTagId, EnumTagId, EfldTagId, ProctypeTagId}
 
 type
   NifasmDecl* = enum

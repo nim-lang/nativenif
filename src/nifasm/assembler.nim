@@ -194,7 +194,8 @@ proc canCompare(t: Type): bool =
   ## deliberately SEPARATE from `canDoIntegerArithmetic` (which add/sub share and
   ## must stay strict — adding/subtracting bools is nonsense).
   t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT,
-             TypeKind.PtrT, TypeKind.AptrT, TypeKind.RegisterT, TypeKind.BoolT}
+             TypeKind.PtrT, TypeKind.AptrT, TypeKind.RegisterT, TypeKind.BoolT,
+             TypeKind.NilT}  # `cmp ptr, nil` / `cmp nil, ptr` null tests
 
 proc canDoBitwiseOps(t: Type): bool =
   ## Check if type supports bitwise operations (including registers and literals)
@@ -492,7 +493,9 @@ proc genInstA64(n: var Cursor; ctx: var GenContext)
 proc checkIntegerArithmetic(t: Type; op: string; n: Cursor)
 proc checkIntegerType(t: Type; op: string; n: Cursor)
 proc checkBitwiseType(t: Type; op: string; n: Cursor)
+proc checkComparable(t: Type; op: string; n: Cursor)
 proc checkCompatibleTypes(t1, t2: Type; op: string; n: Cursor)
+proc checkCmpCompatible(t1, t2: Type; n: Cursor)
 proc checkBitwiseCompatible(t1, t2: Type; op: string; n: Cursor)
 proc checkType(want, got: Type; n: Cursor)
 
@@ -797,6 +800,8 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
     case t
     of BoolTagId:
       result = Type(kind: BoolT)
+    of NilTagId:
+      result = Type(kind: NilT)
     of ITagId:
       result = Type(kind: IntT, bits: normScalarBits(getInt(n)))
       inc n
@@ -1323,6 +1328,13 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       if result.reg in ctx.a64RegBindings:
         error("Register " & $result.reg & " is bound to variable '" &
               ctx.a64RegBindings[result.reg] & "', use the variable name instead", n)
+    elif t == NilTagId:
+      # `(nil)` as a value: the null pointer — a 0 immediate typed `nil` (compatible
+      # with any pointer, never a sized integer). See `compatible`'s NilT arm.
+      result.kind = okImm
+      result.immVal = 0
+      result.typ = Type(kind: NilT)
+      inc n
     elif t == DotTagId:
       # (dot <base> <fieldname>) - similar to x64
       inc n
@@ -2575,9 +2587,11 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
-    checkIntegerArithmetic(dest.typ, "cmp", start)
-    checkIntegerArithmetic(op.typ, "cmp", start)
-    checkCompatibleTypes(dest.typ, op.typ, "cmp", start)
+    # Comparisons work on integers, pointers, bool (the "if bool" test) and `nil` —
+    # the same loose rule as x64's CmpX64 (was the stricter integer-arithmetic check).
+    checkComparable(dest.typ, "cmp", start)
+    checkComparable(op.typ, "cmp", start)
+    checkCmpCompatible(dest.typ, op.typ, start)
     if dest.kind == okMem:
       error("CMP memory not supported yet", n)
     else:
@@ -3037,6 +3051,13 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
       if result.reg in ctx.regBindings:
         error("Register " & $result.reg & " is bound to variable '" &
               ctx.regBindings[result.reg] & "', use the variable name instead", n)
+    elif t == NilTagId:
+      # `(nil)` as a value: the null pointer — a 0 immediate typed `nil` (compatible
+      # with any pointer, never a sized integer). See `compatible`'s NilT arm.
+      result.kind = okImm
+      result.immVal = 0
+      result.typ = Type(kind: NilT)
+      inc n
     elif t == DotTagId:
       # (dot <base-reg> <stackvar> <fieldname>) for stack objects, or
       # (dot <ptr-var> <fieldname>) for pointer variables

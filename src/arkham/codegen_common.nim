@@ -171,6 +171,19 @@ proc isPtrType*(c: Cursor): bool =
   of PtrT, AptrT, ProctypeT: true
   else: false
 
+proc isNilValue*(c: Cursor): bool {.inline.} =
+  ## True if `c` is the synthesized Leng `(nil)` node (a null-pointer value/type).
+  not cursorIsNil(c) and c.kind == TagLit and c.exprKind == NilC
+
+proc isNilSlot*(s: AsmSlot): bool {.inline.} =
+  ## True if `s` carries the synthesized Leng `(nil)` type (a null pointer) — its
+  ## register binds to the asm `(nil)` type and its immediate emits `(nil)`, not `0`.
+  isNilValue(s.typ)
+
+proc isNilImm*(loc: Location): bool {.inline.} =
+  ## A `nil` value resolved to an immediate (`p = nil`, `p == nil`): emit `(nil)`.
+  loc.kind == Imm and isNilSlot(loc.typ)
+
 proc aggrByRef*(g: var CodeGen; typeName: string): bool {.inline.} =
   ## SysV/AAPCS: an aggregate larger than the by-value threshold is passed AND
   ## returned by reference (a hidden pointer) instead of in registers — the single

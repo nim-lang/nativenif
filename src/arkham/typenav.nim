@@ -56,6 +56,17 @@ proc lookupSym*(tc: TypeCtx; nm: string): SymInfo =
     of TvarS: return SymInfo(cat: scTvar, decl: d)
     else: return SymInfo(cat: scGlobal, decl: d)
 
+proc isIndirectCallTarget*(tc: TypeCtx; targetCur: Cursor): bool =
+  ## A call is INDIRECT (dispatched through a fn-ptr value, not a `(prepare sym …)`)
+  ## when its target is NOT a Symbol (a vtable / closure-field expression), OR a
+  ## Symbol naming a proc-typed function LOCAL/parameter — `lookupSym` returns
+  ## `scNone` for a function-local, vs `scProc` for a module/foreign proc decl (and
+  ## `scGlobal`/`scTvar` for a proc-VAR, which the emitter dispatches via its own
+  ## symbol-indirect path). Without this, a bare-Symbol call through a proc-typed
+  ## param/local was mis-sent to the foreign-proc resolver (`foreignCallTarget`
+  ## asserts "not a foreign proc").
+  targetCur.kind != Symbol or tc.lookupSym(symName(targetCur)).cat == scNone
+
 proc getType*(tc: TypeCtx; c: Cursor): Cursor =
   ## The structural Leng type cursor of expression `c` (arkham's analog of
   ## `typenav.getType`). Symbols resolve through `symType` / the global/tvar
@@ -156,7 +167,7 @@ proc exprSlot*(tc: TypeCtx; c: Cursor): AsmSlot =
   of TagLit:
     case c.exprKind
     of AddrC: slotOf(tc.prog[], tc.getType(c))                       # &lvalue → precise (ptr <elem>)
-    of NilC: AsmSlot(cls: AUInt, size: 8, align: 8)                 # nil → a generic pointer
+    of NilC: AsmSlot(cls: AUInt, size: 8, align: 8, typ: tc.prog[].nilLit)  # nil → the `(nil)` type
     of TrueC, FalseC: AsmSlot(cls: AUInt, size: 1, align: 1)        # a bool
     of SizeofC, AlignofC: AsmSlot(cls: AInt, size: 8, align: 8)     # an integer constant
     of SufC, ParC:                                                   # wrappers → the inner value

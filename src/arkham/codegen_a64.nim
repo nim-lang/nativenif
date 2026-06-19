@@ -355,9 +355,14 @@ proc emTypedStackVar(g: var CodeGen; name: string; t: Cursor) =
   ## it); a FLOAT its `(f N)`; an aggregate its real type plus the `(s (align N))`
   ## stack-slot alignment. This backend-specific scalar rule lives here, not in the
   ## caller — that is the whole point of routing through one proc.
-  let slot = slotOf(g.prog, t)
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
+  if isNilValue(t):                          # a spilled nil → `(s) (nil)` (8-byte, align 8)
+    g.ab.keyword SO
+    g.ab.nilValue()
+    g.ab.close()
+    return
+  let slot = slotOf(g.prog, t)
   let sa = stackSlotAlign(g.prog, t)
   if sa > 8:                                  # over-aligned slot → `(s (align N))`
     g.ab.tree X64Flag.SO:
@@ -391,7 +396,9 @@ proc emBindType(g: var CodeGen; typ: AsmSlot) =
   ## Emit the Leng type for a scratch binding: the slot's own type when known, else
   ## the generic `(i 64)` (a register/immediate dont-care placeholder carries no
   ## cursor). Mirrors `emScalarStackVar`'s type emission.
-  if cursorIsNil(typ.typ):
+  if isNilSlot(typ):
+    g.ab.nilValue()                  # `(nil)` — a null pointer, not an `(i 64)` 0
+  elif cursorIsNil(typ.typ):
     g.ab.intType(64)
   else:
     var tc = typ.typ
@@ -1101,13 +1108,25 @@ proc dropFBridge(g: var CodeGen) =
 
 # ── scalar Location → register / register → Location ─────────────────────────
 
+proc emImm(g: var CodeGen; loc: Location) =
+  ## Emit an immediate VALUE operand: `(nil)` for a null pointer, else the integer.
+  if isNilImm(loc): g.ab.nilValue()
+  else: g.ab.intLit loc.ival
+
+proc placeImm(g: var CodeGen; dest: Reg; loc: Location) =
+  ## `mov dest, <imm>` — emits `(mov dest (nil))` for a nil so the register binds to
+  ## the `(nil)` type, else the ordinary `movImm`.
+  if isNilImm(loc):
+    g.ab.tree MovA64: (g.emReg dest; g.ab.nilValue())
+  else: g.movImm(dest, loc.ival)
+
 proc place2(g: var CodeGen; src: Location; dest: Reg) =
   ## `dest ← <scalar Location src>`. The pure-emit analogue of `emitLoad`: a
   ## global/threadvar address is formed straight into `dest` (no borrowed temp),
   ## a complex lvalue routes through the `*2` address machinery.
   case src.kind
   of InReg: g.movReg(dest, src.r)
-  of Imm: g.movImm(dest, src.ival)
+  of Imm: g.placeImm(dest, src)
   of NamedStack: g.emScalarLoad(dest, src.name)
   of Glob:
     # `dest = &g` then `dest = [dest]`. The deref must be typed `(ptr <globalType>)` so
@@ -1866,7 +1885,7 @@ proc emitCast2(g: var CodeGen; c: Cursor) =
     elif iv.kind == Imm:
       if kindChange: retypeCastRes()
       elif res2.isTemp: g.bindTemp(res2.r, res2.typ)
-      g.movImm(res2.r, iv.ival)
+      g.placeImm(res2.r, iv)
   let (srcW, srcSigned) = g.srcWidthSigned(inner)
   if kindChange:
     if ptrTarget and not srcPtr and srcW < 64: g.extendTo(res2.r, srcW, signed = false)
@@ -2052,7 +2071,7 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
     var fc = c
     fc.into:
       targetCur = fc
-      indirect = fc.kind != Symbol
+      indirect = isIndirectCallTarget(g.typeCtx, fc)   # incl. a proc-typed local/param
       if not indirect: fsym = symName(fc)
       skip fc
       while fc.hasMore: (argCurs.add fc; skip fc)
@@ -2298,7 +2317,7 @@ proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
     else: (aBridge = g.takeBridge(aLoc0.typ); g.place2(aLoc0, aBridge); aReg = aBridge)
     let bLoc = g.ra.locs[g.posOf(bC)]
     if bLoc.kind == Imm and bLoc.ival >= 0 and bLoc.ival <= 0xFFFF:
-      g.ab.tree CmpA64: (g.emReg aReg; g.ab.intLit bLoc.ival)
+      g.ab.tree CmpA64: (g.emReg aReg; g.emImm(bLoc))
     else:
       g.emitValue2(bC)
       let bL = g.ra.locs[g.posOf(bC)]
@@ -2442,8 +2461,14 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
       g.emitValue2(inner)
     of TrueC:
       if dst.kind == InReg: (if dst.isTemp: g.bindTemp(dst.r, dst.typ)); g.movImm(dst.r, 1)
-    of FalseC, NilC:
+    of FalseC:
       if dst.kind == InReg: (if dst.isTemp: g.bindTemp(dst.r, dst.typ)); g.movImm(dst.r, 0)
+    of NilC:
+      # The null pointer: bind the register to the `(nil)` type and move `(nil)` into it
+      # (not an `(i 64)` 0), so a later `cmp nilReg, ptr` type-checks (see `compatible`).
+      if dst.kind == InReg:
+        if dst.isTemp: g.bindTemp(dst.r, dst.typ)
+        g.ab.tree MovA64: (g.emReg dst.r; g.ab.nilValue())
     of SizeofC:
       if dst.kind == InReg:
         var t = c; var sz = 0'i64
@@ -2548,7 +2573,7 @@ proc storeScalar2(g: var CodeGen; dst, v: Location) =
         g.emScalarStore(dst.name, v.r)
         if v.isTemp: g.unbindTemp(v.r)
       of Imm:
-        let b = g.takeBridge(dst.typ); g.movImm(b, v.ival); g.emScalarStore(dst.name, b); g.dropBridge b
+        let b = g.takeBridge(dst.typ); g.placeImm(b, v); g.emScalarStore(dst.name, b); g.dropBridge b
       of NamedStack, Mem, Glob, Tvar:
         let b = g.takeBridge(dst.typ); g.place2(v, b); g.emScalarStore(dst.name, b); g.dropBridge b
       else: raiseAssert "arkham a64n: scalar store rhs " & $v.kind
@@ -3044,7 +3069,7 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
         else: (vBridge = g.takeBridge(v.typ); g.place2(v, vBridge); vr = vBridge)
         g.ab.tree MovA64:
           g.ab.tree MemX: g.emLvalAddr2(lhs)
-          if v.kind == Imm: g.ab.intLit v.ival
+          if v.kind == Imm: g.emImm(v)
           elif dstPtr:
             g.ab.tree CastX:
               g.genTypeBody(dstTy)
@@ -3364,8 +3389,9 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool) =
           g.ab.keyword CallA64
       for st in g.ra.spillTemps:
         if st.isFloat: g.emFloatStackVar(st.name, st.typ.size * 8)
-        elif not cursorIsNil(st.typ.typ) and isPtrType(resolveType(g.prog, st.typ.typ)):
-          g.emTypedStackVar(st.name, st.typ.typ)
+        elif isNilSlot(st.typ) or
+             (not cursorIsNil(st.typ.typ) and isPtrType(resolveType(g.prog, st.typ.typ))):
+          g.emTypedStackVar(st.name, st.typ.typ)   # `(nil)` / `(ptr T)` slot keeps its type
         else: g.emScalarStackVar(st.name)
       g.retLabel2 = g.freshLabel()
       g.retLabelUsed2 = false
