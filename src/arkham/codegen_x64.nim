@@ -769,10 +769,19 @@ proc cmpJccTag(ek: LengExpr; whenTrue, signed: bool): X64Inst =
 # Inside a sequence there are no calls, so RAX/RCX/RDX (not in the allocator pool)
 # are free scratch; the result lands in RAX (the integer return register).
 
-proc emMemAt(g: var CodeGen; p: Reg) =        # `(mem p)` — dereference the pointer in p
-  g.ab.tree MemX: g.emReg p
+proc emMemAt(g: var CodeGen; p: Reg; pointee: Cursor) =
+  ## `(mem (cast (ptr T) p))` — dereference `p` typed as `ptr T` so nifasm sizes the
+  ## access to T's width. The atomic memory operand MUST carry the pointee type: an
+  ## untyped `(mem p)` defaults to a 64-bit access, so an atomic on a sub-64-bit lock
+  ## word (e.g. a `uint32` field) would read/WRITE 8 bytes and clobber the adjacent
+  ## field — the same width bug `intMemAccess` fixed for plain `cmp [mem],imm`.
+  g.ab.tree MemX:
+    g.ab.tree CastX:
+      var t = pointee
+      g.ab.ptrType: g.genTypeBody(t)
+      g.emReg p
 
-proc genAtomicXadd(g: var CodeGen; pReg, val: Reg; returnNew, sub: bool) =
+proc genAtomicXadd(g: var CodeGen; pReg, val: Reg; pointee: Cursor; returnNew, sub: bool) =
   ## `lock xadd [p], val` (val ← old). For `sub`, negate val first so memory is
   ## decremented. `returnNew` recomputes old±delta into rax; otherwise returns old.
   if returnNew: g.bindTemp(RDX, ScalarSlot); g.movReg(RDX, val)  # save the original delta
@@ -780,7 +789,7 @@ proc genAtomicXadd(g: var CodeGen; pReg, val: Reg; returnNew, sub: bool) =
     g.ab.tree NegX64: g.emReg val             # val ← -val
   g.ab.tree LockX64:
     g.ab.tree XaddX64:
-      g.emMemAt pReg
+      g.emMemAt(pReg, pointee)
       g.emReg val                              # val ← old; [p] += val
   if returnNew:
     let op = if sub: SubX64 else: AddX64
@@ -788,19 +797,19 @@ proc genAtomicXadd(g: var CodeGen; pReg, val: Reg; returnNew, sub: bool) =
     g.unbindTemp(RDX)
   g.movReg(RAX, val)
 
-proc genAtomicLoopRmw(g: var CodeGen; pReg, val: Reg; op: X64Inst) =
+proc genAtomicLoopRmw(g: var CodeGen; pReg, val: Reg; pointee: Cursor; op: X64Inst) =
   ## `rax = [p]; loop: rdx = rax op val; lock cmpxchg [p], rdx; jne loop`. There
   ## is no lock-fetch form for and/or/xor that yields the old value, so spin on
   ## cmpxchg. Result (old) ends up in rax.
   let lab = g.freshLabel()
-  g.ab.tree MovX64: (g.emReg RAX; g.emMemAt pReg)   # rax = [p]
+  g.ab.tree MovX64: (g.emReg RAX; g.emMemAt(pReg, pointee))   # rax = [p]
   g.withFixed(RDX):
     g.emLab(lab)
     g.movReg(RDX, RAX)
     g.ab.tree op: g.emReg RDX; g.emReg val           # rdx = rax op val (the new value)
     g.ab.tree LockX64:
       g.ab.tree CmpxchgX64:
-        g.emMemAt pReg
+        g.emMemAt(pReg, pointee)
         g.emReg RDX                                   # if [p]==rax: [p]=rdx else rax=[p]
     g.emJcc(JneX64, lab)                              # retry until cmpxchg succeeds
 
@@ -1645,35 +1654,41 @@ proc emitAtomic2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
   ## `genAtomicXadd`/`genAtomicLoopRmw` helpers, shared with the legacy path).
   ## Result → rax (moved to its home by emitCall2). Pointer args stay raw ABI regs.
   for a in argCurs: g.emitValue2(a)                  # → rdi / rsi / rdx / …
+  # Width of the atomic access = the pointee of the first (pointer) arg. Sizing the
+  # `(mem …)` operands by this type is what keeps a sub-64-bit atomic from spilling
+  # into the adjacent field (see emMemAt). All `__atomic_*` take `ptr T` as arg0.
+  var pointee = g.getType(argCurs[0])
+  if isPtrType(pointee): inc pointee
+  else: pointee = g.prog.intType
   case builtin
   of "__atomic_load_n":                              # (ptr, mo) → *ptr
-    g.ab.tree MovX64: (g.emReg RAX; g.emMemAt RDI)
+    g.ab.tree MovX64: (g.emReg RAX; g.emMemAt(RDI, pointee))
   of "__atomic_store_n":                             # (ptr, val, mo) → void
-    g.ab.tree MovX64: (g.emMemAt RDI; g.emReg RSI)
-  of "__atomic_fetch_add": g.genAtomicXadd(RDI, RSI, returnNew = false, sub = false)
-  of "__atomic_fetch_sub": g.genAtomicXadd(RDI, RSI, returnNew = false, sub = true)
-  of "__atomic_add_fetch": g.genAtomicXadd(RDI, RSI, returnNew = true, sub = false)
-  of "__atomic_sub_fetch": g.genAtomicXadd(RDI, RSI, returnNew = true, sub = true)
-  of "__atomic_fetch_and": g.genAtomicLoopRmw(RDI, RSI, AndX64)
-  of "__atomic_fetch_or":  g.genAtomicLoopRmw(RDI, RSI, OrX64)
-  of "__atomic_fetch_xor": g.genAtomicLoopRmw(RDI, RSI, XorX64)
+    g.ab.tree MovX64: (g.emMemAt(RDI, pointee); g.emReg RSI)
+  of "__atomic_fetch_add": g.genAtomicXadd(RDI, RSI, pointee, returnNew = false, sub = false)
+  of "__atomic_fetch_sub": g.genAtomicXadd(RDI, RSI, pointee, returnNew = false, sub = true)
+  of "__atomic_add_fetch": g.genAtomicXadd(RDI, RSI, pointee, returnNew = true, sub = false)
+  of "__atomic_sub_fetch": g.genAtomicXadd(RDI, RSI, pointee, returnNew = true, sub = true)
+  of "__atomic_fetch_and": g.genAtomicLoopRmw(RDI, RSI, pointee, AndX64)
+  of "__atomic_fetch_or":  g.genAtomicLoopRmw(RDI, RSI, pointee, OrX64)
+  of "__atomic_fetch_xor": g.genAtomicLoopRmw(RDI, RSI, pointee, XorX64)
   of "__atomic_exchange_n":                          # (ptr, val, mo) → old
-    g.ab.tree XchgX64: (g.emMemAt RDI; g.emReg RSI)  # rsi ↔ [rdi] (locked); rsi ← old
+    g.ab.tree XchgX64: (g.emMemAt(RDI, pointee); g.emReg RSI)  # rsi ↔ [rdi] (locked); rsi ← old
     g.movReg(RAX, RSI)
   of "__atomic_thread_fence": g.ab.keyword MfenceX64
   of "__atomic_signal_fence": discard                # compiler barrier only
   of "__atomic_compare_exchange_n":                  # (ptr, exp_ptr, des, weak, succ, fail) → bool
-    g.ab.tree MovX64: (g.emReg RAX; g.emMemAt RSI)   # rax = *exp (the comparand)
+    g.ab.tree MovX64: (g.emReg RAX; g.emMemAt(RSI, pointee))   # rax = *exp (the comparand)
     g.ab.tree LockX64:
       g.ab.tree CmpxchgX64:
-        g.emMemAt RDI
+        g.emMemAt(RDI, pointee)
         g.emReg RDX                                  # if [rdi]==rax: [rdi]=rdx,ZF=1 else rax=[rdi]
     let lFail = g.freshLabel()
     let lDone = g.freshLabel()
     g.emJcc(JneX64, lFail)
     g.movImm(RAX, 1); g.emJmp(lDone)                 # success → 1
     g.emLab(lFail)
-    g.ab.tree MovX64: (g.emMemAt RSI; g.emReg RAX)   # *exp = actual old value (rax)
+    g.ab.tree MovX64: (g.emMemAt(RSI, pointee); g.emReg RAX)   # *exp = actual old value (rax)
     g.movImm(RAX, 0)                                 # failure → 0
     g.emLab(lDone)
   else:

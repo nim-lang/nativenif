@@ -1,0 +1,63 @@
+(.nif27)
+(.indexat 993              )
+(stmts
+ (type :Pair.0 .
+  (object .
+   (fld :state.0 .
+    (i 32))
+   (fld :neighbor.0 .
+    (i 32))))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :acx.0
+  (params
+   (param :p.0 .
+    (ptr
+     (i 32)))
+   (param :ep.0 .
+    (ptr
+     (i 32)))
+   (param :des.0 .
+    (i 32))
+   (param :wk.0 .
+    (bool))
+   (param :so.0 .
+    (i 32))
+   (param :fo.0 .
+    (i 32)))
+  (bool)
+  (pragmas
+   (importc "__atomic_compare_exchange_n"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :o.0 . Pair.0 .)
+   (asgn
+    (dot o.0 state.0 0)0)
+   (asgn
+    (dot o.0 neighbor.0 0)66)
+   (var :exp.0 .
+    (i 32)0)
+   (var :ok.0 .
+    (bool)
+    (call acx.0
+     (addr
+      (dot o.0 state.0 0))
+     (addr exp.0)1
+     (false)0 0))
+   (call exit.c
+    (sub
+     (i 32)
+     (dot o.0 neighbor.0 0)
+     (mul
+      (i 32)24
+      (dot o.0 state.0 0)))))))(.index)

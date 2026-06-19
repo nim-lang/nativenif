@@ -515,21 +515,32 @@ proc emitBlr*(dest: var Bytes; rn: Register) =
 # the GCC `__atomic_*` builtins. All operate on the full 64-bit register; the
 # pointer is `[Xn]` with no offset.
 
-proc emitLdaxr*(dest: var Bytes; rt, rn: Register) =
-  ## LDAXR Xt, [Xn] — load-acquire exclusive.
-  dest.addUint32(0xC85FFC00'u32 or (encodeReg(rn) shl 5) or encodeReg(rt))
+proc sizeFieldA64(bits: int): uint32 =
+  ## The 2-bit access-size field in bits [31:30] of the load/store-exclusive and
+  ## load-acquire/store-release encodings: 00=byte, 01=halfword, 10=word (Wt),
+  ## 11=doubleword (Xt). Sizing the op to the lock word's width keeps an atomic on a
+  ## sub-64-bit field from reading/writing (and locking) the adjacent bytes.
+  (case bits
+   of 8: 0'u32
+   of 16: 1'u32
+   of 32: 2'u32
+   else: 3'u32) shl 30
 
-proc emitStlxr*(dest: var Bytes; rs, rt, rn: Register) =
-  ## STLXR Ws, Xt, [Xn] — store-release exclusive; Ws ← 0 on success, 1 on fail.
-  dest.addUint32(0xC800FC00'u32 or (encodeReg(rs) shl 16) or (encodeReg(rn) shl 5) or encodeReg(rt))
+proc emitLdaxr*(dest: var Bytes; rt, rn: Register; bits = 64) =
+  ## LDAXR{B,H} Wt/Xt, [Xn] — load-acquire exclusive, sized to `bits`.
+  dest.addUint32(0x085FFC00'u32 or sizeFieldA64(bits) or (encodeReg(rn) shl 5) or encodeReg(rt))
 
-proc emitLdar*(dest: var Bytes; rt, rn: Register) =
-  ## LDAR Xt, [Xn] — load-acquire (non-exclusive).
-  dest.addUint32(0xC8DFFC00'u32 or (encodeReg(rn) shl 5) or encodeReg(rt))
+proc emitStlxr*(dest: var Bytes; rs, rt, rn: Register; bits = 64) =
+  ## STLXR{B,H} Ws, Wt/Xt, [Xn] — store-release exclusive (Ws ← 0 ok, 1 fail), sized.
+  dest.addUint32(0x0800FC00'u32 or sizeFieldA64(bits) or (encodeReg(rs) shl 16) or (encodeReg(rn) shl 5) or encodeReg(rt))
 
-proc emitStlr*(dest: var Bytes; rt, rn: Register) =
-  ## STLR Xt, [Xn] — store-release (non-exclusive).
-  dest.addUint32(0xC89FFC00'u32 or (encodeReg(rn) shl 5) or encodeReg(rt))
+proc emitLdar*(dest: var Bytes; rt, rn: Register; bits = 64) =
+  ## LDAR{B,H} Wt/Xt, [Xn] — load-acquire (non-exclusive), sized to `bits`.
+  dest.addUint32(0x08DFFC00'u32 or sizeFieldA64(bits) or (encodeReg(rn) shl 5) or encodeReg(rt))
+
+proc emitStlr*(dest: var Bytes; rt, rn: Register; bits = 64) =
+  ## STLR{B,H} Wt/Xt, [Xn] — store-release (non-exclusive), sized to `bits`.
+  dest.addUint32(0x089FFC00'u32 or sizeFieldA64(bits) or (encodeReg(rn) shl 5) or encodeReg(rt))
 
 proc emitDmbIsh*(dest: var Bytes) =
   ## DMB ISH — data memory barrier, inner shareable domain.

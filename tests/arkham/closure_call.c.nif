@@ -1,0 +1,55 @@
+(.nif27)
+(.indexat 871              )
+(stmts
+ (type :Env.0 .
+  (object .
+   (fld :v.0 .
+    (i 64))))
+ (type :Clo.0 .
+  (proctype .
+   (params
+    (param :e.0 .
+     (ptr Env.0)))
+   (i 64).))
+ (type :Pair.0 .
+  (object .
+   (fld :fn.0 . Clo.0)
+   (fld :env.0 .
+    (ptr Env.0))))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :callee.0
+  (params
+   (param :e.0 .
+    (ptr Env.0)))
+  (i 64)
+  (pragmas)
+  (stmts
+   (ret
+    (dot
+     (deref e.0)v.0 0))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :env.0 . Env.0 .)
+   (asgn
+    (dot env.0 v.0 0)42)
+   (var :clo.0 . Pair.0
+    (oconstr Pair.0
+     (kv fn.0 callee.0)
+     (kv env.0
+      (addr env.0))))
+   (var :r.0 .
+    (i 64)
+    (call
+     (dot clo.0 fn.0 0)
+     (dot clo.0 env.0 0)))
+   (call exit.c r.0))))(.index)

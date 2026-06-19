@@ -1,0 +1,115 @@
+(.nif27)
+(.indexat 1504             )
+(stmts
+ (arch x64)
+ (type :S.0
+  (object
+   (fld :x.0
+    (i 64))
+   (fld :y.0
+    (i 64))
+   (fld :z.0
+    (i 64))))
+ (syproc :exit.sys.
+  (params
+   (param :p0.0
+    (rdi)
+    (i 32)))
+  (result)
+  (clobber
+   (rcx)
+   (r11))60)
+ (proc :main.0
+  (params)
+  (result :ret.0
+   (rax)
+   (i 32))
+  (clobber
+   (rax)
+   (rdi)
+   (rsi)
+   (rdx)
+   (rcx)
+   (r8)
+   (r9)
+   (r10)
+   (r11))
+  (stmts
+   (push
+    (rbx))
+   (push
+    (r12))
+   (sub
+    (rsp)
+    (ssize))
+   (var :a.0
+    (s
+     (align 16))
+    (array
+     (object
+      (fld :x.0
+       (i 64))
+      (fld :y.0
+       (i 64))
+      (fld :z.0
+       (i 64)))3))
+   (rebind :tmp0.0
+    (i 64)
+    (r10))
+   (mov tmp0.0 42)
+   (mov
+    (mem
+     (dot
+      (at
+       (rsp)a.0 2)x.0))tmp0.0)
+   (kill tmp0.0)
+   (var :p.0
+    (s)
+    (aptr S.0))
+   (rebind :tmp1.0
+    (ptr S.0)
+    (r10))
+   (lea tmp1.0
+    (at
+     (rsp)a.0 0))
+   (rebind :tmp2.0
+    (aptr S.0)
+    (r10))
+   (mov
+    (mem
+     (rsp)p.0)tmp2.0)
+   (kill tmp2.0)
+   (var :i.0
+    (rbx)
+    (i 64))
+   (mov i.0 2)
+   (prepare exit.sys.
+    (rebind :tmp3.0
+     (i 64)
+     (r12))
+    (rebind :tmp4.0
+     (aptr S.0)
+     (r10))
+    (mov tmp4.0
+     (mem
+      (rsp)p.0))
+    (mov
+     (rdi)
+     (mem
+      (dot
+       (at
+        (cast
+         (aptr S.0)tmp4.0)i.0 tmp3.0)x.0)))
+    (kill tmp4.0)
+    (kill tmp3.0)
+    (mov
+     (arg p0.0)
+     (rdi))
+    (syscall))
+   (kill i.0)
+   (mov
+    (rax)60)
+   (mov
+    (rdi)0)
+   (syscall))))(.index
+ (x exit.sys. 155))

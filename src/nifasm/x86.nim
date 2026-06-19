@@ -1103,18 +1103,21 @@ proc emitXchg*(dest: var Bytes; a, b: Register) =
   dest.add(0x87)  # XCHG r/m64, r64 opcode
   dest.add(encodeModRM(amDirect, int(b), int(a)))  # reg=b, rm=a
 
-proc emitXchg*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
-  ## Emit XCHG instruction: XCHG mem, reg
+proc emitXchg*(dest: var Bytes; mem: MemoryOperand; reg: Register; bits = 64) =
+  ## Emit XCHG mem, reg sized to `bits` (∈ {8,16,32,64}). REX.W only for 64-bit, the
+  ## 0x66 prefix for 16-bit, and the byte opcode for 8-bit — so an atomic exchange on
+  ## a sub-64-bit lock word does not access (and lock) the adjacent bytes.
   emitSegPrefix(dest, mem)
-  var rex = RexPrefix(w: true)
+  if bits == 16: dest.add(0x66)
+  var rex = RexPrefix(w: bits == 64)
   if needsRex(reg): rex.r = true
   if needsRex(mem.base): rex.b = true
   if mem.hasIndex and needsRex(mem.index): rex.x = true
-
-  if rex.r or rex.b or rex.x or rex.w:
+  let forceRex = bits == 8 and int(reg) in 4..7
+  if rex.r or rex.b or rex.x or rex.w or forceRex:
     dest.add(encodeRex(rex))
 
-  dest.add(0x87) # XCHG r/m64, r64
+  dest.add(if bits == 8: 0x86 else: 0x87)  # XCHG r/m8,r8  /  XCHG r/m(16|32|64),r
   dest.emitMem(int(reg), mem)
 
 proc emitXadd*(dest: var Bytes; a, b: Register) =
@@ -1133,19 +1136,20 @@ proc emitXadd*(dest: var Bytes; a, b: Register) =
   dest.add(0xC1)  # XADD r/m64, r64 opcode
   dest.add(encodeModRM(amDirect, int(b), int(a)))  # reg=source(b), rm=dest(a)
 
-proc emitXadd*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
-  ## Emit XADD instruction: XADD mem, reg
+proc emitXadd*(dest: var Bytes; mem: MemoryOperand; reg: Register; bits = 64) =
+  ## Emit XADD mem, reg sized to `bits` (∈ {8,16,32,64}) — see `emitXchg`.
   emitSegPrefix(dest, mem)
-  var rex = RexPrefix(w: true)
+  if bits == 16: dest.add(0x66)
+  var rex = RexPrefix(w: bits == 64)
   if needsRex(reg): rex.r = true
   if needsRex(mem.base): rex.b = true
   if mem.hasIndex and needsRex(mem.index): rex.x = true
-
-  if rex.r or rex.b or rex.x or rex.w:
+  let forceRex = bits == 8 and int(reg) in 4..7
+  if rex.r or rex.b or rex.x or rex.w or forceRex:
     dest.add(encodeRex(rex))
 
   dest.add(0x0F)
-  dest.add(0xC1)
+  dest.add(if bits == 8: 0xC0 else: 0xC1)  # XADD r/m8,r8  /  XADD r/m(16|32|64),r
   dest.emitMem(int(reg), mem)
 
 # Atomic compare and exchange
@@ -1165,19 +1169,22 @@ proc emitCmpxchg*(dest: var Bytes; a, b: Register) =
   dest.add(0xB1)  # CMPXCHG r/m64, r64 opcode
   dest.add(encodeModRM(amDirect, int(b), int(a)))  # reg=source(b), rm=dest(a)
 
-proc emitCmpxchg*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
-  ## Emit CMPXCHG instruction: CMPXCHG mem, reg
+proc emitCmpxchg*(dest: var Bytes; mem: MemoryOperand; reg: Register; bits = 64) =
+  ## Emit CMPXCHG mem, reg sized to `bits` (∈ {8,16,32,64}). The implicit accumulator
+  ## (AL/AX/EAX/RAX) and the store width follow the same size — a 64-bit CMPXCHG on a
+  ## `uint32` lock word would compare/WRITE 8 bytes and corrupt the next field.
   emitSegPrefix(dest, mem)
-  var rex = RexPrefix(w: true)
+  if bits == 16: dest.add(0x66)
+  var rex = RexPrefix(w: bits == 64)
   if needsRex(reg): rex.r = true
   if needsRex(mem.base): rex.b = true
   if mem.hasIndex and needsRex(mem.index): rex.x = true
-
-  if rex.r or rex.b or rex.x or rex.w:
+  let forceRex = bits == 8 and int(reg) in 4..7
+  if rex.r or rex.b or rex.x or rex.w or forceRex:
     dest.add(encodeRex(rex))
 
   dest.add(0x0F)
-  dest.add(0xB1)
+  dest.add(if bits == 8: 0xB0 else: 0xB1)  # CMPXCHG r/m8,r8  /  CMPXCHG r/m(16|32|64),r
   dest.emitMem(int(reg), mem)
 
 # Atomic compare and exchange with 8-byte operand

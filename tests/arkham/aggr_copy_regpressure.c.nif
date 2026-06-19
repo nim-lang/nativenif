@@ -1,0 +1,85 @@
+(.nif27)
+(.indexat 1309             )
+(stmts
+ (type :Pair.0 .
+  (object .
+   (fld :a.0 .
+    (i 64))
+   (fld :b.0 .
+    (i 64))))
+ (type :Wrap.0 .
+  (object .
+   (fld :x.0 .
+    (i 64))
+   (fld :inner.0 . Pair.0)))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :sink.0
+  (params
+   (param :dst.0 .
+    (ptr
+     (i 64)))
+   (param :k.0 .
+    (i 64))
+   (param :w.0 . Wrap.0)).
+  (pragmas)
+  (stmts
+   (asgn
+    (deref dst.0)
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (dot
+       (dot w.0 inner.0 0)a.0 0)
+      (dot
+       (dot w.0 inner.0 0)b.0 0))
+     (dot w.0 x.0 0)))))
+ (proc :run.0
+  (params
+   (param :p0.0 .
+    (ptr
+     (i 64)))
+   (param :p1.0 .
+    (i 64))
+   (param :p2.0 .
+    (i 64))
+   (param :p3.0 .
+    (i 64)))
+  (i 64)
+  (pragmas)
+  (stmts
+   (var :src.0 . Pair.0
+    (oconstr Pair.0
+     (kv a.0 1)
+     (kv b.0 2)))
+   (call sink.0 p0.0 p1.0
+    (oconstr Wrap.0
+     (kv x.0 4)
+     (kv inner.0 src.0)))
+   (ret
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (add
+       (i 64)p1.0 p2.0)p3.0)
+     (deref p0.0)))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :x.0 .
+    (i 64)0)
+   (var :r.0 .
+    (i 64)
+    (call run.0
+     (addr x.0)10 11 14))
+   (call exit.c r.0))))(.index)

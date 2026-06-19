@@ -98,10 +98,14 @@ proc emLdaxr(g: var CodeGen; rt, rn: Reg) =        # rt ← exclusive-acquire [r
   g.ab.tree LdaxrA64: g.emReg rt; g.emReg rn
 proc emStlxr(g: var CodeGen; rs, rt, rn: Reg) =    # store-release-exclusive rt→[rn]; rs←status
   g.ab.tree StlxrA64: g.emReg rs; g.emReg rt; g.emReg rn
-proc emLdar(g: var CodeGen; rt, rn: Reg) =         # rt ← acquire [rn]
-  g.ab.tree LdarA64: g.emReg rt; g.emReg rn
-proc emStlr(g: var CodeGen; rt, rn: Reg) =         # release store rt→[rn]
-  g.ab.tree StlrA64: g.emReg rt; g.emReg rn
+proc emLdar(g: var CodeGen; rt, rn: Reg; bits = 64) =   # rt ← acquire [rn] (sized)
+  g.ab.tree LdarA64:
+    g.emReg rt; g.emReg rn
+    if bits != 64: g.ab.intLit bits
+proc emStlr(g: var CodeGen; rt, rn: Reg; bits = 64) =   # release store rt→[rn] (sized)
+  g.ab.tree StlrA64:
+    g.emReg rt; g.emReg rn
+    if bits != 64: g.ab.intLit bits
 proc emLdrb(g: var CodeGen; rt, base, idx: Reg) =  # rt ← zero-extended byte [base+idx]
   g.ab.tree LdrbA64: g.emReg rt; g.emReg base; g.emReg idx
 proc emStrb(g: var CodeGen; rt, base, idx: Reg) =  # store low byte of rt → [base+idx]
@@ -1942,18 +1946,37 @@ proc emitMemIntrin2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
     g.emLab(done)
   else: raiseAssert "arkham a64n: unsupported mem intrinsic: " & builtin
 
-proc emitRmw2(g: var CodeGen; opStr: string; isXchg, returnNew: bool) =
+proc atomicBits(g: var CodeGen; ptrArg: Cursor): int =
+  ## Access width (bits) of an atomic = the size of the pointee of `ptrArg` (a `ptr T`).
+  ## The LL/SC exclusive ops MUST be sized to this (see sizeFieldA64 in nifasm): a
+  ## 64-bit `ldaxr`/`stlxr` on a sub-64-bit lock word reads/writes the adjacent bytes,
+  ## so its compare sees the neighbour's bits and its store corrupts them.
+  var t = g.getType(ptrArg)
+  if isPtrType(t):
+    inc t
+    result = typeSizeAlign(g.prog, resolveType(g.prog, t))[0] * 8
+  else:
+    result = 64
+  if result notin {8, 16, 32, 64}: result = 64
+
+proc wsfx(bits: int): string =
+  ## Trailing access-width operand for the LL/SC asm-NIF text (omitted for 64-bit, the
+  ## nifasm parse default — keeps the common case's output unchanged).
+  if bits != 64: &" {bits}" else: ""
+
+proc emitRmw2(g: var CodeGen; opStr: string; isXchg, returnNew: bool; bits: int) =
   ## `loop: ldaxr old,[x0]; new = old op x1 (or x1 for xchg); stlxr st,new,[x0];
-  ## cmp st,0; bne loop`. Scratch x3/x4/x5 (raw). Result → x0.
+  ## cmp st,0; bne loop`. Scratch x3/x4/x5 (raw). Result → x0. Sized to `bits`.
   let loop = g.freshLabel()
   let p = g.emOp R0
   let v = g.emOp R1
   let old = g.emOp R3
   let neu = g.emOp R4
   let st = g.emOp R5
+  let w = wsfx(bits)
   let update = if isXchg: &"(mov {neu} {v})" else: &"(mov {neu} {old}) ({opStr} {neu} {v})"
-  g.ab.splice &"(lab :{loop}) (ldaxr {old} {p}) " & update & " " &
-              &"(stlxr {st} {neu} {p}) (cmp {st} 0) (bne {loop})"
+  g.ab.splice &"(lab :{loop}) (ldaxr {old} {p}{w}) " & update & " " &
+              &"(stlxr {st} {neu} {p}{w}) (cmp {st} 0) (bne {loop})"
   g.movReg(IntRet, if returnNew: R4 else: R3)
 
 proc emitAtomic2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
@@ -1963,30 +1986,32 @@ proc emitAtomic2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
     g.emitValue2(argCurs[idx])
     let a = g.ra.locs[g.posOf(argCurs[idx])]
     if a.kind == InReg and a.isTemp: g.unbindTemp(a.r)
+  let bits = g.atomicBits(argCurs[0])
   case builtin
-  of "__atomic_load_n": g.emLdar(IntRet, R0)
-  of "__atomic_store_n": g.emStlr(R1, R0)
+  of "__atomic_load_n": g.emLdar(IntRet, R0, bits)
+  of "__atomic_store_n": g.emStlr(R1, R0, bits)
   of "__atomic_clear":
-    g.movImm(R3, 0); g.emStlr(R3, R0)
+    g.movImm(R3, 0); g.emStlr(R3, R0, bits)
   of "__atomic_thread_fence": g.ab.keyword DmbA64
   of "__atomic_signal_fence": discard
-  of "__atomic_exchange_n": g.emitRmw2("", true, false)
-  of "__atomic_fetch_add": g.emitRmw2("add", false, false)
-  of "__atomic_fetch_sub": g.emitRmw2("sub", false, false)
-  of "__atomic_fetch_and": g.emitRmw2("and", false, false)
-  of "__atomic_fetch_or": g.emitRmw2("orr", false, false)
-  of "__atomic_fetch_xor": g.emitRmw2("eor", false, false)
-  of "__atomic_add_fetch": g.emitRmw2("add", false, true)
-  of "__atomic_sub_fetch": g.emitRmw2("sub", false, true)
+  of "__atomic_exchange_n": g.emitRmw2("", true, false, bits)
+  of "__atomic_fetch_add": g.emitRmw2("add", false, false, bits)
+  of "__atomic_fetch_sub": g.emitRmw2("sub", false, false, bits)
+  of "__atomic_fetch_and": g.emitRmw2("and", false, false, bits)
+  of "__atomic_fetch_or": g.emitRmw2("orr", false, false, bits)
+  of "__atomic_fetch_xor": g.emitRmw2("eor", false, false, bits)
+  of "__atomic_add_fetch": g.emitRmw2("add", false, true, bits)
+  of "__atomic_sub_fetch": g.emitRmw2("sub", false, true, bits)
   of "__atomic_compare_exchange_n":
     let loop = g.freshLabel(); let lFail = g.freshLabel(); let lDone = g.freshLabel()
     let (pp, ep, d) = (g.emOp R0, g.emOp R1, g.emOp R2)
     let (exp, old, st, ret) = (g.emOp R3, g.emOp R4, g.emOp R5, g.emOp IntRet)
+    let w = wsfx(bits)
     g.ab.splice(
-      &"(ldar {exp} {ep}) (lab :{loop}) (ldaxr {old} {pp}) " &
-      &"(cmp {old} {exp}) (bne {lFail}) (stlxr {st} {d} {pp}) " &
+      &"(ldar {exp} {ep}{w}) (lab :{loop}) (ldaxr {old} {pp}{w}) " &
+      &"(cmp {old} {exp}) (bne {lFail}) (stlxr {st} {d} {pp}{w}) " &
       &"(cmp {st} 0) (bne {loop}) (mov {ret} 1) (b {lDone}) " &
-      &"(lab :{lFail}) (clrex) (stlr {old} {ep}) (mov {ret} 0) (lab :{lDone})")
+      &"(lab :{lFail}) (clrex) (stlr {old} {ep}{w}) (mov {ret} 0) (lab :{lDone})")
   else: raiseAssert "arkham a64n: unsupported atomic builtin: " & builtin
 
 proc proctypeOfTarget(g: var CodeGen; targetCur: Cursor): Cursor =

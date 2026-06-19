@@ -2630,34 +2630,40 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     ctx.buf.data.emitStr(op.reg, dest.mem.base, dest.mem.offset)
 
   of LdaxrA64:
-    # (ldaxr Dt Sptr) — Dt ← exclusive-acquire load of [Sptr]. Operands may be
-    # `rebind`-bound scratch names (the atomics lowering binds its temps).
+    # (ldaxr Dt Sptr bits?) — Dt ← exclusive-acquire load of [Sptr]. Operands may be
+    # `rebind`-bound scratch names (the atomics lowering binds its temps). The optional
+    # trailing int is the access width in bits (default 64); arkham emits it so a
+    # sub-64-bit atomic uses the matching `ldaxr{b,h}`/`Wt` form (see sizeFieldA64).
     inc n
     let rt = parseGprA64(n, ctx)
     let rn = parseGprA64(n, ctx)
-    arm64.emitLdaxr(ctx.buf.data, rt, rn)
+    let bits = if n.kind == IntLit: (let b = int(n.intVal); inc n; b) else: 64
+    arm64.emitLdaxr(ctx.buf.data, rt, rn, bits)
 
   of StlxrA64:
-    # (stlxr St Dval Sptr) — store-release-exclusive Dval to [Sptr]; St ← status.
+    # (stlxr St Dval Sptr bits?) — store-release-exclusive Dval to [Sptr]; St ← status.
     inc n
     let rs = parseGprA64(n, ctx)
     let rt = parseGprA64(n, ctx)
     let rn = parseGprA64(n, ctx)
-    arm64.emitStlxr(ctx.buf.data, rs, rt, rn)
+    let bits = if n.kind == IntLit: (let b = int(n.intVal); inc n; b) else: 64
+    arm64.emitStlxr(ctx.buf.data, rs, rt, rn, bits)
 
   of LdarA64:
-    # (ldar Dt Sptr) — Dt ← acquire load of [Sptr].
+    # (ldar Dt Sptr bits?) — Dt ← acquire load of [Sptr].
     inc n
     let rt = parseGprA64(n, ctx)
     let rn = parseGprA64(n, ctx)
-    arm64.emitLdar(ctx.buf.data, rt, rn)
+    let bits = if n.kind == IntLit: (let b = int(n.intVal); inc n; b) else: 64
+    arm64.emitLdar(ctx.buf.data, rt, rn, bits)
 
   of StlrA64:
-    # (stlr Dval Sptr) — release store Dval to [Sptr].
+    # (stlr Dval Sptr bits?) — release store Dval to [Sptr].
     inc n
     let rt = parseGprA64(n, ctx)
     let rn = parseGprA64(n, ctx)
-    arm64.emitStlr(ctx.buf.data, rt, rn)
+    let bits = if n.kind == IntLit: (let b = int(n.intVal); inc n; b) else: 64
+    arm64.emitStlr(ctx.buf.data, rt, rn, bits)
 
   of LdrbA64:
     # (ldrb Dt Bbase Iindex) — Dt ← zero-extended byte [Bbase + Iindex].
@@ -5348,7 +5354,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       if dest.kind != okMem: error("Atomic XADD requires memory destination", n)
       if op.kind != okReg: error("Atomic XADD source must be a register", n)
       x86.emitLock(ctx.buf.data)
-      x86.emitXadd(ctx.buf.data, dest.mem, op.reg)
+      x86.emitXadd(ctx.buf.data, dest.mem, op.reg, intMemAccess(dest.typ).bits)
     of CmpxchgX64:
       # `lock cmpxchg [mem], reg` — compares RAX with [mem]; on equal stores reg,
       # else loads [mem] into RAX. ZF reflects success.
@@ -5358,7 +5364,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       if dest.kind != okMem: error("Atomic CMPXCHG requires memory destination", n)
       if op.kind != okReg: error("Atomic CMPXCHG source must be a register", n)
       x86.emitLock(ctx.buf.data)
-      x86.emitCmpxchg(ctx.buf.data, dest.mem, op.reg)
+      x86.emitCmpxchg(ctx.buf.data, dest.mem, op.reg, intMemAccess(dest.typ).bits)
     else:
        error("Unsupported instruction for LOCK prefix: " & $innerInstTag, n)
 
@@ -5375,7 +5381,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     if dest.kind == okMem:
       if op.kind == okImm: error("XCHG memory, immediate not supported", n)
       if op.kind == okMem: error("XCHG memory, memory not supported", n)
-      x86.emitXchg(ctx.buf.data, dest.mem, op.reg)
+      x86.emitXchg(ctx.buf.data, dest.mem, op.reg, intMemAccess(dest.typ).bits)
     else:
       if op.kind == okImm: error("XCHG reg, immediate not supported", n)
       if op.kind == okMem:
@@ -5392,7 +5398,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     if dest.kind == okMem:
       if op.kind == okImm: error("XADD memory, immediate not supported", n)
       if op.kind == okMem: error("XADD memory, memory not supported", n)
-      x86.emitXadd(ctx.buf.data, dest.mem, op.reg)
+      x86.emitXadd(ctx.buf.data, dest.mem, op.reg, intMemAccess(dest.typ).bits)
     else:
       if op.kind == okImm: error("XADD reg, immediate not supported", n)
       if op.kind == okMem: error("XADD reg, memory not supported (dest must be r/m, src must be r)", n)
@@ -5407,7 +5413,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     if dest.kind == okMem:
       if op.kind == okImm: error("CMPXCHG memory, immediate not supported", n)
       if op.kind == okMem: error("CMPXCHG memory, memory not supported", n)
-      x86.emitCmpxchg(ctx.buf.data, dest.mem, op.reg)
+      x86.emitCmpxchg(ctx.buf.data, dest.mem, op.reg, intMemAccess(dest.typ).bits)
     else:
       if op.kind == okImm: error("CMPXCHG reg, immediate not supported", n)
       if op.kind == okMem: error("CMPXCHG reg, memory not supported (dest must be r/m, src must be r)", n)

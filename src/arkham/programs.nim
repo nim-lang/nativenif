@@ -105,6 +105,11 @@ const LinuxSyscalls* = {
   "close":      (3,   57),
   "mmap":       (9,   222),
   "munmap":     (11,  215),
+  # No libc `futex` symbol exists (callers use the generic `syscall(SYS_futex,…)`
+  # wrapper), but `std/private/syslocks` declares a *named* `futex` importc for the
+  # libc-free build precisely so this row recognizes it — the futex arguments map
+  # straight onto the kernel ABI registers (uaddr/op/val/timeout → arg0..3).
+  "futex":      (202, 98),
   "exit":       (60,  93),
   "exit_group": (231, 94),
   # libc `_exit(status)` terminates the process — map it to the `exit_group` syscall

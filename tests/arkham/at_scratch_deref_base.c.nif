@@ -1,0 +1,85 @@
+(.nif27)
+(.indexat 1317             )
+(stmts
+ (type :Pair.0 .
+  (object .
+   (fld :p.0 .
+    (i 64))
+   (fld :size.0 .
+    (i 64))))
+ (type :HL.0 .
+  (object .
+   (fld :chunks.0 .
+    (array Pair.0 4))))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :setit.0
+  (params
+   (param :np.0 .
+    (ptr HL.0))
+   (param :x.0 .
+    (i 64))
+   (param :a.0 .
+    (i 64))
+   (param :b.0 .
+    (i 64))
+   (param :c.0 .
+    (i 64))
+   (param :d.0 .
+    (i 64)))
+  (i 64)
+  (pragmas)
+  (stmts
+   (var :n.0 .
+    (ptr HL.0)np.0)
+   (var :pp.0 .
+    (ptr
+     (ptr HL.0))
+    (addr n.0))
+   (asgn
+    (at
+     (dot
+      (deref n.0)chunks.0 0)x.0)
+    (oconstr Pair.0
+     (kv p.0 a.0)
+     (kv size.0 b.0)))
+   (asgn
+    (deref pp.0)n.0)
+   (ret
+    (add
+     (i 64)
+     (add
+      (i 64)a.0 b.0)
+     (add
+      (i 64)c.0 d.0)))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :hl.0 . HL.0 .)
+   (var :i.0 .
+    (i 64)0)
+   (var :r.0 .
+    (i 64)
+    (call setit.0
+     (addr hl.0)i.0 30 12 100 200))
+   (call exit.c
+    (sub
+     (i 64)
+     (add
+      (i 64)
+      (add
+       (i 64)
+       (dot
+        (at
+         (dot hl.0 chunks.0 0)0)p.0 0)
+       (dot
+        (at
+         (dot hl.0 chunks.0 0)0)size.0 0))r.0)342)))))(.index)
