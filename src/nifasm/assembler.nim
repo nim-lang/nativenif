@@ -322,6 +322,9 @@ type
     buf: relocs.Buffer  # Code buffer (.text section) for x64
     bssBuf: relocs.Buffer  # BSS buffer (.bss section) for zero-initialized global variables
     arch: Arch
+    emitObj: bool       # `--emit-obj`: write a relocatable MH_OBJECT for the system
+                        # linker (foreign `.o`/framework linking) instead of a
+                        # standalone executable. Mach-O / arm64 only for now.
     symMap: bool        # `--symmap`: dump each generated proc's vaddr to stderr
     procName: string
     callContext: CallContext # Current call context
@@ -5813,6 +5816,143 @@ proc writeMachO(a: var GenContext; outfile: string) =
     if codesignResult != 0:
       raise newException(OSError, "codesign failed with exit code " & $codesignResult)
 
+proc machoName(name: string): string =
+  ## Mangle a nifasm symbol into a Mach-O symbol. macOS C ABI prefixes globals
+  ## with `_`; nifasm's internal names (e.g. `foo.0.mod`) only need a stable,
+  ## collision-free spelling, and `.` is valid in Mach-O symbol names.
+  "_" & name
+
+proc writeMachOObject(a: var GenContext; outfile: string) =
+  ## Emit a relocatable object instead of a standalone executable. Defined procs /
+  ## globals become exported symbols, external `extproc` references become undefined
+  ## symbols, and every fixup the executable path would resolve in-place (external
+  ## calls, gvar `adrp`/`add`, symbol-address initializers) becomes a relocation the
+  ## system linker resolves. The standalone `writeMachO` above is left untouched.
+  finalize(a.buf)
+  finalize(a.bssBuf)
+  let code = a.buf.data
+
+  let (cputype, cpusubtype) = case a.arch
+    of Arch.A64: (CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL)
+    else:
+      quit "nifasm: --emit-obj is only supported for macOS arm64"
+
+  if a.tlvSyms.len > 0:
+    quit "nifasm: --emit-obj does not yet support thread-local variables"
+
+  var labelPos = initTable[int, int]()
+  for ld in a.buf.labels: labelPos[int(ld.id)] = ld.position
+  let dataRegionSize = a.bssOffset   # local copy: the nested procs below must not
+                                     # capture the `var GenContext` param
+
+  # --- symbol table: defined first, then undefined (Mach-O dysymtab ordering) ----
+  var syms: seq[macho.MachOSym] = @[]
+  var defIndex = initTable[string, int]()   # mangled name -> index in `syms`
+
+  proc addDef(name: string; sec: macho.MachOSecKind; value: uint64): int =
+    result = defIndex.getOrDefault(name, -1)
+    if result < 0:
+      result = syms.len
+      defIndex[name] = result
+      syms.add macho.MachOSym(name: name, sec: sec, value: value, defined: true)
+
+  proc defOf(sym: Symbol): int =
+    ## Ensure `sym` is in the table as a defined symbol; return its index (or -1 if
+    ## it has no resolvable location, e.g. an un-emitted proc).
+    case sym.kind
+    of skProc:
+      if labelPos.hasKey(sym.offset):
+        addDef(machoName(sym.name), macho.moText, uint64(labelPos[sym.offset]))
+      else: -1
+    of skRodata:
+      if sym.dataConst:
+        (if sym.size < dataRegionSize: addDef(machoName(sym.name), macho.moData, uint64(sym.size)) else: -1)
+      elif labelPos.hasKey(sym.offset):
+        addDef(machoName(sym.name), macho.moText, uint64(labelPos[sym.offset]))
+      else: -1
+    of skGvar:
+      # A data symbol must point inside the emitted `__data` region; a zero-size
+      # region (`bssOffset == 0`) emits no `__data` section, so skip it then.
+      if sym.size < dataRegionSize: addDef(machoName(sym.name), macho.moData, uint64(sym.size))
+      else: -1
+    else: -1
+
+  # All generated procs (and data referenced below) become exported symbols. The
+  # synthetic per-thread TLS block is an internal artifact (unused on arm64), never
+  # a real exported global.
+  for name in a.generatedSymbols:
+    if name == "arkham.tls.0": continue
+    let sym = a.rootScope.lookup(name)
+    if sym != nil: discard defOf(sym)
+
+  # An `_main` alias at the entry proc so the system crt can find it.
+  if a.entrySym != nil and labelPos.hasKey(a.entrySym.offset):
+    discard addDef("_main", macho.moText, uint64(labelPos[a.entrySym.offset]))
+
+  # --- relocations ---------------------------------------------------------------
+  # The reloc loops below also pull their *defined* targets into the table via
+  # `defOf`. Mach-O requires every defined symbol to precede every undefined one,
+  # so we gather all of these (and their relocs) BEFORE allocating any undef index.
+  var textRels: seq[macho.MachORel] = @[]
+  var dataRels: seq[macho.MachORel] = @[]
+
+  # gvar references: the `adrp`/`add` pair → PAGE21 + PAGEOFF12 to the data symbol.
+  for (pos, sym) in a.gvarSites:
+    let si = defOf(sym)
+    if si >= 0:
+      textRels.add macho.MachORel(address: pos, symIdx: si, kind: macho.mrPage21)
+      textRels.add macho.MachORel(address: pos + 4, symIdx: si, kind: macho.mrPageoff12)
+
+  # Symbol-address pointer fields inside a rodata blob (in __text): 8-byte UNSIGNED.
+  for (labelId, blobOff, sym, _) in a.rodataSymInits:
+    let si = defOf(sym)
+    if si >= 0 and labelPos.hasKey(labelId):
+      textRels.add macho.MachORel(address: labelPos[labelId] + blobOff,
+                                  symIdx: si, kind: macho.mrUnsigned)
+
+  # Symbol-address initializers of globals (in __data): 8-byte UNSIGNED.
+  for (off, sym, _) in a.bssSymInits:
+    let si = defOf(sym)
+    if si >= 0:
+      dataRels.add macho.MachORel(address: int(off), symIdx: si, kind: macho.mrUnsigned)
+
+  # `dataConst` symbol-pointer fields (in __data): 8-byte UNSIGNED to the target.
+  for it in a.rodataRebases:
+    let si = defOf(it.target)
+    if si >= 0:
+      dataRels.add macho.MachORel(address: it.owner.size + it.blobOff,
+                                  symIdx: si, kind: macho.mrUnsigned)
+
+  let nDefined = syms.len  # everything added so far is defined; undefs come next
+
+  # Undefined symbols: one per external proc (deduplicated by external name).
+  var undefIndex = initTable[string, int]()
+  proc undefOf(extName: string): int =
+    result = undefIndex.getOrDefault(extName, -1)
+    if result < 0:
+      result = syms.len
+      undefIndex[extName] = result
+      syms.add macho.MachOSym(name: extName, defined: false)
+
+  # External calls: the BL placeholder at each call site → BRANCH26 to the undef sym.
+  for ext in a.extProcs:
+    let si = undefOf(ext.extName)
+    for cs in ext.callSites:
+      textRels.add macho.MachORel(address: cs, symIdx: si, kind: macho.mrBranch26)
+
+  # --- __data image: the whole globals region, with constant initializers baked ---
+  # (Symbol-address slots stay zero; their relocations above supply the address.)
+  var dataImage: seq[byte] = @[]
+  if a.bssOffset > 0:
+    dataImage = newSeq[byte](a.bssOffset)
+    for it in a.bssInits:
+      for i in 0 ..< it.size:
+        if it.off.int + i < dataImage.len:
+          dataImage[it.off.int + i] = byte((it.val shr (8 * i)) and 0xFF)
+
+  macho.writeMachOObject(code, dataImage, syms, nDefined, textRels, dataRels,
+                         cputype, cpusubtype, outfile)
+
 proc writeExe(a: var GenContext; outfile: string) =
   finalize(a.buf)
   finalize(a.bssBuf)
@@ -6017,7 +6157,7 @@ proc setupTls(ctx: var GenContext) =
   x86.emitSyscall(ctx.buf.data)                             # arch_prctl(ARCH_SET_FS, &block)
   x86.emitJmp(ctx.buf, LabelId(ctx.entrySym.offset))        # → real entry
 
-proc assemble*(filename, outfile: string; symMap = false) =
+proc assemble*(filename, outfile: string; symMap = false; emitObj = false) =
   var buf = parseFromFile(filename, sharedTags = asmTags)
 
   # Extract base directory from filename
@@ -6046,7 +6186,8 @@ proc assemble*(filename, outfile: string; symMap = false) =
     generatedSymbols: initHashSet[string](),
     dedupTable: initTable[string, string](),
     tlsEntryOffset: -1,
-    symMap: symMap
+    symMap: symMap,
+    emitObj: emitObj
   )
 
   # Store main module. `beginRead` BEFORE the move forces the buffer's
@@ -6107,13 +6248,22 @@ proc assemble*(filename, outfile: string; symMap = false) =
   # synthesize the entry prologue that sets the FS base (x86-64).
   setupTls(ctx)
 
-  case ctx.arch
-  of Arch.X64, Arch.LinuxA64:
-    writeElf(ctx, outfile)
-  of Arch.A64:
-    writeMachO(ctx, outfile)
-  of Arch.WinX64, Arch.WinA64:
-    writeExe(ctx, outfile.changeFileExt("exe"))
+  if ctx.emitObj:
+    # Relocatable object for the system linker (foreign `.o` / framework linking).
+    # Standalone executable emission below is unaffected.
+    case ctx.arch
+    of Arch.A64:
+      writeMachOObject(ctx, outfile)
+    else:
+      quit "nifasm: --emit-obj is only supported for macOS arm64"
+  else:
+    case ctx.arch
+    of Arch.X64, Arch.LinuxA64:
+      writeElf(ctx, outfile)
+    of Arch.A64:
+      writeMachO(ctx, outfile)
+    of Arch.WinX64, Arch.WinA64:
+      writeExe(ctx, outfile.changeFileExt("exe"))
 
   # Close all foreign-module readers (the main module has no reader).
   for modname, module in ctx.modules.mpairs:

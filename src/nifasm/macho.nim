@@ -145,6 +145,44 @@ type
     locreloff*: uint32
     nlocrel*: uint32
 
+  MachO_Nlist64* = object
+    ## One symbol-table entry (symtab string-table index + type + section + value).
+    n_strx*: uint32       # byte offset of the name in the string table
+    n_type*: uint8        # N_SECT|N_EXT for a defined symbol, N_UNDF|N_EXT for undefined
+    n_sect*: uint8        # 1-based section number (0 for undefined)
+    n_desc*: uint16
+    n_value*: uint64      # the symbol's address within the object (section addr + offset)
+
+  MachO_RelocInfo* = object
+    ## A scattered-free external relocation_info record (mach-o/reloc.h). `r_info`
+    ## is the packed bitfield r_symbolnum:24,r_pcrel:1,r_length:2,r_extern:1,r_type:4.
+    r_address*: int32     # offset of the fixup within its section
+    r_info*: uint32
+
+  # --- object-file (MH_OBJECT) emission ---------------------------------------
+  # The assembler resolves all the semantics (symbol section/value, reloc target
+  # indices) and hands these simple records to `writeMachOObject`, which keeps the
+  # standalone-executable `writeMachO` path completely untouched.
+  MachOSecKind* = enum
+    moText, moData        # which output section a *defined* symbol lives in
+
+  MachOSym* = object
+    name*: string         # final Mach-O symbol name (already mangled by the caller)
+    sec*: MachOSecKind    # only meaningful when `defined`
+    value*: uint64        # section-relative offset (caller need not add the section base)
+    defined*: bool        # false => undefined (an external reference ld must resolve)
+
+  MachORelKind* = enum
+    mrUnsigned            # 8-byte absolute pointer (ARM64_RELOC_UNSIGNED)
+    mrBranch26            # BL/B target          (ARM64_RELOC_BRANCH26)
+    mrPage21              # ADRP page            (ARM64_RELOC_PAGE21)
+    mrPageoff12           # ADD/LDR low 12 bits  (ARM64_RELOC_PAGEOFF12)
+
+  MachORel* = object
+    address*: int         # offset of the fixup within its section
+    symIdx*: int          # index into the symbol table handed to writeMachOObject
+    kind*: MachORelKind
+
 const
   DyldPath* = "/usr/lib/dyld"
   LibSystemPath* = "/usr/lib/libSystem.B.dylib"
@@ -186,6 +224,18 @@ const
   # Section types for GOT
   S_NON_LAZY_SYMBOL_POINTERS* = 0x06'u32
   S_LAZY_SYMBOL_POINTERS* = 0x07'u32
+  S_REGULAR* = 0x00'u32
+
+  # nlist_64 n_type bits (mach-o/nlist.h)
+  N_EXT* = 0x01'u8        # external symbol
+  N_UNDF* = 0x00'u8       # undefined
+  N_SECT* = 0x0e'u8       # defined in section number n_sect
+
+  # ARM64 relocation types (mach-o/arm64/reloc.h)
+  ARM64_RELOC_UNSIGNED* = 0'u32
+  ARM64_RELOC_BRANCH26* = 2'u32
+  ARM64_RELOC_PAGE21* = 3'u32
+  ARM64_RELOC_PAGEOFF12* = 4'u32
 
   # Section types for thread-local storage (macOS TLV)
   S_THREAD_LOCAL_REGULAR* = 0x11'u32       # __thread_data: initialized TLV template
@@ -813,4 +863,152 @@ proc writeMachO*(code: Bytes; bssSize: int;
 
   let perms = {fpUserExec, fpGroupExec, fpOthersExec, fpUserRead, fpUserWrite}
   setFilePermissions(outfile, perms)
+
+proc alignUp(x, a: int): int {.inline.} = (x + a - 1) and not (a - 1)
+
+proc encodeRelInfo(symIdx: int; kind: MachORelKind): uint32 =
+  ## Pack relocation_info's second word. Every reloc nifasm emits is *external*
+  ## (r_extern = 1): it references a symbol-table entry by index and lets ld supply
+  ## the final value, so we never need section-relative (scattered) relocs.
+  var pcrel, length, typ: uint32
+  case kind
+  of mrUnsigned:  pcrel = 0; length = 3; typ = ARM64_RELOC_UNSIGNED   # 8-byte pointer
+  of mrBranch26:  pcrel = 1; length = 2; typ = ARM64_RELOC_BRANCH26
+  of mrPage21:    pcrel = 1; length = 2; typ = ARM64_RELOC_PAGE21
+  of mrPageoff12: pcrel = 0; length = 2; typ = ARM64_RELOC_PAGEOFF12
+  result = (uint32(symIdx) and 0x00FFFFFF'u32) or (pcrel shl 24) or
+           (length shl 25) or (1'u32 shl 27) or (typ shl 28)
+
+proc writeMachOObject*(code: Bytes; dataImage: seq[byte];
+                       syms: seq[MachOSym]; nDefined: int;
+                       textRels, dataRels: seq[MachORel];
+                       cputype, cpusubtype: uint32; outfile: string) =
+  ## Emit a relocatable `MH_OBJECT` for the system linker to finish (the path used
+  ## when the program links against foreign `.o`s / frameworks, e.g. Objective-C).
+  ## Unlike `writeMachO` it does no address layout, GOT/stub synthesis, dyld bind
+  ## info or codesigning — undefined symbols stay undefined and references become
+  ## relocations. `syms` is ordered defined-first; `nDefined` splits the two halves.
+  let hasData = dataImage.len > 0
+  let nsects = if hasData: 2 else: 1
+
+  # Load-command sizes (one segment with all sections, plus symtab + dysymtab).
+  let segCmdSize = sizeof(MachO_Segment64) + nsects * sizeof(MachO_Section64)
+  let sizeofcmds = segCmdSize + sizeof(MachO_Symtab) + sizeof(MachO_DySymtab)
+  let ncmds = 3'u32
+  let headerSize = sizeof(MachO_Header)
+  let loadEnd = headerSize + sizeofcmds
+
+  # File/VM layout. Text sits at vm address 0; data (when present) is 8-aligned and
+  # its file gap equals its vm gap, so a symbol's vm value maps straight to its file
+  # offset. Trailing tables (relocs, symtab, strtab) follow the section content.
+  let textFileOff = loadEnd
+  let afterText = textFileOff + code.len
+  var dataFileOff = afterText
+  var dataAddr = 0
+  var afterData = afterText
+  if hasData:
+    dataFileOff = alignUp(afterText, 8)
+    dataAddr = dataFileOff - textFileOff
+    afterData = dataFileOff + dataImage.len
+  let textRelOff = alignUp(afterData, 4)
+  let dataRelOff = textRelOff + textRels.len * sizeof(MachO_RelocInfo)
+  let afterRels = dataRelOff + dataRels.len * sizeof(MachO_RelocInfo)
+  let symOff = alignUp(afterRels, 8)
+  let strOff = symOff + syms.len * sizeof(MachO_Nlist64)
+  let segFileSize = afterData - textFileOff
+  let segMemSize = alignUp(segFileSize, 8)
+
+  # String table: a leading NUL (index 0 = "unnamed"), then each name NUL-terminated.
+  var strtab = @[0'u8]
+  var strx = newSeq[uint32](syms.len)
+  for i, s in syms:
+    strx[i] = uint32(strtab.len)
+    for c in s.name: strtab.add byte(c)
+    strtab.add 0'u8
+
+  # Header (MH_OBJECT: no flags, no MH_NOUNDEFS — undefined symbols are expected).
+  var header = initMachOHeader(cputype, cpusubtype, ncmds, uint32(sizeofcmds), 0)
+  header.filetype = MH_OBJECT
+
+  # The single (unnamed) segment carries every section; ld re-segments by the
+  # per-section segname (__TEXT / __DATA) at link time.
+  var segment = initSegment64("", 0, uint64(segMemSize), uint64(textFileOff),
+                              uint64(segFileSize),
+                              VM_PROT_READ or VM_PROT_WRITE or VM_PROT_EXECUTE,
+                              VM_PROT_READ or VM_PROT_WRITE or VM_PROT_EXECUTE,
+                              uint32(nsects))
+
+  var textSection = initSection64("__text", "__TEXT", 0, uint64(code.len),
+                                  uint32(textFileOff), 2,
+                                  S_ATTR_PURE_INSTRUCTIONS or S_ATTR_SOME_INSTRUCTIONS)
+  textSection.reloff = uint32(textRelOff)
+  textSection.nreloc = uint32(textRels.len)
+
+  var dataSection: MachO_Section64
+  if hasData:
+    dataSection = initSection64("__data", "__DATA", uint64(dataAddr),
+                                uint64(dataImage.len), uint32(dataFileOff), 3, S_REGULAR)
+    dataSection.reloff = uint32(dataRelOff)
+    dataSection.nreloc = uint32(dataRels.len)
+
+  var symtab: MachO_Symtab
+  symtab.cmd = LC_SYMTAB
+  symtab.cmdsize = uint32(sizeof(MachO_Symtab))
+  symtab.symoff = uint32(symOff)
+  symtab.nsyms = uint32(syms.len)
+  symtab.stroff = uint32(strOff)
+  symtab.strsize = uint32(strtab.len)
+
+  var dysymtab: MachO_DySymtab
+  dysymtab.cmd = LC_DYSYMTAB
+  dysymtab.cmdsize = uint32(sizeof(MachO_DySymtab))
+  dysymtab.iextdefsym = 0
+  dysymtab.nextdefsym = uint32(nDefined)
+  dysymtab.iundefsym = uint32(nDefined)
+  dysymtab.nundefsym = uint32(syms.len - nDefined)
+
+  var f = newFileStream(outfile, fmWrite)
+
+  f.write(header)
+  f.write(segment)
+  f.write(textSection)
+  if hasData: f.write(dataSection)
+  f.write(symtab)
+  f.write(dysymtab)
+
+  # Section content (we are now at `loadEnd` == textFileOff).
+  if code.len > 0:
+    f.writeData(code.rawData, code.len)
+  if hasData:
+    for _ in afterText ..< dataFileOff: f.write(0'u8)   # pad text→data
+    f.writeData(unsafeAddr dataImage[0], dataImage.len)
+
+  # Relocations.
+  for _ in afterData ..< textRelOff: f.write(0'u8)
+  for r in textRels:
+    f.write(MachO_RelocInfo(r_address: int32(r.address),
+                            r_info: encodeRelInfo(r.symIdx, r.kind)))
+  for r in dataRels:
+    f.write(MachO_RelocInfo(r_address: int32(r.address),
+                            r_info: encodeRelInfo(r.symIdx, r.kind)))
+
+  # Symbol table.
+  for _ in afterRels ..< symOff: f.write(0'u8)
+  for i, s in syms:
+    var nl: MachO_Nlist64
+    nl.n_strx = strx[i]
+    if s.defined:
+      nl.n_type = N_SECT or N_EXT
+      nl.n_sect = if s.sec == moText: 1'u8 else: 2'u8
+      nl.n_value = (if s.sec == moData: uint64(dataAddr) else: 0'u64) + s.value
+    else:
+      nl.n_type = N_UNDF or N_EXT
+      nl.n_sect = 0
+      nl.n_value = 0
+    f.write(nl)
+
+  # String table.
+  f.writeData(unsafeAddr strtab[0], strtab.len)
+
+  f.close()
 
