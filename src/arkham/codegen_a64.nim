@@ -550,36 +550,50 @@ proc genProctypeSig(g: var CodeGen; c: var Cursor) =
   ## *indirect* `(prepare …)` call through a function pointer against it. A function
   ## pointer is still 8 bytes (nifasm sizes `ProcT` as a pointer); the signature is
   ## metadata for call sites.
+  ##
+  ## The signature mirrors `emitSignature`'s declarative split. A DECLARATIVE proctype
+  ## (all single-GPR scalar params + scalar/void result) states the positional
+  ## `pN.0`/`ret.0` ABI so an indirect `(prepare …)` is cross-checked via `(arg pN)`/
+  ## `(res ret.0)`. A NON-declarative one (a float/aggregate param or an aggregate
+  ## return — e.g. a CPS continuation `proc(c): Continuation`) emits EMPTY `(params)`/
+  ## `(result)`, exactly as a non-declarative concrete proc does, so nifasm requires no
+  ## per-param bindings and the call site marshals args into raw ABI registers itself.
+  let declarative = isDeclarativeAbi(g.prog, c)
   g.ab.proctypeType:
-    c.into:
-      skip c                                    # the Empty slot (a proc has its name here)
-      g.ab.tree ParamsD:
-        if c.kind == TagLit:                    # (params (param …) …)
-          var idx = 0
-          c.into:
-            while c.hasMore:
-              c.into:                           # (param :name pragmas type)
-                inc c                           # name → positional pN.0
-                skip c                          # pragmas
-                g.ab.tree ParamD:
-                  g.ab.symDef paramName(idx)
-                  if idx < IntArgRegs.len: g.ab.reg IntArgRegs[idx]  # raw reg *location*
-                  else: g.ab.keyword SO         # 9th+ → stack-passed
-                  g.genPointee(c)              # param type BY REFERENCE (named → sym);
+    if declarative:
+      c.into:
+        skip c                                  # the Empty slot (a proc has its name here)
+        g.ab.tree ParamsD:
+          if c.kind == TagLit:                  # (params (param …) …)
+            var idx = 0
+            c.into:
+              while c.hasMore:
+                c.into:                         # (param :name pragmas type)
+                  inc c                         # name → positional pN.0
+                  skip c                        # pragmas
+                  g.ab.tree ParamD:
+                    g.ab.symDef paramName(idx)
+                    if idx < IntArgRegs.len: g.ab.reg IntArgRegs[idx]  # raw reg *location*
+                    else: g.ab.keyword SO       # 9th+ → stack-passed
+                    g.genPointee(c)            # param type BY REFERENCE (named → sym);
                                                # a self-referential closure sig can't recurse
-                while c.hasMore: skip c
-              inc idx
-        else:
-          skip c
-      g.ab.tree ResultD:
-        # The RetType is always the node after Params (a `.`/`(void)` for void).
-        if retIsVoid(c):
-          skip c                                # consume the void `.`/`(void)` node
-        else:
-          g.ab.symDef "ret.0"
-          g.ab.reg IntRet                       # raw reg *location* of the result
-          g.genPointee(c)                       # return type BY REFERENCE (named → sym)
-      while c.hasMore: skip c                    # pragmas
+                  while c.hasMore: skip c
+                inc idx
+          else:
+            skip c
+        g.ab.tree ResultD:
+          # The RetType is always the node after Params (a `.`/`(void)` for void).
+          if retIsVoid(c):
+            skip c                              # consume the void `.`/`(void)` node
+          else:
+            g.ab.symDef "ret.0"
+            g.ab.reg IntRet                     # raw reg *location* of the result
+            g.genPointee(c)                     # return type BY REFERENCE (named → sym)
+        while c.hasMore: skip c                  # pragmas
+    else:
+      g.ab.keyword ParamsD
+      g.ab.keyword ResultD
+      skip c                                     # advance past the whole proctype node
     g.ab.tree ClobberD:
       for r in ConvClobbersGpr: g.ab.reg r   # a clobber *declaration*: raw reg locations
 
@@ -2034,17 +2048,11 @@ proc emitAtomic2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
   else: raiseAssert "arkham a64n: unsupported atomic builtin: " & builtin
 
 proc proctypeOfTarget(g: var CodeGen; targetCur: Cursor): Cursor =
-  ## The resolved proctype body of an indirect call target, for ABI queries. Two target
-  ## shapes: a `(cast Proctype fnptr)` (vtable load) carries the proctype as its cast
-  ## TARGET TYPE; any other fn-ptr EXPRESSION (e.g. a closure's `(dot clo fld.0)` proc
-  ## field) carries it as the expression's TYPE — so resolve `getType(expr)`, not the
-  ## expression itself. A `(ptr proctype)` field type is peeled to the proctype body.
-  var ptType: Cursor
-  if targetCur.kind == TagLit and targetCur.exprKind in {CastC, ConvC}:
-    ptType = targetCur; inc ptType                       # the cast's target type
-  else:
-    ptType = g.getType(targetCur)                        # the fn-ptr expression's type
-  result = resolveType(g.prog, ptType)
+  ## The resolved proctype body of an indirect call target, for ABI queries. The target
+  ## is just an EXPRESSION whose type IS the proctype — a proc-typed local/param, a
+  ## closure's `(dot clo fld.0)` field, or a vtable `(cast Proctype …)` (`getType` of a
+  ## cast yields its target type). One rule: `getType(target)`, peel a `(ptr proctype)`.
+  result = resolveType(g.prog, g.getType(targetCur))
   if result.kind == TagLit and result.typeKind != ProctypeT:
     var inner = result; inc inner                        # peel `(ptr proctype)` → proctype
     result = resolveType(g.prog, inner)
@@ -2079,11 +2087,10 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
   # Resolve the ABI description (`tgt`) and the `(prepare …)` symbol uniformly.
   var tgt: CallTarget
   var fnptrReg = NoReg                               # indirect: the fn-ptr's held register
-  var fnptrTemp = false
+  var fnTargetName = ""                              # indirect: the synthesized binding to kill
   if indirect:                                       # target is a fn-ptr expression
     let proctype = g.proctypeOfTarget(targetCur)
-    if not isDeclarativeAbi(g.prog, proctype):
-      raiseAssert "arkham a64n: non-declarative indirect call not yet supported"
+    let declarative = isDeclarativeAbi(g.prog, proctype)
     var retType = proctype                           # the proctype's return type (3rd child)
     block:
       var q = proctype
@@ -2091,22 +2098,47 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
         skip q; skip q                               # the Empty (name) slot, the params
         retType = q
         while q.hasMore: skip q
-    # A `(cast Proctype …)` binds its register as a PROCTYPE-typed temp, whose `regLocal`
-    # name is a ProcT symbol nifasm accepts as a `(prepare …)` target. It stays bound
-    # across arg evaluation below.
-    g.emitValue2(targetCur)                          # fn-ptr → its (held) register, proctype-bound
+    # Evaluate the fn-ptr EXPRESSION into its allocator-assigned (held) register — the
+    # call target is just an expression (like codegen.c's `genx`), be it a `(cast
+    # Proctype …)` vtable load, a `(dot closure fld)`, a proc-typed local or PARAM.
+    g.emitValue2(targetCur)
     let tloc = g.ra.locs[g.posOf(targetCur)]
     assert tloc.kind == InReg, "arkham a64n: indirect call target loc " & $tloc.kind
     fnptrReg = tloc.r
-    fnptrTemp = tloc.isTemp
-    assert g.regLocal.hasKey(fnptrReg), "arkham a64n: indirect call target not bound to a name"
-    tgt = CallTarget(declarative: true, asmName: g.regLocal[fnptrReg], retType: retType)
+    # nifasm needs the `(prepare …)` target to be a ProcT-typed symbol. A register-homed
+    # proc-typed LOCAL is already declared `(var :f (reg) (proctype …))` — reuse it. Any
+    # other shape (a proc-typed PARAM left as a raw/aliased register, or a stack-homed
+    # local / complex fn-ptr expression loaded into a scalar-typed temp) gets a fresh
+    # PROCTYPE-typed name here: `rebind` is rename-only (keeps the value) and auto-kills
+    # any prior binding on the register. Killed after the call (`fnTargetName`).
+    if targetCur.kind == Symbol and g.regLocal.getOrDefault(fnptrReg, "") == symName(targetCur):
+      tgt = CallTarget(declarative: declarative, asmName: symName(targetCur), retType: retType)
+    else:
+      let nm = "fntmp" & $g.tmpBindCount & ".0"; inc g.tmpBindCount
+      g.ab.tree RebindA64:
+        g.ab.symDef nm
+        var pc = proctype
+        g.genTypeBody(pc)                            # the proctype signature → ProcT
+        g.ab.reg fnptrReg
+      g.regLocal[fnptrReg] = nm
+      g.boundTemps.incl fnptrReg
+      fnTargetName = nm
+      tgt = CallTarget(declarative: declarative, asmName: nm, retType: retType)
   else:
     if not g.callTarget.hasKey(fsym):
       let si = g.lookupSym(fsym)
       if si.cat in {scGlobal, scTvar}:
-        g.callTarget[fsym] = CallTarget(declarative: true, indirect: true,
-          asmName: fsym, retType: g.indirectRetType(si.decl))
+        # A call through a global/threadvar function POINTER. Its ABI follows the gvar's
+        # proctype — declarative only when every param/result is a single-GPR scalar; an
+        # aggregate-by-value param (a CPS continuation) is non-declarative.
+        var d = si.decl
+        var proctype: Cursor
+        d.into:
+          inc d; skip d                             # name, pragmas
+          proctype = resolveType(g.prog, d)         # the (proctype …) body
+          while d.hasMore: skip d
+        g.callTarget[fsym] = CallTarget(declarative: isDeclarativeAbi(g.prog, proctype),
+          indirect: true, asmName: fsym, retType: g.indirectRetType(si.decl))
       else:
         g.callTarget[fsym] = foreignCallTarget(g.prog, fsym)
     tgt = g.callTarget[fsym]
@@ -2162,8 +2194,11 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
         g.ab.tree MovA64:
           g.emReg IntRet
           g.ab.tree ResX: g.ab.sym "ret.0"
-    # release the fn-ptr register (indirect only): its proctype temp is dead post-call.
-    if indirect and fnptrTemp: g.unbindTemp(fnptrReg)
+    # release the synthesized fn-ptr binding (indirect only): dead post-call.
+    if fnTargetName.len > 0:
+      g.ab.tree KillA64: g.ab.sym fnTargetName
+      g.regLocal.del fnptrReg
+      g.boundTemps.excl fnptrReg
     if hasResult and resLoc.kind == InReg and resLoc.r != IntRet:
       # x0 itself is raw-usable (arg/return reg) and needs no binding; only a result
       # moved to a non-x0 home (a pool reg) is bound so its checked name resolves.
@@ -2230,6 +2265,11 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
     g.ab.tree PrepareA64:
       g.ab.sym tgt.asmName
       g.ab.keyword (if tgt.extern: ExtcallA64 else: CallA64)
+    # release the synthesized fn-ptr binding (indirect only): dead post-call.
+    if fnTargetName.len > 0:
+      g.ab.tree KillA64: g.ab.sym fnTargetName
+      g.regLocal.del fnptrReg
+      g.boundTemps.excl fnptrReg
     if hasResult:
       if resultIsFloat:
         if resLoc.kind == InFReg:

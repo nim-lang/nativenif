@@ -79,7 +79,15 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
     if tc.symType[].hasKey(nm): return tc.symType[][nm]
     let si = tc.lookupSym(nm)
     case si.cat
-    of scProc: result = tc.prog[].procPtr     # a proc as a value → its code-pointer type
+    of scProc:
+      # A proc as a VALUE → its SIGNATURE `(proctype …)`, so a call's result type is
+      # uniformly the return type of the callee's proctype (no static-vs-indirect branch
+      # in `CallC`). Cache a foreign proc's target on first sight (the same lazy resolution
+      # the emitter does). Falls back to the generic code-pointer if the signature is unknown.
+      if not tc.callTarget[].hasKey(nm) and isForeignSym(tc.prog[], nm):
+        tc.callTarget[][nm] = foreignCallTarget(tc.prog[], nm)
+      let ct = tc.callTarget[].getOrDefault(nm)
+      result = if not cursorIsNil(ct.sigType): ct.sigType else: tc.prog[].procPtr
     of scGlobal, scTvar:
       var d = si.decl
       d.into:
@@ -117,22 +125,22 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
         result = innerType(tc.prog[], ptrTy)
         while t.hasMore: skip t
     of CallC:
+      # The type of a call is the RETURN TYPE OF THE CALLEE — always. The callee `fn` is
+      # just an expression whose type is a proctype (a proc symbol carries its signature
+      # via `getType`; a fn-ptr local/param/global, a vtable `(cast Proctype …)`, a closure
+      # field carry theirs as their value type). Peel a `(ptr proctype)`, take the 3rd
+      # child. ONE rule — no static-vs-indirect, no `callTarget` lookup special case.
       var t = c
       t.into:
-        let callee = symName(t)
-        if tc.callTarget[].hasKey(callee):
-          result = tc.callTarget[][callee].retType
-        else:
-          # A foreign call whose target the emitter hasn't lazily cached yet (allocation
-          # runs before the call is emitted): resolve its return type from the owning
-          # module now and cache it (the emitter reuses the entry). Needed e.g. for a
-          # global var initialized by a cross-module call (`var s = newStringStream()`).
-          if isForeignSym(tc.prog[], callee):
-            let ct = foreignCallTarget(tc.prog[], callee)
-            tc.callTarget[][callee] = ct
-            result = ct.retType
-          else:
-            result = tc.callTarget[].getOrDefault(callee).retType
+        var proctype = resolveType(tc.prog[], tc.getType(t))
+        if proctype.kind == TagLit and proctype.typeKind != ProctypeT:
+          var inner = proctype; inc inner              # peel `(ptr proctype)` → proctype
+          proctype = resolveType(tc.prog[], inner)
+        var q = proctype                               # (proctype Empty Params RetType Pragmas)
+        q.into:
+          skip q; skip q                               # the Empty (name) slot, the params
+          result = q                                   # the return type
+          while q.hasMore: skip q
         while t.hasMore: skip t
     of NilC: result = tc.prog[].voidPtr       # nil → a generic pointer type
     of TrueC, FalseC,                         # bool literals & bool-valued operators
