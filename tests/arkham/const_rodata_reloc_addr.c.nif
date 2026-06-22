@@ -1,0 +1,36 @@
+(.nif27)
+(.indexat 537              )
+(stmts
+ (type :Tab.0 .
+  (object .
+   (fld :a.0 .
+    (i 32))
+   (fld :p.0 .
+    (ptr
+     (i 32)))))
+ (const :cval.0 .
+  (i 32)42)
+ (const :tab.0 . Tab.0
+  (oconstr Tab.0
+   (kv a.0 7)
+   (kv p.0
+    (addr cval.0))))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (call exit.c
+    (add
+     (i 32)
+     (deref
+      (dot tab.0 p.0 0))
+     (dot tab.0 a.0 0))))))(.index)

@@ -117,7 +117,8 @@ type
     isTemp*: bool
     case kind*: LocKind
     of Undef, NeedsReg, RegOrImm: discard
-    of InReg: r*: Reg
+    of InReg:
+      r*: Reg
     of InFReg: f*: FReg
     of OnStack: offset*: int
     of NamedStack, Glob, Tvar: name*: string

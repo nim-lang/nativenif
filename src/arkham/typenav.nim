@@ -56,6 +56,17 @@ proc lookupSym*(tc: TypeCtx; nm: string): SymInfo =
     of TvarS: return SymInfo(cat: scTvar, decl: d)
     else: return SymInfo(cat: scGlobal, decl: d)
 
+proc isIndirectCallTarget*(tc: TypeCtx; targetCur: Cursor): bool =
+  ## A call is INDIRECT (dispatched through a fn-ptr value, not a `(prepare sym …)`)
+  ## when its target is NOT a Symbol (a vtable / closure-field expression), OR a
+  ## Symbol naming a proc-typed function LOCAL/parameter — `lookupSym` returns
+  ## `scNone` for a function-local, vs `scProc` for a module/foreign proc decl (and
+  ## `scGlobal`/`scTvar` for a proc-VAR, which the emitter dispatches via its own
+  ## symbol-indirect path). Without this, a bare-Symbol call through a proc-typed
+  ## param/local was mis-sent to the foreign-proc resolver (`foreignCallTarget`
+  ## asserts "not a foreign proc").
+  targetCur.kind != Symbol or tc.lookupSym(symName(targetCur)).cat == scNone
+
 proc getType*(tc: TypeCtx; c: Cursor): Cursor =
   ## The structural Leng type cursor of expression `c` (arkham's analog of
   ## `typenav.getType`). Symbols resolve through `symType` / the global/tvar
@@ -68,7 +79,15 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
     if tc.symType[].hasKey(nm): return tc.symType[][nm]
     let si = tc.lookupSym(nm)
     case si.cat
-    of scProc: result = tc.prog[].procPtr     # a proc as a value → its code-pointer type
+    of scProc:
+      # A proc as a VALUE → its SIGNATURE `(proctype …)`, so a call's result type is
+      # uniformly the return type of the callee's proctype (no static-vs-indirect branch
+      # in `CallC`). Cache a foreign proc's target on first sight (the same lazy resolution
+      # the emitter does). Falls back to the generic code-pointer if the signature is unknown.
+      if not tc.callTarget[].hasKey(nm) and isForeignSym(tc.prog[], nm):
+        tc.callTarget[][nm] = foreignCallTarget(tc.prog[], nm)
+      let ct = tc.callTarget[].getOrDefault(nm)
+      result = if not cursorIsNil(ct.sigType): ct.sigType else: tc.prog[].procPtr
     of scGlobal, scTvar:
       var d = si.decl
       d.into:
@@ -79,7 +98,7 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
   of TagLit:
     case c.exprKind
     of AddC, SubC, MulC, DivC, ModC, ShlC, ShrC, BitandC, BitorC, BitxorC,
-       BitnotC, NegC, NotC, ConvC, CastC, OconstrC, AconstrC:
+       BitnotC, NegC, ConvC, CastC, OconstrC, AconstrC:
       var t = c
       t.into:
         result = t                            # the carried result/target type
@@ -106,11 +125,27 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
         result = innerType(tc.prog[], ptrTy)
         while t.hasMore: skip t
     of CallC:
+      # The type of a call is the RETURN TYPE OF THE CALLEE — always. The callee `fn` is
+      # just an expression whose type is a proctype (a proc symbol carries its signature
+      # via `getType`; a fn-ptr local/param/global, a vtable `(cast Proctype …)`, a closure
+      # field carry theirs as their value type). Peel a `(ptr proctype)`, take the 3rd
+      # child. ONE rule — no static-vs-indirect, no `callTarget` lookup special case.
       var t = c
       t.into:
-        result = tc.callTarget[].getOrDefault(symName(t)).retType
+        var proctype = resolveType(tc.prog[], tc.getType(t))
+        if proctype.kind == TagLit and proctype.typeKind != ProctypeT:
+          var inner = proctype; inc inner              # peel `(ptr proctype)` → proctype
+          proctype = resolveType(tc.prog[], inner)
+        var q = proctype                               # (proctype Empty Params RetType Pragmas)
+        q.into:
+          skip q; skip q                               # the Empty (name) slot, the params
+          result = q                                   # the return type
+          while q.hasMore: skip q
         while t.hasMore: skip t
     of NilC: result = tc.prog[].voidPtr       # nil → a generic pointer type
+    of TrueC, FalseC,                         # bool literals & bool-valued operators
+       EqC, NeqC, LtC, LeC, AndC, OrC, NotC, OvfC:   # `(not operand)` carries NO type child
+      result = tc.prog[].boolType
     of AddrC:                                 # &lvalue → (ptr <type-of-lvalue>)
       var t = c; inc t
       result = tc.prog[].ptrTypeOf(tc.getType(t))
@@ -140,7 +175,7 @@ proc exprSlot*(tc: TypeCtx; c: Cursor): AsmSlot =
   of TagLit:
     case c.exprKind
     of AddrC: slotOf(tc.prog[], tc.getType(c))                       # &lvalue → precise (ptr <elem>)
-    of NilC: AsmSlot(cls: AUInt, size: 8, align: 8)                 # nil → a generic pointer
+    of NilC: AsmSlot(cls: AUInt, size: 8, align: 8, typ: tc.prog[].nilLit)  # nil → the `(nil)` type
     of TrueC, FalseC: AsmSlot(cls: AUInt, size: 1, align: 1)        # a bool
     of SizeofC, AlignofC: AsmSlot(cls: AInt, size: 8, align: 8)     # an integer constant
     of SufC, ParC:                                                   # wrappers → the inner value

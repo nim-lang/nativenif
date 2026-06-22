@@ -1,0 +1,54 @@
+(.nif27)
+(.indexat 806              )
+(stmts
+ (type :Big.0 .
+  (object .
+   (fld :a.0 .
+    (i 64))
+   (fld :b.0 .
+    (i 64))
+   (fld :c.0 .
+    (i 64))))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :consume.0
+  (params
+   (param :o.0 . Big.0))
+  (i 64)
+  (pragmas)
+  (stmts
+   (ret
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (dot o.0 a.0 0)
+      (dot o.0 b.0 0))
+     (dot o.0 c.0 0)))))
+ (proc :forward.0
+  (params
+   (param :o.0 . Big.0))
+  (i 64)
+  (pragmas)
+  (stmts
+   (ret
+    (call consume.0 o.0))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :r.0 .
+    (i 64)
+    (call forward.0
+     (oconstr Big.0
+      (kv a.0 12)
+      (kv b.0 14)
+      (kv c.0 16))))
+   (call exit.c r.0))))(.index)

@@ -1,0 +1,36 @@
+(.nif27)
+(.indexat 528              )
+(stmts
+ (type :Obj.0 .
+  (object .
+   (fld :x.0 .
+    (i 64))
+   (fld :f.0 .
+    (f 64))))
+ (gvar :g.0 . Obj.0
+  (oconstr Obj.0
+   (kv x.0 7)
+   (kv f.0 42.0)))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :d.0 .
+    (f 64)
+    (mul
+     (f 64)
+     (dot g.0 f.0 0)1.0))
+   (var :r.0 .
+    (i 64)
+    (conv
+     (i 64)d.0))
+   (call exit.c r.0))))(.index)

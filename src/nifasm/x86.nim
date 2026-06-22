@@ -645,27 +645,38 @@ proc emitCmpImm*(dest: var Bytes; reg: Register; imm: int32) =
   dest.add(encodeModRM(amDirect, 7, int(reg)))  # /7 extension
   dest.addt32(imm)
 
-proc emitAluImmMem(dest: var Bytes; ext: int; mem: MemoryOperand; imm: int32) =
-  ## `<alu> r/m64, imm32` with a MEMORY destination (opcode 0x81). `ext` is the
-  ## ModRM.reg opcode-extension digit (ADD=0, OR=1, AND=4, SUB=5, XOR=6) — the same
-  ## group-1 encoding as the register-immediate forms, but the r/m field addresses
-  ## memory. Lets an ALU op run in place on a stack slot (`add [rsp+n], imm`).
+proc emitAluImmMem(dest: var Bytes; ext: int; mem: MemoryOperand; imm: int32; bits = 64) =
+  ## `<alu> r/m, imm` with a MEMORY destination, SIZED to `bits` (8/16/32/64). `ext`
+  ## is the ModRM.reg opcode-extension digit (ADD=0, OR=1, AND=4, SUB=5, XOR=6, CMP=7).
+  ## Only a 64-bit operand gets REX.W; a 32-bit op omits it (else the read/write spans 8
+  ## bytes — the sub-word-field over-read that made `cmp [u32field], 0` read the adjacent
+  ## field); 16-bit takes the 0x66 prefix; 8-bit uses opcode 0x80 + imm8. Lets an ALU op
+  ## run in place on a stack slot / a sized field (`add [rsp+n], imm`, `cmp [u32], 0`).
   emitSegPrefix(dest, mem)
-  var rex = RexPrefix(w: true)
-  if needsRex(mem.base): rex.b = true            # ext (0..6) needs no REX.R
+  if bits == 16: dest.add(0x66)                  # operand-size override → 16-bit
+  var rex = RexPrefix(w: bits == 64)             # REX.W ONLY for a 64-bit operand
+  if needsRex(mem.base): rex.b = true            # ext (0..7) needs no REX.R
   if mem.hasIndex and needsRex(mem.index): rex.x = true
   if rex.b or rex.x or rex.w:
     dest.add(encodeRex(rex))
-  dest.add(0x81)
-  dest.emitMem(ext, mem)                         # reg field = opcode extension
-  dest.addt32(imm)
+  if bits == 8:
+    dest.add(0x80)                               # group-1 r/m8, imm8
+    dest.emitMem(ext, mem)
+    dest.add(byte(imm and 0xFF))
+  else:
+    dest.add(0x81)                               # group-1 r/m{16,32,64}, imm{16,32}
+    dest.emitMem(ext, mem)                       # reg field = opcode extension
+    if bits == 16:
+      dest.add(byte(imm and 0xFF)); dest.add(byte((imm shr 8) and 0xFF))
+    else:
+      dest.addt32(imm)
 
-proc emitCmpImm*(dest: var Bytes; mem: MemoryOperand; imm: int32) = emitAluImmMem(dest, 7, mem, imm)
-proc emitAddImm*(dest: var Bytes; mem: MemoryOperand; imm: int32) = emitAluImmMem(dest, 0, mem, imm)
-proc emitSubImm*(dest: var Bytes; mem: MemoryOperand; imm: int32) = emitAluImmMem(dest, 5, mem, imm)
-proc emitAndImm*(dest: var Bytes; mem: MemoryOperand; imm: int32) = emitAluImmMem(dest, 4, mem, imm)
-proc emitOrImm*(dest: var Bytes; mem: MemoryOperand; imm: int32)  = emitAluImmMem(dest, 1, mem, imm)
-proc emitXorImm*(dest: var Bytes; mem: MemoryOperand; imm: int32) = emitAluImmMem(dest, 6, mem, imm)
+proc emitCmpImm*(dest: var Bytes; mem: MemoryOperand; imm: int32; bits = 64) = emitAluImmMem(dest, 7, mem, imm, bits)
+proc emitAddImm*(dest: var Bytes; mem: MemoryOperand; imm: int32; bits = 64) = emitAluImmMem(dest, 0, mem, imm, bits)
+proc emitSubImm*(dest: var Bytes; mem: MemoryOperand; imm: int32; bits = 64) = emitAluImmMem(dest, 5, mem, imm, bits)
+proc emitAndImm*(dest: var Bytes; mem: MemoryOperand; imm: int32; bits = 64) = emitAluImmMem(dest, 4, mem, imm, bits)
+proc emitOrImm*(dest: var Bytes; mem: MemoryOperand; imm: int32; bits = 64)  = emitAluImmMem(dest, 1, mem, imm, bits)
+proc emitXorImm*(dest: var Bytes; mem: MemoryOperand; imm: int32; bits = 64) = emitAluImmMem(dest, 6, mem, imm, bits)
 
 # Shift operations
 proc emitShl*(dest: var Bytes; reg: Register; count: int) =
@@ -1092,18 +1103,21 @@ proc emitXchg*(dest: var Bytes; a, b: Register) =
   dest.add(0x87)  # XCHG r/m64, r64 opcode
   dest.add(encodeModRM(amDirect, int(b), int(a)))  # reg=b, rm=a
 
-proc emitXchg*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
-  ## Emit XCHG instruction: XCHG mem, reg
+proc emitXchg*(dest: var Bytes; mem: MemoryOperand; reg: Register; bits = 64) =
+  ## Emit XCHG mem, reg sized to `bits` (∈ {8,16,32,64}). REX.W only for 64-bit, the
+  ## 0x66 prefix for 16-bit, and the byte opcode for 8-bit — so an atomic exchange on
+  ## a sub-64-bit lock word does not access (and lock) the adjacent bytes.
   emitSegPrefix(dest, mem)
-  var rex = RexPrefix(w: true)
+  if bits == 16: dest.add(0x66)
+  var rex = RexPrefix(w: bits == 64)
   if needsRex(reg): rex.r = true
   if needsRex(mem.base): rex.b = true
   if mem.hasIndex and needsRex(mem.index): rex.x = true
-
-  if rex.r or rex.b or rex.x or rex.w:
+  let forceRex = bits == 8 and int(reg) in 4..7
+  if rex.r or rex.b or rex.x or rex.w or forceRex:
     dest.add(encodeRex(rex))
 
-  dest.add(0x87) # XCHG r/m64, r64
+  dest.add(if bits == 8: 0x86 else: 0x87)  # XCHG r/m8,r8  /  XCHG r/m(16|32|64),r
   dest.emitMem(int(reg), mem)
 
 proc emitXadd*(dest: var Bytes; a, b: Register) =
@@ -1122,19 +1136,20 @@ proc emitXadd*(dest: var Bytes; a, b: Register) =
   dest.add(0xC1)  # XADD r/m64, r64 opcode
   dest.add(encodeModRM(amDirect, int(b), int(a)))  # reg=source(b), rm=dest(a)
 
-proc emitXadd*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
-  ## Emit XADD instruction: XADD mem, reg
+proc emitXadd*(dest: var Bytes; mem: MemoryOperand; reg: Register; bits = 64) =
+  ## Emit XADD mem, reg sized to `bits` (∈ {8,16,32,64}) — see `emitXchg`.
   emitSegPrefix(dest, mem)
-  var rex = RexPrefix(w: true)
+  if bits == 16: dest.add(0x66)
+  var rex = RexPrefix(w: bits == 64)
   if needsRex(reg): rex.r = true
   if needsRex(mem.base): rex.b = true
   if mem.hasIndex and needsRex(mem.index): rex.x = true
-
-  if rex.r or rex.b or rex.x or rex.w:
+  let forceRex = bits == 8 and int(reg) in 4..7
+  if rex.r or rex.b or rex.x or rex.w or forceRex:
     dest.add(encodeRex(rex))
 
   dest.add(0x0F)
-  dest.add(0xC1)
+  dest.add(if bits == 8: 0xC0 else: 0xC1)  # XADD r/m8,r8  /  XADD r/m(16|32|64),r
   dest.emitMem(int(reg), mem)
 
 # Atomic compare and exchange
@@ -1154,19 +1169,22 @@ proc emitCmpxchg*(dest: var Bytes; a, b: Register) =
   dest.add(0xB1)  # CMPXCHG r/m64, r64 opcode
   dest.add(encodeModRM(amDirect, int(b), int(a)))  # reg=source(b), rm=dest(a)
 
-proc emitCmpxchg*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
-  ## Emit CMPXCHG instruction: CMPXCHG mem, reg
+proc emitCmpxchg*(dest: var Bytes; mem: MemoryOperand; reg: Register; bits = 64) =
+  ## Emit CMPXCHG mem, reg sized to `bits` (∈ {8,16,32,64}). The implicit accumulator
+  ## (AL/AX/EAX/RAX) and the store width follow the same size — a 64-bit CMPXCHG on a
+  ## `uint32` lock word would compare/WRITE 8 bytes and corrupt the next field.
   emitSegPrefix(dest, mem)
-  var rex = RexPrefix(w: true)
+  if bits == 16: dest.add(0x66)
+  var rex = RexPrefix(w: bits == 64)
   if needsRex(reg): rex.r = true
   if needsRex(mem.base): rex.b = true
   if mem.hasIndex and needsRex(mem.index): rex.x = true
-
-  if rex.r or rex.b or rex.x or rex.w:
+  let forceRex = bits == 8 and int(reg) in 4..7
+  if rex.r or rex.b or rex.x or rex.w or forceRex:
     dest.add(encodeRex(rex))
 
   dest.add(0x0F)
-  dest.add(0xB1)
+  dest.add(if bits == 8: 0xB0 else: 0xB1)  # CMPXCHG r/m8,r8  /  CMPXCHG r/m(16|32|64),r
   dest.emitMem(int(reg), mem)
 
 # Atomic compare and exchange with 8-byte operand

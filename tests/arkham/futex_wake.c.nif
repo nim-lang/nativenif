@@ -1,0 +1,44 @@
+(.nif27)
+(.indexat 627              )
+(stmts
+ (proc :futex.c
+  (params
+   (param :uaddr.0 .
+    (ptr
+     (u 32)))
+   (param :op.0 .
+    (i 64))
+   (param :val.0 .
+    (i 64))
+   (param :timeout.0 .
+    (i 64)))
+  (i 64)
+  (pragmas
+   (importc "futex"))
+  (stmts .))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0.
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :w.0 .
+    (u 32)0)
+   (var :r.0 .
+    (i 64)
+    (call futex.c
+     (addr w.0)129 1 0))
+   (call exit.c
+    (add
+     (i 32)42
+     (cast
+      (i 32)r.0)))
+   (ret 0))))(.index
+ (x main.0. 370))

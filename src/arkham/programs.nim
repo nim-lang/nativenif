@@ -41,6 +41,9 @@ type
                              ## lowered inline to a native bit instruction (bsf/bsr/…)
     retFloat*: bool          ## true → returns a float (in v0)
     retType*: Cursor         ## the proc's return-type cursor (for `getType`)
+    sigType*: Cursor         ## the proc's SIGNATURE as a `(proctype …)` — the type of the
+                             ## proc used as a VALUE, so `getType` treats a proc symbol like
+                             ## any other fn-ptr (its return type drives a call's result type)
     declarative*: bool       ## true → emit/use nifasm's declarative call ABI
                              ## (typed params + `(arg)`/`(res)` cross-checking);
                              ## false → manual marshalling (floats/aggregates/…)
@@ -80,10 +83,14 @@ type
                                             ## owner), so no separate buffer must be stored.
     voidPtr*: Cursor                        ## a synthesized `(ptr (void))` — the structural
                                             ## type of a `nil` literal (a generic pointer).
+    nilLit*: Cursor                         ## a synthesized Leng `(nil)` — the slot `typ` of
+                                            ## a nil value, so its register binds to the asm
+                                            ## `(nil)` type (not `(i 64)`) and emits `(nil)`.
     intType*: Cursor                        ## synthesized `(i 64)` — type of a bare IntLit
     uintType*: Cursor                       ## synthesized `(u 64)` — type of a bare UIntLit
     charType*: Cursor                       ## synthesized `(c 8)`  — type of a bare CharLit
     floatType*: Cursor                      ## synthesized `(f 64)` — type of a bare FloatLit
+    boolType*: Cursor                       ## synthesized `(bool)` — type of a `(true)`/`(false)` literal
 
   TypeEnv* = Table[string, Cursor]          ## a type-symbol table
 
@@ -104,6 +111,11 @@ const LinuxSyscalls* = {
   "close":      (3,   57),
   "mmap":       (9,   222),
   "munmap":     (11,  215),
+  # No libc `futex` symbol exists (callers use the generic `syscall(SYS_futex,…)`
+  # wrapper), but `std/private/syslocks` declares a *named* `futex` importc for the
+  # libc-free build precisely so this row recognizes it — the futex arguments map
+  # straight onto the kernel ABI registers (uaddr/op/val/timeout → arg0..3).
+  "futex":      (202, 98),
   "exit":       (60,  93),
   "exit_group": (231, 94),
   # libc `_exit(status)` terminates the process — map it to the `exit_group` syscall
@@ -208,6 +220,26 @@ proc ptrTypeOf*(p: Program; elem: Cursor): Cursor =
   buf.closeTag()
   result = beginRead(buf)
 
+proc procSigType*(declStart: Cursor): Cursor =
+  ## The TYPE of a proc used as a VALUE: its signature `(proctype . <params> <ret>
+  ## <pragmas>)`, synthesized from the `(proc :name params ret pragmas body)` decl. Shares
+  ## the decl's literal/tag pools so copied symbol/literal ids stay valid, and the owner
+  ## refcount keeps it alive (the same idiom as `ptrTypeOf`/`procPtr`). Letting `getType`
+  ## return this for a proc symbol makes a call's result type fall out of "the return type
+  ## of the callee's proctype" uniformly — no static-vs-indirect special case.
+  var d = declStart
+  var buf = createTokenBuf(16, sharedPool = declStart.pool, sharedTags = declStart.tags)
+  buf.openTag registerTag(declStart.tags, "proctype")
+  buf.addDotToken()                            # the name slot (a proctype carries none)
+  d.into:
+    inc d                                      # skip the proc name
+    buf.addSubtree d; skip d                   # params
+    buf.addSubtree d; skip d                   # return type
+    buf.addSubtree d; skip d                   # pragmas
+    while d.hasMore: skip d                    # body (and anything else — `into` must drain)
+  buf.closeTag()
+  result = beginRead(buf)
+
 proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
               darwin = false): Program =
   ## `darwin` selects the Mach-O target, which links dynamically against
@@ -229,6 +261,8 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     result.procPtr = beginRead(ptBuf)
     var npBuf = parseFromBuffer("(ptr (void))", "", sharedTags = tags)
     result.voidPtr = beginRead(npBuf)
+    var nilBuf = parseFromBuffer("(nil)", "", sharedTags = tags)
+    result.nilLit = beginRead(nilBuf)
     var itBuf = parseFromBuffer("(i 64)", "", sharedTags = tags)
     result.intType = beginRead(itBuf)
     var utBuf = parseFromBuffer("(u 64)", "", sharedTags = tags)
@@ -237,6 +271,8 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     result.charType = beginRead(ctBuf)
     var ftBuf = parseFromBuffer("(f 64)", "", sharedTags = tags)
     result.floatType = beginRead(ftBuf)
+    var btBuf = parseFromBuffer("(bool)", "", sharedTags = tags)
+    result.boolType = beginRead(btBuf)
   assert buf.beginRead().stmtKind == StmtsS, "Leng top level must be (stmts …)"
   # Pass 1: register every type declaration. Procs (pass 2) resolve their
   # param/return types via `isDeclarativeAbi`, and a proc may reference a type
@@ -281,13 +317,14 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           skip c                              # return type
           parsePragmas(c, importcN, exportcN)
           skip c                              # body
+        let sigType = procSigType(procStart)  # the proc-value's `(proctype …)` (for getType)
         if importcN.len >= 9 and importcN[0 .. 8] == "__atomic_":
           # GCC atomic builtin: not a real external call — arkham lowers it to a
           # lock-free instruction sequence (no extproc/libSystem dependency).
-          result.callTarget[pname] = CallTarget(atomic: importcN, retType: retType)
+          result.callTarget[pname] = CallTarget(atomic: importcN, retType: retType, sigType: sigType)
         elif importcN in ["memcpy", "memmove", "memset", "memcmp"]:
           # C mem* intrinsic: lowered inline (no libc dependency) — see genMemIntrin.
-          result.callTarget[pname] = CallTarget(memIntrin: importcN, retType: retType)
+          result.callTarget[pname] = CallTarget(memIntrin: importcN, retType: retType, sigType: sigType)
         elif importcN in ["__builtin_ctzll", "__builtin_ctz",
                           "__builtin_clzll", "__builtin_clz",
                           "__builtin_popcountll", "__builtin_popcount",
@@ -296,7 +333,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           # lowered inline to a native bit instruction — no libc/extproc. See
           # genBitBuiltin. (nimony's `firstSetBit`/`countTrailingZeroBits` reach
           # `ctz64` ⇒ `__builtin_ctzll` ⇒ a single `bsf`.)
-          result.callTarget[pname] = CallTarget(bitBuiltin: importcN, retType: retType)
+          result.callTarget[pname] = CallTarget(bitBuiltin: importcN, retType: retType, sigType: sigType)
         elif not darwin and importcN.len > 0 and lookupSyscall(importcN).found:
           # A Linux syscall: lowered to a raw kernel trap (no libc, no PLT). Emitted
           # as a `(syproc …)` whose proctype puts args in the syscall ABI registers
@@ -315,7 +352,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           let asmN = importcN & ".sys." & thisModuleSuffix(result)
           result.callTarget[pname] = CallTarget(asmName: asmN, extern: false,
                                                 syscall: true, sysNr: x64Nr, sysNrA64: a64Nr,
-                                                declarative: true, retType: retType)
+                                                declarative: true, retType: retType, sigType: sigType)
           # Record one syproc decl per distinct syscall symbol.
           var already = false
           for sp in result.syscalls:
@@ -327,7 +364,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           let asmN = importcN & ".0"
           result.externOrder.add Extern(asmName: asmN, extName: "_" & importcN)
           result.callTarget[pname] = CallTarget(asmName: asmN, extern: true,
-                                                retFloat: retFloat, retType: retType)
+                                                retFloat: retFloat, retType: retType, sigType: sigType)
           result.needsLibSystem = true
         else:
           # The program entry is the C `main` (`exportc "main"`). Every OTHER
@@ -338,7 +375,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           let entry = exportcN == "main"
           let asmN = if entry: "main.0" else: pname
           result.callTarget[pname] = CallTarget(asmName: asmN, extern: false,
-                                                retFloat: retFloat, retType: retType,
+                                                retFloat: retFloat, retType: retType, sigType: sigType,
                                                 declarative: isDeclarativeAbi(result, procStart))
           result.procs.add ProcInfo(asmName: asmN, decl: procStart, isEntry: entry)
       else:
@@ -408,6 +445,12 @@ proc lookupForeignDecl*(p: var Program; name: string; found: var bool): Cursor =
   p.requestedForeign.add (name, result)
   found = true
 
+proc isForeignSym*(p: Program; name: string): bool =
+  ## True if `name`'s qualified module is a DIFFERENT module than the one being
+  ## compiled (so it must be resolved via its owning module, not the local tables).
+  let s = splitSymName(name)
+  s.module.len > 0 and s.module != p.scheme.name
+
 proc foreignCallTarget*(p: var Program; name: string): CallTarget =
   ## Resolve a cross-module proc reference to a callable target by loading its
   ## declaration from the owning module's embedded index. The asm symbol is the
@@ -431,7 +474,7 @@ proc foreignCallTarget*(p: var Program; name: string): CallTarget =
     parsePragmas(d, importcN, exportcN)
     while d.hasMore: skip d                    # body
   result = CallTarget(asmName: name, extern: false, retFloat: retFloat,
-                      retType: retType,
+                      retType: retType, sigType: procSigType(declCur),
                       declarative: isDeclarativeAbi(p, declCur))
 
 # ── named-type resolution ───────────────────────────────────────────────────
@@ -651,6 +694,11 @@ proc aggrLayout*(p: var Program; typeName: string): seq[FieldInfo] =
   d.into:
     inc d; skip d                             # name, type-pragmas
     body = d; skip d                          # the body
+  if body.kind == Symbol:
+    # a DISTINCT type / type alias (`(type :Wrap . Inner)`) — its body is the underlying
+    # nominal type, with the SAME layout. Resolve through to it (mirrors `aggrByteSize`,
+    # which already resolves via `typeSizeAlign`). Handles chains of distincts.
+    return aggrLayout(p, symName(body))
   assert body.kind == TagLit and body.typeKind == ObjectT,
     "arkham: aggregate ABI requires an object type: " & typeName
   var oc = body

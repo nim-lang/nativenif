@@ -1,6 +1,7 @@
 | Tag                    | Enums                       |   Description |
 |------------------------|-----------------------------|---------------|
 | `(bool)`               | NifasmType                  | boolean type |
+| `(nil)`                | NifasmType                  | nil: the null-pointer value/type, compatible with any pointer |
 | `(i N)`                | NifasmType                  | signed integer type of N bits |
 | `(u N)`                | NifasmType                  | unsigned integer type of N bits |
 | `(f N)`                | NifasmType                  | float type of N bits |

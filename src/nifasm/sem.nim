@@ -5,7 +5,11 @@ import "../../../nimony/src/lib" / [symparser]
 
 type
   TypeKind* = enum
-    ErrorT, VoidT, BoolT, IntT, UIntT, FloatT, PtrT, AptrT, ArrayT, ObjectT, UnionT,
+    ErrorT, VoidT, BoolT,
+    NilT,        # the null-pointer value/type: a 0 that is a *pointer*, compatible with
+                 # any pointer (and only pointers — never a sized integer). arkham emits
+                 # `(nil)` for a Leng `nil` literal instead of an `(i 64)` 0.
+    IntT, UIntT, FloatT, PtrT, AptrT, ArrayT, ObjectT, UnionT,
     RegisterT,   # Pure register usage - accepts any type (effectively untyped)
     StackOffT,   # Stack offset - represents an offset from a base register
     IntLitT,     # Integer literal - compatible with both IntT and UIntT
@@ -18,7 +22,7 @@ type
 
   Type* = ref object
     case kind*: TypeKind
-    of ErrorT, VoidT, BoolT: discard
+    of ErrorT, VoidT, BoolT, NilT: discard
     of IntT, UIntT, FloatT, IntLitT: bits*: int
     of PtrT, AptrT:
       base*: Type
@@ -125,6 +129,7 @@ proc asmAlignOf*(t: Type): int =
   case t.kind
   of ErrorT, VoidT: 1
   of BoolT: 1
+  of NilT: 8 # a pointer-sized null
   of IntT, UIntT, FloatT, IntLitT:
     let size = t.bits div 8
     # Alignment is typically the size, but capped at 8 for x86-64
@@ -144,6 +149,7 @@ proc asmSizeOf*(t: Type): int =
   case t.kind
   of ErrorT, VoidT: 0
   of BoolT: 1
+  of NilT: 8 # a pointer-sized null
   of IntT, UIntT, FloatT, IntLitT: t.bits div 8
   of PtrT, AptrT: 8 # x86-64
   of ArrayT: t.len.int * asmSizeOf(t.elem)
@@ -157,6 +163,7 @@ proc `$`*(t: Type): string =
   of ErrorT: "error"
   of VoidT: "void"
   of BoolT: "bool"
+  of NilT: "nil"
   of IntT: "(i " & $t.bits & ")"
   of UIntT: "(u " & $t.bits & ")"
   of FloatT: "(f " & $t.bits & ")"
@@ -187,6 +194,12 @@ proc compatible*(want, got: Type): bool =
     # `cmp boolReg, 0` "if bool" test) is compatible with it. Still strict against
     # sized int/uint/ptr/etc. — only the literal adapts.
     result = got.kind == BoolT or got.kind == IntLitT
+  of NilT:
+    # `nil` is the null pointer. It compares/assigns with ANY pointer (the universal
+    # `cmp ptr, nil` / `mov ptr, nil`) and with itself, and adapts from a `0` literal
+    # (a materialized nil register `mov nilReg, 0`). NEVER compatible with a sized
+    # integer — that is the whole point: a `cmp i64reg, ptr` mixup stays an error.
+    result = got.kind in {NilT, PtrT, AptrT, IntLitT}
   of IntT, UIntT:
     # Same-WIDTH integers are interchangeable regardless of signedness: the bits are
     # identical, and every operation where signedness matters (idiv/div, sar/shr, the
@@ -204,10 +217,11 @@ proc compatible*(want, got: Type): bool =
   of FloatT:
     result = got.kind == want.kind and want.bits == got.bits
   of PtrT, AptrT:
-    if got.kind == IntLitT:
-      # An integer LITERAL (in practice `0` = nil) is compatible with a pointer: the
-      # universal `cmp ptr, 0` null test / `mov ptr, 0` nil init. Only the literal
-      # adapts — a sized int reg vs a pointer is still rejected (strict typing).
+    if got.kind in {IntLitT, NilT}:
+      # An integer LITERAL (in practice `0`) or an explicit `(nil)` is compatible with
+      # a pointer: the universal `cmp ptr, 0`/`cmp ptr, nil` null test, `mov ptr, nil`
+      # init. Only the literal/nil adapts — a SIZED int reg vs a pointer is still
+      # rejected (strict typing).
       result = true
     elif got.kind != want.kind:
       result = false

@@ -1,0 +1,45 @@
+(.nif27)
+(.indexat 764              )
+(stmts
+ (type :Inner.0 .
+  (object .
+   (fld :x.0 .
+    (i 64))
+   (fld :y.0 .
+    (i 64))))
+ (type :Wrap.0 . Inner.0)
+ (type :Holder.0 .
+  (object .
+   (fld :w.0 . Wrap.0)
+   (fld :tag.0 .
+    (i 64))))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :iv.0 . Inner.0
+    (oconstr Inner.0
+     (kv x.0 20)
+     (kv y.0 22)))
+   (var :h.0 . Holder.0
+    (oconstr Holder.0
+     (kv w.0
+      (conv Wrap.0 iv.0))
+     (kv tag.0 0)))
+   (var :back.0 . Inner.0
+    (conv Inner.0
+     (dot h.0 w.0 0)))
+   (call exit.c
+    (add
+     (i 64)
+     (dot back.0 x.0 0)
+     (dot back.0 y.0 0))))))(.index)

@@ -43,7 +43,20 @@ const arkhamDarwinUnsupported: seq[string] =
     # macOS's native arch is arm64, which has no `keepovf`/`(ovf)` codegen yet
     # (overflow checking is x86-only for now — see arkhamLinuxA64Unsupported).
     "overflow_check",
+    # `futex` is a Linux syscall lowered to a raw kernel trap (svc/syscall); macOS has
+    # no `futex` symbol, so it's Linux-only here. The Darwin equivalent is exercised by
+    # `ulock_wake` (just as `std/private/syslocks` selects `futex` vs `__ulock_wake`
+    # with a `when defined(linux)`/`elif defined(osx)` split). Mirror it: this pair is
+    # one logical test, each half skipped on the platform it doesn't target.
+    "futex_wake",
   ]
+
+const arkhamOsxOnly: seq[string] =
+  # The Darwin counterpart of the Linux-only `futex_wake` (see arkhamDarwinUnsupported):
+  # `ulock_wake` calls `__ulock_wake`, the real libSystem symbol `syslocks` uses on
+  # macOS. It links only against libSystem, so it's skipped on Linux (native x64 and
+  # the linux_arm64 qemu path), where the symbol doesn't exist.
+  @["ulock_wake"]
 
 proc arkhamTests() =
   ## Each `tests/arkham/*.c.nif` is hand-written Leng: arkham generates asm-NIF,
@@ -71,7 +84,9 @@ proc arkhamTests() =
     if base.startsWith("mod_"): continue   # foreign helper, not standalone
     let name = base[0 ..< base.len - ".c.nif".len]
     when defined(macosx):
-      if name in arkhamDarwinUnsupported: continue  # Linux-only flag constant
+      if name in arkhamDarwinUnsupported: continue  # Linux-only flag constant / symbol
+    else:
+      if name in arkhamOsxOnly: continue            # macOS-only libSystem symbol
     inc total
     let stem = file[0 ..< file.len - ".c.nif".len]
     let known = name in arkhamKnownUnsupported
@@ -151,7 +166,8 @@ proc arkhamQemuTests() =
     let base = extractFilename(file)
     if base.startsWith("mod_"): continue
     let name = base[0 ..< base.len - ".c.nif".len]
-    if name in arkhamLinuxA64Unsupported: (inc skipped; continue)
+    if name in arkhamLinuxA64Unsupported or name in arkhamOsxOnly:
+      (inc skipped; continue)                        # arm64-TODO or macOS-only symbol
     inc total
     let stem = file[0 ..< file.len - ".c.nif".len]
     let asmNif = workDir / (name & ".la64.nif")
@@ -263,6 +279,17 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_raw_fbound.nif", "Regist
 # Call-safety: a value living in a caller-saved register (x9) is destroyed by a
 # `(call)`; reading it afterward must be rejected (a callee-saved x19 home would survive).
 execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_clobber_after_call.nif", "in register X9 which was clobbered by a call")
+# `(at)` operand disjointness: an arkham register-allocation bug can hand the same
+# physical register for two operands of one address computation, producing a silently
+# wrong address (the "Bug J" class — caught before only as an ASLR-only runtime SEGV).
+# nifasm now flags these at assemble time. Two distinct collisions, both arches:
+#   * 3-operand `(at base index scratch)` where scratch == base: the `mov scratch,index`
+#     clobbers the base before the address is formed (scratch == index stays legal).
+#   * folded `(at base index)` SIB where base == index: two distinct live values aliased.
+execExpectFailure("nim c -r src/nifasm/nifasm tests/at_scratch_base_collision.nif", "stride scratch aliases the base register (R14)")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_at_scratch_base_collision.nif", "stride scratch aliases the base register (X14)")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/at_base_index_collision.nif", "array base and index occupy the same register (R14)")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_at_base_index_collision.nif", "array base and index occupy the same register (X14)")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/missing_result_binding.nif", "Missing result binding: ret.0")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/stack_result_binding.nif", "Type mismatch: expected (stackoff")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/result_type_mismatch.nif", "Type mismatch:")

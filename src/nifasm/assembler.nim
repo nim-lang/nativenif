@@ -49,8 +49,16 @@ proc infoStr(n: Cursor): string =
 
 proc error(msg: string; n: Cursor) =
   writeStackTrace()
-  quit "[Error] " & msg & " at " & infoStr(n) &
-    " (kind=" & $n.kind & ", tag=" & nodeRepr(n) & ")"
+  # `n` may be DRAINED — an error raised after an `into`-bounded scope has consumed
+  # all its children (e.g. an `(at base index scratch)` disjointness check fires only
+  # after the scratch is parsed) leaves the cursor past its last token, where `.kind`
+  # / `rawLineInfo` would trip nifcore's `load` assert (`c.p != nil and c.rem > 0`).
+  # Guard the position read so the diagnostic prints cleanly instead of crashing.
+  if not cursorIsNil(n) and n.hasMore:
+    quit "[Error] " & msg & " at " & infoStr(n) &
+      " (kind=" & $n.kind & ", tag=" & nodeRepr(n) & ")"
+  else:
+    quit "[Error] " & msg
 
 proc extractDedupKey*(s: string): string =
   ## Extract deduplication key from symbol like "foo.0.key.moduleSuffix" -> "foo.0.key"
@@ -186,7 +194,8 @@ proc canCompare(t: Type): bool =
   ## deliberately SEPARATE from `canDoIntegerArithmetic` (which add/sub share and
   ## must stay strict — adding/subtracting bools is nonsense).
   t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT,
-             TypeKind.PtrT, TypeKind.AptrT, TypeKind.RegisterT, TypeKind.BoolT}
+             TypeKind.PtrT, TypeKind.AptrT, TypeKind.RegisterT, TypeKind.BoolT,
+             TypeKind.NilT}  # `cmp ptr, nil` / `cmp nil, ptr` null tests
 
 proc canDoBitwiseOps(t: Type): bool =
   ## Check if type supports bitwise operations (including registers and literals)
@@ -313,6 +322,9 @@ type
     buf: relocs.Buffer  # Code buffer (.text section) for x64
     bssBuf: relocs.Buffer  # BSS buffer (.bss section) for zero-initialized global variables
     arch: Arch
+    emitObj: bool       # `--emit-obj`: write a relocatable MH_OBJECT for the system
+                        # linker (foreign `.o`/framework linking) instead of a
+                        # standalone executable. Mach-O / arm64 only for now.
     symMap: bool        # `--symmap`: dump each generated proc's vaddr to stderr
     procName: string
     callContext: CallContext # Current call context
@@ -484,7 +496,9 @@ proc genInstA64(n: var Cursor; ctx: var GenContext)
 proc checkIntegerArithmetic(t: Type; op: string; n: Cursor)
 proc checkIntegerType(t: Type; op: string; n: Cursor)
 proc checkBitwiseType(t: Type; op: string; n: Cursor)
+proc checkComparable(t: Type; op: string; n: Cursor)
 proc checkCompatibleTypes(t1, t2: Type; op: string; n: Cursor)
+proc checkCmpCompatible(t1, t2: Type; n: Cursor)
 proc checkBitwiseCompatible(t1, t2: Type; op: string; n: Cursor)
 proc checkType(want, got: Type; n: Cursor)
 
@@ -789,6 +803,8 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
     case t
     of BoolTagId:
       result = Type(kind: BoolT)
+    of NilTagId:
+      result = Type(kind: NilT)
     of ITagId:
       result = Type(kind: IntT, bits: normScalarBits(getInt(n)))
       inc n
@@ -1315,6 +1331,13 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       if result.reg in ctx.a64RegBindings:
         error("Register " & $result.reg & " is bound to variable '" &
               ctx.a64RegBindings[result.reg] & "', use the variable name instead", n)
+    elif t == NilTagId:
+      # `(nil)` as a value: the null pointer — a 0 immediate typed `nil` (compatible
+      # with any pointer, never a sized integer). See `compatible`'s NilT arm.
+      result.kind = okImm
+      result.immVal = 0
+      result.typ = Type(kind: NilT)
+      inc n
     elif t == DotTagId:
       # (dot <base> <fieldname>) - similar to x64
       inc n
@@ -1446,9 +1469,24 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
             error("at: 3-operand form expects a register index", n)
           if baseHasIndex:
             error("at: 3-operand form cannot extend a base that already has an index", n)
+          # Disjointness: `scratch==base` is fatal — `emitMul(scratch, index, X16)`
+          # writes scratch (== base) before `emitAdd(scratch, base, scratch)` reads the
+          # base, dropping it (→ a wild address). This is the arkham "Bug J" class; flag
+          # it at assemble time. `scratch==index` IS allowed here (the X16 stride trick
+          # keeps the index intact through the multiply — see the note below).
+          if scratchReg == baseReg:
+            error("at: 3-operand stride scratch aliases the base register (" &
+                  $baseReg & ") — the base is clobbered before use (codegen bug)", n)
           let stride = asmSizeOf(elemType)
-          arm64.emitMovImm64(ctx.buf.data, scratchReg, uint64(stride))
-          arm64.emitMul(ctx.buf.data, scratchReg, indexOp.reg, scratchReg) # scratch = idx*stride
+          # The stride constant goes into the RESERVED assembler scratch X16, NOT the
+          # output `scratchReg`: arkham may hand a scratch that ALIASES the index (x86
+          # tolerates `scratch==idx`, and under register pressure it can be the only free
+          # register). Materializing the stride into `scratchReg` first would clobber the
+          # index before the multiply; X16 keeps the index intact, so `scratch==idx` stays
+          # correct (`scratch = idx*stride` reads idx, writes scratch). X16/X17 are never
+          # allocated by arkham, so this can't collide with base/index/scratch.
+          arm64.emitMovImm64(ctx.buf.data, arm64.X16, uint64(stride))
+          arm64.emitMul(ctx.buf.data, scratchReg, indexOp.reg, arm64.X16) # scratch = idx*stride
           # scratch = base + that. A SP base (a stack array) needs the EXTENDED-register
           # ADD — the shifted-register `emitAdd` would read register 31 as XZR, not SP,
           # zeroing the base (→ a wild address). Other bases use the plain register ADD.
@@ -1469,6 +1507,12 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
         else:
           if baseHasIndex:
             error("at: two register indices cannot fold into one memory operand", n)
+          # Disjointness: base and index of the folded `[base + index<<shift]` are two
+          # distinct live values (array address vs element index); aliasing them is a
+          # codegen bug, so flag it rather than emit a silently-wrong address.
+          if indexOp.reg == baseReg:
+            error("at: array base and index occupy the same register (" &
+                  $baseReg & ") — distinct values aliased (codegen bug)", n)
           let elemSize = asmSizeOf(elemType)
           if elemSize notin [1, 2, 4, 8]:
             error("Element size " & $elemSize & " not a scale and no scratch supplied", n)
@@ -2546,9 +2590,11 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
-    checkIntegerArithmetic(dest.typ, "cmp", start)
-    checkIntegerArithmetic(op.typ, "cmp", start)
-    checkCompatibleTypes(dest.typ, op.typ, "cmp", start)
+    # Comparisons work on integers, pointers, bool (the "if bool" test) and `nil` —
+    # the same loose rule as x64's CmpX64 (was the stricter integer-arithmetic check).
+    checkComparable(dest.typ, "cmp", start)
+    checkComparable(op.typ, "cmp", start)
+    checkCmpCompatible(dest.typ, op.typ, start)
     if dest.kind == okMem:
       error("CMP memory not supported yet", n)
     else:
@@ -2601,34 +2647,40 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     ctx.buf.data.emitStr(op.reg, dest.mem.base, dest.mem.offset)
 
   of LdaxrA64:
-    # (ldaxr Dt Sptr) — Dt ← exclusive-acquire load of [Sptr]. Operands may be
-    # `rebind`-bound scratch names (the atomics lowering binds its temps).
+    # (ldaxr Dt Sptr bits?) — Dt ← exclusive-acquire load of [Sptr]. Operands may be
+    # `rebind`-bound scratch names (the atomics lowering binds its temps). The optional
+    # trailing int is the access width in bits (default 64); arkham emits it so a
+    # sub-64-bit atomic uses the matching `ldaxr{b,h}`/`Wt` form (see sizeFieldA64).
     inc n
     let rt = parseGprA64(n, ctx)
     let rn = parseGprA64(n, ctx)
-    arm64.emitLdaxr(ctx.buf.data, rt, rn)
+    let bits = if n.kind == IntLit: (let b = int(n.intVal); inc n; b) else: 64
+    arm64.emitLdaxr(ctx.buf.data, rt, rn, bits)
 
   of StlxrA64:
-    # (stlxr St Dval Sptr) — store-release-exclusive Dval to [Sptr]; St ← status.
+    # (stlxr St Dval Sptr bits?) — store-release-exclusive Dval to [Sptr]; St ← status.
     inc n
     let rs = parseGprA64(n, ctx)
     let rt = parseGprA64(n, ctx)
     let rn = parseGprA64(n, ctx)
-    arm64.emitStlxr(ctx.buf.data, rs, rt, rn)
+    let bits = if n.kind == IntLit: (let b = int(n.intVal); inc n; b) else: 64
+    arm64.emitStlxr(ctx.buf.data, rs, rt, rn, bits)
 
   of LdarA64:
-    # (ldar Dt Sptr) — Dt ← acquire load of [Sptr].
+    # (ldar Dt Sptr bits?) — Dt ← acquire load of [Sptr].
     inc n
     let rt = parseGprA64(n, ctx)
     let rn = parseGprA64(n, ctx)
-    arm64.emitLdar(ctx.buf.data, rt, rn)
+    let bits = if n.kind == IntLit: (let b = int(n.intVal); inc n; b) else: 64
+    arm64.emitLdar(ctx.buf.data, rt, rn, bits)
 
   of StlrA64:
-    # (stlr Dval Sptr) — release store Dval to [Sptr].
+    # (stlr Dval Sptr bits?) — release store Dval to [Sptr].
     inc n
     let rt = parseGprA64(n, ctx)
     let rn = parseGprA64(n, ctx)
-    arm64.emitStlr(ctx.buf.data, rt, rn)
+    let bits = if n.kind == IntLit: (let b = int(n.intVal); inc n; b) else: 64
+    arm64.emitStlr(ctx.buf.data, rt, rn, bits)
 
   of LdrbA64:
     # (ldrb Dt Bbase Iindex) — Dt ← zero-extended byte [Bbase + Iindex].
@@ -3002,6 +3054,13 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
       if result.reg in ctx.regBindings:
         error("Register " & $result.reg & " is bound to variable '" &
               ctx.regBindings[result.reg] & "', use the variable name instead", n)
+    elif t == NilTagId:
+      # `(nil)` as a value: the null pointer — a 0 immediate typed `nil` (compatible
+      # with any pointer, never a sized integer). See `compatible`'s NilT arm.
+      result.kind = okImm
+      result.immVal = 0
+      result.typ = Type(kind: NilT)
+      inc n
     elif t == DotTagId:
       # (dot <base-reg> <stackvar> <fieldname>) for stack objects, or
       # (dot <ptr-var> <fieldname>) for pointer variables
@@ -3184,6 +3243,16 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
             error("at: 3-operand form expects a register index", n)
           if baseHasIndex:
             error("at: 3-operand form cannot extend a base that already has an index", n)
+          # Disjointness: the stride scratch must not alias the base register. The
+          # `mov scratch,index` below clobbers `scratch` before the `lea` reads `base`,
+          # so `scratch==base` silently drops the base (→ a wild address). This is the
+          # arkham allocation bug class ("Bug J") that used to surface only as an
+          # ASLR-only runtime segfault; flag it at assemble time. `scratch==index` is
+          # fine (the mov is then a no-op) and is intentionally allowed (under register
+          # pressure it can be the only free choice).
+          if scratchReg == baseReg:
+            error("at: 3-operand stride scratch aliases the base register (" &
+                  $baseReg & ") — the base is clobbered before use (codegen bug)", n)
           let stride = asmSizeOf(elemType)
           x86.emitMov(ctx.buf.data, scratchReg, indexOp.reg)        # scratch = index
           x86.emitImulImm(ctx.buf.data, scratchReg, int32(stride))  # scratch *= stride
@@ -3207,6 +3276,13 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
           # are invariants here (kept as asserts).
           if baseHasIndex:
             error("at: two register indices cannot fold into one memory operand", n)
+          # Disjointness: in the folded SIB `[base + index*scale]`, base and index are
+          # two distinct live values (an array address and an element index); aliasing
+          # them computes `base + base*scale` (a codegen bug). Flag it rather than emit
+          # a silently-wrong address.
+          if indexOp.reg == baseReg:
+            error("at: array base and index occupy the same register (" &
+                  $baseReg & ") — distinct values aliased (codegen bug)", n)
           let elemSize = asmSizeOf(elemType)
           if elemSize notin [1, 2, 4, 8]:
             error("Element size " & $elemSize & " not a SIB scale and no scratch supplied", n)
@@ -4294,7 +4370,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
 
     if dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
-        x86.emitAddImm(ctx.buf.data, dest.mem, int32(op.immVal))  # ADD m64, imm32
+        x86.emitAddImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)  # ADD m, imm (sized)
       elif op.kind == okSsize:
         error("Adding ssize to memory not supported", n)
       elif op.kind == okMem:
@@ -4326,7 +4402,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
 
     if dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
-        x86.emitSubImm(ctx.buf.data, dest.mem, int32(op.immVal))  # SUB m64, imm32
+        x86.emitSubImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)  # SUB m, imm (sized)
       elif op.kind == okSsize:
         error("Subtracting ssize from memory not supported", n)
       elif op.kind == okMem:
@@ -4424,7 +4500,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseCompatible(dest.typ, op.typ, "and", start)
     if dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
-        x86.emitAndImm(ctx.buf.data, dest.mem, int32(op.immVal))  # AND m64, imm32
+        x86.emitAndImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)  # AND m, imm (sized)
       elif op.kind == okMem:
         error("Cannot AND memory to memory", n)
       else:
@@ -4446,7 +4522,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseCompatible(dest.typ, op.typ, "or", start)
     if dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
-        x86.emitOrImm(ctx.buf.data, dest.mem, int32(op.immVal))   # OR m64, imm32
+        x86.emitOrImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)   # OR m, imm (sized)
       elif op.kind == okMem:
         error("Cannot OR memory to memory", n)
       else:
@@ -4468,7 +4544,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseCompatible(dest.typ, op.typ, "xor", start)
     if dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
-        x86.emitXorImm(ctx.buf.data, dest.mem, int32(op.immVal))  # XOR m64, imm32
+        x86.emitXorImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)  # XOR m, imm (sized)
       elif op.kind == okMem:
         error("Cannot XOR memory to memory", n)
       else:
@@ -4605,7 +4681,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkCmpCompatible(dest.typ, op.typ, start)
     if dest.kind == okMem:
       if op.kind == okImm:
-        x86.emitCmpImm(ctx.buf.data, dest.mem, int32(op.immVal))  # CMP m64, imm32 (81 /7)
+        x86.emitCmpImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)  # CMP m, imm (sized)
       elif op.kind == okMem:
         error("Cannot compare memory with memory", n)
       else:
@@ -5302,7 +5378,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       if dest.kind != okMem: error("Atomic XADD requires memory destination", n)
       if op.kind != okReg: error("Atomic XADD source must be a register", n)
       x86.emitLock(ctx.buf.data)
-      x86.emitXadd(ctx.buf.data, dest.mem, op.reg)
+      x86.emitXadd(ctx.buf.data, dest.mem, op.reg, intMemAccess(dest.typ).bits)
     of CmpxchgX64:
       # `lock cmpxchg [mem], reg` — compares RAX with [mem]; on equal stores reg,
       # else loads [mem] into RAX. ZF reflects success.
@@ -5312,7 +5388,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       if dest.kind != okMem: error("Atomic CMPXCHG requires memory destination", n)
       if op.kind != okReg: error("Atomic CMPXCHG source must be a register", n)
       x86.emitLock(ctx.buf.data)
-      x86.emitCmpxchg(ctx.buf.data, dest.mem, op.reg)
+      x86.emitCmpxchg(ctx.buf.data, dest.mem, op.reg, intMemAccess(dest.typ).bits)
     else:
        error("Unsupported instruction for LOCK prefix: " & $innerInstTag, n)
 
@@ -5329,7 +5405,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     if dest.kind == okMem:
       if op.kind == okImm: error("XCHG memory, immediate not supported", n)
       if op.kind == okMem: error("XCHG memory, memory not supported", n)
-      x86.emitXchg(ctx.buf.data, dest.mem, op.reg)
+      x86.emitXchg(ctx.buf.data, dest.mem, op.reg, intMemAccess(dest.typ).bits)
     else:
       if op.kind == okImm: error("XCHG reg, immediate not supported", n)
       if op.kind == okMem:
@@ -5346,7 +5422,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     if dest.kind == okMem:
       if op.kind == okImm: error("XADD memory, immediate not supported", n)
       if op.kind == okMem: error("XADD memory, memory not supported", n)
-      x86.emitXadd(ctx.buf.data, dest.mem, op.reg)
+      x86.emitXadd(ctx.buf.data, dest.mem, op.reg, intMemAccess(dest.typ).bits)
     else:
       if op.kind == okImm: error("XADD reg, immediate not supported", n)
       if op.kind == okMem: error("XADD reg, memory not supported (dest must be r/m, src must be r)", n)
@@ -5361,7 +5437,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     if dest.kind == okMem:
       if op.kind == okImm: error("CMPXCHG memory, immediate not supported", n)
       if op.kind == okMem: error("CMPXCHG memory, memory not supported", n)
-      x86.emitCmpxchg(ctx.buf.data, dest.mem, op.reg)
+      x86.emitCmpxchg(ctx.buf.data, dest.mem, op.reg, intMemAccess(dest.typ).bits)
     else:
       if op.kind == okImm: error("CMPXCHG reg, immediate not supported", n)
       if op.kind == okMem: error("CMPXCHG reg, memory not supported (dest must be r/m, src must be r)", n)
@@ -5740,6 +5816,143 @@ proc writeMachO(a: var GenContext; outfile: string) =
     if codesignResult != 0:
       raise newException(OSError, "codesign failed with exit code " & $codesignResult)
 
+proc machoName(name: string): string =
+  ## Mangle a nifasm symbol into a Mach-O symbol. macOS C ABI prefixes globals
+  ## with `_`; nifasm's internal names (e.g. `foo.0.mod`) only need a stable,
+  ## collision-free spelling, and `.` is valid in Mach-O symbol names.
+  "_" & name
+
+proc writeMachOObject(a: var GenContext; outfile: string) =
+  ## Emit a relocatable object instead of a standalone executable. Defined procs /
+  ## globals become exported symbols, external `extproc` references become undefined
+  ## symbols, and every fixup the executable path would resolve in-place (external
+  ## calls, gvar `adrp`/`add`, symbol-address initializers) becomes a relocation the
+  ## system linker resolves. The standalone `writeMachO` above is left untouched.
+  finalize(a.buf)
+  finalize(a.bssBuf)
+  let code = a.buf.data
+
+  let (cputype, cpusubtype) = case a.arch
+    of Arch.A64: (CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL)
+    else:
+      quit "nifasm: --emit-obj is only supported for macOS arm64"
+
+  if a.tlvSyms.len > 0:
+    quit "nifasm: --emit-obj does not yet support thread-local variables"
+
+  var labelPos = initTable[int, int]()
+  for ld in a.buf.labels: labelPos[int(ld.id)] = ld.position
+  let dataRegionSize = a.bssOffset   # local copy: the nested procs below must not
+                                     # capture the `var GenContext` param
+
+  # --- symbol table: defined first, then undefined (Mach-O dysymtab ordering) ----
+  var syms: seq[macho.MachOSym] = @[]
+  var defIndex = initTable[string, int]()   # mangled name -> index in `syms`
+
+  proc addDef(name: string; sec: macho.MachOSecKind; value: uint64): int =
+    result = defIndex.getOrDefault(name, -1)
+    if result < 0:
+      result = syms.len
+      defIndex[name] = result
+      syms.add macho.MachOSym(name: name, sec: sec, value: value, defined: true)
+
+  proc defOf(sym: Symbol): int =
+    ## Ensure `sym` is in the table as a defined symbol; return its index (or -1 if
+    ## it has no resolvable location, e.g. an un-emitted proc).
+    case sym.kind
+    of skProc:
+      if labelPos.hasKey(sym.offset):
+        addDef(machoName(sym.name), macho.moText, uint64(labelPos[sym.offset]))
+      else: -1
+    of skRodata:
+      if sym.dataConst:
+        (if sym.size < dataRegionSize: addDef(machoName(sym.name), macho.moData, uint64(sym.size)) else: -1)
+      elif labelPos.hasKey(sym.offset):
+        addDef(machoName(sym.name), macho.moText, uint64(labelPos[sym.offset]))
+      else: -1
+    of skGvar:
+      # A data symbol must point inside the emitted `__data` region; a zero-size
+      # region (`bssOffset == 0`) emits no `__data` section, so skip it then.
+      if sym.size < dataRegionSize: addDef(machoName(sym.name), macho.moData, uint64(sym.size))
+      else: -1
+    else: -1
+
+  # All generated procs (and data referenced below) become exported symbols. The
+  # synthetic per-thread TLS block is an internal artifact (unused on arm64), never
+  # a real exported global.
+  for name in a.generatedSymbols:
+    if name == "arkham.tls.0": continue
+    let sym = a.rootScope.lookup(name)
+    if sym != nil: discard defOf(sym)
+
+  # An `_main` alias at the entry proc so the system crt can find it.
+  if a.entrySym != nil and labelPos.hasKey(a.entrySym.offset):
+    discard addDef("_main", macho.moText, uint64(labelPos[a.entrySym.offset]))
+
+  # --- relocations ---------------------------------------------------------------
+  # The reloc loops below also pull their *defined* targets into the table via
+  # `defOf`. Mach-O requires every defined symbol to precede every undefined one,
+  # so we gather all of these (and their relocs) BEFORE allocating any undef index.
+  var textRels: seq[macho.MachORel] = @[]
+  var dataRels: seq[macho.MachORel] = @[]
+
+  # gvar references: the `adrp`/`add` pair → PAGE21 + PAGEOFF12 to the data symbol.
+  for (pos, sym) in a.gvarSites:
+    let si = defOf(sym)
+    if si >= 0:
+      textRels.add macho.MachORel(address: pos, symIdx: si, kind: macho.mrPage21)
+      textRels.add macho.MachORel(address: pos + 4, symIdx: si, kind: macho.mrPageoff12)
+
+  # Symbol-address pointer fields inside a rodata blob (in __text): 8-byte UNSIGNED.
+  for (labelId, blobOff, sym, _) in a.rodataSymInits:
+    let si = defOf(sym)
+    if si >= 0 and labelPos.hasKey(labelId):
+      textRels.add macho.MachORel(address: labelPos[labelId] + blobOff,
+                                  symIdx: si, kind: macho.mrUnsigned)
+
+  # Symbol-address initializers of globals (in __data): 8-byte UNSIGNED.
+  for (off, sym, _) in a.bssSymInits:
+    let si = defOf(sym)
+    if si >= 0:
+      dataRels.add macho.MachORel(address: int(off), symIdx: si, kind: macho.mrUnsigned)
+
+  # `dataConst` symbol-pointer fields (in __data): 8-byte UNSIGNED to the target.
+  for it in a.rodataRebases:
+    let si = defOf(it.target)
+    if si >= 0:
+      dataRels.add macho.MachORel(address: it.owner.size + it.blobOff,
+                                  symIdx: si, kind: macho.mrUnsigned)
+
+  let nDefined = syms.len  # everything added so far is defined; undefs come next
+
+  # Undefined symbols: one per external proc (deduplicated by external name).
+  var undefIndex = initTable[string, int]()
+  proc undefOf(extName: string): int =
+    result = undefIndex.getOrDefault(extName, -1)
+    if result < 0:
+      result = syms.len
+      undefIndex[extName] = result
+      syms.add macho.MachOSym(name: extName, defined: false)
+
+  # External calls: the BL placeholder at each call site → BRANCH26 to the undef sym.
+  for ext in a.extProcs:
+    let si = undefOf(ext.extName)
+    for cs in ext.callSites:
+      textRels.add macho.MachORel(address: cs, symIdx: si, kind: macho.mrBranch26)
+
+  # --- __data image: the whole globals region, with constant initializers baked ---
+  # (Symbol-address slots stay zero; their relocations above supply the address.)
+  var dataImage: seq[byte] = @[]
+  if a.bssOffset > 0:
+    dataImage = newSeq[byte](a.bssOffset)
+    for it in a.bssInits:
+      for i in 0 ..< it.size:
+        if it.off.int + i < dataImage.len:
+          dataImage[it.off.int + i] = byte((it.val shr (8 * i)) and 0xFF)
+
+  macho.writeMachOObject(code, dataImage, syms, nDefined, textRels, dataRels,
+                         cputype, cpusubtype, outfile)
+
 proc writeExe(a: var GenContext; outfile: string) =
   finalize(a.buf)
   finalize(a.bssBuf)
@@ -5944,7 +6157,7 @@ proc setupTls(ctx: var GenContext) =
   x86.emitSyscall(ctx.buf.data)                             # arch_prctl(ARCH_SET_FS, &block)
   x86.emitJmp(ctx.buf, LabelId(ctx.entrySym.offset))        # → real entry
 
-proc assemble*(filename, outfile: string; symMap = false) =
+proc assemble*(filename, outfile: string; symMap = false; emitObj = false) =
   var buf = parseFromFile(filename, sharedTags = asmTags)
 
   # Extract base directory from filename
@@ -5973,7 +6186,8 @@ proc assemble*(filename, outfile: string; symMap = false) =
     generatedSymbols: initHashSet[string](),
     dedupTable: initTable[string, string](),
     tlsEntryOffset: -1,
-    symMap: symMap
+    symMap: symMap,
+    emitObj: emitObj
   )
 
   # Store main module. `beginRead` BEFORE the move forces the buffer's
@@ -6034,13 +6248,22 @@ proc assemble*(filename, outfile: string; symMap = false) =
   # synthesize the entry prologue that sets the FS base (x86-64).
   setupTls(ctx)
 
-  case ctx.arch
-  of Arch.X64, Arch.LinuxA64:
-    writeElf(ctx, outfile)
-  of Arch.A64:
-    writeMachO(ctx, outfile)
-  of Arch.WinX64, Arch.WinA64:
-    writeExe(ctx, outfile.changeFileExt("exe"))
+  if ctx.emitObj:
+    # Relocatable object for the system linker (foreign `.o` / framework linking).
+    # Standalone executable emission below is unaffected.
+    case ctx.arch
+    of Arch.A64:
+      writeMachOObject(ctx, outfile)
+    else:
+      quit "nifasm: --emit-obj is only supported for macOS arm64"
+  else:
+    case ctx.arch
+    of Arch.X64, Arch.LinuxA64:
+      writeElf(ctx, outfile)
+    of Arch.A64:
+      writeMachO(ctx, outfile)
+    of Arch.WinX64, Arch.WinA64:
+      writeExe(ctx, outfile.changeFileExt("exe"))
 
   # Close all foreign-module readers (the main module has no reader).
   for modname, module in ctx.modules.mpairs:

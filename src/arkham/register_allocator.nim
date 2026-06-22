@@ -49,7 +49,12 @@ type
                                       ## for symbol defs; the rewrite fills it for EVERY
                                       ## value-producing position (its result location).
     aux*: Table[int, ExprAux]         ## pos → per-op selection aux (see `ExprAux`)
-    symPos*: Table[string, int]       ## local/param name → its def position
+    symPos*: Table[string, int]       ## local/param name → its def position. This IS the
+                                      ## local→cursor-pos mapping: every local read resolves
+                                      ## through `locs[symPos[name]]` (the emitter late-binds via
+                                      ## `locationOfSym`), so undoing a local's register is a
+                                      ## single-point rewrite that every use sees — no scattered
+                                      ## snapshots to reconcile.
     usedCallee*: set[Reg]             ## callee-saved GPRs to save in prologue
     usedCalleeF*: set[FReg]           ## callee-saved SIMD regs (v8–v15) to save in prologue
     frameSize*: int                   ## bytes of stack frame for spilled slots
@@ -213,9 +218,9 @@ proc record(b: var Builder; pos: int; name: string; loc: Location) =
 proc coldestVictim(b: var Builder; maxW: int; calleeOnly, wantFloat: bool): string =
   ## The lowest-weight live register-resident local (weight strictly below `maxW`)
   ## whose register may be stolen: a non-sealed GPR (`calleeOnly` restricts to the
-  ## callee-saved set) or — `wantFloat` — a SIMD register. The ONE victim-selection
-  ## policy behind `trySteal`/`stealForTmp`/`stealFForTmp`. "" when nothing is
-  ## stealable.
+  ## callee-saved set) or — `wantFloat` — a SIMD register. The victim-selection
+  ## policy behind the local→memory undo (`trySteal` / `reserveHeldScratch`). "" when
+  ## nothing is stealable.
   var bestW = maxW
   result = ""
   for scope in b.scopeVars:
@@ -233,10 +238,11 @@ proc coldestVictim(b: var Builder; maxW: int; calleeOnly, wantFloat: bool): stri
         bestW = vw; result = v
 
 proc demoteToStack(b: var Builder; victim: string) =
-  ## Evict `victim` to a nifasm-managed `(s)` slot, addressed by its own name
-  ## (offsets are nifasm's job). A uniform single-home rewrite of `ra.locs` (one
-  ## home per symbol) — sound across every control-flow path, so it can't recur
-  ## the cross-branch reactive-eviction bug.
+  ## Undo `victim`'s optimistic register assignment: move it to a nifasm-managed `(s)`
+  ## slot addressed by its own name (offsets are nifasm's job). A single-point rewrite
+  ## of `locs[symPos[victim]]` — and because every use reads through `symPos` (the
+  ## emitter late-binds via `locationOfSym`), every use, walked or not, sees the new
+  ## home. Sound across every control-flow path: the home is memory everywhere.
   let vpos = b.ra.symPos[victim]
   b.ra.locs[vpos] = namedStackLoc(victim, b.ra.locs[vpos].typ)
   b.ra.hasStackVars = true
@@ -256,27 +262,13 @@ proc trySteal(b: var Builder; curName: string; curSlot: AsmSlot;
   if bestReg in b.md.intCalleeSavedSet: b.ra.usedCallee.incl bestReg
   result = regLoc(bestReg, curSlot)
 
-proc stealForTmp(b: var Builder; slot: AsmSlot): Location =
-  ## The GPR pool is empty while a *computed temporary* needs a register. A temp
-  ## is needed right now, so it outranks any live local: evict the lowest-weight
-  ## live local holding a non-sealed GPR to its stack home and hand the temp that
-  ## register. `dontCare` if nothing is stealable.
-  let bestV = b.coldestVictim(high(int), calleeOnly = false, wantFloat = false)
-  if bestV.len == 0: return dontCare
-  let r = b.ra.locs[b.ra.symPos[bestV]].r
-  b.demoteToStack(bestV)
-  if r in b.md.intCalleeSavedSet: b.ra.usedCallee.incl r
-  result = regLoc(r, slot, isTemp = true)
-
-proc stealFForTmp(b: var Builder; slot: AsmSlot): Location =
-  ## SIMD twin of `stealForTmp`: evict the lowest-weight float-register local to
-  ## its stack home and give a computed float temporary that register.
-  let bestV = b.coldestVictim(high(int), calleeOnly = false, wantFloat = true)
-  if bestV.len == 0: return dontCare
-  let f = b.ra.locs[b.ra.symPos[bestV]].f
-  b.demoteToStack(bestV)
-  if f in b.md.floatCalleeSavedSet: b.ra.usedCalleeF.incl f
-  result = fregLoc(f, slot, isTemp = true)
+# A computed temporary NEVER steals a live local. codegen.c proves ~2 registers
+# suffice for all computation; temps draw from the volatile/callee-saved scratch the
+# pool still has free, and when none is free they spill to their OWN `(s)` slot
+# (`reserveTmp` below) — single-use, branch-safe, no local touched. The ONLY undo of a
+# register assignment is local→memory (`trySteal` / `reserveHeldScratch`), decided while
+# allocating locals; that is the whole "we optimistically gave a local a register, then
+# found we have too many, so we undo it" story, and it can never collide with a temp.
 
 # ── expression allocation (value-core rewrite; gated by `allocExprs`) ──────────
 # Mirrors codegen's genVal/gen DECISIONS, recording each value position's result
@@ -301,15 +293,12 @@ proc reserveTmp(b: var Builder; slot: AsmSlot): Location =
   if r == NoReg:
     r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
     if r == NoReg:
-      # pool exhausted: steal a register from the coldest live local (the
-      # discussed design — undo a local's register assignment, demote it to its
-      # stack home). Total and branch-safe by the single-home rewrite.
-      let stolen = b.stealForTmp(slot)
-      if stolen.kind == InReg: return stolen
-      # genuinely nothing stealable (all GPRs sealed / already on stack): a last-ditch
-      # `(s)` spill slot. The emitter declares it (`spillTemps`) and PRODUCES the value
-      # position into it through a staging register (`produceIntoMem2`) — `isTemp` marks
-      # it as a produce-into slot, distinct from a symbol's stack home left for folding.
+      # pool exhausted (every free reg holds a live local): spill THIS temp to its own
+      # `(s)` slot. A temp is single-use, so the spill is local, uniform and branch-safe
+      # — NO live local is touched (temps never steal locals). The emitter declares it
+      # (`spillTemps`) and PRODUCES the value position into it through a staging register
+      # (`produceIntoMem2`); `isTemp` marks it a produce-into slot, distinct from a
+      # symbol's stack home left for folding.
       let nm = "etmp" & $b.tmpSpills & ".0"; inc b.tmpSpills
       b.ra.hasStackVars = true
       b.ra.spillTemps.add (name: nm, typ: slot, isFloat: false)
@@ -320,6 +309,27 @@ proc reserveTmp(b: var Builder; slot: AsmSlot): Location =
 proc releaseTmp(b: var Builder; loc: Location) {.inline.} =
   if loc.kind == InReg and loc.isTemp: b.giveBack loc.r
 
+proc reserveHeldScratch(b: var Builder; what: string): Location =
+  ## A SURVIVOR scratch: a register that must outlive a call and/or stay off the R11
+  ## staging bridge (a &global / aggregate-arg address marshalled THROUGH the bridge,
+  ## or held across a ≤16B-result call) — so it cannot come from caller-saved emit-time
+  ## staging (the stride/aggr-copy answer); it must be a CALLEE-SAVED pool register.
+  ## Take a free callee-saved reg, else UNDO a local's optimistic assignment: demote the
+  ## coldest callee-saved-homed local to memory and take its register (the same local→
+  ## memory undo as `trySteal`, sound by the single-home rewrite). Only a genuine
+  ## no-callee-saved-local-left case is fatal.
+  var r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
+  if r != NoReg:
+    b.ra.usedCallee.incl r
+    return regLoc(r, ScalarSlot, isTemp = true)
+  let victim = b.coldestVictim(high(int), calleeOnly = true, wantFloat = false)
+  if victim.len == 0:
+    raiseAssert "arkham: out of registers for " & what & " (nothing to spill)"
+  r = b.ra.locs[b.ra.symPos[victim]].r
+  b.demoteToStack(victim)
+  b.ra.usedCallee.incl r
+  result = regLoc(r, ScalarSlot, isTemp = true)
+
 proc reserveFTmp(b: var Builder; slot: AsmSlot): Location =
   ## A scratch SIMD register for a computed float temporary — the SIMD twin of
   ## `reserveTmp`: the volatile float pool (xmm8–15) first, then callee-saved
@@ -329,8 +339,7 @@ proc reserveFTmp(b: var Builder; slot: AsmSlot): Location =
   if f == NoFReg:
     f = b.takeFReg(b.freeCalleeF, b.md.floatCalleeSaved)
     if f == NoFReg:
-      let stolen = b.stealFForTmp(slot)
-      if stolen.kind == InFReg: return stolen
+      # pool exhausted: spill THIS float temp to its own slot (no local evicted).
       # `eftmp` (NOT `ftmp`): the emitter's `bindFTmp` scratch names are `ftmpN.0`, so a
       # spill slot named `ftmpN.0` would COLLIDE (a `(var (s))` decl vs a `(rebind)` reg
       # binding under the same symbol). The int side is already disambiguated (`etmp`
@@ -349,10 +358,9 @@ proc auxScratch(b: var Builder; pos: int; what: string) =
   ## Reserve a one-shot scratch GPR for the op at `pos` and record it in `aux`
   ## for the emitter. Single transient use (the emitter brackets it with its own
   ## bind/kill), so it is released right away — siblings reuse it in turn.
-  let t = b.reserveTmp(ScalarSlot)
+  let t = b.reserveHeldScratch(what)
   b.releaseTmp(t)
-  if t.kind == InReg: b.ra.aux[pos] = ExprAux(scratch: @[t.r])
-  else: raiseAssert "arkham: out of registers for " & what
+  b.ra.aux[pos] = ExprAux(scratch: @[t.r])
 
 proc symLoc(b: var Builder; name: string): Location
 
@@ -594,8 +602,10 @@ proc allocFValue(b: var Builder; n: var Cursor; dest: var Location) =
   of FloatLit:
     if dest.kind != InFReg:
       dest = b.reserveFTmp(if dest.typ.kind == AFloat: dest.typ else: floatSlot(64))
-    # The bit pattern is materialized through a scratch GPR (fmovq/d xmm ← gpr).
-    b.auxScratch(pos, "a float literal")
+    # The bit pattern is materialized through a scratch GPR (fmovq/d xmm ← gpr); the
+    # emitter draws that GPR from its staging set (x64 R11 bridge / a64 takeBridge) —
+    # it is purely transient (load-imm → fmov → release), never a survivor that needs
+    # an allocator-pool register, so no `auxScratch` is reserved here.
     b.ra.locs[pos] = dest
     inc n
   of Symbol:
@@ -609,14 +619,28 @@ proc allocFValue(b: var Builder; n: var Cursor; dest: var Location) =
       # (the emitter reads the home from locationOfSym and emits a movsd from the slot).
       if dest.kind != InFReg: dest = b.reserveFTmp(home.typ)
     else:
-      # a module-level float global / tvar read: not handled by the emitter yet.
-      raiseAssert "arkham: float global/threadvar read not supported yet"
+      # a module-level float global / tvar read: load it into a SIMD register
+      # (the emitter resolves the global address and emits a movss/movsd).
+      if dest.kind != InFReg: dest = b.reserveFTmp(b.tc.exprSlot(n))
     b.ra.locs[pos] = dest
     inc n
   of TagLit:
     case n.exprKind
     of AddC, SubC, MulC, DivC:
       allocFBin(b, n, dest); return              # records locs[pos] itself
+    of NegC:
+      # float negation `(neg (f N) x)`: the operand lands in the result xmm, the
+      # emitter flips its sign in place. Mirrors the float-unary shape used by a64.
+      if dest.kind != InFReg:
+        dest = b.reserveFTmp(if dest.typ.kind == AFloat: dest.typ else: floatSlot(64))
+      let resDest = dest
+      n.into:
+        skip n                                   # result float type
+        var fd = resDest
+        allocFValue(b, n, fd)                    # operand → the accumulator xmm
+        while n.hasMore: skip n
+      b.ra.locs[pos] = resDest
+      return
     of ConvC:
       # A conversion whose RESULT is float. An INT source is `cvtsi2sd` (the operand
       # in a GPR temp the emitter extends first); a FLOAT source is a precision /
@@ -677,11 +701,11 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
   var intIdx = if hiddenPtr: 1 else: 0         # rdi reserved for a >16B aggregate result ptr
   var fIdx = 0
   n.into:
-    # An INDIRECT call's target is a fn-ptr EXPRESSION (vtable/method-table load), not a
-    # symbol: allocate it into a register HELD across the args + the call (the emitter
-    # declares a proctype var bound to it and `prepare`s through that). A direct call's
-    # symbol callee is just skipped.
-    let indirect = n.kind != Symbol
+    # An INDIRECT call's target is a fn-ptr EXPRESSION (vtable/method-table load), or a
+    # Symbol naming a proc-typed LOCAL/param (a fn-ptr value): allocate it into a register
+    # HELD across the args + the call (the emitter declares a proctype var bound to it and
+    # `prepare`s through that). A direct call's proc-decl symbol is just skipped.
+    let indirect = isIndirectCallTarget(b.tc, n)
     var fnptrTd: Location
     if indirect:
       fnptrTd = needsReg(ScalarSlot)
@@ -709,13 +733,11 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
           # copy temp). Reserve the address scratch FIRST (held), so it can't alias one of
           # the lvalue's embedded base/index regs (which `aggrAddrInto` materializes before
           # the `lea` writes the address scratch).
-          let addrT = b.reserveTmp(ScalarSlot)
+          let addrT = b.reserveHeldScratch("an aggregate-arg address")
           let rc = n
           allocLvalue2(b, n)                    # advances n past the lvalue (embedded regs)
           releaseLvalTemps(b, rc)
           b.releaseTmp(addrT)
-          if addrT.kind != InReg:
-            raiseAssert "arkham: out of registers for an aggregate-arg address"
           # APPEND the address scratch (read as the last element by the emitter): a non-SIB
           # `(at …)`/`(pat …)` arg already stored its stride scratch at `aux[pos].scratch[0]`
           # (same position — `posOf(rc)` IS the at's position), which must not be clobbered.
@@ -834,6 +856,26 @@ proc allocCond(b: var Builder; n: var Cursor) =
     allocValue(b, n, d)
     b.releaseTmp(d)
 
+proc reserveAtScratch(b: var Builder; atPos: int; idxReg: Reg) =
+  ## Reserve the GPR for nifasm's 3-operand `(at base idx scratch)` non-SIB stride form
+  ## (recorded in `aux[atPos]`). The hard invariant is scratch ≠ BASE (`scratch = base +
+  ## idx*stride` aliases catastrophically otherwise). It holds because the base is a live
+  ## local whose register is out of the pool, so `reserveTmp` (which draws from the
+  ## remaining pool and never evicts a local) can never hand out the base register. nifasm
+  ## also flags a scratch==base collision at assemble time (`at_scratch_base_collision`).
+  ##
+  ## scratch == INDEX is permitted: x86 tolerates it (`mov scratch,idx` is a no-op, then
+  ## `idx*stride`, then `base+scratch`), and under real pressure it is the ONLY option, so
+  ## forbidding it would spill the scratch to memory — illegal for a stride register. The
+  ## AArch64 assembler computes the stride into a reserved scratch (X16) precisely so
+  ## scratch==idx stays correct there too. (`idxReg` is accepted for documentation/future
+  ## tuning; the reservation itself only needs the base invariant.)
+  discard idxReg
+  let t = b.reserveTmp(ScalarSlot)
+  if t.kind == InReg:
+    b.ra.aux[atPos] = ExprAux(scratch: @[t.r])
+  else: raiseAssert "arkham: out of registers for an index stride scratch"
+
 proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = false) =
   ## Walk an lvalue subtree (the target of a load / store / `addr`), allocating its
   ## embedded VALUES — a `deref`'s pointer, a computed index — into registers (their
@@ -854,10 +896,15 @@ proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = 
     if b.symLoc(nm).kind == Undef:           # a module-level global aggregate base
       let pos = b.posOf(n)
       if globBase.kind == InReg: b.ra.locs[pos] = globBase
+      elif b.md.arch == X86 and not isStore:
+        # A transient global base for a LOAD (e.g. a float field read whose result is an
+        # xmm, so the GPR address can't be the result reg): the emitter sources the
+        # address from emit-time STAGING (the R11 bridge), so reserve no survivor pool
+        # register here — leave the position unresolved as the marker.
+        b.ra.locs[pos] = dontCare
       else:
-        let t = b.reserveTmp(ScalarSlot)     # fallback (float load): own GPR temp
-        if t.kind == InReg: b.ra.locs[pos] = t
-        else: raiseAssert "arkham: out of registers for a global base address"
+        let t = b.reserveHeldScratch("a global base address")  # survivor (held across rhs / a64)
+        b.ra.locs[pos] = t
     inc n                                    # stack-var / pointer / global base name
   of TagLit:
     case n.exprKind
@@ -872,24 +919,20 @@ proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = 
         while n.hasMore: skip n
     of AtC:
       let atPos = b.posOf(n)
+      var idxReg = NoReg                        # the register index (if any)
       n.into:
         allocLvalue2(b, n, globBase, isStore) # base (stack array, deref, or global)
         if n.kind in {IntLit, UIntLit}: skip n   # immediate index — folds, no scratch
         else:
           var idx = needsReg(ScalarSlot)
           allocValue(b, n, idx)             # register index → a register (folds via scale)
+          if idx.kind == InReg: idxReg = idx.r
         while n.hasMore: skip n
-      if atPos in b.atScratch:
-        # Non-SIB element stride: reserve a scratch GPR for nifasm's 3-operand `(at
-        # base idx scratch)`, recorded in aux. Held until the access has consumed the
-        # address; `releaseLvalTemps` frees it (uniformly for load and store, alongside
-        # the index/pointer temps) so there is no double-free.
-        let t = b.reserveTmp(ScalarSlot)
-        if t.kind == InReg:
-          b.ra.aux[atPos] = ExprAux(scratch: @[t.r])
-        else: raiseAssert "arkham: out of registers for an index stride scratch"
+      if atPos in b.atScratch and b.md.arch == Arm64:
+        reserveAtScratch(b, atPos, idxReg)     # x64 picks it from emit-time staging instead
     of PatC:
       let patPos = b.posOf(n)
+      var idxReg = NoReg
       n.into:
         var d = needsReg(ScalarSlot)
         allocValue(b, n, d)                  # the pointer → a register (its home)
@@ -897,15 +940,11 @@ proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = 
         else:
           var idx = needsReg(ScalarSlot)
           allocValue(b, n, idx)             # register index → a register (folds via scale)
+          if idx.kind == InReg: idxReg = idx.r
         while n.hasMore: skip n
-      if patPos in b.atScratch:
-        # Non-SIB pointer-element stride: reserve a scratch GPR for nifasm's 3-operand
-        # `(at (cast (aptr E) p) idx scratch)`, just like the `AtC` case. Freed by
-        # `releaseLvalTemps` alongside the pointer/index temps.
-        let t = b.reserveTmp(ScalarSlot)
-        if t.kind == InReg:
-          b.ra.aux[patPos] = ExprAux(scratch: @[t.r])
-        else: raiseAssert "arkham: out of registers for a pat stride scratch"
+      if patPos in b.atScratch and b.md.arch == Arm64:
+        reserveAtScratch(b, patPos, idxReg)    # x64 picks it from emit-time staging instead
+
     of BaseobjC:                             # `(baseobj BaseT depth lvalue)` — transparent base
       n.into:
         skip n                               # base type
@@ -1075,7 +1114,7 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
   of Symbol:
     let natural = b.symLoc(symName(n))
     if natural.kind == Undef: b.forceRegDest(dest)   # a global/tvar: load into a register
-    else: b.resolveDest(dest, natural)               # a function-local: its home
+    else: b.resolveDest(dest, natural)               # a function-local: its home (frozen)
     inc n
   of StrLit:
     b.forceRegDest(dest); inc n                # string literal → a reg (lea of rodata)
@@ -1136,11 +1175,11 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
       b.forceRegDest(dest)
       let resDest = dest
       let lvCopy = n                          # for releaseLvalTemps after the load
-      # A destination-passed FIXED register (a register-homed local's home) is NOT a temp
-      # taken out of the pool, so the index/base allocation below could `stealForTmp` it —
-      # stealing the very register this load's result lands in, aliasing the result with one
-      # of its own indices (different types ⇒ a `(mov res[ptr], (mem (at … res[i64])))` that
-      # nifasm rejects). Seal it across the address allocation so the steal picks another.
+      # A destination-passed FIXED register (an arg reg / a register-homed local's home) is
+      # NOT a temp taken out of the pool, so the index/base allocation below could `reserveTmp`
+      # it — landing this load's result on the same register as one of its own indices
+      # (different types ⇒ a `(mov res[ptr], (mem (at … res[i64])))` that nifasm rejects).
+      # Seal it across the address allocation so the index temp picks another.
       let sealedHere = resDest.isTemp == false and resDest.r notin b.ra.sealed
       if sealedHere: b.ra.sealed.incl resDest.r
       allocLvalue2(b, n, resDest)             # embedded base/index regs; a global base
@@ -1170,6 +1209,11 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
           allocLvalue2(b, n)                 # place p (sets locs[p]); no result temp
           releaseLvalTemps(b, lvCopy)
           while n.hasMore: skip n
+        # The address IS p's register; reflect that in `dest` so a wrapping consumer
+        # (e.g. `(cast (ptr T) (addr (deref p)))`) reads the resolved location and not
+        # the still-`NeedsReg` constraint it passed in (every allocValue path leaves
+        # `dest` = the resolved location on return — this identity path must too).
+        dest = identityHome
         b.ra.locs[pos] = identityHome
         return
       b.forceRegDest(dest)
@@ -1203,8 +1247,12 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
       return
     of TrueC:
       b.resolveDest(dest, immLoc(1, ScalarSlot)); skip n
-    of FalseC, NilC:
+    of FalseC:
       b.resolveDest(dest, immLoc(0, ScalarSlot)); skip n
+    of NilC:
+      # nil is a 0 of the `(nil)` type (a null pointer), NOT an `(i 64)` 0: carry the
+      # nil slot so the emitter binds the register / emits the immediate as `(nil)`.
+      b.resolveDest(dest, immLoc(0, b.tc.exprSlot(n))); skip n
     of OvfC:
       # The overflow flag — always false (arkham uses wrapping arithmetic, see the
       # `keepovf`/emitValue2 handling), so the `(if (ovf) …)` handlers are dead.
@@ -1281,30 +1329,46 @@ proc isAggrCopySrc(c: Cursor): bool =
 proc allocAggrCopy(b: var Builder; n: var Cursor; dstIsMem: bool; dstCur: Cursor;
                    auxPos: int) =
   ## Allocator twin of `genAggrCopyStore`: the ONE whole-aggregate copy reservation for
-  ## every (destination × source) form. Reserve the three held scratches the emitter's
-  ## `aggrAddrLoc`/`aggrAddrInto`/`copyAggr` consume — `[dstAddr, srcAddr, copyTmp]` — then
-  ## place each lvalue's embedded base/index regs transiently (a `Mem` destination and a
+  ## every (destination × source) form. Reserve the two held address scratches the
+  ## emitter's `aggrAddrLoc`/`aggrAddrInto` consume — `[dstAddr, srcAddr]` — then place
+  ## each lvalue's embedded base/index regs transiently (a `Mem` destination and a
   ## memory-lvalue source; freed after their address is leas'd, so they never co-live). A
   ## bare symbol needs none. The dst/src stride-scratch aux live at THEIR own positions
   ## (≠ auxPos), so they never collide with these. Advances `n` past the source.
-  let dstAddr = b.reserveTmp(ScalarSlot)
-  let srcAddr = b.reserveTmp(ScalarSlot)
-  let copyTmp = b.reserveTmp(ScalarSlot)
+  ##
+  ## The per-field copy register is NOT reserved from the pool: it is the always-available
+  ## staging bridge (R11 / x14–x15), picked at emit (`genAggrCopyStore`) — live only during
+  ## the final copy loop, after both addresses are already in `dstAddr`/`srcAddr`, so the
+  ## bridge is free then. This keeps the whole-aggregate copy's pool need at TWO GPRs (not
+  ## three), so it still fits when a proc with several register-homed live params crosses an
+  ## aggregate copy (e.g. a setter `[]=(addr deepLvalue, key, Obj(…, field: aggrCopy))`).
+  ##
+  ## Register-pressure ordering: `srcAddr` is reserved only from the source onward, so it is
+  ## not held while the DST lvalue address is computed — keeping the peak simultaneous hold
+  ## at `dstAddr + base/index/stride` then `dstAddr + srcAddr`, never both lvalues' temps.
+  # x64 picks the two address scratches from emit-time staging (`genAggrCopyStore`), like
+  # the stride scratch — so they never starve when locals fill the pool. a64 (large volatile
+  # pool, only two staging bridges) keeps reserving them from the pool.
+  let useAux = b.md.arch == Arm64
+  var dstAddr, srcAddr = dontCare
+  if useAux: dstAddr = b.reserveTmp(ScalarSlot)
   if dstIsMem:
     var dc = dstCur
     allocLvalue2(b, dc, dontCare, isStore = true)
     releaseLvalTemps(b, dstCur)
     b.ra.hasStackVars = true
+  if useAux: srcAddr = b.reserveTmp(ScalarSlot)
   if n.kind == TagLit and n.exprKind in {DotC, DerefC, AtC, PatC}:
     let rc = n
     allocLvalue2(b, n)                                   # advances n past the lvalue
     releaseLvalTemps(b, rc)
   else:
     skip n                                               # a bare symbol
-  b.releaseTmp(copyTmp); b.releaseTmp(srcAddr); b.releaseTmp(dstAddr)
-  if dstAddr.kind != InReg or srcAddr.kind != InReg or copyTmp.kind != InReg:
-    raiseAssert "arkham: out of registers for an aggregate copy"
-  b.ra.aux[auxPos] = ExprAux(scratch: @[dstAddr.r, srcAddr.r, copyTmp.r])
+  if useAux:
+    b.releaseTmp(srcAddr); b.releaseTmp(dstAddr)
+    if dstAddr.kind != InReg or srcAddr.kind != InReg:
+      raiseAssert "arkham: out of registers for an aggregate copy"
+    b.ra.aux[auxPos] = ExprAux(scratch: @[dstAddr.r, srcAddr.r])
 
 proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
   ## Allocator twin of the emitter's `genStore2`. A whole-aggregate COPY (symbol/lvalue
@@ -1322,6 +1386,17 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
       allocAggrCopy(b, n, dst.kind == Mem,
                     (if dst.kind == Mem: dst.cur else: default(Cursor)), auxPos)
       return
+  if n.kind == TagLit and n.exprKind in {ConvC, CastC} and
+     b.tc.exprSlot(n).kind == AMem:
+    # A distinct / representation-preserving conversion of an AGGREGATE (e.g. `Path(s)`
+    # for `Path = distinct string`) is a no-op at the byte level — allocate/store the
+    # underlying operand into the same destination. (A scalar conv has a non-AMem slot
+    # and is handled by the scalar paths below.)
+    n.into:
+      skip n                                             # the target type
+      allocStore(b, n, dst, auxPos)                      # the operand → same dest (advances n)
+      while n.hasMore: skip n
+    return
   if dst.kind == NamedStack and dst.typ.kind == AMem:    # aggregate destination
     if n.kind == TagLit and n.exprKind == OconstrC:
       allocConstr(b, n)                                  # object: place each field value
@@ -1354,7 +1429,7 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
         var d = dontCare
         allocCall(b, n, d, hiddenPtr = true)
       else:
-        let addrT = b.reserveTmp(ScalarSlot)             # &g address temp (held across rhs)
+        let addrT = b.reserveHeldScratch("a global address")  # &g address (held across rhs)
         if n.kind == TagLit and n.exprKind == OconstrC:
           allocConstr(b, n)                              # build field-by-field through &g
         elif n.kind == TagLit and n.exprKind == AconstrC:
@@ -1365,14 +1440,12 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
         else:
           raiseAssert "arkham: aggregate global store rhs not supported: " & $n.exprKind
         b.releaseTmp(addrT)
-        if addrT.kind != InReg: raiseAssert "arkham: out of registers for a global address"
         b.ra.aux[auxPos] = ExprAux(scratch: @[addrT.r])
     else:
-      let addrT = b.reserveTmp(ScalarSlot)               # &g address temp (Tvar ignores it)
+      let addrT = b.reserveHeldScratch("a global address")  # &g address (Tvar ignores it)
       b.allocSingleUse(n)
       b.releaseTmp(addrT)
-      if addrT.kind == InReg: b.ra.aux[auxPos] = ExprAux(scratch: @[addrT.r])
-      else: raiseAssert "arkham: out of registers for a global address"
+      b.ra.aux[auxPos] = ExprAux(scratch: @[addrT.r])
   elif dst.kind == InFReg:                               # float register home: dest-passing
     var d = dst
     allocFValue(b, n, d)
@@ -1405,7 +1478,7 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
     let lhsCur = dst.cur
     let hasGlob = lvalueGlobalBase(b, lhsCur)
     var scratch = dontCare
-    if hasGlob: scratch = b.reserveTmp(ScalarSlot)
+    if hasGlob: scratch = b.reserveHeldScratch("a global address")
     var lc = lhsCur
     allocLvalue2(b, lc, scratch, isStore = true)         # lhs operands (on a copy)
     if n.kind == TagLit and n.exprKind == OconstrC:
@@ -1417,8 +1490,7 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
     releaseLvalTemps(b, lhsCur)                          # free the held index/pointer + `(at)` scratch
     if hasGlob:
       b.releaseTmp(scratch)
-      if scratch.kind == InReg: b.ra.aux[auxPos] = ExprAux(scratch: @[scratch.r])
-      else: raiseAssert "arkham: out of registers for a global address"
+      b.ra.aux[auxPos] = ExprAux(scratch: @[scratch.r])
   else:
     raiseAssert "arkham: store destination not supported: " & $dst.kind
 
@@ -1443,6 +1515,9 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
         allocStore(b, vc, namedStackLoc(name, slot), pos)   # the one general store path
     else:
       let props = b.an.vars.getOrDefault(name).props
+      # Optimistically give the local a register; demote a colder one to memory if the
+      # register class is full (`trySteal`, the only undo). A spilled / address-taken
+      # scalar lives in a nifasm-managed `(s)` slot addressed by name.
       var loc = b.allocStorage(slot, props)
       if loc.kind == OnStack and AddrTaken notin props and
          slot.inRegClass and not slot.isFloat:
@@ -1670,7 +1745,13 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
             # div/mod, rcx for a variable shift), it must move to a callee-saved
             # home that survives the clobber. Treat it like a cross-call param.
             let clobbered = (arg == b.md.divRemReg and b.an.clobbersDivReg) or
-                            (arg == b.md.shiftCountReg and b.an.clobbersShiftReg)
+                            (arg == b.md.shiftCountReg and b.an.clobbersShiftReg) or
+                            # AArch64: x0 is BOTH arg0 and the return register. A param homed
+                            # in x0 that the result expression reads off the projection spine
+                            # is clobbered by a sibling sub-result landing in the accumulator
+                            # before that read — give it a callee-saved home. (No-op on x86-64,
+                            # where intRetReg=rax is never an arg register.)
+                            (arg == b.md.intRetReg and b.an.arg0RetConflict)
             if AddrTaken in props and not aggrByRef:
               loc = b.spill(effSlot)           # address taken → must be on the stack
             elif hasCall or aggrByRef or clobbered:
@@ -1708,46 +1789,69 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
             b.ra.hasStackVars = true
           b.record(pos, name, loc)
 
+proc seedPools(b: var Builder) =
+  ## Fill the four register pools to their full target capacity. As locals are
+  ## declared and params placed, their registers leave the pool; temps draw from
+  ## what remains.
+  b.freeVol = {}; b.freeCallee = {}; b.freeVolF = {}; b.freeCalleeF = {}
+  for r in b.md.intTempRegs: b.freeVol.incl r
+  for r in b.md.intCalleeSaved: b.freeCallee.incl r
+  for f in b.md.floatTempRegs: b.freeVolF.incl f
+  for f in b.md.floatCalleeSaved: b.freeCalleeF.incl f
+
 proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
                    prog: var Program; md: MachineDesc; tc: TypeCtx;
                    presealed: set[Reg] = {}; allocExprs = false;
                    atScratch: HashSet[int] = initHashSet[int]()): RegAlloc =
-  ## Allocate storage for the params and locals of `procDecl`. `md` describes the
-  ## target register file + ABI. `presealed` registers are reserved for the whole
-  ## proc (never allocated/stolen). `prog` is taken by `var` because resolving a
-  ## cross-module type may load a module. `allocExprs` (value-core rewrite) also
-  ## assigns `locs[pos]` to expressions — off by default so the legacy reactive
-  ## emitter sees the unchanged symbol-only `locs`. `atScratch` lists the `(at …)`
-  ## positions (computed by the codegen, which can size strides) that need a scratch
-  ## GPR for a non-SIB element stride.
+  ## Allocate storage for the params, locals and (when `allocExprs`) the expression
+  ## temporaries of `procDecl` in a SINGLE walk over the tree. The model (codegen.c +
+  ## optimistic locals):
+  ##   * Expression temporaries and addressing scratch draw from the volatile/callee-
+  ##     saved registers the pool still has free, and spill to their OWN `(s)` slot when
+  ##     none is free. A temp NEVER takes a live local's register — codegen.c shows ~2
+  ##     registers suffice for all computation, so a temp is always servable.
+  ##   * LOCALS are assigned to registers OPTIMISTICALLY as they are declared. The only
+  ##     undo of a register assignment is local→memory: when we find we have too many
+  ##     locals for a register (a hotter local arrives, or a survivor scratch needs a
+  ##     callee-saved reg), `trySteal`/`reserveHeldScratch` demote a colder local with
+  ##     `demoteToStack` — a single-point `locs[symPos[name]]` rewrite that every use
+  ##     sees (the emitter late-binds local reads via `locationOfSym`). Sound across all
+  ##     control flow because the demoted local lives in memory everywhere.
+  ## Because temps and locals never contend for the same register, there is no temp-vs-
+  ## local collision class to reason about — the simple, effective solution.
+  ##
+  ## `md` describes the target register file + ABI. `presealed` registers are
+  ## reserved for the whole proc. `prog` is `var` because resolving a cross-module
+  ## type may load a module. `atScratch` lists the `(at …)` positions needing a
+  ## non-SIB stride scratch GPR.
   var b = Builder(buf: addr buf, an: addr an, prog: addr prog, tc: tc, md: md,
-                  allocExprs: allocExprs, atScratch: atScratch)
-  b.ra.locs = newSeq[Location](buf.len)
-  b.ra.aux = initTable[int, ExprAux]()
-  b.ra.symPos = initTable[string, int]()
+                  atScratch: atScratch)
+  b.allocExprs = allocExprs
+  b.ra = RegAlloc(locs: newSeq[Location](buf.len),
+                  aux: initTable[int, ExprAux](),
+                  symPos: initTable[string, int]())
   b.ra.sealed = presealed
-  for r in md.intTempRegs: b.freeVol.incl r
-  for r in md.intCalleeSaved: b.freeCallee.incl r
-  for f in md.floatTempRegs: b.freeVolF.incl f
-  for f in md.floatCalleeSaved: b.freeCalleeF.incl f
+  b.scopeVars = @[]; b.pendingFree = @[]; b.freedSyms = initHashSet[string]()
+  b.tmpSpills = 0
+  b.seedPools()
   var n = procDecl
   assert n.stmtKind == ProcS
   b.openScope()
   n.into:
     inc n                                    # name
-    allocParams(b, n, an.hasCall)            # params
+    allocParams(b, n, an.hasCall)
     if n.kind == TagLit:                      # a float return goes to xmm0 (value-core)
       let rtSlot = slotOf(prog, n)
       if rtSlot.isFloat: b.retFloatBits = rtSlot.size * 8
-    elif n.kind == Symbol:                    # a named-type return; aggregate → regs / hidden ptr
+    elif n.kind == Symbol:                    # named-type return; aggregate → regs / hidden ptr
       let rtSlot = slotOf(prog, n)
       if rtSlot.kind == AMem:
         b.retAggr = true
         b.retAggrSlot = rtSlot
         if rtSlot.size > md.aggrByRefThreshold: b.retIndirect = true
-    skip n                                   # return type
-    skip n                                   # pragmas
-    walk(b, n)                               # body
+    skip n                                    # return type
+    skip n                                    # pragmas
+    walk(b, n)                                # body
   b.closeScope()
   result = ensureMove b.ra
 
