@@ -46,7 +46,7 @@ jobs:
           git config --global init.defaultBranch master
 
       - name: Checkout nifasm
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: nifasm
           submodules: false
@@ -177,7 +177,7 @@ jobs:
           architecture: ${{ matrix.target.cpu }}
 
       - name: Checkout Nimony
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: nimony
           repository: nim-lang/nimony
