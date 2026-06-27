@@ -1,0 +1,36 @@
+(.nif27)
+(.indexat 528              )
+(stmts
+ (type :IntFn.0 .
+  (proctype .
+   (params
+    (param :x.0 .
+     (i 64)))
+   (i 64).))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :addone.0
+  (params
+   (param :x.0 .
+    (i 64)))
+  (i 64).
+  (stmts
+   (ret
+    (add
+     (i 64)x.0 1))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :f.0 . IntFn.0 addone.0)
+   (var :r.0 .
+    (i 64)
+    (call f.0 41))
+   (call exit.c r.0))))(.index)

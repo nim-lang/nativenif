@@ -563,28 +563,56 @@ proc genProctypeSig(g: var CodeGen; c: var Cursor) =
     if declarative:
       c.into:
         skip c                                  # the Empty slot (a proc has its name here)
+        # A >16B by-ref aggregate result travels via x8 (handled raw at the call site),
+        # not a signature param — the result slot is empty.
+        var retC = c
+        skip retC                               # params slot → return type
+        var retByRef = false
+        if not retIsVoid(retC):
+          let rs = slotOf(g.prog, retC)
+          retByRef = rs.kind == AMem and rs.size > 16
         g.ab.tree ParamsD:
           if c.kind == TagLit:                  # (params (param …) …)
-            var idx = 0
+            var idx = 0                         # param POSITION (its name pN.0)
+            var gpIdx = 0                       # next x-register
             c.into:
               while c.hasMore:
                 c.into:                         # (param :name pragmas type)
                   inc c                         # name → positional pN.0
                   skip c                        # pragmas
-                  g.ab.tree ParamD:
-                    g.ab.symDef paramName(idx)
-                    if idx < IntArgRegs.len: g.ab.reg IntArgRegs[idx]  # raw reg *location*
-                    else: g.ab.keyword SO       # 9th+ → stack-passed
-                    g.genPointee(c)            # param type BY REFERENCE (named → sym);
-                                               # a self-referential closure sig can't recurse
+                  let ps = slotOf(g.prog, c)
+                  if ps.kind == AMem:
+                    # Aggregate param: >16B by-ref pointer in one x-reg, ≤16B by-value
+                    # over `nw` consecutive x-regs (`(arg pN k)` selects word k).
+                    let nw = (ps.size + 7) div 8
+                    let aggrRef = ps.size > 16
+                    g.ab.tree ParamD:
+                      g.ab.symDef paramName(idx)
+                      g.ab.tree RegsD:
+                        if aggrRef: g.ab.reg IntArgRegs[gpIdx]
+                        else:
+                          for k in 0 ..< nw: g.ab.reg IntArgRegs[gpIdx + k]
+                      if aggrRef:
+                        g.ab.ptrType: g.genPointee(c)
+                      else:
+                        g.genPointee(c)
+                    if aggrRef: inc gpIdx else: gpIdx += nw
+                  else:
+                    g.ab.tree ParamD:
+                      g.ab.symDef paramName(idx)
+                      if gpIdx < IntArgRegs.len: g.ab.reg IntArgRegs[gpIdx]  # raw reg *location*
+                      else: g.ab.keyword SO       # 9th+ → stack-passed
+                      g.genPointee(c)            # param type BY REFERENCE (named → sym);
+                                                 # a self-referential closure sig can't recurse
+                    inc gpIdx
                   while c.hasMore: skip c
                 inc idx
           else:
             skip c
         g.ab.tree ResultD:
           # The RetType is always the node after Params (a `.`/`(void)` for void).
-          if retIsVoid(c):
-            skip c                              # consume the void `.`/`(void)` node
+          if retIsVoid(c) or retByRef:
+            skip c                              # void, or returned via the x8 indirect pointer
           else:
             g.ab.symDef "ret.0"
             g.ab.reg IntRet                     # raw reg *location* of the result
@@ -1032,29 +1060,68 @@ proc emitSignature(g: var CodeGen; decl: Cursor; declarative: bool) =
     var c = decl
     c.into:
       inc c                                   # name → params slot
+      # A >16B by-reference aggregate RESULT travels through the AAPCS64 indirect-result
+      # register x8 (set by the caller, moved to a callee-saved home in the prologue) —
+      # NOT through a signature param, unlike x86-64's hidden-pointer-in-rdi. So the
+      # result slot is just empty; x8 is handled raw on both sides.
+      var retC = c
+      skip retC                               # params slot → return type
+      var retByRef = false
+      if not retIsVoid(retC):
+        let rs = slotOf(g.prog, retC)
+        retByRef = rs.kind == AMem and rs.size > 16
       g.ab.tree ParamsD:
         if c.kind == TagLit:                  # (params (param …) …)
-          var idx = 0
+          var idx = 0                         # param POSITION (its name p{idx})
+          var gpIdx = 0                       # next x-register (an aggregate spans several)
           c.into:
             while c.hasMore:
               c.into:                         # (param :name pragmas type)
                 inc c                         # name → use positional p{idx}
                 skip c                        # pragmas
-                g.ab.tree ParamD:
-                  g.ab.symDef paramName(idx)
-                  if idx < IntArgRegs.len:
-                    g.ab.reg IntArgRegs[idx]  # x0–x7: raw reg *location*
-                  else:
-                    g.ab.keyword SO           # 9th+ → stack-passed `(s)`
-                  g.genTypeBody(c)            # the param type (consumes it)
+                let ps = slotOf(g.prog, c)
+                if ps.kind == AFloat:
+                  raiseAssert "arkham a64: float param in signature not yet supported"
+                if ps.kind == AMem:
+                  # An aggregate param: a >16B aggregate is a by-ref pointer in one x-reg;
+                  # a ≤16B by-value aggregate spans `nw` consecutive x-regs (one per
+                  # eightbyte). Emitted with `(regs …)` (ABI-only); `(arg pN k)` at a call
+                  # selects word k. The body reads the registers raw into its own home.
+                  let nw = (ps.size + 7) div 8
+                  let aggrRef = ps.size > 16
+                  g.ab.tree ParamD:
+                    g.ab.symDef paramName(idx)
+                    g.ab.tree RegsD:
+                      if aggrRef: g.ab.reg IntArgRegs[gpIdx]
+                      else:
+                        for k in 0 ..< nw: g.ab.reg IntArgRegs[gpIdx + k]
+                    if aggrRef:
+                      g.ab.ptrType: g.genTypeBody(c)
+                    else:
+                      g.genTypeBody(c)
+                  if aggrRef: inc gpIdx else: gpIdx += nw
+                else:
+                  g.ab.tree ParamD:
+                    g.ab.symDef paramName(idx)
+                    if gpIdx < IntArgRegs.len:
+                      g.ab.reg IntArgRegs[gpIdx]  # x0–x7: raw reg *location*
+                    else:
+                      g.ab.keyword SO           # 9th+ → stack-passed `(s)`
+                    g.genTypeBody(c)            # the param type (consumes it)
+                  inc gpIdx
                 while c.hasMore: skip c
               inc idx
         else:
           skip c                              # no params slot → consume it
       g.ab.tree ResultD:                      # c now at the return type
-        if retIsVoid(c):
-          skip c                              # void → empty (result)
+        if retIsVoid(c) or retByRef:
+          skip c                              # void, or returned via the x8 indirect pointer
         else:
+          let rs = slotOf(g.prog, c)
+          if rs.kind == AFloat:
+            raiseAssert "arkham a64: float result in signature not yet supported"
+          if rs.kind == AMem:
+            raiseAssert "arkham a64: by-value aggregate result in signature not yet supported"
           g.ab.symDef "ret.0"
           g.ab.reg IntRet                     # raw reg *location* of the result
           g.genTypeBody(c)                    # the result type (consumes it)
@@ -2099,7 +2166,7 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
         retType = q
         while q.hasMore: skip q
     # Evaluate the fn-ptr EXPRESSION into its allocator-assigned (held) register — the
-    # call target is just an expression (like codegen.c's `genx`), be it a `(cast
+    # call target is just an expression, be it a `(cast
     # Proctype …)` vtable load, a `(dot closure fld)`, a proc-typed local or PARAM.
     g.emitValue2(targetCur)
     let tloc = g.ra.locs[g.posOf(targetCur)]
@@ -2157,40 +2224,108 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
   let hasResult = not retIsVoid(tgt.retType)
   let resSlot = if hasResult: slotOf(g.prog, tgt.retType) else: ScalarSlot
   let resultIsFloat = hasResult and resSlot.kind == AFloat
-  let nStack = max(0, argCurs.len - IntArgRegs.len)
   if tgt.declarative:
+    # ── Full-signature call (AAPCS64): every arg binds through `(arg pN [k])`. A scalar
+    # occupies one x-reg; a ≤16B by-value aggregate spans `ceil(size/8)` x-regs (one
+    # `(arg pN k)` per word); a >16B aggregate is a pointer in one x-reg. A >16B
+    # aggregate RESULT travels via the x8 indirect register (set by the caller before
+    # this call), not a signature param. Param NAMES are positional (`paramName(j)`);
+    # register assignment is tracked separately by `gpIdx` (an aggregate spans several).
+    let resultByRef = hasResult and resSlot.kind == AMem and resSlot.size > 16
     g.ab.tree PrepareA64:
       g.ab.sym tgt.asmName
-      # Register args (x0–x7) first, while SP still points at the caller frame.
-      for idx in 0 ..< min(argCurs.len, IntArgRegs.len):
-        g.emitValue2(argCurs[idx])
-        let aloc = g.ra.locs[g.posOf(argCurs[idx])]
-        # Reference the arg register RAW: a checked-name temp binding carries a generic
-        # `(i 64)` that nifasm's strict reg→reg `mov` rejects into a sub-width param.
-        if aloc.kind == InReg and aloc.isTemp: g.unbindTemp(aloc.r)
-        g.ab.tree MovA64:
-          g.ab.tree ArgX: g.ab.sym paramName(idx)
-          g.ab.reg aloc.r
-      if nStack > 0:
-        # Reserve the outgoing area, then compute + store each stack arg IMMEDIATELY:
-        # the allocator reuses ONE scratch register for all stack args (each is dead
-        # after its store), so they must not be deferred (else they clobber each other).
+      var gpIdx = 0                                    # next x-register
+      var j = 0                                        # arg / param position
+      # Phase 1: register args (x0–x7), while SP still points at the caller frame.
+      while j < argCurs.len:
+        let a = argCurs[j]
+        let slot = g.exprSlot(a)
+        var words = 1
+        var tn = ""
+        var aggrRef = false
+        if slot.kind == AMem:
+          let tcur = g.getType(a)
+          if tcur.kind != Symbol:
+            raiseAssert "arkham a64: aggregate call-arg of non-nominal type"
+          tn = symName(tcur)
+          aggrRef = slot.size > 16
+          words = if aggrRef: 1 else: aggrWordCount(g.prog, tn)
+        if gpIdx + words > IntArgRegs.len: break       # the rest go on the stack
+        if slot.kind == AMem:
+          # Marshal the aggregate into IntArgRegs[gpIdx ..], then bind each word.
+          if a.kind == TagLit and a.exprKind in {DotC, DerefC, AtC, PatC}:
+            let srcAddr = g.ra.aux[g.posOf(a)].scratch[^1]
+            g.aggrAddrInto(a, srcAddr, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = true)
+            if aggrRef: g.movReg(IntArgRegs[gpIdx], srcAddr)
+            else: g.marshalAggrFromAddr(srcAddr, tn, gpIdx)
+            g.unbindTemp(srcAddr)
+          else:
+            var home = ""
+            var isGlobal = false
+            if a.kind == Symbol:
+              case g.lookupSym(symName(a)).cat
+              of scGlobal: isGlobal = true
+              of scTvar: raiseAssert "arkham a64: aggregate threadvar passed by value not supported"
+              else: home = symName(a)
+            else:
+              let p = g.posOf(a)
+              home = "aggtmp" & $p & ".0"
+              g.emTypedStackVar(home, g.getType(a))
+              g.varType[home] = tn
+              g.genStore2(a, namedStackLoc(home, slot), p)
+            if aggrRef:
+              if isGlobal: g.emGlobalAddr(IntArgRegs[gpIdx], symName(a))
+              elif g.ra.locationOfSym(home).kind == InReg:
+                g.movReg(IntArgRegs[gpIdx], g.ra.locationOfSym(home).r)
+              else: g.ab.tree LeaA64: (g.emReg IntArgRegs[gpIdx]; g.ab.sym home)
+            else:
+              if isGlobal: g.globalToRegs(symName(a), tn, gpIdx)
+              else: g.structToRegs(home, tn, gpIdx)
+          if aggrRef:
+            g.ab.tree MovA64:
+              g.ab.tree ArgX: g.ab.sym paramName(j)
+              g.emReg IntArgRegs[gpIdx]
+          else:
+            for k in 0 ..< words:
+              g.ab.tree MovA64:
+                g.ab.tree ArgX: (g.ab.sym paramName(j); g.ab.intLit k.int64)
+                g.emReg IntArgRegs[gpIdx + k]
+        else:
+          g.emitValue2(a)
+          let aloc = g.ra.locs[g.posOf(a)]
+          # Reference the arg register RAW: a checked-name temp binding carries a generic
+          # `(i 64)` that nifasm's strict reg→reg `mov` rejects into a sub-width param.
+          if aloc.kind == InReg and aloc.isTemp: g.unbindTemp(aloc.r)
+          g.ab.tree MovA64:
+            g.ab.tree ArgX: g.ab.sym paramName(j)
+            g.emReg aloc.r
+        gpIdx += words
+        inc j
+      # Phase 2: stack args (9th+). Reserve the outgoing area, then compute + store each
+      # IMMEDIATELY (the allocator reuses ONE scratch for all, so they can't be deferred).
+      let hadStack = j < argCurs.len
+      if hadStack:
         g.ab.tree SubA64: g.emReg SP; g.ab.keyword CsizeX
-        for idx in IntArgRegs.len ..< argCurs.len:
-          g.emitValue2(argCurs[idx])
-          let aloc = g.ra.locs[g.posOf(argCurs[idx])]
+        for k in j ..< argCurs.len:
+          let a = argCurs[k]
+          if g.exprSlot(a).kind == AMem:
+            raiseAssert "arkham a64: aggregate stack argument not yet supported"
+          g.emitValue2(a)
+          let aloc = g.ra.locs[g.posOf(a)]
           g.ab.tree MovA64:
             g.ab.tree MemX:
               g.emReg SP
-              g.ab.tree ArgX: g.ab.sym paramName(idx)
+              g.ab.tree ArgX: g.ab.sym paramName(k)
             g.emReg aloc.r
           if aloc.kind == InReg and aloc.isTemp: g.unbindTemp(aloc.r)
       if tgt.syscall:
         g.ab.tree SvcA64: g.ab.intLit 0
       else: g.ab.keyword CallA64
-      if nStack > 0:
+      if hadStack:
         g.ab.tree AddA64: g.emReg SP; g.ab.keyword CsizeX
-      if hasResult:
+      # A scalar result is consumed through `(res ret.0)`; a void / >16B by-ref (value via
+      # x8) result has no `(res)` slot here.
+      if hasResult and not resultByRef and not resultIsFloat and resSlot.kind != AMem:
         g.ab.tree MovA64:
           g.emReg IntRet
           g.ab.tree ResX: g.ab.sym "ret.0"
@@ -2199,7 +2334,7 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
       g.ab.tree KillA64: g.ab.sym fnTargetName
       g.regLocal.del fnptrReg
       g.boundTemps.excl fnptrReg
-    if hasResult and resLoc.kind == InReg and resLoc.r != IntRet:
+    if hasResult and not resultByRef and resLoc.kind == InReg and resLoc.r != IntRet:
       # x0 itself is raw-usable (arg/return reg) and needs no binding; only a result
       # moved to a non-x0 home (a pool reg) is bound so its checked name resolves.
       if resLoc.isTemp and resSlot.kind != AMem: g.bindTemp(resLoc.r, resSlot)

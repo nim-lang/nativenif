@@ -291,9 +291,10 @@ type
     ImpD = (ord(ImpTagId), "imp")  ## import dynamic library
     ExtprocD = (ord(ExtprocTagId), "extproc")  ## external proc from imported library
     SyprocD = (ord(SyprocTagId), "syproc")  ## system-call proc declaration (proctype + clobbers + number)
+    RegsD = (ord(RegsTagId), "regs")  ## multi-register param/result location: `(regs (rdi) (rsi))`
 
 proc rawTagIsNifasmDecl*(raw: TagEnum): bool {.inline.} =
-  raw in {TypeTagId, ProcTagId, ParamsTagId, ParamTagId, ResultTagId, ClobberTagId, VarTagId, ArchTagId, CfvarTagId, RodataTagId, GvarTagId, TvarTagId, ImpTagId, ExtprocTagId, SyprocTagId}
+  raw in {TypeTagId, ProcTagId, ParamsTagId, ParamTagId, ResultTagId, ClobberTagId, VarTagId, ArchTagId, CfvarTagId, RodataTagId, GvarTagId, TvarTagId, ImpTagId, ExtprocTagId, SyprocTagId, RegsTagId}
 
 type
   NifasmExpr* = enum

@@ -18,7 +18,18 @@ type
   Param* = object
     name*: string
     typ*: Type      # If kind == StackOffT, param is on stack
-    reg*: TagEnum
+    reg*: TagEnum   # the param's first (often only) register; == regs[0] when regs.len > 0
+    regs*: seq[TagEnum]
+      ## All registers a register-passed param occupies. A scalar/pointer/float param
+      ## has exactly one; a ≤16B by-value aggregate spans several (one per eightbyte,
+      ## e.g. rdi+rsi). Empty for a stack-passed param (`typ.isOnStack`). `(arg name k)`
+      ## / `(res name k)` select the k-th register.
+    viaRegs*: bool
+      ## True when the location was spelled `(regs …)` (an aggregate param consumed
+      ## RAW by the code generator — it moves the incoming registers into its own home).
+      ## Such a param is ABI-only: it is NOT entered into `regBindings`, so a raw
+      ## `(reg)` use of its register(s) in the body stays legal. A scalar/pointer/float
+      ## `(reg)` param has `viaRegs == false` and IS bound to its name.
 
   Type* = ref object
     case kind*: TypeKind
