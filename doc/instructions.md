@@ -436,3 +436,4 @@
 | `(strb D B I)`      | A64Inst                 | store low byte, register offset [B,I] |
 | `(rebind D T S)`    | X64Inst, A64Inst        | bind a phys reg to a typed name, killing its prior tenant |
 | `(withreg D T S ...)` | X64Inst, A64Inst      | block-scoped rebind; auto-killed at block end |
+| `(regs ...)`          | NifasmDecl                  | multi-register param/result location: `(regs (rdi) (rsi))` |

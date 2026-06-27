@@ -687,6 +687,14 @@ proc allocFValue(b: var Builder; n: var Cursor; dest: var Location) =
         while n.hasMore: skip n
       b.ra.locs[pos] = dest
       return
+    of InfC, NeginfC, NanC:                      # +inf / -inf / NaN — a leaf value node
+      # No sub-expression to place; like a FloatLit, just reserve the result xmm.
+      # The emitter loads the IEEE-754 bit pattern through a transient staging GPR.
+      if dest.kind != InFReg:
+        dest = b.reserveFTmp(if dest.typ.kind == AFloat: dest.typ else: floatSlot(64))
+      b.ra.locs[pos] = dest
+      skip n
+      return
     else:
       raiseAssert "arkham: float expression not supported: " & $n.exprKind
   else:
@@ -1687,6 +1695,14 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
   if params.kind != TagLit: return
   var intIdx = 0
   var fidx = 0
+  # Scalar cross-call register params (1..6) that took a callee-saved home, in
+  # allocation order. A stack-passed param (7th+) MUST have a register home — it
+  # is loaded from the incoming stack slot in the prologue before rsp is lowered,
+  # when a local slot is not yet addressable — so when callee-saved registers run
+  # out it evicts one of these to its stack slot and reuses the register. A
+  # register param spills cleanly (its value arrives in an arg register that
+  # emitParamMoves stores into the slot once the frame is set up).
+  var spillableRegParams: seq[tuple[pos: int; name: string; r: Reg; effSlot: AsmSlot]] = @[]
   params.into:
     while params.hasMore:
       params.into:
@@ -1762,6 +1778,10 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
               if r != NoReg:
                 b.ra.usedCallee.incl r
                 loc = regLoc(r, effSlot)
+                if not aggrByRef:
+                  # Evictable in favour of a later stack param (a by-ref aggregate's
+                  # slot would need its aggregate type, not the pointer — skip those).
+                  spillableRegParams.add (pos: pos, name: name, r: r, effSlot: effSlot)
               else:
                 loc = b.spill(effSlot)
             else:
@@ -1775,9 +1795,17 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
             # out-of-register stack params aren't supported yet.
             if AddrTaken in props:
               raiseAssert "arkham v1: address-taken >8th parameter"
-            let r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
+            var r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
             if r == NoReg:
-              raiseAssert "arkham v1: out of callee-saved registers for >8th parameter"
+              # No free callee-saved register: evict an earlier scalar register
+              # param to its stack slot and reuse its register for this stack param.
+              if spillableRegParams.len == 0:
+                raiseAssert "arkham v1: out of callee-saved registers for >8th parameter"
+              let victim = spillableRegParams.pop()
+              b.record(victim.pos, victim.name,
+                       namedStackLoc(victim.name, victim.effSlot))
+              b.ra.hasStackVars = true
+              r = victim.r                        # already in usedCallee
             b.ra.usedCallee.incl r
             loc = regLoc(r, effSlot)
             inc intIdx

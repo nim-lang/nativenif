@@ -925,16 +925,33 @@ proc parseParams(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
     if nameC.kind != SymbolDef: error("Expected param name", nameC)
     let name = symName(nameC)
 
-    # (reg) or (s) location
+    # (reg) / (regs (r0) (r1) …) / (s) location
     var loc = pr.location
     var reg = InvalidTagId
+    var regs: seq[TagEnum] = @[]
     var onStack = false
+    var viaRegs = false
     if loc.kind == TagLit:
       let locTag = rawTag(loc)
       if rawTagIsX64Reg(locTag) or rawTagIsA64Reg(locTag):
         reg = locTag
+        regs = @[locTag]
       elif locTag == STagId:
         onStack = true
+      elif locTag == RegsTagId:
+        # An aggregate param (≤16B by-value spread over several registers, or a >16B
+        # by-ref pointer in one) consumed RAW by the code generator — ABI-only, not bound.
+        viaRegs = true
+        var rc = loc
+        into rc:
+          while rc.hasMore:
+            if rc.kind != TagLit or
+               not (rawTagIsX64Reg(rawTag(rc)) or rawTagIsA64Reg(rawTag(rc))):
+              error("expected register in (regs …)", rc)
+            regs.add rawTag(rc)
+            skip rc
+        if regs.len == 0: error("empty (regs …)", loc)
+        reg = regs[0]
       else:
         error("Expected location", loc)
     else:
@@ -944,7 +961,7 @@ proc parseParams(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
     var typ = parseType(typC, scope, ctx)
     if onStack:
       typ = Type(kind: StackOffT, offType: typ)
-    result.add Param(name: name, typ: typ, reg: reg)
+    result.add Param(name: name, typ: typ, reg: reg, regs: regs, viaRegs: viaRegs)
   skip n # advance past the whole (params …) node
 
 proc parseResult(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
@@ -1622,13 +1639,20 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       result.typ = Type(kind: IntT, bits: 64)
       inc n
     elif t == ArgTagId:
-      # (arg name) - argument reference inside a prepare block
+      # (arg name [k]) - argument reference inside a prepare block. `into` bounds the
+      # cursor to the arg's children so the optional word index `k` (the k-th register
+      # of a ≤16B by-value aggregate) is read without leaking the following sibling.
       if not ctx.inCall:
         error("(arg ...) can only be used inside a prepare block", n)
-      inc n
-      if n.kind != Symbol: error("Expected argument name in (arg ...)", n)
-      let argName = getSym(n)
-      inc n
+      var argName = ""
+      var wordIdx = 0
+      into n:
+        if n.kind != Symbol: error("Expected argument name in (arg ...)", n)
+        argName = getSym(n)
+        inc n
+        if n.hasMore and n.kind == IntLit:
+          wordIdx = int(getInt(n))
+          inc n
       let paramPtr = findParam(ctx.callContext.typ, argName)
       if paramPtr == nil:
         error("Unknown argument: " & argName, n)
@@ -1646,10 +1670,14 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
         result.immVal = int64(offset)
         result.typ = paramPtr.typ
       else:
+        if wordIdx >= paramPtr.regs.len:
+          error("argument word index out of range for " & argName, n)
         result.kind = okArg
         result.argName = argName
-        result.reg = tagToRegisterA64(paramPtr.reg, n)
-        result.typ = paramPtr.typ
+        result.reg = tagToRegisterA64(paramPtr.regs[wordIdx], n)
+        result.typ =
+          if paramPtr.typ.kind in {TypeKind.ObjectT, TypeKind.ArrayT, TypeKind.UnionT}: Type(kind: RegisterT, regBits: 64)
+          else: paramPtr.typ
     elif t == ResTagId:
       # (res name) - result reference inside a prepare block (after the call)
       if not ctx.inCall:
@@ -1775,25 +1803,38 @@ proc parseDestA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       error("Register " & $result.reg & " is bound to variable '" &
             ctx.a64RegBindings[result.reg] & "', use the variable name instead", n)
   elif n.kind == TagLit and n.tag == ArgTagId:
-    # (arg name) as destination - binds a register argument inside a prepare block
+    # (arg name [k]) as destination - binds a register argument inside a prepare block.
+    # `into` bounds the cursor to the arg's children so the optional word index `k` (the
+    # k-th register of a ≤16B by-value aggregate) is read without leaking the sibling.
     if not ctx.inCall:
       error("(arg ...) can only be used inside a prepare block", n)
-    inc n
-    if n.kind != Symbol: error("Expected argument name in (arg ...)", n)
-    let argName = getSym(n)
-    inc n
+    var argName = ""
+    var wordIdx = 0
+    into n:
+      if n.kind != Symbol: error("Expected argument name in (arg ...)", n)
+      argName = getSym(n)
+      inc n
+      if n.hasMore and n.kind == IntLit:
+        wordIdx = int(getInt(n))
+        inc n
     let paramPtr = findParam(ctx.callContext.typ, argName)
     if paramPtr == nil:
       error("Unknown argument: " & argName, n)
     if paramPtr.typ.isOnStack:
       error("Stack argument '" & argName & "' cannot be used directly as destination, use (mem (sp) (arg " & argName & "))", n)
-    if argName in ctx.callContext.argsSet:
-      error("Argument already set: " & argName, n)
-    ctx.callContext.argsSet.incl(argName)
+    # Track once per name (on word 0) so the missing-arg check passes; allow later words.
+    if wordIdx == 0:
+      if argName in ctx.callContext.argsSet:
+        error("Argument already set: " & argName, n)
+      ctx.callContext.argsSet.incl(argName)
+    if wordIdx >= paramPtr.regs.len:
+      error("argument word index out of range for " & argName, n)
     result.kind = okArg
     result.argName = argName
-    result.reg = tagToRegisterA64(paramPtr.reg, n)
-    result.typ = paramPtr.typ
+    result.reg = tagToRegisterA64(paramPtr.regs[wordIdx], n)
+    result.typ =
+      if paramPtr.typ.kind in {TypeKind.ObjectT, TypeKind.ArrayT, TypeKind.UnionT}: Type(kind: RegisterT, regBits: 64)
+      else: paramPtr.typ
   elif n.kind == TagLit and (n.tag == MemTagId or n.tag == DotTagId or n.tag == AtTagId):
     let op = parseOperandA64(n, ctx)
     if op.kind != okMem:
@@ -2252,7 +2293,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of NoDecl:
     discard "handle via `case instTag`"
   of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD,
-     ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD:
+     ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD:
     raiseAssert("Unhandled declaration tag: " & $declTag)
 
   case instTag
@@ -2988,7 +3029,7 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
         # (a leaf param stays unnamed in its incoming arg register), so params are NOT
         # tracked there — only A64 register *locals* and `rebind`-bound scratch enter
         # `a64RegBindings`.
-        if not isA64Proc and param.reg != InvalidTagId:
+        if not isA64Proc and param.reg != InvalidTagId and not param.viaRegs:
           ctx.regBindings[tagToRegister(param.reg, n)] = param.name
 
     skip n   # past the proc name
@@ -3420,15 +3461,22 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
       result.typ = Type(kind: IntT, bits: 64)
       inc n
     elif t == ArgTagId:
-      # (arg name) - argument reference in prepare block. Capture the node cursor
-      # for diagnostics that run after we've advanced past it.
+      # (arg name [k]) - argument reference in prepare block. Capture the node cursor
+      # for diagnostics that run after we've advanced past it. `into` bounds the cursor
+      # to the arg's children so the optional word index `k` is read without leaking the
+      # following sibling.
       let argTok = n
       if not ctx.inCall:
         error("(arg ...) can only be used inside a prepare block", argTok)
-      inc n
-      if n.kind != Symbol: error("Expected argument name in (arg ...)", n)
-      let argName = getSym(n)
-      inc n
+      var argName = ""
+      var wordIdx = 0          # selects the k-th register of a ≤16B by-value aggregate arg
+      into n:
+        if n.kind != Symbol: error("Expected argument name in (arg ...)", n)
+        argName = getSym(n)
+        inc n
+        if n.hasMore and n.kind == IntLit:
+          wordIdx = int(getInt(n))
+          inc n
 
       let paramPtr = findParam(ctx.callContext.typ, argName)
       if paramPtr == nil:
@@ -3448,11 +3496,15 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
         result.immVal = int64(offset)
         result.typ = paramPtr.typ
       else:
-        # Register argument - return the register
+        # Register argument - return the (word-`wordIdx`) register
+        if wordIdx >= paramPtr.regs.len:
+          error("argument word index out of range for " & argName, argTok)
         result.kind = okArg
         result.argName = argName
-        result.reg = tagToRegister(paramPtr.reg, argTok)
-        result.typ = paramPtr.typ
+        result.reg = tagToRegister(paramPtr.regs[wordIdx], argTok)
+        result.typ =
+          if paramPtr.typ.kind in {TypeKind.ObjectT, TypeKind.ArrayT, TypeKind.UnionT}: Type(kind: RegisterT, regBits: 64)
+          else: paramPtr.typ
     elif t == ResTagId:
       # (res name) - result reference in prepare block (after call). Capture the
       # node cursor for diagnostics: the semantic checks below run after we've
@@ -3576,13 +3628,20 @@ proc parseDest(n: var Cursor; ctx: var GenContext): Operand =
       error("Register " & $result.reg & " is bound to variable '" &
             ctx.regBindings[result.reg] & "', use the variable name instead", n)
   elif n.kind == TagLit and n.tag == ArgTagId:
-    # (arg name) as destination - for register arguments in prepare block
+    # (arg name [k]) as destination - for register arguments in prepare block. `into`
+    # bounds the cursor to the arg's own children so the optional word index `k` is read
+    # without leaking the following sibling (the `(mov)` source) into the check.
     if not ctx.inCall:
       error("(arg ...) can only be used inside a prepare block", n)
-    inc n
-    if n.kind != Symbol: error("Expected argument name in (arg ...)", n)
-    let argName = getSym(n)
-    inc n
+    var argName = ""
+    var wordIdx = 0                      # selects the k-th register of a ≤16B aggregate arg
+    into n:
+      if n.kind != Symbol: error("Expected argument name in (arg ...)", n)
+      argName = getSym(n)
+      inc n
+      if n.hasMore and n.kind == IntLit:
+        wordIdx = int(getInt(n))
+        inc n
 
     let paramPtr = findParam(ctx.callContext.typ, argName)
     if paramPtr == nil:
@@ -3591,16 +3650,25 @@ proc parseDest(n: var Cursor; ctx: var GenContext): Operand =
     if paramPtr.typ.isOnStack:
       error("Stack argument '" & argName & "' cannot be used directly as destination, use (mem (rsp) (arg " & argName & "))", n)
 
-    # Track that this argument is being set
-    if argName in ctx.callContext.argsSet:
-      error("Argument already set: " & argName, n)
-    ctx.callContext.argsSet.incl(argName)
+    # Track that this argument is being set. A multi-word aggregate fills several words
+    # under the same name; count it once (on word 0) so the missing-arg check passes,
+    # but allow the later words without a "already set" error.
+    if wordIdx == 0:
+      if argName in ctx.callContext.argsSet:
+        error("Argument already set: " & argName, n)
+      ctx.callContext.argsSet.incl(argName)
 
-    # Return the register for this argument
+    # Return the (word-`wordIdx`) register for this argument
+    if wordIdx >= paramPtr.regs.len:
+      error("argument word index out of range for " & argName, n)
     result.kind = okArg
     result.argName = argName
-    result.reg = tagToRegister(paramPtr.reg, n)
-    result.typ = paramPtr.typ
+    result.reg = tagToRegister(paramPtr.regs[wordIdx], n)
+    # A by-value aggregate spread over registers receives a raw 64-bit word per slot,
+    # not the whole aggregate — type it as a register so the word `(mov)` type-checks.
+    result.typ =
+      if paramPtr.typ.kind in {TypeKind.ObjectT, TypeKind.ArrayT, TypeKind.UnionT}: Type(kind: RegisterT, regBits: 64)
+      else: paramPtr.typ
   elif n.kind == TagLit and (n.tag == MemTagId or n.tag == DotTagId or n.tag == AtTagId):
     let op = parseOperand(n, ctx)
     if op.kind != okMem:
@@ -4326,7 +4394,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     return
   of NoDecl:
     discard "continue with case instTag"
-  of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD:
+  of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD:
     error("Unexpected declaration: " & $declTag, n)
 
   case instTag

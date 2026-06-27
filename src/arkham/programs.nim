@@ -158,6 +158,7 @@ proc parsePragmas(c: var Cursor; importcN, exportcN: var string) =
     skip c
 
 proc resolveType*(p: var Program; c: Cursor): Cursor
+proc slotOf*(p: var Program; c: Cursor): AsmSlot
 
 proc abiScalarType(p: var Program; c: Cursor): bool =
   ## A type that travels in a single GPR with no layout resolution needed:
@@ -173,12 +174,19 @@ proc abiScalarType(p: var Program; c: Cursor): bool =
   of IT, UT, CT, BoolT, PtrT, AptrT, ProctypeT, EnumT: true
   else: false
 
+const FullSigAggrByRefThreshold = 16
+  ## The SysV/AAPCS64 by-value aggregate threshold (both targets use 16). Aggregates
+  ## larger than this travel by reference. Kept here so `isDeclarativeAbi` (which has
+  ## no `MachineDesc`) can classify a result the same way the code generator does.
+
 proc isDeclarativeAbi*(p: var Program; decl: Cursor): bool =
-  ## Whether `decl`'s call boundary maps onto the simple declarative scheme:
-  ## every parameter is a single-GPR scalar/pointer and the result is void or a
-  ## single-GPR scalar. The first 8 scalar params travel in x0–x7; any beyond
-  ## that are passed on the stack (AAPCS64). Everything else (floats, aggregates,
-  ## by-ref, indirect result, named types) falls back to manual marshalling.
+  ## Whether `decl`'s call boundary uses the FULL typed signature (the declarative
+  ## `(arg pN [k])` / `(res ret.0)` scheme): every parameter is a scalar/pointer OR
+  ## an aggregate (passed by-value in consecutive registers when ≤16B, by a pointer
+  ## otherwise), and the result is void, a scalar, or a >16B by-reference aggregate
+  ## (returned through a hidden result pointer). FLOAT params/results and ≤16B
+  ## by-value aggregate RESULTS are not yet modelled in the typed signature, so those
+  ## procs keep the empty-signature manual-marshalling path.
   var c = decl
   c.into:
     inc c                                     # name → params slot
@@ -186,18 +194,23 @@ proc isDeclarativeAbi*(p: var Program; decl: Cursor): bool =
       var pc = c
       pc.into:
         while pc.hasMore:
-          var ok = false
+          var notFullSig = false
           pc.into:                            # (param :name pragmas type)
             inc pc                            # name
             skip pc                           # pragmas
-            ok = abiScalarType(p, pc)
+            let ps = slotOf(p, pc)
+            # Float params aren't in the typed signature yet; a zero-size aggregate
+            # param (an empty object/tuple) would emit an empty `(regs)` location — both
+            # keep the empty-signature manual-marshalling path (which passes 0 words).
+            notFullSig = ps.kind == AFloat or (ps.kind == AMem and ps.size == 0)
             while pc.hasMore: skip pc          # type (+ anything else)
-          if not ok: return false
+          if notFullSig: return false
     skip c                                    # params
-    # return type: void, or a single-GPR scalar
-    if not (c.kind == DotToken or (c.kind == TagLit and c.typeKind == VoidT)) and
-       not abiScalarType(p, c):
-      return false
+    # return type: void / scalar / >16B by-ref aggregate ok; float or ≤16B aggregate → not yet
+    if not (c.kind == DotToken or (c.kind == TagLit and c.typeKind == VoidT)):
+      let rs = slotOf(p, c)
+      if rs.kind == AFloat: return false
+      if rs.kind == AMem and rs.size <= FullSigAggrByRefThreshold: return false
     while c.hasMore: skip c                   # return type, pragmas, body
   result = true
 

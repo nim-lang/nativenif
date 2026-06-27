@@ -143,6 +143,8 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
           while q.hasMore: skip q
         while t.hasMore: skip t
     of NilC: result = tc.prog[].voidPtr       # nil → a generic pointer type
+    of InfC, NeginfC, NanC:                    # +inf / -inf / NaN float-value nodes
+      result = tc.prog[].floatType
     of TrueC, FalseC,                         # bool literals & bool-valued operators
        EqC, NeqC, LtC, LeC, AndC, OrC, NotC, OvfC:   # `(not operand)` carries NO type child
       result = tc.prog[].boolType
