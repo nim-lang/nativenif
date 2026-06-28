@@ -18,7 +18,7 @@
 ## named type defined in any module classifies correctly (e.g. a cross-module
 ## `enum` parameter is a scalar in a register, not a stack aggregate).
 
-import std / [tables, assertions]
+import std / [tables, assertions, sets]
 import nifcore, nifcdecl, nifcoreparse
 import slots, nifmodules
 import "../../../nimony/src/lib" / [symparser, nifreader, stringviews]
@@ -73,6 +73,17 @@ type
     requestedForeign*: seq[(string, Cursor)] ## foreign types referenced (cross-module
                                              ## dependency record; nifasm links them)
     needsLibSystem*: bool
+    darwin*: bool                           ## Mach-O target (libc via dyld, no raw syscalls)
+    gvarCName*: Table[string, string]       ## importc/exportc gvar/tvar: NIF symbol → bare C
+                                            ## name. The bare name lives in nifasm's shared
+                                            ## root scope, so an `exportc` definition in one
+                                            ## bundled module links to an `importc` reference
+                                            ## in another (C-style global linkage). The
+                                            ## exporting module emits the slot; importc-only
+                                            ## references resolve to it (no local slot).
+    importcOnlyGvars*: HashSet[string]      ## NIF symbols of importc gvars WITHOUT exportc:
+                                            ## their slot is provided elsewhere, so genGlobal
+                                            ## must not emit a (duplicate) definition.
     # ── cross-module machinery ──
     scheme: SplittedModulePath              ## path template (dir/<module>.ext)
     tags: TagPool                           ## shared tag pool for parsing foreign modules
@@ -111,6 +122,15 @@ const LinuxSyscalls* = {
   "close":      (3,   57),
   "mmap":       (9,   222),
   "munmap":     (11,  215),
+  # File metadata / positioning. `stat`/`lstat` have no AArch64 syscall (the
+  # asm-generic ABI uses `fstatat`/`statx` instead), so they get -1 there — like
+  # `open` above, fine for an x86-64 target and flagged loudly if an a64 build
+  # ever reaches them.
+  "lseek":      (8,   62),
+  "fstat":      (5,   80),
+  "stat":       (4,   -1),
+  "lstat":      (6,   -1),
+  "ftruncate":  (77,  46),
   # No libc `futex` symbol exists (callers use the generic `syscall(SYS_futex,…)`
   # wrapper), but `std/private/syslocks` declares a *named* `futex` importc for the
   # libc-free build precisely so this row recognizes it — the futex arguments map
@@ -266,7 +286,10 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                    globals: initTable[string, Cursor](),
                    tvars: initTable[string, Cursor](),
                    loaded: initTable[string, ForeignModule](),
-                   scheme: splitModulePath(inputPath), tags: tags)
+                   gvarCName: initTable[string, string](),
+                   importcOnlyGvars: initHashSet[string](),
+                   scheme: splitModulePath(inputPath), tags: tags,
+                   darwin: darwin)
   block:
     # A standalone `(proctype)` parsed against the shared tag pool; its cursor
     # outlives this buffer (the owner refcount keeps the data alive).
@@ -312,9 +335,34 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         var gc = c
         let isTvar = c.stmtKind == TvarS
         gc.into:
-          let nm = symName(gc)
+          let nm = symName(gc); inc gc
           if isTvar: result.tvars[nm] = gStart   # thread-local (macOS TLV)
           else: result.globals[nm] = gStart      # ordinary .bss global / const
+          # An importc/exportc gvar uses its bare C name so the (single) nifasm
+          # root scope links an `exportc` definition to `importc` references across
+          # bundled modules (C-style global linkage). importc-WITHOUT-exportc means
+          # the slot is defined elsewhere — record it so genGlobal emits no slot.
+          var gImportc, gExportc = ""
+          parsePragmas(gc, gImportc, gExportc)
+          if not isTvar:                           # tvars use FS-segment access, not emGlobalAddr
+            # Canonical C-linkage symbol: `<cName>.0`. A trailing numeric
+            # disambiguator with NO module suffix is (a) a valid NIF Symbol token (a
+            # bare `cName` would tokenize as an Ident nifasm rejects) and (b) treated
+            # as module-less by `extractModule`, so it lives in nifasm's shared root
+            # scope and links the same name across every bundled module.
+            #
+            # Scoped to the runtime's genuine cross-module exportc/importc gvar PAIRS
+            # (`cmdCount`/`cmdLine`: defined+written by the generated `main`, read by
+            # `std/cmdline`). A blanket redirect would break the many importc consts
+            # that have NO in-bundle definition (e.g. `__ATOMIC_RELAXED`): those rely
+            # on falling through to a local zeroed slot, so they must keep their NIF
+            # name. (A full C-linkage namespace in nifasm would generalize this.)
+            const CLinkageGvars = ["cmdCount", "cmdLine"]
+            if gExportc.len > 0 and gExportc in CLinkageGvars:
+              result.gvarCName[nm] = gExportc & ".0"
+            elif gImportc.len > 0 and gImportc in CLinkageGvars:
+              result.gvarCName[nm] = gImportc & ".0"
+              result.importcOnlyGvars.incl nm
           while gc.hasMore: skip gc           # drain so `into` stays balanced
         skip c
       elif c.stmtKind == ProcS:
@@ -458,6 +506,12 @@ proc lookupForeignDecl*(p: var Program; name: string; found: var bool): Cursor =
   p.requestedForeign.add (name, result)
   found = true
 
+proc gvarAsmName*(p: Program; nifName: string): string {.inline.} =
+  ## The asm-NIF symbol for a global reference: an importc/exportc gvar uses its
+  ## bare C name (shared root-scope linkage across bundled modules); any other
+  ## global keeps its fully-qualified NIF name.
+  p.gvarCName.getOrDefault(nifName, nifName)
+
 proc isForeignSym*(p: Program; name: string): bool =
   ## True if `name`'s qualified module is a DIFFERENT module than the one being
   ## compiled (so it must be resolved via its owning module, not the local tables).
@@ -486,9 +540,38 @@ proc foreignCallTarget*(p: var Program; name: string): CallTarget =
     skip d                                    # return type
     parsePragmas(d, importcN, exportcN)
     while d.hasMore: skip d                    # body
-  result = CallTarget(asmName: name, extern: false, retFloat: retFloat,
-                      retType: retType, sigType: procSigType(declCur),
-                      declarative: isDeclarativeAbi(p, declCur))
+  let sigType = procSigType(declCur)
+  # A cross-module call must classify the foreign decl EXACTLY as the owning
+  # module's pass 0 did (see `collect`): an `importc`'d syscall / atomic / mem*
+  # intrinsic / bit builtin is lowered inline (or to a `<name>.sys.<mod>` syproc
+  # the foreign module emits), NOT called by its plain `<name>.0.<mod>` symbol —
+  # which would be an unresolved extern. The asm symbol for a foreign syscall is
+  # the foreign module's `<importc>.sys.<that module>` (its suffix is `s.module`).
+  if importcN.len >= 9 and importcN[0 .. 8] == "__atomic_":
+    result = CallTarget(atomic: importcN, retType: retType, sigType: sigType)
+  elif importcN in ["memcpy", "memmove", "memset", "memcmp"]:
+    result = CallTarget(memIntrin: importcN, retType: retType, sigType: sigType)
+  elif importcN in ["__builtin_ctzll", "__builtin_ctz",
+                    "__builtin_clzll", "__builtin_clz",
+                    "__builtin_popcountll", "__builtin_popcount",
+                    "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64"]:
+    result = CallTarget(bitBuiltin: importcN, retType: retType, sigType: sigType)
+  elif not p.darwin and importcN.len > 0 and lookupSyscall(importcN).found:
+    let (_, x64Nr, a64Nr) = lookupSyscall(importcN)
+    result = CallTarget(asmName: importcN & ".sys." & s.module, extern: false,
+                        syscall: true, sysNr: x64Nr, sysNrA64: a64Nr,
+                        declarative: true, retType: retType, sigType: sigType)
+  elif importcN.len > 0:
+    # A genuine libc extern (the foreign module records it in its own externOrder
+    # + needsLibSystem; here we only need the matching call target). The asm name
+    # is the bare `<importc>.0` the foreign module's extern decl uses.
+    p.needsLibSystem = true
+    result = CallTarget(asmName: importcN & ".0", extern: true, retFloat: retFloat,
+                        retType: retType, sigType: sigType)
+  else:
+    result = CallTarget(asmName: name, extern: false, retFloat: retFloat,
+                        retType: retType, sigType: sigType,
+                        declarative: isDeclarativeAbi(p, declCur))
 
 # ── named-type resolution ───────────────────────────────────────────────────
 

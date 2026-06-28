@@ -70,11 +70,13 @@ proc giveBack(g: var CodeGen; r: Reg) {.inline.} =
   g.unbindTemp(r)
   g.ra.unseal {r}
 
-proc pickStagingSealed(g: var CodeGen; what: string): Reg =
+proc pickStagingSealed(g: var CodeGen; what: string; avoid: Reg = NoReg): Reg =
   ## A transient caller-saved staging register, sealed so a nested pick cannot
   ## reuse it until `giveBack` releases it; fails loudly when none is free (the
-  ## reserved R11 bridge makes that near-impossible).
-  result = g.pickStagingScratch()
+  ## reserved R11 bridge makes that near-impossible). `avoid` keeps the pick off a
+  ## register the caller still needs live (e.g. an accumulator that is not a bound
+  ## temp, so `pickStagingScratch`'s own filters would not otherwise exclude it).
+  result = g.pickStagingScratch(avoid)
   if result == NoReg: raiseAssert "arkham x64n: no staging register for " & what
   g.ra.seal result
 
@@ -560,8 +562,9 @@ proc emitStoreLoc(g: var CodeGen; loc: Location; src: Reg) =
 proc emGlobalAddr(g: var CodeGen; dest: Reg; name: string) =
   ## `dest ← &global` — RIP-relative `lea` (nifasm resolves the gvar to a
   ## `.bss`/`.data` address). x86-64 has no typed RIP-relative memory operand, so
-  ## a global is always accessed by first materializing its address.
-  g.ab.tree LeaX64: (g.emReg dest; g.ab.sym name)
+  ## a global is always accessed by first materializing its address. An importc/
+  ## exportc gvar is referenced by its bare C name (cross-module linkage).
+  g.ab.tree LeaX64: (g.emReg dest; g.ab.sym g.prog.gvarAsmName(name))
 
 proc binMem(g: var CodeGen; op: X64Inst; dest: Reg; loc: Location) =
   ## `dest op= [rsp+slot]` — x86 folds a `NamedStack` memory source into the ALU op.
@@ -1537,15 +1540,27 @@ proc emitStackParamLoadsX64(g: var CodeGen; decl: Cursor) =
   inc c; inc c                                # → params slot
   if c.kind != TagLit: return
   let base = g.framePushBytesX64()
-  var idx = 0
+  # `idx` must count *argument registers* exactly as the signature / allocator do:
+  # the hidden result pointer (a >16B by-ref return) takes rdi, and a ≤16B by-value
+  # aggregate param spans ceil(size/8) GPRs. Counting one-GPR-per-param here would
+  # misclassify which params are stack-passed when either is present.
+  var idx = if g.retIndirect: 1 else: 0
   var stackOrd = 0
   c.into:
     while c.hasMore:
       var nm = ""
+      var tn = ""                             # non-empty → an aggregate param type name
       c.into:                                 # (param :name pragmas type)
         nm = symName(c); inc c
-        skip c
+        skip c                                # pragmas
+        if c.kind == Symbol and slotOf(g.prog, c).kind == AMem: tn = symName(c)
         while c.hasMore: skip c
+      # GPRs this param consumes: a ≤16B by-value aggregate spans several; a >16B
+      # by-ref aggregate and every scalar consume one.
+      let words =
+        if tn.len > 0 and aggrByteSize(g.prog, tn) <= g.md.aggrByRefThreshold:
+          aggrWordCount(g.prog, tn)
+        else: 1
       if idx >= g.md.intArgRegs.len:
         let loc = g.ra.locationOfSym(nm)
         assert loc.kind == InReg,
@@ -1556,7 +1571,7 @@ proc emitStackParamLoadsX64(g: var CodeGen; decl: Cursor) =
             g.ab.reg RSP
             g.ab.intLit (base + stackOrd * 8)
         inc stackOrd
-      inc idx
+      idx += words
 
 # ── thread-local storage ─────────────────────────────────────────────────────
 # nifasm accesses an x86-64 thread-local as `FS:[off]` (it resolves a tvar symbol
@@ -1633,7 +1648,11 @@ proc binFold(g: var CodeGen; op: X64Inst; dest: Reg; loc: Location; opCur: Curso
   ## through a staging reg first — the sized `mov` sign/zero-extends it to the full
   ## 64-bit register — then `op dest, reg`.
   if g.exprSlot(opCur).size < 8:
-    let s = g.pickStagingSealed("a sub-width operand")
+    # `dest` already holds the other operand (the accumulator); the staging reg that
+    # receives the sized load must NOT be `dest`, or the load clobbers it and the
+    # `op dest, s` degenerates to `op dest, dest` — dropping this operand (the set
+    # membership `setbyte and (1 shl bit)` miscompiled to `setbyte and setbyte`).
+    let s = g.pickStagingSealed("a sub-width operand", avoid = dest)
     if loc.kind == NamedStack:
       g.emitLoadLoc(loc, s)                       # sized load → sign/zero-extended
     else:                                         # Mem: load via the lvalue (premat base)
@@ -1672,6 +1691,10 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
     g.emitValue2(rhsC)                                   # rhs → rD (it binds rD if a temp)
     let lhsLoc = g.ra.locs[cursorToPosition(g.buf[], lhsC)]
     let foldOp = if op == SubX64: AddX64 else: op        # sub folds as add (after neg)
+    # `rD` holds the rhs while the lhs folds — protect it from a fold staging pick
+    # (see the non-swapped path below for why an unprotected dest corrupts the op).
+    let rdSeal = not g.ra.isSealed(rD) and rD notin g.boundTemps
+    if rdSeal: g.ra.seal {rD}
     if op == SubX64:
       g.ab.tree NegX64: g.emReg rD                       # rD := -rhs
     case lhsLoc.kind                                     # rD := rD <foldOp> lhs
@@ -1685,6 +1708,7 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
     of InReg: g.binReg(foldOp, rD, lhsLoc.r)
     of NamedStack, Mem: g.binFold(foldOp, rD, lhsLoc, lhsC)  # sub-width field → load+extend
     else: raiseAssert "arkham x64n: bin(swapped) lhs " & $lhsLoc.kind
+    if rdSeal: g.ra.unseal {rD}
     return
   g.emitValue2(lhsC)                                     # materialize sub-results first
   g.emitValue2(rhsC)
@@ -1702,6 +1726,14 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
     rD = res.r
   let reusedLhs = lhsLoc.kind == InReg and lhsLoc.r == rD   # in-place RMW on the left temp
   if res.isTemp and not reusedLhs: g.bindTemp(rD, res.typ)
+  # `rD` now holds (or is about to hold) the placed operand. It MUST be off-limits to
+  # any staging pick made while the OTHER operand is folded — a `binFold`/`binImm64`
+  # staging reg landing on `rD` would clobber the operand and silently degrade
+  # `op dest, src` to `op dest, dest` (the set-membership `setbyte and mask` →
+  # `setbyte and setbyte` miscompile). A bound temp / a `resStaging` slot is already
+  # protected (boundTemps / sealed); a bare non-temp result register is not, so seal it.
+  let rdSeal = not g.ra.isSealed(rD) and rD notin g.boundTemps
+  if rdSeal: g.ra.seal {rD}
   let aliasRhs = aux.aliasRhs
   if aliasRhs:
     # `dest` already holds the rhs value (it aliases the rhs register). A commutative
@@ -1725,6 +1757,7 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
     of InReg: g.binReg(op, rD, rhsLoc.r)
     of NamedStack, Mem: g.binFold(op, rD, rhsLoc, rhsC)  # sub-width field → load+extend
     else: raiseAssert "arkham x64n: bin rhs " & $rhsLoc.kind
+  if rdSeal: g.ra.unseal {rD}
   if rhsLoc.kind == InReg and rhsLoc.isTemp: g.unbindTemp(rhsLoc.r)
   if lhsLoc.kind == InReg and lhsLoc.isTemp and not reusedLhs: g.unbindTemp(lhsLoc.r)
   if resStaging != NoReg:                                # store the result to its stack home
@@ -3317,6 +3350,23 @@ proc genFieldStore2(g: var CodeGen; dst: Location; valC: Cursor) =
         g.emFieldOperand(dst)
         g.emFReg v.f
       if v.isTemp: g.unbindFTmp(v.f)
+    elif v.kind == NamedStack:
+      # A foldable stack-homed scalar/pointer rhs — e.g. a demoted local/param read
+      # straight from its `(s)` slot. x86 has no mem→mem `mov`, so bridge the value
+      # through a staging register before storing it into the field operand.
+      var fty = resolveType(g.prog, g.fieldTypeByName(dst.aggrType, dst.field))
+      let s = g.pickStagingSealed("a constr field stack rhs")
+      g.bindTemp(s, v.typ)
+      g.emitLoadLoc(v, s)
+      g.ab.tree MovX64:
+        g.emFieldOperand(dst)
+        if isPtrType(fty):
+          g.ab.tree CastX:
+            g.genTypeBody(fty)
+            g.emReg s
+        else:
+          g.emReg s
+      g.giveBack s
     else:
       var fty = resolveType(g.prog, g.fieldTypeByName(dst.aggrType, dst.field))
       g.ab.tree MovX64:
@@ -4359,9 +4409,15 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
       stderr.writeLine "DBG emit proc " & symName(pc)
   g.emitProcBody2(info)
 
-proc genGlobal(g: var CodeGen; name: string; decl: Cursor) =
+proc genGlobal(g: var CodeGen; nifName: string; decl: Cursor) =
   ## `(gvar :name <type>)` — a zero-initialized `.bss` global (also `const`); any
   ## initializer is run at program entry by `emitGlobalInits`.
+  # An importc-WITHOUT-exportc gvar names an external (its slot is an `exportc`
+  # definition in another bundled module): emit NO slot — references resolve to
+  # the bare C name via `emGlobalAddr`. An exportc gvar IS the definition, emitted
+  # under its bare C name so importc references in other modules link to it.
+  if nifName in g.prog.importcOnlyGvars: return
+  let name = g.prog.gvarAsmName(nifName)
   var c = decl
   let isConst = c.stmtKind == ConstS
   c.into:                                       # (gvar SymbolDef VarPragmas Type Value?)
