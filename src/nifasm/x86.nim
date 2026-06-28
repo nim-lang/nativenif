@@ -550,6 +550,37 @@ proc emitCmp*(dest: var Bytes; mem: MemoryOperand; reg: Register) =
   dest.add(0x39) # CMP r/m64, r64
   dest.emitMem(int(reg), mem)
 
+proc emitCmpSized*(dest: var Bytes; mem: MemoryOperand; reg: Register; bits: int) =
+  ## CMP mem, reg sized to the MEMORY operand's width (`bits` ∈ {8,16,32,64}).
+  ## A 64-bit `cmp` against a byte/word/dword memory operand over-reads the adjacent
+  ## bytes — e.g. comparing one `char` of a `ptr UncheckedArray[char]` would read 8
+  ## bytes and always mismatch. Mirrors `emitMovToMemSized` (the store counterpart).
+  if bits >= 64: emitCmp(dest, mem, reg); return
+  emitSegPrefix(dest, mem)
+  if bits == 16: dest.add(0x66)                 # operand-size override → 16-bit
+  var rex = RexPrefix(w: false)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  let forceRex = bits == 8 and int(reg) in 4..7  # SPL/BPL/SIL/DIL need REX (else AH/CH/DH/BH)
+  if rex.r or rex.b or rex.x or forceRex: dest.add(encodeRex(rex))
+  dest.add(if bits == 8: 0x38 else: 0x39)       # CMP r/m8,r8 / CMP r/m(16|32),r
+  dest.emitMem(int(reg), mem)
+
+proc emitCmpSized*(dest: var Bytes; reg: Register; mem: MemoryOperand; bits: int) =
+  ## CMP reg, mem sized to the MEMORY operand's width (RM form; see the MR overload).
+  if bits >= 64: emitCmp(dest, reg, mem); return
+  emitSegPrefix(dest, mem)
+  if bits == 16: dest.add(0x66)
+  var rex = RexPrefix(w: false)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  let forceRex = bits == 8 and int(reg) in 4..7
+  if rex.r or rex.b or rex.x or forceRex: dest.add(encodeRex(rex))
+  dest.add(if bits == 8: 0x3A else: 0x3B)       # CMP r8,r/m8 / CMP r,r/m(16|32)
+  dest.emitMem(int(reg), mem)
+
 proc emitTest*(dest: var Bytes; a, b: Register) =
   ## Emit TEST instruction: TEST a, b (compute a AND b, set flags)
   ## Opcode 0x85: TEST r/m64, r64 - reg field is source, r/m field is destination

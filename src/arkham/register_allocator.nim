@@ -1693,7 +1693,11 @@ proc walk(b: var Builder; n: var Cursor) =
 
 proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
   if params.kind != TagLit: return
-  var intIdx = 0
+  # On x86-64 a >16B by-ref aggregate return takes the first integer arg register
+  # (rdi) as the hidden result pointer, so real params start at rsi — skip GPR 0
+  # to stay in lockstep with the signature / emitParamMoves / emitStackParamLoads.
+  # AArch64 passes the hidden pointer in x8 (off the arg-register file), so no skip.
+  var intIdx = if b.retIndirect and b.md.arch == X86: 1 else: 0
   var fidx = 0
   # Scalar cross-call register params (1..6) that took a callee-saved home, in
   # allocation order. A stack-passed param (7th+) MUST have a register home — it
@@ -1816,6 +1820,18 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
             loc = namedStackLoc(name, effSlot)
             b.ra.hasStackVars = true
           b.record(pos, name, loc)
+  # Make the scalar register-homed params visible to `coldestVictim`: a proc whose
+  # params all take callee-saved homes (every reg param crosses a call) would
+  # otherwise leave `reserveHeldScratch`/`trySteal` with no register-resident LOCAL
+  # to evict — the callee-saved pool is full but nothing in `scopeVars` holds it.
+  # These params demote cleanly (`demoteToStack` → NamedStack scalar slot, which
+  # `emitParamMoves` fills from the incoming arg register). by-ref aggregate params
+  # are EXCLUDED (not in `spillableRegParams`): demoting their pointer to a
+  # NamedStack slot would make `emitParamMoves` take its aggregate-by-value branch.
+  # A param already popped+demoted for a >8th stack param is now NamedStack, so
+  # `coldestVictim` skips it (it tests `vloc.kind == InReg`) — harmless to list.
+  for p in spillableRegParams:
+    b.scopeVars[^1].add p.name
 
 proc seedPools(b: var Builder) =
   ## Fill the four register pools to their full target capacity. As locals are
@@ -1866,17 +1882,26 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
   assert n.stmtKind == ProcS
   b.openScope()
   n.into:
-    inc n                                    # name
-    allocParams(b, n, an.hasCall)
-    if n.kind == TagLit:                      # a float return goes to xmm0 (value-core)
-      let rtSlot = slotOf(prog, n)
-      if rtSlot.isFloat: b.retFloatBits = rtSlot.size * 8
-    elif n.kind == Symbol:                    # named-type return; aggregate → regs / hidden ptr
-      let rtSlot = slotOf(prog, n)
-      if rtSlot.kind == AMem:
-        b.retAggr = true
-        b.retAggrSlot = rtSlot
-        if rtSlot.size > md.aggrByRefThreshold: b.retIndirect = true
+    inc n                                    # name → params slot
+    # Classify the RESULT before allocating params: a >16B by-ref aggregate return
+    # is passed via a hidden result pointer that (on x86-64) occupies the first
+    # integer argument register and shifts every real param down one. `allocParams`
+    # must count argument registers from the same base as the signature
+    # (`emitParamsAndResult`) and `emitParamMoves`, so `b.retIndirect` has to be
+    # known first (peeked from a copy — `allocParams` advances `n` past params).
+    block:
+      var rt = n
+      skip rt                                # params → return type
+      if rt.kind == TagLit:                  # a float return goes to xmm0 (value-core)
+        let rtSlot = slotOf(prog, rt)
+        if rtSlot.isFloat: b.retFloatBits = rtSlot.size * 8
+      elif rt.kind == Symbol:                # named-type return; aggregate → regs / hidden ptr
+        let rtSlot = slotOf(prog, rt)
+        if rtSlot.kind == AMem:
+          b.retAggr = true
+          b.retAggrSlot = rtSlot
+          if rtSlot.size > md.aggrByRefThreshold: b.retIndirect = true
+    allocParams(b, n, an.hasCall)            # advances n past params → return type
     skip n                                    # return type
     skip n                                    # pragmas
     walk(b, n)                                # body

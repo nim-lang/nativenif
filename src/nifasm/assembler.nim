@@ -4325,6 +4325,20 @@ proc leaRegBase(n: var Cursor; ctx: var GenContext; baseReg: var x86.Register): 
       baseReg = tagToRegister(s.reg, n); inc n; return true
   return false
 
+proc checkDistinctAluRegs(dest, op: Operand; mnemonic: string; n: Cursor) =
+  ## A register `and`/`or`/`sub` whose two operands are the SAME register is never
+  ## intentional in arkham's codegen: `x and x == x`, `x or x == x`, `x - x == 0`,
+  ## so the real source operand has been dropped — the signature of a staging /
+  ## scratch register colliding with the destination (e.g. the set-membership
+  ## `setbyte and mask` degrading to `setbyte and setbyte`). nifasm is the strict
+  ## checker that must catch such a value-dropping miscompile at assemble time
+  ## instead of leaving it to surface at runtime. (`xor`/`test`/`cmp` with equal
+  ## registers ARE idioms — zero a register / test for zero — so they are excluded.)
+  if dest.kind == okReg and op.kind == okReg and dest.reg == op.reg:
+    error("`" & mnemonic & "` with identical register operands (" & $dest.reg &
+          ") — dropped source operand (staging/scratch register collided with the " &
+          "destination); the value-carrying register must be a distinct typed binding", n)
+
 proc genInstX64(n: var Cursor; ctx: var GenContext) =
   if n.kind != TagLit: error("Expected instruction", n)
   let instTag = tagToX64Inst(n.tag)
@@ -4488,6 +4502,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       elif op.kind == okMem:
         x86.emitSub(ctx.buf.data, dest.reg, op.mem)
       else:
+        checkDistinctAluRegs(dest, op, "sub", start)
         x86.emitSub(ctx.buf.data, dest.reg, op.reg)
 
   of MulX64:
@@ -4579,6 +4594,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       elif op.kind == okMem:
         x86.emitAndMem(ctx.buf.data, dest.reg, op.mem)   # and reg, [mem]
       else:
+        checkDistinctAluRegs(dest, op, "and", start)
         x86.emitAnd(ctx.buf.data, dest.reg, op.reg)
 
   of OrX64:
@@ -4601,6 +4617,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       elif op.kind == okMem:
         x86.emitOrMem(ctx.buf.data, dest.reg, op.mem)    # or reg, [mem]
       else:
+        checkDistinctAluRegs(dest, op, "or", start)
         x86.emitOr(ctx.buf.data, dest.reg, op.reg)
 
   of XorX64:
@@ -4753,18 +4770,15 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       elif op.kind == okMem:
         error("Cannot compare memory with memory", n)
       else:
-        x86.emitCmp(ctx.buf.data, op.reg, dest.mem) # cmp reg, mem? No, cmp mem, reg.
-        # x86.nim: emitCmp(mem, reg) -> CMP r/m64, r64 (39 /r).
-        # Wait, 39 is CMP r/m64, r64 (store in r/m? no, compare r/m with r).
-        # Opcode 39: CMP r/m64, r64. MR encoding.
-        # Operand order: CMP op1, op2.
-        # If op1 is mem, op2 is reg.
-        x86.emitCmp(ctx.buf.data, dest.mem, op.reg)
+        # CMP mem, reg — sized by the memory operand's type so a byte/word/dword
+        # compare does not over-read adjacent bytes (the `cmp r/m64,r64` default read
+        # 8 bytes of a `char` element and always mismatched).
+        x86.emitCmpSized(ctx.buf.data, dest.mem, op.reg, intMemAccess(dest.typ).bits)
     else:
       if op.kind == okImm:
         x86.emitCmpImm(ctx.buf.data, dest.reg, int32(op.immVal))
       elif op.kind == okMem:
-        x86.emitCmp(ctx.buf.data, dest.reg, op.mem)
+        x86.emitCmpSized(ctx.buf.data, dest.reg, op.mem, intMemAccess(op.typ).bits)
       else:
         x86.emitCmp(ctx.buf.data, dest.reg, op.reg)
 
@@ -6223,6 +6237,14 @@ proc setupTls(ctx: var GenContext) =
   x86.emitMovImmToReg(ctx.buf.data, x86.RDI, ArchSetFs)
   x86.emitMovImmToReg(ctx.buf.data, x86.RAX, ArchPrctlNr)
   x86.emitSyscall(ctx.buf.data)                             # arch_prctl(ARCH_SET_FS, &block)
+  # Hand the kernel-provided argc/argv to `main(argc, argv)` the way a C crt0 would.
+  # At process entry the SysV ABI puts argc at [rsp] and argv[0] at [rsp+8] (NOT in
+  # rdi/rsi — the kernel zeroes the registers), and the prologue above leaves rsp
+  # untouched. main's full signature takes argc in rdi (param 0) and argv in rsi
+  # (param 1); without this they were garbage, so `cmdCount`/`cmdLine` stayed 0 and
+  # `paramCount()` returned -1 (every `paramStr` was empty).
+  x86.emitMov(ctx.buf.data, x86.RDI, x86.MemoryOperand(base: x86.RSP))            # rdi = argc
+  x86.emitLea(ctx.buf.data, x86.RSI, x86.MemoryOperand(base: x86.RSP, displacement: 8'i32))  # rsi = &argv[0]
   x86.emitJmp(ctx.buf, LabelId(ctx.entrySym.offset))        # → real entry
 
 proc assemble*(filename, outfile: string; symMap = false; emitObj = false) =
