@@ -84,13 +84,6 @@ proc pickStagingSealed(g: var CodeGen; what: string; slot: AsmSlot; avoid: Reg =
   ## reserved R11 bridge makes that near-impossible). `avoid` keeps the pick off a
   ## register the caller still needs live (e.g. an accumulator that is not a bound
   ## temp, so `pickStagingScratch`'s own filters would not otherwise exclude it).
-  ##
-  ## The register is `bindTemp`'d to `slot` — its REAL type (the scalar/pointer it
-  ## will carry) — so every `emReg` of it emits a CHECKED, well-typed symbol that
-  ## nifasm tracks in `regBindings`, never a raw `(reg)`. This is what lets nifasm
-  ## catch a staging-register collision (a dropped operand) at assemble time. The
-  ## binding is released by `giveBack` (which `unbindTemp`s). `slot` is mandatory:
-  ## the codegen must always say what the bridge holds — there is no untyped escape.
   result = g.pickStagingScratch(avoid)
   if result == NoReg: raiseAssert "arkham x64n: no staging register for " & what
   g.ra.seal result
