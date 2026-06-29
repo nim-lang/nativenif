@@ -613,6 +613,10 @@ proc genProctypeSig(g: var CodeGen; c: var Cursor) =
           # The RetType is always the node after Params (a `.`/`(void)` for void).
           if retIsVoid(c) or retByRef:
             skip c                              # void, or returned via the x8 indirect pointer
+          elif slotOf(g.prog, c).kind == AMem:
+            # ≤16B by-value aggregate result → x0:x1 raw, EMPTY result slot (see
+            # emitSignature): the caller reads the return registers directly.
+            skip c
           else:
             g.ab.symDef "ret.0"
             g.ab.reg IntRet                     # raw reg *location* of the result
@@ -1121,10 +1125,15 @@ proc emitSignature(g: var CodeGen; decl: Cursor; declarative: bool) =
           if rs.kind == AFloat:
             raiseAssert "arkham a64: float result in signature not yet supported"
           if rs.kind == AMem:
-            raiseAssert "arkham a64: by-value aggregate result in signature not yet supported"
-          g.ab.symDef "ret.0"
-          g.ab.reg IntRet                     # raw reg *location* of the result
-          g.genTypeBody(c)                    # the result type (consumes it)
+            # A ≤16B by-value aggregate result travels in x0:x1 with an EMPTY result slot
+            # (like a >16B by-ref result via x8): the callee marshals it into x0:x1 (the
+            # body's `structToRegs`) and the caller reads those raw after the call — no
+            # `(res ret.0)` binding to declare here (mirrors the x64 rax:rdx result).
+            skip c
+          else:
+            g.ab.symDef "ret.0"
+            g.ab.reg IntRet                   # raw reg *location* of the result
+            g.genTypeBody(c)                  # the result type (consumes it)
       while c.hasMore: skip c                 # pragmas, body
   else:
     g.ab.keyword ParamsD
@@ -2778,14 +2787,18 @@ proc copyAggr(g: var CodeGen; dst, src: Reg; size: int; tmp: Reg) =
     g.ab.tree MovA64: (g.emReg tmp; g.emByteAtImm(src, off))
     g.ab.tree MovA64: (g.emByteAtImm(dst, off); g.emReg tmp)
 
-proc copyStructThroughPtr2(g: var CodeGen; srcVar, typeName: string; ptrReg, tmp: Reg) =
-  ## Copy `srcVar` → the memory `ptrReg` points at, through scratch `tmp`. Leas the
-  ## source's address into one staging bridge and funnels through the one `copyAggr`.
+proc copyStructThroughPtr2(g: var CodeGen; srcVar, typeName: string; ptrReg: Reg) =
+  ## Copy `srcVar` → the memory `ptrReg` points at (the >16B aggregate hidden-result-
+  ## pointer return). This runs at the `ret` and crosses NO call, so both scratch
+  ## registers it needs — the source address and the word-transfer temp — come from the
+  ## two staging bridges, never an allocator-reserved callee-saved survivor (mirrors the
+  ## x64 `pickStagingSealed` pair). Leas the source's address into one bridge and funnels
+  ## through the one `copyAggr` with the other bridge as the word temp.
   let sp = g.takeBridge()
   g.ab.tree LeaA64: (g.emReg sp; g.ab.sym srcVar)        # sp = &srcVar
-  g.bindTemp(tmp, ScalarSlot)
+  let tmp = g.takeBridge(avoid = sp)
   g.copyAggr(ptrReg, sp, aggrByteSize(g.prog, typeName), tmp)
-  g.unbindTemp(tmp)
+  g.dropBridge tmp
   g.dropBridge sp
 
 proc regsToStructThroughPtr(g: var CodeGen; ptrReg: Reg; typeName: string; firstArg: int) =
@@ -3407,8 +3420,7 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
             g.varType[srcName] = g.retAggrName
             g.genStore2(cc, namedStackLoc(srcName, slotOf(g.prog, tcur)), pos)
           if g.retIndirect:
-            let tmp = g.ra.aux[g.posOf(cc)].scratch[0]
-            g.copyStructThroughPtr2(srcName, g.retAggrName, g.indirectReg, tmp)
+            g.copyStructThroughPtr2(srcName, g.retAggrName, g.indirectReg)
             g.movReg(IntRet, g.indirectReg)
           else:
             g.structToRegs(srcName, g.retAggrName, 0)
