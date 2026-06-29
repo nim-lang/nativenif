@@ -226,11 +226,11 @@ proc isDeclarativeAbi*(p: var Program; decl: Cursor): bool =
             while pc.hasMore: skip pc          # type (+ anything else)
           if notFullSig: return false
     skip c                                    # params
-    # return type: void / scalar / >16B by-ref aggregate ok; float or ≤16B aggregate → not yet
+    # return type: void / scalar / aggregate (≤16B by-value in rax:rdx, >16B by-ref via
+    # the hidden pointer) ok — all declarative. Only a FLOAT result is not yet modelled.
     if not (c.kind == DotToken or (c.kind == TagLit and c.typeKind == VoidT)):
       let rs = slotOf(p, c)
       if rs.kind == AFloat: return false
-      if rs.kind == AMem and rs.size <= FullSigAggrByRefThreshold: return false
     while c.hasMore: skip c                   # return type, pragmas, body
   result = true
 

@@ -46,6 +46,9 @@ type
     frameRegs*: seq[Reg]                     ## callee-saved GPRs to save (even count)
     frameFRegs*: seq[FReg]                   ## callee-saved SIMD regs to save (even count)
     framePad*: int                           ## x64: extra prologue `sub rsp` for 16-byte call alignment
+    stackArgBaseReg*: Reg                     ## x64: callee-saved reg holding the incoming stack-args
+                                              ## base (rsp after pushes), captured before the frame
+                                              ## `sub`s so stack params survive rsp moving; else NoReg
     labelCount*: int                         ## fresh-label counter
     loopEnds*: seq[string]                   ## stack of enclosing-loop end labels (for `break`)
     retLabel2*: string                       ## value-core: shared epilogue label a mid-proc `ret` jumps to

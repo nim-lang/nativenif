@@ -1658,7 +1658,9 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
         error("Unknown argument: " & argName, n)
       if paramPtr.typ.isOnStack:
         # Stack argument used as an offset (e.g. inside (mem (sp) (arg name))).
-        # The offset is the running byte position among the stack-passed params.
+        # The base offset is the running byte position among the stack-passed
+        # params; the optional word index `k` selects the k-th eightbyte (8 bytes)
+        # of a multi-word stack aggregate so it can be marshalled/read word-by-word.
         var offset = 0
         for p in ctx.callContext.typ.params:
           if p.typ.isOnStack:
@@ -1667,7 +1669,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
             offset += slots.alignedSize(p.typ)
         result.kind = okImm
         result.argName = argName
-        result.immVal = int64(offset)
+        result.immVal = int64(offset + wordIdx * 8)
         result.typ = paramPtr.typ
       else:
         if wordIdx >= paramPtr.regs.len:
@@ -3492,8 +3494,11 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
         error("Unknown argument: " & argName, argTok)
 
       if paramPtr.typ.isOnStack:
-        # Stack argument - return the offset as an immediate
-        # The offset is computed from the stack parameter declarations
+        # Stack argument - return its byte offset as an immediate. The base offset is
+        # the running byte position among the stack-passed params; the optional word
+        # index `k` selects the k-th eightbyte of a multi-word stack aggregate (each
+        # word is 8 bytes), so a by-value struct that spilled to the stack can be
+        # marshalled/read one word at a time the same way a register-passed one is.
         var offset = 0
         for p in ctx.callContext.typ.params:
           if p.typ.isOnStack:
@@ -3502,7 +3507,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
             offset += slots.alignedSize(p.typ)
         result.kind = okImm
         result.argName = argName
-        result.immVal = int64(offset)
+        result.immVal = int64(offset + wordIdx * 8)
         result.typ = paramPtr.typ
       else:
         # Register argument - return the (word-`wordIdx`) register
