@@ -54,11 +54,19 @@ proc emReg(g: var CodeGen; r: Reg) {.inline.} =
     # arg; rsp/rbp are the frame/segment bases; rbx/r12–r15 are callee-saved param
     # homes. (The fixed rcx/rdx/rsi/r8 scratch *inside* the self-contained atomics /
     # mem* / byte-copy loops is nonetheless bound there, for extra checker coverage.)
-    assert r notin g.md.intTempRegs,
-      "arkham x64: unbound scratch-pool register reached emReg: " & x64RegName(r)
+    assert r notin g.md.intTempRegs and r != R11,
+      "arkham x64: unbound scratch/bridge register reached emReg: " & x64RegName(r) &
+      " — every value/address-carrying R10/R11 use must be a typed binding (pickStagingSealed/bindTemp)"
     g.ab.reg r
 
 proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg
+
+let AddrSlot = AsmSlot(cls: AUInt, size: 8, align: 8)
+  ## The binding type for a staging register that holds a raw machine address / word
+  ## (a pointer the consumer always `(cast (aptr T) …)`s before dereferencing, or a
+  ## whole eightbyte copied verbatim). A well-typed `(u 64)` — NOT an untyped escape:
+  ## nifasm still tracks the register and rejects a raw reuse; the cast supplies the
+  ## element type at the point of the actual load/store.
 
 proc giveBack(g: var CodeGen; r: Reg) {.inline.} =
   ## Release a transient register obtained during premat / value evaluation. Its
@@ -70,7 +78,7 @@ proc giveBack(g: var CodeGen; r: Reg) {.inline.} =
   g.unbindTemp(r)
   g.ra.unseal {r}
 
-proc pickStagingSealed(g: var CodeGen; what: string; avoid: Reg = NoReg): Reg =
+proc pickStagingSealed(g: var CodeGen; what: string; slot: AsmSlot; avoid: Reg = NoReg): Reg =
   ## A transient caller-saved staging register, sealed so a nested pick cannot
   ## reuse it until `giveBack` releases it; fails loudly when none is free (the
   ## reserved R11 bridge makes that near-impossible). `avoid` keeps the pick off a
@@ -79,6 +87,7 @@ proc pickStagingSealed(g: var CodeGen; what: string; avoid: Reg = NoReg): Reg =
   result = g.pickStagingScratch(avoid)
   if result == NoReg: raiseAssert "arkham x64n: no staging register for " & what
   g.ra.seal result
+  g.bindTemp(result, slot)
 
 # ── SSE / floating-point scratch pool + emit helpers ─────────────────────────
 # x86-64 floats live in xmm0..xmm15 (the FReg slots F0..F15). The register operand
@@ -511,8 +520,7 @@ proc scalarMemMov(g: var CodeGen; loc: Location; reg: Reg; load: bool) =
       var pSlot = ScalarSlot
       if not cursorIsNil(loc.typ.typ):
         pSlot = typeToSlot(g.prog.ptrTypeOf(loc.typ.typ))
-      let p = g.pickStagingSealed("a global load address")
-      g.bindTemp(p, pSlot)
+      let p = g.pickStagingSealed("a global load address", pSlot)
       g.emGlobalAddr(p, loc.name)
       g.ab.tree MovX64:
         g.emReg reg
@@ -525,8 +533,7 @@ proc scalarMemMov(g: var CodeGen; loc: Location; reg: Reg; load: bool) =
       var pSlot = ScalarSlot
       if not cursorIsNil(loc.typ.typ):
         pSlot = typeToSlot(g.prog.ptrTypeOf(loc.typ.typ))
-      let p = g.pickStagingSealed("a global store address")
-      g.bindTemp(p, pSlot)
+      let p = g.pickStagingSealed("a global store address", pSlot)
       g.emGlobalAddr(p, loc.name)
       g.ab.tree MovX64:
         g.ab.tree MemX: g.emReg p
@@ -595,8 +602,7 @@ proc floatMemMov(g: var CodeGen; loc: Location; reg: FReg; bits: int; load: bool
     var pSlot = ScalarSlot
     if not cursorIsNil(loc.typ.typ):
       pSlot = typeToSlot(g.prog.ptrTypeOf(loc.typ.typ))
-    let p = g.pickStagingSealed("a global float address")
-    g.bindTemp(p, pSlot)
+    let p = g.pickStagingSealed("a global float address", pSlot)
     g.emGlobalAddr(p, loc.name)
     let op = if bits == 32: MovssX64 else: MovsdX64
     g.ab.tree op:
@@ -1005,6 +1011,7 @@ proc transferAggrWords(g: var CodeGen; varName, typeName: string;
       baseReg = loc.r                                  # a by-ref aggregate's pointer
     else:
       addrTmp = g.pickStaging()                        # R11 bridge ← &slot
+      g.bindTemp(addrTmp, AddrSlot)                     # typed+tracked (giveBack unbinds)
       g.emStackAddr(addrTmp, varName)
       baseReg = addrTmp
   for i in 0 ..< aggrWordCount(g.prog, typeName):
@@ -1035,7 +1042,7 @@ proc globalToRegs(g: var CodeGen; name, typeName: string; regs: openArray[Reg]) 
   ## `(u 64)` word (handles packed fields), a trailing PARTIAL eightbyte field-typed.
   ## The read-side twin of `regsToStructThroughPtr`, for a global passed by value as a
   ## call argument (`equalStrings(s, "")` where `s` is a global `string`).
-  let p = g.pickStagingSealed("a global aggregate call-arg address")
+  let p = g.pickStagingSealed("a global aggregate call-arg address", AddrSlot)
   g.emGlobalAddr(p, name)
   let byteSize = aggrByteSize(g.prog, typeName)
   for i in 0 ..< aggrWordCount(g.prog, typeName):
@@ -1652,7 +1659,12 @@ proc binFold(g: var CodeGen; op: X64Inst; dest: Reg; loc: Location; opCur: Curso
     # receives the sized load must NOT be `dest`, or the load clobbers it and the
     # `op dest, s` degenerates to `op dest, dest` — dropping this operand (the set
     # membership `setbyte and (1 shl bit)` miscompiled to `setbyte and setbyte`).
-    let s = g.pickStagingSealed("a sub-width operand", avoid = dest)
+    # The sub-width operand is sign/zero-extended into a full 64-bit register by the
+    # sized load below, so bind the staging reg to the WIDE type of the operand's
+    # class (a char/uint → `(u 64)`, a signed int → `(i 64)`).
+    let s = g.pickStagingSealed("a sub-width operand",
+                                AsmSlot(cls: g.exprSlot(opCur).cls, size: 8, align: 8),
+                                avoid = dest)
     if loc.kind == NamedStack:
       g.emitLoadLoc(loc, s)                       # sized load → sign/zero-extended
     else:                                         # Mem: load via the lvalue (premat base)
@@ -1689,6 +1701,9 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
     assert res.kind == InReg, "arkham x64n: bin(swapped) result " & $res.kind
     let rD = res.r
     g.emitValue2(rhsC)                                   # rhs → rD (it binds rD if a temp)
+    # `rD` holds rhs and feeds the fold — ensure it is a tracked binding (the rhs
+    # producer may not have bound it, e.g. a `produceIntoMem2` bridge result).
+    if res.isTemp and rD notin g.boundTemps: g.bindTemp(rD, res.typ)
     let lhsLoc = g.ra.locs[cursorToPosition(g.buf[], lhsC)]
     let foldOp = if op == SubX64: AddX64 else: op        # sub folds as add (after neg)
     # `rD` holds the rhs while the lhs folds — protect it from a fold staging pick
@@ -1700,7 +1715,7 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
     case lhsLoc.kind                                     # rD := rD <foldOp> lhs
     of Imm:
       if lhsLoc.ival < low(int32).int64 or lhsLoc.ival > high(int32).int64:
-        let s = g.pickStagingSealed("a bin imm64")       # wide imm → register (see below)
+        let s = g.pickStagingSealed("a bin imm64", res.typ) # wide imm → register (see below)
         g.movImm(s, lhsLoc.ival)
         g.binReg(foldOp, rD, s)
         g.giveBack s
@@ -1719,13 +1734,16 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
   var resStaging = NoReg
   var rD: Reg
   if res.kind in {NamedStack, Mem}:
-    resStaging = g.pickStagingSealed("a memory bin result")
+    resStaging = g.pickStagingSealed("a memory bin result", res.typ)
     rD = resStaging
   else:
     assert res.kind == InReg, "arkham x64n: bin result " & $res.kind
     rD = res.r
   let reusedLhs = lhsLoc.kind == InReg and lhsLoc.r == rD   # in-place RMW on the left temp
-  if res.isTemp and not reusedLhs: g.bindTemp(rD, res.typ)
+  # `rD` carries a value into the fold and MUST be a tracked binding for every `emReg`.
+  # Bind it unless a producer already did (an in-place `reusedLhs` left value, or the
+  # `produceIntoMem2` bridge bound at a leaf) — `rD notin boundTemps` is the guard.
+  if res.isTemp and rD notin g.boundTemps: g.bindTemp(rD, res.typ)
   # `rD` now holds (or is about to hold) the placed operand. It MUST be off-limits to
   # any staging pick made while the OTHER operand is folded — a `binFold`/`binImm64`
   # staging reg landing on `rD` would clobber the operand and silently degrade
@@ -1749,7 +1767,7 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
       if rhsLoc.ival < low(int32).int64 or rhsLoc.ival > high(int32).int64:
         # x86 ALU `r/m64, imm` only takes a sign-extended imm32; a wider immediate
         # (e.g. a popcount magic `0x5555…`) must go through a register first.
-        let s = g.pickStagingSealed("a bin imm64")
+        let s = g.pickStagingSealed("a bin imm64", res.typ)
         g.movImm(s, rhsLoc.ival)
         g.binReg(op, rD, s)
         g.giveBack s
@@ -2202,7 +2220,7 @@ proc emitDivMod2(g: var CodeGen; c: Cursor) =
   # rax/rdx) so `idiv` has a register operand.
   var dvsStaging = NoReg
   if dvsLoc.kind != InReg:
-    dvsStaging = g.pickStagingSealed("an idiv divisor")
+    dvsStaging = g.pickStagingSealed("an idiv divisor", dvsLoc.typ)
     g.emitLoadLoc(dvsLoc, dvsStaging)
     dvsLoc = regLoc(dvsStaging, dvsLoc.typ)
   let op = if signed: IdivX64 else: DivX64
@@ -2239,6 +2257,12 @@ proc produceIntoMem2(g: var CodeGen; c: Cursor; pos: int; dst: Location) =
   g.ra.locs[pos] = regLoc(s, dst.typ, isTemp = true)
   g.emitValue2(c)                        # the node now sees an InReg dst → produces into s
   g.ra.locs[pos] = dst                   # restore the slot location for the consumer
+  # `s` carries the produced value into the spill store and MUST be a tracked binding.
+  # A bin/combine producer already bound it; a LEAF (symbol/load/imm) produced into a
+  # register does not — bind it here so `emitStoreLoc`'s `emReg s` emits the checked
+  # name. `giveBack` unbinds. (Not pre-bound: a nested `produceIntoMem2` reuses the
+  # SAME bridge during `emitValue2` above, and binding is exclusive.)
+  if s notin g.boundTemps: g.bindTemp(s, dst.typ)
   g.emitStoreLoc(dst, s)                 # spill the produced value to its `(s)` slot
   g.giveBack s                           # unbind the staging name
 
@@ -2462,8 +2486,7 @@ proc emitFValue2(g: var CodeGen; c: Cursor) =
   case c.kind
   of FloatLit:
     if dst.isTemp: g.bindFTmp(dst.f)
-    let gpr = g.pickStagingSealed("a float literal bit pattern")  # transient scratch GPR
-    g.bindTemp(gpr, AsmSlot(cls: AInt, size: 8, align: 8))
+    let gpr = g.pickStagingSealed("a float literal bit pattern", AsmSlot(cls: AInt, size: 8, align: 8))
     if bits == 32: g.movImm(gpr, int64(cast[uint32](float32(floatVal(c)))))
     else: g.movImm(gpr, cast[int64](floatVal(c)))
     g.fmovFromGpr(dst.f, gpr, bits)
@@ -2501,7 +2524,7 @@ proc emitFValue2(g: var CodeGen; c: Cursor) =
       let z = g.pickFStagingSealed("a float neg temp")
       g.bindFTmp(z)
       g.fmovF(z, dst.f, bits)                             # z = operand
-      let gpr = g.pickStagingSealed("a float neg zero")
+      let gpr = g.pickStagingSealed("a float neg zero", AsmSlot(cls: AInt, size: 8, align: 8))
       g.movImm(gpr, 0)
       g.fmovFromGpr(dst.f, gpr, bits)                     # dst = 0.0
       g.giveBack gpr
@@ -2511,8 +2534,7 @@ proc emitFValue2(g: var CodeGen; c: Cursor) =
       # +inf / -inf / NaN have no FloatLit token — they are bare value nodes. Load
       # the IEEE-754 bit pattern through a scratch GPR, exactly like a `FloatLit`.
       if dst.isTemp: g.bindFTmp(dst.f)
-      let gpr = g.pickStagingSealed("a float special-value bit pattern")
-      g.bindTemp(gpr, AsmSlot(cls: AInt, size: 8, align: 8))
+      let gpr = g.pickStagingSealed("a float special-value bit pattern", AsmSlot(cls: AInt, size: 8, align: 8))
       let pat =
         if bits == 32:
           case c.exprKind
@@ -2665,7 +2687,7 @@ proc reloadMemBase2(g: var CodeGen; pos: int) =
   ## the common case and returns immediately — no steal can move it under us anymore.)
   let loc = g.ra.locs[pos]
   if loc.kind notin {NamedStack, Mem}: return
-  let s = g.pickStagingSealed("a memory address base/index")
+  let s = g.pickStagingSealed("a memory address base/index", loc.typ)
   g.emitLoadLoc(loc, s)
   g.savedHomes[pos] = loc
   g.ra.locs[pos] = regLoc(s, loc.typ)
@@ -2986,7 +3008,7 @@ proc emitAddr2(g: var CodeGen; c: Cursor) =
   var addrStaging = NoReg
   let memRes = res
   if res.kind in {NamedStack, Mem}:
-    addrStaging = g.pickStagingSealed("an addr result")
+    addrStaging = g.pickStagingSealed("an addr result", res.typ)
     res = regLoc(addrStaging, res.typ)
   else:
     assert res.kind == InReg, "arkham x64n: addr result " & $res.kind
@@ -3073,7 +3095,7 @@ proc emitCast2(g: var CodeGen; c: Cursor) =
   var res2 = res
   var castStaging = NoReg
   if res2.kind in {NamedStack, Mem}:
-    castStaging = g.pickStagingSealed("a cast result")
+    castStaging = g.pickStagingSealed("a cast result", res2.typ)
     res2 = regLoc(castStaging, res2.typ)
   let ptrTarget = isPtrType(tc)
   let srcPtr = isPtrType(resolveType(g.prog, g.getType(inner)))
@@ -3184,7 +3206,7 @@ proc copyStructThroughPtr2(g: var CodeGen; srcVar, typeName: string; ptrReg, tmp
   ## Copy `srcVar` → the memory `ptrReg` points at, through scratch `tmp` (the >16B
   ## aggregate hidden-result-pointer return). Leas the source's address into one staging
   ## register and funnels through the one `copyAggr`.
-  let sp = g.pickStagingSealed("a struct-through-ptr source pointer")
+  let sp = g.pickStagingSealed("a struct-through-ptr source pointer", AddrSlot)
   g.emStackAddr(sp, srcVar)
   g.bindTemp(tmp, AsmSlot(cls: AUInt, size: 8, align: 8))
   g.copyAggr(ptrReg, sp, aggrByteSize(g.prog, typeName), tmp)
@@ -3250,7 +3272,7 @@ proc flatCopyToPtr(g: var CodeGen; srcVar: string; sizeBytes: int; dstPtr, tmp: 
   ## Copy the `sizeBytes`-byte aggregate stack slot `srcVar` into `[dstPtr]`, through
   ## scratch `tmp`. Leas the source's address into one staging register and funnels
   ## through the one `copyAggr` (word bulk + byte tail — any size, layout-agnostic).
-  let srcPtr = g.pickStagingSealed("a flat-copy source pointer")
+  let srcPtr = g.pickStagingSealed("a flat-copy source pointer", AddrSlot)
   g.emStackAddr(srcPtr, srcVar)
   g.bindTemp(tmp, AsmSlot(cls: AUInt, size: 8, align: 8))
   g.copyAggr(dstPtr, srcPtr, sizeBytes, tmp)
@@ -3271,7 +3293,7 @@ proc genNestedAggrField(g: var CodeGen; valC, fty: Cursor; fieldPtr: Reg) =
   g.emTypedStackVar(tmpName, fty)
   g.varType[tmpName] = ntn
   g.genStore2(valC, namedStackLoc(tmpName, g.exprSlot(valC)), pos)
-  let scratch = g.pickStagingSealed("a nested-aggregate-field copy word")
+  let scratch = g.pickStagingSealed("a nested-aggregate-field copy word", AddrSlot)
   g.flatCopyToPtr(tmpName, aggrByteSize(g.prog, ntn), fieldPtr, scratch)
   g.giveBack scratch
 
@@ -3337,7 +3359,7 @@ proc genFieldStore2(g: var CodeGen; dst: Location; valC: Cursor) =
   ## value into the field's address). No per-field special-casing at the call site.
   if dst.typ.kind == AMem:                              # nested aggregate field
     let ftyCur = g.fieldTypeByName(dst.aggrType, dst.field)
-    let fptr = g.pickStagingSealed("a nested-aggregate-field pointer")
+    let fptr = g.pickStagingSealed("a nested-aggregate-field pointer", AddrSlot)
     g.emFieldAddr(dst, fptr)
     g.genNestedAggrField(valC, ftyCur, fptr)
     g.giveBack fptr
@@ -3355,8 +3377,7 @@ proc genFieldStore2(g: var CodeGen; dst: Location; valC: Cursor) =
       # straight from its `(s)` slot. x86 has no mem→mem `mov`, so bridge the value
       # through a staging register before storing it into the field operand.
       var fty = resolveType(g.prog, g.fieldTypeByName(dst.aggrType, dst.field))
-      let s = g.pickStagingSealed("a constr field stack rhs")
-      g.bindTemp(s, v.typ)
+      let s = g.pickStagingSealed("a constr field stack rhs", v.typ)
       g.emitLoadLoc(v, s)
       g.ab.tree MovX64:
         g.emFieldOperand(dst)
@@ -3462,7 +3483,7 @@ template aconstrElemStores(g: var CodeGen; c: Cursor; destOp: untyped) =
       while cc.hasMore:
         let valC = cc
         if elemSlot.kind == AMem:                       # nested aggregate element
-          let eptr = g.pickStagingSealed("an aconstr aggregate-element pointer")
+          let eptr = g.pickStagingSealed("an aconstr aggregate-element pointer", AddrSlot)
           g.ab.tree LeaX64: (g.emReg eptr; destOp(i))   # &element[i]
           g.genNestedAggrField(valC, elemTyRaw, eptr)
           g.giveBack eptr
@@ -3527,7 +3548,7 @@ proc genBaseobj2(g: var CodeGen; c: Cursor; dst: Location) =
     g.emTypedStackVar(dtmp, derivedTy)
     g.varType[dtmp] = derivedTn
     g.genStore2(valC, namedStackLoc(dtmp, g.exprSlot(valC)), pos)  # build derived (no held temp)
-    let scratch = g.pickStagingSealed("a baseobj prefix copy")
+    let scratch = g.pickStagingSealed("a baseobj prefix copy", AddrSlot)
     g.genAggrCopy2(dst.name, dtmp, symName(baseTy), scratch)        # copy the base prefix
     g.giveBack scratch
     while cc.hasMore: skip cc
@@ -3562,7 +3583,7 @@ proc storeScalar2(g: var CodeGen; dst, v: Location) =
         g.emitStoreLoc(dst, v.r)
         if v.isTemp: g.unbindTemp(v.r)
       of NamedStack, Mem:
-        let s = g.pickStagingSealed("a scalar store")
+        let s = g.pickStagingSealed("a scalar store", v.typ)
         g.emitLoadLoc(v, s)
         g.emitStoreLoc(dst, s)
         g.giveBack s
@@ -3600,13 +3621,11 @@ proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size, auxPos: 
   ## R11 bridge + free caller-saved), NOT the allocator pool, so the copy never starves
   ## when register-homed locals fill the pool. Each is sealed before the next is picked
   ## (and before address computation, which may itself stage), so they stay disjoint.
-  let dstAddr = g.pickStagingSealed("an aggregate-copy dst address")
-  g.bindTemp(dstAddr, ScalarSlot); g.aggrAddrLoc(dst, dstAddr)   # &dst
-  let srcAddr = g.pickStagingSealed("an aggregate-copy src address")
-  g.bindTemp(srcAddr, ScalarSlot)
+  let dstAddr = g.pickStagingSealed("an aggregate-copy dst address", ScalarSlot)
+  g.aggrAddrLoc(dst, dstAddr)   # &dst
+  let srcAddr = g.pickStagingSealed("an aggregate-copy src address", ScalarSlot)
   g.aggrAddrInto(rhs, srcAddr, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)  # &rhs
-  let tmp = g.pickStagingSealed("an aggregate-copy transfer register")
-  g.bindTemp(tmp, AsmSlot(cls: AUInt, size: 8, align: 8))
+  let tmp = g.pickStagingSealed("an aggregate-copy transfer register", AddrSlot)
   g.copyAggr(dstAddr, srcAddr, size, tmp)
   g.giveBack tmp                                                 # unbinds + unseals the bridge
   g.giveBack srcAddr; g.giveBack dstAddr                         # unbind + unseal
@@ -3701,7 +3720,7 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
     var v = g.ra.locs[cursorToPosition(g.buf[], rhs)]
     var glbStaging = NoReg
     if v.kind in {NamedStack, Mem}:                      # demoted (stolen) local rhs → reg
-      glbStaging = g.pickStagingSealed("a global store rhs")
+      glbStaging = g.pickStagingSealed("a global store rhs", v.typ)
       g.emitLoadLoc(v, glbStaging)
       v = regLoc(glbStaging, v.typ)
     assert v.kind == InReg, "arkham x64n: global store rhs " & $v.kind
@@ -3781,7 +3800,7 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
         let dstPtr = isPtrType(dstTy)
         var rhsStaging = NoReg
         if v.kind in {NamedStack, Mem}:                   # demoted (stolen) local → staging reg
-          rhsStaging = g.pickStagingSealed("a memory store rhs")
+          rhsStaging = g.pickStagingSealed("a memory store rhs", v.typ)
           g.emitLoadLoc(v, rhsStaging)
           v = regLoc(rhsStaging, v.typ)
         g.prematLval2(lhs)                                 # base regs AFTER the rhs is secured
@@ -3929,14 +3948,14 @@ proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
     # first (movabs), since nifasm has no scratch pool of its own.
     var bigImmStaging = NoReg
     if bLoc.kind == Imm and (bLoc.ival < low(int32).int64 or bLoc.ival > high(int32).int64):
-      bigImmStaging = g.pickStagingSealed("a cmp imm64")
+      bigImmStaging = g.pickStagingSealed("a cmp imm64", bLoc.typ)
       g.movImm(bigImmStaging, bLoc.ival)
       bLoc = regLoc(bigImmStaging, bLoc.typ)
     var cmpStaging = NoReg
     if aLoc.kind == NamedStack:
       # demoted (stolen) local as cmp lhs: load it into a staging reg so the rhs may
       # itself be memory (`cmp [a],[b]` is illegal); the InReg-lhs path then applies.
-      cmpStaging = g.pickStagingSealed("a cmp lhs")
+      cmpStaging = g.pickStagingSealed("a cmp lhs", aLoc.typ)
       g.emitLoadLoc(aLoc, cmpStaging)
       aLoc = regLoc(cmpStaging, aLoc.typ)
     if aLoc.kind == Mem:                                 # left folded: cmp [addr], rreg/imm
@@ -3948,7 +3967,7 @@ proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
         # x86 forbids `cmp [mem], [mem]`: a spilled (demoted) rhs local must be loaded
         # into a register. Pick AFTER prematLval2 so the staging reg avoids the now-bound
         # lhs base pointer.
-        rhsStaging = g.pickStagingSealed("a cmp(memlhs) rhs")
+        rhsStaging = g.pickStagingSealed("a cmp(memlhs) rhs", bLoc.typ)
         g.emitLoadLoc(bLoc, rhsStaging)
       g.ab.tree CmpX64:
         g.ab.tree MemX: g.emLvalAddr2(aC)
@@ -3996,7 +4015,7 @@ proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
     else:
       # a stack-homed / global bool value (the allocator left it in its memory home):
       # load it into a staging reg (sized + extended), then compare against zero.
-      let s = g.pickStagingSealed("a bool cond operand")
+      let s = g.pickStagingSealed("a bool cond operand", v.typ)
       g.emitLoadLoc(v, s)
       g.ab.tree CmpX64: (g.emReg s; g.ab.intLit 0)
       g.emJcc(if whenTrue: JneX64 else: JeX64, toLabel)

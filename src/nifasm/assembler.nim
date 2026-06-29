@@ -3095,6 +3095,15 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
       if result.reg in ctx.regBindings:
         error("Register " & $result.reg & " is bound to variable '" &
               ctx.regBindings[result.reg] & "', use the variable name instead", n)
+      # R11 is the codegen's RESERVED staging bridge — never a syscall/call argument
+      # or a callee-saved home. A *raw* `(reg r11)` therefore always means a value or
+      # address was left in the bridge as an UNTRACKED, untyped register; the codegen
+      # must hand it out as a typed `(rebind)` binding (see arkham `pickStagingSealed`).
+      # Rejecting it here keeps the staging bridge inside the typed-binding model so a
+      # dropped/clobbered operand is an assemble-time error, not a runtime miscompile.
+      if result.reg == x86.R11:
+        error("raw r11 operand: the staging bridge must be a typed (rebind) binding, " &
+              "never a bare (reg) — untracked value/address in the bridge", n)
     elif t == NilTagId:
       # `(nil)` as a value: the null pointer — a 0 immediate typed `nil` (compatible
       # with any pointer, never a sized integer). See `compatible`'s NilT arm.
@@ -3627,6 +3636,9 @@ proc parseDest(n: var Cursor; ctx: var GenContext): Operand =
     if result.reg in ctx.regBindings:
       error("Register " & $result.reg & " is bound to variable '" &
             ctx.regBindings[result.reg] & "', use the variable name instead", n)
+    if result.reg == x86.R11:           # the reserved staging bridge (see parseOperand)
+      error("raw r11 destination: the staging bridge must be a typed (rebind) binding, " &
+            "never a bare (reg)", n)
   elif n.kind == TagLit and n.tag == ArgTagId:
     # (arg name [k]) as destination - for register arguments in prepare block. `into`
     # bounds the cursor to the arg's own children so the optional word index `k` is read
