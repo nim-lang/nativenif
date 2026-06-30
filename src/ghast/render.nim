@@ -15,11 +15,13 @@
 ##   …
 ##
 ## The mapping is purely structural, so it is opcode-agnostic (it renders any
-## instruction the codegen emits, not a fixed list): a leading `SymbolDef` child
-## becomes the `%id =` result assignment; remaining children render by token
-## kind — `Symbol` → `%id`, `Ident` → bare enum word, `StrLit` → `"quoted"`,
-## `IntLit` → the number. This module is usable both as a library (`renderSpirv`,
-## called in-process by `ghast`) and as a standalone CLI on a dumped `.spv.nif`.
+## instruction the codegen emits, not a fixed list). A `(Def <SymbolDef %id>
+## (OpFoo …))` tree renders as the `%id = OpFoo …` result assignment; a bare
+## `(OpFoo …)` renders as a result-less instruction. Operands render by token
+## kind — `Symbol` → `%id`, a nullary tag → the bare keyword word (`Shader`),
+## `StrLit` → `"quoted"`, `IntLit` → the number. This module is usable both as a
+## library (`renderSpirv`, called in-process by `ghast`) and as a standalone CLI
+## on a dumped `.spv.nif`.
 
 import std / assertions
 import nifcore, nifcoreparse
@@ -34,14 +36,28 @@ proc idName(sym: string): string =
       break
 
 proc fmtOperand(c: Cursor): string =
-  ## One operand token in SPIR-V spelling. (Operands are always atoms.)
+  ## One operand in SPIR-V spelling. Operands are `Symbol` id uses, nullary
+  ## keyword tags, or literals.
   case c.kind
-  of Symbol, SymbolDef: result = "%" & idName(symName(c))
+  of Symbol: result = "%" & idName(symName(c))
+  of TagLit: result = tagName(c.tags, c.cursorTagId)   # nullary keyword, e.g. (Shader)
   of Ident: result = strVal(c)
   of StrLit: result = "\"" & strVal(c) & "\""
   of IntLit: result = $intVal(c)
   of UIntLit: result = $uintVal(c)
   else: result = "?"
+
+proc renderInstr(c: var Cursor): string =
+  ## Render one `(OpFoo <operands>)` tree (no result binding) and advance past
+  ## it. The opcode is the tag; the children are operands.
+  assert c.kind == TagLit, "renderSpirv: expected an instruction tag"
+  let op = tagName(c.tags, c.cursorTagId)
+  var line = op
+  c.into:
+    while c.hasMore:
+      line.add " " & fmtOperand(c)
+      skip c
+  result = line
 
 proc renderSpirv*(b: var TokenBuf): string =
   ## Walk the `(Module …)` NIF tree and emit textual SPIR-V.
@@ -53,25 +69,18 @@ proc renderSpirv*(b: var TokenBuf): string =
   c.into:
     while c.hasMore:
       assert c.kind == TagLit, "renderSpirv: expected an instruction tag"
-      let op = tagName(c.tags, c.cursorTagId)
-      var resultId = ""
-      var ops: seq[string] = @[]
-      var first = true
-      c.into:
-        while c.hasMore:
-          if first and c.kind == SymbolDef:
-            resultId = idName(symName(c))
-            inc bound
-            inc c
-          else:
-            ops.add fmtOperand(c)
-            inc c
-          first = false
-      var line = ""
-      if resultId.len > 0: line = "%" & resultId & " = "
-      line.add op
-      for o in ops: line.add " " & o
-      instrs.add line
+      if tagName(c.tags, c.cursorTagId) == "Def":
+        # `(Def <SymbolDef %id> (OpFoo …))` -> `%id = OpFoo …`.
+        var resultId = ""
+        var instrText = ""
+        c.into:
+          assert c.kind == SymbolDef, "renderSpirv: Def without a SymbolDef"
+          resultId = idName(symName(c)); inc c
+          instrText = renderInstr(c)
+        inc bound
+        instrs.add "%" & resultId & " = " & instrText
+      else:
+        instrs.add renderInstr(c)
   var lines = @[
     "; SPIR-V",
     "; Version: 1.3",

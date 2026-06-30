@@ -17,10 +17,10 @@
 ## requires it); ids are deduplicated within a function.
 ##
 ## The supported subset is deliberately narrow. Any construct outside it (calls,
-## control flow, aggregates, …) raises `TranslateError`, which `translateModule`
-## catches *per proc* — that proc is skipped (its partial output discarded) and
-## translation continues. So `ghast` runs on a whole real module and emits SPIR-V
-## for the procs it can, rather than only a hand-built fixed module.
+## control flow, aggregates, …) raises `TranslateError`. The error is **not**
+## caught: it propagates out of `translateModule` and aborts the whole run, so
+## ghast never silently emits a quietly-incomplete module — an unsupported
+## construct is a hard failure, not a skipped proc.
 
 import std / [assertions, tables, sets, algorithm, sequtils, strutils]
 import "." / spirv
@@ -49,7 +49,7 @@ type
     entryPoints, execModes, decorations, types, funcs: TokenBuf
     pool: Pool
     tags: TagPool
-    caps: HashSet[string]
+    caps: HashSet[SpirvOp]
     counter: int       ## SSA ids are module-global; this keeps temps unique
 
   ProcGen = object
@@ -59,14 +59,14 @@ type
     entryPoints, execModes, decorations, types, funcs: TokenBuf
     typeIds, constIds: Table[string, string]   ## dedup key -> id
     syms: Table[string, SymInfo]
-    caps: HashSet[string]
+    caps: HashSet[SpirvOp]
 
 proc err(msg: string) {.noreturn.} =
   raise newException(TranslateError, msg)
 
 proc base(id: string): string =
   ## An id without its NIF module suffix — `int64.0` -> `int64` — for building
-  ## derived id names (which `resultId`/`idRef` then take verbatim).
+  ## derived id names (which `def`/`idRef` then take verbatim).
   result = id
   for i in 0 ..< id.len:
     if id[i] == '.':
@@ -94,12 +94,11 @@ proc intType(pg: var ProcGen; width: int; signed: bool): string =
   let id = (if signed: "int" else: "uint") & $width & idSuffix
   pg.typeIds[key] = id
   case width
-  of 8: pg.caps.incl "Int8"
-  of 16: pg.caps.incl "Int16"
-  of 64: pg.caps.incl "Int64"
+  of 8: pg.caps.incl capInt8
+  of 16: pg.caps.incl capInt16
+  of 64: pg.caps.incl capInt64
   else: discard
-  pg.types.instr OpTypeInt:
-    pg.types.resultId id
+  pg.types.def id, OpTypeInt:
     pg.types.litOp width
     pg.types.litOp (if signed: 1 else: 0)
   result = id
@@ -108,16 +107,16 @@ proc boolType(pg: var ProcGen): string =
   if "bool" in pg.typeIds: return pg.typeIds["bool"]
   let id = "bool" & idSuffix
   pg.typeIds["bool"] = id
-  pg.types.instr OpTypeBool:
-    pg.types.resultId id
+  pg.types.def id, OpTypeBool:
+    discard
   result = id
 
 proc voidType(pg: var ProcGen): string =
   if "void" in pg.typeIds: return pg.typeIds["void"]
   let id = "void" & idSuffix
   pg.typeIds["void"] = id
-  pg.types.instr OpTypeVoid:
-    pg.types.resultId id
+  pg.types.def id, OpTypeVoid:
+    discard
   result = id
 
 proc valueType(pg: var ProcGen; t: Cursor): string =
@@ -128,13 +127,12 @@ proc valueType(pg: var ProcGen; t: Cursor): string =
   of BoolT: result = boolType(pg)
   else: err("unsupported type")
 
-proc ptrType(pg: var ProcGen; sc: StorageClass; elem: string): string =
+proc ptrType(pg: var ProcGen; sc: SpirvOp; elem: string): string =
   let key = "ptr:" & $sc & ":" & elem
   if key in pg.typeIds: return pg.typeIds[key]
   let id = "ptr_" & $sc & "_" & base(elem) & idSuffix
   pg.typeIds[key] = id
-  pg.types.instr OpTypePointer:
-    pg.types.resultId id
+  pg.types.def id, OpTypePointer:
     pg.types.enumOp sc
     pg.types.idRef elem
   result = id
@@ -144,8 +142,7 @@ proc vecType(pg: var ProcGen; elem: string; n: int): string =
   if key in pg.typeIds: return pg.typeIds[key]
   let id = "v" & $n & base(elem) & idSuffix
   pg.typeIds[key] = id
-  pg.types.instr OpTypeVector:
-    pg.types.resultId id
+  pg.types.def id, OpTypeVector:
     pg.types.idRef elem
     pg.types.litOp n
   result = id
@@ -156,8 +153,7 @@ proc funcType(pg: var ProcGen; m: var Module; ret: string; params: seq[string]):
   let id = "fnty" & $m.counter & idSuffix
   inc m.counter
   pg.typeIds[key] = id
-  pg.types.instr OpTypeFunction:
-    pg.types.resultId id
+  pg.types.def id, OpTypeFunction:
     pg.types.idRef ret
     for p in params: pg.types.idRef p
   result = id
@@ -167,8 +163,7 @@ proc constInt(pg: var ProcGen; typeId: string; v: int64): string =
   if key in pg.constIds: return pg.constIds[key]
   let id = base(typeId) & "_" & (if v < 0: "n" & $(-v) else: $v) & idSuffix
   pg.constIds[key] = id
-  pg.types.instr OpConstant:
-    pg.types.resultId id
+  pg.types.def id, OpConstant:
     pg.types.idRef typeId
     pg.types.litOp v
   result = id
@@ -183,8 +178,7 @@ proc bufElemAddr(m: var Module; pg: var ProcGen; buf: SymInfo; idxId: string): s
   let u32 = intType(pg, 32, false)
   let zero = constInt(pg, u32, 0)
   result = freshId(m, "ac")
-  pg.funcs.instr OpAccessChain:
-    pg.funcs.resultId result
+  pg.funcs.def result, OpAccessChain:
     pg.funcs.idRef buf.ptrId
     pg.funcs.idRef buf.id
     pg.funcs.idRef zero
@@ -202,8 +196,7 @@ proc genBinop(m: var Module; pg: var ProcGen; n: Cursor; op: SpirvOp): string =
     b = genExpr(m, pg, c, resType); skip c
     if c.hasMore: err("n-ary arithmetic not supported")
   let id = freshId(m, "t")
-  pg.funcs.instr op:
-    pg.funcs.resultId id
+  pg.funcs.def id, op:
     pg.funcs.idRef resType
     pg.funcs.idRef a
     pg.funcs.idRef b
@@ -220,8 +213,7 @@ proc genExpr(m: var Module; pg: var ProcGen; n: Cursor; expected: string): strin
       result = s.id
     of scLocalPtr:
       let id = freshId(m, "t")
-      pg.funcs.instr OpLoad:
-        pg.funcs.resultId id
+      pg.funcs.def id, OpLoad:
         pg.funcs.idRef s.typeId
         pg.funcs.idRef s.id
       result = id
@@ -269,8 +261,7 @@ proc genExpr(m: var Module; pg: var ProcGen; n: Cursor; expected: string): strin
       let buf = pg.syms[bufName]
       let address = bufElemAddr(m, pg, buf, idxId)
       let id = freshId(m, "t")
-      pg.funcs.instr OpLoad:
-        pg.funcs.resultId id
+      pg.funcs.def id, OpLoad:
         pg.funcs.idRef buf.typeId
         pg.funcs.idRef address
       result = id
@@ -363,8 +354,7 @@ proc declareLocals(m: var Module; pg: var ProcGen; body: Cursor) =
       let ptrId = ptrType(pg, scFunction, typeId)
       let name = symName(v.name)
       pg.syms[name] = SymInfo(id: name, cls: scLocalPtr, typeId: typeId)
-      pg.funcs.instr OpVariable:
-        pg.funcs.resultId name
+      pg.funcs.def name, OpVariable:
         pg.funcs.idRef ptrId
         pg.funcs.enumOp scFunction
     skip c
@@ -378,7 +368,7 @@ proc newProcGen(pool: Pool; tags: TagPool): ProcGen =
           typeIds: initTable[string, string](),
           constIds: initTable[string, string](),
           syms: initTable[string, SymInfo](),
-          caps: initHashSet[string]())
+          caps: initHashSet[SpirvOp]())
 
 proc appendAll(dest: var TokenBuf; src: var TokenBuf) =
   var c = src.beginRead()
@@ -425,18 +415,16 @@ proc translateProc(m: var Module; procCursor: Cursor) =
 
   let fnTypeId = funcType(pg, m, retId, paramTypes)
 
-  pg.funcs.instr OpFunction:
-    pg.funcs.resultId fnName
+  pg.funcs.def fnName, OpFunction:
     pg.funcs.idRef retId
     pg.funcs.enumOp fcNone
     pg.funcs.idRef fnTypeId
   for prm in paramOrder:
-    pg.funcs.instr OpFunctionParameter:
-      pg.funcs.resultId prm.id
+    pg.funcs.def prm.id, OpFunctionParameter:
       pg.funcs.idRef prm.typeId
   let entry = freshId(m, "entry")
-  pg.funcs.instr OpLabel:
-    pg.funcs.resultId entry
+  pg.funcs.def entry, OpLabel:
+    discard
 
   declareLocals(m, pg, p.body)
   genStmt(m, pg, p.body)
@@ -483,8 +471,7 @@ proc translateKernel(m: var Module; procCursor: Cursor) =
 
   # The GlobalInvocationId builtin input variable.
   let gid = "gid" & idSuffix
-  pg.types.instr OpVariable:
-    pg.types.resultId gid
+  pg.types.def gid, OpVariable:
     pg.types.idRef ptrInVec3
     pg.types.enumOp scInput
   pg.decorations.instr OpDecorate:
@@ -504,16 +491,14 @@ proc translateKernel(m: var Module; procCursor: Cursor) =
       if pd.typ.typeKind == PtrT:
         let elem = valueType(pg, elementType(pd.typ))
         let rta = freshId(m, "rta")
-        pg.types.instr OpTypeRuntimeArray:
-          pg.types.resultId rta
+        pg.types.def rta, OpTypeRuntimeArray:
           pg.types.idRef elem
         pg.decorations.instr OpDecorate:
           pg.decorations.idRef rta
           pg.decorations.enumOp decArrayStride
           pg.decorations.litOp 4
         let st = freshId(m, "buf")
-        pg.types.instr OpTypeStruct:
-          pg.types.resultId st
+        pg.types.def st, OpTypeStruct:
           pg.types.idRef rta
         pg.decorations.instr OpMemberDecorate:
           pg.decorations.idRef st
@@ -525,8 +510,7 @@ proc translateKernel(m: var Module; procCursor: Cursor) =
           pg.decorations.enumOp decBlock
         let sbPtr = ptrType(pg, scStorageBuffer, st)
         let varId = base(pname) & idSuffix
-        pg.types.instr OpVariable:
-          pg.types.resultId varId
+        pg.types.def varId, OpVariable:
           pg.types.idRef sbPtr
           pg.types.enumOp scStorageBuffer
         pg.decorations.instr OpDecorate:
@@ -559,30 +543,26 @@ proc translateKernel(m: var Module; procCursor: Cursor) =
     pg.execModes.litOp 1
     pg.execModes.litOp 1
 
-  pg.funcs.instr OpFunction:
-    pg.funcs.resultId mainId
+  pg.funcs.def mainId, OpFunction:
     pg.funcs.idRef voidId
     pg.funcs.enumOp fcNone
     pg.funcs.idRef fnty
   let entry = freshId(m, "entry")
-  pg.funcs.instr OpLabel:
-    pg.funcs.resultId entry
+  pg.funcs.def entry, OpLabel:
+    discard
 
   # i = int32(gl_GlobalInvocationID.x)
   let gidPtr = freshId(m, "gidp")
-  pg.funcs.instr OpAccessChain:
-    pg.funcs.resultId gidPtr
+  pg.funcs.def gidPtr, OpAccessChain:
     pg.funcs.idRef ptrInU32
     pg.funcs.idRef gid
     pg.funcs.idRef zero
   let gidx = freshId(m, "gidx")
-  pg.funcs.instr OpLoad:
-    pg.funcs.resultId gidx
+  pg.funcs.def gidx, OpLoad:
     pg.funcs.idRef u32
     pg.funcs.idRef gidPtr
   let idx = freshId(m, "idx")
-  pg.funcs.instr OpBitcast:                  # uint32 -> int32 (same width)
-    pg.funcs.resultId idx
+  pg.funcs.def idx, OpBitcast:               # uint32 -> int32 (same width)
     pg.funcs.idRef indexType
     pg.funcs.idRef gidx
   pg.syms[indexParam] = SymInfo(id: idx, cls: scParamValue, typeId: indexType)
@@ -610,16 +590,16 @@ proc translateModule*(input: var TokenBuf): TokenBuf =
                  types: createTokenBuf(64, pool, tags),
                  funcs: createTokenBuf(64, pool, tags),
                  pool: pool, tags: tags,
-                 caps: initHashSet[string](), counter: 0)
+                 caps: initHashSet[SpirvOp](), counter: 0)
   var c = input.beginRead()
   if c.stmtKind == StmtsS:
     loopInto c:
       if c.stmtKind == ProcS:
-        try:
-          if isKernel(c): translateKernel(m, c)
-          else: translateProc(m, c)
-        except TranslateError:
-          discard   # unsupported proc — skip, keep going
+        # Any unsupported construct raises `TranslateError`, which propagates:
+        # ghast fails on the whole module rather than silently emitting a
+        # quietly-incomplete one.
+        if isKernel(c): translateKernel(m, c)
+        else: translateProc(m, c)
       skip c
 
   result = createTokenBuf(64, pool, tags)
@@ -628,7 +608,7 @@ proc translateModule*(input: var TokenBuf): TokenBuf =
     result.enumOp capShader
   for cap in sorted(toSeq(m.caps)):
     result.instr OpCapability:
-      result.identOp cap
+      result.enumOp cap
   result.instr OpMemoryModel:
     result.enumOp addrLogical
     result.enumOp memGLSL450
