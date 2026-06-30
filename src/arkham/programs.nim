@@ -150,10 +150,48 @@ const LinuxSyscalls* = {
   # `cAbort`/`cExit` raise via `kill(getpid(), SIGABRT)` in the libc-free build.
   "getpid":     (39,  172),
   "kill":       (62,  129),
+  # Process creation / replacement, used by os.execShellCmd's libc-free `system()`
+  # (fork + execve of `/bin/sh -c` + wait). AArch64's asm-generic ABI has no `fork`
+  # syscall (userspace uses `clone`), so it gets -1 there — like `open`/`stat`, fine
+  # for an x86-64 target and flagged loudly if an a64 build ever reaches it.
+  "fork":       (57,  -1),
+  "execve":     (59,  221),
+  # libc `waitpid(pid, status, opts)` is `wait4(pid, status, opts, rusage=NULL)`;
+  # there is no bare `waitpid` syscall. posix.nim's libc-free `waitpid` wraps this
+  # 4-arg `wait4` with `rusage = nil` so the 4th ABI register is a defined NULL.
+  "wait4":      (61,  260),
+  # std/osproc's libc-free startProcess: a pipe per std stream, dup2 to wire the
+  # child's 0/1/2, close the unused ends, optional chdir (workingDir) / setpgid
+  # (poDaemon). AArch64's asm-generic ABI replaces `pipe`/`dup2` with `pipe2`/`dup3`
+  # (an extra flags arg), so they get -1 there — fine for an x86-64 target, flagged
+  # loudly on a64. (`execvp` is NOT here — it is not a syscall; posix.nim implements
+  # it on top of `execve` + a PATH scan.)
+  "pipe":       (22,  -1),
+  "dup2":       (33,  -1),
+  "chdir":      (80,  49),
+  "setpgid":    (109, 154),
+  # getAppFilename → readlink("/proc/self/exe"). AArch64's asm-generic ABI has only
+  # `readlinkat`, so -1 there (fine for x86-64, flagged loudly on a64).
+  "readlink":   (89,  -1),
+  # std/terminal's isatty → ioctl(fd, TCGETS). Same number on both arches.
+  "ioctl":      (16,  29),
+  # std/os filesystem mutators (mkdir/removeDir/removeFile/moveFile). AArch64's
+  # asm-generic ABI replaced all of these with `*at` variants (mkdirat/unlinkat/
+  # renameat), so they get -1 there — fine for an x86-64 target, flagged on a64.
+  "mkdir":      (83,  -1),
+  "rmdir":      (84,  -1),
+  "unlink":     (87,  -1),
+  "rename":     (82,  -1),
   # `abort` is a libc function, not a syscall. For now we lower it to the `exit`
   # syscall so a libc-free build links and terminates (it takes no args, so the exit
   # code is whatever is in the syscall's code register — abort is a cold error path).
   "abort":      (60,  93)}
+
+const CLinkageGvars* = ["cmdCount", "cmdLine", "nimEnviron"]
+  ## Runtime gvars that link by their bare C name (`<cName>.0`) across all bundled
+  ## modules: defined+written by the generated `main`, read by std modules via
+  ## `importc` (`cmdCount`/`cmdLine` ← std/cmdline; `nimEnviron` ← std/envvars,
+  ## std/posix). See `collect` (same-module mapping) and `gvarRefName` (foreign).
 
 const
   LinuxX64ExitNr* = 60
@@ -358,12 +396,13 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
             # scope and links the same name across every bundled module.
             #
             # Scoped to the runtime's genuine cross-module exportc/importc gvar PAIRS
-            # (`cmdCount`/`cmdLine`: defined+written by the generated `main`, read by
-            # `std/cmdline`). A blanket redirect would break the many importc consts
-            # that have NO in-bundle definition (e.g. `__ATOMIC_RELAXED`): those rely
-            # on falling through to a local zeroed slot, so they must keep their NIF
-            # name. (A full C-linkage namespace in nifasm would generalize this.)
-            const CLinkageGvars = ["cmdCount", "cmdLine"]
+            # (`cmdCount`/`cmdLine`/`nimEnviron`: defined+written by the generated
+            # `main`, read by `std/cmdline` / `std/envvars` / `std/posix`). A blanket
+            # redirect would break the many importc consts that have NO in-bundle
+            # definition (e.g. `__ATOMIC_RELAXED`): those rely on falling through to a
+            # local zeroed slot, so they must keep their NIF name. (A full C-linkage
+            # namespace in nifasm would generalize this.) See CLinkageGvars (top-level)
+            # and gvarRefName for the cross-module (foreign-reference) resolution.
             if gExportc.len > 0 and gExportc in CLinkageGvars:
               result.gvarCName[nm] = gExportc & ".0"
             elif gImportc.len > 0 and gImportc in CLinkageGvars:
@@ -578,6 +617,37 @@ proc foreignCallTarget*(p: var Program; name: string): CallTarget =
     result = CallTarget(asmName: name, extern: false, retFloat: retFloat,
                         retType: retType, sigType: sigType,
                         declarative: isDeclarativeAbi(p, declCur))
+
+proc gvarRefName*(p: var Program; nifName: string): string =
+  ## Like `gvarAsmName`, but also resolves a CLinkage gvar referenced from a
+  ## DIFFERENT module than the one that declares it (e.g. `std/posix`'s
+  ## `posix_environ {.importc:"nimEnviron".}` read from `std/os`). The per-module
+  ## `gvarCName` only covers same-module decls, so a foreign reference would keep
+  ## its raw NIF name and fail to link against the canonical `<cName>.0` slot. We
+  ## load the owning module's decl, and if its importc/exportc name is a CLinkage
+  ## gvar, map to `<cName>.0` (and cache it).
+  let local = p.gvarCName.getOrDefault(nifName, "")
+  if local.len > 0: return local
+  if isForeignSym(p, nifName):
+    let s = splitSymName(nifName)
+    let m = loadModule(p, s.module)
+    if hasDecl(m, nifName):
+      let declCur = getDecl(m, nifName, p.tags)
+      var d = declCur
+      var importcN, exportcN = ""
+      d.into:
+        inc d                                   # name
+        parsePragmas(d, importcN, exportcN)     # at the pragmas node
+        while d.hasMore: skip d                 # drain (type, value)
+      let cname =
+        if exportcN.len > 0 and exportcN in CLinkageGvars: exportcN
+        elif importcN.len > 0 and importcN in CLinkageGvars: importcN
+        else: ""
+      if cname.len > 0:
+        result = cname & ".0"
+        p.gvarCName[nifName] = result           # cache for subsequent refs
+        return
+  result = nifName
 
 # ── named-type resolution ───────────────────────────────────────────────────
 

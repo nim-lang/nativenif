@@ -3865,6 +3865,18 @@ proc checkBitwiseCompatible(t1, t2: Type; op: string; n: Cursor) =
   if t1.kind in intish and t2.kind in intish: return
   error("Operation '" & op & "' requires compatible types, got " & $t1 & " and " & $t2, n)
 
+proc checkArithCompatible(t1, t2: Type; op: string; n: Cursor) =
+  ## Compatibility rule for `add`/`sub` — same as `cmp`/bitwise: two SIZED integers of
+  ## ANY width/signedness add fine, because arkham canonicalizes every integer into a
+  ## full 64-bit register (a narrow load is zero/sign-extended), so the op runs at
+  ## register width and `i64 + u32` (e.g. an `int` index plus a `uint32` hash) is valid.
+  ## A pointer keeps the strict `compatible` rule (ptr+int is handled by callers that
+  ## permit it), so an int-vs-pointer mixup is still caught.
+  if compatible(t1, t2): return
+  const intish = {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.BoolT}
+  if t1.kind in intish and t2.kind in intish: return
+  error("Operation '" & op & "' requires compatible types, got " & $t1 & " and " & $t2, n)
+
 proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
   ## Handle (prepare target ... (call) ...) or (prepare target ... (extcall) ...)
   ## The prepare block sets up a call context for type checking and argument tracking.
@@ -4514,7 +4526,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # Type check: add works on integers and pointers
     checkIntegerArithmetic(dest.typ, "add", start)
     checkIntegerArithmetic(op.typ, "add", start)
-    checkCompatibleTypes(dest.typ, op.typ, "add", start)
+    checkArithCompatible(dest.typ, op.typ, "add", start)  # sized ints of any width (64-bit reg)
 
     if dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
@@ -4546,7 +4558,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # Type check: sub works on integers and pointers
     checkIntegerArithmetic(dest.typ, "sub", start)
     checkIntegerArithmetic(op.typ, "sub", start)
-    checkCompatibleTypes(dest.typ, op.typ, "sub", start)
+    checkArithCompatible(dest.typ, op.typ, "sub", start)  # sized ints of any width (64-bit reg)
 
     if dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
@@ -6152,6 +6164,8 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
   case sym.kind
   of skProc:
     if declTag == ProcD:
+      when defined(arkhamDbgSym):
+        stderr.writeLine "DBG generateSymbol proc: " & sym.name
       pass2Proc(n, ctx)
   of skRodata:
     if declTag == RodataD:
@@ -6311,6 +6325,13 @@ proc setupTls(ctx: var GenContext) =
   # `paramCount()` returned -1 (every `paramStr` was empty).
   x86.emitMov(ctx.buf.data, x86.RDI, x86.MemoryOperand(base: x86.RSP))            # rdi = argc
   x86.emitLea(ctx.buf.data, x86.RSI, x86.MemoryOperand(base: x86.RSP, displacement: 8'i32))  # rsi = &argv[0]
+  # main's 3rd arg (rdx) = the environment block. After argv[0..argc-1] and the NULL
+  # terminator, the kernel lays out `envp` at `&argv[argc+1]`. With rdi=argc and
+  # rsi=&argv[0]: `envp = rsi + 8*(argc+1) = rsi + 8*argc + 8`. (genMainProc stores
+  # this into the `nimEnviron` global; std/envvars + std/posix read it under
+  # `-d:nimNativeIo`, matching how rsi feeds `cmdLine`.)
+  x86.emitLea(ctx.buf.data, x86.RDX, x86.MemoryOperand(base: x86.RSI, index: x86.RDI,
+                                                       scale: 8, displacement: 8'i32, hasIndex: true))  # rdx = &envp[0]
   x86.emitJmp(ctx.buf, LabelId(ctx.entrySym.offset))        # → real entry
 
 proc assemble*(filename, outfile: string; symMap = false; emitObj = false) =

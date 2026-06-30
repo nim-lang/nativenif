@@ -571,7 +571,7 @@ proc emGlobalAddr(g: var CodeGen; dest: Reg; name: string) =
   ## `.bss`/`.data` address). x86-64 has no typed RIP-relative memory operand, so
   ## a global is always accessed by first materializing its address. An importc/
   ## exportc gvar is referenced by its bare C name (cross-module linkage).
-  g.ab.tree LeaX64: (g.emReg dest; g.ab.sym g.prog.gvarAsmName(name))
+  g.ab.tree LeaX64: (g.emReg dest; g.ab.sym g.prog.gvarRefName(name))
 
 proc emTvarAddr(g: var CodeGen; dest: Reg; name: string) =
   ## `dest ← &threadvar` — the FS base block address plus the tvar's FS offset, folded
@@ -1650,6 +1650,7 @@ proc emitStackParamLoadsX64(g: var CodeGen; decl: Cursor) =
   # matches the signature, the caller and the allocator exactly.
   var nms: seq[string] = @[]
   var tns: seq[string] = @[]
+  var tcurs: seq[Cursor] = @[]
   var slots: seq[AsmSlot] = @[]
   block:
     var pc = c
@@ -1664,7 +1665,7 @@ proc emitStackParamLoadsX64(g: var CodeGen; decl: Cursor) =
           tcur = pc
           if pc.kind == Symbol and slotOf(g.prog, pc).kind == AMem: tn = symName(pc)
           while pc.hasMore: skip pc
-        nms.add nm; tns.add tn; slots.add slotOf(g.prog, tcur)
+        nms.add nm; tns.add tn; tcurs.add tcur; slots.add slotOf(g.prog, tcur)
   for i, pl in classifyParamsX64(g.md, slots, g.retIndirect):
     if not pl.onStack: continue
     let nm = nms[i]
@@ -1702,6 +1703,15 @@ proc emitStackParamLoadsX64(g: var CodeGen; decl: Cursor) =
           g.emReg loc.r
           g.ab.tree MemX: (g.ab.reg g.stackArgBaseReg; g.ab.intLit off)
       of NamedStack:                            # spilled stack param: incoming → `(s)` slot
+        # Declare the `(s)` home before filling it — otherwise the store below (and
+        # every later body reference) names an undeclared slot and nifasm rejects it
+        # ("Expected index register or stack variable in mem"). Register-passed
+        # spilled scalar params already do this via `emTypedStackVar` (emitParamMoves);
+        # the stack-passed scalar path was missing it. (A by-ref aggregate's pointer
+        # home is typed/declared elsewhere via `varType`, so only the scalar case
+        # needs the slot decl here.)
+        if not pl.byRef:
+          g.emTypedStackVar(nm, tcurs[i])
         let s = g.pickStagingSealed("a spilled stack-param bridge", loc.typ)
         g.ab.tree MovX64:
           g.emReg s
@@ -4576,12 +4586,18 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo) =
       if g.ra.hasStackVars:
         g.ab.tree SubX64: (g.ab.reg RSP; g.ab.keyword SsizeX)
       if g.retIndirect:
-        # The hidden result pointer arrives in rdi, bound to `paramName(0)` by the
-        # signature. Save it into the callee-saved `indirectReg` (read by name — a raw
-        # `(reg rdi)` use of a bound register is rejected) and kill the binding so the
-        # arg register is free for reuse.
-        g.ab.tree MovX64: (g.emReg g.indirectReg; g.ab.sym paramName(0))
-        g.ab.tree KillX64: g.ab.sym paramName(0)
+        # The hidden result pointer arrives in rdi. Save it into the callee-saved
+        # `indirectReg` for the duration of the body. In the DECLARATIVE path the
+        # signature binds rdi to `paramName(0)`, so it must be read by name (a raw
+        # `(reg rdi)` use of a bound register is rejected) and the binding killed. But a
+        # NON-declarative proc (float/≤16B-aggregate-result param forces an empty
+        # signature) never emits that binding, so there `p0.0` is undefined — read the
+        # raw arg register instead, mirroring how non-declarative params are moved.
+        if isDeclarativeAbi(g.prog, info.decl):
+          g.ab.tree MovX64: (g.emReg g.indirectReg; g.ab.sym paramName(0))
+          g.ab.tree KillX64: g.ab.sym paramName(0)
+        else:
+          g.movReg(g.indirectReg, g.md.intArgRegs[0])
       g.emitParamMoves(info.decl)
       g.emitStackParamLoadsX64(info.decl)               # via stackArgBaseReg, regs now free
       if info.isEntry and g.hasGlobalInits:              # run runtime global inits at startup
