@@ -127,9 +127,12 @@ type
       field*: string         ## the member name
       aggrType*: string      ## the enclosing aggregate's nominal type name
       baseReg*: Reg          ## the base, in priority order: `baseReg != NoReg` ⇒ a
-      baseName*: string      ## pointer to the aggregate; else `baseName.len > 0` ⇒
-      baseLval*: Cursor      ## a stack slot of that name; else `baseLval` is the
-                             ## lvalue subtree whose address is the aggregate
+      baseGlob*: string      ## pointer to the aggregate; else `baseGlob.len > 0` ⇒ a
+      baseName*: string      ## module-level SYMBOL whose address is re-derived into a
+      baseLval*: Cursor      ## transient at each use (the survivor-spill totality path) —
+      baseGlobIsTvar*: bool  ## a thread-local if `baseGlobIsTvar`, else a global; else
+                             ## `baseName` ⇒ a stack slot of that name; else `baseLval`
+                             ## is the lvalue subtree whose address is the aggregate
     of Imm: ival*: int64
 
 template dontCare*: Location =
@@ -179,6 +182,16 @@ proc fieldLocReg*(aggrType, field: string; baseReg: Reg; typ: AsmSlot): Location
   ## param / hidden-result buffer / a nested field's computed address).
   Location(kind: Field, aggrType: aggrType, field: field, baseReg: baseReg,
            baseName: "", typ: typ)
+proc fieldLocGlob*(aggrType, field, globName: string; typ: AsmSlot;
+                   isTvar = false): Location {.inline.} =
+  ## Field `field` of a module-level aggregate `globName` (a global, or a thread-local
+  ## if `isTvar`), whose address is RE-DERIVED into a fresh transient at each field store
+  ## (`emFieldOperand`/`emFieldAddr`). Used when the allocator's address survivor spilled
+  ## to a slot (`reserveHeldScratch` totality backstop): the address is re-derivable
+  ## (a link-time global, or FS-base+offset tvar), so recomputing it per use needs no
+  ## register held across the (possibly call-containing) field value evaluation.
+  Location(kind: Field, aggrType: aggrType, field: field, baseReg: NoReg,
+           baseGlob: globName, baseGlobIsTvar: isTvar, baseName: "", typ: typ)
 proc fieldLocLval*(aggrType, field: string; baseLval: Cursor; typ: AsmSlot): Location {.inline.} =
   ## Field `field` of an aggregate addressed by the lvalue subtree `baseLval` (the
   ## genConstrIntoLval2 base — its embedded temps must be pre-materialized).

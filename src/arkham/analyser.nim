@@ -184,7 +184,15 @@ proc analyse(c: var Context; n: var Cursor) =
       # sibling `(stmts)` has closed, keeps it live until after that construct (a
       # single, post-dominating free point). `frameIdx` indexes the variable's
       # *scope* frame (not a `(stmts)` frame), so it is always a live frame here.
-      e.freeAfter = max(e.freeAfter, c.stmtEnd[e.frameIdx])
+      # `frameIdx` is the var's declaring scope frame. Usually it is still open, but a
+      # desugared loop can declare a local inside the loop's `(scope)` (a pushed frame)
+      # and still reference it after the scope closes — at the loop's exit label in the
+      # ENCLOSING frame (e.g. a `for`-cursor used in the loop's continuation). The var
+      # has escaped its lexical scope, so its live range extends into the outer frame;
+      # clamp to the outermost still-open frame so we extend liveness (never free early)
+      # rather than index a popped frame.
+      let fi = min(e.frameIdx, c.stmtEnd.high)
+      e.freeAfter = max(e.freeAfter, c.stmtEnd[fi])
       if (c.inAddr + c.inArrayIndex) > 0:
         # arrays / address-taken locals cannot live in a register
         e.props.incl AddrTaken

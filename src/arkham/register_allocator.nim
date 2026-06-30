@@ -38,6 +38,13 @@ type
     ## pure consumer and the plan/replay seam goes away.
     scratch*: seq[Reg]                ## extra GPRs reserved for this op (idiv RDX, a
                                       ## non-pow2 stride temp, an address scratch…)
+    heldSlot*: seq[string]            ## parallel to `scratch`: when a survivor scratch
+                                      ## could not get a callee-saved reg (`reserveHeld
+                                      ## Scratch` totality backstop), `scratch[i]` is
+                                      ## `NoReg` and this names its spill slot; the
+                                      ## emitter re-derives the address into a transient
+                                      ## at use (see `heldScratchReg`). "" ⇒ `scratch[i]`
+                                      ## is a real register.
     fscratch*: seq[FReg]              ## extra SIMD scratch reserved for this op
     swapped*: bool                    ## operands evaluated in swapped (Sethi–Ullman) order
     foldB*: bool                      ## operand B stays a folded memory operand (no load)
@@ -59,6 +66,10 @@ type
     usedCalleeF*: set[FReg]           ## callee-saved SIMD regs (v8–v15) to save in prologue
     frameSize*: int                   ## bytes of stack frame for spilled slots
     hasStackVars*: bool               ## proc has nifasm-managed `(s)` aggregate vars
+    hasStackParams*: bool             ## proc receives ≥1 parameter on the stack — the
+                                      ## allocator reserved a callee-saved reg for the
+                                      ## emitter's `stackArgBaseReg` (single source of
+                                      ## truth; the emitter must NOT re-classify)
     spillTemps*: seq[tuple[name: string; typ: AsmSlot; isFloat: bool]]
                                       ## value-core totality: `etmp`/`ftmp` slots the
                                       ## allocator synthesized when the register pool
@@ -309,21 +320,44 @@ proc reserveTmp(b: var Builder; slot: AsmSlot): Location =
 proc releaseTmp(b: var Builder; loc: Location) {.inline.} =
   if loc.kind == InReg and loc.isTemp: b.giveBack loc.r
 
-proc reserveHeldScratch(b: var Builder; what: string): Location =
+proc heldSpillSlot(b: var Builder): Location =
+  ## A fresh callee-saved-safe spill slot for a survivor scratch (the totality backstop
+  ## of `reserveHeldScratch`). Like `reserveTmp`'s `etmp`, but a survivor home: its value
+  ## (a re-derivable address) lives here across a call and the emitter re-derives it.
+  let nm = "held" & $b.tmpSpills & ".0"; inc b.tmpSpills
+  b.ra.hasStackVars = true
+  b.ra.spillTemps.add (name: nm, typ: AsmSlot(cls: AInt, size: 8, align: 8), isFloat: false)
+  namedStackLoc(nm, ScalarSlot, isTemp = true)
+
+proc reserveHeldScratch(b: var Builder; what: string; canSpill = false): Location =
   ## A SURVIVOR scratch: a register that must outlive a call and/or stay off the R11
   ## staging bridge (a &global / aggregate-arg address marshalled THROUGH the bridge,
   ## or held across a ≤16B-result call) — so it cannot come from caller-saved emit-time
   ## staging (the stride/aggr-copy answer); it must be a CALLEE-SAVED pool register.
   ## Take a free callee-saved reg, else UNDO a local's optimistic assignment: demote the
   ## coldest callee-saved-homed local to memory and take its register (the same local→
-  ## memory undo as `trySteal`, sound by the single-home rewrite). Only a genuine
-  ## no-callee-saved-local-left case is fatal.
+  ## memory undo as `trySteal`, sound by the single-home rewrite).
+  ##
+  ## TOTALITY (the by-construction guarantee): if the callee-saved pool is genuinely
+  ## exhausted — no free reg AND every callee-saved reg holds another live survivor, so
+  ## there is no local to demote — and the CALLER opted in with `canSpill`, this returns a
+  ## SPILL SLOT (`NamedStack`, isTemp) instead of failing. The survivor's value lives in
+  ## memory across the call (memory is call-clobber-safe by definition) and the emitter
+  ## re-derives it into a transient at each use (every survivor here holds a re-derivable
+  ## address — a `&global`/`&slot`), mirroring `reserveTmp`'s `etmp` fallback. `canSpill`
+  ## is opt-in so only consumers that actually implement the slot reload (`heldRef` +
+  ## emit-side re-derive, e.g. the aggregate-global-store) ever receive a slot; the rest
+  ## (which cannot exhaust the pool, since they hold no scratch across a call) keep the
+  ## loud assert as a not-yet-wired marker rather than silently mis-reading `NoReg`.
+  when defined(arkhamForceSpillAggrGlob):
+    if canSpill: return b.heldSpillSlot()   # TEST-ONLY: exercise the re-derive emit path
   var r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
   if r != NoReg:
     b.ra.usedCallee.incl r
     return regLoc(r, ScalarSlot, isTemp = true)
   let victim = b.coldestVictim(high(int), calleeOnly = true, wantFloat = false)
   if victim.len == 0:
+    if canSpill: return b.heldSpillSlot()   # totality backstop (wired consumer)
     raiseAssert "arkham: out of registers for " & what & " (nothing to spill)"
   r = b.ra.locs[b.ra.symPos[victim]].r
   b.demoteToStack(victim)
@@ -354,13 +388,12 @@ proc reserveFTmp(b: var Builder; slot: AsmSlot): Location =
 proc releaseFTmp(b: var Builder; loc: Location) {.inline.} =
   if loc.kind == InFReg and loc.isTemp: b.giveBackF loc.f
 
-proc auxScratch(b: var Builder; pos: int; what: string) =
-  ## Reserve a one-shot scratch GPR for the op at `pos` and record it in `aux`
-  ## for the emitter. Single transient use (the emitter brackets it with its own
-  ## bind/kill), so it is released right away — siblings reuse it in turn.
-  let t = b.reserveHeldScratch(what)
-  b.releaseTmp(t)
-  b.ra.aux[pos] = ExprAux(scratch: @[t.r])
+proc heldRef(loc: Location): (Reg, string) {.inline.} =
+  ## Split a `reserveHeldScratch` result into the `(scratch reg, heldSlot name)` pair
+  ## the emitter's `aux` carries: a real callee-saved reg → `(reg, "")`; the totality
+  ## spill-slot backstop → `(NoReg, slotName)`. The emitter re-derives the address into
+  ## a transient when the slot form is present (see `heldScratchReg`).
+  if loc.kind == InReg: (loc.r, "") else: (NoReg, loc.name)
 
 proc symLoc(b: var Builder; name: string): Location
 
@@ -700,6 +733,62 @@ proc allocFValue(b: var Builder; n: var Cursor; dest: var Location) =
   else:
     raiseAssert "arkham: float value kind not supported: " & $n.kind
 
+type
+  ParamPlace* = object
+    ## Where one SysV-AMD64 parameter / argument is passed. Produced by
+    ## `classifyParamsX64`; consumed by the signature, prologue, callee stack-loads,
+    ## the call allocator and the call-site marshaller so they cannot disagree.
+    ord*: int            ## param NAME ordinal (decoupled from the register index)
+    onStack*: bool       ## passed on the stack rather than in registers
+    isFloat*: bool       ## a float (xmm if register-passed)
+    isAgg*: bool         ## an aggregate (AMem slot)
+    byRef*: bool         ## aggregate larger than the threshold → a single pointer
+    words*: int          ## eightbytes occupied (1 for a scalar / pointer / float)
+    gpFirst*: int        ## register-passed int/aggregate: first GPR index
+                         ## (registers = intArgRegs[gpFirst ..< gpFirst+words])
+    fpIndex*: int        ## register-passed float: xmm index
+    byteOff*: int        ## stack-passed: byte offset within the stack-argument area
+
+proc classifyParamsX64*(md: MachineDesc; slots: openArray[AsmSlot];
+                        retByRef: bool): seq[ParamPlace] =
+  ## THE one SysV-AMD64 parameter classifier (chibicc's `assign_lvar_offsets`):
+  ## walk params/args left to right, assigning each to argument registers or the
+  ## stack. An aggregate that does not fit in the REMAINING integer arg registers
+  ## goes ENTIRELY on the stack and consumes NO register (so a later, smaller arg
+  ## can still take a free one). `retByRef` reserves rdi/ord 0 for the hidden
+  ## >16B-return pointer. Stack offsets round each slot up to 8 bytes, matching
+  ## nifasm's `alignedSize` (so the callee's load offset == the caller's `(arg)`).
+  result = @[]
+  var gp = if retByRef: 1 else: 0
+  var fp = 0
+  var stackOff = 0
+  var ord = if retByRef: 1 else: 0
+  for s in slots:
+    var pp = ParamPlace(ord: ord)
+    if s.kind == AMem:
+      pp.isAgg = true
+      pp.byRef = s.size > md.aggrByRefThreshold
+      pp.words = if pp.byRef: 1 else: (s.size + 7) div 8
+      if gp + pp.words <= md.intArgRegs.len:
+        pp.gpFirst = gp; gp += pp.words
+      else:
+        pp.onStack = true; pp.byteOff = stackOff
+        stackOff += (if pp.byRef: 8 else: (s.size + 7) and not 7)
+    elif s.kind == AFloat:
+      pp.isFloat = true; pp.words = 1
+      if fp < md.floatArgRegs.len:
+        pp.fpIndex = fp; inc fp
+      else:
+        pp.onStack = true; pp.byteOff = stackOff; stackOff += 8
+    else:                               # scalar int / pointer
+      pp.words = 1
+      if gp < md.intArgRegs.len:
+        pp.gpFirst = gp; inc gp
+      else:
+        pp.onStack = true; pp.byteOff = stackOff; stackOff += 8
+    result.add pp
+    inc ord
+
 proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = false) =
   ## A call: each scalar/pointer argument is allocated into its ABI integer argument
   ## register (rdi…r9), each float argument into its SIMD argument register (xmm0–7);
@@ -727,36 +816,57 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
       # is `allocStore`'s job, not the call's.
       let argSlot = b.tc.exprSlot(n)
       if argSlot.cls == AMem:
-        # An aggregate argument: by-value ≤threshold consumes ceil(size/8) integer arg
-        # registers (the emitter marshals its words); by-reference (>threshold) consumes
-        # one (a pointer). A symbol is read in place; a constructor is built into a
-        # synthetic temp through the one general store path.
-        let words = if argSlot.size <= b.md.aggrByRefThreshold: (argSlot.size + 7) div 8 else: 1
-        if intIdx + words > b.md.intArgRegs.len:
-          raiseAssert "arkham: aggregate call argument exceeds the register arguments"
+        # An aggregate argument: a ≤threshold by-value one consumes ceil(size/8) integer
+        # arg registers, a >threshold by-reference one a single pointer register — UNLESS
+        # it doesn't fit in the remaining arg registers, in which case it is passed on the
+        # stack (classifyParamsX64's rule). A stack-passed aggregate is marshalled through
+        # `gprWords` reserved callee-saved scratch GPRs (one per eightbyte) that the
+        # emitter then writes to the outgoing stack slots; reserve them HELD first so the
+        # value build routes around them, stash them in aux, and DON'T advance `intIdx`.
+        let argPos = b.posOf(n)
+        let byRef = argSlot.size > b.md.aggrByRefThreshold
+        let gprWords = if byRef: 1 else: (argSlot.size + 7) div 8
+        let fits = intIdx + gprWords <= b.md.intArgRegs.len
+        var dst: seq[Location] = @[]
+        if not fits:
+          # A stack-passed arg means this proc reserves an outgoing-argument area in its
+          # frame (the fixed-frame model — nifasm's scanStackArgArea), so it needs the
+          # frame `sub sp`. Flag it like a stack local.
+          b.ra.hasStackVars = true
+          for _ in 0 ..< gprWords: dst.add b.reserveHeldScratch("a stack aggregate-arg word")
+        var addrReg = NoReg
+        var hasAddr = false
         if n.kind == Symbol:
           skip n                                # no per-value allocation — emitter reads the slot
         elif n.kind == TagLit and n.exprKind in {DotC, DerefC, AtC, PatC}:
           # An aggregate LVALUE arg: the emitter marshals STRAIGHT from its address (no
-          # copy temp). Reserve the address scratch FIRST (held), so it can't alias one of
-          # the lvalue's embedded base/index regs (which `aggrAddrInto` materializes before
-          # the `lea` writes the address scratch).
-          let addrT = b.reserveHeldScratch("an aggregate-arg address")
+          # copy temp). Reserve the address scratch (held) so it can't alias one of the
+          # lvalue's embedded base/index regs (`aggrAddrInto` writes it after them).
+          # `canSpill`: under genuine pressure this returns a slot (NoReg) — the address is
+          # re-derivable, so the emitter re-`lea`s it into a transient (see `aggrArgAddr`).
+          let addrT = b.reserveHeldScratch("an aggregate-arg address", canSpill = true)
           let rc = n
           allocLvalue2(b, n)                    # advances n past the lvalue (embedded regs)
           releaseLvalTemps(b, rc)
           b.releaseTmp(addrT)
-          # APPEND the address scratch (read as the last element by the emitter): a non-SIB
-          # `(at …)`/`(pat …)` arg already stored its stride scratch at `aux[pos].scratch[0]`
-          # (same position — `posOf(rc)` IS the at's position), which must not be clobbered.
-          if b.ra.aux.hasKey(b.posOf(rc)):
-            b.ra.aux[b.posOf(rc)].scratch.add addrT.r
-          else:
-            b.ra.aux[b.posOf(rc)] = ExprAux(scratch: @[addrT.r])
+          let (ar, _) = heldRef(addrT); addrReg = ar  # NoReg ⇒ spilled (emitter re-derives)
+          hasAddr = true
         else:                                   # oconstr/aconstr: build into a synthetic aggregate temp
           b.ra.hasStackVars = true
-          allocStore(b, n, namedStackLoc("", argSlot), b.posOf(n))  # advances n
-        intIdx += words
+          allocStore(b, n, namedStackLoc("", argSlot), argPos)  # advances n
+        # Stash the per-arg scratch at `argPos` (the emitter reads it there): the stack
+        # marshalling words FIRST, then the lvalue address LAST (`scratch[^1]`). A non-SIB
+        # `(at …)`/`(pat …)` already left its stride scratch at `scratch[0]`, untouched.
+        var sc: seq[Reg] = @[]
+        for d in dst: sc.add d.r
+        if hasAddr: sc.add addrReg              # lvalue address LAST (NoReg ⇒ spilled); see `aggrArgAddr`
+        if sc.len > 0:
+          if b.ra.aux.hasKey(argPos):
+            for r in sc: b.ra.aux[argPos].scratch.add r
+          else:
+            b.ra.aux[argPos] = ExprAux(scratch: sc)
+        for d in dst: b.releaseTmp(d)           # held only to keep the value build off them
+        if fits: intIdx += gprWords
       elif argSlot.cls == AFloat:               # float argument → xmm{fIdx}
         if fIdx >= b.md.floatArgRegs.len:
           raiseAssert "arkham: more than 8 float call arguments (stack-passed TODO)"
@@ -771,6 +881,9 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
         # 7th+ integer arg → caller stack. Compute into a scratch register; the
         # emitter stores it to the outgoing slot `(mem (rsp) (arg pN))`. The temp is
         # dead after that store, so release it (each stack arg reuses it in turn).
+        # A stack-passed arg means this proc reserves an outgoing-argument area in its
+        # frame, so it needs the frame `sub sp` (see the fixed-frame note above).
+        b.ra.hasStackVars = true
         var ad = needsReg(ScalarSlot)
         allocValue(b, n, ad)
         b.releaseTmp(ad)
@@ -959,6 +1072,13 @@ proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = 
         skip n                               # depth
         allocLvalue2(b, n, globBase, isStore)  # the inner lvalue (its embedded values)
         while n.hasMore: skip n
+    of AconstrC, OconstrC:
+      # A constructor used as an lvalue base — e.g. `[a, b][i]` (`(at (aconstr …) idx)`).
+      # Materialize it into a synthetic stack temp (`aggtmp<pos>`, built by the emitter),
+      # then index/field-access that temp. Allocate the constructor's element/field VALUES
+      # like a store into a synthetic aggregate slot (mirrors the aggregate call-arg path).
+      b.ra.hasStackVars = true
+      allocStore(b, n, namedStackLoc("", b.tc.exprSlot(n)), b.posOf(n))  # advances n
     else:
       raiseAssert "arkham: computed lvalue base not supported: " & $n.exprKind
   else:
@@ -1437,7 +1557,7 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
         var d = dontCare
         allocCall(b, n, d, hiddenPtr = true)
       else:
-        let addrT = b.reserveHeldScratch("a global address")  # &g address (held across rhs)
+        let addrT = b.reserveHeldScratch("an aggregate global &g", canSpill = true)  # &g held across rhs
         if n.kind == TagLit and n.exprKind == OconstrC:
           allocConstr(b, n)                              # build field-by-field through &g
         elif n.kind == TagLit and n.exprKind == AconstrC:
@@ -1448,12 +1568,13 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
         else:
           raiseAssert "arkham: aggregate global store rhs not supported: " & $n.exprKind
         b.releaseTmp(addrT)
-        b.ra.aux[auxPos] = ExprAux(scratch: @[addrT.r])
+        let (sreg, sslot) = heldRef(addrT)              # reg, or a spill-slot name (totality backstop)
+        b.ra.aux[auxPos] = ExprAux(scratch: @[sreg], heldSlot: @[sslot])
     else:
-      let addrT = b.reserveHeldScratch("a global address")  # &g address (Tvar ignores it)
+      # No survivor scratch for the &g address: the emitter re-`lea`s it into a transient
+      # staging register right before the store (no call between the lea and the store),
+      # so it never needs to survive the rhs in a callee-saved register.
       b.allocSingleUse(n)
-      b.releaseTmp(addrT)
-      b.ra.aux[auxPos] = ExprAux(scratch: @[addrT.r])
   elif dst.kind == InFReg:                               # float register home: dest-passing
     var d = dst
     allocFValue(b, n, d)
@@ -1575,21 +1696,19 @@ proc walk(b: var Builder; n: var Cursor) =
           if b.retFloatBits > 0:                         # float result → xmm0 (general store)
             allocStore(b, n, fregLoc(b.md.floatArgRegs[0], floatSlot(b.retFloatBits)), retPos)
           elif b.retAggr:
-            # An aggregate return marshals OUT (≤16B → structToRegs; >16B → through the
-            # hidden result pointer, needing one word-transfer scratch) — the inverse of a
-            # store-into-destination, so it stays here rather than in `allocStore`.
+            # An aggregate return marshals OUT (≤16B → structToRegs; >16B → copy through
+            # the hidden result pointer) — the inverse of a store-into-destination, so it
+            # stays here rather than in `allocStore`. No scratch is reserved here: the
+            # marshalling runs at the `ret`, crosses no call, and draws its transient
+            # registers from the emit-time staging pool (see `copyStructThroughPtr2`).
             if n.kind == Symbol:                         # a named local aggregate
-              if b.retIndirect:
-                b.auxScratch(retPos, "an aggregate return")
               skip n
             else:
               # An inline aggregate VALUE returned by value (`(ret (oconstr …))` /
               # memory lvalue): allocate its field-value temps like a store into a
-              # synthetic aggregate slot, plus the >16B word-transfer scratch.
+              # synthetic aggregate slot.
               b.ra.hasStackVars = true
               allocStore(b, n, namedStackLoc("", b.retAggrSlot), retPos)
-              if b.retIndirect:
-                b.auxScratch(retPos, "an aggregate return")
           else:                                          # scalar/pointer result → ret reg
             allocStore(b, n, regLoc(b.md.intRetReg, ScalarSlot), retPos)
         else:
@@ -1715,20 +1834,34 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
         let name = symName(params); inc params
         skip params                          # pragmas
         let slot = slotOf(b.prog[], params); skip params  # type (resolves named)
-        # Classify an aggregate param: ≤16B by-value (a `(s)` stack home filled
-        # from its GPR(s)) vs >16B by-reference (a pointer, like a scalar).
+        # Classify an aggregate param (matching `classifyParamsX64` / `emitParamMoves`):
+        #  * ≤16B by-value that FITS the remaining arg registers → REGISTER-passed
+        #    (`aggrSmall`): a `(s)` stack home filled from its GPR word(s), consuming
+        #    `aggrWords` arg registers.
+        #  * ≤16B by-value that does NOT fit → STACK-passed (`aggrStack`): the bytes arrive
+        #    in the incoming stack-arg area (copied into the `(s)` home by
+        #    `emitStackParamLoadsX64`), consuming NO arg register — the SysV skip rule, so a
+        #    later smaller param may still take a free GPR. Same home shape as `aggrSmall`.
+        #  * >16B → by-REFERENCE (`aggrByRef`): a pointer (in a reg, or on the stack if none
+        #    is free), like a scalar.
         var aggrSmall = false
+        var aggrStack = false
         var aggrByRef = false
         var aggrWords = 0
         if slot.kind == AMem:
           let sz = slot.size                  # filled by slotOf (named or inline)
-          if sz >= 1 and sz <= b.md.aggrByRefThreshold: (aggrSmall = true; aggrWords = (sz + 7) div 8)
-          else: aggrByRef = true
-        if aggrSmall:
-          # (No early `continue`/`return`: that skips the `into` epilogue.)
+          if sz >= 1 and sz <= b.md.aggrByRefThreshold:
+            aggrWords = (sz + 7) div 8
+            if intIdx + aggrWords <= b.md.intArgRegs.len: aggrSmall = true   # register-passed
+            else: aggrStack = true                                          # stack-passed (0 GPRs)
+          else:
+            aggrByRef = true
+        if aggrSmall or aggrStack:
+          # (No early `continue`/`return`: that skips the `into` epilogue.) Both home the
+          # aggregate in its own `(s)` slot; only a register-passed one consumes GPRs.
           b.record(pos, name, namedStackLoc(name, slot))
           b.ra.hasStackVars = true
-          intIdx += aggrWords
+          if aggrSmall: intIdx += aggrWords
         else:
           # `effSlot` is the in-register value: the scalar itself, or (by-ref) a
           # pointer to the aggregate copy.
@@ -1786,6 +1919,18 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
                   # Evictable in favour of a later stack param (a by-ref aggregate's
                   # slot would need its aggregate type, not the pointer — skip those).
                   spillableRegParams.add (pos: pos, name: name, r: r, effSlot: effSlot)
+              elif aggrByRef and spillableRegParams.len > 0:
+                # No free callee-saved register for the by-ref POINTER. A spilled
+                # pointer (OnStack) has no consistent representation across the
+                # prologue / body field-access / call sites, so instead evict a colder
+                # scalar register param to its stack slot (emitParamMoves fills it from
+                # the incoming arg register) and reuse its register — the pointer stays
+                # InReg, which every consumer already handles.
+                let victim = spillableRegParams.pop()
+                b.record(victim.pos, victim.name,
+                         namedStackLoc(victim.name, victim.effSlot))
+                b.ra.hasStackVars = true
+                loc = regLoc(victim.r, effSlot)   # victim.r already in usedCallee
               else:
                 loc = b.spill(effSlot)
             else:
@@ -1800,18 +1945,24 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
             if AddrTaken in props:
               raiseAssert "arkham v1: address-taken >8th parameter"
             var r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
-            if r == NoReg:
+            if r == NoReg and spillableRegParams.len > 0:
               # No free callee-saved register: evict an earlier scalar register
               # param to its stack slot and reuse its register for this stack param.
-              if spillableRegParams.len == 0:
-                raiseAssert "arkham v1: out of callee-saved registers for >8th parameter"
               let victim = spillableRegParams.pop()
               b.record(victim.pos, victim.name,
                        namedStackLoc(victim.name, victim.effSlot))
               b.ra.hasStackVars = true
               r = victim.r                        # already in usedCallee
-            b.ra.usedCallee.incl r
-            loc = regLoc(r, effSlot)
+            if r == NoReg:
+              # Totality: no callee-saved reg and nothing colder to evict — home this
+              # stack param in its OWN `(s)` slot. The prologue loads it from the incoming
+              # arg area into the slot through a staging bridge (`emitStackParamLoadsX64`),
+              # so no register is held; correct by construction, never a hard fail.
+              loc = namedStackLoc(name, effSlot)
+              b.ra.hasStackVars = true
+            else:
+              b.ra.usedCallee.incl r
+              loc = regLoc(r, effSlot)
             inc intIdx
           if loc.kind == OnStack and slot.kind != AMem:
             # An address-taken scalar param (integer or float): a nifasm `(s)`
@@ -1901,6 +2052,33 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
           b.retAggr = true
           b.retAggrSlot = rtSlot
           if rtSlot.size > md.aggrByRefThreshold: b.retIndirect = true
+    # If any parameter is stack-passed, the emitter needs a callee-saved register for the
+    # incoming-args base (`stackArgBaseReg`) that survives the frame `sub`s. It is picked
+    # at emit time from the callee-saved regs the body did NOT use — so reserve one here,
+    # up front, or a body that uses every callee-saved register would leave none and the
+    # base would be `NoReg` (a `(mem (<noreg>) …)` stack-param load). We only need to
+    # GUARANTEE one stays free; which one is the emitter's choice (any unused callee-saved).
+    block:
+      var pc = n                             # at the params slot
+      var slots: seq[AsmSlot] = @[]
+      if pc.kind == TagLit:
+        pc.into:
+          while pc.hasMore:
+            pc.into:
+              inc pc; skip pc                # name, pragmas
+              slots.add slotOf(b.prog[], pc)
+              while pc.hasMore: skip pc
+      var anyStack = false
+      for pl in classifyParamsX64(b.md, slots, b.retIndirect):
+        if pl.onStack: (anyStack = true; break)
+      b.ra.hasStackParams = anyStack           # single source of truth for the emitter
+      if anyStack:
+        # Reserve a callee-saved reg the body cannot use, for the emitter's
+        # `stackArgBaseReg`. Skip any SEALED reg (e.g. `RBX` presealed for a >16B-return
+        # hidden pointer) — excluding that one reserves nothing extra, leaving the base
+        # `NoReg` under full callee-saved pressure.
+        for r in b.md.intCalleeSaved:
+          if r in b.freeCallee and r notin b.ra.sealed: (b.freeCallee.excl r; break)
     allocParams(b, n, an.hasCall)            # advances n past params → return type
     skip n                                    # return type
     skip n                                    # pragmas

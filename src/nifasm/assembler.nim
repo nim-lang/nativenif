@@ -337,6 +337,10 @@ type
                         # merged across `ite` branches.
     slots: SlotManager
     ssizePatches: seq[int]
+    reservedArgArea: int          # AArch64 fixed-frame: bytes reserved at the frame bottom
+                                  # for the largest outgoing stack-argument area (see
+                                  # scanStackArgArea). Locals sit above it; the caller writes
+                                  # `(mem (sp)(arg pN))` with no per-call `sub sp`.
     csizePatches: seq[(int, int)] # (position, callStackDepth) for csize patches
     gvarSites: seq[(int, Symbol)] # (adrp position in .text, gvar symbol) for adrp+add patching
     tlvSites: seq[(int, Symbol)]  # (adrp position in .text, tvar symbol) for TLV descriptor adrp+add patching (arm64/macOS)
@@ -1658,7 +1662,9 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
         error("Unknown argument: " & argName, n)
       if paramPtr.typ.isOnStack:
         # Stack argument used as an offset (e.g. inside (mem (sp) (arg name))).
-        # The offset is the running byte position among the stack-passed params.
+        # The base offset is the running byte position among the stack-passed
+        # params; the optional word index `k` selects the k-th eightbyte (8 bytes)
+        # of a multi-word stack aggregate so it can be marshalled/read word-by-word.
         var offset = 0
         for p in ctx.callContext.typ.params:
           if p.typ.isOnStack:
@@ -1667,7 +1673,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
             offset += slots.alignedSize(p.typ)
         result.kind = okImm
         result.argName = argName
-        result.immVal = int64(offset)
+        result.immVal = int64(offset + wordIdx * 8)
         result.typ = paramPtr.typ
       else:
         if wordIdx >= paramPtr.regs.len:
@@ -1918,6 +1924,15 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
   # Compute stack argument size (only for internal procs)
   if ctx.callContext.state == CallContextState.NormalCall:
     ctx.callContext.stackArgSize = computeStackArgSize(ctx.callContext.typ)
+    # Fixed-frame soundness (AArch64): this call's outgoing stack args occupy
+    # `[sp, sp+stackArgSize)`, the region `scanStackArgArea` reserved at the frame bottom.
+    # If the pre-scan didn't see this target (an indirect call through a not-yet-declared
+    # local fn-ptr), the reservation may be too small — fail loudly rather than let the
+    # args overwrite a local `(s)` slot.
+    if ctx.callContext.stackArgSize > ctx.reservedArgArea:
+      error("outgoing stack-argument area (" & $ctx.callContext.stackArgSize &
+            " bytes) exceeds the reserved frame area (" & $ctx.reservedArgArea &
+            " bytes); call target not visible to the frame pre-scan", hdr)
 
   # Consume the prepare node: skip the (already-read) target, then generate each
   # instruction. `into` bounds the loop to this node (no ParRi sentinel exists).
@@ -2974,6 +2989,26 @@ proc collectLabels(n: var Cursor; ctx: var GenContext; scope: Scope) =
   else:
     inc n
 
+proc scanStackArgArea(n: var Cursor; ctx: var GenContext; scope: Scope; acc: var int) =
+  ## Pre-scan a proc body for the largest outgoing stack-argument area any `(prepare …)`
+  ## needs (AArch64 fixed-frame model). The result seeds the slot allocator so the area is
+  ## reserved ONCE at the frame bottom: local `(s)` slots then sit ABOVE it and `(ssize)`
+  ## includes it, so the caller writes `(mem (sp) (arg pN))` with no per-call `sub sp` and
+  ## SP stays constant between prologue and epilogue. A target that doesn't resolve here
+  ## (an indirect call through a not-yet-declared local fn-ptr) contributes 0; `genPrepareA64`
+  ## guards against an under-reservation at emit time.
+  if n.kind == TagLit:
+    if n.tag == PrepareTagId:
+      var t = n; inc t                           # the call target symbol
+      if t.kind == Symbol:
+        let s = lookupWithAutoImport(ctx, scope, getSym(t), t)
+        if s != nil and s.typ != nil and s.typ.kind == ProcT:
+          acc = max(acc, computeStackArgSize(s.typ))
+    loopInto n:
+      scanStackArgArea(n, ctx, scope, acc)
+  else:
+    inc n
+
 proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   let oldScope = ctx.scope
   ctx.scope = newScope(oldScope)
@@ -3033,6 +3068,22 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
           ctx.regBindings[tagToRegister(param.reg, n)] = param.name
 
     skip n   # past the proc name
+
+    # AArch64 fixed-frame model: reserve the largest outgoing stack-argument area any
+    # call in this proc needs at the BOTTOM of the frame BEFORE any local `(s)` slot is
+    # allocated, so locals land above it and `(ssize)` covers it. The caller then passes
+    # stack args by writing `(mem (sp) (arg pN))` into that region with NO per-call
+    # `sub sp` — SP is constant from prologue to epilogue, so a stack-passed aggregate
+    # (which can't sit in a register across a shift) is addressed at a stable offset.
+    ctx.reservedArgArea = 0
+    if isA64Proc:
+      var scanArgs = n
+      var maxArgs = 0
+      while scanArgs.hasMore:
+        scanStackArgArea(scanArgs, ctx, ctx.scope, maxArgs)
+      ctx.reservedArgArea = maxArgs
+      ctx.slots.stackSize = max(ctx.slots.stackSize, maxArgs)
+
     # Emit the body — the `(stmts …)` child — and skip the signature sections
     # (already consumed in pass1). The `while hasMore` is bounded by the proc's
     # `into`, so it stops at the proc end naturally.
@@ -3492,8 +3543,11 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
         error("Unknown argument: " & argName, argTok)
 
       if paramPtr.typ.isOnStack:
-        # Stack argument - return the offset as an immediate
-        # The offset is computed from the stack parameter declarations
+        # Stack argument - return its byte offset as an immediate. The base offset is
+        # the running byte position among the stack-passed params; the optional word
+        # index `k` selects the k-th eightbyte of a multi-word stack aggregate (each
+        # word is 8 bytes), so a by-value struct that spilled to the stack can be
+        # marshalled/read one word at a time the same way a register-passed one is.
         var offset = 0
         for p in ctx.callContext.typ.params:
           if p.typ.isOnStack:
@@ -3502,7 +3556,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
             offset += slots.alignedSize(p.typ)
         result.kind = okImm
         result.argName = argName
-        result.immVal = int64(offset)
+        result.immVal = int64(offset + wordIdx * 8)
         result.typ = paramPtr.typ
       else:
         # Register argument - return the (word-`wordIdx`) register
@@ -3806,6 +3860,18 @@ proc checkBitwiseCompatible(t1, t2: Type; op: string; n: Cursor) =
   ## SIZED integers of ANY width/signedness combine fine: x86 bitwise ops run at
   ## register width and arkham canonicalizes integers in 64-bit registers, so e.g.
   ## `i64 and u32` is valid. Non-integer kinds (pointers) stay strict via `compatible`.
+  if compatible(t1, t2): return
+  const intish = {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.BoolT}
+  if t1.kind in intish and t2.kind in intish: return
+  error("Operation '" & op & "' requires compatible types, got " & $t1 & " and " & $t2, n)
+
+proc checkArithCompatible(t1, t2: Type; op: string; n: Cursor) =
+  ## Compatibility rule for `add`/`sub` — same as `cmp`/bitwise: two SIZED integers of
+  ## ANY width/signedness add fine, because arkham canonicalizes every integer into a
+  ## full 64-bit register (a narrow load is zero/sign-extended), so the op runs at
+  ## register width and `i64 + u32` (e.g. an `int` index plus a `uint32` hash) is valid.
+  ## A pointer keeps the strict `compatible` rule (ptr+int is handled by callers that
+  ## permit it), so an int-vs-pointer mixup is still caught.
   if compatible(t1, t2): return
   const intish = {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.BoolT}
   if t1.kind in intish and t2.kind in intish: return
@@ -4460,7 +4526,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # Type check: add works on integers and pointers
     checkIntegerArithmetic(dest.typ, "add", start)
     checkIntegerArithmetic(op.typ, "add", start)
-    checkCompatibleTypes(dest.typ, op.typ, "add", start)
+    checkArithCompatible(dest.typ, op.typ, "add", start)  # sized ints of any width (64-bit reg)
 
     if dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
@@ -4492,7 +4558,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # Type check: sub works on integers and pointers
     checkIntegerArithmetic(dest.typ, "sub", start)
     checkIntegerArithmetic(op.typ, "sub", start)
-    checkCompatibleTypes(dest.typ, op.typ, "sub", start)
+    checkArithCompatible(dest.typ, op.typ, "sub", start)  # sized ints of any width (64-bit reg)
 
     if dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
@@ -6098,6 +6164,8 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
   case sym.kind
   of skProc:
     if declTag == ProcD:
+      when defined(arkhamDbgSym):
+        stderr.writeLine "DBG generateSymbol proc: " & sym.name
       pass2Proc(n, ctx)
   of skRodata:
     if declTag == RodataD:
@@ -6257,6 +6325,13 @@ proc setupTls(ctx: var GenContext) =
   # `paramCount()` returned -1 (every `paramStr` was empty).
   x86.emitMov(ctx.buf.data, x86.RDI, x86.MemoryOperand(base: x86.RSP))            # rdi = argc
   x86.emitLea(ctx.buf.data, x86.RSI, x86.MemoryOperand(base: x86.RSP, displacement: 8'i32))  # rsi = &argv[0]
+  # main's 3rd arg (rdx) = the environment block. After argv[0..argc-1] and the NULL
+  # terminator, the kernel lays out `envp` at `&argv[argc+1]`. With rdi=argc and
+  # rsi=&argv[0]: `envp = rsi + 8*(argc+1) = rsi + 8*argc + 8`. (genMainProc stores
+  # this into the `nimEnviron` global; std/envvars + std/posix read it under
+  # `-d:nimNativeIo`, matching how rsi feeds `cmdLine`.)
+  x86.emitLea(ctx.buf.data, x86.RDX, x86.MemoryOperand(base: x86.RSI, index: x86.RDI,
+                                                       scale: 8, displacement: 8'i32, hasIndex: true))  # rdx = &envp[0]
   x86.emitJmp(ctx.buf, LabelId(ctx.entrySym.offset))        # → real entry
 
 proc assemble*(filename, outfile: string; symMap = false; emitObj = false) =
