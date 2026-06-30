@@ -127,6 +127,12 @@ const LinuxSyscalls* = {
   # `open` above, fine for an x86-64 target and flagged loudly if an a64 build
   # ever reaches them.
   "lseek":      (8,   62),
+  # `getcwd(buf, size)` fills `buf` with the cwd. NOTE: the raw syscall returns the path
+  # LENGTH (>0) on success / `-errno` on error, whereas libc returns `buf` / NULL —
+  # `getCurrentDir` only uses the result for its `== nil` check (a positive length is
+  # non-nil) and reads the path from `buf`, so the success path is correct. A failure
+  # would be mis-read as success, but the cwd reliably exists on the boot path.
+  "getcwd":     (79,  17),
   "fstat":      (5,   80),
   "stat":       (4,   -1),
   "lstat":      (6,   -1),
