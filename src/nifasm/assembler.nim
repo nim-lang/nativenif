@@ -337,6 +337,10 @@ type
                         # merged across `ite` branches.
     slots: SlotManager
     ssizePatches: seq[int]
+    reservedArgArea: int          # AArch64 fixed-frame: bytes reserved at the frame bottom
+                                  # for the largest outgoing stack-argument area (see
+                                  # scanStackArgArea). Locals sit above it; the caller writes
+                                  # `(mem (sp)(arg pN))` with no per-call `sub sp`.
     csizePatches: seq[(int, int)] # (position, callStackDepth) for csize patches
     gvarSites: seq[(int, Symbol)] # (adrp position in .text, gvar symbol) for adrp+add patching
     tlvSites: seq[(int, Symbol)]  # (adrp position in .text, tvar symbol) for TLV descriptor adrp+add patching (arm64/macOS)
@@ -1920,6 +1924,15 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
   # Compute stack argument size (only for internal procs)
   if ctx.callContext.state == CallContextState.NormalCall:
     ctx.callContext.stackArgSize = computeStackArgSize(ctx.callContext.typ)
+    # Fixed-frame soundness (AArch64): this call's outgoing stack args occupy
+    # `[sp, sp+stackArgSize)`, the region `scanStackArgArea` reserved at the frame bottom.
+    # If the pre-scan didn't see this target (an indirect call through a not-yet-declared
+    # local fn-ptr), the reservation may be too small — fail loudly rather than let the
+    # args overwrite a local `(s)` slot.
+    if ctx.callContext.stackArgSize > ctx.reservedArgArea:
+      error("outgoing stack-argument area (" & $ctx.callContext.stackArgSize &
+            " bytes) exceeds the reserved frame area (" & $ctx.reservedArgArea &
+            " bytes); call target not visible to the frame pre-scan", hdr)
 
   # Consume the prepare node: skip the (already-read) target, then generate each
   # instruction. `into` bounds the loop to this node (no ParRi sentinel exists).
@@ -2976,6 +2989,26 @@ proc collectLabels(n: var Cursor; ctx: var GenContext; scope: Scope) =
   else:
     inc n
 
+proc scanStackArgArea(n: var Cursor; ctx: var GenContext; scope: Scope; acc: var int) =
+  ## Pre-scan a proc body for the largest outgoing stack-argument area any `(prepare …)`
+  ## needs (AArch64 fixed-frame model). The result seeds the slot allocator so the area is
+  ## reserved ONCE at the frame bottom: local `(s)` slots then sit ABOVE it and `(ssize)`
+  ## includes it, so the caller writes `(mem (sp) (arg pN))` with no per-call `sub sp` and
+  ## SP stays constant between prologue and epilogue. A target that doesn't resolve here
+  ## (an indirect call through a not-yet-declared local fn-ptr) contributes 0; `genPrepareA64`
+  ## guards against an under-reservation at emit time.
+  if n.kind == TagLit:
+    if n.tag == PrepareTagId:
+      var t = n; inc t                           # the call target symbol
+      if t.kind == Symbol:
+        let s = lookupWithAutoImport(ctx, scope, getSym(t), t)
+        if s != nil and s.typ != nil and s.typ.kind == ProcT:
+          acc = max(acc, computeStackArgSize(s.typ))
+    loopInto n:
+      scanStackArgArea(n, ctx, scope, acc)
+  else:
+    inc n
+
 proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   let oldScope = ctx.scope
   ctx.scope = newScope(oldScope)
@@ -3035,6 +3068,22 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
           ctx.regBindings[tagToRegister(param.reg, n)] = param.name
 
     skip n   # past the proc name
+
+    # AArch64 fixed-frame model: reserve the largest outgoing stack-argument area any
+    # call in this proc needs at the BOTTOM of the frame BEFORE any local `(s)` slot is
+    # allocated, so locals land above it and `(ssize)` covers it. The caller then passes
+    # stack args by writing `(mem (sp) (arg pN))` into that region with NO per-call
+    # `sub sp` — SP is constant from prologue to epilogue, so a stack-passed aggregate
+    # (which can't sit in a register across a shift) is addressed at a stable offset.
+    ctx.reservedArgArea = 0
+    if isA64Proc:
+      var scanArgs = n
+      var maxArgs = 0
+      while scanArgs.hasMore:
+        scanStackArgArea(scanArgs, ctx, ctx.scope, maxArgs)
+      ctx.reservedArgArea = maxArgs
+      ctx.slots.stackSize = max(ctx.slots.stackSize, maxArgs)
+
     # Emit the body — the `(stmts …)` child — and skip the signature sections
     # (already consumed in pass1). The `while hasMore` is bounded by the proc's
     # `into`, so it stops at the proc end naturally.

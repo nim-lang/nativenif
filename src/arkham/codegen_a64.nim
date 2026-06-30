@@ -253,6 +253,7 @@ proc emFStore(g: var CodeGen; d: FReg; addrReg: Reg; bits: int) = # fstr dD/sD, 
 proc structToRegs(g: var CodeGen; varName, typeName: string; firstArg: int)
 proc regsToStruct(g: var CodeGen; varName, typeName: string; firstArg: int)
 proc marshalAggrFromAddr(g: var CodeGen; addrReg: Reg; typeName: string; firstArg: int)
+proc marshalStackAggrArg(g: var CodeGen; a: Cursor; paramNm: string)    # defined below
 proc takeBridge(g: var CodeGen; typ = ScalarSlot; avoid = NoReg): Reg   # defined below
 proc dropBridge(g: var CodeGen; r: Reg)                                 # defined below
 proc emWordThroughPtr(g: var CodeGen; p: Reg; idx: int)                 # defined below
@@ -958,32 +959,53 @@ proc emitStackParamLoads(g: var CodeGen; decl: Cursor) =
   inc c                                       # name → params slot
   if c.kind != TagLit: return                 # (params) is `.` → no parameters
   let base = g.framePushBytes()
-  var idx = 0
+  var idx = 0                                 # next arg register (skip rule)
   var fidx = 0
-  var stackOrd = 0
+  var stackOff = 0                            # byte offset within the incoming-arg area
   c.into:
     while c.hasMore:
       var nm = ""
       var isFloat = false
+      var typeCur: Cursor
       c.into:                                 # (param :name pragmas type)
         nm = symName(c); inc c
         skip c                                # pragmas
+        typeCur = c
         if c.kind == TagLit and c.typeKind == FT: isFloat = true
         while c.hasMore: skip c               # type (+ anything else)
       if isFloat:
         inc fidx                              # floats use v0–v7; never stack here
       else:
-        if idx >= IntArgRegs.len:
+        let ps = slotOf(g.prog, typeCur)
+        # Register-words this param would occupy: a ≤16B by-value aggregate spans its
+        # eightbytes, everything else (scalar / pointer / >16B by-ref pointer) one.
+        let words = if ps.kind == AMem and ps.size <= g.md.aggrByRefThreshold:
+                      aggrWordCount(g.prog, symName(typeCur)) else: 1
+        if idx + words > IntArgRegs.len:
+          # Stack-passed. Its incoming bytes sit at `[sp + base + stackOff]` (valid here,
+          # before SP is lowered). A scalar / >16B-by-ref pointer is LOADED into its home;
+          # a ≤16B by-value aggregate's home is a POINTER to those bytes (address-of), so
+          # the body reads its fields through it (varType set in emitParamMoves) with no
+          # copy. The pointer is absolute, surviving any later frame `sub sp`.
           let loc = g.ra.locationOfSym(nm)
           assert loc.kind == InReg,
             "arkham v1: stack parameter without a register home: " & nm
-          g.ab.tree MovA64:                   # home ← [sp + base + stackOrd*8]
-            g.emReg loc.r
-            g.ab.tree MemX:
-              g.emReg SP
-              g.ab.intLit (base + stackOrd * 8)
-          inc stackOrd
-        inc idx
+          if ps.kind == AMem and ps.size <= g.md.aggrByRefThreshold:
+            g.ab.tree LeaA64:                 # home ← &[sp + base + stackOff] = sp + imm
+              g.emReg loc.r
+              g.ab.tree MemX:
+                g.emReg SP
+                g.ab.intLit (base + stackOff)
+            stackOff += aggrWordCount(g.prog, symName(typeCur)) * 8
+          else:
+            g.ab.tree MovA64:                 # home ← [sp + base + stackOff]
+              g.emReg loc.r
+              g.ab.tree MemX:
+                g.emReg SP
+                g.ab.intLit (base + stackOff)
+            stackOff += 8
+        else:
+          idx += words
 
 proc emitParamMoves(g: var CodeGen; decl: Cursor) =
   ## Move each parameter from its incoming ABI register to the home the
@@ -1018,11 +1040,19 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
         g.regsToStruct(nm, tn, idx)
         idx += aggrWordCount(g.prog, tn)
       elif tn.len > 0 and loc.kind == InReg:
-        # >16B by-reference aggregate: a pointer, homed like a scalar; field
-        # accesses route through it (recorded in varType).
+        # A pointer-homed aggregate: a >16B by-reference one, OR a stack-passed ≤16B
+        # by-value one (whose home is a pointer to its incoming bytes). Field accesses
+        # route through the pointer (recorded in varType). Register-passed → move the
+        # pointer from its incoming arg register and advance idx by its one register;
+        # STACK-passed → `emitStackParamLoads` already loaded/computed the pointer into the
+        # home, and the param consumed NO register (skip rule), so leave idx untouched.
         g.varType[nm] = tn
-        g.movReg(loc.r, IntArgRegs[idx])
-        inc idx
+        let words = if aggrByteSize(g.prog, tn) <= g.md.aggrByRefThreshold:
+                      aggrWordCount(g.prog, tn) else: 1
+        if idx + words <= IntArgRegs.len:
+          g.movReg(loc.r, IntArgRegs[idx])
+          inc idx
+        # else: stack-passed → idx unchanged
       elif loc.kind == InFReg:
         # Float parameter: in a leaf proc it stays in its incoming v{fidx}; if
         # the allocator gave it a callee-saved home, move it there.
@@ -1093,17 +1123,31 @@ proc emitSignature(g: var CodeGen; decl: Cursor; declarative: bool) =
                   # selects word k. The body reads the registers raw into its own home.
                   let nw = (ps.size + 7) div 8
                   let aggrRef = ps.size > 16
-                  g.ab.tree ParamD:
-                    g.ab.symDef paramName(idx)
-                    g.ab.tree RegsD:
-                      if aggrRef: g.ab.reg IntArgRegs[gpIdx]
+                  let words = if aggrRef: 1 else: nw
+                  if gpIdx + words > IntArgRegs.len:
+                    # Doesn't fit the remaining arg registers → stack-passed `(s)`. A >16B
+                    # aggregate travels as ONE pointer (`(s) (ptr T)`, 8 bytes); a ≤16B
+                    # by-value one occupies its eightbytes (`(s) T`). gpIdx is UNCHANGED
+                    # (skip rule), so a later smaller param can still take a free register.
+                    g.ab.tree ParamD:
+                      g.ab.symDef paramName(idx)
+                      g.ab.keyword SO
+                      if aggrRef:
+                        g.ab.ptrType: g.genTypeBody(c)
                       else:
-                        for k in 0 ..< nw: g.ab.reg IntArgRegs[gpIdx + k]
-                    if aggrRef:
-                      g.ab.ptrType: g.genTypeBody(c)
-                    else:
-                      g.genTypeBody(c)
-                  if aggrRef: inc gpIdx else: gpIdx += nw
+                        g.genTypeBody(c)
+                  else:
+                    g.ab.tree ParamD:
+                      g.ab.symDef paramName(idx)
+                      g.ab.tree RegsD:
+                        if aggrRef: g.ab.reg IntArgRegs[gpIdx]
+                        else:
+                          for k in 0 ..< nw: g.ab.reg IntArgRegs[gpIdx + k]
+                      if aggrRef:
+                        g.ab.ptrType: g.genTypeBody(c)
+                      else:
+                        g.genTypeBody(c)
+                    if aggrRef: inc gpIdx else: gpIdx += nw
                 else:
                   g.ab.tree ParamD:
                     g.ab.symDef paramName(idx)
@@ -2244,9 +2288,13 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
     g.ab.tree PrepareA64:
       g.ab.sym tgt.asmName
       var gpIdx = 0                                    # next x-register
-      var j = 0                                        # arg / param position
-      # Phase 1: register args (x0–x7), while SP still points at the caller frame.
-      while j < argCurs.len:
+      # Classify each arg: a register one occupies x0–x7; one that doesn't fit the
+      # REMAINING arg registers goes ENTIRELY on the stack and consumes NO register, so a
+      # later, smaller arg can still take a free one (the allocator's rule, allocCall). SP
+      # is constant in the fixed frame — the outgoing area is reserved in this proc's frame
+      # — so a stack arg writes straight to `(mem (sp) (arg pN [k]))` with NO per-call sub.
+      var stackArgs: seq[int] = @[]
+      for j in 0 ..< argCurs.len:
         let a = argCurs[j]
         let slot = g.exprSlot(a)
         var words = 1
@@ -2259,7 +2307,9 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
           tn = symName(tcur)
           aggrRef = slot.size > 16
           words = if aggrRef: 1 else: aggrWordCount(g.prog, tn)
-        if gpIdx + words > IntArgRegs.len: break       # the rest go on the stack
+        if gpIdx + words > IntArgRegs.len:
+          stackArgs.add j                              # doesn't fit → stack (gpIdx unchanged)
+          continue
         if slot.kind == AMem:
           # Marshal the aggregate into IntArgRegs[gpIdx ..], then bind each word.
           if a.kind == TagLit and a.exprKind in {DotC, DerefC, AtC, PatC}:
@@ -2309,29 +2359,24 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
             g.ab.tree ArgX: g.ab.sym paramName(j)
             g.emReg aloc.r
         gpIdx += words
-        inc j
-      # Phase 2: stack args (9th+). Reserve the outgoing area, then compute + store each
-      # IMMEDIATELY (the allocator reuses ONE scratch for all, so they can't be deferred).
-      let hadStack = j < argCurs.len
-      if hadStack:
-        g.ab.tree SubA64: g.emReg SP; g.ab.keyword CsizeX
-        for k in j ..< argCurs.len:
-          let a = argCurs[k]
-          if g.exprSlot(a).kind == AMem:
-            raiseAssert "arkham a64: aggregate stack argument not yet supported"
+      # Stack args: write each (in declaration order) to its outgoing slot `(mem (sp) (arg
+      # pN [k]))` at the stable, frame-reserved area — no `sub sp` (SP is constant).
+      for j in stackArgs:
+        let a = argCurs[j]
+        if g.exprSlot(a).kind == AMem:
+          g.marshalStackAggrArg(a, paramName(j))
+        else:
           g.emitValue2(a)
           let aloc = g.ra.locs[g.posOf(a)]
           g.ab.tree MovA64:
             g.ab.tree MemX:
               g.emReg SP
-              g.ab.tree ArgX: g.ab.sym paramName(k)
+              g.ab.tree ArgX: g.ab.sym paramName(j)
             g.emReg aloc.r
           if aloc.kind == InReg and aloc.isTemp: g.unbindTemp(aloc.r)
       if tgt.syscall:
         g.ab.tree SvcA64: g.ab.intLit 0
       else: g.ab.keyword CallA64
-      if hadStack:
-        g.ab.tree AddA64: g.emReg SP; g.ab.keyword CsizeX
       # A scalar result is consumed through `(res ret.0)`; a void / >16B by-ref (value via
       # x8) result has no `(res)` slot here.
       if hasResult and not resultByRef and not resultIsFloat and resSlot.kind != AMem:
@@ -2825,6 +2870,66 @@ proc marshalAggrFromAddr(g: var CodeGen; addrReg: Reg; typeName: string; firstAr
     else:
       let fn = fieldAtOffset(aggrLayout(g.prog, typeName), i * 8)
       g.ab.tree MovA64: (g.emReg IntArgRegs[firstArg + i]; g.emPtrFieldMem(addrReg, typeName, fn))
+
+proc aggrArgAddr(g: var CodeGen; a: Cursor; dst: Reg) =
+  ## Put the ADDRESS of an aggregate call-argument SOURCE into `dst` (a usable scratch
+  ## register). Mirrors the register-marshalling source dispatch — a symbol local/global,
+  ## a by-ref param pointer already in a register, an lvalue, or an `oconstr`/`aconstr`
+  ## built into a temp — but yields an address, which the stack-passed path reads through.
+  if a.kind == TagLit and a.exprKind in {DotC, DerefC, AtC, PatC}:
+    g.aggrAddrInto(a, dst, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)
+  elif a.kind == Symbol:
+    case g.lookupSym(symName(a)).cat
+    of scGlobal: g.emGlobalAddr(dst, symName(a))
+    of scTvar: raiseAssert "arkham a64: aggregate threadvar passed by value not supported"
+    else:
+      let home = symName(a)
+      let hl = g.ra.locationOfSym(home)
+      if hl.kind == InReg: g.movReg(dst, hl.r)          # by-ref param: pointer already in a reg
+      else: g.ab.tree LeaA64: (g.emReg dst; g.ab.sym home)
+  else:                                                 # oconstr/aconstr → build into a temp, then &temp
+    let pos = g.posOf(a)
+    let home = "aggtmp" & $pos & ".0"
+    g.emTypedStackVar(home, g.getType(a))
+    g.varType[home] = symName(g.getType(a))
+    g.genStore2(a, namedStackLoc(home, g.exprSlot(a)), pos)
+    g.ab.tree LeaA64: (g.emReg dst; g.ab.sym home)
+
+proc marshalStackAggrArg(g: var CodeGen; a: Cursor; paramNm: string) =
+  ## Write an aggregate call argument that did NOT fit the integer arg registers to its
+  ## outgoing stack slot(s) `(mem (sp) (arg paramNm [k]))`. The fixed frame keeps SP
+  ## constant, so the source is read and the slots written at stable offsets — no
+  ## held-scratch survivors across a `sub sp`. A >16B aggregate passes ONE pointer word;
+  ## a ≤16B by-value one passes its eightbytes (a FULL eightbyte as a raw `(u 64)` word,
+  ## a trailing PARTIAL eightbyte field-typed — exact bytes, no over-read).
+  let tcur = g.getType(a)
+  if tcur.kind != Symbol:
+    raiseAssert "arkham a64: aggregate stack-arg of non-nominal type"
+  let tn = symName(tcur)
+  let sz = aggrByteSize(g.prog, tn)
+  let byRef = sz > g.md.aggrByRefThreshold
+  let src = g.takeBridge()
+  g.aggrArgAddr(a, src)                                 # &source (by-value) / the pointer (by-ref)
+  if byRef:
+    g.ab.tree MovA64:
+      g.ab.tree MemX: (g.emReg SP; g.ab.tree ArgX: g.ab.sym paramNm)
+      g.emReg src
+  else:
+    let w = g.takeBridge(avoid = src)
+    for i in 0 ..< aggrWordCount(g.prog, tn):
+      if sz - i * 8 >= 8:
+        g.ab.tree MovA64: (g.emReg w; g.emWordThroughPtr(src, i))
+      else:
+        let fn = fieldAtOffset(aggrLayout(g.prog, tn), i * 8)
+        if fn.len == 0: raiseAssert "arkham a64: sub-word-packed aggregate stack-arg ABI unsupported"
+        g.ab.tree MovA64: (g.emReg w; g.emPtrFieldMem(src, tn, fn))
+      g.ab.tree MovA64:
+        g.ab.tree MemX:
+          g.emReg SP
+          g.ab.tree ArgX: (g.ab.sym paramNm; g.ab.intLit i.int64)
+        g.emReg w
+    g.dropBridge w
+  g.dropBridge src
 
 proc emLvalFieldMem(g: var CodeGen; lhs: Cursor; field: string) =
   g.ab.tree MemX:

@@ -796,6 +796,10 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
         let fits = intIdx + gprWords <= b.md.intArgRegs.len
         var dst: seq[Location] = @[]
         if not fits:
+          # A stack-passed arg means this proc reserves an outgoing-argument area in its
+          # frame (the fixed-frame model — nifasm's scanStackArgArea), so it needs the
+          # frame `sub sp`. Flag it like a stack local.
+          b.ra.hasStackVars = true
           for _ in 0 ..< gprWords: dst.add b.reserveHeldScratch("a stack aggregate-arg word")
         var addrReg = NoReg
         if n.kind == Symbol:
@@ -840,6 +844,9 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
         # 7th+ integer arg → caller stack. Compute into a scratch register; the
         # emitter stores it to the outgoing slot `(mem (rsp) (arg pN))`. The temp is
         # dead after that store, so release it (each stack arg reuses it in turn).
+        # A stack-passed arg means this proc reserves an outgoing-argument area in its
+        # frame, so it needs the frame `sub sp` (see the fixed-frame note above).
+        b.ra.hasStackVars = true
         var ad = needsReg(ScalarSlot)
         allocValue(b, n, ad)
         b.releaseTmp(ad)
@@ -1782,15 +1789,33 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
         let name = symName(params); inc params
         skip params                          # pragmas
         let slot = slotOf(b.prog[], params); skip params  # type (resolves named)
-        # Classify an aggregate param: ≤16B by-value (a `(s)` stack home filled
-        # from its GPR(s)) vs >16B by-reference (a pointer, like a scalar).
+        # Classify an aggregate param. A ≤16B by-value aggregate is REGISTER-passed when it
+        # fits the remaining arg registers (a `(s)` stack home filled from its GPRs); when
+        # it doesn't (the skip rule), it is STACK-passed and the callee instead takes a
+        # POINTER to the incoming bytes — the same home shape as a >16B by-reference
+        # aggregate, so `emitStackParamLoads` (address-of) and the body's through-pointer
+        # field access need no new case. A >16B aggregate is always by-reference.
         var aggrSmall = false
         var aggrByRef = false
         var aggrWords = 0
         if slot.kind == AMem:
           let sz = slot.size                  # filled by slotOf (named or inline)
-          if sz >= 1 and sz <= b.md.aggrByRefThreshold: (aggrSmall = true; aggrWords = (sz + 7) div 8)
-          else: aggrByRef = true
+          if sz >= 1 and sz <= b.md.aggrByRefThreshold:
+            aggrWords = (sz + 7) div 8
+            if intIdx + aggrWords <= b.md.intArgRegs.len: aggrSmall = true   # register-passed
+            else:
+              aggrByRef = true                                              # stack-passed → pointer
+              # Partial fit: the by-value words don't fit but a FREE arg register remains
+              # (a 9–16B aggregate with exactly one free GPR). Here the skip rule (this
+              # param consumes no register, so a LATER one may take that GPR) would require
+              # `intIdx` not to advance — which this shared path does for the pointer, so a
+              # following register param would be mis-assigned. Reject it rather than
+              # miscompile; the common cases (aggregate fits, or no free GPR left) are fine.
+              if intIdx < b.md.intArgRegs.len:
+                raiseAssert "arkham: stack-passed by-value aggregate param with a partial " &
+                  "register fit (a 9-16B aggregate and one free arg register) not yet supported"
+          else:
+            aggrByRef = true
         if aggrSmall:
           # (No early `continue`/`return`: that skips the `into` epilogue.)
           b.record(pos, name, namedStackLoc(name, slot))
