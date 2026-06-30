@@ -3934,18 +3934,18 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
     assert fv.kind == InFReg, "arkham x64n: float global store rhs " & $fv.kind
     let gbits = if dst.typ.size == 4: 32 else: 64
     let op = if gbits == 32: MovssX64 else: MovsdX64
-    case dst.kind
-    of Glob:                                             # &g into the address temp, then movss/movsd
-      let addrT = g.ra.aux[auxPos].scratch[0]
-      var pSlot = ScalarSlot                             # type it `(ptr (f N))` (nifasm is strict)
-      if not cursorIsNil(dst.typ.typ): pSlot = typeToSlot(g.prog.ptrTypeOf(dst.typ.typ))
-      g.bindTemp(addrT, pSlot)
-      g.emGlobalAddr(addrT, dst.name)
-      g.ab.tree op:
-        g.ab.tree MemX: g.emReg addrT
-        g.emFReg fv.f
-      g.unbindTemp(addrT)
-    else: raiseAssert "arkham x64n: float threadvar store not supported"
+    # &dst is re-derived into a transient here (no call since the rhs), so the allocator
+    # reserves nothing — matching the scalar global store. Type the address `(ptr (f N))`
+    # so the `(mem p)` deref carries the precise float type (nifasm is strict). `emSymAddr`
+    # handles a global (RIP-rel lea) or a thread-local (FS base + offset) uniformly.
+    var pSlot = ScalarSlot
+    if not cursorIsNil(dst.typ.typ): pSlot = typeToSlot(g.prog.ptrTypeOf(dst.typ.typ))
+    let addrT = g.pickStagingSealed("a float global store address", pSlot)
+    g.emSymAddr(addrT, dst)
+    g.ab.tree op:
+      g.ab.tree MemX: g.emReg addrT
+      g.emFReg fv.f
+    g.giveBack addrT
     if fv.isTemp: g.unbindFTmp(fv.f)
   elif dst.kind in {Glob, Tvar} and dst.typ.kind == AMem:
     # Aggregate store into a module-level symbol — a global OR a thread-local. Compute
