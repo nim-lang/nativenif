@@ -3069,14 +3069,18 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
 
     skip n   # past the proc name
 
-    # AArch64 fixed-frame model: reserve the largest outgoing stack-argument area any
-    # call in this proc needs at the BOTTOM of the frame BEFORE any local `(s)` slot is
-    # allocated, so locals land above it and `(ssize)` covers it. The caller then passes
-    # stack args by writing `(mem (sp) (arg pN))` into that region with NO per-call
-    # `sub sp` — SP is constant from prologue to epilogue, so a stack-passed aggregate
-    # (which can't sit in a register across a shift) is addressed at a stable offset.
+    # Fixed-frame model — BOTH AArch64 and x86-64 use it here: reserve the largest
+    # outgoing stack-argument area any call in this proc needs at the BOTTOM of the frame
+    # BEFORE any local `(s)` slot is allocated, so locals land above it and `(ssize)`
+    # covers it. The caller then passes stack args by writing `(mem (sp) (arg pN))` into
+    # that region with NO per-call `sub sp` — SP is constant from prologue to epilogue, so
+    # a stack-passed value (which can't sit in a register across a shift) is addressed at a
+    # stable offset. This MUST run on x86-64 too: arkham emits the same `(mem (rsp)(arg
+    # pN))`-into-`[rsp+off]` sequence with no per-call `sub rsp`, so without the reservation
+    # the outgoing arg slots alias the caller's own locals at `[rsp+0…]` and clobber them
+    # (e.g. a 6th integer arg overwrote a local `Info`'s first 8 bytes).
     ctx.reservedArgArea = 0
-    if isA64Proc:
+    block:
       var scanArgs = n
       var maxArgs = 0
       while scanArgs.hasMore:
@@ -3933,6 +3937,15 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
   # Compute stack argument size (only for internal procs)
   if ctx.callContext.state == CallContextState.NormalCall:
     ctx.callContext.stackArgSize = computeStackArgSize(ctx.callContext.typ)
+    # Fixed-frame soundness (same as the A64 path): this call's outgoing stack args
+    # occupy `[rsp, rsp+stackArgSize)`, the region `scanStackArgArea` reserved at the
+    # frame bottom. If the pre-scan missed this target (an indirect call through a
+    # not-yet-declared local fn-ptr), the reservation may be too small — fail loudly
+    # rather than let the args overwrite a local `(s)` slot.
+    if ctx.callContext.stackArgSize > ctx.reservedArgArea:
+      error("outgoing stack-argument area (" & $ctx.callContext.stackArgSize &
+            " bytes) exceeds the reserved frame area (" & $ctx.reservedArgArea &
+            " bytes); call target not visible to the frame pre-scan", hdr)
 
   # Consume the prepare node: skip the (already-read) target, then generate each
   # instruction. `into` bounds the loop to this node (no ParRi sentinel exists).
@@ -4817,6 +4830,17 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       x86.emitBsf(ctx.buf.data, dest.reg, op.reg)
     else:
       x86.emitBsr(ctx.buf.data, dest.reg, op.reg)
+
+  # Byte swap: `(bswap D bits)` — D is a register reversed IN PLACE; `bits` is 32 or 64
+  # (selects the operand size). Used to lower `__builtin_bswap32/64`.
+  of BswapX64:
+    inc n
+    let dest = parseDest(n, ctx)
+    if dest.kind != okReg: error("bswap destination must be a register", n)
+    if n.kind != IntLit: error("bswap requires a width operand (32 or 64)", n)
+    let bits = int(getInt(n)); inc n
+    if bits != 32 and bits != 64: error("bswap width must be 32 or 64", n)
+    x86.emitBswap(ctx.buf.data, dest.reg, bits)
 
   # Bit test family: `(bt D S)` etc. D is a register, S an immediate bit index.
   of BtX64, BtsX64, BtrX64, BtcX64:

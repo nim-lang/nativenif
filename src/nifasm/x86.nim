@@ -911,6 +911,18 @@ proc emitBsr*(dest: var Bytes; destReg, srcReg: Register) =
   dest.add(0xBD)  # BSR r64, r/m64 opcode
   dest.add(encodeModRM(amDirect, int(destReg), int(srcReg)))
 
+proc emitBswap*(dest: var Bytes; reg: Register; bits: int) =
+  ## Emit BSWAP reg (reverse byte order), encoded `0F C8+rd` with the register in the
+  ## low opcode bits. `bits` is 32 or 64 (REX.W selects 64). A 16-bit byte-swap is NOT
+  ## a BSWAP (x86 BSWAP r16 is officially undefined); the caller lowers `bswap16` to a
+  ## `bswap32` followed by a 16-bit shift instead.
+  var rex = RexPrefix(w: bits == 64)
+  if needsRex(reg): rex.b = true
+  if rex.w or rex.b:
+    dest.add(encodeRex(rex))
+  dest.add(0x0F)                       # two-byte opcode prefix
+  dest.add(byte(0xC8 + (int(reg) and 0x07)))   # BSWAP r32/r64
+
 proc emitBt*(dest: var Bytes; reg: Register; bit: int) =
   ## Emit BT instruction: BT reg, bit (bit test)
   var rex = RexPrefix(w: true)
