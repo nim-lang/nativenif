@@ -47,21 +47,22 @@ proc fmtOperand(c: Cursor): string =
   of UIntLit: result = $uintVal(c)
   else: result = "?"
 
-proc renderInstr(c: var Cursor): string =
-  ## Render one `(OpFoo <operands>)` tree (no result binding) and advance past
-  ## it. The opcode is the tag; the children are operands.
+proc renderInstr(c: var Cursor; dest: var string) =
+  ## Append one `(OpFoo <operands>)` tree (no result binding) to `dest` and
+  ## advance past it. The opcode is the tag; the children are operands.
   assert c.kind == TagLit, "renderSpirv: expected an instruction tag"
-  let op = tagName(c.tags, c.cursorTagId)
-  var line = op
+  dest.add tagName(c.tags, c.cursorTagId)
   c.into:
     while c.hasMore:
-      line.add " " & fmtOperand(c)
+      dest.add ' '
+      dest.add fmtOperand(c)
       skip c
-  result = line
 
-proc renderSpirv*(b: var TokenBuf): string =
-  ## Walk the `(Module …)` NIF tree and emit textual SPIR-V.
-  var instrs: seq[string] = @[]
+proc renderSpirv*(b: var TokenBuf; dest: var string) =
+  ## Walk the `(Module …)` NIF tree and append textual SPIR-V to `dest`. The
+  ## header carries `Bound` (max result id + 1), which is only known once the
+  ## instructions have been walked, so the body is built first, then spliced in.
+  var body = ""
   var bound = 1                      # SPIR-V `Bound` = max result id + 1
   var c = b.beginRead()
   assert c.kind == TagLit and tagName(c.tags, c.cursorTagId) == "Module",
@@ -69,33 +70,28 @@ proc renderSpirv*(b: var TokenBuf): string =
   c.into:
     while c.hasMore:
       assert c.kind == TagLit, "renderSpirv: expected an instruction tag"
+      body.add "\n"
       if tagName(c.tags, c.cursorTagId) == "Def":
         # `(Def <SymbolDef %id> (OpFoo …))` -> `%id = OpFoo …`.
-        var resultId = ""
-        var instrText = ""
         c.into:
           assert c.kind == SymbolDef, "renderSpirv: Def without a SymbolDef"
-          resultId = idName(symName(c)); inc c
-          instrText = renderInstr(c)
+          body.add "%" & idName(symName(c)) & " = "; inc c
+          renderInstr(c, body)
         inc bound
-        instrs.add "%" & resultId & " = " & instrText
       else:
-        instrs.add renderInstr(c)
-  var lines = @[
-    "; SPIR-V",
-    "; Version: 1.3",
-    "; Generator: ghast",
-    "; Bound: " & $bound,
-    "; Schema: 0"]
-  for ln in instrs: lines.add ln
-  result = ""
-  for i, ln in lines:
-    if i > 0: result.add "\n"
-    result.add ln
+        renderInstr(c, body)
+  dest.add "; SPIR-V"
+  dest.add "\n; Version: 1.3"
+  dest.add "\n; Generator: ghast"
+  dest.add "\n; Bound: " & $bound
+  dest.add "\n; Schema: 0"
+  dest.add body
 
 when isMainModule:
   import std / [os, syncio]
   if paramCount() < 2:
     quit "usage: render <module.spv.nif> <out.spvasm>"
   var buf = parseFromFile(paramStr(1))
-  writeFile(paramStr(2), renderSpirv(buf))
+  var text = ""
+  renderSpirv(buf, text)
+  writeFile(paramStr(2), text)

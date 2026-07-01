@@ -35,6 +35,8 @@ proc main() =
   # Dump the SPIR-V *as NIF* (inspectable; `render`'s CLI reads exactly this).
   writeFile(output & ".spv.nif", toString(spv))
   # The artifact itself is the rendered, real-syntax SPIR-V assembly.
-  writeFile(output, renderSpirv(spv))
+  var text = ""
+  renderSpirv(spv, text)
+  writeFile(output, text)
 
 main()

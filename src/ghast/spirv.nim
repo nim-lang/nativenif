@@ -72,27 +72,28 @@ type
     OpReturn = "OpReturn"
     OpReturnValue = "OpReturnValue"
     OpFunctionEnd = "OpFunctionEnd"
-    # ── keyword operands — each `$` is the spelling SPIR-V expects, emitted as
-    #    a nullary tag (`enumOp`). Grouped Nim-side by SPIR-V operand category. ──
-    capShader = "Shader"             # Capability
-    capInt8 = "Int8"
-    capInt16 = "Int16"
-    capInt64 = "Int64"
-    addrLogical = "Logical"          # AddressingModel
-    memGLSL450 = "GLSL450"           # MemoryModel
-    exeGLCompute = "GLCompute"       # ExecutionModel
-    modeLocalSize = "LocalSize"      # ExecutionMode
-    fcNone = "None"                  # FunctionControl
-    scFunction = "Function"          # StorageClass
-    scInput = "Input"
-    scStorageBuffer = "StorageBuffer"
-    biGlobalInvocationId = "GlobalInvocationId"   # BuiltIn
-    decBlock = "Block"               # Decoration
-    decBuiltIn = "BuiltIn"
-    decArrayStride = "ArrayStride"
-    decOffset = "Offset"
-    decDescriptorSet = "DescriptorSet"
-    decBinding = "Binding"
+    # ── keyword operands — UpperCase like the opcodes, each identifier its own
+    #    SPIR-V spelling (so `$` is what SPIR-V expects); emitted as a nullary tag
+    #    (`enumOp`). Grouped Nim-side by SPIR-V operand category.
+    Shader = "Shader"                # Capability
+    Int8 = "Int8"
+    Int16 = "Int16"
+    Int64 = "Int64"
+    Logical = "Logical"              # AddressingModel
+    GLSL450 = "GLSL450"              # MemoryModel
+    GLCompute = "GLCompute"          # ExecutionModel
+    LocalSize = "LocalSize"          # ExecutionMode
+    None = "None"                    # FunctionControl
+    Function = "Function"            # StorageClass
+    Input = "Input"
+    StorageBuffer = "StorageBuffer"
+    GlobalInvocationId = "GlobalInvocationId"   # BuiltIn
+    Block = "Block"                  # Decoration
+    BuiltIn = "BuiltIn"
+    ArrayStride = "ArrayStride"
+    Offset = "Offset"
+    DescriptorSet = "DescriptorSet"
+    Binding = "Binding"
 
 template tagId*(op: SpirvOp): TagId = TagId(uint32(op) + 1'u32)
 
@@ -110,13 +111,13 @@ template instr*(b: var TokenBuf; op: SpirvOp; body: untyped) =
   body
   b.closeTag()
 
-template def*(b: var TokenBuf; id: string; op: SpirvOp; body: untyped) =
+template def*(b: var TokenBuf; id: SymId; op: SpirvOp; body: untyped) =
   ## A result-defining instruction: `(Def <SymbolDef id> (Op… <operands>))`.
   ## The id is bound by the `ghDef` tag — a NIF `SymbolDef` is always *bound* by
   ## a tag, never dropped into operand position — and `body` emits only `Symbol`
   ## uses / literals. `render` turns the whole tree into `%id = Op… …`.
   b.openTag ghDef.tagId
-  b.addSymDef id
+  b.add symdefToken(id)
   b.openTag op.tagId
   body
   b.closeTag()
@@ -128,10 +129,11 @@ const idSuffix* = ".0"
   ## The module suffix every SPIR-V id carries. NIF text classifies a bare token
   ## as a `Symbol` only when it has a `.`-suffix (otherwise it re-parses as an
   ## `Ident`); the suffix makes ids serialise and round-trip as real symbols (the
-  ## same `name.<n>` convention arkham uses on the CPU side). Ids are passed to
-  ## `def`/`idRef` **verbatim** (the codegen mints them already dotted, e.g.
-  ## `int64.0`); `render` strips the suffix for display (`int64.0` -> `%int64`).
-proc idRef*(b: var TokenBuf; id: string) = b.addSymUse id
+  ## same `name.<n>` convention arkham uses on the CPU side). The codegen mints
+  ## each id string already dotted (e.g. `int64.0`) and interns it into the pool
+  ## as a `SymId`, which `def`/`idRef` emit; `render` strips the suffix for
+  ## display (`int64.0` -> `%int64`).
+proc idRef*(b: var TokenBuf; id: SymId) = b.add symToken(id)
 proc enumOp*(b: var TokenBuf; op: SpirvOp) =
   ## A keyword operand: the nullary tag `(Shader)` / `(Logical)` / … — in NIF a
   ## keyword IS a tag, exactly like `(true)` / `(false)`, never an `Ident`.

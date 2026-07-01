@@ -17,28 +17,35 @@
 ## requires it); ids are deduplicated within a function.
 ##
 ## The supported subset is deliberately narrow. Any construct outside it (calls,
-## control flow, aggregates, …) raises `TranslateError`. The error is **not**
-## caught: it propagates out of `translateModule` and aborts the whole run, so
-## ghast never silently emits a quietly-incomplete module — an unsupported
-## construct is a hard failure, not a skipped proc.
+## control flow, aggregates, …) is a hard failure: `err` `quit`s on the first
+## unsupported construct, so ghast never silently emits a quietly-incomplete
+## module — an unsupported construct aborts the whole run, not just its proc.
+##
+## SPIR-V ids are `nifcore` `SymId`s (interned once in the shared pool), never
+## passed around as strings — the type/constant helpers return the `SymId` they
+## mint, and `genExpr` yields its result through a `Location` (see arkham).
 
 import std / [assertions, tables, sets, algorithm, sequtils, strutils]
 import "." / spirv
 import nifcore, nifcdecl
 
 type
-  TranslateError* = object of CatchableError
-
   SymClass = enum
     scParamValue   ## an SSA value (OpFunctionParameter / loaded builtin)
     scLocalPtr     ## an OpVariable pointer — needs OpLoad / OpStore
     scBuffer       ## a StorageBuffer variable — indexed via OpAccessChain
 
   SymInfo = object
-    id: string         ## the SPIR-V id (dotted, e.g. `i.0`)
+    id: SymId          ## the SPIR-V id (dotted, e.g. `i.0`)
     cls: SymClass
-    typeId: string     ## value (pointee/element) type id
-    ptrId: string      ## for scBuffer: the StorageBuffer pointer-to-element type
+    typeId: SymId      ## value (pointee/element) type id
+    ptrId: SymId       ## for scBuffer: the StorageBuffer pointer-to-element type
+
+  Location = object
+    ## Where an expression's result lives — for now just the SPIR-V id of the
+    ## SSA value `genExpr` produced. Mirrors arkham's `Location`; kept as an
+    ## object so it can grow (constant-folded immediates, storage classes, …).
+    s: SymId
 
   Module = object
     ## Global, committed output, assembled in SPIR-V's mandated section order:
@@ -53,29 +60,40 @@ type
     counter: int       ## SSA ids are module-global; this keeps temps unique
 
   ProcGen = object
-    ## Per-proc working state. On success its buffers are appended to the
-    ## `Module`; on `TranslateError` they are dropped, so a half-translated proc
-    ## leaves no trace.
+    ## Per-proc working state, assembled in its own buffers and appended to the
+    ## `Module` on success (SPIR-V's section order is applied at that point).
+    ## `pool` is the module's shared literals pool — the one every id is interned
+    ## into, so a `SymId` minted here is valid in every buffer.
     entryPoints, execModes, decorations, types, funcs: TokenBuf
-    typeIds, constIds: Table[string, string]   ## dedup key -> id
+    typeIds, constIds: Table[string, SymId]   ## dedup key -> id
     syms: Table[string, SymInfo]
     caps: HashSet[SpirvOp]
+    pool: Pool
 
 proc err(msg: string) {.noreturn.} =
-  raise newException(TranslateError, msg)
+  quit "ghast: " & msg
 
 proc base(id: string): string =
-  ## An id without its NIF module suffix — `int64.0` -> `int64` — for building
-  ## derived id names (which `def`/`idRef` then take verbatim).
+  ## An id name without its NIF module suffix — `int64.0` -> `int64` — for
+  ## building derived, human-readable id names.
   result = id
   for i in 0 ..< id.len:
     if id[i] == '.':
       result = id[0 ..< i]
       break
 
-proc freshId(m: var Module; prefix: string): string =
+proc mint(pg: var ProcGen; name: string): SymId =
+  ## Intern an id name into the shared pool, yielding its `SymId`.
+  pg.pool.syms.getOrIncl(name)
+
+proc stem(pg: ProcGen; id: SymId): string =
+  ## The readable stem of an already-minted id — its pooled name minus the NIF
+  ## module suffix (`int64.0` -> `int64`), used to name ids derived from it.
+  base(poolSym(pg.pool, id))
+
+proc freshId(m: var Module; prefix: string): SymId =
   inc m.counter
-  result = prefix & $m.counter & idSuffix
+  result = m.pool.syms.getOrIncl(prefix & $m.counter & idSuffix)
 
 # ── types & constants (emitted into the per-proc `types` buffer) ────────────
 
@@ -88,69 +106,69 @@ proc scalarWidth(t: Cursor): int =
     inc c
     while c.hasMore: skip c   # any trailing attributes (importc/header/…)
 
-proc intType(pg: var ProcGen; width: int; signed: bool): string =
+proc intType(pg: var ProcGen; width: int; signed: bool): SymId =
   let key = (if signed: "i" else: "u") & $width
   if key in pg.typeIds: return pg.typeIds[key]
-  let id = (if signed: "int" else: "uint") & $width & idSuffix
+  let id = mint(pg, (if signed: "int" else: "uint") & $width & idSuffix)
   pg.typeIds[key] = id
   case width
-  of 8: pg.caps.incl capInt8
-  of 16: pg.caps.incl capInt16
-  of 64: pg.caps.incl capInt64
+  of 8: pg.caps.incl Int8
+  of 16: pg.caps.incl Int16
+  of 64: pg.caps.incl Int64
   else: discard
   pg.types.def id, OpTypeInt:
     pg.types.litOp width
     pg.types.litOp (if signed: 1 else: 0)
   result = id
 
-proc boolType(pg: var ProcGen): string =
+proc boolType(pg: var ProcGen): SymId =
   if "bool" in pg.typeIds: return pg.typeIds["bool"]
-  let id = "bool" & idSuffix
+  let id = mint(pg, "bool" & idSuffix)
   pg.typeIds["bool"] = id
   pg.types.def id, OpTypeBool:
     discard
   result = id
 
-proc voidType(pg: var ProcGen): string =
+proc voidType(pg: var ProcGen): SymId =
   if "void" in pg.typeIds: return pg.typeIds["void"]
-  let id = "void" & idSuffix
+  let id = mint(pg, "void" & idSuffix)
   pg.typeIds["void"] = id
   pg.types.def id, OpTypeVoid:
     discard
   result = id
 
-proc valueType(pg: var ProcGen; t: Cursor): string =
-  ## SPIR-V type id for a Leng value type. Unsupported types abort the proc.
+proc valueType(pg: var ProcGen; t: Cursor): SymId =
+  ## SPIR-V type id for a Leng value type. Unsupported types abort the run.
   case t.typeKind
   of IT: result = intType(pg, scalarWidth(t), signed = true)
   of UT: result = intType(pg, scalarWidth(t), signed = false)
   of BoolT: result = boolType(pg)
   else: err("unsupported type")
 
-proc ptrType(pg: var ProcGen; sc: SpirvOp; elem: string): string =
-  let key = "ptr:" & $sc & ":" & elem
+proc ptrType(pg: var ProcGen; sc: SpirvOp; elem: SymId): SymId =
+  let key = "ptr:" & $sc & ":" & $elem
   if key in pg.typeIds: return pg.typeIds[key]
-  let id = "ptr_" & $sc & "_" & base(elem) & idSuffix
+  let id = mint(pg, "ptr_" & $sc & "_" & stem(pg, elem) & idSuffix)
   pg.typeIds[key] = id
   pg.types.def id, OpTypePointer:
     pg.types.enumOp sc
     pg.types.idRef elem
   result = id
 
-proc vecType(pg: var ProcGen; elem: string; n: int): string =
-  let key = "vec:" & elem & ":" & $n
+proc vecType(pg: var ProcGen; elem: SymId; n: int): SymId =
+  let key = "vec:" & $elem & ":" & $n
   if key in pg.typeIds: return pg.typeIds[key]
-  let id = "v" & $n & base(elem) & idSuffix
+  let id = mint(pg, "v" & $n & stem(pg, elem) & idSuffix)
   pg.typeIds[key] = id
   pg.types.def id, OpTypeVector:
     pg.types.idRef elem
     pg.types.litOp n
   result = id
 
-proc funcType(pg: var ProcGen; m: var Module; ret: string; params: seq[string]): string =
-  let key = "fn:" & ret & ":" & params.join(",")
+proc funcType(pg: var ProcGen; m: var Module; ret: SymId; params: seq[SymId]): SymId =
+  let key = "fn:" & $ret & ":" & params.mapIt($it).join(",")
   if key in pg.typeIds: return pg.typeIds[key]
-  let id = "fnty" & $m.counter & idSuffix
+  let id = mint(pg, "fnty" & $m.counter & idSuffix)
   inc m.counter
   pg.typeIds[key] = id
   pg.types.def id, OpTypeFunction:
@@ -158,10 +176,10 @@ proc funcType(pg: var ProcGen; m: var Module; ret: string; params: seq[string]):
     for p in params: pg.types.idRef p
   result = id
 
-proc constInt(pg: var ProcGen; typeId: string; v: int64): string =
-  let key = "c:" & typeId & ":" & $v
+proc constInt(pg: var ProcGen; typeId: SymId; v: int64): SymId =
+  let key = "c:" & $typeId & ":" & $v
   if key in pg.constIds: return pg.constIds[key]
-  let id = base(typeId) & "_" & (if v < 0: "n" & $(-v) else: $v) & idSuffix
+  let id = mint(pg, stem(pg, typeId) & "_" & (if v < 0: "n" & $(-v) else: $v) & idSuffix)
   pg.constIds[key] = id
   pg.types.def id, OpConstant:
     pg.types.idRef typeId
@@ -170,9 +188,9 @@ proc constInt(pg: var ProcGen; typeId: string; v: int64): string =
 
 # ── expressions ─────────────────────────────────────────────────────────────
 
-proc genExpr(m: var Module; pg: var ProcGen; n: Cursor; expected: string): string
+proc genExpr(m: var Module; pg: var ProcGen; n: Cursor; expected: SymId; dest: var Location)
 
-proc bufElemAddr(m: var Module; pg: var ProcGen; buf: SymInfo; idxId: string): string =
+proc bufElemAddr(m: var Module; pg: var ProcGen; buf: SymInfo; idxId: SymId): SymId =
   ## `OpAccessChain` to `buf[idx]`: into the StorageBuffer's `(struct (rtarray))`
   ## at member 0 (the runtime array), then element `idx`.
   let u32 = intType(pg, 32, false)
@@ -184,59 +202,56 @@ proc bufElemAddr(m: var Module; pg: var ProcGen; buf: SymInfo; idxId: string): s
     pg.funcs.idRef zero
     pg.funcs.idRef idxId
 
-proc genBinop(m: var Module; pg: var ProcGen; n: Cursor; op: SpirvOp): string =
+proc genBinop(m: var Module; pg: var ProcGen; n: Cursor; op: SpirvOp; dest: var Location) =
   ## `(add/sub/mul <type> a b)` -> an `OpIAdd`/`OpISub`/`OpIMul` value.
   var c = n
-  var resType = ""
-  var a = ""
-  var b = ""
+  var resType = SymId(0)
+  var a, b: Location
   c.into:
     resType = valueType(pg, c); skip c
-    a = genExpr(m, pg, c, resType); skip c
-    b = genExpr(m, pg, c, resType); skip c
+    genExpr(m, pg, c, resType, a); skip c
+    genExpr(m, pg, c, resType, b); skip c
     if c.hasMore: err("n-ary arithmetic not supported")
   let id = freshId(m, "t")
   pg.funcs.def id, op:
     pg.funcs.idRef resType
-    pg.funcs.idRef a
-    pg.funcs.idRef b
-  result = id
+    pg.funcs.idRef a.s
+    pg.funcs.idRef b.s
+  dest.s = id
 
-proc genExpr(m: var Module; pg: var ProcGen; n: Cursor; expected: string): string =
-  ## Translate an expression to the id of its SSA result value.
+proc genExpr(m: var Module; pg: var ProcGen; n: Cursor; expected: SymId; dest: var Location) =
+  ## Translate an expression, binding `dest` to the id of its SSA result value.
   if n.kind == Symbol:
     let name = symName(n)
     if name notin pg.syms: err("unknown symbol: " & name)
     let s = pg.syms[name]
     case s.cls
     of scParamValue:
-      result = s.id
+      dest.s = s.id
     of scLocalPtr:
       let id = freshId(m, "t")
       pg.funcs.def id, OpLoad:
         pg.funcs.idRef s.typeId
         pg.funcs.idRef s.id
-      result = id
+      dest.s = id
     of scBuffer:
       err("buffer '" & name & "' used as a scalar value")
   elif n.kind == IntLit:
-    if expected.len == 0: err("integer literal without a type context")
-    result = constInt(pg, expected, intVal(n))
+    if expected == SymId(0): err("integer literal without a type context")
+    dest.s = constInt(pg, expected, intVal(n))
   elif n.kind == TagLit:
     case n.exprKind
-    of AddC: result = genBinop(m, pg, n, OpIAdd)
-    of SubC: result = genBinop(m, pg, n, OpISub)
-    of MulC: result = genBinop(m, pg, n, OpIMul)
+    of AddC: genBinop(m, pg, n, OpIAdd, dest)
+    of SubC: genBinop(m, pg, n, OpISub, dest)
+    of MulC: genBinop(m, pg, n, OpIMul, dest)
     of ConvC:
       # `(conv <targetType> <expr>)`. v1 treats a conversion as identity (the
       # only conversions in a kernel are same-width index/int casts); a real
       # width change (OpSConvert/OpUConvert) is a later refinement.
       var c = n
-      var val = ""
       c.into:
         skip c                                   # target type
-        val = genExpr(m, pg, c, expected); skip c
-      result = val
+        genExpr(m, pg, c, expected, dest); skip c
     of SufC:
       # `(suf <intlit> "i32")` — a literal carrying a type suffix.
       var c = n
@@ -245,26 +260,26 @@ proc genExpr(m: var Module; pg: var ProcGen; n: Cursor; expected: string): strin
         if c.kind == IntLit: v = intVal(c)
         skip c
         while c.hasMore: skip c                  # the suffix string
-      if expected.len == 0: err("suffixed literal without a type context")
-      result = constInt(pg, expected, v)
+      if expected == SymId(0): err("suffixed literal without a type context")
+      dest.s = constInt(pg, expected, v)
     of PatC, AtC:
       # `buf[idx]` read -> OpAccessChain + OpLoad.
       var c = n
       var bufName = ""
-      var idxId = ""
+      var idx: Location
       c.into:
         bufName = symName(c); skip c
-        idxId = genExpr(m, pg, c, ""); skip c
+        genExpr(m, pg, c, SymId(0), idx); skip c
         while c.hasMore: skip c                  # bound / extra (array `at`) operands
       if bufName notin pg.syms or pg.syms[bufName].cls != scBuffer:
         err("indexing a non-buffer")
       let buf = pg.syms[bufName]
-      let address = bufElemAddr(m, pg, buf, idxId)
+      let address = bufElemAddr(m, pg, buf, idx.s)
       let id = freshId(m, "t")
       pg.funcs.def id, OpLoad:
         pg.funcs.idRef buf.typeId
         pg.funcs.idRef address
-      result = id
+      dest.s = id
     else: err("unsupported expression")
   else:
     err("unsupported operand")
@@ -286,10 +301,11 @@ proc genStmt(m: var Module; pg: var ProcGen; n: Cursor) =
       let name = symName(v.name)
       if name notin pg.syms: err("local not pre-declared (nested var?)")
       let s = pg.syms[name]
-      let val = genExpr(m, pg, v.value, s.typeId)
+      var val: Location
+      genExpr(m, pg, v.value, s.typeId, val)
       pg.funcs.instr OpStore:
         pg.funcs.idRef s.id
-        pg.funcs.idRef val
+        pg.funcs.idRef val.s
   of AsgnS:
     var c = n
     c.into:
@@ -297,32 +313,34 @@ proc genStmt(m: var Module; pg: var ProcGen; n: Cursor) =
         # `buf[idx] = rhs` -> OpAccessChain + OpStore.
         var lhs = c
         var bufName = ""
-        var idxId = ""
+        var idx: Location
         lhs.into:
           bufName = symName(lhs); skip lhs
-          idxId = genExpr(m, pg, lhs, ""); skip lhs
+          genExpr(m, pg, lhs, SymId(0), idx); skip lhs
           while lhs.hasMore: skip lhs
         skip c
         if bufName notin pg.syms or pg.syms[bufName].cls != scBuffer:
           err("assigning to a non-buffer index")
         let buf = pg.syms[bufName]
-        let val = genExpr(m, pg, c, buf.typeId)
+        var val: Location
+        genExpr(m, pg, c, buf.typeId, val)
         skip c
-        let address = bufElemAddr(m, pg, buf, idxId)
+        let address = bufElemAddr(m, pg, buf, idx.s)
         pg.funcs.instr OpStore:
           pg.funcs.idRef address
-          pg.funcs.idRef val
+          pg.funcs.idRef val.s
       elif c.kind == Symbol:
         let name = symName(c)
         if name notin pg.syms: err("assignment to unknown symbol")
         let s = pg.syms[name]
         if s.cls != scLocalPtr: err("assignment to a non-variable")
         skip c
-        let val = genExpr(m, pg, c, s.typeId)
+        var val: Location
+        genExpr(m, pg, c, s.typeId, val)
         skip c
         pg.funcs.instr OpStore:
           pg.funcs.idRef s.id
-          pg.funcs.idRef val
+          pg.funcs.idRef val.s
       else:
         err("assignment to an unsupported target")
   of RetS:
@@ -331,9 +349,10 @@ proc genStmt(m: var Module; pg: var ProcGen; n: Cursor) =
       if c.kind == DotToken:
         pg.funcs.instr OpReturn: discard
       else:
-        let val = genExpr(m, pg, c, "")
+        var val: Location
+        genExpr(m, pg, c, SymId(0), val)
         pg.funcs.instr OpReturnValue:
-          pg.funcs.idRef val
+          pg.funcs.idRef val.s
       skip c
   else:
     err("unsupported statement")
@@ -351,12 +370,13 @@ proc declareLocals(m: var Module; pg: var ProcGen; body: Cursor) =
       var vc = c
       let v = takeVarDecl(vc)
       let typeId = valueType(pg, v.typ)
-      let ptrId = ptrType(pg, scFunction, typeId)
+      let ptrId = ptrType(pg, Function, typeId)
       let name = symName(v.name)
-      pg.syms[name] = SymInfo(id: name, cls: scLocalPtr, typeId: typeId)
-      pg.funcs.def name, OpVariable:
+      let idSym = mint(pg, name)
+      pg.syms[name] = SymInfo(id: idSym, cls: scLocalPtr, typeId: typeId)
+      pg.funcs.def idSym, OpVariable:
         pg.funcs.idRef ptrId
-        pg.funcs.enumOp scFunction
+        pg.funcs.enumOp Function
     skip c
 
 proc newProcGen(pool: Pool; tags: TagPool): ProcGen =
@@ -365,10 +385,11 @@ proc newProcGen(pool: Pool; tags: TagPool): ProcGen =
           decorations: createTokenBuf(16, pool, tags),
           types: createTokenBuf(32, pool, tags),
           funcs: createTokenBuf(32, pool, tags),
-          typeIds: initTable[string, string](),
-          constIds: initTable[string, string](),
+          typeIds: initTable[string, SymId](),
+          constIds: initTable[string, SymId](),
           syms: initTable[string, SymInfo](),
-          caps: initHashSet[SpirvOp]())
+          caps: initHashSet[SpirvOp](),
+          pool: pool)
 
 proc appendAll(dest: var TokenBuf; src: var TokenBuf) =
   var c = src.beginRead()
@@ -386,30 +407,31 @@ proc commit(m: var Module; pg: var ProcGen) =
 
 proc translateProc(m: var Module; procCursor: Cursor) =
   ## Translate one `(proc …)` into a SPIR-V function, committing to `m` only on
-  ## success. Pre-builds all output in a `ProcGen` so a `TranslateError` mid-way
-  ## leaves the module untouched.
+  ## success. Pre-builds all output in a `ProcGen` so its sections can be spliced
+  ## into the module in SPIR-V's mandated order.
   var pg = newProcGen(m.pool, m.tags)
   var n = procCursor
   let p = takeProcDecl(n)
 
-  let fnName = symName(p.name)
+  let fnName = mint(pg, symName(p.name))
   let retId =
     if p.returnType.kind == DotToken or p.returnType.typeKind == VoidT:
       voidType(pg)
     else:
       valueType(pg, p.returnType)
 
-  var paramTypes: seq[string] = @[]
-  var paramOrder: seq[tuple[id, typeId: string]] = @[]
+  var paramTypes: seq[SymId] = @[]
+  var paramOrder: seq[tuple[id, typeId: SymId]] = @[]
   if p.params.typeKind == ParamsT:
     var pc = p.params
     loopInto pc:
       let pd = takeParamDecl(pc)
       let typeId = valueType(pg, pd.typ)
       let name = symName(pd.name)
-      pg.syms[name] = SymInfo(id: name, cls: scParamValue, typeId: typeId)
+      let idSym = mint(pg, name)
+      pg.syms[name] = SymInfo(id: idSym, cls: scParamValue, typeId: typeId)
       paramTypes.add typeId
-      paramOrder.add (name, typeId)
+      paramOrder.add (idSym, typeId)
   elif p.params.kind != DotToken:
     err("unsupported parameter list")
 
@@ -417,7 +439,7 @@ proc translateProc(m: var Module; procCursor: Cursor) =
 
   pg.funcs.def fnName, OpFunction:
     pg.funcs.idRef retId
-    pg.funcs.enumOp fcNone
+    pg.funcs.enumOp None
     pg.funcs.idRef fnTypeId
   for prm in paramOrder:
     pg.funcs.def prm.id, OpFunctionParameter:
@@ -459,29 +481,29 @@ proc translateKernel(m: var Module; procCursor: Cursor) =
   var pg = newProcGen(m.pool, m.tags)
   var n = procCursor
   let p = takeProcDecl(n)
-  let mainId = symName(p.name)
+  let mainId = mint(pg, symName(p.name))
 
   let u32 = intType(pg, 32, false)
   let voidId = voidType(pg)
   let fnty = funcType(pg, m, voidId, @[])
   let vec3u = vecType(pg, u32, 3)
-  let ptrInVec3 = ptrType(pg, scInput, vec3u)
-  let ptrInU32 = ptrType(pg, scInput, u32)
+  let ptrInVec3 = ptrType(pg, Input, vec3u)
+  let ptrInU32 = ptrType(pg, Input, u32)
   let zero = constInt(pg, u32, 0)
 
   # The GlobalInvocationId builtin input variable.
-  let gid = "gid" & idSuffix
+  let gid = mint(pg, "gid" & idSuffix)
   pg.types.def gid, OpVariable:
     pg.types.idRef ptrInVec3
-    pg.types.enumOp scInput
+    pg.types.enumOp Input
   pg.decorations.instr OpDecorate:
     pg.decorations.idRef gid
-    pg.decorations.enumOp decBuiltIn
-    pg.decorations.enumOp biGlobalInvocationId
+    pg.decorations.enumOp BuiltIn
+    pg.decorations.enumOp GlobalInvocationId
 
   # Classify params: the first scalar is the grid index, each pointer a buffer.
   var indexParam = ""
-  var indexType = ""
+  var indexType = SymId(0)
   var binding = 0
   if p.params.typeKind == ParamsT:
     var pc = p.params
@@ -495,7 +517,7 @@ proc translateKernel(m: var Module; procCursor: Cursor) =
           pg.types.idRef elem
         pg.decorations.instr OpDecorate:
           pg.decorations.idRef rta
-          pg.decorations.enumOp decArrayStride
+          pg.decorations.enumOp ArrayStride
           pg.decorations.litOp 4
         let st = freshId(m, "buf")
         pg.types.def st, OpTypeStruct:
@@ -503,26 +525,26 @@ proc translateKernel(m: var Module; procCursor: Cursor) =
         pg.decorations.instr OpMemberDecorate:
           pg.decorations.idRef st
           pg.decorations.litOp 0
-          pg.decorations.enumOp decOffset
+          pg.decorations.enumOp Offset
           pg.decorations.litOp 0
         pg.decorations.instr OpDecorate:
           pg.decorations.idRef st
-          pg.decorations.enumOp decBlock
-        let sbPtr = ptrType(pg, scStorageBuffer, st)
-        let varId = base(pname) & idSuffix
+          pg.decorations.enumOp Block
+        let sbPtr = ptrType(pg, StorageBuffer, st)
+        let varId = mint(pg, base(pname) & idSuffix)
         pg.types.def varId, OpVariable:
           pg.types.idRef sbPtr
-          pg.types.enumOp scStorageBuffer
+          pg.types.enumOp StorageBuffer
         pg.decorations.instr OpDecorate:
           pg.decorations.idRef varId
-          pg.decorations.enumOp decDescriptorSet
+          pg.decorations.enumOp DescriptorSet
           pg.decorations.litOp 0
         pg.decorations.instr OpDecorate:
           pg.decorations.idRef varId
-          pg.decorations.enumOp decBinding
+          pg.decorations.enumOp Binding
           pg.decorations.litOp binding
         inc binding
-        let elemPtr = ptrType(pg, scStorageBuffer, elem)
+        let elemPtr = ptrType(pg, StorageBuffer, elem)
         pg.syms[pname] = SymInfo(id: varId, cls: scBuffer, typeId: elem, ptrId: elemPtr)
       else:
         if indexParam.len > 0: err("kernel: more than one scalar parameter")
@@ -532,20 +554,20 @@ proc translateKernel(m: var Module; procCursor: Cursor) =
   if indexParam.len == 0: err("kernel: no grid-index parameter")
 
   pg.entryPoints.instr OpEntryPoint:
-    pg.entryPoints.enumOp exeGLCompute
+    pg.entryPoints.enumOp GLCompute
     pg.entryPoints.idRef mainId
     pg.entryPoints.strOp "main"
     pg.entryPoints.idRef gid                 # SPIR-V 1.3 interface = Input/Output vars
   pg.execModes.instr OpExecutionMode:
     pg.execModes.idRef mainId
-    pg.execModes.enumOp modeLocalSize
+    pg.execModes.enumOp LocalSize
     pg.execModes.litOp 1
     pg.execModes.litOp 1
     pg.execModes.litOp 1
 
   pg.funcs.def mainId, OpFunction:
     pg.funcs.idRef voidId
-    pg.funcs.enumOp fcNone
+    pg.funcs.enumOp None
     pg.funcs.idRef fnty
   let entry = freshId(m, "entry")
   pg.funcs.def entry, OpLabel:
@@ -595,9 +617,8 @@ proc translateModule*(input: var TokenBuf): TokenBuf =
   if c.stmtKind == StmtsS:
     loopInto c:
       if c.stmtKind == ProcS:
-        # Any unsupported construct raises `TranslateError`, which propagates:
-        # ghast fails on the whole module rather than silently emitting a
-        # quietly-incomplete one.
+        # Any unsupported construct `quit`s (see `err`): ghast fails on the whole
+        # module rather than silently emitting a quietly-incomplete one.
         if isKernel(c): translateKernel(m, c)
         else: translateProc(m, c)
       skip c
@@ -605,13 +626,13 @@ proc translateModule*(input: var TokenBuf): TokenBuf =
   result = createTokenBuf(64, pool, tags)
   beginModule result
   result.instr OpCapability:
-    result.enumOp capShader
+    result.enumOp Shader
   for cap in sorted(toSeq(m.caps)):
     result.instr OpCapability:
       result.enumOp cap
   result.instr OpMemoryModel:
-    result.enumOp addrLogical
-    result.enumOp memGLSL450
+    result.enumOp Logical
+    result.enumOp GLSL450
   appendAll(result, m.entryPoints)
   appendAll(result, m.execModes)
   appendAll(result, m.decorations)
