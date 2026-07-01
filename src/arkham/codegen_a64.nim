@@ -1768,17 +1768,31 @@ proc foldRhs2(g: var CodeGen; op: A64Inst; dest: Reg; rhsLoc: Location; rhsC: Cu
     g.dropBridge b
   else: raiseAssert "arkham a64n: foldRhs2 " & $rhsLoc.kind
 
+proc normalizeBinWidth(g: var CodeGen; resTypeC: Cursor; rD: Reg; op: A64Inst) =
+  ## arkham keeps register values canonically sign/zero-extended to their full
+  ## 64-bit form. `add`/`sub`/`mul`/`lsl` on a sub-64-bit type can leave nonzero
+  ## bits ABOVE the type width (lsl overflow, add carry, unsigned sub borrow) — a
+  ## following `lsr` / unsigned compare / `udiv` would then read those stale bits.
+  ## Re-normalize the result to restore the invariant. tinyhashes' `!&`/`!$` are the
+  ## canonical case: `x shl 10'u32` overflowed past bit 31 and the next `shr 6'u32`
+  ## pulled the leaked bits back down. (`and`/`orr`/`eor`/`lsr` of already-normalized
+  ## operands stay normalized, so they need no fixup.)
+  if op notin {AddA64, SubA64, MulA64, LslA64}: return
+  let slot = typeToSlot(resTypeC)
+  if slot.kind in {AInt, AUInt} and slot.size > 0 and slot.size < 8:
+    g.extendTo(rD, slot.size * 8, signed = slot.kind == AInt)
+
 proc emitBin2(g: var CodeGen; c: Cursor) =
   ## `(op T a b)` → `dest = a op b` into the precomputed result register, replaying
   ## the allocator's operand placement (swapped / foldB / aliasRhs).
   let pos = g.posOf(c)
   let res = g.ra.locs[pos]
   let op = g.binA64Op(c)
-  var lhsC, rhsC: Cursor
+  var lhsC, rhsC, resTypeC: Cursor
   block:
     var cc = c
     cc.into:
-      skip cc                                             # result type
+      resTypeC = cc; skip cc                              # result type
       lhsC = cc; skip cc
       rhsC = cc; skip cc
       while cc.hasMore: skip cc
@@ -1792,6 +1806,7 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
     if op == SubA64:
       g.ab.tree NegA64: g.emReg rD                        # rD := -rhs
     g.foldRhs2(foldOp, rD, lhsLoc, lhsC)                  # rD := rD <foldOp> lhs
+    g.normalizeBinWidth(resTypeC, rD, op)                 # restore the sub-width invariant
     return
   g.emitValue2(lhsC)
   g.emitValue2(rhsC)
@@ -1815,6 +1830,7 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
   else:
     g.place2(lhsLoc, rD)                                  # dest := lhs
     g.foldRhs2(op, rD, rhsLoc, rhsC)                      # dest op= rhs
+  g.normalizeBinWidth(resTypeC, rD, op)                   # restore the sub-width invariant
   if rhsLoc.kind == InReg and rhsLoc.isTemp: g.unbindTemp(rhsLoc.r)
   if lhsLoc.kind == InReg and lhsLoc.isTemp and not reusedLhs: g.unbindTemp(lhsLoc.r)
   if resStaging != NoReg:

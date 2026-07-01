@@ -1842,6 +1842,21 @@ proc binFold(g: var CodeGen; op: X64Inst; dest: Reg; loc: Location; opCur: Curso
   else:
     g.binMemLval2(op, dest, opCur)
 
+proc normalizeBinWidth(g: var CodeGen; resTypeC: Cursor; rD: Reg; op: X64Inst) =
+  ## arkham keeps register values canonically sign/zero-extended to their full
+  ## 64-bit form. `add`/`sub`/`mul`/`shl` on a sub-64-bit type can leave nonzero
+  ## bits ABOVE the type width (shl overflow past the top bit, add carry, unsigned
+  ## sub borrow) — so a following `shr` / unsigned-compare / `div` would read those
+  ## stale bits. Re-normalize the result to restore the invariant. `!&`/`!$` in
+  ## tinyhashes are the canonical case: `x shl 10'u32` overflowed into bits 32+ and
+  ## the next `shr 6'u32` pulled them back down, diverging RTTI hashes from the C
+  ## backend. (`and`/`or`/`xor`/`shr` of already-normalized operands stay normalized,
+  ## so they need no fixup.)
+  if op notin {AddX64, SubX64, ImulX64, ShlX64}: return
+  let slot = typeToSlot(resTypeC)
+  if slot.kind in {AInt, AUInt} and slot.size > 0 and slot.size < 8:
+    g.extendTo(rD, slot.size * 8, signed = slot.kind == AInt)
+
 proc emitBin2(g: var CodeGen; c: Cursor) =
   ## Emit a binary-arith node into its precomputed result register, replaying the
   ## allocator's operand placement (`aux.foldB` ⇒ the rhs stays a memory operand).
@@ -1849,11 +1864,11 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
   let res = g.ra.locs[pos]
   let (op, isBin) = binArithOp(c)
   assert isBin, "arkham x64n: emitBin2 on a non-bin node"
-  var lhsC, rhsC: Cursor
+  var lhsC, rhsC, resTypeC: Cursor
   block:
     var cc = c
     cc.into:
-      skip cc                                            # result type
+      resTypeC = cc; skip cc                             # result type
       lhsC = cc; skip cc
       rhsC = cc; skip cc
       while cc.hasMore: skip cc
@@ -1876,6 +1891,12 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
     if rdSeal: g.ra.seal {rD}
     if op == SubX64:
       g.ab.tree NegX64: g.emReg rD                       # rD := -rhs
+    # The swapped fold reads the left operand straight from its allocator-assigned
+    # register (`binReg` below). A register-homed symbol that was SPILLED/demoted no
+    # longer HOLDS its value there — so materialize it from its real home first (a load),
+    # exactly as the non-swapped path's `emitValue2(lhsC)` does. Without this the fold
+    # adds a stale register (e.g. a leftover stack address → corrupted upper bits).
+    if lhsLoc.kind == InReg: g.emitValue2(lhsC)
     case lhsLoc.kind                                     # rD := rD <foldOp> lhs
     of Imm:
       if lhsLoc.ival < low(int32).int64 or lhsLoc.ival > high(int32).int64:
@@ -1887,6 +1908,7 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
     of InReg: g.binReg(foldOp, rD, lhsLoc.r)
     of NamedStack, Mem: g.binFold(foldOp, rD, lhsLoc, lhsC)  # sub-width field → load+extend
     else: raiseAssert "arkham x64n: bin(swapped) lhs " & $lhsLoc.kind
+    g.normalizeBinWidth(resTypeC, rD, op)                # restore the sub-width invariant
     if rdSeal: g.ra.unseal {rD}
     return
   g.emitValue2(lhsC)                                     # materialize sub-results first
@@ -1939,6 +1961,7 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
     of InReg: g.binReg(op, rD, rhsLoc.r)
     of NamedStack, Mem: g.binFold(op, rD, rhsLoc, rhsC)  # sub-width field → load+extend
     else: raiseAssert "arkham x64n: bin rhs " & $rhsLoc.kind
+  g.normalizeBinWidth(resTypeC, rD, op)                  # restore the sub-width invariant
   if rdSeal: g.ra.unseal {rD}
   if rhsLoc.kind == InReg and rhsLoc.isTemp: g.unbindTemp(rhsLoc.r)
   if lhsLoc.kind == InReg and lhsLoc.isTemp and not reusedLhs: g.unbindTemp(lhsLoc.r)
@@ -2076,6 +2099,7 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
   var tgt: CallTarget
   var fnptrReg = NoReg                               # indirect: the fn-ptr's held register
   var fnTargetName = ""                              # indirect: the synthesized binding to kill
+  var stagedFnptr = NoReg                            # indirect: sealed staging reg for a SPILLED target (release post-call)
   if indirect:                                       # target is a fn-ptr expression
     let proctype = g.proctypeOfTarget(targetCur)
     let declarative = isDeclarativeAbi(g.prog, proctype)
@@ -2091,8 +2115,17 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
     # Proctype …)` vtable load, a `(dot closure fld)`, a proc-typed local or PARAM.
     g.emitValue2(targetCur)
     let tloc = g.ra.locs[cursorToPosition(g.buf[], targetCur)]
-    assert tloc.kind == InReg, "arkham x64n: indirect call target loc " & $tloc.kind
-    fnptrReg = tloc.r
+    if tloc.kind == InReg:
+      fnptrReg = tloc.r
+    else:
+      # Under register pressure the allocator spilled the fn-ptr target into an `etmp`
+      # stack slot (emitValue2 already produced the value there). nifasm's `(prepare …)`
+      # target must be a REGISTER, so load it into a sealed staging register the arg-
+      # marshalling staging picks route around; released after the call via `stagedFnptr`.
+      assert tloc.kind in {NamedStack, Mem}, "arkham x64n: indirect call target loc " & $tloc.kind
+      stagedFnptr = g.pickStagingSealed("an indirect call target", AddrSlot)
+      g.emitLoadLoc(tloc, stagedFnptr)
+      fnptrReg = stagedFnptr
     # nifasm needs the `(prepare …)` target to be a ProcT-typed symbol. A register-homed
     # proc-typed LOCAL is already declared `(var :f (reg) (proctype …))` — reuse it. Any
     # other shape (a proc-typed PARAM the param-setup left as a raw/aliased register, or a
@@ -2225,6 +2258,7 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
       g.ab.tree KillX64: g.ab.sym fnTargetName
       g.regLocal.del fnptrReg
       g.boundTemps.excl fnptrReg
+    if stagedFnptr != NoReg: g.giveBack stagedFnptr
     if hasResult:
       if resultIsFloat:
         if resLoc.kind == InFReg:
@@ -2404,6 +2438,7 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
     g.ab.tree KillX64: g.ab.sym fnTargetName
     g.regLocal.del fnptrReg
     g.boundTemps.excl fnptrReg
+  if stagedFnptr != NoReg: g.giveBack stagedFnptr
   if hasResult:
     if resultIsFloat:
       if resLoc.kind == InFReg:
