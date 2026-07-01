@@ -1041,7 +1041,12 @@ proc transferAggrWords(g: var CodeGen; varName, typeName: string;
   else:
     addrTmp = g.pickStaging()                          # R11 bridge ← &slot
     g.bindTemp(addrTmp, AddrSlot)                       # typed+tracked (giveBack unbinds)
-    g.emStackAddr(addrTmp, varName)
+    # The source may be a local stack slot OR a module-level global / `const` / tvar
+    # (e.g. `return NoNifLineInfo`, a global const aggregate). `locationOfSym` is
+    # NamedStack for a local and `Undef` for a module-level symbol — whose address is
+    # RIP-relative (global/const) or FS+off (tvar), NEVER rsp-relative `emStackAddr`.
+    if loc.kind == NamedStack: g.emStackAddr(addrTmp, varName)
+    else: g.emSymAddrByName(addrTmp, varName)
     baseReg = addrTmp
   for i in 0 ..< aggrWordCount(g.prog, typeName):
     g.ab.tree MovX64:
@@ -2010,6 +2015,19 @@ proc emitBitBuiltin2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
     # count trailing zeros == index of the least-significant set bit == BSF.
     # (x == 0 is UB in C and never reached: nimony callers guard the zero case.)
     g.ab.tree BsfX64: (g.emReg RAX; g.emReg ar)
+  of "__builtin_bswap64":
+    # reverse all 8 bytes: move the arg into rax, BSWAP it in place (64-bit).
+    g.movReg(RAX, ar)
+    g.ab.tree BswapX64: (g.emReg RAX; g.ab.intLit 64)
+  of "__builtin_bswap32":
+    g.movReg(RAX, ar)
+    g.ab.tree BswapX64: (g.emReg RAX; g.ab.intLit 32)
+  of "__builtin_bswap16":
+    # x86 BSWAP r16 is undefined; reverse as a 32-bit bswap then take the high half
+    # back down (the two low bytes end up swapped in bits 0..15).
+    g.movReg(RAX, ar)
+    g.ab.tree BswapX64: (g.emReg RAX; g.ab.intLit 32)
+    g.ab.tree ShrX64: (g.emReg RAX; g.ab.intLit 16)
   else:
     raiseAssert "arkham x64n: bit builtin not yet implemented: " & builtin
 
@@ -3430,6 +3448,20 @@ proc copyAggr(g: var CodeGen; dst, src: Reg; size: int; tmp: Reg) =
     g.ab.tree MovX64: (g.emReg tmp; g.emByteAtImm(src, off))
     g.ab.tree MovX64: (g.emByteAtImm(dst, off); g.emReg tmp)
 
+proc emAggrSrcAddr(g: var CodeGen; dest: Reg; name: string) =
+  ## `dest ← &name` for an aggregate SOURCE that may be a local stack slot, a by-ref
+  ## aggregate param (its pointer is already in a register), OR a module-level
+  ## global / `const` / threadvar. `locationOfSym` yields NamedStack/InReg for a local
+  ## and `Undef` for a module-level symbol (disambiguated by category in
+  ## `emSymAddrByName`). Crucially, the rsp-base `emStackAddr` must NOT be used for a
+  ## global/const — its address is RIP-relative, not stack-relative (e.g. copying a
+  ## global `const` aggregate like `NoNifLineInfo` out via a `return`).
+  let home = g.ra.locationOfSym(name)
+  case home.kind
+  of NamedStack: g.emStackAddr(dest, name)
+  of InReg: g.movReg(dest, home.r)
+  else: g.emSymAddrByName(dest, name)
+
 proc copyStructThroughPtr2(g: var CodeGen; srcVar, typeName: string; ptrReg: Reg) =
   ## Copy `srcVar` → the memory `ptrReg` points at (the >16B aggregate hidden-result-
   ## pointer return). This runs at the `ret` and crosses NO call, so both scratch
@@ -3437,7 +3469,7 @@ proc copyStructThroughPtr2(g: var CodeGen; srcVar, typeName: string; ptrReg: Reg
   ## transient staging pool, never a callee-saved survivor (a survivor would force the
   ## allocator to find a stealable callee-saved local, which can spuriously fail).
   let sp = g.pickStagingSealed("a struct-through-ptr source pointer", AddrSlot)
-  g.emStackAddr(sp, srcVar)
+  g.emAggrSrcAddr(sp, srcVar)
   let tmp = g.pickStagingSealed("a struct-through-ptr word", AddrSlot, avoid = sp)
   g.copyAggr(ptrReg, sp, aggrByteSize(g.prog, typeName), tmp)
   g.giveBack tmp
@@ -3503,7 +3535,7 @@ proc flatCopyToPtr(g: var CodeGen; srcVar: string; sizeBytes: int; dstPtr, tmp: 
   ## scratch `tmp`. Leas the source's address into one staging register and funnels
   ## through the one `copyAggr` (word bulk + byte tail — any size, layout-agnostic).
   let srcPtr = g.pickStagingSealed("a flat-copy source pointer", AddrSlot)
-  g.emStackAddr(srcPtr, srcVar)
+  g.emAggrSrcAddr(srcPtr, srcVar)
   g.bindTemp(tmp, AsmSlot(cls: AUInt, size: 8, align: 8))
   g.copyAggr(dstPtr, srcPtr, sizeBytes, tmp)
   g.unbindTemp(tmp)
@@ -4718,7 +4750,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   when defined(arkhamDumpLocs):
     block:
       stderr.writeLine "=== allocValue locs ==="
-      for pos in 0 ..< g.ra.locs.len:
+      for pos in g.ra.locs.base ..< g.ra.locs.base + g.ra.locs.data.len:
         let l = g.ra.locs[pos]
         if l.kind == Undef: continue
         var s = "  pos " & $pos & " : " & $l.kind

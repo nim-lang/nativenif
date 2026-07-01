@@ -51,8 +51,21 @@ type
     aliasRhs*: bool                   ## dest register aliases the rhs operand: the emitter
                                       ## must not place lhs into dest first (`s = a - s`)
 
+  LocSpan* = object
+    ## Position-indexed `Location` storage for ONE proc. Token positions are
+    ## ABSOLUTE module-buffer offsets (`cursorToPosition`), but a proc only ever
+    ## touches positions inside its own contiguous subtree span `[base, base+data.len)`.
+    ## Sizing to the SPAN instead of the whole module (the old `newSeq(buf.len)`)
+    ## makes per-proc allocation O(procTokens) rather than O(moduleTokens): with the
+    ## module-sized array, every one of a module's hundreds of procs re-allocated and
+    ## zeroed a full ~buf.len array of ~130-byte `Location`s — GBs of pure memory
+    ## traffic, ~91% of arkham's runtime. Indexing subtracts `base`, so all existing
+    ## `locs[pos]` call sites are unchanged.
+    base*: int
+    data*: seq[Location]
+
   RegAlloc* = object
-    locs*: seq[Location]              ## indexed by cursorToPosition. Currently filled
+    locs*: LocSpan                    ## indexed by cursorToPosition. Currently filled
                                       ## for symbol defs; the rewrite fills it for EVERY
                                       ## value-producing position (its result location).
     aux*: Table[int, ExprAux]         ## pos → per-op selection aux (see `ExprAux`)
@@ -117,6 +130,14 @@ type
                                       ## allocate an inline `(ret (oconstr …))` value
     atScratch: HashSet[int]           ## value-core: `(at …)` positions needing a scratch GPR
                                       ## (non-SIB element stride); sized by the codegen
+
+proc initLocSpan(base, len: int): LocSpan {.inline.} =
+  ## Zero-inits `len` `Location`s (kind `Undef`, ordinal 0 — an unwritten position).
+  LocSpan(base: base, data: newSeq[Location](len))
+
+proc `[]`*(s: LocSpan; pos: int): lent Location {.inline.} = s.data[pos - s.base]
+proc `[]`*(s: var LocSpan; pos: int): var Location {.inline.} = s.data[pos - s.base]
+proc `[]=`*(s: var LocSpan; pos: int; v: Location) {.inline.} = s.data[pos - s.base] = v
 
 proc posOf(b: Builder; c: Cursor): int {.inline.} =
   cursorToPosition(b.buf[], c)
@@ -1288,9 +1309,30 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
           while n.hasMore: skip n
         b.ra.locs[pos] = resDest
       else:
+        # The "compute straight into dest" identity assumes the emitter's
+        # re-representation leaves the register's bits alone. That holds for a
+        # same-width relabel, but a NARROWING int↔int cast emits a destructive
+        # `shl/shr` (extendTo) on the result register. When the operand is a
+        # register-homed symbol, its home is FROZEN for the whole scope and the
+        # variable outlives the cast — so narrowing in place corrupts it (e.g.
+        # `cast[uint32](q)` inside `bigDivisor * cast[uint32](q)` zeroed q's own
+        # upper 32 bits). Detect a register-homed symbol under a strict narrowing
+        # and force a fresh temp so the emitter copies-then-narrows, leaving the
+        # source intact.
+        block:
+          var innerC = n; inc innerC           # tag → target type
+          let tgtSize = slotOf(b.prog[], innerC).size
+          skip innerC                          # target type → inner expr
+          if innerC.kind == Symbol:
+            let sh = b.symLoc(symName(innerC))
+            # A register OR stack home is frozen for the symbol's scope: aliasing the
+            # cast result to it and narrowing in place (a reg `shl/shr`, or a
+            # load-narrow-STORE-BACK for a stack slot) corrupts the live variable.
+            if sh.kind in {InReg, NamedStack} and tgtSize < sh.typ.size:
+              b.forceRegDest(dest)             # do not alias the frozen source home
         n.into:
           skip n                               # target type
-          allocValue(b, n, dest)               # inner → dest (identity)
+          allocValue(b, n, dest)               # inner → dest (fresh temp or identity)
           while n.hasMore: skip n
         b.ra.locs[pos] = dest
       return
@@ -2022,7 +2064,14 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
   var b = Builder(buf: addr buf, an: addr an, prog: addr prog, tc: tc, md: md,
                   atScratch: atScratch)
   b.allocExprs = allocExprs
-  b.ra = RegAlloc(locs: newSeq[Location](buf.len),
+  # `locs` only ever holds positions inside THIS proc's contiguous subtree span, so
+  # size it to that span (base = the proc's first token position) rather than the whole
+  # module. Sizing to `buf.len` re-allocated+zeroed a module-sized array for every proc
+  # — O(procs × moduleTokens), ~91% of arkham's runtime on big modules. See `LocSpan`.
+  let procStart = cursorToPosition(buf, procDecl)
+  var procEndCur = procDecl; skip procEndCur
+  let procEnd = cursorToPosition(buf, procEndCur)
+  b.ra = RegAlloc(locs: initLocSpan(procStart, procEnd - procStart),
                   aux: initTable[int, ExprAux](),
                   symPos: initTable[string, int]())
   b.ra.sealed = presealed
