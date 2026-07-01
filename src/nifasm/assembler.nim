@@ -744,6 +744,20 @@ proc lookupWithAutoImport(ctx: var GenContext; scope: Scope; name: string; n: Cu
 
   # Mark symbol as used for dependency tracking
   if result != nil:
+    # Redirect a deduplicated duplicate to its CANONICAL symbol so every reference
+    # shares ONE symbol — hence ONE label. A weak/COMDAT proc or data blob (e.g. an
+    # enum `$`) is emitted in several modules with the same dedup key but only its
+    # canonical copy's body is generated (processReachableSymbols); a reference left
+    # pointing at a non-canonical duplicate's own (never-defined) label id would fail
+    # linking with "Label not found". First sighting of a key becomes canonical; later
+    # duplicates resolve back to it (its symbol is already in scope from that sighting).
+    let dedupKey = extractDedupKey(result.name)
+    if dedupKey != "" and dedupKey in ctx.dedupTable and
+       ctx.dedupTable[dedupKey] != result.name:
+      let canon = scope.lookup(ctx.dedupTable[dedupKey])
+      if canon != nil: result = canon
+    # `markSymbolUsed` owns dedupTable registration + pending-queue insertion for the
+    # first-seen (canonical) name; we only READ the table above to redirect duplicates.
     markSymbolUsed(ctx, result.name)
 
 proc parsePtrType(kind: TypeKind; n: var Cursor; scope: Scope; ctx: var GenContext): Type =
@@ -5756,6 +5770,30 @@ proc writeElf(a: var GenContext; outfile: string) =
       a.gvarSites[k] = (posMap[a.gvarSites[k][0]], a.gvarSites[k][1])
     if a.tlsEntryOffset >= 0:
       a.tlsEntryOffset = posMap[a.tlsEntryOffset]
+  when defined(arkhamDbgReloc):
+    block validateRelocs:
+      var defined = initHashSet[int]()
+      var labelPos = initTable[int, int]()
+      for ld in a.buf.labels: (defined.incl int(ld.id); labelPos[int(ld.id)] = ld.position)
+      var idToName = initTable[int, string]()
+      var procRows: seq[(int, string)]
+      for name, sym in a.rootScope.syms:
+        if sym.offset >= 0: idToName[sym.offset] = name
+        if sym.kind == skProc and labelPos.hasKey(sym.offset):
+          procRows.add (labelPos[sym.offset], name)
+      procRows.sort(proc (x, y: (int, string)): int = cmp(x[0], y[0]))
+      var bad = 0
+      for r in a.buf.relocs:
+        if not defined.contains(int(r.target)):
+          inc bad
+          var enc = "?"
+          for (p, nm) in procRows:
+            if p <= r.position: enc = nm else: break
+          if bad <= 30:
+            stderr.writeLine "MISSING LABEL: reloc pos=" & $r.position & " kind=" & $r.kind &
+              " targetId=" & $int(r.target) & " targetName=" &
+              idToName.getOrDefault(int(r.target), "<no-name>") & " in proc " & enc
+      if bad > 0: stderr.writeLine "TOTAL MISSING LABELS: " & $bad
   finalize(a.buf)
   finalize(a.bssBuf)
   # `--symmap`: dump every generated proc's virtual address to stderr (the ELF
