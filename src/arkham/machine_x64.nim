@@ -67,10 +67,16 @@ const
                                      # GPR the emitter can grab to make mem←mem / spilled
                                      # value-position produce-into total, so the allocator's
                                      # `etmp` fallback is always emittable.
-    intLocalTempRegs: @[],           # NO volatile int reg may home a local on x86-64: R10 is
-                                     # the emitter's staging scratch (and R11 the bridge), so a
-                                     # local there starves the emitter. Call-free locals that
-                                     # exhaust the callee-saved pool spill instead.
+    intLocalTempRegs: @[RDI, RSI, R8, R9],  # volatile homes a CALL-FREE local may use once the 5
+                                     # callee-saved regs are exhausted (the analyser's `AllRegs`
+                                     # interval test guarantees no call in the range, so these
+                                     # caller-saved regs are not clobbered). Restricted to the arg
+                                     # registers with NO fixed instruction role: rdx (idiv), rcx
+                                     # (shift count), rax (return/mul/div), r10/r11 (emitter staging
+                                     # + bridge) all have non-call uses and stay OUT. A persistent
+                                     # leaf-param home in one of these is excluded in `allocParams`;
+                                     # `pickStagingScratch` already routes staging around a live
+                                     # local/param home (`regHoldsLiveLocal`).
     intCalleeSaved: @[RBX, R12, R13, R14, R15],
     floatTempRegs: @[F8, F9, F10, F11, F12, F13, F14],   # F15 RESERVED as the float
                                                          # staging bridge (FloatStagingBridge)

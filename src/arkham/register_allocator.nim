@@ -28,6 +28,8 @@
 import std / [tables, sets, assertions]
 import nifcore, nifcdecl, slots, machinedesc, analyser, programs, typenav
 
+var gArkhamCurProc* = ""   # debug: the proc arkham is currently allocating (for asserts)
+
 type
   ExprAux* = object
     ## Per-expression-position selection decisions the pure emitter must replay
@@ -194,10 +196,25 @@ proc allocStorage(b: var Builder; slot: AsmSlot; props: VarProps): Location =
     # empty or exhausted, spill rather than steal the emitter's scratch.
     r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
     if r == NoReg: r = b.takeReg(b.freeVol, b.md.intLocalTempRegs)
+    # Still nothing? A local whose interval crosses no variable shift / no div may
+    # additionally home in the shift-count / div-rem register: their fixed role
+    # never overlaps this local's life (guaranteed by the interval test that set
+    # `ShiftRegOk`/`DivRegOk`; asserted at the div/shift emission sites). This is the
+    # per-fixed-role-register generalization of `AllRegs` — more homes for the hot,
+    # call-free leaf functions that are otherwise spill-bound.
+    if r == NoReg and ShiftRegOk in props and b.md.shiftCountReg != NoReg:
+      r = b.takeReg(b.freeVol, [b.md.shiftCountReg])
+    if r == NoReg and DivRegOk in props and b.md.divRemReg != NoReg:
+      r = b.takeReg(b.freeVol, [b.md.divRemReg])
   else:
     # may be live across a call → must be callee-saved (or stack)
     r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
-  if r == NoReg: return b.spill(slot)
+  if r == NoReg:
+    when defined(arkhamSpillDbg):
+      stderr.writeLine "SPILL allregs=" & $(AllRegs in props) &
+        " homesUsed=" & $(b.freeCallee.card + b.freeVol.card) &
+        " callee=" & $(5 - b.freeCallee.card) & "/5 vol=" & $b.freeVol.card & "free"
+    return b.spill(slot)
   if r in b.md.intCalleeSavedSet: b.ra.usedCallee.incl r
   result = regLoc(r, slot)
 
@@ -450,8 +467,6 @@ proc allocConstr(b: var Builder; n: var Cursor)
 proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int)
 proc releaseLvalTemps(b: var Builder; n: Cursor)
 
-proc regOccupied(b: var Builder; reg: Reg): bool
-
 proc isFoldableLeaf(b: var Builder; n: Cursor): bool =
   ## A value needing NO register held across a sibling subtree: an immediate, or a
   ## function-local symbol read (folds as its reg / stack home operand). A computed
@@ -539,10 +554,15 @@ proc allocBin(b: var Builder; n: var Cursor; dest: var Location) =
     allocValue(b, n, lDest)                  # left → a register
     if ek in {ShlC, ShrC} and b.md.shiftCountReg != NoReg and
        n.kind notin {IntLit, UIntLit, CharLit}:
-      # x86 variable shift: the count must be in cl. cl (rcx) cannot hold a live
-      # symbol here: allocParams relocates an rcx-homed param to a callee-saved
-      # register whenever the body contains a variable shift (`clobbersShiftReg`).
-      if b.regOccupied(b.md.shiftCountReg):
+      # x86 variable shift: the count must be in cl. cl (rcx) must be free here — a
+      # LIVE symbol homed in it would be clobbered. `freeVol` membership is the ground
+      # truth for "free": a `ShiftRegOk` local homed in rcx is, by construction, dead
+      # before any variable shift (its interval excludes every shift position), so
+      # flushFree has already returned rcx to the pool by this statement. A stale
+      # `regOccupied` (static-home) test would false-positive on that dead home.
+      # allocParams likewise relocates an rcx-homed param when the body has any
+      # variable shift (`clobbersShiftReg`), so a param never lingers here either.
+      if b.md.shiftCountReg notin b.freeVol:
         raiseAssert "arkham: variable shift while the count register holds a live local"
       rDest = regLoc(b.md.shiftCountReg, ScalarSlot)
     allocValue(b, n, rDest)                  # right → wherever (may fold) / cl for var shift
@@ -555,6 +575,17 @@ proc allocBin(b: var Builder; n: var Cursor; dest: var Location) =
   case dest.kind
   of Undef, NeedsReg, RegOrImm:
     if lDest.kind == InReg and lDest.isTemp: dest = lDest
+    elif rDest.kind == InReg and rDest.isTemp and lDest.kind == InReg and
+         ek notin {ShlC, ShrC}:
+      # Recycle the dead RHS temp as the result. The op consumes rhs, so its register
+      # is free the instant the op emits — reusing it here means we DON'T take a third
+      # register (or, when the pool is down to r10, an `etmp` spill) for `dest` while
+      # rhs sits idle. This is the "free the operand before reserving dest" recycling:
+      # the emitter's `aliasRhs` path computes `dest := rhs op lhs` (commutative) or
+      # `dest := (dest - lhs); neg` (sub) — both need lhs InReg (guaranteed here; a temp
+      # lhs already took the RMW branch above, so this lhs is a non-temp register home).
+      # Not for shifts: rhs is the cl count and must stay put.
+      dest = rDest
     else: dest = b.reserveTmp(ScalarSlot)
   else: discard
   # (A memory-homed dest — a demoted local or a spilled `etmp` — is fine: the
@@ -571,7 +602,7 @@ proc allocBin(b: var Builder; n: var Cursor; dest: var Location) =
                  not sameReg(dest, lDest)
   if aliasRhs and ek in {ShlC, ShrC}:
     raiseAssert "arkham: variable shift whose destination aliases the count register"
-  b.releaseTmp(rDest)
+  if not sameReg(dest, rDest): b.releaseTmp(rDest)   # dest may BE rDest (recycled) — keep it live
   if not sameReg(dest, lDest): b.releaseTmp(lDest)
   b.ra.aux[pos] = ExprAux(foldB: rDest.kind in {NamedStack, Mem},
                           aliasRhs: aliasRhs and ek notin {ShlC, ShrC})
@@ -1173,19 +1204,13 @@ proc releaseLvalTemps(b: var Builder; n: Cursor) =
       while cc.hasMore: skip cc
   else: discard
 
-proc regOccupied(b: var Builder; reg: Reg): bool =
-  ## Is fixed register `reg` the persistent home of some symbol? Guards a
-  ## fixed-register instruction (idiv→rdx, variable shift→rcx) against clobbering
-  ## a live local. Should never fire: `allocParams` relocates an rdx/rcx-homed
-  ## param to a callee-saved register when the body clobbers it
-  ## (`clobbersDivReg`/`clobbersShiftReg`), and locals never draw those registers.
-  if reg == NoReg: return false
-  for name, pos in b.ra.symPos:
-    let loc = b.ra.locs[pos]
-    if loc.kind == InReg and loc.r == reg: return true
-  false
-
-proc divRemOccupied(b: var Builder): bool {.inline.} = b.regOccupied(b.md.divRemReg)
+proc divRemOccupied(b: var Builder): bool {.inline.} =
+  ## Is the div/rem register (rdx) holding a LIVE value at a div/mod? `freeVol`
+  ## membership is the truth: a `DivRegOk` local homed in rdx is dead before any
+  ## div (its interval excludes every div position) and already returned by
+  ## flushFree, so a static-home `regOccupied` would false-positive on it. NoReg
+  ## (RISC) never joins `freeVol`, hence the explicit guard.
+  b.md.divRemReg != NoReg and b.md.divRemReg notin b.freeVol
 
 proc allocDivMod(b: var Builder; n: var Cursor; dest: var Location) =
   ## x86 `idiv`/`div`: dividend → rax, divisor → a register (no immediate form),
@@ -1584,7 +1609,8 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
         allocStore(b, n, namedStackLoc("", b.tc.exprSlot(n)), b.posOf(n))
         while n.hasMore: skip n
     else:
-      raiseAssert "arkham: aggregate store rhs not supported: " & $n.exprKind
+      raiseAssert "arkham: aggregate store rhs not supported: " & $n.exprKind &
+        " in proc " & gArkhamCurProc & " (dst.size=" & $dst.typ.size & ")"
   elif dst.kind == Undef:                                # module-level global / threadvar
     # The emitter resolves the destination to a `Glob`/`Tvar` with a precise slot; the
     # allocator only needs the right scratch. The destination type is unknown here, so
@@ -1671,10 +1697,18 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
     assert n.kind == SymbolDef
     let name = symName(n); inc n
     skip n                                   # pragmas
-    let slot = slotOf(b.prog[], n); skip n  # type (resolves named types)
+    let typeIsOmitted = n.kind == DotToken
+    var slot = slotOf(b.prog[], n); skip n  # type (resolves named types)
     var valCur = n                           # remember the initializer (for allocExprs)
     let hasValue = n.hasMore and n.kind != DotToken   # `.` = explicitly uninitialized
     if n.hasMore: skip n                      # value (analysed in pass 1)
+    # Shoggoth's SROA can emit a var with an OMITTED type (`.`) — e.g.
+    # `(var :sroa.. . . (addr x))`, a pointer. An empty type otherwise classifies
+    # as `AMem size 0` and misroutes to the aggregate-store path; infer the slot
+    # from the initializer instead (an lvalue `addr` → a precise `(ptr T)`). The
+    # emitter follows the recorded Location, so this one fix keeps both in sync.
+    if typeIsOmitted and hasValue:
+      slot = b.tc.exprSlot(valCur)
     if slot.kind == AMem:
       # an aggregate (object/array/named type): a nifasm-managed `(s)` stack
       # var, addressed by name — arkham does not register-allocate it. (No
@@ -1977,6 +2011,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
                 loc = b.spill(effSlot)
             else:
               loc = regLoc(arg, effSlot)       # leaf proc: stay in the arg reg
+              b.freeVol.excl arg               # persistent home → not lendable to a call-free local
             inc intIdx
           else:
             # The 9th integer/pointer parameter onward arrives on the caller's
@@ -2032,6 +2067,20 @@ proc seedPools(b: var Builder) =
   ## what remains.
   b.freeVol = {}; b.freeCallee = {}; b.freeVolF = {}; b.freeCalleeF = {}
   for r in b.md.intTempRegs: b.freeVol.incl r
+  # Call-free locals may also draw from `intLocalTempRegs` (the arg registers with
+  # no fixed instruction role). `reserveTmp` still filters on `intTempRegs` so these
+  # never serve as emitter transient scratch; only `allocStorage`'s `AllRegs` fall-
+  # back (which filters on `intLocalTempRegs`) can hand them to a local. A leaf param
+  # that persistently occupies one is removed from this pool in `allocParams`.
+  for r in b.md.intLocalTempRegs: b.freeVol.incl r
+  # The fixed-role registers (rdx = div/rem, rcx = shift count) also join `freeVol`
+  # so a `DivRegOk`/`ShiftRegOk` local can be homed there. They are handed out ONLY
+  # via those props' candidate list in `allocStorage` (never in `intLocalTempRegs`
+  # nor `intTempRegs`), so no ordinary local/temp draws them; and the interval
+  # analysis guarantees their fixed role never overlaps such a local (asserted by
+  # `divRemOccupied`/`regOccupied` at the div/shift sites). `NoReg` on RISC (a64).
+  if b.md.divRemReg != NoReg: b.freeVol.incl b.md.divRemReg
+  if b.md.shiftCountReg != NoReg: b.freeVol.incl b.md.shiftCountReg
   for r in b.md.intCalleeSaved: b.freeCallee.incl r
   for f in b.md.floatTempRegs: b.freeVolF.incl f
   for f in b.md.floatCalleeSaved: b.freeCalleeF.incl f
@@ -2081,6 +2130,9 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
   var n = procDecl
   assert n.stmtKind == ProcS
   b.openScope()
+  block:
+    var nm = procDecl; inc nm                # step past the (proc tag → name
+    if nm.kind in {Symbol, SymbolDef}: gArkhamCurProc = symName(nm)
   n.into:
     inc n                                    # name → params slot
     # Classify the RESULT before allocating params: a >16B by-ref aggregate return

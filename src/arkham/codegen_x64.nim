@@ -1926,6 +1926,7 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
     assert res.kind == InReg, "arkham x64n: bin result " & $res.kind
     rD = res.r
   let reusedLhs = lhsLoc.kind == InReg and lhsLoc.r == rD   # in-place RMW on the left temp
+  let reusedRhs = rhsLoc.kind == InReg and rhsLoc.r == rD   # dest recycled the RHS temp (aliasRhs)
   # `rD` carries a value into the fold and MUST be a tracked binding for every `emReg`.
   # Bind it unless a producer already did (an in-place `reusedLhs` left value, or the
   # `produceIntoMem2` bridge bound at a leaf) — `rD notin boundTemps` is the guard.
@@ -1963,7 +1964,7 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
     else: raiseAssert "arkham x64n: bin rhs " & $rhsLoc.kind
   g.normalizeBinWidth(resTypeC, rD, op)                  # restore the sub-width invariant
   if rdSeal: g.ra.unseal {rD}
-  if rhsLoc.kind == InReg and rhsLoc.isTemp: g.unbindTemp(rhsLoc.r)
+  if rhsLoc.kind == InReg and rhsLoc.isTemp and not reusedRhs: g.unbindTemp(rhsLoc.r)
   if lhsLoc.kind == InReg and lhsLoc.isTemp and not reusedLhs: g.unbindTemp(lhsLoc.r)
   if resStaging != NoReg:                                # store the result to its stack home
     g.emitStoreLoc(res, resStaging)
@@ -1976,6 +1977,10 @@ proc emitMemIntrin2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
   let s = AsmSlot(cls: AInt, size: 8, align: 8)
   for idx in 0 ..< min(3, argCurs.len):
     g.emitValue2(argCurs[idx])                  # → rdi / rsi / rdx
+  # rdi (dest ptr) and rax (result/byte) are used RAW by the inline loop; a call-free
+  # local the allocator homed in one of them leaves a stale typed name that `emReg`
+  # would emit. Kill it so the loop sees raw registers (rsi/rdx/rcx get fresh temps).
+  g.releaseStaleName(RDI); g.releaseStaleName(RAX)
   g.bindTemp(RSI, s); g.bindTemp(RDX, s); g.bindTemp(RCX, s)
   g.genMemIntrinBody(builtin)
 
@@ -1986,6 +1991,13 @@ proc emitAtomic2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
   ## `genAtomicXadd`/`genAtomicLoopRmw` helpers, shared with the legacy path).
   ## Result → rax (moved to its home by emitCall2). Pointer args stay raw ABI regs.
   for a in argCurs: g.emitValue2(a)                  # → rdi / rsi / rdx / …
+  # The inline lock-prefixed sequence uses rdi/rsi/rdx/rax/rcx as RAW ABI scratch
+  # (`emReg` emits `(reg)`); a call-free local the allocator homed in one of these
+  # leaves a stale typed name that `emReg` would emit instead, mismatching the typed
+  # `(mem …)` operand under nifasm's strict xchg/cmpxchg check (e.g. a `(ptr object)`
+  # local name vs the pointee-typed memory). Kill those bindings so the sequence sees
+  # raw registers, mirroring `emitMemIntrin2`'s explicit rebinds.
+  for r in [RDI, RSI, RDX, RCX, RAX]: g.releaseStaleName(r)
   # Width of the atomic access = the pointee of the first (pointer) arg. Sizing the
   # `(mem …)` operands by this type is what keeps a sub-64-bit atomic from spilling
   # into the adjacent field (see emMemAt). All `__atomic_*` take `ptr T` as arg0.
@@ -2490,6 +2502,35 @@ proc emitDivMod2(g: var CodeGen; c: Cursor) =
     if res.isTemp: g.bindTemp(res.r, res.typ)  # rebind a reused dead-local reg to the result type
     if res.r != resReg: g.movReg(res.r, resReg)
 
+proc transparentCastInner(g: var CodeGen; c: Cursor; home: Location): tuple[hit: bool, inner: Cursor] =
+  ## A conv/cast is a NO-OP when the allocator dest-threaded the SAME stack home onto
+  ## both it and its inner operand (they denote one value) and the conversion is a
+  ## non-narrowing, non-pointer int relabel. For a register home the emitter already
+  ## folds this in place; but when the shared home is a spill SLOT, re-emitting the
+  ## cast round-trips the value through the staging bridge (load slot→reg; store
+  ## reg→slot), once PER level of a nested `cast(conv(field))` chain — the store/reload
+  ## NOP storms in spilled rawAlloc/rawDealloc code. Return the inner cursor so the
+  ## caller can emit it straight into the shared home instead. Non-narrowing only: the
+  ## inner's sized slot store/reload already preserves its value at the source width
+  ## (a 32-bit field load zero/sign-extends), so widen/identity needs no fixup; a
+  ## NARROWING cast emits a real `shl;shr` truncation and must NOT be skipped.
+  result = (false, default(Cursor))
+  if home.kind != NamedStack: return
+  if not (c.kind == TagLit and c.exprKind in {ConvC, CastC}): return
+  var tgtC, innerC: Cursor
+  block:
+    var cc = c
+    cc.into:
+      tgtC = cc; skip cc
+      innerC = cc; skip cc
+      while cc.hasMore: skip cc
+  let innerLoc = g.ra.locs[cursorToPosition(g.buf[], innerC)]
+  if innerLoc.kind != NamedStack or innerLoc.name != home.name: return
+  let tc = resolveType(g.prog, tgtC)
+  if isPtrType(tc) or isPtrType(resolveType(g.prog, g.getType(innerC))): return
+  let (srcW, _) = g.srcWidthSigned(innerC)
+  if intTypeWidth(tc) >= srcW: result = (true, innerC)
+
 proc produceIntoMem2(g: var CodeGen; c: Cursor; pos: int; dst: Location) =
   ## Totality bridge (the value-core analogue of legacy `spillComputed`): the allocator
   ## spilled this value position to an `(s)` slot (`etmpN.0`) because the register pool
@@ -2500,6 +2541,16 @@ proc produceIntoMem2(g: var CodeGen; c: Cursor; pos: int; dst: Location) =
   ## bin, call, load, cast … each emits into the register exactly as for a normal
   ## register result. `locs[pos]` is restored to the slot before returning so any
   ## consumer (a binop folding a spilled operand, `storeScalar2`) reads the memory form.
+  # A transparent cast whose inner shares this exact slot: the inner's own
+  # produce-into materializes the identical value here — skip the cast's redundant
+  # bridge round-trip (the OUTERMOST level of a spilled `cast(conv(field))` chain,
+  # which `emitValue2`'s guard cannot catch because `dst` was already overridden to
+  # the bridge register by the time it re-enters).
+  block:
+    let ti = g.transparentCastInner(c, dst)
+    if ti.hit:
+      g.emitValue2(ti.inner)
+      return
   when defined(arkhamDbgSpill):
     stderr.writeLine "DBG produceIntoMem2 slot=" & dst.name
   # The staging reg is NOT sealed across the recursion: `emitBin2` evaluates BOTH
@@ -2528,6 +2579,10 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
   ## put (the consumer folds or reads it). A computed node runs its op into its result.
   let pos = cursorToPosition(g.buf[], c)
   let dst = g.ra.locs[pos]
+  let ti = g.transparentCastInner(c, dst)
+  if ti.hit:
+    g.emitValue2(ti.inner)                                # inner already produces into the shared home
+    return
   if dst.kind == InFReg:                                 # a float value → the SIMD path
     g.emitFValue2(c); return
   if dst.kind == NamedStack and dst.isTemp:              # spilled (etmp) result → produce-into
