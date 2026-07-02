@@ -1821,7 +1821,8 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
     assert res.kind == InReg, "arkham a64n: bin result " & $res.kind
     rD = res.r
   let reusedLhs = lhsLoc.kind == InReg and lhsLoc.r == rD
-  if res.isTemp and not reusedLhs: g.bindTemp(rD, res.typ)
+  let reusedRhs = rhsLoc.kind == InReg and rhsLoc.r == rD   # dest recycled the RHS temp (aliasRhs)
+  if res.isTemp and not reusedLhs and not reusedRhs: g.bindTemp(rD, res.typ)
   if aux.aliasRhs:
     assert lhsLoc.kind == InReg, "arkham a64n: aliasRhs lhs " & $lhsLoc.kind
     g.binReg(op, rD, lhsLoc.r)                            # dest := rhs op lhs
@@ -1831,7 +1832,7 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
     g.place2(lhsLoc, rD)                                  # dest := lhs
     g.foldRhs2(op, rD, rhsLoc, rhsC)                      # dest op= rhs
   g.normalizeBinWidth(resTypeC, rD, op)                   # restore the sub-width invariant
-  if rhsLoc.kind == InReg and rhsLoc.isTemp: g.unbindTemp(rhsLoc.r)
+  if rhsLoc.kind == InReg and rhsLoc.isTemp and not reusedRhs: g.unbindTemp(rhsLoc.r)
   if lhsLoc.kind == InReg and lhsLoc.isTemp and not reusedLhs: g.unbindTemp(lhsLoc.r)
   if resStaging != NoReg:
     g.storeReg2(res, resStaging)

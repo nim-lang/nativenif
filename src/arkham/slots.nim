@@ -37,6 +37,10 @@ type
     AddrTaken   # address taken (or an array): cannot live in a register
     IsDisjoint  # only `obj.f` used, never `obj` itself
     AllRegs     # used only in a call-free region: any (volatile) register is fine
+    DivRegOk    # AllRegs AND no div/mod in the live interval → the div/rem register
+                # (rdx on x86-64) is a legal extra home (its fixed role never overlaps)
+    ShiftRegOk  # AllRegs AND no *variable* shift in the live interval → the shift-count
+                # register (rcx/cl on x86-64) is a legal extra home
   VarProps* = set[VarProp]
 
 proc kind*(s: AsmSlot): AsmTypeKind {.inline.} =
