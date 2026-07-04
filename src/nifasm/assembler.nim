@@ -91,8 +91,15 @@ proc addrWidthMove(a, b: Type): bool {.inline.} =
   ## arkham's value core — holding a pointer value in a generic `i64` scalar register.
   ## All representationally identical (8 bytes), so accept it in either direction. (A
   ## genuinely narrowing access stays caught by the sized memory-access path.)
+  ##
+  ## `nil` (the null pointer, `NilT`) counts as pointer-like here: it is a pointer-sized
+  ## `0` that arkham materializes into a generic `i64` register on the way to a pointer
+  ## slot or a syscall argument (`mmap(nil, …)`). `compatible` keeps `nil` strictly
+  ## incompatible with a sized integer on purpose — to catch a `cmp i64reg, ptr` mixup —
+  ## but that strictness is for typed compares/ops; this MOV-only escape hatch is where
+  ## the address-in-i64-register reality is modelled, so `mov i64reg, nil` belongs here.
   if a == nil or b == nil: return false
-  const PtrLike = {ProcT, PtrT, AptrT}
+  const PtrLike = {ProcT, PtrT, AptrT, NilT}
   const AddrLike = {ProcT, PtrT, AptrT, IntT, UIntT}
   (a.kind in PtrLike and b.kind in AddrLike) or (b.kind in PtrLike and a.kind in AddrLike)
 
@@ -2383,7 +2390,15 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       proc isIntLike(t: Type): bool = t.kind in {IntT, UIntT, BoolT, IntLitT}
       let sizedMemReg = (dest.kind == okMem) != (op.kind == okMem) and
                         isIntLike(dest.typ) and isIntLike(op.typ)
-      if not sizedMemReg and not movCompatible(dest.typ, op.typ):
+      # Narrowing integer marshal into a call-argument slot (`(mov (arg pN) reg)` for a
+      # `char`/`cint`/… parameter): legitimate in arkham's uniform 64-bit-register model —
+      # the callee reads only the low bits the parameter width selects. `movCompatible`
+      # already accepts the widening direction; this is its narrowing counterpart, scoped
+      # to an `okArg` destination (see the x64 `genMovX64` counterpart).
+      let narrowingArg = dest.kind == okArg and op.kind != okMem and
+                         dest.typ.kind in {IntT, UIntT} and
+                         op.typ.kind in {IntT, UIntT, IntLitT}
+      if not sizedMemReg and not narrowingArg and not movCompatible(dest.typ, op.typ):
         typeError(dest.typ, op.typ, start)
     if dest.kind == okMem:
       if op.kind == okImm:
@@ -4117,7 +4132,17 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
                          dest.typ.kind in {IntT, UIntT} and
                          op.typ.kind in {IntT, UIntT, IntLitT} and
                          op.typ.bits <= dest.typ.bits
-    if not sizedMemReg and not wideningRegReg and not addrWidthMove(dest.typ, op.typ):
+    # Marshalling an integer into a narrower-typed call-argument slot — `(mov (arg pN)
+    # reg)` where pN is a `char`/`cint`/… parameter — is a legitimate *narrowing* move:
+    # arkham holds every integer in a full 64-bit register, and the callee reads only the
+    # low bits its parameter width selects (standard truncating ABI marshalling). The
+    # widening arg case is already covered by `wideningRegReg` (an `(arg pN)` dest is not
+    # okMem); this is its narrowing counterpart. Scoped to an `okArg` destination so a
+    # bare narrowing reg→reg assignment still stays strict.
+    let narrowingArg = dest.kind == okArg and op.kind != okMem and
+                       dest.typ.kind in {IntT, UIntT} and
+                       op.typ.kind in {IntT, UIntT, IntLitT}
+    if not sizedMemReg and not wideningRegReg and not narrowingArg and not addrWidthMove(dest.typ, op.typ):
       checkType(dest.typ, op.typ, start)
 
   if dest.kind == okMem:
