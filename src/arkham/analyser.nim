@@ -77,6 +77,11 @@ type
                                ## accesses) — the points where caller-saved regs die. A
                                ## local may use `AllRegs` iff none of these fall in its
                                ## live interval. Recorded in source order; scanned linearly.
+    divPositions: seq[int]     ## token position of every div/mod (clobbers rdx). An
+                               ## `AllRegs` local additionally earns `DivRegOk` (rdx is a
+                               ## legal home) iff none of these fall in its live interval.
+    shiftPositions: seq[int]   ## token position of every *variable* shift (clobbers rcx);
+                               ## the `ShiftRegOk` analog of `divPositions`.
     loopStack: seq[tuple[lo, hi: int]]  ## spans of the enclosing loops (`WhileS`), so a
                                ## var declared in a loop can record its loop's extent
     stmtEnd: seq[int]          ## per open scope frame: end position of the
@@ -253,6 +258,7 @@ proc analyse(c: var Context; n: var Cursor) =
         else: skip n
       of DivC, ModC:
         c.res.clobbersDivReg = true     # idiv/div clobbers rdx
+        c.divPositions.add posOf(c, n)  # ... at THIS point: denies rdx-as-home across it
         analyseChildren(c, n)
       of ShlC, ShrC:
         # A *variable* shift needs the count in cl, clobbering rcx; a constant shift
@@ -260,7 +266,9 @@ proc analyse(c: var Context; n: var Cursor) =
         var probe = n; probe.into:
           skip probe                    # result type
           skip probe                    # value
-          if probe.kind notin {IntLit, UIntLit, CharLit}: c.res.clobbersShiftReg = true
+          if probe.kind notin {IntLit, UIntLit, CharLit}:
+            c.res.clobbersShiftReg = true
+            c.shiftPositions.add posOf(c, n)  # denies rcx-as-home across it
           while probe.hasMore: skip probe
         analyseChildren(c, n)
       else:
@@ -351,5 +359,20 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
     var crosses = false
     for p in c.callPositions:
       if p > lo and p <= hi: (crosses = true; break)
-    if not crosses: vi.props.incl AllRegs
+    if not crosses:
+      vi.props.incl AllRegs
+      # A call-free local can go further: rdx/rcx have a *fixed* instruction role
+      # (div/mod, variable shift) but are otherwise free. If no such instruction
+      # falls in the interval, that register's role never overlaps this local's
+      # life, so it is a legal extra home — the register-count generalization of
+      # `AllRegs` (same interval test, per fixed-role register). The `regOccupied`
+      # assertions in the allocator are the safety net if this analysis is wrong.
+      var crossesDiv = false
+      for p in c.divPositions:
+        if p > lo and p <= hi: (crossesDiv = true; break)
+      if not crossesDiv: vi.props.incl DivRegOk
+      var crossesShift = false
+      for p in c.shiftPositions:
+        if p > lo and p <= hi: (crossesShift = true; break)
+      if not crossesShift: vi.props.incl ShiftRegOk
   result = ensureMove c.res
