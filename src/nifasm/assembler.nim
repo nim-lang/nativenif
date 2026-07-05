@@ -4117,11 +4117,20 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
                          dest.typ.kind in {IntT, UIntT} and
                          op.typ.kind in {IntT, UIntT, IntLitT} and
                          op.typ.bits <= dest.typ.bits
-    let narrowingRegReg = dest.kind != okMem and op.kind != okMem and
+    # Marshalling a wider integer value into a NARROWER integer call argument (`(arg pN)`)
+    # is a legitimate ABI truncation: the callee reads only the low `param.bits` of the
+    # 64-bit argument register (as C does at the ABI boundary), and a plain 64-bit mov
+    # already leaves the correct low bits there. This is the arg-register analogue of a
+    # `sizedMemReg` store. NOTE the deliberate narrowness: only `okArg` destinations —
+    # a narrowing move into a plain register/variable (`okReg`) stays a hard type error
+    # (e.g. binding an `i64` call result to a `u8` var), so `result_type_mismatch` and
+    # kin keep failing. Legitimate typed narrowing in source always carries an explicit
+    # `(conv)`, so arkham never emits a narrowing reg→reg mov for a var binding.
+    let narrowingArgReg = dest.kind == okArg and op.kind != okMem and
                           dest.typ.kind in {IntT, UIntT, BoolT} and
                           op.typ.kind in {IntT, UIntT, IntLitT} and
                           op.typ.bits > intMemAccess(dest.typ).bits
-    if not sizedMemReg and not wideningRegReg and not narrowingRegReg and
+    if not sizedMemReg and not wideningRegReg and not narrowingArgReg and
        not addrWidthMove(dest.typ, op.typ):
       checkType(dest.typ, op.typ, start)
 
@@ -4166,13 +4175,7 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
       let (bits, signed) = intMemAccess(op.typ)  # sized load: sign-/zero-extend sub-word
       x86.emitLoadExt(ctx.buf.data, dest.reg, op.mem, bits, signed)
     elif dest.reg != op.reg:
-      if dest.typ != nil and op.typ != nil and
-         dest.typ.kind in {IntT, UIntT, BoolT} and op.typ.kind in {IntT, UIntT, IntLitT} and
-         op.typ.bits > intMemAccess(dest.typ).bits:
-        let (bits, signed) = intMemAccess(dest.typ)
-        x86.emitMovExtReg(ctx.buf.data, dest.reg, op.reg, bits, signed)
-      else:
-        x86.emitMov(ctx.buf.data, dest.reg, op.reg)
+      x86.emitMov(ctx.buf.data, dest.reg, op.reg)
     # else: a redundant same-register move — elide it. The declarative-call
     # `(arg …)`/`(res …)` markers resolve to a fixed ABI register, so a value
     # already in that register marshals to `(mov (arg pN) (rN))` == `mov rN,rN`.

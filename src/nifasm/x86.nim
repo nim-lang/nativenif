@@ -202,35 +202,6 @@ proc emitLoadExt*(dest: var Bytes; reg: Register; mem: MemoryOperand; bits: int;
       else:         (if signed: 0xBF else: 0xB7)))
   dest.emitMem(int(reg), mem)
 
-proc emitMovExtReg*(dest: var Bytes; dstReg, srcReg: Register; bits: int; signed: bool) =
-  ## Move the low `bits` of `srcReg` into the full 64-bit `dstReg`, sign- or zero-
-  ## extended — the register-source twin of `emitLoadExt`. Used for a NARROWING
-  ## reg→reg integer move (`mov i32local, i64reg`): keep the low `bits` and re-normalize
-  ## per the destination's signedness, matching the sized store into a stack-homed local.
-  if bits >= 64:
-    emitMov(dest, dstReg, srcReg); return
-  if bits == 32 and not signed:
-    # MOV r32, r/m32 zero-extends into the 64-bit register automatically (no REX.W).
-    var rex = RexPrefix(w: false)
-    if needsRex(dstReg): rex.r = true
-    if needsRex(srcReg): rex.b = true
-    if rex.r or rex.b: dest.add(encodeRex(rex))
-    dest.add(0x8B)                                 # MOV r32, r/m32  (reg=dst, rm=src)
-    dest.add(encodeModRM(amDirect, int(dstReg), int(srcReg)))
-    return
-  var rex = RexPrefix(w: true)                     # extend into the 64-bit destination
-  if needsRex(dstReg): rex.r = true
-  if needsRex(srcReg): rex.b = true
-  dest.add(encodeRex(rex))
-  if bits == 32:                                   # MOVSXD r64, r/m32 (signed dword)
-    dest.add(0x63)
-  else:                                            # MOVSX/MOVZX r64, r/m(8|16)
-    dest.add(0x0F)
-    dest.add(byte(
-      if bits == 8: (if signed: 0xBE else: 0xB6)
-      else:         (if signed: 0xBF else: 0xB7)))
-  dest.add(encodeModRM(amDirect, int(dstReg), int(srcReg)))
-
 proc emitMovImmToReg*(dest: var Bytes; reg: Register; imm: int64) =
   ## Emit MOV instruction: MOV reg, imm
   var rex = RexPrefix(w: true)
