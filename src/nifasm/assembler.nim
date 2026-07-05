@@ -4117,7 +4117,12 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
                          dest.typ.kind in {IntT, UIntT} and
                          op.typ.kind in {IntT, UIntT, IntLitT} and
                          op.typ.bits <= dest.typ.bits
-    if not sizedMemReg and not wideningRegReg and not addrWidthMove(dest.typ, op.typ):
+    let narrowingRegReg = dest.kind != okMem and op.kind != okMem and
+                          dest.typ.kind in {IntT, UIntT, BoolT} and
+                          op.typ.kind in {IntT, UIntT, IntLitT} and
+                          op.typ.bits > intMemAccess(dest.typ).bits
+    if not sizedMemReg and not wideningRegReg and not narrowingRegReg and
+       not addrWidthMove(dest.typ, op.typ):
       checkType(dest.typ, op.typ, start)
 
   if dest.kind == okMem:
@@ -4161,7 +4166,13 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
       let (bits, signed) = intMemAccess(op.typ)  # sized load: sign-/zero-extend sub-word
       x86.emitLoadExt(ctx.buf.data, dest.reg, op.mem, bits, signed)
     elif dest.reg != op.reg:
-      x86.emitMov(ctx.buf.data, dest.reg, op.reg)
+      if dest.typ != nil and op.typ != nil and
+         dest.typ.kind in {IntT, UIntT, BoolT} and op.typ.kind in {IntT, UIntT, IntLitT} and
+         op.typ.bits > intMemAccess(dest.typ).bits:
+        let (bits, signed) = intMemAccess(dest.typ)
+        x86.emitMovExtReg(ctx.buf.data, dest.reg, op.reg, bits, signed)
+      else:
+        x86.emitMov(ctx.buf.data, dest.reg, op.reg)
     # else: a redundant same-register move — elide it. The declarative-call
     # `(arg …)`/`(res …)` markers resolve to a fixed ABI register, so a value
     # already in that register marshals to `(mov (arg pN) (rN))` == `mov rN,rN`.

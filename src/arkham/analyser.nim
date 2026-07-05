@@ -34,11 +34,18 @@ type
     weight*: int               ## usages, but loop bodies count `LoopWeight`×
     props*: VarProps
     freeAfter*: int            ## token position after which the variable is dead:
-                               ## the end of the statement (at the var's own scope
-                               ## level) containing its last use. A single, coarse,
-                               ## post-dominating free point — so a use inside an
-                               ## `if`/`while` frees after the whole construct.
+                               ## its PRECISE last-use position (max token position over
+                               ## the variable's occurrences), extended to the end of any
+                               ## enclosing loop the declaration sits outside of (back-edge
+                               ## safety — see `declLoopDepth`). Branches need no special
+                               ## handling: freeing strictly after the textually-last use
+                               ## means no control-flow path can read the value afterward.
     frameIdx*: int             ## index of the var's declaring scope frame
+    declLoopDepth*: int        ## `loopStack.len` at the declaration: how many loops enclose
+                               ## the decl. A use nested in a DEEPER loop (`loopStack.len`
+                               ## greater) is carried across that loop's back-edge, so
+                               ## `freeAfter` extends to `loopStack[declLoopDepth].hi` — the
+                               ## outermost enclosing loop the decl is NOT inside.
     declInLoop*: bool          ## declared inside a loop → not early-freed (a later
                                ## loop-body decl could reuse the reg across the back-edge)
     liveStart*: int            ## token position of the var's declaration: the start of
@@ -132,8 +139,9 @@ proc analyseVarDecl(c: var Context; n: var Cursor) =
     skip n                       # type
     let hasValue = n.kind != DotToken
     let inLoop = c.inLoops > 0
-    var vi = VarInfo(defs: ord(hasValue), freeAfter: c.stmtEnd[^1],
-                     frameIdx: c.stmtEnd.high, declInLoop: inLoop, liveStart: declPos)
+    var vi = VarInfo(defs: ord(hasValue), freeAfter: declPos,
+                     frameIdx: c.stmtEnd.high, declInLoop: inLoop, liveStart: declPos,
+                     declLoopDepth: c.loopStack.len)
     if inLoop: (vi.loopLo = c.loopStack[^1].lo; vi.loopHi = c.loopStack[^1].hi)
     c.res.vars[vn] = vi
     if hasValue: analyse(c, n)   # analyse the initializer
@@ -184,20 +192,19 @@ proc analyse(c: var Context; n: var Cursor) =
       else: inc e.usages
       # each use counts; uses inside loops count `LoopWeight`× per nesting level
       inc e.weight, 1 + c.inLoops * LoopWeight
-      # extend the (coarse) live range to the end of the enclosing statement at the
-      # variable's OWN scope level — so a use nested in an `if`/`while`, or after a
-      # sibling `(stmts)` has closed, keeps it live until after that construct (a
-      # single, post-dominating free point). `frameIdx` indexes the variable's
-      # *scope* frame (not a `(stmts)` frame), so it is always a live frame here.
-      # `frameIdx` is the var's declaring scope frame. Usually it is still open, but a
-      # desugared loop can declare a local inside the loop's `(scope)` (a pushed frame)
-      # and still reference it after the scope closes — at the loop's exit label in the
-      # ENCLOSING frame (e.g. a `for`-cursor used in the loop's continuation). The var
-      # has escaped its lexical scope, so its live range extends into the outer frame;
-      # clamp to the outermost still-open frame so we extend liveness (never free early)
-      # rather than index a popped frame.
-      let fi = min(e.frameIdx, c.stmtEnd.high)
-      e.freeAfter = max(e.freeAfter, c.stmtEnd[fi])
+      # Extend the live range to this occurrence's PRECISE position — its own token
+      # position, not the enclosing statement's end. Freeing strictly after the
+      # textually-last use is safe for branches: no control-flow path can read the
+      # value once we are past its last textual use, so an `if`/`case` needs no
+      # post-dominating over-extension. The ONE exception is a loop back-edge: a use
+      # nested in a loop the DECLARATION sits outside of is re-read on later
+      # iterations, so the value is carried across that loop's back-edge. Extend to
+      # the end of the OUTERMOST such loop (`loopStack[declLoopDepth]`, ordered
+      # outer→inner) so the register stays reserved for the whole carried span.
+      var hi = posOf(c, n)
+      if c.loopStack.len > e.declLoopDepth:
+        hi = max(hi, c.loopStack[e.declLoopDepth].hi)
+      e.freeAfter = max(e.freeAfter, hi)
       if (c.inAddr + c.inArrayIndex) > 0:
         # arrays / address-taken locals cannot live in a register
         e.props.incl AddrTaken
@@ -330,6 +337,50 @@ proc analyseParams(c: var Context; params: var Cursor) =
         while params.hasMore: skip params   # pragmas, type
         # (rest consumed by into epilogue)
 
+when defined(arkhamPeakLive):
+  proc reportPeakLive(c: Context; pname: string; procStartPos, procEndPos: int) =
+    ## Sweep every named local's coarse live interval and report the maximum number
+    ## simultaneously alive — arkham's structural analogue of gcc's register-pressure
+    ## count. A value occupies a register/slot over its interval, so the peak is the
+    ## minimum registers a spill-free allocation would need. Params (`freeAfter ==
+    ## high`) span the whole body; loop-carried locals use their loop span; others
+    ## use `[liveStart, freeAfter]`. Inclusive containment: a value is alive at any
+    ## point within its interval. Prints one greppable line per proc to stderr.
+    type Iv = tuple[name: string, lo, hi: int]
+    var ivs: seq[Iv] = @[]
+    for name, vi in c.res.vars:
+      var lo, hi: int
+      if vi.freeAfter == high(int):
+        lo = procStartPos; hi = procEndPos          # a param: live across the body
+      elif vi.declInLoop:
+        lo = vi.loopLo; hi = vi.loopHi              # loop-carried: whole loop span
+      else:
+        lo = vi.liveStart; hi = vi.freeAfter
+      ivs.add (name, lo, hi)
+    var pts: seq[int] = @[]                          # candidate points = interval endpoints
+    for iv in ivs: (pts.add iv.lo; pts.add iv.hi)
+    var peak = 0; var peakPt = 0
+    for p in pts:
+      var cnt = 0
+      for iv in ivs:
+        if iv.lo <= p and p <= iv.hi: inc cnt
+      if cnt > peak: (peak = cnt; peakPt = p)
+    var liveNames = ""
+    for iv in ivs:
+      if iv.lo <= peakPt and peakPt <= iv.hi:
+        (if liveNames.len > 0: liveNames.add ' '; liveNames.add iv.name)
+    stderr.write "PEAKLIVE proc=" & pname & " total=" & $ivs.len &
+      " peak=" & $peak & " @pos=" & $peakPt & ": " & liveNames & "\n"
+    # Per-member detail for the peak set: interval width + def/use counts. A narrow
+    # interval that only overlaps `peakPt` by coarse `freeAfter` over-extension hints
+    # at accounting inflation; a wide, heavily-used interval is a genuine co-live value.
+    for iv in ivs:
+      if iv.lo <= peakPt and peakPt <= iv.hi:
+        let vi = c.res.vars[iv.name]
+        stderr.write "    " & iv.name & " iv=[" & $iv.lo & "," & $iv.hi & "] w=" &
+          $(iv.hi - iv.lo) & " defs=" & $vi.defs & " uses=" & $vi.usages &
+          " allregs=" & $(AllRegs in vi.props) & "\n"
+
 proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
                   tvars: HashSet[string] = initHashSet[string]()): ProcAnalysis =
   ## `procDecl` is at a `(proc name params rettype pragmas body)`. `tvars` names
@@ -338,7 +389,14 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
   var c = Context(tvars: tvars, buf: addr buf)
   var n = procDecl
   assert n.stmtKind == ProcS
+  when defined(arkhamPeakLive):
+    let procStartPos = posOf(c, procDecl)
+    var endCur = procDecl; skip endCur
+    let procEndPos = posOf(c, endCur)
+    var pname = "?"
   n.into:
+    when defined(arkhamPeakLive):
+      (if n.kind == SymbolDef: pname = symName(n))
     inc n                               # name (SymbolDef)
     analyseParams(c, n)                 # params
     skip n                              # return type
@@ -375,4 +433,6 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
       for p in c.shiftPositions:
         if p > lo and p <= hi: (crossesShift = true; break)
       if not crossesShift: vi.props.incl ShiftRegOk
+  when defined(arkhamPeakLive):
+    reportPeakLive(c, pname, procStartPos, procEndPos)
   result = ensureMove c.res
