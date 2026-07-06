@@ -1857,6 +1857,24 @@ proc normalizeBinWidth(g: var CodeGen; resTypeC: Cursor; rD: Reg; op: X64Inst) =
   if slot.kind in {AInt, AUInt} and slot.size > 0 and slot.size < 8:
     g.extendTo(rD, slot.size * 8, signed = slot.kind == AInt)
 
+proc binStoreSuppressPos(g: var CodeGen; rhs: Cursor; storeWidth: int): int =
+  ## `rhs`'s token position when it is a sub-64-bit integer `add`/`sub`/`mul`/`shl`
+  ## whose `normalizeBinWidth` fixup is made redundant by a truncating store of
+  ## `storeWidth` bytes; else -1. SOUND: `normalize` (`shl;sar`) only rewrites bits
+  ## AT/ABOVE the type width B, while the store keeps only the low `storeWidth`≤B
+  ## bytes — identical stored bytes with or without it. The bin result is the store's
+  ## RHS (single use), so no other reader observes the un-normalized register.
+  result = -1
+  if rhs.kind != TagLit or storeWidth <= 0: return
+  let (op, isBin) = binArithOp(rhs)
+  if not isBin or op notin {AddX64, SubX64, ImulX64, ShlX64}: return
+  var resTy = rhs
+  inc resTy                                              # step into `(op …` → result type
+  let slot = typeToSlot(resTy)
+  if slot.kind in {AInt, AUInt} and slot.size > 0 and slot.size < 8 and
+     storeWidth <= slot.size:
+    result = cursorToPosition(g.buf[], rhs)
+
 proc emitBin2(g: var CodeGen; c: Cursor) =
   ## Emit a binary-arith node into its precomputed result register, replaying the
   ## allocator's operand placement (`aux.foldB` ⇒ the rhs stays a memory operand).
@@ -1864,6 +1882,9 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
   let res = g.ra.locs[pos]
   let (op, isBin) = binArithOp(c)
   assert isBin, "arkham x64n: emitBin2 on a non-bin node"
+  # A store into a same-or-wider truncating integer destination makes the trailing
+  # sub-width re-normalization dead (see `binStoreSuppressPos`); skip it for THIS node.
+  let suppressNorm = pos >= 0 and pos == g.binNormSuppressPos
   var lhsC, rhsC, resTypeC: Cursor
   block:
     var cc = c
@@ -1908,7 +1929,7 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
     of InReg: g.binReg(foldOp, rD, lhsLoc.r)
     of NamedStack, Mem: g.binFold(foldOp, rD, lhsLoc, lhsC)  # sub-width field → load+extend
     else: raiseAssert "arkham x64n: bin(swapped) lhs " & $lhsLoc.kind
-    g.normalizeBinWidth(resTypeC, rD, op)                # restore the sub-width invariant
+    if not suppressNorm: g.normalizeBinWidth(resTypeC, rD, op)  # restore the sub-width invariant
     if rdSeal: g.ra.unseal {rD}
     return
   g.emitValue2(lhsC)                                     # materialize sub-results first
@@ -1931,6 +1952,24 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
   # Bind it unless a producer already did (an in-place `reusedLhs` left value, or the
   # `produceIntoMem2` bridge bound at a leaf) — `rD notin boundTemps` is the guard.
   if res.isTemp and rD notin g.boundTemps: g.bindTemp(rD, res.typ)
+  # The result register MUST carry the arithmetic RESULT type for the fold. When it
+  # REUSES an operand register in-place (`reusedLhs`/`aliasRhs`), it inherits that
+  # operand's binding — and a folded `cast[int](p)` can leave `p`'s `(ptr …)` type on the
+  # register even though the IR value is integer. For an INTEGER result (the IR result
+  # type is never a bare `ptr` — Nim forbids pointer-to-one arithmetic) retype the
+  # register to the integer result type, so the emitted `add`/`sub` is not run on a
+  # pointer binding (which nifasm correctly rejects: only int / `aptr` pointer-to-many
+  # are arithmetic-legal). The `(rebind)` is zero machine code, and binding exactly the
+  # IR's result type preserves the ptr/aptr distinction — it never loosens the checker.
+  if not isPtrType(resolveType(g.prog, resTypeC)):
+    let nm = g.regLocal.getOrDefault(rD, "")
+    if rD in g.boundTemps:
+      if reusedLhs or reusedRhs: g.bindTemp(rD, res.typ)   # inherited an operand's binding
+    elif nm.len > 0:
+      # A register-homed named local reused polymorphically keeps a stale `(ptr …)`
+      # binding from a branch that held a pointer there; refresh it to the integer
+      # result type (`(rebind)` is zero machine code).
+      g.rebindLocalAs(nm, rD, resTypeC)
   # `rD` now holds (or is about to hold) the placed operand. It MUST be off-limits to
   # any staging pick made while the OTHER operand is folded — a `binFold`/`binImm64`
   # staging reg landing on `rD` would clobber the operand and silently degrade
@@ -1962,7 +2001,7 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
     of InReg: g.binReg(op, rD, rhsLoc.r)
     of NamedStack, Mem: g.binFold(op, rD, rhsLoc, rhsC)  # sub-width field → load+extend
     else: raiseAssert "arkham x64n: bin rhs " & $rhsLoc.kind
-  g.normalizeBinWidth(resTypeC, rD, op)                  # restore the sub-width invariant
+  if not suppressNorm: g.normalizeBinWidth(resTypeC, rD, op)  # restore the sub-width invariant
   if rdSeal: g.ra.unseal {rD}
   if rhsLoc.kind == InReg and rhsLoc.isTemp and not reusedRhs: g.unbindTemp(rhsLoc.r)
   if lhsLoc.kind == InReg and lhsLoc.isTemp and not reusedLhs: g.unbindTemp(lhsLoc.r)
@@ -1990,7 +2029,17 @@ proc emitAtomic2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
   ## lock-prefixed sequence using those registers (the register-parameterized
   ## `genAtomicXadd`/`genAtomicLoopRmw` helpers, shared with the legacy path).
   ## Result → rax (moved to its home by emitCall2). Pointer args stay raw ABI regs.
-  for a in argCurs: g.emitValue2(a)                  # → rdi / rsi / rdx / …
+  # Only the leading ptr / val / exp / des operands feed the inline lock sequence.
+  # x86-64's strong memory model needs no runtime copy of the trailing memory-order /
+  # `weak` / success / failure arguments (all compile-time constants), so emitting them
+  # was dead — a `lea;movsxd` rodata load per order enum. Emit just the consumed prefix.
+  let usedArgs =
+    case builtin
+    of "__atomic_thread_fence", "__atomic_signal_fence": 0
+    of "__atomic_load_n": 1
+    of "__atomic_compare_exchange_n": 3
+    else: 2                                           # store/exchange/fetch_* : ptr,val
+  for i in 0 ..< min(usedArgs, argCurs.len): g.emitValue2(argCurs[i])  # → rdi / rsi / rdx
   # The inline lock-prefixed sequence uses rdi/rsi/rdx/rax/rcx as RAW ABI scratch
   # (`emReg` emits `(reg)`); a call-free local the allocator homed in one of these
   # leaves a stale typed name that `emReg` would emit instead, mismatching the typed
@@ -2479,6 +2528,39 @@ proc emitDivMod2(g: var CodeGen; c: Cursor) =
       dvsC = cc; skip cc                                # divisor
       while cc.hasMore: skip cc
   let signed = isSignedType(resolveType(g.prog, tc))
+  # Constant power-of-two divisor → strength-reduce the `idiv` (~20-40 cycles, plus a
+  # dead `mov r,imm` for the divisor) to shifts. Div and unsigned-mod land in rax like
+  # `idiv`, so the result tail below is shared. Signed mod keeps `idiv` (bias is fiddly);
+  # a huge unsigned-mod mask (> imm32) also falls through.
+  let (dvsIsConst, dval) = g.tryConstFold(dvsC)
+  let isPow2 = dvsIsConst and dval >= 2 and (dval and (dval - 1)) == 0
+  if isPow2 and res.kind == InReg and not (signed and wantRem) and
+     (not wantRem or dval - 1 <= high(int32).int64):
+    var k = 0'i64
+    var t = dval
+    while t > 1: (t = t shr 1; inc k)                  # k = log2(divisor)
+    g.emitValue2(divC)                                  # dividend → rax (pinned by allocCall)
+    let acc = g.md.intRetReg                            # rax: dividend now, result after
+    block:
+      let dl = g.ra.locs[cursorToPosition(g.buf[], divC)]
+      if dl.kind == InReg:
+        if dl.r != acc: g.movReg(acc, dl.r)
+      else: g.emitLoadLoc(dl, acc)
+    if wantRem:                                         # unsigned mod: acc &= 2^k - 1
+      g.binImm(AndX64, acc, dval - 1)
+    elif not signed:                                    # unsigned div: acc >>>= k
+      g.binImm(ShrX64, acc, k)
+    else:                                               # signed div: round-to-zero bias, then sar
+      let tmp = g.pickStagingSealed("a pow2-div sign bias", res.typ, avoid = acc)
+      g.movReg(tmp, acc)
+      g.binImm(SarX64, tmp, 63)                         # tmp = sign mask (all-ones if acc<0)
+      g.binImm(ShrX64, tmp, 64 - k)                     # tmp = (2^k - 1) if acc<0 else 0
+      g.binReg(AddX64, acc, tmp)                        # acc += bias
+      g.binImm(SarX64, acc, k)                          # acc >>= k (arithmetic)
+      g.giveBack tmp
+    if res.isTemp: g.bindTemp(res.r, res.typ)           # rebind a reused dead-local reg
+    if res.r != acc: g.movReg(res.r, acc)               # (shared idiv result tail)
+    return
   g.emitValue2(divC)                                    # dividend → rax (pinned)
   g.emitValue2(dvsC)                                    # divisor → its register
   var dvsLoc = g.ra.locs[cursorToPosition(g.buf[], dvsC)]
@@ -4191,7 +4273,15 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
       # Safe to reorder: hexer un-nests, so every lvalue-embedded value is an idempotent
       # symbol/immediate load. `prematLval2(lhs)` therefore moves down to just before
       # each store's `emLvalAddr2(lhs)`.
+      # If the rhs is a sub-width int bin-arith stored into this (same-or-narrower)
+      # integer field, the store truncates → its `shl;sar` re-normalize is dead.
+      let savedSuppress = g.binNormSuppressPos
+      block:
+        let dstTyR = resolveType(g.prog, g.getType(lhs))
+        let w = if isPtrType(dstTyR): 8 else: typeToSlot(dstTyR).size
+        g.binNormSuppressPos = g.binStoreSuppressPos(rhs, w)
       g.emitValue2(rhs)                                   # rhs value FIRST
+      g.binNormSuppressPos = savedSuppress
       var v = g.ra.locs[cursorToPosition(g.buf[], rhs)]
       let floatRhs = v.kind == InFReg or
                      (v.kind in {NamedStack, Mem} and v.typ.isFloat)
@@ -4476,16 +4566,27 @@ proc emitCaseTest2(g: var CodeGen; selReg: Reg; c: var Cursor; lBody: string; si
 
 proc genStmt2(g: var CodeGen; c: Cursor) =
   if c.kind == DotToken: return                 # an empty statement (e.g. `(stmts .)`)
+  # Capture our own tail-position, then default children to non-tail: only the
+  # LAST child of a straight-line `stmts`/`scope` inherits it (control leaves any
+  # other child sideways, and a nested compound gets its own reset below).
+  let myTail = g.tailStmt
+  g.tailStmt = false
   case c.stmtKind
   of StmtsS:
     var cc = c
     cc.into:
-      while cc.hasMore: (g.genStmt2(cc); skip cc)
+      while cc.hasMore:
+        var nx = cc; skip nx
+        g.tailStmt = myTail and not nx.hasMore
+        g.genStmt2(cc); skip cc
   of ScopeS:
     g.enterScope()
     var cc = c
     cc.into:
-      while cc.hasMore: (g.genStmt2(cc); skip cc)
+      while cc.hasMore:
+        var nx = cc; skip nx
+        g.tailStmt = myTail and not nx.hasMore   # kills trail the last stmt but emit no bytes,
+        g.genStmt2(cc); skip cc                  # so tail fall-through into the epilogue survives
     g.exitScope()
   of VarS, ConstS: g.genVarDecl2(c)    # a local const = an immutable var with a literal init
   of CallS: g.emitCall2(c)
@@ -4530,12 +4631,16 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         case cc.substructureKind
         of ElifU:
           let lNext = g.freshLabel()
+          var peek = cc; skip peek
+          let isLastBranch = not peek.hasMore   # no `elif`/`else` follows this branch
           var bc = cc
           bc.into:
             let condC = bc; skip bc
             g.emitCond2(condC, lNext, whenTrue = false)
             while bc.hasMore: (g.genStmt2(bc); skip bc)
-            g.emJmp(lEnd)
+            # The skip-to-merge jump exists only to hop over later branches; the last
+            # branch has none, so it falls through `lNext` (empty) into `lEnd`.
+            if not isLastBranch: g.emJmp(lEnd)
           g.emLab(lNext)
         of ElseU:
           var bc = cc
@@ -4588,7 +4693,10 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         # The epilogue (framePop + ret) is emitted ONCE at the proc tail by
         # emitProcBody2; a `ret` that is NOT the tail must jump there rather than fall
         # through into the following statements (e.g. a mid-proc `if cond: return x`).
-        g.emJmp(g.retLabel2); g.retLabelUsed2 = true
+        # A tail `ret` falls straight through the (zero-byte) scope kills into the
+        # epilogue, so it needs no jump and does not force the shared label.
+        if not myTail:
+          g.emJmp(g.retLabel2); g.retLabelUsed2 = true
       while cc.hasMore: skip cc
   of CaseS:
     # `(case Expr (of (ranges BranchRange+) StmtList)* (else StmtList)?)`. Mirrors the
@@ -4637,10 +4745,10 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         e.into:
           while e.hasMore: (g.genStmt2(e); skip e)
       g.emJmp(lEnd)
-      for (lBody, bc) in bodies:
-        g.emLab(lBody)
-        g.genStmt2(bc)                                    # body (a stmts node)
-        g.emJmp(lEnd)
+      for idx in 0 ..< bodies.len:
+        g.emLab(bodies[idx][0])
+        g.genStmt2(bodies[idx][1])                        # body (a stmts node)
+        if idx < bodies.len - 1: g.emJmp(lEnd)            # last body falls through to lEnd
     g.emLab(lEnd)
   of LabS:                                                # `(lab :name)` — a goto target
     var cc = c
@@ -4741,9 +4849,13 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo) =
           g.emScalarStackVar(st.name)
       g.retLabel2 = g.freshLabel()                       # shared epilogue for mid-proc `ret`
       g.retLabelUsed2 = false
+      g.binNormSuppressPos = -1                          # no store-fused normalize elision pending
       var c = info.decl
       c.into:
         inc c; skip c; skip c; skip c                    # name, params, ret, pragmas
+        # The whole body is in tail position: after it, control reaches the epilogue.
+        # The entry proc ends in an exit syscall (no epilogue jump), so leave it false.
+        g.tailStmt = not info.isEntry
         if c.stmtKind == StmtsS: g.genStmt2(c)
         while c.hasMore: skip c
       g.exitScope()

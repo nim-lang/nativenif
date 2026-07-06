@@ -194,8 +194,20 @@ proc allocStorage(b: var Builder; slot: AsmSlot; props: VarProps): Location =
     # the target can spare as a local home (empty on x86-64, where R10/R11 are the
     # emitter's own staging scratch; the full pool on AArch64). When that subset is
     # empty or exhausted, spill rather than steal the emitter's scratch.
-    r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
-    if r == NoReg: r = b.takeReg(b.freeVol, b.md.intLocalTempRegs)
+    if b.md.arch == X86:
+      # x86-64: PREFER the volatile `intLocalTempRegs` and fall back to callee-saved.
+      # A call-free local is unconstrained (any register, no prologue push/pop); taking a
+      # scarce callee-saved reg for it starves the cross-call locals — which have NO other
+      # option — into spills (a register-class priority inversion). Reserve callee-saved
+      # for the values that can only use it. (Gated to x86: this exercises volatile-reg
+      # local homes far more, and the x64 emitter has the matching narrowing-mov / reused-
+      # register retype support — see codegen_x64/assembler; the AArch64 path does not yet,
+      # so it keeps the callee-saved-first order it was validated with.)
+      r = b.takeReg(b.freeVol, b.md.intLocalTempRegs)
+      if r == NoReg: r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
+    else:
+      r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
+      if r == NoReg: r = b.takeReg(b.freeVol, b.md.intLocalTempRegs)
     # Still nothing? A local whose interval crosses no variable shift / no div may
     # additionally home in the shift-count / div-rem register: their fixed role
     # never overlaps this local's life (guaranteed by the interval test that set

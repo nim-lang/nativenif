@@ -50,6 +50,18 @@ type
                                               ## base (rsp after pushes), captured before the frame
                                               ## `sub`s so stack params survive rsp moving; else NoReg
     labelCount*: int                         ## fresh-label counter
+    binNormSuppressPos*: int                 ## token pos of the ONE bin-arith node whose
+                                             ## canonical sub-width `shl;sar` re-normalization is
+                                             ## dead because its result feeds a truncating store of
+                                             ## width <= the bin's type (set by genStore2, read by
+                                             ## emitBin2). -1 = none. Never suppresses a result that
+                                             ## feeds `shr`/unsigned-cmp/div (those aren't stores).
+    tailStmt*: bool                          ## the statement about to be emitted is in TAIL
+                                             ## position: control falls straight through to the
+                                             ## proc epilogue afterwards, so a `ret` here needs no
+                                             ## `jmp retLabel2`. Propagated to the last child of a
+                                             ## `stmts`/`scope`; reset to false for any nested
+                                             ## compound so a mid-body `ret` still jumps.
     loopEnds*: seq[string]                   ## stack of enclosing-loop end labels (for `break`)
     retLabel2*: string                       ## value-core: shared epilogue label a mid-proc `ret` jumps to
     retLabelUsed2*: bool                     ## value-core: a `ret` jumped to retLabel2 ⇒ emit the label
