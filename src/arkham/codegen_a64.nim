@@ -905,6 +905,15 @@ proc emLab(g: var CodeGen; name: string) =
 proc emBr(g: var CodeGen; tag: A64Inst; name: string) =
   g.ab.tree tag: g.ab.sym name              # (b L) / (beq L) / …
 
+template emitLoop(g: var CodeGen; body: untyped) =
+  ## Structured infinite loop `(loop (stmts …))`: nifasm emits the back-edge INTERNALLY,
+  ## so no backward branch reaches the asm-NIF (keeps "every branch forward, back-edges
+  ## are loops" true). `body` must branch FORWARD to a break/exit label defined AFTER the
+  ## loop. (a64 has no reg-mirror cache — nothing else to manage, unlike x64's `emitLoop`.)
+  g.ab.tree LoopA64:
+    g.ab.tree StmtsA64:
+      body
+
 # ── atomics: GCC __atomic_* builtins → AArch64 load/store-exclusive loops ─────
 # arkham lowers the call-shaped atomic builtins (see programs.collect) the way
 # the LLVM backend does, but to a portable LL/SC retry loop. Memory ordering is
@@ -1201,6 +1210,7 @@ proc emitValue2(g: var CodeGen; c: Cursor)
 proc emitFValue2(g: var CodeGen; c: Cursor)
 proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int)
 proc emitCall2(g: var CodeGen; c: Cursor)
+proc emitCall2Inner(g: var CodeGen; c: Cursor)
 proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool)
 proc genStmt2(g: var CodeGen; c: Cursor)
 proc emLvalAddr2(g: var CodeGen; c: Cursor)
@@ -2063,51 +2073,47 @@ proc emitMemIntrin2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
   let (i, b, b2) = (R3, R4, R5)
   case builtin
   of "memcpy", "memmove":
-    let loop = g.freshLabel(); let done = g.freshLabel()
+    let done = g.freshLabel()
     if builtin == "memmove":
-      let fwd = g.freshLabel(); let bwd = g.freshLabel()
+      let fwd = g.freshLabel()
       g.ab.tree CmpA64: (g.ab.reg dst; g.ab.reg src)
       g.emBr(BlsA64, fwd)
       g.movReg(i, n)
-      g.emLab(bwd)
-      g.ab.tree CmpA64: (g.ab.reg i; g.ab.intLit 0)
-      g.emBr(BeqA64, done)
-      g.binImm(SubA64, i, 1)
-      g.emLdrb(b, src, i); g.emStrb(b, dst, i)
-      g.emBr(BA64, bwd)
+      g.emitLoop:
+        g.ab.tree CmpA64: (g.ab.reg i; g.ab.intLit 0)
+        g.emBr(BeqA64, done)
+        g.binImm(SubA64, i, 1)
+        g.emLdrb(b, src, i); g.emStrb(b, dst, i)
       g.emLab(fwd)
     g.movImm(i, 0)
-    g.emLab(loop)
-    g.ab.tree CmpA64: (g.ab.reg i; g.ab.reg n)
-    g.emBr(BhsA64, done)
-    g.emLdrb(b, src, i); g.emStrb(b, dst, i)
-    g.binImm(AddA64, i, 1)
-    g.emBr(BA64, loop)
+    g.emitLoop:
+      g.ab.tree CmpA64: (g.ab.reg i; g.ab.reg n)
+      g.emBr(BhsA64, done)
+      g.emLdrb(b, src, i); g.emStrb(b, dst, i)
+      g.binImm(AddA64, i, 1)
     g.emLab(done)
     g.movReg(IntRet, dst)
   of "memset":
-    let loop = g.freshLabel(); let done = g.freshLabel()
+    let done = g.freshLabel()
     g.movImm(i, 0)
-    g.emLab(loop)
-    g.ab.tree CmpA64: (g.ab.reg i; g.ab.reg n)
-    g.emBr(BhsA64, done)
-    g.emStrb(src, dst, i)                                # store low byte of `val` (in x1)
-    g.binImm(AddA64, i, 1)
-    g.emBr(BA64, loop)
+    g.emitLoop:
+      g.ab.tree CmpA64: (g.ab.reg i; g.ab.reg n)
+      g.emBr(BhsA64, done)
+      g.emStrb(src, dst, i)                              # store low byte of `val` (in x1)
+      g.binImm(AddA64, i, 1)
     g.emLab(done)
     g.movReg(IntRet, dst)
   of "memcmp":
-    let loop = g.freshLabel(); let diff = g.freshLabel()
+    let diff = g.freshLabel()
     let equal = g.freshLabel(); let done = g.freshLabel()
     g.movImm(i, 0)
-    g.emLab(loop)
-    g.ab.tree CmpA64: (g.ab.reg i; g.ab.reg n)
-    g.emBr(BhsA64, equal)
-    g.emLdrb(b, dst, i); g.emLdrb(b2, src, i)            # dst=pa, src=pb
-    g.ab.tree CmpA64: (g.ab.reg b; g.ab.reg b2)
-    g.emBr(BneA64, diff)
-    g.binImm(AddA64, i, 1)
-    g.emBr(BA64, loop)
+    g.emitLoop:
+      g.ab.tree CmpA64: (g.ab.reg i; g.ab.reg n)
+      g.emBr(BhsA64, equal)
+      g.emLdrb(b, dst, i); g.emLdrb(b2, src, i)          # dst=pa, src=pb
+      g.ab.tree CmpA64: (g.ab.reg b; g.ab.reg b2)
+      g.emBr(BneA64, diff)
+      g.binImm(AddA64, i, 1)
     g.emLab(diff)
     g.movReg(IntRet, b); g.binReg(SubA64, IntRet, b2)
     g.emBr(BA64, done)
@@ -2137,7 +2143,7 @@ proc wsfx(bits: int): string =
 proc emitRmw2(g: var CodeGen; opStr: string; isXchg, returnNew: bool; bits: int) =
   ## `loop: ldaxr old,[x0]; new = old op x1 (or x1 for xchg); stlxr st,new,[x0];
   ## cmp st,0; bne loop`. Scratch x3/x4/x5 (raw). Result → x0. Sized to `bits`.
-  let loop = g.freshLabel()
+  let lDone = g.freshLabel()
   let p = g.emOp R0
   let v = g.emOp R1
   let old = g.emOp R3
@@ -2145,8 +2151,11 @@ proc emitRmw2(g: var CodeGen; opStr: string; isXchg, returnNew: bool; bits: int)
   let st = g.emOp R5
   let w = wsfx(bits)
   let update = if isXchg: &"(mov {neu} {v})" else: &"(mov {neu} {old}) ({opStr} {neu} {v})"
-  g.ab.splice &"(lab :{loop}) (ldaxr {old} {p}{w}) " & update & " " &
-              &"(stlxr {st} {neu} {p}{w}) (cmp {st} 0) (bne {loop})"
+  # Structured `(loop …)`: nifasm emits the back-edge internally (retry on store-conflict).
+  # The exclusive store SUCCEEDS when `st == 0` → forward `(beq lDone)` leaves the loop;
+  # a non-zero `st` (conflict) falls through to the internal back-edge and retries.
+  g.ab.splice &"(loop (stmts (ldaxr {old} {p}{w}) " & update & " " &
+              &"(stlxr {st} {neu} {p}{w}) (cmp {st} 0) (beq {lDone}))) (lab :{lDone})"
   g.movReg(IntRet, if returnNew: R4 else: R3)
 
 proc emitAtomic2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
@@ -2173,14 +2182,19 @@ proc emitAtomic2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
   of "__atomic_add_fetch": g.emitRmw2("add", false, true, bits)
   of "__atomic_sub_fetch": g.emitRmw2("sub", false, true, bits)
   of "__atomic_compare_exchange_n":
-    let loop = g.freshLabel(); let lFail = g.freshLabel(); let lDone = g.freshLabel()
+    let lSucc = g.freshLabel(); let lFail = g.freshLabel(); let lDone = g.freshLabel()
     let (pp, ep, d) = (g.emOp R0, g.emOp R1, g.emOp R2)
     let (exp, old, st, ret) = (g.emOp R3, g.emOp R4, g.emOp R5, g.emOp IntRet)
     let w = wsfx(bits)
+    # Structured `(loop …)`: the back-edge (retry on store-conflict) is internal to nifasm.
+    # Two FORWARD exits from the body: `(bne lFail)` when the loaded value ≠ expected (CAS
+    # fails), `(beq lSucc)` when the exclusive store succeeded (`st == 0`). A non-zero `st`
+    # (conflict) falls through to the internal back-edge and re-reads.
     g.ab.splice(
-      &"(ldar {exp} {ep}{w}) (lab :{loop}) (ldaxr {old} {pp}{w}) " &
+      &"(ldar {exp} {ep}{w}) (loop (stmts (ldaxr {old} {pp}{w}) " &
       &"(cmp {old} {exp}) (bne {lFail}) (stlxr {st} {d} {pp}{w}) " &
-      &"(cmp {st} 0) (bne {loop}) (mov {ret} 1) (b {lDone}) " &
+      &"(cmp {st} 0) (beq {lSucc}))) " &
+      &"(lab :{lSucc}) (mov {ret} 1) (b {lDone}) " &
       &"(lab :{lFail}) (clrex) (stlr {old} {ep}{w}) (mov {ret} 0) (lab :{lDone})")
   else: raiseAssert "arkham a64n: unsupported atomic builtin: " & builtin
 
@@ -2196,7 +2210,7 @@ proc proctypeOfTarget(g: var CodeGen; targetCur: Cursor): Cursor =
   assert result.kind == TagLit and result.typeKind == ProctypeT,
     "arkham a64n: indirect call target is not a proctype"
 
-proc emitCall2(g: var CodeGen; c: Cursor) =
+proc emitCall2Inner(g: var CodeGen; c: Cursor) =
   ## Emit a call. The allocator placed each argument in its ABI register and the
   ## result in x0 / v0 (or a dest-passed home).
   ##
@@ -2485,6 +2499,41 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
       elif resLoc.kind == InReg and resLoc.r != IntRet:
         if resLoc.isTemp and resSlot.kind != AMem: g.bindTemp(resLoc.r, resSlot)
         g.movReg(resLoc.r, IntRet)
+
+proc emCallerSaveDecl(g: var CodeGen; slotName, varName: string) =
+  ## Declare the reclaimable spill slot with the register-var's own type (`(i 64)`
+  ## scalar / `(ptr T)`), then save the live register value into it. On a64 a stack slot
+  ## is addressed by its bare name (nifasm resolves it to `[sp,#off]` and str's it).
+  if g.symType.hasKey(varName) and isPtrType(resolveType(g.prog, g.symType[varName])):
+    g.emTypedStackVar(slotName, g.symType[varName])
+  else:
+    g.emScalarStackVar(slotName)
+  g.ab.tree MovA64:                              # (mov slot name) — save (→ str)
+    g.ab.sym slotName
+    g.ab.sym varName
+
+proc emitCall2(g: var CodeGen; c: Cursor) =
+  ## Caller-save wrapper (a64 twin of the x64 one): a cross-call local homed in an
+  ## atomic-safe caller-saved volatile (x9–x13) is spilled around this call inside a
+  ## `(scope …)` — save before the call clobbers the register, restore after. The var's
+  ## `(var :name (xN) T)` binding PERSISTS across the scope; the restore's `mov` re-defines
+  ## the register (clearing the call's clobber via the a64 mov-clobber-clear). No caller-
+  ## save vars ⇒ zero overhead, byte-identical to before.
+  let saveSet = g.callerSaveSetAt()
+  if saveSet.len == 0:
+    g.emitCall2Inner(c)
+    return
+  let pos = cursorToPosition(g.buf[], c)
+  g.ab.tree ScopeA64:
+    for it in saveSet:
+      g.emCallerSaveDecl(callerSaveSlotName(pos, it.reg), it.name)
+    g.emitCall2Inner(c)
+    let resLoc = g.ra.locs[pos]
+    for it in saveSet:
+      if resLoc.kind == InReg and resLoc.r == it.reg: continue   # x=f(x): result overwrites
+      g.ab.tree MovA64:                          # (mov name slot) — restore (→ ldr)
+        g.ab.sym it.name
+        g.ab.sym callerSaveSlotName(pos, it.reg)
 
 # ── conditions ───────────────────────────────────────────────────────────────
 
@@ -3479,16 +3528,14 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         g.genStore2(rhsCur, memLoc(lhsCur, ScalarSlot), asgnPos)
       while cc.hasMore: skip cc
   of WhileS:
-    let lStart = g.freshLabel()
     let lEnd = g.freshLabel()
     g.loopEnds.add lEnd
-    var cc = c
-    cc.into:
-      let condC = cc; skip cc
-      g.emLab(lStart)
-      g.emitCond2(condC, lEnd, whenTrue = false)
-      while cc.hasMore: (g.genStmt2(cc); skip cc)
-      g.emBr(BA64, lStart)
+    g.emitLoop:
+      var cc = c
+      cc.into:
+        let condC = cc; skip cc
+        g.emitCond2(condC, lEnd, whenTrue = false)     # forward exit when cond is false
+        while cc.hasMore: (g.genStmt2(cc); skip cc)     # body
     g.emLab(lEnd)
     discard g.loopEnds.pop()
   of IfS:

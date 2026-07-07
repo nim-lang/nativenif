@@ -13,7 +13,7 @@
 ## target `MachineDesc` so the backends drive the (shared) register allocator
 ## and scratch pools from it.
 
-import std / [tables, sets, assertions]
+import std / [tables, sets, assertions, algorithm]
 import nifcore, nifcdecl
 import slots, machinedesc, analyser, register_allocator, programs
 import asmbuf
@@ -622,3 +622,23 @@ proc operandInReg*(g: var CodeGen; operand: Cursor; dest: Reg): bool =
   if operand.kind == Symbol:
     let loc = g.ra.locationOfSym(symName(operand))
     result = loc.kind == InReg and loc.r == dest
+
+# ── caller-save (shared by both backends) ────────────────────────────────────
+proc callerSaveSetAt*(g: var CodeGen): seq[tuple[reg: Reg, name: string]] =
+  ## The caller-save LOCALS (see `RegAlloc.callerSaveHomes`) currently bound in a
+  ## register — they must be spilled around a call (which clobbers the volatile home).
+  ## The trigger is `regLocal` membership = the EMIT-TIME liveness truth (the binding
+  ## persists decl→kill), so a var live across a control-flow merge is still bound at a
+  ## call in a predecessor branch — what a coarse-`freeAfter` interval would MISS (it
+  ## under-approximates across merges; the cont.47 wall). The allocator only hands a
+  ## caller-save home to a var whose value is valid wherever it is bound (SSA-like, no
+  ## call in its initializer), so saving whenever bound is always well-defined. Sorted by
+  ## register for deterministic output.
+  if g.ra.callerSaveHomes.len == 0: return
+  for reg, name in g.regLocal:
+    if g.ra.callerSaveHomes.hasKey(name):
+      result.add (reg: reg, name: name)
+  result.sort(proc (a, b: tuple[reg: Reg, name: string]): int = cmp(ord(a.reg), ord(b.reg)))
+
+proc callerSaveSlotName*(pos: int; reg: Reg): string {.inline.} =
+  "csave." & $pos & "." & $ord(reg) & ".0"

@@ -6,10 +6,15 @@ type
 
   SlotManager* = object
     stackSize*: int
+    maxStackSize*: int   ## high-water mark of `stackSize`. A `(scope …)` reclaims its
+                         ## slots by resetting `stackSize` to the pre-scope value, but the
+                         ## prologue must still reserve the peak: `(ssize)` is patched with
+                         ## `max(stackSize, maxStackSize)`.
     freeSlots*: seq[Slot]
 
 proc initSlotManager*(): SlotManager =
   result.stackSize = 0
+  result.maxStackSize = 0
   result.freeSlots = @[]
 
 proc alignedSize*(t: Type; slotAlign = 8): int =

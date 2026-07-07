@@ -70,6 +70,8 @@ type
   ProcAnalysis* = object
     vars*: Table[string, VarInfo]
     hasCall*: bool
+    callPositions*: seq[int]    ## token positions of every real call — the allocator's
+                                ## caller-save cost model counts how many a var crosses
     clobbersDivReg*: bool       ## body contains a div/mod → rdx is clobbered, so a
                                 ## leaf param must not be homed there (x86-64 only)
     clobbersShiftReg*: bool     ## body contains a variable shift → rcx (cl) is
@@ -521,6 +523,7 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
     scopeFrame(c):                      # the proc-body scope frame (its `stmts`
       iterStmts(c, n): analyse(c, n)    # shares it rather than pushing its own)
   c.res.hasCall = c.callPositions.len > 0 or c.atomicPositions.len > 0
+  c.res.callPositions = c.callPositions
   # Grant `AllRegs` (volatile/caller-saved eligible) to every local whose live
   # interval contains no call point. The interval is `(liveStart, freeAfter]`
   # for ordinary locals, or the enclosing-loop span for loop-carried ones. The

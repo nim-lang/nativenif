@@ -375,6 +375,13 @@ type
     pendingSymbols: seq[string]  # Symbols pending code generation
     generatedSymbols: HashSet[string]  # Symbols already generated
     dedupTable: Table[string, string]  # Maps dedup key to canonical symbol name
+    definedLabels: HashSet[int]  # LabelIds of *local* labels already defined in the
+                        # current proc (populated by (lab …), cleared per proc). A
+                        # `jmp`/`jcc`/`b`/`bcc` whose target is in here is a BACKWARD
+                        # jump — forbidden: back-edges must be expressed as (loop), so
+                        # every emitted control-flow branch stays forward. The internal
+                        # loop back-edge is emitted via emitJmp/emitB directly (it never
+                        # passes through the instruction handlers), so it is exempt.
     # Thread-local storage (x86-64). nifasm owns the unified per-thread block
     # `arkham.tls.0` (sized for ALL bundled modules' tvars) and synthesizes the
     # entry prologue that points FS at it (`arch_prctl`). Nim thread-locals have no
@@ -2108,6 +2115,17 @@ proc genIteA64(n: var Cursor; ctx: var GenContext) =
 
 proc genLoopA64(n: var Cursor; ctx: var GenContext) =
   inc n
+  # Bare infinite-loop form `(loop (stmts …))` — the back-edge is emitted INTERNALLY here,
+  # so no backward branch reaches the input; the body carries a FORWARD branch to a break/
+  # exit label defined AFTER the loop. This is the form arkham emits for every loop (mirrors
+  # the x64 `genLoopX64`). The legacy `(loop <pre> <condflag> <body>)` form below is unused.
+  if atTag(n, StmtsTagId):
+    let lStart = ctx.buf.createLabel()
+    ctx.buf.defineLabel(lStart)
+    genStmt(n, ctx)                 # the body (contains the forward break/exit branch)
+    ctx.buf.emitB(lStart)           # the loop back-edge — emitted by nifasm, not the input
+    return
+
   genStmt(n, ctx)
   let lStart = ctx.buf.createLabel()
   let lEnd = ctx.buf.createLabel()
@@ -2259,6 +2277,17 @@ proc memWidthOpc(typ: Type; isLoad: bool): tuple[size, opc: int] =
             else: 1                                # LDRB/LDRH/LDR(W) zero-extend
   (size, opc)
 
+proc checkForwardJump(ctx: GenContext; label: LabelId; n: Cursor) =
+  ## Enforce the finalir invariant: every `jmp`/`jcc`/`b`/`bcc` must target a label
+  ## that is not yet defined (a forward jump). A back-edge to an already-defined local
+  ## label is forbidden — loops must be structured as `(loop …)`, whose back-edge is
+  ## emitted internally (bypassing this check). Only *local* labels are tracked
+  ## (`ctx.definedLabels`), so branches/tail-calls to proc/rodata/gvar targets — which
+  ## are never added — are never flagged.
+  if int(label) in ctx.definedLabels:
+    error("backward jump to an already-defined label is forbidden; " &
+          "express the back-edge as a (loop …) instead", n)
+
 proc genInstA64(n: var Cursor; ctx: var GenContext) =
   if n.kind != TagLit: error("Expected instruction", n)
   let instTag = tagToA64Inst(n.tag)
@@ -2329,6 +2358,13 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of StmtsA64:
     loopInto n:
       genInstA64(n, ctx)
+  of ScopeA64:
+    # See `ScopeX64`: reclaimable stack-slot arena for a call's caller-save spills.
+    let savedStackSize = ctx.slots.stackSize
+    loopInto n:
+      genInstA64(n, ctx)
+    ctx.slots.maxStackSize = max(ctx.slots.maxStackSize, ctx.slots.stackSize)
+    ctx.slots.stackSize = savedStackSize
   of PrepareA64:
     genPrepareA64(n, ctx)
   of CallA64:
@@ -2356,13 +2392,16 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       let labId = ctx.buf.createLabel()
       ctx.scope.define(Symbol(name: name, kind: skLabel, offset: int(labId)))
       ctx.buf.defineLabel(labId)
+      ctx.definedLabels.incl int(labId)
     elif sym.kind == skLabel:
       if sym.offset == -1:
         let labId = ctx.buf.createLabel()
         sym.offset = int(labId)
         ctx.buf.defineLabel(labId)
+        ctx.definedLabels.incl int(labId)
       else:
         ctx.buf.defineLabel(LabelId(sym.offset))
+        ctx.definedLabels.incl sym.offset
     else:
       error("Symbol is not a label", n)
     inc n
@@ -2866,6 +2905,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let op = parseOperandA64(n, ctx)
     if op.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     arm64.emitB(ctx.buf, op.label)
   of BlA64:
     inc n
@@ -2877,60 +2917,70 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let op = parseOperandA64(n, ctx)
     if op.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     arm64.emitBeq(ctx.buf, op.label)
 
   of BneA64:
     inc n
     let op = parseOperandA64(n, ctx)
     if op.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     arm64.emitBne(ctx.buf, op.label)
 
   of BltA64:
     inc n
     let op = parseOperandA64(n, ctx)
     if op.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     arm64.emitBlt(ctx.buf, op.label)
 
   of BleA64:
     inc n
     let op = parseOperandA64(n, ctx)
     if op.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     arm64.emitBle(ctx.buf, op.label)
 
   of BgtA64:
     inc n
     let op = parseOperandA64(n, ctx)
     if op.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     arm64.emitBgt(ctx.buf, op.label)
 
   of BgeA64:
     inc n
     let op = parseOperandA64(n, ctx)
     if op.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     arm64.emitBge(ctx.buf, op.label)
 
   of BloA64:
     inc n
     let op = parseOperandA64(n, ctx)
     if op.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     arm64.emitBlo(ctx.buf, op.label)
 
   of BlsA64:
     inc n
     let op = parseOperandA64(n, ctx)
     if op.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     arm64.emitBls(ctx.buf, op.label)
 
   of BhiA64:
     inc n
     let op = parseOperandA64(n, ctx)
     if op.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     arm64.emitBhi(ctx.buf, op.label)
 
   of BhsA64:
     inc n
     let op = parseOperandA64(n, ctx)
     if op.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     arm64.emitBhs(ctx.buf, op.label)
 
   of StpA64:
@@ -3042,6 +3092,7 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
       let lab = ctx.buf.createLabel()
       sym.offset = int(lab)
     ctx.buf.defineLabel(LabelId(sym.offset))
+    ctx.definedLabels.clear()   # fresh backward-jump tracking per proc
 
     # Initialize stack context
     ctx.slots = initSlotManager()
@@ -3123,7 +3174,10 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   # Patch ssize. On x86 the placeholder is a raw imm32 in the instruction; on
   # AArch64 the immediate is a bit-field of a 32-bit instruction, so the patch
   # rewrites that field (MOVZ imm16 at [20:5]; ADD/SUB imm12 at [21:10]).
-  let alignedStackSize = (ctx.slots.stackSize + 15) and not 15
+  # `(scope …)` blocks reclaim their slots (reset `stackSize`), so the FINAL
+  # `stackSize` under-counts the frame. Reserve the peak seen at any point.
+  let peakStackSize = max(ctx.slots.stackSize, ctx.slots.maxStackSize)
+  let alignedStackSize = (peakStackSize + 15) and not 15
   let isA64 = ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64}
   let v = uint32(alignedStackSize)
   for pos in ctx.ssizePatches:
@@ -4181,6 +4235,13 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
     # already in that register marshals to `(mov (arg pN) (rN))` == `mov rN,rN`.
     # arkham's own `movReg` elides d==s; this mirrors it for the marshalling path.
 
+    # A register destination now holds a freshly-written value, so an earlier call's
+    # clobber no longer applies — mirror LeaX64 (5211) and the a64 mov (1877). This is
+    # what lets a caller-save reload `(mov x.0 <slot>)` (x.0 bound to a call-clobbered
+    # volatile) pass the clobber verifier: the reload re-defines the register. Sound —
+    # `parseOperand` still rejects reading a clobbered SOURCE; a mov defines its dest.
+    ctx.clobbered.excl(dest.reg)
+
 proc genIteX64(n: var Cursor; ctx: var GenContext) =
   inc n
 
@@ -4257,6 +4318,18 @@ proc genIteX64(n: var Cursor; ctx: var GenContext) =
 
 proc genLoopX64(n: var Cursor; ctx: var GenContext) =
   inc n
+
+  # Bare infinite-loop form `(loop (stmts …))` — the body is a single statement block. The
+  # back-edge is emitted INTERNALLY here, so no token-level backward `jmp` reaches the input:
+  # the body carries a FORWARD `jmp` to a break/exit label defined AFTER the loop. This is
+  # the form arkham emits for every loop; it keeps "every `jmp` is forward, back-edges are
+  # `loop`" true. (The legacy `(loop <pre> <condflag> <body>)` cfvar form below is unused.)
+  if atTag(n, StmtsTagId):
+    let lStart = ctx.buf.createLabel()
+    ctx.buf.defineLabel(lStart)
+    genStmt(n, ctx)                 # the body (contains the forward break/exit jmp)
+    ctx.buf.emitJmp(lStart)         # the loop back-edge — emitted by nifasm, not the input
+    return
 
   # Pre-loop
   genStmt(n, ctx)
@@ -4536,6 +4609,18 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
   of StmtsX64:
     loopInto n:
       genInstX64(n, ctx)
+  of ScopeX64:
+    # A `(scope …)` is a `(stmts …)` with a reclaimable stack-slot arena: `(s)`
+    # locals declared inside are freed when the scope closes, so sibling scopes
+    # (e.g. the caller-save spill slots of consecutive calls) reuse the same
+    # frame bytes. Sound because a call is straight-line control flow — the saved
+    # values are restored before the scope ends, so nothing outside the scope
+    # observes those slots. The prologue still reserves the peak via `maxStackSize`.
+    let savedStackSize = ctx.slots.stackSize
+    loopInto n:
+      genInstX64(n, ctx)
+    ctx.slots.maxStackSize = max(ctx.slots.maxStackSize, ctx.slots.stackSize)
+    ctx.slots.stackSize = savedStackSize
   of PrepareX64:
     genPrepareX64(n, ctx)
   of CallX64:
@@ -5265,6 +5350,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     elif op.label != LabelId(0) or op.typ.kind == UIntT: # Label check
       # op.label is set if it was a label operand
       if op.typ.kind == UIntT: # Label address
+        checkForwardJump(ctx, op.label, n)
         x86.emitJmp(ctx.buf, op.label)
       else:
         x86.emitJmpReg(ctx.buf.data, op.reg)
@@ -5274,81 +5360,97 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJe(ctx.buf, op.label)
   of JneX64, JnzX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJne(ctx.buf, op.label)
   of JgX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJg(ctx.buf, op.label)
   of JgeX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJge(ctx.buf, op.label)
   of JlX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJl(ctx.buf, op.label)
   of JleX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJle(ctx.buf, op.label)
   of JaX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJa(ctx.buf, op.label)
   of JaeX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJae(ctx.buf, op.label)
   of JbX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJb(ctx.buf, op.label)
   of JbeX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJbe(ctx.buf, op.label)
   of JoX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJo(ctx.buf, op.label)
   of JnoX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJno(ctx.buf, op.label)
   of JngX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJle(ctx.buf, op.label)
   of JngeX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJl(ctx.buf, op.label)
   of JnaX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJbe(ctx.buf, op.label)
   of JnaeX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJb(ctx.buf, op.label)
   of NopX64:
     inc n
@@ -5386,13 +5488,16 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       let labId = ctx.buf.createLabel()
       ctx.scope.define(Symbol(name: name, kind: skLabel, offset: int(labId)))
       ctx.buf.defineLabel(labId)
+      ctx.definedLabels.incl int(labId)
     elif sym.kind == skLabel:
       if sym.offset == -1:
         let labId = ctx.buf.createLabel()
         sym.offset = int(labId)
         ctx.buf.defineLabel(labId)
+        ctx.definedLabels.incl int(labId)
       else:
         ctx.buf.defineLabel(LabelId(sym.offset))
+        ctx.definedLabels.incl sym.offset
     else:
       error("Symbol is not a label", n)
     inc n

@@ -82,6 +82,9 @@ const
     intTempRegs: @IntTempRegs,
     intLocalTempRegs: @IntTempRegs,  # AArch64 has 7 volatile int regs — scratch to spare,
                                      # so a call-free local may be homed in the temp pool
+    atomicSafeTempRegs: @[R6, R7],   # caller-save homes: the x64-R8/R9 analogue — arg regs
+                                     # OUTSIDE the x9–x15 scratch pool (so no `emReg` scratch
+                                     # collision) and atomic-safe (a64 atomics touch only x0–x5)
     intCalleeSaved: @IntCalleeSaved,
     floatTempRegs: @FloatTempRegs,
     floatCalleeSaved: @FloatCalleeSaved,
@@ -102,6 +105,7 @@ const
     floatArgRegs: @FloatArgRegs,
     intTempRegs: @IntTempRegsN,
     intLocalTempRegs: @IntTempRegsN,
+    atomicSafeTempRegs: @[R6, R7],   # see aarch64Machine
     intCalleeSaved: @IntCalleeSaved,
     floatTempRegs: @FloatTempRegsN,
     floatCalleeSaved: @FloatCalleeSaved,

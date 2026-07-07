@@ -17,7 +17,7 @@
 ## `exit`s. Floats, aggregates, memory lvalues, parameters, `if`/`case`, div/mod
 ## and shifts `raiseAssert` for now.
 
-import std / [assertions, tables, sets, os]
+import std / [assertions, tables, sets, os, algorithm]
 import nifcore, nifcdecl
 import slots, machinedesc, analyser, register_allocator, programs
 import asmbuf, codegen_common, machine_x64
@@ -320,6 +320,23 @@ proc emJmp(g: var CodeGen; name: string) =
 proc emJcc(g: var CodeGen; tag: X64Inst; name: string) =
   g.mirrorBranchTo(name)      # the taken edge carries the current state; fall-through continues
   g.ab.tree tag: g.ab.sym name
+
+template emitLoop(g: var CodeGen; body: untyped) =
+  ## Structured infinite loop `(loop (stmts …))`: nifasm emits the back-edge INTERNALLY,
+  ## so no backward `jmp` reaches the asm-NIF (keeps the "every jmp forward, back-edges
+  ## are loops" invariant). `body` must jump FORWARD to a break/exit label defined AFTER
+  ## the loop (a condition-false or `break` exit). Mirrors the reg-cache lifecycle of the
+  ## old flat `emLab(header, isLoopHeader=true) … emJmp(header)` pair: clear the cache at
+  ## the header (nothing survives the not-yet-emitted back-edge), and mark fall-through
+  ## dead after (an infinite loop is left only via the forward exits, joined at the exit lab).
+  if g.regCacheOn:
+    g.regMirror.clear()
+    g.mirrorLive = true
+  g.ab.tree LoopX64:
+    g.ab.tree StmtsX64:
+      body
+  if g.regCacheOn:
+    g.mirrorLive = false
 
 proc emSyscall(g: var CodeGen) = g.ab.keyword SyscallX64
 
@@ -962,17 +979,18 @@ proc genAtomicLoopRmw(g: var CodeGen; pReg, val: Reg; pointee: Cursor; op: X64In
   ## `rax = [p]; loop: rdx = rax op val; lock cmpxchg [p], rdx; jne loop`. There
   ## is no lock-fetch form for and/or/xor that yields the old value, so spin on
   ## cmpxchg. Result (old) ends up in rax.
-  let lab = g.freshLabel()
+  let lDone = g.freshLabel()
   g.ab.tree MovX64: (g.emReg RAX; g.emMemAt(pReg, pointee))   # rax = [p]
   g.withFixed(RDX):
-    g.emLab(lab, isLoopHeader = true)
-    g.movReg(RDX, RAX)
-    g.ab.tree op: g.emReg RDX; g.emReg val           # rdx = rax op val (the new value)
-    g.ab.tree LockX64:
-      g.ab.tree CmpxchgX64:
-        g.emMemAt(pReg, pointee)
-        g.emReg RDX                                   # if [p]==rax: [p]=rdx else rax=[p]
-    g.emJcc(JneX64, lab)                              # retry until cmpxchg succeeds
+    g.emitLoop:
+      g.movReg(RDX, RAX)
+      g.ab.tree op: g.emReg RDX; g.emReg val         # rdx = rax op val (the new value)
+      g.ab.tree LockX64:
+        g.ab.tree CmpxchgX64:
+          g.emMemAt(pReg, pointee)
+          g.emReg RDX                                 # if [p]==rax: [p]=rdx else rax=[p]
+      g.emJcc(JeX64, lDone)                           # cmpxchg succeeded (ZF=1) → exit forward
+    g.emLab(lDone)                                    # else fall to the back-edge and retry
 
 # ── mem* intrinsics: inline byte loops (no libc) ─────────────────────────────
 # memcpy/memmove/memset/memcmp masquerade as importc calls (see programs.collect).
@@ -1012,74 +1030,64 @@ proc genMemIntrinBody(g: var CodeGen; builtin: string) =
   ## The dest pointer (rdi) and the byte/result (rax) stay raw — irreducible ABI regs.
   case builtin
   of "memcpy":                                 # (dst, src, n) → dst
-    let loop = g.freshLabel()
     let done = g.freshLabel()
     g.movImm(RCX, 0)                           # i = 0
-    g.emLab(loop, isLoopHeader = true)
-    g.emCmpReg(RCX, RDX)
-    g.emJcc(JaeX64, done)                      # i >= n (unsigned) → done
-    g.emLoadByte(RAX, RSI, RCX)                # b = src[i]
-    g.emStoreByte(RDI, RCX, RAX)               # dst[i] = b
-    g.binImm(AddX64, RCX, 1)
-    g.emJmp(loop)
+    g.emitLoop:
+      g.emCmpReg(RCX, RDX)
+      g.emJcc(JaeX64, done)                    # i >= n (unsigned) → done
+      g.emLoadByte(RAX, RSI, RCX)              # b = src[i]
+      g.emStoreByte(RDI, RCX, RAX)             # dst[i] = b
+      g.binImm(AddX64, RCX, 1)
     g.emLab(done)
     g.movReg(RAX, RDI)                         # memcpy returns dest
   of "memmove":                                # (dst, src, n) → dst; overlap-safe
     let fwd = g.freshLabel()
-    let bwd = g.freshLabel()
     let done = g.freshLabel()
     g.emCmpReg(RDI, RSI)
     g.emJcc(JbeX64, fwd)                        # dst <= src → forward copy is safe
     # backward: i = n; while i != 0: i -= 1; dst[i] = src[i]
     g.movReg(RCX, RDX)                          # i = n
-    g.emLab(bwd, isLoopHeader = true)
-    g.ab.tree CmpX64: (g.emReg RCX; g.ab.intLit 0)
-    g.emJcc(JeX64, done)
-    g.binImm(SubX64, RCX, 1)
-    g.emLoadByte(RAX, RSI, RCX)
-    g.emStoreByte(RDI, RCX, RAX)
-    g.emJmp(bwd)
+    g.emitLoop:
+      g.ab.tree CmpX64: (g.emReg RCX; g.ab.intLit 0)
+      g.emJcc(JeX64, done)
+      g.binImm(SubX64, RCX, 1)
+      g.emLoadByte(RAX, RSI, RCX)
+      g.emStoreByte(RDI, RCX, RAX)
     # forward: i = 0; while i < n: dst[i] = src[i]; i += 1
     g.emLab(fwd)
     g.movImm(RCX, 0)
-    let fwdLoop = g.freshLabel()
-    g.emLab(fwdLoop, isLoopHeader = true)
-    g.emCmpReg(RCX, RDX)
-    g.emJcc(JaeX64, done)
-    g.emLoadByte(RAX, RSI, RCX)
-    g.emStoreByte(RDI, RCX, RAX)
-    g.binImm(AddX64, RCX, 1)
-    g.emJmp(fwdLoop)
+    g.emitLoop:
+      g.emCmpReg(RCX, RDX)
+      g.emJcc(JaeX64, done)
+      g.emLoadByte(RAX, RSI, RCX)
+      g.emStoreByte(RDI, RCX, RAX)
+      g.binImm(AddX64, RCX, 1)
     g.emLab(done)
     g.movReg(RAX, RDI)
   of "memset":                                 # (dst, val, n) → dst
-    let loop = g.freshLabel()
     let done = g.freshLabel()
     g.movImm(RCX, 0)                           # i = 0
-    g.emLab(loop, isLoopHeader = true)
-    g.emCmpReg(RCX, RDX)
-    g.emJcc(JaeX64, done)
-    g.emStoreByte(RDI, RCX, RSI)               # dst[i] = low byte of val
-    g.binImm(AddX64, RCX, 1)
-    g.emJmp(loop)
+    g.emitLoop:
+      g.emCmpReg(RCX, RDX)
+      g.emJcc(JaeX64, done)
+      g.emStoreByte(RDI, RCX, RSI)             # dst[i] = low byte of val
+      g.binImm(AddX64, RCX, 1)
     g.emLab(done)
     g.movReg(RAX, RDI)
   of "memcmp":                                 # (a, b, n) → first byte difference
     g.bindTemp(R8, ScalarSlot)                 # the second byte (held across the loop)
-    let loop = g.freshLabel()
     let diff = g.freshLabel()
     let equal = g.freshLabel()
     let done = g.freshLabel()
     g.movImm(RCX, 0)                           # i = 0
-    g.emLab(loop, isLoopHeader = true)
-    g.emCmpReg(RCX, RDX)
-    g.emJcc(JaeX64, equal)                     # ran off the end, no diff → 0
-    g.emLoadByte(RAX, RDI, RCX)                # ba = a[i] (zero-extended, 0..255)
-    g.emLoadByte(R8, RSI, RCX)                 # bb = b[i]
-    g.emCmpReg(RAX, R8)
-    g.emJcc(JneX64, diff)
-    g.binImm(AddX64, RCX, 1)
-    g.emJmp(loop)
+    g.emitLoop:
+      g.emCmpReg(RCX, RDX)
+      g.emJcc(JaeX64, equal)                   # ran off the end, no diff → 0
+      g.emLoadByte(RAX, RDI, RCX)              # ba = a[i] (zero-extended, 0..255)
+      g.emLoadByte(R8, RSI, RCX)               # bb = b[i]
+      g.emCmpReg(RAX, R8)
+      g.emJcc(JneX64, diff)
+      g.binImm(AddX64, RCX, 1)
     g.emLab(diff)                              # bytes are 0..255 → signed sub gives sign
     g.binReg(SubX64, RAX, R8)                  # rax = ba - bb
     g.emJmp(done)
@@ -2246,7 +2254,7 @@ proc proctypeOfTarget(g: var CodeGen; targetCur: Cursor): Cursor =
   assert result.kind == TagLit and result.typeKind == ProctypeT,
     "arkham x64n: indirect call target is not a proctype"
 
-proc emitCall2(g: var CodeGen; c: Cursor) =
+proc emitCall2Inner(g: var CodeGen; c: Cursor) =
   ## Emit a call. The allocator placed each argument in its ABI register (integer →
   ## rdi…r9, float → xmm0–7) and the result in rax / xmm0 (or a dest-passed home).
   ## Two ABIs: the DECLARATIVE one (all-scalar-int params) binds each arg via
@@ -2633,6 +2641,45 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
       # scalar result only — an aggregate-by-value return spans rax:rdx (consumed word-by-word).
       if resLoc.isTemp and resSlot.kind != AMem: g.bindTemp(resLoc.r, resSlot)
       if resLoc.r != RAX: g.movReg(resLoc.r, RAX)
+
+proc emCallerSaveDecl(g: var CodeGen; slotName, varName: string) =
+  ## Declare the reclaimable spill slot with the SAME type the register-var carries
+  ## (`(i 64)` for scalars — matching `emRegLocalVar` — or `(ptr T)` for a pointer, so
+  ## the save/restore movs type-check), then save the live register value into it.
+  if g.symType.hasKey(varName) and isPtrType(resolveType(g.prog, g.symType[varName])):
+    g.emTypedStackVar(slotName, g.symType[varName])
+  else:
+    g.emScalarStackVar(slotName)
+  g.ab.tree MovX64:                              # (mov (mem (rsp) slot) name) — save
+    g.emStackMem(slotName)
+    g.ab.sym varName
+
+proc emitCall2(g: var CodeGen; c: Cursor) =
+  ## Caller-save wrapper: a cross-call local homed in a caller-saved volatile (R8/R9)
+  ## is spilled around this call inside a `(scope …)` — save before the ABI marshalling
+  ## clobbers the register, restore after. The var's `(var :name (rN) T)` binding
+  ## PERSISTS across the scope (never killed/rebound): the save is a plain copy, the
+  ## marshalling writes the arg register via `(arg pN)` (which nifasm allows even on a
+  ## bound register — only a bare `(rN)` dest is rejected), and the restore reloads via
+  ## the name (the mov re-defines the register, clearing the call's clobber). No
+  ## caller-save vars ⇒ zero overhead, byte-identical to before.
+  let saveSet = g.callerSaveSetAt()
+  if saveSet.len == 0:
+    g.emitCall2Inner(c)
+    return
+  let pos = cursorToPosition(g.buf[], c)
+  g.ab.tree ScopeX64:
+    for it in saveSet:
+      g.emCallerSaveDecl(callerSaveSlotName(pos, it.reg), it.name)
+    g.emitCall2Inner(c)
+    let resLoc = g.ra.locs[pos]
+    for it in saveSet:
+      # `x = f(…, x, …)`: the result already landed in x's home register — reloading the
+      # pre-call value would clobber it. Everything else reloads.
+      if resLoc.kind == InReg and resLoc.r == it.reg: continue
+      g.ab.tree MovX64:                          # (mov name (mem (rsp) slot)) — restore
+        g.ab.sym it.name
+        g.emStackMem(callerSaveSlotName(pos, it.reg))
 
 proc emitDivMod2(g: var CodeGen; c: Cursor) =
   ## Emit x86 `idiv`/`div`: the allocator pinned the dividend to rax and the divisor
@@ -4495,17 +4542,36 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
     skip cc                                              # pragmas
     let typeCur = cc; skip cc                            # type
     g.symType[nm] = typeCur                              # record the type for getType (conds)
-    let loc = g.ra.locationOfSym(nm)
-    let hasVal = cc.hasMore and cc.kind != DotToken
-    case loc.kind
-    of InReg: g.emRegLocalVar(nm, loc.r, typeCur)
-    of InFReg: g.emFRegLocalVar(nm, loc.f, loc.typ.size * 8)   # float local in an xmm
-    of NamedStack:
-      g.emTypedStackVar(nm, typeCur)
-      if typeCur.kind == Symbol: g.varType[nm] = symName(typeCur)  # aggregate field layout
-    else: raiseAssert "arkham x64n: var home " & $loc.kind
-    if hasVal: g.genStore2(cc, loc, declPos)            # the one general store path
-    while cc.hasMore: skip cc
+    if nm in g.ra.aliasedCasts:
+      # Identity-cast value alias (see `allocVarDecl`): `nm` has NO home of its own — its
+      # `symPos` points at the source `c1`, so every use resolves to `c1`'s live register
+      # and field/deref uses auto-emit `(cast T nm→c1)`. Emit NEITHER a decl NOR a store
+      # (a decl would rebind the register away from the still-live `c1`). Keep only the
+      # type record above so `getType`/cond helpers see `nm`'s (cast) type.
+      while cc.hasMore: skip cc
+    else:
+      let loc = g.ra.locationOfSym(nm)
+      let hasVal = cc.hasMore and cc.kind != DotToken
+      case loc.kind
+      of InReg: g.emRegLocalVar(nm, loc.r, typeCur)
+      of InFReg: g.emFRegLocalVar(nm, loc.f, loc.typ.size * 8)   # float local in an xmm
+      of NamedStack:
+        g.emTypedStackVar(nm, typeCur)
+        if typeCur.kind == Symbol: g.varType[nm] = symName(typeCur)  # aggregate field layout
+      else: raiseAssert "arkham x64n: var home " & $loc.kind
+      if hasVal:
+        # Same-width cast/copy inheritance (see `allocVarDecl`): when the value is just
+        # another local homed on THIS var's register, `emRegLocalVar` above already renamed
+        # the register from the source to `nm` via a zero-machine-code `(rebind)` — the
+        # value is in place, so the store is a no-op reg→reg move to skip entirely.
+        var skipInit = false
+        if loc.kind == InReg:
+          let srcSym = copyCastSrcSym(cc)
+          if srcSym.kind == Symbol:
+            let sh = g.ra.locationOfSym(symName(srcSym))
+            if sh.kind == InReg and sh.r == loc.r: skipInit = true
+        if not skipInit: g.genStore2(cc, loc, declPos)  # the one general store path
+      while cc.hasMore: skip cc
 
 proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
   ## Emit a branch test, jumping to `toLabel` when the condition holds (`whenTrue`):
@@ -4745,16 +4811,14 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         g.genStore2(rhsCur, memLoc(lhsCur, ScalarSlot), asgnPos)   # the one general store path
       while cc.hasMore: skip cc
   of WhileS:
-    let lStart = g.freshLabel()
     let lEnd = g.freshLabel()
     g.loopEnds.add lEnd
-    var cc = c
-    cc.into:
-      let condC = cc; skip cc
-      g.emLab(lStart, isLoopHeader = true)
-      g.emitCond2(condC, lEnd, whenTrue = false)
-      while cc.hasMore: (g.genStmt2(cc); skip cc)
-      g.emJmp(lStart)
+    g.emitLoop:
+      var cc = c
+      cc.into:
+        let condC = cc; skip cc
+        g.emitCond2(condC, lEnd, whenTrue = false)     # forward exit when cond is false
+        while cc.hasMore: (g.genStmt2(cc); skip cc)     # body
     g.emLab(lEnd)
     discard g.loopEnds.pop()
   of IfS:
