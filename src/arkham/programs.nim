@@ -792,6 +792,60 @@ proc slotOf*(p: var Program; c: Cursor): AsmSlot =
 
 # ── aggregate layout (shared by the allocator + the code generator) ─────────
 
+proc isCleanSigProc*(p: var Program; decl: Cursor): bool =
+  ## True if the proc's ABI is "clean" for `ArgResident` reasoning: a non-aggregate
+  ## result (no hidden rdi return pointer) and every parameter a single-GPR scalar
+  ## (integer/pointer — no aggregate that spans >1 arg register, no float that consumes an
+  ## xmm and so skips a GPR ordinal). For such a proc/callee the k-th argument lands in the
+  ## k-th arg GPR, so a param passed at its own index is a self-move. Conservative: any
+  ## aggregate/float in the signature ⇒ not clean.
+  var c = decl
+  inc c                                         # (proc → name
+  inc c                                         # name → params slot
+  var rt = c; skip rt                           # params → return type
+  # A void result (`.` or `(void)`) needs no return register and no hidden pointer — clean.
+  # Any real aggregate result is conservatively treated as non-clean (a >16B one takes the
+  # rdi hidden pointer, shifting every arg down; a ≤16B one uses the manual-marshal path).
+  let rtVoid = rt.kind == DotToken or (rt.kind == TagLit and rt.typeKind == VoidT)
+  if not rtVoid and slotOf(p, rt).kind == AMem: return false
+  result = true
+  if c.kind != TagLit: return                   # no params
+  c.into:
+    while c.hasMore:
+      c.into:                                   # (param :name pragmas type)
+        inc c                                   # name
+        skip c                                  # pragmas
+        let s = slotOf(p, c)
+        if s.kind in {AMem, AFloat}: result = false
+        while c.hasMore: skip c
+      if not result: return
+
+proc cleanSigProcNames*(p: var Program): HashSet[string] =
+  ## The decl-symbol names of every internal proc with a clean signature
+  ## (`isCleanSigProc`). Keyed by the decl's `SymbolDef` name — the SAME symbol a call
+  ## site names as its target — so the analyser can test a direct callee by name.
+  result = initHashSet[string]()
+  for pi in p.procs:
+    var nc = pi.decl; inc nc                    # (proc → name
+    if nc.kind == SymbolDef and isCleanSigProc(p, pi.decl):
+      result.incl symName(nc)
+
+proc aggregateTypeNames*(p: var Program): HashSet[string] =
+  ## Names of all types whose ABI class is `AMem` (object/union/array, or an alias to
+  ## one) — passed by value across >1 register or by hidden reference. The analyser uses
+  ## this to spot aggregate CALL ARGUMENTS, which consume >1 arg register and so shift the
+  ## ABI ordinals of the arguments after them (breaking an `ArgResident` param's
+  ## same-position self-move assumption). Collect names first: `slotOf` resolves named
+  ## types and may cache foreign ones into `typeDecls`, which must not mutate mid-iteration.
+  result = initHashSet[string]()
+  var names: seq[string] = @[]
+  for name in p.typeDecls.keys: names.add name
+  for name in names:
+    var d = p.typeDecls[name]
+    d.into:
+      inc d; skip d                             # name, type-pragmas → body
+      if slotOf(p, d).cls == AMem: result.incl name
+
 proc aggrByteSize*(p: var Program; typeName: string): int =
   var d = lookupType(p, typeName)
   d.into:

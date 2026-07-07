@@ -41,6 +41,16 @@ type
                 # (rdx on x86-64) is a legal extra home (its fixed role never overlaps)
     ShiftRegOk  # AllRegs AND no *variable* shift in the live interval → the shift-count
                 # register (rcx/cl on x86-64) is a legal extra home
+    R89Ok       # the live interval crosses no REAL call — only INLINED ATOMICS may lie
+                # in it. An atomic clobbers just {rax} + its arg regs (rdi/rsi/rdx), so
+                # the non-arg volatile temps (r8/r9 on x86-64) survive it. The var is NOT
+                # `AllRegs` (rdi/rsi ARE clobbered), but r8/r9 are still legal homes —
+                # cheaper than the callee-saved a full call would force. (`atomicSafeTempRegs`)
+    ArgResident # a PARAM whose live range crosses no call: the earliest call/atomic in
+                # the proc is exactly at its LAST use (the consuming call, which clobbers
+                # the arg reg anyway). It may STAY in its incoming arg register instead of
+                # taking a callee-saved home — no prologue save, and same-position passing
+                # makes the call-site marshal a self-move (elided). See allocParams.
   VarProps* = set[VarProp]
 
 proc kind*(s: AsmSlot): AsmTypeKind {.inline.} =

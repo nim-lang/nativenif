@@ -218,8 +218,16 @@ proc allocStorage(b: var Builder; slot: AsmSlot; props: VarProps): Location =
       r = b.takeReg(b.freeVol, [b.md.shiftCountReg])
     if r == NoReg and DivRegOk in props and b.md.divRemReg != NoReg:
       r = b.takeReg(b.freeVol, [b.md.divRemReg])
+  elif b.md.arch == X86 and R89Ok in props and b.md.atomicSafeTempRegs.len > 0:
+    # Live across an INLINED ATOMIC but no REAL call (so not `AllRegs`: an atomic
+    # clobbers its arg regs rdi/rsi). The atomic-safe volatile temps (r8/r9) survive
+    # its limited clobber, so PREFER them and reserve the scarce callee-saved pool for
+    # values that cross a real call — which have no volatile option (mirrors the x86
+    # `AllRegs` volatile-first policy; the priority-inversion guard).
+    r = b.takeReg(b.freeVol, b.md.atomicSafeTempRegs)
+    if r == NoReg: r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
   else:
-    # may be live across a call → must be callee-saved (or stack)
+    # may be live across a real call → must be callee-saved (or stack)
     r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
   if r == NoReg:
     when defined(arkhamSpillDbg):
@@ -240,6 +248,17 @@ proc giveBackF(b: var Builder; f: FReg) {.inline.} =
 
 proc weightOf(b: Builder; name: string): int {.inline.} =
   b.an.vars.getOrDefault(name).weight
+
+proc rangeLen(b: Builder; name: string): int {.inline.} =
+  ## Length (in token positions) of a local's live interval — its register-occupancy
+  ## span. Used ONLY as a tie-breaker among equal-`weight` steal candidates. `high(int)`
+  ## for a param (`freeAfter == high`): live across the whole body, so among equals a
+  ## param is the longest-lived and thus the preferred victim.
+  let vi = b.an.vars.getOrDefault(name)
+  if vi.freeAfter == high(int): return high(int)
+  let lo = if vi.declInLoop: vi.loopLo else: vi.liveStart
+  let hi = if vi.declInLoop: vi.loopHi else: vi.freeAfter
+  max(1, hi - lo)
 
 # ── scope-based walk that allocates locals ──────────────────────────────────
 
@@ -276,13 +295,16 @@ proc record(b: var Builder; pos: int; name: string; loc: Location) =
   b.ra.symPos[name] = pos
   b.ra.locs[pos] = loc
 
-proc coldestVictim(b: var Builder; maxW: int; calleeOnly, wantFloat: bool): string =
-  ## The lowest-weight live register-resident local (weight strictly below `maxW`)
-  ## whose register may be stolen: a non-sealed GPR (`calleeOnly` restricts to the
-  ## callee-saved set) or — `wantFloat` — a SIMD register. The victim-selection
-  ## policy behind the local→memory undo (`trySteal` / `reserveHeldScratch`). "" when
-  ## nothing is stealable.
+proc coldestVictim(b: var Builder; maxW, ceilLen: int; calleeOnly, wantFloat: bool): string =
+  ## The coldest live register-resident local whose register may be stolen: a non-sealed
+  ## GPR (`calleeOnly` restricts to the callee-saved set) or — `wantFloat` — a SIMD
+  ## register. "Coldest" = lowest `weight`; **ties broken by the LONGER live range** — an
+  ## equal-use var that occupies its register for a longer span drains the pool more, so
+  ## among equals it is the better spill victim (`tweaks.md` tweak 1). The ceiling
+  ## `(maxW, ceilLen)` is the caller's own coldness: a candidate qualifies iff strictly
+  ## colder than it in that (weight, then length) order. "" when nothing is stealable.
   var bestW = maxW
+  var bestLen = ceilLen               # meaningful only for an equal-`bestW` candidate
   result = ""
   for scope in b.scopeVars:
     for v in scope:
@@ -295,8 +317,8 @@ proc coldestVictim(b: var Builder; maxW: int; calleeOnly, wantFloat: bool): stri
         if vloc.r in b.ra.sealed: continue      # pinned to an in-flight ABI call
         if calleeOnly and vloc.r notin b.md.intCalleeSavedSet: continue
       let vw = b.weightOf(v)
-      if vw < bestW:
-        bestW = vw; result = v
+      if vw < bestW or (vw == bestW and b.rangeLen(v) > bestLen):
+        bestW = vw; bestLen = b.rangeLen(v); result = v
 
 proc demoteToStack(b: var Builder; victim: string) =
   ## Undo `victim`'s optimistic register assignment: move it to a nifasm-managed `(s)`
@@ -315,7 +337,8 @@ proc trySteal(b: var Builder; curName: string; curSlot: AsmSlot;
   ## it is strictly colder than `curName`; that local moves to `fallback` and
   ## `curName` takes its register. Returns `curName`'s chosen location.
   let calleeOnly = AllRegs notin curProps   # cross-call var needs callee-saved
-  let bestV = b.coldestVictim(b.weightOf(curName), calleeOnly, wantFloat = false)
+  let bestV = b.coldestVictim(b.weightOf(curName), b.rangeLen(curName),
+                              calleeOnly, wantFloat = false)
   if bestV.len == 0: return fallback        # nothing colder to steal from
   # evict the victim to its stack slot; current takes its register
   let bestReg = b.ra.locs[b.ra.symPos[bestV]].r
@@ -405,7 +428,7 @@ proc reserveHeldScratch(b: var Builder; what: string; canSpill = false): Locatio
   if r != NoReg:
     b.ra.usedCallee.incl r
     return regLoc(r, ScalarSlot, isTemp = true)
-  let victim = b.coldestVictim(high(int), calleeOnly = true, wantFloat = false)
+  let victim = b.coldestVictim(high(int), low(int), calleeOnly = true, wantFloat = false)
   if victim.len == 0:
     if canSpill: return b.heldSpillSlot()   # totality backstop (wired consumer)
     raiseAssert "arkham: out of registers for " & what & " (nothing to spill)"
@@ -1993,9 +2016,20 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
                             # before that read — give it a callee-saved home. (No-op on x86-64,
                             # where intRetReg=rax is never an arg register.)
                             (arg == b.md.intRetReg and b.an.arg0RetConflict)
+            # An ArgResident param crosses no call (its consuming call is the first in
+            # the proc and its last use) → it may STAY in its incoming arg register even
+            # though the proc has calls: no prologue save, and same-position passing makes
+            # the marshal a self-move. Excludes by-ref aggregates (their pointer must
+            # survive repeated field loads) and fixed-role-clobbered arg regs (rdx/rcx).
+            # Both arches: keep an ArgResident param in its incoming arg register. On x64
+            # the emitter binds the param's arg reg to `regLocal` and must `kill` that dead
+            # binding after the first call (`flushArgResidentParams`); on a64 a param in an
+            # arg reg (x0–x7) is read RAW (no `regLocal` binding — see a64 `emReg`), so there
+            # is no lingering binding to flush.
+            let stayInArg = ArgResident in props and not aggrByRef and not clobbered
             if AddrTaken in props and not aggrByRef:
               loc = b.spill(effSlot)           # address taken → must be on the stack
-            elif hasCall or aggrByRef or clobbered:
+            elif (hasCall or aggrByRef or clobbered) and not stayInArg:
               # Live across a call (the incoming arg reg is volatile), or a by-ref
               # pointer that must survive repeated field loads in the body: give
               # it a callee-saved home so the prologue can `mov home, argReg`.

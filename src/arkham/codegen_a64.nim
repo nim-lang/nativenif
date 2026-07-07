@@ -3724,7 +3724,12 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool) =
         g.ab.keyword RetA64
 
 proc genProc2(g: var CodeGen; info: ProcInfo) =
-  let an = analyseProc(g.buf[], info.decl, g.tvarNames)
+  if not g.cleanSigComputed:                   # compute the clean-signature set once
+    g.cleanSigProcs = cleanSigProcNames(g.prog)
+    g.cleanSigComputed = true
+  let an = analyseProc(g.buf[], info.decl, g.tvarNames,
+                       cleanCallees = g.cleanSigProcs,
+                       procIsClean = isCleanSigProc(g.prog, info.decl))
   g.varType.clear()
   g.symType.clear()
   g.retAggrName = ""; g.retIndirect = false; g.retIsFloat = false

@@ -62,6 +62,12 @@ type
                                      ## only temp reg, R10, is the staging scratch — a
                                      ## local there starves the emitter); the full temp
                                      ## pool on AArch64 (7 volatile regs, scratch to spare)
+    atomicSafeTempRegs*: seq[Reg]    ## subset of `intLocalTempRegs` that survives an
+                                     ## INLINED ATOMIC's limited clobber (rax + arg regs
+                                     ## rdi/rsi/rdx): a var crossing only atomics (VarProp
+                                     ## `R89Ok`) may home here instead of spilling to
+                                     ## callee-saved. x86-64 = @[R8, R9]; empty where the
+                                     ## reduced-clobber atomic model is not applied (arm64)
     intCalleeSaved*: seq[Reg]        ## callee-saved (locals live across a call)
     floatTempRegs*: seq[FReg]        ## caller-saved FP scratch
     floatCalleeSaved*: seq[FReg]     ## callee-saved FP regs

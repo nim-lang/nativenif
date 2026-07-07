@@ -52,6 +52,16 @@ type
                                ## its (coarse) live range, paired with `freeAfter` as the
                                ## end. A call strictly after `liveStart` and at/before
                                ## `freeAfter` crosses the range.
+    lastUsePos*: int           ## PRECISE last-use position, tracked for ALL vars incl.
+                               ## params (whose `freeAfter` is pinned to `high`).
+    usedAfterCall*: bool       ## a use occurred while a call had already RETURNED
+                               ## (`completedCalls > 0`) → the value must survive that call.
+                               ## Disqualifies a param from `ArgResident`.
+    argUnsafe*: bool           ## used as a call TARGET, or as a call ARGUMENT at an ABI
+                               ## position ≠ its own param index, or in a non-clean call
+                               ## (ordinals may shift). Disqualifies `ArgResident`.
+    paramIdx*: int             ## a register param's 0-based ABI index (arg-GPR ordinal) in
+                               ## a clean-signature proc; -1 for locals and non-clean procs.
     loopLo*, loopHi*: int      ## for `declInLoop` vars: span of the innermost enclosing
                                ## loop, used as the live interval instead of
                                ## `(liveStart, freeAfter]` (the value is carried across the
@@ -84,6 +94,13 @@ type
                                ## accesses) — the points where caller-saved regs die. A
                                ## local may use `AllRegs` iff none of these fall in its
                                ## live interval. Recorded in source order; scanned linearly.
+    atomicPositions: seq[int]  ## token position of every call the emitter INLINES as an
+                               ## atomic sequence (`emitAtomic2`). It clobbers only rax + its
+                               ## arg regs (rdi/rsi/rdx), NOT the whole caller-saved file, so
+                               ## it is NOT a full call point: it denies `AllRegs` (rdi/rsi
+                               ## are clobbered) but a var crossing only atomics still earns
+                               ## `R89Ok` (r8/r9 survive). Kept out of `callPositions`.
+    atomicCalls: HashSet[string]  ## names classified as inlined atomics (see `atomicPositions`)
     divPositions: seq[int]     ## token position of every div/mod (clobbers rdx). An
                                ## `AllRegs` local additionally earns `DivRegOk` (rdx is a
                                ## legal home) iff none of these fall in its live interval.
@@ -95,6 +112,21 @@ type
                                ## statement it is currently processing
     buf: ptr TokenBuf          ## for cursor → token-position mapping
     tvars: HashSet[string]     ## thread-local var names: a reference acts like a call
+    cleanCallees: HashSet[string]  ## decl names of procs with a clean signature (all-scalar
+                               ## GPR params, non-aggregate return). In a call to one, the
+                               ## k-th argument lands in the k-th arg GPR — so a param passed
+                               ## at its own index is a self-move. A call to anything else
+                               ## (indirect, or an aggregate/float/retIndirect signature) can
+                               ## shift ordinals, so param args there are `ArgResident`-unsafe.
+    procIsClean: bool          ## the CURRENT proc has a clean signature: `paramIdx` is a
+                               ## valid arg-GPR ordinal and there is no hidden rdi ret ptr.
+    completedCalls: int        ## running count of calls whose args have been FULLY
+                               ## processed (incremented AFTER the call subtree), in program
+                               ## order. A param used while this is >0 executes after some
+                               ## call RETURNED (its arg reg was clobbered) → it needs a
+                               ## callee-saved home, so it cannot be `ArgResident`. A use
+                               ## INSIDE a call's args sees the count not-yet-incremented for
+                               ## that call, so a param consumed by the first call qualifies.
 
 const
   LoopWeight = 3   ## assume a loop body runs ~3× for weighting purposes
@@ -141,7 +173,7 @@ proc analyseVarDecl(c: var Context; n: var Cursor) =
     let inLoop = c.inLoops > 0
     var vi = VarInfo(defs: ord(hasValue), freeAfter: declPos,
                      frameIdx: c.stmtEnd.high, declInLoop: inLoop, liveStart: declPos,
-                     declLoopDepth: c.loopStack.len)
+                     declLoopDepth: c.loopStack.len, paramIdx: -1)
     if inLoop: (vi.loopLo = c.loopStack[^1].lo; vi.loopHi = c.loopStack[^1].hi)
     c.res.vars[vn] = vi
     if hasValue: analyse(c, n)   # analyse the initializer
@@ -205,6 +237,8 @@ proc analyse(c: var Context; n: var Cursor) =
       if c.loopStack.len > e.declLoopDepth:
         hi = max(hi, c.loopStack[e.declLoopDepth].hi)
       e.freeAfter = max(e.freeAfter, hi)
+      e.lastUsePos = max(e.lastUsePos, hi)   # tracked even for params (freeAfter pinned to high)
+      if c.completedCalls > 0: e.usedAfterCall = true  # used after a call returned → must survive it
       if (c.inAddr + c.inArrayIndex) > 0:
         # arrays / address-taken locals cannot live in a register
         e.props.incl AddrTaken
@@ -213,6 +247,7 @@ proc analyse(c: var Context; n: var Cursor) =
       # treat it like a call point: locals live across it must avoid the volatile
       # argument registers.
       c.callPositions.add posOf(c, n)
+      inc c.completedCalls              # the thunk call clobbers the arg regs here and now
     inc n
   of IntLit, UIntLit, FloatLit, CharLit, StrLit, Ident, SymbolDef, DotToken:
     inc n
@@ -286,8 +321,47 @@ proc analyse(c: var Context; n: var Cursor) =
     of StmtsS:                          # statement grouping only — shares the scope frame
       iterStmts(c, n): analyse(c, n)
     of CallS:
-      c.callPositions.add posOf(c, n)
+      # An inlined atomic (emitAtomic2) is NOT a real call: it clobbers only rax + its arg
+      # regs. Record it as an atomic point (denies AllRegs, but leaves R89Ok) rather than a
+      # full call point. The callee is the first child; an indirect (non-Symbol) target or an
+      # unclassified name is conservatively a real call.
+      var isAtomic = false
+      if c.atomicCalls.len > 0:
+        var probe = n
+        probe.into:                       # the callee is the first child
+          if probe.kind == Symbol: isAtomic = symName(probe) in c.atomicCalls
+          while probe.hasMore: skip probe  # drain so `into` sees all children consumed
+      if isAtomic: c.atomicPositions.add posOf(c, n)
+      else: c.callPositions.add posOf(c, n)
+      # ArgResident safety walk (peek only; the real accounting is analyseChildren below).
+      # A param P may stay in its arg register across its consuming call only if that call
+      # marshals it back to its OWN arg-GPR — a self-move no sibling arg clobbers. Peek the
+      # call's shape: the callee (child 0) and each argument (children 1..). Disqualify a
+      # param used as the CALLEE (an indirect target: its reg is needed AND the args
+      # overwrite the arg regs), or passed at an ordinal ≠ its `paramIdx`, or in a call
+      # whose callee is not a clean-signature proc (ordinals may shift — aggregate/float
+      # params, retIndirect, or an indirect target of unknown shape).
+      block argWalk:
+        var probe = n
+        probe.into:
+          if not probe.hasMore: break argWalk
+          let calleeSym = if probe.kind == Symbol: symName(probe) else: ""
+          if calleeSym.len > 0 and c.res.vars.hasKey(calleeSym):
+            c.res.vars[calleeSym].argUnsafe = true         # a param used as a call target
+          let cleanCall = calleeSym.len > 0 and calleeSym in c.cleanCallees
+          skip probe                                       # past the callee → arguments
+          var ordinal = 0
+          while probe.hasMore:
+            if probe.kind == Symbol:
+              let an = symName(probe)
+              if c.res.vars.hasKey(an) and c.res.vars[an].paramIdx >= 0:
+                # a bare param argument: safe ONLY as a same-ordinal self-move in a clean call
+                if not (cleanCall and c.res.vars[an].paramIdx == ordinal):
+                  c.res.vars[an].argUnsafe = true
+            skip probe
+            inc ordinal
       analyseChildren(c, n)
+      inc c.completedCalls              # this call's args are fully built; it has "returned"
     of VarS, GvarS, TvarS, ConstS:
       analyseVarDecl(c, n)
     of AsgnS:
@@ -321,6 +395,8 @@ proc analyseParams(c: var Context; params: var Cursor) =
   ## `(params (param :name pragmas type) …)` or a DotToken.
   if params.kind != TagLit: return
   var first = true
+  var idx = 0                           # 0-based arg-GPR ordinal (valid only when procIsClean:
+                                        # then every param is a single-GPR scalar)
   params.into:
     while params.hasMore:
       params.into:                      # (param …)
@@ -333,7 +409,9 @@ proc analyseParams(c: var Context; params: var Cursor) =
         # pin their live range to the whole proc. `freeAfter == high(int)` also marks
         # them as params for the `AllRegs` finalize, which skips them (allocParams
         # decides their homes from the proc-level `hasCall`, not `AllRegs`).
-        c.res.vars[vn] = VarInfo(defs: 1, freeAfter: high(int))
+        c.res.vars[vn] = VarInfo(defs: 1, freeAfter: high(int),
+                                 paramIdx: (if c.procIsClean: idx else: -1))
+        inc idx
         while params.hasMore: skip params   # pragmas, type
         # (rest consumed by into epilogue)
 
@@ -380,13 +458,52 @@ when defined(arkhamPeakLive):
         stderr.write "    " & iv.name & " iv=[" & $iv.lo & "," & $iv.hi & "] w=" &
           $(iv.hi - iv.lo) & " defs=" & $vi.defs & " uses=" & $vi.usages &
           " allregs=" & $(AllRegs in vi.props) & "\n"
+    # Cross-call pressure: the max simultaneously-live `allregs=false` intervals — the
+    # callee-saved DEMAND (a cross-call var can ONLY use callee-saved without live-range
+    # splitting). If this exceeds the callee-saved count (5, or 6 with rbp), the greedy
+    # allocator MUST spill; if it does NOT, a spill means a bad greedy choice, not real
+    # pressure. This is the number that decides which lever applies.
+    var ccPeak = 0; var ccPt = 0
+    for p in pts:
+      var cnt = 0
+      for iv in ivs:
+        if iv.lo <= p and p <= iv.hi and (AllRegs notin c.res.vars[iv.name].props):
+          inc cnt
+      if cnt > ccPeak: (ccPeak = cnt; ccPt = p)
+    var ccNames = ""
+    for iv in ivs:
+      if iv.lo <= ccPt and ccPt <= iv.hi and (AllRegs notin c.res.vars[iv.name].props):
+        (if ccNames.len > 0: ccNames.add ' '; ccNames.add iv.name)
+    stderr.write "  XCALLPEAK proc=" & pname & " crosscall-peak=" & $ccPeak &
+      " @pos=" & $ccPt & ": " & ccNames & "\n"
+    # The TRUE callee-saved demand under live-range splitting: max over each individual
+    # CALL site of the values live ACROSS that specific call (lo < callPos < hi). A value
+    # only needs preserving across the calls its range actually spans; two values crossing
+    # DIFFERENT calls never contend for a callee-saved reg at the same call. If this is
+    # <= 5, splitting removes EVERY spill (each var uses a volatile between calls, only the
+    # <=5 spanning any one call need callee-saved). This is the number the fix must beat.
+    var acrossPeak = 0; var acrossCall = 0
+    for cp in c.callPositions:
+      var cnt = 0
+      for iv in ivs:
+        if iv.lo < cp and cp < iv.hi: inc cnt    # strictly spans the call → live across it
+      if cnt > acrossPeak: (acrossPeak = cnt; acrossCall = cp)
+    stderr.write "  ACROSSCALL proc=" & pname & " max-live-across-one-call=" & $acrossPeak &
+      " @call=" & $acrossCall & " (ncalls=" & $c.callPositions.len &
+      " natomics=" & $c.atomicPositions.len & " atomicSet=" & $c.atomicCalls.len & ")\n"
 
 proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
-                  tvars: HashSet[string] = initHashSet[string]()): ProcAnalysis =
+                  tvars: HashSet[string] = initHashSet[string]();
+                  atomicCalls: HashSet[string] = initHashSet[string]();
+                  cleanCallees: HashSet[string] = initHashSet[string]();
+                  procIsClean = false): ProcAnalysis =
   ## `procDecl` is at a `(proc name params rettype pragmas body)`. `tvars` names
-  ## the module's thread-locals so their uses force a call-like analysis. `buf` is
-  ## the buffer `procDecl` points into (for cursor → position mapping).
-  var c = Context(tvars: tvars, buf: addr buf)
+  ## the module's thread-locals so their uses force a call-like analysis. `atomicCalls`
+  ## names calls the emitter inlines as an atomic sequence (a limited clobber — see
+  ## `atomicPositions`); empty ⇒ every call is treated as a real call. `buf` is the
+  ## buffer `procDecl` points into (for cursor → position mapping).
+  var c = Context(tvars: tvars, atomicCalls: atomicCalls, cleanCallees: cleanCallees,
+                  procIsClean: procIsClean, buf: addr buf)
   var n = procDecl
   assert n.stmtKind == ProcS
   when defined(arkhamPeakLive):
@@ -403,21 +520,32 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
     skip n                              # pragmas
     scopeFrame(c):                      # the proc-body scope frame (its `stmts`
       iterStmts(c, n): analyse(c, n)    # shares it rather than pushing its own)
-  c.res.hasCall = c.callPositions.len > 0
+  c.res.hasCall = c.callPositions.len > 0 or c.atomicPositions.len > 0
   # Grant `AllRegs` (volatile/caller-saved eligible) to every local whose live
   # interval contains no call point. The interval is `(liveStart, freeAfter]`
   # for ordinary locals, or the enclosing-loop span for loop-carried ones. The
   # check is conservative: `freeAfter` over-approximates the range end and a
   # call within it denies `AllRegs`, so a missed-but-live-across-call case is
   # impossible (the unsafe direction). Params (`freeAfter == high`) are skipped.
+  # An INLINED ATOMIC (`atomicPositions`) clobbers rdi/rsi (its args), so it too
+  # denies `AllRegs`; but a var crossing ONLY atomics (no REAL call) still earns
+  # the weaker `R89Ok` — r8/r9 survive an atomic and stay legal homes.
   for name, vi in mpairs c.res.vars:
     if vi.freeAfter == high(int): continue
     let lo = if vi.declInLoop: vi.loopLo else: vi.liveStart
     let hi = if vi.declInLoop: vi.loopHi else: vi.freeAfter
-    var crosses = false
+    var crossesRealCall = false
     for p in c.callPositions:
-      if p > lo and p <= hi: (crosses = true; break)
-    if not crosses:
+      if p > lo and p <= hi: (crossesRealCall = true; break)
+    var crossesAtomic = false
+    for p in c.atomicPositions:
+      if p > lo and p <= hi: (crossesAtomic = true; break)
+    if not crossesRealCall:
+      # No real call in the interval → r8/r9 (atomic-safe) are legal homes even if an
+      # atomic crosses. `AllRegs` (the full volatile pool, incl. rdi/rsi) needs the
+      # STRONGER condition: no atomic either.
+      vi.props.incl R89Ok
+    if not (crossesRealCall or crossesAtomic):
       vi.props.incl AllRegs
       # A call-free local can go further: rdx/rcx have a *fixed* instruction role
       # (div/mod, variable shift) but are otherwise free. If no such instruction
@@ -433,6 +561,21 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
       for p in c.shiftPositions:
         if p > lo and p <= hi: (crossesShift = true; break)
       if not crossesShift: vi.props.incl ShiftRegOk
+  # ArgResident: a PARAM (freeAfter == high) may keep its incoming arg register instead of
+  # a callee-saved home iff EVERY use of it executes before ANY call returns
+  # (`not usedAfterCall`). Then no call clobbers the arg register while the param is live;
+  # the call that consumes it (its last use is inside that call's args) clobbers the reg
+  # anyway, and the param is dead afterward — so no value is lost. A same-position pass-
+  # through makes the call-site marshal a self-move (elided); a different position stays
+  # correct (one mov reading the still-resident value). Address-taken or unused params are
+  # excluded. Only sound for register params; allocParams layers the fixed-role
+  # (`clobbered`) and aggregate gating on top. Gated on `hasCall` (a leaf proc already
+  # keeps its params in the arg registers via allocParams' plain leaf path).
+  if c.res.hasCall and c.procIsClean:
+    for name, vi in mpairs c.res.vars:
+      if vi.freeAfter == high(int) and AddrTaken notin vi.props and
+         vi.usages > 0 and not vi.usedAfterCall and not vi.argUnsafe:
+        vi.props.incl ArgResident
   when defined(arkhamPeakLive):
     reportPeakLive(c, pname, procStartPos, procEndPos)
   result = ensureMove c.res
