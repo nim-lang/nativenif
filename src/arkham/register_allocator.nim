@@ -647,7 +647,7 @@ proc allocBin(b: var Builder; n: var Cursor; dest: var Location) =
     skip n                                   # result type
     allocValue(b, n, lDest)                  # left → a register
     if ek in {ShlC, ShrC} and b.md.shiftCountReg != NoReg and
-       n.kind notin {IntLit, UIntLit, CharLit}:
+       not isConstShiftCount(n):
       # x86 variable shift: the count must be in cl. cl (rcx) must be free here — a
       # LIVE symbol homed in it would be clobbered. `freeVol` membership is the ground
       # truth for "free": a `ShiftRegOk` local homed in rcx is, by construction, dead

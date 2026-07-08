@@ -239,6 +239,23 @@ proc markArgParamsUnsafe(c: var Context; n0: Cursor; ordinal: int; cleanCall: bo
         while n.hasMore: (markArgParamsUnsafe(c, n, ordinal, cleanCall); skip n)
   else: discard
 
+proc isConstShiftCount*(n: Cursor): bool =
+  ## True when a shift-count operand folds to a compile-time immediate: a bare
+  ## int/uint/char literal, possibly wrapped in `cast`/`conv`/`suf`/`par`. Such a
+  ## count assembles as an `imm8` shift (`sar r, 4`), so — unlike a runtime count —
+  ## it need NOT occupy `cl` and does not clobber `rcx`. A front-end frequently
+  ## hands the count as `(cast (u 64) (suf 4 "i64"))` (unsigned-normalized), which a
+  ## bare `kind in {IntLit,…}` test would miss and needlessly pin to `cl`.
+  var c = n
+  while c.kind == TagLit:
+    case c.exprKind
+    of CastC, ConvC:                       # `(cast TARGET value)` — skip the target type
+      var t = c; inc t; skip t; c = t
+    of SufC, ParC:                         # `(suf value "type")` / `(par value)`
+      var t = c; inc t; c = t
+    else: break
+  result = c.kind in {IntLit, UIntLit, CharLit}
+
 proc analyse(c: var Context; n: var Cursor) =
   case n.kind
   of Symbol:
@@ -333,7 +350,7 @@ proc analyse(c: var Context; n: var Cursor) =
         var probe = n; probe.into:
           skip probe                    # result type
           skip probe                    # value
-          if probe.kind notin {IntLit, UIntLit, CharLit}:
+          if not isConstShiftCount(probe):
             c.res.clobbersShiftReg = true
             c.shiftPositions.add posOf(c, n)  # denies rcx-as-home across it
           while probe.hasMore: skip probe
