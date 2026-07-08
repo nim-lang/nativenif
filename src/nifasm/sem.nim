@@ -1,7 +1,8 @@
 
 import std / [tables]
 import tags, x86
-import "../../../nimony/src/lib" / [symparser]
+import nifcore  # SymId: symbols are keyed by their interned id (main-module pool),
+                # not by re-hashing the qualified name string on every lookup.
 
 type
   TypeKind* = enum
@@ -16,7 +17,8 @@ type
     ProcT        # Procedure type
 
   Param* = object
-    name*: string
+    name*: SymId    # the param symbol's interned id; an `(arg name k)` / `(res name k)`
+                    # reference is the SAME interned symbol, so matching is id equality
     typ*: Type      # If kind == StackOffT, param is on stack
     reg*: TagEnum   # the param's first (often only) register; == regs[0] when regs.len > 0
     regs*: seq[TagEnum]
@@ -74,7 +76,9 @@ type
                 ## plus a syscall number (stored in `offset`); invoked inline via `(syscall)`/`(svc)`
 
   Symbol* = ref object
-    name*: string
+    name*: SymId      # interned identity in the main-module pool; render with
+                      # `poolSym(pool, sym.name)` where a string is genuinely needed
+                      # (foreign index lookup, dedup, diagnostics, extern emission).
     kind*: SymKind
     typ*: Type        # For procs, this is ProcT; for vars/params, the data type (StackOffT if on stack)
     # Storage
@@ -105,30 +109,27 @@ type
 
   Scope* = ref object
     parent*: Scope
-    syms*: Table[string, Symbol]
+    syms*: Table[SymId, Symbol]
 
 proc newScope*(parent: Scope = nil): Scope =
-  Scope(parent: parent, syms: initTable[string, Symbol]())
+  Scope(parent: parent, syms: initTable[SymId, Symbol]())
 
-proc lookup*(s: Scope; name: string): Symbol =
-  # NIF symbols are nominal: the key is the FULL qualified name (with module
-  # suffix). Self-module trailing-dot compression is expanded before lookup, so
-  # `foo.0.modA` and `foo.0.modB` are distinct — there is no "basename clash".
+proc lookup*(s: Scope; name: SymId): Symbol =
+  # NIF symbols are nominal: the key is the FULL qualified name's interned id (the
+  # main-module pool assigns one id per distinct qualified name, so `foo.0.modA`
+  # and `foo.0.modB` are distinct ids — there is no "basename clash"). Comparing
+  # interned ids replaces re-hashing the qualified string on every reference.
   var curr = s
   while curr != nil:
-    if name in curr.syms: return curr.syms[name]
+    let hit = curr.syms.getOrDefault(name)
+    if hit != nil: return hit
     curr = curr.parent
   return nil
-
-proc symBasename*(sym: Symbol): string =
-  ## Get the basename (identifier without version/module) of a symbol's name.
-  result = sym.name
-  extractBasename(result)
 
 proc define*(s: Scope; sym: Symbol) =
   s.syms[sym.name] = sym
 
-proc undefine*(s: Scope; name: string) =
+proc undefine*(s: Scope; name: SymId) =
   s.syms.del(name)
 
 proc isOnStack*(t: Type): bool {.inline.} =

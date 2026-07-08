@@ -364,15 +364,20 @@ proc threadJumps*(buf: var Buffer): seq[int] =
 
   var changed = true
   var guard = 0
+  # Scratch tables, allocated once and cleared each iteration (their contents are
+  # rebuilt from scratch every pass; only the backing storage is reused).
+  var labelPos = initTable[int, int]()      # label id → byte position
+  var uncondAt = initTable[int, int]()      # byte position → reloc index
+  var deadPos = initHashSet[int]()          # positions of dead-jump instructions
   while changed and guard <= buf.relocs.len + 1:
     changed = false
     inc guard
 
     # Current label positions and the reloc index of any unconditional jump that
     # STARTS exactly at a given byte position (one instruction per position).
-    var labelPos = initTable[int, int]()
+    labelPos.clear()
     for ld in buf.labels: labelPos[int(ld.id)] = ld.position
-    var uncondAt = initTable[int, int]()      # byte position → reloc index
+    uncondAt.clear()
     for i in 0 ..< buf.relocs.len:
       if isUncondJump(buf.relocs[i].kind):
         uncondAt[buf.relocs[i].position] = i
@@ -397,7 +402,7 @@ proc threadJumps*(buf: var Buffer): seq[int] =
         # not a byte change; loop again so a newly-exposed dead jump is pruned
 
     # ── 2. PRUNE: collect unconditional jumps to their own fall-through ──
-    var deadPos = initHashSet[int]()          # positions of dead-jump instructions
+    deadPos.clear()
     for i in 0 ..< buf.relocs.len:
       let r = buf.relocs[i]
       if isUncondJump(r.kind) and labelPos.hasKey(int(r.target)) and
