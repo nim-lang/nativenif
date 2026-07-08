@@ -437,3 +437,5 @@
 | `(rebind D T S)`    | X64Inst, A64Inst        | bind a phys reg to a typed name, killing its prior tenant |
 | `(withreg D T S ...)` | X64Inst, A64Inst      | block-scoped rebind; auto-killed at block end |
 | `(regs ...)`          | NifasmDecl                  | multi-register param/result location: `(regs (rdi) (rsi))` |
+| `(bswap D)`           | X64Inst                     | reverse byte order (BSWAP r32/r64; `__builtin_bswap*`) |
+| `(scope ...)`         | X64Inst, A64Inst            | statement block with a reclaimable stack-slot arena: `(s)` locals declared inside are freed at scope end so sibling scopes reuse the frame bytes |

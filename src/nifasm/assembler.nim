@@ -162,6 +162,17 @@ proc getSym(n: Cursor): string =
   else:
     error("Expected symbol", n)
 
+proc getSymId(n: Cursor): SymId =
+  ## The interned identity of a `Symbol`/`SymbolDef` token — a key into the scope
+  ## without materializing (and re-hashing) the qualified-name string. Valid across
+  ## modules because every cursor interns into the one shared pool (`ctx.pool`).
+  case n.kind
+  of Symbol, SymbolDef:
+    result = symId(n)
+  else:
+    error("Expected symbol", n)
+    result = SymId(0)
+
 proc getSymDef(n: var Cursor): string =
   if n.kind != SymbolDef:
     error("Expected symbol definition", n)
@@ -300,11 +311,12 @@ type
   CallContext = object          ## Context for a `prepare` block - tracks call setup state
     state: CallContextState
     callEmitted: bool           # True after (call) or (extcall) is emitted
-    target: string              # Target proc/symbol name
+    target: string              # Target proc/symbol name (a qualified name whose
+                                # module suffix `lookupWithAutoImport` parses — string)
     typ: Type                   # ProcT type (contains params, results, clobbers)
     extProcIdx: int             # Index into extProcs for external calls
-    argsSet: HashSet[string]    # Arguments that have been assigned
-    resultsSet: HashSet[string] # Results that have been bound
+    argsSet: HashSet[SymId]    # Arguments assigned (keyed by `Param.name`, an interned id)
+    resultsSet: HashSet[SymId] # Results bound (keyed by `Param.name`, an interned id)
     stackArgSize: int           # Computed size of stack arguments (csize)
     indirect: bool              # Target is a function-pointer variable: `typ` is its
                                 # proctype signature and `(call)` is an indirect call
@@ -349,6 +361,10 @@ type
     tlsOffset: int  # Current TLS offset for thread-local variables (x86)
     bssOffset: int  # Current offset in .bss section
     modules: Table[string, LoadedModule]  # Cache of loaded foreign modules
+    pool: Pool          # The main module's literal/symbol pool. Foreign decls are
+                        # interned into it too (getDecl is passed `ctx.pool`), so every
+                        # cursor's `symId` is a valid key in this one pool and the scope
+                        # can be keyed by `SymId` instead of the qualified-name string.
     baseDir: string  # Base directory for finding module files
     thisModule: string  # The module being assembled (symbol suffix of the main file);
                         # a `name.0.<thisModule>` reference is local, not foreign
@@ -375,6 +391,13 @@ type
     pendingSymbols: seq[string]  # Symbols pending code generation
     generatedSymbols: HashSet[string]  # Symbols already generated
     dedupTable: Table[string, string]  # Maps dedup key to canonical symbol name
+    definedLabels: HashSet[int]  # LabelIds of *local* labels already defined in the
+                        # current proc (populated by (lab …), cleared per proc). A
+                        # `jmp`/`jcc`/`b`/`bcc` whose target is in here is a BACKWARD
+                        # jump — forbidden: back-edges must be expressed as (loop), so
+                        # every emitted control-flow branch stays forward. The internal
+                        # loop back-edge is emitted via emitJmp/emitB directly (it never
+                        # passes through the instruction handlers), so it is exempt.
     # Thread-local storage (x86-64). nifasm owns the unified per-thread block
     # `arkham.tls.0` (sized for ALL bundled modules' tvars) and synthesizes the
     # entry prologue that points FS at it (`arch_prctl`). Nim thread-locals have no
@@ -422,7 +445,7 @@ type
     reg: x86.Register
     immVal: int64
     mem: x86.MemoryOperand
-    argName: string
+    argName: SymId
     label: LabelId
     gvarSym: Symbol           # non-nil when the operand is a global's address; the
                               # ELF backend patches its `lea` against the .bss segment
@@ -430,6 +453,16 @@ type
 proc inCall(ctx: GenContext): bool {.inline.} =
   ## Returns true if we're inside a prepare block
   ctx.callContext.state != CallContextState.Disabled
+
+template nameOf(ctx: GenContext; s: SymId): string =
+  ## Render a `SymId` back to its qualified name string (for the foreign-index
+  ## lookup, dedup keys, diagnostics and extern emission — the genuine string sinks).
+  poolSym(ctx.pool, s)
+
+template symIdOf(ctx: GenContext; s: string): SymId =
+  ## Intern a qualified name into the main pool, yielding its scope key. Cheap for a
+  ## name already interned (parsing interned every symbol) — a single hash + probe.
+  ctx.pool.syms.getOrIncl(s)
 
 proc markSymbolUsed(ctx: var GenContext; fullName: string) =
   ## Mark a symbol as used, adding it to pending list if not yet generated.
@@ -462,16 +495,16 @@ proc getCanonicalName(ctx: GenContext; fullName: string): string =
   else:
     result = fullName
 
-proc findParam(t: Type; name: string): ptr Param =
-  ## Find a parameter by name in a ProcT type
+proc findParam(t: Type; name: SymId): ptr Param =
+  ## Find a parameter by its interned id in a ProcT type
   assert t.kind == ProcT
   for i in 0..<t.params.len:
     if t.params[i].name == name:
       return addr t.params[i]
   nil
 
-proc findResult(t: Type; name: string): ptr Param =
-  ## Find a result by name in a ProcT type
+proc findResult(t: Type; name: SymId): ptr Param =
+  ## Find a result by its interned id in a ProcT type
   assert t.kind == ProcT
   for i in 0..<t.results.len:
     if t.results[i].name == name:
@@ -619,7 +652,7 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
   ## the cached decl by name.
   let m = ctx.modules[modname]            # ref: stable across table growth
   if not hasDecl(m.foreign, fullName): return nil
-  var c = getDecl(m.foreign, fullName, asmTags)  # cursor at the one decl tree
+  var c = getDecl(m.foreign, fullName, asmTags, ctx.pool)  # cursor at the one decl tree
   let declTag = tagToNifasmDecl(c.tag)
   case declTag
   of TypeD:
@@ -631,7 +664,7 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
     # very type) resolves to this symbol instead of recursing back into here. The
     # placeholder is filled in place, so the captured reference observes the
     # resolved type.
-    result = Symbol(name: fullName, kind: skType, typ: Type(kind: ErrorT),
+    result = Symbol(name: ctx.symIdOf(fullName), kind: skType, typ: Type(kind: ErrorT),
                     isForeign: true, moduleName: modname)
     ctx.rootScope.define(result)
     var parsed: Type
@@ -655,7 +688,7 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
         var r = sig.res; procTyp.results = parseResult(r, scope, ctx)
       if sig.hasClobber:
         var cl = sig.clobber; procTyp.clobbers = parseClobbers(cl)
-    result = Symbol(name: fullName, kind: skProc, typ: procTyp, offset: -1,
+    result = Symbol(name: ctx.symIdOf(fullName), kind: skProc, typ: procTyp, offset: -1,
                     isForeign: true, moduleName: modname)
     ctx.rootScope.define(result)
   of GvarD:
@@ -663,7 +696,7 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
     if c.kind != SymbolDef: return nil
     discard getSymDef(c)
     let typ = parseType(c, scope, ctx)
-    result = Symbol(name: fullName, kind: skGvar, typ: typ, isForeign: true,
+    result = Symbol(name: ctx.symIdOf(fullName), kind: skGvar, typ: typ, isForeign: true,
                     moduleName: modname)
     ctx.rootScope.define(result)
   of TvarD:
@@ -671,7 +704,7 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
     if c.kind != SymbolDef: return nil
     discard getSymDef(c)
     let typ = parseType(c, scope, ctx)
-    result = Symbol(name: fullName, kind: skTvar, typ: typ, isForeign: true,
+    result = Symbol(name: ctx.symIdOf(fullName), kind: skTvar, typ: typ, isForeign: true,
                     moduleName: modname)
     ctx.rootScope.define(result)
     # x86-64 bakes a thread-local's FS displacement at every *reference* site (no
@@ -686,16 +719,16 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
     # and the real offset into later ones — a size field then aliases what a pointer
     # field should be. (macOS/A64 relocates tvars through descriptors and allocates
     # lazily in `generateSymbol`, so leave that path untouched.)
-    if ctx.arch == Arch.X64 and result.name notin ctx.generatedSymbols:
+    if ctx.arch == Arch.X64 and ctx.nameOf(result.name) notin ctx.generatedSymbols:
       result.offset = ctx.tlsOffset
       ctx.tlsOffset += slots.alignedSize(typ)
-      ctx.generatedSymbols.incl result.name
+      ctx.generatedSymbols.incl ctx.nameOf(result.name)
   of RodataD:
     # A foreign read-only data blob (e.g. a string literal, or a gvar with a
     # constant-scalar initializer laid out as static data — see arkham genGlobal).
     inc c
     if c.kind != SymbolDef: return nil
-    result = Symbol(name: fullName, kind: skRodata, offset: -1, isForeign: true,
+    result = Symbol(name: ctx.symIdOf(fullName), kind: skRodata, offset: -1, isForeign: true,
                     moduleName: modname)
     ctx.rootScope.define(result)
   of SyprocD:
@@ -715,7 +748,7 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
       if sig.hasClobber:
         var cl = sig.clobber; procTyp.clobbers = parseClobbers(cl)
     let sysNr = if c.kind == IntLit: int(getInt(c)) else: 0
-    result = Symbol(name: fullName, kind: skSysProc, typ: procTyp, offset: sysNr,
+    result = Symbol(name: ctx.symIdOf(fullName), kind: skSysProc, typ: procTyp, offset: sysNr,
                     isForeign: true, moduleName: modname)
     ctx.rootScope.define(result)
   else:
@@ -735,12 +768,12 @@ proc lookupWithAutoImport(ctx: var GenContext; scope: Scope; name: string; n: Cu
     # module's own symbol — arkham emits self-module globals fully qualified — so
     # it must NOT be treated as foreign, which would shadow the local definition.)
     openForeignModule(ctx, modname, n)
-    result = scope.lookup(name)
+    result = scope.lookup(ctx.symIdOf(name))
     if result == nil:
       result = resolveForeignSym(ctx, modname, name, scope, n)
   else:
     # This is a local symbol - look up in current scope
-    result = scope.lookup(name)
+    result = scope.lookup(ctx.symIdOf(name))
 
   # Mark symbol as used for dependency tracking
   if result != nil:
@@ -751,14 +784,15 @@ proc lookupWithAutoImport(ctx: var GenContext; scope: Scope; name: string; n: Cu
     # pointing at a non-canonical duplicate's own (never-defined) label id would fail
     # linking with "Label not found". First sighting of a key becomes canonical; later
     # duplicates resolve back to it (its symbol is already in scope from that sighting).
-    let dedupKey = extractDedupKey(result.name)
+    let resultName = ctx.nameOf(result.name)
+    let dedupKey = extractDedupKey(resultName)
     if dedupKey != "" and dedupKey in ctx.dedupTable and
-       ctx.dedupTable[dedupKey] != result.name:
-      let canon = scope.lookup(ctx.dedupTable[dedupKey])
+       ctx.dedupTable[dedupKey] != resultName:
+      let canon = scope.lookup(ctx.symIdOf(ctx.dedupTable[dedupKey]))
       if canon != nil: result = canon
     # `markSymbolUsed` owns dedupTable registration + pending-queue insertion for the
     # first-seen (canonical) name; we only READ the table above to redirect duplicates.
-    markSymbolUsed(ctx, result.name)
+    markSymbolUsed(ctx, resultName)
 
 proc parsePtrType(kind: TypeKind; n: var Cursor; scope: Scope; ctx: var GenContext): Type =
   ## Parse the pointee of a `(ptr X)` / `(aptr X)`. A pointer is 8 bytes whatever
@@ -774,7 +808,7 @@ proc parsePtrType(kind: TypeKind; n: var Cursor; scope: Scope; ctx: var GenConte
   var baseName = ""
   if n.kind == Symbol:
     baseName = getSym(n)
-    let sym = scope.lookup(baseName)
+    let sym = scope.lookup(getSymId(n))
     inc n
     if sym != nil and sym.kind == skType:
       base = sym.typ          # resolved eagerly, but keep baseName (nominal id)
@@ -941,7 +975,7 @@ proc parseParams(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
     let pr = takeParam(p)
     var nameC = pr.name
     if nameC.kind != SymbolDef: error("Expected param name", nameC)
-    let name = symName(nameC)
+    let name = getSymId(nameC)
 
     # (reg) / (regs (r0) (r1) …) / (s) location
     var loc = pr.location
@@ -992,7 +1026,7 @@ proc parseResult(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
       if n.kind == TagLit:
         inc n                       # enter the (ret …) wrapper
       if n.kind != SymbolDef: error("Expected result definition", n)
-      let name = symName(n)
+      let name = getSymId(n)
       skip n
       var reg = InvalidTagId
       if n.kind == TagLit:
@@ -1038,7 +1072,7 @@ proc pass1Proc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: str
   if sig.hasClobber:
     var cl = sig.clobber; procTyp.clobbers = parseClobbers(cl)
 
-  let sym = Symbol(name: name, kind: skProc, typ: procTyp, offset: -1,
+  let sym = Symbol(name: ctx.symIdOf(name), kind: skProc, typ: procTyp, offset: -1,
                    moduleName: moduleName, declStart: declStart)
   scope.define(sym)
 
@@ -1066,7 +1100,7 @@ proc pass1Syproc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: s
   if n.kind != IntLit: error("Expected syscall number in syproc", n)
   let sysNr = int(getInt(n))
 
-  let sym = Symbol(name: name, kind: skSysProc, typ: procTyp, offset: sysNr,
+  let sym = Symbol(name: ctx.symIdOf(name), kind: skSysProc, typ: procTyp, offset: sysNr,
                    moduleName: moduleName, declStart: declStart)
   scope.define(sym)
 
@@ -1104,15 +1138,15 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
           inc n
           if n.kind == TagLit and n.tag == ObjectTagId:
             let typ = parseObjectBody(n, scope, ctx)
-            scope.define(Symbol(name: name, kind: skType, typ: typ,
+            scope.define(Symbol(name: ctx.symIdOf(name), kind: skType, typ: typ,
                                 moduleName: moduleName, declStart: declStart))
           elif n.kind == TagLit and n.tag == UnionTagId:
             let typ = parseUnionBody(n, scope, ctx)
-            scope.define(Symbol(name: name, kind: skType, typ: typ,
+            scope.define(Symbol(name: ctx.symIdOf(name), kind: skType, typ: typ,
                                 moduleName: moduleName, declStart: declStart))
           else:
             let typ = parseType(n, scope, ctx)
-            scope.define(Symbol(name: name, kind: skType, typ: typ,
+            scope.define(Symbol(name: ctx.symIdOf(name), kind: skType, typ: typ,
                                 moduleName: moduleName, declStart: declStart))
         of ProcD:
           # (proc :Name (params ...) (result ...) (clobber ...) (body ...))
@@ -1124,7 +1158,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
           inc n
           if n.kind != SymbolDef: error("Expected rodata name", n)
           let name = symName(n)  # Full qualified name
-          var sym = Symbol(name: name, kind: skRodata,
+          var sym = Symbol(name: ctx.symIdOf(name), kind: skRodata,
                           moduleName: moduleName, declStart: declStart)
           sym.offset = -1  # Mark as forward reference until defined
           # A `(rodata :name "bytes" (reloc off sym)*)` whose blob carries
@@ -1150,7 +1184,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
           let name = symName(n)  # Full qualified name
           inc n # skip name
           let typ = parseType(n, scope, ctx)
-          scope.define(Symbol(name: name, kind: skGvar, typ: typ,
+          scope.define(Symbol(name: ctx.symIdOf(name), kind: skGvar, typ: typ,
                               moduleName: moduleName, declStart: declStart))
           n = start
           skip n
@@ -1160,7 +1194,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
           let name = symName(n)  # Full qualified name
           inc n # skip name
           let typ = parseType(n, scope, ctx)
-          scope.define(Symbol(name: name, kind: skTvar, typ: typ,
+          scope.define(Symbol(name: ctx.symIdOf(name), kind: skTvar, typ: typ,
                               moduleName: moduleName, declStart: declStart))
           n = start
           skip n
@@ -1197,7 +1231,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
           let gotSlot = ctx.gotSlotCount
           ctx.gotSlotCount += 1
           # Create symbol
-          let sym = Symbol(name: name, kind: skExtProc, extName: extName, libName: "", gotSlot: gotSlot)
+          let sym = Symbol(name: ctx.symIdOf(name), kind: skExtProc, extName: extName, libName: "", gotSlot: gotSlot)
           scope.define(sym)
           # Track for code generation
           ctx.extProcs.add ExtProcInfo(name: name, extName: extName, libOrdinal: libOrdinal, gotSlot: gotSlot, stubOffset: -1)
@@ -1295,7 +1329,7 @@ proc fpSymReg(ctx: GenContext; n: Cursor): Symbol =
   ## If `n` is a `Symbol` naming a float local bound to a v-register, return its
   ## symbol; else nil. Float locals are never foreign, so a plain scope lookup suffices.
   if n.kind == Symbol:
-    let sym = ctx.scope.lookup(getSym(n))
+    let sym = ctx.scope.lookup(getSymId(n))
     if sym != nil and sym.reg != InvalidTagId and isA64FpRegTag(sym.reg):
       return sym
   return nil
@@ -1346,7 +1380,7 @@ type
     typ: Type
     immVal: int64
     mem: arm64.MemoryOperand
-    argName: string       # set for okArg (call argument / result binding by name)
+    argName: SymId       # set for okArg (call argument / result binding by name)
     label: LabelId
     gvarSym: Symbol       # non-nil if this operand is a global (.bss) address;
                           # its `.size` (the .bss byte offset) is read after all
@@ -1662,18 +1696,18 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       # of a ≤16B by-value aggregate) is read without leaking the following sibling.
       if not ctx.inCall:
         error("(arg ...) can only be used inside a prepare block", n)
-      var argName = ""
+      var argName = SymId(0)
       var wordIdx = 0
       into n:
         if n.kind != Symbol: error("Expected argument name in (arg ...)", n)
-        argName = getSym(n)
+        argName = getSymId(n)
         inc n
         if n.hasMore and n.kind == IntLit:
           wordIdx = int(getInt(n))
           inc n
       let paramPtr = findParam(ctx.callContext.typ, argName)
       if paramPtr == nil:
-        error("Unknown argument: " & argName, n)
+        error("Unknown argument: " & ctx.nameOf(argName), n)
       if paramPtr.typ.isOnStack:
         # Stack argument used as an offset (e.g. inside (mem (sp) (arg name))).
         # The base offset is the running byte position among the stack-passed
@@ -1691,7 +1725,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
         result.typ = paramPtr.typ
       else:
         if wordIdx >= paramPtr.regs.len:
-          error("argument word index out of range for " & argName, n)
+          error("argument word index out of range for " & ctx.nameOf(argName), n)
         result.kind = okArg
         result.argName = argName
         result.reg = tagToRegisterA64(paramPtr.regs[wordIdx], n)
@@ -1704,15 +1738,15 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
         error("(res ...) can only be used inside a prepare block", n)
       inc n
       if n.kind != Symbol: error("Expected result name in (res ...)", n)
-      let resName = getSym(n)
+      let resName = getSymId(n)
       inc n
       if not ctx.callContext.callEmitted:
         error("(res ...) can only be used after (call) or (extcall)", n)
       let resPtr = findResult(ctx.callContext.typ, resName)
       if resPtr == nil:
-        error("Unknown result: " & resName, n)
+        error("Unknown result: " & ctx.nameOf(resName), n)
       if resName in ctx.callContext.resultsSet:
-        error("Result already bound: " & resName, n)
+        error("Result already bound: " & ctx.nameOf(resName), n)
       ctx.callContext.resultsSet.incl(resName)
       result.reg = tagToRegisterA64(resPtr.reg, n)
       result.typ = resPtr.typ
@@ -1828,27 +1862,27 @@ proc parseDestA64(n: var Cursor; ctx: var GenContext): OperandA64 =
     # k-th register of a ≤16B by-value aggregate) is read without leaking the sibling.
     if not ctx.inCall:
       error("(arg ...) can only be used inside a prepare block", n)
-    var argName = ""
+    var argName = SymId(0)
     var wordIdx = 0
     into n:
       if n.kind != Symbol: error("Expected argument name in (arg ...)", n)
-      argName = getSym(n)
+      argName = getSymId(n)
       inc n
       if n.hasMore and n.kind == IntLit:
         wordIdx = int(getInt(n))
         inc n
     let paramPtr = findParam(ctx.callContext.typ, argName)
     if paramPtr == nil:
-      error("Unknown argument: " & argName, n)
+      error("Unknown argument: " & ctx.nameOf(argName), n)
     if paramPtr.typ.isOnStack:
-      error("Stack argument '" & argName & "' cannot be used directly as destination, use (mem (sp) (arg " & argName & "))", n)
+      error("Stack argument '" & ctx.nameOf(argName) & "' cannot be used directly as destination, use (mem (sp) (arg " & ctx.nameOf(argName) & "))", n)
     # Track once per name (on word 0) so the missing-arg check passes; allow later words.
     if wordIdx == 0:
       if argName in ctx.callContext.argsSet:
-        error("Argument already set: " & argName, n)
+        error("Argument already set: " & ctx.nameOf(argName), n)
       ctx.callContext.argsSet.incl(argName)
     if wordIdx >= paramPtr.regs.len:
-      error("argument word index out of range for " & argName, n)
+      error("argument word index out of range for " & ctx.nameOf(argName), n)
     result.kind = okArg
     result.argName = argName
     result.reg = tagToRegisterA64(paramPtr.regs[wordIdx], n)
@@ -1902,8 +1936,8 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
   ctx.callContext = CallContext(
     state: CallContextState.NormalCall,
     target: name,
-    argsSet: initHashSet[string](),
-    resultsSet: initHashSet[string](),
+    argsSet: initHashSet[SymId](),
+    resultsSet: initHashSet[SymId](),
     callEmitted: false
   )
 
@@ -1959,11 +1993,11 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
   if ctx.callContext.state == CallContextState.NormalCall:
     for param in ctx.callContext.typ.params:
       if not param.typ.isOnStack and param.name notin ctx.callContext.argsSet:
-        error("Missing argument: " & param.name, hdr)
+        error("Missing argument: " & ctx.nameOf(param.name), hdr)
 
     for res in ctx.callContext.typ.results:
       if res.name notin ctx.callContext.resultsSet:
-        error("Missing result binding: " & res.name, hdr)
+        error("Missing result binding: " & ctx.nameOf(res.name), hdr)
 
     if not ctx.callContext.callEmitted:
       error("Missing (call) or (extcall) in prepare block", hdr)
@@ -2108,6 +2142,17 @@ proc genIteA64(n: var Cursor; ctx: var GenContext) =
 
 proc genLoopA64(n: var Cursor; ctx: var GenContext) =
   inc n
+  # Bare infinite-loop form `(loop (stmts …))` — the back-edge is emitted INTERNALLY here,
+  # so no backward branch reaches the input; the body carries a FORWARD branch to a break/
+  # exit label defined AFTER the loop. This is the form arkham emits for every loop (mirrors
+  # the x64 `genLoopX64`). The legacy `(loop <pre> <condflag> <body>)` form below is unused.
+  if atTag(n, StmtsTagId):
+    let lStart = ctx.buf.createLabel()
+    ctx.buf.defineLabel(lStart)
+    genStmt(n, ctx)                 # the body (contains the forward break/exit branch)
+    ctx.buf.emitB(lStart)           # the loop back-edge — emitted by nifasm, not the input
+    return
+
   genStmt(n, ctx)
   let lStart = ctx.buf.createLabel()
   let lEnd = ctx.buf.createLabel()
@@ -2157,7 +2202,7 @@ proc genKillA64(n: var Cursor; ctx: var GenContext) =
       ctx.a64FRegBindings.del(tagToFloatRegA64(sym.reg))
     else:
       ctx.a64RegBindings.del(tagToRegisterA64(sym.reg, n))
-  ctx.scope.undefine(name)
+  ctx.scope.undefine(sym.name)
   inc n
 
 proc bindRegA64(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
@@ -2168,10 +2213,10 @@ proc bindRegA64(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
   ## silent clobber). The "(re)bind implies a kill of the prior tenant" rule shared by
   ## `rebind` and `withreg`. Mirrors x64's `bindRegX64`.
   if reg in ctx.a64RegBindings:
-    ctx.scope.undefine(ctx.a64RegBindings[reg])
+    ctx.scope.undefine(ctx.symIdOf(ctx.a64RegBindings[reg]))
     ctx.a64RegBindings.del(reg)
   ctx.clobberedA64.excl(reg)   # a fresh binding abandons a prior call's clobber (see bindRegX64)
-  let sym = Symbol(name: name, kind: skVar, typ: typ)
+  let sym = Symbol(name: ctx.symIdOf(name), kind: skVar, typ: typ)
   sym.reg = regTag
   ctx.a64RegBindings[reg] = name
   ctx.scope.define(sym)
@@ -2183,9 +2228,9 @@ proc bindFRegA64(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
   ## (`(f 32)`/`(f 64)`) so a *named* use recovers s/d. Used for float register locals
   ## and float scratch temps.
   if reg in ctx.a64FRegBindings:
-    ctx.scope.undefine(ctx.a64FRegBindings[reg])
+    ctx.scope.undefine(ctx.symIdOf(ctx.a64FRegBindings[reg]))
     ctx.a64FRegBindings.del(reg)
-  let sym = Symbol(name: name, kind: skVar, typ: typ)
+  let sym = Symbol(name: ctx.symIdOf(name), kind: skVar, typ: typ)
   sym.reg = regTag
   ctx.a64FRegBindings[reg] = name
   ctx.scope.define(sym)
@@ -2232,7 +2277,7 @@ proc genWithregA64(n: var Cursor; ctx: var GenContext) =
         ctx.a64FRegBindings.del(h.freg)
     elif ctx.a64RegBindings.getOrDefault(h.reg, "") == h.name:
       ctx.a64RegBindings.del(h.reg)
-    ctx.scope.undefine(h.name)
+    ctx.scope.undefine(ctx.symIdOf(h.name))
 
 proc memWidthOpc(typ: Type; isLoad: bool): tuple[size, opc: int] =
   ## Access width (0=byte,1=half,2=word,3=dword) and the load/store `opc` for a
@@ -2259,6 +2304,17 @@ proc memWidthOpc(typ: Type; isLoad: bool): tuple[size, opc: int] =
             else: 1                                # LDRB/LDRH/LDR(W) zero-extend
   (size, opc)
 
+proc checkForwardJump(ctx: GenContext; label: LabelId; n: Cursor) =
+  ## Enforce the finalir invariant: every `jmp`/`jcc`/`b`/`bcc` must target a label
+  ## that is not yet defined (a forward jump). A back-edge to an already-defined local
+  ## label is forbidden — loops must be structured as `(loop …)`, whose back-edge is
+  ## emitted internally (bypassing this check). Only *local* labels are tracked
+  ## (`ctx.definedLabels`), so branches/tail-calls to proc/rodata/gvar targets — which
+  ## are never added — are never flagged.
+  if int(label) in ctx.definedLabels:
+    error("backward jump to an already-defined label is forbidden; " &
+          "express the back-edge as a (loop …) instead", n)
+
 proc genInstA64(n: var Cursor; ctx: var GenContext) =
   if n.kind != TagLit: error("Expected instruction", n)
   let instTag = tagToA64Inst(n.tag)
@@ -2272,7 +2328,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let name = symName(n)
     inc n
     let cfvarLabel = ctx.buf.createLabel()
-    let sym = Symbol(name: name, kind: skCfvar, typ: Type(kind: BoolT), offset: int(cfvarLabel), used: false)
+    let sym = Symbol(name: ctx.symIdOf(name), kind: skCfvar, typ: Type(kind: BoolT), offset: int(cfvarLabel), used: false)
     ctx.scope.define(sym)
     return
 
@@ -2303,7 +2359,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     else:
       error("Expected location", n)
     let baseTyp = parseType(n, ctx.scope, ctx)
-    let sym = Symbol(name: name, kind: skVar)
+    let sym = Symbol(name: ctx.symIdOf(name), kind: skVar)
     if onStack:
       sym.typ = Type(kind: StackOffT, offType: baseTyp)
       sym.offset = ctx.slots.allocSlotUp(baseTyp, slotAlign)
@@ -2329,6 +2385,13 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of StmtsA64:
     loopInto n:
       genInstA64(n, ctx)
+  of ScopeA64:
+    # See `ScopeX64`: reclaimable stack-slot arena for a call's caller-save spills.
+    let savedStackSize = ctx.slots.stackSize
+    loopInto n:
+      genInstA64(n, ctx)
+    ctx.slots.maxStackSize = max(ctx.slots.maxStackSize, ctx.slots.stackSize)
+    ctx.slots.stackSize = savedStackSize
   of PrepareA64:
     genPrepareA64(n, ctx)
   of CallA64:
@@ -2354,15 +2417,18 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
     if sym == nil:
       let labId = ctx.buf.createLabel()
-      ctx.scope.define(Symbol(name: name, kind: skLabel, offset: int(labId)))
+      ctx.scope.define(Symbol(name: ctx.symIdOf(name), kind: skLabel, offset: int(labId)))
       ctx.buf.defineLabel(labId)
+      ctx.definedLabels.incl int(labId)
     elif sym.kind == skLabel:
       if sym.offset == -1:
         let labId = ctx.buf.createLabel()
         sym.offset = int(labId)
         ctx.buf.defineLabel(labId)
+        ctx.definedLabels.incl int(labId)
       else:
         ctx.buf.defineLabel(LabelId(sym.offset))
+        ctx.definedLabels.incl sym.offset
     else:
       error("Symbol is not a label", n)
     inc n
@@ -2866,6 +2932,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let op = parseOperandA64(n, ctx)
     if op.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     arm64.emitB(ctx.buf, op.label)
   of BlA64:
     inc n
@@ -2877,60 +2944,70 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let op = parseOperandA64(n, ctx)
     if op.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     arm64.emitBeq(ctx.buf, op.label)
 
   of BneA64:
     inc n
     let op = parseOperandA64(n, ctx)
     if op.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     arm64.emitBne(ctx.buf, op.label)
 
   of BltA64:
     inc n
     let op = parseOperandA64(n, ctx)
     if op.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     arm64.emitBlt(ctx.buf, op.label)
 
   of BleA64:
     inc n
     let op = parseOperandA64(n, ctx)
     if op.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     arm64.emitBle(ctx.buf, op.label)
 
   of BgtA64:
     inc n
     let op = parseOperandA64(n, ctx)
     if op.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     arm64.emitBgt(ctx.buf, op.label)
 
   of BgeA64:
     inc n
     let op = parseOperandA64(n, ctx)
     if op.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     arm64.emitBge(ctx.buf, op.label)
 
   of BloA64:
     inc n
     let op = parseOperandA64(n, ctx)
     if op.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     arm64.emitBlo(ctx.buf, op.label)
 
   of BlsA64:
     inc n
     let op = parseOperandA64(n, ctx)
     if op.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     arm64.emitBls(ctx.buf, op.label)
 
   of BhiA64:
     inc n
     let op = parseOperandA64(n, ctx)
     if op.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     arm64.emitBhi(ctx.buf, op.label)
 
   of BhsA64:
     inc n
     let op = parseOperandA64(n, ctx)
     if op.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     arm64.emitBhs(ctx.buf, op.label)
 
   of StpA64:
@@ -2990,11 +3067,11 @@ proc collectLabels(n: var Cursor; ctx: var GenContext; scope: Scope) =
       var tmp = n
       inc tmp
       if tmp.kind == SymbolDef:
-        let name = symName(tmp)
-        var sym = scope.lookup(name)
+        let nameId = getSymId(tmp)
+        var sym = scope.lookup(nameId)
         if sym == nil:
           let labId = ctx.buf.createLabel()
-          sym = Symbol(name: name, kind: skLabel, offset: int(labId))
+          sym = Symbol(name: nameId, kind: skLabel, offset: int(labId))
           scope.define(sym)
         elif sym.kind == skLabel and sym.offset == -1:
           sym.offset = int(ctx.buf.createLabel())
@@ -3037,11 +3114,12 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
     ctx.procName = name
 
     # Find/Create label for proc
-    let sym = oldScope.lookup(name)
+    let sym = oldScope.lookup(getSymId(n))
     if sym.offset == -1:
       let lab = ctx.buf.createLabel()
       sym.offset = int(lab)
     ctx.buf.defineLabel(LabelId(sym.offset))
+    ctx.definedLabels.clear()   # fresh backward-jump tracking per proc
 
     # Initialize stack context
     ctx.slots = initSlotManager()
@@ -3079,7 +3157,7 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
         # tracked there — only A64 register *locals* and `rebind`-bound scratch enter
         # `a64RegBindings`.
         if not isA64Proc and param.reg != InvalidTagId and not param.viaRegs:
-          ctx.regBindings[tagToRegister(param.reg, n)] = param.name
+          ctx.regBindings[tagToRegister(param.reg, n)] = ctx.nameOf(param.name)
 
     skip n   # past the proc name
 
@@ -3118,12 +3196,15 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   for cfvarName, cfvarSym in ctx.scope.syms:
     if cfvarSym.kind == skCfvar:
       if not cfvarSym.used:
-        quit "[Error] Control flow variable '" & cfvarName & "' declared but never used in proc " & ctx.procName
+        quit "[Error] Control flow variable '" & ctx.nameOf(cfvarName) & "' declared but never used in proc " & ctx.procName
 
   # Patch ssize. On x86 the placeholder is a raw imm32 in the instruction; on
   # AArch64 the immediate is a bit-field of a 32-bit instruction, so the patch
   # rewrites that field (MOVZ imm16 at [20:5]; ADD/SUB imm12 at [21:10]).
-  let alignedStackSize = (ctx.slots.stackSize + 15) and not 15
+  # `(scope …)` blocks reclaim their slots (reset `stackSize`), so the FINAL
+  # `stackSize` under-counts the frame. Reserve the peak seen at any point.
+  let peakStackSize = max(ctx.slots.stackSize, ctx.slots.maxStackSize)
+  let alignedStackSize = (peakStackSize + 15) and not 15
   let isA64 = ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64}
   let v = uint32(alignedStackSize)
   for pos in ctx.ssizePatches:
@@ -3468,12 +3549,12 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
             # (mem (rsp) (arg name)) — an outgoing stack-argument slot. The arg's
             # byte offset within the reserved area becomes the displacement.
             var an = n; inc an                  # peek the arg name before consuming
-            let argName = if an.kind == Symbol: getSym(an) else: ""
+            let argName = if an.kind == Symbol: getSymId(an) else: SymId(0)
             let argOff = parseOperand(n, ctx)
             if argOff.kind != okImm:
               error("(arg ...) in mem must denote a stack argument", n)
             displacement = int32(argOff.immVal)
-            if argName.len > 0: ctx.callContext.argsSet.incl argName
+            if argName != SymId(0): ctx.callContext.argsSet.incl argName
           elif n.hasMore and (n.kind == IntLit or n.kind == Symbol):
             if n.kind == IntLit:
               displacement = int32(getInt(n))
@@ -3546,11 +3627,11 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
       let argTok = n
       if not ctx.inCall:
         error("(arg ...) can only be used inside a prepare block", argTok)
-      var argName = ""
+      var argName = SymId(0)
       var wordIdx = 0          # selects the k-th register of a ≤16B by-value aggregate arg
       into n:
         if n.kind != Symbol: error("Expected argument name in (arg ...)", n)
-        argName = getSym(n)
+        argName = getSymId(n)
         inc n
         if n.hasMore and n.kind == IntLit:
           wordIdx = int(getInt(n))
@@ -3558,7 +3639,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
 
       let paramPtr = findParam(ctx.callContext.typ, argName)
       if paramPtr == nil:
-        error("Unknown argument: " & argName, argTok)
+        error("Unknown argument: " & ctx.nameOf(argName), argTok)
 
       if paramPtr.typ.isOnStack:
         # Stack argument - return its byte offset as an immediate. The base offset is
@@ -3579,7 +3660,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
       else:
         # Register argument - return the (word-`wordIdx`) register
         if wordIdx >= paramPtr.regs.len:
-          error("argument word index out of range for " & argName, argTok)
+          error("argument word index out of range for " & ctx.nameOf(argName), argTok)
         result.kind = okArg
         result.argName = argName
         result.reg = tagToRegister(paramPtr.regs[wordIdx], argTok)
@@ -3596,16 +3677,16 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
         error("(res ...) can only be used inside a prepare block", resTok)
       inc n
       if n.kind != Symbol: error("Expected result name in (res ...)", n)
-      let resName = getSym(n)
+      let resName = getSymId(n)
       inc n
 
       if not ctx.callContext.callEmitted:
         error("(res ...) can only be used after (call) or (extcall)", resTok)
       let resPtr = findResult(ctx.callContext.typ, resName)
       if resPtr == nil:
-        error("Unknown result: " & resName, resTok)
+        error("Unknown result: " & ctx.nameOf(resName), resTok)
       if resName in ctx.callContext.resultsSet:
-        error("Result already bound: " & resName, resTok)
+        error("Result already bound: " & ctx.nameOf(resName), resTok)
       ctx.callContext.resultsSet.incl(resName)
 
       result.reg = tagToRegister(resPtr.reg, resTok)
@@ -3717,11 +3798,11 @@ proc parseDest(n: var Cursor; ctx: var GenContext): Operand =
     # without leaking the following sibling (the `(mov)` source) into the check.
     if not ctx.inCall:
       error("(arg ...) can only be used inside a prepare block", n)
-    var argName = ""
+    var argName = SymId(0)
     var wordIdx = 0                      # selects the k-th register of a ≤16B aggregate arg
     into n:
       if n.kind != Symbol: error("Expected argument name in (arg ...)", n)
-      argName = getSym(n)
+      argName = getSymId(n)
       inc n
       if n.hasMore and n.kind == IntLit:
         wordIdx = int(getInt(n))
@@ -3729,22 +3810,22 @@ proc parseDest(n: var Cursor; ctx: var GenContext): Operand =
 
     let paramPtr = findParam(ctx.callContext.typ, argName)
     if paramPtr == nil:
-      error("Unknown argument: " & argName, n)
+      error("Unknown argument: " & ctx.nameOf(argName), n)
 
     if paramPtr.typ.isOnStack:
-      error("Stack argument '" & argName & "' cannot be used directly as destination, use (mem (rsp) (arg " & argName & "))", n)
+      error("Stack argument '" & ctx.nameOf(argName) & "' cannot be used directly as destination, use (mem (rsp) (arg " & ctx.nameOf(argName) & "))", n)
 
     # Track that this argument is being set. A multi-word aggregate fills several words
     # under the same name; count it once (on word 0) so the missing-arg check passes,
     # but allow the later words without a "already set" error.
     if wordIdx == 0:
       if argName in ctx.callContext.argsSet:
-        error("Argument already set: " & argName, n)
+        error("Argument already set: " & ctx.nameOf(argName), n)
       ctx.callContext.argsSet.incl(argName)
 
     # Return the (word-`wordIdx`) register for this argument
     if wordIdx >= paramPtr.regs.len:
-      error("argument word index out of range for " & argName, n)
+      error("argument word index out of range for " & ctx.nameOf(argName), n)
     result.kind = okArg
     result.argName = argName
     result.reg = tagToRegister(paramPtr.regs[wordIdx], n)
@@ -3826,7 +3907,7 @@ proc isXmmOperand(n: Cursor; ctx: GenContext): bool =
   ## local, emitted as its name, is recognized as a register operand.
   if isXmmTag(n): return true
   if n.kind == Symbol:
-    let sym = ctx.scope.lookup(getSym(n))   # float locals are never foreign
+    let sym = ctx.scope.lookup(getSymId(n))   # float locals are never foreign
     result = sym != nil and sym.reg != InvalidTagId and isXmmTagEnum(sym.reg)
 
 proc parseXmmOperand(n: var Cursor; ctx: var GenContext): x86.XmmRegister =
@@ -3907,8 +3988,8 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
   ctx.callContext = CallContext(
     state: CallContextState.NormalCall,
     target: name,
-    argsSet: initHashSet[string](),
-    resultsSet: initHashSet[string](),
+    argsSet: initHashSet[SymId](),
+    resultsSet: initHashSet[SymId](),
     callEmitted: false
   )
 
@@ -3972,11 +4053,11 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
   if ctx.callContext.state == CallContextState.NormalCall:
     for param in ctx.callContext.typ.params:
       if not param.typ.isOnStack and param.name notin ctx.callContext.argsSet:
-        error("Missing argument: " & param.name, hdr)
+        error("Missing argument: " & ctx.nameOf(param.name), hdr)
 
     for res in ctx.callContext.typ.results:
       if res.name notin ctx.callContext.resultsSet:
-        error("Missing result binding: " & res.name, hdr)
+        error("Missing result binding: " & ctx.nameOf(res.name), hdr)
 
     # Verify call was emitted
     if not ctx.callContext.callEmitted:
@@ -4181,6 +4262,13 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
     # already in that register marshals to `(mov (arg pN) (rN))` == `mov rN,rN`.
     # arkham's own `movReg` elides d==s; this mirrors it for the marshalling path.
 
+    # A register destination now holds a freshly-written value, so an earlier call's
+    # clobber no longer applies — mirror LeaX64 (5211) and the a64 mov (1877). This is
+    # what lets a caller-save reload `(mov x.0 <slot>)` (x.0 bound to a call-clobbered
+    # volatile) pass the clobber verifier: the reload re-defines the register. Sound —
+    # `parseOperand` still rejects reading a clobbered SOURCE; a mov defines its dest.
+    ctx.clobbered.excl(dest.reg)
+
 proc genIteX64(n: var Cursor; ctx: var GenContext) =
   inc n
 
@@ -4257,6 +4345,18 @@ proc genIteX64(n: var Cursor; ctx: var GenContext) =
 
 proc genLoopX64(n: var Cursor; ctx: var GenContext) =
   inc n
+
+  # Bare infinite-loop form `(loop (stmts …))` — the body is a single statement block. The
+  # back-edge is emitted INTERNALLY here, so no token-level backward `jmp` reaches the input:
+  # the body carries a FORWARD `jmp` to a break/exit label defined AFTER the loop. This is
+  # the form arkham emits for every loop; it keeps "every `jmp` is forward, back-edges are
+  # `loop`" true. (The legacy `(loop <pre> <condflag> <body>)` cfvar form below is unused.)
+  if atTag(n, StmtsTagId):
+    let lStart = ctx.buf.createLabel()
+    ctx.buf.defineLabel(lStart)
+    genStmt(n, ctx)                 # the body (contains the forward break/exit jmp)
+    ctx.buf.emitJmp(lStart)         # the loop back-edge — emitted by nifasm, not the input
+    return
 
   # Pre-loop
   genStmt(n, ctx)
@@ -4338,7 +4438,7 @@ proc genKillX64(n: var Cursor; ctx: var GenContext) =
       ctx.regBindings.del(tagToRegister(sym.reg, n))
 
   # Remove from scope to ensure it's not used again
-  ctx.scope.undefine(name)
+  ctx.scope.undefine(sym.name)
 
   inc n
 
@@ -4361,14 +4461,14 @@ proc bindRegX64(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
   ## than a silent clobber. This is the "(re)bind implies a kill (of the prior
   ## tenant)" rule shared by `rebind` and `withreg`.
   if reg in ctx.regBindings:
-    ctx.scope.undefine(ctx.regBindings[reg])
+    ctx.scope.undefine(ctx.symIdOf(ctx.regBindings[reg]))
     ctx.regBindings.del(reg)
   # Establishing a fresh binding abandons whatever a prior call left in `reg`: arkham
   # only rebinds-at-borrow right before writing the scratch, so the register's stale
   # clobbered status no longer applies (it would otherwise reject a scratch temp that
   # happens to reuse a caller-saved register clobbered by an earlier call).
   ctx.clobbered.excl(reg)
-  let sym = Symbol(name: name, kind: skVar, typ: typ)
+  let sym = Symbol(name: ctx.symIdOf(name), kind: skVar, typ: typ)
   sym.reg = regTag
   ctx.regBindings[reg] = name
   ctx.scope.define(sym)
@@ -4379,9 +4479,9 @@ proc bindXmmX64(ctx: var GenContext; name: string; typ: Type; xmmTag: TagEnum;
   ## `name`, killing its prior tenant first. Used for float register locals and
   ## float scratch temps.
   if xmm in ctx.xmmBindings:
-    ctx.scope.undefine(ctx.xmmBindings[xmm])
+    ctx.scope.undefine(ctx.symIdOf(ctx.xmmBindings[xmm]))
     ctx.xmmBindings.del(xmm)
-  let sym = Symbol(name: name, kind: skVar, typ: typ)
+  let sym = Symbol(name: ctx.symIdOf(name), kind: skVar, typ: typ)
   sym.reg = xmmTag
   ctx.xmmBindings[xmm] = name
   ctx.scope.define(sym)
@@ -4428,7 +4528,7 @@ proc genWithregX64(n: var Cursor; ctx: var GenContext) =
         ctx.xmmBindings.del(h.xmm)
     elif ctx.regBindings.getOrDefault(h.reg, "") == h.name:
       ctx.regBindings.del(h.reg)
-    ctx.scope.undefine(h.name)
+    ctx.scope.undefine(ctx.symIdOf(h.name))
 
 proc leaRegBase(n: var Cursor; ctx: var GenContext; baseReg: var x86.Register): bool =
   ## Detect and consume a `lea` base register: a raw `(reg)` tag, or a
@@ -4475,7 +4575,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # Control flow variables are always virtual (bool type, never materialized)
     # We create a label for when this cfvar becomes "true"
     let cfvarLabel = ctx.buf.createLabel()
-    let sym = Symbol(name: name, kind: skCfvar, typ: Type(kind: BoolT), offset: int(cfvarLabel), used: false)
+    let sym = Symbol(name: ctx.symIdOf(name), kind: skCfvar, typ: Type(kind: BoolT), offset: int(cfvarLabel), used: false)
     ctx.scope.define(sym)
 
     return
@@ -4502,7 +4602,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       error("Expected location", n)
     let baseTyp = parseType(n, ctx.scope, ctx)
 
-    let sym = Symbol(name: name, kind: skVar)
+    let sym = Symbol(name: ctx.symIdOf(name), kind: skVar)
     if onStack:
       sym.typ = Type(kind: StackOffT, offType: baseTyp)
       # Positive, base-relative offsets (like AArch64): the code generator lowers
@@ -4536,6 +4636,18 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
   of StmtsX64:
     loopInto n:
       genInstX64(n, ctx)
+  of ScopeX64:
+    # A `(scope …)` is a `(stmts …)` with a reclaimable stack-slot arena: `(s)`
+    # locals declared inside are freed when the scope closes, so sibling scopes
+    # (e.g. the caller-save spill slots of consecutive calls) reuse the same
+    # frame bytes. Sound because a call is straight-line control flow — the saved
+    # values are restored before the scope ends, so nothing outside the scope
+    # observes those slots. The prologue still reserves the peak via `maxStackSize`.
+    let savedStackSize = ctx.slots.stackSize
+    loopInto n:
+      genInstX64(n, ctx)
+    ctx.slots.maxStackSize = max(ctx.slots.maxStackSize, ctx.slots.stackSize)
+    ctx.slots.stackSize = savedStackSize
   of PrepareX64:
     genPrepareX64(n, ctx)
   of CallX64:
@@ -5184,7 +5296,11 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     if n.kind == Symbol:
       let name = getSym(n)
       let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
-      if sym != nil and sym.kind == skVar and sym.reg != InvalidTagId:
+      # A register-homed local OR param is a legal `lea` destination: `lea` DEFINES it,
+      # and a param kept in its incoming arg register (e.g. `lea rdi, [rdi+off]` when the
+      # param is dead afterwards) is exactly the address-of-a-field marshalling arkham
+      # emits. Match the `{skVar, skParam}` convention used by every other operand path.
+      if sym != nil and sym.kind in {skVar, skParam} and sym.reg != InvalidTagId:
         dest = tagToRegister(sym.reg, n)
         ctx.clobbered.excl(dest)            # writing it makes it valid again
         inc n
@@ -5265,6 +5381,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     elif op.label != LabelId(0) or op.typ.kind == UIntT: # Label check
       # op.label is set if it was a label operand
       if op.typ.kind == UIntT: # Label address
+        checkForwardJump(ctx, op.label, n)
         x86.emitJmp(ctx.buf, op.label)
       else:
         x86.emitJmpReg(ctx.buf.data, op.reg)
@@ -5274,81 +5391,97 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJe(ctx.buf, op.label)
   of JneX64, JnzX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJne(ctx.buf, op.label)
   of JgX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJg(ctx.buf, op.label)
   of JgeX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJge(ctx.buf, op.label)
   of JlX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJl(ctx.buf, op.label)
   of JleX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJle(ctx.buf, op.label)
   of JaX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJa(ctx.buf, op.label)
   of JaeX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJae(ctx.buf, op.label)
   of JbX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJb(ctx.buf, op.label)
   of JbeX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJbe(ctx.buf, op.label)
   of JoX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJo(ctx.buf, op.label)
   of JnoX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJno(ctx.buf, op.label)
   of JngX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJle(ctx.buf, op.label)
   of JngeX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJl(ctx.buf, op.label)
   of JnaX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJbe(ctx.buf, op.label)
   of JnaeX64:
     inc n
     let op = parseOperand(n, ctx)
     if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
     x86.emitJb(ctx.buf, op.label)
   of NopX64:
     inc n
@@ -5384,15 +5517,18 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # So we create it here if missing.
     if sym == nil:
       let labId = ctx.buf.createLabel()
-      ctx.scope.define(Symbol(name: name, kind: skLabel, offset: int(labId)))
+      ctx.scope.define(Symbol(name: ctx.symIdOf(name), kind: skLabel, offset: int(labId)))
       ctx.buf.defineLabel(labId)
+      ctx.definedLabels.incl int(labId)
     elif sym.kind == skLabel:
       if sym.offset == -1:
         let labId = ctx.buf.createLabel()
         sym.offset = int(labId)
         ctx.buf.defineLabel(labId)
+        ctx.definedLabels.incl int(labId)
       else:
         ctx.buf.defineLabel(LabelId(sym.offset))
+        ctx.definedLabels.incl sym.offset
     else:
       error("Symbol is not a label", n)
     inc n
@@ -5778,6 +5914,26 @@ proc writeElf(a: var GenContext; outfile: string) =
   # call-site bookkeeping to invalidate, and AArch64 forms are fixed-size). This
   # relays out `.text`, so remap every code byte-offset we still need afterwards:
   # the gvar `lea`/`adrp` patch sites and the synthesized TLS-prologue entry.
+  # Arch-agnostic jump threading + dead-jump prune runs FIRST (both arches): it removes
+  # unconditional jumps to their own fall-through and threads branch chains, which also
+  # exposes more rel8 opportunities for the x64 shortener below. Both passes return an
+  # old→new position map; apply them in sequence to every external code offset we track
+  # (gvar `lea`/`adrp` patch sites, the TLS-prologue entry).
+  block:
+    let threadMap = threadJumps(a.buf)
+    for k in 0 ..< a.gvarSites.len:
+      a.gvarSites[k] = (threadMap[a.gvarSites[k][0]], a.gvarSites[k][1])
+    if a.tlsEntryOffset >= 0:
+      a.tlsEntryOffset = threadMap[a.tlsEntryOffset]
+  block:
+    # `jcc L; jmp M; L:` ⇒ `jncc M` — folds a conditional branch and its fall-through
+    # unconditional jump into one branch. Pattern detection is arch-agnostic (runs on
+    # both arches); only the opcode flip inside is arch-specific.
+    let invMap = invertCondJumps(a.buf)
+    for k in 0 ..< a.gvarSites.len:
+      a.gvarSites[k] = (invMap[a.gvarSites[k][0]], a.gvarSites[k][1])
+    if a.tlsEntryOffset >= 0:
+      a.tlsEntryOffset = invMap[a.tlsEntryOffset]
   if a.arch == Arch.X64:
     let posMap = shortenX64Jumps(a.buf)
     for k in 0 ..< a.gvarSites.len:
@@ -5819,7 +5975,7 @@ proc writeElf(a: var GenContext; outfile: string) =
     var rows: seq[(int, string)]
     for name, sym in a.rootScope.syms:
       if sym.kind == skProc and labelPos.hasKey(sym.offset):
-        rows.add (0x400000 + hdrBytes + labelPos[sym.offset], name)
+        rows.add (0x400000 + hdrBytes + labelPos[sym.offset], a.nameOf(name))
     rows.sort(proc (x, y: (int, string)): int = cmp(x[0], y[0]))
     for (va, name) in rows: stderr.writeLine "0x" & toHex(va, 6) & "  " & name
   var code = a.buf.data
@@ -6092,24 +6248,25 @@ proc writeMachOObject(a: var GenContext; outfile: string) =
       defIndex[name] = result
       syms.add macho.MachOSym(name: name, sec: sec, value: value, defined: true)
 
+  let mpool = a.pool   # capturable pool ref (the nested `defOf` cannot close over `a`)
   proc defOf(sym: Symbol): int =
     ## Ensure `sym` is in the table as a defined symbol; return its index (or -1 if
     ## it has no resolvable location, e.g. an un-emitted proc).
     case sym.kind
     of skProc:
       if labelPos.hasKey(sym.offset):
-        addDef(machoName(sym.name), macho.moText, uint64(labelPos[sym.offset]))
+        addDef(machoName(poolSym(mpool, sym.name)), macho.moText, uint64(labelPos[sym.offset]))
       else: -1
     of skRodata:
       if sym.dataConst:
-        (if sym.size < dataRegionSize: addDef(machoName(sym.name), macho.moData, uint64(sym.size)) else: -1)
+        (if sym.size < dataRegionSize: addDef(machoName(poolSym(mpool, sym.name)), macho.moData, uint64(sym.size)) else: -1)
       elif labelPos.hasKey(sym.offset):
-        addDef(machoName(sym.name), macho.moText, uint64(labelPos[sym.offset]))
+        addDef(machoName(poolSym(mpool, sym.name)), macho.moText, uint64(labelPos[sym.offset]))
       else: -1
     of skGvar:
       # A data symbol must point inside the emitted `__data` region; a zero-size
       # region (`bssOffset == 0`) emits no `__data` section, so skip it then.
-      if sym.size < dataRegionSize: addDef(machoName(sym.name), macho.moData, uint64(sym.size))
+      if sym.size < dataRegionSize: addDef(machoName(poolSym(mpool, sym.name)), macho.moData, uint64(sym.size))
       else: -1
     else: -1
 
@@ -6118,7 +6275,7 @@ proc writeMachOObject(a: var GenContext; outfile: string) =
   # a real exported global.
   for name in a.generatedSymbols:
     if name == "arkham.tls.0": continue
-    let sym = a.rootScope.lookup(name)
+    let sym = a.rootScope.lookup(a.symIdOf(name))
     if sym != nil: discard defOf(sym)
 
   # An `_main` alias at the entry proc so the system crt can find it.
@@ -6222,9 +6379,9 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
   ## emitted, cross-module references resolved as ordinary direct relocations) —
   ## exactly like a local symbol, only the declaration is read from the foreign
   ## module's stream (at its indexed byte offset) instead of the main TokenBuf.
-  if sym.name in ctx.generatedSymbols:
+  if ctx.nameOf(sym.name) in ctx.generatedSymbols:
     return
-  ctx.generatedSymbols.incl sym.name
+  ctx.generatedSymbols.incl ctx.nameOf(sym.name)
 
   if sym.moduleName notin ctx.modules:
     return  # Module not loaded, can't generate
@@ -6232,7 +6389,7 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
   let m = ctx.modules[sym.moduleName]
   var n: Cursor
   if sym.isForeign:
-    n = getDecl(m.foreign, sym.name, asmTags)  # cached one-decl tree
+    n = getDecl(m.foreign, ctx.nameOf(sym.name), asmTags, ctx.pool)  # cached one-decl tree
   else:
     n = cursorAt(m.buf, sym.declStart)
   let declTag = tagToNifasmDecl(n.tag)
@@ -6365,7 +6522,7 @@ proc processReachableSymbols(ctx: var GenContext) =
       continue  # Already generated the canonical version
 
     # Find the symbol by its full qualified name (nominal identity).
-    let sym = ctx.scope.lookup(fullName)
+    let sym = ctx.scope.lookup(ctx.symIdOf(fullName))
     if sym != nil:
       generateSymbol(ctx, sym)
 
@@ -6412,6 +6569,10 @@ proc setupTls(ctx: var GenContext) =
 
 proc assemble*(filename, outfile: string; symMap = false; emitObj = false) =
   var buf = parseFromFile(filename, sharedTags = asmTags)
+  # The main module's pool is shared with every foreign module (getDecl is passed
+  # `ctx.pool`), so a `SymId` from ANY cursor is a valid key in the one scope table.
+  # Captured before the `move buf` below so the ref keeps the pool alive regardless.
+  let mainPool = buf.pool
 
   # Extract base directory from filename
   let baseDir = filename.splitFile.dir
@@ -6430,6 +6591,7 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false) =
     tlsOffset: 0,
     bssOffset: 0,
     modules: initTable[string, LoadedModule](),
+    pool: mainPool,
     baseDir: baseDir,
     thisModule: thisModule,
     imports: @[],
@@ -6455,7 +6617,7 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false) =
   # (arkham only references it for `&tvar`/`FS:[off]`). Define it up front so those
   # references resolve; it's pre-marked generated (nifasm sizes + allocates it in
   # `setupTls` once all bundled tvars are known) and FS is set in the entry prologue.
-  ctx.tlsBlockSym = Symbol(name: "arkham.tls.0", kind: skGvar,
+  ctx.tlsBlockSym = Symbol(name: ctx.symIdOf("arkham.tls.0"), kind: skGvar,
                            typ: Type(kind: UIntT, bits: 8), offset: -1)
   scope.define(ctx.tlsBlockSym)
   ctx.generatedSymbols.incl "arkham.tls.0"
@@ -6476,11 +6638,11 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false) =
           let start = tn
           inc tn                              # tvar tag
           if tn.kind == SymbolDef:
-            let sym = scope.lookup(symName(tn))
-            if sym != nil and sym.kind == skTvar and sym.name notin ctx.generatedSymbols:
+            let sym = scope.lookup(getSymId(tn))
+            if sym != nil and sym.kind == skTvar and ctx.nameOf(sym.name) notin ctx.generatedSymbols:
               sym.offset = ctx.tlsOffset
               ctx.tlsOffset += slots.alignedSize(sym.typ)
-              ctx.generatedSymbols.incl sym.name   # don't re-allocate in generateSymbol
+              ctx.generatedSymbols.incl ctx.nameOf(sym.name)   # don't re-allocate in generateSymbol
           tn = start
         skip tn
 

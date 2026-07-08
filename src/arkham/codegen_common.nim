@@ -13,7 +13,7 @@
 ## target `MachineDesc` so the backends drive the (shared) register allocator
 ## and scratch pools from it.
 
-import std / [tables, sets, assertions]
+import std / [tables, sets, assertions, algorithm]
 import nifcore, nifcdecl
 import slots, machinedesc, analyser, register_allocator, programs
 import asmbuf
@@ -32,6 +32,10 @@ type
     globals*: Table[string, Cursor]          ## global var name → its decl cursor
     tvars*: Table[string, Cursor]            ## thread-local var name → its decl cursor (macOS TLV)
     tvarNames*: HashSet[string]              ## tvar names, for the per-proc analyser
+    atomicCallNames*: HashSet[string]        ## names of calls the emitter INLINES as an atomic
+                                             ## sequence (emitAtomic2) — a limited clobber, not a
+                                             ## real call. The analyser treats them specially so a
+                                             ## var crossing only atomics keeps an r8/r9 home.
     freeTmp*: set[Reg]                       ## volatile temps free for scratch
     freeFTmp*: set[FReg]                     ## volatile SIMD/FP temps free for scratch
     spillCount*: int                         ## fresh-spill-slot counter (per proc): when
@@ -103,10 +107,51 @@ type
                                              ## `bindTemp`, NOT a steal-able local. `stealReg`
                                              ## / `evictFixedReg` skip these (a temp is not a
                                              ## local to spill); released by `unbindTemp`.
+    argResidentParams*: seq[tuple[r: Reg, name: string]]
+                                             ## x64: (arg register, bound name) for each
+                                             ## `ArgResident` param (kept in its incoming reg
+                                             ## despite the proc making calls). The binding is
+                                             ## live until the param's consuming call; after the
+                                             ## FIRST call clobbers the arg regs the param is
+                                             ## dead, so its `regLocal` binding is `(kill)`'d
+                                             ## then — else a later raw reuse of the reg (e.g. an
+                                             ## exit syscall) would emit the dead param's typed
+                                             ## name. Only killed if the reg STILL holds `name`
+                                             ## (a rebind to a temp already released the param).
+    argResidentFlushed*: bool                ## the post-first-call kill above has run
+    cleanSigProcs*: HashSet[string]          ## x64: decl names of clean-signature procs
+                                             ## (all-scalar-GPR params, non-aggregate result);
+                                             ## a same-position param arg to one is a self-move.
+                                             ## Computed once (see `cleanSigComputed`).
+    cleanSigComputed*: bool
     tmpBindCount*: int                       ## x64: per-proc fresh-name counter for scratch
                                              ## register bindings (`tmpN.0`). Bumped in BOTH
                                              ## passes so the names replay identically, like
                                              ## `spillCount`.
+    regMirror*: Table[Reg, string]           ## x64 reload-elimination cache: reg → the
+                                             ## MEMORY-homed local (`NamedStack`) whose value
+                                             ## it currently holds a live copy of. A later read
+                                             ## of that var `mov`s from the reg instead of
+                                             ## reloading `[slot]` (one fewer stack access).
+                                             ## DISTINCT from `regLocal` ("reg IS the home"):
+                                             ## a mirror's canonical home stays in memory.
+                                             ## Invalidated on any (re)write of the reg
+                                             ## (bindTemp / emRegLocalVar / rebindLocalAs /
+                                             ## releaseStaleName), a call clobber (caller-saved),
+                                             ## a store to the var or through a pointer, and
+                                             ## every label/jmp. Populated only when `regCacheOn`.
+    regCacheOn*: bool                        ## enable the `regMirror` cache (ARKHAM_REGCACHE=1).
+                                             ## OFF ⇒ nothing is cached ⇒ byte-identical output.
+    mirrorLive*: bool                        ## reg-cache: is fall-through reachable at the current
+                                             ## emit point? False after an unconditional `jmp`/exit
+                                             ## until the next `(lab)` (tracker.nim's `live`).
+    labelIn*: Table[string, Table[Reg, string]]  ## reg-cache forward-join: label → the JOIN
+                                             ## (per-register intersection) of the mirror state at
+                                             ## every jump seen to it so far. Consumed and cleared
+                                             ## at the label's `(lab)`. A FORWARD label's incoming
+                                             ## edges are all seen before it, so the join is exact;
+                                             ## a loop-header `(lab)` clears instead (its back-edge
+                                             ## predecessor is not yet emitted in this one pass).
     scopeLocals*: seq[seq[tuple[name: string, reg: Reg]]]  ## per-scope register locals to `kill`
     fregLocal*: Table[FReg, string]          ## the SIMD twin of `regLocal`: xmm reg → the
                                              ## named float local/scratch currently bound to it
@@ -577,3 +622,23 @@ proc operandInReg*(g: var CodeGen; operand: Cursor; dest: Reg): bool =
   if operand.kind == Symbol:
     let loc = g.ra.locationOfSym(symName(operand))
     result = loc.kind == InReg and loc.r == dest
+
+# ── caller-save (shared by both backends) ────────────────────────────────────
+proc callerSaveSetAt*(g: var CodeGen): seq[tuple[reg: Reg, name: string]] =
+  ## The caller-save LOCALS (see `RegAlloc.callerSaveHomes`) currently bound in a
+  ## register — they must be spilled around a call (which clobbers the volatile home).
+  ## The trigger is `regLocal` membership = the EMIT-TIME liveness truth (the binding
+  ## persists decl→kill), so a var live across a control-flow merge is still bound at a
+  ## call in a predecessor branch — what a coarse-`freeAfter` interval would MISS (it
+  ## under-approximates across merges; the cont.47 wall). The allocator only hands a
+  ## caller-save home to a var whose value is valid wherever it is bound (SSA-like, no
+  ## call in its initializer), so saving whenever bound is always well-defined. Sorted by
+  ## register for deterministic output.
+  if g.ra.callerSaveHomes.len == 0: return
+  for reg, name in g.regLocal:
+    if g.ra.callerSaveHomes.hasKey(name):
+      result.add (reg: reg, name: name)
+  result.sort(proc (a, b: tuple[reg: Reg, name: string]): int = cmp(ord(a.reg), ord(b.reg)))
+
+proc callerSaveSlotName*(pos: int; reg: Reg): string {.inline.} =
+  "csave." & $pos & "." & $ord(reg) & ".0"

@@ -25,7 +25,14 @@
 ## reuse it); the union of callee-saved registers ever used drives the
 ## prologue/epilogue.
 
-import std / [tables, sets, assertions]
+import std / [tables, sets, assertions, os]
+
+let callerSaveDisabled = existsEnv("ARKHAM_NO_CALLERSAVE")
+  ## measurement toggle: `ARKHAM_NO_CALLERSAVE=1` reverts the caller-save rescue to a
+  ## plain spill, so the spill delta can be A/B compared. Off (feature on) by default.
+let copyInheritDisabled = existsEnv("ARKHAM_NO_COPYINHERIT")
+  ## measurement toggle: `ARKHAM_NO_COPYINHERIT=1` disables same-width cast/copy home
+  ## inheritance (`allocVarDecl`), so the eliminated reg→reg moves can be A/B compared.
 import nifcore, nifcdecl, slots, machinedesc, analyser, programs, typenav
 
 var gArkhamCurProc* = ""   # debug: the proc arkham is currently allocating (for asserts)
@@ -85,6 +92,20 @@ type
                                       ## allocator reserved a callee-saved reg for the
                                       ## emitter's `stackArgBaseReg` (single source of
                                       ## truth; the emitter must NOT re-classify)
+    callerSaveHomes*: Table[string, int]
+                                      ## x64: cross-call LOCALS that, under callee-saved
+                                      ## pressure, were given a CALLER-SAVE volatile home
+                                      ## (R8/R9 — atomic-safe) instead of spilling. Maps the
+                                      ## var name → its coarse `freeAfter`. At each call the
+                                      ## emitter brackets the ones still live-across with a
+                                      ## `(scope …)` save/restore (the reg's value survives
+                                      ## in a reclaimable typed slot). Beats a spill's
+                                      ## reload-per-use: register-resident between calls.
+    aliasedCasts*: HashSet[string]    ## identity-cast value aliases (`let c2 = cast[T](c1)`,
+                                      ## c1 LIVE): `c2` has NO home of its own — its `symPos`
+                                      ## points at `c1`'s decl, so it resolves to `c1`'s live
+                                      ## register. The emitter emits neither a decl nor a store
+                                      ## for these (uses auto-cast via the deref handler).
     spillTemps*: seq[tuple[name: string; typ: AsmSlot; isFloat: bool]]
                                       ## value-core totality: `etmp`/`ftmp` slots the
                                       ## allocator synthesized when the register pool
@@ -218,8 +239,16 @@ proc allocStorage(b: var Builder; slot: AsmSlot; props: VarProps): Location =
       r = b.takeReg(b.freeVol, [b.md.shiftCountReg])
     if r == NoReg and DivRegOk in props and b.md.divRemReg != NoReg:
       r = b.takeReg(b.freeVol, [b.md.divRemReg])
+  elif b.md.arch == X86 and R89Ok in props and b.md.atomicSafeTempRegs.len > 0:
+    # Live across an INLINED ATOMIC but no REAL call (so not `AllRegs`: an atomic
+    # clobbers its arg regs rdi/rsi). The atomic-safe volatile temps (r8/r9) survive
+    # its limited clobber, so PREFER them and reserve the scarce callee-saved pool for
+    # values that cross a real call — which have no volatile option (mirrors the x86
+    # `AllRegs` volatile-first policy; the priority-inversion guard).
+    r = b.takeReg(b.freeVol, b.md.atomicSafeTempRegs)
+    if r == NoReg: r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
   else:
-    # may be live across a call → must be callee-saved (or stack)
+    # may be live across a real call → must be callee-saved (or stack)
     r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
   if r == NoReg:
     when defined(arkhamSpillDbg):
@@ -240,6 +269,17 @@ proc giveBackF(b: var Builder; f: FReg) {.inline.} =
 
 proc weightOf(b: Builder; name: string): int {.inline.} =
   b.an.vars.getOrDefault(name).weight
+
+proc rangeLen(b: Builder; name: string): int {.inline.} =
+  ## Length (in token positions) of a local's live interval — its register-occupancy
+  ## span. Used ONLY as a tie-breaker among equal-`weight` steal candidates. `high(int)`
+  ## for a param (`freeAfter == high`): live across the whole body, so among equals a
+  ## param is the longest-lived and thus the preferred victim.
+  let vi = b.an.vars.getOrDefault(name)
+  if vi.freeAfter == high(int): return high(int)
+  let lo = if vi.declInLoop: vi.loopLo else: vi.liveStart
+  let hi = if vi.declInLoop: vi.loopHi else: vi.freeAfter
+  max(1, hi - lo)
 
 # ── scope-based walk that allocates locals ──────────────────────────────────
 
@@ -276,13 +316,16 @@ proc record(b: var Builder; pos: int; name: string; loc: Location) =
   b.ra.symPos[name] = pos
   b.ra.locs[pos] = loc
 
-proc coldestVictim(b: var Builder; maxW: int; calleeOnly, wantFloat: bool): string =
-  ## The lowest-weight live register-resident local (weight strictly below `maxW`)
-  ## whose register may be stolen: a non-sealed GPR (`calleeOnly` restricts to the
-  ## callee-saved set) or — `wantFloat` — a SIMD register. The victim-selection
-  ## policy behind the local→memory undo (`trySteal` / `reserveHeldScratch`). "" when
-  ## nothing is stealable.
+proc coldestVictim(b: var Builder; maxW, ceilLen: int; calleeOnly, wantFloat: bool): string =
+  ## The coldest live register-resident local whose register may be stolen: a non-sealed
+  ## GPR (`calleeOnly` restricts to the callee-saved set) or — `wantFloat` — a SIMD
+  ## register. "Coldest" = lowest `weight`; **ties broken by the LONGER live range** — an
+  ## equal-use var that occupies its register for a longer span drains the pool more, so
+  ## among equals it is the better spill victim (`tweaks.md` tweak 1). The ceiling
+  ## `(maxW, ceilLen)` is the caller's own coldness: a candidate qualifies iff strictly
+  ## colder than it in that (weight, then length) order. "" when nothing is stealable.
   var bestW = maxW
+  var bestLen = ceilLen               # meaningful only for an equal-`bestW` candidate
   result = ""
   for scope in b.scopeVars:
     for v in scope:
@@ -295,8 +338,8 @@ proc coldestVictim(b: var Builder; maxW: int; calleeOnly, wantFloat: bool): stri
         if vloc.r in b.ra.sealed: continue      # pinned to an in-flight ABI call
         if calleeOnly and vloc.r notin b.md.intCalleeSavedSet: continue
       let vw = b.weightOf(v)
-      if vw < bestW:
-        bestW = vw; result = v
+      if vw < bestW or (vw == bestW and b.rangeLen(v) > bestLen):
+        bestW = vw; bestLen = b.rangeLen(v); result = v
 
 proc demoteToStack(b: var Builder; victim: string) =
   ## Undo `victim`'s optimistic register assignment: move it to a nifasm-managed `(s)`
@@ -315,7 +358,8 @@ proc trySteal(b: var Builder; curName: string; curSlot: AsmSlot;
   ## it is strictly colder than `curName`; that local moves to `fallback` and
   ## `curName` takes its register. Returns `curName`'s chosen location.
   let calleeOnly = AllRegs notin curProps   # cross-call var needs callee-saved
-  let bestV = b.coldestVictim(b.weightOf(curName), calleeOnly, wantFloat = false)
+  let bestV = b.coldestVictim(b.weightOf(curName), b.rangeLen(curName),
+                              calleeOnly, wantFloat = false)
   if bestV.len == 0: return fallback        # nothing colder to steal from
   # evict the victim to its stack slot; current takes its register
   let bestReg = b.ra.locs[b.ra.symPos[bestV]].r
@@ -405,7 +449,7 @@ proc reserveHeldScratch(b: var Builder; what: string; canSpill = false): Locatio
   if r != NoReg:
     b.ra.usedCallee.incl r
     return regLoc(r, ScalarSlot, isTemp = true)
-  let victim = b.coldestVictim(high(int), calleeOnly = true, wantFloat = false)
+  let victim = b.coldestVictim(high(int), low(int), calleeOnly = true, wantFloat = false)
   if victim.len == 0:
     if canSpill: return b.heldSpillSlot()   # totality backstop (wired consumer)
     raiseAssert "arkham: out of registers for " & what & " (nothing to spill)"
@@ -479,6 +523,19 @@ proc allocConstr(b: var Builder; n: var Cursor)
 proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int)
 proc releaseLvalTemps(b: var Builder; n: Cursor)
 
+proc copyCastSrcSym*(n: Cursor): Cursor =
+  ## If `n` is a bare `Symbol`, or a `(cast T sym)` / `(conv T sym)` relabel, return a
+  ## cursor at the inner `Symbol`; otherwise return a cursor whose `.kind != Symbol`
+  ## (the caller filters on that). Spots `let c2 = c1` / `let c2 = cast[T](c1)` whose
+  ## value is just another local — a candidate for register-home inheritance. The
+  ## same-width / liveness / register-class safety gates live at the two call sites.
+  if n.kind == Symbol: return n
+  if n.kind == TagLit and n.exprKind in {CastC, ConvC}:
+    var t = n; inc t          # past the tag
+    skip t                    # past the target type
+    return t                  # at the inner expr (a `Symbol` iff a plain relabel)
+  return n
+
 proc isFoldableLeaf(b: var Builder; n: Cursor): bool =
   ## A value needing NO register held across a sibling subtree: an immediate, or a
   ## function-local symbol read (folds as its reg / stack home operand). A computed
@@ -487,6 +544,31 @@ proc isFoldableLeaf(b: var Builder; n: Cursor): bool =
   of IntLit, UIntLit, CharLit: true
   of Symbol: b.symLoc(symName(n)).kind in {InReg, NamedStack}
   else: false
+
+proc initHasCallImpl(n: var Cursor): bool =
+  ## Advances `n` past the subtree; true iff it contains a call anywhere. A var whose
+  ## initializer contains a call is NOT defined before that call — it is produced BY it —
+  ## so it must not get a caller-save home (the emitter would save an undefined register).
+  if n.kind == TagLit:
+    if n.exprKind == CallC: return true         # the "call" tag → CallC (in any context)
+    n.into:
+      while n.hasMore:
+        if initHasCallImpl(n): return true      # each recursion consumes one child
+  else:
+    inc n
+  return false
+
+proc initHasCall(n: Cursor): bool =
+  var c = n
+  initHasCallImpl(c)
+
+proc callsCrossed(b: Builder; vi: VarInfo): int =
+  ## How many real calls the var's coarse live range spans — the number of save/restore
+  ## pairs a caller-save home would cost. Mirrors the cross-call test in `analyser`.
+  let lo = if vi.declInLoop: vi.loopLo else: vi.liveStart
+  let hi = if vi.declInLoop: vi.loopHi else: vi.freeAfter
+  for p in b.an.callPositions:
+    if lo < p and p <= hi: inc result
 
 proc commutativeExpr(ek: LengExpr): bool {.inline.} =
   ## Integer ops for which `a op b == b op a` (so the heavier operand may be
@@ -565,7 +647,7 @@ proc allocBin(b: var Builder; n: var Cursor; dest: var Location) =
     skip n                                   # result type
     allocValue(b, n, lDest)                  # left → a register
     if ek in {ShlC, ShrC} and b.md.shiftCountReg != NoReg and
-       n.kind notin {IntLit, UIntLit, CharLit}:
+       not isConstShiftCount(n):
       # x86 variable shift: the count must be in cl. cl (rcx) must be free here — a
       # LIVE symbol homed in it would be clobbered. `freeVol` membership is the ground
       # truth for "free": a `ShiftRegOk` local homed in rcx is, by construction, dead
@@ -1732,10 +1814,83 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
         allocStore(b, vc, namedStackLoc(name, slot), pos)   # the one general store path
     else:
       let props = b.an.vars.getOrDefault(name).props
+      # ── same-width cast/copy home inheritance ──────────────────────────────────
+      # `let c2 = cast[T](c1)` / `let c2 = c1`, where the relabel is SAME-WIDTH and `c1`
+      # is a single-def register-homed local whose LAST touch is this initializer: `c2`
+      # occupies `c1`'s register directly. The store then collapses to a zero-machine-code
+      # `(rebind)` (the emitter renames the register from c1 to c2 — see `genVarDecl2`),
+      # eliminating a reg→reg `mov`. Gated to x86 (the emitter's same-reg skip is wired
+      # there) and to a source whose register CLASS already covers c2's lifetime: a
+      # callee-saved home always does; a volatile home only for a call-free c2 (`AllRegs`).
+      var inheritSrc = ""                       # non-empty ⇒ this var inherits `inheritSrc`'s reg
+      if not copyInheritDisabled and b.md.arch == X86 and hasValue and
+         AddrTaken notin props and slot.inRegClass and not slot.isFloat and
+         not b.an.vars.getOrDefault(name).declInLoop:
+        let srcSym = copyCastSrcSym(valCur)
+        if srcSym.kind == Symbol:
+          let srcName = symName(srcSym)
+          let sh = b.symLoc(srcName)
+          let svi = b.an.vars.getOrDefault(srcName)
+          if sh.kind == InReg and not sh.typ.isFloat and sh.typ.size == slot.size and
+             svi.defs == 1 and svi.lastUsePos <= b.posOf(srcSym) and
+             not svi.declInLoop and
+             (sh.r in b.md.intCalleeSavedSet or AllRegs in props):
+            inheritSrc = srcName
+      # NOTE: identity-cast value ALIASING (the c1-LIVE case) was reverted — it produced
+      # nifasm-rejected `cmp (ptr object) (ptr object)` on the allocator (a value use of an
+      # aliased cast lost its precise pointer type). Only the c1-DEAD transfer below remains.
+      var aliasSrc = ""
+      discard aliasSrc                      # aliasing reverted (see note); always empty now
       # Optimistically give the local a register; demote a colder one to memory if the
       # register class is full (`trySteal`, the only undo). A spilled / address-taken
       # scalar lives in a nifasm-managed `(s)` slot addressed by name.
-      var loc = b.allocStorage(slot, props)
+      var loc =
+        if aliasSrc.len > 0: dontCare                                 # c2 is a pure view of c1
+        elif inheritSrc.len > 0: regLoc(b.symLoc(inheritSrc).r, slot) # c2 takes c1's reg
+        else: b.allocStorage(slot, props)
+      if inheritSrc.len > 0:
+        # Transfer the register's free obligation from the (now-dead) source to this var:
+        # drop the source's pending early-free and mark it freed so `closeScope` skips it;
+        # THIS var's own `pendingFree`/`scopeVars` entries below then solely own the reg.
+        var k = 0
+        while k < b.pendingFree.len:
+          if b.pendingFree[k].name == inheritSrc: b.pendingFree.del k
+          else: inc k
+        b.freedSyms.incl inheritSrc
+      # Caller-save rescue: a cross-call scalar that `allocStorage` could not home in a
+      # callee-saved reg (the pool is full) would otherwise SPILL — reloaded at every use.
+      # Instead give it an atomic-safe caller-save volatile (R8/R9): register-resident
+      # between calls, and the emitter brackets each crossed call with a `(scope …)`
+      # save/restore. Restricted to the atomic-safe pool so a var that also crosses an
+      # INLINED atomic (which clobbers rdi/rsi/rdx but not r8/r9) stays sound without a
+      # per-atomic-crossing analysis. Tried BEFORE `trySteal` so it evicts nothing.
+      let vi0 = b.an.vars.getOrDefault(name)
+      if not callerSaveDisabled and
+         loc.kind == OnStack and b.md.arch in {X86, Arm64} and AddrTaken notin props and
+         slot.inRegClass and not slot.isFloat and
+         AllRegs notin props and R89Ok notin props and
+         hasValue and vi0.defs == 1 and vi0.freeAfter != high(int) and
+         not initHasCall(valCur) and
+         vi0.weight > 2 * callsCrossed(b, vi0):
+        # COST MODEL: a caller-save home pays 2 memory ops (save+restore) per crossed
+        # call but makes every USE a register read instead of a spill reload. So it only
+        # wins when the (loop-weighted) use count exceeds twice the calls crossed —
+        # otherwise a plain spill (reload-per-use) is cheaper. Without this gate a var
+        # that crosses several calls but is used once REGRESSED the alloc module (+8 mem).
+        # SOUNDNESS: give a caller-save home ONLY to a var whose value is provably valid
+        # at EVERY call it is bound across — else the emitter's save reads a register that
+        # holds no defined value yet (nifasm rejects reading a clobbered reg, and there is
+        # nothing valid to save). Guarantee: single-def (`defs == 1`), non-whole-proc
+        # (`freeAfter != high`), and its initialiser contains NO call (`not initHasCall`).
+        # Then the var is defined synchronously at its decl, before any subsequent call,
+        # and never rewritten — valid at every crossed call. This excludes: a `result` var
+        # (declared empty → assigned late), a `var x = f(…)` (defined BY the call it would
+        # be saved around — dead before it; the call may be nested in an `(elif…)`), and
+        # any var rewritten past a control-flow merge.
+        let r = b.takeReg(b.freeVol, b.md.atomicSafeTempRegs)
+        if r != NoReg:
+          loc = regLoc(r, slot)
+          b.ra.callerSaveHomes[name] = vi0.freeAfter
       if loc.kind == OnStack and AddrTaken notin props and
          slot.inRegClass and not slot.isFloat:
         loc = b.trySteal(name, slot, props, loc)  # hot var evicts a colder one
@@ -1746,17 +1901,22 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
         # participate in `trySteal` eviction yet; they spill directly here.)
         loc = namedStackLoc(name, slot)
         b.ra.hasStackVars = true
-      b.record(pos, name, loc)
-      b.scopeVars[^1].add name
+      if aliasSrc.len > 0:
+        b.ra.symPos[name] = b.ra.symPos[aliasSrc]   # c2 resolves to c1's LIVE home (no own reg)
+        b.ra.aliasedCasts.incl name                 # emitter emits neither decl nor store for it
+      else:
+        b.record(pos, name, loc)
+        b.scopeVars[^1].add name
       # Register the coarse early-free, unless declared in a loop (a later loop-body
       # decl could reuse the reg across the back-edge). Stored by name so the flush
       # frees the var's *current* reg (it may have been evicted to the stack).
       let vi = b.an.vars.getOrDefault(name)
       if loc.kind == InReg and not vi.declInLoop:
         b.pendingFree.add (pos: vi.freeAfter, name: name)
-      if b.allocExprs and hasValue:
+      if b.allocExprs and hasValue and inheritSrc.len == 0 and aliasSrc.len == 0:
         var vc = valCur
         allocStore(b, vc, loc, pos)            # the one general store path
+      # (an inherited/aliased var needs no store: its value is already in c1's register)
 
 proc walk(b: var Builder; n: var Cursor) =
   case n.stmtKind
@@ -1993,9 +2153,20 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
                             # before that read — give it a callee-saved home. (No-op on x86-64,
                             # where intRetReg=rax is never an arg register.)
                             (arg == b.md.intRetReg and b.an.arg0RetConflict)
+            # An ArgResident param crosses no call (its consuming call is the first in
+            # the proc and its last use) → it may STAY in its incoming arg register even
+            # though the proc has calls: no prologue save, and same-position passing makes
+            # the marshal a self-move. Excludes by-ref aggregates (their pointer must
+            # survive repeated field loads) and fixed-role-clobbered arg regs (rdx/rcx).
+            # Both arches: keep an ArgResident param in its incoming arg register. On x64
+            # the emitter binds the param's arg reg to `regLocal` and must `kill` that dead
+            # binding after the first call (`flushArgResidentParams`); on a64 a param in an
+            # arg reg (x0–x7) is read RAW (no `regLocal` binding — see a64 `emReg`), so there
+            # is no lingering binding to flush.
+            let stayInArg = ArgResident in props and not aggrByRef and not clobbered
             if AddrTaken in props and not aggrByRef:
               loc = b.spill(effSlot)           # address taken → must be on the stack
-            elif hasCall or aggrByRef or clobbered:
+            elif (hasCall or aggrByRef or clobbered) and not stayInArg:
               # Live across a call (the incoming arg reg is volatile), or a by-ref
               # pointer that must survive repeated field loads in the body: give
               # it a callee-saved home so the prologue can `mov home, argReg`.
@@ -2093,6 +2264,10 @@ proc seedPools(b: var Builder) =
   # `divRemOccupied`/`regOccupied` at the div/shift sites). `NoReg` on RISC (a64).
   if b.md.divRemReg != NoReg: b.freeVol.incl b.md.divRemReg
   if b.md.shiftCountReg != NoReg: b.freeVol.incl b.md.shiftCountReg
+  # Caller-save home candidates (x64 R8/R9 — already here via `intLocalTempRegs`; a64 x6/x7
+  # — arg regs NOT otherwise in a pool). Drawn ONLY by the caller-save rescue, which filters
+  # on `atomicSafeTempRegs`, so no ordinary local/temp/AllRegs allocation reaches them.
+  for r in b.md.atomicSafeTempRegs: b.freeVol.incl r
   for r in b.md.intCalleeSaved: b.freeCallee.incl r
   for f in b.md.floatTempRegs: b.freeVolF.incl f
   for f in b.md.floatCalleeSaved: b.freeCalleeF.incl f
