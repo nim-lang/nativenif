@@ -5101,7 +5101,8 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     g.cleanSigComputed = true
   let an = analyseProc(g.buf[], info.decl, atomicCalls = g.atomicCallNames,
                        cleanCallees = g.cleanSigProcs,
-                       procIsClean = isCleanSigProc(g.prog, info.decl))
+                       procIsClean = isCleanSigProc(g.prog, info.decl),
+                       entryLeadingClobber = info.isEntry and g.hasGlobalInits)
   g.varType.clear()                           # reuse the backing storage across procs
   g.symType.clear()
   g.retAggrName = ""; g.retIndirect = false; g.retIsFloat = false

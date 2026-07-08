@@ -216,6 +216,29 @@ proc resultSpineWalk(c: var Context; n: var Cursor; onSpine: bool) =
     else: skip n
   else: inc n
 
+proc markArgParamsUnsafe(c: var Context; n0: Cursor; ordinal: int; cleanCall: bool) =
+  ## Recursively disqualify from `ArgResident` every PARAM read ANYWHERE inside a call
+  ## argument at ABI position `ordinal`. Keeping such a param in its incoming arg register
+  ## is unsound whenever that register is overwritten by the marshalling of arg[paramIdx]
+  ## before this argument is computed — i.e. `paramIdx != ordinal` (a same-ordinal
+  ## self-move is the one safe shape: it reads the register just before overwriting it).
+  ## A NON-clean call (aggregate/float/retIndirect may shift ABI ordinals) makes any use
+  ## unsafe. Crucially this sees THROUGH `dot`/`deref`/`cast`/… wrappers, so a closure env
+  ## `p0.0` (rdi) read as `env->field` for arg1 — while arg0 targets rdi — is caught, not
+  ## only a bare/wrapped param passed directly (e.g. `mmap(nil, cast(size), …)`).
+  var n = n0
+  case n.kind
+  of Symbol:
+    let an = symName(n)
+    if c.res.vars.hasKey(an) and c.res.vars[an].paramIdx >= 0:
+      if (not cleanCall) or c.res.vars[an].paramIdx != ordinal:
+        c.res.vars[an].argUnsafe = true
+  of TagLit:
+    if n.stmtKind == NoStmt:
+      n.into:
+        while n.hasMore: (markArgParamsUnsafe(c, n, ordinal, cleanCall); skip n)
+  else: discard
+
 proc analyse(c: var Context; n: var Cursor) =
   case n.kind
   of Symbol:
@@ -354,12 +377,7 @@ proc analyse(c: var Context; n: var Cursor) =
           skip probe                                       # past the callee → arguments
           var ordinal = 0
           while probe.hasMore:
-            if probe.kind == Symbol:
-              let an = symName(probe)
-              if c.res.vars.hasKey(an) and c.res.vars[an].paramIdx >= 0:
-                # a bare param argument: safe ONLY as a same-ordinal self-move in a clean call
-                if not (cleanCall and c.res.vars[an].paramIdx == ordinal):
-                  c.res.vars[an].argUnsafe = true
+            markArgParamsUnsafe(c, probe, ordinal, cleanCall)
             skip probe
             inc ordinal
       analyseChildren(c, n)
@@ -498,7 +516,8 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
                   tvars: HashSet[string] = initHashSet[string]();
                   atomicCalls: HashSet[string] = initHashSet[string]();
                   cleanCallees: HashSet[string] = initHashSet[string]();
-                  procIsClean = false): ProcAnalysis =
+                  procIsClean = false;
+                  entryLeadingClobber = false): ProcAnalysis =
   ## `procDecl` is at a `(proc name params rettype pragmas body)`. `tvars` names
   ## the module's thread-locals so their uses force a call-like analysis. `atomicCalls`
   ## names calls the emitter inlines as an atomic sequence (a limited clobber — see
@@ -574,7 +593,12 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
   # excluded. Only sound for register params; allocParams layers the fixed-role
   # (`clobbered`) and aggregate gating on top. Gated on `hasCall` (a leaf proc already
   # keeps its params in the arg registers via allocParams' plain leaf path).
-  if c.res.hasCall and c.procIsClean:
+  #
+  # `entryLeadingClobber` disables ArgResident wholesale: the entry proc has a synthetic
+  # `arkhamGlobalInit` call INJECTED before its body (not in the analysed IR), which
+  # clobbers the caller-saved arg registers before the first body use of argc/argv/envp —
+  # so no param may stay in its incoming register here.
+  if c.res.hasCall and c.procIsClean and not entryLeadingClobber:
     for name, vi in mpairs c.res.vars:
       if vi.freeAfter == high(int) and AddrTaken notin vi.props and
          vi.usages > 0 and not vi.usedAfterCall and not vi.argUnsafe:

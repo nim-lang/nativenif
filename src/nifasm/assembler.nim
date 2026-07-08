@@ -5269,7 +5269,11 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     if n.kind == Symbol:
       let name = getSym(n)
       let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
-      if sym != nil and sym.kind == skVar and sym.reg != InvalidTagId:
+      # A register-homed local OR param is a legal `lea` destination: `lea` DEFINES it,
+      # and a param kept in its incoming arg register (e.g. `lea rdi, [rdi+off]` when the
+      # param is dead afterwards) is exactly the address-of-a-field marshalling arkham
+      # emits. Match the `{skVar, skParam}` convention used by every other operand path.
+      if sym != nil and sym.kind in {skVar, skParam} and sym.reg != InvalidTagId:
         dest = tagToRegister(sym.reg, n)
         ctx.clobbered.excl(dest)            # writing it makes it valid again
         inc n
@@ -5883,6 +5887,26 @@ proc writeElf(a: var GenContext; outfile: string) =
   # call-site bookkeeping to invalidate, and AArch64 forms are fixed-size). This
   # relays out `.text`, so remap every code byte-offset we still need afterwards:
   # the gvar `lea`/`adrp` patch sites and the synthesized TLS-prologue entry.
+  # Arch-agnostic jump threading + dead-jump prune runs FIRST (both arches): it removes
+  # unconditional jumps to their own fall-through and threads branch chains, which also
+  # exposes more rel8 opportunities for the x64 shortener below. Both passes return an
+  # old→new position map; apply them in sequence to every external code offset we track
+  # (gvar `lea`/`adrp` patch sites, the TLS-prologue entry).
+  block:
+    let threadMap = threadJumps(a.buf)
+    for k in 0 ..< a.gvarSites.len:
+      a.gvarSites[k] = (threadMap[a.gvarSites[k][0]], a.gvarSites[k][1])
+    if a.tlsEntryOffset >= 0:
+      a.tlsEntryOffset = threadMap[a.tlsEntryOffset]
+  block:
+    # `jcc L; jmp M; L:` ⇒ `jncc M` — folds a conditional branch and its fall-through
+    # unconditional jump into one branch. Pattern detection is arch-agnostic (runs on
+    # both arches); only the opcode flip inside is arch-specific.
+    let invMap = invertCondJumps(a.buf)
+    for k in 0 ..< a.gvarSites.len:
+      a.gvarSites[k] = (invMap[a.gvarSites[k][0]], a.gvarSites[k][1])
+    if a.tlsEntryOffset >= 0:
+      a.tlsEntryOffset = invMap[a.tlsEntryOffset]
   if a.arch == Arch.X64:
     let posMap = shortenX64Jumps(a.buf)
     for k in 0 ..< a.gvarSites.len:
