@@ -731,6 +731,30 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
     result = Symbol(name: ctx.symIdOf(fullName), kind: skRodata, offset: -1, isForeign: true,
                     moduleName: modname)
     ctx.rootScope.define(result)
+  of ExtprocD:
+    # A foreign module's dynamic libc extern (`(extproc :write.c.<mod> "_write")` —
+    # arkham emits each used extern's decl in the module that declares the `importc`;
+    # a bundle whose MAIN module has no externs of its own still reaches them here).
+    # Mirrors the main-module pass-1 ExtprocD case: define the skExtProc symbol with
+    # its external name and a fresh GOT slot, and register it for import binding.
+    inc c
+    if c.kind != SymbolDef: return nil
+    discard getSymDef(c)
+    if c.kind != StrLit: return nil
+    let extName = getStr(c)
+    if ctx.imports.len == 0:
+      # No main-module `(imp …)` was seen (the main module had no externs itself);
+      # the extern must still bind against libSystem, so import it implicitly —
+      # the same default arkham uses for its Darwin extern decls.
+      ctx.imports.add ImportedLib(name: "/usr/lib/libSystem.B.dylib", ordinal: 1)
+    let libOrdinal = ctx.imports[^1].ordinal
+    let gotSlot = ctx.gotSlotCount
+    ctx.gotSlotCount += 1
+    result = Symbol(name: ctx.symIdOf(fullName), kind: skExtProc, extName: extName,
+                    libName: "", gotSlot: gotSlot, isForeign: true, moduleName: modname)
+    ctx.rootScope.define(result)
+    ctx.extProcs.add ExtProcInfo(name: fullName, extName: extName, libOrdinal: libOrdinal,
+                                 gotSlot: gotSlot, stubOffset: -1)
   of SyprocD:
     # A foreign syscall (arkham emits each used syscall's `(syproc …)` in the module
     # that declares the `importc`; another module that calls it resolves it here).
@@ -2315,6 +2339,37 @@ proc checkForwardJump(ctx: GenContext; label: LabelId; n: Cursor) =
     error("backward jump to an already-defined label is forbidden; " &
           "express the back-edge as a (loop …) instead", n)
 
+proc emitAddOffsetA64(ctx: var GenContext; rd, rn: arm64.Register; offset: int64;
+                      scratch: arm64.Register) =
+  ## `rd = rn + offset`, synthesizing through `scratch` (a reserved assembler
+  ## register, X16/X17) when the offset exceeds ADD's 12-bit immediate field.
+  ## The old `uint16(offset)` call sites silently MIS-ENCODED 4096..65535 (the
+  ## immediate overflowed into the shift/opcode bits).
+  if offset >= 0 and offset <= 4095:
+    arm64.emitAddImm(ctx.buf.data, rd, rn, uint16(offset))
+  else:
+    arm64.emitMovImm64(ctx.buf.data, scratch, cast[uint64](offset))
+    if rn == arm64.SP:
+      arm64.emitAddExtended(ctx.buf.data, rd, rn, scratch)
+    else:
+      arm64.emitAdd(ctx.buf.data, rd, rn, scratch)
+
+proc a64CondOf(inst: A64Inst): arm64.Condition =
+  ## The condition code baked into a `csel*`/`cset*` mnemonic (same condition
+  ## vocabulary as the `b*` branches).
+  case inst
+  of CseleqA64, CseteqA64: arm64.CondEQ
+  of CselneA64, CsetneA64: arm64.CondNE
+  of CselltA64, CsetltA64: arm64.CondLT
+  of CselleA64, CsetleA64: arm64.CondLE
+  of CselgtA64, CsetgtA64: arm64.CondGT
+  of CselgeA64, CsetgeA64: arm64.CondGE
+  of CselloA64, CsetloA64: arm64.CondLO
+  of CsellsA64, CsetlsA64: arm64.CondLS
+  of CselhiA64, CsethiA64: arm64.CondHI
+  of CselhsA64, CsethsA64: arm64.CondHS
+  else: raiseAssert("not a conditional-select mnemonic: " & $inst)
+
 proc genInstA64(n: var Cursor; ctx: var GenContext) =
   if n.kind != TagLit: error("Expected instruction", n)
   let instTag = tagToA64Inst(n.tag)
@@ -2461,7 +2516,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       elif dest.mem.hasIndex:
         var base = dest.mem.base
         if dest.mem.offset != 0:
-          arm64.emitAddImm(ctx.buf.data, arm64.X16, base, uint16(dest.mem.offset))
+          emitAddOffsetA64(ctx, arm64.X16, base, dest.mem.offset, arm64.X16)
           base = arm64.X16
         let (size, opc) = memWidthOpc(dest.typ, isLoad = false)
         arm64.emitLoadStoreReg(ctx.buf.data, op.reg, base, dest.mem.index, size, opc, dest.mem.shift)
@@ -2482,7 +2537,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       elif op.kind == okMem and op.mem.hasIndex:
         var base = op.mem.base
         if op.mem.offset != 0:
-          arm64.emitAddImm(ctx.buf.data, arm64.X16, base, uint16(op.mem.offset))
+          emitAddOffsetA64(ctx, arm64.X16, base, op.mem.offset, arm64.X16)
           base = arm64.X16
         let (size, opc) = memWidthOpc(op.typ, isLoad = true)
         arm64.emitLoadStoreReg(ctx.buf.data, dest.reg, base, op.mem.index, size, opc, op.mem.shift)
@@ -2515,9 +2570,9 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       else:
         arm64.emitAddShifted(ctx.buf.data, dest.reg, op.mem.base, op.mem.index, uint8(op.mem.shift))
       if op.mem.offset != 0:
-        arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.mem.offset))
+        emitAddOffsetA64(ctx, dest.reg, dest.reg, op.mem.offset, arm64.X17)
     else:
-      arm64.emitAddImm(ctx.buf.data, dest.reg, op.mem.base, uint16(op.mem.offset))
+      emitAddOffsetA64(ctx, dest.reg, op.mem.base, op.mem.offset, arm64.X17)
 
   of AdrA64:
     inc n
@@ -2566,10 +2621,15 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
         arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, 0'u16)
         ctx.ssizePatches.add(ctx.buf.data.len - 4)
       elif op.kind == okImm or op.kind == okCsize:
-        if op.immVal >= 0 and op.immVal <= 0xFFFF:
+        if op.immVal >= 0 and op.immVal <= 4095:
           arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.immVal))
         else:
-          error("Immediate value too large for ADD (must fit in 16 bits)", n)
+          # ADD's immediate field is 12 bits; a larger (or negative) constant is
+          # synthesized through the reserved assembler scratch X17. (The former
+          # `<= 0xFFFF` gate silently mis-encoded 4096..65535: the immediate
+          # overflowed into the shift/opcode bits.)
+          arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](op.immVal))
+          arm64.emitAdd(ctx.buf.data, dest.reg, dest.reg, arm64.X17)
       elif op.kind == okMem:
         error("ADD from memory not supported yet", n)
       else:
@@ -2589,10 +2649,13 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
         arm64.emitSubImm(ctx.buf.data, dest.reg, dest.reg, 0'u16)
         ctx.ssizePatches.add(ctx.buf.data.len - 4)
       elif op.kind == okImm or op.kind == okCsize:
-        if op.immVal >= 0 and op.immVal <= 0xFFFF:
+        if op.immVal >= 0 and op.immVal <= 4095:
           arm64.emitSubImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.immVal))
         else:
-          error("Immediate value too large for SUB (must fit in 16 bits)", n)
+          # SUB's immediate field is 12 bits — synthesize larger/negative constants
+          # through X17 (see the ADD case above for the mis-encode this closes).
+          arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](op.immVal))
+          arm64.emitSub(ctx.buf.data, dest.reg, dest.reg, arm64.X17)
       elif op.kind == okMem:
         error("SUB from memory not supported yet", n)
       else:
@@ -2608,6 +2671,21 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     if op.kind == okImm: error("MUL immediate not supported", n)
     if op.kind == okMem: error("MUL memory not supported yet", n)
     arm64.emitMul(ctx.buf.data, dest.reg, dest.reg, op.reg)
+
+  of SmulhA64, UmulhA64:
+    inc n
+    let dest = parseDestA64(n, ctx)
+    let op = parseOperandA64(n, ctx)
+    let mn = if instTag == SmulhA64: "smulh" else: "umulh"
+    checkIntegerType(dest.typ, mn, start)
+    checkIntegerType(op.typ, mn, start)
+    if dest.kind == okMem: error(mn & " destination cannot be memory", n)
+    if op.kind == okImm: error(mn & " immediate not supported", n)
+    if op.kind == okMem: error(mn & " memory not supported yet", n)
+    if instTag == SmulhA64:
+      arm64.emitSmulh(ctx.buf.data, dest.reg, dest.reg, op.reg)
+    else:
+      arm64.emitUmulh(ctx.buf.data, dest.reg, dest.reg, op.reg)
 
   of SdivA64:
     inc n
@@ -2735,14 +2813,47 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       error("CMP memory not supported yet", n)
     else:
       if op.kind == okImm:
-        if op.immVal >= 0 and op.immVal <= 0xFFFF:
+        if op.immVal >= 0 and op.immVal <= 4095:
           arm64.emitCmpImm(ctx.buf.data, dest.reg, uint16(op.immVal))
         else:
-          error("Immediate value too large for CMP (must fit in 16 bits)", n)
+          # CMP's immediate field is 12 bits — synthesize larger/negative constants
+          # through the reserved scratch X17. (The former `<= 0xFFFF` gate silently
+          # MIS-ENCODED 4096..65535: the immediate overflowed into the opcode bits.)
+          arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](op.immVal))
+          arm64.emitCmp(ctx.buf.data, dest.reg, arm64.X17)
       elif op.kind == okMem:
         error("CMP memory not supported yet", n)
       else:
         arm64.emitCmp(ctx.buf.data, dest.reg, op.reg)
+
+  of CseleqA64, CselneA64, CselltA64, CselleA64, CselgtA64, CselgeA64,
+     CselloA64, CsellsA64, CselhiA64, CselhsA64:
+    # (csel<cc> D S1 S2): D = S1 if <cc> else S2, reading the NZCV flags of the
+    # preceding `cmp` — the flag-consuming select that turns a min/max/abs branch
+    # diamond into straight-line code. Register-only: CSEL has no immediate or
+    # memory form, so constants must be materialized into a register first.
+    inc n
+    let dest = parseDestA64(n, ctx)
+    let s1 = parseOperandA64(n, ctx)
+    let s2 = parseOperandA64(n, ctx)
+    if dest.kind != okReg: error("CSEL destination must be a register", n)
+    for src in [s1, s2]:
+      if src.kind != okReg: error("CSEL sources must be registers", n)
+      # Both sources must fit the destination's type: the `mov` rule, applied twice.
+      if dest.typ != nil and src.typ != nil and not movCompatible(dest.typ, src.typ):
+        typeError(dest.typ, src.typ, start)
+    arm64.emitCsel(ctx.buf.data, dest.reg, s1.reg, s2.reg, a64CondOf(instTag))
+
+  of CseteqA64, CsetneA64, CsetltA64, CsetleA64, CsetgtA64, CsetgeA64,
+     CsetloA64, CsetlsA64, CsethiA64, CsethsA64:
+    # (cset<cc> D): D = 1 if <cc> else 0 — materializes the NZCV flags of the
+    # preceding `cmp` as a bool value (alias of CSINC D, XZR, XZR, inv(<cc>)).
+    inc n
+    let dest = parseDestA64(n, ctx)
+    if dest.kind != okReg: error("CSET destination must be a register", n)
+    if dest.typ != nil and dest.typ.kind notin {IntT, UIntT, BoolT, IntLitT}:
+      error("CSET requires an integer or bool destination", n)
+    arm64.emitCset(ctx.buf.data, dest.reg, a64CondOf(instTag))
 
   of RetA64:
     inc n
@@ -3112,6 +3223,13 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
       error("Expected symbol definition", n)
     let name = symName(n)
     ctx.procName = name
+
+    # Proc code must start 4-aligned: a lazily emitted rodata blob (arbitrary byte
+    # length, e.g. a 2-byte string constant) may immediately precede this proc in
+    # the text stream, and AArch64 instructions are fixed 4-byte words — a
+    # misaligned body desynchronizes the whole following instruction stream.
+    if ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64}:
+      while (ctx.buf.data.len and 3) != 0: ctx.buf.data.add 0'u8
 
     # Find/Create label for proc
     let sym = oldScope.lookup(getSymId(n))
@@ -6398,7 +6516,7 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
   of skProc:
     if declTag == ProcD:
       when defined(arkhamDbgSym):
-        stderr.writeLine "DBG generateSymbol proc: " & sym.name
+        stderr.writeLine "DBG generateSymbol proc: " & ctx.nameOf(sym.name)
       pass2Proc(n, ctx)
   of skRodata:
     if declTag == RodataD:

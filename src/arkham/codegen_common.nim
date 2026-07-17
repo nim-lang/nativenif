@@ -22,6 +22,12 @@ export typenav   # SymCat / SymInfo / getType / exprSlot moved here; re-export s
                  # the backends' `g.lookupSym(...).cat` etc. keep resolving
 
 type
+  OvfMode* = enum
+    OvfNone,                                  ## no pending keepovf predicate
+    OvfSign,                                  ## overflow iff `ovfReg` is negative (signed add/sub)
+    OvfCmpLo,                                 ## overflow iff `ovfReg <u ovfReg2` (unsigned carry/borrow)
+    OvfNeqZero                                ## overflow iff `ovfReg != 0` (a64 mul: smulh/umulh high half)
+
   CodeGen* = object
     ab*: AsmBuf
     ra*: RegAlloc
@@ -194,6 +200,13 @@ type
                                              ## the `(ovf)` test that immediately follows it picks
                                              ## the right hardware-flag branch (`jo`/`jno` for a
                                              ## signed op, `jb`/`jae` = CF for an unsigned op)
+    ovfMode*: OvfMode                         ## a64: how the pending `(ovf)` test reads the
+                                             ## overflow predicate (no flag-setting arithmetic in
+                                             ## the nifasm a64 vocabulary — see genStmt2 KeepovfS)
+    ovfReg*: Reg                              ## a64 OvfSign: the register holding the sign-bit
+                                             ## predicate; OvfCmpLo: the cmp's LHS
+    ovfReg2*: Reg                             ## a64 OvfCmpLo: the cmp's RHS
+    ovfBridges*: seq[Reg]                     ## a64: staging bridges the `(ovf)` test releases
 
 # ── type predicates ─────────────────────────────────────────────────────────
 
@@ -642,3 +655,106 @@ proc callerSaveSetAt*(g: var CodeGen): seq[tuple[reg: Reg, name: string]] =
 
 proc callerSaveSlotName*(pos: int; reg: Reg): string {.inline.} =
   "csave." & $pos & "." & $ord(reg) & ".0"
+
+# ── select-diamond recognition (shared by a64 `csel` & x64 `cmov`) ────────────
+
+type
+  SelectDiamond* = object
+    ## A recognised `(if (elif COND (asgn DST A)) (else (asgn DST B)))` where COND is
+    ## an integer relation, DST a register-homed scalar, and A/B are side-effect-free
+    ## simple values — lowered branchlessly (a64 `csel`, x64 `cmov`).
+    ek*: LengExpr                 # relation kind: EqC / NeqC / LtC / LeC
+    a*, b*: Cursor                # relation operands
+    dst*: Location                # the shared register-homed destination
+    thenAsgn*, elseAsgn*: Cursor  # the two `(asgn …)` nodes (for their positions)
+    thenRhs*, elseRhs*: Cursor    # the assigned values (A, B)
+
+proc simpleSelectValue(g: var CodeGen; rhs: Cursor): bool =
+  ## A side-effect-free scalar RHS that materialises with plain `mov`/`ldr`/`lea`
+  ## only — never touching the condition flags, so it may sit between the compare and
+  ## the `csel`/`cmov`: an integer immediate, or a register-/stack-homed local.
+  case rhs.kind
+  of IntLit, UIntLit, CharLit: true
+  of Symbol: g.ra.locationOfSym(symName(rhs)).kind in {InReg, NamedStack}
+  else: false
+
+proc selectAsgnDstRhs(asgn: Cursor; dstName: var string; rhs: var Cursor): bool =
+  ## `(asgn DST RHS)` with a symbol DST → its name and the RHS cursor. False for a
+  ## complex (memory) lvalue. `sub` reads the children without a leave obligation.
+  var a = sub(asgn)
+  if a.kind != Symbol: return false
+  dstName = symName(a); skip a
+  if not a.hasMore: return false
+  rhs = a
+  return true
+
+proc singleAsgnOf(stmt: Cursor; asgn: var Cursor): bool =
+  ## The lone `(asgn …)` a select-diamond arm carries: the statement itself, or the
+  ## single child of its `(stmts …)` wrapper. False for anything else (zero/multiple
+  ## statements, a non-assignment) — those keep the branch lowering.
+  if stmt.stmtKind == AsgnS:
+    asgn = stmt; return true
+  if stmt.stmtKind == StmtsS:
+    var s = sub(stmt)
+    if not s.hasMore or s.stmtKind != AsgnS: return false
+    asgn = s; skip s
+    if s.hasMore: return false          # more than one statement in the arm
+    return true
+  return false
+
+proc matchSelectDiamond*(g: var CodeGen; c: Cursor; sd: var SelectDiamond): bool =
+  ## Recognise `(if (elif COND (asgn DST A)) (else (asgn DST B)))` — exactly one
+  ## elif and one else, each arm a single assignment to the SAME register-homed
+  ## scalar DST from a side-effect-free simple value, with COND a plain integer
+  ## relation (eq/ne/lt/le). Fills `sd` and returns true; false (→ the caller's
+  ## branch lowering) for anything that does not fit. Arch-independent: the a64
+  ## backend lowers a match to `csel`, the x64 backend to `cmov`.
+  var condC, thenAsgn, elseAsgn: Cursor
+  var haveElif, haveElse = false
+  var ok = true
+  var cc = c
+  cc.into:
+    while cc.hasMore:
+      case cc.substructureKind
+      of ElifU:
+        if haveElif or haveElse: ok = false
+        var bc = sub(cc)                       # (elif COND ARM) — read only
+        condC = bc; skip bc
+        if not bc.hasMore: ok = false
+        else:
+          thenAsgn = bc; skip bc
+          if bc.hasMore: ok = false            # more than one statement in the arm
+        haveElif = true
+      of ElseU:
+        if not haveElif or haveElse: ok = false
+        var bc = sub(cc)                       # (else ARM)
+        if not bc.hasMore: ok = false
+        else:
+          elseAsgn = bc; skip bc
+          if bc.hasMore: ok = false
+        haveElse = true
+      else: ok = false
+      skip cc
+  if not (ok and haveElif and haveElse): return false
+  var thenBody, elseBody: Cursor
+  if not singleAsgnOf(thenAsgn, thenBody): return false
+  if not singleAsgnOf(elseAsgn, elseBody): return false
+  if condC.kind != TagLit or condC.exprKind notin {EqC, NeqC, LtC, LeC}: return false
+  var aC, bC: Cursor
+  block:
+    var pc = sub(condC)
+    aC = pc; skip pc
+    bC = pc
+  if g.isFloatExpr(aC): return false
+  var thenDst, elseDst: string
+  var thenRhs, elseRhs: Cursor
+  if not selectAsgnDstRhs(thenBody, thenDst, thenRhs): return false
+  if not selectAsgnDstRhs(elseBody, elseDst, elseRhs): return false
+  if thenDst != elseDst: return false
+  let dst = g.ra.locationOfSym(thenDst)
+  if dst.kind != InReg: return false
+  if not g.simpleSelectValue(thenRhs) or not g.simpleSelectValue(elseRhs): return false
+  sd = SelectDiamond(ek: condC.exprKind, a: aC, b: bC, dst: dst,
+                     thenAsgn: thenBody, elseAsgn: elseBody,
+                     thenRhs: thenRhs, elseRhs: elseRhs)
+  return true

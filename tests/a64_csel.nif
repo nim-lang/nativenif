@@ -1,0 +1,45 @@
+(.nif27)
+(.indexat 555              )
+(stmts
+ (arch arm64)
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (var :a.0
+    (x9)
+    (i 64))
+   (var :b.0
+    (x10)
+    (i 64))
+   (var :mn.0
+    (x11)
+    (i 64))
+   (var :mx.0
+    (x12)
+    (i 64))
+   (var :t.0
+    (x13)
+    (i 64))
+   (mov a.0 5)
+   (mov b.0 9)
+   (cmp a.0 b.0)
+   (csellt mn.0 a.0 b.0)
+   (cselgt mx.0 a.0 b.0)
+   (csetlt t.0)
+   (add mn.0 mx.0)
+   (add mn.0 t.0)
+   (cmp b.0 a.0)
+   (cselhi t.0 b.0 a.0)
+   (add mn.0 t.0)
+   (csetlo t.0)
+   (add mn.0 t.0)
+   (cseths t.0)
+   (add mn.0 t.0)
+   (sub mn.0 25)
+   (mov
+    (x16)33554433)
+   (mov
+    (x0)mn.0)
+   (svc 0))))(.index)

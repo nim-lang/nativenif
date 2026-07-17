@@ -1,0 +1,62 @@
+(.nif27)
+(.indexat 1)
+(stmts
+ (type :Pair.0 .
+  (object .
+   (fld :a.0 .
+    (i 64))
+   (fld :b.0 .
+    (i 64))))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :consume.0
+  (params
+   (param :p0.0 .
+    (i 64))
+   (param :p1.0 .
+    (i 64))
+   (param :p2.0 .
+    (i 64))
+   (param :p3.0 .
+    (i 64))
+   (param :p4.0 .
+    (i 64))
+   (param :p5.0 .
+    (i 64))
+   (param :p6.0 .
+    (i 64))
+   (param :p7.0 .
+    (i 64))
+   (param :o.0 . Pair.0))
+  (i 64)
+  (pragmas)
+  (stmts
+   (ret
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (add
+       (i 64)
+       p0.0
+       p7.0)
+      (dot o.0 a.0 0))
+     (dot o.0 b.0 0)))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :r.0 .
+    (i 64)
+    (call consume.0 2 99 99 99 99 99 99 4
+     (oconstr Pair.0
+      (kv a.0 10)
+      (kv b.0 26))))
+   (call exit.c r.0))))(.index)

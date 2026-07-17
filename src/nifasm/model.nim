@@ -184,6 +184,8 @@ type
     MulA64 = (ord(MulTagId), "mul")  ## unsigned multiply
     SdivA64 = (ord(SdivTagId), "sdiv")  ## signed divide
     UdivA64 = (ord(UdivTagId), "udiv")  ## unsigned divide
+    SmulhA64 = (ord(SmulhTagId), "smulh")  ## signed multiply high (top 64 bits of D*S)
+    UmulhA64 = (ord(UmulhTagId), "umulh")  ## unsigned multiply high (top 64 bits of D*S)
     AndA64 = (ord(AndTagId), "and")  ## bitwise and
     OrrA64 = (ord(OrrTagId), "orr")  ## bitwise or
     EorA64 = (ord(EorTagId), "eor")  ## bitwise xor
@@ -214,6 +216,26 @@ type
     BlsA64 = (ord(BlsTagId), "bls")  ## branch if lower or same (unsigned <=)
     BhiA64 = (ord(BhiTagId), "bhi")  ## branch if higher (unsigned >)
     BhsA64 = (ord(BhsTagId), "bhs")  ## branch if higher or same (unsigned >=)
+    CseleqA64 = (ord(CseleqTagId), "cseleq")  ## conditional select: D = if equal then S1 else S2
+    CselneA64 = (ord(CselneTagId), "cselne")  ## conditional select: D = if not equal then S1 else S2
+    CselltA64 = (ord(CselltTagId), "csellt")  ## conditional select: D = if less than (signed) then S1 else S2
+    CselleA64 = (ord(CselleTagId), "cselle")  ## conditional select: D = if less or equal (signed) then S1 else S2
+    CselgtA64 = (ord(CselgtTagId), "cselgt")  ## conditional select: D = if greater than (signed) then S1 else S2
+    CselgeA64 = (ord(CselgeTagId), "cselge")  ## conditional select: D = if greater or equal (signed) then S1 else S2
+    CselloA64 = (ord(CselloTagId), "csello")  ## conditional select: D = if lower (unsigned <) then S1 else S2
+    CsellsA64 = (ord(CsellsTagId), "csells")  ## conditional select: D = if lower or same (unsigned <=) then S1 else S2
+    CselhiA64 = (ord(CselhiTagId), "cselhi")  ## conditional select: D = if higher (unsigned >) then S1 else S2
+    CselhsA64 = (ord(CselhsTagId), "cselhs")  ## conditional select: D = if higher or same (unsigned >=) then S1 else S2
+    CseteqA64 = (ord(CseteqTagId), "cseteq")  ## conditional set: D = if equal then 1 else 0
+    CsetneA64 = (ord(CsetneTagId), "csetne")  ## conditional set: D = if not equal then 1 else 0
+    CsetltA64 = (ord(CsetltTagId), "csetlt")  ## conditional set: D = if less than (signed) then 1 else 0
+    CsetleA64 = (ord(CsetleTagId), "csetle")  ## conditional set: D = if less or equal (signed) then 1 else 0
+    CsetgtA64 = (ord(CsetgtTagId), "csetgt")  ## conditional set: D = if greater than (signed) then 1 else 0
+    CsetgeA64 = (ord(CsetgeTagId), "csetge")  ## conditional set: D = if greater or equal (signed) then 1 else 0
+    CsetloA64 = (ord(CsetloTagId), "csetlo")  ## conditional set: D = if lower (unsigned <) then 1 else 0
+    CsetlsA64 = (ord(CsetlsTagId), "csetls")  ## conditional set: D = if lower or same (unsigned <=) then 1 else 0
+    CsethiA64 = (ord(CsethiTagId), "csethi")  ## conditional set: D = if higher (unsigned >) then 1 else 0
+    CsethsA64 = (ord(CsethsTagId), "cseths")  ## conditional set: D = if higher or same (unsigned >=) then 1 else 0
     LabA64 = (ord(LabTagId), "lab")  ## label definition
     IteA64 = (ord(IteTagId), "ite")  ## if-then-else structure
     LoopA64 = (ord(LoopTagId), "loop")  ## loop structure
@@ -249,7 +271,7 @@ type
     ScopeA64 = (ord(ScopeTagId), "scope")  ## statement block with a reclaimable stack-slot arena: `(s)` locals declared inside are freed at scope end so sibling scopes reuse the frame bytes
 
 proc rawTagIsA64Inst*(raw: TagEnum): bool {.inline.} =
-  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, SvcTagId, AdrTagId, LdrTagId, StrTagId, StpTagId, LdpTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, LdaxrTagId, StlxrTagId, LdarTagId, StlrTagId, DmbTagId, ClrexTagId, FmovTagId, FaddTagId, FsubTagId, FmulTagId, FdivTagId, FnegTagId, FcmpTagId, FldrTagId, FstrTagId, ScvtfTagId, UcvtfTagId, FcvtzsTagId, FcvtzuTagId, FcvtTagId, FstpTagId, FldpTagId, LdrbTagId, StrbTagId, RebindTagId, WithregTagId, ScopeTagId}
+  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, SmulhTagId, UmulhTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, SvcTagId, AdrTagId, LdrTagId, StrTagId, StpTagId, LdpTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, CseleqTagId, CselneTagId, CselltTagId, CselleTagId, CselgtTagId, CselgeTagId, CselloTagId, CsellsTagId, CselhiTagId, CselhsTagId, CseteqTagId, CsetneTagId, CsetltTagId, CsetleTagId, CsetgtTagId, CsetgeTagId, CsetloTagId, CsetlsTagId, CsethiTagId, CsethsTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, LdaxrTagId, StlxrTagId, LdarTagId, StlrTagId, DmbTagId, ClrexTagId, FmovTagId, FaddTagId, FsubTagId, FmulTagId, FdivTagId, FnegTagId, FcmpTagId, FldrTagId, FstrTagId, ScvtfTagId, UcvtfTagId, FcvtzsTagId, FcvtzuTagId, FcvtTagId, FstpTagId, FldpTagId, LdrbTagId, StrbTagId, RebindTagId, WithregTagId, ScopeTagId}
 
 type
   NifasmType* = enum

@@ -467,7 +467,12 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
             result.syscalls.add SyscallProc(asmName: asmN, decl: procStart,
                                             sysNr: x64Nr, sysNrA64: a64Nr)
         elif importcN.len > 0:
-          let asmN = importcN & ".0"
+          # Name the extproc as a proper SELF-MODULE symbol `<name>.c.<thisModule>`
+          # (mirroring the `.sys.` syprocs above): a basename-only `write.0` has one
+          # dot, so the render would treat it as module-LOCAL and leave it out of the
+          # `.index` — unresolvable when this module is a foreign module of a bundle.
+          # The `.c.` disambiguator is reserved (nimony proc disambiguators are numeric).
+          let asmN = importcN & ".c." & thisModuleSuffix(result)
           result.externOrder.add Extern(asmName: asmN, extName: "_" & importcN)
           result.callTarget[pname] = CallTarget(asmName: asmN, extern: true,
                                                 retFloat: retFloat, retType: retType, sigType: sigType)
@@ -609,9 +614,10 @@ proc foreignCallTarget*(p: var Program; name: string): CallTarget =
   elif importcN.len > 0:
     # A genuine libc extern (the foreign module records it in its own externOrder
     # + needsLibSystem; here we only need the matching call target). The asm name
-    # is the bare `<importc>.0` the foreign module's extern decl uses.
+    # is the module-qualified `<importc>.c.<that module>` the foreign module's
+    # extern decl uses (see the externOrder naming in `collect`).
     p.needsLibSystem = true
-    result = CallTarget(asmName: importcN & ".0", extern: true, retFloat: retFloat,
+    result = CallTarget(asmName: importcN & ".c." & s.module, extern: true, retFloat: retFloat,
                         retType: retType, sigType: sigType)
   else:
     result = CallTarget(asmName: name, extern: false, retFloat: retFloat,

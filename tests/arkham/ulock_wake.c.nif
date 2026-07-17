@@ -1,0 +1,40 @@
+(.nif27)
+(stmts
+ (proc :ulock.c
+  (params
+   (param :operation.0 .
+    (i 64))
+   (param :ad.0 .
+    (ptr
+     (u 32)))
+   (param :wakeValue.0 .
+    (i 64)))
+  (i 32)
+  (pragmas
+   (importc "__ulock_wake"))
+  (stmts .))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0.
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :w.0 .
+    (u 32)0)
+   (var :r.0 .
+    (i 32)
+    (call ulock.c
+     16777217 (addr w.0) 0))
+   (call exit.c
+    (add
+     (i 32)42
+     (cast
+      (i 32)r.0)))
+   (ret 0))))

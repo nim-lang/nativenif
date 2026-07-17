@@ -40,9 +40,6 @@ const arkhamDarwinUnsupported: seq[string] =
     # MAP_ANONYMOUS == 0x20 on Linux). On macOS MAP_ANON == 0x1000, so 34 is
     # MAP_PRIVATE plus an unsupported bit and mmap returns MAP_FAILED.
     "mmap_anon",
-    # macOS's native arch is arm64, which has no `keepovf`/`(ovf)` codegen yet
-    # (overflow checking is x86-only for now — see arkhamLinuxA64Unsupported).
-    "overflow_check",
     # `futex` is a Linux syscall lowered to a raw kernel trap (svc/syscall); macOS has
     # no `futex` symbol, so it's Linux-only here. The Darwin equivalent is exercised by
     # `ulock_wake` (just as `std/private/syslocks` selects `futex` vs `__ulock_wake`
@@ -123,10 +120,11 @@ proc arkhamTests() =
 # function-pointer calls, `(pat …)` pointer indexing, and thread-locals. List a
 # test's stem here if a new arm64-only TODO is introduced.
 const arkhamLinuxA64Unsupported: seq[string] = @[
-  # Overflow checking (`keepovf`/`(ovf)`) is x86-only for now: it lowers to a branch on
-  # the hardware overflow flag (`jo`/`jb`), and the a64 backend has no `keepovf`/`(ovf)`
-  # codegen yet (it would need flag-setting `adds`/`subs` + a `cset`/`b.vs` capture).
-  "overflow_check",
+  # (`keepovf`/`(ovf)` overflow checking now has a64 codegen too: the predicate is
+  # computed into a staging bridge — xor/and sign trick for signed add/sub, unsigned
+  # compare for carry/borrow, div-based check for mul — since the nifasm vocabulary
+  # has no flag-setting `adds`/`subs`. See codegen_a64's KeepovfS.)
+  #
   # The a64 backend otherwise reaches x86-64 parity on every arkham test, including
   # the value-core aggregate paths: object/array constructors as a var-init, a call
   # argument, or into a complex lvalue, plus NESTED aggregate fields. The last
@@ -202,6 +200,10 @@ when defined(macosx):
   exec "tests/call_a64_reg_args"
   exec "nim c -r src/nifasm/nifasm tests/call_a64_stack_args.nif"
   exec "tests/call_a64_stack_args"
+  # AArch64 conditional select/set (csel*/cset*): branch-free min/max and bool
+  # materialization from the NZCV flags. Exits 0 only if every result is correct.
+  exec "nim c -r src/nifasm/nifasm tests/a64_csel.nif"
+  exec "tests/a64_csel"
 elif defined(windows):
   exec "nim c -r src/nifasm/nifasm tests/hello_win64.nif"
   exec "./tests/hello_win64.exe"

@@ -34,6 +34,19 @@ const
   XZR* = 31  # Zero register (when used in certain contexts)
 
 type
+  # ARM64 condition codes (the `cond` field of B.cond/CSEL/CSINC/...)
+  Condition* = enum
+    CondEQ = 0, CondNE = 1, CondHS = 2, CondLO = 3,
+    CondMI = 4, CondPL = 5, CondVS = 6, CondVC = 7,
+    CondHI = 8, CondLS = 9, CondGE = 10, CondLT = 11,
+    CondGT = 12, CondLE = 13, CondAL = 14
+
+proc invert*(c: Condition): Condition =
+  ## The complementary condition (EQ<->NE, LT<->GE, ...). AL has no inverse.
+  assert c != CondAL
+  Condition(ord(c) xor 1)
+
+type
   # Memory operand for load/store instructions
   MemoryOperand* = object
     base*: Register
@@ -168,6 +181,25 @@ proc emitMul*(dest: var Bytes; rd, rn, rm: Register) =
   ## Emit MUL instruction: MUL rd, rn, rm (alias for MADD rd, rn, rm, XZR)
   # MADD Xd, Xn, Xm, XZR: 1001 1011 000m mmmm 0111 11nn nnnd dddd
   let instr = 0x9B007C00'u32 or
+              (encodeReg(rm) shl 16) or
+              (encodeReg(rn) shl 5) or
+              encodeReg(rd)
+  dest.addUint32(instr)
+
+# SMULH / UMULH — 64×64→high-64 multiply (top half of the 128-bit product).
+# Same 3-source data-processing family as MADD/MUL, with op31 = 010 (signed) /
+# 110 (unsigned) and Ra = XZR.
+proc emitSmulh*(dest: var Bytes; rd, rn, rm: Register) =
+  ## SMULH rd, rn, rm: 1001 1011 010m mmmm 0111 11nn nnnd dddd
+  let instr = 0x9B407C00'u32 or
+              (encodeReg(rm) shl 16) or
+              (encodeReg(rn) shl 5) or
+              encodeReg(rd)
+  dest.addUint32(instr)
+
+proc emitUmulh*(dest: var Bytes; rd, rn, rm: Register) =
+  ## UMULH rd, rn, rm: 1001 1011 110m mmmm 0111 11nn nnnd dddd
+  let instr = 0x9BC07C00'u32 or
               (encodeReg(rm) shl 16) or
               (encodeReg(rn) shl 5) or
               encodeReg(rd)
@@ -344,13 +376,26 @@ proc emitLoadStoreUImm*(dest: var Bytes; rt, rn: Register; offset: int32;
   ## Sized load/store, unsigned-offset form `[rn, #offset]`. `size`: 0=byte,
   ## 1=half, 2=word, 3=dword. `opc`: 0=store, 1=load(zero-ext), 2=load(sign-ext
   ## to 64), 3=load(sign-ext to 32). The immediate is scaled by the access size.
+  ## An offset the scaled-uimm12 form cannot encode (too large for the 12-bit
+  ## field, unaligned, or negative — e.g. a field deep inside a large object)
+  ## synthesizes the address into the reserved assembler scratch X17 first:
+  ## X17 (IP1) is never register-allocated by arkham, and its veneer use at call
+  ## sites cannot be live inside a single load/store lowering.
   let unit = 1'i32 shl size
-  if (offset mod unit) != 0 or offset < 0 or (offset div unit) > 4095:
-    raise newException(ValueError, "load/store offset out of range/alignment")
-  let sc = uint32(offset div unit)
-  let instr = 0x39000000'u32 or (uint32(size) shl 30) or (uint32(opc) shl 22) or
-              (sc shl 10) or (encodeReg(rn) shl 5) or encodeReg(rt)
-  dest.addUint32(instr)
+  if (offset mod unit) == 0 and offset >= 0 and (offset div unit) <= 4095:
+    let sc = uint32(offset div unit)
+    let instr = 0x39000000'u32 or (uint32(size) shl 30) or (uint32(opc) shl 22) or
+                (sc shl 10) or (encodeReg(rn) shl 5) or encodeReg(rt)
+    dest.addUint32(instr)
+  else:
+    emitMovImm64(dest, X17, cast[uint64](int64(offset)))
+    if rn == SP:
+      emitAddExtended(dest, X17, rn, X17)
+    else:
+      emitAdd(dest, X17, rn, X17)
+    let instr = 0x39000000'u32 or (uint32(size) shl 30) or (uint32(opc) shl 22) or
+                (encodeReg(X17) shl 5) or encodeReg(rt)
+    dest.addUint32(instr)
 
 proc emitLoadStoreReg*(dest: var Bytes; rt, rn, rm: Register; size, opc, shift: int) =
   ## Sized load/store, register-offset form `[rn, rm, LSL #shift]`. Same size/opc
@@ -453,6 +498,25 @@ proc emitBhs*(dest: var Buffer; target: LabelId) =
   let pos = dest.data.getCurrentPosition()
   dest.data.addUint32(0x54000002'u32)  # condition=0010 (HS/CS)
   dest.addReloc(pos, target, rkBEQ, 4)
+
+proc emitCsel*(dest: var Bytes; rd, rn, rm: Register; cond: Condition) =
+  ## Emit CSEL instruction: CSEL rd, rn, rm, cond (rd = cond ? rn : rm)
+  # CSEL Xd, Xn, Xm, cond: 1001 1010 100m mmmm cccc 00nn nnnd dddd
+  let instr = 0x9A800000'u32 or
+              (encodeReg(rm) shl 16) or
+              (uint32(ord(cond)) shl 12) or
+              (encodeReg(rn) shl 5) or
+              encodeReg(rd)
+  dest.addUint32(instr)
+
+proc emitCset*(dest: var Bytes; rd: Register; cond: Condition) =
+  ## Emit CSET instruction: CSET rd, cond (rd = cond ? 1 : 0)
+  # Alias of CSINC Xd, XZR, XZR, invert(cond):
+  # 1001 1010 100 11111 cccc 01 11111 ddddd
+  let instr = 0x9A9F07E0'u32 or
+              (uint32(ord(invert(cond))) shl 12) or
+              encodeReg(rd)
+  dest.addUint32(instr)
 
 proc emitRet*(dest: var Bytes) =
   ## Emit RET instruction: RET (return, defaults to X30/LR)

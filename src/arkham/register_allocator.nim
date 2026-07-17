@@ -1350,12 +1350,17 @@ proc allocDivModRisc(b: var Builder; n: var Cursor; dest: var Location) =
     allocValue(b, n, lDest)
     allocValue(b, n, rDest)
     while n.hasMore: skip n
-  b.releaseTmp(rDest)
+  # The result register is reserved while the divisor is STILL HELD: the emitter
+  # lowers `div`/`mod` as `dest := dividend; … dest ⟵ op divisor …`, reading the
+  # divisor after `dest` is written, so a result that reuses the divisor's register
+  # clobbers it (and the emitter's divisor unbind would strip the result's binding).
+  # Only the dividend's register may be recycled (`sdiv dest, dest, divisor`).
   case dest.kind
   of Undef, NeedsReg, RegOrImm:
     if lDest.kind == InReg and lDest.isTemp: dest = lDest
     else: dest = b.reserveTmp(ScalarSlot)
   else: discard
+  b.releaseTmp(rDest)
   if not sameReg(dest, lDest): b.releaseTmp(lDest)
   b.ra.locs[pos] = dest
 
@@ -1771,14 +1776,33 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
     var scratch = dontCare
     if hasGlob: scratch = b.reserveHeldScratch("a global address")
     var lc = lhsCur
-    allocLvalue2(b, lc, scratch, isStore = true)         # lhs operands (on a copy)
-    if n.kind == TagLit and n.exprKind == OconstrC:
-      allocConstr(b, n)                                  # build through the lvalue address
-    elif n.kind == TagLit and n.exprKind == AconstrC:
-      allocAconstr(b, n)                                 # build array through the lvalue address
+    if n.kind == TagLit and n.exprKind in {OconstrC, AconstrC}:
+      allocLvalue2(b, lc, scratch, isStore = true)       # lhs operands (on a copy)
+      if n.exprKind == OconstrC:
+        allocConstr(b, n)                                # build through the lvalue address
+      else:
+        allocAconstr(b, n)                               # build array through the lvalue address
+      releaseLvalTemps(b, lhsCur)                        # free the held index/pointer + `(at)` scratch
     else:
-      b.allocSingleUse(n)
-    releaseLvalTemps(b, lhsCur)                          # free the held index/pointer + `(at)` scratch
+      # The emitter computes a scalar/float rhs FIRST and only then materializes the
+      # lhs address (see genStore2's `Mem` branch — the deliberate rhs-before-base
+      # order that keeps `x.f = g(x.f)` correct). So the rhs value is live ACROSS the
+      # lhs's inner loads and `(at)` stride scratches. Mirror that order here: reserve
+      # the rhs temp BEFORE the lhs address values, so an inner-lvalue scratch that is
+      # released with its load at alloc time (and re-bound by `prematLval2` at emit
+      # time, AFTER the rhs) can never reuse the register still holding the rhs.
+      if b.isFloatVal(n):
+        var d = dontCare
+        allocFValue(b, n, d)
+        allocLvalue2(b, lc, scratch, isStore = true)
+        releaseLvalTemps(b, lhsCur)
+        b.releaseFTmp(d)
+      else:
+        var d = needsReg(ScalarSlot)
+        allocValue(b, n, d)
+        allocLvalue2(b, lc, scratch, isStore = true)
+        releaseLvalTemps(b, lhsCur)
+        b.releaseTmp(d)
     if hasGlob:
       b.releaseTmp(scratch)
       b.ra.aux[auxPos] = ExprAux(scratch: @[scratch.r])
@@ -1997,6 +2021,8 @@ proc walk(b: var Builder; n: var Cursor) =
       let kPos = b.posOf(n)
       n.into:
         var opCur = n                          # the (op …) value
+        # (a64 mul-overflow now reads the product's high half via `smulh`/`umulh`,
+        # so it needs no `(s)` snapshot slot — no `hasStackVars` reservation here.)
         skip n                                 # advance to dest
         if n.kind == Symbol:
           let dst = b.symLoc(symName(n)); skip n
@@ -2104,16 +2130,22 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
             else: aggrStack = true                                          # stack-passed (0 GPRs)
           else:
             aggrByRef = true
-        if aggrSmall or aggrStack:
-          # (No early `continue`/`return`: that skips the `into` epilogue.) Both home the
+        if aggrSmall or (aggrStack and b.md.arch == X86):
+          # (No early `continue`/`return`: that skips the `into` epilogue.) These home the
           # aggregate in its own `(s)` slot; only a register-passed one consumes GPRs.
+          # A stack-passed by-value aggregate keeps a slot home ONLY on x86-64, where
+          # `emitStackParamLoadsX64` COPIES the incoming stack bytes into it. On AArch64
+          # a stack-passed by-value aggregate instead gets a POINTER home in a register
+          # (below, like a by-ref aggregate): `emitStackParamLoads` computes `&incoming`
+          # with `Lea` and the body reads fields through it — no copy.
           b.record(pos, name, namedStackLoc(name, slot))
           b.ra.hasStackVars = true
           if aggrSmall: intIdx += aggrWords
         else:
-          # `effSlot` is the in-register value: the scalar itself, or (by-ref) a
-          # pointer to the aggregate copy.
-          let effSlot = if aggrByRef: AsmSlot(cls: AUInt, size: 8, align: 8) else: slot
+          # `effSlot` is the in-register value: the scalar itself, or a pointer — to
+          # the aggregate copy (by-ref), or to the incoming stack bytes (a64 stack-passed
+          # by-value aggregate, `aggrStack`; on x86-64 those took the slot path above).
+          let effSlot = if aggrByRef or aggrStack: AsmSlot(cls: AUInt, size: 8, align: 8) else: slot
           let props = b.an.vars.getOrDefault(name).props
           var loc: Location
           if effSlot.isFloat:
@@ -2139,7 +2171,10 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
               loc = b.spill(effSlot)             # >8 float args: stack-passed (TODO)
           elif not effSlot.inRegClass:
             loc = b.spill(effSlot)
-          elif intIdx < b.md.intArgRegs.len:
+          elif intIdx < b.md.intArgRegs.len and not aggrStack:
+            # (`aggrStack` is stack-passed by definition — never register-home it,
+            # even if an arg register looks free: AAPCS64 stopped filling registers
+            # once this composite spilled to the stack.)
             let arg = b.md.intArgRegs[intIdx]
             # A leaf param would normally stay in its arg register, but if that
             # register is a fixed-instruction scratch the body clobbers (rdx for
@@ -2223,7 +2258,11 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
             else:
               b.ra.usedCallee.incl r
               loc = regLoc(r, effSlot)
-            inc intIdx
+            # A stack-passed by-value aggregate (`aggrStack`) consumed NO arg register,
+            # so leave `intIdx` where it is — in lockstep with `emitParamMoves` /
+            # `emitStackParamLoads`, which never advance their arg index for a
+            # stack-passed param. (Scalar / by-ref stack params still bump it.)
+            if not aggrStack: inc intIdx
           if loc.kind == OnStack and slot.kind != AMem:
             # An address-taken scalar param (integer or float): a nifasm `(s)`
             # slot the prologue fills from the incoming arg register (int or SIMD;

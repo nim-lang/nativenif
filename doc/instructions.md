@@ -38,6 +38,8 @@
 | `(idiv D S R)`         | X64Inst                  | signed divide |
 | `(sdiv D S)`           | A64Inst                  | signed divide |
 | `(udiv D S)`           | A64Inst                  | unsigned divide |
+| `(smulh D S)`          | A64Inst                  | signed multiply high (top 64 bits of D*S) |
+| `(umulh D S)`          | A64Inst                  | unsigned multiply high (top 64 bits of D*S) |
 | `(addsd D S)`          | X64Inst                  | add scalar double |
 | `(subsd D S)`          | X64Inst                  | subtract scalar double |
 | `(mulsd D S)`          | X64Inst                  | multiply scalar double |
@@ -185,6 +187,26 @@
 | `(bls L)`              | A64Inst                  | branch if lower or same (unsigned <=) |
 | `(bhi L)`              | A64Inst                  | branch if higher (unsigned >) |
 | `(bhs L)`              | A64Inst                  | branch if higher or same (unsigned >=) |
+| `(cseleq D S1 S2)`     | A64Inst                  | conditional select: D = if equal then S1 else S2 |
+| `(cselne D S1 S2)`     | A64Inst                  | conditional select: D = if not equal then S1 else S2 |
+| `(csellt D S1 S2)`     | A64Inst                  | conditional select: D = if less than (signed) then S1 else S2 |
+| `(cselle D S1 S2)`     | A64Inst                  | conditional select: D = if less or equal (signed) then S1 else S2 |
+| `(cselgt D S1 S2)`     | A64Inst                  | conditional select: D = if greater than (signed) then S1 else S2 |
+| `(cselge D S1 S2)`     | A64Inst                  | conditional select: D = if greater or equal (signed) then S1 else S2 |
+| `(csello D S1 S2)`     | A64Inst                  | conditional select: D = if lower (unsigned <) then S1 else S2 |
+| `(csells D S1 S2)`     | A64Inst                  | conditional select: D = if lower or same (unsigned <=) then S1 else S2 |
+| `(cselhi D S1 S2)`     | A64Inst                  | conditional select: D = if higher (unsigned >) then S1 else S2 |
+| `(cselhs D S1 S2)`     | A64Inst                  | conditional select: D = if higher or same (unsigned >=) then S1 else S2 |
+| `(cseteq D)`           | A64Inst                  | conditional set: D = if equal then 1 else 0 |
+| `(csetne D)`           | A64Inst                  | conditional set: D = if not equal then 1 else 0 |
+| `(csetlt D)`           | A64Inst                  | conditional set: D = if less than (signed) then 1 else 0 |
+| `(csetle D)`           | A64Inst                  | conditional set: D = if less or equal (signed) then 1 else 0 |
+| `(csetgt D)`           | A64Inst                  | conditional set: D = if greater than (signed) then 1 else 0 |
+| `(csetge D)`           | A64Inst                  | conditional set: D = if greater or equal (signed) then 1 else 0 |
+| `(csetlo D)`           | A64Inst                  | conditional set: D = if lower (unsigned <) then 1 else 0 |
+| `(csetls D)`           | A64Inst                  | conditional set: D = if lower or same (unsigned <=) then 1 else 0 |
+| `(csethi D)`           | A64Inst                  | conditional set: D = if higher (unsigned >) then 1 else 0 |
+| `(cseths D)`           | A64Inst                  | conditional set: D = if higher or same (unsigned >=) then 1 else 0 |
 | `(lab L)`              | X64Inst, A64Inst         | label definition |
 | `(ite ...)`            | X64Inst, A64Inst         | if-then-else structure |
 | `(loop ...)`           | X64Inst, A64Inst         | loop structure |
