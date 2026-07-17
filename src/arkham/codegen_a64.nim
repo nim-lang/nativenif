@@ -91,6 +91,30 @@ proc binReg(g: var CodeGen; op: A64Inst; d, s: Reg) =
 proc binImm(g: var CodeGen; op: A64Inst; d: Reg; v: int64) =
   g.ab.tree op: g.emReg d; g.ab.intLit v
 
+# 3-operand forms `(op3 D A B)` → `D = A op B` (arm64 native, non-destructive). Used
+# when the left source `A` is a still-live local in a register distinct from the
+# result `D`, so the value is computed without a preceding `mov D, A`. The 2-operand
+# op tag is mapped to its distinct 3-operand tag (`add`→`add3`, …); nifasm dispatches
+# on the tag's fixed arity (see parse3OperandsA64).
+proc threeOpTag(op: A64Inst): A64Inst =
+  case op
+  of AddA64: Add3A64
+  of SubA64: Sub3A64
+  of MulA64: Mul3A64
+  of AndA64: And3A64
+  of OrrA64: Orr3A64
+  of EorA64: Eor3A64
+  of LslA64: Lsl3A64
+  of LsrA64: Lsr3A64
+  of AsrA64: Asr3A64
+  else: op
+
+proc binReg3(g: var CodeGen; op: A64Inst; d, a, b: Reg) =
+  g.ab.tree threeOpTag(op): g.emReg d; g.emReg a; g.emReg b
+
+proc binImm3(g: var CodeGen; op: A64Inst; d, a: Reg; v: int64) =
+  g.ab.tree threeOpTag(op): g.emReg d; g.emReg a; g.ab.intLit v
+
 proc emAdr(g: var CodeGen; d: Reg; sym: string) =
   g.ab.tree AdrA64: g.emReg d; g.ab.sym sym
 
@@ -1764,6 +1788,11 @@ proc foldRhs2(g: var CodeGen; op: A64Inst; dest: Reg; rhsLoc: Location; rhsC: Cu
   of Imm:
     if op in {AddA64, SubA64} and rhsLoc.ival >= 0 and rhsLoc.ival <= 0xFFFF:
       g.binImm(op, dest, rhsLoc.ival)
+    elif op in {LslA64, LsrA64, AsrA64} and rhsLoc.ival >= 0 and rhsLoc.ival <= 63:
+      # arm64 shifts take an immediate count natively (`lsl x, x, #n`), same form
+      # `extendTo` already emits — so a constant shift amount folds in place rather
+      # than being materialized into a bridge register (`mov b, #n; lsl x, b`).
+      g.binImm(op, dest, rhsLoc.ival)
     else:
       let b = g.takeBridge(avoid = dest)
       g.movImm(b, rhsLoc.ival)
@@ -1777,6 +1806,34 @@ proc foldRhs2(g: var CodeGen; op: A64Inst; dest: Reg; rhsLoc: Location; rhsC: Cu
     g.binReg(op, dest, b)
     g.dropBridge b
   else: raiseAssert "arkham a64n: foldRhs2 " & $rhsLoc.kind
+
+const ThreeOpA64 = {AddA64, SubA64, MulA64, AndA64, OrrA64, EorA64,
+                    LslA64, LsrA64, AsrA64}
+  ## Ops with a native 3-operand `(op D A B)` nifasm encoding (see parseArith3A64).
+
+proc foldRhs3(g: var CodeGen; op: A64Inst; dest, rn: Reg; rhsLoc: Location; rhsC: Cursor) =
+  ## `dest = rn op rhs` — the 3-operand twin of `foldRhs2`. `rn` holds the left
+  ## source (a live local's register, distinct from `dest`); nothing is moved into
+  ## `dest` first. Materializes the rhs exactly as `foldRhs2` does.
+  case rhsLoc.kind
+  of Imm:
+    if op in {AddA64, SubA64} and rhsLoc.ival >= 0 and rhsLoc.ival <= 0xFFFF:
+      g.binImm3(op, dest, rn, rhsLoc.ival)
+    elif op in {LslA64, LsrA64, AsrA64} and rhsLoc.ival >= 0 and rhsLoc.ival <= 63:
+      g.binImm3(op, dest, rn, rhsLoc.ival)
+    else:
+      let b = g.takeBridge(avoid = dest)
+      g.movImm(b, rhsLoc.ival)
+      g.binReg3(op, dest, rn, b)
+      g.dropBridge b
+  of InReg:
+    g.binReg3(op, dest, rn, rhsLoc.r)
+  of NamedStack, Mem, Glob, Tvar:
+    let b = g.takeBridge(avoid = dest)
+    g.place2(rhsLoc, b)
+    g.binReg3(op, dest, rn, b)
+    g.dropBridge b
+  else: raiseAssert "arkham a64n: foldRhs3 " & $rhsLoc.kind
 
 proc normalizeBinWidth(g: var CodeGen; resTypeC: Cursor; rD: Reg; op: A64Inst) =
   ## arkham keeps register values canonically sign/zero-extended to their full
@@ -1850,6 +1907,8 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
     g.binReg(op, rD, lhsLoc.r)                            # dest := rhs op lhs
     if op == SubA64:
       g.ab.tree NegA64: g.emReg rD                        # dest := lhs - rhs
+  elif lhsLoc.kind == InReg and lhsLoc.r != rD and op in ThreeOpA64:
+    g.foldRhs3(op, rD, lhsLoc.r, rhsLoc, rhsC)           # dest := lhs op rhs (no `mov dest, lhs`)
   else:
     g.place2(lhsLoc, rD)                                  # dest := lhs
     g.foldRhs2(op, rD, rhsLoc, rhsC)                      # dest op= rhs

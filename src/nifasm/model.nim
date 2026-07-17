@@ -186,6 +186,15 @@ type
     UdivA64 = (ord(UdivTagId), "udiv")  ## unsigned divide
     SmulhA64 = (ord(SmulhTagId), "smulh")  ## signed multiply high (top 64 bits of D*S)
     UmulhA64 = (ord(UmulhTagId), "umulh")  ## unsigned multiply high (top 64 bits of D*S)
+    Add3A64 = (ord(Add3TagId), "add3")  ## 3-operand add (D = A + B)
+    Sub3A64 = (ord(Sub3TagId), "sub3")  ## 3-operand subtract (D = A - B)
+    Mul3A64 = (ord(Mul3TagId), "mul3")  ## 3-operand multiply (D = A * B)
+    And3A64 = (ord(And3TagId), "and3")  ## 3-operand bitwise and (D = A and B)
+    Orr3A64 = (ord(Orr3TagId), "orr3")  ## 3-operand bitwise or (D = A or B)
+    Eor3A64 = (ord(Eor3TagId), "eor3")  ## 3-operand bitwise xor (D = A xor B)
+    Lsl3A64 = (ord(Lsl3TagId), "lsl3")  ## 3-operand logical shift left (D = A shl B)
+    Lsr3A64 = (ord(Lsr3TagId), "lsr3")  ## 3-operand logical shift right (D = A shr B)
+    Asr3A64 = (ord(Asr3TagId), "asr3")  ## 3-operand arithmetic shift right (D = A sar B)
     AndA64 = (ord(AndTagId), "and")  ## bitwise and
     OrrA64 = (ord(OrrTagId), "orr")  ## bitwise or
     EorA64 = (ord(EorTagId), "eor")  ## bitwise xor
@@ -271,7 +280,7 @@ type
     ScopeA64 = (ord(ScopeTagId), "scope")  ## statement block with a reclaimable stack-slot arena: `(s)` locals declared inside are freed at scope end so sibling scopes reuse the frame bytes
 
 proc rawTagIsA64Inst*(raw: TagEnum): bool {.inline.} =
-  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, SmulhTagId, UmulhTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, SvcTagId, AdrTagId, LdrTagId, StrTagId, StpTagId, LdpTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, CseleqTagId, CselneTagId, CselltTagId, CselleTagId, CselgtTagId, CselgeTagId, CselloTagId, CsellsTagId, CselhiTagId, CselhsTagId, CseteqTagId, CsetneTagId, CsetltTagId, CsetleTagId, CsetgtTagId, CsetgeTagId, CsetloTagId, CsetlsTagId, CsethiTagId, CsethsTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, LdaxrTagId, StlxrTagId, LdarTagId, StlrTagId, DmbTagId, ClrexTagId, FmovTagId, FaddTagId, FsubTagId, FmulTagId, FdivTagId, FnegTagId, FcmpTagId, FldrTagId, FstrTagId, ScvtfTagId, UcvtfTagId, FcvtzsTagId, FcvtzuTagId, FcvtTagId, FstpTagId, FldpTagId, LdrbTagId, StrbTagId, RebindTagId, WithregTagId, ScopeTagId}
+  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, SmulhTagId, UmulhTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, SvcTagId, AdrTagId, LdrTagId, StrTagId, StpTagId, LdpTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, CseleqTagId, CselneTagId, CselltTagId, CselleTagId, CselgtTagId, CselgeTagId, CselloTagId, CsellsTagId, CselhiTagId, CselhsTagId, CseteqTagId, CsetneTagId, CsetltTagId, CsetleTagId, CsetgtTagId, CsetgeTagId, CsetloTagId, CsetlsTagId, CsethiTagId, CsethsTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, LdaxrTagId, StlxrTagId, LdarTagId, StlrTagId, DmbTagId, ClrexTagId, FmovTagId, FaddTagId, FsubTagId, FmulTagId, FdivTagId, FnegTagId, FcmpTagId, FldrTagId, FstrTagId, ScvtfTagId, UcvtfTagId, FcvtzsTagId, FcvtzuTagId, FcvtTagId, FstpTagId, FldpTagId, LdrbTagId, StrbTagId, RebindTagId, WithregTagId, ScopeTagId}
 
 type
   NifasmType* = enum

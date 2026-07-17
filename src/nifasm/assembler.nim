@@ -1946,6 +1946,18 @@ proc parseDestA64(n: var Cursor; ctx: var GenContext): OperandA64 =
   else:
     error("Expected destination", n)
 
+proc parse3OperandsA64(n: var Cursor; ctx: var GenContext; opName: string):
+                      tuple[rd, rn: arm64.Register; rm: OperandA64; dstTyp: Type] =
+  ## Parse the operands of a 3-operand instruction `(op3 D A B)` → `D = A op B`.
+  ## `D` and `A` are registers (`A` is a still-live source read without a prior
+  ## `mov D, A`); `B` is the folded operand (register or immediate). Fixed arity, so
+  ## no boundary peeking — the reader consumes exactly three operands.
+  let dest = parseDestA64(n, ctx)
+  if dest.kind == okMem: error(opName & " destination cannot be memory", n)
+  let a = parseOperandA64(n, ctx)
+  if a.kind != okReg: error(opName & " first source must be a register", n)
+  result = (dest.reg, a.reg, parseOperandA64(n, ctx), dest.typ)
+
 proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
   ## Handle (prepare target ... (call) ...) or (prepare target ... (extcall) ...)
   ## The prepare block sets up a call context for type checking and argument tracking.
@@ -2792,6 +2804,96 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
         error("Shift amount must be 0-63", n)
     else:
       arm64.emitAsr(ctx.buf.data, dest.reg, dest.reg, op.reg)
+
+  of Add3A64:
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "add3")
+    checkIntegerArithmetic(dstT, "add", start)
+    checkIntegerArithmetic(rm.typ, "add", start)
+    if rm.kind == okImm or rm.kind == okCsize:
+      if rm.immVal >= 0 and rm.immVal <= 4095:
+        arm64.emitAddImm(ctx.buf.data, rd, rn, uint16(rm.immVal))
+      else:
+        arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](rm.immVal))
+        arm64.emitAdd(ctx.buf.data, rd, rn, arm64.X17)
+    elif rm.kind == okMem: error("add3 from memory not supported", n)
+    else: arm64.emitAdd(ctx.buf.data, rd, rn, rm.reg)
+
+  of Sub3A64:
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "sub3")
+    checkIntegerArithmetic(dstT, "sub", start)
+    checkIntegerArithmetic(rm.typ, "sub", start)
+    if rm.kind == okImm or rm.kind == okCsize:
+      if rm.immVal >= 0 and rm.immVal <= 4095:
+        arm64.emitSubImm(ctx.buf.data, rd, rn, uint16(rm.immVal))
+      else:
+        arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](rm.immVal))
+        arm64.emitSub(ctx.buf.data, rd, rn, arm64.X17)
+    elif rm.kind == okMem: error("sub3 from memory not supported", n)
+    else: arm64.emitSub(ctx.buf.data, rd, rn, rm.reg)
+
+  of Mul3A64:
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "mul3")
+    checkIntegerType(dstT, "mul", start)
+    checkIntegerType(rm.typ, "mul", start)
+    if rm.kind != okReg: error("mul3 second source must be a register", n)
+    arm64.emitMul(ctx.buf.data, rd, rn, rm.reg)
+
+  of And3A64:
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "and3")
+    checkBitwiseType(dstT, "and", start)
+    checkBitwiseType(rm.typ, "and", start)
+    if rm.kind != okReg: error("and3 second source must be a register", n)
+    arm64.emitAnd(ctx.buf.data, rd, rn, rm.reg)
+
+  of Orr3A64:
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "orr3")
+    checkBitwiseType(dstT, "orr", start)
+    checkBitwiseType(rm.typ, "orr", start)
+    if rm.kind != okReg: error("orr3 second source must be a register", n)
+    arm64.emitOrr(ctx.buf.data, rd, rn, rm.reg)
+
+  of Eor3A64:
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "eor3")
+    checkBitwiseType(dstT, "eor", start)
+    checkBitwiseType(rm.typ, "eor", start)
+    if rm.kind != okReg: error("eor3 second source must be a register", n)
+    arm64.emitEor(ctx.buf.data, rd, rn, rm.reg)
+
+  of Lsl3A64:
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "lsl3")
+    checkBitwiseType(dstT, "lsl", start)
+    if rm.kind == okImm:
+      if rm.immVal >= 0 and rm.immVal <= 63:
+        arm64.emitLslImm(ctx.buf.data, rd, rn, uint8(rm.immVal))
+      else: error("Shift amount must be 0-63", n)
+    else: arm64.emitLsl(ctx.buf.data, rd, rn, rm.reg)
+
+  of Lsr3A64:
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "lsr3")
+    checkBitwiseType(dstT, "lsr", start)
+    if rm.kind == okImm:
+      if rm.immVal >= 0 and rm.immVal <= 63:
+        arm64.emitLsrImm(ctx.buf.data, rd, rn, uint8(rm.immVal))
+      else: error("Shift amount must be 0-63", n)
+    else: arm64.emitLsr(ctx.buf.data, rd, rn, rm.reg)
+
+  of Asr3A64:
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "asr3")
+    checkBitwiseType(dstT, "asr", start)
+    if rm.kind == okImm:
+      if rm.immVal >= 0 and rm.immVal <= 63:
+        arm64.emitAsrImm(ctx.buf.data, rd, rn, uint8(rm.immVal))
+      else: error("Shift amount must be 0-63", n)
+    else: arm64.emitAsr(ctx.buf.data, rd, rn, rm.reg)
 
   of NegA64:
     inc n
