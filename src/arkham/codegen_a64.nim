@@ -2549,6 +2549,49 @@ proc emitCall2(g: var CodeGen; c: Cursor) =
 
 # ── conditions ───────────────────────────────────────────────────────────────
 
+proc emitScalarCmp2(g: var CodeGen; aC, bC: Cursor; ek: LengExpr; whenTrue: bool): A64Inst =
+  ## Emit an integer `cmp aC, bC` for the relational op `ek` and return the branch
+  ## condition tag (`Beq`/`Blt`/…) that fires when the relation holds as `whenTrue`.
+  ## All operand staging bridges are released before returning — NZCV is already set,
+  ## so a caller may take fresh bridges for a following instruction (e.g. a `csel`).
+  ## Shared by `emitCond2` (branch) and `tryEmitCsel` (branchless select).
+  let signed = not (g.cmpOperandUnsigned(aC) or g.cmpOperandUnsigned(bC))
+  result =
+    case ek
+    of EqC:  (if whenTrue: BeqA64 else: BneA64)
+    of NeqC: (if whenTrue: BneA64 else: BeqA64)
+    of LtC:  (if whenTrue: (if signed: BltA64 else: BloA64) else: (if signed: BgeA64 else: BhsA64))
+    of LeC:  (if whenTrue: (if signed: BleA64 else: BlsA64) else: (if signed: BgtA64 else: BhiA64))
+    else: raiseAssert "arkham a64n: cond " & $ek
+  # A folded lvalue operand (`Mem`/`NamedStack`) reaches its bridge with the generic
+  # ScalarSlot the allocator recorded — but a POINTER value bound `(i 64)` cannot be
+  # `cmp`ed against a `(nil)`/pointer operand (nifasm is strict). Bind the bridge
+  # with the operand's precise slot instead (mirrors emitMemLoad2's ptr handling).
+  template cmpBridgeSlot(loc: Location; opC: Cursor): AsmSlot =
+    if isPtrType(resolveType(g.prog, g.getType(opC))): g.exprSlot(opC)
+    else: loc.typ
+  g.emitValue2(aC)
+  let aLoc0 = g.ra.locs[g.posOf(aC)]
+  var aReg = NoReg
+  var aBridge = NoReg
+  if aLoc0.kind == InReg: aReg = aLoc0.r
+  else: (aBridge = g.takeBridge(cmpBridgeSlot(aLoc0, aC)); g.place2(aLoc0, aBridge); aReg = aBridge)
+  let bLoc = g.ra.locs[g.posOf(bC)]
+  if bLoc.kind == Imm and bLoc.ival >= 0 and bLoc.ival <= 0xFFFF:
+    g.ab.tree CmpA64: (g.emReg aReg; g.emImm(bLoc))
+  else:
+    g.emitValue2(bC)
+    let bL = g.ra.locs[g.posOf(bC)]
+    var bReg = NoReg
+    var bBridge = NoReg
+    if bL.kind == InReg: bReg = bL.r
+    else: (bBridge = g.takeBridge(cmpBridgeSlot(bL, bC), avoid = aReg); g.place2(bL, bBridge); bReg = bBridge)
+    g.ab.tree CmpA64: (g.emReg aReg; g.emReg bReg)
+    if bL.kind == InReg and bL.isTemp: g.unbindTemp(bL.r)
+    if bBridge != NoReg: g.dropBridge bBridge
+  if aBridge != NoReg: g.dropBridge aBridge
+  elif aLoc0.kind == InReg and aLoc0.isTemp: g.unbindTemp(aLoc0.r)
+
 proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
   ## Branch to `toLabel` when condition `c` holds (`whenTrue`).
   if c.kind == TagLit and c.exprKind == OvfC:
@@ -2625,43 +2668,8 @@ proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
       if bLoc.isTemp: g.unbindFTmp(bLoc.f)
       if aLoc.isTemp: g.unbindFTmp(aLoc.f)
       return
-    let signed = not (g.cmpOperandUnsigned(aC) or g.cmpOperandUnsigned(bC))
-    let tag =
-      case ek
-      of EqC:  (if whenTrue: BeqA64 else: BneA64)
-      of NeqC: (if whenTrue: BneA64 else: BeqA64)
-      of LtC:  (if whenTrue: (if signed: BltA64 else: BloA64) else: (if signed: BgeA64 else: BhsA64))
-      of LeC:  (if whenTrue: (if signed: BleA64 else: BlsA64) else: (if signed: BgtA64 else: BhiA64))
-      else: raiseAssert "arkham a64n: cond " & $ek
-    # A folded lvalue operand (`Mem`/`NamedStack`) reaches its bridge with the generic
-    # ScalarSlot the allocator recorded — but a POINTER value bound `(i 64)` cannot be
-    # `cmp`ed against a `(nil)`/pointer operand (nifasm is strict). Bind the bridge
-    # with the operand's precise slot instead (mirrors emitMemLoad2's ptr handling).
-    template cmpBridgeSlot(loc: Location; opC: Cursor): AsmSlot =
-      if isPtrType(resolveType(g.prog, g.getType(opC))): g.exprSlot(opC)
-      else: loc.typ
-    g.emitValue2(aC)
-    let aLoc0 = g.ra.locs[g.posOf(aC)]
-    var aReg = NoReg
-    var aBridge = NoReg
-    if aLoc0.kind == InReg: aReg = aLoc0.r
-    else: (aBridge = g.takeBridge(cmpBridgeSlot(aLoc0, aC)); g.place2(aLoc0, aBridge); aReg = aBridge)
-    let bLoc = g.ra.locs[g.posOf(bC)]
-    if bLoc.kind == Imm and bLoc.ival >= 0 and bLoc.ival <= 0xFFFF:
-      g.ab.tree CmpA64: (g.emReg aReg; g.emImm(bLoc))
-    else:
-      g.emitValue2(bC)
-      let bL = g.ra.locs[g.posOf(bC)]
-      var bReg = NoReg
-      var bBridge = NoReg
-      if bL.kind == InReg: bReg = bL.r
-      else: (bBridge = g.takeBridge(cmpBridgeSlot(bL, bC), avoid = aReg); g.place2(bL, bBridge); bReg = bBridge)
-      g.ab.tree CmpA64: (g.emReg aReg; g.emReg bReg)
-      if bL.kind == InReg and bL.isTemp: g.unbindTemp(bL.r)
-      if bBridge != NoReg: g.dropBridge bBridge
+    let tag = g.emitScalarCmp2(aC, bC, ek, whenTrue)
     g.emBr(tag, toLabel)
-    if aBridge != NoReg: g.dropBridge aBridge
-    elif aLoc0.kind == InReg and aLoc0.isTemp: g.unbindTemp(aLoc0.r)
     return
   g.emitValue2(c)
   let v = g.ra.locs[g.posOf(c)]
@@ -3558,6 +3566,125 @@ proc emitCaseTest2(g: var CodeGen; selReg: Reg; c: var Cursor; lBody: string; si
   else:
     g.cmpImm2(selReg, branchImm(c)); g.emBr(BeqA64, lBody)
 
+# ── conditional-move (branchless select) ─────────────────────────────────────
+
+proc cselTagFor(branchTag: A64Inst): A64Inst =
+  ## The `csel<cc>` whose condition matches branch tag `branchTag` (which fires
+  ## when the relation holds): `csel<cc> D, S1, S2` yields `D = cc ? S1 : S2`.
+  case branchTag
+  of BeqA64: CseleqA64
+  of BneA64: CselneA64
+  of BltA64: CselltA64
+  of BleA64: CselleA64
+  of BgtA64: CselgtA64
+  of BgeA64: CselgeA64
+  of BloA64: CselloA64
+  of BlsA64: CsellsA64
+  of BhiA64: CselhiA64
+  of BhsA64: CselhsA64
+  else: raiseAssert "arkham a64n: no csel for " & $branchTag
+
+proc simpleCselValue(g: var CodeGen; rhs: Cursor): bool =
+  ## A side-effect-free scalar RHS that materialises with `mov`/`ldr` only (never
+  ## touching NZCV, so it may sit between the `cmp` and the `csel`): an integer
+  ## immediate, or a plain local/param scalar (register- or stack-homed).
+  case rhs.kind
+  of IntLit, UIntLit, CharLit: true
+  of Symbol: g.ra.locationOfSym(symName(rhs)).kind in {InReg, NamedStack}
+  else: false
+
+proc parseCselAsgn(asgn: Cursor; dstName: var string; rhs: var Cursor): bool =
+  ## `(asgn DST RHS)` with a symbol DST → its name and the RHS cursor. False for a
+  ## complex (memory) lvalue. `sub` reads the children without a leave obligation.
+  var a = sub(asgn)
+  if a.kind != Symbol: return false
+  dstName = symName(a); skip a
+  if not a.hasMore: return false
+  rhs = a
+  return true
+
+proc singleAsgnOf(stmt: Cursor; asgn: var Cursor): bool =
+  ## The lone `(asgn …)` a select-diamond arm carries: the statement itself, or the
+  ## single child of its `(stmts …)` wrapper. False for anything else (zero/multiple
+  ## statements, a non-assignment) — those keep the branch lowering.
+  if stmt.stmtKind == AsgnS:
+    asgn = stmt; return true
+  if stmt.stmtKind == StmtsS:
+    var s = sub(stmt)
+    if not s.hasMore or s.stmtKind != AsgnS: return false
+    asgn = s; skip s
+    if s.hasMore: return false          # more than one statement in the arm
+    return true
+  return false
+
+proc tryEmitCsel(g: var CodeGen; c: Cursor): bool =
+  ## Recognise a select diamond
+  ##   `(if (elif COND (asgn DST A)) (else (asgn DST B)))`
+  ## where COND is an integer relation, DST is a register-homed scalar and A, B are
+  ## side-effect-free simple scalar values, and lower it branchlessly to
+  ## `cmp; csel<cc> DST, A, B` — no forward jumps, no label. Returns false for
+  ## anything that does not fit; the caller then falls back to branch lowering.
+  var condC, thenAsgn, elseAsgn: Cursor
+  var haveElif, haveElse = false
+  var ok = true
+  var cc = c
+  cc.into:
+    while cc.hasMore:
+      case cc.substructureKind
+      of ElifU:
+        if haveElif or haveElse: ok = false
+        var bc = sub(cc)                       # (elif COND ARM) — read only
+        condC = bc; skip bc
+        if not bc.hasMore: ok = false
+        else:
+          thenAsgn = bc; skip bc
+          if bc.hasMore: ok = false            # more than one statement in the arm
+        haveElif = true
+      of ElseU:
+        if not haveElif or haveElse: ok = false
+        var bc = sub(cc)                       # (else ARM)
+        if not bc.hasMore: ok = false
+        else:
+          elseAsgn = bc; skip bc
+          if bc.hasMore: ok = false
+        haveElse = true
+      else: ok = false
+      skip cc
+  if not (ok and haveElif and haveElse): return false
+  # Each arm must carry exactly one `(asgn …)` (unwrapping its `(stmts …)`).
+  var thenBody, elseBody: Cursor
+  if not singleAsgnOf(thenAsgn, thenBody): return false
+  if not singleAsgnOf(elseAsgn, elseBody): return false
+  # COND must be a plain integer relation (not and/or/not, not float, not ovf).
+  if condC.kind != TagLit or condC.exprKind notin {EqC, NeqC, LtC, LeC}: return false
+  var aC, bC: Cursor
+  block:
+    var pc = sub(condC)
+    aC = pc; skip pc
+    bC = pc; skip pc
+  if g.isFloatExpr(aC): return false
+  # Both arms must assign the SAME register-homed scalar DST.
+  var thenDst, elseDst: string
+  var thenRhs, elseRhs: Cursor
+  if not parseCselAsgn(thenBody, thenDst, thenRhs): return false
+  if not parseCselAsgn(elseBody, elseDst, elseRhs): return false
+  if thenDst != elseDst: return false
+  let dst = g.ra.locationOfSym(thenDst)
+  if dst.kind != InReg: return false
+  if not g.simpleCselValue(thenRhs) or not g.simpleCselValue(elseRhs): return false
+  # ── emit: cmp (sets NZCV) → THEN→bridge → ELSE→DST → csel DST, bridge, DST ──
+  # The cmp reads the condition operands at their ORIGINAL values (DST not yet
+  # written). THEN is captured into a fresh bridge before ELSE overwrites DST, so
+  # `if c: x = x …` style self-reads stay correct; both stores are mov/ldr-only, so
+  # the flags survive to the csel.
+  let ct = cselTagFor(g.emitScalarCmp2(aC, bC, condC.exprKind, whenTrue = true))
+  let rT = g.takeBridge(dst.typ)
+  g.genStore2(thenRhs, regLoc(rT, dst.typ), g.posOf(thenBody))
+  g.genStore2(elseRhs, dst, g.posOf(elseBody))
+  g.ab.tree ct: (g.emReg dst.r; g.emReg rT; g.emReg dst.r)
+  g.dropBridge rT
+  return true
+
 # ── statement dispatch ───────────────────────────────────────────────────────
 
 proc genStmt2(g: var CodeGen; c: Cursor) =
@@ -3606,27 +3733,28 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
     g.emLab(lEnd)
     discard g.loopEnds.pop()
   of IfS:
-    let lEnd = g.freshLabel()
-    var cc = c
-    cc.into:
-      while cc.hasMore:
-        case cc.substructureKind
-        of ElifU:
-          let lNext = g.freshLabel()
-          var bc = cc
-          bc.into:
-            let condC = bc; skip bc
-            g.emitCond2(condC, lNext, whenTrue = false)
-            while bc.hasMore: (g.genStmt2(bc); skip bc)
-            g.emBr(BA64, lEnd)
-          g.emLab(lNext)
-        of ElseU:
-          var bc = cc
-          bc.into:
-            while bc.hasMore: (g.genStmt2(bc); skip bc)
-        else: discard
-        skip cc
-    g.emLab(lEnd)
+    if not g.tryEmitCsel(c):        # branchless select diamond, else fall through
+      let lEnd = g.freshLabel()
+      var cc = c
+      cc.into:
+        while cc.hasMore:
+          case cc.substructureKind
+          of ElifU:
+            let lNext = g.freshLabel()
+            var bc = cc
+            bc.into:
+              let condC = bc; skip bc
+              g.emitCond2(condC, lNext, whenTrue = false)
+              while bc.hasMore: (g.genStmt2(bc); skip bc)
+              g.emBr(BA64, lEnd)
+            g.emLab(lNext)
+          of ElseU:
+            var bc = cc
+            bc.into:
+              while bc.hasMore: (g.genStmt2(bc); skip bc)
+          else: discard
+          skip cc
+      g.emLab(lEnd)
   of RetS:
     var cc = c
     cc.into:
