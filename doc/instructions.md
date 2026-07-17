@@ -38,6 +38,8 @@
 | `(idiv D S R)`         | X64Inst                  | signed divide |
 | `(sdiv D S)`           | A64Inst                  | signed divide |
 | `(udiv D S)`           | A64Inst                  | unsigned divide |
+| `(smulh D S)`          | A64Inst                  | signed multiply high (top 64 bits of D*S) |
+| `(umulh D S)`          | A64Inst                  | unsigned multiply high (top 64 bits of D*S) |
 | `(addsd D S)`          | X64Inst                  | add scalar double |
 | `(subsd D S)`          | X64Inst                  | subtract scalar double |
 | `(mulsd D S)`          | X64Inst                  | multiply scalar double |

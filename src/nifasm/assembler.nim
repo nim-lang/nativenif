@@ -2672,6 +2672,21 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     if op.kind == okMem: error("MUL memory not supported yet", n)
     arm64.emitMul(ctx.buf.data, dest.reg, dest.reg, op.reg)
 
+  of SmulhA64, UmulhA64:
+    inc n
+    let dest = parseDestA64(n, ctx)
+    let op = parseOperandA64(n, ctx)
+    let mn = if instTag == SmulhA64: "smulh" else: "umulh"
+    checkIntegerType(dest.typ, mn, start)
+    checkIntegerType(op.typ, mn, start)
+    if dest.kind == okMem: error(mn & " destination cannot be memory", n)
+    if op.kind == okImm: error(mn & " immediate not supported", n)
+    if op.kind == okMem: error(mn & " memory not supported yet", n)
+    if instTag == SmulhA64:
+      arm64.emitSmulh(ctx.buf.data, dest.reg, dest.reg, op.reg)
+    else:
+      arm64.emitUmulh(ctx.buf.data, dest.reg, dest.reg, op.reg)
+
   of SdivA64:
     inc n
     let dest = parseDestA64(n, ctx)

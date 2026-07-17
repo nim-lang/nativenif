@@ -25,7 +25,8 @@ type
   OvfMode* = enum
     OvfNone,                                  ## no pending keepovf predicate
     OvfSign,                                  ## overflow iff `ovfReg` is negative (signed add/sub)
-    OvfCmpLo                                  ## overflow iff `ovfReg <u ovfReg2` (unsigned carry/borrow)
+    OvfCmpLo,                                 ## overflow iff `ovfReg <u ovfReg2` (unsigned carry/borrow)
+    OvfNeqZero                                ## overflow iff `ovfReg != 0` (a64 mul: smulh/umulh high half)
 
   CodeGen* = object
     ab*: AsmBuf

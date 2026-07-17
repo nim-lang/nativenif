@@ -2605,6 +2605,9 @@ proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
     of OvfCmpLo:                                            # overflow ⟺ ovfReg <u ovfReg2
       g.ab.tree CmpA64: (g.emReg g.ovfReg; g.emReg g.ovfReg2)
       g.emBr(if whenTrue: BloA64 else: BhsA64, toLabel)
+    of OvfNeqZero:                                          # overflow ⟺ ovfReg != 0
+      g.ab.tree CmpA64: (g.emReg g.ovfReg; g.ab.intLit 0)
+      g.emBr(if whenTrue: BneA64 else: BeqA64, toLabel)
     of OvfNone:
       raiseAssert "arkham a64n: (ovf) with no preceding keepovf"
     for r in g.ovfBridges: g.dropBridge r
@@ -3822,48 +3825,23 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
       if aLoc.kind == InReg and aLoc.isTemp: g.unbindTemp(aLoc.r)
       if bLoc.kind == InReg and bLoc.isTemp: g.unbindTemp(bLoc.r)
       if ek == MulC:
-        # `d = a * b` with a division-based overflow predicate (no `smulh`/`umulh` in
-        # the nifasm vocabulary): ovf ⟺ b != 0 and (d div b) != a — plus, signed, the
-        # `a == INT64_MIN and b == -1` case where `sdiv` wraps and the quotient check
-        # is blind. Four values (a b d q) live at the peak but only three registers
-        # (two bridges + the dest home), so the `a` snapshot is parked in a synthetic
-        # stack slot (the allocator raised `hasStackVars` for this keepovf).
-        let kPos = g.posOf(c)
-        let slot = "ovfa" & $kPos & ".0"
-        g.emScalarStackVar(slot)
+        # `d = a * b`; overflow is read straight off the 128-bit product's HIGH half
+        # (`smulh`/`umulh` — the register-role equivalent of x86 `imul`→rdx), so there
+        # is no division, no `INT64_MIN·-1` special case, and only the two bridges +
+        # dest are ever live (no stack snapshot of `a`):
+        #   unsigned: ovf ⟺ umulh(a,b) != 0
+        #   signed:   ovf ⟺ smulh(a,b) != (d asr 63)   (the low result's sign extension)
         g.movReg(rD, rA)                                    # d := a
-        g.binReg(MulA64, rD, rB)                            # d := a * b (wrapping)
-        g.emScalarStore(slot, rA)                           # slot ← a
-        let lZero = g.freshLabel()
-        let lOvf = g.freshLabel()
-        let lEnd = g.freshLabel()
-        let lNeg1 = g.freshLabel()
-        g.ab.tree CmpA64: (g.emReg rB; g.ab.intLit 0)
-        g.emBr(BeqA64, lZero)                               # b == 0 → d == 0, no ovf
+        g.binReg(MulA64, rD, rB)                            # d := a * b (low 64)
         if g.ovfSigned:
-          g.movImm(rA, -1)
-          g.ab.tree CmpA64: (g.emReg rB; g.emReg rA)
-          g.emBr(BeqA64, lNeg1)                             # b == -1 → quotient check is blind
-        g.movReg(rA, rD)
-        g.binReg(if g.ovfSigned: SdivA64 else: UdivA64, rA, rB)  # rA = d div b
-        g.emScalarLoad(rB, slot)                            # rB ← a
-        g.ab.tree CmpA64: (g.emReg rA; g.emReg rB)
-        g.emBr(BeqA64, lZero)                               # quotient == a → exact, no ovf
-        g.emBr(BA64, lOvf)
-        if g.ovfSigned:
-          g.emLab(lNeg1)                                    # a * -1 overflows iff a == INT64_MIN
-          g.movImm(rA, low(int64))
-          g.emScalarLoad(rB, slot)
-          g.ab.tree CmpA64: (g.emReg rA; g.emReg rB)
-          g.emBr(BneA64, lZero)
-        g.emLab(lOvf)
-        g.movImm(rA, -1)                                    # negative ⇒ the OvfSign test fires
-        g.emBr(BA64, lEnd)
-        g.emLab(lZero)
-        g.movImm(rA, 0)
-        g.emLab(lEnd)
+          g.binReg(SmulhA64, rA, rB)                        # rA := high(a*b); `a` now dead
+          g.movReg(rB, rD)                                  # rB := d
+          g.ab.splice &"(asr {g.emOp(rB)} 63)"             # rB := d asr 63 (expected high)
+          g.binReg(EorA64, rA, rB)                          # rA := high ^ expected (0 ⟺ no ovf)
+        else:
+          g.binReg(UmulhA64, rA, rB)                        # rA := high(a*b) (0 ⟺ no ovf)
         g.dropBridge rB
-        g.ovfMode = OvfSign
+        g.ovfMode = OvfNeqZero
         g.ovfReg = rA
         g.ovfBridges = @[rA]
       else:

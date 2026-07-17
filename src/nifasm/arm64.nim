@@ -186,6 +186,25 @@ proc emitMul*(dest: var Bytes; rd, rn, rm: Register) =
               encodeReg(rd)
   dest.addUint32(instr)
 
+# SMULH / UMULH — 64×64→high-64 multiply (top half of the 128-bit product).
+# Same 3-source data-processing family as MADD/MUL, with op31 = 010 (signed) /
+# 110 (unsigned) and Ra = XZR.
+proc emitSmulh*(dest: var Bytes; rd, rn, rm: Register) =
+  ## SMULH rd, rn, rm: 1001 1011 010m mmmm 0111 11nn nnnd dddd
+  let instr = 0x9B407C00'u32 or
+              (encodeReg(rm) shl 16) or
+              (encodeReg(rn) shl 5) or
+              encodeReg(rd)
+  dest.addUint32(instr)
+
+proc emitUmulh*(dest: var Bytes; rd, rn, rm: Register) =
+  ## UMULH rd, rn, rm: 1001 1011 110m mmmm 0111 11nn nnnd dddd
+  let instr = 0x9BC07C00'u32 or
+              (encodeReg(rm) shl 16) or
+              (encodeReg(rn) shl 5) or
+              encodeReg(rd)
+  dest.addUint32(instr)
+
 # SDIV instruction (signed divide)
 proc emitSdiv*(dest: var Bytes; rd, rn, rm: Register) =
   ## Emit SDIV instruction: SDIV rd, rn, rm

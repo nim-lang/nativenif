@@ -2021,11 +2021,8 @@ proc walk(b: var Builder; n: var Cursor) =
       let kPos = b.posOf(n)
       n.into:
         var opCur = n                          # the (op …) value
-        if b.md.arch == Arm64 and opCur.kind == TagLit and opCur.exprKind == MulC:
-          # The a64 emitter's div-based mul-overflow predicate parks the `a` operand
-          # snapshot in a synthetic `(s)` slot (`ovfa<pos>.0`) — make sure the frame
-          # reserves the stack-var region (see genStmt2's KeepovfS).
-          b.ra.hasStackVars = true
+        # (a64 mul-overflow now reads the product's high half via `smulh`/`umulh`,
+        # so it needs no `(s)` snapshot slot — no `hasStackVars` reservation here.)
         skip n                                 # advance to dest
         if n.kind == Symbol:
           let dst = b.symLoc(symName(n)); skip n
