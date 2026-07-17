@@ -4575,6 +4575,82 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
         if not skipInit: g.genStore2(cc, loc, declPos)  # the one general store path
       while cc.hasMore: skip cc
 
+proc emitScalarCmp2X64(g: var CodeGen; aC, bC: Cursor; ek: LengExpr; whenTrue: bool): X64Inst =
+  ## Emit an integer `cmp aC, bC` for the relational op `ek` and return the `jcc` tag
+  ## taken when the relation holds as `whenTrue`. Handles folded-memory / spilled /
+  ## imm64 operands, and releases all staging before returning — the flags are already
+  ## set, so a caller may follow with a `jcc` (branch) or a `cmov` (select). Shared by
+  ## `emitCond2` and `tryEmitCmov`.
+  let unsigned = g.cmpOperandUnsigned(aC) or g.cmpOperandUnsigned(bC)
+  result = cmpJccTag(ek, whenTrue, signed = not unsigned)
+  let aLoc0 = g.ra.locs[cursorToPosition(g.buf[], aC)]
+  let bLoc0 = g.ra.locs[cursorToPosition(g.buf[], bC)]
+  if aLoc0.kind != Mem: g.emitValue2(aC)               # lhs: a folded memory load stays put
+  if bLoc0.kind != Mem: g.emitValue2(bC)               # rhs: ditto
+  var aLoc = g.ra.locs[cursorToPosition(g.buf[], aC)]
+  var bLoc = g.ra.locs[cursorToPosition(g.buf[], bC)]
+  # x86 `cmp r/m64, imm` only takes a *sign-extended imm32*; a wider immediate (e.g.
+  # the overflow-saturation `int64.max`/`low`) must be materialized into a register
+  # first (movabs), since nifasm has no scratch pool of its own.
+  var bigImmStaging = NoReg
+  if bLoc.kind == Imm and (bLoc.ival < low(int32).int64 or bLoc.ival > high(int32).int64):
+    bigImmStaging = g.pickStagingSealed("a cmp imm64", bLoc.typ)
+    g.movImm(bigImmStaging, bLoc.ival)
+    bLoc = regLoc(bigImmStaging, bLoc.typ)
+  var cmpStaging = NoReg
+  if aLoc.kind == NamedStack:
+    # demoted (stolen) local as cmp lhs: load it into a staging reg so the rhs may
+    # itself be memory (`cmp [a],[b]` is illegal); the InReg-lhs path then applies.
+    cmpStaging = g.pickStagingSealed("a cmp lhs", aLoc.typ)
+    g.emitLoadLoc(aLoc, cmpStaging)
+    aLoc = regLoc(cmpStaging, aLoc.typ)
+  if aLoc.kind == Mem:                                 # left folded: cmp [addr], rreg/imm
+    var aBound: seq[Reg] = @[]
+    g.bindLvalGlobalBases(aC, aBound)                  # bind a global base reg before the lea
+    g.prematLval2(aC)                                   # materialize the lhs base first
+    var rhsStaging = NoReg
+    if bLoc.kind == NamedStack:
+      # x86 forbids `cmp [mem], [mem]`: a spilled (demoted) rhs local must be loaded
+      # into a register. Pick AFTER prematLval2 so the staging reg avoids the now-bound
+      # lhs base pointer.
+      rhsStaging = g.pickStagingSealed("a cmp(memlhs) rhs", bLoc.typ)
+      g.emitLoadLoc(bLoc, rhsStaging)
+    g.ab.tree CmpX64:
+      g.ab.tree MemX: g.emLvalAddr2(aC)
+      case bLoc.kind
+      of Imm: g.emImm(bLoc)
+      of InReg: g.emReg bLoc.r
+      of NamedStack: g.emReg rhsStaging
+      else: raiseAssert "arkham x64n: cmp(memlhs) rhs " & $bLoc.kind
+    if rhsStaging != NoReg: g.giveBack rhsStaging
+    g.unbindLvalTemps2(aC)
+    for r in aBound: g.unbindTemp(r)
+  else:
+    assert aLoc.kind == InReg, "arkham x64n: cmp lhs " & $aLoc.kind
+    case bLoc.kind
+    of Imm:
+      g.ab.tree CmpX64: (g.emReg aLoc.r; g.emImm(bLoc))
+    of InReg:
+      g.ab.tree CmpX64: (g.emReg aLoc.r; g.emReg bLoc.r)
+    of NamedStack:                                     # spilled scalar slot: cmp reg, [rsp+slot]
+      g.ab.tree CmpX64:
+        g.emReg aLoc.r
+        g.emStackMem(bLoc.name)
+    of Mem:                                            # folded memory load: cmp reg, [addr]
+      var bBound: seq[Reg] = @[]
+      g.bindLvalGlobalBases(bC, bBound)                # bind a global base reg before the lea
+      g.prematLval2(bC)
+      g.ab.tree CmpX64:
+        g.emReg aLoc.r
+        g.ab.tree MemX: g.emLvalAddr2(bC)
+      g.unbindLvalTemps2(bC)
+      for r in bBound: g.unbindTemp(r)
+    else: raiseAssert "arkham x64n: cmp rhs " & $bLoc.kind
+  if bigImmStaging != NoReg: g.giveBack bigImmStaging
+  elif bLoc.kind == InReg and bLoc.isTemp: g.unbindTemp(bLoc.r)
+  if cmpStaging != NoReg: g.giveBack cmpStaging
+  elif aLoc.kind == InReg and aLoc.isTemp: g.unbindTemp(aLoc.r)
+
 proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
   ## Emit a branch test, jumping to `toLabel` when the condition holds (`whenTrue`):
   ## a short-circuit `and`/`or`/`not` tree, a `cmp`/`jcc` for a comparison `(op a b)`,
@@ -4647,76 +4723,8 @@ proc emitCond2(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
       if bLoc.isTemp: g.unbindFTmp(bLoc.f)
       if aLoc.isTemp: g.unbindFTmp(aLoc.f)
       return
-    let unsigned = g.cmpOperandUnsigned(aC) or g.cmpOperandUnsigned(bC)
-    let tag = cmpJccTag(ek, whenTrue, signed = not unsigned)
-    let aLoc0 = g.ra.locs[cursorToPosition(g.buf[], aC)]
-    let bLoc0 = g.ra.locs[cursorToPosition(g.buf[], bC)]
-    if aLoc0.kind != Mem: g.emitValue2(aC)               # lhs: a folded memory load stays put
-    if bLoc0.kind != Mem: g.emitValue2(bC)               # rhs: ditto
-    var aLoc = g.ra.locs[cursorToPosition(g.buf[], aC)]
-    var bLoc = g.ra.locs[cursorToPosition(g.buf[], bC)]
-    # x86 `cmp r/m64, imm` only takes a *sign-extended imm32*; a wider immediate (e.g.
-    # the overflow-saturation `int64.max`/`low`) must be materialized into a register
-    # first (movabs), since nifasm has no scratch pool of its own.
-    var bigImmStaging = NoReg
-    if bLoc.kind == Imm and (bLoc.ival < low(int32).int64 or bLoc.ival > high(int32).int64):
-      bigImmStaging = g.pickStagingSealed("a cmp imm64", bLoc.typ)
-      g.movImm(bigImmStaging, bLoc.ival)
-      bLoc = regLoc(bigImmStaging, bLoc.typ)
-    var cmpStaging = NoReg
-    if aLoc.kind == NamedStack:
-      # demoted (stolen) local as cmp lhs: load it into a staging reg so the rhs may
-      # itself be memory (`cmp [a],[b]` is illegal); the InReg-lhs path then applies.
-      cmpStaging = g.pickStagingSealed("a cmp lhs", aLoc.typ)
-      g.emitLoadLoc(aLoc, cmpStaging)
-      aLoc = regLoc(cmpStaging, aLoc.typ)
-    if aLoc.kind == Mem:                                 # left folded: cmp [addr], rreg/imm
-      var aBound: seq[Reg] = @[]
-      g.bindLvalGlobalBases(aC, aBound)                  # bind a global base reg before the lea
-      g.prematLval2(aC)                                   # materialize the lhs base first
-      var rhsStaging = NoReg
-      if bLoc.kind == NamedStack:
-        # x86 forbids `cmp [mem], [mem]`: a spilled (demoted) rhs local must be loaded
-        # into a register. Pick AFTER prematLval2 so the staging reg avoids the now-bound
-        # lhs base pointer.
-        rhsStaging = g.pickStagingSealed("a cmp(memlhs) rhs", bLoc.typ)
-        g.emitLoadLoc(bLoc, rhsStaging)
-      g.ab.tree CmpX64:
-        g.ab.tree MemX: g.emLvalAddr2(aC)
-        case bLoc.kind
-        of Imm: g.emImm(bLoc)
-        of InReg: g.emReg bLoc.r
-        of NamedStack: g.emReg rhsStaging
-        else: raiseAssert "arkham x64n: cmp(memlhs) rhs " & $bLoc.kind
-      if rhsStaging != NoReg: g.giveBack rhsStaging
-      g.unbindLvalTemps2(aC)
-      for r in aBound: g.unbindTemp(r)
-    else:
-      assert aLoc.kind == InReg, "arkham x64n: cmp lhs " & $aLoc.kind
-      case bLoc.kind
-      of Imm:
-        g.ab.tree CmpX64: (g.emReg aLoc.r; g.emImm(bLoc))
-      of InReg:
-        g.ab.tree CmpX64: (g.emReg aLoc.r; g.emReg bLoc.r)
-      of NamedStack:                                     # spilled scalar slot: cmp reg, [rsp+slot]
-        g.ab.tree CmpX64:
-          g.emReg aLoc.r
-          g.emStackMem(bLoc.name)
-      of Mem:                                            # folded memory load: cmp reg, [addr]
-        var bBound: seq[Reg] = @[]
-        g.bindLvalGlobalBases(bC, bBound)                # bind a global base reg before the lea
-        g.prematLval2(bC)
-        g.ab.tree CmpX64:
-          g.emReg aLoc.r
-          g.ab.tree MemX: g.emLvalAddr2(bC)
-        g.unbindLvalTemps2(bC)
-        for r in bBound: g.unbindTemp(r)
-      else: raiseAssert "arkham x64n: cmp rhs " & $bLoc.kind
+    let tag = g.emitScalarCmp2X64(aC, bC, ek, whenTrue)
     g.emJcc(tag, toLabel)
-    if bigImmStaging != NoReg: g.giveBack bigImmStaging
-    elif bLoc.kind == InReg and bLoc.isTemp: g.unbindTemp(bLoc.r)
-    if cmpStaging != NoReg: g.giveBack cmpStaging
-    elif aLoc.kind == InReg and aLoc.isTemp: g.unbindTemp(aLoc.r)
   else:
     g.emitValue2(c)
     let v = g.ra.locs[cursorToPosition(g.buf[], c)]
@@ -4765,6 +4773,44 @@ proc emitCaseTest2(g: var CodeGen; selReg: Reg; c: var Cursor; lBody: string; si
   else:
     g.ab.tree CmpX64: (g.emReg selReg; g.ab.intLit branchImm(c))
     g.emJcc(JeX64, lBody)
+
+# ── conditional-move (branchless select) ─────────────────────────────────────
+
+proc cmovTagFor(jccTag: X64Inst): X64Inst =
+  ## The `cmov<cc>` whose condition matches `jccTag` (taken when the relation holds):
+  ## `cmov<cc> D, S` performs `D = cc ? S : D`.
+  case jccTag
+  of JeX64:  CmoveX64
+  of JneX64: CmovneX64
+  of JlX64:  CmovlX64
+  of JleX64: CmovleX64
+  of JgX64:  CmovgX64
+  of JgeX64: CmovgeX64
+  of JbX64:  CmovbX64
+  of JbeX64: CmovbeX64
+  of JaX64:  CmovaX64
+  of JaeX64: CmovaeX64
+  else: raiseAssert "arkham x64: no cmov for " & $jccTag
+
+proc tryEmitCmov(g: var CodeGen; c: Cursor): bool =
+  ## Lower a select diamond (see `matchSelectDiamond`) branchlessly to
+  ## `cmp; cmov<cc> DST, A` — no forward jumps, no label. Returns false for anything
+  ## that does not fit; the caller then falls back to branch lowering.
+  var sd: SelectDiamond
+  if not g.matchSelectDiamond(c, sd): return false
+  # ── emit: cmp (sets flags) → THEN→scratch → ELSE→DST → cmov DST, scratch ──
+  # The cmp reads the condition operands at their ORIGINAL values (DST not yet
+  # written). THEN is captured into a scratch register before ELSE overwrites DST, so
+  # `if c: x = x …` self-reads stay correct. Both stores of a simple value are pure
+  # `mov` (movImm never `xor`s; a 64-bit-normalised scalar move needs no flag-setting
+  # `shl`/`sar` extend), so the flags survive to the cmov.
+  let ct = cmovTagFor(g.emitScalarCmp2X64(sd.a, sd.b, sd.ek, whenTrue = true))
+  let rT = g.pickStagingSealed("a cmov then-value", sd.dst.typ, avoid = sd.dst.r)
+  g.genStore2(sd.thenRhs, regLoc(rT, sd.dst.typ), cursorToPosition(g.buf[], sd.thenAsgn))
+  g.genStore2(sd.elseRhs, sd.dst, cursorToPosition(g.buf[], sd.elseAsgn))
+  g.ab.tree ct: (g.emReg sd.dst.r; g.emReg rT)
+  g.giveBack rT
+  return true
 
 proc genStmt2(g: var CodeGen; c: Cursor) =
   if c.kind == DotToken: return                 # an empty statement (e.g. `(stmts .)`)
@@ -4824,31 +4870,32 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
     g.emLab(lEnd)
     discard g.loopEnds.pop()
   of IfS:
-    let lEnd = g.freshLabel()
-    var cc = c
-    cc.into:
-      while cc.hasMore:
-        case cc.substructureKind
-        of ElifU:
-          let lNext = g.freshLabel()
-          var peek = cc; skip peek
-          let isLastBranch = not peek.hasMore   # no `elif`/`else` follows this branch
-          var bc = cc
-          bc.into:
-            let condC = bc; skip bc
-            g.emitCond2(condC, lNext, whenTrue = false)
-            while bc.hasMore: (g.genStmt2(bc); skip bc)
-            # The skip-to-merge jump exists only to hop over later branches; the last
-            # branch has none, so it falls through `lNext` (empty) into `lEnd`.
-            if not isLastBranch: g.emJmp(lEnd)
-          g.emLab(lNext)
-        of ElseU:
-          var bc = cc
-          bc.into:
-            while bc.hasMore: (g.genStmt2(bc); skip bc)
-        else: discard
-        skip cc
-    g.emLab(lEnd)
+    if not g.tryEmitCmov(c):        # branchless select diamond, else fall through
+      let lEnd = g.freshLabel()
+      var cc = c
+      cc.into:
+        while cc.hasMore:
+          case cc.substructureKind
+          of ElifU:
+            let lNext = g.freshLabel()
+            var peek = cc; skip peek
+            let isLastBranch = not peek.hasMore   # no `elif`/`else` follows this branch
+            var bc = cc
+            bc.into:
+              let condC = bc; skip bc
+              g.emitCond2(condC, lNext, whenTrue = false)
+              while bc.hasMore: (g.genStmt2(bc); skip bc)
+              # The skip-to-merge jump exists only to hop over later branches; the last
+              # branch has none, so it falls through `lNext` (empty) into `lEnd`.
+              if not isLastBranch: g.emJmp(lEnd)
+            g.emLab(lNext)
+          of ElseU:
+            var bc = cc
+            bc.into:
+              while bc.hasMore: (g.genStmt2(bc); skip bc)
+          else: discard
+          skip cc
+      g.emLab(lEnd)
   of RetS:
     var cc = c
     cc.into:

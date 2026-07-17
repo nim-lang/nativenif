@@ -3584,104 +3584,22 @@ proc cselTagFor(branchTag: A64Inst): A64Inst =
   of BhsA64: CselhsA64
   else: raiseAssert "arkham a64n: no csel for " & $branchTag
 
-proc simpleCselValue(g: var CodeGen; rhs: Cursor): bool =
-  ## A side-effect-free scalar RHS that materialises with `mov`/`ldr` only (never
-  ## touching NZCV, so it may sit between the `cmp` and the `csel`): an integer
-  ## immediate, or a plain local/param scalar (register- or stack-homed).
-  case rhs.kind
-  of IntLit, UIntLit, CharLit: true
-  of Symbol: g.ra.locationOfSym(symName(rhs)).kind in {InReg, NamedStack}
-  else: false
-
-proc parseCselAsgn(asgn: Cursor; dstName: var string; rhs: var Cursor): bool =
-  ## `(asgn DST RHS)` with a symbol DST → its name and the RHS cursor. False for a
-  ## complex (memory) lvalue. `sub` reads the children without a leave obligation.
-  var a = sub(asgn)
-  if a.kind != Symbol: return false
-  dstName = symName(a); skip a
-  if not a.hasMore: return false
-  rhs = a
-  return true
-
-proc singleAsgnOf(stmt: Cursor; asgn: var Cursor): bool =
-  ## The lone `(asgn …)` a select-diamond arm carries: the statement itself, or the
-  ## single child of its `(stmts …)` wrapper. False for anything else (zero/multiple
-  ## statements, a non-assignment) — those keep the branch lowering.
-  if stmt.stmtKind == AsgnS:
-    asgn = stmt; return true
-  if stmt.stmtKind == StmtsS:
-    var s = sub(stmt)
-    if not s.hasMore or s.stmtKind != AsgnS: return false
-    asgn = s; skip s
-    if s.hasMore: return false          # more than one statement in the arm
-    return true
-  return false
-
 proc tryEmitCsel(g: var CodeGen; c: Cursor): bool =
-  ## Recognise a select diamond
-  ##   `(if (elif COND (asgn DST A)) (else (asgn DST B)))`
-  ## where COND is an integer relation, DST is a register-homed scalar and A, B are
-  ## side-effect-free simple scalar values, and lower it branchlessly to
+  ## Lower a select diamond (see `matchSelectDiamond`) branchlessly to
   ## `cmp; csel<cc> DST, A, B` — no forward jumps, no label. Returns false for
   ## anything that does not fit; the caller then falls back to branch lowering.
-  var condC, thenAsgn, elseAsgn: Cursor
-  var haveElif, haveElse = false
-  var ok = true
-  var cc = c
-  cc.into:
-    while cc.hasMore:
-      case cc.substructureKind
-      of ElifU:
-        if haveElif or haveElse: ok = false
-        var bc = sub(cc)                       # (elif COND ARM) — read only
-        condC = bc; skip bc
-        if not bc.hasMore: ok = false
-        else:
-          thenAsgn = bc; skip bc
-          if bc.hasMore: ok = false            # more than one statement in the arm
-        haveElif = true
-      of ElseU:
-        if not haveElif or haveElse: ok = false
-        var bc = sub(cc)                       # (else ARM)
-        if not bc.hasMore: ok = false
-        else:
-          elseAsgn = bc; skip bc
-          if bc.hasMore: ok = false
-        haveElse = true
-      else: ok = false
-      skip cc
-  if not (ok and haveElif and haveElse): return false
-  # Each arm must carry exactly one `(asgn …)` (unwrapping its `(stmts …)`).
-  var thenBody, elseBody: Cursor
-  if not singleAsgnOf(thenAsgn, thenBody): return false
-  if not singleAsgnOf(elseAsgn, elseBody): return false
-  # COND must be a plain integer relation (not and/or/not, not float, not ovf).
-  if condC.kind != TagLit or condC.exprKind notin {EqC, NeqC, LtC, LeC}: return false
-  var aC, bC: Cursor
-  block:
-    var pc = sub(condC)
-    aC = pc; skip pc
-    bC = pc; skip pc
-  if g.isFloatExpr(aC): return false
-  # Both arms must assign the SAME register-homed scalar DST.
-  var thenDst, elseDst: string
-  var thenRhs, elseRhs: Cursor
-  if not parseCselAsgn(thenBody, thenDst, thenRhs): return false
-  if not parseCselAsgn(elseBody, elseDst, elseRhs): return false
-  if thenDst != elseDst: return false
-  let dst = g.ra.locationOfSym(thenDst)
-  if dst.kind != InReg: return false
-  if not g.simpleCselValue(thenRhs) or not g.simpleCselValue(elseRhs): return false
+  var sd: SelectDiamond
+  if not g.matchSelectDiamond(c, sd): return false
   # ── emit: cmp (sets NZCV) → THEN→bridge → ELSE→DST → csel DST, bridge, DST ──
   # The cmp reads the condition operands at their ORIGINAL values (DST not yet
   # written). THEN is captured into a fresh bridge before ELSE overwrites DST, so
   # `if c: x = x …` style self-reads stay correct; both stores are mov/ldr-only, so
   # the flags survive to the csel.
-  let ct = cselTagFor(g.emitScalarCmp2(aC, bC, condC.exprKind, whenTrue = true))
-  let rT = g.takeBridge(dst.typ)
-  g.genStore2(thenRhs, regLoc(rT, dst.typ), g.posOf(thenBody))
-  g.genStore2(elseRhs, dst, g.posOf(elseBody))
-  g.ab.tree ct: (g.emReg dst.r; g.emReg rT; g.emReg dst.r)
+  let ct = cselTagFor(g.emitScalarCmp2(sd.a, sd.b, sd.ek, whenTrue = true))
+  let rT = g.takeBridge(sd.dst.typ)
+  g.genStore2(sd.thenRhs, regLoc(rT, sd.dst.typ), g.posOf(sd.thenAsgn))
+  g.genStore2(sd.elseRhs, sd.dst, g.posOf(sd.elseAsgn))
+  g.ab.tree ct: (g.emReg sd.dst.r; g.emReg rT; g.emReg sd.dst.r)
   g.dropBridge rT
   return true
 
