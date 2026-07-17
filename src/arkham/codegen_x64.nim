@@ -2880,7 +2880,9 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
           g.place2(loc, dst.r)
   of StrLit:                                            # string literal → rodata + RIP lea
     if dst.kind == InReg:
-      let nm = "msg." & $g.rodata.len
+      # Module-qualified so the literal resolves from a foreign module of a
+      # bundle (see the a64 twin for the naming rule).
+      let nm = "msg." & $g.rodata.len & "." & g.prog.thisModuleSuffix
       g.rodata.add (nm, strVal(c))
       if dst.isTemp: g.bindTemp(dst.r, dst.typ)
       g.ab.tree LeaX64: (g.emReg dst.r; g.ab.sym nm)

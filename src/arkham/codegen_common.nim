@@ -22,6 +22,11 @@ export typenav   # SymCat / SymInfo / getType / exprSlot moved here; re-export s
                  # the backends' `g.lookupSym(...).cat` etc. keep resolving
 
 type
+  OvfMode* = enum
+    OvfNone,                                  ## no pending keepovf predicate
+    OvfSign,                                  ## overflow iff `ovfReg` is negative (signed add/sub)
+    OvfCmpLo                                  ## overflow iff `ovfReg <u ovfReg2` (unsigned carry/borrow)
+
   CodeGen* = object
     ab*: AsmBuf
     ra*: RegAlloc
@@ -194,6 +199,13 @@ type
                                              ## the `(ovf)` test that immediately follows it picks
                                              ## the right hardware-flag branch (`jo`/`jno` for a
                                              ## signed op, `jb`/`jae` = CF for an unsigned op)
+    ovfMode*: OvfMode                         ## a64: how the pending `(ovf)` test reads the
+                                             ## overflow predicate (no flag-setting arithmetic in
+                                             ## the nifasm a64 vocabulary — see genStmt2 KeepovfS)
+    ovfReg*: Reg                              ## a64 OvfSign: the register holding the sign-bit
+                                             ## predicate; OvfCmpLo: the cmp's LHS
+    ovfReg2*: Reg                             ## a64 OvfCmpLo: the cmp's RHS
+    ovfBridges*: seq[Reg]                     ## a64: staging bridges the `(ovf)` test releases
 
 # ── type predicates ─────────────────────────────────────────────────────────
 

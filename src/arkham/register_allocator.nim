@@ -1350,12 +1350,17 @@ proc allocDivModRisc(b: var Builder; n: var Cursor; dest: var Location) =
     allocValue(b, n, lDest)
     allocValue(b, n, rDest)
     while n.hasMore: skip n
-  b.releaseTmp(rDest)
+  # The result register is reserved while the divisor is STILL HELD: the emitter
+  # lowers `div`/`mod` as `dest := dividend; … dest ⟵ op divisor …`, reading the
+  # divisor after `dest` is written, so a result that reuses the divisor's register
+  # clobbers it (and the emitter's divisor unbind would strip the result's binding).
+  # Only the dividend's register may be recycled (`sdiv dest, dest, divisor`).
   case dest.kind
   of Undef, NeedsReg, RegOrImm:
     if lDest.kind == InReg and lDest.isTemp: dest = lDest
     else: dest = b.reserveTmp(ScalarSlot)
   else: discard
+  b.releaseTmp(rDest)
   if not sameReg(dest, lDest): b.releaseTmp(lDest)
   b.ra.locs[pos] = dest
 
@@ -1771,14 +1776,33 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
     var scratch = dontCare
     if hasGlob: scratch = b.reserveHeldScratch("a global address")
     var lc = lhsCur
-    allocLvalue2(b, lc, scratch, isStore = true)         # lhs operands (on a copy)
-    if n.kind == TagLit and n.exprKind == OconstrC:
-      allocConstr(b, n)                                  # build through the lvalue address
-    elif n.kind == TagLit and n.exprKind == AconstrC:
-      allocAconstr(b, n)                                 # build array through the lvalue address
+    if n.kind == TagLit and n.exprKind in {OconstrC, AconstrC}:
+      allocLvalue2(b, lc, scratch, isStore = true)       # lhs operands (on a copy)
+      if n.exprKind == OconstrC:
+        allocConstr(b, n)                                # build through the lvalue address
+      else:
+        allocAconstr(b, n)                               # build array through the lvalue address
+      releaseLvalTemps(b, lhsCur)                        # free the held index/pointer + `(at)` scratch
     else:
-      b.allocSingleUse(n)
-    releaseLvalTemps(b, lhsCur)                          # free the held index/pointer + `(at)` scratch
+      # The emitter computes a scalar/float rhs FIRST and only then materializes the
+      # lhs address (see genStore2's `Mem` branch — the deliberate rhs-before-base
+      # order that keeps `x.f = g(x.f)` correct). So the rhs value is live ACROSS the
+      # lhs's inner loads and `(at)` stride scratches. Mirror that order here: reserve
+      # the rhs temp BEFORE the lhs address values, so an inner-lvalue scratch that is
+      # released with its load at alloc time (and re-bound by `prematLval2` at emit
+      # time, AFTER the rhs) can never reuse the register still holding the rhs.
+      if b.isFloatVal(n):
+        var d = dontCare
+        allocFValue(b, n, d)
+        allocLvalue2(b, lc, scratch, isStore = true)
+        releaseLvalTemps(b, lhsCur)
+        b.releaseFTmp(d)
+      else:
+        var d = needsReg(ScalarSlot)
+        allocValue(b, n, d)
+        allocLvalue2(b, lc, scratch, isStore = true)
+        releaseLvalTemps(b, lhsCur)
+        b.releaseTmp(d)
     if hasGlob:
       b.releaseTmp(scratch)
       b.ra.aux[auxPos] = ExprAux(scratch: @[scratch.r])
@@ -1997,6 +2021,11 @@ proc walk(b: var Builder; n: var Cursor) =
       let kPos = b.posOf(n)
       n.into:
         var opCur = n                          # the (op …) value
+        if b.md.arch == Arm64 and opCur.kind == TagLit and opCur.exprKind == MulC:
+          # The a64 emitter's div-based mul-overflow predicate parks the `a` operand
+          # snapshot in a synthetic `(s)` slot (`ovfa<pos>.0`) — make sure the frame
+          # reserves the stack-var region (see genStmt2's KeepovfS).
+          b.ra.hasStackVars = true
         skip n                                 # advance to dest
         if n.kind == Symbol:
           let dst = b.symLoc(symName(n)); skip n
