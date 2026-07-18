@@ -1946,6 +1946,18 @@ proc parseDestA64(n: var Cursor; ctx: var GenContext): OperandA64 =
   else:
     error("Expected destination", n)
 
+proc parse3OperandsA64(n: var Cursor; ctx: var GenContext; opName: string):
+                      tuple[rd, rn: arm64.Register; rm: OperandA64; dstTyp: Type] =
+  ## Parse the operands of a 3-operand instruction `(op3 D A B)` → `D = A op B`.
+  ## `D` and `A` are registers (`A` is a still-live source read without a prior
+  ## `mov D, A`); `B` is the folded operand (register or immediate). Fixed arity, so
+  ## no boundary peeking — the reader consumes exactly three operands.
+  let dest = parseDestA64(n, ctx)
+  if dest.kind == okMem: error(opName & " destination cannot be memory", n)
+  let a = parseOperandA64(n, ctx)
+  if a.kind != okReg: error(opName & " first source must be a register", n)
+  result = (dest.reg, a.reg, parseOperandA64(n, ctx), dest.typ)
+
 proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
   ## Handle (prepare target ... (call) ...) or (prepare target ... (extcall) ...)
   ## The prepare block sets up a call context for type checking and argument tracking.
@@ -2792,6 +2804,175 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
         error("Shift amount must be 0-63", n)
     else:
       arm64.emitAsr(ctx.buf.data, dest.reg, dest.reg, op.reg)
+
+  of Add3A64:
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "add3")
+    checkIntegerArithmetic(dstT, "add", start)
+    checkIntegerArithmetic(rm.typ, "add", start)
+    if rm.kind == okImm or rm.kind == okCsize:
+      if rm.immVal >= 0 and rm.immVal <= 4095:
+        arm64.emitAddImm(ctx.buf.data, rd, rn, uint16(rm.immVal))
+      else:
+        arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](rm.immVal))
+        arm64.emitAdd(ctx.buf.data, rd, rn, arm64.X17)
+    elif rm.kind == okMem: error("add3 from memory not supported", n)
+    else: arm64.emitAdd(ctx.buf.data, rd, rn, rm.reg)
+
+  of Sub3A64:
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "sub3")
+    checkIntegerArithmetic(dstT, "sub", start)
+    checkIntegerArithmetic(rm.typ, "sub", start)
+    if rm.kind == okImm or rm.kind == okCsize:
+      if rm.immVal >= 0 and rm.immVal <= 4095:
+        arm64.emitSubImm(ctx.buf.data, rd, rn, uint16(rm.immVal))
+      else:
+        arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](rm.immVal))
+        arm64.emitSub(ctx.buf.data, rd, rn, arm64.X17)
+    elif rm.kind == okMem: error("sub3 from memory not supported", n)
+    else: arm64.emitSub(ctx.buf.data, rd, rn, rm.reg)
+
+  of Mul3A64:
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "mul3")
+    checkIntegerType(dstT, "mul", start)
+    checkIntegerType(rm.typ, "mul", start)
+    if rm.kind != okReg: error("mul3 second source must be a register", n)
+    arm64.emitMul(ctx.buf.data, rd, rn, rm.reg)
+
+  of And3A64:
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "and3")
+    checkBitwiseType(dstT, "and", start)
+    checkBitwiseType(rm.typ, "and", start)
+    if rm.kind != okReg: error("and3 second source must be a register", n)
+    arm64.emitAnd(ctx.buf.data, rd, rn, rm.reg)
+
+  of Orr3A64:
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "orr3")
+    checkBitwiseType(dstT, "orr", start)
+    checkBitwiseType(rm.typ, "orr", start)
+    if rm.kind != okReg: error("orr3 second source must be a register", n)
+    arm64.emitOrr(ctx.buf.data, rd, rn, rm.reg)
+
+  of Eor3A64:
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "eor3")
+    checkBitwiseType(dstT, "eor", start)
+    checkBitwiseType(rm.typ, "eor", start)
+    if rm.kind != okReg: error("eor3 second source must be a register", n)
+    arm64.emitEor(ctx.buf.data, rd, rn, rm.reg)
+
+  of Lsl3A64:
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "lsl3")
+    checkBitwiseType(dstT, "lsl", start)
+    if rm.kind == okImm:
+      if rm.immVal >= 0 and rm.immVal <= 63:
+        arm64.emitLslImm(ctx.buf.data, rd, rn, uint8(rm.immVal))
+      else: error("Shift amount must be 0-63", n)
+    else: arm64.emitLsl(ctx.buf.data, rd, rn, rm.reg)
+
+  of Lsr3A64:
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "lsr3")
+    checkBitwiseType(dstT, "lsr", start)
+    if rm.kind == okImm:
+      if rm.immVal >= 0 and rm.immVal <= 63:
+        arm64.emitLsrImm(ctx.buf.data, rd, rn, uint8(rm.immVal))
+      else: error("Shift amount must be 0-63", n)
+    else: arm64.emitLsr(ctx.buf.data, rd, rn, rm.reg)
+
+  of Asr3A64:
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "asr3")
+    checkBitwiseType(dstT, "asr", start)
+    if rm.kind == okImm:
+      if rm.immVal >= 0 and rm.immVal <= 63:
+        arm64.emitAsrImm(ctx.buf.data, rd, rn, uint8(rm.immVal))
+      else: error("Shift amount must be 0-63", n)
+    else: arm64.emitAsr(ctx.buf.data, rd, rn, rm.reg)
+
+  of AddwA64:
+    inc n
+    let dest = parseDestA64(n, ctx)
+    let op = parseOperandA64(n, ctx)
+    checkIntegerArithmetic(dest.typ, "addw", start)
+    checkIntegerArithmetic(op.typ, "addw", start)
+    if dest.kind == okMem: error("ADDW to memory not supported", n)
+    elif op.kind == okImm or op.kind == okCsize:
+      if op.immVal >= 0 and op.immVal <= 4095:
+        arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.immVal), w = true)
+      else:
+        arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](op.immVal))
+        arm64.emitAdd(ctx.buf.data, dest.reg, dest.reg, arm64.X17, w = true)
+    elif op.kind == okMem: error("ADDW from memory not supported", n)
+    else: arm64.emitAdd(ctx.buf.data, dest.reg, dest.reg, op.reg, w = true)
+
+  of SubwA64:
+    inc n
+    let dest = parseDestA64(n, ctx)
+    let op = parseOperandA64(n, ctx)
+    checkIntegerArithmetic(dest.typ, "subw", start)
+    checkIntegerArithmetic(op.typ, "subw", start)
+    if dest.kind == okMem: error("SUBW to memory not supported", n)
+    elif op.kind == okImm or op.kind == okCsize:
+      if op.immVal >= 0 and op.immVal <= 4095:
+        arm64.emitSubImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.immVal), w = true)
+      else:
+        arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](op.immVal))
+        arm64.emitSub(ctx.buf.data, dest.reg, dest.reg, arm64.X17, w = true)
+    elif op.kind == okMem: error("SUBW from memory not supported", n)
+    else: arm64.emitSub(ctx.buf.data, dest.reg, dest.reg, op.reg, w = true)
+
+  of MulwA64:
+    inc n
+    let dest = parseDestA64(n, ctx)
+    let op = parseOperandA64(n, ctx)
+    checkIntegerType(dest.typ, "mulw", start)
+    checkIntegerType(op.typ, "mulw", start)
+    if dest.kind == okMem: error("MULW destination cannot be memory", n)
+    if op.kind == okImm: error("MULW immediate not supported", n)
+    if op.kind == okMem: error("MULW memory not supported", n)
+    arm64.emitMul(ctx.buf.data, dest.reg, dest.reg, op.reg, w = true)
+
+  of Addw3A64:
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "addw3")
+    checkIntegerArithmetic(dstT, "addw", start)
+    checkIntegerArithmetic(rm.typ, "addw", start)
+    if rm.kind == okImm or rm.kind == okCsize:
+      if rm.immVal >= 0 and rm.immVal <= 4095:
+        arm64.emitAddImm(ctx.buf.data, rd, rn, uint16(rm.immVal), w = true)
+      else:
+        arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](rm.immVal))
+        arm64.emitAdd(ctx.buf.data, rd, rn, arm64.X17, w = true)
+    elif rm.kind == okMem: error("addw3 from memory not supported", n)
+    else: arm64.emitAdd(ctx.buf.data, rd, rn, rm.reg, w = true)
+
+  of Subw3A64:
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "subw3")
+    checkIntegerArithmetic(dstT, "subw", start)
+    checkIntegerArithmetic(rm.typ, "subw", start)
+    if rm.kind == okImm or rm.kind == okCsize:
+      if rm.immVal >= 0 and rm.immVal <= 4095:
+        arm64.emitSubImm(ctx.buf.data, rd, rn, uint16(rm.immVal), w = true)
+      else:
+        arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](rm.immVal))
+        arm64.emitSub(ctx.buf.data, rd, rn, arm64.X17, w = true)
+    elif rm.kind == okMem: error("subw3 from memory not supported", n)
+    else: arm64.emitSub(ctx.buf.data, rd, rn, rm.reg, w = true)
+
+  of Mulw3A64:
+    inc n
+    let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "mulw3")
+    checkIntegerType(dstT, "mulw", start)
+    checkIntegerType(rm.typ, "mulw", start)
+    if rm.kind != okReg: error("mulw3 second source must be a register", n)
+    arm64.emitMul(ctx.buf.data, rd, rn, rm.reg, w = true)
 
   of NegA64:
     inc n

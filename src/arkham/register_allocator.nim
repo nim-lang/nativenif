@@ -153,6 +153,12 @@ type
                                       ## allocate an inline `(ret (oconstr …))` value
     atScratch: HashSet[int]           ## value-core: `(at …)` positions needing a scratch GPR
                                       ## (non-SIB element stride); sized by the codegen
+    returnedVar: string               ## name of the local the proc returns via `(ret <sym>)`
+                                      ## (empty if none / multiple / non-symbol return). A
+                                      ## call-free such local prefers the return register as
+                                      ## its home so the trailing `mov intRet, result` — and,
+                                      ## when it is the only callee-saved user, the frame —
+                                      ## fall away.
 
 proc initLocSpan(base, len: int): LocSpan {.inline.} =
   ## Zero-inits `len` `Location`s (kind `Undef`, ordinal 0 — an unwritten position).
@@ -592,6 +598,28 @@ proc isMemLeaf(n: Cursor): bool {.inline.} =
   ## always size-consistent.
   n.kind == TagLit and n.exprKind in {DotC, DerefC, AtC, PatC}
 
+proc exprReadsRegImpl(b: var Builder; n: var Cursor; reg: Reg): bool =
+  ## True iff the subtree at `n` reads a symbol whose home register is `reg`.
+  ## Advances `n` past the subtree (mirrors `initHasCallImpl`). Used to decide when
+  ## the left operand of a bin-op may be computed straight into a pinned `dest`
+  ## register: it is only safe when neither operand reads whatever lives in `dest`
+  ## (the left subtree progressively clobbers it, the right is read afterwards).
+  if n.kind == Symbol:
+    let h = b.symLoc(symName(n))
+    inc n
+    return h.kind == InReg and h.r == reg
+  elif n.kind == TagLit:
+    n.into:
+      while n.hasMore:
+        if exprReadsRegImpl(b, n, reg): return true
+  else:
+    inc n
+  return false
+
+proc exprReadsReg(b: var Builder; n: Cursor; reg: Reg): bool =
+  var c = n
+  exprReadsRegImpl(b, c, reg)
+
 proc allocBin(b: var Builder; n: var Cursor; dest: var Location) =
   ## Binary-arith node. When the left operand is a foldable leaf and the right is a
   ## computed (register-needing) subtree, a **Sethi–Ullman swap** evaluates the
@@ -642,6 +670,24 @@ proc allocBin(b: var Builder; n: var Cursor; dest: var Location) =
     dest = acc            # propagate the result reg to the caller's var so it can free it
     return
   var lDest = needsReg(ScalarSlot)
+  # Destination-passing into the LEFT operand. When the caller pinned a concrete
+  # result register and the left operand is a *computed* subtree while the right is
+  # a foldable leaf (folds in place), compute the left straight into `dest` — the
+  # emitter's `place2(lhs, dest)` then collapses to a no-op, killing the
+  # `mov result, tmp` that a fresh temp would force. (A leaf left operand already
+  # resolves to its own natural home, so `place2` is the single necessary load —
+  # no temp, nothing to elide.) Safety: the left subtree progressively clobbers
+  # `dest.r` and the right leaf is read *after* the op begins, so this is only
+  # valid when neither operand reads whatever currently lives in `dest.r` — hence
+  # the two `exprReadsReg` gates (they also subsume the `symInReg` rhs case). A
+  # right leaf homed in `dest.r` (`s = t op s`) or a left subtree touching it
+  # (`s = (y op s) op t`) keeps the old fresh-temp order. Shifts excluded (the
+  # count pins cl / a fixed reg).
+  if dest.kind == InReg and ek notin {ShlC, ShrC} and
+     not b.isFoldableLeaf(lhsC) and
+     (b.isFoldableLeaf(rhsC) or isMemLeaf(rhsC)) and
+     not b.exprReadsReg(lhsC, dest.r) and not b.exprReadsReg(rhsC, dest.r):
+    lDest = dest
   var rDest = dontCare
   n.into:
     skip n                                   # result type
@@ -1868,9 +1914,22 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
       # Optimistically give the local a register; demote a colder one to memory if the
       # register class is full (`trySteal`, the only undo). A spilled / address-taken
       # scalar lives in a nifasm-managed `(s)` slot addressed by name.
+      # Return-register homing (AArch64): the returned local, when call-free (`AllRegs`),
+      # prefers the return register x0 — so `(ret result)` marshals to a no-op `mov x0, x0`
+      # and, when x0 is then the only would-be callee-saved home, no frame is pushed.
+      # Self-guarding: `intRetReg` is in `freeVol` only while genuinely free (a persistent
+      # leaf param in x0 was removed by `allocParams`), so this falls through to the normal
+      # home whenever x0 is taken. Nothing else draws x0 (it is outside every temp/local
+      # candidate list), so reserving it here cannot starve the emitter's scratch.
+      let takeRet = b.md.arch == Arm64 and name.len > 0 and name == b.returnedVar and
+                    AllRegs in props and not slot.isFloat and AddrTaken notin props and
+                    slot.inRegClass and b.md.intRetReg in b.freeVol
       var loc =
         if aliasSrc.len > 0: dontCare                                 # c2 is a pure view of c1
         elif inheritSrc.len > 0: regLoc(b.symLoc(inheritSrc).r, slot) # c2 takes c1's reg
+        elif takeRet:
+          excl b.freeVol, b.md.intRetReg
+          regLoc(b.md.intRetReg, slot)
         else: b.allocStorage(slot, props)
       if inheritSrc.len > 0:
         # Transfer the register's free obligation from the (now-dead) source to this var:
@@ -2307,9 +2366,37 @@ proc seedPools(b: var Builder) =
   # — arg regs NOT otherwise in a pool). Drawn ONLY by the caller-save rescue, which filters
   # on `atomicSafeTempRegs`, so no ordinary local/temp/AllRegs allocation reaches them.
   for r in b.md.atomicSafeTempRegs: b.freeVol.incl r
+  # AArch64: the integer return register (x0) joins the pool too, drawn ONLY by the
+  # returned local's home (an explicit `[intRetReg]` candidate — never by
+  # `intLocalTempRegs`/`intTempRegs`, which exclude it, nor by any temp). `allocParams`
+  # removes it again if a leaf param persistently occupies it, so it is available for the
+  # returned local exactly when x0 is otherwise free. Homing a call-free returned local
+  # there elides the trailing `mov x0, result` (and the whole frame when it is the only
+  # callee-saved user). Not on x86-64: there rax IS an ordinary scratch/temp register.
+  if b.md.arch == Arm64 and b.md.intRetReg != NoReg: b.freeVol.incl b.md.intRetReg
   for r in b.md.intCalleeSaved: b.freeCallee.incl r
   for f in b.md.floatTempRegs: b.freeVolF.incl f
   for f in b.md.floatCalleeSaved: b.freeCalleeF.incl f
+
+proc findReturnedVarImpl(n: var Cursor): string =
+  ## First bare local returned by a `(ret <sym>)` anywhere in the subtree, or "".
+  ## Advances `n` past the subtree (mirrors `exprReadsRegImpl`'s early-return walk).
+  if n.kind == TagLit:
+    if n.stmtKind == RetS:
+      var r = n
+      inc r                                  # into the ret → its value
+      if r.kind == Symbol: return symName(r)
+    n.into:
+      while n.hasMore:
+        let s = findReturnedVarImpl(n)
+        if s.len > 0: return s
+  else:
+    inc n
+  return ""
+
+proc findReturnedVar(body: Cursor): string =
+  var c = body
+  findReturnedVarImpl(c)
 
 proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
                    prog: var Program; md: MachineDesc; tc: TypeCtx;
@@ -2409,6 +2496,11 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
     allocParams(b, n, an.hasCall)            # advances n past params → return type
     skip n                                    # return type
     skip n                                    # pragmas
+    # A scalar-returning proc: find the local it returns so its var-decl can prefer the
+    # return register as home (only when call-free and the register is free — see the
+    # var-decl path). An aggregate/float/indirect return marshals differently.
+    if not b.retAggr and b.retFloatBits == 0 and not b.retIndirect:
+      b.returnedVar = findReturnedVar(n)
     walk(b, n)                                # body
   b.closeScope()
   result = ensureMove b.ra

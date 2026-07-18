@@ -40,6 +40,21 @@
 | `(udiv D S)`           | A64Inst                  | unsigned divide |
 | `(smulh D S)`          | A64Inst                  | signed multiply high (top 64 bits of D*S) |
 | `(umulh D S)`          | A64Inst                  | unsigned multiply high (top 64 bits of D*S) |
+| `(add3 D A B)`         | A64Inst                  | 3-operand add (D = A + B) |
+| `(sub3 D A B)`         | A64Inst                  | 3-operand subtract (D = A - B) |
+| `(mul3 D A B)`         | A64Inst                  | 3-operand multiply (D = A * B) |
+| `(and3 D A B)`         | A64Inst                  | 3-operand bitwise and (D = A and B) |
+| `(orr3 D A B)`         | A64Inst                  | 3-operand bitwise or (D = A or B) |
+| `(eor3 D A B)`         | A64Inst                  | 3-operand bitwise xor (D = A xor B) |
+| `(lsl3 D A B)`         | A64Inst                  | 3-operand logical shift left (D = A shl B) |
+| `(lsr3 D A B)`         | A64Inst                  | 3-operand logical shift right (D = A shr B) |
+| `(asr3 D A B)`         | A64Inst                  | 3-operand arithmetic shift right (D = A sar B) |
+| `(addw D S)`           | A64Inst                  | 32-bit add (W-form, result zero-extended) |
+| `(subw D S)`           | A64Inst                  | 32-bit subtract (W-form, result zero-extended) |
+| `(mulw D S)`           | A64Inst                  | 32-bit multiply (W-form, result zero-extended) |
+| `(addw3 D A B)`        | A64Inst                  | 32-bit 3-operand add (D = A + B, W-form) |
+| `(subw3 D A B)`        | A64Inst                  | 32-bit 3-operand subtract (D = A - B, W-form) |
+| `(mulw3 D A B)`        | A64Inst                  | 32-bit 3-operand multiply (D = A * B, W-form) |
 | `(addsd D S)`          | X64Inst                  | add scalar double |
 | `(subsd D S)`          | X64Inst                  | subtract scalar double |
 | `(mulsd D S)`          | X64Inst                  | multiply scalar double |
