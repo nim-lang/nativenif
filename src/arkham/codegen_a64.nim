@@ -85,18 +85,35 @@ proc movReg(g: var CodeGen; d, s: Reg) =
   if d == s: return
   g.ab.tree MovA64: g.emReg d; g.emReg s
 
-proc binReg(g: var CodeGen; op: A64Inst; d, s: Reg) =
-  g.ab.tree op: g.emReg d; g.emReg s
+# `w32` selects the 32-bit W-form tag (`add`→`addw`, `add3`→`addw3`, …) for an
+# UNSIGNED 32-bit result: the W-form auto zero-extends into bits 32..63, so the
+# `normalizeBinWidth` shift-pair that would otherwise re-clear the top half is
+# elided (see emitBin2). Only add/sub/mul have W-forms; other ops pass w32 = false.
+proc wForm(op: A64Inst): A64Inst =
+  case op
+  of AddA64: AddwA64
+  of SubA64: SubwA64
+  of MulA64: MulwA64
+  else: op
 
-proc binImm(g: var CodeGen; op: A64Inst; d: Reg; v: int64) =
-  g.ab.tree op: g.emReg d; g.ab.intLit v
+proc binReg(g: var CodeGen; op: A64Inst; d, s: Reg; w32 = false) =
+  g.ab.tree (if w32: wForm(op) else: op): g.emReg d; g.emReg s
+
+proc binImm(g: var CodeGen; op: A64Inst; d: Reg; v: int64; w32 = false) =
+  g.ab.tree (if w32: wForm(op) else: op): g.emReg d; g.ab.intLit v
 
 # 3-operand forms `(op3 D A B)` → `D = A op B` (arm64 native, non-destructive). Used
 # when the left source `A` is a still-live local in a register distinct from the
 # result `D`, so the value is computed without a preceding `mov D, A`. The 2-operand
 # op tag is mapped to its distinct 3-operand tag (`add`→`add3`, …); nifasm dispatches
 # on the tag's fixed arity (see parse3OperandsA64).
-proc threeOpTag(op: A64Inst): A64Inst =
+proc threeOpTag(op: A64Inst; w32 = false): A64Inst =
+  if w32:
+    case op
+    of AddA64: return Addw3A64
+    of SubA64: return Subw3A64
+    of MulA64: return Mulw3A64
+    else: discard
   case op
   of AddA64: Add3A64
   of SubA64: Sub3A64
@@ -109,11 +126,11 @@ proc threeOpTag(op: A64Inst): A64Inst =
   of AsrA64: Asr3A64
   else: op
 
-proc binReg3(g: var CodeGen; op: A64Inst; d, a, b: Reg) =
-  g.ab.tree threeOpTag(op): g.emReg d; g.emReg a; g.emReg b
+proc binReg3(g: var CodeGen; op: A64Inst; d, a, b: Reg; w32 = false) =
+  g.ab.tree threeOpTag(op, w32): g.emReg d; g.emReg a; g.emReg b
 
-proc binImm3(g: var CodeGen; op: A64Inst; d, a: Reg; v: int64) =
-  g.ab.tree threeOpTag(op): g.emReg d; g.emReg a; g.ab.intLit v
+proc binImm3(g: var CodeGen; op: A64Inst; d, a: Reg; v: int64; w32 = false) =
+  g.ab.tree threeOpTag(op, w32): g.emReg d; g.emReg a; g.ab.intLit v
 
 proc emAdr(g: var CodeGen; d: Reg; sym: string) =
   g.ab.tree AdrA64: g.emReg d; g.ab.sym sym
@@ -1781,13 +1798,15 @@ proc binA64Op(g: var CodeGen; c: Cursor): A64Inst =
   of BitxorC: EorA64
   else: raiseAssert "arkham a64n: binA64Op " & $c.exprKind
 
-proc foldRhs2(g: var CodeGen; op: A64Inst; dest: Reg; rhsLoc: Location; rhsC: Cursor) =
+proc foldRhs2(g: var CodeGen; op: A64Inst; dest: Reg; rhsLoc: Location; rhsC: Cursor;
+              w32 = false) =
   ## `dest = dest op rhs`, materializing the rhs as a64 needs (no memory operand; a
   ## large/non-add immediate goes through a bridge). `dest` already holds the lhs.
+  ## `w32` selects the 32-bit W-form tag for add/sub/mul (see wForm/emitBin2).
   case rhsLoc.kind
   of Imm:
     if op in {AddA64, SubA64} and rhsLoc.ival >= 0 and rhsLoc.ival <= 0xFFFF:
-      g.binImm(op, dest, rhsLoc.ival)
+      g.binImm(op, dest, rhsLoc.ival, w32)
     elif op in {LslA64, LsrA64, AsrA64} and rhsLoc.ival >= 0 and rhsLoc.ival <= 63:
       # arm64 shifts take an immediate count natively (`lsl x, x, #n`), same form
       # `extendTo` already emits — so a constant shift amount folds in place rather
@@ -1796,14 +1815,14 @@ proc foldRhs2(g: var CodeGen; op: A64Inst; dest: Reg; rhsLoc: Location; rhsC: Cu
     else:
       let b = g.takeBridge(avoid = dest)
       g.movImm(b, rhsLoc.ival)
-      g.binReg(op, dest, b)
+      g.binReg(op, dest, b, w32)
       g.dropBridge b
   of InReg:
-    g.binReg(op, dest, rhsLoc.r)
+    g.binReg(op, dest, rhsLoc.r, w32)
   of NamedStack, Mem, Glob, Tvar:
     let b = g.takeBridge(avoid = dest)
     g.place2(rhsLoc, b)
-    g.binReg(op, dest, b)
+    g.binReg(op, dest, b, w32)
     g.dropBridge b
   else: raiseAssert "arkham a64n: foldRhs2 " & $rhsLoc.kind
 
@@ -1811,29 +1830,37 @@ const ThreeOpA64 = {AddA64, SubA64, MulA64, AndA64, OrrA64, EorA64,
                     LslA64, LsrA64, AsrA64}
   ## Ops with a native 3-operand `(op D A B)` nifasm encoding (see parseArith3A64).
 
-proc foldRhs3(g: var CodeGen; op: A64Inst; dest, rn: Reg; rhsLoc: Location; rhsC: Cursor) =
+proc foldRhs3(g: var CodeGen; op: A64Inst; dest, rn: Reg; rhsLoc: Location; rhsC: Cursor;
+              w32 = false) =
   ## `dest = rn op rhs` — the 3-operand twin of `foldRhs2`. `rn` holds the left
   ## source (a live local's register, distinct from `dest`); nothing is moved into
   ## `dest` first. Materializes the rhs exactly as `foldRhs2` does.
   case rhsLoc.kind
   of Imm:
     if op in {AddA64, SubA64} and rhsLoc.ival >= 0 and rhsLoc.ival <= 0xFFFF:
-      g.binImm3(op, dest, rn, rhsLoc.ival)
+      g.binImm3(op, dest, rn, rhsLoc.ival, w32)
     elif op in {LslA64, LsrA64, AsrA64} and rhsLoc.ival >= 0 and rhsLoc.ival <= 63:
       g.binImm3(op, dest, rn, rhsLoc.ival)
     else:
       let b = g.takeBridge(avoid = dest)
       g.movImm(b, rhsLoc.ival)
-      g.binReg3(op, dest, rn, b)
+      g.binReg3(op, dest, rn, b, w32)
       g.dropBridge b
   of InReg:
-    g.binReg3(op, dest, rn, rhsLoc.r)
+    g.binReg3(op, dest, rn, rhsLoc.r, w32)
   of NamedStack, Mem, Glob, Tvar:
     let b = g.takeBridge(avoid = dest)
     g.place2(rhsLoc, b)
-    g.binReg3(op, dest, rn, b)
+    g.binReg3(op, dest, rn, b, w32)
     g.dropBridge b
   else: raiseAssert "arkham a64n: foldRhs3 " & $rhsLoc.kind
+
+proc isUnsigned32(resTypeC: Cursor): bool =
+  ## True for a `(u 32)` result — the case where an add/sub/mul W-form gives the
+  ## fully-normalized (zero-extended) value for free, letting emitBin2 both emit the
+  ## `addw`/`subw`/`mulw` tag and skip the `normalizeBinWidth` shift-pair.
+  let slot = typeToSlot(resTypeC)
+  slot.kind == AUInt and slot.size == 4
 
 proc normalizeBinWidth(g: var CodeGen; resTypeC: Cursor; rD: Reg; op: A64Inst) =
   ## arkham keeps register values canonically sign/zero-extended to their full
@@ -1902,17 +1929,22 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
       if reusedLhs or reusedRhs: g.bindTemp(rD, res.typ)   # inherited an operand's binding
     elif nm.len > 0:
       g.rebindLocalAs(nm, rD, resTypeC)
+  # A `(u 32)` add/sub/mul result: emit the W-form (`addw`/`subw`/`mulw`), which
+  # zero-extends bits 32..63 in hardware, and drop the `normalizeBinWidth` shift-pair
+  # that would otherwise re-clear them. The neg-based aliasRhs path keeps the X-form.
+  let w32 = op in {AddA64, SubA64, MulA64} and not aux.aliasRhs and isUnsigned32(resTypeC)
   if aux.aliasRhs:
     assert lhsLoc.kind == InReg, "arkham a64n: aliasRhs lhs " & $lhsLoc.kind
     g.binReg(op, rD, lhsLoc.r)                            # dest := rhs op lhs
     if op == SubA64:
       g.ab.tree NegA64: g.emReg rD                        # dest := lhs - rhs
   elif lhsLoc.kind == InReg and lhsLoc.r != rD and op in ThreeOpA64:
-    g.foldRhs3(op, rD, lhsLoc.r, rhsLoc, rhsC)           # dest := lhs op rhs (no `mov dest, lhs`)
+    g.foldRhs3(op, rD, lhsLoc.r, rhsLoc, rhsC, w32)      # dest := lhs op rhs (no `mov dest, lhs`)
   else:
     g.place2(lhsLoc, rD)                                  # dest := lhs
-    g.foldRhs2(op, rD, rhsLoc, rhsC)                      # dest op= rhs
-  g.normalizeBinWidth(resTypeC, rD, op)                   # restore the sub-width invariant
+    g.foldRhs2(op, rD, rhsLoc, rhsC, w32)                # dest op= rhs
+  if not w32:
+    g.normalizeBinWidth(resTypeC, rD, op)                # restore the sub-width invariant
   if rhsLoc.kind == InReg and rhsLoc.isTemp and not reusedRhs: g.unbindTemp(rhsLoc.r)
   if lhsLoc.kind == InReg and lhsLoc.isTemp and not reusedLhs: g.unbindTemp(lhsLoc.r)
   if resStaging != NoReg:

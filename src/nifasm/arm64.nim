@@ -110,14 +110,21 @@ proc emitMovImm64*(dest: var Bytes; rd: Register; imm: uint64) =
       else:
         emitMovK(dest, rd, chunk, uint8(shift))
 
+# The `sf` bit (bit 31) selects the 64-bit (Xd, sf=1) vs 32-bit (Wd, sf=0) form for
+# the add/sub/mul data-processing encodings below. The base opcodes bake in sf=1; the
+# 32-bit W-form (auto zero-extends the result into bits 32..63) is the same encoding
+# with bit 31 cleared. Callers pass `w = true` for a 32-bit result.
+const SfBit = 0x80000000'u32
+
 # ADD instruction - register + register
-proc emitAdd*(dest: var Bytes; rd, rn, rm: Register) =
-  ## Emit ADD instruction: ADD rd, rn, rm
+proc emitAdd*(dest: var Bytes; rd, rn, rm: Register; w = false) =
+  ## Emit ADD instruction: ADD rd, rn, rm  (Wd form when `w`)
   # ADD Xd, Xn, Xm: 1000 1011 000m mmmm 0000 00nn nnnd dddd
-  let instr = 0x8B000000'u32 or
+  var instr = 0x8B000000'u32 or
               (encodeReg(rm) shl 16) or
               (encodeReg(rn) shl 5) or
               encodeReg(rd)
+  if w: instr = instr and not SfBit
   dest.addUint32(instr)
 
 proc emitAddShifted*(dest: var Bytes; rd, rn, rm: Register; shift: uint8) =
@@ -131,13 +138,14 @@ proc emitAddShifted*(dest: var Bytes; rd, rn, rm: Register; shift: uint8) =
   dest.addUint32(instr)
 
 # ADD immediate
-proc emitAddImm*(dest: var Bytes; rd, rn: Register; imm: uint16) =
-  ## Emit ADD instruction: ADD rd, rn, #imm
+proc emitAddImm*(dest: var Bytes; rd, rn: Register; imm: uint16; w = false) =
+  ## Emit ADD instruction: ADD rd, rn, #imm  (Wd form when `w`)
   # ADD Xd, Xn, #imm: 1001 0001 00ii iiii iiii iinn nnnd dddd
-  let instr = 0x91000000'u32 or
+  var instr = 0x91000000'u32 or
               (uint32(imm) shl 10) or
               (encodeReg(rn) shl 5) or
               encodeReg(rd)
+  if w: instr = instr and not SfBit
   dest.addUint32(instr)
 
 proc emitAddExtended*(dest: var Bytes; rd, rn, rm: Register; shift: uint8 = 0) =
@@ -157,33 +165,36 @@ proc emitAddExtended*(dest: var Bytes; rd, rn, rm: Register; shift: uint8 = 0) =
   dest.addUint32(instr)
 
 # SUB instruction - register - register
-proc emitSub*(dest: var Bytes; rd, rn, rm: Register) =
-  ## Emit SUB instruction: SUB rd, rn, rm
+proc emitSub*(dest: var Bytes; rd, rn, rm: Register; w = false) =
+  ## Emit SUB instruction: SUB rd, rn, rm  (Wd form when `w`)
   # SUB Xd, Xn, Xm: 1100 1011 000m mmmm 0000 00nn nnnd dddd
-  let instr = 0xCB000000'u32 or
+  var instr = 0xCB000000'u32 or
               (encodeReg(rm) shl 16) or
               (encodeReg(rn) shl 5) or
               encodeReg(rd)
+  if w: instr = instr and not SfBit
   dest.addUint32(instr)
 
 # SUB immediate
-proc emitSubImm*(dest: var Bytes; rd, rn: Register; imm: uint16) =
-  ## Emit SUB instruction: SUB rd, rn, #imm
+proc emitSubImm*(dest: var Bytes; rd, rn: Register; imm: uint16; w = false) =
+  ## Emit SUB instruction: SUB rd, rn, #imm  (Wd form when `w`)
   # SUB Xd, Xn, #imm: 1101 0001 00ii iiii iiii iinn nnnd dddd
-  let instr = 0xD1000000'u32 or
+  var instr = 0xD1000000'u32 or
               (uint32(imm) shl 10) or
               (encodeReg(rn) shl 5) or
               encodeReg(rd)
+  if w: instr = instr and not SfBit
   dest.addUint32(instr)
 
 # MUL instruction
-proc emitMul*(dest: var Bytes; rd, rn, rm: Register) =
-  ## Emit MUL instruction: MUL rd, rn, rm (alias for MADD rd, rn, rm, XZR)
+proc emitMul*(dest: var Bytes; rd, rn, rm: Register; w = false) =
+  ## Emit MUL instruction: MUL rd, rn, rm (alias for MADD rd, rn, rm, XZR)  (Wd form when `w`)
   # MADD Xd, Xn, Xm, XZR: 1001 1011 000m mmmm 0111 11nn nnnd dddd
-  let instr = 0x9B007C00'u32 or
+  var instr = 0x9B007C00'u32 or
               (encodeReg(rm) shl 16) or
               (encodeReg(rn) shl 5) or
               encodeReg(rd)
+  if w: instr = instr and not SfBit
   dest.addUint32(instr)
 
 # SMULH / UMULH — 64×64→high-64 multiply (top half of the 128-bit product).
