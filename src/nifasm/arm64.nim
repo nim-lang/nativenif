@@ -562,6 +562,14 @@ proc emitAdrpAddGvar*(dest: var Bytes; rd: Register) =
   dest.addUint32(0x90000000'u32 or encodeReg(rd))                       # adrp rd, 0
   dest.addUint32(0x91000000'u32 or (encodeReg(rd) shl 5) or encodeReg(rd))  # add rd, rd, #0
 
+proc emitAdrpGvarPage*(dest: var Bytes; rd: Register) =
+  ## Placeholder `adrp rd, 0` (page only) for a __DATA/.bss global whose page OFFSET
+  ## rides in a following folded `ldr`/`str` immediate instead of a separate `add`
+  ## (see `gload`/`gstore`). The link-time patch fills the adrp page here and the
+  ## scaled page-offset into the ldr/str at pos+4 — the same gvar site, detected by
+  ## the pos+4 opcode.
+  dest.addUint32(0x90000000'u32 or encodeReg(rd))                       # adrp rd, 0
+
 proc emitAdrp*(dest: var Buffer; rd: Register; target: LabelId) =
   ## Emit ADRP instruction: ADRP rd, target (load page address of label)
   # ADRP Xd, label: 1001 0000 00ii iiii iiii iiii iiii dddd

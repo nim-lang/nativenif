@@ -55,6 +55,8 @@
 | `(addw3 D A B)`        | A64Inst                  | 32-bit 3-operand add (D = A + B, W-form) |
 | `(subw3 D A B)`        | A64Inst                  | 32-bit 3-operand subtract (D = A - B, W-form) |
 | `(mulw3 D A B)`        | A64Inst                  | 32-bit 3-operand multiply (D = A * B, W-form) |
+| `(gload D S)`          | A64Inst                  | load scalar from global S: adrp + folded ldr (drops the address `add`) |
+| `(gstore D S)`         | A64Inst                  | store scalar D to global S: adrp + folded str |
 | `(addsd D S)`          | X64Inst                  | add scalar double |
 | `(subsd D S)`          | X64Inst                  | subtract scalar double |
 | `(mulsd D S)`          | X64Inst                  | multiply scalar double |

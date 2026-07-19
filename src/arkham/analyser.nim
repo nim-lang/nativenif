@@ -87,6 +87,20 @@ type
                                 ## off-spine reads set this. Consumed by `allocParams` (gated
                                 ## on `arg == intRetReg`, so a no-op on x86-64 where ret≠arg0).
 
+  LoopFrame = object
+    ## An enclosing `WhileS`, treated as `loop: (if cond: body else break)`: the
+    ## condition and body form ONE loop body walked once, but the back-edge makes
+    ## every point re-reachable from every other. Two consequences the linear walk
+    ## cannot see textually, recovered here at the frame:
+    ##  * liveness: a var used in the loop is live across the whole span (`lo..hi`);
+    ##  * `usedAfterCall`: a param read anywhere in a loop that contains a call is
+    ##    read again *after* that call via the back-edge — even a param used only in
+    ##    the loop CONDITION, which textually precedes the body's call.
+    lo, hi: int                ## token span of the whole loop (for `declInLoop` liveness)
+    sawCall: bool              ## a real call point occurred within this loop (any depth)
+    usedParams: HashSet[string] ## names of params read within this loop (any depth); on
+                               ## loop exit, if `sawCall`, each is flagged `usedAfterCall`
+
   Context = object
     inLoops, inAddr, inAsgnTarget, inArrayIndex: int
     arg0Name: string           ## name of the FIRST integer/pointer param (the one homed in
@@ -108,8 +122,9 @@ type
                                ## legal home) iff none of these fall in its live interval.
     shiftPositions: seq[int]   ## token position of every *variable* shift (clobbers rcx);
                                ## the `ShiftRegOk` analog of `divPositions`.
-    loopStack: seq[tuple[lo, hi: int]]  ## spans of the enclosing loops (`WhileS`), so a
-                               ## var declared in a loop can record its loop's extent
+    loopStack: seq[LoopFrame]  ## the enclosing loops (`WhileS`), innermost last — so a var
+                               ## declared/used in a loop can record its loop's extent, and a
+                               ## loop's back-edge liveness is resolved when its frame is popped
     stmtEnd: seq[int]          ## per open scope frame: end position of the
                                ## statement it is currently processing
     buf: ptr TokenBuf          ## for cursor → token-position mapping
@@ -281,6 +296,11 @@ proc analyse(c: var Context; n: var Cursor) =
       e.freeAfter = max(e.freeAfter, hi)
       e.lastUsePos = max(e.lastUsePos, hi)   # tracked even for params (freeAfter pinned to high)
       if c.completedCalls > 0: e.usedAfterCall = true  # used after a call returned → must survive it
+      # Record a PARAM read against every enclosing loop: if that loop turns out to
+      # contain a call, the back-edge makes this a use-after-call (resolved at pop),
+      # even when the read textually precedes the call (a loop-CONDITION param).
+      if e.freeAfter == high(int) and c.loopStack.len > 0:
+        c.loopStack[^1].usedParams.incl vn
       if (c.inAddr + c.inArrayIndex) > 0:
         # arrays / address-taken locals cannot live in a register
         e.props.incl AddrTaken
@@ -289,6 +309,7 @@ proc analyse(c: var Context; n: var Cursor) =
       # treat it like a call point: locals live across it must avoid the volatile
       # argument registers.
       c.callPositions.add posOf(c, n)
+      if c.loopStack.len > 0: c.loopStack[^1].sawCall = true
       inc c.completedCalls              # the thunk call clobbers the arg regs here and now
     inc n
   of IntLit, UIntLit, FloatLit, CharLit, StrLit, Ident, SymbolDef, DotToken:
@@ -374,7 +395,9 @@ proc analyse(c: var Context; n: var Cursor) =
           if probe.kind == Symbol: isAtomic = symName(probe) in c.atomicCalls
           while probe.hasMore: skip probe  # drain so `into` sees all children consumed
       if isAtomic: c.atomicPositions.add posOf(c, n)
-      else: c.callPositions.add posOf(c, n)
+      else:
+        c.callPositions.add posOf(c, n)
+        if c.loopStack.len > 0: c.loopStack[^1].sawCall = true
       # ArgResident safety walk (peek only; the real accounting is analyseChildren below).
       # A param P may stay in its arg register across its consuming call only if that call
       # marshals it back to its OWN arg-GPR — a self-move no sibling arg clobbers. Peek the
@@ -416,13 +439,25 @@ proc analyse(c: var Context; n: var Cursor) =
     of ProcS, TypeS:
       skip n                            # nested decls: not our locals
     of WhileS:
+      # Treat `while cond: body` as `loop: (if cond: body else break)` — condition and
+      # body are one loop body under a back-edge (no prepass; the traversal just reads it
+      # that way). Walk it as usual, then resolve the back-edge at the frame.
       var e = n; skip e               # span of the whole loop, for declInLoop vars
-      c.loopStack.add (lo: posOf(c, n), hi: posOf(c, e))
+      c.loopStack.add LoopFrame(lo: posOf(c, n), hi: posOf(c, e))
       n.into:
         inc c.inLoops
         while n.hasMore: analyse(c, n)
         dec c.inLoops
-      discard c.loopStack.pop()
+      let frame = c.loopStack.pop()
+      # Back-edge resolution: a param read anywhere in a loop that contains a call is
+      # re-read after that call on the next iteration → it cannot stay in its incoming
+      # arg register across the loop. Flag it; the ArgResident gate then denies it.
+      if frame.sawCall:
+        for pnm in frame.usedParams: c.res.vars[pnm].usedAfterCall = true
+      # Propagate to the enclosing loop: its back-edge re-reaches this whole sub-loop.
+      if c.loopStack.len > 0:
+        if frame.sawCall: c.loopStack[^1].sawCall = true
+        for pnm in frame.usedParams: c.loopStack[^1].usedParams.incl pnm
     else:
       analyseChildren(c, n)             # if/case/ret/... : recurse
   else:
@@ -615,6 +650,10 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
   # `arkhamGlobalInit` call INJECTED before its body (not in the analysed IR), which
   # clobbers the caller-saved arg registers before the first body use of argc/argv/envp —
   # so no param may stay in its incoming register here.
+  #
+  # (Loop back-edge liveness for `usedAfterCall` is already resolved structurally at each
+  # `WhileS` frame — see `LoopFrame` — so a param read only in a loop CONDITION whose body
+  # contains a call is correctly flagged here without any post-pass.)
   if c.res.hasCall and c.procIsClean and not entryLeadingClobber:
     for name, vi in mpairs c.res.vars:
       if vi.freeAfter == high(int) and AddrTaken notin vi.props and
