@@ -2619,6 +2619,25 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
         error("ADR source must be a label", n)
       arm64.emitAdr(ctx.buf, dest.reg, op.label)
 
+  of GloadA64, GstoreA64:
+    # `(gload D S)` / `(gstore D S)` — scalar load/store of a __DATA/.bss global `S`
+    # with the page OFFSET folded into the ldr/str immediate instead of a separate
+    # `add`: `adrp x17, S@PAGE ; ldr/str D, [x17, S@PAGEOFF]`. The page-offset patch
+    # rides on the SAME gvar site (recorded at the adrp) — writeMachO/writeElf detect
+    # the folded ldr/str at pos+4 by its opcode and patch the scaled imm12 there.
+    let isLoad = instTag == GloadA64
+    inc n
+    let dreg = parseDestA64(n, ctx)
+    let op = parseOperandA64(n, ctx)
+    if dreg.kind != okReg: error((if isLoad: "gload" else: "gstore") & " needs a register", n)
+    if op.gvarSym == nil: error((if isLoad: "gload" else: "gstore") & " source must be a global", n)
+    # Size the access from the global's own scalar type (byte/half/word/dword).
+    let (size, opc) = memWidthOpc(op.gvarSym.typ, isLoad)
+    let pos = ctx.buf.data.getCurrentPosition()
+    arm64.emitAdrpGvarPage(ctx.buf.data, arm64.X17)          # adrp x17, S@PAGE (page patched)
+    ctx.gvarSites.add (pos, op.gvarSym)                      # pos+4 (the ldr/str) gets S@PAGEOFF
+    arm64.emitLoadStoreUImm(ctx.buf.data, dreg.reg, arm64.X17, 0'i32, size, opc)
+
   of AddA64:
     inc n
     let dest = parseDestA64(n, ctx)
@@ -6320,11 +6339,20 @@ proc writeElf(a: var GenContext; outfile: string) =
       adrp = adrp or immlo or immhi
       code[pos+0] = byte(adrp and 0xFF);          code[pos+1] = byte((adrp shr 8) and 0xFF)
       code[pos+2] = byte((adrp shr 16) and 0xFF); code[pos+3] = byte((adrp shr 24) and 0xFF)
-      var add = uint32(code[pos+4]) or (uint32(code[pos+5]) shl 8) or
-                (uint32(code[pos+6]) shl 16) or (uint32(code[pos+7]) shl 24)
-      add = add or (uint32(pageOff and 0xFFF) shl 10)
-      code[pos+4] = byte(add and 0xFF);           code[pos+5] = byte((add shr 8) and 0xFF)
-      code[pos+6] = byte((add shr 16) and 0xFF);  code[pos+7] = byte((add shr 24) and 0xFF)
+      # pos+4 is `add rd, rd, #pageoff` (address-taking) OR a folded `ldr/str rt,
+      # [x17, #pageoff]` (gload/gstore). Load/store unsigned-imm has bits[29:24]==0x39
+      # and scales its imm12 by the access size (bits[31:30]); `add` uses the raw offset.
+      var lo = uint32(code[pos+4]) or (uint32(code[pos+5]) shl 8) or
+               (uint32(code[pos+6]) shl 16) or (uint32(code[pos+7]) shl 24)
+      if ((lo shr 24) and 0x3F'u32) == 0x39'u32:
+        let size = (lo shr 30) and 0x3'u32
+        doAssert (pageOff and ((1'u64 shl size) - 1)) == 0,
+          "gload/gstore: global page-offset not aligned to its access size"
+        lo = lo or (uint32((pageOff shr size) and 0xFFF) shl 10)
+      else:
+        lo = lo or (uint32(pageOff and 0xFFF) shl 10)
+      code[pos+4] = byte(lo and 0xFF);            code[pos+5] = byte((lo shr 8) and 0xFF)
+      code[pos+6] = byte((lo shr 16) and 0xFF);   code[pos+7] = byte((lo shr 24) and 0xFF)
     else:
       # x86-64: a RIP-relative `lea` — 7 bytes with a disp32 at offset +3; RIP points
       # at the next instruction (+7).

@@ -765,13 +765,23 @@ proc writeMachO*(code: Bytes; bssSize: int;
       modifiedCode[pos+1] = byte((adrp shr 8) and 0xFF)
       modifiedCode[pos+2] = byte((adrp shr 16) and 0xFF)
       modifiedCode[pos+3] = byte((adrp shr 24) and 0xFF)
-      var add = uint32(modifiedCode[pos+4]) or (uint32(modifiedCode[pos+5]) shl 8) or
-                (uint32(modifiedCode[pos+6]) shl 16) or (uint32(modifiedCode[pos+7]) shl 24)
-      add = add or (uint32(pageOff and 0xFFF) shl 10)
-      modifiedCode[pos+4] = byte(add and 0xFF)
-      modifiedCode[pos+5] = byte((add shr 8) and 0xFF)
-      modifiedCode[pos+6] = byte((add shr 16) and 0xFF)
-      modifiedCode[pos+7] = byte((add shr 24) and 0xFF)
+      # pos+4 is either `add rd, rd, #pageoff` (address-taking) or a folded
+      # `ldr/str rt, [x17, #pageoff]` (gload/gstore). The load/store unsigned-imm
+      # family has bits[29:24] == 0x39 and scales its imm12 by the access size
+      # (bits[31:30]); `add` uses the raw 12-bit offset. Detect and encode accordingly.
+      var lo = uint32(modifiedCode[pos+4]) or (uint32(modifiedCode[pos+5]) shl 8) or
+               (uint32(modifiedCode[pos+6]) shl 16) or (uint32(modifiedCode[pos+7]) shl 24)
+      if ((lo shr 24) and 0x3F'u32) == 0x39'u32:
+        let size = (lo shr 30) and 0x3'u32
+        doAssert (pageOff and ((1'u64 shl size) - 1)) == 0,
+          "gload/gstore: global page-offset not aligned to its access size"
+        lo = lo or (uint32((pageOff shr size) and 0xFFF) shl 10)
+      else:
+        lo = lo or (uint32(pageOff and 0xFFF) shl 10)
+      modifiedCode[pos+4] = byte(lo and 0xFF)
+      modifiedCode[pos+5] = byte((lo shr 8) and 0xFF)
+      modifiedCode[pos+6] = byte((lo shr 16) and 0xFF)
+      modifiedCode[pos+7] = byte((lo shr 24) and 0xFF)
 
   # Patch TLV adrp+add sites with the descriptor's __thread_vars address (same
   # page-relative encoding as gvars; each descriptor is 24 bytes).

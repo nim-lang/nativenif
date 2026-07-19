@@ -1305,6 +1305,18 @@ proc placeImm(g: var CodeGen; dest: Reg; loc: Location) =
     g.ab.tree MovA64: (g.emReg dest; g.ab.nilValue())
   else: g.movImm(dest, loc.ival)
 
+proc globalIsGvarSlot(g: var CodeGen; name: string): bool =
+  ## True when `name` is a real `.bss`/`.data` gvar (nifasm `GvarD`, carrying a
+  ## page-offset patch site) — the `gload`/`gstore` fold target — rather than a
+  ## read-only `const` blob (`RodataD`), which is a label with no gvar site. Mirrors
+  ## `genGlobal`'s split exactly: rodata iff the decl is a `const` WITH a value.
+  let si = g.lookupSym(name)
+  if si.cat != scGlobal: return false
+  var d = si.decl
+  if d.stmtKind != ConstS: return true                  # a `var`/gvar → GvarD
+  inc d; skip d; skip d                                  # const: name, pragmas, type
+  result = not (d.hasMore and d.kind != DotToken)        # value-less const → gvar slot
+
 proc place2(g: var CodeGen; src: Location; dest: Reg) =
   ## `dest ← <scalar Location src>`. The pure-emit analogue of `emitLoad`: a
   ## global/threadvar address is formed straight into `dest` (no borrowed temp),
@@ -1314,21 +1326,26 @@ proc place2(g: var CodeGen; src: Location; dest: Reg) =
   of Imm: g.placeImm(dest, src)
   of NamedStack: g.emScalarLoad(dest, src.name)
   of Glob:
-    # `dest = &g` then `dest = [dest]`. The deref must be typed `(ptr <globalType>)` so
-    # it yields the global's PRECISE type: `dest` is bound to the *value* type, so a bare
-    # `(mem dest)` drops a pointer level — harmless for a scalar global, but a POINTER
-    # global would then load `object` where `(ptr object)` is wanted (nifasm is strict).
-    # Cast the address in the deref rather than spend a scarce bridge (mirrors the x64
-    # `scalarMemMov` Glob-load fix).
-    g.emAdr(dest, src.name)
-    g.ab.tree MovA64:
-      g.emReg dest
-      g.ab.tree MemX:
-        if not cursorIsNil(src.typ.typ):
-          var pt = g.prog.ptrTypeOf(src.typ.typ)
-          g.ab.tree CastX: (g.genTypeBody(pt); g.emReg dest)
-        else:
-          g.emReg dest
+    if g.globalIsGvarSlot(src.name):
+      # Fold the page offset into the load: `adrp x17, g@PAGE ; ldr dest, [x17, g@PAGEOFF]`
+      # (one `add` fewer than the address-then-deref below). nifasm sizes it from the
+      # gvar's own scalar type.
+      g.ab.tree GloadA64: (g.emReg dest; g.ab.sym src.name)
+    else:
+      # A read-only `const` (rodata label, no page-offset site): form the address, deref.
+      # The deref is typed `(ptr <globalType>)` so it yields the PRECISE type — `dest` is
+      # bound to the *value* type, so a bare `(mem dest)` would drop a pointer level
+      # (harmless for a scalar, but a POINTER const would load `object` where `(ptr
+      # object)` is wanted; nifasm is strict). Cast in the deref rather than spend a bridge.
+      g.emAdr(dest, src.name)
+      g.ab.tree MovA64:
+        g.emReg dest
+        g.ab.tree MemX:
+          if not cursorIsNil(src.typ.typ):
+            var pt = g.prog.ptrTypeOf(src.typ.typ)
+            g.ab.tree CastX: (g.genTypeBody(pt); g.emReg dest)
+          else:
+            g.emReg dest
   of Tvar:
     if g.a64Linux: g.emAdr(dest, src.name)
     else: g.genTlvAddr(src.name, dest)
@@ -1358,11 +1375,15 @@ proc storeReg2(g: var CodeGen; dst: Location; src: Reg) =
   of InReg: g.movReg(dst.r, src)
   of NamedStack: g.emScalarStore(dst.name, src)
   of Glob:
-    let b = g.takeBridge(); g.emAdr(b, dst.name)
-    g.ab.tree MovA64:
-      g.ab.tree MemX: g.emReg b
-      g.emReg src
-    g.dropBridge b
+    if g.globalIsGvarSlot(dst.name):
+      # Fold: `adrp x17, g@PAGE ; str src, [x17, g@PAGEOFF]` — no bridge, no address `add`.
+      g.ab.tree GstoreA64: (g.emReg src; g.ab.sym dst.name)
+    else:
+      let b = g.takeBridge(); g.emAdr(b, dst.name)
+      g.ab.tree MovA64:
+        g.ab.tree MemX: g.emReg b
+        g.emReg src
+      g.dropBridge b
   of Tvar:
     let b = g.takeBridge()
     if g.a64Linux: g.emAdr(b, dst.name) else: g.genTlvAddr(dst.name, b)
