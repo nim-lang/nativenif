@@ -2459,6 +2459,11 @@ proc generateWasm*(buf: var TokenBuf; inputPath: string; tags: TagPool): seq[byt
   if getEnv("ITHAQUA_DEBUG").len > 0:
     for sym, fi in g.funcIdx:
       echo "func #", fi, " = ", sym
+    for nm, a in g.globalAddr:
+      echo "gvar @", a, " = ", nm
+  if getEnv("ITHAQUA_EXPORT_ALL").len > 0:
+    for sym, fi in g.funcIdx:
+      g.wm.addExportFunc("dbg$" & sym, fi)     # debug: drive any proc from the host
 
   # string literals + explicit data
   for (a, s) in g.dataSegs:
