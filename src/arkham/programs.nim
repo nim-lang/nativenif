@@ -379,7 +379,7 @@ proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
   var ignored = false
   parsePragmas(c, importcN, exportcN, intrinsic, ignored)
 
-proc parsePragmas(c: var Cursor; importcN, exportcN: var string) {.inline.} =
+proc parsePragmas*(c: var Cursor; importcN, exportcN: var string) {.inline.} =
   var ignored = NoIntrinsicOp
   parsePragmas(c, importcN, exportcN, ignored)
 
