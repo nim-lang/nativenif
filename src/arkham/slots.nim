@@ -105,24 +105,25 @@ proc typeBits*(c: Cursor): int =
   inc t   # past the type head → first child
   if t.kind == IntLit: int(intVal(t)) else: 0
 
-proc scalarSlot(kind: AsmTypeKind; bits: int): AsmSlot =
-  # `(i -1)` etc. (platform int) → assume 64-bit for now.
-  let sz = if bits > 0: (bits + 7) div 8 else: 8
+proc scalarSlot(kind: AsmTypeKind; bits: int; ptrSize: int): AsmSlot =
+  # `(i -1)` etc. (platform int) → the target's machine word size.
+  let sz = if bits > 0: (bits + 7) div 8 else: ptrSize
   result = AsmSlot(cls: kind, size: sz, align: min(sz, 8))
 
-proc typeToSlot*(c: Cursor): AsmSlot =
+proc typeToSlot*(c: Cursor; ptrSize = 8): AsmSlot =
   ## Classify a Leng type at `c`. Aggregates and unknowns become `AMem`
   ## (passed/kept by reference) for now. The classified slot retains `c` in `.typ`
   ## so a scratch register holding a value of this type can be `(rebind …)`'d to its
-  ## concrete Leng type (see `bindTemp`).
+  ## concrete Leng type (see `bindTemp`). `ptrSize` is the target's pointer/word
+  ## size in bytes (8 for the native targets, 4 for wasm32).
   case c.typeKind
-  of IT:   result = scalarSlot(AInt,  typeBits(c))
-  of UT:   result = scalarSlot(AUInt, typeBits(c))
-  of CT:   result = scalarSlot(AUInt, max(8, typeBits(c)))   # char: at least 1 byte
-  of FT:   result = scalarSlot(AFloat, typeBits(c))
+  of IT:   result = scalarSlot(AInt,  typeBits(c), ptrSize)
+  of UT:   result = scalarSlot(AUInt, typeBits(c), ptrSize)
+  of CT:   result = scalarSlot(AUInt, max(8, typeBits(c)), ptrSize)   # char: at least 1 byte
+  of FT:   result = scalarSlot(AFloat, typeBits(c), ptrSize)
   of BoolT: result = AsmSlot(cls: ABool, size: 1, align: 1)
   of PtrT, AptrT, ProctypeT:
-    result = AsmSlot(cls: AUInt, size: 8, align: 8)           # an address
+    result = AsmSlot(cls: AUInt, size: ptrSize, align: ptrSize)       # an address
   else:
     result = AsmSlot(cls: AMem, size: 0, align: 1)            # object/array/union/void/…
   result.typ = c

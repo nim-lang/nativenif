@@ -159,10 +159,13 @@ type
                                             ## a nil value, so its register binds to the asm
                                             ## `(nil)` type (not `(i 64)`) and emits `(nil)`.
     intType*: Cursor                        ## synthesized `(i 64)` — type of a bare IntLit
+                                            ## (`(i 32)` on a 4-byte-pointer target)
     uintType*: Cursor                       ## synthesized `(u 64)` — type of a bare UIntLit
+                                            ## (`(u 32)` on a 4-byte-pointer target)
     charType*: Cursor                       ## synthesized `(c 8)`  — type of a bare CharLit
     floatType*: Cursor                      ## synthesized `(f 64)` — type of a bare FloatLit
     boolType*: Cursor                       ## synthesized `(bool)` — type of a `(true)`/`(false)` literal
+    ptrSize*: int                           ## target pointer/word size in bytes (8 native, 4 wasm32)
 
   TypeEnv* = Table[SymId, Cursor]           ## a type-symbol table, keyed by POOL ID —
                                             ## the identity a `Symbol` token already
@@ -551,7 +554,7 @@ proc procSigType*(declStart: Cursor): Cursor =
   result = beginRead(buf)
 
 proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
-              darwin = false; windows = false): Program =
+              darwin = false; windows = false; ptrSize = 8): Program =
   ## `darwin` selects the Mach-O target, which links dynamically against
   ## libSystem (dyld + PLT). Unlike the static-ELF Linux target, an `importc`'d
   ## libc name there resolves through the dynamic linker, so it must go through
@@ -574,7 +577,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                    importcOnlyGvars: initHashSet[string](),
                    scheme: splitModulePath(inputPath), tags: tags,
                    pool: buf.pool,
-                   darwin: darwin, windows: windows)
+                   darwin: darwin, windows: windows, ptrSize: ptrSize)
   block:
     # A standalone `(proctype)` parsed against the shared tag pool; its cursor
     # outlives this buffer (the owner refcount keeps the data alive).
@@ -584,9 +587,10 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     result.voidPtr = beginRead(npBuf)
     var nilBuf = parseFromBuffer("(nil)", "", sharedTags = tags)
     result.nilLit = beginRead(nilBuf)
-    var itBuf = parseFromBuffer("(i 64)", "", sharedTags = tags)
+    let wordBits = $max(ptrSize * 8, 8)
+    var itBuf = parseFromBuffer("(i " & wordBits & ")", "", sharedTags = tags)
     result.intType = beginRead(itBuf)
-    var utBuf = parseFromBuffer("(u 64)", "", sharedTags = tags)
+    var utBuf = parseFromBuffer("(u " & wordBits & ")", "", sharedTags = tags)
     result.uintType = beginRead(utBuf)
     var ctBuf = parseFromBuffer("(c 8)", "", sharedTags = tags)
     result.charType = beginRead(ctBuf)
@@ -1057,11 +1061,11 @@ proc typeSizeAlign*(p: var Program; c: Cursor): (int, int) =
     case c.typeKind
     of IT, UT, FT, CT:
       let bits = typeBits(c)
-      let bytes = (if bits > 0: bits else: 64) div 8
+      let bytes = (if bits > 0: bits else: p.ptrSize * 8) div 8
       result = (bytes, bytes)
     of BoolT: result = (1, 1)
     of VoidT: result = (0, 1)
-    of PtrT, AptrT, ProctypeT: result = (8, 8)
+    of PtrT, AptrT, ProctypeT: result = (p.ptrSize, p.ptrSize)
     of FlexarrayT:
       # A flexible array member contributes no fixed size; its alignment is that
       # of the element type (so the enclosing struct's tail is aligned for it).
@@ -1109,7 +1113,7 @@ proc slotOf*(p: var Program; c: Cursor): AsmSlot =
   ## size and alignment filled in (for AAPCS64 size-based ABI decisions).
   let r = resolveType(p, c)
   if r.kind != TagLit:
-    return typeToSlot(r)                       # defensive: shouldn't occur
+    return typeToSlot(r, p.ptrSize)            # defensive: shouldn't occur
   case r.typeKind
   of EnumT:
     var base = r
@@ -1122,7 +1126,7 @@ proc slotOf*(p: var Program; c: Cursor): AsmSlot =
     let (sz, al) = typeSizeAlign(p, r)
     result = AsmSlot(cls: AMem, size: sz, align: al, typ: r)  # carry the type, like every other path
   else:
-    result = typeToSlot(r)                      # scalars, ptr, void, …
+    result = typeToSlot(r, p.ptrSize)           # scalars, ptr, void, …
 
 # ── aggregate layout (shared by the allocator + the code generator) ─────────
 
