@@ -28,7 +28,7 @@
 ##   per signedness); loads canonicalize, overflowing arithmetic
 ##   re-canonicalizes, so comparisons/div pick `_s`/`_u` directly.
 
-import std / [tables, sets, assertions, strutils]
+import std / [tables, sets, assertions, strutils, os, syncio]
 import nifcore, nifcdecl, nifcoreparse
 import slots, programs, typenav
 import wasmenc
@@ -70,6 +70,10 @@ type
     scratchI32b: uint32
     scratchI64: uint32
     retType: Cursor
+    retSret: bool                ## aggregate result → hidden dest-pointer param 0
+    constrDests: seq[uint32]     ## per-nesting-depth constructor dest locals
+    dynSret: int32               ## outstanding sret-temp bytes on the shadow stack,
+                                 ## reclaimed at the end of the enclosing statement
     body: ByteBuf
     depth: int                   ## current block nesting depth inside the proc body
     labelDepth: Table[string, int] ## lab symbol → depth to `br` out of (block closes at the lab)
@@ -156,6 +160,35 @@ proc allocStatic(g: var WasmGen; size, align: int): uint32 =
   result = g.memTop
   g.memTop += uint32(max(size, 1))
 
+proc flexPayloadLen(g: var WasmGen; initv: Cursor): int =
+  ## Extra bytes a constant initializer stores past its type's fixed size:
+  ## the payload of a flexarray tail field (a string literal or an array
+  ## constructor). +1 for a string's NUL so C-string views stay valid.
+  result = 0
+  if initv.kind != TagLit or initv.exprKind notin {OconstrC, AconstrC}: return
+  var t = initv
+  t.into:
+    skip t                                     # the constructed type
+    while t.hasMore:
+      if t.kind == TagLit and t.substructureKind == KvU:
+        var kv = t
+        kv.into:
+          inc kv                               # field name
+          if kv.kind == StrLit:
+            result += strVal(kv).len + 1
+          elif kv.kind == TagLit and kv.exprKind == AconstrC:
+            # count elements × element size, resolved from the aconstr type
+            var ac = kv
+            ac.into:
+              let elemT = innerType(g.prog, resolveType(g.prog, ac))
+              let (esz, _) = typeSizeAlign(g.prog, elemT)
+              skip ac
+              var n = 0
+              while ac.hasMore: (inc n; skip ac)
+              result += n * esz
+          while kv.hasMore: skip kv
+      skip t
+
 proc globalAddrOf(g: var WasmGen; name: string): uint32 =
   ## The linear-memory address of a gvar/const, assigning it on first use.
   ## Zero-initialized globals reserve address space only (wasm memory is
@@ -166,12 +199,20 @@ proc globalAddrOf(g: var WasmGen; name: string): uint32 =
     err g, "not a global: " & name
   var d = si.decl
   var typ: Cursor
+  var initv: Cursor
+  var hasInit = false
   d.into:
     inc d                                      # name
     skip d                                     # pragmas
     typ = d
+    skip d
+    if d.hasMore and d.kind != DotToken:
+      initv = d
+      hasInit = true
     while d.hasMore: skip d
-  let (sz, al) = typeSizeAlign(g.prog, typ)
+  var (sz, al) = typeSizeAlign(g.prog, typ)
+  if hasInit:
+    sz += flexPayloadLen(g, initv)             # flexarray tail data (string consts)
   result = allocStatic(g, sz, al)
   g.globalAddr[name] = result
   if si.cat == scGlobal and not g.globals.hasKey(name):
@@ -209,16 +250,19 @@ proc procSigTypes(g: var WasmGen; decl: Cursor; isProctype: bool): (seq[byte], s
             inc pc                             # name
             skip pc                            # pragmas
             let sc = scalOf(g, pc)
-            if sc.kind == skMem:
-              err g, "aggregate parameters not supported yet"
+            # an aggregate parameter travels as the address of a fresh
+            # caller-made copy (see genCallArgs)
             params.add valType(sc)
             while pc.hasMore: skip pc
     skip d                                     # params
     if not isVoidType(d):
       let sc = scalOf(g, d)
       if sc.kind == skMem:
-        err g, "aggregate results not supported yet"
-      results.add valType(sc)
+        # sret convention: the caller passes the result destination as a
+        # hidden FIRST parameter; the wasm signature returns nothing
+        params.insert(ValI32, 0)
+      else:
+        results.add valType(sc)
     while d.hasMore: skip d
   result = (params, results)
 
@@ -339,6 +383,11 @@ proc genExpr(g: var WasmGen; c: Cursor)
 proc genLvalAddr(g: var WasmGen; c: Cursor)
 proc genStmt(g: var WasmGen; c: var Cursor)
 proc genStmtList(g: var WasmGen; c: Cursor)
+proc constrDest(g: var WasmGen; depth: int): uint32
+proc genConstrInto(g: var WasmGen; constr: Cursor; depth: int)
+proc newLocal(g: var WasmGen; vt: byte): uint32
+proc callResultType(g: var WasmGen; c: Cursor): Cursor
+proc litScal(g: var WasmGen; c: Cursor): Scal
 
 proc fieldOffsetIn(g: var WasmGen; objType: Cursor; field: string;
                    found: var bool): int =
@@ -447,7 +496,11 @@ proc genLvalAddr(g: var WasmGen; c: Cursor) =
         g.constI32 ml.frameOff
         g.op OpI32Add
     elif g.p.locals.hasKey(nm):
-      err g, "address of a register local (pre-scan should have demoted it): " & nm
+      # an aggregate param's wasm local HOLDS the aggregate's address
+      if scalOf(g, g.p.locals[nm].typ).kind == skMem:
+        g.localGet g.p.locals[nm].idx
+      else:
+        err g, "address of a register local (pre-scan should have demoted it): " & nm
     else:
       let si = lookupSym(typeCtx(g), nm)
       case si.cat
@@ -500,6 +553,117 @@ proc genLvalAddr(g: var WasmGen; c: Cursor) =
   else:
     err g, "not an lvalue"
 
+proc exprScal(g: var WasmGen; c: Cursor): Scal =
+  ## The class an expression's genExpr output actually has. Differs from
+  ## `scalOf(lengType(...))` for suffixed literals: typenav reports the
+  ## bare-literal default type, but genSufLit emits at the SUFFIX's width.
+  if c.kind == TagLit and c.exprKind == SufC:
+    var t = c
+    t.into:
+      inc t                                    # past the literal
+      let sfx = strVal(t)
+      while t.hasMore: skip t
+      case sfx
+      of "i64": result = Scal(kind: skI64, bits: 64, signed: true)
+      of "u64": result = Scal(kind: skI64, bits: 64, signed: false)
+      of "f32": result = Scal(kind: skF32, bits: 32)
+      of "f64", "f": result = Scal(kind: skF64, bits: 64)
+      of "i8": result = Scal(kind: skI32, bits: 8, signed: true)
+      of "i16": result = Scal(kind: skI32, bits: 16, signed: true)
+      of "u8": result = Scal(kind: skI32, bits: 8, signed: false)
+      of "u16": result = Scal(kind: skI32, bits: 16, signed: false)
+      of "u", "u32": result = Scal(kind: skI32, bits: 32, signed: false)
+      else: result = Scal(kind: skI32, bits: 32, signed: true)
+  elif c.kind in {IntLit, UIntLit, CharLit, FloatLit}:
+    result = litScal(g, c)
+  else:
+    result = scalOf(g, lengType(g, c))
+
+proc coerceTo(g: var WasmGen; have, want: Scal) =
+  ## Convert the value on the stack from class `have` to class `want` —
+  ## Leng inherits C's implicit arithmetic conversions (an op's carried type
+  ## may differ from an operand's own type), so every typed value context
+  ## coerces.
+  if have.kind == want.kind:
+    if want.kind == skI32 and want.bits < 32 and
+       (want.bits < have.bits or want.signed != have.signed):
+      g.canonNarrow want                       # re-canonicalize to the target width
+    return
+  case want.kind
+  of skI64:
+    case have.kind
+    of skI32, skMem:
+      g.op (if have.kind == skI32 and have.signed: OpI64ExtendI32S
+            else: OpI64ExtendI32U)
+    of skF32: g.op (if want.signed: OpI64TruncF32S else: OpI64TruncF32U)
+    of skF64: g.op (if want.signed: OpI64TruncF64S else: OpI64TruncF64U)
+    else: discard
+  of skI32:
+    case have.kind
+    of skI64:
+      g.op OpI32WrapI64
+      g.canonNarrow want
+    of skF32: g.op (if want.signed: OpI32TruncF32S else: OpI32TruncF32U)
+    of skF64: g.op (if want.signed: OpI32TruncF64S else: OpI32TruncF64U)
+    else: discard                              # skMem: an address is an i32
+  of skF64:
+    case have.kind
+    of skF32: g.op OpF64PromoteF32
+    of skI32: g.op (if have.signed: OpF64ConvertI32S else: OpF64ConvertI32U)
+    of skI64: g.op (if have.signed: OpF64ConvertI64S else: OpF64ConvertI64U)
+    else: discard
+  of skF32:
+    case have.kind
+    of skF64: g.op OpF32DemoteF64
+    of skI32: g.op (if have.signed: OpF32ConvertI32S else: OpF32ConvertI32U)
+    of skI64: g.op (if have.signed: OpF32ConvertI64S else: OpF32ConvertI64U)
+    else: discard
+  of skMem:
+    if have.kind == skI64: g.op OpI32WrapI64   # a 64-bit "address" narrows
+
+proc genValueAs(g: var WasmGen; c: Cursor; sc: Scal) =
+  ## Emit expression `c` in a context of class `sc`. Bare literals carry no
+  ## width in Leng — the CONTEXT types them — so they are emitted directly
+  ## at the context's width; everything else emits via genExpr and is then
+  ## COERCED to the context's class (C implicit-conversion semantics).
+  case c.kind
+  of IntLit:
+    case sc.kind
+    of skI64: g.constI64 intVal(c)
+    of skF64: g.op OpF64Const; g.p.body.addF64 float64(intVal(c))
+    of skF32: g.op OpF32Const; g.p.body.addF32 float32(intVal(c))
+    else: g.constI32 int32(intVal(c))
+  of UIntLit:
+    case sc.kind
+    of skI64: g.constI64 cast[int64](uintVal(c))
+    of skF64: g.op OpF64Const; g.p.body.addF64 float64(uintVal(c))
+    of skF32: g.op OpF32Const; g.p.body.addF32 float32(uintVal(c))
+    else: g.constI32 cast[int32](uint32(uintVal(c) and 0xFFFFFFFF'u64))
+  of CharLit:
+    if sc.kind == skI64: g.constI64 int64(ord(charLit(c)))
+    else: g.constI32 int32(ord(charLit(c)))
+  of FloatLit:
+    if sc.kind == skF32:
+      g.op OpF32Const; g.p.body.addF32 float32(floatVal(c))
+    else:
+      g.op OpF64Const; g.p.body.addF64 floatVal(c)
+  of TagLit:
+    case c.exprKind
+    of NilC, FalseC:
+      if sc.kind == skI64: g.constI64 0 else: g.constI32 0
+    of TrueC:
+      if sc.kind == skI64: g.constI64 1 else: g.constI32 1
+    of ParC:
+      var t = c
+      inc t
+      genValueAs(g, t, sc)
+    else:
+      genExpr(g, c)
+      coerceTo(g, exprScal(g, c), sc)
+  else:
+    genExpr(g, c)
+    coerceTo(g, exprScal(g, c), sc)
+
 proc litScal(g: var WasmGen; c: Cursor): Scal =
   ## The class a literal computes in, given its Leng-typed context is absent:
   ## bare literals default to the machine word (32-bit on wasm32).
@@ -548,8 +712,8 @@ proc genBinArith(g: var WasmGen; c: Cursor; kind: BinOpKind) =
     let typ = t
     let sc = scalOf(g, typ)
     skip t
-    genExpr(g, t); skip t
-    genExpr(g, t)
+    genValueAs(g, t, sc); skip t
+    genValueAs(g, t, sc)
     while t.hasMore: skip t
     case sc.kind
     of skF32, skF64:
@@ -592,10 +756,17 @@ proc genCompare(g: var WasmGen; c: Cursor; kind: LengExpr) =
   ## `(eq a b)` etc. — signedness comes from the OPERAND type.
   var t = c
   t.into:
-    let opT = lengType(g, t)
+    # the comparison width/signedness comes from a NON-LITERAL operand when
+    # one exists (bare literals default to the machine word, which would
+    # mis-type `lit == i64var`)
+    var lhs = t
+    var rhs = t
+    skip rhs
+    let lhsLit = lhs.kind in {IntLit, UIntLit, CharLit, FloatLit}
+    let opT = if lhsLit: lengType(g, rhs) else: lengType(g, lhs)
     let sc = scalOf(g, opT)
-    genExpr(g, t); skip t
-    genExpr(g, t)
+    genValueAs(g, t, sc); skip t
+    genValueAs(g, t, sc)
     while t.hasMore: skip t
     case sc.kind
     of skI32, skMem:
@@ -634,8 +805,7 @@ proc genConv(g: var WasmGen; c: Cursor) =
     let dstT = t
     let dst = scalOf(g, dstT)
     skip t
-    let srcT = lengType(g, t)
-    let src = scalOf(g, srcT)
+    let src = exprScal(g, t)
     genExpr(g, t)
     while t.hasMore: skip t
     case dst.kind
@@ -671,6 +841,61 @@ proc genConv(g: var WasmGen; c: Cursor) =
       of skMem: err g, "aggregate → float conversion"
     of skMem: discard                          # pointer casts are free (both i32)
 
+proc scalForVal(vt: byte): Scal =
+  ## Minimal context class for a wasm value type (drives literal widths).
+  case vt
+  of ValI64: Scal(kind: skI64, bits: 64, signed: true)
+  of ValF32: Scal(kind: skF32, bits: 32)
+  of ValF64: Scal(kind: skF64, bits: 64)
+  else: Scal(kind: skI32, bits: 32, signed: true)
+
+proc genCallArgs(g: var WasmGen; t: var Cursor; expected: seq[byte]): int32 =
+  ## Emit the remaining children of a call as arguments, in order. An
+  ## aggregate argument is passed BY REFERENCE TO A FRESH COPY: bump the
+  ## shadow stack (dynamic — `ret` unwinds from fp regardless, but the
+  ## caller restores sp right after the call so loops don't creep),
+  ## construct or copy the value there, pass the address. Returns the
+  ## dynamic byte count the caller must give back to sp after the call.
+  result = 0
+  var argIdx = 0
+  while t.hasMore:
+    let argT = lengType(g, t)
+    let sc = scalOf(g, argT)
+    if sc.kind == skMem:
+      let sz = int32(align(max(sc.bits, 1), 16))
+      result += sz
+      let tmp = constrDest(g, g.p.constrDests.len)  # a fresh dedicated local
+      g.globalGet GlobSp
+      g.constI32 sz
+      g.op OpI32Sub
+      g.localTee tmp
+      g.globalSet GlobSp
+      if t.kind == TagLit and t.exprKind in {OconstrC, AconstrC}:
+        g.localGet tmp
+        genConstrInto(g, t, g.p.constrDests.len)
+      else:
+        g.localGet tmp
+        genExpr(g, t)                          # source address
+        g.constI32 int32(sc.bits)
+        g.op 0xFC'u8; g.emitU32 10; g.emitU32 0; g.emitU32 0   # memory.copy
+      g.localGet tmp                           # the argument value: the copy's address
+    else:
+      if argIdx < expected.len:
+        genValueAs(g, t, scalForVal(expected[argIdx]))
+      else:
+        genExpr(g, t)                          # varargs tail: self-described
+    skip t
+    inc argIdx
+
+proc restoreDynStack(g: var WasmGen; dynBytes: int32) =
+  ## Give back the shadow-stack space genCallArgs borrowed (safe with a call
+  ## result on the wasm value stack — global ops don't touch values below).
+  if dynBytes > 0:
+    g.globalGet GlobSp
+    g.constI32 dynBytes
+    g.op OpI32Add
+    g.globalSet GlobSp
+
 proc genCallArgsAndTarget(g: var WasmGen; c: Cursor) =
   ## Emit a `(call fn args…)` (used for both statement and value position).
   var t = c
@@ -684,30 +909,62 @@ proc genCallArgsAndTarget(g: var WasmGen; c: Cursor) =
     if indirect:
       calleeType = lengType(g, target)
     skip t
-    # arguments, in order
-    while t.hasMore:
-      genExpr(g, t)
-      skip t
+    # aggregate result → allocate the sret destination and pass it as the
+    # hidden first argument; the temp survives until end of statement
+    let retT = callResultType(g, c)
+    var sretTmp = 0'u32
+    var hasSret = false
+    if not isVoidType(retT):
+      let rsc = scalOf(g, retT)
+      if rsc.kind == skMem:
+        hasSret = true
+        let sz = int32(align(max(rsc.bits, 1), 16))
+        g.p.dynSret += sz
+        sretTmp = constrDest(g, g.p.constrDests.len)
+        g.globalGet GlobSp
+        g.constI32 sz
+        g.op OpI32Sub
+        g.localTee sretTmp
+        g.globalSet GlobSp
+        g.localGet sretTmp                     # the hidden first argument
+    # the callee's wasm param types (for context-typing bare literal args);
+    # strip the sret slot — genCallArgs never sees that argument
+    var fi = 0'u32
+    var pt: Cursor
+    var expected: seq[byte] = @[]
     if not indirect:
       let sym = symName(target)
       # lowered intrinsics (atomics/mem*/bit builtins) never reach here —
       # genCall handles them before argument emission.
-      let fi = refProc(g, sym)
-      g.op OpCall
-      g.emitU32 fi
+      fi = refProc(g, sym)
+      if g.callTarget.hasKey(sym) and not cursorIsNil(g.callTarget[sym].sigType):
+        let (ps, _) = procSigTypes(g, g.callTarget[sym].sigType, isProctype = true)
+        expected = ps
     else:
-      genExpr(g, target)                       # the table slot (an i32)
-      var pt = resolveType(g.prog, calleeType)
+      pt = resolveType(g.prog, calleeType)
       if pt.kind == TagLit and pt.typeKind == PtrT:
         var inner = pt
         inc inner
         pt = resolveType(g.prog, inner)
       if pt.kind != TagLit or pt.typeKind != ProctypeT:
         err g, "indirect call through a non-proctype value"
+      let (ps, _) = procSigTypes(g, pt, isProctype = true)
+      expected = ps
+    if hasSret and expected.len > 0:
+      expected.delete(0)
+    let dynBytes = genCallArgs(g, t, expected)
+    if not indirect:
+      g.op OpCall
+      g.emitU32 fi
+    else:
+      genExpr(g, target)                       # the table slot (an i32)
       let (ps, rs) = procSigTypes(g, pt, isProctype = true)
       g.op OpCallIndirect
       g.emitU32 funcTypeIdx(g, ps, rs)
       g.emitU32 0                              # table 0
+    restoreDynStack(g, dynBytes)               # arg copies are consumed; sret temp is NOT
+    if hasSret:
+      g.localGet sretTmp                       # the call's value: the result's address
 
 proc callResultType(g: var WasmGen; c: Cursor): Cursor =
   lengType(g, c)                               # typenav: return type of the callee
@@ -815,6 +1072,63 @@ proc genInlineCall(g: var WasmGen; c: Cursor; wantValue: bool) =
           g.localGet g.p.scratchI32b
           g.emitStore sc
           if wantValue: g.localGet g.p.scratchI32b
+      of "__atomic_compare_exchange_n":
+        # (ptr, expected_ptr, desired, weak, succ_order, fail_order) → bool.
+        # Single-threaded: if *ptr == *expected: *ptr = desired; true
+        #                  else: *expected = *ptr; false
+        var pT = lengType(g, t)
+        let elemT = innerType(g.prog, resolveType(g.prog, pT))
+        let sc = scalOf(g, elemT)
+        let ptrL = newLocal(g, ValI32)
+        let expL = newLocal(g, ValI32)
+        let desL = newLocal(g, valType(sc))
+        let curL = newLocal(g, valType(sc))
+        genExpr(g, t); skip t                  # ptr
+        g.localSet ptrL
+        genExpr(g, t); skip t                  # expected (a pointer)
+        g.localSet expL
+        genExpr(g, t); skip t                  # desired
+        g.localSet desL
+        while t.hasMore: skip t                # weak + memorders (constants)
+        g.localGet ptrL
+        g.emitLoad sc
+        g.localSet curL
+        g.localGet curL
+        g.localGet expL
+        g.emitLoad sc
+        g.op (if sc.kind == skI64: OpI64Eq else: OpI32Eq)
+        g.op OpIf; g.p.body.add ValI32
+        g.localGet ptrL
+        g.localGet desL
+        g.emitStore sc
+        g.constI32 1
+        g.op OpElse
+        g.localGet expL
+        g.localGet curL
+        g.emitStore sc
+        g.constI32 0
+        g.op OpEnd
+        if not wantValue: g.op OpDrop
+      of "__atomic_exchange_n":
+        # (ptr, val, order) → old value. Single-threaded swap.
+        var pT = lengType(g, t)
+        let elemT = innerType(g.prog, resolveType(g.prog, pT))
+        let sc = scalOf(g, elemT)
+        let ptrL = newLocal(g, ValI32)
+        let valL = newLocal(g, valType(sc))
+        let oldL = newLocal(g, valType(sc))
+        genExpr(g, t); skip t
+        g.localSet ptrL
+        genExpr(g, t); skip t
+        g.localSet valL
+        while t.hasMore: skip t
+        g.localGet ptrL
+        g.emitLoad sc
+        g.localSet oldL
+        g.localGet ptrL
+        g.localGet valL
+        g.emitStore sc
+        if wantValue: g.localGet oldL
       else:
         err g, "atomic not supported yet: " & ct.atomic
     elif ct.bitBuiltin.len > 0:
@@ -1025,6 +1339,84 @@ proc genExpr(g: var WasmGen; c: Cursor) =
 
 # ── statements ───────────────────────────────────────────────────────────────
 
+proc newLocal(g: var WasmGen; vt: byte): uint32 =
+  ## Allocate a fresh wasm local mid-emission (the locals header is written
+  ## after the body, so late allocation is safe).
+  result = uint32(g.p.nparams + g.p.localTypes.len)
+  g.p.localTypes.add vt
+
+proc genFieldStore(g: var WasmGen; dest: uint32; off: int; ft: Cursor;
+                   value: Cursor; depth: int)
+
+proc constrDest(g: var WasmGen; depth: int): uint32 =
+  ## The i32 local holding the destination address of the constructor
+  ## currently being emitted at nesting `depth` (nested constructors each
+  ## need their own).
+  while g.p.constrDests.len <= depth:
+    g.p.constrDests.add newLocal(g, ValI32)
+  result = g.p.constrDests[depth]
+
+proc genConstrInto(g: var WasmGen; constr: Cursor; depth: int) =
+  ## Store an `(oconstr Type (kv field value)*)` / `(aconstr Type value*)`
+  ## field by field through the destination ADDRESS on top of the stack.
+  let dest = constrDest(g, depth)
+  g.localSet dest
+  var t = constr
+  t.into:
+    let typ = t
+    let objT = resolveType(g.prog, typ)
+    skip t
+    if constr.exprKind == OconstrC:
+      while t.hasMore:
+        if t.substructureKind != KvU: err g, "malformed oconstr"
+        var kv = t
+        kv.into:
+          let field = symName(kv); inc kv
+          let value = kv
+          skip kv
+          var fdepth = 0
+          if kv.hasMore and kv.kind == IntLit:
+            fdepth = int(intVal(kv))
+          while kv.hasMore: skip kv
+          let off = dotOffset(g, objT, field, fdepth)
+          let ft = fieldType(g.prog, objT, field)
+          genFieldStore(g, dest, off, ft, value, depth)
+        skip t
+    else:                                      # aconstr: consecutive elements
+      let elemT = innerType(g.prog, objT)
+      let (esz, _) = typeSizeAlign(g.prog, elemT)
+      var idx = 0
+      while t.hasMore:
+        genFieldStore(g, dest, idx * esz, elemT, t, depth)
+        skip t
+        inc idx
+
+proc genFieldStore(g: var WasmGen; dest: uint32; off: int; ft: Cursor;
+                   value: Cursor; depth: int) =
+  ## One member store inside a constructor: dest[off] = value.
+  let sc = scalOf(g, ft)
+  if value.kind == TagLit and value.exprKind in {OconstrC, AconstrC}:
+    g.localGet dest
+    if off != 0:
+      g.constI32 int32(off)
+      g.op OpI32Add
+    genConstrInto(g, value, depth + 1)
+  elif sc.kind == skMem:
+    g.localGet dest
+    if off != 0:
+      g.constI32 int32(off)
+      g.op OpI32Add
+    genExpr(g, value)                          # the source aggregate's address
+    g.constI32 int32(sc.bits)
+    g.op 0xFC'u8; g.emitU32 10; g.emitU32 0; g.emitU32 0     # memory.copy
+  else:
+    g.localGet dest
+    if off != 0:
+      g.constI32 int32(off)
+      g.op OpI32Add
+    genValueAs(g, value, sc)
+    g.emitStore sc
+
 proc genAsgn(g: var WasmGen; lhs, rhs: Cursor) =
   # errv/ovf as destinations → wasm globals
   if lhs.kind == TagLit and lhs.exprKind == ErrvC:
@@ -1038,7 +1430,7 @@ proc genAsgn(g: var WasmGen; lhs, rhs: Cursor) =
   if lhs.kind == Symbol:
     let nm = symName(lhs)
     if g.p.locals.hasKey(nm):
-      genExpr(g, rhs)
+      genValueAs(g, rhs, scalOf(g, g.p.locals[nm].typ))
       g.localSet g.p.locals[nm].idx
       return
   # memory destination
@@ -1046,12 +1438,15 @@ proc genAsgn(g: var WasmGen; lhs, rhs: Cursor) =
   let sc = scalOf(g, lhsT)
   if sc.kind == skMem:
     genLvalAddr(g, lhs)                        # dst
-    genExpr(g, rhs)                            # src address (aggregates are addresses)
-    g.constI32 int32(sc.bits)                  # byte size
-    g.op 0xFC'u8; g.emitU32 10; g.emitU32 0; g.emitU32 0   # memory.copy
+    if rhs.kind == TagLit and rhs.exprKind in {OconstrC, AconstrC}:
+      genConstrInto(g, rhs, 0)                 # construct in place
+    else:
+      genExpr(g, rhs)                          # src address (aggregates are addresses)
+      g.constI32 int32(sc.bits)                # byte size
+      g.op 0xFC'u8; g.emitU32 10; g.emitU32 0; g.emitU32 0   # memory.copy
   else:
     genLvalAddr(g, lhs)
-    genExpr(g, rhs)
+    genValueAs(g, rhs, sc)
     g.emitStore sc
 
 proc genIf(g: var WasmGen; c: Cursor) =
@@ -1165,18 +1560,18 @@ proc genCase(g: var WasmGen; c: Cursor) =
                 var rr = r
                 rr.into:
                   g.localGet selLocal
-                  genExpr(g, rr); skip rr
+                  genValueAs(g, rr, sc); skip rr
                   g.op (if is64: (if sc.signed: OpI64GeS else: OpI64GeU)
                         else: (if sc.signed: OpI32GeS else: OpI32GeU))
                   g.localGet selLocal
-                  genExpr(g, rr)
+                  genValueAs(g, rr, sc)
                   while rr.hasMore: skip rr
                   g.op (if is64: (if sc.signed: OpI64LeS else: OpI64LeU)
                         else: (if sc.signed: OpI32LeS else: OpI32LeU))
                   g.op OpI32And
               else:
                 g.localGet selLocal
-                genExpr(g, r)
+                genValueAs(g, r, sc)
                 g.op (if is64: OpI64Eq else: OpI32Eq)
               inc cond
               if cond > 1: g.op OpI32Or
@@ -1207,7 +1602,18 @@ proc genRet(g: var WasmGen; c: Cursor) =
   var t = c
   t.into:
     if t.hasMore and not (t.kind == DotToken):
-      genExpr(g, t)
+      if g.p.retSret:
+        # copy the aggregate result into the caller's sret destination
+        let sc = scalOf(g, g.p.retType)
+        g.localGet 0                           # the hidden dest pointer
+        if t.kind == TagLit and t.exprKind in {OconstrC, AconstrC}:
+          genConstrInto(g, t, 0)
+        else:
+          genExpr(g, t)                        # result value = its address
+          g.constI32 int32(sc.bits)
+          g.op 0xFC'u8; g.emitU32 10; g.emitU32 0; g.emitU32 0   # memory.copy
+      else:
+        genValueAs(g, t, scalOf(g, g.p.retType))
       skip t
     while t.hasMore: skip t
   if g.p.frameSize > 0:
@@ -1232,44 +1638,67 @@ proc genOnerr(g: var WasmGen; c: Cursor) =
     var calleeType: Cursor
     if indirect: calleeType = lengType(g, target)
     skip t
-    while t.hasMore:
-      genExpr(g, t)
-      skip t
+    # resolve the callee signature + return type BEFORE the arguments (sret
+    # and literal-typing both need them)
+    var expected: seq[byte] = @[]
     var retT: Cursor
+    var fi = 0'u32
+    var pt: Cursor
     if not indirect:
       let sym = symName(target)
-      let fi = refProc(g, sym)
-      # result type = callee's return type
-      var found = false
-      var d: Cursor
+      fi = refProc(g, sym)
+      if g.callTarget.hasKey(sym) and not cursorIsNil(g.callTarget[sym].sigType):
+        let (ps, _) = procSigTypes(g, g.callTarget[sym].sigType, isProctype = true)
+        expected = ps
       if g.callTarget.hasKey(sym) and not cursorIsNil(g.callTarget[sym].retType):
         retT = g.callTarget[sym].retType
-        found = true
-      if not found:
-        d = localProcDecl(g, sym)
-        var dd = d
+      else:
+        var dd = localProcDecl(g, sym)
         dd.into:
           inc dd; skip dd
           retT = dd
           while dd.hasMore: skip dd
-      g.op OpCall
-      g.emitU32 fi
     else:
-      genExpr(g, target)
-      var pt = resolveType(g.prog, calleeType)
+      pt = resolveType(g.prog, calleeType)
       if pt.kind == TagLit and pt.typeKind == PtrT:
         var inner = pt; inc inner
         pt = resolveType(g.prog, inner)
-      let (ps, rs) = procSigTypes(g, pt, isProctype = true)
-      g.op OpCallIndirect
-      g.emitU32 funcTypeIdx(g, ps, rs)
-      g.emitU32 0
+      let (ps, _) = procSigTypes(g, pt, isProctype = true)
+      expected = ps
       var q = pt
       q.into:
         skip q; skip q
         retT = q
         while q.hasMore: skip q
+    # aggregate result → sret destination (discarded; reclaimed at stmt end)
+    var hasSret = false
     if not cursorIsNil(retT) and not isVoidType(retT):
+      let rsc = scalOf(g, retT)
+      if rsc.kind == skMem:
+        hasSret = true
+        let sz = int32(align(max(rsc.bits, 1), 16))
+        g.p.dynSret += sz
+        let sretTmp = constrDest(g, g.p.constrDests.len)
+        g.globalGet GlobSp
+        g.constI32 sz
+        g.op OpI32Sub
+        g.localTee sretTmp
+        g.globalSet GlobSp
+        g.localGet sretTmp
+    if hasSret and expected.len > 0:
+      expected.delete(0)
+    let dynBytes = genCallArgs(g, t, expected)
+    if not indirect:
+      g.op OpCall
+      g.emitU32 fi
+    else:
+      genExpr(g, target)
+      let (ps, rs) = procSigTypes(g, pt, isProctype = true)
+      g.op OpCallIndirect
+      g.emitU32 funcTypeIdx(g, ps, rs)
+      g.emitU32 0
+    restoreDynStack(g, dynBytes)
+    if not hasSret and not cursorIsNil(retT) and not isVoidType(retT):
       g.op OpDrop                              # onerr calls discard their value
     # if errv: run the action
     if not (action.kind == DotToken):
@@ -1280,6 +1709,153 @@ proc genOnerr(g: var WasmGen; c: Cursor) =
       genStmt(g, a)
       g.op OpEnd
       dec g.p.depth
+
+proc genKeepovf(g: var WasmGen; c: Cursor) =
+  ## `(keepovf (add|sub|mul Type a b) dst)` — overflow-checked arithmetic:
+  ## `(ovf, dst) = a op b`. Wasm has no flags register: ≤32-bit ops compute
+  ## in i64 and compare the wrapped result against the wide one; i64 ops use
+  ## the classic sign/division identities.
+  var t = c
+  t.into:
+    let arith = t
+    skip t
+    let dst = t
+    skip t
+    while t.hasMore: skip t
+    var a = arith
+    var opKind: LengExpr
+    var typ, lhs, rhs: Cursor
+    a.into:
+      opKind = arith.exprKind
+      typ = a
+      skip a
+      lhs = a
+      skip a
+      rhs = a
+      skip a
+      while a.hasMore: skip a
+    if opKind notin {AddC, SubC, MulC}:
+      err g, "keepovf on unsupported op: " & $opKind
+    let sc = scalOf(g, typ)
+    case sc.kind
+    of skI32:
+      # widen → op in i64 → overflow iff the wrapped (canonical) result
+      # disagrees with the wide result
+      let rWide = newLocal(g, ValI64)
+      let rNarrow = newLocal(g, ValI32)
+      genValueAs(g, lhs, sc)
+      g.op (if sc.signed: OpI64ExtendI32S else: OpI64ExtendI32U)
+      genValueAs(g, rhs, sc)
+      g.op (if sc.signed: OpI64ExtendI32S else: OpI64ExtendI32U)
+      case opKind
+      of AddC: g.op OpI64Add
+      of SubC: g.op OpI64Sub
+      else: g.op OpI64Mul
+      g.localTee rWide
+      g.op OpI32WrapI64
+      g.canonNarrow sc
+      g.localSet rNarrow
+      g.localGet rNarrow
+      g.op (if sc.signed: OpI64ExtendI32S else: OpI64ExtendI32U)
+      g.localGet rWide
+      g.op OpI64Ne
+      g.globalSet GlobOvf
+      # store the wrapped result
+      if dst.kind == Symbol and g.p.locals.hasKey(symName(dst)):
+        g.localGet rNarrow
+        g.localSet g.p.locals[symName(dst)].idx
+      else:
+        genLvalAddr(g, dst)
+        g.localGet rNarrow
+        g.emitStore sc
+    of skI64:
+      let aL = newLocal(g, ValI64)
+      let bL = newLocal(g, ValI64)
+      let rL = newLocal(g, ValI64)
+      genValueAs(g, lhs, sc)
+      g.localSet aL
+      genValueAs(g, rhs, sc)
+      g.localSet bL
+      g.localGet aL
+      g.localGet bL
+      case opKind
+      of AddC: g.op OpI64Add
+      of SubC: g.op OpI64Sub
+      else: g.op OpI64Mul
+      g.localSet rL
+      if sc.signed:
+        case opKind
+        of AddC:
+          # ovf iff sign(a)==sign(b) and sign(r)!=sign(a):
+          # ((a xor r) and (b xor r)) < 0
+          g.localGet aL; g.localGet rL; g.op OpI64Xor
+          g.localGet bL; g.localGet rL; g.op OpI64Xor
+          g.op OpI64And
+          g.constI64 0
+          g.op OpI64LtS
+        of SubC:
+          # ovf iff sign(a)!=sign(b) and sign(r)!=sign(a):
+          # ((a xor b) and (a xor r)) < 0
+          g.localGet aL; g.localGet bL; g.op OpI64Xor
+          g.localGet aL; g.localGet rL; g.op OpI64Xor
+          g.op OpI64And
+          g.constI64 0
+          g.op OpI64LtS
+        else:
+          # mul: a == 0 → no ovf; a == -1 → ovf iff b == low(i64)
+          # (guards the div trap); else ovf iff r div a != b
+          g.localGet aL
+          g.op OpI64Eqz
+          g.op OpIf; g.p.body.add ValI32
+          g.constI32 0
+          g.op OpElse
+          g.localGet aL
+          g.constI64 -1
+          g.op OpI64Eq
+          g.op OpIf; g.p.body.add ValI32
+          g.localGet bL
+          g.constI64 low(int64)
+          g.op OpI64Eq
+          g.op OpElse
+          g.localGet rL
+          g.localGet aL
+          g.op OpI64DivS
+          g.localGet bL
+          g.op OpI64Ne
+          g.op OpEnd
+          g.op OpEnd
+      else:
+        case opKind
+        of AddC:
+          g.localGet rL
+          g.localGet aL
+          g.op OpI64LtU                        # carry: r < a
+        of SubC:
+          g.localGet aL
+          g.localGet bL
+          g.op OpI64LtU                        # borrow: a < b
+        else:
+          g.localGet aL
+          g.op OpI64Eqz
+          g.op OpIf; g.p.body.add ValI32
+          g.constI32 0
+          g.op OpElse
+          g.localGet rL
+          g.localGet aL
+          g.op OpI64DivU
+          g.localGet bL
+          g.op OpI64Ne
+          g.op OpEnd
+      g.globalSet GlobOvf
+      if dst.kind == Symbol and g.p.locals.hasKey(symName(dst)):
+        g.localGet rL
+        g.localSet g.p.locals[symName(dst)].idx
+      else:
+        genLvalAddr(g, dst)
+        g.localGet rL
+        g.emitStore sc
+    else:
+      err g, "keepovf on a non-integer type"
 
 proc genVarDecl(g: var WasmGen; c: Cursor) =
   var t = c
@@ -1292,19 +1868,23 @@ proc genVarDecl(g: var WasmGen; c: Cursor) =
     if g.p.memLocals.hasKey(nm):
       if hasInit:
         let sc = scalOf(g, typ)
-        if sc.kind == skMem:
-          # aggregate initializer: oconstr/aconstr or copy from another aggregate
-          err g, "aggregate local initializers not supported yet"
         let ml = g.p.memLocals[nm]
         g.localGet g.p.fpIdx
         if ml.frameOff != 0:
           g.constI32 ml.frameOff
           g.op OpI32Add
-        genExpr(g, t)
-        g.emitStore sc
+        if t.kind == TagLit and t.exprKind in {OconstrC, AconstrC}:
+          genConstrInto(g, t, 0)               # construct in place
+        elif sc.kind == skMem:
+          genExpr(g, t)                        # copy from another aggregate
+          g.constI32 int32(sc.bits)
+          g.op 0xFC'u8; g.emitU32 10; g.emitU32 0; g.emitU32 0   # memory.copy
+        else:
+          genValueAs(g, t, sc)
+          g.emitStore sc
     else:
       if hasInit:
-        genExpr(g, t)
+        genValueAs(g, t, scalOf(g, typ))
         g.localSet g.p.locals[nm].idx
       # else: wasm locals are zero-initialized — matches Leng's default init
     while t.hasMore: skip t
@@ -1352,7 +1932,7 @@ proc genStmt(g: var WasmGen; c: var Cursor) =
         genExpr(g, rhs)                        # order swap acceptable for aggregates? keep strict:
         err g, "aggregate (store) not supported yet"
       else:
-        genExpr(g, rhs)
+        genValueAs(g, rhs, sc)
         case valType(sc)
         of ValI64:
           g.localSet g.p.scratchI64
@@ -1427,7 +2007,8 @@ proc genStmt(g: var WasmGen; c: var Cursor) =
       while t.hasMore: skip t
     skip c
   of KeepovfS:
-    err g, "keepovf not implemented yet (WW2 scope: unchecked arithmetic)"
+    genKeepovf(g, c)
+    skip c
   of EmitS:
     err g, "(emit) has no wasm lowering"
   of TryS, RaiseS:
@@ -1465,7 +2046,13 @@ proc genStmtList(g: var WasmGen; c: Cursor) =
   var t = c
   t.into:
     while t.hasMore:
+      # sret temps allocated inside this statement are dead once it
+      # completes — give their shadow-stack space back so loops don't creep
+      let savedSret = g.p.dynSret
       genStmt(g, t)
+      if g.p.dynSret > savedSret:
+        restoreDynStack(g, g.p.dynSret - savedSret)
+        g.p.dynSret = savedSret
 
 # ── proc lowering ────────────────────────────────────────────────────────────
 
@@ -1545,8 +2132,12 @@ proc lowerProc(g: var WasmGen; sym: string; decl: Cursor) =
   if not hasBody:
     err g, "no body for reachable proc " & sym & " (importc without lowering?)"
 
-  # fresh per-proc state
-  g.p = ProcCtx(retType: retType, nparams: params.len)
+  # fresh per-proc state. An aggregate result makes param 0 the hidden sret
+  # destination pointer; declared params shift up by one.
+  let retSret = not isVoidType(retType) and scalOf(g, retType).kind == skMem
+  let paramBase = if retSret: 1 else: 0
+  g.p = ProcCtx(retType: retType, retSret: retSret,
+                nparams: params.len + paramBase)
 
   # address-taken analysis over the body
   var taken = initHashSet[string]()
@@ -1556,12 +2147,15 @@ proc lowerProc(g: var WasmGen; sym: string; decl: Cursor) =
   # into a frame slot at entry
   var frameOff = 0'i32
   var paramCopies: seq[(uint32, string)] = @[]
-  for i, (pn, pt) in params:
+  for j, (pn, pt) in params:
+    let i = j + paramBase
     let sc = scalOf(g, pt)
-    if sc.kind == skMem:
-      err g, "aggregate parameter reached lowering: " & pn
     g.p.symType[pn] = pt
-    if pn in taken:
+    if sc.kind == skMem:
+      # the wasm local holds the address of the caller-made copy; `(addr p)`
+      # and field access both go through that address, no frame slot needed
+      g.p.locals[pn] = RegLocal(idx: uint32(i), typ: pt, vt: ValI32)
+    elif pn in taken:
       let (sz, al) = typeSizeAlign(g.prog, pt)
       frameOff = int32(align(int(frameOff), max(al, 1)))
       g.p.memLocals[pn] = MemLocal(frameOff: frameOff, typ: pt)
@@ -1574,15 +2168,15 @@ proc lowerProc(g: var WasmGen; sym: string; decl: Cursor) =
   scanLocals(g, body, taken, frameOff)
 
   # scratch + frame-pointer locals (always declared; cheap)
-  g.p.scratchI32 = uint32(params.len + g.p.localTypes.len)
+  g.p.scratchI32 = uint32(g.p.nparams + g.p.localTypes.len)
   g.p.localTypes.add ValI32
-  g.p.scratchI32b = uint32(params.len + g.p.localTypes.len)
+  g.p.scratchI32b = uint32(g.p.nparams + g.p.localTypes.len)
   g.p.localTypes.add ValI32
-  g.p.scratchI64 = uint32(params.len + g.p.localTypes.len)
+  g.p.scratchI64 = uint32(g.p.nparams + g.p.localTypes.len)
   g.p.localTypes.add ValI64
   g.p.frameSize = int32(align(int(frameOff), 16))
   if g.p.frameSize > 0:
-    g.p.fpIdx = uint32(params.len + g.p.localTypes.len)
+    g.p.fpIdx = uint32(g.p.nparams + g.p.localTypes.len)
     g.p.localTypes.add ValI32
     # prologue: sp -= frame; fp = sp
     g.globalGet GlobSp
@@ -1617,9 +2211,127 @@ proc lowerProc(g: var WasmGen; sym: string; decl: Cursor) =
   let ti = funcTypeIdx(g, ps, rs)
   discard ti
   g.funcBodies[g.funcIdx[sym]] =
-    (locals: g.p.localTypes, nparams: params.len, code: g.p.body.data)
+    (locals: g.p.localTypes, nparams: g.p.nparams, code: g.p.body.data)
 
 # ── module generation ────────────────────────────────────────────────────────
+
+proc putLE(bytes: var string; off: int; v: uint64; width: int) =
+  ## Write `width` little-endian bytes of `v` at `off`, zero-extending the
+  ## buffer as needed.
+  while bytes.len < off + width: bytes.add '\0'
+  var x = v
+  for i in 0 ..< width:
+    bytes[off + i] = char(x and 0xFF)
+    x = x shr 8
+
+proc constScalarBits(g: var WasmGen; v: Cursor; ok: var bool): uint64 =
+  ## The bit pattern of a compile-time scalar initializer value. Addresses
+  ## (string literals, `(addr global)`, proc symbols → table slots) resolve
+  ## to absolute numbers — ithaqua owns the memory layout, so no relocations
+  ## are needed.
+  ok = true
+  case v.kind
+  of IntLit: result = cast[uint64](intVal(v))
+  of UIntLit: result = uintVal(v)
+  of CharLit: result = uint64(ord(charLit(v)))
+  of FloatLit: result = cast[uint64](floatVal(v))
+  of StrLit: result = uint64(strLitAddr(g, strVal(v)))
+  of Symbol:
+    let nm = symName(v)
+    let si = lookupSym(typeCtx(g), nm)
+    case si.cat
+    of scProc: result = uint64(tableSlotOf(g, nm))
+    of scGlobal, scTvar, scNone:
+      ok = false                               # a VALUE copy is a runtime init
+      result = 0
+  of TagLit:
+    case v.exprKind
+    of TrueC: result = 1
+    of FalseC, NilC: result = 0
+    of SufC, ParC:
+      var t = v
+      inc t
+      result = constScalarBits(g, t, ok)
+    of AddrC:
+      var t = v
+      inc t
+      if t.kind == Symbol:
+        result = uint64(globalAddrOf(g, symName(t)))
+      else:
+        ok = false
+    of NegC:
+      var t = v
+      t.into:
+        skip t                                 # the type
+        var innerOk = true
+        let inner = constScalarBits(g, t, innerOk)
+        ok = innerOk
+        result = cast[uint64](0'i64 - cast[int64](inner))
+        while t.hasMore: skip t
+    else: ok = false
+  else: ok = false
+
+proc serializeConstInto(g: var WasmGen; bytes: var string; base: int;
+                        typ, v: Cursor) =
+  ## Serialize a compile-time aggregate/scalar initializer at `base` in
+  ## `bytes` (offsets mirror the runtime layout queries; a flexarray tail
+  ## takes string-literal payload verbatim, NUL-terminated).
+  let rt = resolveType(g.prog, typ)
+  if v.kind == TagLit and v.exprKind == OconstrC:
+    var t = v
+    t.into:
+      let objT = resolveType(g.prog, t)
+      skip t
+      while t.hasMore:
+        if t.substructureKind != KvU: err g, "malformed const oconstr"
+        var kv = t
+        kv.into:
+          let field = symName(kv); inc kv
+          let value = kv
+          skip kv
+          var fdepth = 0
+          if kv.hasMore and kv.kind == IntLit:
+            fdepth = int(intVal(kv))
+          while kv.hasMore: skip kv
+          let off = dotOffset(g, objT, field, fdepth)
+          let ft = fieldType(g.prog, objT, field)
+          let ftr = resolveType(g.prog, ft)
+          if ftr.kind == TagLit and ftr.typeKind == FlexarrayT:
+            # flexarray tail: raw payload
+            if value.kind == StrLit:
+              let s = strVal(value)
+              while bytes.len < base + off: bytes.add '\0'
+              for ch in s: bytes.add ch
+              bytes.add '\0'
+            elif value.kind == TagLit and value.exprKind == AconstrC:
+              serializeConstInto(g, bytes, base + off, ftr, value)
+            else:
+              err g, "unsupported flexarray const payload"
+          else:
+            serializeConstInto(g, bytes, base + off, ft, value)
+        skip t
+  elif v.kind == TagLit and v.exprKind == AconstrC:
+    var t = v
+    t.into:
+      let arrT = resolveType(g.prog, t)
+      let elemT = innerType(g.prog, arrT)
+      let (esz, _) = typeSizeAlign(g.prog, elemT)
+      skip t
+      var idx = 0
+      while t.hasMore:
+        serializeConstInto(g, bytes, base + idx * esz, elemT, t)
+        skip t
+        inc idx
+  else:
+    let sc = scalOf(g, rt)
+    if sc.kind == skMem:
+      err g, "unsupported aggregate const initializer form"
+    var ok = true
+    var bits = constScalarBits(g, v, ok)
+    if not ok: err g, "const initializer is not compile-time evaluable"
+    if sc.kind == skF32:
+      bits = uint64(cast[uint32](float32(cast[float64](bits))))
+    putLE(bytes, base, bits, max(sc.bits div 8, 1))
 
 proc emitGlobalInit(g: var WasmGen; nm: string; addrv: uint32) =
   ## Turn a gvar/const's STATIC initializer into a data segment. Zero inits
@@ -1641,49 +2353,18 @@ proc emitGlobalInit(g: var WasmGen; nm: string; addrv: uint32) =
       hasInit = true
     while d.hasMore: skip d
   if not hasInit: return
-  let sc = scalOf(g, typ)
+  # a zero initializer needs no segment (wasm memory starts zeroed); runtime
+  # initializers are the ini chain's job (skip them here, don't fail)
+  if initv.kind == TagLit and initv.exprKind in {FalseC, NilC}: return
+  if initv.kind == TagLit and
+     initv.exprKind notin {OconstrC, AconstrC, TrueC, SufC, ParC, AddrC, NegC}:
+    return                                     # runtime-computed init
+  if initv.kind == Symbol and
+     lookupSym(typeCtx(g), symName(initv)).cat != scProc:
+    return                                     # a value copy from another global: runtime init
   var bytes = ""
-  var ok = true
-  case initv.kind
-  of IntLit:
-    var v = cast[uint64](intVal(initv))
-    for i in 0 ..< min(sc.bits div 8, 8):
-      bytes.add char(v and 0xFF)
-      v = v shr 8
-  of UIntLit:
-    var v = uintVal(initv)
-    for i in 0 ..< min(sc.bits div 8, 8):
-      bytes.add char(v and 0xFF)
-      v = v shr 8
-  of CharLit:
-    bytes.add char(ord(charLit(initv)))
-  of FloatLit:
-    let fv = floatVal(initv)
-    if sc.kind == skF32:
-      let b32 = cast[uint32](float32(fv))
-      for i in 0 ..< 4: bytes.add char((b32 shr (i * 8)) and 0xFF)
-    else:
-      let b64 = cast[uint64](fv)
-      for i in 0 ..< 8: bytes.add char((b64 shr (i * 8)) and 0xFF)
-  of Symbol:
-    let initSym = symName(initv)
-    let isi = lookupSym(typeCtx(g), initSym)
-    if isi.cat == scProc or (isForeignSym(g.prog, initSym) and
-                             isi.cat == scNone):
-      let slot = tableSlotOf(g, initSym)       # may enqueue the proc
-      for i in 0 ..< 4: bytes.add char((slot shr (i * 8)) and 0xFF)
-    else:
-      err g, "global initializer symbol not supported yet: " & initSym
-  of StrLit:
-    let a = strLitAddr(g, strVal(initv))
-    for i in 0 ..< 4: bytes.add char((a shr (i * 8)) and 0xFF)
-  of TagLit:
-    case initv.exprKind
-    of TrueC: bytes.add '\1'
-    of FalseC, NilC: ok = false                # zero is the default
-    else: ok = false                           # runtime init handled by ini chain
-  else: ok = false
-  if ok and bytes.len > 0:
+  serializeConstInto(g, bytes, 0, typ, initv)
+  if bytes.len > 0:
     g.dataSegs.add (addrv, bytes)
 
 proc generateWasm*(buf: var TokenBuf; inputPath: string; tags: TagPool): seq[byte] =
@@ -1774,6 +2455,10 @@ proc generateWasm*(buf: var TokenBuf; inputPath: string; tags: TagPool): seq[byt
       if decls.len > 0 and decls[^1][1] == vt: inc decls[^1][0]
       else: decls.add (1'u32, vt)
     g.wm.addCode(decls, fb.code)
+
+  if getEnv("ITHAQUA_DEBUG").len > 0:
+    for sym, fi in g.funcIdx:
+      echo "func #", fi, " = ", sym
 
   # string literals + explicit data
   for (a, s) in g.dataSegs:
