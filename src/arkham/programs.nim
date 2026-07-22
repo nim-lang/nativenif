@@ -224,8 +224,8 @@ proc lookupSyscall*(name: string): tuple[found: bool, x64, a64: int] =
 
 # ── pass 0: collect the main module's top-level declarations ────────────────
 
-proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
-                  intrinsic: var IntrinsicOp; asmProc: var bool) =
+proc parsePragmas*(c: var Cursor; importcN, exportcN: var string;
+                   intrinsic: var IntrinsicOp; asmProc: var bool) =
   if c.substructureKind == PragmasU:
     c.into:
       while c.hasMore:
@@ -254,12 +254,12 @@ proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
   else:
     skip c
 
-proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
-                  intrinsic: var IntrinsicOp) {.inline.} =
+proc parsePragmas*(c: var Cursor; importcN, exportcN: var string;
+                   intrinsic: var IntrinsicOp) {.inline.} =
   var ignored = false
   parsePragmas(c, importcN, exportcN, intrinsic, ignored)
 
-proc parsePragmas(c: var Cursor; importcN, exportcN: var string) {.inline.} =
+proc parsePragmas*(c: var Cursor; importcN, exportcN: var string) {.inline.} =
   var ignored = NoIntrinsicOp
   parsePragmas(c, importcN, exportcN, ignored)
 
