@@ -757,14 +757,23 @@ proc genCompare(g: var WasmGen; c: Cursor; kind: LengExpr) =
   var t = c
   t.into:
     # the comparison width/signedness comes from a NON-LITERAL operand when
-    # one exists (bare literals default to the machine word, which would
-    # mis-type `lit == i64var`)
+    # one exists. Bare literals default to the machine word, and SUFFIXED
+    # literals count as literals too: typenav reports `(suf N "u64")` as the
+    # bare-literal default (i32), so typing the compare from a suf operand
+    # would truncate the other side (`BIGLIT <= u64var` became a signed
+    # 32-bit compare of wrapped halves). When both sides are literal-ish,
+    # exprScal reads the suffix (or the bare default) directly.
     var lhs = t
     var rhs = t
     skip rhs
-    let lhsLit = lhs.kind in {IntLit, UIntLit, CharLit, FloatLit}
-    let opT = if lhsLit: lengType(g, rhs) else: lengType(g, lhs)
-    let sc = scalOf(g, opT)
+    let lhsLit = lhs.kind in {IntLit, UIntLit, CharLit, FloatLit} or
+      (lhs.kind == TagLit and lhs.exprKind == SufC)
+    let rhsLit = rhs.kind in {IntLit, UIntLit, CharLit, FloatLit} or
+      (rhs.kind == TagLit and rhs.exprKind == SufC)
+    let sc =
+      if not lhsLit: scalOf(g, lengType(g, lhs))
+      elif not rhsLit: scalOf(g, lengType(g, rhs))
+      else: exprScal(g, lhs)
     genValueAs(g, t, sc); skip t
     genValueAs(g, t, sc)
     while t.hasMore: skip t
@@ -991,6 +1000,65 @@ proc lowersInline(g: var WasmGen; c: Cursor): bool =
     while t.hasMore: skip t
   result = res
 
+const MemcmpSym = "memcmp.ithaqua.synth" ## dots make collision with NIF syms impossible
+
+proc refMemcmp(g: var WasmGen): uint32 =
+  ## Function index of the synthetic memcmp helper, emitting it on first use.
+  ## Unlike memcpy/memset there is no bulk-memory instruction for compare, so
+  ## call sites become plain calls to this hand-encoded byte loop. It lives in
+  ## `funcIdx`/`funcBodies` like a lowered proc; only the module-assembly decl
+  ## loop special-cases the signature (no Leng decl exists to read it from).
+  if g.funcIdx.hasKey(MemcmpSym): return g.funcIdx[MemcmpSym]
+  result = g.nextFunc
+  inc g.nextFunc
+  g.funcIdx[MemcmpSym] = result
+  # (a: i32, b: i32, n: i32) -> i32; C semantics: sign of the first differing
+  # UNSIGNED byte pair, 0 if the first n bytes match.
+  # params a=0 b=1 n=2, locals ca=3 cb=4
+  var b = ByteBuf()
+  b.add OpLoop; b.add BlockVoid
+  #   if n == 0: return 0
+  b.add OpLocalGet; b.addU32 2
+  b.add OpI32Eqz
+  b.add OpIf; b.add BlockVoid
+  b.add OpI32Const; b.addI32 0
+  b.add OpReturn
+  b.add OpEnd
+  #   ca = load8_u a; cb = load8_u b
+  b.add OpLocalGet; b.addU32 0
+  b.add OpI32Load8U; b.addU32 0; b.addU32 0
+  b.add OpLocalSet; b.addU32 3
+  b.add OpLocalGet; b.addU32 1
+  b.add OpI32Load8U; b.addU32 0; b.addU32 0
+  b.add OpLocalSet; b.addU32 4
+  #   if ca != cb: return ca - cb
+  b.add OpLocalGet; b.addU32 3
+  b.add OpLocalGet; b.addU32 4
+  b.add OpI32Ne
+  b.add OpIf; b.add BlockVoid
+  b.add OpLocalGet; b.addU32 3
+  b.add OpLocalGet; b.addU32 4
+  b.add OpI32Sub
+  b.add OpReturn
+  b.add OpEnd
+  #   a += 1; b += 1; n -= 1; continue
+  b.add OpLocalGet; b.addU32 0
+  b.add OpI32Const; b.addI32 1
+  b.add OpI32Add
+  b.add OpLocalSet; b.addU32 0
+  b.add OpLocalGet; b.addU32 1
+  b.add OpI32Const; b.addI32 1
+  b.add OpI32Add
+  b.add OpLocalSet; b.addU32 1
+  b.add OpLocalGet; b.addU32 2
+  b.add OpI32Const; b.addI32 1
+  b.add OpI32Sub
+  b.add OpLocalSet; b.addU32 2
+  b.add OpBr; b.addU32 0
+  b.add OpEnd                                  # loop
+  b.add OpUnreachable                          # loop never falls through; type the i32 result
+  g.funcBodies[result] = (locals: @[ValI32, ValI32], nparams: 3, code: b.data)
+
 proc genInlineCall(g: var WasmGen; c: Cursor; wantValue: bool) =
   ## Lower an intrinsic call: single-threaded atomics become plain memory
   ## ops; memcpy/memmove/memset become bulk-memory instructions; syscalls
@@ -1006,26 +1074,39 @@ proc genInlineCall(g: var WasmGen; c: Cursor; wantValue: bool) =
         # (dst, src, n) → memory.copy; both intrinsics: memory.copy is overlap-safe
         genExpr(g, t); skip t                  # dst
         genExpr(g, t); skip t                  # src
-        let nT = lengType(g, t)
+        let nSc = exprScal(g, t)               # exprScal: a suf-u64 literal is i64
         genExpr(g, t)
-        if scalOf(g, nT).kind == skI64: g.op OpI32WrapI64
+        if nSc.kind == skI64: g.op OpI32WrapI64
         skip t
         while t.hasMore: skip t
         g.op 0xFC'u8; g.emitU32 10; g.emitU32 0; g.emitU32 0   # memory.copy
         if wantValue: err g, "memcpy result value not modelled"
       of "memset":
         genExpr(g, t); skip t                  # dst
-        let vT = lengType(g, t)
+        let vSc = exprScal(g, t)               # exprScal: a suf-u64 literal is i64
         genExpr(g, t)                          # value
-        if scalOf(g, vT).kind == skI64: g.op OpI32WrapI64
+        if vSc.kind == skI64: g.op OpI32WrapI64
         skip t
-        let nT = lengType(g, t)
+        let nSc = exprScal(g, t)               # exprScal: a suf-u64 literal is i64
         genExpr(g, t)
-        if scalOf(g, nT).kind == skI64: g.op OpI32WrapI64
+        if nSc.kind == skI64: g.op OpI32WrapI64
         skip t
         while t.hasMore: skip t
         g.op 0xFC'u8; g.emitU32 11; g.emitU32 0                # memory.fill
         if wantValue: err g, "memset result value not modelled"
+      of "memcmp":
+        # (a, b, n) → call the synthetic byte-compare loop (value-returning,
+        # so unlike memcpy/memset the result IS modelled)
+        genExpr(g, t); skip t                  # a
+        genExpr(g, t); skip t                  # b
+        let nSc = exprScal(g, t)               # exprScal: a suf-u64 literal is i64
+        genExpr(g, t)
+        if nSc.kind == skI64: g.op OpI32WrapI64
+        skip t
+        while t.hasMore: skip t
+        g.op OpCall
+        g.emitU32 refMemcmp(g)
+        if not wantValue: g.op OpDrop
       else:
         err g, "mem intrinsic not supported yet: " & ct.memIntrin
     elif ct.atomic.len > 0:
@@ -1156,9 +1237,9 @@ proc genInlineCall(g: var WasmGen; c: Cursor; wantValue: bool) =
         if scalOf(g, fdT).kind == skI64: g.op OpI32WrapI64
         skip t
         genExpr(g, t); skip t                  # buf (a pointer)
-        let nT = lengType(g, t)
+        let nSc = exprScal(g, t)               # exprScal: a suf-u64 literal is i64
         genExpr(g, t)
-        if scalOf(g, nT).kind == skI64: g.op OpI32WrapI64
+        if nSc.kind == skI64: g.op OpI32WrapI64
         skip t
         while t.hasMore: skip t
         g.op OpCall; g.emitU32 ImpWrite
@@ -2024,32 +2105,111 @@ proc genStmt(g: var WasmGen; c: var Cursor) =
     else:
       err g, "unknown statement"
 
+proc landingPadLabel(c: Cursor): string =
+  ## Non-empty iff `c` is hexer's jump-into-guarded-region idiom:
+  ## `(if (elif (false) (stmts (lab L) …)))` — C's `if (0) { L: … }`, the
+  ## flag-based error model's exception landing pad. The try body `jmp`s
+  ## INTO the guarded branch, so a plain if-lowering could never reach the
+  ## label; genStmtList restructures it into block/br form instead.
+  result = ""
+  if c.stmtKind != IfS: return
+  var t = c
+  var lab = ""
+  var arms = 0
+  t.into:
+    while t.hasMore:
+      inc arms
+      if arms == 1 and t.substructureKind == ElifU:
+        var e = t
+        e.into:
+          if e.kind == TagLit and e.exprKind == FalseC:
+            skip e                             # (false)
+            if e.hasMore and e.stmtKind == StmtsS:
+              var s = e
+              s.into:
+                if s.hasMore and s.stmtKind == LabS:
+                  var l = s
+                  l.into:
+                    lab = symName(l)
+                    while l.hasMore: skip l
+                while s.hasMore: skip s
+          while e.hasMore: skip e
+      skip t
+  if arms == 1: result = lab
+
 proc genStmtList(g: var WasmGen; c: Cursor) =
   ## Lower a `(stmts …)` list. Every `(lab L)` at THIS level gets a wasm
   ## `block` opened at the head of the list (nested in reverse appearance
   ## order, so the first label closes innermost) — a forward `jmp L` from
-  ## anywhere inside then `br`s to it.
-  var labs: seq[string] = @[]
+  ## anywhere inside then `br`s to it. A label already registered by an
+  ## OUTER list (the landing-pad restructure below) is not reopened; the
+  ## `(lab)` statement closes the outer block.
+  ##
+  ## A landing-pad child `(if (elif (false) (stmts (lab L) …)))` becomes
+  ##   block $join { block $L { …try children…; br $join } …guarded body… }
+  ## with both blocks opened at the head of the list: `jmp L` inside the
+  ## try children brs past $L's end into the guarded body; normal
+  ## fallthrough brs to $join, skipping it.
+  # Collect the CLOSE events of this level in child order — each `(lab L)`
+  # statement and each landing-pad if-child closes the block(s) opened for
+  # it here. wasm `end` is positional (it always closes the innermost open
+  # block), so blocks must nest in REVERSE close order: the event that
+  # closes first gets the innermost block. A single flat "labs then pads"
+  # nesting breaks as soon as a loop-exit label closes before a pad child.
+  var events: seq[(bool, string)] = @[]        # (isPad, label)
   var scan = c
   scan.into:
     while scan.hasMore:
       if scan.stmtKind == LabS:
         var t = scan
         t.into:
-          labs.add symName(t)
+          let nm = symName(t)
+          if not g.p.labelDepth.hasKey(nm):
+            events.add (false, nm)
           while t.hasMore: skip t
+      else:
+        let pl = landingPadLabel(scan)
+        if pl.len > 0: events.add (true, pl)
       skip scan
-  for i in countdown(labs.len - 1, 0):
-    g.op OpBlock; g.p.body.add BlockVoid
-    inc g.p.depth
-    g.p.labelDepth[labs[i]] = g.p.depth
+  var padJoin = initTable[string, int]()
+  for i in countdown(events.len - 1, 0):
+    let (isPad, nm) = events[i]
+    if isPad:
+      g.op OpBlock; g.p.body.add BlockVoid     # $join
+      inc g.p.depth
+      padJoin[nm] = g.p.depth
+      g.op OpBlock; g.p.body.add BlockVoid     # $L (jmp target)
+      inc g.p.depth
+      g.p.labelDepth[nm] = g.p.depth
+    else:
+      g.op OpBlock; g.p.body.add BlockVoid
+      inc g.p.depth
+      g.p.labelDepth[nm] = g.p.depth
   var t = c
   t.into:
     while t.hasMore:
       # sret temps allocated inside this statement are dead once it
       # completes — give their shadow-stack space back so loops don't creep
       let savedSret = g.p.dynSret
-      genStmt(g, t)
+      let pl = landingPadLabel(t)
+      if pl.len > 0 and padJoin.hasKey(pl):
+        g.op OpBr                              # fallthrough skips the pad body
+        g.emitU32 uint32(g.p.depth - padJoin[pl])
+        var f = t
+        f.into:                                # (if
+          var e = f
+          e.into:                              # (elif
+            skip e                             # (false)
+            genStmtList(g, e)                  # (stmts (lab L) …): lab closes $L
+            skip e
+            while e.hasMore: skip e
+          skip f
+          while f.hasMore: skip f
+        g.op OpEnd                             # $join
+        dec g.p.depth
+        skip t
+      else:
+        genStmt(g, t)
       if g.p.dynSret > savedSret:
         restoreDynStack(g, g.p.dynSret - savedSret)
         g.p.dynSret = savedSret
@@ -2252,6 +2412,24 @@ proc constScalarBits(g: var WasmGen; v: Cursor; ok: var bool): uint64 =
       var t = v
       inc t
       result = constScalarBits(g, t, ok)
+    of ConvC, CastC:
+      # `(conv (u N) LIT)` — hexer wraps unsigned-typed literal gvar inits
+      # like this. An integer conv of an integer literal is a bit
+      # passthrough (putLE truncates to the declared width, which equals
+      # the conv target for these). A float conv target is static only when
+      # the operand is already a FloatLit (bits pass through; the f32 case
+      # is re-narrowed by the caller) — int→float needs a conversion, so it
+      # stays a runtime init.
+      var t = v
+      t.into:
+        let floatTarget = t.kind == TagLit and t.typeKind == FT
+        skip t                                 # the conv target type
+        if floatTarget and t.kind != FloatLit:
+          ok = false
+          result = 0
+        else:
+          result = constScalarBits(g, t, ok)
+        while t.hasMore: skip t
     of AddrC:
       var t = v
       inc t
@@ -2356,7 +2534,18 @@ proc emitGlobalInit(g: var WasmGen; nm: string; addrv: uint32) =
   # a zero initializer needs no segment (wasm memory starts zeroed); runtime
   # initializers are the ini chain's job (skip them here, don't fail)
   if initv.kind == TagLit and initv.exprKind in {FalseC, NilC}: return
-  if initv.kind == TagLit and
+  if initv.kind == TagLit and initv.exprKind in {ConvC, CastC}:
+    # static only when the operand is itself compile-time (see the ConvC arm
+    # of constScalarBits); a conv of a global's value is the ini chain's job
+    var t = initv
+    var staticInner = false
+    t.into:
+      skip t                                   # the conv target type
+      staticInner = t.kind in {IntLit, UIntLit, CharLit, FloatLit, StrLit} or
+        (t.kind == TagLit and t.exprKind in {TrueC, FalseC, SufC, NegC})
+      while t.hasMore: skip t
+    if not staticInner: return
+  elif initv.kind == TagLit and
      initv.exprKind notin {OconstrC, AconstrC, TrueC, SufC, ParC, AddrC, NegC}:
     return                                     # runtime-computed init
   if initv.kind == Symbol and
@@ -2438,6 +2627,10 @@ proc generateWasm*(buf: var TokenBuf; inputPath: string; tags: TagPool): seq[byt
   for sym, fi in g.funcIdx:
     order[int(fi) - HostImports.len] = sym
   for sym in order:
+    if sym == MemcmpSym:                       # synthetic: no Leng decl to read
+      discard g.wm.addFunction(funcTypeIdx(g,
+        @[ValI32, ValI32, ValI32], @[ValI32]))
+      continue
     var decl: Cursor
     if isForeignSym(g.prog, sym):
       var found = false
