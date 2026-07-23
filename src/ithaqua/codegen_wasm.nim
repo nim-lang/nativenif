@@ -100,6 +100,15 @@ type
     tableEntries: seq[uint32]              ## slot i+1 → function index
     p: ProcCtx                             ## the proc being lowered
     entrySym: string
+    # host-imports mode (ITHAQUA_HOST_IMPORTS): bodyless importc procs become
+    # env imports instead of trap-bodied functions — the JS bridge implements
+    # them. Two passes: pass 1 collects the names, pass 2 pre-pins them.
+    collectExterns*: bool                  ## pass 1: record instead of pin
+    externsFound*: seq[(string, Cursor)]   ## (importc name, decl), discovery order
+    hostImportIdx: Table[string, uint32]   ## importc name → pinned import index
+    numImports: uint32                     ## total imports (base + host): the
+                                           ## function-index space below this
+                                           ## has no bodies to emit
 
 # ── small helpers ────────────────────────────────────────────────────────────
 
@@ -274,9 +283,54 @@ proc funcTypeIdx(g: var WasmGen; params, results: seq[byte]): uint32 =
 
 # ── proc reachability ────────────────────────────────────────────────────────
 
+proc importcExternOf(decl: Cursor): string =
+  ## The importc name when `decl` is a bodyless FFI proc (importc pragma and
+  ## an empty `(stmts .)` body) — the shape hexer gives C-API decls. ""
+  ## otherwise.
+  result = ""
+  var d = decl
+  var icName, ecName = ""
+  var bodyEmpty = false
+  d.into:
+    inc d                                      # name
+    skip d                                     # params
+    skip d                                     # return type
+    parsePragmas(d, icName, ecName)            # consumes the pragmas node
+    if d.hasMore and d.kind != DotToken:
+      var b = d
+      if b.stmtKind == StmtsS:
+        var inner = b
+        var n = 0
+        inner.into:
+          while inner.hasMore:
+            if inner.kind != DotToken: inc n
+            skip inner
+        bodyEmpty = n == 0
+      skip d
+    else:
+      bodyEmpty = true
+    while d.hasMore: skip d
+  if icName.len > 0 and bodyEmpty:
+    result = icName
+
 proc declareProc(g: var WasmGen; sym: string; decl: Cursor): uint32 =
-  ## Assign `sym` its function index and queue its body for lowering.
+  ## Assign `sym` its function index and queue its body for lowering. A
+  ## bodyless importc proc resolves to its pinned env import in host-imports
+  ## pass 2 (deduped by importc NAME — several Nim decls may bind one C fn);
+  ## pass 1 records it and keeps today's trap body so the pass stays
+  ## well-formed.
   if g.funcIdx.hasKey(sym): return g.funcIdx[sym]
+  let icName = importcExternOf(decl)
+  if icName.len > 0:
+    if g.hostImportIdx.hasKey(icName):
+      result = g.hostImportIdx[icName]
+      g.funcIdx[sym] = result
+      return
+    if g.collectExterns:
+      var seen = false
+      for (n, _) in g.externsFound:
+        if n == icName: seen = true
+      if not seen: g.externsFound.add (icName, decl)
   result = g.nextFunc
   inc g.nextFunc
   g.funcIdx[sym] = result
@@ -2646,8 +2700,12 @@ proc emitGlobalInit(g: var WasmGen; nm: string; addrv: uint32) =
   if bytes.len > 0:
     g.dataSegs.add (addrv, bytes)
 
-proc generateWasm*(buf: var TokenBuf; inputPath: string; tags: TagPool): seq[byte] =
+proc generateWasm*(buf: var TokenBuf; inputPath: string; tags: TagPool;
+                   collectExterns = false;
+                   hostImports: seq[(string, Cursor)] = @[];
+                   externsOut: ptr seq[(string, Cursor)] = nil): seq[byte] =
   var g = WasmGen(tags: tags, memTop: NullGuard, nextFunc: uint32(HostImports.len))
+  g.collectExterns = collectExterns
   g.prog = collect(buf, inputPath, tags, ptrSize = WasmPtrSize)
   g.callTarget = g.prog.callTarget
   g.globals = g.prog.globals
@@ -2657,6 +2715,14 @@ proc generateWasm*(buf: var TokenBuf; inputPath: string; tags: TagPool): seq[byt
   for hi in HostImports:
     let ti = g.wm.addFuncType(hi.params, hi.results)
     discard g.wm.addImportFunc("env", hi.name, ti)
+  # host-imports pass 2: the pass-1 externs, pinned in discovery order
+  for (icName, icDecl) in hostImports:
+    let (ps, rs) = procSigTypes(g, icDecl, isProctype = false)
+    let ti = funcTypeIdx(g, ps, rs)
+    discard g.wm.addImportFunc("env", icName, ti)
+    g.hostImportIdx[icName] = g.nextFunc
+    inc g.nextFunc
+  g.numImports = g.nextFunc
 
   # entry = the exportc "main" proc (arkham's convention)
   var entryDecl: Cursor
@@ -2712,10 +2778,13 @@ proc generateWasm*(buf: var TokenBuf; inputPath: string; tags: TagPool): seq[byt
       processedGlobals.incl nm
       emitGlobalInit(g, nm, g.globalAddr[nm])
 
-  # declare functions in index order and register bodies
-  var order = newSeq[string](g.funcIdx.len)
+  # declare functions in index order and register bodies. Import-mapped syms
+  # (host-imports mode: fi < numImports) have no bodies — and several Nim
+  # decls may share one import index, so order is sized by DEFINED count.
+  var order = newSeq[string](int(g.nextFunc) - int(g.numImports))
   for sym, fi in g.funcIdx:
-    order[int(fi) - HostImports.len] = sym
+    if fi >= g.numImports:
+      order[int(fi) - int(g.numImports)] = sym
   for sym in order:
     if sym == MemcmpSym:                       # synthetic: no Leng decl to read
       discard g.wm.addFunction(funcTypeIdx(g,
@@ -2757,6 +2826,8 @@ proc generateWasm*(buf: var TokenBuf; inputPath: string; tags: TagPool): seq[byt
   # funcref table for indirect calls — always present (call_indirect can be
   # emitted through a fn-ptr that only ever holds null); slot 0 = null
   discard g.wm.addTable(uint32(g.tableEntries.len + 1))
+  g.wm.addExportTable("table", 0)              # JS bridge: callbacks call back
+                                               # into wasm via table.get(slot)
   if g.tableEntries.len > 0:
     g.wm.addElem(1, g.tableEntries)
 
@@ -2792,4 +2863,6 @@ proc generateWasm*(buf: var TokenBuf; inputPath: string; tags: TagPool): seq[byt
   for (sym, cName) in exportRoots:
     g.wm.addExportFunc(cName, g.funcIdx[sym])
 
+  if externsOut != nil:
+    externsOut[] = g.externsFound
   result = encode(g.wm)
