@@ -1220,8 +1220,18 @@ proc genInlineCall(g: var WasmGen; c: Cursor; wantValue: bool) =
       of "__builtin_ctzll":  genExpr(g, t); g.op OpI64Ctz; g.op OpI32WrapI64
       of "__builtin_clzll":  genExpr(g, t); g.op OpI64Clz; g.op OpI32WrapI64
       of "__builtin_popcountll": genExpr(g, t); g.op OpI64Popcnt; g.op OpI32WrapI64
+      of "__builtin_wasm_memory_size":
+        # () -> current size in 64 KiB pages
+        g.op OpMemorySize; g.p.body.add 0'u8
+      of "__builtin_wasm_memory_grow":
+        # (delta pages) -> previous size in pages, or -1 on failure
+        genExpr(g, t)
+        g.op OpMemoryGrow; g.p.body.add 0'u8
       else: err g, "bit builtin not supported yet: " & ct.bitBuiltin
-      skip t
+      # memory_size is the one ZERO-ARG builtin — the shared skip below
+      # assumes exactly-one-arg and would overrun its ParRi
+      if ct.bitBuiltin != "__builtin_wasm_memory_size":
+        skip t
       while t.hasMore: skip t
     elif ct.syscall:
       # The WW3 runtime floor: write goes to the host, exit traps the
