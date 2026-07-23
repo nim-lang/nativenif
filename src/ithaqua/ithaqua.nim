@@ -10,7 +10,7 @@
 ## module are pulled in through the embedded-index loader and emitted into the
 ## same wasm module — there is no separate link step).
 
-import std / [parseopt, syncio, strutils]
+import std / [parseopt, syncio, strutils, envvars]
 import nifcoreparse
 import lengdecl
 import codegen_wasm
@@ -32,7 +32,16 @@ proc run(input, output: string) =
   # program model loads on demand (same arrangement as arkham).
   let tags = createLengTagPool()
   var buf = parseFromFile(input, sharedTags = tags)
-  let code = generateWasm(buf, input, tags)
+  var code: seq[byte]
+  if getEnv("ITHAQUA_HOST_IMPORTS").len > 0:
+    # two passes: discover the bodyless-importc surface, then re-emit with
+    # every discovered name pinned as an env import (the JS bridge contract)
+    var externs: seq[(string, Cursor)] = @[]
+    discard generateWasm(buf, input, tags, collectExterns = true,
+                         externsOut = addr externs)
+    code = generateWasm(buf, input, tags, hostImports = externs)
+  else:
+    code = generateWasm(buf, input, tags)
   var s = newString(code.len)
   for i, b in code: s[i] = char(b)
   writeFile(output, s)
