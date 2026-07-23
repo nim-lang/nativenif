@@ -510,7 +510,8 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         elif importcN in ["__builtin_ctzll", "__builtin_ctz",
                           "__builtin_clzll", "__builtin_clz",
                           "__builtin_popcountll", "__builtin_popcount",
-                          "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64"]:
+                          "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64",
+                          "__builtin_wasm_memory_size", "__builtin_wasm_memory_grow"]:
           # GCC bit builtin (count-trailing/leading-zeros, popcount, byte-swap):
           # lowered inline to a native bit instruction — no libc/extproc. See
           # genBitBuiltin. (nimony's `firstSetBit`/`countTrailingZeroBits` reach
@@ -741,7 +742,8 @@ proc foreignCallTarget*(p: var Program; name: string): CallTarget =
   elif importcN in ["__builtin_ctzll", "__builtin_ctz",
                     "__builtin_clzll", "__builtin_clz",
                     "__builtin_popcountll", "__builtin_popcount",
-                    "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64"]:
+                    "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64",
+                    "__builtin_wasm_memory_size", "__builtin_wasm_memory_grow"]:
     result = CallTarget(bitBuiltin: importcN, retType: retType, sigType: sigType)
   elif not p.darwin and importcN.len > 0 and lookupSyscall(importcN).found:
     let (_, x64Nr, a64Nr) = lookupSyscall(importcN)
