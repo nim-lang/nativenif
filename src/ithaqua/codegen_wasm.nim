@@ -1448,8 +1448,22 @@ proc genConstrInto(g: var WasmGen; constr: Cursor; depth: int) =
     let objT = resolveType(g.prog, typ)
     skip t
     if constr.exprKind == OconstrC:
+      var isFirst = true
       while t.hasMore:
-        if t.substructureKind != KvU: err g, "malformed oconstr"
+        if t.substructureKind != KvU:
+          if isFirst:
+            # inheritance header: a leading non-kv child is the vtable
+            # pointer of a RootObj-derived object — `(oconstr T (addr T.vt.)
+            # (kv …)…)`, e.g. hexer's coroutine frames (method cancel).
+            # Stored at offset 0, ahead of the named fields.
+            g.localGet dest
+            genExpr(g, t)                      # the vtable's address (i32)
+            g.emitStore Scal(kind: skI32, bits: 32, signed: false)
+            skip t
+            isFirst = false
+            continue
+          err g, "malformed oconstr"
+        isFirst = false
         var kv = t
         kv.into:
           let field = symName(kv); inc kv
@@ -2384,6 +2398,20 @@ proc putLE(bytes: var string; off: int; v: uint64; width: int) =
     bytes[off + i] = char(x and 0xFF)
     x = x shr 8
 
+proc isAggregateGlobal(g: var WasmGen; nm: string): bool =
+  ## True when `nm` names a gvar/tvar/const whose DECLARED type is an
+  ## aggregate (skMem) — the case where a C cast of the bare symbol means
+  ## array decay to its address rather than a value read.
+  let si = lookupSym(typeCtx(g), nm)
+  if si.cat notin {scGlobal, scTvar}: return false
+  var d = si.decl
+  result = false
+  d.into:
+    inc d                                      # name
+    skip d                                     # pragmas
+    result = scalOf(g, d).kind == skMem
+    while d.hasMore: skip d
+
 proc constScalarBits(g: var WasmGen; v: Cursor; ok: var bool): uint64 =
   ## The bit pattern of a compile-time scalar initializer value. Addresses
   ## (string literals, `(addr global)`, proc symbols → table slots) resolve
@@ -2427,6 +2455,12 @@ proc constScalarBits(g: var WasmGen; v: Cursor; ok: var bool): uint64 =
         if floatTarget and t.kind != FloatLit:
           ok = false
           result = 0
+        elif t.kind == Symbol and isAggregateGlobal(g, symName(t)):
+          # C array decay: a cast of an AGGREGATE global (e.g. the vtable's
+          # `(cast (ptr (u 32)) X.coro.dy.)` method-table chain) means its
+          # ADDRESS — a link-time constant here, since ithaqua owns the
+          # layout. A cast of a SCALAR global stays a runtime value copy.
+          result = uint64(globalAddrOf(g, symName(t)))
         else:
           result = constScalarBits(g, t, ok)
         while t.hasMore: skip t
