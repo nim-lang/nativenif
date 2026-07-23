@@ -403,7 +403,26 @@ proc fieldOffsetIn(g: var WasmGen; objType: Cursor; field: string;
     skip oc
     while oc.hasMore:
       if oc.kind == TagLit and oc.typeKind == UnionT:
-        err g, "union field offsets not supported yet"
+        # variant-object payload (hexer lowers case-objects to a union of
+        # anonymous object branches): every branch OVERLAYS at the union's
+        # offset — search each for the field; the union occupies max-size
+        # bytes at max-alignment
+        let (usz, ual) = typeSizeAlign(g.prog, oc)
+        off = align(off, int(ual))
+        var un = oc
+        un.into:
+          while un.hasMore:
+            if not found:
+              var inner = false
+              let innerOff = fieldOffsetIn(g, un, field, inner)
+              if inner:
+                found = true
+                result = off + innerOff
+            skip un
+        if not found:
+          off += int(usz)
+        skip oc
+        continue
       oc.into:                                 # (fld :name pragmas type)
         let fn = symName(oc); inc oc
         skip oc                                # pragmas
@@ -546,6 +565,14 @@ proc genLvalAddr(g: var WasmGen; c: Cursor) =
           g.constI32 int32(esz)
           g.op OpI32Mul
         g.op OpI32Add
+    of BaseobjC:
+      # base-object view of a derived object: same address (base at offset 0)
+      var t = c
+      t.into:
+        skip t                                 # base type
+        if t.kind == IntLit: inc t             # depth
+        genLvalAddr(g, t)
+        while t.hasMore: skip t
     of ErrvC, OvfC:
       err g, "errv/ovf have no address"
     else:
