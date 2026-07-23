@@ -1450,6 +1450,25 @@ proc genExpr(g: var WasmGen; c: Cursor) =
         if t.kind == IntLit: inc t             # depth
         genExpr(g, t)
         while t.hasMore: skip t
+    of OconstrC, AconstrC:
+      # a constructor in VALUE position: build it in a shadow-stack temp
+      # (stmt-scoped, reclaimed with the dynSret pool) and yield its address —
+      # the same aggregate-value convention as sret results
+      var ty = c
+      inc ty                                   # the carried type
+      let (sz0, _) = typeSizeAlign(g.prog, resolveType(g.prog, ty))
+      let sz = int32(align(max(sz0, 1), 16))
+      g.p.dynSret += sz
+      let depth = g.p.constrDests.len
+      let tmp = constrDest(g, depth)
+      g.globalGet GlobSp
+      g.constI32 sz
+      g.op OpI32Sub
+      g.localTee tmp
+      g.globalSet GlobSp
+      g.localGet tmp
+      genConstrInto(g, c, depth)
+      g.localGet tmp                           # the expression's value: its address
     else:
       err g, "expression not supported yet: " & $c.exprKind
   else:
