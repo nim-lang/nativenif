@@ -821,6 +821,29 @@ proc litScal(g: var WasmGen; c: Cursor): Scal =
   of FloatLit: Scal(kind: skF64, bits: 64)
   else: err g, "not a literal"
 
+proc sufFloatVal(g: var WasmGen; lit: Cursor): float64 =
+  ## The numeric value of a suffixed float literal: nimony emits FloatLit,
+  ## integral-value IntLit/UIntLit, or a (neg LIT) wrapper for negatives.
+  case lit.kind
+  of FloatLit: floatVal(lit)
+  of IntLit: float64(intVal(lit))
+  of UIntLit: float64(uintVal(lit))
+  of TagLit:
+    case lit.exprKind
+    of NegC:
+      var t = lit
+      var v = 0.0
+      t.into:
+        v = -sufFloatVal(g, t)
+        while t.hasMore: skip t
+      v
+    of NanC: NaN
+    of InfC: Inf
+    of NeginfC: -Inf
+    else:
+      err g, "bad float literal (tag: " & lit.tags.tags[lit.cursorTagId] & ")"
+  else: err g, "bad float literal (kind: " & $lit.kind & ")"
+
 proc genSufLit(g: var WasmGen; c: Cursor) =
   ## `(suf LIT "i32")` — the suffix names the literal's type.
   var t = c
@@ -836,11 +859,13 @@ proc genSufLit(g: var WasmGen; c: Cursor) =
       of UIntLit: g.constI64 cast[int64](uintVal(lit))
       else: err g, "bad i64 literal"
     of "f32":
+      # nimony emits FloatLit, integral IntLit/UIntLit (1.0'f32 → 1), or a
+      # (neg …) wrapper — sufFloatVal covers them all.
       g.op OpF32Const
-      g.p.body.addF32 float32(floatVal(lit))
+      g.p.body.addF32 float32(sufFloatVal(g, lit))
     of "f64", "f":
       g.op OpF64Const
-      g.p.body.addF64 floatVal(lit)
+      g.p.body.addF64 sufFloatVal(g, lit)
     else:                                       # i8/i16/i32/u8/u16/u32/…
       case lit.kind
       of IntLit: g.constI32 int32(intVal(lit))
