@@ -1343,6 +1343,23 @@ proc fieldType*(p: var Program; objType: Cursor; field: string): Cursor =
   ## The structural type cursor of `field` in a resolved `(object …)` type.
   ## An inherited field (the Leng `(dot base field depth)` selector counts the
   ## base levels) is resolved by recursing into the object's base type.
+  ## Plain C unions (`(union (fld …)+)`, e.g. the input-event union) are
+  ## selected into directly — every member overlays at the union's base.
+  if objType.kind == TagLit and objType.typeKind == UnionT:
+    var uc = objType
+    uc.into:
+      while uc.hasMore:
+        if uc.kind == TagLit and uc.substructureKind == FldU:
+          var fn = ""
+          var fc = uc
+          fc.into:
+            fn = symName(fc); inc fc
+            skip fc                             # field-pragmas
+            result = fc; skip fc
+            while fc.hasMore: skip fc
+          if fn == field: return
+        skip uc
+    raiseAssert "arkham: field '" & field & "' not found in union"
   assert objType.kind == TagLit and objType.typeKind == ObjectT,
     "arkham: field access requires an object type (field " & field &
     ", base resolves to " & toString(objType, includeLineInfo = false) & ")"
