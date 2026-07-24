@@ -846,13 +846,24 @@ proc typeSizeAlign*(p: var Program; c: Cursor): (int, int)
 
 proc unionSizeAlign(p: var Program; unionc: Cursor): (int, int) =
   ## A union's branches OVERLAP: size = max(branch size), align = max(branch align).
-  ## Leng object-variant branches are `(object …)` nodes (sized via `objSizeAlign`).
+  ## Leng object-variant branches are `(object …)` nodes (sized via
+  ## `objSizeAlign`); plain C-style unions (e.g. allocator free-list headers)
+  ## carry bare `(fld :name pragmas type)` branches — size the field's type.
   var uc = unionc
   var maxSz = 0
   var maxAl = 1
   uc.into:
     while uc.hasMore:
-      let (bsz, bal) = typeSizeAlign(p, uc)   # each branch is an (object …)
+      var bsz = 0
+      var bal = 1
+      if uc.kind == TagLit and uc.substructureKind == FldU:
+        var fc = uc
+        fc.into:
+          inc fc; skip fc                     # name, field-pragmas
+          (bsz, bal) = typeSizeAlign(p, fc); skip fc
+          while fc.hasMore: skip fc           # trailing extras (offsets etc.)
+      else:
+        (bsz, bal) = typeSizeAlign(p, uc)     # an (object …) branch
       if bsz > maxSz: maxSz = bsz
       if bal > maxAl: maxAl = bal
       skip uc
