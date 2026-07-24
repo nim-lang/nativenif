@@ -1081,6 +1081,9 @@ proc unionSizeAlign(p: var Program; unionc: Cursor): (int, int) =
   ## A `{.union.}`'s children are `(object …)` / `(fld …)` nodes directly; an object
   ## VARIANT's are `(of RANGES BODY)` / `(else BODY)` branches whose body is the
   ## `(object …)` (or `.` when the branch declares no fields, contributing nothing).
+  ## A bare `(fld :name pragmas type)` child — a plain C-style union, e.g. an
+  ## allocator free-list header — is a DECLARATION, not a type, so it is sized by
+  ## its field type rather than handed to `typeSizeAlign` directly.
   var uc = unionc
   var maxSz = 0
   var maxAl = 1
@@ -1088,7 +1091,16 @@ proc unionSizeAlign(p: var Program; unionc: Cursor): (int, int) =
     while uc.hasMore:
       let bodyc = unionBranchBody(uc)
       if bodyc.kind != DotToken:
-        let (bsz, bal) = typeSizeAlign(p, bodyc)
+        var bsz = 0
+        var bal = 1
+        if bodyc.kind == TagLit and bodyc.substructureKind == FldU:
+          var fc = bodyc
+          fc.into:
+            inc fc; skip fc                     # name, field-pragmas
+            (bsz, bal) = typeSizeAlign(p, fc); skip fc
+            while fc.hasMore: skip fc           # trailing extras (offsets etc.)
+        else:
+          (bsz, bal) = typeSizeAlign(p, bodyc)  # an (object …) branch
         if bsz > maxSz: maxSz = bsz
         if bal > maxAl: maxAl = bal
       skip uc

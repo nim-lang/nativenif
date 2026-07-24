@@ -1234,6 +1234,32 @@ proc genInlineCall(g: var WasmGen; c: Cursor; wantValue: bool) =
           g.localGet g.p.scratchI32b
           g.emitStore sc
           if wantValue: g.localGet g.p.scratchI32b
+      of "__atomic_fetch_add", "__atomic_fetch_sub":
+        # fetch-op returning the OLD value (add_fetch above returns the new
+        # one); single-threaded → load old, op, store new, yield old.
+        let valT = callResultType(g, c)
+        let sc = scalOf(g, valT)
+        let ptrL = newLocal(g, ValI32)
+        let deltaL = newLocal(g, valType(sc))
+        let oldL = newLocal(g, valType(sc))
+        genExpr(g, t); skip t                  # pointer
+        g.localSet ptrL
+        genExpr(g, t); skip t                  # delta
+        g.localSet deltaL
+        while t.hasMore: skip t                # memorder
+        g.localGet ptrL
+        g.emitLoad sc
+        g.localSet oldL
+        g.localGet ptrL
+        g.localGet oldL
+        g.localGet deltaL
+        if sc.kind == skI64:
+          g.op (if ct.atomic == "__atomic_fetch_add": OpI64Add else: OpI64Sub)
+        else:
+          g.op (if ct.atomic == "__atomic_fetch_add": OpI32Add else: OpI32Sub)
+          g.canonNarrow sc
+        g.emitStore sc
+        if wantValue: g.localGet oldL
       of "__atomic_compare_exchange_n":
         # (ptr, expected_ptr, desired, weak, succ_order, fail_order) → bool.
         # Single-threaded: if *ptr == *expected: *ptr = desired; true
