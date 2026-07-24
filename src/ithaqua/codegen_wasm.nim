@@ -500,6 +500,10 @@ proc dotOffset(g: var WasmGen; baseType: Cursor; field: string; depth: int): int
   var t = resolveType(g.prog, baseType)
   var lvl = depth
   while true:
+    if t.kind == TagLit and t.typeKind == UnionT:
+      # Plain C union: every member overlays at the union's base. Field
+      # existence/type is checked by fieldType (typenav) — offset is 0.
+      return 0
     if t.kind != TagLit or t.typeKind != ObjectT:
       err g, "dot into a non-object type"
     if lvl > 0:
