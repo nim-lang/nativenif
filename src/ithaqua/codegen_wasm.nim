@@ -2636,14 +2636,29 @@ proc serializeConstInto(g: var WasmGen; bytes: var string; base: int;
     var t = v
     t.into:
       let arrT = resolveType(g.prog, t)
-      let elemT = innerType(g.prog, arrT)
-      let (esz, _) = typeSizeAlign(g.prog, elemT)
+      # element type: a real array/flexarray gives it via innerType; a bare
+      # pointer container (hexer emits a fixed method-table as
+      # `(aconstr (ptr T) elem…)`, e.g. a closure/RootObj RTTI `mt`) means the
+      # elements ARE pointers — the container type itself is the element type,
+      # pointer-width per slot.
+      var elemT: Cursor
+      var esz: int
+      if arrT.kind == TagLit and arrT.typeKind in {PtrT, AptrT}:
+        elemT = arrT
+        esz = WasmPtrSize
+      else:
+        elemT = innerType(g.prog, arrT)
+        (esz, _) = typeSizeAlign(g.prog, elemT)
       skip t
       var idx = 0
       while t.hasMore:
         serializeConstInto(g, bytes, base + idx * esz, elemT, t)
         skip t
         inc idx
+  elif v.kind == TagLit and v.exprKind == NilC:
+    # a nil pointer const (e.g. an empty RTTI method-table slot): zero of
+    # pointer width. rt may be void-shaped in this position; force ptr size.
+    putLE(bytes, base, 0, WasmPtrSize)
   else:
     let sc = scalOf(g, rt)
     if sc.kind == skMem:
