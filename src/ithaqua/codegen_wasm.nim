@@ -96,6 +96,10 @@ type
     globalAddr: Table[string, uint32]
     rodataAddr: Table[string, uint32]      ## string literal → address (deduped)
     dataSegs: seq[(uint32, string)]
+    allocLog: seq[(uint32, uint32, string)]    ## (addr, size, owner) for the
+                                               ## static-layout overrun check
+    synthSigs: Table[string, (seq[byte], seq[byte])] ## synthetic fns (thunks):
+                                               ## sym -> (params, results)
     tableSlot: Table[string, uint32]       ## proc symbol → funcref table slot (0 = null)
     tableEntries: seq[uint32]              ## slot i+1 → function index
     p: ProcCtx                             ## the proc being lowered
@@ -164,10 +168,11 @@ proc isVoidType(t: Cursor): bool =
 
 proc alignUp(x: uint32; a: uint32): uint32 = (x + a - 1) and not (a - 1)
 
-proc allocStatic(g: var WasmGen; size, align: int): uint32 =
+proc allocStatic(g: var WasmGen; size, align: int; tag = ""): uint32 =
   g.memTop = alignUp(g.memTop, uint32(max(align, 1)))
   result = g.memTop
   g.memTop += uint32(max(size, 1))
+  g.allocLog.add (result, uint32(max(size, 1)), tag)
 
 proc flexPayloadLen(g: var WasmGen; initv: Cursor): int =
   ## Extra bytes a constant initializer stores past its type's fixed size:
@@ -175,6 +180,24 @@ proc flexPayloadLen(g: var WasmGen; initv: Cursor): int =
   ## constructor). +1 for a string's NUL so C-string views stay valid.
   result = 0
   if initv.kind != TagLit or initv.exprKind notin {OconstrC, AconstrC}: return
+  if initv.exprKind == AconstrC:
+    # A TOP-LEVEL flexarray/method-table const (`(aconstr T elem…)`): the
+    # whole payload is elements — same element-type convention as the kv
+    # case below / serializeConstInto.
+    var ac = initv
+    ac.into:
+      let arrT = resolveType(g.prog, ac)
+      var esz: int
+      if arrT.kind == TagLit and arrT.typeKind in {PtrT, AptrT}:
+        esz = WasmPtrSize
+      else:
+        let elemT = innerType(g.prog, arrT)
+        (esz, _) = typeSizeAlign(g.prog, elemT)
+      skip ac
+      var n = 0
+      while ac.hasMore: (inc n; skip ac)
+      result += n * esz
+    return
   var t = initv
   t.into:
     skip t                                     # the constructed type
@@ -186,11 +209,23 @@ proc flexPayloadLen(g: var WasmGen; initv: Cursor): int =
           if kv.kind == StrLit:
             result += strVal(kv).len + 1
           elif kv.kind == TagLit and kv.exprKind == AconstrC:
-            # count elements × element size, resolved from the aconstr type
+            # count elements × element size. MUST match serializeConstInto's
+            # element-type convention: a real array/flexarray type gives the
+            # element via innerType; a bare pointer container (hexer's fixed
+            # method-table `(aconstr (ptr T) elem…)`, e.g. a closure/RootObj
+            # RTTI `mt`) means the elements ARE pointers. Diverging here
+            # undersizes the allocation and the emitted data segment silently
+            # overruns the next global (the canvas-browser gWindow heisenbug —
+            # now also caught by the finalize-time overrun invariant).
             var ac = kv
             ac.into:
-              let elemT = innerType(g.prog, resolveType(g.prog, ac))
-              let (esz, _) = typeSizeAlign(g.prog, elemT)
+              let arrT = resolveType(g.prog, ac)
+              var esz: int
+              if arrT.kind == TagLit and arrT.typeKind in {PtrT, AptrT}:
+                esz = WasmPtrSize
+              else:
+                let elemT = innerType(g.prog, arrT)
+                (esz, _) = typeSizeAlign(g.prog, elemT)
               skip ac
               var n = 0
               while ac.hasMore: (inc n; skip ac)
@@ -222,7 +257,7 @@ proc globalAddrOf(g: var WasmGen; name: string): uint32 =
   var (sz, al) = typeSizeAlign(g.prog, typ)
   if hasInit:
     sz += flexPayloadLen(g, initv)             # flexarray tail data (string consts)
-  result = allocStatic(g, sz, al)
+  result = allocStatic(g, sz, al, tag = name)
   g.globalAddr[name] = result
   if si.cat == scGlobal and not g.globals.hasKey(name):
     g.globals[name] = si.decl                  # cache foreign decls for typenav
@@ -231,7 +266,7 @@ proc globalAddrOf(g: var WasmGen; name: string): uint32 =
 
 proc strLitAddr(g: var WasmGen; s: string): uint32 =
   if g.rodataAddr.hasKey(s): return g.rodataAddr[s]
-  result = allocStatic(g, s.len + 1, 1)        # NUL-terminated, matching C backend strings
+  result = allocStatic(g, s.len + 1, 1, tag = "strlit")  # NUL-terminated, matching C backend strings
   g.rodataAddr[s] = result
   g.dataSegs.add (result, s & '\0')
 
@@ -365,6 +400,33 @@ proc tableSlotOf(g: var WasmGen; sym: string): uint32 =
   let fi = refProc(g, sym)
   result = uint32(g.tableEntries.len + 1)
   g.tableSlot[sym] = result
+  g.tableEntries.add fi
+
+proc closureThunkSlot(g: var WasmGen; sym: string;
+                      ps, rs: seq[byte]): uint32 =
+  ## An env-less proc cast to a CLOSURE proctype (hexer bridges capture-free
+  ## handlers this way — the proctype carries an explicit trailing `ep` env
+  ## param the proc itself lacks). C ABIs shrug the extra argument off; wasm
+  ## call_indirect is signature-strict and traps. The pair's fn slot
+  ## therefore points at a synthetic thunk with the closure signature that
+  ## drops the env and calls the real proc directly. `ps`/`rs` are the
+  ## TARGET PROC's wasm signature (env excluded).
+  let thunkSym = sym & ".cthunk.ithaqua.synth"
+  if g.tableSlot.hasKey(thunkSym): return g.tableSlot[thunkSym]
+  let targetFi = refProc(g, sym)
+  let fi = g.nextFunc
+  inc g.nextFunc
+  g.funcIdx[thunkSym] = fi
+  var tps = ps
+  tps.add ValI32                               # the ignored env pointer
+  g.synthSigs[thunkSym] = (tps, rs)
+  var b = ByteBuf()
+  for i in 0 ..< ps.len:
+    b.add OpLocalGet; b.addU32 uint32(i)
+  b.add OpCall; b.addU32 targetFi
+  g.funcBodies[fi] = (locals: @[], nparams: tps.len, code: b.data)
+  result = uint32(g.tableEntries.len + 1)
+  g.tableSlot[thunkSym] = result
   g.tableEntries.add fi
 
 # ── instruction emission helpers ─────────────────────────────────────────────
@@ -899,6 +961,59 @@ proc genConv(g: var WasmGen; c: Cursor) =
     let dstT = t
     let dst = scalOf(g, dstT)
     skip t
+    # closure-cast of an env-less proc symbol → thunk slot (see
+    # closureThunkSlot). Detected by arity: the target proctype carries one
+    # trailing env param the proc's own declaration lacks.
+    if t.kind == Symbol and
+       not g.p.locals.hasKey(symName(t)) and
+       not g.p.memLocals.hasKey(symName(t)):
+      let opSym = symName(t)
+      let opSi = lookupSym(typeCtx(g), opSym)
+      if opSi.cat == scProc and dstT.kind == Symbol:
+        # Arity of the target proctype, walked INSIDE the lookupType
+        # cursor's live scope (typeBody/resolveType hand out a cursor copy
+        # that does not survive for `into` — the typeSizeAlign pattern).
+        var dstArity = -1
+        var d = lookupType(g.prog, symName(dstT))
+        d.into:
+          inc d; skip d                        # name, type-pragmas
+          if d.kind == TagLit and d.typeKind == ProctypeT:
+            var b = d
+            b.into:
+              inc b                            # name slot (`.`)
+              if b.kind == TagLit and b.typeKind == ParamsT:
+                dstArity = 0
+                var pc = b
+                pc.into:
+                  while pc.hasMore: (inc dstArity; skip pc)
+              while b.hasMore: skip b
+          skip d
+          while d.hasMore: skip d
+        if dstArity >= 0:
+          # Fresh decl lookup (the localProcDecl/lookupForeignDecl pattern the
+          # finalize loop uses) — a cached si.decl cursor cannot be re-entered.
+          var pdecl: Cursor
+          var haveDecl = true
+          if isForeignSym(g.prog, opSym):
+            var found = false
+            pdecl = lookupForeignDecl(g.prog, opSym, found)
+            haveDecl = found
+          else:
+            pdecl = localProcDecl(g, opSym)
+          if not haveDecl:
+            discard
+          # NB: procSigTypes may have inserted a hidden sret param (aggregate
+          # result); the proctype's declared arity counts SOURCE params, so
+          # compare against the declared count = pps.len minus any sret slot.
+          let (pps, prs) = if haveDecl: procSigTypes(g, pdecl, isProctype = false)
+                           else: (newSeq[byte](), newSeq[byte]())
+          let declared = pps.len - (if prs.len == 0 and pps.len > dstArity: 1
+                                    else: 0)
+          if haveDecl and dstArity == declared + 1:
+            g.constI32 int32(closureThunkSlot(g, opSym, pps, prs))
+            skip t
+            while t.hasMore: skip t
+            return
     let src = exprScal(g, t)
     genExpr(g, t)
     while t.hasMore: skip t
@@ -2835,6 +2950,10 @@ proc generateWasm*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       discard g.wm.addFunction(funcTypeIdx(g,
         @[ValI32, ValI32, ValI32], @[ValI32]))
       continue
+    if g.synthSigs.hasKey(sym):                # synthetic thunks carry their sig
+      let (ps, rs) = g.synthSigs[sym]
+      discard g.wm.addFunction(funcTypeIdx(g, ps, rs))
+      continue
     var decl: Cursor
     if isForeignSym(g.prog, sym):
       var found = false
@@ -2861,6 +2980,23 @@ proc generateWasm*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   if getEnv("ITHAQUA_EXPORT_ALL").len > 0:
     for sym, fi in g.funcIdx:
       g.wm.addExportFunc("dbg$" & sym, fi)     # debug: drive any proc from the host
+
+  # Static-layout invariant: every data segment must lie inside the single
+  # allocation that owns its start — an overrun means a serialized
+  # initializer was larger than the reserved size, silently corrupting the
+  # next global (a layout-dependent heisenbug; found the hard way in the
+  # canvas-browser sprint). Fail loudly at emit time instead.
+  for (a, s) in g.dataSegs:
+    var owned = false
+    for (base, sz, tag) in g.allocLog:
+      if a >= base and a < base + sz:
+        if uint32(s.len) > base + sz - a:
+          raiseAssert "ithaqua: data segment @" & $a & " (" & $s.len &
+            " bytes) overruns allocation '" & tag & "' @" & $base & "+" & $sz
+        owned = true
+        break
+    if not owned:
+      raiseAssert "ithaqua: data segment @" & $a & " has no owning allocation"
 
   # string literals + explicit data
   for (a, s) in g.dataSegs:
