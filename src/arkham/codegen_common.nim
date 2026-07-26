@@ -656,6 +656,13 @@ proc callerSaveSetAt*(g: var CodeGen): seq[tuple[reg: Reg, name: string]] =
 proc callerSaveSlotName*(pos: int; reg: Reg): string {.inline.} =
   "csave." & $pos & "." & $ord(reg) & ".0"
 
+proc paramCallerSaveSlotName*(varName: string): string {.inline.} =
+  ## Permanent frame slot for a caller-save PARAMETER (declared once in the
+  ## prologue). Distinct from per-call `csave.*` scope slots used for locals —
+  ## those reclaimable arenas must not share the frame with addr-taken param
+  ## spills in a way that aliases under peak-ssize patching edge cases.
+  "pcsave." & varName
+
 # ── select-diamond recognition (shared by a64 `csel` & x64 `cmov`) ────────────
 
 type
@@ -673,9 +680,16 @@ proc simpleSelectValue(g: var CodeGen; rhs: Cursor): bool =
   ## A side-effect-free scalar RHS that materialises with plain `mov`/`ldr`/`lea`
   ## only — never touching the condition flags, so it may sit between the compare and
   ## the `csel`/`cmov`: an integer immediate, or a register-/stack-homed local.
-  case rhs.kind
+  ## Peels `(suf …)` / `(par …)` / identity `(cast …)` / `(conv …)` wrappers that
+  ## xelim / typed lowering leave around literals and symbols (e.g. `max(16, alignment)`
+  ## after hexer), matching the peels used elsewhere in this module.
+  var v = rhs
+  while v.kind == TagLit and v.exprKind in {SufC, ParC, CastC, ConvC}:
+    if v.exprKind in {CastC, ConvC}: (inc v; skip v)   # past tag + target type
+    else: inc v                                        # descend to the wrapped value
+  case v.kind
   of IntLit, UIntLit, CharLit: true
-  of Symbol: g.ra.locationOfSym(symName(rhs)).kind in {InReg, NamedStack}
+  of Symbol: g.ra.locationOfSym(symName(v)).kind in {InReg, NamedStack}
   else: false
 
 proc selectAsgnDstRhs(asgn: Cursor; dstName: var string; rhs: var Cursor): bool =
@@ -690,16 +704,19 @@ proc selectAsgnDstRhs(asgn: Cursor; dstName: var string; rhs: var Cursor): bool 
 
 proc singleAsgnOf(stmt: Cursor; asgn: var Cursor): bool =
   ## The lone `(asgn …)` a select-diamond arm carries: the statement itself, or the
-  ## single child of its `(stmts …)` wrapper. False for anything else (zero/multiple
-  ## statements, a non-assignment) — those keep the branch lowering.
-  if stmt.stmtKind == AsgnS:
-    asgn = stmt; return true
-  if stmt.stmtKind == StmtsS:
-    var s = sub(stmt)
-    if not s.hasMore or s.stmtKind != AsgnS: return false
-    asgn = s; skip s
-    if s.hasMore: return false          # more than one statement in the arm
-    return true
+  ## single child of nested `(stmts …)` wrappers. Hexer/xelim often wrap an arm as
+  ## `(stmts (stmts (stmts (asgn …))))`; peel until one assignment remains. False for
+  ## anything else (zero/multiple statements, a non-assignment) — those keep the
+  ## branch lowering.
+  var s = stmt
+  while s.stmtKind == StmtsS:
+    var inner = sub(s)
+    if not inner.hasMore: return false
+    let first = inner; skip inner
+    if inner.hasMore: return false          # more than one statement in the arm
+    s = first
+  if s.stmtKind == AsgnS:
+    asgn = s; return true
   return false
 
 proc matchSelectDiamond*(g: var CodeGen; c: Cursor; sd: var SelectDiamond): bool =

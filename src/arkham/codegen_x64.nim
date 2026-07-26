@@ -1631,6 +1631,8 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
         # passed pointer (idx past the regs) is loaded by `emitStackParamLoadsX64`.
         g.varType[nm] = tn
         g.movReg(loc.r, g.md.intArgRegs[idx])
+        if g.ra.callerSaveHomes.hasKey(nm):
+          g.emRegLocalVar(nm, loc.r, typeCur)   # named home for `(scope …)` save/restore
         inc idx
       elif tn.len > 0:
         # Stack-passed aggregate (by-value that didn't fit, or a by-ref pointer past
@@ -1667,16 +1669,20 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
           # the binding persists for the whole body — the existing leaf behavior.
           g.argResidentParams.add (argReg, g.regLocal[argReg])
         elif loc.kind == InReg:
-          # Relocated to a callee-saved home. In the declarative path the signature
-          # binds argReg to `pN.0`, so the relocation move must *read* it by name (a raw
-          # `(reg)` use of a bound register is rejected); the binding is then killed so
-          # the now-dead arg register is free. The empty-signature path has no binding,
-          # so it moves the raw register.
+          # Relocated to a callee-saved or caller-save volatile home. In the declarative
+          # path the signature binds argReg to `pN.0`, so the relocation move must
+          # *read* it by name (a raw `(reg)` use of a bound register is rejected); the
+          # binding is then killed so the now-dead arg register is free. The empty-
+          # signature path has no binding, so it moves the raw register. A caller-save
+          # home is then bound by the param's own name so `emitCall2`'s `(scope …)`
+          # save/restore can refer to it (callee-saved homes stay raw for epilogue pops).
           if declarative:
             g.ab.tree MovX64: (g.emReg loc.r; g.ab.sym paramName(ord))
             g.ab.tree KillX64: g.ab.sym paramName(ord)
           else:
             g.movReg(loc.r, argReg)
+          if g.ra.callerSaveHomes.hasKey(nm):
+            g.emRegLocalVar(nm, loc.r, typeCur)
         elif loc.kind == NamedStack and loc.typ.kind != AFloat:
           # an address-taken / spilled scalar param: declare its `(s)` slot and spill the
           # incoming argument register into it so `addr`/loads/stores work. Type the slot
@@ -2654,32 +2660,49 @@ proc emCallerSaveDecl(g: var CodeGen; slotName, varName: string) =
     g.emStackMem(slotName)
     g.ab.sym varName
 
+proc callerSaveSlotFor(g: CodeGen; pos: int; reg: Reg; name: string): string =
+  if name in g.ra.callerSaveParams: paramCallerSaveSlotName(name)
+  else: callerSaveSlotName(pos, reg)
+
 proc emitCall2(g: var CodeGen; c: Cursor) =
-  ## Caller-save wrapper: a cross-call local homed in a caller-saved volatile (R8/R9)
-  ## is spilled around this call inside a `(scope …)` — save before the ABI marshalling
-  ## clobbers the register, restore after. The var's `(var :name (rN) T)` binding
-  ## PERSISTS across the scope (never killed/rebound): the save is a plain copy, the
-  ## marshalling writes the arg register via `(arg pN)` (which nifasm allows even on a
-  ## bound register — only a bare `(rN)` dest is rejected), and the restore reloads via
-  ## the name (the mov re-defines the register, clearing the call's clobber). No
-  ## caller-save vars ⇒ zero overhead, byte-identical to before.
+  ## Caller-save wrapper: a cross-call local/param homed in a caller-saved volatile
+  ## (R8/R9) is spilled around this call — save before ABI marshalling clobbers the
+  ## register, restore after. Locals use a reclaimable `(scope …)` slot; params use a
+  ## permanent prologue slot. No caller-save vars ⇒ zero overhead.
   let saveSet = g.callerSaveSetAt()
   if saveSet.len == 0:
     g.emitCall2Inner(c)
     return
   let pos = cursorToPosition(g.buf[], c)
-  g.ab.tree ScopeX64:
-    for it in saveSet:
-      g.emCallerSaveDecl(callerSaveSlotName(pos, it.reg), it.name)
+  var localSaves: seq[tuple[reg: Reg, name: string]] = @[]
+  var paramSaves: seq[tuple[reg: Reg, name: string]] = @[]
+  for it in saveSet:
+    if it.name in g.ra.callerSaveParams: paramSaves.add it
+    else: localSaves.add it
+  template saveOne(it: tuple[reg: Reg, name: string]; doDecl: bool) =
+    let slot = g.callerSaveSlotFor(pos, it.reg, it.name)
+    if doDecl: g.emCallerSaveDecl(slot, it.name)
+    else:
+      g.ab.tree MovX64: (g.emStackMem(slot); g.ab.sym it.name)
+  template restoreOne(it: tuple[reg: Reg, name: string]; resLoc: Location) =
+    if resLoc.kind == InReg and resLoc.r == it.reg: discard
+    else:
+      g.ab.tree MovX64:
+        g.ab.sym it.name
+        g.emStackMem(g.callerSaveSlotFor(pos, it.reg, it.name))
+  if localSaves.len == 0:
+    for it in paramSaves: saveOne(it, doDecl = false)
     g.emitCall2Inner(c)
     let resLoc = g.ra.locs[pos]
-    for it in saveSet:
-      # `x = f(…, x, …)`: the result already landed in x's home register — reloading the
-      # pre-call value would clobber it. Everything else reloads.
-      if resLoc.kind == InReg and resLoc.r == it.reg: continue
-      g.ab.tree MovX64:                          # (mov name (mem (rsp) slot)) — restore
-        g.ab.sym it.name
-        g.emStackMem(callerSaveSlotName(pos, it.reg))
+    for it in paramSaves: restoreOne(it, resLoc)
+  else:
+    g.ab.tree ScopeX64:
+      for it in paramSaves: saveOne(it, doDecl = false)
+      for it in localSaves: saveOne(it, doDecl = true)
+      g.emitCall2Inner(c)
+      let resLoc = g.ra.locs[pos]
+      for it in localSaves: restoreOne(it, resLoc)
+      for it in paramSaves: restoreOne(it, resLoc)
 
 proc emitDivMod2(g: var CodeGen; c: Cursor) =
   ## Emit x86 `idiv`/`div`: the allocator pinned the dividend to rax and the divisor
@@ -5077,6 +5100,11 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo) =
           g.movReg(g.indirectReg, g.md.intArgRegs[0])
       g.emitParamMoves(info.decl)
       g.emitStackParamLoadsX64(info.decl)               # via stackArgBaseReg, regs now free
+      for name in g.ra.callerSaveParams:
+        if g.symType.hasKey(name) and isPtrType(resolveType(g.prog, g.symType[name])):
+          g.emTypedStackVar(paramCallerSaveSlotName(name), g.symType[name])
+        else:
+          g.emScalarStackVar(paramCallerSaveSlotName(name))
       if info.isEntry and g.hasGlobalInits:              # run runtime global inits at startup
         g.ab.tree PrepareX64:
           g.ab.sym g.globalInitSym
@@ -5221,7 +5249,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     g.ra.usedCallee.incl RBX                   # saved/restored like any callee reg
   # The entry injects a `call` to the synthetic global-init proc, so it makes a call
   # even when its own body does not — keep rsp 16-aligned for that call.
-  g.computeFrameX64(info.isEntry, an.hasCall or (info.isEntry and g.hasGlobalInits),
+  g.computeFrameX64(info.isEntry, an.hasRealCall or (info.isEntry and g.hasGlobalInits),
                     g.ra.hasStackParams)   # allocator's decision (it reserved the base reg)
   # Pure-emit path: the allocator already assigned every value position; emit once.
   g.ab.planning = false

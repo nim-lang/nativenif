@@ -107,11 +107,16 @@ proc movCompatible(want, got: Type): bool =
   # the unwrapped element type on either side. (Previously the register operand was
   # always a raw register — lenient `RegisterT`, compatible with any slot — but a
   # `rebind`-bound scratch carries its concrete type, e.g. `(i 64)`.)
+  # Re-run `addrWidthMove` after the unwrap too: a caller-save spill of a pointer
+  # (`(mov (s)(ptr T) slot, i64-bound-name)` / the restore) is an address-width move
+  # through a `StackOffT` wrapper, and the pre-unwrap check sees `StackOffT` which
+  # is neither PtrLike nor AddrLike.
   var w = want
   var g = got
   if w.kind == StackOffT: w = w.offType
   if g.kind == StackOffT: g = g.offType
   if compatible(w, g): return true
+  if addrWidthMove(w, g): return true
   if w.kind in {IntT, UIntT} and g.kind in {IntT, UIntT, IntLitT}:
     return g.bits <= w.bits
   result = false

@@ -69,7 +69,10 @@ type
 
   ProcAnalysis* = object
     vars*: Table[string, VarInfo]
-    hasCall*: bool
+    hasCall*: bool              ## real call OR inlined atomic — params cannot stay in
+                                ## clobbered arg regs; AllRegs / ArgResident consult this
+    hasRealCall*: bool          ## a true `bl`/`blr` call exists (not just an inlined
+                                ## atomic). Drives the fp/lr frame: atomics need no lr.
     callPositions*: seq[int]    ## token positions of every real call — the allocator's
                                 ## caller-save cost model counts how many a var crosses
     clobbersDivReg*: bool       ## body contains a div/mod → rdx is clobbered, so a
@@ -593,7 +596,8 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
     skip n                              # pragmas
     scopeFrame(c):                      # the proc-body scope frame (its `stmts`
       iterStmts(c, n): analyse(c, n)    # shares it rather than pushing its own)
-  c.res.hasCall = c.callPositions.len > 0 or c.atomicPositions.len > 0
+  c.res.hasRealCall = c.callPositions.len > 0
+  c.res.hasCall = c.res.hasRealCall or c.atomicPositions.len > 0
   c.res.callPositions = c.callPositions
   # Grant `AllRegs` (volatile/caller-saved eligible) to every local whose live
   # interval contains no call point. The interval is `(liveStart, freeAfter]`
