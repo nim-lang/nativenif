@@ -583,13 +583,10 @@ reach by different instructions.
 
 ### Deliberate v1 gaps
 
-- **Only the `d = ins(x)` spelling.** A row with an `inout` operand is rejected
-  *at the declaration* with a message saying so, rather than half-lowered. In
-  Leng a `var` parameter is a pointer and the call site passes `(addr d)`, so
-  the `ins(var d, x)` form needs arkham to recognise `(addr <local>)` in an
-  operand slot and bind the local's home directly — otherwise the local is
-  marked `AddrTaken` and forced to the stack, losing the entire point. That is
-  a self-contained piece of work, not a design gap.
+- ~~**Only the `d = ins(x)` spelling.**~~ **Done** — see *Two-address rows*
+  below. The gap this entry described (Leng spelling a `var` argument the same
+  as a user's `addr`, so binding the local's home meant a special case in the
+  operand slot) was closed by making `(haddr X)` a Leng expression instead.
 - **Two-address forms use `tie`, not `inout`.** x86's `bswap`/`rol`/`ror` are
   written `d = bswap(x)`; the row records `tie = 0` and the emitter seeds the
   destination. `tie` is a property of a *pinned* row; a portable row's lowering
@@ -670,6 +667,66 @@ Not yet: flag WRITERS (`stc`/`clc`/`cmc` — nifasm has no tags for them), `elif
 flag as a `while` condition (§8 keeps loops at `while true` + `break`, and
 `if zf(): break` covers it).
 
+### Two-address rows (§4.1's `inout` spelling)
+
+Twelve rows with `roles[0] == roInout` and no result: `add`, `sub`, `bitand`,
+`bitor`, `bitxor`, `shiftl`, `shiftr`, `sar`, `neg`, `bitnot`, `inc`, `dec`.
+Declared, per §4.1's table, as
+
+```nim
+proc addx(d: var uint64; s: uint64) {.instruction: add.}
+```
+
+and checked in both directions at the declaration: an `inout` operand must be
+`var`, and an `in` operand must not be.
+
+`roInout` is not `tie`, and both are still needed. `tie` says the RESULT aliases
+a source (`d = bswap(x)` — a value-producing form where the allocator inserts a
+copy). `roInout` says there is no result at all: the output goes back through
+operand 0.
+
+**What made this land cleanly was a change to Leng, not to the operand model.**
+Nimony already distinguished `(addr x)` — the user turning a location into a
+value — from `(haddr x)`, the compiler binding a location for a `var` parameter.
+Leng collapsed the two. That collapse is what would have forced an "an `addr`
+inside an instr operand slot means something else" rule, and it would have been
+the allocator's problem: a real `(addr x)` marks x `AddrTaken` and forces it to
+the stack, which is precisely the cost this design exists to avoid. Keeping
+`(haddr X)` as a Leng expression removes the special case — the tag says which
+it is, and every rule reads off it:
+
+```
+(instr addx.0. (haddr r.0) x.0)     →   (add r.0 x.0)
+```
+
+That distinction is worth stating positively, because it now carries weight in
+places far from intrinsics: **every escape and address-taken analysis must match
+both tags**, and both Leng decoders export an `AddrKinds` set so that matching
+just one stands out as the bug it usually is.
+
+Because the destination is only a *name* for a location the allocator already
+chose, these rows need no `.assembler`. Both cells of §0's matrix work:
+
+```nim
+proc mix(a, b: uint64): uint64 =     # an ORDINARY proc
+  var t = a
+  addx(t, b)
+  shl1(t, 2'u64)
+  ...
+```
+
+emits `(add t.0 p1.0)` / `(shl t.0 2)` with `t` in a register — the analyser's
+matching `haddr` rule is what keeps it out of memory.
+
+Two v1 limits: a shift count must be a literal (a variable count needs `cl`,
+the same `pin` gap `rol`/`ror` have), and there are no `adc`/`sbb` rows because
+nifasm has no tags for them — which is the one thing standing between the flag
+columns and a multi-word add.
+
+The C backend refuses these by name: the portable spelling of `add(d, s)` is not
+another intrinsic, it is `d = d + s`, and the message says so rather than
+pointing at `{.intrinsic.}`.
+
 ### `.assembler` mode (phase 6)
 
 The pragmas are `{.assembler.}` on the routine and `{.register: "…".}` /
@@ -726,8 +783,5 @@ Not yet, and each is a real gap rather than a rejection-by-design:
   only worth having once loads and stores through it work too, so the two go in
   together. (A pointer *parameter* already works: it keeps its `(ptr T)` in the
   binding, so nifasm type-checks it.)
-- **No `inout` rows**, so the body cannot yet do arithmetic — the same gap as
-  use case (a) above, and the reason §8's `memzero` example does not compile
-  yet. `.assembler` is where it is *easiest* to close: `(addr <local>)` in an
-  operand slot binds straight to the declared home, because there is no
-  allocator to confuse with `AddrTaken`.
+- **Calls and globals**, as listed above; those are what §8's `memzero` example
+  still needs. The arithmetic it also needs now works — see *Two-address rows*.

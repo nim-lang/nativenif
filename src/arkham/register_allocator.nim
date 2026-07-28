@@ -1448,6 +1448,26 @@ proc allocInstr(b: var Builder; n: var Cursor; dest: var Location) =
   ## `imm8`), so no second register can be clobbered by that copy.
   let pos = b.posOf(n)
   let row = IntrinsicRows[instrOpOf(b, n)]
+  let inoutAt = row.inoutOperand
+  if inoutAt >= 0:
+    # A two-address row writes THROUGH an operand and produces no value, so there
+    # is no result to home. Operand `inoutAt` arrives as `(haddr d)`: the callee
+    # wants d's LOCATION, so the operand simply IS d's home — whatever the
+    # allocator already chose for it. Nothing is allocated, nothing is copied, and
+    # (thanks to the analyser's matching `haddr` rule) d is not forced to memory.
+    var i = 0
+    n.into:
+      skip n                                 # the callee symbol
+      while n.hasMore:
+        if i == inoutAt:
+          skip n                             # the destination: already homed
+        else:
+          var d = regOrImm(ScalarSlot)       # a source: a literal may stay one
+          allocValue(b, n, d)
+          b.releaseTmp(d)
+        inc i
+    b.ra.locs[pos] = Location(kind: Undef)   # no value: nothing consumes this node
+    return
   # The result lands in a register: the caller's home when it passed one, else a
   # fresh temp. Do this FIRST and seal it, mirroring the addressing-expression
   # path, so an operand temp cannot be allocated onto the destination register.
@@ -1580,7 +1600,7 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
       releaseLvalTemps(b, lvCopy)             # index/pointer temps die with the load
       b.ra.locs[pos] = resDest                #   reuses resDest (free until the load lands)
       return
-    of AddrC:
+    of AddrC, HaddrC:
       # `(addr lvalue)` → a pointer in a register. Place any embedded base/index
       # values of the lvalue; the result address lands in dest (typed precisely).
       #

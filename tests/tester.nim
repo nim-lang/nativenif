@@ -70,6 +70,8 @@ const arkhamRejections: seq[(string, string)] = @[
   ("err_nonflag_cond", "condition must be a flag intrinsic"),
   ("err_unannotated_local", "declares every location"),
   ("err_wrong_param_reg", "is passed in rdi by the C ABI, but is pinned to rsi"),
+  ("err_inout_value", "writes through its first operand and returns nothing"),
+  ("err_inout_dest", "must be a `var` argument naming a local"),
 ]
 
 proc arkhamRejectionTests(arkham: string) =

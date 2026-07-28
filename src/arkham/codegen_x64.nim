@@ -2296,6 +2296,68 @@ proc emitIntrinsicOps(g: var CodeGen; op: IntrinsicOp; argBits: int;
   else:
     raiseAssert "arkham x64n: no lowering for intrinsic `" & IntrinsicNames[op] & "`"
 
+proc x64InoutTag(op: IntrinsicOp): X64Inst =
+  ## The nifasm tag a two-address row emits. Six of these rows are spelled
+  ## differently in source than in the assembler (`bitand` → `(and)`, …) purely
+  ## because Nim's keywords got there first; this is where the two vocabularies
+  ## are reconciled, exactly as `x64FlagOf` reconciles `ovf` → `(of)`.
+  case op
+  of AddOp: AddX64
+  of SubOp: SubX64
+  of BitandOp: AndX64
+  of BitorOp: OrX64
+  of BitxorOp: XorX64
+  of ShiftlOp: ShlX64
+  of ShiftrOp: ShrX64
+  of SarOp: SarX64
+  of NegOp: NegX64
+  of BitnotOp: NotX64
+  of IncOp: IncX64
+  of DecOp: DecX64
+  else: NopX64
+
+proc emitInoutInstr2(g: var CodeGen; c: Cursor; op: IntrinsicOp;
+                     argCurs: seq[Cursor]) =
+  ## `add(d, s)` in an ordinary proc: `(add <d's home> <s>)`. The destination is
+  ## `(haddr d)`, and d's home is whatever the allocator gave it — a register, or
+  ## an `(s)` slot, both of which x86 accepts as a destination directly.
+  let row = IntrinsicRows[op]
+  let tag = x64InoutTag(op)
+  if tag == NopX64:
+    lengError c, "`" & IntrinsicNames[op] & "` has no x86-64 two-address form",
+              lengInfo(c)
+  proc emitDest(g: var CodeGen; d: Cursor) =
+    var inner = d
+    var sym = d
+    if d.kind == TagLit and d.exprKind == HaddrC:
+      inner.into:
+        sym = inner; skip inner
+        while inner.hasMore: skip inner
+    if sym.kind != Symbol:
+      lengError d, "the destination of `" & IntrinsicNames[op] & "` must be a " &
+                "`var` argument naming a local", lengInfo(d)
+    let loc = g.ra.locationOfSym(symName(sym))
+    case loc.kind
+    of InReg: g.emReg loc.r
+    of NamedStack: g.emStackMem(loc.name)
+    else:
+      lengError d, "the destination of `" & IntrinsicNames[op] & "` has no " &
+                "register or stack home", lengInfo(d)
+  if row.arity == 1:
+    g.ab.tree tag: g.emitDest(argCurs[0])
+  else:
+    g.emitValue2(argCurs[1])                     # settle the source first
+    let src = g.ra.locs[cursorToPosition(g.buf[], argCurs[1])]
+    g.ab.tree tag:
+      g.emitDest(argCurs[0])
+      case src.kind
+      of InReg: g.emReg src.r
+      of Imm: g.ab.intLit src.ival
+      of NamedStack: g.emStackMem(src.name)
+      else:
+        lengError argCurs[1], "unsupported source operand for `" &
+                  IntrinsicNames[op] & "`", lengInfo(c)
+
 proc emitInstr2(g: var CodeGen; c: Cursor) =
   ## `(instr SYM X*)` — the intrinsic's own instruction(s). The allocator already
   ## placed each operand in a register (or left a literal immediate) and the
@@ -2328,6 +2390,12 @@ proc emitInstr2(g: var CodeGen; c: Cursor) =
               "are only legal inside an `{.assembler.}` proc, where no " &
               "instruction may be inserted between one and its use",
               lengInfo(c)
+  if row.inoutOperand >= 0:
+    # A two-address row in an ORDINARY proc — no `.assembler` needed, because the
+    # destination is a location the allocator already chose and the operand only
+    # names it. `(haddr d)` is what makes that readable off the node.
+    g.emitInoutInstr2(c, tgt.op, argCurs)
+    return
   for a in argCurs: g.emitValue2(a)
   if res.kind != InReg:
     raiseAssert "arkham x64n: intrinsic result is not in a register"
@@ -3025,7 +3093,7 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
     of DivC, ModC: g.emitDivMod2(c)
     of EqC, NeqC, LtC, LeC, AndC, OrC, NotC: g.emitCondValue2(c)
     of DerefC, DotC, AtC, PatC: g.emitMemLoad2(c)
-    of AddrC: g.emitAddr2(c)
+    of AddrC, HaddrC: g.emitAddr2(c)
     of CastC, ConvC: g.emitCast2(c)
     of CallC: g.emitCall2(c)
     of InstrC: g.emitInstr2(c)
@@ -5455,6 +5523,56 @@ proc asmOperand(g: var CodeGen; cur: Cursor) =
   else:
     lengError c, "an `.assembler` operand must be a variable or a literal", g.asmInfo
 
+proc asmInoutDest(g: var CodeGen; c: Cursor) =
+  ## Emit the destination of a two-address row. The operand arrives as
+  ## `(haddr d)` — the compiler binding d's LOCATION for a `var` parameter, not
+  ## the user taking a pointer (see nimony/doc/tags.md). So it resolves to d's
+  ## DECLARED home and nothing is materialised: that tag is the whole reason this
+  ## needs no "an `addr` here means something else" rule.
+  if c.kind != TagLit or c.exprKind != HaddrC:
+    lengError c, "the destination of a two-address instruction must be a `var` " &
+              "argument naming a local", g.asmInfo
+  var inner = c
+  var sym = c
+  inner.into:
+    sym = inner; skip inner
+    while inner.hasMore: skip inner
+  if sym.kind != Symbol:
+    lengError sym, "the destination of a two-address instruction must be a local " &
+              "with a declared location", g.asmInfo
+  let nm = symName(sym)
+  if nm in g.asmStack: g.emStackMem(nm)
+  else: g.emReg g.asmRegOf(sym)
+
+proc asmInoutInstr(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
+  ## `add(d, s)` / `neg(d)` — a row that writes THROUGH operand 0 and returns
+  ## nothing. Statement-only, since there is no value to bind.
+  var argCurs: seq[Cursor] = @[]
+  var fc = c
+  fc.into:
+    skip fc                                      # the callee symbol
+    while fc.hasMore: (argCurs.add asmAtom(fc); skip fc)
+  let row = IntrinsicRows[op]
+  if argCurs.len != row.arity:
+    lengError c, "`" & IntrinsicNames[op] & "` takes " & $row.arity & " operand(s)",
+              g.asmInfo
+  let tag = x64InoutTag(op)
+  if tag == NopX64:
+    lengError c, "`" & IntrinsicNames[op] & "` has no x86-64 two-address form",
+              g.asmInfo
+  if row.arity == 1:
+    g.ab.tree tag: g.asmInoutDest(argCurs[0])
+  else:
+    if g.isAsmStackSym(argCurs[1]) and
+       argCurs[0].kind == TagLit and argCurs[0].exprKind == HaddrC:
+      # `(add [mem], [mem])` does not exist. Only flagged when BOTH are memory;
+      # a memory destination with a register or immediate source is fine.
+      var d = argCurs[0]; inc d
+      if d.kind == Symbol and symName(d) in g.asmStack:
+        lengError c, "`" & IntrinsicNames[op] & "` cannot take two memory operands",
+                  g.asmInfo
+    g.ab.tree tag: (g.asmInoutDest(argCurs[0]); g.asmOperand(argCurs[1]))
+
 proc asmFlagInstr(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
   ## `cmp(a, b)` / `test(a, b)` — an instruction whose entire output is flags.
   ## It is a statement, never a value: there is nothing to bind.
@@ -5545,6 +5663,9 @@ proc asmInstr(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor) =
   if row.isFlagWrite:
     lengError c, "`" & IntrinsicNames[tgt.op] & "` produces no value, only flags; " &
               "use it as a statement", g.asmInfo
+  if row.inoutOperand >= 0:
+    lengError c, "`" & IntrinsicNames[tgt.op] & "` writes through its first " &
+              "operand and returns nothing; use it as a statement", g.asmInfo
   if argCurs.len == 0:
     lengError c, "`" & IntrinsicNames[tgt.op] & "` takes no operands here", g.asmInfo
   var rotCount = 0'i64
@@ -5661,10 +5782,13 @@ proc asmStmt(g: var CodeGen; c: Cursor) =
   of VarS: g.asmVarDecl(c)
   of AsgnS: g.asmAsgn(c)
   of InstrS:
-    # An instruction in statement position produces no value, so the only rows
-    # that belong here are the ones whose output IS the flags.
+    # An instruction in statement position produces no value, so the rows that
+    # belong here are the two that have no result: one that writes through an
+    # `inout` operand, and one whose whole output is the flags.
     let op = g.instrOpAt(c)
-    if op != NoIntrinsicOp and IntrinsicRows[op].isFlagWrite:
+    if op != NoIntrinsicOp and IntrinsicRows[op].inoutOperand >= 0:
+      g.asmInoutInstr(c, op)
+    elif op != NoIntrinsicOp and IntrinsicRows[op].isFlagWrite:
       g.asmFlagInstr(c, op)
     else:
       lengError c, "an instruction used as a statement must have a destination",

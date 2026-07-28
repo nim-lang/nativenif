@@ -549,7 +549,7 @@ proc constAddrSym*(c: Cursor): string =
   # canonical case (a string literal's `more` field points at the data const). The
   # symbol's address is a link-time constant, so it bakes as a reloc exactly like a
   # bare symbol. Peel the `(addr …)` then any further conv/cast/par wrappers.
-  if v.kind == TagLit and v.exprKind == AddrC:
+  if v.kind == TagLit and v.exprKind in AddrKinds:
     inc v                                              # past the (addr tag
     while v.kind == TagLit and v.exprKind in {SufC, ParC, CastC, ConvC}:
       if v.exprKind in {CastC, ConvC}: (inc v; skip v)

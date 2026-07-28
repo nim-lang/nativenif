@@ -154,7 +154,7 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
     of TrueC, FalseC,                         # bool literals & bool-valued operators
        EqC, NeqC, LtC, LeC, AndC, OrC, NotC, OvfC:   # `(not operand)` carries NO type child
       result = tc.prog[].boolType
-    of AddrC:                                 # &lvalue → (ptr <type-of-lvalue>)
+    of AddrC, HaddrC:                         # &lvalue → (ptr <type-of-lvalue>)
       var t = c; inc t
       result = tc.prog[].ptrTypeOf(tc.getType(t))
     of SufC, ParC:                            # wrappers → the inner value's type
@@ -186,7 +186,7 @@ proc exprSlot*(tc: TypeCtx; c: Cursor): AsmSlot =
   of Symbol: slotOf(tc.prog[], tc.getType(c))
   of TagLit:
     case c.exprKind
-    of AddrC: slotOf(tc.prog[], tc.getType(c))                       # &lvalue → precise (ptr <elem>)
+    of AddrC, HaddrC: slotOf(tc.prog[], tc.getType(c))               # &lvalue → precise (ptr <elem>)
     of NilC: AsmSlot(cls: AUInt, size: 8, align: 8, typ: tc.prog[].nilLit)  # nil → the `(nil)` type
     of TrueC, FalseC: AsmSlot(cls: AUInt, size: 1, align: 1)        # a bool
     of SizeofC, AlignofC: AsmSlot(cls: AInt, size: 8, align: 8)     # an integer constant

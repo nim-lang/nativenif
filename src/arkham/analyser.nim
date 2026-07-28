@@ -181,6 +181,26 @@ proc analyseChildren(c: var Context; n: var Cursor) =
   n.into:
     while n.hasMore: analyse(c, n)
 
+proc analyseInstr(c: var Context; n: var Cursor) =
+  ## `(instr SYM …)`, in either value or statement position. A `(haddr d)`
+  ## operand is a two-address row's DESTINATION: the front end spelled it `var d`,
+  ## and `haddr` says the callee wants d's LOCATION, not a pointer value. A
+  ## register IS a location, so — unlike a real `(addr d)` — this must not mark d
+  ## address-taken and force it onto the stack. Keeping the two tags apart in Leng
+  ## is what makes that distinction available here at all.
+  ##
+  ## Purely syntactic, so no access to the row table is needed: `haddr` is only
+  ## ever inserted for a `var`/`out` parameter, and on an intrinsic a `var`
+  ## parameter IS the inout operand (`doc/intrinsics.md` §4.1).
+  n.into:
+    skip n                              # the callee symbol
+    while n.hasMore:
+      if n.kind == TagLit and n.exprKind == HaddrC:
+        n.into:
+          while n.hasMore: analyse(c, n)   # a read+write of the local, not an escape
+      else:
+        analyse(c, n)
+
 proc analyseVarDecl(c: var Context; n: var Cursor) =
   ## `(var :name pragmas type value)` (also gvar/tvar/const).
   let declPos = posOf(c, n)
@@ -319,6 +339,7 @@ proc analyse(c: var Context; n: var Cursor) =
     inc n
   of TagLit:
     case n.stmtKind
+    of InstrS: analyseInstr(c, n)       # a two-address row: a statement, not a value
     of NoStmt:
       case n.exprKind
       of AtC, PatC:
@@ -335,7 +356,7 @@ proc analyse(c: var Context; n: var Cursor) =
           c.inAddr = 0; c.inAsgnTarget = 0; c.inArrayIndex = 0
           analyse(c, n)                 # the index
           c.inAddr = oldA; c.inAsgnTarget = oldT; c.inArrayIndex = oldX
-      of AddrC:
+      of AddrC, HaddrC:
         n.into:
           inc c.inAddr
           while n.hasMore: analyse(c, n)
@@ -364,6 +385,7 @@ proc analyse(c: var Context; n: var Cursor) =
         case n.substructureKind
         of ElifU, ElseU, OfU, KvU: analyseChildren(c, n)
         else: skip n
+      of InstrC: analyseInstr(c, n)
       of DivC, ModC:
         c.res.clobbersDivReg = true     # idiv/div clobbers rdx
         c.divPositions.add posOf(c, n)  # ... at THIS point: denies rdx-as-home across it

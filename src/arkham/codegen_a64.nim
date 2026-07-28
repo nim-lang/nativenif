@@ -2953,7 +2953,7 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
     # global / foldable lvalue): nothing to materialize — the consumer reads it.
     if c.kind == TagLit and c.exprKind in {AddC, SubC, MulC, DivC, ModC, ShlC, ShrC,
         BitandC, BitorC, BitxorC, NegC, BitnotC, NotC, EqC, NeqC, LtC, LeC, AndC, OrC,
-        DerefC, DotC, AtC, PatC, AddrC, CastC, ConvC, CallC}:
+        DerefC, DotC, AtC, PatC, AddrC, HaddrC, CastC, ConvC, CallC}:
       # A computed node whose result was spilled to a non-temp NamedStack/Mem slot
       # (dest-passed into a real local's home). (The isTemp spill case is handled by
       # the `dst.isTemp` produce-into block above, for every node kind.)
@@ -3015,7 +3015,7 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
     of ModC: g.emitMod2(c)
     of EqC, NeqC, LtC, LeC, AndC, OrC, NotC: g.emitCondValue2(c)
     of DerefC, DotC, AtC, PatC: g.emitMemLoad2(c)
-    of AddrC: g.emitAddr2(c)
+    of AddrC, HaddrC: g.emitAddr2(c)
     of CastC, ConvC: g.emitCast2(c)
     of CallC:
       g.emitCall2(c)
