@@ -481,6 +481,10 @@ type
     RegsTagId
     BswapTagId
     ScopeTagId
+    PopcntTagId
+    ClzTagId
+    RbitTagId
+    RevTagId
 const
   TagData*: array[TagEnum, (string, int)] = [
     ("InvalidTagId", 0),
@@ -961,5 +965,9 @@ const
     ("withreg", 475),
     ("regs", 476),
     ("bswap", 477),
-    ("scope", 478)
+    ("scope", 478),
+    ("popcnt", 479),
+    ("clz", 480),
+    ("rbit", 481),
+    ("rev", 482)
   ]

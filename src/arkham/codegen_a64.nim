@@ -1059,10 +1059,15 @@ proc emitStackParamLoads(g: var CodeGen; decl: Cursor) =
 
 proc emitParamMoves(g: var CodeGen; decl: Cursor) =
   ## Move each parameter from its incoming ABI register to the home the
-  ## allocator chose (a callee-saved register for cross-call params; arg regs
-  ## stay put for leaf procs). Emitted after the prologue saved the homes.
+  ## allocator chose (callee-saved or caller-save volatile for cross-call params;
+  ## arg regs stay put for leaf procs). Emitted after the prologue saved the homes.
   ## Stack-passed params (9th integer arg onward) are loaded separately by
   ## `emitStackParamLoads` and skipped here.
+  ##
+  ## A caller-save home (see `RegAlloc.callerSaveHomes`) must be a *named*
+  ## nifasm register var — `callerSaveSetAt` / `emCallerSaveDecl` save and restore
+  ## by symbol, and the slot type must match the register var (`(ptr T)` or
+  ## `(i 64)`). Leaf / callee-saved params stay raw `(xN)` as before.
   var c = decl
   inc c                                       # proc head → name
   inc c                                       # name → params slot
@@ -1073,16 +1078,19 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
     while c.hasMore:
       var nm = ""
       var tn = ""
+      var typeCur: Cursor
       c.into:                                 # (param :name pragmas type)
         nm = symName(c); inc c
         skip c                                # pragmas
-        g.symType[nm] = c                     # record the param's type for getType
+        typeCur = c
+        g.symType[nm] = typeCur               # record the param's type for getType
         # Only true aggregates get a `varType` entry; a named *enum* (or scalar
         # typedef), local or cross-module, resolves to a scalar and stays in the
         # register path. `slotOf` loads a foreign module if the type lives there.
         if c.kind == Symbol and slotOf(g.prog, c).kind == AMem: tn = symName(c)
         while c.hasMore: skip c               # type (+ anything else)
       let loc = g.ra.locationOfSym(nm)
+      let csave = g.ra.callerSaveHomes.hasKey(nm)
       if tn.len > 0 and loc.kind == NamedStack:
         # ≤16B by-value aggregate: declare its stack home, fill from its GPR(s)
         g.varType[nm] = tn
@@ -1097,6 +1105,7 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
         # STACK-passed → `emitStackParamLoads` already loaded/computed the pointer into the
         # home, and the param consumed NO register (skip rule), so leave idx untouched.
         g.varType[nm] = tn
+        if csave: g.emRegLocalVar(nm, loc.r, typeCur)
         let words = if aggrByteSize(g.prog, tn) <= g.md.aggrByRefThreshold:
                       aggrWordCount(g.prog, tn) else: 1
         if idx + words <= IntArgRegs.len:
@@ -1126,6 +1135,7 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
       else:
         case loc.kind
         of InReg:
+          if csave: g.emRegLocalVar(nm, loc.r, typeCur)
           if idx < IntArgRegs.len:
             g.movReg(loc.r, IntArgRegs[idx])
           # else: a stack-passed param — already loaded into loc.r by
@@ -2636,28 +2646,136 @@ proc emCallerSaveDecl(g: var CodeGen; slotName, varName: string) =
     g.ab.sym slotName
     g.ab.sym varName
 
+proc emitInstr2(g: var CodeGen; c: Cursor) =
+  ## `(instr SYM X*)` — the intrinsic's own instruction(s). The a64 twin of the
+  ## x86-64 `emitInstr2`: same node, same row, same allocator contract (operands
+  ## in registers, the result in its own home), only the expansion differs.
+  ## Every a64 form here is three-address, so no `tie` copy ever runs.
+  let pos = g.posOf(c)
+  let res = g.ra.locs[pos]
+  var fsym = ""
+  var argCurs: seq[Cursor] = @[]
+  block:
+    var fc = c
+    fc.into:
+      fsym = symName(fc); skip fc
+      while fc.hasMore: (argCurs.add fc; skip fc)
+  let tgt = instrTargetOf(g.prog, fsym)
+  let row = IntrinsicRows[tgt.op]
+  if row.isFlagRead or row.isFlagWrite:
+    # See the x86-64 `emitInstr2` for the reasoning: an ordinary proc's body is
+    # allocated and scheduled, so nothing promises the flags survive from their
+    # definition to their use. `.assembler` is the only context where they do —
+    # and the AArch64 backend has no `.assembler` path yet either.
+    lengError c, "`" & IntrinsicNames[tgt.op] & "` is a flag instruction; flags " &
+              "are only legal inside an `{.assembler.}` proc, which the AArch64 " &
+              "backend does not support yet", lengInfo(c)
+  if tgA64 notin row.targets:
+    # A user error, not a broken invariant: the row's `targets` column says the
+    # instruction is x86-64-only and the call was not guarded. Report it at the
+    # call site like the flag case above, not as a stack-traced AssertionDefect.
+    lengError c, "`" & IntrinsicNames[tgt.op] & "` has no AArch64 lowering — " &
+              "guard the call with a `when`"
+  for a in argCurs: g.emitValue2(a)
+  if res.kind != InReg:
+    raiseAssert "arkham a64n: intrinsic result is not in a register"
+  let a0 = g.ra.locs[g.posOf(argCurs[0])]
+  let aliasesA0 = a0.kind == InReg and a0.r == res.r
+  if res.isTemp and not aliasesA0: g.bindTemp(res.r, res.typ)
+  # A memory-homed operand is loaded into the destination first; every form below
+  # then reads `res` as its source, which is safe because all of them are
+  # single-source and write the destination last.
+  var src = res.r
+  if a0.kind == InReg: src = a0.r
+  else: g.place2(a0, res.r)
+  # The width the instruction runs at is the row's bound `W`, NOT the declared
+  # result type: `Ctz` returns an `int32` while operating on a 64-bit value.
+  let bits = if tgt.argBits in {8, 16, 32}: 32 else: 64
+  case tgt.op
+  of ClzPinnedOp, ClzOp:
+    g.ab.tree ClzA64: (g.emReg res.r; g.emReg src; g.ab.intLit bits)
+  of RbitOp:
+    g.ab.tree RbitA64: (g.emReg res.r; g.emReg src; g.ab.intLit bits)
+  of CtzOp:
+    # AArch64 has no count-trailing-zeros: reverse the bits and count leading ones.
+    # This is the `clz(rbit(x))` the portable row exists to hide.
+    g.ab.tree RbitA64: (g.emReg res.r; g.emReg src; g.ab.intLit bits)
+    g.ab.tree ClzA64: (g.emReg res.r; g.emReg res.r; g.ab.intLit bits)
+  of RevOp, BswapOp:
+    g.ab.tree RevA64: (g.emReg res.r; g.emReg src; g.ab.intLit bits)
+    if tgt.argBits == 16:
+      # `rev` at the 32-bit width reverses all four bytes; the swapped half ends
+      # up in bits 16..31, so shift it back down.
+      g.binImm(LsrA64, res.r, 16)
+  else:
+    raiseAssert "arkham a64n: no lowering for intrinsic `" & IntrinsicNames[tgt.op] & "`"
+  if a0.kind == InReg and a0.isTemp and a0.r != res.r: g.unbindTemp(a0.r)
+
+proc callIsInlinedAtomic(g: CodeGen; c: Cursor): bool =
+  ## True when `emitCall2Inner` will lower this call to `emitAtomic2` (LL/SC), which
+  ## clobbers only x0–x5 — so atomic-safe caller-save homes (x6/x7) need no spill.
+  ## Only consults an already-resolved `callTarget` entry (populated by pass 0 /
+  ## a prior call); unknown callees conservatively return false.
+  var probe = c
+  if probe.stmtKind != CallS: return false
+  probe.into:
+    if probe.kind != Symbol: return false
+    let fsym = symName(probe)
+    if g.callTarget.hasKey(fsym):
+      return g.callTarget[fsym].atomic.len > 0
+    return false
+
+proc callerSaveSlotFor(g: CodeGen; pos: int; reg: Reg; name: string): string =
+  ## Locals → per-call reclaimable `csave.*` slot; params → permanent `pcsave.*`.
+  if name in g.ra.callerSaveParams: paramCallerSaveSlotName(name)
+  else: callerSaveSlotName(pos, reg)
+
 proc emitCall2(g: var CodeGen; c: Cursor) =
-  ## Caller-save wrapper (a64 twin of the x64 one): a cross-call local homed in an
-  ## atomic-safe caller-saved volatile (x9–x13) is spilled around this call inside a
-  ## `(scope …)` — save before the call clobbers the register, restore after. The var's
-  ## `(var :name (xN) T)` binding PERSISTS across the scope; the restore's `mov` re-defines
-  ## the register (clearing the call's clobber via the a64 mov-clobber-clear). No caller-
-  ## save vars ⇒ zero overhead, byte-identical to before.
+  ## Caller-save wrapper (a64 twin of the x64 one): a cross-call local/param homed in an
+  ## atomic-safe caller-saved volatile (x6/x7) is spilled around this call — save before
+  ## the call clobbers the register, restore after. The var's `(var :name (xN) T)` binding
+  ## PERSISTS; the restore's `mov` re-defines the register (clearing the call's clobber via
+  ## the a64 mov-clobber-clear). Locals use a reclaimable `(scope …)` slot; params use a
+  ## permanent prologue slot (shared with other `(s)` frame vars — no nested arena).
+  ## Inlined atomics skip the wrap (they do not clobber the atomic-safe pool).
+  if g.callIsInlinedAtomic(c):
+    g.emitCall2Inner(c)
+    return
   let saveSet = g.callerSaveSetAt()
   if saveSet.len == 0:
     g.emitCall2Inner(c)
     return
   let pos = cursorToPosition(g.buf[], c)
-  g.ab.tree ScopeA64:
-    for it in saveSet:
-      g.emCallerSaveDecl(callerSaveSlotName(pos, it.reg), it.name)
+  # Split: param saves are plain movs (slot already declared); local saves need a scope.
+  var localSaves: seq[tuple[reg: Reg, name: string]] = @[]
+  var paramSaves: seq[tuple[reg: Reg, name: string]] = @[]
+  for it in saveSet:
+    if it.name in g.ra.callerSaveParams: paramSaves.add it
+    else: localSaves.add it
+  template saveOne(it: tuple[reg: Reg, name: string]; doDecl: bool) =
+    let slot = g.callerSaveSlotFor(pos, it.reg, it.name)
+    if doDecl: g.emCallerSaveDecl(slot, it.name)
+    else:
+      g.ab.tree MovA64: (g.ab.sym slot; g.ab.sym it.name)
+  template restoreOne(it: tuple[reg: Reg, name: string]; resLoc: Location) =
+    if resLoc.kind == InReg and resLoc.r == it.reg: discard  # x=f(x): result overwrites
+    else:
+      g.ab.tree MovA64:
+        g.ab.sym it.name
+        g.ab.sym g.callerSaveSlotFor(pos, it.reg, it.name)
+  if localSaves.len == 0:
+    for it in paramSaves: saveOne(it, doDecl = false)
     g.emitCall2Inner(c)
     let resLoc = g.ra.locs[pos]
-    for it in saveSet:
-      if resLoc.kind == InReg and resLoc.r == it.reg: continue   # x=f(x): result overwrites
-      g.ab.tree MovA64:                          # (mov name slot) — restore (→ ldr)
-        g.ab.sym it.name
-        g.ab.sym callerSaveSlotName(pos, it.reg)
+    for it in paramSaves: restoreOne(it, resLoc)
+  else:
+    g.ab.tree ScopeA64:
+      for it in paramSaves: saveOne(it, doDecl = false)
+      for it in localSaves: saveOne(it, doDecl = true)
+      g.emitCall2Inner(c)
+      let resLoc = g.ra.locs[pos]
+      for it in localSaves: restoreOne(it, resLoc)
+      for it in paramSaves: restoreOne(it, resLoc)
 
 # ── conditions ───────────────────────────────────────────────────────────────
 
@@ -2838,7 +2956,7 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
     # global / foldable lvalue): nothing to materialize — the consumer reads it.
     if c.kind == TagLit and c.exprKind in {AddC, SubC, MulC, DivC, ModC, ShlC, ShrC,
         BitandC, BitorC, BitxorC, NegC, BitnotC, NotC, EqC, NeqC, LtC, LeC, AndC, OrC,
-        DerefC, DotC, AtC, PatC, AddrC, CastC, ConvC, CallC}:
+        DerefC, DotC, AtC, PatC, AddrC, HaddrC, CastC, ConvC, CallC}:
       # A computed node whose result was spilled to a non-temp NamedStack/Mem slot
       # (dest-passed into a real local's home). (The isTemp spill case is handled by
       # the `dst.isTemp` produce-into block above, for every node kind.)
@@ -2900,10 +3018,11 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
     of ModC: g.emitMod2(c)
     of EqC, NeqC, LtC, LeC, AndC, OrC, NotC: g.emitCondValue2(c)
     of DerefC, DotC, AtC, PatC: g.emitMemLoad2(c)
-    of AddrC: g.emitAddr2(c)
+    of AddrC, HaddrC: g.emitAddr2(c)
     of CastC, ConvC: g.emitCast2(c)
     of CallC:
       g.emitCall2(c)
+    of InstrC: g.emitInstr2(c)
     of NegC, BitnotC:
       var inner: Cursor
       block:
@@ -3735,6 +3854,7 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
     g.exitScope()
   of VarS, GvarS, TvarS, ConstS: g.genVarDecl2(c)
   of CallS: g.emitCall2(c)
+  of InstrS: g.emitInstr2(c)
   of BreakS:
     assert g.loopEnds.len > 0, "arkham a64n: `break` outside a loop"
     g.emBr(BA64, g.loopEnds[^1])
@@ -4066,12 +4186,24 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool) =
     g.ab.symDef info.asmName
     g.emitSignature(info.decl, declarative)
     g.ab.tree StmtsA64:
+      # One scope covers caller-save param bindings (`emRegLocalVar` in
+      # emitParamMoves) and the body locals — `scopeLocals` must be non-empty
+      # before those param binds, and param kills must outlive the body.
+      g.enterScope()
       if g.hasFrame: framePush(g)
       g.emitStackParamLoads(info.decl)
       if g.ra.hasStackVars:
         g.ab.tree SubA64: g.emReg SP; g.ab.keyword SsizeX
       if g.retIndirect: g.movReg(g.indirectReg, IndirectResultReg)
       g.emitParamMoves(info.decl)
+      # Permanent spill slots for caller-save parameters (see `callerSaveParams`).
+      # Declared once with the rest of the frame so offsets sit in the same arena as
+      # addr-taken spills — not in per-call reclaimable `(scope …)` slots.
+      for name in g.ra.callerSaveParams:
+        if g.symType.hasKey(name) and isPtrType(resolveType(g.prog, g.symType[name])):
+          g.emTypedStackVar(paramCallerSaveSlotName(name), g.symType[name])
+        else:
+          g.emScalarStackVar(paramCallerSaveSlotName(name))
       if info.isEntry and g.hasGlobalInits:           # run runtime global inits at startup
         g.ab.tree PrepareA64:
           g.ab.sym g.globalInitSym
@@ -4084,7 +4216,6 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool) =
         else: g.emScalarStackVar(st.name)
       g.retLabel2 = g.freshLabel()
       g.retLabelUsed2 = false
-      g.enterScope()
       var c = info.decl
       c.into:
         inc c; skip c; skip c; skip c
@@ -4106,6 +4237,13 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool) =
 proc genProc2(g: var CodeGen; info: ProcInfo) =
   when defined(arkhamTraceProcs):
     stderr.writeLine "arkham genProc2: " & info.asmName
+  if info.isAsm:
+    # `.assembler` is a transliteration whose register names are x86-64's; there is
+    # no target-neutral reading of `{.register: "rax".}`. Rejecting is the whole
+    # point of the mode ("no fallbacks", doc/intrinsics.md §8) — an AArch64 body is
+    # a different `when` branch the user must write.
+    lengError info.decl, "an `.assembler` proc is not supported by the AArch64 " &
+              "backend yet; its register pins name x86-64 registers", lengInfo(info.decl)
   if not g.cleanSigComputed:                   # compute the clean-signature set once
     g.cleanSigProcs = cleanSigProcNames(g.prog)
     g.cleanSigComputed = true
@@ -4152,7 +4290,10 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
     g.ra.usedCallee.incl R19
   # The entry injects a `call` to the synthetic global-init proc, so it makes a call
   # even when its own body does not — give it a frame (lr saved) for that call.
-  g.computeFrame(an.hasCall or (info.isEntry and g.hasGlobalInits))
+  # fp/lr only when a real `bl` exists (or the entry runs global inits). Inlined
+  # atomics do not need lr — counting them as `hasCall` used to force a frame on
+  # otherwise-leaf hot paths (rawDealloc's CAS loop, etc.).
+  g.computeFrame(an.hasRealCall or (info.isEntry and g.hasGlobalInits))
   let declarative = isDeclarativeAbi(g.prog, info.decl)
   g.ab.planning = false
   g.regLocal.clear(); g.aliasToDecl.clear(); g.boundTemps = {}; g.scopeLocals = @[]
