@@ -2671,8 +2671,11 @@ proc emitInstr2(g: var CodeGen; c: Cursor) =
               "are only legal inside an `{.assembler.}` proc, which the AArch64 " &
               "backend does not support yet", lengInfo(c)
   if tgA64 notin row.targets:
-    raiseAssert "arkham a64n: `" & IntrinsicNames[tgt.op] &
-                "` has no AArch64 lowering — guard the call with a `when`"
+    # A user error, not a broken invariant: the row's `targets` column says the
+    # instruction is x86-64-only and the call was not guarded. Report it at the
+    # call site like the flag case above, not as a stack-traced AssertionDefect.
+    lengError c, "`" & IntrinsicNames[tgt.op] & "` has no AArch64 lowering — " &
+              "guard the call with a `when`"
   for a in argCurs: g.emitValue2(a)
   if res.kind != InReg:
     raiseAssert "arkham a64n: intrinsic result is not in a register"

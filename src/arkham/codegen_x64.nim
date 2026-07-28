@@ -2378,8 +2378,10 @@ proc emitInstr2(g: var CodeGen; c: Cursor) =
   let tgt = instrTargetOf(g.prog, fsym)
   let row = IntrinsicRows[tgt.op]
   if tgX64 notin row.targets:
-    raiseAssert "arkham x64n: `" & IntrinsicNames[tgt.op] &
-                "` has no x86-64 lowering — guard the call with a `when`"
+    # See the AArch64 twin: an unguarded call to a target-pinned row is the
+    # user's error, so it gets a call-site message, not an AssertionDefect.
+    lengError c, "`" & IntrinsicNames[tgt.op] & "` has no x86-64 lowering — " &
+              "guard the call with a `when`"
   if row.isFlagRead or row.isFlagWrite:
     # A flag row outside an `.assembler` proc. Nothing here is wrong with the
     # DECLARATION — it is the context: an ordinary proc's body is allocated and
