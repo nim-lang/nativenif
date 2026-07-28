@@ -108,6 +108,14 @@ type
                                              ## `recordEviction` recover the decl name from the
                                              ## point-in-time `regLocal[r]` with no `ra.locs`
                                              ## reverse scan. Populated at the param prologue.
+    regBindPtr*: set[Reg]                    ## x64: registers whose current `regLocal` binding is
+                                             ## POINTER-typed. nifasm type-checks every write
+                                             ## against the bound name's type, and a `(nil)` value
+                                             ## only fits a pointer — so a nil materialized into a
+                                             ## register still carrying an `(i 64)` name needs a
+                                             ## fresh binding first (see `emitValue2`'s `NilC`).
+                                             ## Maintained wherever a GPR name is bound/released:
+                                             ## `emRegLocalVar` / `bindTemp` / `unbindTemp`.
     boundTemps*: set[Reg]                    ## x64: registers whose `regLocal` entry is a
                                              ## transient scratch temp `(rebind …)`'d by
                                              ## `bindTemp`, NOT a steal-able local. `stealReg`
@@ -252,6 +260,15 @@ proc isNilSlot*(s: AsmSlot): bool {.inline.} =
   ## True if `s` carries the synthesized Leng `(nil)` type (a null pointer) — its
   ## register binds to the asm `(nil)` type and its immediate emits `(nil)`, not `0`.
   isNilValue(s.typ)
+
+proc isSubWidthIntSlot*(s: AsmSlot): bool {.inline.} =
+  ## A sized integer slot NARROWER than a register — `(i 32)`, `(u 8)`, … — that also
+  ## carries its Leng type (so it can be re-emitted in a `(cast …)`). arkham keeps every
+  ## register-homed local a full `(i 64)` binding and expresses width through explicit
+  ## extends, so a temp bound to one of these is a deliberate narrow BRIDGE: a value
+  ## arriving from a full-width register must be reinterpreted into it, never `mov`ed
+  ## (nifasm allows only widening moves).
+  s.kind in {AInt, AUInt} and s.size > 0 and s.size < 8 and not cursorIsNil(s.typ)
 
 proc isNilImm*(loc: Location): bool {.inline.} =
   ## A `nil` value resolved to an immediate (`p = nil`, `p == nil`): emit `(nil)`.
