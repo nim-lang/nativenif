@@ -116,6 +116,11 @@ type
                                              ## fresh binding first (see `emitValue2`'s `NilC`).
                                              ## Maintained wherever a GPR name is bound/released:
                                              ## `emRegLocalVar` / `bindTemp` / `unbindTemp`.
+    curProcName*: string                     ## the proc currently being emitted. arkham's input
+                                             ## carries no line info, so a bare register-pressure
+                                             ## or typing assert names nothing actionable; this
+                                             ## pins it to one routine (same reason nifasm's
+                                             ## `error` reports `in proc …`).
     boundTemps*: set[Reg]                    ## x64: registers whose `regLocal` entry is a
                                              ## transient scratch temp `(rebind …)`'d by
                                              ## `bindTemp`, NOT a steal-able local. `stealReg`
@@ -298,6 +303,21 @@ proc getType*(g: var CodeGen; c: Cursor): Cursor {.inline.} =
 
 proc exprSlot*(g: var CodeGen; c: Cursor): AsmSlot {.inline.} =
   g.typeCtx.exprSlot(c)
+
+proc declType*(g: var CodeGen; typeCur, valueCur: Cursor): Cursor =
+  ## The type a local should be DECLARED with. Shoggoth's SROA / cse /
+  ## induction-variable passes synthesize `(var :t . . <value>)` with the type
+  ## slot LEFT EMPTY and the type implied by the initializer — a form lengc
+  ## already infers (`codegen.genVarDecl`'s `getNominalType` fallback), so
+  ## arkham must too. An empty slot otherwise sizes as `AMem 0` (which asserts
+  ## in `typeSizeAlign`) and, worse, an `(addr x)` initializer silently loses
+  ## its `(ptr T)`-ness so every later deref/field access mistypes.
+  ## `allocVarDecl` already infers the SLOT this way (`typeIsOmitted`); this
+  ## gives the emitter and `symType` the matching type CURSOR, so the two
+  ## passes agree.
+  if typeCur.kind != DotToken: return typeCur
+  if not valueCur.hasMore or valueCur.kind == DotToken: return typeCur
+  result = g.getType(valueCur)
 
 proc tryConstFold*(g: var CodeGen; c: Cursor): (bool, int64) =
   ## Evaluate a compile-time-constant INTEGER expression to its value WITHOUT

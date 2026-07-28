@@ -60,6 +60,7 @@ proc emReg(g: var CodeGen; r: Reg) {.inline.} =
     g.ab.reg r
 
 proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg
+proc stagingCensus(g: var CodeGen; avoid: Reg): string
 
 let AddrSlot = AsmSlot(cls: AUInt, size: 8, align: 8)
   ## The binding type for a staging register that holds a raw machine address / word
@@ -85,7 +86,12 @@ proc pickStagingSealed(g: var CodeGen; what: string; slot: AsmSlot; avoid: Reg =
   ## register the caller still needs live (e.g. an accumulator that is not a bound
   ## temp, so `pickStagingScratch`'s own filters would not otherwise exclude it).
   result = g.pickStagingScratch(avoid)
-  if result == NoReg: raiseAssert "arkham x64n: no staging register for " & what
+  if result == NoReg:
+    # Report WHY each candidate was unavailable: "out of registers" is otherwise
+    # indistinguishable from "one filter is wrong / a seal was never released",
+    # and those need opposite fixes.
+    raiseAssert "arkham x64n: no staging register for " & what &
+                " in proc " & g.curProcName & g.stagingCensus(avoid)
   g.ra.seal result
   g.bindTemp(result, slot)
 
@@ -882,6 +888,20 @@ proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg =
       g.releaseStaleName(r)
       return r
   return NoReg
+
+proc stagingCensus(g: var CodeGen; avoid: Reg): string =
+  ## Why every staging candidate was unavailable. "Out of registers" is otherwise
+  ## indistinguishable from "a filter is wrong / a seal was never released", and
+  ## those need opposite fixes.
+  result = ""
+  for r in StagingCandidates:
+    result.add "\n    " & $r & ": "
+    if r == avoid: result.add "avoid"
+    elif g.ra.isSealed(r): result.add "sealed"
+    elif r in g.liveAccums: result.add "liveAccum"
+    elif r in g.boundTemps: result.add "boundTemp " & g.regLocal.getOrDefault(r, "?")
+    elif g.regHoldsLiveLocal(r): result.add "live local " & g.regLocal.getOrDefault(r, "?")
+    else: result.add "FREE (unreachable)"
 
 proc pickStaging(g: var CodeGen; avoid: Reg = NoReg): Reg =
   ## A transient compute register for a spill (see `pickStagingScratch`).
@@ -4447,7 +4467,20 @@ proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size, auxPos: 
   g.aggrAddrLoc(dst, dstAddr)   # &dst
   let srcAddr = g.pickStagingSealed("an aggregate-copy src address", ScalarSlot)
   g.aggrAddrInto(rhs, srcAddr, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)  # &rhs
-  let tmp = g.pickStagingSealed("an aggregate-copy transfer register", AddrSlot)
+  # The two addresses already consumed the R11 bridge, so the per-word transfer
+  # register is a third staging pick and can genuinely fail under pressure. Fall back
+  # to the pool register `allocAggrCopy` reserved for exactly this (it can demote a
+  # local; the emitter cannot). Staging succeeds in the common case, and then the
+  # reserved register simply goes unused.
+  var tmp = g.pickStagingScratch()
+  if tmp == NoReg and g.ra.aux.hasKey(auxPos) and g.ra.aux[auxPos].scratch.len > 0:
+    tmp = g.ra.aux[auxPos].scratch[0]                             # NoReg ⇒ it spilled too
+  if tmp == NoReg:
+    tmp = g.pickStagingSealed("an aggregate-copy transfer register", AddrSlot)
+  else:
+    g.releaseStaleName(tmp)      # drop a dead binding so `(rebind)` is legal
+    g.ra.seal tmp
+    g.bindTemp(tmp, AddrSlot)
   g.copyAggr(dstAddr, srcAddr, size, tmp)
   g.giveBack tmp                                                 # unbinds + unseals the bridge
   g.giveBack srcAddr; g.giveBack dstAddr                         # unbind + unseal
@@ -4706,7 +4739,8 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
     let declPos = cursorToPosition(g.buf[], cc)         # SymbolDef pos (aux key, matches allocVarDecl)
     let nm = symName(cc); inc cc
     skip cc                                              # pragmas
-    let typeCur = cc; skip cc                            # type
+    let declaredCur = cc; skip cc                        # type (`.` when shoggoth omitted it)
+    let typeCur = g.declType(declaredCur, cc)            # infer from the initializer
     g.symType[nm] = typeCur                              # record the type for getType (conds)
     if nm in g.ra.aliasedCasts:
       # Identity-cast value alias (see `allocVarDecl`): `nm` has NO home of its own — its
@@ -5284,7 +5318,8 @@ proc recordVarType(g: var CodeGen; c: Cursor) =
     if cc.kind == SymbolDef:
       let nm = symName(cc); inc cc
       skip cc                                    # pragmas
-      g.symType[nm] = cc                         # type
+      let typeCur = cc; skip cc                  # type
+      g.symType[nm] = g.declType(typeCur, cc)    # `.` ⇒ inferred from the initializer
     while cc.hasMore: skip cc
 
 proc recordSymTypes(g: var CodeGen; c: Cursor) =
@@ -5396,6 +5431,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.regMirror.clear()                          # per-proc reload cache: no value carries across procs
   g.labelIn.clear(); g.mirrorLive = true       # reg-cache forward-join state (reachable at entry)
   g.tmpBindCount = 0; g.ftmpBindCount = 0
+  g.curProcName = info.asmName
   when defined(arkhamDbgProc):
     block:
       var pc = info.decl; inc pc

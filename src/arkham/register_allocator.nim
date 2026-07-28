@@ -1785,6 +1785,27 @@ proc allocAggrCopy(b: var Builder; n: var Cursor; dstIsMem: bool; dstCur: Cursor
     if dstAddr.kind != InReg or srcAddr.kind != InReg:
       raiseAssert "arkham: out of registers for an aggregate copy"
     b.ra.aux[auxPos] = ExprAux(scratch: @[dstAddr.r, srcAddr.r])
+  else:
+    # x64 FALLBACK for the per-word transfer register. The comment above says the
+    # copy needs only TWO pool GPRs because the transfer register is the always-free
+    # R11 bridge — but on x64 `dstAddr`/`srcAddr` themselves come from emit-time
+    # staging and CONSUME that bridge, so the transfer register is a genuine THIRD
+    # staging pick. In a proc where every other caller-saved register hosts a live
+    # local (shoggoth's SROA/inlining raise exactly this pressure — `nimStrAtLe`
+    # after `-d:danger`) that pick fails. Reserve a pool register the emitter falls
+    # back to; it is released immediately, so it costs nothing when staging succeeds
+    # (the usual case) and, unlike the emitter, the allocator can DEMOTE a local to
+    # produce one.
+    # Deliberately NON-demoting: take a callee-saved register only if one is
+    # genuinely free. `reserveHeldScratch` would evict the coldest local to
+    # manufacture one, and paying that on EVERY aggregate copy would perturb
+    # allocation everywhere to rescue a case that only arises under extreme
+    # pressure. `NoReg` here just means the emitter keeps its old behaviour.
+    let xfer = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
+    if xfer != NoReg:
+      b.ra.usedCallee.incl xfer
+      b.freeCallee.incl xfer                             # released immediately
+    b.ra.aux[auxPos] = ExprAux(scratch: @[xfer])
 
 proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
   ## Allocator twin of the emitter's `genStore2`. A whole-aggregate COPY (symbol/lvalue
