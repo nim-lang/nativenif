@@ -476,5 +476,9 @@
 | `(rebind D T S)`    | X64Inst, A64Inst        | bind a phys reg to a typed name, killing its prior tenant |
 | `(withreg D T S ...)` | X64Inst, A64Inst      | block-scoped rebind; auto-killed at block end |
 | `(regs ...)`          | NifasmDecl                  | multi-register param/result location: `(regs (rdi) (rsi))` |
-| `(bswap D)`           | X64Inst                     | reverse byte order (BSWAP r32/r64; `__builtin_bswap*`) |
+| `(bswap D N)`         | X64Inst                     | reverse byte order of D in place; `N` is the operand size in bits (32 or 64) |
 | `(scope ...)`         | X64Inst, A64Inst            | statement block with a reclaimable stack-slot arena: `(s)` locals declared inside are freed at scope end so sibling scopes reuse the frame bytes |
+| `(popcnt D S N)`      | X64Inst                     | population count: D = number of set bits in S; `N` is the operand size in bits (32 or 64) |
+| `(clz D S N)`         | A64Inst                     | count leading zeros: D = number of leading zero bits of S; `N` is the operand size in bits (32 or 64) |
+| `(rbit D S N)`        | A64Inst                     | reverse bit order of S into D (with `clz` this is a count-trailing-zeros); `N` is the operand size in bits |
+| `(rev D S N)`         | A64Inst                     | reverse byte order of S into D; `N` is the operand size in bits (32 or 64) |

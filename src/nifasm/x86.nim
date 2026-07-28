@@ -911,6 +911,19 @@ proc emitBsr*(dest: var Bytes; destReg, srcReg: Register) =
   dest.add(0xBD)  # BSR r64, r/m64 opcode
   dest.add(encodeModRM(amDirect, int(destReg), int(srcReg)))
 
+proc emitPopcnt*(dest: var Bytes; destReg, srcReg: Register; bits: int) =
+  ## Emit POPCNT destReg, srcReg (`F3 0F B8 /r`). SSE4.2 / ABM; `bits` is 32 or 64
+  ## and selects REX.W. Unlike BSF/BSR the zero case is defined (result 0).
+  dest.add(0xF3)                       # mandatory prefix (this is what makes it POPCNT)
+  var rex = RexPrefix(w: bits == 64)
+  if needsRex(destReg): rex.r = true
+  if needsRex(srcReg): rex.b = true
+  if rex.w or rex.r or rex.b:
+    dest.add(encodeRex(rex))
+  dest.add(0x0F)
+  dest.add(0xB8)
+  dest.add(encodeModRM(amDirect, int(destReg), int(srcReg)))
+
 proc emitBswap*(dest: var Bytes; reg: Register; bits: int) =
   ## Emit BSWAP reg (reverse byte order), encoded `0F C8+rd` with the register in the
   ## low opcode bits. `bits` is 32 or 64 (REX.W selects 64). A 16-bit byte-swap is NOT

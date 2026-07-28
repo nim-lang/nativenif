@@ -32,9 +32,28 @@ const arkhamKnownUnsupported: seq[string] =
   # handled on x86-64 AND AArch64. No quarantine remains.
   @[]
 
+# Tests that cannot run on ANY AArch64 target, whichever OS hosts it: the Linux
+# `linux_arm64` qemu pass and the macOS native pass both skip these. Keep the two
+# reasons apart — a stem belongs here when the FIXTURE is x86-64-specific, and in
+# `arkhamDarwinUnsupported` when the fixture is fine but the OS differs.
+const arkhamA64Unsupported: seq[string] = @[
+  # x86-64 target-pinned instructions (`{.instruction: bsf.}` and friends). Being
+  # unavailable on a64 is the POINT — the row's `targets` column says so and the
+  # backend errors at the call site naming the target, exactly as C does. The
+  # portable counterparts are covered by `intrinsics`, which runs on both.
+  "intrinsics_x64",
+  # `{.assembler.}` transliteration. Its `{.register: "rdi".}` pins name x86-64
+  # registers, so there is no target-neutral reading of the body — that is the
+  # mode's premise ("no fallbacks", doc/intrinsics.md §8), not a gap: an AArch64
+  # version is a different `when` branch the user writes, with `x0`/`x9` in it.
+  "assembler_x64",
+]
+
 const arkhamDarwinUnsupported: seq[string] =
   # The hand-written Leng fixture bakes in a Linux flag constant that has a
   # different numeric value on macOS, so the call genuinely fails on Darwin.
+  # x86-64-only fixtures do NOT go here — they go in `arkhamA64Unsupported`,
+  # which the macOS pass also honours (it targets arm64, see `arch` below).
   @[
     # `mmap_anon` passes `flags = 34` (MAP_PRIVATE | MAP_ANONYMOUS where
     # MAP_ANONYMOUS == 0x20 on Linux). On macOS MAP_ANON == 0x1000, so 34 is
@@ -54,6 +73,33 @@ const arkhamOsxOnly: seq[string] =
   # macOS. It links only against libSystem, so it's skipped on Linux (native x64 and
   # the linux_arm64 qemu path), where the symbol doesn't exist.
   @["ulock_wake"]
+
+const arkhamRejections: seq[(string, string)] = @[
+  # Arkham owns the `{.assembler.}` rules outright — nimony's sem only forwards
+  # the pragmas — so its REJECTIONS need regression coverage as much as its code
+  # generation does. Each fixture is a hand-written Leng module that must not
+  # compile, paired with the part of the message that says why. See
+  # `doc/intrinsics.md` §6 and §8.
+  ("err_flag_value", "is a flag, not a value"),
+  ("err_flag_outside_asm", "only legal inside an `{.assembler.}` proc"),
+  ("err_nonflag_cond", "condition must be a flag intrinsic"),
+  ("err_unannotated_local", "declares every location"),
+  ("err_wrong_param_reg", "is passed in rdi by the C ABI, but is pinned to rsi"),
+  ("err_inout_value", "writes through its first operand and returns nothing"),
+  ("err_inout_dest", "must be a `var` argument naming a local"),
+]
+
+proc arkhamRejectionTests(arkham: string) =
+  ## Every fixture above must fail, with the stated reason. x86-64 only: the
+  ## register names in an `{.assembler.}` body are x86-64's, and the AArch64
+  ## backend rejects the whole mode before reaching any of these checks.
+  var passed = 0
+  for (name, expected) in arkhamRejections:
+    execExpectFailure(quoteShell(arkham) & " -a:x64 -o:" &
+                      quoteShell("tests" / "arkham" / "nimcache" / (name & ".rej.nif")) &
+                      " " & quoteShell("tests" / "arkham" / (name & ".c.nif")), expected)
+    inc passed
+  echo passed, " / ", arkhamRejections.len, " arkham rejection tests successful"
 
 proc arkhamTests() =
   ## Each `tests/arkham/*.c.nif` is hand-written Leng: arkham generates asm-NIF,
@@ -79,9 +125,12 @@ proc arkhamTests() =
   for file in walkFiles("tests" / "arkham" / "*.c.nif"):
     let base = extractFilename(file)
     if base.startsWith("mod_"): continue   # foreign helper, not standalone
+    if base.startsWith("err_"): continue   # must NOT compile — see arkhamRejectionTests
     let name = base[0 ..< base.len - ".c.nif".len]
     when defined(macosx):
-      if name in arkhamDarwinUnsupported: continue  # Linux-only flag constant / symbol
+      # The macOS run targets arm64, so BOTH lists apply: the fixture may be
+      # x86-64-pinned, or it may be portable but depend on a Linux-only symbol.
+      if name in arkhamDarwinUnsupported or name in arkhamA64Unsupported: continue
     else:
       if name in arkhamOsxOnly: continue            # macOS-only libSystem symbol
     inc total
@@ -118,8 +167,13 @@ proc arkhamTests() =
 # Most `tests/arkham/*.c.nif` run end-to-end under the static Linux/ELF
 # `linux_arm64` qemu path — the arm64 backend reached x86-64 feature parity for
 # function-pointer calls, `(pat …)` pointer indexing, and thread-locals. List a
-# test's stem here if a new arm64-only TODO is introduced.
+# test's stem here only when it fails under THIS pass alone (static ELF, svc
+# syscalls, qemu); an AArch64 gap that the macOS run would hit too goes in
+# `arkhamA64Unsupported`.
 const arkhamLinuxA64Unsupported: seq[string] = @[
+  # Nothing is quarantined for the qemu pass alone — the x86-64-pinned fixtures
+  # live in `arkhamA64Unsupported`, which this pass also honours.
+  #
   # (`keepovf`/`(ovf)` overflow checking now has a64 codegen too: the predicate is
   # computed into a staging bridge — xor/and sign trick for signed add/sub, unsigned
   # compare for carry/borrow, div-based check for mul — since the nifasm vocabulary
@@ -163,8 +217,10 @@ proc arkhamQemuTests() =
   for file in walkFiles("tests" / "arkham" / "*.c.nif"):
     let base = extractFilename(file)
     if base.startsWith("mod_"): continue
+    if base.startsWith("err_"): continue   # must NOT compile — see arkhamRejectionTests
     let name = base[0 ..< base.len - ".c.nif".len]
-    if name in arkhamLinuxA64Unsupported or name in arkhamOsxOnly:
+    if name in arkhamLinuxA64Unsupported or name in arkhamA64Unsupported or
+       name in arkhamOsxOnly:
       (inc skipped; continue)                        # arm64-TODO or macOS-only symbol
     inc total
     let stem = file[0 ..< file.len - ".c.nif".len]
@@ -312,6 +368,10 @@ exec "nim c -r src/nifasm/nifasm tests/module_gvar_access.nif"
 # AArch64/Darwin on macOS), so we run them only where the binaries execute.
 when (defined(linux) and defined(amd64)) or (defined(macosx) and defined(arm64)):
   arkhamTests()
+
+# The `{.assembler.}` rejections are x86-64-only (see `arkhamRejectionTests`).
+when defined(linux) and defined(amd64):
+  arkhamRejectionTests(("bin" / "arkham").addFileExt(ExeExt))
 
 # Additionally exercise the AArch64 backend on an x86-64 Linux host by emitting the
 # `linux_arm64` ELF variant and running it under qemu-aarch64 (no-op if qemu is

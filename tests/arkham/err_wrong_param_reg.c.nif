@@ -1,0 +1,51 @@
+(.nif27)
+(.indexat 742             )
+(stmts
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :cmp64.0
+  (params
+   (param :a.0 .
+    (u 64))
+   (param :b.0 .
+    (u 64))).
+  (pragmas
+   (instruction cmp))
+  (stmts .))
+ (proc :zf.0
+  (params)
+  (bool)
+  (pragmas
+   (instruction zf))
+  (stmts .))
+ (proc :subject.0
+  (params
+   (param :x.0
+    (pragmas
+     (register "rsi"))
+    (u 64)))
+  (u 64)
+  (pragmas
+   (assembler))
+  (stmts
+   (var :result.0 .
+    (u 64).)
+   (asgn result.0 x.0)
+   (ret result.0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :a.0 .
+    (u 64)
+    (call subject.0 1))
+   (call exit.c
+    (conv
+     (i 32)a.0)))))(.index)

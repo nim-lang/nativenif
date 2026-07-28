@@ -117,11 +117,16 @@ proc movCompatible(want, got: Type): bool =
   # the unwrapped element type on either side. (Previously the register operand was
   # always a raw register — lenient `RegisterT`, compatible with any slot — but a
   # `rebind`-bound scratch carries its concrete type, e.g. `(i 64)`.)
+  # Re-run `addrWidthMove` after the unwrap too: a caller-save spill of a pointer
+  # (`(mov (s)(ptr T) slot, i64-bound-name)` / the restore) is an address-width move
+  # through a `StackOffT` wrapper, and the pre-unwrap check sees `StackOffT` which
+  # is neither PtrLike nor AddrLike.
   var w = want
   var g = got
   if w.kind == StackOffT: w = w.offType
   if g.kind == StackOffT: g = g.offType
   if compatible(w, g): return true
+  if addrWidthMove(w, g): return true
   if w.kind in {IntT, UIntT} and g.kind in {IntT, UIntT, IntLitT}:
     return g.bits <= w.bits
   result = false
@@ -3016,6 +3021,29 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     if op.kind == okMem: error("NEG memory not supported yet", n)
     arm64.emitNeg(ctx.buf.data, op.reg, op.reg)
 
+  # Bit-counting / bit- and byte-reversal: `(clz D S N)`, `(rbit D S N)`,
+  # `(rev D S N)`. All are three-address (D is a pure destination), so unlike
+  # x86's `bswap` they need no copy into the destination first. `N` (32 or 64) is
+  # the operand size, given EXPLICITLY: a 32-bit `clz` counts from bit 31, and the
+  # declared type of a bit-count destination says nothing about that width.
+  of ClzA64, RbitA64, RevA64:
+    let mnemonic = $instTag
+    inc n
+    let dest = parseDestA64(n, ctx)
+    let op = parseOperandA64(n, ctx)
+    checkBitwiseType(dest.typ, mnemonic, start)
+    checkBitwiseType(op.typ, mnemonic, start)
+    if dest.kind != okReg: error(mnemonic & " destination must be a register", n)
+    if op.kind != okReg: error(mnemonic & " source must be a register", n)
+    if n.kind != IntLit: error(mnemonic & " requires a width operand (32 or 64)", n)
+    let bits = int(getInt(n)); inc n
+    if bits != 32 and bits != 64: error(mnemonic & " width must be 32 or 64", n)
+    let w = bits == 32
+    case instTag
+    of ClzA64:  arm64.emitClz(ctx.buf.data, dest.reg, op.reg, w)
+    of RbitA64: arm64.emitRbit(ctx.buf.data, dest.reg, op.reg, w)
+    else:       arm64.emitRev(ctx.buf.data, dest.reg, op.reg, w)
+
   of CmpA64:
     inc n
     let dest = parseDestA64(n, ctx)
@@ -5305,6 +5333,23 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       x86.emitBsf(ctx.buf.data, dest.reg, op.reg)
     else:
       x86.emitBsr(ctx.buf.data, dest.reg, op.reg)
+
+  # Population count: `(popcnt D S N)`. `N` (32 or 64) is the operand size, given
+  # EXPLICITLY rather than inferred from the operand types — the destination of a
+  # bit-counting instruction is a small count whose declared type says nothing
+  # about the width the instruction must run at. Same convention as `(bswap D N)`.
+  of PopcntX64:
+    inc n
+    let dest = parseDest(n, ctx)
+    let op = parseOperand(n, ctx)
+    checkBitwiseType(dest.typ, $instTag, start)
+    checkBitwiseType(op.typ, $instTag, start)
+    if dest.kind != okReg: error("popcnt destination must be a register", n)
+    if op.kind != okReg: error("popcnt source must be a register", n)
+    if n.kind != IntLit: error("popcnt requires a width operand (32 or 64)", n)
+    let bits = int(getInt(n)); inc n
+    if bits != 32 and bits != 64: error("popcnt width must be 32 or 64", n)
+    x86.emitPopcnt(ctx.buf.data, dest.reg, op.reg, bits)
 
   # Byte swap: `(bswap D bits)` — D is a register reversed IN PLACE; `bits` is 32 or 64
   # (selects the operand size). Used to lower `__builtin_bswap32/64`.

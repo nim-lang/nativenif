@@ -142,13 +142,19 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
           result = q                                   # the return type
           while q.hasMore: skip q
         while t.hasMore: skip t
+    of InstrC:
+      # `(instr SYM …)` is typed exactly like a call — the callee's return type —
+      # but the callee is never a value, so it has no proctype to peel: the row
+      # recorded the declared return type directly.
+      var t = c; inc t
+      result = instrTargetOf(tc.prog[], symName(t)).retType
     of NilC: result = tc.prog[].voidPtr       # nil → a generic pointer type
     of InfC, NeginfC, NanC:                    # +inf / -inf / NaN float-value nodes
       result = tc.prog[].floatType
     of TrueC, FalseC,                         # bool literals & bool-valued operators
        EqC, NeqC, LtC, LeC, AndC, OrC, NotC, OvfC:   # `(not operand)` carries NO type child
       result = tc.prog[].boolType
-    of AddrC:                                 # &lvalue → (ptr <type-of-lvalue>)
+    of AddrC, HaddrC:                         # &lvalue → (ptr <type-of-lvalue>)
       var t = c; inc t
       result = tc.prog[].ptrTypeOf(tc.getType(t))
     of SufC, ParC:                            # wrappers → the inner value's type
@@ -180,7 +186,7 @@ proc exprSlot*(tc: TypeCtx; c: Cursor): AsmSlot =
   of Symbol: slotOf(tc.prog[], tc.getType(c))
   of TagLit:
     case c.exprKind
-    of AddrC: slotOf(tc.prog[], tc.getType(c))                       # &lvalue → precise (ptr <elem>)
+    of AddrC, HaddrC: slotOf(tc.prog[], tc.getType(c))               # &lvalue → precise (ptr <elem>)
     of NilC: AsmSlot(cls: AUInt, size: 8, align: 8, typ: tc.prog[].nilLit)  # nil → the `(nil)` type
     of TrueC, FalseC: AsmSlot(cls: AUInt, size: 1, align: 1)        # a bool
     of SizeofC, AlignofC: AsmSlot(cls: AInt, size: 8, align: 8)     # an integer constant

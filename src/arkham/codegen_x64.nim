@@ -17,7 +17,7 @@
 ## `exit`s. Floats, aggregates, memory lvalues, parameters, `if`/`case`, div/mod
 ## and shifts `raiseAssert` for now.
 
-import std / [assertions, tables, sets, os, algorithm]
+import std / [assertions, tables, sets, os, algorithm, strutils]
 import nifcore, nifcdecl
 import slots, machinedesc, analyser, register_allocator, programs
 import asmbuf, codegen_common, machine_x64
@@ -1713,6 +1713,8 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
         # passed pointer (idx past the regs) is loaded by `emitStackParamLoadsX64`.
         g.varType[nm] = tn
         g.movReg(loc.r, g.md.intArgRegs[idx])
+        if g.ra.callerSaveHomes.hasKey(nm):
+          g.emRegLocalVar(nm, loc.r, typeCur)   # named home for `(scope …)` save/restore
         inc idx
       elif tn.len > 0:
         # Stack-passed aggregate (by-value that didn't fit, or a by-ref pointer past
@@ -1749,16 +1751,20 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
           # the binding persists for the whole body — the existing leaf behavior.
           g.argResidentParams.add (argReg, g.regLocal[argReg])
         elif loc.kind == InReg:
-          # Relocated to a callee-saved home. In the declarative path the signature
-          # binds argReg to `pN.0`, so the relocation move must *read* it by name (a raw
-          # `(reg)` use of a bound register is rejected); the binding is then killed so
-          # the now-dead arg register is free. The empty-signature path has no binding,
-          # so it moves the raw register.
+          # Relocated to a callee-saved or caller-save volatile home. In the declarative
+          # path the signature binds argReg to `pN.0`, so the relocation move must
+          # *read* it by name (a raw `(reg)` use of a bound register is rejected); the
+          # binding is then killed so the now-dead arg register is free. The empty-
+          # signature path has no binding, so it moves the raw register. A caller-save
+          # home is then bound by the param's own name so `emitCall2`'s `(scope …)`
+          # save/restore can refer to it (callee-saved homes stay raw for epilogue pops).
           if declarative:
             g.ab.tree MovX64: (g.emReg loc.r; g.ab.sym paramName(ord))
             g.ab.tree KillX64: g.ab.sym paramName(ord)
           else:
             g.movReg(loc.r, argReg)
+          if g.ra.callerSaveHomes.hasKey(nm):
+            g.emRegLocalVar(nm, loc.r, typeCur)
         elif loc.kind == NamedStack and loc.typ.kind != AFloat:
           # an address-taken / spilled scalar param: declare its `(s)` slot and spill the
           # incoming argument register into it so `addr`/loads/stores work. Type the slot
@@ -2369,6 +2375,186 @@ proc emitBitBuiltin2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
   else:
     raiseAssert "arkham x64n: bit builtin not yet implemented: " & builtin
 
+proc inPlaceIntrinsicX64(op: IntrinsicOp): bool {.inline.} =
+  ## Which lowerings write their destination IN PLACE is a fact about *this*
+  ## target, not about the opcode: a pinned row records it as `tie`, but a
+  ## portable row (`Bswap`) has no tie and still lands on x86's in-place BSWAP.
+  ## So the backend decides, and the caller seeds the destination with operand 0.
+  ## Safe for every form here: they have a single register operand (`rol`/`ror`
+  ## take their count as an immediate — the row's `tie` made the allocator keep it
+  ## one), so that seeding copy can clobber no other operand.
+  op in {BswapOp, BswapPinnedOp, RolOp, RorOp}
+
+proc emitIntrinsicOps(g: var CodeGen; op: IntrinsicOp; argBits: int;
+                      dst, src0: Reg; rotCount: int64) =
+  ## Emit one intrinsic row's instruction(s) on ALREADY-PLACED operands. Shared by
+  ## the allocator-driven path (`emitInstr2`, which reads the placement out of
+  ## `ra.locs`) and the `.assembler` path (`genAsmProc`, where the placement is
+  ## the user's `.register` annotation) — they differ only in how `dst`/`src0`
+  ## were chosen, never in what gets emitted. For an in-place row the caller has
+  ## already seeded `dst` from operand 0 and passes `src0 == dst`.
+  let bits = if argBits in {8, 16, 32}: 32 else: 64
+  case op
+  of BsfOp, CtzOp:
+    # count-trailing-zeros == index of the least-significant set bit. `src == 0` is
+    # undefined (the row says so); nimony's callers guard the zero case.
+    g.ab.tree BsfX64: (g.emReg dst; g.emReg src0)
+  of BsrOp:
+    g.ab.tree BsrX64: (g.emReg dst; g.emReg src0)
+  of ClzOp:
+    # `__builtin_clz` counts leading zeros; BSR yields the index of the HIGHEST set
+    # bit, and `clz == (W-1) - bsr`, which for a power-of-two W is `bsr xor (W-1)`.
+    g.ab.tree BsrX64: (g.emReg dst; g.emReg src0)
+    g.ab.tree XorX64: (g.emReg dst; g.ab.intLit(bits - 1))
+  of PopcntOp, PopcountOp:
+    g.ab.tree PopcntX64: (g.emReg dst; g.emReg src0; g.ab.intLit bits)
+  of BswapPinnedOp, BswapOp:
+    # x86 BSWAP r16 is undefined, so a 16-bit swap is a 32-bit BSWAP whose two low
+    # bytes end up in bits 16..31 — shift them back down.
+    if argBits == 16:
+      g.ab.tree BswapX64: (g.emReg dst; g.ab.intLit 32)
+      g.ab.tree ShrX64: (g.emReg dst; g.ab.intLit 16)
+    else:
+      g.ab.tree BswapX64: (g.emReg dst; g.ab.intLit bits)
+  of RolOp:
+    g.ab.tree RolX64: (g.emReg dst; g.ab.intLit rotCount)
+  of RorOp:
+    g.ab.tree RorX64: (g.emReg dst; g.ab.intLit rotCount)
+  else:
+    raiseAssert "arkham x64n: no lowering for intrinsic `" & IntrinsicNames[op] & "`"
+
+proc x64InoutTag(op: IntrinsicOp): X64Inst =
+  ## The nifasm tag a two-address row emits. Six of these rows are spelled
+  ## differently in source than in the assembler (`bitand` → `(and)`, …) purely
+  ## because Nim's keywords got there first; this is where the two vocabularies
+  ## are reconciled, exactly as `x64FlagOf` reconciles `ovf` → `(of)`.
+  case op
+  of AddOp: AddX64
+  of SubOp: SubX64
+  of BitandOp: AndX64
+  of BitorOp: OrX64
+  of BitxorOp: XorX64
+  of ShiftlOp: ShlX64
+  of ShiftrOp: ShrX64
+  of SarOp: SarX64
+  of NegOp: NegX64
+  of BitnotOp: NotX64
+  of IncOp: IncX64
+  of DecOp: DecX64
+  else: NopX64
+
+proc emitInoutInstr2(g: var CodeGen; c: Cursor; op: IntrinsicOp;
+                     argCurs: seq[Cursor]) =
+  ## `add(d, s)` in an ordinary proc: `(add <d's home> <s>)`. The destination is
+  ## `(haddr d)`, and d's home is whatever the allocator gave it — a register, or
+  ## an `(s)` slot, both of which x86 accepts as a destination directly.
+  let row = IntrinsicRows[op]
+  let tag = x64InoutTag(op)
+  if tag == NopX64:
+    lengError c, "`" & IntrinsicNames[op] & "` has no x86-64 two-address form",
+              lengInfo(c)
+  proc emitDest(g: var CodeGen; d: Cursor) =
+    var inner = d
+    var sym = d
+    if d.kind == TagLit and d.exprKind == HaddrC:
+      inner.into:
+        sym = inner; skip inner
+        while inner.hasMore: skip inner
+    if sym.kind != Symbol:
+      lengError d, "the destination of `" & IntrinsicNames[op] & "` must be a " &
+                "`var` argument naming a local", lengInfo(d)
+    let loc = g.ra.locationOfSym(symName(sym))
+    case loc.kind
+    of InReg: g.emReg loc.r
+    of NamedStack: g.emStackMem(loc.name)
+    else:
+      lengError d, "the destination of `" & IntrinsicNames[op] & "` has no " &
+                "register or stack home", lengInfo(d)
+  if row.arity == 1:
+    g.ab.tree tag: g.emitDest(argCurs[0])
+  else:
+    g.emitValue2(argCurs[1])                     # settle the source first
+    let src = g.ra.locs[cursorToPosition(g.buf[], argCurs[1])]
+    g.ab.tree tag:
+      g.emitDest(argCurs[0])
+      case src.kind
+      of InReg: g.emReg src.r
+      of Imm: g.ab.intLit src.ival
+      of NamedStack: g.emStackMem(src.name)
+      else:
+        lengError argCurs[1], "unsupported source operand for `" &
+                  IntrinsicNames[op] & "`", lengInfo(c)
+
+proc emitInstr2(g: var CodeGen; c: Cursor) =
+  ## `(instr SYM X*)` — the intrinsic's own instruction(s). The allocator already
+  ## placed each operand in a register (or left a literal immediate) and the
+  ## result in its own home, so this is a transliteration of the row: no ABI, no
+  ## call point, no `rax` round trip. Compare `emitCall2`.
+  ##
+  ## The opcode is the USER'S; only the operand placement was ours. Nothing here
+  ## may substitute a different instruction.
+  let pos = cursorToPosition(g.buf[], c)
+  let res = g.ra.locs[pos]
+  var fsym = ""
+  var argCurs: seq[Cursor] = @[]
+  block:
+    var fc = c
+    fc.into:
+      fsym = symName(fc); skip fc
+      while fc.hasMore: (argCurs.add fc; skip fc)
+  let tgt = instrTargetOf(g.prog, fsym)
+  let row = IntrinsicRows[tgt.op]
+  if tgX64 notin row.targets:
+    # See the AArch64 twin: an unguarded call to a target-pinned row is the
+    # user's error, so it gets a call-site message, not an AssertionDefect.
+    lengError c, "`" & IntrinsicNames[tgt.op] & "` has no x86-64 lowering — " &
+              "guard the call with a `when`"
+  if row.isFlagRead or row.isFlagWrite:
+    # A flag row outside an `.assembler` proc. Nothing here is wrong with the
+    # DECLARATION — it is the context: an ordinary proc's body is allocated and
+    # scheduled, so arkham may put a flag-clobbering instruction between the
+    # `cmp` and its read and there is no promise it will not. `.assembler` is
+    # where source order is the contract, so that is where flags are legal.
+    lengError c, "`" & IntrinsicNames[tgt.op] & "` is a flag instruction; flags " &
+              "are only legal inside an `{.assembler.}` proc, where no " &
+              "instruction may be inserted between one and its use",
+              lengInfo(c)
+  if row.inoutOperand >= 0:
+    # A two-address row in an ORDINARY proc — no `.assembler` needed, because the
+    # destination is a location the allocator already chose and the operand only
+    # names it. `(haddr d)` is what makes that readable off the node.
+    g.emitInoutInstr2(c, tgt.op, argCurs)
+    return
+  for a in argCurs: g.emitValue2(a)
+  if res.kind != InReg:
+    raiseAssert "arkham x64n: intrinsic result is not in a register"
+  # Bind the destination before writing it, unless it already holds operand 0 of a
+  # tied form (then the binding is the operand's and the copy below is a no-op).
+  let a0 = if argCurs.len > 0: g.ra.locs[cursorToPosition(g.buf[], argCurs[0])]
+           else: default(Location)
+  let aliasesA0 = a0.kind == InReg and a0.r == res.r
+  if res.isTemp and not aliasesA0: g.bindTemp(res.r, res.typ)
+  let inPlace = inPlaceIntrinsicX64(tgt.op)
+  if inPlace and not aliasesA0:
+    if a0.kind == InReg: g.movReg(res.r, a0.r)
+    else: g.place2(a0, res.r)
+  proc srcReg(g: CodeGen; cur: Cursor): Reg =
+    let l = g.ra.locs[cursorToPosition(g.buf[], cur)]
+    if l.kind != InReg:
+      raiseAssert "arkham x64n: intrinsic operand is not in a register"
+    l.r
+  let src0 = if inPlace: res.r else: g.srcReg(argCurs[0])
+  # A rotate's count is an immediate (the row's second operand is `imm8`), so no
+  # `cl` pinning and no clobber of the shift register.
+  var rotCount = 0'i64
+  if tgt.op in {RolOp, RorOp}:
+    let cnt = g.ra.locs[cursorToPosition(g.buf[], argCurs[1])]
+    if cnt.kind != Imm:
+      raiseAssert "arkham x64n: `" & IntrinsicNames[tgt.op] &
+                  "` needs a compile-time rotate count"
+    rotCount = cnt.ival
+  g.emitIntrinsicOps(tgt.op, tgt.argBits, res.r, src0, rotCount)
+
 proc proctypeOfTarget(g: var CodeGen; targetCur: Cursor): Cursor =
   ## The resolved proctype body of an indirect call target, for ABI queries. The target
   ## is just an EXPRESSION whose type IS the proctype — a proc-typed local/param, a
@@ -2807,32 +2993,49 @@ proc emCallerSaveDecl(g: var CodeGen; slotName, varName: string) =
     g.emStackMem(slotName)
     g.ab.sym varName
 
+proc callerSaveSlotFor(g: CodeGen; pos: int; reg: Reg; name: string): string =
+  if name in g.ra.callerSaveParams: paramCallerSaveSlotName(name)
+  else: callerSaveSlotName(pos, reg)
+
 proc emitCall2(g: var CodeGen; c: Cursor) =
-  ## Caller-save wrapper: a cross-call local homed in a caller-saved volatile (R8/R9)
-  ## is spilled around this call inside a `(scope …)` — save before the ABI marshalling
-  ## clobbers the register, restore after. The var's `(var :name (rN) T)` binding
-  ## PERSISTS across the scope (never killed/rebound): the save is a plain copy, the
-  ## marshalling writes the arg register via `(arg pN)` (which nifasm allows even on a
-  ## bound register — only a bare `(rN)` dest is rejected), and the restore reloads via
-  ## the name (the mov re-defines the register, clearing the call's clobber). No
-  ## caller-save vars ⇒ zero overhead, byte-identical to before.
+  ## Caller-save wrapper: a cross-call local/param homed in a caller-saved volatile
+  ## (R8/R9) is spilled around this call — save before ABI marshalling clobbers the
+  ## register, restore after. Locals use a reclaimable `(scope …)` slot; params use a
+  ## permanent prologue slot. No caller-save vars ⇒ zero overhead.
   let saveSet = g.callerSaveSetAt()
   if saveSet.len == 0:
     g.emitCall2Inner(c)
     return
   let pos = cursorToPosition(g.buf[], c)
-  g.ab.tree ScopeX64:
-    for it in saveSet:
-      g.emCallerSaveDecl(callerSaveSlotName(pos, it.reg), it.name)
+  var localSaves: seq[tuple[reg: Reg, name: string]] = @[]
+  var paramSaves: seq[tuple[reg: Reg, name: string]] = @[]
+  for it in saveSet:
+    if it.name in g.ra.callerSaveParams: paramSaves.add it
+    else: localSaves.add it
+  template saveOne(it: tuple[reg: Reg, name: string]; doDecl: bool) =
+    let slot = g.callerSaveSlotFor(pos, it.reg, it.name)
+    if doDecl: g.emCallerSaveDecl(slot, it.name)
+    else:
+      g.ab.tree MovX64: (g.emStackMem(slot); g.ab.sym it.name)
+  template restoreOne(it: tuple[reg: Reg, name: string]; resLoc: Location) =
+    if resLoc.kind == InReg and resLoc.r == it.reg: discard
+    else:
+      g.ab.tree MovX64:
+        g.ab.sym it.name
+        g.emStackMem(g.callerSaveSlotFor(pos, it.reg, it.name))
+  if localSaves.len == 0:
+    for it in paramSaves: saveOne(it, doDecl = false)
     g.emitCall2Inner(c)
     let resLoc = g.ra.locs[pos]
-    for it in saveSet:
-      # `x = f(…, x, …)`: the result already landed in x's home register — reloading the
-      # pre-call value would clobber it. Everything else reloads.
-      if resLoc.kind == InReg and resLoc.r == it.reg: continue
-      g.ab.tree MovX64:                          # (mov name (mem (rsp) slot)) — restore
-        g.ab.sym it.name
-        g.emStackMem(callerSaveSlotName(pos, it.reg))
+    for it in paramSaves: restoreOne(it, resLoc)
+  else:
+    g.ab.tree ScopeX64:
+      for it in paramSaves: saveOne(it, doDecl = false)
+      for it in localSaves: saveOne(it, doDecl = true)
+      g.emitCall2Inner(c)
+      let resLoc = g.ra.locs[pos]
+      for it in localSaves: restoreOne(it, resLoc)
+      for it in paramSaves: restoreOne(it, resLoc)
 
 proc emitDivMod2(g: var CodeGen; c: Cursor) =
   ## Emit x86 `idiv`/`div`: the allocator pinned the dividend to rax and the divisor
@@ -3059,9 +3262,10 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
     of DivC, ModC: g.emitDivMod2(c)
     of EqC, NeqC, LtC, LeC, AndC, OrC, NotC: g.emitCondValue2(c)
     of DerefC, DotC, AtC, PatC: g.emitMemLoad2(c)
-    of AddrC: g.emitAddr2(c)
+    of AddrC, HaddrC: g.emitAddr2(c)
     of CastC, ConvC: g.emitCast2(c)
     of CallC: g.emitCall2(c)
+    of InstrC: g.emitInstr2(c)
     of NegC, BitnotC:                                   # unary in-place: operand in res, then op
       var inner: Cursor
       block:
@@ -5060,6 +5264,7 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
     g.exitScope()
   of VarS, ConstS: g.genVarDecl2(c)    # a local const = an immutable var with a literal init
   of CallS: g.emitCall2(c)
+  of InstrS: g.emitInstr2(c)
   of BreakS:
     assert g.loopEnds.len > 0, "arkham x64n: `break` outside a loop"
     g.emJmp(g.loopEnds[^1])
@@ -5299,6 +5504,11 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo) =
           g.movReg(g.indirectReg, g.md.intArgRegs[0])
       g.emitParamMoves(info.decl)
       g.emitStackParamLoadsX64(info.decl)               # via stackArgBaseReg, regs now free
+      for name in g.ra.callerSaveParams:
+        if g.symType.hasKey(name) and isPtrType(resolveType(g.prog, g.symType[name])):
+          g.emTypedStackVar(paramCallerSaveSlotName(name), g.symType[name])
+        else:
+          g.emScalarStackVar(paramCallerSaveSlotName(name))
       if info.isEntry and g.hasGlobalInits:              # run runtime global inits at startup
         g.ab.tree PrepareX64:
           g.ab.sym g.globalInitSym
@@ -5361,10 +5571,667 @@ proc recordSymTypes(g: var CodeGen; c: Cursor) =
         g.recordSymTypes(cc)
         skip cc
 
+# ── `.assembler` procs: transliteration, not compilation ────────────────────
+# doc/intrinsics.md §8. Everything below deliberately bypasses `allocateProc` and
+# the whole value core: in an `.assembler` body every location is DECLARED, so
+# there is nothing to allocate, and every construct must map one-to-one to an
+# instruction, so there is nothing to lower. What is left is a checker plus a
+# literal transcription — and arkham is the only checker there is (nimony's sem
+# just forwards the pragmas), so each rejection below is a user-facing error with
+# the offending node's own file/line/col, not a `raiseAssert`.
+
+proc x64RegByName(name: string): Reg =
+  ## `"rdi"` → `RDI`. The inverse of `x64RegName`, over the 16 GPRs; `NoReg` for
+  ## anything else (including `rsp`/`rbp`, which the frame owns — see `asmPinReg`).
+  result = NoReg
+  for r in [R0, R1, R2, R3, R4, R5, R6, R7, R8, R9, R10, R11, R12, R13, R14, R15]:
+    if x64RegName(r) == name: return r
+
+proc asmPinReg(g: var CodeGen; at: Cursor; name: string): Reg =
+  ## Resolve a `.register: "…"` spelling to a register, rejecting the ones the
+  ## proc's own frame owns: `rsp`/`rbp` move under the prologue's pushes, so a
+  ## value pinned there would be silently destroyed.
+  result = x64RegByName(name)
+  if result == NoReg:
+    lengError at, "`" & name & "` is not an x86-64 general-purpose register", g.asmInfo
+  if result in {RSP, RBP}:
+    lengError at, "`" & name & "` is reserved for the stack frame and cannot hold a value",
+              g.asmInfo
+
+type
+  AsmDeclKind = enum
+    aslNone,       ## no location pragma at all
+    aslReg,        ## `{.register: "rax".}`
+    aslStack       ## `{.stack.}`
+  AsmDeclLoc = object
+    ## Where a `.assembler` param/local was DECLARED to live.
+    kind: AsmDeclKind
+    r: Reg
+
+proc asmDeclLoc(g: var CodeGen; prag: Cursor): AsmDeclLoc =
+  ## Read `(pragmas (register "rax"))` / `(pragmas (stack))` off a param or local.
+  result = AsmDeclLoc(kind: aslNone, r: NoReg)
+  if prag.substructureKind != PragmasU: return
+  var p = prag
+  p.into:
+    while p.hasMore:
+      case p.pragmaKind
+      of RegisterP:
+        let at = p
+        var nm = ""
+        p.into:
+          if p.hasMore and p.kind == StrLit: (nm = strVal(p); inc p)
+          while p.hasMore: skip p
+        result = AsmDeclLoc(kind: aslReg, r: g.asmPinReg(at, nm))
+      of StackP:
+        result = AsmDeclLoc(kind: aslStack, r: NoReg)
+        skip p
+      else: skip p
+
+proc isResultName(nm: string): bool {.inline.} =
+  ## Nimony names a routine's implicit result `result.<n>[.<module>]`. It is the one
+  ## local a user cannot annotate — `result` is not a declaration they write — so
+  ## `.assembler` pins it to the ABI return register instead of demanding a pragma.
+  nm.startsWith("result.")
+
+proc x64FlagOf(op: IntrinsicOp): X64Flag =
+  ## The nifasm condition tag a flag-read row denotes. `(ite (zf) …)` already
+  ## exists in the assembler with all ten x86 conditions, so a flag intrinsic is
+  ## a rename, not a new mechanism — the row says which bit and which polarity,
+  ## and this is the one place the two vocabularies meet.
+  case op
+  of ZfOp: ZfO
+  of NotZfOp: NzO
+  of CfOp: CfO
+  of NotCfOp: NcO
+  of SfOp: SfO
+  of NotSfOp: NsO
+  of OfOp: OfO
+  of NotOfOp: NoO
+  of PfOp: PfO
+  of NotPfOp: NpO
+  else: NoFlag
+
+proc instrOpAt(g: var CodeGen; c: Cursor): IntrinsicOp =
+  ## The row an `(instr SYM …)` node names, or `NoIntrinsicOp` if `c` is not one.
+  result = NoIntrinsicOp
+  if c.kind != TagLit or c.exprKind != InstrC: return
+  var fc = c
+  var sym = ""
+  fc.into:
+    sym = symName(fc); skip fc
+    while fc.hasMore: skip fc
+  result = instrTargetOf(g.prog, sym).op
+
+proc asmNoteInfo(g: var CodeGen; c: Cursor) {.inline.} =
+  ## Remember the innermost node that carried line info, so a rejection deeper in
+  ## (NIF line info is sparse) still points at the right statement.
+  let li = lengInfo(c)
+  if li.len > 0: g.asmInfo = li
+
+proc asmRegOf(g: var CodeGen; c: Cursor): Reg =
+  ## The register an operand names. `.assembler` operands must be ATOMS, so this is
+  ## a table lookup and nothing else — no evaluation, no materialization.
+  if c.kind != Symbol:
+    lengError c, "an `.assembler` operand must be a variable or a literal, not " &
+              "a computed expression", g.asmInfo
+  let nm = symName(c)
+  if nm in g.asmStack:
+    lengError c, "`" & userName(nm) & "` lives on the stack; this operand needs a register",
+              g.asmInfo
+  if not g.asmReg.hasKey(nm):
+    lengError c, "`" & userName(nm) & "` has no declared location — every local in an " &
+              "`.assembler` proc needs `{.register: \"…\".}` or `{.stack.}`", g.asmInfo
+  result = g.asmReg[nm]
+
+proc asmScanLocs(g: var CodeGen; c: Cursor; used: var set[Reg]; anyStack: var bool) =
+  ## Pre-pass over the body: which registers the locals pin (so the prologue knows
+  ## which callee-saved ones to push) and whether any `(s)` slot exists (so the
+  ## prologue reserves the `(ssize)` region the epilogue releases). Both facts are
+  ## needed BEFORE the first statement is emitted, and both are pure declaration
+  ## reading — no evaluation is involved.
+  if c.kind != TagLit: return
+  if c.stmtKind == VarS:
+    var cc = c
+    cc.into:
+      inc cc                                     # name
+      let loc = g.asmDeclLoc(cc)
+      case loc.kind
+      of aslReg: used.incl loc.r
+      of aslStack: anyStack = true
+      of aslNone: discard
+      while cc.hasMore: skip cc
+    return
+  if c.stmtKind in {ProcS, TypeS}: return
+  var cc = c
+  cc.into:
+    while cc.hasMore: (g.asmScanLocs(cc, used, anyStack); skip cc)
+
+proc asmStmt(g: var CodeGen; c: Cursor)
+proc asmInstr(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor)
+
+proc isAsmStackSym(g: CodeGen; c: Cursor): bool {.inline.} =
+  c.kind == Symbol and symName(c) in g.asmStack
+
+proc asmAtom(c: Cursor): Cursor =
+  ## Peel the type-only wrappers the front end puts around a literal: `result = 100`
+  ## in a `uint64` context arrives as `(conv (u 64) 100)`. A conversion of a
+  ## CONSTANT is a fact about the constant — the assembler encodes the immediate
+  ## at the operand's width and no instruction exists to emit — so folding it is
+  ## what "one-to-one" means here. A `conv` of a *value* is a real sign/zero
+  ## extension and is left alone, so it still reaches the rejection below.
+  result = c
+  while result.kind == TagLit and result.exprKind in {ConvC, CastC}:
+    var inner = result
+    var got = result
+    var count = 0
+    inner.into:
+      skip inner                                 # the target type
+      while inner.hasMore:
+        if count == 0: got = inner
+        inc count
+        skip inner
+    if count != 1 or got.kind notin {IntLit, UIntLit, CharLit}: return
+    result = got
+
+proc asmOperand(g: var CodeGen; cur: Cursor) =
+  ## One source operand of a flag-defining instruction: a register local, a stack
+  ## slot, or a literal. Unlike `asmRegOf` this permits memory and immediates,
+  ## because `cmp`/`test` take them directly — no materialisation involved.
+  let c = asmAtom(cur)
+  case c.kind
+  of Symbol:
+    if g.isAsmStackSym(c): g.emStackMem(symName(c))
+    else: g.emReg g.asmRegOf(c)
+  of IntLit: g.ab.intLit intVal(c)
+  of UIntLit: g.ab.intLit cast[int64](uintVal(c))
+  else:
+    lengError c, "an `.assembler` operand must be a variable or a literal", g.asmInfo
+
+proc asmInoutDest(g: var CodeGen; c: Cursor) =
+  ## Emit the destination of a two-address row. The operand arrives as
+  ## `(haddr d)` — the compiler binding d's LOCATION for a `var` parameter, not
+  ## the user taking a pointer (see nimony/doc/tags.md). So it resolves to d's
+  ## DECLARED home and nothing is materialised: that tag is the whole reason this
+  ## needs no "an `addr` here means something else" rule.
+  if c.kind != TagLit or c.exprKind != HaddrC:
+    lengError c, "the destination of a two-address instruction must be a `var` " &
+              "argument naming a local", g.asmInfo
+  var inner = c
+  var sym = c
+  inner.into:
+    sym = inner; skip inner
+    while inner.hasMore: skip inner
+  if sym.kind != Symbol:
+    lengError sym, "the destination of a two-address instruction must be a local " &
+              "with a declared location", g.asmInfo
+  let nm = symName(sym)
+  if nm in g.asmStack: g.emStackMem(nm)
+  else: g.emReg g.asmRegOf(sym)
+
+proc asmInoutInstr(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
+  ## `add(d, s)` / `neg(d)` — a row that writes THROUGH operand 0 and returns
+  ## nothing. Statement-only, since there is no value to bind.
+  var argCurs: seq[Cursor] = @[]
+  var fc = c
+  fc.into:
+    skip fc                                      # the callee symbol
+    while fc.hasMore: (argCurs.add asmAtom(fc); skip fc)
+  let row = IntrinsicRows[op]
+  if argCurs.len != row.arity:
+    lengError c, "`" & IntrinsicNames[op] & "` takes " & $row.arity & " operand(s)",
+              g.asmInfo
+  let tag = x64InoutTag(op)
+  if tag == NopX64:
+    lengError c, "`" & IntrinsicNames[op] & "` has no x86-64 two-address form",
+              g.asmInfo
+  if row.arity == 1:
+    g.ab.tree tag: g.asmInoutDest(argCurs[0])
+  else:
+    if g.isAsmStackSym(argCurs[1]) and
+       argCurs[0].kind == TagLit and argCurs[0].exprKind == HaddrC:
+      # `(add [mem], [mem])` does not exist. Only flagged when BOTH are memory;
+      # a memory destination with a register or immediate source is fine.
+      var d = argCurs[0]; inc d
+      if d.kind == Symbol and symName(d) in g.asmStack:
+        lengError c, "`" & IntrinsicNames[op] & "` cannot take two memory operands",
+                  g.asmInfo
+    g.ab.tree tag: (g.asmInoutDest(argCurs[0]); g.asmOperand(argCurs[1]))
+
+proc asmFlagInstr(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
+  ## `cmp(a, b)` / `test(a, b)` — an instruction whose entire output is flags.
+  ## It is a statement, never a value: there is nothing to bind.
+  var argCurs: seq[Cursor] = @[]
+  var fc = c
+  fc.into:
+    skip fc                                      # the callee symbol
+    while fc.hasMore: (argCurs.add asmAtom(fc); skip fc)
+  if argCurs.len != 2:
+    lengError c, "`" & IntrinsicNames[op] & "` takes two operands", g.asmInfo
+  if g.isAsmStackSym(argCurs[0]) and g.isAsmStackSym(argCurs[1]):
+    lengError c, "`" & IntrinsicNames[op] & "` cannot take two memory operands",
+              g.asmInfo
+  let tag = if op == CmpOp: CmpX64 else: TestX64
+  g.ab.tree tag: (g.asmOperand(argCurs[0]); g.asmOperand(argCurs[1]))
+
+proc asmAsgn(g: var CodeGen; c: Cursor) =
+  ## `(asgn dest src)` — the only shape that produces a value. `dest` is an atom
+  ## with a declared home; `src` is an atom, a literal, or ONE `(instr …)`.
+  var cc = c
+  cc.into:
+    let destC = cc
+    skip cc
+    let srcC = asmAtom(cc)
+    # A `{.stack.}` local is a memory operand, so a move touching one is `mov
+    # [slot], reg` / `mov reg, [slot]`. Memory on BOTH sides would take a scratch
+    # register no one declared — the one thing `.assembler` will not invent.
+    if g.isAsmStackSym(destC):
+      if g.isAsmStackSym(srcC):
+        lengError srcC, "a memory-to-memory move needs a scratch register; " &
+                  "assign through a `{.register: \"…\".}` local", g.asmInfo
+      let nm = symName(destC)
+      case srcC.kind
+      of Symbol:
+        g.ab.tree MovX64: (g.emStackMem(nm); g.emReg g.asmRegOf(srcC))
+      of IntLit:
+        g.ab.tree MovX64: (g.emStackMem(nm); g.ab.intLit intVal(srcC))
+      of UIntLit:
+        g.ab.tree MovX64: (g.emStackMem(nm); g.ab.intLit cast[int64](uintVal(srcC)))
+      else:
+        lengError srcC, "a `{.stack.}` local can only be assigned a variable or a literal",
+                  g.asmInfo
+      skip cc
+      while cc.hasMore: skip cc
+      return
+    let dst = g.asmRegOf(destC)
+    case srcC.kind
+    of Symbol:
+      if g.isAsmStackSym(srcC):
+        g.ab.tree MovX64: (g.emReg dst; g.emStackMem(symName(srcC)))
+      else:
+        g.movReg(dst, g.asmRegOf(srcC))
+    of IntLit:
+      g.movImm(dst, intVal(srcC))
+    of UIntLit:
+      g.movImm(dst, cast[int64](uintVal(srcC)))
+    of TagLit:
+      if srcC.exprKind != InstrC:
+        lengError srcC, "an `.assembler` statement must be one instruction; `" &
+                  $srcC.exprKind & "` would need temporaries", g.asmInfo
+      g.asmInstr(destC, dst, srcC)
+    else:
+      lengError srcC, "unsupported `.assembler` operand", g.asmInfo
+    skip cc
+    while cc.hasMore: skip cc
+
+proc asmInstr(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor) =
+  ## `(instr SYM X*)` in an `.assembler` body: the operands are already where the
+  ## user put them, so this is the row's opcode over `dst` and the operand
+  ## registers — the same `emitIntrinsicOps` the allocated path ends in.
+  var fsym = ""
+  var argCurs: seq[Cursor] = @[]
+  var fc = c
+  fc.into:
+    fsym = symName(fc); skip fc
+    while fc.hasMore: (argCurs.add asmAtom(fc); skip fc)
+  let tgt = instrTargetOf(g.prog, fsym)
+  let row = IntrinsicRows[tgt.op]
+  if tgX64 notin row.targets:
+    lengError c, "`" & IntrinsicNames[tgt.op] & "` has no x86-64 lowering; an " &
+              "`.assembler` proc has no fallback path", g.asmInfo
+  if row.isFlagRead:
+    # The rule of §6, at its one enforcement point: a flag has no register behind
+    # it, and `setcc` — the instruction that would give it one — reads the same
+    # bit that everything emitted in between may already have destroyed.
+    lengError c, "`" & IntrinsicNames[tgt.op] & "()` is a flag, not a value; " &
+              "it can only be an `if` condition", g.asmInfo
+  if row.isFlagWrite:
+    lengError c, "`" & IntrinsicNames[tgt.op] & "` produces no value, only flags; " &
+              "use it as a statement", g.asmInfo
+  if row.inoutOperand >= 0:
+    lengError c, "`" & IntrinsicNames[tgt.op] & "` writes through its first " &
+              "operand and returns nothing; use it as a statement", g.asmInfo
+  if argCurs.len == 0:
+    lengError c, "`" & IntrinsicNames[tgt.op] & "` takes no operands here", g.asmInfo
+  var rotCount = 0'i64
+  if tgt.op in {RolOp, RorOp}:
+    if argCurs.len < 2 or argCurs[1].kind notin {IntLit, UIntLit}:
+      lengError c, "`" & IntrinsicNames[tgt.op] & "` needs a literal rotate count",
+                g.asmInfo
+    rotCount = (if argCurs[1].kind == IntLit: intVal(argCurs[1])
+                else: cast[int64](uintVal(argCurs[1])))
+  # An in-place form reads and writes one register, so the destination must be
+  # seeded with operand 0 first. Outside `.assembler` the allocator arranges the
+  # tie; here the user did, and if they did not the seeding `mov` is the honest
+  # transliteration of what they wrote.
+  let src0 = if inPlaceIntrinsicX64(tgt.op): dst else: g.asmRegOf(argCurs[0])
+  if inPlaceIntrinsicX64(tgt.op):
+    g.movReg(dst, g.asmRegOf(argCurs[0]))
+  g.emitIntrinsicOps(tgt.op, tgt.argBits, dst, src0, rotCount)
+
+proc asmVarDecl(g: var CodeGen; c: Cursor) =
+  ## `(var :nm (pragmas (register "rax")) T init?)` — a DECLARATION of a location,
+  ## not an allocation request. Several locals may name the same register (the user
+  ## pinned them together); only the first declares a nifasm binding.
+  var cc = c
+  cc.into:
+    let nameC = cc
+    let nm = symName(cc); inc cc
+    let loc = g.asmDeclLoc(cc)
+    skip cc                                      # pragmas
+    let typeCur = cc
+    skip cc                                      # type
+    let hasInit = cc.hasMore and cc.kind != DotToken
+    let initC = asmAtom(cc)
+    case loc.kind
+    of aslReg:
+      g.asmReg[nm] = loc.r
+      # The signature already bound the ABI registers (`p0.0`, `ret.0`); pinning a
+      # local onto one of those is legal — it is the same machine register under a
+      # second source name — but must not redeclare the binding.
+      if not g.regLocal.hasKey(loc.r):
+        g.emRegLocalVar(nm, loc.r, typeCur)
+    of aslStack:
+      g.asmStack.incl nm
+      g.emTypedStackVar(nm, typeCur)
+    of aslNone:
+      if isResultName(nm):
+        # The result is pinned to the ABI return register, derived rather than
+        # annotated: Nimony has no syntax for annotating `result`, and the ABI
+        # leaves no choice anyway.
+        g.asmReg[nm] = g.md.intRetReg
+      else:
+        lengError nameC, "`" & userName(nm) & "` needs `{.register: \"…\".}` or `{.stack.}` — an " &
+                  "`.assembler` proc declares every location", g.asmInfo
+    if hasInit:
+      # `var r {.register: "rax".} = x` is an assignment like any other.
+      if loc.kind == aslStack:
+        case initC.kind
+        of Symbol:
+          if g.isAsmStackSym(initC):
+            lengError initC, "a memory-to-memory move needs a scratch register; " &
+                      "assign through a `{.register: \"…\".}` local", g.asmInfo
+          g.ab.tree MovX64: (g.emStackMem(nm); g.emReg g.asmRegOf(initC))
+        of IntLit:
+          g.ab.tree MovX64: (g.emStackMem(nm); g.ab.intLit intVal(initC))
+        of UIntLit:
+          g.ab.tree MovX64: (g.emStackMem(nm); g.ab.intLit cast[int64](uintVal(initC)))
+        else:
+          lengError initC, "a `{.stack.}` local can only be initialized with a " &
+                    "variable or a literal", g.asmInfo
+      else:
+        case initC.kind
+        of Symbol:
+          if g.isAsmStackSym(initC):
+            g.ab.tree MovX64: (g.emReg g.asmReg[nm]; g.emStackMem(symName(initC)))
+          else:
+            g.movReg(g.asmReg[nm], g.asmRegOf(initC))
+        of IntLit: g.movImm(g.asmReg[nm], intVal(initC))
+        of UIntLit: g.movImm(g.asmReg[nm], cast[int64](uintVal(initC)))
+        of TagLit:
+          if initC.exprKind != InstrC:
+            lengError initC, "an `.assembler` initializer must be one instruction or an atom",
+                      g.asmInfo
+          g.asmInstr(nameC, g.asmReg[nm], initC)
+        else:
+          lengError initC, "unsupported `.assembler` initializer", g.asmInfo
+      skip cc
+    while cc.hasMore: skip cc
+
+proc asmStmt(g: var CodeGen; c: Cursor) =
+  if c.kind == DotToken: return
+  g.asmNoteInfo(c)
+  # Tail position, tracked exactly as `genStmt2` does: only the LAST statement of
+  # a straight-line `stmts`/`scope` inherits it. A `ret` there falls through to the
+  # epilogue instead of jumping to it — in a mode whose premise is one-to-one, a
+  # `jmp` to the very next label is an instruction the user did not write.
+  let myTail = g.tailStmt
+  g.tailStmt = false
+  case c.stmtKind
+  of StmtsS:
+    var cc = c
+    cc.into:
+      while cc.hasMore:
+        var nx = cc; skip nx
+        g.tailStmt = myTail and not nx.hasMore
+        g.asmStmt(cc); skip cc
+  of ScopeS:
+    g.enterScope()
+    var cc = c
+    cc.into:
+      while cc.hasMore:
+        var nx = cc; skip nx
+        g.tailStmt = myTail and not nx.hasMore
+        g.asmStmt(cc); skip cc
+    g.exitScope()
+  of VarS: g.asmVarDecl(c)
+  of AsgnS: g.asmAsgn(c)
+  of InstrS:
+    # An instruction in statement position produces no value, so the rows that
+    # belong here are the two that have no result: one that writes through an
+    # `inout` operand, and one whose whole output is the flags.
+    let op = g.instrOpAt(c)
+    if op != NoIntrinsicOp and IntrinsicRows[op].inoutOperand >= 0:
+      g.asmInoutInstr(c, op)
+    elif op != NoIntrinsicOp and IntrinsicRows[op].isFlagWrite:
+      g.asmFlagInstr(c, op)
+    else:
+      lengError c, "an instruction used as a statement must have a destination",
+                g.asmInfo
+  of WhileS:
+    # `while true` only. A conditional loop would need the condition evaluated into
+    # flags, which is §6's flag intrinsics — not yet available, so it is rejected
+    # rather than silently compiled through the ordinary (allocating) path.
+    var cc = c
+    cc.into:
+      let condC = cc
+      if not (condC.kind == TagLit and condC.exprKind == TrueC):
+        lengError condC, "an `.assembler` loop must be `while true`; use `break` to leave it",
+                  g.asmInfo
+      skip cc
+      let lEnd = g.freshLabel()
+      g.loopEnds.add lEnd
+      g.emitLoop:
+        while cc.hasMore: (g.asmStmt(cc); skip cc)
+      g.emLab(lEnd)
+      discard g.loopEnds.pop()
+  of IfS:
+    # `if <flag>(): … else: …` → nifasm's `(ite (zf) then else)`, which already
+    # exists with all ten x86 conditions. A flag is the ONLY condition allowed:
+    # anything else would have to be computed into a register first, and the
+    # instruction that computed it would clobber the very bit an enclosing flag
+    # test might be reading. `elif` is a nested `if` on the machine, and writing
+    # it that way keeps every `(ite …)` one flag test.
+    var cc = c
+    var branches = 0
+    cc.into:
+      while cc.hasMore:
+        case cc.substructureKind
+        of ElifU:
+          inc branches
+          if branches > 1:
+            lengError cc, "an `.assembler` `if` takes one condition; write a " &
+                      "nested `if` for the next flag test", g.asmInfo
+          var bc = cc
+          bc.into:
+            let condC = bc
+            let op = g.instrOpAt(condC)
+            if op == NoIntrinsicOp or not IntrinsicRows[op].isFlagRead:
+              lengError condC, "an `.assembler` condition must be a flag " &
+                        "intrinsic such as `zf()`; any other condition would " &
+                        "need an instruction that clobbers the flags", g.asmInfo
+            let flag = x64FlagOf(op)
+            if flag == NoFlag:
+              lengError condC, "`" & IntrinsicNames[op] &
+                        "` has no x86-64 condition code", g.asmInfo
+            skip bc
+            # `(ite cond then else)`: nifasm reads exactly two statements, so an
+            # `if` with no `else` gets an empty one.
+            var peek = cc; skip peek
+            let hasElse = peek.hasMore and peek.substructureKind == ElseU
+            g.ab.tree IteX64:
+              g.ab.keyword flag
+              g.ab.tree StmtsX64:
+                g.enterScope()
+                while bc.hasMore: (g.asmStmt(bc); skip bc)
+                g.exitScope()
+              g.ab.tree StmtsX64:
+                if hasElse:
+                  var ec = peek
+                  ec.into:
+                    g.enterScope()
+                    while ec.hasMore: (g.asmStmt(ec); skip ec)
+                    g.exitScope()
+        of ElseU:
+          discard                                # emitted inside the `elif` above
+        else:
+          lengError cc, "unsupported `if` shape in an `.assembler` proc", g.asmInfo
+        skip cc
+  of BreakS:
+    if g.loopEnds.len == 0:
+      lengError c, "`break` outside a loop", g.asmInfo
+    g.emJmp(g.loopEnds[^1])
+  of LabS:
+    var cc = c
+    cc.into:
+      g.emLab(symName(cc)); skip cc
+      while cc.hasMore: skip cc
+  of JmpS:
+    var cc = c
+    cc.into:
+      g.emJmp(symName(cc)); skip cc
+      while cc.hasMore: skip cc
+  of RetS:
+    var cc = c
+    cc.into:
+      if cc.hasMore and cc.kind != DotToken:
+        if g.isAsmStackSym(cc):
+          g.ab.tree MovX64: (g.emReg g.md.intRetReg; g.emStackMem(symName(cc)))
+        else:
+          g.movReg(g.md.intRetReg, g.asmRegOf(cc))  # a no-op when already pinned there
+        skip cc
+      while cc.hasMore: skip cc
+    if not myTail:
+      g.retLabelUsed2 = true
+      g.emJmp(g.retLabel2)
+  else:
+    lengError c, "`" & $c.stmtKind & "` is not allowed in an `.assembler` proc", g.asmInfo
+
+proc genAsmProc(g: var CodeGen; info: ProcInfo) =
+  ## Emit an `.assembler` proc: no allocator, no analyser, no value core. The
+  ## signature is the ordinary declarative one (that is what lets ordinary Nimony
+  ## call it), and the `.register` annotations on the parameters are checked
+  ## AGAINST it — in an `.assembler` proc a location constraint is an assertion,
+  ## not a request.
+  g.varType.clear(); g.symType.clear()
+  g.regLocal.clear(); g.aliasToDecl.clear(); g.boundTemps = {}
+  g.fregLocal.clear(); g.boundFTmps = {}
+  g.scopeLocals = @[]; g.scopeFLocals = @[]
+  g.asmReg.clear(); g.asmStack.clear()
+  g.asmInfo = lengInfo(info.decl)
+  g.loopEnds = @[]
+  g.retAggrName = ""; g.retIndirect = false; g.retIsFloat = false
+  g.indirectReg = NoReg
+  g.isEntryProc = info.isEntry
+  g.regMirror.clear(); g.labelIn.clear(); g.mirrorLive = true
+  g.ra = RegAlloc()
+  if info.isEntry:
+    lengError info.decl, "the program entry point cannot be an `.assembler` proc", g.asmInfo
+  if not isDeclarativeAbi(g.prog, info.decl):
+    lengError info.decl, "an `.assembler` proc's parameters and result must be " &
+              "integers or pointers (float and small-aggregate boundaries are not " &
+              "modelled in the typed signature yet)", g.asmInfo
+  # Parameters: bind each ABI register to the signature's `pN.0` (as the allocated
+  # path does) and map the param's own Leng name onto the same register, so the
+  # body may spell it either way and `emReg` renders the one nifasm knows.
+  var used: set[Reg] = {}
+  block:
+    var pc = info.decl
+    inc pc; inc pc                               # head → name → params
+    var ord = 0
+    if pc.kind == TagLit:
+      pc.into:
+        while pc.hasMore:
+          var nameC = pc
+          pc.into:                               # (param :nm pragmas type)
+            nameC = pc
+            let nm = symName(pc); inc pc
+            let loc = g.asmDeclLoc(pc)
+            skip pc                              # pragmas
+            g.symType[nm] = pc
+            if ord >= g.md.intArgRegs.len:
+              lengError nameC, "an `.assembler` proc takes at most " &
+                        $g.md.intArgRegs.len & " parameters (the 7th and beyond " &
+                        "arrive on the stack)", g.asmInfo
+            let abiReg = g.md.intArgRegs[ord]
+            case loc.kind
+            of aslNone:
+              lengError nameC, "parameter `" & userName(nm) & "` needs `{.register: \"" &
+                        x64RegName(abiReg) & "\".}` — an `.assembler` proc's " &
+                        "annotations ARE its ABI", g.asmInfo
+            of aslStack:
+              lengError nameC, "parameter `" & userName(nm) & "` arrives in " &
+                        x64RegName(abiReg) & ", so it cannot be `{.stack.}`", g.asmInfo
+            of aslReg:
+              if loc.r != abiReg:
+                lengError nameC, "parameter `" & userName(nm) & "` is passed in " &
+                          x64RegName(abiReg) & " by the C ABI, but is pinned to " &
+                          x64RegName(loc.r), g.asmInfo
+            g.asmReg[nm] = abiReg
+            g.regLocal[abiReg] = paramName(ord)
+            used.incl abiReg
+            while pc.hasMore: skip pc
+          inc ord
+  # The result register. The signature's `(result :ret.0 (rax) …)` is the CALLER's
+  # view; inside the proc rax stays an ordinary register the body may pin a local
+  # onto — exactly what the allocated path does when it writes the result.
+  block:
+    var rc = info.decl
+    inc rc; inc rc; skip rc                      # → return type
+    if not (rc.kind == DotToken or (rc.kind == TagLit and rc.typeKind == VoidT)):
+      used.incl g.md.intRetReg
+  var anyStack = false
+  block:                                         # scan the BODY (`asmScanLocs` stops at a `proc`)
+    var bc = info.decl
+    bc.into:
+      inc bc; skip bc; skip bc; skip bc          # name, params, ret, pragmas
+      if bc.stmtKind == StmtsS: g.asmScanLocs(bc, used, anyStack)
+      while bc.hasMore: skip bc
+  g.ra.usedCallee = used * g.md.intCalleeSavedSet
+  g.ra.hasStackVars = anyStack
+  g.computeFrameX64(isEntry = false, hasCall = false, hasStackParams = false)
+  g.ab.tree ProcD:
+    g.ab.symDef info.asmName
+    g.emitSignature(info.decl)
+    g.ab.tree StmtsX64:
+      g.enterScope()
+      g.framePush()
+      if g.framePad > 0: g.binImm(SubX64, RSP, g.framePad.int64)
+      if g.ra.hasStackVars:
+        g.ab.tree SubX64: (g.ab.reg RSP; g.ab.keyword SsizeX)
+      g.retLabel2 = g.freshLabel()
+      g.retLabelUsed2 = false
+      var c = info.decl
+      c.into:
+        inc c; skip c; skip c; skip c            # name, params, ret, pragmas
+        g.tailStmt = true                        # the whole body is in tail position
+        if c.stmtKind == StmtsS: g.asmStmt(c)
+        while c.hasMore: skip c
+      # The label FIRST, then the scope kills: every `ret` jumps here, so the kills
+      # belong on the path that actually reaches the epilogue (emitting them before
+      # the label would leave them stranded after the body's final `jmp`).
+      if g.retLabelUsed2: g.emLab(g.retLabel2)
+      g.exitScope()
+      g.framePop()
+      g.ab.keyword RetX64
+
 # MODEL: the `StartEmit` per-proc reset in proofs/arkham_bindings.tla. Every per-proc
 # table (regLocal/boundTemps + the ra.locs snapshot) must be reset here or
 # RegisterBindingsMatchLoc breaks.
 proc genProc(g: var CodeGen; info: ProcInfo) =
+  if info.isAsm:
+    g.genAsmProc(info)
+    return
   # Unlike A64 (where a thread-local goes through a TLV-descriptor thunk call), x64
   # reads/writes a tvar directly as an FS-segment operand — no call — so tvar
   # accesses must NOT mark the proc non-leaf. Hence the empty tvar set here.
@@ -5444,7 +6311,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     g.ra.usedCallee.incl RBX                   # saved/restored like any callee reg
   # The entry injects a `call` to the synthetic global-init proc, so it makes a call
   # even when its own body does not — keep rsp 16-aligned for that call.
-  g.computeFrameX64(info.isEntry, an.hasCall or (info.isEntry and g.hasGlobalInits),
+  g.computeFrameX64(info.isEntry, an.hasRealCall or (info.isEntry and g.hasGlobalInits),
                     g.ra.hasStackParams)   # allocator's decision (it reserved the base reg)
   # Pure-emit path: the allocator already assigned every value position; emit once.
   g.ab.planning = false

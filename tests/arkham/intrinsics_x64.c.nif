@@ -1,0 +1,109 @@
+(.nif27)
+(.indexat 1023             )
+(stmts
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :bsf64.0
+  (params
+   (param :x.0 .
+    (u 64)))
+  (u 64)
+  (pragmas
+   (instruction bsf))
+  (stmts .))
+ (proc :bsr64.0
+  (params
+   (param :x.0 .
+    (u 64)))
+  (u 64)
+  (pragmas
+   (instruction bsr))
+  (stmts .))
+ (proc :popcnt64.0
+  (params
+   (param :x.0 .
+    (u 64)))
+  (u 64)
+  (pragmas
+   (instruction popcnt))
+  (stmts .))
+ (proc :bswap64.0
+  (params
+   (param :x.0 .
+    (u 64)))
+  (u 64)
+  (pragmas
+   (instruction bswap))
+  (stmts .))
+ (proc :rol64.0
+  (params
+   (param :x.0 .
+    (u 64))
+   (param :n.0 .
+    (u 64)))
+  (u 64)
+  (pragmas
+   (instruction rol))
+  (stmts .))
+ (proc :ror64.0
+  (params
+   (param :x.0 .
+    (u 64))
+   (param :n.0 .
+    (u 64)))
+  (u 64)
+  (pragmas
+   (instruction ror))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :a.0 .
+    (u 64)
+    (instr bsf64.0 65536))
+   (var :b.0 .
+    (u 64)
+    (instr bsr64.0 65536))
+   (var :c.0 .
+    (u 64)
+    (instr popcnt64.0 255))
+   (var :d.0 .
+    (u 64)
+    (instr bswap64.0 72057594037927936))
+   (var :e.0 .
+    (u 64)
+    (instr rol64.0 1 3))
+   (var :f.0 .
+    (u 64)
+    (instr ror64.0 8 3))
+   (var :s1.0 .
+    (u 64)
+    (add
+     (u 64)a.0 b.0))
+   (var :s2.0 .
+    (u 64)
+    (add
+     (u 64)s1.0 c.0))
+   (var :s3.0 .
+    (u 64)
+    (add
+     (u 64)s2.0 d.0))
+   (var :s4.0 .
+    (u 64)
+    (add
+     (u 64)s3.0 e.0))
+   (var :s5.0 .
+    (u 64)
+    (add
+     (u 64)s4.0 f.0))
+   (call exit.c
+    (conv
+     (i 32)s5.0)))))(.index)

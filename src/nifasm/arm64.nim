@@ -349,6 +349,30 @@ proc emitNeg*(dest: var Bytes; rd, rm: Register) =
               encodeReg(rd)
   dest.addUint32(instr)
 
+# Data-processing (1 source): CLZ / RBIT / REV. All share the
+# `sf 1 0 11010110 00000 000ooo Rn Rd` shape and differ only in the opcode field.
+#   RBIT Xd, Xn : 1101 1010 1100 0000 0000 00nn nnnd dddd  (0xDAC00000)
+#   REV  Xd, Xn : ... 0000 11..                            (0xDAC00C00)
+#   CLZ  Xd, Xn : ... 0001 00..                            (0xDAC01000)
+# The W-form clears the sf bit; REV's W-form is `REV32`-shaped (opcode 0b000010),
+# so it is encoded separately rather than by clearing sf alone.
+proc emitRbit*(dest: var Bytes; rd, rn: Register; w = false) =
+  var instr = 0xDAC00000'u32 or (encodeReg(rn) shl 5) or encodeReg(rd)
+  if w: instr = instr and not SfBit
+  dest.addUint32(instr)
+
+proc emitClz*(dest: var Bytes; rd, rn: Register; w = false) =
+  var instr = 0xDAC01000'u32 or (encodeReg(rn) shl 5) or encodeReg(rd)
+  if w: instr = instr and not SfBit
+  dest.addUint32(instr)
+
+proc emitRev*(dest: var Bytes; rd, rn: Register; w = false) =
+  ## REV Xd, Xn (64-bit, opcode 0b000011) or REV Wd, Wn (32-bit, opcode 0b000010).
+  let instr =
+    if w: (0x5AC00800'u32 or (encodeReg(rn) shl 5) or encodeReg(rd))
+    else: (0xDAC00C00'u32 or (encodeReg(rn) shl 5) or encodeReg(rd))
+  dest.addUint32(instr)
+
 # Load/Store instructions
 proc emitLdr*(dest: var Bytes; rt: Register; rn: Register; offset: int32) =
   ## Emit LDR instruction: LDR rt, [rn, #offset]
