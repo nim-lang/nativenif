@@ -14,6 +14,7 @@
 ## and scratch pools from it.
 
 import std / [tables, sets, assertions, algorithm]
+import symparser
 import nifcore, nifcdecl
 import slots, machinedesc, analyser, register_allocator, programs
 import asmbuf
@@ -207,6 +208,50 @@ type
                                              ## predicate; OvfCmpLo: the cmp's LHS
     ovfReg2*: Reg                             ## a64 OvfCmpLo: the cmp's RHS
     ovfBridges*: seq[Reg]                     ## a64: staging bridges the `(ovf)` test releases
+    # ── `.assembler` transliteration (doc/intrinsics.md §8) ──
+    # In an `.assembler` proc there is no allocator: every value's home is DECLARED
+    # (`.register`/`.stack` on the param or local), so the register IS the identity
+    # and these two tables are the whole location model. Several Leng names may map
+    # to one register — that is the user pinning them together, not a conflict —
+    # so `emReg` renders whichever nifasm binding is live there.
+    asmReg*: Table[string, Reg]               ## Leng local/param name → its pinned register
+    asmStack*: HashSet[string]                ## Leng local names pinned to an `(s)` slot
+    asmInfo*: string                          ## last `file(line, col)` seen while walking an
+                                              ## `.assembler` body: the fallback location for a
+                                              ## rejection on a node with no line info of its own
+
+# ── user-facing diagnostics ─────────────────────────────────────────────────
+# Most of arkham's internal consistency checks are `raiseAssert`s: they can only
+# fire on a compiler bug, so a stack trace is the useful output. An `.assembler`
+# body is different — arkham is the ONLY checker of that source-level subset (see
+# `doc/intrinsics.md` §8), so its rejections are ordinary user errors and must
+# read like one. NIF carries the original file/line/col on the very node that is
+# wrong, which is why delegating the checking here costs no diagnostic quality.
+
+proc userName*(sym: string): string =
+  ## `r.0.mymod` → `r`. A NIF symbol is `<name>.<disambiguator>[.<module>]`; both
+  ## suffixes belong to the front end, so neither may appear in a message a human
+  ## reads — they would name something the user never wrote.
+  result = splitSymName(sym).name             # drops the module suffix
+  var i = result.len - 1
+  while i > 0 and result[i] in {'0' .. '9'}: dec i
+  if i > 0 and i < result.len - 1 and result[i] == '.': result.setLen i
+
+proc lengInfo*(c: Cursor): string =
+  ## `file(line, col)` for the Leng node `c`, or "" when it carries no line info
+  ## (NIF line info is sparse: only nodes the front end stamped have it).
+  let li = rawLineInfo(c)
+  if not li.file.isValid: return ""
+  result = lineInfoFile(c) & "(" & $li.line & ", " & $li.col & ")"
+
+proc lengError*(c: Cursor; msg: string; fallback = "") {.noreturn.} =
+  ## Report a user error against the Leng node `c` and stop. `fallback` is a
+  ## previously-seen `lengInfo` used when `c` itself is uninformative, so a
+  ## rejection always points at least at the enclosing statement.
+  var where = lengInfo(c)
+  if where.len == 0: where = fallback
+  if where.len == 0: where = "arkham"
+  quit where & " Error: " & msg, QuitFailure
 
 # ── type predicates ─────────────────────────────────────────────────────────
 

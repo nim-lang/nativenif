@@ -13,7 +13,7 @@ intrinsic in a perfectly normal proc, and get *that instruction*, while register
 allocation, spilling, ABI and temporaries stay arkham's job. The user overrides
 **instruction selection** and nothing else.
 
-**(b) `.asm` procs.** Every construct maps one-to-one to assembler, no
+**(b) `.assembler` procs.** Every construct maps one-to-one to assembler, no
 heuristics: locations are explicit (`.register`, `.stack`), control flow is
 `while true` / `if cond` / named blocks + `break`, and any expression that would
 need a materialisation slot is rejected.
@@ -23,12 +23,12 @@ These are **independent axes**, not two points on a scale:
 |                     | portable intrinsic (fallback exists) | target-pinned instruction |
 |---------------------|--------------------------------------|---------------------------|
 | **normal proc**     | `ctz(x)` — any target                | **(a)** `bsf(x)` — arkham allocates |
-| **`.asm` proc**     | only if it expands without temporaries | **(b)** transliteration |
+| **`.assembler` proc**     | only if it expands without temporaries | **(b)** transliteration |
 
 The same declaration, the same call-site node, and the same operand table serve
 all four cells. The only thing that changes between cells is how the operand
 constraints are *read*: in a normal proc they are **requests** the allocator
-satisfies (by copying, loading, spilling); in an `.asm` proc they are
+satisfies (by copying, loading, spilling); in an `.assembler` proc they are
 **assertions** the checker verifies.
 
 So the design question is: **what must an intrinsic declaration say, such that
@@ -117,7 +117,7 @@ property must be kept.**
   declaration.
 - **The table dictates the spelling.** There is exactly one legal way to declare
   a given instruction (§4.1). No author choice, no reconciliation.
-- **Constraints are requests in a normal proc, assertions in an `.asm` proc.**
+- **Constraints are requests in a normal proc, assertions in an `.assembler` proc.**
 - **The opcode is the user's; the operands are arkham's.** An `(instr …)` node
   fixes *which* instruction. Where its operands live stays allocation's job.
 - **Prefer rejecting to analysing, in v1.** Where a correctness question needs
@@ -149,7 +149,7 @@ proc ctz(x: uint64): int32 {.inline.} =
   else:                <portable loop>
 ```
 
-No `.asm`, no compiler table entry, no backend `case`. That deletes
+No `.assembler`, no compiler table entry, no backend `case`. That deletes
 `emitBitBuiltin2` from both backends and turns `codegen_a64.nim:2441`'s
 `raiseAssert` into a `when` branch. **Adding an intrinsic becomes a library
 edit.**
@@ -339,7 +339,7 @@ tier or a `when`, never silent.
 
 `.register`/`.stack` on a local are legal in a normal proc too, as a hard pin
 the allocator honours (it drops that register from the pool). That is the
-"influence" dial short of full `.asm`.
+"influence" dial short of full `.assembler`.
 
 ## 6. Flags are intrinsics, not variables
 
@@ -428,11 +428,15 @@ target-pinned intrinsic (§3), so what reaches arkham is:
 bsf  r13, r12
 ```
 
-## 8. `.asm` mode — use case (b)
+## 8. `.assembler` mode — use case (b)
+
+Spelled `assembler`, not `asm`: Nim's parser reads a pragma entry as an
+*expression*, so a keyword cannot appear there and `{.asm.}` does not parse at
+all. The tag is `(assembler)`, unrelated to the `(asm X+)` statement.
 
 ```nim
 proc memzero(p {.register: "rdi".}: pointer;
-             n {.register: "rcx".}: uint64) {.asm.} =
+             n {.register: "rcx".}: uint64) {.assembler.} =
   var z {.register: "rax".}: uint64
   xor(z, z)
   block outer:
@@ -447,7 +451,7 @@ proc memzero(p {.register: "rdi".}: pointer;
 **Variables.** `.register: "rax"` and `.stack` map onto nifasm's `(var D L T)`
 location slot — `(rax)` and `(s)`. An unannotated local is an error. Parameters
 and the result are annotated the same way, which *is* the proc's ABI — and is
-what lets an `.asm` proc be called from ordinary Nimony (arkham marshals at the
+what lets an `.assembler` proc be called from ordinary Nimony (arkham marshals at the
 boundary only, never inside).
 
 **Control flow.** `while true` → `(loop (stmts …))`, which arkham already emits.
@@ -461,16 +465,16 @@ operand's immediate range, `addr` of a global, or a label. Nested
 `(instr (instr …))` is rejected; one instruction per statement. Assignment sugar
 is not needed — §4.1 already forces the spelling that matches the machine.
 
-**No fallbacks.** Inside `.asm`, an instruction the target lacks is a compile
+**No fallbacks.** Inside `.assembler`, an instruction the target lacks is a compile
 error, not a call to a fallback body.
 
 **Calls.** Only to procs whose parameters and result are fully
 register-annotated, i.e. whose ABI is declared rather than inferred.
 
-**Optimizer.** `nj` treats an `.asm` body as verbatim: source order is the
+**Optimizer.** `nj` treats an `.assembler` body as verbatim: source order is the
 contract.
 
-**Non-goal:** `.asm` + `.inline` into ordinary code (the GCC
+**Non-goal:** `.assembler` + `.inline` into ordinary code (the GCC
 inline-asm-with-constraints problem). Use case (a) covers the "fast path in a
 portable wrapper" pattern directly (§3).
 
@@ -534,7 +538,7 @@ Each phase is independently shippable, and (a) lands well before (b).
    expressible.
 5. **Move the portable layer to the stdlib** as `inline` + `when` wrappers;
    delete `emitBitBuiltin2` and friends.
-6. **`.asm` mode**: `.register`/`.stack`, the atom rule, the control-flow subset.
+6. **`.assembler` mode**: `.register`/`.stack`, the atom rule, the control-flow subset.
 7. **Delete the legacy path**, move syscalls to an explicit `{.syscall: "write".}`
    pragma (they stay call-shaped — they clobber like calls — but stop being
    sniffed; the per-arch number table stays in arkham, keyed by the pragma), and
@@ -542,8 +546,10 @@ Each phase is independently shippable, and (a) lands well before (b).
 
 ## 12. Implementation status
 
-**Phases 2 and 3 are implemented** — use case (a) works end to end, on both
-targets, through both backends. Phases 0, 1 and 4–7 are not started; the legacy
+**Phases 2, 3 and 6 are implemented, and phase 4's flag half** — use case (a)
+works end to end on both targets through both backends, use case (b) works on
+x86-64 for the subset listed below, and flags are reachable there. Phases 0, 1,
+5 and 7 are not started, nor is phase 4's multi-out half; the legacy
 `importc`-sniffing path is untouched and still carries `memcpy`, the atomics and
 the syscalls.
 
@@ -599,4 +605,129 @@ reach by different instructions.
 - **No LLVM-backend lowering.** `llvm.cttz`/`ctlz`/`ctpop`/`bswap` each need a
   `declare` and (for cttz/ctlz) an extra `i1` operand that `genCallWithType`
   cannot express. It rejects rather than substituting something else.
-- **Flags, multi-out and `.asm` are untouched** (§6, §4.2, §8) — phases 4 and 6.
+- **Multi-out is untouched** (§4.2) — the tuple form that would bind a flag at
+  its definition site (`let (sum, carry) = addCarry(a, b)`). Only §6's other
+  half, the general `zf()` escape hatch, exists.
+
+### Flags (§6)
+
+The row gained two columns, `uses` and `defs` over a `MachineFlag` set, and §6's
+claim that this needs no new machinery held up: nifasm already had `(ite (zf) …)`
+with all ten x86 conditions, so a flag intrinsic is a rename, not a mechanism.
+`arkham/codegen_x64.x64FlagOf` is the whole of the mapping.
+
+```nim
+proc cmp64(a, b: uint64) {.instruction: cmp.}
+proc zf(): bool {.instruction: zf.}
+
+proc pick(x {.register: "rdi".}: uint64,
+          y {.register: "rsi".}: uint64): uint64 {.assembler.} =
+  cmp64(x, y)
+  if zf(): result = 100
+  else: result = 7
+```
+
+emits exactly `(cmp p0.0 p1.0)` and `(ite (zf) (stmts (mov (rax) 100)) (stmts
+(mov (rax) 7)))`.
+
+Two shapes, as §6 describes. An instruction that DEFINES flags and returns
+nothing (`cmp`, `test`): `ret` is void, `defs` is non-empty, and it is a
+statement. And a zero-operand `bool` that READS one (`zf`, `nz`, `cf`, `nc`,
+`sf`, `ns`, `ovf`, `novf`, `pf`, `np`): `uses` names the bit, and it is legal
+only as an `if` condition.
+
+Notice what the columns buy. A `cmp` is deliberately **not** `efPure` — a "pure"
+row with a void result is dead by definition and DCE would be right to delete
+it; `defs` is what makes a flag-only instruction non-removable. And `uses` is
+what lets `isFlagRead` be a property of the row rather than a hardcoded list of
+opcode names.
+
+The v1 rule is enforced at exactly one point per backend, and is stricter than
+§6 in one way worth stating: flags are legal **only inside an `{.assembler.}`
+proc**. §6's rule ("legal only where it can be consumed without materialisation")
+is about the *placement*; but in an ordinary proc the placement is not the whole
+story, because arkham may schedule a spill or a reload between the `cmp` and the
+`if` and nothing promises it will not. `.assembler` is the context where source
+order is the contract, so that is where flags work. Everywhere else — the
+allocated path in both backends, and the C backend — rejects them by name.
+
+Two deviations from "the name is the nifasm tag", both forced by Nim's grammar
+rather than chosen: `ovf`/`novf` are spelled that way because nifasm's tags are
+`of`/`no` and `of` is a keyword, so `{.instruction: of.}` does not parse. Same
+collision as `{.asm.}`. The backend maps them back, so the assembler still sees
+`(of)`/`(no)`.
+
+Two passes needed the `.assembler` gate that `xelim` already had. `njvl`'s
+Final-IR lowering (`nj`, the contract analysis) asserts that every call was
+already hoisted to a location, which is precisely the normalization an
+`.assembler` body must not undergo — so a flag as an `if` condition tripped it.
+Such a body now lowers to a bodyless declaration there: no contracts to check,
+and no vocabulary to check them in. This is §8's "`nj` treats an `.assembler`
+body as verbatim" reaching the second of the two passes that must honour it.
+
+Not yet: flag WRITERS (`stc`/`clc`/`cmc` — nifasm has no tags for them), `elif`
+(one condition per `if`; a nested `if` is the machine's own spelling), and a
+flag as a `while` condition (§8 keeps loops at `while true` + `break`, and
+`if zf(): break` covers it).
+
+### `.assembler` mode (phase 6)
+
+The pragmas are `{.assembler.}` on the routine and `{.register: "…".}` /
+`{.stack.}` on a parameter or local, all three forwarded to Leng verbatim.
+Nimony's sem checks only their *shape* (routine-only; the register name is a
+string literal); every other rule is arkham's, per the design's premise that the
+machine model is where the checking belongs.
+
+That premise binds hexer too, and cost one real change: `xelim` was rewriting
+`r = bsf(x)` into `var tmp = bsf(x); r = tmp` — inventing exactly the
+materialisation slot the mode forbids. `trProc` now takes an `{.assembler.}`
+body verbatim. "Source order is the contract" is not only `nj`'s obligation.
+
+| Piece | Where |
+|---|---|
+| The pragmas | `(assembler)`, `(register STR)`, `(stack)` in `nimony/doc/tags.md` |
+| Verbatim body | `hexer/xelim.trProc` — no hoisting, no temporaries, no reordering |
+| C / LLVM refusal | `lengc/codegen.genProcDecl`, `lengc/llvmcodegen.genProcDeclLLVM` — by name, pointing at `doc/asm-c-interop.md`, rather than a prototype that fails to link |
+| Transliteration | `arkham/codegen_x64.genAsmProc` — no `allocateProc`, no analyser, no value core |
+| Diagnostics | `arkham/codegen_common.lengError` — `file(line, col) Error: …` off the offending node's own NIF line info |
+
+Spelled `assembler` because `{.asm.}` does not parse: Nim reads a pragma entry as
+an expression, so a keyword cannot appear there.
+
+What the x86-64 path accepts: `.register`/`.stack` locals (a register may carry
+several names — that is the user pinning them together), `result` pinned to the
+ABI return register (derived, since Nimony cannot annotate `result`), parameters
+whose pins are *checked against* the SysV registers, `d = ins(x)`, flag
+instructions and `if <flag>()` (see *Flags* below), moves between
+registers/slots/literals, `while true` + `break`, `(lab)`/`(jmp)`, and `ret`.
+Callee-saved pins are pushed and popped from the used-register set. A `conv` of a
+*literal* is folded — the front end inserts it for typing and there is no
+instruction behind it — while a `conv` of a value is a real extension and is
+rejected like any other computed expression.
+
+Everything else is a user error with precise line info — a computed expression
+(`r = bsf(x) + 1`), a conditional `while`, an unannotated local, a pin to
+`rsp`/`rbp`, a memory-to-memory move, a parameter past the sixth, an opcode with
+no x86-64 lowering. Tests: `tests/arkham/assembler_x64.c.nif` for the code
+generation, `tests/arkham/err_*.c.nif` for the rejections (arkham owns these
+rules outright, so its refusals are regression-tested like its output), and
+`nimony/tests/nimony/assembler/*.nim` for the front-end and C-backend halves.
+
+Not yet, and each is a real gap rather than a rejection-by-design:
+
+- **AArch64.** `codegen_a64.genProc2` refuses an `.assembler` proc rather than
+  ignoring the pins. The x86-64 register names in a body have no target-neutral
+  reading, so an a64 version is a different `when` branch either way — but the
+  a64 backend still needs its own `genAsmProc` before that branch can exist.
+- **Calls.** In §8's subset; a call needs the callee's ABI checked against the
+  caller's live pins. (`if <flag>` now works — see *Flags* above.)
+- **Globals.** §8's operand list includes `addr` of a global; only locals and
+  parameters are accepted so far. `p = addr(g)` is one `lea`, but a pointer is
+  only worth having once loads and stores through it work too, so the two go in
+  together. (A pointer *parameter* already works: it keeps its `(ptr T)` in the
+  binding, so nifasm type-checks it.)
+- **No `inout` rows**, so the body cannot yet do arithmetic — the same gap as
+  use case (a) above, and the reason §8's `memzero` example does not compile
+  yet. `.assembler` is where it is *easiest* to close: `(addr <local>)` in an
+  operand slot binds straight to the declared home, because there is no
+  allocator to confuse with `AddrTaken`.

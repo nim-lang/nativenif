@@ -2662,6 +2662,14 @@ proc emitInstr2(g: var CodeGen; c: Cursor) =
       while fc.hasMore: (argCurs.add fc; skip fc)
   let tgt = instrTargetOf(g.prog, fsym)
   let row = IntrinsicRows[tgt.op]
+  if row.isFlagRead or row.isFlagWrite:
+    # See the x86-64 `emitInstr2` for the reasoning: an ordinary proc's body is
+    # allocated and scheduled, so nothing promises the flags survive from their
+    # definition to their use. `.assembler` is the only context where they do —
+    # and the AArch64 backend has no `.assembler` path yet either.
+    lengError c, "`" & IntrinsicNames[tgt.op] & "` is a flag instruction; flags " &
+              "are only legal inside an `{.assembler.}` proc, which the AArch64 " &
+              "backend does not support yet", lengInfo(c)
   if tgA64 notin row.targets:
     raiseAssert "arkham a64n: `" & IntrinsicNames[tgt.op] &
                 "` has no AArch64 lowering — guard the call with a `when`"
@@ -4226,6 +4234,13 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool) =
 proc genProc2(g: var CodeGen; info: ProcInfo) =
   when defined(arkhamTraceProcs):
     stderr.writeLine "arkham genProc2: " & info.asmName
+  if info.isAsm:
+    # `.assembler` is a transliteration whose register names are x86-64's; there is
+    # no target-neutral reading of `{.register: "rax".}`. Rejecting is the whole
+    # point of the mode ("no fallbacks", doc/intrinsics.md §8) — an AArch64 body is
+    # a different `when` branch the user must write.
+    lengError info.decl, "an `.assembler` proc is not supported by the AArch64 " &
+              "backend yet; its register pins name x86-64 registers", lengInfo(info.decl)
   if not g.cleanSigComputed:                   # compute the clean-signature set once
     g.cleanSigProcs = cleanSigProcNames(g.prog)
     g.cleanSigComputed = true

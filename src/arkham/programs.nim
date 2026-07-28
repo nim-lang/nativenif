@@ -64,6 +64,10 @@ type
     asmName*: string         ## the proc's asm-NIF name (entry → "main.0")
     decl*: Cursor            ## the `(proc …)` declaration
     isEntry*: bool
+    isAsm*: bool             ## `(assembler)`: the body is a TRANSLITERATION — every
+                             ## construct maps one-to-one to an instruction and every
+                             ## location is declared, so it bypasses the register
+                             ## allocator entirely. See `doc/intrinsics.md` §8.
 
   SyscallProc* = object
     asmName*: string         ## the `(syproc …)` symbol name (e.g. "mmap.0")
@@ -219,12 +223,15 @@ proc lookupSyscall*(name: string): tuple[found: bool, x64, a64: int] =
 # ── pass 0: collect the main module's top-level declarations ────────────────
 
 proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
-                  intrinsic: var IntrinsicOp) =
+                  intrinsic: var IntrinsicOp; asmProc: var bool) =
   if c.substructureKind == PragmasU:
     c.into:
       while c.hasMore:
         let pk = c.pragmaKind
         case pk
+        of AssemblerP:
+          asmProc = true
+          skip c
         of ImportcP:
           c.into:
             if c.hasMore: (importcN = strVal(c); inc c)
@@ -244,6 +251,11 @@ proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
         else: skip c
   else:
     skip c
+
+proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
+                  intrinsic: var IntrinsicOp) {.inline.} =
+  var ignored = false
+  parsePragmas(c, importcN, exportcN, intrinsic, ignored)
 
 proc parsePragmas(c: var Cursor; importcN, exportcN: var string) {.inline.} =
   var ignored = NoIntrinsicOp
@@ -466,13 +478,14 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         var retFloat = false
         var retType: Cursor
         var intrinsic = NoIntrinsicOp
+        var asmProc = false
         c.into:
           pname = symName(c); inc c           # name
           skip c                              # params
           retType = c                         # return-type cursor (for getType)
           retFloat = c.kind == TagLit and c.typeKind == FT   # `(f N)` return → v0
           skip c                              # return type
-          parsePragmas(c, importcN, exportcN, intrinsic)
+          parsePragmas(c, importcN, exportcN, intrinsic, asmProc)
           skip c                              # body
         let sigType = procSigType(procStart)  # the proc-value's `(proctype …)` (for getType)
         if intrinsic != NoIntrinsicOp:
@@ -545,7 +558,8 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           result.callTarget[pname] = CallTarget(asmName: asmN, extern: false,
                                                 retFloat: retFloat, retType: retType, sigType: sigType,
                                                 declarative: isDeclarativeAbi(result, procStart))
-          result.procs.add ProcInfo(asmName: asmN, decl: procStart, isEntry: entry)
+          result.procs.add ProcInfo(asmName: asmN, decl: procStart, isEntry: entry,
+                                    isAsm: asmProc)
       else:
         skip c
   # Emit the entry proc first so it begins the text section.
