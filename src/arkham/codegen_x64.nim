@@ -1080,6 +1080,30 @@ proc emStoreByte(g: var CodeGen; base, idx, src: Reg) =
 proc emCmpReg(g: var CodeGen; a, b: Reg) =
   g.ab.tree CmpX64: (g.emReg a; g.emReg b)
 
+proc genRepMovsFwd(g: var CodeGen; nReg: Reg) =
+  ## ASCENDING block copy of `nReg` BYTES from `[rsi]` to `[rdi]`: `rep movsq` for the
+  ## 8-byte bulk, `rep movsb` for the ≤7-byte tail.
+  ##
+  ## The string instructions take their operands implicitly and DESTROY rdi, rsi and rcx
+  ## (both pointers advance past the copied block, rcx ends at 0), so the caller must
+  ## have saved anything it still needs — `nReg` must therefore not be one of them.
+  ## nifasm records the same clobber set (see `RepmovsbX64` in the assembler), and the
+  ## register mirror is dropped here so no cached value survives the copy. DF is 0
+  ## throughout an arkham program (SysV guarantees it at entry and at every call, and
+  ## arkham never emits `std`), so `movs` always steps upward.
+  ##
+  ## Quadword bulk + byte tail rather than a lone `rep movsb`: without ERMSB the byte
+  ## form moves one byte per iteration, and the two extra `mov`s plus a possibly
+  ## zero-count second `rep` are cheap next to that. (On ERMSB/FSRM parts a bare
+  ## `rep movsb` would edge it out; not worth a CPU-feature split here.)
+  g.movReg(RCX, nReg)
+  g.binImm(ShrX64, RCX, 3)                     # quadwords = n div 8
+  g.ab.keyword RepmovsqX64
+  g.movReg(RCX, nReg)
+  g.binImm(AndX64, RCX, 7)                     # tail bytes = n mod 8
+  g.ab.keyword RepmovsbX64
+  for r in [RDI, RSI, RCX]: g.mirrorInvalidate(r)
+
 proc genMemIntrinBody(g: var CodeGen; builtin: string) =
   ## The inline `mem*` loop, assuming the args are already loaded (dst→rdi,
   ## src/val→rsi, n→rdx) and rsi/rdx/rcx are bound to checked names. Result → RAX.
@@ -1088,40 +1112,40 @@ proc genMemIntrinBody(g: var CodeGen; builtin: string) =
   ## The dest pointer (rdi) and the byte/result (rax) stay raw — irreducible ABI regs.
   case builtin
   of "memcpy":                                 # (dst, src, n) → dst
-    let done = g.freshLabel()
-    g.movImm(RCX, 0)                           # i = 0
-    g.emitLoop:
-      g.emCmpReg(RCX, RDX)
-      g.emJcc(JaeX64, done)                    # i >= n (unsigned) → done
-      g.emLoadByte(RAX, RSI, RCX)              # b = src[i]
-      g.emStoreByte(RDI, RCX, RAX)             # dst[i] = b
-      g.binImm(AddX64, RCX, 1)
-    g.emLab(done)
-    g.movReg(RAX, RDI)                         # memcpy returns dest
+    g.movReg(RAX, RDI)                         # the return value, BEFORE `movs` eats rdi
+    g.genRepMovsFwd(RDX)
   of "memmove":                                # (dst, src, n) → dst; overlap-safe
+    # An ascending copy is safe unless the destination starts strictly INSIDE the
+    # source block — i.e. it is safe when `dst <= src` (the classic case) and also
+    # when `dst >= src + n` (disjoint; very common, e.g. shifting a block UP in a
+    # seq). Only a genuinely overlapping `src < dst < src+n` needs the descending
+    # copy, and that one keeps the byte loop: `rep movs` would run downward only
+    # with DF=1, and arkham deliberately never emits `std` (SysV requires DF clear
+    # at entry and at every call boundary, so setting it would have to be undone on
+    # every path out — including the ones an exit or a trap takes).
+    g.bindTemp(R8, ScalarSlot)
+    g.movReg(R8, RDI)                          # saved dest: `rep movs` destroys rdi
     let fwd = g.freshLabel()
     let done = g.freshLabel()
     g.emCmpReg(RDI, RSI)
-    g.emJcc(JbeX64, fwd)                        # dst <= src → forward copy is safe
+    g.emJcc(JbeX64, fwd)                       # dst <= src → ascending is safe
+    g.movReg(RAX, RSI)
+    g.binReg(AddX64, RAX, RDX)                 # rax = src + n
+    g.emCmpReg(RDI, RAX)
+    g.emJcc(JaeX64, fwd)                       # dst >= src+n → disjoint, ascending is safe
     # backward: i = n; while i != 0: i -= 1; dst[i] = src[i]
-    g.movReg(RCX, RDX)                          # i = n
+    g.movReg(RCX, RDX)                         # i = n
     g.emitLoop:
       g.ab.tree CmpX64: (g.emReg RCX; g.ab.intLit 0)
       g.emJcc(JeX64, done)
       g.binImm(SubX64, RCX, 1)
       g.emLoadByte(RAX, RSI, RCX)
       g.emStoreByte(RDI, RCX, RAX)
-    # forward: i = 0; while i < n: dst[i] = src[i]; i += 1
     g.emLab(fwd)
-    g.movImm(RCX, 0)
-    g.emitLoop:
-      g.emCmpReg(RCX, RDX)
-      g.emJcc(JaeX64, done)
-      g.emLoadByte(RAX, RSI, RCX)
-      g.emStoreByte(RDI, RCX, RAX)
-      g.binImm(AddX64, RCX, 1)
+    g.genRepMovsFwd(RDX)
     g.emLab(done)
-    g.movReg(RAX, RDI)
+    g.movReg(RAX, R8)                          # memmove returns dest
+    g.unbindTemp(R8)
   of "memset":                                 # (dst, val, n) → dst
     let done = g.freshLabel()
     g.movImm(RCX, 0)                           # i = 0

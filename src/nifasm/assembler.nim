@@ -5821,18 +5821,20 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
   of NopX64:
     inc n
     x86.emitNop(ctx.buf.data)
-  of RepmovsbX64:
+  of RepmovsbX64, RepmovswX64, RepmovsdX64, RepmovsqX64:
+    # The `rep movs` family names NONE of its operands in the tree: it copies `rcx`
+    # units from `[rsi]` to `[rdi]`, advancing both pointers and leaving `rcx` at 0.
+    # Record that clobber explicitly — without it a later read of a local homed in
+    # rdi/rsi/rcx would silently see a destroyed value instead of raising here.
+    # (DF is 0 throughout: SysV guarantees it clear at entry and at every call, and
+    # nothing in this assembler emits `std`, so `movs` always steps upward.)
+    let stringOp = n.tag
     inc n
-    x86.emitRepMovsb(ctx.buf.data)
-  of RepmovswX64:
-    inc n
-    x86.emitRepMovsw(ctx.buf.data)
-  of RepmovsdX64:
-    inc n
-    x86.emitRepMovsd(ctx.buf.data)
-  of RepmovsqX64:
-    inc n
-    x86.emitRepMovsq(ctx.buf.data)
+    ctx.clobbered.incl {x86.RDI, x86.RSI, x86.RCX}
+    if stringOp == RepmovsbTagId:   x86.emitRepMovsb(ctx.buf.data)
+    elif stringOp == RepmovswTagId: x86.emitRepMovsw(ctx.buf.data)
+    elif stringOp == RepmovsdTagId: x86.emitRepMovsd(ctx.buf.data)
+    else:                           x86.emitRepMovsq(ctx.buf.data)
   of RetX64:
     inc n
     x86.emitRet(ctx.buf.data)
