@@ -21,7 +21,8 @@
 import std / [tables, assertions, sets]
 import nifcore, nifcdecl, nifcoreparse
 import slots, nifmodules
-import "../../../nimony/src/lib" / [symparser, nifreader, stringviews]
+import "../../../nimony/src/lib" / [symparser, nifreader, stringviews, intrinsics]
+export intrinsics
 
 type
   Extern* = object
@@ -50,6 +51,15 @@ type
     indirect*: bool          ## true → call *through* a function-pointer variable
                              ## (`asmName` is the gvar/tvar holding the pointer)
 
+  InstrTarget* = object
+    ## How to lower an `(instr SYM …)`. Unlike `CallTarget` there is no asm symbol,
+    ## no ABI and no call point: the opcode names the instruction(s) to emit, and
+    ## the operands are ordinary allocation requests. See `doc/intrinsics.md`.
+    op*: IntrinsicOp         ## the row in `lib/intrinsics`
+    retType*: Cursor         ## the proc's return type (drives `getType` + the result slot)
+    argBits*: int            ## the width `W` the row bound, read off the first integer
+                             ## operand: what distinguishes a 32- from a 64-bit form
+
   ProcInfo* = object
     asmName*: string         ## the proc's asm-NIF name (entry → "main.0")
     decl*: Cursor            ## the `(proc …)` declaration
@@ -64,6 +74,8 @@ type
   Program* = object
     externOrder*: seq[Extern]               ## extproc decls, in order (main module)
     callTarget*: Table[string, CallTarget]  ## Leng proc symbol → how to call it
+    instrTarget*: Table[string, InstrTarget] ## Leng proc symbol → which instruction(s)
+                                            ## an `(instr …)` on it emits
     procs*: seq[ProcInfo]                   ## internal procs to emit (entry first)
     syscalls*: seq[SyscallProc]             ## syscalls used → one `(syproc …)` decl each
     globals*: Table[string, Cursor]         ## global (gvar/const) var name → its decl cursor
@@ -206,20 +218,58 @@ proc lookupSyscall*(name: string): tuple[found: bool, x64, a64: int] =
 
 # ── pass 0: collect the main module's top-level declarations ────────────────
 
-proc parsePragmas(c: var Cursor; importcN, exportcN: var string) =
+proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
+                  intrinsic: var IntrinsicOp) =
   if c.substructureKind == PragmasU:
     c.into:
       while c.hasMore:
-        case c.pragmaKind
+        let pk = c.pragmaKind
+        case pk
         of ImportcP:
           c.into:
             if c.hasMore: (importcN = strVal(c); inc c)
         of ExportcP:
           c.into:
             if c.hasMore: (exportcN = strVal(c); inc c)
+        of InstructionP, IntrinsicP:
+          # `(instruction bsf)` / `(intrinsic Ctz)` — the argument is an ident from
+          # the shared `lib/intrinsics` enum, so this is a table lookup, not a match
+          # against a C name. Sem already checked it against the signature.
+          c.into:
+            if c.hasMore and c.kind == Ident:
+              intrinsic = intrinsicOpByName(strVal(c),
+                            (if pk == InstructionP: icPinned else: icPortable))
+              inc c
+            while c.hasMore: skip c
         else: skip c
   else:
     skip c
+
+proc parsePragmas(c: var Cursor; importcN, exportcN: var string) {.inline.} =
+  var ignored = NoIntrinsicOp
+  parsePragmas(c, importcN, exportcN, ignored)
+
+proc firstIntParamBits(decl: Cursor): int =
+  ## The bit width of a proc's first integer parameter — the width its row's `W`
+  ## bound, and the one thing an emitter needs beyond the opcode (a 32-bit `clz`
+  ## counts from bit 31, not bit 63). 0 when there is no such parameter.
+  result = 0
+  var c = decl
+  c.into:
+    inc c                                   # name → params
+    if c.kind == TagLit:
+      var pc = c
+      pc.into:
+        while pc.hasMore:                   # drain every param: `into` must balance
+          pc.into:                          # (param :name pragmas type)
+            inc pc                          # name
+            skip pc                         # pragmas
+            if result == 0 and pc.kind == TagLit and pc.typeKind in {IT, UT, CT}:
+              var b = pc
+              inc b
+              if b.kind == IntLit: result = int(intVal(b))
+            while pc.hasMore: skip pc
+    while c.hasMore: skip c
 
 proc resolveType*(p: var Program; c: Cursor): Cursor
 proc slotOf*(p: var Program; c: Cursor): AsmSlot
@@ -415,16 +465,23 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         var pname, importcN, exportcN = ""
         var retFloat = false
         var retType: Cursor
+        var intrinsic = NoIntrinsicOp
         c.into:
           pname = symName(c); inc c           # name
           skip c                              # params
           retType = c                         # return-type cursor (for getType)
           retFloat = c.kind == TagLit and c.typeKind == FT   # `(f N)` return → v0
           skip c                              # return type
-          parsePragmas(c, importcN, exportcN)
+          parsePragmas(c, importcN, exportcN, intrinsic)
           skip c                              # body
         let sigType = procSigType(procStart)  # the proc-value's `(proctype …)` (for getType)
-        if importcN.len >= 9 and importcN[0 .. 8] == "__atomic_":
+        if intrinsic != NoIntrinsicOp:
+          # An intrinsic declares an instruction, not a callable: there is no body to
+          # emit, no extern to import and no call target. Applications of it arrive as
+          # `(instr …)`, which never routes through `callTarget`.
+          result.instrTarget[pname] = InstrTarget(op: intrinsic, retType: retType,
+                                                  argBits: firstIntParamBits(procStart))
+        elif importcN.len >= 9 and importcN[0 .. 8] == "__atomic_":
           # GCC atomic builtin: not a real external call — arkham lowers it to a
           # lock-free instruction sequence (no extproc/libSystem dependency).
           result.callTarget[pname] = CallTarget(atomic: importcN, retType: retType, sigType: sigType)
@@ -623,6 +680,32 @@ proc foreignCallTarget*(p: var Program; name: string): CallTarget =
     result = CallTarget(asmName: name, extern: false, retFloat: retFloat,
                         retType: retType, sigType: sigType,
                         declarative: isDeclarativeAbi(p, declCur))
+
+proc instrTargetOf*(p: var Program; name: string): InstrTarget =
+  ## The row an `(instr SYM …)` names, resolving across modules. A same-module
+  ## symbol was registered by `collect`; a foreign one is loaded from its owning
+  ## module's embedded index and classified the SAME way that module's pass 0 did
+  ## — the pragma travels with the declaration, so there is nothing to re-derive.
+  if p.instrTarget.hasKey(name): return p.instrTarget[name]
+  var found = false
+  let declCur = lookupForeignDecl(p, name, found)
+  if not found:
+    raiseAssert "arkham: (instr …) on an unknown proc: " & name
+  var d = declCur
+  var retType: Cursor
+  var importcN, exportcN = ""
+  var op = NoIntrinsicOp
+  d.into:
+    inc d                                     # name
+    skip d                                    # params
+    retType = d
+    skip d                                    # return type
+    parsePragmas(d, importcN, exportcN, op)
+    while d.hasMore: skip d                   # body
+  if op == NoIntrinsicOp:
+    raiseAssert "arkham: (instr …) on a proc without an instruction/intrinsic pragma: " & name
+  result = InstrTarget(op: op, retType: retType, argBits: firstIntParamBits(declCur))
+  p.instrTarget[name] = result
 
 proc gvarRefName*(p: var Program; nifName: string): string =
   ## Like `gvarAsmName`, but also resolves a CLinkage gvar referenced from a

@@ -2646,6 +2646,60 @@ proc emCallerSaveDecl(g: var CodeGen; slotName, varName: string) =
     g.ab.sym slotName
     g.ab.sym varName
 
+proc emitInstr2(g: var CodeGen; c: Cursor) =
+  ## `(instr SYM X*)` — the intrinsic's own instruction(s). The a64 twin of the
+  ## x86-64 `emitInstr2`: same node, same row, same allocator contract (operands
+  ## in registers, the result in its own home), only the expansion differs.
+  ## Every a64 form here is three-address, so no `tie` copy ever runs.
+  let pos = g.posOf(c)
+  let res = g.ra.locs[pos]
+  var fsym = ""
+  var argCurs: seq[Cursor] = @[]
+  block:
+    var fc = c
+    fc.into:
+      fsym = symName(fc); skip fc
+      while fc.hasMore: (argCurs.add fc; skip fc)
+  let tgt = instrTargetOf(g.prog, fsym)
+  let row = IntrinsicRows[tgt.op]
+  if tgA64 notin row.targets:
+    raiseAssert "arkham a64n: `" & IntrinsicNames[tgt.op] &
+                "` has no AArch64 lowering — guard the call with a `when`"
+  for a in argCurs: g.emitValue2(a)
+  if res.kind != InReg:
+    raiseAssert "arkham a64n: intrinsic result is not in a register"
+  let a0 = g.ra.locs[g.posOf(argCurs[0])]
+  let aliasesA0 = a0.kind == InReg and a0.r == res.r
+  if res.isTemp and not aliasesA0: g.bindTemp(res.r, res.typ)
+  # A memory-homed operand is loaded into the destination first; every form below
+  # then reads `res` as its source, which is safe because all of them are
+  # single-source and write the destination last.
+  var src = res.r
+  if a0.kind == InReg: src = a0.r
+  else: g.place2(a0, res.r)
+  # The width the instruction runs at is the row's bound `W`, NOT the declared
+  # result type: `Ctz` returns an `int32` while operating on a 64-bit value.
+  let bits = if tgt.argBits in {8, 16, 32}: 32 else: 64
+  case tgt.op
+  of ClzPinnedOp, ClzOp:
+    g.ab.tree ClzA64: (g.emReg res.r; g.emReg src; g.ab.intLit bits)
+  of RbitOp:
+    g.ab.tree RbitA64: (g.emReg res.r; g.emReg src; g.ab.intLit bits)
+  of CtzOp:
+    # AArch64 has no count-trailing-zeros: reverse the bits and count leading ones.
+    # This is the `clz(rbit(x))` the portable row exists to hide.
+    g.ab.tree RbitA64: (g.emReg res.r; g.emReg src; g.ab.intLit bits)
+    g.ab.tree ClzA64: (g.emReg res.r; g.emReg res.r; g.ab.intLit bits)
+  of RevOp, BswapOp:
+    g.ab.tree RevA64: (g.emReg res.r; g.emReg src; g.ab.intLit bits)
+    if tgt.argBits == 16:
+      # `rev` at the 32-bit width reverses all four bytes; the swapped half ends
+      # up in bits 16..31, so shift it back down.
+      g.binImm(LsrA64, res.r, 16)
+  else:
+    raiseAssert "arkham a64n: no lowering for intrinsic `" & IntrinsicNames[tgt.op] & "`"
+  if a0.kind == InReg and a0.isTemp and a0.r != res.r: g.unbindTemp(a0.r)
+
 proc callIsInlinedAtomic(g: CodeGen; c: Cursor): bool =
   ## True when `emitCall2Inner` will lower this call to `emitAtomic2` (LL/SC), which
   ## clobbers only x0–x5 — so atomic-safe caller-save homes (x6/x7) need no spill.
@@ -2957,6 +3011,7 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
     of CastC, ConvC: g.emitCast2(c)
     of CallC:
       g.emitCall2(c)
+    of InstrC: g.emitInstr2(c)
     of NegC, BitnotC:
       var inner: Cursor
       block:
@@ -3788,6 +3843,7 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
     g.exitScope()
   of VarS, GvarS, TvarS, ConstS: g.genVarDecl2(c)
   of CallS: g.emitCall2(c)
+  of InstrS: g.emitInstr2(c)
   of BreakS:
     assert g.loopEnds.len > 0, "arkham a64n: `break` outside a loop"
     g.emBr(BA64, g.loopEnds[^1])

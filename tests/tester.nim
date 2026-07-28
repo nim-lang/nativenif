@@ -120,6 +120,11 @@ proc arkhamTests() =
 # function-pointer calls, `(pat …)` pointer indexing, and thread-locals. List a
 # test's stem here if a new arm64-only TODO is introduced.
 const arkhamLinuxA64Unsupported: seq[string] = @[
+  # x86-64 target-pinned instructions (`{.instruction: bsf.}` and friends). Being
+  # unavailable on a64 is the POINT — the row's `targets` column says so and the
+  # backend errors at the call site naming the target, exactly as C does. The
+  # portable counterparts are covered by `intrinsics`, which runs on both.
+  "intrinsics_x64",
   # (`keepovf`/`(ovf)` overflow checking now has a64 codegen too: the predicate is
   # computed into a staging bridge — xor/and sign trick for signed add/sub, unsigned
   # compare for carry/borrow, div-based check for mul — since the nifasm vocabulary

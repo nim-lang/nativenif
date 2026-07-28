@@ -142,6 +142,12 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
           result = q                                   # the return type
           while q.hasMore: skip q
         while t.hasMore: skip t
+    of InstrC:
+      # `(instr SYM …)` is typed exactly like a call — the callee's return type —
+      # but the callee is never a value, so it has no proctype to peel: the row
+      # recorded the declared return type directly.
+      var t = c; inc t
+      result = instrTargetOf(tc.prog[], symName(t)).retType
     of NilC: result = tc.prog[].voidPtr       # nil → a generic pointer type
     of InfC, NeginfC, NanC:                    # +inf / -inf / NaN float-value nodes
       result = tc.prog[].floatType

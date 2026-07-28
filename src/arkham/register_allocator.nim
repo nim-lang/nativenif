@@ -1424,6 +1424,56 @@ proc forceRegDest(b: var Builder; dest: var Location) =
   of Undef: dest = b.reserveTmp(ScalarSlot)
   else: discard
 
+proc instrOpOf(b: var Builder; n: Cursor): IntrinsicOp =
+  ## The opcode an `(instr SYM …)` names. The tag alone already said "not an ABI
+  ## call"; this resolves *which* instruction, which is all the allocator needs.
+  result = NoIntrinsicOp
+  var probe = n
+  probe.into:
+    if probe.kind == Symbol:
+      result = instrTargetOf(b.prog[], symName(probe)).op
+    while probe.hasMore: skip probe
+
+proc allocInstr(b: var Builder; n: var Cursor; dest: var Location) =
+  ## `(instr SYM X*)` — an intrinsic application. The opposite of `allocCall` in
+  ## every way that matters: no ABI registers, no call point, no `rax` round trip.
+  ## The row's constraints are read as *requests* — each operand needs a register,
+  ## and the result is allocated as the value's OWN home, so `d = bsf(x)` with `x`
+  ## in r12 and `d` homed in r13 emits exactly `bsf r13, r12`.
+  ##
+  ## `tie = k` marks a two-address form (x86 `bswap`/`rol`/`ror` write their
+  ## destination in place). The destination is still a normal home; the emitter
+  ## copies operand *k* into it first, and elides the copy when they coincide.
+  ## Every other operand of a tied row must be an immediate (the row's `loc` is
+  ## `imm8`), so no second register can be clobbered by that copy.
+  let pos = b.posOf(n)
+  let row = IntrinsicRows[instrOpOf(b, n)]
+  # The result lands in a register: the caller's home when it passed one, else a
+  # fresh temp. Do this FIRST and seal it, mirroring the addressing-expression
+  # path, so an operand temp cannot be allocated onto the destination register.
+  b.forceRegDest(dest)
+  let resDest = dest
+  let sealedHere = resDest.kind == InReg and not resDest.isTemp and
+                   resDest.r notin b.ra.sealed
+  if sealedHere: b.ra.sealed.incl resDest.r
+  var opLocs: seq[Location] = @[]
+  n.into:
+    skip n                                   # the callee symbol
+    var i = 0
+    while n.hasMore:
+      # A tied row's non-tied operands are immediates; `RegOrImm` lets a literal
+      # stay one and forces anything else into a register.
+      var d = if row.tie >= 0 and i != row.tie: regOrImm(ScalarSlot)
+              else: needsReg(ScalarSlot)
+      allocValue(b, n, d)
+      opLocs.add d
+      inc i
+  if sealedHere: b.ra.sealed.excl resDest.r
+  for d in opLocs:
+    if not sameReg(d, resDest): b.releaseTmp(d)
+  dest = resDest
+  b.ra.locs[pos] = resDest
+
 proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
   let pos = b.posOf(n)
   case n.kind
@@ -1570,6 +1620,8 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
       return
     of CallC:
       allocCall(b, n, dest); return          # records locs[pos] itself
+    of InstrC:
+      allocInstr(b, n, dest); return         # records locs[pos] itself
     of NegC, BitnotC:
       # Unary in-place op (`(neg T x)` / `(bitnot T x)`): the operand computes into the
       # result register; the emitter applies neg/not in place.
@@ -2049,9 +2101,9 @@ proc walk(b: var Builder; n: var Cursor) =
           while n.hasMore: skip n              # void return
     else:
       skip n
-  of CallS:
+  of CallS, InstrS:
     if b.allocExprs:
-      var d = dontCare                         # a statement call: result unused
+      var d = dontCare                         # a statement call/instr: result unused
       allocValue(b, n, d)
     else:
       if n.kind == TagLit:

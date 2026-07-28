@@ -2248,6 +2248,91 @@ proc emitBitBuiltin2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
   else:
     raiseAssert "arkham x64n: bit builtin not yet implemented: " & builtin
 
+proc emitInstr2(g: var CodeGen; c: Cursor) =
+  ## `(instr SYM X*)` — the intrinsic's own instruction(s). The allocator already
+  ## placed each operand in a register (or left a literal immediate) and the
+  ## result in its own home, so this is a transliteration of the row: no ABI, no
+  ## call point, no `rax` round trip. Compare `emitCall2`.
+  ##
+  ## The opcode is the USER'S; only the operand placement was ours. Nothing here
+  ## may substitute a different instruction.
+  let pos = cursorToPosition(g.buf[], c)
+  let res = g.ra.locs[pos]
+  var fsym = ""
+  var argCurs: seq[Cursor] = @[]
+  block:
+    var fc = c
+    fc.into:
+      fsym = symName(fc); skip fc
+      while fc.hasMore: (argCurs.add fc; skip fc)
+  let tgt = instrTargetOf(g.prog, fsym)
+  let row = IntrinsicRows[tgt.op]
+  if tgX64 notin row.targets:
+    raiseAssert "arkham x64n: `" & IntrinsicNames[tgt.op] &
+                "` has no x86-64 lowering — guard the call with a `when`"
+  for a in argCurs: g.emitValue2(a)
+  if res.kind != InReg:
+    raiseAssert "arkham x64n: intrinsic result is not in a register"
+  # Bind the destination before writing it, unless it already holds operand 0 of a
+  # tied form (then the binding is the operand's and the copy below is a no-op).
+  let a0 = if argCurs.len > 0: g.ra.locs[cursorToPosition(g.buf[], argCurs[0])]
+           else: default(Location)
+  let aliasesA0 = a0.kind == InReg and a0.r == res.r
+  if res.isTemp and not aliasesA0: g.bindTemp(res.r, res.typ)
+  # Which lowerings write their destination IN PLACE is a fact about *this*
+  # target, not about the opcode: a pinned row records it as `tie`, but a
+  # portable row (`Bswap`) has no tie and still lands on x86's in-place BSWAP.
+  # So the backend decides, and seeds the destination with operand 0. Safe for
+  # every form here: they have a single register operand (`rol`/`ror` take their
+  # count as an immediate — the row's `tie` made the allocator keep it one), so
+  # the copy can clobber no other operand.
+  let inPlace = tgt.op in {BswapOp, BswapPinnedOp, RolOp, RorOp}
+  if inPlace and not aliasesA0:
+    if a0.kind == InReg: g.movReg(res.r, a0.r)
+    else: g.place2(a0, res.r)
+  proc srcReg(g: CodeGen; cur: Cursor): Reg =
+    let l = g.ra.locs[cursorToPosition(g.buf[], cur)]
+    if l.kind != InReg:
+      raiseAssert "arkham x64n: intrinsic operand is not in a register"
+    l.r
+  let src0 = if inPlace: res.r else: g.srcReg(argCurs[0])
+  let bits = if tgt.argBits in {8, 16, 32}: 32 else: 64
+  case tgt.op
+  of BsfOp, CtzOp:
+    # count-trailing-zeros == index of the least-significant set bit. `src == 0` is
+    # undefined (the row says so); nimony's callers guard the zero case.
+    g.ab.tree BsfX64: (g.emReg res.r; g.emReg src0)
+  of BsrOp:
+    g.ab.tree BsrX64: (g.emReg res.r; g.emReg src0)
+  of ClzOp:
+    # `__builtin_clz` counts leading zeros; BSR yields the index of the HIGHEST set
+    # bit, and `clz == (W-1) - bsr`, which for a power-of-two W is `bsr xor (W-1)`.
+    g.ab.tree BsrX64: (g.emReg res.r; g.emReg src0)
+    g.ab.tree XorX64: (g.emReg res.r; g.ab.intLit(bits - 1))
+  of PopcntOp, PopcountOp:
+    g.ab.tree PopcntX64: (g.emReg res.r; g.emReg src0; g.ab.intLit bits)
+  of BswapPinnedOp, BswapOp:
+    # x86 BSWAP r16 is undefined, so a 16-bit swap is a 32-bit BSWAP whose two low
+    # bytes end up in bits 16..31 — shift them back down.
+    if tgt.argBits == 16:
+      g.ab.tree BswapX64: (g.emReg res.r; g.ab.intLit 32)
+      g.ab.tree ShrX64: (g.emReg res.r; g.ab.intLit 16)
+    else:
+      g.ab.tree BswapX64: (g.emReg res.r; g.ab.intLit bits)
+  of RolOp, RorOp:
+    # The count is an immediate (the row's second operand is `imm8`), so no `cl`
+    # pinning and no clobber of the shift register.
+    let cnt = g.ra.locs[cursorToPosition(g.buf[], argCurs[1])]
+    if cnt.kind != Imm:
+      raiseAssert "arkham x64n: `" & IntrinsicNames[tgt.op] &
+                  "` needs a compile-time rotate count"
+    if tgt.op == RolOp:
+      g.ab.tree RolX64: (g.emReg res.r; g.ab.intLit cnt.ival)
+    else:
+      g.ab.tree RorX64: (g.emReg res.r; g.ab.intLit cnt.ival)
+  else:
+    raiseAssert "arkham x64n: no lowering for intrinsic `" & IntrinsicNames[tgt.op] & "`"
+
 proc proctypeOfTarget(g: var CodeGen; targetCur: Cursor): Cursor =
   ## The resolved proctype body of an indirect call target, for ABI queries. The target
   ## is just an EXPRESSION whose type IS the proctype — a proc-typed local/param, a
@@ -2918,6 +3003,7 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
     of AddrC: g.emitAddr2(c)
     of CastC, ConvC: g.emitCast2(c)
     of CallC: g.emitCall2(c)
+    of InstrC: g.emitInstr2(c)
     of NegC, BitnotC:                                   # unary in-place: operand in res, then op
       var inner: Cursor
       block:
@@ -4861,6 +4947,7 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
     g.exitScope()
   of VarS, ConstS: g.genVarDecl2(c)    # a local const = an immutable var with a literal init
   of CallS: g.emitCall2(c)
+  of InstrS: g.emitInstr2(c)
   of BreakS:
     assert g.loopEnds.len > 0, "arkham x64n: `break` outside a loop"
     g.emJmp(g.loopEnds[^1])
