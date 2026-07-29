@@ -14,7 +14,7 @@
     (u 64)))
   (i 32)
   (pragmas
-   (intrinsic Ctz))
+   (intrinsic "Ctz"))
   (stmts .))
  (proc :clz64.0
   (params
@@ -22,7 +22,7 @@
     (u 64)))
   (i 32)
   (pragmas
-   (intrinsic Clz))
+   (intrinsic "Clz"))
   (stmts .))
  (proc :clz32.0
   (params
@@ -30,7 +30,7 @@
     (u 32)))
   (i 32)
   (pragmas
-   (intrinsic Clz))
+   (intrinsic "Clz"))
   (stmts .))
  (proc :bswap64.0
   (params
@@ -38,7 +38,7 @@
     (u 64)))
   (u 64)
   (pragmas
-   (intrinsic Bswap))
+   (intrinsic "Bswap"))
   (stmts .))
  (proc :main.0
   (params)

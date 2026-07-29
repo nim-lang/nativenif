@@ -47,6 +47,21 @@ const
   IntBridgeRegs* = [R14, R15]
   FloatBridgeReg* = F31
 
+  ## The three GPRs an atomic's LL/SC sequence takes for itself: the loaded value,
+  ## the computed value, and the store-exclusive status. None of them can ever hold
+  ## a live value — x14/x15 are the staging bridges just above, withheld from the
+  ## allocator's pools, and x16 (IP0) is in `ReservedRegs`, which arkham never
+  ## allocates. That is what makes an atomic cheap now that it is an INSTRUCTION
+  ## rather than a call: its clobber set cannot overlap anything the allocator
+  ## owns, so no analysis has to prove that it doesn't. It also removes every
+  ## aliasing question — the sequence reads the caller's cell/value registers and
+  ## writes only its own, so the destination may coincide with either.
+  ##
+  ## x16's other use is nifasm's: an indirect-call veneer (`blr x16`) and the macOS
+  ## TLV thunk. Neither can occur inside one of these sequences — they contain no
+  ## call and address no global.
+  AtomicScratchRegs* = [R14, R15, R16]
+
   ## Caller-saved SIMD/FP scratch: v16–v31 are fully caller-saved (and v0–v7
   ## are argument/return registers, also caller-saved). arkham keeps float
   ## values in these; a float that must survive a call (v8–v15 callee-saved)
@@ -82,9 +97,9 @@ const
     intTempRegs: @IntTempRegs,
     intLocalTempRegs: @IntTempRegs,  # AArch64 has 7 volatile int regs — scratch to spare,
                                      # so a call-free local may be homed in the temp pool
-    atomicSafeTempRegs: @[R6, R7],   # caller-save homes: the x64-R8/R9 analogue — arg regs
-                                     # OUTSIDE the x9–x15 scratch pool (so no `emReg` scratch
-                                     # collision) and atomic-safe (a64 atomics touch only x0–x5)
+    rescueHomeRegs: @[R6, R7],       # caller-save rescue homes: the x64-R8/R9 analogue —
+                                     # arg regs OUTSIDE the x9–x15 scratch pool, so no
+                                     # `emReg` scratch collision
     intCalleeSaved: @IntCalleeSaved,
     floatTempRegs: @FloatTempRegs,
     floatCalleeSaved: @FloatCalleeSaved,
@@ -105,7 +120,7 @@ const
     floatArgRegs: @FloatArgRegs,
     intTempRegs: @IntTempRegsN,
     intLocalTempRegs: @IntTempRegsN,
-    atomicSafeTempRegs: @[R6, R7],   # see aarch64Machine
+    rescueHomeRegs: @[R6, R7],       # see aarch64Machine
     intCalleeSaved: @IntCalleeSaved,
     floatTempRegs: @FloatTempRegsN,
     floatCalleeSaved: @FloatCalleeSaved,

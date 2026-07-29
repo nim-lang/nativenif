@@ -52,8 +52,8 @@ proc emReg(g: var CodeGen; r: Reg) {.inline.} =
     # register has an irreducible structural raw use and is allowed: rax/rdi/rsi/rdx/
     # r8/r9 are the syscall + call-argument / return ABI registers; rcx is the 4th call
     # arg; rsp/rbp are the frame/segment bases; rbx/r12–r15 are callee-saved param
-    # homes. (The fixed rcx/rdx/rsi/r8 scratch *inside* the self-contained atomics /
-    # mem* / byte-copy loops is nonetheless bound there, for extra checker coverage.)
+    # homes. (The fixed rcx/rdx/rsi/r8 scratch *inside* the self-contained mem* /
+    # byte-copy loops is nonetheless bound there, for extra checker coverage.)
     assert r notin g.md.intTempRegs and r != R11,
       "arkham x64: unbound scratch/bridge register reached emReg: " & x64RegName(r) &
       " — every value/address-carrying R10/R11 use must be a typed binding (pickStagingSealed/bindTemp)"
@@ -560,17 +560,6 @@ proc unbindTemp(g: var CodeGen; r: Reg) =
     g.boundTemps.excl r
     g.regBindPtr.excl r
 
-template withFixed(g: var CodeGen; r: Reg; body: untyped) =
-  ## Bracket a hardcoded use of a fixed ABI/ISA register `r` (atomics, mem*,
-  ## byte-copy, the aggregate-result pointer) with a typed binding, so its `emReg`
-  ## operands inside `body` are checked names instead of a raw `(reg)` that bypasses
-  ## nifasm's binder. Like `bindTemp`/`unbindTemp` it is zero machine code. The bind
-  ## kills `r`'s prior tenant, so a later raw use of a value wrongly left there
-  ## becomes a build error rather than a silent clobber.
-  g.bindTemp(r, ScalarSlot)
-  body
-  g.unbindTemp(r)
-
 proc emStackMem(g: var CodeGen; name: string) =       # (mem (rsp) name)
   g.ab.tree MemX:
     g.ab.reg RSP
@@ -997,13 +986,22 @@ proc cmpJccTag(ek: LengExpr; whenTrue, signed: bool): X64Inst =
 # clobbers (rcx, r11). A call site then uses the ordinary declarative `(prepare …)`
 # path with a `(syscall)` marker — see `emitSyproc` and `emitCall2`.
 
-# ── atomic builtins (GCC `__atomic_*` → x86 lock-prefixed instructions) ──────
+# ── the atomic rows (`{.intrinsic: "AtomicX".}` → x86 lock-prefixed sequences) ──
 # x86-64 has a strong memory model: a plain aligned `mov` is already an atomic
 # load/store, `xchg` with memory is implicitly locked, and an RMW that returns the
-# old value uses `lock xadd` / a `lock cmpxchg` retry loop. The `memorder` arg is
-# ignored (all sequences are at least acquire/release), matching the A64 backend.
-# Inside a sequence there are no calls, so RAX/RCX/RDX (not in the allocator pool)
-# are free scratch; the result lands in RAX (the integer return register).
+# old value uses `lock xadd` / a `lock cmpxchg` retry loop. The memory-order
+# operands are not evaluated at all (see `evaluatedOperands`): every sequence here
+# is at least acquire/release, which satisfies whichever order was asked for.
+#
+# An atomic arrives as `(instr …)`, so its operands are wherever the ALLOCATOR put
+# them and the sequence must not assume an ABI. The only registers it takes for
+# itself are `rax` — architecturally required as `cmpxchg`'s comparand — and `r11`,
+# the reserved staging bridge, as the working register. Those two are precisely the
+# GPRs the allocator never hands out, which is the point: an atomic's clobber set
+# cannot overlap a live value, so nothing upstream has to prove that it doesn't.
+# The `work` register also removes every aliasing question — the caller's `p`, `val`
+# and destination registers may coincide freely, because the sequence reads them
+# and writes only its own.
 
 proc emMemAt(g: var CodeGen; p: Reg; pointee: Cursor) =
   ## `(mem (cast (ptr T) p))` — dereference `p` typed as `ptr T` so nifasm sizes the
@@ -1017,46 +1015,13 @@ proc emMemAt(g: var CodeGen; p: Reg; pointee: Cursor) =
       g.ab.ptrType: g.genTypeBody(t)
       g.emReg p
 
-proc genAtomicXadd(g: var CodeGen; pReg, val: Reg; pointee: Cursor; returnNew, sub: bool) =
-  ## `lock xadd [p], val` (val ← old). For `sub`, negate val first so memory is
-  ## decremented. `returnNew` recomputes old±delta into rax; otherwise returns old.
-  if returnNew: g.bindTemp(RDX, ScalarSlot); g.movReg(RDX, val)  # save the original delta
-  if sub:
-    g.ab.tree NegX64: g.emReg val             # val ← -val
-  g.ab.tree LockX64:
-    g.ab.tree XaddX64:
-      g.emMemAt(pReg, pointee)
-      g.emReg val                              # val ← old; [p] += val
-  if returnNew:
-    let op = if sub: SubX64 else: AddX64
-    g.ab.tree op: g.emReg val; g.emReg RDX     # new = old ± delta
-    g.unbindTemp(RDX)
-  g.movReg(RAX, val)
-
-proc genAtomicLoopRmw(g: var CodeGen; pReg, val: Reg; pointee: Cursor; op: X64Inst) =
-  ## `rax = [p]; loop: rdx = rax op val; lock cmpxchg [p], rdx; jne loop`. There
-  ## is no lock-fetch form for and/or/xor that yields the old value, so spin on
-  ## cmpxchg. Result (old) ends up in rax.
-  let lDone = g.freshLabel()
-  g.ab.tree MovX64: (g.emReg RAX; g.emMemAt(pReg, pointee))   # rax = [p]
-  g.withFixed(RDX):
-    g.emitLoop:
-      g.movReg(RDX, RAX)
-      g.ab.tree op: g.emReg RDX; g.emReg val         # rdx = rax op val (the new value)
-      g.ab.tree LockX64:
-        g.ab.tree CmpxchgX64:
-          g.emMemAt(pReg, pointee)
-          g.emReg RDX                                 # if [p]==rax: [p]=rdx else rax=[p]
-      g.emJcc(JeX64, lDone)                           # cmpxchg succeeded (ZF=1) → exit forward
-    g.emLab(lDone)                                    # else fall to the back-edge and retry
-
 # ── mem* intrinsics: inline byte loops (no libc) ─────────────────────────────
 # memcpy/memmove/memset/memcmp masquerade as importc calls (see programs.collect).
 # arkham has no C runtime, so each lowers to a short inline byte loop. Sizes are
 # runtime values; the result lands in RAX (memcpy/memmove/memset return dest,
 # memcmp the first byte difference). Unlike the AArch64 backend these can't use
-# the 2-register scratch pool (it can't hold dst+src+n+i+b at once), so — like the
-# atomics — they evaluate operands into fixed caller-saved registers (rdi/rsi/rdx/
+# the 2-register scratch pool (it can't hold dst+src+n+i+b at once), so they
+# evaluate operands into fixed caller-saved registers (rdi/rsi/rdx/
 # rcx/r8): free scratch since a mem* sequence contains no calls.
 
 proc emByteAt(g: var CodeGen; base, idx: Reg) =
@@ -2283,69 +2248,178 @@ proc emitMemIntrin2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
   g.bindTemp(RSI, s); g.bindTemp(RDX, s); g.bindTemp(RCX, s)
   g.genMemIntrinBody(builtin)
 
-proc emitAtomic2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
-  ## Value-core `__atomic_*` builtin: allocCall placed the args in the ABI integer
-  ## registers (ptr→rdi, val/exp→rsi, des→rdx, …), so emit them, then the inline
-  ## lock-prefixed sequence using those registers (the register-parameterized
-  ## `genAtomicXadd`/`genAtomicLoopRmw` helpers, shared with the legacy path).
-  ## Result → rax (moved to its home by emitCall2). Pointer args stay raw ABI regs.
-  # Only the leading ptr / val / exp / des operands feed the inline lock sequence.
-  # x86-64's strong memory model needs no runtime copy of the trailing memory-order /
-  # `weak` / success / failure arguments (all compile-time constants), so emitting them
-  # was dead — a `lea;movsxd` rodata load per order enum. Emit just the consumed prefix.
-  let usedArgs =
-    case builtin
-    of "__atomic_thread_fence", "__atomic_signal_fence": 0
-    of "__atomic_load_n": 1
-    of "__atomic_compare_exchange_n": 3
-    else: 2                                           # store/exchange/fetch_* : ptr,val
-  for i in 0 ..< min(usedArgs, argCurs.len): g.emitValue2(argCurs[i])  # → rdi / rsi / rdx
-  # The inline lock-prefixed sequence uses rdi/rsi/rdx/rax/rcx as RAW ABI scratch
-  # (`emReg` emits `(reg)`); a call-free local the allocator homed in one of these
-  # leaves a stale typed name that `emReg` would emit instead, mismatching the typed
-  # `(mem …)` operand under nifasm's strict xchg/cmpxchg check (e.g. a `(ptr object)`
-  # local name vs the pointee-typed memory). Kill those bindings so the sequence sees
-  # raw registers, mirroring `emitMemIntrin2`'s explicit rebinds.
-  for r in [RDI, RSI, RDX, RCX, RAX]: g.releaseStaleName(r)
-  # Width of the atomic access = the pointee of the first (pointer) arg. Sizing the
-  # `(mem …)` operands by this type is what keeps a sub-64-bit atomic from spilling
-  # into the adjacent field (see emMemAt). All `__atomic_*` take `ptr T` as arg0.
-  var pointee = g.getType(argCurs[0])
-  if isPtrType(pointee): inc pointee
-  else: pointee = g.prog.intType
-  case builtin
-  of "__atomic_load_n":                              # (ptr, mo) → *ptr
-    g.ab.tree MovX64: (g.emReg RAX; g.emMemAt(RDI, pointee))
-  of "__atomic_store_n":                             # (ptr, val, mo) → void
-    g.ab.tree MovX64: (g.emMemAt(RDI, pointee); g.emReg RSI)
-  of "__atomic_fetch_add": g.genAtomicXadd(RDI, RSI, pointee, returnNew = false, sub = false)
-  of "__atomic_fetch_sub": g.genAtomicXadd(RDI, RSI, pointee, returnNew = false, sub = true)
-  of "__atomic_add_fetch": g.genAtomicXadd(RDI, RSI, pointee, returnNew = true, sub = false)
-  of "__atomic_sub_fetch": g.genAtomicXadd(RDI, RSI, pointee, returnNew = true, sub = true)
-  of "__atomic_fetch_and": g.genAtomicLoopRmw(RDI, RSI, pointee, AndX64)
-  of "__atomic_fetch_or":  g.genAtomicLoopRmw(RDI, RSI, pointee, OrX64)
-  of "__atomic_fetch_xor": g.genAtomicLoopRmw(RDI, RSI, pointee, XorX64)
-  of "__atomic_exchange_n":                          # (ptr, val, mo) → old
-    g.ab.tree XchgX64: (g.emMemAt(RDI, pointee); g.emReg RSI)  # rsi ↔ [rdi] (locked); rsi ← old
-    g.movReg(RAX, RSI)
-  of "__atomic_thread_fence": g.ab.keyword MfenceX64
-  of "__atomic_signal_fence": discard                # compiler barrier only
-  of "__atomic_compare_exchange_n":                  # (ptr, exp_ptr, des, weak, succ, fail) → bool
-    g.ab.tree MovX64: (g.emReg RAX; g.emMemAt(RSI, pointee))   # rax = *exp (the comparand)
+proc atomicValueIsImm(loc: Location): bool {.inline.} = loc.kind == Imm
+
+proc seedWork(g: var CodeGen; work: Reg; val: Location) =
+  ## Load the atomic's VALUE operand into the working register — a register copy, or
+  ## `mov work, imm` when the allocator left it a literal (see `allocInstr`).
+  if val.kind == Imm: g.placeImm(work, val)
+  else: g.movReg(work, val.r)
+
+proc workOp(g: var CodeGen; op: X64Inst; work: Reg; val: Location) =
+  ## `work <op>= val`, immediate or register.
+  if val.kind == Imm: g.binImm(op, work, val.ival)
+  else: g.binReg(op, work, val.r)
+
+proc genAtomicXadd(g: var CodeGen; dst, pReg, work: Reg; val: Location;
+                   pointee: Cursor; returnNew, sub: bool) =
+  ## `lock xadd [p], work` with `work` seeded from `val` — the exchange leaves the
+  ## OLD value in `work`. For `sub` the addend is negated first, so memory is
+  ## decremented; `returnNew` then recomputes `old ± delta`, for which `val` is still
+  ## available (the sequence writes only `work` and `dst`).
+  g.seedWork(work, val)
+  if sub:
+    g.ab.tree NegX64: g.emReg work            # work ← -delta
+  g.ab.tree LockX64:
+    g.ab.tree XaddX64:
+      g.emMemAt(pReg, pointee)
+      g.emReg work                             # work ← old; [p] += work
+  if returnNew:
+    g.workOp(if sub: SubX64 else: AddX64, work, val)   # new = old ± delta
+  g.movReg(dst, work)
+
+proc genAtomicLoopRmw(g: var CodeGen; dst, pReg, work: Reg; val: Location;
+                      pointee: Cursor; op: X64Inst) =
+  ## `rax = [p]; loop: work = rax op val; lock cmpxchg [p], work; jne loop`. There
+  ## is no lock-prefixed fetch form for and/or/xor that yields the old value, so
+  ## spin on `cmpxchg` — whose comparand register is architecturally `rax`. The old
+  ## value ends up there and moves to `dst` once the loop is left.
+  let lDone = g.freshLabel()
+  g.ab.tree MovX64: (g.emReg RAX; g.emMemAt(pReg, pointee))   # rax = [p]
+  g.emitLoop:
+    g.movReg(work, RAX)
+    g.workOp(op, work, val)                         # work = rax op val (the new value)
     g.ab.tree LockX64:
       g.ab.tree CmpxchgX64:
-        g.emMemAt(RDI, pointee)
-        g.emReg RDX                                  # if [rdi]==rax: [rdi]=rdx,ZF=1 else rax=[rdi]
-    let lFail = g.freshLabel()
-    let lDone = g.freshLabel()
-    g.emJcc(JneX64, lFail)
-    g.movImm(RAX, 1); g.emJmp(lDone)                 # success → 1
-    g.emLab(lFail)
-    g.ab.tree MovX64: (g.emMemAt(RSI, pointee); g.emReg RAX)   # *exp = actual old value (rax)
-    g.movImm(RAX, 0)                                 # failure → 0
-    g.emLab(lDone)
-  else:
-    raiseAssert "arkham x64n: unsupported atomic builtin: " & builtin
+        g.emMemAt(pReg, pointee)
+        g.emReg work                                # if [p]==rax: [p]=work else rax=[p]
+    g.emJcc(JeX64, lDone)                           # cmpxchg succeeded (ZF=1) → exit forward
+  g.emLab(lDone)                                    # else fall to the back-edge and retry
+  g.movReg(dst, RAX)
+
+proc instrOperandReg(g: CodeGen; cur: Cursor): Reg =
+  ## The register an already-emitted `(instr …)` operand landed in. `allocInstr`
+  ## asked for `NeedsReg` on every operand a lowering reads, so anything else here
+  ## is an allocator bug, not a source-level condition.
+  let l = g.ra.locs[cursorToPosition(g.buf[], cur)]
+  if l.kind != InReg:
+    raiseAssert "arkham x64n: intrinsic operand is not in a register"
+  l.r
+
+proc atomicPointee(g: var CodeGen; ptrArg: Cursor): Cursor =
+  ## The type an atomic accesses: the pointee of its cell operand. Sizing the
+  ## `(mem …)` by it is not a refinement — an untyped operand defaults to a 64-bit
+  ## access, so an atomic on a `uint32` lock word would read and WRITE the four
+  ## adjacent bytes and corrupt whatever field sits next to it (see `emMemAt`).
+  result = g.getType(ptrArg)
+  if isPtrType(result): inc result
+  else: result = g.prog.intType
+
+proc emitAtomicInstr2(g: var CodeGen; c: Cursor; op: IntrinsicOp;
+                      argCurs: seq[Cursor]; res: Location) =
+  ## An atomic row's x86-64 sequence, on operands the ALLOCATOR placed (see the
+  ## section header above for the register discipline). `res` is the row's result
+  ## home, and is `Undef` for the rows that produce no value.
+  # A fence has no cell operand at all — and its memory order is not evaluated —
+  # so it must be answered before anything reads `argCurs[0]`.
+  case op
+  of AtomicThreadFenceOp:
+    g.mirrorClearAll()                    # nothing cached may be assumed across it
+    g.ab.keyword MfenceX64
+    return
+  of AtomicSignalFenceOp:
+    # A compiler barrier only: it orders nothing in hardware, and what it forbids
+    # — hoisting a memory access across it — arkham does not do to begin with.
+    return
+  else: discard
+  # Every atomic writes memory that some OTHER thread may also write, so no value
+  # the register mirror is caching may be assumed to survive one. As a call this
+  # clearing came for free from the call handling; as an instruction it is stated.
+  g.mirrorClearAll()
+  # `rax` and `r11` are about to be raw scratch. A dead local can still be sitting
+  # in `regLocal` under its typed name, which `emReg` would emit instead of the raw
+  # tag — a type mismatch against the pointee-typed `(mem …)` operand.
+  for r in [RAX, R11]: g.releaseStaleName(r)
+  let pointee = g.atomicPointee(argCurs[0])
+  let p = g.instrOperandReg(argCurs[0])
+  # The VALUE operand of every row but the compare-exchange (whose operand 1 is the
+  # `expected` POINTER). It may be a folded immediate — see `atomicValueMayBeImm`.
+  let val = if op in {AtomicLoadOp, AtomicCompareExchangeOp}: default(Location)
+            else: g.ra.locs[cursorToPosition(g.buf[], argCurs[1])]
+  if res.kind == InReg and res.isTemp and res.r notin g.boundTemps:
+    g.bindTemp(res.r, res.typ)
+  # The working register, for the forms that need one — a load reads straight into
+  # its destination and a compare-exchange works out of `rax`, so those two take no
+  # `r11` and get no binding for it. Bound to the CELL's type, not a generic scalar:
+  # nifasm type-checks `xchg`/`cmpxchg` against their memory operand, and the cell may
+  # well be a pointer (a lock-free list head is the common case) — an `(i 64)` binding
+  # is rejected against a `(ptr (ptr T))` access.
+  let needsWork = op notin {AtomicLoadOp, AtomicCompareExchangeOp}
+  if needsWork: g.bindTemp(R11, slotOf(g.prog, pointee))
+  block:
+    case op
+    of AtomicLoadOp:
+      # An aligned `mov` IS the atomic load here; the strong memory model does the
+      # acquire for us.
+      g.ab.tree MovX64: (g.emReg res.r; g.emMemAt(p, pointee))
+    of AtomicStoreOp:
+      # `xchg` with a memory operand carries an implicit LOCK, which is what makes
+      # the store sequentially consistent; a plain `mov` would need a trailing
+      # `mfence` to match, for the same cost.
+      g.seedWork(R11, val)
+      g.ab.tree XchgX64: (g.emMemAt(p, pointee); g.emReg R11)
+    of AtomicExchangeOp:
+      g.seedWork(R11, val)
+      g.ab.tree XchgX64: (g.emMemAt(p, pointee); g.emReg R11)   # r11 ↔ [p]; r11 ← old
+      g.movReg(res.r, R11)
+    of AtomicFetchAddOp:
+      g.genAtomicXadd(res.r, p, R11, val, pointee, returnNew = false, sub = false)
+    of AtomicFetchSubOp:
+      g.genAtomicXadd(res.r, p, R11, val, pointee, returnNew = false, sub = true)
+    of AtomicAddFetchOp:
+      g.genAtomicXadd(res.r, p, R11, val, pointee, returnNew = true, sub = false)
+    of AtomicSubFetchOp:
+      g.genAtomicXadd(res.r, p, R11, val, pointee, returnNew = true, sub = true)
+    of AtomicFetchAndOp:
+      g.genAtomicLoopRmw(res.r, p, R11, val, pointee, AndX64)
+    of AtomicFetchOrOp:
+      g.genAtomicLoopRmw(res.r, p, R11, val, pointee, OrX64)
+    of AtomicFetchXorOp:
+      g.genAtomicLoopRmw(res.r, p, R11, val, pointee, XorX64)
+    of AtomicCompareExchangeOp:
+      let ep = g.instrOperandReg(argCurs[1])          # `expected`, a POINTER
+      let des = g.instrOperandReg(argCurs[2])
+      g.ab.tree MovX64: (g.emReg RAX; g.emMemAt(ep, pointee))    # rax = *expected
+      g.ab.tree LockX64:
+        g.ab.tree CmpxchgX64:
+          g.emMemAt(p, pointee)
+          g.emReg des                    # if [p]==rax: [p]=des,ZF=1 else rax=[p]
+      let lFail = g.freshLabel()
+      let lDone = g.freshLabel()
+      g.emJcc(JneX64, lFail)
+      g.movImm(res.r, 1)                                         # success
+      g.emJmp(lDone)
+      g.emLab(lFail)
+      # The failure path MUST publish what was actually there: that is the whole
+      # protocol — the caller retries against the value it now holds.
+      g.ab.tree MovX64: (g.emMemAt(ep, pointee); g.emReg RAX)
+      g.movImm(res.r, 0)
+      g.emLab(lDone)
+    else:
+      # `AtomicTestAndSet` / `AtomicClear`: the rows exist and their `targets` is
+      # empty, so this is the message that column promises.
+      lengError c, "`" & IntrinsicNames[op] & "` has no x86-64 lowering — " &
+                "guard the call with a `when`"
+  if needsWork: g.unbindTemp(R11)
+  # Release the operand temps' nifasm bindings. Ordinarily a volatile temp's binding
+  # dies when the register is rebound for the next value, but an operand that had to
+  # be escalated to a CALLEE-SAVED register (`reserveInstrReg`) may see no such rebind
+  # before the epilogue's `pop` — which nifasm rejects while the register is still
+  # bound to a name.
+  for i in 0 ..< min(IntrinsicRows[op].evaluatedOperands, argCurs.len):
+    let a = g.ra.locs[cursorToPosition(g.buf[], argCurs[i])]
+    if a.kind == InReg and a.isTemp and not (res.kind == InReg and a.r == res.r):
+      g.unbindTemp(a.r)
 
 proc emitBitBuiltin2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
   ## Value-core GCC bit builtin: allocCall placed the single integer argument in rdi
@@ -2424,21 +2498,24 @@ proc emitIntrinsicOps(g: var CodeGen; op: IntrinsicOp; argBits: int;
     raiseAssert "arkham x64n: no lowering for intrinsic `" & IntrinsicNames[op] & "`"
 
 proc x64InoutTag(op: IntrinsicOp): X64Inst =
-  ## The nifasm tag a two-address row emits. Six of these rows are spelled
-  ## differently in source than in the assembler (`bitand` → `(and)`, …) purely
-  ## because Nim's keywords got there first; this is where the two vocabularies
-  ## are reconciled, exactly as `x64FlagOf` reconciles `ovf` → `(of)`.
+  ## The nifasm tag a two-address row emits. Name-for-name throughout — the row's
+  ## name IS the assembler's mnemonic — so this crosses the two ENUMS and nothing
+  ## else; a row that reaches here without a tag is one the table gained and this
+  ## did not, which `NopX64` turns into the caller's `lengError`. (It once also
+  ## reconciled two vocabularies: `bitand` → `(and)`, because the pragma argument
+  ## was an ident and could not be a Nim keyword. It is a string now, and the cover
+  ## names are gone.)
   case op
   of AddOp: AddX64
   of SubOp: SubX64
-  of BitandOp: AndX64
-  of BitorOp: OrX64
-  of BitxorOp: XorX64
-  of ShiftlOp: ShlX64
-  of ShiftrOp: ShrX64
+  of AndOp: AndX64
+  of OrOp: OrX64
+  of XorOp: XorX64
+  of ShlOp: ShlX64
+  of ShrOp: ShrX64
   of SarOp: SarX64
   of NegOp: NegX64
-  of BitnotOp: NotX64
+  of NotOp: NotX64
   of IncOp: IncX64
   of DecOp: DecX64
   else: NopX64
@@ -2525,7 +2602,14 @@ proc emitInstr2(g: var CodeGen; c: Cursor) =
     # names it. `(haddr d)` is what makes that readable off the node.
     g.emitInoutInstr2(c, tgt.op, argCurs)
     return
-  for a in argCurs: g.emitValue2(a)
+  # Only the operands the row says are real — the atomics' trailing memory orders
+  # are never evaluated, and `allocInstr` allocated nothing for them either.
+  for i in 0 ..< min(row.evaluatedOperands, argCurs.len): g.emitValue2(argCurs[i])
+  if tgt.op.isAtomic:
+    # A whole SEQUENCE, not a transliteration of one opcode — and several of these
+    # rows have no result, so this comes before the result check below.
+    g.emitAtomicInstr2(c, tgt.op, argCurs, res)
+    return
   if res.kind != InReg:
     raiseAssert "arkham x64n: intrinsic result is not in a register"
   # Bind the destination before writing it, unless it already holds operand 0 of a
@@ -2538,12 +2622,7 @@ proc emitInstr2(g: var CodeGen; c: Cursor) =
   if inPlace and not aliasesA0:
     if a0.kind == InReg: g.movReg(res.r, a0.r)
     else: g.place2(a0, res.r)
-  proc srcReg(g: CodeGen; cur: Cursor): Reg =
-    let l = g.ra.locs[cursorToPosition(g.buf[], cur)]
-    if l.kind != InReg:
-      raiseAssert "arkham x64n: intrinsic operand is not in a register"
-    l.r
-  let src0 = if inPlace: res.r else: g.srcReg(argCurs[0])
+  let src0 = if inPlace: res.r else: g.instrOperandReg(argCurs[0])
   # A rotate's count is an immediate (the row's second operand is `imm8`), so no
   # `cl` pinning and no clobber of the shift register.
   var rotCount = 0'i64
@@ -2667,10 +2746,6 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor) =
     tgt = g.callTarget[fsym]
     if tgt.memIntrin.len > 0:                        # C mem* intrinsic → inline loop
       g.emitMemIntrin2(argCurs, tgt.memIntrin)
-      if resLoc.kind == InReg and resLoc.r != RAX: g.movReg(resLoc.r, RAX)
-      return
-    if tgt.atomic.len > 0:                           # __atomic_* builtin → inline sequence
-      g.emitAtomic2(argCurs, tgt.atomic)
       if resLoc.kind == InReg and resLoc.r != RAX: g.movReg(resLoc.r, RAX)
       return
     if tgt.bitBuiltin.len > 0:                        # GCC bit builtin (ctz/…) → inline bsf/…
@@ -5637,8 +5712,9 @@ proc isResultName(nm: string): bool {.inline.} =
 proc x64FlagOf(op: IntrinsicOp): X64Flag =
   ## The nifasm condition tag a flag-read row denotes. `(ite (zf) …)` already
   ## exists in the assembler with all ten x86 conditions, so a flag intrinsic is
-  ## a rename, not a new mechanism — the row says which bit and which polarity,
-  ## and this is the one place the two vocabularies meet.
+  ## no new mechanism — the row says which bit and which polarity, and this maps
+  ## the one enum to the other. Name-for-name, `of`/`no` included (they were once
+  ## `ovf`/`novf`, for want of a keyword in ident position).
   case op
   of ZfOp: ZfO
   of NotZfOp: NzO
@@ -6238,7 +6314,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   if not g.cleanSigComputed:                   # compute the clean-signature set once
     g.cleanSigProcs = cleanSigProcNames(g.prog)
     g.cleanSigComputed = true
-  let an = analyseProc(g.buf[], info.decl, atomicCalls = g.atomicCallNames,
+  let an = analyseProc(g.buf[], info.decl,
                        cleanCallees = g.cleanSigProcs,
                        procIsClean = isCleanSigProc(g.prog, info.decl),
                        entryLeadingClobber = info.isEntry and g.hasGlobalInits)
@@ -6311,7 +6387,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     g.ra.usedCallee.incl RBX                   # saved/restored like any callee reg
   # The entry injects a `call` to the synthetic global-init proc, so it makes a call
   # even when its own body does not — keep rsp 16-aligned for that call.
-  g.computeFrameX64(info.isEntry, an.hasRealCall or (info.isEntry and g.hasGlobalInits),
+  g.computeFrameX64(info.isEntry, an.hasCall or (info.isEntry and g.hasGlobalInits),
                     g.ra.hasStackParams)   # allocator's decision (it reserved the base reg)
   # Pure-emit path: the allocator already assigned every value position; emit once.
   g.ab.planning = false
@@ -6431,12 +6507,6 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool): string =
   g.ab.renderReg = x64RegName                 # render register slots as x86 names
   g.prog = collect(buf, inputPath, tags)
   g.callTarget = g.prog.callTarget
-  # Names the emitter lowers INLINE as an atomic sequence (`emitAtomic2`) rather than a
-  # real `call`. Their clobber is limited to rax + arg regs (rdi/rsi/rdx), so a local that
-  # crosses one still survives in r8/r9 — the analyser needs this set to avoid over-
-  # counting them as full call points (which would force a spill / callee-saved home).
-  for nm, ct in g.callTarget:
-    if ct.atomic.len > 0: g.atomicCallNames.incl nm
   g.globals = g.prog.globals
   g.tvars = g.prog.tvars
   for nm in g.tvars.keys: g.tvarNames.incl nm

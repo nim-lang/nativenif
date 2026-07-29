@@ -112,10 +112,10 @@ expression evaluator:
   and the marshalling of a single call can overwrite the source of one of its own
   later arguments — the general fix for which is a parallel-copy (shuffle)
   algorithm with cycle breaking. Partitioning is how this codegen avoids needing
-  one. `atomicSafeTempRegs` (x86-64 r8/r9, AArch64 x6/x7) is therefore usable only
-  for a value crossing an **inlined atomic**, which marshals nothing through those
-  registers and contains no `call`; it must never host a value crossing a real
-  call. `callerSaveHomeCandidates` enforces exactly that.
+  one. `rescueHomeRegs` (x86-64 r8/r9, AArch64 x6/x7) is therefore reserved for the
+  **caller-save rescue** alone, where each crossed call is bracketed with an explicit
+  save/restore; it must never host a value that is merely live across a call.
+  `callerSaveHomeRegs` enforces exactly that.
 
 - **Aggregate results.** A ≤16-byte aggregate is returned by value in the result
   registers (x0:x1 / rax:rdx); a larger one is returned through a hidden pointer

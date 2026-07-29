@@ -216,18 +216,14 @@ proc callerSaveHomeCandidates(b: Builder): seq[Reg] =
   ## That invariant is what makes the ABI correct here without any shuffle analysis —
   ## the same reason a stack-machine codegen like chibicc's is trivially correct.
   ##
-  ## `atomicSafeTempRegs` is @[r8, r9] on x86-64 and @[x6, x7] on AArch64 — ARGUMENT
+  ## `rescueHomeRegs` is @[r8, r9] on x86-64 and @[x6, x7] on AArch64 — ARGUMENT
   ## registers on both. Homing a cross-call value there breaks the partition, and every
   ## patch on top (per-argument clobber unions, outgoing-arg-span pre-passes) is just
   ## re-deriving the parallel-copy analysis the partition exists to avoid. So: no
   ## argument register may be a cross-call home. On both current targets that empties
   ## this pool and cross-call values go to callee-saved homes, as the design says.
-  ##
-  ## NOT the same as `R89Ok` (a value crossing only INLINED ATOMICS), which still uses
-  ## `atomicSafeTempRegs` directly and is sound: an inlined atomic marshals nothing
-  ## through r8/r9 and contains no `call`, so there is no shuffle to collide with.
   result = @[]
-  for r in b.md.atomicSafeTempRegs:
+  for r in b.md.rescueHomeRegs:
     var isArgReg = false
     for ar in b.md.intArgRegs:
       if ar == r: (isArgReg = true; break)
@@ -281,14 +277,6 @@ proc allocStorage(b: var Builder; slot: AsmSlot; props: VarProps): Location =
       r = b.takeReg(b.freeVol, [b.md.shiftCountReg])
     if r == NoReg and DivRegOk in props and b.md.divRemReg != NoReg:
       r = b.takeReg(b.freeVol, [b.md.divRemReg])
-  elif R89Ok in props and b.md.atomicSafeTempRegs.len > 0:
-    # Live across an INLINED ATOMIC but no REAL call (so not `AllRegs`: an atomic
-    # clobbers its arg regs). The atomic-safe volatile temps (x64 r8/r9, a64 x6/x7)
-    # survive its limited clobber, so PREFER them and reserve the scarce callee-saved
-    # pool for values that cross a real call — shrink-wrap pressure: fewer prologue
-    # pushes on procs whose only call-like ops are inlined atomics.
-    r = b.takeReg(b.freeVol, b.md.atomicSafeTempRegs)
-    if r == NoReg: r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
   else:
     # may be live across a real call → must be callee-saved (or stack)
     r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
@@ -1537,6 +1525,44 @@ proc instrOpOf(b: var Builder; n: Cursor): IntrinsicOp =
       result = instrTargetOf(b.prog[], symName(probe)).op
     while probe.hasMore: skip probe
 
+proc reserveInstrReg(b: var Builder; slot: AsmSlot): Location =
+  ## A register an `(instr …)` operand or result MUST have.
+  ##
+  ## `reserveTmp` is TOTAL but not GUARANTEED: with both pools empty it answers with
+  ## a spill slot, and the emitter folds the value out of memory at the use. That is
+  ## the right answer almost everywhere and the wrong one here — `cmpxchg`, `ldaxr`
+  ## and their kin take a register or nothing, and an intrinsic sequence has no spare
+  ## scratch to load one into (what it owns is fully spoken for). So escalate:
+  ## `reserveHeldScratch` buys a callee-saved register by demoting the coldest local
+  ## to memory, the same optimistic-assignment undo `trySteal` performs. There is no
+  ## call inside an intrinsic, so a callee-saved register is a fine home for it.
+  result = b.reserveTmp(slot)
+  if result.kind != InReg:
+    result = b.reserveHeldScratch("an intrinsic operand")
+    # `reserveHeldScratch` types its answer `ScalarSlot` — right for the address it
+    # normally hands back, wrong here: the caller asked for a specific type and the
+    # emitter binds the register to it. A `nil` or a `(ptr T)` bound as `(i 64)` is
+    # rejected by nifasm at the very use this register exists for.
+    result.typ = slot
+
+proc atomicValueMayBeImm(b: Builder; op: IntrinsicOp; i: int): bool =
+  ## May an atomic's operand `i` stay a literal?
+  ##
+  ## Only the VALUE operand, and only on x86-64, where the sequence seeds its own
+  ## working register (`mov work, imm`) and any `*_fetch` fixup is an `add`/`sub` by
+  ## the same literal — so the value never needs a register of its own. That is not a
+  ## micro-optimisation: `arcInc`'s delta is the literal `1`, and giving it a home
+  ## costs the runtime's hottest leaf a callee-saved push/pop pair.
+  ##
+  ## Not on AArch64: its LL/SC loop already has all three of its scratch registers
+  ## spoken for, so it cannot absorb whatever an out-of-range immediate might need
+  ## to be materialised inside the loop. Not for the compare-exchange either — its
+  ## operand 1 is the `expected` POINTER, and `cmpxchg`'s source must be a register.
+  b.md.arch == X86 and i == 1 and
+    op in {AtomicStoreOp, AtomicExchangeOp, AtomicFetchAddOp, AtomicFetchSubOp,
+           AtomicAddFetchOp, AtomicSubFetchOp,
+           AtomicFetchAndOp, AtomicFetchOrOp, AtomicFetchXorOp}
+
 proc allocInstr(b: var Builder; n: var Cursor; dest: var Location) =
   ## `(instr SYM X*)` — an intrinsic application. The opposite of `allocCall` in
   ## every way that matters: no ABI registers, no call point, no `rax` round trip.
@@ -1550,8 +1576,17 @@ proc allocInstr(b: var Builder; n: var Cursor; dest: var Location) =
   ## Every other operand of a tied row must be an immediate (the row's `loc` is
   ## `imm8`), so no second register can be clobbered by that copy.
   let pos = b.posOf(n)
-  let row = IntrinsicRows[instrOpOf(b, n)]
+  let op = instrOpOf(b, n)
+  let row = IntrinsicRows[op]
   let inoutAt = row.inoutOperand
+  # The atomics declare trailing operands v1 does not read — the memory orders and
+  # `AtomicCompareExchange`'s `weak`. They are not merely allocated-and-unused:
+  # `__ATOMIC_SEQ_CST` and its siblings are `importc` globals with no definition in
+  # a program that links no C runtime, so materialising one would not link. The row
+  # says how many LEADING operands are real; the rest are skipped outright, here and
+  # in the emitter alike. Nothing else has a value below its arity, so this is a
+  # no-op for every other row.
+  let nEval = row.evaluatedOperands
   if inoutAt >= 0:
     # A two-address row writes THROUGH an operand and produces no value, so there
     # is no result to home. Operand `inoutAt` arrives as `(haddr d)`: the callee
@@ -1571,10 +1606,42 @@ proc allocInstr(b: var Builder; n: var Cursor; dest: var Location) =
         inc i
     b.ra.locs[pos] = Location(kind: Undef)   # no value: nothing consumes this node
     return
+  if row.isVoidResult:
+    # `AtomicStore`, `AtomicClear`, the fences. A third shape next to the two
+    # above: no result to home AND no destination operand to write through — the
+    # entire output is the memory effect, which is why the row carries `efWrites`
+    # / `efBarrier` and why nothing may delete it for producing no value. Operands
+    # are ordinary requests; the node itself resolves to `Undef` because, exactly
+    # as for a two-address row, nothing consumes it.
+    var i = 0
+    var opLocs: seq[Location] = @[]
+    n.into:
+      skip n                                 # the callee symbol
+      while n.hasMore:
+        if i >= nEval:
+          skip n                             # an ignored knob — see `nEval` above
+        else:
+          # The operand's OWN slot, not a generic scalar: pre-reserving a register
+          # bypasses `resolveDest`, which is where a leaf would otherwise contribute
+          # its type — and a `nil` or a pointer bound as `(i 64)` fails nifasm's
+          # strict check at the use.
+          var d = if b.atomicValueMayBeImm(op, i): regOrImm(b.tc.exprSlot(n))
+                  else: b.reserveInstrReg(b.tc.exprSlot(n))
+          allocValue(b, n, d)
+          opLocs.add d
+        inc i
+    # Release only once every operand is placed. Freeing each as it is allocated
+    # would let the NEXT one draw the register just freed, and an `AtomicStore`
+    # would then take its cell address and its value from one register.
+    for d in opLocs: b.releaseTmp(d)
+    b.ra.locs[pos] = Location(kind: Undef)
+    return
   # The result lands in a register: the caller's home when it passed one, else a
-  # fresh temp. Do this FIRST and seal it, mirroring the addressing-expression
-  # path, so an operand temp cannot be allocated onto the destination register.
-  b.forceRegDest(dest)
+  # fresh temp — a REAL one, since the emitter writes the instruction's destination
+  # directly and cannot produce into a slot. Do this FIRST and seal it, mirroring the
+  # addressing-expression path, so an operand temp cannot land on the destination.
+  if dest.kind in {NeedsReg, RegOrImm}: dest = b.reserveInstrReg(dest.typ)
+  elif dest.kind == Undef: dest = b.reserveInstrReg(ScalarSlot)
   let resDest = dest
   let sealedHere = resDest.kind == InReg and not resDest.isTemp and
                    resDest.r notin b.ra.sealed
@@ -1584,12 +1651,16 @@ proc allocInstr(b: var Builder; n: var Cursor; dest: var Location) =
     skip n                                   # the callee symbol
     var i = 0
     while n.hasMore:
-      # A tied row's non-tied operands are immediates; `RegOrImm` lets a literal
-      # stay one and forces anything else into a register.
-      var d = if row.tie >= 0 and i != row.tie: regOrImm(ScalarSlot)
-              else: needsReg(ScalarSlot)
-      allocValue(b, n, d)
-      opLocs.add d
+      if i >= nEval:
+        skip n                               # an ignored knob — see `nEval` above
+      else:
+        # A tied row's non-tied operands are immediates; `RegOrImm` lets a literal
+        # stay one and forces anything else into a register.
+        var d = if (row.tie >= 0 and i != row.tie) or b.atomicValueMayBeImm(op, i):
+                  regOrImm(b.tc.exprSlot(n))
+                else: b.reserveInstrReg(b.tc.exprSlot(n))   # its own slot — see above
+        allocValue(b, n, d)
+        opLocs.add d
       inc i
   if sealedHere: b.ra.sealed.excl resDest.r
   for d in opLocs:
@@ -2147,14 +2218,13 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
       # callee-saved reg (the pool is full) would otherwise SPILL — reloaded at every use.
       # Instead give it an atomic-safe caller-save volatile (R8/R9): register-resident
       # between calls, and the emitter brackets each crossed call with a `(scope …)`
-      # save/restore. Restricted to the atomic-safe pool so a var that also crosses an
-      # INLINED atomic (which clobbers rdi/rsi/rdx but not r8/r9) stays sound without a
-      # per-atomic-crossing analysis. Tried BEFORE `trySteal` so it evicts nothing.
+      # save/restore. Restricted to `rescueHomeRegs` so no ordinary allocation can have
+      # drawn the register first. Tried BEFORE `trySteal` so it evicts nothing.
       let vi0 = b.an.vars.getOrDefault(name)
       if not callerSaveDisabled() and
          loc.kind == OnStack and b.md.arch in {X86, Arm64} and AddrTaken notin props and
          slot.inRegClass and not slot.isFloat and
-         AllRegs notin props and R89Ok notin props and
+         AllRegs notin props and
          hasValue and vi0.defs == 1 and vi0.freeAfter != high(int) and
          not initHasCall(valCur) and
          vi0.weight > 2 * callsCrossed(b, vi0):
@@ -2651,10 +2721,11 @@ proc seedPools(b: var Builder) =
   # `divRemOccupied`/`regOccupied` at the div/shift sites). `NoReg` on RISC (a64).
   if b.md.divRemReg != NoReg: b.freeVol.incl b.md.divRemReg
   if b.md.shiftCountReg != NoReg: b.freeVol.incl b.md.shiftCountReg
-  # Caller-save home candidates (x64 R8/R9 — already here via `intLocalTempRegs`; a64 x6/x7
-  # — arg regs NOT otherwise in a pool). Drawn ONLY by the caller-save rescue, which filters
-  # on `atomicSafeTempRegs`, so no ordinary local/temp/AllRegs allocation reaches them.
-  for r in b.md.atomicSafeTempRegs: b.freeVol.incl r
+  # Caller-save rescue candidates (x64 R8/R9 — already here via `intLocalTempRegs`; a64
+  # x6/x7 — arg regs NOT otherwise in a pool). Drawn ONLY by the caller-save rescue,
+  # which filters on `rescueHomeRegs`, so no ordinary local/temp/AllRegs allocation
+  # reaches them.
+  for r in b.md.rescueHomeRegs: b.freeVol.incl r
   # AArch64: the integer return register (x0) joins the pool too, drawn ONLY by the
   # returned local's home (an explicit `[intRetReg]` candidate — never by
   # `intLocalTempRegs`/`intTempRegs`, which exclude it, nor by any temp). `allocParams`

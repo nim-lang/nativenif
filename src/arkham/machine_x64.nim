@@ -77,11 +77,9 @@ const
                                      # leaf-param home in one of these is excluded in `allocParams`;
                                      # `pickStagingScratch` already routes staging around a live
                                      # local/param home (`regHoldsLiveLocal`).
-    atomicSafeTempRegs: @[R8, R9],   # the non-arg subset of intLocalTempRegs: an inlined
-                                     # atomic (emitAtomic2) clobbers only rax + its arg regs
-                                     # rdi/rsi/rdx, so r8/r9 survive it. A var crossing only
-                                     # atomics (VarProp R89Ok) homes here instead of consuming
-                                     # a scarce callee-saved slot a REAL call would demand.
+    rescueHomeRegs: @[R8, R9],       # caller-save rescue homes only (see `rescueHomeRegs`);
+                                     # already reachable via intLocalTempRegs, listed here so
+                                     # the rescue's candidate set is one named place.
     intCalleeSaved: @[RBX, R12, R13, R14, R15],
                                      # NOTE: RBP is free (arkham never sets up an rbp frame) and
                                      # was tried as a 6th callee-saved home — it helps, but under
