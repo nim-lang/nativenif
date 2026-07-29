@@ -924,3 +924,35 @@ proc lvalueGlobalBaseE*(g: var CodeGen; n: Cursor): bool =
         while cc.hasMore: skip cc
     else: result = false
   else: result = false
+
+proc fixedRegsClobberedByE*(g: var CodeGen; n: Cursor): set[Reg] =
+  ## Registers this expression is FORCED to overwrite because the ISA pins
+  ## them: `cl` (rcx) for a runtime shift count, rdx (+rax) for `idiv`. An
+  ## already-marshalled call argument sitting in one of them is destroyed with
+  ## no diagnostic, so the fused call marshaller parks such arguments off
+  ## their ABI register. Empty on AArch64. (Fused port of the allocator's
+  ## `fixedRegsClobberedBy`.)
+  result = {}
+  if g.md.shiftCountReg == NoReg and g.md.divRemReg == NoReg: return
+  var stack = @[n]
+  while stack.len > 0:
+    var c = stack.pop()
+    if c.kind != TagLit: continue
+    case c.exprKind
+    of ShlC, ShrC:
+      if g.md.shiftCountReg != NoReg:
+        var count = c; inc count                 # tag → result type
+        skip count                               # result type → lhs
+        skip count                               # lhs → count
+        if count.hasMore and not isConstShiftCount(count):
+          result.incl g.md.shiftCountReg
+    of DivC, ModC:
+      if g.md.divRemReg != NoReg:
+        result.incl g.md.divRemReg
+        if g.md.intRetReg != NoReg: result.incl g.md.intRetReg
+    else: discard
+    var ch = c
+    ch.into:
+      while ch.hasMore:
+        stack.add ch
+        skip ch
