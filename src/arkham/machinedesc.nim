@@ -62,12 +62,15 @@ type
                                      ## only temp reg, R10, is the staging scratch — a
                                      ## local there starves the emitter); the full temp
                                      ## pool on AArch64 (7 volatile regs, scratch to spare)
-    atomicSafeTempRegs*: seq[Reg]    ## volatiles that survive an INLINED ATOMIC's limited
-                                     ## clobber: a var crossing only atomics (VarProp
-                                     ## `R89Ok`) may home here instead of consuming
-                                     ## callee-saved. x86-64 = @[R8, R9] (outside rax/rdi/
-                                     ## rsi/rdx); AArch64 = @[R6, R7] (outside x0–x5 that
-                                     ## atomics touch, and outside the x9–x15 scratch pool)
+    rescueHomeRegs*: seq[Reg]        ## ARGUMENT registers that no ordinary allocation
+                                     ## draws, kept for the caller-save rescue alone (a
+                                     ## spilled hot var re-homed here and bracketed with an
+                                     ## explicit save/restore around each crossed call).
+                                     ## x86-64 = @[R8, R9]; AArch64 = @[R6, R7]. They are
+                                     ## argument registers, so `callerSaveHomeRegs` filters
+                                     ## them right back out — see the note there and
+                                     ## `design.md`: no argument register may host a value
+                                     ## that is live across a call.
     intCalleeSaved*: seq[Reg]        ## callee-saved (locals live across a call)
     floatTempRegs*: seq[FReg]        ## caller-saved FP scratch
     floatCalleeSaved*: seq[FReg]     ## callee-saved FP regs

@@ -32,7 +32,7 @@
     (i 32)))
   (bool)
   (pragmas
-   (importc "__atomic_compare_exchange_n"))
+   (intrinsic "AtomicCompareExchange"))
   (stmts .))
  (proc :main.0
   (params)
@@ -49,7 +49,7 @@
     (i 32)0)
    (var :ok.0 .
     (bool)
-    (call acx.0
+    (instr acx.0
      (addr
       (dot o.0 state.0 0))
      (addr exp.0)1

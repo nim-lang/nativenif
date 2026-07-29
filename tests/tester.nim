@@ -37,7 +37,7 @@ const arkhamKnownUnsupported: seq[string] =
 # reasons apart — a stem belongs here when the FIXTURE is x86-64-specific, and in
 # `arkhamDarwinUnsupported` when the fixture is fine but the OS differs.
 const arkhamA64Unsupported: seq[string] = @[
-  # x86-64 target-pinned instructions (`{.instruction: bsf.}` and friends). Being
+  # x86-64 target-pinned instructions (`{.instruction: "bsf".}` and friends). Being
   # unavailable on a64 is the POINT — the row's `targets` column says so and the
   # backend errors at the call site naming the target, exactly as C does. The
   # portable counterparts are covered by `intrinsics`, which runs on both.

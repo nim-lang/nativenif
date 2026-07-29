@@ -22,7 +22,7 @@
    (param :mo.0 .
     (i 32))).
   (pragmas
-   (importc "__atomic_store_n"))
+   (intrinsic "AtomicStore"))
   (stmts .))
  (proc :acx.0
   (params
@@ -42,7 +42,7 @@
     (i 32)))
   (bool)
   (pragmas
-   (importc "__atomic_compare_exchange_n"))
+   (intrinsic "AtomicCompareExchange"))
   (stmts .))
  (proc :main.0
   (params)
@@ -50,11 +50,11 @@
   (pragmas
    (exportc "main"))
   (stmts
-   (call asn.0
+   (instr asn.0
     (addr v.0)99 0)
    (var :ok.0 .
     (bool)
-    (call acx.0
+    (instr acx.0
      (addr v.0)
      (addr expg.0)1
      (false)0 0))
