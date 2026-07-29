@@ -1032,17 +1032,22 @@ proc emitStackParamLoads(g: var CodeGen; decl: Cursor) =
         let loc = g.ra.locationOfSym(nm)
         assert loc.kind == InReg,
           "arkham v1: stack parameter without a register home: " & nm
+        # RAW register operands: this text is written into the PROLOGUE, which
+        # the body-buffer model emits AFTER the body — `emReg` would render
+        # whatever binding the home register carries post-body, a name that is
+        # not bound yet at this point in program order. (Pre-body the bindings
+        # were empty, so raw is also byte-identical to the old output.)
         if pl.isAgg and not pl.byRef:
           g.ab.tree LeaA64:                   # home ← &[sp + base + byteOff] = sp + imm
-            g.emReg loc.r
+            g.ab.reg loc.r
             g.ab.tree MemX:
-              g.emReg SP
+              g.ab.reg SP
               g.ab.intLit (base + pl.byteOff)
         else:
           g.ab.tree MovA64:                   # home ← [sp + base + byteOff]
-            g.emReg loc.r
+            g.ab.reg loc.r
             g.ab.tree MemX:
-              g.emReg SP
+              g.ab.reg SP
               g.ab.intLit (base + pl.byteOff)
 
 proc emitParamMoves(g: var CodeGen; decl: Cursor) =
@@ -4198,48 +4203,63 @@ proc collectAtScratch2(g: var CodeGen; n: Cursor; res: var HashSet[int]; asBase 
         firstChild = false
         skip cc
 
-proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool) =
+proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool;
+                   frameHasCall: bool) =
+  ## Body-buffer model (the x64 stage-2 twin): the BODY is emitted into a side
+  ## buffer first; the prologue — whose shape (callee-saved pairs, the `(s)`
+  ## region `sub`) is only final once the body is known — is written after it,
+  ## into the main buffer, and the body appended. This is what lets the merged
+  ## value core mint spill slots and draw callee-saved temps INLINE during
+  ## emission. The prologue text is written with POST-body RegBind state, so it
+  ## uses only RAW register operands (see `emitStackParamLoads`).
+  var side = g.ab.sideBuf()
+  swap(g.ab, side)                        # emit into the side buffer; `side` holds main
+  # One scope covers caller-save param bindings (`emRegLocalVar` in
+  # emitParamMoves) and the body locals — `scopeLocals` must be non-empty
+  # before those param binds, and param kills must outlive the body.
+  g.enterScope()
+  if g.retIndirect: g.movReg(g.indirectReg, IndirectResultReg)
+  g.emitParamMoves(info.decl)
+  if info.isEntry and g.hasGlobalInits:           # run runtime global inits at startup
+    g.ab.tree PrepareA64:
+      g.ab.sym g.globalInitSym
+      g.ab.keyword CallA64
+  for st in g.ra.spillTemps:
+    if st.isFloat: g.emFloatStackVar(st.name, st.typ.size * 8)
+    elif isNilSlot(st.typ) or
+         (not cursorIsNil(st.typ.typ) and isPtrType(resolveType(g.prog, st.typ.typ))):
+      g.emTypedStackVar(st.name, st.typ.typ)   # `(nil)` / `(ptr T)` slot keeps its type
+    else: g.emScalarStackVar(st.name)
+  g.retLabel2 = g.freshLabel()
+  g.retLabelUsed2 = false
+  var c = info.decl
+  c.into:
+    inc c; skip c; skip c; skip c
+    if c.stmtKind == StmtsS:
+      c.into:
+        while c.hasMore: (g.genStmt2(c); skip c)
+  g.exitScope()
+  if g.retLabelUsed2: g.emLab(g.retLabel2)
+  if info.isEntry and g.a64Linux:                 # the entry exits by syscall (no epilogue)
+    g.movImm(IntRet, 0)
+    g.movImm(R8, LinuxA64ExitNr.int64)
+    g.ab.tree SvcA64: g.ab.intLit 0
+  swap(g.ab, side)                        # back to the main buffer; `side` holds the body
+  # The body is emitted — `ra.usedCallee`/`usedCalleeF`/`hasStackVars` are final.
+  # Finalize the frame and write the prologue, then splice the body after it.
+  g.computeFrame(frameHasCall)
   g.ab.tree ProcD:
     g.ab.symDef info.asmName
     g.emitSignature(info.decl, declarative)
     g.ab.tree StmtsA64:
-      # One scope covers caller-save param bindings (`emRegLocalVar` in
-      # emitParamMoves) and the body locals — `scopeLocals` must be non-empty
-      # before those param binds, and param kills must outlive the body.
-      g.enterScope()
       if g.hasFrame: framePush(g)
       g.emitStackParamLoads(info.decl)
       if g.ra.hasStackVars:
-        g.ab.tree SubA64: g.emReg SP; g.ab.keyword SsizeX
-      if g.retIndirect: g.movReg(g.indirectReg, IndirectResultReg)
-      g.emitParamMoves(info.decl)
-      if info.isEntry and g.hasGlobalInits:           # run runtime global inits at startup
-        g.ab.tree PrepareA64:
-          g.ab.sym g.globalInitSym
-          g.ab.keyword CallA64
-      for st in g.ra.spillTemps:
-        if st.isFloat: g.emFloatStackVar(st.name, st.typ.size * 8)
-        elif isNilSlot(st.typ) or
-             (not cursorIsNil(st.typ.typ) and isPtrType(resolveType(g.prog, st.typ.typ))):
-          g.emTypedStackVar(st.name, st.typ.typ)   # `(nil)` / `(ptr T)` slot keeps its type
-        else: g.emScalarStackVar(st.name)
-      g.retLabel2 = g.freshLabel()
-      g.retLabelUsed2 = false
-      var c = info.decl
-      c.into:
-        inc c; skip c; skip c; skip c
-        if c.stmtKind == StmtsS:
-          c.into:
-            while c.hasMore: (g.genStmt2(c); skip c)
-      g.exitScope()
-      if g.retLabelUsed2: g.emLab(g.retLabel2)
-      if info.isEntry and g.a64Linux:
-        g.movImm(IntRet, 0)
-        g.movImm(R8, LinuxA64ExitNr.int64)
-        g.ab.tree SvcA64: g.ab.intLit 0
-      else:
+        g.ab.tree SubA64: g.ab.reg SP; g.ab.keyword SsizeX
+      g.ab.append side                            # the body
+      if not (info.isEntry and g.a64Linux):
         if g.ra.hasStackVars:
-          g.ab.tree AddA64: g.emReg SP; g.ab.keyword SsizeX
+          g.ab.tree AddA64: g.ab.reg SP; g.ab.keyword SsizeX
         if g.hasFrame: framePop(g)
         g.ab.keyword RetA64
 
@@ -4301,11 +4321,13 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   # fp/lr only when a `bl` exists (or the entry runs global inits). An atomic is an
   # instruction now, not a call, so a CAS loop no longer drags a frame onto an
   # otherwise-leaf hot path (rawDealloc and friends) — that is what `hasCall` says.
-  g.computeFrame(an.hasCall or (info.isEntry and g.hasGlobalInits))
+  # (The frame itself is finalized INSIDE emitProcBody2, after the body —
+  # body-buffer model.)
   let declarative = isDeclarativeAbi(g.prog, info.decl)
   g.rb.resetProc(); g.aliasToDecl.clear(); g.savedHomes.clear()
   g.noFoldPos = -1
-  g.emitProcBody2(info, declarative)
+  g.emitProcBody2(info, declarative,
+                  frameHasCall = an.hasCall or (info.isEntry and g.hasGlobalInits))
 
 # MODEL: the `StartEmit` per-proc reset in proofs/arkham_bindings.tla. The two-pass seam
 # below must reset every per-proc table (regLocal/boundTemps/freeTmp + the ra.locs snapshot)
