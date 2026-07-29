@@ -206,6 +206,33 @@ proc spill(b: var Builder; slot: AsmSlot): Location =
   b.ra.frameSize += align(max(slot.size, 1), 8)
   result = stackLoc(-b.ra.frameSize, slot)
 
+proc callerSaveHomeCandidates(b: Builder): seq[Reg] =
+  ## Registers eligible to HOME a value that is live across a REAL call.
+  ##
+  ## `design.md` ("How this deals with the ABI") handles the whole calling convention
+  ## by PARTITIONING the register file: argument/return registers are never handed out
+  ## as homes, so "argument shuffling and expression evaluation use disjoint register
+  ## sets" and a call's marshalling can never collide with the values it is marshalling.
+  ## That invariant is what makes the ABI correct here without any shuffle analysis —
+  ## the same reason a stack-machine codegen like chibicc's is trivially correct.
+  ##
+  ## `atomicSafeTempRegs` is @[r8, r9] on x86-64 and @[x6, x7] on AArch64 — ARGUMENT
+  ## registers on both. Homing a cross-call value there breaks the partition, and every
+  ## patch on top (per-argument clobber unions, outgoing-arg-span pre-passes) is just
+  ## re-deriving the parallel-copy analysis the partition exists to avoid. So: no
+  ## argument register may be a cross-call home. On both current targets that empties
+  ## this pool and cross-call values go to callee-saved homes, as the design says.
+  ##
+  ## NOT the same as `R89Ok` (a value crossing only INLINED ATOMICS), which still uses
+  ## `atomicSafeTempRegs` directly and is sound: an inlined atomic marshals nothing
+  ## through r8/r9 and contains no `call`, so there is no shuffle to collide with.
+  result = @[]
+  for r in b.md.atomicSafeTempRegs:
+    var isArgReg = false
+    for ar in b.md.intArgRegs:
+      if ar == r: (isArgReg = true; break)
+    if not isArgReg: result.add r
+
 proc allocStorage(b: var Builder; slot: AsmSlot; props: VarProps): Location =
   ## Decide where one local/param lives. Records reg use for scope freeing.
   if slot.isFloat:
@@ -2146,7 +2173,7 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
         # (declared empty → assigned late), a `var x = f(…)` (defined BY the call it would
         # be saved around — dead before it; the call may be nested in an `(elif…)`), and
         # any var rewritten past a control-flow merge.
-        let r = b.takeReg(b.freeVol, b.md.atomicSafeTempRegs)
+        let r = b.takeReg(b.freeVol, b.callerSaveHomeCandidates())
         if r != NoReg:
           loc = regLoc(r, slot)
           b.ra.callerSaveHomes[name] = vi0.freeAfter
@@ -2492,15 +2519,16 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
               # and csave slot share `(ptr T)` or `(i 64)`. Address-taken params
               # already spilled above; skip caller-save when disabled.
               var placed = false
+              let csHomes = b.callerSaveHomeCandidates()
               if not callerSaveDisabled() and AddrTaken notin props and
-                 b.md.atomicSafeTempRegs.len > 0:
+                 csHomes.len > 0:
                 # Only home in an atomic-safe reg that is not still holding a
                 # *later* param's incoming ABI value. Homing param 0 in x6 when
                 # param 6 arrives in x6 would clobber it (emitParamMoves is
                 # forward-order). Homing param 6 in its own x6, or using x6 when
                 # fewer than 7 int args exist, is fine.
                 var candidates: seq[Reg] = @[]
-                for r in b.md.atomicSafeTempRegs:
+                for r in csHomes:
                   let ai = incomingArgIdxOf(b.md, r)
                   if ai >= 0 and ai > intIdx and ai < intArgsUsed:
                     continue                   # still live as a later incoming arg
