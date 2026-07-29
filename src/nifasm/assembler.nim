@@ -465,6 +465,26 @@ type
     gvarSym: Symbol           # non-nil when the operand is a global's address; the
                               # ELF backend patches its `lea` against the .bss segment
 
+proc checkPtrStore(dest: Type; srcKind: OperandKind; srcTyp: Type; n: Cursor) =
+  ## A `mov` STORES, so it can leave a pointer-typed name holding a non-pointer. The
+  ## only integer literals that may be stored into a pointer are `0` and `(nil)`; any
+  ## other is a type error. Arch-neutral: both `genMovX64` and the a64 `mov` call it.
+  ##
+  ## `compatible` cannot make this call, because it also serves COMPARISON, where a
+  ## pointer against an arbitrary literal is legitimate — `cmp result, -1` is mmap's
+  ## MAP_FAILED test. A compare writes nothing and so cannot corrupt a binding; a store
+  ## can. Conflating the two is what left `(mov <ptr-bound name> 32)` assembling
+  ## silently: exactly the shape a code generator's stale register binding produces,
+  ## which made that whole bug class invisible unless the bad value happened to reach an
+  ## instruction carrying its own type rule (`shl`).
+  if dest == nil or srcTyp == nil or srcKind != okImm: return
+  if srcTyp.kind != TypeKind.IntLitT or srcTyp.litVal == 0: return
+  var d = dest
+  if d.kind == StackOffT: d = d.offType
+  if d.kind in {TypeKind.PtrT, TypeKind.AptrT, TypeKind.ProcT}:
+    error("cannot store the non-zero integer " & $srcTyp.litVal &
+          " into the pointer-typed destination " & $d & " (only 0 / (nil) may be)", n)
+
 proc inCall(ctx: GenContext): bool {.inline.} =
   ## Returns true if we're inside a prepare block
   ctx.callContext.state != CallContextState.Disabled
@@ -1800,7 +1820,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
   elif n.kind == IntLit:
     result.kind = okImm
     result.immVal = getInt(n)
-    result.typ = Type(kind: IntLitT, bits: 64)
+    result.typ = Type(kind: IntLitT, bits: 64, litVal: result.immVal)
     inc n
   elif n.kind == Symbol:
     let name = getSym(n)
@@ -2539,6 +2559,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
                         isIntLike(dest.typ) and isIntLike(op.typ)
       if not sizedMemReg and not movCompatible(dest.typ, op.typ):
         typeError(dest.typ, op.typ, start)
+    checkPtrStore(dest.typ, op.kind, op.typ, start)
     if dest.kind == okMem:
       if op.kind == okImm:
         error("Moving immediate to memory not fully supported yet for ARM64", n)
@@ -3931,6 +3952,25 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
                 displacement = int32(indexSym.offset)
                 stackVarType = if indexSym.typ.kind == StackOffT: indexSym.typ.offType else: indexSym.typ
                 inc n
+                if n.hasMore and n.kind == IntLit:
+                  # `(mem <base> <stackvar> <disp>)` — a raw byte offset WITHIN the named
+                  # slot, folded into the slot's own displacement. This is what lets a
+                  # word of a stack aggregate be read/written without first materializing
+                  # the aggregate's address in a register: a copy out of a named slot then
+                  # costs zero address registers instead of one. The access WIDTH still
+                  # comes from the operand's type, so a caller reading a raw eightbyte
+                  # wraps this in `(cast (u 64) …)`.
+                  #
+                  # Bounds-checked against the slot — the one safety a `(cast (aptr T)
+                  # <reg>)` access can never have, since the register form has no
+                  # object to check against.
+                  let extra = getInt(n)
+                  let slotSize = asmSizeOf(indexSym.typ)
+                  if extra < 0 or extra >= slotSize:
+                    error("offset " & $extra & " is outside stack slot '" & indexName &
+                          "' (" & $slotSize & " bytes)", n)
+                  displacement += int32(extra)
+                  inc n
               elif indexSym != nil and indexSym.kind == skVar and indexSym.reg != InvalidTagId:
                 # This is the index register
                 hasIndex = true
@@ -4059,7 +4099,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
   elif n.kind == IntLit:
     result.kind = okImm
     result.immVal = getInt(n)
-    result.typ = Type(kind: IntLitT, bits: 64)
+    result.typ = Type(kind: IntLitT, bits: 64, litVal: result.immVal)
     inc n
   elif n.kind == Symbol:
     let name = getSym(n)
@@ -4197,7 +4237,14 @@ proc parseDest(n: var Cursor; ctx: var GenContext): Operand =
     result.typ =
       if paramPtr.typ.kind in {TypeKind.ObjectT, TypeKind.ArrayT, TypeKind.UnionT}: Type(kind: RegisterT, regBits: 64)
       else: paramPtr.typ
-  elif n.kind == TagLit and (n.tag == MemTagId or n.tag == DotTagId or n.tag == AtTagId):
+  elif n.kind == TagLit and (n.tag == MemTagId or n.tag == DotTagId or n.tag == AtTagId or
+                             n.tag == CastTagId):
+    # `(cast T <mem>)` is a legal destination: a cast only retypes an operand, and a
+    # memory operand is a legal destination, so retyping one is too. This is how a raw
+    # eightbyte is STORED into a named stack slot at an offset — `(cast (u 64) (mem (rsp)
+    # v 8))` — where the slot's own declared (aggregate) type would otherwise size the
+    # access. `okMem` is still required, so `(cast T (reg))` remains rejected: a register
+    # destination must be a typed binding, never a retyped raw register.
     let op = parseOperand(n, ctx)
     if op.kind != okMem:
       error("Expected memory destination", n)
@@ -4577,6 +4624,7 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
     if not sizedMemReg and not wideningRegReg and not narrowingArgReg and
        not addrWidthMove(dest.typ, op.typ):
       checkType(dest.typ, op.typ, start)
+  checkPtrStore(dest.typ, op.kind, op.typ, start)
 
   if dest.kind == okMem:
     if op.kind == okImm:

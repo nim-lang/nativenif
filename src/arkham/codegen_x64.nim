@@ -261,11 +261,13 @@ proc flushArgResidentParams(g: var CodeGen) =
       g.regLocal.del r
   g.argResidentParams.setLen 0
 
+proc releaseStaleName(g: var CodeGen; r: Reg)
+
 proc releaseArgDest(g: var CodeGen; r: Reg; valueSym: string) =
   ## An argument value is about to be MATERIALIZED into argument register `r`. Any name
   ## still bound to `r` is stale — the marshalling overwrites the register — and `emReg`
   ## would write the new value under that stale name, whose type generally does not admit
-  ## it. Two shapes reach here, both nifasm type errors:
+  ## it. THREE shapes reach here, all nifasm type errors:
   ##
   ## * an `ArgResident` param (one that kept its incoming arg register): its binding
   ##   carries the param's PRECISE ABI type, so `(mov p1.0 92)` into an `(i 8)` param is
@@ -273,23 +275,28 @@ proc releaseArgDest(g: var CodeGen; r: Reg; valueSym: string) =
   ##   flush only runs AFTER the first call, too late for that call's OWN arguments.
   ## * a leftover `bindTemp` scratch, e.g. the `(nil)`-typed binding a nil argument left
   ##   on an arg register: a later `(u 64)` word marshalled through it does not fit.
+  ## * an ordinary register-homed LOCAL. `intLocalTempRegs` on x86-64 IS the argument
+  ##   register set (rdi/rsi/r8/r9), so a call-free local routinely homes in one — e.g. a
+  ##   `(ptr T)` local in rdi, then `(mov <that name> (mem …))` of an integer argument.
+  ##   This shape is the reason the doc above used to say "two".
   ##
-  ## Both are dead here by construction — the allocator would not hand the register to
-  ## another value otherwise. Skipped when the value IS that symbol, which legitimately
-  ## reads through the name.
+  ## All three are dead here by construction, and for the same reason: the allocator hands
+  ## a caller-saved register to another value only when nothing live occupies it, and it
+  ## homes a local in one only under `AllRegs` — the analyser's proof that the local's
+  ## live range crosses NO call. This IS a call. So the value being built cannot read the
+  ## bound name either, which is what makes killing it before `emitValue2` safe. Skipped
+  ## when the value IS that symbol, which legitimately reads through the name.
   let bound = g.regLocal.getOrDefault(r, "")
   if bound.len == 0 or bound == valueSym: return
   if r in g.boundTemps:
     g.unbindTemp(r)                                 # kills the name, drops the binding
-    g.regBindPtr.excl r
     return
   for i in 0 ..< g.argResidentParams.len:
     if g.argResidentParams[i].r == r and g.argResidentParams[i].name == bound:
-      g.ab.tree KillX64: g.ab.sym bound
-      g.regLocal.del r
-      g.regBindPtr.excl r
+      g.releaseStaleName(r)
       g.argResidentParams.del i
       return
+  g.releaseStaleName(r)                             # a register-homed local, dead at a call
 
 proc mirrorClearVar(g: var CodeGen; name: string) =
   ## `name`'s memory changed (a store to it) → its cached copies are stale.
@@ -482,6 +489,7 @@ proc exitScope(g: var CodeGen) =
 
 proc emStackVar(g: var CodeGen; name, typeName: string) =
   ## `(var :name (s) typeName)` — a nifasm-managed aggregate stack slot.
+  g.stackSlots.incl name
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
   g.ab.keyword SO
@@ -490,6 +498,7 @@ proc emStackVar(g: var CodeGen; name, typeName: string) =
 
 proc emScalarStackVar(g: var CodeGen; name: string) =
   ## `(var :name (s) (i 64))` — a spilled/address-taken scalar's 8-byte slot.
+  g.stackSlots.incl name
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
   g.ab.keyword SO
@@ -501,6 +510,7 @@ proc emTypedStackVar(g: var CodeGen; name: string; t: Cursor) =
   ## generic `(i 64)` slot) for a homed/spilled scalar whose type matters to
   ## nifasm — e.g. a pointer param that the body later derefs, where an `(i 64)`
   ## slot would both reject the typed store and forbid the deref (nifasm is strict).
+  g.stackSlots.incl name
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
   if isNilValue(t):                          # a spilled nil → `(s) (nil)` (8-byte, align 8)
@@ -856,6 +866,7 @@ proc releaseStaleName(g: var CodeGen; r: Reg) =
   ## the i64 `start` param → nifasm strict-type mismatch). `(kill)` the binding and
   ## drop it so `emReg` falls back to the raw `(reg)` tag (untyped scratch).
   g.mirrorInvalidate(r)                          # r about to be raw scratch → any cached value dies
+  g.regBindPtr.excl r                            # no binding ⇒ not a pointer-typed one
   if r != NoReg and g.regLocal.hasKey(r):
     g.ab.tree KillX64: g.ab.sym g.regLocal[r]
     g.regLocal.del r
@@ -2746,6 +2757,10 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor) =
       elif g.isFloatExpr(a):
         g.emitValue2(a)                                 # → its xmm arg register
       else:
+        block:                                          # free a stale name on the ABI register
+          let aPre = g.ra.locs[cursorToPosition(g.buf[], a)]
+          if aPre.kind == InReg:
+            g.releaseArgDest(aPre.r, (if a.kind == Symbol: symName(a) else: ""))
         g.emitValue2(a)                                 # → its GPR arg register
         inc intIdx
       for k in intIdx0 ..< min(intIdx, g.md.intArgRegs.len):
@@ -4185,20 +4200,92 @@ proc emByteAtImm(g: var CodeGen; p: Reg; off: int) =
         g.emReg p
       g.ab.intLit off.int64
 
-proc copyAggr(g: var CodeGen; dst, src: Reg; size: int; tmp: Reg) =
-  ## copy `size` bytes from `[src]` to `[dst]` through the bound scratch `tmp` — 8-byte
-  ## words for the aligned bulk, then a sized byte tail. Layout-agnostic and byte-accurate,
-  ## so it is TOTAL for any aggregate regardless of field packing; both ends are just an address
-  ## in a register. nifasm's sized mem↔reg move extends a byte load / truncates a byte
-  ## store, so `tmp` stays a plain `(u 64)`. (`dst`, `src`, `tmp` are bound by the caller.)
+proc emWordAtSlot(g: var CodeGen; name: string; off: int) =
+  ## `(cast (u 64) (mem (rsp) name off))` — the eightbyte at byte offset `off` of the
+  ## NAMED stack slot `name`, typed as a raw word. The pointer twin `emWordThroughPtr`
+  ## needs the slot's ADDRESS in a register first; this needs no register at all,
+  ## because nifasm folds `off` into the slot's own rsp displacement (and bounds-checks
+  ## it against the slot, which the register form cannot).
+  g.ab.tree CastX:
+    g.ab.uintType(64)
+    g.ab.tree MemX:
+      g.ab.reg RSP
+      g.ab.sym name
+      g.ab.intLit off.int64
+
+proc emByteAtSlot(g: var CodeGen; name: string; off: int) =
+  ## The byte-granular `emWordAtSlot`, for a copy's sub-word tail.
+  g.ab.tree CastX:
+    g.ab.uintType(8)
+    g.ab.tree MemX:
+      g.ab.reg RSP
+      g.ab.sym name
+      g.ab.intLit off.int64
+
+type AggrEnd = object
+  ## One end (source or destination) of a whole-aggregate copy, in the form the MACHINE
+  ## can actually address it:
+  ##   * a NAMED rsp-relative `(s)` slot — costs ZERO registers, each word addressed as
+  ##     `(mem (rsp) slot off)`;
+  ##   * an address already materialized in a register — costs one.
+  ## Making the form explicit is what TIERS the copy's register demand: a copy between
+  ## two named slots needs only the transfer register, one named end needs two, and only
+  ## a copy between two computed addresses needs the three that used to be demanded
+  ## unconditionally. That last tier is what exhausted the emit-time staging pool under
+  ## `-d:danger` (every volatile hosting a call-free local), and it is now rare rather
+  ## than universal.
+  slot: string        ## non-empty ⇒ an rsp-relative named slot
+  reg: Reg            ## else, the register holding the aggregate's address
+
+proc slotEnd(name: string): AggrEnd {.inline.} = AggrEnd(slot: name, reg: NoReg)
+proc regEnd(r: Reg): AggrEnd {.inline.} = AggrEnd(slot: "", reg: r)
+
+proc emWordAt(g: var CodeGen; e: AggrEnd; idx: int) =
+  if e.slot.len > 0: g.emWordAtSlot(e.slot, idx * 8)
+  else: g.emWordThroughPtr(e.reg, idx)
+
+proc emByteAt(g: var CodeGen; e: AggrEnd; off: int) =
+  if e.slot.len > 0: g.emByteAtSlot(e.slot, off)
+  else: g.emByteAtImm(e.reg, off)
+
+proc copyAggr(g: var CodeGen; dst, src: AggrEnd; size: int; tmp: Reg) =
+  ## Copy `size` bytes from `src` to `dst` through the bound scratch `tmp` — 8-byte words
+  ## for the aligned bulk, then a sized byte tail. Layout-agnostic and byte-accurate, so it
+  ## is TOTAL for any aggregate regardless of field packing. nifasm's sized mem↔reg move
+  ## extends a byte load / truncates a byte store, so `tmp` stays a plain `(u 64)`.
+  ## (`tmp` and any register end are bound by the caller.)
   let words = size div 8
   for i in 0 ..< words:
-    g.ab.tree MovX64: (g.emReg tmp; g.emWordThroughPtr(src, i))
-    g.ab.tree MovX64: (g.emWordThroughPtr(dst, i); g.emReg tmp)
+    g.ab.tree MovX64: (g.emReg tmp; g.emWordAt(src, i))
+    g.ab.tree MovX64: (g.emWordAt(dst, i); g.emReg tmp)
   for b in 0 ..< (size - words * 8):                     # sub-word tail, byte by byte
     let off = words * 8 + b
-    g.ab.tree MovX64: (g.emReg tmp; g.emByteAtImm(src, off))
-    g.ab.tree MovX64: (g.emByteAtImm(dst, off); g.emReg tmp)
+    g.ab.tree MovX64: (g.emReg tmp; g.emByteAt(src, off))
+    g.ab.tree MovX64: (g.emByteAt(dst, off); g.emReg tmp)
+
+proc copyAggr(g: var CodeGen; dst, src: Reg; size: int; tmp: Reg) {.inline.} =
+  ## Both ends are addresses in registers — the historical shape.
+  g.copyAggr(regEnd(dst), regEnd(src), size, tmp)
+
+proc aggrSrcEnd(g: var CodeGen; name: string; staged: var Reg): AggrEnd =
+  ## The copy-source form of the aggregate `name`, and how many registers it costs:
+  ##   * an rsp-relative `(s)` slot — an allocator-homed `NamedStack` local OR an emitter-
+  ##     synthesized temp (`stackSlots`) — costs NOTHING;
+  ##   * a by-ref aggregate param, whose pointer is ALREADY in a register, costs nothing
+  ##     either (the old code copied that register into a fresh staging one);
+  ##   * only a module-level global/const/threadvar genuinely needs an address, because its
+  ##     `lea` is RIP-relative and there is no rsp-relative form of it.
+  ## `staged` receives the register to `giveBack`, or `NoReg`.
+  staged = NoReg
+  let home = g.ra.locationOfSym(name)
+  case home.kind
+  of NamedStack: return slotEnd(name)
+  of InReg: return regEnd(home.r)
+  else:
+    if name in g.stackSlots: return slotEnd(name)
+    staged = g.pickStagingSealed("an aggregate-copy source address", AddrSlot)
+    g.emSymAddrByName(staged, name)
+    return regEnd(staged)
 
 proc emAggrSrcAddr(g: var CodeGen; dest: Reg; name: string) =
   ## `dest ← &name` for an aggregate SOURCE that may be a local stack slot, a by-ref
@@ -4216,14 +4303,16 @@ proc emAggrSrcAddr(g: var CodeGen; dest: Reg; name: string) =
 
 proc copyStructThroughPtr2(g: var CodeGen; srcVar, typeName: string; ptrReg: Reg) =
   ## Copy `srcVar` → the memory `ptrReg` points at (the >16B aggregate hidden-result-
-  ## pointer return). This runs at the `ret` and crosses NO call, so both scratch
-  ## registers it needs — the source address and the word-transfer temp — come from the
-  ## transient staging pool, never a callee-saved survivor (a survivor would force the
-  ## allocator to find a stealable callee-saved local, which can spuriously fail).
-  let sp = g.pickStagingSealed("a struct-through-ptr source pointer", AddrSlot)
-  g.emAggrSrcAddr(sp, srcVar)
+  ## pointer return). This runs at the `ret` and crosses NO call, so its scratch comes
+  ## from the transient staging pool, never a callee-saved survivor (a survivor would
+  ## force the allocator to find a stealable callee-saved local, which can spuriously
+  ## fail). Usually that is ONE register — the word-transfer temp — because the source
+  ## is a stack slot or an already-held pointer (`aggrSrcEnd`); only a global source
+  ## stages a second.
+  var sp = NoReg
+  let src = g.aggrSrcEnd(srcVar, sp)
   let tmp = g.pickStagingSealed("a struct-through-ptr word", AddrSlot, avoid = sp)
-  g.copyAggr(ptrReg, sp, aggrByteSize(g.prog, typeName), tmp)
+  g.copyAggr(regEnd(ptrReg), src, aggrByteSize(g.prog, typeName), tmp)
   g.giveBack tmp
   g.giveBack sp
 
@@ -4284,14 +4373,18 @@ proc marshalAggrFromAddr(g: var CodeGen; addrReg: Reg; typeName: string;
 
 proc flatCopyToPtr(g: var CodeGen; srcVar: string; sizeBytes: int; dstPtr, tmp: Reg) =
   ## Copy the `sizeBytes`-byte aggregate stack slot `srcVar` into `[dstPtr]`, through
-  ## scratch `tmp`. Leas the source's address into one staging register and funnels
-  ## through the one `copyAggr` (word bulk + byte tail — any size, layout-agnostic).
-  let srcPtr = g.pickStagingSealed("a flat-copy source pointer", AddrSlot)
-  g.emAggrSrcAddr(srcPtr, srcVar)
+  ## scratch `tmp`, by the one `copyAggr` (word bulk + byte tail — any size,
+  ## layout-agnostic). `srcVar` is a synthetic `(s)` slot at every call site, so the
+  ## source is addressed straight off rsp and the copy holds TWO registers, not three.
+  ## Three was the count that exhausted the staging pool in `toDecimal64` under
+  ## `-d:danger`, and it was never a machine requirement — only a consequence of forcing
+  ## every source into a register first.
   g.bindTemp(tmp, AsmSlot(cls: AUInt, size: 8, align: 8))
-  g.copyAggr(dstPtr, srcPtr, sizeBytes, tmp)
+  var sp = NoReg
+  let src = g.aggrSrcEnd(srcVar, sp)
+  g.copyAggr(regEnd(dstPtr), src, sizeBytes, tmp)
+  g.giveBack sp
   g.unbindTemp(tmp)
-  g.giveBack srcPtr
 
 proc buildNestedAggrTemp(g: var CodeGen; valC, fty: Cursor): (string, int) =
   ## Build an aggregate field/element value `valC` (an inline `(oconstr/aconstr …)`, an
@@ -4668,6 +4761,17 @@ proc aggrAddrLoc(g: var CodeGen; loc: Location; dest: Reg) =
   of Mem: g.aggrAddrInto(loc.cur, dest, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)
   else: raiseAssert "arkham x64n: aggrAddrLoc of " & $loc.kind
 
+proc aggrDstEnd(g: var CodeGen; loc: Location; staged: var Reg): AggrEnd =
+  ## The copy-destination twin of `aggrSrcEnd`: a `NamedStack` slot is written straight
+  ## through `(mem (rsp) name off)` and costs no register; a global/threadvar/computed
+  ## lvalue must have its address materialized. `staged` receives the register to
+  ## `giveBack`, or `NoReg`.
+  staged = NoReg
+  if loc.kind == NamedStack: return slotEnd(loc.name)
+  staged = g.pickStagingSealed("an aggregate-copy dst address", ScalarSlot)
+  g.aggrAddrLoc(loc, staged)
+  regEnd(staged)
+
 proc isAggrCopySrc(c: Cursor): bool =
   ## An aggregate-valued source that is COPIED (not produced): a symbol or a memory lvalue.
   c.kind == Symbol or (c.kind == TagLit and c.exprKind in {DotC, DerefC, AtC, PatC})
@@ -4683,21 +4787,33 @@ proc dstAggrInfo(g: var CodeGen; dst: Location): (bool, int) =
   else: (false, 0)
 
 proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size, auxPos: int) =
-  ## THE whole-aggregate copy `dst = rhs`: reduce BOTH sides to an address in a register
-  ## (`aggrAddrLoc`/`aggrAddrInto` — the one `gen_addr`), then `copyAggr`. ONE path for
-  ## every (destination form × source form). All three working registers — the two
-  ## addresses and the per-field transfer reg — come from the emit-time STAGING set (the
-  ## R11 bridge + free caller-saved), NOT the allocator pool, so the copy never starves
-  ## when register-homed locals fill the pool. Each is sealed before the next is picked
-  ## (and before address computation, which may itself stage), so they stay disjoint.
+  ## THE whole-aggregate copy `dst = rhs`: reduce each side to the form the machine can
+  ## address it in (`aggrDstEnd`/`aggrSrcEnd`), then `copyAggr`. ONE path for every
+  ## (destination form × source form). The working registers come from the emit-time
+  ## STAGING set (the R11 bridge + free caller-saved), NOT the allocator pool, so the copy
+  ## never starves when register-homed locals fill the pool; each is sealed before the next
+  ## is picked (and before address computation, which may itself stage), so they stay
+  ## disjoint.
+  ##
+  ## The count is TIERED by operand form rather than fixed at three: a named `(s)` slot on
+  ## either side is addressed straight off rsp and needs no register at all, so two named
+  ## ends cost one register (the transfer), one named end costs two, and only a copy
+  ## between two COMPUTED addresses costs three. Three-for-everything was self-inflicted —
+  ## the price of "reduce both sides to an address" — and it is what ran the staging pool
+  ## dry once `-d:danger` filled every volatile with a call-free local.
   g.mirrorClearAll()            # an aggregate store through a computed address may alias any slot
-  let dstAddr = g.pickStagingSealed("an aggregate-copy dst address", ScalarSlot)
-  g.aggrAddrLoc(dst, dstAddr)   # &dst
-  let srcAddr = g.pickStagingSealed("an aggregate-copy src address", ScalarSlot)
-  g.aggrAddrInto(rhs, srcAddr, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)  # &rhs
-  # The two addresses already consumed the R11 bridge, so the per-word transfer
-  # register is a third staging pick and can genuinely fail under pressure. Fall back
-  # to the pool register `allocAggrCopy` reserved for exactly this (it can demote a
+  var dstAddr = NoReg
+  let dstE = g.aggrDstEnd(dst, dstAddr)                                  # &dst (or its slot)
+  var srcAddr = NoReg
+  let srcE =
+    if rhs.kind == Symbol: g.aggrSrcEnd(symName(rhs), srcAddr)
+    else:
+      srcAddr = g.pickStagingSealed("an aggregate-copy src address", ScalarSlot)
+      g.aggrAddrInto(rhs, srcAddr, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)
+      regEnd(srcAddr)
+  # In the top tier both addresses have already consumed the R11 bridge, so the per-word
+  # transfer register is a third staging pick and can genuinely fail under pressure. Fall
+  # back to the pool register `allocAggrCopy` reserved for exactly this (it can demote a
   # local; the emitter cannot). Staging succeeds in the common case, and then the
   # reserved register simply goes unused.
   var tmp = g.pickStagingScratch()
@@ -4709,9 +4825,9 @@ proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size, auxPos: 
     g.releaseStaleName(tmp)      # drop a dead binding so `(rebind)` is legal
     g.ra.seal tmp
     g.bindTemp(tmp, AddrSlot)
-  g.copyAggr(dstAddr, srcAddr, size, tmp)
+  g.copyAggr(dstE, srcE, size, tmp)
   g.giveBack tmp                                                 # unbinds + unseals the bridge
-  g.giveBack srcAddr; g.giveBack dstAddr                         # unbind + unseal
+  g.giveBack srcAddr; g.giveBack dstAddr                         # unbind + unseal (NoReg ⇒ no-op)
 
 proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
   ## The general destination-passing store of the value core. An aggregate COPY (symbol /
@@ -6123,7 +6239,7 @@ proc genAsmProc(g: var CodeGen; info: ProcInfo) =
   ## call it), and the `.register` annotations on the parameters are checked
   ## AGAINST it — in an `.assembler` proc a location constraint is an assertion,
   ## not a request.
-  g.varType.clear(); g.symType.clear()
+  g.varType.clear(); g.symType.clear(); g.stackSlots.clear()
   g.regLocal.clear(); g.aliasToDecl.clear(); g.boundTemps = {}
   g.fregLocal.clear(); g.boundFTmps = {}
   g.scopeLocals = @[]; g.scopeFLocals = @[]

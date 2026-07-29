@@ -86,11 +86,21 @@ an accumulator plus stack spills — and it lets all five of rbx/r12–r15 home
 locals.
 
 Locals are mapped to **callee-saved** registers so they survive calls inside the
-expression; a local with no live range across a call may instead sit in the
-working pool on AArch64 (`intLocalTempRegs`), but never on x86-64 (r10/r11 are
-the emitter's scratch, so a local there would starve it). When the callee-saved
-pool is exhausted, `reserveHeldScratch`/the steal logic demotes the coldest
+expression; a local with no live range across a call may instead sit in
+`intLocalTempRegs` — the volatile registers with no fixed instruction role
+(AArch64 x9–x13; x86-64 rdi/rsi/r8/r9, i.e. the argument registers, but never
+r10/r11, which are the emitter's scratch and bridge). When the callee-saved pool
+is exhausted, `reserveHeldScratch`/the steal logic demotes the coldest
 register-homed local to a stack slot and reuses its register.
+
+Note what that costs on x86-64: those same volatiles are the emitter's
+`StagingCandidates`, so every call-free local homed there is one fewer register the
+emitter can transiently borrow. Under `-d:danger` (SROA + inlining) a hot leaf can
+home a local in *all* of rdi/rsi/r8/r9 — and rcx/rdx too, via the `ShiftRegOk`/
+`DivRegOk` extensions — leaving the emitter only r10/r11. Any emitter step that needs
+a third register is then non-total. The fix is never to hunt harder at emit time
+(`pickStagingScratch` cannot demote a local; only the allocator can) but to keep each
+step's demand inside that budget — see the copy tiering below.
 
 ## How this deals with the ABI
 
@@ -116,6 +126,17 @@ expression evaluator:
   for a value crossing an **inlined atomic**, which marshals nothing through those
   registers and contains no `call`; it must never host a value crossing a real
   call. `callerSaveHomeCandidates` enforces exactly that.
+
+- **Whole-aggregate copies are tiered by operand FORM, not given a fixed budget.** A
+  copy needs a per-word transfer register plus one register per end whose address
+  must be computed. A *named* `(s)` slot is not such an end: nifasm folds a byte
+  offset into the slot's own frame displacement (`(mem (rsp) name off)`, bounds-checked
+  against the slot), so each named end costs **zero** registers. Two named ends
+  therefore cost one register, one named end two, and only a copy between two computed
+  addresses costs three. Reducing every source to an address in a register first —
+  "one path for all forms" — made three the price of *every* copy, which is what ran
+  the emit-time staging pool dry once optimization filled the volatiles with call-free
+  locals. The tier is picked by `aggrSrcEnd`/`aggrDstEnd` and carried in `AggrEnd`.
 
 - **Aggregate results.** A ≤16-byte aggregate is returned by value in the result
   registers (x0:x1 / rax:rdx); a larger one is returned through a hidden pointer
