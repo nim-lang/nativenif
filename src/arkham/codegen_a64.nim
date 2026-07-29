@@ -2325,9 +2325,14 @@ proc emitMemIntrin2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
   ## int-arg call); during this leaf intrinsic the free arg registers x3/x4/x5 are the
   ## loop scratch (raw, caller-saved). Result → x0 (moved to its home by emitCall2).
   for idx in 0 ..< min(3, argCurs.len):
-    g.emitValue2(argCurs[idx])
-    let a = g.ra.locs[g.posOf(argCurs[idx])]
-    if a.kind == InReg and a.isTemp: g.unbindTemp(a.r)   # x0/x1/x2 used raw below
+    if g.fusedMode:
+      var aD = regLoc(IntArgRegs[idx], ScalarSlot)
+      g.emitValue2(argCurs[idx], aD)                     # → x0 / x1 / x2 directly
+      g.unbindTemp(aD.r)                                 # used raw below
+    else:
+      g.emitValue2(argCurs[idx])
+      let a = g.ra.locs[g.posOf(argCurs[idx])]
+      if a.kind == InReg and a.isTemp: g.unbindTemp(a.r)   # x0/x1/x2 used raw below
   let (dst, src, n) = (R0, R1, R2)                       # for memset: src holds `val`
   let (i, b, b2) = (R3, R4, R5)
   case builtin
@@ -3581,22 +3586,43 @@ proc genFieldStore2(g: var CodeGen; dst: Location; valC: Cursor) =
     let ftyCur = g.fieldTypeByName(dst.aggrType, dst.field)
     g.genNestedAggrField(dst, valC, ftyCur)
   else:                                                 # scalar / float / pointer field
-    g.emitValue2(valC)
-    let v = g.ra.locs[g.posOf(valC)]
-    if v.kind == InFReg:                                # float field
+    var v: Location
+    if g.fusedMode:
+      if g.isFloatExpr(valC):
+        v = dontCare
+        g.emitFValue2(valC, v)
+      else:
+        v = needsReg(ScalarSlot)                        # single-use (allocSingleUse's shape)
+        g.emitValue2(valC, v)
+    else:
+      g.emitValue2(valC)
+      v = g.ra.locs[g.posOf(valC)]
+    if v.kind == InFReg or (g.fusedMode and v.typ.isFloat):  # float field
       let bits = if v.typ.size == 4: 32 else: 64
-      g.ab.tree FstrA64: (g.emFieldOperand(dst); g.emFReg(v.f, bits))
-      if v.isTemp: g.unbindFTmp(v.f)
+      var fr = NoFReg
+      var fb = false
+      if v.kind == InFReg: fr = v.f
+      else:                                             # eftmp spill (pool-dry) → bridge
+        fr = g.takeFBridge(bits); g.placeF2(v, fr, bits); fb = true
+      g.ab.tree FstrA64: (g.emFieldOperand(dst); g.emFReg(fr, bits))
+      if fb: g.dropFBridge()
+      elif v.isTemp: g.unbindFTmp(v.f)
     else:
       var fty = resolveType(g.prog, g.fieldTypeByName(dst.aggrType, dst.field))
+      var vr = NoReg
+      var vb = NoReg
+      if v.kind == InReg: vr = v.r
+      else:                                             # etmp spill (pool-dry) → bridge
+        vb = g.takeBridge(v.typ); g.place2(v, vb); vr = vb
       g.ab.tree MovA64:
         g.emFieldOperand(dst)
         if isPtrType(fty):
           g.ab.tree CastX:
             g.genTypeBody(fty)
-            g.emReg v.r
-        else: g.emReg v.r
-      if v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
+            g.emReg vr
+        else: g.emReg vr
+      if vb != NoReg: g.dropBridge vb
+      elif v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
 
 proc constrFieldStores(g: var CodeGen; c: Cursor; base: Location) =
   ## The ONE field-store loop behind `genConstr2`/`genConstrIntoLval2`/nested fields:
@@ -3667,22 +3693,43 @@ template aconstrElemStores(g: var CodeGen; c: Cursor; destOp, addrOp: untyped) =
           inc i
           skip cc
           continue
-        g.emitValue2(valC)
-        let v = g.ra.locs[g.posOf(valC)]
-        if v.kind == InFReg:
+        var v: Location
+        if g.fusedMode:
+          if g.isFloatExpr(valC):
+            v = dontCare
+            g.emitFValue2(valC, v)
+          else:
+            v = needsReg(ScalarSlot)
+            g.emitValue2(valC, v)
+        else:
+          g.emitValue2(valC)
+          v = g.ra.locs[g.posOf(valC)]
+        if v.kind == InFReg or (g.fusedMode and v.typ.isFloat):
           let bits = if v.typ.size == 4: 32 else: 64
-          g.ab.tree FstrA64: (destOp(i); g.emFReg(v.f, bits))
-          if v.isTemp: g.unbindFTmp(v.f)
+          var fr = NoFReg
+          var fb = false
+          if v.kind == InFReg: fr = v.f
+          else:                                         # eftmp spill (pool-dry) → bridge
+            fr = g.takeFBridge(bits); g.placeF2(v, fr, bits); fb = true
+          g.ab.tree FstrA64: (destOp(i); g.emFReg(fr, bits))
+          if fb: g.dropFBridge()
+          elif v.isTemp: g.unbindFTmp(v.f)
         else:
           var etc = et
+          var vr = NoReg
+          var vb = NoReg
+          if v.kind == InReg: vr = v.r
+          else:                                         # etmp spill (pool-dry) → bridge
+            vb = g.takeBridge(v.typ); g.place2(v, vb); vr = vb
           g.ab.tree MovA64:
             destOp(i)
             if etIsPtr:
               g.ab.tree CastX:
                 g.genTypeBody(etc)
-                g.emReg v.r
-            else: g.emReg v.r
-          if v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
+                g.emReg vr
+            else: g.emReg vr
+          if vb != NoReg: g.dropBridge vb
+          elif v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
         inc i
         skip cc
 
@@ -3763,14 +3810,29 @@ proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size, auxPos: 
   ## `[dstAddr, srcAddr]`; the per-field transfer register is a staging bridge (x14/x15),
   ## taken here — both addresses are already in `a[0]`/`a[1]`, so a bridge is free — sparing
   ## a pool GPR so the copy fits under high register pressure.
-  let a = g.ra.aux[auxPos].scratch
-  g.bindTemp(a[0], ScalarSlot); g.aggrAddrLoc(dst, a[0])         # &dst
-  g.bindTemp(a[1], ScalarSlot)
-  g.aggrAddrInto(rhs, a[1], AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)  # &rhs
+  var a0, a1: Reg
+  var h0 = dontCare
+  var h1 = dontCare
+  if g.fusedMode:
+    # Emit-time picks replace the allocator reservation: pool temps first, a
+    # callee-saved survivor as the totality backstop (`takeHeld` fails loudly —
+    # exactly the old `allocAggrCopy` "out of registers" contract).
+    h0 = g.takeTmp(ScalarSlot)
+    if h0.kind != InReg: h0 = g.takeHeld("an aggregate-copy dst address")
+    h1 = g.takeTmp(ScalarSlot)
+    if h1.kind != InReg: h1 = g.takeHeld("an aggregate-copy src address")
+    a0 = h0.r; a1 = h1.r
+  else:
+    let a = g.ra.aux[auxPos].scratch
+    a0 = a[0]; a1 = a[1]
+  g.bindTemp(a0, ScalarSlot); g.aggrAddrLoc(dst, a0)             # &dst
+  g.bindTemp(a1, ScalarSlot)
+  g.aggrAddrInto(rhs, a1, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)  # &rhs
   let tmp = g.takeBridge(AsmSlot(cls: AUInt, size: 8, align: 8))
-  g.copyAggr(a[0], a[1], size, tmp)
+  g.copyAggr(a0, a1, size, tmp)
   g.dropBridge tmp
-  g.unbindTemp(a[1]); g.unbindTemp(a[0])
+  g.unbindTemp(a1); g.unbindTemp(a0)
+  if g.fusedMode: (g.freeVal(h1); g.freeVal(h0))
 
 proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
   ## The general destination-passing store: emit `rhs` so its value lands at `dst`. An
@@ -3799,9 +3861,17 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
     elif rhs.kind == TagLit and rhs.exprKind == CallC:
       if aggrByteSize(g.prog, tn) > 16:
         g.ab.tree LeaA64: (g.emReg IndirectResultReg; g.ab.sym dstVar)
-        g.emitCall2(rhs)
+        if g.fusedMode:
+          var d = dontCare
+          g.emitCall2(rhs, d, hiddenPtr = true)          # the callee writes through x8
+        else:
+          g.emitCall2(rhs)
       else:
-        g.emitCall2(rhs)
+        if g.fusedMode:
+          var d = dontCare
+          g.emitCall2(rhs, d)                            # ≤16B result in x0:x1
+        else:
+          g.emitCall2(rhs)
         g.regsToStruct(dstVar, tn, 0)
     elif rhs.kind == TagLit and rhs.exprKind == BaseobjC:
       g.genBaseobj2(rhs, dst)                              # object→base slice
@@ -3816,9 +3886,22 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
     if rhs.kind == TagLit and rhs.exprKind == CallC and
        dst.typ.size > g.md.aggrByRefThreshold:
       g.emAdr(IndirectResultReg, dst.name)              # >16B: &g is the hidden result ptr
-      g.emitCall2(rhs)
+      if g.fusedMode:
+        var d = dontCare
+        g.emitCall2(rhs, d, hiddenPtr = true)
+      else:
+        g.emitCall2(rhs)
     else:
-      let addrT = g.ra.aux[auxPos].scratch[0]
+      # The &g address scratch, held across the build: a callee-saved survivor
+      # picked here in fused mode (a call rhs clobbers every volatile), the
+      # allocator's reservation otherwise.
+      var heldLoc = dontCare
+      let addrT =
+        if g.fusedMode:
+          heldLoc = g.takeHeld("an aggregate global &g")
+          heldLoc.r
+        else:
+          g.ra.aux[auxPos].scratch[0]
       g.bindTemp(addrT, ScalarSlot)
       if rhs.kind == TagLit and rhs.exprKind == OconstrC:
         g.emAdr(addrT, dst.name)
@@ -3831,39 +3914,95 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
         template elemAddr(i) = g.emPtrElemAt(addrT, elemTy, i)
         g.aconstrElemStores(rhs, dest, elemAddr)
       elif rhs.kind == TagLit and rhs.exprKind == CallC:  # ≤16B result in x0:x1
-        g.emitCall2(rhs)
+        if g.fusedMode:
+          var d = dontCare
+          g.emitCall2(rhs, d)
+        else:
+          g.emitCall2(rhs)
         g.emAdr(addrT, dst.name)
         g.regsToStructThroughPtr(addrT, symName(g.getType(rhs)), 0)
       else: raiseAssert "arkham a64n: aggregate global store rhs " & $rhs.exprKind
       g.unbindTemp(addrT)
+      if g.fusedMode: g.freeVal(heldLoc)
   elif dst.kind in {Glob, Tvar}:                             # scalar/float/pointer global/tvar
     if dst.typ.kind == AFloat:
-      g.emitValue2(rhs)
-      let fv = g.ra.locs[g.posOf(rhs)]
+      var fv: Location
+      if g.fusedMode:
+        fv = dontCare
+        g.emitFValue2(rhs, fv)
+      else:
+        g.emitValue2(rhs)
+        fv = g.ra.locs[g.posOf(rhs)]
       let bits = if dst.typ.size == 4: 32 else: 64
+      var fr = NoFReg
+      var fb = false
+      if fv.kind == InFReg: fr = fv.f
+      else:                                              # eftmp spill (pool-dry) → bridge
+        fr = g.takeFBridge(bits); g.placeF2(fv, fr, bits); fb = true
       let b = g.takeBridge()
       if dst.kind == Glob or g.a64Linux: g.emAdr(b, dst.name) else: g.genTlvAddr(dst.name, b)
-      g.emFStore(fv.f, b, bits)
+      g.emFStore(fr, b, bits)
       g.dropBridge b
-      if fv.kind == InFReg and fv.isTemp: g.unbindFTmp(fv.f)
+      if fb: g.dropFBridge()
+      elif fv.kind == InFReg and fv.isTemp: g.unbindFTmp(fv.f)
     else:
-      g.emitValue2(rhs)
-      var v = g.ra.locs[g.posOf(rhs)]
-      g.storeReg2(dst, (if v.kind == InReg: v.r else: (let b = g.takeBridge(); g.place2(v, b); b)))
-      if v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
-      elif v.kind notin {InReg, Imm}: discard            # bridge auto-dropped? handle below
+      var v: Location
+      if g.fusedMode:
+        v = needsReg(ScalarSlot)                         # single-use rhs (allocSingleUse's shape)
+        g.emitValue2(rhs, v)
+      else:
+        g.emitValue2(rhs)
+        v = g.ra.locs[g.posOf(rhs)]
+      var vb = NoReg
+      var vr: Reg
+      if v.kind == InReg: vr = v.r
+      else: (vb = g.takeBridge(); g.place2(v, vb); vr = vb)
+      g.storeReg2(dst, vr)
+      if vb != NoReg: g.dropBridge vb
+      elif v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
   elif dst.kind == Mem:                                      # store through complex lvalue
     let lhs = dst.cur
-    # A global aggregate base in the lvalue reserved an address scratch (aux); bind it
-    # so prematLval2's `lea scratch, &g` emits a checked name. The allocator held it
-    # across the rhs evaluation.
-    let globScratch = if g.ra.aux.hasKey(auxPos): g.ra.aux[auxPos].scratch[0] else: NoReg
+    # A global aggregate base in the lvalue needs an address scratch, held across the
+    # rhs; bind it so prematLval2's `lea scratch, &g` emits a checked name. Fused: only
+    # a CONSTRUCTOR build holds `&g` across the rhs (a scalar store emits the rhs
+    # FIRST, so its global base is a plain walk pick — no survivor needed); the
+    # allocator reserved it in aux otherwise.
+    var globScratch = NoReg
+    var globHeld = dontCare
+    if g.fusedMode:
+      if (rhs.kind == TagLit and rhs.exprKind in {OconstrC, AconstrC}) and
+         g.lvalueGlobalBaseE(lhs):
+        globHeld = g.takeHeld("a global address")
+        globScratch = globHeld.r
+    elif g.ra.aux.hasKey(auxPos):
+      globScratch = g.ra.aux[auxPos].scratch[0]
     if globScratch != NoReg: g.bindTemp(globScratch, ScalarSlot)
-    if rhs.kind == TagLit and rhs.exprKind == OconstrC: g.genConstrIntoLval2(rhs, lhs)
-    elif rhs.kind == TagLit and rhs.exprKind == AconstrC: g.genAconstrIntoLval2(rhs, lhs)
+    let globBaseLoc = (if globScratch != NoReg: regLoc(globScratch, ScalarSlot)
+                       else: dontCare)
+    if rhs.kind == TagLit and rhs.exprKind == OconstrC:
+      if g.fusedMode: g.emitLvalue2(lhs, globBaseLoc, isStore = true)
+      g.genConstrIntoLval2(rhs, lhs)
+      if g.fusedMode: g.freeLvalTemps2(lhs)
+    elif rhs.kind == TagLit and rhs.exprKind == AconstrC:
+      if g.fusedMode: g.emitLvalue2(lhs, globBaseLoc, isStore = true)
+      g.genAconstrIntoLval2(rhs, lhs)
+      if g.fusedMode: g.freeLvalTemps2(lhs)
     else:
-      g.emitValue2(rhs)
-      var v = g.ra.locs[g.posOf(rhs)]
+      var v: Location
+      if g.fusedMode:
+        if g.isFloatExpr(rhs):
+          v = dontCare
+          g.emitFValue2(rhs, v)                          # rhs value FIRST
+        else:
+          v = needsReg(ScalarSlot)
+          g.emitValue2(rhs, v)
+        # lvalue picks AFTER the rhs: the live rhs value is a bound temp, so the
+        # picks cannot land on it. `isStore=false`: the rhs is done, nothing must
+        # survive it — the walk takes an ordinary temp for a global base.
+        g.emitLvalue2(lhs, globBaseLoc, isStore = false)
+      else:
+        g.emitValue2(rhs)
+        v = g.ra.locs[g.posOf(rhs)]
       let floatRhs = v.kind == InFReg or (v.kind in {NamedStack, Mem} and v.typ.isFloat)
       g.prematLval2(lhs)
       if floatRhs:
@@ -3896,13 +4035,38 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
         if vBridge != NoReg: g.dropBridge vBridge
         elif v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
       g.unbindLvalTemps2(lhs)
+      if g.fusedMode: g.freeLvalTemps2(lhs)
     if globScratch != NoReg: g.unbindTemp(globScratch)
+    if g.fusedMode: g.freeVal(globHeld)
   elif dst.kind == Field:                                    # a field within an aggregate
     g.genFieldStore2(dst, rhs)
   else:                                                      # scalar / float register or `(s)` slot
-    g.emitValue2(rhs)
-    let v = g.ra.locs[g.posOf(rhs)]
-    g.storeScalar2(dst, v)
+    if g.fusedMode:
+      # Dest threading: a register home receives the rhs DIRECTLY (the store
+      # collapses); a slot home takes a single-use temp then stores. Never
+      # thread a NamedStack dest into emitValue2 — leaves would emit nothing.
+      if dst.kind == InFReg:
+        var v = dst
+        g.emitFValue2(rhs, v)
+        g.storeScalar2(dst, v)
+      elif dst.kind == InReg:
+        var v = dst
+        g.emitValue2(rhs, v)
+        g.storeScalar2(dst, v)
+      elif dst.typ.isFloat:
+        var v = g.takeFTmp(dst.typ)              # carry the precise (f N) width
+        g.emitFValue2(rhs, v)
+        g.storeScalar2(dst, v)
+        g.freeVal(v)
+      else:
+        var v = needsReg(dst.typ)
+        g.emitValue2(rhs, v)
+        g.storeScalar2(dst, v)
+        g.freeVal(v)
+    else:
+      g.emitValue2(rhs)
+      let v = g.ra.locs[g.posOf(rhs)]
+      g.storeScalar2(dst, v)
 
 # ── fused value core (step 3): implementations ──────────────────────────────
 
