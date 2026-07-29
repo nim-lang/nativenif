@@ -107,6 +107,16 @@ expression evaluator:
   in callee-saved registers; a temporary that the allocator sees crossing a call
   is given a callee-saved home (or spilled) rather than a pool register.
 
+  This is load-bearing, not a preference. The moment a value that is live across a
+  call is homed in an *argument* register, the first bullet's disjointness is gone
+  and the marshalling of a single call can overwrite the source of one of its own
+  later arguments — the general fix for which is a parallel-copy (shuffle)
+  algorithm with cycle breaking. Partitioning is how this codegen avoids needing
+  one. `atomicSafeTempRegs` (x86-64 r8/r9, AArch64 x6/x7) is therefore usable only
+  for a value crossing an **inlined atomic**, which marshals nothing through those
+  registers and contains no `call`; it must never host a value crossing a real
+  call. `callerSaveHomeCandidates` enforces exactly that.
+
 - **Aggregate results.** A ≤16-byte aggregate is returned by value in the result
   registers (x0:x1 / rax:rdx); a larger one is returned through a hidden pointer
   (x8 on AArch64 / a synthetic first parameter in rdi on x86-64), which the

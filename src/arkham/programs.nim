@@ -855,8 +855,10 @@ proc typeSizeAlign*(p: var Program; c: Cursor): (int, int) =
         let n = if t.kind == IntLit: int(intVal(t)) else: 0
         while t.hasMore: skip t               # consume the length (+ any extra)
         result = (esz * n, eal)
-    else: raiseAssert "arkham: cannot size type " & $c.typeKind
-  else: raiseAssert "arkham: malformed type for sizing"
+    else: raiseAssert "arkham: cannot size type " & $c.typeKind &
+                      ": " & toString(c, includeLineInfo = false)
+  else: raiseAssert "arkham: malformed type for sizing (kind=" & $c.kind &
+                    "): " & toString(c, includeLineInfo = false)
 
 proc stackSlotAlign*(p: var Program; c: Cursor): int =
   ## The STACK-slot alignment for a local of type `c`. Starts from the type's natural
@@ -1001,7 +1003,9 @@ proc fieldType*(p: var Program; objType: Cursor; field: string): Cursor =
 proc innerType*(p: var Program; t: Cursor): Cursor =
   ## The element/pointee type of a resolved `(ptr T)` / `(aptr T)` / `(array T …)`
   ## / `(flexarray T)` — in each the first child is the element/pointee type.
-  assert t.kind == TagLit, "arkham: expected a pointer/array type"
+  if t.kind != TagLit:
+    raiseAssert "arkham: expected a pointer/array type, got kind=" & $t.kind &
+                ": " & toString(t, includeLineInfo = false)
   case t.typeKind
   of PtrT, AptrT, ArrayT, FlexarrayT:
     var tc = t

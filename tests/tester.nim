@@ -337,6 +337,10 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_raw_fbound.nif", "Regist
 # Call-safety: a value living in a caller-saved register (x9) is destroyed by a
 # `(call)`; reading it afterward must be rejected (a callee-saved x19 home would survive).
 execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_clobber_after_call.nif", "in register X9 which was clobbered by a call")
+# The `rep movs` family names none of its operands in the tree, yet destroys rdi/rsi/rcx.
+# Reading a local homed in one of them afterwards must be rejected here — otherwise the
+# only symptom is a silently wrong value at run time.
+execExpectFailure("nim c -r src/nifasm/nifasm tests/repmovs_clobber.nif", "in register RSI which was clobbered")
 # `(at)` operand disjointness: an arkham register-allocation bug can hand the same
 # physical register for two operands of one address computation, producing a silently
 # wrong address (the "Bug J" class — caught before only as an ASLR-only runtime SEGV).

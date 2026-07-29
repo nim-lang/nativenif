@@ -3762,7 +3762,8 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
     let declPos = g.posOf(cc)
     let nm = symName(cc); inc cc
     skip cc                                                  # pragmas
-    let typeCur = cc; skip cc                                # type
+    let declaredCur = cc; skip cc                            # type (`.` when shoggoth omitted it)
+    let typeCur = g.declType(declaredCur, cc)                # infer from the initializer
     g.symType[nm] = typeCur
     let loc = g.ra.locationOfSym(nm)
     let hasVal = cc.hasMore and cc.kind != DotToken
@@ -4113,7 +4114,8 @@ proc recordVarType2(g: var CodeGen; c: Cursor) =
     if cc.kind == SymbolDef:
       let nm = symName(cc); inc cc
       skip cc
-      g.symType[nm] = cc
+      let typeCur = cc; skip cc                  # type
+      g.symType[nm] = g.declType(typeCur, cc)    # `.` ⇒ inferred from the initializer
     while cc.hasMore: skip cc
 
 proc recordSymTypes2(g: var CodeGen; c: Cursor) =

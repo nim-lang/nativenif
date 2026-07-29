@@ -109,6 +109,19 @@ type
                                              ## `recordEviction` recover the decl name from the
                                              ## point-in-time `regLocal[r]` with no `ra.locs`
                                              ## reverse scan. Populated at the param prologue.
+    regBindPtr*: set[Reg]                    ## x64: registers whose current `regLocal` binding is
+                                             ## POINTER-typed. nifasm type-checks every write
+                                             ## against the bound name's type, and a `(nil)` value
+                                             ## only fits a pointer — so a nil materialized into a
+                                             ## register still carrying an `(i 64)` name needs a
+                                             ## fresh binding first (see `emitValue2`'s `NilC`).
+                                             ## Maintained wherever a GPR name is bound/released:
+                                             ## `emRegLocalVar` / `bindTemp` / `unbindTemp`.
+    curProcName*: string                     ## the proc currently being emitted. arkham's input
+                                             ## carries no line info, so a bare register-pressure
+                                             ## or typing assert names nothing actionable; this
+                                             ## pins it to one routine (same reason nifasm's
+                                             ## `error` reports `in proc …`).
     boundTemps*: set[Reg]                    ## x64: registers whose `regLocal` entry is a
                                              ## transient scratch temp `(rebind …)`'d by
                                              ## `bindTemp`, NOT a steal-able local. `stealReg`
@@ -298,6 +311,15 @@ proc isNilSlot*(s: AsmSlot): bool {.inline.} =
   ## register binds to the asm `(nil)` type and its immediate emits `(nil)`, not `0`.
   isNilValue(s.typ)
 
+proc isSubWidthIntSlot*(s: AsmSlot): bool {.inline.} =
+  ## A sized integer slot NARROWER than a register — `(i 32)`, `(u 8)`, … — that also
+  ## carries its Leng type (so it can be re-emitted in a `(cast …)`). arkham keeps every
+  ## register-homed local a full `(i 64)` binding and expresses width through explicit
+  ## extends, so a temp bound to one of these is a deliberate narrow BRIDGE: a value
+  ## arriving from a full-width register must be reinterpreted into it, never `mov`ed
+  ## (nifasm allows only widening moves).
+  s.kind in {AInt, AUInt} and s.size > 0 and s.size < 8 and not cursorIsNil(s.typ)
+
 proc isNilImm*(loc: Location): bool {.inline.} =
   ## A `nil` value resolved to an immediate (`p = nil`, `p == nil`): emit `(nil)`.
   loc.kind == Imm and isNilSlot(loc.typ)
@@ -326,6 +348,21 @@ proc getType*(g: var CodeGen; c: Cursor): Cursor {.inline.} =
 
 proc exprSlot*(g: var CodeGen; c: Cursor): AsmSlot {.inline.} =
   g.typeCtx.exprSlot(c)
+
+proc declType*(g: var CodeGen; typeCur, valueCur: Cursor): Cursor =
+  ## The type a local should be DECLARED with. Shoggoth's SROA / cse /
+  ## induction-variable passes synthesize `(var :t . . <value>)` with the type
+  ## slot LEFT EMPTY and the type implied by the initializer — a form lengc
+  ## already infers (`codegen.genVarDecl`'s `getNominalType` fallback), so
+  ## arkham must too. An empty slot otherwise sizes as `AMem 0` (which asserts
+  ## in `typeSizeAlign`) and, worse, an `(addr x)` initializer silently loses
+  ## its `(ptr T)`-ness so every later deref/field access mistypes.
+  ## `allocVarDecl` already infers the SLOT this way (`typeIsOmitted`); this
+  ## gives the emitter and `symType` the matching type CURSOR, so the two
+  ## passes agree.
+  if typeCur.kind != DotToken: return typeCur
+  if not valueCur.hasMore or valueCur.kind == DotToken: return typeCur
+  result = g.getType(valueCur)
 
 proc tryConstFold*(g: var CodeGen; c: Cursor): (bool, int64) =
   ## Evaluate a compile-time-constant INTEGER expression to its value WITHOUT

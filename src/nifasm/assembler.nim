@@ -47,6 +47,11 @@ proc infoStr(n: Cursor): string =
   else:
     result = "???"
 
+var gCurProc = ""
+  ## The proc currently being assembled. arkham's asm-NIF carries no line info, so
+  ## `infoStr` degrades to `???` and a bare type error names nothing you can act on;
+  ## the proc's mangled symbol pins it to one module and one routine.
+
 proc error(msg: string; n: Cursor) =
   writeStackTrace()
   # `n` may be DRAINED — an error raised after an `into`-bounded scope has consumed
@@ -54,11 +59,16 @@ proc error(msg: string; n: Cursor) =
   # after the scratch is parsed) leaves the cursor past its last token, where `.kind`
   # / `rawLineInfo` would trip nifcore's `load` assert (`c.p != nil and c.rem > 0`).
   # Guard the position read so the diagnostic prints cleanly instead of crashing.
+  let inProc = if gCurProc.len > 0: " in proc " & gCurProc else: ""
   if not cursorIsNil(n) and n.hasMore:
+    # arkham's asm-NIF has no line info, so render the offending SUBTREE — the whole
+    # instruction is what identifies it. Capped: a `(prepare …)` can be huge.
+    var sub = toString(n, includeLineInfo = false)
+    if sub.len > 400: sub = sub[0 ..< 400] & "…"
     quit "[Error] " & msg & " at " & infoStr(n) &
-      " (kind=" & $n.kind & ", tag=" & nodeRepr(n) & ")"
+      " (kind=" & $n.kind & ", tag=" & nodeRepr(n) & ")" & inProc & "\n  " & sub
   else:
-    quit "[Error] " & msg
+    quit "[Error] " & msg & inProc
 
 proc extractDedupKey*(s: string): string =
   ## Extract deduplication key from symbol like "foo.0.key.moduleSuffix" -> "foo.0.key"
@@ -916,8 +926,14 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
         var cl = sig.clobber; procTyp.clobbers = parseClobbers(cl)
       result = procTyp
     of CTagId:
-      # Leng character type `(c N)` — an N-bit integer for the machine.
-      result = Type(kind: IntT, bits: normScalarBits(getInt(n)))
+      # Leng character type `(c N)` — an N-bit UNSIGNED integer for the machine.
+      # Unsigned is not cosmetic: `intMemAccess`/`memWidthOpc` derive the extension
+      # of a sub-word load from the kind, so an `IntT` char made `(mem p)` on a
+      # `(ptr (c 8))` emit `movsbq` and every byte ≥ 0x80 arrived as a negative
+      # number (`c shr 3` in a `set[char]` test then indexed far out of bounds).
+      # The C backend agrees: `typedef unsigned char NC8`, and arkham's own
+      # `isSignedType` already answers false for `CT`.
+      result = Type(kind: UIntT, bits: normScalarBits(getInt(n)))
       inc n
     of VoidTagId:
       result = Type(kind: VoidT)
@@ -3451,6 +3467,7 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
       error("Expected symbol definition", n)
     let name = symName(n)
     ctx.procName = name
+    gCurProc = name
 
     # Proc code must start 4-aligned: a lazily emitted rodata blob (arbitrary byte
     # length, e.g. a 2-byte string constant) may immediately precede this proc in
@@ -5849,18 +5866,20 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
   of NopX64:
     inc n
     x86.emitNop(ctx.buf.data)
-  of RepmovsbX64:
+  of RepmovsbX64, RepmovswX64, RepmovsdX64, RepmovsqX64:
+    # The `rep movs` family names NONE of its operands in the tree: it copies `rcx`
+    # units from `[rsi]` to `[rdi]`, advancing both pointers and leaving `rcx` at 0.
+    # Record that clobber explicitly — without it a later read of a local homed in
+    # rdi/rsi/rcx would silently see a destroyed value instead of raising here.
+    # (DF is 0 throughout: SysV guarantees it clear at entry and at every call, and
+    # nothing in this assembler emits `std`, so `movs` always steps upward.)
+    let stringOp = n.tag
     inc n
-    x86.emitRepMovsb(ctx.buf.data)
-  of RepmovswX64:
-    inc n
-    x86.emitRepMovsw(ctx.buf.data)
-  of RepmovsdX64:
-    inc n
-    x86.emitRepMovsd(ctx.buf.data)
-  of RepmovsqX64:
-    inc n
-    x86.emitRepMovsq(ctx.buf.data)
+    ctx.clobbered.incl {x86.RDI, x86.RSI, x86.RCX}
+    if stringOp == RepmovsbTagId:   x86.emitRepMovsb(ctx.buf.data)
+    elif stringOp == RepmovswTagId: x86.emitRepMovsw(ctx.buf.data)
+    elif stringOp == RepmovsdTagId: x86.emitRepMovsd(ctx.buf.data)
+    else:                           x86.emitRepMovsq(ctx.buf.data)
   of RetX64:
     inc n
     x86.emitRet(ctx.buf.data)

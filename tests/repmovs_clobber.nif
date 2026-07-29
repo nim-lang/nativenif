@@ -1,0 +1,17 @@
+(.nif27)
+(.index)
+(stmts
+ (proc :test_repmovs_clobber.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (var :v.0
+    (rsi)
+    (i 64))
+   (mov v.0 42)
+   (repmovsq)
+   (mov
+    (rax)v.0)
+   (syscall))))
+(.index)

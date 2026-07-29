@@ -142,6 +142,12 @@ type
                                       ## coarse `freeAfter` position (last-use end)
     freedSyms: HashSet[string]        ## locals already early-freed: skipped by
                                       ## `trySteal` (dead) and `closeScope` (no re-free)
+    inheritedHomes: HashSet[string]   ## locals that took over a dead source local's register
+                                      ## (`allocVarDecl`'s copy/cast home inheritance). Their
+                                      ## initializing store is NOT allocated — the value is
+                                      ## already in the register — so their home must STAY
+                                      ## `InReg` or the emitter would emit a store whose rhs
+                                      ## has no recorded location. Hence: never a steal victim.
     allocExprs: bool                  ## value-core rewrite: also assign `locs[pos]` for
                                       ## expressions (not just var defs). Off by default so
                                       ## the legacy reactive emitter sees the unchanged
@@ -199,6 +205,33 @@ proc takeFReg(b: var Builder; pool: var set[FReg]; cands: openArray[FReg]): FReg
 proc spill(b: var Builder; slot: AsmSlot): Location =
   b.ra.frameSize += align(max(slot.size, 1), 8)
   result = stackLoc(-b.ra.frameSize, slot)
+
+proc callerSaveHomeCandidates(b: Builder): seq[Reg] =
+  ## Registers eligible to HOME a value that is live across a REAL call.
+  ##
+  ## `design.md` ("How this deals with the ABI") handles the whole calling convention
+  ## by PARTITIONING the register file: argument/return registers are never handed out
+  ## as homes, so "argument shuffling and expression evaluation use disjoint register
+  ## sets" and a call's marshalling can never collide with the values it is marshalling.
+  ## That invariant is what makes the ABI correct here without any shuffle analysis —
+  ## the same reason a stack-machine codegen like chibicc's is trivially correct.
+  ##
+  ## `atomicSafeTempRegs` is @[r8, r9] on x86-64 and @[x6, x7] on AArch64 — ARGUMENT
+  ## registers on both. Homing a cross-call value there breaks the partition, and every
+  ## patch on top (per-argument clobber unions, outgoing-arg-span pre-passes) is just
+  ## re-deriving the parallel-copy analysis the partition exists to avoid. So: no
+  ## argument register may be a cross-call home. On both current targets that empties
+  ## this pool and cross-call values go to callee-saved homes, as the design says.
+  ##
+  ## NOT the same as `R89Ok` (a value crossing only INLINED ATOMICS), which still uses
+  ## `atomicSafeTempRegs` directly and is sound: an inlined atomic marshals nothing
+  ## through r8/r9 and contains no `call`, so there is no shuffle to collide with.
+  result = @[]
+  for r in b.md.atomicSafeTempRegs:
+    var isArgReg = false
+    for ar in b.md.intArgRegs:
+      if ar == r: (isArgReg = true; break)
+    if not isArgReg: result.add r
 
 proc allocStorage(b: var Builder; slot: AsmSlot; props: VarProps): Location =
   ## Decide where one local/param lives. Records reg use for scope freeing.
@@ -339,6 +372,7 @@ proc coldestVictim(b: var Builder; maxW, ceilLen: int; calleeOnly, wantFloat: bo
   for scope in b.scopeVars:
     for v in scope:
       if v in b.freedSyms: continue             # already dead (early-freed)
+      if v in b.inheritedHomes: continue        # its store was never allocated; must stay InReg
       let vloc = b.ra.locs[b.ra.symPos[v]]
       if wantFloat:
         if vloc.kind != InFReg: continue
@@ -928,6 +962,40 @@ proc allocFValue(b: var Builder; n: var Cursor; dest: var Location) =
   else:
     raiseAssert "arkham: float value kind not supported: " & $n.kind
 
+proc fixedRegsClobberedBy(b: Builder; n: Cursor): set[Reg] =
+  ## Registers this expression is FORCED to overwrite because the ISA pins them:
+  ## `cl` (rcx) for a runtime shift count, rdx for `idiv`'s sign-extended high half.
+  ## Unlike an ordinary temp these are NOT taken out of a pool — `allocBin`/
+  ## `allocDivMod` write them unconditionally — so an already-marshalled call
+  ## argument sitting in one of them is destroyed with no diagnostic (both values
+  ## are same-typed integers, so nifasm's register typing cannot see it either).
+  ## `allocCall` uses this to park such an argument off its ABI register.
+  ## Empty on AArch64, where both fixed-role registers are `NoReg`.
+  result = {}
+  if b.md.shiftCountReg == NoReg and b.md.divRemReg == NoReg: return
+  var stack = @[n]
+  while stack.len > 0:
+    var c = stack.pop()
+    if c.kind != TagLit: continue
+    case c.exprKind
+    of ShlC, ShrC:
+      if b.md.shiftCountReg != NoReg:
+        var count = c; inc count                 # tag → result type
+        skip count                               # result type → lhs
+        skip count                               # lhs → count
+        if count.hasMore and not isConstShiftCount(count):
+          result.incl b.md.shiftCountReg
+    of DivC, ModC:
+      if b.md.divRemReg != NoReg:
+        result.incl b.md.divRemReg
+        if b.md.intRetReg != NoReg: result.incl b.md.intRetReg
+    else: discard
+    var ch = c
+    ch.into:
+      while ch.hasMore:
+        stack.add ch
+        skip ch
+
 type
   ParamPlace* = object
     ## Where one SysV-AMD64 parameter / argument is passed. Produced by
@@ -1004,6 +1072,22 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
       allocValue(b, n, fnptrTd)                # fn-ptr target → a held register (advances n)
     else:
       skip n                                   # callee symbol
+    # Which ABI argument registers does a LATER argument overwrite by ISA fiat?
+    # `laterClob[i]` = union of the fixed-register clobbers of arguments after `i`.
+    # Marshalling argument `i` straight into such a register would lose it before
+    # the `call` (see `fixedRegsClobberedBy`), so those arguments are parked in a
+    # callee-saved survivor and bound to `(arg pN)` at the end of the prepare block.
+    var laterClob: seq[set[Reg]] = @[]
+    block:
+      var scan = n
+      var per: seq[set[Reg]] = @[]
+      while scan.hasMore:
+        per.add fixedRegsClobberedBy(b, scan)
+        skip scan
+      laterClob = newSeq[set[Reg]](per.len + 1)
+      for i in countdown(per.len - 1, 0): laterClob[i] = laterClob[i+1] + per[i]
+    var argIdx = 0
+    var heldArgs: seq[Location] = @[]
     while n.hasMore:
       # The argument's ABI class is just its type — one `exprSlot`, the SAME navigator
       # the emitter uses. No per-form ladder: a struct var and an `(oconstr …)`/`(aconstr …)`
@@ -1014,21 +1098,31 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
         # An aggregate argument: a ≤threshold by-value one consumes ceil(size/8) integer
         # arg registers, a >threshold by-reference one a single pointer register — UNLESS
         # it doesn't fit in the remaining arg registers, in which case it is passed on the
-        # stack (classifyParamsX64's rule). A stack-passed aggregate is marshalled through
-        # `gprWords` reserved callee-saved scratch GPRs (one per eightbyte) that the
-        # emitter then writes to the outgoing stack slots; reserve them HELD first so the
-        # value build routes around them, stash them in aux, and DON'T advance `intIdx`.
+        # stack (classifyParamsX64's rule) and DOESN'T advance `intIdx`.
+        #
+        # A stack-passed aggregate needs NO reservation here: its words land in the
+        # outgoing stack area, so none of them has to stay in a register past its own
+        # store, and the emitter marshals them one at a time through a transient staging
+        # register. (This used to reserve `gprWords` callee-saved SURVIVORS, which failed
+        # outright — "nothing to spill" — once other survivors already held the whole
+        # callee-saved pool, and cost registers even when it succeeded.)
         let argPos = b.posOf(n)
         let byRef = argSlot.size > b.md.aggrByRefThreshold
         let gprWords = if byRef: 1 else: (argSlot.size + 7) div 8
         let fits = intIdx + gprWords <= b.md.intArgRegs.len
-        var dst: seq[Location] = @[]
+        if fits:
+          # Same hazard as the scalar branch, but an aggregate marshals into its ABI
+          # registers inside the emitter (`dst[k]`), which has no parking mechanism —
+          # fail loudly rather than emit a silent clobber.
+          for k in 0 ..< gprWords:
+            if b.md.intArgRegs[intIdx + k] in laterClob[argIdx+1]:
+              raiseAssert "arkham: aggregate call-argument in a register a later " &
+                          "argument's shift/div clobbers (parking not implemented)"
         if not fits:
           # A stack-passed arg means this proc reserves an outgoing-argument area in its
           # frame (the fixed-frame model — nifasm's scanStackArgArea), so it needs the
           # frame `sub sp`. Flag it like a stack local.
           b.ra.hasStackVars = true
-          for _ in 0 ..< gprWords: dst.add b.reserveHeldScratch("a stack aggregate-arg word")
         var addrReg = NoReg
         var hasAddr = false
         if n.kind == Symbol:
@@ -1049,18 +1143,14 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
         else:                                   # oconstr/aconstr: build into a synthetic aggregate temp
           b.ra.hasStackVars = true
           allocStore(b, n, namedStackLoc("", argSlot), argPos)  # advances n
-        # Stash the per-arg scratch at `argPos` (the emitter reads it there): the stack
-        # marshalling words FIRST, then the lvalue address LAST (`scratch[^1]`). A non-SIB
-        # `(at …)`/`(pat …)` already left its stride scratch at `scratch[0]`, untouched.
-        var sc: seq[Reg] = @[]
-        for d in dst: sc.add d.r
-        if hasAddr: sc.add addrReg              # lvalue address LAST (NoReg ⇒ spilled); see `aggrArgAddr`
-        if sc.len > 0:
+        # Stash the per-arg scratch at `argPos` (the emitter reads it there): the lvalue
+        # address goes LAST (`scratch[^1]`), so a non-SIB `(at …)`/`(pat …)` stride scratch
+        # already sitting at `scratch[0]` stays untouched.
+        if hasAddr:                             # NoReg ⇒ spilled; see `aggrArgAddr`
           if b.ra.aux.hasKey(argPos):
-            for r in sc: b.ra.aux[argPos].scratch.add r
+            b.ra.aux[argPos].scratch.add addrReg
           else:
-            b.ra.aux[argPos] = ExprAux(scratch: sc)
-        for d in dst: b.releaseTmp(d)           # held only to keep the value build off them
+            b.ra.aux[argPos] = ExprAux(scratch: @[addrReg])
         if fits: intIdx += gprWords
       elif argSlot.cls == AFloat:               # float argument → xmm{fIdx}
         if fIdx >= b.md.floatArgRegs.len:
@@ -1069,7 +1159,18 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
         allocFValue(b, n, ad)
         inc fIdx
       elif intIdx < b.md.intArgRegs.len:        # integer/pointer argument → rdi…r9
-        var ad = regLoc(b.md.intArgRegs[intIdx], ScalarSlot)
+        let abiReg = b.md.intArgRegs[intIdx]
+        var ad =
+          if abiReg in laterClob[argIdx+1]:
+            # A later argument is FORCED to write this ABI register (x86 pins `cl`
+            # for a runtime shift count, rdx for `idiv`). Computing straight into it
+            # would be silently overwritten before the `call`, so take a callee-saved
+            # survivor instead; the emitter sees `loc.r != abiReg` and defers the
+            # `(arg pN)` bind to the end of the prepare block.
+            b.reserveHeldScratch("a clobber-exposed call argument")
+          else:
+            regLoc(abiReg, ScalarSlot)
+        if ad.kind == InReg and ad.r != abiReg: heldArgs.add ad
         allocValue(b, n, ad)
         inc intIdx
       else:
@@ -1083,6 +1184,8 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
         allocValue(b, n, ad)
         b.releaseTmp(ad)
         inc intIdx
+      inc argIdx
+    for h in heldArgs: b.releaseTmp(h)         # parked args: dead once the call marshals them
     if indirect: b.releaseTmp(fnptrTd)         # the held fn-ptr target reg, dead after the call
   case dest.kind
   of Undef, NeedsReg, RegOrImm:
@@ -1784,6 +1887,27 @@ proc allocAggrCopy(b: var Builder; n: var Cursor; dstIsMem: bool; dstCur: Cursor
     if dstAddr.kind != InReg or srcAddr.kind != InReg:
       raiseAssert "arkham: out of registers for an aggregate copy"
     b.ra.aux[auxPos] = ExprAux(scratch: @[dstAddr.r, srcAddr.r])
+  else:
+    # x64 FALLBACK for the per-word transfer register. The comment above says the
+    # copy needs only TWO pool GPRs because the transfer register is the always-free
+    # R11 bridge — but on x64 `dstAddr`/`srcAddr` themselves come from emit-time
+    # staging and CONSUME that bridge, so the transfer register is a genuine THIRD
+    # staging pick. In a proc where every other caller-saved register hosts a live
+    # local (shoggoth's SROA/inlining raise exactly this pressure — `nimStrAtLe`
+    # after `-d:danger`) that pick fails. Reserve a pool register the emitter falls
+    # back to; it is released immediately, so it costs nothing when staging succeeds
+    # (the usual case) and, unlike the emitter, the allocator can DEMOTE a local to
+    # produce one.
+    # Deliberately NON-demoting: take a callee-saved register only if one is
+    # genuinely free. `reserveHeldScratch` would evict the coldest local to
+    # manufacture one, and paying that on EVERY aggregate copy would perturb
+    # allocation everywhere to rescue a case that only arises under extreme
+    # pressure. `NoReg` here just means the emitter keeps its old behaviour.
+    let xfer = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
+    if xfer != NoReg:
+      b.ra.usedCallee.incl xfer
+      b.freeCallee.incl xfer                             # released immediately
+    b.ra.aux[auxPos] = ExprAux(scratch: @[xfer])
 
 proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
   ## Allocator twin of the emitter's `genStore2`. A whole-aggregate COPY (symbol/lvalue
@@ -2015,6 +2139,10 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
           if b.pendingFree[k].name == inheritSrc: b.pendingFree.del k
           else: inc k
         b.freedSyms.incl inheritSrc
+        # Pin the home: `allocStore` is skipped below (the value is already in the
+        # register), so a later `trySteal` evicting THIS var to the stack would leave
+        # the emitter emitting a store whose rhs position has no recorded location.
+        b.inheritedHomes.incl name
       # Caller-save rescue: a cross-call scalar that `allocStorage` could not home in a
       # callee-saved reg (the pool is full) would otherwise SPILL — reloaded at every use.
       # Instead give it an atomic-safe caller-save volatile (R8/R9): register-resident
@@ -2045,7 +2173,7 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
         # (declared empty → assigned late), a `var x = f(…)` (defined BY the call it would
         # be saved around — dead before it; the call may be nested in an `(elif…)`), and
         # any var rewritten past a control-flow merge.
-        let r = b.takeReg(b.freeVol, b.md.atomicSafeTempRegs)
+        let r = b.takeReg(b.freeVol, b.callerSaveHomeCandidates())
         if r != NoReg:
           loc = regLoc(r, slot)
           b.ra.callerSaveHomes[name] = vi0.freeAfter
@@ -2391,15 +2519,16 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
               # and csave slot share `(ptr T)` or `(i 64)`. Address-taken params
               # already spilled above; skip caller-save when disabled.
               var placed = false
+              let csHomes = b.callerSaveHomeCandidates()
               if not callerSaveDisabled() and AddrTaken notin props and
-                 b.md.atomicSafeTempRegs.len > 0:
+                 csHomes.len > 0:
                 # Only home in an atomic-safe reg that is not still holding a
                 # *later* param's incoming ABI value. Homing param 0 in x6 when
                 # param 6 arrives in x6 would clobber it (emitParamMoves is
                 # forward-order). Homing param 6 in its own x6, or using x6 when
                 # fewer than 7 int args exist, is fine.
                 var candidates: seq[Reg] = @[]
-                for r in b.md.atomicSafeTempRegs:
+                for r in csHomes:
                   let ai = incomingArgIdxOf(b.md, r)
                   if ai >= 0 and ai > intIdx and ai < intArgsUsed:
                     continue                   # still live as a later incoming arg
