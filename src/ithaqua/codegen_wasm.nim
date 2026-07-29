@@ -1220,7 +1220,7 @@ proc lowersInline(g: var WasmGen; c: Cursor): bool =
           g.callTarget[nm] = foreignCallTarget(g.prog, nm)
       if g.callTarget.hasKey(nm):
         let ct = g.callTarget[nm]
-        res = ct.atomic.len > 0 or ct.memIntrin.len > 0 or
+        res = ct.memIntrin.len > 0 or
               ct.bitBuiltin.len > 0 or ct.syscall
     while t.hasMore: skip t
   result = res
@@ -1334,135 +1334,6 @@ proc genInlineCall(g: var WasmGen; c: Cursor; wantValue: bool) =
         if not wantValue: g.op OpDrop
       else:
         err g, "mem intrinsic not supported yet: " & ct.memIntrin
-    elif ct.atomic.len > 0:
-      # Single-threaded target: __atomic_* collapse to plain operations.
-      case ct.atomic
-      of "__atomic_load_n":
-        let retT = callResultType(g, c)
-        genExpr(g, t); skip t                  # the pointer
-        while t.hasMore: skip t                # memorder
-        g.emitLoad scalOf(g, retT)
-      of "__atomic_store_n":
-        var pT = lengType(g, t)
-        genExpr(g, t); skip t                  # pointer
-        let valT = lengType(g, t)
-        genExpr(g, t); skip t                  # value
-        while t.hasMore: skip t
-        discard pT
-        g.emitStore scalOf(g, valT)
-      of "__atomic_add_fetch", "__atomic_sub_fetch":
-        # fetch-op returning the NEW value; single-threaded → load, op, store,
-        # reload via scratch local.
-        let valT = callResultType(g, c)
-        let sc = scalOf(g, valT)
-        genExpr(g, t); skip t                  # pointer
-        g.localTee g.p.scratchI32              # keep the address
-        g.emitLoad sc
-        let deltaT = lengType(g, t)
-        genExpr(g, t); skip t
-        discard deltaT
-        while t.hasMore: skip t
-        case sc.kind
-        of skI64:
-          g.op (if ct.atomic == "__atomic_add_fetch": OpI64Add else: OpI64Sub)
-          g.localSet g.p.scratchI64
-          g.localGet g.p.scratchI32
-          g.localGet g.p.scratchI64
-          g.emitStore sc
-          if wantValue: g.localGet g.p.scratchI64
-        else:
-          g.op (if ct.atomic == "__atomic_add_fetch": OpI32Add else: OpI32Sub)
-          g.canonNarrow sc
-          g.localSet g.p.scratchI32b
-          g.localGet g.p.scratchI32
-          g.localGet g.p.scratchI32b
-          g.emitStore sc
-          if wantValue: g.localGet g.p.scratchI32b
-      of "__atomic_fetch_add", "__atomic_fetch_sub":
-        # fetch-op returning the OLD value (add_fetch above returns the new
-        # one); single-threaded → load old, op, store new, yield old.
-        let valT = callResultType(g, c)
-        let sc = scalOf(g, valT)
-        let ptrL = newLocal(g, ValI32)
-        let deltaL = newLocal(g, valType(sc))
-        let oldL = newLocal(g, valType(sc))
-        genExpr(g, t); skip t                  # pointer
-        g.localSet ptrL
-        genExpr(g, t); skip t                  # delta
-        g.localSet deltaL
-        while t.hasMore: skip t                # memorder
-        g.localGet ptrL
-        g.emitLoad sc
-        g.localSet oldL
-        g.localGet ptrL
-        g.localGet oldL
-        g.localGet deltaL
-        if sc.kind == skI64:
-          g.op (if ct.atomic == "__atomic_fetch_add": OpI64Add else: OpI64Sub)
-        else:
-          g.op (if ct.atomic == "__atomic_fetch_add": OpI32Add else: OpI32Sub)
-          g.canonNarrow sc
-        g.emitStore sc
-        if wantValue: g.localGet oldL
-      of "__atomic_compare_exchange_n":
-        # (ptr, expected_ptr, desired, weak, succ_order, fail_order) → bool.
-        # Single-threaded: if *ptr == *expected: *ptr = desired; true
-        #                  else: *expected = *ptr; false
-        var pT = lengType(g, t)
-        let elemT = innerType(g.prog, resolveType(g.prog, pT))
-        let sc = scalOf(g, elemT)
-        let ptrL = newLocal(g, ValI32)
-        let expL = newLocal(g, ValI32)
-        let desL = newLocal(g, valType(sc))
-        let curL = newLocal(g, valType(sc))
-        genExpr(g, t); skip t                  # ptr
-        g.localSet ptrL
-        genExpr(g, t); skip t                  # expected (a pointer)
-        g.localSet expL
-        genExpr(g, t); skip t                  # desired
-        g.localSet desL
-        while t.hasMore: skip t                # weak + memorders (constants)
-        g.localGet ptrL
-        g.emitLoad sc
-        g.localSet curL
-        g.localGet curL
-        g.localGet expL
-        g.emitLoad sc
-        g.op (if sc.kind == skI64: OpI64Eq else: OpI32Eq)
-        g.op OpIf; g.p.body.add ValI32
-        g.localGet ptrL
-        g.localGet desL
-        g.emitStore sc
-        g.constI32 1
-        g.op OpElse
-        g.localGet expL
-        g.localGet curL
-        g.emitStore sc
-        g.constI32 0
-        g.op OpEnd
-        if not wantValue: g.op OpDrop
-      of "__atomic_exchange_n":
-        # (ptr, val, order) → old value. Single-threaded swap.
-        var pT = lengType(g, t)
-        let elemT = innerType(g.prog, resolveType(g.prog, pT))
-        let sc = scalOf(g, elemT)
-        let ptrL = newLocal(g, ValI32)
-        let valL = newLocal(g, valType(sc))
-        let oldL = newLocal(g, valType(sc))
-        genExpr(g, t); skip t
-        g.localSet ptrL
-        genExpr(g, t); skip t
-        g.localSet valL
-        while t.hasMore: skip t
-        g.localGet ptrL
-        g.emitLoad sc
-        g.localSet oldL
-        g.localGet ptrL
-        g.localGet valL
-        g.emitStore sc
-        if wantValue: g.localGet oldL
-      else:
-        err g, "atomic not supported yet: " & ct.atomic
     elif ct.bitBuiltin.len > 0:
       case ct.bitBuiltin
       of "__builtin_ctz":  genExpr(g, t); g.op OpI32Ctz
@@ -1521,6 +1392,178 @@ proc genInlineCall(g: var WasmGen; c: Cursor; wantValue: bool) =
         g.op OpUnreachable                     # unsupported syscall: trap loudly
     else:
       err g, "genInlineCall on a plain call"
+
+proc genInstr(g: var WasmGen; c: Cursor; wantValue: bool) =
+  ## `(instr SYM args…)` — an intrinsic/instruction application (nimony
+  ## #2196/#2211: atomics and the portable bit intrinsics are declarations
+  ## plus a dedicated Leng tag now, not `__atomic_*`/`__builtin_*` importc
+  ## calls). Typed exactly like a call, so the operand walk and the typenav
+  ## queries are the call path's. wasm32 lowers the portable bit rows to
+  ## native wasm opcodes and the atomics to plain memory ops — single-
+  ## threaded target, the same collapse the old `__atomic_*` call path
+  ## used. Target-pinned, flags and two-address rows have no wasm
+  ## equivalent (no flags, no register ties) and error loudly rather than
+  ## miscompile.
+  var t = c
+  t.into:
+    let nm = symName(t)
+    let it = instrTargetOf(g.prog, nm)
+    skip t
+    case it.op
+    of AtomicLoadOp:
+      let retT = callResultType(g, c)
+      genExpr(g, t); skip t                    # the pointer
+      while t.hasMore: skip t                  # memorder
+      g.emitLoad scalOf(g, retT)
+      if not wantValue: g.op OpDrop
+    of AtomicStoreOp:
+      genExpr(g, t); skip t                    # pointer
+      let valT = lengType(g, t)
+      genExpr(g, t); skip t                    # value
+      while t.hasMore: skip t
+      g.emitStore scalOf(g, valT)
+      if wantValue: err g, "(instr …) atomic store has no value"
+    of AtomicAddFetchOp, AtomicSubFetchOp:
+      # returns the NEW value; single-threaded → load, op, store, reload
+      # via scratch local.
+      let valT = callResultType(g, c)
+      let sc = scalOf(g, valT)
+      genExpr(g, t); skip t                    # pointer
+      g.localTee g.p.scratchI32                # keep the address
+      g.emitLoad sc
+      genExpr(g, t); skip t                    # delta
+      while t.hasMore: skip t                  # memorder
+      case sc.kind
+      of skI64:
+        g.op (if it.op == AtomicAddFetchOp: OpI64Add else: OpI64Sub)
+        g.localSet g.p.scratchI64
+        g.localGet g.p.scratchI32
+        g.localGet g.p.scratchI64
+        g.emitStore sc
+        if wantValue: g.localGet g.p.scratchI64
+      else:
+        g.op (if it.op == AtomicAddFetchOp: OpI32Add else: OpI32Sub)
+        g.canonNarrow sc
+        g.localSet g.p.scratchI32b
+        g.localGet g.p.scratchI32
+        g.localGet g.p.scratchI32b
+        g.emitStore sc
+        if wantValue: g.localGet g.p.scratchI32b
+    of AtomicFetchAddOp, AtomicFetchSubOp, AtomicFetchAndOp,
+       AtomicFetchOrOp, AtomicFetchXorOp:
+      # fetch-op returning the OLD value.
+      let valT = callResultType(g, c)
+      let sc = scalOf(g, valT)
+      let ptrL = newLocal(g, ValI32)
+      let deltaL = newLocal(g, valType(sc))
+      let oldL = newLocal(g, valType(sc))
+      genExpr(g, t); skip t                    # pointer
+      g.localSet ptrL
+      genExpr(g, t); skip t                    # operand
+      g.localSet deltaL
+      while t.hasMore: skip t                  # memorder
+      g.localGet ptrL
+      g.emitLoad sc
+      g.localSet oldL
+      g.localGet ptrL
+      g.localGet oldL
+      g.localGet deltaL
+      if sc.kind == skI64:
+        g.op (case it.op
+              of AtomicFetchAddOp: OpI64Add
+              of AtomicFetchSubOp: OpI64Sub
+              of AtomicFetchAndOp: OpI64And
+              of AtomicFetchOrOp: OpI64Or
+              else: OpI64Xor)
+      else:
+        g.op (case it.op
+              of AtomicFetchAddOp: OpI32Add
+              of AtomicFetchSubOp: OpI32Sub
+              of AtomicFetchAndOp: OpI32And
+              of AtomicFetchOrOp: OpI32Or
+              else: OpI32Xor)
+        g.canonNarrow sc
+      g.emitStore sc
+      if wantValue: g.localGet oldL
+    of AtomicExchangeOp:
+      # (ptr, val, order) → old value. Single-threaded swap.
+      var pT = lengType(g, t)
+      let elemT = innerType(g.prog, resolveType(g.prog, pT))
+      let sc = scalOf(g, elemT)
+      let ptrL = newLocal(g, ValI32)
+      let valL = newLocal(g, valType(sc))
+      let oldL = newLocal(g, valType(sc))
+      genExpr(g, t); skip t
+      g.localSet ptrL
+      genExpr(g, t); skip t
+      g.localSet valL
+      while t.hasMore: skip t
+      g.localGet ptrL
+      g.emitLoad sc
+      g.localSet oldL
+      g.localGet ptrL
+      g.localGet valL
+      g.emitStore sc
+      if wantValue: g.localGet oldL
+    of AtomicCompareExchangeOp:
+      # (ptr, expected_ptr, desired, weak, succ_order, fail_order) → bool.
+      # Single-threaded: if *ptr == *expected: *ptr = desired; true
+      #                  else: *expected = *ptr; false
+      var pT = lengType(g, t)
+      let elemT = innerType(g.prog, resolveType(g.prog, pT))
+      let sc = scalOf(g, elemT)
+      let ptrL = newLocal(g, ValI32)
+      let expL = newLocal(g, ValI32)
+      let desL = newLocal(g, valType(sc))
+      let curL = newLocal(g, valType(sc))
+      genExpr(g, t); skip t                    # ptr
+      g.localSet ptrL
+      genExpr(g, t); skip t                    # expected (a pointer)
+      g.localSet expL
+      genExpr(g, t); skip t                    # desired
+      g.localSet desL
+      while t.hasMore: skip t                  # weak + memorders (constants)
+      g.localGet ptrL
+      g.emitLoad sc
+      g.localSet curL
+      g.localGet curL
+      g.localGet expL
+      g.emitLoad sc
+      g.op (if sc.kind == skI64: OpI64Eq else: OpI32Eq)
+      g.op OpIf; g.p.body.add ValI32
+      g.localGet ptrL
+      g.localGet desL
+      g.emitStore sc
+      g.constI32 1
+      g.op OpElse
+      g.localGet expL
+      g.localGet curL
+      g.emitStore sc
+      g.constI32 0
+      g.op OpEnd
+      if not wantValue: g.op OpDrop
+    of CtzOp, ClzOp, PopcountOp:
+      # portable bit rows — native wasm opcodes; the count is produced at
+      # the operand's width, then converted to the declared return width.
+      let sc = exprScal(g, t)
+      genExpr(g, t); skip t
+      while t.hasMore: skip t
+      if sc.kind == skI64:
+        g.op (case it.op
+              of CtzOp: OpI64Ctz
+              of ClzOp: OpI64Clz
+              else: OpI64Popcnt)
+      else:
+        g.op (case it.op
+              of CtzOp: OpI32Ctz
+              of ClzOp: OpI32Clz
+              else: OpI32Popcnt)
+      let retSc = scalOf(g, callResultType(g, c))
+      if sc.kind == skI64 and retSc.kind != skI64: g.op OpI32WrapI64
+      elif sc.kind != skI64 and retSc.kind == skI64: g.op OpI64ExtendI32U
+      if not wantValue: g.op OpDrop
+    else:
+      err g, "(instr …) row not supported on wasm32: " & $it.op
 
 proc genCall(g: var WasmGen; c: Cursor; wantValue: bool) =
   if lowersInline(g, c):
@@ -1648,6 +1691,7 @@ proc genExpr(g: var WasmGen; c: Cursor) =
       if sc.kind != skMem: g.emitLoad sc
     of ConvC, CastC: genConv(g, c)
     of CallC: genCall(g, c, wantValue = true)
+    of InstrC: genInstr(g, c, wantValue = true)
     of SizeofC:
       var t = c
       t.into:
@@ -2267,11 +2311,8 @@ proc genVarDecl(g: var WasmGen; c: Cursor) =
 proc genStmt(g: var WasmGen; c: var Cursor) =
   case c.stmtKind
   of InstrS:
-    # (instr …) — a native instruction row. The pinned and flags/two-address
-    # rows have no wasm equivalent (no flags, no register ties); the portable
-    # rows (ctz/clz/popcount/bswap) are not lowered here yet. Flag loudly
-    # rather than miscompile.
-    err g, "(instr …) native instruction intrinsics are not supported on wasm32"
+    genInstr(g, c, wantValue = false)
+    skip c
   of StmtsS, ScopeS:
     genStmtList(g, c)
     skip c
