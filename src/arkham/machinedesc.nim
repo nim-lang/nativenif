@@ -71,7 +71,17 @@ type
 
 type
   LocKind* = enum
-    Undef          ## the dontCare target (fill me in)
+    Undef          ## the dontCare target (fill me in), and the "produces no value"
+                   ## marker for statement positions. NEVER the answer to a symbol
+                   ## lookup — that is `NoLoc`, so a zero-initialized `locs[]` entry
+                   ## or a genuine dont-care can no longer be confused with "this
+                   ## name is not a proc-local" (historically that conflation made
+                   ## module-level globals, thread-locals and emitter-synthesized
+                   ## slots indistinguishable from an absent location).
+    NoLoc          ## a symbol-lookup MISS (`locationOfSym`/`symLoc`): the name is
+                   ## not an allocator-known local/param — a module-level symbol
+                   ## (global / tvar / proc, disambiguated via `lookupSym`) or an
+                   ## emitter-synthesized stack slot (`stackSlots`)
     NeedsReg       ## a destination *constraint*: the value must end up in a GPR,
                    ## but the callee chooses which one (allocating lazily, or
                    ## reusing the register a value already occupies). Like `Undef`,
@@ -86,54 +96,80 @@ type
                    ## `var`) with the concrete `InReg`/`Imm`. Destination-only.
     InReg          ## value in a GPR
     InFReg         ## value in an FP/SIMD register
-    OnStack        ## value in a frame slot at `offset` (from the frame base)
     NamedStack     ## a stack var/slot managed by nifasm, addressed by `name`
                    ## (aggregate, spilled scalar, or synthetic spill — no cursor)
     Mem            ## a foldable memory operand: the lvalue subtree `cur`
                    ## (`(dot …)`/`(at …)`/`(deref …)`) re-emitted on demand so
                    ## nifasm collapses the access chain to `base+offset`
     Field          ## a field `field` (of aggregate type `aggrType`) WITHIN an
-                   ## aggregate destination, addressed either by the stack slot
-                   ## named `baseName` (when `baseReg == NoReg`) or via a pointer
-                   ## to the aggregate held in `baseReg`. `typ` is the field's
-                   ## slot, so a store into it dispatches scalar/float/aggregate
-                   ## like any other destination — and a nested aggregate field
-                   ## recurses (a `(dot base field)` re-resolved to a `Field`
-                   ## whose base is the field's address). This is what lets the
-                   ## one `genStore2`/`allocStore` path build an `oconstr`
+                   ## aggregate destination, addressed via `base` (a `FieldBase`
+                   ## variant — register pointer, stack slot, global/tvar or
+                   ## lvalue subtree; each an explicit kind, not a priority
+                   ## ladder of sentinel fields). `typ` is the field's slot, so
+                   ## a store into it dispatches scalar/float/aggregate like any
+                   ## other destination — and a nested aggregate field recurses
+                   ## (a `(dot base field)` re-resolved to a `Field` whose base
+                   ## is the field's address). This is what lets the one
+                   ## `genStore2`/`allocStore` path build an `oconstr`
                    ## field-by-field with no per-field special-casing.
     Glob           ## a module-level global addressed by `name` (RIP-relative)
     Tvar           ## a thread-local addressed by `name` (FS/TLV)
     Imm            ## a known immediate (constant / target hint)
 
+  FieldBaseKind* = enum
+    FbReg          ## a pointer to the aggregate held in a register
+    FbSlot         ## the aggregate IS the stack slot named `sym`
+    FbGlob         ## a module-level global: its address is RE-DERIVED into a
+                   ## fresh transient at each use (the survivor-spill totality
+                   ## path — a link-time constant needs no register held across
+                   ## the field value's evaluation)
+    FbTvar         ## a thread-local: address re-derived per use, like `FbGlob`
+    FbLval         ## an lvalue subtree whose address is the aggregate (its
+                   ## embedded temps must be pre-materialized)
+
+  FieldBase* = object
+    ## HOW a `Field` location reaches its aggregate — one explicit kind per
+    ## addressing form. (Formerly a priority ladder of four sentinel fields:
+    ## `baseReg != NoReg`, else `baseGlob.len > 0`, else `baseName.len > 0`,
+    ## else `baseLval` — a missing case fell through to the WRONG arm instead
+    ## of failing.)
+    case kind*: FieldBaseKind
+    of FbReg: reg*: Reg
+    of FbSlot, FbGlob, FbTvar: sym*: string
+    of FbLval: lval*: Cursor
+
   Location* = object
     ## The one descriptor for "where a value lives, or should go" — long-lived
     ## storage (the allocator's output) and just-computed values (the codegen's
-    ## dont-care result) share it. `isTemp` marks a register the codegen borrowed
-    ## as scratch and must hand back (vs. a register-resident local, which it must
-    ## not); `freeTemp` releases it and no-ops on every persistent location. It is
-    ## meaningless for the non-register kinds.
+    ## dont-care result) share it.
     typ*: AsmSlot
-    isTemp*: bool
+    isTemp*: bool     ## REGISTERS ONLY (`InReg`/`InFReg`): the codegen borrowed this
+                      ## register as scratch and must hand it back, vs. a
+                      ## register-resident local (which it must not). Meaningless —
+                      ## and never set — for every other kind; `spillTemp` is the
+                      ## produce-into marker for `NamedStack`.
+    spillTemp*: bool  ## `NamedStack` ONLY: a synthesized `etmp`/`eftmp`/`held` spill
+                      ## slot the emitter must PRODUCE the value into through a
+                      ## staging register (`produceIntoMem2`), as opposed to a
+                      ## symbol's stack home left in place for operand folding.
+                      ## (Formerly overloaded onto `isTemp`, which silently meant
+                      ## two unrelated things depending on the kind.)
     case kind*: LocKind
-    of Undef, NeedsReg, RegOrImm: discard
+    of Undef, NoLoc, NeedsReg, RegOrImm: discard
     of InReg:
       r*: Reg
     of InFReg: f*: FReg
-    of OnStack: offset*: int
     of NamedStack, Glob, Tvar: name*: string
     of Mem: cur*: Cursor
     of Field:
       field*: string         ## the member name
       aggrType*: string      ## the enclosing aggregate's nominal type name
-      baseReg*: Reg          ## the base, in priority order: `baseReg != NoReg` ⇒ a
-      baseGlob*: string      ## pointer to the aggregate; else `baseGlob.len > 0` ⇒ a
-      baseName*: string      ## module-level SYMBOL whose address is re-derived into a
-      baseLval*: Cursor      ## transient at each use (the survivor-spill totality path) —
-      baseGlobIsTvar*: bool  ## a thread-local if `baseGlobIsTvar`, else a global; else
-                             ## `baseName` ⇒ a stack slot of that name; else `baseLval`
-                             ## is the lvalue subtree whose address is the aggregate
+      base*: FieldBase       ## how the aggregate is reached (explicit kind)
     of Imm: ival*: int64
+
+template noLoc*: Location =
+  ## The symbol-lookup miss: "this name has no allocator location".
+  Location(kind: NoLoc)
 
 template dontCare*: Location =
   ## The "fill me in" target for the dont-care evaluator. A template (not a
@@ -159,14 +195,12 @@ proc regLoc*(r: Reg; typ: AsmSlot; isTemp = false): Location {.inline.} =
   Location(kind: InReg, r: r, typ: typ, isTemp: isTemp)
 proc fregLoc*(f: FReg; typ: AsmSlot; isTemp = false): Location {.inline.} =
   Location(kind: InFReg, f: f, typ: typ, isTemp: isTemp)
-proc stackLoc*(offset: int; typ: AsmSlot): Location {.inline.} =
-  Location(kind: OnStack, offset: offset, typ: typ)
-proc namedStackLoc*(name: string; typ: AsmSlot; isTemp = false): Location {.inline.} =
-  ## `isTemp` marks a *spill-temp* slot (an `etmp`/`ftmp` synthesized when the
+proc namedStackLoc*(name: string; typ: AsmSlot; spillTemp = false): Location {.inline.} =
+  ## `spillTemp` marks a *spill-temp* slot (an `etmp`/`eftmp` synthesized when the
   ## register pool was exhausted) — a value position the emitter must PRODUCE into
   ## (via a staging register), as opposed to a symbol's stack home left in place for
   ## folding. The emitter (`produceIntoMem2`) keys on it.
-  Location(kind: NamedStack, name: name, typ: typ, isTemp: isTemp)
+  Location(kind: NamedStack, name: name, typ: typ, spillTemp: spillTemp)
 proc globLoc*(name: string; typ: AsmSlot): Location {.inline.} =
   Location(kind: Glob, name: name, typ: typ)
 proc tvarLoc*(name: string; typ: AsmSlot): Location {.inline.} =
@@ -175,13 +209,13 @@ proc memLoc*(cur: Cursor; typ: AsmSlot): Location {.inline.} =
   Location(kind: Mem, cur: cur, typ: typ)
 proc fieldLoc*(aggrType, field, baseName: string; typ: AsmSlot): Location {.inline.} =
   ## Field `field` of a stack-slot aggregate named `baseName` (the genConstr2 base).
-  Location(kind: Field, aggrType: aggrType, field: field, baseReg: NoReg,
-           baseName: baseName, typ: typ)
+  Location(kind: Field, aggrType: aggrType, field: field,
+           base: FieldBase(kind: FbSlot, sym: baseName), typ: typ)
 proc fieldLocReg*(aggrType, field: string; baseReg: Reg; typ: AsmSlot): Location {.inline.} =
   ## Field `field` of an aggregate whose address is held in `baseReg` (a by-ref
   ## param / hidden-result buffer / a nested field's computed address).
-  Location(kind: Field, aggrType: aggrType, field: field, baseReg: baseReg,
-           baseName: "", typ: typ)
+  Location(kind: Field, aggrType: aggrType, field: field,
+           base: FieldBase(kind: FbReg, reg: baseReg), typ: typ)
 proc fieldLocGlob*(aggrType, field, globName: string; typ: AsmSlot;
                    isTvar = false): Location {.inline.} =
   ## Field `field` of a module-level aggregate `globName` (a global, or a thread-local
@@ -190,13 +224,14 @@ proc fieldLocGlob*(aggrType, field, globName: string; typ: AsmSlot;
   ## to a slot (`reserveHeldScratch` totality backstop): the address is re-derivable
   ## (a link-time global, or FS-base+offset tvar), so recomputing it per use needs no
   ## register held across the (possibly call-containing) field value evaluation.
-  Location(kind: Field, aggrType: aggrType, field: field, baseReg: NoReg,
-           baseGlob: globName, baseGlobIsTvar: isTvar, baseName: "", typ: typ)
+  let base = if isTvar: FieldBase(kind: FbTvar, sym: globName)
+             else: FieldBase(kind: FbGlob, sym: globName)
+  Location(kind: Field, aggrType: aggrType, field: field, base: base, typ: typ)
 proc fieldLocLval*(aggrType, field: string; baseLval: Cursor; typ: AsmSlot): Location {.inline.} =
   ## Field `field` of an aggregate addressed by the lvalue subtree `baseLval` (the
   ## genConstrIntoLval2 base — its embedded temps must be pre-materialized).
-  Location(kind: Field, aggrType: aggrType, field: field, baseReg: NoReg,
-           baseName: "", baseLval: baseLval, typ: typ)
+  Location(kind: Field, aggrType: aggrType, field: field,
+           base: FieldBase(kind: FbLval, lval: baseLval), typ: typ)
 proc immLoc*(ival: int64; typ: AsmSlot): Location {.inline.} =
   Location(kind: Imm, ival: ival, typ: typ)
 

@@ -136,16 +136,20 @@ proc regName*(f: FReg): string =
 proc `$`*(loc: Location): string =
   case loc.kind
   of Undef: "undef"
+  of NoLoc: "noloc"
   of NeedsReg: "needsreg"
   of RegOrImm: "regorimm"
   of InReg: regName(loc.r)
   of InFReg: regName(loc.f)
-  of OnStack: "[fp," & $loc.offset & "]"
   of NamedStack: "&" & loc.name
   of Mem: "[mem]"
   of Field:
-    (if loc.baseReg == NoReg: "&" & loc.baseName else: "[" & regName(loc.baseReg) & "]") &
-      "." & loc.field
+    (case loc.base.kind
+     of FbReg: "[" & regName(loc.base.reg) & "]"
+     of FbSlot: "&" & loc.base.sym
+     of FbGlob: "@" & loc.base.sym
+     of FbTvar: "%fs:" & loc.base.sym
+     of FbLval: "[lval]") & "." & loc.field
   of Glob: "@" & loc.name
   of Tvar: "%fs:" & loc.name
   of Imm: "#" & $loc.ival

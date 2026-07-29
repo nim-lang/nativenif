@@ -94,7 +94,6 @@ type
                                       ## snapshots to reconcile.
     usedCallee*: set[Reg]             ## callee-saved GPRs to save in prologue
     usedCalleeF*: set[FReg]           ## callee-saved SIMD regs (v8–v15) to save in prologue
-    frameSize*: int                   ## bytes of stack frame for spilled slots
     hasStackVars*: bool               ## proc has nifasm-managed `(s)` aggregate vars
     hasStackParams*: bool             ## proc receives ≥1 parameter on the stack — the
                                       ## allocator reserved a callee-saved reg for the
@@ -205,11 +204,15 @@ proc takeFReg(b: var Builder; pool: var set[FReg]; cands: openArray[FReg]): FReg
       return f
   result = NoFReg
 
-proc spill(b: var Builder; slot: AsmSlot): Location =
-  b.ra.frameSize += align(max(slot.size, 1), 8)
-  result = stackLoc(-b.ra.frameSize, slot)
+proc spillTo(b: var Builder; name: string; slot: AsmSlot): Location =
+  ## A value that must live in memory: its nifasm-managed `(s)` slot, addressed
+  ## by its own name (nifasm computes the offset). This states the final home
+  ## outright — the former `OnStack` placeholder that every caller had to convert
+  ## is gone. The caller still decides `hasStackVars` (a steal may re-home the
+  ## value in a register before the decision is final).
+  namedStackLoc(name, slot)
 
-proc allocStorage(b: var Builder; slot: AsmSlot; props: VarProps): Location =
+proc allocStorage(b: var Builder; name: string; slot: AsmSlot; props: VarProps): Location =
   ## Decide where one local/param lives. Records reg use for scope freeing.
   if slot.isFloat:
     # A float local lives only in a callee-saved register (saved in the prologue),
@@ -221,13 +224,13 @@ proc allocStorage(b: var Builder; slot: AsmSlot; props: VarProps): Location =
     # trees. So `AllRegs` is moot for floats. On x86-64 there are NO callee-saved
     # xmm regs at all (SysV), so a float local always spills there — exactly the
     # behavior before precise `AllRegs`, when the empty callee pool forced a spill.
-    if AddrTaken in props: return b.spill(slot)
+    if AddrTaken in props: return b.spillTo(name, slot)
     let f = b.takeFReg(b.freeCalleeF, b.md.floatCalleeSaved)
-    if f == NoFReg: return b.spill(slot)
+    if f == NoFReg: return b.spillTo(name, slot)
     b.ra.usedCalleeF.incl f
     return fregLoc(f, slot)
   if AddrTaken in props or not slot.inRegClass:
-    return b.spill(slot)
+    return b.spillTo(name, slot)
   var r = NoReg
   if AllRegs in props:
     # A call-free local could legally live in a caller-saved volatile.
@@ -265,7 +268,7 @@ proc allocStorage(b: var Builder; slot: AsmSlot; props: VarProps): Location =
       stderr.writeLine "SPILL allregs=" & $(AllRegs in props) &
         " homesUsed=" & $(b.freeCallee.card + b.freeVol.card) &
         " callee=" & $(5 - b.freeCallee.card) & "/5 vol=" & $b.freeVol.card & "free"
-    return b.spill(slot)
+    return b.spillTo(name, slot)
   if r in b.md.intCalleeSavedSet: b.ra.usedCallee.incl r
   result = regLoc(r, slot)
 
@@ -413,12 +416,12 @@ proc reserveTmp(b: var Builder; slot: AsmSlot): Location =
       # `(s)` slot. A temp is single-use, so the spill is local, uniform and branch-safe
       # — NO live local is touched (temps never steal locals). The emitter declares it
       # (`spillTemps`) and PRODUCES the value position into it through a staging register
-      # (`produceIntoMem2`); `isTemp` marks it a produce-into slot, distinct from a
+      # (`produceIntoMem2`); `spillTemp` marks it a produce-into slot, distinct from a
       # symbol's stack home left for folding.
       let nm = "etmp" & $b.tmpSpills & ".0"; inc b.tmpSpills
       b.ra.hasStackVars = true
       b.ra.spillTemps.add (name: nm, typ: slot, isFloat: false)
-      return namedStackLoc(nm, slot, isTemp = true)
+      return namedStackLoc(nm, slot, spillTemp = true)
     if r in b.md.intCalleeSavedSet: b.ra.usedCallee.incl r
   result = regLoc(r, slot, isTemp = true)
 
@@ -432,7 +435,7 @@ proc heldSpillSlot(b: var Builder): Location =
   let nm = "held" & $b.tmpSpills & ".0"; inc b.tmpSpills
   b.ra.hasStackVars = true
   b.ra.spillTemps.add (name: nm, typ: AsmSlot(cls: AInt, size: 8, align: 8), isFloat: false)
-  namedStackLoc(nm, ScalarSlot, isTemp = true)
+  namedStackLoc(nm, ScalarSlot, spillTemp = true)
 
 proc reserveHeldScratch(b: var Builder; what: string; canSpill = false): Location =
   ## A SURVIVOR scratch: a register that must outlive a call and/or stay off the R11
@@ -446,7 +449,7 @@ proc reserveHeldScratch(b: var Builder; what: string; canSpill = false): Locatio
   ## TOTALITY (the by-construction guarantee): if the callee-saved pool is genuinely
   ## exhausted — no free reg AND every callee-saved reg holds another live survivor, so
   ## there is no local to demote — and the CALLER opted in with `canSpill`, this returns a
-  ## SPILL SLOT (`NamedStack`, isTemp) instead of failing. The survivor's value lives in
+  ## SPILL SLOT (`NamedStack`, spillTemp) instead of failing. The survivor's value lives in
   ## memory across the call (memory is call-clobber-safe by definition) and the emitter
   ## re-derives it into a transient at each use (every survivor here holds a re-derivable
   ## address — a `&global`/`&slot`), mirroring `reserveTmp`'s `etmp` fallback. `canSpill`
@@ -486,7 +489,7 @@ proc reserveFTmp(b: var Builder; slot: AsmSlot): Location =
       let nm = "eftmp" & $b.tmpSpills & ".0"; inc b.tmpSpills
       b.ra.hasStackVars = true
       b.ra.spillTemps.add (name: nm, typ: slot, isFloat: true)
-      return namedStackLoc(nm, slot, isTemp = true)
+      return namedStackLoc(nm, slot, spillTemp = true)
     if f in b.md.floatCalleeSavedSet: b.ra.usedCalleeF.incl f
   result = fregLoc(f, slot, isTemp = true)
 
@@ -511,9 +514,9 @@ proc isFloatVal(b: var Builder; n: Cursor): bool =
 proc symLoc(b: var Builder; name: string): Location =
   ## A symbol reference reads where the symbol is stored. A module-level
   ## global/proc is not in `symPos`; the emitter resolves those (Glob / `lea`), so
-  ## return `dontCare` and let it.
+  ## return `NoLoc` and let it.
   let p = b.ra.symPos.getOrDefault(name, -1)
-  if p >= 0: b.ra.locs[p] else: dontCare
+  if p >= 0: b.ra.locs[p] else: noLoc
 
 proc resolveDest(b: var Builder; dest: var Location; natural: Location) =
   ## Resolve a *leaf* destination constraint against the value's `natural`
@@ -1210,7 +1213,7 @@ proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = 
   case n.kind
   of Symbol:
     let nm = symName(n)
-    if b.symLoc(nm).kind == Undef:           # a module-level global aggregate base
+    if b.symLoc(nm).kind == NoLoc:           # a module-level global aggregate base
       let pos = b.posOf(n)
       if globBase.kind == InReg: b.ra.locs[pos] = globBase
       elif b.md.arch == X86 and not isStore:
@@ -1287,7 +1290,7 @@ proc lvalueGlobalBase(b: var Builder; n: Cursor): bool =
   ## lvalue, so it stops the search. Read-only (never advances the caller's cursor).
   var c = n
   case c.kind
-  of Symbol: result = b.symLoc(symName(c)).kind == Undef
+  of Symbol: result = b.symLoc(symName(c)).kind == NoLoc
   of TagLit:
     case c.exprKind
     of DotC, AtC:
@@ -1589,7 +1592,7 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
     b.resolveDest(dest, immLoc(int64(ord(charLit(n))), ScalarSlot)); inc n
   of Symbol:
     let natural = b.symLoc(symName(n))
-    if natural.kind == Undef: b.forceRegDest(dest)   # a global/tvar: load into a register
+    if natural.kind == NoLoc: b.forceRegDest(dest)   # a global/tvar: load into a register
     else: b.resolveDest(dest, natural)               # a function-local: its home (frozen)
     inc n
   of StrLit:
@@ -1677,7 +1680,8 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
       # it — landing this load's result on the same register as one of its own indices
       # (different types ⇒ a `(mov res[ptr], (mem (at … res[i64])))` that nifasm rejects).
       # Seal it across the address allocation so the index temp picks another.
-      let sealedHere = resDest.isTemp == false and resDest.r notin b.ra.sealed
+      let sealedHere = resDest.kind == InReg and not resDest.isTemp and
+                       resDest.r notin b.ra.sealed
       if sealedHere: b.ra.sealed.incl resDest.r
       allocLvalue2(b, n, resDest)             # embedded base/index regs; a global base
       if sealedHere: b.ra.sealed.excl resDest.r
@@ -1900,7 +1904,7 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
       case dst.kind
       of NamedStack, Glob: dst.typ.kind == AMem
       of Mem: b.tc.exprSlot(dst.cur).kind == AMem
-      of Undef: b.tc.exprSlot(n).kind == AMem            # module-level global: classify by rhs
+      of NoLoc: b.tc.exprSlot(n).kind == AMem            # module-level global: classify by rhs
       else: false                                        # Field recurses via its own branch
     if dstAggr and isAggrCopySrc(n):
       allocAggrCopy(b, n, dst.kind == Mem,
@@ -1936,7 +1940,7 @@ proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int) =
     else:
       raiseAssert "arkham: aggregate store rhs not supported: " & $n.exprKind &
         " in proc " & gArkhamCurProc & " (dst.size=" & $dst.typ.size & ")"
-  elif dst.kind == Undef:                                # module-level global / threadvar
+  elif dst.kind == NoLoc:                                # module-level global / threadvar
     # The emitter resolves the destination to a `Glob`/`Tvar` with a precise slot; the
     # allocator only needs the right scratch. The destination type is unknown here, so
     # classify by the RHS: an AGGREGATE store builds/copies through the global's address
@@ -2110,7 +2114,7 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
         elif takeRet:
           excl b.freeVol, b.md.intRetReg
           regLoc(b.md.intRetReg, slot)
-        else: b.allocStorage(slot, props)
+        else: b.allocStorage(name, slot, props)
       if inheritSrc.len > 0:
         # Transfer the register's free obligation from the (now-dead) source to this var:
         # drop the source's pending early-free and mark it freed so `closeScope` skips it;
@@ -2124,15 +2128,10 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
         # register), so a later `trySteal` evicting THIS var to the stack would leave
         # the emitter emitting a store whose rhs position has no recorded location.
         b.inheritedHomes.incl name
-      if loc.kind == OnStack and AddrTaken notin props and
+      if loc.kind == NamedStack and AddrTaken notin props and
          slot.inRegClass and not slot.isFloat:
         loc = b.trySteal(name, slot, props, loc)  # hot var evicts a colder one
-      if loc.kind == OnStack:
-        # A spilled (or address-taken) scalar — integer/pointer (`(s) (i 64)`) or
-        # float (`(s) (f N)`) — lives in a nifasm-managed slot addressed by name,
-        # same frame as aggregates, so nifasm computes the offset. (Floats don't
-        # participate in `trySteal` eviction yet; they spill directly here.)
-        loc = namedStackLoc(name, slot)
+      if loc.kind == NamedStack:
         b.ra.hasStackVars = true
       if aliasSrc.len > 0:
         b.ra.symPos[name] = b.ra.symPos[aliasSrc]   # c2 resolves to c1's LIVE home (no own reg)
@@ -2358,20 +2357,22 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
             # (The >8-float / stack-passed case is still TODO.)
             if not pl.onStack:
               if AddrTaken in props:
-                loc = b.spill(effSlot)           # address taken → must be on the stack
+                loc = b.spillTo(name, effSlot)   # address taken → must be on the stack
               elif hasCall:
                 let f = b.takeFReg(b.freeCalleeF, b.md.floatCalleeSaved)
                 if f != NoFReg:
                   b.ra.usedCalleeF.incl f
                   loc = fregLoc(f, effSlot)
                 else:
-                  loc = b.spill(effSlot)
+                  loc = b.spillTo(name, effSlot)
               else:
                 loc = fregLoc(b.md.floatArgRegs[pl.fpIndex], effSlot)
             else:
-              loc = b.spill(effSlot)             # >8 float args: stack-passed (TODO)
+              loc = b.spillTo(name, effSlot)     # >8 float args: stack-passed (TODO)
           elif not effSlot.inRegClass:
-            loc = b.spill(effSlot)
+            if effSlot.kind == AMem:
+              raiseAssert "arkham: unsupported parameter slot (zero-size aggregate): " & name
+            loc = b.spillTo(name, effSlot)
           elif not pl.onStack:
             # (`aggrStack` is stack-passed by definition — never register-home it,
             # even if an arg register looks free: AAPCS64 stopped filling registers
@@ -2401,7 +2402,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
             # is no lingering binding to flush.
             let stayInArg = ArgResident in props and not aggrByRef and not clobbered
             if AddrTaken in props and not aggrByRef:
-              loc = b.spill(effSlot)           # address taken → must be on the stack
+              loc = b.spillTo(name, effSlot)   # address taken → must be on the stack
             elif (hasCall or aggrByRef or clobbered) and not stayInArg:
               # Live across a call (the incoming arg reg is volatile), or a by-ref
               # pointer that must survive repeated field loads in the body:
@@ -2427,7 +2428,12 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
                 b.ra.hasStackVars = true
                 loc = regLoc(victim.r, effSlot)
               else:
-                loc = b.spill(effSlot)
+                if aggrByRef:
+                  # A spilled by-ref pointer has no consistent representation across
+                  # the prologue / body field access / call sites - fail HERE, at the
+                  # decision, not later via a poison location.
+                  raiseAssert "arkham: no register for a by-ref aggregate parameter's pointer: " & name
+                loc = b.spillTo(name, effSlot)
             else:
               loc = regLoc(arg, effSlot)       # leaf proc: stay in the arg reg
               b.freeVol.excl arg               # persistent home → not lendable to a call-free local
@@ -2458,11 +2464,9 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
             else:
               b.ra.usedCallee.incl r
               loc = regLoc(r, effSlot)
-          if loc.kind == OnStack and slot.kind != AMem:
-            # An address-taken scalar param (integer or float): a nifasm `(s)`
-            # slot the prologue fills from the incoming arg register (int or SIMD;
-            # see emitParamMoves).
-            loc = namedStackLoc(name, effSlot)
+          if loc.kind == NamedStack:
+            # An address-taken / spilled param's `(s)` slot: the prologue fills it
+            # from the incoming arg register (int or SIMD; see emitParamMoves).
             b.ra.hasStackVars = true
           b.record(pos, name, loc)
   # Make the scalar register-homed params visible to `coldestVictim`: a proc whose
@@ -2629,9 +2633,10 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
 # ── lookup API (used by codegen) ────────────────────────────────────────────
 
 proc locationOfSym*(ra: RegAlloc; name: string): Location {.inline.} =
-  ## Storage of a local/param by name; `Undef` if unknown.
+  ## Storage of a local/param by name; `NoLoc` if the name is not an
+  ## allocator-known local/param (a module-level symbol or a synthesized slot).
   let p = ra.symPos.getOrDefault(name, -1)
-  if p >= 0: ra.locs[p] else: dontCare
+  if p >= 0: ra.locs[p] else: noLoc
 
 # ── sealing (driven by codegen during ABI call marshalling) ─────────────────
 # Before codegen places an argument in `xN` (or `x8` for an indirect result),

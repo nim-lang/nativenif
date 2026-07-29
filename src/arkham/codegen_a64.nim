@@ -1415,7 +1415,7 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
   of Symbol:
     let nm = symName(c)
     let loc = g.ra.locationOfSym(nm)
-    if loc.kind == Undef:                                 # module-level global base
+    if loc.kind == NoLoc:                                 # module-level global base
       let baseReg = g.ra.locs[g.posOf(c)]
       let si = g.lookupSym(nm)
       var d = si.decl
@@ -1515,7 +1515,7 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
   ## `(lea …)` tree opens.
   if c.kind == Symbol:
     let loc = g.ra.locs[g.posOf(c)]
-    if loc.kind == InReg and g.ra.locationOfSym(symName(c)).kind == Undef:
+    if loc.kind == InReg and g.ra.locationOfSym(symName(c)).kind == NoLoc:
       # a module-level global aggregate base: `lea reg, &g` into the address register
       # the allocator assigned (already bound by the caller — the access result reg for
       # a load/addr, or the aux store scratch for a store).
@@ -1658,7 +1658,7 @@ proc bindLvalGlobalBases(g: var CodeGen; c: Cursor; bound: var seq[Reg]) =
   if c.kind == Symbol:
     let loc = g.ra.locs[g.posOf(c)]
     if loc.kind == InReg and loc.isTemp and not g.rb.isBoundTemp(loc.r) and
-       g.ra.locationOfSym(symName(c)).kind == Undef:
+       g.ra.locationOfSym(symName(c)).kind == NoLoc:
       g.bindTemp(loc.r, ScalarSlot)
       bound.add loc.r
   elif c.kind == TagLit and c.exprKind in {AtC, DotC, DerefC, PatC}:
@@ -2883,7 +2883,7 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
   let dst = g.ra.locs[pos]
   if dst.kind == InFReg:
     g.emitFValue2(c); return
-  if dst.kind in {NamedStack, Mem} and dst.isTemp:
+  if dst.kind == NamedStack and dst.spillTemp:
     # A value position the allocator spilled to a fresh `(s)` slot (`etmpN.0`) because
     # the register pool was exhausted — produce it into the bridge and store it. This
     # covers EVERY node kind uniformly (a leaf symbol/literal *as well as* a computed
@@ -2929,7 +2929,7 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
   of Symbol:
     if dst.kind == InReg:
       let home = g.ra.locationOfSym(symName(c))
-      if home.kind != Undef:
+      if home.kind != NoLoc:
         if dst.isTemp: g.bindTemp(dst.r, dst.typ)
         g.place2(home, dst.r)
       else:
@@ -3037,7 +3037,7 @@ proc emitFValue2(g: var CodeGen; c: Cursor) =
     g.dropBridge gpr
   of Symbol:
     var home = g.ra.locationOfSym(symName(c))
-    if home.kind == Undef:                               # a module-level float global / tvar
+    if home.kind == NoLoc:                               # a module-level float global / tvar
       var cc = c
       home = g.asLoc(cc)                                 # Glob/Tvar with the float slot
     if dst.isTemp: g.bindFTmp(dst.f, bits)
@@ -3314,25 +3314,31 @@ proc emFieldOperand(g: var CodeGen; dst: Location) =
   ## The `(mem (dot <base> field))` operand for a `Field` destination, dispatching on
   ## how its base aggregate is addressed (a pointer reg / a named stack slot / an
   ## lvalue subtree). nifasm sizes the access from the field's declared type.
-  if dst.baseReg != NoReg:    g.emPtrFieldMem(dst.baseReg, dst.aggrType, dst.field)
-  elif dst.baseName.len > 0:  g.emAggrFieldMem(dst.baseName, dst.field)
-  else:                       g.emLvalFieldMem(dst.baseLval, dst.field)
+  case dst.base.kind
+  of FbReg:  g.emPtrFieldMem(dst.base.reg, dst.aggrType, dst.field)
+  of FbSlot: g.emAggrFieldMem(dst.base.sym, dst.field)
+  of FbLval: g.emLvalFieldMem(dst.base.lval, dst.field)
+  of FbGlob, FbTvar:
+    raiseAssert "arkham a64n: FbGlob/FbTvar field base must be pre-materialized"
 
 proc emFieldDot(g: var CodeGen; dst: Location) =
   ## The bare `(dot <base> field)` ADDRESS tree (no `(mem …)` wrapper) — what a64's
   ## `lea` takes (unlike x86, which leas a memory operand).
-  if dst.baseReg != NoReg:
+  case dst.base.kind
+  of FbReg:
     g.ab.tree DotX:
       g.ab.tree CastX:
         g.ab.ptrType: g.ab.sym dst.aggrType
-        g.emReg dst.baseReg
+        g.emReg dst.base.reg
       g.ab.sym dst.field
-  elif dst.baseName.len > 0:
-    g.emAggrDot(dst.baseName, dst.field)
-  else:
+  of FbSlot:
+    g.emAggrDot(dst.base.sym, dst.field)
+  of FbLval:
     g.ab.tree DotX:
-      g.emLvalAddr2(dst.baseLval)
+      g.emLvalAddr2(dst.base.lval)
       g.ab.sym dst.field
+  of FbGlob, FbTvar:
+    raiseAssert "arkham a64n: FbGlob/FbTvar field base must be pre-materialized"
 
 proc emFieldAddr(g: var CodeGen; dst: Location; into: Reg) =
   ## `&(base.field)` → `into`: `lea` over the field's address tree.
@@ -3806,7 +3812,7 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
       if cc.kind == Symbol:
         let lhsCur = cc
         var dst = g.ra.locationOfSym(symName(cc)); skip cc
-        if dst.kind == Undef:
+        if dst.kind == NoLoc:
           var lc = lhsCur
           dst = g.asLoc(lc)
         g.genStore2(cc, dst, asgnPos)
@@ -3977,7 +3983,7 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
       if cc.kind != Symbol:
         raiseAssert "arkham a64n: keepovf into a complex lvalue not yet supported"
       var dst = g.ra.locationOfSym(symName(cc))
-      if dst.kind == Undef:
+      if dst.kind == NoLoc:
         var lc = cc
         dst = g.asLoc(lc)
       skip cc

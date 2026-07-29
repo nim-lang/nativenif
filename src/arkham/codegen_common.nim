@@ -96,7 +96,7 @@ type
                                              ## only part of it: the emitter also synthesizes
                                              ## slots (constructor temps, `nctmp…`) that no
                                              ## `symPos` knows about, and `locationOfSym`
-                                             ## reports those as `Undef` — indistinguishable
+                                             ## reports those as `NoLoc` — indistinguishable
                                              ## from a module-level global, which is NOT
                                              ## rsp-relative. A copy that wants the zero-register
                                              ## `(mem (rsp) name off)` form must tell them apart.
@@ -368,7 +368,7 @@ proc srcWidthSigned*(g: var CodeGen; c: Cursor): tuple[width: int, signed: bool]
   of Symbol:
     let nm = symName(c)
     let loc = g.ra.locationOfSym(nm)
-    if loc.kind != Undef:
+    if loc.kind != NoLoc:
       return slotWidthSigned(loc.typ)        # a local/param: the allocator knows it
     let si = g.lookupSym(nm)                   # a global / thread-local: read its decl type
     case si.cat
