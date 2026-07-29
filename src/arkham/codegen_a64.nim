@@ -4894,9 +4894,351 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
     else:
       g.extendTo(res2.r, targetW, signed = isSignedType(tc))          # narrow / equal
 proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false) =
-  raiseAssert "arkham a64n: fused emitCall2 not yet converted"
+  ## FUSED a64 call: allocCall's placements decided inline. No parking on
+  ## AArch64 (no ISA-pinned clobber registers); scalar args dest-thread
+  ## straight into their ABI registers, aggregate sources reach their words
+  ## via `aggrAddrInto`/`structToRegs`, the result settles from x0/v0.
+  discard hiddenPtr                            # the x8 hidden pointer is set by the caller
+  var argCurs: seq[Cursor] = @[]
+  var fsym = ""
+  var targetCur: Cursor
+  var indirect = false
+  block:
+    var fc = c
+    fc.into:
+      targetCur = fc
+      indirect = isIndirectCallTarget(g.typeCtx, fc)
+      if not indirect: fsym = symName(fc)
+      skip fc
+      while fc.hasMore: (argCurs.add fc; skip fc)
+  var tgt: CallTarget
+  var fnptrReg = NoReg
+  var fnTargetName = ""
+  var fnptrLoc = dontCare
+  if indirect:
+    let proctype = g.proctypeOfTarget(targetCur)
+    let declarative = isDeclarativeAbi(g.prog, proctype)
+    var retType = proctype
+    block:
+      var q = proctype
+      q.into:
+        skip q; skip q
+        retType = q
+        while q.hasMore: skip q
+    fnptrLoc = needsReg(ScalarSlot)
+    g.emitValue2(targetCur, fnptrLoc)          # fn-ptr target → a held register
+    assert fnptrLoc.kind == InReg, "arkham a64n: indirect call target loc " & $fnptrLoc.kind
+    fnptrReg = fnptrLoc.r
+    if targetCur.kind == Symbol and g.rb.boundName(fnptrReg) == symName(targetCur):
+      tgt = CallTarget(declarative: declarative, asmName: symName(targetCur), retType: retType)
+    else:
+      let nm = g.rb.freshTmpName("fntmp")
+      g.ab.tree RebindA64:
+        g.ab.symDef nm
+        var pc = proctype
+        g.genTypeBody(pc)
+        g.ab.reg fnptrReg
+      g.rb.bindScratch(fnptrReg, nm, isPtr = false)
+      fnTargetName = nm
+      tgt = CallTarget(declarative: declarative, asmName: nm, retType: retType)
+  else:
+    if not g.callTarget.hasKey(fsym):
+      let si = g.lookupSym(fsym)
+      if si.cat in {scGlobal, scTvar}:
+        var d = si.decl
+        var proctype: Cursor
+        d.into:
+          inc d; skip d
+          proctype = resolveType(g.prog, d)
+          while d.hasMore: skip d
+        g.callTarget[fsym] = CallTarget(declarative: isDeclarativeAbi(g.prog, proctype),
+          indirect: true, asmName: fsym, retType: g.indirectRetType(si.decl))
+      else:
+        g.callTarget[fsym] = foreignCallTarget(g.prog, fsym)
+    tgt = g.callTarget[fsym]
+    if tgt.memIntrin.len > 0:
+      g.emitMemIntrin2(argCurs, tgt.memIntrin)   # (fused arg emission inside)
+      if not (dest.kind == InReg and not dest.isTemp):
+        dest = regLoc(IntRet, ScalarSlot, isTemp = true)
+      elif dest.r != IntRet:
+        g.movReg(dest.r, IntRet)
+      return
+    if tgt.bitBuiltin.len > 0:
+      raiseAssert "arkham a64n: bit builtin not yet implemented: " & tgt.bitBuiltin
+  let hasResult = not retIsVoid(tgt.retType)
+  let resSlot = if hasResult: slotOf(g.prog, tgt.retType) else: ScalarSlot
+  let resultIsFloat = hasResult and resSlot.kind == AFloat
+  let resultByRef = hasResult and resSlot.kind == AMem and resSlot.size > 16
+  var heldArgs: seq[Location] = @[]
+
+  proc settleCallResult(g: var CodeGen; dest: var Location) =
+    if not hasResult or resultByRef: return
+    if resultIsFloat:
+      let rbits = if resSlot.size == 4: 32 else: 64
+      if dest.kind != InFReg:
+        dest = g.takeFTmp(resSlot)             # the float pool excludes v0
+      if dest.kind == InFReg:
+        if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f, rbits)
+        if dest.f != FloatRet: g.fmovF(dest.f, FloatRet, rbits)
+      else:
+        g.emFloatScalarStore(dest.name, FloatRet, rbits)
+    elif resSlot.kind == AMem:
+      discard                                  # ≤16B aggregate result: caller reads x0:x1
+    else:
+      case dest.kind
+      of Undef, NeedsReg, RegOrImm:
+        dest = regLoc(IntRet, resSlot, isTemp = true)   # x0 itself is raw-usable
+      of InReg:
+        if dest.r != IntRet:
+          if dest.isTemp and not g.rb.isBoundTemp(dest.r): g.bindTemp(dest.r, resSlot)
+          g.movReg(dest.r, IntRet)
+      of NamedStack, Mem:
+        g.storeReg2(dest, IntRet)
+      else: raiseAssert "arkham a64n: call result dest " & $dest.kind
+
+  if tgt.declarative:
+    var callArgSlots: seq[AsmSlot] = @[]
+    for a in argCurs: callArgSlots.add g.exprSlot(a)
+    let plan = planCall(g.md, callArgSlots, retByRef = false)
+    g.ab.tree PrepareA64:
+      g.ab.sym tgt.asmName
+      var stackArgs: seq[int] = @[]
+      for j in 0 ..< argCurs.len:
+        let a = argCurs[j]
+        let pl = plan.args[j]
+        var tn = ""
+        if pl.isAgg:
+          let tcur = g.getType(a)
+          if tcur.kind != Symbol:
+            raiseAssert "arkham a64: aggregate call-arg of non-nominal type"
+          tn = symName(tcur)
+        if pl.onStack:
+          stackArgs.add j
+          continue
+        if pl.isAgg:
+          if a.kind == TagLit and a.exprKind in {DotC, DerefC, AtC, PatC}:
+            let addrHeld = g.takeHeld("an aggregate-arg address")
+            heldArgs.add addrHeld
+            let srcAddr = addrHeld.r
+            g.aggrAddrInto(a, srcAddr, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = true)
+            if pl.byRef: g.movReg(g.md.gprAt(pl), srcAddr)
+            else: g.marshalAggrFromAddr(srcAddr, tn, pl.gpFirst)
+            g.unbindTemp(srcAddr)
+          else:
+            var home = ""
+            var isGlobal = false
+            if a.kind == Symbol:
+              case g.lookupSym(symName(a)).cat
+              of scGlobal: isGlobal = true
+              of scTvar: raiseAssert "arkham a64: aggregate threadvar passed by value not supported"
+              else: home = symName(a)
+            else:
+              let p = g.posOf(a)
+              home = "aggtmp" & $p & ".0"
+              g.emTypedStackVar(home, g.getType(a))
+              g.varType[home] = tn
+              g.genStore2(a, namedStackLoc(home, callArgSlots[j]), p)
+            if pl.byRef:
+              if isGlobal: g.emGlobalAddr(g.md.gprAt(pl), symName(a))
+              elif g.ra.locationOfSym(home).kind == InReg:
+                g.movReg(g.md.gprAt(pl), g.ra.locationOfSym(home).r)
+              else: g.ab.tree LeaA64: (g.emReg g.md.gprAt(pl); g.ab.sym home)
+            else:
+              if isGlobal: g.globalToRegs(symName(a), tn, pl.gpFirst)
+              else: g.structToRegs(home, tn, pl.gpFirst)
+          if pl.byRef:
+            g.ab.tree MovA64:
+              g.ab.tree ArgX: g.ab.sym paramName(j)
+              g.emReg g.md.gprAt(pl)
+          else:
+            for k in 0 ..< pl.words:
+              g.ab.tree MovA64:
+                g.ab.tree ArgX: (g.ab.sym paramName(j); g.ab.intLit k.int64)
+                g.emReg g.md.gprAt(pl, k)
+        else:
+          var aD = regLoc(g.md.gprAt(pl), ScalarSlot)
+          g.emitValue2(a, aD)                  # → its ABI register directly
+          # Reference the arg register RAW: a checked-name temp binding carries a
+          # generic `(i 64)` that nifasm's strict reg→reg `mov` rejects into a
+          # sub-width param.
+          g.unbindTemp(aD.r)
+          g.ab.tree MovA64:
+            g.ab.tree ArgX: g.ab.sym paramName(j)
+            g.emReg aD.r
+      for j in stackArgs:
+        let a = argCurs[j]
+        if g.exprSlot(a).kind == AMem:
+          g.marshalStackAggrArg(a, paramName(j))
+        else:
+          var aD = needsReg(ScalarSlot)
+          g.emitValue2(a, aD)
+          var srcReg: Reg
+          var srcBridge = NoReg
+          if aD.kind == InReg: srcReg = aD.r
+          else:
+            srcBridge = g.takeBridge(aD.typ)
+            g.place2(aD, srcBridge)
+            srcReg = srcBridge
+          g.ab.tree MovA64:
+            g.ab.tree MemX:
+              g.emReg SP
+              g.ab.tree ArgX: g.ab.sym paramName(j)
+            g.emReg srcReg
+          if srcBridge != NoReg: g.dropBridge srcBridge
+          g.freeVal(aD)
+      if tgt.syscall:
+        g.ab.tree SvcA64: g.ab.intLit 0
+      else: g.ab.keyword CallA64
+      if hasResult and not resultByRef and not resultIsFloat and resSlot.kind != AMem:
+        g.ab.tree MovA64:
+          g.emReg IntRet
+          g.ab.tree ResX: g.ab.sym "ret.0"
+    if fnTargetName.len > 0:
+      g.ab.tree KillA64: g.ab.sym fnTargetName
+      discard g.rb.takeBinding(fnptrReg)
+    g.freeVal(fnptrLoc)
+    for h in heldArgs: g.freeVal(h)
+    g.settleCallResult(dest)
+  else:
+    var intIdx = 0
+    var fIdx = 0
+    for idx in 0 ..< argCurs.len:
+      let a = argCurs[idx]
+      if g.isFloatExpr(a):
+        var fD = fregLoc(FloatArgRegs[fIdx], AsmSlot(cls: AFloat, size: 8, align: 8))
+        g.emitFValue2(a, fD)
+        inc fIdx
+      elif g.exprSlot(a).kind == AMem:
+        let tcur = g.getType(a)
+        if tcur.kind != Symbol:
+          raiseAssert "arkham a64: aggregate call-arg of non-nominal type"
+        let tn = symName(tcur)
+        let sz = aggrByteSize(g.prog, tn)
+        if a.kind == TagLit and a.exprKind in {DotC, DerefC, AtC, PatC}:
+          let addrHeld = g.takeHeld("an aggregate-arg address")
+          heldArgs.add addrHeld
+          let srcAddr = addrHeld.r
+          g.aggrAddrInto(a, srcAddr, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = true)
+          if sz > 16:
+            g.movReg(IntArgRegs[intIdx], srcAddr); inc intIdx
+          else:
+            g.marshalAggrFromAddr(srcAddr, tn, intIdx)
+            intIdx += aggrWordCount(g.prog, tn)
+          g.unbindTemp(srcAddr)
+        else:
+          var home = ""
+          var isGlobal = false
+          if a.kind == Symbol:
+            case g.lookupSym(symName(a)).cat
+            of scGlobal: isGlobal = true
+            of scTvar: raiseAssert "arkham a64: aggregate threadvar passed by value not supported"
+            else: home = symName(a)
+          else:
+            let pos = g.posOf(a)
+            home = "aggtmp" & $pos & ".0"
+            g.emTypedStackVar(home, tcur)
+            g.varType[home] = tn
+            g.genStore2(a, namedStackLoc(home, g.exprSlot(a)), pos)
+          if sz > 16:
+            if isGlobal: g.emGlobalAddr(IntArgRegs[intIdx], symName(a))
+            elif g.ra.locationOfSym(home).kind == InReg:
+              g.movReg(IntArgRegs[intIdx], g.ra.locationOfSym(home).r)
+            else: g.ab.tree LeaA64: (g.emReg IntArgRegs[intIdx]; g.ab.sym home)
+            inc intIdx
+          else:
+            let nw = aggrWordCount(g.prog, tn)
+            if isGlobal: g.globalToRegs(symName(a), tn, intIdx)
+            else: g.structToRegs(home, tn, intIdx)
+            intIdx += nw
+      else:
+        var aD = regLoc(IntArgRegs[intIdx], ScalarSlot)
+        g.emitValue2(a, aD)                    # → its ABI register directly
+        inc intIdx
+    g.ab.tree PrepareA64:
+      g.ab.sym tgt.asmName
+      g.ab.keyword (if tgt.extern: ExtcallA64 else: CallA64)
+    if fnTargetName.len > 0:
+      g.ab.tree KillA64: g.ab.sym fnTargetName
+      discard g.rb.takeBinding(fnptrReg)
+    g.freeVal(fnptrLoc)
+    for h in heldArgs: g.freeVal(h)
+    g.settleCallResult(dest)
+
 proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
-  raiseAssert "arkham a64n: fused emitInstr2 not yet converted"
+  ## FUSED a64 `(instr SYM X*)`: operand placement inline (pool → survivor,
+  ## never a bridge — the atomics own x14/x15/x16); resolved operand Locations
+  ## go to the `ra.locs` memo so `emitAtomicInstr2` reads them unchanged.
+  var fsym = ""
+  var argCurs: seq[Cursor] = @[]
+  block:
+    var fc = c
+    fc.into:
+      fsym = symName(fc); skip fc
+      while fc.hasMore: (argCurs.add fc; skip fc)
+  let tgt = instrTargetOf(g.prog, fsym)
+  let row = IntrinsicRows[tgt.op]
+  if row.isFlagRead or row.isFlagWrite:
+    lengError c, "`" & IntrinsicNames[tgt.op] & "` is a flag instruction; flags " &
+              "are only legal inside an `{.assembler.}` proc, which the AArch64 " &
+              "backend does not support yet", lengInfo(c)
+  if tgA64 notin row.targets:
+    lengError c, "`" & IntrinsicNames[tgt.op] & "` has no AArch64 lowering — " &
+              "guard the call with a `when`"
+  # Resolve the result FIRST and seal it, so an operand pick cannot land on it.
+  var res = Location(kind: Undef)
+  if not row.isVoidResult:
+    case dest.kind
+    of NeedsReg, RegOrImm: dest = g.takeInstrReg(dest.typ)
+    of Undef: dest = g.takeInstrReg(ScalarSlot)
+    else: discard
+    res = dest
+  let sealedHere = res.kind == InReg and not res.isTemp and not g.ra.isSealed(res.r)
+  if sealedHere: g.ra.seal {res.r}
+  var ops: seq[Location] = @[]
+  block:
+    var i = 0
+    for a in argCurs:
+      if i >= row.evaluatedOperands: break     # trailing memory-order knobs
+      # No immediate atomics on a64 (the LL/SC loops have no spare scratch to
+      # materialize one — the allocator's atomicValueMayBeImm was x86-only).
+      var d = g.takeInstrReg(g.exprSlot(a))
+      g.emitValue2(a, d)
+      g.ra.locs[cursorToPosition(g.buf[], a)] = d
+      ops.add d
+      inc i
+  if sealedHere: g.ra.unseal {res.r}
+  if tgt.op.isAtomic:
+    g.emitAtomicInstr2(c, tgt.op, argCurs, res)
+    for d in ops:
+      if not (res.kind == InReg and d.kind == InReg and d.r == res.r): g.freeVal(d)
+    return
+  if res.kind != InReg:
+    raiseAssert "arkham a64n: intrinsic result is not in a register"
+  let a0 = g.ra.locs[cursorToPosition(g.buf[], argCurs[0])]
+  let aliasesA0 = a0.kind == InReg and a0.r == res.r
+  if res.isTemp and not aliasesA0 and not g.rb.isBoundTemp(res.r):
+    g.bindTemp(res.r, res.typ)
+  var src = res.r
+  if a0.kind == InReg: src = a0.r
+  else: g.place2(a0, res.r)
+  let bits = if tgt.argBits in {8, 16, 32}: 32 else: 64
+  case tgt.op
+  of ClzPinnedOp, ClzOp:
+    g.ab.tree ClzA64: (g.emReg res.r; g.emReg src; g.ab.intLit bits)
+  of RbitOp:
+    g.ab.tree RbitA64: (g.emReg res.r; g.emReg src; g.ab.intLit bits)
+  of CtzOp:
+    g.ab.tree RbitA64: (g.emReg res.r; g.emReg src; g.ab.intLit bits)
+    g.ab.tree ClzA64: (g.emReg res.r; g.emReg res.r; g.ab.intLit bits)
+  of RevOp, BswapOp:
+    g.ab.tree RevA64: (g.emReg res.r; g.emReg src; g.ab.intLit bits)
+    if tgt.argBits == 16:
+      g.binImm(LsrA64, res.r, 16)
+  else:
+    raiseAssert "arkham a64n: no lowering for intrinsic `" & IntrinsicNames[tgt.op] & "`"
+  for d in ops:
+    if d.kind == InReg and d.r != res.r: g.freeVal(d)
+  dest = res
 
 # ── var declarations ─────────────────────────────────────────────────────────
 
