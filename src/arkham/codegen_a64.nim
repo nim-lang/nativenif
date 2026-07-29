@@ -451,10 +451,8 @@ proc emBindType(g: var CodeGen; typ: AsmSlot) =
 proc bindTemp(g: var CodeGen; r: Reg; typ: AsmSlot) =
   ## Give scratch register `r` a typed nifasm name `tmpN.0` via `(rebind …)`, so every
   ## later `emReg r` emits a checked symbol rather than a raw `(xN)` the binding
-  ## checker can't see. The name counter bumps in BOTH passes (so names replay
-  ## identically); the `(rebind …)` tree auto-no-ops in the plan pass (zero machine
-  ## code — pure nifasm bookkeeping). `boundTemps` records that `r`'s `regLocal` entry
-  ## is a transient temp; released by `unbindTemp`.
+  ## checker can't see. The binding is recorded as a transient temp; released by
+  ## `unbindTemp`.
   let name = g.rb.freshTmpName()
   g.ab.tree RebindA64:
     g.ab.symDef name
@@ -492,13 +490,6 @@ proc emFloatScalarStore(g: var CodeGen; name: string; src: FReg; bits: int) =
 # MODEL: the `pickStaging` action in proofs/arkham_bindings.tla — only ever returns a
 # register with no live owner (the `Free` guard); staging on an occupied reg breaks
 # NoSharedRegister. Change this ⇒ re-check that action.
-# ── codegen-time register steal (evict a live local to a stack slot) ─────────
-# The exact mirror of x64's steal machinery: when the scratch pool is exhausted
-# at a `borrowTmp`, evict a register-bound local to a nifasm `(s)` slot and hand
-# its register over as scratch — recorded in the plan pass, replayed (with the
-# spill store) in the emit pass, keyed by the borrow-log index so both passes
-# stay byte-consistent. `recordEviction` emits no machine code (it only mutates
-# the allocator's view, which `genProc` snapshot/restores); `replayEviction` does.
 
 # MODEL: the `steal` action in proofs/arkham_bindings.tla — the evicted victim must move
 # to a stack slot (loc→Stack, binding cleared) or LiveLocalsHaveHomes / RegisterBindingsMatchLoc
@@ -931,7 +922,7 @@ proc freshLabel(g: var CodeGen): string =
   # trailing `.<digits>`, so put the counter *before* the suffix ("L0.0", …)
   # to keep basenames ("L0", "L1") distinct.
   result = "L" & $g.labelCount & ".0"
-  if not g.ab.planning: inc g.labelCount   # plan pass emits no labels → don't burn names
+  inc g.labelCount
 
 proc emLab(g: var CodeGen; name: string) =
   g.ab.tree LabA64: g.ab.symDef name        # (lab :L)
@@ -1043,15 +1034,10 @@ proc emitStackParamLoads(g: var CodeGen; decl: Cursor) =
 
 proc emitParamMoves(g: var CodeGen; decl: Cursor) =
   ## Move each parameter from its incoming ABI register to the home the
-  ## allocator chose (callee-saved or caller-save volatile for cross-call params;
-  ## arg regs stay put for leaf procs). Emitted after the prologue saved the homes.
-  ## Stack-passed params (9th integer arg onward) are loaded separately by
-  ## `emitStackParamLoads` and skipped here.
-  ##
-  ## A caller-save home (see `RegAlloc.callerSaveHomes`) must be a *named*
-  ## nifasm register var — `callerSaveSetAt` / `emCallerSaveDecl` save and restore
-  ## by symbol, and the slot type must match the register var (`(ptr T)` or
-  ## `(i 64)`). Leaf / callee-saved params stay raw `(xN)` as before.
+  ## allocator chose (callee-saved for cross-call params; arg regs stay put for
+  ## leaf procs). Emitted after the prologue saved the homes. Stack-passed params
+  ## (9th integer arg onward) are loaded separately by `emitStackParamLoads` and
+  ## skipped here.
   var c = decl
   inc c                                       # proc head → name
   inc c                                       # name → params slot
@@ -1077,7 +1063,6 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
         if c.kind == Symbol and slotOf(g.prog, c).kind == AMem: tn = symName(c)
         while c.hasMore: skip c               # type (+ anything else)
       let loc = g.ra.locationOfSym(nm)
-      let csave = g.ra.callerSaveHomes.hasKey(nm)
       if tn.len > 0 and loc.kind == NamedStack:
         # ≤16B by-value aggregate: declare its stack home, fill from its GPR(s)
         g.varType[nm] = tn
@@ -1091,7 +1076,6 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
         # already loaded/computed the pointer into the home, and the param consumed
         # NO register (the plan's skip rule), so there is nothing to move.
         g.varType[nm] = tn
-        if csave: g.emRegLocalVar(nm, loc.r, typeCur)
         if not pl.onStack:
           g.movReg(loc.r, g.md.gprAt(pl))
       elif loc.kind == InFReg:
@@ -1114,7 +1098,6 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
       else:
         case loc.kind
         of InReg:
-          if csave: g.emRegLocalVar(nm, loc.r, typeCur)
           if not pl.onStack:
             g.movReg(loc.r, g.md.gprAt(pl))
           # else: a stack-passed param — already loaded into loc.r by
@@ -2659,18 +2642,6 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor) =
         if resLoc.isTemp and resSlot.kind != AMem: g.bindTemp(resLoc.r, resSlot)
         g.movReg(resLoc.r, IntRet)
 
-proc emCallerSaveDecl(g: var CodeGen; slotName, varName: string) =
-  ## Declare the reclaimable spill slot with the register-var's own type (`(i 64)`
-  ## scalar / `(ptr T)`), then save the live register value into it. On a64 a stack slot
-  ## is addressed by its bare name (nifasm resolves it to `[sp,#off]` and str's it).
-  if g.symType.hasKey(varName) and isPtrType(resolveType(g.prog, g.symType[varName])):
-    g.emTypedStackVar(slotName, g.symType[varName])
-  else:
-    g.emScalarStackVar(slotName)
-  g.ab.tree MovA64:                              # (mov slot name) — save (→ str)
-    g.ab.sym slotName
-    g.ab.sym varName
-
 proc emitInstr2(g: var CodeGen; c: Cursor) =
   ## `(instr SYM X*)` — the intrinsic's own instruction(s). The a64 twin of the
   ## x86-64 `emitInstr2`: same node, same row, same allocator contract (operands
@@ -2743,53 +2714,8 @@ proc emitInstr2(g: var CodeGen; c: Cursor) =
     raiseAssert "arkham a64n: no lowering for intrinsic `" & IntrinsicNames[tgt.op] & "`"
   if a0.kind == InReg and a0.isTemp and a0.r != res.r: g.unbindTemp(a0.r)
 
-proc callerSaveSlotFor(g: CodeGen; pos: int; reg: Reg; name: string): string =
-  ## Locals → per-call reclaimable `csave.*` slot; params → permanent `pcsave.*`.
-  if name in g.ra.callerSaveParams: paramCallerSaveSlotName(name)
-  else: callerSaveSlotName(pos, reg)
-
 proc emitCall2(g: var CodeGen; c: Cursor) =
-  ## Caller-save wrapper (a64 twin of the x64 one): a cross-call local/param homed in a
-  ## caller-saved volatile (x6/x7) is spilled around this call — save before the call
-  ## clobbers the register, restore after. The var's `(var :name (xN) T)` binding
-  ## PERSISTS; the restore's `mov` re-defines the register (clearing the call's clobber via
-  ## the a64 mov-clobber-clear). Locals use a reclaimable `(scope …)` slot; params use a
-  ## permanent prologue slot (shared with other `(s)` frame vars — no nested arena).
-  let saveSet = g.callerSaveSetAt()
-  if saveSet.len == 0:
-    g.emitCall2Inner(c)
-    return
-  let pos = cursorToPosition(g.buf[], c)
-  # Split: param saves are plain movs (slot already declared); local saves need a scope.
-  var localSaves: seq[tuple[reg: Reg, name: string]] = @[]
-  var paramSaves: seq[tuple[reg: Reg, name: string]] = @[]
-  for it in saveSet:
-    if it.name in g.ra.callerSaveParams: paramSaves.add it
-    else: localSaves.add it
-  template saveOne(it: tuple[reg: Reg, name: string]; doDecl: bool) =
-    let slot = g.callerSaveSlotFor(pos, it.reg, it.name)
-    if doDecl: g.emCallerSaveDecl(slot, it.name)
-    else:
-      g.ab.tree MovA64: (g.ab.sym slot; g.ab.sym it.name)
-  template restoreOne(it: tuple[reg: Reg, name: string]; resLoc: Location) =
-    if resLoc.kind == InReg and resLoc.r == it.reg: discard  # x=f(x): result overwrites
-    else:
-      g.ab.tree MovA64:
-        g.ab.sym it.name
-        g.ab.sym g.callerSaveSlotFor(pos, it.reg, it.name)
-  if localSaves.len == 0:
-    for it in paramSaves: saveOne(it, doDecl = false)
-    g.emitCall2Inner(c)
-    let resLoc = g.ra.locs[pos]
-    for it in paramSaves: restoreOne(it, resLoc)
-  else:
-    g.ab.tree ScopeA64:
-      for it in paramSaves: saveOne(it, doDecl = false)
-      for it in localSaves: saveOne(it, doDecl = true)
-      g.emitCall2Inner(c)
-      let resLoc = g.ra.locs[pos]
-      for it in localSaves: restoreOne(it, resLoc)
-      for it in paramSaves: restoreOne(it, resLoc)
+  g.emitCall2Inner(c)
 
 # ── conditions ───────────────────────────────────────────────────────────────
 
@@ -4212,14 +4138,6 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool) =
         g.ab.tree SubA64: g.emReg SP; g.ab.keyword SsizeX
       if g.retIndirect: g.movReg(g.indirectReg, IndirectResultReg)
       g.emitParamMoves(info.decl)
-      # Permanent spill slots for caller-save parameters (see `callerSaveParams`).
-      # Declared once with the rest of the frame so offsets sit in the same arena as
-      # addr-taken spills — not in per-call reclaimable `(scope …)` slots.
-      for name in g.ra.callerSaveParams:
-        if g.symType.hasKey(name) and isPtrType(resolveType(g.prog, g.symType[name])):
-          g.emTypedStackVar(paramCallerSaveSlotName(name), g.symType[name])
-        else:
-          g.emScalarStackVar(paramCallerSaveSlotName(name))
       if info.isEntry and g.hasGlobalInits:           # run runtime global inits at startup
         g.ab.tree PrepareA64:
           g.ab.sym g.globalInitSym
@@ -4273,7 +4191,7 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   g.indirectReg = NoReg
   g.isEntryProc = info.isEntry
   g.rb.resetProc(); g.aliasToDecl.clear()
-  g.loopEnds = @[]; g.spillCount = 0
+  g.loopEnds = @[]
   g.savedHomes.clear()
   block:
     var rc = info.decl
@@ -4310,7 +4228,6 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   # otherwise-leaf hot path (rawDealloc and friends) — that is what `hasCall` says.
   g.computeFrame(an.hasCall or (info.isEntry and g.hasGlobalInits))
   let declarative = isDeclarativeAbi(g.prog, info.decl)
-  g.ab.planning = false
   g.rb.resetProc(); g.aliasToDecl.clear(); g.savedHomes.clear()
   g.emitProcBody2(info, declarative)
 

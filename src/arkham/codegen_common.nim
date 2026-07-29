@@ -44,11 +44,6 @@ type
     tvarNames*: HashSet[string]              ## tvar names, for the per-proc analyser
     freeTmp*: set[Reg]                       ## volatile temps free for scratch
     freeFTmp*: set[FReg]                     ## volatile SIMD/FP temps free for scratch
-    spillCount*: int                         ## fresh-spill-slot counter (per proc): when
-                                             ## the scratch pool is exhausted, a computed
-                                             ## value is materialized into an `(s)` slot
-                                             ## `spill.N` instead of a register — so register
-                                             ## allocation never fails
     retIsFloat*: bool                        ## current proc returns a float (in v0)
     retFloatBits*: int                       ## width (32/64) of the float return type
     rodata*: seq[(string, string)]           ## module-level string literals
@@ -135,30 +130,6 @@ type
                                              ## a same-position param arg to one is a self-move.
                                              ## Computed once (see `cleanSigComputed`).
     cleanSigComputed*: bool
-    regMirror*: Table[Reg, string]           ## x64 reload-elimination cache: reg → the
-                                             ## MEMORY-homed local (`NamedStack`) whose value
-                                             ## it currently holds a live copy of. A later read
-                                             ## of that var `mov`s from the reg instead of
-                                             ## reloading `[slot]` (one fewer stack access).
-                                             ## DISTINCT from `regLocal` ("reg IS the home"):
-                                             ## a mirror's canonical home stays in memory.
-                                             ## Invalidated on any (re)write of the reg
-                                             ## (bindTemp / emRegLocalVar / rebindLocalAs /
-                                             ## releaseStaleName), a call clobber (caller-saved),
-                                             ## a store to the var or through a pointer, and
-                                             ## every label/jmp. Populated only when `regCacheOn`.
-    regCacheOn*: bool                        ## enable the `regMirror` cache (ARKHAM_REGCACHE=1).
-                                             ## OFF ⇒ nothing is cached ⇒ byte-identical output.
-    mirrorLive*: bool                        ## reg-cache: is fall-through reachable at the current
-                                             ## emit point? False after an unconditional `jmp`/exit
-                                             ## until the next `(lab)` (tracker.nim's `live`).
-    labelIn*: Table[string, Table[Reg, string]]  ## reg-cache forward-join: label → the JOIN
-                                             ## (per-register intersection) of the mirror state at
-                                             ## every jump seen to it so far. Consumed and cleared
-                                             ## at the label's `(lab)`. A FORWARD label's incoming
-                                             ## edges are all seen before it, so the join is exact;
-                                             ## a loop-header `(lab)` clears instead (its back-edge
-                                             ## predecessor is not yet emitted in this one pass).
     savedHomes*: Table[int, Location]        ## value-core pure path: a deref/at/pat base or
                                              ## index left in its stack home by the allocator is
                                              ## loaded into a transient staging reg for the lval
@@ -670,15 +641,6 @@ proc paramName*(idx: int): string {.inline.} =
   ## `p` and collide. Each param therefore gets a distinct basename `pN`.
   result = "p" & $idx & ".0"
 
-proc spillName*(n: int): string {.inline.} =
-  ## The asm-NIF symbol for spill slot `n`. Like `paramName`, this must give each
-  ## slot a distinct *basename* (`spill0`, `spill1`, …): nifasm's scope keys stack
-  ## symbols by NIF basename (the part before the `.<counter>` suffix), so the
-  ## counter cannot disambiguate — `spill.0` and `spill.1` would both reduce to
-  ## basename `spill` and ALIAS the same stack slot (a value stored to one is read
-  ## back from the other). Hence `spillN.0`, not `spill.N`.
-  result = "spill" & $n & ".0"
-
 proc operandInReg*(g: var CodeGen; operand: Cursor; dest: Reg): bool =
   ## Does the (peeked, not consumed) `operand` resolve to a register-resident
   ## local whose home register is `dest`? The accumulator codegen evaluates a
@@ -690,33 +652,6 @@ proc operandInReg*(g: var CodeGen; operand: Cursor; dest: Reg): bool =
   if operand.kind == Symbol:
     let loc = g.ra.locationOfSym(symName(operand))
     result = loc.kind == InReg and loc.r == dest
-
-# ── caller-save (shared by both backends) ────────────────────────────────────
-proc callerSaveSetAt*(g: var CodeGen): seq[tuple[reg: Reg, name: string]] =
-  ## The caller-save LOCALS (see `RegAlloc.callerSaveHomes`) currently bound in a
-  ## register — they must be spilled around a call (which clobbers the volatile home).
-  ## The trigger is `regLocal` membership = the EMIT-TIME liveness truth (the binding
-  ## persists decl→kill), so a var live across a control-flow merge is still bound at a
-  ## call in a predecessor branch — what a coarse-`freeAfter` interval would MISS (it
-  ## under-approximates across merges; the cont.47 wall). The allocator only hands a
-  ## caller-save home to a var whose value is valid wherever it is bound (SSA-like, no
-  ## call in its initializer), so saving whenever bound is always well-defined. Sorted by
-  ## register for deterministic output.
-  if g.ra.callerSaveHomes.len == 0: return
-  for reg, name in g.rb.gprBindings:
-    if g.ra.callerSaveHomes.hasKey(name):
-      result.add (reg: reg, name: name)
-  result.sort(proc (a, b: tuple[reg: Reg, name: string]): int = cmp(ord(a.reg), ord(b.reg)))
-
-proc callerSaveSlotName*(pos: int; reg: Reg): string {.inline.} =
-  "csave." & $pos & "." & $ord(reg) & ".0"
-
-proc paramCallerSaveSlotName*(varName: string): string {.inline.} =
-  ## Permanent frame slot for a caller-save PARAMETER (declared once in the
-  ## prologue). Distinct from per-call `csave.*` scope slots used for locals —
-  ## those reclaimable arenas must not share the frame with addr-taken param
-  ## spills in a way that aliases under peak-ssize patching edge cases.
-  "pcsave." & varName
 
 # ── select-diamond recognition (shared by a64 `csel` & x64 `cmov`) ────────────
 

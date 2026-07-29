@@ -216,32 +216,6 @@ proc extendTo(g: var CodeGen; dest: Reg; width: int; signed: bool) =
   g.binImm(ShlX64, dest, sh)
   g.binImm(if signed: SarX64 else: ShrX64, dest, sh)
 
-# ── register-contents cache (reload elimination; ARKHAM_REGCACHE) ──────────────
-# `regMirror[r] = name` records that GPR `r` currently holds a reloaded copy of the
-# MEMORY-homed local `name` (a `NamedStack` var). A later read of `name` can then
-# `mov`-from-`r` instead of re-loading `[slot]`, removing a stack access. Mirror
-# targets come only from `reserveTmp` (r10 + callee-saved), which is DISJOINT from
-# the staging pool (`StagingCandidates`, caller-saved minus r10/r11), so staging never
-# silently clobbers a mirror. Every other write of a mirror reg funnels through a
-# rebind site (`bindTemp`/`emRegLocalVar`/`rebindLocalAs`/`releaseStaleName`) or a call
-# clobber. The invalidation calls are UNCONDITIONAL — a no-op on the empty table when
-# the cache is off — so only `mirrorSet`/`mirrorReuse` are gated on `regCacheOn`.
-
-proc mirrorInvalidate(g: var CodeGen; r: Reg) {.inline.} =
-  ## `r` is about to be (re)written → drop any value it was caching.
-  if g.regMirror.len > 0: g.regMirror.del r
-
-proc mirrorClearAll(g: var CodeGen) {.inline.} =
-  ## A join / label / jmp, or an aliasing store through a pointer.
-  if g.regMirror.len > 0: g.regMirror.clear()
-
-proc mirrorClearCallerSaved(g: var CodeGen) =
-  ## A call clobbers every caller-saved GPR; callee-saved mirrors survive it.
-  if g.regMirror.len == 0: return
-  var doomed: seq[Reg] = @[]
-  for r in g.regMirror.keys:
-    if r notin g.md.intCalleeSavedSet: doomed.add r
-  for r in doomed: g.regMirror.del r
 
 proc flushArgResidentParams(g: var CodeGen) =
   ## Called right after the FIRST call/syscall in a proc. Every `ArgResident` param
@@ -297,88 +271,23 @@ proc releaseArgDest(g: var CodeGen; r: Reg; valueSym: string) =
       return
   g.releaseStaleName(r)                             # a register-homed local, dead at a call
 
-proc mirrorClearVar(g: var CodeGen; name: string) =
-  ## `name`'s memory changed (a store to it) → its cached copies are stale.
-  if g.regMirror.len == 0: return
-  var doomed: seq[Reg] = @[]
-  for r, nm in g.regMirror:
-    if nm == name: doomed.add r
-  for r in doomed: g.regMirror.del r
-
-proc mirrorSet(g: var CodeGen; r: Reg; name: string) {.inline.} =
-  if g.regCacheOn:
-    when defined(arkhamRegCacheDbg): stderr.writeLine "SET   " & name
-    g.regMirror[r] = name
-
-proc mirrorReuse(g: var CodeGen; name: string): Reg =
-  ## A register already holding `name`'s value (else `NoReg`). A reg sealed to an
-  ## in-flight ABI call is skipped (it is committed to the call, not a free source).
-  result = NoReg
-  if not g.regCacheOn: return
-  for r, nm in g.regMirror:
-    if nm == name and not g.ra.isSealed(r):
-      when defined(arkhamRegCacheDbg): stderr.writeLine "REUSE " & name
-      return r
-  when defined(arkhamRegCacheDbg): stderr.writeLine "MISS  " & name
-
-proc mirrorIntersect(a, b: Table[Reg, string]): Table[Reg, string] =
-  ## The join (⊔) of two mirror states: a reg holds a var after the merge only if it
-  ## holds the SAME var on both incoming edges. Sound at a control-flow join.
-  result = initTable[Reg, string]()
-  for r, nm in a:
-    if b.getOrDefault(r, "") == nm: result[r] = nm
-
-proc mirrorBranchTo(g: var CodeGen; target: string) =
-  ## A jump (conditional or unconditional) to `target` carries the CURRENT mirror state
-  ## along that edge; fold it into `target`'s accumulated incoming join.
-  if not g.regCacheOn: return
-  if target in g.labelIn:
-    g.labelIn[target] = mirrorIntersect(g.labelIn[target], g.regMirror)
-  else:
-    g.labelIn[target] = g.regMirror              # a copy (value semantics)
-
-proc emLab(g: var CodeGen; name: string; isLoopHeader = false) =
-  ## `(lab name)`. A FORWARD merge joins the fall-through state (if reachable) with every
-  ## recorded incoming jump — a reload survives iff it holds on ALL predecessors. A
-  ## LOOP-HEADER label clears: its back-edge predecessor is not yet emitted in this one
-  ## forward pass, so no reload can be assumed to survive the iteration.
-  if g.regCacheOn:
-    if isLoopHeader:
-      g.regMirror.clear()
-    else:
-      let incoming = g.labelIn.getOrDefault(name, initTable[Reg, string]())
-      if name in g.labelIn:
-        g.regMirror = (if g.mirrorLive: mirrorIntersect(g.regMirror, incoming) else: incoming)
-      # else: a pure fall-through label (no jumps to it) → keep the fall-through state
-    g.labelIn.del name
-    g.mirrorLive = true                          # a label is a reachable point
+proc emLab(g: var CodeGen; name: string) =
   g.ab.tree LabX64: g.ab.symDef name
 
 proc emJmp(g: var CodeGen; name: string) =
-  g.mirrorBranchTo(name)      # record this edge's state into the target's join
-  g.mirrorLive = false        # fall-through is unreachable until the next `(lab)`
   g.ab.tree JmpX64: g.ab.sym name
 
 proc emJcc(g: var CodeGen; tag: X64Inst; name: string) =
-  g.mirrorBranchTo(name)      # the taken edge carries the current state; fall-through continues
   g.ab.tree tag: g.ab.sym name
 
 template emitLoop(g: var CodeGen; body: untyped) =
   ## Structured infinite loop `(loop (stmts …))`: nifasm emits the back-edge INTERNALLY,
   ## so no backward `jmp` reaches the asm-NIF (keeps the "every jmp forward, back-edges
   ## are loops" invariant). `body` must jump FORWARD to a break/exit label defined AFTER
-  ## the loop (a condition-false or `break` exit). Mirrors the reg-cache lifecycle of the
-  ## old flat `emLab(header, isLoopHeader=true) … emJmp(header)` pair: clear the cache at
-  ## the header (nothing survives the not-yet-emitted back-edge), and mark fall-through
-  ## dead after (an infinite loop is left only via the forward exits, joined at the exit lab).
-  if g.regCacheOn:
-    g.regMirror.clear()
-    g.mirrorLive = true
+  ## the loop (a condition-false or `break` exit).
   g.ab.tree LoopX64:
     g.ab.tree StmtsX64:
       body
-  if g.regCacheOn:
-    g.mirrorLive = false
 
 proc emSyscall(g: var CodeGen) = g.ab.keyword SyscallX64
 
@@ -420,7 +329,6 @@ proc binArithOp(c: Cursor): tuple[op: X64Inst, isBin: bool] =
 proc emRegLocalVar(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   ## Declare `(var :name (reg) type)` and bind `r` to `name` for the rest of its
   ## scope, so subsequent uses emit the typed name instead of `(reg)`.
-  g.mirrorInvalidate(r)                          # r becomes a named home → any cached value dies
   # If `r` still holds an earlier, now-dead local (the allocator early-freed it at
   # its last use and reassigned the register here), `kill` that binding first —
   # nifasm forbids binding a still-live register. The kill lands at this rebind,
@@ -540,7 +448,6 @@ proc bindTemp(g: var CodeGen; r: Reg; typ: AsmSlot) =
   ## later `emReg r` emits a checked symbol rather than a raw `(reg)` the binding
   ## checker can't see. The binding is recorded as a temp, not a named local.
   ## Released by `unbindTemp`.
-  g.mirrorInvalidate(r)                          # r is being (re)written → any cached value dies
   let name = g.rb.freshTmpName()
   g.ab.tree RebindX64:
     g.ab.symDef name
@@ -655,14 +562,6 @@ proc scalarMemMov(g: var CodeGen; loc: Location; reg: Reg; load: bool) =
   ## — the value register and the memory operand swap order in the `(mov …)` — apart
   ## from `Glob`: a store stages a separate address temp (it must not clobber
   ## `reg`), whereas a load reuses `reg` itself as the address scratch.
-  if load:
-    g.mirrorInvalidate(reg)                  # the destination reg is overwritten by the load
-  elif g.regMirror.len > 0:                   # a store changes memory → drop stale cached copies
-    case loc.kind
-    of NamedStack: g.mirrorClearVar(loc.name) # this var's slot changed
-    of Mem: g.mirrorClearAll()                # store through a pointer may alias any mirrored slot
-    of InReg: g.mirrorInvalidate(loc.r)       # the home reg is overwritten
-    else: discard                             # Glob/Tvar: not a mirrored (local) slot
   case loc.kind
   of InReg:
     if load: g.movReg(reg, loc.r) else: g.movReg(loc.r, reg)
@@ -842,7 +741,6 @@ proc releaseStaleName(g: var CodeGen; r: Reg) =
   ## emit that typed name for the new value (e.g. `(mov p1.0 <ptr>)` where p1.0 is
   ## the i64 `start` param → nifasm strict-type mismatch). `(kill)` the binding and
   ## drop it so `emReg` falls back to the raw `(reg)` tag (untyped scratch).
-  g.mirrorInvalidate(r)                          # r about to be raw scratch → any cached value dies
   if r != NoReg:
     let dead = g.rb.takeBinding(r)               # also clears a stale pointer-typed bit
     if dead.len > 0:
@@ -937,7 +835,6 @@ proc rebindLocalAs(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   ## tracks `name` (declared by `emRegLocalVar`), so `scopeLocals` is NOT touched. Type
   ## emission mirrors `emRegLocalVar`: a pointer keeps its precise `(ptr …)`, every
   ## other scalar is the generic `(i 64)` register form.
-  g.mirrorInvalidate(r)                          # r is retyped/rebound → any cached value dies
   let isPtr = isPtrType(resolveType(g.prog, typeCur))
   g.ab.tree RebindX64:
     g.ab.symDef name
@@ -1066,7 +963,6 @@ proc genRepMovsFwd(g: var CodeGen; nReg: Reg) =
   g.movReg(RCX, nReg)
   g.binImm(AndX64, RCX, 7)                     # tail bytes = n mod 8
   g.ab.keyword RepmovsbX64
-  for r in [RDI, RSI, RCX]: g.mirrorInvalidate(r)
 
 proc genMemIntrinBody(g: var CodeGen; builtin: string) =
   ## The inline `mem*` loop, assuming the args are already loaded (dst→rdi,
@@ -1656,8 +1552,6 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
         # passed pointer (past the regs) is loaded by `emitStackParamLoadsX64`.
         g.varType[nm] = tn
         g.movReg(loc.r, g.md.gprAt(pl))
-        if g.ra.callerSaveHomes.hasKey(nm):
-          g.emRegLocalVar(nm, loc.r, typeCur)   # named home for `(scope …)` save/restore
       elif tn.len > 0:
         # Stack-passed aggregate (by-value that didn't fit, or a by-ref pointer past
         # the arg regs): record its type so the body can navigate it; the bytes /
@@ -1702,8 +1596,6 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
             g.ab.tree KillX64: g.ab.sym paramName(pl.ord)
           else:
             g.movReg(loc.r, argReg)
-          if g.ra.callerSaveHomes.hasKey(nm):
-            g.emRegLocalVar(nm, loc.r, typeCur)
         elif loc.kind == NamedStack and loc.typ.kind != AFloat:
           # an address-taken / spilled scalar param: declare its `(s)` slot and spill the
           # incoming argument register into it so `addr`/loads/stores work. Type the slot
@@ -2279,7 +2171,6 @@ proc emitAtomicInstr2(g: var CodeGen; c: Cursor; op: IntrinsicOp;
   # so it must be answered before anything reads `argCurs[0]`.
   case op
   of AtomicThreadFenceOp:
-    g.mirrorClearAll()                    # nothing cached may be assumed across it
     g.ab.keyword MfenceX64
     return
   of AtomicSignalFenceOp:
@@ -2287,10 +2178,6 @@ proc emitAtomicInstr2(g: var CodeGen; c: Cursor; op: IntrinsicOp;
     # — hoisting a memory access across it — arkham does not do to begin with.
     return
   else: discard
-  # Every atomic writes memory that some OTHER thread may also write, so no value
-  # the register mirror is caching may be assumed to survive one. As a call this
-  # clearing came for free from the call handling; as an instruction it is stated.
-  g.mirrorClearAll()
   # `rax` and `r11` are about to be raw scratch. A dead local can still be sitting
   # in `regLocal` under its typed name, which `emReg` would emit instead of the raw
   # tag — a type mismatch against the pointee-typed `(mem …)` operand.
@@ -2801,7 +2688,6 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor) =
       g.ab.sym tgt.asmName
       if isSyscall: g.emSyscall()
       else: g.ab.keyword CallX64
-    g.mirrorClearCallerSaved()                     # the call/syscall clobbered every volatile GPR
     g.flushArgResidentParams()                     # ArgResident params are dead after this call
     g.rb.unsealAccums(sealedArgs)
     if fnTargetName.len > 0:
@@ -3020,7 +2906,6 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor) =
         g.emReg pb.src
     if isSyscall: g.emSyscall()
     else: g.ab.keyword CallX64
-    g.mirrorClearCallerSaved()                     # the call/syscall clobbered every volatile GPR
     g.flushArgResidentParams()                     # ArgResident params are dead after this call
     # A scalar result must be CONSUMED through `(res ret.0)` so nifasm sees the result
     # provided; a void / >16B by-ref (value via the hidden pointer) / float result has
@@ -3046,61 +2931,8 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor) =
       if resLoc.isTemp and resSlot.kind != AMem: g.bindTemp(resLoc.r, resSlot)
       if resLoc.r != RAX: g.movReg(resLoc.r, RAX)
 
-proc emCallerSaveDecl(g: var CodeGen; slotName, varName: string) =
-  ## Declare the reclaimable spill slot with the SAME type the register-var carries
-  ## (`(i 64)` for scalars — matching `emRegLocalVar` — or `(ptr T)` for a pointer, so
-  ## the save/restore movs type-check), then save the live register value into it.
-  if g.symType.hasKey(varName) and isPtrType(resolveType(g.prog, g.symType[varName])):
-    g.emTypedStackVar(slotName, g.symType[varName])
-  else:
-    g.emScalarStackVar(slotName)
-  g.ab.tree MovX64:                              # (mov (mem (rsp) slot) name) — save
-    g.emStackMem(slotName)
-    g.ab.sym varName
-
-proc callerSaveSlotFor(g: CodeGen; pos: int; reg: Reg; name: string): string =
-  if name in g.ra.callerSaveParams: paramCallerSaveSlotName(name)
-  else: callerSaveSlotName(pos, reg)
-
 proc emitCall2(g: var CodeGen; c: Cursor) =
-  ## Caller-save wrapper: a cross-call local/param homed in a caller-saved volatile
-  ## (R8/R9) is spilled around this call — save before ABI marshalling clobbers the
-  ## register, restore after. Locals use a reclaimable `(scope …)` slot; params use a
-  ## permanent prologue slot. No caller-save vars ⇒ zero overhead.
-  let saveSet = g.callerSaveSetAt()
-  if saveSet.len == 0:
-    g.emitCall2Inner(c)
-    return
-  let pos = cursorToPosition(g.buf[], c)
-  var localSaves: seq[tuple[reg: Reg, name: string]] = @[]
-  var paramSaves: seq[tuple[reg: Reg, name: string]] = @[]
-  for it in saveSet:
-    if it.name in g.ra.callerSaveParams: paramSaves.add it
-    else: localSaves.add it
-  template saveOne(it: tuple[reg: Reg, name: string]; doDecl: bool) =
-    let slot = g.callerSaveSlotFor(pos, it.reg, it.name)
-    if doDecl: g.emCallerSaveDecl(slot, it.name)
-    else:
-      g.ab.tree MovX64: (g.emStackMem(slot); g.ab.sym it.name)
-  template restoreOne(it: tuple[reg: Reg, name: string]; resLoc: Location) =
-    if resLoc.kind == InReg and resLoc.r == it.reg: discard
-    else:
-      g.ab.tree MovX64:
-        g.ab.sym it.name
-        g.emStackMem(g.callerSaveSlotFor(pos, it.reg, it.name))
-  if localSaves.len == 0:
-    for it in paramSaves: saveOne(it, doDecl = false)
-    g.emitCall2Inner(c)
-    let resLoc = g.ra.locs[pos]
-    for it in paramSaves: restoreOne(it, resLoc)
-  else:
-    g.ab.tree ScopeX64:
-      for it in paramSaves: saveOne(it, doDecl = false)
-      for it in localSaves: saveOne(it, doDecl = true)
-      g.emitCall2Inner(c)
-      let resLoc = g.ra.locs[pos]
-      for it in localSaves: restoreOne(it, resLoc)
-      for it in paramSaves: restoreOne(it, resLoc)
+  g.emitCall2Inner(c)
 
 proc emitDivMod2(g: var CodeGen; c: Cursor) =
   ## Emit x86 `idiv`/`div`: the allocator pinned the dividend to rax and the divisor
@@ -3279,14 +3111,8 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
       if home.kind != Undef:                            # a function-local
         if dst.isTemp: g.bindTemp(dst.r, dst.typ)        # stack-homed local → loaded into a temp
         if home.kind == NamedStack and dst.isTemp:
-          # A memory-homed local (spilled / address-taken / stack-param). If some
-          # register already holds a live copy of it (`regMirror`), `mov` from that
-          # register instead of reloading `[slot]` — one fewer stack access. Record
-          # `dst.r` as (also) mirroring it, for the next reader.
-          let src = g.mirrorReuse(symName(c))
-          if src != NoReg and src != dst.r: g.movReg(dst.r, src)
-          else: g.place2(home, dst.r)
-          g.mirrorSet(dst.r, symName(c))
+          # A memory-homed local (spilled / address-taken / stack-param): reload it.
+          g.place2(home, dst.r)
         elif dst.isTemp and home.kind == InReg and home.r != dst.r and
              isSubWidthIntSlot(dst.typ):
           # A REGISTER-homed local into a SUB-WIDTH temp. arkham declares every
@@ -4851,7 +4677,6 @@ proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size, auxPos: 
   ## between two COMPUTED addresses costs three. Three-for-everything was self-inflicted —
   ## the price of "reduce both sides to an address" — and it is what ran the staging pool
   ## dry once `-d:danger` filled every volatile with a call-free local.
-  g.mirrorClearAll()            # an aggregate store through a computed address may alias any slot
   var dstAddr = NoReg
   let dstE = g.aggrDstEnd(dst, dstAddr)                                  # &dst (or its slot)
   var srcAddr = NoReg
@@ -5669,11 +5494,6 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo) =
           g.movReg(g.indirectReg, g.md.intArgRegs[0])
       g.emitParamMoves(info.decl)
       g.emitStackParamLoadsX64(info.decl)               # via stackArgBaseReg, regs now free
-      for name in g.ra.callerSaveParams:
-        if g.symType.hasKey(name) and isPtrType(resolveType(g.prog, g.symType[name])):
-          g.emTypedStackVar(paramCallerSaveSlotName(name), g.symType[name])
-        else:
-          g.emScalarStackVar(paramCallerSaveSlotName(name))
       if info.isEntry and g.hasGlobalInits:              # run runtime global inits at startup
         g.ab.tree PrepareX64:
           g.ab.sym g.globalInitSym
@@ -6297,7 +6117,6 @@ proc genAsmProc(g: var CodeGen; info: ProcInfo) =
   g.retAggrName = ""; g.retIndirect = false; g.retIsFloat = false
   g.indirectReg = NoReg
   g.isEntryProc = info.isEntry
-  g.regMirror.clear(); g.labelIn.clear(); g.mirrorLive = true
   g.ra = RegAlloc()
   if info.isEntry:
     lengError info.decl, "the program entry point cannot be an `.assembler` proc", g.asmInfo
@@ -6471,13 +6290,10 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.computeFrameX64(info.isEntry, an.hasCall or (info.isEntry and g.hasGlobalInits),
                     g.ra.hasStackParams)   # allocator's decision (it reserved the base reg)
   # Pure-emit path: the allocator already assigned every value position; emit once.
-  g.ab.planning = false
   g.rb.resetProc(); g.aliasToDecl.clear()
   g.argResidentParams.setLen 0; g.argResidentFlushed = false
   g.savedHomes.clear()
   g.lvalStride.clear()
-  g.regMirror.clear()                          # per-proc reload cache: no value carries across procs
-  g.labelIn.clear(); g.mirrorLive = true       # reg-cache forward-join state (reachable at entry)
   g.curProcName = info.asmName
   when defined(arkhamDbgProc):
     block:
@@ -6583,7 +6399,6 @@ proc buildGlobalInitProc(g: var CodeGen; initBuf: var TokenBuf) =
 proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool): string =
   ## Compile a parsed Leng module to x86-64 / Linux asm-NIF text.
   var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: x64Machine)
-  g.regCacheOn = getEnv("ARKHAM_REGCACHE") == "1"  # opt-in reload-elimination cache (default OFF)
   g.ab.renderReg = x64RegName                 # render register slots as x86 names
   g.prog = collect(buf, inputPath, tags)
   g.callTarget = g.prog.callTarget
