@@ -956,3 +956,18 @@ proc fixedRegsClobberedByE*(g: var CodeGen; n: Cursor): set[Reg] =
       while ch.hasMore:
         stack.add ch
         skip ch
+
+proc subtreeHasCallE*(n: Cursor): bool =
+  ## Does this expression subtree contain a CALL? Read-only. An `(at base idx)`
+  ## whose INDEX calls — a bounds check, say — evaluates the base FIRST and
+  ## reads it back AFTER the call, so the base's scratch must be a callee-saved
+  ## survivor rather than a volatile the call clobbers. (Fused port of the
+  ## allocator's `subtreeHasCall`.)
+  if n.kind != TagLit: return false
+  if n.exprKind == CallC: return true
+  var cc = n
+  cc.into:
+    while cc.hasMore:
+      if subtreeHasCallE(cc): return true
+      skip cc
+  return false

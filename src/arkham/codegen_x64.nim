@@ -7277,11 +7277,17 @@ proc resolveLvalVal(g: var CodeGen; c: Cursor; dest: var Location) =
   of CharLit: g.resolveDestE(dest, immLoc(int64(ord(charLit(c))), ScalarSlot))
   else: g.forceRegDestE(dest)                        # computed: reserve the result
 
-proc emitLvalWalk(g: var CodeGen; n: var Cursor; globBase: Location; isStore: bool) =
+proc emitLvalWalk(g: var CodeGen; n: var Cursor; globBase: Location; isStore: bool;
+                  heldBase = false) =
   ## FUSED port of the allocator's `allocLvalue2`: walk an lvalue subtree,
   ## deciding its embedded values' locations into the `ra.locs` memo — the
   ## registers `prematLval2` materializes into and `emLvalAddr2` reads. Pure
   ## pick-and-record: NO emission here. Advances `n` past the whole lvalue.
+  ##
+  ## `heldBase` says an enclosing `(at …)`/`(pat …)` has an INDEX that CALLS (a
+  ## bounds check, typically): the base is materialized before that call and
+  ## read back after it, so its scratch must be a callee-saved survivor rather
+  ## than a volatile the call would clobber (075b051's fix, fused twin).
   case n.kind
   of Symbol:
     let nm = symName(n)
@@ -7289,7 +7295,7 @@ proc emitLvalWalk(g: var CodeGen; n: var Cursor; globBase: Location; isStore: bo
       let pos = cursorToPosition(g.buf[], n)
       if globBase.kind == InReg:
         g.ra.locs[pos] = globBase
-      elif not isStore:
+      elif not isStore and not heldBase:
         # transient global base for a LOAD: `prematLval2` sources the address
         # from emit-time staging (the R11 bridge) — leave the position
         # unresolved as the marker.
@@ -7301,19 +7307,25 @@ proc emitLvalWalk(g: var CodeGen; n: var Cursor; globBase: Location; isStore: bo
     case n.exprKind
     of DotC:
       n.into:
-        g.emitLvalWalk(n, globBase, isStore)         # base (a stack var, deref, or global)
+        g.emitLvalWalk(n, globBase, isStore, heldBase) # base (a stack var, deref, or global)
         while n.hasMore: skip n                      # field name (+ any extras)
     of DerefC:
       n.into:
         let pPos = cursorToPosition(g.buf[], n)
-        var d = needsReg(ScalarSlot)
+        var d = if heldBase: g.takeHeld("a deref base held across an index call")
+                else: needsReg(ScalarSlot)
         g.resolveLvalVal(n, d)                       # the pointer → a register
         g.ra.locs[pPos] = d
         skip n
         while n.hasMore: skip n
     of AtC:
       n.into:
-        g.emitLvalWalk(n, globBase, isStore)         # base (stack array, deref, or global)
+        # Peek at the index BEFORE deciding the base: a calling index (a bounds
+        # check) clobbers the volatiles between the base's materialization and
+        # its use, so the base subtree must take survivors.
+        var idxPeek = n; skip idxPeek
+        let held = heldBase or subtreeHasCallE(idxPeek)
+        g.emitLvalWalk(n, globBase, isStore, held)   # base (stack array, deref, or global)
         if n.kind in {IntLit, UIntLit}: skip n       # immediate index — folds, no scratch
         else:
           let iPos = cursorToPosition(g.buf[], n)
@@ -7324,8 +7336,11 @@ proc emitLvalWalk(g: var CodeGen; n: var Cursor; globBase: Location; isStore: bo
         while n.hasMore: skip n
     of PatC:
       n.into:
+        var idxPeek = n; skip idxPeek                # same base-vs-calling-index hazard
+        let held = heldBase or subtreeHasCallE(idxPeek)
         let pPos = cursorToPosition(g.buf[], n)
-        var d = needsReg(ScalarSlot)
+        var d = if held: g.takeHeld("a pat base held across an index call")
+                else: needsReg(ScalarSlot)
         g.resolveLvalVal(n, d)                       # the pointer → a register
         g.ra.locs[pPos] = d
         skip n
@@ -7341,7 +7356,7 @@ proc emitLvalWalk(g: var CodeGen; n: var Cursor; globBase: Location; isStore: bo
       n.into:
         skip n                                       # base type
         skip n                                       # depth
-        g.emitLvalWalk(n, globBase, isStore)         # the inner lvalue
+        g.emitLvalWalk(n, globBase, isStore, heldBase) # the inner lvalue
         while n.hasMore: skip n
     of AconstrC, OconstrC:
       # A constructor used as an lvalue base (`[a,b][i]`): nothing to decide
