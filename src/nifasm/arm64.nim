@@ -148,6 +148,22 @@ proc emitAddImm*(dest: var Bytes; rd, rn: Register; imm: uint16; w = false) =
   if w: instr = instr and not SfBit
   dest.addUint32(instr)
 
+const ShBit12* = 0x00400000'u32
+  ## The `sh` bit (22) of ADD/SUB (immediate): when set, the 12-bit immediate is
+  ## shifted left by 12. Together, an unshifted and a shifted instruction encode any
+  ## 24-bit value — which is how a frame larger than 4095 bytes is reserved (a single
+  ## imm12 cannot hold it, and the frame size is only known at patch time).
+
+proc emitAddImmShifted12*(dest: var Bytes; rd, rn: Register; imm: uint16) =
+  ## `ADD rd, rn, #imm, LSL #12` — the high half of a 24-bit immediate.
+  dest.addUint32(0x91000000'u32 or ShBit12 or
+                 (uint32(imm) shl 10) or (encodeReg(rn) shl 5) or encodeReg(rd))
+
+proc emitSubImmShifted12*(dest: var Bytes; rd, rn: Register; imm: uint16) =
+  ## `SUB rd, rn, #imm, LSL #12` — the high half of a 24-bit immediate.
+  dest.addUint32(0xD1000000'u32 or ShBit12 or
+                 (uint32(imm) shl 10) or (encodeReg(rn) shl 5) or encodeReg(rd))
+
 proc emitAddExtended*(dest: var Bytes; rd, rn, rm: Register; shift: uint8 = 0) =
   ## Emit ADD (extended register): ADD rd, rn|SP, rm, UXTX #shift.
   ## Unlike the shifted-register ADD (`emitAdd`/`emitAddShifted`), the extended form

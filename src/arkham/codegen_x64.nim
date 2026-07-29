@@ -5220,7 +5220,7 @@ proc tryEmitCmov(g: var CodeGen; c: Cursor): bool =
   # `mov` (movImm never `xor`s; a 64-bit-normalised scalar move needs no flag-setting
   # `shl`/`sar` extend), so the flags survive to the cmov.
   let ct = cmovTagFor(g.emitScalarCmp2X64(sd.a, sd.b, sd.ek, whenTrue = true))
-  let rT = g.pickStagingSealed("a cmov then-value", sd.dst.typ, avoid = sd.dst.r)
+  let rT = g.pickStagingSealed("a cmov then-value", g.selectStagingSlot(sd), avoid = sd.dst.r)
   g.genStore2(sd.thenRhs, regLoc(rT, sd.dst.typ), cursorToPosition(g.buf[], sd.thenAsgn))
   g.genStore2(sd.elseRhs, sd.dst, cursorToPosition(g.buf[], sd.elseAsgn))
   g.ab.tree ct: (g.emReg sd.dst.r; g.emReg rT)

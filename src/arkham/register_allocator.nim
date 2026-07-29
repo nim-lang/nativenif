@@ -531,7 +531,8 @@ proc resolveDest(b: var Builder; dest: var Location; natural: Location) =
 
 proc allocValue(b: var Builder; n: var Cursor; dest: var Location)
 proc allocFValue(b: var Builder; n: var Cursor; dest: var Location)
-proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = false)
+proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = false;
+                  heldBase = false)
 proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = false)
 proc allocConstr(b: var Builder; n: var Cursor)
 proc allocStore(b: var Builder; n: var Cursor; dst: Location; auxPos: int)
@@ -1196,7 +1197,22 @@ proc reserveAtScratch(b: var Builder; atPos: int; idxReg: Reg) =
     b.ra.aux[atPos] = ExprAux(scratch: @[t.r])
   else: raiseAssert "arkham: out of registers for an index stride scratch"
 
-proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = false) =
+proc subtreeHasCall(n: Cursor): bool =
+  ## Does this expression subtree contain a CALL? Read-only (never advances the
+  ## caller's cursor). An `(at base idx)` whose INDEX calls — a bounds check, say —
+  ## evaluates the base FIRST and reads it back AFTER the call, so the base's scratch
+  ## must be a callee-saved survivor rather than a volatile temp (see `allocLvalue2`).
+  if n.kind != TagLit: return false
+  if n.exprKind == CallC: return true
+  var cc = n
+  cc.into:
+    while cc.hasMore:
+      if subtreeHasCall(cc): return true
+      skip cc
+  return false
+
+proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = false;
+                  heldBase = false) =
   ## Walk an lvalue subtree (the target of a load / store / `addr`), allocating its
   ## embedded VALUES — a `deref`'s pointer, a computed index — into registers (their
   ## homes, recorded in `locs`); stack-var / field names and immediate indices need
@@ -1210,6 +1226,11 @@ proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = 
   ## reused — no extra temp, normal lifecycle); for a STORE it is a scratch the
   ## caller reserved and holds across the rhs. A `dontCare` (e.g. a float load whose
   ## result is an xmm) reserves an own GPR temp instead.
+  ##
+  ## `heldBase` says an enclosing `(at …)`/`(pat …)` has an INDEX that CALLS — a bounds
+  ## check, typically. The base is materialized before that call and read back after it,
+  ## so every scratch this subtree takes must be a callee-saved survivor instead of a
+  ## volatile temp the call would clobber.
   case n.kind
   of Symbol:
     let nm = symName(n)
@@ -1230,18 +1251,25 @@ proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = 
     case n.exprKind
     of DotC:
       n.into:
-        allocLvalue2(b, n, globBase, isStore) # base (a stack var, deref, or global)
+        allocLvalue2(b, n, globBase, isStore, heldBase) # base (a stack var, deref, or global)
         while n.hasMore: skip n              # field name (+ any extras)
     of DerefC:
       n.into:
-        var d = needsReg(ScalarSlot)
+        # The pointer's home: a survivor when an enclosing index calls over it,
+        # else the ordinary volatile-first temp.
+        var d = if heldBase: b.reserveHeldScratch("a deref base held across an index call")
+                else: needsReg(ScalarSlot)
         allocValue(b, n, d)                  # the pointer → a register (its home)
         while n.hasMore: skip n
     of AtC:
       let atPos = b.posOf(n)
       var idxReg = NoReg                        # the register index (if any)
       n.into:
-        allocLvalue2(b, n, globBase, isStore) # base (stack array, deref, or global)
+        # Peek at the index BEFORE allocating the base: a calling index (a bounds
+        # check) clobbers the volatiles between the base's materialization and its use.
+        var idxPeek = n; skip idxPeek
+        let held = heldBase or subtreeHasCall(idxPeek)
+        allocLvalue2(b, n, globBase, isStore, held) # base (stack array, deref, or global)
         if n.kind in {IntLit, UIntLit}: skip n   # immediate index — folds, no scratch
         else:
           var idx = needsReg(ScalarSlot)
@@ -1254,7 +1282,10 @@ proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = 
       let patPos = b.posOf(n)
       var idxReg = NoReg
       n.into:
-        var d = needsReg(ScalarSlot)
+        var idxPeek = n; skip idxPeek          # same base-vs-calling-index hazard as `at`
+        let held = heldBase or subtreeHasCall(idxPeek)
+        var d = if held: b.reserveHeldScratch("a pat base held across an index call")
+                else: needsReg(ScalarSlot)
         allocValue(b, n, d)                  # the pointer → a register (its home)
         if n.kind in {IntLit, UIntLit}: skip n   # immediate index
         else:
@@ -1269,7 +1300,7 @@ proc allocLvalue2(b: var Builder; n: var Cursor; globBase = dontCare; isStore = 
       n.into:
         skip n                               # base type
         skip n                               # depth
-        allocLvalue2(b, n, globBase, isStore)  # the inner lvalue (its embedded values)
+        allocLvalue2(b, n, globBase, isStore, heldBase)  # the inner lvalue (its embedded values)
         while n.hasMore: skip n
     of AconstrC, OconstrC:
       # A constructor used as an lvalue base — e.g. `[a, b][i]` (`(at (aconstr …) idx)`).

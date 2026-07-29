@@ -765,3 +765,16 @@ proc matchSelectDiamond*(g: var CodeGen; c: Cursor; sd: var SelectDiamond): bool
                      thenAsgn: thenBody, elseAsgn: elseBody,
                      thenRhs: thenRhs, elseRhs: elseRhs)
   return true
+
+proc selectStagingSlot*(g: var CodeGen; sd: SelectDiamond): AsmSlot =
+  ## The slot for the register that stages the THEN value. It receives a COPY of DST,
+  ## so it must be bound with DST's *asm* type — and a register-homed scalar local is
+  ## declared `(i 64)` whatever its logical width (see `emRegLocalVar`, same rule in
+  ## both backends). DST's own precise slot is the wrong answer: an `enum` DST would
+  ## bind the staging register `(u 8)` and nifasm then rejects the `mov` that copies
+  ## the `(i 64)`-declared DST into it. A POINTER DST keeps its real type, which is
+  ## exactly what its declaration keeps too.
+  if not cursorIsNil(sd.dst.typ.typ) and isPtrType(resolveType(g.prog, sd.dst.typ.typ)):
+    sd.dst.typ
+  else:
+    AsmSlot(cls: AInt, size: 8, align: 8)

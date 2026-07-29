@@ -572,6 +572,7 @@ proc checkComparable(t: Type; op: string; n: Cursor)
 proc checkCompatibleTypes(t1, t2: Type; op: string; n: Cursor)
 proc checkCmpCompatible(t1, t2: Type; n: Cursor)
 proc checkBitwiseCompatible(t1, t2: Type; op: string; n: Cursor)
+proc checkArithCompatible(t1, t2: Type; op: string; n: Cursor)
 proc checkType(want, got: Type; n: Cursor)
 
 proc atTypeStart(n: Cursor): bool =
@@ -2686,12 +2687,19 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperandA64(n, ctx)
     checkIntegerArithmetic(dest.typ, "add", start)
     checkIntegerArithmetic(op.typ, "add", start)
-    checkCompatibleTypes(dest.typ, op.typ, "add", start)
+    checkArithCompatible(dest.typ, op.typ, "add", start)  # sized ints of any width (64-bit reg)
     if dest.kind == okMem:
       error("ADD to memory not supported yet for ARM64", n)
     else:
       if op.kind == okSsize:
+        # A PAIR: `add sp, sp, #lo12` + `add sp, sp, #hi12, lsl #12`. The frame size is
+        # only known at patch time and ADD's immediate is 12 bits, so a single
+        # instruction silently truncated any frame over 4095 bytes (a 10KB frame came
+        # out as `sub sp, sp, #2000`, leaving every local access off the end of the
+        # stack — an ASLR-dependent crash). The patcher fills each half; see `finalize`.
         arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, 0'u16)
+        ctx.ssizePatches.add(ctx.buf.data.len - 4)
+        arm64.emitAddImmShifted12(ctx.buf.data, dest.reg, dest.reg, 0'u16)
         ctx.ssizePatches.add(ctx.buf.data.len - 4)
       elif op.kind == okImm or op.kind == okCsize:
         if op.immVal >= 0 and op.immVal <= 4095:
@@ -2714,12 +2722,14 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperandA64(n, ctx)
     checkIntegerArithmetic(dest.typ, "sub", start)
     checkIntegerArithmetic(op.typ, "sub", start)
-    checkCompatibleTypes(dest.typ, op.typ, "sub", start)
+    checkArithCompatible(dest.typ, op.typ, "sub", start)  # sized ints of any width (64-bit reg)
     if dest.kind == okMem:
       error("SUB to memory not supported yet for ARM64", n)
     else:
       if op.kind == okSsize:
-        arm64.emitSubImm(ctx.buf.data, dest.reg, dest.reg, 0'u16)
+        arm64.emitSubImm(ctx.buf.data, dest.reg, dest.reg, 0'u16)   # lo12 (see AddA64)
+        ctx.ssizePatches.add(ctx.buf.data.len - 4)
+        arm64.emitSubImmShifted12(ctx.buf.data, dest.reg, dest.reg, 0'u16)  # hi12
         ctx.ssizePatches.add(ctx.buf.data.len - 4)
       elif op.kind == okImm or op.kind == okCsize:
         if op.immVal >= 0 and op.immVal <= 4095:
@@ -2802,7 +2812,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperandA64(n, ctx)
     checkBitwiseType(dest.typ, "orr", start)
     checkBitwiseType(op.typ, "orr", start)
-    checkCompatibleTypes(dest.typ, op.typ, "orr", start)
+    checkBitwiseCompatible(dest.typ, op.typ, "orr", start)
     if dest.kind == okMem: error("ORR to memory not supported yet", n)
     else:
       if op.kind == okImm: error("ORR immediate not supported yet", n)
@@ -2816,7 +2826,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperandA64(n, ctx)
     checkBitwiseType(dest.typ, "eor", start)
     checkBitwiseType(op.typ, "eor", start)
-    checkCompatibleTypes(dest.typ, op.typ, "eor", start)
+    checkBitwiseCompatible(dest.typ, op.typ, "eor", start)
     if dest.kind == okMem: error("EOR to memory not supported yet", n)
     else:
       if op.kind == okImm: error("EOR immediate not supported yet", n)
@@ -3597,9 +3607,21 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
       var instr = uint32(ctx.buf.data[pos]) or (uint32(ctx.buf.data[pos+1]) shl 8) or
                   (uint32(ctx.buf.data[pos+2]) shl 16) or (uint32(ctx.buf.data[pos+3]) shl 24)
       if (instr shr 24) == 0xD2'u32:        # MOVZ Xd, #imm16 → imm16 at [20:5]
+        if v > 0xFFFF'u32:
+          quit "nifasm: stack frame of " & $alignedStackSize &
+               " bytes exceeds the 16-bit `mov reg, (ssize)` immediate"
         instr = (instr and not (0xFFFF'u32 shl 5)) or ((v and 0xFFFF'u32) shl 5)
-      else:                                 # ADD/SUB Xd, Xn, #imm12 → imm12 at [21:10]
-        instr = (instr and not (0xFFF'u32 shl 10)) or ((v and 0xFFF'u32) shl 10)
+      else:
+        # ADD/SUB Xd, Xn, #imm12 → imm12 at [21:10]. These come in PAIRS (see the
+        # `okSsize` emit sites): the instruction carrying the `sh` bit takes the HIGH
+        # 12 bits, the other the low 12. Masking both to `v and 0xFFF` is what silently
+        # truncated every frame over 4095 bytes.
+        if v > 0xFFFFFF'u32:
+          quit "nifasm: stack frame of " & $alignedStackSize &
+               " bytes exceeds the 24-bit ADD/SUB immediate pair"
+        let half = if (instr and arm64.ShBit12) != 0: (v shr 12) and 0xFFF'u32
+                   else: v and 0xFFF'u32
+        instr = (instr and not (0xFFF'u32 shl 10)) or (half shl 10)
       ctx.buf.data[pos]   = byte(instr and 0xFF)
       ctx.buf.data[pos+1] = byte((instr shr 8) and 0xFF)
       ctx.buf.data[pos+2] = byte((instr shr 16) and 0xFF)
@@ -4366,19 +4388,23 @@ proc checkCmpCompatible(t1, t2: Type; n: Cursor) =
 
 proc checkBitwiseCompatible(t1, t2: Type; op: string; n: Cursor) =
   ## Compatibility rule for `and`/`or`/`xor` — looser than arithmetic, like `cmp`. Two
-  ## SIZED integers of ANY width/signedness combine fine: x86 bitwise ops run at
-  ## register width and arkham canonicalizes integers in 64-bit registers, so e.g.
-  ## `i64 and u32` is valid. Non-integer kinds (pointers) stay strict via `compatible`.
+  ## SIZED integers of ANY width/signedness combine fine: bitwise ops run at register
+  ## width on both x86 and AArch64, and arkham canonicalizes integers in 64-bit
+  ## registers, so e.g. `i64 and u32` is valid. It emits exactly that for a widening
+  ## `conv` over a narrow bitwise expression: the operation runs in the (already
+  ## 64-bit-bound) destination register and a following `lsl`/`asr` pair re-extends.
+  ## Non-integer kinds (pointers) stay strict via `compatible`.
   if compatible(t1, t2): return
   const intish = {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.BoolT}
   if t1.kind in intish and t2.kind in intish: return
   error("Operation '" & op & "' requires compatible types, got " & $t1 & " and " & $t2, n)
 
 proc checkArithCompatible(t1, t2: Type; op: string; n: Cursor) =
-  ## Compatibility rule for `add`/`sub` — same as `cmp`/bitwise: two SIZED integers of
-  ## ANY width/signedness add fine, because arkham canonicalizes every integer into a
-  ## full 64-bit register (a narrow load is zero/sign-extended), so the op runs at
-  ## register width and `i64 + u32` (e.g. an `int` index plus a `uint32` hash) is valid.
+  ## Compatibility rule for `add`/`sub` — same as `cmp`/bitwise, on x86 and AArch64
+  ## alike: two SIZED integers of ANY width/signedness add fine, because arkham
+  ## canonicalizes every integer into a full 64-bit register (a narrow load is
+  ## zero/sign-extended), so the op runs at register width and `i64 + u32` (e.g. an
+  ## `int` index plus a `uint32` hash) is valid.
   ## A pointer keeps the strict `compatible` rule (ptr+int is handled by callers that
   ## permit it), so an int-vs-pointer mixup is still caught.
   if compatible(t1, t2): return

@@ -448,6 +448,19 @@ proc emBindType(g: var CodeGen; typ: AsmSlot) =
     if tc.kind == Symbol: g.ab.sym symName(tc)
     else: g.genTypeBody(tc)
 
+proc stackHomeSlot(g: var CodeGen; typ: AsmSlot): AsmSlot =
+  ## The slot a destination must be bound with when its value is LOADED FROM A STACK
+  ## HOME. `emTypedStackVar`/`emScalarStackVar` declare every non-pointer scalar's slot
+  ## a forced `(i 64)` — arkham keeps scalars 64-bit in registers and the `ldr`/`str`
+  ## accessors are 64-bit, so a narrow slot would mis-size the access. Binding the
+  ## destination with the VALUE's own narrow slot instead (`(bool)`, `(u 8)`, `(u 32)`)
+  ## makes the load `(mov <narrow> <(stackoff (i 64))>)` — a type error nifasm rejects.
+  ## A POINTER keeps its real `(ptr T)`, which is exactly what its declaration keeps.
+  if isNilSlot(typ): return typ                    # a `(nil)` binding — a null pointer
+  if not cursorIsNil(typ.typ) and isPtrType(resolveType(g.prog, typ.typ)): return typ
+  if typ.kind in {ABool, AInt, AUInt}: return ScalarSlot
+  result = typ
+
 proc bindTemp(g: var CodeGen; r: Reg; typ: AsmSlot) =
   ## Give scratch register `r` a typed nifasm name `tmpN.0` via `(rebind …)`, so every
   ## later `emReg r` emits a checked symbol rather than a raw `(xN)` the binding
@@ -1270,6 +1283,22 @@ proc placeImm(g: var CodeGen; dest: Reg; loc: Location) =
   if isNilImm(loc):
     g.ab.tree MovA64: (g.emReg dest; g.ab.nilValue())
   else: g.movImm(dest, loc.ival)
+
+proc placeImmTyped(g: var CodeGen; dest: Reg; loc: Location; typeCur: Cursor) =
+  ## `placeImm` for a `dest` bound with `typeCur`'s slot. When that slot is a POINTER
+  ## and the literal is a non-zero integer, the bare `(mov dest <imm>)` is exactly the
+  ## shape nifasm's `checkPtrStore` rejects — it cannot tell it from a code generator's
+  ## stale register binding. Spell the intent out with an explicit `(cast …)`, which
+  ## opts out of that rule: `cast[pointer](-1)`, mmap's MAP_FAILED, is a deliberate
+  ## non-zero pointer literal.
+  if not isNilImm(loc) and loc.ival != 0 and not cursorIsNil(typeCur) and
+      isPtrType(resolveType(g.prog, typeCur)):
+    var tc = typeCur
+    g.ab.tree MovA64:
+      g.emReg dest
+      g.ab.tree CastX: (g.genTypeBody(tc); g.ab.intLit loc.ival)
+  else:
+    g.placeImm(dest, loc)
 
 proc globalIsGvarSlot(g: var CodeGen; name: string): bool =
   ## True when `name` is a real `.bss`/`.data` gvar (nifasm `GvarD`, carrying a
@@ -2134,9 +2163,14 @@ proc emitCast2(g: var CodeGen; c: Cursor) =
     elif iv.kind == InReg:
       if kindChange: retypeCastRes()
     elif iv.kind == Imm:
-      if kindChange: retypeCastRes()
-      elif res2.isTemp: g.bindTemp(res2.r, res2.typ)
-      g.placeImm(res2.r, iv)
+      if kindChange:
+        # `retypeCastRes` rebinds the destination to the POINTER type, so the literal
+        # needs the explicit-cast spelling (see placeImmTyped).
+        retypeCastRes()
+        g.placeImmTyped(res2.r, iv, targetCur)
+      else:
+        if res2.isTemp: g.bindTemp(res2.r, res2.typ)
+        g.placeImm(res2.r, iv)
   let (srcW, srcSigned) = g.srcWidthSigned(inner)
   if kindChange:
     if ptrTarget and not srcPtr and srcW < 64: g.extendTo(res2.r, srcW, signed = false)
@@ -2739,13 +2773,19 @@ proc emitScalarCmp2(g: var CodeGen; aC, bC: Cursor; ek: LengExpr; whenTrue: bool
   # with the operand's precise slot instead (mirrors emitMemLoad2's ptr handling).
   template cmpBridgeSlot(loc: Location; opC: Cursor): AsmSlot =
     if isPtrType(resolveType(g.prog, g.getType(opC))): g.exprSlot(opC)
+    elif loc.kind == NamedStack: g.stackHomeSlot(loc.typ)   # the slot is `(i 64)`
     else: loc.typ
+  # …and because the bridge then carries that pointer slot, an immediate operand
+  # (`cast[pointer](-1)`) must reach it as an explicit cast rather than a bare `mov`.
+  template placeCmpOperand(loc: Location; opC: Cursor; bridge: Reg) =
+    if loc.kind == Imm: g.placeImmTyped(bridge, loc, g.getType(opC))
+    else: g.place2(loc, bridge)
   g.emitValue2(aC)
   let aLoc0 = g.ra.locs[g.posOf(aC)]
   var aReg = NoReg
   var aBridge = NoReg
   if aLoc0.kind == InReg: aReg = aLoc0.r
-  else: (aBridge = g.takeBridge(cmpBridgeSlot(aLoc0, aC)); g.place2(aLoc0, aBridge); aReg = aBridge)
+  else: (aBridge = g.takeBridge(cmpBridgeSlot(aLoc0, aC)); placeCmpOperand(aLoc0, aC, aBridge); aReg = aBridge)
   let bLoc = g.ra.locs[g.posOf(bC)]
   if bLoc.kind == Imm and bLoc.ival >= 0 and bLoc.ival <= 0xFFFF:
     g.ab.tree CmpA64: (g.emReg aReg; g.emImm(bLoc))
@@ -2755,7 +2795,7 @@ proc emitScalarCmp2(g: var CodeGen; aC, bC: Cursor; ek: LengExpr; whenTrue: bool
     var bReg = NoReg
     var bBridge = NoReg
     if bL.kind == InReg: bReg = bL.r
-    else: (bBridge = g.takeBridge(cmpBridgeSlot(bL, bC), avoid = aReg); g.place2(bL, bBridge); bReg = bBridge)
+    else: (bBridge = g.takeBridge(cmpBridgeSlot(bL, bC), avoid = aReg); placeCmpOperand(bL, bC, bBridge); bReg = bBridge)
     g.ab.tree CmpA64: (g.emReg aReg; g.emReg bReg)
     if bL.kind == InReg and bL.isTemp: g.unbindTemp(bL.r)
     if bBridge != NoReg: g.dropBridge bBridge
@@ -2930,7 +2970,11 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
     if dst.kind == InReg:
       let home = g.ra.locationOfSym(symName(c))
       if home.kind != NoLoc:
-        if dst.isTemp: g.bindTemp(dst.r, dst.typ)
+        # A stack home is declared `(i 64)` for a non-pointer scalar, so the
+        # destination has to be bound to match the LOAD (see stackHomeSlot).
+        if dst.isTemp:
+          g.bindTemp(dst.r, if home.kind == NamedStack: g.stackHomeSlot(dst.typ)
+                            else: dst.typ)
         g.place2(home, dst.r)
       else:
         let si = g.lookupSym(symName(c))
@@ -3777,7 +3821,7 @@ proc tryEmitCsel(g: var CodeGen; c: Cursor): bool =
   # `if c: x = x …` style self-reads stay correct; both stores are mov/ldr-only, so
   # the flags survive to the csel.
   let ct = cselTagFor(g.emitScalarCmp2(sd.a, sd.b, sd.ek, whenTrue = true))
-  let rT = g.takeBridge(sd.dst.typ)
+  let rT = g.takeBridge(g.selectStagingSlot(sd))
   g.genStore2(sd.thenRhs, regLoc(rT, sd.dst.typ), g.posOf(sd.thenAsgn))
   g.genStore2(sd.elseRhs, sd.dst, g.posOf(sd.elseAsgn))
   g.ab.tree ct: (g.emReg sd.dst.r; g.emReg rT; g.emReg sd.dst.r)
