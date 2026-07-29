@@ -1,0 +1,34 @@
+(.nif27)
+(stmts
+ (type :Big.0 . (object . (fld :ba.0 . (i 64)) (fld :bb.0 . (i 64)) (fld :bc.0 . (i 64))))
+ (proc :exit.c (params (param :code.0 . (i 32))). (pragmas (importc "exit")) (stmts .))
+ (proc :take.0
+  (params
+   (param :x0.0 . (i 64))
+   (param :x1.0 . (i 64))
+   (param :p.0 . Big.0)
+   (param :d.0 . (i 64)))
+  (i 64).
+  (stmts
+   (ret
+    (add (i 64)
+     (add (i 64)
+      (add (i 64)
+       (add (i 64)
+        (add (i 64) x0.0 x1.0)
+        (dot p.0 ba.0))
+       (dot p.0 bb.0))
+      (dot p.0 bc.0))
+     d.0))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas (exportc "main"))
+  (stmts
+   (var :n.0 . (i 64) 20)
+   (var :m.0 . (i 64) 4)
+   (var :q.0 . Big.0 (oconstr Big.0 (kv ba.0 10) (kv bb.0 20) (kv bc.0 30)))
+   (var :r.0 . (i 64)
+    (call take.0 1 2 q.0
+     (div (i 64) n.0 m.0)))
+   (call exit.c r.0))))
