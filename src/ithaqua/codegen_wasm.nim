@@ -1674,7 +1674,7 @@ proc genExpr(g: var WasmGen; c: Cursor) =
         g.op OpI32Eqz; g.op OpI32Eqz
         g.op OpEnd
         while t.hasMore: skip t
-    of AddrC:
+    of AddrC, HaddrC:
       var t = c
       t.into:
         genLvalAddr(g, t)
@@ -2554,7 +2554,7 @@ proc genStmtList(g: var WasmGen; c: Cursor) =
 proc scanAddrTaken(c: Cursor; taken: var HashSet[string]) =
   ## Which symbols appear under `(addr …)` in this proc body.
   if c.kind != TagLit: return
-  if c.exprKind == AddrC:
+  if c.exprKind in AddrKinds:
     var inner = c
     inc inner                                  # into the (addr …) → the lvalue
     # the addressed ROOT symbol: peel dot/at/pat chains
@@ -2785,7 +2785,7 @@ proc constScalarBits(g: var WasmGen; v: Cursor; ok: var bool): uint64 =
         else:
           result = constScalarBits(g, t, ok)
         while t.hasMore: skip t
-    of AddrC:
+    of AddrC, HaddrC:
       var t = v
       inc t
       if t.kind == Symbol:
@@ -2916,7 +2916,7 @@ proc emitGlobalInit(g: var WasmGen; nm: string; addrv: uint32) =
       while t.hasMore: skip t
     if not staticInner: return
   elif initv.kind == TagLit and
-     initv.exprKind notin {OconstrC, AconstrC, TrueC, SufC, ParC, AddrC, NegC}:
+     initv.exprKind notin {OconstrC, AconstrC, TrueC, SufC, ParC, AddrC, HaddrC, NegC}:
     return                                     # runtime-computed init
   if initv.kind == Symbol and
      lookupSym(typeCtx(g), symName(initv)).cat != scProc:
