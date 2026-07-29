@@ -21,7 +21,7 @@
     (i 32)))
   (i 64)
   (pragmas
-   (importc "__atomic_fetch_add"))
+   (intrinsic "AtomicFetchAdd"))
   (stmts .))
  (proc :aln.0
   (params
@@ -32,7 +32,7 @@
     (i 32)))
   (i 64)
   (pragmas
-   (importc "__atomic_load_n"))
+   (intrinsic "AtomicLoad"))
   (stmts .))
  (proc :asn.0
   (params
@@ -44,7 +44,7 @@
    (param :mo.0 .
     (i 32))).
   (pragmas
-   (importc "__atomic_store_n"))
+   (intrinsic "AtomicStore"))
   (stmts .))
  (proc :main.0
   (params)
@@ -52,15 +52,15 @@
   (pragmas
    (exportc "main"))
   (stmts
-   (call asn.0
+   (instr asn.0
     (addr counter.0)10 0)
    (var :old.0 .
     (i 64)
-    (call afa.0
+    (instr afa.0
      (addr counter.0)5 0))
    (var :cur.0 .
     (i 64)
-    (call aln.0
+    (instr aln.0
      (addr counter.0)0))
    (call exit.c
     (add

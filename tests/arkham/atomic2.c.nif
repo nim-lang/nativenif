@@ -20,7 +20,7 @@
    (param :mo.0 .
     (i 32))).
   (pragmas
-   (importc "__atomic_store_n"))
+   (intrinsic "AtomicStore"))
   (stmts .))
  (proc :axc.0
   (params
@@ -33,7 +33,7 @@
     (i 32)))
   (i 64)
   (pragmas
-   (importc "__atomic_exchange_n"))
+   (intrinsic "AtomicExchange"))
   (stmts .))
  (proc :afo.0
   (params
@@ -46,7 +46,7 @@
     (i 32)))
   (i 64)
   (pragmas
-   (importc "__atomic_fetch_or"))
+   (intrinsic "AtomicFetchOr"))
   (stmts .))
  (proc :asf.0
   (params
@@ -59,14 +59,14 @@
     (i 32)))
   (i 64)
   (pragmas
-   (importc "__atomic_sub_fetch"))
+   (intrinsic "AtomicSubFetch"))
   (stmts .))
  (proc :tf.0
   (params
    (param :mo.0 .
     (i 32))).
   (pragmas
-   (importc "__atomic_thread_fence"))
+   (intrinsic "AtomicThreadFence"))
   (stmts .))
  (proc :main.0
   (params)
@@ -74,21 +74,21 @@
   (pragmas
    (exportc "main"))
   (stmts
-   (call asn.0
+   (instr asn.0
     (addr v.0)8 0)
    (var :old.0 .
     (i 64)
-    (call axc.0
+    (instr axc.0
      (addr v.0)5 0))
    (var :ored.0 .
     (i 64)
-    (call afo.0
+    (instr afo.0
      (addr v.0)2 0))
    (var :newv.0 .
     (i 64)
-    (call asf.0
+    (instr asf.0
      (addr v.0)3 0))
-   (call tf.0 0)
+   (instr tf.0 0)
    (call exit.c
     (add
      (i 64)old.0

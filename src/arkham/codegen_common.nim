@@ -39,10 +39,6 @@ type
     globals*: Table[string, Cursor]          ## global var name → its decl cursor
     tvars*: Table[string, Cursor]            ## thread-local var name → its decl cursor (macOS TLV)
     tvarNames*: HashSet[string]              ## tvar names, for the per-proc analyser
-    atomicCallNames*: HashSet[string]        ## names of calls the emitter INLINES as an atomic
-                                             ## sequence (emitAtomic2) — a limited clobber, not a
-                                             ## real call. The analyser treats them specially so a
-                                             ## var crossing only atomics keeps an r8/r9 home.
     freeTmp*: set[Reg]                       ## volatile temps free for scratch
     freeFTmp*: set[FReg]                     ## volatile SIMD/FP temps free for scratch
     spillCount*: int                         ## fresh-spill-slot counter (per proc): when

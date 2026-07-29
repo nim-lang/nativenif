@@ -15,13 +15,13 @@
    (param :b.0 .
     (u 64))).
   (pragmas
-   (instruction cmp))
+   (instruction "cmp"))
   (stmts .))
  (proc :zf.0
   (params)
   (bool)
   (pragmas
-   (instruction zf))
+   (instruction "zf"))
   (stmts .))
  (proc :subject.0
   (params

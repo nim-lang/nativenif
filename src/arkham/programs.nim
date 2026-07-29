@@ -36,7 +36,6 @@ type
     sysNr*: int              ## x86-64 Linux syscall number (when `syscall`)
     sysNrA64*: int           ## AArch64 Linux syscall number (when `syscall`); `-1` if
                              ## the name has no syscall on that arch
-    atomic*: string          ## non-empty → a GCC `__atomic_*` builtin lowered inline
     memIntrin*: string       ## non-empty → a mem* intrinsic (memcpy/…) lowered inline
     bitBuiltin*: string      ## non-empty → a GCC bit builtin (`__builtin_ctzll`, …)
                              ## lowered inline to a native bit instruction (bsf/bsr/…)
@@ -239,11 +238,11 @@ proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
           c.into:
             if c.hasMore: (exportcN = strVal(c); inc c)
         of InstructionP, IntrinsicP:
-          # `(instruction bsf)` / `(intrinsic Ctz)` — the argument is an ident from
+          # `(instruction "bsf")` / `(intrinsic "Ctz")` — the argument names a row in
           # the shared `lib/intrinsics` enum, so this is a table lookup, not a match
           # against a C name. Sem already checked it against the signature.
           c.into:
-            if c.hasMore and c.kind == Ident:
+            if c.hasMore and c.kind == StrLit:
               intrinsic = intrinsicOpByName(strVal(c),
                             (if pk == InstructionP: icPinned else: icPortable))
               inc c
@@ -494,10 +493,6 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           # `(instr …)`, which never routes through `callTarget`.
           result.instrTarget[pname] = InstrTarget(op: intrinsic, retType: retType,
                                                   argBits: firstIntParamBits(procStart))
-        elif importcN.len >= 9 and importcN[0 .. 8] == "__atomic_":
-          # GCC atomic builtin: not a real external call — arkham lowers it to a
-          # lock-free instruction sequence (no extproc/libSystem dependency).
-          result.callTarget[pname] = CallTarget(atomic: importcN, retType: retType, sigType: sigType)
         elif importcN in ["memcpy", "memmove", "memset", "memcmp"]:
           # C mem* intrinsic: lowered inline (no libc dependency) — see genMemIntrin.
           result.callTarget[pname] = CallTarget(memIntrin: importcN, retType: retType, sigType: sigType)
@@ -663,14 +658,12 @@ proc foreignCallTarget*(p: var Program; name: string): CallTarget =
     while d.hasMore: skip d                    # body
   let sigType = procSigType(declCur)
   # A cross-module call must classify the foreign decl EXACTLY as the owning
-  # module's pass 0 did (see `collect`): an `importc`'d syscall / atomic / mem*
+  # module's pass 0 did (see `collect`): an `importc`'d syscall / mem*
   # intrinsic / bit builtin is lowered inline (or to a `<name>.sys.<mod>` syproc
   # the foreign module emits), NOT called by its plain `<name>.0.<mod>` symbol —
   # which would be an unresolved extern. The asm symbol for a foreign syscall is
   # the foreign module's `<importc>.sys.<that module>` (its suffix is `s.module`).
-  if importcN.len >= 9 and importcN[0 .. 8] == "__atomic_":
-    result = CallTarget(atomic: importcN, retType: retType, sigType: sigType)
-  elif importcN in ["memcpy", "memmove", "memset", "memcmp"]:
+  if importcN in ["memcpy", "memmove", "memset", "memcmp"]:
     result = CallTarget(memIntrin: importcN, retType: retType, sigType: sigType)
   elif importcN in ["__builtin_ctzll", "__builtin_ctz",
                     "__builtin_clzll", "__builtin_clz",

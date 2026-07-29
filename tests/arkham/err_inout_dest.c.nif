@@ -15,7 +15,7 @@
    (param :b.0 .
     (u 64))).
   (pragmas
-   (instruction cmp))
+   (instruction "cmp"))
   (stmts .))
  (proc :addx.0
   (params
@@ -25,13 +25,13 @@
    (param :s.0 .
     (u 64))).
   (pragmas
-   (instruction add))
+   (instruction "add"))
   (stmts .))
  (proc :zf.0
   (params)
   (bool)
   (pragmas
-   (instruction zf))
+   (instruction "zf"))
   (stmts .))
  (proc :subject.0
   (params

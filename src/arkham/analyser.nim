@@ -69,11 +69,10 @@ type
 
   ProcAnalysis* = object
     vars*: Table[string, VarInfo]
-    hasCall*: bool              ## real call OR inlined atomic — params cannot stay in
-                                ## clobbered arg regs; AllRegs / ArgResident consult this
-    hasRealCall*: bool          ## a true `bl`/`blr` call exists (not just an inlined
-                                ## atomic). Drives the fp/lr frame: atomics need no lr.
-    callPositions*: seq[int]    ## token positions of every real call — the allocator's
+    hasCall*: bool              ## a call exists — params cannot stay in clobbered arg
+                                ## regs; AllRegs / ArgResident consult this, and the
+                                ## fp/lr frame decision is this same question
+    callPositions*: seq[int]    ## token positions of every call — the allocator's
                                 ## caller-save cost model counts how many a var crosses
     clobbersDivReg*: bool       ## body contains a div/mod → rdx is clobbered, so a
                                 ## leaf param must not be homed there (x86-64 only)
@@ -113,13 +112,6 @@ type
                                ## accesses) — the points where caller-saved regs die. A
                                ## local may use `AllRegs` iff none of these fall in its
                                ## live interval. Recorded in source order; scanned linearly.
-    atomicPositions: seq[int]  ## token position of every call the emitter INLINES as an
-                               ## atomic sequence (`emitAtomic2`). It clobbers only rax + its
-                               ## arg regs (rdi/rsi/rdx), NOT the whole caller-saved file, so
-                               ## it is NOT a full call point: it denies `AllRegs` (rdi/rsi
-                               ## are clobbered) but a var crossing only atomics still earns
-                               ## `R89Ok` (r8/r9 survive). Kept out of `callPositions`.
-    atomicCalls: HashSet[string]  ## names classified as inlined atomics (see `atomicPositions`)
     divPositions: seq[int]     ## token position of every div/mod (clobbers rdx). An
                                ## `AllRegs` local additionally earns `DivRegOk` (rdx is a
                                ## legal home) iff none of these fall in its live interval.
@@ -409,20 +401,13 @@ proc analyse(c: var Context; n: var Cursor) =
     of StmtsS:                          # statement grouping only — shares the scope frame
       iterStmts(c, n): analyse(c, n)
     of CallS:
-      # An inlined atomic (emitAtomic2) is NOT a real call: it clobbers only rax + its arg
-      # regs. Record it as an atomic point (denies AllRegs, but leaves R89Ok) rather than a
-      # full call point. The callee is the first child; an indirect (non-Symbol) target or an
-      # unclassified name is conservatively a real call.
-      var isAtomic = false
-      if c.atomicCalls.len > 0:
-        var probe = n
-        probe.into:                       # the callee is the first child
-          if probe.kind == Symbol: isAtomic = symName(probe) in c.atomicCalls
-          while probe.hasMore: skip probe  # drain so `into` sees all children consumed
-      if isAtomic: c.atomicPositions.add posOf(c, n)
-      else:
-        c.callPositions.add posOf(c, n)
-        if c.loopStack.len > 0: c.loopStack[^1].sawCall = true
+      # Every `(call …)` is a real call point now that the atomics are `(instr …)`.
+      # They used to need an exception here — an inlined atomic clobbers a handful of
+      # registers, not the caller-saved file — and modelling that took a name set, a
+      # second position list and a weaker variant property. As instructions they take
+      # only registers the allocator never hands out, so there is nothing to model.
+      c.callPositions.add posOf(c, n)
+      if c.loopStack.len > 0: c.loopStack[^1].sawCall = true
       # ArgResident safety walk (peek only; the real accounting is analyseChildren below).
       # A param P may stay in its arg register across its consuming call only if that call
       # marshals it back to its OWN arg-GPR — a self-move no sibling arg clobbers. Peek the
@@ -586,21 +571,17 @@ when defined(arkhamPeakLive):
         if iv.lo < cp and cp < iv.hi: inc cnt    # strictly spans the call → live across it
       if cnt > acrossPeak: (acrossPeak = cnt; acrossCall = cp)
     stderr.write "  ACROSSCALL proc=" & pname & " max-live-across-one-call=" & $acrossPeak &
-      " @call=" & $acrossCall & " (ncalls=" & $c.callPositions.len &
-      " natomics=" & $c.atomicPositions.len & " atomicSet=" & $c.atomicCalls.len & ")\n"
+      " @call=" & $acrossCall & " (ncalls=" & $c.callPositions.len & ")\n"
 
 proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
                   tvars: HashSet[string] = initHashSet[string]();
-                  atomicCalls: HashSet[string] = initHashSet[string]();
                   cleanCallees: HashSet[string] = initHashSet[string]();
                   procIsClean = false;
                   entryLeadingClobber = false): ProcAnalysis =
   ## `procDecl` is at a `(proc name params rettype pragmas body)`. `tvars` names
-  ## the module's thread-locals so their uses force a call-like analysis. `atomicCalls`
-  ## names calls the emitter inlines as an atomic sequence (a limited clobber — see
-  ## `atomicPositions`); empty ⇒ every call is treated as a real call. `buf` is the
+  ## the module's thread-locals so their uses force a call-like analysis. `buf` is the
   ## buffer `procDecl` points into (for cursor → position mapping).
-  var c = Context(tvars: tvars, atomicCalls: atomicCalls, cleanCallees: cleanCallees,
+  var c = Context(tvars: tvars, cleanCallees: cleanCallees,
                   procIsClean: procIsClean, buf: addr buf)
   var n = procDecl
   assert n.stmtKind == ProcS
@@ -618,8 +599,7 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
     skip n                              # pragmas
     scopeFrame(c):                      # the proc-body scope frame (its `stmts`
       iterStmts(c, n): analyse(c, n)    # shares it rather than pushing its own)
-  c.res.hasRealCall = c.callPositions.len > 0
-  c.res.hasCall = c.res.hasRealCall or c.atomicPositions.len > 0
+  c.res.hasCall = c.callPositions.len > 0
   c.res.callPositions = c.callPositions
   # Grant `AllRegs` (volatile/caller-saved eligible) to every local whose live
   # interval contains no call point. The interval is `(liveStart, freeAfter]`
@@ -627,25 +607,14 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
   # check is conservative: `freeAfter` over-approximates the range end and a
   # call within it denies `AllRegs`, so a missed-but-live-across-call case is
   # impossible (the unsafe direction). Params (`freeAfter == high`) are skipped.
-  # An INLINED ATOMIC (`atomicPositions`) clobbers rdi/rsi (its args), so it too
-  # denies `AllRegs`; but a var crossing ONLY atomics (no REAL call) still earns
-  # the weaker `R89Ok` — r8/r9 survive an atomic and stay legal homes.
   for name, vi in mpairs c.res.vars:
     if vi.freeAfter == high(int): continue
     let lo = if vi.declInLoop: vi.loopLo else: vi.liveStart
     let hi = if vi.declInLoop: vi.loopHi else: vi.freeAfter
-    var crossesRealCall = false
+    var crossesCall = false
     for p in c.callPositions:
-      if p > lo and p <= hi: (crossesRealCall = true; break)
-    var crossesAtomic = false
-    for p in c.atomicPositions:
-      if p > lo and p <= hi: (crossesAtomic = true; break)
-    if not crossesRealCall:
-      # No real call in the interval → r8/r9 (atomic-safe) are legal homes even if an
-      # atomic crosses. `AllRegs` (the full volatile pool, incl. rdi/rsi) needs the
-      # STRONGER condition: no atomic either.
-      vi.props.incl R89Ok
-    if not (crossesRealCall or crossesAtomic):
+      if p > lo and p <= hi: (crossesCall = true; break)
+    if not crossesCall:
       vi.props.incl AllRegs
       # A call-free local can go further: rdx/rcx have a *fixed* instruction role
       # (div/mod, variable shift) but are otherwise free. If no such instruction

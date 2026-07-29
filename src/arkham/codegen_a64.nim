@@ -955,11 +955,15 @@ template emitLoop(g: var CodeGen; body: untyped) =
     g.ab.tree StmtsA64:
       body
 
-# ── atomics: GCC __atomic_* builtins → AArch64 load/store-exclusive loops ─────
-# arkham lowers the call-shaped atomic builtins (see programs.collect) the way
-# the LLVM backend does, but to a portable LL/SC retry loop. Memory ordering is
-# always the strong acquire/release form (matching the backend's seq_cst); the
-# `memorder` argument is ignored. Every variant leaves its result in x0.
+# ── the atomic rows (`{.intrinsic: "AtomicX".}` → AArch64 LL/SC loops) ─────────
+# AArch64 has no lock prefix: every read-modify-write is a load-exclusive /
+# store-exclusive retry loop, and the acquire/release forms (`ldaxr`/`stlxr`)
+# carry the ordering. Memory ordering is always that strong form, so the
+# memory-order operands are not evaluated (see `evaluatedOperands`).
+#
+# An atomic arrives as `(instr …)`, so its operands are wherever the ALLOCATOR put
+# them and the sequence assumes no ABI; the three registers it takes for itself are
+# `AtomicScratchRegs`, which the allocator never hands out. See `emitAtomicInstr2`.
 
 # ── mem* intrinsics: inline byte loops (no libc) ─────────────────────────────
 # memcpy/memmove/memset/memcmp masquerade as importc calls (see programs.collect).
@@ -2274,63 +2278,123 @@ proc wsfx(bits: int): string =
   ## nifasm parse default — keeps the common case's output unchanged).
   if bits != 64: &" {bits}" else: ""
 
-proc emitRmw2(g: var CodeGen; opStr: string; isXchg, returnNew: bool; bits: int) =
-  ## `loop: ldaxr old,[x0]; new = old op x1 (or x1 for xchg); stlxr st,new,[x0];
-  ## cmp st,0; bne loop`. Scratch x3/x4/x5 (raw). Result → x0. Sized to `bits`.
-  let lDone = g.freshLabel()
-  let p = g.emOp R0
-  let v = g.emOp R1
-  let old = g.emOp R3
-  let neu = g.emOp R4
-  let st = g.emOp R5
-  let w = wsfx(bits)
-  let update = if isXchg: &"(mov {neu} {v})" else: &"(mov {neu} {old}) ({opStr} {neu} {v})"
-  # Structured `(loop …)`: nifasm emits the back-edge internally (retry on store-conflict).
-  # The exclusive store SUCCEEDS when `st == 0` → forward `(beq lDone)` leaves the loop;
-  # a non-zero `st` (conflict) falls through to the internal back-edge and retries.
-  g.ab.splice &"(loop (stmts (ldaxr {old} {p}{w}) " & update & " " &
-              &"(stlxr {st} {neu} {p}{w}) (cmp {st} 0) (beq {lDone}))) (lab :{lDone})"
-  g.movReg(IntRet, if returnNew: R4 else: R3)
+proc instrOperandReg(g: CodeGen; cur: Cursor): Reg =
+  ## The register an already-emitted `(instr …)` operand landed in. `allocInstr`
+  ## asked for `NeedsReg` on every operand a lowering reads, so anything else here
+  ## is an allocator bug, not a source-level condition.
+  let l = g.ra.locs[cursorToPosition(g.buf[], cur)]
+  if l.kind != InReg:
+    raiseAssert "arkham a64n: intrinsic operand is not in a register"
+  l.r
 
-proc emitAtomic2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
-  ## Inline `__atomic_*` LL/SC sequence. Args in x0(ptr)/x1(val|expPtr)/x2(des);
-  ## loop scratch x3/x4/x5 (raw, free during this leaf op). Result → x0.
-  for idx in 0 ..< argCurs.len:
-    g.emitValue2(argCurs[idx])
-    let a = g.ra.locs[g.posOf(argCurs[idx])]
-    if a.kind == InReg and a.isTemp: g.unbindTemp(a.r)
+proc releaseStaleName(g: var CodeGen; r: Reg) =
+  ## A register about to be used as RAW scratch must carry no stale named-local
+  ## binding: `emOp`/`emReg` would emit that typed name instead of the `(xN)` tag,
+  ## and its type would not match the pointee-typed exclusive access. `(kill)` the
+  ## binding so the raw tag is what comes out. The x86-64 twin does the same.
+  if r != NoReg and g.regLocal.hasKey(r):
+    g.ab.tree KillA64: g.ab.sym g.regLocal[r]
+    g.regLocal.del r
+
+proc emitAtomicRmw2(g: var CodeGen; dst, p, v: Reg; opStr: string;
+                    isXchg, returnNew: bool; bits: int) =
+  ## `loop: ldaxr old,[p]; new = old op v (or v, for an exchange); stlxr st,new,[p];
+  ## cmp st,0; beq done` — a non-zero status means another agent won the line, so
+  ## the loop falls through to nifasm's internal back-edge and re-reads.
+  ##
+  ## `old`/`new`/`st` are the dedicated scratch (`AtomicScratchRegs`); `p` and `v`
+  ## are only ever read, which is what lets `dst` alias either of them.
+  let lDone = g.freshLabel()
+  let (pS, vS) = (g.emOp p, g.emOp v)
+  let old = g.emOp AtomicScratchRegs[0]
+  let neu = g.emOp AtomicScratchRegs[1]
+  let st = g.emOp AtomicScratchRegs[2]
+  let w = wsfx(bits)
+  let update = if isXchg: &"(mov {neu} {vS})" else: &"(mov {neu} {old}) ({opStr} {neu} {vS})"
+  # Structured `(loop …)`: nifasm emits the back-edge internally. The exclusive
+  # store SUCCEEDS when `st == 0` → the forward `(beq lDone)` leaves the loop.
+  g.ab.splice &"(loop (stmts (ldaxr {old} {pS}{w}) " & update & " " &
+              &"(stlxr {st} {neu} {pS}{w}) (cmp {st} 0) (beq {lDone}))) (lab :{lDone})"
+  g.movReg(dst, AtomicScratchRegs[if returnNew: 1 else: 0])
+
+proc emitAtomicInstr2(g: var CodeGen; c: Cursor; op: IntrinsicOp;
+                      argCurs: seq[Cursor]; res: Location) =
+  ## An atomic row's AArch64 sequence, on operands the ALLOCATOR placed. Every
+  ## variant is the strong acquire/release form, so the memory-order operands are
+  ## not evaluated at all (see `evaluatedOperands`) — whatever order was asked for,
+  ## this satisfies it.
+  # A fence has no cell operand, and its memory order is not evaluated, so it must
+  # be answered before anything reads `argCurs[0]`.
+  case op
+  of AtomicThreadFenceOp:
+    g.ab.keyword DmbA64
+    return
+  of AtomicSignalFenceOp:
+    # A compiler barrier only: it orders nothing in hardware, and what it forbids —
+    # hoisting a memory access across it — arkham does not do to begin with.
+    return
+  else: discard
+  for r in AtomicScratchRegs: g.releaseStaleName(r)
   let bits = g.atomicBits(argCurs[0])
-  case builtin
-  of "__atomic_load_n": g.emLdar(IntRet, R0, bits)
-  of "__atomic_store_n": g.emStlr(R1, R0, bits)
-  of "__atomic_clear":
-    g.movImm(R3, 0); g.emStlr(R3, R0, bits)
-  of "__atomic_thread_fence": g.ab.keyword DmbA64
-  of "__atomic_signal_fence": discard
-  of "__atomic_exchange_n": g.emitRmw2("", true, false, bits)
-  of "__atomic_fetch_add": g.emitRmw2("add", false, false, bits)
-  of "__atomic_fetch_sub": g.emitRmw2("sub", false, false, bits)
-  of "__atomic_fetch_and": g.emitRmw2("and", false, false, bits)
-  of "__atomic_fetch_or": g.emitRmw2("orr", false, false, bits)
-  of "__atomic_fetch_xor": g.emitRmw2("eor", false, false, bits)
-  of "__atomic_add_fetch": g.emitRmw2("add", false, true, bits)
-  of "__atomic_sub_fetch": g.emitRmw2("sub", false, true, bits)
-  of "__atomic_compare_exchange_n":
-    let lSucc = g.freshLabel(); let lFail = g.freshLabel(); let lDone = g.freshLabel()
-    let (pp, ep, d) = (g.emOp R0, g.emOp R1, g.emOp R2)
-    let (exp, old, st, ret) = (g.emOp R3, g.emOp R4, g.emOp R5, g.emOp IntRet)
+  let p = g.instrOperandReg(argCurs[0])
+  if res.kind == InReg and res.isTemp and res.r notin g.boundTemps:
+    g.bindTemp(res.r, res.typ)
+  case op
+  of AtomicLoadOp: g.emLdar(res.r, p, bits)
+  of AtomicStoreOp: g.emStlr(g.instrOperandReg(argCurs[1]), p, bits)
+  of AtomicExchangeOp:
+    g.emitAtomicRmw2(res.r, p, g.instrOperandReg(argCurs[1]), "", true, false, bits)
+  of AtomicFetchAddOp:
+    g.emitAtomicRmw2(res.r, p, g.instrOperandReg(argCurs[1]), "add", false, false, bits)
+  of AtomicFetchSubOp:
+    g.emitAtomicRmw2(res.r, p, g.instrOperandReg(argCurs[1]), "sub", false, false, bits)
+  of AtomicFetchAndOp:
+    g.emitAtomicRmw2(res.r, p, g.instrOperandReg(argCurs[1]), "and", false, false, bits)
+  of AtomicFetchOrOp:
+    g.emitAtomicRmw2(res.r, p, g.instrOperandReg(argCurs[1]), "orr", false, false, bits)
+  of AtomicFetchXorOp:
+    g.emitAtomicRmw2(res.r, p, g.instrOperandReg(argCurs[1]), "eor", false, false, bits)
+  of AtomicAddFetchOp:
+    g.emitAtomicRmw2(res.r, p, g.instrOperandReg(argCurs[1]), "add", false, true, bits)
+  of AtomicSubFetchOp:
+    g.emitAtomicRmw2(res.r, p, g.instrOperandReg(argCurs[1]), "sub", false, true, bits)
+  of AtomicCompareExchangeOp:
+    let lSucc = g.freshLabel()
+    let lFail = g.freshLabel()
+    let lDone = g.freshLabel()
+    let pp = g.emOp p
+    let ep = g.emOp g.instrOperandReg(argCurs[1])   # `expected`, a POINTER
+    let d = g.emOp g.instrOperandReg(argCurs[2])
+    let exp = g.emOp AtomicScratchRegs[0]
+    let old = g.emOp AtomicScratchRegs[1]
+    let st = g.emOp AtomicScratchRegs[2]
+    let ret = g.emOp res.r
     let w = wsfx(bits)
-    # Structured `(loop …)`: the back-edge (retry on store-conflict) is internal to nifasm.
-    # Two FORWARD exits from the body: `(bne lFail)` when the loaded value ≠ expected (CAS
-    # fails), `(beq lSucc)` when the exclusive store succeeded (`st == 0`). A non-zero `st`
-    # (conflict) falls through to the internal back-edge and re-reads.
+    # Two FORWARD exits from the loop body: `(bne lFail)` when the cell no longer
+    # holds `expected`, `(beq lSucc)` when the exclusive store succeeded. A non-zero
+    # `st` (another agent won the line) falls through to the internal back-edge and
+    # re-reads. The failure path MUST publish what was actually there — that is the
+    # whole protocol: the caller retries against the value it now holds.
     g.ab.splice(
       &"(ldar {exp} {ep}{w}) (loop (stmts (ldaxr {old} {pp}{w}) " &
       &"(cmp {old} {exp}) (bne {lFail}) (stlxr {st} {d} {pp}{w}) " &
       &"(cmp {st} 0) (beq {lSucc}))) " &
       &"(lab :{lSucc}) (mov {ret} 1) (b {lDone}) " &
       &"(lab :{lFail}) (clrex) (stlr {old} {ep}{w}) (mov {ret} 0) (lab :{lDone})")
-  else: raiseAssert "arkham a64n: unsupported atomic builtin: " & builtin
+  else:
+    # `AtomicTestAndSet` / `AtomicClear`: the rows exist and their `targets` is
+    # empty, so this is the message that column promises.
+    lengError c, "`" & IntrinsicNames[op] & "` has no AArch64 lowering — " &
+              "guard the call with a `when`"
+  # Release the operand temps' nifasm bindings. Ordinarily a volatile temp's binding
+  # dies when the register is rebound for the next value, but an operand that had to
+  # be escalated to a CALLEE-SAVED register (`reserveInstrReg`) may see no such rebind
+  # before the epilogue's `ldp` — which nifasm rejects while the register is still
+  # bound to a name.
+  for i in 0 ..< min(IntrinsicRows[op].evaluatedOperands, argCurs.len):
+    let a = g.ra.locs[g.posOf(argCurs[i])]
+    if a.kind == InReg and a.isTemp and not (res.kind == InReg and a.r == res.r):
+      g.unbindTemp(a.r)
 
 proc proctypeOfTarget(g: var CodeGen; targetCur: Cursor): Cursor =
   ## The resolved proctype body of an indirect call target, for ABI queries. The target
@@ -2430,12 +2494,6 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor) =
     if tgt.memIntrin.len > 0:
       g.emitMemIntrin2(argCurs, tgt.memIntrin)
       if resLoc.kind == InReg and resLoc.r != IntRet: g.movReg(resLoc.r, IntRet)
-      return
-    if tgt.atomic.len > 0:
-      g.emitAtomic2(argCurs, tgt.atomic)
-      if resLoc.kind == InReg and resLoc.r != IntRet:
-        if resLoc.isTemp: g.bindTemp(resLoc.r, AsmSlot(cls: AInt, size: 8, align: 8))
-        g.movReg(resLoc.r, IntRet)
       return
     if tgt.bitBuiltin.len > 0:
       raiseAssert "arkham a64n: bit builtin not yet implemented: " & tgt.bitBuiltin
@@ -2676,7 +2734,14 @@ proc emitInstr2(g: var CodeGen; c: Cursor) =
     # call site like the flag case above, not as a stack-traced AssertionDefect.
     lengError c, "`" & IntrinsicNames[tgt.op] & "` has no AArch64 lowering — " &
               "guard the call with a `when`"
-  for a in argCurs: g.emitValue2(a)
+  # Only the operands the row says are real — the atomics' trailing memory orders
+  # are never evaluated, and `allocInstr` allocated nothing for them either.
+  for i in 0 ..< min(row.evaluatedOperands, argCurs.len): g.emitValue2(argCurs[i])
+  if tgt.op.isAtomic:
+    # A whole SEQUENCE, not a transliteration of one opcode — and several of these
+    # rows have no result, so this comes before the result check below.
+    g.emitAtomicInstr2(c, tgt.op, argCurs, res)
+    return
   if res.kind != InReg:
     raiseAssert "arkham a64n: intrinsic result is not in a register"
   let a0 = g.ra.locs[g.posOf(argCurs[0])]
@@ -2711,36 +2776,18 @@ proc emitInstr2(g: var CodeGen; c: Cursor) =
     raiseAssert "arkham a64n: no lowering for intrinsic `" & IntrinsicNames[tgt.op] & "`"
   if a0.kind == InReg and a0.isTemp and a0.r != res.r: g.unbindTemp(a0.r)
 
-proc callIsInlinedAtomic(g: CodeGen; c: Cursor): bool =
-  ## True when `emitCall2Inner` will lower this call to `emitAtomic2` (LL/SC), which
-  ## clobbers only x0–x5 — so atomic-safe caller-save homes (x6/x7) need no spill.
-  ## Only consults an already-resolved `callTarget` entry (populated by pass 0 /
-  ## a prior call); unknown callees conservatively return false.
-  var probe = c
-  if probe.stmtKind != CallS: return false
-  probe.into:
-    if probe.kind != Symbol: return false
-    let fsym = symName(probe)
-    if g.callTarget.hasKey(fsym):
-      return g.callTarget[fsym].atomic.len > 0
-    return false
-
 proc callerSaveSlotFor(g: CodeGen; pos: int; reg: Reg; name: string): string =
   ## Locals → per-call reclaimable `csave.*` slot; params → permanent `pcsave.*`.
   if name in g.ra.callerSaveParams: paramCallerSaveSlotName(name)
   else: callerSaveSlotName(pos, reg)
 
 proc emitCall2(g: var CodeGen; c: Cursor) =
-  ## Caller-save wrapper (a64 twin of the x64 one): a cross-call local/param homed in an
-  ## atomic-safe caller-saved volatile (x6/x7) is spilled around this call — save before
-  ## the call clobbers the register, restore after. The var's `(var :name (xN) T)` binding
+  ## Caller-save wrapper (a64 twin of the x64 one): a cross-call local/param homed in a
+  ## caller-saved volatile (x6/x7) is spilled around this call — save before the call
+  ## clobbers the register, restore after. The var's `(var :name (xN) T)` binding
   ## PERSISTS; the restore's `mov` re-defines the register (clearing the call's clobber via
   ## the a64 mov-clobber-clear). Locals use a reclaimable `(scope …)` slot; params use a
   ## permanent prologue slot (shared with other `(s)` frame vars — no nested arena).
-  ## Inlined atomics skip the wrap (they do not clobber the atomic-safe pool).
-  if g.callIsInlinedAtomic(c):
-    g.emitCall2Inner(c)
-    return
   let saveSet = g.callerSaveSetAt()
   if saveSet.len == 0:
     g.emitCall2Inner(c)
@@ -4292,10 +4339,10 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
     g.ra.usedCallee.incl R19
   # The entry injects a `call` to the synthetic global-init proc, so it makes a call
   # even when its own body does not — give it a frame (lr saved) for that call.
-  # fp/lr only when a real `bl` exists (or the entry runs global inits). Inlined
-  # atomics do not need lr — counting them as `hasCall` used to force a frame on
-  # otherwise-leaf hot paths (rawDealloc's CAS loop, etc.).
-  g.computeFrame(an.hasRealCall or (info.isEntry and g.hasGlobalInits))
+  # fp/lr only when a `bl` exists (or the entry runs global inits). An atomic is an
+  # instruction now, not a call, so a CAS loop no longer drags a frame onto an
+  # otherwise-leaf hot path (rawDealloc and friends) — that is what `hasCall` says.
+  g.computeFrame(an.hasCall or (info.isEntry and g.hasGlobalInits))
   let declarative = isDeclarativeAbi(g.prog, info.decl)
   g.ab.planning = false
   g.regLocal.clear(); g.aliasToDecl.clear(); g.boundTemps = {}; g.scopeLocals = @[]

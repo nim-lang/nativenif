@@ -14,7 +14,7 @@
     (u 64)))
   (u 64)
   (pragmas
-   (instruction bsf))
+   (instruction "bsf"))
   (stmts .))
  (proc :bsr64.0
   (params
@@ -22,7 +22,7 @@
     (u 64)))
   (u 64)
   (pragmas
-   (instruction bsr))
+   (instruction "bsr"))
   (stmts .))
  (proc :popcnt64.0
   (params
@@ -30,7 +30,7 @@
     (u 64)))
   (u 64)
   (pragmas
-   (instruction popcnt))
+   (instruction "popcnt"))
   (stmts .))
  (proc :bswap64.0
   (params
@@ -38,7 +38,7 @@
     (u 64)))
   (u 64)
   (pragmas
-   (instruction bswap))
+   (instruction "bswap"))
   (stmts .))
  (proc :rol64.0
   (params
@@ -48,7 +48,7 @@
     (u 64)))
   (u 64)
   (pragmas
-   (instruction rol))
+   (instruction "rol"))
   (stmts .))
  (proc :ror64.0
   (params
@@ -58,7 +58,7 @@
     (u 64)))
   (u 64)
   (pragmas
-   (instruction ror))
+   (instruction "ror"))
   (stmts .))
  (proc :main.0
   (params)
