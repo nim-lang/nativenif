@@ -55,6 +55,10 @@ type
                                               ## base (rsp after pushes), captured before the frame
                                               ## `sub`s so stack params survive rsp moving; else NoReg
     labelCount*: int                         ## fresh-label counter
+    emitTmpSpills*: int                      ## step-3 value core: fresh counter for emit-time
+                                             ## minted spill slots (`etmpN.0`/`eftmpN.0`/
+                                             ## `heldN.0`) — the merged emitter's analogue of
+                                             ## the allocator's `tmpSpills`. Reset per proc.
     noFoldPos*: int                          ## token pos of a `keepovf`'s op node: it must
                                              ## EMIT even when constant-foldable, because the
                                              ## `(ovf)` test that follows reads the hardware
@@ -756,3 +760,82 @@ proc selectStagingSlot*(g: var CodeGen; sd: SelectDiamond): AsmSlot =
     sd.dst.typ
   else:
     AsmSlot(cls: AInt, size: 8, align: 8)
+
+# ── emit-time temp allocation (step-3 merged value core) ─────────────────────
+# The merged emitter DECIDES expression registers at the point of emission
+# (vmgen-style dest threading) instead of reading a pre-pass plan. Register
+# freeness is DERIVED per pick from the live state the emitter already owns —
+# RegBind bindings, the pre-pass homes (symPos, immutable per proc), and the
+# call seals — the same filter discipline `pickStagingScratch` has always used.
+# No second pool-set state machine, hence no walk-synchronization invariant.
+# Homes for named locals/params remain the decl-only allocator pre-pass.
+
+proc regHoldsHome*(g: var CodeGen; r: Reg): bool =
+  ## A named local/param is homed in `r` (a pre-pass decision, immutable for the
+  ## whole proc — steals/demotes resolve before emission starts).
+  for name, pos in g.ra.symPos:
+    let loc = g.ra.locs[pos]
+    if loc.kind == InReg and loc.r == r: return true
+
+proc fregHoldsHome*(g: var CodeGen; f: FReg): bool =
+  ## The SIMD twin of `regHoldsHome`.
+  for name, pos in g.ra.symPos:
+    let loc = g.ra.locs[pos]
+    if loc.kind == InFReg and loc.f == f: return true
+
+proc regFreeForTemp*(g: var CodeGen; r: Reg): bool =
+  ## May the merged emitter hand `r` out as an expression temp right now? Not
+  ## pinned to an in-flight call (sealed), not a live accumulator, not carrying
+  ## any named binding (a local in scope or a temp in flight), not a home.
+  ## Conservative where the old allocator was clever: a dead-but-in-scope
+  ## local's home stays refused (its binding is killed at scope exit, not at
+  ## `freeAfter`) — the totality fallback is an etmp spill, never a clobber.
+  not g.ra.isSealed(r) and not g.rb.isAccum(r) and
+    not g.rb.isBound(r) and not g.regHoldsHome(r)
+
+proc pickTempReg*(g: var CodeGen): Reg =
+  ## An expression-temp GPR: the volatile temp pool first, then a callee-saved
+  ## register (recorded in `ra.usedCallee` so the prologue saves it — the frame
+  ## is finalized AFTER body emission in the merged core). `NoReg` when every
+  ## candidate is live; the caller then mints a spill slot (`mintSpillName` +
+  ## the backend's produce-into path), keeping temp allocation total exactly
+  ## like the old `reserveTmp` fallback.
+  for r in g.md.intTempRegs:
+    if regFreeForTemp(g, r): return r
+  for r in g.md.intCalleeSaved:
+    if regFreeForTemp(g, r):
+      g.ra.usedCallee.incl r
+      return r
+  NoReg
+
+proc pickFTempReg*(g: var CodeGen): FReg =
+  ## The SIMD twin of `pickTempReg`: volatile float pool first, then the
+  ## callee-saved float pool (empty on x86-64 SysV).
+  for f in g.md.floatTempRegs:
+    if not g.rb.isSealedF(f) and g.rb.boundFName(f).len == 0 and
+       not g.rb.isBoundFTmp(f) and not g.fregHoldsHome(f):
+      if f in g.md.floatCalleeSavedSet: g.ra.usedCalleeF.incl f
+      return f
+  NoFReg
+
+proc pickHeldReg*(g: var CodeGen): Reg =
+  ## A SURVIVOR scratch: must outlive a call, so callee-saved only. `NoReg`
+  ## when the callee-saved file is fully live — the caller either spills the
+  ## (re-derivable) value to a `heldN.0` slot or fails loudly; demoting a local
+  ## mid-emission is impossible in the merged core (its uses are already
+  ## emitted), and the corpus needed that demotion exactly once.
+  for r in g.md.intCalleeSaved:
+    if regFreeForTemp(g, r):
+      g.ra.usedCallee.incl r
+      return r
+  NoReg
+
+proc mintSpillName*(g: var CodeGen; prefix: string): string =
+  ## A fresh emit-time spill-slot name (`etmp`/`eftmp`/`held` + counter). The
+  ## backend declares the `(var :name (s) T)` inline at first use — mid-body
+  ## slot decls are legal nifasm (the aggtmp constructor temps already rely on
+  ## that) — and flags `ra.hasStackVars` so the frame `sub` is emitted when the
+  ## prologue is finalized.
+  result = prefix & $g.emitTmpSpills & ".0"
+  inc g.emitTmpSpills
+  g.ra.hasStackVars = true

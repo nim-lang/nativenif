@@ -132,6 +132,25 @@ proc splice*(a: var AsmBuf; nifText: string) =
       a.buf.addSubtree c
       skip c
 
+proc sideBuf*(a: AsmBuf): AsmBuf =
+  ## A detached buffer sharing this one's literal pool + tag namespace, so
+  ## appending it back (`append`) is a bulk copy. The body-buffer trick: the
+  ## emitter writes a proc's body here first, then writes the prologue — whose
+  ## shape (callee-saved pushes, alignment pad, the `(s)` region `sub`) is only
+  ## final once the body has been emitted — into the main buffer, and appends
+  ## the body after it.
+  AsmBuf(buf: createTokenBuf(256, a.buf.pool, a.buf.tags),
+         ids: a.ids, renderReg: a.renderReg)
+
+proc append*(a: var AsmBuf; other: var AsmBuf) =
+  ## Append every top-level node of `other` (a `sideBuf` of `a`; the shared
+  ## pools make each copy a bulk `copyMem`).
+  var c = other.buf.beginRead()
+  while c.hasMore:
+    a.buf.addSubtree c
+    skip c
+  endRead c
+
 proc render*(a: var AsmBuf; dottedSuffix = ""): string =
   ## Serialize to a full NIF module for nifasm: `(.nif27)` header, body, and a
   ## trailing embedded `(.index …)` (so nifasm resolves cross-module symbols

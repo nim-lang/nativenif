@@ -1618,24 +1618,32 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
 # local or a stack-param home). Saved registers stay RAW (`(rbx)`), never named
 # locals, so the epilogue can pop them without nifasm's bound-register guard.
 
-proc computeFrameX64(g: var CodeGen; isEntry, hasCall, hasStackParams: bool) =
-  g.frameRegs = @[]
-  for r in g.md.intCalleeSaved:
-    if r in g.ra.usedCallee: g.frameRegs.add r
-  # A proc with stack-passed parameters needs the incoming-args base in a register
-  # that survives the frame `sub`s (rsp moves). Reserve a callee-saved reg the body
-  # isn't already using; it is pushed/popped with the other frame regs.
+proc pickStackArgBaseX64(g: var CodeGen; hasStackParams: bool) =
+  ## A proc with stack-passed parameters needs the incoming-args base in a register
+  ## that survives the frame `sub`s (rsp moves). Pick a callee-saved reg the body
+  ## isn't using. Split out of `computeFrameX64` because the body-buffer emitter
+  ## needs the register's IDENTITY before the body (its stack-param loads name it)
+  ## while the frame SHAPE is finalized only after.
   g.stackArgBaseReg = NoReg
   if hasStackParams:
     for r in g.md.intCalleeSaved:
-      if r notin g.ra.usedCallee and r notin g.frameRegs:
+      if r notin g.ra.usedCallee:
         g.stackArgBaseReg = r
-        g.frameRegs.add r
         break
     # The allocator reserved a non-sealed callee-saved reg when it set `hasStackParams`,
     # so the pick above always finds one. (Belt-and-braces: a genuine miss would be an
     # allocator/emitter classification drift — both must read `g.ra.hasStackParams`.)
     assert g.stackArgBaseReg != NoReg, "arkham x64n: no callee-saved reg for stackArgBaseReg"
+
+proc computeFrameX64(g: var CodeGen; isEntry, hasCall: bool) =
+  ## Finalize the frame shape. Runs AFTER the body is emitted (body-buffer model):
+  ## only then are `ra.usedCallee` / `hasStackVars` final. `stackArgBaseReg` was
+  ## picked up front (`pickStackArgBaseX64`) and is pushed with the frame regs.
+  g.frameRegs = @[]
+  for r in g.md.intCalleeSaved:
+    if r in g.ra.usedCallee: g.frameRegs.add r
+  if g.stackArgBaseReg != NoReg:
+    g.frameRegs.add g.stackArgBaseReg
   # SysV requires rsp ≡ 0 (mod 16) at a `call`. The kernel enters the entry with
   # rsp ≡ 0; a normal callee is entered with rsp ≡ 8 (the caller's pushed return
   # address). Each saved reg is 8 bytes, so after the pushes the parity may be
@@ -5488,73 +5496,94 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
       while cc.hasMore: skip cc
   else: raiseAssert "arkham x64n: genStmt2 " & $c.stmtKind
 
-proc emitProcBody2(g: var CodeGen; info: ProcInfo) =
+proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
   ## The pure-emitter twin of `emitProcBody`, run ONCE (no plan pass). Reuses the
   ## shared signature / frame / param-settling / scope machinery; only the value
   ## core (`genStmt2`/`emitValue2`) differs.
+  ##
+  ## Body-buffer model (chibicc's trick): the BODY is emitted into a side buffer
+  ## first; the prologue — whose shape (callee-saved pushes, alignment pad, the
+  ## `(s)` region `sub`) is only final once the body is known — is written after
+  ## it, into the main buffer, and the body appended. This is what lets the
+  ## merged value core mint spill slots and draw callee-saved temps INLINE
+  ## during emission. Only `stackArgBaseReg`'s identity is fixed up front (the
+  ## body's stack-param loads name it).
+  g.pickStackArgBaseX64(g.ra.hasStackParams)
+  var side = g.ab.sideBuf()
+  swap(g.ab, side)                        # emit into the side buffer; `side` holds main
+  g.enterScope()
+  if g.retIndirect:
+    # The hidden result pointer arrives in rdi. Save it into the callee-saved
+    # `indirectReg` for the duration of the body. In the DECLARATIVE path the
+    # signature binds rdi to `paramName(0)`, so it must be read by name (a raw
+    # `(reg rdi)` use of a bound register is rejected) and the binding killed. But a
+    # NON-declarative proc (float/≤16B-aggregate-result param forces an empty
+    # signature) never emits that binding, so there `p0.0` is undefined — read the
+    # raw arg register instead, mirroring how non-declarative params are moved.
+    if isDeclarativeAbi(g.prog, info.decl):
+      g.ab.tree MovX64: (g.emReg g.indirectReg; g.ab.sym paramName(0))
+      g.ab.tree KillX64: g.ab.sym paramName(0)
+    else:
+      g.movReg(g.indirectReg, g.md.intArgRegs[0])
+  g.emitParamMoves(info.decl)
+  g.emitStackParamLoadsX64(info.decl)               # via stackArgBaseReg, regs now free
+  if info.isEntry and g.hasGlobalInits:              # run runtime global inits at startup
+    g.ab.tree PrepareX64:
+      g.ab.sym g.globalInitSym
+      g.ab.keyword CallX64
+  # Declare the totality spill slots the allocator synthesized (`etmp`/`ftmp`):
+  # a value position the register pool couldn't hold is produced into its slot
+  # via a staging register (`produceIntoMem2`/`produceIntoFMem2`). A pointer slot
+  # keeps its precise `(ptr T)` type so a later deref/cmp through it type-checks;
+  # an integer slot is the generic `(s)(i 64)` (sized mem↔reg moves truncate/extend).
+  for st in g.ra.spillTemps:
+    if st.isFloat:
+      g.emFloatStackVar(st.name, st.typ.size * 8)
+    elif isNilSlot(st.typ) or
+         (not cursorIsNil(st.typ.typ) and isPtrType(resolveType(g.prog, st.typ.typ))):
+      g.emTypedStackVar(st.name, st.typ.typ)   # `(nil)` / `(ptr T)` slot keeps its type
+    else:
+      g.emScalarStackVar(st.name)
+  g.retLabel2 = g.freshLabel()                       # shared epilogue for mid-proc `ret`
+  g.retLabelUsed2 = false
+  g.binNormSuppressPos = -1                          # no store-fused normalize elision pending
+  var c = info.decl
+  c.into:
+    inc c; skip c; skip c; skip c                    # name, params, ret, pragmas
+    # The whole body is in tail position: after it, control reaches the epilogue.
+    # The entry proc ends in an exit syscall (no epilogue jump), so leave it false.
+    g.tailStmt = not info.isEntry
+    if c.stmtKind == StmtsS: g.genStmt2(c)
+    while c.hasMore: skip c
+  g.exitScope()
+  if g.retLabelUsed2: g.emLab(g.retLabel2)           # a non-tail `ret` lands here
+  if info.isEntry:
+    g.movImm(RAX, 60); g.movImm(RDI, 0); g.emSyscall()
+  swap(g.ab, side)                        # back to the main buffer; `side` holds the body
+  # The body is emitted — `ra.usedCallee` / `hasStackVars` are final. Finalize the
+  # frame and write the prologue, then splice the body after it.
+  g.computeFrameX64(info.isEntry, frameHasCall)
   g.ab.tree ProcD:
     g.ab.symDef info.asmName
     g.emitSignature(info.decl)
     g.ab.tree StmtsX64:
-      g.enterScope()
       g.framePush()
       # Capture the incoming stack-args base (rsp after the pushes) BEFORE the frame
       # `sub`s move rsp — stack params are then loaded relative to it, after the `(s)`
-      # region exists and `emitParamMoves` has freed the arg registers.
+      # region exists and `emitParamMoves` has freed the arg registers. RAW register
+      # operands: this text is written AFTER the body was emitted (body-buffer model),
+      # so `emReg`/`binImm` would render whatever binding the reg carries post-body —
+      # a name that, in program order, is not bound yet at this point.
       if g.stackArgBaseReg != NoReg:
-        g.ab.tree MovX64: (g.emReg g.stackArgBaseReg; g.ab.reg RSP)
-        g.binImm(AddX64, g.stackArgBaseReg, g.framePushBytesX64().int64)
+        g.ab.tree MovX64: (g.ab.reg g.stackArgBaseReg; g.ab.reg RSP)
+        g.ab.tree AddX64:
+          g.ab.reg g.stackArgBaseReg
+          g.ab.intLit g.framePushBytesX64().int64
       if g.framePad > 0: g.binImm(SubX64, RSP, g.framePad.int64)
       if g.ra.hasStackVars:
         g.ab.tree SubX64: (g.ab.reg RSP; g.ab.keyword SsizeX)
-      if g.retIndirect:
-        # The hidden result pointer arrives in rdi. Save it into the callee-saved
-        # `indirectReg` for the duration of the body. In the DECLARATIVE path the
-        # signature binds rdi to `paramName(0)`, so it must be read by name (a raw
-        # `(reg rdi)` use of a bound register is rejected) and the binding killed. But a
-        # NON-declarative proc (float/≤16B-aggregate-result param forces an empty
-        # signature) never emits that binding, so there `p0.0` is undefined — read the
-        # raw arg register instead, mirroring how non-declarative params are moved.
-        if isDeclarativeAbi(g.prog, info.decl):
-          g.ab.tree MovX64: (g.emReg g.indirectReg; g.ab.sym paramName(0))
-          g.ab.tree KillX64: g.ab.sym paramName(0)
-        else:
-          g.movReg(g.indirectReg, g.md.intArgRegs[0])
-      g.emitParamMoves(info.decl)
-      g.emitStackParamLoadsX64(info.decl)               # via stackArgBaseReg, regs now free
-      if info.isEntry and g.hasGlobalInits:              # run runtime global inits at startup
-        g.ab.tree PrepareX64:
-          g.ab.sym g.globalInitSym
-          g.ab.keyword CallX64
-      # Declare the totality spill slots the allocator synthesized (`etmp`/`ftmp`):
-      # a value position the register pool couldn't hold is produced into its slot
-      # via a staging register (`produceIntoMem2`/`produceIntoFMem2`). A pointer slot
-      # keeps its precise `(ptr T)` type so a later deref/cmp through it type-checks;
-      # an integer slot is the generic `(s)(i 64)` (sized mem↔reg moves truncate/extend).
-      for st in g.ra.spillTemps:
-        if st.isFloat:
-          g.emFloatStackVar(st.name, st.typ.size * 8)
-        elif isNilSlot(st.typ) or
-             (not cursorIsNil(st.typ.typ) and isPtrType(resolveType(g.prog, st.typ.typ))):
-          g.emTypedStackVar(st.name, st.typ.typ)   # `(nil)` / `(ptr T)` slot keeps its type
-        else:
-          g.emScalarStackVar(st.name)
-      g.retLabel2 = g.freshLabel()                       # shared epilogue for mid-proc `ret`
-      g.retLabelUsed2 = false
-      g.binNormSuppressPos = -1                          # no store-fused normalize elision pending
-      var c = info.decl
-      c.into:
-        inc c; skip c; skip c; skip c                    # name, params, ret, pragmas
-        # The whole body is in tail position: after it, control reaches the epilogue.
-        # The entry proc ends in an exit syscall (no epilogue jump), so leave it false.
-        g.tailStmt = not info.isEntry
-        if c.stmtKind == StmtsS: g.genStmt2(c)
-        while c.hasMore: skip c
-      g.exitScope()
-      if g.retLabelUsed2: g.emLab(g.retLabel2)           # a non-tail `ret` lands here
-      if info.isEntry:
-        g.movImm(RAX, 60); g.movImm(RDI, 0); g.emSyscall()
-      else:
+      g.ab.append side                                 # the body
+      if not info.isEntry:
         g.framePop()
         g.ab.keyword RetX64
 
@@ -6210,7 +6239,8 @@ proc genAsmProc(g: var CodeGen; info: ProcInfo) =
       while bc.hasMore: skip bc
   g.ra.usedCallee = used * g.md.intCalleeSavedSet
   g.ra.hasStackVars = anyStack
-  g.computeFrameX64(isEntry = false, hasCall = false, hasStackParams = false)
+  g.pickStackArgBaseX64(hasStackParams = false)
+  g.computeFrameX64(isEntry = false, hasCall = false)
   g.ab.tree ProcD:
     g.ab.symDef info.asmName
     g.emitSignature(info.decl)
@@ -6313,11 +6343,10 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   if g.retIndirect:
     g.indirectReg = RBX
     g.ra.usedCallee.incl RBX                   # saved/restored like any callee reg
-  # The entry injects a `call` to the synthetic global-init proc, so it makes a call
-  # even when its own body does not — keep rsp 16-aligned for that call.
-  g.computeFrameX64(info.isEntry, an.hasCall or (info.isEntry and g.hasGlobalInits),
-                    g.ra.hasStackParams)   # allocator's decision (it reserved the base reg)
   # Pure-emit path: the allocator already assigned every value position; emit once.
+  # (The frame is finalized INSIDE emitProcBody2, after the body — body-buffer model.
+  # The entry injects a `call` to the synthetic global-init proc, so it makes a call
+  # even when its own body does not — keep rsp 16-aligned for that call.)
   g.rb.resetProc(); g.aliasToDecl.clear()
   g.argResidentParams.setLen 0; g.argResidentFlushed = false
   g.savedHomes.clear()
@@ -6328,7 +6357,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     block:
       var pc = info.decl; inc pc
       stderr.writeLine "DBG emit proc " & symName(pc)
-  g.emitProcBody2(info)
+  g.emitProcBody2(info, an.hasCall or (info.isEntry and g.hasGlobalInits))
 
 proc genGlobal(g: var CodeGen; nifName: string; decl: Cursor) =
   ## `(gvar :name <type>)` — a zero-initialized `.bss` global (also `const`); any
