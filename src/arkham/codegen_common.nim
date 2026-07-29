@@ -59,6 +59,20 @@ type
                                              ## minted spill slots (`etmpN.0`/`eftmpN.0`/
                                              ## `heldN.0`) — the merged emitter's analogue of
                                              ## the allocator's `tmpSpills`. Reset per proc.
+    pickedRegs*: set[Reg]                    ## step-3 value core: GPRs handed out by `takeTmp`/
+                                             ## `takeHeld` but not yet BOUND — the reserve→bind
+                                             ## gap of the lazy-bind convention (a consumer
+                                             ## binds a temp only when it materializes a value
+                                             ## into it). Freeness filters exclude these so a
+                                             ## nested pick can't steal a reserved accumulator.
+                                             ## `freeVal` clears the flag on release.
+    pickedFRegs*: set[FReg]                  ## the SIMD twin of `pickedRegs`
+    fusedMode*: bool                         ## step-3: this proc is emitted by the FUSED value
+                                             ## core (decisions at emission; `allocExprs=false`).
+                                             ## Shared helpers that must serve both worlds during
+                                             ## the transition (prematLval2's value
+                                             ## materialization, genStore2) branch on it; the
+                                             ## flag dies when both backends are fused.
     noFoldPos*: int                          ## token pos of a `keepovf`'s op node: it must
                                              ## EMIT even when constant-foldable, because the
                                              ## `(ovf)` test that follows reads the hardware
@@ -785,12 +799,13 @@ proc fregHoldsHome*(g: var CodeGen; f: FReg): bool =
 
 proc regFreeForTemp*(g: var CodeGen; r: Reg): bool =
   ## May the merged emitter hand `r` out as an expression temp right now? Not
-  ## pinned to an in-flight call (sealed), not a live accumulator, not carrying
-  ## any named binding (a local in scope or a temp in flight), not a home.
-  ## Conservative where the old allocator was clever: a dead-but-in-scope
-  ## local's home stays refused (its binding is killed at scope exit, not at
-  ## `freeAfter`) — the totality fallback is an etmp spill, never a clobber.
-  not g.ra.isSealed(r) and not g.rb.isAccum(r) and
+  ## picked-but-unbound (the reserve→bind gap), not pinned to an in-flight call
+  ## (sealed), not a live accumulator, not carrying any named binding (a local
+  ## in scope or a temp in flight), not a home. Conservative where the old
+  ## allocator was clever: a dead-but-in-scope local's home stays refused (its
+  ## binding is killed at scope exit, not at `freeAfter`) — the totality
+  ## fallback is an etmp spill, never a clobber.
+  r notin g.pickedRegs and not g.ra.isSealed(r) and not g.rb.isAccum(r) and
     not g.rb.isBound(r) and not g.regHoldsHome(r)
 
 proc pickTempReg*(g: var CodeGen): Reg =
@@ -812,7 +827,8 @@ proc pickFTempReg*(g: var CodeGen): FReg =
   ## The SIMD twin of `pickTempReg`: volatile float pool first, then the
   ## callee-saved float pool (empty on x86-64 SysV).
   for f in g.md.floatTempRegs:
-    if not g.rb.isSealedF(f) and g.rb.boundFName(f).len == 0 and
+    if f notin g.pickedFRegs and not g.rb.isSealedF(f) and
+       g.rb.boundFName(f).len == 0 and
        not g.rb.isBoundFTmp(f) and not g.fregHoldsHome(f):
       if f in g.md.floatCalleeSavedSet: g.ra.usedCalleeF.incl f
       return f
@@ -839,3 +855,72 @@ proc mintSpillName*(g: var CodeGen; prefix: string): string =
   result = prefix & $g.emitTmpSpills & ".0"
   inc g.emitTmpSpills
   g.ra.hasStackVars = true
+
+# ── fused value core: syntactic operand predicates (shared by both backends) ─
+# Ports of the allocator's private Builder predicates; these become the only
+# copies once the allocator's expression walk is deleted.
+
+proc commutativeExpr*(ek: LengExpr): bool {.inline.} =
+  ## Integer ops for which `a op b == b op a` (so the heavier operand may be
+  ## evaluated first and the lighter one folded after). `sub` is handled too —
+  ## via a `neg` after the swap — but is NOT commutative, so it is separate.
+  ek in {AddC, MulC, BitandC, BitorC, BitxorC}
+
+proc isMemLeaf*(n: Cursor): bool {.inline.} =
+  ## A foldable memory-load operand: a `dot`/`deref`/`at`/`pat` addressing
+  ## chain in value position (folds as `op reg, [mem]` instead of pinning a
+  ## register across a sibling — operands are pure, hexer un-nests calls).
+  n.kind == TagLit and n.exprKind in {DotC, DerefC, AtC, PatC}
+
+proc isFoldableLeafE*(g: var CodeGen; n: Cursor): bool =
+  ## A value needing NO register held across a sibling subtree: an immediate,
+  ## or a function-local symbol read (folds as its reg / stack-home operand).
+  case n.kind
+  of IntLit, UIntLit, CharLit: true
+  of Symbol: g.ra.locationOfSym(symName(n)).kind in {InReg, NamedStack}
+  else: false
+
+proc symInRegE*(g: var CodeGen; n: Cursor; reg: Reg): bool {.inline.} =
+  ## Is `n` a symbol homed in `reg`? (Forbids a Sethi–Ullman swap whose
+  ## rhs-into-dest evaluation would clobber a lhs homed in dest.)
+  if n.kind != Symbol: return false
+  let h = g.ra.locationOfSym(symName(n))
+  h.kind == InReg and h.r == reg
+
+proc exprReadsRegImplE(g: var CodeGen; n: var Cursor; reg: Reg): bool =
+  if n.kind == Symbol:
+    let h = g.ra.locationOfSym(symName(n))
+    inc n
+    return h.kind == InReg and h.r == reg
+  elif n.kind == TagLit:
+    n.into:
+      while n.hasMore:
+        if g.exprReadsRegImplE(n, reg): return true
+  else:
+    inc n
+  return false
+
+proc exprReadsRegE*(g: var CodeGen; n: Cursor; reg: Reg): bool =
+  ## True iff the subtree at `n` reads a symbol homed in `reg` — the guard for
+  ## computing a binop's left operand straight into a pinned `dest` register.
+  var c = n
+  g.exprReadsRegImplE(c, reg)
+
+proc lvalueGlobalBaseE*(g: var CodeGen; n: Cursor): bool =
+  ## Does the lvalue chain `n` (a `dot`/`at` over a symbol) bottom out at a
+  ## module-level global aggregate? Such a base needs its address materialized
+  ## into a scratch register. A `deref`/`pat` base is a pointer VALUE, not a
+  ## global lvalue, so it stops the search. (Fused port of the allocator's
+  ## private `lvalueGlobalBase`.)
+  var c = n
+  case c.kind
+  of Symbol: result = g.ra.locationOfSym(symName(c)).kind == NoLoc
+  of TagLit:
+    case c.exprKind
+    of DotC, AtC:
+      var cc = c
+      cc.into:
+        result = g.lvalueGlobalBaseE(cc)
+        while cc.hasMore: skip cc
+    else: result = false
+  else: result = false
