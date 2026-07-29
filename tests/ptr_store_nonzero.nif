@@ -1,0 +1,23 @@
+(.nif27)
+(.index)
+(stmts
+ (type :Box.0
+  (object
+   (fld :v.0
+    (i 64))))
+ (proc :test_ptr_store_nonzero.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (var :b.0
+    (s)Box.0)
+   (var :p.0
+    (rsi)
+    (ptr Box.0))
+   (lea p.0
+    (rsp)b.0)
+   (mov p.0 0)
+   (mov p.0 32)
+   (syscall))))
+(.index)
