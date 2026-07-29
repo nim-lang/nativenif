@@ -2281,9 +2281,11 @@ proc genVarDecl(g: var WasmGen; c: Cursor) =
   t.into:
     let nm = symName(t); inc t
     skip t                                     # pragmas
-    let typ = t
+    var typ = t
     skip t
     var hasInit = t.hasMore and t.kind != DotToken
+    if typ.kind == DotToken and g.p.symType.hasKey(nm):
+      typ = g.p.symType[nm]                    # scanLocals inferred it
     if g.p.memLocals.hasKey(nm):
       if hasInit:
         let sc = scalOf(g, typ)
@@ -2578,7 +2580,15 @@ proc scanLocals(g: var WasmGen; c: Cursor; taken: HashSet[string];
     t.into:
       let nm = symName(t); inc t
       skip t                                   # pragmas
-      let typ = t
+      var typ = t
+      if typ.kind == DotToken:
+        # The tree optimizers (cse / induction_variables) synthesize
+        # `(var :t . . (addr expr))` without spelling the type — infer it
+        # from the initializer, exactly like lengc's codegen does.
+        var v = t
+        inc v                                  # past the empty type slot
+        if v.kind != DotToken:
+          typ = lengType(g, v)
       let sc = scalOf(g, typ)
       g.p.symType[nm] = typ
       if sc.kind == skMem or nm in taken:
