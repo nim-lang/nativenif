@@ -21,6 +21,9 @@ import asmbuf
 import typenav
 export typenav   # SymCat / SymInfo / getType / exprSlot moved here; re-export so
                  # the backends' `g.lookupSym(...).cat` etc. keep resolving
+import regbind
+export regbind   # the emitter's register-binding state (`g.rb`); the single
+                 # owner of reg↔name bindings — see regbind.nim
 
 type
   OvfMode* = enum
@@ -79,20 +82,13 @@ type
                                              ## syscalls, no Darwin TLV/dyld) instead of
                                              ## the default Darwin/Mach-O — lets the arm64
                                              ## output run under qemu-aarch64 on Linux
-    sealedF*: set[FReg]                       ## SIMD arg registers (xmm0–7) pinned to an
-                                              ## in-flight value: a float arg being marshalled
-                                              ## into xmmN, or a transient float staging reg
-                                              ## (`pickFStaging`) held across a sibling
-                                              ## evaluation. A later float spill's staging
-                                              ## pick must avoid these — the float analogue of
-                                              ## `sealed`/`liveAccums` on the GPR side.
-    liveAccums*: set[Reg]                     ## arg/return registers currently holding an
-                                             ## in-flight expression accumulator (a genInto
-                                             ## target that is *not* a named local, so absent
-                                             ## from `regLocal`). A spill's transient staging
-                                             ## register must avoid these — else it clobbers
-                                             ## the value being built (e.g. x0 = the return
-                                             ## value while a deep right-operand spills).
+    rb*: RegBind                              ## the emitter's register-binding state: reg↔name
+                                              ## bindings, temp/pointer flags, scope stacks and
+                                              ## the accumulator/SIMD seals. Fields are private
+                                              ## to regbind.nim — every mutation goes through
+                                              ## its transition procs, which keep the tables
+                                              ## consistent as one atomic step (the historic
+                                              ## Cat-1 bug source was ad-hoc partial updates).
     indirectReg*: Reg                        ## callee-saved reg holding the x8 dest pointer
     varType*: Table[string, string]          ## aggregate var/param name → its type name
     stackSlots*: HashSet[string]             ## names declared as a nifasm `(var :name (s) …)`
@@ -110,33 +106,18 @@ type
                                              ## rsp-relative. A copy that wants the zero-register
                                              ## `(mem (rsp) name off)` form must tell them apart.
     symType*: Table[string, Cursor]          ## local/param name → its Leng type cursor (for getType)
-    regLocal*: Table[Reg, string]            ## reg → the named local currently bound to it
-                                             ## (x64 named-locals: emit the name, not `(reg)`)
     aliasToDecl*: Table[string, string]      ## param ABI alias `pN.0` → the param's own decl
                                              ## name (its `symPos` key). A register-passed
                                              ## param binds its arg reg to the signature alias
                                              ## `pN.0`, which is NOT a `symPos` key; this lets
                                              ## `recordEviction` recover the decl name from the
-                                             ## point-in-time `regLocal[r]` with no `ra.locs`
+                                             ## point-in-time binding with no `ra.locs`
                                              ## reverse scan. Populated at the param prologue.
-    regBindPtr*: set[Reg]                    ## x64: registers whose current `regLocal` binding is
-                                             ## POINTER-typed. nifasm type-checks every write
-                                             ## against the bound name's type, and a `(nil)` value
-                                             ## only fits a pointer — so a nil materialized into a
-                                             ## register still carrying an `(i 64)` name needs a
-                                             ## fresh binding first (see `emitValue2`'s `NilC`).
-                                             ## Maintained wherever a GPR name is bound/released:
-                                             ## `emRegLocalVar` / `bindTemp` / `unbindTemp`.
     curProcName*: string                     ## the proc currently being emitted. arkham's input
                                              ## carries no line info, so a bare register-pressure
                                              ## or typing assert names nothing actionable; this
                                              ## pins it to one routine (same reason nifasm's
                                              ## `error` reports `in proc …`).
-    boundTemps*: set[Reg]                    ## x64: registers whose `regLocal` entry is a
-                                             ## transient scratch temp `(rebind …)`'d by
-                                             ## `bindTemp`, NOT a steal-able local. `stealReg`
-                                             ## / `evictFixedReg` skip these (a temp is not a
-                                             ## local to spill); released by `unbindTemp`.
     argResidentParams*: seq[tuple[r: Reg, name: string]]
                                              ## x64: (arg register, bound name) for each
                                              ## `ArgResident` param (kept in its incoming reg
@@ -154,10 +135,6 @@ type
                                              ## a same-position param arg to one is a self-move.
                                              ## Computed once (see `cleanSigComputed`).
     cleanSigComputed*: bool
-    tmpBindCount*: int                       ## x64: per-proc fresh-name counter for scratch
-                                             ## register bindings (`tmpN.0`). Bumped in BOTH
-                                             ## passes so the names replay identically, like
-                                             ## `spillCount`.
     regMirror*: Table[Reg, string]           ## x64 reload-elimination cache: reg → the
                                              ## MEMORY-homed local (`NamedStack`) whose value
                                              ## it currently holds a live copy of. A later read
@@ -182,20 +159,6 @@ type
                                              ## edges are all seen before it, so the join is exact;
                                              ## a loop-header `(lab)` clears instead (its back-edge
                                              ## predecessor is not yet emitted in this one pass).
-    scopeLocals*: seq[seq[tuple[name: string, reg: Reg]]]  ## per-scope register locals to `kill`
-    fregLocal*: Table[FReg, string]          ## the SIMD twin of `regLocal`: xmm reg → the
-                                             ## named float local/scratch currently bound to it
-                                             ## (`emFReg` emits the name, not `(xmmN)`). Covers
-                                             ## both float register locals (InFReg, declared via
-                                             ## `emFRegLocalVar`) and scratch temps (`bindFTmp`).
-                                             ## Only the xmm8–15 scratch pool is tracked; the
-                                             ## xmm0–7 arg/return/staging regs stay raw.
-    boundFTmps*: set[FReg]                    ## SIMD twin of `boundTemps`: xmm regs whose
-                                             ## `fregLocal` entry is a transient scratch temp,
-                                             ## released by `unbindFTmp`.
-    ftmpBindCount*: int                       ## per-proc fresh-name counter for float scratch
-                                             ## bindings (`ftmpN.0`); bumped in BOTH passes.
-    scopeFLocals*: seq[seq[tuple[name: string, f: FReg]]]  ## per-scope float register locals to `kill`
     savedHomes*: Table[int, Location]        ## value-core pure path: a deref/at/pat base or
                                              ## index left in its stack home by the allocator is
                                              ## loaded into a transient staging reg for the lval
@@ -740,7 +703,7 @@ proc callerSaveSetAt*(g: var CodeGen): seq[tuple[reg: Reg, name: string]] =
   ## call in its initializer), so saving whenever bound is always well-defined. Sorted by
   ## register for deterministic output.
   if g.ra.callerSaveHomes.len == 0: return
-  for reg, name in g.regLocal:
+  for reg, name in g.rb.gprBindings:
     if g.ra.callerSaveHomes.hasKey(name):
       result.add (reg: reg, name: name)
   result.sort(proc (a, b: tuple[reg: Reg, name: string]): int = cmp(ord(a.reg), ord(b.reg)))

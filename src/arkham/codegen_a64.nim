@@ -55,7 +55,8 @@ proc emReg(g: var CodeGen; r: Reg) {.inline.} =
   ## A value GPR operand: a register currently hosting a named local / param /
   ## `rebind`-bound scratch → its checked name (which nifasm type-checks and resolves
   ## back to the register); otherwise the raw `(xN)` tag.
-  if g.regLocal.hasKey(r): g.ab.sym g.regLocal[r]
+  let nm = g.rb.boundName(r)
+  if nm.len > 0: g.ab.sym nm
   else:
     # The volatile scratch pool (x9–x15) is the only register class the allocator
     # hands out for arbitrary computed values, and every such hand-out is `bindTemp`'d
@@ -75,7 +76,8 @@ proc emOp(g: CodeGen; r: Reg): string =
   ## a string): a bound register by its checked name (no parens), an unbound register
   ## as the raw `(xN)` tag. Used by the inline-asm lowerings (extend, atomics) whose
   ## operands may be `rebind`-bound scratch or register-locals.
-  if g.regLocal.hasKey(r): g.regLocal[r]
+  let nm = g.rb.boundName(r)
+  if nm.len > 0: nm
   else: "(" & regName(r) & ")"
 
 proc movImm(g: var CodeGen; d: Reg; v: int64) =
@@ -202,9 +204,9 @@ proc killFrameRegLocals(g: var CodeGen) =
   ## on another path needing the same callee register bound is the pre-existing
   ## multi-`ret` limitation — out of scope here.)
   for r in g.frameRegs:
-    if g.regLocal.hasKey(r):
-      g.ab.tree KillA64: g.ab.sym g.regLocal[r]
-      g.regLocal.del r
+    let dead = g.rb.takeBinding(r)
+    if dead.len > 0:
+      g.ab.tree KillA64: g.ab.sym dead
 
 proc framePushBytes(g: CodeGen): int =
   ## Bytes `framePush` lowers SP by: the fp/lr pair plus each saved callee-saved
@@ -224,21 +226,19 @@ proc bindFTmp(g: var CodeGen; f: FReg; bits: int) =
   ## passes (names replay identically) and the `(rebind …)` tree auto-no-ops in the plan
   ## pass. The binding type `(f bits)` carries the precision so a *named* use recovers
   ## s/d (unlike x64, the arm64 operand encodes precision).
-  let name = "ftmp" & $g.ftmpBindCount & ".0"; inc g.ftmpBindCount
+  let name = g.rb.freshFTmpName()
   g.ab.tree RebindA64:
     g.ab.symDef name
     g.ab.floatType(bits)
     g.ab.freg(f, bits)
-  g.fregLocal[f] = name
-  g.boundFTmps.incl f
+  g.rb.bindFScratch(f, name)
 
 proc unbindFTmp(g: var CodeGen; f: FReg) =
   ## Release a scratch binding made by `bindFTmp`: `(kill)` the name and drop the
-  ## `fregLocal`/`boundFTmps` entries. A no-op when `f` carries no temp binding.
-  if f in g.boundFTmps:
-    g.ab.tree KillA64: g.ab.sym g.fregLocal[f]
-    g.fregLocal.del f
-    g.boundFTmps.excl f
+  ## binding. A no-op when `f` carries no temp binding.
+  let dead = g.rb.takeFScratch(f)
+  if dead.len > 0:
+    g.ab.tree KillA64: g.ab.sym dead
 
 # `bits` (32 or 64) selects the s/d register view; nifasm reads the operand tag
 # to pick single- vs double-precision encodings.
@@ -251,7 +251,8 @@ proc emFReg(g: var CodeGen; f: FReg; bits: int) {.inline.} =
   ## pool register reaching here is an unbound scratch slipping past the binder. The
   ## v0–v7 arg/return registers and v8–v15 callee-saved homes (saved raw by fstp/fldp)
   ## keep their structural raw uses.
-  if g.fregLocal.hasKey(f): g.ab.sym g.fregLocal[f]
+  let nm = g.rb.boundFName(f)
+  if nm.len > 0: g.ab.sym nm
   else:
     assert f notin g.md.floatTempRegs,
       "arkham a64: unbound float scratch-pool register reached emFReg: " & regName(f)
@@ -454,22 +455,22 @@ proc bindTemp(g: var CodeGen; r: Reg; typ: AsmSlot) =
   ## identically); the `(rebind …)` tree auto-no-ops in the plan pass (zero machine
   ## code — pure nifasm bookkeeping). `boundTemps` records that `r`'s `regLocal` entry
   ## is a transient temp; released by `unbindTemp`.
-  let name = "tmp" & $g.tmpBindCount & ".0"; inc g.tmpBindCount
+  let name = g.rb.freshTmpName()
   g.ab.tree RebindA64:
     g.ab.symDef name
     g.emBindType(typ)
     g.ab.reg r
-  g.regLocal[r] = name
-  g.boundTemps.incl r
+  let isPtr = isNilSlot(typ) or
+              (not cursorIsNil(typ.typ) and isPtrType(resolveType(g.prog, typ.typ)))
+  g.rb.bindScratch(r, name, isPtr)
 
 proc unbindTemp(g: var CodeGen; r: Reg) =
   ## Release a scratch binding made by `bindTemp`: `(kill)` the name and drop the
-  ## `regLocal`/`boundTemps` entries. A no-op when `r` carries no temp binding (so it
-  ## is safe on every `giveBack`, whether or not the reg was a bound temp).
-  if r in g.boundTemps:
-    g.ab.tree KillA64: g.ab.sym g.regLocal[r]
-    g.regLocal.del r
-    g.boundTemps.excl r
+  ## binding. A no-op when `r` carries no temp binding (so it is safe on every
+  ## `giveBack`, whether or not the reg was a bound temp).
+  let dead = g.rb.takeScratch(r)
+  if dead.len > 0:
+    g.ab.tree KillA64: g.ab.sym dead
 
 proc emFloatStackVar(g: var CodeGen; name: string; bits: int) =
   ## Declare a spilled float scalar's stack slot `(var :name (s) (f N))`. nifasm
@@ -542,16 +543,16 @@ proc rebindLocalAs(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   ## tracks `name` (declared by `emRegLocalVar`), so `scopeLocals` is NOT touched. Type
   ## emission mirrors `emRegLocalVar`: a pointer keeps its precise `(ptr …)`, every
   ## other scalar is the generic `(i 64)` register form.
+  let isPtr = isPtrType(resolveType(g.prog, typeCur))
   g.ab.tree RebindA64:
     g.ab.symDef name
-    if isPtrType(resolveType(g.prog, typeCur)):
+    if isPtr:
       var t = typeCur
       g.genTypeBody(t)
     else:
       g.ab.intType(64)
     g.ab.reg r
-  g.regLocal[r] = name
-  g.boundTemps.excl r
+  g.rb.rebindLocal(r, name, isPtr)
 
 # ── floating-point expressions (single + double precision) ──────────────────
 # `bits` (32/64) is the value's precision, threaded top-down: it selects s/d
@@ -615,40 +616,36 @@ proc genProctypeSig(g: var CodeGen; c: var Cursor) =
           retByRef = rs.kind == AMem and rs.size > 16
         g.ab.tree ParamsD:
           if c.kind == TagLit:                  # (params (param …) …)
-            var idx = 0                         # param POSITION (its name pN.0)
-            var gpIdx = 0                       # next x-register
+            # THE plan (see abi.nim). AArch64's hidden result pointer travels in x8
+            # (off the argument file), so the plan is never shifted (retByRef=false).
+            let plan = planCall(g.md, paramSlots(g.prog, c), retByRef = false)
+            var pIdx = 0
             c.into:
               while c.hasMore:
+                let pl = plan.args[pIdx]
+                inc pIdx
                 c.into:                         # (param :name pragmas type)
                   inc c                         # name → positional pN.0
                   skip c                        # pragmas
-                  let ps = slotOf(g.prog, c)
-                  if ps.kind == AMem:
+                  if pl.isAgg:
                     # Aggregate param: >16B by-ref pointer in one x-reg, ≤16B by-value
-                    # over `nw` consecutive x-regs (`(arg pN k)` selects word k).
-                    let nw = (ps.size + 7) div 8
-                    let aggrRef = ps.size > 16
+                    # over `pl.words` consecutive x-regs (`(arg pN k)` selects word k).
                     g.ab.tree ParamD:
-                      g.ab.symDef paramName(idx)
+                      g.ab.symDef paramName(pl.ord)
                       g.ab.tree RegsD:
-                        if aggrRef: g.ab.reg IntArgRegs[gpIdx]
-                        else:
-                          for k in 0 ..< nw: g.ab.reg IntArgRegs[gpIdx + k]
-                      if aggrRef:
+                        for k in 0 ..< pl.words: g.ab.reg g.md.gprAt(pl, k)
+                      if pl.byRef:
                         g.ab.ptrType: g.genPointee(c)
                       else:
                         g.genPointee(c)
-                    if aggrRef: inc gpIdx else: gpIdx += nw
                   else:
                     g.ab.tree ParamD:
-                      g.ab.symDef paramName(idx)
-                      if gpIdx < IntArgRegs.len: g.ab.reg IntArgRegs[gpIdx]  # raw reg *location*
+                      g.ab.symDef paramName(pl.ord)
+                      if not pl.onStack: g.ab.reg g.md.gprAt(pl)  # raw reg *location*
                       else: g.ab.keyword SO       # 9th+ → stack-passed
                       g.genPointee(c)            # param type BY REFERENCE (named → sym);
                                                  # a self-referential closure sig can't recurse
-                    inc gpIdx
                   while c.hasMore: skip c
-                inc idx
           else:
             skip c
         g.ab.tree ResultD:
@@ -888,19 +885,20 @@ proc emRegLocalVar(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   # If `r` still holds an earlier, now-dead local (the allocator early-freed it at
   # its last use and reassigned the register here), `kill` that binding first —
   # nifasm forbids binding a still-live register.
-  if g.regLocal.hasKey(r):
-    g.ab.tree KillA64: g.ab.sym g.regLocal[r]
+  let dead = g.rb.takeBinding(r)
+  if dead.len > 0:
+    g.ab.tree KillA64: g.ab.sym dead
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
   g.ab.reg r
   let rt = resolveType(g.prog, typeCur)
-  if isPtrType(rt):
+  let isPtr = isPtrType(rt)
+  if isPtr:
     var tc = typeCur
     g.genTypeBody(tc)
   else: g.ab.intType(64)
   g.ab.close()
-  g.regLocal[r] = name
-  g.scopeLocals[^1].add (name: name, reg: r)
+  g.rb.bindLocal(r, name, isPtr)
 
 proc emFRegLocalVar(g: var CodeGen; name: string; f: FReg; bits: int) =
   ## Declare a float register local: bind v-register `f` to `name` via `(rebind …)` for
@@ -911,25 +909,20 @@ proc emFRegLocalVar(g: var CodeGen; name: string; f: FReg; bits: int) =
     g.ab.symDef name
     g.ab.floatType(bits)
     g.ab.freg(f, bits)
-  g.fregLocal[f] = name
+  g.rb.bindFLocal(f, name)
   g.freeFTmp.excl f                             # a local's home is no longer scratch
-  g.scopeFLocals[^1].add (name: name, f: f)
 
 proc enterScope(g: var CodeGen) =
-  g.scopeLocals.add @[]
-  g.scopeFLocals.add @[]
+  g.rb.enterScope()
 
 proc exitScope(g: var CodeGen) =
   ## Skip any local whose register was already rebound to a later one (already
   ## killed at that rebind via emRegLocalVar).
-  for it in g.scopeLocals.pop():
-    if g.regLocal.getOrDefault(it.reg, "") == it.name:
-      g.ab.tree KillA64: g.ab.sym it.name
-      g.regLocal.del it.reg
-  for it in g.scopeFLocals.pop():
-    if g.fregLocal.getOrDefault(it.f, "") == it.name:
-      g.ab.tree KillA64: g.ab.sym it.name
-      g.fregLocal.del it.f
+  let dead = g.rb.exitScope()
+  for name in dead.gprs:
+    g.ab.tree KillA64: g.ab.sym name
+  for name in dead.fprs:
+    g.ab.tree KillA64: g.ab.sym name
 
 # ── control flow: labels + goto ─────────────────────────────────────────────
 
@@ -1013,53 +1006,40 @@ proc emitStackParamLoads(g: var CodeGen; decl: Cursor) =
   inc c                                       # name → params slot
   if c.kind != TagLit: return                 # (params) is `.` → no parameters
   let base = g.framePushBytes()
-  var idx = 0                                 # next arg register (skip rule)
-  var fidx = 0
-  var stackOff = 0                            # byte offset within the incoming-arg area
+  # THE plan (see abi.nim): which params are stack-passed and at what byte offset
+  # within the incoming-arg area — the same answer the signature and the caller got.
+  let plan = planCall(g.md, paramSlots(g.prog, c), retByRef = false)
+  var pIdx = 0
   c.into:
     while c.hasMore:
+      let pl = plan.args[pIdx]
+      inc pIdx
       var nm = ""
-      var isFloat = false
-      var typeCur: Cursor
       c.into:                                 # (param :name pragmas type)
         nm = symName(c); inc c
         skip c                                # pragmas
-        typeCur = c
-        if c.kind == TagLit and c.typeKind == FT: isFloat = true
         while c.hasMore: skip c               # type (+ anything else)
-      if isFloat:
-        inc fidx                              # floats use v0–v7; never stack here
-      else:
-        let ps = slotOf(g.prog, typeCur)
-        # Register-words this param would occupy: a ≤16B by-value aggregate spans its
-        # eightbytes, everything else (scalar / pointer / >16B by-ref pointer) one.
-        let words = if ps.kind == AMem and ps.size <= g.md.aggrByRefThreshold:
-                      aggrWordCount(g.prog, symName(typeCur)) else: 1
-        if idx + words > IntArgRegs.len:
-          # Stack-passed. Its incoming bytes sit at `[sp + base + stackOff]` (valid here,
-          # before SP is lowered). A scalar / >16B-by-ref pointer is LOADED into its home;
-          # a ≤16B by-value aggregate's home is a POINTER to those bytes (address-of), so
-          # the body reads its fields through it (varType set in emitParamMoves) with no
-          # copy. The pointer is absolute, surviving any later frame `sub sp`.
-          let loc = g.ra.locationOfSym(nm)
-          assert loc.kind == InReg,
-            "arkham v1: stack parameter without a register home: " & nm
-          if ps.kind == AMem and ps.size <= g.md.aggrByRefThreshold:
-            g.ab.tree LeaA64:                 # home ← &[sp + base + stackOff] = sp + imm
-              g.emReg loc.r
-              g.ab.tree MemX:
-                g.emReg SP
-                g.ab.intLit (base + stackOff)
-            stackOff += aggrWordCount(g.prog, symName(typeCur)) * 8
-          else:
-            g.ab.tree MovA64:                 # home ← [sp + base + stackOff]
-              g.emReg loc.r
-              g.ab.tree MemX:
-                g.emReg SP
-                g.ab.intLit (base + stackOff)
-            stackOff += 8
+      if not pl.isFloat and pl.onStack:
+        # Stack-passed. Its incoming bytes sit at `[sp + base + byteOff]` (valid here,
+        # before SP is lowered). A scalar / >16B-by-ref pointer is LOADED into its home;
+        # a ≤16B by-value aggregate's home is a POINTER to those bytes (address-of), so
+        # the body reads its fields through it (varType set in emitParamMoves) with no
+        # copy. The pointer is absolute, surviving any later frame `sub sp`.
+        let loc = g.ra.locationOfSym(nm)
+        assert loc.kind == InReg,
+          "arkham v1: stack parameter without a register home: " & nm
+        if pl.isAgg and not pl.byRef:
+          g.ab.tree LeaA64:                   # home ← &[sp + base + byteOff] = sp + imm
+            g.emReg loc.r
+            g.ab.tree MemX:
+              g.emReg SP
+              g.ab.intLit (base + pl.byteOff)
         else:
-          idx += words
+          g.ab.tree MovA64:                   # home ← [sp + base + byteOff]
+            g.emReg loc.r
+            g.ab.tree MemX:
+              g.emReg SP
+              g.ab.intLit (base + pl.byteOff)
 
 proc emitParamMoves(g: var CodeGen; decl: Cursor) =
   ## Move each parameter from its incoming ABI register to the home the
@@ -1076,10 +1056,13 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
   inc c                                       # proc head → name
   inc c                                       # name → params slot
   if c.kind != TagLit: return                 # (params) is `.` → no parameters
-  var idx = 0
-  var fidx = 0
+  # THE plan (see abi.nim): register indices below read it — no local counting.
+  let plan = planCall(g.md, paramSlots(g.prog, c), retByRef = false)
+  var pIdx = 0
   c.into:                                     # into (params …)
     while c.hasMore:
+      let pl = plan.args[pIdx]
+      inc pIdx
       var nm = ""
       var tn = ""
       var typeCur: Cursor
@@ -1099,53 +1082,44 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
         # ≤16B by-value aggregate: declare its stack home, fill from its GPR(s)
         g.varType[nm] = tn
         g.emStackVar(nm, tn)
-        g.regsToStruct(nm, tn, idx)
-        idx += aggrWordCount(g.prog, tn)
+        g.regsToStruct(nm, tn, pl.gpFirst)
       elif tn.len > 0 and loc.kind == InReg:
         # A pointer-homed aggregate: a >16B by-reference one, OR a stack-passed ≤16B
         # by-value one (whose home is a pointer to its incoming bytes). Field accesses
         # route through the pointer (recorded in varType). Register-passed → move the
-        # pointer from its incoming arg register and advance idx by its one register;
-        # STACK-passed → `emitStackParamLoads` already loaded/computed the pointer into the
-        # home, and the param consumed NO register (skip rule), so leave idx untouched.
+        # pointer from its incoming arg register; STACK-passed → `emitStackParamLoads`
+        # already loaded/computed the pointer into the home, and the param consumed
+        # NO register (the plan's skip rule), so there is nothing to move.
         g.varType[nm] = tn
         if csave: g.emRegLocalVar(nm, loc.r, typeCur)
-        let words = if aggrByteSize(g.prog, tn) <= g.md.aggrByRefThreshold:
-                      aggrWordCount(g.prog, tn) else: 1
-        if idx + words <= IntArgRegs.len:
-          g.movReg(loc.r, IntArgRegs[idx])
-          inc idx
-        # else: stack-passed → idx unchanged
+        if not pl.onStack:
+          g.movReg(loc.r, g.md.gprAt(pl))
       elif loc.kind == InFReg:
-        # Float parameter: in a leaf proc it stays in its incoming v{fidx}; if
+        # Float parameter: in a leaf proc it stays in its incoming v{fpIndex}; if
         # the allocator gave it a callee-saved home, move it there.
-        g.fmovF(loc.f, FloatArgRegs[fidx], loc.typ.size * 8)
-        inc fidx
+        g.fmovF(loc.f, FloatArgRegs[pl.fpIndex], loc.typ.size * 8)
       elif loc.kind == NamedStack and loc.typ.kind == AFloat:
         # An address-taken / spilled float param: declare its `(s) (f N)` slot and
         # spill the incoming SIMD arg register into it so `addr`/loads/stores work.
-        assert fidx < FloatArgRegs.len, "arkham v1: >8 float params (stack TODO)"
+        assert not pl.onStack, "arkham v1: >8 float params (stack TODO)"
         let bits = loc.typ.size * 8
         g.emFloatStackVar(nm, bits)
-        g.emFloatScalarStore(nm, FloatArgRegs[fidx], bits)
-        inc fidx
+        g.emFloatScalarStore(nm, FloatArgRegs[pl.fpIndex], bits)
       elif loc.kind == NamedStack:
         # An address-taken scalar param: declare its `(s)` slot and spill the
         # incoming argument register into it so `addr`/loads/stores work.
-        assert idx < IntArgRegs.len, "arkham v1: >8 integer params (stack TODO)"
+        assert not pl.onStack, "arkham v1: >8 integer params (stack TODO)"
         g.emScalarStackVar(nm)
-        g.emScalarStore(nm, IntArgRegs[idx])
-        inc idx
+        g.emScalarStore(nm, g.md.gprAt(pl))
       else:
         case loc.kind
         of InReg:
           if csave: g.emRegLocalVar(nm, loc.r, typeCur)
-          if idx < IntArgRegs.len:
-            g.movReg(loc.r, IntArgRegs[idx])
+          if not pl.onStack:
+            g.movReg(loc.r, g.md.gprAt(pl))
           # else: a stack-passed param — already loaded into loc.r by
           # emitStackParamLoads before SP was lowered. Nothing to move.
         else: raiseAssert "arkham v1: stack-resident parameter: " & nm
-        inc idx
 
 proc emitSignature(g: var CodeGen; decl: Cursor; declarative: bool) =
   ## Emit the proc's `(params)/(result)/(clobber)`. When `declarative`, the ABI
@@ -1170,59 +1144,54 @@ proc emitSignature(g: var CodeGen; decl: Cursor; declarative: bool) =
         retByRef = rs.kind == AMem and rs.size > 16
       g.ab.tree ParamsD:
         if c.kind == TagLit:                  # (params (param …) …)
-          var idx = 0                         # param POSITION (its name p{idx})
-          var gpIdx = 0                       # next x-register (an aggregate spans several)
+          # THE plan (see abi.nim); AArch64's hidden result pointer is x8, off the
+          # argument file, so the plan is never shifted (retByRef=false).
+          let plan = planCall(g.md, paramSlots(g.prog, c), retByRef = false)
+          var pIdx = 0
           c.into:
             while c.hasMore:
+              let pl = plan.args[pIdx]
+              inc pIdx
               c.into:                         # (param :name pragmas type)
-                inc c                         # name → use positional p{idx}
+                inc c                         # name → use positional p{ord}
                 skip c                        # pragmas
-                let ps = slotOf(g.prog, c)
-                if ps.kind == AFloat:
+                if pl.isFloat:
                   raiseAssert "arkham a64: float param in signature not yet supported"
-                if ps.kind == AMem:
+                if pl.isAgg:
                   # An aggregate param: a >16B aggregate is a by-ref pointer in one x-reg;
-                  # a ≤16B by-value aggregate spans `nw` consecutive x-regs (one per
+                  # a ≤16B by-value aggregate spans `pl.words` consecutive x-regs (one per
                   # eightbyte). Emitted with `(regs …)` (ABI-only); `(arg pN k)` at a call
                   # selects word k. The body reads the registers raw into its own home.
-                  let nw = (ps.size + 7) div 8
-                  let aggrRef = ps.size > 16
-                  let words = if aggrRef: 1 else: nw
-                  if gpIdx + words > IntArgRegs.len:
+                  if pl.onStack:
                     # Doesn't fit the remaining arg registers → stack-passed `(s)`. A >16B
                     # aggregate travels as ONE pointer (`(s) (ptr T)`, 8 bytes); a ≤16B
-                    # by-value one occupies its eightbytes (`(s) T`). gpIdx is UNCHANGED
-                    # (skip rule), so a later smaller param can still take a free register.
+                    # by-value one occupies its eightbytes (`(s) T`). The plan's skip rule:
+                    # a later smaller param can still take a free register.
                     g.ab.tree ParamD:
-                      g.ab.symDef paramName(idx)
+                      g.ab.symDef paramName(pl.ord)
                       g.ab.keyword SO
-                      if aggrRef:
+                      if pl.byRef:
                         g.ab.ptrType: g.genTypeBody(c)
                       else:
                         g.genTypeBody(c)
                   else:
                     g.ab.tree ParamD:
-                      g.ab.symDef paramName(idx)
+                      g.ab.symDef paramName(pl.ord)
                       g.ab.tree RegsD:
-                        if aggrRef: g.ab.reg IntArgRegs[gpIdx]
-                        else:
-                          for k in 0 ..< nw: g.ab.reg IntArgRegs[gpIdx + k]
-                      if aggrRef:
+                        for k in 0 ..< pl.words: g.ab.reg g.md.gprAt(pl, k)
+                      if pl.byRef:
                         g.ab.ptrType: g.genTypeBody(c)
                       else:
                         g.genTypeBody(c)
-                    if aggrRef: inc gpIdx else: gpIdx += nw
                 else:
                   g.ab.tree ParamD:
-                    g.ab.symDef paramName(idx)
-                    if gpIdx < IntArgRegs.len:
-                      g.ab.reg IntArgRegs[gpIdx]  # x0–x7: raw reg *location*
+                    g.ab.symDef paramName(pl.ord)
+                    if not pl.onStack:
+                      g.ab.reg g.md.gprAt(pl)   # x0–x7: raw reg *location*
                     else:
                       g.ab.keyword SO           # 9th+ → stack-passed `(s)`
                     g.genTypeBody(c)            # the param type (consumes it)
-                  inc gpIdx
                 while c.hasMore: skip c
-              inc idx
         else:
           skip c                              # no params slot → consume it
       g.ab.tree ResultD:                      # c now at the return type
@@ -1292,7 +1261,7 @@ proc takeBridge(g: var CodeGen; typ = ScalarSlot; avoid = NoReg): Reg =
   ## checked symbol and a typed memory base type-checks. Released by `dropBridge`.
   ## Two bridges nest (e.g. a `cmp` of two spilled operands); a third asserts.
   for r in IntBridgeRegs:
-    if r != avoid and r notin g.boundTemps:
+    if r != avoid and not g.rb.isBoundTemp(r):
       g.bindTemp(r, typ); return r
   raiseAssert "arkham a64n: both staging bridges in use"
 
@@ -1705,7 +1674,7 @@ proc bindLvalGlobalBases(g: var CodeGen; c: Cursor; bound: var seq[Reg]) =
   ## already-bound base reg (a caller — e.g. `emitAddr2` — may reuse its bound result reg).
   if c.kind == Symbol:
     let loc = g.ra.locs[g.posOf(c)]
-    if loc.kind == InReg and loc.isTemp and loc.r notin g.boundTemps and
+    if loc.kind == InReg and loc.isTemp and not g.rb.isBoundTemp(loc.r) and
        g.ra.locationOfSym(symName(c)).kind == Undef:
       g.bindTemp(loc.r, ScalarSlot)
       bound.add loc.r
@@ -1959,8 +1928,8 @@ proc emitBin2(g: var CodeGen; c: Cursor) =
   # int / `aptr` are arithmetic-legal). Retype to the IR result type when it is not a
   # pointer; the `(rebind)` is zero machine code (mirrors the x64 emitBin2 fix).
   if not isPtrType(resolveType(g.prog, resTypeC)):
-    let nm = g.regLocal.getOrDefault(rD, "")
-    if rD in g.boundTemps:
+    let nm = g.rb.boundName(rD)
+    if g.rb.isBoundTemp(rD):
       if reusedLhs or reusedRhs: g.bindTemp(rD, res.typ)   # inherited an operand's binding
     elif nm.len > 0:
       g.rebindLocalAs(nm, rD, resTypeC)
@@ -2162,7 +2131,7 @@ proc emitCast2(g: var CodeGen; c: Cursor) =
     if res2.isTemp:
       g.bindTemp(res2.r, (if ptrTarget: slotOf(g.prog, targetCur) else: ScalarSlot))
     else:
-      let nm = g.regLocal.getOrDefault(res2.r, "")
+      let nm = g.rb.boundName(res2.r)
       if nm.len > 0: g.rebindLocalAs(nm, res2.r, targetCur)
   if iv.kind in {NamedStack, Mem}:
     if kindChange: retypeCastRes()
@@ -2292,9 +2261,10 @@ proc releaseStaleName(g: var CodeGen; r: Reg) =
   ## binding: `emOp`/`emReg` would emit that typed name instead of the `(xN)` tag,
   ## and its type would not match the pointee-typed exclusive access. `(kill)` the
   ## binding so the raw tag is what comes out. The x86-64 twin does the same.
-  if r != NoReg and g.regLocal.hasKey(r):
-    g.ab.tree KillA64: g.ab.sym g.regLocal[r]
-    g.regLocal.del r
+  if r != NoReg:
+    let dead = g.rb.takeBinding(r)
+    if dead.len > 0:
+      g.ab.tree KillA64: g.ab.sym dead
 
 proc emitAtomicRmw2(g: var CodeGen; dst, p, v: Reg; opStr: string;
                     isXchg, returnNew: bool; bits: int) =
@@ -2337,7 +2307,7 @@ proc emitAtomicInstr2(g: var CodeGen; c: Cursor; op: IntrinsicOp;
   for r in AtomicScratchRegs: g.releaseStaleName(r)
   let bits = g.atomicBits(argCurs[0])
   let p = g.instrOperandReg(argCurs[0])
-  if res.kind == InReg and res.isTemp and res.r notin g.boundTemps:
+  if res.kind == InReg and res.isTemp and not g.rb.isBoundTemp(res.r):
     g.bindTemp(res.r, res.typ)
   case op
   of AtomicLoadOp: g.emLdar(res.r, p, bits)
@@ -2460,17 +2430,16 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor) =
     # local / complex fn-ptr expression loaded into a scalar-typed temp) gets a fresh
     # PROCTYPE-typed name here: `rebind` is rename-only (keeps the value) and auto-kills
     # any prior binding on the register. Killed after the call (`fnTargetName`).
-    if targetCur.kind == Symbol and g.regLocal.getOrDefault(fnptrReg, "") == symName(targetCur):
+    if targetCur.kind == Symbol and g.rb.boundName(fnptrReg) == symName(targetCur):
       tgt = CallTarget(declarative: declarative, asmName: symName(targetCur), retType: retType)
     else:
-      let nm = "fntmp" & $g.tmpBindCount & ".0"; inc g.tmpBindCount
+      let nm = g.rb.freshTmpName("fntmp")
       g.ab.tree RebindA64:
         g.ab.symDef nm
         var pc = proctype
         g.genTypeBody(pc)                            # the proctype signature → ProcT
         g.ab.reg fnptrReg
-      g.regLocal[fnptrReg] = nm
-      g.boundTemps.incl fnptrReg
+      g.rb.bindScratch(fnptrReg, nm, isPtr = false)
       fnTargetName = nm
       tgt = CallTarget(declarative: declarative, asmName: nm, retType: retType)
   else:
@@ -2508,38 +2477,39 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor) =
     # this call), not a signature param. Param NAMES are positional (`paramName(j)`);
     # register assignment is tracked separately by `gpIdx` (an aggregate spans several).
     let resultByRef = hasResult and resSlot.kind == AMem and resSlot.size > 16
+    # THE plan for this call's arguments (see abi.nim): the same classification the
+    # callee's signature and `allocCall` state. AArch64's hidden result pointer is
+    # x8, off the argument file, so the plan is never shifted. An arg that doesn't
+    # fit the REMAINING registers goes ENTIRELY on the stack and consumes none, so
+    # a later, smaller arg can still take a free one (the skip rule).
+    var callArgSlots: seq[AsmSlot] = @[]
+    for a in argCurs: callArgSlots.add g.exprSlot(a)
+    let plan = planCall(g.md, callArgSlots, retByRef = false)
     g.ab.tree PrepareA64:
       g.ab.sym tgt.asmName
-      var gpIdx = 0                                    # next x-register
-      # Classify each arg: a register one occupies x0–x7; one that doesn't fit the
-      # REMAINING arg registers goes ENTIRELY on the stack and consumes NO register, so a
-      # later, smaller arg can still take a free one (the allocator's rule, allocCall). SP
-      # is constant in the fixed frame — the outgoing area is reserved in this proc's frame
-      # — so a stack arg writes straight to `(mem (sp) (arg pN [k]))` with NO per-call sub.
+      # SP is constant in the fixed frame — the outgoing area is reserved in this
+      # proc's frame — so a stack arg writes straight to `(mem (sp) (arg pN [k]))`
+      # with NO per-call sub.
       var stackArgs: seq[int] = @[]
       for j in 0 ..< argCurs.len:
         let a = argCurs[j]
-        let slot = g.exprSlot(a)
-        var words = 1
+        let pl = plan.args[j]
         var tn = ""
-        var aggrRef = false
-        if slot.kind == AMem:
+        if pl.isAgg:
           let tcur = g.getType(a)
           if tcur.kind != Symbol:
             raiseAssert "arkham a64: aggregate call-arg of non-nominal type"
           tn = symName(tcur)
-          aggrRef = slot.size > 16
-          words = if aggrRef: 1 else: aggrWordCount(g.prog, tn)
-        if gpIdx + words > IntArgRegs.len:
-          stackArgs.add j                              # doesn't fit → stack (gpIdx unchanged)
+        if pl.onStack:
+          stackArgs.add j                              # doesn't fit → stack (skip rule)
           continue
-        if slot.kind == AMem:
-          # Marshal the aggregate into IntArgRegs[gpIdx ..], then bind each word.
+        if pl.isAgg:
+          # Marshal the aggregate into IntArgRegs[pl.gpFirst ..], then bind each word.
           if a.kind == TagLit and a.exprKind in {DotC, DerefC, AtC, PatC}:
             let srcAddr = g.ra.aux[g.posOf(a)].scratch[^1]
             g.aggrAddrInto(a, srcAddr, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = true)
-            if aggrRef: g.movReg(IntArgRegs[gpIdx], srcAddr)
-            else: g.marshalAggrFromAddr(srcAddr, tn, gpIdx)
+            if pl.byRef: g.movReg(g.md.gprAt(pl), srcAddr)
+            else: g.marshalAggrFromAddr(srcAddr, tn, pl.gpFirst)
             g.unbindTemp(srcAddr)
           else:
             var home = ""
@@ -2554,24 +2524,24 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor) =
               home = "aggtmp" & $p & ".0"
               g.emTypedStackVar(home, g.getType(a))
               g.varType[home] = tn
-              g.genStore2(a, namedStackLoc(home, slot), p)
-            if aggrRef:
-              if isGlobal: g.emGlobalAddr(IntArgRegs[gpIdx], symName(a))
+              g.genStore2(a, namedStackLoc(home, callArgSlots[j]), p)
+            if pl.byRef:
+              if isGlobal: g.emGlobalAddr(g.md.gprAt(pl), symName(a))
               elif g.ra.locationOfSym(home).kind == InReg:
-                g.movReg(IntArgRegs[gpIdx], g.ra.locationOfSym(home).r)
-              else: g.ab.tree LeaA64: (g.emReg IntArgRegs[gpIdx]; g.ab.sym home)
+                g.movReg(g.md.gprAt(pl), g.ra.locationOfSym(home).r)
+              else: g.ab.tree LeaA64: (g.emReg g.md.gprAt(pl); g.ab.sym home)
             else:
-              if isGlobal: g.globalToRegs(symName(a), tn, gpIdx)
-              else: g.structToRegs(home, tn, gpIdx)
-          if aggrRef:
+              if isGlobal: g.globalToRegs(symName(a), tn, pl.gpFirst)
+              else: g.structToRegs(home, tn, pl.gpFirst)
+          if pl.byRef:
             g.ab.tree MovA64:
               g.ab.tree ArgX: g.ab.sym paramName(j)
-              g.emReg IntArgRegs[gpIdx]
+              g.emReg g.md.gprAt(pl)
           else:
-            for k in 0 ..< words:
+            for k in 0 ..< pl.words:
               g.ab.tree MovA64:
                 g.ab.tree ArgX: (g.ab.sym paramName(j); g.ab.intLit k.int64)
-                g.emReg IntArgRegs[gpIdx + k]
+                g.emReg g.md.gprAt(pl, k)
         else:
           g.emitValue2(a)
           let aloc = g.ra.locs[g.posOf(a)]
@@ -2581,7 +2551,6 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor) =
           g.ab.tree MovA64:
             g.ab.tree ArgX: g.ab.sym paramName(j)
             g.emReg aloc.r
-        gpIdx += words
       # Stack args: write each (in declaration order) to its outgoing slot `(mem (sp) (arg
       # pN [k]))` at the stable, frame-reserved area — no `sub sp` (SP is constant).
       for j in stackArgs:
@@ -2609,8 +2578,7 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor) =
     # release the synthesized fn-ptr binding (indirect only): dead post-call.
     if fnTargetName.len > 0:
       g.ab.tree KillA64: g.ab.sym fnTargetName
-      g.regLocal.del fnptrReg
-      g.boundTemps.excl fnptrReg
+      discard g.rb.takeBinding(fnptrReg)
     if hasResult and not resultByRef and resLoc.kind == InReg and resLoc.r != IntRet:
       # x0 itself is raw-usable (arg/return reg) and needs no binding; only a result
       # moved to a non-x0 home (a pool reg) is bound so its checked name resolves.
@@ -2680,8 +2648,7 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor) =
     # release the synthesized fn-ptr binding (indirect only): dead post-call.
     if fnTargetName.len > 0:
       g.ab.tree KillA64: g.ab.sym fnTargetName
-      g.regLocal.del fnptrReg
-      g.boundTemps.excl fnptrReg
+      discard g.rb.takeBinding(fnptrReg)
     if hasResult:
       if resultIsFloat:
         if resLoc.kind == InFReg:
@@ -4305,9 +4272,8 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   g.retAggrName = ""; g.retIndirect = false; g.retIsFloat = false
   g.indirectReg = NoReg
   g.isEntryProc = info.isEntry
-  g.regLocal.clear(); g.aliasToDecl.clear(); g.boundTemps = {}; g.scopeLocals = @[]
-  g.fregLocal.clear(); g.boundFTmps = {}; g.scopeFLocals = @[]
-  g.tmpBindCount = 0; g.ftmpBindCount = 0; g.loopEnds = @[]; g.spillCount = 0
+  g.rb.resetProc(); g.aliasToDecl.clear()
+  g.loopEnds = @[]; g.spillCount = 0
   g.savedHomes.clear()
   block:
     var rc = info.decl
@@ -4345,9 +4311,7 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   g.computeFrame(an.hasCall or (info.isEntry and g.hasGlobalInits))
   let declarative = isDeclarativeAbi(g.prog, info.decl)
   g.ab.planning = false
-  g.regLocal.clear(); g.aliasToDecl.clear(); g.boundTemps = {}; g.scopeLocals = @[]
-  g.fregLocal.clear(); g.boundFTmps = {}; g.scopeFLocals = @[]; g.savedHomes.clear()
-  g.tmpBindCount = 0; g.ftmpBindCount = 0
+  g.rb.resetProc(); g.aliasToDecl.clear(); g.savedHomes.clear()
   g.emitProcBody2(info, declarative)
 
 # MODEL: the `StartEmit` per-proc reset in proofs/arkham_bindings.tla. The two-pass seam

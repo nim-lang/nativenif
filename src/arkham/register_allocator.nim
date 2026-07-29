@@ -36,6 +36,9 @@ let copyInheritDisabled = existsEnv("ARKHAM_NO_COPYINHERIT")
   ## measurement toggle: `ARKHAM_NO_COPYINHERIT=1` disables same-width cast/copy home
   ## inheritance (`allocVarDecl`), so the eliminated reg→reg moves can be A/B compared.
 import nifcore, nifcdecl, slots, machinedesc, analyser, programs, typenav
+import abi
+export abi         # CallPlan / planCall / ParamPlace: the one ABI classifier the
+                   # allocator and both emitters consume (see abi.nim)
 
 var gArkhamCurProc* = ""   # debug: the proc arkham is currently allocating (for asserts)
 
@@ -57,6 +60,14 @@ type
                                       ## at use (see `heldScratchReg`). "" ⇒ `scratch[i]`
                                       ## is a real register.
     fscratch*: seq[FReg]              ## extra SIMD scratch reserved for this op
+    parkRegs*: seq[Reg]               ## clobber-exposed AGGREGATE call argument: a later
+                                      ## argument's shift/div unconditionally overwrites one
+                                      ## of its ABI target registers (x86 cl/rdx), so its
+                                      ## words marshal into these callee-saved survivors
+                                      ## instead (one per word; the by-ref pointer is one)
+                                      ## and the emitter binds `(arg pN [k])` from them at
+                                      ## the END of the prepare block — the aggregate
+                                      ## analogue of the scalar parking (`pendingArgBinds`)
     swapped*: bool                    ## operands evaluated in swapped (Sethi–Ullman) order
     foldB*: bool                      ## operand B stays a folded memory operand (no load)
     aliasRhs*: bool                   ## dest register aliases the rhs operand: the emitter
@@ -991,70 +1002,12 @@ proc fixedRegsClobberedBy(b: Builder; n: Cursor): set[Reg] =
         stack.add ch
         skip ch
 
-type
-  ParamPlace* = object
-    ## Where one SysV-AMD64 parameter / argument is passed. Produced by
-    ## `classifyParamsX64`; consumed by the signature, prologue, callee stack-loads,
-    ## the call allocator and the call-site marshaller so they cannot disagree.
-    ord*: int            ## param NAME ordinal (decoupled from the register index)
-    onStack*: bool       ## passed on the stack rather than in registers
-    isFloat*: bool       ## a float (xmm if register-passed)
-    isAgg*: bool         ## an aggregate (AMem slot)
-    byRef*: bool         ## aggregate larger than the threshold → a single pointer
-    words*: int          ## eightbytes occupied (1 for a scalar / pointer / float)
-    gpFirst*: int        ## register-passed int/aggregate: first GPR index
-                         ## (registers = intArgRegs[gpFirst ..< gpFirst+words])
-    fpIndex*: int        ## register-passed float: xmm index
-    byteOff*: int        ## stack-passed: byte offset within the stack-argument area
-
-proc classifyParamsX64*(md: MachineDesc; slots: openArray[AsmSlot];
-                        retByRef: bool): seq[ParamPlace] =
-  ## THE one SysV-AMD64 parameter classifier (chibicc's `assign_lvar_offsets`):
-  ## walk params/args left to right, assigning each to argument registers or the
-  ## stack. An aggregate that does not fit in the REMAINING integer arg registers
-  ## goes ENTIRELY on the stack and consumes NO register (so a later, smaller arg
-  ## can still take a free one). `retByRef` reserves rdi/ord 0 for the hidden
-  ## >16B-return pointer. Stack offsets round each slot up to 8 bytes, matching
-  ## nifasm's `alignedSize` (so the callee's load offset == the caller's `(arg)`).
-  result = @[]
-  var gp = if retByRef: 1 else: 0
-  var fp = 0
-  var stackOff = 0
-  var ord = if retByRef: 1 else: 0
-  for s in slots:
-    var pp = ParamPlace(ord: ord)
-    if s.kind == AMem:
-      pp.isAgg = true
-      pp.byRef = s.size > md.aggrByRefThreshold
-      pp.words = if pp.byRef: 1 else: (s.size + 7) div 8
-      if gp + pp.words <= md.intArgRegs.len:
-        pp.gpFirst = gp; gp += pp.words
-      else:
-        pp.onStack = true; pp.byteOff = stackOff
-        stackOff += (if pp.byRef: 8 else: (s.size + 7) and not 7)
-    elif s.kind == AFloat:
-      pp.isFloat = true; pp.words = 1
-      if fp < md.floatArgRegs.len:
-        pp.fpIndex = fp; inc fp
-      else:
-        pp.onStack = true; pp.byteOff = stackOff; stackOff += 8
-    else:                               # scalar int / pointer
-      pp.words = 1
-      if gp < md.intArgRegs.len:
-        pp.gpFirst = gp; inc gp
-      else:
-        pp.onStack = true; pp.byteOff = stackOff; stackOff += 8
-    result.add pp
-    inc ord
-
 proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = false) =
   ## A call: each scalar/pointer argument is allocated into its ABI integer argument
   ## register (rdi…r9), each float argument into its SIMD argument register (xmm0–7);
   ## the result lands in the return register (rax, or xmm0 for a float result) or a
   ## destination-passed home. More arguments than the ABI registers hold fail loudly.
   let pos = b.posOf(n)
-  var intIdx = if hiddenPtr: 1 else: 0         # rdi reserved for a >16B aggregate result ptr
-  var fIdx = 0
   n.into:
     # An INDIRECT call's target is a fn-ptr EXPRESSION (vtable/method-table load), or a
     # Symbol naming a proc-typed LOCAL/param (a fn-ptr value): allocate it into a register
@@ -1073,27 +1026,35 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
     # the `call` (see `fixedRegsClobberedBy`), so those arguments are parked in a
     # callee-saved survivor and bound to `(arg pN)` at the end of the prepare block.
     var laterClob: seq[set[Reg]] = @[]
+    var argSlots: seq[AsmSlot] = @[]
     block:
       var scan = n
       var per: seq[set[Reg]] = @[]
       while scan.hasMore:
         per.add fixedRegsClobberedBy(b, scan)
+        # The argument's ABI class is just its type — one `exprSlot`, the SAME
+        # navigator the emitter uses. No per-form ladder: a struct var and an
+        # `(oconstr …)`/`(aconstr …)` are both `AMem`; only *building* the value
+        # differs, and that is `allocStore`'s job, not the call's.
+        argSlots.add b.tc.exprSlot(scan)
         skip scan
       laterClob = newSeq[set[Reg]](per.len + 1)
       for i in countdown(per.len - 1, 0): laterClob[i] = laterClob[i+1] + per[i]
+    # THE plan: every register/stack decision below reads it — no local counting.
+    # (`hiddenPtr` reserves the first GPR on both arches — the historic behavior;
+    # AArch64's real convention is x8, but marshalling reads the allocator's
+    # placement, so the shift only costs one register there.)
+    let plan = planCall(b.md, argSlots, retByRef = hiddenPtr)
     var argIdx = 0
     var heldArgs: seq[Location] = @[]
     while n.hasMore:
-      # The argument's ABI class is just its type — one `exprSlot`, the SAME navigator
-      # the emitter uses. No per-form ladder: a struct var and an `(oconstr …)`/`(aconstr …)`
-      # are both `AMem` and share this branch; only *building* the value differs, and that
-      # is `allocStore`'s job, not the call's.
-      let argSlot = b.tc.exprSlot(n)
+      let pl = plan.args[argIdx]
+      let argSlot = argSlots[argIdx]
       if argSlot.cls == AMem:
         # An aggregate argument: a ≤threshold by-value one consumes ceil(size/8) integer
         # arg registers, a >threshold by-reference one a single pointer register — UNLESS
         # it doesn't fit in the remaining arg registers, in which case it is passed on the
-        # stack (classifyParamsX64's rule) and DOESN'T advance `intIdx`.
+        # stack (the plan's skip rule) and consumes NO register.
         #
         # A stack-passed aggregate needs NO reservation here: its words land in the
         # outgoing stack area, so none of them has to stay in a register past its own
@@ -1102,18 +1063,27 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
         # outright — "nothing to spill" — once other survivors already held the whole
         # callee-saved pool, and cost registers even when it succeeded.)
         let argPos = b.posOf(n)
-        let byRef = argSlot.size > b.md.aggrByRefThreshold
-        let gprWords = if byRef: 1 else: (argSlot.size + 7) div 8
-        let fits = intIdx + gprWords <= b.md.intArgRegs.len
-        if fits:
-          # Same hazard as the scalar branch, but an aggregate marshals into its ABI
-          # registers inside the emitter (`dst[k]`), which has no parking mechanism —
-          # fail loudly rather than emit a silent clobber.
-          for k in 0 ..< gprWords:
-            if b.md.intArgRegs[intIdx + k] in laterClob[argIdx+1]:
-              raiseAssert "arkham: aggregate call-argument in a register a later " &
-                          "argument's shift/div clobbers (parking not implemented)"
-        if not fits:
+        if not pl.onStack:
+          # Same hazard as the scalar branch: a later argument's shift/div is FORCED
+          # to overwrite one of this aggregate's ABI target registers (x86 cl/rdx).
+          # Park the whole aggregate: reserve one callee-saved survivor per word; the
+          # emitter marshals into the survivors and binds `(arg pN [k])` from them at
+          # the end of the prepare block, once every clobbering argument is done.
+          var exposed = false
+          for k in 0 ..< pl.words:
+            if b.md.gprAt(pl, k) in laterClob[argIdx+1]: exposed = true
+          if exposed:
+            var parked: seq[Reg] = @[]
+            for k in 0 ..< pl.words:
+              let h = b.reserveHeldScratch("a clobber-exposed aggregate call argument")
+              heldArgs.add h                    # live until the call marshals them
+              let (hr, _) = heldRef(h)
+              parked.add hr
+            if b.ra.aux.hasKey(argPos):
+              b.ra.aux[argPos].parkRegs = parked
+            else:
+              b.ra.aux[argPos] = ExprAux(parkRegs: parked)
+        else:
           # A stack-passed arg means this proc reserves an outgoing-argument area in its
           # frame (the fixed-frame model — nifasm's scanStackArgArea), so it needs the
           # frame `sub sp`. Flag it like a stack local.
@@ -1146,15 +1116,13 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
             b.ra.aux[argPos].scratch.add addrReg
           else:
             b.ra.aux[argPos] = ExprAux(scratch: @[addrReg])
-        if fits: intIdx += gprWords
-      elif argSlot.cls == AFloat:               # float argument → xmm{fIdx}
-        if fIdx >= b.md.floatArgRegs.len:
+      elif argSlot.cls == AFloat:               # float argument → xmm{fpIndex}
+        if pl.onStack:
           raiseAssert "arkham: more than 8 float call arguments (stack-passed TODO)"
-        var ad = fregLoc(b.md.floatArgRegs[fIdx], floatSlot(64))
+        var ad = fregLoc(b.md.floatArgRegs[pl.fpIndex], floatSlot(64))
         allocFValue(b, n, ad)
-        inc fIdx
-      elif intIdx < b.md.intArgRegs.len:        # integer/pointer argument → rdi…r9
-        let abiReg = b.md.intArgRegs[intIdx]
+      elif not pl.onStack:                      # integer/pointer argument → rdi…r9
+        let abiReg = b.md.gprAt(pl)
         var ad =
           if abiReg in laterClob[argIdx+1]:
             # A later argument is FORCED to write this ABI register (x86 pins `cl`
@@ -1167,7 +1135,6 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
             regLoc(abiReg, ScalarSlot)
         if ad.kind == InReg and ad.r != abiReg: heldArgs.add ad
         allocValue(b, n, ad)
-        inc intIdx
       else:
         # 7th+ integer arg → caller stack. Compute into a scratch register; the
         # emitter stores it to the outgoing slot `(mem (rsp) (arg pN))`. The temp is
@@ -1178,7 +1145,6 @@ proc allocCall(b: var Builder; n: var Cursor; dest: var Location; hiddenPtr = fa
         var ad = needsReg(ScalarSlot)
         allocValue(b, n, ad)
         b.releaseTmp(ad)
-        inc intIdx
       inc argIdx
     for h in heldArgs: b.releaseTmp(h)         # parked args: dead once the call marshals them
     if indirect: b.releaseTmp(fnptrTd)         # the held fn-ptr target reg, dead after the call
@@ -2423,45 +2389,6 @@ proc walk(b: var Builder; n: var Cursor) =
     else:
       inc n
 
-proc countIntArgRegsUsed(b: Builder; params: Cursor): int =
-  ## Exclusive end of the `intArgRegs` slice that holds *incoming* ABI values for
-  ## this proc (`intArgRegs[0 ..< result]`). Caller-save param homes must not land
-  ## in `intArgRegs[j]` for `j` still in that slice ahead of the param being
-  ## settled — `emitParamMoves` goes in declaration order, so an early
-  ## `mov x6, x0` would wipe param 6's value before it is copied out.
-  ## Mirrors `allocParams`' intIdx advances (capped at `intArgRegs.len`).
-  var intIdx = if b.retIndirect and b.md.arch == X86: 1 else: 0
-  var p = params
-  if p.kind != TagLit: return min(intIdx, b.md.intArgRegs.len)
-  p.into:
-    while p.hasMore:
-      p.into:
-        inc p; skip p                          # name, pragmas
-        let slot = slotOf(b.prog[], p); skip p
-        var aggrSmall = false
-        var aggrStack = false
-        var aggrWords = 0
-        if slot.kind == AMem:
-          let sz = slot.size
-          if sz >= 1 and sz <= b.md.aggrByRefThreshold:
-            aggrWords = (sz + 7) div 8
-            if intIdx + aggrWords <= b.md.intArgRegs.len: aggrSmall = true
-            else: aggrStack = true
-          # else: by-ref — one pointer reg (handled below)
-        if aggrSmall or (aggrStack and b.md.arch == X86):
-          if aggrSmall: intIdx += aggrWords
-        elif slot.isFloat:
-          discard                              # SIMD arg regs — not intArgRegs
-        elif not slot.inRegClass and slot.kind != AMem:
-          discard
-        elif intIdx < b.md.intArgRegs.len and not aggrStack:
-          inc intIdx                           # one int/pointer/by-ref arg reg
-        else:
-          # Stack-passed (9th+ scalar/by-ref, or a64 stack-passed by-value aggr).
-          # Scalar/by-ref still bump intIdx in allocParams; cap below.
-          if not aggrStack: inc intIdx
-  result = min(intIdx, b.md.intArgRegs.len)
-
 proc incomingArgIdxOf(md: MachineDesc; r: Reg): int =
   ## Index of `r` in `intArgRegs`, or -1 if it is not an ABI arg register.
   for i, ar in md.intArgRegs:
@@ -2470,13 +2397,20 @@ proc incomingArgIdxOf(md: MachineDesc; r: Reg): int =
 
 proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
   if params.kind != TagLit: return
+  # THE plan: every register/stack decision below reads it — no local counting.
   # On x86-64 a >16B by-ref aggregate return takes the first integer arg register
-  # (rdi) as the hidden result pointer, so real params start at rsi — skip GPR 0
-  # to stay in lockstep with the signature / emitParamMoves / emitStackParamLoads.
-  # AArch64 passes the hidden pointer in x8 (off the arg-register file), so no skip.
-  var intIdx = if b.retIndirect and b.md.arch == X86: 1 else: 0
-  var fidx = 0
-  let intArgsUsed = countIntArgRegsUsed(b, params)
+  # (rdi) as the hidden result pointer, so real params start at rsi — in lockstep
+  # with the signature / emitParamMoves / emitStackParamLoads. AArch64 passes the
+  # hidden pointer in x8 (off the arg-register file), so no skip.
+  let plan = planCall(b.md, paramSlots(b.prog[], params),
+                      retByRef = b.retIndirect and b.md.arch == X86)
+  # Exclusive end of the `intArgRegs` slice holding *incoming* ABI values.
+  # Caller-save param homes must not land in `intArgRegs[j]` for `j` still in
+  # that slice ahead of the param being settled — `emitParamMoves` goes in
+  # declaration order, so an early `mov x6, x0` would wipe param 6's value
+  # before it is copied out.
+  let intArgsUsed = plan.gpUsed
+  var pIdx = 0
   # Scalar cross-call register params (1..6) that took a callee-saved home, in
   # allocation order. A stack-passed param (7th+) MUST have a register home — it
   # is loaded from the incoming stack slot in the prologue before rsp is lowered,
@@ -2487,34 +2421,27 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
   var spillableRegParams: seq[tuple[pos: int; name: string; r: Reg; effSlot: AsmSlot]] = @[]
   params.into:
     while params.hasMore:
+      let pl = plan.args[pIdx]
+      inc pIdx
       params.into:
         let pos = b.posOf(params)
         assert params.kind == SymbolDef
         let name = symName(params); inc params
         skip params                          # pragmas
         let slot = slotOf(b.prog[], params); skip params  # type (resolves named)
-        # Classify an aggregate param (matching `classifyParamsX64` / `emitParamMoves`):
+        # An aggregate param, per the plan:
         #  * ≤16B by-value that FITS the remaining arg registers → REGISTER-passed
         #    (`aggrSmall`): a `(s)` stack home filled from its GPR word(s), consuming
-        #    `aggrWords` arg registers.
+        #    `pl.words` arg registers.
         #  * ≤16B by-value that does NOT fit → STACK-passed (`aggrStack`): the bytes arrive
         #    in the incoming stack-arg area (copied into the `(s)` home by
         #    `emitStackParamLoadsX64`), consuming NO arg register — the SysV skip rule, so a
         #    later smaller param may still take a free GPR. Same home shape as `aggrSmall`.
         #  * >16B → by-REFERENCE (`aggrByRef`): a pointer (in a reg, or on the stack if none
         #    is free), like a scalar.
-        var aggrSmall = false
-        var aggrStack = false
-        var aggrByRef = false
-        var aggrWords = 0
-        if slot.kind == AMem:
-          let sz = slot.size                  # filled by slotOf (named or inline)
-          if sz >= 1 and sz <= b.md.aggrByRefThreshold:
-            aggrWords = (sz + 7) div 8
-            if intIdx + aggrWords <= b.md.intArgRegs.len: aggrSmall = true   # register-passed
-            else: aggrStack = true                                          # stack-passed (0 GPRs)
-          else:
-            aggrByRef = true
+        let aggrSmall = pl.isAgg and not pl.byRef and not pl.onStack
+        let aggrStack = pl.isAgg and not pl.byRef and pl.onStack
+        let aggrByRef = pl.isAgg and pl.byRef
         if aggrSmall or (aggrStack and b.md.arch == X86):
           # (No early `continue`/`return`: that skips the `into` epilogue.) These home the
           # aggregate in its own `(s)` slot; only a register-passed one consumes GPRs.
@@ -2525,7 +2452,6 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
           # with `Lea` and the body reads fields through it — no copy.
           b.record(pos, name, namedStackLoc(name, slot))
           b.ra.hasStackVars = true
-          if aggrSmall: intIdx += aggrWords
         else:
           # `effSlot` is the in-register value: the scalar itself, or a pointer — to
           # the aggregate copy (by-ref), or to the incoming stack bytes (a64 stack-passed
@@ -2534,12 +2460,11 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
           let props = b.an.vars.getOrDefault(name).props
           var loc: Location
           if effSlot.isFloat:
-            # A float parameter arrives in v{fidx}. In a leaf proc it stays
+            # A float parameter arrives in v{fpIndex}. In a leaf proc it stays
             # there; if the proc makes calls it moves to a callee-saved register
             # (v8–v15) so it survives them; if address-taken it spills to a slot.
-            # Either way the incoming register is consumed, so `fidx` advances in
-            # lockstep with emitParamMoves (the >8-float case is still TODO).
-            if fidx < b.md.floatArgRegs.len:
+            # (The >8-float / stack-passed case is still TODO.)
+            if not pl.onStack:
               if AddrTaken in props:
                 loc = b.spill(effSlot)           # address taken → must be on the stack
               elif hasCall:
@@ -2550,17 +2475,16 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
                 else:
                   loc = b.spill(effSlot)
               else:
-                loc = fregLoc(b.md.floatArgRegs[fidx], effSlot)
-              inc fidx
+                loc = fregLoc(b.md.floatArgRegs[pl.fpIndex], effSlot)
             else:
               loc = b.spill(effSlot)             # >8 float args: stack-passed (TODO)
           elif not effSlot.inRegClass:
             loc = b.spill(effSlot)
-          elif intIdx < b.md.intArgRegs.len and not aggrStack:
+          elif not pl.onStack:
             # (`aggrStack` is stack-passed by definition — never register-home it,
             # even if an arg register looks free: AAPCS64 stopped filling registers
             # once this composite spilled to the stack.)
-            let arg = b.md.intArgRegs[intIdx]
+            let arg = b.md.gprAt(pl)
             # A leaf param would normally stay in its arg register, but if that
             # register is a fixed-instruction scratch the body clobbers (rdx for
             # div/mod, rcx for a variable shift), it must move to a callee-saved
@@ -2607,7 +2531,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
                 var candidates = csHomes
                 for r in csHomes:
                   let ai = incomingArgIdxOf(b.md, r)
-                  if ai >= 0 and ai > intIdx and ai < intArgsUsed:
+                  if ai >= 0 and ai > pl.gpFirst and ai < intArgsUsed:
                     candidates.excl r          # still live as a later incoming arg
                 let r = b.takeReg(b.freeVol, candidates)
                 if r != NoReg:
@@ -2654,7 +2578,6 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
             else:
               loc = regLoc(arg, effSlot)       # leaf proc: stay in the arg reg
               b.freeVol.excl arg               # persistent home → not lendable to a call-free local
-            inc intIdx
           else:
             # The 9th integer/pointer parameter onward arrives on the caller's
             # stack (AAPCS64). arkham gives it a callee-saved register home that
@@ -2682,11 +2605,6 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
             else:
               b.ra.usedCallee.incl r
               loc = regLoc(r, effSlot)
-            # A stack-passed by-value aggregate (`aggrStack`) consumed NO arg register,
-            # so leave `intIdx` where it is — in lockstep with `emitParamMoves` /
-            # `emitStackParamLoads`, which never advance their arg index for a
-            # stack-passed param. (Scalar / by-ref stack params still bump it.)
-            if not aggrStack: inc intIdx
           if loc.kind == OnStack and slot.kind != AMem:
             # An address-taken scalar param (integer or float): a nifasm `(s)`
             # slot the prologue fills from the incoming arg register (int or SIMD;
@@ -2839,20 +2757,9 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
     # base would be `NoReg` (a `(mem (<noreg>) …)` stack-param load). We only need to
     # GUARANTEE one stays free; which one is the emitter's choice (any unused callee-saved).
     block:
-      var pc = n                             # at the params slot
-      var slots: seq[AsmSlot] = @[]
-      if pc.kind == TagLit:
-        pc.into:
-          while pc.hasMore:
-            pc.into:
-              inc pc; skip pc                # name, pragmas
-              slots.add slotOf(b.prog[], pc)
-              while pc.hasMore: skip pc
-      var anyStack = false
-      for pl in classifyParamsX64(b.md, slots, b.retIndirect):
-        if pl.onStack: (anyStack = true; break)
-      b.ra.hasStackParams = anyStack           # single source of truth for the emitter
-      if anyStack:
+      let plan = planCall(b.md, paramSlots(b.prog[], n), b.retIndirect)
+      b.ra.hasStackParams = plan.hasStackArgs  # single source of truth for the emitter
+      if plan.hasStackArgs:
         # Reserve a callee-saved reg the body cannot use, for the emitter's
         # `stackArgBaseReg`. Skip any SEALED reg (e.g. `RBX` presealed for a >16B-return
         # hidden pointer) — excluding that one reserves nothing extra, leaving the base
