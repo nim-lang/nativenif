@@ -2917,6 +2917,15 @@ proc produceIntoMem2(g: var CodeGen; c: Cursor; pos: int; dst: Location) =
   g.storeReg2(dst, s)
   g.unbindTemp(s)
 
+proc placeFoldedImm(g: var CodeGen; dst: Location; v: int64) =
+  ## A constant-folded expression node (`constFold` hit — the allocator resolved
+  ## it like a literal leaf): nothing to compute. Materialize the immediate only
+  ## when the destination is a register; an `Imm` destination is read by the
+  ## consumer directly, exactly like a literal.
+  if dst.kind == InReg:
+    if dst.isTemp: g.bindTemp(dst.r, dst.typ)
+    g.movImm(dst.r, v)
+
 proc emitValue2(g: var CodeGen; c: Cursor) =
   ## Materialize `c`'s value at its precomputed `locs[pos]`.
   let pos = g.posOf(c)
@@ -2998,8 +3007,18 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
       g.emAdr(dst.r, nm)
   of TagLit:
     case c.exprKind
-    of AddC, SubC, MulC, DivC, BitandC, BitorC, BitxorC, ShlC, ShrC: g.emitBin2(c)
-    of ModC: g.emitMod2(c)
+    of AddC, SubC, MulC, DivC, BitandC, BitorC, BitxorC, ShlC, ShrC:
+      # Constant-folded node (the allocator resolved it to a literal — same pure
+      # `constFold`, so the two decisions cannot diverge): no operand walk, no op.
+      let (isConst, cval) =
+        (if pos != g.noFoldPos: g.tryConstFold(c) else: (false, 0'i64))
+      if isConst: g.placeFoldedImm(dst, cval)
+      else: g.emitBin2(c)
+    of ModC:
+      let (isConst, cval) =
+        (if pos != g.noFoldPos: g.tryConstFold(c) else: (false, 0'i64))
+      if isConst: g.placeFoldedImm(dst, cval)
+      else: g.emitMod2(c)
     of EqC, NeqC, LtC, LeC, AndC, OrC, NotC: g.emitCondValue2(c)
     of DerefC, DotC, AtC, PatC: g.emitMemLoad2(c)
     of AddrC, HaddrC: g.emitAddr2(c)
@@ -3008,6 +3027,12 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
       g.emitCall2(c)
     of InstrC: g.emitInstr2(c)
     of NegC, BitnotC:
+      block:
+        let (isConst, cval) =
+          (if pos != g.noFoldPos: g.tryConstFold(c) else: (false, 0'i64))
+        if isConst:
+          g.placeFoldedImm(dst, cval)
+          return
       var inner: Cursor
       block:
         var cc = c
@@ -4279,6 +4304,7 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   g.computeFrame(an.hasCall or (info.isEntry and g.hasGlobalInits))
   let declarative = isDeclarativeAbi(g.prog, info.decl)
   g.rb.resetProc(); g.aliasToDecl.clear(); g.savedHomes.clear()
+  g.noFoldPos = -1
   g.emitProcBody2(info, declarative)
 
 # MODEL: the `StartEmit` per-proc reset in proofs/arkham_bindings.tla. The two-pass seam

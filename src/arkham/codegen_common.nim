@@ -55,6 +55,14 @@ type
                                               ## base (rsp after pushes), captured before the frame
                                               ## `sub`s so stack params survive rsp moving; else NoReg
     labelCount*: int                         ## fresh-label counter
+    noFoldPos*: int                          ## token pos of a `keepovf`'s op node: it must
+                                             ## EMIT even when constant-foldable, because the
+                                             ## `(ovf)` test that follows reads the hardware
+                                             ## flag that very instruction sets. -1 = none.
+                                             ## Set by genStmt2's KeepovfS around its store,
+                                             ## mirrored by the allocator's walk (same rule,
+                                             ## same position). Checked wherever a fold would
+                                             ## replace the op with an immediate.
     binNormSuppressPos*: int                 ## token pos of the ONE bin-arith node whose
                                              ## canonical sub-width `shl;sar` re-normalization is
                                              ## dead because its result feeds a truncating store of
@@ -310,45 +318,15 @@ proc declType*(g: var CodeGen; typeCur, valueCur: Cursor): Cursor =
 
 proc tryConstFold*(g: var CodeGen; c: Cursor): (bool, int64) =
   ## Evaluate a compile-time-constant INTEGER expression to its value WITHOUT
-  ## advancing the cursor or emitting anything: a literal, `sizeof`/`alignof`, or
-  ## any `+ - * and or xor shl` over such (recursively). The caller materializes
-  ## the result as a single lazy `Imm` Location — one immediate, foldable into the
-  ## consuming `cmp`/`add`/… — instead of the runtime mov/sub sequence a tree-walk
-  ## would emit (e.g. `SmallChunkSize - sizeof(SmallChunk)` → `0xFC0`, not a
-  ## load-load-subtract). Returns (false, 0) for anything not a pure int constant.
-  case c.kind
-  of IntLit:  return (true, intVal(c))
-  of UIntLit: return (true, cast[int64](uintVal(c)))
-  of CharLit: return (true, int64(ord(charLit(c))))
-  of TagLit:
-    case c.exprKind
-    of TrueC:        return (true, 1)
-    of FalseC, NilC: return (true, 0)
-    of SufC, ParC:                               # `(suf v "type")` / `(par v)`
-      var t = c; inc t
-      return g.tryConstFold(t)
-    of SizeofC:
-      var t = c; inc t
-      return (true, typeSizeAlign(g.prog, t)[0].int64)
-    of AlignofC:
-      var t = c; inc t
-      return (true, typeSizeAlign(g.prog, t)[1].int64)
-    of AddC, SubC, MulC, BitandC, BitorC, BitxorC, ShlC:
-      var t = c; inc t; skip t                   # past the result type → operand a
-      let (okA, va) = g.tryConstFold(t); skip t  # → operand b
-      let (okB, vb) = g.tryConstFold(t)
-      if not (okA and okB): return (false, 0)
-      case c.exprKind
-      of AddC:    return (true, va + vb)
-      of SubC:    return (true, va - vb)
-      of MulC:    return (true, va * vb)
-      of BitandC: return (true, va and vb)
-      of BitorC:  return (true, va or vb)
-      of BitxorC: return (true, va xor vb)
-      of ShlC:    return (true, (if vb >= 0 and vb < 64: va shl vb else: 0))
-      else:       return (false, 0)
-    else: return (false, 0)
-  else: return (false, 0)
+  ## advancing the cursor or emitting anything. Delegates to `constFold`
+  ## (programs.nim) — the ONE width-masked evaluator the allocator and both
+  ## emitters consult, so a fold decision is a pure function of the subtree and
+  ## the passes cannot disagree about it. The caller materializes the result as
+  ## a single `Imm` Location — one immediate, foldable into the consuming
+  ## `cmp`/`add`/… — instead of the runtime mov/sub sequence a tree-walk would
+  ## emit (e.g. `SmallChunkSize - sizeof(SmallChunk)` → `0xFC0`, not a
+  ## load-load-subtract).
+  constFold(g.prog, c)
 
 proc isFloatExpr*(g: var CodeGen; c: Cursor): bool =
   ## Whether `c` has floating-point type (so it flows through the SIMD path).

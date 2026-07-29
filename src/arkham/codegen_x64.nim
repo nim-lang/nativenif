@@ -3072,6 +3072,15 @@ proc produceIntoMem2(g: var CodeGen; c: Cursor; pos: int; dst: Location) =
   g.emitStoreLoc(dst, s)                 # spill the produced value to its `(s)` slot
   g.giveBack s                           # unbind the staging name
 
+proc placeFoldedImm(g: var CodeGen; dst: Location; v: int64) =
+  ## A constant-folded expression node (`constFold` hit — the allocator resolved
+  ## it like a literal leaf): nothing to compute. Materialize the immediate only
+  ## when the destination is a register; an `Imm` destination is read by the
+  ## consumer directly, exactly like a literal.
+  if dst.kind == InReg:
+    if dst.isTemp: g.bindTemp(dst.r, dst.typ)
+    g.movImm(dst.r, v)
+
 proc emitValue2(g: var CodeGen; c: Cursor) =
   ## Ensure `c`'s value is materialized at its precomputed `locs[pos]`. A leaf whose
   ## location is a register is moved there (the allocator placed it via destination-
@@ -3144,8 +3153,18 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
       g.ab.tree LeaX64: (g.emReg dst.r; g.ab.sym nm)
   of TagLit:
     case c.exprKind
-    of AddC, SubC, MulC, BitandC, BitorC, BitxorC, ShlC, ShrC: g.emitBin2(c)
-    of DivC, ModC: g.emitDivMod2(c)
+    of AddC, SubC, MulC, BitandC, BitorC, BitxorC, ShlC, ShrC:
+      # Constant-folded node (the allocator resolved it to a literal — same pure
+      # `constFold`, so the two decisions cannot diverge): no operand walk, no op.
+      let (isConst, cval) =
+        (if pos != g.noFoldPos: g.tryConstFold(c) else: (false, 0'i64))
+      if isConst: g.placeFoldedImm(dst, cval)
+      else: g.emitBin2(c)
+    of DivC, ModC:
+      let (isConst, cval) =
+        (if pos != g.noFoldPos: g.tryConstFold(c) else: (false, 0'i64))
+      if isConst: g.placeFoldedImm(dst, cval)
+      else: g.emitDivMod2(c)
     of EqC, NeqC, LtC, LeC, AndC, OrC, NotC: g.emitCondValue2(c)
     of DerefC, DotC, AtC, PatC: g.emitMemLoad2(c)
     of AddrC, HaddrC: g.emitAddr2(c)
@@ -3153,6 +3172,12 @@ proc emitValue2(g: var CodeGen; c: Cursor) =
     of CallC: g.emitCall2(c)
     of InstrC: g.emitInstr2(c)
     of NegC, BitnotC:                                   # unary in-place: operand in res, then op
+      block:
+        let (isConst, cval) =
+          (if pos != g.noFoldPos: g.tryConstFold(c) else: (false, 0'i64))
+        if isConst:
+          g.placeFoldedImm(dst, cval)
+          return
       var inner: Cursor
       block:
         var cc = c
@@ -5434,6 +5459,9 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
     cc.into:
       let kPos = cursorToPosition(g.buf[], c)
       var opCur = cc                                        # the (op …) value
+      # The `(ovf)` that follows reads the flag THIS op sets: emit it even when
+      # constant-foldable (the allocator suppressed the fold at this position too).
+      g.noFoldPos = cursorToPosition(g.buf[], opCur)
       block:
         var opTy = opCur; inc opTy                          # past the op tag → its result type
         g.ovfSigned = isSignedType(opTy)
@@ -5456,6 +5484,7 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
       else:
         let lhsCur = cc; skip cc
         g.genStore2(opCur, memLoc(lhsCur, ScalarSlot), kPos)
+      g.noFoldPos = -1
       while cc.hasMore: skip cc
   else: raiseAssert "arkham x64n: genStmt2 " & $c.stmtKind
 
@@ -6293,6 +6322,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.argResidentParams.setLen 0; g.argResidentFlushed = false
   g.savedHomes.clear()
   g.lvalStride.clear()
+  g.noFoldPos = -1
   g.curProcName = info.asmName
   when defined(arkhamDbgProc):
     block:

@@ -157,6 +157,9 @@ type
                                       ## allocate an inline `(ret (oconstr …))` value
     atScratch: HashSet[int]           ## value-core: `(at …)` positions needing a scratch GPR
                                       ## (non-SIB element stride); sized by the codegen
+    noFoldPos: int                    ## a `keepovf` op node's position: must not constant-
+                                      ## fold (its `(ovf)` reads the op's hardware flag).
+                                      ## Mirrors CodeGen.noFoldPos; -1 = none
     returnedVar: string               ## name of the local the proc returns via `(ret <sym>)`
                                       ## (empty if none / multiple / non-symbol return). A
                                       ## call-free such local prefers the return register as
@@ -378,6 +381,9 @@ proc trySteal(b: var Builder; curName: string; curSlot: AsmSlot;
   # evict the victim to its stack slot; current takes its register
   let bestReg = b.ra.locs[b.ra.symPos[bestV]].r
   b.demoteToStack(bestV)
+  when defined(arkhamHomeTrace):
+    stderr.writeLine "HOMETRACE steal proc=" & gArkhamCurProc & " thief=" & curName &
+      " victim=" & bestV & " exprMode=" & $b.allocExprs
   if bestReg in b.md.intCalleeSavedSet: b.ra.usedCallee.incl bestReg
   result = regLoc(bestReg, curSlot)
 
@@ -423,6 +429,8 @@ proc reserveTmp(b: var Builder; slot: AsmSlot): Location =
       b.ra.spillTemps.add (name: nm, typ: slot, isFloat: false)
       return namedStackLoc(nm, slot, spillTemp = true)
     if r in b.md.intCalleeSavedSet: b.ra.usedCallee.incl r
+    when defined(arkhamHomeTrace):
+      stderr.writeLine "HOMETRACE tmp-callee proc=" & gArkhamCurProc & " reg=r" & $ord(r)
   result = regLoc(r, slot, isTemp = true)
 
 proc releaseTmp(b: var Builder; loc: Location) {.inline.} =
@@ -469,6 +477,9 @@ proc reserveHeldScratch(b: var Builder; what: string; canSpill = false): Locatio
     raiseAssert "arkham: out of registers for " & what & " (nothing to spill)"
   r = b.ra.locs[b.ra.symPos[victim]].r
   b.demoteToStack(victim)
+  when defined(arkhamHomeTrace):
+    stderr.writeLine "HOMETRACE held-demote proc=" & gArkhamCurProc &
+      " victim=" & victim & " what=" & what
   b.ra.usedCallee.incl r
   result = regLoc(r, ScalarSlot, isTemp = true)
 
@@ -491,6 +502,8 @@ proc reserveFTmp(b: var Builder; slot: AsmSlot): Location =
       b.ra.spillTemps.add (name: nm, typ: slot, isFloat: true)
       return namedStackLoc(nm, slot, spillTemp = true)
     if f in b.md.floatCalleeSavedSet: b.ra.usedCalleeF.incl f
+    when defined(arkhamHomeTrace):
+      stderr.writeLine "HOMETRACE tmp-callee proc=" & gArkhamCurProc & " reg=f" & $ord(f)
   result = fregLoc(f, slot, isTemp = true)
 
 proc releaseFTmp(b: var Builder; loc: Location) {.inline.} =
@@ -1631,8 +1644,26 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
   of TagLit:
     case n.exprKind
     of AddC, SubC, MulC, BitandC, BitorC, BitxorC, ShlC, ShrC:
+      # Both operands threaded to immediates ⇒ the node IS an immediate: resolve
+      # it like a literal leaf (Imm stays Imm and folds into the consumer; a
+      # fixed/NeedsReg dest gets a plain `mov reg, imm`). No temps, no operand
+      # walk. `constFold` is the one width-masked evaluator the emitter re-derives
+      # from, so the passes agree by construction. sizeof/alignof are already Imm
+      # leaves to it, which is what folds hexer's `sizeof(A)+sizeof(B)` output.
+      if pos != b.noFoldPos:
+        let (isConst, cval) = constFold(b.prog[], n)
+        if isConst:
+          b.resolveDest(dest, immLoc(cval, ScalarSlot)); skip n
+          b.ra.locs[pos] = dest
+          return
       allocBin(b, n, dest); return           # records locs[pos] itself
     of DivC, ModC:
+      if pos != b.noFoldPos:                 # constant divisor AND dividend: fold whole node
+        let (isConst, cval) = constFold(b.prog[], n)
+        if isConst:
+          b.resolveDest(dest, immLoc(cval, ScalarSlot)); skip n
+          b.ra.locs[pos] = dest
+          return
       if b.md.divRemReg == NoReg:
         allocDivModRisc(b, n, dest); return  # RISC: plain ALU, no fixed regs
       allocDivMod(b, n, dest); return        # records locs[pos] itself
@@ -1762,6 +1793,12 @@ proc allocValue(b: var Builder; n: var Cursor; dest: var Location) =
     of InstrC:
       allocInstr(b, n, dest); return         # records locs[pos] itself
     of NegC, BitnotC:
+      if pos != b.noFoldPos:                 # constant operand: the node is an immediate
+        let (isConst, cval) = constFold(b.prog[], n)
+        if isConst:
+          b.resolveDest(dest, immLoc(cval, ScalarSlot)); skip n
+          b.ra.locs[pos] = dest
+          return
       # Unary in-place op (`(neg T x)` / `(bitnot T x)`): the operand computes into the
       # result register; the emitter applies neg/not in place.
       b.forceRegDest(dest)
@@ -2260,6 +2297,9 @@ proc walk(b: var Builder; n: var Cursor) =
       let kPos = b.posOf(n)
       n.into:
         var opCur = n                          # the (op …) value
+        # The `(ovf)` that follows reads the hardware flag THIS op sets — the op
+        # must emit even when both operands are constants (no Imm fold).
+        b.noFoldPos = b.posOf(opCur)
         # (a64 mul-overflow now reads the product's high half via `smulh`/`umulh`,
         # so it needs no `(s)` snapshot slot — no `hasStackVars` reservation here.)
         skip n                                 # advance to dest
@@ -2269,6 +2309,7 @@ proc walk(b: var Builder; n: var Cursor) =
         else:
           let lhsCur = n; skip n
           allocStore(b, opCur, memLoc(lhsCur, ScalarSlot), kPos)
+        b.noFoldPos = -1
         while n.hasMore: skip n
     else:
       n.into:
@@ -2565,6 +2606,23 @@ proc findReturnedVar(body: Cursor): string =
   var c = body
   findReturnedVarImpl(c)
 
+when defined(arkhamHomeTrace):
+  proc homeStr(loc: Location): string =
+    ## Arch-neutral rendering for the home-divergence trace (compared within
+    ## one arch, so raw ordinals suffice).
+    case loc.kind
+    of InReg: "r" & $ord(loc.r)
+    of InFReg: "f" & $ord(loc.f)
+    of NamedStack: "stack"
+    else: $loc.kind
+
+  proc sameHome(a, s: Location): bool =
+    if a.kind != s.kind: return false
+    case a.kind
+    of InReg: a.r == s.r
+    of InFReg: a.f == s.f
+    else: true
+
 proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
                    prog: var Program; md: MachineDesc; tc: TypeCtx;
                    presealed: set[Reg] = {}; allocExprs = false;
@@ -2591,7 +2649,7 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
   ## type may load a module. `atScratch` lists the `(at …)` positions needing a
   ## non-SIB stride scratch GPR.
   var b = Builder(buf: addr buf, an: addr an, prog: addr prog, tc: tc, md: md,
-                  atScratch: atScratch)
+                  atScratch: atScratch, noFoldPos: -1)
   b.allocExprs = allocExprs
   # `locs` only ever holds positions inside THIS proc's contiguous subtree span, so
   # size it to that span (base = the proc's first token position) rather than the whole
@@ -2659,6 +2717,29 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
       b.returnedVar = findReturnedVar(n)
     walk(b, n)                                # body
   b.closeScope()
+  when defined(arkhamHomeTrace):
+    if b.allocExprs:
+      # EXPERIMENT: re-run the allocator over the same proc with `allocExprs=false` —
+      # a decl-only walk with the identical homing policy (allocStorage, early-free,
+      # trySteal) but NO expression allocation. Any home divergence is exactly what
+      # the expression walk feeds back into local homing (held-scratch demotions,
+      # temps drawing callee-saved, case selectors held across decls).
+      let shadow = allocateProc(buf, procDecl, an, prog, md, tc, presealed,
+                                allocExprs = false)
+      var total, diverged = 0
+      for name, pos in b.ra.symPos:
+        if name in b.ra.aliasedCasts: continue
+        if name notin shadow.symPos: continue
+        let a = b.ra.locs[pos]
+        let s = shadow.locs[shadow.symPos[name]]
+        if a.kind notin {InReg, InFReg, NamedStack}: continue
+        inc total
+        if not sameHome(a, s):
+          inc diverged
+          stderr.writeLine "HOMETRACE diverge proc=" & gArkhamCurProc &
+            " var=" & name & " actual=" & homeStr(a) & " static=" & homeStr(s)
+      stderr.writeLine "HOMETRACE proc=" & gArkhamCurProc &
+        " vars=" & $total & " diverged=" & $diverged
   result = ensureMove b.ra
 
 # ── lookup API (used by codegen) ────────────────────────────────────────────
