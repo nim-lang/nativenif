@@ -1,0 +1,21 @@
+(.nif27)
+(.indexat 1                )
+(stmts
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (var :buf.0
+    (s)
+    (array
+     (i 64)2))
+   (mov
+    (rax)
+    (mem
+     (rsp)buf.0 16))
+   (mov
+    (rdi)0)
+   (mov
+    (rax)60)
+   (syscall))))(.index)

@@ -77,7 +77,7 @@ const
                                      # leaf-param home in one of these is excluded in `allocParams`;
                                      # `pickStagingScratch` already routes staging around a live
                                      # local/param home (`regHoldsLiveLocal`).
-    rescueHomeRegs: @[R8, R9],       # caller-save rescue homes only (see `rescueHomeRegs`);
+    rescueHomeRegs: @[R8, R9],       # caller-save rescue homes only (see `machinedesc`);
                                      # already reachable via intLocalTempRegs, listed here so
                                      # the rescue's candidate set is one named place.
     intCalleeSaved: @[RBX, R12, R13, R14, R15],

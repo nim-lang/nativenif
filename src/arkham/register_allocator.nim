@@ -194,6 +194,16 @@ proc takeReg(b: var Builder; pool: var set[Reg]; cands: openArray[Reg]): Reg =
       return r
   result = NoReg
 
+proc takeReg(b: var Builder; pool: var set[Reg]; cands: set[Reg]): Reg =
+  ## `takeReg` over an unordered candidate set: picks the lowest free, non-sealed
+  ## slot. For a candidate pool with no ABI preference order (`callerSaveHomeCandidates`)
+  ## the choice among equals is arbitrary anyway.
+  for r in cands:
+    if r in pool and r notin b.ra.sealed:
+      excl pool, r
+      return r
+  result = NoReg
+
 proc takeFReg(b: var Builder; pool: var set[FReg]; cands: openArray[FReg]): FReg =
   ## Take the first free SIMD register from `cands` out of `pool`.
   for f in cands:
@@ -206,7 +216,7 @@ proc spill(b: var Builder; slot: AsmSlot): Location =
   b.ra.frameSize += align(max(slot.size, 1), 8)
   result = stackLoc(-b.ra.frameSize, slot)
 
-proc callerSaveHomeCandidates(b: Builder): seq[Reg] =
+proc callerSaveHomeCandidates(b: Builder): set[Reg] =
   ## Registers eligible to HOME a value that is live across a REAL call.
   ##
   ## `design.md` ("How this deals with the ABI") handles the whole calling convention
@@ -222,12 +232,9 @@ proc callerSaveHomeCandidates(b: Builder): seq[Reg] =
   ## re-deriving the parallel-copy analysis the partition exists to avoid. So: no
   ## argument register may be a cross-call home. On both current targets that empties
   ## this pool and cross-call values go to callee-saved homes, as the design says.
-  result = @[]
-  for r in b.md.rescueHomeRegs:
-    var isArgReg = false
-    for ar in b.md.intArgRegs:
-      if ar == r: (isArgReg = true; break)
-    if not isArgReg: result.add r
+  result = {}
+  for r in b.md.rescueHomeRegs: result.incl r
+  for r in b.md.intArgRegs: result.excl r
 
 proc allocStorage(b: var Builder; slot: AsmSlot; props: VarProps): Location =
   ## Decide where one local/param lives. Records reg use for scope freeing.
@@ -2597,12 +2604,11 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
                 # param 6 arrives in x6 would clobber it (emitParamMoves is
                 # forward-order). Homing param 6 in its own x6, or using x6 when
                 # fewer than 7 int args exist, is fine.
-                var candidates: seq[Reg] = @[]
+                var candidates = csHomes
                 for r in csHomes:
                   let ai = incomingArgIdxOf(b.md, r)
                   if ai >= 0 and ai > intIdx and ai < intArgsUsed:
-                    continue                   # still live as a later incoming arg
-                  candidates.add r
+                    candidates.excl r          # still live as a later incoming arg
                 let r = b.takeReg(b.freeVol, candidates)
                 if r != NoReg:
                   loc = regLoc(r, effSlot)

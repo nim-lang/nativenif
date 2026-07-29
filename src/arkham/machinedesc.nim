@@ -67,7 +67,7 @@ type
                                      ## spilled hot var re-homed here and bracketed with an
                                      ## explicit save/restore around each crossed call).
                                      ## x86-64 = @[R8, R9]; AArch64 = @[R6, R7]. They are
-                                     ## argument registers, so `callerSaveHomeRegs` filters
+                                     ## argument registers, so `callerSaveHomeCandidates` filters
                                      ## them right back out — see the note there and
                                      ## `design.md`: no argument register may host a value
                                      ## that is live across a call.

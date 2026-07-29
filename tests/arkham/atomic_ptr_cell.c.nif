@@ -1,0 +1,112 @@
+(.nif27)
+(.indexat 1                )
+(stmts
+ (type :Node.0 .
+  (object .
+   (fld :val.0 .
+    (i 64))))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :asn.0
+  (params
+   (param :p.0 .
+    (ptr
+     (ptr Node.0)))
+   (param :val.0 .
+    (ptr Node.0))
+   (param :mo.0 .
+    (i 32))).
+  (pragmas
+   (intrinsic "AtomicStore"))
+  (stmts .))
+ (proc :axc.0
+  (params
+   (param :p.0 .
+    (ptr
+     (ptr Node.0)))
+   (param :val.0 .
+    (ptr Node.0))
+   (param :mo.0 .
+    (i 32)))
+  (ptr Node.0)
+  (pragmas
+   (intrinsic "AtomicExchange"))
+  (stmts .))
+ (proc :acx.0
+  (params
+   (param :p.0 .
+    (ptr
+     (ptr Node.0)))
+   (param :ep.0 .
+    (ptr
+     (ptr Node.0)))
+   (param :des.0 .
+    (ptr Node.0))
+   (param :wk.0 .
+    (bool))
+   (param :so.0 .
+    (i 32))
+   (param :fo.0 .
+    (i 32)))
+  (bool)
+  (pragmas
+   (intrinsic "AtomicCompareExchange"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :n1.0 . Node.0 .)
+   (var :n2.0 . Node.0 .)
+   (asgn
+    (dot n1.0 val.0 0)10)
+   (asgn
+    (dot n2.0 val.0 0)20)
+   (var :head.0 .
+    (ptr Node.0).)
+   (var :expp.0 .
+    (ptr Node.0).)
+   (instr asn.0
+    (addr head.0)
+    (addr n1.0)0)
+   (var :old.0 .
+    (ptr Node.0)
+    (instr axc.0
+     (addr head.0)
+     (addr n2.0)0))
+   (asgn expp.0
+    (addr n2.0))
+   (var :ok.0 .
+    (bool)
+    (instr acx.0
+     (addr head.0)
+     (addr expp.0)
+     (addr n1.0)
+     (false)0 0))
+   (var :sum.0 .
+    (i 32)
+    (conv
+     (i 32)
+     (dot
+      (deref old.0)val.0 0)))
+   (if
+    (elif ok.0
+     (stmts
+      (asgn sum.0
+       (add
+        (i 32)sum.0 7)))))
+   (asgn sum.0
+    (add
+     (i 32)sum.0
+     (conv
+      (i 32)
+      (dot
+       (deref head.0)val.0 0))))
+   (call exit.c sum.0))))(.index)

@@ -34,6 +34,13 @@ type
       ## `(reg)` param has `viaRegs == false` and IS bound to its name.
 
   Type* = ref object
+    litVal*: int64
+      ## For `IntLitT`: the literal's VALUE. STORING a literal into a pointer is legal
+      ## only for `0`/`nil`, and that cannot be decided from the kind alone — so
+      ## `checkPtrStore` reads this. (COMPARING a pointer to a literal stays open to any
+      ## value: `cmp ptr, -1` is mmap's MAP_FAILED test, and a compare writes nothing,
+      ## so it cannot corrupt a binding.) Zero for every other kind, which is also the
+      ## safe default for any `IntLitT` built without it.
     case kind*: TypeKind
     of ErrorT, VoidT, BoolT, NilT: discard
     of IntT, UIntT, FloatT, IntLitT: bits*: int
@@ -221,19 +228,24 @@ proc compatible*(want, got: Type): bool =
     result = got.kind in {IntT, UIntT, IntLitT} and want.bits == got.bits
   of IntLitT:
     # Literal is compatible with IntT, UIntT, or another literal of same size, with
-    # bool (the `cmp boolReg, 0` test, operands either order), and with a pointer (the
-    # `cmp ptr, 0` / nil test — only the *literal* adapts; a sized int reg stays
-    # strictly incompatible with a pointer). See the PtrT/AptrT arm for the mirror.
+    # bool (the `cmp boolReg, 0` test, operands either order), and with a pointer — the
+    # `cmp ptr, 0` null test and the `cmp ptr, -1` sentinel test (mmap's MAP_FAILED).
+    # Only the *literal* adapts; a sized int reg stays strictly incompatible with a
+    # pointer. See the PtrT/AptrT arm for the mirror. NOTE this is a COMPARISON-grade
+    # rule: a literal may not be STORED into a pointer unless it is 0 or nil, which
+    # `checkPtrStore` enforces at the `mov` sites (a compare writes nothing, so it
+    # cannot corrupt a binding; a store can, and silently did — see `litVal`).
     result = (got.kind in {IntT, UIntT, IntLitT, BoolT} and (got.kind == BoolT or want.bits == got.bits)) or
              got.kind in {PtrT, AptrT}
   of FloatT:
     result = got.kind == want.kind and want.bits == got.bits
   of PtrT, AptrT:
     if got.kind in {IntLitT, NilT}:
-      # An integer LITERAL (in practice `0`) or an explicit `(nil)` is compatible with
-      # a pointer: the universal `cmp ptr, 0`/`cmp ptr, nil` null test, `mov ptr, nil`
-      # init. Only the literal/nil adapts — a SIZED int reg vs a pointer is still
-      # rejected (strict typing).
+      # An integer LITERAL or an explicit `(nil)` is compatible with a pointer: the
+      # `cmp ptr, 0`/`cmp ptr, nil` null test, the `cmp ptr, -1` MAP_FAILED sentinel,
+      # `mov ptr, nil` init. Only the literal/nil adapts — a SIZED int reg vs a pointer
+      # is still rejected (strict typing). STORES are narrower: see the `IntLitT` arm
+      # and `checkPtrStore`.
       result = true
     elif got.kind != want.kind:
       result = false

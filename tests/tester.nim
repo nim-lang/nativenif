@@ -352,6 +352,20 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/at_scratch_base_collision.ni
 execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_at_scratch_base_collision.nif", "stride scratch aliases the base register (X14)")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/at_base_index_collision.nif", "array base and index occupy the same register (R14)")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_at_base_index_collision.nif", "array base and index occupy the same register (X14)")
+# `(mem <base> <stackvar> <disp>)` addresses a word INSIDE a named slot with no address
+# register. A named slot knows its size, so an out-of-range offset is a hard error — the
+# one safety the `(cast (aptr T) <reg>)` form can never offer, and the reason the copy
+# tiering prefers the named form. `(cast T …)` is a legal destination only over MEMORY:
+# a register destination must stay a typed binding.
+# Storing a non-zero integer literal into a pointer-typed binding is what a code
+# generator's STALE REGISTER BINDING looks like (an ordinary value written under a dead
+# local's name). It used to assemble silently, so the whole class was invisible unless
+# the bad value reached an instruction with its own type rule. The fixture's preceding
+# `(mov p.0 0)` must still pass — nulling a pointer is legal, and `cmp ptr, -1`
+# (MAP_FAILED) stays legal too, because a COMPARE cannot corrupt a binding.
+execExpectFailure("nim c -r src/nifasm/nifasm tests/ptr_store_nonzero.nif", "cannot store the non-zero integer 32 into the pointer-typed destination")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/mem_slot_offset_range.nif", "offset 16 is outside stack slot 'buf.0' (16 bytes)")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/cast_dest_reg.nif", "Expected memory destination")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/missing_result_binding.nif", "Missing result binding: ret.0")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/stack_result_binding.nif", "Type mismatch: expected (stackoff")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/result_type_mismatch.nif", "Type mismatch:")

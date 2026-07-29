@@ -95,6 +95,20 @@ type
                                              ## value while a deep right-operand spills).
     indirectReg*: Reg                        ## callee-saved reg holding the x8 dest pointer
     varType*: Table[string, string]          ## aggregate var/param name → its type name
+    stackSlots*: HashSet[string]             ## names declared as a nifasm `(var :name (s) …)`
+                                             ## slot, hence addressable straight off rsp. Same
+                                             ## lifetime as `varType` (arkham symbol names are
+                                             ## module-unique, so it need not be per-proc; and a
+                                             ## stale hit would make nifasm reject an rsp-relative
+                                             ## reference to a non-stack symbol, never miscompile
+                                             ## it). The allocator's `NamedStack` locals are
+                                             ## only part of it: the emitter also synthesizes
+                                             ## slots (constructor temps, `nctmp…`) that no
+                                             ## `symPos` knows about, and `locationOfSym`
+                                             ## reports those as `Undef` — indistinguishable
+                                             ## from a module-level global, which is NOT
+                                             ## rsp-relative. A copy that wants the zero-register
+                                             ## `(mem (rsp) name off)` form must tell them apart.
     symType*: Table[string, Cursor]          ## local/param name → its Leng type cursor (for getType)
     regLocal*: Table[Reg, string]            ## reg → the named local currently bound to it
                                              ## (x64 named-locals: emit the name, not `(reg)`)
