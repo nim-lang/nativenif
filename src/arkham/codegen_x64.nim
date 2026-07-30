@@ -311,11 +311,8 @@ proc unbindLvalTemps2(g: var CodeGen; c: Cursor)
 
 # ── fused value core (step 3): decide-and-emit overloads ─────────────────────
 # These carry the destination as a threaded parameter (constraint in, resolved
-# location out) instead of reading the allocator's per-position plan. During
-# the conversion both worlds coexist — the old locs-reading procs above keep
-# running until genProc flips to `allocExprs=false`, at which point the old
-# overloads are deleted and every remaining unconverted call site becomes a
-# compile error.
+# location out); every register decision is made inline at the point of
+# emission.
 proc emitValue2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitDivMod2(g: var CodeGen; c: Cursor; dest: var Location)
@@ -1872,13 +1869,11 @@ proc genTvar(g: var CodeGen; name: string; decl: Cursor) =
     while c.hasMore: skip c
 
 
-# ── value-core: the PURE emitter (consumes precomputed locs/aux) ──────────────
-# Single-pass: the register allocator (allocExprs=true) has already assigned every
-# value position a Location in `g.ra.locs` (+ `aux`); this code only emits bytes,
-# making NO register decisions — so there is no plan/replay seam. See
-# `codegen2_design.md`. Every proc body is emitted through this path (`genProc` →
-# `emitProcBody2`); the old reactive emitter and the `procModeled2` gate it fed
-# have been deleted entirely.
+# ── value core: shared helpers of the fused emitter ──────────────────────────
+# Single-pass: every register decision is made inline at the point of emission
+# (dest threading); `g.ra` carries only the decl-only pre-pass (param/local
+# homes) plus the emitter-private `locs`/`aux` memo the fused lvalue walk
+# writes. Every proc body is emitted through `genProc` → `emitProcBody2`.
 
 proc emImm(g: var CodeGen; loc: Location) =
   ## Emit an immediate VALUE operand: `(nil)` for a null pointer, else the integer.
@@ -6640,16 +6635,13 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
       skip pc                                      # pragmas
       if pc.stmtKind == StmtsS: g.recordSymTypes(pc)
       while pc.hasMore: skip pc                    # drain (body + any trailing)
-  # THE FUSED PATH: the pre-pass allocates HOMES only (decl walk, allocExprs=false
-  # — validated static by the homing experiment); every expression decision is
-  # made inline by the fused emitters at the point of emission. No collectAtScratch:
-  # the x64 stride scratch comes from emit-time staging (takeLvalStride).
-  g.fusedMode = true
+  # The pre-pass allocates HOMES only (decl walk); every expression decision is
+  # made inline by the fused emitters at the point of emission. The x64 stride
+  # scratch comes from emit-time staging (takeLvalStride).
   g.pickedRegs = {}
   g.pickedFRegs = {}
   g.emitTmpSpills = 0
-  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64Machine, g.typeCtx, preseal,
-                      allocExprs = false)
+  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64Machine, g.typeCtx, preseal)
   when defined(arkhamTracePath):
     stderr.writeLine "[arkham] " & info.asmName & ": NEW"
   when defined(arkhamDumpLocs):

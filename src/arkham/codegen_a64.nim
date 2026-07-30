@@ -1224,15 +1224,14 @@ proc emitSignature(g: var CodeGen; decl: Cursor; declarative: bool) =
     for r in ConvClobbersGpr: g.ab.reg r     # a clobber *declaration*: raw reg locations
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Pure-emit value core (`*2`) — the AArch64 twin of codegen_x64.nim's emit*2
-#  family. The allocator (allocExprs=true, machine `aarch64MachineN`) precomputes
-#  a Location for EVERY value position into `ra.locs` plus per-op selection hints
-#  in `ra.aux`; these procs are pure consumers that read `locs[pos]`/`aux[pos]`
-#  and emit bytes — no emit-time borrow/steal/spill, no plan/replay. Transient
-#  scratch the emitter still needs (a folded memory operand a64 must load, a
-#  global address temp, a produce-into-memory spill) comes from the reserved
-#  staging bridges x14/x15/v31 (`IntBridgeRegs`/`FloatBridgeReg`), withheld from
-#  the allocator pool so one is always free.
+#  Fused value core (`*2`) — the AArch64 twin of codegen_x64.nim's emit*2
+#  family. The destination is threaded as a parameter (constraint in, resolved
+#  location out); every register decision is made inline at the point of
+#  emission (machine `aarch64MachineN`). Transient scratch the emitter needs
+#  (a folded memory operand a64 must load, a global address temp, a
+#  produce-into-memory spill) comes from the reserved staging bridges
+#  x14/x15/v31 (`IntBridgeRegs`/`FloatBridgeReg`), withheld from the pick
+#  pools so one is always free.
 # ════════════════════════════════════════════════════════════════════════════
 
 proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int)
@@ -4796,16 +4795,14 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
       skip pc; skip pc; skip pc
       if pc.stmtKind == StmtsS: g.recordSymTypes2(pc)
       while pc.hasMore: skip pc
-  # THE FUSED PATH: the pre-pass allocates HOMES only (decl walk, allocExprs=false);
-  # every expression decision is made inline by the fused emitters at the point of
-  # emission. No collectAtScratch2: the `(at base idx scratch)` stride scratch is a
-  # pick-time reservation inside the fused lvalue walk (emitLvalWalk → ra.aux memo).
-  g.fusedMode = true
+  # The pre-pass allocates HOMES only (decl walk); every expression decision is
+  # made inline by the fused emitters at the point of emission. The `(at base
+  # idx scratch)` stride scratch is a pick-time reservation inside the fused
+  # lvalue walk (emitLvalWalk → ra.aux memo).
   g.pickedRegs = {}
   g.pickedFRegs = {}
   g.emitTmpSpills = 0
-  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, aarch64MachineN, g.typeCtx, preseal,
-                      allocExprs = false)
+  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, aarch64MachineN, g.typeCtx, preseal)
   if g.retIndirect:
     g.indirectReg = R19
     g.ra.usedCallee.incl R19

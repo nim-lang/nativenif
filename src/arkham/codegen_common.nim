@@ -67,12 +67,6 @@ type
                                              ## nested pick can't steal a reserved accumulator.
                                              ## `freeVal` clears the flag on release.
     pickedFRegs*: set[FReg]                  ## the SIMD twin of `pickedRegs`
-    fusedMode*: bool                         ## step-3: this proc is emitted by the FUSED value
-                                             ## core (decisions at emission; `allocExprs=false`).
-                                             ## Shared helpers that must serve both worlds during
-                                             ## the transition (prematLval2's value
-                                             ## materialization, genStore2) branch on it; the
-                                             ## flag dies when both backends are fused.
     noFoldPos*: int                          ## token pos of a `keepovf`'s op node: it must
                                              ## EMIT even when constant-foldable, because the
                                              ## `(ovf)` test that follows reads the hardware
