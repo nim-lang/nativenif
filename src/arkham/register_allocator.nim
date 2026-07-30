@@ -470,6 +470,15 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
         loc = b.trySteal(name, slot, props, loc)  # hot var evicts a colder one
       if loc.kind == NamedStack:
         b.ra.hasStackVars = true
+      when defined(arkhamSSAStats):
+        if loc.kind == NamedStack and AddrTaken notin props and
+           slot.inRegClass and not slot.isFloat:
+          # a register-eligible scalar that ended in memory = a PRESSURE spill
+          let svi = b.an.vars.getOrDefault(name)
+          stderr.write "SSASPILL proc=" & gArkhamCurProc & " var=" & name &
+            " defs=" & $svi.defs & " uses=" & $svi.usages &
+            " init=" & $svi.initClass & " weight=" & $svi.weight &
+            " inloop=" & $svi.declInLoop & "\n"
       if aliasSrc.len > 0:
         b.ra.symPos[name] = b.ra.symPos[aliasSrc]   # c2 resolves to c1's LIVE home (no own reg)
         b.ra.aliasedCasts.incl name                 # emitter emits neither decl nor store for it

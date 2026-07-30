@@ -23,10 +23,14 @@
 ## Ported from `src/wip/native/analyser.nim` to the nifcore cursor API; keyed
 ## by symbol *name* (nifcore has no stable SymId for inline-short symbols).
 
-import std / [tables, sets, assertions]
+import std / [tables, sets, assertions, os, strutils]
 import nifcore
 import nifcdecl
 import slots
+
+let birthFilterEnv = getEnv("ARKHAM_BIRTH_FILTER")
+  ## debug bisection toggle: "" = birth-point exemption everywhere (normal);
+  ## "-" = disabled everywhere; else a comma-separated allowlist of proc names
 
 type
   VarInfo* = object
@@ -62,10 +66,32 @@ type
                                ## (ordinals may shift). Disqualifies `ArgResident`.
     paramIdx*: int             ## a register param's 0-based ABI index (arg-GPR ordinal) in
                                ## a clean-signature proc; -1 for locals and non-clean procs.
+    initClass*: InitClass      ## shape of the decl initializer (see `InitClass`)
+    initEndPos*: int           ## token position just PAST the decl initializer — the
+                               ## point where the var's value is BORN. A call inside
+                               ## the initializer (e.g. `let x = f(…)`) precedes the
+                               ## birth, so it cannot clobber the value; 0 when no
+                               ## initializer
     loopLo*, loopHi*: int      ## for `declInLoop` vars: span of the innermost enclosing
                                ## loop, used as the live interval instead of
                                ## `(liveStart, freeAfter]` (the value is carried across the
                                ## back-edge, so any call in the loop crosses it)
+
+  InitClass* = enum
+    ## What a local's DECL initializer is, after peeling value-preserving wrappers
+    ## (`cast`/`conv`/`suf`/`par`). Instrumentation for the mild-SSA survey
+    ## (`-d:arkhamSSAStats`): a `defs == 1` local with a known-shape initializer is
+    ## an SSA value whose content is statically evident at every use.
+    icNone,       ## no initializer (`.`)
+    icConst,      ## int/uint/char literal — rematerializable, foldable as imm
+    icCopy,       ## a bare (possibly cast-wrapped) local symbol — copy-prop candidate
+    icAddr,       ## `(addr …)` — an address computation, `lea`-rematerializable
+    icCall,       ## a `(call …)` at the root: the var's home receives its FIRST
+                  ## write only after the outermost call RETURNS (args marshal
+                  ## through arg regs/etmps, never the destination), so the
+                  ## initializer's own call(s) cannot clobber the value — see the
+                  ## birth-point exemption in `analyseProc`
+    icOther       ## anything else (binop, load, …)
 
   ProcAnalysis* = object
     vars*: Table[string, VarInfo]
@@ -193,6 +219,26 @@ proc analyseInstr(c: var Context; n: var Cursor) =
       else:
         analyse(c, n)
 
+proc classifyInit(n: Cursor): InitClass =
+  ## Peel value-preserving wrappers (`cast`/`conv`/`suf`/`par` — the same set
+  ## `isConstShiftCount` peels), then classify the initializer core.
+  var c = n
+  while c.kind == TagLit:
+    case c.exprKind
+    of CastC, ConvC:                       # `(cast TARGET value)` — skip the target type
+      var t = c; inc t; skip t; c = t
+    of SufC, ParC:                         # `(suf value "type")` / `(par value)`
+      var t = c; inc t; c = t
+    else: break
+  case c.kind
+  of IntLit, UIntLit, CharLit: icConst
+  of Symbol: icCopy
+  of TagLit:
+    if c.stmtKind == CallS: icCall
+    elif c.exprKind == AddrC: icAddr
+    else: icOther
+  else: icOther
+
 proc analyseVarDecl(c: var Context; n: var Cursor) =
   ## `(var :name pragmas type value)` (also gvar/tvar/const).
   let declPos = posOf(c, n)
@@ -205,10 +251,13 @@ proc analyseVarDecl(c: var Context; n: var Cursor) =
     let inLoop = c.inLoops > 0
     var vi = VarInfo(defs: ord(hasValue), freeAfter: declPos,
                      frameIdx: c.stmtEnd.high, declInLoop: inLoop, liveStart: declPos,
-                     declLoopDepth: c.loopStack.len, paramIdx: -1)
+                     declLoopDepth: c.loopStack.len, paramIdx: -1,
+                     initClass: (if hasValue: classifyInit(n) else: icNone))
     if inLoop: (vi.loopLo = c.loopStack[^1].lo; vi.loopHi = c.loopStack[^1].hi)
     c.res.vars[vn] = vi
-    if hasValue: analyse(c, n)   # analyse the initializer
+    if hasValue:
+      analyse(c, n)              # analyse the initializer
+      c.res.vars[vn].initEndPos = posOf(c, n)   # the value's birth point
     else: inc n                  # consume the `.`
 
 proc resultSpineWalk(c: var Context; n: var Cursor; onSpine: bool) =
@@ -589,10 +638,9 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
     let procStartPos = posOf(c, procDecl)
     var endCur = procDecl; skip endCur
     let procEndPos = posOf(c, endCur)
-    var pname = "?"
+  var pname = "?"
   n.into:
-    when defined(arkhamPeakLive):
-      (if n.kind == SymbolDef: pname = symName(n))
+    (if n.kind == SymbolDef: pname = symName(n))
     inc n                               # name (SymbolDef)
     analyseParams(c, n)                 # params
     skip n                              # return type
@@ -609,7 +657,21 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
   # impossible (the unsafe direction). Params (`freeAfter == high`) are skipped.
   for name, vi in mpairs c.res.vars:
     if vi.freeAfter == high(int): continue
-    let lo = if vi.declInLoop: vi.loopLo else: vi.liveStart
+    # Birth-point exemption: a `let x = f(…)` initializer's own call precedes the
+    # value's existence — x's home receives its FIRST write from the call's result,
+    # after it returned — so it must not deny `AllRegs`. Only sound for a ROOT call
+    # (`icCall`): any other initializer shape may stage a partial value in the
+    # destination (the fused emitters thread the dest into subexpressions), which a
+    # later embedded call would clobber. Loop-carried vars keep their loop span.
+    # `initEndPos - 1`, not `initEndPos`: the cursor position just past the
+    # initializer subtree can COINCIDE with the next statement's own token
+    # position, and a call there is after the birth — it must still deny. Only
+    # calls strictly INSIDE the initializer (p < initEndPos) are exempt.
+    let birthOk = birthFilterEnv.len == 0 or
+                  (birthFilterEnv != "-" and pname in birthFilterEnv.split(','))
+    let lo = if vi.declInLoop: vi.loopLo
+             elif vi.initClass == icCall and birthOk: vi.initEndPos - 1
+             else: vi.liveStart
     let hi = if vi.declInLoop: vi.loopHi else: vi.freeAfter
     var crossesCall = false
     for p in c.callPositions:
@@ -656,4 +718,36 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
         vi.props.incl ArgResident
   when defined(arkhamPeakLive):
     reportPeakLive(c, pname, procStartPos, procEndPos)
+  when defined(arkhamSSAStats):
+    # The mild-SSA census: a local with `defs == 1` AND a decl initializer is an
+    # SSA value (its one def is the decl, which dominates every use by scoping).
+    # `defs == 1` without an initializer means one assignment SOMEWHERE — not
+    # necessarily dominating — so those are tallied separately (`asgn1`).
+    var nLocals, nSSA, nSSAUse1, nConst, nCopy, nAddrI, nLoopSSA, nAsgn1 = 0
+    var nBirthFlip = 0    # denied AllRegs ONLY by call(s) inside the own initializer
+    for name, vi in c.res.vars:
+      if vi.freeAfter == high(int): continue      # params: homed by allocParams
+      inc nLocals
+      if AllRegs notin vi.props and not vi.declInLoop and vi.initEndPos > 0:
+        var crosses = false
+        for p in c.callPositions:
+          if p >= vi.initEndPos and p <= vi.freeAfter: (crosses = true; break)
+        if not crosses: inc nBirthFlip
+      if vi.defs == 1:
+        if vi.initClass == icNone:
+          inc nAsgn1
+        else:
+          inc nSSA
+          if vi.usages == 1: inc nSSAUse1
+          if vi.declInLoop: inc nLoopSSA
+          case vi.initClass
+          of icConst: inc nConst
+          of icCopy: inc nCopy
+          of icAddr: inc nAddrI
+          else: discard
+    if nLocals > 0:
+      stderr.write "SSASTATS proc=" & pname & " locals=" & $nLocals &
+        " ssa=" & $nSSA & " (const=" & $nConst & " copy=" & $nCopy &
+        " addr=" & $nAddrI & " use1=" & $nSSAUse1 & " inloop=" & $nLoopSSA &
+        ") asgn1=" & $nAsgn1 & " birthflip=" & $nBirthFlip & "\n"
   result = ensureMove c.res
