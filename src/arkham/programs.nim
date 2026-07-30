@@ -113,10 +113,13 @@ type
                                             ## a nil value, so its register binds to the asm
                                             ## `(nil)` type (not `(i 64)`) and emits `(nil)`.
     intType*: Cursor                        ## synthesized `(i 64)` — type of a bare IntLit
+                                            ## (`(i 32)` on a 4-byte-pointer target)
     uintType*: Cursor                       ## synthesized `(u 64)` — type of a bare UIntLit
+                                            ## (`(u 32)` on a 4-byte-pointer target)
     charType*: Cursor                       ## synthesized `(c 8)`  — type of a bare CharLit
     floatType*: Cursor                      ## synthesized `(f 64)` — type of a bare FloatLit
     boolType*: Cursor                       ## synthesized `(bool)` — type of a `(true)`/`(false)` literal
+    ptrSize*: int                           ## target pointer/word size in bytes (8 native, 4 wasm32)
 
   TypeEnv* = Table[string, Cursor]          ## a type-symbol table
 
@@ -221,8 +224,8 @@ proc lookupSyscall*(name: string): tuple[found: bool, x64, a64: int] =
 
 # ── pass 0: collect the main module's top-level declarations ────────────────
 
-proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
-                  intrinsic: var IntrinsicOp; asmProc: var bool) =
+proc parsePragmas*(c: var Cursor; importcN, exportcN: var string;
+                   intrinsic: var IntrinsicOp; asmProc: var bool) =
   if c.substructureKind == PragmasU:
     c.into:
       while c.hasMore:
@@ -251,12 +254,12 @@ proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
   else:
     skip c
 
-proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
-                  intrinsic: var IntrinsicOp) {.inline.} =
+proc parsePragmas*(c: var Cursor; importcN, exportcN: var string;
+                   intrinsic: var IntrinsicOp) {.inline.} =
   var ignored = false
   parsePragmas(c, importcN, exportcN, intrinsic, ignored)
 
-proc parsePragmas(c: var Cursor; importcN, exportcN: var string) {.inline.} =
+proc parsePragmas*(c: var Cursor; importcN, exportcN: var string) {.inline.} =
   var ignored = NoIntrinsicOp
   parsePragmas(c, importcN, exportcN, ignored)
 
@@ -379,7 +382,7 @@ proc procSigType*(declStart: Cursor): Cursor =
   result = beginRead(buf)
 
 proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
-              darwin = false): Program =
+              darwin = false; ptrSize = 8): Program =
   ## `darwin` selects the Mach-O target, which links dynamically against
   ## libSystem (dyld + PLT). Unlike the static-ELF Linux target, an `importc`'d
   ## libc name there resolves through the dynamic linker, so it must go through
@@ -394,7 +397,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                    gvarCName: initTable[string, string](),
                    importcOnlyGvars: initHashSet[string](),
                    scheme: splitModulePath(inputPath), tags: tags,
-                   darwin: darwin)
+                   darwin: darwin, ptrSize: ptrSize)
   block:
     # A standalone `(proctype)` parsed against the shared tag pool; its cursor
     # outlives this buffer (the owner refcount keeps the data alive).
@@ -404,9 +407,10 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     result.voidPtr = beginRead(npBuf)
     var nilBuf = parseFromBuffer("(nil)", "", sharedTags = tags)
     result.nilLit = beginRead(nilBuf)
-    var itBuf = parseFromBuffer("(i 64)", "", sharedTags = tags)
+    let wordBits = $max(ptrSize * 8, 8)
+    var itBuf = parseFromBuffer("(i " & wordBits & ")", "", sharedTags = tags)
     result.intType = beginRead(itBuf)
-    var utBuf = parseFromBuffer("(u 64)", "", sharedTags = tags)
+    var utBuf = parseFromBuffer("(u " & wordBits & ")", "", sharedTags = tags)
     result.uintType = beginRead(utBuf)
     var ctBuf = parseFromBuffer("(c 8)", "", sharedTags = tags)
     result.charType = beginRead(ctBuf)
@@ -499,7 +503,8 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         elif importcN in ["__builtin_ctzll", "__builtin_ctz",
                           "__builtin_clzll", "__builtin_clz",
                           "__builtin_popcountll", "__builtin_popcount",
-                          "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64"]:
+                          "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64",
+                          "__builtin_wasm_memory_size", "__builtin_wasm_memory_grow"]:
           # GCC bit builtin (count-trailing/leading-zeros, popcount, byte-swap):
           # lowered inline to a native bit instruction — no libc/extproc. See
           # genBitBuiltin. (nimony's `firstSetBit`/`countTrailingZeroBits` reach
@@ -615,7 +620,13 @@ proc lookupForeignDecl*(p: var Program; name: string; found: var bool): Cursor =
   ## A resolved decl is recorded in `requestedForeign` so nifasm links it.
   found = false
   let s = splitSymName(name)
-  if s.module.len == 0 or s.module == p.scheme.name: return
+  if s.module == p.scheme.name: return
+  if s.module.len == 0:
+    # A module-less symbol has no owning module to load from and the embedded
+    # index never lists single-dot names. Hexer hoists surviving proc-level
+    # consts to module-suffixed top-level decls, and the C-linkage gvars
+    # resolve through `gvarRefName` — nothing legitimate reaches here.
+    return
   let m = loadModule(p, s.module)
   if not hasDecl(m, name): return
   result = getDecl(m, name, p.tags)
@@ -668,7 +679,8 @@ proc foreignCallTarget*(p: var Program; name: string): CallTarget =
   elif importcN in ["__builtin_ctzll", "__builtin_ctz",
                     "__builtin_clzll", "__builtin_clz",
                     "__builtin_popcountll", "__builtin_popcount",
-                    "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64"]:
+                    "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64",
+                    "__builtin_wasm_memory_size", "__builtin_wasm_memory_grow"]:
     result = CallTarget(bitBuiltin: importcN, retType: retType, sigType: sigType)
   elif not p.darwin and importcN.len > 0 and lookupSyscall(importcN).found:
     let (_, x64Nr, a64Nr) = lookupSyscall(importcN)
@@ -771,13 +783,24 @@ proc typeSizeAlign*(p: var Program; c: Cursor): (int, int)
 
 proc unionSizeAlign(p: var Program; unionc: Cursor): (int, int) =
   ## A union's branches OVERLAP: size = max(branch size), align = max(branch align).
-  ## Leng object-variant branches are `(object …)` nodes (sized via `objSizeAlign`).
+  ## Leng object-variant branches are `(object …)` nodes (sized via
+  ## `objSizeAlign`); plain C-style unions (e.g. allocator free-list headers)
+  ## carry bare `(fld :name pragmas type)` branches — size the field's type.
   var uc = unionc
   var maxSz = 0
   var maxAl = 1
   uc.into:
     while uc.hasMore:
-      let (bsz, bal) = typeSizeAlign(p, uc)   # each branch is an (object …)
+      var bsz = 0
+      var bal = 1
+      if uc.kind == TagLit and uc.substructureKind == FldU:
+        var fc = uc
+        fc.into:
+          inc fc; skip fc                     # name, field-pragmas
+          (bsz, bal) = typeSizeAlign(p, fc); skip fc
+          while fc.hasMore: skip fc           # trailing extras (offsets etc.)
+      else:
+        (bsz, bal) = typeSizeAlign(p, uc)     # an (object …) branch
       if bsz > maxSz: maxSz = bsz
       if bal > maxAl: maxAl = bal
       skip uc
@@ -821,11 +844,11 @@ proc typeSizeAlign*(p: var Program; c: Cursor): (int, int) =
     case c.typeKind
     of IT, UT, FT, CT:
       let bits = typeBits(c)
-      let bytes = (if bits > 0: bits else: 64) div 8
+      let bytes = (if bits > 0: bits else: p.ptrSize * 8) div 8
       result = (bytes, bytes)
     of BoolT: result = (1, 1)
     of VoidT: result = (0, 1)
-    of PtrT, AptrT, ProctypeT: result = (8, 8)
+    of PtrT, AptrT, ProctypeT: result = (p.ptrSize, p.ptrSize)
     of FlexarrayT:
       # A flexible array member contributes no fixed size; its alignment is that
       # of the element type (so the enclosing struct's tail is aligned for it).
@@ -873,7 +896,7 @@ proc slotOf*(p: var Program; c: Cursor): AsmSlot =
   ## size and alignment filled in (for AAPCS64 size-based ABI decisions).
   let r = resolveType(p, c)
   if r.kind != TagLit:
-    return typeToSlot(r)                       # defensive: shouldn't occur
+    return typeToSlot(r, p.ptrSize)            # defensive: shouldn't occur
   case r.typeKind
   of EnumT:
     var base = r
@@ -886,7 +909,7 @@ proc slotOf*(p: var Program; c: Cursor): AsmSlot =
     let (sz, al) = typeSizeAlign(p, r)
     result = AsmSlot(cls: AMem, size: sz, align: al, typ: r)  # carry the type, like every other path
   else:
-    result = typeToSlot(r)                      # scalars, ptr, void, …
+    result = typeToSlot(r, p.ptrSize)           # scalars, ptr, void, …
 
 # ── aggregate layout (shared by the allocator + the code generator) ─────────
 
@@ -957,6 +980,23 @@ proc fieldType*(p: var Program; objType: Cursor; field: string): Cursor =
   ## The structural type cursor of `field` in a resolved `(object …)` type.
   ## An inherited field (the Leng `(dot base field depth)` selector counts the
   ## base levels) is resolved by recursing into the object's base type.
+  ## Plain C unions (`(union (fld …)+)`, e.g. the input-event union) are
+  ## selected into directly — every member overlays at the union's base.
+  if objType.kind == TagLit and objType.typeKind == UnionT:
+    var uc = objType
+    uc.into:
+      while uc.hasMore:
+        if uc.kind == TagLit and uc.substructureKind == FldU:
+          var fn = ""
+          var fc = uc
+          fc.into:
+            fn = symName(fc); inc fc
+            skip fc                             # field-pragmas
+            result = fc; skip fc
+            while fc.hasMore: skip fc
+          if fn == field: return
+        skip uc
+    raiseAssert "arkham: field '" & field & "' not found in union"
   assert objType.kind == TagLit and objType.typeKind == ObjectT,
     "arkham: field access requires an object type"
   var oc = objType
