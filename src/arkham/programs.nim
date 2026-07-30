@@ -771,15 +771,20 @@ proc typeSizeAlign*(p: var Program; c: Cursor): (int, int)
 
 proc unionSizeAlign(p: var Program; unionc: Cursor): (int, int) =
   ## A union's branches OVERLAP: size = max(branch size), align = max(branch align).
-  ## Leng object-variant branches are `(object …)` nodes (sized via `objSizeAlign`).
+  ## A `{.union.}`'s children are `(object …)` / `(fld …)` nodes directly; an object
+  ## VARIANT's are `(of RANGES BODY)` / `(else BODY)` branches whose body is the
+  ## `(object …)` (or `.` when the branch declares no fields, contributing nothing).
   var uc = unionc
   var maxSz = 0
   var maxAl = 1
   uc.into:
     while uc.hasMore:
-      let (bsz, bal) = typeSizeAlign(p, uc)   # each branch is an (object …)
-      if bsz > maxSz: maxSz = bsz
-      if bal > maxAl: maxAl = bal
+      var bodyc = uc
+      if isUnionBranch(uc): bodyc = asUnionBranch(uc).body
+      if bodyc.kind != DotToken:
+        let (bsz, bal) = typeSizeAlign(p, bodyc)
+        if bsz > maxSz: maxSz = bsz
+        if bal > maxAl: maxAl = bal
       skip uc
   result = (align(maxSz, maxAl), maxAl)
 
@@ -968,19 +973,23 @@ proc fieldType*(p: var Program; objType: Cursor; field: string): Cursor =
     skip oc
     while oc.hasMore:
       if oc.kind == TagLit and oc.typeKind == UnionT:
-        # An object VARIANT: search each `(union (object …branch)+)` branch's fields.
+        # An object VARIANT: search each branch's fields. A branch is `(of RANGES
+        # BODY)` / `(else BODY)` whose body is an `(object . fld*)`, or `.` when it
+        # declares no fields (`of x: nil`) and so has nothing to find.
         var u = oc
         u.into:
-          while u.hasMore:                    # each branch is an (object . fld*)
+          while u.hasMore:
             var br = u
-            br.into:
-              skip br                          # branch base slot (`.`)
-              while br.hasMore:
-                br.into:                       # (fld :name pragmas type)
-                  let fn = symName(br); inc br
-                  skip br                       # field-pragmas
-                  result = br; skip br
-                  if fn == field: return
+            if isUnionBranch(u): br = asUnionBranch(u).body
+            if br.kind != DotToken:
+              br.into:
+                skip br                        # branch base slot (`.`)
+                while br.hasMore:
+                  br.into:                     # (fld :name pragmas type)
+                    let fn = symName(br); inc br
+                    skip br                     # field-pragmas
+                    result = br; skip br
+                    if fn == field: return
             skip u
         skip oc
       else:
