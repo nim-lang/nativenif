@@ -2709,15 +2709,29 @@ proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
   ## `[dstAddr, srcAddr]`; the per-field transfer register is a staging bridge (x14/x15),
   ## taken here — both addresses are already in `a[0]`/`a[1]`, so a bridge is free — sparing
   ## a pool GPR so the copy fits under high register pressure.
-  # Emit-time picks: pool temps first, a callee-saved survivor as the totality
-  # backstop (`takeHeld` fails loudly — the old `allocAggrCopy` "out of
-  # registers" contract).
-  var h0 = g.takeTmp(ScalarSlot)
-  if h0.kind != InReg: h0 = g.takeHeld("an aggregate-copy dst address")
-  var h1 = g.takeTmp(ScalarSlot)
-  if h1.kind != InReg: h1 = g.takeHeld("an aggregate-copy src address")
-  let a0 = h0.r
-  let a1 = h1.r
+  # Emit-time picks: pool temp, else callee-saved survivor, else a staging
+  # bridge — the copy crosses no call, so even a bridge-backed address is safe
+  # and the acquisition is total. (When both bridges serve as addresses, the
+  # transfer register falls back to the produce bridge x16 below.)
+  var a0, a1: Reg
+  var h0 = dontCare
+  var h1 = dontCare
+  var b0 = NoReg
+  var b1 = NoReg
+  block:
+    var r = g.pickTempReg()
+    if r == NoReg: r = g.pickHeldReg()
+    if r != NoReg:
+      g.pickedRegs.incl r; h0 = regLoc(r, ScalarSlot, isTemp = true); a0 = r
+    else:
+      b0 = g.takeBridge(); a0 = b0
+  block:
+    var r = g.pickTempReg()
+    if r == NoReg: r = g.pickHeldReg()
+    if r != NoReg:
+      g.pickedRegs.incl r; h1 = regLoc(r, ScalarSlot, isTemp = true); a1 = r
+    else:
+      b1 = g.takeBridge(avoid = b0); a1 = b1
   if dst.kind == Mem:
     g.emitLvalue2(dst.cur)                 # pick the dst lvalue's embedded values
   g.bindTemp(a0, ScalarSlot); g.aggrAddrLoc(dst, a0)             # &dst
@@ -2727,9 +2741,14 @@ proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
     g.emitLvalue2(rhs)                     # pick the src lvalue's embedded values
   g.aggrAddrInto(rhs, a1, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)  # &rhs
   if rhs.kind == TagLit: g.freeLvalTemps2(rhs)
-  let tmp = g.takeBridge(AsmSlot(cls: AUInt, size: 8, align: 8))
+  var tmp: Reg
+  if b0 != NoReg and b1 != NoReg:
+    tmp = R16                        # total exhaustion: the produce bridge serves
+    g.bindTemp(tmp, AsmSlot(cls: AUInt, size: 8, align: 8))
+  else:
+    tmp = g.takeBridge(AsmSlot(cls: AUInt, size: 8, align: 8))
   g.copyAggr(a0, a1, size, tmp)
-  g.dropBridge tmp
+  g.dropBridge tmp                   # unbind (uniform for a bridge or x16)
   g.unbindTemp(a1); g.unbindTemp(a0)
   g.freeVal(h1); g.freeVal(h0)
 
@@ -3894,6 +3913,11 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
       g.dropBridge b
     return
   var iv = dest                                 # identity: thread dest down
+  if iv.kind == Undef:
+    # An unconstrained dest could resolve to the inner's memory home — but the
+    # cast re-represents (rebind/extend) in a REGISTER. Demand reg-or-imm: a
+    # foldable literal stays an Imm (returned above), a memory home loads.
+    iv = regOrImm(dest.typ)
   g.emitValue2(inner, iv)
   dest = iv
   if dest.kind == Imm: return                   # a folded constant reinterprets freely
@@ -4042,14 +4066,27 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
           continue
         if pl.isAgg:
           if a.kind == TagLit and a.exprKind in {DotC, DerefC, AtC, PatC}:
-            let addrHeld = g.takeHeld("an aggregate-arg address")
-            heldArgs.add addrHeld
-            let srcAddr = addrHeld.r
+            # The address is consumed within THIS arg's own marshalling (any
+            # embedded call runs during the premat, before the lea writes it),
+            # so a pool temp serves when no callee-saved survivor is free, and
+            # a bridge serves when both pools are dry — never a hard failure.
+            var srcAddr: Reg
+            var addrBridge = NoReg
+            var hr = g.pickHeldReg()
+            if hr == NoReg: hr = g.pickTempReg()
+            if hr != NoReg:
+              g.pickedRegs.incl hr
+              heldArgs.add regLoc(hr, ScalarSlot, isTemp = true)
+              srcAddr = hr
+            else:
+              addrBridge = g.takeBridge()
+              srcAddr = addrBridge
             g.emitLvalue2(a)                 # pick embedded base/index regs
             g.aggrAddrInto(a, srcAddr, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = true)
             if pl.byRef: g.movReg(g.md.gprAt(pl), srcAddr)
             else: g.marshalAggrFromAddr(srcAddr, tn, pl.gpFirst)
-            g.unbindTemp(srcAddr)
+            if addrBridge != NoReg: g.dropBridge addrBridge
+            else: g.unbindTemp(srcAddr)
             g.freeLvalTemps2(a)
           else:
             var home = ""
@@ -4142,9 +4179,19 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
         let tn = symName(tcur)
         let sz = aggrByteSize(g.prog, tn)
         if a.kind == TagLit and a.exprKind in {DotC, DerefC, AtC, PatC}:
-          let addrHeld = g.takeHeld("an aggregate-arg address")
-          heldArgs.add addrHeld
-          let srcAddr = addrHeld.r
+          # Same totality chain as the proc-pointer marshaller above: survivor,
+          # else pool temp, else bridge (the address dies within this arg).
+          var srcAddr: Reg
+          var addrBridge = NoReg
+          var hr = g.pickHeldReg()
+          if hr == NoReg: hr = g.pickTempReg()
+          if hr != NoReg:
+            g.pickedRegs.incl hr
+            heldArgs.add regLoc(hr, ScalarSlot, isTemp = true)
+            srcAddr = hr
+          else:
+            addrBridge = g.takeBridge()
+            srcAddr = addrBridge
           g.emitLvalue2(a)                   # pick embedded base/index regs
           g.aggrAddrInto(a, srcAddr, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = true)
           if sz > 16:
@@ -4152,7 +4199,8 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
           else:
             g.marshalAggrFromAddr(srcAddr, tn, intIdx)
             intIdx += aggrWordCount(g.prog, tn)
-          g.unbindTemp(srcAddr)
+          if addrBridge != NoReg: g.dropBridge addrBridge
+          else: g.unbindTemp(srcAddr)
           g.freeLvalTemps2(a)
         else:
           var home = ""

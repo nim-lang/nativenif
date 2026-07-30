@@ -4581,7 +4581,12 @@ proc emitScalarCmpE(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
     g.freeVal(rD)
     g.freeLvalTemps2(aC)
     return
-  var lD = needsReg(ScalarSlot)
+  # A pointer-typed lhs carries its precise slot so a pool-dry etmp spill and
+  # its staged reload stay ptr-typed — `cmp (i 64) (nil)` is a nifasm error
+  # (the a64 twin's cmpBridgeSlot rule).
+  var lD = needsReg(
+    if isPtrType(resolveType(g.prog, g.getType(aC))): g.exprSlot(aC)
+    else: ScalarSlot)
   g.emitValue2(aC, lD)                                 # left → a register
   var rD = dontCare
   let rhsMemFold = isMemLeaf(bC)
@@ -4973,6 +4978,11 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
       var st = g.getType(inner)
       g.rebindLocalAs(nm, dest.r, st)
   var iv = dest                                          # identity: thread dest down
+  if iv.kind == Undef:
+    # An unconstrained dest could resolve to the inner's memory home — but the
+    # cast re-represents (rebind/extend) in a REGISTER. Demand reg-or-imm: a
+    # foldable literal stays an Imm (returned above), a memory home loads.
+    iv = regOrImm(dest.typ)
   g.emitValue2(inner, iv)
   dest = iv
   if dest.kind == Imm: return                            # a folded constant reinterprets freely
@@ -5222,6 +5232,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
   # ── the unified declarative path: every argument binds via `(arg pN [k])`.
   var sealedArgs: set[Reg] = {}
   var pendingArgBinds: seq[tuple[nameIdx: int, src: Reg, wordIdx: int]] = @[]
+  var pendingSpillArgs: seq[tuple[nameIdx: int, slot: Location]] = @[]
   g.ab.tree PrepareX64:
     g.ab.sym tgt.asmName
     if resultByRef:
@@ -5348,10 +5359,23 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
         # Scalar arg. Clobber-exposed → compute into a parked survivor and bind
         # at the end; else straight into the ABI register.
         var aD: Location
+        var parkSpilled = false
         if not pl.onStack and g.md.gprAt(pl) in laterClob[j+1]:
-          aD = g.takeHeld("a clobber-exposed call argument")
+          let hr = g.pickHeldReg()
+          if hr != NoReg:
+            g.pickedRegs.incl hr
+            aD = regLoc(hr, ScalarSlot, isTemp = true)
+          else:
+            # No survivor free. A bound POOL temp parks just as safely: the
+            # later-arg clobbers are the FIXED cl/rdx only, and every later
+            # pick avoids bound temps. Both pools dry → produce into a minted
+            # slot and reload at the bind-flush point (memory survives all).
+            aD = g.takeTmp(ScalarSlot)
           heldArgs.add aD
           g.emitValue2(a, aD)
+          if aD.kind != InReg:
+            pendingSpillArgs.add (nameIdx: nameIdx, slot: aD)
+            parkSpilled = true
         elif not pl.onStack:
           let abiReg = g.md.gprAt(pl)
           g.releaseArgDest(abiReg, (if a.kind == Symbol: symName(a) else: ""))
@@ -5360,35 +5384,46 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
         else:
           aD = needsReg(ScalarSlot)
           g.emitValue2(a, aD)                      # 7th+ arg: any register
-        var srcReg = NoReg
-        var ownSrc = false
-        if aD.kind == InReg:
-          srcReg = aD.r
-        else:                                      # pool-dry etmp: staged reload
-          srcReg = g.pickStaging()
-          g.bindTemp(srcReg, ScalarSlot)
-          g.emitLoadLoc(aD, srcReg)
-          ownSrc = true
-        if not pl.onStack:
-          if not ownSrc and srcReg != g.md.gprAt(pl):
-            pendingArgBinds.add (nameIdx: nameIdx, src: srcReg, wordIdx: -1)
-            g.rb.sealAccum srcReg; sealedArgs.incl srcReg
+        if not parkSpilled:
+          var srcReg = NoReg
+          var ownSrc = false
+          if aD.kind == InReg:
+            srcReg = aD.r
+          else:                                    # pool-dry etmp: staged reload
+            srcReg = g.pickStaging()
+            g.bindTemp(srcReg, ScalarSlot)
+            g.emitLoadLoc(aD, srcReg)
+            ownSrc = true
+          if not pl.onStack:
+            if not ownSrc and srcReg != g.md.gprAt(pl):
+              pendingArgBinds.add (nameIdx: nameIdx, src: srcReg, wordIdx: -1)
+              g.rb.sealAccum srcReg; sealedArgs.incl srcReg
+            else:
+              g.ab.tree MovX64:
+                g.ab.tree ArgX: g.ab.sym paramName(nameIdx)
+                g.emReg srcReg
           else:
+            g.ra.hasStackVars = true         # outgoing stack-arg area ⇒ frame sub
             g.ab.tree MovX64:
-              g.ab.tree ArgX: g.ab.sym paramName(nameIdx)
+              g.ab.tree MemX:
+                g.ab.reg RSP
+                g.ab.tree ArgX: g.ab.sym paramName(nameIdx)
               g.emReg srcReg
-        else:
-          g.ra.hasStackVars = true           # outgoing stack-arg area ⇒ frame sub
-          g.ab.tree MovX64:
-            g.ab.tree MemX:
-              g.ab.reg RSP
-              g.ab.tree ArgX: g.ab.sym paramName(nameIdx)
-            g.emReg srcReg
-          if not ownSrc: g.freeVal(aD)             # the stack-arg temp dies with its store
-        if ownSrc: g.giveBack srcReg
+            if not ownSrc: g.freeVal(aD)           # the stack-arg temp dies with its store
+          if ownSrc: g.giveBack srcReg
       if not pl.isFloat and not pl.onStack:
         for k in 0 ..< pl.words:
           g.rb.sealAccum g.md.gprAt(pl, k); sealedArgs.incl g.md.gprAt(pl, k)
+    for ps in pendingSpillArgs:
+      # A clobber-exposed arg that had to park in a minted slot: reload through
+      # staging and bind now, after every clobbering computation ran.
+      let s = g.pickStaging()
+      g.bindTemp(s, ScalarSlot)
+      g.emitLoadLoc(ps.slot, s)
+      g.ab.tree MovX64:
+        g.ab.tree ArgX: g.ab.sym paramName(ps.nameIdx)
+        g.emReg s
+      g.giveBack s
     for pb in pendingArgBinds:
       g.ab.tree MovX64:
         g.ab.tree ArgX:
