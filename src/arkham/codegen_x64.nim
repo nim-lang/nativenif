@@ -1917,7 +1917,7 @@ proc aggrArgAddr(g: var CodeGen; a: Cursor; recorded: Reg; avoid: openArray[Reg]
   g.aggrAddrInto(a, s, slot, doBind = false)   # already bound by pickStagingSealed
   (s, true)
 proc genConstr2(g: var CodeGen; c: Cursor; dstVar: string)
-proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int)
+proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location)
 proc binMemLval2(g: var CodeGen; op: X64Inst; dest: Reg; c: Cursor)
 
 proc aggrArgSource(g: var CodeGen; a: Cursor; tcur: Cursor; tn: string):
@@ -1950,7 +1950,7 @@ proc aggrArgSource(g: var CodeGen; a: Cursor; tcur: Cursor; tn: string):
     home = "aggtmp" & $pos & ".0"
     g.emTypedStackVar(home, tcur)
     g.varType[home] = tn
-    g.genStore2(a, namedStackLoc(home, g.exprSlot(a)), pos)
+    g.genStore2(a, namedStackLoc(home, g.exprSlot(a)))
   (home, ptrReg, isTvar)
 
 proc binFold(g: var CodeGen; op: X64Inst; dest: Reg; loc: Location; opCur: Cursor) =
@@ -2844,7 +2844,7 @@ proc prematLval2(g: var CodeGen; c: Cursor; asBase = false) =
       var tcur = c; inc tcur                            # the constructed (array/object) type
       g.emTypedStackVar(home, tcur)
       if tcur.kind == Symbol: g.varType[home] = symName(tcur)
-      g.genStore2(c, namedStackLoc(home, g.exprSlot(c)), pos)
+      g.genStore2(c, namedStackLoc(home, g.exprSlot(c)))
     else: discard
 
 proc unbindLvalTemps2(g: var CodeGen; c: Cursor) =
@@ -3245,7 +3245,7 @@ proc buildNestedAggrTemp(g: var CodeGen; valC, fty: Cursor): (string, int) =
   let tmpName = "nctmp" & $pos & ".0"
   g.emTypedStackVar(tmpName, fty)
   g.varType[tmpName] = ntn
-  g.genStore2(valC, namedStackLoc(tmpName, g.exprSlot(valC)), pos)   # build (no staging held)
+  g.genStore2(valC, namedStackLoc(tmpName, g.exprSlot(valC)))   # build (no staging held)
   (tmpName, aggrByteSize(g.prog, ntn))
 
 proc copyNestedAggrTemp(g: var CodeGen; tmpName: string; sizeBytes: int; dstPtr: Reg) =
@@ -3428,7 +3428,7 @@ proc constrFieldStores(g: var CodeGen; c: Cursor; base: Location) =
         of Glob, Tvar: fieldLocGlob(typeName, field, base.name, fSlot,  # addr re-derived per store
                                     isTvar = base.kind == Tvar)
         else: raiseAssert "arkham x64n: bad oconstr base " & $base.kind
-      g.genStore2(valC, fdst, cursorToPosition(g.buf[], valC))
+      g.genStore2(valC, fdst)
     while cc.hasMore:
       if cc.kind == TagLit and cc.exprKind == OconstrC:
         g.constrFieldStores(cc, base)                  # nested inherited-base sub-object
@@ -3562,7 +3562,7 @@ proc genBaseobj2(g: var CodeGen; c: Cursor; dst: Location) =
     let dtmp = "botmp" & $pos & ".0"
     g.emTypedStackVar(dtmp, derivedTy)
     g.varType[dtmp] = derivedTn
-    g.genStore2(valC, namedStackLoc(dtmp, g.exprSlot(valC)), pos)  # build derived (no held temp)
+    g.genStore2(valC, namedStackLoc(dtmp, g.exprSlot(valC)))  # build derived (no held temp)
     let scratch = g.pickStagingSealed("a baseobj prefix copy", AddrSlot)
     g.genAggrCopy2(dst.name, dtmp, symName(baseTy), scratch)        # copy the base prefix
     g.giveBack scratch
@@ -3640,7 +3640,7 @@ proc dstAggrInfo(g: var CodeGen; dst: Location): (bool, int) =
     (s.kind == AMem, s.size)
   else: (false, 0)
 
-proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size, auxPos: int) =
+proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
   ## THE whole-aggregate copy `dst = rhs`: reduce each side to the form the machine can
   ## address it in (`aggrDstEnd`/`aggrSrcEnd`), then `copyAggr`. ONE path for every
   ## (destination form × source form). The working registers come from the emit-time
@@ -3687,14 +3687,14 @@ proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size, auxPos: 
   g.giveBack tmp                                                 # unbinds + unseals the bridge
   g.giveBack srcAddr; g.giveBack dstAddr                         # unbind + unseal (NoReg ⇒ no-op)
 
-proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
+proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
   ## The general destination-passing store of the value core. An aggregate COPY (symbol /
   ## lvalue source) goes through the ONE `genAggrCopyStore` regardless of destination form;
   ## constructors/calls/baseobj PRODUCE into the destination per-form; a scalar/float
   ## destination goes through `storeScalar2`.
   let (dstAggr, aggrSize) = g.dstAggrInfo(dst)
   if dstAggr and isAggrCopySrc(rhs):                     # the ONE whole-aggregate copy path
-    g.genAggrCopyStore(rhs, dst, aggrSize, auxPos)
+    g.genAggrCopyStore(rhs, dst, aggrSize)
     return
   if rhs.kind == TagLit and rhs.exprKind in {ConvC, CastC} and
      g.exprSlot(rhs).kind == AMem:
@@ -3704,7 +3704,7 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
     var inner = rhs
     inner.into:
       skip inner                                         # the target type
-      g.genStore2(inner, dst, auxPos)                    # the operand → same dest
+      g.genStore2(inner, dst)                    # the operand → same dest
       while inner.hasMore: skip inner
     return
   if dst.kind == NamedStack and dst.typ.kind == AMem:    # aggregate destination (a slot var)
@@ -3751,8 +3751,8 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location; auxPos: int) =
     # build/copy the aggregate THROUGH that pointer — an `oconstr` field-by-field, an
     # array by element, a call by its ABI (>16B → &dst as the hidden result pointer in
     # rdi; ≤16B → the result regs stored through &dst). The build dispatches only on the
-    # RHS kind; global-vs-threadvar lives entirely in `emSymAddr`. The allocator reserves
-    # the address temp at `aux[auxPos].scratch[0]`.
+    # RHS kind; global-vs-threadvar lives entirely in `emSymAddr`. The address temp
+    # is a callee-saved survivor picked at emission (`takeHeld`).
     if rhs.kind == TagLit and rhs.exprKind == CallC and
        dst.typ.size > g.md.aggrByRefThreshold:
       g.emSymAddr(RDI, dst)                              # >16B: &dst is the hidden result ptr
@@ -4003,7 +4003,7 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
           if srcSym.kind == Symbol:
             let sh = g.ra.locationOfSym(symName(srcSym))
             if sh.kind == InReg and sh.r == loc.r: skipInit = true
-        if not skipInit: g.genStore2(cc, loc, declPos)  # the one general store path
+        if not skipInit: g.genStore2(cc, loc)  # the one general store path
       while cc.hasMore: skip cc
 
 proc emitCaseTest2(g: var CodeGen; selReg: Reg; c: var Cursor; lBody: string; signed: bool) =
@@ -4057,8 +4057,8 @@ proc tryEmitCmov(g: var CodeGen; c: Cursor): bool =
   # `shl`/`sar` extend), so the flags survive to the cmov.
   let ct = cmovTagFor(g.emitScalarCmpE(sd.a, sd.b, sd.ek, whenTrue = true))
   let rT = g.pickStagingSealed("a cmov then-value", g.selectStagingSlot(sd), avoid = sd.dst.r)
-  g.genStore2(sd.thenRhs, regLoc(rT, sd.dst.typ), cursorToPosition(g.buf[], sd.thenAsgn))
-  g.genStore2(sd.elseRhs, sd.dst, cursorToPosition(g.buf[], sd.elseAsgn))
+  g.genStore2(sd.thenRhs, regLoc(rT, sd.dst.typ))
+  g.genStore2(sd.elseRhs, sd.dst)
   g.ab.tree ct: (g.emReg sd.dst.r; g.emReg rT)
   g.giveBack rT
   return true
@@ -4109,12 +4109,12 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         if dst.kind == NoLoc:                               # module-level global / threadvar
           var lc = lhsCur
           dst = g.asLoc(lc)                                 # Glob/Tvar with precise type
-        g.genStore2(cc, dst, asgnPos)                       # the one general store path
+        g.genStore2(cc, dst)                       # the one general store path
       else:
         # A memory store through a complex lvalue (dot/deref/at).
         let lhsCur = cc
         var rhsCur = cc; skip rhsCur                        # past the lhs → the rhs value
-        g.genStore2(rhsCur, memLoc(lhsCur, ScalarSlot), asgnPos)   # the one general store path
+        g.genStore2(rhsCur, memLoc(lhsCur, ScalarSlot))   # the one general store path
       while cc.hasMore: skip cc
   of WhileS:
     let lEnd = g.freshLabel()
@@ -4184,7 +4184,7 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
             else: tcur = g.getType(cc)
             g.emTypedStackVar(srcName, tcur)
             g.varType[srcName] = g.retAggrName
-            g.genStore2(cc, namedStackLoc(srcName, slotOf(g.prog, tcur)), pos)
+            g.genStore2(cc, namedStackLoc(srcName, slotOf(g.prog, tcur)))
           if g.retIndirect:                                # >16B: copy through the hidden ptr
             g.copyStructThroughPtr2(srcName, g.retAggrName, g.indirectReg)
             g.movReg(RAX, g.indirectReg)                   # SysV: return the buffer pointer in rax
@@ -4194,9 +4194,9 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
           let retPos = cursorToPosition(g.buf[], cc)
           if g.retIsFloat:
             let fb = g.retFloatBits
-            g.genStore2(cc, fregLoc(FloatRet, AsmSlot(cls: AFloat, size: fb div 8, align: fb div 8)), retPos)
+            g.genStore2(cc, fregLoc(FloatRet, AsmSlot(cls: AFloat, size: fb div 8, align: fb div 8)))
           else:
-            g.genStore2(cc, regLoc(g.md.intRetReg, ScalarSlot), retPos)
+            g.genStore2(cc, regLoc(g.md.intRetReg, ScalarSlot))
         # The epilogue (framePop + ret) is emitted ONCE at the proc tail by
         # emitProcBody2; a `ret` that is NOT the tail must jump there rather than fall
         # through into the following statements (e.g. a mid-proc `if cond: return x`).
@@ -4299,10 +4299,10 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         if dst.kind == NoLoc:
           var lc = lhsCur
           dst = g.asLoc(lc)
-        g.genStore2(opCur, dst, kPos)
+        g.genStore2(opCur, dst)
       else:
         let lhsCur = cc; skip cc
-        g.genStore2(opCur, memLoc(lhsCur, ScalarSlot), kPos)
+        g.genStore2(opCur, memLoc(lhsCur, ScalarSlot))
       g.noFoldPos = -1
       while cc.hasMore: skip cc
   else: raiseAssert "arkham x64n: genStmt2 " & $c.stmtKind
@@ -5181,7 +5181,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
             home = "aggtmp" & $pos & ".0"
             g.emTypedStackVar(home, tcur)
             g.varType[home] = tn
-            g.genStore2(a, namedStackLoc(home, g.exprSlot(a)), pos)
+            g.genStore2(a, namedStackLoc(home, g.exprSlot(a)))
           if not pl.byRef:
             if ptrReg != NoReg: g.marshalAggrFromAddr(ptrReg, tn, marshalRegs)
             elif home.len > 0: g.structToRegs(home, tn, marshalRegs)
