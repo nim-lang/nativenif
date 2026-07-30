@@ -103,11 +103,6 @@ type
     scheme: SplittedModulePath              ## path template (dir/<module>.ext)
     tags: TagPool                           ## shared tag pool for parsing foreign modules
     loaded: Table[string, ForeignModule]    ## module suffix → loaded foreign module
-    rootDecls: Table[string, Cursor]        ## module-less (root-scope) gvar/tvar/const name
-                                            ## → decl, found by scanning loaded modules; the
-                                            ## embedded index never lists single-dot symbols
-    rootScanned: HashSet[string]            ## module suffixes already root-scanned
-    rootBufs: seq[TokenBuf]                 ## keep-alive for rootDecls' backing buffers
     procPtr*: Cursor                        ## a synthesized `(proctype)` — the code-pointer
                                             ## type of a proc used as a value. A nifcore
                                             ## Cursor keeps its own backing alive (refcounted
@@ -399,8 +394,6 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                    globals: initTable[string, Cursor](),
                    tvars: initTable[string, Cursor](),
                    loaded: initTable[string, ForeignModule](),
-                   rootDecls: initTable[string, Cursor](),
-                   rootScanned: initHashSet[string](),
                    gvarCName: initTable[string, string](),
                    importcOnlyGvars: initHashSet[string](),
                    scheme: splitModulePath(inputPath), tags: tags,
@@ -618,44 +611,6 @@ proc lookupType*(p: var Program; name: string): Cursor =
   p.requestedForeign.add (name, d)
   result = d
 
-proc scanTreeForRootDecls(p: var Program; c: var Cursor) =
-  ## Consume the node at `c`, recording every MODULE-LESS gvar/tvar/const decl
-  ## found anywhere inside it. Recursion matters: hexer leaves proc-LEVEL
-  ## consts (e.g. the Schubfach tables like `mod5.0`) inside their proc's body
-  ## rather than hoisting them to the top level.
-  if c.kind == TagLit:
-    if c.stmtKind in {GvarS, TvarS, ConstS}:
-      var gc = c
-      gc.into:
-        let nm = symName(gc)
-        if splitSymName(nm).module.len == 0 and not p.rootDecls.hasKey(nm):
-          p.rootDecls[nm] = c
-        while gc.hasMore: skip gc             # drain so `into` stays balanced
-      skip c
-    else:
-      c.into:
-        while c.hasMore:
-          scanTreeForRootDecls(p, c)
-  else:
-    skip c
-
-proc scanRootDecls(p: var Program; suffix: string) =
-  ## Record module `suffix`'s MODULE-LESS gvar/tvar/const decls (at any
-  ## nesting depth) in `p.rootDecls`. One full parse of the module file, run
-  ## at most once per module, and only when a module-less lookup has already
-  ## missed everywhere else — the embedded index cannot serve these
-  ## (single-dot symbols are never indexed).
-  if p.rootScanned.contains(suffix): return
-  p.rootScanned.incl suffix
-  var sc = p.scheme
-  sc.name = suffix
-  var buf = parseFromFile($sc, sharedTags = p.tags)
-  var c = beginRead(buf)
-  scanTreeForRootDecls(p, c)
-  # cursor-before-move pattern (see foreignmodules.getDecl): the cursors taken
-  # above travel with the buffer's ref-counted owner into the keep-alive seq
-  p.rootBufs.add ensureMove(buf)
-
 proc lookupForeignDecl*(p: var Program; name: string; found: var bool): Cursor =
   ## The top-level declaration (`gvar|var|const|tvar|proc|type :name …`) for a
   ## cross-module symbol, loaded from the owning module's embedded index (same
@@ -667,28 +622,10 @@ proc lookupForeignDecl*(p: var Program; name: string; found: var bool): Cursor =
   let s = splitSymName(name)
   if s.module == p.scheme.name: return
   if s.module.len == 0:
-    # A module-less (shared-root-scope) symbol — e.g. a hexer-emitted const
-    # like `mod5.0` — referenced from a foreign module's body. The embedded
-    # index never lists single-dot symbols (nifbuilder's >= 2-dots rule), so
-    # the lazy per-symbol jump cannot find them; instead scan the top level
-    # of every loaded module once (the referencing module is necessarily
-    # loaded — its body is what's being compiled). Native codegen never
-    # reaches here for these (per-module compiles see them as main-module
-    # locals; nifasm's root scope links the rest), but ithaqua's
-    # whole-program lowering does. NOT recorded in `requestedForeign`: the
-    # native link path resolves root-scope names without our help.
-    var suffixes: seq[string] = @[]
-    for k in p.loaded.keys: suffixes.add k
-    when defined(rootScanDebug):
-      stderr.writeLine "rootscan: miss for " & name & "; loaded=" & $suffixes
-    for suffix in suffixes:
-      scanRootDecls(p, suffix)
-    if p.rootDecls.hasKey(name):
-      result = p.rootDecls[name]
-      found = true
-    when defined(rootScanDebug):
-      stderr.writeLine "rootscan: " & name & " found=" & $found &
-        " rootDecls=" & $p.rootDecls.len
+    # A module-less symbol has no owning module to load from and the embedded
+    # index never lists single-dot names. Hexer hoists surviving proc-level
+    # consts to module-suffixed top-level decls, and the C-linkage gvars
+    # resolve through `gvarRefName` — nothing legitimate reaches here.
     return
   let m = loadModule(p, s.module)
   if not hasDecl(m, name): return
