@@ -1,0 +1,207 @@
+(stmts
+
+  (constants :Vals.0. :HeldRegs.0. :PoolRegs.0. :Bridges.0. :Slots.0.
+             :Regs.0. :Clobber.0.)
+  (models Vals.0. :v1.0. :v2.0. :v3.0. :v4.0.)
+  (models HeldRegs.0. :h1.0.)
+  (models PoolRegs.0. :p1.0.)
+  (models Bridges.0. :b1.0.)
+  (models Slots.0. :s1.0. :s2.0. :s3.0. :s4.0.)
+  (assign Regs.0. (union HeldRegs.0. (union PoolRegs.0. Bridges.0.)))
+  (assign Clobber.0. (union PoolRegs.0. Bridges.0.))
+
+  (variables :status.0. :loc.0. :written.0. :picked.0. :callPending.0. :badRead.0.)
+
+  (def :sFree.0. 0)
+  (def :sWants.0. 1)
+  (def :sReserved.0. 2)
+  (def :sBound.0. 3)
+  (def :sDead.0. 4)
+
+  (def :LocFree.0.
+    (forall :w.0 Vals.0.
+      (implies
+        (or (eq (apply status.0. w.0) sReserved.0.)
+            (eq (apply status.0. w.0) sBound.0.))
+        (neq (apply loc.0. w.0) L.0))))
+
+  (def :RegAvail.0.
+    (and (notin L.0 picked.0.) LocFree.0.))
+
+  (def :HeldAvail.0. (exists :L.0 HeldRegs.0. RegAvail.0.))
+  (def :PoolAvail.0. (exists :L.0 PoolRegs.0. RegAvail.0.))
+  (def :BridgeAvail.0. (exists :L.0 Bridges.0. RegAvail.0.))
+  (def :SlotAvail.0. (exists :L.0 Slots.0. LocFree.0.))
+
+  (def :Init.0.
+    (and
+      (prime status.0. (funof :v.0 Vals.0. sFree.0.))
+      (prime loc.0. (funof :v.0 Vals.0. (null)))
+      (prime written.0. (funof :v.0 Vals.0. (false)))
+      (prime picked.0. (emptyset))
+      (prime callPending.0. (false))
+      (prime badRead.0. (false))))
+
+  (def :Want.0.
+    (exists :v.0 Vals.0.
+      (and
+        (eq (apply status.0. v.0) sFree.0.)
+        (forall :w.0 Vals.0. (neq (apply status.0. w.0) sWants.0.))
+        (prime status.0. (except status.0. (mapsto v.0 sWants.0.))))))
+
+  (def :ResolveHeld.0.
+    (exists :v.0 Vals.0.
+      (and
+        (eq (apply status.0. v.0) sWants.0.)
+        (exists :L.0 HeldRegs.0.
+          (and RegAvail.0.
+            (prime status.0. (except status.0. (mapsto v.0 sReserved.0.)))
+            (prime loc.0. (except loc.0. (mapsto v.0 L.0)))
+            (prime picked.0. (union picked.0. (set L.0))))))))
+
+  (def :ResolvePool.0.
+    (exists :v.0 Vals.0.
+      (and
+        (eq (apply status.0. v.0) sWants.0.)
+        (not HeldAvail.0.)
+        (exists :L.0 PoolRegs.0.
+          (and RegAvail.0.
+            (prime status.0. (except status.0. (mapsto v.0 sReserved.0.)))
+            (prime loc.0. (except loc.0. (mapsto v.0 L.0)))
+            (prime picked.0. (union picked.0. (set L.0))))))))
+
+  (def :ResolveBridge.0.
+    (exists :v.0 Vals.0.
+      (and
+        (eq (apply status.0. v.0) sWants.0.)
+        (not HeldAvail.0.)
+        (not PoolAvail.0.)
+        (exists :L.0 Bridges.0.
+          (and RegAvail.0.
+            (prime status.0. (except status.0. (mapsto v.0 sReserved.0.)))
+            (prime loc.0. (except loc.0. (mapsto v.0 L.0)))
+            (prime picked.0. (union picked.0. (set L.0))))))))
+
+  (def :ResolveSpill.0.
+    (exists :v.0 Vals.0.
+      (and
+        (eq (apply status.0. v.0) sWants.0.)
+        (not HeldAvail.0.)
+        (not PoolAvail.0.)
+        (not BridgeAvail.0.)
+        (exists :L.0 Slots.0.
+          (and LocFree.0.
+            (prime status.0. (except status.0. (mapsto v.0 sReserved.0.)))
+            (prime loc.0. (except loc.0. (mapsto v.0 L.0))))))))
+
+  (def :Materialize.0.
+    (exists :v.0 Vals.0.
+      (and
+        (eq (apply status.0. v.0) sReserved.0.)
+        (prime status.0. (except status.0. (mapsto v.0 sBound.0.)))
+        (prime written.0. (except written.0. (mapsto v.0 (in (apply loc.0. v.0) Regs.0.))))
+        (prime picked.0. (setminus picked.0. (set (apply loc.0. v.0)))))))
+
+  (def :Cancel.0.
+    (exists :v.0 Vals.0.
+      (and
+        (eq (apply status.0. v.0) sReserved.0.)
+        (prime status.0. (except status.0. (mapsto v.0 sDead.0.)))
+        (prime loc.0. (except loc.0. (mapsto v.0 (null))))
+        (prime picked.0. (setminus picked.0. (set (apply loc.0. v.0)))))))
+
+  (def :Consume.0.
+    (exists :v.0 Vals.0.
+      (and
+        (eq (apply status.0. v.0) sBound.0.)
+        (prime status.0. (except status.0. (mapsto v.0 sDead.0.)))
+        (prime loc.0. (except loc.0. (mapsto v.0 (null))))
+        (prime badRead.0. (or badRead.0. (not (apply written.0. v.0)))))))
+
+  (def :RequestCall.0.
+    (and
+      (eq callPending.0. (false))
+      (exists :v.0 Vals.0. (eq (apply status.0. v.0) sBound.0.))
+      (prime callPending.0. (true))))
+
+  (def :ParkToHeld.0.
+    (exists :v.0 Vals.0.
+      (and
+        (eq callPending.0. (true))
+        (eq (apply status.0. v.0) sBound.0.)
+        (in (apply loc.0. v.0) Clobber.0.)
+        (exists :L.0 HeldRegs.0.
+          (and RegAvail.0.
+            (prime loc.0. (except loc.0. (mapsto v.0 L.0))))))))
+
+  (def :ParkToSlot.0.
+    (exists :v.0 Vals.0.
+      (and
+        (eq callPending.0. (true))
+        (eq (apply status.0. v.0) sBound.0.)
+        (in (apply loc.0. v.0) Clobber.0.)
+        (not HeldAvail.0.)
+        (exists :L.0 Slots.0.
+          (and LocFree.0.
+            (prime loc.0. (except loc.0. (mapsto v.0 L.0))))))))
+
+  (def :CallExec.0.
+    (and
+      (eq callPending.0. (true))
+      (forall :v.0 Vals.0.
+        (implies (eq (apply status.0. v.0) sBound.0.)
+                 (notin (apply loc.0. v.0) Clobber.0.)))
+      (prime callPending.0. (false))))
+
+  (def :Next.0.
+    (or Want.0.
+        ResolveHeld.0. ResolvePool.0. ResolveBridge.0. ResolveSpill.0.
+        Materialize.0. Cancel.0. Consume.0.
+        RequestCall.0. ParkToHeld.0. ParkToSlot.0. CallExec.0.))
+
+  (def :Excl.0.
+    (forall :w.0 Vals.0.
+      (forall :u.0 Vals.0.
+        (implies
+          (and (neq w.0 u.0)
+               (or (eq (apply status.0. w.0) sReserved.0.)
+                   (eq (apply status.0. w.0) sBound.0.))
+               (or (eq (apply status.0. u.0) sReserved.0.)
+                   (eq (apply status.0. u.0) sBound.0.)))
+          (neq (apply loc.0. w.0) (apply loc.0. u.0))))))
+
+  (def :PickAccounted.0.
+    (and
+      (forall :L.0 picked.0.
+        (exists :w.0 Vals.0.
+          (and (eq (apply status.0. w.0) sReserved.0.)
+               (eq (apply loc.0. w.0) L.0))))
+      (forall :w.0 Vals.0.
+        (implies (and (eq (apply status.0. w.0) sReserved.0.)
+                      (in (apply loc.0. w.0) Regs.0.))
+                 (in (apply loc.0. w.0) picked.0.)))))
+
+  (def :DemandTotal.0.
+    (implies
+      (exists :w.0 Vals.0. (eq (apply status.0. w.0) sWants.0.))
+      (or HeldAvail.0. PoolAvail.0. BridgeAvail.0. SlotAvail.0.)))
+
+  (def :ParkTotal.0.
+    (implies
+      (and (eq callPending.0. (true))
+           (exists :w.0 Vals.0.
+             (and (eq (apply status.0. w.0) sBound.0.)
+                  (in (apply loc.0. w.0) Clobber.0.))))
+      (or HeldAvail.0. SlotAvail.0.)))
+
+  (def :Inv.0.
+    (and Excl.0.
+         PickAccounted.0.
+         (not badRead.0.)
+         DemandTotal.0.
+         ParkTotal.0.))
+
+  (spec (always-stutter Init.0. Next.0.
+    (tuple status.0. loc.0. written.0. picked.0. callPending.0. badRead.0.)))
+  (check Inv.0.)
+)
