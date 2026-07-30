@@ -259,10 +259,7 @@ proc rangeLen(b: Builder; name: string): int {.inline.} =
   ## param is the longest-lived and thus the preferred victim.
   let vi = b.an.vars.getOrDefault(name)
   if vi.freeAfter == high(int): return high(int)
-  let carried = vi.declInLoop and not vi.rebornEachIteration
-  let lo = if carried: vi.loopLo else: vi.liveStart
-  let hi = if carried: vi.loopHi else: vi.freeAfter
-  max(1, hi - lo)
+  max(1, vi.freeAfter - vi.liveStart)
 
 # ── scope-based walk that allocates locals ──────────────────────────────────
 
@@ -414,15 +411,13 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
       # eliminating a reg→reg `mov`. Gated to x86 (the emitter's same-reg skip is wired
       # there) and to a source whose register CLASS already covers c2's lifetime: a
       # callee-saved home always does; a volatile home only for a call-free c2 (`AllRegs`).
-      # In-loop decls qualify when REBORN (`rebornEachIteration`): both c1 and c2 are then
-      # re-initialized each iteration before any use, so the back-edge revives nothing —
-      # c1's decl re-writes the shared register only after c2's previous-iteration value
-      # is already dead. A loop-CARRIED var on either side still disqualifies.
+      # In-loop decls qualify like any other: loop-body locals have per-iteration
+      # lifetime (no loop-carrying semantics), so the back-edge revives nothing —
+      # c1's decl re-writes the shared register only after c2's previous-iteration
+      # value is already dead.
       var inheritSrc = ""                       # non-empty ⇒ this var inherits `inheritSrc`'s reg
-      let nvi = b.an.vars.getOrDefault(name)
       if not copyInheritDisabled and b.md.arch == X86 and hasValue and
-         AddrTaken notin props and slot.inRegClass and not slot.isFloat and
-         (not nvi.declInLoop or nvi.rebornEachIteration):
+         AddrTaken notin props and slot.inRegClass and not slot.isFloat:
         let srcSym = copyCastSrcSym(valCur)
         if srcSym.kind == Symbol:
           let srcName = symName(srcSym)
@@ -430,7 +425,6 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
           let svi = b.an.vars.getOrDefault(srcName)
           if sh.kind == InReg and not sh.typ.isFloat and sh.typ.size == slot.size and
              svi.defs == 1 and svi.lastUsePos <= b.posOf(srcSym) and
-             (not svi.declInLoop or svi.rebornEachIteration) and
              (sh.r in b.md.intCalleeSavedSet or AllRegs in props):
             inheritSrc = srcName
       # NOTE: identity-cast value ALIASING (the c1-LIVE case) was reverted — it produced
@@ -491,15 +485,17 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
       else:
         b.record(pos, name, loc)
         b.scopeVars[^1].add name
-      # Register the coarse early-free, unless declared in a loop (a later loop-body
-      # decl could reuse the reg across the back-edge). This deliberately includes
-      # REBORN in-loop vars: the hazard is not this var's own liveness (a reborn var
-      # is dead after its last per-iteration use) but the freed register being taken
-      # by a later decl whose var IS loop-carried — this decl's re-execution would
-      # clobber that carried value on the next iteration. Stored by name so the flush
-      # frees the var's *current* reg (it may have been evicted to the stack).
+      # Register the coarse early-free. In-loop decls participate too: a loop-body
+      # local's lifetime is per-iteration (no loop-carrying semantics — its scope
+      # ends within the iteration), so once the walk passes its last use the
+      # register is genuinely reusable. A later same-body decl that takes it is
+      # itself per-iteration, and this var's decl re-executing on the next
+      # iteration overwrites only dead values. An OUTSIDE-declared var used in the
+      # loop is protected by its `freeAfter` extension over the whole loop span.
+      # Stored by name so the flush frees the var's *current* reg (it may have
+      # been evicted to the stack).
       let vi = b.an.vars.getOrDefault(name)
-      if loc.kind == InReg and not vi.declInLoop:
+      if loc.kind == InReg:
         b.pendingFree.add (pos: vi.freeAfter, name: name)
 
 proc walk(b: var Builder; n: var Cursor) =

@@ -15,8 +15,10 @@
 ## value is an interval test — does the value's live range contain a call? —
 ## not a whole-scope one. A local whose range ends before the first call, or
 ## starts after the last, is call-free even if the scope has calls elsewhere.
-## Loop-carried locals (`declInLoop`) are live across the back-edge, so we use
-## their enclosing loop's span as the interval (any call in the loop crosses).
+## A local DECLARED inside a loop has per-iteration lifetime (its scope ends
+## within the iteration), so it is never loop-carried; only a local declared
+## OUTSIDE a loop and used inside is carried, and its `freeAfter` extends over
+## that loop's span (see `declLoopDepth`).
 ## Locals live across a call go to callee-saved registers or the stack. The
 ## register allocator consumes this.
 ##
@@ -50,8 +52,14 @@ type
                                ## greater) is carried across that loop's back-edge, so
                                ## `freeAfter` extends to `loopStack[declLoopDepth].hi` — the
                                ## outermost enclosing loop the decl is NOT inside.
-    declInLoop*: bool          ## declared inside a loop → not early-freed (a later
-                               ## loop-body decl could reuse the reg across the back-edge)
+    declInLoop*: bool          ## declared inside a loop — INFORMATIONAL only (census/
+                               ## debug). A loop-body local has NO loop-carrying
+                               ## semantics: its lifetime ends within the iteration (its
+                               ## scope end), so every iteration re-creates it before any
+                               ## use — reads of a previous iteration's value are illegal
+                               ## IR. Loop-carrying exists only for vars declared OUTSIDE
+                               ## a loop and used inside; `declLoopDepth`'s `freeAfter`
+                               ## extension covers exactly those.
     liveStart*: int            ## token position of the var's declaration: the start of
                                ## its (coarse) live range, paired with `freeAfter` as the
                                ## end. A call strictly after `liveStart` and at/before
@@ -72,11 +80,6 @@ type
                                ## the initializer (e.g. `let x = f(…)`) precedes the
                                ## birth, so it cannot clobber the value; 0 when no
                                ## initializer
-    loopLo*, loopHi*: int      ## for loop-CARRIED vars (`declInLoop` and not
-                               ## `rebornEachIteration`): span of the innermost enclosing
-                               ## loop, used as the live interval instead of
-                               ## `(liveStart, freeAfter]` (the value is carried across the
-                               ## back-edge, so any call in the loop crosses it)
 
   InitClass* = enum
     ## What a local's DECL initializer is, after peeling value-preserving wrappers
@@ -125,7 +128,8 @@ type
     ##  * `usedAfterCall`: a param read anywhere in a loop that contains a call is
     ##    read again *after* that call via the back-edge — even a param used only in
     ##    the loop CONDITION, which textually precedes the body's call.
-    lo, hi: int                ## token span of the whole loop (for `declInLoop` liveness)
+    lo, hi: int                ## token span of the whole loop (the `declLoopDepth`
+                               ## back-edge extension for OUTSIDE-declared vars)
     sawCall: bool              ## a real call point occurred within this loop (any depth)
     usedParams: HashSet[string] ## names of params read within this loop (any depth); on
                                ## loop exit, if `sawCall`, each is flagged `usedAfterCall`
@@ -170,21 +174,6 @@ type
 const
   LoopWeight = 3   ## assume a loop body runs ~3× for weighting purposes
 
-proc rebornEachIteration*(vi: VarInfo): bool {.inline.} =
-  ## A loop-declared var whose ONE def is its decl initializer is NOT loop-carried:
-  ## the decl re-executes and re-initializes it every iteration before any use can
-  ## read it — a use cannot textually precede its decl, so every path from the
-  ## back-edge to a use passes the (re-)initialization first. This is a purely
-  ## scoping/dominance argument about the DECL, not about the loop's head: it holds
-  ## for `while cond` today and equally for the planned bare `loop` form (where the
-  ## condition becomes body statements — whose temps then profit from exactly this
-  ## rule). Such a var's live interval is its precise `(liveStart, freeAfter]`, not
-  ## the enclosing loop span; `freeAfter` still extends over any DEEPER loop a use
-  ## sits in (`declLoopDepth`), so a value carried across an inner back-edge keeps
-  ## that inner span. NOTE: early-free stays denied for ALL in-loop decls including
-  ## reborn ones — freeing mid-body would let a LATER decl take the register, and a
-  ## loop-carried later var would then be clobbered by this decl's re-execution.
-  vi.declInLoop and vi.defs == 1 and vi.initClass != icNone
 
 proc posOf(c: Context; cur: Cursor): int {.inline.} =
   cursorToPosition(c.buf[], cur)
@@ -270,7 +259,6 @@ proc analyseVarDecl(c: var Context; n: var Cursor) =
                      frameIdx: c.stmtEnd.high, declInLoop: inLoop, liveStart: declPos,
                      declLoopDepth: c.loopStack.len, paramIdx: -1,
                      initClass: (if hasValue: classifyInit(n) else: icNone))
-    if inLoop: (vi.loopLo = c.loopStack[^1].lo; vi.loopHi = c.loopStack[^1].hi)
     c.res.vars[vn] = vi
     if hasValue:
       analyse(c, n)              # analyse the initializer
@@ -518,7 +506,7 @@ proc analyse(c: var Context; n: var Cursor) =
       # Treat `while cond: body` as `loop: (if cond: body else break)` — condition and
       # body are one loop body under a back-edge (no prepass; the traversal just reads it
       # that way). Walk it as usual, then resolve the back-edge at the frame.
-      var e = n; skip e               # span of the whole loop, for declInLoop vars
+      var e = n; skip e               # span of the whole loop (back-edge extension)
       c.loopStack.add LoopFrame(lo: posOf(c, n), hi: posOf(c, e))
       n.into:
         inc c.inLoops
@@ -569,8 +557,8 @@ when defined(arkhamPeakLive):
     ## simultaneously alive — arkham's structural analogue of gcc's register-pressure
     ## count. A value occupies a register/slot over its interval, so the peak is the
     ## minimum registers a spill-free allocation would need. Params (`freeAfter ==
-    ## high`) span the whole body; loop-carried locals use their loop span; others
-    ## use `[liveStart, freeAfter]`. Inclusive containment: a value is alive at any
+    ## high`) span the whole body; others use `[liveStart, freeAfter]` (loop-body
+    ## locals have per-iteration lifetime, so the precise interval is exact). Inclusive containment: a value is alive at any
     ## point within its interval. Prints one greppable line per proc to stderr.
     type Iv = tuple[name: string, lo, hi: int]
     var ivs: seq[Iv] = @[]
@@ -578,8 +566,6 @@ when defined(arkhamPeakLive):
       var lo, hi: int
       if vi.freeAfter == high(int):
         lo = procStartPos; hi = procEndPos          # a param: live across the body
-      elif vi.declInLoop and not vi.rebornEachIteration:
-        lo = vi.loopLo; hi = vi.loopHi              # loop-carried: whole loop span
       else:
         lo = vi.liveStart; hi = vi.freeAfter
       ivs.add (name, lo, hi)
@@ -667,11 +653,14 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
   c.res.hasCall = c.callPositions.len > 0
   c.res.callPositions = c.callPositions
   # Grant `AllRegs` (volatile/caller-saved eligible) to every local whose live
-  # interval contains no call point. The interval is `(liveStart, freeAfter]`
-  # for ordinary locals, or the enclosing-loop span for loop-carried ones. The
-  # check is conservative: `freeAfter` over-approximates the range end and a
-  # call within it denies `AllRegs`, so a missed-but-live-across-call case is
-  # impossible (the unsafe direction). Params (`freeAfter == high`) are skipped.
+  # interval `(liveStart, freeAfter]` contains no call point. Loop-body locals
+  # need no special span: their lifetime is per-iteration, and an OUTSIDE-
+  # declared local used in a loop already had `freeAfter` extended over that
+  # loop (`declLoopDepth`), so a value carried across a back-edge keeps every
+  # call of that loop inside its interval. The check is conservative:
+  # `freeAfter` over-approximates the range end and a call within it denies
+  # `AllRegs`, so a missed-but-live-across-call case is impossible (the unsafe
+  # direction). Params (`freeAfter == high`) are skipped.
   for name, vi in mpairs c.res.vars:
     if vi.freeAfter == high(int): continue
     # Birth-point exemption: a `let x = f(…)` initializer's own call precedes the
@@ -684,16 +673,11 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
     # initializer subtree can COINCIDE with the next statement's own token
     # position, and a call there is after the birth — it must still deny. Only
     # calls strictly INSIDE the initializer (p < initEndPos) are exempt.
-    # Only loop-CARRIED vars use the loop span; a reborn one is re-initialized
-    # each iteration before any use, so its precise interval (and, for a root-call
-    # initializer, the birth exemption) applies exactly as in straight-line code.
     let birthOk = birthFilterEnv.len == 0 or
                   (birthFilterEnv != "-" and pname in birthFilterEnv.split(','))
-    let carried = vi.declInLoop and not vi.rebornEachIteration
-    let lo = if carried: vi.loopLo
-             elif vi.initClass == icCall and birthOk: vi.initEndPos - 1
+    let lo = if vi.initClass == icCall and birthOk: vi.initEndPos - 1
              else: vi.liveStart
-    let hi = if carried: vi.loopHi else: vi.freeAfter
+    let hi = vi.freeAfter
     var crossesCall = false
     for p in c.callPositions:
       if p > lo and p <= hi: (crossesCall = true; break)
@@ -749,7 +733,7 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
     for name, vi in c.res.vars:
       if vi.freeAfter == high(int): continue      # params: homed by allocParams
       inc nLocals
-      if AllRegs notin vi.props and not vi.declInLoop and vi.initEndPos > 0:
+      if AllRegs notin vi.props and vi.initEndPos > 0:
         var crosses = false
         for p in c.callPositions:
           if p >= vi.initEndPos and p <= vi.freeAfter: (crosses = true; break)
