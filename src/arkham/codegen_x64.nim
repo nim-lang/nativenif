@@ -2421,6 +2421,14 @@ proc emitLeafImm(g: var CodeGen; dest: var Location; natural: Location) =
   if dest.kind == InReg:
     if dest.isTemp and not g.rb.isBoundTemp(dest.r): g.bindTemp(dest.r, dest.typ)
     g.movImm(dest.r, natural.ival)
+  elif dest.kind == NamedStack and dest.spillTemp:
+    # `needsReg` under a dry pool minted an etmp slot: the literal MUST be
+    # stored into it (silently skipping it hands the consumer's reload
+    # garbage) — through staging, like produceIntoMem2.
+    let s = g.pickStagingSealed("a literal spill", dest.typ)
+    g.movImm(s, natural.ival)
+    g.emitStoreLoc(dest, s)
+    g.giveBack s
 
 proc emitValue2(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED decide-and-emit (vmgen dest threading): resolve `dest` — a

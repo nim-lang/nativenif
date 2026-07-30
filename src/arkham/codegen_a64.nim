@@ -2954,6 +2954,15 @@ proc emitLeafImm(g: var CodeGen; dest: var Location; natural: Location) =
   if dest.kind == InReg:
     if dest.isTemp and not g.rb.isBoundTemp(dest.r): g.bindTemp(dest.r, dest.typ)
     g.placeImm(dest.r, natural)
+  elif dest.kind == NamedStack and dest.spillTemp:
+    # `needsReg` under a dry pool minted an etmp slot: the literal MUST be
+    # stored into it (silently skipping it hands the consumer's reload
+    # garbage) — through the produce bridge, like produceIntoMem2.
+    let s = R16
+    g.bindTemp(s, dest.typ)
+    g.placeImm(s, natural)
+    g.storeReg2(dest, s)
+    g.unbindTemp(s)
 
 proc produceIntoMem2(g: var CodeGen; c: Cursor; dst: Location) =
   ## FUSED totality bridge: `dst` is an `(s)` spill slot (`etmpN.0`, minted when
