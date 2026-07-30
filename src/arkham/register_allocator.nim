@@ -39,34 +39,12 @@ var gArkhamCurProc* = ""   # debug: the proc arkham is currently allocating (for
 
 type
   ExprAux* = object
-    ## Per-expression-position selection decisions the pure emitter must replay
-    ## that don't fit in the result `Location` (kept in `RegAlloc.aux`, sparse —
-    ## only ops with arch constraints get an entry). Part of the value-core
-    ## rewrite (see `codegen2_design.md`): once the allocator assigns every value
-    ## position a result `Location` (in `locs`) plus this aux, codegen becomes a
-    ## pure consumer and the plan/replay seam goes away.
-    scratch*: seq[Reg]                ## extra GPRs reserved for this op (idiv RDX, a
+    ## Per-expression-position scratch memo (kept in `RegAlloc.aux`, sparse).
+    ## Written by the a64 fused lvalue walk (`emitLvalWalk`) for the `(at base
+    ## idx scratch)` non-scale stride register; read back by `emLvalAddr2` and
+    ## the lvalue release helpers.
+    scratch*: seq[Reg]                ## extra GPRs reserved for this op (a
                                       ## non-pow2 stride temp, an address scratch…)
-    heldSlot*: seq[string]            ## parallel to `scratch`: when a survivor scratch
-                                      ## could not get a callee-saved reg (`reserveHeld
-                                      ## Scratch` totality backstop), `scratch[i]` is
-                                      ## `NoReg` and this names its spill slot; the
-                                      ## emitter re-derives the address into a transient
-                                      ## at use (see `heldScratchReg`). "" ⇒ `scratch[i]`
-                                      ## is a real register.
-    fscratch*: seq[FReg]              ## extra SIMD scratch reserved for this op
-    parkRegs*: seq[Reg]               ## clobber-exposed AGGREGATE call argument: a later
-                                      ## argument's shift/div unconditionally overwrites one
-                                      ## of its ABI target registers (x86 cl/rdx), so its
-                                      ## words marshal into these callee-saved survivors
-                                      ## instead (one per word; the by-ref pointer is one)
-                                      ## and the emitter binds `(arg pN [k])` from them at
-                                      ## the END of the prepare block — the aggregate
-                                      ## analogue of the scalar parking (`pendingArgBinds`)
-    swapped*: bool                    ## operands evaluated in swapped (Sethi–Ullman) order
-    foldB*: bool                      ## operand B stays a folded memory operand (no load)
-    aliasRhs*: bool                   ## dest register aliases the rhs operand: the emitter
-                                      ## must not place lhs into dest first (`s = a - s`)
 
   LocSpan* = object
     ## Position-indexed `Location` storage for ONE proc. Token positions are

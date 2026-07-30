@@ -6656,7 +6656,6 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
         of Imm: s.add " imm=" & $l.ival
         of NamedStack, Glob, Tvar: s.add " " & l.name
         else: discard
-        if g.ra.aux.hasKey(pos): s.add "   [foldB=" & $g.ra.aux[pos].foldB & "]"
         stderr.writeLine s
   if g.retIndirect:
     g.indirectReg = RBX
