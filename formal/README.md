@@ -75,3 +75,22 @@ the implementation has.
 NIF gotcha: standalone `#...#` comments are not valid in this dialect
 (comments may only ride a `@line-info` annotation), so the spec files are
 comment-free.
+
+## TLC cross-validation
+
+`regproto.tla` is a hand-kept TLA+ mirror of `regproto.nif` for checking
+with TLC (`tla2tools.jar`, needs a JRE):
+
+    java -XX:+UseParallelGC -jar tla2tools.jar -workers 16 -deadlock \
+         -checkpoint 0 -config regproto.cfg regproto.tla
+
+(`-deadlock` *disables* TLC's deadlock check — the model has terminal
+all-dead states, and tlanif does not check deadlock either.)
+
+TLC independently confirms the tlanif result: 58,174 distinct states with
+`regproto.cfg`, invariant holds. `regproto_stress.cfg` (6 values, 2 pool
+regs, 6 slots) is the full pressure model: 67,363,106 distinct states,
+invariant holds over the complete space (TLC, 16 workers, ~2 min). If you
+edit one spec, edit the other; a diverging state count is the alarm bell.
+Note TLC dedups on 64-bit fingerprints (it reports a tiny probability of
+missed states per run); tlanif's dedup is exact.
