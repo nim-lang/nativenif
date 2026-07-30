@@ -34,6 +34,11 @@ type
     relocs*: seq[RelocEntry]  # Track instructions needing relocation
     labels*: seq[LabelDef]    # Track label definitions
     nextLabelId*: int         # Next available label ID
+    fixedRanges*: seq[(int, int)] # [start, end) byte ranges whose LAYOUT is frozen:
+                              # a `casejmp` computed-goto region (`jmp base + idx*N`)
+                              # relies on every slot keeping its exact byte size, so
+                              # the jump optimizers must not delete, invert or shrink
+                              # instructions inside — only patch displacements.
 
 # LabelId equality comparison
 proc `==`*(a, b: LabelId): bool =
@@ -252,6 +257,14 @@ proc updateRelocDisplacements*(buf: var Buffer) =
       buf.data[currentPos + 2] = byte((instr shr 16) and 0xFF)
       buf.data[currentPos + 3] = byte((instr shr 24) and 0xFF)
 
+proc inFixedRange(buf: Buffer; pos: int): bool {.inline.} =
+  ## Whether byte position `pos` lies inside a layout-frozen `casejmp` region
+  ## (see `fixedRanges`). Instructions there keep their exact size and position
+  ## relative to the region start; the optimizers only patch their displacements.
+  for (s, e) in buf.fixedRanges:
+    if pos >= s and pos < e: return true
+  false
+
 proc canUseShortJump(distance: int): bool {.inline.} =
   ## Whether a displacement fits x86's signed 8-bit (rel8) jump form.
   distance >= -128 and distance <= 127
@@ -329,6 +342,8 @@ proc prunePositions(buf: var Buffer; deadPos: HashSet[int]): seq[int] =
   result[curLen] = newData.len
   for k in 0 ..< buf.labels.len:
     buf.labels[k].position = result[buf.labels[k].position]
+  for k in 0 ..< buf.fixedRanges.len:      # no deletion happens INSIDE a fixed range
+    buf.fixedRanges[k] = (result[buf.fixedRanges[k][0]], result[buf.fixedRanges[k][1]])
   var newRelocs: seq[RelocEntry] = @[]
   for r in buf.relocs:
     if r.position in deadPos: continue
@@ -406,7 +421,8 @@ proc threadJumps*(buf: var Buffer): seq[int] =
     for i in 0 ..< buf.relocs.len:
       let r = buf.relocs[i]
       if isUncondJump(r.kind) and labelPos.hasKey(int(r.target)) and
-         labelPos[int(r.target)] == r.position + r.originalSize:
+         labelPos[int(r.target)] == r.position + r.originalSize and
+         not inFixedRange(buf, r.position):    # a casejmp slot keeps its exact size
         deadPos.incl r.position
     if deadPos.len == 0: continue             # threading may still have changed targets
 
@@ -504,9 +520,11 @@ proc invertCondJumps*(buf: var Buffer): seq[int] =
     for i in 0 ..< buf.relocs.len:
       if not isInvertibleCond(buf.relocs[i].kind): continue
       let jccPos = buf.relocs[i].position
+      if inFixedRange(buf, jccPos): continue    # a casejmp slot keeps its exact size
       let jmpPos = jccPos + buf.relocs[i].originalSize    # the branch's fall-through
       if not uncondAt.hasKey(jmpPos): continue            # fall-through is not a bare jump
       if jmpPos in deadPos: continue                       # jump already claimed this pass
+      if inFixedRange(buf, jmpPos): continue               # jmp inside a frozen region
       let j = uncondAt[jmpPos]
       let afterJmp = jmpPos + buf.relocs[j].originalSize
       # The branch must target exactly the instruction after the jump (label `L`)…
@@ -565,9 +583,12 @@ proc shortenX64Jumps*(buf: var Buffer): seq[int] =
   for ld in buf.labels: labelPos[int(ld.id)] = ld.position
 
   # Every shrinkable jump starts short; non-shrinkable relocs are permanently long.
+  # A jump inside a layout-frozen `casejmp` region must keep its emitted (long)
+  # size — the computed `base + idx*N` target arithmetic depends on it.
   var isShort = newSeq[bool](relocs.len)
   for i in 0 ..< relocs.len:
-    isShort[i] = isShrinkableX64(relocs[i].kind)
+    isShort[i] = isShrinkableX64(relocs[i].kind) and
+                 not inFixedRange(buf, relocs[i].position)
 
   # Old reloc positions in ascending order (== relocs order, already sorted), for
   # the per-pass binary search.
@@ -638,6 +659,8 @@ proc shortenX64Jumps*(buf: var Buffer): seq[int] =
 
   for k in 0 ..< buf.labels.len:
     buf.labels[k].position = result[buf.labels[k].position]
+  for k in 0 ..< buf.fixedRanges.len:      # nothing shrinks INSIDE a fixed range
+    buf.fixedRanges[k] = (result[buf.fixedRanges[k][0]], result[buf.fixedRanges[k][1]])
   buf.data = newData
   buf.relocs = newRelocs
 
