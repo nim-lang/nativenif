@@ -794,8 +794,7 @@ proc genTypeBody(g: var CodeGen; c: var Cursor) =
               g.ab.unionType:
                 c.into:
                   while c.hasMore:
-                    var bodyc = c
-                    if isUnionBranch(c): bodyc = asUnionBranch(c).body
+                    var bodyc = unionBranchBody(c)
                     if bodyc.kind != DotToken: g.genTypeBody(bodyc)
                     skip c
             else:

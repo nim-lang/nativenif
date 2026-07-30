@@ -765,6 +765,23 @@ proc resolveType*(p: var Program; c: Cursor): Cursor =
     inc guard
     assert guard < 1000, "arkham: cyclic type alias"
 
+# ── object-variant union branches ───────────────────────────────────────────
+
+proc unionBranchBody*(c: Cursor): Cursor =
+  ## The payload of a union child. A `{.union.}`'s children are `(object …)` /
+  ## `(fld …)` nodes and are returned unchanged; an object VARIANT's are
+  ## `(of RANGES BODY)` / `(else BODY)` branches, for which the BODY is returned
+  ## — a `.` when the branch declares no fields (`of x: nil`). The two shapes
+  ## never mix, so the child tag alone tells them apart.
+  result = c
+  let k = c.substructureKind
+  if k in {OfU, ElseU}:
+    var n = c
+    n.into:
+      if k == OfU: skip n                        # the `(ranges …)` selectors
+      result = n                                 # the body (a copy; `n` walks on)
+      while n.hasMore: skip n                    # drain so `into` stays balanced
+
 # ── size / layout (name-resolving — lives here, not in slots) ────────────────
 
 proc typeSizeAlign*(p: var Program; c: Cursor): (int, int)
@@ -779,8 +796,7 @@ proc unionSizeAlign(p: var Program; unionc: Cursor): (int, int) =
   var maxAl = 1
   uc.into:
     while uc.hasMore:
-      var bodyc = uc
-      if isUnionBranch(uc): bodyc = asUnionBranch(uc).body
+      let bodyc = unionBranchBody(uc)
       if bodyc.kind != DotToken:
         let (bsz, bal) = typeSizeAlign(p, bodyc)
         if bsz > maxSz: maxSz = bsz
@@ -979,8 +995,7 @@ proc fieldType*(p: var Program; objType: Cursor; field: string): Cursor =
         var u = oc
         u.into:
           while u.hasMore:
-            var br = u
-            if isUnionBranch(u): br = asUnionBranch(u).body
+            var br = unionBranchBody(u)
             if br.kind != DotToken:
               br.into:
                 skip br                        # branch base slot (`.`)
