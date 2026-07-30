@@ -72,7 +72,8 @@ type
                                ## the initializer (e.g. `let x = f(…)`) precedes the
                                ## birth, so it cannot clobber the value; 0 when no
                                ## initializer
-    loopLo*, loopHi*: int      ## for `declInLoop` vars: span of the innermost enclosing
+    loopLo*, loopHi*: int      ## for loop-CARRIED vars (`declInLoop` and not
+                               ## `rebornEachIteration`): span of the innermost enclosing
                                ## loop, used as the live interval instead of
                                ## `(liveStart, freeAfter]` (the value is carried across the
                                ## back-edge, so any call in the loop crosses it)
@@ -168,6 +169,22 @@ type
 
 const
   LoopWeight = 3   ## assume a loop body runs ~3× for weighting purposes
+
+proc rebornEachIteration*(vi: VarInfo): bool {.inline.} =
+  ## A loop-declared var whose ONE def is its decl initializer is NOT loop-carried:
+  ## the decl re-executes and re-initializes it every iteration before any use can
+  ## read it — a use cannot textually precede its decl, so every path from the
+  ## back-edge to a use passes the (re-)initialization first. This is a purely
+  ## scoping/dominance argument about the DECL, not about the loop's head: it holds
+  ## for `while cond` today and equally for the planned bare `loop` form (where the
+  ## condition becomes body statements — whose temps then profit from exactly this
+  ## rule). Such a var's live interval is its precise `(liveStart, freeAfter]`, not
+  ## the enclosing loop span; `freeAfter` still extends over any DEEPER loop a use
+  ## sits in (`declLoopDepth`), so a value carried across an inner back-edge keeps
+  ## that inner span. NOTE: early-free stays denied for ALL in-loop decls including
+  ## reborn ones — freeing mid-body would let a LATER decl take the register, and a
+  ## loop-carried later var would then be clobbered by this decl's re-execution.
+  vi.declInLoop and vi.defs == 1 and vi.initClass != icNone
 
 proc posOf(c: Context; cur: Cursor): int {.inline.} =
   cursorToPosition(c.buf[], cur)
@@ -561,7 +578,7 @@ when defined(arkhamPeakLive):
       var lo, hi: int
       if vi.freeAfter == high(int):
         lo = procStartPos; hi = procEndPos          # a param: live across the body
-      elif vi.declInLoop:
+      elif vi.declInLoop and not vi.rebornEachIteration:
         lo = vi.loopLo; hi = vi.loopHi              # loop-carried: whole loop span
       else:
         lo = vi.liveStart; hi = vi.freeAfter
@@ -667,12 +684,16 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
     # initializer subtree can COINCIDE with the next statement's own token
     # position, and a call there is after the birth — it must still deny. Only
     # calls strictly INSIDE the initializer (p < initEndPos) are exempt.
+    # Only loop-CARRIED vars use the loop span; a reborn one is re-initialized
+    # each iteration before any use, so its precise interval (and, for a root-call
+    # initializer, the birth exemption) applies exactly as in straight-line code.
     let birthOk = birthFilterEnv.len == 0 or
                   (birthFilterEnv != "-" and pname in birthFilterEnv.split(','))
-    let lo = if vi.declInLoop: vi.loopLo
+    let carried = vi.declInLoop and not vi.rebornEachIteration
+    let lo = if carried: vi.loopLo
              elif vi.initClass == icCall and birthOk: vi.initEndPos - 1
              else: vi.liveStart
-    let hi = if vi.declInLoop: vi.loopHi else: vi.freeAfter
+    let hi = if carried: vi.loopHi else: vi.freeAfter
     var crossesCall = false
     for p in c.callPositions:
       if p > lo and p <= hi: (crossesCall = true; break)
