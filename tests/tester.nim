@@ -203,14 +203,18 @@ const arkhamStressKnown: seq[(string, int, string)] = @[
   # regression (the defect got easier to hit) and reported as new, while passing at
   # or below it says the defect is gone. That keeps a sweep quiet and still strict.
   #
-  # 1. SILENT MISCOMPILE (k<=2). `emitAtomicInstr2`'s `AtomicCompareExchangeOp`
-  #    hardcodes RAX (architecturally `cmpxchg`'s comparand) but `instrOperandReg`
-  #    never excludes RAX from the `expected`/`desired`/cell operands. When the
-  #    pools starve enough for `desired` to land in RAX, the `mov rax, *expected`
-  #    emitted between them destroys it, and the CAS compares the value against
-  #    itself — it "succeeds" and stores the OLD value. RDX (idiv) and RCX (shift
-  #    count) are modeled as fixed roles in `MachineDesc`; RAX's cmpxchg role is not.
-  ("atomic_ptr_cell", 2, "cmpxchg desired-operand aliases the RAX comparand"),
+  # 1. FIXED — the cmpxchg/RAX silent miscompile. `emitAtomicInstr2` claims RAX
+  #    (architecturally `cmpxchg`'s comparand) but nothing kept the `expected` /
+  #    `desired` / cell operands off it: RAX is in no allocator POOL, yet
+  #    `takeInstrReg`'s staging fallback draws from `StagingCandidates`, where RAX
+  #    sits second. Starve the pools, `desired` lands in RAX, the `mov rax, *expected`
+  #    emitted between them destroys it, and the CAS compares the cell against itself
+  #    — it "succeeds" and stores the OLD value back. `emitInstr2` now seals
+  #    `atomicRegClaims(op)` across the result and operand picks. Stating the claim
+  #    PER ROW is what keeps it affordable: a compare-exchange uses no `work`
+  #    register, so it gets the R11 bridge back in exchange for RAX and still fits.
+  #    Pinned by `atomic_cas_regpressure` (k<=3) and `atomic_ptr_cell`/`atomic2`
+  #    (k<=2). Emission at full pools is byte-identical across the whole corpus.
   # 2. INVALID ASM-NIF (k<=3), caught by nifasm rather than miscompiled:
   #    `(mov (mem (rsp) p3.0) p3.0)` — "expected (i 64), got (stackoff (i 64))".
   ("aggr_copy_regpressure", 3, "nested-aggregate copy emits a stackoff into a value slot"),
@@ -227,6 +231,14 @@ const arkhamStressKnown: seq[(string, int, string)] = @[
   ("aggr_arg_parked", 4, "clobber-exposed aggregate-arg park has no spill arm"),
   ("aggr_arg_parked_byref", 3, "clobber-exposed aggregate-arg park has no spill arm"),
   ("aggr_arg_parked_manual", 4, "clobber-exposed aggregate-arg park has no spill arm"),
+  # 5. TOTALITY GAP (k<=2), the same class as 4 and found by the fixture written to
+  #    pin 1. `takeInstrReg` documents its assert as a contract — an `(instr …)`
+  #    operand has no memory form — so when the pools AND the staging set are dry it
+  #    raises rather than evicting a live local to a slot. Three live locals plus a
+  #    three-operand compare-exchange do not fit two registers per pool. Loud and
+  #    correct, not a miscompile, but it is still an arm with no answer; the fix is
+  #    the same steal-and-spill arm `takeHeld(canSpill)` already has.
+  ("atomic_cas_regpressure", 2, "intrinsic-operand pick has no steal/spill arm"),
 ]
 
 proc arkhamStressTests(arch: string; runner = ""; skip: seq[string] = @[];
@@ -575,7 +587,7 @@ when defined(linux) and defined(amd64):
 
 const arkhamStressA64Known: seq[(string, int, string)] = @[
   # The AArch64 half of the 2026-08-03 stress findings (see `arkhamStressKnown`).
-  # Both entries are SILENT MISCOMPILES — the fixture builds and runs and returns
+  # The first two are SILENT MISCOMPILES — the fixture builds and runs and returns
   # the wrong answer, which is the class neither the corpus nor a totality argument
   # can see. Shrinking a pool may cost performance or hit a documented
   # out-of-registers assert; it can never legitimately change what a program
@@ -589,6 +601,12 @@ const arkhamStressA64Known: seq[(string, int, string)] = @[
   # failure is not monotone in the pool size). The allocator's `trySteal` over a
   # straddling live range.
   ("steal_straddle", 4, "trySteal over a straddling live range yields a stale value"),
+  # The a64 half of x64 finding 5: the same out-of-registers assert on the same new
+  # fixture, one level LOOSER (this pass floors at k=3, and that is where it lands).
+  # The compare-exchange itself is fine here — a64 has no fixed-register CAS, it is
+  # `ldxr`/`stxr` on whatever the allocator picked — so this is purely the missing
+  # steal/spill arm on the intrinsic-operand pick, not an aliasing bug.
+  ("atomic_cas_regpressure", 3, "intrinsic-operand pick has no steal/spill arm"),
 ]
 
 # The AArch64 backend gets the same starved-pool pass, under qemu. Its `takeHeld`

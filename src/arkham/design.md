@@ -187,3 +187,22 @@ that the value arriving in it is the right one.
 `ARKHAM_STRESS_LEVELS=4,3,2`. Known-broken fixtures are listed with the pool size
 at which they break, so a NEW failure — or an old one reaching a *looser* pool — is
 fatal.
+
+### Fixed-register roles must be stated, not assumed
+
+The first defect this mode found is the shape to watch for. `MachineDesc` models
+the roles the *allocator* has to respect — `divRemReg` (rdx, clobbered by `idiv`),
+`shiftCountReg` (rcx) — and the pools then simply omit rax. Every atomic lowering
+read that omission as "rax is mine", which held right up to the point where the
+pools ran dry and `takeInstrReg` fell through to the staging set, where rax is the
+second candidate. A compare-exchange's `desired` landed there, the `mov rax,
+*expected` that precedes the `cmpxchg` destroyed it, and the CAS compared the cell
+against itself: reported success, stored the old value back.
+
+The rule this leaves behind: **a register an emitter claims must be excluded where
+the claim is made, not inferred from a pool it happens not to be in.** The
+exclusion belongs to the *row*, not the opcode class — `atomicRegClaims` names rax
+only for the rows that spin on a `cmpxchg` and r11 only for the rows that need a
+`work` register, and a compare-exchange (which needs no `work`) gets the bridge
+back in exchange. A blanket claim would have been the easy fix and would have made
+three-operand atomics stop compiling under pressure instead.
