@@ -1536,13 +1536,18 @@ proc genTypeBody(g: var CodeGen; c: var Cursor) =
           if baseName.len > 0: g.ab.sym baseName
           while c.hasMore:
             if c.kind == TagLit and c.typeKind == UnionT:
-              # An object VARIANT's union part: `(union (object …branch)+)`. Each branch
-              # is an object whose fields are sequential; branches overlap (nifasm lays
-              # the union out as max branch size). Emit it through — `genTypeBody`
-              # recurses on each branch object.
+              # An object VARIANT's union part. Each branch is `(of RANGES BODY)` /
+              # `(else BODY)` whose body is an object with sequential fields; branches
+              # overlap (nifasm lays the union out as max branch size). The asm-NIF
+              # union is UNTAGGED, so emit only the bodies — the discriminant lives in
+              # the `fld` preceding the union, which is emitted as an ordinary field.
+              # A body-less branch (`of x: nil`) contributes no member.
               g.ab.unionType:
                 c.into:
-                  while c.hasMore: g.genTypeBody(c)
+                  while c.hasMore:
+                    var bodyc = unionBranchBody(c)
+                    if bodyc.kind != DotToken: g.genTypeBody(bodyc)
+                    skip c
             else:
               c.into:                         # (fld :name pragmas type)
                 let fn = symName(c); inc c
