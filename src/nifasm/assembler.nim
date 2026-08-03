@@ -4054,14 +4054,23 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
               error("(arg ...) in mem must denote a stack argument", n)
             displacement = int32(argOff.immVal)
             if argName != SymId(0): ctx.callContext.argsSet.incl argName
-            # The slot IS the parameter, so it carries the parameter's declared type —
-            # not the machine word a bare `(rsp)` base would otherwise imply. Without
-            # this, storing e.g. a `nil` into a stack-passed `pointer` parameter is a
-            # type error against a phantom `(i 64)`. An AGGREGATE keeps the word type:
-            # `(arg pN k)` addresses one eightbyte of it, not the whole object.
+            # The slot IS the parameter, so it may carry the parameter's declared type
+            # rather than the machine word a bare `(rsp)` base would otherwise imply.
+            # Without this, storing e.g. a `nil` into a stack-passed `pointer` parameter
+            # is a type error against a phantom `(i 64)`.
+            #
+            # ONLY for a type that fills the whole eightbyte, because the operand type is
+            # also the ACCESS WIDTH (`memWidthOpc`/`intMemAccess`). Every stack argument
+            # occupies a full slot (`alignedSize` rounds up to 8) and the CALLEE reads the
+            # whole slot — arkham's `emitStackParamLoadsX64` loads a word — so narrowing
+            # the store for a sub-word parameter, a `bool` say, would leave the upper
+            # bytes holding whatever the previous call left in the outgoing area, and the
+            # callee would read that junk along with the value. An AGGREGATE keeps the
+            # word type too: `(arg pN k)` addresses one eightbyte of it, not the object.
             if argOff.typ != nil:
               let pt = if argOff.typ.kind == StackOffT: argOff.typ.offType else: argOff.typ
-              if pt != nil and pt.kind notin {TypeKind.ObjectT, TypeKind.ArrayT, TypeKind.UnionT}:
+              if pt != nil and asmSizeOf(pt) == 8 and
+                 pt.kind notin {TypeKind.ObjectT, TypeKind.ArrayT, TypeKind.UnionT}:
                 stackVarType = pt
           elif n.hasMore and (n.kind == IntLit or n.kind == Symbol):
             if n.kind == IntLit:

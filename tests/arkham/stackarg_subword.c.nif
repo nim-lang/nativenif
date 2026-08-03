@@ -1,0 +1,58 @@
+(.nif27)
+(.indexat 0                )
+(stmts
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :dirty.0
+  (params
+   (param :a.0 . (i 64))
+   (param :b.0 . (i 64))
+   (param :c.0 . (i 64))
+   (param :d.0 . (i 64))
+   (param :e.0 . (i 64))
+   (param :f.0 . (i 64))
+   (param :g.0 . (i 64))
+   (param :h.0 . (i 64))
+   (param :i.0 . (i 64))
+   (param :j.0 . (i 64)))
+  (i 64).
+  (stmts
+   (ret a.0)))
+ (proc :pick.0
+  (params
+   (param :a.0 . (i 64))
+   (param :b.0 . (i 64))
+   (param :c.0 . (i 64))
+   (param :d.0 . (i 64))
+   (param :e.0 . (i 64))
+   (param :f.0 . (i 64))
+   (param :flag.0 . (bool))
+   (param :x.0 . (i 64)))
+  (i 64).
+  (stmts
+   (if
+    (elif flag.0
+     (stmts
+      (ret x.0))))
+   (ret 0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :junk.0 . (i 64) (call dirty.0 1 2 3 4 5 6 72340172838076672 72340172838076672 72340172838076672 72340172838076672))
+   (var :r1.0 . (i 64) (call pick.0 1 2 3 4 5 6 (false) 99))
+   (var :r2.0 . (i 64) (call pick.0 1 2 3 4 5 6 (true) 42))
+   (call exit.c
+    (add
+     (i 64)
+     (add
+      (i 64)r1.0 r2.0)
+     (sub
+      (i 64)junk.0 1))))))(.index)
