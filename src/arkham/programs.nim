@@ -152,6 +152,12 @@ const LinuxSyscalls* = {
   "stat":       (4,   -1),
   "lstat":      (6,   -1),
   "ftruncate":  (77,  46),
+  # `fallocate(fd, mode, offset, len)` — the Linux syscall glibc/musl also export
+  # under that exact name, which is why posix.nim's `posix_fallocate` binds
+  # `fallocate` rather than `posix_fallocate` (no syscall of the latter exists;
+  # glibc's version is this call plus a write-the-gaps fallback). Argument order
+  # matches the kernel ABI 1:1.
+  "fallocate":  (285, 47),
   # No libc `futex` symbol exists (callers use the generic `syscall(SYS_futex,…)`
   # wrapper), but `std/private/syslocks` declares a *named* `futex` importc for the
   # libc-free build precisely so this row recognizes it — the futex arguments map

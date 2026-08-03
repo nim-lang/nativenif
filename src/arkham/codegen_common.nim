@@ -164,6 +164,11 @@ type
                                              ## register pressure. Keyed by the at/pat position,
                                              ## populated in `prematLval2`, consumed by
                                              ## `emLvalAddr2`, released by `unbindLvalTemps2`.
+    lvalStrideBorrowed*: HashSet[int]        ## x64: the `lvalStride` entries that BORROW the
+                                             ## consuming instruction's destination register
+                                             ## instead of taking a staging reg of their own.
+                                             ## The consumer owns that register, so
+                                             ## `dropLvalStride` must not unbind it.
     lvalGlobBase*: Table[int, Reg]           ## x64: the address of a module-level global
                                              ## aggregate base used in a transient LOAD (e.g. a
                                              ## float field read whose result is an xmm, so the
