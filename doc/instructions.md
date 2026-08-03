@@ -482,3 +482,4 @@
 | `(clz D S N)`         | A64Inst                     | count leading zeros: D = number of leading zero bits of S; `N` is the operand size in bits (32 or 64) |
 | `(rbit D S N)`        | A64Inst                     | reverse bit order of S into D (with `clz` this is a count-trailing-zeros); `N` is the operand size in bits |
 | `(rev D S N)`         | A64Inst                     | reverse byte order of S into D; `N` is the operand size in bits (32 or 64) |
+| `(casejmp S T ...)`   | X64Inst                     | computed-goto case dispatch (`imul S,S,N; lea T,[rip+slots]; add T,S; jmp T`): the `(stmts ...)` children are the branch bodies, NOP-padded to the measured uniform slot size N, so no lookup table and no memory load. S holds the 0-based slot index; S and T are destroyed. Every branch must end in a terminating jump (the pad NOPs are never executed) and must not define a label at its very end |

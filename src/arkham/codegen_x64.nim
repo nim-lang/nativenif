@@ -5408,6 +5408,112 @@ proc tryEmitCmov(g: var CodeGen; c: Cursor): bool =
   g.giveBack rT
   return true
 
+# ── computed-goto case dispatch (issue #32) ──────────────────────────────────
+
+proc genStmt2(g: var CodeGen; c: Cursor)
+
+const CaseJmpMinBranches = 4
+  ## Below this the cmp/je chain is at most 3 compares — cheaper than the
+  ## dispatch preamble (mov+sub+cmp+ja+imul+lea+add+jmp).
+
+proc tryEmitCaseJmp(g: var CodeGen; c: Cursor): bool =
+  ## Lower a DENSE `case` as a computed goto (`(casejmp …)`, see nifasm): the
+  ## branch bodies become uniform NOP-padded slots and the dispatch is
+  ## `jmp base + (sel-lo)*N` — no compare chain, no lookup table, no memory
+  ## load. Fits when every of-branch has exactly ONE value, the values cover
+  ## [lo, hi] with no gaps, and there are at least `CaseJmpMinBranches` of
+  ## them. A non-match (sel < lo or > hi, one unsigned compare after the
+  ## rebase) falls to else / the end. Returns false when the shape doesn't
+  ## fit; the caller then uses the compare-chain lowering.
+  var vals: seq[(int64, Cursor)] = @[]          # (branch value, body stmts cursor)
+  var elseAt = c
+  var hasElse = false
+  var probe = sub(c)
+  skip probe                                    # the selector expression
+  while probe.hasMore:
+    case probe.substructureKind
+    of OfU:
+      var b = sub(probe)                        # at the (ranges …) child
+      var r = sub(b)
+      var nvals = 0
+      var v = 0'i64
+      while r.hasMore:
+        if r.kind == TagLit and r.substructureKind == RangeU:
+          return false                          # a lo..hi range: not a single slot
+        v = branchImm(r)
+        inc nvals
+      if nvals != 1: return false               # `of 1, 3:` would need body duplication
+      skip b                                    # past (ranges …) → the body stmts
+      vals.add (v, b)
+      skip probe
+    of ElseU:
+      hasElse = true; elseAt = probe; skip probe
+    else: skip probe
+  if vals.len < CaseJmpMinBranches: return false
+  vals.sort(proc (x, y: (int64, Cursor)): int = cmp(x[0], y[0]))
+  for i in 1 ..< vals.len:                      # exactly dense: k, k+1, k+2, …
+    if vals[i][0] != vals[i-1][0] + 1: return false  # a gap (or duplicate) breaks slot arithmetic
+  let lo = vals[0][0]
+  let hi = vals[^1][0]
+  if lo < low(int32).int64 or hi > high(int32).int64: return false  # sub/cmp fold imm32
+  # ── shape fits: emit ──
+  let lEnd = g.freshLabel()
+  let lElse = if hasElse: g.freshLabel() else: lEnd
+  var cc = c
+  cc.into:
+    let selC = cc
+    g.emitValue2(cc); skip cc                   # selector → its location
+    while cc.hasMore: skip cc                   # bodies are emitted from `vals`
+    let selLoc = g.ra.locs[cursorToPosition(g.buf[], selC)]
+    # The slot index is COMPUTED IN PLACE (sub + imul destroy it), so it never
+    # uses a live local's home register: copy/load the selector into a sealed
+    # staging register first.
+    var idx: Reg
+    if selLoc.kind == InReg:
+      idx = g.pickStagingSealed("casejmp index", ScalarSlot, avoid = selLoc.r)
+      g.movReg(idx, selLoc.r)
+      if selLoc.isTemp: g.unbindTemp(selLoc.r)  # selector dead after the copy
+    else:
+      idx = g.pickStagingSealed("casejmp index", ScalarSlot)
+      g.emitLoadLoc(selLoc, idx)
+    if lo != 0: g.binImm(SubX64, idx, lo)       # rebase to 0-based slot index
+    # One UNSIGNED compare catches both sides: sel < lo wraps to a huge value.
+    g.ab.tree CmpX64: (g.emReg idx; g.ab.intLit hi - lo)
+    g.emJcc(JaX64, lElse)
+    let base = g.pickStagingSealed("casejmp base", AddrSlot)
+    let mirrorSnap = g.regMirror                # dispatch-point cache state (a copy)
+    var released = false
+    g.ab.tree CasejmpX64:
+      g.emReg idx
+      g.emReg base
+      for (v, body) in vals:
+        # Each slot is entered via the indirect jump with the DISPATCH-POINT
+        # register-cache state; no label exists to join through, so restore it
+        # by hand (the emJmp below folds each slot's exit into lEnd's join).
+        if g.regCacheOn:
+          g.regMirror = mirrorSnap
+          g.mirrorLive = true
+        g.ab.tree StmtsX64:
+          if not released:
+            # idx/base are dead once the indirect jump ran. Release them as slot
+            # 0's first (zero-byte) statements: the `(kill)`s unbind sequentially
+            # for the whole rest of the stream, and unsealing here keeps the R11
+            # staging bridge available to spills inside the slot bodies (the
+            # `produceIntoMem2` totality guarantee).
+            g.giveBack base
+            g.giveBack idx
+            released = true
+          g.genStmt2(body)                      # the branch body (a stmts node)
+          g.emJmp(lEnd)                         # every slot ends in a terminating jump
+    g.mirrorLive = false                        # nothing falls out of the region
+    if hasElse:
+      g.emLab(lElse)
+      var e = elseAt
+      e.into:
+        while e.hasMore: (g.genStmt2(e); skip e)
+  g.emLab(lEnd)
+  result = true
+
 proc genStmt2(g: var CodeGen; c: Cursor) =
   if c.kind == DotToken: return                 # an empty statement (e.g. `(stmts .)`)
   # Capture our own tail-position, then default children to non-tail: only the
@@ -5543,6 +5649,9 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
           g.emJmp(g.retLabel2); g.retLabelUsed2 = true
       while cc.hasMore: skip cc
   of CaseS:
+    # A dense single-value case lowers to the computed-goto dispatch (issue #32);
+    # anything else falls through to the compare-chain lowering below.
+    if g.tryEmitCaseJmp(c): return
     # `(case Expr (of (ranges BranchRange+) StmtList)* (else StmtList)?)`. Mirrors the
     # legacy genCase: selector → a register live across ALL range tests; a non-match
     # falls through to else (or the end); bodies are emitted AFTER the test chain, so

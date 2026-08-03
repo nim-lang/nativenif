@@ -4969,6 +4969,100 @@ proc checkDistinctAluRegs(dest, op: Operand; mnemonic: string; n: Cursor) =
           ") — dropped source operand (staging/scratch register collided with the " &
           "destination); the value-carrying register must be a distinct typed binding", n)
 
+proc shiftCodePositions(ctx: var GenContext; at, by: int) =
+  ## Rebase every recorded byte position `>= at` by `by` freshly inserted bytes
+  ## (the `casejmp` NOP padding). A label/reloc exactly AT the insert point
+  ## belongs to the code AFTER the padding (the next slot), so `>=` is right —
+  ## which is also why a casejmp branch body must not define a label at its very
+  ## end (see doc/instructions.md).
+  for k in 0 ..< ctx.buf.relocs.len:
+    if ctx.buf.relocs[k].position >= at: ctx.buf.relocs[k].position += by
+  for k in 0 ..< ctx.buf.labels.len:
+    if ctx.buf.labels[k].position >= at: ctx.buf.labels[k].position += by
+  for k in 0 ..< ctx.buf.fixedRanges.len:      # a NESTED casejmp region inside a slot
+    let (s, e) = ctx.buf.fixedRanges[k]
+    ctx.buf.fixedRanges[k] = ((if s >= at: s + by else: s), (if e >= at: e + by else: e))
+  for k in 0 ..< ctx.gvarSites.len:
+    if ctx.gvarSites[k][0] >= at: ctx.gvarSites[k] = (ctx.gvarSites[k][0] + by, ctx.gvarSites[k][1])
+  for k in 0 ..< ctx.ssizePatches.len:
+    if ctx.ssizePatches[k] >= at: ctx.ssizePatches[k] += by
+  for k in 0 ..< ctx.csizePatches.len:
+    if ctx.csizePatches[k][0] >= at: ctx.csizePatches[k] = (ctx.csizePatches[k][0] + by, ctx.csizePatches[k][1])
+  for k in 0 ..< ctx.tlvSites.len:
+    if ctx.tlvSites[k][0] >= at: ctx.tlvSites[k] = (ctx.tlvSites[k][0] + by, ctx.tlvSites[k][1])
+
+proc genCasejmpX64(n: var Cursor; ctx: var GenContext) =
+  ## `(casejmp S T (stmts …)+)` — computed-goto case dispatch (issue #32). The
+  ## k-th `(stmts …)` child is slot k's branch body. Bodies are emitted
+  ## back-to-back and NOP-padded to the measured uniform slot size N, so the
+  ## dispatch is pure arithmetic — no lookup table, no memory load:
+  ##     imul S, S, N          ; slot index → byte offset (N patched below)
+  ##     lea  T, [rip+slots]   ; T ← &slot0
+  ##     add  T, S
+  ##     jmp  T                ; the pad NOPs are never executed
+  ## Every body must end in a terminating jump/exit (arkham emits `jmp lEnd`),
+  ## so falling into the padding is impossible. The [slots, end) region is
+  ## registered as a layout-frozen `fixedRange`: the jump optimizers must not
+  ## delete/invert/shrink instructions inside, or `T + S*N` lands mid-instruction.
+  let start = n
+  n.into:
+    # S: the slot-index register (read, then destroyed by the imul). A raw `(reg)`
+    # or a register-bound local name; parseOperand also runs the clobber check.
+    let selOp = parseOperand(n, ctx)
+    if selOp.kind != okReg:
+      error("casejmp selector must be a register or register-bound local", start)
+    # T: the base scratch — write-only, so parse it like a `lea` destination.
+    var baseReg: x86.Register
+    if not leaRegBase(n, ctx, baseReg):
+      error("casejmp scratch must be a register or register-bound local", start)
+    if baseReg == selOp.reg:
+      error("casejmp scratch and selector occupy the same register (" & $baseReg & ")", start)
+    # ── dispatch preamble: fixed byte size, independent of the patched N ──
+    x86.emitImulImm(ctx.buf.data, selOp.reg, 0)      # S *= N (imm32 patched below)
+    let immPos = ctx.buf.data.len - 4
+    let slotsLab = ctx.buf.createLabel()
+    x86.emitLea(ctx.buf, baseReg, slotsLab)          # T ← &slot0 (rkLea, always 7 bytes)
+    x86.emitAdd(ctx.buf.data, baseReg, selOp.reg)
+    x86.emitJmpReg(ctx.buf.data, baseReg)
+    ctx.clobbered.excl(selOp.reg)                    # both are freshly written here
+    ctx.clobbered.excl(baseReg)
+    # ── slot bodies, back-to-back; measure each. Slots execute EXCLUSIVELY
+    # (exactly one runs per dispatch), so clobber state forks per slot and
+    # merges as the union — same rule as `ite`'s branches. ──
+    ctx.buf.defineLabel(slotsLab)
+    let slotsStart = ctx.buf.data.len
+    let clobBefore = ctx.clobbered
+    var clobUnion = ctx.clobbered
+    var bounds: seq[(int, int)] = @[]
+    while n.hasMore:
+      if not (n.kind == TagLit and n.tag == StmtsTagId):
+        error("casejmp children must be (stmts …) branch bodies", n)
+      let s = ctx.buf.data.len
+      ctx.clobbered = clobBefore
+      genInstX64(n, ctx)                             # the StmtsX64 arm drains the body
+      clobUnion = clobUnion + ctx.clobbered
+      bounds.add (s, ctx.buf.data.len)
+    ctx.clobbered = clobUnion
+    if bounds.len == 0:
+      error("casejmp requires at least one (stmts …) branch body", start)
+    var slotSize = 0
+    for (s, e) in bounds: slotSize = max(slotSize, e - s)
+    # ── NOP-pad every slot to the uniform size, last-to-first so earlier insert
+    # points stay valid; every recorded position past an insert is rebased ──
+    for i in countdown(bounds.len - 1, 0):
+      let (s, e) = bounds[i]
+      let pad = slotSize - (e - s)
+      if pad > 0:
+        insertRepeated(ctx.buf.data, e, 0x90'u8, pad)
+        shiftCodePositions(ctx, e, pad)
+    # patch the measured slot size into the imul (immPos precedes the region: stable)
+    let nv = uint32(slotSize)
+    ctx.buf.data[immPos]     = byte(nv and 0xFF)
+    ctx.buf.data[immPos + 1] = byte((nv shr 8) and 0xFF)
+    ctx.buf.data[immPos + 2] = byte((nv shr 16) and 0xFF)
+    ctx.buf.data[immPos + 3] = byte((nv shr 24) and 0xFF)
+    ctx.buf.fixedRanges.add (slotsStart, slotsStart + bounds.len * slotSize)
+
 proc genInstX64(n: var Cursor; ctx: var GenContext) =
   if n.kind != TagLit: error("Expected instruction", n)
   let instTag = tagToX64Inst(n.tag)
@@ -5914,6 +6008,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
   of NopX64:
     inc n
     x86.emitNop(ctx.buf.data)
+  of CasejmpX64:
+    genCasejmpX64(n, ctx)
   of RepmovsbX64, RepmovswX64, RepmovsdX64, RepmovsqX64:
     # The `rep movs` family names NONE of its operands in the tree: it copies `rcx`
     # units from `[rsi]` to `[rdi]`, advancing both pointers and leaving `rcx` at 0.
