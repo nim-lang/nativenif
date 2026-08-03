@@ -13,7 +13,7 @@
 ## target `MachineDesc` so the backends drive the (shared) register allocator
 ## and scratch pools from it.
 
-import std / [tables, sets, assertions, algorithm]
+import std / [tables, sets, assertions, algorithm, strutils]
 import symparser
 import nifcore, nifcdecl
 import slots, machinedesc, analyser, register_allocator, programs
@@ -201,6 +201,35 @@ type
     asmInfo*: string                          ## last `file(line, col)` seen while walking an
                                               ## `.assembler` body: the fallback location for a
                                               ## rejection on a node with no line info of its own
+
+proc isInitPrologueStmt*(c: Cursor; index: int): bool =
+  ## Is statement `index` of a module init proc's body part of the prefix that must run
+  ## BEFORE the module's global initializers?
+  ##
+  ## nimony builds that body as: the once-only guard (`if iniGuard: return`, then
+  ## `iniGuard = true` — always the first two statements, see lengcgen's
+  ## `genInitProc`), then one call per imported module's init, then the module's own
+  ## top-level code. Nim initializes an imported module completely before the importer
+  ## runs, and executes a top-level `var x = expr` in source order among that code — so
+  ## the initializers belong exactly after this prefix and before the rest.
+  if index < 2: return true                      # the guard pair
+  if c.stmtKind != CallS: return false
+  var cc = c
+  cc.into:
+    result = cc.kind == Symbol and symName(cc).startsWith "`ini.0."
+    while cc.hasMore: skip cc
+
+proc runsGlobalInits*(g: CodeGen; info: ProcInfo): bool {.inline.} =
+  ## Is `info` the proc that must call this module's synthetic global-init proc?
+  ##
+  ## That is the module's own nimony init proc — NOT the program entry. Every module
+  ## is reached through the init chain (`main` calls its own module's init, which
+  ## calls each imported module's init first), so hanging the initializers off the
+  ## entry would run only the ENTRY module's: every other module's globals would stay
+  ## zero, and a call through one — `std/windows/winlean` exposes its `dynlib` procs
+  ## as function-pointer globals — would jump to address 0.
+  g.hasGlobalInits and g.prog.moduleInitName.len > 0 and
+    info.asmName == g.prog.moduleInitName
 
 # ── user-facing diagnostics ─────────────────────────────────────────────────
 # Most of arkham's internal consistency checks are `raiseAssert`s: they can only

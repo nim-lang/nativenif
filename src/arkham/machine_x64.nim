@@ -96,3 +96,44 @@ const
   ## The GPRs a SysV call clobbers — the caller-saved volatiles arkham manages
   ## (rax + the arg registers + r10/r11). Emitted as the proc's `(clobber …)`.
   x64ClobbersGpr* = [RAX, RDI, RSI, RDX, RCX, R8, R9, R10, R11]
+
+  WinShadowSpace* = 32
+    ## Win64 requires the caller to reserve 32 bytes below the return address that
+    ## the callee may spill its four register arguments into — present whether or
+    ## not the callee has four parameters, and NOT part of the stack-argument area.
+    ## So the 5th argument sits at `[rsp+32]`, not `[rsp+0]`. nifasm adds this base
+    ## to an `(arg …)` offset of an extern call and reserves it in the frame; the
+    ## constant is repeated there (`WinShadowSpace` in `assembler.nim`) because the
+    ## two tools share no module.
+
+  ## The Win64 calling convention, as the ABI planner (`abi.planCall`) consumes it —
+  ## used ONLY to classify the arguments of a call to an `importc`'d Windows API, the
+  ## sole foreign boundary of an otherwise self-contained image. Everything arkham
+  ## generates on BOTH sides of a call keeps `x64Machine`'s SysV assignment, which is
+  ## a valid private convention here: the Win64 callee-saved set (rbx, rbp, rdi, rsi,
+  ## r12–r15) CONTAINS SysV's (rbx, r12–r15), so a value arkham parks across a call to
+  ## kernel32 survives, and rdi/rsi — volatile under SysV, preserved under Win64 — are
+  ## only ever homes for call-free locals.
+  ##
+  ## Only the argument registers differ from `x64Machine`; the temp/callee-saved pools
+  ## describe the CALLER's own register file and are unchanged. Aggregate and float
+  ## arguments are rejected by `emitWinExtproc` rather than modelled: Win64 passes an
+  ## aggregate in a register only at size 1/2/4/8 (by reference otherwise — not the
+  ## `> threshold` rule `planCall` implements) and indexes an SSE argument register
+  ## POSITIONALLY, skipping the GPR of the same position. No Windows API arkham binds
+  ## takes either.
+  win64Machine* = MachineDesc(
+    arch: X86,
+    intRetReg: RAX,
+    divRemReg: RDX,
+    shiftCountReg: RCX,
+    intArgRegs: @[RCX, RDX, R8, R9],
+    floatArgRegs: @[F0, F1, F2, F3],
+    intTempRegs: @[R10],
+    intLocalTempRegs: @[RDI, RSI, R8, R9],
+    intCalleeSaved: @[RBX, R12, R13, R14, R15],
+    floatTempRegs: @[F8, F9, F10, F11, F12, F13, F14],
+    floatCalleeSaved: @[],
+    intCalleeSavedSet: {RBX, R12, R13, R14, R15},
+    floatCalleeSavedSet: {},
+    aggrByRefThreshold: 8)

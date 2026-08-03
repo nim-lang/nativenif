@@ -1,6 +1,6 @@
 # PE (Portable Executable) binary format writer for Windows
 
-import std / [streams]
+import std / [streams, tables]
 
 when not defined(windows):
   import std / os
@@ -176,6 +176,27 @@ const
   # Default image base for executables
   DEFAULT_IMAGE_BASE* = 0x140000000'u64  # 64-bit default
 
+  IMAGE_REL_BASED_ABSOLUTE* = 0'u16   ## padding entry; the loader skips it
+  IMAGE_REL_BASED_DIR64* = 10'u16     ## add the load delta to a 64-bit field
+
+type
+  PeLayout* = object
+    ## Where the sections landed, handed to `writePE`'s `patch` hook. The hook runs
+    ## after layout and before anything is written, which is the only moment at which
+    ## an address baked INTO the image can be computed.
+    imageBase*: uint64
+    textRva*, dataRva*: uint32
+
+  AbsSite* = object
+    ## An 8-byte ABSOLUTE address baked into the image by the `patch` hook (a
+    ## function-pointer global's initializer, a vtable slot). Unlike everything else
+    ## nifasm emits — RIP-relative, hence load-address independent — these have to be
+    ## fixed up if the loader rebases the image, so each one gets a base relocation.
+    inData*: bool     ## the site is in `.data` rather than `.text`
+    pos*: int         ## byte offset within that section
+
+  PePatchProc* = proc (lay: PeLayout) {.closure.}
+
 proc initDosHeader*(peHeaderOffset: uint32): IMAGE_DOS_HEADER =
   result.e_magic = IMAGE_DOS_SIGNATURE
   result.e_cblp = 0x90
@@ -250,11 +271,22 @@ proc initSectionHeader*(
 proc alignTo(value, alignment: uint32): uint32 =
   (value + alignment - 1) and not (alignment - 1)
 
-proc writePE*(code: var Buffer; bssSize: int; entryOffset: uint32;
-              machine: uint16; outfile: string;
-              dynlink: DynLinkInfo = DynLinkInfo()) =
-  ## Write a PE executable file
+proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
+              entryOffset: uint32; machine: uint16; outfile: string;
+              dynlink: DynLinkInfo = DynLinkInfo();
+              absSites: seq[AbsSite] = @[];
+              patch: PePatchProc = nil) =
+  ## Write a PE executable file.
+  ##
+  ## `dataImage` is the writable data section's initial contents (`bssSize` bytes; a
+  ## shorter seq is zero-extended). `patch`, if given, runs once the section RVAs are
+  ## known and before anything is written — that is where the caller bakes addresses
+  ## into `code`/`dataImage` (globals' RIP-relative `lea` displacements, absolute
+  ## function pointers). `absSites` lists the absolute 8-byte fields it writes, so
+  ## they can be listed in `.reloc` and survive ASLR.
   let hasExtProcs = dynlink.extProcs.len > 0
+  let dataSize = uint32(bssSize)
+  let hasData = dataSize > 0
 
   # DOS header size
   let dosHeaderSize = sizeof(IMAGE_DOS_HEADER).uint32
@@ -280,12 +312,14 @@ proc writePE*(code: var Buffer; bssSize: int; entryOffset: uint32;
   let fileHeaderSize = sizeof(IMAGE_FILE_HEADER).uint32
   let optHeaderSize = sizeof(IMAGE_OPTIONAL_HEADER64).uint32
 
-  # Calculate number of sections
+  # Calculate number of sections. Every `inc` here MUST have a matching section
+  # header written below — a count that overshoots makes the loader read the padding
+  # after the real headers as one more section descriptor.
   var numSections = 1'u16  # .text
-  if bssSize > 0:
-    inc numSections  # .bss or .data
   if hasExtProcs:
     inc numSections  # .idata for imports
+  if hasData:
+    inc numSections  # .data: globals (zero-filled unless statically initialized)
   inc numSections  # .reloc for ASLR support
 
   let sectionHeadersSize = uint32(numSections) * sizeof(IMAGE_SECTION_HEADER).uint32
@@ -444,43 +478,61 @@ proc writePE*(code: var Buffer; bssSize: int; entryOffset: uint32;
       currentIltOffset += 8
       currentIatOffset += 8
 
-  # Build .reloc section (minimal, for ASLR support)
-  # Since we use RIP-relative addressing, we don't have absolute references to relocate
-  # But Windows requires a valid .reloc section when DYNAMIC_BASE is set
-  # Format: Base Relocation Block(s)
-  #   - VirtualAddress (4 bytes): Page RVA
-  #   - SizeOfBlock (4 bytes): Size including header
-  #   - TypeOffset entries (2 bytes each)
-  const relocBlockSize = 12'u32  # 8 byte header + 2 padding entries (4 bytes)
-  var relocBytes: array[12, byte]
-  # Block header for page 0x1000 (.text section)
-  relocBytes[0] = byte(textRva and 0xFF)
-  relocBytes[1] = byte((textRva shr 8) and 0xFF)
-  relocBytes[2] = byte((textRva shr 16) and 0xFF)
-  relocBytes[3] = byte((textRva shr 24) and 0xFF)
-  # SizeOfBlock = 12
-  relocBytes[4] = byte(relocBlockSize and 0xFF)
-  relocBytes[5] = byte((relocBlockSize shr 8) and 0xFF)
-  relocBytes[6] = byte((relocBlockSize shr 16) and 0xFF)
-  relocBytes[7] = byte((relocBlockSize shr 24) and 0xFF)
-  # Two padding entries (type 0 = IMAGE_REL_BASED_ABSOLUTE, offset 0)
-  relocBytes[8] = 0
-  relocBytes[9] = 0
-  relocBytes[10] = 0
-  relocBytes[11] = 0
+  # .data section (globals) comes after .idata — or straight after .text when there
+  # are no imports.
+  var dataRva = 0'u32
+  if hasData:
+    dataRva = if hasExtProcs: alignTo(idataRva + idataSize, SECTION_ALIGNMENT)
+              else: alignTo(textRva + textSize, SECTION_ALIGNMENT)
+    if dataImage.len < bssSize: dataImage.setLen bssSize      # the rest is zero-filled
+    elif dataImage.len > bssSize: dataImage.setLen bssSize
 
-  let relocSize = relocBlockSize
+  # The layout is settled: let the caller bake its addresses in before anything is
+  # written. Everything else nifasm emits is RIP-relative and needed no layout.
+  if patch != nil:
+    patch(PeLayout(imageBase: DEFAULT_IMAGE_BASE, textRva: textRva, dataRva: dataRva))
+
+  # Build the .reloc section. Windows requires a valid one whenever DYNAMIC_BASE is
+  # set — and it must genuinely list every ABSOLUTE field the image contains, or a
+  # rebased load leaves those pointers aimed at the preferred base. `absSites` are the
+  # 8-byte pointers the `patch` hook wrote; everything else is RIP-relative and needs
+  # no entry. Entries are grouped into per-4K-page blocks, each `(type shl 12) or
+  # offset-in-page`, and every block is padded to a 4-byte multiple.
+  var relocBytes: seq[byte] = @[]
+  block:
+    var byPage = initOrderedTable[uint32, seq[uint16]]()
+    for s in absSites:
+      let rva = (if s.inData: dataRva else: textRva) + uint32(s.pos)
+      let page = rva and not (SECTION_ALIGNMENT - 1)
+      byPage.mgetOrPut(page, @[]).add uint16((IMAGE_REL_BASED_DIR64 shl 12) or
+                                             uint16(rva - page))
+    if byPage.len == 0:
+      # No absolute fields at all — emit the one empty block the loader tolerates,
+      # so the directory is still valid.
+      byPage[textRva] = @[]
+    for page, entries in byPage:
+      var es = entries
+      if (es.len and 1) != 0: es.add uint16(IMAGE_REL_BASED_ABSOLUTE shl 12)  # pad to 4 bytes
+      if es.len == 0: es.add(uint16(0)); es.add(uint16(0))
+      let blockSize = uint32(8 + es.len * 2)
+      for i in 0 ..< 4: relocBytes.add byte((page shr (8 * i)) and 0xFF)
+      for i in 0 ..< 4: relocBytes.add byte((blockSize shr (8 * i)) and 0xFF)
+      for e in es:
+        relocBytes.add byte(e and 0xFF)
+        relocBytes.add byte((e shr 8) and 0xFF)
+
+  let relocSize = uint32(relocBytes.len)
   let relocRawSize = alignTo(relocSize, FILE_ALIGNMENT)
 
   # Calculate final image size
   var sizeOfImage = textRva + alignTo(textSize, SECTION_ALIGNMENT)
   if hasExtProcs:
     sizeOfImage = idataRva + alignTo(idataSize, SECTION_ALIGNMENT)
+  if hasData:
+    sizeOfImage = dataRva + alignTo(dataSize, SECTION_ALIGNMENT)
   # Add .reloc section to image size
   let relocRva = sizeOfImage
   sizeOfImage = relocRva + alignTo(relocSize, SECTION_ALIGNMENT)
-  if bssSize > 0:
-    sizeOfImage += alignTo(uint32(bssSize), SECTION_ALIGNMENT)
 
   # Create headers
   var dosHeader = initDosHeader(peSignatureOffset)
@@ -529,10 +581,29 @@ proc writePE*(code: var Buffer; bssSize: int; entryOffset: uint32;
       IMAGE_SCN_CNT_INITIALIZED_DATA or IMAGE_SCN_MEM_READ or IMAGE_SCN_MEM_WRITE
     )
 
-  # .reloc section (comes after .idata or .text)
+  # .data section (globals) — after .idata, or straight after .text
+  var dataSection: IMAGE_SECTION_HEADER
+  var dataFileOffset = 0'u32
+  var dataRawSize = 0'u32
+  if hasData:
+    dataFileOffset = if hasExtProcs: idataFileOffset + idataRawSize
+                     else: textFileOffset + textRawSize
+    dataRawSize = alignTo(dataSize, FILE_ALIGNMENT)
+    dataSection = initSectionHeader(
+      ".data",
+      dataSize,
+      dataRva,
+      dataRawSize,
+      dataFileOffset,
+      IMAGE_SCN_CNT_INITIALIZED_DATA or IMAGE_SCN_MEM_READ or IMAGE_SCN_MEM_WRITE
+    )
+
+  # .reloc section (comes after .data / .idata / .text)
   var relocFileOffset = textFileOffset + textRawSize
   if hasExtProcs:
     relocFileOffset = idataFileOffset + idataRawSize
+  if hasData:
+    relocFileOffset = dataFileOffset + dataRawSize
   var relocSection = initSectionHeader(
     ".reloc",
     relocSize,
@@ -563,10 +634,13 @@ proc writePE*(code: var Buffer; bssSize: int; entryOffset: uint32;
   # Optional Header
   f.writeData(unsafeAddr optHeader, sizeof(optHeader))
 
-  # Section Headers
+  # Section Headers — one per `numSections` above, in the same order as the section
+  # bodies written below.
   f.writeData(unsafeAddr textSection, sizeof(textSection))
   if hasExtProcs:
     f.writeData(unsafeAddr idataSection, sizeof(idataSection))
+  if hasData:
+    f.writeData(unsafeAddr dataSection, sizeof(dataSection))
   f.writeData(unsafeAddr relocSection, sizeof(relocSection))
 
   # Padding to first section
@@ -625,6 +699,15 @@ proc writePE*(code: var Buffer; bssSize: int; entryOffset: uint32;
     if idataPadding > 0:
       var zeros = newSeq[byte](idataPadding)
       f.writeData(unsafeAddr zeros[0], idataPadding)
+
+  # .data section
+  if hasData:
+    if dataImage.len > 0:
+      f.writeData(unsafeAddr dataImage[0], dataImage.len)
+    let dataPadding = int(dataRawSize) - dataImage.len
+    if dataPadding > 0:
+      var zeros = newSeq[byte](dataPadding)
+      f.writeData(unsafeAddr zeros[0], dataPadding)
 
   # .reloc section
   f.writeData(unsafeAddr relocBytes[0], relocBytes.len)

@@ -3214,7 +3214,9 @@ proc emitValue2(g: var CodeGen; c: Cursor; dest: var Location) =
     if dest.kind == NamedStack and dest.spillTemp:
       g.produceIntoMem2(c, dest); return
     let nm = "msg." & $g.rodata.len & "." & g.prog.thisModuleSuffix
-    g.rodata.add (nm, strVal(c))
+    # NUL-terminated: a literal's address alone does not say whether the callee reads
+    # it as a `cstring` or as a length-carrying `string` payload. See the x86-64 twin.
+    g.rodata.add (nm, strVal(c) & '\0')
     if dest.isTemp and not g.rb.isBoundTemp(dest.r): g.bindTemp(dest.r, dest.typ)
     g.emAdr(dest.r, nm)
   of TagLit:
@@ -4766,18 +4768,27 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool;
   g.enterScope()
   if g.retIndirect: g.movReg(g.indirectReg, IndirectResultReg)
   g.emitParamMoves(info.decl)
-  if info.isEntry and g.hasGlobalInits:           # run runtime global inits at startup
-    g.ab.tree PrepareA64:
-      g.ab.sym g.globalInitSym
-      g.ab.keyword CallA64
   g.retLabel2 = g.freshLabel()
   g.retLabelUsed2 = false
   var c = info.decl
   c.into:
     inc c; skip c; skip c; skip c
     if c.stmtKind == StmtsS:
+      # In a module's init proc, inject the call to its synthetic global-init proc
+      # between the prologue (`isInitPrologueStmt`) and the module's own top-level
+      # code — see the x86-64 twin's `genModuleInitBody2`.
+      let inject = g.runsGlobalInits(info)
+      var injected = false
+      var idx = 0
       c.into:
-        while c.hasMore: (g.genStmt2(c); skip c)
+        while c.hasMore:
+          if inject and not injected and not isInitPrologueStmt(c, idx):
+            g.ab.tree PrepareA64: (g.ab.sym g.globalInitSym; g.ab.keyword CallA64)
+            injected = true
+          g.genStmt2(c); skip c
+          inc idx
+      if inject and not injected:      # a body that is prologue all the way down
+        g.ab.tree PrepareA64: (g.ab.sym g.globalInitSym; g.ab.keyword CallA64)
   g.exitScope()
   if g.retLabelUsed2: g.emLab(g.retLabel2)
   if info.isEntry and g.a64Linux:                 # the entry exits by syscall (no epilogue)
@@ -4827,8 +4838,7 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
     g.cleanSigComputed = true
   let an = analyseProc(g.buf[], info.decl, g.tvarNames,
                        cleanCallees = g.cleanSigProcs,
-                       procIsClean = isCleanSigProc(g.prog, info.decl),
-                       entryLeadingClobber = info.isEntry and g.hasGlobalInits)
+                       procIsClean = isCleanSigProc(g.prog, info.decl))
   g.varType.clear()
   g.symType.clear()
   g.retAggrName = ""; g.retIndirect = false; g.retIsFloat = false
@@ -4880,7 +4890,7 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   g.rb.resetProc(); g.aliasToDecl.clear(); g.savedHomes.clear()
   g.noFoldPos = -1
   g.emitProcBody2(info, declarative,
-                  frameHasCall = an.hasCall or (info.isEntry and g.hasGlobalInits))
+                  frameHasCall = an.hasCall or g.runsGlobalInits(info))
 
 # MODEL: the `StartEmit` per-proc reset in proofs/arkham_bindings.tla. The two-pass seam
 # below must reset every per-proc table (regLocal/boundTemps/freeTmp + the ra.locs snapshot)
@@ -4979,12 +4989,14 @@ proc genTvar(g: var CodeGen; name: string; decl: Cursor) =
 proc buildGlobalInitProc(g: var CodeGen; initBuf: var TokenBuf) =
   ## Lower each global's RUNTIME initializer into a synthetic `(proc … (stmts (asgn
   ## g e) …))` so it routes through the ordinary value-core pipeline (allocateProc +
-  ## emitProcBody2) — no special-case emitter. The entry calls this proc at startup
-  ## (see `emitProcBody2`). Const-scalar initializers are laid out as static data by
+  ## emitProcBody2) — no special-case emitter. The module's init proc calls it (see
+  ## `runsGlobalInits`). Const-scalar initializers are laid out as static data by
   ## `genGlobal` and are skipped here, so a module with none gets no init proc.
   var inits: seq[(string, Cursor)] = @[]
-  for name, decl in g.globals:
-    var c = decl
+  # DECLARATION order — one initializer may read a global a preceding one set. See the
+  # x86-64 twin.
+  for name in g.prog.globalOrder:
+    var c = g.globals[name]
     if c.stmtKind == ConstS: continue           # emitted as a rodata data blob
     c.into:
       inc c; skip c                             # name, pragmas
@@ -4995,7 +5007,9 @@ proc buildGlobalInitProc(g: var CodeGen; initBuf: var TokenBuf) =
       while c.hasMore: skip c
   if inits.len == 0: return
   g.hasGlobalInits = true
-  g.globalInitSym = "arkhamGlobalInit.0"
+  # A SELF-MODULE symbol, so the name reaches the rendered `.index` and a bundle can
+  # resolve it from the module init that calls it. See the x86-64 twin.
+  g.globalInitSym = "arkhamGlobalInit.0." & g.prog.thisModuleSuffix
   template tag(e): TagId = TagId(uint32(ord(e)))
   initBuf.openTag tag(ProcS)
   initBuf.addSymDef g.globalInitSym

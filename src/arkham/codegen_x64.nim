@@ -1303,13 +1303,18 @@ proc genPointee(g: var CodeGen; c: var Cursor) =
   else:
     g.genTypeBody(c)
 
-proc emitParamsAndResult(g: var CodeGen; c: var Cursor; byRef: bool): int =
-  ## Emit the SysV `(params (param :pN.0 <reg|s> T)…) (result (res :ret.0 (rax) T))?`
-  ## of a signature, consuming the params slot and the return type at `c`, and return
-  ## the count of integer arg registers consumed (for the clobber set). `byRef`
-  ## selects how a *named* type is emitted: by reference (`genPointee`, so a
-  ## self-referential proctype can't recurse forever) or inline (`genTypeBody`).
-  ## Shared by `genProctypeSig` and `emitSignature`.
+proc emitParamsAndResult(g: var CodeGen; c: var Cursor; byRef: bool;
+                         amd: MachineDesc): int =
+  ## Emit the `(params (param :pN.0 <reg|s> T)…) (result (res :ret.0 (rax) T))?` of a
+  ## signature under the calling convention `amd` describes, consuming the params slot
+  ## and the return type at `c`, and returning the count of integer arg registers
+  ## consumed (for the clobber set). `byRef` selects how a *named* type is emitted: by
+  ## reference (`genPointee`, so a self-referential proctype can't recurse forever) or
+  ## inline (`genTypeBody`). Shared by `genProctypeSig` and `emitSignature`.
+  ##
+  ## `amd` is `g.md` (arkham's own SysV convention) for everything arkham generates,
+  ## and `win64Machine` for a `stdcall` proctype — a pointer to foreign code, whose
+  ## signature must state where WINDOWS puts the arguments. See `isForeignAbiProctype`.
   ##
   ## A >16B by-ref aggregate RETURN is modelled as a synthetic leading pointer
   ## param `paramName(0)` in rdi — chibicc's hidden return pointer (`push_args`'s
@@ -1320,17 +1325,17 @@ proc emitParamsAndResult(g: var CodeGen; c: var Cursor; byRef: bool): int =
   var retByRef = false
   if not retIsVoid(retC):
     let rs = slotOf(g.prog, retC)
-    retByRef = rs.kind == AMem and rs.size > g.md.aggrByRefThreshold
+    retByRef = rs.kind == AMem and rs.size > amd.aggrByRefThreshold
   # THE plan (see abi.nim): register indices and name ordinals below read it —
   # a param's NAME ordinal advances by exactly 1 per param, decoupled from the
   # GPR index (a stack/float param consumes 0 GPRs, an aggregate several).
-  let plan = planCall(g.md, paramSlots(g.prog, c), retByRef)
+  let plan = planCall(amd, paramSlots(g.prog, c), retByRef)
   var pIdx = 0
   g.ab.tree ParamsD:
     if retByRef:                                # synthetic hidden result pointer in rdi
       g.ab.tree ParamD:
         g.ab.symDef paramName(0)
-        g.ab.reg g.md.intArgRegs[0]
+        g.ab.reg amd.intArgRegs[0]
         g.ab.ptrType:
           var rc = retC
           if byRef: g.genPointee(rc) else: g.genTypeBody(rc)
@@ -1356,7 +1361,7 @@ proc emitParamsAndResult(g: var CodeGen; c: var Cursor; byRef: bool): int =
                 g.ab.symDef paramName(pl.ord)
                 if not pl.onStack:
                   g.ab.tree RegsD:
-                    for k in 0 ..< pl.words: g.ab.reg g.md.gprAt(pl, k)
+                    for k in 0 ..< pl.words: g.ab.reg amd.gprAt(pl, k)
                 else:
                   g.ab.keyword SO              # doesn't fit → entirely on the stack
                 if pl.byRef:
@@ -1367,7 +1372,7 @@ proc emitParamsAndResult(g: var CodeGen; c: var Cursor; byRef: bool): int =
             else:
               g.ab.tree ParamD:
                 g.ab.symDef paramName(pl.ord)
-                if not pl.onStack: g.ab.reg g.md.gprAt(pl)
+                if not pl.onStack: g.ab.reg amd.gprAt(pl)
                 else: g.ab.keyword SO           # past the arg registers → stack-passed
                 if byRef: g.genPointee(c) else: g.genTypeBody(c)
             while c.hasMore: skip c
@@ -1391,13 +1396,14 @@ proc emitParamsAndResult(g: var CodeGen; c: var Cursor; byRef: bool): int =
         if byRef: g.genPointee(c) else: g.genTypeBody(c)
   result = plan.gpUsed
 
-proc emitAbiClobber(g: var CodeGen; numArgRegs: int) =
+proc emitAbiClobber(g: var CodeGen; numArgRegs: int;
+                    amd: MachineDesc = x64Machine) =
   ## `(clobber …)` listing the volatile GPRs EXCEPT the first `numArgRegs` integer
-  ## arg registers — they hold live params on entry, and nifasm treats a declared
-  ## clobber as clobbered there, so listing them would stop the body/callee reading
-  ## its own params.
+  ## arg registers of `amd`'s convention — they hold live params on entry, and nifasm
+  ## treats a declared clobber as clobbered there, so listing them would stop the
+  ## body/callee reading its own params.
   var paramRegs: set[Reg] = {}
-  for i in 0 ..< min(numArgRegs, g.md.intArgRegs.len): paramRegs.incl g.md.intArgRegs[i]
+  for i in 0 ..< min(numArgRegs, amd.intArgRegs.len): paramRegs.incl amd.intArgRegs[i]
   g.ab.tree ClobberD:
     for r in x64ClobbersGpr:
       if r notin paramRegs: g.ab.reg r
@@ -1447,6 +1453,94 @@ proc emitSyproc(g: var CodeGen; sp: SyscallProc) =
       g.ab.intLit sp.sysNr.int64
     while c.hasMore: skip c                       # drain the importc decl's pragmas + body
 
+const WindowsKernelDll* = "kernel32.dll"
+  ## The one DLL arkham's `importc` externs bind against. See `generateX64`.
+
+proc emitWinExtproc(g: var CodeGen; ex: Extern) =
+  ## Emit a Windows extern's declaration:
+  ## `(extproc :<name>.c.<mod> "<name>" (params (param :pN.0 <reg|s> T)…) (result …)?
+  ##  (clobber …))`.
+  ##
+  ## Unlike the Darwin extern decl — a bare name/string pair whose call sites marshal
+  ## into raw ABI registers — this carries the callee's FULL Win64 signature, so the
+  ## call goes through nifasm's declarative `(arg pN)` path. Two things fall out of
+  ## that which the raw path cannot express: nifasm CHECKS each argument against the
+  ## declared parameter, and it reserves the call's outgoing stack-argument area
+  ## (Win64 shadow space plus the 5th+ arguments) in the caller's fixed frame. The
+  ## `WriteFile` the freestanding `writeErr` calls has five parameters and needs both.
+  var c = ex.decl
+  c.into:
+    inc c                                        # name
+    var pc = c; skip c                           # params slot; c → return type
+    # THE plan (abi.nim), against the Win64 register file — the ONE place the
+    # convention of a call out to the OS differs from arkham's internal SysV one.
+    # `retByRef` is false: an aggregate return is rejected below.
+    let plan = planCall(win64Machine, paramSlots(g.prog, pc), retByRef = false)
+    g.ab.tree ExtprocD:
+      g.ab.symDef ex.asmName
+      g.ab.str ex.extName
+      var idx = 0
+      g.ab.tree ParamsD:
+        if pc.kind == TagLit:                    # (params (param …) …)
+          pc.into:
+            while pc.hasMore:
+              let pl = plan.args[idx]
+              pc.into:                           # (param :name pragmas type)
+                inc pc                           # name → positional pN.0
+                skip pc                          # pragmas
+                if pl.isFloat or pl.isAgg:
+                  # Not modelled — see `win64Machine`. No Windows API arkham binds
+                  # takes either, and guessing would miscompile silently.
+                  raiseAssert "arkham win_x64: float/aggregate parameter in extern " &
+                              ex.extName
+                g.ab.tree ParamD:
+                  g.ab.symDef paramName(pl.ord)
+                  if not pl.onStack: g.ab.reg win64Machine.gprAt(pl)
+                  else: g.ab.keyword SO          # past rcx/rdx/r8/r9 → stack-passed
+                  g.genTypeBody(pc)
+                while pc.hasMore: skip pc
+              inc idx
+      g.ab.tree ResultD:                         # c at the return type
+        if not retIsVoid(c):
+          if slotOf(g.prog, c).kind in {AFloat, AMem}:
+            raiseAssert "arkham win_x64: float/aggregate result in extern " & ex.extName
+          g.ab.symDef "ret.0"
+          g.ab.reg RAX
+          g.genTypeBody(c)
+      # The volatiles a Win64 call destroys, EXCEPT this callee's own argument
+      # registers (nifasm treats a declared clobber as already dead, so listing one
+      # would stop the call site binding its `(arg pN)`) — the same rule as
+      # `emitAbiClobber`. Declaring arkham's whole SysV volatile set is safe and
+      # deliberate: Win64 additionally PRESERVES rdi/rsi, so this over-states what is
+      # lost and can only make the caller more careful, never less.
+      var paramRegs: set[Reg] = {}
+      for i in 0 ..< min(plan.gpUsed, win64Machine.intArgRegs.len):
+        paramRegs.incl win64Machine.intArgRegs[i]
+      g.ab.tree ClobberD:
+        for r in x64ClobbersGpr:
+          if r notin paramRegs: g.ab.reg r
+    while c.hasMore: skip c                       # drain the importc decl's pragmas + body
+
+proc emitWinExitProcessDecl(g: var CodeGen; asmName: string) =
+  ## `(extproc :ExitProcess.c.<mod> "ExitProcess" (params (param :p0.0 (rcx) (u 32)))
+  ##  (result) (clobber …))` — hand-written because the entry module reaches
+  ## `ExitProcess` without declaring it: `emProcessExit` calls it to terminate the
+  ## process, but the `importc` that would have produced an `Extern` for it lives in
+  ## `system/exits`, a DIFFERENT module. (When the entry module happens to declare it
+  ## too, `generateX64` skips this and uses that decl — same symbol either way.)
+  g.ab.tree ExtprocD:
+    g.ab.symDef asmName
+    g.ab.str "ExitProcess"
+    g.ab.tree ParamsD:
+      g.ab.tree ParamD:
+        g.ab.symDef paramName(0)
+        g.ab.reg RCX
+        g.ab.uintType(32)                        # Win32 `UINT uExitCode`
+    g.ab.keyword ResultD                         # `noreturn`, hence no result
+    g.ab.tree ClobberD:
+      for r in x64ClobbersGpr:
+        if r != RCX: g.ab.reg r                  # rcx holds the argument — see emitWinExtproc
+
 proc genProctypeSig(g: var CodeGen; c: var Cursor) =
   ## Lower a Leng `(proctype Empty Params [RetType] Pragmas)` to a concrete asm-NIF
   ## signature `(proctype (params (param :pN.0 <reg|s> T)…) (result (res :ret.0 (rax)
@@ -1467,17 +1561,20 @@ proc genProctypeSig(g: var CodeGen; c: var Cursor) =
   ## registers itself. Without this, a call through such a fn-ptr fails nifasm's
   ## "Missing argument: p0.0" check.
   let declarative = isDeclarativeAbi(g.prog, c)
+  # A `stdcall` proctype points at foreign code, so its signature must state where
+  # WINDOWS reads the arguments, not where arkham's own convention puts them.
+  let amd = if isForeignAbiProctype(g.prog, c): win64Machine else: g.md
   g.ab.proctypeType:
     if declarative:
       c.into:
         skip c                                  # the Empty slot (a proc has its name here)
-        let numParams = g.emitParamsAndResult(c, byRef = true)
+        let numParams = g.emitParamsAndResult(c, byRef = true, amd)
         while c.hasMore: skip c                  # pragmas
-        g.emitAbiClobber(numParams)             # mirrors `emitSignature`
+        g.emitAbiClobber(numParams, amd)        # mirrors `emitSignature`
     else:
       g.ab.keyword ParamsD
       g.ab.keyword ResultD
-      g.emitAbiClobber(0)                       # a call destroys every volatile GPR
+      g.emitAbiClobber(0, amd)                  # a call destroys every volatile GPR
       skip c                                     # advance past the whole proctype node
 
 proc genTypeBody(g: var CodeGen; c: var Cursor) =
@@ -1614,7 +1711,9 @@ proc emitSignature(g: var CodeGen; decl: Cursor) =
     var c = decl
     c.into:
       inc c                                 # name → params slot
-      discard g.emitParamsAndResult(c, byRef = false)  # types inline (concrete proc)
+      # arkham's own convention (`g.md`): this is a proc arkham GENERATES, so both
+      # sides of every call to it are its own — see `generateX64`.
+      discard g.emitParamsAndResult(c, byRef = false, g.md)  # types inline (concrete proc)
       while c.hasMore: skip c               # pragmas, body
   else:
     g.ab.keyword ParamsD
@@ -1760,13 +1859,15 @@ proc computeFrameX64(g: var CodeGen; isEntry, hasCall: bool) =
     if r in g.ra.usedCallee: g.frameRegs.add r
   if g.stackArgBaseReg != NoReg:
     g.frameRegs.add g.stackArgBaseReg
-  # SysV requires rsp ≡ 0 (mod 16) at a `call`. The kernel enters the entry with
-  # rsp ≡ 0; a normal callee is entered with rsp ≡ 8 (the caller's pushed return
-  # address). Each saved reg is 8 bytes, so after the pushes the parity may be
-  # wrong — pad with an extra 8 when this proc itself makes a call.
+  # Both ABIs require rsp ≡ 0 (mod 16) at a `call`. A normal callee is entered with
+  # rsp ≡ 8 (the caller's pushed return address). The Linux ENTRY is the exception —
+  # the kernel jumps to it with rsp ≡ 0 and no return address; the Windows entry is
+  # not: ntdll's thread-start thunk `call`s it, so it is biased like any other callee.
+  # Each saved reg is 8 bytes, so after the pushes the parity may be wrong — pad with
+  # an extra 8 when this proc itself makes a call.
   g.framePad = 0
   if hasCall:
-    let entryBias = if isEntry: 0 else: 8
+    let entryBias = if isEntry and not g.prog.windows: 0 else: 8
     if (entryBias + 8 * g.frameRegs.len) mod 16 != 0: g.framePad = 8
   g.hasFrame = g.frameRegs.len > 0 or g.framePad > 0
 
@@ -1822,10 +1923,14 @@ proc emitStackParamLoadsX64(g: var CodeGen; decl: Cursor) =
           if pc.kind == Symbol and slotOf(g.prog, pc).kind == AMem: tn = symName(pc)
           while pc.hasMore: skip pc
         nms.add nm; tns.add tn; tcurs.add tcur; slots.add slotOf(g.prog, tcur)
+  # On Windows every caller reserves the Win64 shadow space at the bottom of its
+  # outgoing area (nifasm does this uniformly — see its `WinShadowSpace`), so the
+  # incoming stack arguments start that far above the base.
+  let argAreaBase = (if g.prog.windows: WinShadowSpace else: 0).int64
   for i, pl in planCall(g.md, slots, g.retIndirect).args:
     if not pl.onStack: continue
     let nm = nms[i]
-    let off = pl.byteOff.int64
+    let off = argAreaBase + pl.byteOff.int64
     if pl.isAgg and not pl.byRef:
       # A by-value aggregate passed entirely on the stack: declare its `(s)` home and
       # copy its eightbytes in from the incoming area `[stackArgBaseReg + byteOff + k*8]`
@@ -1928,6 +2033,38 @@ proc place2(g: var CodeGen; src: Location; dest: Reg) =
   of Imm: g.placeImm(dest, src)
   of NamedStack, Mem, Glob, Tvar: g.emitLoadLoc(src, dest)
   else: raiseAssert "arkham x64n: place2 src " & $src.kind
+
+proc winExitProcessName(g: CodeGen): string {.inline.} =
+  ## The self-module `(extproc …)` symbol for kernel32 `ExitProcess`. Named exactly
+  ## as `collect` names an `importc` extern, so a module that ALSO declares
+  ## `ExitProcess` itself (the freestanding `system/exits`) shares this one decl
+  ## instead of defining a second symbol for the same import.
+  "ExitProcess.c." & g.prog.thisModuleSuffix
+
+proc emProcessExit(g: var CodeGen; code: Location) =
+  ## Terminate the process with exit status `code` — the entry proc's tail, which
+  ## returns to nobody. On Linux that is the `exit_group` trap; on Windows it is a
+  ## call to kernel32 `ExitProcess`, since a PE image that merely returns from its
+  ## entry point leaves the exit status to whatever the thread-start thunk makes of
+  ## the register it finds.
+  if g.prog.windows:
+    var v = code
+    let r = g.pickStagingSealed("the process exit code", ScalarSlot)
+    g.place2(v, r)
+    # `ExitProcess` is `noreturn`, so nothing after this can observe a register:
+    # bind the argument and go. The declarative form is what makes nifasm reserve
+    # the call's Win64 shadow space in this frame (see `emitWinExtproc`).
+    g.ra.hasStackVars = true
+    g.ab.tree PrepareX64:
+      g.ab.sym g.winExitProcessName
+      g.ab.tree MovX64:
+        g.ab.tree ArgX: g.ab.sym paramName(0)
+        g.emReg r
+      g.ab.keyword ExtcallX64
+    g.giveBack r
+  else:
+    g.place2(code, RDI)
+    g.movImm(RAX, LinuxX64ExitNr); g.emSyscall()
 
 proc aggrAddrInto(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind: bool)
 proc bindLvalGlobalBases(g: var CodeGen; c: Cursor; bound: var seq[Reg])
@@ -2528,7 +2665,13 @@ proc emitValue2(g: var CodeGen; c: Cursor; dest: var Location) =
     if dest.kind == NamedStack and dest.spillTemp:
       g.produceIntoMem2(c, dest); return
     let nm = "msg." & $g.rodata.len & "." & g.prog.thisModuleSuffix
-    g.rodata.add (nm, strVal(c))
+    # The blob is NUL-TERMINATED. A Leng string literal reaches a call as a bare
+    # address, and nothing downstream says whether the callee reads it as a `cstring`
+    # (`nimGetProcAddr("WriteFile")`, `nimLoadLibrary("kernel32")`) or as the payload of
+    # a length-carrying `string` — so the terminator the C backend gets for free from
+    # its C literal has to be here. It is invisible to the length-carrying use, whose
+    # size travels separately.
+    g.rodata.add (nm, strVal(c) & '\0')
     if dest.isTemp and not g.rb.isBoundTemp(dest.r): g.bindTemp(dest.r, dest.typ)
     g.ab.tree LeaX64: (g.emReg dest.r; g.ab.sym nm)
   of TagLit:
@@ -4411,14 +4554,14 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
     cc.into:
       let hasVal = cc.hasMore and cc.kind != DotToken
       if g.isEntryProc:
-        # the Linux entry terminates the process: return value → exit code in rdi.
+        # the entry proc terminates the process: its return value is the exit status.
         if hasVal:
           var v = needsReg(ScalarSlot)
           g.emitValue2(cc, v)
-          g.place2(v, RDI)
+          g.emProcessExit(v)
           g.freeVal(v)
-        else: g.movImm(RDI, 0)
-        g.movImm(RAX, LinuxX64ExitNr); g.emSyscall()
+        else:
+          g.emProcessExit(immLoc(0, ScalarSlot))
       else:
         if g.retAggrName.len > 0:                          # aggregate return
           var srcName: string
@@ -5336,8 +5479,10 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
       stagedFnptr = g.pickStagingSealed("an indirect call target", AddrSlot)
       g.emitLoadLoc(fnptrLoc, stagedFnptr)
       fnptrReg = stagedFnptr
+    let foreignAbi = isForeignAbiProctype(g.prog, proctype)
     if targetCur.kind == Symbol and g.rb.boundName(fnptrReg) == symName(targetCur):
-      tgt = CallTarget(declarative: declarative, asmName: symName(targetCur), retType: retType)
+      tgt = CallTarget(declarative: declarative, asmName: symName(targetCur),
+                       retType: retType, foreignAbi: foreignAbi)
     else:
       let nm = g.rb.freshTmpName("fntmp")
       g.ab.tree RebindX64:
@@ -5347,7 +5492,8 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
         g.ab.reg fnptrReg
       g.rb.bindScratch(fnptrReg, nm, isPtr = false)
       fnTargetName = nm
-      tgt = CallTarget(declarative: declarative, asmName: nm, retType: retType)
+      tgt = CallTarget(declarative: declarative, asmName: nm, retType: retType,
+                       foreignAbi: foreignAbi)
   else:
     if not g.callTarget.hasKey(fsym):
       let si = g.lookupSym(fsym)
@@ -5359,7 +5505,8 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
           proctype = resolveType(g.prog, d)
           while d.hasMore: skip d
         g.callTarget[fsym] = CallTarget(declarative: isDeclarativeAbi(g.prog, proctype),
-          indirect: true, asmName: fsym, retType: g.indirectRetType(si.decl))
+          indirect: true, asmName: fsym, retType: g.indirectRetType(si.decl),
+          foreignAbi: isForeignAbiProctype(g.prog, proctype))
       else:
         g.callTarget[fsym] = foreignCallTarget(g.prog, fsym)
     tgt = g.callTarget[fsym]
@@ -5378,7 +5525,20 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
   let resultByRef = hasResult and resSlot.kind == AMem and resSlot.size > g.md.aggrByRefThreshold
   var callArgSlots: seq[AsmSlot] = @[]
   for a in argCurs: callArgSlots.add g.exprSlot(a)
-  let plan = planCall(g.md, callArgSlots, resultByRef)
+  # The CALLEE's argument convention. It is arkham's own (SysV) for everything arkham
+  # generates, and the OS's for the one foreign boundary: a call out to an `importc`'d
+  # Windows API. Only the argument REGISTERS differ — the temp / callee-saved pools
+  # below stay `g.md`'s, because those describe this caller's own register file.
+  let foreignCall = tgt.foreignAbi or (tgt.extern and g.prog.windows)
+  let amd = if foreignCall: win64Machine else: g.md
+  let plan = planCall(amd, callArgSlots, resultByRef)
+  if foreignCall:
+    # A Win64 call ALWAYS has an outgoing stack-argument area — the 32-byte shadow
+    # space — even with no stack-passed argument, so the frame must carry the
+    # `(ssize)` region nifasm reserved it in. (The stack-arg arms below set this too,
+    # but only when an argument actually spills; four arguments or fewer would leave
+    # the callee spilling its registers over this frame's return address.)
+    g.ra.hasStackVars = true
   # Which ABI argument registers does a LATER argument overwrite by ISA fiat?
   var laterClob: seq[set[Reg]] = @[]
   block:
@@ -5422,7 +5582,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
     # by-value aggregate results). Args go straight into raw ABI registers.
     var sealedArgs: set[Reg] = {}
     var pendingRestores: seq[tuple[dst, src: Reg]] = @[]
-    if resultByRef: (g.rb.sealAccum g.md.intArgRegs[0]; sealedArgs.incl g.md.intArgRegs[0])
+    if resultByRef: (g.rb.sealAccum amd.intArgRegs[0]; sealedArgs.incl amd.intArgRegs[0])
     for j in 0 ..< argCurs.len:
       let a = argCurs[j]
       let pl = plan.args[j]
@@ -5434,19 +5594,19 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
         var exposed = false
         if not pl.onStack:
           for k in 0 ..< pl.words:
-            if g.md.gprAt(pl, k) in laterClob[j+1]: exposed = true
+            if amd.gprAt(pl, k) in laterClob[j+1]: exposed = true
         var parked: seq[Reg] = @[]
         if exposed:
           for k in 0 ..< pl.words:
             let h = g.takeHeld("a clobber-exposed aggregate call argument")
             heldArgs.add h
             parked.add h.r
-        var marshalRegs = @(g.md.intArgRegs[pl.gpFirst ..< pl.gpFirst + pl.words])
+        var marshalRegs = @(amd.intArgRegs[pl.gpFirst ..< pl.gpFirst + pl.words])
         if parked.len > 0:
           marshalRegs = parked
           for k in 0 ..< pl.words:
             g.releaseStaleName(parked[k])
-            pendingRestores.add (dst: g.md.gprAt(pl, k), src: parked[k])
+            pendingRestores.add (dst: amd.gprAt(pl, k), src: parked[k])
             g.rb.sealAccum parked[k]; sealedArgs.incl parked[k]
         if a.kind == TagLit and a.exprKind in {DotC, DerefC, AtC, PatC}:
           let addrHeld = g.takeHeld("an aggregate-arg address", canSpill = true)
@@ -5485,23 +5645,24 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
             elif home.len > 0: g.emStackAddr(marshalRegs[0], home)
             else: g.emGlobalAddr(marshalRegs[0], symName(a))
       elif g.isFloatExpr(a):
-        var fD = fregLoc(g.md.floatArgRegs[pl.fpIndex],
+        var fD = fregLoc(amd.floatArgRegs[pl.fpIndex],
                          AsmSlot(cls: AFloat, size: 8, align: 8))
         g.emitFValue2(a, fD)                       # → its xmm arg register
       else:
-        let abiReg = g.md.gprAt(pl)
+        let abiReg = amd.gprAt(pl)
         g.releaseArgDest(abiReg, (if a.kind == Symbol: symName(a) else: ""))
         var aD = regLoc(abiReg, ScalarSlot)
         g.emitValue2(a, aD)                        # → its GPR arg register
       if not pl.isFloat and not pl.onStack:
         for k in 0 ..< pl.words:
-          g.rb.sealAccum g.md.gprAt(pl, k); sealedArgs.incl g.md.gprAt(pl, k)
+          g.rb.sealAccum amd.gprAt(pl, k); sealedArgs.incl amd.gprAt(pl, k)
     for pr in pendingRestores:                     # parked words → their raw ABI registers
       g.releaseStaleName(pr.dst)
       g.movReg(pr.dst, pr.src)
     g.ab.tree PrepareX64:
       g.ab.sym tgt.asmName
       if isSyscall: g.emSyscall()
+      elif tgt.extern: g.ab.keyword ExtcallX64   # dynamic import → indirect via the IAT/GOT
       else: g.ab.keyword CallX64
     g.flushArgResidentParams()
     g.rb.unsealAccums(sealedArgs)
@@ -5522,8 +5683,8 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
     if resultByRef:
       g.ab.tree MovX64:
         g.ab.tree ArgX: g.ab.sym paramName(0)
-        g.emReg g.md.intArgRegs[0]
-      g.rb.sealAccum g.md.intArgRegs[0]; sealedArgs.incl g.md.intArgRegs[0]
+        g.emReg amd.intArgRegs[0]
+      g.rb.sealAccum amd.intArgRegs[0]; sealedArgs.incl amd.intArgRegs[0]
     for j in 0 ..< argCurs.len:
       let a = argCurs[j]
       let pl = plan.args[j]
@@ -5540,7 +5701,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
         var exposed = false
         if fits:
           for k in 0 ..< gprWords:
-            if g.md.gprAt(pl, k) in laterClob[j+1]: exposed = true
+            if amd.gprAt(pl, k) in laterClob[j+1]: exposed = true
         var parked: seq[Reg] = @[]
         if exposed:
           for k in 0 ..< gprWords:
@@ -5556,7 +5717,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
           else:
             let aSym = if a.kind == Symbol: symName(a) else: ""
             for k in 0 ..< gprWords:
-              let r = g.md.gprAt(pl, k)
+              let r = amd.gprAt(pl, k)
               g.releaseArgDest(r, aSym)
               dst.add r
         if not fits:
@@ -5633,7 +5794,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
                   if not byRef: g.ab.intLit k.int64
                 g.emReg dst[k]
       elif g.isFloatExpr(a):
-        var fD = fregLoc(g.md.floatArgRegs[pl.fpIndex],
+        var fD = fregLoc(amd.floatArgRegs[pl.fpIndex],
                          AsmSlot(cls: AFloat, size: 8, align: 8))
         g.emitFValue2(a, fD)
         g.ab.tree MovX64:
@@ -5644,7 +5805,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
         # at the end; else straight into the ABI register.
         var aD: Location
         var parkSpilled = false
-        if not pl.onStack and g.md.gprAt(pl) in laterClob[j+1]:
+        if not pl.onStack and amd.gprAt(pl) in laterClob[j+1]:
           let hr = g.pickHeldReg()
           if hr != NoReg:
             g.pickedRegs.incl hr
@@ -5661,7 +5822,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
             pendingSpillArgs.add (nameIdx: nameIdx, slot: aD)
             parkSpilled = true
         elif not pl.onStack:
-          let abiReg = g.md.gprAt(pl)
+          let abiReg = amd.gprAt(pl)
           g.releaseArgDest(abiReg, (if a.kind == Symbol: symName(a) else: ""))
           aD = regLoc(abiReg, ScalarSlot)
           g.emitValue2(a, aD)
@@ -5679,7 +5840,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
             g.emitLoadLoc(aD, srcReg)
             ownSrc = true
           if not pl.onStack:
-            if not ownSrc and srcReg != g.md.gprAt(pl):
+            if not ownSrc and srcReg != amd.gprAt(pl):
               pendingArgBinds.add (nameIdx: nameIdx, src: srcReg, wordIdx: -1)
               g.rb.sealAccum srcReg; sealedArgs.incl srcReg
             else:
@@ -5697,7 +5858,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
           if ownSrc: g.giveBack srcReg
       if not pl.isFloat and not pl.onStack:
         for k in 0 ..< pl.words:
-          g.rb.sealAccum g.md.gprAt(pl, k); sealedArgs.incl g.md.gprAt(pl, k)
+          g.rb.sealAccum amd.gprAt(pl, k); sealedArgs.incl amd.gprAt(pl, k)
     for ps in pendingSpillArgs:
       # A clobber-exposed arg that had to park in a minted slot: reload through
       # staging and bind now, after every clobbering computation ran.
@@ -5715,6 +5876,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
           if pb.wordIdx >= 0: g.ab.intLit pb.wordIdx.int64
         g.emReg pb.src
     if isSyscall: g.emSyscall()
+    elif tgt.extern: g.ab.keyword ExtcallX64     # dynamic import → indirect via the IAT/GOT
     else: g.ab.keyword CallX64
     g.flushArgResidentParams()
     if hasResult and not resultByRef and not resultIsFloat and resSlot.kind != AMem:
@@ -6130,6 +6292,30 @@ proc freeLvalTemps2(g: var CodeGen; c: Cursor) =
       while cc.hasMore: skip cc
   else: discard
 
+proc genModuleInitBody2(g: var CodeGen; c: Cursor) =
+  ## Emit a module init proc's `(stmts …)`, injecting the call to this module's
+  ## synthetic global-init proc between the prologue (`isInitPrologueStmt`) and the
+  ## module's own top-level code. Everything about it mirrors `genStmt2`'s `StmtsS`
+  ## arm; only the injection is extra. The call lands INSIDE the once-only guard
+  ## (whose early `ret` jumps to the shared epilogue), so a second call to the init
+  ## proc — one per module that imports this one — does not re-run the initializers.
+  let myTail = g.tailStmt
+  var injected = false
+  var idx = 0
+  var cc = c
+  cc.into:
+    while cc.hasMore:
+      if not injected and not isInitPrologueStmt(cc, idx):
+        g.ab.tree PrepareX64: (g.ab.sym g.globalInitSym; g.ab.keyword CallX64)
+        injected = true
+      var nx = cc; skip nx
+      g.tailStmt = myTail and not nx.hasMore
+      g.genStmt2(cc); skip cc
+      inc idx
+  if not injected:                       # a body that is prologue all the way down
+    g.tailStmt = myTail
+    g.ab.tree PrepareX64: (g.ab.sym g.globalInitSym; g.ab.keyword CallX64)
+
 proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
   ## The pure-emitter twin of `emitProcBody`, run ONCE (no plan pass). Reuses the
   ## shared signature / frame / param-settling / scope machinery; only the value
@@ -6164,10 +6350,6 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
       g.movReg(g.indirectReg, g.md.intArgRegs[0])
   g.emitParamMoves(info.decl)
   g.emitStackParamLoadsX64(info.decl)               # via stackArgBaseReg, regs now free
-  if info.isEntry and g.hasGlobalInits:              # run runtime global inits at startup
-    g.ab.tree PrepareX64:
-      g.ab.sym g.globalInitSym
-      g.ab.keyword CallX64
   g.retLabel2 = g.freshLabel()                       # shared epilogue for mid-proc `ret`
   g.retLabelUsed2 = false
   g.binNormSuppressPos = -1                          # no store-fused normalize elision pending
@@ -6177,12 +6359,14 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
     # The whole body is in tail position: after it, control reaches the epilogue.
     # The entry proc ends in an exit syscall (no epilogue jump), so leave it false.
     g.tailStmt = not info.isEntry
-    if c.stmtKind == StmtsS: g.genStmt2(c)
+    if c.stmtKind == StmtsS:
+      if g.runsGlobalInits(info): g.genModuleInitBody2(c)
+      else: g.genStmt2(c)
     while c.hasMore: skip c
   g.exitScope()
   if g.retLabelUsed2: g.emLab(g.retLabel2)           # a non-tail `ret` lands here
   if info.isEntry:
-    g.movImm(RAX, 60); g.movImm(RDI, 0); g.emSyscall()
+    g.emProcessExit(immLoc(0, ScalarSlot))    # fell off the end of `main` ⇒ exit(0)
   swap(g.ab, side)                        # back to the main buffer; `side` holds the body
   # The body is emitted — `ra.usedCallee` / `hasStackVars` are final. Finalize the
   # frame and write the prologue, then splice the body after it.
@@ -6918,8 +7102,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     g.cleanSigComputed = true
   let an = analyseProc(g.buf[], info.decl,
                        cleanCallees = g.cleanSigProcs,
-                       procIsClean = isCleanSigProc(g.prog, info.decl),
-                       entryLeadingClobber = info.isEntry and g.hasGlobalInits)
+                       procIsClean = isCleanSigProc(g.prog, info.decl))
   g.varType.clear()                           # reuse the backing storage across procs
   g.symType.clear()
   g.retAggrName = ""; g.retIndirect = false; g.retIsFloat = false
@@ -6993,7 +7176,11 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     block:
       var pc = info.decl; inc pc
       stderr.writeLine "DBG emit proc " & symName(pc)
-  g.emitProcBody2(info, an.hasCall or (info.isEntry and g.hasGlobalInits))
+  # Two procs make a call their body does not contain: the module init proc runs the
+  # global initializers, and on Windows the entry proc exits through `ExitProcess`.
+  # Either way rsp must be 16-aligned at that call.
+  g.emitProcBody2(info, an.hasCall or g.runsGlobalInits(info) or
+                        (info.isEntry and g.prog.windows))
 
 proc genGlobal(g: var CodeGen; nifName: string; decl: Cursor) =
   ## `(gvar :name <type>)` — a zero-initialized `.bss` global (also `const`); any
@@ -7051,8 +7238,8 @@ proc genGlobal(g: var CodeGen; nifName: string; decl: Cursor) =
 proc buildGlobalInitProc(g: var CodeGen; initBuf: var TokenBuf) =
   ## Lower each global's RUNTIME initializer into a synthetic `(proc … (stmts (asgn
   ## g e) …))` so it routes through the ordinary value-core pipeline (allocateProc +
-  ## emitProcBody2) — no special-case emitter. The entry calls this proc at startup
-  ## (see `emitProcBody2`). Const-scalar initializers are laid out as static data by
+  ## emitProcBody2) — no special-case emitter. The module's init proc calls it (see
+  ## `runsGlobalInits`). Const-scalar initializers are laid out as static data by
   ## `genGlobal` and are skipped here, so a module with none gets no init proc.
   ##
   ## `initBuf` shares the input buffer's pool + tag pool, so each `(asgn …)`'s symbol
@@ -7060,8 +7247,11 @@ proc buildGlobalInitProc(g: var CodeGen; initBuf: var TokenBuf) =
   ## `copyMem`. Built into a separate buffer (not the input) so `cursorToPosition`
   ## keys the allocator/emitter location map by position WITHIN `initBuf`.
   var inits: seq[(string, Cursor)] = @[]
-  for name, decl in g.globals:
-    var c = decl
+  # DECLARATION order (`globalOrder`), not `globals` table order: one initializer may
+  # read a global a preceding one set. `winlean` is exactly that — the library handle
+  # is a global, and each `dynlib` proc's own global initializer resolves through it.
+  for name in g.prog.globalOrder:
+    var c = g.globals[name]
     if c.stmtKind == ConstS: continue           # emitted as a rodata data blob
     c.into:
       inc c; skip c                             # name, pragmas
@@ -7074,7 +7264,11 @@ proc buildGlobalInitProc(g: var CodeGen; initBuf: var TokenBuf) =
       while c.hasMore: skip c
   if inits.len == 0: return
   g.hasGlobalInits = true
-  g.globalInitSym = "arkhamGlobalInit.0"
+  # A SELF-MODULE symbol (`…0.<thisModule>`), like the synthesized syprocs/extprocs:
+  # only a module-suffixed name reaches the rendered `.index`, and this one has to —
+  # it is called from the module's init proc, whose body a bundle assembles as a
+  # FOREIGN module, resolving each symbol it names by full module-qualified name.
+  g.globalInitSym = "arkhamGlobalInit.0." & g.prog.thisModuleSuffix
   template tag(e): TagId = TagId(uint32(ord(e)))
   initBuf.openTag tag(ProcS)
   initBuf.addSymDef g.globalInitSym
@@ -7090,11 +7284,20 @@ proc buildGlobalInitProc(g: var CodeGen; initBuf: var TokenBuf) =
   initBuf.closeTag()                                     # stmts
   initBuf.closeTag()                                     # proc
 
-proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool): string =
-  ## Compile a parsed Leng module to x86-64 / Linux asm-NIF text.
+proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
+                  windows = false): string =
+  ## Compile a parsed Leng module to x86-64 asm-NIF text — Linux/ELF by default, or
+  ## Windows/PE when `windows`, which nifasm's `win_x64` target assembles to a static
+  ## `.exe` that binds `kernel32.dll` through the import table.
+  ##
+  ## The two targets share ONE code generator: the image is self-contained, so the
+  ## convention on both sides of every arkham-generated call is arkham's own (SysV,
+  ## `x64Machine`) whichever OS it runs on. Only the two edges where the OS is the
+  ## other party differ — the calls out to `importc`'d Windows APIs (Win64 ABI, see
+  ## `win64Machine`) and process exit (see `emProcessExit`).
   var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: x64Machine)
   g.ab.renderReg = x64RegName                 # render register slots as x86 names
-  g.prog = collect(buf, inputPath, tags)
+  g.prog = collect(buf, inputPath, tags, windows = windows)
   g.callTarget = g.prog.callTarget
   g.globals = g.prog.globals
   g.tvars = g.prog.tvars
@@ -7105,7 +7308,26 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool): string =
   var initBuf = createTokenBuf(64, buf.pool, buf.tags)
   g.buildGlobalInitProc(initBuf)
   g.ab.tree StmtsX64:
-    g.ab.tree ArchD: g.ab.ident "x64"
+    g.ab.tree ArchD: g.ab.ident (if windows: "win_x64" else: "x64")
+    if windows:
+      # Every `importc` on Windows is a DLL import — there are no raw syscalls to
+      # lower to (see `collect`), so an image that calls out at all needs kernel32.
+      # arkham binds only kernel32 names today (`ExitProcess`, `VirtualAlloc`,
+      # `GetStdHandle`, `WriteFile`, `LoadLibraryA`, `GetProcAddress`); a
+      # `dynlib`-directed import table is future work.
+      var hasEntry = false
+      for info in g.prog.procs:
+        if info.isEntry: hasEntry = true; break
+      if g.prog.needsLibSystem or g.prog.externOrder.len > 0 or hasEntry:
+        g.ab.tree ImpD: g.ab.str WindowsKernelDll
+      var declaresExit = false
+      for ex in g.prog.externOrder:
+        if ex.asmName == g.winExitProcessName: declaresExit = true
+        g.emitWinExtproc(ex)
+      # The entry proc terminates through `ExitProcess` whether or not this module
+      # imports it — see `emitWinExitProcessDecl`.
+      if hasEntry and not declaresExit:
+        g.emitWinExitProcessDecl(g.winExitProcessName)
     for (name, decl) in g.prog.mainTypeList:
       g.genType(name, decl)
     for name, decl in g.prog.globals:

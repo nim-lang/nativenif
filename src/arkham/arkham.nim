@@ -23,7 +23,7 @@ Usage:
 
 Options:
   -o:file, --output:file   output asm-NIF file (default: <input>.asm.nif)
-  -a:arch, --arch:arch     target: arm64 (default) | x64
+  -a:arch, --arch:arch     target: arm64 (default) | x64 | linux_arm64 | win_x64
   -h, --help               show this help
 """
 
@@ -35,6 +35,7 @@ proc run(input, output, arch: string) =
   var buf = parseFromFile(input, sharedTags = tags)
   let code = case arch
              of "x64", "x86_64", "amd64": generateX64(buf, input, tags)
+             of "win_x64", "windows_x64": generateX64(buf, input, tags, windows = true)
              of "arm64", "aarch64", "": generateA64(buf, input, tags)
              of "linux_arm64", "linux_aarch64": generateA64(buf, input, tags, linux = true)
              else: quit("arkham: unknown --arch:" & arch, QuitFailure)
