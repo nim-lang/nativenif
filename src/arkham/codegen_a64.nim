@@ -4768,6 +4768,10 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool;
   g.enterScope()
   if g.retIndirect: g.movReg(g.indirectReg, IndirectResultReg)
   g.emitParamMoves(info.decl)
+  if g.initsGlobalsAtEntry(info):     # no init proc to hang them off: run them here
+    g.ab.tree PrepareA64:
+      g.ab.sym g.globalInitSym
+      g.ab.keyword CallA64
   g.retLabel2 = g.freshLabel()
   g.retLabelUsed2 = false
   var c = info.decl
@@ -4776,8 +4780,9 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool;
     if c.stmtKind == StmtsS:
       # In a module's init proc, inject the call to its synthetic global-init proc
       # between the prologue (`isInitPrologueStmt`) and the module's own top-level
-      # code — see the x86-64 twin's `genModuleInitBody2`.
-      let inject = g.runsGlobalInits(info)
+      # code — see the x86-64 twin's `genModuleInitBody2`. The entry-proc fallback
+      # above already emitted it, ahead of the whole body.
+      let inject = g.runsGlobalInits(info) and not g.initsGlobalsAtEntry(info)
       var injected = false
       var idx = 0
       c.into:
@@ -4838,7 +4843,8 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
     g.cleanSigComputed = true
   let an = analyseProc(g.buf[], info.decl, g.tvarNames,
                        cleanCallees = g.cleanSigProcs,
-                       procIsClean = isCleanSigProc(g.prog, info.decl))
+                       procIsClean = isCleanSigProc(g.prog, info.decl),
+                       entryLeadingClobber = g.initsGlobalsAtEntry(info))
   g.varType.clear()
   g.symType.clear()
   g.retAggrName = ""; g.retIndirect = false; g.retIsFloat = false

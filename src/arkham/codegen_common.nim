@@ -219,17 +219,30 @@ proc isInitPrologueStmt*(c: Cursor; index: int): bool =
     result = cc.kind == Symbol and symName(cc).startsWith "`ini.0."
     while cc.hasMore: skip cc
 
+proc initsGlobalsAtEntry*(g: CodeGen; info: ProcInfo): bool {.inline.} =
+  ## Does `info` — the program entry — host the global-init call because this module
+  ## has no nimony init proc to hang it off?
+  ##
+  ## Hand-written Leng has no init chain: every `tests/arkham` fixture is a single
+  ## module whose only startup-once proc is the entry. The call then goes at the very
+  ## FRONT of the body, not after `isInitPrologueStmt`'s prefix — that prefix
+  ## describes lengcgen's init proc and means nothing in a body someone wrote by hand.
+  g.hasGlobalInits and g.prog.moduleInitName.len == 0 and info.isEntry
+
 proc runsGlobalInits*(g: CodeGen; info: ProcInfo): bool {.inline.} =
   ## Is `info` the proc that must call this module's synthetic global-init proc?
   ##
-  ## That is the module's own nimony init proc — NOT the program entry. Every module
+  ## Normally the module's own nimony init proc — NOT the program entry. Every module
   ## is reached through the init chain (`main` calls its own module's init, which
   ## calls each imported module's init first), so hanging the initializers off the
   ## entry would run only the ENTRY module's: every other module's globals would stay
   ## zero, and a call through one — `std/windows/winlean` exposes its `dynlib` procs
   ## as function-pointer globals — would jump to address 0.
-  g.hasGlobalInits and g.prog.moduleInitName.len > 0 and
-    info.asmName == g.prog.moduleInitName
+  ##
+  ## A module with no init proc falls back to the entry — see `initsGlobalsAtEntry`.
+  if not g.hasGlobalInits: false
+  elif g.prog.moduleInitName.len > 0: info.asmName == g.prog.moduleInitName
+  else: info.isEntry
 
 # ── user-facing diagnostics ─────────────────────────────────────────────────
 # Most of arkham's internal consistency checks are `raiseAssert`s: they can only

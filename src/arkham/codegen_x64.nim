@@ -6350,6 +6350,10 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
       g.movReg(g.indirectReg, g.md.intArgRegs[0])
   g.emitParamMoves(info.decl)
   g.emitStackParamLoadsX64(info.decl)               # via stackArgBaseReg, regs now free
+  if g.initsGlobalsAtEntry(info):     # no init proc to hang them off: run them here
+    g.ab.tree PrepareX64:
+      g.ab.sym g.globalInitSym
+      g.ab.keyword CallX64
   g.retLabel2 = g.freshLabel()                       # shared epilogue for mid-proc `ret`
   g.retLabelUsed2 = false
   g.binNormSuppressPos = -1                          # no store-fused normalize elision pending
@@ -6360,7 +6364,10 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
     # The entry proc ends in an exit syscall (no epilogue jump), so leave it false.
     g.tailStmt = not info.isEntry
     if c.stmtKind == StmtsS:
-      if g.runsGlobalInits(info): g.genModuleInitBody2(c)
+      # The init-proc host injects the call INSIDE the body (after the prologue); the
+      # entry-proc fallback already emitted it above, ahead of the whole body.
+      if g.runsGlobalInits(info) and not g.initsGlobalsAtEntry(info):
+        g.genModuleInitBody2(c)
       else: g.genStmt2(c)
     while c.hasMore: skip c
   g.exitScope()
@@ -7102,7 +7109,8 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     g.cleanSigComputed = true
   let an = analyseProc(g.buf[], info.decl,
                        cleanCallees = g.cleanSigProcs,
-                       procIsClean = isCleanSigProc(g.prog, info.decl))
+                       procIsClean = isCleanSigProc(g.prog, info.decl),
+                       entryLeadingClobber = g.initsGlobalsAtEntry(info))
   g.varType.clear()                           # reuse the backing storage across procs
   g.symType.clear()
   g.retAggrName = ""; g.retIndirect = false; g.retIsFloat = false
