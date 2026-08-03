@@ -1067,3 +1067,102 @@ proc aggrLayout*(p: var Program; typeName: string): seq[FieldInfo] =
         off = align(off, fal)
         result.add (name: fn, off: off, size: fsz)
         off += fsz
+
+# ── compile-time integer constant evaluation ────────────────────────────────
+
+proc maskToWidth(v: uint64; bits: int; signed: bool): uint64 =
+  ## Wrap a 64-bit result to the operation's width, keeping the 64-bit pattern
+  ## sign-extended for signed types so nested folds see the right value.
+  if bits >= 64: return v
+  let m = (1'u64 shl bits) - 1
+  result = v and m
+  if signed and (result and (1'u64 shl (bits - 1))) != 0:
+    result = result or not m
+
+proc constFold*(p: var Program; c: Cursor): (bool, int64) =
+  ## Evaluate a compile-time-constant INTEGER expression to its value WITHOUT
+  ## advancing the cursor or emitting anything: a literal, `sizeof`/`alignof`,
+  ## or any `+ - * div mod and or xor shl shr neg bitnot` over such
+  ## (recursively) — PROVIDED the op's type child is a plain integer form
+  ## (`(i|u|c N)`), the guard that keeps this away from `.assembler` bodies,
+  ## where `(add (rax) 5)` is an instruction. The result wraps to the op's
+  ## width exactly as the runtime instruction would (`shr` on a signed type is
+  ## an ARITHMETIC shift, matching `emitBin2`'s sar; division truncates toward
+  ## zero). A fold whose runtime behaviour is a trap or target-dependent is
+  ## REFUSED instead of guessed: division by zero, signed INT64_MIN div -1,
+  ## and a shift count outside `[0, bits)`. Returns (false, 0) for anything
+  ## not a pure integer constant.
+  ##
+  ## Consulted by `allocValue` (which resolves a folded node to an `Imm`
+  ## Location — Araq's "both operands threaded to immediates" model) and
+  ## re-derived by the emitters at the same positions; being one pure function
+  ## of the subtree, the two consultations cannot disagree.
+  case c.kind
+  of IntLit:  return (true, intVal(c))
+  of UIntLit: return (true, cast[int64](uintVal(c)))
+  of CharLit: return (true, int64(ord(charLit(c))))
+  of TagLit:
+    case c.exprKind
+    of TrueC:        return (true, 1)
+    of FalseC, NilC: return (true, 0)
+    of SufC, ParC:                              # `(suf v "type")` / `(par v)`
+      var t = c; inc t
+      return constFold(p, t)
+    of SizeofC:
+      var t = c; inc t
+      return (true, typeSizeAlign(p, t)[0].int64)
+    of AlignofC:
+      var t = c; inc t
+      return (true, typeSizeAlign(p, t)[1].int64)
+    of AddC, SubC, MulC, DivC, ModC, BitandC, BitorC, BitxorC, ShlC, ShrC,
+       NegC, BitnotC:
+      var t = c; inc t                          # → the result-type child
+      if t.kind != TagLit: return (false, 0)
+      var bits = 64
+      var signed = true
+      case t.typeKind
+      of IT: bits = typeBits(t)
+      of UT: (signed = false; bits = typeBits(t))
+      of CT: (signed = false; bits = max(8, typeBits(t)))
+      else: return (false, 0)                   # not integer arithmetic
+      if bits <= 0: bits = 64                   # `(i -1)` platform int
+      let unary = c.exprKind in {NegC, BitnotC}
+      skip t                                    # → operand a
+      let (okA, ia) = constFold(p, t)
+      if not okA: return (false, 0)
+      var ib = 0'i64
+      if not unary:
+        skip t                                  # → operand b
+        let (okB, vb) = constFold(p, t)
+        if not okB: return (false, 0)
+        ib = vb
+      let a = cast[uint64](ia)
+      let b = cast[uint64](ib)
+      var v: uint64
+      case c.exprKind
+      of AddC:    v = a + b
+      of SubC:    v = a - b
+      of MulC:    v = a * b
+      of BitandC: v = a and b
+      of BitorC:  v = a or b
+      of BitxorC: v = a xor b
+      of NegC:    v = 0'u64 - a
+      of BitnotC: v = not a
+      of ShlC, ShrC:
+        if ib < 0 or ib >= bits: return (false, 0)   # target-dependent at runtime
+        if c.exprKind == ShlC: v = a shl ib
+        elif signed: v = cast[uint64](ashr(ia, ib))  # sar, as emitBin2 chooses
+        else: v = maskToWidth(a, bits, signed = false) shr ib
+      of DivC, ModC:
+        if ib == 0: return (false, 0)                # the runtime trap stays runtime
+        if signed:
+          if ia == low(int64) and ib == -1: return (false, 0)
+          v = cast[uint64](if c.exprKind == DivC: ia div ib else: ia mod ib)
+        else:
+          let ua = maskToWidth(a, bits, false)
+          let ub = maskToWidth(b, bits, false)
+          v = (if c.exprKind == DivC: ua div ub else: ua mod ub)
+      else: return (false, 0)
+      return (true, cast[int64](maskToWidth(v, bits, signed)))
+    else: return (false, 0)
+  else: return (false, 0)

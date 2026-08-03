@@ -44,11 +44,6 @@ type
     tvarNames*: HashSet[string]              ## tvar names, for the per-proc analyser
     freeTmp*: set[Reg]                       ## volatile temps free for scratch
     freeFTmp*: set[FReg]                     ## volatile SIMD/FP temps free for scratch
-    spillCount*: int                         ## fresh-spill-slot counter (per proc): when
-                                             ## the scratch pool is exhausted, a computed
-                                             ## value is materialized into an `(s)` slot
-                                             ## `spill.N` instead of a register — so register
-                                             ## allocation never fails
     retIsFloat*: bool                        ## current proc returns a float (in v0)
     retFloatBits*: int                       ## width (32/64) of the float return type
     rodata*: seq[(string, string)]           ## module-level string literals
@@ -60,6 +55,26 @@ type
                                               ## base (rsp after pushes), captured before the frame
                                               ## `sub`s so stack params survive rsp moving; else NoReg
     labelCount*: int                         ## fresh-label counter
+    emitTmpSpills*: int                      ## step-3 value core: fresh counter for emit-time
+                                             ## minted spill slots (`etmpN.0`/`eftmpN.0`/
+                                             ## `heldN.0`) — the merged emitter's analogue of
+                                             ## the allocator's `tmpSpills`. Reset per proc.
+    pickedRegs*: set[Reg]                    ## step-3 value core: GPRs handed out by `takeTmp`/
+                                             ## `takeHeld` but not yet BOUND — the reserve→bind
+                                             ## gap of the lazy-bind convention (a consumer
+                                             ## binds a temp only when it materializes a value
+                                             ## into it). Freeness filters exclude these so a
+                                             ## nested pick can't steal a reserved accumulator.
+                                             ## `freeVal` clears the flag on release.
+    pickedFRegs*: set[FReg]                  ## the SIMD twin of `pickedRegs`
+    noFoldPos*: int                          ## token pos of a `keepovf`'s op node: it must
+                                             ## EMIT even when constant-foldable, because the
+                                             ## `(ovf)` test that follows reads the hardware
+                                             ## flag that very instruction sets. -1 = none.
+                                             ## Set by genStmt2's KeepovfS around its store,
+                                             ## mirrored by the allocator's walk (same rule,
+                                             ## same position). Checked wherever a fold would
+                                             ## replace the op with an immediate.
     binNormSuppressPos*: int                 ## token pos of the ONE bin-arith node whose
                                              ## canonical sub-width `shl;sar` re-normalization is
                                              ## dead because its result feeds a truncating store of
@@ -101,7 +116,7 @@ type
                                              ## only part of it: the emitter also synthesizes
                                              ## slots (constructor temps, `nctmp…`) that no
                                              ## `symPos` knows about, and `locationOfSym`
-                                             ## reports those as `Undef` — indistinguishable
+                                             ## reports those as `NoLoc` — indistinguishable
                                              ## from a module-level global, which is NOT
                                              ## rsp-relative. A copy that wants the zero-register
                                              ## `(mem (rsp) name off)` form must tell them apart.
@@ -135,30 +150,6 @@ type
                                              ## a same-position param arg to one is a self-move.
                                              ## Computed once (see `cleanSigComputed`).
     cleanSigComputed*: bool
-    regMirror*: Table[Reg, string]           ## x64 reload-elimination cache: reg → the
-                                             ## MEMORY-homed local (`NamedStack`) whose value
-                                             ## it currently holds a live copy of. A later read
-                                             ## of that var `mov`s from the reg instead of
-                                             ## reloading `[slot]` (one fewer stack access).
-                                             ## DISTINCT from `regLocal` ("reg IS the home"):
-                                             ## a mirror's canonical home stays in memory.
-                                             ## Invalidated on any (re)write of the reg
-                                             ## (bindTemp / emRegLocalVar / rebindLocalAs /
-                                             ## releaseStaleName), a call clobber (caller-saved),
-                                             ## a store to the var or through a pointer, and
-                                             ## every label/jmp. Populated only when `regCacheOn`.
-    regCacheOn*: bool                        ## enable the `regMirror` cache (ARKHAM_REGCACHE=1).
-                                             ## OFF ⇒ nothing is cached ⇒ byte-identical output.
-    mirrorLive*: bool                        ## reg-cache: is fall-through reachable at the current
-                                             ## emit point? False after an unconditional `jmp`/exit
-                                             ## until the next `(lab)` (tracker.nim's `live`).
-    labelIn*: Table[string, Table[Reg, string]]  ## reg-cache forward-join: label → the JOIN
-                                             ## (per-register intersection) of the mirror state at
-                                             ## every jump seen to it so far. Consumed and cleared
-                                             ## at the label's `(lab)`. A FORWARD label's incoming
-                                             ## edges are all seen before it, so the join is exact;
-                                             ## a loop-header `(lab)` clears instead (its back-edge
-                                             ## predecessor is not yet emitted in this one pass).
     savedHomes*: Table[int, Location]        ## value-core pure path: a deref/at/pat base or
                                              ## index left in its stack home by the allocator is
                                              ## loaded into a transient staging reg for the lval
@@ -339,45 +330,15 @@ proc declType*(g: var CodeGen; typeCur, valueCur: Cursor): Cursor =
 
 proc tryConstFold*(g: var CodeGen; c: Cursor): (bool, int64) =
   ## Evaluate a compile-time-constant INTEGER expression to its value WITHOUT
-  ## advancing the cursor or emitting anything: a literal, `sizeof`/`alignof`, or
-  ## any `+ - * and or xor shl` over such (recursively). The caller materializes
-  ## the result as a single lazy `Imm` Location — one immediate, foldable into the
-  ## consuming `cmp`/`add`/… — instead of the runtime mov/sub sequence a tree-walk
-  ## would emit (e.g. `SmallChunkSize - sizeof(SmallChunk)` → `0xFC0`, not a
-  ## load-load-subtract). Returns (false, 0) for anything not a pure int constant.
-  case c.kind
-  of IntLit:  return (true, intVal(c))
-  of UIntLit: return (true, cast[int64](uintVal(c)))
-  of CharLit: return (true, int64(ord(charLit(c))))
-  of TagLit:
-    case c.exprKind
-    of TrueC:        return (true, 1)
-    of FalseC, NilC: return (true, 0)
-    of SufC, ParC:                               # `(suf v "type")` / `(par v)`
-      var t = c; inc t
-      return g.tryConstFold(t)
-    of SizeofC:
-      var t = c; inc t
-      return (true, typeSizeAlign(g.prog, t)[0].int64)
-    of AlignofC:
-      var t = c; inc t
-      return (true, typeSizeAlign(g.prog, t)[1].int64)
-    of AddC, SubC, MulC, BitandC, BitorC, BitxorC, ShlC:
-      var t = c; inc t; skip t                   # past the result type → operand a
-      let (okA, va) = g.tryConstFold(t); skip t  # → operand b
-      let (okB, vb) = g.tryConstFold(t)
-      if not (okA and okB): return (false, 0)
-      case c.exprKind
-      of AddC:    return (true, va + vb)
-      of SubC:    return (true, va - vb)
-      of MulC:    return (true, va * vb)
-      of BitandC: return (true, va and vb)
-      of BitorC:  return (true, va or vb)
-      of BitxorC: return (true, va xor vb)
-      of ShlC:    return (true, (if vb >= 0 and vb < 64: va shl vb else: 0))
-      else:       return (false, 0)
-    else: return (false, 0)
-  else: return (false, 0)
+  ## advancing the cursor or emitting anything. Delegates to `constFold`
+  ## (programs.nim) — the ONE width-masked evaluator the allocator and both
+  ## emitters consult, so a fold decision is a pure function of the subtree and
+  ## the passes cannot disagree about it. The caller materializes the result as
+  ## a single `Imm` Location — one immediate, foldable into the consuming
+  ## `cmp`/`add`/… — instead of the runtime mov/sub sequence a tree-walk would
+  ## emit (e.g. `SmallChunkSize - sizeof(SmallChunk)` → `0xFC0`, not a
+  ## load-load-subtract).
+  constFold(g.prog, c)
 
 proc isFloatExpr*(g: var CodeGen; c: Cursor): bool =
   ## Whether `c` has floating-point type (so it flows through the SIMD path).
@@ -397,7 +358,7 @@ proc srcWidthSigned*(g: var CodeGen; c: Cursor): tuple[width: int, signed: bool]
   of Symbol:
     let nm = symName(c)
     let loc = g.ra.locationOfSym(nm)
-    if loc.kind != Undef:
+    if loc.kind != NoLoc:
       return slotWidthSigned(loc.typ)        # a local/param: the allocator knows it
     let si = g.lookupSym(nm)                   # a global / thread-local: read its decl type
     case si.cat
@@ -670,15 +631,6 @@ proc paramName*(idx: int): string {.inline.} =
   ## `p` and collide. Each param therefore gets a distinct basename `pN`.
   result = "p" & $idx & ".0"
 
-proc spillName*(n: int): string {.inline.} =
-  ## The asm-NIF symbol for spill slot `n`. Like `paramName`, this must give each
-  ## slot a distinct *basename* (`spill0`, `spill1`, …): nifasm's scope keys stack
-  ## symbols by NIF basename (the part before the `.<counter>` suffix), so the
-  ## counter cannot disambiguate — `spill.0` and `spill.1` would both reduce to
-  ## basename `spill` and ALIAS the same stack slot (a value stored to one is read
-  ## back from the other). Hence `spillN.0`, not `spill.N`.
-  result = "spill" & $n & ".0"
-
 proc operandInReg*(g: var CodeGen; operand: Cursor; dest: Reg): bool =
   ## Does the (peeked, not consumed) `operand` resolve to a register-resident
   ## local whose home register is `dest`? The accumulator codegen evaluates a
@@ -690,33 +642,6 @@ proc operandInReg*(g: var CodeGen; operand: Cursor; dest: Reg): bool =
   if operand.kind == Symbol:
     let loc = g.ra.locationOfSym(symName(operand))
     result = loc.kind == InReg and loc.r == dest
-
-# ── caller-save (shared by both backends) ────────────────────────────────────
-proc callerSaveSetAt*(g: var CodeGen): seq[tuple[reg: Reg, name: string]] =
-  ## The caller-save LOCALS (see `RegAlloc.callerSaveHomes`) currently bound in a
-  ## register — they must be spilled around a call (which clobbers the volatile home).
-  ## The trigger is `regLocal` membership = the EMIT-TIME liveness truth (the binding
-  ## persists decl→kill), so a var live across a control-flow merge is still bound at a
-  ## call in a predecessor branch — what a coarse-`freeAfter` interval would MISS (it
-  ## under-approximates across merges; the cont.47 wall). The allocator only hands a
-  ## caller-save home to a var whose value is valid wherever it is bound (SSA-like, no
-  ## call in its initializer), so saving whenever bound is always well-defined. Sorted by
-  ## register for deterministic output.
-  if g.ra.callerSaveHomes.len == 0: return
-  for reg, name in g.rb.gprBindings:
-    if g.ra.callerSaveHomes.hasKey(name):
-      result.add (reg: reg, name: name)
-  result.sort(proc (a, b: tuple[reg: Reg, name: string]): int = cmp(ord(a.reg), ord(b.reg)))
-
-proc callerSaveSlotName*(pos: int; reg: Reg): string {.inline.} =
-  "csave." & $pos & "." & $ord(reg) & ".0"
-
-proc paramCallerSaveSlotName*(varName: string): string {.inline.} =
-  ## Permanent frame slot for a caller-save PARAMETER (declared once in the
-  ## prologue). Distinct from per-call `csave.*` scope slots used for locals —
-  ## those reclaimable arenas must not share the frame with addr-taken param
-  ## spills in a way that aliases under peak-ssize patching edge cases.
-  "pcsave." & varName
 
 # ── select-diamond recognition (shared by a64 `csel` & x64 `cmov`) ────────────
 
@@ -830,3 +755,213 @@ proc matchSelectDiamond*(g: var CodeGen; c: Cursor; sd: var SelectDiamond): bool
                      thenAsgn: thenBody, elseAsgn: elseBody,
                      thenRhs: thenRhs, elseRhs: elseRhs)
   return true
+
+proc selectStagingSlot*(g: var CodeGen; sd: SelectDiamond): AsmSlot =
+  ## The slot for the register that stages the THEN value. It receives a COPY of DST,
+  ## so it must be bound with DST's *asm* type — and a register-homed scalar local is
+  ## declared `(i 64)` whatever its logical width (see `emRegLocalVar`, same rule in
+  ## both backends). DST's own precise slot is the wrong answer: an `enum` DST would
+  ## bind the staging register `(u 8)` and nifasm then rejects the `mov` that copies
+  ## the `(i 64)`-declared DST into it. A POINTER DST keeps its real type, which is
+  ## exactly what its declaration keeps too.
+  if not cursorIsNil(sd.dst.typ.typ) and isPtrType(resolveType(g.prog, sd.dst.typ.typ)):
+    sd.dst.typ
+  else:
+    AsmSlot(cls: AInt, size: 8, align: 8)
+
+# ── emit-time temp allocation (step-3 merged value core) ─────────────────────
+# The merged emitter DECIDES expression registers at the point of emission
+# (vmgen-style dest threading) instead of reading a pre-pass plan. Register
+# freeness is DERIVED per pick from the live state the emitter already owns —
+# RegBind bindings, the pre-pass homes (symPos, immutable per proc), and the
+# call seals — the same filter discipline `pickStagingScratch` has always used.
+# No second pool-set state machine, hence no walk-synchronization invariant.
+# Homes for named locals/params remain the decl-only allocator pre-pass.
+
+proc regHoldsHome*(g: var CodeGen; r: Reg): bool =
+  ## A named local/param is homed in `r` (a pre-pass decision, immutable for the
+  ## whole proc — steals/demotes resolve before emission starts).
+  for name, pos in g.ra.symPos:
+    let loc = g.ra.locs[pos]
+    if loc.kind == InReg and loc.r == r: return true
+
+proc fregHoldsHome*(g: var CodeGen; f: FReg): bool =
+  ## The SIMD twin of `regHoldsHome`.
+  for name, pos in g.ra.symPos:
+    let loc = g.ra.locs[pos]
+    if loc.kind == InFReg and loc.f == f: return true
+
+proc regFreeForTemp*(g: var CodeGen; r: Reg): bool =
+  ## May the merged emitter hand `r` out as an expression temp right now? Not
+  ## picked-but-unbound (the reserve→bind gap), not pinned to an in-flight call
+  ## (sealed), not a live accumulator, not carrying any named binding (a local
+  ## in scope or a temp in flight), not a home. Conservative where the old
+  ## allocator was clever: a dead-but-in-scope local's home stays refused (its
+  ## binding is killed at scope exit, not at `freeAfter`) — the totality
+  ## fallback is an etmp spill, never a clobber.
+  r notin g.pickedRegs and not g.ra.isSealed(r) and not g.rb.isAccum(r) and
+    not g.rb.isBound(r) and not g.regHoldsHome(r)
+
+proc pickTempReg*(g: var CodeGen): Reg =
+  ## An expression-temp GPR: the volatile temp pool first, then a callee-saved
+  ## register (recorded in `ra.usedCallee` so the prologue saves it — the frame
+  ## is finalized AFTER body emission in the merged core). `NoReg` when every
+  ## candidate is live; the caller then mints a spill slot (`mintSpillName` +
+  ## the backend's produce-into path), keeping temp allocation total exactly
+  ## like the old `reserveTmp` fallback.
+  for r in g.md.intTempRegs:
+    if regFreeForTemp(g, r): return r
+  for r in g.md.intCalleeSaved:
+    if regFreeForTemp(g, r):
+      g.ra.usedCallee.incl r
+      return r
+  NoReg
+
+proc pickFTempReg*(g: var CodeGen): FReg =
+  ## The SIMD twin of `pickTempReg`: volatile float pool first, then the
+  ## callee-saved float pool (empty on x86-64 SysV).
+  for f in g.md.floatTempRegs:
+    if f notin g.pickedFRegs and not g.rb.isSealedF(f) and
+       g.rb.boundFName(f).len == 0 and
+       not g.rb.isBoundFTmp(f) and not g.fregHoldsHome(f):
+      if f in g.md.floatCalleeSavedSet: g.ra.usedCalleeF.incl f
+      return f
+  NoFReg
+
+proc pickHeldReg*(g: var CodeGen): Reg =
+  ## A SURVIVOR scratch: must outlive a call, so callee-saved only. `NoReg`
+  ## when the callee-saved file is fully live — the caller either spills the
+  ## (re-derivable) value to a `heldN.0` slot or fails loudly; demoting a local
+  ## mid-emission is impossible in the merged core (its uses are already
+  ## emitted), and the corpus needed that demotion exactly once.
+  for r in g.md.intCalleeSaved:
+    if regFreeForTemp(g, r):
+      g.ra.usedCallee.incl r
+      return r
+  NoReg
+
+proc mintSpillName*(g: var CodeGen; prefix: string): string =
+  ## A fresh emit-time spill-slot name (`etmp`/`eftmp`/`held` + counter). The
+  ## backend declares the `(var :name (s) T)` inline at first use — mid-body
+  ## slot decls are legal nifasm (the aggtmp constructor temps already rely on
+  ## that) — and flags `ra.hasStackVars` so the frame `sub` is emitted when the
+  ## prologue is finalized.
+  result = prefix & $g.emitTmpSpills & ".0"
+  inc g.emitTmpSpills
+  g.ra.hasStackVars = true
+
+# ── fused value core: syntactic operand predicates (shared by both backends) ─
+# Ports of the allocator's private Builder predicates; these become the only
+# copies once the allocator's expression walk is deleted.
+
+proc commutativeExpr*(ek: LengExpr): bool {.inline.} =
+  ## Integer ops for which `a op b == b op a` (so the heavier operand may be
+  ## evaluated first and the lighter one folded after). `sub` is handled too —
+  ## via a `neg` after the swap — but is NOT commutative, so it is separate.
+  ek in {AddC, MulC, BitandC, BitorC, BitxorC}
+
+proc isMemLeaf*(n: Cursor): bool {.inline.} =
+  ## A foldable memory-load operand: a `dot`/`deref`/`at`/`pat` addressing
+  ## chain in value position (folds as `op reg, [mem]` instead of pinning a
+  ## register across a sibling — operands are pure, hexer un-nests calls).
+  n.kind == TagLit and n.exprKind in {DotC, DerefC, AtC, PatC}
+
+proc isFoldableLeafE*(g: var CodeGen; n: Cursor): bool =
+  ## A value needing NO register held across a sibling subtree: an immediate,
+  ## or a function-local symbol read (folds as its reg / stack-home operand).
+  case n.kind
+  of IntLit, UIntLit, CharLit: true
+  of Symbol: g.ra.locationOfSym(symName(n)).kind in {InReg, NamedStack}
+  else: false
+
+proc symInRegE*(g: var CodeGen; n: Cursor; reg: Reg): bool {.inline.} =
+  ## Is `n` a symbol homed in `reg`? (Forbids a Sethi–Ullman swap whose
+  ## rhs-into-dest evaluation would clobber a lhs homed in dest.)
+  if n.kind != Symbol: return false
+  let h = g.ra.locationOfSym(symName(n))
+  h.kind == InReg and h.r == reg
+
+proc exprReadsRegImplE(g: var CodeGen; n: var Cursor; reg: Reg): bool =
+  if n.kind == Symbol:
+    let h = g.ra.locationOfSym(symName(n))
+    inc n
+    return h.kind == InReg and h.r == reg
+  elif n.kind == TagLit:
+    n.into:
+      while n.hasMore:
+        if g.exprReadsRegImplE(n, reg): return true
+  else:
+    inc n
+  return false
+
+proc exprReadsRegE*(g: var CodeGen; n: Cursor; reg: Reg): bool =
+  ## True iff the subtree at `n` reads a symbol homed in `reg` — the guard for
+  ## computing a binop's left operand straight into a pinned `dest` register.
+  var c = n
+  g.exprReadsRegImplE(c, reg)
+
+proc lvalueGlobalBaseE*(g: var CodeGen; n: Cursor): bool =
+  ## Does the lvalue chain `n` (a `dot`/`at` over a symbol) bottom out at a
+  ## module-level global aggregate? Such a base needs its address materialized
+  ## into a scratch register. A `deref`/`pat` base is a pointer VALUE, not a
+  ## global lvalue, so it stops the search. (Fused port of the allocator's
+  ## private `lvalueGlobalBase`.)
+  var c = n
+  case c.kind
+  of Symbol: result = g.ra.locationOfSym(symName(c)).kind == NoLoc
+  of TagLit:
+    case c.exprKind
+    of DotC, AtC:
+      var cc = c
+      cc.into:
+        result = g.lvalueGlobalBaseE(cc)
+        while cc.hasMore: skip cc
+    else: result = false
+  else: result = false
+
+proc fixedRegsClobberedByE*(g: var CodeGen; n: Cursor): set[Reg] =
+  ## Registers this expression is FORCED to overwrite because the ISA pins
+  ## them: `cl` (rcx) for a runtime shift count, rdx (+rax) for `idiv`. An
+  ## already-marshalled call argument sitting in one of them is destroyed with
+  ## no diagnostic, so the fused call marshaller parks such arguments off
+  ## their ABI register. Empty on AArch64. (Fused port of the allocator's
+  ## `fixedRegsClobberedBy`.)
+  result = {}
+  if g.md.shiftCountReg == NoReg and g.md.divRemReg == NoReg: return
+  var stack = @[n]
+  while stack.len > 0:
+    var c = stack.pop()
+    if c.kind != TagLit: continue
+    case c.exprKind
+    of ShlC, ShrC:
+      if g.md.shiftCountReg != NoReg:
+        var count = c; inc count                 # tag → result type
+        skip count                               # result type → lhs
+        skip count                               # lhs → count
+        if count.hasMore and not isConstShiftCount(count):
+          result.incl g.md.shiftCountReg
+    of DivC, ModC:
+      if g.md.divRemReg != NoReg:
+        result.incl g.md.divRemReg
+        if g.md.intRetReg != NoReg: result.incl g.md.intRetReg
+    else: discard
+    var ch = c
+    ch.into:
+      while ch.hasMore:
+        stack.add ch
+        skip ch
+
+proc subtreeHasCallE*(n: Cursor): bool =
+  ## Does this expression subtree contain a CALL? Read-only. An `(at base idx)`
+  ## whose INDEX calls — a bounds check, say — evaluates the base FIRST and
+  ## reads it back AFTER the call, so the base's scratch must be a callee-saved
+  ## survivor rather than a volatile the call clobbers. (Fused port of the
+  ## allocator's `subtreeHasCall`.)
+  if n.kind != TagLit: return false
+  if n.exprKind == CallC: return true
+  var cc = n
+  cc.into:
+    while cc.hasMore:
+      if subtreeHasCallE(cc): return true
+      skip cc
+  return false

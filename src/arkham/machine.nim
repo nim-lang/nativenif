@@ -97,9 +97,6 @@ const
     intTempRegs: @IntTempRegs,
     intLocalTempRegs: @IntTempRegs,  # AArch64 has 7 volatile int regs — scratch to spare,
                                      # so a call-free local may be homed in the temp pool
-    rescueHomeRegs: @[R6, R7],       # caller-save rescue homes: the x64-R8/R9 analogue —
-                                     # arg regs OUTSIDE the x9–x15 scratch pool, so no
-                                     # `emReg` scratch collision
     intCalleeSaved: @IntCalleeSaved,
     floatTempRegs: @FloatTempRegs,
     floatCalleeSaved: @FloatCalleeSaved,
@@ -120,7 +117,6 @@ const
     floatArgRegs: @FloatArgRegs,
     intTempRegs: @IntTempRegsN,
     intLocalTempRegs: @IntTempRegsN,
-    rescueHomeRegs: @[R6, R7],       # see aarch64Machine
     intCalleeSaved: @IntCalleeSaved,
     floatTempRegs: @FloatTempRegsN,
     floatCalleeSaved: @FloatCalleeSaved,
@@ -140,16 +136,20 @@ proc regName*(f: FReg): string =
 proc `$`*(loc: Location): string =
   case loc.kind
   of Undef: "undef"
+  of NoLoc: "noloc"
   of NeedsReg: "needsreg"
   of RegOrImm: "regorimm"
   of InReg: regName(loc.r)
   of InFReg: regName(loc.f)
-  of OnStack: "[fp," & $loc.offset & "]"
   of NamedStack: "&" & loc.name
   of Mem: "[mem]"
   of Field:
-    (if loc.baseReg == NoReg: "&" & loc.baseName else: "[" & regName(loc.baseReg) & "]") &
-      "." & loc.field
+    (case loc.base.kind
+     of FbReg: "[" & regName(loc.base.reg) & "]"
+     of FbSlot: "&" & loc.base.sym
+     of FbGlob: "@" & loc.base.sym
+     of FbTvar: "%fs:" & loc.base.sym
+     of FbLval: "[lval]") & "." & loc.field
   of Glob: "@" & loc.name
   of Tvar: "%fs:" & loc.name
   of Imm: "#" & $loc.ival
