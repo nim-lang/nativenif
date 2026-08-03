@@ -170,6 +170,179 @@ proc arkhamTests() =
 # test's stem here only when it fails under THIS pass alone (static ELF, svc
 # syscalls, qemu); an AArch64 gap that the macOS run would hit too goes in
 # `arkhamA64Unsupported`.
+# ── register-pressure stress pass (`-d:arkhamStress`, see src/arkham/stress.nim) ──
+#
+# The corpus above is NECESSARY BUT NEVER SUFFICIENT, and the project has the
+# receipts: the five 2026-07-30 nimsem regressions and the eight 2026-08-03
+# self-host fixes were ALL green here before they were found, every one of them by
+# bootstrapping nimony instead. The common factor is register pressure — these
+# fixtures are small enough that no pool ever runs dry, so the emitters' pool-dry
+# arms (produce-into-memory, staging chains, survivor parking) are never taken.
+#
+# This pass reaches that regime without writing bigger fixtures: it re-runs the SAME
+# corpus against a deliberately starved register file (`ARKHAM_STRESS=k` keeps only
+# the first `k` registers of each allocatable pool). Each fixture's own
+# `.exitcode`/`.output` remains the oracle, so the pass checks totality (no pool-dry
+# assert) AND correctness under maximum spilling — the second half is the one a
+# totality argument alone cannot give you, and it is where the `cmpxchg` miscompile
+# below was caught.
+const arkhamStressLevel = 2
+  ## Registers kept per pool. `2` is the working point: it starves the pools hard
+  ## enough to reach every fallback arm while staying above the floors in
+  ## `stress.nim` (where an exhaustion means "this machine is too small", not a
+  ## bug). Override with `ARKHAM_STRESS_LEVELS=4,3,2` to sweep.
+
+const arkhamStressKnown: seq[(string, int, string)] = @[
+  # FOUND BY THIS PASS, 2026-08-03, not yet fixed. Each entry is a REAL defect with
+  # a reproduction (`ARKHAM_STRESS=k bin/arkham_stress -a:x64 …`), parked here so
+  # the gate is green on today's known set and any NEW failure is fatal. Remove an
+  # entry with its fix — and add the shrunk-pool fixture that pins it.
+  #
+  # The middle field is the LOOSEST pool at which the fixture still breaks, so the
+  # entry pins a threshold rather than just a name: failing at a level ABOVE it is a
+  # regression (the defect got easier to hit) and reported as new, while passing at
+  # or below it says the defect is gone. That keeps a sweep quiet and still strict.
+  #
+  # 1. SILENT MISCOMPILE (k<=2). `emitAtomicInstr2`'s `AtomicCompareExchangeOp`
+  #    hardcodes RAX (architecturally `cmpxchg`'s comparand) but `instrOperandReg`
+  #    never excludes RAX from the `expected`/`desired`/cell operands. When the
+  #    pools starve enough for `desired` to land in RAX, the `mov rax, *expected`
+  #    emitted between them destroys it, and the CAS compares the value against
+  #    itself — it "succeeds" and stores the OLD value. RDX (idiv) and RCX (shift
+  #    count) are modeled as fixed roles in `MachineDesc`; RAX's cmpxchg role is not.
+  ("atomic_ptr_cell", 2, "cmpxchg desired-operand aliases the RAX comparand"),
+  # 2. INVALID ASM-NIF (k<=3), caught by nifasm rather than miscompiled:
+  #    `(mov (mem (rsp) p3.0) p3.0)` — "expected (i 64), got (stackoff (i 64))".
+  ("aggr_copy_regpressure", 3, "nested-aggregate copy emits a stackoff into a value slot"),
+  # 3. INVALID ASM-NIF (k<=3): "Expected index register or stack variable in mem"
+  #    — a by-ref aggregate's base failed to materialize into a register.
+  ("stack_aggr_byref", 3, "by-ref aggregate base not materialized before the (mem …)"),
+  # 4. TOTALITY GAP (k<=4, i.e. ONE callee-saved register removed). The
+  #    clobber-exposed aggregate-argument park calls `takeHeld` with the default
+  #    `canSpill = false` and asserts. 11 of the 15 `takeHeld` sites across both
+  #    backends do. This is the `ParkTotal` obligation — and note that
+  #    `formal/regproto.nif` asserts it HOLDS, with `regproto_bug_noparkslot.nif`
+  #    as the variant that removes the slot arm: the model states the property the
+  #    code does not have, because its `SlotAvail` is a tautology at Vals == Slots.
+  ("aggr_arg_parked", 4, "clobber-exposed aggregate-arg park has no spill arm"),
+  ("aggr_arg_parked_byref", 3, "clobber-exposed aggregate-arg park has no spill arm"),
+  ("aggr_arg_parked_manual", 4, "clobber-exposed aggregate-arg park has no spill arm"),
+]
+
+proc arkhamStressTests(arch: string; runner = ""; skip: seq[string] = @[];
+                       known: seq[(string, int, string)]; floorLevel = 2) =
+  ## Re-emit + assemble + RUN the corpus with the register file artificially
+  ## starved. Uses its own `bin/arkham_stress` binary: the shrink is behind
+  ## `-d:arkhamStress`, so the shipped `bin/arkham` cannot be perturbed by a stray
+  ## environment variable, and with `ARKHAM_STRESS` unset the two binaries are
+  ## byte-identical on every fixture (the inert-addition check).
+  ##
+  ## `runner` prefixes the produced executable (`qemu-aarch64` for the
+  ## `linux_arm64` pass); empty means run it natively.
+  ##
+  ## `floorLevel` is where THIS backend stops giving signal: below it the
+  ## backend's own documented out-of-registers asserts dominate and every fixture
+  ## with an atomic or a non-scale array index dies on one, which says "the
+  ## machine is too small", not "the emitter is wrong". Levels under it are
+  ## skipped with a note rather than silently, because the line is a judgement and
+  ## should be visible.
+  exec "nim c --hints:off -d:arkhamStress -o:bin/arkham_stress src/arkham/arkham.nim"
+  let arkham = ("bin" / "arkham_stress").addFileExt(ExeExt)
+  let nifasm = ("src" / "nifasm" / "nifasm").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham" / "nimcache"
+  createDir workDir
+  # The default (CI) run is ONE level per backend: the tightest that still gives
+  # signal, clamped UP to this backend's floor so every backend is actually
+  # exercised. An explicit `ARKHAM_STRESS_LEVELS` sweep is taken literally and its
+  # below-floor levels are skipped with a note — a manual sweep should be able to
+  # ask for a level and be told why it was not run.
+  var levels: seq[int] = @[max(arkhamStressLevel, floorLevel)]
+  let envLevels = getEnv("ARKHAM_STRESS_LEVELS").strip
+  if envLevels.len > 0:
+    levels = @[]
+    for part in envLevels.split(','): levels.add parseInt(part.strip)
+  proc knownAt(name: string; k: int): bool =
+    ## Is `name` a recorded defect EXPECTED to break at pool size `k`? Only at or
+    ## below its recorded threshold: breaking at a LOOSER pool means the defect
+    ## widened, which is a regression, not a known failure.
+    ##
+    ## Failure is not monotone in `k` — which registers survive the shrink decides
+    ## whether a given aliasing bug is reachable, so a fixture can break at k=4 and
+    ## k=3 yet pass at k=2. The threshold is therefore an upper bound on where the
+    ## defect has been SEEN, and "it is fixed" is judged across the whole sweep
+    ## (`sawFail` below), never from one level.
+    for (stem, level, _) in known:
+      if stem == name: return k <= level
+    false
+  proc everKnown(name: string): bool =
+    for (stem, _, _) in known:
+      if stem == name: return true
+    false
+  var newFailures: seq[string] = @[]
+  var sawFail: seq[string] = @[]
+  for k in levels:
+    if k < floorLevel:
+      echo "NOTE: ", arch, " stress: skipping k=", k, " (below this backend's floor of ",
+           floorLevel, " every atomic / non-scale index dies on a documented ",
+           "out-of-registers assert)"
+      continue
+    putEnv("ARKHAM_STRESS", $k)                 # inherited by the arkham children
+    for file in walkFiles("tests" / "arkham" / "mod_*.c.nif"):
+      let name = extractFilename(file)[0 ..< extractFilename(file).len - ".c.nif".len]
+      exec quoteShell(arkham) & " -a:" & arch & " -o:" &
+           quoteShell(workDir / (name & ".asm.nif")) & " " & quoteShell(file)
+    var total, passed, expectedFail = 0
+    for file in walkFiles("tests" / "arkham" / "*.c.nif"):
+      let base = extractFilename(file)
+      if base.startsWith("mod_") or base.startsWith("err_"): continue
+      let name = base[0 ..< base.len - ".c.nif".len]
+      if name in skip: continue
+      inc total
+      let stem = file[0 ..< file.len - ".c.nif".len]
+      let asmNif = workDir / (name & ".stress.nif")
+      let exe = workDir / (name & ".stress.out")
+      var failed = ""
+      block run:
+        let (ao, ac) = execCmdEx(quoteShell(arkham) & " -a:" & arch & " -o:" &
+                                 quoteShell(asmNif) & " " & quoteShell(file))
+        if ac != 0:
+          failed = "codegen: " & ao.splitLines[^2 .. ^1].join(" ").strip; break run
+        let (no, nc) = execCmdEx(quoteShell(nifasm) & " -o:" & quoteShell(exe) &
+                                 " " & quoteShell(asmNif))
+        if nc != 0:
+          failed = "assemble: " & no.splitLines[^1].strip; break run
+        let (po, pc) = execCmdEx(
+          (if runner.len > 0: quoteShell(runner) & " " else: "") & quoteShell(exe))
+        let ecFile = stem & ".exitcode"
+        let expectedCode = if fileExists(ecFile): parseInt(readFile(ecFile).strip) else: 0
+        let outFile = stem & ".output"
+        let expectedOut = if fileExists(outFile): readFile(outFile).strip else: ""
+        if pc != expectedCode:
+          failed = "MISCOMPILE: exitcode " & $expectedCode & " but got " & $pc; break run
+        if po.strip != expectedOut:
+          failed = "MISCOMPILE: output mismatch"; break run
+      if failed.len == 0:
+        inc passed
+      else:
+        if name notin sawFail: sawFail.add name
+        if knownAt(name, k):
+          inc expectedFail
+        elif everKnown(name):
+          newFailures.add "k=" & $k & " " & name &
+                          " — breaks at a LOOSER pool than recorded: " & failed
+        else:
+          newFailures.add "k=" & $k & " " & name & " — " & failed
+    echo passed, " / ", total - expectedFail, " arkham ", arch,
+         " stress tests successful (k=", k, ", ", expectedFail, " known-broken)"
+  delEnv("ARKHAM_STRESS")
+  for (stem, _, why) in known:
+    if stem notin sawFail:
+      echo "NOTE: ", arch, " stress: ", stem, " passed at every swept level (",
+           why, ") — drop its arkhamStressKnown entry, or sweep wider"
+  if newFailures.len > 0:
+    quit "FAILURE arkham register-pressure stress (" & arch &
+         ") found NEW breakage:\n  " & newFailures.join("\n  ")
+
 const arkhamLinuxA64Unsupported: seq[string] = @[
   # Nothing is quarantined for the qemu pass alone — the x86-64-pinned fixtures
   # live in `arkhamA64Unsupported`, which this pass also honours.
@@ -382,6 +555,13 @@ exec "nim c -r src/nifasm/nifasm tests/module_gvar_access.nif"
 # AArch64/Darwin on macOS), so we run them only where the binaries execute.
 when (defined(linux) and defined(amd64)) or (defined(macosx) and defined(arm64)):
   arkhamTests()
+  # The same corpus again, against a starved register file — the pool-dry arms the
+  # fixtures are otherwise too small to reach (see `arkhamStressTests`).
+  arkhamStressTests(arch = (when defined(macosx): "arm64" else: "x64"),
+                    skip = (when defined(macosx): arkhamDarwinUnsupported &
+                                                  arkhamA64Unsupported
+                            else: arkhamOsxOnly),
+                    known = arkhamStressKnown)
 
 # The `{.assembler.}` rejections are x86-64-only (see `arkhamRejectionTests`).
 when defined(linux) and defined(amd64):
@@ -392,3 +572,40 @@ when defined(linux) and defined(amd64):
 # absent). Gives the arm64 path end-to-end coverage without a macOS machine.
 when defined(linux) and defined(amd64):
   arkhamQemuTests()
+
+const arkhamStressA64Known: seq[(string, int, string)] = @[
+  # The AArch64 half of the 2026-08-03 stress findings (see `arkhamStressKnown`).
+  # Both entries are SILENT MISCOMPILES — the fixture builds and runs and returns
+  # the wrong answer, which is the class neither the corpus nor a totality argument
+  # can see. Shrinking a pool may cost performance or hit a documented
+  # out-of-registers assert; it can never legitimately change what a program
+  # COMPUTES, so a changed exit code is a codegen bug by construction.
+  #
+  # `spill_produce_float` returns 219 / 19 / 84 instead of 16 at k=4/3/2 — a
+  # different wrong value per level, i.e. it reads whatever the reused register
+  # happened to hold, in `produceIntoFMem2`'s float spill path.
+  ("spill_produce_float", 4, "float produce-into-spill reads a clobbered register"),
+  # `steal_straddle` returns 84 instead of 94 at k=4 and k=3 (and passes at k=2 —
+  # failure is not monotone in the pool size). The allocator's `trySteal` over a
+  # straddling live range.
+  ("steal_straddle", 4, "trySteal over a straddling live range yields a stale value"),
+]
+
+# The AArch64 backend gets the same starved-pool pass, under qemu. Its `takeHeld`
+# has MORE no-spill call sites than x86-64's (7 of 9 vs 4 of 6), so the totality
+# obligations are, if anything, looser here.
+when defined(linux) and defined(amd64):
+  if findExe("qemu-aarch64").len > 0:
+    arkhamStressTests(arch = "linux_arm64", runner = "qemu-aarch64",
+                      skip = arkhamLinuxA64Unsupported & arkhamA64Unsupported &
+                             arkhamOsxOnly,
+                      known = arkhamStressA64Known,
+                      # a64's floor is one higher than x86-64's: `takeInstrReg` and
+                      # `takeLvalStride` route through `takeHeld` with no spill arm,
+                      # so at k=2 every atomic (`atomic2`, `atomic_ptr_cell`,
+                      # `intrinsics`) and every non-scale index (`array2d`) dies on
+                      # that documented assert, and `call_stack_args` reaches the
+                      # ">8 integer params (stack TODO)" limit. Those are the
+                      # backend's stated contracts, not findings — until the
+                      # `canSpill` audit closes them, k=2 here is all noise.
+                      floorLevel = 3)

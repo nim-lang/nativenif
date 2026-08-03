@@ -20,7 +20,12 @@
 import std / [assertions, tables, sets, os, algorithm, strutils]
 import nifcore, nifcdecl
 import slots, machinedesc, analyser, register_allocator, programs
-import asmbuf, codegen_common, machine_x64
+import asmbuf, codegen_common, machine_x64, stress
+
+let x64MachineA = stressed(x64Machine)
+  ## The machine arkham actually allocates against: `x64Machine` itself, unless
+  ## the `-d:arkhamStress` shrink is armed (see `stress.nim`). A module-level
+  ## `let` so the environment is read and the pools rebuilt ONCE, not per proc.
 
 const TlsBlockName = "arkham.tls.0"
   ## The static block FS points at (see `emitTlsSetup`); a tvar lives at
@@ -773,7 +778,7 @@ proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg =
   ## chain: every nesting level holds its result register from before its own
   ## address is materialized, so a `((a.b).c).d` chain of spilled loads wants
   ## one register per level (`cmpStringPtrs`, `-d:danger`).
-  for r in StagingCandidates:
+  for r in StagingCandidates.toOpenArray(0, stressLimit(StagingCandidates.len) - 1):
     if r != avoid and not g.ra.isSealed(r) and not g.rb.isAccum(r) and
        not g.rb.isBoundTemp(r) and not g.regHoldsLiveLocal(r):
       # not `isBoundTemp`: a register holding a live scratch temp (`bindTemp`'d)
@@ -792,7 +797,7 @@ proc stagingCensus(g: var CodeGen; avoid: Reg): string =
   ## indistinguishable from "a filter is wrong / a seal was never released", and
   ## those need opposite fixes.
   result = ""
-  for r in StagingCandidates:
+  for r in StagingCandidates.toOpenArray(0, stressLimit(StagingCandidates.len) - 1):
     result.add "\n    " & $r & ": "
     if r == avoid: result.add "avoid"
     elif g.ra.isSealed(r): result.add "sealed (" & g.rb.boundName(r) & ")"
@@ -6960,7 +6965,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.pickedRegs = {}
   g.pickedFRegs = {}
   g.emitTmpSpills = 0
-  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64Machine, g.typeCtx, preseal)
+  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64MachineA, g.typeCtx, preseal)
   when defined(arkhamTracePath):
     stderr.writeLine "[arkham] " & info.asmName & ": NEW"
   when defined(arkhamDumpLocs):
@@ -7092,7 +7097,7 @@ proc buildGlobalInitProc(g: var CodeGen; initBuf: var TokenBuf) =
 
 proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool): string =
   ## Compile a parsed Leng module to x86-64 / Linux asm-NIF text.
-  var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: x64Machine)
+  var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: x64MachineA)
   g.ab.renderReg = x64RegName                 # render register slots as x86 names
   g.prog = collect(buf, inputPath, tags)
   g.callTarget = g.prog.callTarget

@@ -24,6 +24,12 @@ import nifcore, nifcdecl
 import slots, machine, analyser, register_allocator, programs
 import asmbuf
 import codegen_common
+import stress
+
+let aarch64MachineA = stressed(aarch64MachineN)
+  ## The machine arkham actually allocates against: `aarch64MachineN` itself,
+  ## unless the `-d:arkhamStress` shrink is armed (see `stress.nim`). A
+  ## module-level `let` so the environment is read and the pools rebuilt ONCE.
 
 const DarwinLibSystem = "/usr/lib/libSystem.B.dylib"
 
@@ -4865,7 +4871,7 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   g.pickedRegs = {}
   g.pickedFRegs = {}
   g.emitTmpSpills = 0
-  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, aarch64MachineN, g.typeCtx, preseal)
+  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, aarch64MachineA, g.typeCtx, preseal)
   if g.retIndirect:
     g.indirectReg = R19
     g.ra.usedCallee.incl R19
@@ -5018,7 +5024,7 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## which `nifasm`'s `linux_arm64` target assembles to a qemu-runnable ELF.
   ## `inputPath` and `tags` let the program model load *other* modules on demand
   ## to resolve cross-module symbols (`Foo.0.othermod`).
-  var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: aarch64MachineN,
+  var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: aarch64MachineA,
                   a64Linux: linux)
   g.prog = collect(buf, inputPath, tags, darwin = not linux)
   g.callTarget = g.prog.callTarget
