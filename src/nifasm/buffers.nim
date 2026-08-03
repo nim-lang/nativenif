@@ -39,6 +39,17 @@ proc len*(buf: Bytes): int =
   ## Get the length of the buffer
   buf.data.len
 
+proc insertRepeated*(buf: var Bytes; at: int; b: byte; count: int) =
+  ## Insert `count` copies of `b` at byte position `at`, shifting later bytes.
+  ## Used by the `casejmp` slot padding (NOP fill to the uniform slot size).
+  if count <= 0: return
+  let oldLen = buf.data.len
+  buf.data.setLen(oldLen + count)
+  for i in countdown(oldLen - 1, at):
+    buf.data[i + count] = buf.data[i]
+  for i in 0 ..< count:
+    buf.data[at + i] = b
+
 proc `[]=`*(buf: var Bytes; i: int; b: byte) {.inline.} =
   buf.data[i] = b
 
