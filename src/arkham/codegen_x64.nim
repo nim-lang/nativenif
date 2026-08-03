@@ -305,7 +305,7 @@ proc framePop(g: var CodeGen)
 proc pickStaging(g: var CodeGen; avoid: Reg = NoReg): Reg
 # value-core emitters (defined far below) used by the shared memory-move helpers
 # (`scalarMemMov`/`floatMemMov`) to emit a folded access chain:
-proc prematLval2(g: var CodeGen; c: Cursor; asBase = false)
+proc prematLval2(g: var CodeGen; c: Cursor; asBase = false; hint = NoReg)
 proc emLvalAddr2(g: var CodeGen; c: Cursor)
 proc unbindLvalTemps2(g: var CodeGen; c: Cursor)
 
@@ -320,7 +320,7 @@ proc emitCondValue2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCondE(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool)
 proc emitScalarCmpE(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
                     whenTrue: bool): X64Inst
-proc emitMemLoad2(g: var CodeGen; c: Cursor; dest: var Location)
+proc emitMemLoad2(g: var CodeGen; c: Cursor; dest: var Location; late = false)
 proc emitAddr2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
@@ -761,11 +761,28 @@ proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg =
   ## (dead-param) name binding on it is released first so `emReg` emits the raw
   ## `(reg)` rather than the dead param's typed name. Returns `NoReg` when none is
   ## free (the genuinely-out-of-registers case).
+  ##
+  ## TOTALITY BACKSTOP: when every volatile is taken, a *free* callee-saved
+  ## register is drawn instead. That is not the demotion design.md rules out
+  ## (no local moves, the allocator's decisions stand) — it is the same inline
+  ## callee-saved draw `pickTempReg`/`takeHeld` already make, and it is legal
+  ## for the same reason: the body-buffer model finalizes the prologue AFTER
+  ## the body, so a register named in `usedCallee` during emission still gets
+  ## its push/pop. It costs one save/restore pair in the procs that need it.
+  ## The step whose demand exceeds the r10/r11 budget is a `(mem …)` address
+  ## chain: every nesting level holds its result register from before its own
+  ## address is materialized, so a `((a.b).c).d` chain of spilled loads wants
+  ## one register per level (`cmpStringPtrs`, `-d:danger`).
   for r in StagingCandidates:
     if r != avoid and not g.ra.isSealed(r) and not g.rb.isAccum(r) and
        not g.rb.isBoundTemp(r) and not g.regHoldsLiveLocal(r):
       # not `isBoundTemp`: a register holding a live scratch temp (`bindTemp`'d)
       # must not be handed out as staging — that would clobber the temp's value.
+      g.releaseStaleName(r)
+      return r
+  for r in g.md.intCalleeSaved:
+    if r != avoid and regFreeForTemp(g, r) and not g.regHoldsLiveLocal(r):
+      g.ra.usedCallee.incl r                  # the prologue must now save it
       g.releaseStaleName(r)
       return r
   return NoReg
@@ -778,17 +795,29 @@ proc stagingCensus(g: var CodeGen; avoid: Reg): string =
   for r in StagingCandidates:
     result.add "\n    " & $r & ": "
     if r == avoid: result.add "avoid"
-    elif g.ra.isSealed(r): result.add "sealed"
+    elif g.ra.isSealed(r): result.add "sealed (" & g.rb.boundName(r) & ")"
     elif g.rb.isAccum(r): result.add "liveAccum"
     elif g.rb.isBoundTemp(r): result.add "boundTemp " & g.rb.boundName(r)
     elif g.regHoldsLiveLocal(r): result.add "live local " & g.rb.boundName(r)
+    else: result.add "FREE (unreachable)"
+  for r in g.md.intCalleeSaved:               # the callee-saved backstop's view
+    result.add "\n    " & $r & ": "
+    if r == avoid: result.add "avoid"
+    elif r in g.pickedRegs: result.add "picked"
+    elif g.ra.isSealed(r): result.add "sealed"
+    elif g.rb.isAccum(r): result.add "liveAccum"
+    elif g.rb.isBound(r): result.add "bound " & g.rb.boundName(r)
+    elif g.regHoldsHome(r) or g.regHoldsLiveLocal(r): result.add "home"
     else: result.add "FREE (unreachable)"
 
 proc pickStaging(g: var CodeGen; avoid: Reg = NoReg): Reg =
   ## A transient compute register for a spill (see `pickStagingScratch`).
   result = g.pickStagingScratch(avoid)
   if result == NoReg:
-    raiseAssert "arkham x64: no staging register available for a spill"
+    # Same census as `pickStagingSealed`: "genuinely out of registers" and "a
+    # filter is wrong / a seal was never released" need opposite fixes.
+    raiseAssert "arkham x64: no staging register available for a spill in proc " &
+                g.curProcName & g.stagingCensus(avoid)
 
 proc regHoldsLiveFLoc(g: var CodeGen; f: FReg): bool =
   ## True if a float local/param currently lives in SIMD register `f` (per the
@@ -2403,6 +2432,17 @@ proc produceIntoMem2(g: var CodeGen; c: Cursor; dst: Location) =
       return
   when defined(arkhamDbgSpill):
     stderr.writeLine "DBG produceIntoMem2 slot=" & dst.name
+  if c.kind == TagLit and c.exprKind in {DerefC, DotC, AtC, PatC}:
+    # A LOAD into the slot: the address must be materialized before any transfer
+    # register is needed, and the address registers die with the `(mem …)` tree.
+    # Taking the transfer register up front (below) would hold it across that
+    # materialization — one register per level of a spilled address chain, which
+    # overruns the r10/r11 budget at depth 3. See `emitMemLoad2`'s `late`.
+    var d = needsReg(dst.typ)
+    g.emitMemLoad2(c, d, late = true)
+    g.emitStoreLoc(dst, d.r)
+    g.giveBack d.r
+    return
   # The staging reg is NOT bound/sealed across the recursion: a leaf/combine
   # binds it only when it materializes the value, so a deep right-nested
   # spilled chain reuses the SAME bridge register level-by-level — one
@@ -2743,16 +2783,62 @@ proc restoreMemBase2(g: var CodeGen; pos: int) =
     g.ra.locs[pos] = g.savedHomes[pos]
     g.savedHomes.del pos
 
-proc takeLvalStride(g: var CodeGen; c: Cursor; atPos: int; asBase = false) =
+proc lvalUsesReg(g: var CodeGen; c: Cursor; r: Reg): bool =
+  ## Does any already-materialized part of lvalue `c`'s ADDRESS occupy `r`? Used
+  ## to keep a borrowed stride scratch off the base register (nifasm rejects
+  ## `scratch == base`: the scratch is written before the base is read).
+  case c.kind
+  of Symbol:                                        # a global base's `lea` register
+    let l = g.ra.locs[cursorToPosition(g.buf[], c)]
+    result = (l.kind == InReg and l.r == r) or
+             g.lvalGlobBase.getOrDefault(cursorToPosition(g.buf[], c), NoReg) == r
+  of TagLit:
+    case c.exprKind
+    of DotC, BaseobjC:
+      var cc = c
+      cc.into:
+        if c.exprKind == BaseobjC: (skip cc; skip cc)  # base type, depth
+        result = g.lvalUsesReg(cc, r)
+        while cc.hasMore: skip cc
+    of DerefC:
+      var cc = c
+      cc.into:
+        let l = g.ra.locs[cursorToPosition(g.buf[], cc)]
+        result = l.kind == InReg and l.r == r
+        while cc.hasMore: skip cc
+    of AtC, PatC:
+      if g.lvalStride.getOrDefault(cursorToPosition(g.buf[], c), NoReg) == r:
+        return true
+      var cc = c
+      cc.into:
+        if c.exprKind == PatC:                      # the pointer is a VALUE
+          let l = g.ra.locs[cursorToPosition(g.buf[], cc)]
+          result = l.kind == InReg and l.r == r
+        else:
+          result = g.lvalUsesReg(cc, r)             # the base is an lvalue
+        skip cc
+        if not result and cc.hasMore and cc.kind notin {IntLit, UIntLit}:
+          let l = g.ra.locs[cursorToPosition(g.buf[], cc)]
+          result = l.kind == InReg and l.r == r
+        while cc.hasMore: skip cc
+    else: result = false
+  else: result = false
+
+proc takeLvalStride(g: var CodeGen; c: Cursor; atPos: int; asBase = false;
+                    hint = NoReg) =
   ## Reserve the non-SIB `(at/pat base idx scratch)` stride scratch from the emit-time
   ## STAGING set (the always-free R11 bridge + free caller-saved), NOT a pool register
   ## the allocator handed out — so it cannot starve when register-homed locals fill the
-  ## pool (the x64 trepro `out of registers for an index stride scratch` case). Sealed +
-  ## bound BEFORE the base/index are materialized, so their (possibly spilled) reloads
-  ## via `pickStagingScratch` pick OTHER staging regs and never alias the scratch (the
-  ## Bug-J disjointness invariant — nifasm also rejects scratch==base at assemble time).
-  ## A nested `(at (at …) …)` nests fine: each level seals its own scratch, so the inner
-  ## level's pick avoids the outer's. Released by `dropLvalStride` after the `(mem …)`.
+  ## pool (the x64 trepro `out of registers for an index stride scratch` case). Taken
+  ## AFTER the base/index are materialized: they are sealed + bound by then, so the pick
+  ## cannot alias them (the Bug-J disjointness invariant — nifasm also rejects
+  ## scratch==base at assemble time) and the scratch does not sit reserved, holding
+  ## nothing, across a premat recursion that may itself need staging registers (the
+  ## `-d:danger` `cmpStringPtrs` "no staging register available for a spill" case: a
+  ## spilled `(pat …)` pointer whose own address is a spilled load needs three).
+  ## A nested `(at (at …) …)` nests fine: the inner level takes its scratch first and
+  ## keeps it sealed, so the outer's pick avoids it. Released by `dropLvalStride`
+  ## after the `(mem …)`.
   ##
   ## `asBase`: this `(at)`/`(pat)` is itself the BASE of an enclosing indexed access. x86
   ## allows only ONE index register per memory operand, so even a SIB-valid stride (the
@@ -2760,8 +2846,29 @@ proc takeLvalStride(g: var CodeGen; c: Cursor; atPos: int; asBase = false) =
   ## address into a clean base register when its index is a register — else the fold would
   ## carry two index registers (the `(at (at base i) j)` two-register case nifasm rejects).
   if not (g.atNeedsScratch(c) or (asBase and g.atIndexIsReg(c))): return
+  # BORROW the CONSUMER's destination register (`lea dst, (at …)` /
+  # `mov dst, (mem (at …))`): it is reserved but still empty — the consuming
+  # instruction writes it only after reading the address it is computing. Both
+  # assemblers fold the stride into the scratch and then address `[scratch]`, so
+  # `scratch == dst` is exactly the `lea dst, [dst+disp]` a two-step address
+  # computation would emit anyway. Refused when `dst` already carries part of
+  # THIS address (a global base leas into the same register — nifasm rejects
+  # `scratch == base`).
+  #
+  # NOT the index register, even though both assemblers document `scratch ==
+  # index` as legal: legal there means "the multiply still reads a live index",
+  # not "the index is dead afterwards". A materialized index outlives its
+  # access — `a[i].f0 = 0; a[i].f1 = 0` reloads `i` once and folds it twice —
+  # so `lea idx, [base+idx*16]` leaves the second fold multiplying an ADDRESS.
+  if hint != NoReg and not g.lvalUsesReg(c, hint):
+    g.lvalStride[atPos] = hint
+    g.lvalStrideBorrowed.incl atPos
+    return
   let s = g.pickStagingScratch()
-  if s == NoReg: raiseAssert "arkham x64: no staging register for an (at) stride scratch"
+  if s == NoReg:
+    raiseAssert "arkham x64: no staging register for an (at) stride scratch in proc " &
+                g.curProcName & " (asBase=" & $asBase & ", hint=" & $hint & ")" &
+                g.stagingCensus(NoReg)
   g.ra.seal s
   g.bindTemp(s, AsmSlot(cls: AInt, size: 8, align: 8))
   g.lvalStride[atPos] = s
@@ -2770,8 +2877,12 @@ proc dropLvalStride(g: var CodeGen; atPos: int) =
   ## Release a `takeLvalStride` scratch after the consuming `(mem …)`/`(lea …)`.
   if g.lvalStride.hasKey(atPos):
     let s = g.lvalStride[atPos]
-    g.unbindTemp(s)
-    g.ra.unseal s
+    if atPos in g.lvalStrideBorrowed:
+      # The consumer's destination register: it owns it, so it frees it.
+      g.lvalStrideBorrowed.excl atPos
+    else:
+      g.unbindTemp(s)
+      g.ra.unseal s
     g.lvalStride.del atPos
 
 proc prematAddrVal2(g: var CodeGen; c: Cursor) =
@@ -2786,11 +2897,15 @@ proc prematAddrVal2(g: var CodeGen; c: Cursor) =
   g.ra.locs[pos] = d
   g.reloadMemBase2(pos)
 
-proc prematLval2(g: var CodeGen; c: Cursor; asBase = false) =
+proc prematLval2(g: var CodeGen; c: Cursor; asBase = false; hint = NoReg) =
   ## Materialize an lvalue's embedded values (a `deref` pointer, an index, a global
   ## base's address) into their allocated registers BEFORE the consuming `(mem …)` /
   ## `(lea …)` tree opens (an emit-inside-the-tree would corrupt it). For a stack /
   ## register-pointer symbol base this is a no-op.
+  ##
+  ## `hint` is the consuming instruction's DESTINATION register: reserved but not
+  ## yet written, so an `(at)`/`(pat)` stride scratch may borrow it instead of
+  ## taking a third staging register (see `takeLvalStride`).
   if c.kind == Symbol:
     # A module-level global aggregate base: `lea baseReg, &global`. The base register
     # (the access result for a load/addr, or a store scratch) was assigned by the
@@ -2816,7 +2931,7 @@ proc prematLval2(g: var CodeGen; c: Cursor; asBase = false) =
     of DotC:
       var cc = c
       cc.into:
-        g.prematLval2(cc, asBase)                       # a dot over an indexed base propagates
+        g.prematLval2(cc, asBase, hint)                 # a dot over an indexed base propagates
         while cc.hasMore: skip cc
     of DerefC:
       var cc = c
@@ -2825,16 +2940,15 @@ proc prematLval2(g: var CodeGen; c: Cursor; asBase = false) =
         while cc.hasMore: skip cc
     of AtC:
       let atPos = cursorToPosition(g.buf[], c)
-      g.takeLvalStride(c, atPos, asBase)                # stride / nested-base scratch ← staging
       var cc = c
       cc.into:
-        g.prematLval2(cc, asBase = true); skip cc       # base IS indexed by THIS at
+        g.prematLval2(cc, asBase = true, hint = hint); skip cc  # base IS indexed by THIS at
         if cc.kind notin {IntLit, UIntLit}:             # register index → its reg
           g.prematAddrVal2(cc)                          # follow steals
         while cc.hasMore: skip cc
+      g.takeLvalStride(c, atPos, asBase, hint)          # stride / nested-base scratch ← staging
     of PatC:
       let patPos = cursorToPosition(g.buf[], c)
-      g.takeLvalStride(c, patPos, asBase)               # stride / nested-base scratch ← staging
       var cc = c
       cc.into:
         g.prematAddrVal2(cc)                            # the pointer → its register (follow steals)
@@ -2842,11 +2956,12 @@ proc prematLval2(g: var CodeGen; c: Cursor; asBase = false) =
         if cc.kind notin {IntLit, UIntLit}:             # register index → its reg
           g.prematAddrVal2(cc)                          # follow steals
         while cc.hasMore: skip cc
+      g.takeLvalStride(c, patPos, asBase, hint)         # stride / nested-base scratch ← staging
     of BaseobjC:                                        # transparent: materialize the inner lvalue
       var cc = c
       cc.into:
         skip cc; skip cc                               # base type, depth
-        g.prematLval2(cc)                              # the inner lvalue
+        g.prematLval2(cc, hint = hint)                 # the inner lvalue
         while cc.hasMore: skip cc
     of AconstrC, OconstrC:
       # A constructor used as an lvalue base (`[a,b][i]`): build it into a synthetic stack
@@ -3011,7 +3126,7 @@ proc aggrAddrInto(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind:
     if doBind: g.bindTemp(dest, aslot)                  # bind first: a global base leas &g into dest
     var bound: seq[Reg] = @[]
     g.bindLvalGlobalBases(lv, bound)                    # bind any UNBOUND global-base reg first
-    g.prematLval2(lv)
+    g.prematLval2(lv, hint = dest)                      # `dest` is still empty: it may host the stride
     g.ab.tree LeaX64:
       g.emReg dest
       g.emLvalAddr2(lv)
@@ -4056,22 +4171,49 @@ proc cmovTagFor(jccTag: X64Inst): X64Inst =
   of JaeX64: CmovaeX64
   else: raiseAssert "arkham x64: no cmov for " & $jccTag
 
+proc readsReg(g: var CodeGen; n: Cursor; r: Reg): bool =
+  ## Does expression `n` read a symbol whose home is register `r`? A
+  ## register-homed local cannot be reached any other way (no memory aliases it),
+  ## so scanning the symbols is exact.
+  result = false
+  if n.kind == Symbol:
+    let l = g.ra.locationOfSym(symName(n))
+    result = l.kind == InReg and l.r == r
+  elif n.kind == TagLit:
+    var c = n
+    c.into:
+      while c.hasMore:
+        if not result and g.readsReg(c, r): result = true
+        skip c
+
 proc tryEmitCmov(g: var CodeGen; c: Cursor): bool =
   ## Lower a select diamond (see `matchSelectDiamond`) branchlessly to
   ## `cmp; cmov<cc> DST, A` — no forward jumps, no label. Returns false for anything
   ## that does not fit; the caller then falls back to branch lowering.
   var sd: SelectDiamond
   if not g.matchSelectDiamond(c, sd): return false
-  # ── emit: cmp (sets flags) → THEN→scratch → ELSE→DST → cmov DST, scratch ──
-  # The cmp reads the condition operands at their ORIGINAL values (DST not yet
-  # written). THEN is captured into a scratch register before ELSE overwrites DST, so
-  # `if c: x = x …` self-reads stay correct. Both stores of a simple value are pure
-  # `mov` (movImm never `xor`s; a 64-bit-normalised scalar move needs no flag-setting
-  # `shl`/`sar` extend), so the flags survive to the cmov.
-  let ct = cmovTagFor(g.emitScalarCmpE(sd.a, sd.b, sd.ek, whenTrue = true))
+  # ── emit: THEN→scratch → ELSE→DST → cmp (sets flags) → cmov DST, scratch ──
+  # The COMPARE MUST BE LAST. Materializing a value is not flag-neutral: a store
+  # of a sub-64-bit scalar re-normalizes with `shl reg,32; shr reg,32`, and `shr`
+  # writes ZF. With the compare first, `(mov tag 15)(shl tag 32)(shr tag 32)` made
+  # the following `cmovne` read the SHR's flags instead of the compare's and take
+  # the THEN value unconditionally (`sem.nim`'s `tag = TagId(FalseTagId)`, whose
+  # `TagId` is 32-bit — a silent wrong-branch miscompile in the self-hosted
+  # compiler). The old order rested on "both stores are pure `mov`", which only
+  # held for 64-bit destinations. (The a64 twin is unaffected: its stores are
+  # `movz`/`movk` and its sign/zero-extends are `sbfm`/`ubfm`, none of which
+  # touch NZCV.)
+  #
+  # Emitting the values first is correct only when the condition neither reads
+  # DST — it is overwritten by the ELSE store before the compare — nor calls,
+  # which would clobber the volatile staging register holding the THEN value.
+  # Both are rare; they simply keep the branch lowering.
+  if subtreeHasCallE(sd.a) or subtreeHasCallE(sd.b): return false
+  if g.readsReg(sd.a, sd.dst.r) or g.readsReg(sd.b, sd.dst.r): return false
   let rT = g.pickStagingSealed("a cmov then-value", g.selectStagingSlot(sd), avoid = sd.dst.r)
   g.genStore2(sd.thenRhs, regLoc(rT, sd.dst.typ))
   g.genStore2(sd.elseRhs, sd.dst)
+  let ct = cmovTagFor(g.emitScalarCmpE(sd.a, sd.b, sd.ek, whenTrue = true))
   g.ab.tree ct: (g.emReg sd.dst.r; g.emReg rT)
   g.giveBack rT
   return true
@@ -4129,10 +4271,9 @@ proc tryEmitCaseJmp(g: var CodeGen; c: Cursor): bool =
   let lElse = if hasElse: g.freshLabel() else: lEnd
   var cc = c
   cc.into:
-    let selC = cc
-    g.emitValue2(cc); skip cc                   # selector → its location
+    var selLoc = needsReg(ScalarSlot)           # a GPR, the callee's choice
+    g.emitValue2(cc, selLoc); skip cc           # selector → its location
     while cc.hasMore: skip cc                   # bodies are emitted from `vals`
-    let selLoc = g.ra.locs[cursorToPosition(g.buf[], selC)]
     # The slot index is COMPUTED IN PLACE (sub + imul destroy it), so it never
     # uses a live local's home register: copy/load the selector into a sealed
     # staging register first.
@@ -4140,7 +4281,7 @@ proc tryEmitCaseJmp(g: var CodeGen; c: Cursor): bool =
     if selLoc.kind == InReg:
       idx = g.pickStagingSealed("casejmp index", ScalarSlot, avoid = selLoc.r)
       g.movReg(idx, selLoc.r)
-      if selLoc.isTemp: g.unbindTemp(selLoc.r)  # selector dead after the copy
+      g.freeVal(selLoc)                         # selector dead after the copy
     else:
       idx = g.pickStagingSealed("casejmp index", ScalarSlot)
       g.emitLoadLoc(selLoc, idx)
@@ -4149,18 +4290,11 @@ proc tryEmitCaseJmp(g: var CodeGen; c: Cursor): bool =
     g.ab.tree CmpX64: (g.emReg idx; g.ab.intLit hi - lo)
     g.emJcc(JaX64, lElse)
     let base = g.pickStagingSealed("casejmp base", AddrSlot)
-    let mirrorSnap = g.regMirror                # dispatch-point cache state (a copy)
     var released = false
     g.ab.tree CasejmpX64:
       g.emReg idx
       g.emReg base
       for (v, body) in vals:
-        # Each slot is entered via the indirect jump with the DISPATCH-POINT
-        # register-cache state; no label exists to join through, so restore it
-        # by hand (the emJmp below folds each slot's exit into lEnd's join).
-        if g.regCacheOn:
-          g.regMirror = mirrorSnap
-          g.mirrorLive = true
         g.ab.tree StmtsX64:
           if not released:
             # idx/base are dead once the indirect jump ran. Release them as slot
@@ -4173,7 +4307,6 @@ proc tryEmitCaseJmp(g: var CodeGen; c: Cursor): bool =
             released = true
           g.genStmt2(body)                      # the branch body (a stmts node)
           g.emJmp(lEnd)                         # every slot ends in a terminating jump
-    g.mirrorLive = false                        # nothing falls out of the region
     if hasElse:
       g.emLab(lElse)
       var e = elseAt
@@ -4856,26 +4989,45 @@ proc emitCondValue2(g: var CodeGen; c: Cursor; dest: var Location) =
   g.movImm(res.r, 0)
   g.emLab(lEnd)
   dest = res
-proc emitMemLoad2(g: var CodeGen; c: Cursor; dest: var Location) =
+proc emitMemLoad2(g: var CodeGen; c: Cursor; dest: var Location; late = false) =
   ## FUSED addressing expr in VALUE position → load `[addr]` into a register.
   ## Decisions inline (allocValue's Deref/Dot/At/Pat case): force a register
   ## result, seal a fixed dest across the embedded-value picks (an index temp
   ## landing on it would mistype the load), pick the embedded values
   ## (`emitLvalue2`; a global base reuses the result register), then the old
   ## emission body.
-  g.forceRegDestE(dest)
-  if dest.kind == NamedStack and dest.spillTemp:
-    g.produceIntoMem2(c, dest); return
-  let res = dest
-  let sealedHere = res.kind == InReg and not res.isTemp and not g.ra.isSealed(res.r)
+  ##
+  ## `late` (the produce-into-memory caller, see `produceIntoMem2`): the caller
+  ## does not care WHICH register carries the value — it only stores it to an
+  ## `(s)` slot. Then the transfer register is taken AFTER the address is
+  ## materialized, and `dest` is an out-parameter. That is what keeps a chain of
+  ## spilled loads (`((a.more).data)[0]`, `cmpStringPtrs`) inside the r10/r11
+  ## budget: taken up front, the result register is held across the recursion
+  ## that materializes the address, so every nesting level costs one register —
+  ## while the address registers themselves die at each level's `(mem …)` tree.
+  ## `late` is only viable because the global-base optimization (`globBase`, one
+  ## `lea &g` straight into the result register) is skipped with it; a global
+  ## base then takes its own staging register via `prematLval2`'s `dontCare`
+  ## marker, which is the pre-existing transient path.
+  if not late:
+    g.forceRegDestE(dest)
+    if dest.kind == NamedStack and dest.spillTemp:
+      g.produceIntoMem2(c, dest); return
+  var res = dest
+  let sealedHere = not late and res.kind == InReg and not res.isTemp and
+                   not g.ra.isSealed(res.r)
   if sealedHere: g.ra.seal {res.r}
-  g.emitLvalue2(c, globBase = res)
+  g.emitLvalue2(c, globBase = (if late: dontCare else: res))
   if sealedHere: g.ra.unseal {res.r}
   let cty = resolveType(g.prog, g.getType(c))
   if cty.typeKind in {LengType.ArrayT, LengType.FlexarrayT}:
     # An array / flexible-array-member lvalue DECAYS to its address: `lea`.
-    if res.isTemp and not g.rb.isBoundTemp(res.r): g.bindTemp(res.r, ScalarSlot)
-    g.prematLval2(c)
+    if not late and res.isTemp and not g.rb.isBoundTemp(res.r):
+      g.bindTemp(res.r, ScalarSlot)
+    g.prematLval2(c, hint = (if late: NoReg else: res.r))
+    if late:
+      res = regLoc(g.pickStaging(), ScalarSlot, isTemp = true)
+      g.bindTemp(res.r, ScalarSlot)
     g.ab.tree LeaX64:
       g.emReg res.r
       g.emLvalAddr2(c)
@@ -4883,9 +5035,12 @@ proc emitMemLoad2(g: var CodeGen; c: Cursor; dest: var Location) =
   else:
     var bindSlot = res.typ
     if isPtrType(cty): bindSlot = g.exprSlot(c)
-    if res.isTemp and not g.rb.isBoundTemp(res.r):
+    if not late and res.isTemp and not g.rb.isBoundTemp(res.r):
       g.bindTemp(res.r, bindSlot)                       # bind first: a global base leas &g
-    g.prematLval2(c)                                    #   into res before the (mem …) tree
+    g.prematLval2(c, hint = (if late: NoReg else: res.r))  # into res before the (mem …) tree
+    if late:
+      res = regLoc(g.pickStaging(), bindSlot, isTemp = true)
+      g.bindTemp(res.r, bindSlot)
     g.ab.tree MovX64:
       g.emReg res.r
       g.ab.tree MemX: g.emLvalAddr2(c)
@@ -5028,7 +5183,14 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
     if dest.kind == NamedStack and dest.spillTemp:
       g.produceIntoFMem2(c, dest); return
     let res = dest
-    let dstBits = if res.typ.size == 4: 32 else: 64
+    # The width comes from the conversion's TARGET TYPE, never from the
+    # destination register's slot: `dest` is frequently a generic 8-byte float
+    # temp (see the `takeFTmp` above), and reading `res.typ.size` then made every
+    # `float32(x)` emit `cvtss2sd` instead of `cvtsd2ss` — reinterpreting the low
+    # half of a double as a single. `float64(float32(4.5))` came out 0.0, and
+    # with it `sigmatch.checkFloatLitRange`, so a self-hosted compiler rejected
+    # `printF32 1.0'f32 + 4.5` (tests/nimony/typeconversions).
+    let dstBits = if slotOf(g.prog, targetCur).size == 4: 32 else: 64
     if g.isFloatExpr(inner):
       var fv = res                                       # dest-pass into the operand
       g.emitFValue2(inner, fv)
@@ -6824,7 +6986,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.rb.resetProc(); g.aliasToDecl.clear()
   g.argResidentParams.setLen 0; g.argResidentFlushed = false
   g.savedHomes.clear()
-  g.lvalStride.clear()
+  g.lvalStride.clear(); g.lvalStrideBorrowed.clear()
   g.noFoldPos = -1
   g.curProcName = info.asmName
   when defined(arkhamDbgProc):

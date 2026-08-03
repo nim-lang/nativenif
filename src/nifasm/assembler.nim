@@ -106,6 +106,14 @@ proc addrWidthMove(a, b: Type): bool {.inline.} =
   const AddrLike = {ProcT, PtrT, AptrT, IntT, UIntT}
   (a.kind in PtrLike and b.kind in AddrLike) or (b.kind in PtrLike and a.kind in AddrLike)
 
+proc litFitsWidth(v: int64; bits: int): bool {.inline.} =
+  ## Does integer literal `v` fit a `bits`-wide destination, read as either
+  ## signed or unsigned? (`0..2^bits-1` ∪ `-2^(bits-1)..-1`.) Both readings are
+  ## the same bit pattern in the same register, and which one a value "is" is the
+  ## instruction's business, not the literal's.
+  if bits >= 64: return true
+  v >= -(1'i64 shl (bits - 1)) and v <= (1'i64 shl bits) - 1
+
 proc movCompatible(want, got: Type): bool =
   ## Type rule for `mov`: strict compatibility, OR a *widening* integer move —
   ## a smaller integer into a larger register (a safe extending move/load).
@@ -127,7 +135,14 @@ proc movCompatible(want, got: Type): bool =
   if g.kind == StackOffT: g = g.offType
   if compatible(w, g): return true
   if addrWidthMove(w, g): return true
-  if w.kind in {IntT, UIntT} and g.kind in {IntT, UIntT, IntLitT}:
+  if w.kind in {IntT, UIntT} and g.kind == IntLitT:
+    # A literal carries no width of its own — `parseOperand` types every one as
+    # `(lit 64)` — so judge it by its VALUE: it fits when the destination width
+    # holds the bit pattern under EITHER reading. `(u 32) ← 2400959708`
+    # (0x8F1BBCDC, a SHA-1 round constant) is a plain 32-bit store; so is
+    # `(u 32) ← -1`. Only a literal too wide for the destination is narrowing.
+    return litFitsWidth(g.litVal, w.bits)
+  if w.kind in {IntT, UIntT} and g.kind in {IntT, UIntT}:
     return g.bits <= w.bits
   result = false
 
@@ -4630,10 +4645,16 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
     proc isIntLike(t: Type): bool = t.kind in {IntT, UIntT, BoolT, IntLitT}
     let sizedMemReg = (dest.kind == okMem) != (op.kind == okMem) and
                       isIntLike(dest.typ) and isIntLike(op.typ)
+    # A LITERAL has no width of its own (`parseOperand` types every one `(lit 64)`),
+    # so it widens/narrows by VALUE: `(u 32) ← 2400959708` (0x8F1BBCDC, a SHA-1
+    # round constant) is a plain 32-bit store, as is `(u 32) ← -1`. Only a literal
+    # whose bit pattern does not fit the destination is a real narrowing.
     let wideningRegReg = dest.kind != okMem and op.kind != okMem and
                          dest.typ.kind in {IntT, UIntT} and
-                         op.typ.kind in {IntT, UIntT, IntLitT} and
-                         op.typ.bits <= dest.typ.bits
+                         ((op.typ.kind in {IntT, UIntT} and
+                           op.typ.bits <= dest.typ.bits) or
+                          (op.typ.kind == IntLitT and
+                           litFitsWidth(op.typ.litVal, dest.typ.bits)))
     # Marshalling a wider integer value into a NARROWER integer call argument (`(arg pN)`)
     # is a legitimate ABI truncation: the callee reads only the low `param.bits` of the
     # 64-bit argument register (as C does at the ABI boundary), and a plain 64-bit mov

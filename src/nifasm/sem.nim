@@ -196,6 +196,12 @@ proc `$`*(t: Type): string =
   of StackOffT: "(stackoff " & $t.offType & ")"
   of ProcT: "(proc " & $t.params.len & " params)"
 
+proc isVoidPtr(t: Type): bool =
+  ## `(ptr void)` / `(aptr void)` — the untyped pointer. Both the structural and
+  ## the lazily-recorded (nominal) spelling count.
+  t.kind in {PtrT, AptrT} and
+    ((t.base != nil and t.base.kind == VoidT) or t.baseName == "void")
+
 proc compatible*(want, got: Type): bool =
   if want == got: return true
   # RegisterT is lenient - accepts/provides any type that fits
@@ -249,6 +255,15 @@ proc compatible*(want, got: Type): bool =
       result = true
     elif got.kind != want.kind:
       result = false
+    elif isVoidPtr(want) or isVoidPtr(got):
+      # `(ptr void)` is the UNIVERSAL object pointer — Leng's `pointer`, C's
+      # `void*` — and converts to and from every other pointer. Rejecting
+      # `cmp (ptr void), (ptr char)` (`while p < p +! n`, nifreader.decodeStr)
+      # would catch no real mixup: what the pointee type buys nifasm is FIELD
+      # and element typing, and a `void` pointee has neither. The int-vs-pointer
+      # confusion this arm exists to catch is still rejected — `void` is only
+      # universal among POINTERS.
+      result = true
     elif want.base != nil and got.base != nil:
       # Both pointees structurally resolved — compare structurally.
       result = compatible(want.base, got.base)
