@@ -235,7 +235,8 @@ proc canCompare(t: Type): bool =
   ## deliberately SEPARATE from `canDoIntegerArithmetic` (which add/sub share and
   ## must stay strict — adding/subtracting bools is nonsense).
   t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT,
-             TypeKind.PtrT, TypeKind.AptrT, TypeKind.RegisterT, TypeKind.BoolT,
+             TypeKind.PtrT, TypeKind.AptrT, TypeKind.ProcT,  # `cmp fnptr, nil`
+             TypeKind.RegisterT, TypeKind.BoolT,
              TypeKind.NilT}  # `cmp ptr, nil` / `cmp nil, ptr` null tests
 
 proc canDoBitwiseOps(t: Type): bool =
@@ -2577,22 +2578,29 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
         typeError(dest.typ, op.typ, start)
     checkPtrStore(dest.typ, op.kind, op.typ, start)
     if dest.kind == okMem:
-      if op.kind == okImm:
-        error("Moving immediate to memory not fully supported yet for ARM64", n)
-      elif op.kind == okSsize:
+      if op.kind == okSsize:
         error("Moving ssize to memory not supported", n)
       elif op.kind == okMem:
         error("Cannot move memory to memory", n)
-      elif dest.mem.hasIndex:
-        var base = dest.mem.base
-        if dest.mem.offset != 0:
-          emitAddOffsetA64(ctx, arm64.X16, base, dest.mem.offset, arm64.X16)
-          base = arm64.X16
-        let (size, opc) = memWidthOpc(dest.typ, isLoad = false)
-        arm64.emitLoadStoreReg(ctx.buf.data, op.reg, base, dest.mem.index, size, opc, dest.mem.shift)
       else:
-        let (size, opc) = memWidthOpc(dest.typ, isLoad = false)
-        arm64.emitLoadStoreUImm(ctx.buf.data, op.reg, dest.mem.base, dest.mem.offset, size, opc)
+        # AArch64's `str` has no immediate source, so a constant is materialized in
+        # the scratch first and then stored — the same two instructions the emitter
+        # used to emit by hand. x86-64 is where the direct form saves one; arkham
+        # emits the identical NIF for both and each backend does what it can.
+        var src = op.reg
+        if op.kind == okImm:
+          arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](op.immVal))
+          src = arm64.X17
+        if dest.mem.hasIndex:
+          var base = dest.mem.base
+          if dest.mem.offset != 0:
+            emitAddOffsetA64(ctx, arm64.X16, base, dest.mem.offset, arm64.X16)
+            base = arm64.X16
+          let (size, opc) = memWidthOpc(dest.typ, isLoad = false)
+          arm64.emitLoadStoreReg(ctx.buf.data, src, base, dest.mem.index, size, opc, dest.mem.shift)
+        else:
+          let (size, opc) = memWidthOpc(dest.typ, isLoad = false)
+          arm64.emitLoadStoreUImm(ctx.buf.data, src, dest.mem.base, dest.mem.offset, size, opc)
     else:
       if op.kind == okSsize:
         arm64.emitMovImm(ctx.buf.data, dest.reg, 0'u16)
@@ -4675,20 +4683,19 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
 
   if dest.kind == okMem:
     if op.kind == okImm:
-      # x86 supports mov r/m64, imm32 (sign extended)
-      if op.immVal >= low(int32) and op.immVal <= high(int32):
-        # We need emitMov(MemoryOperand, int32)
-        # I haven't added it to x86.nim yet.
-        # But I can load to scratch? No, that clobbers.
-        # Assume immediate fits 32-bit or error?
-        # "MOV r/m64, imm32" (C7 /0)
-        # I'll assume it fits or implement `emitMov(mem, imm)`.
-        # Since I can't easily add to x86.nim right now without another round,
-        # I'll raise error for mem, imm if not supported.
-        # Wait, I can use `emitMovImmToReg` if I have a scratch register? No.
-        error("Moving immediate to memory not fully supported yet (requires emitMovImmToMem)", n)
+      # Store the constant straight into memory — no scratch register, one instruction
+      # instead of the `mov r,imm; mov [m],r` pair the emitter would otherwise need.
+      let (bits, _) = intMemAccess(dest.typ)     # sized store: don't clobber neighbors
+      # MOV r/m64,imm32 SIGN-extends its 32-bit immediate, so a wider constant has no
+      # direct form. arkham range-checks before emitting this shape, so reaching the
+      # error means a hand-written `(mov (mem …) <big>)`.
+      if bits >= 64 and (op.immVal < low(int32) or op.immVal > high(int32)):
+        error("Immediate too large for a direct memory store (must fit in 32 bits)", n)
       else:
-        error("Immediate too large for memory move (must fit in 32 bits)", n)
+        # A narrower destination writes only its low `bits`, exactly as the register
+        # store does, so `0xFF → (u 8)` is a plain byte store rather than a range error.
+        x86.emitMovImmToMemSized(ctx.buf.data, dest.mem,
+                                 cast[int32](uint32(op.immVal and 0xFFFFFFFF)), bits)
     elif op.kind == okSsize:
       # Similar issue, ssize is immediate 0 (patched).
       error("Moving ssize to memory not supported", n)
@@ -5244,7 +5251,10 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         x86.emitAdd(ctx.buf.data, dest.mem, op.reg)
     else:
       if op.kind == okSsize:
-        x86.emitAddImm(ctx.buf.data, dest.reg, 0)
+        # `forceImm32`: the 0 is a PLACEHOLDER patched to the frame size below, and
+        # the patch writes 4 bytes at `len - 4` — the short imm8 form would land it
+        # on the opcode.
+        x86.emitAddImm(ctx.buf.data, dest.reg, 0, forceImm32 = true)
         ctx.ssizePatches.add(ctx.buf.data.len - 4)
       elif op.kind == okCsize:
         x86.emitAddImm(ctx.buf.data, dest.reg, int32(op.immVal))
@@ -5276,7 +5286,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         x86.emitSub(ctx.buf.data, dest.mem, op.reg)
     else:
       if op.kind == okSsize:
-        x86.emitSubImm(ctx.buf.data, dest.reg, 0)
+        # `forceImm32`: placeholder patched to the frame size — see the `add` twin.
+        x86.emitSubImm(ctx.buf.data, dest.reg, 0, forceImm32 = true)
         ctx.ssizePatches.add(ctx.buf.data.len - 4)
       elif op.kind == okCsize:
         x86.emitSubImm(ctx.buf.data, dest.reg, int32(op.immVal))

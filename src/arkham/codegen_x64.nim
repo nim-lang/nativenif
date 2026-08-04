@@ -2087,6 +2087,58 @@ proc place2(g: var CodeGen; src: Location; dest: Reg) =
   of NamedStack, Mem, Glob, Tvar: g.emitLoadLoc(src, dest)
   else: raiseAssert "arkham x64n: place2 src " & $src.kind
 
+proc immStorable(v: Location; dstTy: Cursor; width: int): bool =
+  ## May `v` be stored STRAIGHT into a `width`-byte memory destination of type
+  ## `dstTy` — `mov [m], imm`, no register anywhere — rather than being
+  ## materialized in a scratch register first?
+  ##
+  ## Two limits, both from the hardware/nifasm side:
+  ## * `mov r/m64, imm32` carries only a 32-bit immediate and SIGN-extends it, so a
+  ##   wider constant (a 64-bit hash seed, a full-width mask) has no direct form.
+  ##   A narrower store writes only its low `width` bytes, which is exactly what the
+  ##   register store does too, so there any value's low bits are already right.
+  ## * nifasm refuses to store a non-zero integer literal into a POINTER-typed
+  ##   destination (`checkPtrStore` — that check is what makes a stale register
+  ##   binding visible), and a register source spells the reinterpretation with an
+  ##   explicit `(cast (ptr T) reg)`. `(nil)` and `0` are the two it accepts.
+  if v.kind != Imm: return false
+  if isNilImm(v): return true                        # `(nil)`: a typed zero store
+  if not cursorIsNil(dstTy) and isPtrType(dstTy) and v.ival != 0: return false
+  if width in 1 ..< 8: return true
+  result = v.ival >= low(int32) and v.ival <= high(int32)
+
+proc emitStoreImmLoc(g: var CodeGen; loc: Location; v: Location) =
+  ## `<scalar Location> ← <immediate>`: the immediate twin of `emitStoreLoc`. The
+  ## constant goes into memory in ONE instruction and needs no register at all —
+  ## the value core would otherwise `mov` it into a staging register and store that,
+  ## which costs an instruction, a `rebind`/`kill` pair, and a register at exactly
+  ## the moments the pool is tightest (a constructor's field/element run).
+  ##
+  ## Callers must have checked `immStorable` for this destination's width/type.
+  case loc.kind
+  of Tvar:                                          # nifasm resolves a tvar to FS:[off]
+    g.ab.tree MovX64: (g.ab.sym loc.name; g.emImm v)
+  of NamedStack:
+    g.ab.tree MovX64: (g.emStackMem(loc.name); g.emImm v)
+  of Mem:
+    g.prematLval2(loc.cur)
+    g.ab.tree MovX64:
+      g.ab.tree MemX: g.emLvalAddr2(loc.cur)
+      g.emImm v
+    g.unbindLvalTemps2(loc.cur)
+  of Glob:
+    # A global still needs its address materialized (x86-64 has no typed
+    # RIP-relative memory operand), but not a second register for the value.
+    var pSlot = ScalarSlot
+    if not cursorIsNil(loc.typ.typ): pSlot = typeToSlot(g.prog.ptrTypeOf(loc.typ.typ))
+    let p = g.pickStagingSealed("a global immediate store address", pSlot)
+    g.emGlobalAddr(p, loc.name)
+    g.ab.tree MovX64:
+      g.ab.tree MemX: g.emReg p
+      g.emImm v
+    g.giveBack p
+  else: raiseAssert "arkham x64: emitStoreImmLoc on location kind " & $loc.kind
+
 proc aggrAddrInto(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind: bool)
 proc bindLvalGlobalBases(g: var CodeGen; c: Cursor; bound: var seq[Reg])
 proc marshalAggrFromAddr(g: var CodeGen; addrReg: Reg; typeName: string; regs: openArray[Reg])
@@ -2614,6 +2666,19 @@ proc produceIntoMem2(g: var CodeGen; c: Cursor; dst: Location) =
       return
   when defined(arkhamDbgSpill):
     stderr.writeLine "DBG produceIntoMem2 slot=" & dst.name
+  block:
+    # A CONSTANT needs no transfer register: it goes into the slot in one store.
+    # We are here because the register pool ran dry, so not taking one — not even
+    # transiently, not even the bridge — is worth the special case on its own.
+    let v =
+      case c.kind
+      of IntLit: immLoc(intVal(c), dst.typ)
+      of UIntLit: immLoc(cast[int64](uintVal(c)), dst.typ)
+      of CharLit: immLoc(int64(ord(charLit(c))), dst.typ)
+      else: dontCare
+    if v.kind == Imm and immStorable(v, dst.typ.typ, dst.typ.size):
+      g.emitStoreImmLoc(dst, v)
+      return
   if c.kind == TagLit and c.exprKind in {DerefC, DotC, AtC, PatC}:
     # A LOAD into the slot: the address must be materialized before any transfer
     # register is needed, and the address registers die with the `(mem …)` tree.
@@ -2653,11 +2718,15 @@ proc emitLeafImm(g: var CodeGen; dest: var Location; natural: Location) =
   elif dest.kind == NamedStack and dest.spillTemp:
     # `needsReg` under a dry pool minted an etmp slot: the literal MUST be
     # stored into it (silently skipping it hands the consumer's reload
-    # garbage) — through staging, like produceIntoMem2.
-    let s = g.pickStagingSealed("a literal spill", dest.typ)
-    g.movImm(s, natural.ival)
-    g.emitStoreLoc(dest, s)
-    g.giveBack s
+    # garbage). The pool being dry is exactly when a register is most expensive,
+    # so store the constant into the slot directly when it has a direct form.
+    if immStorable(natural, dest.typ.typ, dest.typ.size):
+      g.emitStoreImmLoc(dest, natural)
+    else:
+      let s = g.pickStagingSealed("a literal spill", dest.typ)
+      g.placeImm(s, natural)
+      g.emitStoreLoc(dest, s)
+      g.giveBack s
 
 proc emitValue2(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED decide-and-emit (vmgen dest threading): resolve `dest` — a
@@ -3713,12 +3782,24 @@ proc genFieldStore2(g: var CodeGen; dst: Location; valC: Cursor) =
     if gbTmp != NoReg: g.giveBack gbTmp
   else:                                                 # scalar / float / pointer field
     var v: Location
+    var immStaging = NoReg
     if g.isFloatExpr(valC):
       v = dontCare
       g.emitFValue2(valC, v)
     else:
-      v = needsReg(ScalarSlot)                          # single-use (allocSingleUse's shape)
+      # `regOrImm`, not `needsReg`: a constant field value is stored into the field
+      # directly (`mov [m], imm`). A constructor is a RUN of such stores, so this is
+      # where the saving is densest — and the register it no longer takes is one more
+      # the next field's value can use.
+      v = regOrImm(ScalarSlot)                          # single-use (allocSingleUse's shape)
       g.emitValue2(valC, v)
+      if v.kind == Imm:
+        let fty = resolveType(g.prog, g.fieldTypeByName(dst.aggrType, dst.field))
+        if not immStorable(v, fty, g.fieldSlotByName(dst.aggrType, dst.field).size):
+          # No direct form: materialize it, and take the `(cast …)` path below.
+          immStaging = g.pickStagingSealed("a wide immediate field store", v.typ)
+          g.placeImm(immStaging, v)
+          v = regLoc(immStaging, v.typ)
     # Re-derive a spilled-survivor `&g` AFTER the value eval (so it survives no call).
     let (d, gbTmp) = g.materializeGlobBase(dst, if v.kind == InReg: v.r else: NoReg)
     if v.kind == InFReg:                                # float field
@@ -3758,6 +3839,7 @@ proc genFieldStore2(g: var CodeGen; dst: Location; valC: Cursor) =
             g.emReg v.r
         else: raiseAssert "arkham x64n: constr field rhs " & $v.kind
       if v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
+    if immStaging != NoReg: g.giveBack immStaging
     if gbTmp != NoReg: g.giveBack gbTmp
 
 proc constrFieldStores(g: var CodeGen; c: Cursor; base: Location) =
@@ -3856,8 +3938,18 @@ template aconstrElemStores(g: var CodeGen; c: Cursor; destOp: untyped) =
           v = dontCare
           g.emitFValue2(valC, v)
         else:
-          v = needsReg(ScalarSlot)
+          # `regOrImm`: a constant element goes straight into `dest(i)`. A literal
+          # array (a lookup table, a `[0, 0, …]` zero-init) is nothing BUT constant
+          # elements, so this halves the whole construction.
+          v = regOrImm(ScalarSlot)
           g.emitValue2(valC, v)
+        if v.kind == Imm and immStorable(v, et, elemSlot.size):
+          g.ab.tree MovX64:
+            destOp(i)
+            g.emImm(v)
+          inc i
+          skip cc
+          continue
         if v.kind == InFReg:                            # float element
           let bits = if v.typ.size == 4: 32 else: 64
           g.ab.tree (if bits == 32: MovssX64 else: MovsdX64):
@@ -3866,14 +3958,16 @@ template aconstrElemStores(g: var CodeGen; c: Cursor; destOp: untyped) =
           if v.isTemp: g.unbindFTmp(v.f)
         else:
           # scalar/ptr element. The element must be in a GPR to store (no mem→mem
-          # mov); load a spilled (NamedStack) value into a staging register first.
+          # mov); a spilled (NamedStack) value is loaded into a staging register
+          # first, and so is the rare immediate with no direct store form — `place2`
+          # covers both.
           var vReg: Reg
           var ownV = false
           if v.kind == InReg:
             vReg = v.r
           else:
             vReg = g.pickStagingSealed("aconstr scalar element", v.typ)
-            g.emitLoadLoc(v, vReg)
+            g.place2(v, vReg)
             ownV = true
           var etc = et
           g.ab.tree MovX64:
@@ -3959,6 +4053,16 @@ proc storeScalar2(g: var CodeGen; dst, v: Location) =
       of InReg:
         g.emitStoreLoc(dst, v.r)
         if v.isTemp: g.unbindTemp(v.r)
+      of Imm:
+        # A constant goes straight into the slot; only one too wide for `mov r/m,imm32`
+        # still needs a register to carry it.
+        if immStorable(v, dst.typ.typ, dst.typ.size):
+          g.emitStoreImmLoc(dst, v)
+        else:
+          let s = g.pickStagingSealed("a wide immediate store", v.typ)
+          g.placeImm(s, v)
+          g.emitStoreLoc(dst, s)
+          g.giveBack s
       of NamedStack, Mem:
         let s = g.pickStagingSealed("a scalar store", v.typ)
         g.emitLoadLoc(v, s)
@@ -4319,7 +4423,9 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
         v = dontCare
         g.emitFValue2(rhs, v)                             # rhs value FIRST
       else:
-        v = needsReg(ScalarSlot)
+        # `regOrImm`, not `needsReg`: a constant (or const-folded) rhs reaches the
+        # store as an immediate, which x86 writes into the lvalue directly.
+        v = regOrImm(ScalarSlot)
         g.emitValue2(rhs, v)
       # lvalue picks AFTER the rhs: the live rhs value is a bound temp, so the
       # picks (and later premat staging) cannot land on it. `isStore=false`:
@@ -4355,6 +4461,13 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
         if v.kind in {NamedStack, Mem}:                   # demoted (stolen) local → staging reg
           rhsStaging = g.pickStagingSealed("a memory store rhs", v.typ)
           g.emitLoadLoc(v, rhsStaging)
+          v = regLoc(rhsStaging, v.typ)
+        elif v.kind == Imm and
+             not immStorable(v, dstTy, (if dstPtr: 8 else: typeToSlot(dstTy).size)):
+          # No direct form (too wide for `imm32`, or a non-zero integer into a pointer
+          # field): carry it in a register, which then takes the `(cast …)` below.
+          rhsStaging = g.pickStagingSealed("a wide immediate store", v.typ)
+          g.placeImm(rhsStaging, v)
           v = regLoc(rhsStaging, v.typ)
         g.prematLval2(lhs)                                 # base regs AFTER the rhs is secured
         g.ab.tree MovX64:
@@ -4394,7 +4507,9 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
       g.emitFValue2(rhs, v)
       g.storeScalar2(dst, v)
     else:
-      var v = needsReg(dst.typ)
+      # `regOrImm`, not `needsReg`: a constant rhs stays an immediate so `storeScalar2`
+      # can put it into the slot directly instead of through a register.
+      var v = (if dst.kind == NamedStack: regOrImm(dst.typ) else: needsReg(dst.typ))
       g.emitValue2(rhs, v)
       g.storeScalar2(dst, v)
 

@@ -1,0 +1,58 @@
+(.nif27)
+(.indexat 727              )
+(stmts
+ (arch linux_arm64)
+ (type :Rec.0
+  (object
+   (fld :b.0
+    (u 8))
+   (fld :w.0
+    (u 16))
+   (fld :q.0
+    (i 64))))
+ (proc :main.0
+  (params)
+  (result)
+  (clobber
+   (x0)
+   (x8)
+   (x9)
+   (x10)
+   (x17))
+  (stmts
+   (sub
+    (sp)
+    (ssize))
+   (var :r.0
+    (s)Rec.0)
+   (mov
+    (mem
+     (dot r.0 b.0))7)
+   (mov
+    (mem
+     (dot r.0 w.0))300)
+   (mov
+    (mem
+     (dot r.0 q.0))-265)
+   (var :a.0
+    (x9)
+    (i 64))
+   (var :t.0
+    (x10)
+    (i 64))
+   (mov a.0
+    (mem
+     (dot r.0 b.0)))
+   (mov t.0
+    (mem
+     (dot r.0 w.0)))
+   (add a.0 t.0)
+   (mov t.0
+    (mem
+     (dot r.0 q.0)))
+   (add a.0 t.0)
+   (mov
+    (x0)a.0)
+   (mov
+    (x8)93)
+   (svc 0))))(.index)

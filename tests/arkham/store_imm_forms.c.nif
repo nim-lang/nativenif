@@ -1,0 +1,168 @@
+(.nif27)
+(.indexat 2544             )
+(stmts
+ (type :Fns.0 .
+  (proctype .
+   (params
+    (param :a.0 .
+     (i 64)))
+   (i 64).))
+ (type :Rec.0 .
+  (object .
+   (fld :b.0 .
+    (u 8))
+   (fld :w.0 .
+    (u 16))
+   (fld :i.0 .
+    (i 32))
+   (fld :q.0 .
+    (i 64))
+   (fld :p.0 .
+    (ptr
+     (i 64)))
+   (fld :fn.0 . Fns.0)
+   (fld :wide.0 .
+    (u 64))))
+ (type :Arr4.0 .
+  (array
+   (i 64)4))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :r.0 . Rec.0 .)
+   (asgn
+    (dot r.0 b.0 0)255)
+   (asgn
+    (dot r.0 w.0 0)65535)
+   (asgn
+    (dot r.0 i.0 0)100000)
+   (asgn
+    (dot r.0 q.0 0)7)
+   (asgn
+    (dot r.0 p.0 0)
+    (nil))
+   (asgn
+    (dot r.0 fn.0 0)
+    (nil))
+   (asgn
+    (dot r.0 wide.0 0)
+    (suf 9223372036854775807u "u64"))
+   (var :a.0 . Arr4.0
+    (aconstr Arr4.0 1 2 3 4))
+   (var :z.0 .
+    (i 64)0)
+   (var :s.0 .
+    (i 64)100)
+   (if
+    (elif
+     (neq
+      (dot r.0 b.0 0)255)
+     (stmts
+      (call exit.c 11))))
+   (if
+    (elif
+     (neq
+      (dot r.0 w.0 0)65535)
+     (stmts
+      (call exit.c 12))))
+   (if
+    (elif
+     (neq
+      (dot r.0 i.0 0)100000)
+     (stmts
+      (call exit.c 13))))
+   (if
+    (elif
+     (neq
+      (dot r.0 q.0 0)7)
+     (stmts
+      (call exit.c 14))))
+   (if
+    (elif
+     (neq
+      (dot r.0 p.0 0)
+      (nil))
+     (stmts
+      (call exit.c 15))))
+   (if
+    (elif
+     (neq
+      (dot r.0 fn.0 0)
+      (nil))
+     (stmts
+      (call exit.c 16))))
+   (if
+    (elif
+     (neq
+      (dot r.0 wide.0 0)
+      (suf 9223372036854775807u "u64"))
+     (stmts
+      (call exit.c 17))))
+   (if
+    (elif
+     (neq
+      (at a.0 0)1)
+     (stmts
+      (call exit.c 18))))
+   (if
+    (elif
+     (neq
+      (at a.0 3)4)
+     (stmts
+      (call exit.c 19))))
+   (if
+    (elif
+     (neq z.0 0)
+     (stmts
+      (call exit.c 20))))
+   (asgn s.0
+    (add
+     (i 64)s.0 127))
+   (if
+    (elif
+     (neq s.0 227)
+     (stmts
+      (call exit.c 21))))
+   (asgn s.0
+    (add
+     (i 64)s.0 128))
+   (if
+    (elif
+     (neq s.0 355)
+     (stmts
+      (call exit.c 22))))
+   (asgn s.0
+    (sub
+     (i 64)s.0 129))
+   (if
+    (elif
+     (neq s.0 226)
+     (stmts
+      (call exit.c 23))))
+   (asgn s.0
+    (sub
+     (i 64)s.0 128))
+   (if
+    (elif
+     (neq s.0 98)
+     (stmts
+      (call exit.c 24))))
+   (asgn s.0
+    (bitand
+     (i 64)s.0 127))
+   (if
+    (elif
+     (neq s.0 98)
+     (stmts
+      (call exit.c 25))))
+   (call exit.c 42))))(.index)

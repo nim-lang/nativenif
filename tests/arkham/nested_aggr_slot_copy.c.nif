@@ -1,0 +1,49 @@
+(.nif27)
+(.indexat 900              )
+(stmts
+ (type :Bytes.0 .
+  (array
+   (u 8)13))
+ (type :Outer.0 .
+  (object .
+   (fld :x.0 .
+    (i 64))
+   (fld :bs.0 . Bytes.0)))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :o.0 . Outer.0
+    (oconstr Outer.0
+     (kv x.0 19)
+     (kv bs.0
+      (aconstr Bytes.0 1 2 3 4 5 6 7 8 9 10 11 12 13))))
+   (call exit.c
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (dot o.0 x.0)
+      (conv
+       (i 64)
+       (at
+        (dot o.0 bs.0)0)))
+     (add
+      (i 64)
+      (conv
+       (i 64)
+       (at
+        (dot o.0 bs.0)8))
+      (conv
+       (i 64)
+       (at
+        (dot o.0 bs.0)12)))))))) (.index)

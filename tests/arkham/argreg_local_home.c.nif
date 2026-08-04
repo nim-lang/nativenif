@@ -1,0 +1,63 @@
+(.nif27)
+(.indexat 900              )
+(stmts
+ (type :Box.0 .
+  (object .
+   (fld :v.0 .
+    (i 64))))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :take.0
+  (params
+   (param :a.0 .
+    (i 64))
+   (param :b.0 .
+    (i 64)))
+  (i 64).
+  (stmts
+   (ret
+    (add
+     (i 64)a.0 b.0))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :bx.0 . Box.0
+    (oconstr Box.0
+     (kv v.0 7)))
+   (var :n.0 .
+    (i 64)3)
+   (var :flag.0 .
+    (i 64)1)
+   (var :w.0 .
+    (u 32)32)
+   (if
+    (elif
+     (lt 0 flag.0)
+     (stmts
+      (var :p.0 .
+       (ptr Box.0)
+       (addr bx.0))
+      (asgn n.0
+       (add
+        (i 64)n.0
+        (dot
+         (deref p.0)v.0 0)))))
+    (else
+     (stmts
+      (asgn n.0 0))))
+   (asgn n.0
+    (call take.0 n.0
+     (conv
+      (i 64)w.0)))
+   (call exit.c
+    (conv
+     (i 32)n.0)))))
+(.index)

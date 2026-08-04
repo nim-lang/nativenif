@@ -100,7 +100,12 @@ home a local in *all* of rdi/rsi/r8/r9 — and rcx/rdx too, via the `ShiftRegOk`
 `DivRegOk` extensions — leaving the emitter only r10/r11. Any emitter step that needs
 a third register is then non-total. Keeping each step's demand inside that budget is
 still the *first* answer — see the copy tiering below — because it costs nothing at
-run time. But it cannot be the whole answer: the demand of a `(mem …)` address chain,
+run time. The cheapest version of that answer is to need NO register: a constant
+stored into memory goes straight there (`mov [m], imm`, see `emitStoreImmLoc` and its
+`immStorable` guard) instead of being materialized in a staging register first. That
+is one instruction less AND one less claim on the pool at its tightest moments — a
+constructor's field/element run, or `produceIntoMem2`, which is only reached *because*
+the pool ran dry. But it cannot be the whole answer: the demand of a `(mem …)` address chain,
 and of a right-nested spilled expression that holds its partial in the bridge while it
 evaluates the other side, grows with nesting depth, and no fixed reservation covers an
 unbounded demand.

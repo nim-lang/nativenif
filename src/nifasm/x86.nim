@@ -173,6 +173,27 @@ proc emitMovToMemSized*(dest: var Bytes; mem: MemoryOperand; reg: Register; bits
   dest.add(if bits == 8: 0x88 else: 0x89)       # MOV r/m8,r8  /  MOV r/m(16|32),r
   dest.emitMem(int(reg), mem)
 
+proc emitMovImmToMemSized*(dest: var Bytes; mem: MemoryOperand; imm: int32; bits: int) =
+  ## Store the immediate `imm` straight into `mem` — MOV r/m, imm (C6 /0 for a byte,
+  ## C7 /0 otherwise), sized like `emitMovToMemSized` so a narrow store leaves the
+  ## neighbouring bytes alone. No register is involved, which is the whole point:
+  ## the caller would otherwise have to materialize the constant in a scratch first.
+  ##
+  ## The 64-bit form carries a 32-bit immediate that the CPU SIGN-extends, so the
+  ## caller must have range-checked `imm` against the destination width; for the
+  ## narrow forms only the low `bits` are written.
+  emitSegPrefix(dest, mem)
+  if bits == 16: dest.add(0x66)                 # operand-size override → 16-bit
+  var rex = RexPrefix(w: bits >= 64)
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  if rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
+  dest.add(if bits == 8: 0xC6 else: 0xC7)       # MOV r/m8,imm8 / MOV r/m(16|32|64),imm(16|32)
+  dest.emitMem(0, mem)                          # /0
+  if bits == 8: dest.add(byte(imm and 0xFF))
+  elif bits == 16: dest.addUint16(uint16(imm and 0xFFFF))
+  else: dest.addt32(imm)
+
 proc emitLoadExt*(dest: var Bytes; reg: Register; mem: MemoryOperand; bits: int; signed: bool) =
   ## Load `bits` from `mem` into the full 64-bit `reg`, sign- or zero-extended.
   if bits >= 64:
@@ -598,83 +619,51 @@ proc emitTest*(dest: var Bytes; a, b: Register) =
   dest.add(encodeModRM(amDirect, int(b), int(a)))  # reg=b, rm=a
 
 # Arithmetic with immediate values
-proc emitAddImm*(dest: var Bytes; reg: Register; imm: int32) =
-  ## Emit ADD instruction: ADD reg, imm32
+proc fitsImm8(imm: int32): bool {.inline.} =
+  ## Can this immediate ride in the one-byte, sign-extended `0x83` form?
+  imm >= -128 and imm <= 127
+
+proc emitAluImmReg(dest: var Bytes; ext: int; reg: Register; imm: int32;
+                   forceImm32 = false) =
+  ## `<alu> r64, imm` — `ext` is the ModRM.reg opcode-extension digit (ADD=0, OR=1,
+  ## AND=4, SUB=5, XOR=6, CMP=7).
+  ##
+  ## Small constants take the `0x83` form, whose immediate is ONE byte sign-extended
+  ## to the operand width: 4 bytes instead of 7 for the same instruction with the same
+  ## flags. Most of these immediates are small — a `cmp r, 0` bool test, a `sub rsp, n`
+  ## frame adjustment, a `+1` bump — so this is the difference between a dense and a
+  ## bloated text section (~3% of the whole binary, measured on nimsem).
+  ##
+  ## `forceImm32` pins the long form. A caller that emits a PLACEHOLDER and patches the
+  ## immediate afterwards (`ssizePatches`, which records `buf.len - 4`) must pass it:
+  ## its placeholder is 0, 0 fits in a byte, and the short encoding would leave the
+  ## later 4-byte patch writing over the opcode. That is not hypothetical — it is what
+  ## this parameter was added for, after `sub rsp, <ssize>` started segfaulting.
   var rex = RexPrefix(w: true)
-
   if needsRex(reg): rex.b = true
-
   if rex.b or rex.w:
     dest.add(encodeRex(rex))
+  if fitsImm8(imm) and not forceImm32:
+    dest.add(0x83)                                # group-1 r/m64, imm8 (sign-extended)
+    dest.add(encodeModRM(amDirect, ext, int(reg)))
+    dest.add(byte(imm and 0xFF))
+  else:
+    dest.add(0x81)                                # group-1 r/m64, imm32
+    dest.add(encodeModRM(amDirect, ext, int(reg)))
+    dest.addt32(imm)
 
-  dest.add(0x81)  # ADD r/m64, imm32 opcode
-  dest.add(encodeModRM(amDirect, 0, int(reg)))  # /0 extension
-  dest.addt32(imm)
-
-proc emitSubImm*(dest: var Bytes; reg: Register; imm: int32) =
-  ## Emit SUB instruction: SUB reg, imm32
-  var rex = RexPrefix(w: true)
-
-  if needsRex(reg): rex.b = true
-
-  if rex.b or rex.w:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x81)  # SUB r/m64, imm32 opcode
-  dest.add(encodeModRM(amDirect, 5, int(reg)))  # /5 extension
-  dest.addt32(imm)
-
-proc emitAndImm*(dest: var Bytes; reg: Register; imm: int32) =
-  ## Emit AND instruction: AND reg, imm32
-  var rex = RexPrefix(w: true)
-
-  if needsRex(reg): rex.b = true
-
-  if rex.b or rex.w:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x81)  # AND r/m64, imm32 opcode
-  dest.add(encodeModRM(amDirect, 4, int(reg)))  # /4 extension
-  dest.addt32(imm)
-
-proc emitOrImm*(dest: var Bytes; reg: Register; imm: int32) =
-  ## Emit OR instruction: OR reg, imm32
-  var rex = RexPrefix(w: true)
-
-  if needsRex(reg): rex.b = true
-
-  if rex.b or rex.w:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x81)  # OR r/m64, imm32 opcode
-  dest.add(encodeModRM(amDirect, 1, int(reg)))  # /1 extension
-  dest.addt32(imm)
-
-proc emitXorImm*(dest: var Bytes; reg: Register; imm: int32) =
-  ## Emit XOR instruction: XOR reg, imm32
-  var rex = RexPrefix(w: true)
-
-  if needsRex(reg): rex.b = true
-
-  if rex.b or rex.w:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x81)  # XOR r/m64, imm32 opcode
-  dest.add(encodeModRM(amDirect, 6, int(reg)))  # /6 extension
-  dest.addt32(imm)
-
-proc emitCmpImm*(dest: var Bytes; reg: Register; imm: int32) =
-  ## Emit CMP instruction: CMP reg, imm32
-  var rex = RexPrefix(w: true)
-
-  if needsRex(reg): rex.b = true
-
-  if rex.b or rex.w:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x81)  # CMP r/m64, imm32 opcode
-  dest.add(encodeModRM(amDirect, 7, int(reg)))  # /7 extension
-  dest.addt32(imm)
+proc emitAddImm*(dest: var Bytes; reg: Register; imm: int32; forceImm32 = false) =
+  emitAluImmReg(dest, 0, reg, imm, forceImm32)
+proc emitOrImm*(dest: var Bytes; reg: Register; imm: int32; forceImm32 = false) =
+  emitAluImmReg(dest, 1, reg, imm, forceImm32)
+proc emitAndImm*(dest: var Bytes; reg: Register; imm: int32; forceImm32 = false) =
+  emitAluImmReg(dest, 4, reg, imm, forceImm32)
+proc emitSubImm*(dest: var Bytes; reg: Register; imm: int32; forceImm32 = false) =
+  emitAluImmReg(dest, 5, reg, imm, forceImm32)
+proc emitXorImm*(dest: var Bytes; reg: Register; imm: int32; forceImm32 = false) =
+  emitAluImmReg(dest, 6, reg, imm, forceImm32)
+proc emitCmpImm*(dest: var Bytes; reg: Register; imm: int32; forceImm32 = false) =
+  emitAluImmReg(dest, 7, reg, imm, forceImm32)
 
 proc emitAluImmMem(dest: var Bytes; ext: int; mem: MemoryOperand; imm: int32; bits = 64) =
   ## `<alu> r/m, imm` with a MEMORY destination, SIZED to `bits` (8/16/32/64). `ext`
@@ -692,6 +681,10 @@ proc emitAluImmMem(dest: var Bytes; ext: int; mem: MemoryOperand; imm: int32; bi
     dest.add(encodeRex(rex))
   if bits == 8:
     dest.add(0x80)                               # group-1 r/m8, imm8
+    dest.emitMem(ext, mem)
+    dest.add(byte(imm and 0xFF))
+  elif fitsImm8(imm):
+    dest.add(0x83)                               # group-1 r/m{16,32,64}, imm8 (sign-ext)
     dest.emitMem(ext, mem)
     dest.add(byte(imm and 0xFF))
   else:

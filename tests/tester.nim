@@ -359,6 +359,22 @@ proc arkhamQemuTests() =
   echo passed, " / ", total, " arkham linux_arm64 (qemu) tests successful (",
        skipped, " Darwin-only skipped)"
 
+  # Hand-written asm-NIF for AArch64 forms that arkham's a64 codegen does not (yet)
+  # emit, so the corpus above cannot reach them. `(mov <mem> <imm>)` is one: x86-64
+  # stores the constant directly, AArch64 has no such `str`, and the assembler
+  # materializes it in the scratch instead — that lowering needs its own test or it
+  # ships unexercised. Each exits with 42 on success.
+  for name in ["a64_mov_imm_mem"]:
+    let exe = workDir / (name & ".hand.out")
+    let (no, nc) = execCmdEx(quoteShell(nifasm) & " -o:" & quoteShell(exe) & " " &
+                             quoteShell("tests" / (name & ".nif")))
+    if nc != 0: quit "FAILURE nifasm (hand-written linux_arm64) " & name & "\n" & no
+    let (po, pc) = execCmdEx(quoteShell(qemu) & " " & quoteShell(exe))
+    if pc != 42:
+      quit "FAILURE (qemu linux_arm64, hand-written) exitcode 42 but got " & $pc &
+           " for " & name & "\n" & po
+    echo "hand-written linux_arm64 asm test ", name, " successful"
+
 when defined(macosx):
   exec "nim c -r src/nifasm/nifasm tests/hello_darwin.nif"
   exec "tests/hello_darwin"

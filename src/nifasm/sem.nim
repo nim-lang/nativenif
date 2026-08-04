@@ -282,6 +282,12 @@ proc compatible*(want, got: Type): bool =
     # StackOffT is compatible if the underlying types are compatible
     result = got.kind == StackOffT and compatible(want.offType, got.offType)
   of ProcT:
+    # A null function pointer: `(nil)` — and the `0` literal it materializes from —
+    # assigns to and compares with a proctype, exactly as with a data pointer (see the
+    # PtrT/AptrT arm). `checkPtrStore` already treats ProcT as pointer-like and admits
+    # only those two, which is the STORE-grade half of this rule; this arm is what lets
+    # `(mov (mem …fnptr field…) (nil))` type-check without a register to carry the nil.
+    if got.kind in {NilT, IntLitT}: return true
     # ProcT compatibility: same number of params/results and compatible types
     if got.kind != ProcT: return false
     if want.params.len != got.params.len: return false
