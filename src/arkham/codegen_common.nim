@@ -50,10 +50,9 @@ type
     hasFrame*: bool                          ## current proc needs a stack frame
     frameRegs*: seq[Reg]                     ## callee-saved GPRs to save (even count)
     frameFRegs*: seq[FReg]                   ## callee-saved SIMD regs to save (even count)
-    framePad*: int                           ## x64: extra prologue `sub rsp` for 16-byte call alignment
     stackArgBaseReg*: Reg                     ## x64: callee-saved reg holding the incoming stack-args
                                               ## base (rsp after pushes), captured before the frame
-                                              ## `sub`s so stack params survive rsp moving; else NoReg
+                                              ## `sub` so stack params survive rsp moving; else NoReg
     labelCount*: int                         ## fresh-label counter
     emitTmpSpills*: int                      ## step-3 value core: fresh counter for emit-time
                                              ## minted spill slots (`etmpN.0`/`eftmpN.0`/
@@ -864,11 +863,9 @@ proc mintSpillName*(g: var CodeGen; prefix: string): string =
   ## A fresh emit-time spill-slot name (`etmp`/`eftmp`/`held` + counter). The
   ## backend declares the `(var :name (s) T)` inline at first use — mid-body
   ## slot decls are legal nifasm (the aggtmp constructor temps already rely on
-  ## that) — and flags `ra.hasStackVars` so the frame `sub` is emitted when the
-  ## prologue is finalized.
+  ## that), and nifasm sizes the frame around whatever slots it ends up seeing.
   result = prefix & $g.emitTmpSpills & ".0"
   inc g.emitTmpSpills
-  g.ra.hasStackVars = true
 
 # ── fused value core: syntactic operand predicates (shared by both backends) ─
 # Ports of the allocator's private Builder predicates; these become the only

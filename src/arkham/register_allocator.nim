@@ -72,7 +72,6 @@ type
                                       ## snapshots to reconcile.
     usedCallee*: set[Reg]             ## callee-saved GPRs to save in prologue
     usedCalleeF*: set[FReg]           ## callee-saved SIMD regs (v8–v15) to save in prologue
-    hasStackVars*: bool               ## proc has nifasm-managed `(s)` aggregate vars
     hasStackParams*: bool             ## proc receives ≥1 parameter on the stack — the
                                       ## allocator reserved a callee-saved reg for the
                                       ## emitter's `stackArgBaseReg` (single source of
@@ -177,8 +176,8 @@ proc spillTo(b: var Builder; name: string; slot: AsmSlot): Location =
   ## A value that must live in memory: its nifasm-managed `(s)` slot, addressed
   ## by its own name (nifasm computes the offset). This states the final home
   ## outright — the former `OnStack` placeholder that every caller had to convert
-  ## is gone. The caller still decides `hasStackVars` (a steal may re-home the
-  ## value in a register before the decision is final).
+  ## is gone. (A steal may re-home the value in a register before the decision
+  ## is final.)
   namedStackLoc(name, slot)
 
 proc allocStorage(b: var Builder; name: string; slot: AsmSlot; props: VarProps): Location =
@@ -330,7 +329,6 @@ proc demoteToStack(b: var Builder; victim: string) =
   ## home. Sound across every control-flow path: the home is memory everywhere.
   let vpos = b.ra.symPos[victim]
   b.ra.locs[vpos] = namedStackLoc(victim, b.ra.locs[vpos].typ)
-  b.ra.hasStackVars = true
 
 proc trySteal(b: var Builder; curName: string; curSlot: AsmSlot;
               curProps: VarProps; fallback: Location): Location =
@@ -400,7 +398,6 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
       # var, addressed by name — arkham does not register-allocate it. (No
       # early `return` here: that would skip the `into` epilogue and desync.)
       b.record(pos, name, namedStackLoc(name, slot))
-      b.ra.hasStackVars = true
     else:
       let props = b.an.vars.getOrDefault(name).props
       # ── same-width cast/copy home inheritance ──────────────────────────────────
@@ -468,8 +465,6 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
       if loc.kind == NamedStack and AddrTaken notin props and
          slot.inRegClass and not slot.isFloat:
         loc = b.trySteal(name, slot, props, loc)  # hot var evicts a colder one
-      if loc.kind == NamedStack:
-        b.ra.hasStackVars = true
       when defined(arkhamSSAStats):
         if loc.kind == NamedStack and AddrTaken notin props and
            slot.inRegClass and not slot.isFloat:
@@ -583,7 +578,6 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
           # (below, like a by-ref aggregate): `emitStackParamLoads` computes `&incoming`
           # with `Lea` and the body reads fields through it — no copy.
           b.record(pos, name, namedStackLoc(name, slot))
-          b.ra.hasStackVars = true
         else:
           # `effSlot` is the in-register value: the scalar itself, or a pointer — to
           # the aggregate copy (by-ref), or to the incoming stack bytes (a64 stack-passed
@@ -666,7 +660,6 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
                 let victim = spillableRegParams.pop()
                 b.record(victim.pos, victim.name,
                          namedStackLoc(victim.name, victim.effSlot))
-                b.ra.hasStackVars = true
                 loc = regLoc(victim.r, effSlot)
               else:
                 if aggrByRef:
@@ -693,7 +686,6 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
               let victim = spillableRegParams.pop()
               b.record(victim.pos, victim.name,
                        namedStackLoc(victim.name, victim.effSlot))
-              b.ra.hasStackVars = true
               r = victim.r                        # already in usedCallee
             if r == NoReg:
               # Totality: no callee-saved reg and nothing colder to evict — home this
@@ -701,14 +693,11 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
               # arg area into the slot through a staging bridge (`emitStackParamLoadsX64`),
               # so no register is held; correct by construction, never a hard fail.
               loc = namedStackLoc(name, effSlot)
-              b.ra.hasStackVars = true
             else:
               b.ra.usedCallee.incl r
               loc = regLoc(r, effSlot)
-          if loc.kind == NamedStack:
-            # An address-taken / spilled param's `(s)` slot: the prologue fills it
-            # from the incoming arg register (int or SIMD; see emitParamMoves).
-            b.ra.hasStackVars = true
+          # A `NamedStack` home here is an address-taken / spilled param's `(s)` slot;
+          # the prologue fills it from the incoming arg register (see emitParamMoves).
           b.record(pos, name, loc)
   # Make the scalar register-homed params visible to `coldestVictim`: a proc whose
   # params all take callee-saved homes (every reg param crosses a call) would

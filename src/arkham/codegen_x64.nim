@@ -192,7 +192,6 @@ proc emFcvt(g: var CodeGen; d, s: FReg; dstBits, srcBits: int) =   # precision c
 # saved xmm registers, so a float that must survive a call has nowhere else to
 # go). It is loaded/stored with movss/movsd against `(mem (rsp) name)`.
 proc emFloatStackVar(g: var CodeGen; name: string; bits: int) =
-  g.ra.hasStackVars = true                   # a `(s)` var exists ⇒ frame sub needed
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
   g.ab.keyword SO
@@ -432,7 +431,6 @@ proc exitScope(g: var CodeGen) =
 
 proc emStackVar(g: var CodeGen; name, typeName: string) =
   ## `(var :name (s) typeName)` — a nifasm-managed aggregate stack slot.
-  g.ra.hasStackVars = true                   # a `(s)` var exists ⇒ frame sub needed
   g.stackSlots.incl name
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
@@ -442,7 +440,6 @@ proc emStackVar(g: var CodeGen; name, typeName: string) =
 
 proc emScalarStackVar(g: var CodeGen; name: string) =
   ## `(var :name (s) (i 64))` — a spilled/address-taken scalar's 8-byte slot.
-  g.ra.hasStackVars = true                   # a `(s)` var exists ⇒ frame sub needed
   g.stackSlots.incl name
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
@@ -455,7 +452,6 @@ proc emTypedStackVar(g: var CodeGen; name: string; t: Cursor) =
   ## generic `(i 64)` slot) for a homed/spilled scalar whose type matters to
   ## nifasm — e.g. a pointer param that the body later derefs, where an `(i 64)`
   ## slot would both reject the typed store and forbid the deref (nifasm is strict).
-  g.ra.hasStackVars = true                   # a `(s)` var exists ⇒ frame sub needed
   g.stackSlots.incl name
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
@@ -1909,29 +1905,29 @@ proc pickStackArgBaseX64(g: var CodeGen; hasStackParams: bool) =
     # allocator/emitter classification drift — both must read `g.ra.hasStackParams`.)
     assert g.stackArgBaseReg != NoReg, "arkham x64n: no callee-saved reg for stackArgBaseReg"
 
-proc computeFrameX64(g: var CodeGen; isEntry, hasCall: bool) =
+proc computeFrameX64(g: var CodeGen) =
   ## Finalize the frame shape. Runs AFTER the body is emitted (body-buffer model):
-  ## only then are `ra.usedCallee` / `hasStackVars` final. `stackArgBaseReg` was
-  ## picked up front (`pickStackArgBaseX64`) and is pushed with the frame regs.
+  ## only then is `ra.usedCallee` final. `stackArgBaseReg` was picked up front
+  ## (`pickStackArgBaseX64`) and is pushed with the frame regs.
+  ##
+  ## Which registers to save is a register-allocation fact, so it is decided here.
+  ## How far rsp then has to drop is NOT: the `(s)` slot region is nifasm's to lay
+  ## out, and the 16-byte call alignment SysV wants is a property of that same drop.
+  ## arkham used to compute an alignment pad and emit its own `sub rsp, 8` in front
+  ## of the frame `sub` — two instructions for one adjustment. It now just marks
+  ## where the frame opens and closes (`(sub (rsp)(ssize))`) and nifasm, which
+  ## counts the pushes and the slots, folds both into a single instruction.
   g.frameRegs = @[]
   for r in g.md.intCalleeSaved:
     if r in g.ra.usedCallee: g.frameRegs.add r
   if g.stackArgBaseReg != NoReg:
     g.frameRegs.add g.stackArgBaseReg
-  # SysV requires rsp ≡ 0 (mod 16) at a `call`. The kernel enters the entry with
-  # rsp ≡ 0; a normal callee is entered with rsp ≡ 8 (the caller's pushed return
-  # address). Each saved reg is 8 bytes, so after the pushes the parity may be
-  # wrong — pad with an extra 8 when this proc itself makes a call.
-  g.framePad = 0
-  if hasCall:
-    let entryBias = if isEntry: 0 else: 8
-    if (entryBias + 8 * g.frameRegs.len) mod 16 != 0: g.framePad = 8
-  g.hasFrame = g.frameRegs.len > 0 or g.framePad > 0
+  g.hasFrame = g.frameRegs.len > 0
 
 proc framePushBytesX64(g: CodeGen): int =
-  ## Bytes between the current rsp (after the callee-saved pushes, before the pad)
-  ## and the caller's first stack argument: the return address (8) plus each saved
-  ## register (8). Used to address incoming stack params.
+  ## Bytes between the current rsp (after the callee-saved pushes, before the frame
+  ## `sub`) and the caller's first stack argument: the return address (8) plus each
+  ## saved register (8). Used to address incoming stack params.
   8 + 8 * g.frameRegs.len
 
 proc framePush(g: var CodeGen) =
@@ -1939,19 +1935,18 @@ proc framePush(g: var CodeGen) =
     g.ab.tree PushX64: g.ab.reg r                          # raw push
 
 proc framePop(g: var CodeGen) =
-  # Release the nifasm-managed `(s)` slot region first (reverse of the prologue,
-  # which lowered rsp by the pad then the `(ssize)` block), then the alignment pad
-  # and the callee-saved registers.
-  if g.ra.hasStackVars:
-    g.ab.tree AddX64: g.ab.reg RSP; g.ab.keyword SsizeX
-  if g.framePad > 0: g.binImm(AddX64, RSP, g.framePad.int64)
+  # Close the frame (the exact reverse of the prologue's `(ssize)` open), then restore
+  # the callee-saved registers. Emitted unconditionally: whether this proc has a frame
+  # at all is nifasm's call — it owns the slots and the alignment — and it deletes the
+  # instruction outright when the answer is "none".
+  g.ab.tree AddX64: g.ab.reg RSP; g.ab.keyword SsizeX
   for i in countdown(g.frameRegs.high, 0):
     g.ab.tree PopX64: g.ab.reg g.frameRegs[i]             # raw pop, reverse order
 
 proc emitStackParamLoadsX64(g: var CodeGen; decl: Cursor) =
   ## Load the 7th+ integer/pointer parameters from the caller's outgoing argument
   ## area into their allocated (callee-saved) register homes. Emitted right after
-  ## `framePush` and before the alignment pad, so each arg sits at the statically
+  ## `framePush` and before the frame `sub`, so each arg sits at the statically
   ## known offset `framePushBytes + k*8` from the current rsp.
   var c = decl
   inc c; inc c                                # → params slot
@@ -5979,7 +5974,6 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
               g.releaseArgDest(r, aSym)
               dst.add r
         if not fits:
-          g.ra.hasStackVars = true           # outgoing stack-arg area ⇒ frame sub
           var srcAddr = NoReg
           var srcSpilled = false
           var srcOwned = true
@@ -6106,7 +6100,6 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
                 g.ab.tree ArgX: g.ab.sym paramName(nameIdx)
                 g.emReg srcReg
           else:
-            g.ra.hasStackVars = true         # outgoing stack-arg area ⇒ frame sub
             g.ab.tree MovX64:
               g.ab.tree MemX:
                 g.ab.reg RSP
@@ -6562,7 +6555,7 @@ proc freeLvalTemps2(g: var CodeGen; c: Cursor) =
       while cc.hasMore: skip cc
   else: discard
 
-proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
+proc emitProcBody2(g: var CodeGen; info: ProcInfo) =
   ## The pure-emitter twin of `emitProcBody`, run ONCE (no plan pass). Reuses the
   ## shared signature / frame / param-settling / scope machinery; only the value
   ## core (`genStmt2`/`emitValue2`) differs.
@@ -6616,9 +6609,10 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
   if info.isEntry:
     g.movImm(RAX, 60); g.movImm(RDI, 0); g.emSyscall()
   swap(g.ab, side)                        # back to the main buffer; `side` holds the body
-  # The body is emitted — `ra.usedCallee` / `hasStackVars` are final. Finalize the
-  # frame and write the prologue, then splice the body after it.
-  g.computeFrameX64(info.isEntry, frameHasCall)
+  # The body is emitted — `ra.usedCallee` is final. Finalize the frame SHAPE and
+  # write the prologue, then splice the body after it. (Its SIZE is nifasm's: it
+  # allocates the `(s)` slots this body just declared.)
+  g.computeFrameX64()
   g.ab.tree ProcD:
     g.ab.symDef info.asmName
     g.emitSignature(info.decl)
@@ -6635,9 +6629,7 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
         g.ab.tree AddX64:
           g.ab.reg g.stackArgBaseReg
           g.ab.intLit g.framePushBytesX64().int64
-      if g.framePad > 0: g.binImm(SubX64, RSP, g.framePad.int64)
-      if g.ra.hasStackVars:
-        g.ab.tree SubX64: (g.ab.reg RSP; g.ab.keyword SsizeX)
+      g.ab.tree SubX64: (g.ab.reg RSP; g.ab.keyword SsizeX)   # open the frame — see framePop
       # Declare the totality spill slots (`etmp`/`eftmp`/`held`) — minted INLINE
       # during body emission (`takeTmp` exhaustion), which is why this loop runs
       # here, in the prologue that is written AFTER the body. A pointer slot
@@ -6796,12 +6788,12 @@ proc asmRegOf(g: var CodeGen; c: Cursor): Reg =
               "`.assembler` proc needs `{.register: \"…\".}` or `{.stack.}`", g.asmInfo
   result = g.asmReg[nm]
 
-proc asmScanLocs(g: var CodeGen; c: Cursor; used: var set[Reg]; anyStack: var bool) =
-  ## Pre-pass over the body: which registers the locals pin (so the prologue knows
-  ## which callee-saved ones to push) and whether any `(s)` slot exists (so the
-  ## prologue reserves the `(ssize)` region the epilogue releases). Both facts are
-  ## needed BEFORE the first statement is emitted, and both are pure declaration
-  ## reading — no evaluation is involved.
+proc asmScanLocs(g: var CodeGen; c: Cursor; used: var set[Reg]) =
+  ## Pre-pass over the body: which registers the locals pin, so the prologue knows
+  ## which callee-saved ones to push. Needed BEFORE the first statement is emitted,
+  ## and pure declaration reading — no evaluation is involved. (Whether the body
+  ## declares any `(s)` slot is deliberately NOT collected: nifasm allocates those
+  ## slots, so it is the one that decides whether a frame `sub` is needed.)
   if c.kind != TagLit: return
   if c.stmtKind == VarS:
     var cc = c
@@ -6810,14 +6802,13 @@ proc asmScanLocs(g: var CodeGen; c: Cursor; used: var set[Reg]; anyStack: var bo
       let loc = g.asmDeclLoc(cc)
       case loc.kind
       of aslReg: used.incl loc.r
-      of aslStack: anyStack = true
-      of aslNone: discard
+      of aslStack, aslNone: discard
       while cc.hasMore: skip cc
     return
   if c.stmtKind in {ProcS, TypeS}: return
   var cc = c
   cc.into:
-    while cc.hasMore: (g.asmScanLocs(cc, used, anyStack); skip cc)
+    while cc.hasMore: (g.asmScanLocs(cc, used); skip cc)
 
 proc asmStmt(g: var CodeGen; c: Cursor)
 proc asmInstr(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor)
@@ -7299,26 +7290,22 @@ proc genAsmProc(g: var CodeGen; info: ProcInfo) =
     inc rc; inc rc; skip rc                      # → return type
     if not (rc.kind == DotToken or (rc.kind == TagLit and rc.typeKind == VoidT)):
       used.incl g.md.intRetReg
-  var anyStack = false
   block:                                         # scan the BODY (`asmScanLocs` stops at a `proc`)
     var bc = info.decl
     bc.into:
       inc bc; skip bc; skip bc; skip bc          # name, params, ret, pragmas
-      if bc.stmtKind == StmtsS: g.asmScanLocs(bc, used, anyStack)
+      if bc.stmtKind == StmtsS: g.asmScanLocs(bc, used)
       while bc.hasMore: skip bc
   g.ra.usedCallee = used * g.md.intCalleeSavedSet
-  g.ra.hasStackVars = anyStack
   g.pickStackArgBaseX64(hasStackParams = false)
-  g.computeFrameX64(isEntry = false, hasCall = false)
+  g.computeFrameX64()
   g.ab.tree ProcD:
     g.ab.symDef info.asmName
     g.emitSignature(info.decl)
     g.ab.tree StmtsX64:
       g.enterScope()
       g.framePush()
-      if g.framePad > 0: g.binImm(SubX64, RSP, g.framePad.int64)
-      if g.ra.hasStackVars:
-        g.ab.tree SubX64: (g.ab.reg RSP; g.ab.keyword SsizeX)
+      g.ab.tree SubX64: (g.ab.reg RSP; g.ab.keyword SsizeX)   # open the frame — see framePop
       g.retLabel2 = g.freshLabel()
       g.retLabelUsed2 = false
       var c = info.decl
@@ -7417,9 +7404,11 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     g.indirectReg = RBX
     g.ra.usedCallee.incl RBX                   # saved/restored like any callee reg
   # Pure-emit path: the allocator already assigned every value position; emit once.
-  # (The frame is finalized INSIDE emitProcBody2, after the body — body-buffer model.
-  # The entry injects a `call` to the synthetic global-init proc, so it makes a call
-  # even when its own body does not — keep rsp 16-aligned for that call.)
+  # (The frame SHAPE — which callee-saved registers to push — is finalized INSIDE
+  # emitProcBody2, after the body; its SIZE and 16-byte call alignment are nifasm's,
+  # decided from the emitted pushes and calls. That is also why the entry's injected
+  # `call` to the synthetic global-init proc needs no special handling here: nifasm
+  # sees the call in the text like any other.)
   g.rb.resetProc(); g.aliasToDecl.clear()
   g.argResidentParams.setLen 0; g.argResidentFlushed = false
   g.savedHomes.clear()
@@ -7430,7 +7419,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     block:
       var pc = info.decl; inc pc
       stderr.writeLine "DBG emit proc " & symName(pc)
-  g.emitProcBody2(info, an.hasCall or (info.isEntry and g.hasGlobalInits))
+  g.emitProcBody2(info)
 
 proc genGlobal(g: var CodeGen; nifName: string; decl: Cursor) =
   ## `(gvar :name <type>)` — a zero-initialized `.bss` global (also `const`); any

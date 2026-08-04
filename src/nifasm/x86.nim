@@ -623,8 +623,7 @@ proc fitsImm8(imm: int32): bool {.inline.} =
   ## Can this immediate ride in the one-byte, sign-extended `0x83` form?
   imm >= -128 and imm <= 127
 
-proc emitAluImmReg(dest: var Bytes; ext: int; reg: Register; imm: int32;
-                   forceImm32 = false) =
+proc emitAluImmReg(dest: var Bytes; ext: int; reg: Register; imm: int32) =
   ## `<alu> r64, imm` — `ext` is the ModRM.reg opcode-extension digit (ADD=0, OR=1,
   ## AND=4, SUB=5, XOR=6, CMP=7).
   ##
@@ -634,16 +633,17 @@ proc emitAluImmReg(dest: var Bytes; ext: int; reg: Register; imm: int32;
   ## frame adjustment, a `+1` bump — so this is the difference between a dense and a
   ## bloated text section (~3% of the whole binary, measured on nimsem).
   ##
-  ## `forceImm32` pins the long form. A caller that emits a PLACEHOLDER and patches the
-  ## immediate afterwards (`ssizePatches`, which records `buf.len - 4`) must pass it:
-  ## its placeholder is 0, 0 fits in a byte, and the short encoding would leave the
-  ## later 4-byte patch writing over the opcode. That is not hypothetical — it is what
-  ## this parameter was added for, after `sub rsp, <ssize>` started segfaulting.
+  ## Every caller therefore gets the shortest encoding that fits, with no way to pin
+  ## the long one. That is only safe because no caller patches the immediate after the
+  ## fact any more: the frame `sub rsp, <ssize>` used to, and a placeholder of 0 fits
+  ## in a byte, so its later 4-byte patch wrote over the opcode. `finalizeFrameSites`
+  ## now resolves the frame size BEFORE encoding it (see `FrameSite` in assembler.nim),
+  ## which is what let the `forceImm32` escape hatch go away.
   var rex = RexPrefix(w: true)
   if needsRex(reg): rex.b = true
   if rex.b or rex.w:
     dest.add(encodeRex(rex))
-  if fitsImm8(imm) and not forceImm32:
+  if fitsImm8(imm):
     dest.add(0x83)                                # group-1 r/m64, imm8 (sign-extended)
     dest.add(encodeModRM(amDirect, ext, int(reg)))
     dest.add(byte(imm and 0xFF))
@@ -652,18 +652,18 @@ proc emitAluImmReg(dest: var Bytes; ext: int; reg: Register; imm: int32;
     dest.add(encodeModRM(amDirect, ext, int(reg)))
     dest.addt32(imm)
 
-proc emitAddImm*(dest: var Bytes; reg: Register; imm: int32; forceImm32 = false) =
-  emitAluImmReg(dest, 0, reg, imm, forceImm32)
-proc emitOrImm*(dest: var Bytes; reg: Register; imm: int32; forceImm32 = false) =
-  emitAluImmReg(dest, 1, reg, imm, forceImm32)
-proc emitAndImm*(dest: var Bytes; reg: Register; imm: int32; forceImm32 = false) =
-  emitAluImmReg(dest, 4, reg, imm, forceImm32)
-proc emitSubImm*(dest: var Bytes; reg: Register; imm: int32; forceImm32 = false) =
-  emitAluImmReg(dest, 5, reg, imm, forceImm32)
-proc emitXorImm*(dest: var Bytes; reg: Register; imm: int32; forceImm32 = false) =
-  emitAluImmReg(dest, 6, reg, imm, forceImm32)
-proc emitCmpImm*(dest: var Bytes; reg: Register; imm: int32; forceImm32 = false) =
-  emitAluImmReg(dest, 7, reg, imm, forceImm32)
+proc emitAddImm*(dest: var Bytes; reg: Register; imm: int32) =
+  emitAluImmReg(dest, 0, reg, imm)
+proc emitOrImm*(dest: var Bytes; reg: Register; imm: int32) =
+  emitAluImmReg(dest, 1, reg, imm)
+proc emitAndImm*(dest: var Bytes; reg: Register; imm: int32) =
+  emitAluImmReg(dest, 4, reg, imm)
+proc emitSubImm*(dest: var Bytes; reg: Register; imm: int32) =
+  emitAluImmReg(dest, 5, reg, imm)
+proc emitXorImm*(dest: var Bytes; reg: Register; imm: int32) =
+  emitAluImmReg(dest, 6, reg, imm)
+proc emitCmpImm*(dest: var Bytes; reg: Register; imm: int32) =
+  emitAluImmReg(dest, 7, reg, imm)
 
 proc emitAluImmMem(dest: var Bytes; ext: int; mem: MemoryOperand; imm: int32; bits = 64) =
   ## `<alu> r/m, imm` with a MEMORY destination, SIZED to `bits` (8/16/32/64). `ext`

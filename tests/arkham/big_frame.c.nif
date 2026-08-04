@@ -1,0 +1,68 @@
+(.nif27)
+(.indexat 957             )
+(stmts
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :take.0
+  (params
+   (param :a.0 .
+    (i 64)))
+  (i 64).
+  (stmts
+   (ret a.0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :a.0 .
+    (array
+     (i 64)600).)
+   (var :b.0 .
+    (array
+     (i 64)600).)
+   (asgn
+    (at a.0 0)5)
+   (asgn
+    (at a.0 299)7)
+   (asgn
+    (at a.0 599)9)
+   (asgn
+    (at b.0 0)1)
+   (asgn
+    (at b.0 599)2)
+   (var :i.0 .
+    (i 64)599)
+   (var :s.0 .
+    (i 64)
+    (call take.0
+     (add
+      (i 64)
+      (at a.0 0)
+      (add
+       (i 64)
+       (at a.0 299)
+       (at a.0 i.0)))))
+   (if
+    (elif
+     (neq s.0 21)
+     (stmts
+      (call exit.c 11))))
+   (asgn s.0
+    (add
+     (i 64)
+     (at b.0 0)
+     (at b.0 i.0)))
+   (if
+    (elif
+     (neq s.0 3)
+     (stmts
+      (call exit.c 12))))
+   (call exit.c 42))))
+(.index)

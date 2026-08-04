@@ -216,13 +216,28 @@ expression evaluator:
   (x8 on AArch64 / a synthetic first parameter in rdi on x86-64), which the
   prologue parks in a callee-saved register for the body to fill.
 
-- **The frame is fixed.** The prologue saves the used callee-saved registers
-  (AArch64 pairs them with fp/lr via `stp`) and lowers SP **once**, by an amount
-  that already includes the local/`etmp` slots **and** the largest outgoing
-  stack-argument area any call in the body needs. SP is then constant between
-  prologue and epilogue. This is what lets stack-passed call arguments be written
-  straight to `(mem sp (arg pN k))` at the reserved bottom of the frame with **no
-  per-call `sub sp`**, and it keeps every `(s)` slot at a statically known offset.
+- **The frame is fixed, and it is nifasm's.** The prologue saves the used
+  callee-saved registers (AArch64 pairs them with fp/lr via `stp`) and lowers SP
+  **once**, by an amount that already includes the local/`etmp` slots **and** the
+  largest outgoing stack-argument area any call in the body needs. SP is then
+  constant between prologue and epilogue. This is what lets stack-passed call
+  arguments be written straight to `(mem sp (arg pN k))` at the reserved bottom of
+  the frame with **no per-call `sub sp`**, and it keeps every `(s)` slot at a
+  statically known offset.
+
+  Arkham does not compute that amount, and does not decide whether SP moves at
+  all: it emits `(sub (rsp)(ssize))` to say *the frame opens here* and `(add
+  (rsp)(ssize))` to say *it closes here*, and nifasm — which allocates the `(s)`
+  slots and the argument area — fills them in. Everything downstream of that
+  number is nifasm's too: how many bytes to add so SP is 16-aligned at a `call`
+  (it counts the pushes and the calls in the emitted text), which encoding to
+  spend, and whether to emit an instruction at all — a frame of zero leaves no
+  trace. Arkham used to own the alignment half and emitted its own `sub rsp, 8`
+  in front of the frame `sub`; splitting one adjustment across two owners cost
+  two instructions in every prologue *and* every epilogue of the ~20% of procs
+  that needed the correction, and it was computed from a pre-lowering analysis
+  that could claim a call in a proc whose calls had all been inlined away.
+  See `FrameSite` / `finalizeFrameSites` in `src/nifasm/assembler.nim`.
 
 - **Stack-passed arguments and parameters** appear once the integer arg registers
   are exhausted. An argument that does not fit the *remaining* arg registers goes

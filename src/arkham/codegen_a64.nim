@@ -4791,7 +4791,7 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool;
     g.movImm(R8, LinuxA64ExitNr.int64)
     g.ab.tree SvcA64: g.ab.intLit 0
   swap(g.ab, side)                        # back to the main buffer; `side` holds the body
-  # The body is emitted — `ra.usedCallee`/`usedCalleeF`/`hasStackVars` are final.
+  # The body is emitted — `ra.usedCallee`/`usedCalleeF` are final.
   # Finalize the frame and write the prologue, then splice the body after it.
   g.computeFrame(frameHasCall)
   g.ab.tree ProcD:
@@ -4800,8 +4800,10 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool;
     g.ab.tree StmtsA64:
       if g.hasFrame: framePush(g)
       g.emitStackParamLoads(info.decl)
-      if g.ra.hasStackVars:
-        g.ab.tree SubA64: g.ab.reg SP; g.ab.keyword SsizeX
+      # Open the frame unconditionally: how far SP drops (and whether it drops at all)
+      # is nifasm's decision — it lays out the `(s)` slots and the outgoing-argument
+      # area — and it emits nothing here when the answer is "no frame".
+      g.ab.tree SubA64: g.ab.reg SP; g.ab.keyword SsizeX
       # etmp/eftmp/held slots minted DURING body emission: their decls must
       # precede the body's loads/stores, and the set is only known post-body —
       # so they are declared here, in the prologue, not in the side buffer.
@@ -4813,8 +4815,7 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool;
         else: g.emScalarStackVar(st.name)
       g.ab.append side                            # the body
       if not (info.isEntry and g.a64Linux):
-        if g.ra.hasStackVars:
-          g.ab.tree AddA64: g.ab.reg SP; g.ab.keyword SsizeX
+        g.ab.tree AddA64: g.ab.reg SP; g.ab.keyword SsizeX   # close it — see the `sub`
         if g.hasFrame: framePop(g)
         g.ab.keyword RetA64
 

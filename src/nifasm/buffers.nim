@@ -50,6 +50,18 @@ proc insertRepeated*(buf: var Bytes; at: int; b: byte; count: int) =
   for i in 0 ..< count:
     buf.data[at + i] = b
 
+proc removeRange*(buf: var Bytes; at: int; count: int) =
+  ## Delete `count` bytes starting at `at`, pulling later bytes down. The inverse
+  ## of `insertRepeated`; used to trim the surplus of a placeholder that was
+  ## reserved at its widest encoding and finalized to a shorter one (the frame
+  ## `sub rsp, (ssize)` — see `finalizeFrameSites`). Every recorded byte position
+  ## past `at` must be rebased by the caller.
+  if count <= 0: return
+  let oldLen = buf.data.len
+  for i in at ..< oldLen - count:
+    buf.data[i] = buf.data[i + count]
+  buf.data.setLen(oldLen - count)
+
 proc `[]=`*(buf: var Bytes; i: int; b: byte) {.inline.} =
   buf.data[i] = b
 

@@ -357,6 +357,20 @@ type
                                 # and `syscallNr` is loaded into rax/x8 before it
     syscallNr: int
 
+  FrameSite = object
+    ## A `(sub (rsp)(ssize))` / `(add (rsp)(ssize))` — the request "open/close this
+    ## proc's frame here". Arkham states the intent; nifasm owns the stack, so it
+    ## decides how many bytes to move SP by (it is the one allocating the `(s)`
+    ## slots and the outgoing-argument area) and which encoding to spend on it.
+    ## Neither is known while the body is still being emitted, so the site reserves
+    ## `slotLen` bytes — the widest form — and `finalizeFrameSites` writes the real
+    ## instruction and deletes the surplus.
+    pos: int           # first byte of the reserved placeholder
+    slotLen: int       # bytes reserved for it
+    isSub: bool        # `sub` (prologue) vs `add` (epilogue)
+    pushBytes: int     # bytes already pushed by this proc's prologue at this point,
+                       # which is what decides the 16-byte call-alignment correction
+
   GenContext = object
     scope: Scope        # Current (possibly proc-local) lexical scope
     rootScope: Scope    # Module/global scope; foreign symbols are defined here so
@@ -379,7 +393,13 @@ type
                         # call-safety guarantee. Cleared when the register is rewritten;
                         # merged across `ite` branches.
     slots: SlotManager
-    ssizePatches: seq[int]
+    ssizePatches: seq[int]        # `(ssize)` used as a plain immediate (`mov reg, (ssize)`):
+                                  # the value is patched in place, the instruction keeps its size
+    frameSites: seq[FrameSite]    # the frame-opening/closing `sub`/`add` on the stack pointer
+    procPushBytes: int            # bytes this proc has pushed so far (callee-saved saves)
+    procHasCall: bool             # this proc calls out, so SP must be 16-aligned at the call
+    procIsEntry: bool             # the process entry: the kernel enters it with SP 16-aligned,
+                                  # an ordinary callee with the pushed return address on top
     reservedArgArea: int          # AArch64 fixed-frame: bytes reserved at the frame bottom
                                   # for the largest outgoing stack-argument area (see
                                   # scanStackArgArea). Locals sit above it; the caller writes
@@ -2409,6 +2429,23 @@ proc checkForwardJump(ctx: GenContext; label: LabelId; n: Cursor) =
     error("backward jump to an already-defined label is forbidden; " &
           "express the back-edge as a (loop …) instead", n)
 
+proc recordFrameSite(ctx: var GenContext; isSub: bool; slotLen: int) =
+  ## Reserve `slotLen` bytes for a frame-opening (`sub`) / closing (`add`) stack-pointer
+  ## adjustment and remember where they are. The real instruction cannot be encoded yet:
+  ## the frame size is the peak of a slot allocation that is still running, and the
+  ## 16-byte call-alignment correction depends on whether the rest of the body calls out.
+  ## `finalizeFrameSites` fills the site in at the end of the proc and trims what is
+  ## left over — including all of it, when the proc turns out to need no frame at all.
+  ## The filler is a NOP so a site that somehow escaped finalization is inert rather
+  ## than a fabricated instruction.
+  ctx.frameSites.add FrameSite(pos: ctx.buf.data.len, slotLen: slotLen, isSub: isSub,
+                               pushBytes: ctx.procPushBytes)
+  if ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64}:
+    var i = 0
+    while i < slotLen: (arm64.emitNop(ctx.buf.data); i += 4)
+  else:
+    for _ in 0 ..< slotLen: x86.emitNop(ctx.buf.data)
+
 proc emitAddOffsetA64(ctx: var GenContext; rd, rn: arm64.Register; offset: int64;
                       scratch: arm64.Register) =
   ## `rd = rn + offset`, synthesizing through `scratch` (a reserved assembler
@@ -2715,15 +2752,12 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       error("ADD to memory not supported yet for ARM64", n)
     else:
       if op.kind == okSsize:
-        # A PAIR: `add sp, sp, #lo12` + `add sp, sp, #hi12, lsl #12`. The frame size is
-        # only known at patch time and ADD's immediate is 12 bits, so a single
-        # instruction silently truncated any frame over 4095 bytes (a 10KB frame came
-        # out as `sub sp, sp, #2000`, leaving every local access off the end of the
-        # stack — an ASLR-dependent crash). The patcher fills each half; see `finalize`.
-        arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, 0'u16)
-        ctx.ssizePatches.add(ctx.buf.data.len - 4)
-        arm64.emitAddImmShifted12(ctx.buf.data, dest.reg, dest.reg, 0'u16)
-        ctx.ssizePatches.add(ctx.buf.data.len - 4)
+        # Closing the frame. Reserve the widest form — the `#lo12` + `#hi12, lsl #12`
+        # PAIR, because ADD's immediate is 12 bits and a frame over 4095 bytes needs
+        # both halves — and let `finalizeFrameSites` collapse it to the single
+        # instruction the (overwhelmingly common) small frame actually needs, or to
+        # nothing when the frame is empty.
+        recordFrameSite(ctx, isSub = false, slotLen = 8)
       elif op.kind == okImm or op.kind == okCsize:
         if op.immVal >= 0 and op.immVal <= 4095:
           arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.immVal))
@@ -2750,10 +2784,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       error("SUB to memory not supported yet for ARM64", n)
     else:
       if op.kind == okSsize:
-        arm64.emitSubImm(ctx.buf.data, dest.reg, dest.reg, 0'u16)   # lo12 (see AddA64)
-        ctx.ssizePatches.add(ctx.buf.data.len - 4)
-        arm64.emitSubImmShifted12(ctx.buf.data, dest.reg, dest.reg, 0'u16)  # hi12
-        ctx.ssizePatches.add(ctx.buf.data.len - 4)
+        recordFrameSite(ctx, isSub = true, slotLen = 8)   # see AddA64
       elif op.kind == okImm or op.kind == okCsize:
         if op.immVal >= 0 and op.immVal <= 4095:
           arm64.emitSubImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.immVal))
@@ -3509,6 +3540,92 @@ proc scanStackArgArea(n: var Cursor; ctx: var GenContext; scope: Scope; acc: var
   else:
     inc n
 
+proc dropCodeBytes(ctx: var GenContext; at, count: int) =
+  ## Delete `count` bytes at `at` and pull every recorded byte position past them down.
+  ## The mirror image of `shiftCodePositions` (which rebases after an INSERT), and it
+  ## must touch exactly the same set of position records. Nothing may be recorded
+  ## strictly INSIDE `[at, at+count)` — the callers delete only the unused tail of a
+  ## placeholder they emitted atomically — so a position at `at` itself belongs to the
+  ## code that follows the hole and stays put; only `>= at + count` moves.
+  if count <= 0: return
+  ctx.buf.data.removeRange(at, count)
+  let after = at + count
+  for k in 0 ..< ctx.buf.relocs.len:
+    if ctx.buf.relocs[k].position >= after: ctx.buf.relocs[k].position -= count
+  for k in 0 ..< ctx.buf.labels.len:
+    if ctx.buf.labels[k].position >= after: ctx.buf.labels[k].position -= count
+  for k in 0 ..< ctx.buf.fixedRanges.len:      # a `casejmp` region never contains a frame site
+    let (s, e) = ctx.buf.fixedRanges[k]
+    ctx.buf.fixedRanges[k] = ((if s >= after: s - count else: s),
+                              (if e >= after: e - count else: e))
+  for k in 0 ..< ctx.gvarSites.len:
+    if ctx.gvarSites[k][0] >= after:
+      ctx.gvarSites[k] = (ctx.gvarSites[k][0] - count, ctx.gvarSites[k][1])
+  for k in 0 ..< ctx.ssizePatches.len:
+    if ctx.ssizePatches[k] >= after: ctx.ssizePatches[k] -= count
+  for k in 0 ..< ctx.csizePatches.len:
+    if ctx.csizePatches[k][0] >= after:
+      ctx.csizePatches[k] = (ctx.csizePatches[k][0] - count, ctx.csizePatches[k][1])
+  for k in 0 ..< ctx.tlvSites.len:
+    if ctx.tlvSites[k][0] >= after:
+      ctx.tlvSites[k] = (ctx.tlvSites[k][0] - count, ctx.tlvSites[k][1])
+
+proc frameSizeFor(ctx: GenContext; peak, pushBytes: int; isA64: bool): int =
+  ## How far this proc's prologue lowers the stack pointer. Two jobs in one number:
+  ## reserving the `(s)` slot region (plus the outgoing-argument area already folded
+  ## into `peak`), and leaving SP 16-byte aligned at every `call`.
+  ##
+  ## The alignment half used to be arkham's: it counted its own callee-saved pushes and
+  ## emitted a separate `sub rsp, 8` ahead of this one. But which registers get pushed,
+  ## how big the frame is and whether SP ends up aligned are all facts about the stack —
+  ## nifasm's stack — so the correction belongs here, folded into the same instruction.
+  ## SysV enters an ordinary callee with the return address pushed (SP ≡ 8 mod 16) and
+  ## the process entry with SP ≡ 0; each saved register is another 8. AArch64 needs no
+  ## correction: it saves in 16-byte `stp` pairs and the frame is already 16-aligned.
+  result = (peak + 15) and not 15
+  if not isA64 and ctx.procHasCall:
+    let entryBias = if ctx.procIsEntry: 0 else: 8
+    if (entryBias + pushBytes + result) mod 16 != 0: result += 8
+
+proc finalizeFrameSites(ctx: var GenContext; peak: int) =
+  ## Write the real stack-pointer adjustment into each site `recordFrameSite` reserved
+  ## and drop the bytes the chosen encoding did not need — all of them when the proc
+  ## needs no frame at all, which is the common case for a leaf. Descending by position
+  ## so a trim never moves a site still to be filled in.
+  if ctx.frameSites.len == 0: return
+  let isA64 = ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64}
+  for i in countdown(ctx.frameSites.high, 0):
+    let site = ctx.frameSites[i]
+    let frame = frameSizeFor(ctx, peak, site.pushBytes, isA64)
+    var code = initBytes()
+    if frame > 0:
+      if isA64:
+        if frame > 0xFFFFFF:
+          quit "nifasm: stack frame of " & $frame &
+               " bytes exceeds the 24-bit ADD/SUB immediate pair"
+        let lo = uint16(frame and 0xFFF)
+        let hi = uint16((frame shr 12) and 0xFFF)
+        # `#lo12` first, then `#hi12, lsl #12` — and only when there IS a high half,
+        # which is what makes the ordinary small frame one instruction instead of two.
+        if site.isSub:
+          if lo != 0 or hi == 0: arm64.emitSubImm(code, arm64.SP, arm64.SP, lo)
+          if hi != 0: arm64.emitSubImmShifted12(code, arm64.SP, arm64.SP, hi)
+        else:
+          if lo != 0 or hi == 0: arm64.emitAddImm(code, arm64.SP, arm64.SP, lo)
+          if hi != 0: arm64.emitAddImmShifted12(code, arm64.SP, arm64.SP, hi)
+      else:
+        if frame > high(int32):
+          quit "nifasm: stack frame of " & $frame & " bytes exceeds the 32-bit immediate"
+        # The value is FINAL here, so `emitSubImm` is free to pick the 4-byte `imm8`
+        # form — which is the whole point of resolving the frame before encoding it.
+        if site.isSub: x86.emitSubImm(code, x86.RSP, int32(frame))
+        else: x86.emitAddImm(code, x86.RSP, int32(frame))
+    if code.len > site.slotLen:
+      quit "nifasm: frame adjustment does not fit its reserved site in proc " & ctx.procName
+    for k in 0 ..< code.len: ctx.buf.data[site.pos + k] = code[k]
+    dropCodeBytes(ctx, site.pos + code.len, site.slotLen - code.len)
+  ctx.frameSites.setLen 0
+
 proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   let oldScope = ctx.scope
   ctx.scope = newScope(oldScope)
@@ -3541,6 +3658,14 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
     # Initialize stack context
     ctx.slots = initSlotManager()
     ctx.ssizePatches = @[]
+    # Frame bookkeeping: what the prologue pushes and whether the body calls out decide
+    # how far SP must drop, so both are gathered as the body is assembled and consumed
+    # by `finalizeFrameSites` below. The entry is entered by the kernel, not by a
+    # `call`, so its incoming alignment differs — see `frameSizeFor`.
+    ctx.frameSites = @[]
+    ctx.procPushBytes = 0
+    ctx.procHasCall = false
+    ctx.procIsEntry = name == "_start" or name == "main.0"
     # Clear register bindings at the start of each proc
     ctx.regBindings = initTable[x86.Register, string]()
     ctx.a64RegBindings = initTable[arm64.Register, string]()
@@ -3615,14 +3740,19 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
       if not cfvarSym.used:
         quit "[Error] Control flow variable '" & ctx.nameOf(cfvarName) & "' declared but never used in proc " & ctx.procName
 
-  # Patch ssize. On x86 the placeholder is a raw imm32 in the instruction; on
-  # AArch64 the immediate is a bit-field of a 32-bit instruction, so the patch
-  # rewrites that field (MOVZ imm16 at [20:5]; ADD/SUB imm12 at [21:10]).
-  # `(scope …)` blocks reclaim their slots (reset `stackSize`), so the FINAL
-  # `stackSize` under-counts the frame. Reserve the peak seen at any point.
+  # The frame size is known only now: `(scope …)` blocks reclaim their slots (reset
+  # `stackSize`), so the FINAL `stackSize` under-counts it — reserve the peak seen at
+  # any point. First the frame-opening/closing `sub`/`add` themselves, which are still
+  # NOP placeholders and now get encoded (and shrunk) around the real number.
   let peakStackSize = max(ctx.slots.stackSize, ctx.slots.maxStackSize)
-  let alignedStackSize = (peakStackSize + 15) and not 15
   let isA64 = ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64}
+  finalizeFrameSites(ctx, peakStackSize)
+
+  # Then `(ssize)` used as a plain immediate (`mov reg, (ssize)`, hand-written asm
+  # only): fixed-size instructions whose immediate field is patched in place. On x86
+  # that is a raw imm32; on AArch64 a bit-field of a 32-bit instruction (MOVZ imm16 at
+  # [20:5]; ADD/SUB imm12 at [21:10]). It must report the SAME frame the `sub` applied.
+  let alignedStackSize = frameSizeFor(ctx, peakStackSize, ctx.procPushBytes, isA64)
   let v = uint32(alignedStackSize)
   for pos in ctx.ssizePatches:
     if pos + 4 > ctx.buf.data.len: continue
@@ -5208,12 +5338,18 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     ctx.slots.maxStackSize = max(ctx.slots.maxStackSize, ctx.slots.stackSize)
     ctx.slots.stackSize = savedStackSize
   of PrepareX64:
+    # SysV wants SP ≡ 0 (mod 16) at every `call`; noting that this proc calls at all is
+    # what lets `frameSizeFor` fold the correction into the frame `sub`.
+    ctx.procHasCall = true
     genPrepareX64(n, ctx)
   of CallX64:
+    ctx.procHasCall = true
     genCallMarkerX64(n, ctx)
   of ExtcallX64:
+    ctx.procHasCall = true
     genExtcallX64(n, ctx)
   of IatX64:
+    ctx.procHasCall = true
     genIatX64(n, ctx)
 
   of MovX64:
@@ -5251,11 +5387,10 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         x86.emitAdd(ctx.buf.data, dest.mem, op.reg)
     else:
       if op.kind == okSsize:
-        # `forceImm32`: the 0 is a PLACEHOLDER patched to the frame size below, and
-        # the patch writes 4 bytes at `len - 4` — the short imm8 form would land it
-        # on the opcode.
-        x86.emitAddImm(ctx.buf.data, dest.reg, 0, forceImm32 = true)
-        ctx.ssizePatches.add(ctx.buf.data.len - 4)
+        # Closing the frame. Reserve the widest form (`add rsp, imm32`, 7 bytes);
+        # `finalizeFrameSites` shrinks it to the 4-byte `imm8` encoding or deletes
+        # it outright once the frame size is known. See `FrameSite`.
+        recordFrameSite(ctx, isSub = false, slotLen = 7)
       elif op.kind == okCsize:
         x86.emitAddImm(ctx.buf.data, dest.reg, int32(op.immVal))
       elif op.kind == okImm:
@@ -5286,9 +5421,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         x86.emitSub(ctx.buf.data, dest.mem, op.reg)
     else:
       if op.kind == okSsize:
-        # `forceImm32`: placeholder patched to the frame size — see the `add` twin.
-        x86.emitSubImm(ctx.buf.data, dest.reg, 0, forceImm32 = true)
-        ctx.ssizePatches.add(ctx.buf.data.len - 4)
+        recordFrameSite(ctx, isSub = true, slotLen = 7)   # see the `add` twin
       elif op.kind == okCsize:
         x86.emitSubImm(ctx.buf.data, dest.reg, int32(op.immVal))
       elif op.kind == okImm:
@@ -5851,6 +5984,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       error("PUSH memory not supported yet", n)
     else:
       x86.emitPush(ctx.buf.data, op.reg)
+    # Every push shifts SP by 8 and so flips the frame's 16-byte alignment parity;
+    # `frameSizeFor` corrects for the total standing at the frame site.
+    ctx.procPushBytes += 8
 
   of PopX64:
     inc n
