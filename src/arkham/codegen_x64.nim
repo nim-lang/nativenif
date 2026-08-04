@@ -67,7 +67,8 @@ proc emReg(g: var CodeGen; r: Reg) {.inline.} =
 
 proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg
 proc stagingCensus(g: var CodeGen; avoid: Reg): string
-proc borrowEmergency(g: var CodeGen; what: string; avoid: Reg): Reg
+proc borrowEmergency(g: var CodeGen; what: string; avoid: set[Reg];
+                     closedWindow = false): Reg
 
 let AddrSlot = AsmSlot(cls: AUInt, size: 8, align: 8)
   ## The binding type for a staging register that holds a raw machine address / word
@@ -98,11 +99,12 @@ proc pickStagingSealed(g: var CodeGen; what: string; slot: AsmSlot; avoid: Reg =
   ## reserved R11 bridge makes that near-impossible). `avoid` keeps the pick off a
   ## register the caller still needs live (e.g. an accumulator that is not a bound
   ## temp, so `pickStagingScratch`'s own filters would not otherwise exclude it).
-  result = if stmtPos and stressEmergency: g.borrowEmergency(what, avoid) else: NoReg
+  let avoidSet = if avoid == NoReg: {} else: {avoid}
+  result = if stmtPos and stressEmergency: g.borrowEmergency(what, avoidSet) else: NoReg
   if result == NoReg:
     result = g.pickStagingScratch(avoid)
   if result == NoReg and stmtPos:
-    result = g.borrowEmergency(what, avoid)
+    result = g.borrowEmergency(what, avoidSet)
   if result == NoReg:
     # Not "out of registers" any more — `borrowEmergency` covers that. Reaching
     # here means every candidate is `avoid`, already borrowed, or a live local
@@ -828,7 +830,8 @@ proc stagingCensus(g: var CodeGen; avoid: Reg): string =
     elif g.regHoldsHome(r) or g.regHoldsLiveLocal(r): result.add "home"
     else: result.add "FREE (unreachable)"
 
-proc borrowEmergency(g: var CodeGen; what: string; avoid: Reg): Reg =
+proc borrowEmergency(g: var CodeGen; what: string; avoid: set[Reg];
+                     closedWindow = false): Reg =
   ## LAST RESORT, and the reason the transient staging picks are total: when every
   ## register is occupied, free one by *spilling its owner to memory* for the
   ## duration of the borrow. `giveBack` reloads it.
@@ -856,56 +859,78 @@ proc borrowEmergency(g: var CodeGen; what: string; avoid: Reg): Reg =
   ## registers can cover it. One 8-byte slot per active borrow can, because the
   ## borrows nest: depth is bounded by the expression, and the slots are minted
   ## on demand and reused across the body.
-  for r in StagingCandidates.toOpenArray(0, stressLimit(StagingCandidates.len) - 1):
-    if r == avoid or r in g.emergencyHeld: continue
-    if g.regHoldsLiveLocal(r): continue            # named — see above
-    var forcedFree = false
-    if g.ra.isSealed(r) or g.rb.isAccum(r): continue
-    if not g.rb.isBoundTemp(r):
-      # In production an unoccupied candidate is unreachable — `pickStagingScratch`
-      # would have returned it. `ARKHAM_STRESS_EMERGENCY` gets here anyway (it asks
-      # for the borrow first), and displacing a dead value is harmless, so let it
-      # through: that is what puts the save / kill / rebind / restore sequence under
-      # the corpus instead of only under programs too big to be fixtures.
-      if not stressEmergency: continue
-      # The forcing knob must not INVENT a binding on a register that carries a
-      # fixed instruction role: `idiv` clobbers rax/rdx and a variable shift needs
-      # cl, and nifasm rejects those while a binding is live. In production such a
-      # register is a victim only when it is genuinely occupied, which the code
-      # around it already accounts for — so relaxing there would test a state the
-      # emitter can never actually be in.
-      if r == g.md.intRetReg or r == g.md.divRemReg or r == g.md.shiftCountReg:
-        continue
-      forcedFree = true
-    # Reuse the slot minted for this depth; mint one the first time we get here.
-    let depth = g.emergencyBorrows.len
-    if depth >= g.emergencySlots.len:
-      let nm = g.mintSpillName("estage")
-      g.ra.spillTemps.add (name: nm, typ: AsmSlot(cls: AUInt, size: 8, align: 8),
-                           isFloat: false)
-      g.emergencySlots.add nm
-    let slot = g.emergencySlots[depth]
-    # A forced (otherwise-free) victim is given a binding first, so the sequence
-    # below is byte-for-byte the production one — R11 in particular has NO legal
-    # bare `(reg)` form, so "save an unbound register" is not even expressible.
-    if forcedFree and g.rb.boundName(r).len == 0:
-      g.bindTemp(r, AddrSlot)
-    # Save through the victim's own NAME: nifasm rejects a raw `(reg)` operand for
-    # a bound register, and the bridge may never appear as one at all.
-    let vname = g.rb.boundName(r)
-    g.ab.tree MovX64: (g.emStackMem(slot); g.emReg r)    # slot ← victim
-    g.emergencyBorrows.add (r: r, slot: slot, name: vname,
-                            typ: g.tmpBindTyp.getOrDefault(r, AddrSlot),
-                            isPtr: g.rb.isPtrBound(r),
-                            wasTemp: g.rb.isBoundTemp(r))
-    # The name must be KILLED, not merely detached: `(rebind)` refuses to retarget
-    # a register whose binding is still live, so the borrower could not take it.
-    # `restoreEmergency` re-creates the name with the recorded type.
-    let dead = g.rb.takeBinding(r)
-    if dead.len > 0:
-      g.ab.tree KillX64: g.ab.sym dead
-    g.emergencyHeld.incl r
-    return r
+  # Two passes. The first runs only under the forcing knob for a closed window, and
+  # takes a SEALED/accumulator victim by preference — that relaxation is otherwise
+  # unreachable from the corpus (measured: zero such victims without it), and an
+  # unexercised out-of-registers arm is exactly what this knob exists to prevent.
+  for pass in 0 .. 1:
+   if pass == 0 and not (stressEmergency and closedWindow): continue
+   for r in StagingCandidates.toOpenArray(0, stressLimit(StagingCandidates.len) - 1):
+     if r in avoid or r in g.emergencyHeld: continue
+     # A named local's home is displaceable ONLY in a closed window. The rule is
+     # the same one as for sealed registers, and it is the window — not the value —
+     # that decides: an open window can emit a use of any local by name, a closed
+     # one emits a known sequence naming only the caller's own registers (which are
+     # in `avoid`). This is what makes the closed-window callers total: with every
+     # candidate but their own ends displaceable, "no register available" cannot
+     # happen unless the caller itself owns them all.
+     if not closedWindow and g.regHoldsLiveLocal(r): continue
+     if pass == 0 and not (g.ra.isSealed(r) or g.rb.isAccum(r) or
+                           g.regHoldsLiveLocal(r)): continue
+     var forcedFree = false
+     # A SEALED / accumulator register belongs to some step's in-flight value. It is
+     # safe to displace only when the window is CLOSED — a fixed instruction
+     # sequence the caller can enumerate, so "nothing inside reads it" is checkable
+     # and the caller has listed its own registers in `avoid`. An open window
+     # (`produceIntoMem2` recurses into arbitrary expression emission, which can
+     # reach an enclosing step's parked base through `ra.locs`) gets the strict rule.
+     if not closedWindow and (g.ra.isSealed(r) or g.rb.isAccum(r)): continue
+     if not (g.rb.isBoundTemp(r) or (closedWindow and
+                                     (g.ra.isSealed(r) or g.rb.isAccum(r)))):
+       # In production an unoccupied candidate is unreachable — `pickStagingScratch`
+       # would have returned it. `ARKHAM_STRESS_EMERGENCY` gets here anyway (it asks
+       # for the borrow first), and displacing a dead value is harmless, so let it
+       # through: that is what puts the save / kill / rebind / restore sequence under
+       # the corpus instead of only under programs too big to be fixtures.
+       if not stressEmergency: continue
+       # The forcing knob must not INVENT a binding on a register that carries a
+       # fixed instruction role: `idiv` clobbers rax/rdx and a variable shift needs
+       # cl, and nifasm rejects those while a binding is live. In production such a
+       # register is a victim only when it is genuinely occupied, which the code
+       # around it already accounts for — so relaxing there would test a state the
+       # emitter can never actually be in.
+       if r == g.md.intRetReg or r == g.md.divRemReg or r == g.md.shiftCountReg:
+         continue
+       forcedFree = true
+     # Reuse the slot minted for this depth; mint one the first time we get here.
+     let depth = g.emergencyBorrows.len
+     if depth >= g.emergencySlots.len:
+       let nm = g.mintSpillName("estage")
+       g.ra.spillTemps.add (name: nm, typ: AsmSlot(cls: AUInt, size: 8, align: 8),
+                            isFloat: false)
+       g.emergencySlots.add nm
+     let slot = g.emergencySlots[depth]
+     # A forced (otherwise-free) victim is given a binding first, so the sequence
+     # below is byte-for-byte the production one — R11 in particular has NO legal
+     # bare `(reg)` form, so "save an unbound register" is not even expressible.
+     if forcedFree and g.rb.boundName(r).len == 0:
+       g.bindTemp(r, AddrSlot)
+     # Save through the victim's own NAME: nifasm rejects a raw `(reg)` operand for
+     # a bound register, and the bridge may never appear as one at all.
+     let vname = g.rb.boundName(r)
+     g.ab.tree MovX64: (g.emStackMem(slot); g.emReg r)    # slot ← victim
+     g.emergencyBorrows.add (r: r, slot: slot, name: vname,
+                             typ: g.tmpBindTyp.getOrDefault(r, AddrSlot),
+                             isPtr: g.rb.isPtrBound(r),
+                             wasTemp: g.rb.isBoundTemp(r))
+     # The name must be KILLED, not merely detached: `(rebind)` refuses to retarget
+     # a register whose binding is still live, so the borrower could not take it.
+     # `restoreEmergency` re-creates the name with the recorded type.
+     let dead = g.rb.takeBinding(r)
+     if dead.len > 0:
+       g.ab.tree KillX64: g.ab.sym dead
+     g.emergencyHeld.incl r
+     return r
   return NoReg
 
 proc restoreEmergency(g: var CodeGen; r: Reg) =
@@ -938,11 +963,12 @@ proc pickStaging(g: var CodeGen; what: string; avoid: Reg = NoReg;
   ## A transient compute register for a spill (see `pickStagingScratch`). Total:
   ## when nothing is free, `borrowEmergency` makes something free. Every caller
   ## of this MUST `giveBack` the result — that is what closes the borrow window.
-  result = if stmtPos and stressEmergency: g.borrowEmergency(what, avoid) else: NoReg
+  let avoidSet = if avoid == NoReg: {} else: {avoid}
+  result = if stmtPos and stressEmergency: g.borrowEmergency(what, avoidSet) else: NoReg
   if result == NoReg:
     result = g.pickStagingScratch(avoid)
   if result == NoReg and stmtPos:
-    result = g.borrowEmergency(what, avoid)
+    result = g.borrowEmergency(what, avoidSet)
   if result == NoReg:
     # Not "out of registers" any more — `borrowEmergency` covers that. Reaching
     # here means every candidate is either `avoid`, already borrowed, or a live
@@ -4025,11 +4051,27 @@ proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
   # The spilled-ends arm needs the SOURCE address to be one we staged: that register
   # becomes the value register, and a staged destination then supplies the second.
   let spillable = srcAddr != NoReg
-  var tmp = if stressEmergency and spillable: NoReg else: g.pickStagingScratch()
-  if tmp == NoReg and not (stressEmergency and spillable):
+  # Forced mode descends past the cheap picks always; past the borrow as well when
+  # the source is staged, so that BOTH new arms get corpus coverage — the borrow
+  # via the named-source shapes, the spilled ends via the staged-source ones.
+  var tmp = if stressEmergency: NoReg else: g.pickStagingScratch()
+  if tmp == NoReg and not stressEmergency:
     tmp = g.pickHeldReg()        # non-demoting callee-saved grab (freed right after)
-    if tmp == NoReg:
-      tmp = g.borrowEmergency("an aggregate-copy transfer register", NoReg)
+  if tmp == NoReg and not (stressEmergency and spillable):
+    block:
+      # CLOSED window: what follows is `copyAggr`'s fixed load/store sequence, which
+      # touches only `srcE`, `dstE` and `tmp`. Nothing recurses, so "nothing inside
+      # reads the victim" is decidable here — and the two registers this step does
+      # read are named in `avoid`. That is what lets the borrow take a register
+      # sealed by an ENCLOSING step, which is the only thing left when both of this
+      # copy's own ends are sealed.
+      var mine: set[Reg] = {}
+      if srcAddr != NoReg: mine.incl srcAddr
+      if dstAddr != NoReg: mine.incl dstAddr
+      if dstE.reg != NoReg: mine.incl dstE.reg      # a local's register home, too
+      if srcE.reg != NoReg: mine.incl srcE.reg
+      tmp = g.borrowEmergency("an aggregate-copy transfer register", mine,
+                              closedWindow = true)
   if tmp != NoReg:
     g.releaseStaleName(tmp)      # drop a dead binding so `(rebind)` is legal
     g.ra.seal tmp
@@ -4061,9 +4103,10 @@ proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
   let a = srcAddr
   let b = dstAddr
   if a == NoReg:
-    # A named-slot source into a computed destination: parking the destination
-    # frees ONE register, but the value and the reloaded address cannot share it.
-    # Needs a second register from somewhere, and by here there is none.
+    # A named-slot source into a computed destination, and the closed-window borrow
+    # above found nothing either — which needs every staging candidate to be one of
+    # this copy's own ends. Unreachable while `StagingCandidates` has more than two
+    # entries; kept as an assert rather than a silent wrong answer.
     raiseAssert "arkham x64n: no staging register for an aggregate-copy transfer " &
                 "register (named source, computed destination) in proc " &
                 g.curProcName & g.stagingCensus(NoReg)

@@ -148,10 +148,27 @@ the reloaded address. Four instructions per word instead of two, which is the ri
 trade for a path that is otherwise a compile error.
 
 It needs the SOURCE address to be one we staged (that register is what carries the
-value). A *named-slot* source into a *computed* destination is therefore still not
-total: parking the destination frees one register, and the value and the reloaded
-address cannot share it. That arm needs a second register from somewhere, and by the
-time it is reached there is none.
+value). A *named-slot* source into a *computed* destination has no such register, and
+is served by the step before it instead — the borrow, in **closed-window** mode.
+
+### Open vs closed windows
+
+Whether a borrow may displace a given value is decided by the WINDOW, not by the
+value. An **open** window — `produceIntoMem2` recurses into arbitrary expression
+emission — can emit a use of any named local, and can reach an enclosing step's parked
+base through `ra.locs`; so there the victim must be an unsealed bound temp, nothing
+else. A **closed** window is a fixed instruction sequence the caller can enumerate:
+`copyAggr`'s load/store loop names only `srcE`, `dstE` and `tmp`. There "nothing inside
+reads the victim" is decidable, the caller lists its own registers in `avoid`, and
+*every other candidate* — sealed, accumulator, even a named local's home — is fair
+game. That is what makes the closed-window callers total: running out of registers
+would require the caller to own them all.
+
+The two knobs are not optional decoration. `ARKHAM_STRESS_EMERGENCY` runs a preference
+pass that takes a sealed / local-home victim when one exists, because those arms are
+otherwise unreachable from the corpus — measured: zero such victims without it. Every
+rule stated above was established by that pass reporting a wrong answer, not by
+reading the code.
 
 ## How this deals with the ABI
 
