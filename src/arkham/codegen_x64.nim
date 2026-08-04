@@ -6335,30 +6335,6 @@ proc freeLvalTemps2(g: var CodeGen; c: Cursor) =
       while cc.hasMore: skip cc
   else: discard
 
-proc genModuleInitBody2(g: var CodeGen; c: Cursor) =
-  ## Emit a module init proc's `(stmts …)`, injecting the call to this module's
-  ## synthetic global-init proc between the prologue (`isInitPrologueStmt`) and the
-  ## module's own top-level code. Everything about it mirrors `genStmt2`'s `StmtsS`
-  ## arm; only the injection is extra. The call lands INSIDE the once-only guard
-  ## (whose early `ret` jumps to the shared epilogue), so a second call to the init
-  ## proc — one per module that imports this one — does not re-run the initializers.
-  let myTail = g.tailStmt
-  var injected = false
-  var idx = 0
-  var cc = c
-  cc.into:
-    while cc.hasMore:
-      if not injected and not isInitPrologueStmt(cc, idx):
-        g.ab.tree PrepareX64: (g.ab.sym g.globalInitSym; g.ab.keyword CallX64)
-        injected = true
-      var nx = cc; skip nx
-      g.tailStmt = myTail and not nx.hasMore
-      g.genStmt2(cc); skip cc
-      inc idx
-  if not injected:                       # a body that is prologue all the way down
-    g.tailStmt = myTail
-    g.ab.tree PrepareX64: (g.ab.sym g.globalInitSym; g.ab.keyword CallX64)
-
 proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
   ## The pure-emitter twin of `emitProcBody`, run ONCE (no plan pass). Reuses the
   ## shared signature / frame / param-settling / scope machinery; only the value
@@ -6393,7 +6369,7 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
       g.movReg(g.indirectReg, g.md.intArgRegs[0])
   g.emitParamMoves(info.decl)
   g.emitStackParamLoadsX64(info.decl)               # via stackArgBaseReg, regs now free
-  if g.entryRunsGlobalInits(info):                   # no init chain: the entry runs them
+  if g.runsGlobalInits(info):                        # run runtime global inits at startup
     g.ab.tree PrepareX64: (g.ab.sym g.globalInitSym; g.ab.keyword CallX64)
   g.retLabel2 = g.freshLabel()                       # shared epilogue for mid-proc `ret`
   g.retLabelUsed2 = false
@@ -6404,9 +6380,7 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
     # The whole body is in tail position: after it, control reaches the epilogue.
     # The entry proc ends in an exit syscall (no epilogue jump), so leave it false.
     g.tailStmt = not info.isEntry
-    if c.stmtKind == StmtsS:
-      if g.runsGlobalInits(info): g.genModuleInitBody2(c)
-      else: g.genStmt2(c)
+    if c.stmtKind == StmtsS: g.genStmt2(c)
     while c.hasMore: skip c
   g.exitScope()
   if g.retLabelUsed2: g.emLab(g.retLabel2)           # a non-tail `ret` lands here
@@ -7148,7 +7122,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   let an = analyseProc(g.buf[], info.decl,
                        cleanCallees = g.cleanSigProcs,
                        procIsClean = isCleanSigProc(g.prog, info.decl),
-                       entryLeadingClobber = g.entryRunsGlobalInits(info))
+                       entryLeadingClobber = g.runsGlobalInits(info))
   g.varType.clear()                           # reuse the backing storage across procs
   g.symType.clear()
   g.retAggrName = ""; g.retIndirect = false; g.retIsFloat = false
@@ -7222,12 +7196,9 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     block:
       var pc = info.decl; inc pc
       stderr.writeLine "DBG emit proc " & symName(pc)
-  # Two procs make a call their body does not contain: whichever proc runs the global
-  # initializers (the module init proc, or the entry when there is no init chain), and
-  # on Windows the entry proc, which exits through `ExitProcess`. Either way rsp must
-  # be 16-aligned at that call.
+  # The entry makes two calls its body does not contain: the global-init proc, and on
+  # Windows `ExitProcess`. Either way rsp must be 16-aligned at that call.
   g.emitProcBody2(info, an.hasCall or g.runsGlobalInits(info) or
-                        g.entryRunsGlobalInits(info) or
                         (info.isEntry and g.prog.windows))
 
 proc genGlobal(g: var CodeGen; nifName: string; decl: Cursor) =
@@ -7286,7 +7257,7 @@ proc genGlobal(g: var CodeGen; nifName: string; decl: Cursor) =
 proc buildGlobalInitProc(g: var CodeGen; initBuf: var TokenBuf) =
   ## Lower each global's RUNTIME initializer into a synthetic `(proc … (stmts (asgn
   ## g e) …))` so it routes through the ordinary value-core pipeline (allocateProc +
-  ## emitProcBody2) — no special-case emitter. The module's init proc calls it (see
+  ## emitProcBody2) — no special-case emitter. The entry proc calls it (see
   ## `runsGlobalInits`). Const-scalar initializers are laid out as static data by
   ## `genGlobal` and are skipped here, so a module with none gets no init proc.
   ##
@@ -7314,8 +7285,8 @@ proc buildGlobalInitProc(g: var CodeGen; initBuf: var TokenBuf) =
   g.hasGlobalInits = true
   # A SELF-MODULE symbol (`…0.<thisModule>`), like the synthesized syprocs/extprocs:
   # only a module-suffixed name reaches the rendered `.index`, and this one has to —
-  # it is called from the module's init proc, whose body a bundle assembles as a
-  # FOREIGN module, resolving each symbol it names by full module-qualified name.
+  # every module in a bundle emits one of these, and a bundle resolves each symbol a
+  # body names by full module-qualified name.
   g.globalInitSym = "arkhamGlobalInit.0." & g.prog.thisModuleSuffix
   template tag(e): TagId = TagId(uint32(ord(e)))
   initBuf.openTag tag(ProcS)

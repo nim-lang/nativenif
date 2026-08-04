@@ -708,12 +708,10 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
   # (`clobbered`) and aggregate gating on top. Gated on `hasCall` (a leaf proc already
   # keeps its params in the arg registers via allocParams' plain leaf path).
   #
-  # `entryLeadingClobber` disables ArgResident wholesale: the `arkhamGlobalInit` call is
-  # normally APPENDED into the module init proc's body — a proc with no parameters, see
-  # `runsGlobalInits` — but a module with no init chain runs it from the ENTRY proc, where
-  # it is INJECTED before the body (not in the analysed IR) and clobbers the caller-saved
-  # arg registers before the first body use of argc/argv/envp. So no param may stay in its
-  # incoming register there (see `entryRunsGlobalInits`).
+  # `entryLeadingClobber` disables ArgResident wholesale: the entry proc has a synthetic
+  # `arkhamGlobalInit` call INJECTED before its body (not in the analysed IR), which
+  # clobbers the caller-saved arg registers before the first body use of argc/argv/envp —
+  # so no param may stay in its incoming register here.
   #
   # (Loop back-edge liveness for `usedAfterCall` is already resolved structurally at each
   # `WhileS` frame — see `LoopFrame` — so a param read only in a loop CONDITION whose body

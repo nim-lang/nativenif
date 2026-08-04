@@ -91,11 +91,6 @@ type
     instrTarget*: Table[string, InstrTarget] ## Leng proc symbol → which instruction(s)
                                             ## an `(instr …)` on it emits
     procs*: seq[ProcInfo]                   ## internal procs to emit (entry first)
-    moduleInitName*: string                 ## this module's nimony init proc (`` `ini.0.<mod> ``),
-                                            ## or "" if it has none. Its body already runs
-                                            ## once, after every imported module's init — so
-                                            ## it is where the module's runtime global
-                                            ## initializers belong (see `buildGlobalInitProc`)
     syscalls*: seq[SyscallProc]             ## syscalls used → one `(syproc …)` decl each
     globals*: Table[string, Cursor]         ## global (gvar/const) var name → its decl cursor
     globalOrder*: seq[string]               ## the same names in DECLARATION order. A global's
@@ -640,12 +635,6 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                                                 declarative: isDeclarativeAbi(result, procStart))
           result.procs.add ProcInfo(asmName: asmN, decl: procStart, isEntry: entry,
                                     isAsm: asmProc)
-          # nimony names each module's init proc `` `ini.0.<suffix> `` (lengcgen's
-          # `initProcName`). Recognizing it lets the runtime global initializers be
-          # appended to it — the only place in the program that is guaranteed to run
-          # exactly once and after every imported module's init.
-          if pname == "`ini.0." & thisModuleSuffix(result):
-            result.moduleInitName = asmN
       else:
         skip c
   # Emit the entry proc first so it begins the text section.

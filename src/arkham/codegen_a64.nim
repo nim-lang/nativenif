@@ -4774,7 +4774,7 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool;
   g.enterScope()
   if g.retIndirect: g.movReg(g.indirectReg, IndirectResultReg)
   g.emitParamMoves(info.decl)
-  if g.entryRunsGlobalInits(info):                # no init chain: the entry runs them
+  if g.runsGlobalInits(info):                     # run runtime global inits at startup
     g.ab.tree PrepareA64: (g.ab.sym g.globalInitSym; g.ab.keyword CallA64)
   g.retLabel2 = g.freshLabel()
   g.retLabelUsed2 = false
@@ -4782,21 +4782,8 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool;
   c.into:
     inc c; skip c; skip c; skip c
     if c.stmtKind == StmtsS:
-      # In a module's init proc, inject the call to its synthetic global-init proc
-      # between the prologue (`isInitPrologueStmt`) and the module's own top-level
-      # code — see the x86-64 twin's `genModuleInitBody2`.
-      let inject = g.runsGlobalInits(info)
-      var injected = false
-      var idx = 0
       c.into:
-        while c.hasMore:
-          if inject and not injected and not isInitPrologueStmt(c, idx):
-            g.ab.tree PrepareA64: (g.ab.sym g.globalInitSym; g.ab.keyword CallA64)
-            injected = true
-          g.genStmt2(c); skip c
-          inc idx
-      if inject and not injected:      # a body that is prologue all the way down
-        g.ab.tree PrepareA64: (g.ab.sym g.globalInitSym; g.ab.keyword CallA64)
+        while c.hasMore: (g.genStmt2(c); skip c)
   g.exitScope()
   if g.retLabelUsed2: g.emLab(g.retLabel2)
   if info.isEntry and g.a64Linux:                 # the entry exits by syscall (no epilogue)
@@ -4847,7 +4834,7 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   let an = analyseProc(g.buf[], info.decl, g.tvarNames,
                        cleanCallees = g.cleanSigProcs,
                        procIsClean = isCleanSigProc(g.prog, info.decl),
-                       entryLeadingClobber = g.entryRunsGlobalInits(info))
+                       entryLeadingClobber = g.runsGlobalInits(info))
   g.varType.clear()
   g.symType.clear()
   g.retAggrName = ""; g.retIndirect = false; g.retIsFloat = false
@@ -4888,9 +4875,9 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   if g.retIndirect:
     g.indirectReg = R19
     g.ra.usedCallee.incl R19
-  # Whichever proc runs the global initializers makes a call its own body does not
-  # contain, so give it a frame (lr saved) for that call.
-  # fp/lr only when a `bl` exists (or the proc runs global inits). An atomic is an
+  # The entry injects a `call` to the synthetic global-init proc, so it makes a call
+  # even when its own body does not — give it a frame (lr saved) for that call.
+  # fp/lr only when a `bl` exists (or the entry runs global inits). An atomic is an
   # instruction now, not a call, so a CAS loop no longer drags a frame onto an
   # otherwise-leaf hot path (rawDealloc and friends) — that is what `hasCall` says.
   # (The frame itself is finalized INSIDE emitProcBody2, after the body —
@@ -4899,8 +4886,7 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   g.rb.resetProc(); g.aliasToDecl.clear(); g.savedHomes.clear()
   g.noFoldPos = -1
   g.emitProcBody2(info, declarative,
-                  frameHasCall = an.hasCall or g.runsGlobalInits(info) or
-                                 g.entryRunsGlobalInits(info))
+                  frameHasCall = an.hasCall or g.runsGlobalInits(info))
 
 # MODEL: the `StartEmit` per-proc reset in proofs/arkham_bindings.tla. The two-pass seam
 # below must reset every per-proc table (regLocal/boundTemps/freeTmp + the ra.locs snapshot)
@@ -4999,7 +4985,7 @@ proc genTvar(g: var CodeGen; name: string; decl: Cursor) =
 proc buildGlobalInitProc(g: var CodeGen; initBuf: var TokenBuf) =
   ## Lower each global's RUNTIME initializer into a synthetic `(proc … (stmts (asgn
   ## g e) …))` so it routes through the ordinary value-core pipeline (allocateProc +
-  ## emitProcBody2) — no special-case emitter. The module's init proc calls it (see
+  ## emitProcBody2) — no special-case emitter. The entry proc calls it (see
   ## `runsGlobalInits`). Const-scalar initializers are laid out as static data by
   ## `genGlobal` and are skipped here, so a module with none gets no init proc.
   var inits: seq[(string, Cursor)] = @[]
@@ -5018,7 +5004,7 @@ proc buildGlobalInitProc(g: var CodeGen; initBuf: var TokenBuf) =
   if inits.len == 0: return
   g.hasGlobalInits = true
   # A SELF-MODULE symbol, so the name reaches the rendered `.index` and a bundle can
-  # resolve it from the module init that calls it. See the x86-64 twin.
+  # resolve it (every module in one emits an `arkhamGlobalInit`). See the x86-64 twin.
   g.globalInitSym = "arkhamGlobalInit.0." & g.prog.thisModuleSuffix
   template tag(e): TagId = TagId(uint32(ord(e)))
   initBuf.openTag tag(ProcS)
