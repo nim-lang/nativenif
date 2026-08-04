@@ -164,6 +164,110 @@ proc arkhamTests() =
   echo passed, " / ", total - skipped, " arkham tests successful (",
        skipped, " known-unsupported skipped)"
 
+# ── register-pressure stress pass (`-d:arkhamStress`, see src/arkham/stress.nim) ──
+#
+# The corpus above never runs a pool dry, so the emitters' pool-dry arms
+# (produce-into-memory, staging chains, survivor parking) are never taken and every
+# bug in one has been found by bootstrapping nimony instead. This pass re-runs the
+# SAME fixtures against a starved register file (`ARKHAM_STRESS=k` keeps the first
+# `k` registers of each allocatable pool), with each fixture's own
+# `.exitcode`/`.output` still the oracle — so it checks both totality and
+# correctness under maximum spilling.
+
+const arkhamStressKnown: seq[string] = @[
+  # Real defects found by this pass at x86-64's level, parked so that any NEW
+  # failure is fatal. Remove an entry with its fix.
+  "aggr_copy_regpressure",  # nested-aggregate copy emits a stackoff into a value slot
+  "stack_aggr_byref",       # by-ref aggregate base not materialized before the (mem …)
+  # `takeHeld` with the default `canSpill = false` asserts instead of evicting a
+  # live local. 11 of the 15 `takeHeld` sites across both backends do.
+  "aggr_arg_parked",
+  "aggr_arg_parked_byref",
+  "aggr_arg_parked_manual",
+  "atomic_cas_regpressure", # intrinsic-operand pick has no steal/spill arm
+]
+
+const arkhamStressA64Known: seq[string] = @[
+  # Both a64 passes take this list — the qemu `linux_arm64` one and the native
+  # macOS one — because they drive the same emitters. The first two are SILENT
+  # MISCOMPILES: fewer registers may cost performance or hit a documented
+  # out-of-registers assert, but can never legitimately change what a program
+  # computes, so a wrong answer here is a codegen bug by construction.
+  "spill_produce_float",    # float produce-into-spill reads a clobbered register
+  "steal_straddle",         # trySteal over a straddling live range yields a stale value
+  "atomic_cas_regpressure", # intrinsic-operand pick has no steal/spill arm
+]
+
+const
+  arkhamStressLevel = 2       ## registers kept per pool, x86-64
+  arkhamStressA64Level = 3
+    ## One higher: `takeInstrReg` and `takeLvalStride` route through `takeHeld`
+    ## with no spill arm, so at k=2 every atomic and every non-scale index dies on
+    ## that documented assert and `call_stack_args` hits the ">8 integer params"
+    ## limit. Those are the backend's stated contracts, not findings.
+
+proc arkhamStressTests(arch: string; runner = ""; skip: seq[string] = @[];
+                       known: seq[string]; level: int) =
+  ## Re-emit + assemble + RUN the corpus with the register file starved to `level`
+  ## registers per pool. Uses its own `bin/arkham_stress` binary so the shipped
+  ## `bin/arkham` cannot be perturbed by a stray environment variable. `runner`
+  ## prefixes the produced executable (`qemu-aarch64` for the `linux_arm64` pass).
+  exec "nim c --hints:off -d:arkhamStress -o:bin/arkham_stress src/arkham/arkham.nim"
+  let arkham = ("bin" / "arkham_stress").addFileExt(ExeExt)
+  let nifasm = ("src" / "nifasm" / "nifasm").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham" / "nimcache"
+  createDir workDir
+  putEnv("ARKHAM_STRESS", $level)               # inherited by the arkham children
+  for file in walkFiles("tests" / "arkham" / "mod_*.c.nif"):
+    let name = extractFilename(file)[0 ..< extractFilename(file).len - ".c.nif".len]
+    exec quoteShell(arkham) & " -a:" & arch & " -o:" &
+         quoteShell(workDir / (name & ".asm.nif")) & " " & quoteShell(file)
+  var total, passed, expectedFail = 0
+  var newFailures: seq[string] = @[]
+  for file in walkFiles("tests" / "arkham" / "*.c.nif"):
+    let base = extractFilename(file)
+    if base.startsWith("mod_") or base.startsWith("err_"): continue
+    let name = base[0 ..< base.len - ".c.nif".len]
+    if name in skip: continue
+    inc total
+    let stem = file[0 ..< file.len - ".c.nif".len]
+    let asmNif = workDir / (name & ".stress.nif")
+    let exe = workDir / (name & ".stress.out")
+    var failed = ""
+    block run:
+      let (ao, ac) = execCmdEx(quoteShell(arkham) & " -a:" & arch & " -o:" &
+                               quoteShell(asmNif) & " " & quoteShell(file))
+      if ac != 0:
+        failed = "codegen: " & ao.splitLines[^2 .. ^1].join(" ").strip; break run
+      let (no, nc) = execCmdEx(quoteShell(nifasm) & " -o:" & quoteShell(exe) &
+                               " " & quoteShell(asmNif))
+      if nc != 0:
+        failed = "assemble: " & no.splitLines[^1].strip; break run
+      let (po, pc) = execCmdEx(
+        (if runner.len > 0: quoteShell(runner) & " " else: "") & quoteShell(exe))
+      let ecFile = stem & ".exitcode"
+      let expectedCode = if fileExists(ecFile): parseInt(readFile(ecFile).strip) else: 0
+      let outFile = stem & ".output"
+      let expectedOut = if fileExists(outFile): readFile(outFile).strip else: ""
+      if pc != expectedCode:
+        failed = "MISCOMPILE: exitcode " & $expectedCode & " but got " & $pc; break run
+      if po.strip != expectedOut:
+        failed = "MISCOMPILE: output mismatch"; break run
+    if failed.len == 0:
+      if name in known:
+        echo "NOTE: ", name, " now passes — remove it from the stress known list"
+      inc passed
+    elif name in known:
+      inc expectedFail
+    else:
+      newFailures.add name & " — " & failed
+  delEnv("ARKHAM_STRESS")
+  echo passed, " / ", total - expectedFail, " arkham ", arch,
+       " stress tests successful (k=", level, ", ", expectedFail, " known-broken)"
+  if newFailures.len > 0:
+    quit "FAILURE arkham register-pressure stress (" & arch &
+         ") found NEW breakage:\n  " & newFailures.join("\n  ")
+
 # Most `tests/arkham/*.c.nif` run end-to-end under the static Linux/ELF
 # `linux_arm64` qemu path — the arm64 backend reached x86-64 feature parity for
 # function-pointer calls, `(pat …)` pointer indexing, and thread-locals. List a
@@ -382,6 +486,17 @@ exec "nim c -r src/nifasm/nifasm tests/module_gvar_access.nif"
 # AArch64/Darwin on macOS), so we run them only where the binaries execute.
 when (defined(linux) and defined(amd64)) or (defined(macosx) and defined(arm64)):
   arkhamTests()
+  # The same corpus again, against a starved register file. Every argument is
+  # picked by BACKEND, not by host: macOS drives the AArch64 emitters, so it takes
+  # the same known set and level as the qemu `linux_arm64` pass below.
+  arkhamStressTests(arch = (when defined(macosx): "arm64" else: "x64"),
+                    skip = (when defined(macosx): arkhamDarwinUnsupported &
+                                                  arkhamA64Unsupported
+                            else: arkhamOsxOnly),
+                    known = (when defined(macosx): arkhamStressA64Known
+                             else: arkhamStressKnown),
+                    level = (when defined(macosx): arkhamStressA64Level
+                             else: arkhamStressLevel))
 
 # The `{.assembler.}` rejections are x86-64-only (see `arkhamRejectionTests`).
 when defined(linux) and defined(amd64):
@@ -392,3 +507,12 @@ when defined(linux) and defined(amd64):
 # absent). Gives the arm64 path end-to-end coverage without a macOS machine.
 when defined(linux) and defined(amd64):
   arkhamQemuTests()
+
+# The AArch64 backend gets the same starved-pool pass, under qemu.
+when defined(linux) and defined(amd64):
+  if findExe("qemu-aarch64").len > 0:
+    arkhamStressTests(arch = "linux_arm64", runner = "qemu-aarch64",
+                      skip = arkhamLinuxA64Unsupported & arkhamA64Unsupported &
+                             arkhamOsxOnly,
+                      known = arkhamStressA64Known,
+                      level = arkhamStressA64Level)

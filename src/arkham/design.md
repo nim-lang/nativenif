@@ -160,3 +160,39 @@ expression evaluator:
   prologue, before SP moves; a stack-passed ≤16-byte by-value aggregate is left
   in place and its home holds the *address* of those incoming bytes, so the body
   reads its fields through that pointer with no copy.
+
+## Testing the pool-dry arms
+
+Everything above has a *pool-dry* arm — produce-into-memory, the staging chain,
+survivor parking, `mintSpillName` — and the `tests/arkham` fixtures are too small
+to take any of them. `-d:arkhamStress` reaches that regime without bigger
+fixtures: `ARKHAM_STRESS=k` keeps only the first `k` registers of each allocatable
+pool (`src/arkham/stress.nim`), so the *same* corpus runs against a starved
+register file. The ABI and the reserved emitter bridges (r11/xmm15, x14/x15/v31)
+are not shrunk — they are the guarantee the emitters are written against.
+
+Each fixture's own `.exitcode`/`.output` stays the oracle, which is the point:
+fewer registers may cost performance, or hit a documented out-of-registers assert,
+but can never legitimately change what a program computes. A changed answer is
+therefore a codegen bug by construction — the half a totality argument cannot
+supply, since it proves a register is always available, not that the value
+arriving in it is the right one.
+
+### Fixed-register roles must be stated, not assumed
+
+The first defect this mode found is the shape to watch for. `MachineDesc` models
+the roles the *allocator* has to respect — `divRemReg` (rdx, clobbered by `idiv`),
+`shiftCountReg` (rcx) — and the pools then simply omit rax. Every atomic lowering
+read that omission as "rax is mine", which held right up to the point where the
+pools ran dry and `takeInstrReg` fell through to the staging set, where rax is the
+second candidate. A compare-exchange's `desired` landed there, the `mov rax,
+*expected` that precedes the `cmpxchg` destroyed it, and the CAS compared the cell
+against itself: reported success, stored the old value back.
+
+The rule this leaves behind: **a register an emitter claims must be excluded where
+the claim is made, not inferred from a pool it happens not to be in.** The
+exclusion belongs to the *row*, not the opcode class — `atomicRegClaims` names rax
+only for the rows that spin on a `cmpxchg` and r11 only for the rows that need a
+`work` register, so a compare-exchange gets the bridge back in exchange for rax.
+A blanket claim would have made three-operand atomics stop compiling under
+pressure instead.
