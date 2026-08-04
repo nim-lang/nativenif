@@ -4590,7 +4590,25 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         g.genStore2(opCur, memLoc(lhsCur, ScalarSlot))
       g.noFoldPos = -1
       while cc.hasMore: skip cc
-  else: raiseAssert "arkham x64n: genStmt2 " & $c.stmtKind
+  else:
+    when declared(ComesfromS):
+      if c.stmtKind == ComesfromS:
+        # `(comesfrom SYM S*)` — statements produced by expanding SYM (a
+        # template today). Debug-info only: no scope and no code of its own, so
+        # it behaves as `stmts` once the leading origin SYMBOL is stepped over.
+        # That first child is an operand, not a statement.
+        #
+        # Guarded so arkham still compiles against a nimony that predates the
+        # tag (nim-lang/nimony#2240); drop the `when` once that has merged.
+        var cc = c
+        cc.into:
+          skip cc                               # the origin symbol
+          while cc.hasMore:
+            var nx = cc; skip nx
+            g.tailStmt = myTail and not nx.hasMore
+            g.genStmt2(cc); skip cc
+        return
+    raiseAssert "arkham x64n: genStmt2 " & $c.stmtKind
 
 # ── fused value core: unconverted-proc stubs (die as each case lands) ────────
 proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
@@ -6838,6 +6856,19 @@ proc asmStmt(g: var CodeGen; c: Cursor) =
       g.retLabelUsed2 = true
       g.emJmp(g.retLabel2)
   else:
+    when declared(ComesfromS):
+      if c.stmtKind == ComesfromS:
+        # See `genStmt2`: transparent debug-info marker, first child is an
+        # operand. Guarded so arkham still compiles against a nimony that
+        # predates the tag (nim-lang/nimony#2240).
+        var cc = c
+        cc.into:
+          skip cc                               # the origin symbol
+          while cc.hasMore:
+            var nx = cc; skip nx
+            g.tailStmt = myTail and not nx.hasMore
+            g.asmStmt(cc); skip cc
+        return
     lengError c, "`" & $c.stmtKind & "` is not allowed in an `.assembler` proc", g.asmInfo
 
 proc genAsmProc(g: var CodeGen; info: ProcInfo) =

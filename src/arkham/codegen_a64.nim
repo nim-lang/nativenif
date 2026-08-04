@@ -4702,7 +4702,22 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
           g.ovfReg2 = rB
           g.ovfBridges = @[rA, rB]
       while cc.hasMore: skip cc
-  else: raiseAssert "arkham a64n: genStmt2 " & $c.stmtKind
+  else:
+    when declared(ComesfromS):
+      if c.stmtKind == ComesfromS:
+        # `(comesfrom SYM S*)` — statements produced by expanding SYM (a
+        # template today). Debug-info only: no scope and no code of its own, so
+        # it behaves as `stmts` once the leading origin SYMBOL is stepped over.
+        # That first child is an operand, not a statement.
+        #
+        # Guarded so arkham still compiles against a nimony that predates the
+        # tag (nim-lang/nimony#2240); drop the `when` once that has merged.
+        var cc = c
+        cc.into:
+          skip cc                               # the origin symbol
+          while cc.hasMore: (g.genStmt2(cc); skip cc)
+        return
+    raiseAssert "arkham a64n: genStmt2 " & $c.stmtKind
 
 # ── proc emission / driver (pure-emit path) ──────────────────────────────────
 

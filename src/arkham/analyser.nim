@@ -523,6 +523,19 @@ proc analyse(c: var Context; n: var Cursor) =
         if frame.sawCall: c.loopStack[^1].sawCall = true
         for pnm in frame.usedParams: c.loopStack[^1].usedParams.incl pnm
     else:
+      when declared(ComesfromS):
+        if n.stmtKind == ComesfromS:
+          # `(comesfrom SYM S*)`: debug-info marker, walks like `stmts` but
+          # opens no scope frame. The leading child is the origin SYMBOL, not a
+          # statement, so `analyseChildren` would analyse it as a symbol *use*
+          # and record a read of the expanded routine at this position.
+          #
+          # Guarded so arkham still compiles against a nimony that predates the
+          # tag (nim-lang/nimony#2240); drop the `when` once that has merged.
+          n.into:
+            skip n                        # the origin symbol
+            while n.hasMore: analyse(c, n)
+          return
       analyseChildren(c, n)             # if/case/ret/... : recurse
   else:
     inc n

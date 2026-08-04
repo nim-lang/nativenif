@@ -527,6 +527,20 @@ proc walk(b: var Builder; n: var Cursor) =
     n.into:
       while n.hasMore: walk(b, n)
   else:
+    when declared(ComesfromS):
+      if n.stmtKind == ComesfromS:
+        # `(comesfrom SYM S*)`: debug-info marker, walks like `stmts`. The
+        # leading child is the origin SYMBOL, not a statement, so the generic
+        # recursion below would count it as a use of the expanded routine here.
+        #
+        # Guarded so arkham still compiles against a nimony that predates the
+        # tag (nim-lang/nimony#2240); drop the `when` once that has merged.
+        n.into:
+          skip n                              # the origin symbol
+          while n.hasMore:
+            walk(b, n)
+            flushFree(b, b.posOf(n))
+        return
     if n.kind == TagLit:
       n.into:
         while n.hasMore: walk(b, n)          # recurse (var decls may nest)
