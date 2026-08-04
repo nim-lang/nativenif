@@ -6369,8 +6369,6 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
       g.movReg(g.indirectReg, g.md.intArgRegs[0])
   g.emitParamMoves(info.decl)
   g.emitStackParamLoadsX64(info.decl)               # via stackArgBaseReg, regs now free
-  if g.runsGlobalInits(info):                        # run runtime global inits at startup
-    g.ab.tree PrepareX64: (g.ab.sym g.globalInitSym; g.ab.keyword CallX64)
   g.retLabel2 = g.freshLabel()                       # shared epilogue for mid-proc `ret`
   g.retLabelUsed2 = false
   g.binNormSuppressPos = -1                          # no store-fused normalize elision pending
@@ -7121,8 +7119,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     g.cleanSigComputed = true
   let an = analyseProc(g.buf[], info.decl,
                        cleanCallees = g.cleanSigProcs,
-                       procIsClean = isCleanSigProc(g.prog, info.decl),
-                       entryLeadingClobber = g.runsGlobalInits(info))
+                       procIsClean = isCleanSigProc(g.prog, info.decl))
   g.varType.clear()                           # reuse the backing storage across procs
   g.symType.clear()
   g.retAggrName = ""; g.retIndirect = false; g.retIsFloat = false
@@ -7196,10 +7193,9 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     block:
       var pc = info.decl; inc pc
       stderr.writeLine "DBG emit proc " & symName(pc)
-  # The entry makes two calls its body does not contain: the global-init proc, and on
-  # Windows `ExitProcess`. Either way rsp must be 16-aligned at that call.
-  g.emitProcBody2(info, an.hasCall or g.runsGlobalInits(info) or
-                        (info.isEntry and g.prog.windows))
+  # On Windows the entry proc makes a call its body does not contain: it exits
+  # through `ExitProcess`, and rsp must be 16-aligned at that call.
+  g.emitProcBody2(info, an.hasCall or (info.isEntry and g.prog.windows))
 
 proc genGlobal(g: var CodeGen; nifName: string; decl: Cursor) =
   ## `(gvar :name <type>)` — a zero-initialized `.bss` global (also `const`); any
@@ -7242,66 +7238,9 @@ proc genGlobal(g: var CodeGen; nifName: string; decl: Cursor) =
       # module's gvar in a bundle (its entry-time `emitGlobalInits` never runs) and
       # for a `var` later mutated (a read-only rodata blob would fault). Other
       # (runtime) initializers are still stored at entry by `emitGlobalInits`.
-      if hasValue and isConstScalarInit(c):
-        g.ab.intLit cast[int64](constLitBits(c))
-      elif hasValue:
-        # A static-ADDRESS initializer (function-pointer hook etc.): emit the
-        # symbol as the gvar's value so nifasm bakes its resolved address into the
-        # slot — also correct for a foreign module's gvar in a bundle.
-        let addrSym = constAddrSym(c)
-        if addrSym.len > 0:
-          g.ab.sym addrSym
+      g.genGlobalInitValue(name, typeCur, c, hasValue)
       g.ab.close()
     while c.hasMore: skip c                      # value (also handled at entry, if runtime)
-
-proc buildGlobalInitProc(g: var CodeGen; initBuf: var TokenBuf) =
-  ## Lower each global's RUNTIME initializer into a synthetic `(proc … (stmts (asgn
-  ## g e) …))` so it routes through the ordinary value-core pipeline (allocateProc +
-  ## emitProcBody2) — no special-case emitter. The entry proc calls it (see
-  ## `runsGlobalInits`). Const-scalar initializers are laid out as static data by
-  ## `genGlobal` and are skipped here, so a module with none gets no init proc.
-  ##
-  ## `initBuf` shares the input buffer's pool + tag pool, so each `(asgn …)`'s symbol
-  ## use re-interns to the SAME `SymId` and the copied initializer subtree is a bulk
-  ## `copyMem`. Built into a separate buffer (not the input) so `cursorToPosition`
-  ## keys the allocator/emitter location map by position WITHIN `initBuf`.
-  var inits: seq[(string, Cursor)] = @[]
-  # DECLARATION order (`globalOrder`), not `globals` table order: one initializer may
-  # read a global a preceding one set. `winlean` is exactly that — the library handle
-  # is a global, and each `dynlib` proc's own global initializer resolves through it.
-  for name in g.prog.globalOrder:
-    var c = g.globals[name]
-    if c.stmtKind == ConstS: continue           # emitted as a rodata data blob
-    c.into:
-      inc c; skip c                             # name, pragmas
-      skip c                                    # type
-      # A constant-scalar or static-address initializer was laid out as static
-      # data (see genGlobal), so there is no entry-time store to emit for it here.
-      if c.hasMore and c.kind != DotToken and not isConstScalarInit(c) and
-         constAddrSym(c).len == 0:
-        inits.add (name, c)
-      while c.hasMore: skip c
-  if inits.len == 0: return
-  g.hasGlobalInits = true
-  # A SELF-MODULE symbol (`…0.<thisModule>`), like the synthesized syprocs/extprocs:
-  # only a module-suffixed name reaches the rendered `.index`, and this one has to —
-  # every module in a bundle emits one of these, and a bundle resolves each symbol a
-  # body names by full module-qualified name.
-  g.globalInitSym = "arkhamGlobalInit.0." & g.prog.thisModuleSuffix
-  template tag(e): TagId = TagId(uint32(ord(e)))
-  initBuf.openTag tag(ProcS)
-  initBuf.addSymDef g.globalInitSym
-  initBuf.openTag tag(ParamsT); initBuf.closeTag()       # (params)
-  initBuf.addDotToken()                                  # void return
-  initBuf.openTag tag(PragmasU); initBuf.closeTag()      # (pragmas)
-  initBuf.openTag tag(StmtsS)
-  for (name, initCur) in inits:
-    initBuf.openTag tag(AsgnS)
-    initBuf.addSymUse name                               # the global lvalue
-    initBuf.addSubtree initCur                           # its initializer expression
-    initBuf.closeTag()
-  initBuf.closeTag()                                     # stmts
-  initBuf.closeTag()                                     # proc
 
 proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                   windows = false): string =
@@ -7326,11 +7265,6 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   g.globals = g.prog.globals
   g.tvars = g.prog.tvars
   for nm in g.tvars.keys: g.tvarNames.incl nm
-  # Build the synthetic global-init proc (if any runtime initializers exist) BEFORE
-  # the proc loop, so the entry proc's frame/body account for the startup `call`.
-  # `initBuf` must outlive `genProc` below; it shares `buf`'s pool + tag pool.
-  var initBuf = createTokenBuf(64, buf.pool, buf.tags)
-  g.buildGlobalInitProc(initBuf)
   g.ab.tree StmtsX64:
     g.ab.tree ArchD: g.ab.ident (if windows: "win_x64" else: "x64")
     if windows:
@@ -7365,12 +7299,6 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       g.emitSyproc(sp)
     for info in g.prog.procs:
       genProc(g, info)
-    if g.hasGlobalInits:                         # emit the synthetic init proc itself
-      let savedBuf = g.buf
-      g.buf = addr initBuf
-      var ic = initBuf.beginRead()
-      genProc(g, ProcInfo(asmName: g.globalInitSym, decl: ic, isEntry: false))
-      g.buf = savedBuf
     for (nm, bytes) in g.rodata:
       g.ab.tree RodataD:
         g.ab.symDef nm

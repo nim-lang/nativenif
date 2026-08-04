@@ -7260,6 +7260,33 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
         if initSym != nil:
           ctx.bssSymInits.add (off: sym.size.int64, sym: initSym,
                                size: asmSizeOf(sym.typ))
+      elif lc.hasVal and lc.val.kind == StrLit:
+        # An AGGREGATE constant initializer — an object/array constructor or a
+        # string, laid out by arkham's `constToBytes` as the raw little-endian
+        # bytes of the value. Fill the writable image byte-wise, exactly like a
+        # `dataConst` rodata blob; zero bytes are already zero in the image.
+        # Trailing `(reloc <off> <sym>)` children name the fields holding a
+        # symbol ADDRESS, which only the final layout knows — same treatment as
+        # the scalar symbol case above, one entry per field.
+        let s = getStr(lc.val)
+        for i, ch in s:
+          if ch != '\0':
+            ctx.bssInits.add (off: int64(sym.size + i), val: int64(ch), size: 1)
+        var rc = n                            # (gvar :name type "bytes" (reloc …)*)
+        into rc:
+          skip rc                             # name
+          skip rc                             # type
+          skip rc                             # the byte blob
+          while rc.hasMore:
+            var relc = rc
+            into relc:
+              let blobOff = getInt(relc); skip relc
+              let tname = getSym(relc)
+              let tsym = lookupWithAutoImport(ctx, ctx.scope, tname, relc)
+              skip relc                       # past the target symbol
+              if tsym != nil:
+                ctx.bssSymInits.add (off: int64(sym.size) + blobOff, sym: tsym, size: 8)
+            skip rc
       ctx.bssOffset += size
   of skTvar:
     if declTag == TvarD:
