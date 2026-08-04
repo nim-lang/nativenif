@@ -1,0 +1,68 @@
+(.nif27)
+(.indexat 1                )
+(stmts
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :acx.0
+  (params
+   (param :p.0 .
+    (ptr
+     (i 64)))
+   (param :ep.0 .
+    (ptr
+     (i 64)))
+   (param :des.0 .
+    (i 64))
+   (param :wk.0 .
+    (bool))
+   (param :so.0 .
+    (i 32))
+   (param :fo.0 .
+    (i 32)))
+  (bool)
+  (pragmas
+   (intrinsic "AtomicCompareExchange"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :cell.0 .
+    (i 64)5)
+   (var :expl.0 .
+    (i 64)5)
+   (var :a.0 .
+    (i 64)1)
+   (var :b.0 .
+    (i 64)2)
+   (var :c.0 .
+    (i 64)3)
+   (var :ok.0 .
+    (bool)
+    (instr acx.0
+     (addr cell.0)
+     (addr expl.0)99
+     (false)0 0))
+   (var :sum.0 .
+    (i 64)
+    (add
+     (i 64)a.0
+     (add
+      (i 64)b.0 c.0)))
+   (asgn sum.0
+    (add
+     (i 64)sum.0 cell.0))
+   (if
+    (elif ok.0
+     (stmts
+      (asgn sum.0
+       (add
+        (i 64)sum.0 7)))))
+   (call exit.c sum.0))))(.index)

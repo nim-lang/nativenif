@@ -20,7 +20,12 @@
 import std / [assertions, tables, sets, os, algorithm, strutils]
 import nifcore, nifcdecl
 import slots, machinedesc, analyser, register_allocator, programs
-import asmbuf, codegen_common, machine_x64
+import asmbuf, codegen_common, machine_x64, stress
+
+let x64MachineA = stressed(x64Machine)
+  ## The machine arkham allocates against: `x64Machine` itself, unless the
+  ## `-d:arkhamStress` shrink is armed (see `stress.nim`). A module-level `let`
+  ## so the environment is read and the pools rebuilt once, not per proc.
 
 const TlsBlockName = "arkham.tls.0"
   ## The static block FS points at (see `emitTlsSetup`); a tvar lives at
@@ -773,7 +778,7 @@ proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg =
   ## chain: every nesting level holds its result register from before its own
   ## address is materialized, so a `((a.b).c).d` chain of spilled loads wants
   ## one register per level (`cmpStringPtrs`, `-d:danger`).
-  for r in StagingCandidates:
+  for r in StagingCandidates.toOpenArray(0, stressLimit(StagingCandidates.len) - 1):
     if r != avoid and not g.ra.isSealed(r) and not g.rb.isAccum(r) and
        not g.rb.isBoundTemp(r) and not g.regHoldsLiveLocal(r):
       # not `isBoundTemp`: a register holding a live scratch temp (`bindTemp`'d)
@@ -792,7 +797,7 @@ proc stagingCensus(g: var CodeGen; avoid: Reg): string =
   ## indistinguishable from "a filter is wrong / a seal was never released", and
   ## those need opposite fixes.
   result = ""
-  for r in StagingCandidates:
+  for r in StagingCandidates.toOpenArray(0, stressLimit(StagingCandidates.len) - 1):
     result.add "\n    " & $r & ": "
     if r == avoid: result.add "avoid"
     elif g.ra.isSealed(r): result.add "sealed (" & g.rb.boundName(r) & ")"
@@ -1003,12 +1008,13 @@ proc cmpJccTag(ek: LengExpr; whenTrue, signed: bool): X64Inst =
 # An atomic arrives as `(instr …)`, so its operands are wherever the ALLOCATOR put
 # them and the sequence must not assume an ABI. The only registers it takes for
 # itself are `rax` — architecturally required as `cmpxchg`'s comparand — and `r11`,
-# the reserved staging bridge, as the working register. Those two are precisely the
-# GPRs the allocator never hands out, which is the point: an atomic's clobber set
-# cannot overlap a live value, so nothing upstream has to prove that it doesn't.
-# The `work` register also removes every aliasing question — the caller's `p`, `val`
-# and destination registers may coincide freely, because the sequence reads them
-# and writes only its own.
+# the reserved staging bridge, as the working register; which of the two a given row
+# claims is `atomicRegClaims`. That claim is ENFORCED by a seal `emitInstr2` holds
+# across the operand picks: it used to rest on "the allocator never hands those out",
+# which is true of the pools and false of `takeInstrReg`'s staging fallback.
+# The `work` register removes every aliasing question among the operands themselves —
+# the caller's `p`, `val` and destination registers may coincide freely, because the
+# sequence reads them and writes only its own.
 
 proc emMemAt(g: var CodeGen; p: Reg; pointee: Cursor) =
   ## `(mem (cast (ptr T) p))` — dereference `p` typed as `ptr T` so nifasm sizes the
@@ -2270,6 +2276,27 @@ proc atomicPointee(g: var CodeGen; ptrArg: Cursor): Cursor =
   if isPtrType(result): inc result
   else: result = g.prog.intType
 
+proc atomicRegClaims(op: IntrinsicOp): set[Reg] =
+  ## The registers an atomic row's lowering takes FOR ITSELF, and which therefore
+  ## must not host one of its operands (`emitInstr2` seals these across the operand
+  ## picks). Per-row rather than per-class, which is what keeps the exclusion
+  ## affordable: a compare-exchange has three register operands plus a result, so
+  ## reserving a register it never touches would exhaust the pools under pressure.
+  ##
+  ##  * `rax` — `cmpxchg`'s comparand is architecturally RAX, so every row that spins
+  ##    on one owns it: the compare-exchange itself, and the and/or/xor retry loops
+  ##    (`genAtomicLoopRmw`), which have no lock-prefixed fetch form.
+  ##  * `r11` — the staging bridge, used as the `work` register by every row that
+  ##    needs one. A load reads straight into its destination and a compare-exchange
+  ##    works out of `rax`, so those two claim no `work` (this is exactly the
+  ##    `needsWork` test below, and the two must stay in step).
+  if op in {AtomicCompareExchangeOp, AtomicFetchAndOp, AtomicFetchOrOp,
+            AtomicFetchXorOp}:
+    result.incl RAX
+  if op notin {AtomicLoadOp, AtomicCompareExchangeOp, AtomicThreadFenceOp,
+               AtomicSignalFenceOp}:
+    result.incl R11
+
 proc emitAtomicInstr2(g: var CodeGen; c: Cursor; op: IntrinsicOp;
                       argCurs: seq[Cursor]; res: Location) =
   ## An atomic row's x86-64 sequence, on operands the ALLOCATOR placed (see the
@@ -2286,10 +2313,13 @@ proc emitAtomicInstr2(g: var CodeGen; c: Cursor; op: IntrinsicOp;
     # — hoisting a memory access across it — arkham does not do to begin with.
     return
   else: discard
-  # `rax` and `r11` are about to be raw scratch. A dead local can still be sitting
-  # in `regLocal` under its typed name, which `emReg` would emit instead of the raw
-  # tag — a type mismatch against the pointee-typed `(mem …)` operand.
-  for r in [RAX, R11]: g.releaseStaleName(r)
+  # The registers THIS row claims are about to be raw scratch. A dead local can still
+  # be sitting in `regLocal` under its typed name, which `emReg` would emit instead of
+  # the raw tag — a type mismatch against the pointee-typed `(mem …)` operand. Only
+  # the claimed ones: a register the row does not touch may legitimately be hosting
+  # one of its own operands, and killing that binding is the corruption this guards
+  # against.
+  for r in atomicRegClaims(op): g.releaseStaleName(r)
   let pointee = g.atomicPointee(argCurs[0])
   let p = g.instrOperandReg(argCurs[0])
   # The VALUE operand of every row but the compare-exchange (whose operand 1 is the
@@ -2304,7 +2334,7 @@ proc emitAtomicInstr2(g: var CodeGen; c: Cursor; op: IntrinsicOp;
   # nifasm type-checks `xchg`/`cmpxchg` against their memory operand, and the cell may
   # well be a pointer (a lock-free list head is the common case) — an `(i 64)` binding
   # is rejected against a `(ptr (ptr T))` access.
-  let needsWork = op notin {AtomicLoadOp, AtomicCompareExchangeOp}
+  let needsWork = R11 in atomicRegClaims(op)
   if needsWork: g.bindTemp(R11, slotOf(g.prog, pointee))
   block:
     case op
@@ -5901,13 +5931,14 @@ proc takeInstrReg(g: var CodeGen; slot: AsmSlot): Location =
   if r != NoReg:
     g.pickedRegs.incl r
     return regLoc(r, slot, isTemp = true)
-  # NOT the R11 bridge: the atomic sequences use it as their own work register
-  # (`seedWork`/xadd), and the old allocator's pools could never produce it —
-  # the lowering bodies rely on that.
-  let s = g.pickStagingScratch(avoid = R11)
+  # What this draw must NOT return — the registers the row's own lowering claims —
+  # is a SEAL held by `emitInstr2` (`atomicRegClaims`) rather than an `avoid`
+  # argument: there can be two of them, and the seal also covers the nested
+  # `pickStaging` calls inside `emitValue2`, which an `avoid` here would not reach.
+  let s = g.pickStagingScratch()
   if s == NoReg:
     raiseAssert "arkham x64n: out of registers for an intrinsic operand in proc " &
-                g.curProcName
+                g.curProcName & g.stagingCensus(NoReg)
   g.ra.seal {s}
   result = regLoc(s, slot, isTemp = true)
 
@@ -5957,7 +5988,18 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
       if d.kind == InReg: g.giveBack d.r
     dest = Location(kind: Undef)                # no value: nothing consumes this node
     return
-  # Resolve the result FIRST and seal it, so an operand pick cannot land on it.
+  # Seal what the LOWERING claims, before anything is picked. `takeInstrReg`'s
+  # staging fallback draws from `StagingCandidates`, and RAX sits second there — so
+  # starve the pools and a compare-exchange's `desired` lands in RAX, the
+  # `mov rax, *expected` emitted between them destroys it, and the CAS compares the
+  # cell against ITSELF: it reports success and stores the old value back. RDX
+  # (idiv) and RCX (shift count) are fixed roles in `MachineDesc`; RAX's atomic role
+  # has no such home, so it is stated here. A non-atomic row claims only the R11
+  # bridge, as before.
+  let claims = if tgt.op.isAtomic: atomicRegClaims(tgt.op) else: {R11}
+  let sealedClaims = claims - g.ra.sealed
+  g.ra.seal sealedClaims
+  # Resolve the result and seal it too, so an operand pick cannot land on it.
   var res = Location(kind: Undef)
   if not row.isVoidResult:
     case dest.kind
@@ -5982,6 +6024,7 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
       ops.add d
       inc i
   if sealedHere: g.ra.unseal {res.r}
+  g.ra.unseal sealedClaims
   if tgt.op.isAtomic:
     g.emitAtomicInstr2(c, tgt.op, argCurs, res)
     for d in ops:
@@ -6350,6 +6393,8 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
       g.movReg(g.indirectReg, g.md.intArgRegs[0])
   g.emitParamMoves(info.decl)
   g.emitStackParamLoadsX64(info.decl)               # via stackArgBaseReg, regs now free
+  if g.entryRunsGlobalInits(info):                   # no init chain: the entry runs them
+    g.ab.tree PrepareX64: (g.ab.sym g.globalInitSym; g.ab.keyword CallX64)
   g.retLabel2 = g.freshLabel()                       # shared epilogue for mid-proc `ret`
   g.retLabelUsed2 = false
   g.binNormSuppressPos = -1                          # no store-fused normalize elision pending
@@ -7102,7 +7147,8 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     g.cleanSigComputed = true
   let an = analyseProc(g.buf[], info.decl,
                        cleanCallees = g.cleanSigProcs,
-                       procIsClean = isCleanSigProc(g.prog, info.decl))
+                       procIsClean = isCleanSigProc(g.prog, info.decl),
+                       entryLeadingClobber = g.entryRunsGlobalInits(info))
   g.varType.clear()                           # reuse the backing storage across procs
   g.symType.clear()
   g.retAggrName = ""; g.retIndirect = false; g.retIsFloat = false
@@ -7143,7 +7189,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.pickedRegs = {}
   g.pickedFRegs = {}
   g.emitTmpSpills = 0
-  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64Machine, g.typeCtx, preseal)
+  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64MachineA, g.typeCtx, preseal)
   when defined(arkhamTracePath):
     stderr.writeLine "[arkham] " & info.asmName & ": NEW"
   when defined(arkhamDumpLocs):
@@ -7176,10 +7222,12 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     block:
       var pc = info.decl; inc pc
       stderr.writeLine "DBG emit proc " & symName(pc)
-  # Two procs make a call their body does not contain: the module init proc runs the
-  # global initializers, and on Windows the entry proc exits through `ExitProcess`.
-  # Either way rsp must be 16-aligned at that call.
+  # Two procs make a call their body does not contain: whichever proc runs the global
+  # initializers (the module init proc, or the entry when there is no init chain), and
+  # on Windows the entry proc, which exits through `ExitProcess`. Either way rsp must
+  # be 16-aligned at that call.
   g.emitProcBody2(info, an.hasCall or g.runsGlobalInits(info) or
+                        g.entryRunsGlobalInits(info) or
                         (info.isEntry and g.prog.windows))
 
 proc genGlobal(g: var CodeGen; nifName: string; decl: Cursor) =
@@ -7295,7 +7343,12 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## `x64Machine`) whichever OS it runs on. Only the two edges where the OS is the
   ## other party differ — the calls out to `importc`'d Windows APIs (Win64 ABI, see
   ## `win64Machine`) and process exit (see `emProcessExit`).
-  var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: x64Machine)
+  ##
+  ## `md` is the ALLOCATED-against machine (`x64MachineA`), so the prologue/epilogue's
+  ## view of the callee-saved pool matches `allocateProc`'s under `-d:arkhamStress`.
+  ## The foreign edge keeps the unshrunk `win64Machine` — that is an ABI, not an
+  ## allocation choice (see `stress.nim`).
+  var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: x64MachineA)
   g.ab.renderReg = x64RegName                 # render register slots as x86 names
   g.prog = collect(buf, inputPath, tags, windows = windows)
   g.callTarget = g.prog.callTarget

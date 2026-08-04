@@ -628,7 +628,8 @@ when defined(arkhamPeakLive):
 proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
                   tvars: HashSet[string] = initHashSet[string]();
                   cleanCallees: HashSet[string] = initHashSet[string]();
-                  procIsClean = false): ProcAnalysis =
+                  procIsClean = false;
+                  entryLeadingClobber = false): ProcAnalysis =
   ## `procDecl` is at a `(proc name params rettype pragmas body)`. `tvars` names
   ## the module's thread-locals so their uses force a call-like analysis. `buf` is the
   ## buffer `procDecl` points into (for cursor → position mapping).
@@ -707,14 +708,17 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
   # (`clobbered`) and aggregate gating on top. Gated on `hasCall` (a leaf proc already
   # keeps its params in the arg registers via allocParams' plain leaf path).
   #
-  # No synthetic call is INJECTED before a body, so the analysed IR is the whole story
-  # about what runs before a param's first use. (The `arkhamGlobalInit` call is APPENDED
-  # to the module init proc's body — a proc with no parameters — see `runsGlobalInits`.)
+  # `entryLeadingClobber` disables ArgResident wholesale: the `arkhamGlobalInit` call is
+  # normally APPENDED into the module init proc's body — a proc with no parameters, see
+  # `runsGlobalInits` — but a module with no init chain runs it from the ENTRY proc, where
+  # it is INJECTED before the body (not in the analysed IR) and clobbers the caller-saved
+  # arg registers before the first body use of argc/argv/envp. So no param may stay in its
+  # incoming register there (see `entryRunsGlobalInits`).
   #
   # (Loop back-edge liveness for `usedAfterCall` is already resolved structurally at each
   # `WhileS` frame — see `LoopFrame` — so a param read only in a loop CONDITION whose body
   # contains a call is correctly flagged here without any post-pass.)
-  if c.res.hasCall and c.procIsClean:
+  if c.res.hasCall and c.procIsClean and not entryLeadingClobber:
     for name, vi in mpairs c.res.vars:
       if vi.freeAfter == high(int) and AddrTaken notin vi.props and
          vi.usages > 0 and not vi.usedAfterCall and not vi.argUnsafe:

@@ -176,8 +176,10 @@ type
                                              ## emit-time STAGING (R11 bridge), NOT a survivor pool
                                              ## reg — same lifecycle/rationale as `lvalStride`.
     hasGlobalInits*: bool                     ## the module has runtime (non-static) global
-                                             ## initializers, emitted as a synthetic init
-                                             ## proc the entry calls (see `buildGlobalInitProc`)
+                                             ## initializers, emitted as a synthetic init proc
+                                             ## the module init proc calls — or the entry, if the
+                                             ## module has no init proc (see `buildGlobalInitProc`,
+                                             ## `runsGlobalInits`, `entryRunsGlobalInits`)
     globalInitSym*: string                    ## the synthetic init proc's asm-NIF symbol
     ovfSigned*: bool                          ## signedness of the most recent `keepovf` op, so
                                              ## the `(ovf)` test that immediately follows it picks
@@ -230,6 +232,15 @@ proc runsGlobalInits*(g: CodeGen; info: ProcInfo): bool {.inline.} =
   ## as function-pointer globals — would jump to address 0.
   g.hasGlobalInits and g.prog.moduleInitName.len > 0 and
     info.asmName == g.prog.moduleInitName
+
+proc entryRunsGlobalInits*(g: CodeGen; info: ProcInfo): bool {.inline.} =
+  ## The fallback for a module with NO init proc: a hand-written Leng module (every
+  ## `tests/arkham` fixture) is a whole program on its own — nimony's init chain is
+  ## what `moduleInitName` names, and there is none here. Its entry proc is then the
+  ## only place the initializers can run, so it calls them itself, right after the
+  ## param moves (see the backends' `emitProcBody2`). Mutually exclusive with
+  ## `runsGlobalInits` by the `moduleInitName` test, so exactly one call is emitted.
+  g.hasGlobalInits and g.prog.moduleInitName.len == 0 and info.isEntry
 
 # ── user-facing diagnostics ─────────────────────────────────────────────────
 # Most of arkham's internal consistency checks are `raiseAssert`s: they can only

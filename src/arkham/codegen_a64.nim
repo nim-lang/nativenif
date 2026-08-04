@@ -24,6 +24,12 @@ import nifcore, nifcdecl
 import slots, machine, analyser, register_allocator, programs
 import asmbuf
 import codegen_common
+import stress
+
+let aarch64MachineA = stressed(aarch64MachineN)
+  ## The machine arkham allocates against: `aarch64MachineN` itself, unless the
+  ## `-d:arkhamStress` shrink is armed (see `stress.nim`). A module-level `let`
+  ## so the environment is read and the pools rebuilt once, not per proc.
 
 const DarwinLibSystem = "/usr/lib/libSystem.B.dylib"
 
@@ -4768,6 +4774,8 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool;
   g.enterScope()
   if g.retIndirect: g.movReg(g.indirectReg, IndirectResultReg)
   g.emitParamMoves(info.decl)
+  if g.entryRunsGlobalInits(info):                # no init chain: the entry runs them
+    g.ab.tree PrepareA64: (g.ab.sym g.globalInitSym; g.ab.keyword CallA64)
   g.retLabel2 = g.freshLabel()
   g.retLabelUsed2 = false
   var c = info.decl
@@ -4838,7 +4846,8 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
     g.cleanSigComputed = true
   let an = analyseProc(g.buf[], info.decl, g.tvarNames,
                        cleanCallees = g.cleanSigProcs,
-                       procIsClean = isCleanSigProc(g.prog, info.decl))
+                       procIsClean = isCleanSigProc(g.prog, info.decl),
+                       entryLeadingClobber = g.entryRunsGlobalInits(info))
   g.varType.clear()
   g.symType.clear()
   g.retAggrName = ""; g.retIndirect = false; g.retIsFloat = false
@@ -4875,13 +4884,13 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   g.pickedRegs = {}
   g.pickedFRegs = {}
   g.emitTmpSpills = 0
-  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, aarch64MachineN, g.typeCtx, preseal)
+  g.ra = allocateProc(g.buf[], info.decl, an, g.prog, aarch64MachineA, g.typeCtx, preseal)
   if g.retIndirect:
     g.indirectReg = R19
     g.ra.usedCallee.incl R19
-  # The entry injects a `call` to the synthetic global-init proc, so it makes a call
-  # even when its own body does not — give it a frame (lr saved) for that call.
-  # fp/lr only when a `bl` exists (or the entry runs global inits). An atomic is an
+  # Whichever proc runs the global initializers makes a call its own body does not
+  # contain, so give it a frame (lr saved) for that call.
+  # fp/lr only when a `bl` exists (or the proc runs global inits). An atomic is an
   # instruction now, not a call, so a CAS loop no longer drags a frame onto an
   # otherwise-leaf hot path (rawDealloc and friends) — that is what `hasCall` says.
   # (The frame itself is finalized INSIDE emitProcBody2, after the body —
@@ -4890,7 +4899,8 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   g.rb.resetProc(); g.aliasToDecl.clear(); g.savedHomes.clear()
   g.noFoldPos = -1
   g.emitProcBody2(info, declarative,
-                  frameHasCall = an.hasCall or g.runsGlobalInits(info))
+                  frameHasCall = an.hasCall or g.runsGlobalInits(info) or
+                                 g.entryRunsGlobalInits(info))
 
 # MODEL: the `StartEmit` per-proc reset in proofs/arkham_bindings.tla. The two-pass seam
 # below must reset every per-proc table (regLocal/boundTemps/freeTmp + the ra.locs snapshot)
@@ -5032,7 +5042,7 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## which `nifasm`'s `linux_arm64` target assembles to a qemu-runnable ELF.
   ## `inputPath` and `tags` let the program model load *other* modules on demand
   ## to resolve cross-module symbols (`Foo.0.othermod`).
-  var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: aarch64MachineN,
+  var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: aarch64MachineA,
                   a64Linux: linux)
   g.prog = collect(buf, inputPath, tags, darwin = not linux)
   g.callTarget = g.prog.callTarget
