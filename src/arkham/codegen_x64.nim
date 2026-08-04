@@ -69,6 +69,7 @@ proc emReg(g: var CodeGen; r: Reg) {.inline.} =
 
 proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg
 proc stagingCensus(g: var CodeGen; avoid: Reg): string
+proc borrowEmergency(g: var CodeGen; what: string; avoid: Reg): Reg
 
 let AddrSlot = AsmSlot(cls: AUInt, size: 8, align: 8)
   ## The binding type for a staging register that holds a raw machine address / word
@@ -77,27 +78,37 @@ let AddrSlot = AsmSlot(cls: AUInt, size: 8, align: 8)
   ## nifasm still tracks the register and rejects a raw reuse; the cast supplies the
   ## element type at the point of the actual load/store.
 
+proc restoreEmergency(g: var CodeGen; r: Reg)
+
 proc giveBack(g: var CodeGen; r: Reg) {.inline.} =
   ## Release a transient register obtained during premat / value evaluation. Its
   ## scratch binding (`bindTemp`) is `(kill)`'d first; then a staging register
   ## (caller-saved, sealed while it held an address/index so a sibling pick couldn't
   ## reuse it) is unsealed. Unbinding/unsealing a reg that carries neither is a
-  ## harmless no-op.
+  ## harmless no-op. Finally, if `r` was an EMERGENCY borrow (`borrowEmergency`),
+  ## its displaced owner's value is reloaded from the borrow slot — this is the
+  ## close of the borrow window, so it must happen last.
   if r == NoReg: return
   g.unbindTemp(r)
   g.ra.unseal {r}
+  g.restoreEmergency(r)
 
-proc pickStagingSealed(g: var CodeGen; what: string; slot: AsmSlot; avoid: Reg = NoReg): Reg =
+proc pickStagingSealed(g: var CodeGen; what: string; slot: AsmSlot; avoid: Reg = NoReg;
+                       stmtPos = false): Reg =
   ## A transient caller-saved staging register, sealed so a nested pick cannot
   ## reuse it until `giveBack` releases it; fails loudly when none is free (the
   ## reserved R11 bridge makes that near-impossible). `avoid` keeps the pick off a
   ## register the caller still needs live (e.g. an accumulator that is not a bound
   ## temp, so `pickStagingScratch`'s own filters would not otherwise exclude it).
-  result = g.pickStagingScratch(avoid)
+  result = if stmtPos and stressEmergency: g.borrowEmergency(what, avoid) else: NoReg
   if result == NoReg:
-    # Report WHY each candidate was unavailable: "out of registers" is otherwise
-    # indistinguishable from "one filter is wrong / a seal was never released",
-    # and those need opposite fixes.
+    result = g.pickStagingScratch(avoid)
+  if result == NoReg and stmtPos:
+    result = g.borrowEmergency(what, avoid)
+  if result == NoReg:
+    # Not "out of registers" any more — `borrowEmergency` covers that. Reaching
+    # here means every candidate is `avoid`, already borrowed, or a live local
+    # home, i.e. a filter is wrong or a seal was never released.
     raiseAssert "arkham x64n: no staging register for " & what &
                 " in proc " & g.curProcName & g.stagingCensus(avoid)
   g.ra.seal result
@@ -309,7 +320,8 @@ proc freshLabel(g: var CodeGen): string =
 
 proc genTypeBody(g: var CodeGen; c: var Cursor)
 proc framePop(g: var CodeGen)
-proc pickStaging(g: var CodeGen; avoid: Reg = NoReg): Reg
+proc pickStaging(g: var CodeGen; what: string; avoid: Reg = NoReg;
+                 stmtPos = false): Reg
 # value-core emitters (defined far below) used by the shared memory-move helpers
 # (`scalarMemMov`/`floatMemMov`) to emit a folded access chain:
 proc prematLval2(g: var CodeGen; c: Cursor; asBase = false; hint = NoReg)
@@ -489,6 +501,7 @@ proc bindTemp(g: var CodeGen; r: Reg; typ: AsmSlot) =
   let isPtr = isNilSlot(typ) or
               (not cursorIsNil(typ.typ) and isPtrType(resolveType(g.prog, typ.typ)))
   g.rb.bindScratch(r, name, isPtr)
+  g.tmpBindTyp[r] = typ                 # `borrowEmergency` must reproduce this rebind
   when defined(arkhamBindTrace): dbgRegSite[ord(r)] = getStackTrace()
 
 proc unbindTemp(g: var CodeGen; r: Reg) =
@@ -889,14 +902,127 @@ proc stagingCensus(g: var CodeGen; avoid: Reg): string =
     elif g.regHoldsHome(r) or g.regHoldsLiveLocal(r): result.add "home"
     else: result.add "FREE (unreachable)"
 
-proc pickStaging(g: var CodeGen; avoid: Reg = NoReg): Reg =
-  ## A transient compute register for a spill (see `pickStagingScratch`).
-  result = g.pickStagingScratch(avoid)
+proc borrowEmergency(g: var CodeGen; what: string; avoid: Reg): Reg =
+  ## LAST RESORT, and the reason the transient staging picks are total: when every
+  ## register is occupied, free one by *spilling its owner to memory* for the
+  ## duration of the borrow. `giveBack` reloads it.
+  ##
+  ## The victim may only be a register holding a plain BOUND TEMP: an anonymous
+  ## value reachable solely through a `Location` its owner captured further up the
+  ## Nim call stack. The borrow window is properly nested inside that owner's step,
+  ## so the owner cannot read the register before we have put the value back.
+  ##
+  ## Everything else is excluded, and each exclusion is load-bearing:
+  ##   * a register homing a *named* local — code emitted inside the window can
+  ##     name that local, and nifasm resolves the name to the very register we are
+  ##     scribbling on;
+  ##   * a SEALED register — the seal means "pinned to a value the step that is
+  ##     currently emitting still needs", i.e. one that IS read inside the window.
+  ##     `genAggrCopyStore` seals its source and destination address registers and
+  ##     then reads them all through `copyAggr`; displacing one there is a silent
+  ##     miscompile (caught by the forced-emergency pass as `baseobj_slice`);
+  ##   * a live accumulator — same argument.
+  ##
+  ## This is what makes the design.md budget argument unnecessary for these
+  ## steps. The demand of a `(mem …)` address chain — and of a right-nested
+  ## spilled expression, which holds its partial in the bridge while evaluating
+  ## the other side — grows with nesting depth, so no fixed reservation of
+  ## registers can cover it. One 8-byte slot per active borrow can, because the
+  ## borrows nest: depth is bounded by the expression, and the slots are minted
+  ## on demand and reused across the body.
+  for r in StagingCandidates.toOpenArray(0, stressLimit(StagingCandidates.len) - 1):
+    if r == avoid or r in g.emergencyHeld: continue
+    if g.regHoldsLiveLocal(r): continue            # named — see above
+    var forcedFree = false
+    if g.ra.isSealed(r) or g.rb.isAccum(r): continue
+    if not g.rb.isBoundTemp(r):
+      # In production an unoccupied candidate is unreachable — `pickStagingScratch`
+      # would have returned it. `ARKHAM_STRESS_EMERGENCY` gets here anyway (it asks
+      # for the borrow first), and displacing a dead value is harmless, so let it
+      # through: that is what puts the save / kill / rebind / restore sequence under
+      # the corpus instead of only under programs too big to be fixtures.
+      if not stressEmergency: continue
+      # The forcing knob must not INVENT a binding on a register that carries a
+      # fixed instruction role: `idiv` clobbers rax/rdx and a variable shift needs
+      # cl, and nifasm rejects those while a binding is live. In production such a
+      # register is a victim only when it is genuinely occupied, which the code
+      # around it already accounts for — so relaxing there would test a state the
+      # emitter can never actually be in.
+      if r == g.md.intRetReg or r == g.md.divRemReg or r == g.md.shiftCountReg:
+        continue
+      forcedFree = true
+    # Reuse the slot minted for this depth; mint one the first time we get here.
+    let depth = g.emergencyBorrows.len
+    if depth >= g.emergencySlots.len:
+      let nm = g.mintSpillName("estage")
+      g.ra.spillTemps.add (name: nm, typ: AsmSlot(cls: AUInt, size: 8, align: 8),
+                           isFloat: false)
+      g.emergencySlots.add nm
+    let slot = g.emergencySlots[depth]
+    # A forced (otherwise-free) victim is given a binding first, so the sequence
+    # below is byte-for-byte the production one — R11 in particular has NO legal
+    # bare `(reg)` form, so "save an unbound register" is not even expressible.
+    if forcedFree and g.rb.boundName(r).len == 0:
+      g.bindTemp(r, AddrSlot)
+    # Save through the victim's own NAME: nifasm rejects a raw `(reg)` operand for
+    # a bound register, and the bridge may never appear as one at all.
+    let vname = g.rb.boundName(r)
+    g.ab.tree MovX64: (g.emStackMem(slot); g.emReg r)    # slot ← victim
+    g.emergencyBorrows.add (r: r, slot: slot, name: vname,
+                            typ: g.tmpBindTyp.getOrDefault(r, AddrSlot),
+                            isPtr: g.rb.isPtrBound(r),
+                            wasTemp: g.rb.isBoundTemp(r))
+    # The name must be KILLED, not merely detached: `(rebind)` refuses to retarget
+    # a register whose binding is still live, so the borrower could not take it.
+    # `restoreEmergency` re-creates the name with the recorded type.
+    let dead = g.rb.takeBinding(r)
+    if dead.len > 0:
+      g.ab.tree KillX64: g.ab.sym dead
+    g.emergencyHeld.incl r
+    return r
+  return NoReg
+
+proc restoreEmergency(g: var CodeGen; r: Reg) =
+  ## Close an emergency borrow window: put the displaced owner's value — and its
+  ## binding — back. Only the innermost borrow can close (the windows nest), so a
+  ## `giveBack` of some other register is a no-op here. Runs AFTER `giveBack`'s
+  ## `unbindTemp`, so the borrower's own name is already killed and `rebind`'s
+  ## kill-the-prior-tenant has nothing left to fight over.
+  let n = g.emergencyBorrows.len
+  if n == 0 or g.emergencyBorrows[n-1].r != r: return
+  let b = g.emergencyBorrows[n-1]
+  g.emergencyBorrows.setLen n-1
+  g.emergencyHeld.excl r
+  # Re-create the binding FIRST, then reload through it — same reason the save
+  # went through `emReg`: once the name exists the raw `(reg)` form is rejected.
+  if b.name.len > 0:
+    g.ab.tree RebindX64:
+      g.ab.symDef b.name
+      g.emBindType(b.typ)
+      g.ab.reg r
+    if b.wasTemp:
+      g.rb.bindScratch(r, b.name, b.isPtr)
+      g.tmpBindTyp[r] = b.typ
+    else:
+      g.rb.bindLocal(r, b.name, b.isPtr)
+  g.ab.tree MovX64: (g.emReg r; g.emStackMem(b.slot))    # victim ← slot
+
+proc pickStaging(g: var CodeGen; what: string; avoid: Reg = NoReg;
+                 stmtPos = false): Reg =
+  ## A transient compute register for a spill (see `pickStagingScratch`). Total:
+  ## when nothing is free, `borrowEmergency` makes something free. Every caller
+  ## of this MUST `giveBack` the result — that is what closes the borrow window.
+  result = if stmtPos and stressEmergency: g.borrowEmergency(what, avoid) else: NoReg
   if result == NoReg:
-    # Same census as `pickStagingSealed`: "genuinely out of registers" and "a
-    # filter is wrong / a seal was never released" need opposite fixes.
-    raiseAssert "arkham x64: no staging register available for a spill in proc " &
-                g.curProcName & g.stagingCensus(avoid)
+    result = g.pickStagingScratch(avoid)
+  if result == NoReg and stmtPos:
+    result = g.borrowEmergency(what, avoid)
+  if result == NoReg:
+    # Not "out of registers" any more — `borrowEmergency` covers that. Reaching
+    # here means every candidate is either `avoid`, already borrowed, or a live
+    # local home, i.e. a filter is wrong or a seal was never released.
+    raiseAssert "arkham x64: no staging register available for " & what &
+                " in proc " & g.curProcName & g.stagingCensus(avoid)
 
 proc regHoldsLiveFLoc(g: var CodeGen; f: FReg): bool =
   ## True if a float local/param currently lives in SIMD register `f` (per the
@@ -1390,7 +1516,7 @@ proc transferAggrWords(g: var CodeGen; varName, typeName: string;
   if loc.kind == InReg:
     baseReg = loc.r                                    # a by-ref aggregate's pointer
   else:
-    addrTmp = g.pickStaging()                          # R11 bridge ← &slot
+    addrTmp = g.pickStaging("an aggregate reg<->slot address")  # R11 bridge ← &slot
     g.bindTemp(addrTmp, AddrSlot)                       # typed+tracked (giveBack unbinds)
     # The source may be a local stack slot OR a module-level global / `const` / tvar
     # (e.g. `return NoNifLineInfo`, a global const aggregate). `locationOfSym` is
@@ -2097,7 +2223,7 @@ proc emitStackParamLoadsX64(g: var CodeGen; decl: Cursor) =
       # word — rather than `regsToStruct`, which needs a held register per word.
       let homeAddr = g.pickStagingSealed("a stack-param aggregate home", AddrSlot)
       g.emStackAddr(homeAddr, nm)
-      let v = g.pickStaging()
+      let v = g.pickStaging("a stack-param aggregate word")
       g.bindTemp(v, AddrSlot)
       for k in 0 ..< pl.words:
         g.ab.tree MovX64:                       # v ← incoming word k
@@ -2809,7 +2935,9 @@ proc produceIntoMem2(g: var CodeGen; c: Cursor; dst: Location) =
   # binds it only when it materializes the value, so a deep right-nested
   # spilled chain reuses the SAME bridge register level-by-level — one
   # always-free bridge keeps produce-into total at ANY depth.
-  let s = g.pickStaging()                # total: the reserved bridge is always pickable
+  # Statement position: nothing is half-emitted here, so `pickStaging` may fall
+  # back to an emergency borrow (which has to inject a save/restore `mov`).
+  let s = g.pickStaging("a produce-into-memory spill", stmtPos = true)
   var d = regLoc(s, dst.typ, isTemp = true)
   g.emitValue2(c, d)
   # `s` carries the produced value into the spill store and MUST be a tracked
@@ -3139,7 +3267,10 @@ proc reloadMemBase2(g: var CodeGen; pos: int) =
   ## the common case and returns immediately — no steal can move it under us anymore.)
   let loc = g.ra.locs[pos]
   if loc.kind notin {NamedStack, Mem}: return
-  let s = g.pickStagingSealed("a memory address base/index", loc.typ)
+  # `prematLval2` calls this at STATEMENT position (its whole job is to emit the
+  # base/index materialization before the consuming instruction), so an
+  # emergency borrow may inject its save/restore here.
+  let s = g.pickStagingSealed("a memory address base/index", loc.typ, stmtPos = true)
   g.emitLoadLoc(loc, s)
   g.savedHomes[pos] = loc
   g.ra.locs[pos] = regLoc(s, loc.typ)
@@ -4172,7 +4303,10 @@ proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
     if rhs.kind == Symbol: g.aggrSrcEnd(symName(rhs), srcAddr)
     else:
       g.emitLvalue2(rhs)                   # pick the src lvalue's embedded values
-      srcAddr = g.pickStagingSealed("an aggregate-copy src address", ScalarSlot)
+      # Statement position throughout `genAggrCopyStore` (it emits the address
+      # materialization and then the word loop), so an emergency borrow is legal.
+      srcAddr = g.pickStagingSealed("an aggregate-copy src address", ScalarSlot,
+                                    stmtPos = true)
       g.aggrAddrInto(rhs, srcAddr, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)
       g.freeLvalTemps2(rhs)
       regEnd(srcAddr)
@@ -4185,7 +4319,8 @@ proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
   if tmp == NoReg:
     tmp = g.pickHeldReg()        # non-demoting callee-saved grab (freed right after)
   if tmp == NoReg:
-    tmp = g.pickStagingSealed("an aggregate-copy transfer register", AddrSlot)
+    tmp = g.pickStagingSealed("an aggregate-copy transfer register", AddrSlot,
+                              stmtPos = true)
   else:
     g.releaseStaleName(tmp)      # drop a dead binding so `(rebind)` is legal
     g.ra.seal tmp
@@ -5491,7 +5626,7 @@ proc emitMemLoad2(g: var CodeGen; c: Cursor; dest: var Location; late = false) =
       g.bindTemp(res.r, ScalarSlot)
     g.prematLval2(c, hint = (if late: NoReg else: res.r))
     if late:
-      res = regLoc(g.pickStaging(), ScalarSlot, isTemp = true)
+      res = regLoc(g.pickStaging("a late array-decay address"), ScalarSlot, isTemp = true)
       g.bindTemp(res.r, ScalarSlot)
     g.ab.tree LeaX64:
       g.emReg res.r
@@ -5504,7 +5639,7 @@ proc emitMemLoad2(g: var CodeGen; c: Cursor; dest: var Location; late = false) =
       g.bindTemp(res.r, bindSlot)                       # bind first: a global base leas &g
     g.prematLval2(c, hint = (if late: NoReg else: res.r))  # into res before the (mem …) tree
     if late:
-      res = regLoc(g.pickStaging(), bindSlot, isTemp = true)
+      res = regLoc(g.pickStaging("a late memory-load address"), bindSlot, isTemp = true)
       g.bindTemp(res.r, bindSlot)
     g.ab.tree MovX64:
       g.emReg res.r
@@ -6157,7 +6292,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
           if aD.kind == InReg:
             srcReg = aD.r
           else:                                    # pool-dry etmp: staged reload
-            srcReg = g.pickStaging()
+            srcReg = g.pickStaging("a spilled call-arg reload")
             g.bindTemp(srcReg, ScalarSlot)
             g.emitLoadLoc(aD, srcReg)
             ownSrc = true
@@ -6184,7 +6319,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
     for ps in pendingSpillArgs:
       # A clobber-exposed arg that had to park in a minted slot: reload through
       # staging and bind now, after every clobbering computation ran.
-      let s = g.pickStaging()
+      let s = g.pickStaging("a parked call-arg reload")
       g.bindTemp(s, ScalarSlot)
       g.emitLoadLoc(ps.slot, s)
       g.ab.tree MovX64:
@@ -7506,6 +7641,11 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.pickedRegs = {}
   g.pickedFRegs = {}
   g.emitTmpSpills = 0
+  # The borrow slots are named off `emitTmpSpills` and declared through this
+  # proc's `ra.spillTemps`, so both the windows and the slot pool are per-proc.
+  g.emergencyBorrows.setLen 0
+  g.emergencyHeld = {}
+  g.emergencySlots.setLen 0
   g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64MachineA, g.typeCtx, preseal)
   when defined(arkhamTracePath):
     stderr.writeLine "[arkham] " & info.asmName & ": NEW"

@@ -128,6 +128,21 @@ type
                                              ## `recordEviction` recover the decl name from the
                                              ## point-in-time binding with no `ra.locs`
                                              ## reverse scan. Populated at the param prologue.
+    tmpBindTyp*: Table[Reg, AsmSlot]         ## the `AsmSlot` each `bindTemp` bound a register
+                                             ## with. `RegBind` keeps only the name and the
+                                             ## pointer bit, but `borrowEmergency` has to
+                                             ## re-emit the victim's `(rebind …)` verbatim.
+    emergencyBorrows*: seq[tuple[r: Reg, slot: string, name: string,
+                                 typ: AsmSlot, isPtr: bool, wasTemp: bool]]
+                                             ## x64 `borrowEmergency`: the open borrow windows,
+                                             ## innermost last. A register is freed under full
+                                             ## pressure by spilling its (anonymous) owner to
+                                             ## `slot`; `giveBack` pops and reloads.
+    emergencyHeld*: set[Reg]                 ## registers with an open borrow window — never
+                                             ## victimized twice.
+    emergencySlots*: seq[string]             ## the borrow slots, indexed by nesting depth and
+                                             ## reused across the body: a proc that borrows at
+                                             ## depth 2 costs two 8-byte slots in total.
     curProcName*: string                     ## the proc currently being emitted. arkham's input
                                              ## carries no line info, so a bare register-pressure
                                              ## or typing assert names nothing actionable; this

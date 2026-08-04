@@ -304,7 +304,7 @@ const
     ## limit. Those are the backend's stated contracts, not findings.
 
 proc arkhamStressTests(arch: string; runner = ""; skip: seq[string] = @[];
-                       known: seq[string]; level: int) =
+                       known: seq[string]; level: int; emergency = false) =
   ## Re-emit + assemble + RUN the corpus with the register file starved to `level`
   ## registers per pool. Uses its own `bin/arkham_stress` binary so the shipped
   ## `bin/arkham` cannot be perturbed by a stray environment variable. `runner`
@@ -314,7 +314,13 @@ proc arkhamStressTests(arch: string; runner = ""; skip: seq[string] = @[];
   let nifasm = ("src" / "nifasm" / "nifasm").addFileExt(ExeExt)
   let workDir = "tests" / "arkham" / "nimcache"
   createDir workDir
-  putEnv("ARKHAM_STRESS", $level)               # inherited by the arkham children
+  # Both knobs are inherited by the arkham children. `level == 0` leaves the
+  # register file alone, which is what the emergency pass wants: starving the
+  # pools leaves FEWER registers occupied and so makes the emergency borrow
+  # LESS reachable, not more.
+  putEnv("ARKHAM_STRESS", if level > 0: $level else: "")
+  if emergency: putEnv("ARKHAM_STRESS_EMERGENCY", "1")
+  else: delEnv("ARKHAM_STRESS_EMERGENCY")
   for file in walkFiles("tests" / "arkham" / "mod_*.c.nif"):
     let name = extractFilename(file)[0 ..< extractFilename(file).len - ".c.nif".len]
     exec quoteShell(arkham) & " -a:" & arch & " -o:" &
@@ -362,8 +368,10 @@ proc arkhamStressTests(arch: string; runner = ""; skip: seq[string] = @[];
     else:
       newFailures.add name & " — " & failed
   delEnv("ARKHAM_STRESS")
+  delEnv("ARKHAM_STRESS_EMERGENCY")
   echo passed, " / ", total - expectedFail, " arkham ", arch,
-       " stress tests successful (k=", level, ", ", expectedFail, " known-broken)"
+       (if emergency: " forced-emergency" else: " stress"),
+       " tests successful (k=", level, ", ", expectedFail, " known-broken)"
   if newFailures.len > 0:
     quit "FAILURE arkham register-pressure stress (" & arch &
          ") found NEW breakage:\n  " & newFailures.join("\n  ")
@@ -600,6 +608,19 @@ when (defined(linux) and defined(amd64)) or (defined(macosx) and defined(arm64))
                              else: arkhamStressKnown),
                     level = (when defined(macosx): arkhamStressA64Level
                              else: arkhamStressLevel))
+
+# Take EVERY x86-64 emergency borrow that is available, on the whole corpus.
+# `borrowEmergency` frees a register by displacing its owner to a frame slot; it
+# fires only when every staging candidate is occupied, which no fixture is big
+# enough to arrange, so without this pass the save/kill/rebind/restore sequence
+# would be exercised by nothing but full compiler builds. Each fixture's own
+# `.exitcode`/`.output` is the oracle: displacing a live value and putting it
+# back is either invisible or a miscompile.
+when defined(linux) and defined(amd64):
+  # No known-broken list: the register file is untouched here (k=0), so every
+  # fixture that passes normally must pass with the borrow forced on too.
+  arkhamStressTests(arch = "x64", skip = arkhamOsxOnly,
+                    known = @[], level = 0, emergency = true)
 
 # The `{.assembler.}` rejections are x86-64-only (see `arkhamRejectionTests`).
 when defined(linux) and defined(amd64):
