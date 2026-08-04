@@ -164,29 +164,19 @@ expression evaluator:
 ## Testing the pool-dry arms
 
 Everything above has a *pool-dry* arm — produce-into-memory, the staging chain,
-survivor parking, `mintSpillName`. The `tests/arkham` corpus never takes any of
-them: its fixtures are small enough that no pool runs out. That is not a
-theoretical gap. The five 2026-07-30 nimsem regressions and the eight 2026-08-03
-self-host fixes were **all green in the corpus** before they were found, every one
-of them by bootstrapping nimony instead.
+survivor parking, `mintSpillName` — and the `tests/arkham` fixtures are too small
+to take any of them. `-d:arkhamStress` reaches that regime without bigger
+fixtures: `ARKHAM_STRESS=k` keeps only the first `k` registers of each allocatable
+pool (`src/arkham/stress.nim`), so the *same* corpus runs against a starved
+register file. The ABI and the reserved emitter bridges (r11/xmm15, x14/x15/v31)
+are not shrunk — they are the guarantee the emitters are written against.
 
-`-d:arkhamStress` reaches that regime without bigger fixtures: `ARKHAM_STRESS=k`
-keeps only the first `k` registers of each allocatable pool (`src/arkham/stress.nim`),
-so the *same* corpus runs against a starved register file. The ABI and the reserved
-emitter bridges (r11/xmm15, x14/x15/v31) are not shrunk — they are the guarantee the
-emitters are written against.
-
-The oracle is each fixture's own `.exitcode`/`.output`, which is the point:
-**fewer registers may cost performance, or hit a documented out-of-registers
-assert, but can never legitimately change what a program computes.** A changed
-answer under this mode is a codegen bug by construction. That is the half a
-totality argument cannot supply — it proves a register is always available, not
-that the value arriving in it is the right one.
-
-`tests/tester` runs one level per backend by default and sweeps with
-`ARKHAM_STRESS_LEVELS=4,3,2`. Known-broken fixtures are listed with the pool size
-at which they break, so a NEW failure — or an old one reaching a *looser* pool — is
-fatal.
+Each fixture's own `.exitcode`/`.output` stays the oracle, which is the point:
+fewer registers may cost performance, or hit a documented out-of-registers assert,
+but can never legitimately change what a program computes. A changed answer is
+therefore a codegen bug by construction — the half a totality argument cannot
+supply, since it proves a register is always available, not that the value
+arriving in it is the right one.
 
 ### Fixed-register roles must be stated, not assumed
 
@@ -203,6 +193,6 @@ The rule this leaves behind: **a register an emitter claims must be excluded whe
 the claim is made, not inferred from a pool it happens not to be in.** The
 exclusion belongs to the *row*, not the opcode class — `atomicRegClaims` names rax
 only for the rows that spin on a `cmpxchg` and r11 only for the rows that need a
-`work` register, and a compare-exchange (which needs no `work`) gets the bridge
-back in exchange. A blanket claim would have been the easy fix and would have made
-three-operand atomics stop compiling under pressure instead.
+`work` register, so a compare-exchange gets the bridge back in exchange for rax.
+A blanket claim would have made three-operand atomics stop compiling under
+pressure instead.

@@ -27,9 +27,9 @@ import codegen_common
 import stress
 
 let aarch64MachineA = stressed(aarch64MachineN)
-  ## The machine arkham actually allocates against: `aarch64MachineN` itself,
-  ## unless the `-d:arkhamStress` shrink is armed (see `stress.nim`). A
-  ## module-level `let` so the environment is read and the pools rebuilt ONCE.
+  ## The machine arkham allocates against: `aarch64MachineN` itself, unless the
+  ## `-d:arkhamStress` shrink is armed (see `stress.nim`). A module-level `let`
+  ## so the environment is read and the pools rebuilt once, not per proc.
 
 const DarwinLibSystem = "/usr/lib/libSystem.B.dylib"
 

@@ -23,9 +23,9 @@ import slots, machinedesc, analyser, register_allocator, programs
 import asmbuf, codegen_common, machine_x64, stress
 
 let x64MachineA = stressed(x64Machine)
-  ## The machine arkham actually allocates against: `x64Machine` itself, unless
-  ## the `-d:arkhamStress` shrink is armed (see `stress.nim`). A module-level
-  ## `let` so the environment is read and the pools rebuilt ONCE, not per proc.
+  ## The machine arkham allocates against: `x64Machine` itself, unless the
+  ## `-d:arkhamStress` shrink is armed (see `stress.nim`). A module-level `let`
+  ## so the environment is read and the pools rebuilt once, not per proc.
 
 const TlsBlockName = "arkham.tls.0"
   ## The static block FS points at (see `emitTlsSetup`); a tvar lives at
@@ -1009,10 +1009,9 @@ proc cmpJccTag(ek: LengExpr; whenTrue, signed: bool): X64Inst =
 # them and the sequence must not assume an ABI. The only registers it takes for
 # itself are `rax` — architecturally required as `cmpxchg`'s comparand — and `r11`,
 # the reserved staging bridge, as the working register; which of the two a given row
-# claims is `atomicRegClaims`. That claim is ENFORCED, by a seal `emitInstr2` holds
+# claims is `atomicRegClaims`. That claim is ENFORCED by a seal `emitInstr2` holds
 # across the operand picks: it used to rest on "the allocator never hands those out",
-# which is true of the pools and FALSE of `takeInstrReg`'s staging fallback, and a
-# compare-exchange whose `desired` landed in rax silently stored the old value back.
+# which is true of the pools and false of `takeInstrReg`'s staging fallback.
 # The `work` register removes every aliasing question among the operands themselves —
 # the caller's `p`, `val` and destination registers may coincide freely, because the
 # sequence reads them and writes only its own.
@@ -2143,10 +2142,9 @@ proc atomicPointee(g: var CodeGen; ptrArg: Cursor): Cursor =
 proc atomicRegClaims(op: IntrinsicOp): set[Reg] =
   ## The registers an atomic row's lowering takes FOR ITSELF, and which therefore
   ## must not host one of its operands (`emitInstr2` seals these across the operand
-  ## picks). The section header calls the claim `rax` + `r11`, but it is per-row —
-  ## and stating it per-row is what keeps the exclusion affordable: a compare-exchange
-  ## has THREE register operands plus a result, so blanket-reserving a register it
-  ## never touches is the difference between compiling and a pool-dry assert.
+  ## picks). Per-row rather than per-class, which is what keeps the exclusion
+  ## affordable: a compare-exchange has three register operands plus a result, so
+  ## reserving a register it never touches would exhaust the pools under pressure.
   ##
   ##  * `rax` — `cmpxchg`'s comparand is architecturally RAX, so every row that spins
   ##    on one owns it: the compare-exchange itself, and the and/or/xor retry loops
@@ -2182,8 +2180,8 @@ proc emitAtomicInstr2(g: var CodeGen; c: Cursor; op: IntrinsicOp;
   # be sitting in `regLocal` under its typed name, which `emReg` would emit instead of
   # the raw tag — a type mismatch against the pointee-typed `(mem …)` operand. Only
   # the claimed ones: a register the row does not touch may legitimately be hosting
-  # one of its own operands (`emitInstr2` sealed the claims and nothing else), and
-  # killing that binding is precisely the corruption this guards against.
+  # one of its own operands, and killing that binding is the corruption this guards
+  # against.
   for r in atomicRegClaims(op): g.releaseStaleName(r)
   let pointee = g.atomicPointee(argCurs[0])
   let p = g.instrOperandReg(argCurs[0])
@@ -5772,10 +5770,9 @@ proc takeInstrReg(g: var CodeGen; slot: AsmSlot): Location =
     g.pickedRegs.incl r
     return regLoc(r, slot, isTemp = true)
   # What this draw must NOT return — the registers the row's own lowering claims —
-  # is expressed as a SEAL held by `emitInstr2` across both the result and the
-  # operand picks (`atomicRegClaims`), not as an `avoid` argument: there can be two
-  # of them, and the seal also covers the nested `pickStaging` calls inside
-  # `emitValue2`, which an `avoid` here would not reach.
+  # is a SEAL held by `emitInstr2` (`atomicRegClaims`) rather than an `avoid`
+  # argument: there can be two of them, and the seal also covers the nested
+  # `pickStaging` calls inside `emitValue2`, which an `avoid` here would not reach.
   let s = g.pickStagingScratch()
   if s == NoReg:
     raiseAssert "arkham x64n: out of registers for an intrinsic operand in proc " &
@@ -5833,16 +5830,10 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
   # staging fallback draws from `StagingCandidates`, and RAX sits second there — so
   # starve the pools and a compare-exchange's `desired` lands in RAX, the
   # `mov rax, *expected` emitted between them destroys it, and the CAS compares the
-  # cell against ITSELF: it reports success and stores the old value back. Silent,
-  # and a shape the corpus cannot reach at full pools. (`emitAtomicInstr2` also opens
-  # by `releaseStaleName`-ing its claims, which KILLS the operand's binding, so the
-  # register is not merely overwritten — the emission loses its name too.) RDX (idiv)
-  # and RCX (shift count) are fixed roles in `MachineDesc`; RAX's atomic role has no
-  # such home, so it is stated here — as a seal rather than an `avoid` argument,
-  # because the nested `pickStaging` calls inside `emitValue2` must honour it too.
-  #
-  # A non-atomic row claims only the R11 bridge, as before; `emitIntrinsicOps` works
-  # entirely out of the `dst`/`src0` it is handed.
+  # cell against ITSELF: it reports success and stores the old value back. RDX
+  # (idiv) and RCX (shift count) are fixed roles in `MachineDesc`; RAX's atomic role
+  # has no such home, so it is stated here. A non-atomic row claims only the R11
+  # bridge, as before.
   let claims = if tgt.op.isAtomic: atomicRegClaims(tgt.op) else: {R11}
   let sealedClaims = claims - g.ra.sealed
   g.ra.seal sealedClaims
