@@ -132,10 +132,26 @@ Two conditions, and both are load-bearing:
   one there is a silent miscompile — which is exactly what `ARKHAM_STRESS_EMERGENCY`
   reported as `baseobj_slice` the first time that site was (wrongly) opted in.
 
-What remains non-total is the step that wants a third register while holding two
-*sealed* addresses — `genAggrCopyStore`'s per-word transfer register. It has no
-eligible victim by construction, so it still asserts under extreme pressure; making it
-total means giving that step a way to release one of its two ends, not a bigger pool.
+### The copy that holds two sealed addresses
+
+`genAggrCopyStore`'s per-word transfer register is the step that wants a third register
+while its own two end addresses are sealed — so the borrow above has no eligible victim
+by construction whenever those ends are all that is left. It escalates:
+`pickStagingScratch` → `pickHeldReg` → `borrowEmergency` → **spilled ends**.
+
+The last arm is the same tiering argument once more. A copy is expensive in registers
+only because it wants both addresses live at once, and *an address parked in a frame
+slot is not live*: `copyAggrSpilledEnds` writes each staged end's address to an 8-byte
+slot and reloads it per word, handing the copy back exactly the registers those
+addresses were occupying — the source's becomes the value register, the destination's
+the reloaded address. Four instructions per word instead of two, which is the right
+trade for a path that is otherwise a compile error.
+
+It needs the SOURCE address to be one we staged (that register is what carries the
+value). A *named-slot* source into a *computed* destination is therefore still not
+total: parking the destination frees one register, and the value and the reloaded
+address cannot share it. That arm needs a second register from somewhere, and by the
+time it is reached there is none.
 
 ## How this deals with the ABI
 

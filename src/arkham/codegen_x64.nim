@@ -3392,6 +3392,53 @@ proc copyAggr(g: var CodeGen; dst, src: AggrEnd; size: int; tmp: Reg) =
     g.ab.tree MovX64: (g.emReg tmp; g.emByteAt(src, off))
     g.ab.tree MovX64: (g.emByteAt(dst, off); g.emReg tmp)
 
+proc copyAggrSpilledEnds(g: var CodeGen; dst, src: AggrEnd; size: int;
+                         dstPtr, srcPtr: string; a, b: Reg) =
+  ## The OUT-OF-REGISTERS arm of `copyAggr`: no transfer register was available,
+  ## so each end whose address sat in a register has been parked in an 8-byte
+  ## frame slot (`srcPtr`/`dstPtr`; "" when that end is already a named `(s)`
+  ## slot and costs nothing) and is RELOADED per word. That hands the copy back
+  ## the very registers those addresses were occupying — `a` carries the value,
+  ## `b` the reloaded destination address.
+  ##
+  ## This is the same tiering argument as `AggrEnd` itself, applied once more: a
+  ## copy is only expensive in registers because it wants both addresses live at
+  ## once, and an address in a frame slot is not live. It costs 4 instructions per
+  ## word instead of 2, which is the correct trade for a path that is otherwise a
+  ## compile error.
+  proc loadValue(g: var CodeGen; e: AggrEnd; ptrSlot: string; a: Reg; word: bool;
+                 off: int) =
+    if ptrSlot.len > 0:
+      g.ab.tree MovX64: (g.emReg a; g.emStackMem(ptrSlot))       # a = src address
+      g.ab.tree MovX64:                                          # a = the datum
+        g.emReg a
+        if word: g.emWordThroughPtr(a, off div 8) else: g.emByteAtImm(a, off)
+    else:
+      g.ab.tree MovX64:
+        g.emReg a
+        if word: g.emWordAtSlot(e.slot, off) else: g.emByteAtSlot(e.slot, off)
+
+  proc storeValue(g: var CodeGen; e: AggrEnd; ptrSlot: string; a, b: Reg;
+                  word: bool; off: int) =
+    if ptrSlot.len > 0:
+      g.ab.tree MovX64: (g.emReg b; g.emStackMem(ptrSlot))       # b = dst address
+      g.ab.tree MovX64:
+        (if word: g.emWordThroughPtr(b, off div 8) else: g.emByteAtImm(b, off))
+        g.emReg a
+    else:
+      g.ab.tree MovX64:
+        (if word: g.emWordAtSlot(e.slot, off) else: g.emByteAtSlot(e.slot, off))
+        g.emReg a
+
+  let words = size div 8
+  for i in 0 ..< words:
+    g.loadValue(src, srcPtr, a, word = true, off = i * 8)
+    g.storeValue(dst, dstPtr, a, b, word = true, off = i * 8)
+  for k in 0 ..< (size - words * 8):
+    let off = words * 8 + k
+    g.loadValue(src, srcPtr, a, word = false, off = off)
+    g.storeValue(dst, dstPtr, a, b, word = false, off = off)
+
 proc copyAggr(g: var CodeGen; dst, src: Reg; size: int; tmp: Reg) {.inline.} =
   ## Both ends are addresses in registers — the historical shape.
   g.copyAggr(regEnd(dst), regEnd(src), size, tmp)
@@ -3966,19 +4013,68 @@ proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
   # back to the pool register `allocAggrCopy` reserved for exactly this (it can demote a
   # local; the emitter cannot). Staging succeeds in the common case, and then the
   # reserved register simply goes unused.
-  var tmp = g.pickStagingScratch()
-  if tmp == NoReg:
+  # Three escalating sources for the per-word transfer register. The last —
+  # `borrowEmergency` — may displace only an UNSEALED bound temp, so it can supply
+  # this step (whose own end addresses are sealed) but cannot supply it when the
+  # ends are ALL that is left; that is what the spilled-ends arm below is for.
+  #
+  # `ARKHAM_STRESS_EMERGENCY` forces the descent: past the cheap picks always, and
+  # past the borrow as well when both ends are staged (the shape the spilled-ends
+  # arm fully supports). Neither arm fires on a fixture otherwise — both want every
+  # register occupied, which only a real compiler build arranges.
+  # The spilled-ends arm needs the SOURCE address to be one we staged: that register
+  # becomes the value register, and a staged destination then supplies the second.
+  let spillable = srcAddr != NoReg
+  var tmp = if stressEmergency and spillable: NoReg else: g.pickStagingScratch()
+  if tmp == NoReg and not (stressEmergency and spillable):
     tmp = g.pickHeldReg()        # non-demoting callee-saved grab (freed right after)
-  if tmp == NoReg:
-    tmp = g.pickStagingSealed("an aggregate-copy transfer register", AddrSlot,
-                              stmtPos = true)
-  else:
+    if tmp == NoReg:
+      tmp = g.borrowEmergency("an aggregate-copy transfer register", NoReg)
+  if tmp != NoReg:
     g.releaseStaleName(tmp)      # drop a dead binding so `(rebind)` is legal
     g.ra.seal tmp
     g.bindTemp(tmp, AddrSlot)
-  g.copyAggr(dstE, srcE, size, tmp)
-  g.giveBack tmp                                                 # unbinds + unseals the bridge
-  g.giveBack srcAddr; g.giveBack dstAddr                         # unbind + unseal (NoReg ⇒ no-op)
+    g.copyAggr(dstE, srcE, size, tmp)
+    g.giveBack tmp                                               # unbinds + unseals the bridge
+    g.giveBack srcAddr; g.giveBack dstAddr                       # unbind + unseal (NoReg ⇒ no-op)
+    return
+
+  # No transfer register anywhere. The emergency borrow cannot help here — it may
+  # only displace an UNSEALED bound temp, and this step's own two end addresses are
+  # exactly the sealed registers it must not touch. So free them the honest way:
+  # park each computed address in a frame slot and reload it per word
+  # (`copyAggrSpilledEnds`). Only an address WE staged may be parked; an end that
+  # is a local's register home (`aggrSrcEnd`/`aggrDstEnd` leave `staged == NoReg`
+  # for a by-ref aggregate's pointer) belongs to the allocator and is stable
+  # anyway, so it simply is not a source of a free register.
+  var srcPtr, dstPtr = ""
+  if srcAddr != NoReg:
+    srcPtr = g.mintSpillName("acpys")
+    g.ra.spillTemps.add (name: srcPtr, typ: AddrSlot, isFloat: false)
+    g.ab.tree MovX64: (g.emStackMem(srcPtr); g.emReg srcAddr)
+  if dstAddr != NoReg:
+    dstPtr = g.mintSpillName("acpyd")
+    g.ra.spillTemps.add (name: dstPtr, typ: AddrSlot, isFloat: false)
+    g.ab.tree MovX64: (g.emStackMem(dstPtr); g.emReg dstAddr)
+  # `a` carries the value, `b` the reloaded destination address (unused when the
+  # destination is a named slot and so costs no register).
+  let a = srcAddr
+  let b = dstAddr
+  if a == NoReg:
+    # A named-slot source into a computed destination: parking the destination
+    # frees ONE register, but the value and the reloaded address cannot share it.
+    # Needs a second register from somewhere, and by here there is none.
+    raiseAssert "arkham x64n: no staging register for an aggregate-copy transfer " &
+                "register (named source, computed destination) in proc " &
+                g.curProcName & g.stagingCensus(NoReg)
+  # Retype the freed address registers as plain 8-byte scratch: `a` now alternates
+  # between an address and the datum, and `copyAggrSpilledEnds` moves bytes through
+  # it as well as words (nifasm's sized mem<->reg move extends/truncates).
+  g.unbindTemp(a); g.bindTemp(a, AddrSlot)
+  if b != NoReg: (g.unbindTemp(b); g.bindTemp(b, AddrSlot))
+  g.copyAggrSpilledEnds(dstE, srcE, size, dstPtr, srcPtr, a, b)
+  g.giveBack a
+  if b != NoReg: g.giveBack b
 
 proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
   ## The general destination-passing store of the value core. An aggregate COPY (symbol /
