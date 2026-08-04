@@ -41,6 +41,7 @@ const
 when StressEnabled:
   import std/[os, strutils]
 
+
   let stressKeep* = block:
     ## `ARKHAM_STRESS=k`: keep at most `k` registers per allocatable pool. Unset /
     ## empty / unparseable / `<= 0` leaves the mode dormant, so a
@@ -56,6 +57,21 @@ else:
 proc stressActive*(): bool {.inline.} =
   when StressEnabled: stressKeep > 0
   else: false
+
+when StressEnabled:
+  let stressEmergency* = getEnv("ARKHAM_STRESS_EMERGENCY").strip.len > 0
+    ## `ARKHAM_STRESS_EMERGENCY=1`: take the x86-64 emitter's EMERGENCY BORROW
+    ## (`borrowEmergency`) whenever one is possible, in preference to a free
+    ## register. Shrinking the register file (`ARKHAM_STRESS=k`) cannot reach that
+    ## arm — it fires only when *every* staging candidate is occupied, and taking
+    ## registers away from the allocator leaves FEWER of them holding anything —
+    ## so without this knob the whole save/restore-through-a-frame-slot path runs
+    ## on nothing but the programs too big to be fixtures. Forcing it turns the
+    ## entire corpus into its test, with each fixture's own `.exitcode`/`.output`
+    ## as the oracle: displacing a live value and putting it back is either
+    ## invisible or a miscompile.
+else:
+  const stressEmergency* = false
 
 when StressEnabled:
   proc keepFirst[T](pool: seq[T]; floorN: int): seq[T] =
