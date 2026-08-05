@@ -185,10 +185,9 @@ const arkhamStressKnown: seq[string] = @[
 const arkhamStressA64Known: seq[string] = @[
   # Both a64 passes take this list — the qemu `linux_arm64` one and the native
   # macOS one — because they drive the same emitters. The first two are SILENT
-  # MISCOMPILES: fewer registers may cost performance or hit a documented
-  # out-of-registers assert, but can never legitimately change what a program
-  # computes, so a wrong answer here is a codegen bug by construction.
-  "steal_straddle",         # trySteal over a straddling live range yields a stale value
+  # Fewer registers may cost performance or hit a documented out-of-registers
+  # assert, but can never legitimately change what a program computes, so a
+  # wrong answer here is a codegen bug by construction.
   "atomic_cas_regpressure", # intrinsic-operand pick has no steal/spill arm
 ]
 

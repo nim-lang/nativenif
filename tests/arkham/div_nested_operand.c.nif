@@ -1,0 +1,8 @@
+(.nif27)
+(stmts
+ (proc :exit.c (params (param :code.0 . (i 32))). (pragmas (importc "exit")) (stmts .))
+ (proc :main.0 (params) (i 32) (pragmas (exportc "main"))
+  (stmts
+   (var :h0.0 . (i 64)80)
+   (var :h1.0 . (i 64)3)
+   (call exit.c (mod (i 64) (add (i 64) (div (i 64)h0.0 8) h1.0)256)))))

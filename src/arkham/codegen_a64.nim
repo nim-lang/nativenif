@@ -3428,7 +3428,12 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
   of Undef, NeedsReg, RegOrImm:
     if lDest.kind == InReg and lDest.isTemp: res = lDest # in-place on the dead lhs temp
     elif rDest.kind == InReg and rDest.isTemp and lDest.kind == InReg and
-         ek notin {ShlC, ShrC}:
+         ek notin {ShlC, ShrC, DivC, ModC}:
+      # Recycling makes the result alias the RHS, and the `aliasRhs` arm then
+      # computes `rhs op lhs` — sound for the commutative ops and for Sub (neg
+      # fixup), but a division has no fixup: `8 div h4` is not `h4 div 8`.
+      # Under a starved pool this recycled every div whose lhs was a register
+      # local — the k-gate's `steal_straddle` silent miscompile.
       res = rDest                                        # recycle the dead rhs temp
     else: res = g.takeTmp(ScalarSlot)
   else: discard
