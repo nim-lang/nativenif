@@ -2831,13 +2831,19 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       elif op.kind == okImm or op.kind == okCsize:
         if op.immVal >= 0 and op.immVal <= 4095:
           arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.immVal))
-        else:
-          # ADD's immediate field is 12 bits; a larger (or negative) constant is
-          # synthesized through the reserved assembler scratch X17. (The former
-          # `<= 0xFFFF` gate silently mis-encoded 4096..65535: the immediate
-          # overflowed into the shift/opcode bits.)
+        elif op.kind == okCsize:
+          # `(csize)` is nifasm's OWN number (the call's outgoing-area size,
+          # known only after layout), so synthesizing an oversized value
+          # through the reserved scratch is the assembler encoding its own
+          # operand — not code generation on the emitter's behalf.
           arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](op.immVal))
           arm64.emitAdd(ctx.buf.data, dest.reg, dest.reg, arm64.X17)
+        else:
+          # ADD's immediate field is 12 unsigned bits. A larger or negative
+          # constant has no such instruction, and the assembler does not
+          # invent one — the code generator must materialize it in a register.
+          error("AArch64 `add` immediate must be 0..4095; the code generator " &
+                "must materialize the constant in a register first", n)
       elif op.kind == okMem:
         error("ADD from memory not supported yet", n)
       else:
@@ -2858,11 +2864,13 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       elif op.kind == okImm or op.kind == okCsize:
         if op.immVal >= 0 and op.immVal <= 4095:
           arm64.emitSubImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.immVal))
-        else:
-          # SUB's immediate field is 12 bits — synthesize larger/negative constants
-          # through X17 (see the ADD case above for the mis-encode this closes).
+        elif op.kind == okCsize:
+          # nifasm's own operand — see the ADD case.
           arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](op.immVal))
           arm64.emitSub(ctx.buf.data, dest.reg, dest.reg, arm64.X17)
+        else:
+          error("AArch64 `sub` immediate must be 0..4095; the code generator " &
+                "must materialize the constant in a register first", n)
       elif op.kind == okMem:
         error("SUB from memory not supported yet", n)
       else:
