@@ -7204,7 +7204,7 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## Compile a parsed Leng module to x86-64 asm-NIF text — Linux/ELF by default, or
   ## Windows/PE when `windows`, which nifasm's `win_x64` target assembles to a static
   ## `.exe` whose imports bind through the import table (each extern's own
-  ## `(dll …)`-named library).
+  ## `(dynlib …)`-named library).
   ##
   ## The two targets share ONE code generator: the image is self-contained, so the
   ## convention on both sides of every arkham-generated call is arkham's own (SysV,
@@ -7229,7 +7229,7 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     if windows:
       # Every `importc` on Windows is a DLL import (there are no raw syscalls to
       # lower to — see `collect`), and every import names its OWN library via
-      # the decl's `(dll …)` pragma; arkham hardcodes no library name. Externs
+      # the decl's `(dynlib …)` pragma; arkham hardcodes no library name. Externs
       # are emitted grouped per dll behind that dll's `(imp …)` — nifasm binds
       # an `(extproc …)` against the last import library seen.
       var dlls: seq[string] = @[]

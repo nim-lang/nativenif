@@ -27,7 +27,7 @@ export intrinsics
 type
   Extern* = object
     asmName*, extName*: string
-    dll*: string             ## the import library the decl's `(dll "…")` pragma names
+    dll*: string             ## the import library the decl's `(dynlib "…")` pragma names
                              ## (normalized to a `.dll` suffix). REQUIRED on Windows —
                              ## there is no implicit kernel32 fallback; empty on the
                              ## Darwin path (libSystem is the platform default there).
@@ -267,14 +267,6 @@ proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
         of ImportcP:
           c.into:
             if c.hasMore: (importcN = strVal(c); inc c)
-        of DllP:
-          # The import library of a static Windows import (hexer forwards a
-          # `dynlib` importc as this). Normalized to the loader's spelling.
-          c.into:
-            if c.hasMore:
-              dllN = strVal(c)
-              if not dllN.contains('.'): dllN.add ".dll"
-              inc c
         of ExportcP:
           c.into:
             if c.hasMore: (exportcN = strVal(c); inc c)
@@ -288,6 +280,22 @@ proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
                             (if pk == InstructionP: icPinned else: icPortable))
               inc c
             while c.hasMore: skip c
+        of NoPragma:
+          # `(dynlib "kernel32")` — the import library of a Windows import; the
+          # Leng spelling of Nim's `dynlib` pragma. NOT part of leng's
+          # `LengPragma` vocabulary yet (hexer still turns a `dynlib` importc
+          # into a runtime loader stub instead of forwarding the pragma), so it
+          # is matched by tag NAME: the tag pool interns unknown tags with ids
+          # beyond the `TagEnum` range and `pragmaKind` reports them `NoPragma`.
+          if c.kind == TagLit and tagName(c.tags, c.cursorTagId) == "dynlib":
+            c.into:
+              if c.hasMore:
+                dllN = strVal(c)      # normalized to the loader's spelling
+                if not dllN.contains('.'): dllN.add ".dll"
+                inc c
+              while c.hasMore: skip c
+          else:
+            skip c
         else: skip c
   else:
     skip c
@@ -629,7 +637,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           let asmN = importcN & ".c." & thisModuleSuffix(result)
           if windows and dllN.len == 0:
             # No implicit import library: a Windows extern must NAME its dll
-            # (a `dynlib: "kernel32"` on the Nim decl → `(dll …)` in Leng).
+            # (a `dynlib: "kernel32"` on the Nim decl → `(dynlib …)` in Leng).
             quit "arkham: the Windows extern `" & importcN &
               "` names no import library; annotate the declaration with " &
               "`dynlib` (e.g. `dynlib: \"kernel32\"`)"
