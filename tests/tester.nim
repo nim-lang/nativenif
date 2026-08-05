@@ -242,6 +242,15 @@ const arkhamStressKnown: seq[string] = @[
   "aggr_arg_parked_byref",
   "aggr_arg_parked_manual",
   "atomic_cas_regpressure", # intrinsic-operand pick has no steal/spill arm
+  # SILENT MISCOMPILE (71 -> 95), and a64 has the same defect (see below).
+  # `produceIntoMem2` hands out the produce bridge for the WHOLE node on the
+  # claim that it is "not held across the recursion". True for a leaf or a load;
+  # false for a binop, whose left partial sits in the bridge while the right
+  # operand is evaluated — and that evaluation re-enters `produceIntoMem2` and
+  # takes the same register. The partial must be parked in an `etmp` slot before
+  # the sibling recursion. The fixture's OWN job (the emitter's staging demand is
+  # two at any address-chain depth) is a codegen-level claim and holds.
+  "addr_chain_depth",
 ]
 
 const arkhamStressA64Known: seq[string] = @[
@@ -253,6 +262,12 @@ const arkhamStressA64Known: seq[string] = @[
   "spill_produce_float",    # float produce-into-spill reads a clobbered register
   "steal_straddle",         # trySteal over a straddling live range yields a stale value
   "atomic_cas_regpressure", # intrinsic-operand pick has no steal/spill arm
+  # NOT listed, but known: `addr_chain_depth` is the x16 twin of the x86-64
+  # `addr_chain_depth` entry above — `produceIntoMem2` re-enters the produce
+  # bridge while an enclosing `emitBin2`'s partial is still live in it — and
+  # silently returns 221 instead of 71 at k<=2 (22 instead of 64 at chain depth
+  # 10). It passes at this list's own k=3, so listing it would only report
+  # "now passes". Lowering `arkhamStressA64Level` needs that fix first.
 ]
 
 const
