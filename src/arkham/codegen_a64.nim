@@ -2979,8 +2979,22 @@ proc emitLeafImm(g: var CodeGen; dest: var Location; natural: Location) =
 proc produceIntoMem2(g: var CodeGen; c: Cursor; dst: Location) =
   ## FUSED totality bridge: `dst` is an `(s)` spill slot (`etmpN.0`, minted when
   ## `takeTmp` found the pools dry). Produce into the reserved produce bridge
-  ## x16 (never allocator-assigned; not held across the recursion, so deep
-  ## chains reuse it level-by-level), then store to the slot.
+  ## x16 (never allocator-assigned), then store to the slot.
+  ##
+  ## x16 is handed to `emitValue2` for the WHOLE node, so it is live for the
+  ## node's entire evaluation — the old claim that it is "not held across the
+  ## recursion, so deep chains reuse it level-by-level" holds only for a leaf and
+  ## for a load. For a COMBINING node it is false: `emitBin2` computes its
+  ## accumulator here and then evaluates the other operand, which re-enters this
+  ## proc and would scribble on the partial. That is a silent miscompile — it
+  ## returned a pointer where a sum was expected (`addr_chain_depth`).
+  ##
+  ## The invariant is therefore "x16 is FREE on entry", and it is the CALLER's to
+  ## keep: a step that would hold its partial here across a sibling recursion must
+  ## not put it here in the first place — see `emitBin2`'s swap suppression. It
+  ## cannot be repaired from this side: handing the nested level a real bridge
+  ## instead just moves the shortage (`takeBridge` then asserts with both x14/x15
+  ## already serving the address the recursion is materializing).
   let s = R16                                             # the produce bridge (IP0)
   var d = regLoc(s, dst.typ, isTemp = true)
   g.emitValue2(c, d)
@@ -3349,9 +3363,17 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
      not g.exprReadsRegE(lhsC, dest.r) and not g.exprReadsRegE(rhsC, dest.r):
     lDest = dest                                         # compute lhs straight into dest
   g.emitValue2(lhsC, lDest)
+  # The lhs partial is LIVE in `lDest` across the rhs evaluation, which recurses
+  # into arbitrary emission — see the x86-64 twin for the failure this prevents.
+  # A bound temp is already excluded from every pick; a fixed destination carries
+  # no binding, so say what it is holding.
+  let lSeal = lDest.kind == InReg and not g.ra.isSealed(lDest.r) and
+              not g.rb.isBoundTemp(lDest.r)
+  if lSeal: g.ra.seal {lDest.r}
   var rDest = dontCare
   if ek == DivC: rDest = needsReg(ScalarSlot)            # sdiv/udiv need a register rhs
   g.emitValue2(rhsC, rDest)
+  if lSeal: g.ra.unseal {lDest.r}                        # the partial is consumed below
   var res = dest
   case dest.kind
   of Undef, NeedsReg, RegOrImm:

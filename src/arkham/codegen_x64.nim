@@ -4827,6 +4827,17 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
      not g.exprReadsRegE(lhsC, dest.r) and not g.exprReadsRegE(rhsC, dest.r):
     lDest = dest                                         # compute lhs straight into dest
   g.emitValue2(lhsC, lDest)
+  # The lhs partial is LIVE in `lDest` across the rhs evaluation, and that
+  # evaluation recurses into arbitrary emission. A bound TEMP is already off
+  # limits to a staging pick (`isBoundTemp`); a FIXED destination is not — the
+  # proc's result register carries no binding at all, so nothing stopped
+  # `pickStagingScratch` handing out the rax holding a half-built `(ret …)`
+  # value, and an address temp of the rhs overwrote it (`addr_chain_depth`).
+  # Seal states what the register is doing; `regFreeForTemp` honours it too, so
+  # the allocator's own pool picks stay off it as well.
+  let lSeal = lDest.kind == InReg and not g.ra.isSealed(lDest.r) and
+              not g.rb.isBoundTemp(lDest.r)
+  if lSeal: g.ra.seal {lDest.r}
   var rDest = dontCare
   if ek in {ShlC, ShrC} and g.md.shiftCountReg != NoReg and
      not isConstShiftCount(rhsC):
@@ -4838,6 +4849,7 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
       raiseAssert "arkham: variable shift while the count register holds a live value"
     rDest = regLoc(g.md.shiftCountReg, ScalarSlot)
   g.emitValue2(rhsC, rDest)                              # rhs → wherever (may stay imm/home)
+  if lSeal: g.ra.unseal {lDest.r}                        # the partial is consumed below
   # ── result placement: keep a fixed dest; else in-place RMW on a dead lhs
   # temp; else recycle the dead rhs temp (aliasRhs); else a fresh temp.
   var res = dest
