@@ -516,6 +516,9 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/kill_use_after_kill.nif", "E
 execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_xmm_raw_bound.nif", "Register XMM8 is bound to variable 'f.0', use the variable name instead")
 # AArch64 register-binding checks (mirror the x64 binding guards above): a second
 # `(var)` on a still-bound x-register, and a raw `(xN)` use of a bound register.
+# `(mov <mem> <imm>)` on AArch64: `str` has no immediate source and nifasm does
+# not invent instructions — materialization is the code generator's job.
+execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_mov_imm_mem.nif", "has no immediate source")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_double_bind.nif", "Register X19 is already bound to variable 'x.0'")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_raw_bound.nif", "Register X19 is bound to variable 'x.0', use the variable name instead")
 # AArch64 SSE/float register binding: a raw `(dN)`/`(sN)` use of a v-register bound to

@@ -2688,14 +2688,16 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       elif op.kind == okMem:
         error("Cannot move memory to memory", n)
       else:
-        # AArch64's `str` has no immediate source, so a constant is materialized in
-        # the scratch first and then stored — the same two instructions the emitter
-        # used to emit by hand. x86-64 is where the direct form saves one; arkham
-        # emits the identical NIF for both and each backend does what it can.
-        var src = op.reg
+        # AArch64's `str` has no immediate source, and the assembler does not
+        # invent one: every `(mov <mem> X)` must name a register source. The
+        # code generator owns materialization — it emits instructions that
+        # exist, and nifasm assembles exactly what is written. (x86-64's
+        # `mov r/m, imm32` is a real instruction, so the direct form is legal
+        # THERE.)
         if op.kind == okImm:
-          arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](op.immVal))
-          src = arm64.X17
+          error("AArch64 `str` has no immediate source; the code generator " &
+                "must materialize the constant in a register first", n)
+        let src = op.reg
         if dest.mem.hasIndex:
           var base = dest.mem.base
           if dest.mem.offset != 0:
