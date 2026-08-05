@@ -1060,6 +1060,20 @@ proc takeHeld(g: var CodeGen; what: string; canSpill = false): Location =
   raiseAssert "arkham x64n: out of registers for " & what &
               " in proc " & g.curProcName & " (nothing to spill)"
 
+proc takeParkLoc(g: var CodeGen; slot: AsmSlot): Location =
+  ## A parking place for a marshalled call argument a LATER argument's fixed
+  ## clobber (`idiv`'s rdx, a shift's cl) would destroy in its ABI register.
+  ## Total, cheapest first: a callee-saved survivor; a bound POOL temp, which
+  ## parks just as safely — the later-argument clobbers are the fixed cl/rdx
+  ## only, and every later pick avoids bound temps; and when both pools are
+  ## dry, a minted spill slot — memory survives everything, and the caller
+  ## reloads at its bind-flush point. Release through `freeVal` (`heldArgs`).
+  let hr = g.pickHeldReg()
+  if hr != NoReg:
+    g.pickedRegs.incl hr
+    return regLoc(hr, slot, isTemp = true)
+  g.takeTmp(slot)
+
 proc freeVal(g: var CodeGen; loc: Location) {.inline.} =
   ## Release a reserved/resolved temp — the emit-time `releaseTmp`: clear the
   ## pick flag and, if a consumer bound it, `(kill)` the binding so the
@@ -5989,7 +6003,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
     # ── Manual-marshalling path (empty signature: float params/results, ≤16B
     # by-value aggregate results). Args go straight into raw ABI registers.
     var sealedArgs: set[Reg] = {}
-    var pendingRestores: seq[tuple[dst, src: Reg]] = @[]
+    var pendingRestores: seq[tuple[dst: Reg; src: Location]] = @[]
     if resultByRef: (g.rb.sealAccum amd.intArgRegs[0]; sealedArgs.incl amd.intArgRegs[0])
     for j in 0 ..< argCurs.len:
       let a = argCurs[j]
@@ -6003,19 +6017,26 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
         if not pl.onStack:
           for k in 0 ..< pl.words:
             if amd.gprAt(pl, k) in laterClob[j+1]: exposed = true
-        var parked: seq[Reg] = @[]
+        var marshalRegs = @(amd.intArgRegs[pl.gpFirst ..< pl.gpFirst + pl.words])
+        var parkSaves: seq[tuple[wordIdx: int; slot: Location]] = @[]
         if exposed:
           for k in 0 ..< pl.words:
-            let h = g.takeHeld("a clobber-exposed aggregate call argument")
+            let h = g.takeParkLoc(ScalarSlot)
             heldArgs.add h
-            parked.add h.r
-        var marshalRegs = @(amd.intArgRegs[pl.gpFirst ..< pl.gpFirst + pl.words])
-        if parked.len > 0:
-          marshalRegs = parked
-          for k in 0 ..< pl.words:
-            g.releaseStaleName(parked[k])
-            pendingRestores.add (dst: amd.gprAt(pl, k), src: parked[k])
-            g.rb.sealAccum parked[k]; sealedArgs.incl parked[k]
+            if h.kind == InReg:
+              marshalRegs[k] = h.r
+              g.releaseStaleName(h.r)
+              # A POOL-temp park carries a marshalled word through r10/r11, and
+              # every value-carrying scratch use must be a typed binding.
+              if h.r in g.md.intTempRegs or h.r == R11: g.bindTemp(h.r, AddrSlot)
+              g.rb.sealAccum h.r; sealedArgs.incl h.r
+            else:
+              # Both pools dry: the word marshals into its natural ABI register
+              # and parks its VALUE in the minted slot right after the marshal
+              # (`parkSaves`); the restore below reloads it once every
+              # clobbering argument has run.
+              parkSaves.add (wordIdx: k, slot: h)
+            pendingRestores.add (dst: amd.gprAt(pl, k), src: h)
         if a.kind == TagLit and a.exprKind in {DotC, DerefC, AtC, PatC}:
           let addrHeld = g.takeHeld("an aggregate-arg address", canSpill = true)
           heldArgs.add addrHeld
@@ -6052,6 +6073,8 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
             if ptrReg != NoReg: g.movReg(marshalRegs[0], ptrReg)
             elif home.len > 0: g.emStackAddr(marshalRegs[0], home)
             else: g.emGlobalAddr(marshalRegs[0], symName(a))
+        for psv in parkSaves:                      # pool-dry park: value → slot, reg is free again
+          g.emitStoreLoc(psv.slot, marshalRegs[psv.wordIdx])
       elif g.isFloatExpr(a):
         var fD = fregLoc(amd.floatArgRegs[pl.fpIndex],
                          AsmSlot(cls: AFloat, size: 8, align: 8))
@@ -6066,7 +6089,8 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
           g.rb.sealAccum amd.gprAt(pl, k); sealedArgs.incl amd.gprAt(pl, k)
     for pr in pendingRestores:                     # parked words → their raw ABI registers
       g.releaseStaleName(pr.dst)
-      g.movReg(pr.dst, pr.src)
+      if pr.src.kind == InReg: g.movReg(pr.dst, pr.src.r)
+      else: g.emitLoadLoc(pr.src, pr.dst)          # slot-parked value reloads directly
     g.ab.tree PrepareX64:
       g.ab.sym tgt.asmName
       if isSyscall: g.emSyscall()
@@ -6085,7 +6109,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
   # ── the unified declarative path: every argument binds via `(arg pN [k])`.
   var sealedArgs: set[Reg] = {}
   var pendingArgBinds: seq[tuple[nameIdx: int, src: Reg, wordIdx: int]] = @[]
-  var pendingSpillArgs: seq[tuple[nameIdx: int, slot: Location]] = @[]
+  var pendingSpillArgs: seq[tuple[nameIdx: int, slot: Location, wordIdx: int]] = @[]
   g.ab.tree PrepareX64:
     g.ab.sym tgt.asmName
     if resultByRef:
@@ -6110,20 +6134,35 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
         if fits:
           for k in 0 ..< gprWords:
             if amd.gprAt(pl, k) in laterClob[j+1]: exposed = true
-        var parked: seq[Reg] = @[]
+        var parked: seq[Location] = @[]
         if exposed:
           for k in 0 ..< gprWords:
-            let h = g.takeHeld("a clobber-exposed aggregate call argument")
+            let h = g.takeParkLoc(ScalarSlot)
             heldArgs.add h
-            parked.add h.r
+            parked.add h
         var dst: seq[Reg] = @[]
+        var parkSaves: seq[tuple[wordIdx: int; slot: Location]] = @[]
         if fits:
+          let aSym = if a.kind == Symbol: symName(a) else: ""
           if parked.len > 0:
-            for r in parked:
-              g.releaseStaleName(r)
-              dst.add r
+            for k in 0 ..< gprWords:
+              if parked[k].kind == InReg:
+                g.releaseStaleName(parked[k].r)
+                # A POOL-temp park carries a marshalled word through r10/r11:
+                # bind it so the scratch checker sees a typed value.
+                if parked[k].r in g.md.intTempRegs or parked[k].r == R11:
+                  g.bindTemp(parked[k].r, AddrSlot)
+                dst.add parked[k].r
+              else:
+                # Both pools dry: marshal through the natural ABI register and
+                # park the VALUE in the minted slot (`parkSaves`); the slot is
+                # bound at the flush point (`pendingSpillArgs`), after every
+                # clobbering argument has run.
+                let r = amd.gprAt(pl, k)
+                g.releaseArgDest(r, aSym)
+                dst.add r
+                parkSaves.add (wordIdx: k, slot: parked[k])
           else:
-            let aSym = if a.kind == Symbol: symName(a) else: ""
             for k in 0 ..< gprWords:
               let r = amd.gprAt(pl, k)
               g.releaseArgDest(r, aSym)
@@ -6188,11 +6227,17 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
             elif isTvar: g.tvarToRegs(symName(a), tn, dst)
             else: g.globalToRegs(symName(a), tn, dst)
         if fits:
+          for psv in parkSaves:                    # pool-dry park: value → slot, reg is free again
+            g.emitStoreLoc(psv.slot, dst[psv.wordIdx])
           if parked.len > 0:
             for k in 0 ..< gprWords:
-              pendingArgBinds.add (nameIdx: nameIdx, src: dst[k],
-                                   wordIdx: (if byRef: -1 else: k))
-              g.rb.sealAccum dst[k]; sealedArgs.incl dst[k]
+              if parked[k].kind == InReg:
+                pendingArgBinds.add (nameIdx: nameIdx, src: dst[k],
+                                     wordIdx: (if byRef: -1 else: k))
+                g.rb.sealAccum dst[k]; sealedArgs.incl dst[k]
+              else:
+                pendingSpillArgs.add (nameIdx: nameIdx, slot: parked[k],
+                                      wordIdx: (if byRef: -1 else: k))
           else:
             for k in 0 ..< gprWords:
               g.ab.tree MovX64:
@@ -6213,20 +6258,11 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
         var aD: Location
         var parkSpilled = false
         if not pl.onStack and amd.gprAt(pl) in laterClob[j+1]:
-          let hr = g.pickHeldReg()
-          if hr != NoReg:
-            g.pickedRegs.incl hr
-            aD = regLoc(hr, ScalarSlot, isTemp = true)
-          else:
-            # No survivor free. A bound POOL temp parks just as safely: the
-            # later-arg clobbers are the FIXED cl/rdx only, and every later
-            # pick avoids bound temps. Both pools dry → produce into a minted
-            # slot and reload at the bind-flush point (memory survives all).
-            aD = g.takeTmp(ScalarSlot)
+          aD = g.takeParkLoc(ScalarSlot)
           heldArgs.add aD
           g.emitValue2(a, aD)
           if aD.kind != InReg:
-            pendingSpillArgs.add (nameIdx: nameIdx, slot: aD)
+            pendingSpillArgs.add (nameIdx: nameIdx, slot: aD, wordIdx: -1)
             parkSpilled = true
         elif not pl.onStack:
           let abiReg = amd.gprAt(pl)
@@ -6266,13 +6302,16 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
         for k in 0 ..< pl.words:
           g.rb.sealAccum amd.gprAt(pl, k); sealedArgs.incl amd.gprAt(pl, k)
     for ps in pendingSpillArgs:
-      # A clobber-exposed arg that had to park in a minted slot: reload through
-      # staging and bind now, after every clobbering computation ran.
+      # A clobber-exposed arg (or aggregate word) that had to park in a minted
+      # slot: reload through staging and bind now, after every clobbering
+      # computation ran.
       let s = g.pickStaging("a parked call-arg reload")
       g.bindTemp(s, ScalarSlot)
       g.emitLoadLoc(ps.slot, s)
       g.ab.tree MovX64:
-        g.ab.tree ArgX: g.ab.sym paramName(ps.nameIdx)
+        g.ab.tree ArgX:
+          g.ab.sym paramName(ps.nameIdx)
+          if ps.wordIdx >= 0: g.ab.intLit ps.wordIdx.int64
         g.emReg s
       g.giveBack s
     for pb in pendingArgBinds:

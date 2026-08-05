@@ -179,11 +179,6 @@ const arkhamStressKnown: seq[string] = @[
   # failure is fatal. Remove an entry with its fix.
   "aggr_copy_regpressure",  # nested-aggregate copy emits a stackoff into a value slot
   "stack_aggr_byref",       # by-ref aggregate base not materialized before the (mem …)
-  # `takeHeld` with the default `canSpill = false` asserts instead of evicting a
-  # live local. 11 of the 15 `takeHeld` sites across both backends do.
-  "aggr_arg_parked",
-  "aggr_arg_parked_byref",
-  "aggr_arg_parked_manual",
   "atomic_cas_regpressure", # intrinsic-operand pick has no steal/spill arm
 ]
 
