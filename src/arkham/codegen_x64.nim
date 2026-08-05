@@ -724,10 +724,22 @@ const StagingCandidates = [R11, RAX, RDI, RSI, RDX, RCX, R8, R9]
   ## Registers `pickStagingScratch` may hand out as a transient compute register for a
   ## spill / mem←mem bridge. R11 is FIRST and is the RESERVED bridge: it is kept out of
   ## the allocator's temp pool (`intTempRegs`), so it is never a live local/temp home —
-  ## always pickable. That guarantees `pickStaging` never fails, which is what makes the
-  ## value-core `produceIntoMem2` total (every spilled value position has a staging reg).
-  ## The ABI caller-saved regs follow as extra staging slots for nested staging (each
-  ## guarded by `liveAccums`/`regHoldsLiveLocal`/`sealed` so a live value is never hit).
+  ## always pickable. The ABI caller-saved regs follow as extra staging slots for nested
+  ## staging (each guarded by `liveAccums`/`regHoldsLiveLocal`/`sealed` so a live value
+  ## is never hit).
+  ##
+  ## MEASURED DEMAND IS **TWO**, and R11 is the only one of these that is GUARANTEED —
+  ## see design.md, "How many registers the emitter actually needs". Every step that
+  ## must hold an ADDRESS in a register while a VALUE passes through another wants two:
+  ## a load through a materialized global base, an `(at …)` stride fold, an aggregate
+  ## copy word between computed ends, a `casejmp` base, an atomic row that claims R11
+  ## as its own `work` register, a chain of spilled pointer loads at ANY depth
+  ## (`tests/arkham/addr_chain_depth`). No step in the corpus wants three.
+  ##
+  ## So the second one is luck — an ABI volatile that happens to be free, or the
+  ## callee-saved backstop below. Closing that gap needs a register taken from the
+  ## allocator, and on x86-64 there is none going spare: R9 was tried and is a live
+  ## PARAMETER home in any proc with six integer parameters.
 
 const FloatStagingBridge = F15
   ## The reserved float staging bridge — kept out of `floatTempRegs` so it is always
@@ -2541,6 +2553,49 @@ proc transparentCastInner(g: var CodeGen; c: Cursor; home: Location): tuple[hit:
   let (srcW, _) = g.srcWidthSigned(innerC)
   if intTypeWidth(tc) >= srcW: result = (true, innerC)
 
+proc lvalHasComputedPart(c: Cursor): bool =
+  ## Does materializing this lvalue's address require EMITTING a value first — a
+  ## deref'd pointer or an index that is a computed expression rather than a
+  ## symbol's home or a literal?
+  ##
+  ## This is the question `emitMemLoad2`'s `late` mode is the answer to: `late`
+  ## keeps the transfer register out of the address recursion (one register per
+  ## nesting level saved), and pays for it with the global-base fusion — the
+  ## `lea &g` that would otherwise land straight in the result register. With no
+  ## recursion to protect, that trade is a pure loss of one register, and a plain
+  ## `(dot <global> f)` load then wants TWO staging registers where one suffices.
+  if c.kind != TagLit: return false
+  case c.exprKind
+  of DotC:
+    var cc = c
+    cc.into:
+      result = lvalHasComputedPart(cc)                # the base
+      while cc.hasMore: skip cc
+  of BaseobjC:
+    var cc = c
+    cc.into:
+      skip cc; skip cc                                # base type, depth
+      result = lvalHasComputedPart(cc)                # the inner lvalue
+      while cc.hasMore: skip cc
+  of DerefC:
+    var cc = c
+    cc.into:
+      result = cc.kind == TagLit                      # a computed pointer
+      while cc.hasMore: skip cc
+  of AtC:
+    var cc = c
+    cc.into:
+      result = lvalHasComputedPart(cc); skip cc       # the base
+      if not result and cc.kind == TagLit: result = true   # a computed index
+      while cc.hasMore: skip cc
+  of PatC:
+    var cc = c
+    cc.into:
+      result = cc.kind == TagLit; skip cc             # a computed pointer
+      if not result and cc.kind == TagLit: result = true   # a computed index
+      while cc.hasMore: skip cc
+  else: result = true                                 # a constructor base: it emits
+
 proc produceIntoMem2(g: var CodeGen; c: Cursor; dst: Location) =
   ## Totality bridge of the FUSED core: `dst` is an `(s)` spill slot (`etmpN.0`,
   ## minted when `takeTmp` found the pools dry). Materialize the value into a
@@ -2556,12 +2611,19 @@ proc produceIntoMem2(g: var CodeGen; c: Cursor; dst: Location) =
       return
   when defined(arkhamDbgSpill):
     stderr.writeLine "DBG produceIntoMem2 slot=" & dst.name
-  if c.kind == TagLit and c.exprKind in {DerefC, DotC, AtC, PatC}:
-    # A LOAD into the slot: the address must be materialized before any transfer
-    # register is needed, and the address registers die with the `(mem …)` tree.
-    # Taking the transfer register up front (below) would hold it across that
-    # materialization — one register per level of a spilled address chain, which
-    # overruns the r10/r11 budget at depth 3. See `emitMemLoad2`'s `late`.
+  if c.kind == TagLit and c.exprKind in {DerefC, DotC, AtC, PatC} and
+     lvalHasComputedPart(c):
+    # A LOAD into the slot whose ADDRESS is itself computed: the address must be
+    # materialized before any transfer register is needed, and the address
+    # registers die with the `(mem …)` tree. Taking the transfer register up
+    # front (below) would hold it across that materialization — one register per
+    # level of a spilled address chain, which overruns the r10/r11 budget at
+    # depth 3. See `emitMemLoad2`'s `late`.
+    #
+    # An address with NO computed part takes the path below instead: there is no
+    # recursion for `late` to protect, and the staging register taken up front is
+    # the one a global base leas into (`globBase`), so the load costs ONE
+    # register rather than two.
     var d = needsReg(dst.typ)
     g.emitMemLoad2(c, d, late = true)
     g.emitStoreLoc(dst, d.r)
@@ -4765,6 +4827,17 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
      not g.exprReadsRegE(lhsC, dest.r) and not g.exprReadsRegE(rhsC, dest.r):
     lDest = dest                                         # compute lhs straight into dest
   g.emitValue2(lhsC, lDest)
+  # The lhs partial is LIVE in `lDest` across the rhs evaluation, and that
+  # evaluation recurses into arbitrary emission. A bound TEMP is already off
+  # limits to a staging pick (`isBoundTemp`); a FIXED destination is not — the
+  # proc's result register carries no binding at all, so nothing stopped
+  # `pickStagingScratch` handing out the rax holding a half-built `(ret …)`
+  # value, and an address temp of the rhs overwrote it (`addr_chain_depth`).
+  # Seal states what the register is doing; `regFreeForTemp` honours it too, so
+  # the allocator's own pool picks stay off it as well.
+  let lSeal = lDest.kind == InReg and not g.ra.isSealed(lDest.r) and
+              not g.rb.isBoundTemp(lDest.r)
+  if lSeal: g.ra.seal {lDest.r}
   var rDest = dontCare
   if ek in {ShlC, ShrC} and g.md.shiftCountReg != NoReg and
      not isConstShiftCount(rhsC):
@@ -4776,6 +4849,7 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
       raiseAssert "arkham: variable shift while the count register holds a live value"
     rDest = regLoc(g.md.shiftCountReg, ScalarSlot)
   g.emitValue2(rhsC, rDest)                              # rhs → wherever (may stay imm/home)
+  if lSeal: g.ra.unseal {lDest.r}                        # the partial is consumed below
   # ── result placement: keep a fixed dest; else in-place RMW on a dead lhs
   # temp; else recycle the dead rhs temp (aliasRhs); else a fresh temp.
   var res = dest
