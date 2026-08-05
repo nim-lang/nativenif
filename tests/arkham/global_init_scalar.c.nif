@@ -1,5 +1,4 @@
 (.nif27)
-(.indexat 294              )
 (stmts
  (proc :exit.c
   (params
@@ -9,13 +8,19 @@
    (importc "exit"))
   (stmts .))
  (gvar :g.0 .
-  (i 64)
-  (add
-   (i 64)40 2))
+  (i 64).)
+ (proc :`ini.0.
+  (params).
+  (pragmas)
+  (stmts
+   (asgn g.0
+    (add
+     (i 64)40 2))))
  (proc :main.0
   (params)
   (i 32)
   (pragmas
    (exportc "main"))
   (stmts
-   (call exit.c g.0))))(.index)
+   (call `ini.0.)
+   (call exit.c g.0))))

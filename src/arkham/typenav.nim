@@ -53,7 +53,14 @@ proc lookupSym*(tc: TypeCtx; nm: string): SymInfo =
   if found:
     case d.stmtKind
     of ProcS: return SymInfo(cat: scProc, asmName: nm)   # foreign proc: its fully-qualified NIF name
-    of TvarS: return SymInfo(cat: scTvar, decl: d)
+    of TvarS:
+      # A FOREIGN thread-local must be classified exactly as its OWNING module
+      # classified its own — and on Windows `collect` demotes every thread-local to
+      # an ordinary global, so that module emitted a `(gvar …)` for it. Reading it
+      # back as a thread-local here would address it through an FS block the target
+      # does not have, against a symbol nifasm knows as a global.
+      if tc.prog[].windows: return SymInfo(cat: scGlobal, decl: d)
+      return SymInfo(cat: scTvar, decl: d)
     else: return SymInfo(cat: scGlobal, decl: d)
 
 proc isIndirectCallTarget*(tc: TypeCtx; targetCur: Cursor): bool =

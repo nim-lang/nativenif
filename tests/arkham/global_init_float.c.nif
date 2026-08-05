@@ -1,10 +1,7 @@
 (.nif27)
-(.indexat 550              )
 (stmts
  (gvar :g.0 .
-  (f 64)
-  (add
-   (f 64)40.0 1.0))
+  (f 64).)
  (proc :exit.c
   (params
    (param :code.0 .
@@ -23,12 +20,20 @@
     (add
      (f 64)
      (deref p.0)1.0))))
+ (proc :`ini.0.
+  (params).
+  (pragmas)
+  (stmts
+   (asgn g.0
+    (add
+     (f 64)40.0 1.0))))
  (proc :main.0
   (params)
   (i 32)
   (pragmas
    (exportc "main"))
   (stmts
+   (call `ini.0.)
    (var :s.0 .
     (f 64)
     (call addp.0
@@ -37,4 +42,4 @@
     (i 64)
     (conv
      (i 64)s.0))
-   (call exit.c r.0))))(.index)
+   (call exit.c r.0))))

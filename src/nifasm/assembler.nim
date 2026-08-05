@@ -7,6 +7,24 @@ import buffers, relocs, x86, arm64, elf, macho, pe
 import sem, slots
 import decls
 
+const
+  WindowsKernelDll = "kernel32.dll"
+    ## The implicit import library of a Windows image — the one arkham binds against.
+
+  WinShadowSpace = 32
+    ## Win64 makes the CALLER reserve 32 bytes at the bottom of the outgoing argument
+    ## area that the callee may spill its four register arguments into, whether or not
+    ## it has four parameters. So a call's stack arguments start at `[rsp+32]`, not
+    ## `[rsp+0]`, and even a no-stack-argument call occupies 32 bytes of frame.
+    ##
+    ## Reserved for EVERY call in a `win_x64` image, not only the ones that leave it.
+    ## arkham's own procs never touch the area (their convention is SysV-shaped —
+    ## see arkham's `generateX64`), so those 32 bytes are pure frame waste there; but
+    ## a call THROUGH a function pointer cannot be told apart from an internal one at
+    ## this level — `winlean` reaches every one of its `dynlib` imports that way — and
+    ## reserving uniformly is what makes the layout agree on both sides regardless.
+    ## Mirrored in arkham's `machine_x64.WinShadowSpace`.
+
 proc createAsmTagPool(): TagPool =
   ## A `nifcore` tag pool seeded so each asm-NIF tag's `TagId` equals its
   ## `TagEnum` ordinal — the same scheme arkham uses (`nifcdecl.createLengTagPool`).
@@ -348,7 +366,13 @@ type
     extProcIdx: int             # Index into extProcs for external calls
     argsSet: HashSet[SymId]    # Arguments assigned (keyed by `Param.name`, an interned id)
     resultsSet: HashSet[SymId] # Results bound (keyed by `Param.name`, an interned id)
-    stackArgSize: int           # Computed size of stack arguments (csize)
+    stackArgSize: int           # Computed size of stack arguments (csize), INCLUDING
+                                # `stackArgBase` — it is what the frame must reserve
+    stackArgBase: int           # Byte offset of the FIRST stack argument within the
+                                # outgoing area: 0 normally, `WinShadowSpace` for a
+                                # Win64 `extproc` call. Added to every `(arg pN)`
+                                # offset, so caller and callee agree on where the
+                                # 5th+ argument lives
     indirect: bool              # Target is a function-pointer variable: `typ` is its
                                 # proctype signature and `(call)` is an indirect call
                                 # through the loaded pointer (vs a direct `call rel32`)
@@ -456,6 +480,10 @@ type
     tlsBlockSym: Symbol          # the synthetic `arkham.tls.0` gvar (FS base block)
     entrySym: Symbol             # the entry proc (`_start`/`main.0`) — prologue jumps here
     tlsEntryOffset: int          # .text offset of the synthesized FS-setup prologue, or -1
+    winEntryOffset: int          # .text offset of the synthesized PE entry stub, or -1
+                                 # (see setupWinEntry — the Windows counterpart of the
+                                 # FS-setup prologue: it supplies `main`'s arguments,
+                                 # which the OS does not put anywhere it can find them)
     # A gvar with a compile-time constant scalar initializer is laid out as static
     # data: arkham emits its bits as the gvar value, and these are written into the
     # (writable) `.bss` image on disk so the slot starts with that value (correct in
@@ -598,6 +626,7 @@ proc parsePtrType(kind: TypeKind; n: var Cursor; scope: Scope; ctx: var GenConte
 proc parseParams(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param]
 proc parseResult(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param]
 proc parseClobbers(n: var Cursor): set[x86.Register]
+proc parseExtprocSig(n: var Cursor; scope: Scope; ctx: var GenContext): Type
 proc parseUnionBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type
 proc genStmt(n: var Cursor; ctx: var GenContext)
 proc genInstA64(n: var Cursor; ctx: var GenContext)
@@ -814,15 +843,19 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
     discard getSymDef(c)
     if c.kind != StrLit: return nil
     let extName = getStr(c)
+    inc c
+    let typ = parseExtprocSig(c, scope, ctx)     # the Windows form carries a signature
     if ctx.imports.len == 0:
       # No main-module `(imp …)` was seen (the main module had no externs itself);
-      # the extern must still bind against libSystem, so import it implicitly —
-      # the same default arkham uses for its Darwin extern decls.
-      ctx.imports.add ImportedLib(name: "/usr/lib/libSystem.B.dylib", ordinal: 1)
+      # the extern must still bind against the platform's base library, so import it
+      # implicitly — the same default the backends use for their own extern decls.
+      ctx.imports.add ImportedLib(
+        name: (if ctx.arch in {Arch.WinX64, Arch.WinA64}: WindowsKernelDll
+               else: "/usr/lib/libSystem.B.dylib"), ordinal: 1)
     let libOrdinal = ctx.imports[^1].ordinal
     let gotSlot = ctx.gotSlotCount
     ctx.gotSlotCount += 1
-    result = Symbol(name: ctx.symIdOf(fullName), kind: skExtProc, extName: extName,
+    result = Symbol(name: ctx.symIdOf(fullName), kind: skExtProc, typ: typ, extName: extName,
                     libName: "", gotSlot: gotSlot, isForeign: true, moduleName: modname)
     ctx.rootScope.define(result)
     ctx.extProcs.add ExtProcInfo(name: fullName, extName: extName, libOrdinal: libOrdinal,
@@ -1178,6 +1211,27 @@ proc pass1Proc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: str
                    moduleName: moduleName, declStart: declStart)
   scope.define(sym)
 
+proc parseExtprocSig(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
+  ## The OPTIONAL `(params …)(result …)(clobber …)` tail of an `(extproc :name "ext" …)`,
+  ## advancing `n` past it. `nil` when the decl carries none.
+  ##
+  ## A signature turns the extern into an ordinary declarative call target: the call site
+  ## binds `(arg pN)`/`(res ret.0)` and is type-checked against it, and the frame pre-scan
+  ## can size the call's outgoing stack-argument area — neither of which a bare extern
+  ## permits, because there is nothing to check against and no way to know how many
+  ## arguments spill. The Windows backend declares one for every import (`emitWinExtproc`);
+  ## the Darwin one declares none and marshals into raw ABI registers at the call site,
+  ## which is why both forms have to keep working.
+  let sig = takeSig(n)
+  if not (sig.hasParams or sig.hasResult or sig.hasClobber): return nil
+  result = Type(kind: ProcT, params: @[], results: @[], clobbers: {})
+  if sig.hasParams:
+    var p = sig.params; result.params = parseParams(p, scope, ctx)
+  if sig.hasResult:
+    var r = sig.res; result.results = parseResult(r, scope, ctx)
+  if sig.hasClobber:
+    var cl = sig.clobber; result.clobbers = parseClobbers(cl)
+
 proc pass1Syproc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string; declStart: int) =
   # (syproc :Name (params ...) (result ...) (clobber ...) NR) — a Linux syscall with a
   # full proctype: params bound to the syscall ABI registers (so an `(arg pN)` binding
@@ -1317,7 +1371,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
           if not found:
             ctx.imports.add ImportedLib(name: libPath, ordinal: ctx.imports.len + 1)
         of ExtprocD:
-          # (extproc :name "external_name")
+          # (extproc :name "external_name" (params …)? (result …)? (clobber …)?)
           inc n
           if n.kind != SymbolDef: error("Expected extproc name", n)
           let name = symName(n)
@@ -1325,6 +1379,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
           if n.kind != StrLit: error("Expected external symbol name string", n)
           let extName = getStr(n)
           inc n
+          let typ = parseExtprocSig(n, scope, ctx)
           # Find the library (use last imported library, or default to libSystem)
           var libOrdinal = 1
           if ctx.imports.len > 0:
@@ -1333,7 +1388,7 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
           let gotSlot = ctx.gotSlotCount
           ctx.gotSlotCount += 1
           # Create symbol
-          let sym = Symbol(name: ctx.symIdOf(name), kind: skExtProc, extName: extName, libName: "", gotSlot: gotSlot)
+          let sym = Symbol(name: ctx.symIdOf(name), kind: skExtProc, typ: typ, extName: extName, libName: "", gotSlot: gotSlot)
           scope.define(sym)
           # Track for code generation
           ctx.extProcs.add ExtProcInfo(name: name, extName: extName, libOrdinal: libOrdinal, gotSlot: gotSlot, stubOffset: -1)
@@ -1815,7 +1870,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
         # The base offset is the running byte position among the stack-passed
         # params; the optional word index `k` selects the k-th eightbyte (8 bytes)
         # of a multi-word stack aggregate so it can be marshalled/read word-by-word.
-        var offset = 0
+        var offset = ctx.callContext.stackArgBase   # Win64 extern: above the shadow space
         for p in ctx.callContext.typ.params:
           if p.typ.isOnStack:
             if p.name == argName:
@@ -2045,8 +2100,15 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
   let name = getSym(hdr)
   let sym = lookupWithAutoImport(ctx, ctx.scope, name, hdr)
 
-  if ctx.callContext.state != CallContextState.Disabled:
-    error("Nested prepare blocks are not allowed", hdr)
+  let outerCall = ctx.callContext            # restored at the end — see genPrepareX64
+  # `> stackArgBase`, not `> 0`: the base is Win64 shadow space, which the CALLEE
+  # writes after the call, so two nested calls never contend for it. Genuine stack
+  # ARGUMENTS are the conflict — the outer call has already placed some in the one
+  # outgoing area the inner call is about to reuse.
+  if outerCall.state != CallContextState.Disabled and
+     outerCall.stackArgSize > outerCall.stackArgBase:
+    error("Nested prepare blocks are not allowed when the outer call passes arguments " &
+          "on the stack: both would write the one outgoing argument area", hdr)
   ctx.callContext = CallContext(
     state: CallContextState.NormalCall,
     target: name,
@@ -2119,7 +2181,13 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
     if not ctx.callContext.callEmitted:
       error("Missing (extcall) in prepare block", hdr)
 
-  ctx.callContext.state = CallContextState.Disabled
+  # Resume the enclosing call, if this prepare was nested inside one. arkham emits that
+  # for an argument that is itself a call — `f(g(x))`, which hexer leaves unflattened in
+  # a global's initializer expression. The inner call completes (its result lands in the
+  # return register) before any of the outer call's `(arg …)` bindings that follow it.
+  ctx.callContext = outerCall
+  if outerCall.state == CallContextState.Disabled:
+    ctx.callContext.state = CallContextState.Disabled
 
 const A64CallClobbers = {arm64.X0 .. arm64.X15}
   ## The caller-saved GPRs a call destroys (AAPCS64; x16/x17 are assembler veneers
@@ -3530,11 +3598,17 @@ proc scanStackArgArea(n: var Cursor; ctx: var GenContext; scope: Scope; acc: var
   ## guards against an under-reservation at emit time.
   if n.kind == TagLit:
     if n.tag == PrepareTagId:
+      # A Win64 call owns the 32-byte shadow space at the bottom of the area whatever
+      # its signature says — reserved even for a call with no stack argument at all,
+      # and even for one whose target does not resolve here. Must match
+      # `genPrepareX64`'s `stackArgBase`, which is what it checks against.
+      let base = if ctx.arch == Arch.WinX64: WinShadowSpace else: 0
+      acc = max(acc, base)
       var t = n; inc t                           # the call target symbol
       if t.kind == Symbol:
         let s = lookupWithAutoImport(ctx, scope, getSym(t), t)
         if s != nil and s.typ != nil and s.typ.kind == ProcT:
-          acc = max(acc, computeStackArgSize(s.typ))
+          acc = max(acc, base + computeStackArgSize(s.typ))
     loopInto n:
       scanStackArgArea(n, ctx, scope, acc)
   else:
@@ -3579,12 +3653,16 @@ proc frameSizeFor(ctx: GenContext; peak, pushBytes: int; isA64: bool): int =
   ## emitted a separate `sub rsp, 8` ahead of this one. But which registers get pushed,
   ## how big the frame is and whether SP ends up aligned are all facts about the stack —
   ## nifasm's stack — so the correction belongs here, folded into the same instruction.
-  ## SysV enters an ordinary callee with the return address pushed (SP ≡ 8 mod 16) and
-  ## the process entry with SP ≡ 0; each saved register is another 8. AArch64 needs no
-  ## correction: it saves in 16-byte `stp` pairs and the frame is already 16-aligned.
+  ## An ordinary callee is entered with the return address pushed (SP ≡ 8 mod 16);
+  ## each saved register is another 8. The LINUX process entry is the one exception:
+  ## the kernel jumps to it with SP ≡ 0 and no return address. The Windows entry is
+  ## not — ntdll's thread-start thunk `call`s the PE entry point and the synthesized
+  ## stub (`setupWinEntry`) only `jmp`s from there, so `main.0` is biased like any
+  ## other callee. AArch64 needs no correction: it saves in 16-byte `stp` pairs and
+  ## the frame is already 16-aligned.
   result = (peak + 15) and not 15
   if not isA64 and ctx.procHasCall:
-    let entryBias = if ctx.procIsEntry: 0 else: 8
+    let entryBias = if ctx.procIsEntry and ctx.arch != Arch.WinX64: 0 else: 8
     if (entryBias + pushBytes + result) mod 16 != 0: result += 8
 
 proc finalizeFrameSites(ctx: var GenContext; peak: int) =
@@ -3684,7 +3762,11 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
     # at the first stack arg, so incoming stack params are addressed SP-relative
     # from offset 0 (valid before the callee shifts SP).
     let isA64Proc = ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64}
-    var paramOffset = if isA64Proc: 0 else: 16
+    # …and on Win64 the caller's stack arguments start above the shadow space it also
+    # reserved, so the callee's view of them shifts by the same amount.
+    var paramOffset = if isA64Proc: 0
+                      elif ctx.arch == Arch.WinX64: 16 + WinShadowSpace
+                      else: 16
     for param in sym.typ.params:
       if param.typ.isOnStack:
         # param.typ is already StackOffT
@@ -4114,6 +4196,15 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
               error("(arg ...) in mem must denote a stack argument", n)
             displacement = int32(argOff.immVal)
             if argName != SymId(0): ctx.callContext.argsSet.incl argName
+            # The slot IS the parameter, so it carries the parameter's declared type —
+            # not the machine word a bare `(rsp)` base would otherwise imply. Without
+            # this, storing e.g. a `nil` into a stack-passed `pointer` parameter is a
+            # type error against a phantom `(i 64)`. An AGGREGATE keeps the word type:
+            # `(arg pN k)` addresses one eightbyte of it, not the whole object.
+            if argOff.typ != nil:
+              let pt = if argOff.typ.kind == StackOffT: argOff.typ.offType else: argOff.typ
+              if pt != nil and pt.kind notin {TypeKind.ObjectT, TypeKind.ArrayT, TypeKind.UnionT}:
+                stackVarType = pt
           elif n.hasMore and (n.kind == IntLit or n.kind == Symbol):
             if n.kind == IntLit:
               displacement = int32(getInt(n))
@@ -4225,7 +4316,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
         # index `k` selects the k-th eightbyte of a multi-word stack aggregate (each
         # word is 8 bytes), so a by-value struct that spilled to the stack can be
         # marshalled/read one word at a time the same way a register-passed one is.
-        var offset = 0
+        var offset = ctx.callContext.stackArgBase   # Win64 extern: above the shadow space
         for p in ctx.callContext.typ.params:
           if p.typ.isOnStack:
             if p.name == argName:
@@ -4574,12 +4665,30 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
   let name = getSym(hdr)
   let sym = lookupWithAutoImport(ctx, ctx.scope, name, hdr)
 
+  # A prepare block may NEST inside another: arkham emits that for an argument that is
+  # itself a call — `f(g(x))`, which hexer leaves unflattened in a global's initializer
+  # expression. The inner call is complete before the outer one's following `(arg …)`
+  # bindings, so the enclosing context just has to survive it; save it and restore at
+  # the end. The one shape that cannot work is an outer call with STACK arguments: both
+  # calls write the single outgoing argument area the frame reserves, so the inner one
+  # would overwrite what the outer already put there.
+  let outerCall = ctx.callContext
+  # `> stackArgBase`, not `> 0`: the base is Win64 shadow space, which the CALLEE
+  # writes after the call, so two nested calls never contend for it. Genuine stack
+  # ARGUMENTS are the conflict — the outer call has already placed some in the one
+  # outgoing area the inner call is about to reuse.
+  if outerCall.state != CallContextState.Disabled and
+     outerCall.stackArgSize > outerCall.stackArgBase:
+    error("Nested prepare blocks are not allowed when the outer call passes arguments " &
+          "on the stack: both would write the one outgoing argument area", hdr)
+
   ctx.callContext = CallContext(
     state: CallContextState.NormalCall,
     target: name,
     argsSet: initHashSet[SymId](),
     resultsSet: initHashSet[SymId](),
-    callEmitted: false
+    callEmitted: false,
+    stackArgBase: (if ctx.arch == Arch.WinX64: WinShadowSpace else: 0)
   )
 
   if sym == nil:
@@ -4607,20 +4716,28 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
     ctx.callContext.state = CallContextState.NormalCall
     ctx.callContext.indirect = true
   elif sym.kind == skExtProc:
-    # External proc - find its info
+    # A dynamic import: the invocation is an indirect `(extcall)` through the IAT/GOT
+    # slot rather than a `call rel32`. If the decl carried a signature (the Windows
+    # form — see `parseExtprocSig`) it is checked and laid out exactly like any other
+    # call; a bare Darwin extern has no signature to check against, so its call site
+    # marshals into raw ABI registers and only the marker is verified below.
     ctx.callContext.state = CallContextState.ExternalCall
+    ctx.callContext.typ = sym.typ
     for i, ext in ctx.extProcs:
       if ext.name == name:
         ctx.callContext.extProcIdx = i
         break
-    # External procs don't have full signatures in current design
-    # For now, we skip argument checking for external procs
   else:
     error("Expected proc symbol, got " & $sym.kind, hdr)
 
-  # Compute stack argument size (only for internal procs)
-  if ctx.callContext.state == CallContextState.NormalCall:
-    ctx.callContext.stackArgSize = computeStackArgSize(ctx.callContext.typ)
+  # Whether the call is checked against a signature — every internal call, plus an
+  # extern whose decl declared one.
+  let typed = ctx.callContext.typ != nil
+
+  # Compute stack argument size
+  if typed:
+    ctx.callContext.stackArgSize = ctx.callContext.stackArgBase +
+                                   computeStackArgSize(ctx.callContext.typ)
     # Fixed-frame soundness (same as the A64 path): this call's outgoing stack args
     # occupy `[rsp, rsp+stackArgSize)`, the region `scanStackArgArea` reserved at the
     # frame bottom. If the pre-scan missed this target (an indirect call through a
@@ -4639,7 +4756,7 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
       genInstX64(n, ctx)
 
   # Verify all bindings are done
-  if ctx.callContext.state == CallContextState.NormalCall:
+  if typed:
     for param in ctx.callContext.typ.params:
       if not param.typ.isOnStack and param.name notin ctx.callContext.argsSet:
         error("Missing argument: " & ctx.nameOf(param.name), hdr)
@@ -4648,13 +4765,15 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
       if res.name notin ctx.callContext.resultsSet:
         error("Missing result binding: " & ctx.nameOf(res.name), hdr)
 
-    # Verify call was emitted
-    if not ctx.callContext.callEmitted:
+  # Verify call was emitted
+  if not ctx.callContext.callEmitted:
+    if ctx.callContext.state == CallContextState.NormalCall:
       error("Missing (call) or (extcall) in prepare block", hdr)
-  else:
-    if not ctx.callContext.callEmitted:
+    else:
       error("Missing (extcall) in prepare block", hdr)
-  ctx.callContext.state = CallContextState.Disabled
+  ctx.callContext = outerCall                  # resume the enclosing call, if any
+  if outerCall.state == CallContextState.Disabled:
+    ctx.callContext.state = CallContextState.Disabled
 
 proc genCallMarkerX64(n: var Cursor; ctx: var GenContext) =
   ## `(call)` inside a `prepare` block emits the actual call: a direct `call rel32`
@@ -4721,6 +4840,12 @@ proc genExtcallX64(n: var Cursor; ctx: var GenContext) =
     error("Multiple call instructions in prepare block", n)
   if ctx.callContext.state == CallContextState.NormalCall:
     error("Use (call) for internal procs, not (extcall)", n)
+
+  # The registers the callee destroys — declared by a signature-carrying extern, so a
+  # value the caller left bound in one is reported rather than silently read back after
+  # the call. (A bare extern declares none; its call site marshals raw and binds nothing.)
+  if ctx.callContext.typ != nil:
+    ctx.clobbered.incl(ctx.callContext.typ.clobbers)
 
   # Record call site and emit IAT call
   let callPos = ctx.buf.data.len
@@ -7099,7 +7224,82 @@ proc writeExe(a: var GenContext; outfile: string) =
       libOrdinal: ext.libOrdinal, gotSlot: ext.gotSlot,
       callSites: ext.callSites)
 
-  writePE(a.buf, a.bssOffset, 0'u32, machine, outfile, dynlink)
+  var labelPos = initTable[int, int]()
+  for ld in a.buf.labels: labelPos[int(ld.id)] = ld.position
+
+  # The `.data` image: every global's storage, with its statically known scalar
+  # initializers already baked (`stdout = 1`, a string literal's bytes). Symbol
+  # ADDRESS initializers can't be — they wait for the layout, below.
+  var dataImage: seq[byte] = @[]
+  if a.bssOffset > 0:
+    dataImage = newSeq[byte](a.bssOffset)
+    for it in a.bssInits:
+      for i in 0 ..< it.size:
+        if it.off.int + i < dataImage.len:
+          dataImage[it.off.int + i] = byte((it.val shr (8 * i)) and 0xFF)
+
+  # Every absolute pointer the patch below writes, so `.reloc` can list it and the
+  # image survives being loaded away from its preferred base.
+  var absSites: seq[pe.AbsSite] = @[]
+  for it in a.bssSymInits:
+    absSites.add pe.AbsSite(inData: true, pos: it.off.int)
+  for it in a.rodataSymInits:
+    if labelPos.hasKey(it.labelId):
+      absSites.add pe.AbsSite(inData: false, pos: labelPos[it.labelId] + it.blobOff)
+
+  # The patch hook below runs inside `writePE`, so it cannot capture the `var
+  # GenContext` itself — take the site lists it needs (cheap ref-counted seqs) and a
+  # pointer to the code buffer, all of which ARE capturable.
+  let codeBuf = addr a.buf
+  let gvarSites = a.gvarSites
+  let bssSymInits = a.bssSymInits
+  let rodataSymInits = a.rodataSymInits
+
+  proc symVaddr(lay: pe.PeLayout; sym: Symbol): uint64 =
+    ## The runtime address of `sym`: a proc/rodata label sits in `.text`, a global in
+    ## `.data`. (The `.bss` byte offset of a global is kept in `sym.size`.)
+    case sym.kind
+    of skProc, skRodata:
+      if labelPos.hasKey(sym.offset):
+        lay.imageBase + lay.textRva.uint64 + labelPos[sym.offset].uint64
+      else: 0'u64
+    of skGvar: lay.imageBase + lay.dataRva.uint64 + sym.size.uint64
+    else: 0'u64
+
+  proc patchAddrs(lay: pe.PeLayout) =
+    ## Bake every address that only the final layout determines. The ELF twin of this
+    ## lives in `writeElf`; both are driven by the same three site lists.
+    # Each global's RIP-relative `lea` placeholder: a 7-byte instruction with a disp32
+    # at +3, relative to the address of the NEXT instruction.
+    for (pos, sym) in gvarSites:
+      let instrRva = lay.textRva + uint32(pos)
+      let targetRva = lay.dataRva + uint32(sym.size)
+      let disp = int32(int64(targetRva) - int64(instrRva + 7))
+      for i in 0 ..< 4:
+        codeBuf[].data[pos + 3 + i] = byte((disp shr (8 * i)) and 0xFF)
+    # Function-pointer hooks (`gExitFlush = nimNoopFlush`) — an absolute address in a
+    # global's slot; without this the slot stays zero and the indirect call jumps to 0.
+    for it in bssSymInits:
+      let v = symVaddr(lay, it.sym)
+      for i in 0 ..< it.size:
+        if it.off.int + i < dataImage.len:
+          dataImage[it.off.int + i] = byte((v shr (8 * i)) and 0xFF)
+    # The same, for an address embedded in a rodata blob (a vtable / RTTI record),
+    # which lives in `.text` at its own label.
+    for it in rodataSymInits:
+      if not labelPos.hasKey(it.labelId): continue
+      let sitePos = labelPos[it.labelId] + it.blobOff
+      let v = symVaddr(lay, it.sym)
+      for i in 0 ..< it.size:
+        if sitePos + i < codeBuf[].data.len:
+          codeBuf[].data[sitePos + i] = byte((v shr (8 * i)) and 0xFF)
+
+  # The synthesized process entry, if any (see `setupWinEntry`); otherwise the image
+  # starts at the first byte of `.text`, which is the entry proc.
+  let entryOff = if a.winEntryOffset >= 0: a.winEntryOffset.uint32 else: 0'u32
+
+  writePE(a.buf, dataImage, a.bssOffset, entryOff, machine, outfile, dynlink,
+          absSites, patchAddrs)
 
 
 proc generateSymbol(ctx: var GenContext; sym: Symbol) =
@@ -7211,6 +7411,33 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
         if initSym != nil:
           ctx.bssSymInits.add (off: sym.size.int64, sym: initSym,
                                size: asmSizeOf(sym.typ))
+      elif lc.hasVal and lc.val.kind == StrLit:
+        # An AGGREGATE constant initializer — an object/array constructor or a
+        # string, laid out by arkham's `constToBytes` as the raw little-endian
+        # bytes of the value. Fill the writable image byte-wise, exactly like a
+        # `dataConst` rodata blob; zero bytes are already zero in the image.
+        # Trailing `(reloc <off> <sym>)` children name the fields holding a
+        # symbol ADDRESS, which only the final layout knows — same treatment as
+        # the scalar symbol case above, one entry per field.
+        let s = getStr(lc.val)
+        for i, ch in s:
+          if ch != '\0':
+            ctx.bssInits.add (off: int64(sym.size + i), val: int64(ch), size: 1)
+        var rc = n                            # (gvar :name type "bytes" (reloc …)*)
+        into rc:
+          skip rc                             # name
+          skip rc                             # type
+          skip rc                             # the byte blob
+          while rc.hasMore:
+            var relc = rc
+            into relc:
+              let blobOff = getInt(relc); skip relc
+              let tname = getSym(relc)
+              let tsym = lookupWithAutoImport(ctx, ctx.scope, tname, relc)
+              skip relc                       # past the target symbol
+              if tsym != nil:
+                ctx.bssSymInits.add (off: int64(sym.size) + blobOff, sym: tsym, size: 8)
+            skip rc
       ctx.bssOffset += size
   of skTvar:
     if declTag == TvarD:
@@ -7254,6 +7481,24 @@ proc processReachableSymbols(ctx: var GenContext) =
     let sym = ctx.scope.lookup(ctx.symIdOf(fullName))
     if sym != nil:
       generateSymbol(ctx, sym)
+
+proc setupWinEntry(ctx: var GenContext) =
+  ## Synthesize the PE entry stub — the Windows counterpart of `setupTls`'s prologue.
+  ##
+  ## arkham's `main.0` has the C signature `main(argc, argv, envp)` and reads those
+  ## three from its argument registers, which on Linux the entry prologue fills from
+  ## the stack block the kernel hands over. Windows hands the entry point NOTHING:
+  ## the command line is fetched from `GetCommandLineW`, and every register is
+  ## undefined. So zero them — `paramCount()` then reports no arguments rather than
+  ## `main` storing garbage into `cmdCount`/`cmdLine`/`nimEnviron` and every later
+  ## `paramStr` walking a wild pointer. (Wiring the real command line through
+  ## `GetCommandLineW` + `CommandLineToArgvW` is a separate step.)
+  if ctx.arch != Arch.WinX64 or ctx.entrySym == nil: return
+  ctx.winEntryOffset = ctx.buf.data.len
+  x86.emitMovImmToReg(ctx.buf.data, x86.RDI, 0)             # argc = 0
+  x86.emitMovImmToReg(ctx.buf.data, x86.RSI, 0)             # argv = nil
+  x86.emitMovImmToReg(ctx.buf.data, x86.RDX, 0)             # envp = nil
+  x86.emitJmp(ctx.buf, LabelId(ctx.entrySym.offset))        # → real entry
 
 proc setupTls(ctx: var GenContext) =
   ## nifasm owns the per-thread TLS. After every bundled tvar has an FS offset
@@ -7330,6 +7575,7 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false) =
     generatedSymbols: initHashSet[string](),
     dedupTable: initTable[string, string](),
     tlsEntryOffset: -1,
+    winEntryOffset: -1,
     symMap: symMap,
     emitObj: emitObj
   )
@@ -7391,6 +7637,7 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false) =
   # Now that every bundled tvar has an FS offset, reserve the unified TLS block and
   # synthesize the entry prologue that sets the FS base (x86-64).
   setupTls(ctx)
+  setupWinEntry(ctx)
 
   if ctx.emitObj:
     # Relocatable object for the system linker (foreign `.o` / framework linking).
