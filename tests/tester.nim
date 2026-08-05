@@ -1,5 +1,44 @@
 import std/[os, osproc, strutils]
 
+const
+  runTimeoutMs = 30_000
+    ## Wall-clock budget for ONE generated test binary. Generous: every fixture in the
+    ## corpus finishes in milliseconds, so anything near this is a hang, not slowness.
+  timeoutExitCode = 124
+    ## What `runProgram` reports for a killed child, following `timeout(1)`. No fixture
+    ## expects it (`.exitcode` files hold small values), so it always reads as a failure.
+
+proc runProgram(cmd: string; timeoutMs = runTimeoutMs): tuple[output: string, exitCode: int] =
+  ## `execCmdEx` for a *generated program*, with a deadline. Miscompiled code loops
+  ## forever as readily as it crashes — a call site patched at the wrong offset leaves
+  ## a `bl` branching to itself — and `execCmdEx` would then wedge the whole suite with
+  ## no clue which fixture did it. Killing the child turns that into an ordinary
+  ## failure naming the test.
+  ##
+  ## Output is collected through a shell redirect rather than a pipe: nothing reads the
+  ## pipe until the child exits, so a chatty program would otherwise deadlock on a full
+  ## buffer and look exactly like the hang this proc exists to catch.
+  let logFile = getTempDir() / "nifasm_tester_run.log"
+  removeFile logFile
+  let p = startProcess(cmd & " > " & quoteShell(logFile) & " 2>&1",
+                       options = {poEvalCommand})
+  var waited = 0
+  while waited < timeoutMs and p.running:
+    sleep 5
+    inc waited, 5
+  if p.running:
+    p.terminate()
+    sleep 50
+    if p.running: p.kill()
+    discard p.waitForExit()
+    p.close()
+    result = ("", timeoutExitCode)
+  else:
+    let code = p.waitForExit()
+    p.close()
+    result = ((if fileExists(logFile): readFile(logFile) else: ""), code)
+  removeFile logFile
+
 proc exec(cmd: string; showProgress = false) =
   if showProgress:
     let exitCode = execShellCmd(cmd)
@@ -17,8 +56,18 @@ proc execExpectFailure(cmd: string; expectedSubstr = "") =
   if expectedSubstr.len > 0 and not s.contains(expectedSubstr):
     quit "UNEXPECTED OUTPUT " & cmd & "\nExpected to contain: " & expectedSubstr & "\nGot:\n" & s
 
+proc execRun(cmd: string) =
+  ## `exec` for a produced test binary — same "exit 0 or die", but hang-proof.
+  let (s, exitCode) = runProgram(cmd)
+  if exitCode == timeoutExitCode:
+    quit "FAILURE (TIMEOUT after " & $(runTimeoutMs div 1000) & "s) " & cmd & "\n"
+  if exitCode != 0:
+    quit "FAILURE " & cmd & "\n" & s
+
 proc execExpectOutput(cmd: string; expected: string) =
-  let (s, exitCode) = execCmdEx(cmd)
+  let (s, exitCode) = runProgram(cmd)
+  if exitCode == timeoutExitCode:
+    quit "FAILURE (TIMEOUT after " & $(runTimeoutMs div 1000) & "s) " & cmd & "\n"
   if exitCode != 0:
     quit "FAILURE " & cmd & "\n" & s
   if s != expected:
@@ -148,7 +197,9 @@ proc arkhamTests() =
     let (no, nc) = execCmdEx(quoteShell(nifasm) & " -o:" & quoteShell(exe) & " " &
                              quoteShell(asmNif))
     if nc != 0: tolerate("nifasm (assemble/link)", no)
-    let (po, pc) = execCmdEx(quoteShell(exe))
+    let (po, pc) = runProgram(quoteShell(exe))
+    if pc == timeoutExitCode:
+      tolerate("TIMEOUT after " & $(runTimeoutMs div 1000) & "s running", "")
     let ecFile = stem & ".exitcode"
     let expectedCode = if fileExists(ecFile): parseInt(readFile(ecFile).strip) else: 0
     if pc != expectedCode:
@@ -242,8 +293,10 @@ proc arkhamStressTests(arch: string; runner = ""; skip: seq[string] = @[];
                                " " & quoteShell(asmNif))
       if nc != 0:
         failed = "assemble: " & no.splitLines[^1].strip; break run
-      let (po, pc) = execCmdEx(
+      let (po, pc) = runProgram(
         (if runner.len > 0: quoteShell(runner) & " " else: "") & quoteShell(exe))
+      if pc == timeoutExitCode:
+        failed = "HANG: still running after " & $(runTimeoutMs div 1000) & "s"; break run
       let ecFile = stem & ".exitcode"
       let expectedCode = if fileExists(ecFile): parseInt(readFile(ecFile).strip) else: 0
       let outFile = stem & ".output"
@@ -337,7 +390,10 @@ proc arkhamQemuTests() =
     let (no, nc) = execCmdEx(quoteShell(nifasm) & " -o:" & quoteShell(exe) & " " &
                              quoteShell(asmNif))
     if nc != 0: quit "FAILURE nifasm (linux_arm64 assemble) " & file & "\n" & no
-    let (po, pc) = execCmdEx(quoteShell(qemu) & " " & quoteShell(exe))
+    let (po, pc) = runProgram(quoteShell(qemu) & " " & quoteShell(exe))
+    if pc == timeoutExitCode:
+      quit "FAILURE (qemu linux_arm64) TIMEOUT after " &
+           $(runTimeoutMs div 1000) & "s for " & file
     let ecFile = stem & ".exitcode"
     let expectedCode = if fileExists(ecFile): parseInt(readFile(ecFile).strip) else: 0
     if pc != expectedCode:
@@ -362,7 +418,10 @@ proc arkhamQemuTests() =
     let (no, nc) = execCmdEx(quoteShell(nifasm) & " -o:" & quoteShell(exe) & " " &
                              quoteShell("tests" / (name & ".nif")))
     if nc != 0: quit "FAILURE nifasm (hand-written linux_arm64) " & name & "\n" & no
-    let (po, pc) = execCmdEx(quoteShell(qemu) & " " & quoteShell(exe))
+    let (po, pc) = runProgram(quoteShell(qemu) & " " & quoteShell(exe))
+    if pc == timeoutExitCode:
+      quit "FAILURE (qemu linux_arm64, hand-written) TIMEOUT after " &
+           $(runTimeoutMs div 1000) & "s for " & name
     if pc != 42:
       quit "FAILURE (qemu linux_arm64, hand-written) exitcode 42 but got " & $pc &
            " for " & name & "\n" & po
@@ -370,20 +429,20 @@ proc arkhamQemuTests() =
 
 when defined(macosx):
   exec "nim c -r src/nifasm/nifasm tests/hello_darwin.nif"
-  exec "tests/hello_darwin"
+  execRun "tests/hello_darwin"
   # Declarative call ABI on AArch64 (macOS arm64). Each test exits with
-  # (computed - 42), i.e. 0 on success, so plain `exec` validates it.
+  # (computed - 42), i.e. 0 on success, so `execRun` alone validates it.
   exec "nim c -r src/nifasm/nifasm tests/call_a64_reg_args.nif"
-  exec "tests/call_a64_reg_args"
+  execRun "tests/call_a64_reg_args"
   exec "nim c -r src/nifasm/nifasm tests/call_a64_stack_args.nif"
-  exec "tests/call_a64_stack_args"
+  execRun "tests/call_a64_stack_args"
   # AArch64 conditional select/set (csel*/cset*): branch-free min/max and bool
   # materialization from the NZCV flags. Exits 0 only if every result is correct.
   exec "nim c -r src/nifasm/nifasm tests/a64_csel.nif"
-  exec "tests/a64_csel"
+  execRun "tests/a64_csel"
 elif defined(windows):
   exec "nim c -r src/nifasm/nifasm tests/hello_win64.nif"
-  exec "./tests/hello_win64.exe"
+  execRun "./tests/hello_win64.exe"
 
 exec "nim c -r src/nifasm/nifasm tests/hello.nif"
 exec "nim c -r src/nifasm/nifasm tests/thread_local_tls.nif"
@@ -421,23 +480,23 @@ exec "nim c -r src/nifasm/nifasm tests/module_no_dedup.nif"
 
 when defined(linux) and defined(amd64):
   # binaries have been built for linux only:
-  exec "tests/hello"
-  exec "tests/atomic_ops"
+  execRun "tests/hello"
+  execRun "tests/atomic_ops"
   # The new x86-64 bit instructions (rol/ror/rcl/rcr/bsf/bsr/bt/bts/btr/btc):
   # both binaries compute their checks and exit 0 only when every result matches.
-  exec "tests/bitops_rotate_scan"
-  exec "tests/bitops_bittest"
-  exec "tests/dot_at_access"
-  exec "tests/nested_dot_at"
-  exec "tests/pointer_dot_store"
-  exec "tests/array_i64_register_index"
-  exec "tests/pointer_field_at"
-  exec "tests/pointer_roundtrip"
+  execRun "tests/bitops_rotate_scan"
+  execRun "tests/bitops_bittest"
+  execRun "tests/dot_at_access"
+  execRun "tests/nested_dot_at"
+  execRun "tests/pointer_dot_store"
+  execRun "tests/array_i64_register_index"
+  execRun "tests/pointer_field_at"
+  execRun "tests/pointer_roundtrip"
   execExpectOutput("./tests/string_pointer_field", "Hello\n")
   execExpectOutput("./tests/message_inline_array", "Ping\n")
   execExpectOutput("./tests/rep_movs_copy", "Rep!\n")
   execExpectOutput("./tests/call_hello_chain", "Hello through calls\n")
-  exec "./tests/call_multi_result"
+  execRun "./tests/call_multi_result"
 
 # Failing tests are not platform specific!
 execExpectFailure("nim c -r src/nifasm/nifasm tests/double_bind.nif", "Register RAX is already bound to variable 'x.0'")

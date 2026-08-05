@@ -3643,6 +3643,16 @@ proc dropCodeBytes(ctx: var GenContext; at, count: int) =
   for k in 0 ..< ctx.tlvSites.len:
     if ctx.tlvSites[k][0] >= after:
       ctx.tlvSites[k] = (ctx.tlvSites[k][0] - count, ctx.tlvSites[k][1])
+  # An external call site is a .text position too — the `bl`/`call [got]` placeholder
+  # the image writer patches to reach the stub. A frame site that shrinks BEFORE it
+  # (the common case: a leaf-shaped proc whose `(sub (sp)(ssize))` resolves to a zero
+  # frame and drops entirely) moves it just like a label, and an unrebased site leaves
+  # the real `bl` unpatched (branching to itself — a hang) while corrupting whatever
+  # instruction now sits at the stale offset.
+  for e in 0 ..< ctx.extProcs.len:
+    for k in 0 ..< ctx.extProcs[e].callSites.len:
+      if ctx.extProcs[e].callSites[k] >= after:
+        ctx.extProcs[e].callSites[k] -= count
 
 proc frameSizeFor(ctx: GenContext; peak, pushBytes: int; isA64: bool): int =
   ## How far this proc's prologue lowers the stack pointer. Two jobs in one number:
@@ -5299,6 +5309,9 @@ proc shiftCodePositions(ctx: var GenContext; at, by: int) =
     if ctx.csizePatches[k][0] >= at: ctx.csizePatches[k] = (ctx.csizePatches[k][0] + by, ctx.csizePatches[k][1])
   for k in 0 ..< ctx.tlvSites.len:
     if ctx.tlvSites[k][0] >= at: ctx.tlvSites[k] = (ctx.tlvSites[k][0] + by, ctx.tlvSites[k][1])
+  for e in 0 ..< ctx.extProcs.len:                # external `bl`/`call [got]` placeholders
+    for k in 0 ..< ctx.extProcs[e].callSites.len:
+      if ctx.extProcs[e].callSites[k] >= at: ctx.extProcs[e].callSites[k] += by
 
 proc genCasejmpX64(n: var Cursor; ctx: var GenContext) =
   ## `(casejmp S T (stmts …)+)` — computed-goto case dispatch (issue #32). The
