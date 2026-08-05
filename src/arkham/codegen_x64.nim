@@ -1621,9 +1621,6 @@ proc emitSyproc(g: var CodeGen; sp: SyscallProc) =
       g.ab.intLit sp.sysNr.int64
     while c.hasMore: skip c                       # drain the importc decl's pragmas + body
 
-const WindowsKernelDll* = "kernel32.dll"
-  ## The one DLL arkham's `importc` externs bind against. See `generateX64`.
-
 proc emitWinExtproc(g: var CodeGen; ex: Extern) =
   ## Emit a Windows extern's declaration:
   ## `(extproc :<name>.c.<mod> "<name>" (params (param :pN.0 <reg|s> T)…) (result …)?
@@ -1688,26 +1685,6 @@ proc emitWinExtproc(g: var CodeGen; ex: Extern) =
         for r in x64ClobbersGpr:
           if r notin paramRegs: g.ab.reg r
     while c.hasMore: skip c                       # drain the importc decl's pragmas + body
-
-proc emitWinExitProcessDecl(g: var CodeGen; asmName: string) =
-  ## `(extproc :ExitProcess.c.<mod> "ExitProcess" (params (param :p0.0 (rcx) (u 32)))
-  ##  (result) (clobber …))` — hand-written because the entry module reaches
-  ## `ExitProcess` without declaring it: `emProcessExit` calls it to terminate the
-  ## process, but the `importc` that would have produced an `Extern` for it lives in
-  ## `system/exits`, a DIFFERENT module. (When the entry module happens to declare it
-  ## too, `generateX64` skips this and uses that decl — same symbol either way.)
-  g.ab.tree ExtprocD:
-    g.ab.symDef asmName
-    g.ab.str "ExitProcess"
-    g.ab.tree ParamsD:
-      g.ab.tree ParamD:
-        g.ab.symDef paramName(0)
-        g.ab.reg RCX
-        g.ab.uintType(32)                        # Win32 `UINT uExitCode`
-    g.ab.keyword ResultD                         # `noreturn`, hence no result
-    g.ab.tree ClobberD:
-      for r in x64ClobbersGpr:
-        if r != RCX: g.ab.reg r                  # rcx holds the argument — see emitWinExtproc
 
 proc genProctypeSig(g: var CodeGen; c: var Cursor) =
   ## Lower a Leng `(proctype Empty Params [RetType] Pragmas)` to a concrete asm-NIF
@@ -2251,37 +2228,17 @@ proc emitStoreImmLoc(g: var CodeGen; loc: Location; v: Location) =
     g.giveBack p
   else: raiseAssert "arkham x64: emitStoreImmLoc on location kind " & $loc.kind
 
-proc winExitProcessName(g: CodeGen): string {.inline.} =
-  ## The self-module `(extproc …)` symbol for kernel32 `ExitProcess`. Named exactly
-  ## as `collect` names an `importc` extern, so a module that ALSO declares
-  ## `ExitProcess` itself (the freestanding `system/exits`) shares this one decl
-  ## instead of defining a second symbol for the same import.
-  "ExitProcess.c." & g.prog.thisModuleSuffix
-
 proc emProcessExit(g: var CodeGen; code: Location) =
-  ## Terminate the process with exit status `code` — the entry proc's tail, which
-  ## returns to nobody. On Linux that is the `exit_group` trap; on Windows it is a
-  ## call to kernel32 `ExitProcess`, since a PE image that merely returns from its
-  ## entry point leaves the exit status to whatever the thread-start thunk makes of
-  ## the register it finds.
-  if g.prog.windows:
-    var v = code
-    let r = g.pickStagingSealed("the process exit code", ScalarSlot)
-    g.place2(v, r)
-    # `ExitProcess` is `noreturn`, so nothing after this can observe a register:
-    # bind the argument and go. The declarative form is what lets nifasm size the
-    # call's outgoing area — Win64 shadow space included — into this frame
-    # (see `emitWinExtproc`).
-    g.ab.tree PrepareX64:
-      g.ab.sym g.winExitProcessName
-      g.ab.tree MovX64:
-        g.ab.tree ArgX: g.ab.sym paramName(0)
-        g.emReg r
-      g.ab.keyword ExtcallX64
-    g.giveBack r
-  else:
-    g.place2(code, RDI)
-    g.movImm(RAX, LinuxX64ExitNr); g.emSyscall()
+  ## Terminate the process with exit status `code` — the LINUX entry proc's
+  ## tail, which returns to nobody (the kernel entered it with no return
+  ## address): the `exit_group` trap. Windows needs no counterpart: its entry
+  ## is `call`ed by ntdll's thread-start thunk, so it returns like any other
+  ## proc and the thunk exits the thread with the returned status — the entry
+  ## is not special-cased there at all. (nimony's synthesized `main` never
+  ## reaches either path: it terminates through a declared call to `cExit`.)
+  assert not g.prog.windows, "arkham x64: emProcessExit on a win_x64 target"
+  g.place2(code, RDI)
+  g.movImm(RAX, LinuxX64ExitNr); g.emSyscall()
 
 proc aggrAddrInto(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind: bool)
 proc bindLvalGlobalBases(g: var CodeGen; c: Cursor; bound: var seq[Reg])
@@ -4979,8 +4936,9 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
     var cc = c
     cc.into:
       let hasVal = cc.hasMore and cc.kind != DotToken
-      if g.isEntryProc:
-        # the entry proc terminates the process: its return value is the exit status.
+      if g.isEntryProc and not g.prog.windows:
+        # The Linux entry proc terminates the process: its return value is the
+        # exit status. (The Windows entry returns normally — see emProcessExit.)
         if hasVal:
           var v = needsReg(ScalarSlot)
           g.emitValue2(cc, v)
@@ -6791,13 +6749,14 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo) =
   c.into:
     inc c; skip c; skip c; skip c                    # name, params, ret, pragmas
     # The whole body is in tail position: after it, control reaches the epilogue.
-    # The entry proc ends in an exit syscall (no epilogue jump), so leave it false.
-    g.tailStmt = not info.isEntry
+    # The LINUX entry proc ends in an exit syscall (no epilogue jump), so leave
+    # it false there; the Windows entry returns like any other proc.
+    g.tailStmt = not info.isEntry or g.prog.windows
     if c.stmtKind == StmtsS: g.genStmt2(c)
     while c.hasMore: skip c
   g.exitScope()
   if g.retLabelUsed2: g.emLab(g.retLabel2)           # a non-tail `ret` lands here
-  if info.isEntry:
+  if info.isEntry and not g.prog.windows:
     g.emProcessExit(immLoc(0, ScalarSlot))    # fell off the end of `main` ⇒ exit(0)
   swap(g.ab, side)                        # back to the main buffer; `side` holds the body
   # The body is emitted — `ra.usedCallee` is final. Finalize the frame SHAPE and
@@ -7660,13 +7619,15 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                   windows = false): string =
   ## Compile a parsed Leng module to x86-64 asm-NIF text — Linux/ELF by default, or
   ## Windows/PE when `windows`, which nifasm's `win_x64` target assembles to a static
-  ## `.exe` that binds `kernel32.dll` through the import table.
+  ## `.exe` whose imports bind through the import table (each extern's own
+  ## `(dll …)`-named library).
   ##
   ## The two targets share ONE code generator: the image is self-contained, so the
   ## convention on both sides of every arkham-generated call is arkham's own (SysV,
-  ## `x64Machine`) whichever OS it runs on. Only the two edges where the OS is the
+  ## `x64Machine`) whichever OS it runs on. Only the edges where the OS is the
   ## other party differ — the calls out to `importc`'d Windows APIs (Win64 ABI, see
-  ## `win64Machine`) and process exit (see `emProcessExit`).
+  ## `win64Machine`) and the LINUX entry's exit trap (see `emProcessExit`; the
+  ## Windows entry returns to ntdll's thunk like an ordinary proc).
   ##
   ## `md` is the ALLOCATED-against machine (`x64MachineA`), so the prologue/epilogue's
   ## view of the callee-saved pool matches `allocateProc`'s under `-d:arkhamStress`.
@@ -7682,24 +7643,18 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   g.ab.tree StmtsX64:
     g.ab.tree ArchD: g.ab.ident (if windows: "win_x64" else: "x64")
     if windows:
-      # Every `importc` on Windows is a DLL import — there are no raw syscalls to
-      # lower to (see `collect`), so an image that calls out at all needs kernel32.
-      # arkham binds only kernel32 names today (`ExitProcess`, `VirtualAlloc`,
-      # `GetStdHandle`, `WriteFile`, `LoadLibraryA`, `GetProcAddress`); a
-      # `dynlib`-directed import table is future work.
-      var hasEntry = false
-      for info in g.prog.procs:
-        if info.isEntry: hasEntry = true; break
-      if g.prog.needsLibSystem or g.prog.externOrder.len > 0 or hasEntry:
-        g.ab.tree ImpD: g.ab.str WindowsKernelDll
-      var declaresExit = false
+      # Every `importc` on Windows is a DLL import (there are no raw syscalls to
+      # lower to — see `collect`), and every import names its OWN library via
+      # the decl's `(dll …)` pragma; arkham hardcodes no library name. Externs
+      # are emitted grouped per dll behind that dll's `(imp …)` — nifasm binds
+      # an `(extproc …)` against the last import library seen.
+      var dlls: seq[string] = @[]
       for ex in g.prog.externOrder:
-        if ex.asmName == g.winExitProcessName: declaresExit = true
-        g.emitWinExtproc(ex)
-      # The entry proc terminates through `ExitProcess` whether or not this module
-      # imports it — see `emitWinExitProcessDecl`.
-      if hasEntry and not declaresExit:
-        g.emitWinExitProcessDecl(g.winExitProcessName)
+        if ex.dll notin dlls: dlls.add ex.dll
+      for dll in dlls:
+        g.ab.tree ImpD: g.ab.str dll
+        for ex in g.prog.externOrder:
+          if ex.dll == dll: g.emitWinExtproc(ex)
     for (name, decl) in g.prog.mainTypeList:
       g.genType(name, decl)
     for name, decl in g.prog.globals:

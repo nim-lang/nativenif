@@ -18,7 +18,7 @@
 ## named type defined in any module classifies correctly (e.g. a cross-module
 ## `enum` parameter is a scalar in a register, not a stack aggregate).
 
-import std / [tables, assertions, sets]
+import std / [tables, assertions, sets, strutils]
 import nifcore, nifcdecl, nifcoreparse
 import slots, nifmodules
 import "../../../nimony/src/lib" / [symparser, nifreader, stringviews, intrinsics]
@@ -27,6 +27,10 @@ export intrinsics
 type
   Extern* = object
     asmName*, extName*: string
+    dll*: string             ## the import library the decl's `(dll "…")` pragma names
+                             ## (normalized to a `.dll` suffix). REQUIRED on Windows —
+                             ## there is no implicit kernel32 fallback; empty on the
+                             ## Darwin path (libSystem is the platform default there).
     decl*: Cursor            ## the `importc` proc decl (params + return type). A Windows
                              ## extern emits its FULL signature into the `(extproc …)`
                              ## decl, so nifasm type-checks the call and reserves its
@@ -250,7 +254,8 @@ proc lookupSyscall*(name: string): tuple[found: bool, x64, a64: int] =
 # ── pass 0: collect the main module's top-level declarations ────────────────
 
 proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
-                  intrinsic: var IntrinsicOp; asmProc: var bool) =
+                  intrinsic: var IntrinsicOp; asmProc: var bool;
+                  dllN: var string) =
   if c.substructureKind == PragmasU:
     c.into:
       while c.hasMore:
@@ -262,6 +267,14 @@ proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
         of ImportcP:
           c.into:
             if c.hasMore: (importcN = strVal(c); inc c)
+        of DllP:
+          # The import library of a static Windows import (hexer forwards a
+          # `dynlib` importc as this). Normalized to the loader's spelling.
+          c.into:
+            if c.hasMore:
+              dllN = strVal(c)
+              if not dllN.contains('.'): dllN.add ".dll"
+              inc c
         of ExportcP:
           c.into:
             if c.hasMore: (exportcN = strVal(c); inc c)
@@ -278,6 +291,11 @@ proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
         else: skip c
   else:
     skip c
+
+proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
+                  intrinsic: var IntrinsicOp; asmProc: var bool) {.inline.} =
+  var ignoredDll = ""
+  parsePragmas(c, importcN, exportcN, intrinsic, asmProc, ignoredDll)
 
 proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
                   intrinsic: var IntrinsicOp) {.inline.} =
@@ -544,7 +562,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         skip c
       elif c.stmtKind == ProcS:
         let procStart = c
-        var pname, importcN, exportcN = ""
+        var pname, importcN, exportcN, dllN = ""
         var retFloat = false
         var retType: Cursor
         var intrinsic = NoIntrinsicOp
@@ -555,7 +573,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           retType = c                         # return-type cursor (for getType)
           retFloat = c.kind == TagLit and c.typeKind == FT   # `(f N)` return → v0
           skip c                              # return type
-          parsePragmas(c, importcN, exportcN, intrinsic, asmProc)
+          parsePragmas(c, importcN, exportcN, intrinsic, asmProc, dllN)
           skip c                              # body
         let sigType = procSigType(procStart)  # the proc-value's `(proctype …)` (for getType)
         if intrinsic != NoIntrinsicOp:
@@ -609,9 +627,15 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           # `.index` — unresolvable when this module is a foreign module of a bundle.
           # The `.c.` disambiguator is reserved (nimony proc disambiguators are numeric).
           let asmN = importcN & ".c." & thisModuleSuffix(result)
+          if windows and dllN.len == 0:
+            # No implicit import library: a Windows extern must NAME its dll
+            # (a `dynlib: "kernel32"` on the Nim decl → `(dll …)` in Leng).
+            quit "arkham: the Windows extern `" & importcN &
+              "` names no import library; annotate the declaration with " &
+              "`dynlib` (e.g. `dynlib: \"kernel32\"`)"
           # The external symbol as the dynamic loader spells it: Mach-O prefixes every
           # C symbol with an underscore, PE does not.
-          result.externOrder.add Extern(asmName: asmN, decl: procStart,
+          result.externOrder.add Extern(asmName: asmN, decl: procStart, dll: dllN,
                                         extName: (if windows: importcN else: "_" & importcN))
           # A Windows extern is called DECLARATIVELY (`(arg pN)` against the signature
           # its `(extproc …)` decl carries) — see `emitWinExtproc`. That is what gives
