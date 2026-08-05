@@ -18,7 +18,7 @@
 ## named type defined in any module classifies correctly (e.g. a cross-module
 ## `enum` parameter is a scalar in a register, not a stack aggregate).
 
-import std / [tables, assertions, sets]
+import std / [tables, assertions, sets, strutils]
 import nifcore, nifcdecl, nifcoreparse
 import slots, nifmodules
 import "../../../nimony/src/lib" / [symparser, nifreader, stringviews, intrinsics]
@@ -27,6 +27,16 @@ export intrinsics
 type
   Extern* = object
     asmName*, extName*: string
+    dll*: string             ## the import library the decl's `(dynlib "…")` pragma names
+                             ## (normalized to a `.dll` suffix). REQUIRED on Windows —
+                             ## there is no implicit kernel32 fallback; empty on the
+                             ## Darwin path (libSystem is the platform default there).
+    decl*: Cursor            ## the `importc` proc decl (params + return type). A Windows
+                             ## extern emits its FULL signature into the `(extproc …)`
+                             ## decl, so nifasm type-checks the call and reserves its
+                             ## outgoing stack-argument area (Win64 shadow space + the
+                             ## 5th+ arguments). Darwin externs declare no signature and
+                             ## leave this nil — they marshal into raw ABI registers.
 
   CallTarget* = object
     asmName*: string         ## the asm-NIF symbol to call
@@ -49,6 +59,11 @@ type
                              ## false → manual marshalling (floats/aggregates/…)
     indirect*: bool          ## true → call *through* a function-pointer variable
                              ## (`asmName` is the gvar/tvar holding the pointer)
+    foreignAbi*: bool        ## the callee is FOREIGN code reached through a pointer, so
+                             ## the call marshals by the platform convention rather than
+                             ## arkham's own. Only a `stdcall` proctype on Windows sets
+                             ## it (see `isForeignAbiProctype`) — how `winlean`'s
+                             ## `dynlib` imports are called.
 
   InstrTarget* = object
     ## How to lower an `(instr SYM …)`. Unlike `CallTarget` there is no asm symbol,
@@ -82,6 +97,12 @@ type
     procs*: seq[ProcInfo]                   ## internal procs to emit (entry first)
     syscalls*: seq[SyscallProc]             ## syscalls used → one `(syproc …)` decl each
     globals*: Table[string, Cursor]         ## global (gvar/const) var name → its decl cursor
+    globalOrder*: seq[string]               ## the same names in DECLARATION order. A global's
+                                            ## runtime initializer may read another global of
+                                            ## the same module (`winlean`'s `dynlib` procs read
+                                            ## the library handle a preceding global loaded), so
+                                            ## the init proc must run them in source order — a
+                                            ## `Table` walk would order them by hash
     tvars*: Table[string, Cursor]           ## thread-local var name → its decl cursor (macOS TLV)
     typeDecls*: TypeEnv                     ## resolved type env: main + requested foreign
     mainTypeList*: seq[(string, Cursor)]    ## main-module types, in declaration order
@@ -89,6 +110,11 @@ type
                                              ## dependency record; nifasm links them)
     needsLibSystem*: bool
     darwin*: bool                           ## Mach-O target (libc via dyld, no raw syscalls)
+    windows*: bool                          ## PE/Win64 target: every `importc` binds through
+                                            ## the import table (no Linux syscalls), and the
+                                            ## image is single-threaded, so a Nim thread-local
+                                            ## is collected as an ordinary `.bss` global —
+                                            ## Win64 has no FS-based TLS block to point at.
     gvarCName*: Table[string, string]       ## importc/exportc gvar/tvar: NIF symbol → bare C
                                             ## name. The bare name lives in nifasm's shared
                                             ## root scope, so an `exportc` definition in one
@@ -228,7 +254,8 @@ proc lookupSyscall*(name: string): tuple[found: bool, x64, a64: int] =
 # ── pass 0: collect the main module's top-level declarations ────────────────
 
 proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
-                  intrinsic: var IntrinsicOp; asmProc: var bool) =
+                  intrinsic: var IntrinsicOp; asmProc: var bool;
+                  dllN: var string) =
   if c.substructureKind == PragmasU:
     c.into:
       while c.hasMore:
@@ -253,9 +280,30 @@ proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
                             (if pk == InstructionP: icPinned else: icPortable))
               inc c
             while c.hasMore: skip c
+        of NoPragma:
+          # `(dynlib "kernel32")` — the import library of a Windows import; the
+          # Leng spelling of Nim's `dynlib` pragma. NOT part of leng's
+          # `LengPragma` vocabulary yet (hexer still turns a `dynlib` importc
+          # into a runtime loader stub instead of forwarding the pragma), so it
+          # is matched by tag NAME: the tag pool interns unknown tags with ids
+          # beyond the `TagEnum` range and `pragmaKind` reports them `NoPragma`.
+          if c.kind == TagLit and tagName(c.tags, c.cursorTagId) == "dynlib":
+            c.into:
+              if c.hasMore:
+                dllN = strVal(c)      # normalized to the loader's spelling
+                if not dllN.contains('.'): dllN.add ".dll"
+                inc c
+              while c.hasMore: skip c
+          else:
+            skip c
         else: skip c
   else:
     skip c
+
+proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
+                  intrinsic: var IntrinsicOp; asmProc: var bool) {.inline.} =
+  var ignoredDll = ""
+  parsePragmas(c, importcN, exportcN, intrinsic, asmProc, ignoredDll)
 
 proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
                   intrinsic: var IntrinsicOp) {.inline.} =
@@ -304,6 +352,34 @@ proc abiScalarType(p: var Program; c: Cursor): bool =
   case t.typeKind
   of IT, UT, CT, BoolT, PtrT, AptrT, ProctypeT, EnumT: true
   else: false
+
+proc hasStdcallPragma(c: Cursor): bool =
+  ## Does the `(pragmas …)` node at `c` name the `stdcall` calling convention?
+  if c.substructureKind != PragmasU: return false
+  var pc = c
+  pc.into:
+    while pc.hasMore:
+      if pc.kind == TagLit and pc.callConvKind == Stdcall: return true
+      skip pc
+
+proc isForeignAbiProctype*(p: Program; c: Cursor): bool =
+  ## Does a call THROUGH this `(proctype . Params RetType Pragmas)` leave the image?
+  ##
+  ## Only on Windows, and only for a `stdcall` proctype — which is how nimony spells
+  ## "this is a Windows API entry point". It matters because arkham's own convention
+  ## is SysV whatever the OS (see `generateX64`), so a pointer to foreign code is the
+  ## one indirect call that must be marshalled the Win64 way. `std/windows/winlean`
+  ## reaches its `dynlib` imports exactly like this: each is a function-pointer global
+  ## that `GetProcAddress` fills in, so the call site has only the proctype to go on.
+  if not p.windows: return false
+  var t = c
+  if t.kind != TagLit or t.typeKind != ProctypeT: return false
+  t.into:
+    skip t                                    # the name slot (a proctype carries none)
+    skip t                                    # params
+    skip t                                    # return type
+    if t.hasMore and hasStdcallPragma(t): return true
+    while t.hasMore: skip t
 
 const FullSigAggrByRefThreshold = 16
   ## The SysV/AAPCS64 by-value aggregate threshold (both targets use 16). Aggregates
@@ -385,13 +461,20 @@ proc procSigType*(declStart: Cursor): Cursor =
   result = beginRead(buf)
 
 proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
-              darwin = false): Program =
+              darwin = false; windows = false): Program =
   ## `darwin` selects the Mach-O target, which links dynamically against
   ## libSystem (dyld + PLT). Unlike the static-ELF Linux target, an `importc`'d
   ## libc name there resolves through the dynamic linker, so it must go through
   ## the normal extern path rather than being lowered to a raw kernel trap —
   ## Darwin's syscall numbers and `svc #0x80` convention differ from Linux's, and
   ## raw syscalls are unstable ABI on macOS. See the syscall branch below.
+  ##
+  ## `windows` selects the PE/Win64 target and rules out raw syscalls for the same
+  ## reason, more strongly: Windows has no stable syscall ABI at all, so EVERY
+  ## `importc` — including the POSIX-looking names `lookupSyscall` knows — binds
+  ## through the import table. The syscall table is x86-64/AArch64 LINUX numbers;
+  ## consulting it here would silently turn e.g. an `importc: "read"` into a trap
+  ## into the NT kernel with Linux argument registers.
   result = Program(callTarget: initTable[string, CallTarget](),
                    typeDecls: initTable[string, Cursor](),
                    globals: initTable[string, Cursor](),
@@ -400,7 +483,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                    gvarCName: initTable[string, string](),
                    importcOnlyGvars: initHashSet[string](),
                    scheme: splitModulePath(inputPath), tags: tags,
-                   darwin: darwin)
+                   darwin: darwin, windows: windows)
   block:
     # A standalone `(proctype)` parsed against the shared tag pool; its cursor
     # outlives this buffer (the owner refcount keeps the data alive).
@@ -444,11 +527,19 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       if c.stmtKind in {GvarS, TvarS, ConstS}:
         let gStart = c
         var gc = c
-        let isTvar = c.stmtKind == TvarS
+        # On Windows a thread-local is collected as an ORDINARY global: the PE image
+        # is single-threaded (the native backend spawns no threads) and Win64 has no
+        # counterpart to the FS-based `arkham.tls.0` block the Linux target points at
+        # — GS holds the TEB, whose layout nifasm does not model. Demoting it here
+        # (rather than at each use) is what keeps every downstream `scTvar` dispatch —
+        # `emTvarAddr`, the `Tvar` location arms, `genTvar` — off the Windows path.
+        let isTvar = c.stmtKind == TvarS and not windows
         gc.into:
           let nm = symName(gc); inc gc
           if isTvar: result.tvars[nm] = gStart   # thread-local (macOS TLV)
-          else: result.globals[nm] = gStart      # ordinary .bss global / const
+          else:
+            result.globals[nm] = gStart          # ordinary .bss global / const
+            result.globalOrder.add nm
           # An importc/exportc gvar uses its bare C name so the (single) nifasm
           # root scope links an `exportc` definition to `importc` references across
           # bundled modules (C-style global linkage). importc-WITHOUT-exportc means
@@ -479,7 +570,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         skip c
       elif c.stmtKind == ProcS:
         let procStart = c
-        var pname, importcN, exportcN = ""
+        var pname, importcN, exportcN, dllN = ""
         var retFloat = false
         var retType: Cursor
         var intrinsic = NoIntrinsicOp
@@ -490,7 +581,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           retType = c                         # return-type cursor (for getType)
           retFloat = c.kind == TagLit and c.typeKind == FT   # `(f N)` return → v0
           skip c                              # return type
-          parsePragmas(c, importcN, exportcN, intrinsic, asmProc)
+          parsePragmas(c, importcN, exportcN, intrinsic, asmProc, dllN)
           skip c                              # body
         let sigType = procSigType(procStart)  # the proc-value's `(proctype …)` (for getType)
         if intrinsic != NoIntrinsicOp:
@@ -511,7 +602,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           # genBitBuiltin. (nimony's `firstSetBit`/`countTrailingZeroBits` reach
           # `ctz64` ⇒ `__builtin_ctzll` ⇒ a single `bsf`.)
           result.callTarget[pname] = CallTarget(bitBuiltin: importcN, retType: retType, sigType: sigType)
-        elif not darwin and importcN.len > 0 and lookupSyscall(importcN).found:
+        elif not darwin and not windows and importcN.len > 0 and lookupSyscall(importcN).found:
           # A Linux syscall: lowered to a raw kernel trap (no libc, no PLT). Emitted
           # as a `(syproc …)` whose proctype puts args in the syscall ABI registers
           # and declares the kernel's clobbers; calls go through the declarative
@@ -544,8 +635,23 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           # `.index` — unresolvable when this module is a foreign module of a bundle.
           # The `.c.` disambiguator is reserved (nimony proc disambiguators are numeric).
           let asmN = importcN & ".c." & thisModuleSuffix(result)
-          result.externOrder.add Extern(asmName: asmN, extName: "_" & importcN)
+          if windows and dllN.len == 0:
+            # No implicit import library: a Windows extern must NAME its dll
+            # (a `dynlib: "kernel32"` on the Nim decl → `(dynlib …)` in Leng).
+            quit "arkham: the Windows extern `" & importcN &
+              "` names no import library; annotate the declaration with " &
+              "`dynlib` (e.g. `dynlib: \"kernel32\"`)"
+          # The external symbol as the dynamic loader spells it: Mach-O prefixes every
+          # C symbol with an underscore, PE does not.
+          result.externOrder.add Extern(asmName: asmN, decl: procStart, dll: dllN,
+                                        extName: (if windows: importcN else: "_" & importcN))
+          # A Windows extern is called DECLARATIVELY (`(arg pN)` against the signature
+          # its `(extproc …)` decl carries) — see `emitWinExtproc`. That is what gives
+          # the 5th+ argument of e.g. `WriteFile` a checked stack slot above the Win64
+          # shadow space; the Darwin path marshals into raw ABI registers and so tops
+          # out at the 6 SysV argument registers.
           result.callTarget[pname] = CallTarget(asmName: asmN, extern: true,
+                                                declarative: windows and isDeclarativeAbi(result, procStart),
                                                 retFloat: retFloat, retType: retType, sigType: sigType)
           result.needsLibSystem = true
         else:
@@ -676,7 +782,7 @@ proc foreignCallTarget*(p: var Program; name: string): CallTarget =
                     "__builtin_popcountll", "__builtin_popcount",
                     "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64"]:
     result = CallTarget(bitBuiltin: importcN, retType: retType, sigType: sigType)
-  elif not p.darwin and importcN.len > 0 and lookupSyscall(importcN).found:
+  elif not p.darwin and not p.windows and importcN.len > 0 and lookupSyscall(importcN).found:
     let (_, x64Nr, a64Nr) = lookupSyscall(importcN)
     result = CallTarget(asmName: importcN & ".sys." & s.module, extern: false,
                         syscall: true, sysNr: x64Nr, sysNrA64: a64Nr,
@@ -688,6 +794,7 @@ proc foreignCallTarget*(p: var Program; name: string): CallTarget =
     # extern decl uses (see the externOrder naming in `collect`).
     p.needsLibSystem = true
     result = CallTarget(asmName: importcN & ".c." & s.module, extern: true, retFloat: retFloat,
+                        declarative: p.windows and isDeclarativeAbi(p, declCur),
                         retType: retType, sigType: sigType)
   else:
     result = CallTarget(asmName: name, extern: false, retFloat: retFloat,

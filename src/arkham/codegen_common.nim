@@ -13,7 +13,7 @@
 ## target `MachineDesc` so the backends drive the (shared) register allocator
 ## and scratch pools from it.
 
-import std / [tables, sets, assertions, algorithm]
+import std / [tables, sets, assertions, algorithm, strutils]
 import symparser
 import nifcore, nifcdecl
 import slots, machinedesc, analyser, register_allocator, programs
@@ -175,10 +175,6 @@ type
                                              ## GPR address can't be the result reg). Sourced from
                                              ## emit-time STAGING (R11 bridge), NOT a survivor pool
                                              ## reg — same lifecycle/rationale as `lvalStride`.
-    hasGlobalInits*: bool                     ## the module has runtime (non-static) global
-                                             ## initializers, emitted as a synthetic init
-                                             ## proc the entry calls (see `buildGlobalInitProc`)
-    globalInitSym*: string                    ## the synthetic init proc's asm-NIF symbol
     ovfSigned*: bool                          ## signedness of the most recent `keepovf` op, so
                                              ## the `(ovf)` test that immediately follows it picks
                                              ## the right hardware-flag branch (`jo`/`jno` for a
@@ -532,6 +528,36 @@ proc constAddrSym*(c: Cursor): string =
       else: inc v
   if v.kind == Symbol: result = symName(v)
 
+proc isStaticConstInit*(c: Cursor): bool =
+  ## Whether an initializer is a compile-time constant that `constToBytes` can lay
+  ## out as raw bytes: a scalar literal, a static address, a string, or an
+  ## `(aconstr …)`/`(oconstr …)` built recursively out of those.
+  ##
+  ## This is the IR CONTRACT for a `gvar`'s value. Anything else is code, and code
+  ## is not arkham's to schedule: hexer lowers a runtime initializer to an `(asgn …)`
+  ## in the module's init proc (`lengcgen`'s `trToplevel`), which reaches arkham as
+  ## an ordinary statement. `genGlobal` rejects a violation rather than guessing.
+  if c.kind == StrLit: return true
+  if isConstScalarInit(c): return true
+  if constAddrSym(c).len > 0: return true
+  if c.kind == TagLit and c.exprKind in {AconstrC, OconstrC}:
+    result = true
+    var vc = c
+    vc.into:
+      skip vc                                  # the constructed type
+      while vc.hasMore:
+        if vc.kind == TagLit and vc.substructureKind == KvU:
+          var kv = vc
+          kv.into:
+            inc kv                             # field name
+            if kv.hasMore and not isStaticConstInit(kv): result = false
+            while kv.hasMore: skip kv
+        elif not isStaticConstInit(vc):
+          result = false
+        skip vc
+  else:
+    result = false
+
 proc appendLE(buf: var string; bits: uint64; size: int) =
   for i in 0 ..< size: buf.add char((bits shr (8 * i)) and 0xFF'u64)
 
@@ -628,6 +654,42 @@ proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string;
     while (buf.len - startLen) < align(off, maxAl): buf.add '\0'  # tail padding
   else:
     raiseAssert "arkham const: unsupported const type " & $rt.typeKind
+
+proc genGlobalInitValue*(g: var CodeGen; name: string; typ, val: Cursor; hasValue: bool) =
+  ## Emit a gvar's initial VALUE into the open `(gvar :name <type> …)` as STATIC
+  ## data: nifasm prefills the (writable) slot from the on-disk image, so the value
+  ## is there before any code runs — correct for a foreign module's gvar in a bundle
+  ## just as much as for the main module's.
+  ##
+  ## Three shapes, cheapest first: a scalar's raw bits; a symbol whose address only
+  ## the final layout knows, which nifasm bakes into the slot; and an object / array
+  ## / string constant, laid out by `constToBytes` as bytes plus one `(reloc off
+  ## sym)` per address-valued field.
+  ##
+  ## A value that is NOT a compile-time constant is a contract violation, not a case
+  ## to fall back on: hexer lowers a runtime initializer to an `(asgn …)` in the
+  ## module's init proc (`lengcgen`'s `trToplevel`), so it reaches arkham as an
+  ## ordinary statement and never as a gvar value. Say so rather than guess.
+  if not hasValue: return
+  if isConstScalarInit(val):
+    g.ab.intLit cast[int64](constLitBits(val))
+  else:
+    let addrSym = constAddrSym(val)
+    if addrSym.len > 0:
+      g.ab.sym addrSym
+    elif isStaticConstInit(val):
+      var bytes = ""
+      var relocs: seq[(int, string)] = @[]
+      constToBytes(g.prog, typ, val, bytes, relocs)
+      g.ab.str bytes
+      for (off, sym) in relocs:
+        g.ab.tree RelocX:
+          g.ab.intLit off
+          g.ab.sym sym
+    else:
+      lengError val, "the initializer of the global `" & name & "` is not a compile-time " &
+        "constant. Runtime initialization belongs in the module\'s init proc as an " &
+        "assignment, which is where hexer lowers it"
 
 proc paramName*(idx: int): string {.inline.} =
   ## The asm-NIF symbol for positional call parameter `idx`. nifasm's scope keys

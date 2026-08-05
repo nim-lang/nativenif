@@ -3220,7 +3220,9 @@ proc emitValue2(g: var CodeGen; c: Cursor; dest: var Location) =
     if dest.kind == NamedStack and dest.spillTemp:
       g.produceIntoMem2(c, dest); return
     let nm = "msg." & $g.rodata.len & "." & g.prog.thisModuleSuffix
-    g.rodata.add (nm, strVal(c))
+    # NUL-terminated: a literal's address alone does not say whether the callee reads
+    # it as a `cstring` or as a length-carrying `string` payload. See the x86-64 twin.
+    g.rodata.add (nm, strVal(c) & '\0')
     if dest.isTemp and not g.rb.isBoundTemp(dest.r): g.bindTemp(dest.r, dest.typ)
     g.emAdr(dest.r, nm)
   of TagLit:
@@ -4772,10 +4774,6 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool;
   g.enterScope()
   if g.retIndirect: g.movReg(g.indirectReg, IndirectResultReg)
   g.emitParamMoves(info.decl)
-  if info.isEntry and g.hasGlobalInits:           # run runtime global inits at startup
-    g.ab.tree PrepareA64:
-      g.ab.sym g.globalInitSym
-      g.ab.keyword CallA64
   g.retLabel2 = g.freshLabel()
   g.retLabelUsed2 = false
   var c = info.decl
@@ -4833,8 +4831,7 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
     g.cleanSigComputed = true
   let an = analyseProc(g.buf[], info.decl, g.tvarNames,
                        cleanCallees = g.cleanSigProcs,
-                       procIsClean = isCleanSigProc(g.prog, info.decl),
-                       entryLeadingClobber = info.isEntry and g.hasGlobalInits)
+                       procIsClean = isCleanSigProc(g.prog, info.decl))
   g.varType.clear()
   g.symType.clear()
   g.retAggrName = ""; g.retIndirect = false; g.retIsFloat = false
@@ -4875,9 +4872,7 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   if g.retIndirect:
     g.indirectReg = R19
     g.ra.usedCallee.incl R19
-  # The entry injects a `call` to the synthetic global-init proc, so it makes a call
-  # even when its own body does not — give it a frame (lr saved) for that call.
-  # fp/lr only when a `bl` exists (or the entry runs global inits). An atomic is an
+  # fp/lr only when a `bl` exists. An atomic is an
   # instruction now, not a call, so a CAS loop no longer drags a frame onto an
   # otherwise-leaf hot path (rawDealloc and friends) — that is what `hasCall` says.
   # (The frame itself is finalized INSIDE emitProcBody2, after the body —
@@ -4885,8 +4880,7 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   let declarative = isDeclarativeAbi(g.prog, info.decl)
   g.rb.resetProc(); g.aliasToDecl.clear(); g.savedHomes.clear()
   g.noFoldPos = -1
-  g.emitProcBody2(info, declarative,
-                  frameHasCall = an.hasCall or (info.isEntry and g.hasGlobalInits))
+  g.emitProcBody2(info, declarative, frameHasCall = an.hasCall)
 
 # MODEL: the `StartEmit` per-proc reset in proofs/arkham_bindings.tla. The two-pass seam
 # below must reset every per-proc table (regLocal/boundTemps/freeTmp + the ra.locs snapshot)
@@ -4935,14 +4929,7 @@ proc genGlobal(g: var CodeGen; name: string; decl: Cursor) =
       g.ab.symDef name
       var tc2 = typeCur
       g.genTypeBody(tc2)                       # type
-      if hasValue and isConstScalarInit(c):
-        g.ab.intLit cast[int64](constLitBits(c))
-      elif hasValue:
-        # Static-ADDRESS initializer (function-pointer hook etc.) — emit the
-        # symbol so nifasm bakes its resolved address into the slot.
-        let addrSym = constAddrSym(c)
-        if addrSym.len > 0:
-          g.ab.sym addrSym
+      g.genGlobalInitValue(name, typeCur, c, hasValue)
       g.ab.close()
     while c.hasMore: skip c                   # value (runtime inits done at entry)
 
@@ -4982,41 +4969,6 @@ proc genTvar(g: var CodeGen; name: string; decl: Cursor) =
     g.ab.close()
     while c.hasMore: skip c
 
-proc buildGlobalInitProc(g: var CodeGen; initBuf: var TokenBuf) =
-  ## Lower each global's RUNTIME initializer into a synthetic `(proc … (stmts (asgn
-  ## g e) …))` so it routes through the ordinary value-core pipeline (allocateProc +
-  ## emitProcBody2) — no special-case emitter. The entry calls this proc at startup
-  ## (see `emitProcBody2`). Const-scalar initializers are laid out as static data by
-  ## `genGlobal` and are skipped here, so a module with none gets no init proc.
-  var inits: seq[(string, Cursor)] = @[]
-  for name, decl in g.globals:
-    var c = decl
-    if c.stmtKind == ConstS: continue           # emitted as a rodata data blob
-    c.into:
-      inc c; skip c                             # name, pragmas
-      skip c                                    # type
-      if c.hasMore and c.kind != DotToken and not isConstScalarInit(c) and
-         constAddrSym(c).len == 0:
-        inits.add (name, c)
-      while c.hasMore: skip c
-  if inits.len == 0: return
-  g.hasGlobalInits = true
-  g.globalInitSym = "arkhamGlobalInit.0"
-  template tag(e): TagId = TagId(uint32(ord(e)))
-  initBuf.openTag tag(ProcS)
-  initBuf.addSymDef g.globalInitSym
-  initBuf.openTag tag(ParamsT); initBuf.closeTag()       # (params)
-  initBuf.addDotToken()                                  # void return
-  initBuf.openTag tag(PragmasU); initBuf.closeTag()      # (pragmas)
-  initBuf.openTag tag(StmtsS)
-  for (name, initCur) in inits:
-    initBuf.openTag tag(AsgnS)
-    initBuf.addSymUse name                               # the global lvalue
-    initBuf.addSubtree initCur                           # its initializer expression
-    initBuf.closeTag()
-  initBuf.closeTag()                                     # stmts
-  initBuf.closeTag()                                     # proc
-
 proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                   linux = false): string =
   ## Compile a parsed Leng module to AArch64 asm-NIF text — Darwin/Mach-O by
@@ -5031,11 +4983,6 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   g.globals = g.prog.globals
   g.tvars = g.prog.tvars
   for nm in g.tvars.keys: g.tvarNames.incl nm
-  # Build the synthetic global-init proc (if any runtime initializers) BEFORE the proc
-  # loop so the entry proc's frame/body account for the startup call. `initBuf` shares
-  # `buf`'s pool + tag pool and must outlive the `genProc2` below.
-  var initBuf = createTokenBuf(64, buf.pool, buf.tags)
-  g.buildGlobalInitProc(initBuf)
   g.ab.tree StmtsA64:
     g.ab.tree ArchD: g.ab.ident (if linux: "linux_arm64" else: "arm64")
     if not linux:
@@ -5059,12 +5006,6 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       g.emitSyprocA64(sp)
     for info in g.prog.procs:
       genProc2(g, info)
-    if g.hasGlobalInits:                         # emit the synthetic init proc itself
-      let savedBuf = g.buf
-      g.buf = addr initBuf
-      var ic = initBuf.beginRead()
-      genProc2(g, ProcInfo(asmName: g.globalInitSym, decl: ic, isEntry: false))
-      g.buf = savedBuf
     # NOTE: foreign types are NOT emitted here. arkham loads other modules only to
     # resolve their layout for *its own* codegen (sizing, field offsets, ABI). The
     # actual cross-module linking is nifasm's job: a module-suffixed symbol like
