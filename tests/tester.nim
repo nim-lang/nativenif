@@ -1,4 +1,4 @@
-import std/[os, osproc, strutils]
+import std/[os, osproc, streams, strutils]
 
 const
   runTimeoutMs = 30_000
@@ -8,20 +8,23 @@ const
     ## What `runProgram` reports for a killed child, following `timeout(1)`. No fixture
     ## expects it (`.exitcode` files hold small values), so it always reads as a failure.
 
-proc runProgram(cmd: string; timeoutMs = runTimeoutMs): tuple[output: string, exitCode: int] =
+proc runProgram(exe: string; args: openArray[string] = [];
+                timeoutMs = runTimeoutMs): tuple[output: string, exitCode: int] =
   ## `execCmdEx` for a *generated program*, with a deadline. Miscompiled code loops
   ## forever as readily as it crashes — a call site patched at the wrong offset leaves
   ## a `bl` branching to itself — and `execCmdEx` would then wedge the whole suite with
   ## no clue which fixture did it. Killing the child turns that into an ordinary
   ## failure naming the test.
   ##
-  ## Output is collected through a shell redirect rather than a pipe: nothing reads the
-  ## pipe until the child exits, so a chatty program would otherwise deadlock on a full
-  ## buffer and look exactly like the hang this proc exists to catch.
-  let logFile = getTempDir() / "nifasm_tester_run.log"
-  removeFile logFile
-  let p = startProcess(cmd & " > " & quoteShell(logFile) & " 2>&1",
-                       options = {poEvalCommand})
+  ## `exe` is a PATH and `args` its argument vector: no shell, so nothing here depends
+  ## on a platform's quoting or redirection syntax (`poEvalCommand` does not even go
+  ## through a shell on Windows — the string lands in `CreateProcess` verbatim).
+  ##
+  ## The child's output is drained only after it exits, so a program that wrote more
+  ## than a pipe buffer holds would block in `write` and be reported as a timeout. Every
+  ## fixture prints at most a line or two, which is why that trade is worth the
+  ## simplicity of not needing a reader thread.
+  let p = startProcess(exe, args = args, options = {poStdErrToStdOut})
   var waited = 0
   while waited < timeoutMs and p.running:
     sleep 5
@@ -34,10 +37,12 @@ proc runProgram(cmd: string; timeoutMs = runTimeoutMs): tuple[output: string, ex
     p.close()
     result = ("", timeoutExitCode)
   else:
+    # The child is gone and its end of the pipe with it, so `readAll` drains what it
+    # wrote and stops at EOF rather than blocking.
+    let output = p.outputStream.readAll()
     let code = p.waitForExit()
     p.close()
-    result = ((if fileExists(logFile): readFile(logFile) else: ""), code)
-  removeFile logFile
+    result = (output, code)
 
 proc exec(cmd: string; showProgress = false) =
   if showProgress:
@@ -56,22 +61,23 @@ proc execExpectFailure(cmd: string; expectedSubstr = "") =
   if expectedSubstr.len > 0 and not s.contains(expectedSubstr):
     quit "UNEXPECTED OUTPUT " & cmd & "\nExpected to contain: " & expectedSubstr & "\nGot:\n" & s
 
-proc execRun(cmd: string) =
-  ## `exec` for a produced test binary — same "exit 0 or die", but hang-proof.
-  let (s, exitCode) = runProgram(cmd)
+proc execRun(exe: string) =
+  ## `exec` for a produced test binary — same "exit 0 or die", but hang-proof. Takes the
+  ## executable's PATH, not a shell line: `runProgram` spawns it directly.
+  let (s, exitCode) = runProgram(exe)
   if exitCode == timeoutExitCode:
-    quit "FAILURE (TIMEOUT after " & $(runTimeoutMs div 1000) & "s) " & cmd & "\n"
+    quit "FAILURE (TIMEOUT after " & $(runTimeoutMs div 1000) & "s) " & exe & "\n"
   if exitCode != 0:
-    quit "FAILURE " & cmd & "\n" & s
+    quit "FAILURE " & exe & "\n" & s
 
-proc execExpectOutput(cmd: string; expected: string) =
-  let (s, exitCode) = runProgram(cmd)
+proc execExpectOutput(exe: string; expected: string) =
+  let (s, exitCode) = runProgram(exe)
   if exitCode == timeoutExitCode:
-    quit "FAILURE (TIMEOUT after " & $(runTimeoutMs div 1000) & "s) " & cmd & "\n"
+    quit "FAILURE (TIMEOUT after " & $(runTimeoutMs div 1000) & "s) " & exe & "\n"
   if exitCode != 0:
-    quit "FAILURE " & cmd & "\n" & s
+    quit "FAILURE " & exe & "\n" & s
   if s != expected:
-    quit "UNEXPECTED OUTPUT " & cmd & "\nExpected:\n" & expected & "\nGot:\n" & s
+    quit "UNEXPECTED OUTPUT " & exe & "\nExpected:\n" & expected & "\nGot:\n" & s
 
 const arkhamKnownUnsupported: seq[string] =
   # Both backends now route the whole corpus through the value-core pure-emit path:
@@ -197,7 +203,7 @@ proc arkhamTests() =
     let (no, nc) = execCmdEx(quoteShell(nifasm) & " -o:" & quoteShell(exe) & " " &
                              quoteShell(asmNif))
     if nc != 0: tolerate("nifasm (assemble/link)", no)
-    let (po, pc) = runProgram(quoteShell(exe))
+    let (po, pc) = runProgram(exe)
     if pc == timeoutExitCode:
       tolerate("TIMEOUT after " & $(runTimeoutMs div 1000) & "s running", "")
     let ecFile = stem & ".exitcode"
@@ -293,8 +299,9 @@ proc arkhamStressTests(arch: string; runner = ""; skip: seq[string] = @[];
                                " " & quoteShell(asmNif))
       if nc != 0:
         failed = "assemble: " & no.splitLines[^1].strip; break run
-      let (po, pc) = runProgram(
-        (if runner.len > 0: quoteShell(runner) & " " else: "") & quoteShell(exe))
+      let (po, pc) =
+        if runner.len > 0: runProgram(runner, [exe])   # `qemu-aarch64 <exe>`
+        else: runProgram(exe)
       if pc == timeoutExitCode:
         failed = "HANG: still running after " & $(runTimeoutMs div 1000) & "s"; break run
       let ecFile = stem & ".exitcode"
@@ -390,7 +397,7 @@ proc arkhamQemuTests() =
     let (no, nc) = execCmdEx(quoteShell(nifasm) & " -o:" & quoteShell(exe) & " " &
                              quoteShell(asmNif))
     if nc != 0: quit "FAILURE nifasm (linux_arm64 assemble) " & file & "\n" & no
-    let (po, pc) = runProgram(quoteShell(qemu) & " " & quoteShell(exe))
+    let (po, pc) = runProgram(qemu, [exe])
     if pc == timeoutExitCode:
       quit "FAILURE (qemu linux_arm64) TIMEOUT after " &
            $(runTimeoutMs div 1000) & "s for " & file
@@ -418,7 +425,7 @@ proc arkhamQemuTests() =
     let (no, nc) = execCmdEx(quoteShell(nifasm) & " -o:" & quoteShell(exe) & " " &
                              quoteShell("tests" / (name & ".nif")))
     if nc != 0: quit "FAILURE nifasm (hand-written linux_arm64) " & name & "\n" & no
-    let (po, pc) = runProgram(quoteShell(qemu) & " " & quoteShell(exe))
+    let (po, pc) = runProgram(qemu, [exe])
     if pc == timeoutExitCode:
       quit "FAILURE (qemu linux_arm64, hand-written) TIMEOUT after " &
            $(runTimeoutMs div 1000) & "s for " & name
@@ -442,7 +449,7 @@ when defined(macosx):
   execRun "tests/a64_csel"
 elif defined(windows):
   exec "nim c -r src/nifasm/nifasm tests/hello_win64.nif"
-  execRun "./tests/hello_win64.exe"
+  execRun("tests" / "hello_win64.exe")
 
 exec "nim c -r src/nifasm/nifasm tests/hello.nif"
 exec "nim c -r src/nifasm/nifasm tests/thread_local_tls.nif"
@@ -492,11 +499,11 @@ when defined(linux) and defined(amd64):
   execRun "tests/array_i64_register_index"
   execRun "tests/pointer_field_at"
   execRun "tests/pointer_roundtrip"
-  execExpectOutput("./tests/string_pointer_field", "Hello\n")
-  execExpectOutput("./tests/message_inline_array", "Ping\n")
-  execExpectOutput("./tests/rep_movs_copy", "Rep!\n")
-  execExpectOutput("./tests/call_hello_chain", "Hello through calls\n")
-  execRun "./tests/call_multi_result"
+  execExpectOutput("tests/string_pointer_field", "Hello\n")
+  execExpectOutput("tests/message_inline_array", "Ping\n")
+  execExpectOutput("tests/rep_movs_copy", "Rep!\n")
+  execExpectOutput("tests/call_hello_chain", "Hello through calls\n")
+  execRun "tests/call_multi_result"
 
 # Failing tests are not platform specific!
 execExpectFailure("nim c -r src/nifasm/nifasm tests/double_bind.nif", "Register RAX is already bound to variable 'x.0'")
