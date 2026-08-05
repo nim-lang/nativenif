@@ -172,6 +172,14 @@ proc bindFLocal*(rb: var RegBind; f: FReg; name: string) =
   rb.boundFTmps.excl f
   rb.scopeFLocals[^1].add (name: name, f: f)
 
+proc rebindFLocal*(rb: var RegBind; f: FReg; name: string) =
+  ## Re-establish `f`'s binding to the already-declared float local `name` (the
+  ## caller emitted the `(rebind …)`). No scope entry — the local's declaring
+  ## scope already tracks it. The SIMD twin of `rebindLocal` (floats carry no
+  ## pointer bit).
+  rb.fregLocal[f] = name
+  rb.boundFTmps.excl f
+
 proc takeFBindingIf*(rb: var RegBind; f: FReg; name: string): bool =
   result = rb.fregLocal.getOrDefault(f, "") == name
   if result:

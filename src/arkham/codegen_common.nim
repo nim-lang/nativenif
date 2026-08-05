@@ -142,6 +142,13 @@ type
     emergencySlots*: seq[string]             ## the borrow slots, indexed by nesting depth and
                                              ## reused across the body: a proc that borrows at
                                              ## depth 2 costs two 8-byte slots in total.
+    fBridgeBorrows*: seq[tuple[f: FReg, saveSlot: string, name: string, bits: int]]
+                                             ## a64 `takeFBridge`: open float-bridge borrow
+                                             ## windows, innermost last. When v31 is busy (it
+                                             ## doubles as the produce-into-spill accumulator)
+                                             ## and the pool is dry, a pool register's named
+                                             ## value is parked in `saveSlot` for the window;
+                                             ## `dropFBridge` restores value and binding.
     curProcName*: string                     ## the proc currently being emitted. arkham's input
                                              ## carries no line info, so a bare register-pressure
                                              ## or typing assert names nothing actionable; this

@@ -1298,10 +1298,77 @@ proc dropBridge(g: var CodeGen; r: Reg) =
   if r != NoReg: g.unbindTemp(r)
 
 proc takeFBridge(g: var CodeGen; bits: int): FReg =
-  g.bindFTmp(FloatBridgeReg, bits); FloatBridgeReg
+  ## The reserved float transient v31 — unless it is BUSY: it doubles as the
+  ## produce-into-spill accumulator (`produceIntoFMem2`), so a fold running
+  ## under a produce chain finds it bound to the in-flight partial. Rebinding
+  ## it there orphaned the partial and folded the value against itself — a
+  ## silent miscompile (the k-starved gate's `spill_produce_float`). Total
+  ## ladder instead: v31 when free; a free pool register; else BORROW a pool
+  ## register for the window — park its named value in a minted slot, and
+  ## `dropFBridge` restores value and binding. Every bridge window is closed
+  ## (a fixed load/compute sequence naming only the bridge and the caller's
+  ## own accumulator), so a named local's home is a legal victim; in-flight
+  ## values (reserved picks, bound scratch temps) are excluded.
+  if not g.rb.isBoundFTmp(FloatBridgeReg):
+    g.bindFTmp(FloatBridgeReg, bits); return FloatBridgeReg
+  let free = g.pickFTempReg()
+  if free != NoFReg:
+    g.pickedFRegs.incl free
+    g.bindFTmp(free, bits)
+    return free
+  # Pool dry. A free v8–v15 survivor costs only its prologue save (body-buffer
+  # model: `usedCalleeF` is read after the body); a v0–v7 arg/return register
+  # is free between call sequences (params are settled into homes before any
+  # body expression emits). Both are cheaper than a borrow.
+  for f in g.md.floatCalleeSaved:
+    if f notin g.pickedFRegs and g.rb.boundFName(f).len == 0:
+      g.pickedFRegs.incl f
+      g.ra.usedCalleeF.incl f
+      g.bindFTmp(f, bits)
+      return f
+  for f in g.md.floatArgRegs:
+    if f notin g.pickedFRegs and g.rb.boundFName(f).len == 0:
+      g.pickedFRegs.incl f
+      g.bindFTmp(f, bits)
+      return f
+  var victim = NoFReg
+  for f in g.md.floatTempRegs:
+    if f == FloatBridgeReg or f in g.pickedFRegs or g.rb.isBoundFTmp(f): continue
+    if g.rb.boundFName(f).len == 0: continue         # free would have been picked above
+    victim = f; break
+  if victim == NoFReg:
+    raiseAssert "arkham a64n: no float bridge available in proc " & g.curProcName
+  let vname = g.rb.boundFName(victim)
+  # The victim's own precision: it types the save slot, and the restore rebind
+  # must carry it VERBATIM — a named use recovers s/d from the binding's type.
+  let vloc = g.ra.locationOfSym(vname)
+  assert vloc.kind == InFReg and vloc.typ.size in {4, 8},
+    "arkham a64n: float-bridge victim " & vname & " has no register home"
+  let vbits = vloc.typ.size * 8
+  let saveNm = g.mintSpillName("efsave")
+  g.ra.spillTemps.add (name: saveNm, typ: vloc.typ, isFloat: true)
+  g.emFloatScalarStore(saveNm, victim, vbits)        # store through the NAME
+  discard g.rb.takeFBindingIf(victim, vname)
+  g.ab.tree KillA64: g.ab.sym vname
+  g.fBridgeBorrows.add (f: victim, saveSlot: saveNm, name: vname, bits: vbits)
+  g.bindFTmp(victim, bits)
+  victim
 
-proc dropFBridge(g: var CodeGen) =
-  g.unbindFTmp(FloatBridgeReg)
+proc dropFBridge(g: var CodeGen; f: FReg) =
+  ## Close a `takeFBridge` window: unbind, and put a borrowed pool register's
+  ## displaced value — and its binding — back.
+  g.unbindFTmp(f)
+  if f == FloatBridgeReg: return
+  let n = g.fBridgeBorrows.len
+  if n > 0 and g.fBridgeBorrows[n-1].f == f:
+    let b = g.fBridgeBorrows[n-1]
+    g.fBridgeBorrows.setLen n-1
+    g.ab.tree RebindA64:
+      g.ab.symDef b.name
+      g.ab.floatType(b.bits)
+      g.ab.freg(f, b.bits)
+    g.rb.rebindFLocal(f, b.name)
+    g.emFloatScalarLoad(f, b.saveSlot, b.bits)       # via the re-established name
 
 # ── fused value core: emit-time destination protocol (step 3, a64 twin) ──────
 # Lazy-bind lifecycle identical to x64's: `takeTmp` RESERVES (pickedRegs flag
@@ -2223,7 +2290,7 @@ proc storeScalar2(g: var CodeGen; dst, v: Location) =
         let fs = g.takeFBridge(bits)
         g.placeF2(v, fs, bits)
         g.emFloatScalarStore(dst.name, fs, bits)
-        g.dropFBridge()
+        g.dropFBridge(fs)
       else: raiseAssert "arkham a64n: float scalar store rhs " & $v.kind
     else:
       case v.kind
@@ -2520,7 +2587,7 @@ proc genFieldStore2(g: var CodeGen; dst: Location; valC: Cursor) =
       else:                                             # eftmp spill (pool-dry) → bridge
         fr = g.takeFBridge(bits); g.placeF2(v, fr, bits); fb = true
       g.ab.tree FstrA64: (g.emFieldOperand(dst); g.emFReg(fr, bits))
-      if fb: g.dropFBridge()
+      if fb: g.dropFBridge(fr)
       elif v.isTemp: g.unbindFTmp(v.f)
     else:
       var fty = resolveType(g.prog, g.fieldTypeByName(dst.aggrType, dst.field))
@@ -2623,7 +2690,7 @@ template aconstrElemStores(g: var CodeGen; c: Cursor; destOp, addrOp: untyped) =
           else:                                         # eftmp spill (pool-dry) → bridge
             fr = g.takeFBridge(bits); g.placeF2(v, fr, bits); fb = true
           g.ab.tree FstrA64: (destOp(i); g.emFReg(fr, bits))
-          if fb: g.dropFBridge()
+          if fb: g.dropFBridge(fr)
           elif v.isTemp: g.unbindFTmp(v.f)
         else:
           var etc = et
@@ -2850,7 +2917,7 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
       if dst.kind == Glob or g.a64Linux: g.emAdr(b, dst.name) else: g.genTlvAddr(dst.name, b)
       g.emFStore(fr, b, bits)
       g.dropBridge b
-      if fb: g.dropFBridge()
+      if fb: g.dropFBridge(fr)
       elif fv.kind == InFReg and fv.isTemp: g.unbindFTmp(fv.f)
     else:
       var v = needsReg(ScalarSlot)                       # single-use rhs (allocSingleUse's shape)
@@ -2907,7 +2974,7 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
         g.ab.tree FstrA64:
           g.ab.tree MemX: g.emLvalAddr2(lhs)
           g.emFReg(fr, bits)
-        if v.kind != InFReg: g.dropFBridge()
+        if v.kind != InFReg: g.dropFBridge(fr)
         elif v.isTemp: g.unbindFTmp(v.f)
       else:
         var dstTy = resolveType(g.prog, g.getType(lhs))
@@ -2989,14 +3056,18 @@ proc produceIntoMem2(g: var CodeGen; c: Cursor; dst: Location) =
   g.unbindTemp(s)
 
 proc produceIntoFMem2(g: var CodeGen; c: Cursor; dst: Location) =
-  ## The SIMD twin: produce into the float bridge (v31), then store.
+  ## The SIMD twin: produce into the float bridge, then store. Acquired via
+  ## `takeFBridge` — NOT hardcoded v31: a nested produce (the spilled rhs of a
+  ## spilled binop) runs while v31 still holds the enclosing partial, and
+  ## producing into it again silently destroyed that partial (the k-starved
+  ## gate's `spill_produce_float`). The bridge arrives bound, so the whole
+  ## subtree emitted below sees it busy and acquires its own.
   let bits = dst.typ.size * 8
-  let fs = FloatBridgeReg
+  let fs = g.takeFBridge(bits)
   var d = fregLoc(fs, dst.typ, isTemp = true)
   g.emitFValue2(c, d)
-  if not g.rb.isBoundFTmp(fs): g.bindFTmp(fs, bits)
   g.emFloatScalarStore(dst.name, fs, bits)
-  g.unbindFTmp(fs)
+  g.dropFBridge(fs)
 
 proc resolveLvalVal(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED: decide (only) where an lvalue-embedded VALUE — a deref'd pointer, a
@@ -3494,7 +3565,7 @@ proc emitFBinE(g: var CodeGen; c: Cursor; dest: var Location) =
       let lt = g.takeFBridge(bits)
       g.emFloatScalarLoad(lt, lHome.name, bits)
       g.fbin(op, acc.f, lt, bits)
-      g.dropFBridge()
+      g.dropFBridge(lt)
     dest = acc
     return
   if dest.kind != InFReg: dest = g.takeFTmp(fslot)
@@ -3521,7 +3592,7 @@ proc emitFBinE(g: var CodeGen; c: Cursor; dest: var Location) =
       let fs2 = g.takeFBridge(bits)
       g.emFloatScalarLoad(fs2, rD.name, bits)
       g.fbin(op, res.f, fs2, bits)
-      g.dropFBridge()
+      g.dropFBridge(fs2)
   dest = res
 
 proc emitFValue2(g: var CodeGen; c: Cursor; dest: var Location) =
@@ -3871,7 +3942,7 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
           let b = g.takeFBridge(srcBits)
           g.placeF2(fv, b, srcBits)
           g.emFcvt(res.f, b, dstBits, srcBits)
-          g.dropFBridge()
+          g.dropFBridge(b)
         g.freeVal(fv)
     else:
       var iv = needsReg(ScalarSlot)
@@ -4869,6 +4940,7 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   g.pickedRegs = {}
   g.pickedFRegs = {}
   g.emitTmpSpills = 0
+  g.fBridgeBorrows.setLen 0
   g.ra = allocateProc(g.buf[], info.decl, an, g.prog, aarch64MachineA, g.typeCtx, preseal)
   if g.retIndirect:
     g.indirectReg = R19

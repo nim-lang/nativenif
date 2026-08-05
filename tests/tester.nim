@@ -188,7 +188,6 @@ const arkhamStressA64Known: seq[string] = @[
   # MISCOMPILES: fewer registers may cost performance or hit a documented
   # out-of-registers assert, but can never legitimately change what a program
   # computes, so a wrong answer here is a codegen bug by construction.
-  "spill_produce_float",    # float produce-into-spill reads a clobbered register
   "steal_straddle",         # trySteal over a straddling live range yields a stale value
   "atomic_cas_regpressure", # intrinsic-operand pick has no steal/spill arm
 ]
