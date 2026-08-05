@@ -1298,77 +1298,20 @@ proc dropBridge(g: var CodeGen; r: Reg) =
   if r != NoReg: g.unbindTemp(r)
 
 proc takeFBridge(g: var CodeGen; bits: int): FReg =
-  ## The reserved float transient v31 — unless it is BUSY: it doubles as the
-  ## produce-into-spill accumulator (`produceIntoFMem2`), so a fold running
-  ## under a produce chain finds it bound to the in-flight partial. Rebinding
-  ## it there orphaned the partial and folded the value against itself — a
-  ## silent miscompile (the k-starved gate's `spill_produce_float`). Total
-  ## ladder instead: v31 when free; a free pool register; else BORROW a pool
-  ## register for the window — park its named value in a minted slot, and
-  ## `dropFBridge` restores value and binding. Every bridge window is closed
-  ## (a fixed load/compute sequence naming only the bridge and the caller's
-  ## own accumulator), so a named local's home is a legal victim; in-flight
-  ## values (reserved picks, bound scratch temps) are excluded.
-  if not g.rb.isBoundFTmp(FloatBridgeReg):
-    g.bindFTmp(FloatBridgeReg, bits); return FloatBridgeReg
-  let free = g.pickFTempReg()
-  if free != NoFReg:
-    g.pickedFRegs.incl free
-    g.bindFTmp(free, bits)
-    return free
-  # Pool dry. A free v8–v15 survivor costs only its prologue save (body-buffer
-  # model: `usedCalleeF` is read after the body); a v0–v7 arg/return register
-  # is free between call sequences (params are settled into homes before any
-  # body expression emits). Both are cheaper than a borrow.
-  for f in g.md.floatCalleeSaved:
-    if f notin g.pickedFRegs and g.rb.boundFName(f).len == 0:
-      g.pickedFRegs.incl f
-      g.ra.usedCalleeF.incl f
-      g.bindFTmp(f, bits)
-      return f
-  for f in g.md.floatArgRegs:
-    if f notin g.pickedFRegs and g.rb.boundFName(f).len == 0:
-      g.pickedFRegs.incl f
-      g.bindFTmp(f, bits)
-      return f
-  var victim = NoFReg
-  for f in g.md.floatTempRegs:
-    if f == FloatBridgeReg or f in g.pickedFRegs or g.rb.isBoundFTmp(f): continue
-    if g.rb.boundFName(f).len == 0: continue         # free would have been picked above
-    victim = f; break
-  if victim == NoFReg:
-    raiseAssert "arkham a64n: no float bridge available in proc " & g.curProcName
-  let vname = g.rb.boundFName(victim)
-  # The victim's own precision: it types the save slot, and the restore rebind
-  # must carry it VERBATIM — a named use recovers s/d from the binding's type.
-  let vloc = g.ra.locationOfSym(vname)
-  assert vloc.kind == InFReg and vloc.typ.size in {4, 8},
-    "arkham a64n: float-bridge victim " & vname & " has no register home"
-  let vbits = vloc.typ.size * 8
-  let saveNm = g.mintSpillName("efsave")
-  g.ra.spillTemps.add (name: saveNm, typ: vloc.typ, isFloat: true)
-  g.emFloatScalarStore(saveNm, victim, vbits)        # store through the NAME
-  discard g.rb.takeFBindingIf(victim, vname)
-  g.ab.tree KillA64: g.ab.sym vname
-  g.fBridgeBorrows.add (f: victim, saveSlot: saveNm, name: vname, bits: vbits)
-  g.bindFTmp(victim, bits)
-  victim
+  ## One of the two reserved float transients (v31/v30) — always free BY
+  ## CONSTRUCTION: no value lives in a bridge across a recursive emission
+  ## step (every partial goes to a slot its owner mints — see design.md).
+  ## Two bridges for the same reason as the two INT bridges: one fold or
+  ## compare of two spilled operands loads both. A dry take is therefore a
+  ## BUG in the emitter (a value held across a recursion), never pressure.
+  for f in FloatBridgeRegs:
+    if not g.rb.isBoundFTmp(f):
+      g.bindFTmp(f, bits); return f
+  raiseAssert "arkham a64n: both float bridges busy in proc " & g.curProcName &
+              " — a value was held in a bridge across an emission step"
 
 proc dropFBridge(g: var CodeGen; f: FReg) =
-  ## Close a `takeFBridge` window: unbind, and put a borrowed pool register's
-  ## displaced value — and its binding — back.
   g.unbindFTmp(f)
-  if f == FloatBridgeReg: return
-  let n = g.fBridgeBorrows.len
-  if n > 0 and g.fBridgeBorrows[n-1].f == f:
-    let b = g.fBridgeBorrows[n-1]
-    g.fBridgeBorrows.setLen n-1
-    g.ab.tree RebindA64:
-      g.ab.symDef b.name
-      g.ab.floatType(b.bits)
-      g.ab.freg(f, b.bits)
-    g.rb.rebindFLocal(f, b.name)
-    g.emFloatScalarLoad(f, b.saveSlot, b.bits)       # via the re-established name
 
 # ── fused value core: emit-time destination protocol (step 3, a64 twin) ──────
 # Lazy-bind lifecycle identical to x64's: `takeTmp` RESERVES (pickedRegs flag
@@ -3055,19 +2998,59 @@ proc produceIntoMem2(g: var CodeGen; c: Cursor; dst: Location) =
   g.storeReg2(dst, s)
   g.unbindTemp(s)
 
+proc fOperandLoc(g: var CodeGen; a: Cursor; typ: AsmSlot): Location =
+  ## Where a spilled float binop reads its operand from: the operand's HOME
+  ## when it has one, else a minted slot the operand is produced into FIRST —
+  ## the recursion runs with no register held (design.md: every partial that
+  ## is not the live accumulator goes to the stack).
+  if a.kind == Symbol:
+    let home = g.ra.locationOfSym(symName(a))
+    if home.kind != NoLoc: return home
+  let nm = g.mintSpillName("eftmp")
+  g.ra.spillTemps.add (name: nm, typ: typ, isFloat: true)
+  result = namedStackLoc(nm, typ, spillTemp = true)
+  g.produceIntoFMem2(a, result)
+
 proc produceIntoFMem2(g: var CodeGen; c: Cursor; dst: Location) =
-  ## The SIMD twin: produce into the float bridge, then store. Acquired via
-  ## `takeFBridge` — NOT hardcoded v31: a nested produce (the spilled rhs of a
-  ## spilled binop) runs while v31 still holds the enclosing partial, and
-  ## producing into it again silently destroyed that partial (the k-starved
-  ## gate's `spill_produce_float`). The bridge arrives bound, so the whole
-  ## subtree emitted below sees it busy and acquires its own.
+  ## Produce a float value into its stack slot — design.md's partials-to-slots
+  ## shape. A binop's computed operands are produced into their OWN slots by
+  ## recursion first, with no register live across those recursions; then the
+  ## operands are loaded through the bridges and folded. The bridges carry
+  ## values only WITHIN this step, which is what keeps them free by
+  ## construction at any nesting depth (the old bridge-as-accumulator shape
+  ## held v31 across the rhs recursion — the `spill_produce_float`
+  ## miscompile, then a borrow ladder; both gone). A non-binop uses a bridge
+  ## as a write-only destination: its value materializes at the step's end.
   let bits = dst.typ.size * 8
-  let fs = g.takeFBridge(bits)
-  var d = fregLoc(fs, dst.typ, isTemp = true)
-  g.emitFValue2(c, d)
-  g.emFloatScalarStore(dst.name, fs, bits)
-  g.dropFBridge(fs)
+  if c.kind == TagLit and c.exprKind in {AddC, SubC, MulC, DivC}:
+    let op = fbinA64Op(c.exprKind)
+    var lhsC, rhsC: Cursor
+    block:
+      var cc = c
+      cc.into:
+        skip cc                                  # result float type
+        lhsC = cc; skip cc
+        rhsC = cc; skip cc
+        while cc.hasMore: skip cc
+    let l = g.fOperandLoc(lhsC, dst.typ)
+    let r = g.fOperandLoc(rhsC, dst.typ)
+    let f1 = g.takeFBridge(bits)
+    g.placeF2(l, f1, bits)
+    if r.kind == InFReg:
+      g.fbin(op, f1, r.f, bits)
+    else:
+      let f2 = g.takeFBridge(bits)
+      g.placeF2(r, f2, bits)
+      g.fbin(op, f1, f2, bits)
+      g.dropFBridge(f2)
+    g.emFloatScalarStore(dst.name, f1, bits)
+    g.dropFBridge(f1)
+  else:
+    let fs = g.takeFBridge(bits)
+    var d = fregLoc(fs, dst.typ, isTemp = true)
+    g.emitFValue2(c, d)
+    g.emFloatScalarStore(dst.name, fs, bits)
+    g.dropFBridge(fs)
 
 proc resolveLvalVal(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED: decide (only) where an lvalue-embedded VALUE — a deref'd pointer, a
@@ -3551,6 +3534,19 @@ proc emitFBinE(g: var CodeGen; c: Cursor; dest: var Location) =
       lhsC = cc; skip cc
       rhsC = cc; skip cc
       while cc.hasMore: skip cc
+  if dest.kind == InFReg and dest.f in FloatBridgeRegs:
+    # A bridge may not serve as the ACCUMULATOR of a binop — it would be live
+    # across the operand recursions, which is what the partials-to-slots shape
+    # forbids. A caller that threads a bridge destination (a conv around a
+    # binop, a produce leaf) gets the value via a minted slot instead.
+    let bits = if fslot.size == 4: 32 else: 64
+    let nm = g.mintSpillName("eftmp")
+    g.ra.spillTemps.add (name: nm, typ: fslot, isFloat: true)
+    let tmp = namedStackLoc(nm, fslot, spillTemp = true)
+    g.produceIntoFMem2(c, tmp)
+    if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f, bits)
+    g.emFloatScalarLoad(dest.f, nm, bits)
+    return
   let lHome = (if lhsC.kind == Symbol: g.ra.locationOfSym(symName(lhsC)) else: noLoc)
   let swap = ek in {AddC, MulC} and g.foldableFloatLeafE(lhsC) and
              not g.foldableFloatLeafE(rhsC) and
@@ -4945,7 +4941,6 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   g.pickedRegs = {}
   g.pickedFRegs = {}
   g.emitTmpSpills = 0
-  g.fBridgeBorrows.setLen 0
   g.ra = allocateProc(g.buf[], info.decl, an, g.prog, aarch64MachineA, g.typeCtx, preseal)
   if g.retIndirect:
     g.indirectReg = R19

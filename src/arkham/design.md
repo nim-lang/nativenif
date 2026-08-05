@@ -65,7 +65,7 @@ register file into the same four roles:
 |--------------------------|----------------------------|--------------------------|
 | arg / return             | x0–x7 (return x0)          | rdi, rsi, rdx, rcx, r8, r9 (return rax) |
 | working temps (the pool) | x9–x13                     | r10                      |
-| **staging bridge**       | x14, x15 (float v31)       | r11 (float xmm15)        |
+| **staging bridge**       | x14, x15 (float v31, v30)  | r11 (float xmm15)        |
 | locals across a call     | x19–x28 (callee-saved)     | rbx, r12–r15 (callee-saved) |
 
 The **accumulator** of an expression is a register drawn from the working pool.
@@ -78,7 +78,18 @@ ALU that has no memory form (AArch64's three-operand `mul`/`add`), and a global
 or stack address all need a scratch register that is guaranteed free. AArch64
 reserves **two** bridges (x14/x15) because a single `cmp` of two spilled operands
 must load both into registers (it has no memory-operand compare); x86-64 needs
-only **one** (r11) because its instructions take a memory operand directly.
+only **one** (r11) because its instructions take a memory operand directly. The
+float file follows the same argument: AArch64 reserves v31/v30 (no memory-operand
+float forms), x86-64 only xmm15.
+
+The bridges stay free **by construction**, and that is an enforced invariant,
+not a preference: *a bridge is never live across a recursive emission step —
+every partial that is not the live accumulator goes to a slot its owner mints*
+(`produceIntoFMem2`'s partials-to-slots shape; a dry `takeFBridge` raises,
+naming the violation). The alternative — parking in-flight values in reserved
+registers and making later picks total by displacing someone (an "emergency
+borrow") — re-creates exactly the save/kill/rebind/restore bookkeeping this
+design exists to avoid.
 
 Note how lopsided x86-64 is: a *single* working temp (r10) plus the r11 bridge.
 That is only viable because of the principle above — any expression reduces to

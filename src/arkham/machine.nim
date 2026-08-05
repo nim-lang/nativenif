@@ -46,6 +46,8 @@ const
   ## must load each into a register (a64 has no memory-operand compare).
   IntBridgeRegs* = [R14, R15]
   FloatBridgeReg* = F31
+  FloatBridgeRegs* = [F31, F30]   ## v31 first: the historical single bridge,
+                                  ## so single-bridge steps emit identically
 
   ## The three GPRs an atomic's LL/SC sequence takes for itself: the loaded value,
   ## the computed value, and the store-exclusive status. None of them can ever hold
@@ -68,9 +70,12 @@ const
   ## is not yet supported.
   FloatTempRegs* = [F16, F17, F18, F19, F20, F21, F22, F23,
                     F24, F25, F26, F27, F28, F29, F30, F31]
-  ## The pure-emit value core reserves v31 out of the pool as the float bridge.
+  ## The pure-emit value core reserves TWO float bridges out of the pool
+  ## (v31/v30) — the same budget argument as the two INT bridges: a single
+  ## fold/compare of two spilled float operands must load both, AArch64
+  ## having no memory-operand float forms.
   FloatTempRegsN* = [F16, F17, F18, F19, F20, F21, F22, F23,
-                     F24, F25, F26, F27, F28, F29, F30]
+                     F24, F25, F26, F27, F28, F29]
   ## Callee-saved (low 64 bits of v8–v15) — reserved for a future FP frame.
   FloatCalleeSaved* = [F8, F9, F10, F11, F12, F13, F14, F15]
 
