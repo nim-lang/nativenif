@@ -1,0 +1,130 @@
+(.nif27)
+(.indexat 0                )
+(stmts
+ (type :N4.0 .
+  (object .
+   (fld :val.0 .
+    (i 64))))
+ (type :N3.0 .
+  (object .
+   (fld :val.0 .
+    (i 64))
+   (fld :next.0 .
+    (ptr N4.0))))
+ (type :N2.0 .
+  (object .
+   (fld :val.0 .
+    (i 64))
+   (fld :next.0 .
+    (ptr N3.0))))
+ (type :N1.0 .
+  (object .
+   (fld :val.0 .
+    (i 64))
+   (fld :next.0 .
+    (ptr N2.0))))
+ (type :N0.0 .
+  (object .
+   (fld :val.0 .
+    (i 64))
+   (fld :next.0 .
+    (ptr N1.0))))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :chain.0
+  (params
+   (param :p0.0 .
+    (ptr N0.0))
+   (param :a.0 .
+    (i 64))
+   (param :b.0 .
+    (i 64))
+   (param :c.0 .
+    (i 64))
+   (param :d.0 .
+    (i 64))
+   (param :e.0 .
+    (i 64)))
+  (i 64)
+  (pragmas)
+  (stmts
+   (var :s0.0 .
+    (i 64)
+    (add
+     (i 64)a.0 b.0))
+   (var :s1.0 .
+    (i 64)
+    (add
+     (i 64)c.0 d.0))
+   (var :s2.0 .
+    (i 64)
+    (add
+     (i 64)e.0 1))
+   (var :s3.0 .
+    (i 64)
+    (add
+     (i 64)a.0 e.0))
+   (ret
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (add
+       (i 64)
+       (dot
+        (deref
+         (dot
+          (deref
+           (dot
+            (deref
+             (dot
+              (deref
+               (dot
+                (deref p0.0)next.0 0))next.0 0))next.0 0))next.0 0))val.0 0)
+       (add
+        (i 64)s0.0 s1.0))
+      (add
+       (i 64)s2.0 s3.0))
+     (dot
+      (deref
+       (dot
+        (deref
+         (dot
+          (deref p0.0)next.0 0))next.0 0))val.0 0)))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :n4.0 . N4.0 .)
+   (var :n3.0 . N3.0 .)
+   (var :n2.0 . N2.0 .)
+   (var :n1.0 . N1.0 .)
+   (var :n0.0 . N0.0 .)
+   (asgn
+    (dot n4.0 val.0 0)42)
+   (asgn
+    (dot n3.0 val.0 0)0)
+   (asgn
+    (dot n2.0 val.0 0)7)
+   (asgn
+    (dot n3.0 next.0 0)
+    (addr n4.0))
+   (asgn
+    (dot n2.0 next.0 0)
+    (addr n3.0))
+   (asgn
+    (dot n1.0 next.0 0)
+    (addr n2.0))
+   (asgn
+    (dot n0.0 next.0 0)
+    (addr n1.0))
+   (call exit.c
+    (call chain.0
+     (addr n0.0)1 2 3 4 5)))))(.index)

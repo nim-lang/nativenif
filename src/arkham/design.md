@@ -93,6 +93,38 @@ r10/r11, which are the emitter's scratch and bridge). When the callee-saved pool
 is exhausted, `reserveHeldScratch`/the steal logic demotes the coldest
 register-homed local to a stack slot and reuses its register.
 
+### How many registers the emitter actually needs
+
+The budget above is a claim about *values*. The steps that overrun it are the ones
+that hold an **address** in a register while a value passes through another one, and
+they are enumerable: a load through a materialized global base (`lea &g` then
+`mov dst, [base+off]`), an `(at …)` stride fold, an aggregate copy word between two
+computed ends, a `casejmp` base, an atomic row that claims R11 as its own `work`
+register. Each wants **two**. None wants three.
+
+Depth does not enter. A chain of spilled pointer loads — `p->a->b->c->…` — costs two
+registers at depth 4 and two at depth 10, because `emitMemLoad2`'s `late` mode takes
+the transfer register *after* the address is materialized, so it is not held across
+the recursion, and each level's address registers die with its `(mem …)` tree.
+`late` is not free, though: it gives up the global-base fusion that leas `&g`
+straight into the result register, so it is taken only when the address HAS a
+computed part (`lvalHasComputedPart`). Applied unconditionally it made a plain
+`(dot <global> f)` load — which has no recursion to protect — want two registers
+where one suffices, and that was a measured out-of-registers failure, not a
+hypothetical. `tests/arkham/addr_chain_depth` is the fixture; it passes at
+`ARKHAM_STRESS=2` at chain depth 5 and at depth 10.
+
+**Only one of the two is guaranteed.** R11 is reserved; the second is whichever ABI
+volatile happens to be free, falling back to `pickStagingScratch`'s callee-saved draw.
+Closing that gap means taking a register from the allocator, and on x86-64 nothing is
+going spare: rax is the return/div/mul register, rcx and rdx have fixed instruction
+roles, rdi–r9 are argument registers that hold live *parameters* (R9 was tried as a
+second reserved bridge and is a live param home in any six-parameter proc), rbx/r12–r15
+are the callee-saved local homes, and r10 is the allocator's entire temp pool. The
+second bridge therefore has to be bought from the callee-saved set — one fewer local
+home, plus a push/pop in the procs that use it — and that is a measurement to make,
+not a decision to take from the register file's shape.
+
 Note what that costs on x86-64: those same volatiles are the emitter's
 `StagingCandidates`, so every call-free local homed there is one fewer register the
 emitter can transiently borrow. Under `-d:danger` (SROA + inlining) a hot leaf can

@@ -36,7 +36,11 @@ const
   CalleeSavedFloor = 2
   TempFloor = 1
   FTempFloor = 1
-  StagingFloor = 1        ## R11, the reserved bridge — never shrink past it
+  StagingFloor = 1        ## R11, the reserved bridge — never shrink past it. NOTE that
+                          ## `k=1` is therefore BELOW the emitter's measured demand of
+                          ## two (see `StagingCandidates`): a k=1 x86-64 run tests a
+                          ## machine arkham does not claim to serve, so its failures are
+                          ## the demand statement, not findings. k=2 is the real floor.
 
 when StressEnabled:
   import std/[os, strutils]
