@@ -487,6 +487,7 @@ proc bindTemp(g: var CodeGen; r: Reg; typ: AsmSlot) =
   let isPtr = isNilSlot(typ) or
               (not cursorIsNil(typ.typ) and isPtrType(resolveType(g.prog, typ.typ)))
   g.rb.bindScratch(r, name, isPtr)
+  when defined(arkhamBindTrace): dbgRegSite[ord(r)] = getStackTrace()
 
 proc unbindTemp(g: var CodeGen; r: Reg) =
   ## Release a scratch binding made by `bindTemp`: `(kill)` the name and drop the
@@ -790,6 +791,16 @@ proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg =
   ## chain: every nesting level holds its result register from before its own
   ## address is materialized, so a `((a.b).c).d` chain of spilled loads wants
   ## one register per level (`cmpStringPtrs`, `-d:danger`).
+  # The temp pool first, when it happens to be free: "exhausted by the time we
+  # get here" holds for a spill mid-expression, but NOT for a statement-level
+  # step that already released its pool picks (an aggregate copy whose two ends
+  # are sealed staging regs while r10 — used for an end's address value, then
+  # given back — sits idle). A free pool register costs nothing and keeps the
+  # R11 bridge available for a deeper pick that has no alternative.
+  for r in g.md.intTempRegs:
+    if r != avoid and regFreeForTemp(g, r) and not g.regHoldsLiveLocal(r):
+      g.releaseStaleName(r)
+      return r
   for r in StagingCandidates.toOpenArray(0, stressLimit(StagingCandidates.len) - 1):
     if r != avoid and not g.ra.isSealed(r) and not g.rb.isAccum(r) and
        not g.rb.isBoundTemp(r) and not g.regHoldsLiveLocal(r):
@@ -808,6 +819,24 @@ proc stagingCensus(g: var CodeGen; avoid: Reg): string =
   ## Why every staging candidate was unavailable. "Out of registers" is otherwise
   ## indistinguishable from "a filter is wrong / a seal was never released", and
   ## those need opposite fixes.
+  when defined(arkhamBindTrace):
+    # `-d:arkhamBindTrace`: name the SITE that bound/sealed each occupied
+    # register (recorded at bindTemp/seal/takeTmp time), so a stale hold — a
+    # pick made before the work that needed the register — is readable straight
+    # off the failure instead of reconstructed from the emit paths.
+    stderr.writeLine "=== bind/seal sites of occupied registers ==="
+    for r in g.md.intTempRegs:
+      stderr.writeLine "--- pool " & $r & ": picked=" & $(r in g.pickedRegs) &
+        " bound=" & g.rb.boundName(r) & " site:"
+      stderr.writeLine dbgRegSite.getOrDefault(ord(r), "  <no record>")
+    for r in StagingCandidates:
+      if g.ra.isSealed(r) or g.rb.isBoundTemp(r):
+        stderr.writeLine "--- " & $r & " bound/sealed at:"
+        stderr.writeLine dbgRegSite.getOrDefault(ord(r), "  <no record>")
+    for r in g.md.intCalleeSaved:
+      if g.ra.isSealed(r):
+        stderr.writeLine "--- " & $r & " sealed at:"
+        stderr.writeLine dbgRegSite.getOrDefault(ord(r), "  <no record>")
   result = ""
   for r in StagingCandidates.toOpenArray(0, stressLimit(StagingCandidates.len) - 1):
     result.add "\n    " & $r & ": "
@@ -894,6 +923,7 @@ proc takeTmp(g: var CodeGen; slot: AsmSlot): Location =
     g.ra.spillTemps.add (name: nm, typ: slot, isFloat: false)
     return namedStackLoc(nm, slot, spillTemp = true)
   g.pickedRegs.incl r
+  when defined(arkhamBindTrace): dbgRegSite[ord(r)] = getStackTrace()
   result = regLoc(r, slot, isTemp = true)
 
 proc takeFTmp(g: var CodeGen; slot: AsmSlot): Location =
@@ -1958,6 +1988,15 @@ proc emitStackParamLoadsX64(g: var CodeGen; decl: Cursor) =
         g.ab.tree MovX64:
           g.emReg loc.r
           g.ab.tree MemX: (g.ab.reg g.stackArgBaseReg; g.ab.intLit off)
+        # The 8-byte load above reads the whole eightbyte, but a sub-8-byte
+        # scalar's upper bits are NOT the value's extension: our own callers
+        # store through the arg slot's declared width (a 4-byte `mov` for a
+        # cint) and a C caller leaves them undefined outright. Re-extend to the
+        # canonical 64-bit register form (`cint mapFlags = -1` arrived as
+        # 0x00000000FFFFFFFF and `mapFlags == -1` compared false — memfiles).
+        let sl = slots[i]
+        if sl.kind in {AInt, AUInt, ABool} and sl.size < 8:
+          g.extendTo(loc.r, sl.size * 8, signed = sl.kind == AInt)
       of NamedStack:                            # spilled stack param: incoming → `(s)` slot
         # Declare the `(s)` home before filling it — otherwise the store below (and
         # every later body reference) names an undeclared slot and nifasm rejects it
@@ -2113,17 +2152,24 @@ proc binFold(g: var CodeGen; op: X64Inst; dest: Reg; loc: Location; opCur: Curso
     # The sub-width operand is sign/zero-extended into a full 64-bit register by the
     # sized load below, so bind the staging reg to the WIDE type of the operand's
     # class (a char/uint → `(u 64)`, a signed int → `(i 64)`).
-    let s = g.pickStagingSealed("a sub-width operand",
-                                AsmSlot(cls: g.exprSlot(opCur).cls, size: 8, align: 8),
-                                avoid = dest)
+    # The staging pick comes AFTER the address is materialized: `prematLval2`
+    # needs registers of its own (a spilled address chain stages through
+    # `produceIntoMem2`), and a pick held across it is one register the chain
+    # cannot have — the pick-before-use ordering that ran `semBodyCheckBody`
+    # dry. The rebind only has to precede the `mov` that uses `s`.
+    let wide = AsmSlot(cls: g.exprSlot(opCur).cls, size: 8, align: 8)
     if loc.kind == NamedStack:
+      let s = g.pickStagingSealed("a sub-width operand", wide, avoid = dest)
       g.emitLoadLoc(loc, s)                       # sized load → sign/zero-extended
+      g.binReg(op, dest, s)
+      g.giveBack s
     else:                                         # Mem: load via the lvalue (premat base)
       g.prematLval2(opCur)
+      let s = g.pickStagingSealed("a sub-width operand", wide, avoid = dest)
       g.ab.tree MovX64: (g.emReg s; g.ab.tree MemX: g.emLvalAddr2(opCur))
       g.unbindLvalTemps2(opCur)
-    g.binReg(op, dest, s)
-    g.giveBack s
+      g.binReg(op, dest, s)
+      g.giveBack s
   elif loc.kind == NamedStack:
     g.binMem(op, dest, loc)
   else:
@@ -5177,22 +5223,39 @@ proc emitCondE(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
       g.giveBack s
 
 proc emitCondValue2(g: var CodeGen; c: Cursor; dest: var Location) =
-  ## FUSED comparison / and/or/not as a 0/1 VALUE: assume 1, clear to 0 unless
-  ## the condition holds. The result temp is reserved (and bound) BEFORE the
-  ## condition emits, so operand picks cannot land on it.
-  case dest.kind
-  of Undef, NeedsReg, RegOrImm: dest = g.takeTmp(ScalarSlot)
-  else: discard
+  ## FUSED comparison / and/or/not as a 0/1 VALUE. The condition is emitted
+  ## FIRST (jump protocol), the result register is resolved and written only
+  ## AFTER it: a result taken up front is a register held across the whole
+  ## condition — operand evaluation that deep (a spilled bin chain, a premat'd
+  ## address) then runs the transient file dry (`semBodyCheckBody`). Taken
+  ## late, the carrier is dead during the condition, so operand picks may use
+  ## it freely; there is no clobber hazard because every write happens after
+  ## every operand read. Dynamic cost is unchanged (2 instrs on either path);
+  ## static cost is one extra `jmp` + label over the assume-1 scheme.
+  let lTrue = g.freshLabel()
+  let lEnd = g.freshLabel()
+  g.emitCondE(c, lTrue, whenTrue = true)
+  if dest.kind in {Undef, NeedsReg, RegOrImm}: dest = g.takeTmp(ScalarSlot)
   if dest.kind == NamedStack and dest.spillTemp:
-    g.produceIntoMem2(c, dest); return
+    # pool-dry etmp result: materialize through staging (free now — the
+    # condition's operand temps are dead), then store to the slot.
+    let s = g.pickStagingSealed("a cond value spill", ScalarSlot)
+    g.movImm(s, 0)
+    g.emJmp lEnd
+    g.emLab lTrue
+    g.movImm(s, 1)
+    g.emLab lEnd
+    g.emitStoreLoc(dest, s)
+    g.giveBack s
+    return
   let res = dest
   assert res.kind == InReg, "arkham x64n: cond-value result " & $res.kind
   if res.isTemp and not g.rb.isBoundTemp(res.r): g.bindTemp(res.r, res.typ)
-  let lEnd = g.freshLabel()
-  g.movImm(res.r, 1)
-  g.emitCondE(c, lEnd, whenTrue = true)
   g.movImm(res.r, 0)
-  g.emLab(lEnd)
+  g.emJmp lEnd
+  g.emLab lTrue
+  g.movImm(res.r, 1)
+  g.emLab lEnd
   dest = res
 proc emitMemLoad2(g: var CodeGen; c: Cursor; dest: var Location; late = false) =
   ## FUSED addressing expr in VALUE position → load `[addr]` into a register.

@@ -877,8 +877,17 @@ proc locationOfSym*(ra: RegAlloc; name: string): Location {.inline.} =
 # it seals that register so any scratch borrow or steal during the rest of the
 # call setup cannot clobber the committed value; it unseals after the call.
 
-proc seal*(ra: var RegAlloc; r: Reg) {.inline.} = ra.sealed.incl r
+when defined(arkhamBindTrace):
+  var dbgRegSite*: Table[int, string] = initTable[int, string]()
+    ## TEMP DIAGNOSTIC: per-register stack trace of the last bind/seal.
+
+proc seal*(ra: var RegAlloc; r: Reg) {.inline.} =
+  ra.sealed.incl r
+  when defined(arkhamBindTrace): dbgRegSite[ord(r)] = getStackTrace()
 proc unseal*(ra: var RegAlloc; r: Reg) {.inline.} = ra.sealed.excl r
-proc seal*(ra: var RegAlloc; regs: set[Reg]) {.inline.} = ra.sealed = ra.sealed + regs
+proc seal*(ra: var RegAlloc; regs: set[Reg]) {.inline.} =
+  ra.sealed = ra.sealed + regs
+  when defined(arkhamBindTrace):
+    for r in regs: dbgRegSite[ord(r)] = getStackTrace()
 proc unseal*(ra: var RegAlloc; regs: set[Reg]) {.inline.} = ra.sealed = ra.sealed - regs
 proc isSealed*(ra: RegAlloc; r: Reg): bool {.inline.} = r in ra.sealed
