@@ -89,23 +89,42 @@ proc error(msg: string; n: Cursor) =
     quit "[Error] " & msg & inProc
 
 proc extractDedupKey*(s: string): string =
-  ## Extract deduplication key from symbol like "foo.0.key.moduleSuffix" -> "foo.0.key"
-  ## The dedup key is everything before the module suffix.
-  ## Deduplication only applies if there are more than 2 dots.
-  ## For "foo.0.moduleSuffix" (2 dots) -> "" (no dedup)
-  ## For "foo.0" (1 dot) -> "" (local, no dedup)
-  ## For "foo.0.key.moduleSuffix" (3 dots) -> "foo.0.key"
+  ## The COMDAT key of a generic instantiation: `foo.0.Ihash.moduleSuffix` ->
+  ## `foo.0.Ihash`. Every module that needs an instantiation emits its own copy,
+  ## so the copies must collapse onto one definition — that is what this key is
+  ## for. `""` means "not a duplicate of anything", and the symbol keeps its own
+  ## definition.
+  ##
+  ## The key is the name minus its module suffix, and dropping the module is only
+  ## sound when what remains is GLOBALLY unique. nimony guarantees that for one
+  ## family alone: an instantiation, whose name carries an `.I<hash>` segment that
+  ## canonicalizes the instantiated arguments (`sem.newInstSymId` mints
+  ## `abc.123.Iabcdefgh.instmod`, `symparser.genericTypeName` mints
+  ## `` `t.0.I<key>.<mod> ``). Requiring that segment is therefore the whole test.
+  ##
+  ## Dot count alone is NOT: hexer's lambda-lifting environment types are
+  ## `<proc>.<counter>.env.<module>`, three dots like an instantiation but private
+  ## to their module. Two modules that each close over a variable in a proc named
+  ## `outer` (tests/nimony/closures `tgeneric_closure` + `tparam_capture`) both
+  ## produce key `outer.0.env`, and merging them made a field of the one resolve
+  ## against the layout of the other.
   var dotCount = 0
   var lastDotPos = -1
+  var prevDotPos = -1
   for i in 0..<s.len:
     if s[i] == '.':
       inc dotCount
+      prevDotPos = lastDotPos
       lastDotPos = i
 
   if dotCount <= 2:
-    return ""  # No deduplication for <= 2 dots
+    return ""  # a module-local or plain module-qualified name: nothing to merge
 
-  # More than 2 dots: dedup key is everything before the last dot (module suffix)
+  # The segment between the last two dots is the instantiation marker, or this is
+  # a compound name that merely looks like one.
+  if lastDotPos - prevDotPos < 2 or s[prevDotPos+1] != 'I':
+    return ""
+
   result = s[0 ..< lastDotPos]
 
 proc typeError(want, got: Type; n: Cursor) =
