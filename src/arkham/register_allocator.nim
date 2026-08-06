@@ -93,6 +93,14 @@ type
                                       ## call (args being marshalled, x8 result,
                                       ## values live through the call): never
                                       ## allocate to or steal from these
+    homeRegs*: set[Reg]               ## cache: every GPR some `symPos` entry is homed in.
+    homeFRegs*: set[FReg]             ## Homes are immutable once emission starts, but the
+    homesDirty*: bool                 ## pre-pass mutates them (record/demote/alias) — each
+                                      ## mutation sets `homesDirty`; `regHoldsHome` rebuilds
+                                      ## lazily. Without this cache every register-freeness
+                                      ## query scanned ALL of `symPos`, turning emission
+                                      ## quadratic in proc size (30s+ on inliner-fattened
+                                      ## procs).
 
   Builder = object
     ra: RegAlloc
@@ -140,6 +148,18 @@ proc initLocSpan(base, len: int): LocSpan {.inline.} =
 proc `[]`*(s: LocSpan; pos: int): lent Location {.inline.} = s.data[pos - s.base]
 proc `[]`*(s: var LocSpan; pos: int): var Location {.inline.} = s.data[pos - s.base]
 proc `[]=`*(s: var LocSpan; pos: int; v: Location) {.inline.} = s.data[pos - s.base] = v
+
+proc rebuildHomes*(ra: var RegAlloc) =
+  ## Recompute `homeRegs`/`homeFRegs` from `symPos`/`locs`. Runs at most once per
+  ## pre-pass mutation (in practice: once per proc, on the first freeness query).
+  ra.homeRegs = {}
+  ra.homeFRegs = {}
+  for pos in ra.symPos.values:
+    case ra.locs[pos].kind
+    of InReg: ra.homeRegs.incl ra.locs[pos].r
+    of InFReg: ra.homeFRegs.incl ra.locs[pos].f
+    else: discard
+  ra.homesDirty = false
 
 proc posOf(b: Builder; c: Cursor): int {.inline.} =
   cursorToPosition(b.buf[], c)
@@ -295,6 +315,7 @@ proc closeScope(b: var Builder) =
 proc record(b: var Builder; pos: int; name: string; loc: Location) =
   b.ra.symPos[name] = pos
   b.ra.locs[pos] = loc
+  b.ra.homesDirty = true
 
 proc coldestVictim(b: var Builder; maxW, ceilLen: int; calleeOnly, wantFloat: bool): string =
   ## The coldest live register-resident local whose register may be stolen: a non-sealed
@@ -331,6 +352,7 @@ proc demoteToStack(b: var Builder; victim: string) =
   let vpos = b.ra.symPos[victim]
   b.ra.locs[vpos] = namedStackLoc(victim, b.ra.locs[vpos].typ)
   b.ra.hasStackVars = true
+  b.ra.homesDirty = true
 
 proc trySteal(b: var Builder; curName: string; curSlot: AsmSlot;
               curProps: VarProps; fallback: Location): Location =
@@ -482,6 +504,7 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
       if aliasSrc.len > 0:
         b.ra.symPos[name] = b.ra.symPos[aliasSrc]   # c2 resolves to c1's LIVE home (no own reg)
         b.ra.aliasedCasts.incl name                 # emitter emits neither decl nor store for it
+        b.ra.homesDirty = true
       else:
         b.record(pos, name, loc)
         b.scopeVars[^1].add name

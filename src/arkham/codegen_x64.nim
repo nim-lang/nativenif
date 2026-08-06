@@ -763,9 +763,8 @@ proc regHoldsLiveLocal(g: var CodeGen; r: Reg): bool =
   ## True if a local/param is currently allocated to register `r` (per the
   ## allocator's view). A *param* can sit in a caller-saved arg register (e.g.
   ## `p0.0` in rdi), so staging must not clobber it just because it's caller-saved.
-  for name, pos in g.ra.symPos:
-    let loc = g.ra.locs[pos]
-    if loc.kind == InReg and loc.r == r: return true
+  ## Same immutable-per-proc home set as `regHoldsHome` — served from its mask.
+  regHoldsHome(g, r)
 
 # MODEL: the `pickStaging` action in proofs/arkham_bindings.tla — only ever returns a
 # register with no live owner (the `Free` guard); staging on an occupied reg breaks
