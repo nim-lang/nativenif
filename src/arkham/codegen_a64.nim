@@ -671,7 +671,7 @@ proc genProctypeSig(g: var CodeGen; c: var Cursor) =
             # emitSignature): the caller reads the return registers directly.
             skip c
           else:
-            g.ab.symDef "ret.0"
+            g.ab.symDef synth("ret.0")
             g.ab.reg IntRet                     # raw reg *location* of the result
             g.genPointee(c)                     # return type BY REFERENCE (named → sym)
         while c.hasMore: skip c                  # pragmas
@@ -712,7 +712,7 @@ proc emitSyprocA64(g: var CodeGen; sp: SyscallProc) =
               inc idx
       g.ab.tree ResultD:                         # c at the return type
         if not retIsVoid(c):
-          g.ab.symDef "ret.0"
+          g.ab.symDef synth("ret.0")
           g.ab.reg IntRet
           g.genTypeBody(c)
       g.ab.intLit sp.sysNrA64.int64
@@ -949,8 +949,9 @@ proc exitScope(g: var CodeGen) =
 proc freshLabel(g: var CodeGen): string =
   # Name must be a NIF *symbol* (needs a '.'), but `extractBasename` strips a
   # trailing `.<digits>`, so put the counter *before* the suffix ("L0.0", …)
-  # to keep basenames ("L0", "L1") distinct.
-  result = "L" & $g.labelCount & ".0"
+  # to keep basenames ("L0", "L1") distinct. `SynthMark` keeps them out of the
+  # Leng namespace, where a `block L0:` would produce the very same name.
+  result = synth("L") & $g.labelCount & ".0"
   inc g.labelCount
 
 proc emLab(g: var CodeGen; name: string) =
@@ -1225,7 +1226,7 @@ proc emitSignature(g: var CodeGen; decl: Cursor; declarative: bool) =
             # `(res ret.0)` binding to declare here (mirrors the x64 rax:rdx result).
             skip c
           else:
-            g.ab.symDef "ret.0"
+            g.ab.symDef synth("ret.0")
             g.ab.reg IntRet                   # raw reg *location* of the result
             g.genTypeBody(c)                  # the result type (consumes it)
       while c.hasMore: skip c                 # pragmas, body
@@ -2332,7 +2333,7 @@ proc aggrArgAddr(g: var CodeGen; a: Cursor; dst: Reg) =
       else: g.ab.tree LeaA64: (g.emReg dst; g.ab.sym home)
   else:                                                 # oconstr/aconstr → build into a temp, then &temp
     let pos = g.posOf(a)
-    let home = "aggtmp" & $pos & ".0"
+    let home = synth("aggtmp") & $pos & ".0"
     g.emTypedStackVar(home, g.getType(a))
     g.varType[home] = symName(g.getType(a))
     g.genStore2(a, namedStackLoc(home, g.exprSlot(a)))
@@ -2484,7 +2485,7 @@ proc genNestedAggrField(g: var CodeGen; dst: Location; valC, fty: Cursor) =
     raiseAssert "arkham a64n: nested aggregate field of non-nominal type"
   let ntn = symName(fty)
   let pos = g.posOf(valC)
-  let tmpName = "nctmp" & $pos & ".0"
+  let tmpName = synth("nctmp") & $pos & ".0"
   g.emTypedStackVar(tmpName, fty)
   g.varType[tmpName] = ntn
   g.genStore2(valC, namedStackLoc(tmpName, slotOf(g.prog, fty)))   # build (no bridge held)
@@ -2595,7 +2596,7 @@ template aconstrElemStores(g: var CodeGen; c: Cursor; destOp, addrOp: untyped) =
         if elemSlot.kind == AMem:                       # nested aggregate element
           let ntn = symName(elemTyRaw)
           let pos = g.posOf(valC)
-          let tmpName = "nctmp" & $pos & ".0"
+          let tmpName = synth("nctmp") & $pos & ".0"
           g.emTypedStackVar(tmpName, elemTyRaw)
           g.varType[tmpName] = ntn
           g.genStore2(valC, namedStackLoc(tmpName, elemSlot))  # build (no bridge held)
@@ -2677,7 +2678,7 @@ proc genBaseobj2(g: var CodeGen; c: Cursor; dst: Location) =
     let valC = cc
     let pos = g.posOf(valC)
     let derivedTy = g.getType(valC)
-    let dtmp = "botmp" & $pos & ".0"
+    let dtmp = synth("botmp") & $pos & ".0"
     g.emTypedStackVar(dtmp, derivedTy)
     g.varType[dtmp] = symName(derivedTy)
     g.genStore2(valC, namedStackLoc(dtmp, g.exprSlot(valC)))  # build derived
@@ -4143,7 +4144,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
               else: home = symName(a)
             else:
               let p = g.posOf(a)
-              home = "aggtmp" & $p & ".0"
+              home = synth("aggtmp") & $p & ".0"
               g.emTypedStackVar(home, g.getType(a))
               g.varType[home] = tn
               g.genStore2(a, namedStackLoc(home, callArgSlots[j]))
@@ -4201,7 +4202,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
       if hasResult and not resultByRef and not resultIsFloat and resSlot.kind != AMem:
         g.ab.tree MovA64:
           g.emReg IntRet
-          g.ab.tree ResX: g.ab.sym "ret.0"
+          g.ab.tree ResX: g.ab.sym synth("ret.0")
     if fnTargetName.len > 0:
       g.ab.tree KillA64: g.ab.sym fnTargetName
       discard g.rb.takeBinding(fnptrReg)
@@ -4257,7 +4258,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
             else: home = symName(a)
           else:
             let pos = g.posOf(a)
-            home = "aggtmp" & $pos & ".0"
+            home = synth("aggtmp") & $pos & ".0"
             g.emTypedStackVar(home, tcur)
             g.varType[home] = tn
             g.genStore2(a, namedStackLoc(home, g.exprSlot(a)))
@@ -4546,7 +4547,7 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
             # memory lvalue): materialize into a synthetic temp via the general store
             # path (mirrors the aggregate call-argument marshalling), then marshal out.
             let pos = g.posOf(cc)
-            srcName = "rettmp" & $pos & ".0"
+            srcName = synth("rettmp") & $pos & ".0"
             var tcur = cc
             if cc.exprKind in {OconstrC, AconstrC}: inc tcur   # the constructed type
             else: tcur = g.getType(cc)

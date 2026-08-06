@@ -79,8 +79,8 @@ iterator gprBindings*(rb: RegBind): (Reg, string) =
 
 proc freshTmpName*(rb: var RegBind; prefix = "tmp"): string =
   ## A fresh per-proc scratch-binding name (`tmpN.0`; `fntmp` for an indirect
-  ## call target). Distinct basenames — nifasm scopes by basename.
-  result = prefix & $rb.tmpBindCount & ".0"
+  ## call target), in arkham's synthetic namespace (see `SynthMark`).
+  result = synth(prefix) & $rb.tmpBindCount & ".0"
   inc rb.tmpBindCount
 
 proc bindScratch*(rb: var RegBind; r: Reg; name: string; isPtr: bool) =
@@ -151,7 +151,7 @@ proc rebindLocal*(rb: var RegBind; r: Reg; name: string; isPtr: bool) =
 # ── float transitions (the SIMD twins) ──────────────────────────────────────
 
 proc freshFTmpName*(rb: var RegBind): string =
-  result = "ftmp" & $rb.ftmpBindCount & ".0"
+  result = synth("ftmp") & $rb.ftmpBindCount & ".0"
   inc rb.ftmpBindCount
 
 proc bindFScratch*(rb: var RegBind; f: FReg; name: string) =

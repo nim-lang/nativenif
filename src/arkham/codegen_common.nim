@@ -692,11 +692,12 @@ proc genGlobalInitValue*(g: var CodeGen; name: string; typ, val: Cursor; hasValu
         "assignment, which is where hexer lowers it"
 
 proc paramName*(idx: int): string {.inline.} =
-  ## The asm-NIF symbol for positional call parameter `idx`. nifasm's scope keys
-  ## symbols by NIF *basename* (the part before the `.<counter>` suffix), so the
-  ## counter cannot disambiguate — `p.0` and `p.1` would both reduce to basename
-  ## `p` and collide. Each param therefore gets a distinct basename `pN`.
-  result = "p" & $idx & ".0"
+  ## The asm-NIF symbol for positional call parameter `idx`. nifasm scopes a
+  ## symbol by its full name, so the ordinal has to live in the *name*: `p.0`
+  ## and `p.1` are two names for the same thing to a reader and buy nothing
+  ## here, whereas `pN.0` is unambiguous. `SynthMark` keeps the whole family out
+  ## of the Leng namespace — see its doc comment for the bug that proved it must.
+  result = synth("p") & $idx & ".0"
 
 proc operandInReg*(g: var CodeGen; operand: Cursor; dest: Reg): bool =
   ## Does the (peeked, not consumed) `operand` resolve to a register-resident
@@ -912,7 +913,7 @@ proc mintSpillName*(g: var CodeGen; prefix: string): string =
   ## slot decls are legal nifasm (the aggtmp constructor temps already rely on
   ## that) — and flags `ra.hasStackVars` so the frame `sub` is emitted when the
   ## prologue is finalized.
-  result = prefix & $g.emitTmpSpills & ".0"
+  result = synth(prefix) & $g.emitTmpSpills & ".0"
   inc g.emitTmpSpills
   g.ra.hasStackVars = true
 
