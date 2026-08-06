@@ -18,6 +18,8 @@
 import std / tables
 import nifcore, nifcdecl
 import slots, programs
+when defined(fieldDebug):
+  import nifcoreparse
 
 type
   SymCat* = enum
@@ -119,6 +121,9 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
       var t = c
       t.into:
         let objTy = resolveType(tc.prog[], tc.getType(t)); skip t  # past the base subtree
+        when defined(fieldDebug):
+          if not (objTy.kind == TagLit and objTy.typeKind == ObjectT):
+            echo "BAD DOT: ", toString(c, includeLineInfo = false)
         result = fieldType(tc.prog[], objTy, symName(t)); inc t
         while t.hasMore: skip t
     of AtC, PatC:
