@@ -847,16 +847,15 @@ proc selectStagingSlot*(g: var CodeGen; sd: SelectDiamond): AsmSlot =
 
 proc regHoldsHome*(g: var CodeGen; r: Reg): bool =
   ## A named local/param is homed in `r` (a pre-pass decision, immutable for the
-  ## whole proc — steals/demotes resolve before emission starts).
-  for name, pos in g.ra.symPos:
-    let loc = g.ra.locs[pos]
-    if loc.kind == InReg and loc.r == r: return true
+  ## whole proc — steals/demotes resolve before emission starts). Served from the
+  ## cached mask: a full `symPos` scan per query made emission quadratic in proc size.
+  if g.ra.homesDirty: rebuildHomes(g.ra)
+  r in g.ra.homeRegs
 
 proc fregHoldsHome*(g: var CodeGen; f: FReg): bool =
   ## The SIMD twin of `regHoldsHome`.
-  for name, pos in g.ra.symPos:
-    let loc = g.ra.locs[pos]
-    if loc.kind == InFReg and loc.f == f: return true
+  if g.ra.homesDirty: rebuildHomes(g.ra)
+  f in g.ra.homeFRegs
 
 proc regFreeForTemp*(g: var CodeGen; r: Reg): bool =
   ## May the merged emitter hand `r` out as an expression temp right now? Not
