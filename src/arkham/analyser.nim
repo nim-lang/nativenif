@@ -134,6 +134,17 @@ type
     usedParams: HashSet[string] ## names of params read within this loop (any depth); on
                                ## loop exit, if `sawCall`, each is flagged `usedAfterCall`
 
+  ClobberSite = object
+    ## A fixed-role-register clobber (div/mod → rdx, variable shift → rcx) at token
+    ## position `pos`, inside the scope-level statement starting at `stmtStart`.
+    ## The statement start matters because operand EVALUATION order differs from
+    ## token order: in `bitand(mask, shl(1, n))` the mask's textually-last use
+    ## precedes the shl's tokens, yet its value is consumed by the AND *after* the
+    ## shift executed — so a local whose interval merely touches the statement
+    ## containing the clobber must be denied the fixed-role home.
+    pos: int
+    stmtStart: int
+
   Context = object
     inLoops, inAddr, inAsgnTarget, inArrayIndex: int
     arg0Name: string           ## name of the FIRST integer/pointer param (the one homed in
@@ -143,16 +154,18 @@ type
                                ## accesses) — the points where caller-saved regs die. A
                                ## local may use `AllRegs` iff none of these fall in its
                                ## live interval. Recorded in source order; scanned linearly.
-    divPositions: seq[int]     ## token position of every div/mod (clobbers rdx). An
-                               ## `AllRegs` local additionally earns `DivRegOk` (rdx is a
-                               ## legal home) iff none of these fall in its live interval.
-    shiftPositions: seq[int]   ## token position of every *variable* shift (clobbers rcx);
+    divPositions: seq[ClobberSite]   ## every div/mod (clobbers rdx). An `AllRegs` local
+                               ## additionally earns `DivRegOk` (rdx is a legal home) iff
+                               ## none of these overlaps its live interval.
+    shiftPositions: seq[ClobberSite] ## every *variable* shift (clobbers rcx);
                                ## the `ShiftRegOk` analog of `divPositions`.
     loopStack: seq[LoopFrame]  ## the enclosing loops (`WhileS`), innermost last — so a var
                                ## declared/used in a loop can record its loop's extent, and a
                                ## loop's back-edge liveness is resolved when its frame is popped
     stmtEnd: seq[int]          ## per open scope frame: end position of the
                                ## statement it is currently processing
+    stmtStart: seq[int]        ## per open scope frame: START position of that same
+                               ## statement — `ClobberSite.stmtStart` comes from here
     buf: ptr TokenBuf          ## for cursor → token-position mapping
     tvars: HashSet[string]     ## thread-local var names: a reference acts like a call
     cleanCallees: HashSet[string]  ## decl names of procs with a clean signature (all-scalar
@@ -189,6 +202,7 @@ template iterStmts(c: var Context; n: var Cursor; body: untyped) =
   n.into:
     while n.hasMore:
       var e = n; skip e                   # end position of this child statement
+      c.stmtStart[^1] = posOf(c, n)
       c.stmtEnd[^1] = posOf(c, e)
       body
 
@@ -196,8 +210,10 @@ template scopeFrame(c: var Context; body: untyped) =
   ## Push the `stmtEnd` frame for a variable scope (a `scope`, or the proc body) —
   ## the unit `freeAfter`/`frameIdx` are measured in, one per `openScope`.
   c.stmtEnd.add 0
+  c.stmtStart.add 0
   body
   discard c.stmtEnd.pop()
+  discard c.stmtStart.pop()
 
 proc analyse(c: var Context; n: var Cursor)
 
@@ -434,7 +450,7 @@ proc analyse(c: var Context; n: var Cursor) =
       of InstrC: analyseInstr(c, n)
       of DivC, ModC:
         c.res.clobbersDivReg = true     # idiv/div clobbers rdx
-        c.divPositions.add posOf(c, n)  # ... at THIS point: denies rdx-as-home across it
+        c.divPositions.add ClobberSite(pos: posOf(c, n), stmtStart: c.stmtStart[^1])
         analyseChildren(c, n)
       of ShlC, ShrC:
         # A *variable* shift needs the count in cl, clobbering rcx; a constant shift
@@ -444,7 +460,7 @@ proc analyse(c: var Context; n: var Cursor) =
           skip probe                    # value
           if not isConstShiftCount(probe):
             c.res.clobbersShiftReg = true
-            c.shiftPositions.add posOf(c, n)  # denies rcx-as-home across it
+            c.shiftPositions.add ClobberSite(pos: posOf(c, n), stmtStart: c.stmtStart[^1])
           while probe.hasMore: skip probe
         analyseChildren(c, n)
       else:
@@ -688,13 +704,18 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
       # life, so it is a legal extra home — the register-count generalization of
       # `AllRegs` (same interval test, per fixed-role register). The `regOccupied`
       # assertions in the allocator are the safety net if this analysis is wrong.
+      # `s.pos > lo and hi >= s.stmtStart`, not the naive `s.pos <= hi`: a local
+      # whose textually-last use precedes the clobber INSIDE the same statement
+      # (operand of an instruction whose other operand subtree holds the div/shift,
+      # e.g. `bitand(mask, shl(1, n))`) is still consumed AFTER the clobber
+      # executes, so touching the clobber's statement at all denies the home.
       var crossesDiv = false
-      for p in c.divPositions:
-        if p > lo and p <= hi: (crossesDiv = true; break)
+      for s in c.divPositions:
+        if s.pos > lo and hi >= s.stmtStart: (crossesDiv = true; break)
       if not crossesDiv: vi.props.incl DivRegOk
       var crossesShift = false
-      for p in c.shiftPositions:
-        if p > lo and p <= hi: (crossesShift = true; break)
+      for s in c.shiftPositions:
+        if s.pos > lo and hi >= s.stmtStart: (crossesShift = true; break)
       if not crossesShift: vi.props.incl ShiftRegOk
   # ArgResident: a PARAM (freeAfter == high) may keep its incoming arg register instead of
   # a callee-saved home iff EVERY use of it executes before ANY call returns
