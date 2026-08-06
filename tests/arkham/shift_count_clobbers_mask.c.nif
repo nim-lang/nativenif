@@ -1,0 +1,92 @@
+(.nif27)
+(stmts
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :id.0
+  (params
+   (param :v.0 .
+    (i 64)))
+  (i 64).
+  (stmts
+   (ret v.0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :c1.0 .
+    (i 64)
+    (call id.0 1))
+   (var :c2.0 .
+    (i 64)
+    (call id.0 2))
+   (var :c3.0 .
+    (i 64)
+    (call id.0 3))
+   (var :c4.0 .
+    (i 64)
+    (call id.0 4))
+   (var :c5.0 .
+    (i 64)
+    (call id.0 5))
+   (var :f1.0 .
+    (i 64)
+    (add
+     (i 64)c1.0 10))
+   (var :f2.0 .
+    (i 64)
+    (add
+     (i 64)c2.0 10))
+   (var :f3.0 .
+    (i 64)
+    (add
+     (i 64)c3.0 10))
+   (var :f4.0 .
+    (i 64)
+    (add
+     (i 64)c4.0 10))
+   (var :op.0 .
+    (u 64)3u)
+   (var :mask.0 .
+    (u 8)24u)
+   (var :bit.0 .
+    (u 8)
+    (bitand
+     (u 8)mask.0
+     (shl
+      (u 8)
+      (cast
+       (u 8)1u)
+      (bitand
+       (u 64)op.0 7u))))
+   (var :sum.0 .
+    (i 64)
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (add
+       (i 64)
+       (add
+        (i 64)
+        (add
+         (i 64)
+         (add
+          (i 64)
+          (add
+           (i 64)
+           (add
+            (i 64)f1.0 f2.0)f3.0)f4.0)c5.0)c1.0)c2.0)c3.0)c4.0))
+   (call exit.c
+    (add
+     (i 64)
+     (cast
+      (i 64)bit.0)
+     (sub
+      (i 64)sum.0 31))))))(.index)

@@ -262,6 +262,13 @@ const arkhamStressA64Known: seq[string] = @[
   "spill_produce_float",    # float produce-into-spill reads a clobbered register
   "steal_straddle",         # trySteal over a straddling live range yields a stale value
   "atomic_cas_regpressure", # intrinsic-operand pick has no steal/spill arm
+  "shift_count_clobbers_mask", # spill path emits a stackoff (i 64) into a (u 8) value
+                            # slot under k=3 — the "stackoff into a value slot"
+                            # class, same as aggr_copy_regpressure on x64. The
+                            # fixture's own job is x86-64-only (rcx shift-count
+                            # clobber vs a ShiftRegOk-homed local); a64 has no
+                            # fixed shift-count register, so this entry hides
+                            # nothing the fixture is meant to guard.
   # NOT listed, but known: `addr_chain_depth` is the x16 twin of the x86-64
   # `addr_chain_depth` entry above — `produceIntoMem2` re-enters the produce
   # bridge while an enclosing `emitBin2`'s partial is still live in it — and
