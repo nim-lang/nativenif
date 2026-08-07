@@ -42,6 +42,8 @@ let ScalarSlot = AsmSlot(cls: AInt, size: 8, align: 8)
 
 proc bindTemp(g: var CodeGen; r: Reg; typ: AsmSlot)
 proc unbindTemp(g: var CodeGen; r: Reg)
+proc emWordThroughPtr(g: var CodeGen; p: Reg; idx: int)
+proc emPtrElemMem(g: var CodeGen; p: Reg; elemTy: Cursor; idx: int)
 
 proc emReg(g: var CodeGen; r: Reg) {.inline.} =
   ## A value register operand. If `r` currently hosts a named local, emit the
@@ -561,8 +563,10 @@ proc scalarMemMov(g: var CodeGen; loc: Location; reg: Reg; load: bool) =
   ## The one GPR scalar memory move over every lvalue kind, both directions:
   ## `load` → `reg ← <loc>`; else `<loc> ← reg`. Load and store are mirror images
   ## — the value register and the memory operand swap order in the `(mov …)` — apart
-  ## from `Glob`: a store stages a separate address temp (it must not clobber
-  ## `reg`), whereas a load reuses `reg` itself as the address scratch.
+  ## from `Glob`, which has to materialize an address first (x86-64 has no typed
+  ## RIP-relative memory operand): a store must stage that address in a SEPARATE
+  ## register, since `reg` still holds the value being stored, while a load can fall
+  ## back to staging it in `reg` itself. See the branch.
   case loc.kind
   of InReg:
     if load: g.movReg(reg, loc.r) else: g.movReg(loc.r, reg)
@@ -573,19 +577,44 @@ proc scalarMemMov(g: var CodeGen; loc: Location; reg: Reg; load: bool) =
   of Glob:
     if load:                                       # &g into a typed staging temp, then deref
       # The address temp is `(ptr <globalType>)` so the `(mem p)` deref yields the
-      # global's PRECISE type. Reusing `reg` (bound to the *value* type) as the address
-      # drops a pointer level — harmless for a scalar global (`addrWidthMove` tolerates
-      # it), but a POINTER global would then load `object` where `(ptr object)` is wanted
-      # (nifasm is strict). Mirror the store branch below.
+      # global's PRECISE type. Mirror of the store branch below, and the form to prefer:
+      # `reg` keeps one binding for the whole step.
       var pSlot = ScalarSlot
       if not cursorIsNil(loc.typ.typ):
         pSlot = typeToSlot(g.prog.ptrTypeOf(loc.typ.typ))
-      let p = g.pickStagingSealed("a global load address", pSlot)
-      g.emGlobalAddr(p, loc.name)
-      g.ab.tree MovX64:
-        g.emReg reg
-        g.ab.tree MemX: g.emReg p
-      g.giveBack p
+      var p = g.pickStagingScratch()
+      if p == NoReg and g.rb.isBoundTemp(reg):
+        # NOTHING free — and this step must not be the one that fails, because it is
+        # reached from inside an address computation that already owns every staging
+        # register (`-d:danger` `toDecimal64`: an `(at <global> <expr>)` whose base
+        # address is staged and whose index reads a second global). So drop the demand
+        # to ZERO extra registers instead of hunting for one, per design.md's "keep
+        # each step's demand inside that budget".
+        #
+        # `reg` is the LOAD's destination: whatever it holds is dead, so it can carry
+        # the address for the two instructions before the value lands in it. The
+        # pointer level that costs — nifasm would deref a `(ptr T)`-bound `reg` to `T`
+        # while the destination wants `T` — is supplied by the `(cast (aptr T) …)` the
+        # element operand already wraps its address register in, which reads `reg`
+        # whatever its binding says. So `reg` is bound as a raw address across the
+        # `lea` and as the value's own type across the `mov`; both rebinds are
+        # zero machine code.
+        g.releaseStaleName(reg)
+        g.bindTemp(reg, AddrSlot)                  # a raw `(u 64)` address for the lea
+        g.emGlobalAddr(reg, loc.name)
+        g.releaseStaleName(reg)
+        g.bindTemp(reg, loc.typ)                   # the value's own type for the mov
+        g.ab.tree MovX64:
+          g.emReg reg
+          if cursorIsNil(loc.typ.typ): g.emWordThroughPtr(reg, 0)
+          else: g.emPtrElemMem(reg, loc.typ.typ, 0)
+      else:
+        p = g.pickStagingSealed("a global load address", pSlot)
+        g.emGlobalAddr(p, loc.name)
+        g.ab.tree MovX64:
+          g.emReg reg
+          g.ab.tree MemX: g.emReg p
+        g.giveBack p
     else:                                          # &g into a staging temp, then store
       # Type the address temp as `(ptr <globalType>)` so the `(mem p)` deref carries
       # the global's PRECISE type — a store of a typed pointer value into a pointer
@@ -1234,8 +1263,6 @@ proc emAggrFieldMem(g: var CodeGen; base, field: string) =
     # name, just like a `NamedStack` var — the allocator simply doesn't track it.
     if g.varType.hasKey(base): g.emFieldMem(base, field)
     else: raiseAssert "arkham x64 v0: aggregate base neither stack nor pointer: " & base
-
-proc emWordThroughPtr(g: var CodeGen; p: Reg; idx: int)   # defined below
 
 proc transferAggrWords(g: var CodeGen; varName, typeName: string;
                        regs: openArray[Reg]; toRegs: bool) =
