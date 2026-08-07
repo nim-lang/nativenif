@@ -241,6 +241,13 @@ const arkhamStressKnown: seq[string] = @[
   "aggr_arg_parked_byref",
   "aggr_arg_parked_manual",
   "atomic_cas_regpressure", # intrinsic-operand pick has no steal/spill arm
+  # Same missing arm, one step further in: this fixture's job is the DEFAULT
+  # register file, where it pins `instrOperandInPlace` (it is the compare-exchange
+  # out of `realloc` that `nimony n -d:danger` died on, and it fails on any arkham
+  # without that fix at k>=4 and unstressed alike). At k<=3 the operands' own
+  # address computations run the staging bridge dry before the row is reached —
+  # a different step, broken here identically before and after the fix.
+  "atomic_cas_operand_home",
   # SILENT MISCOMPILE (71 -> 95), and a64 has the same defect (see below).
   # `produceIntoMem2` hands out the produce bridge for the WHOLE node on the
   # claim that it is "not held across the recursion". True for a leaf or a load;
@@ -261,6 +268,14 @@ const arkhamStressA64Known: seq[string] = @[
   "spill_produce_float",    # float produce-into-spill reads a clobbered register
   "steal_straddle",         # trySteal over a straddling live range yields a stale value
   "atomic_cas_regpressure", # intrinsic-operand pick has no steal/spill arm
+  # `instrOperandInPlace` — read a register-homed symbol operand where it lies
+  # instead of copying it into a register the row then cannot find — is x86-64
+  # ONLY, deliberately: that is the machine whose whole emitter budget is two
+  # registers, and every atomic sequence there was read to confirm it writes no
+  # operand. a64 has x9–x13 plus two bridges and passes this fixture unstressed;
+  # porting the rule is a separate change with its own reading of the LDXR/STXR
+  # sequences, not a paste.
+  "atomic_cas_operand_home",
   "shift_count_clobbers_mask", # spill path emits a stackoff (i 64) into a (u 8) value
                             # slot under k=3 — the "stackoff into a value slot"
                             # class. (Not the `SynthMark` shadowing bug that used
