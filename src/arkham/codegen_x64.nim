@@ -6074,6 +6074,32 @@ proc takeInstrReg(g: var CodeGen; slot: AsmSlot): Location =
   g.ra.seal {s}
   result = regLoc(s, slot, isTemp = true)
 
+proc instrOperandInPlace(g: var CodeGen; a: Cursor; avoid: set[Reg]): Location =
+  ## An intrinsic operand that is a SYMBOL already living in a register is read
+  ## WHERE IT LIES, instead of `takeInstrReg`-ing a second register and `mov`ing
+  ## the value across. The copy is free on a wide machine and ruinous on this one:
+  ## the emitter's whole budget is r10 + r11 (design.md, "keep each step's demand
+  ## inside that budget"), and a compare-exchange needs THREE registers at once
+  ## plus its rax claim. Under `-d:danger` the allocator homes a local in every
+  ## other volatile, so the third pick had nothing left and the `atomicCompareExchange`
+  ## inlined into `realloc` did not compile at all.
+  ##
+  ## Sound because every row reaching here treats its operands as pure input: a
+  ## two-address `roInout` row returns before this, the atomic sequences write only
+  ## their `work` register, rax and the result (see `genAtomicXadd`'s note), and
+  ## `emitIntrinsicOps` only ever reads `src0`. `avoid` is what the lowering DOES
+  ## write — its claims and the result — since an operand read after the row
+  ## clobbered its home would read the row's own output.
+  ##
+  ## `isTemp` stays false: this register is a local's home, not something the row
+  ## may bind, unbind or give back. That is what the `d.isTemp` guards on the two
+  ## release loops below are for.
+  result = Location(kind: Undef)
+  if a.kind != Symbol: return
+  let home = g.ra.locationOfSym(symName(a))
+  if home.kind == InReg and home.r notin avoid:
+    result = home
+
 proc atomicValueMayBeImmE(op: IntrinsicOp; i: int): bool {.inline.} =
   ## May an atomic's operand `i` stay a literal on x86-64? (Port of the
   ## allocator's `atomicValueMayBeImm`, x64 half.)
@@ -6141,6 +6167,11 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
     res = dest
   let sealedHere = res.kind == InReg and not res.isTemp and not g.ra.isSealed(res.r)
   if sealedHere: g.ra.seal {res.r}
+  # What the row's own lowering writes, and which an operand may therefore not be
+  # read out of. The seals above already keep the PICKS off these; this set is for
+  # `instrOperandInPlace`, which does not pick at all.
+  var written = claims
+  if res.kind == InReg: written.incl res.r
   var ops: seq[Location] = @[]
   block:
     var i = 0
@@ -6150,7 +6181,8 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
         if (row.tie >= 0 and i != row.tie) or atomicValueMayBeImmE(tgt.op, i):
           regOrImm(g.exprSlot(a))
         else:
-          g.takeInstrReg(g.exprSlot(a))
+          g.instrOperandInPlace(a, written)
+      if d.kind == Undef: d = g.takeInstrReg(g.exprSlot(a))
       g.emitValue2(a, d)
       g.ra.locs[cursorToPosition(g.buf[], a)] = d
       ops.add d
@@ -6160,7 +6192,7 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
   if tgt.op.isAtomic:
     g.emitAtomicInstr2(c, tgt.op, argCurs, res)
     for d in ops:
-      if d.kind == InReg and not (res.kind == InReg and d.r == res.r):
+      if d.kind == InReg and d.isTemp and not (res.kind == InReg and d.r == res.r):
         g.giveBack d.r
     return
   if res.kind != InReg:
@@ -6185,7 +6217,9 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
     rotCount = cnt.ival
   g.emitIntrinsicOps(tgt.op, tgt.argBits, res.r, src0, rotCount)
   for d in ops:
-    if d.kind == InReg and d.r != res.r: g.giveBack d.r
+    # `isTemp`: an operand read in place (`instrOperandInPlace`) is a LOCAL'S HOME —
+    # `giveBack` would kill a binding and break a seal this row never made.
+    if d.kind == InReg and d.isTemp and d.r != res.r: g.giveBack d.r
   dest = res
 proc emitFValue2(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED SIMD value: resolve `dest` (an xmm constraint / fixed register /

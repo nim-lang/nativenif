@@ -1,0 +1,108 @@
+(.nif27)
+(.indexat 1                )
+(stmts
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :acx.0
+  (params
+   (param :p.0 .
+    (ptr
+     (i 64)))
+   (param :ep.0 .
+    (ptr
+     (i 64)))
+   (param :des.0 .
+    (i 64))
+   (param :wk.0 .
+    (bool))
+   (param :so.0 .
+    (i 32))
+   (param :fo.0 .
+    (i 32)))
+  (bool)
+  (pragmas
+   (intrinsic "AtomicCompareExchange"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :cells.0 .
+    (array
+     (i 64)4).)
+   (var :exps.0 .
+    (array
+     (i 64)4).)
+   (var :i.0 .
+    (i 64)1)
+   (var :j.0 .
+    (i 64)2)
+   (var :des.0 .
+    (i 64)9)
+   (var :a.0 .
+    (i 64)1)
+   (var :b.0 .
+    (i 64)2)
+   (var :c.0 .
+    (i 64)3)
+   (var :d.0 .
+    (i 64)4)
+   (var :e.0 .
+    (i 64)5)
+   (var :f.0 .
+    (i 64)6)
+   (var :g.0 .
+    (i 64)7)
+   (var :h.0 .
+    (i 64)8)
+   (asgn
+    (at cells.0 1)5)
+   (asgn
+    (at exps.0 2)5)
+   (var :ok.0 .
+    (bool)
+    (instr acx.0
+     (addr
+      (at cells.0 i.0))
+     (addr
+      (at exps.0 j.0))des.0
+     (false)0 0))
+   (var :sum.0 .
+    (i 64)
+    (add
+     (i 64)a.0
+     (add
+      (i 64)b.0
+      (add
+       (i 64)c.0
+       (add
+        (i 64)d.0
+        (add
+         (i 64)e.0
+         (add
+          (i 64)f.0
+          (add
+           (i 64)g.0 h.0))))))))
+   (asgn sum.0
+    (add
+     (i 64)sum.0
+     (add
+      (i 64)
+      (at cells.0 1)
+      (add
+       (i 64)
+       (at exps.0 2)des.0))))
+   (if
+    (elif ok.0
+     (stmts
+      (asgn sum.0
+       (add
+        (i 64)sum.0 7)))))
+   (call exit.c sum.0))))(.index)
