@@ -58,11 +58,36 @@ proc defineLabel*(buf: var Buffer; label: LabelId) =
   buf.labels.add(LabelDef(id: label, position: buf.data.len))
 
 proc getLabelPosition*(buf: Buffer; label: LabelId): int =
-  ## Get the position of a label definition
+  ## Get the position of a label definition. A linear scan, which is fine for the
+  ## one-off callers; anything that resolves EVERY reloc's target must build a
+  ## `labelPositions` table instead — see it for why.
   for labelDef in buf.labels:
     if labelDef.id == label:
       return labelDef.position
   raise newException(ValueError, "Label not found")
+
+proc labelPositions*(buf: Buffer): seq[int] =
+  ## Every label's position, indexed by its id; `-1` for an id never defined (0 is a
+  ## legal position — the first byte of the buffer — so the sentinel cannot be 0).
+  ## `createLabel` hands ids out densely from 0, so this is an array, not a table.
+  ##
+  ## Exists because `getLabelPosition` is a linear scan over `buf.labels` and
+  ## `updateRelocDisplacements` called it once per relocation: 106,810 relocs
+  ## against 154,679 labels on a `nimsem` link, which was 40% of nifasm's entire
+  ## run time. It is built at the point of use rather than cached in `Buffer`
+  ## because the jump optimizers (`threadJumps`, `invertCondJumps`,
+  ## `shortenX64Jumps`) rewrite label positions in place, and a stored table would
+  ## have to be invalidated at each of them.
+  ##
+  ## FIRST definition wins, matching `getLabelPosition`'s scan order.
+  var n = buf.nextLabelId
+  for labelDef in buf.labels:                 # a buffer may carry ids minted elsewhere
+    if int(labelDef.id) >= n: n = int(labelDef.id) + 1
+  result = newSeq[int](n)
+  for i in 0 ..< n: result[i] = -1
+  for labelDef in buf.labels:
+    let id = int(labelDef.id)
+    if result[id] < 0: result[id] = labelDef.position
 
 # Relocation helper functions
 proc addReloc*(buf: var Buffer; position: int; target: LabelId; kind: RelocKind; size: int) =
@@ -94,12 +119,16 @@ proc calculateRelocDistance*(fromPos: int; toPos: int; kind: RelocKind = rkJmp):
 # Jump optimization functions
 proc updateRelocDisplacements*(buf: var Buffer) =
   ## Update all relocation displacements based on current label positions
+  let labelPos = buf.labelPositions()   # O(1) per lookup; see `labelPositions`
   for reloc in buf.relocs:
     # Skip IAT calls - they are patched later when IAT address is known
     if reloc.kind == rkIatCall:
       continue
     let currentPos = reloc.position
-    let targetPos = buf.getLabelPosition(reloc.target)
+    let t = int(reloc.target)
+    if t < 0 or t >= labelPos.len or labelPos[t] < 0:
+      raise newException(ValueError, "Label not found")   # as `getLabelPosition`
+    let targetPos = labelPos[t]
     let distance = calculateRelocDistance(currentPos, targetPos, reloc.kind)
 
     # Convert to signed 32-bit for proper encoding
