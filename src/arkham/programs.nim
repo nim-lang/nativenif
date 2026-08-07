@@ -1087,7 +1087,8 @@ proc fieldType*(p: var Program; objType: Cursor; field: string): Cursor =
   ## An inherited field (the Leng `(dot base field depth)` selector counts the
   ## base levels) is resolved by recursing into the object's base type.
   assert objType.kind == TagLit and objType.typeKind == ObjectT,
-    "arkham: field access requires an object type"
+    "arkham: field access requires an object type (field " & field &
+    ", base resolves to " & toString(objType, includeLineInfo = false) & ")"
   var oc = objType
   var baseType: Cursor
   var hasBase = false

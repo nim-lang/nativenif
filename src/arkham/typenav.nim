@@ -18,6 +18,8 @@
 import std / tables
 import nifcore, nifcdecl
 import slots, programs
+when defined(fieldDebug):
+  import nifcoreparse
 
 type
   SymCat* = enum
@@ -47,7 +49,12 @@ proc lookupSym*(tc: TypeCtx; nm: string): SymInfo =
   ## `genVal`) classify on the result rather than re-deciding local-vs-foreign.
   if tc.globals[].hasKey(nm): return SymInfo(cat: scGlobal, decl: tc.globals[][nm])
   if tc.tvars[].hasKey(nm): return SymInfo(cat: scTvar, decl: tc.tvars[][nm])
-  if tc.callTarget[].hasKey(nm): return SymInfo(cat: scProc, asmName: tc.callTarget[][nm].asmName)
+  if tc.callTarget[].hasKey(nm) and not tc.callTarget[][nm].indirect:
+    # An `indirect` entry is the cached call path THROUGH a fn-ptr variable —
+    # the symbol itself is a global/tvar, not a proc. Emitting such a call
+    # first must not make a later `(asgn sym …)` (or any lvalue use) classify
+    # the variable as a proc, so fall through to the decl lookups for it.
+    return SymInfo(cat: scProc, asmName: tc.callTarget[][nm].asmName)
   var found = false
   let d = lookupForeignDecl(tc.prog[], nm, found)
   if found:
@@ -114,6 +121,9 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
       var t = c
       t.into:
         let objTy = resolveType(tc.prog[], tc.getType(t)); skip t  # past the base subtree
+        when defined(fieldDebug):
+          if not (objTy.kind == TagLit and objTy.typeKind == ObjectT):
+            echo "BAD DOT: ", toString(c, includeLineInfo = false)
         result = fieldType(tc.prog[], objTy, symName(t)); inc t
         while t.hasMore: skip t
     of AtC, PatC:

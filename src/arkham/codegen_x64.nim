@@ -3811,11 +3811,22 @@ proc constrFieldStores(g: var CodeGen; c: Cursor; base: Location) =
 proc genConstrIntoLval2(g: var CodeGen; c: Cursor; lhs: Cursor) =
   ## Emit `(oconstr T (kv field value)*)` straight into the memory aggregate addressed
   ## by lvalue `lhs` (e.g. `n->chunks[0] = (p, size)`). The address-targeted twin of
-  ## `genConstr2`: materialize the lvalue's embedded regs once, then store each field
-  ## value at `(dot <lhs> field)`.
-  g.prematLval2(lhs)                                     # the lvalue's base/index regs, once
-  g.constrFieldStores(c, memLoc(lhs, ScalarSlot))        # base = the lvalue subtree
-  g.unbindLvalTemps2(lhs)                                # release the lvalue's base/index temps
+  ## `genConstr2`: collapse the destination to ONE address register, then store each
+  ## field through it (`fieldLocReg`).
+  ##
+  ## The former shape — premat the lvalue's embedded regs and hold them across ALL
+  ## the field stores (base reload + stride + embedded value = up to three staging
+  ## registers) — ran the pool dry the moment a nested-aggregate field needed its
+  ## field pointer + copy scratch on top (3 held + 2 = 5 concurrent; a proc with
+  ## enough live locals has 4 free). One lea up front costs a single held register
+  ## however deep the lvalue is, the same "reduce to an address" move the aggregate
+  ## assignment above made for the same reason. Field values are flat operands
+  ## (xelim hoisted calls), so nothing clobbers the address across the stores.
+  let addrReg = g.pickStagingSealed("an oconstr destination address", AddrSlot)
+  g.aggrAddrInto(lhs, addrReg, AddrSlot, doBind = false) # premats + releases internally
+  g.freeLvalTemps2(lhs)                                  # release computed index/pointer values
+  g.constrFieldStores(c, regLoc(addrReg, ScalarSlot))    # base = &lhs in one register
+  g.giveBack addrReg
 
 proc emLvalElemMem(g: var CodeGen; lhs: Cursor; idx: int) =
   ## `(mem (at <lvalue address> idx))` — element `idx` of the array addressed by `lhs`.
