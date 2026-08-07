@@ -3608,6 +3608,21 @@ proc emitFValue2(g: var CodeGen; c: Cursor; dest: var Location) =
       if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f, bits)
       g.ensureFAccum2(dest.f, iv, bits)
       g.ab.tree FnegA64: g.emFReg(dest.f, bits)
+    of InfC, NeginfC, NanC:
+      # `inf` / `-inf` / `nan` have no `fmov` immediate encoding (a64's 8-bit
+      # float immediate covers only normal values), so they travel the same
+      # route as any other float literal: bit pattern into a bridge GPR, then
+      # `fmov` across.
+      if dest.kind != InFReg:
+        dest = g.takeFTmp(if dest.typ.kind == AFloat: dest.typ else: f64)
+        if dest.kind == NamedStack:
+          g.produceIntoFMem2(c, dest); return
+      let bits = if dest.typ.size == 4: 32 else: 64
+      if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f, bits)
+      let gpr = g.takeBridge()
+      g.movImm(gpr, specialFloatBits(c.exprKind, bits))
+      g.fmovFromGpr(dest.f, gpr, bits)
+      g.dropBridge gpr
     of ConvC, CastC: g.emitCast2(c, dest)
     of CallC: g.emitCall2(c, dest)
     of DotC, AtC, DerefC, PatC:

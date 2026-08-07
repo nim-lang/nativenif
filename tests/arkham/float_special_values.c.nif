@@ -1,0 +1,72 @@
+(.nif27)
+(stmts
+ (gvar :gf32.0 .
+  (f 32)42.0)
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :n.0 .
+    (f 64)
+    (nan))
+   (var :pinf.0 .
+    (f 64)
+    (inf))
+   (var :ninf.0 .
+    (f 64)
+    (neginf))
+   (var :n32.0 .
+    (f 32)
+    (nan))
+   (if
+    (elif
+     (eq n.0 n.0)
+     (stmts
+      (call exit.c 11))))
+   (if
+    (elif
+     (eq n32.0 n32.0)
+     (stmts
+      (call exit.c 12))))
+   (if
+    (elif
+     (le pinf.0 1000000.0)
+     (stmts
+      (call exit.c 13))))
+   (if
+    (elif
+     (le -1000000.0 ninf.0)
+     (stmts
+      (call exit.c 14))))
+   (var :nbits.0 .
+    (i 64)
+    (cast
+     (i 64)n.0))
+   (if
+    (elif
+     (neq nbits.0 9221120237041090560)
+     (stmts
+      (call exit.c 15))))
+   (var :ibits.0 .
+    (i 64)
+    (cast
+     (i 64)pinf.0))
+   (if
+    (elif
+     (neq ibits.0 9218868437227405312)
+     (stmts
+      (call exit.c 16))))
+   (var :r.0 .
+    (i 64)
+    (conv
+     (i 64)gf32.0))
+   (call exit.c r.0))))
