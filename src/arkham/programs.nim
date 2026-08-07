@@ -280,22 +280,17 @@ proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
                             (if pk == InstructionP: icPinned else: icPortable))
               inc c
             while c.hasMore: skip c
-        of NoPragma:
+        of DynlibP:
           # `(dynlib "kernel32")` — the import library of a Windows import; the
-          # Leng spelling of Nim's `dynlib` pragma. NOT part of leng's
-          # `LengPragma` vocabulary yet (hexer still turns a `dynlib` importc
-          # into a runtime loader stub instead of forwarding the pragma), so it
-          # is matched by tag NAME: the tag pool interns unknown tags with ids
-          # beyond the `TagEnum` range and `pragmaKind` reports them `NoPragma`.
-          if c.kind == TagLit and tagName(c.tags, c.cursorTagId) == "dynlib":
-            c.into:
-              if c.hasMore:
-                dllN = strVal(c)      # normalized to the loader's spelling
-                if not dllN.contains('.'): dllN.add ".dll"
-                inc c
-              while c.hasMore: skip c
-          else:
-            skip c
+          # Leng spelling of Nim's `dynlib` pragma, which hexer forwards onto the
+          # declaration for the native backend instead of lowering it to a runtime
+          # loader stub.
+          c.into:
+            if c.hasMore:
+              dllN = strVal(c)      # normalized to the loader's spelling
+              if not dllN.contains('.'): dllN.add ".dll"
+              inc c
+            while c.hasMore: skip c
         else: skip c
   else:
     skip c

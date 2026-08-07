@@ -24,6 +24,28 @@
 import slots
 import nifcore   # `Cursor`: a `Mem` location captures the lvalue subtree to re-emit
 
+const SynthMark* = "`"
+  ## Prefix of every asm-NIF symbol arkham MINTS itself: the positional
+  ## parameters, the result binding, scratch/spill bindings, labels and the
+  ## aggregate homes. Leng symbols are copied into the asm verbatim and nifasm
+  ## scopes them by their full name, so a synthetic name that is spellable as a
+  ## Nim identifier is *shadowed* the moment the body declares a local of that
+  ## name — and every later reference silently resolves to the local instead.
+  ## `formatfloat`'s `mulShift(x: uint64; y: uint64x2)` hit exactly that: its
+  ## locals `p0`/`p1` reach Leng as `p0.0`/`p1.0`, which are also the positional
+  ## names of its own two parameters.
+  ##
+  ## The leading backtick is nimony's marker for "compiler-generated, unspellable
+  ## in Nim source" (hexer mints `` `x.N ``, `` `tc.N ``, `` `cse.N `` …), so it
+  ## rules out any collision with user code. Inside that namespace arkham owns
+  ## the tags `p` `ret` `tmp` `ftmp` `fntmp` `L` `etmp` `eftmp` `held` `aggtmp`
+  ## `nctmp` `botmp` `rettmp`, none of which hexer mints — and all but `ret` and
+  ## `L` carry a counter *in the name*, so even a same-tag hexer symbol (`` `tmp.N ``
+  ## from the duplifier) stays a different string from `` `tmpN.0 ``.
+
+template synth*(tag: string): string = SynthMark & tag
+  ## Spelling of an arkham-minted asm symbol whose name is exactly `tag`.
+
 type
   Reg* = enum   ## abstract GPR slot; a backend maps it to a hardware register
     R0, R1, R2, R3, R4, R5, R6, R7, R8, R9, R10, R11, R12, R13, R14, R15,
