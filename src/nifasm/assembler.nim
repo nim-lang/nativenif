@@ -96,30 +96,18 @@ proc extractDedupKey*(s: string): string =
   ## definition.
   ##
   ## The key is the name minus its module suffix, and dropping the module is only
-  ## sound when what remains is GLOBALLY unique. nif-spec.md spells a global symbol
-  ## `<ident>.<disamb>.<moduleSuffix>` or `<ident>.<disamb>.<key>.<moduleSuffix>`,
-  ## "where `key` usually is the result from a generic instantiation" — so the
-  ## four-component form is where that uniqueness can live, and the three-component
-  ## form is never mergeable.
+  ## sound when what remains is GLOBALLY unique. nimony guarantees that for one
+  ## family alone: an instantiation, whose name carries an `.I<hash>` segment that
+  ## canonicalizes the instantiated arguments (`sem.newInstSymId` mints
+  ## `abc.123.Iabcdefgh.instmod`, `symparser.genericTypeName` mints
+  ## `` `t.0.I<key>.<mod> ``). Requiring that segment is therefore the whole test.
   ##
-  ## Note what the spec does NOT say: nothing constrains how a key is spelled.
-  ## Requiring a leading `I` is a nimony CONVENTION, not a rule of NIF — it is how
-  ## `sem.newInstSymId` (`abc.123.Iabcdefgh.instmod`), `symparser.genericTypeName`
-  ## (`` `t.0.I<key>.<mod> ``) and `lengcgen`'s content-hashed
-  ## `strlit.0.I<hash>.<mod>` all mark a real key. Testing for it buys a margin
-  ## against a producer that puts a non-key in the key slot, and it is deliberately
-  ## the SAFE direction to be wrong in: a key we decline to merge costs a duplicate
-  ## definition, which the linker reports, whereas merging two things that only
-  ## looked alike is silent.
-  ##
-  ## It was worth the margin. hexer used to spell a lambda-lifting environment type
-  ## `<proc>.<counter>.env.<module>` and a coroutine frame
-  ## `<proc>.<counter>.coro.<module>`, putting a role name where a key belongs.
-  ## Two modules that each closed over a variable in a proc named `outer`
-  ## (tests/nimony/closures `tgeneric_closure` + `tparam_capture`) both produced key
-  ## `outer.0.env`, and merging them made a field of the one resolve against the
-  ## layout of the other. nimony mints those `` outer`env.0.<module> `` now —
-  ## unkeyed, because they are module-private — via `symparser.derivedName`.
+  ## Dot count alone is NOT: hexer's lambda-lifting environment types are
+  ## `<proc>.<counter>.env.<module>`, three dots like an instantiation but private
+  ## to their module. Two modules that each close over a variable in a proc named
+  ## `outer` (tests/nimony/closures `tgeneric_closure` + `tparam_capture`) both
+  ## produce key `outer.0.env`, and merging them made a field of the one resolve
+  ## against the layout of the other.
   var dotCount = 0
   var lastDotPos = -1
   var prevDotPos = -1
