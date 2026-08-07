@@ -300,7 +300,7 @@ template emitLoop(g: var CodeGen; body: untyped) =
 proc emSyscall(g: var CodeGen) = g.ab.keyword SyscallX64
 
 proc freshLabel(g: var CodeGen): string =
-  result = "L" & $g.labelCount & ".0"
+  result = synth("L") & $g.labelCount & ".0"
   inc g.labelCount
 
 # ── expressions ──────────────────────────────────────────────────────────────
@@ -1438,7 +1438,7 @@ proc emitParamsAndResult(g: var CodeGen; c: var Cursor; byRef: bool;
         # reads those raw after the call — no `(res ret.0)` binding to declare here.
         skip c
       else:
-        g.ab.symDef "ret.0"
+        g.ab.symDef synth("ret.0")
         g.ab.reg RAX
         if byRef: g.genPointee(c) else: g.genTypeBody(c)
   result = plan.gpUsed
@@ -1491,7 +1491,7 @@ proc emitSyproc(g: var CodeGen; sp: SyscallProc) =
               inc idx
       g.ab.tree ResultD:                         # c at the return type
         if not retIsVoid(c):
-          g.ab.symDef "ret.0"
+          g.ab.symDef synth("ret.0")
           g.ab.reg RAX
           g.genTypeBody(c)
       g.ab.tree ClobberD:                        # x86-64 `syscall` destroys rcx, r11
@@ -1548,7 +1548,7 @@ proc emitWinExtproc(g: var CodeGen; ex: Extern) =
         if not retIsVoid(c):
           if slotOf(g.prog, c).kind in {AFloat, AMem}:
             raiseAssert "arkham win_x64: float/aggregate result in extern " & ex.extName
-          g.ab.symDef "ret.0"
+          g.ab.symDef synth("ret.0")
           g.ab.reg RAX
           g.genTypeBody(c)
       # The volatiles a Win64 call destroys, EXCEPT this callee's own argument
@@ -2131,7 +2131,7 @@ proc aggrArgSource(g: var CodeGen; a: Cursor; tcur: Cursor; tn: string):
         " (locKind=" & $sloc.kind & ")"
   else:                                           # oconstr/aconstr: build into a temp
     let pos = cursorToPosition(g.buf[], a)
-    home = "aggtmp" & $pos & ".0"
+    home = synth("aggtmp") & $pos & ".0"
     g.emTypedStackVar(home, tcur)
     g.varType[home] = tn
     g.genStore2(a, namedStackLoc(home, g.exprSlot(a)))
@@ -2995,7 +2995,7 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
       # an ordinary `(rsp) name` stack-var base.
       let pos = cursorToPosition(g.buf[], c)
       g.ab.reg RSP
-      g.ab.sym ("aggtmp" & $pos & ".0")
+      g.ab.sym (synth("aggtmp") & $pos & ".0")
     else: raiseAssert "arkham x64n: emLvalAddr2 expr " & $c.exprKind
   else: raiseAssert "arkham x64n: emLvalAddr2 kind " & $c.kind
 
@@ -3205,7 +3205,7 @@ proc prematLval2(g: var CodeGen; c: Cursor; asBase = false; hint = NoReg) =
       # temp `aggtmp<pos>` HERE (before the access instruction opens), then address that
       # temp in `emLvalAddr2`. Mirrors the aggregate call-arg materialization.
       let pos = cursorToPosition(g.buf[], c)
-      let home = "aggtmp" & $pos & ".0"
+      let home = synth("aggtmp") & $pos & ".0"
       var tcur = c; inc tcur                            # the constructed (array/object) type
       g.emTypedStackVar(home, tcur)
       if tcur.kind == Symbol: g.varType[home] = symName(tcur)
@@ -3607,7 +3607,7 @@ proc buildNestedAggrTemp(g: var CodeGen; valC, fty: Cursor): (string, int) =
     raiseAssert "arkham x64n: nested aggregate field of non-nominal type"
   let ntn = symName(fty)
   let pos = cursorToPosition(g.buf[], valC)
-  let tmpName = "nctmp" & $pos & ".0"
+  let tmpName = synth("nctmp") & $pos & ".0"
   g.emTypedStackVar(tmpName, fty)
   g.varType[tmpName] = ntn
   g.genStore2(valC, namedStackLoc(tmpName, g.exprSlot(valC)))   # build (no staging held)
@@ -3935,7 +3935,7 @@ proc genBaseobj2(g: var CodeGen; c: Cursor; dst: Location) =
     let pos = cursorToPosition(g.buf[], valC)
     let derivedTy = g.getType(valC)
     let derivedTn = symName(derivedTy)
-    let dtmp = "botmp" & $pos & ".0"
+    let dtmp = synth("botmp") & $pos & ".0"
     g.emTypedStackVar(dtmp, derivedTy)
     g.varType[dtmp] = derivedTn
     g.genStore2(valC, namedStackLoc(dtmp, g.exprSlot(valC)))  # build derived (no held temp)
@@ -4679,7 +4679,7 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
             # via the general store path (mirrors the aggregate call-argument
             # marshalling), then marshal that temp out by the ABI below.
             let pos = cursorToPosition(g.buf[], cc)
-            srcName = "rettmp" & $pos & ".0"
+            srcName = synth("rettmp") & $pos & ".0"
             var tcur = cc
             if cc.exprKind in {OconstrC, AconstrC}: inc tcur   # the constructed type
             else: tcur = g.getType(cc)
@@ -5767,7 +5767,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
               raiseAssert "arkham x64: aggregate symbol arg neither local nor global: " & symName(a)
           else:
             let pos = cursorToPosition(g.buf[], a)
-            home = "aggtmp" & $pos & ".0"
+            home = synth("aggtmp") & $pos & ".0"
             g.emTypedStackVar(home, tcur)
             g.varType[home] = tn
             g.genStore2(a, namedStackLoc(home, g.exprSlot(a)))
@@ -6017,7 +6017,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
     if hasResult and not resultByRef and not resultIsFloat and resSlot.kind != AMem:
       g.ab.tree MovX64:
         g.emReg RAX
-        g.ab.tree ResX: g.ab.sym "ret.0"
+        g.ab.tree ResX: g.ab.sym synth("ret.0")
   g.rb.unsealAccums(sealedArgs)
   if fnTargetName.len > 0:
     g.ab.tree KillX64: g.ab.sym fnTargetName

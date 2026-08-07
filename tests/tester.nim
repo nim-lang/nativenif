@@ -234,7 +234,6 @@ proc arkhamTests() =
 const arkhamStressKnown: seq[string] = @[
   # Real defects found by this pass at x86-64's level, parked so that any NEW
   # failure is fatal. Remove an entry with its fix.
-  "aggr_copy_regpressure",  # nested-aggregate copy emits a stackoff into a value slot
   "stack_aggr_byref",       # by-ref aggregate base not materialized before the (mem …)
   # `takeHeld` with the default `canSpill = false` asserts instead of evicting a
   # live local. 11 of the 15 `takeHeld` sites across both backends do.
@@ -264,8 +263,10 @@ const arkhamStressA64Known: seq[string] = @[
   "atomic_cas_regpressure", # intrinsic-operand pick has no steal/spill arm
   "shift_count_clobbers_mask", # spill path emits a stackoff (i 64) into a (u 8) value
                             # slot under k=3 — the "stackoff into a value slot"
-                            # class, same as aggr_copy_regpressure on x64. The
-                            # fixture's own job is x86-64-only (rcx shift-count
+                            # class. (Not the `SynthMark` shadowing bug that used
+                            # to park `aggr_copy_regpressure` here: this one
+                            # survives the fix.) The fixture's own job is
+                            # x86-64-only (rcx shift-count
                             # clobber vs a ShiftRegOk-homed local); a64 has no
                             # fixed shift-count register, so this entry hides
                             # nothing the fixture is meant to guard.
