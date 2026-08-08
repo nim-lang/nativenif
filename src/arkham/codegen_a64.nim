@@ -380,6 +380,7 @@ proc emAggrDot(g: var CodeGen; base, field: string) =
 
 proc emStackVar(g: var CodeGen; name, typeName: string) =
   ## Declare a nifasm-managed stack slot `(var :name (s) typeName)`.
+  g.ra.hasStackVars = true                   # a `(s)` var exists ⇒ frame sub needed
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
   g.ab.keyword SO
@@ -390,6 +391,7 @@ proc emScalarStackVar(g: var CodeGen; name: string) =
   ## Declare a spilled integer/pointer scalar's stack slot `(var :name (s) (i 64))`.
   ## Always 8-byte wide / 8-aligned (arkham keeps scalars 64-bit in registers and
   ## nifasm's `ldr`/`str` need an 8-aligned slot), regardless of the logical width.
+  g.ra.hasStackVars = true                   # a `(s)` var exists ⇒ frame sub needed
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
   g.ab.keyword SO
@@ -406,6 +408,7 @@ proc emTypedStackVar(g: var CodeGen; name: string; t: Cursor) =
   ## it); a FLOAT its `(f N)`; an aggregate its real type plus the `(s (align N))`
   ## stack-slot alignment. This backend-specific scalar rule lives here, not in the
   ## caller — that is the whole point of routing through one proc.
+  g.ra.hasStackVars = true                   # a `(s)` var exists ⇒ frame sub needed
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
   if isNilValue(t):                          # a spilled nil → `(s) (nil)` (8-byte, align 8)
@@ -496,6 +499,7 @@ proc unbindTemp(g: var CodeGen; r: Reg) =
 proc emFloatStackVar(g: var CodeGen; name: string; bits: int) =
   ## Declare a spilled float scalar's stack slot `(var :name (s) (f N))`. nifasm
   ## sizes/aligns the slot and resolves the bare symbol to `[sp,#off]`.
+  g.ra.hasStackVars = true                   # a `(s)` var exists ⇒ frame sub needed
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
   g.ab.keyword SO
