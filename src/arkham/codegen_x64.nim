@@ -6307,18 +6307,7 @@ proc emitFValue2(g: var CodeGen; c: Cursor; dest: var Location) =
       if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f)
       let gpr = g.pickStagingSealed("a float special-value bit pattern",
                                     AsmSlot(cls: AInt, size: 8, align: 8))
-      let pat =
-        if bits == 32:
-          case c.exprKind
-          of InfC: 0x7F80_0000'i64
-          of NeginfC: 0xFF80_0000'i64
-          else: 0x7FC0_0000'i64                          # NanC (quiet NaN)
-        else:
-          case c.exprKind
-          of InfC: 0x7FF0_0000_0000_0000'i64
-          of NeginfC: cast[int64](0xFFF0_0000_0000_0000'u64)
-          else: 0x7FF8_0000_0000_0000'i64                # NanC (quiet NaN)
-      g.movImm(gpr, pat)
+      g.movImm(gpr, specialFloatBits(c.exprKind, bits))
       g.fmovFromGpr(dest.f, gpr, bits)
       g.giveBack gpr
     of ConvC, CastC: g.emitCast2(c, dest)                # conversion TO float

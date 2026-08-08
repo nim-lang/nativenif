@@ -464,8 +464,18 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
       # leaf param in x0 was removed by `allocParams`), so this falls through to the normal
       # home whenever x0 is taken. Nothing else draws x0 (it is outside every temp/local
       # candidate list), so reserving it here cannot starve the emitter's scratch.
+      #
+      # Only in a proc that makes NO call. `AllRegs` says this local's own interval
+      # crosses no call, which is not the same thing: the EMITTER uses x0 as argument 0
+      # and as the call result wherever a call appears, and `emReg` renders a bound
+      # register by the variable's name — so `f(handle)` in another branch came out as
+      # `mov canRaise.0, handle` / `mov x.129, canRaise.0` across the call, which nifasm
+      # rejects (osproc's `close`, 6 modules of `nimony n` on nimsem). In a call-free
+      # proc x0 has no second role, and that is exactly where the payoff is anyway —
+      # eliding the trailing `mov` and, with it, the frame.
       let takeRet = b.md.arch == Arm64 and name.len > 0 and name == b.returnedVar and
-                    AllRegs in props and not slot.isFloat and AddrTaken notin props and
+                    AllRegs in props and not b.an.hasCall and
+                    not slot.isFloat and AddrTaken notin props and
                     slot.inRegClass and b.md.intRetReg in b.freeVol
       var loc =
         if aliasSrc.len > 0: dontCare                                 # c2 is a pure view of c1

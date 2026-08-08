@@ -181,6 +181,12 @@ proc movCompatible(want, got: Type): bool =
     return litFitsWidth(g.litVal, w.bits)
   if w.kind in {IntT, UIntT} and g.kind in {IntT, UIntT}:
     return g.bits <= w.bits
+  if w.kind in {IntT, UIntT} and g.kind == BoolT and w.bits >= 8:
+    # A `bool` is a canonical 0/1 byte, so moving it into a WIDER integer is the same
+    # widening move already blessed for `(u 8)`. arkham forces every integer AND bool
+    # local to an `(i 64)` slot, so storing a loaded bool field to its home lands here
+    # (sigmatch's `conceptRoutineAvailable`). `int → bool` stays a narrowing.
+    return true
   result = false
 
 proc getInt(n: Cursor): int64 =
@@ -2660,7 +2666,14 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       proc isIntLike(t: Type): bool = t.kind in {IntT, UIntT, BoolT, IntLitT}
       let sizedMemReg = (dest.kind == okMem) != (op.kind == okMem) and
                         isIntLike(dest.typ) and isIntLike(op.typ)
-      if not sizedMemReg and not movCompatible(dest.typ, op.typ):
+      # Placing an integer in a PARAMETER's register is the ABI's own truncation, not
+      # a narrowing the caller has to spell out: AAPCS64 leaves the bits above a
+      # sub-word parameter unspecified, and the callee reads the register at the
+      # parameter's width. A code generator that keeps every scalar 64-bit in
+      # registers (arkham does) would otherwise have to name a fresh, param-width
+      # binding for each such argument.
+      let argWidth = dest.kind == okArg and isIntLike(dest.typ) and isIntLike(op.typ)
+      if not sizedMemReg and not argWidth and not movCompatible(dest.typ, op.typ):
         typeError(dest.typ, op.typ, start)
     checkPtrStore(dest.typ, op.kind, op.typ, start)
     if dest.kind == okMem:
@@ -2744,13 +2757,34 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       #   adrp x0, desc@PAGE ; add x0, x0, desc@PAGEOFF   (patched in writeMachO)
       #   ldr  x16, [x0]                                   ; load the thunk
       #   blr  x16                                         ; x0 = &var
+      #
+      # x0 and x16 are the sequence's OWN scratch, not the caller's to lose. Every
+      # other instruction here writes its destination and nothing else, and a code
+      # generator that staged `f(a, tvar)` — arg 0 already parked in x0 — would
+      # otherwise watch that argument vanish with no instruction to blame. Spill
+      # both around the thunk so `(adr D tvar)` writes D alone. (`blr` still sets
+      # lr, which is why a proc touching a thread-local is analysed as having a
+      # call and keeps a frame.)
+      arm64.emitSubImm(ctx.buf.data, arm64.SP, arm64.SP, 16'u16)
+      arm64.emitStr(ctx.buf.data, arm64.X0, arm64.SP, 0'i32)
+      arm64.emitStr(ctx.buf.data, arm64.X16, arm64.SP, 8'i32)
       let pos = ctx.buf.data.getCurrentPosition()
       arm64.emitAdrpAddGvar(ctx.buf.data, arm64.X0)     # x0 = &descriptor
       ctx.tlvSites.add (pos, op.tlvSym)
       arm64.emitLdr(ctx.buf.data, arm64.X16, arm64.X0, 0'i32)
       arm64.emitBlr(ctx.buf.data, arm64.X16)
-      if dest.reg != arm64.X0:
+      # Land the result in `dest` and restore the two scratch registers — skipping
+      # whichever one `dest` IS, since that one now holds the address.
+      if dest.reg == arm64.X0:
+        arm64.emitLdr(ctx.buf.data, arm64.X16, arm64.SP, 8'i32)
+      elif dest.reg == arm64.X16:
+        arm64.emitMov(ctx.buf.data, arm64.X16, arm64.X0)
+        arm64.emitLdr(ctx.buf.data, arm64.X0, arm64.SP, 0'i32)
+      else:
         arm64.emitMov(ctx.buf.data, dest.reg, arm64.X0)
+        arm64.emitLdr(ctx.buf.data, arm64.X0, arm64.SP, 0'i32)
+        arm64.emitLdr(ctx.buf.data, arm64.X16, arm64.SP, 8'i32)
+      arm64.emitAddImm(ctx.buf.data, arm64.SP, arm64.SP, 16'u16)
     elif op.gvarSym != nil:
       # Global in __DATA/.bss: form its address with adrp+add (PC-relative adr
       # can't reach __DATA). Emit placeholders; writeMachO patches the page /
