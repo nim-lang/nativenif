@@ -377,6 +377,11 @@ proc srcWidthSigned*(g: var CodeGen; c: Cursor): tuple[width: int, signed: bool]
         inc d; skip d                          # name, pragmas
         return slotWidthSigned(slotOf(g.prog, d))
     of scNone: return (64, true)
+  of UIntLit, CharLit:
+    # An UNSIGNED literal. The width is the full register (nothing to extend), but
+    # the signedness decides `scvtf` vs `ucvtf`: `float(0xFFFF_FFFF_FFFF_FFFF'u64)`
+    # is 1.8446744073709552e19, not -1.0.
+    return (64, false)
   of TagLit:
     case c.exprKind
     of AddC, SubC, MulC, DivC, ModC, ShlC, ShrC,
@@ -384,6 +389,11 @@ proc srcWidthSigned*(g: var CodeGen; c: Cursor): tuple[width: int, signed: bool]
       var t = c                               # these carry their result type first
       t.into:
         return slotWidthSigned(slotOf(g.prog, t))
+    of SufC, ParC:                            # wrappers: the inner value decides
+      var t = c
+      t.into:
+        return g.srcWidthSigned(t)
+    of TrueC, FalseC: return (64, false)
     else: return (64, true)
   else: return (64, true)
 

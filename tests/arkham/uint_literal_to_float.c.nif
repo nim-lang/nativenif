@@ -1,0 +1,43 @@
+(.nif27)
+(stmts
+ (gvar :f.0 .
+  (f 64)0.0)
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (asgn f.0
+    (conv
+     (f 64)
+     (suf 18446744073709551615u "u64")))
+   (if
+    (elif
+     (lt f.0 1.0)
+     (stmts
+      (call exit.c 11))))
+   (asgn f.0
+    (conv
+     (f 64)9223372036854775808u))
+   (if
+    (elif
+     (lt f.0 1.0)
+     (stmts
+      (call exit.c 12))))
+   (asgn f.0
+    (conv
+     (f 64)-5))
+   (if
+    (elif
+     (neq f.0 -5.0)
+     (stmts
+      (call exit.c 13))))
+   (call exit.c 42))))
