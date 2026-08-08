@@ -551,8 +551,9 @@ proc extendTo(g: var CodeGen; dest: Reg; width: int; signed: bool) =
 proc emGlobalAddr(g: var CodeGen; dest: Reg; name: string) =
   ## `dest ← &global` — adrp+add (nifasm resolves the gvar to its `.bss`/`.data`
   ## address). AArch64 has no typed PC-relative memory operand, so a global is
-  ## always accessed by first materializing its address.
-  g.emAdr(dest, name)
+  ## always accessed by first materializing its address. An importc/exportc gvar is
+  ## referenced by its bare C name (cross-module linkage), like on x86-64.
+  g.emAdr(dest, g.prog.gvarRefName(name))
 
 proc rebindLocalAs(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   ## Re-establish register `r`'s binding to the named local `name`, retyped to
@@ -1507,14 +1508,14 @@ proc place2(g: var CodeGen; src: Location; dest: Reg) =
       # Fold the page offset into the load: `adrp x17, g@PAGE ; ldr dest, [x17, g@PAGEOFF]`
       # (one `add` fewer than the address-then-deref below). nifasm sizes it from the
       # gvar's own scalar type.
-      g.ab.tree GloadA64: (g.emReg dest; g.ab.sym src.name)
+      g.ab.tree GloadA64: (g.emReg dest; g.ab.sym g.prog.gvarRefName(src.name))
     else:
       # A read-only `const` (rodata label, no page-offset site): form the address, deref.
       # The deref is typed `(ptr <globalType>)` so it yields the PRECISE type — `dest` is
       # bound to the *value* type, so a bare `(mem dest)` would drop a pointer level
       # (harmless for a scalar, but a POINTER const would load `object` where `(ptr
       # object)` is wanted; nifasm is strict). Cast in the deref rather than spend a bridge.
-      g.emAdr(dest, src.name)
+      g.emAdr(dest, g.prog.gvarRefName(src.name))
       g.ab.tree MovA64:
         g.emReg dest
         g.ab.tree MemX:
@@ -1539,7 +1540,8 @@ proc placeF2(g: var CodeGen; src: Location; dest: FReg; bits: int) =
   of InFReg: g.fmovF(dest, src.f, bits)
   of NamedStack: g.emFloatScalarLoad(dest, src.name, bits)
   of Glob:
-    let b = g.takeBridge(); g.emAdr(b, src.name); g.emFLoad(dest, b, bits); g.dropBridge b
+    let b = g.takeBridge(); g.emAdr(b, g.prog.gvarRefName(src.name))
+    g.emFLoad(dest, b, bits); g.dropBridge b
   of Mem:
     g.prematLval2(src.cur)
     g.ab.tree FldrA64: (g.emFReg(dest, bits); g.ab.tree MemX: g.emLvalAddr2(src.cur))
@@ -1554,9 +1556,9 @@ proc storeReg2(g: var CodeGen; dst: Location; src: Reg) =
   of Glob:
     if g.globalIsGvarSlot(dst.name):
       # Fold: `adrp x17, g@PAGE ; str src, [x17, g@PAGEOFF]` — no bridge, no address `add`.
-      g.ab.tree GstoreA64: (g.emReg src; g.ab.sym dst.name)
+      g.ab.tree GstoreA64: (g.emReg src; g.ab.sym g.prog.gvarRefName(dst.name))
     else:
-      let b = g.takeBridge(); g.emAdr(b, dst.name)
+      let b = g.takeBridge(); g.emAdr(b, g.prog.gvarRefName(dst.name))
       g.ab.tree MovA64:
         g.ab.tree MemX: g.emReg b
         g.emReg src
@@ -1581,7 +1583,8 @@ proc storeFReg2(g: var CodeGen; dst: Location; src: FReg; bits: int) =
   of InFReg: g.fmovF(dst.f, src, bits)
   of NamedStack: g.emFloatScalarStore(dst.name, src, bits)
   of Glob:
-    let b = g.takeBridge(); g.emAdr(b, dst.name); g.emFStore(src, b, bits); g.dropBridge b
+    let b = g.takeBridge(); g.emAdr(b, g.prog.gvarRefName(dst.name))
+    g.emFStore(src, b, bits); g.dropBridge b
   of Mem:
     g.prematLval2(dst.cur)
     g.ab.tree FstrA64:
@@ -5061,13 +5064,19 @@ proc genType(g: var CodeGen; name: string; decl: Cursor) =
       g.ab.symDef name
       g.genTypeBody(c)
 
-proc genGlobal(g: var CodeGen; name: string; decl: Cursor) =
+proc genGlobal(g: var CodeGen; nifName: string; decl: Cursor) =
   ## Emit a top-level `const`/`gvar`. A true `const` with a value becomes a
   ## read-only `.text` data blob; a `gvar` with a compile-time-constant SCALAR
   ## initializer is laid out as static `.bss`-image data (so it is correct even for
   ## a FOREIGN module's gvar in a bundle, whose entry-time `emitGlobalInits` never
   ## runs — and for a `var` later mutated). Any other (runtime) initializer is a
   ## zeroed slot filled at entry by `emitGlobalInits`.
+  # An importc-WITHOUT-exportc gvar names an external (its slot is an `exportc`
+  # definition in another bundled module): emit NO slot — references resolve to the
+  # bare C name via `emGlobalAddr`. An exportc gvar IS the definition, emitted under
+  # that bare C name so importc references in other modules link to it.
+  if nifName in g.prog.importcOnlyGvars: return
+  let name = g.prog.gvarAsmName(nifName)
   var c = decl
   let isConst = c.stmtKind == ConstS
   c.into:                                     # (gvar SymbolDef VarPragmas Type Value?)
