@@ -222,6 +222,12 @@ const LinuxSyscalls* = {
   "readlink":   (89,  -1),
   # std/terminal's isatty → ioctl(fd, TCGETS). Same number on both arches.
   "ioctl":      (16,  29),
+  # `clock_gettime(clk_id, timespec*)` backs `std/monotimes` and `std/times`.
+  # libc serves it from the vDSO, which a static libc-free image cannot reach;
+  # the syscall has identical semantics, just without the vDSO's saved
+  # user/kernel transition. Without this row NOTHING in a `nimony n` build can
+  # read a clock — a program cannot even time itself.
+  "clock_gettime": (228, 113),
   # std/os filesystem mutators (mkdir/removeDir/removeFile/moveFile). AArch64's
   # asm-generic ABI replaced all of these with `*at` variants (mkdirat/unlinkat/
   # renameat), so they get -1 there — fine for an x86-64 target, flagged on a64.
