@@ -1,0 +1,143 @@
+(.nif27)
+(.indexat 2105             )
+(stmts
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :memcmp.c
+  (params
+   (param :a.0 .
+    (ptr
+     (i 64)))
+   (param :b.0 .
+    (ptr
+     (i 64)))
+   (param :n.0 .
+    (i 64)))
+  (i 32)
+  (pragmas
+   (importc "memcmp"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :a.0 .
+    (array
+     (i 64)4).)
+   (var :c.0 .
+    (array
+     (i 64)4).)
+   (var :e.0 .
+    (array
+     (i 64)1).)
+   (var :f.0 .
+    (array
+     (i 64)1).)
+   (asgn
+    (at a.0 0)1)
+   (asgn
+    (at a.0 1)2)
+   (asgn
+    (at a.0 2)3)
+   (asgn
+    (at a.0 3)4)
+   (asgn
+    (at c.0 0)1)
+   (asgn
+    (at c.0 1)2)
+   (asgn
+    (at c.0 2)1283)
+   (asgn
+    (at c.0 3)4)
+   (asgn
+    (at e.0 0)658188)
+   (asgn
+    (at f.0 0)655884)
+   (var :r0.0 .
+    (i 32)
+    (call memcmp.c
+     (addr
+      (at a.0 0))
+     (addr
+      (at a.0 0))32))
+   (var :r1.0 .
+    (i 32)
+    (call memcmp.c
+     (addr
+      (at a.0 0))
+     (addr
+      (at c.0 0))32))
+   (var :r2.0 .
+    (i 32)
+    (call memcmp.c
+     (addr
+      (at c.0 0))
+     (addr
+      (at a.0 0))32))
+   (var :r3.0 .
+    (i 32)
+    (call memcmp.c
+     (addr
+      (at e.0 0))
+     (addr
+      (at f.0 0))3))
+   (var :r4.0 .
+    (i 32)
+    (call memcmp.c
+     (addr
+      (at a.0 0))
+     (addr
+      (at c.0 0))0))
+   (var :r5.0 .
+    (i 32)
+    (call memcmp.c
+     (addr
+      (at a.0 0))
+     (addr
+      (at c.0 0))17))
+   (var :r6.0 .
+    (i 32)
+    (call memcmp.c
+     (addr
+      (at a.0 0))
+     (addr
+      (at c.0 0))18))
+   (var :acc.0 .
+    (i 32)42)
+   (asgn acc.0
+    (add
+     (i 32)acc.0 r0.0))
+   (asgn acc.0
+    (add
+     (i 32)acc.0
+     (add
+      (i 32)r1.0 5)))
+   (asgn acc.0
+    (add
+     (i 32)acc.0
+     (sub
+      (i 32)r2.0 5)))
+   (asgn acc.0
+    (add
+     (i 32)acc.0
+     (sub
+      (i 32)r3.0 9)))
+   (asgn acc.0
+    (add
+     (i 32)acc.0 r4.0))
+   (asgn acc.0
+    (add
+     (i 32)acc.0 r5.0))
+   (asgn acc.0
+    (add
+     (i 32)acc.0
+     (add
+      (i 32)r6.0 5)))
+   (call exit.c acc.0))))(.index)
