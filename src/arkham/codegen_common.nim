@@ -884,6 +884,17 @@ proc pickTempReg*(g: var CodeGen): Reg =
       return r
   NoReg
 
+proc tempPoolDry*(g: var CodeGen): bool =
+  ## Would `pickTempReg` fail right now? Same census, no side effect — it must
+  ## not mark a callee-saved register `usedCallee` (that would add a push/pop for
+  ## a register we then decline to take). For callers that can serve a value from
+  ## its existing home and only want a temp when one is genuinely free.
+  for r in g.md.intTempRegs:
+    if regFreeForTemp(g, r): return false
+  for r in g.md.intCalleeSaved:
+    if regFreeForTemp(g, r): return false
+  true
+
 proc pickFTempReg*(g: var CodeGen): FReg =
   ## The SIMD twin of `pickTempReg`: volatile float pool first, then the
   ## callee-saved float pool (empty on x86-64 SysV).

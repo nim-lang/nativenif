@@ -6502,6 +6502,25 @@ proc resolveLvalVal(g: var CodeGen; c: Cursor; dest: var Location) =
   of Symbol:
     let home = g.ra.locationOfSym(symName(c))
     if home.kind == NoLoc: g.forceRegDestE(dest)     # a global/tvar value read
+    elif home.kind in {NamedStack, Mem} and dest.kind in {NeedsReg, RegOrImm} and
+         g.tempPoolDry():
+      # A stack-homed symbol IS its own natural location. Honouring `NeedsReg`
+      # with the temp pool dry mints an `etmpN.0` SLOT — which cannot satisfy
+      # "needs a register" in the first place. `prematAddrVal2` then copies one
+      # stack slot into the other through the staging bridge, and
+      # `reloadMemBase2` loads it straight back out:
+      #     mov R, [home] ; mov [etmp], R ; mov R, [etmp]
+      # Three instructions, a wasted frame slot, and staging taken TWICE, to end
+      # up exactly where the first instruction already was. Every consumer of an
+      # lvalue-embedded value goes through `reloadMemBase2`, whose whole job is
+      # bringing a memory home into a staging register — and it does that just as
+      # well from the symbol's OWN slot, in one load and one staging pick. So
+      # record the home and reserve nothing.
+      #
+      # Gated on the pool being dry so this changes NOTHING while a temp is free:
+      # there `takeTmp` gives a real register, the value lands in it, and holding
+      # it across the address computation is what we want.
+      dest = home
     else: g.resolveDestE(dest, home)
   of IntLit: g.resolveDestE(dest, immLoc(intVal(c), ScalarSlot))
   of UIntLit: g.resolveDestE(dest, immLoc(cast[int64](uintVal(c)), ScalarSlot))
