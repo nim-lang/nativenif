@@ -169,6 +169,13 @@ type
                                              ## instead of taking a staging reg of their own.
                                              ## The consumer owns that register, so
                                              ## `dropLvalStride` must not unbind it.
+    lvalStrideOnBridge*: HashSet[int]        ## a64: the `(at/pat)` positions whose stride scratch
+                                             ## must come from a STAGING BRIDGE at emission time
+                                             ## because the allocation walk found the temp pool AND
+                                             ## the callee-saved file fully live (register-homed
+                                             ## locals do not compete for a bridge). Recorded by
+                                             ## `emitLvalWalk`, honoured in `prematLval2`, released
+                                             ## with the rest of the scratch in `freeLvalTemps2`.
     lvalGlobBase*: Table[int, Reg]           ## x64: the address of a module-level global
                                              ## aggregate base used in a transient LOAD (e.g. a
                                              ## float field read whose result is an xmm, so the

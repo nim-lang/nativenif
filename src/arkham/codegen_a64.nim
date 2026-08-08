@@ -913,7 +913,10 @@ proc aggrWordsToFromRegs(g: var CodeGen; varName, typeName: string;
     baseReg = loc.r                                    # a by-ref aggregate's pointer
   else:
     bridge = g.takeBridge()
-    g.ab.tree LeaA64: (g.emReg bridge; g.ab.sym varName)     # bridge ← &slot
+    case (if loc.kind == NoLoc: g.lookupSym(varName).cat else: scNone)
+    of scGlobal: g.emGlobalAddr(bridge, varName)       # `(ret NoNifLineInfo)`: a global
+    of scTvar: g.genTlvAddr(varName, bridge)           # source, addressed with `adr`
+    else: g.ab.tree LeaA64: (g.emReg bridge; g.ab.sym varName)  # bridge ← &slot
     baseReg = bridge
   for i in 0 ..< aggrWordCount(g.prog, typeName):
     if byteSize - i * 8 >= 8:                          # a full eightbyte → raw u64 word
@@ -1727,6 +1730,23 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
     else: raiseAssert "arkham a64n: emLvalAddr2 expr " & $c.exprKind
   else: raiseAssert "arkham a64n: emLvalAddr2 kind " & $c.kind
 
+proc bindStrideScratch(g: var CodeGen; atPos: int) =
+  ## Bind the stride scratch `reserveStrideScratch` reserved for the access at
+  ## `atPos`, taking the staging bridge now if that is what it settled for.
+  if atPos in g.lvalStrideOnBridge:
+    g.ra.aux[atPos] = ExprAux(scratch: @[g.takeBridge()])
+  else:
+    g.bindTemp(g.ra.aux[atPos].scratch[0], ScalarSlot)
+
+proc releaseStrideScratch(g: var CodeGen; atPos: int) =
+  ## Release it after the consuming `(mem …)`/`(lea …)`. `dropBridge` and the pool
+  ## release are the same two operations, so the only difference a bridge makes is
+  ## that the position stops being marked.
+  let r = g.ra.aux[atPos].scratch[0]
+  g.lvalStrideOnBridge.excl atPos
+  g.pickedRegs.excl r
+  g.unbindTemp(r)
+
 proc prematLval2(g: var CodeGen; c: Cursor) =
   ## Materialize an lvalue's embedded values (a deref pointer, an index, a global
   ## base address) into their allocated registers BEFORE the consuming `(mem …)`/
@@ -1761,7 +1781,7 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
           g.prematAddrVal2(cc)                            # follow steals
         while cc.hasMore: skip cc
       if g.ra.aux.hasKey(atPos) and g.ra.aux[atPos].scratch.len > 0:
-        g.bindTemp(g.ra.aux[atPos].scratch[0], ScalarSlot)
+        g.bindStrideScratch(atPos)
     of PatC:
       let patPos = g.posOf(c)
       var cc = c
@@ -1772,7 +1792,7 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
           g.prematAddrVal2(cc)                            # follow steals
         while cc.hasMore: skip cc
       if g.ra.aux.hasKey(patPos) and g.ra.aux[patPos].scratch.len > 0:
-        g.bindTemp(g.ra.aux[patPos].scratch[0], ScalarSlot)
+        g.bindStrideScratch(patPos)
     of BaseobjC:                                          # transparent: materialize inner lvalue
       var cc = c
       cc.into:
@@ -3109,6 +3129,28 @@ proc resolveLvalVal(g: var CodeGen; c: Cursor; dest: var Location) =
   of CharLit: g.resolveDestE(dest, immLoc(int64(ord(charLit(c))), ScalarSlot))
   else: g.forceRegDestE(dest)                        # computed: reserve the result
 
+proc reserveStrideScratch(g: var CodeGen; atPos: int) =
+  ## Reserve the `(at/pat base idx scratch)` stride scratch for the access at `atPos`.
+  ##
+  ## The pools first, as always. But this scratch lives for exactly one `(mem …)` and
+  ## competes with every register-homed local for the pool, so a proc with enough live
+  ## locals used to run out and there was nowhere to go: the consumer needs a REGISTER,
+  ## so the `heldN.0` spill fallback `takeHeld` offers cannot serve it. Fall back to a
+  ## staging bridge instead — never allocator-assigned, so it neither starves nor can
+  ## alias the base/index nifasm requires it to differ from. The bridge is not free at
+  ## walk time (nothing is emitted yet), so record the intent and let `prematLval2`
+  ## take it at emission, where a bridge's lifetime belongs.
+  var t = g.takeTmp(ScalarSlot)
+  if t.kind != InReg:
+    let r = g.pickHeldReg()
+    if r == NoReg:
+      g.lvalStrideOnBridge.incl atPos
+      g.ra.aux[atPos] = ExprAux(scratch: @[NoReg])   # filled in by `prematLval2`
+      return
+    g.pickedRegs.incl r
+    t = regLoc(r, ScalarSlot, isTemp = true)
+  g.ra.aux[atPos] = ExprAux(scratch: @[t.r])
+
 proc emitLvalWalk(g: var CodeGen; n: var Cursor; globBase: Location; isStore: bool;
                   heldBase = false; asBase = false) =
   ## FUSED port of the allocator's `allocLvalue2` (a64 flavour): decide the
@@ -3170,10 +3212,7 @@ proc emitLvalWalk(g: var CodeGen; n: var Cursor; globBase: Location; isStore: bo
           skip n
         while n.hasMore: skip n
       if needsScratch:
-        var t = g.takeTmp(ScalarSlot)
-        if t.kind != InReg:
-          t = g.takeHeld("an index stride scratch")
-        g.ra.aux[atPos] = ExprAux(scratch: @[t.r])
+        g.reserveStrideScratch(atPos)
     of PatC:
       let patPos = g.posOf(n)
       let needsScratch = g.atNeedsScratch(n) or (asBase and g.atIndexIsReg(n))
@@ -3195,10 +3234,7 @@ proc emitLvalWalk(g: var CodeGen; n: var Cursor; globBase: Location; isStore: bo
           skip n
         while n.hasMore: skip n
       if needsScratch:
-        var t = g.takeTmp(ScalarSlot)
-        if t.kind != InReg:
-          t = g.takeHeld("an index stride scratch")
-        g.ra.aux[patPos] = ExprAux(scratch: @[t.r])
+        g.reserveStrideScratch(patPos)
     of BaseobjC:
       n.into:
         skip n                                       # base type
@@ -3249,9 +3285,7 @@ proc freeLvalTemps2(g: var CodeGen; c: Cursor) =
           g.freeVal(g.ra.locs[g.posOf(cc)])
         while cc.hasMore: skip cc
       if g.ra.aux.hasKey(atPos) and g.ra.aux[atPos].scratch.len > 0:
-        let r = g.ra.aux[atPos].scratch[0]
-        g.pickedRegs.excl r
-        g.unbindTemp(r)
+        g.releaseStrideScratch(atPos)
     of PatC:
       let patPos = g.posOf(c)
       var cc = c
@@ -3262,9 +3296,7 @@ proc freeLvalTemps2(g: var CodeGen; c: Cursor) =
           g.freeVal(g.ra.locs[g.posOf(cc)])
         while cc.hasMore: skip cc
       if g.ra.aux.hasKey(patPos) and g.ra.aux[patPos].scratch.len > 0:
-        let r = g.ra.aux[patPos].scratch[0]
-        g.pickedRegs.excl r
-        g.unbindTemp(r)
+        g.releaseStrideScratch(patPos)
     of BaseobjC:
       var cc = c
       cc.into:
@@ -4266,9 +4298,13 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
         else:
           var aD = regLoc(g.md.gprAt(pl), ScalarSlot)
           g.emitValue2(a, aD)                  # → its ABI register directly
-          # Reference the arg register RAW: a checked-name temp binding carries a
-          # generic `(i 64)` that nifasm's strict reg→reg `mov` rejects into a
-          # sub-width param.
+          # Release the temp binding so the arg register is referenced RAW where it
+          # can be. Where it CANNOT — the allocator also homes plain locals in the
+          # volatile arg registers, and nifasm insists a bound register be named —
+          # the name carries arkham's generic `(i 64)`, which nifasm accepts into a
+          # sub-width param as the ABI truncation it is (memfiles' `close`, where
+          # `canRaise` lives in x0 and is dead across the `raiseOSError(cint)` it
+          # stages).
           g.unbindTemp(aD.r)
           g.ab.tree MovA64:
             g.ab.tree ArgX: g.ab.sym paramName(j)

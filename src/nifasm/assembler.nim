@@ -2660,7 +2660,14 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       proc isIntLike(t: Type): bool = t.kind in {IntT, UIntT, BoolT, IntLitT}
       let sizedMemReg = (dest.kind == okMem) != (op.kind == okMem) and
                         isIntLike(dest.typ) and isIntLike(op.typ)
-      if not sizedMemReg and not movCompatible(dest.typ, op.typ):
+      # Placing an integer in a PARAMETER's register is the ABI's own truncation, not
+      # a narrowing the caller has to spell out: AAPCS64 leaves the bits above a
+      # sub-word parameter unspecified, and the callee reads the register at the
+      # parameter's width. A code generator that keeps every scalar 64-bit in
+      # registers (arkham does) would otherwise have to name a fresh, param-width
+      # binding for each such argument.
+      let argWidth = dest.kind == okArg and isIntLike(dest.typ) and isIntLike(op.typ)
+      if not sizedMemReg and not argWidth and not movCompatible(dest.typ, op.typ):
         typeError(dest.typ, op.typ, start)
     checkPtrStore(dest.typ, op.kind, op.typ, start)
     if dest.kind == okMem:
