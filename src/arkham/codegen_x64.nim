@@ -1062,6 +1062,23 @@ proc cmpJccTag(ek: LengExpr; whenTrue, signed: bool): X64Inst =
             else:        (if signed: JgX64 else: JaX64))
   else: raiseAssert "arkham x64 v0: condition not supported: " & $ek
 
+proc cmpSetccTag(jcc: X64Inst): X64Inst =
+  ## The `setcc` that MATERIALIZES the condition `jcc` would branch on. Total over
+  ## everything `cmpJccTag` can return, so the two stay in step by construction
+  ## rather than by a second copy of the signed/unsigned rule.
+  case jcc
+  of JeX64:  SeteX64
+  of JneX64: SetneX64
+  of JlX64:  SetlX64
+  of JleX64: SetleX64
+  of JgX64:  SetgX64
+  of JgeX64: SetgeX64
+  of JbX64:  SetbX64
+  of JbeX64: SetbeX64
+  of JaX64:  SetaX64
+  of JaeX64: SetaeX64
+  else: raiseAssert "arkham x64: no setcc for " & $jcc
+
 # Linux syscalls are recognised in `programs.collect` (the `LinuxSyscalls` table)
 # and emitted as `(syproc …)` declarations whose proctype puts args in the syscall
 # ABI registers (arg4 → r10, not the C ABI's rcx) and declares the kernel's
@@ -5349,6 +5366,53 @@ proc emitCondValue2(g: var CodeGen; c: Cursor; dest: var Location) =
   ## it freely; there is no clobber hazard because every write happens after
   ## every operand read. Dynamic cost is unchanged (2 instrs on either path);
   ## static cost is one extra `jmp` + label over the assume-1 scheme.
+  ##
+  ## A PLAIN INTEGER COMPARISON skips all of that: `cmp` already left the answer
+  ## in the flags, and `setcc` reads it straight into the result's low byte — two
+  ## instructions, no branches, no labels, where the diamond needs five and two
+  ## label sites. (`and $1` clears the rest: `setcc` writes ONE byte and leaves
+  ## the upper 56 bits as they were, which a consumer's `cmp r, 0` would read.)
+  ##
+  ## It is sound only because NOTHING may be emitted between the `cmp` and the
+  ## `setcc`. `takeTmp` (a pool pick, or a spill-slot Location the produce-into
+  ## path fills later) and `bindTemp` (a `(rebind …)` declaration) emit no
+  ## instructions, so the flags survive both — that is exactly why the carrier can
+  ## still be taken LATE here, keeping the register-pressure property above. The
+  ## pool-dry path's `pickStagingSealed` CAN spill and must not come between, so
+  ## that case keeps the branch form — consuming the very same live flags via the
+  ## `jcc` tag `emitScalarCmpE` handed back.
+  block setccFastPath:
+    if c.kind != TagLit or c.exprKind notin {EqC, NeqC, LtC, LeC}: break setccFastPath
+    var aC, bC: Cursor
+    block:
+      var cc = c
+      cc.into:
+        aC = cc; skip cc
+        bC = cc; skip cc
+        while cc.hasMore: skip cc
+    if g.isFloatExpr(aC): break setccFastPath   # comisd + the xmm dance: unchanged
+    let tag = g.emitScalarCmpE(aC, bC, c.exprKind, whenTrue = true)
+    if dest.kind in {Undef, NeedsReg, RegOrImm}: dest = g.takeTmp(ScalarSlot)
+    if dest.kind == NamedStack and dest.spillTemp:
+      let lT = g.freshLabel()
+      let lE = g.freshLabel()
+      g.emJcc(tag, lT)                          # flags are still live here
+      let s = g.pickStagingSealed("a cond value spill", ScalarSlot)
+      g.movImm(s, 0)
+      g.emJmp lE
+      g.emLab lT
+      g.movImm(s, 1)
+      g.emLab lE
+      g.emitStoreLoc(dest, s)
+      g.giveBack s
+      return
+    let res = dest
+    assert res.kind == InReg, "arkham x64n: cond-value result " & $res.kind
+    if res.isTemp and not g.rb.isBoundTemp(res.r): g.bindTemp(res.r, res.typ)
+    g.ab.tree cmpSetccTag(tag): g.emReg res.r
+    g.binImm(AndX64, res.r, 1)                  # the byte write left the rest alone
+    dest = res
+    return
   let lTrue = g.freshLabel()
   let lEnd = g.freshLabel()
   g.emitCondE(c, lTrue, whenTrue = true)
