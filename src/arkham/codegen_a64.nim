@@ -1502,7 +1502,17 @@ proc place2(g: var CodeGen; src: Location; dest: Reg) =
   case src.kind
   of InReg: g.movReg(dest, src.r)
   of Imm: g.placeImm(dest, src)
-  of NamedStack: g.emScalarLoad(dest, src.name)
+  of NamedStack:
+    g.emScalarLoad(dest, src.name)
+    # The slot is a forced `(i 64)` (see `emTypedStackVar`), so the load is 64-bit
+    # and arkham's own stores keep the canonical extended form in it. A local whose
+    # ADDRESS was taken breaks that: a callee holding `ptr int8` writes exactly one
+    # byte and leaves the other seven at whatever was there before. Re-extend a
+    # sub-64-bit scalar on the way out — cheap, since only a SPILLED narrow local
+    # reaches here at all, and the alternative is a value that prints right (`$`
+    # narrows on the way out) but compares wrong (the compare is 64-bit).
+    if src.typ.kind in {AInt, AUInt} and src.typ.size > 0 and src.typ.size < 8:
+      g.extendTo(dest, src.typ.size * 8, signed = src.typ.kind == AInt)
   of Glob:
     if g.globalIsGvarSlot(src.name):
       # Fold the page offset into the load: `adrp x17, g@PAGE ; ldr dest, [x17, g@PAGEOFF]`
