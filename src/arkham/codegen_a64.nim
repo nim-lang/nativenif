@@ -3511,7 +3511,7 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
   of Undef, NeedsReg, RegOrImm:
     if lDest.kind == InReg and lDest.isTemp: res = lDest # in-place on the dead lhs temp
     elif rDest.kind == InReg and rDest.isTemp and lDest.kind == InReg and
-         ek notin {ShlC, ShrC}:
+         ek notin {ShlC, ShrC, DivC}:
       res = rDest                                        # recycle the dead rhs temp
     else: res = g.takeTmp(ScalarSlot)
   else: discard
@@ -3542,9 +3542,20 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
   let w32 = op in {AddA64, SubA64, MulA64} and not aliasRhs and isUnsigned32(resTypeC)
   if aliasRhs:
     assert lDest.kind == InReg, "arkham a64n: aliasRhs lhs " & $lDest.kind
-    g.binReg(op, rD, lDest.r)                            # dest := rhs op lhs
-    if op == SubA64:
-      g.ab.tree NegA64: g.emReg rD                       # dest := lhs - rhs
+    if op in {UdivA64, SdivA64}:
+      # `dest := rhs op lhs` below relies on the op being commutative (or, for
+      # `sub`, fixable by a following `neg`). Division is neither: computing
+      # `512 div x` where `x div 512` was asked for is silently wrong. Move the
+      # divisor out of the destination first and emit the operands in order.
+      let b = g.takeBridge(avoid = rD)
+      g.movReg(b, rD)                                    # b := rhs (the divisor)
+      g.place2(lDest, rD)                                # dest := lhs
+      g.binReg(op, rD, b)                                # dest := lhs div rhs
+      g.dropBridge b
+    else:
+      g.binReg(op, rD, lDest.r)                          # dest := rhs op lhs
+      if op == SubA64:
+        g.ab.tree NegA64: g.emReg rD                     # dest := lhs - rhs
   elif lDest.kind == InReg and lDest.r != rD and op in ThreeOpA64:
     g.foldRhs3(op, rD, lDest.r, rDest, rhsC, w32)        # dest := lhs op rhs (no mov)
   else:

@@ -261,12 +261,11 @@ const arkhamStressKnown: seq[string] = @[
 
 const arkhamStressA64Known: seq[string] = @[
   # Both a64 passes take this list — the qemu `linux_arm64` one and the native
-  # macOS one — because they drive the same emitters. The first two are SILENT
-  # MISCOMPILES: fewer registers may cost performance or hit a documented
+  # macOS one — because they drive the same emitters. The first is a SILENT
+  # MISCOMPILE: fewer registers may cost performance or hit a documented
   # out-of-registers assert, but can never legitimately change what a program
   # computes, so a wrong answer here is a codegen bug by construction.
   "spill_produce_float",    # float produce-into-spill reads a clobbered register
-  "steal_straddle",         # trySteal over a straddling live range yields a stale value
   "atomic_cas_regpressure", # intrinsic-operand pick has no steal/spill arm
   # `instrOperandInPlace` — read a register-homed symbol operand where it lies
   # instead of copying it into a register the row then cannot find — is x86-64
