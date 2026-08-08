@@ -2527,6 +2527,34 @@ proc emitAddOffsetA64(ctx: var GenContext; rd, rn: arm64.Register; offset: int64
     else:
       arm64.emitAdd(ctx.buf.data, rd, rn, scratch)
 
+proc a64FpMemBase(ctx: var GenContext; m: arm64.MemoryOperand;
+                  single: bool): (arm64.Register, int32) =
+  ## Reduce an FP load/store's memory operand to a (base, offset) pair the scaled
+  ## unsigned-offset FP form can actually encode.
+  ##
+  ## That form has NO index register and only a `0..0xFFF` *scaled* displacement,
+  ## while `(at …)` hands us `base + index<<shift (+ offset)` and a big frame hands
+  ## us an offset past the field. Both fold into the reserved X16 veneer (arkham
+  ## never allocates X16/X17), leaving the access itself a plain `[X16, #0]`.
+  ## Before this, an INDEX was silently dropped — `powtens[i]` read `powtens[0]`
+  ## for every i — and a large offset raised "FP LDR offset out of range".
+  let scale = if single: 4'i32 else: 8'i32
+  if not m.hasIndex and (m.offset mod scale) == 0 and
+     m.offset >= 0 and (m.offset div scale) <= 0xFFF:
+    return (m.base, m.offset)
+  if m.hasIndex:
+    # A SP base needs the EXTENDED-register ADD: the shifted form reads reg 31 as
+    # XZR, not SP (same rule as `lea`).
+    if m.base == arm64.SP:
+      arm64.emitAddExtended(ctx.buf.data, arm64.X16, m.base, m.index, uint8(m.shift))
+    else:
+      arm64.emitAddShifted(ctx.buf.data, arm64.X16, m.base, m.index, uint8(m.shift))
+    if m.offset != 0:
+      emitAddOffsetA64(ctx, arm64.X16, arm64.X16, m.offset, arm64.X17)
+  else:
+    emitAddOffsetA64(ctx, arm64.X16, m.base, m.offset, arm64.X17)
+  result = (arm64.X16, 0'i32)
+
 proc a64CondOf(inst: A64Inst): arm64.Condition =
   ## The condition code baked into a `csel*`/`cset*` mnemonic (same condition
   ## vocabulary as the `b*` branches).
@@ -3423,7 +3451,8 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let rt = parseFloatOperandA64(n, ctx)
     let op = parseOperandA64(n, ctx)
     if op.kind != okMem: error("FLDR source must be memory", n)
-    arm64.emitFldr(ctx.buf.data, rt, op.mem.base, op.mem.offset, single)
+    let (base, off) = a64FpMemBase(ctx, op.mem, single)
+    arm64.emitFldr(ctx.buf.data, rt, base, off, single)
 
   of FstrA64:
     # (fstr <mem> D) — store a double/single.
@@ -3432,7 +3461,8 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     if dest.kind != okMem: error("FSTR destination must be memory", n)
     let single = isA64FpSingle(n, ctx)
     let rt = parseFloatOperandA64(n, ctx)
-    arm64.emitFstr(ctx.buf.data, rt, dest.mem.base, dest.mem.offset, single)
+    let (base, off) = a64FpMemBase(ctx, dest.mem, single)
+    arm64.emitFstr(ctx.buf.data, rt, base, off, single)
 
   of ScvtfA64, UcvtfA64:
     # (scvtf Dfp Sgpr) — int → double/single.
