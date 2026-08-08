@@ -2216,6 +2216,16 @@ proc normalizeBinWidth(g: var CodeGen; resTypeC: Cursor; rD: Reg; op: X64Inst) =
   if slot.kind in {AInt, AUInt} and slot.size > 0 and slot.size < 8:
     g.extendTo(rD, slot.size * 8, signed = slot.kind == AInt)
 
+proc normalizeUnaryWidth(g: var CodeGen; resTypeC: Cursor; rD: Reg) =
+  ## The `neg`/`not` twin of `normalizeBinWidth`. Both are computed 64-bit wide, so
+  ## on a sub-64-bit type they leave bits ABOVE the type width: `~15'u8` is
+  ## `0xFFFF_FFFF_FFFF_FFF0`, not `0xF0`, and a following unsigned compare (or
+  ## `shr`, or `div`) reads the stale bits. Signed types need it too, but only at
+  ## the boundary — `neg` of `-128'i8` is `+128`, whose i8 value is `-128` again.
+  let slot = typeToSlot(resTypeC)
+  if slot.kind in {AInt, AUInt} and slot.size > 0 and slot.size < 8:
+    g.extendTo(rD, slot.size * 8, signed = slot.kind == AInt)
+
 proc binStoreSuppressPos(g: var CodeGen; rhs: Cursor; storeWidth: int): int =
   ## `rhs`'s token position when it is a sub-64-bit integer `add`/`sub`/`mul`/`shl`
   ## whose `normalizeBinWidth` fixup is made redundant by a truncating store of
@@ -2825,11 +2835,11 @@ proc emitValue2(g: var CodeGen; c: Cursor; dest: var Location) =
       g.forceRegDestE(dest)
       if dest.kind == NamedStack and dest.spillTemp:
         g.produceIntoMem2(c, dest); return
-      var inner: Cursor
+      var resType, inner: Cursor
       block:
         var cc = c
         cc.into:
-          skip cc                                 # result type
+          resType = cc; skip cc                   # result type
           inner = cc; skip cc
           while cc.hasMore: skip cc
       var iv = dest                               # dest-thread into the operand
@@ -2844,6 +2854,7 @@ proc emitValue2(g: var CodeGen; c: Cursor; dest: var Location) =
           g.ab.tree NegX64: g.emReg dest.r
         else:
           g.ab.tree NotX64: g.emReg dest.r
+        g.normalizeUnaryWidth(resType, dest.r)
         if not (iv.kind == InReg and iv.r == dest.r): g.freeVal(iv)
     of SufC, ParC:                                # wrapper → the inner value
       var inner: Cursor

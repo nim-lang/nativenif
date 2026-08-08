@@ -2049,6 +2049,16 @@ proc foldRhs3(g: var CodeGen; op: A64Inst; dest, rn: Reg; rhsLoc: Location; rhsC
     g.dropBridge b
   else: raiseAssert "arkham a64n: foldRhs3 " & $rhsLoc.kind
 
+proc normalizeUnaryWidth(g: var CodeGen; resTypeC: Cursor; rD: Reg) =
+  ## The `neg`/`bitnot` twin of `normalizeBinWidth`. Both are computed 64-bit wide,
+  ## so on a sub-64-bit type they leave bits ABOVE the type width: `~15'u8` is
+  ## `0xFFFF_FFFF_FFFF_FFF0`, not `0xF0`, and a following unsigned compare (or
+  ## `lsr`, or `udiv`) reads the stale bits. Signed types need it too, but only at
+  ## the boundary — `neg` of `-128'i8` is `+128`, whose i8 value is `-128` again.
+  let slot = typeToSlot(resTypeC)
+  if slot.kind in {AInt, AUInt} and slot.size > 0 and slot.size < 8:
+    g.extendTo(rD, slot.size * 8, signed = slot.kind == AInt)
+
 proc isUnsigned32(resTypeC: Cursor): bool =
   ## True for a `(u 32)` result — the case where an add/sub/mul W-form gives the
   ## fully-normalized (zero-extended) value for free, letting emitBin2 both emit the
@@ -3388,11 +3398,11 @@ proc emitValue2(g: var CodeGen; c: Cursor; dest: var Location) =
       g.forceRegDestE(dest)
       if dest.kind == NamedStack and dest.spillTemp:
         g.produceIntoMem2(c, dest); return
-      var inner: Cursor
+      var resType, inner: Cursor
       block:
         var cc = c
         cc.into:
-          skip cc                                 # result type
+          resType = cc; skip cc                   # result type
           inner = cc; skip cc
           while cc.hasMore: skip cc
       var iv = dest                               # dest-thread into the operand
@@ -3405,6 +3415,7 @@ proc emitValue2(g: var CodeGen; c: Cursor; dest: var Location) =
         elif iv.kind != InReg: g.place2(iv, dest.r)
         g.ab.tree NegA64: g.emReg dest.r
         if c.exprKind == BitnotC: g.binImm(SubA64, dest.r, 1)  # ~a = -a - 1
+        g.normalizeUnaryWidth(resType, dest.r)
         if not (iv.kind == InReg and iv.r == dest.r): g.freeVal(iv)
     of SufC, ParC:
       var inner: Cursor
