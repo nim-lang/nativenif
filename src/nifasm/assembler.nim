@@ -6955,8 +6955,37 @@ proc writeMachO(a: var GenContext; outfile: string) =
                                      targetOff: it.target.size)
     else: discard
 
+  # A GVAR whose initializer is a symbol ADDRESS (`(gvar :scheduler (proctype …)
+  # trivialTick.0)` — a function-pointer hook, or a global pointing at another
+  # global). Same treatment as the blob fields above: bake the target's preferred
+  # vaddr and let dyld slide it. `writeElf` bakes these into its .bss image; this
+  # path used to drop them, so on macOS every such global started as NULL and the
+  # first call through it branched to 0.
+  for it in a.bssSymInits:
+    case it.sym.kind
+    of skProc, skRodata:
+      if it.sym.kind == skRodata and it.sym.dataConst:
+        rebases.add macho.RodataRebase(fieldOff: it.off.int, targetInData: true,
+                                       targetOff: it.sym.size)
+      elif labelPos.hasKey(it.sym.offset):
+        rebases.add macho.RodataRebase(fieldOff: it.off.int, targetInData: false,
+                                       targetOff: labelPos[it.sym.offset])
+    of skGvar:
+      rebases.add macho.RodataRebase(fieldOff: it.off.int, targetInData: true,
+                                     targetOff: it.sym.size)
+    else: discard
+
+  # `--symmap`: dump every generated proc's virtual address (the Mach-O carries no
+  # symbol table). Only `writeMachO` knows where __text lands, so hand it the rows.
+  var symMapRows: seq[(int, string)]
+  if a.symMap:
+    for name, sym in a.rootScope.syms:
+      if sym.kind == skProc and labelPos.hasKey(sym.offset):
+        symMapRows.add (labelPos[sym.offset], a.nameOf(name))
+    symMapRows.sort(proc (x, y: (int, string)): int = cmp(x[0], y[0]))
+
   macho.writeMachO(code, a.bssOffset, cputype, cpusubtype, outfile, dynlink, gsites, tlv,
-                   a.bssInits, rebases)
+                   a.bssInits, rebases, symMapRows)
 
   # macOS arm64 requires code signing for all executables
   when defined(macosx):
