@@ -1,0 +1,156 @@
+(.nif27)
+(stmts
+ (type :Arr9.0 .
+  (array
+   (u 8)9))
+ (type :Packed12.0 .
+  (object .
+   (fld :a.0 .
+    (u 32))
+   (fld :b.0 .
+    (i 32))
+   (fld :c.0 .
+    (i 32))))
+ (type :Three.0 .
+  (object .
+   (fld :x.0 .
+    (u 8))
+   (fld :y.0 .
+    (u 8))
+   (fld :z.0 .
+    (u 8))))
+ (gvar :guard.0 .
+  (u 64)7777)
+ (gvar :gpacked.0 . Packed12.0 .)
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :sumArr.0
+  (params
+   (param :a.0 . Arr9.0))
+  (i 64).
+  (stmts
+   (var :s.0 .
+    (i 64)0)
+   (var :i.0 .
+    (i 64)0)
+   (while
+    (lt i.0 9)
+    (stmts
+     (asgn s.0
+      (add
+       (i 64)s.0
+       (conv
+        (i 64)
+        (at a.0 i.0))))
+     (asgn i.0
+      (add
+       (i 64)i.0 1))))
+   (ret s.0)))
+ (proc :sumPacked.0
+  (params
+   (param :p.0 . Packed12.0))
+  (i 64).
+  (stmts
+   (ret
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (conv
+       (i 64)
+       (dot p.0 a.0))
+      (conv
+       (i 64)
+       (dot p.0 b.0)))
+     (conv
+      (i 64)
+      (dot p.0 c.0))))))
+ (proc :sumThree.0
+  (params
+   (param :t.0 . Three.0))
+  (i 64).
+  (stmts
+   (ret
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (conv
+       (i 64)
+       (dot t.0 x.0))
+      (conv
+       (i 64)
+       (dot t.0 y.0)))
+     (conv
+      (i 64)
+      (dot t.0 z.0))))))
+ (proc :mkPacked.0
+  (params) Packed12.0 .
+  (stmts
+   (var :r.0 . Packed12.0
+    (oconstr Packed12.0
+     (kv a.0 100)
+     (kv b.0 20)
+     (kv c.0 3)))
+   (ret r.0)))
+ (proc :mkThree.0
+  (params) Three.0 .
+  (stmts
+   (var :r.0 . Three.0
+    (oconstr Three.0
+     (kv x.0 4)
+     (kv y.0 5)
+     (kv z.0 6)))
+   (ret r.0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :arr.0 . Arr9.0
+    (aconstr Arr9.0 1 2 3 4 5 6 7 8 9))
+   (var :acc.0 .
+    (i 64)0)
+   (asgn acc.0
+    (call sumArr.0 arr.0))
+   (if
+    (elif
+     (neq acc.0 45)
+     (stmts
+      (call exit.c 11))))
+   (var :p.0 . Packed12.0
+    (call mkPacked.0))
+   (if
+    (elif
+     (neq
+      (call sumPacked.0 p.0)123)
+     (stmts
+      (call exit.c 12))))
+   (var :t.0 . Three.0
+    (call mkThree.0))
+   (if
+    (elif
+     (neq
+      (call sumThree.0 t.0)15)
+     (stmts
+      (call exit.c 13))))
+   (asgn gpacked.0
+    (call mkPacked.0))
+   (if
+    (elif
+     (neq
+      (call sumPacked.0 gpacked.0)123)
+     (stmts
+      (call exit.c 14))))
+   (if
+    (elif
+     (neq guard.0 7777)
+     (stmts
+      (call exit.c 15))))
+   (call exit.c 42))))

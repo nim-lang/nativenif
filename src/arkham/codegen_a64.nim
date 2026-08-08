@@ -823,9 +823,13 @@ proc genTypeBody(g: var CodeGen; c: var Cursor) =
     raiseAssert "arkham v1: malformed type"
 
 # ── AAPCS64 small-aggregate (≤16B) marshalling ──────────────────────────────
-# A ≤16-byte aggregate travels in 1–2 consecutive GPRs; word i ↔ the field at
-# byte offset 8·i (word-aligned fields only for now — sub-word packing and the
-# >16-byte by-reference / x8-indirect paths `raiseAssert`). Layout/size live in
+# A ≤16-byte aggregate travels in 1–2 consecutive GPRs. The transfer is purely
+# POSITIONAL — eightbyte i is the 8 bytes at offset 8·i — and never consults the
+# field layout, so an object, a tuple, an array and a field packing that straddles
+# the eightbyte boundary all marshal alike. A trailing PARTIAL eightbyte (an
+# aggregate whose size is not a multiple of 8) goes through `loadAggrTail` /
+# `storeAggrTail`, which touch exactly the aggregate's own bytes. The >16-byte
+# by-reference / x8-indirect paths still `raiseAssert`. Layout/size live in
 # slots.nim so the register allocator shares them.
 
 proc emWordThroughPtr(g: var CodeGen; p: Reg; idx: int) =
@@ -838,37 +842,88 @@ proc emWordThroughPtr(g: var CodeGen; p: Reg; idx: int) =
         g.emReg p
       g.ab.intLit idx
 
+proc emScalarAtOff(g: var CodeGen; p: Reg; off, size: int) =
+  ## `(mem (cast (aptr (u size·8)) p) off)` — the `size`-byte unsigned scalar at the
+  ## RAW byte offset `off` from `[p]`. `(at …)` strides by the element size and so
+  ## can only reach multiples of the width; nifasm's `(mem base offset)` form takes a
+  ## free byte displacement, which is what an aggregate's unaligned tail needs.
+  g.ab.tree MemX:
+    g.ab.tree CastX:
+      g.ab.aptrType: g.ab.uintType(size * 8)
+      g.emReg p
+    g.ab.intLit off
+
+proc loadAggrTail(g: var CodeGen; dst, base: Reg; aggrSize, byteOff: int) =
+  ## `dst ←` the aggregate's trailing `aggrSize - byteOff` bytes at `[base + byteOff]`,
+  ## right-justified in `dst` (the by-value ABI leaves the eightbyte's padding bits
+  ## unspecified, so the high bytes are free).
+  ##
+  ## Reads NOTHING outside the aggregate. The eightbyte a ≤16-byte value ends in may
+  ## be the last mapped bytes of a page — a heap `seq` payload, the tail of a `.bss`
+  ## section — and a lazy 8-byte over-read there is a segfault that only shows up on
+  ## the allocation that happens to land at the boundary.
+  let n = aggrSize - byteOff
+  if byteOff >= 8:
+    # A whole eightbyte precedes this one, so the aggregate's LAST 8 bytes are all in
+    # bounds: read them as one word and shift the tail down into place.
+    g.ab.tree MovA64: (g.emReg dst; g.emScalarAtOff(base, aggrSize - 8, 8))
+    g.binImm(LsrA64, dst, int64((8 - n) * 8))
+  elif n in {1, 2, 4}:
+    g.ab.tree MovA64: (g.emReg dst; g.emScalarAtOff(base, byteOff, n))
+  else:
+    # A 3/5/6/7-byte aggregate: no single load covers it and there is no full word to
+    # borrow from, so assemble it from the top byte down.
+    let tmp = g.takeBridge(avoid = base)
+    g.ab.tree MovA64: (g.emReg dst; g.emScalarAtOff(base, byteOff + n - 1, 1))
+    for b in countdown(n - 2, 0):
+      g.binImm(LslA64, dst, 8)
+      g.ab.tree MovA64: (g.emReg tmp; g.emScalarAtOff(base, byteOff + b, 1))
+      g.binReg(OrrA64, dst, tmp)
+    g.dropBridge tmp
+
+proc storeAggrTail(g: var CodeGen; base, src: Reg; aggrSize, byteOff: int) =
+  ## `[base + byteOff] ←` the low `aggrSize - byteOff` bytes of `src`. The write-side
+  ## twin of `loadAggrTail`, and the reason it cannot simply store a full word: the
+  ## bytes past the aggregate belong to whatever sits next to it.
+  let n = aggrSize - byteOff
+  if n in {1, 2, 4}:
+    g.ab.tree MovA64: (g.emScalarAtOff(base, byteOff, n); g.emReg src)
+  else:
+    let tmp = g.takeBridge(avoid = base)
+    g.ab.tree MovA64: (g.emScalarAtOff(base, byteOff, 1); g.emReg src)
+    for b in 1 ..< n:
+      g.binImm3(LsrA64, tmp, src, int64(8 * b))
+      g.ab.tree MovA64: (g.emScalarAtOff(base, byteOff + b, 1); g.emReg tmp)
+    g.dropBridge tmp
+
 proc aggrWordsToFromRegs(g: var CodeGen; varName, typeName: string;
                          firstArg: int; toRegs: bool) =
   ## Move a ≤16-byte aggregate between its memory home and x{firstArg+i} (the by-value
-  ## aggregate ABI). A FULL eightbyte moves as a RAW `(u 64)` word — the slot's address
-  ## goes into a staging bridge (a by-ref aggregate already has its pointer in a reg)
-  ## and `emWordThroughPtr` carries the whole 8 bytes, so fields PACKED into one word
-  ## (`{int32; int32}`) all transfer (a field-typed move would drop all but the field
-  ## at the boundary). A trailing PARTIAL eightbyte (a single sub-word field for a
-  ## ≤16-byte aggregate) keeps the field-typed access (exact bytes, no over-read).
+  ## aggregate ABI). The whole transfer is positional: the slot's address goes into a
+  ## staging bridge (a by-ref aggregate already has its pointer in a reg) and each
+  ## eightbyte moves as a RAW `(u 64)` word, so fields PACKED into one word
+  ## (`{int32; int32}`) all transfer and a non-object aggregate — a tuple, an array —
+  ## needs no layout at all. A trailing PARTIAL eightbyte goes through
+  ## `loadAggrTail` / `storeAggrTail`: exact bytes, no over-read, no over-write.
   let byteSize = aggrByteSize(g.prog, typeName)
   let loc = g.ra.locationOfSym(varName)
   var baseReg = NoReg
   var bridge = NoReg
-  if byteSize >= 8:                                    # at least one full eightbyte
-    if loc.kind == InReg:
-      baseReg = loc.r                                  # a by-ref aggregate's pointer
-    else:
-      bridge = g.takeBridge()
-      g.ab.tree LeaA64: (g.emReg bridge; g.ab.sym varName)   # bridge ← &slot
-      baseReg = bridge
+  if loc.kind == InReg:
+    baseReg = loc.r                                    # a by-ref aggregate's pointer
+  else:
+    bridge = g.takeBridge()
+    g.ab.tree LeaA64: (g.emReg bridge; g.ab.sym varName)     # bridge ← &slot
+    baseReg = bridge
   for i in 0 ..< aggrWordCount(g.prog, typeName):
     if byteSize - i * 8 >= 8:                          # a full eightbyte → raw u64 word
       g.ab.tree MovA64:
         if toRegs: (g.emReg IntArgRegs[firstArg + i]; g.emWordThroughPtr(baseReg, i))
         else: (g.emWordThroughPtr(baseReg, i); g.emReg IntArgRegs[firstArg + i])
-    else:                                              # trailing partial eightbyte → field
-      let fn = fieldAtOffset(aggrLayout(g.prog, typeName), i * 8)
-      if fn.len == 0: raiseAssert "arkham a64: sub-word-packed aggregate ABI unsupported"
-      g.ab.tree MovA64:
-        if toRegs: (g.emReg IntArgRegs[firstArg + i]; g.emAggrFieldMem(varName, fn))
-        else: (g.emAggrFieldMem(varName, fn); g.emReg IntArgRegs[firstArg + i])
+    elif toRegs:
+      g.loadAggrTail(IntArgRegs[firstArg + i], baseReg, byteSize, i * 8)
+    else:
+      g.storeAggrTail(baseReg, IntArgRegs[firstArg + i], byteSize, i * 8)
   if bridge != NoReg: g.dropBridge bridge
 
 proc structToRegs(g: var CodeGen; varName, typeName: string; firstArg: int) =
@@ -883,8 +938,8 @@ proc globalToRegs(g: var CodeGen; name, typeName: string; firstArg: int) =
   ## Read a GLOBAL aggregate's words into x{firstArg+i}. The global is a `.bss` label
   ## (no stack slot), so its address goes into a staging bridge and each word is read
   ## through that pointer — a FULL eightbyte as a raw `(u 64)` word (handles packed
-  ## fields), a trailing PARTIAL eightbyte field-typed. For a global passed by value as
-  ## a call argument (`equalStrings(s, "")` where `s` is a global `string`).
+  ## fields), a trailing PARTIAL eightbyte through `loadAggrTail`. For a global passed
+  ## by value as a call argument (`equalStrings(s, "")` where `s` is a global `string`).
   let bridge = g.takeBridge()
   g.emGlobalAddr(bridge, name)
   let byteSize = aggrByteSize(g.prog, typeName)
@@ -892,8 +947,7 @@ proc globalToRegs(g: var CodeGen; name, typeName: string; firstArg: int) =
     if byteSize - i * 8 >= 8:
       g.ab.tree MovA64: (g.emReg IntArgRegs[firstArg + i]; g.emWordThroughPtr(bridge, i))
     else:
-      let fn = fieldAtOffset(aggrLayout(g.prog, typeName), i * 8)
-      g.ab.tree MovA64: (g.emReg IntArgRegs[firstArg + i]; g.emPtrFieldMem(bridge, typeName, fn))
+      g.loadAggrTail(IntArgRegs[firstArg + i], bridge, byteSize, i * 8)
   g.dropBridge bridge
 
 # ── named register locals (typed nifasm vars; transient scratch stays `(xN)`) ─
@@ -2293,15 +2347,15 @@ proc copyStructThroughPtr2(g: var CodeGen; srcVar, typeName: string; ptrReg: Reg
 proc regsToStructThroughPtr(g: var CodeGen; ptrReg: Reg; typeName: string; firstArg: int) =
   ## `[ptrReg] ← x{firstArg+i}` — marshal a ≤16B aggregate held in the return registers
   ## into the memory `ptrReg` points at: a FULL eightbyte as a raw `(u 64)` word
-  ## (handles packed fields), a trailing PARTIAL eightbyte by field. The through-pointer
-  ## twin of `regsToStruct` — stores an aggregate call result into a global.
+  ## (handles packed fields), a trailing PARTIAL eightbyte through `storeAggrTail`. The
+  ## through-pointer twin of `regsToStruct` — stores an aggregate call result into a
+  ## global.
   let byteSize = aggrByteSize(g.prog, typeName)
   for i in 0 ..< aggrWordCount(g.prog, typeName):
     if byteSize - i * 8 >= 8:
       g.ab.tree MovA64: (g.emWordThroughPtr(ptrReg, i); g.emReg IntArgRegs[firstArg + i])
     else:
-      let fn = fieldAtOffset(aggrLayout(g.prog, typeName), i * 8)
-      g.ab.tree MovA64: (g.emPtrFieldMem(ptrReg, typeName, fn); g.emReg IntArgRegs[firstArg + i])
+      g.storeAggrTail(ptrReg, IntArgRegs[firstArg + i], byteSize, i * 8)
 
 proc marshalAggrFromAddr(g: var CodeGen; addrReg: Reg; typeName: string; firstArg: int) =
   ## `x{firstArg+i} ← [addrReg]` — load a ≤16B aggregate at `[addrReg]` into the by-value
@@ -2312,8 +2366,7 @@ proc marshalAggrFromAddr(g: var CodeGen; addrReg: Reg; typeName: string; firstAr
     if byteSize - i * 8 >= 8:
       g.ab.tree MovA64: (g.emReg IntArgRegs[firstArg + i]; g.emWordThroughPtr(addrReg, i))
     else:
-      let fn = fieldAtOffset(aggrLayout(g.prog, typeName), i * 8)
-      g.ab.tree MovA64: (g.emReg IntArgRegs[firstArg + i]; g.emPtrFieldMem(addrReg, typeName, fn))
+      g.loadAggrTail(IntArgRegs[firstArg + i], addrReg, byteSize, i * 8)
 
 proc aggrArgAddr(g: var CodeGen; a: Cursor; dst: Reg) =
   ## Put the ADDRESS of an aggregate call-argument SOURCE into `dst` (a usable scratch
@@ -2345,7 +2398,12 @@ proc marshalStackAggrArg(g: var CodeGen; a: Cursor; paramNm: string) =
   ## constant, so the source is read and the slots written at stable offsets — no
   ## held-scratch survivors across a `sub sp`. A >16B aggregate passes ONE pointer word;
   ## a ≤16B by-value one passes its eightbytes (a FULL eightbyte as a raw `(u 64)` word,
-  ## a trailing PARTIAL eightbyte field-typed — exact bytes, no over-read).
+  ## a trailing PARTIAL eightbyte through `loadAggrTail` — exact bytes, no over-read).
+  ##
+  ## Both staging bridges are live here (the source address and the word carrier), so
+  ## the one tail shape that needs a third scratch — a 3/5/6/7-byte aggregate, which has
+  ## neither a single covering load nor a full word to borrow from — is refused rather
+  ## than silently mis-marshalled. It takes a call with 8+ integer arguments to reach.
   let tcur = g.getType(a)
   if tcur.kind != Symbol:
     raiseAssert "arkham a64: aggregate stack-arg of non-nominal type"
@@ -2364,9 +2422,9 @@ proc marshalStackAggrArg(g: var CodeGen; a: Cursor; paramNm: string) =
       if sz - i * 8 >= 8:
         g.ab.tree MovA64: (g.emReg w; g.emWordThroughPtr(src, i))
       else:
-        let fn = fieldAtOffset(aggrLayout(g.prog, tn), i * 8)
-        if fn.len == 0: raiseAssert "arkham a64: sub-word-packed aggregate stack-arg ABI unsupported"
-        g.ab.tree MovA64: (g.emReg w; g.emPtrFieldMem(src, tn, fn))
+        if i == 0 and sz notin {1, 2, 4}:
+          raiseAssert "arkham a64: " & $sz & "-byte aggregate stack-arg ABI unsupported"
+        g.loadAggrTail(w, src, sz, i * 8)
       g.ab.tree MovA64:
         g.ab.tree MemX:
           g.emReg SP
