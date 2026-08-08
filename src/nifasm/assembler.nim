@@ -2744,13 +2744,34 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       #   adrp x0, desc@PAGE ; add x0, x0, desc@PAGEOFF   (patched in writeMachO)
       #   ldr  x16, [x0]                                   ; load the thunk
       #   blr  x16                                         ; x0 = &var
+      #
+      # x0 and x16 are the sequence's OWN scratch, not the caller's to lose. Every
+      # other instruction here writes its destination and nothing else, and a code
+      # generator that staged `f(a, tvar)` — arg 0 already parked in x0 — would
+      # otherwise watch that argument vanish with no instruction to blame. Spill
+      # both around the thunk so `(adr D tvar)` writes D alone. (`blr` still sets
+      # lr, which is why a proc touching a thread-local is analysed as having a
+      # call and keeps a frame.)
+      arm64.emitSubImm(ctx.buf.data, arm64.SP, arm64.SP, 16'u16)
+      arm64.emitStr(ctx.buf.data, arm64.X0, arm64.SP, 0'i32)
+      arm64.emitStr(ctx.buf.data, arm64.X16, arm64.SP, 8'i32)
       let pos = ctx.buf.data.getCurrentPosition()
       arm64.emitAdrpAddGvar(ctx.buf.data, arm64.X0)     # x0 = &descriptor
       ctx.tlvSites.add (pos, op.tlvSym)
       arm64.emitLdr(ctx.buf.data, arm64.X16, arm64.X0, 0'i32)
       arm64.emitBlr(ctx.buf.data, arm64.X16)
-      if dest.reg != arm64.X0:
+      # Land the result in `dest` and restore the two scratch registers — skipping
+      # whichever one `dest` IS, since that one now holds the address.
+      if dest.reg == arm64.X0:
+        arm64.emitLdr(ctx.buf.data, arm64.X16, arm64.SP, 8'i32)
+      elif dest.reg == arm64.X16:
+        arm64.emitMov(ctx.buf.data, arm64.X16, arm64.X0)
+        arm64.emitLdr(ctx.buf.data, arm64.X0, arm64.SP, 0'i32)
+      else:
         arm64.emitMov(ctx.buf.data, dest.reg, arm64.X0)
+        arm64.emitLdr(ctx.buf.data, arm64.X0, arm64.SP, 0'i32)
+        arm64.emitLdr(ctx.buf.data, arm64.X16, arm64.SP, 8'i32)
+      arm64.emitAddImm(ctx.buf.data, arm64.SP, arm64.SP, 16'u16)
     elif op.gvarSym != nil:
       # Global in __DATA/.bss: form its address with adrp+add (PC-relative adr
       # can't reach __DATA). Emit placeholders; writeMachO patches the page /

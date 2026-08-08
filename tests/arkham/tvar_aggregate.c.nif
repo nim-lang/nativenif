@@ -1,0 +1,78 @@
+(.nif27)
+(stmts
+ (type :Pair.0 .
+  (object .
+   (fld :pa.0 .
+    (i 64))
+   (fld :pb.0 .
+    (i 64))))
+ (tvar :pad.0 .
+  (i 64)0)
+ (tvar :tp.0 . Pair.0 .)
+ (tvar :tq.0 . Pair.0 .)
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :sum.0
+  (params
+   (param :first.0 .
+    (i 64))
+   (param :p.0 . Pair.0))
+  (i 64).
+  (stmts
+   (ret
+    (add
+     (i 64)
+     (add
+      (i 64)first.0
+      (dot p.0 pa.0))
+     (dot p.0 pb.0)))))
+ (proc :mk.0
+  (params) Pair.0 .
+  (stmts
+   (var :r.0 . Pair.0
+    (oconstr Pair.0
+     (kv pa.0 30)
+     (kv pb.0 4)))
+   (ret r.0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (asgn tp.0
+    (oconstr Pair.0
+     (kv pa.0 10)
+     (kv pb.0 20)))
+   (if
+    (elif
+     (neq
+      (call sum.0 1000 tp.0)1030)
+     (stmts
+      (call exit.c 11))))
+   (asgn tq.0
+    (call mk.0))
+   (if
+    (elif
+     (neq
+      (call sum.0 100 tq.0)134)
+     (stmts
+      (call exit.c 12))))
+   (asgn tp.0 tq.0)
+   (if
+    (elif
+     (neq
+      (dot tp.0 pa.0)30)
+     (stmts
+      (call exit.c 13))))
+   (if
+    (elif
+     (neq pad.0 0)
+     (stmts
+      (call exit.c 14))))
+   (call exit.c 42))))

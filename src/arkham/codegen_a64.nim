@@ -934,14 +934,14 @@ proc regsToStruct(g: var CodeGen; varName, typeName: string; firstArg: int) =
   ## x{firstArg+i} → aggregate (one GPR per 8-byte eightbyte).
   g.aggrWordsToFromRegs(varName, typeName, firstArg, toRegs = false)
 
-proc globalToRegs(g: var CodeGen; name, typeName: string; firstArg: int) =
-  ## Read a GLOBAL aggregate's words into x{firstArg+i}. The global is a `.bss` label
-  ## (no stack slot), so its address goes into a staging bridge and each word is read
+proc globalToRegs(g: var CodeGen; name, typeName: string; firstArg: int; isTvar = false) =
+  ## Read a GLOBAL (or THREADVAR) aggregate's words into x{firstArg+i}. It is a label,
+  ## not a stack slot, so its address goes into a staging bridge and each word is read
   ## through that pointer — a FULL eightbyte as a raw `(u 64)` word (handles packed
   ## fields), a trailing PARTIAL eightbyte through `loadAggrTail`. For a global passed
   ## by value as a call argument (`equalStrings(s, "")` where `s` is a global `string`).
   let bridge = g.takeBridge()
-  g.emGlobalAddr(bridge, name)
+  if isTvar: g.genTlvAddr(name, bridge) else: g.emGlobalAddr(bridge, name)
   let byteSize = aggrByteSize(g.prog, typeName)
   for i in 0 ..< aggrWordCount(g.prog, typeName):
     if byteSize - i * 8 >= 8:
@@ -2378,7 +2378,7 @@ proc aggrArgAddr(g: var CodeGen; a: Cursor; dst: Reg) =
   elif a.kind == Symbol:
     case g.lookupSym(symName(a)).cat
     of scGlobal: g.emGlobalAddr(dst, symName(a))
-    of scTvar: raiseAssert "arkham a64: aggregate threadvar passed by value not supported"
+    of scTvar: g.genTlvAddr(symName(a), dst)
     else:
       let home = symName(a)
       let hl = g.ra.locationOfSym(home)
@@ -2760,6 +2760,7 @@ proc aggrAddrLoc(g: var CodeGen; loc: Location; dest: Reg) =
       g.emReg dest
       g.ab.sym loc.name
   of Glob: g.emGlobalAddr(dest, loc.name)
+  of Tvar: g.genTlvAddr(loc.name, dest)
   of Mem: g.aggrAddrInto(loc.cur, dest, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)
   else: raiseAssert "arkham a64n: aggrAddrLoc of " & $loc.kind
 
@@ -2768,7 +2769,7 @@ proc isAggrCopySrc(c: Cursor): bool =
 
 proc dstAggrInfo(g: var CodeGen; dst: Location): (bool, int) =
   case dst.kind
-  of NamedStack, Glob: (dst.typ.kind == AMem, dst.typ.size)
+  of NamedStack, Glob, Tvar: (dst.typ.kind == AMem, dst.typ.size)
   of Mem:
     let s = g.exprSlot(dst.cur)
     (s.kind == AMem, s.size)
@@ -2860,12 +2861,12 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
       g.genBaseobj2(rhs, dst)                              # object→base slice
     else: raiseAssert "arkham a64n: aggregate store rhs " & $rhs.exprKind
   elif dst.kind in {Glob, Tvar} and dst.typ.kind == AMem:
-    # Aggregate store into a GLOBAL: address it into a pointer scratch and build/copy
-    # the aggregate THROUGH that pointer — `oconstr` field-by-field (InReg base), a
-    # symbol by whole-aggregate copy, a call by its ABI (>16B → &g as the hidden result
-    # ptr x8; ≤16B → the result regs x0:x1 stored through &g). The &g address temp
-    # is a callee-saved survivor picked at emission (`takeHeld`).
-    assert dst.kind == Glob, "arkham a64n: aggregate threadvar store not supported"
+    # Aggregate store into a GLOBAL or a THREADVAR: address it into a pointer scratch
+    # and build/copy the aggregate THROUGH that pointer — `oconstr` field-by-field
+    # (InReg base), a symbol by whole-aggregate copy, a call by its ABI (>16B → &g as
+    # the hidden result ptr x8; ≤16B → the result regs x0:x1 stored through &g). The
+    # &g address temp is a callee-saved survivor picked at emission (`takeHeld`), so
+    # it also outlives the macOS TLV thunk behind a threadvar's `(adr …)`.
     if rhs.kind == TagLit and rhs.exprKind == CallC and
        dst.typ.size > g.md.aggrByRefThreshold:
       g.emAdr(IndirectResultReg, dst.name)              # >16B: &g is the hidden result ptr
@@ -2877,11 +2878,13 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
       var heldLoc = g.takeHeld("an aggregate global &g")
       let addrT = heldLoc.r
       g.bindTemp(addrT, ScalarSlot)
+      # Materialize &g BEFORE anything else, the call rhs included: the value the
+      # callee leaves in x0:x1 is exactly what a threadvar's TLV thunk would use as
+      # its own argument and result register.
+      g.emAdr(addrT, dst.name)
       if rhs.kind == TagLit and rhs.exprKind == OconstrC:
-        g.emAdr(addrT, dst.name)
         g.constrFieldStores(rhs, regLoc(addrT, dst.typ))
       elif rhs.kind == TagLit and rhs.exprKind == AconstrC:
-        g.emAdr(addrT, dst.name)
         var atc = rhs; inc atc                            # the array type
         let elemTy = innerType(g.prog, resolveType(g.prog, atc))
         template dest(i) = g.emPtrElemMem(addrT, elemTy, i)  # element i through &g
@@ -2890,7 +2893,6 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
       elif rhs.kind == TagLit and rhs.exprKind == CallC:  # ≤16B result in x0:x1
         var d = dontCare
         g.emitCall2(rhs, d)
-        g.emAdr(addrT, dst.name)
         g.regsToStructThroughPtr(addrT, symName(g.getType(rhs)), 0)
       else: raiseAssert "arkham a64n: aggregate global store rhs " & $rhs.exprKind
       g.unbindTemp(addrT)
@@ -4210,10 +4212,11 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
           else:
             var home = ""
             var isGlobal = false
+            var isTvar = false
             if a.kind == Symbol:
               case g.lookupSym(symName(a)).cat
               of scGlobal: isGlobal = true
-              of scTvar: raiseAssert "arkham a64: aggregate threadvar passed by value not supported"
+              of scTvar: (isGlobal = true; isTvar = true)
               else: home = symName(a)
             else:
               let p = g.posOf(a)
@@ -4222,12 +4225,13 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
               g.varType[home] = tn
               g.genStore2(a, namedStackLoc(home, callArgSlots[j]))
             if pl.byRef:
-              if isGlobal: g.emGlobalAddr(g.md.gprAt(pl), symName(a))
+              if isTvar: g.genTlvAddr(symName(a), g.md.gprAt(pl))
+              elif isGlobal: g.emGlobalAddr(g.md.gprAt(pl), symName(a))
               elif g.ra.locationOfSym(home).kind == InReg:
                 g.movReg(g.md.gprAt(pl), g.ra.locationOfSym(home).r)
               else: g.ab.tree LeaA64: (g.emReg g.md.gprAt(pl); g.ab.sym home)
             else:
-              if isGlobal: g.globalToRegs(symName(a), tn, pl.gpFirst)
+              if isGlobal: g.globalToRegs(symName(a), tn, pl.gpFirst, isTvar)
               else: g.structToRegs(home, tn, pl.gpFirst)
           if pl.byRef:
             g.ab.tree MovA64:
@@ -4324,10 +4328,11 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
         else:
           var home = ""
           var isGlobal = false
+          var isTvar = false
           if a.kind == Symbol:
             case g.lookupSym(symName(a)).cat
             of scGlobal: isGlobal = true
-            of scTvar: raiseAssert "arkham a64: aggregate threadvar passed by value not supported"
+            of scTvar: (isGlobal = true; isTvar = true)
             else: home = symName(a)
           else:
             let pos = g.posOf(a)
@@ -4336,14 +4341,15 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
             g.varType[home] = tn
             g.genStore2(a, namedStackLoc(home, g.exprSlot(a)))
           if sz > 16:
-            if isGlobal: g.emGlobalAddr(IntArgRegs[intIdx], symName(a))
+            if isTvar: g.genTlvAddr(symName(a), IntArgRegs[intIdx])
+            elif isGlobal: g.emGlobalAddr(IntArgRegs[intIdx], symName(a))
             elif g.ra.locationOfSym(home).kind == InReg:
               g.movReg(IntArgRegs[intIdx], g.ra.locationOfSym(home).r)
             else: g.ab.tree LeaA64: (g.emReg IntArgRegs[intIdx]; g.ab.sym home)
             inc intIdx
           else:
             let nw = aggrWordCount(g.prog, tn)
-            if isGlobal: g.globalToRegs(symName(a), tn, intIdx)
+            if isGlobal: g.globalToRegs(symName(a), tn, intIdx, isTvar)
             else: g.structToRegs(home, tn, intIdx)
             intIdx += nw
       else:
