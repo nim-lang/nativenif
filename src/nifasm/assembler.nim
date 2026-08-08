@@ -181,6 +181,12 @@ proc movCompatible(want, got: Type): bool =
     return litFitsWidth(g.litVal, w.bits)
   if w.kind in {IntT, UIntT} and g.kind in {IntT, UIntT}:
     return g.bits <= w.bits
+  if w.kind in {IntT, UIntT} and g.kind == BoolT and w.bits >= 8:
+    # A `bool` is a canonical 0/1 byte, so moving it into a WIDER integer is the same
+    # widening move already blessed for `(u 8)`. arkham forces every integer AND bool
+    # local to an `(i 64)` slot, so storing a loaded bool field to its home lands here
+    # (sigmatch's `conceptRoutineAvailable`). `int → bool` stays a narrowing.
+    return true
   result = false
 
 proc getInt(n: Cursor): int64 =
