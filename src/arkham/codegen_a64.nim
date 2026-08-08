@@ -1615,6 +1615,15 @@ proc prematAddrVal2(g: var CodeGen; c: Cursor) =
   g.ra.locs[pos] = d
   g.reloadMemBase2(pos)
 
+proc inlineAggrHome(g: var CodeGen; c: Cursor): string =
+  ## The stack slot standing in for an aggregate CONSTRUCTOR used as an lvalue base —
+  ## `[a, b][i]`, which hexer hands over as `(at (aconstr …) i)`. A constructor is a
+  ## value, not a location, so there is nothing to address until one exists; this
+  ## names the slot that `prematLval2` builds it into and `emLvalAddr2` then reads.
+  ## Keyed on the node's position, so both passes name the same slot without a side
+  ## table.
+  synth("lvaltmp") & $g.posOf(c) & ".0"
+
 proc emLvalAddr2(g: var CodeGen; c: Cursor) =
   ## Emit the nifasm address sub-tree for lvalue `c` (operand of a `(mem …)`/`(lea
   ## …)`), reading any embedded value register from its pre-allocated `locs`.
@@ -1713,6 +1722,8 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
         else:
           g.emLvalAddr2(cc)                               # transparent
         while cc.hasMore: skip cc
+    of AconstrC, OconstrC:
+      g.ab.sym g.inlineAggrHome(c)                        # built by `prematLval2`
     else: raiseAssert "arkham a64n: emLvalAddr2 expr " & $c.exprKind
   else: raiseAssert "arkham a64n: emLvalAddr2 kind " & $c.kind
 
@@ -1768,6 +1779,16 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
         skip cc; skip cc                                 # base type, depth
         g.prematLval2(cc)
         while cc.hasMore: skip cc
+    of AconstrC, OconstrC:
+      # An aggregate CONSTRUCTOR in lvalue position (`[a, b][i]`): build it into a
+      # stack slot here, before the consuming `(mem …)` tree opens, and let
+      # `emLvalAddr2` address that slot. A constructor has no address of its own.
+      let home = g.inlineAggrHome(c)
+      if not g.varType.hasKey(home):
+        let t = g.getType(c)
+        g.emTypedStackVar(home, t)
+        if t.kind == Symbol: g.varType[home] = symName(t)
+        g.genStore2(c, namedStackLoc(home, g.exprSlot(c)))
     else: discard
 
 proc unbindLvalTemps2(g: var CodeGen; c: Cursor) =
