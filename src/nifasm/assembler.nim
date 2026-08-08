@@ -831,10 +831,21 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
   of RodataD:
     # A foreign read-only data blob (e.g. a string literal, or a gvar with a
     # constant-scalar initializer laid out as static data — see arkham genGlobal).
+    var probe = c              # the un-entered decl, for the `(reloc …)` scan below
     inc c
     if c.kind != SymbolDef: return nil
     result = Symbol(name: ctx.symIdOf(fullName), kind: skRodata, offset: -1, isForeign: true,
                     moduleName: modname)
+    # A blob with symbol-pointer fields must be flagged here too — exactly as pass 1
+    # flags a main-module one. Without it the Mach-O path leaves a foreign vtable in
+    # read-only __TEXT, where no rebase can reach its pointer fields, so every one of
+    # them reads back as 0 (a `=destroy` hook dispatched through it branches to null).
+    into probe:
+      skip probe               # name
+      skip probe               # bytes string literal
+      if probe.hasMore:        # one or more trailing (reloc ...) children
+        result.dataConst = true
+      while probe.hasMore: skip probe   # drain so `into` sees rem == 0
     ctx.rootScope.define(result)
   of ExtprocD:
     # A foreign module's dynamic libc extern (`(extproc :write.c.<mod> "_write")` —
