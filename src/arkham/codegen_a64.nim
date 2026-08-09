@@ -1331,14 +1331,21 @@ template posOf(g: CodeGen; cur: Cursor): int = cursorToPosition(g.buf[], cur)
 
 # ── staging bridges (always free; reserved out of the allocator pool) ────────
 
+proc tryTakeBridge(g: var CodeGen; typ = ScalarSlot; avoid = NoReg): Reg =
+  ## `takeBridge` for a caller that HAS another answer when both bridges are
+  ## already staging: reports exhaustion as `NoReg` instead of asserting.
+  for r in IntBridgeRegs:
+    if r != avoid and not g.rb.isBoundTemp(r):
+      g.bindTemp(r, typ); return r
+  NoReg
+
 proc takeBridge(g: var CodeGen; typ = ScalarSlot; avoid = NoReg): Reg =
   ## A staging-bridge GPR (x14/x15). Bound to a typed name so `emReg` emits a
   ## checked symbol and a typed memory base type-checks. Released by `dropBridge`.
   ## Two bridges nest (e.g. a `cmp` of two spilled operands); a third asserts.
-  for r in IntBridgeRegs:
-    if r != avoid and not g.rb.isBoundTemp(r):
-      g.bindTemp(r, typ); return r
-  raiseAssert "arkham a64n: both staging bridges in use"
+  result = g.tryTakeBridge(typ, avoid)
+  if result == NoReg:
+    raiseAssert "arkham a64n: both staging bridges in use in proc " & g.curProcName
 
 proc dropBridge(g: var CodeGen; r: Reg) =
   if r != NoReg: g.unbindTemp(r)
@@ -3595,12 +3602,45 @@ proc emitMod2(g: var CodeGen; c: Cursor; dest: var Location) =
   if res.kind == InReg and res.isTemp and not reusedDiv and not g.rb.isBoundTemp(rD):
     g.bindTemp(rD, res.typ)
   g.place2(lD, rD)                                       # dest := a
-  let q = g.takeBridge(avoid = rD)
-  g.movReg(q, rD)                                        # q := a
-  g.binReg(if signed: SdivA64 else: UdivA64, q, dvsReg)  # q := a div b
-  g.binReg(MulA64, q, dvsReg)                            # q := (a div b)*b
-  g.binReg(SubA64, rD, q)                                # dest := a - q
-  g.dropBridge q
+  # `a mod b` needs THREE live registers — a, b and the quotient — and this one
+  # expression can already be holding both bridges: one staging a memory result,
+  # one reloading a spilled divisor. The budget is two, so when they are gone the
+  # quotient comes from the callee-saved file instead (`pickHeldReg` records it,
+  # so the prologue saves it). `toDecimal64`'s `q mod 2 != 0` at `-d:danger` is
+  # the case: the compare's own staging plus the mod's leaves nothing.
+  let qBridge = g.tryTakeBridge(avoid = rD)
+  let qTmp = if qBridge == NoReg: g.takeTmp(ScalarSlot) else: dontCare
+  if qBridge != NoReg or qTmp.kind == InReg:
+    let q = if qBridge != NoReg: qBridge else: qTmp.r
+    g.movReg(q, rD)                                      # q := a
+    g.binReg(if signed: SdivA64 else: UdivA64, q, dvsReg)# q := a div b
+    g.binReg(MulA64, q, dvsReg)                          # q := (a div b)*b
+    g.binReg(SubA64, rD, q)                              # dest := a - q
+    if qBridge != NoReg: g.dropBridge qBridge
+    else: g.freeVal(qTmp)
+  else:
+    # Nothing left to hold the quotient in: no bridge (this one expression can
+    # already own both — one staging a memory result, one reloading a spilled
+    # divisor), no volatile temp, no callee-saved survivor. `toDecimal64`'s
+    # `q mod 2 != 0` at `-d:danger` reaches exactly that.
+    #
+    # Three values are live — a, b, the quotient — but only until the multiply:
+    # after `q*b` the DIVISOR is dead, so park `a` in the spill slot `takeTmp`
+    # just handed us and let b's register carry it back. Costs a store and a
+    # load on a path that would otherwise not compile at all. It requires that
+    # register to be OURS, which it is whenever the divisor was staged rather
+    # than read out of a local's home.
+    let dvsOwned = dvsBridge != NoReg or (rD0.kind == InReg and rD0.isTemp)
+    if not dvsOwned:
+      raiseAssert "arkham a64n: no register for a `mod` quotient in proc " &
+                  g.curProcName & ", picked: " & $g.pickedRegs
+    g.storeReg2(qTmp, rD)                                # slot := a
+    g.binReg(if signed: SdivA64 else: UdivA64, rD, dvsReg)  # rD := a div b
+    g.binReg(MulA64, rD, dvsReg)                         # rD := (a div b)*b
+    g.place2(qTmp, dvsReg)                               # b's reg := a (b now dead)
+    g.binReg(SubA64, dvsReg, rD)                         # := a - (a div b)*b
+    g.movReg(rD, dvsReg)
+    g.freeVal(qTmp)
   if dvsBridge != NoReg: g.dropBridge dvsBridge
   else: g.freeVal(rD0)
   if not reusedDiv: g.freeVal(lD)
@@ -5051,6 +5091,7 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   let declarative = isDeclarativeAbi(g.prog, info.decl)
   g.rb.resetProc(); g.aliasToDecl.clear(); g.savedHomes.clear()
   g.noFoldPos = -1
+  g.curProcName = info.asmName            # names the proc in this backend's diagnostics
   g.emitProcBody2(info, declarative, frameHasCall = an.hasCall)
 
 # MODEL: the `StartEmit` per-proc reset in proofs/arkham_bindings.tla. The two-pass seam
