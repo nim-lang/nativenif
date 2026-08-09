@@ -337,7 +337,7 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitDivMod2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCondValue2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCondE(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool)
-proc emitScalarCmpE(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
+proc emitScalarCmpE(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
                     whenTrue: bool): X64Inst
 proc emitMemLoad2(g: var CodeGen; c: Cursor; dest: var Location; late = false)
 proc emitAddr2(g: var CodeGen; c: Cursor; dest: var Location)
@@ -1228,6 +1228,29 @@ proc cmpSetccTag(jcc: X64Inst): X64Inst =
   of JaX64:  SetaX64
   of JaeX64: SetaeX64
   else: raiseAssert "arkham x64: no setcc for " & $jcc
+
+proc mirrorJcc(jcc: X64Inst): X64Inst =
+  ## The condition that holds for `cmp b, a` given `jcc` holds for `cmp a, b`.
+  ## Equality is symmetric; the orderings change side.
+  case jcc
+  of JeX64:  JeX64
+  of JneX64: JneX64
+  of JlX64:  JgX64
+  of JleX64: JgeX64
+  of JgX64:  JlX64
+  of JgeX64: JleX64
+  of JbX64:  JaX64
+  of JbeX64: JaeX64
+  of JaX64:  JbX64
+  of JaeX64: JbeX64
+  else: raiseAssert "arkham x64: no mirror for " & $jcc
+
+proc isCmpImmLeaf(c: Cursor): bool =
+  ## A bare integer literal, `(suf …)`/`(par …)` wrappers included: what `cmp`
+  ## can take as an immediate operand — and, on the left, what costs a `mov`.
+  var cur = c
+  if cur.kind == TagLit and cur.exprKind in {SufC, ParC}: inc cur
+  result = cur.kind in {IntLit, UIntLit, CharLit}
 
 # Linux syscalls are recognised in `programs.collect` (the `LinuxSyscalls` table)
 # and emitted as `(syproc …)` declarations whose proctype puts args in the syscall
@@ -5341,13 +5364,24 @@ proc emitDivMod2(g: var CodeGen; c: Cursor; dest: var Location) =
   if dvsStaging != NoReg: g.giveBack dvsStaging
   else: g.freeVal(dD)
   g.settleResultReg(dest, if wantRem: g.md.divRemReg else: g.md.intRetReg)
-proc emitScalarCmpE(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
+proc emitScalarCmpE(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
                     whenTrue: bool): X64Inst =
   ## FUSED integer `cmp` for the relation `ek`: operand placement (allocCond's
   ## memory-fold rules) decided inline, flags set, staging released; returns
   ## the `jcc` tag taken when the relation holds as `whenTrue`.
+  var aC = aC0
+  var bC = bC0
   let unsigned = g.cmpOperandUnsigned(aC) or g.cmpOperandUnsigned(bC)
   result = cmpJccTag(ek, whenTrue, signed = not unsigned)
+  if isCmpImmLeaf(aC) and not isCmpImmLeaf(bC):
+    # `cmp`'s LEFT operand must be a register or memory, so a literal there is
+    # first materialised with a `mov`. Leng has no `>`/`>=` — they ARE `<`/`<=`
+    # with the operands exchanged — so `0 <= i` reaches us as `(le 0 i)` and
+    # every lower-bound check paid that `mov`. Exchange the operands and mirror
+    # the condition instead; the literal then folds as the immediate, and if the
+    # new left is a memory leaf the `cmp [mem], imm` path below takes it.
+    swap(aC, bC)
+    result = mirrorJcc(result)
   if isMemLeaf(aC) and not isMemLeaf(bC):
     # left is a memory load, right is not → fold the LEFT: `cmp [mem], reg/imm`
     # (x86 allows a memory destination; only one memory operand).

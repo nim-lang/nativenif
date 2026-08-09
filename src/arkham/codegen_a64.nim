@@ -1266,7 +1266,7 @@ proc emitMod2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitFBinE(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCondValue2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCondE(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool)
-proc emitScalarCmpE(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
+proc emitScalarCmpE(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
                     whenTrue: bool): A64Inst
 proc emitMemLoad2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitAddr2(g: var CodeGen; c: Cursor; dest: var Location)
@@ -3635,11 +3635,36 @@ proc emitFValue2(g: var CodeGen; c: Cursor; dest: var Location) =
       g.emitFValue2(inner, dest)
     else: raiseAssert "arkham a64n: emitFValue2(fused) expr " & $c.exprKind
   else: raiseAssert "arkham a64n: emitFValue2(fused) kind " & $c.kind
-proc emitScalarCmpE(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
+proc mirrorBranch(t: A64Inst): A64Inst =
+  ## The condition that holds for `cmp b, a` given `t` holds for `cmp a, b`.
+  ## Equality is symmetric; the orderings change side.
+  case t
+  of BeqA64: BeqA64
+  of BneA64: BneA64
+  of BltA64: BgtA64
+  of BleA64: BgeA64
+  of BgtA64: BltA64
+  of BgeA64: BleA64
+  of BloA64: BhiA64
+  of BlsA64: BhsA64
+  of BhiA64: BloA64
+  of BhsA64: BlsA64
+  else: raiseAssert "arkham a64n: no mirror for " & $t
+
+proc isCmpImmLeaf(c: Cursor): bool =
+  ## A bare integer literal, `(suf …)`/`(par …)` wrappers included: what `cmp`
+  ## takes as an immediate — and, on the left, what costs a materialising `mov`.
+  var cur = c
+  if cur.kind == TagLit and cur.exprKind in {SufC, ParC}: inc cur
+  result = cur.kind in {IntLit, UIntLit, CharLit}
+
+proc emitScalarCmpE(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
                     whenTrue: bool): A64Inst =
   ## FUSED integer `cmp`: operands resolve dontCare (a home / immediate stays
   ## put; a computed subtree takes a temp) and the bridges serve everything
   ## else — 075b051's stackHomeSlot / placeImmTyped bridge typing preserved.
+  var aC = aC0
+  var bC = bC0
   let signed = not (g.cmpOperandUnsigned(aC) or g.cmpOperandUnsigned(bC))
   result =
     case ek
@@ -3648,6 +3673,13 @@ proc emitScalarCmpE(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
     of LtC:  (if whenTrue: (if signed: BltA64 else: BloA64) else: (if signed: BgeA64 else: BhsA64))
     of LeC:  (if whenTrue: (if signed: BleA64 else: BlsA64) else: (if signed: BgtA64 else: BhiA64))
     else: raiseAssert "arkham a64n: cond " & $ek
+  if isCmpImmLeaf(aC) and not isCmpImmLeaf(bC):
+    # `cmp`'s first operand must be a register, so a literal there is first
+    # materialised into a bridge. Leng has no `>`/`>=` — they ARE `<`/`<=` with
+    # the operands exchanged — so `0 <= i` reaches us as `(le 0 i)` and every
+    # lower-bound check paid that materialisation. Exchange and mirror instead.
+    swap(aC, bC)
+    result = mirrorBranch(result)
   template cmpBridgeSlot(loc: Location; opC: Cursor): AsmSlot =
     if isPtrType(resolveType(g.prog, g.getType(opC))): g.exprSlot(opC)
     elif loc.kind == NamedStack: g.stackHomeSlot(loc.typ)   # the slot is `(i 64)`
