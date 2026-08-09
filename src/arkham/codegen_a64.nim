@@ -4398,9 +4398,41 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
   else:
     var intIdx = 0
     var fIdx = 0
+    # Apple's AArch64 ABI passes a `{.varargs.}` call's VARIADIC tail on the stack,
+    # 8-byte slotted, even while x2–x7 sit idle — the one place it departs from
+    # AAPCS64, and libc is compiled to that rule. `open(path, flags, 0o666)` put the
+    # mode in x2, so every file arkham created got whatever the stack happened to
+    # hold as its permission bits: `nifbench.scratch.bif` came out mode 0355 and the
+    # next read of it failed. Linux/AAPCS64 keeps filling registers, so this is
+    # Darwin-only.
+    #
+    # The values are still produced into the argument registers the tail WOULD have
+    # taken — those are caller-saved and this callee never reads them — and moved
+    # down to the outgoing area once every argument is evaluated. Reserving late
+    # matters: an argument may load a local out of an `(s)` slot, and those are
+    # SP-relative, so SP must not have moved yet.
+    let variadicFrom = if tgt.isVarargs and not g.a64Linux: tgt.fixedParams else: -1
+    var varTail: seq[tuple[r: Reg; f: FReg; off: int]] = @[]
     for idx in 0 ..< argCurs.len:
       let a = argCurs[idx]
-      if g.isFloatExpr(a):
+      let isVariadic = variadicFrom >= 0 and idx >= variadicFrom
+      if isVariadic:
+        let off = varTail.len * 8
+        if g.exprSlot(a).kind == AMem:
+          # C's default argument promotions never produce one, and guessing the
+          # HFA/indirect split would miscompile silently.
+          raiseAssert "arkham a64: aggregate in the variadic tail of " & tgt.asmName
+        elif g.isFloatExpr(a):
+          var fD = fregLoc(FloatArgRegs[fIdx], AsmSlot(cls: AFloat, size: 8, align: 8))
+          g.emitFValue2(a, fD)                 # promoted to double by the front end
+          varTail.add (NoReg, FloatArgRegs[fIdx], off)
+          inc fIdx
+        else:
+          var aD = regLoc(IntArgRegs[intIdx], ScalarSlot)
+          g.emitValue2(a, aD)
+          varTail.add (IntArgRegs[intIdx], NoFReg, off)
+          inc intIdx
+      elif g.isFloatExpr(a):
         var fD = fregLoc(FloatArgRegs[fIdx], AsmSlot(cls: AFloat, size: 8, align: 8))
         g.emitFValue2(a, fD)
         inc fIdx
@@ -4465,9 +4497,28 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
         var aD = regLoc(IntArgRegs[intIdx], ScalarSlot)
         g.emitValue2(a, aD)                    # → its ABI register directly
         inc intIdx
+    # Drop the variadic tail into a freshly reserved outgoing area at [sp+0…]. The
+    # frame nifasm sizes has no room for it (that reservation is driven by a callee's
+    # DECLARED signature, and a Darwin extern declares none), so carve it here and
+    # give it back straight after the call — 16-aligned, as the ABI requires SP to be.
+    var varArea = 0
+    if varTail.len > 0:
+      varArea = (varTail.len * 8 + 15) and not 15
+      g.ab.tree SubA64: (g.ab.reg SP; g.ab.intLit varArea)
+      for it in varTail:
+        if it.r != NoReg:
+          g.ab.tree MovA64:
+            g.ab.tree MemX: (g.emReg SP; g.ab.intLit it.off)
+            g.emReg it.r
+        else:
+          g.ab.tree FstrA64:
+            g.ab.tree MemX: (g.emReg SP; g.ab.intLit it.off)
+            g.emFReg(it.f, 64)
     g.ab.tree PrepareA64:
       g.ab.sym tgt.asmName
       g.ab.keyword (if tgt.extern: ExtcallA64 else: CallA64)
+    if varArea > 0:
+      g.ab.tree AddA64: (g.ab.reg SP; g.ab.intLit varArea)
     if fnTargetName.len > 0:
       g.ab.tree KillA64: g.ab.sym fnTargetName
       discard g.rb.takeBinding(fnptrReg)

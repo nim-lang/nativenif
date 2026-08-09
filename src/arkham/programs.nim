@@ -57,6 +57,12 @@ type
     declarative*: bool       ## true → emit/use nifasm's declarative call ABI
                              ## (typed params + `(arg)`/`(res)` cross-checking);
                              ## false → manual marshalling (floats/aggregates/…)
+    isVarargs*: bool         ## a `{.varargs.}` importc (C `printf`/`open`/`fcntl`). Default
+                             ## false, so a `CallTarget` built anywhere else stays fixed-arity.
+    fixedParams*: int        ## meaningful only with `isVarargs`: how many parameters the decl
+                             ## names before the variadic tail. Darwin's AArch64 ABI passes
+                             ## variadic arguments on the STACK, so the call site has to know
+                             ## where that tail begins.
     indirect*: bool          ## true → call *through* a function-pointer variable
                              ## (`asmName` is the gvar/tvar holding the pointer)
     foreignAbi*: bool        ## the callee is FOREIGN code reached through a pointer, so
@@ -329,6 +335,30 @@ proc firstIntParamBits(decl: Cursor): int =
               inc b
               if b.kind == IntLit: result = int(intVal(b))
             while pc.hasMore: skip pc
+    while c.hasMore: skip c
+
+proc fixedParamCount(decl: Cursor): int =
+  ## How many parameters a `{.varargs.}` importc declares BEFORE its variadic
+  ## tail, or `-1` when the proc is not variadic. Leng materializes the marker as
+  ## a synthetic trailing param whose type is `(varargs …)`, so the count is that
+  ## param's index. Darwin's AArch64 ABI passes everything from there on the
+  ## STACK rather than in registers, which is what the caller needs to know.
+  result = -1
+  var c = decl
+  c.into:
+    inc c                                   # name → params
+    if c.kind == TagLit:
+      var pc = c
+      var i = 0
+      pc.into:
+        while pc.hasMore:                   # drain every param: `into` must balance
+          pc.into:                          # (param :name pragmas type)
+            inc pc                          # name
+            skip pc                         # pragmas
+            if result < 0 and pc.kind == TagLit and pc.typeKind == VarargsT:
+              result = i
+            while pc.hasMore: skip pc
+          inc i
     while c.hasMore: skip c
 
 proc resolveType*(p: var Program; c: Cursor): Cursor
@@ -645,8 +675,10 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           # the 5th+ argument of e.g. `WriteFile` a checked stack slot above the Win64
           # shadow space; the Darwin path marshals into raw ABI registers and so tops
           # out at the 6 SysV argument registers.
+          let fixed = fixedParamCount(procStart)
           result.callTarget[pname] = CallTarget(asmName: asmN, extern: true,
                                                 declarative: windows and isDeclarativeAbi(result, procStart),
+                                                isVarargs: fixed >= 0, fixedParams: fixed,
                                                 retFloat: retFloat, retType: retType, sigType: sigType)
           result.needsLibSystem = true
         else:
