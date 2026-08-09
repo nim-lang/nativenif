@@ -882,6 +882,10 @@ proc pickTempReg*(g: var CodeGen): Reg =
     if regFreeForTemp(g, r):
       g.ra.usedCallee.incl r
       return r
+  for r in g.md.intEmergencyRegs:            # never a local home — ours to borrow
+    if regFreeForTemp(g, r):
+      g.ra.usedCallee.incl r
+      return r
   NoReg
 
 proc tempPoolDry*(g: var CodeGen): bool =
@@ -892,6 +896,8 @@ proc tempPoolDry*(g: var CodeGen): bool =
   for r in g.md.intTempRegs:
     if regFreeForTemp(g, r): return false
   for r in g.md.intCalleeSaved:
+    if regFreeForTemp(g, r): return false
+  for r in g.md.intEmergencyRegs:            # must agree with `pickTempReg`
     if regFreeForTemp(g, r): return false
   true
 
@@ -913,6 +919,10 @@ proc pickHeldReg*(g: var CodeGen): Reg =
   ## mid-emission is impossible in the merged core (its uses are already
   ## emitted), and the corpus needed that demotion exactly once.
   for r in g.md.intCalleeSaved:
+    if regFreeForTemp(g, r):
+      g.ra.usedCallee.incl r
+      return r
+  for r in g.md.intEmergencyRegs:            # a survivor scratch may borrow it too
     if regFreeForTemp(g, r):
       g.ra.usedCallee.incl r
       return r

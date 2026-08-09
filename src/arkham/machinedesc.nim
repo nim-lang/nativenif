@@ -85,6 +85,17 @@ type
                                      ## local there starves the emitter); the full temp
                                      ## pool on AArch64 (7 volatile regs, scratch to spare)
     intCalleeSaved*: seq[Reg]        ## callee-saved (locals live across a call)
+    intEmergencyRegs*: seq[Reg]      ## callee-saved registers the EMITTER may draw as a
+                                     ## last resort but the ALLOCATOR must never home a
+                                     ## local in. A local homed here would be permanent,
+                                     ## paying its push/pop in every call and — worse —
+                                     ## taking away the very backstop the emitter needs
+                                     ## when the pools run dry (that is what made rbp as
+                                     ## a sixth `intCalleeSaved` home break `-d:danger`:
+                                     ## "R5: home"). Drawn only under pressure, so only
+                                     ## the procs that genuinely need it pay for it.
+                                     ## Must also appear in `intCalleeSavedSet` so
+                                     ## `usedCallee`/`giveBack` classify it correctly.
     floatTempRegs*: seq[FReg]        ## caller-saved FP scratch
     floatCalleeSaved*: seq[FReg]     ## callee-saved FP regs
     intCalleeSavedSet*: set[Reg]     ## membership form of `intCalleeSaved`

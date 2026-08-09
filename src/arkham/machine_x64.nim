@@ -78,6 +78,8 @@ const
                                      # `pickStagingScratch` already routes staging around a live
                                      # local/param home (`regHoldsLiveLocal`).
     intCalleeSaved: @[RBX, R12, R13, R14, R15],
+    intEmergencyRegs: @[RBP],        # unused by the ABI here; costs one push/pop
+                                     # in exactly the procs whose emitter runs dry
                                      # NOTE: RBP is free (arkham never sets up an rbp frame) and
                                      # was tried as a 6th callee-saved home — it helps, but under
                                      # precise live ranges it exposes a latent miscompile (a
@@ -89,7 +91,7 @@ const
                                                          # staging bridge (FloatStagingBridge)
                                                          # — the SIMD twin of R11.
     floatCalleeSaved: @[],
-    intCalleeSavedSet: {RBX, R12, R13, R14, R15},
+    intCalleeSavedSet: {RBX, R12, R13, R14, R15, RBP},
     floatCalleeSavedSet: {},
     aggrByRefThreshold: 16)
 

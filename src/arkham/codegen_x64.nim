@@ -841,6 +841,11 @@ proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg =
       g.ra.usedCallee.incl r                  # the prologue must now save it
       g.releaseStaleName(r)
       return r
+  for r in g.md.intEmergencyRegs:             # THE last resort. It is still free
+    if r != avoid and regFreeForTemp(g, r) and not g.regHoldsLiveLocal(r):
+      g.ra.usedCallee.incl r                  # here precisely because the allocator
+      g.releaseStaleName(r)                   # was never allowed to home a local in it
+      return r
   return NoReg
 
 proc stagingCensus(g: var CodeGen; avoid: Reg): string =
@@ -2004,6 +2009,8 @@ proc computeFrameX64(g: var CodeGen; isEntry, hasCall: bool) =
   ## picked up front (`pickStackArgBaseX64`) and is pushed with the frame regs.
   g.frameRegs = @[]
   for r in g.md.intCalleeSaved:
+    if r in g.ra.usedCallee: g.frameRegs.add r
+  for r in g.md.intEmergencyRegs:
     if r in g.ra.usedCallee: g.frameRegs.add r
   if g.stackArgBaseReg != NoReg:
     g.frameRegs.add g.stackArgBaseReg

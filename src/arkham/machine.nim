@@ -98,6 +98,7 @@ const
     intLocalTempRegs: @IntTempRegs,  # AArch64 has 7 volatile int regs — scratch to spare,
                                      # so a call-free local may be homed in the temp pool
     intCalleeSaved: @IntCalleeSaved,
+    intEmergencyRegs: @[],
     floatTempRegs: @FloatTempRegs,
     floatCalleeSaved: @FloatCalleeSaved,
     intCalleeSavedSet: {R19..R28},
@@ -118,6 +119,7 @@ const
     intTempRegs: @IntTempRegsN,
     intLocalTempRegs: @IntTempRegsN,
     intCalleeSaved: @IntCalleeSaved,
+    intEmergencyRegs: @[],
     floatTempRegs: @FloatTempRegsN,
     floatCalleeSaved: @FloatCalleeSaved,
     intCalleeSavedSet: {R19..R28},
