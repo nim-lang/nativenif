@@ -238,28 +238,25 @@ const arkhamStressKnown: seq[string] = @[
   # `takeHeld` with the default `canSpill = false` asserts instead of evicting a
   # live local. 11 of the 15 `takeHeld` sites across both backends do.
   "aggr_arg_parked",
+  "aggr_arg_parked_byref",
   "aggr_arg_parked_manual",
   "atomic_cas_regpressure", # intrinsic-operand pick has no steal/spill arm
+  "atomic_cas_operand_home",  # same missing arm, one step in: the compare-exchange
+                            # out of `realloc` that `nimony n -d:danger` died on.
+  # NO LONGER A SILENT MISCOMPILE. The comment here used to read "SILENT MISCOMPILE
+  # (71 -> 95)": `produceIntoMem2` hands the produce bridge to the WHOLE node on the
+  # claim that it is "not held across the recursion" — true for a leaf or a load,
+  # false for a binop, whose left partial sits in the bridge while the other side is
+  # evaluated. Verified 2026-08-09 across k=2..5 with the emergency pool hidden from
+  # stress: the fixture now either returns the correct 71 (k>=5) or ASSERTS (k<=4).
+  # It never answers wrong. What remains is a totality gap, not a correctness one:
+  # at the failing pick every register is either SEALED (a live partial the emitting
+  # step still needs) or a named local's home, so `borrowEmergency` has no eligible
+  # victim by construction — the same shape the commit that introduced it recorded
+  # for `genAggrCopyStore`. Lifting it means letting a borrow spill a SEALED partial,
+  # which needs the owner's `Location` updated, not just its register.
+  "addr_chain_depth",
 ]
-
-# THREE ENTRIES LEFT THIS LIST WHEN `md.intEmergencyRegs` (rbp on x86-64) gave the
-# emitter a last-resort register: `aggr_arg_parked_byref`, `atomic_cas_operand_home`
-# and `addr_chain_depth`. They are removed because the gate is only useful if a
-# passing fixture that starts failing is fatal — but the DEFECTS BEHIND THEM ARE
-# MASKED, NOT FIXED, and are worth keeping in view:
-#
-#  * `addr_chain_depth` was a SILENT MISCOMPILE (71 -> 95), and a64 still has it.
-#    `produceIntoMem2` hands out the produce bridge for the WHOLE node on the claim
-#    that it is "not held across the recursion". True for a leaf or a load; false
-#    for a binop, whose left partial sits in the bridge while the right operand is
-#    evaluated — and that evaluation re-enters `produceIntoMem2` and takes the same
-#    register. The partial must be parked in an `etmp` before the sibling recursion.
-#    The emergency register merely means the re-entry now has somewhere else to go
-#    at k=2; spend it and the clobber returns.
-#  * `atomic_cas_operand_home` is the compare-exchange out of `realloc` that
-#    `nimony n -d:danger` died on; `takeHeld`'s `canSpill = false` still asserts
-#    instead of evicting a live local, in 11 of the 15 `takeHeld` sites.
-#  * `aggr_arg_parked_byref` is that same missing eviction arm.
 
 const arkhamStressA64Known: seq[string] = @[
   # Both a64 passes take this list — the qemu `linux_arm64` one and the native

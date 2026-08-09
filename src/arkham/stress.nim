@@ -94,6 +94,10 @@ proc stressed*(md: MachineDesc): MachineDesc =
   when StressEnabled:
     if stressKeep <= 0: return
     result.intCalleeSaved = keepFirst(md.intCalleeSaved, CalleeSavedFloor)
+    # The emergency pool is RELIEF for a dry emitter — exactly the arm this mode
+    # exists to exercise. Leaving it in place would let a fixture pass because the
+    # relief was there, hiding the defect on the path that runs without it.
+    result.intEmergencyRegs = @[]
     result.intLocalTempRegs = keepFirst(md.intLocalTempRegs, 0)
     result.intTempRegs = keepFirst(md.intTempRegs, TempFloor)
     result.floatTempRegs = keepFirst(md.floatTempRegs, FTempFloor)
