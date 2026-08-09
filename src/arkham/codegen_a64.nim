@@ -3945,6 +3945,16 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
       var tgc = targetCur
       if sh.kind in {InReg, NamedStack} and slotOf(g.prog, tgc).size < sh.typ.size:
         g.forceRegDestE(dest)
+      elif sh.kind == InReg and dest.kind in {Undef, NeedsReg, RegOrImm} and
+           (isPtrType(tc) or (not cursorIsNil(sh.typ.typ) and
+                              isPtrType(resolveType(g.prog, sh.typ.typ)))):
+        # A pointer-ness change over a register-homed local, with no destination
+        # of our own: without a temp the value would be threaded up in the
+        # SYMBOL's home and the re-representation below would `rebindLocalAs`
+        # that home — retyping the local itself for the rest of its scope. A
+        # later use at its declared type then fails the binding checker. The
+        # x64 twin carries the measured repro.
+        g.forceRegDestE(dest)
   if dest.kind in {NamedStack, Mem} and not (dest.kind == NamedStack and dest.spillTemp):
     # a memory-home destination: compute into a temp, re-represent, store
     var tmp = needsReg(dest.typ)

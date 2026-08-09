@@ -1,0 +1,65 @@
+(.nif27)
+(.indexat 0                )
+(stmts
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :classify.0
+  (params
+   (param :p.0 .
+    (ptr
+     (i 64))))
+  (i 64)
+  (pragmas)
+  (stmts
+   (var :c.0 .
+    (ptr
+     (i 64))
+    (cast
+     (ptr
+      (i 64))
+     (bitand
+      (i 64)
+      (cast
+       (i 64)p.0)
+      (suf -8 "i64"))))
+   (var :r.0 .
+    (i 64)0)
+   (if
+    (elif
+     (eq p.0
+      (nil))
+     (stmts
+      (asgn r.0 1)))
+    (else
+     (stmts
+      (asgn r.0
+       (deref c.0)))))
+   (ret
+    (add
+     (i 64)r.0 40))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :x.0 .
+    (i 64)7)
+   (var :a.0 .
+    (i 64)
+    (call classify.0
+     (addr x.0)))
+   (var :b.0 .
+    (i 64)
+    (call classify.0
+     (nil)))
+   (call exit.c
+    (conv
+     (i 32)
+     (add
+      (i 64)a.0 b.0))))))
