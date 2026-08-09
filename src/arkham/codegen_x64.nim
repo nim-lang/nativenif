@@ -802,11 +802,30 @@ proc releaseStaleName(g: var CodeGen; r: Reg) =
       g.ab.tree KillX64: g.ab.sym dead
 
 proc regHoldsLiveLocal(g: var CodeGen; r: Reg): bool =
-  ## True if a local/param is currently allocated to register `r` (per the
-  ## allocator's view). A *param* can sit in a caller-saved arg register (e.g.
-  ## `p0.0` in rdi), so staging must not clobber it just because it's caller-saved.
-  ## Same immutable-per-proc home set as `regHoldsHome` — served from its mask.
-  regHoldsHome(g, r)
+  ## Is a local/param LIVE in `r` right now? A *param* can sit in a caller-saved
+  ## arg register (`p0.0` in rdi), so staging must not clobber it just because it
+  ## is caller-saved.
+  ##
+  ## This used to answer from `regHoldsHome`, the immutable per-proc UNION of every
+  ## register any local is ever homed in. That threw away the allocator's whole
+  ## point: it frees a register at `closeScope` and at `freeAfter`, so one register
+  ## homes many locals across disjoint scopes (`lruTouchBody`: 42 register-homed
+  ## symbols packed into 7 registers). The union then refused all 7 for the WHOLE
+  ## body, including where those locals are dead or not yet declared — the failure
+  ## census showed five registers rejected as "live local" with no bound name at
+  ## all. It is why inlining starved the emitter: inlining multiplies the number of
+  ## distinct locals while their scopes keep peak pressure flat, so the union grows
+  ## and the free set shrinks even though nothing is more live than before.
+  ##
+  ## `rb` is the authority on what is live: the emitter binds a register local at
+  ## its `(var :name (reg) T)` and releases it at scope exit, and nifasm's binding
+  ## checker validates the result. Ask that instead.
+  ##
+  ## NAMED bindings only. A bound TEMP is anonymous — reachable solely through a
+  ## `Location` held further up the Nim call stack — and is exactly what
+  ## `borrowEmergency` is allowed to displace; counting it here would tell the
+  ## borrow that its only eligible victims are ineligible.
+  g.rb.isBound(r) and not g.rb.isBoundTemp(r)
 
 # MODEL: the `pickStaging` action in proofs/arkham_bindings.tla — only ever returns a
 # register with no live owner (the `Free` guard); staging on an occupied reg breaks
@@ -5626,7 +5645,14 @@ proc emitMemLoad2(g: var CodeGen; c: Cursor; dest: var Location; late = false) =
       g.bindTemp(res.r, ScalarSlot)
     g.prematLval2(c, hint = (if late: NoReg else: res.r))
     if late:
-      res = regLoc(g.pickStaging("a late array-decay address"), ScalarSlot, isTemp = true)
+      # Statement position, by the same argument as `produceIntoMem2`'s own pick:
+      # `late` has exactly ONE caller, that proc's spill branch, and `prematLval2`
+      # above has just finished emitting the address's embedded values as
+      # statements while the consuming `(lea …)`/`(mov …)` tree below is not open
+      # yet. So an emergency borrow's save/restore `mov`s land cleanly between
+      # them rather than splicing into a half-built operand tree.
+      res = regLoc(g.pickStaging("a late array-decay address", stmtPos = true),
+                   ScalarSlot, isTemp = true)
       g.bindTemp(res.r, ScalarSlot)
     g.ab.tree LeaX64:
       g.emReg res.r
@@ -5639,7 +5665,8 @@ proc emitMemLoad2(g: var CodeGen; c: Cursor; dest: var Location; late = false) =
       g.bindTemp(res.r, bindSlot)                       # bind first: a global base leas &g
     g.prematLval2(c, hint = (if late: NoReg else: res.r))  # into res before the (mem …) tree
     if late:
-      res = regLoc(g.pickStaging("a late memory-load address"), bindSlot, isTemp = true)
+      res = regLoc(g.pickStaging("a late memory-load address", stmtPos = true),
+                   bindSlot, isTemp = true)
       g.bindTemp(res.r, bindSlot)
     g.ab.tree MovX64:
       g.emReg res.r
@@ -6866,6 +6893,15 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
   if info.isEntry and not g.prog.windows:
     g.emProcessExit(immLoc(0, ScalarSlot))    # fell off the end of `main` ⇒ exit(0)
   swap(g.ab, side)                        # back to the main buffer; `side` holds the body
+  when defined(arkhamHomeDbg):
+    var inReg = 0
+    for pos in g.ra.symPos.values:
+      if g.ra.locs[pos].kind == InReg: inc inReg
+    if g.ra.homesDirty: rebuildHomes(g.ra)
+    var maskN = 0
+    for r in g.ra.homeRegs: inc maskN
+    stderr.writeLine "HOMEDBG proc=" & g.curProcName & " regHomedSyms=" & $inReg &
+                     " maskSize=" & $maskN
   # The body is emitted — `ra.usedCallee` / `hasStackVars` are final. Finalize the
   # frame and write the prologue, then splice the body after it.
   g.computeFrameX64(info.isEntry, frameHasCall)
