@@ -2838,7 +2838,9 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       # Check if operand is a label: type should be UIntT and not immediate/memory
       if op.typ.kind != UIntT or op.kind == okImm or op.kind == okMem:
         error("ADR source must be a label", n)
-      arm64.emitAdr(ctx.buf, dest.reg, op.label)
+      # Long form (`adr`+`add`): a rodata blob can sit anywhere in a multi-megabyte
+      # `.text`, well past plain ADR's ±1 MB.
+      arm64.emitAdrLong(ctx.buf, dest.reg, op.label)
 
   of GloadA64, GstoreA64:
     # `(gload D S)` / `(gstore D S)` — scalar load/store of a __DATA/.bss global `S`
