@@ -5278,6 +5278,15 @@ proc emitCondE(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
   ## FUSED branch test: jump to `toLabel` when the condition holds
   ## (`whenTrue`) — short-circuit and/or/not, `cmp`/`jcc` relations, `(ovf)`,
   ## or `cmp v, 0` for a plain boolean value. Operand placement inline.
+  ##
+  ## A CONSTANT condition decides the branch here, with no code. It is not a rare
+  ## case: hexer lowers `while <cond>: …` with the exit inside the body to
+  ## `(while (true) …)`, so without this every such loop pays `mov r, 1; cmp r, 0;
+  ## jcc` on EVERY iteration — three instructions and a branch to re-derive
+  ## something already known at compile time.
+  if c.kind == TagLit and c.exprKind in {TrueC, FalseC}:
+    if (c.exprKind == TrueC) == whenTrue: g.emJmp(toLabel)   # always taken
+    return                                                   # else: never taken
   if c.kind == TagLit and c.exprKind == OvfC:
     let tag =
       if g.ovfSigned: (if whenTrue: JoX64 else: JnoX64)

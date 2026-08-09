@@ -3972,11 +3972,46 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
             error("at: 3-operand stride scratch aliases the base register (" &
                   $baseReg & ") — the base is clobbered before use (codegen bug)", n)
           let stride = asmSizeOf(elemType)
-          x86.emitMov(ctx.buf.data, scratchReg, indexOp.reg)        # scratch = index
-          x86.emitImulImm(ctx.buf.data, scratchReg, int32(stride))  # scratch *= stride
-          x86.emitLea(ctx.buf.data, scratchReg,                     # scratch = base + disp + scratch
-            x86.MemoryOperand(base: baseReg, index: scratchReg, scale: 1,
-                              displacement: baseDisp, hasIndex: true))
+          # `base + index*stride` without a multiply wherever the stride allows it.
+          # A SIB scale covers {1,2,4,8}; a SUM of two scales covers the strides that
+          # actually dominate this compiler — 16 (`HashEntry`, and any pair of words)
+          # is 8+8, so two `lea`s replace `mov`+`imul`+`lea`: one instruction fewer,
+          # and no 3-cycle `imul` on the address path of every indexed access.
+          #
+          # The split form reads `index` TWICE, so it needs `scratch != index` —
+          # which the disjointness rule above deliberately permits (under pressure
+          # arkham may hand us the index register as the scratch). When they alias,
+          # the first `lea` would destroy the index before the second reads it, so
+          # fall through to the sequential form, where `mov scratch, index` is a
+          # no-op and the shift/multiply operates in place.
+          var loScale = 0
+          var hiScale = 0
+          if scratchReg != indexOp.reg:
+            if stride in [1, 2, 4, 8]:
+              loScale = stride                       # a single `lea` does it all
+            else:
+              for a in [8, 4, 2, 1]:
+                if stride > a and (stride - a) in [1, 2, 4, 8]:
+                  loScale = a; hiScale = stride - a; break
+          if loScale != 0:
+            x86.emitLea(ctx.buf.data, scratchReg,                   # scratch = base + disp + index*lo
+              x86.MemoryOperand(base: baseReg, index: indexOp.reg, scale: loScale,
+                                displacement: baseDisp, hasIndex: true))
+            if hiScale != 0:
+              x86.emitLea(ctx.buf.data, scratchReg,                 # scratch += index*hi
+                x86.MemoryOperand(base: scratchReg, index: indexOp.reg, scale: hiScale,
+                                  displacement: 0, hasIndex: true))
+          else:
+            x86.emitMov(ctx.buf.data, scratchReg, indexOp.reg)      # scratch = index
+            if stride > 0 and (stride and (stride - 1)) == 0:
+              var sh = 0
+              while (1 shl sh) < stride: inc sh
+              x86.emitShl(ctx.buf.data, scratchReg, sh)             # scratch <<= log2(stride)
+            else:
+              x86.emitImulImm(ctx.buf.data, scratchReg, int32(stride))
+            x86.emitLea(ctx.buf.data, scratchReg,                   # scratch = base + disp + scratch
+              x86.MemoryOperand(base: baseReg, index: scratchReg, scale: 1,
+                                displacement: baseDisp, hasIndex: true))
           result.kind = okMem
           result.mem = x86.MemoryOperand(base: scratchReg, displacement: 0, hasIndex: false)
         elif indexOp.kind == okImm:
@@ -6079,7 +6114,15 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       elif op.kind == okLabel:
         x86.emitLea(ctx.buf, dest, op.label)
       elif op.kind == okMem:
-        x86.emitLea(ctx.buf.data, dest, op.mem)
+        # `lea dest, [dest]` is a no-op. It is not incidental: the 3-operand
+        # `(at base index scratch)` form computes the address INTO the scratch and
+        # hands back `okMem{base: scratch}`, and arkham deliberately passes the
+        # consuming instruction's destination as that scratch (`prematLval2`'s
+        # `hint`, so the stride needs no third register). The address is therefore
+        # already in `dest` by the time we get here.
+        if not (op.mem.base == dest and not op.mem.hasIndex and
+                op.mem.displacement == 0):
+          x86.emitLea(ctx.buf.data, dest, op.mem)
       else:
         error("lea requires an address expression (base-reg offset, mem, dot, at, or label)", n)
   of JmpX64:
