@@ -399,15 +399,16 @@ proc emScalarStackVar(g: var CodeGen; name: string) =
   g.ab.close()
 
 proc emTypedStackVar(g: var CodeGen; name: string; t: Cursor) =
-  ## The ONE local-variable stack-slot emitter — `(var :name (s) <slot type>)`,
-  ## dispatching on the value class so callers need no per-form ladder (genVarDecl2
-  ## mirrors x64's single call). The slot type is NOT always the real type: a64 spills
-  ## every integer/bool/char scalar to a forced `(i 64)` (arkham keeps scalars 64-bit
-  ## in registers and the `ldr/str` accessors are 64-bit, so a narrow slot would
-  ## mis-size the access). A POINTER keeps its real `(ptr T)` type (the body may deref
-  ## it); a FLOAT its `(f N)`; an aggregate its real type plus the `(s (align N))`
-  ## stack-slot alignment. This backend-specific scalar rule lives here, not in the
-  ## caller — that is the whole point of routing through one proc.
+  ## The ONE local-variable stack-slot emitter — `(var :name (s) <the value's real
+  ## Leng type>)`, dispatching on the value class so callers need no per-form ladder.
+  ## Identical in effect to x64's: the slot says what it holds. A scalar's slot still
+  ## OCCUPIES 8 bytes and stays 8-aligned (`allocSlotUp` rounds every footprint up to
+  ## the slot granularity), so a narrow type costs nothing in layout — it only tells
+  ## nifasm the ACCESS width, which is what keeps a `bool`/`int8` home honest: the
+  ## store writes one byte and the load `ldrsb`/`ldrb`-extends it back to arkham's
+  ## canonical 64-bit form. Declaring `(i 64)` here instead made every such slot
+  ## untyped to the checker AND made the load a raw 64-bit read of whatever a callee
+  ## holding `ptr int8` had left in the upper seven bytes.
   g.ra.hasStackVars = true                   # a `(s)` var exists ⇒ frame sub needed
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
@@ -423,18 +424,11 @@ proc emTypedStackVar(g: var CodeGen; name: string; t: Cursor) =
       g.ab.tree AlignX: g.ab.intLit sa.int64
   else:
     g.ab.keyword SO                           # ordinary 8-granular slot → `(s)`
-  case slot.kind
-  of AFloat:
+  if slot.kind == AFloat:
     g.ab.floatType(slot.size * 8)             # `(f N)` — typed fp slot
-  of AMem:
-    var tc = t                                # aggregate: its real type (align applied above)
+  else:
+    var tc = t                                # everything else: its own type
     if tc.kind == Symbol: g.ab.sym symName(tc) else: g.genTypeBody(tc)
-  else:                                       # int / uint / bool / char / pointer
-    if isPtrType(resolveType(g.prog, t)):
-      var tc = t                              # pointer: real `(ptr T)` so the body can deref
-      if tc.kind == Symbol: g.ab.sym symName(tc) else: g.genTypeBody(tc)
-    else:
-      g.ab.intType(64)                        # scalar: forced 8-byte slot (64-bit access)
   g.ab.close()
 
 proc emScalarLoad(g: var CodeGen; dest: Reg; name: string) =
@@ -458,19 +452,6 @@ proc emBindType(g: var CodeGen; typ: AsmSlot) =
     var tc = typ.typ
     if tc.kind == Symbol: g.ab.sym symName(tc)
     else: g.genTypeBody(tc)
-
-proc stackHomeSlot(g: var CodeGen; typ: AsmSlot): AsmSlot =
-  ## The slot a destination must be bound with when its value is LOADED FROM A STACK
-  ## HOME. `emTypedStackVar`/`emScalarStackVar` declare every non-pointer scalar's slot
-  ## a forced `(i 64)` — arkham keeps scalars 64-bit in registers and the `ldr`/`str`
-  ## accessors are 64-bit, so a narrow slot would mis-size the access. Binding the
-  ## destination with the VALUE's own narrow slot instead (`(bool)`, `(u 8)`, `(u 32)`)
-  ## makes the load `(mov <narrow> <(stackoff (i 64))>)` — a type error nifasm rejects.
-  ## A POINTER keeps its real `(ptr T)`, which is exactly what its declaration keeps.
-  if isNilSlot(typ): return typ                    # a `(nil)` binding — a null pointer
-  if not cursorIsNil(typ.typ) and isPtrType(resolveType(g.prog, typ.typ)): return typ
-  if typ.kind in {ABool, AInt, AUInt}: return ScalarSlot
-  result = typ
 
 proc bindTemp(g: var CodeGen; r: Reg; typ: AsmSlot) =
   ## Give scratch register `r` a typed nifasm name `tmpN.0` via `(rebind …)`, so every
@@ -1188,9 +1169,11 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
         g.emFloatScalarStore(nm, FloatArgRegs[pl.fpIndex], bits)
       elif loc.kind == NamedStack:
         # An address-taken scalar param: declare its `(s)` slot and spill the
-        # incoming argument register into it so `addr`/loads/stores work.
+        # incoming argument register into it so `addr`/loads/stores work. The slot
+        # carries the PARAMETER's type (as on x64), so a narrow one is stored and
+        # reloaded at its own width instead of as a raw 64-bit cell.
         assert not pl.onStack, "arkham v1: >8 integer params (stack TODO)"
-        g.emScalarStackVar(nm)
+        g.emTypedStackVar(nm, typeCur)
         g.emScalarStore(nm, g.md.gprAt(pl))
       else:
         case loc.kind
@@ -1503,16 +1486,10 @@ proc place2(g: var CodeGen; src: Location; dest: Reg) =
   of InReg: g.movReg(dest, src.r)
   of Imm: g.placeImm(dest, src)
   of NamedStack:
+    # The slot carries its own type, so nifasm sizes this load by it: a narrow local
+    # comes back `ldrsb`/`ldrb`-extended into arkham's canonical 64-bit form, whether
+    # arkham stored it or a callee holding `ptr int8` wrote the one byte.
     g.emScalarLoad(dest, src.name)
-    # The slot is a forced `(i 64)` (see `emTypedStackVar`), so the load is 64-bit
-    # and arkham's own stores keep the canonical extended form in it. A local whose
-    # ADDRESS was taken breaks that: a callee holding `ptr int8` writes exactly one
-    # byte and leaves the other seven at whatever was there before. Re-extend a
-    # sub-64-bit scalar on the way out — cheap, since only a SPILLED narrow local
-    # reaches here at all, and the alternative is a value that prints right (`$`
-    # narrows on the way out) but compares wrong (the compare is 64-bit).
-    if src.typ.kind in {AInt, AUInt} and src.typ.size > 0 and src.typ.size < 8:
-      g.extendTo(dest, src.typ.size * 8, signed = src.typ.kind == AInt)
   of Glob:
     if g.globalIsGvarSlot(src.name):
       # Fold the page offset into the load: `adrp x17, g@PAGE ; ldr dest, [x17, g@PAGEOFF]`
@@ -3351,11 +3328,8 @@ proc emitValue2(g: var CodeGen; c: Cursor; dest: var Location) =
       if dest.kind == NamedStack and dest.spillTemp:
         g.produceIntoMem2(c, dest); return
       if dest.kind == InReg and not (home.kind == InReg and home.r == dest.r):
-        # A stack home is declared `(i 64)` for a non-pointer scalar; bind the
-        # destination to match the LOAD (075b051's stackHomeSlot fix).
         if dest.isTemp and not g.rb.isBoundTemp(dest.r):
-          g.bindTemp(dest.r, if home.kind == NamedStack: g.stackHomeSlot(dest.typ)
-                             else: dest.typ)
+          g.bindTemp(dest.r, dest.typ)
         g.place2(home, dest.r)
     else:
       g.forceRegDestE(dest)
@@ -3817,7 +3791,6 @@ proc emitScalarCmpE(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
     else: raiseAssert "arkham a64n: cond " & $ek
   template cmpBridgeSlot(loc: Location; opC: Cursor): AsmSlot =
     if isPtrType(resolveType(g.prog, g.getType(opC))): g.exprSlot(opC)
-    elif loc.kind == NamedStack: g.stackHomeSlot(loc.typ)   # the slot is `(i 64)`
     else: loc.typ
   template placeCmpOperand(loc: Location; opC: Cursor; bridge: Reg) =
     if loc.kind == Imm: g.placeImmTyped(bridge, loc, g.getType(opC))

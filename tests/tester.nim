@@ -275,15 +275,9 @@ const arkhamStressA64Known: seq[string] = @[
   # porting the rule is a separate change with its own reading of the LDXR/STXR
   # sequences, not a paste.
   "atomic_cas_operand_home",
-  "shift_count_clobbers_mask", # spill path emits a stackoff (i 64) into a (u 8) value
-                            # slot under k=3 — the "stackoff into a value slot"
-                            # class. (Not the `SynthMark` shadowing bug that used
-                            # to park `aggr_copy_regpressure` here: this one
-                            # survives the fix.) The fixture's own job is
-                            # x86-64-only (rcx shift-count
-                            # clobber vs a ShiftRegOk-homed local); a64 has no
-                            # fixed shift-count register, so this entry hides
-                            # nothing the fixture is meant to guard.
+  # (`shift_count_clobbers_mask` lived here for the "stackoff into a value slot"
+  # class — a spilled `(u 8)` whose slot arkham declared `(i 64)`. Slots now carry
+  # their own type, so the class is gone and the fixture passes.)
   # NOT listed, but known: `addr_chain_depth` is the x16 twin of the x86-64
   # `addr_chain_depth` entry above — `produceIntoMem2` re-enters the produce
   # bridge while an enclosing `emitBin2`'s partial is still live in it — and

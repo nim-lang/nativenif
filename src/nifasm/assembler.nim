@@ -181,12 +181,6 @@ proc movCompatible(want, got: Type): bool =
     return litFitsWidth(g.litVal, w.bits)
   if w.kind in {IntT, UIntT} and g.kind in {IntT, UIntT}:
     return g.bits <= w.bits
-  if w.kind in {IntT, UIntT} and g.kind == BoolT and w.bits >= 8:
-    # A `bool` is a canonical 0/1 byte, so moving it into a WIDER integer is the same
-    # widening move already blessed for `(u 8)`. arkham forces every integer AND bool
-    # local to an `(i 64)` slot, so storing a loaded bool field to its home lands here
-    # (sigmatch's `conceptRoutineAvailable`). `int → bool` stays a narrowing.
-    return true
   result = false
 
 proc getInt(n: Cursor): int64 =
@@ -2480,16 +2474,26 @@ proc memWidthOpc(typ: Type; isLoad: bool): tuple[size, opc: int] =
   ## Access width (0=byte,1=half,2=word,3=dword) and the load/store `opc` for a
   ## typed memory operand. A `(mem (dot …))` / `(mem (at …))` carries the field /
   ## element type, so a narrow integer load sign-/zero-extends and a narrow store
-  ## writes only its low bits. Anything non-integer (pointer, raw `(mem reg)`,
-  ## stack slot) is a full 64-bit access.
+  ## writes only its low bits. Anything non-integer (pointer, raw `(mem reg)`) is a
+  ## full 64-bit access.
+  ##
+  ## A STACK SLOT is its content type behind a `(stackoff …)` wrapper, so unwrap it
+  ## and size the access by what the slot HOLDS. A slot always occupies 8 bytes
+  ## (`allocSlotUp` rounds every footprint up to the granularity), so this is not
+  ## about layout — it is what makes a narrow local's home behave like the variable
+  ## it is: `strb` in, `ldrsb`/`ldrb` out. Reading one as a 64-bit cell instead
+  ## returns the upper seven bytes as well, which for a local whose address escaped
+  ## into a callee holding `ptr int8` is whatever was there before.
   var bits = 64
   var signed = false
   if typ != nil:
-    case typ.kind
-    of IntT: bits = typ.bits; signed = true       # `(i N)` (and `(c N)` chars)
-    of UIntT: bits = typ.bits
+    var t = typ
+    if t.kind == StackOffT and t.offType != nil: t = t.offType
+    case t.kind
+    of IntT: bits = t.bits; signed = true         # `(i N)` (and `(c N)` chars)
+    of UIntT: bits = t.bits
     of BoolT: bits = 8
-    else: bits = 64                                # PtrT / StackOffT / raw mem
+    else: bits = 64                                # PtrT / raw mem / aggregate
   let size = case bits
     of 8: 0
     of 16: 1
@@ -2702,17 +2706,16 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     # integer-like, any width pairing is accepted (`memWidthOpc` emits the extension/
     # truncation); other moves keep the strict check. Mirrors x64's `genMovX64`.
     if dest.typ != nil and op.typ != nil:
-      proc isIntLike(t: Type): bool = t.kind in {IntT, UIntT, BoolT, IntLitT}
+      proc isIntLike(t: Type): bool =
+        # A STACK SLOT holding an integer is sized integer memory like any `(dot …)`
+        # or `(at …)`: `memWidthOpc` unwraps the `(stackoff …)` and picks the access
+        # width from the content type, so the pairing is as safe here as it is there.
+        var u = t
+        if u.kind == StackOffT and u.offType != nil: u = u.offType
+        u.kind in {IntT, UIntT, BoolT, IntLitT}
       let sizedMemReg = (dest.kind == okMem) != (op.kind == okMem) and
                         isIntLike(dest.typ) and isIntLike(op.typ)
-      # Placing an integer in a PARAMETER's register is the ABI's own truncation, not
-      # a narrowing the caller has to spell out: AAPCS64 leaves the bits above a
-      # sub-word parameter unspecified, and the callee reads the register at the
-      # parameter's width. A code generator that keeps every scalar 64-bit in
-      # registers (arkham does) would otherwise have to name a fresh, param-width
-      # binding for each such argument.
-      let argWidth = dest.kind == okArg and isIntLike(dest.typ) and isIntLike(op.typ)
-      if not sizedMemReg and not argWidth and not movCompatible(dest.typ, op.typ):
+      if not sizedMemReg and not movCompatible(dest.typ, op.typ):
         typeError(dest.typ, op.typ, start)
     checkPtrStore(dest.typ, op.kind, op.typ, start)
     if dest.kind == okMem:
