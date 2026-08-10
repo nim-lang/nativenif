@@ -78,15 +78,14 @@ const
                                      # `pickStagingScratch` already routes staging around a live
                                      # local/param home (`regHoldsLiveLocal`).
     intCalleeSaved: @[RBX, R12, R13, R14, R15],
-    intEmergencyRegs: @[RBP],        # unused by the ABI here; costs one push/pop
-                                     # in exactly the procs whose emitter runs dry
-                                     # NOTE: RBP is free (arkham never sets up an rbp frame) and
-                                     # was tried as a 6th callee-saved home — it helps, but under
-                                     # precise live ranges it exposes a latent miscompile (a
-                                     # value living in rbp across a call is clobbered; frame
-                                     # push/pop of rbp is correct, so the fault is elsewhere —
-                                     # likely a callee not preserving rbp or a nifasm mem/TLS
-                                     # encoding path). Left out until that is root-caused.
+                                     # RBP is deliberately NOT here. arkham never sets up an
+                                     # rbp frame, so it looks free, but adding it as a sixth
+                                     # callee-saved home exposes a latent miscompile under
+                                     # precise live ranges: a value living in rbp across a call
+                                     # comes back clobbered even though the frame push/pop of
+                                     # rbp is correct — so the fault is elsewhere (a callee not
+                                     # preserving rbp, or a nifasm mem/TLS encoding path).
+                                     # Root-cause that before reaching for it.
     floatTempRegs: @[F8, F9, F10, F11, F12, F13, F14],   # F15 RESERVED as the float
                                                          # staging bridge (FloatStagingBridge)
                                                          # — the SIMD twin of R11.

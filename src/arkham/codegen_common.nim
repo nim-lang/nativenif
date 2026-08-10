@@ -130,19 +130,8 @@ type
                                              ## reverse scan. Populated at the param prologue.
     tmpBindTyp*: Table[Reg, AsmSlot]         ## the `AsmSlot` each `bindTemp` bound a register
                                              ## with. `RegBind` keeps only the name and the
-                                             ## pointer bit, but `borrowEmergency` has to
-                                             ## re-emit the victim's `(rebind …)` verbatim.
-    emergencyBorrows*: seq[tuple[r: Reg, slot: string, name: string,
-                                 typ: AsmSlot, isPtr: bool, wasTemp: bool]]
-                                             ## x64 `borrowEmergency`: the open borrow windows,
-                                             ## innermost last. A register is freed under full
-                                             ## pressure by spilling its (anonymous) owner to
-                                             ## `slot`; `giveBack` pops and reloads.
-    emergencyHeld*: set[Reg]                 ## registers with an open borrow window — never
-                                             ## victimized twice.
-    emergencySlots*: seq[string]             ## the borrow slots, indexed by nesting depth and
-                                             ## reused across the body: a proc that borrows at
-                                             ## depth 2 costs two 8-byte slots in total.
+                                             ## pointer bit, and a `(rebind …)` has to name the
+                                             ## same type the register was bound with.
     curProcName*: string                     ## the proc currently being emitted. arkham's input
                                              ## carries no line info, so a bare register-pressure
                                              ## or typing assert names nothing actionable; this
@@ -949,10 +938,6 @@ proc pickTempReg*(g: var CodeGen): Reg =
     if regFreeForTemp(g, r):
       g.ra.usedCallee.incl r
       return r
-  for r in g.md.intEmergencyRegs:            # never a local home — ours to borrow
-    if regFreeForTemp(g, r):
-      g.ra.usedCallee.incl r
-      return r
   NoReg
 
 proc tempPoolDry*(g: var CodeGen): bool =
@@ -963,8 +948,6 @@ proc tempPoolDry*(g: var CodeGen): bool =
   for r in g.md.intTempRegs:
     if regFreeForTemp(g, r): return false
   for r in g.md.intCalleeSaved:
-    if regFreeForTemp(g, r): return false
-  for r in g.md.intEmergencyRegs:            # must agree with `pickTempReg`
     if regFreeForTemp(g, r): return false
   true
 
@@ -986,10 +969,6 @@ proc pickHeldReg*(g: var CodeGen): Reg =
   ## mid-emission is impossible in the merged core (its uses are already
   ## emitted), and the corpus needed that demotion exactly once.
   for r in g.md.intCalleeSaved:
-    if regFreeForTemp(g, r):
-      g.ra.usedCallee.incl r
-      return r
-  for r in g.md.intEmergencyRegs:            # a survivor scratch may borrow it too
     if regFreeForTemp(g, r):
       g.ra.usedCallee.incl r
       return r

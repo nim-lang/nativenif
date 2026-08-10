@@ -63,21 +63,6 @@ proc stressActive*(): bool {.inline.} =
   else: false
 
 when StressEnabled:
-  let stressEmergency* = getEnv("ARKHAM_STRESS_EMERGENCY").strip.len > 0
-    ## `ARKHAM_STRESS_EMERGENCY=1`: take the x86-64 emitter's EMERGENCY BORROW
-    ## (`borrowEmergency`) whenever one is possible, in preference to a free
-    ## register. Shrinking the register file (`ARKHAM_STRESS=k`) cannot reach that
-    ## arm — it fires only when *every* staging candidate is occupied, and taking
-    ## registers away from the allocator leaves FEWER of them holding anything —
-    ## so without this knob the whole save/restore-through-a-frame-slot path runs
-    ## on nothing but the programs too big to be fixtures. Forcing it turns the
-    ## entire corpus into its test, with each fixture's own `.exitcode`/`.output`
-    ## as the oracle: displacing a live value and putting it back is either
-    ## invisible or a miscompile.
-else:
-  const stressEmergency* = false
-
-when StressEnabled:
   proc keepFirst[T](pool: seq[T]; floorN: int): seq[T] =
     let n = max(floorN, min(stressKeep, pool.len))
     if n >= pool.len: pool else: pool[0 ..< n]
@@ -94,10 +79,6 @@ proc stressed*(md: MachineDesc): MachineDesc =
   when StressEnabled:
     if stressKeep <= 0: return
     result.intCalleeSaved = keepFirst(md.intCalleeSaved, CalleeSavedFloor)
-    # The emergency pool is RELIEF for a dry emitter — exactly the arm this mode
-    # exists to exercise. Leaving it in place would let a fixture pass because the
-    # relief was there, hiding the defect on the path that runs without it.
-    result.intEmergencyRegs = @[]
     result.intLocalTempRegs = keepFirst(md.intLocalTempRegs, 0)
     result.intTempRegs = keepFirst(md.intTempRegs, TempFloor)
     result.floatTempRegs = keepFirst(md.floatTempRegs, FTempFloor)
