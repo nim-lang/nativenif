@@ -1,0 +1,56 @@
+(.nif27)
+(stmts
+ (type :Arr8f.0 .
+  (array
+   (f 64)8))
+ (const :powtens.0 . Arr8f.0
+  (aconstr Arr8f.0 1.0 10.0 100.0 1000.0 10000.0 100000.0 1000000.0 10000000.0))
+ (gvar :gi.0 .
+  (i 64)3)
+ (gvar :gf.0 .
+  (f 64)0.0)
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :i.0 .
+    (i 64)3)
+   (if
+    (elif
+     (neq
+      (at powtens.0 i.0)1000.0)
+     (stmts
+      (call exit.c 11))))
+   (if
+    (elif
+     (neq
+      (at powtens.0 gi.0)1000.0)
+     (stmts
+      (call exit.c 12))))
+   (var :a.0 . Arr8f.0
+    (aconstr Arr8f.0 0.0 1.5 2.5 3.5 4.5 5.5 6.5 7.5))
+   (asgn
+    (at a.0 i.0)42.5)
+   (if
+    (elif
+     (neq
+      (at a.0 i.0)42.5)
+     (stmts
+      (call exit.c 13))))
+   (asgn gf.0
+    (at a.0 i.0))
+   (if
+    (elif
+     (neq gf.0 42.5)
+     (stmts
+      (call exit.c 14))))
+   (call exit.c 42))))

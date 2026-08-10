@@ -1,0 +1,59 @@
+(.nif27)
+(stmts
+ (gvar :b.0 .
+  (u 8)15)
+ (gvar :h.0 .
+  (u 16)15)
+ (gvar :w.0 .
+  (u 32)15)
+ (gvar :sb.0 .
+  (i 8)-128)
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (if
+    (elif
+     (neq
+      (bitnot
+       (u 8)b.0)240u)
+     (stmts
+      (call exit.c 11))))
+   (if
+    (elif
+     (neq
+      (bitnot
+       (u 16)h.0)65520u)
+     (stmts
+      (call exit.c 12))))
+   (if
+    (elif
+     (neq
+      (bitnot
+       (u 32)w.0)4294967280u)
+     (stmts
+      (call exit.c 13))))
+   (if
+    (elif
+     (neq
+      (neg
+       (u 8)b.0)241u)
+     (stmts
+      (call exit.c 14))))
+   (if
+    (elif
+     (neq
+      (neg
+       (i 8)sb.0)-128)
+     (stmts
+      (call exit.c 15))))
+   (call exit.c 42))))
