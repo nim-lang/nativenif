@@ -230,6 +230,19 @@ proc allocStorage(b: var Builder; name: string; slot: AsmSlot; props: VarProps):
       # option — into spills (a register-class priority inversion). Reserve callee-saved
       # for the values that can only use it.
       r = b.takeReg(b.freeVol, b.md.intLocalTempRegs)
+      # The fixed-role volatiles come BEFORE the callee-saved fallback, not after
+      # it. `ShiftRegOk`/`DivRegOk` are the same interval proof as `AllRegs` but
+      # per register — this value's life never overlaps rcx's shift-count role /
+      # rdx's div-rem role — so they are free homes, while a callee-saved register
+      # costs a push and a pop in a prologue that may run millions of times. The
+      # old order reached them only once the callee-saved pool was ALSO dry, which
+      # for a leaf proc (where every value is `AllRegs`) meant it never reached
+      # them at all: `rawLineInfo`, a leaf, pushed all six callee-saved registers
+      # while rcx and rdx sat free.
+      if r == NoReg and ShiftRegOk in props and b.md.shiftCountReg != NoReg:
+        r = b.takeReg(b.freeVol, [b.md.shiftCountReg])
+      if r == NoReg and DivRegOk in props and b.md.divRemReg != NoReg:
+        r = b.takeReg(b.freeVol, [b.md.divRemReg])
       if r == NoReg: r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
     else:
       # AArch64: prefer callee-saved first (one prologue push, then resident). Volatile-

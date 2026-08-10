@@ -5382,6 +5382,12 @@ proc emitDivMod2(g: var CodeGen; c: Cursor; dest: var Location) =
   # (`fixedRegsClobberedByE`), so an accum seal on rdx here is the protected case.
   if g.rb.isBoundTemp(g.md.divRemReg):
     raiseAssert "arkham: div/mod while the remainder register holds a live value"
+  # A `DivRegOk` home in rdx is interval-proved DEAD here, but "dead" is arkham's
+  # word: nifasm still sees the name bound to the register, and `idiv`'s raw
+  # `(rdx)` operand bypasses the binding check that would otherwise catch it
+  # (`checkFixedRegFree`). Retire the binding so the clobber is declared rather
+  # than silent — the same treatment every other raw reuse of a register gets.
+  g.releaseStaleName(g.md.divRemReg)
   let acc = g.md.intRetReg                              # rax: dividend, then result
 
   # Constant power-of-two divisor → shifts (~20-40 cycles saved). Signed mod
