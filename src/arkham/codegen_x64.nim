@@ -344,8 +344,10 @@ proc pickStaging(g: var CodeGen; what: string; avoid: Reg = NoReg;
                  stmtPos = false): Reg
 # value-core emitters (defined far below) used by the shared memory-move helpers
 # (`scalarMemMov`/`floatMemMov`) to emit a folded access chain:
-proc prematLval2(g: var CodeGen; c: Cursor; asBase = false; hint = NoReg)
+proc prematLval2(g: var CodeGen; c: Cursor; asBase = false; hint = NoReg;
+                 foldDisp = false)
 proc emLvalAddr2(g: var CodeGen; c: Cursor)
+proc emMemLval2(g: var CodeGen; c: Cursor)
 proc unbindLvalTemps2(g: var CodeGen; c: Cursor)
 
 # ── fused value core (step 3): decide-and-emit overloads ─────────────────────
@@ -669,13 +671,13 @@ proc scalarMemMov(g: var CodeGen; loc: Location; reg: Reg; load: bool) =
     # A folded access chain: materialize the embedded base/index values (statements
     # BEFORE the consuming `mov`), emit the chain as one nifasm address operand,
     # then release the address temps — the value-core lvalue machinery.
-    g.prematLval2(loc.cur)
+    g.prematLval2(loc.cur, foldDisp = true)
     g.ab.tree MovX64:
       if load:
         g.emReg reg
-        g.ab.tree MemX: g.emLvalAddr2(loc.cur)
+        g.emMemLval2(loc.cur)
       else:
-        g.ab.tree MemX: g.emLvalAddr2(loc.cur)
+        g.emMemLval2(loc.cur)
         g.emReg reg
     g.unbindLvalTemps2(loc.cur)
   else: raiseAssert "arkham x64: scalarMemMov on location kind " & $loc.kind
@@ -768,13 +770,13 @@ proc floatMemMov(g: var CodeGen; loc: Location; reg: FReg; bits: int; load: bool
     g.giveBack p
   of Mem:
     let op = if bits == 32: MovssX64 else: MovsdX64
-    g.prematLval2(loc.cur)
+    g.prematLval2(loc.cur, foldDisp = true)
     g.ab.tree op:
       if load:
         g.emFReg reg
-        g.ab.tree MemX: g.emLvalAddr2(loc.cur)
+        g.emMemLval2(loc.cur)
       else:
-        g.ab.tree MemX: g.emLvalAddr2(loc.cur)
+        g.emMemLval2(loc.cur)
         g.emFReg reg
     g.unbindLvalTemps2(loc.cur)
   else: raiseAssert "arkham x64: floatMemMov on location kind " & $loc.kind
@@ -2516,9 +2518,9 @@ proc binFold(g: var CodeGen; op: X64Inst; dest: Reg; loc: Location; opCur: Curso
       g.binReg(op, dest, s)
       g.giveBack s
     else:                                         # Mem: load via the lvalue (premat base)
-      g.prematLval2(opCur)
+      g.prematLval2(opCur, foldDisp = true)
       let s = g.pickStagingSealed("a sub-width operand", wide, avoid = dest)
-      g.ab.tree MovX64: (g.emReg s; g.ab.tree MemX: g.emLvalAddr2(opCur))
+      g.ab.tree MovX64: (g.emReg s; g.emMemLval2(opCur))
       g.unbindLvalTemps2(opCur)
       g.binReg(op, dest, s)
       g.giveBack s
@@ -3503,7 +3505,94 @@ proc prematAddrVal2(g: var CodeGen; c: Cursor) =
   g.ra.locs[pos] = d
   g.reloadMemBase2(pos)
 
-proc prematLval2(g: var CodeGen; c: Cursor; asBase = false; hint = NoReg) =
+proc prematAddrValAs2(g: var CodeGen; c, valueCur: Cursor) =
+  ## `prematAddrVal2` with the emitted VALUE decoupled from the POSITION whose register
+  ## receives it: the address operand of a displacement-folded `(deref (… + K))` holds
+  ## only the base, but it lives in the register the allocator reserved for the whole
+  ## pointer expression. Everything downstream (`emLvalAddr2`, `unbindLvalTemps2`) keys
+  ## off that position and is unchanged — only the value in the register differs.
+  let pos = cursorToPosition(g.buf[], c)
+  var d = g.ra.locs[pos]
+  g.emitValue2(valueCur, d)
+  g.ra.locs[pos] = d
+  g.reloadMemBase2(pos)
+
+proc derefDispSplit(g: var CodeGen; c: Cursor): (Cursor, int32, bool) =
+  ## For a `(deref P)` lvalue: is `P` a pointer plus a compile-time constant BYTE
+  ## offset? If so, return the sub-expression that actually needs a register and the
+  ## displacement, which x86 carries in the address operand for free — so
+  ## `mov r,base; add r,K; mov x,[r]` becomes `mov x,[base+K]`, two instructions and
+  ## one register temp lighter.
+  ##
+  ## A PURE function of the subtree, deliberately: `prematLval2` consults it to decide
+  ## what to materialize and `emMemLval2` consults it to decide whether to emit the
+  ## displacement. Being one function, they cannot disagree — the same discipline
+  ## `constFold` is under. Both are gated on the caller's `foldDisp`, so a `deref`
+  ## nested under a `(dot …)`/`(at …)`/`(lea …)` (where a trailing IntLit would be read
+  ## as a field/index or not read at all) never reaches either.
+  ##
+  ## Requirements beyond the shape: the add must be at full register width (a narrower
+  ## one wraps where an address does not), the constant must fit disp32, and it must be
+  ## non-zero (nothing to fold otherwise).
+  result = (c, 0'i32, false)
+  if c.kind != TagLit or c.exprKind != DerefC: return
+  var p: Cursor
+  block:
+    var dd = c
+    dd.into:
+      p = dd; skip dd
+      while dd.hasMore: skip dd
+  # Peel the value-preserving wrappers the pointer arrives in — hexer spells the
+  # address arithmetic `cast[ptr T](cast[uint](base) + k)`.
+  var core = p
+  var guard = 0
+  while core.kind == TagLit and guard < 8:
+    inc guard
+    let ek = core.exprKind
+    if ek in {CastC, ConvC}:
+      var t = core
+      t.into:
+        skip t                                  # the target type
+        core = t
+        while t.hasMore: skip t
+    elif ek in {SufC, ParC}:
+      var t = core
+      t.into:
+        core = t
+        while t.hasMore: skip t
+    else: break
+  if core.kind != TagLit or core.exprKind notin {AddC, SubC}: return
+  let isSub = core.exprKind == SubC
+  var a, b: Cursor
+  var widthOk = false
+  block:
+    var t = core
+    t.into:
+      if t.kind == TagLit:
+        case t.typeKind
+        of IT, UT:
+          let bits = typeBits(t)
+          widthOk = bits == 64 or bits <= 0   # `(i -1)` is the platform int
+        else: discard
+      skip t                                    # result type
+      a = t; skip t
+      b = t; skip t
+      while t.hasMore: skip t
+  if not widthOk: return
+  # The constant is the right operand; for `add` it may equally be the left one.
+  var baseCur = a
+  var (ok, k) = g.tryConstFold(b)
+  if not ok and not isSub:
+    (ok, k) = g.tryConstFold(a)
+    baseCur = b
+  if not ok: return
+  if isSub: k = -k
+  if k == 0 or k < low(int32).int64 or k > high(int32).int64: return
+  if g.tryConstFold(baseCur)[0]: return         # wholly constant: not our fold
+  result = (baseCur, int32(k), true)
+
+proc prematLval2(g: var CodeGen; c: Cursor; asBase = false; hint = NoReg;
+                 foldDisp = false) =
   ## Materialize an lvalue's embedded values (a `deref` pointer, an index, a global
   ## base's address) into their allocated registers BEFORE the consuming `(mem …)` /
   ## `(lea …)` tree opens (an emit-inside-the-tree would corrupt it). For a stack /
@@ -3540,9 +3629,14 @@ proc prematLval2(g: var CodeGen; c: Cursor; asBase = false; hint = NoReg) =
         g.prematLval2(cc, asBase, hint)                 # a dot over an indexed base propagates
         while cc.hasMore: skip cc
     of DerefC:
+      let (baseCur, _, folded) = (if foldDisp: g.derefDispSplit(c)
+                                  else: (c, 0'i32, false))
       var cc = c
       cc.into:
-        g.prematAddrVal2(cc)                            # the pointer → its register (follow steals)
+        # Folded: only the BASE goes into the register the allocator reserved for the
+        # whole pointer expression; `emMemLval2` re-derives the same displacement.
+        if folded: g.prematAddrValAs2(cc, baseCur)
+        else: g.prematAddrVal2(cc)                      # the pointer → its register (follow steals)
         while cc.hasMore: skip cc
     of AtC:
       let atPos = cursorToPosition(g.buf[], c)
@@ -3645,14 +3739,25 @@ proc unbindLvalTemps2(g: var CodeGen; c: Cursor) =
         while cc.hasMore: skip cc
     else: discard
 
+proc emMemLval2(g: var CodeGen; c: Cursor) =
+  ## `(mem <address> [disp])` — the ONE place a folded constant displacement is
+  ## emitted, so it can only ever appear where nifasm reads it as one: as the second
+  ## child of a `mem` node. `emLvalAddr2` stays displacement-free, which is what keeps
+  ## a nested `deref` under a `(dot …)`/`(at …)`/`(lea …)` correct by construction.
+  ## Pair with `prematLval2(c, foldDisp = true)`.
+  g.ab.tree MemX:
+    g.emLvalAddr2(c)
+    let (_, disp, folded) = g.derefDispSplit(c)
+    if folded: g.ab.intLit disp.int64
+
 proc binMemLval2(g: var CodeGen; op: X64Inst; dest: Reg; c: Cursor) =
   ## `dest op= [<lvalue c>]` — fold a memory-load operand into an ALU op via the
   ## value-core address machinery (prematLval2 / emLvalAddr2 / unbindLvalTemps2).
   ## The mirror of emitMemLoad2 with an ALU op in place of the load `mov`.
-  g.prematLval2(c)
+  g.prematLval2(c, foldDisp = true)
   g.ab.tree op:
     g.emReg dest
-    g.ab.tree MemX: g.emLvalAddr2(c)
+    g.emMemLval2(c)
   g.unbindLvalTemps2(c)
 
 proc aggrAddrInto(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind: bool) =
@@ -4650,15 +4755,15 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
         if v.kind != InFReg:                              # demoted (stolen) float local → staging xmm
           let fs = g.pickFStagingSealed("a memory store rhs")
           g.floatMemMov(v, fs, bits, load = true)
-          g.prematLval2(lhs)                              # base regs AFTER the rhs is secured
+          g.prematLval2(lhs, foldDisp = true)                              # base regs AFTER the rhs is secured
           g.ab.tree (if bits == 32: MovssX64 else: MovsdX64):
-            g.ab.tree MemX: g.emLvalAddr2(lhs)
+            g.emMemLval2(lhs)
             g.emFReg fs
           g.rb.unsealF fs
         else:
-          g.prematLval2(lhs)
+          g.prematLval2(lhs, foldDisp = true)
           g.ab.tree (if bits == 32: MovssX64 else: MovsdX64):
-            g.ab.tree MemX: g.emLvalAddr2(lhs)
+            g.emMemLval2(lhs)
             g.emFReg v.f
           if v.isTemp: g.unbindFTmp(v.f)
       else:                                               # integer/immediate store
@@ -4673,9 +4778,9 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
           rhsStaging = g.pickStagingSealed("a memory store rhs", v.typ)
           g.emitLoadLoc(v, rhsStaging)
           v = regLoc(rhsStaging, v.typ)
-        g.prematLval2(lhs)                                 # base regs AFTER the rhs is secured
+        g.prematLval2(lhs, foldDisp = true)                                 # base regs AFTER the rhs is secured
         g.ab.tree MovX64:
-          g.ab.tree MemX: g.emLvalAddr2(lhs)
+          g.emMemLval2(lhs)
           case v.kind
           of Imm: g.emImm(v)
           of InReg:
@@ -5468,13 +5573,13 @@ proc emitScalarCmpE(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
       bLoc = regLoc(bigImmStaging, bLoc.typ)
     var aBound: seq[Reg] = @[]
     g.bindLvalGlobalBases(aC, aBound)                  # bind a global base before the lea
-    g.prematLval2(aC)                                  # materialize the lhs base first
+    g.prematLval2(aC, foldDisp = true)                                  # materialize the lhs base first
     var rhsStaging = NoReg
     if bLoc.kind == NamedStack:                        # no `cmp [mem], [mem]`
       rhsStaging = g.pickStagingSealed("a cmp(memlhs) rhs", bLoc.typ)
       g.emitLoadLoc(bLoc, rhsStaging)
     g.ab.tree CmpX64:
-      g.ab.tree MemX: g.emLvalAddr2(aC)
+      g.emMemLval2(aC)
       case bLoc.kind
       of Imm: g.emImm(bLoc)
       of InReg: g.emReg bLoc.r
@@ -5517,10 +5622,10 @@ proc emitScalarCmpE(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
   if rhsMemFold:
     var bBound: seq[Reg] = @[]
     g.bindLvalGlobalBases(bC, bBound)
-    g.prematLval2(bC)
+    g.prematLval2(bC, foldDisp = true)
     g.ab.tree CmpX64:
       g.emReg aLoc.r
-      g.ab.tree MemX: g.emLvalAddr2(bC)
+      g.emMemLval2(bC)
     g.unbindLvalTemps2(bC)
     for r in bBound: g.unbindTemp(r)
     g.freeLvalTemps2(bC)
@@ -5809,14 +5914,14 @@ proc emitMemLoad2(g: var CodeGen; c: Cursor; dest: var Location; late = false) =
     if isPtrType(cty): bindSlot = g.exprSlot(c)
     if not late and res.isTemp and not g.rb.isBoundTemp(res.r):
       g.bindTemp(res.r, bindSlot)                       # bind first: a global base leas &g
-    g.prematLval2(c, hint = (if late: NoReg else: res.r))  # into res before the (mem …) tree
+    g.prematLval2(c, hint = (if late: NoReg else: res.r), foldDisp = true)  # into res before the (mem …) tree
     if late:
       res = regLoc(g.pickStaging("a late memory-load address", stmtPos = true),
                    bindSlot, isTemp = true)
       g.bindTemp(res.r, bindSlot)
     g.ab.tree MovX64:
       g.emReg res.r
-      g.ab.tree MemX: g.emLvalAddr2(c)
+      g.emMemLval2(c)
     g.unbindLvalTemps2(c)                               # release staging/stride
   g.freeLvalTemps2(c)                                   # release the picked embedded temps
   dest = res
@@ -6893,11 +6998,11 @@ proc emitFValue2(g: var CodeGen; c: Cursor; dest: var Location) =
           g.produceIntoFMem2(c, dest); return
       let bits = if dest.typ.size == 4: 32 else: 64
       g.emitLvalue2(c)                                   # pick embedded base/index
-      g.prematLval2(c)
+      g.prematLval2(c, foldDisp = true)
       if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f)
       g.ab.tree (if bits == 32: MovssX64 else: MovsdX64):
         g.emFReg dest.f
-        g.ab.tree MemX: g.emLvalAddr2(c)
+        g.emMemLval2(c)
       g.unbindLvalTemps2(c)
       g.freeLvalTemps2(c)
     of SufC, ParC:
