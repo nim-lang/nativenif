@@ -350,7 +350,7 @@ type
   NifasmExpr* = enum
     NoExpr
     AlignX = (ord(AlignTagId), "align")  ## stack-slot alignment annotation (child of `(s)`)
-    SsizeX = (ord(SsizeTagId), "ssize")  ## stack size expression
+    SsizeX = (ord(SsizeTagId), "ssize")  ## stack size expression; the optional `N` adds N bytes at THIS site only (the prologue folds its 16-alignment pad in)
     CsizeX = (ord(CsizeTagId), "csize")  ## call stack size expression
     ArgX = (ord(ArgTagId), "arg")  ## argument reference in prepare block
     ResX = (ord(ResTagId), "res")  ## result reference in prepare block

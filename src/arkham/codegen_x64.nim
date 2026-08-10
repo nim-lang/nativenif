@@ -2234,13 +2234,37 @@ proc framePush(g: var CodeGen) =
   for r in g.frameRegs:
     g.ab.tree PushX64: g.ab.reg r                          # raw push
 
-proc framePop(g: var CodeGen) =
-  # Release the nifasm-managed `(s)` slot region first (reverse of the prologue,
-  # which lowered rsp by the pad then the `(ssize)` block), then the alignment pad
-  # and the callee-saved registers.
+proc emitFrameSub(g: var CodeGen) =
+  ## Lower rsp by the `(s)` slot region PLUS the 16-alignment pad, in ONE
+  ## instruction. `(ssize N)` tells nifasm — which is what sizes and aligns the
+  ## slot region — to add N to the frame size at this site.
+  ##
+  ## These used to be two instructions, `sub rsp, 8` then `sub rsp, (ssize)`, with
+  ## the matching pair on the way out. 177 of nifbench's 442 procs emit both (the
+  ## pad is needed exactly when the pushes leave rsp at 8 mod 16), so the redundant
+  ## half cost 107 M instructions — 1.2 % of the whole program — for an addition.
   if g.ra.hasStackVars:
-    g.ab.tree AddX64: g.ab.reg RSP; g.ab.keyword SsizeX
-  if g.framePad > 0: g.binImm(AddX64, RSP, g.framePad.int64)
+    g.ab.tree SubX64:
+      g.ab.reg RSP
+      g.ab.tree SsizeX:
+        if g.framePad > 0: g.ab.intLit g.framePad.int64
+  elif g.framePad > 0:
+    g.binImm(SubX64, RSP, g.framePad.int64)
+
+proc emitFrameAdd(g: var CodeGen) =
+  ## Exact mirror of `emitFrameSub`.
+  if g.ra.hasStackVars:
+    g.ab.tree AddX64:
+      g.ab.reg RSP
+      g.ab.tree SsizeX:
+        if g.framePad > 0: g.ab.intLit g.framePad.int64
+  elif g.framePad > 0:
+    g.binImm(AddX64, RSP, g.framePad.int64)
+
+proc framePop(g: var CodeGen) =
+  # Release the frame (slot region + alignment pad) first, then the callee-saved
+  # registers — reverse of the prologue.
+  g.emitFrameAdd()
   for i in countdown(g.frameRegs.high, 0):
     g.ab.tree PopX64: g.ab.reg g.frameRegs[i]             # raw pop, reverse order
 
@@ -7131,9 +7155,7 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
         g.ab.tree AddX64:
           g.ab.reg g.stackArgBaseReg
           g.ab.intLit g.framePushBytesX64().int64
-      if g.framePad > 0: g.binImm(SubX64, RSP, g.framePad.int64)
-      if g.ra.hasStackVars:
-        g.ab.tree SubX64: (g.ab.reg RSP; g.ab.keyword SsizeX)
+      g.emitFrameSub()
       # Declare the totality spill slots (`etmp`/`eftmp`/`held`) — minted INLINE
       # during body emission (`takeTmp` exhaustion), which is why this loop runs
       # here, in the prologue that is written AFTER the body. A pointer slot
@@ -7812,9 +7834,7 @@ proc genAsmProc(g: var CodeGen; info: ProcInfo) =
     g.ab.tree StmtsX64:
       g.enterScope()
       g.framePush()
-      if g.framePad > 0: g.binImm(SubX64, RSP, g.framePad.int64)
-      if g.ra.hasStackVars:
-        g.ab.tree SubX64: (g.ab.reg RSP; g.ab.keyword SsizeX)
+      g.emitFrameSub()
       g.retLabel2 = g.freshLabel()
       g.retLabelUsed2 = false
       var c = info.decl

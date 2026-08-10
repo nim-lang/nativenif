@@ -421,7 +421,7 @@ type
                         # call-safety guarantee. Cleared when the register is rewritten;
                         # merged across `ite` branches.
     slots: SlotManager
-    ssizePatches: seq[int]
+    ssizePatches: seq[tuple[pos: int; pad: int]]
     reservedArgArea: int          # AArch64 fixed-frame: bytes reserved at the frame bottom
                                   # for the largest outgoing stack-argument area (see
                                   # scanStackArgArea). Locals sit above it; the caller writes
@@ -1867,9 +1867,17 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
           else:
             result.typ = Type(kind: IntT, bits: 64)
     elif t == SsizeTagId:
+      # `(ssize)` is the frame size, filled in at `finalize` once every `(s)` slot is
+      # allocated. The optional `(ssize N)` adds N bytes to THIS site only — the
+      # prologue/epilogue use it to fold the 16-byte alignment pad into the frame
+      # adjustment instead of emitting a second `sub rsp, 8` / `add rsp, 8`.
       result.kind = okSsize
       result.typ = Type(kind: IntT, bits: 64)
+      result.immVal = 0
       inc n
+      if n.kind == IntLit:
+        result.immVal = n.intVal
+        inc n
     elif t == CsizeTagId:
       # (csize) - total bytes reserved for outgoing stack arguments
       if not ctx.inCall:
@@ -2760,7 +2768,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     else:
       if op.kind == okSsize:
         arm64.emitMovImm(ctx.buf.data, dest.reg, 0'u16)
-        ctx.ssizePatches.add(ctx.buf.data.len - 4)
+        ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
       elif op.kind == okImm:
         if op.immVal >= 0 and op.immVal <= 0xFFFF:
           arm64.emitMovImm(ctx.buf.data, dest.reg, uint16(op.immVal))
@@ -2900,9 +2908,9 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
         # out as `sub sp, sp, #2000`, leaving every local access off the end of the
         # stack — an ASLR-dependent crash). The patcher fills each half; see `finalize`.
         arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, 0'u16)
-        ctx.ssizePatches.add(ctx.buf.data.len - 4)
+        ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
         arm64.emitAddImmShifted12(ctx.buf.data, dest.reg, dest.reg, 0'u16)
-        ctx.ssizePatches.add(ctx.buf.data.len - 4)
+        ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
       elif op.kind == okImm or op.kind == okCsize:
         if op.immVal >= 0 and op.immVal <= 4095:
           arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.immVal))
@@ -2930,9 +2938,9 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     else:
       if op.kind == okSsize:
         arm64.emitSubImm(ctx.buf.data, dest.reg, dest.reg, 0'u16)   # lo12 (see AddA64)
-        ctx.ssizePatches.add(ctx.buf.data.len - 4)
+        ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
         arm64.emitSubImmShifted12(ctx.buf.data, dest.reg, dest.reg, 0'u16)  # hi12
-        ctx.ssizePatches.add(ctx.buf.data.len - 4)
+        ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
       elif op.kind == okImm or op.kind == okCsize:
         if op.immVal >= 0 and op.immVal <= 4095:
           arm64.emitSubImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.immVal))
@@ -3814,8 +3822,12 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   let peakStackSize = max(ctx.slots.stackSize, ctx.slots.maxStackSize)
   let alignedStackSize = (peakStackSize + 15) and not 15
   let isA64 = ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64}
-  let v = uint32(alignedStackSize)
-  for pos in ctx.ssizePatches:
+  for (pos, pad) in ctx.ssizePatches:
+    # `pad` is the caller-supplied alignment correction from `(ssize N)`: the frame
+    # `sub`/`add` folds the 16-alignment pad into the SAME instruction instead of
+    # emitting a second `sub rsp, 8` / `add rsp, 8` around it. `alignedStackSize` is
+    # 16-aligned, so `+ pad` lands the frame exactly where the separate pair did.
+    let v = uint32(alignedStackSize + pad)
     if pos + 4 > ctx.buf.data.len: continue
     if isA64:
       var instr = uint32(ctx.buf.data[pos]) or (uint32(ctx.buf.data[pos+1]) shl 8) or
@@ -4291,9 +4303,17 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
           else:
             result.typ = Type(kind: IntT, bits: 64)
     elif t == SsizeTagId:
+      # `(ssize)` is the frame size, filled in at `finalize` once every `(s)` slot is
+      # allocated. The optional `(ssize N)` adds N bytes to THIS site only — the
+      # prologue/epilogue use it to fold the 16-byte alignment pad into the frame
+      # adjustment instead of emitting a second `sub rsp, 8` / `add rsp, 8`.
       result.kind = okSsize
       result.typ = Type(kind: IntT, bits: 64)
+      result.immVal = 0
       inc n
+      if n.kind == IntLit:
+        result.immVal = n.intVal
+        inc n
     elif t == CsizeTagId:
       # (csize) - call stack argument size
       if not ctx.inCall:
@@ -4978,7 +4998,7 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
     # dest is reg
     if op.kind == okSsize:
       x86.emitMovImmToReg32(ctx.buf.data, dest.reg, 0)
-      ctx.ssizePatches.add(ctx.buf.data.len - 4)
+      ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
     elif op.kind == okCsize:
       # csize is a known value - the stack argument size for the current call
       x86.emitMovImmToReg32(ctx.buf.data, dest.reg, int32(op.immVal))
@@ -5309,7 +5329,7 @@ proc shiftCodePositions(ctx: var GenContext; at, by: int) =
   for k in 0 ..< ctx.gvarSites.len:
     if ctx.gvarSites[k][0] >= at: ctx.gvarSites[k] = (ctx.gvarSites[k][0] + by, ctx.gvarSites[k][1])
   for k in 0 ..< ctx.ssizePatches.len:
-    if ctx.ssizePatches[k] >= at: ctx.ssizePatches[k] += by
+    if ctx.ssizePatches[k].pos >= at: ctx.ssizePatches[k].pos += by
   for k in 0 ..< ctx.csizePatches.len:
     if ctx.csizePatches[k][0] >= at: ctx.csizePatches[k] = (ctx.csizePatches[k][0] + by, ctx.csizePatches[k][1])
   for k in 0 ..< ctx.tlvSites.len:
@@ -5522,7 +5542,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     else:
       if op.kind == okSsize:
         x86.emitAddImm(ctx.buf.data, dest.reg, 0)
-        ctx.ssizePatches.add(ctx.buf.data.len - 4)
+        ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
       elif op.kind == okCsize:
         x86.emitAddImm(ctx.buf.data, dest.reg, int32(op.immVal))
       elif op.kind == okImm:
@@ -5554,7 +5574,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     else:
       if op.kind == okSsize:
         x86.emitSubImm(ctx.buf.data, dest.reg, 0)
-        ctx.ssizePatches.add(ctx.buf.data.len - 4)
+        ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
       elif op.kind == okCsize:
         x86.emitSubImm(ctx.buf.data, dest.reg, int32(op.immVal))
       elif op.kind == okImm:

@@ -21,7 +21,7 @@
 | `(arch x64/arm64)`     | NifasmDecl                  | architecture pragma |
 | `(s)`                  | X64Flag                 | stack slot location tag |
 | `(align N)`            | NifasmExpr                  | stack-slot alignment annotation (child of `(s)`) |
-| `(ssize)`              | NifasmExpr                  | stack size expression |
+| `(ssize)` / `(ssize N)` | NifasmExpr                 | stack size expression; the optional `N` adds N bytes at THIS site only (the prologue folds its 16-alignment pad in) |
 | `(csize)`              | NifasmExpr                  | call stack size expression |
 | `(arg S)`              | NifasmExpr                  | argument reference in prepare block |
 | `(res S)`              | NifasmExpr                  | result reference in prepare block |
