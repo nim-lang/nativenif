@@ -173,6 +173,40 @@ proc emitMovToMemSized*(dest: var Bytes; mem: MemoryOperand; reg: Register; bits
   dest.add(if bits == 8: 0x88 else: 0x89)       # MOV r/m8,r8  /  MOV r/m(16|32),r
   dest.emitMem(int(reg), mem)
 
+proc emitRegExt*(dest: var Bytes; d, s: Register; bits: int; signed: bool) =
+  ## `d = extend(low `bits` of `s`)` into the full 64-bit `d` — the register-source
+  ## twin of `emitLoadExt`, same opcodes with a register-direct ModR/M.
+  ##
+  ## The alternative arkham used before this existed is `shl #(64-bits); shr|sar
+  ## #(64-bits)` on the destination: two instructions and 8 bytes where these are
+  ## one and three or four.
+  if bits >= 64:
+    emitMov(dest, d, s); return
+  if bits == 32 and not signed:
+    # MOV r32, r/m32 zero-extends into the full 64-bit register (no REX.W). Note
+    # this is the ONLY case that is not a 0F-escaped opcode.
+    var rex = RexPrefix(w: false)
+    if needsRex(s): rex.r = true
+    if needsRex(d): rex.b = true
+    if rex.r or rex.b: dest.add(encodeRex(rex))
+    dest.add(0x89)                                # MOV r/m32, r32
+    dest.add(encodeModRM(amDirect, int(s), int(d)))
+    return
+  var rex = RexPrefix(w: true)                    # extend into the 64-bit destination
+  if needsRex(d): rex.r = true                    # `reg` field is the DESTINATION here
+  if needsRex(s): rex.b = true                    # `r/m` field is the SOURCE
+  dest.add(encodeRex(rex))
+  # A byte source in SPL/BPL/SIL/DIL (regs 4..7) needs the REX prefix to select the
+  # low byte rather than AH/CH/DH/BH — REX.W above already guarantees one is emitted.
+  if bits == 32:                                  # MOVSXD r64, r/m32 (signed dword)
+    dest.add(0x63)
+  else:                                           # MOVSX/MOVZX r64, r/m(8|16)
+    dest.add(0x0F)
+    dest.add(byte(
+      if bits == 8: (if signed: 0xBE else: 0xB6)
+      else:         (if signed: 0xBF else: 0xB7)))
+  dest.add(encodeModRM(amDirect, int(d), int(s)))
+
 proc emitLoadExt*(dest: var Bytes; reg: Register; mem: MemoryOperand; bits: int; signed: bool) =
   ## Load `bits` from `mem` into the full 64-bit `reg`, sign- or zero-extended.
   if bits >= 64:

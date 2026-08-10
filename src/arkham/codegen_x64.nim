@@ -234,14 +234,28 @@ proc binImm(g: var CodeGen; op: X64Inst; d: Reg; v: int64) =  # d op= imm
 
 proc extendTo(g: var CodeGen; dest: Reg; width: int; signed: bool) =
   ## Normalize the low `width` bits of `dest` to its full 64-bit register form
-  ## (sign- or zero-extended). No-op for 64-bit. Done with the `shl #(64-w);
-  ## sar|shr #(64-w)` shift pair (immediate shifts), matching the A64 backend —
-  ## arkham keeps every scalar 64-bit-wide in a register, so widths are normalized
-  ## explicitly rather than relying on sized loads.
+  ## (sign- or zero-extended). No-op for 64-bit. arkham keeps every scalar
+  ## 64-bit-wide in a register, so widths are normalized explicitly rather than
+  ## relying on sized loads.
+  ##
+  ## 8/16/32 go through `movzx`/`movsx`, which is exactly this operation in ONE
+  ## instruction (3-4 bytes). The generic `shl #(64-w); sar|shr #(64-w)` pair is
+  ## kept only for the widths x86 has no extension form for — nothing emits those
+  ## today, but the fallback keeps the helper total.
   if width <= 0 or width >= 64: return
+  if width in {8, 16, 32}:
+    g.ab.tree (if signed: MovsxX64 else: MovzxX64):
+      g.emReg dest; g.emReg dest; g.ab.intLit int64(width)
+    return
   let sh = int64(64 - width)
   g.binImm(ShlX64, dest, sh)
   g.binImm(if signed: SarX64 else: ShrX64, dest, sh)
+
+proc cmpZero(g: var CodeGen; r: Reg) =
+  ## `cmp r, 0` as `test r, r`: 3 bytes instead of 7, and every flag is identical
+  ## (both clear CF/OF and set ZF/SF/PF from the same value), so it is valid under
+  ## any condition code. 2326 sites in a self-hosted image.
+  g.binReg(TestX64, r, r)
 
 
 proc flushArgResidentParams(g: var CodeGen) =
@@ -1417,7 +1431,7 @@ proc genMemIntrinBody(g: var CodeGen; builtin: string) =
     # backward: i = n; while i != 0: i -= 1; dst[i] = src[i]
     g.movReg(RCX, RDX)                         # i = n
     g.emitLoop:
-      g.ab.tree CmpX64: (g.emReg RCX; g.ab.intLit 0)
+      g.cmpZero RCX
       g.emJcc(JeX64, done)
       g.binImm(SubX64, RCX, 1)
       g.emLoadByte(RAX, RSI, RCX)
@@ -2045,9 +2059,19 @@ proc emitSignature(g: var CodeGen; decl: Cursor) =
   else:
     g.ab.keyword ParamsD
     g.ab.keyword ResultD
-  # `numIncomingArgRegs` (not the param *count*) — it accounts for an aggregate
-  # spanning several GPRs and a float consuming none.
-  g.emitAbiClobber(g.numIncomingArgRegs(decl))
+  if declIsNoReturn(decl):
+    # A diverging callee (`panic`, `raiseAssert`, the bound-check failure path) returns
+    # to nobody, so NO caller can observe what it destroyed. The clobber list exists to
+    # tell nifasm which registers a call site must treat as dead afterwards — and there
+    # is no afterwards. Declaring the volatile set anyway is what forced every proc
+    # containing a cold guard to home its live values in callee-saved registers and push
+    # them in the prologue: `nifcore.kind` paid three pushes, three pops and a frame for
+    # one `assert`.
+    g.ab.tree ClobberD: discard
+  else:
+    # `numIncomingArgRegs` (not the param *count*) — it accounts for an aggregate
+    # spanning several GPRs and a float consuming none.
+    g.emitAbiClobber(g.numIncomingArgRegs(decl))
 
 proc emitParamMoves(g: var CodeGen; decl: Cursor) =
   ## Settle each register-passed parameter into its allocated home. A param the
@@ -5473,7 +5497,12 @@ proc emitScalarCmpE(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
   else:
     case bLoc.kind
     of Imm:
-      g.ab.tree CmpX64: (g.emReg aLoc.r; g.emImm(bLoc))
+      # `cmp r, 0` is `test r, r` — same flags, 3 bytes instead of 7. A nil literal
+      # is an Imm too but is emitted as `(nil)`, so exclude it explicitly.
+      if not isNilImm(bLoc) and bLoc.ival == 0:
+        g.cmpZero aLoc.r
+      else:
+        g.ab.tree CmpX64: (g.emReg aLoc.r; g.emImm(bLoc))
     of InReg:
       g.ab.tree CmpX64: (g.emReg aLoc.r; g.emReg bLoc.r)
     of NamedStack:                                     # spilled scalar: cmp reg, [rsp+slot]
@@ -5602,14 +5631,14 @@ proc emitCondE(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
     var v = needsReg(ScalarSlot)
     g.emitValue2(c, v)
     if v.kind == InReg:
-      g.ab.tree CmpX64: (g.emReg v.r; g.ab.intLit 0)
+      g.cmpZero v.r
       g.emJcc(if whenTrue: JneX64 else: JeX64, toLabel)
       g.freeVal(v)
     else:
       # a pool-dry etmp bool value: load it staged, compare against zero.
       let s = g.pickStagingSealed("a bool cond operand", v.typ)
       g.emitLoadLoc(v, s)
-      g.ab.tree CmpX64: (g.emReg s; g.ab.intLit 0)
+      g.cmpZero s
       g.emJcc(if whenTrue: JneX64 else: JeX64, toLabel)
       g.giveBack s
 
@@ -5888,7 +5917,7 @@ proc fcvtU2F(g: var CodeGen; d: FReg; s: Reg; bits: int) =
   ## `s` is only READ: it may be a live local's home register.
   let lBig = g.freshLabel()
   let lDone = g.freshLabel()
-  g.ab.tree CmpX64: (g.emReg s; g.ab.intLit 0)
+  g.cmpZero s
   g.emJcc(JlX64, lBig)                             # bit 63 set ⇒ ≥ 2^63 unsigned
   g.fcvtI2F(d, s, bits)
   g.emJmp lDone
@@ -5905,6 +5934,56 @@ proc fcvtU2F(g: var CodeGen; d: FReg; s: Reg; bits: int) =
   g.giveBack odd
   g.giveBack half
   g.emLab lDone
+
+proc arrivesNormalized(g: var CodeGen; src: Cursor; width: int; signed: bool): bool =
+  ## True when emitting `src` into a register ALREADY leaves the canonical 64-bit
+  ## form for (`width`, `signed`) — so the `extendTo` a conversion would append is
+  ## dead code. `extendTo` costs a `shl`/`shr` PAIR, and `nifcore.kind` carried two
+  ## of them (4 of its 14 instructions) around a body that is a load and a mask.
+  ##
+  ## Deliberately syntactic and deliberately narrow: it claims a fact only where
+  ## the fact is established by the very next instruction nifasm emits, never from
+  ## a whole-function invariant.
+  if width <= 0 or width >= 64: return false
+  # 1. The source's own scalar type ALREADY is (width, signed). arkham keeps every
+  #    sub-64-bit scalar normalized to its type's width in a register — that is the
+  #    invariant `normalizeBinWidth` restores after `add`/`sub`/`mul`/`shl` and that
+  #    it relies on when it skips the fixup for `and`/`or`/`xor`/`shr`. Re-extending
+  #    to a width the value already has is a pure no-op. `srcWidthSigned` answers
+  #    (64, true) for anything it cannot classify, and 64 never equals `width` here,
+  #    so an unknown source is excluded rather than assumed.
+  let (sw, ss) = g.srcWidthSigned(src)
+  if sw == width and ss == signed: return true
+  var c = src
+  case c.exprKind
+  of DerefC:
+    # A typed pointer deref becomes `(mem …)` whose type is the POINTEE, and
+    # nifasm sizes the load from it (`intMemAccess` → `emitLoadExt`): a sub-word
+    # integer is loaded sign-/zero-extending, a 4-byte one with a 32-bit `mov`
+    # that zeroes the upper half. So the value arrives already extended.
+    #
+    # ONLY a genuine deref: a stack SLOT operand carries `StackOffT`, which
+    # `intMemAccess` reads as a full 64-bit access — nothing is extended there.
+    let sl = typeToSlot(resolveType(g.prog, g.getType(c)))
+    result = sl.kind in {AInt, AUInt, ABool} and sl.size * 8 == width and
+             (sl.kind == AInt) == signed
+  of BitandC:
+    # `x and M` for a non-negative literal mask M < 2^width is bounded by M, hence
+    # already zero-extended. (Signed targets are excluded: a mask says nothing
+    # about sign extension.)
+    if signed: return false
+    var t = c
+    t.into:
+      skip t                                    # the result type
+      while t.hasMore:
+        var lit = t                             # a literal arrives `(suf 15u "u32")`
+        if lit.exprKind == SufC:
+          lit = sub(lit)
+        if lit.kind == IntLit or lit.kind == UIntLit:
+          let m = (if lit.kind == IntLit: intVal(lit) else: cast[int64](uintVal(lit)))
+          if m >= 0 and m < (1'i64 shl width): result = true
+        skip t
+  else: result = false
 
 proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED `(conv|cast Type inner)`. Decisions inline (allocValue CastC/ConvC):
@@ -6053,9 +6132,13 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
   else:
     let targetW = intTypeWidth(tc)
     if srcW < targetW:
-      g.extendTo(res2.r, srcW, signed = (not isCast) and srcSigned)   # widen
+      let sgn = (not isCast) and srcSigned
+      if not g.arrivesNormalized(inner, srcW, sgn):
+        g.extendTo(res2.r, srcW, sgn)                                 # widen
     else:
-      g.extendTo(res2.r, targetW, signed = isSignedType(tc))          # narrow / equal
+      let sgn = isSignedType(tc)
+      if not g.arrivesNormalized(inner, targetW, sgn):
+        g.extendTo(res2.r, targetW, sgn)                              # narrow / equal
 proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false) =
   ## FUSED call. allocCall's placement decisions run inline: each scalar arg
   ## dest-threads straight into its ABI register (or a parked callee-saved
@@ -7760,10 +7843,12 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   # accesses must NOT mark the proc non-leaf. Hence the empty tvar set here.
   if not g.cleanSigComputed:                   # compute the clean-signature set once
     g.cleanSigProcs = cleanSigProcNames(g.prog)
+    g.noReturnProcs = noReturnProcs(g.prog)
     g.cleanSigComputed = true
   let an = analyseProc(g.buf[], info.decl,
                        cleanCallees = g.cleanSigProcs,
-                       procIsClean = isCleanSigProc(g.prog, info.decl))
+                       procIsClean = isCleanSigProc(g.prog, info.decl),
+                       noReturnCallees = g.noReturnProcs)
   g.varType.clear()                           # reuse the backing storage across procs
   g.symType.clear()
   g.retAggrName = ""; g.retIndirect = false; g.retIsFloat = false

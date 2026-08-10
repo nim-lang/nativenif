@@ -5870,13 +5870,42 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       else:
         x86.emitCmp(ctx.buf.data, dest.reg, op.reg)
 
+  # Width extension: `(movzx D S N)` / `(movsx D S N)`. Three-address like the a64
+  # `(clz D S N)` — `N` (8/16/32) is the SOURCE width, given explicitly because the
+  # declared type of a register says nothing about how many of its bits are the
+  # value. The register-source counterpart of the sized load `(mov D (mem …))`
+  # already performs.
+  of MovzxX64, MovsxX64:
+    let mnemonic = $instTag
+    let signed = instTag == MovsxX64
+    inc n
+    let dest = parseDest(n, ctx)
+    let op = parseOperand(n, ctx)
+    # `checkComparable` for the same reason as `test`: a bool IS an 8-bit value a
+    # zero-extension is meaningful on, and `canDoBitwiseOps` excludes it.
+    checkComparable(dest.typ, mnemonic, start)
+    checkComparable(op.typ, mnemonic, start)
+    if dest.kind != okReg: error(mnemonic & " destination must be a register", n)
+    if op.kind != okReg: error(mnemonic & " source must be a register", n)
+    if n.kind != IntLit: error(mnemonic & " requires a width operand (8, 16 or 32)", n)
+    let bits = int(getInt(n)); inc n
+    if bits notin {8, 16, 32}: error(mnemonic & " width must be 8, 16 or 32", n)
+    x86.emitRegExt(ctx.buf.data, dest.reg, op.reg, bits, signed)
+    # The destination is freshly written, so an earlier call's clobber no longer
+    # applies — same rule as `mov`/`lea` (see genMovX64).
+    ctx.clobbered.excl(dest.reg)
+
   of TestX64:
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    checkBitwiseType(dest.typ, "test", start)
-    checkBitwiseType(op.typ, "test", start)
-    checkCompatibleTypes(dest.typ, op.typ, "test", start)
+    # `checkComparable`, not `checkBitwiseType`: `test r, r` is the canonical
+    # zero-test and so has exactly `cmp`'s operand domain — a bool ("is this flag
+    # set") and a pointer ("is this nil") are both legitimate, and `cmp x, 0`
+    # already accepts them. `test` only reads its operands to set flags.
+    checkComparable(dest.typ, "test", start)
+    checkComparable(op.typ, "test", start)
+    checkCmpCompatible(dest.typ, op.typ, start)
     if dest.kind == okMem:
       error("TEST memory not supported yet", n)
     elif op.kind == okImm:

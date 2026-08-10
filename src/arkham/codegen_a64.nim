@@ -1279,7 +1279,11 @@ proc emitSignature(g: var CodeGen; decl: Cursor; declarative: bool) =
     g.ab.keyword ParamsD
     g.ab.keyword ResultD
   g.ab.tree ClobberD:
-    for r in ConvClobbersGpr: g.ab.reg r     # a clobber *declaration*: raw reg locations
+    # A diverging callee returns to nobody, so no caller can observe what it
+    # destroyed — declaring clobbers only forces every proc with a cold guard onto
+    # callee-saved homes. See the x64 twin in `emitSignature`.
+    if not declIsNoReturn(decl):
+      for r in ConvClobbersGpr: g.ab.reg r   # a clobber *declaration*: raw reg locations
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Fused value core (`*2`) — the AArch64 twin of codegen_x64.nim's emit*2
@@ -5132,10 +5136,12 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
               "backend yet; its register pins name x86-64 registers", lengInfo(info.decl)
   if not g.cleanSigComputed:                   # compute the clean-signature set once
     g.cleanSigProcs = cleanSigProcNames(g.prog)
+    g.noReturnProcs = noReturnProcs(g.prog)
     g.cleanSigComputed = true
   let an = analyseProc(g.buf[], info.decl, g.tvarNames,
                        cleanCallees = g.cleanSigProcs,
-                       procIsClean = isCleanSigProc(g.prog, info.decl))
+                       procIsClean = isCleanSigProc(g.prog, info.decl),
+                       noReturnCallees = g.noReturnProcs)
   g.varType.clear()
   g.symType.clear()
   g.retAggrName = ""; g.retIndirect = false; g.retIsFloat = false

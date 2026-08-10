@@ -164,6 +164,9 @@ type
                                              ## (all-scalar-GPR params, non-aggregate result);
                                              ## a same-position param arg to one is a self-move.
                                              ## Computed once (see `cleanSigComputed`).
+    noReturnProcs*: HashSet[SymId]           ## pool ids of called `(attr "noreturn")` procs;
+                                             ## a call to one is not a liveness call point.
+                                             ## Computed once, alongside `cleanSigProcs`.
     cleanSigComputed*: bool
     savedHomes*: Table[int, Location]        ## value-core pure path: a deref/at/pat base or
                                              ## index left in its stack home by the allocator is
