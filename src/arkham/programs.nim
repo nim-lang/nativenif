@@ -1390,5 +1390,30 @@ proc constFold*(p: var Program; c: Cursor): (bool, int64) =
           v = (if c.exprKind == DivC: ua div ub else: ua mod ub)
       else: return (false, 0)
       return (true, cast[int64](maskToWidth(v, bits, signed)))
+    of ConvC, CastC:
+      # `(conv T x)` / `(cast T x)` over a constant is a constant — the width
+      # change IS the operation, so apply it (`maskToWidth` truncates and
+      # re-sign-extends exactly as the runtime `movsx`/`movzx` pair would).
+      # Without this the folder refuses one node too early and the whole
+      # enclosing expression falls back to a runtime tree: hexer wraps literal
+      # operands in `(conv …)` routinely, so `uint(1) * uint(sizeof(NifToken))`
+      # — the address arithmetic behind every `peekAhead`-shaped index — came
+      # out as `mov r,1` + `imul r,r,4` instead of the immediate 4, and the two
+      # extra temps it needed pushed a callee-saved register into the prologue.
+      # A non-integer target (a pointer cast, a float) is not our business.
+      var t = c; inc t                          # → target type
+      if t.kind != TagLit: return (false, 0)
+      var bits = 64
+      var signed = true
+      case t.typeKind
+      of IT: bits = typeBits(t)
+      of UT: (signed = false; bits = typeBits(t))
+      of CT: (signed = false; bits = max(8, typeBits(t)))
+      else: return (false, 0)
+      if bits <= 0: bits = 64                   # `(i -1)` platform int
+      skip t                                    # → the value
+      let (ok, v) = constFold(p, t)
+      if not ok: return (false, 0)
+      return (true, cast[int64](maskToWidth(cast[uint64](v), bits, signed)))
     else: return (false, 0)
   else: return (false, 0)
