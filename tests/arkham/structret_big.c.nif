@@ -9,7 +9,7 @@
     (i 64))
    (fld :z.0 .
     (i 64))))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -35,7 +35,7 @@
   (stmts
    (var :v.0 . Vec3.0
     (call mk.0))
-   (call exit.c
+   (call exit.0
     (add
      (i 64)
      (dot v.0 x.0)

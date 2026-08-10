@@ -1,0 +1,215 @@
+(.nif27)
+(.indexat 2705             )
+(stmts
+ (arch arm64)
+ (imp "/usr/lib/libSystem.B.dylib")
+ (extproc :exit.c. "_exit")
+ (proc :main.0
+  (params)
+  (result :ret.0
+   (x0)
+   (i 32))
+  (clobber
+   (x0)
+   (x1)
+   (x2)
+   (x3)
+   (x4)
+   (x5)
+   (x6)
+   (x7)
+   (x8)
+   (x9)
+   (x10)
+   (x11)
+   (x12)
+   (x13)
+   (x14)
+   (x15))
+  (stmts
+   (stp
+    (x29)
+    (x30)
+    (sp)-16)
+   (stp
+    (x19)
+    (x20)
+    (sp)-16)
+   (sub
+    (sp)
+    (ssize))
+   (var :a.0
+    (s
+     (align 16))
+    (array
+     (i 64)600))
+   (var :b.0
+    (s
+     (align 16))
+    (array
+     (i 64)600))
+   (rebind :tmp0.0
+    (i 64)
+    (x9))
+   (mov tmp0.0 5)
+   (mov
+    (mem
+     (at a.0 0))tmp0.0)
+   (kill tmp0.0)
+   (rebind :tmp1.0
+    (i 64)
+    (x9))
+   (mov tmp1.0 7)
+   (mov
+    (mem
+     (at a.0 299))tmp1.0)
+   (kill tmp1.0)
+   (rebind :tmp2.0
+    (i 64)
+    (x9))
+   (mov tmp2.0 9)
+   (mov
+    (mem
+     (at a.0 599))tmp2.0)
+   (kill tmp2.0)
+   (rebind :tmp3.0
+    (i 64)
+    (x9))
+   (mov tmp3.0 1)
+   (mov
+    (mem
+     (at b.0 0))tmp3.0)
+   (kill tmp3.0)
+   (rebind :tmp4.0
+    (i 64)
+    (x9))
+   (mov tmp4.0 2)
+   (mov
+    (mem
+     (at b.0 599))tmp4.0)
+   (kill tmp4.0)
+   (var :i.0
+    (x19)
+    (i 64))
+   (mov i.0 599)
+   (var :s.0
+    (x20)
+    (i 64))
+   (prepare take.0
+    (mov
+     (x0)
+     (mem
+      (at a.0 299)))
+    (rebind :tmp5.0
+     (i 64)
+     (x9))
+    (mov tmp5.0
+     (mem
+      (at a.0 i.0)))
+    (add
+     (x0)tmp5.0)
+    (kill tmp5.0)
+    (rebind :tmp6.0
+     (i 64)
+     (x14))
+    (mov tmp6.0
+     (mem
+      (at a.0 0)))
+    (add
+     (x0)tmp6.0)
+    (kill tmp6.0)
+    (mov
+     (arg p0.0)
+     (x0))
+    (call)
+    (mov
+     (x0)
+     (res ret.0)))
+   (mov s.0
+    (x0))
+   (cmp s.0 21)
+   (beq L2.0)
+   (mov
+    (x0)11)
+   (prepare exit.c.
+    (extcall))
+   (b L1.0)
+   (lab :L2.0)
+   (lab :L1.0)
+   (mov s.0
+    (mem
+     (at b.0 0)))
+   (rebind :tmp7.0
+    (i 64)
+    (x9))
+   (mov tmp7.0
+    (mem
+     (at b.0 i.0)))
+   (rebind :s.0
+    (i 64)
+    (x20))
+   (add s.0 tmp7.0)
+   (kill tmp7.0)
+   (cmp s.0 3)
+   (beq L4.0)
+   (mov
+    (x0)12)
+   (prepare exit.c.
+    (extcall))
+   (b L3.0)
+   (lab :L4.0)
+   (lab :L3.0)
+   (mov
+    (x0)42)
+   (prepare exit.c.
+    (extcall))
+   (kill i.0)
+   (kill s.0)
+   (add
+    (sp)
+    (ssize))
+   (ldp
+    (x19)
+    (x20)
+    (sp)16)
+   (ldp
+    (x29)
+    (x30)
+    (sp)16)
+   (ret)))
+ (proc :take.0
+  (params
+   (param :p0.0
+    (x0)
+    (i 64)))
+  (result :ret.0
+   (x0)
+   (i 64))
+  (clobber
+   (x0)
+   (x1)
+   (x2)
+   (x3)
+   (x4)
+   (x5)
+   (x6)
+   (x7)
+   (x8)
+   (x9)
+   (x10)
+   (x11)
+   (x12)
+   (x13)
+   (x14)
+   (x15))
+  (stmts
+   (sub
+    (sp)
+    (ssize))
+   (b L5.0)
+   (lab :L5.0)
+   (add
+    (sp)
+    (ssize))
+   (ret))))(.index
+ (x exit.c. 94))

@@ -1,7 +1,7 @@
 (.nif27)
 (.indexat 484              )
 (stmts
- (proc :write.c
+ (proc :write.0
   (params
    (param :fd.0 .
     (i 32))
@@ -14,7 +14,7 @@
   (pragmas
    (importc "write"))
   (stmts .))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -27,7 +27,7 @@
   (pragmas
    (exportc "main"))
   (stmts
-   (call write.c 1 "Hello World\0A" 12)
-   (call exit.c 0)
+   (call write.0 1 "Hello World\0A" 12)
+   (call exit.0 0)
    (ret 0))))(.index
  (x main.0. 334))

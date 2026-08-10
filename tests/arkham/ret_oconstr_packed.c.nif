@@ -7,7 +7,7 @@
     (i 32))
    (fld :b.0 .
     (i 32))))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -31,7 +31,7 @@
    (var :p.0 . Pair.0
     (call mk.0))
    (var :q.0 . Pair.0 p.0)
-   (call exit.c
+   (call exit.0
     (add
      (i 32)
      (dot q.0 a.0 0)

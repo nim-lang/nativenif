@@ -29,7 +29,7 @@
     (i 64))
    (fld :next.0 .
     (ptr N1.0))))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -125,6 +125,6 @@
    (asgn
     (dot n0.0 next.0 0)
     (addr n1.0))
-   (call exit.c
+   (call exit.0
     (call chain.0
      (addr n0.0)1 2 3 4 5)))))(.index)

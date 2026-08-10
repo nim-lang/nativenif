@@ -7,7 +7,7 @@
     (i 64))
    (fld :b.0 .
     (i 64))))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -48,4 +48,4 @@
      (oconstr Pair.0
       (kv a.0 1)
       (kv b.0 1))))
-   (call exit.c r.0))))(.index)
+   (call exit.0 r.0))))(.index)

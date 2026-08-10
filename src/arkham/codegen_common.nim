@@ -128,6 +128,10 @@ type
                                              ## `recordEviction` recover the decl name from the
                                              ## point-in-time binding with no `ra.locs`
                                              ## reverse scan. Populated at the param prologue.
+    tmpBindTyp*: Table[Reg, AsmSlot]         ## the `AsmSlot` each `bindTemp` bound a register
+                                             ## with. `RegBind` keeps only the name and the
+                                             ## pointer bit, and a `(rebind …)` has to name the
+                                             ## same type the register was bound with.
     curProcName*: string                     ## the proc currently being emitted. arkham's input
                                              ## carries no line info, so a bare register-pressure
                                              ## or typing assert names nothing actionable; this
@@ -149,6 +153,9 @@ type
                                              ## (all-scalar-GPR params, non-aggregate result);
                                              ## a same-position param arg to one is a self-move.
                                              ## Computed once (see `cleanSigComputed`).
+    noReturnProcs*: HashSet[SymId]           ## pool ids of called `(attr "noreturn")` procs;
+                                             ## a call to one is not a liveness call point.
+                                             ## Computed once, alongside `cleanSigProcs`.
     cleanSigComputed*: bool
     savedHomes*: Table[int, Location]        ## value-core pure path: a deref/at/pat base or
                                              ## index left in its stack home by the allocator is
@@ -932,6 +939,17 @@ proc pickTempReg*(g: var CodeGen): Reg =
       g.ra.usedCallee.incl r
       return r
   NoReg
+
+proc tempPoolDry*(g: var CodeGen): bool =
+  ## Would `pickTempReg` fail right now? Same census, no side effect — it must
+  ## not mark a callee-saved register `usedCallee` (that would add a push/pop for
+  ## a register we then decline to take). For callers that can serve a value from
+  ## its existing home and only want a temp when one is genuinely free.
+  for r in g.md.intTempRegs:
+    if regFreeForTemp(g, r): return false
+  for r in g.md.intCalleeSaved:
+    if regFreeForTemp(g, r): return false
+  true
 
 proc pickFTempReg*(g: var CodeGen): FReg =
   ## The SIMD twin of `pickTempReg`: volatile float pool first, then the

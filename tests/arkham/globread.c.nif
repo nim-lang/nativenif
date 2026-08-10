@@ -3,7 +3,7 @@
 (stmts
  (gvar :g.0 .
   (i 64)100)
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -20,4 +20,4 @@
     (i 64)
     (add
      (i 64)g.0 5))
-   (call exit.c x.0))))(.index)
+   (call exit.0 x.0))))(.index)

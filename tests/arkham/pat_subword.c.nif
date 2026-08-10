@@ -1,7 +1,7 @@
 (.nif27)
 (.indexat 773              )
 (stmts
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -52,4 +52,4 @@
     (u 64)
     (bitand
      (u 64)hi.0 255))
-   (call exit.c hb.0))))(.index)
+   (call exit.0 hb.0))))(.index)

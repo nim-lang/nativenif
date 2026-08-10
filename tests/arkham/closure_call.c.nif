@@ -16,7 +16,7 @@
    (fld :fn.0 . Clo.0)
    (fld :env.0 .
     (ptr Env.0))))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -52,4 +52,4 @@
     (call
      (dot clo.0 fn.0 0)
      (dot clo.0 env.0 0)))
-   (call exit.c r.0))))(.index)
+   (call exit.0 r.0))))(.index)

@@ -230,6 +230,19 @@ proc allocStorage(b: var Builder; name: string; slot: AsmSlot; props: VarProps):
       # option — into spills (a register-class priority inversion). Reserve callee-saved
       # for the values that can only use it.
       r = b.takeReg(b.freeVol, b.md.intLocalTempRegs)
+      # The fixed-role volatiles come BEFORE the callee-saved fallback, not after
+      # it. `ShiftRegOk`/`DivRegOk` are the same interval proof as `AllRegs` but
+      # per register — this value's life never overlaps rcx's shift-count role /
+      # rdx's div-rem role — so they are free homes, while a callee-saved register
+      # costs a push and a pop in a prologue that may run millions of times. The
+      # old order reached them only once the callee-saved pool was ALSO dry, which
+      # for a leaf proc (where every value is `AllRegs`) meant it never reached
+      # them at all: `rawLineInfo`, a leaf, pushed all six callee-saved registers
+      # while rcx and rdx sat free.
+      if r == NoReg and ShiftRegOk in props and b.md.shiftCountReg != NoReg:
+        r = b.takeReg(b.freeVol, [b.md.shiftCountReg])
+      if r == NoReg and DivRegOk in props and b.md.divRemReg != NoReg:
+        r = b.takeReg(b.freeVol, [b.md.divRemReg])
       if r == NoReg: r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
     else:
       # AArch64: prefer callee-saved first (one prologue push, then resident). Volatile-
@@ -674,7 +687,23 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
             # binding after the first call (`flushArgResidentParams`); on a64 a param in an
             # arg reg (x0–x7) is read RAW (no `regLocal` binding — see a64 `emReg`), so there
             # is no lingering binding to flush.
-            let stayInArg = ArgResident in props and not aggrByRef and not clobbered
+            # The general form of the same argument: `AllRegs` on a PARAM means the
+            # analyser proved its last use precedes the FIRST call, so no call has
+            # marshalled anything into its arg register while it is live, and the
+            # ABI partitioning design.md calls load-bearing still holds — the param
+            # is dead by the time any marshalling starts. (`ArgResident` is the older,
+            # narrower rule: it additionally allows the last use to sit *inside* the
+            # first call's own arguments, which the position test here denies.)
+            # `flushArgResidentParams` kills the lingering binding after that call,
+            # and it is already fed from `loc.r == argReg`, not from the prop.
+            # A by-ref aggregate's POINTER is excluded from `ArgResident` because it
+            # "must survive repeated field loads" — but a field load through it does
+            # not write it, so what it actually has to survive is a CALL, and
+            # `AllRegs` says there is none. Hence `aggrByRef` blocks only the older
+            # rule. (`emitParamMoves` already elides the relocation move when the
+            # home IS the incoming register.)
+            let stayInArg = (ArgResident in props and not aggrByRef and not clobbered) or
+                            (AllRegs in props and not clobbered)
             if AddrTaken in props and not aggrByRef:
               loc = b.spillTo(name, effSlot)   # address taken → must be on the stack
             elif (hasCall or aggrByRef or clobbered) and not stayInArg:

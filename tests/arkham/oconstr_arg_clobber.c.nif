@@ -11,7 +11,7 @@
   (object .
    (fld :a.0 . Inner.0)
    (fld :b.0 . Inner.0)))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -43,4 +43,4 @@
      (oconstr Box.0
       (kv a.0 iv.0)
       (kv b.0 iv.0))))
-   (call exit.c r.0))))(.index)
+   (call exit.0 r.0))))(.index)

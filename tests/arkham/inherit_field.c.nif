@@ -11,7 +11,7 @@
   (object Base.0
    (fld :c.0 .
     (i 64))))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -31,7 +31,7 @@
     (dot d.0 b.0 0)7)
    (asgn
     (dot d.0 c.0 0)9)
-   (call exit.c
+   (call exit.0
     (add
      (i 64)
      (dot d.0 b.0 0)

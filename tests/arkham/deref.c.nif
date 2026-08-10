@@ -7,7 +7,7 @@
     (i 64))
    (fld :b.0 .
     (i 64))))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -33,5 +33,5 @@
     (deref p.0))
    (asgn
     (deref p.0)42)
-   (call exit.c
+   (call exit.0
     (dot obj.0 a.0)))))(.index)

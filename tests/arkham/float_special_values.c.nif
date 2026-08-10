@@ -2,7 +2,7 @@
 (stmts
  (gvar :gf32.0 .
   (f 32)42.0)
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -31,22 +31,22 @@
     (elif
      (eq n.0 n.0)
      (stmts
-      (call exit.c 11))))
+      (call exit.0 11))))
    (if
     (elif
      (eq n32.0 n32.0)
      (stmts
-      (call exit.c 12))))
+      (call exit.0 12))))
    (if
     (elif
      (le pinf.0 1000000.0)
      (stmts
-      (call exit.c 13))))
+      (call exit.0 13))))
    (if
     (elif
      (le -1000000.0 ninf.0)
      (stmts
-      (call exit.c 14))))
+      (call exit.0 14))))
    (var :nbits.0 .
     (i 64)
     (cast
@@ -55,7 +55,7 @@
     (elif
      (neq nbits.0 9221120237041090560)
      (stmts
-      (call exit.c 15))))
+      (call exit.0 15))))
    (var :ibits.0 .
     (i 64)
     (cast
@@ -64,33 +64,33 @@
     (elif
      (neq ibits.0 9218868437227405312)
      (stmts
-      (call exit.c 16))))
+      (call exit.0 16))))
    (if
     (elif
      (lt n.0 1.0)
      (stmts
-      (call exit.c 17))))
+      (call exit.0 17))))
    (if
     (elif
      (lt 1.0 n.0)
      (stmts
-      (call exit.c 18))))
+      (call exit.0 18))))
    (if
     (elif
      (le n.0 1.0)
      (stmts
-      (call exit.c 19))))
+      (call exit.0 19))))
    (if
     (elif
      (le 1.0 n.0)
      (stmts
-      (call exit.c 20))))
+      (call exit.0 20))))
    (if
     (elif
      (not
       (neq n.0 n.0))
      (stmts
-      (call exit.c 21))))
+      (call exit.0 21))))
    (var :fromBits.0 .
     (f 64)
     (cast
@@ -99,9 +99,9 @@
     (elif
      (le fromBits.0 1000000.0)
      (stmts
-      (call exit.c 22))))
+      (call exit.0 22))))
    (var :r.0 .
     (i 64)
     (conv
      (i 64)gf32.0))
-   (call exit.c r.0))))
+   (call exit.0 r.0))))

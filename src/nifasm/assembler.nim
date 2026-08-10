@@ -421,7 +421,7 @@ type
                         # call-safety guarantee. Cleared when the register is rewritten;
                         # merged across `ite` branches.
     slots: SlotManager
-    ssizePatches: seq[int]
+    ssizePatches: seq[tuple[pos: int; pad: int]]
     reservedArgArea: int          # AArch64 fixed-frame: bytes reserved at the frame bottom
                                   # for the largest outgoing stack-argument area (see
                                   # scanStackArgArea). Locals sit above it; the caller writes
@@ -1867,9 +1867,17 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
           else:
             result.typ = Type(kind: IntT, bits: 64)
     elif t == SsizeTagId:
+      # `(ssize)` is the frame size, filled in at `finalize` once every `(s)` slot is
+      # allocated. The optional `(ssize N)` adds N bytes to THIS site only — the
+      # prologue/epilogue use it to fold the 16-byte alignment pad into the frame
+      # adjustment instead of emitting a second `sub rsp, 8` / `add rsp, 8`.
       result.kind = okSsize
       result.typ = Type(kind: IntT, bits: 64)
+      result.immVal = 0
       inc n
+      if n.kind == IntLit:
+        result.immVal = n.intVal
+        inc n
     elif t == CsizeTagId:
       # (csize) - total bytes reserved for outgoing stack arguments
       if not ctx.inCall:
@@ -2760,7 +2768,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     else:
       if op.kind == okSsize:
         arm64.emitMovImm(ctx.buf.data, dest.reg, 0'u16)
-        ctx.ssizePatches.add(ctx.buf.data.len - 4)
+        ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
       elif op.kind == okImm:
         if op.immVal >= 0 and op.immVal <= 0xFFFF:
           arm64.emitMovImm(ctx.buf.data, dest.reg, uint16(op.immVal))
@@ -2900,9 +2908,9 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
         # out as `sub sp, sp, #2000`, leaving every local access off the end of the
         # stack — an ASLR-dependent crash). The patcher fills each half; see `finalize`.
         arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, 0'u16)
-        ctx.ssizePatches.add(ctx.buf.data.len - 4)
+        ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
         arm64.emitAddImmShifted12(ctx.buf.data, dest.reg, dest.reg, 0'u16)
-        ctx.ssizePatches.add(ctx.buf.data.len - 4)
+        ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
       elif op.kind == okImm or op.kind == okCsize:
         if op.immVal >= 0 and op.immVal <= 4095:
           arm64.emitAddImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.immVal))
@@ -2930,9 +2938,9 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     else:
       if op.kind == okSsize:
         arm64.emitSubImm(ctx.buf.data, dest.reg, dest.reg, 0'u16)   # lo12 (see AddA64)
-        ctx.ssizePatches.add(ctx.buf.data.len - 4)
+        ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
         arm64.emitSubImmShifted12(ctx.buf.data, dest.reg, dest.reg, 0'u16)  # hi12
-        ctx.ssizePatches.add(ctx.buf.data.len - 4)
+        ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
       elif op.kind == okImm or op.kind == okCsize:
         if op.immVal >= 0 and op.immVal <= 4095:
           arm64.emitSubImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.immVal))
@@ -3814,8 +3822,12 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   let peakStackSize = max(ctx.slots.stackSize, ctx.slots.maxStackSize)
   let alignedStackSize = (peakStackSize + 15) and not 15
   let isA64 = ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64}
-  let v = uint32(alignedStackSize)
-  for pos in ctx.ssizePatches:
+  for (pos, pad) in ctx.ssizePatches:
+    # `pad` is the caller-supplied alignment correction from `(ssize N)`: the frame
+    # `sub`/`add` folds the 16-alignment pad into the SAME instruction instead of
+    # emitting a second `sub rsp, 8` / `add rsp, 8` around it. `alignedStackSize` is
+    # 16-aligned, so `+ pad` lands the frame exactly where the separate pair did.
+    let v = uint32(alignedStackSize + pad)
     if pos + 4 > ctx.buf.data.len: continue
     if isA64:
       var instr = uint32(ctx.buf.data[pos]) or (uint32(ctx.buf.data[pos+1]) shl 8) or
@@ -4074,11 +4086,46 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
             error("at: 3-operand stride scratch aliases the base register (" &
                   $baseReg & ") — the base is clobbered before use (codegen bug)", n)
           let stride = asmSizeOf(elemType)
-          x86.emitMov(ctx.buf.data, scratchReg, indexOp.reg)        # scratch = index
-          x86.emitImulImm(ctx.buf.data, scratchReg, int32(stride))  # scratch *= stride
-          x86.emitLea(ctx.buf.data, scratchReg,                     # scratch = base + disp + scratch
-            x86.MemoryOperand(base: baseReg, index: scratchReg, scale: 1,
-                              displacement: baseDisp, hasIndex: true))
+          # `base + index*stride` without a multiply wherever the stride allows it.
+          # A SIB scale covers {1,2,4,8}; a SUM of two scales covers the strides that
+          # actually dominate this compiler — 16 (`HashEntry`, and any pair of words)
+          # is 8+8, so two `lea`s replace `mov`+`imul`+`lea`: one instruction fewer,
+          # and no 3-cycle `imul` on the address path of every indexed access.
+          #
+          # The split form reads `index` TWICE, so it needs `scratch != index` —
+          # which the disjointness rule above deliberately permits (under pressure
+          # arkham may hand us the index register as the scratch). When they alias,
+          # the first `lea` would destroy the index before the second reads it, so
+          # fall through to the sequential form, where `mov scratch, index` is a
+          # no-op and the shift/multiply operates in place.
+          var loScale = 0
+          var hiScale = 0
+          if scratchReg != indexOp.reg:
+            if stride in [1, 2, 4, 8]:
+              loScale = stride                       # a single `lea` does it all
+            else:
+              for a in [8, 4, 2, 1]:
+                if stride > a and (stride - a) in [1, 2, 4, 8]:
+                  loScale = a; hiScale = stride - a; break
+          if loScale != 0:
+            x86.emitLea(ctx.buf.data, scratchReg,                   # scratch = base + disp + index*lo
+              x86.MemoryOperand(base: baseReg, index: indexOp.reg, scale: loScale,
+                                displacement: baseDisp, hasIndex: true))
+            if hiScale != 0:
+              x86.emitLea(ctx.buf.data, scratchReg,                 # scratch += index*hi
+                x86.MemoryOperand(base: scratchReg, index: indexOp.reg, scale: hiScale,
+                                  displacement: 0, hasIndex: true))
+          else:
+            x86.emitMov(ctx.buf.data, scratchReg, indexOp.reg)      # scratch = index
+            if stride > 0 and (stride and (stride - 1)) == 0:
+              var sh = 0
+              while (1 shl sh) < stride: inc sh
+              x86.emitShl(ctx.buf.data, scratchReg, sh)             # scratch <<= log2(stride)
+            else:
+              x86.emitImulImm(ctx.buf.data, scratchReg, int32(stride))
+            x86.emitLea(ctx.buf.data, scratchReg,                   # scratch = base + disp + scratch
+              x86.MemoryOperand(base: baseReg, index: scratchReg, scale: 1,
+                                displacement: baseDisp, hasIndex: true))
           result.kind = okMem
           result.mem = x86.MemoryOperand(base: scratchReg, displacement: 0, hasIndex: false)
         elif indexOp.kind == okImm:
@@ -4256,9 +4303,17 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
           else:
             result.typ = Type(kind: IntT, bits: 64)
     elif t == SsizeTagId:
+      # `(ssize)` is the frame size, filled in at `finalize` once every `(s)` slot is
+      # allocated. The optional `(ssize N)` adds N bytes to THIS site only — the
+      # prologue/epilogue use it to fold the 16-byte alignment pad into the frame
+      # adjustment instead of emitting a second `sub rsp, 8` / `add rsp, 8`.
       result.kind = okSsize
       result.typ = Type(kind: IntT, bits: 64)
+      result.immVal = 0
       inc n
+      if n.kind == IntLit:
+        result.immVal = n.intVal
+        inc n
     elif t == CsizeTagId:
       # (csize) - call stack argument size
       if not ctx.inCall:
@@ -4943,7 +4998,7 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
     # dest is reg
     if op.kind == okSsize:
       x86.emitMovImmToReg32(ctx.buf.data, dest.reg, 0)
-      ctx.ssizePatches.add(ctx.buf.data.len - 4)
+      ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
     elif op.kind == okCsize:
       # csize is a known value - the stack argument size for the current call
       x86.emitMovImmToReg32(ctx.buf.data, dest.reg, int32(op.immVal))
@@ -5274,7 +5329,7 @@ proc shiftCodePositions(ctx: var GenContext; at, by: int) =
   for k in 0 ..< ctx.gvarSites.len:
     if ctx.gvarSites[k][0] >= at: ctx.gvarSites[k] = (ctx.gvarSites[k][0] + by, ctx.gvarSites[k][1])
   for k in 0 ..< ctx.ssizePatches.len:
-    if ctx.ssizePatches[k] >= at: ctx.ssizePatches[k] += by
+    if ctx.ssizePatches[k].pos >= at: ctx.ssizePatches[k].pos += by
   for k in 0 ..< ctx.csizePatches.len:
     if ctx.csizePatches[k][0] >= at: ctx.csizePatches[k] = (ctx.csizePatches[k][0] + by, ctx.csizePatches[k][1])
   for k in 0 ..< ctx.tlvSites.len:
@@ -5487,7 +5542,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     else:
       if op.kind == okSsize:
         x86.emitAddImm(ctx.buf.data, dest.reg, 0)
-        ctx.ssizePatches.add(ctx.buf.data.len - 4)
+        ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
       elif op.kind == okCsize:
         x86.emitAddImm(ctx.buf.data, dest.reg, int32(op.immVal))
       elif op.kind == okImm:
@@ -5519,7 +5574,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     else:
       if op.kind == okSsize:
         x86.emitSubImm(ctx.buf.data, dest.reg, 0)
-        ctx.ssizePatches.add(ctx.buf.data.len - 4)
+        ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
       elif op.kind == okCsize:
         x86.emitSubImm(ctx.buf.data, dest.reg, int32(op.immVal))
       elif op.kind == okImm:
@@ -5835,13 +5890,42 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       else:
         x86.emitCmp(ctx.buf.data, dest.reg, op.reg)
 
+  # Width extension: `(movzx D S N)` / `(movsx D S N)`. Three-address like the a64
+  # `(clz D S N)` — `N` (8/16/32) is the SOURCE width, given explicitly because the
+  # declared type of a register says nothing about how many of its bits are the
+  # value. The register-source counterpart of the sized load `(mov D (mem …))`
+  # already performs.
+  of MovzxX64, MovsxX64:
+    let mnemonic = $instTag
+    let signed = instTag == MovsxX64
+    inc n
+    let dest = parseDest(n, ctx)
+    let op = parseOperand(n, ctx)
+    # `checkComparable` for the same reason as `test`: a bool IS an 8-bit value a
+    # zero-extension is meaningful on, and `canDoBitwiseOps` excludes it.
+    checkComparable(dest.typ, mnemonic, start)
+    checkComparable(op.typ, mnemonic, start)
+    if dest.kind != okReg: error(mnemonic & " destination must be a register", n)
+    if op.kind != okReg: error(mnemonic & " source must be a register", n)
+    if n.kind != IntLit: error(mnemonic & " requires a width operand (8, 16 or 32)", n)
+    let bits = int(getInt(n)); inc n
+    if bits notin {8, 16, 32}: error(mnemonic & " width must be 8, 16 or 32", n)
+    x86.emitRegExt(ctx.buf.data, dest.reg, op.reg, bits, signed)
+    # The destination is freshly written, so an earlier call's clobber no longer
+    # applies — same rule as `mov`/`lea` (see genMovX64).
+    ctx.clobbered.excl(dest.reg)
+
   of TestX64:
     inc n
     let dest = parseDest(n, ctx)
     let op = parseOperand(n, ctx)
-    checkBitwiseType(dest.typ, "test", start)
-    checkBitwiseType(op.typ, "test", start)
-    checkCompatibleTypes(dest.typ, op.typ, "test", start)
+    # `checkComparable`, not `checkBitwiseType`: `test r, r` is the canonical
+    # zero-test and so has exactly `cmp`'s operand domain — a bool ("is this flag
+    # set") and a pointer ("is this nil") are both legitimate, and `cmp x, 0`
+    # already accepts them. `test` only reads its operands to set flags.
+    checkComparable(dest.typ, "test", start)
+    checkComparable(op.typ, "test", start)
+    checkCmpCompatible(dest.typ, op.typ, start)
     if dest.kind == okMem:
       error("TEST memory not supported yet", n)
     elif op.kind == okImm:
@@ -6181,7 +6265,15 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       elif op.kind == okLabel:
         x86.emitLea(ctx.buf, dest, op.label)
       elif op.kind == okMem:
-        x86.emitLea(ctx.buf.data, dest, op.mem)
+        # `lea dest, [dest]` is a no-op. It is not incidental: the 3-operand
+        # `(at base index scratch)` form computes the address INTO the scratch and
+        # hands back `okMem{base: scratch}`, and arkham deliberately passes the
+        # consuming instruction's destination as that scratch (`prematLval2`'s
+        # `hint`, so the stride needs no third register). The address is therefore
+        # already in `dest` by the time we get here.
+        if not (op.mem.base == dest and not op.mem.hasIndex and
+                op.mem.displacement == 0):
+          x86.emitLea(ctx.buf.data, dest, op.mem)
       else:
         error("lea requires an address expression (base-reg offset, mem, dot, at, or label)", n)
   of JmpX64:

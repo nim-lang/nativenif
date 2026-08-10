@@ -8,7 +8,7 @@
    (fld :b.0 .
     (i 64))))
  (gvar :gp.0 . Pair.0 .)
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -35,7 +35,7 @@
     (dot gp.0 a.0 0)1)
    (asgn
     (dot gp.0 b.0 0)1)
-   (call exit.c
+   (call exit.0
     (add
      (i 64)
      (add

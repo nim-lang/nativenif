@@ -3,7 +3,7 @@
 (stmts
  (gvar :v.0 .
   (i 64).)
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -89,7 +89,7 @@
     (instr asf.0
      (addr v.0)3 0))
    (instr tf.0 0)
-   (call exit.c
+   (call exit.0
     (add
      (i 64)old.0
      (add

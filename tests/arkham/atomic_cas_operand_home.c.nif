@@ -1,7 +1,7 @@
 (.nif27)
 (.indexat 1                )
 (stmts
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -105,4 +105,4 @@
       (asgn sum.0
        (add
         (i 64)sum.0 7)))))
-   (call exit.c sum.0))))(.index)
+   (call exit.0 sum.0))))(.index)

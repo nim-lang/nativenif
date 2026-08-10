@@ -21,13 +21,15 @@
 | `(arch x64/arm64)`     | NifasmDecl                  | architecture pragma |
 | `(s)`                  | X64Flag                 | stack slot location tag |
 | `(align N)`            | NifasmExpr                  | stack-slot alignment annotation (child of `(s)`) |
-| `(ssize)`              | NifasmExpr                  | stack size expression |
+| `(ssize)` / `(ssize N)` | NifasmExpr                 | stack size expression; the optional `N` adds N bytes at THIS site only (the prologue folds its 16-alignment pad in) |
 | `(csize)`              | NifasmExpr                  | call stack size expression |
 | `(arg S)`              | NifasmExpr                  | argument reference in prepare block |
 | `(res S)`              | NifasmExpr                  | result reference in prepare block |
 | `(prepare S ...)`      | X64Inst, A64Inst            | prepare block for function call |
 | `(mov D S)`            | X64Inst, A64Inst         | move instruction |
 | `(lea D S)`            | X64Inst, A64Inst         | load effective address |
+| `(movzx D S N)`        | X64Inst                  | D = the low `N` bits of S, ZERO-extended into the full 64-bit D (`N` is 8, 16 or 32) |
+| `(movsx D S N)`        | X64Inst                  | D = the low `N` bits of S, SIGN-extended into the full 64-bit D (`N` is 8, 16 or 32) |
 | `(movapd D S)`         | X64Inst                  | move aligned packed double |
 | `(movsd D S)`          | X64Inst                  | move scalar double |
 | `(add D S)`            | X64Inst, A64Inst         | add instruction |

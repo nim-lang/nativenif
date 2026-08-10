@@ -17,7 +17,7 @@
     (i 64))
    (fld :d.0 .
     (i 64))))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -70,6 +70,6 @@
       (kv b.0 2)
       (kv c.0 3)
       (kv d.0 4))))
-   (call exit.c
+   (call exit.0
     (add
      (i 64)x.0 y.0)))))(.index)

@@ -9,7 +9,7 @@
     (i 64))
    (fld :py.0 .
     (i 64))))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -65,18 +65,18 @@
     (elif
      (neq r.0 103087)
      (stmts
-      (call exit.c 11))))
+      (call exit.0 11))))
    (asgn r.0
     (call pick.0 1 0))
    (if
     (elif
      (neq r.0 87103)
      (stmts
-      (call exit.c 12))))
+      (call exit.0 12))))
    (if
     (elif
      (neq
       (call dotOf.0 0)11)
      (stmts
-      (call exit.c 13))))
-   (call exit.c 42))))
+      (call exit.0 13))))
+   (call exit.0 42))))

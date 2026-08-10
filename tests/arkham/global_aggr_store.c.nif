@@ -19,7 +19,7 @@
  (gvar :g_cp.0 . Pair.0 .)
  (gvar :g_sm.0 . Pair.0 .)
  (gvar :g_bg.0 . Big.0 .)
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -62,7 +62,7 @@
     (call mk.0))
    (asgn g_bg.0
     (call mkBig.0))
-   (call exit.c
+   (call exit.0
     (add
      (i 64)
      (add

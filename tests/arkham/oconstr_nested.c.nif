@@ -12,7 +12,7 @@
    (fld :x.0 .
     (i 64))
    (fld :inner.0 . Inner.0)))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -32,7 +32,7 @@
       (oconstr Inner.0
        (kv a.0 30)
        (kv b.0 2)))))
-   (call exit.c
+   (call exit.0
     (add
      (i 64)
      (add

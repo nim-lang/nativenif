@@ -9,7 +9,7 @@
   (cast
    (ptr
     (i 32))cval.0))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -22,5 +22,5 @@
   (pragmas
    (exportc "main"))
   (stmts
-   (call exit.c
+   (call exit.0
     (deref cptr.0)))))(.index)

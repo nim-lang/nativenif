@@ -22,7 +22,7 @@
  (gvar :guard.0 .
   (u 64)7777)
  (gvar :gpacked.0 . Packed12.0 .)
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -123,7 +123,7 @@
     (elif
      (neq acc.0 45)
      (stmts
-      (call exit.c 11))))
+      (call exit.0 11))))
    (var :p.0 . Packed12.0
     (call mkPacked.0))
    (if
@@ -131,7 +131,7 @@
      (neq
       (call sumPacked.0 p.0)123)
      (stmts
-      (call exit.c 12))))
+      (call exit.0 12))))
    (var :t.0 . Three.0
     (call mkThree.0))
    (if
@@ -139,7 +139,7 @@
      (neq
       (call sumThree.0 t.0)15)
      (stmts
-      (call exit.c 13))))
+      (call exit.0 13))))
    (asgn gpacked.0
     (call mkPacked.0))
    (if
@@ -147,10 +147,10 @@
      (neq
       (call sumPacked.0 gpacked.0)123)
      (stmts
-      (call exit.c 14))))
+      (call exit.0 14))))
    (if
     (elif
      (neq guard.0 7777)
      (stmts
-      (call exit.c 15))))
-   (call exit.c 42))))
+      (call exit.0 15))))
+   (call exit.0 42))))

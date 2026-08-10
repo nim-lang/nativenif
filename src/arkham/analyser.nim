@@ -174,6 +174,20 @@ type
                                ## at its own index is a self-move. A call to anything else
                                ## (indirect, or an aggregate/float/retIndirect signature) can
                                ## shift ordinals, so param args there are `ArgResident`-unsafe.
+    noReturnCallees: HashSet[SymId] ## pool ids of `(attr "noreturn")` procs. A call to
+                               ## one is NOT a call point for liveness: it never returns, so
+                               ## nothing textually after it is reachable *through* it and no
+                               ## value has to survive it. See `sawNoReturnCall`.
+    noReturnPositions: seq[int] ## token position of every DIVERGING call. Kept out of
+                               ## `callPositions` (they deny nothing for `AllRegs`), but
+                               ## still consulted for the fixed-role registers: `DivRegOk`
+                               ## and `ShiftRegOk` say "rdx/rcx is a legal home", and those
+                               ## have their own interval tests whose precision was only
+                               ## ever exercised on call-free ranges. Keeping them strict
+                               ## confines this relaxation to the callee-saved question.
+    sawNoReturnCall: bool      ## at least one diverging call was seen. `hasCall` must still
+                               ## be true: the frame code uses it to keep rsp 16-aligned at
+                               ## the call, and the call really is executed on the cold path.
     procIsClean: bool          ## the CURRENT proc has a clean signature: `paramIdx` is a
                                ## valid arg-GPR ordinal and there is no hidden rdi ret ptr.
     completedCalls: int        ## running count of calls whose args have been FULLY
@@ -476,8 +490,29 @@ proc analyse(c: var Context; n: var Cursor) =
       # registers, not the caller-saved file — and modelling that took a name set, a
       # second position list and a weaker variant property. As instructions they take
       # only registers the allocator never hands out, so there is nothing to model.
-      c.callPositions.add posOf(c, n)
-      if c.loopStack.len > 0: c.loopStack[^1].sawCall = true
+      #
+      # EXCEPT a diverging callee (`(attr "noreturn")`: panic, raiseAssert, the
+      # bound-check failure path). Control never comes back from it, so no value
+      # has to survive it, no loop back-edge re-reaches through it, and no arg
+      # register is clobbered "for" any later use. Keeping such a position in
+      # `callPositions` denied `AllRegs` to every local whose interval merely
+      # SPANS the cold guard, which pushed the whole proc onto callee-saved
+      # registers — three pushes, three pops and a frame in `nifcore.kind`, whose
+      # real body is a load and a mask. `hasCall` still becomes true (below), so
+      # the alignment pad at the call is unchanged.
+      var noReturnCall = false
+      block:
+        # `sub`, not `into`: this is a read-only peek at child 0 and `into`
+        # asserts that its body consumed every child.
+        let probe = sub(n)
+        if probe.hasMore and probe.kind == Symbol:
+          noReturnCall = probe.symId in c.noReturnCallees
+      if noReturnCall:
+        c.sawNoReturnCall = true
+        c.noReturnPositions.add posOf(c, n)
+      else:
+        c.callPositions.add posOf(c, n)
+        if c.loopStack.len > 0: c.loopStack[^1].sawCall = true
       # ArgResident safety walk (peek only; the real accounting is analyseChildren below).
       # A param P may stay in its arg register across its consuming call only if that call
       # marshals it back to its OWN arg-GPR — a self-move no sibling arg clobbers. Peek the
@@ -501,7 +536,10 @@ proc analyse(c: var Context; n: var Cursor) =
             skip probe
             inc ordinal
       analyseChildren(c, n)
-      inc c.completedCalls              # this call's args are fully built; it has "returned"
+      if not noReturnCall:
+        inc c.completedCalls            # this call's args are fully built; it has "returned"
+        # A diverging call never returns, so nothing executes "after it returned" —
+        # a param read later is reached only on the path that skipped it.
     of VarS, GvarS, TvarS, ConstS:
       analyseVarDecl(c, n)
     of AsgnS:
@@ -644,11 +682,13 @@ when defined(arkhamPeakLive):
 proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
                   tvars: HashSet[string] = initHashSet[string]();
                   cleanCallees: HashSet[string] = initHashSet[string]();
-                  procIsClean = false): ProcAnalysis =
+                  procIsClean = false;
+                  noReturnCallees: HashSet[SymId] = initHashSet[SymId]()): ProcAnalysis =
   ## `procDecl` is at a `(proc name params rettype pragmas body)`. `tvars` names
   ## the module's thread-locals so their uses force a call-like analysis. `buf` is the
   ## buffer `procDecl` points into (for cursor → position mapping).
   var c = Context(tvars: tvars, cleanCallees: cleanCallees,
+                  noReturnCallees: noReturnCallees,
                   procIsClean: procIsClean, buf: addr buf)
   var n = procDecl
   assert n.stmtKind == ProcS
@@ -665,7 +705,7 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
     skip n                              # pragmas
     scopeFrame(c):                      # the proc-body scope frame (its `stmts`
       iterStmts(c, n): analyse(c, n)    # shares it rather than pushing its own)
-  c.res.hasCall = c.callPositions.len > 0
+  c.res.hasCall = c.callPositions.len > 0 or c.sawNoReturnCall
   c.res.callPositions = c.callPositions
   # Grant `AllRegs` (volatile/caller-saved eligible) to every local whose live
   # interval `(liveStart, freeAfter]` contains no call point. Loop-body locals
@@ -675,9 +715,19 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
   # call of that loop inside its interval. The check is conservative:
   # `freeAfter` over-approximates the range end and a call within it denies
   # `AllRegs`, so a missed-but-live-across-call case is impossible (the unsafe
-  # direction). Params (`freeAfter == high`) are skipped.
+  # direction).
+  #
+  # PARAMS take part too, on `lastUsePos` instead of `freeAfter`: their `freeAfter`
+  # is pinned to `high` because the allocator, not the scope walk, manages their
+  # storage — that pin says "never early-freed", not "live to the end". Their live
+  # range starts at proc entry (`lo` stays 0 — every call position is > 0), so the
+  # test reduces to "the last use precedes the first call", which is exactly the
+  # condition under which a param may stay in its incoming argument register.
+  # `lastUsePos` already carries the loop back-edge extension (a use inside a loop
+  # reaches to the loop's end), so a param re-read across a back-edge that spans a
+  # call is denied here, structurally.
   for name, vi in mpairs c.res.vars:
-    if vi.freeAfter == high(int): continue
+    let isParam = vi.freeAfter == high(int)
     # Birth-point exemption: a `let x = f(…)` initializer's own call precedes the
     # value's existence — x's home receives its FIRST write from the call's result,
     # after it returned — so it must not deny `AllRegs`. Only sound for a ROOT call
@@ -692,12 +742,31 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
                   (birthFilterEnv != "-" and pname in birthFilterEnv.split(','))
     let lo = if vi.initClass == icCall and birthOk: vi.initEndPos - 1
              else: vi.liveStart
-    let hi = vi.freeAfter
+    let hi = if isParam: vi.lastUsePos else: vi.freeAfter
     var crossesCall = false
     for p in c.callPositions:
       if p > lo and p <= hi: (crossesCall = true; break)
+    # `usedAfterCall` is the same fact reached by counting completed calls rather
+    # than comparing positions. Redundant with the interval test above, kept as the
+    # belt-and-braces gate on the param path (it is what `ArgResident` has always
+    # used, and the two disagreeing would mean one of them is wrong).
+    if isParam and vi.usedAfterCall: crossesCall = true
     if not crossesCall:
       vi.props.incl AllRegs
+      # A param's fixed-role eligibility (rdx/rcx) is decided per-proc in
+      # `allocParams` from `clobbersDivReg`/`clobbersShiftReg`, not from these
+      # per-variable props — leave them off rather than grant something unread.
+      if isParam: continue
+      # The fixed-role homes below stay on the STRICT test — a diverging call in the
+      # interval denies them. `AllRegs` only claims "a caller-saved register is a legal
+      # home", which a call that never returns cannot invalidate; `DivRegOk`/`ShiftRegOk`
+      # additionally claim rdx/rcx are free of their instruction role across the range,
+      # and that interval test had only ever been exercised on genuinely call-free
+      # ranges. Granting it to a bounds-checked `[]=` (whose panic call is diverging)
+      # promptly tripped the allocator's own clobber check on rcx.
+      var crossesDiverging = false
+      for p in c.noReturnPositions:
+        if p > lo and p <= hi: (crossesDiverging = true; break)
       # A call-free local can go further: rdx/rcx have a *fixed* instruction role
       # (div/mod, variable shift) but are otherwise free. If no such instruction
       # falls in the interval, that register's role never overlaps this local's
@@ -709,11 +778,11 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
       # (operand of an instruction whose other operand subtree holds the div/shift,
       # e.g. `bitand(mask, shl(1, n))`) is still consumed AFTER the clobber
       # executes, so touching the clobber's statement at all denies the home.
-      var crossesDiv = false
+      var crossesDiv = crossesDiverging
       for s in c.divPositions:
         if s.pos > lo and hi >= s.stmtStart: (crossesDiv = true; break)
       if not crossesDiv: vi.props.incl DivRegOk
-      var crossesShift = false
+      var crossesShift = crossesDiverging
       for s in c.shiftPositions:
         if s.pos > lo and hi >= s.stmtStart: (crossesShift = true; break)
       if not crossesShift: vi.props.incl ShiftRegOk

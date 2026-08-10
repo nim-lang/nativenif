@@ -1,7 +1,7 @@
 (.nif27)
 (.indexat 627              )
 (stmts
- (proc :futex.c
+ (proc :futex.0
   (params
    (param :uaddr.0 .
     (ptr
@@ -16,7 +16,7 @@
   (pragmas
    (importc "futex"))
   (stmts .))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -33,9 +33,9 @@
     (u 32)0)
    (var :r.0 .
     (i 64)
-    (call futex.c
+    (call futex.0
      (addr w.0)129 1 0))
-   (call exit.c
+   (call exit.0
     (add
      (i 32)42
      (cast

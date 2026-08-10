@@ -16,7 +16,7 @@
       (i 64))))
    (fld :last.0 .
     (i 64))))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -38,7 +38,7 @@
     (dot v.0 b.0 0)20)
    (asgn
     (dot v.0 last.0 0)12)
-   (call exit.c
+   (call exit.0
     (add
      (i 64)
      (add

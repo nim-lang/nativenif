@@ -7,7 +7,7 @@
     (u 32))
    (fld :b.0 .
     (u 32))))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -33,7 +33,7 @@
       (dot p.0 a.0 0)
       (suf 0 \2Bu32))
      (stmts
-      (call exit.c 42)))
+      (call exit.0 42)))
     (else
      (stmts
-      (call exit.c 1)))))))(.index)
+      (call exit.0 1)))))))(.index)

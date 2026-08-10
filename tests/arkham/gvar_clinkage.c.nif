@@ -4,7 +4,7 @@
   (pragmas
    (exportc "cmdCount"))
   (i 32).)
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -18,5 +18,5 @@
    (exportc "main"))
   (stmts
    (asgn gExp.0 42)
-   (call exit.c
+   (call exit.0
     (call readIt.0.mod_clinkage)))))

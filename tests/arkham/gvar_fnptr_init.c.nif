@@ -6,7 +6,7 @@
     (param :x.0 .
      (i 64)))
    (i 64).))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -40,7 +40,7 @@
      (neq
       (call h.0 20)40)
      (stmts
-      (call exit.c 11))))
+      (call exit.0 11))))
    (var :p.0 .
     (ptr
      (i 64))alias.0)
@@ -49,5 +49,5 @@
      (neq
       (deref p.0)7)
      (stmts
-      (call exit.c 12))))
-   (call exit.c 42))))
+      (call exit.0 12))))
+   (call exit.0 42))))

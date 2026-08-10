@@ -1,6 +1,6 @@
 (.nif27)
 (stmts
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -23,4 +23,4 @@
    (exportc "main"))
   (stmts
    (call `ini.0.)
-   (call exit.c g.0))))
+   (call exit.0 g.0))))

@@ -1279,7 +1279,11 @@ proc emitSignature(g: var CodeGen; decl: Cursor; declarative: bool) =
     g.ab.keyword ParamsD
     g.ab.keyword ResultD
   g.ab.tree ClobberD:
-    for r in ConvClobbersGpr: g.ab.reg r     # a clobber *declaration*: raw reg locations
+    # A diverging callee returns to nobody, so no caller can observe what it
+    # destroyed — declaring clobbers only forces every proc with a cold guard onto
+    # callee-saved homes. See the x64 twin in `emitSignature`.
+    if not declIsNoReturn(decl):
+      for r in ConvClobbersGpr: g.ab.reg r   # a clobber *declaration*: raw reg locations
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Fused value core (`*2`) — the AArch64 twin of codegen_x64.nim's emit*2
@@ -1311,7 +1315,7 @@ proc emitMod2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitFBinE(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCondValue2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCondE(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool)
-proc emitScalarCmpE(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
+proc emitScalarCmpE(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
                     whenTrue: bool): A64Inst
 proc emitMemLoad2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitAddr2(g: var CodeGen; c: Cursor; dest: var Location)
@@ -3816,11 +3820,36 @@ proc emitFValue2(g: var CodeGen; c: Cursor; dest: var Location) =
       g.emitFValue2(inner, dest)
     else: raiseAssert "arkham a64n: emitFValue2(fused) expr " & $c.exprKind
   else: raiseAssert "arkham a64n: emitFValue2(fused) kind " & $c.kind
-proc emitScalarCmpE(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
+proc mirrorBranch(t: A64Inst): A64Inst =
+  ## The condition that holds for `cmp b, a` given `t` holds for `cmp a, b`.
+  ## Equality is symmetric; the orderings change side.
+  case t
+  of BeqA64: BeqA64
+  of BneA64: BneA64
+  of BltA64: BgtA64
+  of BleA64: BgeA64
+  of BgtA64: BltA64
+  of BgeA64: BleA64
+  of BloA64: BhiA64
+  of BlsA64: BhsA64
+  of BhiA64: BloA64
+  of BhsA64: BlsA64
+  else: raiseAssert "arkham a64n: no mirror for " & $t
+
+proc isCmpImmLeaf(c: Cursor): bool =
+  ## A bare integer literal, `(suf …)`/`(par …)` wrappers included: what `cmp`
+  ## takes as an immediate — and, on the left, what costs a materialising `mov`.
+  var cur = c
+  if cur.kind == TagLit and cur.exprKind in {SufC, ParC}: inc cur
+  result = cur.kind in {IntLit, UIntLit, CharLit}
+
+proc emitScalarCmpE(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
                     whenTrue: bool): A64Inst =
   ## FUSED integer `cmp`: operands resolve dontCare (a home / immediate stays
   ## put; a computed subtree takes a temp) and the bridges serve everything
   ## else — 075b051's stackHomeSlot / placeImmTyped bridge typing preserved.
+  var aC = aC0
+  var bC = bC0
   let signed = not (g.cmpOperandUnsigned(aC) or g.cmpOperandUnsigned(bC))
   result =
     case ek
@@ -3829,6 +3858,13 @@ proc emitScalarCmpE(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
     of LtC:  (if whenTrue: (if signed: BltA64 else: BloA64) else: (if signed: BgeA64 else: BhsA64))
     of LeC:  (if whenTrue: (if signed: BleA64 else: BlsA64) else: (if signed: BgtA64 else: BhiA64))
     else: raiseAssert "arkham a64n: cond " & $ek
+  if isCmpImmLeaf(aC) and not isCmpImmLeaf(bC):
+    # `cmp`'s first operand must be a register, so a literal there is first
+    # materialised into a bridge. Leng has no `>`/`>=` — they ARE `<`/`<=` with
+    # the operands exchanged — so `0 <= i` reaches us as `(le 0 i)` and every
+    # lower-bound check paid that materialisation. Exchange and mirror instead.
+    swap(aC, bC)
+    result = mirrorBranch(result)
   template cmpBridgeSlot(loc: Location; opC: Cursor): AsmSlot =
     if isPtrType(resolveType(g.prog, g.getType(opC))): g.exprSlot(opC)
     else: loc.typ
@@ -4124,6 +4160,16 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
       let sh = g.ra.locationOfSym(symName(inner))
       var tgc = targetCur
       if sh.kind in {InReg, NamedStack} and slotOf(g.prog, tgc).size < sh.typ.size:
+        g.forceRegDestE(dest)
+      elif sh.kind == InReg and dest.kind in {Undef, NeedsReg, RegOrImm} and
+           (isPtrType(tc) or (not cursorIsNil(sh.typ.typ) and
+                              isPtrType(resolveType(g.prog, sh.typ.typ)))):
+        # A pointer-ness change over a register-homed local, with no destination
+        # of our own: without a temp the value would be threaded up in the
+        # SYMBOL's home and the re-representation below would `rebindLocalAs`
+        # that home — retyping the local itself for the rest of its scope. A
+        # later use at its declared type then fails the binding checker. The
+        # x64 twin carries the measured repro.
         g.forceRegDestE(dest)
   if dest.kind in {NamedStack, Mem} and not (dest.kind == NamedStack and dest.spillTemp):
     # a memory-home destination: compute into a temp, re-represent, store
@@ -5090,10 +5136,12 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
               "backend yet; its register pins name x86-64 registers", lengInfo(info.decl)
   if not g.cleanSigComputed:                   # compute the clean-signature set once
     g.cleanSigProcs = cleanSigProcNames(g.prog)
+    g.noReturnProcs = noReturnProcs(g.prog)
     g.cleanSigComputed = true
   let an = analyseProc(g.buf[], info.decl, g.tvarNames,
                        cleanCallees = g.cleanSigProcs,
-                       procIsClean = isCleanSigProc(g.prog, info.decl))
+                       procIsClean = isCleanSigProc(g.prog, info.decl),
+                       noReturnCallees = g.noReturnProcs)
   g.varType.clear()
   g.symType.clear()
   g.retAggrName = ""; g.retIndirect = false; g.retIsFloat = false

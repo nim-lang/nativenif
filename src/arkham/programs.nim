@@ -1095,6 +1095,85 @@ proc cleanSigProcNames*(p: var Program): HashSet[string] =
     if nc.kind == SymbolDef and isCleanSigProc(p, pi.decl):
       result.incl symName(nc)
 
+proc declIsNoReturn*(decl: Cursor): bool =
+  ## True if the `(proc …)` declaration carries `(attr "noreturn")` — hexer's
+  ## spelling for a proc that genuinely diverges (`panic`, `raiseAssert`, `quit`).
+  ## It is deliberately NOT emitted for `.raises` procs, which under goto
+  ## exceptions do return with an error code, so this is safe to trust.
+  result = false
+  var c = decl
+  c.into:
+    inc c                                       # name
+    skip c                                      # params
+    skip c                                      # return type
+    if c.substructureKind == PragmasU:
+      c.into:
+        while c.hasMore:
+          if c.kind == TagLit and c.pragmaKind == AttrP:
+            var q = c
+            q.into:
+              while q.hasMore:
+                if q.kind == StrLit and strVal(q) == "noreturn": result = true
+                skip q
+          skip c
+    else:
+      skip c
+    while c.hasMore: skip c                     # body — `into` requires a full drain
+
+proc collectCallees(n: Cursor; seen: var HashSet[SymId];
+                    order: var seq[(SymId, string)]) =
+  ## Every DIRECT call target in the subtree (`(call SYM …)`), deduped. The name
+  ## is captured alongside the id because resolving the declaration needs it —
+  ## once per distinct callee, not once per call site.
+  var n = n
+  if n.kind != TagLit: return
+  if n.stmtKind == CallS:
+    let probe = sub(n)                          # read-only peek at the callee
+    if probe.hasMore and probe.kind == Symbol:
+      let id = probe.symId
+      if not seen.containsOrIncl(id): order.add (id, symName(probe))
+  n.loopInto:
+    collectCallees(n, seen, order)
+    skip n
+
+proc noReturnProcs*(p: var Program): HashSet[SymId] =
+  ## Pool ids of every proc CALLED in this module whose declaration carries
+  ## `(attr "noreturn")`. Ids, not names: a call site names its target with a
+  ## `Symbol` token that already IS the pool id, so the analyser tests membership
+  ## without materialising a string per call — and every buffer here shares one
+  ## pool, so the ids are comparable.
+  ##
+  ## Why the analyser wants this: a call is what forces a value that outlives it
+  ## into a callee-saved register, and the prologue then pushes every such
+  ## register on EVERY entry. A diverging callee returns to nobody, so nothing
+  ## the linear walk sees "after" it is reachable through it — and asserts,
+  ## panics and bound-check failures are exactly the calls that sit on cold
+  ## paths of otherwise leaf-shaped accessors. `nifcore.kind` paid three pushes,
+  ## three pops and a frame for one `assert`.
+  ##
+  ## Only CALLED procs are resolved, so the foreign-module loads this triggers
+  ## are ones codegen performs anyway (`foreignCallTarget` at each call site).
+  result = initHashSet[SymId]()
+  var seen = initHashSet[SymId]()
+  var callees: seq[(SymId, string)] = @[]
+  for pi in p.procs:
+    if pi.isAsm: continue
+    var b = pi.decl
+    b.into:
+      inc b; skip b; skip b; skip b             # name, params, ret, pragmas
+      while b.hasMore: (collectCallees(b, seen, callees); skip b)
+  var localDecl = initTable[SymId, Cursor]()
+  for pi in p.procs:
+    var nc = pi.decl; inc nc
+    if nc.kind == SymbolDef: localDecl[nc.symId] = pi.decl
+  for (id, name) in callees:
+    if localDecl.hasKey(id):
+      if declIsNoReturn(localDecl[id]): result.incl id
+    elif isForeignSym(p, name):
+      var found = false
+      let d = lookupForeignDecl(p, name, found)
+      if found and d.stmtKind == ProcS and declIsNoReturn(d): result.incl id
+
 proc aggregateTypeNames*(p: var Program): HashSet[string] =
   ## Names of all types whose ABI class is `AMem` (object/union/array, or an alias to
   ## one) — passed by value across >1 register or by hidden reference. The analyser uses
@@ -1311,5 +1390,30 @@ proc constFold*(p: var Program; c: Cursor): (bool, int64) =
           v = (if c.exprKind == DivC: ua div ub else: ua mod ub)
       else: return (false, 0)
       return (true, cast[int64](maskToWidth(v, bits, signed)))
+    of ConvC, CastC:
+      # `(conv T x)` / `(cast T x)` over a constant is a constant — the width
+      # change IS the operation, so apply it (`maskToWidth` truncates and
+      # re-sign-extends exactly as the runtime `movsx`/`movzx` pair would).
+      # Without this the folder refuses one node too early and the whole
+      # enclosing expression falls back to a runtime tree: hexer wraps literal
+      # operands in `(conv …)` routinely, so `uint(1) * uint(sizeof(NifToken))`
+      # — the address arithmetic behind every `peekAhead`-shaped index — came
+      # out as `mov r,1` + `imul r,r,4` instead of the immediate 4, and the two
+      # extra temps it needed pushed a callee-saved register into the prologue.
+      # A non-integer target (a pointer cast, a float) is not our business.
+      var t = c; inc t                          # → target type
+      if t.kind != TagLit: return (false, 0)
+      var bits = 64
+      var signed = true
+      case t.typeKind
+      of IT: bits = typeBits(t)
+      of UT: (signed = false; bits = typeBits(t))
+      of CT: (signed = false; bits = max(8, typeBits(t)))
+      else: return (false, 0)
+      if bits <= 0: bits = 64                   # `(i -1)` platform int
+      skip t                                    # → the value
+      let (ok, v) = constFold(p, t)
+      if not ok: return (false, 0)
+      return (true, cast[int64](maskToWidth(cast[uint64](v), bits, signed)))
     else: return (false, 0)
   else: return (false, 0)

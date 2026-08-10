@@ -7,7 +7,7 @@
     (param :x.0 .
      (i 64)))
    (i 64).))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -34,5 +34,5 @@
     (i 64)
     (call
      (cast PT.0 slot.0)41))
-   (call exit.c r.0))))
+   (call exit.0 r.0))))
 (.index)

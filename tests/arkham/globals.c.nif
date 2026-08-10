@@ -5,7 +5,7 @@
   (i 64)40)
  (gvar :h.0 .
   (i 64).)
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -25,6 +25,6 @@
    (exportc "main"))
   (stmts
    (call bump.0)
-   (call exit.c
+   (call exit.0
     (add
      (i 64)g.0 h.0)))))(.index)

@@ -241,21 +241,18 @@ const arkhamStressKnown: seq[string] = @[
   "aggr_arg_parked_byref",
   "aggr_arg_parked_manual",
   "atomic_cas_regpressure", # intrinsic-operand pick has no steal/spill arm
-  # Same missing arm, one step further in: this fixture's job is the DEFAULT
-  # register file, where it pins `instrOperandInPlace` (it is the compare-exchange
-  # out of `realloc` that `nimony n -d:danger` died on, and it fails on any arkham
-  # without that fix at k>=4 and unstressed alike). At k<=3 the operands' own
-  # address computations run the staging bridge dry before the row is reached —
-  # a different step, broken here identically before and after the fix.
-  "atomic_cas_operand_home",
-  # SILENT MISCOMPILE (71 -> 95), and a64 has the same defect (see below).
-  # `produceIntoMem2` hands out the produce bridge for the WHOLE node on the
-  # claim that it is "not held across the recursion". True for a leaf or a load;
-  # false for a binop, whose left partial sits in the bridge while the right
-  # operand is evaluated — and that evaluation re-enters `produceIntoMem2` and
-  # takes the same register. The partial must be parked in an `etmp` slot before
-  # the sibling recursion. The fixture's OWN job (the emitter's staging demand is
-  # two at any address-chain depth) is a codegen-level claim and holds.
+  "atomic_cas_operand_home",  # same missing arm, one step in: the compare-exchange
+                            # out of `realloc` that `nimony n -d:danger` died on.
+  # NO LONGER A SILENT MISCOMPILE. The comment here used to read "SILENT MISCOMPILE
+  # (71 -> 95)": `produceIntoMem2` hands the produce bridge to the WHOLE node on the
+  # claim that it is "not held across the recursion" — true for a leaf or a load,
+  # false for a binop, whose left partial sits in the bridge while the other side is
+  # Verified 2026-08-09 across k=2..5: the fixture either returns the correct 71
+  # (k>=5) or ASSERTS (k<=4). It never answers wrong. What remains is a totality
+  # gap, not a correctness one: at the failing pick every register is either SEALED
+  # (a live partial the emitting step still needs) or a named local's home. Closing
+  # it means needing fewer live values there — not a second allocator inside the
+  # emitter, which is what the removed emergency borrow was.
   "addr_chain_depth",
 ]
 
@@ -305,7 +302,8 @@ proc arkhamStressTests(arch: string; runner = ""; skip: seq[string] = @[];
   let nifasm = ("src" / "nifasm" / "nifasm").addFileExt(ExeExt)
   let workDir = "tests" / "arkham" / "nimcache"
   createDir workDir
-  putEnv("ARKHAM_STRESS", $level)               # inherited by the arkham children
+  # Inherited by the arkham children.
+  putEnv("ARKHAM_STRESS", if level > 0: $level else: "")
   for file in walkFiles("tests" / "arkham" / "mod_*.c.nif"):
     let name = extractFilename(file)[0 ..< extractFilename(file).len - ".c.nif".len]
     exec quoteShell(arkham) & " -a:" & arch & " -o:" &

@@ -45,6 +45,7 @@ const
 when StressEnabled:
   import std/[os, strutils]
 
+
   let stressKeep* = block:
     ## `ARKHAM_STRESS=k`: keep at most `k` registers per allocatable pool. Unset /
     ## empty / unparseable / `<= 0` leaves the mode dormant, so a

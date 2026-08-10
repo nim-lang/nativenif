@@ -1,14 +1,14 @@
 (.nif27)
 (.indexat 2105             )
 (stmts
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
   (pragmas
    (importc "exit"))
   (stmts .))
- (proc :memcmp.c
+ (proc :memcmp.0
   (params
    (param :a.0 .
     (ptr
@@ -62,49 +62,49 @@
     (at f.0 0)655884)
    (var :r0.0 .
     (i 32)
-    (call memcmp.c
+    (call memcmp.0
      (addr
       (at a.0 0))
      (addr
       (at a.0 0))32))
    (var :r1.0 .
     (i 32)
-    (call memcmp.c
+    (call memcmp.0
      (addr
       (at a.0 0))
      (addr
       (at c.0 0))32))
    (var :r2.0 .
     (i 32)
-    (call memcmp.c
+    (call memcmp.0
      (addr
       (at c.0 0))
      (addr
       (at a.0 0))32))
    (var :r3.0 .
     (i 32)
-    (call memcmp.c
+    (call memcmp.0
      (addr
       (at e.0 0))
      (addr
       (at f.0 0))3))
    (var :r4.0 .
     (i 32)
-    (call memcmp.c
+    (call memcmp.0
      (addr
       (at a.0 0))
      (addr
       (at c.0 0))0))
    (var :r5.0 .
     (i 32)
-    (call memcmp.c
+    (call memcmp.0
      (addr
       (at a.0 0))
      (addr
       (at c.0 0))17))
    (var :r6.0 .
     (i 32)
-    (call memcmp.c
+    (call memcmp.0
      (addr
       (at a.0 0))
      (addr
@@ -140,4 +140,4 @@
      (i 32)acc.0
      (add
       (i 32)r6.0 5)))
-   (call exit.c acc.0))))(.index)
+   (call exit.0 acc.0))))(.index)

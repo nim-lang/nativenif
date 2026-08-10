@@ -10,7 +10,7 @@
   (i 64)0)
  (tvar :tp.0 . Pair.0 .)
  (tvar :tq.0 . Pair.0 .)
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -54,7 +54,7 @@
      (neq
       (call sum.0 1000 tp.0)1030)
      (stmts
-      (call exit.c 11))))
+      (call exit.0 11))))
    (asgn tq.0
     (call mk.0))
    (if
@@ -62,17 +62,17 @@
      (neq
       (call sum.0 100 tq.0)134)
      (stmts
-      (call exit.c 12))))
+      (call exit.0 12))))
    (asgn tp.0 tq.0)
    (if
     (elif
      (neq
       (dot tp.0 pa.0)30)
      (stmts
-      (call exit.c 13))))
+      (call exit.0 13))))
    (if
     (elif
      (neq pad.0 0)
      (stmts
-      (call exit.c 14))))
-   (call exit.c 42))))
+      (call exit.0 14))))
+   (call exit.0 42))))

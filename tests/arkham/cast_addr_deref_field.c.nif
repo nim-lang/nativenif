@@ -6,7 +6,7 @@
    (fld :ptr.0 .
     (ptr
      (i 64)))))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -33,6 +33,6 @@
         (i 64))
        (addr
         (deref p.0))))))
-   (call exit.c
+   (call exit.0
     (deref
      (dot b.0 ptr.0 0))))))(.index)
