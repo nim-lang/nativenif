@@ -40,4 +40,52 @@
      (neq f.0 -5.0)
      (stmts
       (call exit.c 13))))
+   (var :a.0 .
+    (i 64)
+    (cast
+     (i 64)
+     (conv
+      (f 64)
+      (suf 18446744073709551615u "u64"))))
+   (if
+    (elif
+     (neq a.0 4895412794951729152)
+     (stmts
+      (call exit.c 14))))
+   (var :b.0 .
+    (i 64)
+    (cast
+     (i 64)
+     (conv
+      (f 64)
+      (suf 9223372036854775809u "u64"))))
+   (if
+    (elif
+     (neq b.0 4890909195324358656)
+     (stmts
+      (call exit.c 15))))
+   (var :c.0 .
+    (i 64)
+    (cast
+     (i 64)
+     (conv
+      (f 64)
+      (suf 9223372036854776833u "u64"))))
+   (if
+    (elif
+     (neq c.0 4890909195324358657)
+     (stmts
+      (call exit.c 16))))
+   (var :d.0 .
+    (i 64)
+    (cast
+     (i 64)
+     (conv
+      (f 64)
+      (suf 9223372036854776832u "u64"))))
+   (if
+    (elif
+     (neq d.0 4890909195324358656)
+     (stmts
+      (call exit.c 17))))
    (call exit.c 42))))

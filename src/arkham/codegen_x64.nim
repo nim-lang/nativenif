@@ -5517,6 +5517,39 @@ proc emitFBinE(g: var CodeGen; c: Cursor; dest: var Location) =
       g.rb.unsealF fs2
   dest = res
 
+proc fcvtU2F(g: var CodeGen; d: FReg; s: Reg; bits: int) =
+  ## UNSIGNED 64-bit → float. `cvtsi2sd` reads its GPR as a SIGNED 64-bit value,
+  ## and SSE2 has no unsigned counterpart, so a source with bit 63 set would
+  ## convert to a negative double (`float(0xFFFF_FFFF_FFFF_FFFF'u64)` came out
+  ## -1.0). Split on that bit:
+  ##
+  ##   * clear ⇒ the value is its own signed reading; one `cvtsi2sd`.
+  ##   * set ⇒ halve it, convert, and double the result back. The halving is
+  ##     ROUND-TO-ODD (`(v shr 1) or (v and 1)`), which keeps the discarded low
+  ##     bit as a sticky bit so `cvtsi2sd`'s own rounding cannot round twice —
+  ##     a plain `shr` would make e.g. 2^64-1 come out as 2^64 exactly.
+  ##
+  ## `s` is only READ: it may be a live local's home register.
+  let lBig = g.freshLabel()
+  let lDone = g.freshLabel()
+  g.ab.tree CmpX64: (g.emReg s; g.ab.intLit 0)
+  g.emJcc(JlX64, lBig)                             # bit 63 set ⇒ ≥ 2^63 unsigned
+  g.fcvtI2F(d, s, bits)
+  g.emJmp lDone
+  g.emLab lBig
+  let half = g.pickStagingSealed("an unsigned int→float halving", ScalarSlot)
+  let odd = g.pickStagingSealed("an unsigned int→float sticky bit", ScalarSlot)
+  g.movReg(half, s)
+  g.binImm(ShrX64, half, 1)
+  g.movReg(odd, s)
+  g.binImm(AndX64, odd, 1)
+  g.binReg(OrX64, half, odd)
+  g.fcvtI2F(d, half, bits)
+  g.fbin(AddssX64, AddsdX64, d, d, bits)           # ×2 undoes the halving
+  g.giveBack odd
+  g.giveBack half
+  g.emLab lDone
+
 proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED `(conv|cast Type inner)`. Decisions inline (allocValue CastC/ConvC):
   ## float targets/sources force the SIMD/GPR shapes; a NARROWING cast whose
@@ -5571,7 +5604,8 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
       else:
         let (srcW, srcSigned) = g.srcWidthSigned(inner)
         g.extendTo(ivReg, srcW, srcSigned)               # normalize to the full int value
-        g.fcvtI2F(res.f, ivReg, dstBits)
+        if srcSigned or srcW < 64: g.fcvtI2F(res.f, ivReg, dstBits)
+        else: g.fcvtU2F(res.f, ivReg, dstBits)           # 2^63.. has no cvtsi2sd
       if ownIv: g.giveBack(ivReg)
       else: g.freeVal(iv)
     dest = res
