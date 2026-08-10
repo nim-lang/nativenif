@@ -1,6 +1,6 @@
 # Mach-O binary format writer for macOS
 
-import std / [streams, os]
+import std / [streams, os, strutils]
 
 import buffers
 
@@ -377,7 +377,8 @@ proc writeMachO*(code: Bytes; bssSize: int;
                  gvarSites: seq[(int, int)] = @[];
                  tlv: TlvInfo = TlvInfo();
                  bssInits: seq[tuple[off: int64, val: int64, size: int]] = @[];
-                 rebases: seq[RodataRebase] = @[]) =
+                 rebases: seq[RodataRebase] = @[];
+                 symMap: seq[(int, string)] = @[]) =
   let pageSize = 0x4000.uint64  # 16KB page size for arm64 macOS
   let baseAddr = 0x100000000.uint64  # macOS default base address
 
@@ -463,6 +464,13 @@ proc writeMachO*(code: Bytes; bssSize: int;
   # Virtual addresses
   let textVmaddr = baseAddr
   let textSectionVmaddr = textVmaddr + codeFileOffset  # Section starts after headers
+
+  # `--symmap`: the executable carries no symbol table, so dump each generated
+  # proc's virtual address for a disassembler to name frames by. Only here is the
+  # __text vaddr known (it depends on the load-command space reserved above).
+  if symMap.len > 0:
+    for (off, name) in symMap:
+      stderr.writeLine "0x" & toHex(int(textSectionVmaddr) + off, 9) & "  " & name
 
   # DATA segment byte layout (offsets within __DATA): __got, then the TLV
   # descriptors and init template, then bss. The GOT + TLV region is file-backed

@@ -1,0 +1,14 @@
+(.nif27)
+(.indexat 175              )
+(stmts
+ (gvar :gImp.0.
+  (pragmas
+   (importc "cmdCount"))
+  (i 32).)
+ (proc :readIt.0.
+  (params)
+  (i 32).
+  (stmts
+   (ret gImp.0.))))(.index
+ (x gImp.0. 44)
+ (x readIt.0. 63))

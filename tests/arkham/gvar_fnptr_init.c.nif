@@ -1,0 +1,53 @@
+(.nif27)
+(stmts
+ (type :Hook.0 .
+  (proctype .
+   (params
+    (param :x.0 .
+     (i 64)))
+   (i 64).))
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :twice.0
+  (params
+   (param :x.0 .
+    (i 64)))
+  (i 64).
+  (stmts
+   (ret
+    (add
+     (i 64)x.0 x.0))))
+ (gvar :hook.0 . Hook.0 twice.0)
+ (gvar :alias.0 .
+  (ptr
+   (i 64))counter.0)
+ (gvar :counter.0 .
+  (i 64)7)
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :h.0 . Hook.0 hook.0)
+   (if
+    (elif
+     (neq
+      (call h.0 20)40)
+     (stmts
+      (call exit.c 11))))
+   (var :p.0 .
+    (ptr
+     (i 64))alias.0)
+   (if
+    (elif
+     (neq
+      (deref p.0)7)
+     (stmts
+      (call exit.c 12))))
+   (call exit.c 42))))

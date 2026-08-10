@@ -1,0 +1,29 @@
+(.nif27)
+(.indexat 425              )
+(stmts
+ (type :Hooks.0. .
+  (object .
+   (fld :tag.0. .
+    (i 64))
+   (fld :destroy.0. .
+    (proctype .
+     (params
+      (param :x.0. .
+       (i 64)))
+     (i 64).))))
+ (proc :twice.0.
+  (params
+   (param :x.0. .
+    (i 64)))
+  (i 64).
+  (stmts
+   (ret
+    (add
+     (i 64)x.0. x.0.))))
+ (const :vtab.0. . Hooks.0.
+  (oconstr Hooks.0.
+   (kv tag.0. 2)
+   (kv destroy.0. twice.0.))))(.index
+ (x Hooks.0. 44)
+ (x twice.0. 166)
+ (x vtab.0. 119))

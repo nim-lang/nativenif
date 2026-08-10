@@ -1,0 +1,35 @@
+(.nif27)
+(stmts
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :h.0 .
+    (proctype .
+     (params
+      (param :x.0 .
+       (i 64)))
+     (i 64).)
+    (dot vtab.0.mod_vtab destroy.0.mod_vtab))
+   (if
+    (elif
+     (neq
+      (call h.0 20)40)
+     (stmts
+      (call exit.c 11))))
+   (if
+    (elif
+     (neq
+      (dot vtab.0.mod_vtab tag.0.mod_vtab)2)
+     (stmts
+      (call exit.c 12))))
+   (call exit.c 42))))

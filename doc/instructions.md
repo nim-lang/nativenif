@@ -178,6 +178,7 @@
 | `(jbe L)`              | X64Inst                  | jump if below or equal |
 | `(jo L)`               | X64Inst                  | jump if overflow |
 | `(jno L)`              | X64Inst                  | jump if not overflow |
+| `(jp L)`               | X64Inst                  | jump if parity (unordered float compare) |
 | `(call T ...)`         | X64Inst, A64Inst         | function call marker inside prepare |
 | `(extcall)`            | X64Inst, A64Inst         | external call marker inside prepare |
 | `(iat S)`              | X64Inst                  | indirect call through IAT (Import Address Table) |
