@@ -7054,7 +7054,7 @@ proc writeMachO(a: var GenContext; outfile: string) =
 
   # `--symmap`: dump every generated proc's virtual address (the Mach-O carries no
   # symbol table). Only `writeMachO` knows where __text lands, so hand it the rows.
-  var symMapRows: seq[(int, string)]
+  var symMapRows: seq[(int, string)] = @[]
   if a.symMap:
     for name, sym in a.rootScope.syms:
       if sym.kind == skProc and labelPos.hasKey(sym.offset):
