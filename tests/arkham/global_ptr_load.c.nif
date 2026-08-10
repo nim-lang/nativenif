@@ -8,7 +8,7 @@
  (gvar :gobj.0 . T.0 .)
  (gvar :gp.0 .
   (ptr T.0).)
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -25,6 +25,6 @@
     (addr gobj.0))
    (asgn
     (dot gobj.0 v.0 0)42)
-   (call exit.c
+   (call exit.0
     (dot
      (deref gp.0)v.0 0)))))(.index)

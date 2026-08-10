@@ -5,7 +5,7 @@
   (object .
    (fld :val.0 .
     (i 64))))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -109,4 +109,4 @@
       (i 32)
       (dot
        (deref head.0)val.0 0))))
-   (call exit.c sum.0))))(.index)
+   (call exit.0 sum.0))))(.index)

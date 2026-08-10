@@ -11,7 +11,7 @@
     (i 64))))
  (type :BaseArr2.0 .
   (array Base.0 2))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -40,7 +40,7 @@
    (asgn
     (at dst.0 0)
     (at src.0 i.0))
-   (call exit.c
+   (call exit.0
     (add
      (i 64)
      (dot

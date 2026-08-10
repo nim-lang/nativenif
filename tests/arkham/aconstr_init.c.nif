@@ -4,7 +4,7 @@
  (type :IntArr4.0 .
   (array
    (i 64)4))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -23,7 +23,7 @@
     (aconstr IntArr4.0 10 x.0
      (add
       (i 64)x.0 -8)0))
-   (call exit.c
+   (call exit.0
     (add
      (i 64)
      (add

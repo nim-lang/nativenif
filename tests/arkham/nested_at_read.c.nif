@@ -6,7 +6,7 @@
    (i 64)2))
  (type :Mat.0 .
   (array Row.0 2))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -38,7 +38,7 @@
     (i 64)1)
    (var :k.0 .
     (i 64)0)
-   (call exit.c
+   (call exit.0
     (add
      (i 64)
      (at

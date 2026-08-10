@@ -9,7 +9,7 @@
   (i 64)3)
  (gvar :gf.0 .
   (f 64)0.0)
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -29,13 +29,13 @@
      (neq
       (at powtens.0 i.0)1000.0)
      (stmts
-      (call exit.c 11))))
+      (call exit.0 11))))
    (if
     (elif
      (neq
       (at powtens.0 gi.0)1000.0)
      (stmts
-      (call exit.c 12))))
+      (call exit.0 12))))
    (var :a.0 . Arr8f.0
     (aconstr Arr8f.0 0.0 1.5 2.5 3.5 4.5 5.5 6.5 7.5))
    (asgn
@@ -45,12 +45,12 @@
      (neq
       (at a.0 i.0)42.5)
      (stmts
-      (call exit.c 13))))
+      (call exit.0 13))))
    (asgn gf.0
     (at a.0 i.0))
    (if
     (elif
      (neq gf.0 42.5)
      (stmts
-      (call exit.c 14))))
-   (call exit.c 42))))
+      (call exit.0 14))))
+   (call exit.0 42))))

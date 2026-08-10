@@ -4,7 +4,7 @@
   (i 64).)
  (tvar :tg.0 .
   (i 64)7)
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -43,5 +43,5 @@
     (elif
      (neq r.0 72)
      (stmts
-      (call exit.c 11))))
-   (call exit.c 42))))
+      (call exit.0 11))))
+   (call exit.0 42))))

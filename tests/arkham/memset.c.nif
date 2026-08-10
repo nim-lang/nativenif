@@ -1,14 +1,14 @@
 (.nif27)
 (.indexat 678              )
 (stmts
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
   (pragmas
    (importc "exit"))
   (stmts .))
- (proc :memset.c
+ (proc :memset.0
   (params
    (param :d.0 .
     (ptr
@@ -35,12 +35,12 @@
     (at buf.0 0)999)
    (asgn
     (at buf.0 1)999)
-   (call memset.c
+   (call memset.0
     (addr
      (at buf.0 0))0 16)
    (asgn
     (at buf.0 0)42)
-   (call exit.c
+   (call exit.0
     (add
      (i 64)
      (at buf.0 0)

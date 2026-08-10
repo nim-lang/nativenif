@@ -1,7 +1,7 @@
 (.nif27)
 (.indexat 912              )
 (stmts
- (proc :mmap.c
+ (proc :mmap.0
   (params
    (param :addr.0 .
     (i 64))
@@ -19,7 +19,7 @@
   (pragmas
    (importc "mmap"))
   (stmts .))
- (proc :munmap.c
+ (proc :munmap.0
   (params
    (param :uaddr.0 .
     (i 64))
@@ -29,7 +29,7 @@
   (pragmas
    (importc "munmap"))
   (stmts .))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -44,7 +44,7 @@
   (stmts
    (var :p.0 .
     (i 64)
-    (call mmap.c 0 4096 3 34
+    (call mmap.0 0 4096 3 34
      (neg
       (i 64)1)0))
    (if
@@ -53,10 +53,10 @@
       (neg
        (i 64)1))
      (stmts
-      (call exit.c 1))))
+      (call exit.0 1))))
    (var :r.0 .
     (i 64)
-    (call munmap.c p.0 4096))
-   (call exit.c r.0)
+    (call munmap.0 p.0 4096))
+   (call exit.0 r.0)
    (ret 0))))(.index
  (x main.0. 566))

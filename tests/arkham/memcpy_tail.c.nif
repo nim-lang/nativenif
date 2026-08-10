@@ -1,14 +1,14 @@
 (.nif27)
 (.indexat 728              )
 (stmts
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
   (pragmas
    (importc "exit"))
   (stmts .))
- (proc :memcpy.c
+ (proc :memcpy.0
   (params
    (param :d.0 .
     (ptr
@@ -48,17 +48,17 @@
     (at dst.0 1)4294967296)
    (asgn
     (at zed.0 0)7)
-   (call memcpy.c
+   (call memcpy.0
     (addr
      (at dst.0 0))
     (addr
      (at src.0 0))12)
-   (call memcpy.c
+   (call memcpy.0
     (addr
      (at zed.0 0))
     (addr
      (at src.0 0))0)
-   (call exit.c
+   (call exit.0
     (add
      (i 64)
      (add

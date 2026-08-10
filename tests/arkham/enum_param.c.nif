@@ -7,7 +7,7 @@
    (efld :Red.0 0)
    (efld :Green.0 1)
    (efld :Blue.0 2)))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -31,4 +31,4 @@
    (var :x.0 .
     (i 64)
     (call f.0 2))
-   (call exit.c x.0))))(.index)
+   (call exit.0 x.0))))(.index)

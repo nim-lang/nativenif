@@ -1,7 +1,7 @@
 (.nif27)
 (.indexat 497              )
 (stmts
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -32,4 +32,4 @@
    (var :r.0 .
     (i 64)
     (call foo.0 20 6 7))
-   (call exit.c r.0))))(.index)
+   (call exit.0 r.0))))(.index)

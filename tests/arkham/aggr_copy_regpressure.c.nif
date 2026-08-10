@@ -12,7 +12,7 @@
    (fld :x.0 .
     (i 64))
    (fld :inner.0 . Pair.0)))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -82,4 +82,4 @@
     (i 64)
     (call run.0
      (addr x.0)10 11 14))
-   (call exit.c r.0))))(.index)
+   (call exit.0 r.0))))(.index)

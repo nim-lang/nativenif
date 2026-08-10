@@ -9,7 +9,7 @@
     (i 64))
    (fld :z.0 .
     (i 64))))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -40,4 +40,4 @@
    (var :r.0 .
     (i 64)
     (call useBig.0 b.0))
-   (call exit.c r.0))))(.index)
+   (call exit.0 r.0))))(.index)

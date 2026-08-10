@@ -5,7 +5,7 @@
   (i 64).)
  (tvar :tg.0 .
   (i 64)5)
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -24,4 +24,4 @@
     (addr tg.0))
    (asgn
     (deref p.0)37)
-   (call exit.c tg.0))))(.index)
+   (call exit.0 tg.0))))(.index)

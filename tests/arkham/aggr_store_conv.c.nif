@@ -13,7 +13,7 @@
    (fld :w.0 . Wrap.0)
    (fld :tag.0 .
     (i 64))))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -38,7 +38,7 @@
    (var :back.0 . Inner.0
     (conv Inner.0
      (dot h.0 w.0 0)))
-   (call exit.c
+   (call exit.0
     (add
      (i 64)
      (dot back.0 x.0 0)

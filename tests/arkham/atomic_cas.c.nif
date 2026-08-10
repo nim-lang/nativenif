@@ -5,7 +5,7 @@
   (i 64).)
  (gvar :expg.0 .
   (i 64)7)
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -58,4 +58,4 @@
      (addr v.0)
      (addr expg.0)1
      (false)0 0))
-   (call exit.c expg.0))))(.index)
+   (call exit.0 expg.0))))(.index)

@@ -1,14 +1,14 @@
 (.nif27)
 (.indexat 686              )
 (stmts
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
   (pragmas
    (importc "exit"))
   (stmts .))
- (proc :memcmp.c
+ (proc :memcmp.0
   (params
    (param :a.0 .
     (ptr
@@ -40,9 +40,9 @@
     (at b.0 0)58)
    (var :r.0 .
     (i 32)
-    (call memcmp.c
+    (call memcmp.0
      (addr
       (at a.0 0))
      (addr
       (at b.0 0))8))
-   (call exit.c r.0))))(.index)
+   (call exit.0 r.0))))(.index)

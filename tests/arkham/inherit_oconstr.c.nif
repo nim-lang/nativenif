@@ -17,7 +17,7 @@
   (object Mid.0
    (fld :d.0 .
     (i 64))))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -38,7 +38,7 @@
      (oconstr Mid.0 1
       (kv m.0 6))
      (kv d.0 15)))
-   (call exit.c
+   (call exit.0
     (add
      (i 64)
      (add

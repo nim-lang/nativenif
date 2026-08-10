@@ -1,7 +1,7 @@
 (.nif27)
 (.indexat 430              )
 (stmts
- (proc :write.c
+ (proc :write.0
   (params
    (param :fd.0 .
     (i 32))
@@ -24,7 +24,7 @@
     (i 64)40)
    (var :y.0 .
     (i 64)2)
-   (call write.c 1 "hi\0A" 3)
+   (call write.0 1 "hi\0A" 3)
    (ret
     (add
      (i 64)x.0 y.0)))))(.index)

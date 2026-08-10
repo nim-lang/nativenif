@@ -7,7 +7,7 @@
  (type :Holder.0 .
   (object .
    (fld :arr.0 . IntArr3.0)))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -24,7 +24,7 @@
    (asgn
     (dot h.0 arr.0)
     (aconstr IntArr3.0 20 15 7))
-   (call exit.c
+   (call exit.0
     (add
      (i 64)
      (add

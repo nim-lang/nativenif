@@ -8,7 +8,7 @@
     (u 64))))
  (gvar :g.0 .
   (u 64)0)
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -38,13 +38,13 @@
      (neq
       (dot p.0 a.0)9)
      (stmts
-      (call exit.c 11))))
+      (call exit.0 11))))
    (if
     (elif
      (neq
       (dot p.0 b.0)392)
      (stmts
-      (call exit.c 12))))
+      (call exit.0 12))))
    (asgn g.0
     (div
      (u 64)x.0 512))
@@ -52,7 +52,7 @@
     (elif
      (neq g.0 9)
      (stmts
-      (call exit.c 13))))
+      (call exit.0 13))))
    (var :sq.0 .
     (i 64)
     (div
@@ -61,5 +61,5 @@
     (elif
      (neq sq.0 -9)
      (stmts
-      (call exit.c 14))))
-   (call exit.c 42))))
+      (call exit.0 14))))
+   (call exit.0 42))))

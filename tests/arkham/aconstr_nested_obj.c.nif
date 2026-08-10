@@ -9,7 +9,7 @@
     (i 64))))
  (type :PointArr2.0 .
   (array Point.0 2))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -30,7 +30,7 @@
      (oconstr Point.0
       (kv px.0 20)
       (kv py.0 7))))
-   (call exit.c
+   (call exit.0
     (add
      (i 64)
      (add

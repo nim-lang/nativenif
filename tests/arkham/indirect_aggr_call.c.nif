@@ -12,7 +12,7 @@
    (params
     (param :x.0 . Box.0))
    (i 64).))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -52,4 +52,4 @@
    (var :res.0 .
     (i 64)
     (call apply.0 sumBox.0 inp.0))
-   (call exit.c res.0))))(.index)
+   (call exit.0 res.0))))(.index)

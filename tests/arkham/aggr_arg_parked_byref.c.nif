@@ -1,7 +1,7 @@
 (.nif27)
 (stmts
  (type :Big.0 . (object . (fld :ba.0 . (i 64)) (fld :bb.0 . (i 64)) (fld :bc.0 . (i 64))))
- (proc :exit.c (params (param :code.0 . (i 32))). (pragmas (importc "exit")) (stmts .))
+ (proc :exit.0 (params (param :code.0 . (i 32))). (pragmas (importc "exit")) (stmts .))
  (proc :take.0
   (params
    (param :x0.0 . (i 64))
@@ -31,4 +31,4 @@
    (var :r.0 . (i 64)
     (call take.0 1 2 q.0
      (div (i 64) n.0 m.0)))
-   (call exit.c r.0))))
+   (call exit.0 r.0))))

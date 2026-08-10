@@ -7,7 +7,7 @@
     (i 32))
    (fld :neighbor.0 .
     (i 32))))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -54,7 +54,7 @@
       (dot o.0 state.0 0))
      (addr exp.0)1
      (false)0 0))
-   (call exit.c
+   (call exit.0
     (sub
      (i 32)
      (dot o.0 neighbor.0 0)

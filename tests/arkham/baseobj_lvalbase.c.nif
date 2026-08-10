@@ -9,7 +9,7 @@
   (object Base.0
    (fld :extra.0 .
     (i 64))))
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -49,7 +49,7 @@
     (dot
      (baseobj Base.0 1
       (deref p.0))tag.0))
-   (call exit.c
+   (call exit.0
     (add
      (i 64)x1.0 x2.0)))))
 (.index)

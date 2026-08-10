@@ -2,7 +2,7 @@
 (stmts
  (gvar :g.0 .
   (f 64).)
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -42,4 +42,4 @@
     (i 64)
     (conv
      (i 64)s.0))
-   (call exit.c r.0))))
+   (call exit.0 r.0))))
