@@ -1131,6 +1131,44 @@ proc emLoadByte(g: var CodeGen; dest, base, idx: Reg) =
 proc emStoreByte(g: var CodeGen; base, idx, src: Reg) =
   g.ab.tree MovX64: (g.emByteAt(base, idx); g.emReg src)
 
+proc emQwordAt(g: var CodeGen; base, idx: Reg) =
+  ## `(mem (at (cast (aptr (u 64)) base) idx))` — the QUADWORD at `base[idx]`, i.e.
+  ## byte offset `idx*8`: `at` scales the index by the element type, and 8 is a legal
+  ## SIB scale, so this is still a single addressing mode. `idx` therefore counts
+  ## quadwords, not bytes.
+  g.ab.tree MemX:
+    g.ab.tree AtX:
+      g.ab.tree CastX:
+        g.ab.aptrType: g.ab.uintType(64)
+        g.emReg base
+      g.emReg idx
+
+proc emQwordThru(g: var CodeGen; base: Reg) =
+  ## `(mem (cast (ptr (u 64)) base))` — the quadword at `[base]`, no index.
+  g.ab.tree MemX:
+    g.ab.tree CastX:
+      g.ab.ptrType: g.ab.uintType(64)
+      g.emReg base
+
+proc emLoadQword(g: var CodeGen; dest, base: Reg) =
+  g.ab.tree MovX64: (g.emReg dest; g.emQwordThru(base))
+
+proc emStoreQword(g: var CodeGen; base, idx, src: Reg) =
+  g.ab.tree MovX64: (g.emQwordAt(base, idx); g.emReg src)
+
+proc emBroadcastByte(g: var CodeGen; dest, src, scratch: Reg) =
+  ## `dest` ← the low byte of `src` replicated into all eight lanes, so one quadword
+  ## store paints eight bytes. Doubling by shift+or rather than
+  ## `imul dest, 0x0101010101010101`: the multiplier does not fit an x86 immediate,
+  ## so that form would cost a `mov imm64` anyway and then a 3-cycle multiply.
+  ## `dest`, `src` and `scratch` must be three distinct registers.
+  g.movReg(dest, src)
+  g.binImm(AndX64, dest, 0xFF)
+  for sh in [8'i64, 16, 32]:
+    g.movReg(scratch, dest)
+    g.binImm(ShlX64, scratch, sh)
+    g.binReg(OrX64, dest, scratch)
+
 proc emCmpReg(g: var CodeGen; a, b: Reg) =
   g.ab.tree CmpX64: (g.emReg a; g.emReg b)
 
@@ -1200,8 +1238,29 @@ proc genMemIntrinBody(g: var CodeGen; builtin: string) =
     g.movReg(RAX, R8)                          # memmove returns dest
     g.unbindTemp(R8)
   of "memset":                                 # (dst, val, n) → dst
+    # Quadword bulk + byte tail, mirroring `genRepMovsFwd`'s split: eight bytes per
+    # iteration instead of one. The byte loop this replaces cost ~1.7 cycles per byte,
+    # which showed up as a ~50x gap against gcc's vectorized `memset` — and `zeroMem`
+    # sits behind every zeroed allocation in the runtime.
+    #
+    # `rep stosq` would be shorter still, but nifasm has no `stos` instruction (only
+    # `Repmovsb/w/d/q`), and its per-`rep` startup cost is poor at the small sizes
+    # (tens of bytes) the runtime actually memsets.
+    let tail = g.freshLabel()
     let done = g.freshLabel()
-    g.movImm(RCX, 0)                           # i = 0
+    g.bindTemp(R8, ScalarSlot)                 # the broadcast scratch, then the qword count
+    g.emBroadcastByte(RAX, RSI, R8)            # rax = val's low byte in all 8 lanes
+    g.movReg(R8, RDX)
+    g.binImm(ShrX64, R8, 3)                    # quadwords = n div 8
+    g.movImm(RCX, 0)                           # i = 0, counting QUADWORDS
+    g.emitLoop:
+      g.emCmpReg(RCX, R8)
+      g.emJcc(JaeX64, tail)
+      g.emStoreQword(RDI, RCX, RAX)            # dst64[i] = the broadcast value
+      g.binImm(AddX64, RCX, 1)
+    g.emLab(tail)
+    # The loop leaves i == n div 8, so `i*8` is where the ≤7-byte tail starts.
+    g.binImm(ShlX64, RCX, 3)                   # i = n and not 7, now counting BYTES
     g.emitLoop:
       g.emCmpReg(RCX, RDX)
       g.emJcc(JaeX64, done)
@@ -1209,11 +1268,32 @@ proc genMemIntrinBody(g: var CodeGen; builtin: string) =
       g.binImm(AddX64, RCX, 1)
     g.emLab(done)
     g.movReg(RAX, RDI)
+    g.unbindTemp(R8)
   of "memcmp":                                 # (a, b, n) → first byte difference
-    g.bindTemp(R8, ScalarSlot)                 # the second byte (held across the loop)
+    g.bindTemp(R8, ScalarSlot)                 # the second byte/quadword (held across the loop)
+    let byteLoop = g.freshLabel()
     let diff = g.freshLabel()
     let equal = g.freshLabel()
     let done = g.freshLabel()
+    # Bulk: compare EIGHT bytes per iteration. A quadword mismatch does not say which
+    # byte differs, so it just falls into the byte loop below WITHOUT advancing the
+    # pointers — that loop then rescans those same eight bytes and finds the first one.
+    # A mismatch happens at most once, so the rescan is paid once per call; the common
+    # case in this compiler is `cmpMem` on EQUAL strings, which scans to the end.
+    # Both pointers and the remaining count advance in place; memcmp returns a value,
+    # so nothing downstream needs rdi/rsi/rdx afterwards (see `memcpy`, which likewise
+    # lets `rep movs` eat rdi).
+    g.emitLoop:
+      g.ab.tree CmpX64: (g.emReg RDX; g.ab.intLit 8)
+      g.emJcc(JbX64, byteLoop)                 # fewer than 8 left → tail
+      g.emLoadQword(RAX, RDI)
+      g.emLoadQword(R8, RSI)
+      g.emCmpReg(RAX, R8)
+      g.emJcc(JneX64, byteLoop)                # differs somewhere in these 8
+      g.binImm(AddX64, RDI, 8)
+      g.binImm(AddX64, RSI, 8)
+      g.binImm(SubX64, RDX, 8)
+    g.emLab(byteLoop)
     g.movImm(RCX, 0)                           # i = 0
     g.emitLoop:
       g.emCmpReg(RCX, RDX)

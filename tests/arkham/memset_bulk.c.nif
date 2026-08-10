@@ -1,0 +1,121 @@
+(.nif27)
+(.indexat 1833             )
+(stmts
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :memset.c
+  (params
+   (param :d.0 .
+    (ptr
+     (i 64)))
+   (param :v.0 .
+    (i 32))
+   (param :n.0 .
+    (i 64)))
+  (ptr
+   (i 64))
+  (pragmas
+   (importc "memset"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :buf.0 .
+    (array
+     (i 64)5).)
+   (var :b2.0 .
+    (array
+     (i 64)1).)
+   (var :z.0 .
+    (array
+     (i 64)1).)
+   (var :t.0 .
+    (array
+     (i 64)1).)
+   (asgn
+    (at buf.0 0)0)
+   (asgn
+    (at buf.0 1)0)
+   (asgn
+    (at buf.0 2)0)
+   (asgn
+    (at buf.0 3)0)
+   (asgn
+    (at buf.0 4)7)
+   (asgn
+    (at b2.0 0)0)
+   (asgn
+    (at z.0 0)7)
+   (asgn
+    (at t.0 0)0)
+   (call memset.c
+    (addr
+     (at buf.0 0))1 29)
+   (call memset.c
+    (addr
+     (at b2.0 0))257 8)
+   (call memset.c
+    (addr
+     (at z.0 0))9 0)
+   (call memset.c
+    (addr
+     (at t.0 0))2 3)
+   (var :acc.0 .
+    (i 64)42)
+   (asgn acc.0
+    (add
+     (i 64)acc.0
+     (sub
+      (i 64)
+      (at buf.0 0)72340172838076673)))
+   (asgn acc.0
+    (add
+     (i 64)acc.0
+     (sub
+      (i 64)
+      (at buf.0 1)72340172838076673)))
+   (asgn acc.0
+    (add
+     (i 64)acc.0
+     (sub
+      (i 64)
+      (at buf.0 2)72340172838076673)))
+   (asgn acc.0
+    (add
+     (i 64)acc.0
+     (sub
+      (i 64)
+      (at buf.0 3)4311810305)))
+   (asgn acc.0
+    (add
+     (i 64)acc.0
+     (sub
+      (i 64)
+      (at buf.0 4)7)))
+   (asgn acc.0
+    (add
+     (i 64)acc.0
+     (sub
+      (i 64)
+      (at b2.0 0)72340172838076673)))
+   (asgn acc.0
+    (add
+     (i 64)acc.0
+     (sub
+      (i 64)
+      (at z.0 0)7)))
+   (asgn acc.0
+    (add
+     (i 64)acc.0
+     (sub
+      (i 64)
+      (at t.0 0)131586)))
+   (call exit.c acc.0))))(.index)
