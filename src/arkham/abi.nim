@@ -56,7 +56,8 @@ type
     hasStackArgs*: bool  ## any argument is stack-passed
     stackBytes*: int     ## bytes of the stack-argument area (8-rounded slots)
 
-proc planCall*(md: MachineDesc; slots: openArray[AsmSlot]; retByRef: bool): CallPlan =
+proc planCall*(md: MachineDesc; slots: openArray[AsmSlot]; retByRef: bool;
+               variadicFrom = -1): CallPlan =
   ## Classify `slots` (caller: one per argument expression; callee: one per
   ## declared parameter) against the target's argument registers. An aggregate
   ## that does not fit in the REMAINING integer arg registers goes ENTIRELY on
@@ -68,8 +69,30 @@ proc planCall*(md: MachineDesc; slots: openArray[AsmSlot]; retByRef: bool): Call
   var fp = 0
   var stackOff = 0
   var ord = if retByRef: 1 else: 0
+  var idx = 0
   for s in slots:
     var pp = ParamPlace(ord: ord)
+    if variadicFrom >= 0 and idx >= variadicFrom:
+      # Darwin AArch64: every argument past a `{.varargs.}` proc's declared
+      # parameters travels on the stack, 8-byte slotted, no matter how many
+      # argument registers are still free. This is the one place Apple's ABI
+      # departs from AAPCS64 (which would keep filling x0–x7), and the callee —
+      # libc's `open`/`printf`, compiled against Apple's rule — reads them from
+      # there. Passing them in registers leaves it reading whatever the stack
+      # happened to hold: `open`'s mode came out as garbage permission bits.
+      pp.isFloat = s.kind == AFloat
+      pp.isAgg = s.kind == AMem
+      pp.byRef = pp.isAgg and s.size > md.aggrByRefThreshold
+      pp.words = if pp.isAgg and not pp.byRef: (s.size + 7) div 8 else: 1
+      pp.onStack = true
+      pp.byteOff = stackOff
+      stackOff += (if pp.isAgg and not pp.byRef: (s.size + 7) and not 7 else: 8)
+      result.hasStackArgs = true
+      result.args.add pp
+      inc ord
+      inc idx
+      continue
+    inc idx
     if s.kind == AMem:
       pp.isAgg = true
       pp.byRef = s.size > md.aggrByRefThreshold

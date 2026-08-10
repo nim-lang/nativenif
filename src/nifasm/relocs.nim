@@ -19,7 +19,16 @@ type
   RelocKind* = enum
     rkCall, rkJmp, rkJe, rkJne, rkJg, rkJl, rkJge, rkJle, rkJa, rkJb, rkJae, rkJbe,
     rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp, rkLea, rkIatCall
-    rkB, rkBL, rkBEQ, rkBNE, rkCBZ, rkCBNZ, rkTBZ, rkTBNZ, rkADR, rkADRP
+    rkB, rkBL, rkBEQ, rkBNE, rkCBZ, rkCBNZ, rkTBZ, rkTBNZ, rkADR, rkADRP,
+    rkADRADD
+      ## AArch64 long-range address materialization: `adr rd, .+lo` followed by
+      ## `add|sub rd, rd, #hi, lsl #12` — 8 bytes, reach ±16 MB. Plain `ADR` has a
+      ## 21-bit signed field (±1 MB) and the patcher masked to it WITHOUT a range
+      ## check, so a rodata reference from a proc further away silently wrapped and
+      ## produced an address 2 MB (2^21) off. It stays a pure distance computation —
+      ## `adr` supplies the PC — so unlike `adrp`+`add` it needs no page arithmetic
+      ## and no knowledge of the section's final vaddr, which is why it can live here
+      ## and serve Mach-O, ELF and PE alike.
 
   # Relocation entry for optimization and patching
   RelocEntry* = object
@@ -113,7 +122,7 @@ proc calculateRelocDistance*(fromPos: int; toPos: int; kind: RelocKind = rkJmp):
   of rkIatCall: toPos - (fromPos + 6)  # IAT call is 6 bytes: FF 15 disp32
   of rkJe, rkJne, rkJg, rkJl, rkJge, rkJle, rkJa, rkJb, rkJae, rkJbe,
      rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp: toPos - (fromPos + 6)
-  of rkB, rkBL, rkBEQ, rkBNE, rkCBZ, rkCBNZ, rkTBZ, rkTBNZ, rkADR, rkADRP:
+  of rkB, rkBL, rkBEQ, rkBNE, rkCBZ, rkCBNZ, rkTBZ, rkTBNZ, rkADR, rkADRP, rkADRADD:
     toPos - fromPos  # ARM64: distance from start of instruction (will be divided by 4 later)
 
 # Jump optimization functions
@@ -144,6 +153,8 @@ proc updateRelocDisplacements*(buf: var Buffer) =
         currentPos + 6
       of rkB, rkBL, rkBEQ, rkBNE, rkCBZ, rkCBNZ, rkTBZ, rkTBNZ, rkADR, rkADRP:
         currentPos + 4  # All ARM64 instructions are 4 bytes
+      of rkADRADD:
+        currentPos + 8  # `adr` + `add|sub` pair
 
     if requiredSize > buf.data.len:
       continue  # Skip this relocation if buffer is too small
@@ -252,8 +263,47 @@ proc updateRelocDisplacements*(buf: var Buffer) =
       buf.data[currentPos + 1] = byte((instr shr 8) and 0xFF)
       buf.data[currentPos + 2] = byte((instr shr 16) and 0xFF)
       buf.data[currentPos + 3] = byte((instr shr 24) and 0xFF)
+    of rkADRADD:
+      # ARM64 long-range address: `adr rd, .+lo` ; `add|sub rd, rd, #hi, lsl #12`.
+      # Split the displacement into a 4096-granular part carried by the shifted
+      # `add`/`sub` immediate and a remainder |lo| < 4096 that always fits ADR's
+      # 21-bit signed field. Purely a distance computation — `adr` contributes the
+      # PC — so no page arithmetic and no final-vaddr knowledge is needed.
+      var hi = distance div 4096
+      var lo = distance - hi * 4096          # Nim `div` truncates toward zero, so
+      if lo < 0: lo += 4096; dec hi          # normalize to 0 <= lo < 4096
+      let neg = hi < 0
+      let mag = if neg: -hi else: hi
+      if mag > 0xFFF:
+        raise newException(ValueError,
+          "AArch64 address materialization out of range: " & $distance &
+          " bytes (limit ±16 MB)")
+      let imm21 = uint32(int32(lo) and 0x1FFFFF)
+      var adrInstr = uint32(buf.data[currentPos]) or
+                     (uint32(buf.data[currentPos + 1]) shl 8) or
+                     (uint32(buf.data[currentPos + 2]) shl 16) or
+                     (uint32(buf.data[currentPos + 3]) shl 24)
+      adrInstr = (adrInstr and 0x9F00001F'u32) or
+                 ((imm21 and 0x03'u32) shl 29) or ((imm21 shr 2) shl 5)
+      for i in 0 ..< 4:
+        buf.data[currentPos + i] = byte((adrInstr shr (8 * i)) and 0xFF)
+      # ADD/SUB (immediate), 64-bit, with `sh` (bit 22) set for the LSL #12 form.
+      # The placeholder carries `rd`/`rn`; bit 30 selects SUB, so a negative
+      # displacement only flips that bit.
+      var addInstr = uint32(buf.data[currentPos + 4]) or
+                     (uint32(buf.data[currentPos + 5]) shl 8) or
+                     (uint32(buf.data[currentPos + 6]) shl 16) or
+                     (uint32(buf.data[currentPos + 7]) shl 24)
+      addInstr = (addInstr and 0xBF0003FF'u32) or 0x00400000'u32 or
+                 (uint32(mag) shl 10)
+      if neg: addInstr = addInstr or 0x40000000'u32
+      for i in 0 ..< 4:
+        buf.data[currentPos + 4 + i] = byte((addInstr shr (8 * i)) and 0xFF)
     of rkADR:
       # ARM64 ADR: 21-bit signed immediate, byte offset from PC
+      if distance < -(1 shl 20) or distance >= (1 shl 20):
+        raise newException(ValueError,
+          "AArch64 ADR out of range: " & $distance & " bytes (limit ±1 MB)")
       let imm21 = uint32(int32(distance) and 0x1FFFFF)
       let baseInstr = uint32(buf.data[currentPos]) or
                       (uint32(buf.data[currentPos + 1]) shl 8) or
@@ -313,6 +363,7 @@ proc longSizeOf(kind: RelocKind): int {.inline.} =
   of rkJe, rkJne, rkJg, rkJl, rkJge, rkJle, rkJa, rkJb, rkJae, rkJbe,
      rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp: 6
   of rkB, rkBL, rkBEQ, rkBNE, rkCBZ, rkCBNZ, rkTBZ, rkTBNZ, rkADR, rkADRP: 4
+  of rkADRADD: 8
 
 proc shortJccOpcode(kind: RelocKind): byte =
   case kind

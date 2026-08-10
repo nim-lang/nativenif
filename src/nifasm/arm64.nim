@@ -595,6 +595,16 @@ proc emitAdr*(dest: var Buffer; rd: Register; target: LabelId) =
   dest.data.addUint32(0x10000000'u32 or encodeReg(rd))  # Placeholder
   dest.addReloc(pos, target, rkADR, 4)
 
+proc emitAdrLong*(dest: var Buffer; rd: Register; target: LabelId) =
+  ## `rd = &target` for a target ANY distance up to ±16 MB away: `adr rd, .+lo`
+  ## followed by `add|sub rd, rd, #hi, lsl #12` (see `rkADRADD`). Plain `emitAdr`
+  ## reaches only ±1 MB, which a multi-megabyte `.text` — nimony's self-hosted
+  ## `nimsem` is 2.5 MB — silently exceeded.
+  let pos = dest.data.getCurrentPosition()
+  dest.data.addUint32(0x10000000'u32 or encodeReg(rd))                      # adr rd, 0
+  dest.data.addUint32(0x91000000'u32 or (encodeReg(rd) shl 5) or encodeReg(rd))  # add rd, rd, #0
+  dest.addReloc(pos, target, rkADRADD, 8)
+
 # ADRP instruction (load page address)
 proc emitAdrpAddGvar*(dest: var Bytes; rd: Register) =
   ## Placeholder `adrp rd, 0` + `add rd, rd, #0` for a __DATA/.bss global; the

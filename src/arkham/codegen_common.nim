@@ -184,6 +184,13 @@ type
                                              ## instead of taking a staging reg of their own.
                                              ## The consumer owns that register, so
                                              ## `dropLvalStride` must not unbind it.
+    lvalStrideOnBridge*: HashSet[int]        ## a64: the `(at/pat)` positions whose stride scratch
+                                             ## must come from a STAGING BRIDGE at emission time
+                                             ## because the allocation walk found the temp pool AND
+                                             ## the callee-saved file fully live (register-homed
+                                             ## locals do not compete for a bridge). Recorded by
+                                             ## `emitLvalWalk`, honoured in `prematLval2`, released
+                                             ## with the rest of the scratch in `freeLvalTemps2`.
     lvalGlobBase*: Table[int, Reg]           ## x64: the address of a module-level global
                                              ## aggregate base used in a transient LOAD (e.g. a
                                              ## float field read whose result is an xmm, so the
@@ -385,6 +392,11 @@ proc srcWidthSigned*(g: var CodeGen; c: Cursor): tuple[width: int, signed: bool]
         inc d; skip d                          # name, pragmas
         return slotWidthSigned(slotOf(g.prog, d))
     of scNone: return (64, true)
+  of UIntLit, CharLit:
+    # An UNSIGNED literal. The width is the full register (nothing to extend), but
+    # the signedness decides `scvtf` vs `ucvtf`: `float(0xFFFF_FFFF_FFFF_FFFF'u64)`
+    # is 1.8446744073709552e19, not -1.0.
+    return (64, false)
   of TagLit:
     case c.exprKind
     of AddC, SubC, MulC, DivC, ModC, ShlC, ShrC,
@@ -392,6 +404,11 @@ proc srcWidthSigned*(g: var CodeGen; c: Cursor): tuple[width: int, signed: bool]
       var t = c                               # these carry their result type first
       t.into:
         return slotWidthSigned(slotOf(g.prog, t))
+    of SufC, ParC:                            # wrappers: the inner value decides
+      var t = c
+      t.into:
+        return g.srcWidthSigned(t)
+    of TrueC, FalseC: return (64, false)
     else: return (64, true)
   else: return (64, true)
 
@@ -447,6 +464,24 @@ proc retIsVoid*(t: Cursor): bool {.inline.} =
 # `.bss` and running an initialiser at entry. Arch-neutral: the layout follows
 # the same `typeSizeAlign` the ABI uses.
 
+proc specialFloatBits*(ek: LengExpr; bits: int): int64 =
+  ## IEEE-754 bit pattern of `(inf)` / `(-inf)` / `(nan)` at `bits` width. Both
+  ## backends materialize these through a GPR: the exponent-all-ones patterns are
+  ## outside what either ISA's float immediate encoding reaches (a64's `fmov`
+  ## 8-bit immediate covers normal values only; x64 has no float immediate at
+  ## all). `nan` is the quiet NaN — the sign bit is clear and the payload is the
+  ## leading quiet bit, matching what every other backend emits for it.
+  if bits == 32:
+    case ek
+    of InfC: 0x7F80_0000'i64
+    of NeginfC: 0xFF80_0000'i64
+    else: 0x7FC0_0000'i64
+  else:
+    case ek
+    of InfC: 0x7FF0_0000_0000_0000'i64
+    of NeginfC: cast[int64](0xFFF0_0000_0000_0000'u64)
+    else: 0x7FF8_0000_0000_0000'i64
+
 proc constLitBits*(c: Cursor): uint64 =
   ## Raw bits of a scalar literal, unwrapping `(suf value "type")` / `(par …)` and
   ## reinterprets `(cast Type value)` (e.g. `cast[ptr CFile](1)` collapses to the bits
@@ -476,6 +511,10 @@ proc constLitBits*(c: Cursor): uint64 =
     of FalseC: result = 0'u64
     of NilC:   result = 0'u64
     of NegC:   (inc v; result = cast[uint64](-cast[int64](constLitBits(v))))
+    of InfC, NeginfC, NanC:
+      # Always the f64 pattern; the FT case of `constToBytes` narrows it when the
+      # constant's type is `(f 32)`, exactly as it does for a plain float literal.
+      result = cast[uint64](specialFloatBits(v.exprKind, 64)); rawFloat = true
     else: raiseAssert "arkham const: unsupported scalar " & $v.exprKind
   else: raiseAssert "arkham const: unsupported literal kind " & $v.kind
   # Apply a class-changing int↔float conversion against the base literal's class.
@@ -576,6 +615,16 @@ proc isStaticConstInit*(c: Cursor): bool =
 proc appendLE(buf: var string; bits: uint64; size: int) =
   for i in 0 ..< size: buf.add char((bits shr (8 * i)) and 0xFF'u64)
 
+proc constScalarBits*(p: var Program; typ, val: Cursor): uint64 =
+  ## `constLitBits`, narrowed to the width of the DECLARED type. `constLitBits`
+  ## speaks f64 throughout, so an `(f 32)` constant needs its value ROUNDED to
+  ## single precision: truncating the double bits to four bytes yields 0 for
+  ## every literal whose mantissa fits in a double's low word — i.e. all of them.
+  result = constLitBits(val)
+  let rt = resolveType(p, typ)
+  if rt.kind == TagLit and rt.typeKind == FT and typeSizeAlign(p, rt)[0] == 4:
+    result = uint64(cast[uint32](float32(cast[float64](result))))
+
 proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string;
                    relocs: var seq[(int, string)]) =
   ## Append the in-memory bytes of constant `val` (of Leng type `typ`) to `buf`.
@@ -591,7 +640,7 @@ proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string;
   case rt.typeKind
   of IT, UT, CT, BoolT, FT, EnumT:
     let (sz, _) = typeSizeAlign(p, rt)
-    appendLE(buf, constLitBits(val), sz)
+    appendLE(buf, constScalarBits(p, rt, val), sz)
   of PtrT, AptrT, ProctypeT:
     let addrSym = constAddrSym(val)
     if addrSym.len > 0:
@@ -687,7 +736,7 @@ proc genGlobalInitValue*(g: var CodeGen; name: string; typ, val: Cursor; hasValu
   ## ordinary statement and never as a gvar value. Say so rather than guess.
   if not hasValue: return
   if isConstScalarInit(val):
-    g.ab.intLit cast[int64](constLitBits(val))
+    g.ab.intLit cast[int64](constScalarBits(g.prog, typ, val))
   else:
     let addrSym = constAddrSym(val)
     if addrSym.len > 0:

@@ -1,0 +1,65 @@
+(.nif27)
+(stmts
+ (type :Pair.0 .
+  (object .
+   (fld :a.0 .
+    (u 64))
+   (fld :b.0 .
+    (u 64))))
+ (gvar :g.0 .
+  (u 64)0)
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :x.0 .
+    (u 64)5000)
+   (var :s.0 .
+    (i 64)-5000)
+   (var :p.0 . Pair.0
+    (oconstr Pair.0
+     (kv a.0
+      (div
+       (u 64)x.0 512))
+     (kv b.0
+      (mod
+       (u 64)x.0 512))))
+   (if
+    (elif
+     (neq
+      (dot p.0 a.0)9)
+     (stmts
+      (call exit.c 11))))
+   (if
+    (elif
+     (neq
+      (dot p.0 b.0)392)
+     (stmts
+      (call exit.c 12))))
+   (asgn g.0
+    (div
+     (u 64)x.0 512))
+   (if
+    (elif
+     (neq g.0 9)
+     (stmts
+      (call exit.c 13))))
+   (var :sq.0 .
+    (i 64)
+    (div
+     (i 64)s.0 512))
+   (if
+    (elif
+     (neq sq.0 -9)
+     (stmts
+      (call exit.c 14))))
+   (call exit.c 42))))

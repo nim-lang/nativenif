@@ -1,0 +1,22 @@
+(.nif27)
+(stmts
+ (gvar :gExp.0
+  (pragmas
+   (exportc "cmdCount"))
+  (i 32).)
+ (proc :exit.c
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (asgn gExp.0 42)
+   (call exit.c
+    (call readIt.0.mod_clinkage)))))

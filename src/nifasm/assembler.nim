@@ -487,6 +487,12 @@ type
     # (writable) `.bss` image on disk so the slot starts with that value (correct in
     # a bundle, where a foreign module's entry-time initializer never runs).
     bssInits: seq[tuple[off: int64, val: int64, size: int]]  # (.bss byte offset, value, size)
+    # The same, for a THREAD-LOCAL's literal initializer, keyed by the tvar's
+    # displacement inside the unified block. The block's own `.bss` offset is only
+    # known once every tvar has one (`setupTls`), which is where these fold into
+    # `bssInits`. x86-64 only — macOS/arm64 bakes a tvar initializer into the
+    # `__thread_data` template instead (see `generateSymbol`).
+    tlsInits: seq[tuple[off: int64, val: int64, size: int]]
     # A gvar whose initializer is a *symbol address* (e.g. a function-pointer hook
     # like `gExitFlush = nimNoopFlush`): the target's absolute vaddr isn't known
     # until layout, so record (slot offset, target symbol) and bake the resolved
@@ -739,6 +745,22 @@ proc openForeignModule(ctx: var GenContext; modname: string; n: Cursor) =
     error("Foreign module has no embedded NIF index (reindex it): " & modfile, n)
   ctx.modules[modname] = LoadedModule(foreign: fm, loaded: true)
 
+proc allocTlsSlotX64(ctx: var GenContext; sym: Symbol; decl: Cursor) =
+  ## x86-64: give a thread-local its displacement inside the unified
+  ## `arkham.tls.0` block, and record a literal initializer so `setupTls` can bake
+  ## it into the block's image. The block is ordinary `.bss` and nothing runs
+  ## before `main` to fill it, so an initializer that is not baked in is simply
+  ## LOST — `(tvar :t . (i 64) 7)` then read 0. Three callers allocate an offset
+  ## (foreign decl, main-module pre-pass, `generateSymbol`); all three come here so
+  ## the initializer cannot be honoured by only some of them.
+  sym.offset = ctx.tlsOffset
+  ctx.tlsOffset += slots.alignedSize(sym.typ)
+  var dn = decl
+  let lc = takeLocal(dn)
+  if lc.hasVal and lc.val.kind == IntLit:
+    ctx.tlsInits.add (off: int64(sym.offset), val: getInt(lc.val),
+                      size: asmSizeOf(sym.typ))
+
 proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Scope; n: Cursor): Symbol =
   ## Resolve ONE foreign declaration by following its qualified name through the
   ## shared `nifmodules` loader: `getDecl` jumps to the indexed byte offset and
@@ -752,6 +774,7 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
   let m = ctx.modules[modname]            # ref: stable across table growth
   if not hasDecl(m.foreign, fullName): return nil
   var c = getDecl(m.foreign, fullName, asmTags, ctx.pool)  # cursor at the one decl tree
+  let declStartCur = c                    # the un-entered decl (a tvar reads its initializer)
   let declTag = tagToNifasmDecl(c.tag)
   case declTag
   of TypeD:
@@ -819,16 +842,26 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
     # field should be. (macOS/A64 relocates tvars through descriptors and allocates
     # lazily in `generateSymbol`, so leave that path untouched.)
     if ctx.arch == Arch.X64 and ctx.nameOf(result.name) notin ctx.generatedSymbols:
-      result.offset = ctx.tlsOffset
-      ctx.tlsOffset += slots.alignedSize(typ)
+      allocTlsSlotX64(ctx, result, declStartCur)
       ctx.generatedSymbols.incl ctx.nameOf(result.name)
   of RodataD:
     # A foreign read-only data blob (e.g. a string literal, or a gvar with a
     # constant-scalar initializer laid out as static data — see arkham genGlobal).
+    var probe = c              # the un-entered decl, for the `(reloc …)` scan below
     inc c
     if c.kind != SymbolDef: return nil
     result = Symbol(name: ctx.symIdOf(fullName), kind: skRodata, offset: -1, isForeign: true,
                     moduleName: modname)
+    # A blob with symbol-pointer fields must be flagged here too — exactly as pass 1
+    # flags a main-module one. Without it the Mach-O path leaves a foreign vtable in
+    # read-only __TEXT, where no rebase can reach its pointer fields, so every one of
+    # them reads back as 0 (a `=destroy` hook dispatched through it branches to null).
+    into probe:
+      skip probe               # name
+      skip probe               # bytes string literal
+      if probe.hasMore:        # one or more trailing (reloc ...) children
+        result.dataConst = true
+      while probe.hasMore: skip probe   # drain so `into` sees rem == 0
     ctx.rootScope.define(result)
   of ExtprocD:
     # A foreign module's dynamic libc extern (`(extproc :write.c.<mod> "_write")` —
@@ -2463,16 +2496,26 @@ proc memWidthOpc(typ: Type; isLoad: bool): tuple[size, opc: int] =
   ## Access width (0=byte,1=half,2=word,3=dword) and the load/store `opc` for a
   ## typed memory operand. A `(mem (dot …))` / `(mem (at …))` carries the field /
   ## element type, so a narrow integer load sign-/zero-extends and a narrow store
-  ## writes only its low bits. Anything non-integer (pointer, raw `(mem reg)`,
-  ## stack slot) is a full 64-bit access.
+  ## writes only its low bits. Anything non-integer (pointer, raw `(mem reg)`) is a
+  ## full 64-bit access.
+  ##
+  ## A STACK SLOT is its content type behind a `(stackoff …)` wrapper, so unwrap it
+  ## and size the access by what the slot HOLDS. A slot always occupies 8 bytes
+  ## (`allocSlotUp` rounds every footprint up to the granularity), so this is not
+  ## about layout — it is what makes a narrow local's home behave like the variable
+  ## it is: `strb` in, `ldrsb`/`ldrb` out. Reading one as a 64-bit cell instead
+  ## returns the upper seven bytes as well, which for a local whose address escaped
+  ## into a callee holding `ptr int8` is whatever was there before.
   var bits = 64
   var signed = false
   if typ != nil:
-    case typ.kind
-    of IntT: bits = typ.bits; signed = true       # `(i N)` (and `(c N)` chars)
-    of UIntT: bits = typ.bits
+    var t = typ
+    if t.kind == StackOffT and t.offType != nil: t = t.offType
+    case t.kind
+    of IntT: bits = t.bits; signed = true         # `(i N)` (and `(c N)` chars)
+    of UIntT: bits = t.bits
     of BoolT: bits = 8
-    else: bits = 64                                # PtrT / StackOffT / raw mem
+    else: bits = 64                                # PtrT / raw mem / aggregate
   let size = case bits
     of 8: 0
     of 16: 1
@@ -2509,6 +2552,34 @@ proc emitAddOffsetA64(ctx: var GenContext; rd, rn: arm64.Register; offset: int64
       arm64.emitAddExtended(ctx.buf.data, rd, rn, scratch)
     else:
       arm64.emitAdd(ctx.buf.data, rd, rn, scratch)
+
+proc a64FpMemBase(ctx: var GenContext; m: arm64.MemoryOperand;
+                  single: bool): (arm64.Register, int32) =
+  ## Reduce an FP load/store's memory operand to a (base, offset) pair the scaled
+  ## unsigned-offset FP form can actually encode.
+  ##
+  ## That form has NO index register and only a `0..0xFFF` *scaled* displacement,
+  ## while `(at …)` hands us `base + index<<shift (+ offset)` and a big frame hands
+  ## us an offset past the field. Both fold into the reserved X16 veneer (arkham
+  ## never allocates X16/X17), leaving the access itself a plain `[X16, #0]`.
+  ## Before this, an INDEX was silently dropped — `powtens[i]` read `powtens[0]`
+  ## for every i — and a large offset raised "FP LDR offset out of range".
+  let scale = if single: 4'i32 else: 8'i32
+  if not m.hasIndex and (m.offset mod scale) == 0 and
+     m.offset >= 0 and (m.offset div scale) <= 0xFFF:
+    return (m.base, m.offset)
+  if m.hasIndex:
+    # A SP base needs the EXTENDED-register ADD: the shifted form reads reg 31 as
+    # XZR, not SP (same rule as `lea`).
+    if m.base == arm64.SP:
+      arm64.emitAddExtended(ctx.buf.data, arm64.X16, m.base, m.index, uint8(m.shift))
+    else:
+      arm64.emitAddShifted(ctx.buf.data, arm64.X16, m.base, m.index, uint8(m.shift))
+    if m.offset != 0:
+      emitAddOffsetA64(ctx, arm64.X16, arm64.X16, m.offset, arm64.X17)
+  else:
+    emitAddOffsetA64(ctx, arm64.X16, m.base, m.offset, arm64.X17)
+  result = (arm64.X16, 0'i32)
 
 proc a64CondOf(inst: A64Inst): arm64.Condition =
   ## The condition code baked into a `csel*`/`cset*` mnemonic (same condition
@@ -2657,7 +2728,13 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     # integer-like, any width pairing is accepted (`memWidthOpc` emits the extension/
     # truncation); other moves keep the strict check. Mirrors x64's `genMovX64`.
     if dest.typ != nil and op.typ != nil:
-      proc isIntLike(t: Type): bool = t.kind in {IntT, UIntT, BoolT, IntLitT}
+      proc isIntLike(t: Type): bool =
+        # A STACK SLOT holding an integer is sized integer memory like any `(dot …)`
+        # or `(at …)`: `memWidthOpc` unwraps the `(stackoff …)` and picks the access
+        # width from the content type, so the pairing is as safe here as it is there.
+        var u = t
+        if u.kind == StackOffT and u.offType != nil: u = u.offType
+        u.kind in {IntT, UIntT, BoolT, IntLitT}
       let sizedMemReg = (dest.kind == okMem) != (op.kind == okMem) and
                         isIntLike(dest.typ) and isIntLike(op.typ)
       if not sizedMemReg and not movCompatible(dest.typ, op.typ):
@@ -2744,13 +2821,34 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       #   adrp x0, desc@PAGE ; add x0, x0, desc@PAGEOFF   (patched in writeMachO)
       #   ldr  x16, [x0]                                   ; load the thunk
       #   blr  x16                                         ; x0 = &var
+      #
+      # x0 and x16 are the sequence's OWN scratch, not the caller's to lose. Every
+      # other instruction here writes its destination and nothing else, and a code
+      # generator that staged `f(a, tvar)` — arg 0 already parked in x0 — would
+      # otherwise watch that argument vanish with no instruction to blame. Spill
+      # both around the thunk so `(adr D tvar)` writes D alone. (`blr` still sets
+      # lr, which is why a proc touching a thread-local is analysed as having a
+      # call and keeps a frame.)
+      arm64.emitSubImm(ctx.buf.data, arm64.SP, arm64.SP, 16'u16)
+      arm64.emitStr(ctx.buf.data, arm64.X0, arm64.SP, 0'i32)
+      arm64.emitStr(ctx.buf.data, arm64.X16, arm64.SP, 8'i32)
       let pos = ctx.buf.data.getCurrentPosition()
       arm64.emitAdrpAddGvar(ctx.buf.data, arm64.X0)     # x0 = &descriptor
       ctx.tlvSites.add (pos, op.tlvSym)
       arm64.emitLdr(ctx.buf.data, arm64.X16, arm64.X0, 0'i32)
       arm64.emitBlr(ctx.buf.data, arm64.X16)
-      if dest.reg != arm64.X0:
+      # Land the result in `dest` and restore the two scratch registers — skipping
+      # whichever one `dest` IS, since that one now holds the address.
+      if dest.reg == arm64.X0:
+        arm64.emitLdr(ctx.buf.data, arm64.X16, arm64.SP, 8'i32)
+      elif dest.reg == arm64.X16:
+        arm64.emitMov(ctx.buf.data, arm64.X16, arm64.X0)
+        arm64.emitLdr(ctx.buf.data, arm64.X0, arm64.SP, 0'i32)
+      else:
         arm64.emitMov(ctx.buf.data, dest.reg, arm64.X0)
+        arm64.emitLdr(ctx.buf.data, arm64.X0, arm64.SP, 0'i32)
+        arm64.emitLdr(ctx.buf.data, arm64.X16, arm64.SP, 8'i32)
+      arm64.emitAddImm(ctx.buf.data, arm64.SP, arm64.SP, 16'u16)
     elif op.gvarSym != nil:
       # Global in __DATA/.bss: form its address with adrp+add (PC-relative adr
       # can't reach __DATA). Emit placeholders; writeMachO patches the page /
@@ -2762,7 +2860,9 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       # Check if operand is a label: type should be UIntT and not immediate/memory
       if op.typ.kind != UIntT or op.kind == okImm or op.kind == okMem:
         error("ADR source must be a label", n)
-      arm64.emitAdr(ctx.buf, dest.reg, op.label)
+      # Long form (`adr`+`add`): a rodata blob can sit anywhere in a multi-megabyte
+      # `.text`, well past plain ADR's ±1 MB.
+      arm64.emitAdrLong(ctx.buf, dest.reg, op.label)
 
   of GloadA64, GstoreA64:
     # `(gload D S)` / `(gstore D S)` — scalar load/store of a __DATA/.bss global `S`
@@ -3378,7 +3478,8 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let rt = parseFloatOperandA64(n, ctx)
     let op = parseOperandA64(n, ctx)
     if op.kind != okMem: error("FLDR source must be memory", n)
-    arm64.emitFldr(ctx.buf.data, rt, op.mem.base, op.mem.offset, single)
+    let (base, off) = a64FpMemBase(ctx, op.mem, single)
+    arm64.emitFldr(ctx.buf.data, rt, base, off, single)
 
   of FstrA64:
     # (fstr <mem> D) — store a double/single.
@@ -3387,7 +3488,8 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     if dest.kind != okMem: error("FSTR destination must be memory", n)
     let single = isA64FpSingle(n, ctx)
     let rt = parseFloatOperandA64(n, ctx)
-    arm64.emitFstr(ctx.buf.data, rt, dest.mem.base, dest.mem.offset, single)
+    let (base, off) = a64FpMemBase(ctx, dest.mem, single)
+    arm64.emitFstr(ctx.buf.data, rt, base, off, single)
 
   of ScvtfA64, UcvtfA64:
     # (scvtf Dfp Sgpr) — int → double/single.
@@ -6211,6 +6313,15 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     if op.typ.kind != UIntT: error("Jump target must be label", n)
     checkForwardJump(ctx, op.label, n)
     x86.emitJno(ctx.buf, op.label)
+  of JpX64:
+    # PF=1. After `comisd`/`comiss` that is the UNORDERED result (an operand was
+    # NaN), which is how a float comparison tells "equal" from "either is NaN" —
+    # ZF alone cannot, since unordered sets ZF too.
+    inc n
+    let op = parseOperand(n, ctx)
+    if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
+    x86.emitJp(ctx.buf, op.label)
   of JngX64:
     inc n
     let op = parseOperand(n, ctx)
@@ -6964,8 +7075,37 @@ proc writeMachO(a: var GenContext; outfile: string) =
                                      targetOff: it.target.size)
     else: discard
 
+  # A GVAR whose initializer is a symbol ADDRESS (`(gvar :scheduler (proctype …)
+  # trivialTick.0)` — a function-pointer hook, or a global pointing at another
+  # global). Same treatment as the blob fields above: bake the target's preferred
+  # vaddr and let dyld slide it. `writeElf` bakes these into its .bss image; this
+  # path used to drop them, so on macOS every such global started as NULL and the
+  # first call through it branched to 0.
+  for it in a.bssSymInits:
+    case it.sym.kind
+    of skProc, skRodata:
+      if it.sym.kind == skRodata and it.sym.dataConst:
+        rebases.add macho.RodataRebase(fieldOff: it.off.int, targetInData: true,
+                                       targetOff: it.sym.size)
+      elif labelPos.hasKey(it.sym.offset):
+        rebases.add macho.RodataRebase(fieldOff: it.off.int, targetInData: false,
+                                       targetOff: labelPos[it.sym.offset])
+    of skGvar:
+      rebases.add macho.RodataRebase(fieldOff: it.off.int, targetInData: true,
+                                     targetOff: it.sym.size)
+    else: discard
+
+  # `--symmap`: dump every generated proc's virtual address (the Mach-O carries no
+  # symbol table). Only `writeMachO` knows where __text lands, so hand it the rows.
+  var symMapRows: seq[(int, string)] = @[]
+  if a.symMap:
+    for name, sym in a.rootScope.syms:
+      if sym.kind == skProc and labelPos.hasKey(sym.offset):
+        symMapRows.add (labelPos[sym.offset], a.nameOf(name))
+    symMapRows.sort(proc (x, y: (int, string)): int = cmp(x[0], y[0]))
+
   macho.writeMachO(code, a.bssOffset, cputype, cpusubtype, outfile, dynlink, gsites, tlv,
-                   a.bssInits, rebases)
+                   a.bssInits, rebases, symMapRows)
 
   # macOS arm64 requires code signing for all executables
   when defined(macosx):
@@ -7371,8 +7511,7 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
         for i in 0 ..< size:
           ctx.tlvData.add byte((initVal shr (8 * i)) and 0xFF)
       else:
-        sym.offset = ctx.tlsOffset
-        ctx.tlsOffset += size
+        allocTlsSlotX64(ctx, sym, n)
   else:
     discard  # Types and other symbols don't need code generation
 
@@ -7427,6 +7566,11 @@ proc setupTls(ctx: var GenContext) =
   ctx.bssOffset = (ctx.bssOffset + 15) and not 15
   ctx.tlsBlockSym.size = ctx.bssOffset
   ctx.bssOffset += (ctx.tlsOffset + 15) and not 15
+  # Now that the block has its `.bss` offset, every tvar's literal initializer is at
+  # a known image address: bake it in like a gvar's (`allocTlsSlotX64`).
+  for it in ctx.tlsInits:
+    ctx.bssInits.add (off: int64(ctx.tlsBlockSym.size) + it.off, val: it.val,
+                      size: it.size)
   # Synthesize the FS-setup prologue at the end of .text — it becomes the ELF entry
   # (see writeElf) and tail-jumps to the program's real entry proc.
   ctx.tlsEntryOffset = ctx.buf.data.len
@@ -7526,8 +7670,7 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false) =
           if tn.kind == SymbolDef:
             let sym = scope.lookup(getSymId(tn))
             if sym != nil and sym.kind == skTvar and ctx.nameOf(sym.name) notin ctx.generatedSymbols:
-              sym.offset = ctx.tlsOffset
-              ctx.tlsOffset += slots.alignedSize(sym.typ)
+              allocTlsSlotX64(ctx, sym, start)
               ctx.generatedSymbols.incl ctx.nameOf(sym.name)   # don't re-allocate in generateSymbol
           tn = start
         skip tn

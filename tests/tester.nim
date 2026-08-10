@@ -260,12 +260,11 @@ const arkhamStressKnown: seq[string] = @[
 
 const arkhamStressA64Known: seq[string] = @[
   # Both a64 passes take this list — the qemu `linux_arm64` one and the native
-  # macOS one — because they drive the same emitters. The first two are SILENT
-  # MISCOMPILES: fewer registers may cost performance or hit a documented
+  # macOS one — because they drive the same emitters. The first is a SILENT
+  # MISCOMPILE: fewer registers may cost performance or hit a documented
   # out-of-registers assert, but can never legitimately change what a program
   # computes, so a wrong answer here is a codegen bug by construction.
   "spill_produce_float",    # float produce-into-spill reads a clobbered register
-  "steal_straddle",         # trySteal over a straddling live range yields a stale value
   "atomic_cas_regpressure", # intrinsic-operand pick has no steal/spill arm
   # `instrOperandInPlace` — read a register-homed symbol operand where it lies
   # instead of copying it into a register the row then cannot find — is x86-64
@@ -275,15 +274,9 @@ const arkhamStressA64Known: seq[string] = @[
   # porting the rule is a separate change with its own reading of the LDXR/STXR
   # sequences, not a paste.
   "atomic_cas_operand_home",
-  "shift_count_clobbers_mask", # spill path emits a stackoff (i 64) into a (u 8) value
-                            # slot under k=3 — the "stackoff into a value slot"
-                            # class. (Not the `SynthMark` shadowing bug that used
-                            # to park `aggr_copy_regpressure` here: this one
-                            # survives the fix.) The fixture's own job is
-                            # x86-64-only (rcx shift-count
-                            # clobber vs a ShiftRegOk-homed local); a64 has no
-                            # fixed shift-count register, so this entry hides
-                            # nothing the fixture is meant to guard.
+  # (`shift_count_clobbers_mask` lived here for the "stackoff into a value slot"
+  # class — a spilled `(u 8)` whose slot arkham declared `(i 64)`. Slots now carry
+  # their own type, so the class is gone and the fixture passes.)
   # NOT listed, but known: `addr_chain_depth` is the x16 twin of the x86-64
   # `addr_chain_depth` entry above — `produceIntoMem2` re-enters the produce
   # bridge while an enclosing `emitBin2`'s partial is still live in it — and

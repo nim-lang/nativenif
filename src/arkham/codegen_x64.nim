@@ -171,6 +171,12 @@ proc fmovFromGpr(g: var CodeGen; d: FReg; s: Reg; bits: int) =     # movfd/movfq
   let op = if bits == 32: MovfdX64 else: MovfqX64
   g.ab.tree op: g.emFReg d; g.emReg s
 
+proc fmovToGpr(g: var CodeGen; d: Reg; s: FReg; bits: int) =       # movfd/movfq gpr ← xmm
+  # The other direction of the same instruction; nifasm picks gpr→xmm vs xmm→gpr
+  # from which operand is the xmm one, so only the operand ORDER differs here.
+  let op = if bits == 32: MovfdX64 else: MovfqX64
+  g.ab.tree op: g.emReg d; g.emFReg s
+
 proc fbin(g: var CodeGen; op32, op64: X64Inst; d, s: FReg; bits: int) =  # d = d op s
   let op = if bits == 32: op32 else: op64
   g.ab.tree op: g.emFReg d; g.emFReg s
@@ -2319,13 +2325,13 @@ proc emitStackParamLoadsX64(g: var CodeGen; decl: Cursor) =
 # to a displacement-only FS-segment memory operand). nifasm (the linker) owns the
 # unified per-thread block `arkham.tls.0` across all bundled modules and points FS
 # at it via `arch_prctl(ARCH_SET_FS, &block)` in the entry prologue it synthesizes;
-# arkham only references the block for `&tvar`. Nim thread-locals have no
-# initializers, so the block is plain zeroed `.bss`.
+# arkham only references the block for `&tvar`. The block is `.bss`, so a literal
+# initializer is baked into its image bytes (nifasm's `allocTlsSlotX64`) — nothing
+# runs before `main` that could store one.
 
 proc genTvar(g: var CodeGen; name: string; decl: Cursor) =
-  ## Emit `(tvar :name <type> <intlit>?)`. nifasm allocates the FS offset; the
-  ## optional literal is carried (parsed but unused on x64 — `emitTlsSetup` stores
-  ## non-zero initializers at runtime since `.bss` defaults to zero).
+  ## Emit `(tvar :name <type> <intlit>?)`. nifasm allocates the FS offset and
+  ## honours the optional literal by initializing the block's image.
   var c = decl
   c.into:                                         # (tvar SymbolDef VarPragmas Type Value?)
     inc c; skip c                                 # name, pragmas
@@ -2484,6 +2490,16 @@ proc normalizeBinWidth(g: var CodeGen; resTypeC: Cursor; rD: Reg; op: X64Inst) =
   ## backend. (`and`/`or`/`xor`/`shr` of already-normalized operands stay normalized,
   ## so they need no fixup.)
   if op notin {AddX64, SubX64, ImulX64, ShlX64}: return
+  let slot = typeToSlot(resTypeC)
+  if slot.kind in {AInt, AUInt} and slot.size > 0 and slot.size < 8:
+    g.extendTo(rD, slot.size * 8, signed = slot.kind == AInt)
+
+proc normalizeUnaryWidth(g: var CodeGen; resTypeC: Cursor; rD: Reg) =
+  ## The `neg`/`not` twin of `normalizeBinWidth`. Both are computed 64-bit wide, so
+  ## on a sub-64-bit type they leave bits ABOVE the type width: `~15'u8` is
+  ## `0xFFFF_FFFF_FFFF_FFF0`, not `0xF0`, and a following unsigned compare (or
+  ## `shr`, or `div`) reads the stale bits. Signed types need it too, but only at
+  ## the boundary — `neg` of `-128'i8` is `+128`, whose i8 value is `-128` again.
   let slot = typeToSlot(resTypeC)
   if slot.kind in {AInt, AUInt} and slot.size > 0 and slot.size < 8:
     g.extendTo(rD, slot.size * 8, signed = slot.kind == AInt)
@@ -3099,11 +3115,11 @@ proc emitValue2(g: var CodeGen; c: Cursor; dest: var Location) =
       g.forceRegDestE(dest)
       if dest.kind == NamedStack and dest.spillTemp:
         g.produceIntoMem2(c, dest); return
-      var inner: Cursor
+      var resType, inner: Cursor
       block:
         var cc = c
         cc.into:
-          skip cc                                 # result type
+          resType = cc; skip cc                   # result type
           inner = cc; skip cc
           while cc.hasMore: skip cc
       var iv = dest                               # dest-thread into the operand
@@ -3118,6 +3134,7 @@ proc emitValue2(g: var CodeGen; c: Cursor; dest: var Location) =
           g.ab.tree NegX64: g.emReg dest.r
         else:
           g.ab.tree NotX64: g.emReg dest.r
+        g.normalizeUnaryWidth(resType, dest.r)
         if not (iv.kind == InReg and iv.r == dest.r): g.freeVal(iv)
     of SufC, ParC:                                # wrapper → the inner value
       var inner: Cursor
@@ -5530,16 +5547,52 @@ proc emitCondE(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
         while cc.hasMore: skip cc
     if g.isFloatExpr(aC):
       # FLOAT comparison: comisd/comiss; both operands in xmm registers.
+      #
+      # `comisd` reports an UNORDERED pair (either operand NaN) as ZF=PF=CF=1 —
+      # which reads exactly like "equal" and like "below or equal" to the plain
+      # unsigned tags. IEEE says every one of `==`, `<`, `<=` is FALSE against a
+      # NaN (and `!=` is true), so the tags cannot be taken as-is:
+      #   * `<` / `<=`: emit the compare with the operands SWAPPED and test the
+      #     above/above-or-equal side. Those need CF=0, which unordered never
+      #     produces, so the relation comes out false — no extra branch. The
+      #     evaluation order of the operands is untouched; only the two register
+      #     fields of the `comisd` trade places.
+      #   * `==` / `!=`: ZF alone cannot separate "equal" from "unordered", so PF
+      #     decides. `==`-taken needs one guard jump around the `je`; the three
+      #     other combinations are a two-jump disjunction or a single jump.
       let fbits = g.floatBits(aC)
-      let tag = cmpJccTag(ek, whenTrue, signed = false)
+      let swapped = ek in {LtC, LeC}
       var fa = dontCare
       g.emitFValue2(aC, fa)
       var fb = dontCare
       g.emitFValue2(bC, fb)
       assert fa.kind == InFReg and fb.kind == InFReg, "arkham x64n: float cmp operands"
       g.ab.tree (if fbits == 32: ComissX64 else: ComisdX64):
-        g.emFReg fa.f; g.emFReg fb.f
-      g.emJcc(tag, toLabel)
+        if swapped: (g.emFReg fb.f; g.emFReg fa.f)
+        else:       (g.emFReg fa.f; g.emFReg fb.f)
+      case ek
+      of LtC:                                          # a < b  ⟺  b > a (ordered)
+        g.emJcc((if whenTrue: JaX64 else: JbeX64), toLabel)
+      of LeC:                                          # a <= b ⟺  b >= a (ordered)
+        g.emJcc((if whenTrue: JaeX64 else: JbX64), toLabel)
+      of EqC:
+        if whenTrue:
+          let lNot = g.freshLabel()
+          g.emJcc(JpX64, lNot)                         # unordered ⇒ not equal
+          g.emJcc(JeX64, toLabel)
+          g.emLab(lNot)
+        else:
+          g.emJcc(JneX64, toLabel)
+          g.emJcc(JpX64, toLabel)                      # unordered ⇒ take the false arm
+      else:                                            # NeqC
+        if whenTrue:
+          g.emJcc(JneX64, toLabel)
+          g.emJcc(JpX64, toLabel)                      # unordered ⇒ `!=` holds
+        else:
+          let lNot = g.freshLabel()
+          g.emJcc(JpX64, lNot)
+          g.emJcc(JeX64, toLabel)
+          g.emLab(lNot)
       g.freeVal(fb)
       g.freeVal(fa)
       return
@@ -5820,6 +5873,39 @@ proc emitFBinE(g: var CodeGen; c: Cursor; dest: var Location) =
       g.rb.unsealF fs2
   dest = res
 
+proc fcvtU2F(g: var CodeGen; d: FReg; s: Reg; bits: int) =
+  ## UNSIGNED 64-bit → float. `cvtsi2sd` reads its GPR as a SIGNED 64-bit value,
+  ## and SSE2 has no unsigned counterpart, so a source with bit 63 set would
+  ## convert to a negative double (`float(0xFFFF_FFFF_FFFF_FFFF'u64)` came out
+  ## -1.0). Split on that bit:
+  ##
+  ##   * clear ⇒ the value is its own signed reading; one `cvtsi2sd`.
+  ##   * set ⇒ halve it, convert, and double the result back. The halving is
+  ##     ROUND-TO-ODD (`(v shr 1) or (v and 1)`), which keeps the discarded low
+  ##     bit as a sticky bit so `cvtsi2sd`'s own rounding cannot round twice —
+  ##     a plain `shr` would make e.g. 2^64-1 come out as 2^64 exactly.
+  ##
+  ## `s` is only READ: it may be a live local's home register.
+  let lBig = g.freshLabel()
+  let lDone = g.freshLabel()
+  g.ab.tree CmpX64: (g.emReg s; g.ab.intLit 0)
+  g.emJcc(JlX64, lBig)                             # bit 63 set ⇒ ≥ 2^63 unsigned
+  g.fcvtI2F(d, s, bits)
+  g.emJmp lDone
+  g.emLab lBig
+  let half = g.pickStagingSealed("an unsigned int→float halving", ScalarSlot)
+  let odd = g.pickStagingSealed("an unsigned int→float sticky bit", ScalarSlot)
+  g.movReg(half, s)
+  g.binImm(ShrX64, half, 1)
+  g.movReg(odd, s)
+  g.binImm(AndX64, odd, 1)
+  g.binReg(OrX64, half, odd)
+  g.fcvtI2F(d, half, bits)
+  g.fbin(AddssX64, AddsdX64, d, d, bits)           # ×2 undoes the halving
+  g.giveBack odd
+  g.giveBack half
+  g.emLab lDone
+
 proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED `(conv|cast Type inner)`. Decisions inline (allocValue CastC/ConvC):
   ## float targets/sources force the SIMD/GPR shapes; a NARROWING cast whose
@@ -5869,17 +5955,21 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
         g.emitLoadLoc(iv, ivReg)
         ownIv = true
       if res.isTemp and not g.rb.isBoundFTmp(res.f): g.bindFTmp(res.f)
-      let (srcW, srcSigned) = g.srcWidthSigned(inner)
-      g.extendTo(ivReg, srcW, srcSigned)                 # normalize to the full int value
-      g.fcvtI2F(res.f, ivReg, dstBits)
+      if isCast:
+        g.fmovFromGpr(res.f, ivReg, dstBits)             # bit reinterpret, no rounding
+      else:
+        let (srcW, srcSigned) = g.srcWidthSigned(inner)
+        g.extendTo(ivReg, srcW, srcSigned)               # normalize to the full int value
+        if srcSigned or srcW < 64: g.fcvtI2F(res.f, ivReg, dstBits)
+        else: g.fcvtU2F(res.f, ivReg, dstBits)           # 2^63.. has no cvtsi2sd
       if ownIv: g.giveBack(ivReg)
       else: g.freeVal(iv)
     dest = res
     return
   if g.isFloatExpr(inner):
-    # FLOAT source → int/ptr target: cvttsd2si, then a narrow target extends.
-    if isCast:                                           # `(cast int float)` = bit reinterpret
-      raiseAssert "arkham: float bit-reinterpret cast not supported yet"
+    # FLOAT source → int/ptr target: `(conv)` is cvttsd2si and a narrow target
+    # extends; `(cast)` is a BIT REINTERPRET (movq/movd out of the xmm), so it
+    # neither rounds nor re-extends — the bits are the value.
     g.forceRegDestE(dest)
     if dest.kind == NamedStack and dest.spillTemp:
       g.produceIntoMem2(c, dest); return
@@ -5888,10 +5978,14 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
     g.emitFValue2(inner, fv)
     assert fv.kind == InFReg, "arkham x64n: float→int operand " & $fv.kind
     if res.isTemp and not g.rb.isBoundTemp(res.r): g.bindTemp(res.r, res.typ)
-    g.fcvtF2I(res.r, fv.f, (if fv.typ.size == 4: 32 else: 64))
-    if not isPtrType(tc):
-      let targetW = intTypeWidth(tc)
-      if targetW < 64: g.extendTo(res.r, targetW, signed = isSignedType(tc))
+    let fbits = if fv.typ.size == 4: 32 else: 64
+    if isCast:
+      g.fmovToGpr(res.r, fv.f, fbits)
+    else:
+      g.fcvtF2I(res.r, fv.f, fbits)
+      if not isPtrType(tc):
+        let targetW = intTypeWidth(tc)
+        if targetW < 64: g.extendTo(res.r, targetW, signed = isSignedType(tc))
     g.freeVal(fv)
     dest = res
     return
@@ -6673,18 +6767,7 @@ proc emitFValue2(g: var CodeGen; c: Cursor; dest: var Location) =
       if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f)
       let gpr = g.pickStagingSealed("a float special-value bit pattern",
                                     AsmSlot(cls: AInt, size: 8, align: 8))
-      let pat =
-        if bits == 32:
-          case c.exprKind
-          of InfC: 0x7F80_0000'i64
-          of NeginfC: 0xFF80_0000'i64
-          else: 0x7FC0_0000'i64                          # NanC (quiet NaN)
-        else:
-          case c.exprKind
-          of InfC: 0x7FF0_0000_0000_0000'i64
-          of NeginfC: cast[int64](0xFFF0_0000_0000_0000'u64)
-          else: 0x7FF8_0000_0000_0000'i64                # NanC (quiet NaN)
-      g.movImm(gpr, pat)
+      g.movImm(gpr, specialFloatBits(c.exprKind, bits))
       g.fmovFromGpr(dest.f, gpr, bits)
       g.giveBack gpr
     of ConvC, CastC: g.emitCast2(c, dest)                # conversion TO float
