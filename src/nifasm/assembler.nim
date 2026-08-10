@@ -487,6 +487,12 @@ type
     # (writable) `.bss` image on disk so the slot starts with that value (correct in
     # a bundle, where a foreign module's entry-time initializer never runs).
     bssInits: seq[tuple[off: int64, val: int64, size: int]]  # (.bss byte offset, value, size)
+    # The same, for a THREAD-LOCAL's literal initializer, keyed by the tvar's
+    # displacement inside the unified block. The block's own `.bss` offset is only
+    # known once every tvar has one (`setupTls`), which is where these fold into
+    # `bssInits`. x86-64 only — macOS/arm64 bakes a tvar initializer into the
+    # `__thread_data` template instead (see `generateSymbol`).
+    tlsInits: seq[tuple[off: int64, val: int64, size: int]]
     # A gvar whose initializer is a *symbol address* (e.g. a function-pointer hook
     # like `gExitFlush = nimNoopFlush`): the target's absolute vaddr isn't known
     # until layout, so record (slot offset, target symbol) and bake the resolved
@@ -739,6 +745,22 @@ proc openForeignModule(ctx: var GenContext; modname: string; n: Cursor) =
     error("Foreign module has no embedded NIF index (reindex it): " & modfile, n)
   ctx.modules[modname] = LoadedModule(foreign: fm, loaded: true)
 
+proc allocTlsSlotX64(ctx: var GenContext; sym: Symbol; decl: Cursor) =
+  ## x86-64: give a thread-local its displacement inside the unified
+  ## `arkham.tls.0` block, and record a literal initializer so `setupTls` can bake
+  ## it into the block's image. The block is ordinary `.bss` and nothing runs
+  ## before `main` to fill it, so an initializer that is not baked in is simply
+  ## LOST — `(tvar :t . (i 64) 7)` then read 0. Three callers allocate an offset
+  ## (foreign decl, main-module pre-pass, `generateSymbol`); all three come here so
+  ## the initializer cannot be honoured by only some of them.
+  sym.offset = ctx.tlsOffset
+  ctx.tlsOffset += slots.alignedSize(sym.typ)
+  var dn = decl
+  let lc = takeLocal(dn)
+  if lc.hasVal and lc.val.kind == IntLit:
+    ctx.tlsInits.add (off: int64(sym.offset), val: getInt(lc.val),
+                      size: asmSizeOf(sym.typ))
+
 proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Scope; n: Cursor): Symbol =
   ## Resolve ONE foreign declaration by following its qualified name through the
   ## shared `nifmodules` loader: `getDecl` jumps to the indexed byte offset and
@@ -752,6 +774,7 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
   let m = ctx.modules[modname]            # ref: stable across table growth
   if not hasDecl(m.foreign, fullName): return nil
   var c = getDecl(m.foreign, fullName, asmTags, ctx.pool)  # cursor at the one decl tree
+  let declStartCur = c                    # the un-entered decl (a tvar reads its initializer)
   let declTag = tagToNifasmDecl(c.tag)
   case declTag
   of TypeD:
@@ -819,8 +842,7 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
     # field should be. (macOS/A64 relocates tvars through descriptors and allocates
     # lazily in `generateSymbol`, so leave that path untouched.)
     if ctx.arch == Arch.X64 and ctx.nameOf(result.name) notin ctx.generatedSymbols:
-      result.offset = ctx.tlsOffset
-      ctx.tlsOffset += slots.alignedSize(typ)
+      allocTlsSlotX64(ctx, result, declStartCur)
       ctx.generatedSymbols.incl ctx.nameOf(result.name)
   of RodataD:
     # A foreign read-only data blob (e.g. a string literal, or a gvar with a
@@ -7437,8 +7459,7 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
         for i in 0 ..< size:
           ctx.tlvData.add byte((initVal shr (8 * i)) and 0xFF)
       else:
-        sym.offset = ctx.tlsOffset
-        ctx.tlsOffset += size
+        allocTlsSlotX64(ctx, sym, n)
   else:
     discard  # Types and other symbols don't need code generation
 
@@ -7493,6 +7514,11 @@ proc setupTls(ctx: var GenContext) =
   ctx.bssOffset = (ctx.bssOffset + 15) and not 15
   ctx.tlsBlockSym.size = ctx.bssOffset
   ctx.bssOffset += (ctx.tlsOffset + 15) and not 15
+  # Now that the block has its `.bss` offset, every tvar's literal initializer is at
+  # a known image address: bake it in like a gvar's (`allocTlsSlotX64`).
+  for it in ctx.tlsInits:
+    ctx.bssInits.add (off: int64(ctx.tlsBlockSym.size) + it.off, val: it.val,
+                      size: it.size)
   # Synthesize the FS-setup prologue at the end of .text — it becomes the ELF entry
   # (see writeElf) and tail-jumps to the program's real entry proc.
   ctx.tlsEntryOffset = ctx.buf.data.len
@@ -7592,8 +7618,7 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false) =
           if tn.kind == SymbolDef:
             let sym = scope.lookup(getSymId(tn))
             if sym != nil and sym.kind == skTvar and ctx.nameOf(sym.name) notin ctx.generatedSymbols:
-              sym.offset = ctx.tlsOffset
-              ctx.tlsOffset += slots.alignedSize(sym.typ)
+              allocTlsSlotX64(ctx, sym, start)
               ctx.generatedSymbols.incl ctx.nameOf(sym.name)   # don't re-allocate in generateSymbol
           tn = start
         skip tn

@@ -2047,13 +2047,13 @@ proc emitStackParamLoadsX64(g: var CodeGen; decl: Cursor) =
 # to a displacement-only FS-segment memory operand). nifasm (the linker) owns the
 # unified per-thread block `arkham.tls.0` across all bundled modules and points FS
 # at it via `arch_prctl(ARCH_SET_FS, &block)` in the entry prologue it synthesizes;
-# arkham only references the block for `&tvar`. Nim thread-locals have no
-# initializers, so the block is plain zeroed `.bss`.
+# arkham only references the block for `&tvar`. The block is `.bss`, so a literal
+# initializer is baked into its image bytes (nifasm's `allocTlsSlotX64`) — nothing
+# runs before `main` that could store one.
 
 proc genTvar(g: var CodeGen; name: string; decl: Cursor) =
-  ## Emit `(tvar :name <type> <intlit>?)`. nifasm allocates the FS offset; the
-  ## optional literal is carried (parsed but unused on x64 — `emitTlsSetup` stores
-  ## non-zero initializers at runtime since `.bss` defaults to zero).
+  ## Emit `(tvar :name <type> <intlit>?)`. nifasm allocates the FS offset and
+  ## honours the optional literal by initializing the block's image.
   var c = decl
   c.into:                                         # (tvar SymbolDef VarPragmas Type Value?)
     inc c; skip c                                 # name, pragmas
