@@ -715,9 +715,19 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
   # call of that loop inside its interval. The check is conservative:
   # `freeAfter` over-approximates the range end and a call within it denies
   # `AllRegs`, so a missed-but-live-across-call case is impossible (the unsafe
-  # direction). Params (`freeAfter == high`) are skipped.
+  # direction).
+  #
+  # PARAMS take part too, on `lastUsePos` instead of `freeAfter`: their `freeAfter`
+  # is pinned to `high` because the allocator, not the scope walk, manages their
+  # storage — that pin says "never early-freed", not "live to the end". Their live
+  # range starts at proc entry (`lo` stays 0 — every call position is > 0), so the
+  # test reduces to "the last use precedes the first call", which is exactly the
+  # condition under which a param may stay in its incoming argument register.
+  # `lastUsePos` already carries the loop back-edge extension (a use inside a loop
+  # reaches to the loop's end), so a param re-read across a back-edge that spans a
+  # call is denied here, structurally.
   for name, vi in mpairs c.res.vars:
-    if vi.freeAfter == high(int): continue
+    let isParam = vi.freeAfter == high(int)
     # Birth-point exemption: a `let x = f(…)` initializer's own call precedes the
     # value's existence — x's home receives its FIRST write from the call's result,
     # after it returned — so it must not deny `AllRegs`. Only sound for a ROOT call
@@ -732,12 +742,21 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
                   (birthFilterEnv != "-" and pname in birthFilterEnv.split(','))
     let lo = if vi.initClass == icCall and birthOk: vi.initEndPos - 1
              else: vi.liveStart
-    let hi = vi.freeAfter
+    let hi = if isParam: vi.lastUsePos else: vi.freeAfter
     var crossesCall = false
     for p in c.callPositions:
       if p > lo and p <= hi: (crossesCall = true; break)
+    # `usedAfterCall` is the same fact reached by counting completed calls rather
+    # than comparing positions. Redundant with the interval test above, kept as the
+    # belt-and-braces gate on the param path (it is what `ArgResident` has always
+    # used, and the two disagreeing would mean one of them is wrong).
+    if isParam and vi.usedAfterCall: crossesCall = true
     if not crossesCall:
       vi.props.incl AllRegs
+      # A param's fixed-role eligibility (rdx/rcx) is decided per-proc in
+      # `allocParams` from `clobbersDivReg`/`clobbersShiftReg`, not from these
+      # per-variable props — leave them off rather than grant something unread.
+      if isParam: continue
       # The fixed-role homes below stay on the STRICT test — a diverging call in the
       # interval denies them. `AllRegs` only claims "a caller-saved register is a legal
       # home", which a call that never returns cannot invalidate; `DivRegOk`/`ShiftRegOk`

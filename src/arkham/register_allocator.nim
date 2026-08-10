@@ -674,7 +674,23 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
             # binding after the first call (`flushArgResidentParams`); on a64 a param in an
             # arg reg (x0–x7) is read RAW (no `regLocal` binding — see a64 `emReg`), so there
             # is no lingering binding to flush.
-            let stayInArg = ArgResident in props and not aggrByRef and not clobbered
+            # The general form of the same argument: `AllRegs` on a PARAM means the
+            # analyser proved its last use precedes the FIRST call, so no call has
+            # marshalled anything into its arg register while it is live, and the
+            # ABI partitioning design.md calls load-bearing still holds — the param
+            # is dead by the time any marshalling starts. (`ArgResident` is the older,
+            # narrower rule: it additionally allows the last use to sit *inside* the
+            # first call's own arguments, which the position test here denies.)
+            # `flushArgResidentParams` kills the lingering binding after that call,
+            # and it is already fed from `loc.r == argReg`, not from the prop.
+            # A by-ref aggregate's POINTER is excluded from `ArgResident` because it
+            # "must survive repeated field loads" — but a field load through it does
+            # not write it, so what it actually has to survive is a CALL, and
+            # `AllRegs` says there is none. Hence `aggrByRef` blocks only the older
+            # rule. (`emitParamMoves` already elides the relocation move when the
+            # home IS the incoming register.)
+            let stayInArg = (ArgResident in props and not aggrByRef and not clobbered) or
+                            (AllRegs in props and not clobbered)
             if AddrTaken in props and not aggrByRef:
               loc = b.spillTo(name, effSlot)   # address taken → must be on the stack
             elif (hasCall or aggrByRef or clobbered) and not stayInArg:
