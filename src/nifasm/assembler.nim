@@ -6270,6 +6270,15 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     if op.typ.kind != UIntT: error("Jump target must be label", n)
     checkForwardJump(ctx, op.label, n)
     x86.emitJno(ctx.buf, op.label)
+  of JpX64:
+    # PF=1. After `comisd`/`comiss` that is the UNORDERED result (an operand was
+    # NaN), which is how a float comparison tells "equal" from "either is NaN" —
+    # ZF alone cannot, since unordered sets ZF too.
+    inc n
+    let op = parseOperand(n, ctx)
+    if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
+    x86.emitJp(ctx.buf, op.label)
   of JngX64:
     inc n
     let op = parseOperand(n, ctx)

@@ -65,6 +65,41 @@
      (neq ibits.0 9218868437227405312)
      (stmts
       (call exit.c 16))))
+   (if
+    (elif
+     (lt n.0 1.0)
+     (stmts
+      (call exit.c 17))))
+   (if
+    (elif
+     (lt 1.0 n.0)
+     (stmts
+      (call exit.c 18))))
+   (if
+    (elif
+     (le n.0 1.0)
+     (stmts
+      (call exit.c 19))))
+   (if
+    (elif
+     (le 1.0 n.0)
+     (stmts
+      (call exit.c 20))))
+   (if
+    (elif
+     (not
+      (neq n.0 n.0))
+     (stmts
+      (call exit.c 21))))
+   (var :fromBits.0 .
+    (f 64)
+    (cast
+     (f 64)9218868437227405312))
+   (if
+    (elif
+     (le fromBits.0 1000000.0)
+     (stmts
+      (call exit.c 22))))
    (var :r.0 .
     (i 64)
     (conv
