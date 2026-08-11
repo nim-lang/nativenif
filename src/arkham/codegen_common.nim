@@ -918,10 +918,35 @@ proc regFreeForTemp*(g: var CodeGen; r: Reg): bool =
   ## May the merged emitter hand `r` out as an expression temp right now? Not
   ## picked-but-unbound (the reserve→bind gap), not pinned to an in-flight call
   ## (sealed), not a live accumulator, not carrying any named binding (a local
-  ## in scope or a temp in flight), not a home. Conservative where the old
-  ## allocator was clever: a dead-but-in-scope local's home stays refused (its
-  ## binding is killed at scope exit, not at `freeAfter`) — the totality
-  ## fallback is an etmp spill, never a clobber.
+  ## in scope or a temp in flight), not a home.
+  ##
+  ## `regHoldsHome` is the immutable per-proc UNION of every register any local is
+  ## ever homed in — the same over-approximation `regHoldsLiveLocal` was written to
+  ## replace on the staging path, and the replacement never reached HERE, the path
+  ## every `pickTempReg` takes. **MEASURED COST** (`-d:arkhamTempDbg`, nifbench): of
+  ## the ~5.75 volatiles refused at each fall-through into the callee-saved pool,
+  ## **3.05 are refused by the union alone** — the largest single reason, ahead of a
+  ## live binding (1.51) and the reserve→bind gap (1.12). The pushes those
+  ## fall-throughs cause are 3.82 % of all executed instructions.
+  ##
+  ## **It still cannot go, and the reason is precise.** A register-homed BY-REF
+  ## AGGREGATE param is read as a RAW register operand (`(cast (ptr Box.0) (rsi))`),
+  ## never through a name, so it has no `rb` binding and `isBound` cannot see it.
+  ## Dropping the union hands rsi out as `tmp1.0` in `tests/arkham/a64_param_ret_alias`
+  ## (which the corpus pass builds for x64), and the field load then reads through
+  ## the very pointer it overwrites:
+  ##
+  ##     (rebind :`tmp1.0 (i 64) (rsi))
+  ##     (mov `tmp1.0 (mem (dot (dot (cast (ptr Box.0) `tmp1.0) a.0) q.0)))
+  ##
+  ## — silent corruption, then a segfault at the next field. AArch64 has the same
+  ## hole for scalar params in x0–x7 (its `emReg` reads those raw too).
+  ##
+  ## THE FIX, when someone takes it: give register-homed params an `rb` binding so
+  ## `isBound` becomes the whole authority — as `regHoldsLiveLocal` already assumes
+  ## for locals — and then delete the union from here. That is a change to how params
+  ## are emitted, not to this filter, and it unblocks the R11 bridge too (see
+  ## `forEachVolatileTempCand`).
   r notin g.pickedRegs and not g.ra.isSealed(r) and not g.rb.isAccum(r) and
     not g.rb.isBound(r) and not g.regHoldsHome(r)
 
@@ -953,6 +978,32 @@ template forEachVolatileTempCand(g: var CodeGen; r, body: untyped) =
       let r = g.md.divRemReg; body
     if g.md.shiftCountReg != NoReg and not g.ra.shiftRegClobbered:
       let r = g.md.shiftCountReg; body
+    # R11, the staging bridge, is NOT here — TRIED AND REVERTED. Adding it last (only
+    # where the alternative is a callee-saved push and pop) looks free, because
+    # `pickStagingScratch` has a callee-saved totality backstop of its own. It is not:
+    # `tests/arkham/addr_chain_depth` then dies with "no staging register available
+    # for a late memory-load address in proc chain.0", because that backstop asks
+    # `regFreeForTemp`, which refuses every callee-saved register via `regHoldsHome`.
+    # So the union blocks the temp pool AND the staging fallback; R11 only becomes
+    # spare once register-homed params carry an `rb` binding. One root cause, two
+    # symptoms — see `regFreeForTemp`.
+
+when defined(arkhamTempDbg):
+  ## `-d:arkhamTempDbg`: when `pickTempReg` falls through the WHOLE volatile pool and
+  ## takes a callee-saved register — a push and a pop — which filter refused each
+  ## volatile? "Out of registers" and "a filter is too coarse" need opposite fixes,
+  ## and only this tells them apart. It is what showed that `regHoldsHome` (the
+  ## per-proc union) refuses 3.05 of the ~5.75 candidates at every fall-through.
+  ## `arkham.nim` calls `dumpTempStats` once per module at exit.
+  var tempRefusals*: array[5, int]   ## picked, sealed, accum, bound, home
+  var tempFallbacks*: int
+  var tempVolatileHits*: int
+  proc dumpTempStats*() =
+    stderr.writeLine "TEMPSTATS volatileHits=" & $tempVolatileHits &
+      " calleeFallbacks=" & $tempFallbacks &
+      " refusedBy picked=" & $tempRefusals[0] & " sealed=" & $tempRefusals[1] &
+      " accum=" & $tempRefusals[2] & " bound=" & $tempRefusals[3] &
+      " home=" & $tempRefusals[4]
 
 proc pickTempReg*(g: var CodeGen): Reg =
   ## An expression-temp GPR: the volatile temp pool first, then a callee-saved
@@ -962,7 +1013,19 @@ proc pickTempReg*(g: var CodeGen): Reg =
   ## the backend's produce-into path), keeping temp allocation total exactly
   ## like the old `reserveTmp` fallback.
   forEachVolatileTempCand(g, r):
-    if regFreeForTemp(g, r): return r
+    if regFreeForTemp(g, r):
+      when defined(arkhamTempDbg): inc tempVolatileHits
+      return r
+  when defined(arkhamTempDbg):
+    # Charge each refused volatile to the FIRST filter that rejected it — the order
+    # `regFreeForTemp` itself evaluates them in.
+    inc tempFallbacks
+    forEachVolatileTempCand(g, r):
+      if r in g.pickedRegs: inc tempRefusals[0]
+      elif g.ra.isSealed(r): inc tempRefusals[1]
+      elif g.rb.isAccum(r): inc tempRefusals[2]
+      elif g.rb.isBound(r): inc tempRefusals[3]
+      elif g.regHoldsHome(r): inc tempRefusals[4]
   for r in g.md.intCalleeSaved:
     if regFreeForTemp(g, r):
       g.ra.usedCallee.incl r

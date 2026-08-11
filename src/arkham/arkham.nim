@@ -11,6 +11,7 @@
 import std / [parseopt, syncio, strutils]
 import nifcoreparse              # parseFromFile + nifcore
 import lengdecl                  # createLengTagPool
+import codegen_common            # (arkhamTempDbg: dumpTempStats)
 import codegen_a64               # AArch64 / Darwin backend
 import codegen_x64               # x86-64 / Linux backend
 
@@ -99,6 +100,7 @@ proc main() =
     if cpu.len == 0: cpu = hostCPU
     arch = archOf(os, cpu)
   run(input, output, arch)
+  when defined(arkhamTempDbg): dumpTempStats()
 
 when isMainModule:
   main()
