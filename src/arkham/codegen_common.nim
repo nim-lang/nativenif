@@ -925,6 +925,35 @@ proc regFreeForTemp*(g: var CodeGen; r: Reg): bool =
   r notin g.pickedRegs and not g.ra.isSealed(r) and not g.rb.isAccum(r) and
     not g.rb.isBound(r) and not g.regHoldsHome(r)
 
+template forEachVolatileTempCand(g: var CodeGen; r, body: untyped) =
+  ## The volatile GPRs `pickTempReg` may hand out, in preference order, BEFORE the
+  ## callee-saved fallback. `intTempRegs` is `r10` ALONE on x86-64, so the second
+  ## simultaneously-live expression temp went straight to a callee-saved register —
+  ## a push and a pop in a prologue that may run millions of times — while rdi, rsi,
+  ## r8, r9, rcx and rdx sat idle. Measured: `tokenWidth`, a CALL-FREE leaf, pushes
+  ## rbx and r12 for `tmp2`/`tmp4` with five volatiles free; its push/pop is 28.8 %
+  ## of its own executed instructions.
+  ##
+  ## SAFETY is the same class as `r10`'s, not a new one. `r10` is itself a
+  ## caller-saved register in `x64ClobbersGpr`, so "an expression temp does not
+  ## survive a call" is already a load-bearing invariant of this pool (a temp that
+  ## must outlive a call comes from `pickHeldReg`, callee-saved only). Adding more
+  ## volatiles cannot break an invariant the first candidate already relies on, and
+  ## `regFreeForTemp` still refuses anything picked, sealed (an in-flight call's
+  ## marshalling), bound, accumulating, or hosting a named home.
+  ##
+  ## The two FIXED-ROLE volatiles are the exception, and they are gated on the
+  ## analyser's whole-proc facts: rdx is destroyed by `idiv`, rcx by a variable
+  ## shift (and by `rep movs`, which only ever runs inside a call — where no temp
+  ## is live anyway). A proc that contains neither has no second use for them.
+  block:
+    for r in g.md.intTempRegs: body            # r10
+    for r in g.md.intLocalTempRegs: body       # rdi, rsi, r8, r9 — no fixed role
+    if g.md.divRemReg != NoReg and not g.ra.divRegClobbered:
+      let r = g.md.divRemReg; body
+    if g.md.shiftCountReg != NoReg and not g.ra.shiftRegClobbered:
+      let r = g.md.shiftCountReg; body
+
 proc pickTempReg*(g: var CodeGen): Reg =
   ## An expression-temp GPR: the volatile temp pool first, then a callee-saved
   ## register (recorded in `ra.usedCallee` so the prologue saves it — the frame
@@ -932,7 +961,7 @@ proc pickTempReg*(g: var CodeGen): Reg =
   ## candidate is live; the caller then mints a spill slot (`mintSpillName` +
   ## the backend's produce-into path), keeping temp allocation total exactly
   ## like the old `reserveTmp` fallback.
-  for r in g.md.intTempRegs:
+  forEachVolatileTempCand(g, r):
     if regFreeForTemp(g, r): return r
   for r in g.md.intCalleeSaved:
     if regFreeForTemp(g, r):
@@ -945,7 +974,7 @@ proc tempPoolDry*(g: var CodeGen): bool =
   ## not mark a callee-saved register `usedCallee` (that would add a push/pop for
   ## a register we then decline to take). For callers that can serve a value from
   ## its existing home and only want a temp when one is genuinely free.
-  for r in g.md.intTempRegs:
+  forEachVolatileTempCand(g, r):
     if regFreeForTemp(g, r): return false
   for r in g.md.intCalleeSaved:
     if regFreeForTemp(g, r): return false

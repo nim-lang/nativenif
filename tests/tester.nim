@@ -242,7 +242,11 @@ const arkhamStressKnown: seq[string] = @[
   "aggr_arg_parked_manual",
   # The intrinsic-operand pick has no steal/spill arm, one step in: the
   # compare-exchange out of `realloc` that `nimony n -d:danger` died on.
-  # (`atomic_cas_regpressure` sat here for the same reason and now passes at k=2.)
+  # (`atomic_cas_regpressure` sat here for the same reason and now PASSES: the
+  # missing arm was `pickTempReg`'s volatile candidate list, which was
+  # `intTempRegs` = r10 ALONE, so the second live temp went straight to a
+  # callee-saved register and under `k=2` stress there was nothing left to go to.
+  # Widening it to the idle volatiles fixed that fixture outright.)
   "atomic_cas_operand_home",
   # NO LONGER A SILENT MISCOMPILE. The comment here used to read "SILENT MISCOMPILE
   # (71 -> 95)": `produceIntoMem2` hands the produce bridge to the WHOLE node on the

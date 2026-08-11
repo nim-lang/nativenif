@@ -93,6 +93,10 @@ type
                                       ## call (args being marshalled, x8 result,
                                       ## values live through the call): never
                                       ## allocate to or steal from these
+    divRegClobbered*: bool            ## body contains a div/mod (rdx) / a variable shift (rcx).
+    shiftRegClobbered*: bool          ## Copied from the analyser so the EMITTER can decide whether
+                                      ## the fixed-role volatiles are usable as expression temps —
+                                      ## `pickTempReg` has no `ProcAnalysis` of its own.
     homeRegs*: set[Reg]               ## cache: every GPR some `symPos` entry is homed in.
     homeFRegs*: set[FReg]             ## Homes are immutable once emission starts, but the
     homesDirty*: bool                 ## pre-pass mutates them (record/demote/alias) — each
@@ -870,6 +874,8 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
                   aux: initTable[int, ExprAux](),
                   symPos: initTable[string, int]())
   b.ra.sealed = presealed
+  b.ra.divRegClobbered = an.clobbersDivReg
+  b.ra.shiftRegClobbered = an.clobbersShiftReg
   b.scopeVars = @[]; b.pendingFree = @[]; b.freedSyms = initHashSet[string]()
   b.seedPools()
   var n = procDecl
