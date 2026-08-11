@@ -1,6 +1,7 @@
 
 import std / [tables]
 import tags, x86
+from arm64 import nil  # only `arm64.Register`, qualified: `Register` alone stays x86's
 import nifcore  # SymId: symbols are keyed by their interned id (main-module pool),
                 # not by re-hashing the qualified name string on every lookup.
 
@@ -73,6 +74,15 @@ type
       params*: seq[Param]
       results*: seq[Param]
       clobbers*: set[Register]
+      clobbersA64*: set[arm64.Register]
+        ## The AArch64 half of the same `(clobber …)` declaration. Kept apart from
+        ## `clobbers` because the two register enums are unrelated types; a decl
+        ## only ever lists one arch's registers, so the other set stays empty.
+      hasClobberDecl*: bool
+        ## Whether a `(clobber …)` was present at all. An EMPTY declared list is
+        ## meaningful — arkham emits it for a `(attr "noreturn")` callee, whose
+        ## destruction no caller can observe — so it must not be confused with a
+        ## signature that never declared one (assume the full caller-saved set).
 
   TypeDuo* = object
     want*, got*: Type
