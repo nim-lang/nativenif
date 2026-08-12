@@ -542,16 +542,13 @@ proc rebindLocalAs(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   ## `typeCur`, via a zero-machine-code `(rebind …)`. `rebind` auto-kills the transient
   ## tenant `r` currently carries, so no manual `kill` is needed. The scope already
   ## tracks `name` (declared by `emRegLocalVar`), so `scopeLocals` is NOT touched. Type
-  ## emission mirrors `emRegLocalVar`: a pointer keeps its precise `(ptr …)`, every
-  ## other scalar is the generic `(i 64)` register form.
+  ## emission mirrors `emRegLocalVar`: the type given is the type declared, pointer or
+  ## not (it used to flatten every non-pointer to `(i 64)`).
   let isPtr = isPtrType(resolveType(g.prog, typeCur))
   g.ab.tree RebindA64:
     g.ab.symDef name
-    if isPtr:
-      var t = typeCur
-      g.genTypeBody(t)
-    else:
-      g.ab.intType(64)
+    var t = typeCur
+    g.genTypeBody(t)
     g.ab.reg r
   g.rb.rebindLocal(r, name, isPtr)
 
@@ -972,10 +969,14 @@ proc emRegLocalVar(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   g.ab.reg r
   let rt = resolveType(g.prog, typeCur)
   let isPtr = isPtrType(rt)
-  if isPtr:
-    var tc = typeCur
-    g.genTypeBody(tc)
-  else: g.ab.intType(64)
+  # The local's OWN type — `(u 8)` stays `(u 8)`. arkham still keeps every scalar
+  # 64-bit-wide in the register and normalizes with explicit extends; the declared
+  # type is what the VARIABLE is, and a register operand's type never reaches the
+  # encoder (nifasm's `movTypeOk`), so it costs nothing and makes a wide value
+  # landing in a narrow local without its extend an error rather than an invisible
+  # truncation. This used to flatten every non-pointer to `(i 64)`.
+  var tc = typeCur
+  g.genTypeBody(tc)
   g.ab.close()
   g.rb.bindLocal(r, name, isPtr)
 
@@ -4368,6 +4369,19 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
       g.storeReg2(dest, b)
       g.dropBridge b
     return
+  # Pre-retype a register-homed named dest to the INNER's type while the inner
+  # emits, and put the target type back after the extend below. The register
+  # genuinely HOLDS the inner's value until `extendTo` converts it, so a `(u 8)`
+  # local receiving an `(i 64)` value is a narrowing move nifasm rejects — rightly:
+  # the narrowing is the `lsl`/`lsr` pair that follows, not the move. Zero machine
+  # code; only the declared type moves. Mirrors the x86-64 twin.
+  var preRetyped = ""
+  if dest.kind == InReg and not dest.isTemp:
+    let nm = g.rb.boundName(dest.r)
+    var st = g.getType(inner)
+    if nm.len > 0 and bindTypeDiffers(g.prog, st, targetCur):
+      g.rebindLocalAs(nm, dest.r, st)
+      preRetyped = nm
   var iv = dest                                 # identity: thread dest down
   if iv.kind == Undef:
     # An unconstrained dest could resolve to the inner's memory home — but the
@@ -4408,6 +4422,10 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
       g.extendTo(res2.r, srcW, signed = (not isCast) and srcSigned)   # widen
     else:
       g.extendTo(res2.r, targetW, signed = isSignedType(tc))          # narrow / equal
+  # The register now holds the TARGET's value, so put the target type back on the
+  # name the pre-retype above widened. `kindChange` already did it.
+  if preRetyped.len > 0 and not kindChange:
+    g.rebindLocalAs(preRetyped, res2.r, targetCur)
 proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false) =
   ## FUSED a64 call: allocCall's placements decided inline. No parking on
   ## AArch64 (no ISA-pinned clobber registers); scalar args dest-thread
