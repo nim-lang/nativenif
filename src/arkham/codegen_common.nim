@@ -281,6 +281,19 @@ proc isPtrType*(c: Cursor): bool =
   of PtrT, AptrT, ProctypeT: true
   else: false
 
+proc bindTypeDiffers*(prog: var Program; a, b: Cursor): bool =
+  ## Would nifasm see two different BINDING types for `a` and `b`? Compares exactly
+  ## what a register binding declares — pointer-ness, width, signedness — so a
+  ## caller can skip a retype that would emit the same type it already has.
+  ## Two pointers always count as differing: the pointee drives field/element
+  ## typing, and a retype between them is free (zero machine code).
+  let ra = resolveType(prog, a)
+  let rb = resolveType(prog, b)
+  let pa = isPtrType(ra)
+  let pb = isPtrType(rb)
+  if pa or pb: return true
+  result = intTypeWidth(ra) != intTypeWidth(rb) or isSignedType(ra) != isSignedType(rb)
+
 proc checkArithResultType*(prog: var Program; resTypeC: Cursor; fallback = "") =
   ## An arithmetic node states its result type as its first child, and that type is
   ## an integer, a float, or `(aptr T)` — the array pointer, which carries an element
