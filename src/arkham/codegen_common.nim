@@ -281,6 +281,26 @@ proc isPtrType*(c: Cursor): bool =
   of PtrT, AptrT, ProctypeT: true
   else: false
 
+proc checkArithResultType*(prog: var Program; resTypeC: Cursor; fallback = "") =
+  ## An arithmetic node states its result type as its first child, and that type is
+  ## an integer, a float, or `(aptr T)` — the array pointer, which carries an element
+  ## stride and is the ONLY pointer Leng does arithmetic on. A `(ptr T)` addresses a
+  ## single object and has no `+`; neither has a proc type. Such a node is ill-typed
+  ## INPUT, and the well-typed spelling of what it wants already exists: cast to an
+  ## integer, do the arithmetic, cast back (`cast_ptr_local_retype` in the corpus).
+  ##
+  ## It is rejected rather than reinterpreted because no reinterpretation is safe to
+  ## pick. Reading it as a raw byte offset costs two zero-code `rebind`s and looks
+  ## harmless, but lengc's C backend compiles the same node as `((T)(a + b))` — C
+  ## pointer arithmetic, SCALED by the pointee's size. The two backends then answer
+  ## differently for every pointee wider than a byte, and nothing in the program says
+  ## which one the producer meant. So say so here instead, at the node that is wrong.
+  let rt = resolveType(prog, resTypeC)
+  if isPtrType(rt) and rt.typeKind != AptrT:
+    lengError(resTypeC, "arithmetic result type is a single-object pointer (" &
+              $rt.typeKind & "); Leng does pointer arithmetic on `(aptr T)` only. " &
+              "Cast to an integer, compute, and cast back.", fallback)
+
 proc isNilValue*(c: Cursor): bool {.inline.} =
   ## True if `c` is the synthesized Leng `(nil)` node (a null-pointer value/type).
   not cursorIsNil(c) and c.kind == TagLit and c.exprKind == NilC

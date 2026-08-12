@@ -142,6 +142,12 @@ const arkhamRejections: seq[(string, string)] = @[
   ("err_wrong_param_reg", "is passed in rdi by the C ABI, but is pinned to rsi"),
   ("err_inout_value", "writes through its first operand and returns nothing"),
   ("err_inout_dest", "must be a `var` argument naming a local"),
+  # Not an `{.assembler.}` rule but the same duty: `(add (ptr T) …)` is ill-typed
+  # Leng — arithmetic is for integers and `(aptr T)`. It used to be made to assemble
+  # by rebinding the destination to `(i 64)` for the instruction and back after, i.e.
+  # by picking a raw-byte reading of `+` that lengc's C backend (which emits scaled C
+  # pointer arithmetic for the same node) does not share. Both backends reject it now.
+  ("err_ptr_arith", "Leng does pointer arithmetic on `(aptr T)` only"),
 ]
 
 proc arkhamRejectionTests(arkham: string) =

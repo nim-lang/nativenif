@@ -5173,6 +5173,7 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
       lhsC = cc; skip cc
       rhsC = cc; skip cc
       while cc.hasMore: skip cc
+  checkArithResultType(g.prog, resTypeC, lengInfo(c))
   # ── Sethi–Ullman swap: foldable/memory lhs + computed rhs → rhs first, into
   # the accumulator; the leaf lhs folds after (sub completes with a neg).
   let lhsMem = isMemLeaf(lhsC)

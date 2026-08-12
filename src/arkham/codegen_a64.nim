@@ -3603,20 +3603,20 @@ proc emitValue2(g: var CodeGen; c: Cursor; dest: var Location) =
 
 # ── fused value core: unconverted-proc stubs (die as each case lands) ────────
 proc retypeBinDest(g: var CodeGen; rD: Reg; resTypeC: Cursor;
-                   inheritedOperand: bool): string =
-  ## Give `rD`'s nifasm binding a type the arithmetic about to run on it is legal
-  ## for, and return the named local whose ORIGINAL pointer binding must be put back
-  ## afterwards ("" when there is nothing to restore).
+                   inheritedOperand: bool) =
+  ## Give `rD`'s nifasm binding the type of the arithmetic result about to land in
+  ## it. The register is a named local's home (or a bound temp) whose declared type
+  ## may be a pointer while the value being computed into it is an integer — the
+  ## `(var :c.0 (ptr T) (cast (ptr T) (bitand (i 64) …)))` shape, where an enclosing
+  ## cast puts the pointer type back on. The `rebind` is zero machine code: the
+  ## register never moves, only its declared type does.
   ##
-  ## nifasm does integer arithmetic on integers and on `(aptr T)` — the array
-  ## pointer, which carries an element stride — but refuses it on a `(ptr T)`: a
-  ## single-object pointer has no meaningful `+`. Leng's `+` on a `pointer` is a RAW
-  ## byte offset (`r.base + r.pos` in bif's `rStr`), so the operation wants the
-  ## generic `(i 64)` register form and the pointer binding goes back on after it.
-  ## Both rebinds are zero machine code — the register never moves.
-  result = ""
-  let rt = resolveType(g.prog, resTypeC)
-  if not isPtrType(rt):
+  ## A POINTER result type is not handled here — `checkArithResultType` has already
+  ## rejected the node. Retyping the binding to `(i 64)` and back around the
+  ## instruction would make an ill-typed `(add (ptr T) …)` assemble by hiding it from
+  ## nifasm's `checkIntegerArithmetic`, under a raw-byte reading of `+` that the C
+  ## backend does not share.
+  if not isPtrType(resolveType(g.prog, resTypeC)):
     let nm = g.rb.boundName(rD)
     if g.rb.isBoundTemp(rD):
       if inheritedOperand:                               # inherited an operand's binding
@@ -3624,15 +3624,6 @@ proc retypeBinDest(g: var CodeGen; rD: Reg; resTypeC: Cursor;
         g.bindTemp(rD, slotOf(g.prog, rtc))
     elif nm.len > 0:
       g.rebindLocalAs(nm, rD, resTypeC)
-  elif rt.typeKind != AptrT and not g.rb.isBoundTemp(rD):
-    let nm = g.rb.boundName(rD)
-    if nm.len > 0:
-      g.ab.tree RebindA64:
-        g.ab.symDef nm
-        g.ab.intType(64)
-        g.ab.reg rD
-      g.rb.rebindLocal(rD, nm, false)
-      result = nm
 
 proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED a64 binary-arith: the shared allocBin policy decided inline
@@ -3648,6 +3639,7 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
       lhsC = cc; skip cc
       rhsC = cc; skip cc
       while cc.hasMore: skip cc
+  checkArithResultType(g.prog, resTypeC, lengInfo(c))
   let lhsMem = isMemLeaf(lhsC)
   let swap = ek notin {ShlC, ShrC} and (commutativeExpr(ek) or ek == SubC) and
              (g.isFoldableLeafE(lhsC) or lhsMem) and
@@ -3664,10 +3656,10 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     var rdst = acc
     g.emitValue2(rhsC, rdst)                             # rhs → the accumulator
     if acc.isTemp and not g.rb.isBoundTemp(rD): g.bindTemp(rD, acc.typ)
-    # Same retype the general path does below: the accumulator may be a `(ptr …)`
-    # local (a `pointer` var whose initializer is a byte-offset add), and nifasm
-    # refuses arithmetic on a single-object pointer binding.
-    let restoreSwap = g.retypeBinDest(rD, resTypeC, inheritedOperand = false)
+    # Same retype the general path does below: the accumulator may be a named
+    # local's home whose declared type is not the type of the value now landing
+    # in it (an integer computed into a `(ptr …)` local under an enclosing cast).
+    g.retypeBinDest(rD, resTypeC, inheritedOperand = false)
     var lLoc = dontCare                                  # the leaf lhs: its natural place
     if lhsMem:
       g.emitLvalue2(lhsC)                                # pick embedded base/index regs
@@ -3680,8 +3672,6 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     g.foldRhs2(foldOp, rD, lLoc, lhsC)                   # bridges serve Imm/slot/Mem lhs
     if lhsMem: g.freeLvalTemps2(lhsC)
     g.normalizeBinWidth(resTypeC, rD, op)
-    if restoreSwap.len > 0:
-      g.rebindLocalAs(restoreSwap, rD, resTypeC)         # back to its pointer type
     dest = acc
     return
   var lDest = needsReg(ScalarSlot)
@@ -3727,7 +3717,7 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
   let reusedRhs = rDest.kind == InReg and rDest.r == rD
   if res.kind == InReg and res.isTemp and not g.rb.isBoundTemp(rD):
     g.bindTemp(rD, res.typ)
-  let restorePtr = g.retypeBinDest(rD, resTypeC, reusedLhs or reusedRhs)
+  g.retypeBinDest(rD, resTypeC, reusedLhs or reusedRhs)
   let w32 = op in {AddA64, SubA64, MulA64} and not aliasRhs and isUnsigned32(resTypeC)
   if aliasRhs:
     assert lDest.kind == InReg, "arkham a64n: aliasRhs lhs " & $lDest.kind
@@ -3752,8 +3742,6 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     g.foldRhs2(op, rD, rDest, rhsC, w32)                 # dest op= rhs
   if not w32:
     g.normalizeBinWidth(resTypeC, rD, op)
-  if restorePtr.len > 0:
-    g.rebindLocalAs(restorePtr, rD, resTypeC)            # back to its pointer type
   if not reusedRhs: g.freeVal(rDest)
   if not reusedLhs: g.freeVal(lDest)
   if resStaging != NoReg:
