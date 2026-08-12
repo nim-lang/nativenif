@@ -286,8 +286,17 @@ proc canCompare(t: Type): bool =
              TypeKind.NilT}  # `cmp ptr, nil` / `cmp nil, ptr` null tests
 
 proc canDoBitwiseOps(t: Type): bool =
-  ## Check if type supports bitwise operations (including registers and literals)
-  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.RegisterT}
+  ## May `t` be an operand of `and`/`or`/`xor`/`not`? Integers, literals, raw
+  ## registers — and `bool`, for the same reason `canCompare` admits it: a bool is
+  ## an 8-bit 0/1 integer, and masking one is meaningful. `and reg, 1` after a
+  ## `setcc` is what ESTABLISHES the 0/1 invariant (the byte write leaves the rest
+  ## of the register alone), so rejecting it rejected the very sequence that makes a
+  ## bool a bool — `arc/t24764` and 74 other native tests died on it.
+  ##
+  ## Pointers stay out: there is no bit pattern of a pointer a code generator has
+  ## business masking without saying so through a cast.
+  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.RegisterT,
+             TypeKind.BoolT}
 
 proc canExchange(t: Type): bool =
   ## Check if a type may be an `xchg` operand: any register-sized scalar — integer
