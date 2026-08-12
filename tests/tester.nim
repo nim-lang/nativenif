@@ -577,7 +577,13 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/ptr_store_nonzero.nif", "can
 execExpectFailure("nim c -r src/nifasm/nifasm tests/mem_slot_offset_range.nif", "offset 16 is outside stack slot 'buf.0' (16 bytes)")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/cast_dest_reg.nif", "Expected memory destination")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/missing_result_binding.nif", "Missing result binding: ret.0")
-execExpectFailure("nim c -r src/nifasm/nifasm tests/stack_result_binding.nif", "Type mismatch: expected (stackoff")
+# `(mov <stack slot> (res ret.0))` — a call result stored straight into its stack home.
+# This USED to be an expected failure, but only by accident: x86-64's mov check did not
+# unwrap `(stackoff …)` while AArch64's did, so the same program was a type error on one
+# target and a plain sized store on the other. It is an ordinary spill of a call result;
+# both arches accept it now (one shared `movTypeOk`), and `intMemAccess`/`memWidthOpc`
+# size the store by what the slot holds.
+exec "nim c -r src/nifasm/nifasm tests/stack_result_binding.nif"
 execExpectFailure("nim c -r src/nifasm/nifasm tests/result_type_mismatch.nif", "Type mismatch:")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/call_missing_argument.nif", "Missing argument: arg.1")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/call_a64_missing_arg.nif", "Missing argument: arg.1")

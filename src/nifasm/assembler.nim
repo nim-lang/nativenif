@@ -556,6 +556,71 @@ proc checkPtrStore(dest: Type; srcKind: OperandKind; srcTyp: Type; n: Cursor) =
     error("cannot store the non-zero integer " & $srcTyp.litVal &
           " into the pointer-typed destination " & $d & " (only 0 / (nil) may be)", n)
 
+proc intMemAccess(typ: Type): tuple[bits: int; signed: bool] =
+  ## A typed memory operand's access width + signedness, so a sub-word field /
+  ## element load sign-/zero-extends and a narrow store writes only its low bits.
+  ## Pointers / raw `(mem reg)` are full 64-bit accesses.
+  ##
+  ## A STACK SLOT is its content type behind a `(stackoff …)` wrapper: unwrap it and
+  ## size the access by what the slot HOLDS, exactly as the a64 twin `memWidthOpc`
+  ## does. A slot always occupies 8 bytes, so this is not about layout — it is what
+  ## makes a narrow local's home behave like the variable it is, instead of reading
+  ## back the seven bytes above it.
+  if typ == nil: return (64, false)
+  var t = typ
+  if t.kind == StackOffT and t.offType != nil: t = t.offType
+  case t.kind
+  of IntT: (t.bits, true)
+  of UIntT: (t.bits, false)
+  of BoolT: (8, false)
+  else: (64, false)
+
+proc movTypeOk(destKind: OperandKind; destTyp: Type;
+               opKind: OperandKind; opTyp: Type): bool =
+  ## THE type rule for `mov`, shared by `genMovX64` and the a64 `MovA64` arm so the
+  ## two arches accept exactly the same programs. Both used to carry their own
+  ## spelling of it and had drifted: only x86-64 admitted the narrowing `(arg …)`
+  ## store below, so the same arkham output was legal on one target and a type error
+  ## on the other.
+  ##
+  ## The rule is kind-aware on purpose. A register operand's declared type never
+  ## reaches the encoder — a reg↔reg `mov` emits the full-width form either way, and
+  ## only a MEMORY operand sizes its access (`intMemAccess` / `memWidthOpc`). So the
+  ## width pairings that are safe depend on where the operands live, not just on what
+  ## they are:
+  ##
+  ## * `sizedMemReg` — exactly one side is memory: a load into a 64-bit register
+  ##   sign-/zero-extends a narrower field, and a store writes only the low bits. Any
+  ##   width pairing is fine; the sized emit does the work.
+  ## * `movCompatible` — the strict core: same width (either signedness), a widening
+  ##   integer move, a literal that fits by value, the address-width family, and the
+  ##   `StackOffT` unwrap for slots named directly.
+  ## * `narrowingArg` — a wider value into a NARROWER call argument is the ABI
+  ##   truncation C also performs: the callee reads only the low `param.bits` of the
+  ##   argument register, which a plain 64-bit mov already leaves correct.
+  ##
+  ## Everything else stays an error. In particular a narrowing move into a plain
+  ## register or variable (`okReg`) is NOT accepted — that is what catches binding an
+  ## `i64` call result to a `u8` var (`result_type_mismatch`), and legitimate typed
+  ## narrowing in source always carries an explicit `(conv)`.
+  if destTyp == nil or opTyp == nil: return true
+  proc isIntLike(t: Type): bool =
+    ## A STACK SLOT holding an integer is sized integer memory like any `(dot …)` or
+    ## `(at …)`: the emit unwraps the `(stackoff …)` and picks the access width from
+    ## the content type, so the pairing is as safe here as it is there.
+    var u = t
+    if u.kind == StackOffT and u.offType != nil: u = u.offType
+    u.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.BoolT, TypeKind.IntLitT}
+  let sizedMemReg = (destKind == okMem) != (opKind == okMem) and
+                    isIntLike(destTyp) and isIntLike(opTyp)
+  if sizedMemReg: return true
+  if movCompatible(destTyp, opTyp): return true
+  let narrowingArg = destKind == okArg and opKind != okMem and
+                     destTyp.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.BoolT} and
+                     opTyp.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT} and
+                     opTyp.bits > intMemAccess(destTyp).bits
+  result = narrowingArg
+
 proc inCall(ctx: GenContext): bool {.inline.} =
   ## Returns true if we're inside a prepare block
   ctx.callContext.state != CallContextState.Disabled
@@ -2764,26 +2829,13 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
-    # Type-check the move (consistent with x64's mov and ARM64's add/sub): a named
-    # local carries its declared type, so e.g. narrowing `(mov i8local i64val)` is
-    # rejected, while a widening `(mov i64local i8field)` (extending load) is allowed.
-    # A *sized* integer mem↔reg move legitimately differs in width: a load into a
-    # 64-bit register sign-/zero-extends a narrower field/element, and a store writes
-    # only the register's low bits. So when exactly one side is memory and both are
-    # integer-like, any width pairing is accepted (`memWidthOpc` emits the extension/
-    # truncation); other moves keep the strict check. Mirrors x64's `genMovX64`.
-    if dest.typ != nil and op.typ != nil:
-      proc isIntLike(t: Type): bool =
-        # A STACK SLOT holding an integer is sized integer memory like any `(dot …)`
-        # or `(at …)`: `memWidthOpc` unwraps the `(stackoff …)` and picks the access
-        # width from the content type, so the pairing is as safe here as it is there.
-        var u = t
-        if u.kind == StackOffT and u.offType != nil: u = u.offType
-        u.kind in {IntT, UIntT, BoolT, IntLitT}
-      let sizedMemReg = (dest.kind == okMem) != (op.kind == okMem) and
-                        isIntLike(dest.typ) and isIntLike(op.typ)
-      if not sizedMemReg and not movCompatible(dest.typ, op.typ):
-        typeError(dest.typ, op.typ, start)
+    # Type-check the move against THE shared rule (`movTypeOk`), the same one
+    # `genMovX64` applies: a named local carries its declared type, so a narrowing
+    # `(mov i8local i64val)` is rejected while a widening one, a sized mem↔reg pair
+    # and an ABI-truncating `(arg …)` store are accepted. Both arches must answer
+    # identically — arkham emits one program and picks a target afterwards.
+    if not movTypeOk(dest.kind, dest.typ, op.kind, op.typ):
+      typeError(dest.typ, op.typ, start)
     checkPtrStore(dest.typ, op.kind, op.typ, start)
     if dest.kind == okMem:
       if op.kind == okImm:
@@ -4951,60 +5003,16 @@ proc genIatX64(n: var Cursor; ctx: var GenContext) =
   # Emit indirect call through IAT using relocation system
   ctx.buf.emitIatCall(iatSlot)
 
-proc intMemAccess(typ: Type): tuple[bits: int; signed: bool] =
-  ## A typed memory operand's access width + signedness, so a sub-word field /
-  ## element load sign-/zero-extends and a narrow store writes only its low bits.
-  ## Pointers / raw `(mem reg)` / stack slots are full 64-bit accesses.
-  if typ == nil: return (64, false)
-  case typ.kind
-  of IntT: (typ.bits, true)
-  of UIntT: (typ.bits, false)
-  of BoolT: (8, false)
-  else: (64, false)
-
 proc genMovX64(n: var Cursor; ctx: var GenContext) =
   let start = n
   inc n
   let dest = parseDest(n, ctx)
   let op = parseOperand(n, ctx)
 
-  # Type checking. A *sized* integer mem↔reg move legitimately differs in width: a load
-  # into a 64-bit register sign-/zero-extends a narrower field/element, and a store
-  # writes only the register's low bits — so when exactly one side is memory and both
-  # are integer-like, any width pairing is accepted (the sized emit below handles it).
-  # A WIDENING reg↔reg integer move is likewise fine — a `u32` value into an `i64`
-  # scratch, in arkham's uniform 64-bit-register integer model. Narrowing reg↔reg, a
-  # kind change (the i64↔ptr family), and stack-slot result binding all stay strict.
-  if dest.typ != nil and op.typ != nil:
-    proc isIntLike(t: Type): bool = t.kind in {IntT, UIntT, BoolT, IntLitT}
-    let sizedMemReg = (dest.kind == okMem) != (op.kind == okMem) and
-                      isIntLike(dest.typ) and isIntLike(op.typ)
-    # A LITERAL has no width of its own (`parseOperand` types every one `(lit 64)`),
-    # so it widens/narrows by VALUE: `(u 32) ← 2400959708` (0x8F1BBCDC, a SHA-1
-    # round constant) is a plain 32-bit store, as is `(u 32) ← -1`. Only a literal
-    # whose bit pattern does not fit the destination is a real narrowing.
-    let wideningRegReg = dest.kind != okMem and op.kind != okMem and
-                         dest.typ.kind in {IntT, UIntT} and
-                         ((op.typ.kind in {IntT, UIntT} and
-                           op.typ.bits <= dest.typ.bits) or
-                          (op.typ.kind == IntLitT and
-                           litFitsWidth(op.typ.litVal, dest.typ.bits)))
-    # Marshalling a wider integer value into a NARROWER integer call argument (`(arg pN)`)
-    # is a legitimate ABI truncation: the callee reads only the low `param.bits` of the
-    # 64-bit argument register (as C does at the ABI boundary), and a plain 64-bit mov
-    # already leaves the correct low bits there. This is the arg-register analogue of a
-    # `sizedMemReg` store. NOTE the deliberate narrowness: only `okArg` destinations —
-    # a narrowing move into a plain register/variable (`okReg`) stays a hard type error
-    # (e.g. binding an `i64` call result to a `u8` var), so `result_type_mismatch` and
-    # kin keep failing. Legitimate typed narrowing in source always carries an explicit
-    # `(conv)`, so arkham never emits a narrowing reg→reg mov for a var binding.
-    let narrowingArgReg = dest.kind == okArg and op.kind != okMem and
-                          dest.typ.kind in {IntT, UIntT, BoolT} and
-                          op.typ.kind in {IntT, UIntT, IntLitT} and
-                          op.typ.bits > intMemAccess(dest.typ).bits
-    if not sizedMemReg and not wideningRegReg and not narrowingArgReg and
-       not addrWidthMove(dest.typ, op.typ):
-      checkType(dest.typ, op.typ, start)
+  # Type checking against THE shared rule (`movTypeOk`), the same one the a64 `mov`
+  # applies — see it for what each admitted pairing rests on.
+  if not movTypeOk(dest.kind, dest.typ, op.kind, op.typ):
+    typeError(dest.typ, op.typ, start)
   checkPtrStore(dest.typ, op.kind, op.typ, start)
 
   if dest.kind == okMem:
