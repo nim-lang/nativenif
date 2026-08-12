@@ -253,6 +253,14 @@ proc flushArgResidentParams(g: var CodeGen) =
   ## the lingering `regLocal` name binding so a later RAW reuse of that arg register (an
   ## exit syscall, a fresh marshal) emits `(reg)` rather than the dead param's typed name
   ## (which would be a nifasm type mismatch, e.g. i32 argc reused as a 64-bit syscall arg).
+  # Bindings `restoreBindings` re-established on caller-saved registers after a
+  # DIVERGING call die here too, and unlike `argResidentParams` this drain is not
+  # one-shot — a proc can have several panics, each restoring afresh.
+  if g.postDivergeBinds.len > 0:
+    for (r, name) in g.postDivergeBinds:
+      if g.rb.takeBindingIf(r, name):
+        g.ab.tree KillX64: g.ab.sym name
+    g.postDivergeBinds.setLen 0
   if g.argResidentFlushed or g.argResidentParams.len == 0: return
   g.argResidentFlushed = true
   for (r, name) in g.argResidentParams:
@@ -346,12 +354,15 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitDivMod2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCondValue2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCondE(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool)
+proc condFuseSym(g: CodeGen; c: Cursor): string
 proc emitScalarCmpE(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
                     whenTrue: bool): X64Inst
 proc emitMemLoad2(g: var CodeGen; c: Cursor; dest: var Location; late = false)
 proc emitAddr2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
+proc emCallerSaveOpen(g: var CodeGen): CallerSaveWindow
+proc emCallerSaveClose(g: var CodeGen; w: CallerSaveWindow; dest: Location)
 proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitFValue2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitLvalue2(g: var CodeGen; c: Cursor; globBase = dontCare; isStore = false)
@@ -376,6 +387,18 @@ proc binArithOp(c: Cursor): tuple[op: X64Inst, isBin: bool] =
   else: (AddX64, false)
 
 # ── named local variables (nifasm type-checks them; raw scratch stays `(reg)`) ─
+
+when not defined(arkhamNoNarrowHomes):
+  let nhFilter = getEnv("ARKHAM_NH", "*")
+    ## `ARKHAM_NH`: "*" (default) = the narrow-home filter everywhere; "-" = nowhere;
+    ## otherwise a comma-separated allowlist of proc asm-names. The bisect driver
+    ## halves the list until one proc alone reproduces the crash.
+  proc nhEnabledFor(name: string): bool =
+    if nhFilter == "*": return true
+    if nhFilter == "-": return false
+    for it in nhFilter.split(','):
+      if it == name: return true
+    false
 
 proc emRegLocalVar(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   ## Declare `(var :name (reg) type)` and bind `r` to `name` for the rest of its
@@ -404,6 +427,73 @@ proc emRegLocalVar(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
     g.ab.intType(64)
   g.ab.close()
   g.rb.bindLocal(r, name, isPtr)
+  g.nameBindTyp[name] = NameBindTyp(isPtr: isPtr, typ: typeCur)
+
+proc emRegAggrPtrVar(g: var CodeGen; name: string; r: Reg; typeName: string) =
+  ## Declare `(var :name (reg) (ptr T))` for a register holding a POINTER to the
+  ## aggregate `T`, and bind `r` to `name`. The by-reference aggregate parameter had
+  ## no declaration at all: its pointer was `mov`'d into the home register and every
+  ## later field access named the bare register (`(cast (ptr T) (rdi))`). With no
+  ## symbol, `rb` could not see the register was occupied and neither could nifasm's
+  ## binding checker — the reservation lived only in `regFreeForTemp`'s per-proc
+  ## `regHoldsHome` union. Declaring it is what lets the readers name it.
+  let dead = g.rb.takeBinding(r)
+  if dead.len > 0:
+    g.ab.tree KillX64: g.ab.sym dead
+  g.ab.open NifasmDecl.VarD
+  g.ab.symDef name
+  g.ab.reg r
+  g.ab.ptrType: g.ab.sym typeName
+  g.ab.close()
+  g.rb.bindLocal(r, name, isPtr = true)
+  g.nameBindTyp[name] = NameBindTyp(aggrName: typeName, isPtr: true)
+
+# ── bindings across a DIVERGING call ────────────────────────────────────────
+# A `(attr "noreturn")` callee never comes back, so the statement after its call is
+# reached only by a branch that jumped OVER the whole `(prepare …)` — at which point
+# every register still holds what it held before. Nothing has to survive the call;
+# what has to survive is the NAME. `rb` is linear and cannot say "not this path", so
+# the `(kill nm)`s the marshalling must emit (nifasm rejects a raw write to a bound
+# register) erase names that are still live, and the reads after fall back to raw
+# `(reg)` operands nothing can check. Snapshot, then re-establish.
+
+proc isDivergingCall(g: CodeGen; c: Cursor): bool =
+  if c.kind != TagLit: return false
+  var fc = c
+  inc fc                                     # → the callee
+  result = fc.kind == Symbol and fc.symId in g.noReturnProcs
+
+proc namedBindings(g: CodeGen): seq[tuple[r: Reg, name: string]] =
+  ## Every NAMED local/param binding (not a transient `bindTemp` scratch — that one
+  ## belongs to an expression the diverging call is not inside of, and its
+  ## `unbindTemp` is the emitter's own business).
+  result = @[]
+  for r, nm in g.rb.gprBindings():
+    if not g.rb.isBoundTemp(r) and g.nameBindTyp.hasKey(nm):
+      result.add (r: r, name: nm)
+
+proc restoreBindings(g: var CodeGen; saved: seq[tuple[r: Reg, name: string]]) =
+  for it in saved:
+    if g.rb.isBound(it.r): continue           # still ours, or legitimately re-let
+    let bt = g.nameBindTyp[it.name]
+    g.ab.tree RebindX64:                      # zero machine code: a naming directive
+      g.ab.symDef it.name
+      if bt.aggrName.len > 0:
+        g.ab.ptrType: (g.ab.sym bt.aggrName)
+      elif bt.isPtr:
+        var tc = bt.typ
+        g.genTypeBody(tc)
+      else:
+        g.ab.intType(64)
+      g.ab.reg it.r
+    g.rb.rebindLocal(it.r, it.name, bt.isPtr)
+    if it.r notin g.md.intCalleeSaved:
+      # A caller-saved home: the name is good until a call that RETURNS clobbers the
+      # register. Leaving it past that point is how a by-ref param homed in rdx ends up
+      # renaming the SECOND RETURN WORD of a later call (`(mov (mem …) n.8)` where
+      # arkham means rdx). `AllRegs` guarantees no returning call sits in the value's
+      # live range, so killing it at the next one costs nothing.
+      g.postDivergeBinds.add it
 
 proc emFRegLocalVar(g: var CodeGen; name: string; f: FReg; bits: int) =
   ## Declare a float register local: bind xmm `f` to `name` via `(rebind …)` for the
@@ -989,7 +1079,9 @@ proc takeTmp(g: var CodeGen; slot: AsmSlot): Location =
   let r = g.pickTempReg()
   if r == NoReg:
     let nm = g.mintSpillName("etmp")
-    g.ra.spillTemps.add (name: nm, typ: slot, isFloat: false)
+    when defined(arkhamTempDbg):
+      stderr.writeLine "ETMP " & g.curProcName & " " & nm & g.tempCensus()
+    g.ra.addSpillTemp(nm, slot)
     return namedStackLoc(nm, slot, spillTemp = true)
   g.pickedRegs.incl r
   when defined(arkhamBindTrace): dbgRegSite[ord(r)] = getStackTrace()
@@ -1000,7 +1092,7 @@ proc takeFTmp(g: var CodeGen; slot: AsmSlot): Location =
   let f = g.pickFTempReg()
   if f == NoFReg:
     let nm = g.mintSpillName("eftmp")
-    g.ra.spillTemps.add (name: nm, typ: slot, isFloat: true)
+    g.ra.addSpillTemp(nm, slot, isFloat = true)
     return namedStackLoc(nm, slot, spillTemp = true)
   g.pickedFRegs.incl f
   result = fregLoc(f, slot, isTemp = true)
@@ -1017,8 +1109,7 @@ proc takeHeld(g: var CodeGen; what: string; canSpill = false): Location =
     return regLoc(r, ScalarSlot, isTemp = true)
   if canSpill:
     let nm = g.mintSpillName("held")
-    g.ra.spillTemps.add (name: nm, typ: AsmSlot(cls: AInt, size: 8, align: 8),
-                         isFloat: false)
+    g.ra.addSpillTemp(nm, AsmSlot(cls: AInt, size: 8, align: 8))
     return namedStackLoc(nm, ScalarSlot, spillTemp = true)
   raiseAssert "arkham x64n: out of registers for " & what &
               " in proc " & g.curProcName & " (nothing to spill)"
@@ -1140,6 +1231,23 @@ proc mirrorJcc(jcc: X64Inst): X64Inst =
   of JaX64:  JbX64
   of JaeX64: JbeX64
   else: raiseAssert "arkham x64: no mirror for " & $jcc
+
+proc invertJcc(jcc: X64Inst): X64Inst =
+  ## The condition that holds exactly when `jcc` does not. Total over everything
+  ## `cmpJccTag`/`mirrorJcc` can produce, so a fused branch (`scanCondFusions`) can
+  ## take either sense of a compare that has already executed.
+  case jcc
+  of JeX64:  JneX64
+  of JneX64: JeX64
+  of JlX64:  JgeX64
+  of JgeX64: JlX64
+  of JleX64: JgX64
+  of JgX64:  JleX64
+  of JbX64:  JaeX64
+  of JaeX64: JbX64
+  of JbeX64: JaX64
+  of JaX64:  JbeX64
+  else: raiseAssert "arkham x64: no inverse for " & $jcc
 
 proc isCmpImmLeaf(c: Cursor): bool =
   ## A bare integer literal, `(suf …)`/`(par …)` wrappers included: what `cmp`
@@ -1417,13 +1525,82 @@ proc emPtrFieldMem(g: var CodeGen; ptrReg: Reg; typeName, field: string) =
         g.emReg ptrReg
       g.ab.sym field
 
+const arkhamNameAggrBase* = not defined(arkhamNoNameAggrBase)
+  ## Address a register-homed pointer-to-aggregate BY NAME in field accesses, and
+  ## declare the by-reference aggregate parameters that had no declaration at all, so
+  ## `rb` and nifasm's binding checker can both see them. `-d:arkhamNoNameAggrBase`
+  ## restores the old raw-register form.
+  ##
+  ## This is the prerequisite for retiring `regFreeForTemp`'s `regHoldsHome` union
+  ## (54.8 % of every "out of registers" verdict): while these pointers were unnamed,
+  ## that per-proc union was the ONLY thing reserving their registers.
+  ##
+  ## Turning it on is also what first made nifasm's call-safety checker able to see
+  ## them, and it immediately reported `syms.1` in `collectExplicitInstMatches.0.` —
+  ## a by-reference aggregate parameter left bound to **rdx** across three calls. The
+  ## allocator was right (the analyser counts a field read THROUGH the pointer as a
+  ## use, so a pointer read after a call is denied `AllRegs` and gets a callee-saved
+  ## home — verified). What was missing was the FLUSH: see `emitParamMoves`.
+
+proc emAggrPtrBase(g: var CodeGen; nm: string) =
+  ## Name the register that carries the pointer to aggregate `nm` — or, when the
+  ## register carries no binding for it, fall back to the bare register.
+  ##
+  ## The fallback is a MEASURE OF THE REMAINING HOLE, not a design: every time it
+  ## fires, a live pointer sits in a register that `rb` and nifasm's binding checker
+  ## cannot see. `-d:arkhamRawBaseDbg` counts and names them. **Two sites in a whole
+  ## nifbench build**, both the same shape: a by-ref aggregate param whose binding was
+  ## released by the marshalling of a NORETURN call (`raiseAssert`), read again on the
+  ## path that jumps over that call — where the pointer is still live. `AllRegs`
+  ## deliberately permits a diverging call in a param's interval, so the value really
+  ## is live there; only the binding is gone.
+  ##
+  ## `rawHomeRegs` picks the reservation back up for `regFreeForTemp`'s narrow filter,
+  ## but only from HERE — a temp picked between the kill and this read would still be
+  ## handed the register (the temp for the enclosing load is picked first). Closing
+  ## that window is work for whoever turns `-d:arkhamNarrowHomes` on; the per-proc
+  ## `regHoldsHome` union covers it today.
+  let loc = g.ra.locationOfSym(nm)
+  if arkhamNameAggrBase and loc.kind == InReg and g.rb.boundName(loc.r) == nm:
+    g.ab.sym nm
+  else:
+    when defined(arkhamRawBaseDbg):
+      stderr.writeLine "RAWBASE " & g.curProcName & " " & nm &
+        (if loc.kind == InReg: " reg=" & $loc.r & " boundTo=" & g.rb.boundName(loc.r)
+         else: " loc=" & $loc.kind)
+    if loc.kind == InReg:
+      g.rawHomeRegs.incl loc.r
+      g.emReg loc.r
+    else: g.ab.sym nm
+
+proc emPtrFieldMemSym(g: var CodeGen; ptrSym, typeName, field: string) =
+  ## `(mem (dot (cast (ptr T) name) field))` — the same operand as `emPtrFieldMem`
+  ## but naming the SYMBOL that owns the pointer instead of its register.
+  ##
+  ## Naming it is what makes the reservation visible. `emReg` renders a register by
+  ## its binding only when one happens to be live, so the register form silently
+  ## degrades to a bare `(rsi)` the moment the binding is not — and then nothing in
+  ## `rb` knows the register is occupied. That is the whole reason the emitter's temp
+  ## filter still has to consult `regHoldsHome`, the per-proc union of every register
+  ## any local is EVER homed in (see `regFreeForTemp`): it is compensating for reads
+  ## that dropped the name. Measured: a temp handed `rsi` in `collectSyms` while
+  ## `t.0h67 (ptr Table…)` lived there produced `rsi = 7` and a segfault, and nothing
+  ## in the asm-NIF flagged it.
+  g.ab.tree MemX:
+    g.ab.tree DotX:
+      g.ab.tree CastX:
+        g.ab.ptrType: g.ab.sym typeName
+        g.emAggrPtrBase(ptrSym)
+      g.ab.sym field
+
 proc emAggrFieldMem(g: var CodeGen; base, field: string) =
   ## Field memory operand for aggregate `base`: a `(s)` stack struct → direct dot;
-  ## a pointer in a register (a by-ref param) → through the pointer.
+  ## a pointer in a register (a by-ref param, or any pointer-to-aggregate local) →
+  ## through the pointer, BY NAME (see `emPtrFieldMemSym`).
   let loc = g.ra.locationOfSym(base)
   case loc.kind
   of NamedStack: g.emFieldMem(base, field)
-  of InReg:      g.emPtrFieldMem(loc.r, g.varType[base], field)
+  of InReg:      g.emPtrFieldMemSym(base, g.varType[base], field)
   else:
     # a synthetic nifasm `(s)` slot (e.g. a constructor temp) is rsp-relative by
     # name, just like a `NamedStack` var — the allocator simply doesn't track it.
@@ -1994,6 +2171,24 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
         # passed pointer (past the regs) is loaded by `emitStackParamLoadsX64`.
         g.varType[nm] = tn
         g.movReg(loc.r, g.md.gprAt(pl))
+        # Give the pointer a NAME so every field access can address it by symbol
+        # (`emPtrFieldMemSym` / the lvalue base) instead of naming the bare register.
+        if arkhamNameAggrBase:
+          g.emRegAggrPtrVar(nm, loc.r, tn)
+          if loc.r == g.md.gprAt(pl):
+            # The pointer STAYED in its incoming argument register, which is
+            # caller-saved. `allocParams` only allows that under `AllRegs` — the
+            # analyser's proof that the param's last use precedes the FIRST call — so
+            # the value is dead by that call, but the NAME BINDING is not: without a
+            # flush it outlives every call that clobbers the register, and the next
+            # raw use of that register (a marshal, or reading the SECOND return word
+            # of a 2-eightbyte result out of rdx) renders under the dead param's name.
+            # Same lifetime and same remedy as an `ArgResident` scalar param, so use
+            # the same list: `flushArgResidentParams` kills it after the first call,
+            # and `releaseArgDest` releases it should a marshal reach the register
+            # first. A relocated pointer is in a callee-saved home and needs neither.
+            g.argResidentParams.add (loc.r, nm)
+        else: g.rawHomeRegs.incl loc.r        # unnamed ⇒ the union must reserve it
       elif tn.len > 0:
         # Stack-passed aggregate (by-value that didn't fit, or a by-ref pointer past
         # the arg regs): record its type so the body can navigate it; the bytes /
@@ -2016,6 +2211,12 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
         if loc.kind == InReg and loc.r == argReg:
           if declarative:
             g.rb.bindParam(argReg, paramName(pl.ord)) # the signature binds it as `pN.0`
+            # Record the type so `restoreBindings` can re-establish this name after a
+            # DIVERGING call. Without it the param is nameless from the first panic
+            # onward and every later read of it emits a raw `(reg)` — `inc.0.nifisob2`
+            # reading its `(ptr Cursor)` out of a bare rdi is the canonical case.
+            g.nameBindTyp[paramName(pl.ord)] =
+              NameBindTyp(isPtr: isPtrType(resolveType(g.prog, typeCur)), typ: typeCur)
           else:
             # no signature binding (empty params) → bind the param's own name to its
             # arg register so the body can refer to it by name.
@@ -2030,14 +2231,23 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
           # path the signature binds argReg to `pN.0`, so the relocation move must
           # *read* it by name (a raw `(reg)` use of a bound register is rejected); the
           # binding is then killed so the now-dead arg register is free. The empty-
-          # signature path has no binding, so it moves the raw register. A caller-save
-          # home is then bound by the param's own name so `emitCall2`'s `(scope …)`
-          # save/restore can refer to it (callee-saved homes stay raw for epilogue pops).
+          # signature path has no binding, so it moves the raw register.
           if declarative:
             g.ab.tree MovX64: (g.emReg loc.r; g.ab.sym paramName(pl.ord))
             g.ab.tree KillX64: g.ab.sym paramName(pl.ord)
           else:
             g.movReg(loc.r, argReg)
+          # Then DECLARE the home under the param's own name — after the move, never
+          # before it (a binding created ahead of its value is the stillborn shape).
+          #
+          # This used to be a `rawHomeRegs` entry instead: the home stayed unbound for
+          # the whole proc "for epilogue pops", and every read of the param emitted a
+          # bare `(rbx)`. That was 2780 of the 2956 raw register operands in a nifbench
+          # build — a nimony `var T` param is lowered to a plain `(ptr T)`, so the vast
+          # majority of pointer params take THIS branch, not the aggregate one above.
+          # The pops are the only thing that needed the register raw, and `framePop`
+          # now kills whatever is bound to a frame register just before them.
+          g.emRegLocalVar(nm, loc.r, typeCur)
         elif loc.kind == NamedStack and loc.typ.kind != AFloat:
           # an address-taken / spilled scalar param: declare its `(s)` slot and spill the
           # incoming argument register into it so `addr`/loads/stores work. Type the slot
@@ -2139,6 +2349,17 @@ proc framePop(g: var CodeGen) =
   # Release the frame (slot region + alignment pad) first, then the callee-saved
   # registers — reverse of the prologue.
   g.emitFrameAdd()
+  # A `pop` names its register RAW, which nifasm rejects while something is bound to
+  # it. Callee-saved registers are exactly the homes `emitParamMoves` gives relocated
+  # parameters (and `allocLocals` gives cross-call locals), and a param's home is
+  # never early-freed — its binding is still live here. Kill it. Safe to do
+  # unconditionally at this one site: the epilogue is emitted ONCE at the proc tail
+  # (every proc in a nifbench build has exactly one `(ret)`), so nothing downstream
+  # can read the name afterwards.
+  for i in countdown(g.frameRegs.high, 0):
+    let dead = g.rb.takeBinding(g.frameRegs[i])
+    if dead.len > 0:
+      g.ab.tree KillX64: g.ab.sym dead
   for i in countdown(g.frameRegs.high, 0):
     g.ab.tree PopX64: g.ab.reg g.frameRegs[i]             # raw pop, reverse order
 
@@ -2211,9 +2432,14 @@ proc emitStackParamLoadsX64(g: var CodeGen; decl: Cursor) =
       let loc = g.ra.locationOfSym(nm)
       case loc.kind
       of InReg:
+        g.rawHomeRegs.incl loc.r               # RAW home (see `emitParamMoves`)
         g.ab.tree MovX64:
           g.emReg loc.r
           g.ab.tree MemX: (g.ab.reg g.stackArgBaseReg; g.ab.intLit off)
+        if arkhamNameAggrBase and g.varType.hasKey(nm):
+          # A by-reference aggregate whose pointer arrived on the stack: name it, for
+          # the same reason `emitParamMoves` does (see `emRegAggrPtrVar`).
+          g.emRegAggrPtrVar(nm, loc.r, g.varType[nm])
         # The 8-byte load above reads the whole eightbyte, but a sub-8-byte
         # scalar's upper bits are NOT the value's extension: our own callers
         # store through the arg slot's declared width (a 4-byte `mov` for a
@@ -3143,11 +3369,14 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
           else: g.genTypeBody(d)
         g.emReg baseReg
     elif loc.kind == InReg and g.varType.hasKey(nm):
-      # a >16B by-reference aggregate param: a pointer in a register — type it via
-      # `(cast (ptr T) reg)` so the enclosing dot/at can compute the field offset.
+      # a pointer-to-aggregate in a register (a >16B by-reference param, or any such
+      # local) — type it via `(cast (ptr T) name)` so the enclosing dot/at can compute
+      # the field offset. BY NAME, not by register: see `emPtrFieldMemSym`. `emReg`
+      # would degrade to a bare `(rdi)` wherever the binding is not live, and then the
+      # register looks free to every filter that asks `rb`.
       g.ab.tree CastX:
         g.ab.ptrType: g.ab.sym g.varType[nm]
-        g.emReg loc.r
+        g.emAggrPtrBase(nm)
     else:                                               # a `(s)` stack-var base
       g.ab.reg RSP
       g.ab.sym nm
@@ -4436,9 +4665,17 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
       g.genAconstr2(rhs, dstVar)                          # build array element-by-element
     elif rhs.kind == TagLit and rhs.exprKind == CallC:   # call-returned aggregate
       if g.aggrByRef(tn):                                # >16B: pass &dst as the hidden result ptr
+        # The window opens BEFORE `&dst` is written into rdi. rdi is an ABI argument
+        # register and may be a caller-saved local's home; writing it here — outside
+        # `emitCall2`, which is where the save would otherwise happen — destroys that
+        # value in place. (nifasm forbids naming a register that carries a live
+        # binding, so the write comes out as `(lea <thatlocal> …)` and the corruption
+        # is invisible to any scan for raw register operands.)
+        let w = g.emCallerSaveOpen()
         g.emStackAddr(RDI, dstVar)
         var d = dontCare
         g.emitCall2(rhs, d, hiddenPtr = true)            # the callee writes through rdi
+        g.emCallerSaveClose(w, d)
       else:
         var d = dontCare
         g.emitCall2(rhs, d)                              # ≤16B result in rax:rdx
@@ -4475,9 +4712,11 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
     # is a callee-saved survivor picked at emission (`takeHeld`).
     if rhs.kind == TagLit and rhs.exprKind == CallC and
        dst.typ.size > g.md.aggrByRefThreshold:
+      let w = g.emCallerSaveOpen()                       # rdi first: see the sibling site
       g.emSymAddr(RDI, dst)                              # >16B: &dst is the hidden result ptr
       var d = dontCare
       g.emitCall2(rhs, d, hiddenPtr = true)              # callee writes through rdi
+      g.emCallerSaveClose(w, d)
     else:
       # `spilled`: the address survivor could not get a callee-saved register
       # (totality backstop), so no register holds `&dst` across the build —
@@ -4690,6 +4929,11 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
   var cc = c
   cc.into:
     let declPos = cursorToPosition(g.buf[], cc)         # SymbolDef pos (aux key, matches allocVarDecl)
+    if declPos in g.fuseCondDecl:
+      # The bool this declares is consumed by a fused branch and never materialized
+      # (`scanCondFusions`), so it needs neither a declaration nor a register home.
+      while cc.hasMore: skip cc
+      return
     let nm = symName(cc); inc cc
     skip cc                                              # pragmas
     let declaredCur = cc; skip cc                        # type (`.` when shoggoth omitted it)
@@ -4705,13 +4949,31 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
     else:
       let loc = g.ra.locationOfSym(nm)
       let hasVal = cc.hasMore and cc.kind != DotToken
-      case loc.kind
-      of InReg: g.emRegLocalVar(nm, loc.r, typeCur)
-      of InFReg: g.emFRegLocalVar(nm, loc.f, loc.typ.size * 8)   # float local in an xmm
-      of NamedStack:
-        g.emTypedStackVar(nm, typeCur)
-        if typeCur.kind == Symbol: g.varType[nm] = symName(typeCur)  # aggregate field layout
-      else: raiseAssert "arkham x64n: var home " & $loc.kind
+      # ── A register home whose value comes STRAIGHT FROM A CALL is declared AFTER
+      # the call, not before it. Declaring first binds the register to a value that
+      # does not exist yet; if that register is also an argument register (and on
+      # x64 every volatile local home is one — `intLocalTempRegs` is rdi/rsi/r8/r9)
+      # the marshaller must then `(kill …)` the binding to load the argument, the
+      # result is written back RAW, and the local is live-and-UNBOUND for the rest
+      # of its range. 559 bindings per nifbench build were stillborn that way — all
+      # of them in rdi or rsi, argument 0 and 1 — and it is why `isBound` cannot be
+      # made the whole authority for the emitter's temp filter (`regFreeForTemp`).
+      #
+      # Restricted to a ROOT-LEVEL call: nothing of this var is live in the register
+      # while the call is set up (the value only exists once the result settles), so
+      # leaving it unbound across the call is safe and no seal is needed. Any other
+      # initializer keeps the old order, where the binding protects the partial
+      # value from a nested temp pick.
+      let callInit = hasVal and cc.kind == TagLit and cc.exprKind == CallC and
+                     loc.kind == InReg
+      if not callInit:
+        case loc.kind
+        of InReg: g.emRegLocalVar(nm, loc.r, typeCur)
+        of InFReg: g.emFRegLocalVar(nm, loc.f, loc.typ.size * 8)   # float local in an xmm
+        of NamedStack:
+          g.emTypedStackVar(nm, typeCur)
+          if typeCur.kind == Symbol: g.varType[nm] = symName(typeCur)  # aggregate field layout
+        else: raiseAssert "arkham x64n: var home " & $loc.kind
       if hasVal:
         # Same-width cast/copy inheritance (see `allocVarDecl`): when the value is just
         # another local homed on THIS var's register, `emRegLocalVar` above already renamed
@@ -4724,6 +4986,13 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
             let sh = g.ra.locationOfSym(symName(srcSym))
             if sh.kind == InReg and sh.r == loc.r: skipInit = true
         if not skipInit: g.genStore2(cc, loc)  # the one general store path
+        if callInit:
+          # The result is in the register now; bind the name to it. `emRegLocalVar`
+          # emits only the `(var :nm (reg) T)` declaration — no machine code — so
+          # this costs nothing and gives the value a name for the rest of its range.
+          g.emRegLocalVar(nm, loc.r, typeCur)
+      elif callInit:
+        g.emRegLocalVar(nm, loc.r, typeCur)   # unreachable (callInit implies hasVal)
       while cc.hasMore: skip cc
 
 proc emitCaseTest2(g: var CodeGen; selReg: Reg; c: var Cursor; lBody: string; signed: bool) =
@@ -4947,6 +5216,36 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
     var cc = c
     cc.into:
       let asgnPos = cursorToPosition(g.buf[], c)
+      if asgnPos in g.fuseCondAsgn:
+        # `scanCondFusions` marked this: the bool is read only by the branch that
+        # follows, so emit the COMPARE and stop. `emitCondE` takes the branch off the
+        # flags — no `setcc`, no `and $1`, no `test`. Five instructions become two.
+        let b = symName(cc); skip cc
+        var op = cc
+        let ek = op.exprKind
+        var aC, bC: Cursor
+        op.into:
+          aC = op; skip op
+          bC = op; skip op
+          while op.hasMore: skip op
+        g.pendingCondTag[b] = g.emitScalarCmpE(aC, bC, ek, whenTrue = true)
+        while cc.hasMore: skip cc
+        return
+      if asgnPos in g.fuseCondCopy:
+        # A chain LINK: `b2 = b1` or `b2 = not b1`, both single-use. Emits nothing —
+        # just move the pending tag to the new name, inverted once per `not`.
+        let b2 = symName(cc); skip cc
+        var t = cc
+        var negations = 0
+        while t.kind == TagLit and t.exprKind == NotC:
+          inc t; inc negations
+        let src = symName(t)
+        var tag = g.pendingCondTag[src]
+        for _ in 1 .. negations: tag = invertJcc(tag)
+        g.pendingCondTag.del src
+        g.pendingCondTag[b2] = tag
+        while cc.hasMore: skip cc
+        return
       if cc.kind == Symbol:
         let lhsCur = cc                                     # for asLoc (global/tvar)
         var dst = g.ra.locationOfSym(symName(cc)); skip cc  # local lvalue; a global → Undef
@@ -4972,7 +5271,11 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
     g.emLab(lEnd)
     discard g.loopEnds.pop()
   of IfS:
-    if not g.tryEmitCmov(c):        # branchless select diamond, else fall through
+    # A cond fused by `scanCondFusions` has no materialized bool for `tryEmitCmov` to
+    # select on — the answer is in the flags and only `emitCondE` knows how to spend it.
+    let fusedSym = g.condFuseSym(c)
+    let isFused = fusedSym.len > 0 and g.pendingCondTag.hasKey(fusedSym)
+    if isFused or not g.tryEmitCmov(c):  # branchless select diamond, else fall through
       let lEnd = g.freshLabel()
       var cc = c
       cc.into:
@@ -5221,9 +5524,23 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
   # ── canonical order: lhs into a register (or straight into a pinned dest
   # when safe), rhs folds in place.
   var lDest = needsReg(ScalarSlot)
-  if dest.kind == InReg and ek notin {ShlC, ShrC} and
+  # A shift is excluded only because a VARIABLE count is pinned to cl below; with
+  # a constant count no fixed register is involved and the passthrough is as safe
+  # as for any other op. Excluding every shift cost a `mov` per shift whose result
+  # has a home: the lhs landed in a fresh temp and the result then had to be moved
+  # out of it. `(asgn x (and (shr y 4) 511))` came out as
+  #     mov y,T ; shr $4,T ; mov T,x ; and $511,x
+  # where three instructions do the work (nifbench: 117 M executions of the
+  # `mov`+const-shift pair, 1.5 % of all instructions).
+  # `isImmLeaf` rather than `isFoldableLeafE` for the rhs: the latter only knows
+  # BARE literals, and a front-end spells a typed one `(suf 511u "u32")` — so the
+  # passthrough was dead for every op with a suffixed operand, which is most of
+  # them. (The swap branch above must keep the narrow test: there the lhs is only
+  # RESOLVED, by `resolveLvalVal`, which materializes bare literals and symbol
+  # homes and nothing else.)
+  if dest.kind == InReg and (ek notin {ShlC, ShrC} or isConstShiftCount(rhsC)) and
      not g.isFoldableLeafE(lhsC) and
-     (g.isFoldableLeafE(rhsC) or isMemLeaf(rhsC)) and
+     (g.isFoldableLeafE(rhsC) or isImmLeaf(rhsC) or isMemLeaf(rhsC)) and
      not g.exprReadsRegE(lhsC, dest.r) and not g.exprReadsRegE(rhsC, dest.r):
     lDest = dest                                         # compute lhs straight into dest
   g.emitValue2(lhsC, lDest)
@@ -5523,6 +5840,189 @@ proc emitScalarCmpE(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
   if cmpStaging != NoReg: g.giveBack cmpStaging
   g.freeVal(lD)
 
+proc condFuseSym(g: CodeGen; c: Cursor): string =
+  ## The bool symbol an `(if …)`'s FIRST branch tests, when that branch's condition is
+  ## a bare symbol — the only shape `scanCondFusions` fuses.
+  result = ""
+  if c.kind != TagLit or c.stmtKind != IfS: return
+  var cc = c
+  cc.into:
+    if cc.hasMore and cc.substructureKind == ElifU:
+      var bc = cc
+      bc.into:
+        if bc.hasMore:
+          # Peel `(not …)`: `emitCondE` lowers it by flipping `whenTrue` and recursing,
+          # so the symbol underneath still reaches the fused-flags path. Worth peeling —
+          # `(if (elif (not b) …))` is where the HOT sites are (`allocatedSize` alone is
+          # 17.7 M), because hexer inlines `>`/`>=` as `not (le …)` / `not (lt …)`.
+          var t = bc
+          var guard = 0
+          while t.kind == TagLit and t.exprKind == NotC and guard < 8:
+            inc t                       # → the negated operand
+            inc guard
+          if t.kind == Symbol: result = symName(t)
+        while bc.hasMore: skip bc
+    while cc.hasMore: skip cc
+
+proc scanCondFusions(g: var CodeGen; body: Cursor) =
+  ## A materialized bool that is branched on straight away costs FIVE instructions:
+  ##
+  ##     (test `sroa.8 `sroa.8)     ← the compare
+  ##     (setg `x.0h149)            ← materialize 0/1
+  ##     (and `x.0h149 1)           ← `setcc` writes ONE byte; clear the rest
+  ##     (test `x.0h149 `x.0h149)   ← …and the consumer looks at it again
+  ##     (je `L92.0)
+  ##
+  ## where `(test `sroa.8 `sroa.8) (jle `L92.0)` says the same thing. The shape is
+  ## hexer's INLINER: a one-expression `proc <(a, b: int): bool` becomes a
+  ## declaration, a `(scope …)` holding `(asgn b (lt …))` and the inlined body's
+  ## return label, and then the branch. **328 of the 511 `setcc`+`and` sites in a
+  ## nifbench build are exactly this**, and in the finished image all five
+  ## instructions are adjacent.
+  ##
+  ## Marked here, acted on in `genStmt2`/`emitCondE`. The compare stays exactly where
+  ## it is — moving it to the branch would name operands whose scope has closed — and
+  ## only the ANSWER travels, in the flags. That is sound because `setcc` never writes
+  ## flags, and because this pass only fuses when every statement between the two
+  ## emits no machine code: an unreferenced `(lab …)`, a value-less declaration, a
+  ## `(scope …)` boundary (whose `(kill …)`s are metadata).
+  g.fuseCondAsgn.clear(); g.fuseCondDecl.clear(); g.fuseCondCopy.clear()
+  # Referenced labels first: a `(lab :L)` that some `(jmp L)` targets is a JOIN, so
+  # the flags arriving there are whatever the other path left.
+  var jumpTargets = initHashSet[string]()
+  var symCount = initCountTable[string]()
+    ## Every `Symbol` occurrence in the body, by name. A `SymbolDef` is a different
+    ## kind and does not count, so the fusable bool — one `(asgn b …)` target and one
+    ## `(elif b …)` condition — is exactly the name with a count of 2. That is a
+    ## stronger and cheaper test than asking the analyser for `usages`/`defs`/
+    ## `AddrTaken`: with both occurrences accounted for, there is no third.
+  block:
+    var stack = @[body]
+    while stack.len > 0:
+      var cur = stack.pop()
+      if cur.kind != TagLit: continue
+      if cur.stmtKind == JmpS:
+        var jc = cur
+        jc.into:
+          if jc.hasMore and jc.kind == Symbol: jumpTargets.incl symName(jc)
+          while jc.hasMore: skip jc
+        continue
+      var ch = cur
+      ch.into:
+        while ch.hasMore:
+          if ch.kind == TagLit: stack.add ch
+          elif ch.kind == Symbol: symCount.inc symName(ch)
+          skip ch
+
+  var pendingSym = ""          # a candidate `(asgn b <cmp>)` seen, nothing emitted since
+  var pendingPos = -1
+  var copyPos: seq[int] = @[]  # the chain links behind `pendingSym`
+  var chainDecls: seq[string] = @[]
+  var declPos = initTable[string, int]()
+
+  proc walk(g: var CodeGen; n: Cursor) =
+    var c = n
+    c.into:
+      while c.hasMore:
+        if c.kind != TagLit:                 # a bare operand, not a statement
+          pendingSym = ""
+          skip c
+          continue
+        let pos = cursorToPosition(g.buf[], c)
+        case c.stmtKind
+        of StmtsS, ScopeS:
+          walk(g, c)                       # transparent: emits no code of its own
+          skip c
+          continue
+        of LabS:
+          var lc = c
+          var nm = ""
+          lc.into:
+            if lc.hasMore and lc.kind == Symbol: nm = symName(lc)
+            while lc.hasMore: skip lc
+          if nm in jumpTargets: pendingSym = ""     # a join point: flags are not ours
+          skip c
+          continue
+        of VarS, ConstS:
+          # A value-less declaration emits nothing; one with an initializer does.
+          var vc = c
+          var nm = ""
+          var symDefPos = -1
+          var hasVal = false
+          vc.into:
+            if vc.hasMore:
+              # The SAME key `genVarDecl2` uses: the SymbolDef's position, not the
+              # statement's.
+              symDefPos = cursorToPosition(g.buf[], vc)
+              nm = (if vc.kind == SymbolDef: symName(vc) else: "")
+              skip vc
+            if vc.hasMore: skip vc                  # pragmas
+            if vc.hasMore: skip vc                  # type
+            hasVal = vc.hasMore and vc.kind != DotToken
+            while vc.hasMore: skip vc
+          if hasVal: pendingSym = ""
+          elif nm.len > 0: declPos[nm] = symDefPos
+          skip c
+          continue
+        of AsgnS:
+          var ac = c
+          var lhs = ""
+          var isCmp = false
+          var copyOf = ""            # rhs is `b` or `(not b)` — a chain LINK
+          ac.into:
+            if ac.hasMore and ac.kind == Symbol: (lhs = symName(ac); skip ac)
+            if ac.hasMore:
+              if ac.kind == TagLit and ac.exprKind in {EqC, NeqC, LtC, LeC}:
+                var op = ac
+                op.into:
+                  isCmp = op.hasMore and not g.isFloatExpr(op)
+                  while op.hasMore: skip op
+              else:
+                var t = ac
+                var guard = 0
+                while t.kind == TagLit and t.exprKind == NotC and guard < 8:
+                  inc t; inc guard
+                if t.kind == Symbol: copyOf = symName(t)
+            while ac.hasMore: skip ac
+          if lhs.len > 0 and isCmp and symCount[lhs] == 2:
+            pendingSym = lhs; pendingPos = pos
+            copyPos.setLen 0                 # a fresh chain head: drop any aborted chain
+            chainDecls = @[lhs]
+          elif lhs.len > 0 and copyOf.len > 0 and copyOf == pendingSym and
+               symCount[lhs] == 2:
+            # `b2 = b1` / `b2 = not b1`, both single-use: the answer is still only in
+            # the flags. hexer renames the result bool once per inlined splice, so this
+            # link is what connects `isValid`'s `(eq …)` to the caller's branch.
+            copyPos.add pos
+            pendingSym = lhs
+            chainDecls.add lhs
+          else:
+            pendingSym = ""
+          skip c
+          continue
+        of IfS:
+          let s = g.condFuseSym(c)
+          if s.len > 0 and s == pendingSym:
+            g.fuseCondAsgn.incl pendingPos
+            for p in copyPos: g.fuseCondCopy.incl p
+            for nm in chainDecls:
+              if declPos.hasKey(nm): g.fuseCondDecl.incl declPos[nm]
+          else:
+            when defined(arkhamFuseDbg):
+              if s.len > 0:
+                stderr.writeLine "FUSEMISS " & g.curProcName & " cond=" & s &
+                  " pending=" & pendingSym & " count=" & $symCount[s]
+          pendingSym = ""; copyPos.setLen 0; chainDecls.setLen 0
+          walk(g, c)                       # the branches themselves still get scanned
+          skip c
+          continue
+        else:
+          pendingSym = ""
+          walk(g, c)
+          skip c
+
+  walk(g, body)
+
 proc emitCondE(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
   ## FUSED branch test: jump to `toLabel` when the condition holds
   ## (`whenTrue`) — short-circuit and/or/not, `cmp`/`jcc` relations, `(ovf)`,
@@ -5635,6 +6135,15 @@ proc emitCondE(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
       return
     let tag = g.emitScalarCmpE(aC, bC, ek, whenTrue)
     g.emJcc(tag, toLabel)
+  elif c.kind == Symbol and g.pendingCondTag.hasKey(symName(c)):
+    # `scanCondFusions` proved this bool has one def and one use, that its defining
+    # compare has already run, and that nothing since has emitted a single machine
+    # instruction. The flags still hold the answer — take the branch straight off
+    # them and never materialize the 0/1 at all.
+    let nm = symName(c)
+    let tag = g.pendingCondTag[nm]
+    g.emJcc((if whenTrue: tag else: invertJcc(tag)), toLabel)
+    g.pendingCondTag.del nm
   else:
     var v = needsReg(ScalarSlot)
     g.emitValue2(c, v)
@@ -6141,7 +6650,7 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
       let sgn = isSignedType(tc)
       if not g.arrivesNormalized(inner, targetW, sgn):
         g.extendTo(res2.r, targetW, sgn)                              # narrow / equal
-proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false) =
+proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false) =
   ## FUSED call. allocCall's placement decisions run inline: each scalar arg
   ## dest-threads straight into its ABI register (or a parked callee-saved
   ## survivor when a later argument's shift/div would clobber it — decided by
@@ -6598,6 +7107,133 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
   g.freeVal(fnptrLoc)
   for h in heldArgs: g.freeVal(h)
   g.settleCallResult(dest)
+
+proc emCallerSaveStore(g: var CodeGen; varName: string) =
+  ## Save a caller-saved value into its permanent slot, then release the register.
+  g.ab.tree MovX64:                                  # (mov (mem (rsp) slot) name)
+    g.emStackMem(callerSaveSlotName(varName))
+    g.ab.sym varName
+  # Then RELEASE the register. The home is an argument register, and marshalling is
+  # about to write it; nifasm rejects a write to a register that still carries a live
+  # binding ("use the variable name instead"). Releasing here is exactly what makes an
+  # argument register a legal caller-saved home: between this kill and the restore the
+  # value lives only in the slot, so the ABI partition is intact for the whole call.
+  g.ab.tree KillX64: g.ab.sym varName
+  discard g.rb.takeBinding(g.ra.locationOfSym(varName).r)
+
+proc emCallerSaveRestore(g: var CodeGen; slotName, varName: string; r: Reg) =
+  ## Reload a caller-saved value after the call. The call CLOBBERS every volatile, and
+  ## nifasm drops the bindings of clobbered registers with it — so the name is no longer
+  ## a legal destination and must be re-bound first (same register, same type it was
+  ## declared with) before the reload can name it.
+  let dead = g.rb.takeBinding(r)                     # whatever the call left there
+  if dead.len > 0 and dead != varName:
+    g.ab.tree KillX64: g.ab.sym dead
+  var isPtr = false
+  g.ab.tree RebindX64:
+    g.ab.symDef varName
+    if g.symType.hasKey(varName) and isPtrType(resolveType(g.prog, g.symType[varName])):
+      isPtr = true
+      var tc = g.symType[varName]
+      g.genTypeBody(tc)
+    else:
+      g.ab.intType(64)
+    g.ab.reg r
+  g.rb.rebindLocal(r, varName, isPtr)
+  g.ab.tree MovX64:
+    g.ab.sym varName
+    g.emStackMem(slotName)
+
+when defined(arkhamCallerSaveDbg):
+  proc csDbgCall(g: var CodeGen; c: Cursor;
+                 saveSet, nested: seq[tuple[reg: Reg, name: string]]) =
+    ## One `CSCALL` line per emitted call: WHERE the emitter actually saves, in the
+    ## same token-position space the analyser measures intervals in. Joined against
+    ## the `CSVAR` lines by `scratchpad/csdiff.py`; a call inside a value's interval
+    ## with the value in neither `saved` nor `nested` is a save the emitter owed and
+    ## did not make. `unbound` is the interesting residue: the allocator thinks the
+    ## value is live here, the emitter holds no binding for it.
+    var saved, nest, unbound = ""
+    var seen = initHashSet[string]()
+    for it in saveSet: (seen.incl it.name; (if saved.len > 0: saved.add ','); saved.add it.name)
+    for it in nested: (seen.incl it.name; (if nest.len > 0: nest.add ','); nest.add it.name)
+    for name in g.ra.callerSaveHomes.keys:
+      if name notin seen:
+        if unbound.len > 0: unbound.add ','
+        unbound.add name
+    stderr.write "CSCALL proc=" & gArkhamCurProc & " pos=" &
+      $cursorToPosition(g.buf[], c) & " saved=" & saved & " nested=" & nest &
+      " unbound=" & unbound & "\n"
+
+proc emCallerSaveOpen(g: var CodeGen): CallerSaveWindow =
+  ## Open a call's caller-save window: store every caller-saved local BOUND right now
+  ## into its slot, release the binding, and redirect its reads there
+  ## (`ra.callerSaveActive`). Idempotent with respect to an ENCLOSING window — a value
+  ## already active is skipped, since its register may already be clobbered, so
+  ## re-saving would store garbage, and reads already resolve to the outer slot.
+  for it in g.callerSaveSetAt():
+    if not g.ra.callerSaveActive.hasKey(it.name): result.saved.add it
+  if result.saved.len == 0: return
+  # Types BEFORE the redirects are installed: `locationOfSym` answers with the slot
+  # once a name is active, and the restore needs the register's declared type.
+  var types: seq[AsmSlot] = @[]
+  for it in result.saved: types.add g.ra.locationOfSym(it.name).typ
+  result.prevActive = g.ra.callerSaveActive          # nested calls restore, never clear
+  for it in result.saved: g.emCallerSaveStore(it.name)
+  for i, it in result.saved:
+    g.ra.callerSaveActive[it.name] =
+      Location(kind: NamedStack, name: callerSaveSlotName(it.name), typ: types[i])
+
+proc emCallerSaveClose(g: var CodeGen; w: CallerSaveWindow; dest: Location) =
+  if w.saved.len == 0: return
+  g.ra.callerSaveActive = w.prevActive
+  for it in w.saved:
+    # The result settling into this very register means the call overwrote the home;
+    # restoring would clobber the result. Unreachable for a valid caller-saved value
+    # (single-def, never born from a call), kept as a guard.
+    if dest.kind == InReg and dest.r == it.reg: continue
+    g.emCallerSaveRestore(callerSaveSlotName(it.name), it.name, it.reg)
+
+proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false) =
+  ## Caller-save wrapper: every caller-saved local bound right now is stored before
+  ## this call's ABI marshalling clobbers its volatile home, and reloaded after the
+  ## call returns. Between the two, `ra.callerSaveActive` redirects every read of
+  ## those names to the save slot — so an argument whose source is one of them is
+  ## marshalled from memory instead of from a register that marshalling itself is
+  ## about to overwrite. That is what keeps `design.md`'s partition intact without a
+  ## parallel-copy analysis. No caller-saved vars bound ⇒ not one extra instruction.
+  ##
+  ## A caller that writes an ABI register for THIS call before getting here (the
+  ## hidden result pointer in rdi) must open the window itself — see
+  ## `emCallerSaveOpen`; this one then finds everything already active and adds
+  ## nothing.
+  when defined(arkhamCallerSaveDbg):
+    if g.ra.callerSaveHomes.len > 0:
+      var bound, act: seq[tuple[reg: Reg, name: string]] = @[]
+      # `active` comes from the redirect table, NOT from the bindings: a window opened
+      # early (the hidden-result-pointer sites) has already released the binding, so
+      # the value is covered yet invisible to `callerSaveSetAt`.
+      for name in g.ra.callerSaveActive.keys: act.add (reg: NoReg, name: name)
+      for it in g.callerSaveSetAt():
+        if not g.ra.callerSaveActive.hasKey(it.name): bound.add it
+      g.csDbgCall(c, bound, act)
+  # A DIVERGING call executes only on a path that never rejoins, so at the statement
+  # after it every register still holds exactly what it held before — the marshalling
+  # simply did not run. `rb` cannot express that: it is linear, and the `(kill nm)`s
+  # `releaseArgDest` must emit (nifasm rejects a raw write to a bound register) erase
+  # the names for the rest of the proc. Every later read of a still-live local then
+  # falls back to a raw `(reg)` that no checker can see — ~96 operands per nifbench
+  # build, and the reason `AllRegs`/`DivRegOk` had to be conservative around panics.
+  #
+  # So snapshot the bindings, and re-establish whatever the call dropped.
+  let diverging = g.isDivergingCall(c)
+  var savedBinds: seq[tuple[r: Reg, name: string]] = @[]
+  if diverging: savedBinds = g.namedBindings()
+  let w = g.emCallerSaveOpen()
+  g.emitCall2Inner(c, dest, hiddenPtr)
+  g.emCallerSaveClose(w, dest)
+  if diverging: g.restoreBindings(savedBinds)
+
 proc takeInstrReg(g: var CodeGen; slot: AsmSlot): Location =
   ## A register an `(instr …)` operand or result MUST have (no memory form).
   ## Pools first; exhausted, draw from the emit-time STAGING set — an intrinsic
@@ -7070,6 +7706,15 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
   # Seal the base so inline callee-saved temp draws during the body cannot take
   # it (its pushes/loads are written into the prologue after the body).
   if g.stackArgBaseReg != NoReg: g.ra.seal {g.stackArgBaseReg}
+  # Per-proc reset of the RAW-home reservation. `narrowHomes` asks `rawHomeRegs` — the
+  # registers whose occupant `rb` genuinely cannot see — instead of the whole-proc
+  # `regHoldsHome` union; see `regFreeForTemp` for the four fixes that made that sound.
+  # `ARKHAM_NH` narrows it to named procs, which is how each remaining miscompile was
+  # BISECTED (the failure is a run-time segfault, not a nifasm error, so it can only be
+  # localized by building the program with the filter on for a subset of procs).
+  g.rawHomeRegs = {}
+  if g.stackArgBaseReg != NoReg: g.rawHomeRegs.incl g.stackArgBaseReg
+  when not defined(arkhamNoNarrowHomes): g.narrowHomes = nhEnabledFor(g.curProcName)
   var side = g.ab.sideBuf()
   swap(g.ab, side)                        # emit into the side buffer; `side` holds main
   g.enterScope()
@@ -7086,6 +7731,16 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
       g.ab.tree KillX64: g.ab.sym paramName(0)
     else:
       g.movReg(g.indirectReg, g.md.intArgRegs[0])
+    # Name it, for the same reason the relocated parameters above are named: unnamed,
+    # it was the last big block of raw register operands (564 of the 742 left after
+    # `emitParamMoves` was fixed) — every `(mov (mem (at (cast (aptr (u 64)) (rbx))k))
+    # …)` writing the result buffer out. It has no `symPos` entry, so it was not even
+    # in the `regHoldsHome` union; only `rawHomeRegs` reserved it. `framePop` kills the
+    # binding before the pops (`indirectReg` is RBX, always a frame register here).
+    if g.retAggrName.len > 0:
+      g.emRegAggrPtrVar(synth("retptr.0"), g.indirectReg, g.retAggrName)
+    else:
+      g.rawHomeRegs.incl g.indirectReg
   g.emitParamMoves(info.decl)
   g.emitStackParamLoadsX64(info.decl)               # via stackArgBaseReg, regs now free
   g.retLabel2 = g.freshLabel()                       # shared epilogue for mid-proc `ret`
@@ -7098,7 +7753,10 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
     # The LINUX entry proc ends in an exit syscall (no epilogue jump), so leave
     # it false there; the Windows entry returns like any other proc.
     g.tailStmt = not info.isEntry or g.prog.windows
-    if c.stmtKind == StmtsS: g.genStmt2(c)
+    if c.stmtKind == StmtsS:
+      g.pendingCondTag.clear()
+      g.scanCondFusions(c)
+      g.genStmt2(c)
     while c.hasMore: skip c
   g.exitScope()
   if g.retLabelUsed2: g.emLab(g.retLabel2)           # a non-tail `ret` lands here
@@ -7733,6 +8391,7 @@ proc genAsmProc(g: var CodeGen; info: ProcInfo) =
   ## not a request.
   g.varType.clear(); g.symType.clear(); g.stackSlots.clear()
   g.rb.resetProc(); g.aliasToDecl.clear()
+  g.rawHomeRegs = {}; g.narrowHomes = false   # no allocator, no temp pool here
   g.asmReg.clear(); g.asmStack.clear()
   g.asmInfo = lengInfo(info.decl)
   g.loopEnds = @[]
@@ -7888,6 +8547,34 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.pickedFRegs = {}
   g.emitTmpSpills = 0
   g.ra = allocateProc(g.buf[], info.decl, an, g.prog, x64MachineA, g.typeCtx, preseal)
+  g.curProcName = info.asmName                # names the proc in this backend's diagnostics
+  when defined(arkhamCallerSaveDbg):
+    # The ALLOCATOR's side of the caller-save audit: for every value it gave a
+    # caller-saved home, the live interval it made that decision on, plus every call
+    # position inside it. `emitCall2` prints where it actually saved (`CSCALL`);
+    # `scratchpad/csdiff.py` joins the two. The emitted asm alone cannot answer this —
+    # a value that is live but UNBOUND at a call looks correct to an asm-level audit
+    # (nothing to save) and is fatal at run time.
+    if g.ra.callerSaveHomes.len > 0:
+      var allCalls = ""
+      for p in an.callPositions:
+        if allCalls.len > 0: allCalls.add ','
+        allCalls.add $p
+      stderr.write "CSPROC proc=" & info.asmName & " calls=" & allCalls & "\n"
+      for name in g.ra.callerSaveHomes.keys:
+        let vi = an.vars.getOrDefault(name)
+        var crossed = ""
+        for p in an.callPositions:
+          if p > vi.initEndPos and p <= vi.freeAfter:
+            if crossed.len > 0: crossed.add ','
+            crossed.add $p
+        let home = g.ra.locationOfSym(name)
+        stderr.write "CSVAR proc=" & info.asmName & " var=" & name &
+          " reg=" & (if home.kind == InReg: $home.r else: "?" & $home.kind) &
+          " liveStart=" & $vi.liveStart & " initEnd=" & $vi.initEndPos &
+          " freeAfter=" & $vi.freeAfter & " lastUse=" & $vi.lastUsePos &
+          " defs=" & $vi.defs & " weight=" & $vi.weight &
+          " init=" & $vi.initClass & " crossed=" & crossed & "\n"
   when defined(arkhamTracePath):
     stderr.writeLine "[arkham] " & info.asmName & ": NEW"
   when defined(arkhamDumpLocs):
@@ -7912,6 +8599,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   # even when its own body does not — keep rsp 16-aligned for that call.)
   g.rb.resetProc(); g.aliasToDecl.clear()
   g.argResidentParams.setLen 0; g.argResidentFlushed = false
+  g.postDivergeBinds.setLen 0; g.nameBindTyp.clear()
   g.savedHomes.clear()
   g.lvalStride.clear(); g.lvalStrideBorrowed.clear()
   g.noFoldPos = -1

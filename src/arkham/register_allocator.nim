@@ -25,7 +25,7 @@
 ## reuse it); the union of callee-saved registers ever used drives the
 ## prologue/epilogue.
 
-import std / [tables, sets, assertions, os]
+import std / [tables, sets, assertions, os, strutils]
 
 let copyInheritDisabled = existsEnv("ARKHAM_NO_COPYINHERIT")
   ## measurement toggle: `ARKHAM_NO_COPYINHERIT=1` disables same-width cast/copy home
@@ -93,6 +93,20 @@ type
                                       ## call (args being marshalled, x8 result,
                                       ## values live through the call): never
                                       ## allocate to or steal from these
+    callerSaveHomes*: Table[string, int]
+                                      ## name → `freeAfter` for each local given a CALLER-SAVED
+                                      ## home: a value that crosses a call but lives in a
+                                      ## volatile register, with the emitter bracketing every
+                                      ## crossed call with a save/restore. The third option
+                                      ## between "callee-saved" and "memory" — see
+                                      ## `callerSaveRescue` for why it is sound in an argument
+                                      ## register and `design.md` for the partition it respects.
+    callerSaveActive*: Table[string, Location]
+                                      ## installed by the emitter for the duration of ONE call's
+                                      ## marshalling: while a caller-saved value sits in its save
+                                      ## slot, every read of it must come FROM that slot, because
+                                      ## marshalling is about to overwrite the register. This is
+                                      ## the rule that removes the parallel-copy hazard.
     divRegClobbered*: bool            ## body contains a div/mod (rdx) / a variable shift (rcx).
     shiftRegClobbered*: bool          ## Copied from the analyser so the EMITTER can decide whether
                                       ## the fixed-role volatiles are usable as expression temps —
@@ -271,8 +285,19 @@ proc allocStorage(b: var Builder; name: string; slot: AsmSlot; props: VarProps):
     r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
   if r == NoReg:
     when defined(arkhamSpillDbg):
+      # How many call points does this value's interval actually cross, and how
+      # many uses pay for the spill? A cross-call value with FEW crossings and
+      # MANY uses is what a caller-saved home (volatile reg + save/restore at
+      # the crossing) would win big on — arkham has no such option today.
+      let vi = b.an.vars.getOrDefault(name)
+      let lo = vi.liveStart
+      let hi = if vi.freeAfter == high(int): vi.lastUsePos else: vi.freeAfter
+      var crossed = 0
+      for p in b.an.callPositions:
+        if p > lo and p <= hi: inc crossed
       stderr.writeLine "SPILL allregs=" & $(AllRegs in props) &
-        " homesUsed=" & $(b.freeCallee.card + b.freeVol.card) &
+        " crossed=" & $crossed & " weight=" & $vi.weight &
+        " span=" & $(hi - lo) &
         " callee=" & $(5 - b.freeCallee.card) & "/5 vol=" & $b.freeVol.card & "free"
     return b.spillTo(name, slot)
   if r in b.md.intCalleeSavedSet: b.ra.usedCallee.incl r
@@ -334,7 +359,8 @@ proc record(b: var Builder; pos: int; name: string; loc: Location) =
   b.ra.locs[pos] = loc
   b.ra.homesDirty = true
 
-proc coldestVictim(b: var Builder; maxW, ceilLen: int; calleeOnly, wantFloat: bool): string =
+proc coldestVictim(b: var Builder; maxW, ceilLen, thiefDepth: int;
+                   calleeOnly, wantFloat: bool): string =
   ## The coldest live register-resident local whose register may be stolen: a non-sealed
   ## GPR (`calleeOnly` restricts to the callee-saved set) or — `wantFloat` — a SIMD
   ## register. "Coldest" = lowest `weight`; **ties broken by the LONGER live range** — an
@@ -360,6 +386,19 @@ proc coldestVictim(b: var Builder; maxW, ceilLen: int; calleeOnly, wantFloat: bo
       if vw < bestW or (vw == bestW and b.rangeLen(v) > bestLen):
         bestW = vw; bestLen = b.rangeLen(v); result = v
 
+proc addSpillTemp*(ra: var RegAlloc; name: string; typ: AsmSlot; isFloat = false) =
+  ## Register a totality spill slot. `hasStackVars` comes WITH it: a spill temp is a
+  ## nifasm `(s)` slot like any other, and the frame `sub` is emitted from that flag.
+  ##
+  ## The prologue is written after the body, and its slot-declaration loop runs AFTER
+  ## `emitFrameSub` — so `emScalarStackVar`'s own `hasStackVars = true` is too late for
+  ## anything declared from `spillTemps`. That was invisible while every spill temp was
+  ## minted under register exhaustion, which no proc reaches without stack vars of its
+  ## own; the caller-saved save slot is the first one a register-only proc can have, and
+  ## it produced a proc with a slot and NO frame — every save writing below `rsp`.
+  ra.spillTemps.add (name: name, typ: typ, isFloat: isFloat)
+  ra.hasStackVars = true
+
 proc demoteToStack(b: var Builder; victim: string) =
   ## Undo `victim`'s optimistic register assignment: move it to a nifasm-managed `(s)`
   ## slot addressed by its own name (offsets are nifasm's job). A single-point rewrite
@@ -367,6 +406,7 @@ proc demoteToStack(b: var Builder; victim: string) =
   ## emitter late-binds via `locationOfSym`), every use, walked or not, sees the new
   ## home. Sound across every control-flow path: the home is memory everywhere.
   let vpos = b.ra.symPos[victim]
+  b.ra.callerSaveHomes.del victim     # its home is memory now: nothing to save/restore
   b.ra.locs[vpos] = namedStackLoc(victim, b.ra.locs[vpos].typ)
   b.ra.hasStackVars = true
   b.ra.homesDirty = true
@@ -378,15 +418,33 @@ proc trySteal(b: var Builder; curName: string; curSlot: AsmSlot;
   ## it is strictly colder than `curName`; that local moves to `fallback` and
   ## `curName` takes its register. Returns `curName`'s chosen location.
   let calleeOnly = AllRegs notin curProps   # cross-call var needs callee-saved
-  let bestV = b.coldestVictim(b.weightOf(curName), b.rangeLen(curName),
+  let thiefDepth = b.an.vars.getOrDefault(curName).declLoopDepth
+  # NOT loop-carried-aware. `weight` counts STATIC uses × loop depth, so a loop
+  # COUNTER read twice in the condition (every iteration, unconditionally) looks
+  # colder than a body temp read five times under a guard, and `addTree`'s counter
+  # duly ends up on the stack — 28.6 M executed instructions. Both repairs measured
+  # WORSE: refusing such a victim outright is nifbench −0.21 % / nimsem **+3.44 %**,
+  # and merely PREFERRING another is nifbench **+0.17 %**. The victim `weight` picks
+  # really is the coldest one available; the alternative is hotter still.
+  let bestV = b.coldestVictim(b.weightOf(curName), b.rangeLen(curName), thiefDepth,
                               calleeOnly, wantFloat = false)
-  if bestV.len == 0: return fallback        # nothing colder to steal from
-  # evict the victim to its stack slot; current takes its register
+  if bestV.len == 0:
+    when defined(arkhamHomeTrace):
+      let vi = b.an.vars.getOrDefault(curName)
+      stderr.writeLine "HOMETRACE nosteal proc=" & gArkhamCurProc & " loser=" & curName &
+        "(w=" & $vi.weight & ",u=" & $vi.usages & ",d=" & $vi.defs &
+        ",len=" & $b.rangeLen(curName) & ",dld=" & $vi.declLoopDepth & ")"
+    return fallback                          # nothing colder to steal from
   let bestReg = b.ra.locs[b.ra.symPos[bestV]].r
+  # evict the victim to its stack slot; current takes its register
   b.demoteToStack(bestV)
   when defined(arkhamHomeTrace):
     stderr.writeLine "HOMETRACE steal proc=" & gArkhamCurProc & " thief=" & curName &
-      " victim=" & bestV
+      "(w=" & $b.weightOf(curName) & ",len=" & $b.rangeLen(curName) & ",dld=" & $b.an.vars.getOrDefault(curName).declLoopDepth &
+      ",u=" & $b.an.vars.getOrDefault(curName).usages & ")" &
+      " victim=" & bestV & "(w=" & $b.weightOf(bestV) & ",len=" & $b.rangeLen(bestV) &
+      ",u=" & $b.an.vars.getOrDefault(bestV).usages &
+      ",dld=" & $b.an.vars.getOrDefault(bestV).declLoopDepth & ")"
   if bestReg in b.md.intCalleeSavedSet: b.ra.usedCallee.incl bestReg
   result = regLoc(bestReg, curSlot)
 
@@ -397,6 +455,118 @@ proc trySteal(b: var Builder; curName: string; curSlot: AsmSlot;
 # register assignment is local→memory (`trySteal` / `reserveHeldScratch`), decided while
 # allocating locals; that is the whole "we optimistically gave a local a register, then
 # found we have too many, so we undo it" story, and it can never collide with a temp.
+
+let callerSaveOn = existsEnv("ARKHAM_CALLERSAVE")
+let csBisectMod = (if existsEnv("ARKHAM_CS_MOD"): parseInt(getEnv("ARKHAM_CS_MOD")) else: 0)
+let csBisectRem = (if existsEnv("ARKHAM_CS_REM"): parseInt(getEnv("ARKHAM_CS_REM")) else: 0)
+proc readCsProcList(): HashSet[string] =
+  ## `ARKHAM_CS_PROCS=<file>` restricts the rescue to the `proc=` names listed one per
+  ## line in that file — the bisect axis the hash knob only approximates. arkham runs
+  ## one process per module, so a global counter cannot bisect; an explicit name set
+  ## can, and `-d:arkhamCallerSaveDbg`'s `CSVAR` lines are exactly the candidate list
+  ## to halve. Empty (unset) = no restriction.
+  result = initHashSet[string]()
+  if existsEnv("ARKHAM_CS_PROCS"):
+    for line in lines(getEnv("ARKHAM_CS_PROCS")):
+      let t = line.strip()
+      if t.len > 0: result.incl t
+
+let csOnlyProcs = readCsProcList()
+let csIgnoreCost = existsEnv("ARKHAM_CS_ALL")
+  ## Drop the `weight > 2 * crossings` gate: rescue EVERY cross-call value that
+  ## qualifies structurally. Measurement knob — it answers whether the cost model or
+  ## the mechanism is what limits the payoff.
+  ## Bisect knob: with `ARKHAM_CS_MOD=N ARKHAM_CS_REM=r` the rescue fires only in procs
+  ## whose name hashes to `r mod N`, so a miscompile can be halved down to one proc.
+  ## OPT-IN, and off by default: the rescue is correct on the whole test corpus, the
+  ## stress runs and all 77 native tests, but still miscompiles nimsem (a segfault in
+  ## the produced compiler). Until that is found, `ARKHAM_CALLERSAVE=1` is how you run
+  ## it. See `callerSaveRescue` for what it does and why.
+
+proc initHasCallImpl(n: var Cursor): bool =
+  ## Advances `n` past the subtree; true iff it contains a call anywhere.
+  if n.kind == TagLit:
+    if n.exprKind == CallC: return true
+    n.into:
+      while n.hasMore:
+        if initHasCallImpl(n): return true    # each recursion consumes one child
+  else:
+    inc n
+  return false
+
+proc initHasCall(n: Cursor): bool =
+  ## A var whose initializer contains a call is not defined *before* that call — it is
+  ## produced BY it. Such a var must never get a caller-saved home: the emitter's save
+  ## would read a register that holds nothing yet, and the call's own result is what
+  ## defines it. (`initEndPos` alone does not catch this: the decl's register is live
+  ## from the decl, and the defining call sits after it.)
+  var c = n
+  initHasCallImpl(c)
+
+proc callsCrossedAfterInit(b: Builder; vi: VarInfo): int =
+  ## Calls the value crosses ONCE IT EXISTS — counted from `initEndPos`, the position
+  ## its value is born at, not from its declaration. A call inside the initializer
+  ## (`let x = f(…)`) therefore does not count: the register holds nothing to save
+  ## there, and the value is produced by that very call.
+  for p in b.an.callPositions:
+    if p > vi.initEndPos and p <= vi.freeAfter: inc result
+
+proc callerSaveRescue(b: var Builder; name: string; slot: AsmSlot;
+                      props: VarProps; valCur: Cursor; hasValue: bool;
+                      fallback: Location): Location =
+  ## The third option between "callee-saved register" and "memory".
+  ##
+  ## `allocStorage` gives a value that crosses a call the callee-saved pool or the
+  ## stack — and 90 % of arkham's spills take the stack while 6-7 VOLATILE registers
+  ## sit free, because a volatile is clobbered by the call. A caller-saved home closes
+  ## that: the value lives in a volatile and the emitter brackets each crossed call
+  ## with a save/restore, so it is register-resident everywhere else.
+  ##
+  ## SOUNDNESS in an ARGUMENT register. `design.md` forbids homing a value that is
+  ## *merely live across* a call in an argument register: marshalling would clobber it,
+  ## and repairing that in general needs a parallel-copy with cycle breaking. A
+  ## caller-saved value is never live in its register across the call — it is stored
+  ## before marshalling begins and reloaded after the call returns. The one residual
+  ## hazard, that this value is itself the SOURCE of an argument to the same call, is
+  ## closed by `RegAlloc.callerSaveActive`: inside the call window every read resolves
+  ## to the save slot. So the partition still holds where the design needs it, and no
+  ## shuffle analysis appears.
+  ##
+  ## VALIDITY. Save whenever bound (the emitter uses live bindings, not the coarse
+  ## interval, so a value bound across a control-flow merge is still saved). That is
+  ## only well-defined if the register holds a defined value at EVERY call it is bound
+  ## across, hence: single-def, a bounded interval, and crossings counted from
+  ## `initEndPos`. This excludes a `result` var (declared empty, assigned late) and
+  ## `var x = f(…)` (born from the call it would be saved around).
+  ##
+  ## COST. Two memory ops per crossed call against one register read per use, so it
+  ## pays only when `weight > 2 * crossings`; below that a plain spill is cheaper.
+  if not callerSaveOn or b.md.arch != X86: return fallback
+  if csOnlyProcs.len > 0 and gArkhamCurProc notin csOnlyProcs: return fallback
+  if csBisectMod > 0:
+    var h = 0
+    for ch in gArkhamCurProc: h = (h * 131 + int(ch)) and 0x3fffffff
+    if h mod csBisectMod != csBisectRem: return fallback
+  if AddrTaken in props or not slot.inRegClass or slot.isFloat: return fallback
+  if AllRegs in props: return fallback          # not a cross-call value; already handled
+  if not hasValue or initHasCall(valCur): return fallback
+  let vi = b.an.vars.getOrDefault(name)
+  if vi.defs != 1 or vi.freeAfter == high(int): return fallback
+  let crossings = b.callsCrossedAfterInit(vi)
+  if crossings == 0: return fallback
+  if not csIgnoreCost and vi.weight <= 2 * crossings: return fallback
+  let r = b.takeReg(b.freeVol, b.md.intLocalTempRegs)
+  if r == NoReg: return fallback
+  b.ra.callerSaveHomes[name] = vi.freeAfter
+  # The save slot is declared in the PROLOGUE, not at the decl. arkham emits by a
+  # textual walk, so a binding made inside one branch is still live when the sibling
+  # branch is emitted, and the sibling's calls save through this slot too. A slot
+  # declared inside the decl's scope would be reclaimed for the sibling's own locals —
+  # the save would then corrupt an unrelated variable. (Saving a value the sibling
+  # path never defined is harmless in itself: it is dead there, so the reload is dead
+  # too. Aliasing the slot is what was fatal.)
+  b.ra.addSpillTemp("csave." & name, slot)
+  result = regLoc(r, slot)
 
 proc symLoc(b: var Builder; name: string): Location =
   ## A symbol reference reads where the symbol is stored. A module-level
@@ -514,6 +684,11 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
         # register), so a later `trySteal` evicting THIS var to the stack would leave
         # the emitter emitting a store whose rhs position has no recorded location.
         b.inheritedHomes.incl name
+      if loc.kind == NamedStack:
+        # Tried BEFORE `trySteal` because it evicts nothing: it draws a volatile the
+        # cross-call value could not otherwise use, instead of taking a callee-saved
+        # register away from a colder value that has no third option either.
+        loc = b.callerSaveRescue(name, slot, props, valCur, hasValue, loc)
       if loc.kind == NamedStack and AddrTaken notin props and
          slot.inRegClass and not slot.isFloat:
         loc = b.trySteal(name, slot, props, loc)  # hot var evicts a colder one
@@ -937,6 +1112,16 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
 proc locationOfSym*(ra: RegAlloc; name: string): Location {.inline.} =
   ## Storage of a local/param by name; `NoLoc` if the name is not an
   ## allocator-known local/param (a module-level symbol or a synthesized slot).
+  ##
+  ## A caller-saved value inside an open call window reads from its SAVE SLOT, not
+  ## from its register: the save has already run and ABI marshalling is about to
+  ## overwrite the register — possibly while marshalling an argument whose source
+  ## is this very value. Redirecting here covers every read uniformly, which is
+  ## why no shuffle/cycle-breaking analysis is needed (`design.md` "How this deals
+  ## with the ABI").
+  if ra.callerSaveActive.len > 0:
+    let act = ra.callerSaveActive.getOrDefault(name, noLoc)
+    if act.kind != NoLoc: return act
   let p = ra.symPos.getOrDefault(name, -1)
   if p >= 0: ra.locs[p] else: noLoc
 

@@ -13,7 +13,7 @@
 ## target `MachineDesc` so the backends drive the (shared) register allocator
 ## and scratch pools from it.
 
-import std / [tables, sets, assertions, algorithm, strutils]
+import std / [tables, sets, assertions, algorithm, strutils, os]
 import symparser
 import nifcore, nifcdecl
 import slots, machinedesc, analyser, register_allocator, programs
@@ -31,6 +31,15 @@ type
     OvfSign,                                  ## overflow iff `ovfReg` is negative (signed add/sub)
     OvfCmpLo,                                 ## overflow iff `ovfReg <u ovfReg2` (unsigned carry/borrow)
     OvfNeqZero                                ## overflow iff `ovfReg != 0` (a64 mul: smulh/umulh high half)
+
+  NameBindTyp* = object
+    ## How to re-emit the TYPE of a named local/param binding. `RegBind` keeps only
+    ## the name and the pointer bit, but `(rebind :name TYPE (reg))` must name the
+    ## same type the `(var …)` declared, so the two producers record theirs here.
+    aggrName*: string                        ## non-empty ⇒ `(ptr <aggrName>)`
+                                             ## (`emRegAggrPtrVar`: a pointer to an aggregate)
+    isPtr*: bool                             ## else `emRegLocalVar`'s rule: a pointer keeps its
+    typ*: Cursor                             ## declared `(ptr T)`, everything else is `(i 64)`
 
   CodeGen* = object
     ab*: AsmBuf
@@ -132,11 +141,51 @@ type
                                              ## with. `RegBind` keeps only the name and the
                                              ## pointer bit, and a `(rebind …)` has to name the
                                              ## same type the register was bound with.
+    fuseCondAsgn*: HashSet[int]              ## token positions of `(asgn b <cmp>)` statements
+                                             ## whose bool is consumed ONLY by the branch that
+                                             ## follows: emit the compare, skip the `setcc`/
+                                             ## `and $1`, and let the branch read the FLAGS.
+    fuseCondCopy*: HashSet[int]              ## token positions of `(asgn b2 b1)` / `(asgn b2 (not b1))`
+                                             ## LINKS in such a chain: hexer's inliner renames the
+                                             ## bool once per splice level, so the compare and the
+                                             ## branch are rarely adjacent. A link emits nothing and
+                                             ## just re-keys (and maybe inverts) the pending tag.
+    fuseCondDecl*: HashSet[int]              ## token positions of the matching `(var :b . bool .)`
+                                             ## declarations — nothing reads `b`, so it need not
+                                             ## reserve a register either.
+    pendingCondTag*: Table[string, X64Inst]  ## bool symbol → the `jcc` that means "true", set by
+                                             ## the fused `(asgn …)` and consumed by `emitCondE`.
+                                             ## Live only across statements that emit no code.
+    postDivergeBinds*: seq[tuple[r: Reg, name: string]]
+                                             ## bindings on CALLER-SAVED registers that
+                                             ## `restoreBindings` re-established after a diverging
+                                             ## call. Valid only until the next call that actually
+                                             ## RETURNS clobbers the register — `AllRegs` says no
+                                             ## such call is in the value's range, so killing them
+                                             ## there loses nothing and stops a stale name from
+                                             ## renaming an ABI result register.
+    nameBindTyp*: Table[string, NameBindTyp] ## the twin of `tmpBindTyp` for NAMED locals and
+                                             ## params: what type to re-emit when a binding has
+                                             ## to be re-established. Only consumer so far is
+                                             ## `restoreBindingsAfterDiverging`.
     curProcName*: string                     ## the proc currently being emitted. arkham's input
                                              ## carries no line info, so a bare register-pressure
                                              ## or typing assert names nothing actionable; this
                                              ## pins it to one routine (same reason nifasm's
                                              ## `error` reports `in proc …`).
+    rawHomeRegs*: set[Reg]                   ## x64: the registers hosting a home that the
+                                             ## `rb` binding table CANNOT see — a param whose
+                                             ## home is written as a RAW `(reg)` and read back
+                                             ## raw for the rest of the body. These, and only
+                                             ## these, need a per-proc reservation; see
+                                             ## `regFreeForTemp`. Populated by `emitParamMoves`
+                                             ## / `emitStackParamLoadsX64` / the hidden-result
+                                             ## and stack-arg-base setup, and reset per proc.
+    narrowHomes*: bool                       ## the backend populated `rawHomeRegs` and wants
+                                             ## `regFreeForTemp` to consult it INSTEAD of the
+                                             ## whole-proc `regHoldsHome` union. x64 only —
+                                             ## a64 has not been audited for raw param homes,
+                                             ## so it keeps the coarse (safe) filter.
     argResidentParams*: seq[tuple[r: Reg, name: string]]
                                              ## x64: (arg register, bound name) for each
                                              ## `ArgResident` param (kept in its incoming reg
@@ -914,41 +963,69 @@ proc fregHoldsHome*(g: var CodeGen; f: FReg): bool =
   if g.ra.homesDirty: rebuildHomes(g.ra)
   f in g.ra.homeFRegs
 
+when not defined(arkhamNoNarrowHomes):
+  let nhRegs = getEnv("ARKHAM_NH_REGS", "*")
+    ## `ARKHAM_NH_REGS`: which registers the narrow filter may NEWLY admit (ones the
+    ## `regHoldsHome` union would refuse). "*" = all; otherwise a comma-separated list
+    ## of `Reg` names. Bisecting the crash down to one register inside one proc.
+  proc nhRegAllowed*(r: Reg; isHome: bool): bool =
+    if not isHome: return true            # not a home at all — nothing to decide
+    if nhRegs == "*": return true
+    for it in nhRegs.split(','):
+      if it == $r: return true
+    false
+else:
+  proc nhRegAllowed*(r: Reg; isHome: bool): bool {.inline.} = not isHome
+
 proc regFreeForTemp*(g: var CodeGen; r: Reg): bool =
   ## May the merged emitter hand `r` out as an expression temp right now? Not
   ## picked-but-unbound (the reserve→bind gap), not pinned to an in-flight call
   ## (sealed), not a live accumulator, not carrying any named binding (a local
   ## in scope or a temp in flight), not a home.
   ##
-  ## `regHoldsHome` is the immutable per-proc UNION of every register any local is
-  ## ever homed in — the same over-approximation `regHoldsLiveLocal` was written to
-  ## replace on the staging path, and the replacement never reached HERE, the path
-  ## every `pickTempReg` takes. **MEASURED COST** (`-d:arkhamTempDbg`, nifbench): of
-  ## the ~5.75 volatiles refused at each fall-through into the callee-saved pool,
-  ## **3.05 are refused by the union alone** — the largest single reason, ahead of a
-  ## live binding (1.51) and the reserve→bind gap (1.12). The pushes those
-  ## fall-throughs cause are 3.82 % of all executed instructions.
+  ## The reservation it asks about is `rawHomeRegs`, NOT the old whole-proc
+  ## `regHoldsHome` union — the union was the largest single reason a temp fell
+  ## through to a callee-saved register (`-d:arkhamTempDbg`: 3.05 of the ~5.75
+  ## volatiles refused at each fall-through, ahead of a live binding at 1.51 and the
+  ## reserve->bind gap at 1.12), and the pushes those fall-throughs cause were 3.82 %
+  ## of all executed instructions.
   ##
-  ## **It still cannot go, and the reason is precise.** A register-homed BY-REF
-  ## AGGREGATE param is read as a RAW register operand (`(cast (ptr Box.0) (rsi))`),
-  ## never through a name, so it has no `rb` binding and `isBound` cannot see it.
-  ## Dropping the union hands rsi out as `tmp1.0` in `tests/arkham/a64_param_ret_alias`
-  ## (which the corpus pass builds for x64), and the field load then reads through
-  ## the very pointer it overwrites:
+  ## Retiring it took four fixes, and each one was a place where a LIVE value sat in a
+  ## register carrying no `rb` binding, so `isBound` answered "free":
   ##
-  ##     (rebind :`tmp1.0 (i 64) (rsi))
-  ##     (mov `tmp1.0 (mem (dot (dot (cast (ptr Box.0) `tmp1.0) a.0) q.0)))
+  ##  1. a by-reference aggregate param had NO declaration at all — its pointer was
+  ##     `mov`'d into the home and every field access named the bare register
+  ##     (`emRegAggrPtrVar` + `emPtrFieldMemSym`);
+  ##  2. a RELOCATED param's home was left unbound on purpose, "for the epilogue
+  ##     pops" — and a nimony `var T` is a plain `(ptr T)`, so that was MOST pointer
+  ##     params (`emRegLocalVar` in `emitParamMoves`; `framePop` kills before popping);
+  ##  3. the hidden indirect-result pointer (`synth("retptr.0")`);
+  ##  4. a DIVERGING call's marshalling `(kill …)`s a still-live home, because `rb` is
+  ##     linear and cannot say "this path is not taken" (`restoreBindings`).
   ##
-  ## — silent corruption, then a segfault at the next field. AArch64 has the same
-  ## hole for scalar params in x0–x7 (its `emReg` reads those raw too).
-  ##
-  ## THE FIX, when someone takes it: give register-homed params an `rb` binding so
-  ## `isBound` becomes the whole authority — as `regHoldsLiveLocal` already assumes
-  ## for locals — and then delete the union from here. That is a change to how params
-  ## are emitted, not to this filter, and it unblocks the R11 bridge too (see
-  ## `forEachVolatileTempCand`).
-  r notin g.pickedRegs and not g.ra.isSealed(r) and not g.rb.isAccum(r) and
-    not g.rb.isBound(r) and not g.regHoldsHome(r)
+  ## Raw pointer operands per nifbench build: **2956 -> 45**, and the 45 are the fixed
+  ## rdi/rsi/rdx of the self-contained `mem*` sequences, which allocate no temps.
+  ## `-d:arkhamNoNarrowHomes` restores the union; `-d:arkhamHomeAudit` prints every
+  ## register the narrow filter admits that the union would refuse, and `ARKHAM_NH` /
+  ## `ARKHAM_NH_REGS` narrow it to named procs / registers, which is how each of the
+  ## four shapes above was bisected out of a whole-program segfault.
+  result = r notin g.pickedRegs and not g.ra.isSealed(r) and not g.rb.isAccum(r) and
+    not g.rb.isBound(r) and
+    (if g.narrowHomes: r notin g.rawHomeRegs and nhRegAllowed(r, g.regHoldsHome(r))
+     else: not g.regHoldsHome(r))
+  when defined(arkhamHomeAudit):
+    # Every register the narrow filter ADMITS but the old union would have refused:
+    # each one must be a home whose symbol is provably not live here, i.e. `rb` would
+    # have told us. Printing the symbol names living there is how the missing raw-home
+    # shapes were enumerated (a `(ptr object)` param read raw is the classic one).
+    if result and g.narrowHomes and g.regHoldsHome(r):
+      var who = ""
+      for name, pos in g.ra.symPos:
+        let l = g.ra.locs[pos]
+        if l.kind == InReg and l.r == r:
+          who.add (if who.len > 0: "," else: "") & name & ":" & $l.typ.kind &
+                  (if l.typ.size > 0: "/" & $l.typ.size else: "")
+      stderr.writeLine "HOMEAUDIT " & g.curProcName & " " & $r & " admits [" & who & "]"
 
 template forEachVolatileTempCand(g: var CodeGen; r, body: untyped) =
   ## The volatile GPRs `pickTempReg` may hand out, in preference order, BEFORE the
@@ -987,6 +1064,29 @@ template forEachVolatileTempCand(g: var CodeGen; r, body: untyped) =
     # So the union blocks the temp pool AND the staging fallback; R11 only becomes
     # spare once register-homed params carry an `rb` binding. One root cause, two
     # symptoms — see `regFreeForTemp`.
+
+proc tempCensus*(g: var CodeGen): string =
+  ## Why every candidate was refused, in `pickTempReg`'s own order — the temp-pool
+  ## twin of `stagingCensus`. `pickTempReg` returning `NoReg` means the register
+  ## file is FULL, and "genuinely full" and "a filter is too coarse" want opposite
+  ## fixes; only naming the refusing filter per register tells them apart.
+  result = ""
+  forEachVolatileTempCand(g, r):
+    result.add "\n    " & $r & ": "
+    if r in g.pickedRegs: result.add "picked (reserve->bind gap)"
+    elif g.ra.isSealed(r): result.add "sealed (in-flight call)"
+    elif g.rb.isAccum(r): result.add "liveAccum"
+    elif g.rb.isBound(r): result.add "bound " & g.rb.boundName(r)
+    elif g.regHoldsHome(r): result.add "HOME UNION (per-proc, not liveness)"
+    else: result.add "FREE (unreachable)"
+  for r in g.md.intCalleeSaved:
+    result.add "\n    " & $r & ": "
+    if r in g.pickedRegs: result.add "picked (reserve->bind gap)"
+    elif g.ra.isSealed(r): result.add "sealed (in-flight call)"
+    elif g.rb.isAccum(r): result.add "liveAccum"
+    elif g.rb.isBound(r): result.add "bound " & g.rb.boundName(r)
+    elif g.regHoldsHome(r): result.add "HOME UNION (per-proc, not liveness)"
+    else: result.add "FREE (unreachable)"
 
 when defined(arkhamTempDbg):
   ## `-d:arkhamTempDbg`: when `pickTempReg` falls through the WHOLE volatile pool and
@@ -1191,3 +1291,32 @@ proc subtreeHasCallE*(n: Cursor): bool =
       if subtreeHasCallE(cc): return true
       skip cc
   return false
+# ── caller-save rescue (see `RegAlloc.callerSaveHomes`) ─────────────────────
+
+proc callerSaveSetAt*(g: var CodeGen): seq[tuple[reg: Reg, name: string]] =
+  ## The caller-saved locals currently BOUND to a register — the ones this call is
+  ## about to clobber. The trigger is live binding, not the coarse `freeAfter`
+  ## interval: a value live across a control-flow merge is still bound at a call in a
+  ## predecessor branch, which an interval test under-approximates. The allocator only
+  ## hands out a caller-saved home to a value that is valid wherever it is bound, so
+  ## "save whenever bound" is always well-defined. Sorted for deterministic output.
+  if g.ra.callerSaveHomes.len == 0: return
+  for reg, name in g.rb.gprBindings:
+    if g.ra.callerSaveHomes.hasKey(name):
+      result.add (reg: reg, name: name)
+  result.sort(proc (a, b: tuple[reg: Reg, name: string]): int = cmp(ord(a.reg), ord(b.reg)))
+
+type
+  CallerSaveWindow* = object
+    ## One open save window: what was stored, and the redirect table to put back when
+    ## it closes. Opened at `emitCall2` — or EARLIER by a caller that writes an ABI
+    ## register for the call itself (the hidden result pointer in rdi), which must
+    ## happen after the save or it clobbers the value it was supposed to preserve.
+    saved*: seq[tuple[reg: Reg, name: string]]
+    prevActive*: Table[string, Location]
+
+proc callerSaveSlotName*(varName: string): string {.inline.} =
+  ## ONE permanent slot per caller-saved value, declared with the value itself. A
+  ## per-call slot inside the call's own `(scope …)` does not work: the call's result
+  ## binding is created in that scope and consumed after it closes.
+  "csave." & varName
