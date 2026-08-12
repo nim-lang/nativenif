@@ -261,9 +261,19 @@ proc isFloatType(t: Type): bool =
   t.kind == TypeKind.FloatT
 
 proc canDoIntegerArithmetic(t: Type): bool =
-  ## Check if type supports integer arithmetic operations (add, sub)
-  ## Includes integer types, literals, array pointers (for pointer arithmetic), and registers
-  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.AptrT, TypeKind.RegisterT}
+  ## May `t` be an operand of `add`/`sub`/`neg`? Integers, integer literals and raw
+  ## (untyped) registers — no pointer of any kind.
+  ##
+  ## `(aptr T)` used to be admitted here as "pointer arithmetic". It is not a legal
+  ## Leng form: an `add` says nothing about whether the offset counts BYTES or
+  ## ELEMENTS, and the two backends answered differently — nifasm emitted a plain
+  ## machine `add` (bytes) while lengc's C output read the same node as scaled C
+  ## pointer arithmetic (elements). Offsetting an array pointer is `(at base index)`,
+  ## which takes the element type and therefore has one meaning; raw byte work casts
+  ## to an integer and back. arkham rejects such a node before it ever gets here
+  ## (`checkArithResultType`); this is the assembler's own backstop, and it also
+  ## covers hand-written asm-NIF.
+  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.RegisterT}
 
 proc canCompare(t: Type): bool =
   ## Check if a type may be a `cmp` operand. A superset of integer arithmetic:
