@@ -4611,10 +4611,11 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
           # Release the temp binding so the arg register is referenced RAW where it
           # can be. Where it CANNOT — the allocator also homes plain locals in the
           # volatile arg registers, and nifasm insists a bound register be named —
-          # the name carries arkham's generic `(i 64)`, which nifasm accepts into a
-          # sub-width param as the ABI truncation it is (memfiles' `close`, where
-          # `canRaise` lives in x0 and is dead across the `raiseOSError(cint)` it
-          # stages).
+          # the name carries the local's own type, and a wider one marshalling into
+          # a sub-width param is the ABI truncation `movTypeOk`'s `narrowingArg` arm
+          # admits (memfiles' `close`, where `canRaise` lives in x0 and is dead
+          # across the `raiseOSError(cint)` it stages). That arm was x86-64-only
+          # until the rule was unified — this path would have been rejected here.
           g.unbindTemp(aD.r)
           g.ab.tree MovA64:
             g.ab.tree ArgX: g.ab.sym paramName(j)
