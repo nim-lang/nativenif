@@ -303,6 +303,15 @@ proc bindTypeDiffers*(prog: var Program; a, b: Cursor): bool =
   if pa or pb: return true
   result = intTypeWidth(ra) != intTypeWidth(rb) or isSignedType(ra) != isSignedType(rb)
 
+proc slotTypeDiffers*(prog: var Program; s: AsmSlot; t: Cursor): bool =
+  ## `bindTypeDiffers` for a slot that may carry no cursor at all. A dont-care slot
+  ## binds as `(i 64)`, so it differs from anything that is not that.
+  if cursorIsNil(s.typ):
+    let rt = resolveType(prog, t)
+    return isPtrType(rt) or intTypeWidth(rt) != 64 or not isSignedType(rt)
+  var a = s.typ
+  result = bindTypeDiffers(prog, a, t)
+
 proc checkArithResultType*(prog: var Program; resTypeC: Cursor; fallback = "") =
   ## An arithmetic node states its result type as its first child, and that type is
   ## an integer or a float. NO pointer is legal — not `(ptr T)`, not `(aptr T)`, not

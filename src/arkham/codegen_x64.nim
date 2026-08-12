@@ -5191,9 +5191,12 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
              not (dest.kind == InReg and g.symInRegE(lhsC, dest.r))
   if swap:
     var acc = dest
-    # The accumulator ends up holding the RESULT, so it is bound at the result's
-    # own type — an `(i 64)` dont-care would throw the value's range away.
-    if acc.kind != InReg: acc = g.takeTmp(g.binResultSlot(resTypeC))
+    # The accumulator receives the RHS first and only becomes the result's type at
+    # `normalizeBinWidth` below, so it is minted at the RHS's type and retyped after
+    # the normalizer. Minting it at the result type made the rhs fill a narrowing
+    # reg→reg move; same rule as the general path below.
+    let accIncoming = g.exprSlot(rhsC)
+    if acc.kind != InReg: acc = g.takeTmp(accIncoming)
     if acc.kind == NamedStack and acc.spillTemp:
       g.produceIntoMem2(c, acc)                          # pools dry: whole node via staging
       dest = acc
@@ -5226,6 +5229,10 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     else: raiseAssert "arkham x64n: bin(swapped) lhs " & $lLoc.kind
     if lhsMem: g.freeLvalTemps2(lhsC)                    # embedded picks die with the fold
     if not suppressNorm: g.normalizeBinWidth(resTypeC, rD, op)
+    if acc.isTemp and g.rb.isBoundTemp(rD) and
+       slotTypeDiffers(g.prog, accIncoming, resTypeC):
+      var rtcS = resTypeC
+      g.bindTemp(rD, slotOf(g.prog, rtcS))               # now it holds the result
     if rdSeal: g.ra.unseal {rD}
     dest = acc
     return
@@ -5287,8 +5294,17 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     rD = res.r
   let reusedLhs = lDest.kind == InReg and lDest.r == rD  # in-place RMW on the left temp
   let reusedRhs = rDest.kind == InReg and rDest.r == rD  # dest recycled the RHS temp
+  # A TEMP destination is bound at the type of what LANDS IN IT — the lhs `place2`
+  # moves in below — not at the result type. The register only becomes the result's
+  # type at `normalizeBinWidth` (the `movzx` after the op), and the retype for that
+  # happens down there. Binding it at the result type up front made the lhs move
+  # narrowing: `(rebind tmp1 (u 32))` then `(mov tmp1 (i 64)tmp0)`, which nifasm
+  # rejects — and rightly, since nothing has converted anything yet.
+  # A dont-care lhs slot is not "no information": it is the `(i 64)` its own temp
+  # is bound as, which is precisely what arrives here.
+  let incoming = (if lDest.kind == InReg: lDest.typ else: res.typ)
   if res.kind == InReg and res.isTemp and not g.rb.isBoundTemp(rD):
-    g.bindTemp(rD, res.typ)
+    g.bindTemp(rD, incoming)
   if not isPtrType(resolveType(g.prog, resTypeC)):
     let nm = g.rb.boundName(rD)
     if g.rb.isBoundTemp(rD):
@@ -5318,6 +5334,12 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     of NamedStack, Mem: g.binFold(op, rD, rDest, rhsC)   # sub-width field → load+extend
     else: raiseAssert "arkham x64n: bin rhs " & $rDest.kind
   if not suppressNorm: g.normalizeBinWidth(resTypeC, rD, op)
+  # The op ran and the width was normalized, so the register now holds the RESULT.
+  # Put the result's type on the temp that was bound at the incoming type above.
+  if res.kind == InReg and res.isTemp and g.rb.isBoundTemp(rD) and
+     slotTypeDiffers(g.prog, incoming, resTypeC):
+    var rtc2 = resTypeC
+    g.bindTemp(rD, slotOf(g.prog, rtc2))
   if rdSeal: g.ra.unseal {rD}
   if not reusedRhs: g.freeVal(rDest)                     # freeVal frees only temps
   if not reusedLhs: g.freeVal(lDest)
