@@ -3243,6 +3243,14 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
 proc emitLeafImm(g: var CodeGen; dest: var Location; natural: Location) =
   ## FUSED literal leaf: resolve the constraint against the immediate; a
   ## register destination gets it materialized (binding a fresh temp first).
+  ##
+  ## A Leng literal carries no type of its own — `42` and `'a'` are typed by where
+  ## they go — so the callers hand one over as a dont-care slot. Take the type from
+  ## the DESTINATION when it has one, or the temp minted below is bound `(i 64)`
+  ## and a `(c 8)` value loses its range and signedness on the way in.
+  var natural = natural
+  if cursorIsNil(natural.typ.typ) and not cursorIsNil(dest.typ.typ):
+    natural.typ = dest.typ
   g.resolveDestE(dest, natural)
   if dest.kind == InReg:
     if dest.isTemp and not g.rb.isBoundTemp(dest.r): g.bindTemp(dest.r, dest.typ)
@@ -3648,7 +3656,9 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
              not (dest.kind == InReg and g.symInRegE(lhsC, dest.r))
   if swap:
     var acc = dest
-    if acc.kind != InReg: acc = g.takeTmp(ScalarSlot)
+    # The accumulator ends up holding the RESULT, so it is bound at the result's
+    # own type — an `(i 64)` dont-care would throw the value's range away.
+    if acc.kind != InReg: acc = g.takeTmp(g.binResultSlot(resTypeC))
     if acc.kind == NamedStack and acc.spillTemp:
       g.produceIntoMem2(c, acc)                          # pools dry: whole node via x16
       dest = acc
@@ -3700,7 +3710,7 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     elif rDest.kind == InReg and rDest.isTemp and lDest.kind == InReg and
          ek notin {ShlC, ShrC, DivC}:
       res = rDest                                        # recycle the dead rhs temp
-    else: res = g.takeTmp(ScalarSlot)
+    else: res = g.takeTmp(g.binResultSlot(resTypeC))
   else: discard
   let aliasRhs = res.kind == InReg and rDest.kind == InReg and res.r == rDest.r and
                  not (lDest.kind == InReg and res.kind == InReg and lDest.r == res.r)
@@ -3778,7 +3788,7 @@ proc emitMod2(g: var CodeGen; c: Cursor; dest: var Location) =
   case dest.kind
   of Undef, NeedsReg, RegOrImm:
     if lD.kind == InReg and lD.isTemp: res = lD          # reuse the dead dividend temp
-    else: res = g.takeTmp(ScalarSlot)
+    else: res = g.takeTmp(g.binResultSlot(rt))
   else: discard
   var resStaging = NoReg
   var rD: Reg

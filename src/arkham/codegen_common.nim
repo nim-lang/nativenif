@@ -281,6 +281,15 @@ proc isPtrType*(c: Cursor): bool =
   of PtrT, AptrT, ProctypeT: true
   else: false
 
+proc binResultSlot*(g: var CodeGen; resTypeC: Cursor): AsmSlot =
+  ## The slot for the register a binary-arith result lands in: the node's OWN
+  ## result type, so the temp is bound `(c 8)`/`(u 16)`/… rather than a dont-care
+  ## `(i 64)`. The register is 64 bits wide either way — that is where the value
+  ## lives, not what it is, and binding it as `(i 64)` discards the range and the
+  ## signedness the rest of the pipeline is entitled to check.
+  var t = resTypeC
+  result = slotOf(g.prog, t)
+
 proc bindTypeDiffers*(prog: var Program; a, b: Cursor): bool =
   ## Would nifasm see two different BINDING types for `a` and `b`? Compares exactly
   ## what a register binding declares — pointer-ness, width, signedness — so a
