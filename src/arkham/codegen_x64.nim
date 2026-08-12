@@ -2962,6 +2962,16 @@ proc emitValue2(g: var CodeGen; c: Cursor; dest: var Location) =
   if dest.kind == NamedStack and dest.spillTemp:
     g.produceIntoMem2(c, dest)
     return
+  # THE place dont-care destinations acquire a type. A caller that asks for "some
+  # register" with a placeholder slot is not saying the value is an `(i 64)` — it is
+  # saying it does not care WHERE the value goes. What the value IS, is `c`'s own
+  # type, and every temp minted for this destination downstream binds from this
+  # slot. Filling it here types them all at one site instead of at each mint, and
+  # keeps a `(c 8)` a `(c 8)` instead of flattening it to the register's width.
+  if dest.kind in {Undef, NeedsReg, RegOrImm} and cursorIsNil(dest.typ.typ):
+    let s = g.exprSlot(c)
+    if not cursorIsNil(s.typ) and s.cls notin {AFloat, AMem}:
+      dest.typ = s
   let pos = cursorToPosition(g.buf[], c)          # for the keepovf no-fold guard
   case c.kind
   of IntLit: g.emitLeafImm(dest, immLoc(intVal(c), ScalarSlot))
