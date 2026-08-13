@@ -210,8 +210,29 @@ proc emFloatScalarStore(g: var CodeGen; name: string; src: FReg; bits: int) =
 proc movImm(g: var CodeGen; d: Reg; v: int64) =
   g.ab.tree MovX64: g.emReg d; g.ab.intLit v
 
+proc genTypeBody(g: var CodeGen; c: var Cursor)   # forward: `movReg` states its cast
+proc bindTypeOf(g: var CodeGen; r: Reg): Cursor
+
 proc movReg(g: var CodeGen; d, s: Reg) =
+  ## THE reg→reg move. Both ends are NAMES when they carry bindings, and nifasm
+  ## checks the names' declared types, not the machine move — which moves the whole
+  ## register whatever the two sides call it. Where they disagree the move is a
+  ## reinterpretation, so say so with a `(cast …)` rather than emit something that
+  ## reads as a narrowing move; `genStore2` already answers a pointer field that way.
+  ## The destination's type is not ours to change here: it is a named local's, and
+  ## it is right. (A retype that is genuinely wrong is a bug at the PRODUCER — see
+  ## `emitCast2`'s pre-retype and `restoreBindings` — and this does not paper over
+  ## those: they decide what the binding says, this only spells the move honestly.)
   if d == s: return
+  let dt = g.bindTypeOf(d)
+  if not cursorIsNil(dt):
+    let st = g.bindTypeOf(s)
+    if not cursorIsNil(st) and bindTypeDiffers(g.prog, st, dt):
+      var dtc = dt
+      g.ab.tree MovX64:
+        g.emReg d
+        g.ab.tree CastX: (g.genTypeBody(dtc); g.emReg s)
+      return
   g.ab.tree MovX64: g.emReg d; g.emReg s
 
 proc binReg(g: var CodeGen; op: X64Inst; d, s: Reg) =      # d op= s
@@ -334,7 +355,6 @@ proc freshLabel(g: var CodeGen): string =
 
 # ── expressions ──────────────────────────────────────────────────────────────
 
-proc genTypeBody(g: var CodeGen; c: var Cursor)
 proc framePop(g: var CodeGen)
 proc pickStaging(g: var CodeGen; what: string; avoid: Reg = NoReg): Reg
 # value-core emitters (defined far below) used by the shared memory-move helpers
@@ -483,11 +503,14 @@ proc restoreBindings(g: var CodeGen; saved: seq[tuple[r: Reg, name: string]]) =
       g.ab.symDef it.name
       if bt.aggrName.len > 0:
         g.ab.ptrType: (g.ab.sym bt.aggrName)
-      elif bt.isPtr:
+      else:
+        # The name's OWN type, pointer or not. Re-establishing a `(u 32)` param as
+        # a flat `(i 64)` is what `emRegLocalVar` stopped doing at the declaration
+        # and this had to stop doing at the restore: nifasm checks `mov` operand
+        # types now, and `tagLitToken`'s `(mov `tmp12.0 `p1.0)` — a `(u 32)` param
+        # read after a diverging `failVal` call — was rejected outright.
         var tc = bt.typ
         g.genTypeBody(tc)
-      else:
-        g.ab.intType(64)
       g.ab.reg it.r
     g.rb.rebindLocal(it.r, it.name, bt.isPtr)
     if it.r notin g.md.intCalleeSaved:
@@ -1168,6 +1191,25 @@ proc rebindLocalAs(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
     g.genTypeBody(t)
     g.ab.reg r
   g.rb.rebindLocal(r, name, isPtr)
+  # The name's binding type is now `typeCur`, so the record has to move with it:
+  # `restoreBindings` re-emits from it after a diverging call, and `bindTypeOf`
+  # answers from it. Leaving the declaration-time entry made both name a type the
+  # binding no longer has.
+  g.nameBindTyp[name] = NameBindTyp(isPtr: isPtr, typ: typeCur)
+
+proc bindTypeOf(g: var CodeGen; r: Reg): Cursor =
+  ## The Leng type `r`'s CURRENT nifasm binding declares, or a nil cursor when it
+  ## declares none: a raw register, an aggregate-pointer binding (whose type is a
+  ## name, not a cursor), or a dont-care temp. This is what an operand ARRIVES as,
+  ## which is not always what its expression's static type says — see `emitCast2`.
+  result = default(Cursor)
+  if g.rb.isBoundTemp(r):
+    if g.tmpBindTyp.hasKey(r): result = g.tmpBindTyp[r].typ
+  else:
+    let nm = g.rb.boundName(r)
+    if nm.len > 0 and g.nameBindTyp.hasKey(nm):
+      let bt = g.nameBindTyp[nm]
+      if bt.aggrName.len == 0: result = bt.typ
 
 # ── conditions / branches ────────────────────────────────────────────────────
 
@@ -1513,6 +1555,18 @@ const x64RetRegs = [RAX, RDX]   # SysV ≤16B aggregate result: rax (word 0), rd
 
 proc emStackAddr(g: var CodeGen; dest: Reg; name: string) =   # dest ← &stackvar
   g.ab.tree LeaX64: (g.emReg dest; g.ab.reg RSP; g.ab.sym name)
+
+proc dropStaleBinding(g: var CodeGen; r: Reg) =
+  ## `r` is about to be WRITTEN with a value of an unrelated type — the hidden
+  ## result pointer. A binding still sitting on it makes `emReg` name that local
+  ## instead of the register, so the write comes out as `(lea `x.64 …)` into a
+  ## name declared `(bool)` — which nifasm rejects now that it checks operand
+  ## types, and which was a silent lie before. Whatever was still LIVE there was
+  ## parked by the caller-save window that opens first; this only surrenders the
+  ## name of a value that is already dead.
+  let dead = g.rb.takeBinding(r)
+  if dead.len > 0:
+    g.ab.tree KillX64: g.ab.sym dead
 
 proc emPtrFieldMem(g: var CodeGen; ptrReg: Reg; typeName, field: string) =
   ## `(mem (dot (cast (ptr T) reg) field))` — a field through a register holding a
@@ -4690,6 +4744,7 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
         # binding, so the write comes out as `(lea <thatlocal> …)` and the corruption
         # is invisible to any scan for raw register operands.)
         let w = g.emCallerSaveOpen()
+        g.dropStaleBinding(RDI)
         g.emStackAddr(RDI, dstVar)
         var d = dontCare
         g.emitCall2(rhs, d, hiddenPtr = true)            # the callee writes through rdi
@@ -4731,6 +4786,7 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
     if rhs.kind == TagLit and rhs.exprKind == CallC and
        dst.typ.size > g.md.aggrByRefThreshold:
       let w = g.emCallerSaveOpen()                       # rdi first: see the sibling site
+      g.dropStaleBinding(RDI)
       g.emSymAddr(RDI, dst)                              # >16B: &dst is the hidden result ptr
       var d = dontCare
       g.emitCall2(rhs, d, hiddenPtr = true)              # callee writes through rdi
@@ -5648,6 +5704,18 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     if op == SubX64:
       g.ab.tree NegX64: g.emReg rD                       # dest := lhs - rhs
   else:
+    # `rD` may be a NAMED destination whose type is not ours to change (the retype
+    # above put the result type back on it), while the lhs partial sits in a temp
+    # minted at the dont-care `(i 64)`. Retype the TEMP instead — in Leng both
+    # operands of an integer op already have the node's result type, and a rebind
+    # is zero machine code — so the move below is not a narrowing one. Without it
+    # `(or (u 32) 1 …)` into a `(u 32)` result emitted `(mov result.71 `tmp5.0)`
+    # with `tmp5.0` bound `(i 64)`, which nifasm rejects.
+    if lDest.kind == InReg and lDest.isTemp and lDest.r != rD and
+       g.rb.isBoundTemp(lDest.r) and not g.rb.isBoundTemp(rD) and
+       slotTypeDiffers(g.prog, lDest.typ, resTypeC):
+      var rtcL = resTypeC
+      g.bindTemp(lDest.r, slotOf(g.prog, rtcL))
     g.place2(lDest, rD)                                  # dest := lhs
     case rDest.kind                                      # dest op= rhs
     of Imm:
@@ -6662,6 +6730,16 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
   if dest.kind == InReg and not dest.isTemp:
     let nm = g.rb.boundName(dest.r)
     var st = g.getType(inner)
+    # What the value ARRIVES as, which is not always the inner's static type: an
+    # inner symbol that shares another local's home (an identity-cast alias) comes
+    # out of THAT name's binding. `(cast (u -1) exprKind.0)` whose `exprKind.0`
+    # lives in an `(i 64)` local retyped the destination to the enum's `(u 16)` and
+    # then moved 64 signed bits into it — a mismatch nifasm rejects.
+    if inner.kind == Symbol:
+      let sh = g.ra.locationOfSym(symName(inner))
+      if sh.kind == InReg:
+        let bt = g.bindTypeOf(sh.r)
+        if not cursorIsNil(bt): st = bt
     if nm.len > 0 and bindTypeDiffers(g.prog, st, targetCur):
       g.rebindLocalAs(nm, dest.r, st)
       preRetyped = nm
@@ -7186,8 +7264,10 @@ proc emCallerSaveRestore(g: var CodeGen; slotName, varName: string; r: Reg) =
   var isPtr = false
   g.ab.tree RebindX64:
     g.ab.symDef varName
-    if g.symType.hasKey(varName) and isPtrType(resolveType(g.prog, g.symType[varName])):
-      isPtr = true
+    if g.symType.hasKey(varName):
+      # Its declared type, whatever it is — see `restoreBindings` for why a blanket
+      # `(i 64)` is not good enough for a non-pointer either.
+      isPtr = isPtrType(resolveType(g.prog, g.symType[varName]))
       var tc = g.symType[varName]
       g.genTypeBody(tc)
     else:
@@ -7408,6 +7488,7 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
   var written = claims
   if res.kind == InReg: written.incl res.r
   var ops: seq[Location] = @[]
+  let inPlace = inPlaceIntrinsicX64(tgt.op)
   block:
     var i = 0
     for a in argCurs:
@@ -7417,7 +7498,14 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
           regOrImm(g.exprSlot(a))
         else:
           g.instrOperandInPlace(a, written)
-      if d.kind == Undef: d = g.takeInstrReg(g.exprSlot(a))
+      if d.kind == Undef:
+        # An in-place row `mov`s operand 0 INTO the result register below, so the
+        # two bindings have to agree on type. Taking the operand at the
+        # expression's own slot types a bare literal `(i 64)`, and `bswap`'s
+        # `(mov `x.8 `tmp33.0)` into a `(u 32)` local is a mismatch nifasm rejects.
+        let slot = if i == 0 and inPlace and res.kind == InReg: res.typ
+                   else: g.exprSlot(a)
+        d = g.takeInstrReg(slot)
       g.emitValue2(a, d)
       g.ra.locs[cursorToPosition(g.buf[], a)] = d
       ops.add d
@@ -7438,7 +7526,6 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
   let aliasesA0 = a0.kind == InReg and a0.r == res.r
   if res.isTemp and not aliasesA0 and not g.rb.isBoundTemp(res.r):
     g.bindTemp(res.r, res.typ)
-  let inPlace = inPlaceIntrinsicX64(tgt.op)
   if inPlace and not aliasesA0:
     if a0.kind == InReg: g.movReg(res.r, a0.r)
     else: g.place2(a0, res.r)

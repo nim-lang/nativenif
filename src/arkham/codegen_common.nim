@@ -351,6 +351,15 @@ proc bindTypeDiffers*(prog: var Program; a, b: Cursor): bool =
   let pb = isPtrType(rb)
   if pa or pb: return true
   result = intTypeWidth(ra) != intTypeWidth(rb) or isSignedType(ra) != isSignedType(rb)
+  if not result:
+    # `intTypeWidth` answers 64 for anything that is not a literal `(i|u|c N)`, so
+    # every ENUM looks the same width as every other. nifasm types an enum binding
+    # by its BASE, and `(u 16)` vs `(u 8)` is exactly the mismatch that reached it:
+    # `(cast NimonyType e)` out of a `TagEnum` skipped the pre-retype in `emitCast2`
+    # and emitted a bare narrowing move. The SLOT does carry the base width.
+    var ac = a
+    var bc = b
+    result = slotOf(prog, ac).size != slotOf(prog, bc).size
 
 proc slotTypeDiffers*(prog: var Program; s: AsmSlot; t: Cursor): bool =
   ## `bindTypeDiffers` for a slot that may carry no cursor at all. A dont-care slot
