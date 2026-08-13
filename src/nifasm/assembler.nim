@@ -4806,7 +4806,13 @@ proc checkType(want, got: Type; n: Cursor) =
 
 proc checkIntegerArithmetic(t: Type; op: string; n: Cursor) =
   if not canDoIntegerArithmetic(t):
-    error("Operation '" & op & "' requires integer or pointer type, got " & $t, n)
+    # NOT "integer or pointer": `canDoIntegerArithmetic` admits no pointer of any
+    # kind, and saying otherwise sends the reader looking for which pointer was
+    # meant. Name the two legal spellings instead — that is what the producer has
+    # to change to.
+    error("Operation '" & op & "' requires an integer type, got " & $t &
+          " — Leng has no arithmetic on pointers: offset an array pointer with " &
+          "`(at …)`/`(pat …)`, or cast to an integer, compute, and cast back", n)
 
 proc checkComparable(t: Type; op: string; n: Cursor) =
   if not canCompare(t):

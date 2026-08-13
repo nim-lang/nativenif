@@ -6804,11 +6804,20 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
   let srcPtr = isPtrType(resolveType(g.prog, g.getType(inner)))
   let kindChange = ptrTarget or srcPtr
   if kindChange:
+    let reboundAs = (if ptrTarget: slotOf(g.prog, targetCur) else: ScalarSlot)
     if res2.isTemp:
-      g.bindTemp(res2.r, (if ptrTarget: slotOf(g.prog, targetCur) else: ScalarSlot))
+      g.bindTemp(res2.r, reboundAs)
     else:
       let nm = g.rb.boundName(res2.r)                    # the register's named local
       if nm.len > 0: g.rebindLocalAs(nm, res2.r, targetCur)
+    # And say so in the LOCATION, not only in the binding. They are two records of
+    # one fact and the caller reads the Location: `emitBin2` binds its result temp
+    # at `lDest.typ`, so a cast that left the inner's slot there had the ADD's
+    # destination declared as the inner's type. `cast[ptr char](cast[uint](p) + n)`
+    # — the sanctioned way to offset a pointer — came out as `(add <aptr> …)`, which
+    # is exactly the arithmetic-on-a-pointer nifasm rejects. Only reachable with a
+    # bigger `InlineTinyBound`, which is what put this shape in one basic block.
+    dest.typ = reboundAs
   let (srcW, srcSigned) = g.srcWidthSigned(inner)
   if kindChange:
     if ptrTarget and not srcPtr and srcW < 64: g.extendTo(res2.r, srcW, signed = false)
