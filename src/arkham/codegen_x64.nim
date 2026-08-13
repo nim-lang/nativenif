@@ -2405,6 +2405,15 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
           let home = pairWord(loc, k)
           let arg = g.md.gprAt(pl, k)
           if home != arg: g.movReg(home, arg)
+          # A pair word is written RAW and read back RAW (`pairFieldReg` hands out
+          # the bare register), so `rb` cannot see it and `isBound` answers "free".
+          # That is precisely what `rawHomeRegs` is for — without it the emitter
+          # hands the word out as an expression temp while the parameter is still
+          # live: `(rebind :tmp13.0 (rbx))` on top of a `string` param's word 0,
+          # and the very next call marshals `(mov (rdx) (rbx))` from the clobbered
+          # register. Same shape as the by-ref pointer in `emRegAggrPtrVar`, which
+          # solves it by NAMING the register instead.
+          g.rawHomeRegs.incl home
       elif tn.len > 0 and loc.kind == InReg and not pl.onStack:
         # >16B by-reference aggregate passed in a register: a pointer homed like a
         # scalar; field accesses route through it (recorded in varType). A stack-

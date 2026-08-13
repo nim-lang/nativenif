@@ -1339,7 +1339,13 @@ proc canHomeInRegPair*(p: var Program; typeName: string): bool =
   if lay.len == 0: return false
   for f in lay:
     if f.size != 8 or (f.off and 7) != 0: return false
-    if slotOf(p, fieldType(p, body, f.name)).kind == AFloat: return false
+    # A float travels in SIMD registers, and an AGGREGATE field is addressed as
+    # MEMORY however wide it is — `(dot p f)` on a nested object hands the emitter
+    # an lvalue, and a register has no address. `Node = object (next: Node;
+    # value: Elem)` is two 8-byte fields at 8-byte offsets, so the size/offset
+    # test alone admitted it, and the synthesized `=destroy` then tripped
+    # `address of InRegPair local dest.0`.
+    if slotOf(p, fieldType(p, body, f.name)).kind in {AFloat, AMem}: return false
   true
 
 # ── compile-time integer constant evaluation ────────────────────────────────
