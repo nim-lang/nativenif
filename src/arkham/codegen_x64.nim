@@ -6808,13 +6808,21 @@ proc emitAddr2(g: var CodeGen; c: Cursor; dest: var Location) =
   # Call-arg dest-threading puts `&stackAgg` in rdi/rsi/… while a dead scalar
   # local is still bound there (`AllRegs` homes). `doBind` is false (the dest
   # is the ABI register, not a temp), so the lea would keep that name's type.
-  # Kill a non-pointer tenant; then bind a pointer temp if the register is raw.
+  # Kill a non-pointer tenant.
   if res.kind == InReg and not res.isTemp and g.rb.isBound(res.r) and
      not g.rb.isBoundTemp(res.r) and not g.rb.isPtrBound(res.r):
     g.releaseStaleName(res.r)
   g.emitLvalue2(lv, globBase = res)                     # a global base reuses the lea dest
-  g.aggrAddrInto(lv, res.r, g.exprSlot(c),
-                 doBind = res.isTemp or not g.rb.isBound(res.r))
+  # …but do NOT also bind a fresh temp when the register is raw. A non-temp dest
+  # here IS the in-flight ABI argument register, and nothing releases such a
+  # binding: the marshaller seals an argument only AFTER emitting it, so there is
+  # no point at which this one is dropped, and it survives the `(call)` that
+  # clobbers the register. nifasm then rejects the next read —
+  #   Access to variable `tmp299.0` in register RDX which was clobbered
+  # — which is how `nifbench` and three `cps` tests stopped building natively.
+  # The binding is only wanted to type the `lea`; the argument is transferred
+  # immediately afterwards, so a raw dest is what this position can support.
+  g.aggrAddrInto(lv, res.r, g.exprSlot(c), doBind = res.isTemp)
   g.freeLvalTemps2(lv)
   dest = res
 
