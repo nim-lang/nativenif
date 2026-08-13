@@ -487,7 +487,7 @@ proc srcWidthSigned*(g: var CodeGen; c: Cursor): tuple[width: int, signed: bool]
   case c.kind
   of Symbol:
     let nm = symName(c)
-    let loc = g.ra.locationOfSym(nm)
+    let loc = g.ra.locationOfSym(nm, cursorToPosition(g.buf[], c))
     if loc.kind != NoLoc:
       return slotWidthSigned(loc.typ)        # a local/param: the allocator knows it
     let si = g.lookupSym(nm)                   # a global / thread-local: read its decl type
@@ -549,7 +549,7 @@ proc asLoc*(g: var CodeGen; c: var Cursor): Location =
       # A proc as a value is its address, not an lvalue; `genVal` emits the `lea`.
       raiseAssert "arkham: proc used as an lvalue: " & nm
     of scNone:
-      let loc = g.ra.locationOfSym(nm)
+      let loc = g.ra.homeOfSym(nm)
       case loc.kind
       of InReg: result = regLoc(loc.r, slot)
       of InFReg: result = fregLoc(loc.f, slot)
@@ -879,7 +879,7 @@ proc operandInReg*(g: var CodeGen; operand: Cursor; dest: Reg): bool =
   ## expression is materialized into a fresh scratch (never a live local's home).
   result = false
   if operand.kind == Symbol:
-    let loc = g.ra.locationOfSym(symName(operand))
+    let loc = g.ra.locationOfSym(symName(operand), cursorToPosition(g.buf[], operand))
     result = loc.kind == InReg and loc.r == dest
 
 # ── select-diamond recognition (shared by a64 `csel` & x64 `cmov`) ────────────
@@ -908,7 +908,7 @@ proc simpleSelectValue(g: var CodeGen; rhs: Cursor): bool =
     else: inc v                                        # descend to the wrapped value
   case v.kind
   of IntLit, UIntLit, CharLit: true
-  of Symbol: g.ra.locationOfSym(symName(v)).kind in {InReg, NamedStack}
+  of Symbol: g.ra.locationOfSym(symName(v), cursorToPosition(g.buf[], v)).kind in {InReg, NamedStack}
   else: false
 
 proc selectAsgnDstRhs(asgn: Cursor; dstName: var string; rhs: var Cursor): bool =
@@ -987,7 +987,7 @@ proc matchSelectDiamond*(g: var CodeGen; c: Cursor; sd: var SelectDiamond): bool
   if not selectAsgnDstRhs(thenBody, thenDst, thenRhs): return false
   if not selectAsgnDstRhs(elseBody, elseDst, elseRhs): return false
   if thenDst != elseDst: return false
-  let dst = g.ra.locationOfSym(thenDst)
+  let dst = g.ra.homeOfSym(thenDst)
   if dst.kind != InReg: return false
   if not g.simpleSelectValue(thenRhs) or not g.simpleSelectValue(elseRhs): return false
   sd = SelectDiamond(ek: condC.exprKind, a: aC, b: bC, dst: dst,
@@ -1263,19 +1263,19 @@ proc isFoldableLeafE*(g: var CodeGen; n: Cursor): bool =
   ## or a function-local symbol read (folds as its reg / stack-home operand).
   case n.kind
   of IntLit, UIntLit, CharLit: true
-  of Symbol: g.ra.locationOfSym(symName(n)).kind in {InReg, NamedStack}
+  of Symbol: g.ra.locationOfSym(symName(n), cursorToPosition(g.buf[], n)).kind in {InReg, NamedStack}
   else: false
 
 proc symInRegE*(g: var CodeGen; n: Cursor; reg: Reg): bool {.inline.} =
   ## Is `n` a symbol homed in `reg`? (Forbids a Sethi–Ullman swap whose
   ## rhs-into-dest evaluation would clobber a lhs homed in dest.)
   if n.kind != Symbol: return false
-  let h = g.ra.locationOfSym(symName(n))
+  let h = g.ra.locationOfSym(symName(n), cursorToPosition(g.buf[], n))
   h.kind == InReg and h.r == reg
 
 proc exprReadsRegImplE(g: var CodeGen; n: var Cursor; reg: Reg): bool =
   if n.kind == Symbol:
-    let h = g.ra.locationOfSym(symName(n))
+    let h = g.ra.locationOfSym(symName(n), cursorToPosition(g.buf[], n))
     inc n
     return h.kind == InReg and h.r == reg
   elif n.kind == TagLit:
@@ -1300,7 +1300,7 @@ proc lvalueGlobalBaseE*(g: var CodeGen; n: Cursor): bool =
   ## private `lvalueGlobalBase`.)
   var c = n
   case c.kind
-  of Symbol: result = g.ra.locationOfSym(symName(c)).kind == NoLoc
+  of Symbol: result = g.ra.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind == NoLoc
   of TagLit:
     case c.exprKind
     of DotC, AtC:

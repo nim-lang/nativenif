@@ -46,6 +46,14 @@ type
     scratch*: seq[Reg]                ## extra GPRs reserved for this op (a
                                       ## non-pow2 stride temp, an address scratch…)
 
+  LocSeg* = object
+    ## One stretch of a local's live range and where its value is over that
+    ## stretch. The allocator produces none of these yet — a local has one home
+    ## for its whole range — but `locationOfSym` is already asked position-wise,
+    ## so producing them is an addition rather than a rewrite of every consumer.
+    fromPos*: int
+    loc*: Location
+
   LocSpan* = object
     ## Position-indexed `Location` storage for ONE proc. Token positions are
     ## ABSOLUTE module-buffer offsets (`cursorToPosition`), but a proc only ever
@@ -64,6 +72,11 @@ type
                                       ## for symbol defs; the rewrite fills it for EVERY
                                       ## value-producing position (its result location).
     aux*: Table[int, ExprAux]         ## pos → per-op selection aux (see `ExprAux`)
+    segs*: Table[string, seq[LocSeg]] ## name → where its value lives, per stretch of its
+                                      ## range, sorted by `fromPos`. EMPTY today: one home
+                                      ## per local, so `locationOfSym` falls through to
+                                      ## `symPos`/`locs` below and answers the same
+                                      ## everywhere. The split-range allocator fills this.
     symPos*: Table[string, int]       ## local/param name → its def position. This IS the
                                       ## local→cursor-pos mapping: every local read resolves
                                       ## through `locs[symPos[name]]` (the emitter late-binds via
@@ -1109,9 +1122,15 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
 
 # ── lookup API (used by codegen) ────────────────────────────────────────────
 
-proc locationOfSym*(ra: RegAlloc; name: string): Location {.inline.} =
-  ## Storage of a local/param by name; `NoLoc` if the name is not an
-  ## allocator-known local/param (a module-level symbol or a synthesized slot).
+proc homeOfSym*(ra: RegAlloc; name: string): Location {.inline.} =
+  ## The DECLARED STORAGE of a local/param — the one place its value lives when it
+  ## is not in flight. `NoLoc` if the name is not an allocator-known local/param (a
+  ## module-level symbol or a synthesized slot).
+  ##
+  ## Ask this when the question is about the storage itself: addressing a stack
+  ## slot, deciding whether a name has a slot to spill to, saving and restoring it
+  ## around a call. Ask `locationOfSym` instead when the question is "where is this
+  ## VALUE, here" — see there.
   ##
   ## A caller-saved value inside an open call window reads from its SAVE SLOT, not
   ## from its register: the save has already run and ABI marshalling is about to
@@ -1122,6 +1141,32 @@ proc locationOfSym*(ra: RegAlloc; name: string): Location {.inline.} =
   if ra.callerSaveActive.len > 0:
     let act = ra.callerSaveActive.getOrDefault(name, noLoc)
     if act.kind != NoLoc: return act
+  let p = ra.symPos.getOrDefault(name, -1)
+  if p >= 0: ra.locs[p] else: noLoc
+
+proc locationOfSym*(ra: RegAlloc; name: string; pos: int): Location {.inline.} =
+  ## Where the VALUE of `name` is at token position `pos`.
+  ##
+  ## Today every local has exactly one location for its whole live range, so this
+  ## answers the same as `homeOfSym` — `segs` is always empty. The two are
+  ## nevertheless different questions, and separating them is the point: an
+  ## allocator that splits a live range (a volatile between calls, the save slot
+  ## across one) makes the answer depend on WHERE it is asked, and every site that
+  ## asks it has to be a site that knows where it is. The sites that genuinely
+  ## want the storage keep asking `homeOfSym`, and stay right.
+  ##
+  ## Segments are sorted by `fromPos` and cover the range from there to the next
+  ## one; a position before the first segment means the value is not live yet,
+  ## which is the declared home by construction.
+  if ra.callerSaveActive.len > 0:
+    let act = ra.callerSaveActive.getOrDefault(name, noLoc)
+    if act.kind != NoLoc: return act
+  if ra.segs.len > 0 and ra.segs.hasKey(name):
+    let s = ra.segs[name]
+    if s.len > 0:
+      var i = s.len - 1
+      while i > 0 and s[i].fromPos > pos: dec i
+      if s[i].fromPos <= pos: return s[i].loc
   let p = ra.symPos.getOrDefault(name, -1)
   if p >= 0: ra.locs[p] else: noLoc
 

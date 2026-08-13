@@ -344,7 +344,7 @@ proc emAggrFieldMem(g: var CodeGen; base, field: string) =
   ## Field memory operand for the aggregate named `base`, dispatching on how it
   ## is held: a `(s)` stack struct → direct `(dot …)`; a pointer in a register
   ## (a by-reference param) → through the pointer.
-  let loc = g.ra.locationOfSym(base)
+  let loc = g.ra.homeOfSym(base)
   case loc.kind
   of NamedStack: g.emFieldMem(base, field)
   of InReg:      g.emPtrFieldMem(loc.r, g.varType[base], field)
@@ -357,7 +357,7 @@ proc emAggrFieldMem(g: var CodeGen; base, field: string) =
 proc emAggrDot(g: var CodeGen; base, field: string) =
   ## The `(dot …)` operand alone (no `mem` wrapper), location-aware — for `lea`
   ## (address-of a field). Stack struct → `(dot var field)`; pointer → cast.
-  let loc = g.ra.locationOfSym(base)
+  let loc = g.ra.homeOfSym(base)
   case loc.kind
   of NamedStack:
     g.ab.tree DotX:
@@ -905,7 +905,7 @@ proc aggrWordsToFromRegs(g: var CodeGen; varName, typeName: string;
   ## needs no layout at all. A trailing PARTIAL eightbyte goes through
   ## `loadAggrTail` / `storeAggrTail`: exact bytes, no over-read, no over-write.
   let byteSize = aggrByteSize(g.prog, typeName)
-  let loc = g.ra.locationOfSym(varName)
+  let loc = g.ra.homeOfSym(varName)
   var baseReg = NoReg
   var bridge = NoReg
   if loc.kind == InReg:
@@ -1106,7 +1106,7 @@ proc emitStackParamLoads(g: var CodeGen; decl: Cursor) =
         # a ≤16B by-value aggregate's home is a POINTER to those bytes (address-of), so
         # the body reads its fields through it (varType set in emitParamMoves) with no
         # copy. The pointer is absolute, surviving any later frame `sub sp`.
-        let loc = g.ra.locationOfSym(nm)
+        let loc = g.ra.homeOfSym(nm)
         assert loc.kind == InReg,
           "arkham v1: stack parameter without a register home: " & nm
         # RAW register operands: this text is written into the PROLOGUE, which
@@ -1157,7 +1157,7 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
         # register path. `slotOf` loads a foreign module if the type lives there.
         if c.kind == Symbol and slotOf(g.prog, c).kind == AMem: tn = symName(c)
         while c.hasMore: skip c               # type (+ anything else)
-      let loc = g.ra.locationOfSym(nm)
+      let loc = g.ra.homeOfSym(nm)
       if tn.len > 0 and loc.kind == NamedStack:
         # ≤16B by-value aggregate: declare its stack home, fill from its GPR(s)
         g.varType[nm] = tn
@@ -1728,7 +1728,7 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
   case c.kind
   of Symbol:
     let nm = symName(c)
-    let loc = g.ra.locationOfSym(nm)
+    let loc = g.ra.locationOfSym(nm, cursorToPosition(g.buf[], c))
     if loc.kind == NoLoc:                                 # module-level global base
       let baseReg = g.ra.locs[g.posOf(c)]
       let si = g.lookupSym(nm)
@@ -1904,7 +1904,7 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
   ## `(lea …)` tree opens.
   if c.kind == Symbol:
     let loc = g.ra.locs[g.posOf(c)]
-    if loc.kind == InReg and g.ra.locationOfSym(symName(c)).kind == NoLoc:
+    if loc.kind == InReg and g.ra.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind == NoLoc:
       # a module-level global aggregate base: `lea reg, &g` into the address register
       # the walk reserved (fused: a lazy-bound pick — bind it here, at
       # materialization; pre-fuse it was bound by the caller).
@@ -2033,7 +2033,7 @@ proc bindLvalGlobalBases(g: var CodeGen; c: Cursor; bound: var seq[Reg]) =
   if c.kind == Symbol:
     let loc = g.ra.locs[g.posOf(c)]
     if loc.kind == InReg and loc.isTemp and not g.rb.isBoundTemp(loc.r) and
-       g.ra.locationOfSym(symName(c)).kind == NoLoc:
+       g.ra.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind == NoLoc:
       g.bindTemp(loc.r, ScalarSlot)
       bound.add loc.r
   elif c.kind == TagLit and c.exprKind in {AtC, DotC, DerefC, PatC}:
@@ -2099,7 +2099,7 @@ proc aggrAddrInto(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind:
       else: g.genTlvAddr(loc.name, dest)
     else: raiseAssert "arkham a64n: &sym resolved to " & $loc.kind
   elif lv.kind == Symbol:                               # a LOCAL aggregate var
-    let home = g.ra.locationOfSym(symName(lv))
+    let home = g.ra.locationOfSym(symName(lv), cursorToPosition(g.buf[], lv))
     if doBind: g.bindTemp(dest, aslot)
     case home.kind
     of NamedStack:                                      # &local stack slot
@@ -2589,7 +2589,7 @@ proc aggrArgAddr(g: var CodeGen; a: Cursor; dst: Reg) =
     of scTvar: g.genTlvAddr(symName(a), dst)
     else:
       let home = symName(a)
-      let hl = g.ra.locationOfSym(home)
+      let hl = g.ra.locationOfSym(home, cursorToPosition(g.buf[], a))
       if hl.kind == InReg: g.movReg(dst, hl.r)          # by-ref param: pointer already in a reg
       else: g.ab.tree LeaA64: (g.emReg dst; g.ab.sym home)
   else:                                                 # oconstr/aconstr → build into a temp, then &temp
@@ -3307,7 +3307,7 @@ proc resolveLvalVal(g: var CodeGen; c: Cursor; dest: var Location) =
   ## reserved temp (its computation emits at premat time, dest-threaded).
   case c.kind
   of Symbol:
-    let home = g.ra.locationOfSym(symName(c))
+    let home = g.ra.locationOfSym(symName(c), cursorToPosition(g.buf[], c))
     if home.kind == NoLoc: g.forceRegDestE(dest)     # a global/tvar value read
     else: g.resolveDestE(dest, home)
   of IntLit: g.resolveDestE(dest, immLoc(intVal(c), ScalarSlot))
@@ -3349,7 +3349,7 @@ proc emitLvalWalk(g: var CodeGen; n: var Cursor; globBase: Location; isStore: bo
   case n.kind
   of Symbol:
     let nm = symName(n)
-    if g.ra.locationOfSym(nm).kind == NoLoc:         # a module-level global aggregate base
+    if g.ra.locationOfSym(nm, cursorToPosition(g.buf[], n)).kind == NoLoc:         # a module-level global aggregate base
       let pos = g.posOf(n)
       if globBase.kind == InReg:
         # The caller donated its result register; it owns (and frees) that pick —
@@ -3447,7 +3447,7 @@ proc freeLvalTemps2(g: var CodeGen; c: Cursor) =
   ## unbinds; this clears the pick flags and frees the pool.)
   case c.kind
   of Symbol:
-    if g.ra.locationOfSym(symName(c)).kind == NoLoc:
+    if g.ra.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind == NoLoc:
       g.freeVal(g.ra.locs[g.posOf(c)])               # the global base temp/survivor
   of TagLit:
     case c.exprKind
@@ -3504,7 +3504,7 @@ proc emitValue2(g: var CodeGen; c: Cursor; dest: var Location) =
   of UIntLit: g.emitLeafImm(dest, immLoc(cast[int64](uintVal(c)), ScalarSlot))
   of CharLit: g.emitLeafImm(dest, immLoc(int64(ord(charLit(c))), ScalarSlot))
   of Symbol:
-    let home = g.ra.locationOfSym(symName(c))
+    let home = g.ra.locationOfSym(symName(c), cursorToPosition(g.buf[], c))
     if home.kind != NoLoc:
       g.resolveDestE(dest, home)
       if dest.kind == NamedStack and dest.spillTemp:
@@ -3847,7 +3847,7 @@ proc emitMod2(g: var CodeGen; c: Cursor; dest: var Location) =
     g.dropBridge resStaging
   dest = res
 proc foldableFloatLeafE(g: var CodeGen; c: Cursor): bool =
-  c.kind == Symbol and g.ra.locationOfSym(symName(c)).kind in {InFReg, NamedStack}
+  c.kind == Symbol and g.ra.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind in {InFReg, NamedStack}
 
 proc emitFBinE(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED a64 float binary-arith (allocFBin's policy inline).
@@ -3862,7 +3862,7 @@ proc emitFBinE(g: var CodeGen; c: Cursor; dest: var Location) =
       lhsC = cc; skip cc
       rhsC = cc; skip cc
       while cc.hasMore: skip cc
-  let lHome = (if lhsC.kind == Symbol: g.ra.locationOfSym(symName(lhsC)) else: noLoc)
+  let lHome = (if lhsC.kind == Symbol: g.ra.locationOfSym(symName(lhsC), cursorToPosition(g.buf[], lhsC)) else: noLoc)
   let swap = ek in {AddC, MulC} and g.foldableFloatLeafE(lhsC) and
              not g.foldableFloatLeafE(rhsC) and
              not (dest.kind == InFReg and lHome.kind == InFReg and lHome.f == dest.f)
@@ -3892,8 +3892,8 @@ proc emitFBinE(g: var CodeGen; c: Cursor; dest: var Location) =
   var lD = res
   g.emitFValue2(lhsC, lD)                              # a → the result register
   if res.isTemp and not g.rb.isBoundFTmp(res.f): g.bindFTmp(res.f, bits)
-  if rhsC.kind == Symbol and g.ra.locationOfSym(symName(rhsC)).kind == InFReg:
-    let rHome = g.ra.locationOfSym(symName(rhsC))
+  if rhsC.kind == Symbol and g.ra.locationOfSym(symName(rhsC), cursorToPosition(g.buf[], rhsC)).kind == InFReg:
+    let rHome = g.ra.locationOfSym(symName(rhsC), cursorToPosition(g.buf[], rhsC))
     if rHome.f == res.f and
        not (lhsC.kind == Symbol and symName(lhsC) == symName(rhsC)):
       raiseAssert "arkham: float operand fold aliases the destination register"
@@ -3931,7 +3931,7 @@ proc emitFValue2(g: var CodeGen; c: Cursor; dest: var Location) =
     g.fmovFromGpr(dest.f, gpr, bits)
     g.dropBridge gpr
   of Symbol:
-    var home = g.ra.locationOfSym(symName(c))
+    var home = g.ra.locationOfSym(symName(c), cursorToPosition(g.buf[], c))
     if home.kind == NoLoc:                             # a module-level float global / tvar
       var cc = c
       home = g.asLoc(cc)
@@ -4258,7 +4258,7 @@ proc emitAddr2(g: var CodeGen; c: Cursor; dest: var Location) =
     if lv.kind == TagLit and lv.exprKind == DerefC:
       var p = lv; inc p
       if p.kind == Symbol:
-        let home = g.ra.locationOfSym(symName(p))
+        let home = g.ra.locationOfSym(symName(p), cursorToPosition(g.buf[], p))
         if home.kind == InReg:
           dest = home                           # the address IS p's register
           return
@@ -4351,7 +4351,7 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
   # forces a fresh temp (copy-then-narrow, source intact).
   block:
     if inner.kind == Symbol:
-      let sh = g.ra.locationOfSym(symName(inner))
+      let sh = g.ra.locationOfSym(symName(inner), cursorToPosition(g.buf[], inner))
       var tgc = targetCur
       if sh.kind in {InReg, NamedStack} and slotOf(g.prog, tgc).size < sh.typ.size:
         g.forceRegDestE(dest)
@@ -4599,8 +4599,8 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
             if pl.byRef:
               if isTvar: g.genTlvAddr(symName(a), g.md.gprAt(pl))
               elif isGlobal: g.emGlobalAddr(g.md.gprAt(pl), symName(a))
-              elif g.ra.locationOfSym(home).kind == InReg:
-                g.movReg(g.md.gprAt(pl), g.ra.locationOfSym(home).r)
+              elif g.ra.homeOfSym(home).kind == InReg:
+                g.movReg(g.md.gprAt(pl), g.ra.homeOfSym(home).r)
               else: g.ab.tree LeaA64: (g.emReg g.md.gprAt(pl); g.ab.sym home)
             else:
               if isGlobal: g.globalToRegs(symName(a), tn, pl.gpFirst, isTvar)
@@ -4752,8 +4752,8 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
           if sz > 16:
             if isTvar: g.genTlvAddr(symName(a), IntArgRegs[intIdx])
             elif isGlobal: g.emGlobalAddr(IntArgRegs[intIdx], symName(a))
-            elif g.ra.locationOfSym(home).kind == InReg:
-              g.movReg(IntArgRegs[intIdx], g.ra.locationOfSym(home).r)
+            elif g.ra.homeOfSym(home).kind == InReg:
+              g.movReg(IntArgRegs[intIdx], g.ra.homeOfSym(home).r)
             else: g.ab.tree LeaA64: (g.emReg IntArgRegs[intIdx]; g.ab.sym home)
             inc intIdx
           else:
@@ -4881,7 +4881,7 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
     let declaredCur = cc; skip cc                            # type (`.` when shoggoth omitted it)
     let typeCur = g.declType(declaredCur, cc)                # infer from the initializer
     g.symType[nm] = typeCur
-    let loc = g.ra.locationOfSym(nm)
+    let loc = g.ra.homeOfSym(nm)
     let hasVal = cc.hasMore and cc.kind != DotToken
     case loc.kind
     of InReg: g.emRegLocalVar(nm, loc.r, typeCur)
@@ -4987,7 +4987,7 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
       let asgnPos = g.posOf(c)
       if cc.kind == Symbol:
         let lhsCur = cc
-        var dst = g.ra.locationOfSym(symName(cc)); skip cc
+        var dst = g.ra.locationOfSym(symName(cc), cursorToPosition(g.buf[], cc)); skip cc
         if dst.kind == NoLoc:
           var lc = lhsCur
           dst = g.asLoc(lc)
@@ -5166,7 +5166,7 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
       skip cc                                               # advance to dest
       if cc.kind != Symbol:
         raiseAssert "arkham a64n: keepovf into a complex lvalue not yet supported"
-      var dst = g.ra.locationOfSym(symName(cc))
+      var dst = g.ra.locationOfSym(symName(cc), cursorToPosition(g.buf[], cc))
       if dst.kind == NoLoc:
         var lc = cc
         dst = g.asLoc(lc)
