@@ -121,6 +121,7 @@ type
                    ## must be reg/imm (a memory `b` is loaded first). Filled in (via
                    ## `var`) with the concrete `InReg`/`Imm`. Destination-only.
     InReg          ## value in a GPR
+    InRegPair      ## ≤16B by-value aggregate in 1–2 GPRs (ABI eightbytes)
     InFReg         ## value in an FP/SIMD register
     NamedStack     ## a stack var/slot managed by nifasm, addressed by `name`
                    ## (aggregate, spilled scalar, or synthetic spill — no cursor)
@@ -184,6 +185,9 @@ type
     of Undef, NoLoc, NeedsReg, RegOrImm: discard
     of InReg:
       r*: Reg
+    of InRegPair:
+      r0*: Reg            ## eightbyte 0 (offset 0)
+      r1*: Reg            ## eightbyte 1 (offset 8); `NoReg` if the aggregate is 8 bytes
     of InFReg: f*: FReg
     of NamedStack, Glob, Tvar: name*: string
     of Mem: cur*: Cursor
@@ -219,6 +223,12 @@ proc regOrImm*(typ: AsmSlot): Location {.inline.} =
 
 proc regLoc*(r: Reg; typ: AsmSlot; isTemp = false): Location {.inline.} =
   Location(kind: InReg, r: r, typ: typ, isTemp: isTemp)
+proc regPairLoc*(r0, r1: Reg; typ: AsmSlot): Location {.inline.} =
+  ## A ≤16B by-value aggregate whose eightbytes live in `r0` and (if 16B) `r1`.
+  Location(kind: InRegPair, r0: r0, r1: r1, typ: typ)
+proc pairWord*(loc: Location; i: int): Reg {.inline.} =
+  assert loc.kind == InRegPair
+  if i == 0: loc.r0 else: loc.r1
 proc fregLoc*(f: FReg; typ: AsmSlot; isTemp = false): Location {.inline.} =
   Location(kind: InFReg, f: f, typ: typ, isTemp: isTemp)
 proc namedStackLoc*(name: string; typ: AsmSlot; spillTemp = false): Location {.inline.} =

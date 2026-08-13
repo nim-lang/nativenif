@@ -430,6 +430,26 @@ proc aggrByRef*(g: var CodeGen; typeName: string): bool {.inline.} =
   ## call-returned-aggregate var, param moves, incoming-arg-reg counting).
   aggrByteSize(g.prog, typeName) > g.md.aggrByRefThreshold
 
+proc spilledByRefPtr*(g: var CodeGen; name: string): bool {.inline.} =
+  ## `name` is a >16B by-ref aggregate whose POINTER was spilled to an 8-byte
+  ## `(s)` slot. Distinguished from a by-value stack struct (`NamedStack` +
+  ## `AMem` + `varType`) and from a spilled scalar pointer (`NamedStack` +
+  ## `AUInt`, no `varType`): the slot holds `&aggregate`, not the aggregate.
+  ## The HOME question — the slot is where the pointer lives for the whole proc.
+  let loc = g.ra.homeOfSym(name)
+  loc.kind == NamedStack and g.varType.hasKey(name) and
+    loc.typ.kind == AUInt and loc.typ.size == 8
+
+proc truncateImm*(v: int64; bits: int; signed: bool): int64 {.inline.} =
+  ## Keep the low `bits` of `v`, sign-extending when `signed`. A Leng
+  ## `cast[byte](4000)` is this truncation, not a nifasm-illegal
+  ## `(mov (u 8) 4000)`.
+  if bits <= 0 or bits >= 64: return v
+  let mask = (1'i64 shl bits) - 1
+  result = v and mask
+  if signed and (result and (1'i64 shl (bits - 1))) != 0:
+    result = result or (not mask)
+
 # ── structural type / slot analysis ─────────────────────────────────────────
 
 proc typeCtx*(g: var CodeGen): TypeCtx {.inline.} =
@@ -557,6 +577,7 @@ proc asLoc*(g: var CodeGen; c: var Cursor): Location =
       let loc = g.ra.homeOfSym(nm)
       case loc.kind
       of InReg: result = regLoc(loc.r, slot)
+      of InRegPair: result = loc
       of InFReg: result = fregLoc(loc.f, slot)
       of NamedStack: result = namedStackLoc(loc.name, slot)  # aggregate or scalar; `typ` tells apart
       else: raiseAssert "arkham: symbol is not an lvalue: " & nm
@@ -1391,3 +1412,32 @@ proc callerSaveSlotName*(varName: string): string {.inline.} =
   ## per-call slot inside the call's own `(scope …)` does not work: the call's result
   ## binding is created in that scope and consumed after it closes.
   "csave." & varName
+
+proc pairFieldReg*(g: var CodeGen; c: Cursor): Reg =
+  ## If `c` is `(dot S f)` and `S` is a register-homed ≤16B by-value aggregate
+  ## whose field `f` is a full 8-byte ABI word, return that word's register.
+  ## Otherwise `NoReg` — the caller uses the memory path.
+  result = NoReg
+  if c.kind != TagLit or c.exprKind != DotC: return
+  var cc = c
+  cc.into:
+    if cc.kind != Symbol: return
+    let base = symName(cc)
+    let home = g.ra.homeOfSym(base)
+    if home.kind != InRegPair: return
+    skip cc
+    if cc.kind != Symbol: return
+    let field = symName(cc)
+    let tn = g.varType.getOrDefault(base)
+    if tn.len == 0: return
+    for f in aggrLayout(g.prog, tn):
+      if f.name == field:
+        if f.size == 8 and (f.off and 7) == 0:
+          result = pairWord(home, f.off div 8)
+        return
+
+proc isFoldableMemLeaf*(g: var CodeGen; n: Cursor): bool {.inline.} =
+  ## `isMemLeaf`, except a field of a register-homed ≤16B aggregate: that field
+  ## IS a GPR, so folding it as `[mem]` would address a stack slot that does
+  ## not exist.
+  isMemLeaf(n) and g.pairFieldReg(n) == NoReg

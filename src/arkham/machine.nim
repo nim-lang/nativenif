@@ -142,6 +142,8 @@ proc `$`*(loc: Location): string =
   of NeedsReg: "needsreg"
   of RegOrImm: "regorimm"
   of InReg: regName(loc.r)
+  of InRegPair:
+    "{" & regName(loc.r0) & (if loc.r1 != NoReg: "," & regName(loc.r1) else: "") & "}"
   of InFReg: regName(loc.f)
   of NamedStack: "&" & loc.name
   of Mem: "[mem]"
