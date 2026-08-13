@@ -2477,26 +2477,27 @@ proc storeScalar2(g: var CodeGen; dst, v: Location) =
       if v.isTemp: g.unbindFTmp(v.f)
   of NamedStack:
     let bits = dst.typ.size * 8
+    # Decided by `memToMemBridgeDemand`, executed here — see the x86-64 twin.
+    let need = memToMemBridgeDemand(g.md, dst, v)
     if dst.typ.isFloat:
-      case v.kind
-      of InFReg:
-        g.emFloatScalarStore(dst.name, v.f, bits)
-        if v.isTemp: g.unbindFTmp(v.f)
-      of NamedStack, Mem, Glob:
+      if need.fregs > 0:
         let fs = g.takeFBridge(bits)
         g.placeF2(v, fs, bits)
         g.emFloatScalarStore(dst.name, fs, bits)
         g.dropFBridge()
+      elif v.kind == InFReg:
+        g.emFloatScalarStore(dst.name, v.f, bits)
+        if v.isTemp: g.unbindFTmp(v.f)
       else: raiseAssert "arkham a64n: float scalar store rhs " & $v.kind
     else:
-      case v.kind
-      of InReg:
+      if need.gprs > 0:
+        let b = g.takeBridge(need.slot)
+        if v.kind == Imm: g.placeImm(b, v) else: g.place2(v, b)
+        g.emScalarStore(dst.name, b)
+        g.dropBridge b
+      elif v.kind == InReg:
         g.emScalarStore(dst.name, v.r)
         if v.isTemp: g.unbindTemp(v.r)
-      of Imm:
-        let b = g.takeBridge(dst.typ); g.placeImm(b, v); g.emScalarStore(dst.name, b); g.dropBridge b
-      of NamedStack, Mem, Glob, Tvar:
-        let b = g.takeBridge(dst.typ); g.place2(v, b); g.emScalarStore(dst.name, b); g.dropBridge b
       else: raiseAssert "arkham a64n: scalar store rhs " & $v.kind
   else: raiseAssert "arkham a64n: scalar store dst " & $dst.kind
 

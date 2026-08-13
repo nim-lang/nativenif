@@ -4612,27 +4612,28 @@ proc storeScalar2(g: var CodeGen; dst, v: Location) =
     elif v.kind == InFReg and v.f != dst.f: g.fmovF(dst.f, v.f, bits)
   of NamedStack:
     let bits = dst.typ.size * 8
+    # The bridge is DECIDED by `memToMemBridgeDemand` and only executed here, so
+    # the allocator can ask the same question without emitting (machinedesc.nim).
+    let need = memToMemBridgeDemand(g.md, dst, v)
     if dst.typ.isFloat:
-      case v.kind
-      of InFReg:
-        g.emitStoreFLoc(dst, v.f, bits)
-        if v.isTemp: g.unbindFTmp(v.f)
-      of NamedStack, Mem:
+      if need.fregs > 0:
         let fs = g.pickFStagingSealed("a scalar store")
         g.floatMemMov(v, fs, bits, load = true)
         g.emitStoreFLoc(dst, fs, bits)
         g.rb.unsealF fs
+      elif v.kind == InFReg:
+        g.emitStoreFLoc(dst, v.f, bits)
+        if v.isTemp: g.unbindFTmp(v.f)
       else: raiseAssert "arkham x64n: float scalar store rhs " & $v.kind
     else:
-      case v.kind
-      of InReg:
-        g.emitStoreLoc(dst, v.r)
-        if v.isTemp: g.unbindTemp(v.r)
-      of NamedStack, Mem:
-        let s = g.pickStagingSealed("a scalar store", v.typ)
+      if need.gprs > 0:
+        let s = g.pickStagingSealed("a scalar store", need.slot)
         g.emitLoadLoc(v, s)
         g.emitStoreLoc(dst, s)
         g.giveBack s
+      elif v.kind == InReg:
+        g.emitStoreLoc(dst, v.r)
+        if v.isTemp: g.unbindTemp(v.r)
       else: raiseAssert "arkham x64n: scalar store rhs " & $v.kind
   else: raiseAssert "arkham x64n: scalar store dst " & $dst.kind
 

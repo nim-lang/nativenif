@@ -261,3 +261,50 @@ proc sameReg*(a, b: Location): bool {.inline.} =
   ## True if both name the same physical register (for move coalescing).
   (a.kind == InReg and b.kind == InReg and a.r == b.r) or
   (a.kind == InFReg and b.kind == InFReg and a.f == b.f)
+
+# ── emitter scratch demand ──────────────────────────────────────────────────
+# A step of emission sometimes needs a transient register that belongs to no
+# value in the program — an x86 store whose source is also in memory has to pass
+# through one, because the ISA has no memory-to-memory move.
+#
+# Today the emitter DECIDES that at emission time and takes the register from a
+# reserved pool (`StagingCandidates`, headed by the one register kept out of the
+# allocator's hands so a pick can never fail). That reservation is why the
+# allocator cannot give a cross-call value a volatile even when six of them are
+# idle: the emitter's claim on the register file is real but not written down,
+# so nobody can prove a volatile is free.
+#
+# The fix is to write the claim down — as a VALUE the allocator can read without
+# emitting anything. These functions are that value. The emitter calls them at
+# the site it used to decide implicitly, so the two can never disagree: there is
+# one function and, for now, one caller.
+
+type
+  ScratchDemand* = object
+    ## What one emission step needs in transient registers.
+    gprs*: int          ## general-purpose scratch registers
+    fregs*: int         ## SIMD scratch registers
+    slot*: AsmSlot      ## the type a GPR scratch must be bound at (nifasm checks it)
+
+proc memToMemBridgeDemand*(md: MachineDesc; dst, v: Location): ScratchDemand =
+  ## Storing `v` into the stack home `dst` when `v` is ITSELF in memory: neither
+  ## ISA has a memory-to-memory move, so the value passes through one register.
+  ##
+  ## The source sets differ by ISA and that is the point of asking the machine
+  ## rather than hardcoding a `case`: AArch64 also has no store-immediate and no
+  ## RIP-relative operand, so an `Imm`, a global and a thread-local each need the
+  ## bridge there and none of them does on x86-64.
+  if dst.kind != NamedStack: return ScratchDemand()
+  if dst.typ.isFloat:
+    let fromMem = (case md.arch
+                   of X86: v.kind in {NamedStack, Mem}
+                   of Arm64: v.kind in {NamedStack, Mem, Glob})
+    if fromMem: ScratchDemand(fregs: 1) else: ScratchDemand()
+  else:
+    let needsBridge = (case md.arch
+                       of X86: v.kind in {NamedStack, Mem}
+                       of Arm64: v.kind in {NamedStack, Mem, Glob, Tvar, Imm})
+    if needsBridge:
+      ScratchDemand(gprs: 1, slot: (if md.arch == X86: v.typ else: dst.typ))
+    else:
+      ScratchDemand()
