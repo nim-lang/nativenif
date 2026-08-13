@@ -44,6 +44,7 @@ proc bindTemp(g: var CodeGen; r: Reg; typ: AsmSlot)
 proc unbindTemp(g: var CodeGen; r: Reg)
 proc emWordThroughPtr(g: var CodeGen; p: Reg; idx: int)
 proc emPtrElemMem(g: var CodeGen; p: Reg; elemTy: Cursor; idx: int)
+proc emWordAtSlot(g: var CodeGen; name: string; off: int)
 
 proc emReg(g: var CodeGen; r: Reg) {.inline.} =
   ## A value register operand. If `r` currently hosts a named local, emit the
@@ -1682,22 +1683,31 @@ proc transferAggrWords(g: var CodeGen; varName, typeName: string;
   let loc = g.ra.locationOfSym(varName)
   var baseReg = NoReg
   var addrTmp = NoReg
+  # A NAMED STACK SLOT needs no address at all: `(mem (rsp) name off)` folds the
+  # offset into the slot's own rsp displacement. Materializing `&slot` into the R11
+  # bridge first cost a `lea` per transfer AND held a register across it — and it
+  # cost the READER too, since `(at (cast (aptr (u 64)) tmp) k)` and `(mem (rsp)
+  # name off)` are two spellings of one address that no later pass can equate.
+  # nifasm bounds-checks the slot-relative form against the slot; it cannot check
+  # the pointer form at all.
+  let slotDirect = loc.kind == NamedStack
   if loc.kind == InReg:
     baseReg = loc.r                                    # a by-ref aggregate's pointer
-  else:
+  elif not slotDirect:
     addrTmp = g.pickStaging("an aggregate reg<->slot address")  # R11 bridge ← &slot
     g.bindTemp(addrTmp, AddrSlot)                       # typed+tracked (giveBack unbinds)
-    # The source may be a local stack slot OR a module-level global / `const` / tvar
-    # (e.g. `return NoNifLineInfo`, a global const aggregate). `locationOfSym` is
-    # NamedStack for a local and `NoLoc` for a module-level symbol — whose address is
-    # RIP-relative (global/const) or FS+off (tvar), NEVER rsp-relative `emStackAddr`.
-    if loc.kind == NamedStack: g.emStackAddr(addrTmp, varName)
-    else: g.emSymAddrByName(addrTmp, varName)
+    # A module-level global / `const` / tvar: its address is RIP-relative or FS+off,
+    # NEVER rsp-relative, so it has to go through a register.
+    g.emSymAddrByName(addrTmp, varName)
     baseReg = addrTmp
   for i in 0 ..< aggrWordCount(g.prog, typeName):
     g.ab.tree MovX64:
-      if toRegs: (g.emReg regs[i]; g.emWordThroughPtr(baseReg, i))
-      else: (g.emWordThroughPtr(baseReg, i); g.emReg regs[i])
+      if toRegs:
+        g.emReg regs[i]
+        if slotDirect: g.emWordAtSlot(varName, i * 8) else: g.emWordThroughPtr(baseReg, i)
+      else:
+        if slotDirect: g.emWordAtSlot(varName, i * 8) else: g.emWordThroughPtr(baseReg, i)
+        g.emReg regs[i]
   if addrTmp != NoReg: g.giveBack addrTmp
 
 proc structToRegs(g: var CodeGen; varName, typeName: string; regs: openArray[Reg]) =
