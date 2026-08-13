@@ -568,7 +568,28 @@ proc callerSaveRescue(b: var Builder; name: string; slot: AsmSlot;
   let crossings = b.callsCrossedAfterInit(vi)
   if crossings == 0: return fallback
   if not csIgnoreCost and vi.weight <= 2 * crossings: return fallback
-  let r = b.takeReg(b.freeVol, b.md.intLocalTempRegs)
+  # The bridge FIRST, and only here. It is the emitter's staging register and stays
+  # out of every general pool: the stress corpus shows why — put it in
+  # `intLocalTempRegs` and `chain.0`, whose six parameters are all live, exhausts
+  # every `StagingCandidates` entry and the pick fails. The guarantee it provides is
+  # needed exactly in the procs where the other candidates are live.
+  #
+  # A RESCUED value is different in kind: single-def, bounded interval, only exists
+  # because the callee-saved pool ran out, and it pays for itself only above
+  # `weight > 2 * crossings` — so it is both rare and short. And the bridge is the
+  # only volatile with NO ABI role, which is what the others lack: a rescued value
+  # homed in an argument register collides with the marshalling of every call it is
+  # saved around, which is why this rescue won nothing while 85 % of spills happened
+  # with six volatiles idle.
+  #
+  # NOT in a proc containing an `(instr …)`: those rows take the bridge DIRECTLY as
+  # their `work` register. `emitInstr2` seals it, which keeps the operand PICKS off
+  # it, but a value already homed there is just released (`releaseStaleName`) — sound
+  # only while nothing could be homed there. Same shape as `clobbersDivReg` keeping a
+  # leaf param out of rdx.
+  var r = NoReg
+  if not b.an.clobbersBridgeReg: r = b.takeReg(b.freeVol, [b.md.stagingBridgeReg])
+  if r == NoReg: r = b.takeReg(b.freeVol, b.md.intLocalTempRegs)
   if r == NoReg: return fallback
   b.ra.callerSaveHomes[name] = vi.freeAfter
   # The save slot is declared in the PROLOGUE, not at the decl. arkham emits by a
@@ -997,6 +1018,7 @@ proc seedPools(b: var Builder) =
   # `divRemOccupied`/`regOccupied` at the div/shift sites). `NoReg` on RISC (a64).
   if b.md.divRemReg != NoReg: b.freeVol.incl b.md.divRemReg
   if b.md.shiftCountReg != NoReg: b.freeVol.incl b.md.shiftCountReg
+  if b.md.stagingBridgeReg != NoReg: b.freeVol.incl b.md.stagingBridgeReg
   # AArch64: the integer return register (x0) joins the pool too, drawn ONLY by the
   # returned local's home (an explicit `[intRetReg]` candidate — never by
   # `intLocalTempRegs`/`intTempRegs`, which exclude it, nor by any temp). `allocParams`

@@ -78,6 +78,10 @@ type
     intArgRegs*: seq[Reg]            ## integer/pointer argument registers, ABI order
     floatArgRegs*: seq[FReg]         ## float argument registers, ABI order
     intTempRegs*: seq[Reg]           ## caller-saved scratch (call-free locals)
+    stagingBridgeReg*: Reg           ## the volatile kept out of every general pool so a
+                                     ## staging pick can never fail (x86-64: R11).
+                                     ## `callerSaveRescue` is the ONE allocator client
+                                     ## allowed to take it.
     intLocalTempRegs*: seq[Reg]      ## subset of `intTempRegs` a call-free local may be
                                      ## *homed* in; the rest of `intTempRegs` stays
                                      ## reserved as emitter scratch. Empty on x86-64 (its

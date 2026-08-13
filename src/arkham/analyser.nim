@@ -106,6 +106,14 @@ type
                                 ## caller-save cost model counts how many a var crosses
     clobbersDivReg*: bool       ## body contains a div/mod → rdx is clobbered, so a
                                 ## leaf param must not be homed there (x86-64 only)
+    clobbersBridgeReg*: bool    ## body contains an `(instr …)` row whose lowering claims
+                                ## the staging bridge (x86-64 R11) as its own `work`
+                                ## register. Those rows take it DIRECTLY — sealing keeps
+                                ## the operand PICKS off it, but a value already homed
+                                ## there is simply released (`releaseStaleName`), which
+                                ## was sound only while nothing could be homed there.
+                                ## `callerSaveRescue` is the one client that may draw the
+                                ## bridge, and must not in such a proc.
     clobbersShiftReg*: bool     ## body contains a variable shift → rcx (cl) is
                                 ## clobbered, so a leaf param must not be homed there
     arg0RetConflict*: bool      ## the FIRST integer/pointer param is read in a `(ret …)`
@@ -460,7 +468,9 @@ proc analyse(c: var Context; n: var Cursor) =
     inc n
   of TagLit:
     case n.stmtKind
-    of InstrS: analyseInstr(c, n)       # a two-address row: a statement, not a value
+    of InstrS:                          # a two-address row: a statement, not a value
+      c.res.clobbersBridgeReg = true    # see the expression case below
+      analyseInstr(c, n)
     of NoStmt:
       case n.exprKind
       of PatC:
@@ -544,7 +554,12 @@ proc analyse(c: var Context; n: var Cursor) =
               inc idx
         of KvU: analyseChildren(c, n)
         else: skip n
-      of InstrC: analyseInstr(c, n)
+      of InstrC:
+        # Which registers the row claims is the EMITTER's table (`atomicRegClaims`);
+        # all the allocator needs to know is that some row in this body may take the
+        # bridge, so the one client allowed to draw it must not here.
+        c.res.clobbersBridgeReg = true
+        analyseInstr(c, n)
       of DivC, ModC:
         c.res.clobbersDivReg = true     # idiv/div clobbers rdx
         c.divPositions.add ClobberSite(pos: posOf(c, n), stmtStart: c.stmtStart[^1])

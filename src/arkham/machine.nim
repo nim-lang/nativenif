@@ -95,6 +95,7 @@ const
     intArgRegs: @IntArgRegs,
     floatArgRegs: @FloatArgRegs,
     intTempRegs: @IntTempRegs,
+    stagingBridgeReg: NoReg,
     intLocalTempRegs: @IntTempRegs,  # AArch64 has 7 volatile int regs — scratch to spare,
                                      # so a call-free local may be homed in the temp pool
     intCalleeSaved: @IntCalleeSaved,
@@ -116,6 +117,7 @@ const
     intArgRegs: @IntArgRegs,
     floatArgRegs: @FloatArgRegs,
     intTempRegs: @IntTempRegsN,
+    stagingBridgeReg: NoReg,
     intLocalTempRegs: @IntTempRegsN,
     intCalleeSaved: @IntCalleeSaved,
     floatTempRegs: @FloatTempRegsN,
