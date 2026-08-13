@@ -157,6 +157,9 @@ proc rebuildHomes*(ra: var RegAlloc) =
   for pos in ra.symPos.values:
     case ra.locs[pos].kind
     of InReg: ra.homeRegs.incl ra.locs[pos].r
+    of InRegPair:
+      ra.homeRegs.incl ra.locs[pos].r0
+      if ra.locs[pos].r1 != NoReg: ra.homeRegs.incl ra.locs[pos].r1
     of InFReg: ra.homeFRegs.incl ra.locs[pos].f
     else: discard
   ra.homesDirty = false
@@ -308,6 +311,9 @@ proc flushFree(b: var Builder; curpos: int) =
       let name = b.pendingFree[i].name
       let loc = b.ra.locs[b.ra.symPos[name]]
       if loc.kind == InReg: b.giveBack loc.r
+      elif loc.kind == InRegPair:
+        b.giveBack loc.r0
+        if loc.r1 != NoReg: b.giveBack loc.r1
       elif loc.kind == InFReg: b.giveBackF loc.f
       b.freedSyms.incl name
       b.pendingFree.del i              # swap-remove; order is irrelevant
@@ -323,6 +329,9 @@ proc closeScope(b: var Builder) =
     if v in b.freedSyms: continue
     let loc = b.ra.locs[b.ra.symPos[v]]
     if loc.kind == InReg: b.giveBack loc.r
+    elif loc.kind == InRegPair:
+      b.giveBack loc.r0
+      if loc.r1 != NoReg: b.giveBack loc.r1
     elif loc.kind == InFReg: b.giveBackF loc.f
 
 proc record(b: var Builder; pos: int; name: string; loc: Location) =
@@ -606,11 +615,13 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
         assert params.kind == SymbolDef
         let name = symName(params); inc params
         skip params                          # pragmas
+        let typeNm = if params.kind == Symbol: symName(params) else: ""
         let slot = slotOf(b.prog[], params); skip params  # type (resolves named)
         # An aggregate param, per the plan:
         #  * ≤16B by-value that FITS the remaining arg registers → REGISTER-passed
-        #    (`aggrSmall`): a `(s)` stack home filled from its GPR word(s), consuming
-        #    `pl.words` arg registers.
+        #    (`aggrSmall`): each ABI eightbyte in a GPR, like a scalar — UNLESS the
+        #    address is taken or a field is sub-word (then a `(s)` stack home filled
+        #    from those GPRs, the old always-stack path).
         #  * ≤16B by-value that does NOT fit → STACK-passed (`aggrStack`): the bytes arrive
         #    in the incoming stack-arg area (copied into the `(s)` home by
         #    `emitStackParamLoadsX64`), consuming NO arg register — the SysV skip rule, so a
@@ -620,7 +631,45 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
         let aggrSmall = pl.isAgg and not pl.byRef and not pl.onStack
         let aggrStack = pl.isAgg and not pl.byRef and pl.onStack
         let aggrByRef = pl.isAgg and pl.byRef
-        if aggrSmall or (aggrStack and b.md.arch == X86):
+        if aggrSmall:
+          let props = b.an.vars.getOrDefault(name).props
+          var pairOk = AddrTaken notin props and typeNm.len > 0 and
+                       canHomeInRegPair(b.prog[], typeNm)
+          var r0 = NoReg
+          var r1 = NoReg
+          if pairOk:
+            for k in 0 ..< pl.words:
+              let arg = b.md.gprAt(pl, k)
+              let clobbered = (arg == b.md.divRemReg and b.an.clobbersDivReg) or
+                              (arg == b.md.shiftCountReg and b.an.clobbersShiftReg) or
+                              (arg == b.md.intRetReg and b.an.arg0RetConflict)
+              let stayInArg = (ArgResident in props and not clobbered) or
+                              (AllRegs in props and not clobbered)
+              var r: Reg
+              if (hasCall or clobbered) and not stayInArg:
+                r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
+                if r == NoReg:
+                  pairOk = false
+                  break
+                b.ra.usedCallee.incl r
+              else:
+                r = arg
+                b.freeVol.excl arg
+              if k == 0: r0 = r else: r1 = r
+            if not pairOk:
+              if r0 != NoReg:
+                b.giveBack r0
+                b.ra.usedCallee.excl r0
+              if r1 != NoReg:
+                b.giveBack r1
+                b.ra.usedCallee.excl r1
+              r0 = NoReg; r1 = NoReg
+          if pairOk:
+            b.record(pos, name, regPairLoc(r0, r1, slot))
+          else:
+            b.record(pos, name, namedStackLoc(name, slot))
+            b.ra.hasStackVars = true
+        elif aggrStack and b.md.arch == X86:
           # (No early `continue`/`return`: that skips the `into` epilogue.) These home the
           # aggregate in its own `(s)` slot; only a register-passed one consumes GPRs.
           # A stack-passed by-value aggregate keeps a slot home ONLY on x86-64, where
@@ -719,23 +768,20 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
                   # slot would need its aggregate type, not the pointer — skip those).
                   spillableRegParams.add (pos: pos, name: name, r: r, effSlot: effSlot)
               elif aggrByRef and spillableRegParams.len > 0:
-                # No free register for the by-ref POINTER. A spilled pointer
-                # (OnStack) has no consistent representation across the prologue /
-                # body field-access / call sites, so instead evict a colder scalar
-                # register param to its stack slot (emitParamMoves fills it from
-                # the incoming arg register) and reuse its register — the pointer
-                # stays InReg, which every consumer already handles.
+                # No free register for the by-ref POINTER. Prefer evicting a colder
+                # scalar register param to its stack slot (emitParamMoves fills it
+                # from the incoming arg register) and reusing its register — the
+                # pointer stays InReg, which every consumer already handles.
                 let victim = spillableRegParams.pop()
                 b.record(victim.pos, victim.name,
                          namedStackLoc(victim.name, victim.effSlot))
                 b.ra.hasStackVars = true
                 loc = regLoc(victim.r, effSlot)
               else:
-                if aggrByRef:
-                  # A spilled by-ref pointer has no consistent representation across
-                  # the prologue / body field access / call sites - fail HERE, at the
-                  # decision, not later via a poison location.
-                  raiseAssert "arkham: no register for a by-ref aggregate parameter's pointer: " & name
+                # Totality: no callee-saved reg and nothing colder to evict. A
+                # by-ref POINTER homes in an 8-byte `(s)` slot (`effSlot` is the
+                # pointer, not the aggregate). emitParamMoves stores the incoming
+                # arg register there; field access / `aggrAddr*` load it back.
                 loc = b.spillTo(name, effSlot)
             else:
               loc = regLoc(arg, effSlot)       # leaf proc: stay in the arg reg

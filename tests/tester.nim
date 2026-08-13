@@ -244,7 +244,6 @@ proc arkhamTests() =
 const arkhamStressKnown: seq[string] = @[
   # Real defects found by this pass at x86-64's level, parked so that any NEW
   # failure is fatal. Remove an entry with its fix.
-  "stack_aggr_byref",       # by-ref aggregate base not materialized before the (mem …)
   # `takeHeld` with the default `canSpill = false` asserts instead of evicting a
   # live local. 11 of the 15 `takeHeld` sites across both backends do.
   "aggr_arg_parked",

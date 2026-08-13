@@ -1319,6 +1319,29 @@ proc aggrLayout*(p: var Program; typeName: string): seq[FieldInfo] =
         result.add (name: fn, off: off, size: fsz)
         off += fsz
 
+proc canHomeInRegPair*(p: var Program; typeName: string): bool =
+  ## True when every field is a full 8-byte integer/pointer word at an 8-byte
+  ## offset, so the ABI eightbytes ARE the fields (a `string`, a `Point` of two
+  ## `int64`s). Those can live in the incoming GPR pair; a packed `{int32; int32}`
+  ## still goes through a stack slot so sub-word field access has a memory
+  ## operand, and a float field stays on the stack (it travels in SIMD regs).
+  let sz = aggrByteSize(p, typeName)
+  if sz != 8 and sz != 16: return false
+  var d = lookupType(p, typeName)
+  var body: Cursor
+  d.into:
+    inc d; skip d                             # name, type-pragmas
+    body = d; skip d
+  if body.kind == Symbol:
+    return canHomeInRegPair(p, symName(body))
+  if body.kind != TagLit or body.typeKind != ObjectT: return false
+  let lay = aggrLayout(p, typeName)
+  if lay.len == 0: return false
+  for f in lay:
+    if f.size != 8 or (f.off and 7) != 0: return false
+    if slotOf(p, fieldType(p, body, f.name)).kind == AFloat: return false
+  true
+
 # ── compile-time integer constant evaluation ────────────────────────────────
 
 proc maskToWidth(v: uint64; bits: int; signed: bool): uint64 =
