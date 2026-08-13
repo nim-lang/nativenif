@@ -142,6 +142,16 @@ const arkhamRejections: seq[(string, string)] = @[
   ("err_wrong_param_reg", "is passed in rdi by the C ABI, but is pinned to rsi"),
   ("err_inout_value", "writes through its first operand and returns nothing"),
   ("err_inout_dest", "must be a `var` argument naming a local"),
+  # Not an `{.assembler.}` rule but the same duty: arithmetic on a POINTER is not a
+  # Leng form, whichever pointer it is. `(add (ptr T) …)` used to be made to assemble
+  # by rebinding the destination to `(i 64)` for the instruction and back after — i.e.
+  # by picking a raw-byte reading of `+` that lengc's C backend (which emits scaled C
+  # pointer arithmetic for the same node) does not share. `(aptr T)` was admitted for
+  # a while longer on the theory that its element stride made the arithmetic
+  # well-defined; it does not — the stride says what one element is, not whether `+ 8`
+  # meant eight of them. Offsetting an array pointer is `(at …)`/`(pat …)`.
+  ("err_ptr_arith", "arithmetic result type is a pointer (ptr)"),
+  ("err_aptr_arith", "arithmetic result type is a pointer (aptr)"),
 ]
 
 proc arkhamRejectionTests(arkham: string) =
@@ -571,7 +581,13 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/ptr_store_nonzero.nif", "can
 execExpectFailure("nim c -r src/nifasm/nifasm tests/mem_slot_offset_range.nif", "offset 16 is outside stack slot 'buf.0' (16 bytes)")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/cast_dest_reg.nif", "Expected memory destination")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/missing_result_binding.nif", "Missing result binding: ret.0")
-execExpectFailure("nim c -r src/nifasm/nifasm tests/stack_result_binding.nif", "Type mismatch: expected (stackoff")
+# `(mov <stack slot> (res ret.0))` — a call result stored straight into its stack home.
+# This USED to be an expected failure, but only by accident: x86-64's mov check did not
+# unwrap `(stackoff …)` while AArch64's did, so the same program was a type error on one
+# target and a plain sized store on the other. It is an ordinary spill of a call result;
+# both arches accept it now (one shared `movTypeOk`), and `intMemAccess`/`memWidthOpc`
+# size the store by what the slot holds.
+exec "nim c -r src/nifasm/nifasm tests/stack_result_binding.nif"
 execExpectFailure("nim c -r src/nifasm/nifasm tests/result_type_mismatch.nif", "Type mismatch:")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/call_missing_argument.nif", "Missing argument: arg.1")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/call_a64_missing_arg.nif", "Missing argument: arg.1")

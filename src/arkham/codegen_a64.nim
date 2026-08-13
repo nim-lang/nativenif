@@ -542,16 +542,13 @@ proc rebindLocalAs(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   ## `typeCur`, via a zero-machine-code `(rebind …)`. `rebind` auto-kills the transient
   ## tenant `r` currently carries, so no manual `kill` is needed. The scope already
   ## tracks `name` (declared by `emRegLocalVar`), so `scopeLocals` is NOT touched. Type
-  ## emission mirrors `emRegLocalVar`: a pointer keeps its precise `(ptr …)`, every
-  ## other scalar is the generic `(i 64)` register form.
+  ## emission mirrors `emRegLocalVar`: the type given is the type declared, pointer or
+  ## not (it used to flatten every non-pointer to `(i 64)`).
   let isPtr = isPtrType(resolveType(g.prog, typeCur))
   g.ab.tree RebindA64:
     g.ab.symDef name
-    if isPtr:
-      var t = typeCur
-      g.genTypeBody(t)
-    else:
-      g.ab.intType(64)
+    var t = typeCur
+    g.genTypeBody(t)
     g.ab.reg r
   g.rb.rebindLocal(r, name, isPtr)
 
@@ -972,10 +969,14 @@ proc emRegLocalVar(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   g.ab.reg r
   let rt = resolveType(g.prog, typeCur)
   let isPtr = isPtrType(rt)
-  if isPtr:
-    var tc = typeCur
-    g.genTypeBody(tc)
-  else: g.ab.intType(64)
+  # The local's OWN type — `(u 8)` stays `(u 8)`. arkham still keeps every scalar
+  # 64-bit-wide in the register and normalizes with explicit extends; the declared
+  # type is what the VARIABLE is, and a register operand's type never reaches the
+  # encoder (nifasm's `movTypeOk`), so it costs nothing and makes a wide value
+  # landing in a narrow local without its extend an error rather than an invisible
+  # truncation. This used to flatten every non-pointer to `(i 64)`.
+  var tc = typeCur
+  g.genTypeBody(tc)
   g.ab.close()
   g.rb.bindLocal(r, name, isPtr)
 
@@ -3242,6 +3243,14 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
 proc emitLeafImm(g: var CodeGen; dest: var Location; natural: Location) =
   ## FUSED literal leaf: resolve the constraint against the immediate; a
   ## register destination gets it materialized (binding a fresh temp first).
+  ##
+  ## A Leng literal carries no type of its own — `42` and `'a'` are typed by where
+  ## they go — so the callers hand one over as a dont-care slot. Take the type from
+  ## the DESTINATION when it has one, or the temp minted below is bound `(i 64)`
+  ## and a `(c 8)` value loses its range and signedness on the way in.
+  var natural = natural
+  if cursorIsNil(natural.typ.typ) and not cursorIsNil(dest.typ.typ):
+    natural.typ = dest.typ
   g.resolveDestE(dest, natural)
   if dest.kind == InReg:
     if dest.isTemp and not g.rb.isBoundTemp(dest.r): g.bindTemp(dest.r, dest.typ)
@@ -3603,20 +3612,20 @@ proc emitValue2(g: var CodeGen; c: Cursor; dest: var Location) =
 
 # ── fused value core: unconverted-proc stubs (die as each case lands) ────────
 proc retypeBinDest(g: var CodeGen; rD: Reg; resTypeC: Cursor;
-                   inheritedOperand: bool): string =
-  ## Give `rD`'s nifasm binding a type the arithmetic about to run on it is legal
-  ## for, and return the named local whose ORIGINAL pointer binding must be put back
-  ## afterwards ("" when there is nothing to restore).
+                   inheritedOperand: bool) =
+  ## Give `rD`'s nifasm binding the type of the arithmetic result about to land in
+  ## it. The register is a named local's home (or a bound temp) whose declared type
+  ## may be a pointer while the value being computed into it is an integer — the
+  ## `(var :c.0 (ptr T) (cast (ptr T) (bitand (i 64) …)))` shape, where an enclosing
+  ## cast puts the pointer type back on. The `rebind` is zero machine code: the
+  ## register never moves, only its declared type does.
   ##
-  ## nifasm does integer arithmetic on integers and on `(aptr T)` — the array
-  ## pointer, which carries an element stride — but refuses it on a `(ptr T)`: a
-  ## single-object pointer has no meaningful `+`. Leng's `+` on a `pointer` is a RAW
-  ## byte offset (`r.base + r.pos` in bif's `rStr`), so the operation wants the
-  ## generic `(i 64)` register form and the pointer binding goes back on after it.
-  ## Both rebinds are zero machine code — the register never moves.
-  result = ""
-  let rt = resolveType(g.prog, resTypeC)
-  if not isPtrType(rt):
+  ## A POINTER result type is not handled here — `checkArithResultType` has already
+  ## rejected the node. Retyping the binding to `(i 64)` and back around the
+  ## instruction would make an ill-typed `(add (ptr T) …)` assemble by hiding it from
+  ## nifasm's `checkIntegerArithmetic`, under a raw-byte reading of `+` that the C
+  ## backend does not share.
+  if not isPtrType(resolveType(g.prog, resTypeC)):
     let nm = g.rb.boundName(rD)
     if g.rb.isBoundTemp(rD):
       if inheritedOperand:                               # inherited an operand's binding
@@ -3624,15 +3633,6 @@ proc retypeBinDest(g: var CodeGen; rD: Reg; resTypeC: Cursor;
         g.bindTemp(rD, slotOf(g.prog, rtc))
     elif nm.len > 0:
       g.rebindLocalAs(nm, rD, resTypeC)
-  elif rt.typeKind != AptrT and not g.rb.isBoundTemp(rD):
-    let nm = g.rb.boundName(rD)
-    if nm.len > 0:
-      g.ab.tree RebindA64:
-        g.ab.symDef nm
-        g.ab.intType(64)
-        g.ab.reg rD
-      g.rb.rebindLocal(rD, nm, false)
-      result = nm
 
 proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED a64 binary-arith: the shared allocBin policy decided inline
@@ -3648,6 +3648,7 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
       lhsC = cc; skip cc
       rhsC = cc; skip cc
       while cc.hasMore: skip cc
+  checkArithResultType(g.prog, resTypeC, lengInfo(c))
   let lhsMem = isMemLeaf(lhsC)
   let swap = ek notin {ShlC, ShrC} and (commutativeExpr(ek) or ek == SubC) and
              (g.isFoldableLeafE(lhsC) or lhsMem) and
@@ -3655,7 +3656,9 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
              not (dest.kind == InReg and g.symInRegE(lhsC, dest.r))
   if swap:
     var acc = dest
-    if acc.kind != InReg: acc = g.takeTmp(ScalarSlot)
+    # The accumulator ends up holding the RESULT, so it is bound at the result's
+    # own type — an `(i 64)` dont-care would throw the value's range away.
+    if acc.kind != InReg: acc = g.takeTmp(g.binResultSlot(resTypeC))
     if acc.kind == NamedStack and acc.spillTemp:
       g.produceIntoMem2(c, acc)                          # pools dry: whole node via x16
       dest = acc
@@ -3664,10 +3667,10 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     var rdst = acc
     g.emitValue2(rhsC, rdst)                             # rhs → the accumulator
     if acc.isTemp and not g.rb.isBoundTemp(rD): g.bindTemp(rD, acc.typ)
-    # Same retype the general path does below: the accumulator may be a `(ptr …)`
-    # local (a `pointer` var whose initializer is a byte-offset add), and nifasm
-    # refuses arithmetic on a single-object pointer binding.
-    let restoreSwap = g.retypeBinDest(rD, resTypeC, inheritedOperand = false)
+    # Same retype the general path does below: the accumulator may be a named
+    # local's home whose declared type is not the type of the value now landing
+    # in it (an integer computed into a `(ptr …)` local under an enclosing cast).
+    g.retypeBinDest(rD, resTypeC, inheritedOperand = false)
     var lLoc = dontCare                                  # the leaf lhs: its natural place
     if lhsMem:
       g.emitLvalue2(lhsC)                                # pick embedded base/index regs
@@ -3680,8 +3683,6 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     g.foldRhs2(foldOp, rD, lLoc, lhsC)                   # bridges serve Imm/slot/Mem lhs
     if lhsMem: g.freeLvalTemps2(lhsC)
     g.normalizeBinWidth(resTypeC, rD, op)
-    if restoreSwap.len > 0:
-      g.rebindLocalAs(restoreSwap, rD, resTypeC)         # back to its pointer type
     dest = acc
     return
   var lDest = needsReg(ScalarSlot)
@@ -3709,7 +3710,7 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     elif rDest.kind == InReg and rDest.isTemp and lDest.kind == InReg and
          ek notin {ShlC, ShrC, DivC}:
       res = rDest                                        # recycle the dead rhs temp
-    else: res = g.takeTmp(ScalarSlot)
+    else: res = g.takeTmp(g.binResultSlot(resTypeC))
   else: discard
   let aliasRhs = res.kind == InReg and rDest.kind == InReg and res.r == rDest.r and
                  not (lDest.kind == InReg and res.kind == InReg and lDest.r == res.r)
@@ -3727,7 +3728,7 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
   let reusedRhs = rDest.kind == InReg and rDest.r == rD
   if res.kind == InReg and res.isTemp and not g.rb.isBoundTemp(rD):
     g.bindTemp(rD, res.typ)
-  let restorePtr = g.retypeBinDest(rD, resTypeC, reusedLhs or reusedRhs)
+  g.retypeBinDest(rD, resTypeC, reusedLhs or reusedRhs)
   let w32 = op in {AddA64, SubA64, MulA64} and not aliasRhs and isUnsigned32(resTypeC)
   if aliasRhs:
     assert lDest.kind == InReg, "arkham a64n: aliasRhs lhs " & $lDest.kind
@@ -3752,8 +3753,6 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     g.foldRhs2(op, rD, rDest, rhsC, w32)                 # dest op= rhs
   if not w32:
     g.normalizeBinWidth(resTypeC, rD, op)
-  if restorePtr.len > 0:
-    g.rebindLocalAs(restorePtr, rD, resTypeC)            # back to its pointer type
   if not reusedRhs: g.freeVal(rDest)
   if not reusedLhs: g.freeVal(lDest)
   if resStaging != NoReg:
@@ -3789,7 +3788,7 @@ proc emitMod2(g: var CodeGen; c: Cursor; dest: var Location) =
   case dest.kind
   of Undef, NeedsReg, RegOrImm:
     if lD.kind == InReg and lD.isTemp: res = lD          # reuse the dead dividend temp
-    else: res = g.takeTmp(ScalarSlot)
+    else: res = g.takeTmp(g.binResultSlot(rt))
   else: discard
   var resStaging = NoReg
   var rD: Reg
@@ -4380,6 +4379,19 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
       g.storeReg2(dest, b)
       g.dropBridge b
     return
+  # Pre-retype a register-homed named dest to the INNER's type while the inner
+  # emits, and put the target type back after the extend below. The register
+  # genuinely HOLDS the inner's value until `extendTo` converts it, so a `(u 8)`
+  # local receiving an `(i 64)` value is a narrowing move nifasm rejects — rightly:
+  # the narrowing is the `lsl`/`lsr` pair that follows, not the move. Zero machine
+  # code; only the declared type moves. Mirrors the x86-64 twin.
+  var preRetyped = ""
+  if dest.kind == InReg and not dest.isTemp:
+    let nm = g.rb.boundName(dest.r)
+    var st = g.getType(inner)
+    if nm.len > 0 and bindTypeDiffers(g.prog, st, targetCur):
+      g.rebindLocalAs(nm, dest.r, st)
+      preRetyped = nm
   var iv = dest                                 # identity: thread dest down
   if iv.kind == Undef:
     # An unconstrained dest could resolve to the inner's memory home — but the
@@ -4420,6 +4432,10 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
       g.extendTo(res2.r, srcW, signed = (not isCast) and srcSigned)   # widen
     else:
       g.extendTo(res2.r, targetW, signed = isSignedType(tc))          # narrow / equal
+  # The register now holds the TARGET's value, so put the target type back on the
+  # name the pre-retype above widened. `kindChange` already did it.
+  if preRetyped.len > 0 and not kindChange:
+    g.rebindLocalAs(preRetyped, res2.r, targetCur)
 proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false) =
   ## FUSED a64 call: allocCall's placements decided inline. No parking on
   ## AArch64 (no ISA-pinned clobber registers); scalar args dest-thread
@@ -4605,10 +4621,11 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
           # Release the temp binding so the arg register is referenced RAW where it
           # can be. Where it CANNOT — the allocator also homes plain locals in the
           # volatile arg registers, and nifasm insists a bound register be named —
-          # the name carries arkham's generic `(i 64)`, which nifasm accepts into a
-          # sub-width param as the ABI truncation it is (memfiles' `close`, where
-          # `canRaise` lives in x0 and is dead across the `raiseOSError(cint)` it
-          # stages).
+          # the name carries the local's own type, and a wider one marshalling into
+          # a sub-width param is the ABI truncation `movTypeOk`'s `narrowingArg` arm
+          # admits (memfiles' `close`, where `canRaise` lives in x0 and is dead
+          # across the `raiseOSError(cint)` it stages). That arm was x86-64-only
+          # until the rule was unified — this path would have been rejected here.
           g.unbindTemp(aD.r)
           g.ab.tree MovA64:
             g.ab.tree ArgX: g.ab.sym paramName(j)

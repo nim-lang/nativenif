@@ -390,18 +390,21 @@ proc emRegLocalVar(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
   g.ab.reg r                                   # the concrete register (the binding)
-  # arkham keeps scalars 64-bit in registers and handles width/signedness via
-  # explicit extends, so an int/uint/bool/char local is declared as plain
-  # `(i 64)` (a logical `i8`/`u8` would mismatch a 64-bit `mov`, and nifasm also
-  # rejects an `i`↔`u` move); a pointer keeps its `(ptr T)` so deref/field typing
-  # works. Signed-vs-unsigned comparisons still pick `jb`/`jl` from the slot.
+  # A local is declared with its OWN type — `(u 8)` stays `(u 8)`. arkham still keeps
+  # every scalar 64-bit-wide in the register and normalizes with explicit extends;
+  # the declared type is what the VARIABLE is, and a register operand's type never
+  # reaches the encoder (nifasm's `movTypeOk`), so saying `(u 8)` costs nothing and
+  # buys a real check: a wide value landing in a narrow local without the extend
+  # that converts it is now an error rather than an invisible truncation. Widening
+  # reads out of it stay legal; the narrowing write is the `movzx`/`movsx` itself,
+  # which `emitCast2` retypes around (see the pre-retype there).
+  #
+  # This used to declare every non-pointer as a flat `(i 64)`, which made the width
+  # and signedness of every register-homed local invisible to nifasm.
   let rt = resolveType(g.prog, typeCur)
   let isPtr = isPtrType(rt)                    # a ptr binding admits `(nil)` (see `NilC`)
-  if isPtr:
-    var tc = typeCur
-    g.genTypeBody(tc)
-  else:
-    g.ab.intType(64)
+  var tc = typeCur
+  g.genTypeBody(tc)                            # the local's OWN type — see the note above
   g.ab.close()
   g.rb.bindLocal(r, name, isPtr)
 
@@ -1065,16 +1068,13 @@ proc rebindLocalAs(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   ## `typeCur`, via a zero-machine-code `(rebind …)`. `rebind` auto-kills the transient
   ## tenant `r` currently carries, so no manual `kill` is needed. The scope already
   ## tracks `name` (declared by `emRegLocalVar`), so `scopeLocals` is NOT touched. Type
-  ## emission mirrors `emRegLocalVar`: a pointer keeps its precise `(ptr …)`, every
-  ## other scalar is the generic `(i 64)` register form.
+  ## emission mirrors `emRegLocalVar`: the type given is the type declared, pointer or
+  ## not (it used to flatten every non-pointer to `(i 64)`).
   let isPtr = isPtrType(resolveType(g.prog, typeCur))
   g.ab.tree RebindX64:
     g.ab.symDef name
-    if isPtr:
-      var t = typeCur
-      g.genTypeBody(t)
-    else:
-      g.ab.intType(64)
+    var t = typeCur
+    g.genTypeBody(t)
     g.ab.reg r
   g.rb.rebindLocal(r, name, isPtr)
 
@@ -2931,6 +2931,14 @@ proc emitLeafImm(g: var CodeGen; dest: var Location; natural: Location) =
   ## FUSED literal leaf: resolve the constraint against the immediate; a
   ## register destination gets it materialized (binding a fresh temp first —
   ## an already-bound temp, e.g. the produce staging, is left as is).
+  ##
+  ## A Leng literal carries no type of its own — `42` and `'a'` are typed by where
+  ## they go — so the callers hand one over as a dont-care slot. Take the type from
+  ## the DESTINATION when it has one, or the temp minted below is bound `(i 64)`
+  ## and a `(c 8)` value loses its range and signedness on the way in.
+  var natural = natural
+  if cursorIsNil(natural.typ.typ) and not cursorIsNil(dest.typ.typ):
+    natural.typ = dest.typ
   g.resolveDestE(dest, natural)
   if dest.kind == InReg:
     if dest.isTemp and not g.rb.isBoundTemp(dest.r): g.bindTemp(dest.r, dest.typ)
@@ -2954,6 +2962,16 @@ proc emitValue2(g: var CodeGen; c: Cursor; dest: var Location) =
   if dest.kind == NamedStack and dest.spillTemp:
     g.produceIntoMem2(c, dest)
     return
+  # THE place dont-care destinations acquire a type. A caller that asks for "some
+  # register" with a placeholder slot is not saying the value is an `(i 64)` — it is
+  # saying it does not care WHERE the value goes. What the value IS, is `c`'s own
+  # type, and every temp minted for this destination downstream binds from this
+  # slot. Filling it here types them all at one site instead of at each mint, and
+  # keeps a `(c 8)` a `(c 8)` instead of flattening it to the register's width.
+  if dest.kind in {Undef, NeedsReg, RegOrImm} and cursorIsNil(dest.typ.typ):
+    let s = g.exprSlot(c)
+    if not cursorIsNil(s.typ) and s.cls notin {AFloat, AMem}:
+      dest.typ = s
   let pos = cursorToPosition(g.buf[], c)          # for the keepovf no-fold guard
   case c.kind
   of IntLit: g.emitLeafImm(dest, immLoc(intVal(c), ScalarSlot))
@@ -5173,6 +5191,7 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
       lhsC = cc; skip cc
       rhsC = cc; skip cc
       while cc.hasMore: skip cc
+  checkArithResultType(g.prog, resTypeC, lengInfo(c))
   # ── Sethi–Ullman swap: foldable/memory lhs + computed rhs → rhs first, into
   # the accumulator; the leaf lhs folds after (sub completes with a neg).
   let lhsMem = isMemLeaf(lhsC)
@@ -5182,7 +5201,12 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
              not (dest.kind == InReg and g.symInRegE(lhsC, dest.r))
   if swap:
     var acc = dest
-    if acc.kind != InReg: acc = g.takeTmp(ScalarSlot)
+    # The accumulator receives the RHS first and only becomes the result's type at
+    # `normalizeBinWidth` below, so it is minted at the RHS's type and retyped after
+    # the normalizer. Minting it at the result type made the rhs fill a narrowing
+    # reg→reg move; same rule as the general path below.
+    let accIncoming = g.exprSlot(rhsC)
+    if acc.kind != InReg: acc = g.takeTmp(accIncoming)
     if acc.kind == NamedStack and acc.spillTemp:
       g.produceIntoMem2(c, acc)                          # pools dry: whole node via staging
       dest = acc
@@ -5215,6 +5239,10 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     else: raiseAssert "arkham x64n: bin(swapped) lhs " & $lLoc.kind
     if lhsMem: g.freeLvalTemps2(lhsC)                    # embedded picks die with the fold
     if not suppressNorm: g.normalizeBinWidth(resTypeC, rD, op)
+    if acc.isTemp and g.rb.isBoundTemp(rD) and
+       slotTypeDiffers(g.prog, accIncoming, resTypeC):
+      var rtcS = resTypeC
+      g.bindTemp(rD, slotOf(g.prog, rtcS))               # now it holds the result
     if rdSeal: g.ra.unseal {rD}
     dest = acc
     return
@@ -5259,7 +5287,7 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     elif rDest.kind == InReg and rDest.isTemp and lDest.kind == InReg and
          ek notin {ShlC, ShrC}:
       res = rDest
-    else: res = g.takeTmp(ScalarSlot)
+    else: res = g.takeTmp(g.binResultSlot(resTypeC))
   else: discard
   let aliasRhs = res.kind == InReg and rDest.kind == InReg and res.r == rDest.r and
                  not (lDest.kind == InReg and res.kind == InReg and lDest.r == res.r)
@@ -5276,8 +5304,17 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     rD = res.r
   let reusedLhs = lDest.kind == InReg and lDest.r == rD  # in-place RMW on the left temp
   let reusedRhs = rDest.kind == InReg and rDest.r == rD  # dest recycled the RHS temp
+  # A TEMP destination is bound at the type of what LANDS IN IT — the lhs `place2`
+  # moves in below — not at the result type. The register only becomes the result's
+  # type at `normalizeBinWidth` (the `movzx` after the op), and the retype for that
+  # happens down there. Binding it at the result type up front made the lhs move
+  # narrowing: `(rebind tmp1 (u 32))` then `(mov tmp1 (i 64)tmp0)`, which nifasm
+  # rejects — and rightly, since nothing has converted anything yet.
+  # A dont-care lhs slot is not "no information": it is the `(i 64)` its own temp
+  # is bound as, which is precisely what arrives here.
+  let incoming = (if lDest.kind == InReg: lDest.typ else: res.typ)
   if res.kind == InReg and res.isTemp and not g.rb.isBoundTemp(rD):
-    g.bindTemp(rD, res.typ)
+    g.bindTemp(rD, incoming)
   if not isPtrType(resolveType(g.prog, resTypeC)):
     let nm = g.rb.boundName(rD)
     if g.rb.isBoundTemp(rD):
@@ -5307,6 +5344,12 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     of NamedStack, Mem: g.binFold(op, rD, rDest, rhsC)   # sub-width field → load+extend
     else: raiseAssert "arkham x64n: bin rhs " & $rDest.kind
   if not suppressNorm: g.normalizeBinWidth(resTypeC, rD, op)
+  # The op ran and the width was normalized, so the register now holds the RESULT.
+  # Put the result's type on the temp that was bound at the incoming type above.
+  if res.kind == InReg and res.isTemp and g.rb.isBoundTemp(rD) and
+     slotTypeDiffers(g.prog, incoming, resTypeC):
+    var rtc2 = resTypeC
+    g.bindTemp(rD, slotOf(g.prog, rtc2))
   if rdSeal: g.ra.unseal {rD}
   if not reusedRhs: g.freeVal(rDest)                     # freeVal frees only temps
   if not reusedLhs: g.freeVal(lDest)
@@ -6100,13 +6143,19 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
     else: g.freeVal(tmp)
     return
   # Pre-retype a register-homed named dest to the INNER's type while the inner
-  # emits (int arithmetic under an int→ptr reinterpret runs int-typed).
-  if dest.kind == InReg and not dest.isTemp and
-     (isPtrType(tc) or isPtrType(resolveType(g.prog, g.getType(inner)))):
+  # emits, and put the target type back after the extend below. Two reasons, one
+  # rule: int arithmetic under an int→ptr reinterpret must run int-typed, and the
+  # register genuinely HOLDS the inner's value until `extendTo` converts it — a
+  # `(u 8)` local receiving an `(i 64)` value is a narrowing move nifasm rejects,
+  # and rightly: the narrowing is the `movzx` that follows, not the move.
+  # Zero machine code either way; only the declared type moves.
+  var preRetyped = ""
+  if dest.kind == InReg and not dest.isTemp:
     let nm = g.rb.boundName(dest.r)
-    if nm.len > 0:
-      var st = g.getType(inner)
+    var st = g.getType(inner)
+    if nm.len > 0 and bindTypeDiffers(g.prog, st, targetCur):
       g.rebindLocalAs(nm, dest.r, st)
+      preRetyped = nm
   var iv = dest                                          # identity: thread dest down
   if iv.kind == Undef:
     # An unconstrained dest could resolve to the inner's memory home — but the
@@ -6141,6 +6190,10 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
       let sgn = isSignedType(tc)
       if not g.arrivesNormalized(inner, targetW, sgn):
         g.extendTo(res2.r, targetW, sgn)                              # narrow / equal
+  # The register now holds the TARGET's value, so put the target type back on the
+  # name the pre-retype above widened (see there). `kindChange` already did it.
+  if preRetyped.len > 0 and not kindChange:
+    g.rebindLocalAs(preRetyped, res2.r, targetCur)
 proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false) =
   ## FUSED call. allocCall's placement decisions run inline: each scalar arg
   ## dest-threads straight into its ABI register (or a parked callee-saved

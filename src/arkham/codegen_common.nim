@@ -281,6 +281,63 @@ proc isPtrType*(c: Cursor): bool =
   of PtrT, AptrT, ProctypeT: true
   else: false
 
+proc binResultSlot*(g: var CodeGen; resTypeC: Cursor): AsmSlot =
+  ## The slot for the register a binary-arith result lands in: the node's OWN
+  ## result type, so the temp is bound `(c 8)`/`(u 16)`/… rather than a dont-care
+  ## `(i 64)`. The register is 64 bits wide either way — that is where the value
+  ## lives, not what it is, and binding it as `(i 64)` discards the range and the
+  ## signedness the rest of the pipeline is entitled to check.
+  var t = resTypeC
+  result = slotOf(g.prog, t)
+
+proc bindTypeDiffers*(prog: var Program; a, b: Cursor): bool =
+  ## Would nifasm see two different BINDING types for `a` and `b`? Compares exactly
+  ## what a register binding declares — pointer-ness, width, signedness — so a
+  ## caller can skip a retype that would emit the same type it already has.
+  ## Two pointers always count as differing: the pointee drives field/element
+  ## typing, and a retype between them is free (zero machine code).
+  let ra = resolveType(prog, a)
+  let rb = resolveType(prog, b)
+  let pa = isPtrType(ra)
+  let pb = isPtrType(rb)
+  if pa or pb: return true
+  result = intTypeWidth(ra) != intTypeWidth(rb) or isSignedType(ra) != isSignedType(rb)
+
+proc slotTypeDiffers*(prog: var Program; s: AsmSlot; t: Cursor): bool =
+  ## `bindTypeDiffers` for a slot that may carry no cursor at all. A dont-care slot
+  ## binds as `(i 64)`, so it differs from anything that is not that.
+  if cursorIsNil(s.typ):
+    let rt = resolveType(prog, t)
+    return isPtrType(rt) or intTypeWidth(rt) != 64 or not isSignedType(rt)
+  var a = s.typ
+  result = bindTypeDiffers(prog, a, t)
+
+proc checkArithResultType*(prog: var Program; resTypeC: Cursor; fallback = "") =
+  ## An arithmetic node states its result type as its first child, and that type is
+  ## an integer or a float. NO pointer is legal — not `(ptr T)`, not `(aptr T)`, not
+  ## a proc type. Arithmetic on a pointer is not a Leng form.
+  ##
+  ## The reason is that an `add` does not say whether the offset counts BYTES or
+  ## ELEMENTS, and the backends answered differently: nifasm emitted a plain machine
+  ## `add` (bytes) while lengc compiles the same node as `((T)(a + b))` — C pointer
+  ## arithmetic, SCALED by the pointee. Nothing in the program says which the
+  ## producer meant, so there is no reinterpretation that is safe to pick.
+  ##
+  ## Both well-typed spellings already exist. Offsetting an array pointer is
+  ## `(at base index)` / `(pat p i)`, which carry the element type and so have ONE
+  ## meaning; raw byte work casts to an integer, computes, and casts back — the
+  ## shape `cast_ptr_local_retype` exercises in the corpus.
+  ##
+  ## (`(aptr T)` was admitted here at first, on the theory that the array pointer's
+  ## element stride made its arithmetic well-defined. It does not: the stride tells
+  ## you what one element is, not whether `+ 8` meant eight of them.)
+  let rt = resolveType(prog, resTypeC)
+  if isPtrType(rt):
+    lengError(resTypeC, "arithmetic result type is a pointer (" & $rt.typeKind &
+              "); Leng has no arithmetic on pointers. Offset an array pointer with " &
+              "`(at …)`/`(pat …)`, or cast to an integer, compute, and cast back.",
+              fallback)
+
 proc isNilValue*(c: Cursor): bool {.inline.} =
   ## True if `c` is the synthesized Leng `(nil)` node (a null-pointer value/type).
   not cursorIsNil(c) and c.kind == TagLit and c.exprKind == NilC
