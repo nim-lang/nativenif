@@ -183,12 +183,21 @@ type
                                              ## locals do not compete for a bridge). Recorded by
                                              ## `emitLvalWalk`, honoured in `prematLval2`, released
                                              ## with the rest of the scratch in `freeLvalTemps2`.
-    lvalGlobBase*: Table[int, Reg]           ## x64: the address of a module-level global
-                                             ## aggregate base used in a transient LOAD (e.g. a
-                                             ## float field read whose result is an xmm, so the
-                                             ## GPR address can't be the result reg). Sourced from
-                                             ## emit-time STAGING (R11 bridge), NOT a survivor pool
-                                             ## reg — same lifecycle/rationale as `lvalStride`.
+    lvalGlobBase*: Table[int, Reg]           ## An lvalue base that had to be materialized into a
+                                             ## register by `prematLval2`, keyed by the base's
+                                             ## token position and released by `unbindLvalTemps2`.
+                                             ## Two producers, same lifecycle:
+                                             ##  * the address of a module-level global aggregate
+                                             ##    base used in a transient LOAD (e.g. a float
+                                             ##    field read whose result is an xmm, so the GPR
+                                             ##    address can't be the result reg);
+                                             ##  * a >16B by-ref parameter whose POINTER was
+                                             ##    spilled (`spilledByRefPtr`) — the slot holds
+                                             ##    &aggregate, so the pointer is loaded back here.
+                                             ## Sourced from emit-time STAGING (the x64 R11 / a64
+                                             ## bridge), NOT a survivor pool reg — same
+                                             ## lifecycle/rationale as `lvalStride`. Both backends
+                                             ## use it; read it with `getOrDefault`, never `[]`.
     ovfSigned*: bool                          ## signedness of the most recent `keepovf` op, so
                                              ## the `(ovf)` test that immediately follows it picks
                                              ## the right hardware-flag branch (`jo`/`jno` for a
@@ -368,13 +377,15 @@ proc aggrByRef*(g: var CodeGen; typeName: string): bool {.inline.} =
   aggrByteSize(g.prog, typeName) > g.md.aggrByRefThreshold
 
 proc spilledByRefPtr*(g: var CodeGen; name: string): bool {.inline.} =
-  ## `name` is a >16B by-ref aggregate whose POINTER was spilled to an 8-byte
-  ## `(s)` slot. Distinguished from a by-value stack struct (`NamedStack` +
-  ## `AMem` + `varType`) and from a spilled scalar pointer (`NamedStack` +
-  ## `AUInt`, no `varType`): the slot holds `&aggregate`, not the aggregate.
-  let loc = g.ra.locationOfSym(name)
-  loc.kind == NamedStack and g.varType.hasKey(name) and
-    loc.typ.kind == AUInt and loc.typ.size == 8
+  ## `name` is a >16B by-ref aggregate parameter whose POINTER was spilled to an
+  ## 8-byte `(s)` slot: the slot holds `&aggregate`, not the aggregate. ~20
+  ## emitter sites branch on this, and both mistakes are silent — reading the
+  ## pointer as the aggregate, or writing the aggregate over the pointer — so it
+  ## is a FACT recorded by the allocator at the single point that decides it
+  ## (`byRefPtrSlots`), not a shape inferred from the slot. The shape test it
+  ## replaces (`NamedStack` + `varType` + 8-byte `AUInt`) would also match any
+  ## future 8-byte by-value aggregate homed on the stack.
+  name in g.ra.byRefPtrSlots
 
 proc truncateImm*(v: int64; bits: int; signed: bool): int64 {.inline.} =
   ## Keep the low `bits` of `v`, sign-extending when `signed`. A Leng

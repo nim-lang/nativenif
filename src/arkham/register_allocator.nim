@@ -82,6 +82,15 @@ type
                                       ## points at `c1`'s decl, so it resolves to `c1`'s live
                                       ## register. The emitter emits neither a decl nor a store
                                       ## for these (uses auto-cast via the deref handler).
+    byRefPtrSlots*: HashSet[string]   ## params whose >16B by-reference POINTER was spilled
+                                      ## to an 8-byte `(s)` slot: the slot holds `&aggregate`,
+                                      ## not the aggregate. Recorded HERE, at the one place
+                                      ## that decides it, because ~20 emitter sites branch on
+                                      ## it and getting it wrong either way is a miscompile,
+                                      ## not an assertion. (It used to be re-derived from the
+                                      ## slot's shape — `NamedStack` + `varType` + an 8-byte
+                                      ## `AUInt` — which is a property any future 8-byte
+                                      ## aggregate would also have.)
     spillTemps*: seq[tuple[name: string; typ: AsmSlot; isFloat: bool]]
                                       ## value-core totality: `etmp`/`ftmp` slots the
                                       ## allocator synthesized when the register pool
@@ -637,6 +646,13 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
                        canHomeInRegPair(b.prog[], typeNm)
           var r0 = NoReg
           var r1 = NoReg
+          # The rollback below must undo exactly what the loop did, and the two
+          # acquisition paths are NOT symmetric: a callee-saved take also enters
+          # `usedCallee` (prologue save/restore), an arg register only leaves
+          # `freeVol`. Blanket-`excl`ing `usedCallee` for both would, the moment
+          # an arg register ever coincided with a callee-saved one, drop a
+          # prologue save and corrupt the caller's register. Remember which.
+          var tookCallee: array[2, bool] = [false, false]
           if pairOk:
             for k in 0 ..< pl.words:
               let arg = b.md.gprAt(pl, k)
@@ -652,17 +668,16 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
                   pairOk = false
                   break
                 b.ra.usedCallee.incl r
+                tookCallee[k] = true
               else:
                 r = arg
                 b.freeVol.excl arg
               if k == 0: r0 = r else: r1 = r
             if not pairOk:
-              if r0 != NoReg:
-                b.giveBack r0
-                b.ra.usedCallee.excl r0
-              if r1 != NoReg:
-                b.giveBack r1
-                b.ra.usedCallee.excl r1
+              for k, r in [r0, r1]:
+                if r == NoReg: continue
+                b.giveBack r
+                if tookCallee[k]: b.ra.usedCallee.excl r
               r0 = NoReg; r1 = NoReg
           if pairOk:
             b.record(pos, name, regPairLoc(r0, r1, slot))
@@ -783,6 +798,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
                 # pointer, not the aggregate). emitParamMoves stores the incoming
                 # arg register there; field access / `aggrAddr*` load it back.
                 loc = b.spillTo(name, effSlot)
+                if aggrByRef: b.ra.byRefPtrSlots.incl name
             else:
               loc = regLoc(arg, effSlot)       # leaf proc: stay in the arg reg
               b.freeVol.excl arg               # persistent home → not lendable to a call-free local
@@ -810,6 +826,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
               # so no register is held; correct by construction, never a hard fail.
               loc = namedStackLoc(name, effSlot)
               b.ra.hasStackVars = true
+              if aggrByRef: b.ra.byRefPtrSlots.incl name
             else:
               b.ra.usedCallee.incl r
               loc = regLoc(r, effSlot)

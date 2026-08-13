@@ -1832,9 +1832,17 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
         g.ab.ptrType: g.ab.sym g.varType[nm]
         g.emReg loc.r
     elif loc.kind == NamedStack and g.spilledByRefPtr(nm):
+      # `prematLval2` loaded the spilled pointer into a bridge and parked it
+      # here. A miss means this lvalue reached the emitter without that walk —
+      # say so instead of raising `KeyError` from a table subscript three
+      # frames down.
+      let base = g.lvalGlobBase.getOrDefault(g.posOf(c), NoReg)
+      if base == NoReg:
+        raiseAssert "arkham a64n: spilled by-ref base " & nm &
+                    " used without a preceding prematLval2"
       g.ab.tree CastX:
         g.ab.ptrType: g.ab.sym g.varType[nm]
-        g.emReg g.lvalGlobBase[g.posOf(c)]
+        g.emReg base
     elif loc.kind == InRegPair:
       raiseAssert "arkham a64n: address of InRegPair local " & nm
     else:                                                 # a `(s)` stack-var base
@@ -2743,6 +2751,17 @@ proc aggrArgAddr(g: var CodeGen; a: Cursor; dst: Reg) =
       let hl = g.ra.locationOfSym(home)
       if hl.kind == InReg: g.movReg(dst, hl.r)          # by-ref param: pointer already in a reg
       elif g.spilledByRefPtr(home): g.emScalarLoad(dst, home)
+      elif hl.kind == InRegPair:
+        # A register-homed ≤16B aggregate has NO memory — the eightbytes are the
+        # value. `lea` of the name would address a stack slot that was never
+        # allocated, so materialize one (same shape as the constructor branch
+        # below) and hand back its address. Reached when such a param is passed
+        # on to a call with 8+ integer arguments (`marshalStackAggrArg`).
+        let slot = synth("pairtmp") & $g.posOf(a) & ".0"
+        g.emTypedStackVar(slot, g.getType(a))
+        g.varType[slot] = symName(g.getType(a))
+        g.genStore2(a, namedStackLoc(slot, g.exprSlot(a)))
+        g.ab.tree LeaA64: (g.emReg dst; g.ab.sym slot)
       else: g.ab.tree LeaA64: (g.emReg dst; g.ab.sym home)
   else:                                                 # oconstr/aconstr → build into a temp, then &temp
     let pos = g.posOf(a)
@@ -3074,6 +3093,19 @@ proc genConstr2(g: var CodeGen; c: Cursor; dstVar: string) =
   g.constrFieldStores(c, namedStackLoc(dstVar, ScalarSlot))   # base = the stack slot
 
 proc genAconstr2(g: var CodeGen; c: Cursor; dstVar: string) =
+  if g.spilledByRefPtr(dstVar):
+    # `dstVar` names an 8-byte slot holding &array, NOT the array. Addressing it
+    # by name would write the elements over the pointer itself — load the
+    # pointer and store through it, as `constrFieldStores` does for `oconstr`.
+    let p = g.takeBridge()
+    g.emScalarLoad(p, dstVar)
+    var tc = c; inc tc                                  # the array type
+    let elemTy = innerType(g.prog, resolveType(g.prog, tc))
+    template destP(i) = g.emPtrElemMem(p, elemTy, i)
+    template elemAddrP(i) = g.emPtrElemAt(p, elemTy, i)
+    g.aconstrElemStores(c, destP, elemAddrP)
+    g.dropBridge p
+    return
   template dest(i) = g.emAggrElemMem(dstVar, i)
   template elemAddr(i) = g.emAggrElemAt(dstVar, i)
   g.aconstrElemStores(c, dest, elemAddr)
@@ -4493,14 +4525,18 @@ proc emitAddr2(g: var CodeGen; c: Cursor; dest: var Location) =
     g.produceIntoMem2(c, dest); return
   let res = dest
   # Same stale-scalar-in-arg-reg hole as the x64 twin: `&stackAgg` dest-threaded
-  # into x0 while a dead bool/int local is still bound there.
+  # into x0 while a dead bool/int local is still bound there. Sound only because
+  # this is a call's argument sequence — see `emStackAddr`'s proof obligation.
   if res.kind == InReg and not res.isTemp and g.rb.isBound(res.r) and
      not g.rb.isBoundTemp(res.r) and not g.rb.isPtrBound(res.r):
     g.releaseStaleName(res.r)
   g.emitLvalue2(lv, globBase = res)             # a global base reuses the lea dest
-  g.aggrAddrInto(lv, res.r, g.exprSlot(c),
-                 doBind = res.isTemp or not g.rb.isBound(res.r))
+  # We own a binding minted on a non-temp dest; nothing downstream frees it, so
+  # release the NAME after the address instruction (x64 twin has the long form).
+  let minted = not res.isTemp and not g.rb.isBound(res.r)
+  g.aggrAddrInto(lv, res.r, g.exprSlot(c), doBind = res.isTemp or minted)
   g.freeLvalTemps2(lv)
+  if minted: g.unbindTemp(res.r)
   dest = res
 
 proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =

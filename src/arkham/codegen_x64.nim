@@ -222,7 +222,17 @@ proc binImm(g: var CodeGen; op: X64Inst; d: Reg; v: int64) =  # d op= imm
   ## multiply even after `sizeof` folds to 4/8, and GCC turns that into
   ## `shl` / a SIB scale. Catching it here covers both the canonical and
   ## swapped emitBin2 paths (and every other immediate-mul).
-  if op == ImulX64 and v >= 2 and (v and (v - 1)) == 0:
+  ##
+  ## NOT under a `keepovf`, though. `imul` and `shl` agree on the low 64 bits
+  ## and disagree on the FLAGS: `shl` leaves OF undefined for counts > 1 and
+  ## puts the last bit shifted out in CF, while `KeepovfS` emits the bare op
+  ## precisely so the mandatory `(ovf)` test right after it can read `jo`/`jb`
+  ## (see `genStmt2`'s KeepovfS and `emitCond2`'s OvfC). Rewriting the
+  ## instruction would silently give checked `x * 8` a garbage overflow answer.
+  ## `noFoldPos >= 0` marks exactly the keepovf op's emission window.
+  ## (The a64 twin needs no such guard: it computes the predicate explicitly
+  ## from `smulh`/`umulh` snapshots rather than from hardware flags.)
+  if op == ImulX64 and v >= 2 and (v and (v - 1)) == 0 and g.noFoldPos < 0:
     var k = 0'i64
     var t = v
     while t > 1: (t = t shr 1; inc k)
@@ -1500,12 +1510,23 @@ proc genMemIntrinBody(g: var CodeGen; builtin: string) =
 const x64RetRegs = [RAX, RDX]   # SysV ≤16B aggregate result: rax (word 0), rdx (word 1)
 
 proc emStackAddr(g: var CodeGen; dest: Reg; name: string) =   # dest ← &stackvar
-  ## `dest` is often an ABI argument register that still carries a dead
-  ## scalar local (x86-64 homes AllRegs locals in rdi/rsi/…). `emReg` would
-  ## emit that name, and nifasm rejects `(lea boolName, &struct)`. Drop a
-  ## non-pointer binding; a pointer-typed dest (the assignment `p = addr x`)
-  ## is kept.
-  if g.rb.isBound(dest) and not g.rb.isBoundTemp(dest) and not g.rb.isPtrBound(dest):
+  ## `dest` is often an ABI argument register that still carries a dead scalar
+  ## local (x86-64's `intLocalTempRegs` IS the argument register set, so a
+  ## call-free `AllRegs` local routinely homes in one). `emReg` would emit that
+  ## name and nifasm rejects `(lea boolName, &struct)`, so the binding is
+  ## dropped. A pointer-typed dest is kept: that is the assignment `p = addr x`
+  ## writing p's own home, not a stale tenant.
+  ##
+  ## PROOF OBLIGATION for callers. `rb` cannot distinguish "bound and dead" from
+  ## "bound and live" — it releases a local at scope exit, not at last use — so
+  ## this kill is only sound where the register is dead by construction. Every
+  ## current caller reaches here while marshalling a CALL's arguments, which is
+  ## exactly the argument `releaseArgDest` spells out: the allocator homes a
+  ## local in a caller-saved register only under `AllRegs`, the analyser's proof
+  ## that its live range crosses no call. A caller that is NOT in a call's
+  ## argument sequence must pass a register it owns, not one that may still
+  ## hold a live local — `regHoldsLiveLocal` is the test for that.
+  if g.regHoldsLiveLocal(dest) and not g.rb.isPtrBound(dest):
     g.releaseStaleName(dest)
   g.ab.tree LeaX64: (g.emReg dest; g.ab.reg RSP; g.ab.sym name)
 
@@ -2509,6 +2530,25 @@ proc aggrArgSource(g: var CodeGen; a: Cursor; tcur: Cursor; tn: string):
     g.genStore2(a, namedStackLoc(home, g.exprSlot(a)))
   (home, ptrReg, isTvar)
 
+proc spillPairToSlot(g: var CodeGen; a: Cursor; tcur: Cursor; tn: string): string =
+  ## A ≤16B by-value aggregate homed in GPRs (`InRegPair`) has NO memory — the
+  ## eightbytes are the value. `aggrArgSource` still reports it by name, because
+  ## the register-passed path marshals pair→pair with no round trip. A consumer
+  ## that needs its ADDRESS must materialize one first: `emStackAddr` of that
+  ## name would `lea rsp+<name>` for a slot that was never allocated.
+  result = synth("pairtmp") & $cursorToPosition(g.buf[], a) & ".0"
+  g.emTypedStackVar(result, tcur)
+  g.varType[result] = tn
+  g.genStore2(a, namedStackLoc(result, g.exprSlot(a)))
+
+proc addressableAggrHome(g: var CodeGen; home: string; a: Cursor;
+                         tcur: Cursor; tn: string): string {.inline.} =
+  ## `home`, or a freshly materialized slot when `home` lives in registers.
+  if home.len > 0 and g.ra.locationOfSym(home).kind == InRegPair:
+    g.spillPairToSlot(a, tcur, tn)
+  else:
+    home
+
 proc binFold(g: var CodeGen; op: X64Inst; dest: Reg; loc: Location; opCur: Cursor) =
   ## `dest op= <memory operand>` (a `NamedStack` slot or a `Mem` access chain `opCur`),
   ## EXCEPT a sub-8-byte field: it has no 64-bit ALU memory form (`add r64, m32` doesn't
@@ -3329,11 +3369,17 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
         g.emReg loc.r
     elif loc.kind == NamedStack and g.spilledByRefPtr(nm):
       # spilled by-ref POINTER: premat loaded it into lvalGlobBase; type it like
-      # the InReg case so the enclosing dot/at can compute the field offset.
+      # the InReg case so the enclosing dot/at can compute the field offset. A
+      # miss means this lvalue skipped `prematLval2` — say so rather than raise
+      # `KeyError` from a table subscript.
       let pos = cursorToPosition(g.buf[], c)
+      let base = g.lvalGlobBase.getOrDefault(pos, NoReg)
+      if base == NoReg:
+        raiseAssert "arkham x64n: spilled by-ref base " & nm &
+                    " used without a preceding prematLval2"
       g.ab.tree CastX:
         g.ab.ptrType: g.ab.sym g.varType[nm]
-        g.emReg g.lvalGlobBase[pos]
+        g.emReg base
     elif loc.kind == InRegPair:
       raiseAssert "arkham x64n: address of InRegPair local " & nm
     else:                                               # a `(s)` stack-var base
@@ -4084,6 +4130,13 @@ proc emAggrSrcAddr(g: var CodeGen; dest: Reg; name: string) =
     else:
       g.emStackAddr(dest, name)
   of InReg: g.movReg(dest, home.r)
+  of InRegPair:
+    # An `InRegPair` home has NO memory at all — the eightbytes ARE the value.
+    # Falling through to `emSymAddrByName` would silently take the RIP-relative
+    # address of an unrelated module-level symbol of the same name. Callers that
+    # need the bytes in memory must spill the pair first (`aggrSrcEnd` raises for
+    # the same reason).
+    raiseAssert "arkham x64n: emAggrSrcAddr of InRegPair " & name
   else: g.emSymAddrByName(dest, name)
 
 proc copyStructThroughPtr2(g: var CodeGen; srcVar, typeName: string; ptrReg: Reg) =
@@ -4505,6 +4558,19 @@ proc genConstr2(g: var CodeGen; c: Cursor; dstVar: string) =
 proc genAconstr2(g: var CodeGen; c: Cursor; dstVar: string) =
   ## Emit `(aconstr ArrayT e0 e1 …)` into the stack array `dstVar`: store each (bare)
   ## element value at `(mem (at (rsp) dstVar i))`. The array twin of `genConstr2`.
+  if g.spilledByRefPtr(dstVar):
+    # `dstVar` names an 8-byte slot holding &array, NOT the array. The
+    # rsp-relative element operand would write the elements over the pointer
+    # itself and up the stack — load the pointer and store through it, exactly
+    # as `constrFieldStores` does for the `oconstr` twin.
+    let p = g.pickStagingSealed("an aconstr spilled by-ref base", AddrSlot)
+    g.ab.tree MovX64: (g.emReg p; g.emStackMem(dstVar))
+    var tc = c; inc tc                                  # the array type
+    let elemTy = innerType(g.prog, resolveType(g.prog, tc))
+    template destP(i) = g.emPtrElemMem(p, elemTy, i)
+    g.aconstrElemStores(c, destP)
+    g.giveBack p
+    return
   template dest(i) = g.emAggrElemMem(dstVar, i)
   g.aconstrElemStores(c, dest)
 
@@ -6169,14 +6235,23 @@ proc emitAddr2(g: var CodeGen; c: Cursor; dest: var Location) =
   # Call-arg dest-threading puts `&stackAgg` in rdi/rsi/… while a dead scalar
   # local is still bound there (`AllRegs` homes). `doBind` is false (the dest
   # is the ABI register, not a temp), so the lea would keep that name's type.
-  # Kill a non-pointer tenant; then bind a pointer temp if the register is raw.
-  if res.kind == InReg and not res.isTemp and g.rb.isBound(res.r) and
-     not g.rb.isBoundTemp(res.r) and not g.rb.isPtrBound(res.r):
+  # Kill a non-pointer tenant. Sound for the same reason as `emStackAddr`'s
+  # kill: this is a call's argument sequence, where an `AllRegs` local is dead
+  # by the analyser's own proof (see `releaseArgDest`).
+  if res.kind == InReg and not res.isTemp and g.regHoldsLiveLocal(res.r) and
+     not g.rb.isPtrBound(res.r):
     g.releaseStaleName(res.r)
   g.emitLvalue2(lv, globBase = res)                     # a global base reuses the lea dest
-  g.aggrAddrInto(lv, res.r, g.exprSlot(c),
-                 doBind = res.isTemp or not g.rb.isBound(res.r))
+  # The kill can leave the register raw, and `lea` wants a typed destination —
+  # so mint a temp binding. WE own it: `res` is not a temp, so no consumer will
+  # release it (a pinned ABI register is not a `Location` anyone frees) and it
+  # would linger as a stale name on an argument register. Drop the NAME once the
+  # address instruction is out; the value stays, and later reads emit the raw
+  # register, which is what a pinned dest wants anyway.
+  let minted = not res.isTemp and not g.rb.isBound(res.r)
+  g.aggrAddrInto(lv, res.r, g.exprSlot(c), doBind = res.isTemp or minted)
   g.freeLvalTemps2(lv)
+  if minted: g.unbindTemp(res.r)
   dest = res
 
 proc produceIntoFMem2(g: var CodeGen; c: Cursor; dst: Location) =
@@ -6834,10 +6909,13 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
             g.emitLvalue2(a)
             (srcAddr, srcSpilled) = g.aggrArgAddr(a, recorded, [])
           else:
-            let (home, ptrReg, isTvar) = g.aggrArgSource(a, tcur, tn)
+            let (home0, ptrReg, isTvar) = g.aggrArgSource(a, tcur, tn)
             if ptrReg != NoReg:
               srcAddr = ptrReg; srcOwned = false
             else:
+              # The outgoing stack-arg area is filled by reading the source
+              # THROUGH an address, so a register-homed pair needs a slot first.
+              let home = g.addressableAggrHome(home0, a, tcur, tn)
               srcAddr = g.pickStagingSealed("a stack aggregate-arg address", AddrSlot)
               srcSpilled = true
               if home.len > 0: g.emStackAddr(srcAddr, home)
@@ -6873,8 +6951,12 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
         else:
           let (home, ptrReg, isTvar) = g.aggrArgSource(a, tcur, tn)
           if byRef:
+            # (`byRef` means the PARAMETER is >16B, so `home` cannot be an
+            # `InRegPair` ≤16B one — but route through the helper anyway rather
+            # than rely on that being true from two files away.)
             if ptrReg != NoReg: g.movReg(dst[0], ptrReg)
-            elif home.len > 0: g.emStackAddr(dst[0], home)
+            elif home.len > 0:
+              g.emStackAddr(dst[0], g.addressableAggrHome(home, a, tcur, tn))
             elif isTvar: g.emTvarAddr(dst[0], symName(a))
             else: g.emGlobalAddr(dst[0], symName(a))
           else:
