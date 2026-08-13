@@ -77,6 +77,35 @@ let AddrSlot = AsmSlot(cls: AUInt, size: 8, align: 8)
   ## nifasm still tracks the register and rejects a raw reuse; the cast supplies the
   ## element type at the point of the actual load/store.
 
+proc stagingNote(g: var CodeGen; r: Reg; what: string) {.inline.} =
+  ## Record that a staging register was handed out. The PEAK of this — how many
+  ## transients the emitter ever holds AT ONCE — is the number that decides whether
+  ## R11 can leave `StagingCandidates`: the reservation exists so that a pick can
+  ## never fail, and the allocator can only take over that guarantee if it knows how
+  ## many to reserve. `design.md` asserts the answer is two, from chibicc; this
+  ## measures THIS emitter. Debug-only: the field does not exist otherwise.
+  when defined(arkhamStagingDbg):
+    if r != NoReg:
+      g.stagingLive.add (r, what)
+      if g.stagingLive.len > g.stagingPeak:
+        g.stagingPeak = g.stagingLive.len
+        var s = ""
+        for it in g.stagingLive:
+          if s.len > 0: s.add " + "
+          s.add it[1]
+        g.stagingPeakWhat = s
+  else:
+    discard
+
+proc stagingRelease(g: var CodeGen; r: Reg) {.inline.} =
+  when defined(arkhamStagingDbg):
+    for i in countdown(g.stagingLive.high, 0):
+      if g.stagingLive[i][0] == r:
+        g.stagingLive.delete i
+        return
+  else:
+    discard
+
 proc giveBack(g: var CodeGen; r: Reg) {.inline.} =
   ## Release a transient register obtained during premat / value evaluation. Its
   ## scratch binding (`bindTemp`) is `(kill)`'d first; then a staging register
@@ -84,6 +113,7 @@ proc giveBack(g: var CodeGen; r: Reg) {.inline.} =
   ## reuse it) is unsealed. Unbinding/unsealing a reg that carries neither is a
   ## harmless no-op.
   if r == NoReg: return
+  g.stagingRelease(r)
   g.unbindTemp(r)
   g.ra.unseal {r}
 
@@ -102,6 +132,7 @@ proc pickStagingSealed(g: var CodeGen; what: string; slot: AsmSlot; avoid: Reg =
                 " in proc " & g.curProcName & g.stagingCensus(avoid)
   g.ra.seal result
   g.bindTemp(result, slot)
+  g.stagingNote(result, what)
 
 # ── SSE / floating-point scratch pool + emit helpers ─────────────────────────
 # x86-64 floats live in xmm0..xmm15 (the FReg slots F0..F15). The register operand
@@ -897,7 +928,9 @@ const StagingCandidates = [R11, RAX, RDI, RSI, RDX, RCX, R8, R9]
   ## staging (each guarded by `liveAccums`/`regHoldsLiveLocal`/`sealed` so a live value
   ## is never hit).
   ##
-  ## MEASURED DEMAND IS **TWO**, and R11 is the only one of these that is GUARANTEED —
+  ## MEASURED DEMAND IS **THREE** in 1 % of procs and two in 17 % (see design.md,
+  ## "How many registers the emitter actually needs" — `-d:arkhamStagingDbg` counts
+  ## it), and R11 is the only one of these that is GUARANTEED —
   ## see design.md, "How many registers the emitter actually needs". Every step that
   ## must hold an ADDRESS in a register while a VALUE passes through another wants two:
   ## a load through a materialized global base, an `(at …)` stride fold, an aggregate
@@ -1050,6 +1083,7 @@ proc pickStaging(g: var CodeGen; what: string; avoid: Reg = NoReg): Reg =
   if result == NoReg:
     raiseAssert "arkham x64: no staging register available for " & what &
                 " in proc " & g.curProcName & g.stagingCensus(avoid)
+  g.stagingNote(result, what)
 
 proc regHoldsLiveFLoc(g: var CodeGen; f: FReg): bool =
   ## True if a float local/param currently lives in SIMD register `f` (per the
@@ -8761,6 +8795,12 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
       var pc = info.decl; inc pc
       stderr.writeLine "DBG emit proc " & symName(pc)
   g.emitProcBody2(info, an.hasCall)
+  when defined(arkhamStagingDbg):
+    stderr.writeLine "STAGING proc=" & info.asmName & " peak=" & $g.stagingPeak &
+      " leaked=" & $g.stagingLive.len & " at=" & g.stagingPeakWhat
+    g.stagingPeak = 0
+    g.stagingPeakWhat = ""
+    g.stagingLive.setLen 0
 
 proc genGlobal(g: var CodeGen; nifName: string; decl: Cursor) =
   ## `(gvar :name <type>)` — a zero-initialized `.bss` global (also `const`); any

@@ -168,6 +168,11 @@ type
                                              ## params: what type to re-emit when a binding has
                                              ## to be re-established. Only consumer so far is
                                              ## `restoreBindingsAfterDiverging`.
+    when defined(arkhamStagingDbg):
+      stagingLive*: seq[(Reg, string)]  ## staging registers handed out and not yet given
+                                        ## back, with the label of what asked for each
+      stagingPeak*: int                 ## the most that were ever live AT ONCE in this proc
+      stagingPeakWhat*: string          ## and which labels those were — the SHAPE to reserve for
     curProcName*: string                     ## the proc currently being emitted. arkham's input
                                              ## carries no line info, so a bare register-pressure
                                              ## or typing assert names nothing actionable; this
