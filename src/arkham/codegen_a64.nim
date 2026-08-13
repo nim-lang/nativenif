@@ -3683,8 +3683,6 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     g.foldRhs2(foldOp, rD, lLoc, lhsC)                   # bridges serve Imm/slot/Mem lhs
     if lhsMem: g.freeLvalTemps2(lhsC)
     g.normalizeBinWidth(resTypeC, rD, op)
-    if restoreSwap.len > 0:
-      g.rebindLocalAs(restoreSwap, rD, resTypeC)         # back to its pointer type
     dest = acc
     return
   var lDest = needsReg(ScalarSlot)
@@ -3755,8 +3753,6 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     g.foldRhs2(op, rD, rDest, rhsC, w32)                 # dest op= rhs
   if not w32:
     g.normalizeBinWidth(resTypeC, rD, op)
-  if restorePtr.len > 0:
-    g.rebindLocalAs(restorePtr, rD, resTypeC)            # back to its pointer type
   if not reusedRhs: g.freeVal(rDest)
   if not reusedLhs: g.freeVal(lDest)
   if resStaging != NoReg:
