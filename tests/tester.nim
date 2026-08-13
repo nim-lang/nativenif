@@ -240,9 +240,10 @@ const arkhamStressKnown: seq[string] = @[
   "aggr_arg_parked",
   "aggr_arg_parked_byref",
   "aggr_arg_parked_manual",
-  "atomic_cas_regpressure", # intrinsic-operand pick has no steal/spill arm
-  "atomic_cas_operand_home",  # same missing arm, one step in: the compare-exchange
-                            # out of `realloc` that `nimony n -d:danger` died on.
+  # The intrinsic-operand pick has no steal/spill arm, one step in: the
+  # compare-exchange out of `realloc` that `nimony n -d:danger` died on.
+  # (`atomic_cas_regpressure` sat here for the same reason and now passes at k=2.)
+  "atomic_cas_operand_home",
   # NO LONGER A SILENT MISCOMPILE. The comment here used to read "SILENT MISCOMPILE
   # (71 -> 95)": `produceIntoMem2` hands the produce bridge to the WHOLE node on the
   # claim that it is "not held across the recursion" — true for a leaf or a load,
@@ -263,7 +264,8 @@ const arkhamStressA64Known: seq[string] = @[
   # out-of-registers assert, but can never legitimately change what a program
   # computes, so a wrong answer here is a codegen bug by construction.
   "spill_produce_float",    # float produce-into-spill reads a clobbered register
-  "atomic_cas_regpressure", # intrinsic-operand pick has no steal/spill arm
+  # (`atomic_cas_regpressure` lived here for the missing steal/spill arm on the
+  # intrinsic-operand pick, and now passes at this list's own k=3.)
   # `instrOperandInPlace` — read a register-homed symbol operand where it lies
   # instead of copying it into a register the row then cannot find — is x86-64
   # ONLY, deliberately: that is the machine whose whole emitter budget is two
@@ -532,7 +534,13 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_raw_bound.nif", "Registe
 execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_raw_fbound.nif", "Register D8 is bound to variable 'f.0', use the variable name instead")
 # Call-safety: a value living in a caller-saved register (x9) is destroyed by a
 # `(call)`; reading it afterward must be rejected (a callee-saved x19 home would survive).
+# The callee's own `(clobber …)` is what says so — see the accepting twin below.
 execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_clobber_after_call.nif", "in register X9 which was clobbered by a call")
+# ...and the same code with an EMPTY `(clobber)` must ASSEMBLE: arkham emits that for a
+# `(attr "noreturn")` callee, which returns to nobody, so no caller can observe what it
+# destroyed. Taking the empty list at face value is what lets a value stay in a
+# caller-saved register across a cold guard instead of paying a callee-saved home.
+exec "nim c -r src/nifasm/nifasm tests/a64_noreturn_clobber.nif"
 # The `rep movs` family names none of its operands in the tree, yet destroys rdi/rsi/rcx.
 # Reading a local homed in one of them afterwards must be rejected here — otherwise the
 # only symptom is a silently wrong value at run time.

@@ -306,6 +306,7 @@ proc marshalAggrFromAddr(g: var CodeGen; addrReg: Reg; typeName: string; firstAr
 proc marshalStackAggrArg(g: var CodeGen; a: Cursor; paramNm: string)    # defined below
 proc takeBridge(g: var CodeGen; typ = ScalarSlot; avoid = NoReg): Reg   # defined below
 proc dropBridge(g: var CodeGen; r: Reg)                                 # defined below
+proc releaseStaleName(g: var CodeGen; r: Reg)                           # defined below
 proc emWordThroughPtr(g: var CodeGen; p: Reg; idx: int)                 # defined below
 proc genTypeBody(g: var CodeGen; c: var Cursor)
 proc genPointee(g: var CodeGen; c: var Cursor)
@@ -701,6 +702,13 @@ proc emitSyprocA64(g: var CodeGen; sp: SyscallProc) =
           g.ab.symDef synth("ret.0")
           g.ab.reg IntRet
           g.genTypeBody(c)
+      if sp.sysNrA64 < 0:
+        # A row whose AArch64 column is `-1` (a legacy call the asm-generic ABI
+        # dropped: `open`, `stat`, `fork`, …). Emitting it anyway would trap with
+        # x8 = -1, i.e. a silent ENOSYS that surfaces as `fileExists` always false
+        # rather than as a build error. std/posix routes each of these through the
+        # `*at`/`*2` form under `linuxA64Raw`; reaching here means one was missed.
+        raiseAssert "arkham a64: no AArch64 syscall for " & sp.asmName
       g.ab.intLit sp.sysNrA64.int64
     while c.hasMore: skip c                       # drain the importc decl's pragmas + body
 
@@ -773,6 +781,14 @@ proc genTypeBody(g: var CodeGen; c: var Cursor) =
       c.into:                               # Leng `(enum BaseType efld*)`
         g.genTypeBody(c)                    # collapse to the base integer type
         while c.hasMore: skip c             # efld members
+    of VarargsT:
+      # A C `{.varargs.}` importc marker materialises as a synthetic trailing
+      # param `(param :vanon . . (varargs))` — e.g. posix `open`/`fcntl`. It owns
+      # no storage of its own; the variadic slot is just one ABI/syscall register
+      # wide. Emit it as a 64-bit uint so the param maps to exactly one register.
+      # `skip` drains the whole `(varargs …)` node, with or without a recorded
+      # element type.
+      g.ab.uintType(64); skip c
     of ObjectT:
       c.into:
         # Inheritance: a Symbol base is emitted by reference (nifasm resolves it
@@ -1397,6 +1413,16 @@ proc takeHeld(g: var CodeGen; what: string; canSpill = false): Location =
   if r != NoReg:
     g.pickedRegs.incl r
     return regLoc(r, ScalarSlot, isTemp = true)
+  # Second chance, callee-saved only (the value must survive a call): judged by
+  # LIVE bindings instead of the `regHoldsHome` union — see `pickStagingA64` for
+  # why the union is what runs out under `-d:release`.
+  for cs in g.md.intCalleeSaved:
+    if cs notin g.pickedRegs and not g.ra.isSealed(cs) and not g.rb.isAccum(cs) and
+       not g.rb.isBound(cs):
+      g.ra.usedCallee.incl cs                    # the (post-body) prologue saves it
+      g.releaseStaleName(cs)
+      g.pickedRegs.incl cs
+      return regLoc(cs, ScalarSlot, isTemp = true)
   if canSpill:
     let nm = g.mintSpillName("held")
     g.ra.spillTemps.add (name: nm, typ: AsmSlot(cls: AInt, size: 8, align: 8),
@@ -1406,16 +1432,68 @@ proc takeHeld(g: var CodeGen; what: string; canSpill = false): Location =
               " in proc " & g.curProcName & " (nothing to spill), picked: " &
               $g.pickedRegs
 
-proc takeInstrReg(g: var CodeGen; slot: AsmSlot): Location =
-  ## A register an `(instr …)` operand or result MUST have. Pools, then a
-  ## callee-saved survivor — NEVER a bridge (the atomic sequences own
-  ## x14/x15/x16) and never a spill slot.
+proc pickStagingA64(g: var CodeGen): Reg =
+  ## Last-resort transient GPR for an operand that MUST be in a register and cannot
+  ## use a bridge (an atomic's operands: its LL/SC sequence owns x14/x15/x16).
+  ##
+  ## Same candidates `pickTempReg`/`pickHeldReg` walk, but judged by what is LIVE
+  ## rather than by `regHoldsHome` — the immutable per-proc UNION of every register
+  ## any local is EVER homed in. The union is the right conservative answer for an
+  ## ordinary temp, but as a last resort it throws away the allocator's whole point:
+  ## one register homes many locals across DISJOINT scopes, so the union refuses all
+  ## of them for the entire body. `-d:release` is where that bites — shoggoth's
+  ## inlining multiplies the number of distinct locals while their scopes keep peak
+  ## pressure flat, so the union grows and the free set shrinks even though nothing
+  ## is more live than before. `rb` is the authority instead: the emitter binds a
+  ## register local at its `(var :name (reg) T)` and releases it at scope exit, and
+  ## nifasm's binding checker validates the result. This is the x86-64
+  ## `pickStagingScratch`'s reasoning, ported.
+  ##
+  ## A register carrying ANY binding — a live local or an anonymous in-flight temp —
+  ## is still refused, so nothing owned can be clobbered.
+  for r in g.md.intTempRegs:
+    if r notin g.pickedRegs and not g.ra.isSealed(r) and not g.rb.isAccum(r) and
+       not g.rb.isBound(r):
+      g.releaseStaleName(r); return r
+  for r in g.md.intCalleeSaved:
+    if r notin g.pickedRegs and not g.ra.isSealed(r) and not g.rb.isAccum(r) and
+       not g.rb.isBound(r):
+      g.ra.usedCallee.incl r                     # the (post-body) prologue saves it
+      g.releaseStaleName(r); return r
+  NoReg
+
+proc takeInstrReg(g: var CodeGen; slot: AsmSlot; atomic: bool): Location =
+  ## A register an `(instr …)` operand or result MUST have (never a spill slot).
+  ## Pools, then a callee-saved survivor, then — for a NON-atomic intrinsic — a
+  ## staging bridge.
+  ##
+  ## The bridges are off-limits to the ATOMIC lowerings, which is where the blanket
+  ## "never a bridge" rule came from: their `ldaxr`/`stlxr` retry loops use
+  ## x14/x15/x16 themselves, so an operand parked there would be destroyed between
+  ## the exclusive load and the store. `clz`/`rbit`/`rev`/`bswap` are ONE
+  ## instruction with nothing in between, and at most a result plus one operand —
+  ## exactly what two bridges cover. Under `-d:release` (shoggoth's denser
+  ## expressions leave the pools empty) a bridge is sometimes the only register
+  ## left, and the alternative was a hard failure.
   let r = g.pickTempReg()
   if r != NoReg:
     g.pickedRegs.incl r
     return regLoc(r, slot, isTemp = true)
-  result = g.takeHeld("an intrinsic operand")
-  result.typ = slot                            # keep the precise type for the binding
+  if atomic:
+    let s = g.pickStagingA64()
+    if s == NoReg:
+      result = g.takeHeld("an atomic intrinsic operand")  # fails loudly
+      result.typ = slot                        # keep the precise type for the binding
+      return
+    g.pickedRegs.incl s
+    return regLoc(s, slot, isTemp = true)
+  let h = g.pickHeldReg()
+  if h != NoReg:
+    g.pickedRegs.incl h
+    return regLoc(h, slot, isTemp = true)
+  let b = g.takeBridge(slot)                   # binds it; `freeVal` releases it
+  g.pickedRegs.incl b
+  result = regLoc(b, slot, isTemp = true)
 
 proc freeVal(g: var CodeGen; loc: Location) {.inline.} =
   ## Release a reserved/resolved temp — the emit-time `releaseTmp`: clear the
@@ -1600,7 +1678,19 @@ proc reloadMemBase2(g: var CodeGen; pos: int) =
   ## homed base returns immediately — no steal can move it under us anymore.)
   let loc = g.ra.locs[pos]
   if loc.kind notin {NamedStack, Mem}: return
-  let s = g.takeBridge(loc.typ)
+  var s = g.tryTakeBridge(loc.typ)
+  if s == NoReg:
+    # Both bridges are already staging inside this one address chain (a `(mem …)`
+    # with a spilled base AND a spilled index, under an aggregate copy that put its
+    # two end addresses there first). Any register with no live binding serves — the
+    # reload dies with the operand — and `pickStagingA64` finds those the whole-proc
+    # home union hides.
+    s = g.pickStagingA64()
+    if s == NoReg:
+      raiseAssert "arkham a64n: no register to reload a spilled memory base in proc " &
+                  g.curProcName
+    g.pickedRegs.incl s
+    g.bindTemp(s, loc.typ)
   g.place2(loc, s)
   g.savedHomes[pos] = loc
   g.ra.locs[pos] = regLoc(s, loc.typ)
@@ -1735,11 +1825,67 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
     else: raiseAssert "arkham a64n: emLvalAddr2 expr " & $c.exprKind
   else: raiseAssert "arkham a64n: emLvalAddr2 kind " & $c.kind
 
-proc bindStrideScratch(g: var CodeGen; atPos: int) =
+proc lvalMaterializedRegs(g: CodeGen; c: Cursor; acc: var set[Reg]) =
+  ## Every register the lvalue/value subtree `c` has materialized something into (a
+  ## deref pointer, an index, a global base address). `locs` is position-indexed
+  ## over the proc's whole token span, so the subtree is a plain range scan — no
+  ## structural re-walk that could miss a nesting level. An untouched entry is
+  ## `Undef` (the zero value), never a bogus `InReg`.
+  let first = g.posOf(c)
+  var e = c; skip e
+  for p in first ..< g.posOf(e):
+    let l = g.ra.locs[p]
+    if l.kind == InReg: acc.incl l.r
+
+proc strideRecycle(g: CodeGen; idxCur, baseCur: Cursor): Reg =
+  ## The index's register when it may double as the stride scratch, else `NoReg`.
+  ##
+  ## Two conditions. It must be a TRANSIENT — a staging bridge or a pool temp this
+  ## operand reserved for the index — so that no later read can see the multiply's
+  ## result; an index left in its allocator-assigned home is a named local whose
+  ## value outlives the access. And it must not be the BASE's register: nifasm
+  ## allows `scratch == index` (it stages the stride constant in its own reserved
+  ## x16, so `scratch = idx*stride` reads the index in the very instruction that
+  ## overwrites it) but rejects `scratch == base`, which the following
+  ## `add scratch, base, scratch` would destroy before reading.
+  if idxCur.kind in {IntLit, UIntLit}: return NoReg
+  let l = g.ra.locs[g.posOf(idxCur)]
+  if l.kind != InReg or not l.isTemp or not g.rb.isBoundTemp(l.r): return NoReg
+  var baseRegs: set[Reg] = {}
+  g.lvalMaterializedRegs(baseCur, baseRegs)
+  if l.r in baseRegs: NoReg else: l.r
+
+proc bindStrideScratch(g: var CodeGen; atPos: int; recycle: Reg) =
   ## Bind the stride scratch `reserveStrideScratch` reserved for the access at
   ## `atPos`, taking the staging bridge now if that is what it settled for.
+  ##
+  ## `recycle` is the index's own register when `strideRecycle` proved it reusable —
+  ## the last resort when BOTH bridges already carry this same operand's reloaded
+  ## base and index. Three spilled operands in one `(mem …)` is what a `-d:release`
+  ## build reaches (shoggoth's inlining and CSE make expressions dense enough that
+  ## nothing is left in the pools), and there is no third bridge.
   if atPos in g.lvalStrideOnBridge:
-    g.ra.aux[atPos] = ExprAux(scratch: @[g.takeBridge()])
+    var r = g.tryTakeBridge()
+    if r == NoReg:
+      # No bridge left (both already carry this operand's reloaded base and index).
+      # Any register with NO live binding still serves — the scratch is a plain
+      # transient — and `pickStagingA64` judges that by what is bound right now
+      # instead of by the whole-proc home union `reserveStrideScratch` consulted.
+      r = g.pickStagingA64()
+      if r != NoReg:
+        g.pickedRegs.incl r
+        g.bindTemp(r, ScalarSlot)
+      else:
+        if recycle == NoReg:
+          raiseAssert "arkham a64n: no stride scratch for the indexed access in proc " &
+                      g.curProcName
+        # nifasm ALLOWS `scratch == index`: it stages the stride constant in its own
+        # reserved x16, so `scratch = idx*stride` reads the index in the very
+        # instruction that overwrites it. Only `scratch == base` is rejected there
+        # (that one would destroy the base before `add scratch, base, scratch`).
+        r = recycle
+      g.lvalStrideOnBridge.excl atPos   # no bridge of its own to release
+    g.ra.aux[atPos] = ExprAux(scratch: @[r])
   else:
     g.bindTemp(g.ra.aux[atPos].scratch[0], ScalarSlot)
 
@@ -1780,24 +1926,30 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
     of AtC:
       let atPos = g.posOf(c)
       var cc = c
+      var recycle = NoReg
       cc.into:
+        let baseCur = cc
         g.prematLval2(cc); skip cc                        # base
         if cc.kind notin {IntLit, UIntLit}:
           g.prematAddrVal2(cc)                            # follow steals
+          recycle = g.strideRecycle(cc, baseCur)          # last-resort stride scratch
         while cc.hasMore: skip cc
       if g.ra.aux.hasKey(atPos) and g.ra.aux[atPos].scratch.len > 0:
-        g.bindStrideScratch(atPos)
+        g.bindStrideScratch(atPos, recycle)
     of PatC:
       let patPos = g.posOf(c)
       var cc = c
+      var recycle = NoReg
       cc.into:
+        let baseCur = cc
         g.prematAddrVal2(cc)                              # the pointer → its reg (follow steals)
         skip cc
         if cc.kind notin {IntLit, UIntLit}:
           g.prematAddrVal2(cc)                            # follow steals
+          recycle = g.strideRecycle(cc, baseCur)          # last-resort stride scratch
         while cc.hasMore: skip cc
       if g.ra.aux.hasKey(patPos) and g.ra.aux[patPos].scratch.len > 0:
-        g.bindStrideScratch(patPos)
+        g.bindStrideScratch(patPos, recycle)
     of BaseobjC:                                          # transparent: materialize inner lvalue
       var cc = c
       cc.into:
@@ -2849,21 +3001,32 @@ proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
   block:
     var r = g.pickTempReg()
     if r == NoReg: r = g.pickHeldReg()
+    # Before a bridge: any register with no LIVE binding (`pickStagingA64`). The copy
+    # crosses no call, so a caller-saved one is as good as a survivor — and every
+    # bridge left free here is one the two addresses' own materialization can use.
+    if r == NoReg: r = g.pickStagingA64()
     if r != NoReg:
       g.pickedRegs.incl r; h0 = regLoc(r, ScalarSlot, isTemp = true); a0 = r
     else:
       b0 = g.takeBridge(); a0 = b0
-  block:
-    var r = g.pickTempReg()
-    if r == NoReg: r = g.pickHeldReg()
-    if r != NoReg:
-      g.pickedRegs.incl r; h1 = regLoc(r, ScalarSlot, isTemp = true); a1 = r
-    else:
-      b1 = g.takeBridge(avoid = b0); a1 = b1
   if dst.kind == Mem:
     g.emitLvalue2(dst.cur)                 # pick the dst lvalue's embedded values
   g.bindTemp(a0, ScalarSlot); g.aggrAddrLoc(dst, a0)             # &dst
   if dst.kind == Mem: g.freeLvalTemps2(dst.cur)
+  # The SOURCE register is reserved only NOW, after `&dst` is in `a0`. Reserving
+  # both up front used to hand the two bridges out before either address was
+  # materialized — and materializing a `Mem` destination whose base or index is
+  # itself spilled needs a bridge of its own (`reloadMemBase2`), which was then
+  # gone. Deferring costs nothing: `a1` is not read until `&rhs` is emitted, and
+  # any bridge the destination borrowed is back by then.
+  block:
+    var r = g.pickTempReg()
+    if r == NoReg: r = g.pickHeldReg()
+    if r == NoReg: r = g.pickStagingA64()
+    if r != NoReg:
+      g.pickedRegs.incl r; h1 = regLoc(r, ScalarSlot, isTemp = true); a1 = r
+    else:
+      b1 = g.takeBridge(avoid = b0); a1 = b1
   g.bindTemp(a1, ScalarSlot)
   if rhs.kind == TagLit:
     g.emitLvalue2(rhs)                     # pick the src lvalue's embedded values
@@ -3439,6 +3602,38 @@ proc emitValue2(g: var CodeGen; c: Cursor; dest: var Location) =
   else: raiseAssert "arkham a64n: emitValue2(fused) kind " & $c.kind
 
 # ── fused value core: unconverted-proc stubs (die as each case lands) ────────
+proc retypeBinDest(g: var CodeGen; rD: Reg; resTypeC: Cursor;
+                   inheritedOperand: bool): string =
+  ## Give `rD`'s nifasm binding a type the arithmetic about to run on it is legal
+  ## for, and return the named local whose ORIGINAL pointer binding must be put back
+  ## afterwards ("" when there is nothing to restore).
+  ##
+  ## nifasm does integer arithmetic on integers and on `(aptr T)` — the array
+  ## pointer, which carries an element stride — but refuses it on a `(ptr T)`: a
+  ## single-object pointer has no meaningful `+`. Leng's `+` on a `pointer` is a RAW
+  ## byte offset (`r.base + r.pos` in bif's `rStr`), so the operation wants the
+  ## generic `(i 64)` register form and the pointer binding goes back on after it.
+  ## Both rebinds are zero machine code — the register never moves.
+  result = ""
+  let rt = resolveType(g.prog, resTypeC)
+  if not isPtrType(rt):
+    let nm = g.rb.boundName(rD)
+    if g.rb.isBoundTemp(rD):
+      if inheritedOperand:                               # inherited an operand's binding
+        var rtc = resTypeC
+        g.bindTemp(rD, slotOf(g.prog, rtc))
+    elif nm.len > 0:
+      g.rebindLocalAs(nm, rD, resTypeC)
+  elif rt.typeKind != AptrT and not g.rb.isBoundTemp(rD):
+    let nm = g.rb.boundName(rD)
+    if nm.len > 0:
+      g.ab.tree RebindA64:
+        g.ab.symDef nm
+        g.ab.intType(64)
+        g.ab.reg rD
+      g.rb.rebindLocal(rD, nm, false)
+      result = nm
+
 proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED a64 binary-arith: the shared allocBin policy decided inline
   ## (Sethi–Ullman swap, dest passthrough, rhs recycling, aliasRhs), emitted
@@ -3469,6 +3664,10 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     var rdst = acc
     g.emitValue2(rhsC, rdst)                             # rhs → the accumulator
     if acc.isTemp and not g.rb.isBoundTemp(rD): g.bindTemp(rD, acc.typ)
+    # Same retype the general path does below: the accumulator may be a `(ptr …)`
+    # local (a `pointer` var whose initializer is a byte-offset add), and nifasm
+    # refuses arithmetic on a single-object pointer binding.
+    let restoreSwap = g.retypeBinDest(rD, resTypeC, inheritedOperand = false)
     var lLoc = dontCare                                  # the leaf lhs: its natural place
     if lhsMem:
       g.emitLvalue2(lhsC)                                # pick embedded base/index regs
@@ -3481,6 +3680,8 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     g.foldRhs2(foldOp, rD, lLoc, lhsC)                   # bridges serve Imm/slot/Mem lhs
     if lhsMem: g.freeLvalTemps2(lhsC)
     g.normalizeBinWidth(resTypeC, rD, op)
+    if restoreSwap.len > 0:
+      g.rebindLocalAs(restoreSwap, rD, resTypeC)         # back to its pointer type
     dest = acc
     return
   var lDest = needsReg(ScalarSlot)
@@ -3526,14 +3727,7 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
   let reusedRhs = rDest.kind == InReg and rDest.r == rD
   if res.kind == InReg and res.isTemp and not g.rb.isBoundTemp(rD):
     g.bindTemp(rD, res.typ)
-  if not isPtrType(resolveType(g.prog, resTypeC)):
-    let nm = g.rb.boundName(rD)
-    if g.rb.isBoundTemp(rD):
-      if reusedLhs or reusedRhs:                         # inherited an operand's binding
-        var rtc = resTypeC
-        g.bindTemp(rD, slotOf(g.prog, rtc))
-    elif nm.len > 0:
-      g.rebindLocalAs(nm, rD, resTypeC)
+  let restorePtr = g.retypeBinDest(rD, resTypeC, reusedLhs or reusedRhs)
   let w32 = op in {AddA64, SubA64, MulA64} and not aliasRhs and isUnsigned32(resTypeC)
   if aliasRhs:
     assert lDest.kind == InReg, "arkham a64n: aliasRhs lhs " & $lDest.kind
@@ -3558,6 +3752,8 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     g.foldRhs2(op, rD, rDest, rhsC, w32)                 # dest op= rhs
   if not w32:
     g.normalizeBinWidth(resTypeC, rD, op)
+  if restorePtr.len > 0:
+    g.rebindLocalAs(restorePtr, rD, resTypeC)            # back to its pointer type
   if not reusedRhs: g.freeVal(rDest)
   if not reusedLhs: g.freeVal(lDest)
   if resStaging != NoReg:
@@ -4190,6 +4386,16 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
     # cast re-represents (rebind/extend) in a REGISTER. Demand reg-or-imm: a
     # foldable literal stays an Imm (returned above), a memory home loads.
     iv = regOrImm(dest.typ)
+  if iv.typ.cls in {ABool, AInt, AUInt} and iv.typ.size < 8 and not isPtrType(tc) and
+     (iv.kind in {NeedsReg, RegOrImm} or
+      (iv.kind == InReg and iv.isTemp and not g.rb.isBoundTemp(iv.r))):
+    # An int↔int re-representation happens IN a register and is FINISHED by the
+    # explicit `extendTo` below, so the register that receives the source must be
+    # bound at the canonical 64-bit width. Binding it at the TARGET's narrow width
+    # instead made the move that brings the (64-bit) source in a narrowing reg→reg
+    # move — `(mov u16tmp i64local)` — which nifasm rejects, even though the very
+    # next `lsl`/`lsr` pair is what performs the narrowing.
+    iv.typ = ScalarSlot
   g.emitValue2(inner, iv)
   dest = iv
   if dest.kind == Imm: return                   # a folded constant reinterprets freely
@@ -4596,8 +4802,8 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
   var res = Location(kind: Undef)
   if not row.isVoidResult:
     case dest.kind
-    of NeedsReg, RegOrImm: dest = g.takeInstrReg(dest.typ)
-    of Undef: dest = g.takeInstrReg(ScalarSlot)
+    of NeedsReg, RegOrImm: dest = g.takeInstrReg(dest.typ, tgt.op.isAtomic)
+    of Undef: dest = g.takeInstrReg(ScalarSlot, tgt.op.isAtomic)
     else: discard
     res = dest
   let sealedHere = res.kind == InReg and not res.isTemp and not g.ra.isSealed(res.r)
@@ -4609,7 +4815,7 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
       if i >= row.evaluatedOperands: break     # trailing memory-order knobs
       # No immediate atomics on a64 (the LL/SC loops have no spare scratch to
       # materialize one — the allocator's atomicValueMayBeImm was x86-only).
-      var d = g.takeInstrReg(g.exprSlot(a))
+      var d = g.takeInstrReg(g.exprSlot(a), tgt.op.isAtomic)
       g.emitValue2(a, d)
       g.ra.locs[cursorToPosition(g.buf[], a)] = d
       ops.add d
@@ -4949,9 +5155,22 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         var lc = cc
         dst = g.asLoc(lc)
       skip cc
-      if dst.kind != InReg:
-        raiseAssert "arkham a64n: keepovf into a non-register dest not yet supported"
-      let rD = dst.r
+      # The sequence below READS `d` back to derive the overflow predicate, so the
+      # destination has to be a register. When the allocator gave it a stack home
+      # (peak pressure under `-d:release`), compute into a transient and store the
+      # result once the predicate has been built from it.
+      var rD: Reg
+      var spillDst = dontCare
+      if dst.kind == InReg:
+        rD = dst.r
+      else:
+        rD = g.pickStagingA64()
+        if rD == NoReg:
+          raiseAssert "arkham a64n: no register for the keepovf destination in proc " &
+                      g.curProcName
+        g.pickedRegs.incl rD
+        g.bindTemp(rD, ScalarSlot)
+        spillDst = dst
       # Operand values at their pre-allocated locations, then snapshots into the two
       # staging bridges — the op below may overwrite either operand's register (the
       # allocator dest-passes into `rD`, which can alias an operand home or temp).
@@ -5011,6 +5230,12 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
           g.ovfReg = rA
           g.ovfReg2 = rB
           g.ovfBridges = @[rA, rB]
+      if spillDst.kind != Undef:
+        # After the predicate — which reads `rD` — and before the `(ovf)` test,
+        # which may read it too (`OvfCmpLo`'s carry form compares `d <u a`). The
+        # store does not touch `rD`, and the test's `ovfBridges` release frees it.
+        g.storeReg2(spillDst, rD)
+        g.ovfBridges.add rD
       while cc.hasMore: skip cc
   else: raiseAssert "arkham a64n: genStmt2 " & $c.stmtKind
 

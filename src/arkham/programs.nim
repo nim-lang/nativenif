@@ -161,18 +161,27 @@ type
 # AArch64 (asm-generic unistd) number, which differ (write=1 vs 64, exit=60 vs 93).
 # `-1` in a column means "no syscall of this name on that arch" (e.g. x86-64 has
 # `open`, AArch64 only `openat`). To teach arkham a new syscall, add one row here.
+#
+# A `-1` is not a fallback: emitting it would trap with the number register set to
+# -1, i.e. a silent ENOSYS. `emitSyprocA64` rejects one outright, and std/posix
+# reaches every AArch64-missing call through the `*at` / `*2` / `clone` form the
+# kernel does have (see `linuxA64Raw` there) — so the `-1` rows below are only ever
+# selected by an x86-64 target.
 const LinuxSyscalls* = {
   "read":       (0,   63),
   "write":      (1,   64),
   "open":       (2,   -1),
-  "openat":     (-1,  56),
+  "openat":     (257, 56),
+  # std/posix reimplements opendir/readdir on top of this (DIR is a libc struct,
+  # not a kernel one), so the raw name has to resolve on both arches.
+  "getdents64": (217, 61),
   "close":      (3,   57),
   "mmap":       (9,   222),
   "munmap":     (11,  215),
   # File metadata / positioning. `stat`/`lstat` have no AArch64 syscall (the
-  # asm-generic ABI uses `fstatat`/`statx` instead), so they get -1 there — like
-  # `open` above, fine for an x86-64 target and flagged loudly if an a64 build
-  # ever reaches them.
+  # asm-generic ABI uses `fstatat`/`statx` instead), so they get -1 there — on
+  # that arch std/posix binds `newfstatat` below and does the AT_FDCWD shuffle
+  # itself (see `linuxA64Raw`), exactly as glibc's wrapper does.
   "lseek":      (8,   62),
   # `getcwd(buf, size)` fills `buf` with the cwd. NOTE: the raw syscall returns the path
   # LENGTH (>0) on success / `-errno` on error, whereas libc returns `buf` / NULL —
@@ -183,6 +192,7 @@ const LinuxSyscalls* = {
   "fstat":      (5,   80),
   "stat":       (4,   -1),
   "lstat":      (6,   -1),
+  "newfstatat": (262, 79),
   "ftruncate":  (77,  46),
   # `fallocate(fd, mode, offset, len)` — the Linux syscall glibc/musl also export
   # under that exact name, which is why posix.nim's `posix_fallocate` binds
@@ -205,9 +215,12 @@ const LinuxSyscalls* = {
   "kill":       (62,  129),
   # Process creation / replacement, used by os.execShellCmd's libc-free `system()`
   # (fork + execve of `/bin/sh -c` + wait). AArch64's asm-generic ABI has no `fork`
-  # syscall (userspace uses `clone`), so it gets -1 there — like `open`/`stat`, fine
-  # for an x86-64 target and flagged loudly if an a64 build ever reaches it.
+  # syscall — std/posix builds it from `clone` below, so a `-1` here can only be
+  # reached by an x86-64 target (`emitSyprocA64` rejects it loudly otherwise).
   "fork":       (57,  -1),
+  # AArch64's `fork()` is `clone(SIGCHLD, 0, 0, 0, 0)`; std/posix spells that out
+  # under `linuxA64Raw`. The number is the plain `clone`, not `clone3`.
+  "clone":      (56,  220),
   "execve":     (59,  221),
   # libc `waitpid(pid, status, opts)` is `wait4(pid, status, opts, rusage=NULL)`;
   # there is no bare `waitpid` syscall. posix.nim's libc-free `waitpid` wraps this
@@ -216,16 +229,22 @@ const LinuxSyscalls* = {
   # std/osproc's libc-free startProcess: a pipe per std stream, dup2 to wire the
   # child's 0/1/2, close the unused ends, optional chdir (workingDir) / setpgid
   # (poDaemon). AArch64's asm-generic ABI replaces `pipe`/`dup2` with `pipe2`/`dup3`
-  # (an extra flags arg), so they get -1 there — fine for an x86-64 target, flagged
-  # loudly on a64. (`execvp` is NOT here — it is not a syscall; posix.nim implements
-  # it on top of `execve` + a PATH scan.)
+  # (an extra flags arg), so they get -1 there and std/posix routes through the pair
+  # below. (`execvp` is NOT here — it is not a syscall; posix.nim implements it on
+  # top of `execve` + a PATH scan.)
   "pipe":       (22,  -1),
   "dup2":       (33,  -1),
+  # The AArch64 replacements for the two above (each takes an extra flags arg);
+  # std/posix routes `pipe`/`dup2` through them there.
+  "pipe2":      (293, 59),
+  "dup3":       (292, 24),
   "chdir":      (80,  49),
   "setpgid":    (109, 154),
   # getAppFilename → readlink("/proc/self/exe"). AArch64's asm-generic ABI has only
-  # `readlinkat`, so -1 there (fine for x86-64, flagged loudly on a64).
+  # `readlinkat`, so -1 there and std/posix goes through the row below.
   "readlink":   (89,  -1),
+  "readlinkat": (267, 78),
+  "symlinkat":  (266, 36),
   # std/terminal's isatty → ioctl(fd, TCGETS). Same number on both arches.
   "ioctl":      (16,  29),
   # `clock_gettime(clk_id, timespec*)` backs `std/monotimes` and `std/times`.
@@ -236,11 +255,17 @@ const LinuxSyscalls* = {
   "clock_gettime": (228, 113),
   # std/os filesystem mutators (mkdir/removeDir/removeFile/moveFile). AArch64's
   # asm-generic ABI replaced all of these with `*at` variants (mkdirat/unlinkat/
-  # renameat), so they get -1 there — fine for an x86-64 target, flagged on a64.
+  # renameat), so they get -1 there and std/posix uses the rows below.
   "mkdir":      (83,  -1),
   "rmdir":      (84,  -1),
   "unlink":     (87,  -1),
   "rename":     (82,  -1),
+  # Their AArch64 `*at` replacements. `rmdir` is `unlinkat(…, AT_REMOVEDIR)` and
+  # `mkdir`/`unlink`/`rename` take an AT_FDCWD dirfd — the shuffles live in
+  # std/posix (`linuxA64Raw`), so arkham only has to know the names.
+  "mkdirat":    (258, 34),
+  "unlinkat":   (263, 35),
+  "renameat":   (264, 38),
   # `abort` is a libc function, not a syscall. For now we lower it to the `exit`
   # syscall so a libc-free build links and terminates (it takes no args, so the exit
   # code is whatever is in the syscall's code register — abort is a cold error path).

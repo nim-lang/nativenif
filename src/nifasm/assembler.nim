@@ -477,7 +477,10 @@ type
     # initializers, so the block is just zeroed `.bss`.
     tlsBlockSym: Symbol          # the synthetic `arkham.tls.0` gvar (FS base block)
     entrySym: Symbol             # the entry proc (`_start`/`main.0`) — prologue jumps here
-    tlsEntryOffset: int          # .text offset of the synthesized FS-setup prologue, or -1
+    entryStubOffset: int          # .text offset of the synthesized ELF entry stub, or -1.
+                                  # x86-64: the FS-setup prologue (setupTls); AArch64:
+                                  # the argc/argv/envp prologue (setupLinuxA64Entry).
+                                  # Both tail-jump to `entrySym`.
     winEntryOffset: int          # .text offset of the synthesized PE entry stub, or -1
                                  # (see setupWinEntry — the Windows counterpart of the
                                  # FS-setup prologue: it supplies `main`'s arguments,
@@ -629,7 +632,8 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type
 proc parsePtrType(kind: TypeKind; n: var Cursor; scope: Scope; ctx: var GenContext): Type
 proc parseParams(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param]
 proc parseResult(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param]
-proc parseClobbers(n: var Cursor): set[x86.Register]
+proc parseClobbers(n: var Cursor; a64: var set[arm64.Register]): set[x86.Register]
+proc tagToRegisterA64(t: TagEnum; n: Cursor): arm64.Register
 proc parseExtprocSig(n: var Cursor; scope: Scope; ctx: var GenContext): Type
 proc parseUnionBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type
 proc genStmt(n: var Cursor; ctx: var GenContext)
@@ -809,7 +813,9 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
       if sig.hasResult:
         var r = sig.res; procTyp.results = parseResult(r, scope, ctx)
       if sig.hasClobber:
-        var cl = sig.clobber; procTyp.clobbers = parseClobbers(cl)
+        var cl = sig.clobber
+        procTyp.clobbers = parseClobbers(cl, procTyp.clobbersA64)
+        procTyp.hasClobberDecl = true
     result = Symbol(name: ctx.symIdOf(fullName), kind: skProc, typ: procTyp, offset: -1,
                     isForeign: true, moduleName: modname)
     ctx.rootScope.define(result)
@@ -906,7 +912,9 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
       if sig.hasResult:
         var r = sig.res; procTyp.results = parseResult(r, scope, ctx)
       if sig.hasClobber:
-        var cl = sig.clobber; procTyp.clobbers = parseClobbers(cl)
+        var cl = sig.clobber
+        procTyp.clobbers = parseClobbers(cl, procTyp.clobbersA64)
+        procTyp.hasClobberDecl = true
     let sysNr = if c.kind == IntLit: int(getInt(c)) else: 0
     result = Symbol(name: ctx.symIdOf(fullName), kind: skSysProc, typ: procTyp, offset: sysNr,
                     isForeign: true, moduleName: modname)
@@ -1044,7 +1052,9 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
       if sig.hasResult:
         var r = sig.res; procTyp.results = parseResult(r, scope, ctx)
       if sig.hasClobber:
-        var cl = sig.clobber; procTyp.clobbers = parseClobbers(cl)
+        var cl = sig.clobber
+        procTyp.clobbers = parseClobbers(cl, procTyp.clobbersA64)
+        procTyp.hasClobberDecl = true
       result = procTyp
     of CTagId:
       # Leng character type `(c N)` — an N-bit UNSIGNED integer for the machine.
@@ -1077,14 +1087,18 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
       var ptParams: seq[Param] = @[]
       var ptResults: seq[Param] = @[]
       var ptClobbers: set[x86.Register] = {}
+      var ptClobbersA64: set[arm64.Register] = {}
+      var ptHasClobberDecl = false
       let sig = takeSig(n)
       if sig.hasParams:
         var p = sig.params; ptParams = parseParams(p, scope, ctx)
       if sig.hasResult:
         var r = sig.res; ptResults = parseResult(r, scope, ctx)
       if sig.hasClobber:
-        var cl = sig.clobber; ptClobbers = parseClobbers(cl)
-      result = Type(kind: ProcT, params: ptParams, results: ptResults, clobbers: ptClobbers)
+        var cl = sig.clobber; ptClobbers = parseClobbers(cl, ptClobbersA64)
+        ptHasClobberDecl = true
+      result = Type(kind: ProcT, params: ptParams, results: ptResults, clobbers: ptClobbers,
+                    clobbersA64: ptClobbersA64, hasClobberDecl: ptHasClobberDecl)
     else:
       error("Unknown type tag: " & $t, n)
     # Jump to the precomputed node end: this consumes any Leng type qualifiers we
@@ -1207,16 +1221,14 @@ proc parseResult(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
       let typ = parseType(n, scope, ctx)
       result.add Param(name: name, typ: typ, reg: reg)
 
-proc parseClobbers(n: var Cursor): set[x86.Register] =
-  # (clobber (rax) (rbx) ...)
+proc parseClobbers(n: var Cursor; a64: var set[arm64.Register]): set[x86.Register] =
+  # (clobber (rax) (rbx) ...) — or its AArch64 twin (clobber (x0) (x1) ...)
   if declTag(n) == ClobberD:
     loopInto n:
       if n.kind == TagLit and rawTagIsX64Reg(rawTag(n)):
         result.incl parseRegister(n)
       elif n.kind == TagLit and rawTagIsA64Reg(rawTag(n)):
-        # AArch64 clobbers describe the convention's caller-saved set. The
-        # interference model that consumes `clobbers` is x86-only (the A64 path
-        # resolves registers directly), so accept and skip them here.
+        a64.incl tagToRegisterA64(n.tag, n)
         skip n
       else:
         error("Expected register in clobber list", n)
@@ -1236,7 +1248,9 @@ proc pass1Proc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: str
   if sig.hasResult:
     var r = sig.res; procTyp.results = parseResult(r, scope, ctx)
   if sig.hasClobber:
-    var cl = sig.clobber; procTyp.clobbers = parseClobbers(cl)
+    var cl = sig.clobber
+    procTyp.clobbers = parseClobbers(cl, procTyp.clobbersA64)
+    procTyp.hasClobberDecl = true
 
   let sym = Symbol(name: ctx.symIdOf(name), kind: skProc, typ: procTyp, offset: -1,
                    moduleName: moduleName, declStart: declStart)
@@ -1261,7 +1275,9 @@ proc parseExtprocSig(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
   if sig.hasResult:
     var r = sig.res; result.results = parseResult(r, scope, ctx)
   if sig.hasClobber:
-    var cl = sig.clobber; result.clobbers = parseClobbers(cl)
+    var cl = sig.clobber
+    result.clobbers = parseClobbers(cl, result.clobbersA64)
+    result.hasClobberDecl = true
 
 proc pass1Syproc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string; declStart: int) =
   # (syproc :Name (params ...) (result ...) (clobber ...) NR) — a Linux syscall with a
@@ -1282,7 +1298,9 @@ proc pass1Syproc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: s
   if sig.hasResult:
     var r = sig.res; procTyp.results = parseResult(r, scope, ctx)
   if sig.hasClobber:
-    var cl = sig.clobber; procTyp.clobbers = parseClobbers(cl)
+    var cl = sig.clobber
+    procTyp.clobbers = parseClobbers(cl, procTyp.clobbersA64)
+    procTyp.hasClobberDecl = true
 
   if n.kind != IntLit: error("Expected syscall number in syproc", n)
   let sysNr = int(getInt(n))
@@ -2235,6 +2253,19 @@ const A64CallClobbers = {arm64.X0 .. arm64.X15}
   ## avoids by homing cross-call values in callee-saved x19–x28, and what the clobber
   ## check guards against. Matches arkham's emitted `(clobber …)` (`ConvClobbersGpr`).
 
+proc callClobbersA64(ctx: GenContext): set[arm64.Register] =
+  ## What the callee currently being `prepare`d actually destroys. The signature's
+  ## own `(clobber …)` wins when it declared one: arkham emits an EMPTY list for a
+  ## `(attr "noreturn")` callee (panic, raiseAssert, the bounds-check failure path),
+  ## because a call that never returns has no "afterwards" in which a caller could
+  ## observe the damage — and taking that at face value is what lets the allocator
+  ## keep a value in a caller-saved register across a cold guard instead of forcing
+  ## it onto a callee-saved home with the prologue push/pop that entails. A
+  ## signature that declared nothing at all falls back to the full volatile set.
+  let t = ctx.callContext.typ
+  if t != nil and t.kind == ProcT and t.hasClobberDecl: t.clobbersA64
+  else: A64CallClobbers
+
 proc genCallMarkerA64(n: var Cursor; ctx: var GenContext) =
   ## Handle (call) marker inside a prepare block - emits the actual call instruction
   if not ctx.inCall:
@@ -2246,7 +2277,7 @@ proc genCallMarkerA64(n: var Cursor; ctx: var GenContext) =
     error("Use (extcall) for external procs, not (call)", n)
 
   let sym = lookupWithAutoImport(ctx, ctx.scope, ctx.callContext.target, n)
-  ctx.clobberedA64.incl A64CallClobbers   # the call destroys every caller-saved GPR
+  ctx.clobberedA64.incl callClobbersA64(ctx)   # what the callee declares it destroys
 
   if ctx.callContext.indirect:
     # Indirect call through a function-pointer variable: load the pointer into x16
@@ -2307,7 +2338,7 @@ proc genExtcallA64(n: var Cursor; ctx: var GenContext) =
     error("Multiple call instructions in prepare block", n)
   if ctx.callContext.state == CallContextState.NormalCall:
     error("Use (call) for internal procs, not (extcall)", n)
-  ctx.clobberedA64.incl A64CallClobbers   # the call destroys every caller-saved GPR
+  ctx.clobberedA64.incl callClobbersA64(ctx)   # what the callee declares it destroys
 
   # Record call site and emit BL (will be patched to point to stub)
   let callPos = ctx.buf.data.len
@@ -2663,6 +2694,12 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
         error("Register " & $targetReg & " is already bound to variable '" &
               ctx.a64RegBindings[targetReg] & "', kill it first before reusing", n)
       ctx.a64RegBindings[targetReg] = name
+      # A fresh binding abandons a prior call's clobber — the same rule
+      # `bindRegA64` applies to `rebind`. A `(var …)` starts a NEW variable's life
+      # in the register, so whatever an earlier call destroyed there is not this
+      # variable's value. Without this a local declared after a call, in a
+      # caller-saved register, was rejected on its first read.
+      ctx.clobberedA64.excl(targetReg)
     ctx.scope.define(sym)
     return
   of NoDecl:
@@ -6829,18 +6866,18 @@ proc writeElf(a: var GenContext; outfile: string) =
   # Shorten x86 rel32 jumps to rel8 where they fit (static-ELF x64 only: no IAT
   # call-site bookkeeping to invalidate, and AArch64 forms are fixed-size). This
   # relays out `.text`, so remap every code byte-offset we still need afterwards:
-  # the gvar `lea`/`adrp` patch sites and the synthesized TLS-prologue entry.
+  # the gvar `lea`/`adrp` patch sites and the synthesized entry stub.
   # Arch-agnostic jump threading + dead-jump prune runs FIRST (both arches): it removes
   # unconditional jumps to their own fall-through and threads branch chains, which also
   # exposes more rel8 opportunities for the x64 shortener below. Both passes return an
   # old→new position map; apply them in sequence to every external code offset we track
-  # (gvar `lea`/`adrp` patch sites, the TLS-prologue entry).
+  # (gvar `lea`/`adrp` patch sites, the entry stub).
   block:
     let threadMap = threadJumps(a.buf)
     for k in 0 ..< a.gvarSites.len:
       a.gvarSites[k] = (threadMap[a.gvarSites[k][0]], a.gvarSites[k][1])
-    if a.tlsEntryOffset >= 0:
-      a.tlsEntryOffset = threadMap[a.tlsEntryOffset]
+    if a.entryStubOffset >= 0:
+      a.entryStubOffset = threadMap[a.entryStubOffset]
   block:
     # `jcc L; jmp M; L:` ⇒ `jncc M` — folds a conditional branch and its fall-through
     # unconditional jump into one branch. Pattern detection is arch-agnostic (runs on
@@ -6848,14 +6885,14 @@ proc writeElf(a: var GenContext; outfile: string) =
     let invMap = invertCondJumps(a.buf)
     for k in 0 ..< a.gvarSites.len:
       a.gvarSites[k] = (invMap[a.gvarSites[k][0]], a.gvarSites[k][1])
-    if a.tlsEntryOffset >= 0:
-      a.tlsEntryOffset = invMap[a.tlsEntryOffset]
+    if a.entryStubOffset >= 0:
+      a.entryStubOffset = invMap[a.entryStubOffset]
   if a.arch == Arch.X64:
     let posMap = shortenX64Jumps(a.buf)
     for k in 0 ..< a.gvarSites.len:
       a.gvarSites[k] = (posMap[a.gvarSites[k][0]], a.gvarSites[k][1])
-    if a.tlsEntryOffset >= 0:
-      a.tlsEntryOffset = posMap[a.tlsEntryOffset]
+    if a.entryStubOffset >= 0:
+      a.entryStubOffset = posMap[a.entryStubOffset]
   when defined(arkhamDbgReloc):
     block validateRelocs:
       var defined = initHashSet[int]()
@@ -6907,10 +6944,11 @@ proc writeElf(a: var GenContext; outfile: string) =
   let textFileSize = headersSize.uint64 + code.len.uint64  # Headers + code
   let textMemSize = (textFileSize + pageSize - 1) and not (pageSize - 1)
 
-  # Entry point is after the headers. When nifasm synthesized a TLS-setup prologue
-  # (see setupTls) it becomes the real entry — it sets the FS base then jumps to the
+  # Entry point is after the headers. When nifasm synthesized an entry stub — the
+  # x86-64 FS-setup prologue (`setupTls`) or the AArch64 argc/argv/envp prologue
+  # (`setupLinuxA64Entry`) — that stub is the real entry and tail-jumps to the
   # program's entry proc; otherwise the entry is the first byte of code (offset 0).
-  let entryOff = if a.tlsEntryOffset >= 0: a.tlsEntryOffset.uint64 else: 0'u64
+  let entryOff = if a.entryStubOffset >= 0: a.entryStubOffset.uint64 else: 0'u64
   let entryAddr = baseAddr + headersSize.uint64 + entryOff
 
   # .bss section comes after .text in memory
@@ -7599,6 +7637,36 @@ proc setupWinEntry(ctx: var GenContext) =
   x86.emitMovImmToReg(ctx.buf.data, x86.RDX, 0)             # envp = nil
   x86.emitJmp(ctx.buf, LabelId(ctx.entrySym.offset))        # → real entry
 
+proc setupLinuxA64Entry(ctx: var GenContext) =
+  ## Synthesize the AArch64/Linux entry stub — the counterpart of `setupTls`'s
+  ## argc/argv tail on x86-64.
+  ##
+  ## arkham's `main.0` has the C signature `main(argc, argv, envp)` and reads the
+  ## three from x0/x1/x2 straight into the `cmdCount`/`cmdLine`/`nimEnviron` globals
+  ## that `std/cmdline` and `std/envvars` are built on. The kernel does NOT put them
+  ## in registers: at process entry SP points at the argument block — argc is the
+  ## word at [sp], argv[0] follows at [sp+8] — and the registers are undefined. With
+  ## no stub the ELF entry was `main.0` itself, so `cmdCount` took whatever x0 held
+  ## and `paramCount()` reported -1 (argc 0 ⇒ count = argc-1).
+  ##
+  ## Unlike x86-64 this is unconditional: AArch64 needs no TLS prologue to hang the
+  ## argument setup off, so the stub exists purely for this.
+  if ctx.arch != Arch.LinuxA64 or ctx.entrySym == nil: return
+  # Same 4-alignment rule as a proc body (see `pass2Proc`): the stub is appended
+  # to a `.text` whose last bytes are a lazily emitted rodata blob of arbitrary
+  # length, and the ELF entry must land on an instruction boundary or the very
+  # first `ldr` takes SIGBUS.
+  while (ctx.buf.data.len and 3) != 0: ctx.buf.data.add 0'u8
+  ctx.entryStubOffset = ctx.buf.data.len
+  arm64.emitLdr(ctx.buf.data, arm64.X0, arm64.SP, 0'i32)      # x0 = argc
+  arm64.emitAddImm(ctx.buf.data, arm64.X1, arm64.SP, 8'u16)   # x1 = &argv[0]
+  # envp sits past argv[0..argc-1] and its NULL terminator, i.e. at &argv[argc+1]:
+  # `x2 = x1 + 8*argc + 8`. argc is a full 64-bit word on the stack even though
+  # `main` types it `(i 32)`, so the shifted add is exact.
+  arm64.emitAddShifted(ctx.buf.data, arm64.X2, arm64.X1, arm64.X0, 3'u8)
+  arm64.emitAddImm(ctx.buf.data, arm64.X2, arm64.X2, 8'u16)   # x2 = &envp[0]
+  arm64.emitB(ctx.buf, LabelId(ctx.entrySym.offset))          # → real entry
+
 proc setupTls(ctx: var GenContext) =
   ## nifasm owns the per-thread TLS. After every bundled tvar has an FS offset
   ## (`ctx.tlsOffset`), reserve the unified `arkham.tls.0` block in `.bss` (sized
@@ -7622,7 +7690,7 @@ proc setupTls(ctx: var GenContext) =
                       size: it.size)
   # Synthesize the FS-setup prologue at the end of .text — it becomes the ELF entry
   # (see writeElf) and tail-jumps to the program's real entry proc.
-  ctx.tlsEntryOffset = ctx.buf.data.len
+  ctx.entryStubOffset = ctx.buf.data.len
   let pos = x86.emitLeaRipPlaceholder(ctx.buf, x86.RSI)     # lea rsi, [rip+arkham.tls.0]
   ctx.gvarSites.add (pos, ctx.tlsBlockSym)
   x86.emitMovImmToReg(ctx.buf.data, x86.RDI, ArchSetFs)
@@ -7678,7 +7746,7 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false) =
     pendingSymbols: @[],
     generatedSymbols: initHashSet[string](),
     dedupTable: initTable[string, string](),
-    tlsEntryOffset: -1,
+    entryStubOffset: -1,
     winEntryOffset: -1,
     symMap: symMap,
     emitObj: emitObj
@@ -7738,9 +7806,11 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false) =
   processReachableSymbols(ctx)
 
   # Now that every bundled tvar has an FS offset, reserve the unified TLS block and
-  # synthesize the entry prologue that sets the FS base (x86-64).
+  # synthesize the per-target entry stub: the FS base (x86-64), zeroed arguments
+  # (Windows), the kernel's argument block (AArch64/Linux). At most one applies.
   setupTls(ctx)
   setupWinEntry(ctx)
+  setupLinuxA64Entry(ctx)
 
   if ctx.emitObj:
     # Relocatable object for the system linker (foreign `.o` / framework linking).
