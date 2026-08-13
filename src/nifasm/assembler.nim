@@ -5142,18 +5142,11 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
 
   if dest.kind == okMem:
     if op.kind == okImm:
-      # x86 supports mov r/m64, imm32 (sign extended)
+      # `mov r/m, imm32` (C7 /0), sign-extended into a 64-bit destination and
+      # SIZED like every other store here so a narrow field's neighbours survive.
       if op.immVal >= low(int32) and op.immVal <= high(int32):
-        # We need emitMov(MemoryOperand, int32)
-        # I haven't added it to x86.nim yet.
-        # But I can load to scratch? No, that clobbers.
-        # Assume immediate fits 32-bit or error?
-        # "MOV r/m64, imm32" (C7 /0)
-        # I'll assume it fits or implement `emitMov(mem, imm)`.
-        # Since I can't easily add to x86.nim right now without another round,
-        # I'll raise error for mem, imm if not supported.
-        # Wait, I can use `emitMovImmToReg` if I have a scratch register? No.
-        error("Moving immediate to memory not fully supported yet (requires emitMovImmToMem)", n)
+        x86.emitMovImmToMem(ctx.buf.data, dest.mem, int32(op.immVal),
+                            intMemAccess(dest.typ).bits)
       else:
         error("Immediate too large for memory move (must fit in 32 bits)", n)
     elif op.kind == okSsize:
