@@ -1,0 +1,38 @@
+(.nif27)
+(.indexat 0                )
+(stmts
+ (proc :bump.0
+  (params
+   (param :p.0 .
+    (ptr
+     (i 64))))
+  (i 64)
+  (pragmas)
+  (stmts
+   (var :q.0 .
+    (ptr
+     (i 64))p.0)
+   (asgn q.0
+    (add
+     (aptr
+      (i 64))q.0 8))
+   (ret
+    (deref q.0))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :a.0 .
+    (array
+     (i 64) 4)
+    .)
+   (ret
+    (conv
+     (i 32)
+     (call bump.0
+      (cast
+       (ptr
+        (i 64))
+       (addr a.0))))))))
