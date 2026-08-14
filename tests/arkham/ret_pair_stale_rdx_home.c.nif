@@ -1,0 +1,79 @@
+(.nif27)
+(stmts
+ (type :Pair.0 .
+  (object .
+   (fld :a.0 .
+    (i 64))
+   (fld :b.0 .
+    (i 64))))
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :id.0
+  (params
+   (param :v.0 .
+    (i 64)))
+  (i 64).
+  (stmts
+   (ret v.0)))
+ (proc :mk.0
+  (params
+   (param :v.0 .
+    (i 64)))
+  Pair.0
+  (pragmas)
+  (stmts
+   (ret
+    (oconstr Pair.0
+     (kv a.0 v.0)
+     (kv b.0
+      (add
+       (i 64)v.0 1))))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :n1.0 .
+    (i 64)
+    (call id.0 1))
+   (var :n2.0 .
+    (i 64)
+    (call id.0 2))
+   (var :t1.0 .
+    (i 64)
+    (add
+     (i 64)n1.0 1))
+   (var :t2.0 .
+    (i 64)
+    (add
+     (i 64)n2.0 1))
+   (var :t3.0 .
+    (i 64)
+    (add
+     (i 64)t1.0 2))
+   (var :t4.0 .
+    (i 64)
+    (add
+     (i 64)t2.0 2))
+   (var :s.0 .
+    (i 64)
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (add
+       (i 64)t1.0 t2.0)t3.0)t4.0))
+   (var :p.0 .
+    Pair.0
+    (call mk.0 s.0))
+   (call exit.0
+    (add
+     (i 64)
+     (dot p.0 a.0 0)
+     (dot p.0 b.0 0))))))(.index)
