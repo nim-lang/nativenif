@@ -5368,7 +5368,7 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
   var cc = c
   cc.into:
     let declPos = cursorToPosition(g.buf[], cc)         # SymbolDef pos (aux key, matches allocVarDecl)
-    if declPos in g.fuseCondDecl:
+    if declPos in g.condFuse.decl:
       # The bool this declares is consumed by a fused branch and never materialized
       # (`scanCondFusions`), so it needs neither a declaration nor a register home.
       while cc.hasMore: skip cc
@@ -5657,7 +5657,7 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
     var cc = c
     cc.into:
       let asgnPos = cursorToPosition(g.buf[], c)
-      if asgnPos in g.fuseCondAsgn:
+      if asgnPos in g.condFuse.cmp:
         # `scanCondFusions` marked this: the bool is read only by the branch that
         # follows, so emit the COMPARE and stop. `emitCondE` takes the branch off the
         # flags — no `setcc`, no `and $1`, no `test`. Five instructions become two.
@@ -5669,10 +5669,10 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
           aC = op; skip op
           bC = op; skip op
           while op.hasMore: skip op
-        g.pendingCondTag[b] = g.emitScalarCmpE(aC, bC, ek, whenTrue = true)
+        g.condFuse.tag[b] = g.emitScalarCmpE(aC, bC, ek, whenTrue = true)
         while cc.hasMore: skip cc
         return
-      if asgnPos in g.fuseCondCopy:
+      if asgnPos in g.condFuse.link:
         # A chain LINK: `b2 = b1` or `b2 = not b1`, both single-use. Emits nothing —
         # just move the pending tag to the new name, inverted once per `not`.
         let b2 = symName(cc); skip cc
@@ -5681,10 +5681,10 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         while t.kind == TagLit and t.exprKind == NotC:
           inc t; inc negations
         let src = symName(t)
-        var tag = g.pendingCondTag[src]
+        var tag = g.condFuse.tag[src]
         for _ in 1 .. negations: tag = invertJcc(tag)
-        g.pendingCondTag.del src
-        g.pendingCondTag[b2] = tag
+        g.condFuse.tag.del src
+        g.condFuse.tag[b2] = tag
         while cc.hasMore: skip cc
         return
       if cc.kind == Symbol:
@@ -5715,7 +5715,7 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
     # A cond fused by `scanCondFusions` has no materialized bool for `tryEmitCmov` to
     # select on — the answer is in the flags and only `emitCondE` knows how to spend it.
     let fusedSym = g.condFuseSym(c)
-    let isFused = fusedSym.len > 0 and g.pendingCondTag.hasKey(fusedSym)
+    let isFused = fusedSym.len > 0 and g.condFuse.tag.hasKey(fusedSym)
     if isFused or not g.tryEmitCmov(c):  # branchless select diamond, else fall through
       let lEnd = g.freshLabel()
       var cc = c
@@ -6371,7 +6371,7 @@ proc scanCondFusions(g: var CodeGen; body: Cursor) =
   ## flags, and because this pass only fuses when every statement between the two
   ## emits no machine code: an unreferenced `(lab …)`, a value-less declaration, a
   ## `(scope …)` boundary (whose `(kill …)`s are metadata).
-  g.fuseCondAsgn.clear(); g.fuseCondDecl.clear(); g.fuseCondCopy.clear()
+  g.condFuse.resetPlan()
   # Referenced labels first: a `(lab :L)` that some `(jmp L)` targets is a JOIN, so
   # the flags arriving there are whatever the other path left.
   var jumpTargets = initHashSet[string]()
@@ -6488,10 +6488,10 @@ proc scanCondFusions(g: var CodeGen; body: Cursor) =
         of IfS:
           let s = g.condFuseSym(c)
           if s.len > 0 and s == pendingSym:
-            g.fuseCondAsgn.incl pendingPos
-            for p in copyPos: g.fuseCondCopy.incl p
+            g.condFuse.cmp.incl pendingPos
+            for p in copyPos: g.condFuse.link.incl p
             for nm in chainDecls:
-              if declPos.hasKey(nm): g.fuseCondDecl.incl declPos[nm]
+              if declPos.hasKey(nm): g.condFuse.decl.incl declPos[nm]
           else:
             when defined(arkhamFuseDbg):
               if s.len > 0:
@@ -6620,15 +6620,15 @@ proc emitCondE(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
       return
     let tag = g.emitScalarCmpE(aC, bC, ek, whenTrue)
     g.emJcc(tag, toLabel)
-  elif c.kind == Symbol and g.pendingCondTag.hasKey(symName(c)):
+  elif c.kind == Symbol and g.condFuse.tag.hasKey(symName(c)):
     # `scanCondFusions` proved this bool has one def and one use, that its defining
     # compare has already run, and that nothing since has emitted a single machine
     # instruction. The flags still hold the answer — take the branch straight off
     # them and never materialize the 0/1 at all.
     let nm = symName(c)
-    let tag = g.pendingCondTag[nm]
+    let tag = g.condFuse.tag[nm]
     g.emJcc((if whenTrue: tag else: invertJcc(tag)), toLabel)
-    g.pendingCondTag.del nm
+    g.condFuse.tag.del nm
   else:
     var v = needsReg(ScalarSlot)
     g.emitValue2(c, v)
@@ -8338,7 +8338,7 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
     # it false there; the Windows entry returns like any other proc.
     g.tailStmt = not info.isEntry or g.prog.windows
     if c.stmtKind == StmtsS:
-      g.pendingCondTag.clear()
+      g.condFuse.tag.clear()
       g.scanCondFusions(c)
       g.genStmt2(c)
     while c.hasMore: skip c

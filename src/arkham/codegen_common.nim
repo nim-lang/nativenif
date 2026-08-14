@@ -41,6 +41,40 @@ type
     isPtr*: bool                             ## else `emRegLocalVar`'s rule: a pointer keeps its
     typ*: Cursor                             ## declared `(ptr T)`, everything else is `(i 64)`
 
+  CondFusion* = object
+    ## The bool that is never materialised: `(asgn b <cmp>)` … `(if b …)` emits the
+    ## compare, skips the `setcc`/`and $1` that would build `b`, and lets the branch
+    ## read the FLAGS. **328 of the 511 `setcc`+`and` sites in a nifbench build are
+    ## this shape** — hexer's inliner turning a one-expression `proc (a, b: int):
+    ## bool` into a declaration, an `(asgn b (lt …))`, a return label and a branch.
+    ##
+    ## x86-64 ONLY: `tag` is an `X64Inst` (the `jcc` that means "true"), and AArch64
+    ## has its own condition handling. `scanCondFusions` and the emitter that reads
+    ## these both live in `codegen_x64`.
+    ##
+    ## Two halves, with different lifetimes — which is why they are one object but
+    ## not one table:
+    ##  * the PLAN — `cmp` / `link` / `decl`, token positions `scanCondFusions`
+    ##    decides ONCE per proc and only reads thereafter;
+    ##  * the in-flight STATE — `tag`, written when the compare is emitted and taken
+    ##    by the branch that consumes it, live only across statements that emit no
+    ##    machine code (an unreferenced `(lab …)`, a value-less declaration, a
+    ##    `(scope …)` boundary). Reset per proc, ahead of the scan.
+    cmp*: HashSet[int]                       ## `(asgn b <cmp>)` — the compare that STAYS put
+                                             ## (moving it to the branch would name operands
+                                             ## whose scope has closed); only the ANSWER travels,
+                                             ## in the flags, which is sound because `setcc`
+                                             ## never writes them
+    link*: HashSet[int]                      ## `(asgn b2 b1)` / `(asgn b2 (not b1))` LINKS in the
+                                             ## chain: the inliner renames the bool once per
+                                             ## splice level, so the compare and the branch are
+                                             ## rarely adjacent. A link emits nothing — it re-keys
+                                             ## (and maybe inverts) the pending tag
+    decl*: HashSet[int]                      ## the matching `(var :b . bool .)` declarations —
+                                             ## nothing reads `b`, so it need not reserve a
+                                             ## register either
+    tag*: Table[string, X64Inst]             ## bool symbol → the `jcc` that means "true"
+
   CodeGen* = object
     ab*: AsmBuf
     ra*: RegAlloc
@@ -147,21 +181,9 @@ type
                                              ## with. `RegBind` keeps only the name and the
                                              ## pointer bit, and a `(rebind …)` has to name the
                                              ## same type the register was bound with.
-    fuseCondAsgn*: HashSet[int]              ## token positions of `(asgn b <cmp>)` statements
-                                             ## whose bool is consumed ONLY by the branch that
-                                             ## follows: emit the compare, skip the `setcc`/
-                                             ## `and $1`, and let the branch read the FLAGS.
-    fuseCondCopy*: HashSet[int]              ## token positions of `(asgn b2 b1)` / `(asgn b2 (not b1))`
-                                             ## LINKS in such a chain: hexer's inliner renames the
-                                             ## bool once per splice level, so the compare and the
-                                             ## branch are rarely adjacent. A link emits nothing and
-                                             ## just re-keys (and maybe inverts) the pending tag.
-    fuseCondDecl*: HashSet[int]              ## token positions of the matching `(var :b . bool .)`
-                                             ## declarations — nothing reads `b`, so it need not
-                                             ## reserve a register either.
-    pendingCondTag*: Table[string, X64Inst]  ## bool symbol → the `jcc` that means "true", set by
-                                             ## the fused `(asgn …)` and consumed by `emitCondE`.
-                                             ## Live only across statements that emit no code.
+    condFuse*: CondFusion                    ## x64: the compare-into-branch fusion — its plan
+                                             ## (which statement positions to skip) and the
+                                             ## pending flags tag. See `CondFusion`.
     postDivergeBinds*: seq[tuple[r: Reg, name: string]]
                                              ## bindings on CALLER-SAVED registers that
                                              ## `restoreBindings` re-established after a diverging
@@ -271,6 +293,14 @@ type
     asmInfo*: string                          ## last `file(line, col)` seen while walking an
                                               ## `.assembler` body: the fallback location for a
                                               ## rejection on a node with no line info of its own
+
+proc resetPlan*(cf: var CondFusion) {.inline.} =
+  ## Drop the previous proc's fusion PLAN, ahead of `scanCondFusions` deciding this
+  ## one's. Deliberately not `tag`: that is emit-time state with its own reset, and
+  ## clearing it here would tie two different lifetimes to one call.
+  cf.cmp.clear()
+  cf.link.clear()
+  cf.decl.clear()
 
 # ── user-facing diagnostics ─────────────────────────────────────────────────
 # Most of arkham's internal consistency checks are `raiseAssert`s: they can only
