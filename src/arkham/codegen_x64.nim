@@ -6022,6 +6022,16 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     # by the marshaller — so only a temp is asserted.
     if g.rb.isBoundTemp(g.md.shiftCountReg):
       raiseAssert "arkham: variable shift while the count register holds a live value"
+    # A `ShiftRegOk` home in rcx is interval-proved DEAD here, but "dead" is arkham's
+    # word: nifasm still sees the NAME bound to the register, so `emitValue2` writes
+    # the count out under that name — at that name's type. `rawLineInfo` homes a
+    # `(ptr (u 32))` there and then shifts by 14: `(mov `cse.1 14)`, rejected as
+    # "cannot store the non-zero integer 14 into the pointer-typed destination".
+    # Retire the binding so the count lands in a raw `(rcx)` instead. Exactly what
+    # the div/mod path does for rdx (see `releaseStaleName` there) — this side was
+    # missing it, and only register pressure high enough to home a local in rcx at
+    # all made the difference visible.
+    g.releaseStaleName(g.md.shiftCountReg)
     rDest = regLoc(g.md.shiftCountReg, ScalarSlot)
   g.emitValue2(rhsC, rDest)                              # rhs → wherever (may stay imm/home)
   if lSeal: g.ra.unseal {lDest.r}                        # the partial is consumed below
