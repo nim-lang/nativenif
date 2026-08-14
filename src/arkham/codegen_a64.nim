@@ -24,6 +24,8 @@ import nifcore, nifcdecl
 import slots, machine, analyser, register_allocator, programs
 import asmbuf
 import codegen_common
+from arm64 import isLogicalImm   # nifasm: the bitmask-immediate predicate, so
+                                 # arkham folds exactly the constants it can encode
 import stress
 
 let aarch64MachineA = stressed(aarch64MachineN)
@@ -2264,6 +2266,14 @@ proc binA64Op(g: var CodeGen; c: Cursor): A64Inst =
   of BitxorC: EorA64
   else: raiseAssert "arkham a64n: binA64Op " & $c.exprKind
 
+proc isLogicalImmA64(v: int64): bool =
+  ## Is `v` an AArch64 "bitmask immediate" — the form `and`/`orr`/`eor` take
+  ## directly? Every bitfield mask is one (0xff, 0xf, 0x1ff, 0x3fff, …), so this
+  ## is the difference between `and x, y, #0xff` and materializing the constant
+  ## into a register first. nifasm owns the encoding; this only has to agree with
+  ## it on WHICH values are representable, and it answers with the same routine.
+  arm64.isLogicalImm(cast[uint64](v))
+
 proc foldRhs2(g: var CodeGen; op: A64Inst; dest: Reg; rhsLoc: Location; rhsC: Cursor;
               w32 = false) =
   ## `dest = dest op rhs`, materializing the rhs as a64 needs (no memory operand; a
@@ -2283,6 +2293,8 @@ proc foldRhs2(g: var CodeGen; op: A64Inst; dest: Reg; rhsLoc: Location; rhsC: Cu
       var t = rhsLoc.ival
       while t > 1: (t = t shr 1; inc k)
       g.binImm(LslA64, dest, k)
+    elif op in {AndA64, OrrA64, EorA64} and isLogicalImmA64(rhsLoc.ival):
+      g.binImm(op, dest, rhsLoc.ival)
     else:
       let b = g.takeBridge(avoid = dest)
       g.movImm(b, rhsLoc.ival)
@@ -2317,6 +2329,8 @@ proc foldRhs3(g: var CodeGen; op: A64Inst; dest, rn: Reg; rhsLoc: Location; rhsC
       var t = rhsLoc.ival
       while t > 1: (t = t shr 1; inc k)
       g.binImm3(LslA64, dest, rn, k)
+    elif op in {AndA64, OrrA64, EorA64} and isLogicalImmA64(rhsLoc.ival):
+      g.binImm3(op, dest, rn, rhsLoc.ival)
     else:
       let b = g.takeBridge(avoid = dest)
       g.movImm(b, rhsLoc.ival)

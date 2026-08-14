@@ -1867,8 +1867,22 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
           # index before the multiply; X16 keeps the index intact, so `scratch==idx` stays
           # correct (`scratch = idx*stride` reads idx, writes scratch). X16/X17 are never
           # allocated by arkham, so this can't collide with base/index/scratch.
-          arm64.emitMovImm64(ctx.buf.data, arm64.X16, uint64(stride))
-          arm64.emitMul(ctx.buf.data, scratchReg, indexOp.reg, arm64.X16) # scratch = idx*stride
+          # A power-of-two stride — which every aggregate whose size the layout rounded
+          # up is — is a SHIFT, so it needs neither the constant nor the multiply:
+          # `lsl scratch, idx, #k` replaces `mov x16,#stride; mul scratch, idx, x16`.
+          # This is the 3-operand `(at …)` used for a non-scale element size, i.e. an
+          # ADDRESS computation inside a loop, so the pair was paying twice over.
+          if stride > 0 and (stride and (stride - 1)) == 0:
+            var k = 0'u8
+            var t = stride
+            while t > 1: (t = t shr 1; inc k)
+            if k == 0:
+              arm64.emitMov(ctx.buf.data, scratchReg, indexOp.reg)      # stride 1
+            else:
+              arm64.emitLslImm(ctx.buf.data, scratchReg, indexOp.reg, k)
+          else:
+            arm64.emitMovImm64(ctx.buf.data, arm64.X16, uint64(stride))
+            arm64.emitMul(ctx.buf.data, scratchReg, indexOp.reg, arm64.X16) # scratch = idx*stride
           # scratch = base + that. A SP base (a stack array) needs the EXTENDED-register
           # ADD — the shifted-register `emitAdd` would read register 31 as XZR, not SP,
           # zeroing the base (→ a wild address). Other bases use the plain register ADD.
@@ -3142,7 +3156,15 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseCompatible(dest.typ, op.typ, "and", start)
     if dest.kind == okMem: error("AND to memory not supported yet", n)
     else:
-      if op.kind == okImm: error("AND immediate not supported yet", n)
+      if op.kind == okImm:
+        # AArch64 takes the mask directly when it is a "bitmask immediate" — which
+        # every bitfield mask is. Otherwise it has to reach a register; X17 is the
+        # assembler's own scratch (never allocated by arkham), same as `add3` above.
+        if arm64.isLogicalImm(cast[uint64](op.immVal)):
+          arm64.emitAndImm(ctx.buf.data, dest.reg, dest.reg, cast[uint64](op.immVal))
+        else:
+          arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](op.immVal))
+          arm64.emitAnd(ctx.buf.data, dest.reg, dest.reg, arm64.X17)
       elif op.kind == okMem: error("AND from memory not supported yet", n)
       else:
         arm64.emitAnd(ctx.buf.data, dest.reg, dest.reg, op.reg)
@@ -3156,7 +3178,15 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseCompatible(dest.typ, op.typ, "orr", start)
     if dest.kind == okMem: error("ORR to memory not supported yet", n)
     else:
-      if op.kind == okImm: error("ORR immediate not supported yet", n)
+      if op.kind == okImm:
+        # AArch64 takes the mask directly when it is a "bitmask immediate" — which
+        # every bitfield mask is. Otherwise it has to reach a register; X17 is the
+        # assembler's own scratch (never allocated by arkham), same as `add3` above.
+        if arm64.isLogicalImm(cast[uint64](op.immVal)):
+          arm64.emitOrrImm(ctx.buf.data, dest.reg, dest.reg, cast[uint64](op.immVal))
+        else:
+          arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](op.immVal))
+          arm64.emitOrr(ctx.buf.data, dest.reg, dest.reg, arm64.X17)
       elif op.kind == okMem: error("ORR from memory not supported yet", n)
       else:
         arm64.emitOrr(ctx.buf.data, dest.reg, dest.reg, op.reg)
@@ -3170,7 +3200,15 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseCompatible(dest.typ, op.typ, "eor", start)
     if dest.kind == okMem: error("EOR to memory not supported yet", n)
     else:
-      if op.kind == okImm: error("EOR immediate not supported yet", n)
+      if op.kind == okImm:
+        # AArch64 takes the mask directly when it is a "bitmask immediate" — which
+        # every bitfield mask is. Otherwise it has to reach a register; X17 is the
+        # assembler's own scratch (never allocated by arkham), same as `add3` above.
+        if arm64.isLogicalImm(cast[uint64](op.immVal)):
+          arm64.emitEorImm(ctx.buf.data, dest.reg, dest.reg, cast[uint64](op.immVal))
+        else:
+          arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](op.immVal))
+          arm64.emitEor(ctx.buf.data, dest.reg, dest.reg, arm64.X17)
       elif op.kind == okMem: error("EOR from memory not supported yet", n)
       else:
         arm64.emitEor(ctx.buf.data, dest.reg, dest.reg, op.reg)
@@ -3258,24 +3296,42 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "and3")
     checkBitwiseType(dstT, "and", start)
     checkBitwiseType(rm.typ, "and", start)
-    if rm.kind != okReg: error("and3 second source must be a register", n)
-    arm64.emitAnd(ctx.buf.data, rd, rn, rm.reg)
+    if rm.kind == okImm:
+      if arm64.isLogicalImm(cast[uint64](rm.immVal)):
+        arm64.emitAndImm(ctx.buf.data, rd, rn, cast[uint64](rm.immVal))
+      else:
+        arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](rm.immVal))
+        arm64.emitAnd(ctx.buf.data, rd, rn, arm64.X17)
+    elif rm.kind != okReg: error("and3 second source must be a register or immediate", n)
+    else: arm64.emitAnd(ctx.buf.data, rd, rn, rm.reg)
 
   of Orr3A64:
     inc n
     let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "orr3")
     checkBitwiseType(dstT, "orr", start)
     checkBitwiseType(rm.typ, "orr", start)
-    if rm.kind != okReg: error("orr3 second source must be a register", n)
-    arm64.emitOrr(ctx.buf.data, rd, rn, rm.reg)
+    if rm.kind == okImm:
+      if arm64.isLogicalImm(cast[uint64](rm.immVal)):
+        arm64.emitOrrImm(ctx.buf.data, rd, rn, cast[uint64](rm.immVal))
+      else:
+        arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](rm.immVal))
+        arm64.emitOrr(ctx.buf.data, rd, rn, arm64.X17)
+    elif rm.kind != okReg: error("orr3 second source must be a register or immediate", n)
+    else: arm64.emitOrr(ctx.buf.data, rd, rn, rm.reg)
 
   of Eor3A64:
     inc n
     let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "eor3")
     checkBitwiseType(dstT, "eor", start)
     checkBitwiseType(rm.typ, "eor", start)
-    if rm.kind != okReg: error("eor3 second source must be a register", n)
-    arm64.emitEor(ctx.buf.data, rd, rn, rm.reg)
+    if rm.kind == okImm:
+      if arm64.isLogicalImm(cast[uint64](rm.immVal)):
+        arm64.emitEorImm(ctx.buf.data, rd, rn, cast[uint64](rm.immVal))
+      else:
+        arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](rm.immVal))
+        arm64.emitEor(ctx.buf.data, rd, rn, arm64.X17)
+    elif rm.kind != okReg: error("eor3 second source must be a register or immediate", n)
+    else: arm64.emitEor(ctx.buf.data, rd, rn, rm.reg)
 
   of Lsl3A64:
     inc n
