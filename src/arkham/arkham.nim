@@ -10,6 +10,7 @@
 
 import std / [parseopt, syncio, strutils]
 import nifcoreparse              # parseFromFile + nifcore
+import "../../../nimony/src/lib" / symparser   # changeModuleExt (the `.clobbers.nif` sidecar)
 import lengdecl                  # createLengTagPool
 import codegen_common            # (arkhamTempDbg: dumpTempStats)
 import codegen_a64               # AArch64 / Darwin backend
@@ -68,13 +69,21 @@ proc run(input, output, arch: string) =
   # decoding) line up across modules.
   let tags = createLengTagPool()
   var buf = parseFromFile(input, sharedTags = tags)
+  # The per-module register-footprint summary that lets the NEXT module's call sites
+  # keep values in volatiles across a call (see `ClobbersExt`). Written beside the
+  # asm-NIF; x86-64 only for now, so the AArch64 paths leave it empty and every call
+  # there keeps assuming the whole caller-saved set dies.
+  var summary = ""
   let code = case arch
-             of "x64", "x86_64", "amd64": generateX64(buf, input, tags)
-             of "win_x64", "windows_x64": generateX64(buf, input, tags, windows = true)
+             of "x64", "x86_64", "amd64": generateX64(buf, input, tags, clobberSummary = addr summary)
+             of "win_x64", "windows_x64": generateX64(buf, input, tags, windows = true,
+                                                      clobberSummary = addr summary)
              of "arm64", "aarch64", "": generateA64(buf, input, tags)
              of "linux_arm64", "linux_aarch64": generateA64(buf, input, tags, linux = true)
              else: quit("arkham: unknown --arch:" & arch, QuitFailure)
   writeFile(output, code)
+  if summary.len > 0:
+    writeFile(changeModuleExt(output, ClobbersExt), summary)
 
 proc main() =
   var input, output, arch, os, cpu = ""

@@ -297,8 +297,51 @@ proc allocStorage(b: var Builder; name: string; slot: AsmSlot; props: VarProps):
     if r == NoReg and DivRegOk in props and b.md.divRemReg != NoReg:
       r = b.takeReg(b.freeVol, [b.md.divRemReg])
   else:
-    # may be live across a real call → must be callee-saved (or stack)
-    r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
+    # Live across a call. Traditionally that means a callee-saved register (paid for
+    # with a push and a pop in a prologue that may run millions of times) or the
+    # stack. Callsite-specific clobber lists add a third, strictly cheaper home: a
+    # VOLATILE that every crossed call provably leaves alone — no crossed callee
+    # destroys it and no crossed call's argument marshalling writes it. Such a
+    # register holds the value across the call unaided, so the value is resident for
+    # its whole life and the prologue grows by nothing.
+    #
+    # Preferred over the callee-saved pool rather than a fallback behind it: as a
+    # fallback it never fired (the callee-saved pool rarely runs dry). Preferring it
+    # is also the right shape — a home with no prologue cost should beat one with —
+    # and it leaves the scarce callee-saved registers to values that have no proof.
+    #
+    # MEASURED, and the number is the point: on a whole nimsem build this removes ONE
+    # push out of 11,669, and nifbench's instruction count moves by 468 out of 7.09
+    # billion. The census (`-d:arkhamSurvDbg`) says why: 98.3 % of `sem.nim`'s 5,638
+    # cross-call values cross only calls whose callee touches everything. SysV has 9
+    # volatiles; 6 are argument registers the CALLER's own marshalling destroys, rax
+    # is the return register, and r10/r11 are the emitter's staging pool — so what a
+    # narrow clobber list can hand back is bounded by the callee being small, and the
+    # calls a long-lived value actually crosses are calls to big procs. The mechanism
+    # is right and cheap; the room for it on this ABI is not there yet.
+    #
+    # Restricted to `intLocalTempRegs` so the emitter's staging pool (r10/r11) stays
+    # out of long-lived hands. rdx/rcx are not reachable: `DivRegOk`/`ShiftRegOk` are
+    # only granted in the analyser's `not crossesCall` arm, so a cross-call value
+    # never carries them — extending that per-fixed-role interval proof to cross-call
+    # values is a separate step.
+    let surv = b.an.vars.getOrDefault(name).survivorRegs
+    if surv != {}:
+      for cand in b.md.intLocalTempRegs:
+        if cand in surv:
+          r = b.takeReg(b.freeVol, [cand])
+          if r != NoReg: break
+    when defined(arkhamSurvDbg):
+      # The census this was built on: per cross-call value, how many calls it crosses,
+      # how many of those have a WIDE (unresolved / genuinely all-touching) callee, and
+      # what is left over. On `sem.nim`: 5638 cross-call values, 98.3 % crossing only
+      # wide calls, 5 with any surviving volatile.
+      var sn = 0
+      for x in surv: inc sn
+      stderr.writeLine "SURV var=" & name & " survivors=" & $sn &
+        (if r != NoReg: " TOOK=" & $r else: "")
+    if r == NoReg:
+      r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
   if r == NoReg:
     when defined(arkhamSpillDbg):
       # How many call points does this value's interval actually cross, and how

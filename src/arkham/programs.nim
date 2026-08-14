@@ -1145,7 +1145,7 @@ proc declIsNoReturn*(decl: Cursor): bool =
       skip c
     while c.hasMore: skip c                     # body — `into` requires a full drain
 
-proc collectCallees(n: Cursor; seen: var HashSet[SymId];
+proc collectCallees*(n: Cursor; seen: var HashSet[SymId];
                     order: var seq[(SymId, string)]) =
   ## Every DIRECT call target in the subtree (`(call SYM …)`), deduped. The name
   ## is captured alongside the id because resolving the declaration needs it —
@@ -1160,6 +1160,21 @@ proc collectCallees(n: Cursor; seen: var HashSet[SymId];
   n.loopInto:
     collectCallees(n, seen, order)
     skip n
+
+proc siblingModulePath*(p: Program; suffix, ext: string): string =
+  ## `<dir-of-main>/<suffix><ext>` — the same directory scheme `loadModule` resolves
+  ## a foreign `.c.nif` through, for the sidecar files that live beside it (the
+  ## `.clobbers.nif` register-footprint summary).
+  var sc = p.scheme
+  sc.name = suffix
+  sc.ext = ext
+  result = $sc
+
+proc moduleOfSym*(p: Program; name: string): string =
+  ## The module suffix a qualified symbol belongs to, or `""` when it is local to
+  ## the module being compiled (unqualified, or qualified with our own suffix).
+  let s = splitSymName(name)
+  if s.module.len == 0 or s.module == p.scheme.name: "" else: s.module
 
 proc noReturnProcs*(p: var Program): HashSet[SymId] =
   ## Pool ids of every proc CALLED in this module whose declaration carries
