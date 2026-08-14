@@ -45,12 +45,6 @@ const DarwinLibSystem = "/usr/lib/libSystem.B.dylib"
 
 # ── low-level emit helpers ──────────────────────────────────────────────────
 
-let ScalarSlot = AsmSlot(cls: AInt, size: 8, align: 8)
-  ## Placeholder slot for a register/immediate dont-care result: no consumer of an
-  ## `InReg`/`Imm` value reads `.typ` (the old `Val` carried no type). As a scratch
-  ## binding type it carries no cursor, so `bindTemp` falls back to `(i 64)`. A `let`
-  ## (not `const`) because `AsmSlot` now holds a `Cursor`, not a compile-time value.
-
 proc bindTemp(g: var CodeGen; r: Reg; typ: AsmSlot)
 proc unbindTemp(g: var CodeGen; r: Reg)
 # Order in which a codegen-time steal looks for a victim register-local: prefer
@@ -498,9 +492,7 @@ proc bindTemp(g: var CodeGen; r: Reg; typ: AsmSlot) =
     g.ab.symDef name
     g.emBindType(typ)
     g.ab.reg r
-  let isPtr = isNilSlot(typ) or
-              (not cursorIsNil(typ.typ) and isPtrType(resolveType(g.prog, typ.typ)))
-  g.rb.bindScratch(r, name, isPtr)
+  g.rb.bindScratch(r, name, g.slotIsPointer(typ))
 
 proc unbindTemp(g: var CodeGen; r: Reg) =
   ## Release a scratch binding made by `bindTemp`: `(kill)` the name and drop the
@@ -1672,34 +1664,29 @@ proc place2(g: var CodeGen; src: Location; dest: Reg) =
       g.ab.tree GloadA64: (g.emReg dest; g.ab.sym g.prog.gvarRefName(src.name))
     else:
       # A read-only `const` (rodata label, no page-offset site): form the address, deref.
-      # The deref is typed `(ptr <globalType>)` so it yields the PRECISE type — `dest` is
-      # bound to the *value* type, so a bare `(mem dest)` would drop a pointer level
-      # (harmless for a scalar, but a POINTER const would load `object` where `(ptr
-      # object)` is wanted; nifasm is strict). Cast in the deref rather than spend a bridge.
+      # The deref is typed `(ptr <its declared type>)` so it yields the PRECISE type —
+      # `dest` is bound to the *value* type, so a bare `(mem dest)` would drop a pointer
+      # level (harmless for a scalar, but a POINTER const would load `object` where
+      # `(ptr object)` is wanted; nifasm is strict). Cast in the deref rather than spend
+      # a bridge.
       g.emAdr(dest, g.prog.gvarRefName(src.name))
+      var pt = g.prog.ptrTypeOf(g.globalDeclType(src.name))
       g.ab.tree MovA64:
         g.emReg dest
         g.ab.tree MemX:
-          if not cursorIsNil(src.typ.typ):
-            var pt = g.prog.ptrTypeOf(src.typ.typ)
-            g.ab.tree CastX: (g.genTypeBody(pt); g.emReg dest)
-          else:
-            g.emReg dest
+          g.ab.tree CastX: (g.genTypeBody(pt); g.emReg dest)
   of Tvar:
-    # Address, then deref — and the deref is typed `(ptr <tvarType>)` for the same
-    # reason the `const` arm above casts: `dest` is bound to the *value* type, so a
-    # bare `(mem dest)` drops a pointer level and a POINTER threadvar would load
+    # Address, then deref — and the deref is typed `(ptr <its declared type>)` for the
+    # same reason the `const` arm above casts: `dest` is bound to the *value* type, so
+    # a bare `(mem dest)` drops a pointer level and a POINTER threadvar would load
     # `object` where `(ptr object)` is wanted.
     if g.a64Linux: g.emAdr(dest, src.name)
     else: g.genTlvAddr(src.name, dest)
+    var pt = g.prog.ptrTypeOf(g.globalDeclType(src.name))
     g.ab.tree MovA64:
       g.emReg dest
       g.ab.tree MemX:
-        if not cursorIsNil(src.typ.typ):
-          var pt = g.prog.ptrTypeOf(src.typ.typ)
-          g.ab.tree CastX: (g.genTypeBody(pt); g.emReg dest)
-        else:
-          g.emReg dest
+        g.ab.tree CastX: (g.genTypeBody(pt); g.emReg dest)
   of Mem:
     let wr = g.pairFieldReg(src.cur)
     if wr != NoReg:
@@ -1724,16 +1711,15 @@ proc placeF2(g: var CodeGen; src: Location; dest: FReg; bits: int) =
     g.unbindLvalTemps2(src.cur)
   else: raiseAssert "arkham a64n: placeF2 src " & $src.kind
 
-proc addrSlotOf(g: var CodeGen; valSlot: AsmSlot): AsmSlot =
-  ## The slot for an address temp about to hold `&x`, where `x`'s own slot is
-  ## `valSlot`: `(ptr <x's type>)` whenever that type is known. The `(mem p)` deref
-  ## built on that temp then carries the PRECISE pointee type instead of nifasm's
-  ## generic `(i 64)` fallback — without which storing a pointer-typed value, or a
-  ## `(nil)`-typed one (`exc = nil` into a `ptr Exception` threadvar), into a pointer
-  ## global/threadvar is a type error (nifasm is strict). x64's `scalarMemMov` types
-  ## its store-address temp the same way.
-  if cursorIsNil(valSlot.typ): ScalarSlot
-  else: typeToSlot(g.prog.ptrTypeOf(valSlot.typ))
+proc globalAddrSlot(g: var CodeGen; name: string): AsmSlot =
+  ## The slot for an address temp about to hold `&global` / `&threadvar`:
+  ## `(ptr <its declared type>)`. The `(mem p)` deref built on that temp then carries
+  ## the PRECISE pointee type instead of nifasm's generic `(i 64)` reading — without
+  ## which storing a pointer-typed value, or a `(nil)`-typed one (`exc = nil` into a
+  ## `ptr Exception` threadvar), into a pointer global/threadvar is a type error
+  ## (nifasm is strict). x64's `scalarMemMov` types its store-address temp the same
+  ## way. The type comes from the DECLARATION, so there is no case with no answer.
+  typeToSlot(g.prog.ptrTypeOf(g.globalDeclType(name)))
 
 proc storeReg2(g: var CodeGen; dst: Location; src: Reg) =
   ## `<scalar Location dst> ← src` (integer/pointer).
@@ -1745,13 +1731,13 @@ proc storeReg2(g: var CodeGen; dst: Location; src: Reg) =
       # Fold: `adrp x17, g@PAGE ; str src, [x17, g@PAGEOFF]` — no bridge, no address `add`.
       g.ab.tree GstoreA64: (g.emReg src; g.ab.sym g.prog.gvarRefName(dst.name))
     else:
-      let b = g.takeBridge(g.addrSlotOf(dst.typ)); g.emAdr(b, g.prog.gvarRefName(dst.name))
+      let b = g.takeBridge(g.globalAddrSlot(dst.name)); g.emAdr(b, g.prog.gvarRefName(dst.name))
       g.ab.tree MovA64:
         g.ab.tree MemX: g.emReg b
         g.emReg src
       g.dropBridge b
   of Tvar:
-    let b = g.takeBridge(g.addrSlotOf(dst.typ))
+    let b = g.takeBridge(g.globalAddrSlot(dst.name))
     if g.a64Linux: g.emAdr(b, dst.name) else: g.genTlvAddr(dst.name, b)
     g.ab.tree MovA64:
       g.ab.tree MemX: g.emReg b
@@ -2957,7 +2943,7 @@ proc genFieldStore2(g: var CodeGen; dst: Location; valC: Cursor) =
       v = dontCare
       g.emitFValue2(valC, v)
     else:
-      v = needsReg(ScalarSlot)                          # single-use (allocSingleUse's shape)
+      v = needsReg(g.valueSlot(valC))                   # single-use (allocSingleUse's shape)
       g.emitValue2(valC, v)
     if v.kind == InFReg or v.typ.isFloat:               # float field
       let bits = if v.typ.size == 4: 32 else: 64
@@ -3383,7 +3369,7 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
       if fb: g.dropFBridge()
       elif fv.kind == InFReg and fv.isTemp: g.unbindFTmp(fv.f)
     else:
-      var v = needsReg(ScalarSlot)                       # single-use rhs (allocSingleUse's shape)
+      var v = needsReg(g.valueSlot(rhs))                 # single-use rhs (allocSingleUse's shape)
       g.emitValue2(rhs, v)
       var vb = NoReg
       var vr: Reg
@@ -3963,7 +3949,7 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
               not g.rb.isBoundTemp(lDest.r)
   if lSeal: g.ra.seal {lDest.r}
   var rDest = dontCare
-  if ek == DivC: rDest = needsReg(ScalarSlot)            # sdiv/udiv need a register rhs
+  if ek == DivC: rDest = needsReg(g.valueSlot(rhsC))     # sdiv/udiv need a register rhs
   g.emitValue2(rhsC, rDest)
   if lSeal: g.ra.unseal {lDest.r}                        # the partial is consumed below
   var res = dest
@@ -4035,9 +4021,9 @@ proc emitMod2(g: var CodeGen; c: Cursor; dest: var Location) =
       dvsC = cc; skip cc
       while cc.hasMore: skip cc
   let signed = isSignedType(rt)
-  var lD = needsReg(ScalarSlot)
+  var lD = needsReg(g.valueSlot(divC))
   g.emitValue2(divC, lD)
-  var rD0 = needsReg(ScalarSlot)
+  var rD0 = needsReg(g.valueSlot(dvsC))
   g.emitValue2(dvsC, rD0)
   var dvsReg: Reg
   var dvsBridge = NoReg
@@ -4450,7 +4436,7 @@ proc emitCondE(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
     let tag = g.emitScalarCmpE(aC, bC, ek, whenTrue)
     g.emBr(tag, toLabel)
     return
-  var v = needsReg(ScalarSlot)
+  var v = needsReg(g.valueSlot(c))
   g.emitValue2(c, v)
   if v.kind == InReg:
     g.ab.tree CmpA64: (g.emReg v.r; g.ab.intLit 0)
@@ -4488,12 +4474,13 @@ proc emitMemLoad2(g: var CodeGen; c: Cursor; dest: var Location) =
     if dest.kind == NamedStack and dest.spillTemp:
       g.produceIntoMem2(c, dest); return
     let res = dest
-    # A POINTER field keeps its real type, exactly as the memory path below does: a
-    # `dontCare` destination arrives as the generic `(i 64)` `ScalarSlot`, and a
-    # `(cmp thatTemp (nil))` — the null test on a `seq`'s `data` word, read out of a
-    # by-value ≤16B aggregate held in a register pair — is a type error against it.
+    # A POINTER field keeps its real type (`valueSlot`'s rule), exactly as the memory
+    # path below does: a `dontCare` destination arrives as the generic `(i 64)`
+    # `ScalarSlot`, and a `(cmp thatTemp (nil))` — the null test on a `seq`'s `data`
+    # word, read out of a by-value ≤16B aggregate held in a register pair — is a type
+    # error against it.
     var bindSlot = res.typ
-    if isPtrType(resolveType(g.prog, g.getType(c))): bindSlot = g.exprSlot(c)
+    if g.slotIsPointer(g.exprSlot(c)): bindSlot = g.exprSlot(c)
     if res.isTemp and not g.rb.isBoundTemp(res.r): g.bindTemp(res.r, bindSlot)
     if res.r != wr: g.movReg(res.r, wr)
     dest = res
@@ -4515,7 +4502,7 @@ proc emitMemLoad2(g: var CodeGen; c: Cursor; dest: var Location) =
     g.unbindLvalTemps2(c)
   else:
     var bindSlot = res.typ
-    if isPtrType(cty): bindSlot = g.exprSlot(c)
+    if g.slotIsPointer(g.exprSlot(c)): bindSlot = g.exprSlot(c)
     if res.isTemp and not g.rb.isBoundTemp(res.r): g.bindTemp(res.r, bindSlot)
     g.prematLval2(c)
     g.ab.tree MovA64:
@@ -4556,6 +4543,55 @@ proc emitAddr2(g: var CodeGen; c: Cursor; dest: var Location) =
                  doBind = res.isTemp or not g.rb.isBound(res.r))
   g.freeLvalTemps2(lv)
   dest = res
+
+proc reReprCast2(g: var CodeGen; res: var Location; inner, targetCur, tc: Cursor;
+                 isCast: bool; preRetyped: string) =
+  ## Convert the INNER value now held in register `res.r` into the cast's TARGET
+  ## representation, in place: the pointer-kind rebind, the `extendTo` shift pair
+  ## that IS the widening/narrowing, and the binding retype that records the new
+  ## type on the name.
+  ##
+  ## Split out of `emitCast2` so the SPILLED result path can run it too, staged
+  ## through the produce bridge. That path used to `return` with the conversion
+  ## never emitted — a silent miscompile, since the extend is the whole cast:
+  ## `cast[uint32](zi)` in `formatfloat.toDecimal64` kept all 64 bits whenever the
+  ## register pools happened to be dry at that expression.
+  let ptrTarget = isPtrType(tc)
+  let srcPtr = isPtrType(resolveType(g.prog, g.getType(inner)))
+  let kindChange = ptrTarget or srcPtr
+  if kindChange:
+    if res.isTemp:
+      g.bindTemp(res.r, (if ptrTarget: slotOf(g.prog, targetCur) else: ScalarSlot))
+    elif g.rb.isBoundTemp(res.r):
+      # The register is not a pool temp (a call dest-threads its argument straight
+      # into the ABI register), yet the value in it was bound as a SCRATCH `tmpN.0`.
+      # `rebindLocalAs` would drop the temp bit, and the `unbindTemp` the call path
+      # runs next then finds no scratch to kill: the name stays bound to that argument
+      # register for the rest of the proc, so the NEXT call still spells it — and
+      # `(mov <name typed (ptr void)> 7)` is a nifasm error (`rStr`, whose `min(x, 7)`
+      # follows a `copyMem(…: pointer, …)`). Retype it as the temp it is.
+      g.rebindTempAs(res.r, targetCur)
+    else:
+      let nm = g.rb.boundName(res.r)
+      if nm.len > 0: g.rebindLocalAs(nm, res.r, targetCur)
+  let (srcW, srcSigned) = g.srcWidthSigned(inner)
+  if kindChange:
+    if ptrTarget and not srcPtr and srcW < 64: g.extendTo(res.r, srcW, signed = false)
+  else:
+    let targetW = intTypeWidth(tc)
+    if srcW < targetW:
+      g.extendTo(res.r, srcW, signed = (not isCast) and srcSigned)   # widen
+    else:
+      g.extendTo(res.r, targetW, signed = isSignedType(tc))          # narrow / equal
+  # The register now holds the TARGET's value, so put the target type back on the
+  # name the pre-retype above widened. `kindChange` already did it.
+  if not kindChange:
+    if preRetyped.len > 0:
+      g.rebindLocalAs(preRetyped, res.r, targetCur)
+    elif res.isTemp:
+      if g.rb.isBoundTemp(res.r): g.rebindTempAs(res.r, targetCur)
+      else: g.bindTemp(res.r, slotOf(g.prog, targetCur))
+      res.typ = slotOf(g.prog, targetCur)
 
 proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED `(conv|cast Type inner)` — the a64 twin: bit-reinterprets use fmov,
@@ -4642,8 +4678,7 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
       if sh.kind in {InReg, NamedStack} and slotOf(g.prog, tgc).size < sh.typ.size:
         g.forceRegDestE(dest)
       elif sh.kind == InReg and dest.kind in {Undef, NeedsReg, RegOrImm} and
-           (isPtrType(tc) or (not cursorIsNil(sh.typ.typ) and
-                              isPtrType(resolveType(g.prog, sh.typ.typ)))):
+           (isPtrType(tc) or g.slotIsPointer(sh.typ)):
         # A pointer-ness change over a register-homed local, with no destination
         # of our own: without a temp the value would be threaded up in the
         # SYMBOL's home and the re-representation below would `rebindLocalAs`
@@ -4651,7 +4686,16 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
         # later use at its declared type then fails the binding checker. The
         # x64 twin carries the measured repro.
         g.forceRegDestE(dest)
-  if dest.kind in {NamedStack, Mem} and not (dest.kind == NamedStack and dest.spillTemp):
+  if dest.kind == NamedStack and dest.spillTemp:
+    # The destination is an `(s)` SPILL slot: the pools were dry when the guard above
+    # forced a register. Stage the WHOLE node through the produce bridge — that
+    # re-enters here with a fixed REGISTER destination, so the re-representation
+    # really happens — and store the converted value. Falling through instead
+    # threaded the slot down as the INNER's destination and bailed out at the
+    # spilled guard below, dropping the conversion. Same shape as the two float
+    # arms above; `produceIntoMem2`'s x16-is-free contract is the caller's, as there.
+    g.produceIntoMem2(c, dest); return
+  if dest.kind in {NamedStack, Mem}:
     # a memory-home destination: compute into a temp, re-represent, store
     var tmp = needsReg(dest.typ)
     g.emitCast2(c, tmp)
@@ -4704,45 +4748,24 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
       if tw < 64:
         dest.ival = truncateImm(dest.ival, tw, isSignedType(tc))
     return
-  if dest.kind == NamedStack and dest.spillTemp: return
+  if dest.kind == NamedStack and dest.spillTemp:
+    # The INNER settled in an `(s)` spill slot: the pools ran dry resolving it, and
+    # the value came back in memory. The re-representation is an INSTRUCTION, so it
+    # has nowhere to happen there — this used to just `return`, and the cast became
+    # a no-op. Stage it: load the slot into the produce bridge, convert, store back.
+    # x16 is free by the same argument that let it be used a moment ago: reaching
+    # here means `emitValue2` routed the inner through `produceIntoMem2`, which took
+    # and released it.
+    let s = R16
+    var rl = regLoc(s, ScalarSlot, isTemp = true)
+    g.bindTemp(s, ScalarSlot)                  # canonical 64-bit: the extend narrows
+    g.emScalarLoad(s, dest.name)
+    g.reReprCast2(rl, inner, targetCur, tc, isCast, "")
+    g.emScalarStore(dest.name, s)
+    g.unbindTemp(s)
+    return
   assert dest.kind == InReg, "arkham a64n: cast result " & $dest.kind
-  let res2 = dest
-  let ptrTarget = isPtrType(tc)
-  let srcPtr = isPtrType(resolveType(g.prog, g.getType(inner)))
-  let kindChange = ptrTarget or srcPtr
-  if kindChange:
-    if res2.isTemp:
-      g.bindTemp(res2.r, (if ptrTarget: slotOf(g.prog, targetCur) else: ScalarSlot))
-    elif g.rb.isBoundTemp(res2.r):
-      # The register is not a pool temp (a call dest-threads its argument straight
-      # into the ABI register), yet the value in it was bound as a SCRATCH `tmpN.0`.
-      # `rebindLocalAs` would drop the temp bit, and the `unbindTemp` the call path
-      # runs next then finds no scratch to kill: the name stays bound to that argument
-      # register for the rest of the proc, so the NEXT call still spells it — and
-      # `(mov <name typed (ptr void)> 7)` is a nifasm error (`rStr`, whose `min(x, 7)`
-      # follows a `copyMem(…: pointer, …)`). Retype it as the temp it is.
-      g.rebindTempAs(res2.r, targetCur)
-    else:
-      let nm = g.rb.boundName(res2.r)
-      if nm.len > 0: g.rebindLocalAs(nm, res2.r, targetCur)
-  let (srcW, srcSigned) = g.srcWidthSigned(inner)
-  if kindChange:
-    if ptrTarget and not srcPtr and srcW < 64: g.extendTo(res2.r, srcW, signed = false)
-  else:
-    let targetW = intTypeWidth(tc)
-    if srcW < targetW:
-      g.extendTo(res2.r, srcW, signed = (not isCast) and srcSigned)   # widen
-    else:
-      g.extendTo(res2.r, targetW, signed = isSignedType(tc))          # narrow / equal
-  # The register now holds the TARGET's value, so put the target type back on the
-  # name the pre-retype above widened. `kindChange` already did it.
-  if not kindChange:
-    if preRetyped.len > 0:
-      g.rebindLocalAs(preRetyped, res2.r, targetCur)
-    elif res2.isTemp:
-      if g.rb.isBoundTemp(res2.r): g.rebindTempAs(res2.r, targetCur)
-      else: g.bindTemp(res2.r, slotOf(g.prog, targetCur))
-      dest.typ = slotOf(g.prog, targetCur)
+  g.reReprCast2(dest, inner, targetCur, tc, isCast, preRetyped)
 
 proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false) =
   ## FUSED a64 call: allocCall's placements decided inline. No parking on
@@ -4949,7 +4972,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
         if g.exprSlot(a).kind == AMem:
           g.marshalStackAggrArg(a, paramName(j))
         else:
-          var aD = needsReg(ScalarSlot)
+          var aD = needsReg(g.valueSlot(a))
           g.emitValue2(a, aD)
           var srcReg: Reg
           var srcBridge = NoReg
@@ -5366,7 +5389,7 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
       let hasVal = cc.hasMore and cc.kind != DotToken
       if g.isEntryProc and g.a64Linux:
         if hasVal:
-          var d = needsReg(ScalarSlot)
+          var d = needsReg(g.valueSlot(cc))
           g.emitValue2(cc, d)
           g.place2(d, IntRet)                            # exit code → x0
           g.freeVal(d)
@@ -5410,7 +5433,7 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
     cc.into:
       let selC = cc
       let signed = not g.cmpOperandUnsigned(selC)
-      var selLoc = needsReg(ScalarSlot)                  # held across ALL range tests
+      var selLoc = needsReg(g.valueSlot(selC))           # held across ALL range tests
       g.emitValue2(cc, selLoc); skip cc
       # Pool-dry etmp slot → a bridge for the (call-free) test chain; x15 stays
       # free for cmpImm2's large-literal materialization.
@@ -5683,8 +5706,7 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool;
       # so they are declared here, in the prologue, not in the side buffer.
       for st in g.ra.spillTemps:
         if st.isFloat: g.emFloatStackVar(st.name, st.typ.size * 8)
-        elif isNilSlot(st.typ) or
-             (not cursorIsNil(st.typ.typ) and isPtrType(resolveType(g.prog, st.typ.typ))):
+        elif g.slotIsPointer(st.typ):
           g.emTypedStackVar(st.name, st.typ.typ)   # `(nil)` / `(ptr T)` slot keeps its type
         else: g.emScalarStackVar(st.name)
       g.ab.append side                            # the body

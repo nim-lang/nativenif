@@ -1,0 +1,73 @@
+(.nif27)
+(.indexat 1)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :z0.0 .
+    (u 64)4294968296)
+   (var :z1.0 .
+    (u 64)8589934692)
+   (var :z2.0 .
+    (u 64)12884902788)
+   (var :z3.0 .
+    (u 64)17179869214)
+   (var :z4.0 .
+    (u 64)21474836980)
+   (var :z5.0 .
+    (u 64)25769803801)
+   (var :z6.0 .
+    (u 64)30064771712)
+   (var :z7.0 .
+    (u 64)34359738384)
+   (var :s.0 .
+    (u 32)0)
+   (asgn s.0
+    (add
+     (u 32)
+     (add
+      (u 32)
+      (div
+       (u 32)
+       (cast
+        (u 32)z0.0)
+       (cast
+        (u 32)z1.0))
+      (div
+       (u 32)
+       (cast
+        (u 32)z2.0)
+       (cast
+        (u 32)z3.0)))
+     (add
+      (u 32)
+      (div
+       (u 32)
+       (cast
+        (u 32)z4.0)
+       (cast
+        (u 32)z5.0))
+      (div
+       (u 32)
+       (cast
+        (u 32)z6.0)
+       (cast
+        (u 32)z7.0)))))
+   (var :rc.0 .
+    (i 32)9)
+   (if
+    (elif
+     (eq s.0 100)
+     (stmts
+      (asgn rc.0 7))))
+   (call exit.0 rc.0))))(.index)
