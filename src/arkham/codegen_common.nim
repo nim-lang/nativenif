@@ -1063,16 +1063,14 @@ proc matchSelectDiamond*(g: var CodeGen; c: Cursor; sd: var SelectDiamond): bool
 
 proc selectStagingSlot*(g: var CodeGen; sd: SelectDiamond): AsmSlot =
   ## The slot for the register that stages the THEN value. It receives a COPY of DST,
-  ## so it must be bound with DST's *asm* type — and a register-homed scalar local is
-  ## declared `(i 64)` whatever its logical width (see `emRegLocalVar`, same rule in
-  ## both backends). DST's own precise slot is the wrong answer: an `enum` DST would
-  ## bind the staging register `(u 8)` and nifasm then rejects the `mov` that copies
-  ## the `(i 64)`-declared DST into it. A POINTER DST keeps its real type, which is
-  ## exactly what its declaration keeps too.
-  if not cursorIsNil(sd.dst.typ.typ) and isPtrType(resolveType(g.prog, sd.dst.typ.typ)):
-    sd.dst.typ
-  else:
-    AsmSlot(cls: AInt, size: 8, align: 8)
+  ## so it must be bound with DST's *asm* type — which is simply DST's own slot: both
+  ## backends' `emRegLocalVar` declares a register-homed local with its OWN type
+  ## (`(u 8)` stays `(u 8)`). This used to answer a flat `(i 64)` for every
+  ## non-pointer, matching the older declaration rule; once that rule changed, an
+  ## `enum`/`uint8` DST declared `(u 8)` made the `csel DST, staging, DST` against an
+  ## `(i 64)` staging register a type error (`posixToErrorCode`, whose `ErrorCode`
+  ## result the select-diamond lowering reaches).
+  sd.dst.typ
 
 # ── emit-time temp allocation (step-3 merged value core) ─────────────────────
 # The merged emitter DECIDES expression registers at the point of emission

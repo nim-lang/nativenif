@@ -1686,9 +1686,20 @@ proc place2(g: var CodeGen; src: Location; dest: Reg) =
           else:
             g.emReg dest
   of Tvar:
+    # Address, then deref — and the deref is typed `(ptr <tvarType>)` for the same
+    # reason the `const` arm above casts: `dest` is bound to the *value* type, so a
+    # bare `(mem dest)` drops a pointer level and a POINTER threadvar would load
+    # `object` where `(ptr object)` is wanted.
     if g.a64Linux: g.emAdr(dest, src.name)
     else: g.genTlvAddr(src.name, dest)
-    g.ab.tree MovA64: (g.emReg dest; g.ab.tree MemX: g.emReg dest)
+    g.ab.tree MovA64:
+      g.emReg dest
+      g.ab.tree MemX:
+        if not cursorIsNil(src.typ.typ):
+          var pt = g.prog.ptrTypeOf(src.typ.typ)
+          g.ab.tree CastX: (g.genTypeBody(pt); g.emReg dest)
+        else:
+          g.emReg dest
   of Mem:
     let wr = g.pairFieldReg(src.cur)
     if wr != NoReg:
@@ -1713,6 +1724,17 @@ proc placeF2(g: var CodeGen; src: Location; dest: FReg; bits: int) =
     g.unbindLvalTemps2(src.cur)
   else: raiseAssert "arkham a64n: placeF2 src " & $src.kind
 
+proc addrSlotOf(g: var CodeGen; valSlot: AsmSlot): AsmSlot =
+  ## The slot for an address temp about to hold `&x`, where `x`'s own slot is
+  ## `valSlot`: `(ptr <x's type>)` whenever that type is known. The `(mem p)` deref
+  ## built on that temp then carries the PRECISE pointee type instead of nifasm's
+  ## generic `(i 64)` fallback — without which storing a pointer-typed value, or a
+  ## `(nil)`-typed one (`exc = nil` into a `ptr Exception` threadvar), into a pointer
+  ## global/threadvar is a type error (nifasm is strict). x64's `scalarMemMov` types
+  ## its store-address temp the same way.
+  if cursorIsNil(valSlot.typ): ScalarSlot
+  else: typeToSlot(g.prog.ptrTypeOf(valSlot.typ))
+
 proc storeReg2(g: var CodeGen; dst: Location; src: Reg) =
   ## `<scalar Location dst> ← src` (integer/pointer).
   case dst.kind
@@ -1723,13 +1745,13 @@ proc storeReg2(g: var CodeGen; dst: Location; src: Reg) =
       # Fold: `adrp x17, g@PAGE ; str src, [x17, g@PAGEOFF]` — no bridge, no address `add`.
       g.ab.tree GstoreA64: (g.emReg src; g.ab.sym g.prog.gvarRefName(dst.name))
     else:
-      let b = g.takeBridge(); g.emAdr(b, g.prog.gvarRefName(dst.name))
+      let b = g.takeBridge(g.addrSlotOf(dst.typ)); g.emAdr(b, g.prog.gvarRefName(dst.name))
       g.ab.tree MovA64:
         g.ab.tree MemX: g.emReg b
         g.emReg src
       g.dropBridge b
   of Tvar:
-    let b = g.takeBridge()
+    let b = g.takeBridge(g.addrSlotOf(dst.typ))
     if g.a64Linux: g.emAdr(b, dst.name) else: g.genTlvAddr(dst.name, b)
     g.ab.tree MovA64:
       g.ab.tree MemX: g.emReg b
@@ -3197,9 +3219,15 @@ proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
       g.dropBridge addrR
     else:
       # src InRegPair → memory dest
-      let addrR = g.takeBridge()
-      g.bindTemp(addrR, ScalarSlot)
+      let addrR = g.takeBridge()                 # already bound by `takeBridge`
+      # A `Mem` destination's embedded base/index values — and the a64 stride scratch
+      # a non-scale element size needs — are decided by the lvalue WALK, exactly as in
+      # the general copy path below. Without it `aggrAddrLoc` re-emits the address tree
+      # with nothing reserved, and a 16-byte element (`s[i] = e` on a `seq[HashEntry]`)
+      # has no addressing scale to fold into: nifasm rejects the 2-operand `(at …)`.
+      if dst.kind == Mem: g.emitLvalue2(dst.cur)
       g.aggrAddrLoc(dst, addrR)
+      if dst.kind == Mem: g.freeLvalTemps2(dst.cur)
       for i in 0 ..< nwords:
         g.ab.tree MovA64:
           g.emWordThroughPtr(addrR, i)
@@ -3511,9 +3539,18 @@ proc produceIntoMem2(g: var CodeGen; c: Cursor; dst: Location) =
   ## instead just moves the shortage (`takeBridge` then asserts with both x14/x15
   ## already serving the address the recursion is materializing).
   let s = R16                                             # the produce bridge (IP0)
-  var d = regLoc(s, dst.typ, isTemp = true)
+  # Stage at the canonical 64-bit width for a sub-word INTEGER destination. arkham
+  # keeps every scalar full-width in a register (a narrowing is an explicit extend,
+  # never the move), the `(s)` slot is declared `(i 64)` regardless, and the store
+  # into it is sized by the SLOT either way — so this changes no machine code. Bound
+  # at the narrow destination width instead, the move that brings the value in was a
+  # narrowing reg→reg move (`(mov (u 32)bridge (u 64)zi`, `cast[uint32](zi)` spilled
+  # in `toDecimal64`), which nifasm rejects. Same rule, same reason, as `emitCast2`.
+  var slot = dst.typ
+  if slot.cls in {ABool, AInt, AUInt} and slot.size < 8: slot = ScalarSlot
+  var d = regLoc(s, slot, isTemp = true)
   g.emitValue2(c, d)
-  if not g.rb.isBoundTemp(s): g.bindTemp(s, dst.typ)      # a leaf produced raw: bind for the store
+  if not g.rb.isBoundTemp(s): g.bindTemp(s, slot)         # a leaf produced raw: bind for the store
   g.storeReg2(dst, s)
   g.unbindTemp(s)
 
@@ -4451,7 +4488,13 @@ proc emitMemLoad2(g: var CodeGen; c: Cursor; dest: var Location) =
     if dest.kind == NamedStack and dest.spillTemp:
       g.produceIntoMem2(c, dest); return
     let res = dest
-    if res.isTemp and not g.rb.isBoundTemp(res.r): g.bindTemp(res.r, res.typ)
+    # A POINTER field keeps its real type, exactly as the memory path below does: a
+    # `dontCare` destination arrives as the generic `(i 64)` `ScalarSlot`, and a
+    # `(cmp thatTemp (nil))` — the null test on a `seq`'s `data` word, read out of a
+    # by-value ≤16B aggregate held in a register pair — is a type error against it.
+    var bindSlot = res.typ
+    if isPtrType(resolveType(g.prog, g.getType(c))): bindSlot = g.exprSlot(c)
+    if res.isTemp and not g.rb.isBoundTemp(res.r): g.bindTemp(res.r, bindSlot)
     if res.r != wr: g.movReg(res.r, wr)
     dest = res
     return
@@ -4670,6 +4713,15 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
   if kindChange:
     if res2.isTemp:
       g.bindTemp(res2.r, (if ptrTarget: slotOf(g.prog, targetCur) else: ScalarSlot))
+    elif g.rb.isBoundTemp(res2.r):
+      # The register is not a pool temp (a call dest-threads its argument straight
+      # into the ABI register), yet the value in it was bound as a SCRATCH `tmpN.0`.
+      # `rebindLocalAs` would drop the temp bit, and the `unbindTemp` the call path
+      # runs next then finds no scratch to kill: the name stays bound to that argument
+      # register for the rest of the proc, so the NEXT call still spells it — and
+      # `(mov <name typed (ptr void)> 7)` is a nifasm error (`rStr`, whose `min(x, 7)`
+      # follows a `copyMem(…: pointer, …)`). Retype it as the temp it is.
+      g.rebindTempAs(res2.r, targetCur)
     else:
       let nm = g.rb.boundName(res2.r)
       if nm.len > 0: g.rebindLocalAs(nm, res2.r, targetCur)
@@ -5053,6 +5105,15 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
       g.ab.keyword (if tgt.extern: ExtcallA64 else: CallA64)
     if varArea > 0:
       g.ab.tree AddA64: (g.ab.reg SP; g.ab.intLit varArea)
+    # The call CLOBBERS every volatile register, so a scratch name still bound to an
+    # argument register is stale from here on. The general call path unbinds each one
+    # as it copies the value into its `(arg …)` slot; this path produces INTO the
+    # physical registers, so the binding has to survive until the call — but no
+    # further. Left bound, `emReg` keeps spelling it: in `memfiles.open` a `(u 16)`
+    # `mode_t` temp stayed on x2 and a later `mmap` argument came out as
+    # `(mov tmp54.0 x.2)` — an `(i 32)` into a `(u 16)` name, which nifasm rejects.
+    for i in 0 ..< intIdx: g.unbindTemp(IntArgRegs[i])
+    for i in 0 ..< fIdx: g.unbindFTmp(FloatArgRegs[i])
     if fnTargetName.len > 0:
       g.ab.tree KillA64: g.ab.sym fnTargetName
       discard g.rb.takeBinding(fnptrReg)
