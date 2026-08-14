@@ -215,6 +215,9 @@ type
                                ## every call before callsite-specific lists existed.
     volatileRegs: set[Reg]     ## the caller-saved pool of the target machine; `{}` turns
                                ## the survivor analysis off entirely.
+    divergingClobbers: set[Reg] ## registers a DIVERGING call's argument marshalling may
+                               ## write — the argument registers. Subtracted from
+                               ## `survivorRegs` for any value whose range spans one.
     callClobberAt: seq[set[Reg]] ## aligned with `callPositions`: what the call at that
                                ## position destroys. Kept parallel rather than folded into
                                ## a tuple so the existing position loops stay untouched.
@@ -824,7 +827,8 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
                   procIsClean = false;
                   noReturnCallees: HashSet[SymId] = initHashSet[SymId]();
                   callClobbers: Table[SymId, set[Reg]] = initTable[SymId, set[Reg]]();
-                  volatileRegs: set[Reg] = {}): ProcAnalysis =
+                  volatileRegs: set[Reg] = {};
+                  divergingClobbers: set[Reg] = {}): ProcAnalysis =
   ## `procDecl` is at a `(proc name params rettype pragmas body)`. `tvars` names
   ## the module's thread-locals so their uses force a call-like analysis. `buf` is the
   ## buffer `procDecl` points into (for cursor → position mapping).
@@ -835,6 +839,7 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
   var c = Context(tvars: tvars, cleanCallees: cleanCallees,
                   noReturnCallees: noReturnCallees,
                   callClobbers: callClobbers, volatileRegs: volatileRegs,
+                  divergingClobbers: divergingClobbers,
                   procIsClean: procIsClean, buf: addr buf)
   var n = procDecl
   assert n.stmtKind == ProcS
@@ -902,6 +907,20 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
       if p > lo and p <= hi:
         crossesCall = true
         if i < c.callClobberAt.len: surv = surv - c.callClobberAt[i]
+    # A DIVERGING call is not a call point — nothing after it is reachable through it,
+    # which is the whole reason `noReturnPositions` is kept apart. Its ARGUMENT
+    # MARSHALLING is still emitted, though, and that is a real write: `releaseArgDest`
+    # kills the binding on each argument register it overwrites, and arkham's binding
+    # table is linear, so a later read of a still-live value homed there falls back to
+    # a raw `(reg)` of the wrong type. nifasm catches it (`cannot store the non-zero
+    # integer … into the pointer-typed destination`, `rawLineInfo`), which is exactly
+    # the failure mode a bounds-checked leaf produces. Machine-state-wise this is pure
+    # pessimism; it is the same limitation `-d:arkhamStrictNoReturn` documents.
+    if c.divergingClobbers != {}:
+      for p in c.noReturnPositions:
+        if p > lo and p <= hi:
+          surv = surv - c.divergingClobbers
+          break
     vi.survivorRegs = surv
     when defined(arkhamStrictNoReturn):
       # EXPERIMENT: also deny `AllRegs` across a DIVERGING call. Machine-state-wise

@@ -88,6 +88,22 @@ type
                                      ## only temp reg, R10, is the staging scratch — a
                                      ## local there starves the emitter); the full temp
                                      ## pool on AArch64 (7 volatile regs, scratch to spare)
+    intCrossCallVolatiles*: seq[Reg] ## volatiles RESERVED for values that live ACROSS a
+                                     ## call, and kept out of `intLocalTempRegs` so
+                                     ## ordinary call-free locals cannot consume them.
+                                     ##
+                                     ## This is the register-class half of callsite-specific
+                                     ## clobber lists, and without it the lists have nothing
+                                     ## to report: caller and callee drew their locals from
+                                     ## the SAME preference list, so every callee destroyed
+                                     ## exactly the registers its callers wanted. Measured on
+                                     ## a whole nimsem build (3,883 procs, least fixpoint over
+                                     ## the call graph): with one shared pool r8/r9 are
+                                     ## preserved by 8 %/18 % of procs; with the pools split
+                                     ## they are preserved by 72 %/82 %, and the average
+                                     ## clobber set falls from 8.02 to 6.73 of 9.
+                                     ##
+                                     ## Empty ⇒ the split is off for that machine.
     intCalleeSaved*: seq[Reg]        ## callee-saved (locals live across a call)
     floatTempRegs*: seq[FReg]        ## caller-saved FP scratch
     floatCalleeSaved*: seq[FReg]     ## callee-saved FP regs

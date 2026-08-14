@@ -320,14 +320,15 @@ proc allocStorage(b: var Builder; name: string; slot: AsmSlot; props: VarProps):
     # calls a long-lived value actually crosses are calls to big procs. The mechanism
     # is right and cheap; the room for it on this ABI is not there yet.
     #
-    # Restricted to `intLocalTempRegs` so the emitter's staging pool (r10/r11) stays
-    # out of long-lived hands. rdx/rcx are not reachable: `DivRegOk`/`ShiftRegOk` are
-    # only granted in the analyser's `not crossesCall` arm, so a cross-call value
-    # never carries them — extending that per-fixed-role interval proof to cross-call
-    # values is a separate step.
+    # Drawn from `intCrossCallVolatiles`, which exists precisely so that ordinary
+    # call-free locals cannot consume these registers first — see its doc comment for
+    # the measurement. rdx/rcx are not reachable: `DivRegOk`/`ShiftRegOk` are only
+    # granted in the analyser's `not crossesCall` arm, so a cross-call value never
+    # carries them; extending that per-fixed-role interval proof to cross-call values
+    # is a separate step.
     let surv = b.an.vars.getOrDefault(name).survivorRegs
     if surv != {}:
-      for cand in b.md.intLocalTempRegs:
+      for cand in b.md.intCrossCallVolatiles:
         if cand in surv:
           r = b.takeReg(b.freeVol, [cand])
           if r != NoReg: break
@@ -641,6 +642,11 @@ proc callerSaveRescue(b: var Builder; name: string; slot: AsmSlot;
   # leaf param out of rdx.
   var r = NoReg
   if not b.an.clobbersBridgeReg: r = b.takeReg(b.freeVol, [b.md.stagingBridgeReg])
+  # Then the cross-call reservation: same class of value, and these are reserved for
+  # exactly it. A rescued value reaches here only when no crossed call SPARED one of
+  # them, so it pays the save/restore the survivor path avoids — still cheaper than
+  # the stack slot this falls back to.
+  if r == NoReg: r = b.takeReg(b.freeVol, b.md.intCrossCallVolatiles)
   if r == NoReg: r = b.takeReg(b.freeVol, b.md.intLocalTempRegs)
   if r == NoReg: return fallback
   b.ra.callerSaveHomes[name] = vi.freeAfter
@@ -1114,6 +1120,10 @@ proc seedPools(b: var Builder) =
   # back (which filters on `intLocalTempRegs`) can hand them to a local. A leaf param
   # that persistently occupies one is removed from this pool in `allocParams`.
   for r in b.md.intLocalTempRegs: b.freeVol.incl r
+  # …and the cross-call reservation. In the pool, but reachable only through
+  # `allocStorage`'s survivor path, so an ordinary call-free local cannot take one —
+  # that reservation is the whole point (see `MachineDesc.intCrossCallVolatiles`).
+  for r in b.md.intCrossCallVolatiles: b.freeVol.incl r
   # The fixed-role registers (rdx = div/rem, rcx = shift count) also join `freeVol`
   # so a `DivRegOk`/`ShiftRegOk` local can be homed there. They are handed out ONLY
   # via those props' candidate list in `allocStorage` (never in `intLocalTempRegs`
