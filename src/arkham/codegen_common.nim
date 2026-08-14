@@ -13,7 +13,7 @@
 ## target `MachineDesc` so the backends drive the (shared) register allocator
 ## and scratch pools from it.
 
-import std / [tables, sets, assertions, algorithm, strutils]
+import std / [tables, sets, assertions, algorithm, strutils, os]
 import symparser
 import nifcore, nifcdecl
 import slots, machinedesc, analyser, register_allocator, programs
@@ -31,6 +31,49 @@ type
     OvfSign,                                  ## overflow iff `ovfReg` is negative (signed add/sub)
     OvfCmpLo,                                 ## overflow iff `ovfReg <u ovfReg2` (unsigned carry/borrow)
     OvfNeqZero                                ## overflow iff `ovfReg != 0` (a64 mul: smulh/umulh high half)
+
+  NameBindTyp* = object
+    ## How to re-emit the TYPE of a named local/param binding. `RegBind` keeps only
+    ## the name and the pointer bit, but `(rebind :name TYPE (reg))` must name the
+    ## same type the `(var …)` declared, so the two producers record theirs here.
+    aggrSym*: SymId                          ## set ⇒ `(ptr <that type>)`, by pool id
+                                             ## (`emRegAggrPtrVar`: a pointer to an aggregate)
+    isPtr*: bool                             ## else `emRegLocalVar`'s rule: a pointer keeps its
+    typ*: Cursor                             ## declared `(ptr T)`, everything else is `(i 64)`
+
+  CondFusion* = object
+    ## The bool that is never materialised: `(asgn b <cmp>)` … `(if b …)` emits the
+    ## compare, skips the `setcc`/`and $1` that would build `b`, and lets the branch
+    ## read the FLAGS. **328 of the 511 `setcc`+`and` sites in a nifbench build are
+    ## this shape** — hexer's inliner turning a one-expression `proc (a, b: int):
+    ## bool` into a declaration, an `(asgn b (lt …))`, a return label and a branch.
+    ##
+    ## x86-64 ONLY: `tag` is an `X64Inst` (the `jcc` that means "true"), and AArch64
+    ## has its own condition handling. `scanCondFusions` and the emitter that reads
+    ## these both live in `codegen_x64`.
+    ##
+    ## Two halves, with different lifetimes — which is why they are one object but
+    ## not one table:
+    ##  * the PLAN — `cmp` / `link` / `decl`, token positions `scanCondFusions`
+    ##    decides ONCE per proc and only reads thereafter;
+    ##  * the in-flight STATE — `tag`, written when the compare is emitted and taken
+    ##    by the branch that consumes it, live only across statements that emit no
+    ##    machine code (an unreferenced `(lab …)`, a value-less declaration, a
+    ##    `(scope …)` boundary). Reset per proc, ahead of the scan.
+    cmp*: HashSet[int]                       ## `(asgn b <cmp>)` — the compare that STAYS put
+                                             ## (moving it to the branch would name operands
+                                             ## whose scope has closed); only the ANSWER travels,
+                                             ## in the flags, which is sound because `setcc`
+                                             ## never writes them
+    link*: HashSet[int]                      ## `(asgn b2 b1)` / `(asgn b2 (not b1))` LINKS in the
+                                             ## chain: the inliner renames the bool once per
+                                             ## splice level, so the compare and the branch are
+                                             ## rarely adjacent. A link emits nothing — it re-keys
+                                             ## (and maybe inverts) the pending tag
+    decl*: HashSet[int]                      ## the matching `(var :b . bool .)` declarations —
+                                             ## nothing reads `b`, so it need not reserve a
+                                             ## register either
+    tag*: Table[string, X64Inst]             ## bool symbol → the `jcc` that means "true"
 
   CodeGen* = object
     ab*: AsmBuf
@@ -90,7 +133,9 @@ type
     loopEnds*: seq[string]                   ## stack of enclosing-loop end labels (for `break`)
     retLabel2*: string                       ## value-core: shared epilogue label a mid-proc `ret` jumps to
     retLabelUsed2*: bool                     ## value-core: a `ret` jumped to retLabel2 ⇒ emit the label
-    retAggrName*: string                     ## current proc's aggregate return type (or "")
+    retAggrSym*: SymId                       ## POOL ID of the current proc's aggregate return
+                                             ## type, `NoTypeSym` when the result is not an
+                                             ## aggregate
     retIndirect*: bool                       ## return type is >16B (x8 indirect result)
     isEntryProc*: bool                       ## the proc currently emitted is the entry
     a64Linux*: bool                          ## a64 backend: target Linux/ELF (svc-based
@@ -105,7 +150,11 @@ type
                                               ## consistent as one atomic step (the historic
                                               ## Cat-1 bug source was ad-hoc partial updates).
     indirectReg*: Reg                        ## callee-saved reg holding the x8 dest pointer
-    varType*: Table[string, string]          ## aggregate var/param name → its type name
+    varType*: Table[string, SymId]           ## aggregate var/param name → the POOL ID of its
+                                             ## nominal type: the key every layout query takes
+                                             ## (`aggrLayout`/`aggrByteSize`/`lookupType`), so a
+                                             ## lookup here hands one straight on without
+                                             ## minting a name
     stackSlots*: HashSet[string]             ## names declared as a nifasm `(var :name (s) …)`
                                              ## slot, hence addressable straight off rsp. Same
                                              ## lifetime as `varType` (arkham symbol names are
@@ -132,11 +181,44 @@ type
                                              ## with. `RegBind` keeps only the name and the
                                              ## pointer bit, and a `(rebind …)` has to name the
                                              ## same type the register was bound with.
+    condFuse*: CondFusion                    ## x64: the compare-into-branch fusion — its plan
+                                             ## (which statement positions to skip) and the
+                                             ## pending flags tag. See `CondFusion`.
+    postDivergeBinds*: seq[tuple[r: Reg, name: string]]
+                                             ## bindings on CALLER-SAVED registers that
+                                             ## `restoreBindings` re-established after a diverging
+                                             ## call. Valid only until the next call that actually
+                                             ## RETURNS clobbers the register — `AllRegs` says no
+                                             ## such call is in the value's range, so killing them
+                                             ## there loses nothing and stops a stale name from
+                                             ## renaming an ABI result register.
+    nameBindTyp*: Table[string, NameBindTyp] ## the twin of `tmpBindTyp` for NAMED locals and
+                                             ## params: what type to re-emit when a binding has
+                                             ## to be re-established. Only consumer so far is
+                                             ## `restoreBindingsAfterDiverging`.
+    when defined(arkhamStagingDbg):
+      stagingLive*: seq[(Reg, string)]  ## staging registers handed out and not yet given
+                                        ## back, with the label of what asked for each
+      stagingPeak*: int                 ## the most that were ever live AT ONCE in this proc
+      stagingPeakWhat*: string          ## and which labels those were — the SHAPE to reserve for
     curProcName*: string                     ## the proc currently being emitted. arkham's input
                                              ## carries no line info, so a bare register-pressure
                                              ## or typing assert names nothing actionable; this
                                              ## pins it to one routine (same reason nifasm's
                                              ## `error` reports `in proc …`).
+    rawHomeRegs*: set[Reg]                   ## x64: the registers hosting a home that the
+                                             ## `rb` binding table CANNOT see — a param whose
+                                             ## home is written as a RAW `(reg)` and read back
+                                             ## raw for the rest of the body. These, and only
+                                             ## these, need a per-proc reservation; see
+                                             ## `regFreeForTemp`. Populated by `emitParamMoves`
+                                             ## / `emitStackParamLoadsX64` / the hidden-result
+                                             ## and stack-arg-base setup, and reset per proc.
+    narrowHomes*: bool                       ## the backend populated `rawHomeRegs` and wants
+                                             ## `regFreeForTemp` to consult it INSTEAD of the
+                                             ## whole-proc `regHoldsHome` union. x64 only —
+                                             ## a64 has not been audited for raw param homes,
+                                             ## so it keeps the coarse (safe) filter.
     argResidentParams*: seq[tuple[r: Reg, name: string]]
                                              ## x64: (arg register, bound name) for each
                                              ## `ArgResident` param (kept in its incoming reg
@@ -211,6 +293,14 @@ type
     asmInfo*: string                          ## last `file(line, col)` seen while walking an
                                               ## `.assembler` body: the fallback location for a
                                               ## rejection on a node with no line info of its own
+
+proc resetPlan*(cf: var CondFusion) {.inline.} =
+  ## Drop the previous proc's fusion PLAN, ahead of `scanCondFusions` deciding this
+  ## one's. Deliberately not `tag`: that is emit-time state with its own reset, and
+  ## clearing it here would tie two different lifetimes to one call.
+  cf.cmp.clear()
+  cf.link.clear()
+  cf.decl.clear()
 
 # ── user-facing diagnostics ─────────────────────────────────────────────────
 # Most of arkham's internal consistency checks are `raiseAssert`s: they can only
@@ -302,6 +392,15 @@ proc bindTypeDiffers*(prog: var Program; a, b: Cursor): bool =
   let pb = isPtrType(rb)
   if pa or pb: return true
   result = intTypeWidth(ra) != intTypeWidth(rb) or isSignedType(ra) != isSignedType(rb)
+  if not result:
+    # `intTypeWidth` answers 64 for anything that is not a literal `(i|u|c N)`, so
+    # every ENUM looks the same width as every other. nifasm types an enum binding
+    # by its BASE, and `(u 16)` vs `(u 8)` is exactly the mismatch that reached it:
+    # `(cast NimonyType e)` out of a `TagEnum` skipped the pre-retype in `emitCast2`
+    # and emitted a bare narrowing move. The SLOT does carry the base width.
+    var ac = a
+    var bc = b
+    result = slotOf(prog, ac).size != slotOf(prog, bc).size
 
 proc slotTypeDiffers*(prog: var Program; s: AsmSlot; t: Cursor): bool =
   ## `bindTypeDiffers` for a slot that may carry no cursor at all. A dont-care slot
@@ -360,12 +459,35 @@ proc isNilImm*(loc: Location): bool {.inline.} =
   ## A `nil` value resolved to an immediate (`p = nil`, `p == nil`): emit `(nil)`.
   loc.kind == Imm and isNilSlot(loc.typ)
 
-proc aggrByRef*(g: var CodeGen; typeName: string): bool {.inline.} =
+proc aggrByRef*(g: var CodeGen; typeSym: SymId): bool {.inline.} =
   ## SysV/AAPCS: an aggregate larger than the by-value threshold is passed AND
   ## returned by reference (a hidden pointer) instead of in registers — the single
   ## predicate behind every "by-ref vs by-value" branch (call marshalling, a
   ## call-returned-aggregate var, param moves, incoming-arg-reg counting).
-  aggrByteSize(g.prog, typeName) > g.md.aggrByRefThreshold
+  aggrByteSize(g.prog, typeSym) > g.md.aggrByRefThreshold
+
+proc emTypeSym*(g: var CodeGen; id: SymId) {.inline.} =
+  ## Emit the nominal type `id` as an asm-NIF symbol — THE boundary where a pool id
+  ## becomes text, and now the only one. The asm buffer gets its own pool
+  ## (`initAsmBuf` calls `createTokenBuf` with no `sharedPool`), so an INPUT-pool id
+  ## is meaningless there and the name has to cross as characters; `addSymUse`
+  ## re-interns it on the far side.
+  ##
+  ## Everything upstream of this call is keyed by the id: `lookupType` and the
+  ## layout API over it, `varType`, `Location.StackPtr.pointeeType` /
+  ## `Location.Field.aggrType`, `retAggrSym`. `pool.syms[]` yields `lent string`, so
+  ## the operand costs no copy.
+  g.ab.sym g.prog.pool.syms[id]
+
+proc truncateImm*(v: int64; bits: int; signed: bool): int64 {.inline.} =
+  ## Keep the low `bits` of `v`, sign-extending when `signed`. A Leng
+  ## `cast[byte](4000)` is this truncation, not a nifasm-illegal
+  ## `(mov (u 8) 4000)`.
+  if bits <= 0 or bits >= 64: return v
+  let mask = (1'i64 shl bits) - 1
+  result = v and mask
+  if signed and (result and (1'i64 shl (bits - 1))) != 0:
+    result = result or (not mask)
 
 # ── structural type / slot analysis ─────────────────────────────────────────
 
@@ -429,7 +551,7 @@ proc srcWidthSigned*(g: var CodeGen; c: Cursor): tuple[width: int, signed: bool]
   case c.kind
   of Symbol:
     let nm = symName(c)
-    let loc = g.ra.locationOfSym(nm)
+    let loc = g.ra.locationOfSym(nm, cursorToPosition(g.buf[], c))
     if loc.kind != NoLoc:
       return slotWidthSigned(loc.typ)        # a local/param: the allocator knows it
     let si = g.lookupSym(nm)                   # a global / thread-local: read its decl type
@@ -491,11 +613,13 @@ proc asLoc*(g: var CodeGen; c: var Cursor): Location =
       # A proc as a value is its address, not an lvalue; `genVal` emits the `lea`.
       raiseAssert "arkham: proc used as an lvalue: " & nm
     of scNone:
-      let loc = g.ra.locationOfSym(nm)
+      let loc = g.ra.homeOfSym(nm)
       case loc.kind
       of InReg: result = regLoc(loc.r, slot)
+      of InRegPair: result = loc
       of InFReg: result = fregLoc(loc.f, slot)
       of NamedStack: result = namedStackLoc(loc.name, slot)  # aggregate or scalar; `typ` tells apart
+      of StackPtr: result = stackPtrLoc(loc.ptrName, loc.pointeeType, slot)
       else: raiseAssert "arkham: symbol is not an lvalue: " & nm
   of TagLit:
     case c.exprKind
@@ -821,7 +945,7 @@ proc operandInReg*(g: var CodeGen; operand: Cursor; dest: Reg): bool =
   ## expression is materialized into a fresh scratch (never a live local's home).
   result = false
   if operand.kind == Symbol:
-    let loc = g.ra.locationOfSym(symName(operand))
+    let loc = g.ra.locationOfSym(symName(operand), cursorToPosition(g.buf[], operand))
     result = loc.kind == InReg and loc.r == dest
 
 # ── select-diamond recognition (shared by a64 `csel` & x64 `cmov`) ────────────
@@ -850,7 +974,7 @@ proc simpleSelectValue(g: var CodeGen; rhs: Cursor): bool =
     else: inc v                                        # descend to the wrapped value
   case v.kind
   of IntLit, UIntLit, CharLit: true
-  of Symbol: g.ra.locationOfSym(symName(v)).kind in {InReg, NamedStack}
+  of Symbol: g.ra.locationOfSym(symName(v), cursorToPosition(g.buf[], v)).kind in {InReg, NamedStack}
   else: false
 
 proc selectAsgnDstRhs(asgn: Cursor; dstName: var string; rhs: var Cursor): bool =
@@ -929,7 +1053,7 @@ proc matchSelectDiamond*(g: var CodeGen; c: Cursor; sd: var SelectDiamond): bool
   if not selectAsgnDstRhs(thenBody, thenDst, thenRhs): return false
   if not selectAsgnDstRhs(elseBody, elseDst, elseRhs): return false
   if thenDst != elseDst: return false
-  let dst = g.ra.locationOfSym(thenDst)
+  let dst = g.ra.homeOfSym(thenDst)
   if dst.kind != InReg: return false
   if not g.simpleSelectValue(thenRhs) or not g.simpleSelectValue(elseRhs): return false
   sd = SelectDiamond(ek: condC.exprKind, a: aC, b: bC, dst: dst,
@@ -971,16 +1095,147 @@ proc fregHoldsHome*(g: var CodeGen; f: FReg): bool =
   if g.ra.homesDirty: rebuildHomes(g.ra)
   f in g.ra.homeFRegs
 
+when not defined(arkhamNoNarrowHomes):
+  let nhRegs = getEnv("ARKHAM_NH_REGS", "*")
+    ## `ARKHAM_NH_REGS`: which registers the narrow filter may NEWLY admit (ones the
+    ## `regHoldsHome` union would refuse). "*" = all; otherwise a comma-separated list
+    ## of `Reg` names. Bisecting the crash down to one register inside one proc.
+  proc nhRegAllowed*(r: Reg; isHome: bool): bool =
+    if not isHome: return true            # not a home at all — nothing to decide
+    if nhRegs == "*": return true
+    for it in nhRegs.split(','):
+      if it == $r: return true
+    false
+else:
+  proc nhRegAllowed*(r: Reg; isHome: bool): bool {.inline.} = not isHome
+
 proc regFreeForTemp*(g: var CodeGen; r: Reg): bool =
   ## May the merged emitter hand `r` out as an expression temp right now? Not
   ## picked-but-unbound (the reserve→bind gap), not pinned to an in-flight call
   ## (sealed), not a live accumulator, not carrying any named binding (a local
-  ## in scope or a temp in flight), not a home. Conservative where the old
-  ## allocator was clever: a dead-but-in-scope local's home stays refused (its
-  ## binding is killed at scope exit, not at `freeAfter`) — the totality
-  ## fallback is an etmp spill, never a clobber.
-  r notin g.pickedRegs and not g.ra.isSealed(r) and not g.rb.isAccum(r) and
-    not g.rb.isBound(r) and not g.regHoldsHome(r)
+  ## in scope or a temp in flight), not a home.
+  ##
+  ## The reservation it asks about is `rawHomeRegs`, NOT the old whole-proc
+  ## `regHoldsHome` union — the union was the largest single reason a temp fell
+  ## through to a callee-saved register (`-d:arkhamTempDbg`: 3.05 of the ~5.75
+  ## volatiles refused at each fall-through, ahead of a live binding at 1.51 and the
+  ## reserve->bind gap at 1.12), and the pushes those fall-throughs cause were 3.82 %
+  ## of all executed instructions.
+  ##
+  ## Retiring it took four fixes, and each one was a place where a LIVE value sat in a
+  ## register carrying no `rb` binding, so `isBound` answered "free":
+  ##
+  ##  1. a by-reference aggregate param had NO declaration at all — its pointer was
+  ##     `mov`'d into the home and every field access named the bare register
+  ##     (`emRegAggrPtrVar` + `emPtrFieldMemSym`);
+  ##  2. a RELOCATED param's home was left unbound on purpose, "for the epilogue
+  ##     pops" — and a nimony `var T` is a plain `(ptr T)`, so that was MOST pointer
+  ##     params (`emRegLocalVar` in `emitParamMoves`; `framePop` kills before popping);
+  ##  3. the hidden indirect-result pointer (`synth("retptr.0")`);
+  ##  4. a DIVERGING call's marshalling `(kill …)`s a still-live home, because `rb` is
+  ##     linear and cannot say "this path is not taken" (`restoreBindings`).
+  ##
+  ## Raw pointer operands per nifbench build: **2956 -> 45**, and the 45 are the fixed
+  ## rdi/rsi/rdx of the self-contained `mem*` sequences, which allocate no temps.
+  ## `-d:arkhamNoNarrowHomes` restores the union; `-d:arkhamHomeAudit` prints every
+  ## register the narrow filter admits that the union would refuse, and `ARKHAM_NH` /
+  ## `ARKHAM_NH_REGS` narrow it to named procs / registers, which is how each of the
+  ## four shapes above was bisected out of a whole-program segfault.
+  result = r notin g.pickedRegs and not g.ra.isSealed(r) and not g.rb.isAccum(r) and
+    not g.rb.isBound(r) and
+    (if g.narrowHomes: r notin g.rawHomeRegs and nhRegAllowed(r, g.regHoldsHome(r))
+     else: not g.regHoldsHome(r))
+  when defined(arkhamHomeAudit):
+    # Every register the narrow filter ADMITS but the old union would have refused:
+    # each one must be a home whose symbol is provably not live here, i.e. `rb` would
+    # have told us. Printing the symbol names living there is how the missing raw-home
+    # shapes were enumerated (a `(ptr object)` param read raw is the classic one).
+    if result and g.narrowHomes and g.regHoldsHome(r):
+      var who = ""
+      for name, pos in g.ra.symPos:
+        let l = g.ra.locs[pos]
+        if l.kind == InReg and l.r == r:
+          who.add (if who.len > 0: "," else: "") & name & ":" & $l.typ.kind &
+                  (if l.typ.size > 0: "/" & $l.typ.size else: "")
+      stderr.writeLine "HOMEAUDIT " & g.curProcName & " " & $r & " admits [" & who & "]"
+
+template forEachVolatileTempCand(g: var CodeGen; r, body: untyped) =
+  ## The volatile GPRs `pickTempReg` may hand out, in preference order, BEFORE the
+  ## callee-saved fallback. `intTempRegs` is `r10` ALONE on x86-64, so the second
+  ## simultaneously-live expression temp went straight to a callee-saved register —
+  ## a push and a pop in a prologue that may run millions of times — while rdi, rsi,
+  ## r8, r9, rcx and rdx sat idle. Measured: `tokenWidth`, a CALL-FREE leaf, pushes
+  ## rbx and r12 for `tmp2`/`tmp4` with five volatiles free; its push/pop is 28.8 %
+  ## of its own executed instructions.
+  ##
+  ## SAFETY is the same class as `r10`'s, not a new one. `r10` is itself a
+  ## caller-saved register in `x64ClobbersGpr`, so "an expression temp does not
+  ## survive a call" is already a load-bearing invariant of this pool (a temp that
+  ## must outlive a call comes from `pickHeldReg`, callee-saved only). Adding more
+  ## volatiles cannot break an invariant the first candidate already relies on, and
+  ## `regFreeForTemp` still refuses anything picked, sealed (an in-flight call's
+  ## marshalling), bound, accumulating, or hosting a named home.
+  ##
+  ## The two FIXED-ROLE volatiles are the exception, and they are gated on the
+  ## analyser's whole-proc facts: rdx is destroyed by `idiv`, rcx by a variable
+  ## shift (and by `rep movs`, which only ever runs inside a call — where no temp
+  ## is live anyway). A proc that contains neither has no second use for them.
+  block:
+    for r in g.md.intTempRegs: body            # r10
+    for r in g.md.intLocalTempRegs: body       # rdi, rsi, r8, r9 — no fixed role
+    if g.md.divRemReg != NoReg and not g.ra.divRegClobbered:
+      let r = g.md.divRemReg; body
+    if g.md.shiftCountReg != NoReg and not g.ra.shiftRegClobbered:
+      let r = g.md.shiftCountReg; body
+    # R11, the staging bridge, is NOT here — TRIED AND REVERTED. Adding it last (only
+    # where the alternative is a callee-saved push and pop) looks free, because
+    # `pickStagingScratch` has a callee-saved totality backstop of its own. It is not:
+    # `tests/arkham/addr_chain_depth` then dies with "no staging register available
+    # for a late memory-load address in proc chain.0", because that backstop asks
+    # `regFreeForTemp`, which refuses every callee-saved register via `regHoldsHome`.
+    # So the union blocks the temp pool AND the staging fallback; R11 only becomes
+    # spare once register-homed params carry an `rb` binding. One root cause, two
+    # symptoms — see `regFreeForTemp`.
+
+proc tempCensus*(g: var CodeGen): string =
+  ## Why every candidate was refused, in `pickTempReg`'s own order — the temp-pool
+  ## twin of `stagingCensus`. `pickTempReg` returning `NoReg` means the register
+  ## file is FULL, and "genuinely full" and "a filter is too coarse" want opposite
+  ## fixes; only naming the refusing filter per register tells them apart.
+  result = ""
+  forEachVolatileTempCand(g, r):
+    result.add "\n    " & $r & ": "
+    if r in g.pickedRegs: result.add "picked (reserve->bind gap)"
+    elif g.ra.isSealed(r): result.add "sealed (in-flight call)"
+    elif g.rb.isAccum(r): result.add "liveAccum"
+    elif g.rb.isBound(r): result.add "bound " & g.rb.boundName(r)
+    elif g.regHoldsHome(r): result.add "HOME UNION (per-proc, not liveness)"
+    else: result.add "FREE (unreachable)"
+  for r in g.md.intCalleeSaved:
+    result.add "\n    " & $r & ": "
+    if r in g.pickedRegs: result.add "picked (reserve->bind gap)"
+    elif g.ra.isSealed(r): result.add "sealed (in-flight call)"
+    elif g.rb.isAccum(r): result.add "liveAccum"
+    elif g.rb.isBound(r): result.add "bound " & g.rb.boundName(r)
+    elif g.regHoldsHome(r): result.add "HOME UNION (per-proc, not liveness)"
+    else: result.add "FREE (unreachable)"
+
+when defined(arkhamTempDbg):
+  ## `-d:arkhamTempDbg`: when `pickTempReg` falls through the WHOLE volatile pool and
+  ## takes a callee-saved register — a push and a pop — which filter refused each
+  ## volatile? "Out of registers" and "a filter is too coarse" need opposite fixes,
+  ## and only this tells them apart. It is what showed that `regHoldsHome` (the
+  ## per-proc union) refuses 3.05 of the ~5.75 candidates at every fall-through.
+  ## `arkham.nim` calls `dumpTempStats` once per module at exit.
+  var tempRefusals*: array[5, int]   ## picked, sealed, accum, bound, home
+  var tempFallbacks*: int
+  var tempVolatileHits*: int
+  proc dumpTempStats*() =
+    stderr.writeLine "TEMPSTATS volatileHits=" & $tempVolatileHits &
+      " calleeFallbacks=" & $tempFallbacks &
+      " refusedBy picked=" & $tempRefusals[0] & " sealed=" & $tempRefusals[1] &
+      " accum=" & $tempRefusals[2] & " bound=" & $tempRefusals[3] &
+      " home=" & $tempRefusals[4]
 
 proc pickTempReg*(g: var CodeGen): Reg =
   ## An expression-temp GPR: the volatile temp pool first, then a callee-saved
@@ -989,8 +1244,20 @@ proc pickTempReg*(g: var CodeGen): Reg =
   ## candidate is live; the caller then mints a spill slot (`mintSpillName` +
   ## the backend's produce-into path), keeping temp allocation total exactly
   ## like the old `reserveTmp` fallback.
-  for r in g.md.intTempRegs:
-    if regFreeForTemp(g, r): return r
+  forEachVolatileTempCand(g, r):
+    if regFreeForTemp(g, r):
+      when defined(arkhamTempDbg): inc tempVolatileHits
+      return r
+  when defined(arkhamTempDbg):
+    # Charge each refused volatile to the FIRST filter that rejected it — the order
+    # `regFreeForTemp` itself evaluates them in.
+    inc tempFallbacks
+    forEachVolatileTempCand(g, r):
+      if r in g.pickedRegs: inc tempRefusals[0]
+      elif g.ra.isSealed(r): inc tempRefusals[1]
+      elif g.rb.isAccum(r): inc tempRefusals[2]
+      elif g.rb.isBound(r): inc tempRefusals[3]
+      elif g.regHoldsHome(r): inc tempRefusals[4]
   for r in g.md.intCalleeSaved:
     if regFreeForTemp(g, r):
       g.ra.usedCallee.incl r
@@ -1002,7 +1269,7 @@ proc tempPoolDry*(g: var CodeGen): bool =
   ## not mark a callee-saved register `usedCallee` (that would add a push/pop for
   ## a register we then decline to take). For callers that can serve a value from
   ## its existing home and only want a temp when one is genuinely free.
-  for r in g.md.intTempRegs:
+  forEachVolatileTempCand(g, r):
     if regFreeForTemp(g, r): return false
   for r in g.md.intCalleeSaved:
     if regFreeForTemp(g, r): return false
@@ -1062,19 +1329,19 @@ proc isFoldableLeafE*(g: var CodeGen; n: Cursor): bool =
   ## or a function-local symbol read (folds as its reg / stack-home operand).
   case n.kind
   of IntLit, UIntLit, CharLit: true
-  of Symbol: g.ra.locationOfSym(symName(n)).kind in {InReg, NamedStack}
+  of Symbol: g.ra.locationOfSym(symName(n), cursorToPosition(g.buf[], n)).kind in {InReg, NamedStack}
   else: false
 
 proc symInRegE*(g: var CodeGen; n: Cursor; reg: Reg): bool {.inline.} =
   ## Is `n` a symbol homed in `reg`? (Forbids a Sethi–Ullman swap whose
   ## rhs-into-dest evaluation would clobber a lhs homed in dest.)
   if n.kind != Symbol: return false
-  let h = g.ra.locationOfSym(symName(n))
+  let h = g.ra.locationOfSym(symName(n), cursorToPosition(g.buf[], n))
   h.kind == InReg and h.r == reg
 
 proc exprReadsRegImplE(g: var CodeGen; n: var Cursor; reg: Reg): bool =
   if n.kind == Symbol:
-    let h = g.ra.locationOfSym(symName(n))
+    let h = g.ra.locationOfSym(symName(n), cursorToPosition(g.buf[], n))
     inc n
     return h.kind == InReg and h.r == reg
   elif n.kind == TagLit:
@@ -1099,7 +1366,7 @@ proc lvalueGlobalBaseE*(g: var CodeGen; n: Cursor): bool =
   ## private `lvalueGlobalBase`.)
   var c = n
   case c.kind
-  of Symbol: result = g.ra.locationOfSym(symName(c)).kind == NoLoc
+  of Symbol: result = g.ra.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind == NoLoc
   of TagLit:
     case c.exprKind
     of DotC, AtC:
@@ -1156,3 +1423,61 @@ proc subtreeHasCallE*(n: Cursor): bool =
       if subtreeHasCallE(cc): return true
       skip cc
   return false
+# ── caller-save rescue (see `RegAlloc.callerSaveHomes`) ─────────────────────
+
+proc callerSaveSetAt*(g: var CodeGen): seq[tuple[reg: Reg, name: string]] =
+  ## The caller-saved locals currently BOUND to a register — the ones this call is
+  ## about to clobber. The trigger is live binding, not the coarse `freeAfter`
+  ## interval: a value live across a control-flow merge is still bound at a call in a
+  ## predecessor branch, which an interval test under-approximates. The allocator only
+  ## hands out a caller-saved home to a value that is valid wherever it is bound, so
+  ## "save whenever bound" is always well-defined. Sorted for deterministic output.
+  if g.ra.callerSaveHomes.len == 0: return
+  for reg, name in g.rb.gprBindings:
+    if g.ra.callerSaveHomes.hasKey(name):
+      result.add (reg: reg, name: name)
+  result.sort(proc (a, b: tuple[reg: Reg, name: string]): int = cmp(ord(a.reg), ord(b.reg)))
+
+type
+  CallerSaveWindow* = object
+    ## One open save window: what was stored, and the redirect table to put back when
+    ## it closes. Opened at `emitCall2` — or EARLIER by a caller that writes an ABI
+    ## register for the call itself (the hidden result pointer in rdi), which must
+    ## happen after the save or it clobbers the value it was supposed to preserve.
+    saved*: seq[tuple[reg: Reg, name: string]]
+    prevActive*: Table[string, Location]
+
+proc callerSaveSlotName*(varName: string): string {.inline.} =
+  ## ONE permanent slot per caller-saved value, declared with the value itself. A
+  ## per-call slot inside the call's own `(scope …)` does not work: the call's result
+  ## binding is created in that scope and consumed after it closes.
+  "csave." & varName
+
+proc pairFieldReg*(g: var CodeGen; c: Cursor): Reg =
+  ## If `c` is `(dot S f)` and `S` is a register-homed ≤16B by-value aggregate
+  ## whose field `f` is a full 8-byte ABI word, return that word's register.
+  ## Otherwise `NoReg` — the caller uses the memory path.
+  result = NoReg
+  if c.kind != TagLit or c.exprKind != DotC: return
+  var cc = c
+  cc.into:
+    if cc.kind != Symbol: return
+    let base = symName(cc)
+    let home = g.ra.homeOfSym(base)
+    if home.kind != InRegPair: return
+    skip cc
+    if cc.kind != Symbol: return
+    let field = symName(cc)
+    let tn = g.varType.getOrDefault(base, NoTypeSym)
+    if tn == NoTypeSym: return
+    for f in aggrLayout(g.prog, tn):
+      if f.name == field:
+        if f.size == 8 and (f.off and 7) == 0:
+          result = pairWord(home, f.off div 8)
+        return
+
+proc isFoldableMemLeaf*(g: var CodeGen; n: Cursor): bool {.inline.} =
+  ## `isMemLeaf`, except a field of a register-homed ≤16B aggregate: that field
+  ## IS a GPR, so folding it as `[mem]` would address a stack slot that does
+  ## not exist.
+  isMemLeaf(n) and g.pairFieldReg(n) == NoReg

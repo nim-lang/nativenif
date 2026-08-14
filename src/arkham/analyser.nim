@@ -106,6 +106,14 @@ type
                                 ## caller-save cost model counts how many a var crosses
     clobbersDivReg*: bool       ## body contains a div/mod → rdx is clobbered, so a
                                 ## leaf param must not be homed there (x86-64 only)
+    clobbersBridgeReg*: bool    ## body contains an `(instr …)` row whose lowering claims
+                                ## the staging bridge (x86-64 R11) as its own `work`
+                                ## register. Those rows take it DIRECTLY — sealing keeps
+                                ## the operand PICKS off it, but a value already homed
+                                ## there is simply released (`releaseStaleName`), which
+                                ## was sound only while nothing could be homed there.
+                                ## `callerSaveRescue` is the one client that may draw the
+                                ## bridge, and must not in such a proc.
     clobbersShiftReg*: bool     ## body contains a variable shift → rcx (cl) is
                                 ## clobbered, so a leaf param must not be homed there
     arg0RetConflict*: bool      ## the FIRST integer/pointer param is read in a `(ret …)`
@@ -147,6 +155,17 @@ type
 
   Context = object
     inLoops, inAddr, inAsgnTarget, inArrayIndex: int
+    inCold: int                ## depth of enclosing COLD blocks: a branch body that ends
+                               ## in a diverging call (`panic`, `raiseIndexError3`, an
+                               ## `assert`'s failure arm). Every bounds check has one, so
+                               ## without this a variable's `weight` — the allocator's
+                               ## only notion of hotness — counts its appearance in the
+                               ## check's ERROR message as heavily as its use in the loop
+                               ## the check guards, and the index/length of a hot loop
+                               ## looks hotter than it is while a variable used ONLY on a
+                               ## panic path looks worth a register. Uses in here add
+                               ## nothing to `weight` (they still count for `usages` and
+                               ## liveness — the value is genuinely read on that path).
     arg0Name: string           ## name of the FIRST integer/pointer param (the one homed in
                                ## the return register on AArch64); "" if none / aggregate
     res: ProcAnalysis
@@ -353,13 +372,16 @@ proc markArgParamsUnsafe(c: var Context; n0: Cursor; ordinal: int; cleanCall: bo
         while n.hasMore: (markArgParamsUnsafe(c, n, ordinal, cleanCall); skip n)
   else: discard
 
-proc isConstShiftCount*(n: Cursor): bool =
-  ## True when a shift-count operand folds to a compile-time immediate: a bare
-  ## int/uint/char literal, possibly wrapped in `cast`/`conv`/`suf`/`par`. Such a
-  ## count assembles as an `imm8` shift (`sar r, 4`), so — unlike a runtime count —
-  ## it need NOT occupy `cl` and does not clobber `rcx`. A front-end frequently
-  ## hands the count as `(cast (u 64) (suf 4 "i64"))` (unsigned-normalized), which a
-  ## bare `kind in {IntLit,…}` test would miss and needlessly pin to `cl`.
+proc isImmLeaf*(n: Cursor): bool =
+  ## True when an operand is a compile-time immediate: a bare int/uint/char
+  ## literal, possibly wrapped in `cast`/`conv`/`suf`/`par`. Such an operand
+  ## materializes AT ITS POINT OF USE and so holds no register across a sibling
+  ## subtree — which is what lets the consumer evaluate the other operand
+  ## straight into the destination.
+  ##
+  ## The wrappers are not decoration. A front-end spells a typed literal
+  ## `(suf 511u "u32")` and an unsigned-normalized one `(cast (u 64) (suf 4
+  ## "i64"))`; a bare `kind in {IntLit,…}` test sees a `TagLit` and says no.
   var c = n
   while c.kind == TagLit:
     case c.exprKind
@@ -370,6 +392,35 @@ proc isConstShiftCount*(n: Cursor): bool =
     else: break
   result = c.kind in {IntLit, UIntLit, CharLit}
 
+proc isConstShiftCount*(n: Cursor): bool {.inline.} =
+  ## A shift count that is an immediate assembles as an `imm8` shift (`sar r, 4`),
+  ## so — unlike a runtime count — it need NOT occupy `cl` and does not clobber
+  ## `rcx`.
+  isImmLeaf(n)
+
+proc endsDiverging(c: Context; branch: Cursor): bool =
+  ## True when this `(elif …)`/`(else …)`/`(of …)`'s BODY ends in a call that never
+  ## returns — the shape of every bounds check, `assert` and `raiseIndexError3` guard.
+  ## Trailing `(stmts …)`/`(scope …)` wrappers are transparent (hexer's inliner adds a
+  ## scope per splice), so the walk descends to the genuinely last statement.
+  result = false
+  if branch.kind != TagLit: return
+  var cur = branch
+  var guard = 0
+  while guard < 64:
+    inc guard
+    if cur.kind != TagLit: return false
+    if cur.stmtKind == CallS:
+      let callee = sub(cur)
+      return callee.kind == Symbol and callee.symId in c.noReturnCallees
+    # descend to the LAST child: the branch's body, then through the `(stmts …)` /
+    # `(scope …)` wrappers hexer's inliner adds, to the genuinely last statement.
+    var probe = sub(cur)
+    if not probe.hasMore: return false
+    var last = probe
+    while probe.hasMore: (last = probe; skip probe)
+    cur = last
+
 proc analyse(c: var Context; n: var Cursor) =
   case n.kind
   of Symbol:
@@ -378,8 +429,10 @@ proc analyse(c: var Context; n: var Cursor) =
       let e = addr c.res.vars[vn]
       if c.inAsgnTarget > 0: inc e.defs
       else: inc e.usages
-      # each use counts; uses inside loops count `LoopWeight`× per nesting level
-      inc e.weight, 1 + c.inLoops * LoopWeight
+      # each use counts; uses inside loops count `LoopWeight`× per nesting level —
+      # and a use on a COLD path (a branch that ends in a diverging call) counts for
+      # nothing, loop or not.
+      if c.inCold == 0: inc e.weight, 1 + c.inLoops * LoopWeight
       # Extend the live range to this occurrence's PRECISE position — its own token
       # position, not the enclosing statement's end. Freeing strictly after the
       # textually-last use is safe for branches: no control-flow path can read the
@@ -415,10 +468,26 @@ proc analyse(c: var Context; n: var Cursor) =
     inc n
   of TagLit:
     case n.stmtKind
-    of InstrS: analyseInstr(c, n)       # a two-address row: a statement, not a value
+    of InstrS:                          # a two-address row: a statement, not a value
+      c.res.clobbersBridgeReg = true    # see the expression case below
+      analyseInstr(c, n)
     of NoStmt:
       case n.exprKind
-      of AtC, PatC:
+      of PatC:
+        # `(pat p i)` is POINTER indexing, and BOTH operands are plain value reads:
+        # `p` is loaded into a register and scaled, exactly like `(deref p)` below.
+        # The emitter has always known this — `lvalUsesReg` says "the pointer is a
+        # VALUE" for `PatC` and "the base is an lvalue" for `AtC` — but the analyser
+        # lumped the two together, so every pointer indexed with `p[i]` was marked
+        # `AddrTaken` and forced onto the STACK. That is why `hasKey`'s `sroa.7`, the
+        # seq DATA pointer, is stored and reloaded once per probe iteration: 26.7 M
+        # executed instructions in the hasKey microbenchmark, per proc.
+        n.into:
+          let oldA = c.inAddr; let oldT = c.inAsgnTarget; let oldX = c.inArrayIndex
+          c.inAddr = 0; c.inAsgnTarget = 0; c.inArrayIndex = 0
+          while n.hasMore: analyse(c, n)
+          c.inAddr = oldA; c.inAsgnTarget = oldT; c.inArrayIndex = oldX
+      of AtC:
         n.into:
           inc c.inArrayIndex
           analyse(c, n)                 # the array/base
@@ -459,9 +528,38 @@ proc analyse(c: var Context; n: var Cursor) =
         # freed at its def and its register reused by the next field's temp → both fields
         # ended up the same value. Other NoExpr nodes (types, etc.) carry no locals.
         case n.substructureKind
-        of ElifU, ElseU, OfU, KvU: analyseChildren(c, n)
+        of ElifU, ElseU, OfU:
+          # The BODY is the last child. When it ends in a diverging call the whole
+          # branch is a cold guard — the shape every bounds check, `assert` and
+          # `raiseIndexError3` has — so its uses must not inflate `weight`. The
+          # CONDITION is not cold: it runs on the hot path.
+          #
+          # A general per-branch DISCOUNT (halve the weight per conditional level, the
+          # standard static-profile guess) was built here too and MEASURED NEGATIVE:
+          # nifbench −0.013 % (noise), nimsem **+0.56 %**. Do not re-add it.
+          let cold = endsDiverging(c, n)
+          when defined(arkhamColdDbg):
+            if cold: stderr.writeLine "COLDBLOCK"
+          n.into:
+            var idx = 0
+            var last = 0
+            block:                         # how many children (1 for `else`, 2 otherwise)
+              var probe = n
+              while probe.hasMore: (inc last; skip probe)
+            while n.hasMore:
+              let isBody = idx == last - 1
+              if isBody and cold: inc c.inCold
+              analyse(c, n)
+              if isBody and cold: dec c.inCold
+              inc idx
+        of KvU: analyseChildren(c, n)
         else: skip n
-      of InstrC: analyseInstr(c, n)
+      of InstrC:
+        # Which registers the row claims is the EMITTER's table (`atomicRegClaims`);
+        # all the allocator needs to know is that some row in this body may take the
+        # bridge, so the one client allowed to draw it must not here.
+        c.res.clobbersBridgeReg = true
+        analyseInstr(c, n)
       of DivC, ModC:
         c.res.clobbersDivReg = true     # idiv/div clobbers rdx
         c.divPositions.add ClobberSite(pos: posOf(c, n), stmtStart: c.stmtStart[^1])
@@ -536,10 +634,13 @@ proc analyse(c: var Context; n: var Cursor) =
             skip probe
             inc ordinal
       analyseChildren(c, n)
-      if not noReturnCall:
+      if not noReturnCall or defined(arkhamStrictNoReturn):
         inc c.completedCalls            # this call's args are fully built; it has "returned"
         # A diverging call never returns, so nothing executes "after it returned" —
         # a param read later is reached only on the path that skipped it.
+        # (…which is true of the MACHINE but not of `rb`; see the `arkhamStrictNoReturn`
+        # note at the `AllRegs` interval test. `ArgResident` needs the same gate, or a
+        # param stays in its arg register across a marshal that killed its binding.)
     of VarS, GvarS, TvarS, ConstS:
       analyseVarDecl(c, n)
     of AsgnS:
@@ -746,6 +847,16 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
     var crossesCall = false
     for p in c.callPositions:
       if p > lo and p <= hi: (crossesCall = true; break)
+    when defined(arkhamStrictNoReturn):
+      # EXPERIMENT: also deny `AllRegs` across a DIVERGING call. Machine-state-wise
+      # that is pure pessimism — a call that never returns clobbers nothing anyone can
+      # observe. It is arkham's BINDING TABLE that cannot express it: `releaseArgDest`
+      # emits `(kill nm)` for each arg register the marshalling overwrites, `rb` is
+      # linear and has no notion of "this path is not taken", so the name is gone for
+      # the rest of the proc and every later read of that still-live local falls back
+      # to a raw `(reg)`.
+      for p in c.noReturnPositions:
+        if p > lo and p <= hi: (crossesCall = true; break)
     # `usedAfterCall` is the same fact reached by counting completed calls rather
     # than comparing positions. Redundant with the interval test above, kept as the
     # belt-and-braces gate on the param path (it is what `ArgResident` has always
@@ -757,16 +868,19 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
       # `allocParams` from `clobbersDivReg`/`clobbersShiftReg`, not from these
       # per-variable props — leave them off rather than grant something unread.
       if isParam: continue
-      # The fixed-role homes below stay on the STRICT test — a diverging call in the
-      # interval denies them. `AllRegs` only claims "a caller-saved register is a legal
-      # home", which a call that never returns cannot invalidate; `DivRegOk`/`ShiftRegOk`
-      # additionally claim rdx/rcx are free of their instruction role across the range,
-      # and that interval test had only ever been exercised on genuinely call-free
-      # ranges. Granting it to a bounds-checked `[]=` (whose panic call is diverging)
-      # promptly tripped the allocator's own clobber check on rcx.
+      # `DivRegOk`/`ShiftRegOk` claim rdx/rcx are free of their INSTRUCTION role across
+      # the range. They used to also deny a diverging call in the interval, because
+      # granting it to a bounds-checked `[]=` (whose panic is diverging) tripped the
+      # allocator's own clobber check on rcx. That was the binding table, not the
+      # machine: the panic's marshalling had to `(kill …)` the home, and every later
+      # read of the still-live local went raw. `restoreBindings` (codegen_x64) now
+      # re-establishes those names after the diverging call, so the strict test is no
+      # longer needed — and rdx/rcx are 2 of the 4 GPRs arkham is short of against gcc.
+      # `-d:arkhamStrictDivAcrossPanic` restores the old behaviour.
       var crossesDiverging = false
-      for p in c.noReturnPositions:
-        if p > lo and p <= hi: (crossesDiverging = true; break)
+      when defined(arkhamStrictDivAcrossPanic):
+        for p in c.noReturnPositions:
+          if p > lo and p <= hi: (crossesDiverging = true; break)
       # A call-free local can go further: rdx/rcx have a *fixed* instruction role
       # (div/mod, variable shift) but are otherwise free. If no such instruction
       # falls in the interval, that register's role never overlaps this local's

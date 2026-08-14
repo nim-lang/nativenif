@@ -95,6 +95,7 @@ const
     intArgRegs: @IntArgRegs,
     floatArgRegs: @FloatArgRegs,
     intTempRegs: @IntTempRegs,
+    stagingBridgeReg: NoReg,
     intLocalTempRegs: @IntTempRegs,  # AArch64 has 7 volatile int regs — scratch to spare,
                                      # so a call-free local may be homed in the temp pool
     intCalleeSaved: @IntCalleeSaved,
@@ -116,6 +117,7 @@ const
     intArgRegs: @IntArgRegs,
     floatArgRegs: @FloatArgRegs,
     intTempRegs: @IntTempRegsN,
+    stagingBridgeReg: NoReg,
     intLocalTempRegs: @IntTempRegsN,
     intCalleeSaved: @IntCalleeSaved,
     floatTempRegs: @FloatTempRegsN,
@@ -140,8 +142,11 @@ proc `$`*(loc: Location): string =
   of NeedsReg: "needsreg"
   of RegOrImm: "regorimm"
   of InReg: regName(loc.r)
+  of InRegPair:
+    "{" & regName(loc.r0) & (if loc.r1 != NoReg: "," & regName(loc.r1) else: "") & "}"
   of InFReg: regName(loc.f)
   of NamedStack: "&" & loc.name
+  of StackPtr: "*" & loc.ptrName
   of Mem: "[mem]"
   of Field:
     (case loc.base.kind

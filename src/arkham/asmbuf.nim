@@ -20,6 +20,7 @@ import std / tables
 import nifcore, nifcoreparse
 import model                 # nifasm: A64Inst, NifasmDecl, NifasmType, NifasmExpr
 import machine               # arkham: Reg, regName
+import peephole              # the finished-shape rewrites, applied in `render`
 export A64Inst, X64Inst, NifasmDecl, NifasmType, NifasmExpr, X64Flag
 
 type
@@ -27,6 +28,8 @@ type
     buf: TokenBuf
     ids: Table[string, TagId]   ## spelling → interned tag id (cache)
     renderReg*: proc (r: Reg): string {.nimcall.}  ## GPR slot → arch spelling shim
+    immAnyDest*: bool           ## target carries an immediate into any `mov`
+                                ## destination (x86-64 does, AArch64 does not)
 
 proc initAsmBuf*(): AsmBuf =
   ## Defaults the register shim to AArch64 spellings; the x86-64 backend
@@ -140,7 +143,7 @@ proc sideBuf*(a: AsmBuf): AsmBuf =
   ## final once the body has been emitted — into the main buffer, and appends
   ## the body after it.
   AsmBuf(buf: createTokenBuf(256, a.buf.pool, a.buf.tags),
-         ids: a.ids, renderReg: a.renderReg)
+         ids: a.ids, renderReg: a.renderReg, immAnyDest: a.immAnyDest)
 
 proc append*(a: var AsmBuf; other: var AsmBuf) =
   ## Append every top-level node of `other` (a `sideBuf` of `a`; the shared
@@ -156,4 +159,10 @@ proc render*(a: var AsmBuf; dottedSuffix = ""): string =
   ## trailing embedded `(.index …)` (so nifasm resolves cross-module symbols
   ## lazily by their indexed byte offset). `dottedSuffix` (e.g. `.mymod`)
   ## compresses self-module symbol suffixes to a trailing dot.
+  ##
+  ## The peephole runs HERE, on the finished buffer, so it sees the shapes the
+  ## emitters produce rather than the intentions behind them (see peephole.nim).
+  ## `-d:arkhamNoPeephole` turns it off for a bisect.
+  when not defined(arkhamNoPeephole):
+    discard peephole(a.buf, a.immAnyDest)
   toModuleString(a.buf, dottedSuffix)

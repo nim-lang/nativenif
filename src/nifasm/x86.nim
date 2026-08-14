@@ -173,6 +173,32 @@ proc emitMovToMemSized*(dest: var Bytes; mem: MemoryOperand; reg: Register; bits
   dest.add(if bits == 8: 0x88 else: 0x89)       # MOV r/m8,r8  /  MOV r/m(16|32),r
   dest.emitMem(int(reg), mem)
 
+proc emitMovImmToMem*(dest: var Bytes; mem: MemoryOperand; imm: int32; bits = 64) =
+  ## `mov r/m, imm` (C6 /0 for a byte, C7 /0 otherwise), SIZED to `bits` on the
+  ## same rules as `emitAluImmMem`: REX.W only for a 64-bit operand (where the
+  ## imm32 is sign-extended), 0x66 for 16-bit, imm8 for 8-bit. Storing a constant
+  ## is otherwise two instructions and a scratch register — materialize into a
+  ## register, then store it — which is what arkham emitted before the peephole
+  ## that now folds the pair could rely on this form existing.
+  emitSegPrefix(dest, mem)
+  if bits == 16: dest.add(0x66)
+  var rex = RexPrefix(w: bits == 64)
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  if rex.b or rex.x or rex.w:
+    dest.add(encodeRex(rex))
+  if bits == 8:
+    dest.add(0xC6)
+    dest.emitMem(0, mem)
+    dest.add(byte(imm and 0xFF))
+  else:
+    dest.add(0xC7)
+    dest.emitMem(0, mem)
+    if bits == 16:
+      dest.add(byte(imm and 0xFF)); dest.add(byte((imm shr 8) and 0xFF))
+    else:
+      dest.addt32(imm)
+
 proc emitRegExt*(dest: var Bytes; d, s: Register; bits: int; signed: bool) =
   ## `d = extend(low `bits` of `s`)` into the full 64-bit `d` — the register-source
   ## twin of `emitLoadExt`, same opcodes with a register-direct ModR/M.
@@ -1947,6 +1973,18 @@ proc emitIatCall*(dest: var Buffer; iatSlot: int) =
 
 proc emitLea*(dest: var Bytes; reg: Register; mem: MemoryOperand) =
   ## Emit LEA instruction: LEA reg, mem
+  ##
+  ## An address that is a bare base register with no index and no displacement is
+  ## not an address computation at all — `lea reg, [base]` is `mov reg, base`, and
+  ## the two forms differ in what they COST: a register-to-register `mov` is
+  ## resolved at rename on every current core and never reaches an execution port,
+  ## while `lea` always occupies one. It is the same number of instructions, so an
+  ## instruction count cannot see the difference; the wall clock can. (No FS
+  ## override here: `fs:[0+off]` is a real address, and it always carries a
+  ## displacement anyway.)
+  if not mem.hasIndex and mem.displacement == 0 and not mem.useFsSegment:
+    if reg != mem.base: emitMov(dest, reg, mem.base)
+    return
   emitSegPrefix(dest, mem)
   var rex = RexPrefix(w: true)
   if needsRex(reg): rex.r = true

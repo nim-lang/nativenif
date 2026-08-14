@@ -67,6 +67,7 @@ const
                                      # GPR the emitter can grab to make mem←mem / spilled
                                      # value-position produce-into total, so the allocator's
                                      # `etmp` fallback is always emittable.
+    stagingBridgeReg: R11,
     intLocalTempRegs: @[RDI, RSI, R8, R9],  # volatile homes a CALL-FREE local may use once the 5
                                      # callee-saved regs are exhausted (the analyser's `AllRegs`
                                      # interval test guarantees no call in the range, so these
@@ -131,6 +132,7 @@ const
     intArgRegs: @[RCX, RDX, R8, R9],
     floatArgRegs: @[F0, F1, F2, F3],
     intTempRegs: @[R10],
+    stagingBridgeReg: R11,
     intLocalTempRegs: @[RDI, RSI, R8, R9],
     intCalleeSaved: @[RBX, R12, R13, R14, R15],
     floatTempRegs: @[F8, F9, F10, F11, F12, F13, F14],

@@ -244,16 +244,16 @@ proc arkhamTests() =
 const arkhamStressKnown: seq[string] = @[
   # Real defects found by this pass at x86-64's level, parked so that any NEW
   # failure is fatal. Remove an entry with its fix.
-  "stack_aggr_byref",       # by-ref aggregate base not materialized before the (mem …)
   # `takeHeld` with the default `canSpill = false` asserts instead of evicting a
   # live local. 11 of the 15 `takeHeld` sites across both backends do.
   "aggr_arg_parked",
-  "aggr_arg_parked_byref",
   "aggr_arg_parked_manual",
-  # The intrinsic-operand pick has no steal/spill arm, one step in: the
-  # compare-exchange out of `realloc` that `nimony n -d:danger` died on.
-  # (`atomic_cas_regpressure` sat here for the same reason and now passes at k=2.)
-  "atomic_cas_operand_home",
+  # `atomic_cas_regpressure`, `atomic_cas_operand_home` and `aggr_arg_parked_byref`
+  # all sat here for the "intrinsic-operand pick has no steal/spill arm" reason and
+  # all three now PASS. The missing arm was `pickTempReg`'s volatile candidate list,
+  # which was `intTempRegs` = r10 ALONE, so the second live temp went straight to a
+  # callee-saved register and under `k=2` stress there was nothing left to go to.
+  # Widening it to the idle volatiles fixed them outright.
   # NO LONGER A SILENT MISCOMPILE. The comment here used to read "SILENT MISCOMPILE
   # (71 -> 95)": `produceIntoMem2` hands the produce bridge to the WHOLE node on the
   # claim that it is "not held across the recursion" — true for a leaf or a load,

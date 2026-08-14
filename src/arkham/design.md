@@ -102,6 +102,31 @@ they are enumerable: a load through a materialized global base (`lea &g` then
 computed ends, a `casejmp` base, an atomic row that claims R11 as its own `work`
 register. Each wants **two**. None wants three.
 
+**MEASURED, and the last sentence was wrong.** `-d:arkhamStagingDbg` counts the
+staging registers handed out and not yet given back, and reports the PEAK per
+proc. Over a whole `nimony n -d:release` build of nimsem — 3,792 procs, zero
+leaked registers:
+
+| peak concurrent staging registers | procs |
+|---|---|
+| 0 | 1,320 (34.8 %) |
+| 1 | 1,800 (47.5 %) |
+| 2 | 633 (16.7 %) |
+| **3** | **39 (1.0 %)** |
+
+Every shape that needs two is *address + word* — an aggregate copy holding a
+pointer while a word passes through it. The three-register shape is one of those
+nested inside another: `an oconstr destination address + a nested-aggregate-field
+pointer + a nested-aggregate-field copy word`. The others, in order of how many
+procs hit them: nested-aggregate-field pointer + copy word (495), aggregate-copy
+dst + src address (39), stack-param aggregate home + word (35), casejmp index +
+base (15), aconstr element pointer + copy word (15).
+
+This is the number the allocator needs in order to take over the guarantee that a
+staging pick can never fail. R11 is reserved today precisely because nobody knew
+it; reserving THREE where these shapes occur, and nothing elsewhere, is what lets
+the reservation go — and with it the register the spill census wants back.
+
 Depth does not enter. A chain of spilled pointer loads — `p->a->b->c->…` — costs two
 registers at depth 4 and two at depth 10, because `emitMemLoad2`'s `late` mode takes
 the transfer register *after* the address is materialized, so it is not held across
@@ -272,3 +297,40 @@ only for the rows that spin on a `cmpxchg` and r11 only for the rows that need a
 `work` register, so a compare-exchange gets the bridge back in exchange for rax.
 A blanket claim would have made three-operand atomics stop compiling under
 pressure instead.
+
+## Two questions, not one: `homeOfSym` vs `locationOfSym`
+
+A local used to be looked up one way — `locationOfSym(name)` — because there was
+one answer: the allocator gives a local a single home for its whole live range,
+and returns registers to the pool by *scope*. That is what makes the allocator
+fragile under inlining. Inlining lengthens live ranges, moves calls into ranges
+that had none, and adds the callee's locals to the same pool; the classification
+that decides a home is binary (does the range cross a call?) and the scarce class
+it selects — the callee-saved registers — is five wide. So demand grows roughly
+additively while supply does not, and the measured result is that **90 % of
+spills are cross-call values while six or seven volatile registers sit idle**.
+Nothing is spilled for want of registers; it is spilled for want of registers of
+the right *kind*, and one home per local means a value can never change kind.
+
+Fixing that means splitting a range — a volatile between calls, the save slot
+across one — which makes "where does this value live" depend on WHERE the
+question is asked. So the question is now asked in two forms, and every caller
+has to say which it means:
+
+ * **`homeOfSym(name)`** — the declared STORAGE. Addressing a stack slot, asking
+   whether a name has a slot at all, saving and restoring it around a call, the
+   parameter prologue moving an incoming value into its home. These are about the
+   place, not the value, and they stay right no matter how the range is split.
+ * **`locationOfSym(name, pos)`** — where the VALUE is, at token position `pos`.
+   Every read of a local in an expression is one of these, and every such site
+   already has a cursor, so it already knows its position.
+
+Today the two answer identically: `RegAlloc.segs` is empty, so `locationOfSym`
+falls through to the one home. The split was landed on its own, with the emitted
+asm-NIF proven byte-identical, precisely so that the allocator change after it is
+an ADDITION — fill `segs` — rather than a rewrite of eighty call sites whose
+correctness could then only be argued, not diffed.
+
+It is also what lets the allocator eventually decide locations for *expression*
+positions and not just for symbol definitions: `locs` is already indexed by token
+position, and the query is now asked that way too.

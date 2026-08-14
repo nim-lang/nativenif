@@ -78,6 +78,10 @@ type
     intArgRegs*: seq[Reg]            ## integer/pointer argument registers, ABI order
     floatArgRegs*: seq[FReg]         ## float argument registers, ABI order
     intTempRegs*: seq[Reg]           ## caller-saved scratch (call-free locals)
+    stagingBridgeReg*: Reg           ## the volatile kept out of every general pool so a
+                                     ## staging pick can never fail (x86-64: R11).
+                                     ## `callerSaveRescue` is the ONE allocator client
+                                     ## allowed to take it.
     intLocalTempRegs*: seq[Reg]      ## subset of `intTempRegs` a call-free local may be
                                      ## *homed* in; the rest of `intTempRegs` stays
                                      ## reserved as emitter scratch. Empty on x86-64 (its
@@ -117,9 +121,25 @@ type
                    ## must be reg/imm (a memory `b` is loaded first). Filled in (via
                    ## `var`) with the concrete `InReg`/`Imm`. Destination-only.
     InReg          ## value in a GPR
+    InRegPair      ## ≤16B by-value aggregate in 1–2 GPRs (ABI eightbytes)
     InFReg         ## value in an FP/SIMD register
     NamedStack     ## a stack var/slot managed by nifasm, addressed by `name`
-                   ## (aggregate, spilled scalar, or synthetic spill — no cursor)
+                   ## (aggregate, spilled scalar, or synthetic spill — no cursor).
+                   ## The slot IS the value.
+    StackPtr       ## an 8-byte nifasm slot holding a POINTER to an aggregate: the
+                   ## value lives wherever the pointer points (the caller's buffer,
+                   ## or the incoming stack-arg area), and every access loads the
+                   ## pointer first. A >16B by-ref aggregate param whose pointer found
+                   ## no register home, or (AArch64) a stack-passed by-value aggregate
+                   ## addressed in place.
+                   ##
+                   ## `typ` is the AGGREGATE's slot, not the pointer's, so size/class
+                   ## questions read like any other aggregate location; the one extra
+                   ## load is what this KIND says. Formerly `NamedStack` plus the
+                   ## `spilledByRefPtr` predicate, which re-derived the distinction at
+                   ## ~30 sites from the home's slot shape and a `varType` side table —
+                   ## and a site that forgot to ask silently transferred the pointer's
+                   ## own bytes as if they were the struct.
     Mem            ## a foldable memory operand: the lvalue subtree `cur`
                    ## (`(dot …)`/`(at …)`/`(deref …)`) re-emitted on demand so
                    ## nifasm collapses the access chain to `base+offset`
@@ -180,12 +200,27 @@ type
     of Undef, NoLoc, NeedsReg, RegOrImm: discard
     of InReg:
       r*: Reg
+    of InRegPair:
+      r0*: Reg            ## eightbyte 0 (offset 0)
+      r1*: Reg            ## eightbyte 1 (offset 8); `NoReg` if the aggregate is 8 bytes
     of InFReg: f*: FReg
     of NamedStack, Glob, Tvar: name*: string
+    of StackPtr:
+      ptrName*: string       ## the 8-byte slot holding `&aggregate`
+      pointeeType*: SymId    ## POOL ID of the pointee's nominal type symbol — the
+                             ## identity a `Symbol` token already carries, so nothing
+                             ## materialises a string to compare or store one (the
+                             ## reasoning `noReturnProcs` spells out; the input buffers
+                             ## share one pool, so ids are comparable). Text is minted
+                             ## only at the two boundaries that need it: the name-keyed
+                             ## layout API (`lookupType`) and the asm buffer's own pool.
+                             ## Not `aggrType`: `Field` owns that name, and a variant's
+                             ## branches share one field namespace.
     of Mem: cur*: Cursor
     of Field:
       field*: string         ## the member name
-      aggrType*: string      ## the enclosing aggregate's nominal type name
+      aggrType*: SymId       ## POOL ID of the enclosing aggregate's nominal type — the
+                             ## key the layout API takes, like `StackPtr.pointeeType`
       base*: FieldBase       ## how the aggregate is reached (explicit kind)
     of Imm: ival*: int64
 
@@ -215,6 +250,12 @@ proc regOrImm*(typ: AsmSlot): Location {.inline.} =
 
 proc regLoc*(r: Reg; typ: AsmSlot; isTemp = false): Location {.inline.} =
   Location(kind: InReg, r: r, typ: typ, isTemp: isTemp)
+proc regPairLoc*(r0, r1: Reg; typ: AsmSlot): Location {.inline.} =
+  ## A ≤16B by-value aggregate whose eightbytes live in `r0` and (if 16B) `r1`.
+  Location(kind: InRegPair, r0: r0, r1: r1, typ: typ)
+proc pairWord*(loc: Location; i: int): Reg {.inline.} =
+  assert loc.kind == InRegPair
+  if i == 0: loc.r0 else: loc.r1
 proc fregLoc*(f: FReg; typ: AsmSlot; isTemp = false): Location {.inline.} =
   Location(kind: InFReg, f: f, typ: typ, isTemp: isTemp)
 proc namedStackLoc*(name: string; typ: AsmSlot; spillTemp = false): Location {.inline.} =
@@ -223,22 +264,32 @@ proc namedStackLoc*(name: string; typ: AsmSlot; spillTemp = false): Location {.i
   ## (via a staging register), as opposed to a symbol's stack home left in place for
   ## folding. The emitter (`produceIntoMem2`) keys on it.
   Location(kind: NamedStack, name: name, typ: typ, spillTemp: spillTemp)
+proc stackPtrLoc*(name: string; pointeeType: SymId; typ: AsmSlot): Location {.inline.} =
+  ## An 8-byte `(s)` slot holding `&aggregate` — the aggregate itself is elsewhere.
+  ## `typ` is the AGGREGATE's slot (what the location's value IS), `pointeeType` the
+  ## pool id of its nominal type; the pointer's own 8-byte shape is implied by the kind
+  ## and never spelled out, so no consumer can mistake one for the other.
+  ##
+  ## The id comes from the type token itself (`symId`), which is only defined for a
+  ## `Symbol` — so an unnamed inline aggregate type, which has no layout to look up,
+  ## cannot be smuggled in as a plausible-looking empty name.
+  Location(kind: StackPtr, ptrName: name, pointeeType: pointeeType, typ: typ)
 proc globLoc*(name: string; typ: AsmSlot): Location {.inline.} =
   Location(kind: Glob, name: name, typ: typ)
 proc tvarLoc*(name: string; typ: AsmSlot): Location {.inline.} =
   Location(kind: Tvar, name: name, typ: typ)
 proc memLoc*(cur: Cursor; typ: AsmSlot): Location {.inline.} =
   Location(kind: Mem, cur: cur, typ: typ)
-proc fieldLoc*(aggrType, field, baseName: string; typ: AsmSlot): Location {.inline.} =
+proc fieldLoc*(aggrType: SymId; field, baseName: string; typ: AsmSlot): Location {.inline.} =
   ## Field `field` of a stack-slot aggregate named `baseName` (the genConstr2 base).
   Location(kind: Field, aggrType: aggrType, field: field,
            base: FieldBase(kind: FbSlot, sym: baseName), typ: typ)
-proc fieldLocReg*(aggrType, field: string; baseReg: Reg; typ: AsmSlot): Location {.inline.} =
+proc fieldLocReg*(aggrType: SymId; field: string; baseReg: Reg; typ: AsmSlot): Location {.inline.} =
   ## Field `field` of an aggregate whose address is held in `baseReg` (a by-ref
   ## param / hidden-result buffer / a nested field's computed address).
   Location(kind: Field, aggrType: aggrType, field: field,
            base: FieldBase(kind: FbReg, reg: baseReg), typ: typ)
-proc fieldLocGlob*(aggrType, field, globName: string; typ: AsmSlot;
+proc fieldLocGlob*(aggrType: SymId; field, globName: string; typ: AsmSlot;
                    isTvar = false): Location {.inline.} =
   ## Field `field` of a module-level aggregate `globName` (a global, or a thread-local
   ## if `isTvar`), whose address is RE-DERIVED into a fresh transient at each field store
@@ -249,7 +300,7 @@ proc fieldLocGlob*(aggrType, field, globName: string; typ: AsmSlot;
   let base = if isTvar: FieldBase(kind: FbTvar, sym: globName)
              else: FieldBase(kind: FbGlob, sym: globName)
   Location(kind: Field, aggrType: aggrType, field: field, base: base, typ: typ)
-proc fieldLocLval*(aggrType, field: string; baseLval: Cursor; typ: AsmSlot): Location {.inline.} =
+proc fieldLocLval*(aggrType: SymId; field: string; baseLval: Cursor; typ: AsmSlot): Location {.inline.} =
   ## Field `field` of an aggregate addressed by the lvalue subtree `baseLval` (the
   ## genConstrIntoLval2 base — its embedded temps must be pre-materialized).
   Location(kind: Field, aggrType: aggrType, field: field,
@@ -261,3 +312,50 @@ proc sameReg*(a, b: Location): bool {.inline.} =
   ## True if both name the same physical register (for move coalescing).
   (a.kind == InReg and b.kind == InReg and a.r == b.r) or
   (a.kind == InFReg and b.kind == InFReg and a.f == b.f)
+
+# ── emitter scratch demand ──────────────────────────────────────────────────
+# A step of emission sometimes needs a transient register that belongs to no
+# value in the program — an x86 store whose source is also in memory has to pass
+# through one, because the ISA has no memory-to-memory move.
+#
+# Today the emitter DECIDES that at emission time and takes the register from a
+# reserved pool (`StagingCandidates`, headed by the one register kept out of the
+# allocator's hands so a pick can never fail). That reservation is why the
+# allocator cannot give a cross-call value a volatile even when six of them are
+# idle: the emitter's claim on the register file is real but not written down,
+# so nobody can prove a volatile is free.
+#
+# The fix is to write the claim down — as a VALUE the allocator can read without
+# emitting anything. These functions are that value. The emitter calls them at
+# the site it used to decide implicitly, so the two can never disagree: there is
+# one function and, for now, one caller.
+
+type
+  ScratchDemand* = object
+    ## What one emission step needs in transient registers.
+    gprs*: int          ## general-purpose scratch registers
+    fregs*: int         ## SIMD scratch registers
+    slot*: AsmSlot      ## the type a GPR scratch must be bound at (nifasm checks it)
+
+proc memToMemBridgeDemand*(md: MachineDesc; dst, v: Location): ScratchDemand =
+  ## Storing `v` into the stack home `dst` when `v` is ITSELF in memory: neither
+  ## ISA has a memory-to-memory move, so the value passes through one register.
+  ##
+  ## The source sets differ by ISA and that is the point of asking the machine
+  ## rather than hardcoding a `case`: AArch64 also has no store-immediate and no
+  ## RIP-relative operand, so an `Imm`, a global and a thread-local each need the
+  ## bridge there and none of them does on x86-64.
+  if dst.kind != NamedStack: return ScratchDemand()
+  if dst.typ.isFloat:
+    let fromMem = (case md.arch
+                   of X86: v.kind in {NamedStack, Mem}
+                   of Arm64: v.kind in {NamedStack, Mem, Glob})
+    if fromMem: ScratchDemand(fregs: 1) else: ScratchDemand()
+  else:
+    let needsBridge = (case md.arch
+                       of X86: v.kind in {NamedStack, Mem}
+                       of Arm64: v.kind in {NamedStack, Mem, Glob, Tvar, Imm})
+    if needsBridge:
+      ScratchDemand(gprs: 1, slot: (if md.arch == X86: v.typ else: dst.typ))
+    else:
+      ScratchDemand()

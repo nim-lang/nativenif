@@ -11,6 +11,11 @@ const
   WindowsKernelDll = "kernel32.dll"
     ## The implicit import library of a Windows image — the one arkham binds against.
 
+  ListingTextCap = 300
+    ## `--listing` renders each instruction node as NIF; a compound node (a whole
+    ## `(ite …)`, a `(prepare …)` with every argument) can be enormous and its
+    ## deeper rows carry the detail anyway, so the text is capped.
+
   WinShadowSpace = 32
     ## Win64 makes the CALLER reserve 32 bytes at the bottom of the outgoing argument
     ## area that the callee may spill its four register arguments into, whether or not
@@ -418,6 +423,18 @@ type
                                 # and `syscallNr` is loaded into rax/x8 before it
     syscallNr: int
 
+  ListingRow = object
+    ## One `genInst` call: the asm-NIF instruction node and the `.text` byte range
+    ## it produced. `--listing:FILE` writes these after branch relaxation, so the
+    ## positions are the ones in the finished image — which is what makes an
+    ## execution profile joinable to the SOURCE construct (and, because arkham
+    ## renders a bound register by its variable name, to the variable) rather than
+    ## to a bare register number.
+    start, stop: int    # `.text` byte range [start, stop)
+    depth: int          # `listDepth` at this node; deeper = nearer the machine
+    procName: string
+    text: string        # the node, rendered as NIF (capped, see ListingTextCap)
+
   GenContext = object
     scope: Scope        # Current (possibly proc-local) lexical scope
     rootScope: Scope    # Module/global scope; foreign symbols are defined here so
@@ -430,6 +447,12 @@ type
                         # linker (foreign `.o`/framework linking) instead of a
                         # standalone executable. Mach-O / arm64 only for now.
     symMap: bool        # `--symmap`: dump each generated proc's vaddr to stderr
+    listing: bool       # `--listing:FILE`: record one row per asm-NIF instruction node
+    listingPath: string # where to write it
+    listDepth: int      # nesting depth of the current `genInst` (a compound node such as
+                        # `(ite …)`/`(loop …)` recurses); the DEEPEST row covering a byte
+                        # is the instruction that actually emitted it
+    listRows: seq[ListingRow]
     procName: string
     callContext: CallContext # Current call context
     clobbered: set[x86.Register] # Registers clobbered in current flow (x64 only)
@@ -3759,12 +3782,95 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of NoA64Inst:
     error("Invalid ARM64 instruction", n)
 
-proc genInst(n: var Cursor; ctx: var GenContext) =
+proc genInstDispatch(n: var Cursor; ctx: var GenContext) {.inline.} =
   case ctx.arch
   of Arch.X64, Arch.WinX64:
     genInstX64(n, ctx)
   of Arch.A64, Arch.WinA64, Arch.LinuxA64:
     genInstA64(n, ctx)
+
+proc genInst(n: var Cursor; ctx: var GenContext) =
+  if not ctx.listing:
+    genInstDispatch(n, ctx)
+  else:
+    # Render BEFORE the dispatch: `n` is advanced past the node by it. The NIF
+    # renderer breaks lines; the listing is one TSV row per node, so flatten
+    # runs of whitespace to single spaces (and drop the tabs a string literal
+    # could otherwise smuggle into a column separator).
+    var text = ""
+    var sawSpace = true                          # leading whitespace is dropped
+    for ch in toString(n, includeLineInfo = false):
+      if ch in {' ', '\t', '\n', '\r'}:
+        if not sawSpace: text.add ' '
+        sawSpace = true
+      else:
+        text.add ch
+        sawSpace = false
+      if text.len >= ListingTextCap:
+        text.add "…"
+        break
+    let start = ctx.buf.data.len
+    let depth = ctx.listDepth
+    inc ctx.listDepth
+    genInstDispatch(n, ctx)
+    dec ctx.listDepth
+    let stop = ctx.buf.data.len
+    if stop > start:                       # a node that emitted no bytes is not a row
+      ctx.listRows.add ListingRow(start: start, stop: stop, depth: depth,
+                                  procName: ctx.procName, text: text)
+
+proc remapListing(ctx: var GenContext; posMap: seq[int]) =
+  ## Carry the listing through one of the post-emission layout passes
+  ## (`threadJumps` / `invertCondJumps` / `shortenX64Jumps`), each of which
+  ## returns an old→new byte-position map. Same treatment `gvarSites` and
+  ## `entryStubOffset` gets — without it every row would name a pre-relaxation
+  ## address and the join to a profile would be silently wrong.
+  ##
+  ## Those passes DELETE code (a threaded-away jump, a folded `jcc`/`jmp` pair).
+  ## A deleted byte's map entry is the position the deletion collapsed to, so such
+  ## a row comes out empty (`start == stop`) and is dropped here: its instruction
+  ## is not in the image any more.
+  if not ctx.listing: return
+  var keep = 0
+  for k in 0 ..< ctx.listRows.len:
+    let s = posMap[ctx.listRows[k].start]
+    let e = posMap[ctx.listRows[k].stop]
+    if e > s:
+      ctx.listRows[keep] = ctx.listRows[k]
+      ctx.listRows[keep].start = s
+      ctx.listRows[keep].stop = e
+      inc keep
+  ctx.listRows.setLen keep
+
+proc writeListing(ctx: GenContext; path: string; textVaddr: int) =
+  ## `--listing:FILE`: one TSV row per asm-NIF instruction node that survived into
+  ## the image, as `vaddr<TAB>len<TAB>depth<TAB>proc<TAB>nif`, sorted by address
+  ## then by depth. Rows NEST: a compound node (`ite`, `loop`, `prepare`) covers
+  ## its children's bytes too, so a consumer attributing one address picks the row
+  ## with the GREATEST depth that contains it — that is the node the bytes came
+  ## from. The shallower rows are kept because the enclosing construct is often
+  ## what you actually want to blame.
+  ##
+  ## `textVaddr` is the virtual address `.text` byte 0 lands at, so the addresses
+  ## match `--symmap` and a disassembly of the finished image with no arithmetic
+  ## on the consumer's side.
+  var rows = ctx.listRows
+  rows.sort(proc (x, y: ListingRow): int =
+    result = cmp(x.start, y.start)
+    if result == 0: result = cmp(x.depth, y.depth))
+  var s = newStringOfCap(rows.len * 96)
+  s.add "# nifasm --listing: vaddr\tlen\tdepth\tproc\tnif\n"
+  s.add "# rows NEST; attribute an address to the DEEPEST row containing it.\n"
+  s.add "# .text base 0x" & toHex(textVaddr, 6) &
+        (if textVaddr == 0: " (addresses are __text-RELATIVE on this format)\n" else: "\n")
+  for r in rows:
+    s.add "0x" & toHex(textVaddr + r.start, 6)
+    s.add '\t'; s.add $(r.stop - r.start)
+    s.add '\t'; s.add $r.depth
+    s.add '\t'; s.add r.procName
+    s.add '\t'; s.add r.text
+    s.add '\n'
+  writeFile(path, s)
 
 proc collectLabels(n: var Cursor; ctx: var GenContext; scope: Scope) =
   ## Pre-scan a cursor subtree and create placeholder symbols for labels.
@@ -4700,7 +4806,13 @@ proc checkType(want, got: Type; n: Cursor) =
 
 proc checkIntegerArithmetic(t: Type; op: string; n: Cursor) =
   if not canDoIntegerArithmetic(t):
-    error("Operation '" & op & "' requires integer or pointer type, got " & $t, n)
+    # NOT "integer or pointer": `canDoIntegerArithmetic` admits no pointer of any
+    # kind, and saying otherwise sends the reader looking for which pointer was
+    # meant. Name the two legal spellings instead — that is what the producer has
+    # to change to.
+    error("Operation '" & op & "' requires an integer type, got " & $t &
+          " — Leng has no arithmetic on pointers: offset an array pointer with " &
+          "`(at …)`/`(pat …)`, or cast to an integer, compute, and cast back", n)
 
 proc checkComparable(t: Type; op: string; n: Cursor) =
   if not canCompare(t):
@@ -5036,18 +5148,11 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
 
   if dest.kind == okMem:
     if op.kind == okImm:
-      # x86 supports mov r/m64, imm32 (sign extended)
+      # `mov r/m, imm32` (C7 /0), sign-extended into a 64-bit destination and
+      # SIZED like every other store here so a narrow field's neighbours survive.
       if op.immVal >= low(int32) and op.immVal <= high(int32):
-        # We need emitMov(MemoryOperand, int32)
-        # I haven't added it to x86.nim yet.
-        # But I can load to scratch? No, that clobbers.
-        # Assume immediate fits 32-bit or error?
-        # "MOV r/m64, imm32" (C7 /0)
-        # I'll assume it fits or implement `emitMov(mem, imm)`.
-        # Since I can't easily add to x86.nim right now without another round,
-        # I'll raise error for mem, imm if not supported.
-        # Wait, I can use `emitMovImmToReg` if I have a scratch register? No.
-        error("Moving immediate to memory not fully supported yet (requires emitMovImmToMem)", n)
+        x86.emitMovImmToMem(ctx.buf.data, dest.mem, int32(op.immVal),
+                            intMemAccess(dest.typ).bits)
       else:
         error("Immediate too large for memory move (must fit in 32 bits)", n)
     elif op.kind == okSsize:
@@ -6905,6 +7010,7 @@ proc writeElf(a: var GenContext; outfile: string) =
       a.gvarSites[k] = (threadMap[a.gvarSites[k][0]], a.gvarSites[k][1])
     if a.entryStubOffset >= 0:
       a.entryStubOffset = threadMap[a.entryStubOffset]
+    a.remapListing(threadMap)
   block:
     # `jcc L; jmp M; L:` ⇒ `jncc M` — folds a conditional branch and its fall-through
     # unconditional jump into one branch. Pattern detection is arch-agnostic (runs on
@@ -6914,12 +7020,14 @@ proc writeElf(a: var GenContext; outfile: string) =
       a.gvarSites[k] = (invMap[a.gvarSites[k][0]], a.gvarSites[k][1])
     if a.entryStubOffset >= 0:
       a.entryStubOffset = invMap[a.entryStubOffset]
+    a.remapListing(invMap)
   if a.arch == Arch.X64:
     let posMap = shortenX64Jumps(a.buf)
     for k in 0 ..< a.gvarSites.len:
       a.gvarSites[k] = (posMap[a.gvarSites[k][0]], a.gvarSites[k][1])
     if a.entryStubOffset >= 0:
       a.entryStubOffset = posMap[a.entryStubOffset]
+    a.remapListing(posMap)
   when defined(arkhamDbgReloc):
     block validateRelocs:
       var defined = initHashSet[int]()
@@ -6958,6 +7066,10 @@ proc writeElf(a: var GenContext; outfile: string) =
         rows.add (0x400000 + hdrBytes + labelPos[sym.offset], a.nameOf(name))
     rows.sort(proc (x, y: (int, string)): int = cmp(x[0], y[0]))
     for (va, name) in rows: stderr.writeLine "0x" & toHex(va, 6) & "  " & name
+  if a.listing:
+    # `.text` byte 0 lands right after the ELF header + the two program headers,
+    # the same arithmetic `--symmap` above does.
+    a.writeListing(a.listingPath, 0x400000 + 64 + 56 * 2)
   var code = a.buf.data
   let baseAddr = 0x400000.uint64
   let headersSize = 64 + (56 * 2)  # ELF header + 2 program headers
@@ -7217,6 +7329,10 @@ proc writeMachO(a: var GenContext; outfile: string) =
       if sym.kind == skProc and labelPos.hasKey(sym.offset):
         symMapRows.add (labelPos[sym.offset], a.nameOf(name))
     symMapRows.sort(proc (x, y: (int, string)): int = cmp(x[0], y[0]))
+  if a.listing:
+    # Only `writeMachO` knows where __text lands, so these rows stay __text-relative;
+    # the header line says so.
+    a.writeListing(a.listingPath, 0)
 
   macho.writeMachO(code, a.bssOffset, cputype, cpusubtype, outfile, dynlink, gsites, tlv,
                    a.bssInits, rebases, symMapRows)
@@ -7740,7 +7856,8 @@ proc setupTls(ctx: var GenContext) =
                                                        scale: 8, displacement: 8'i32, hasIndex: true))  # rdx = &envp[0]
   x86.emitJmp(ctx.buf, LabelId(ctx.entrySym.offset))        # → real entry
 
-proc assemble*(filename, outfile: string; symMap = false; emitObj = false) =
+proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
+               listing = "") =
   var buf = parseFromFile(filename, sharedTags = asmTags)
   # The main module's pool is shared with every foreign module (getDecl is passed
   # `ctx.pool`), so a `SymId` from ANY cursor is a valid key in the one scope table.
@@ -7776,6 +7893,8 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false) =
     entryStubOffset: -1,
     winEntryOffset: -1,
     symMap: symMap,
+    listing: listing.len > 0,
+    listingPath: listing,
     emitObj: emitObj
   )
 
