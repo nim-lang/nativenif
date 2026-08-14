@@ -430,6 +430,16 @@ proc aggrByRef*(g: var CodeGen; typeName: string): bool {.inline.} =
   ## call-returned-aggregate var, param moves, incoming-arg-reg counting).
   aggrByteSize(g.prog, typeName) > g.md.aggrByRefThreshold
 
+proc typeNameOf*(g: var CodeGen; id: SymId): lent string {.inline.} =
+  ## The nominal type NAME behind a pool id (`StackPtr.pointeeType`). Text is minted
+  ## only where it is genuinely the currency: the name-keyed layout API
+  ## (`lookupType` → `aggrLayout`/`aggrByteSize`/`fieldTypeByName`), and the asm
+  ## buffer — which has its OWN pool (`initAsmBuf`), so an input-pool id means
+  ## nothing there and the symbol has to cross as characters.
+  ##
+  ## `lent`, so a use in an operand costs no copy: the pool owns the string.
+  g.buf[].pool.syms[id]
+
 proc truncateImm*(v: int64; bits: int; signed: bool): int64 {.inline.} =
   ## Keep the low `bits` of `v`, sign-extending when `signed`. A Leng
   ## `cast[byte](4000)` is this truncation, not a nifasm-illegal

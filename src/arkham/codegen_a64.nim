@@ -1838,7 +1838,7 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
         g.emReg loc.r
     elif loc.kind == StackPtr:
       g.ab.tree CastX:
-        g.ab.ptrType: g.ab.sym loc.pointeeType
+        g.ab.ptrType: g.ab.sym g.typeNameOf(loc.pointeeType)
         g.emReg g.lvalGlobBase[g.posOf(c)]
     elif loc.kind == InRegPair:
       raiseAssert "arkham a64n: address of InRegPair local " & nm
@@ -3278,7 +3278,8 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
   if dst.kind in {NamedStack, StackPtr} and dst.typ.kind == AMem:
     # `StackPtr` reaches its aggregate through the slot's pointer; `NamedStack` IS it.
     let dstVar = (if dst.kind == StackPtr: dst.ptrName else: dst.name)
-    let tn = (if dst.kind == StackPtr: dst.pointeeType else: g.varType[dstVar])
+    let tn = (if dst.kind == StackPtr: g.typeNameOf(dst.pointeeType)
+              else: g.varType[dstVar])
     if rhs.kind == TagLit and rhs.exprKind == OconstrC: g.genConstr2(rhs, dst)
     elif rhs.kind == TagLit and rhs.exprKind == AconstrC:
       if dst.kind == StackPtr:

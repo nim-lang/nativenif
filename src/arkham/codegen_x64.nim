@@ -3692,7 +3692,7 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
       # the InReg case so the enclosing dot/at can compute the field offset.
       let pos = cursorToPosition(g.buf[], c)
       g.ab.tree CastX:
-        g.ab.ptrType: g.ab.sym loc.pointeeType
+        g.ab.ptrType: g.ab.sym g.typeNameOf(loc.pointeeType)
         g.emReg g.lvalGlobBase[pos]
     elif loc.kind == InRegPair:
       raiseAssert "arkham x64n: address of InRegPair local " & nm
@@ -4316,10 +4316,10 @@ proc genAggrCopy2(g: var CodeGen; dstVar, srcVar, typeName: string; tmp: Reg) =
     g.bindTemp(tmp, g.fieldSlotByName(typeName, f.name))
     g.ab.tree MovX64:
       g.emReg tmp
-      if srcR != NoReg: g.emPtrFieldMem(srcR, srcHome.pointeeType, f.name)
+      if srcR != NoReg: g.emPtrFieldMem(srcR, g.typeNameOf(srcHome.pointeeType), f.name)
       else: g.emAggrFieldMem(srcVar, f.name)
     g.ab.tree MovX64:
-      if dstR != NoReg: g.emPtrFieldMem(dstR, dstHome.pointeeType, f.name)
+      if dstR != NoReg: g.emPtrFieldMem(dstR, g.typeNameOf(dstHome.pointeeType), f.name)
       else: g.emAggrFieldMem(dstVar, f.name)
       g.emReg tmp
     g.unbindTemp(tmp)
@@ -5083,7 +5083,8 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
   if dst.kind in {NamedStack, StackPtr} and dst.typ.kind == AMem:
     # `StackPtr` reaches its aggregate through the slot's pointer; `NamedStack` IS it.
     let dstVar = (if dst.kind == StackPtr: dst.ptrName else: dst.name)
-    let tn = (if dst.kind == StackPtr: dst.pointeeType else: g.varType[dstVar])
+    let tn = (if dst.kind == StackPtr: g.typeNameOf(dst.pointeeType)
+              else: g.varType[dstVar])
     if rhs.kind == TagLit and rhs.exprKind == OconstrC:
       g.genConstr2(rhs, dst)                             # build object field-by-field
     elif rhs.kind == TagLit and rhs.exprKind == AconstrC:

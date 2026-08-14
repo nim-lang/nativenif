@@ -829,6 +829,10 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
         let name = symName(params); inc params
         skip params                          # pragmas
         let typeNm = if params.kind == Symbol: symName(params) else: ""
+        # The type's POOL ID, for a `StackPtr` home to carry (see `stackPtrLoc`). Taken
+        # from the token, which already holds it — `symName` above is the string the
+        # name-keyed paths still want, not the identity.
+        let typeSym = if params.kind == Symbol: params.symId else: default(SymId)
         let slot = slotOf(b.prog[], params); skip params  # type (resolves named)
         # An aggregate param, per the plan:
         #  * ≤16B by-value that FITS the remaining arg registers → REGISTER-passed
@@ -903,7 +907,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
           # extra load outright, and carries the pointee's type so no side table has to.
           let viaPtr = aggrByRef or aggrStack
           template memHome(): Location =
-            if viaPtr: stackPtrLoc(name, typeNm, slot) else: b.spillTo(name, effSlot)
+            if viaPtr: stackPtrLoc(name, typeSym, slot) else: b.spillTo(name, effSlot)
           let props = b.an.vars.getOrDefault(name).props
           var loc: Location
           if effSlot.isFloat:
