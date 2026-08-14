@@ -271,13 +271,6 @@ type
     scanTagsReady*: bool
     curProcFootprint*: set[Reg]              ## the volatile GPRs the proc being emitted
                                              ## destroys, scanned off its finished body.
-    curProcPreserve*: set[Reg]               ## volatiles this proc PROMISES to preserve: pushed
-                                             ## in its prologue and popped in its epilogue like a
-                                             ## callee-saved register, and subtracted from its
-                                             ## `(clobber …)`. Opt-in per proc, because the cost is
-                                             ## two instructions at every entry and the payoff is
-                                             ## at every CALL SITE — worth it exactly for the few
-                                             ## procs the whole program funnels through.
     curProcNarrow*: bool                     ## the scan reached a definite answer for this proc,
                                              ## so `emitSignature` may declare `curProcFootprint`
                                              ## instead of the whole ABI set. False is always the

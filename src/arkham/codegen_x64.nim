@@ -2330,47 +2330,6 @@ proc genType(g: var CodeGen; name: string; decl: Cursor) =
 # `x64VolatileGprs`; the scan only ever SUBTRACTS, so a shape it does not model
 # costs a missed optimization, never a wrong answer.
 
-let preserveSelector = getEnv("ARKHAM_PRESERVE")
-  ## Comma-separated substrings; a generated proc whose asm name contains one promises
-  ## to preserve `PreservableRegs`. Empty ⇒ nobody does (the default).
-  ##
-  ## Why a selector and not "everybody": the promise costs a push and a pop at EVERY
-  ## entry and pays off at every CALL SITE, so it is worth it exactly for the procs a
-  ## whole program funnels through.
-  ##
-  ## MEASURED — BOTH ENDS ARE NEGATIVE, AND THE MIDDLE HAS NO ROOM:
-  ##
-  ##   selector                  pushes   procs with a full 9-reg set   nifbench Ir
-  ##   (none)                    11,669              76.4 %             7,093.5 M
-  ##   the four allocator roots  11,677              74.4 %             (unmoved)
-  ##   every proc                16,554               3.3 %             7,513.2 M  (+5.9 %)
-  ##
-  ## The four roots — `rawAlloc`, `getBigChunk`, `requestOsChunks`, `prepareMutation`,
-  ## transitively reached by 2,617 of 3,883 procs — cost almost nothing and buy almost
-  ## nothing: the wideness above them is re-created by the intermediate procs' OWN use
-  ## of r8/r9, not only inherited from the roots. Promising everywhere does collapse
-  ## the clobber sets (76.4 % → 3.3 % wide) and loses 5.9 % anyway, because that is
-  ## simply "make r8/r9 callee-saved", and 7 volatiles + 7 callee-saved is a worse
-  ## split than 9 + 5 for this workload: call-free locals are far more numerous than
-  ## cross-call ones, so the pushes land where the benefit does not.
-  ##
-  ## The economics, which the numbers match: a promise costs 2 instructions per ENTRY
-  ## of the promising proc; a caller that spills instead pays ~1 reload per CALL. Both
-  ## scale with the same frequency, so the promise only wins where a caller has 2-3
-  ## such values live at once. That is not a callee property, and no selector over
-  ## callees can find it.
-
-const PreservableRegs = {R8, R9}
-  ## What a promising proc preserves. r8/r9 are argument registers 5 and 6, so a
-  ## caller's own marshalling only destroys them for a call taking 5+ integer
-  ## arguments — and 80 % of this compiler's calls take 3 or fewer.
-
-proc promisesToPreserve(g: CodeGen; asmName: string): bool =
-  if preserveSelector.len == 0: return false
-  for pat in preserveSelector.split(','):
-    if pat.len > 0 and pat in asmName: return true
-  false
-
 proc initClobberScan(g: var CodeGen) =
   ## Intern the register-operand spellings once, so the scan compares `TagId`s.
   if g.scanTagsReady: return
@@ -2771,12 +2730,6 @@ proc computeFrameX64(g: var CodeGen; isEntry, hasCall: bool) =
   g.frameRegs = @[]
   for r in g.md.intCalleeSaved:
     if r in g.ra.usedCallee: g.frameRegs.add r
-  # A promised volatile is saved exactly like a callee-saved register — same push in
-  # the prologue, same pop in the epilogue, and `framePushBytesX64` counts it so the
-  # incoming stack-parameter offsets stay right. That IS the promise: the register is
-  # left out of the proc's `(clobber …)`, so every call site may keep a value there.
-  for r in g.curProcPreserve:
-    if r notin g.frameRegs: g.frameRegs.add r
   if g.stackArgBaseReg != NoReg:
     g.frameRegs.add g.stackArgBaseReg
   # Both ABIs require rsp ≡ 0 (mod 16) at a `call`. A normal callee is entered with
@@ -8598,24 +8551,6 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
     fp.incl g.rawHomeRegs
     if g.stackArgBaseReg != NoReg: fp.incl g.stackArgBaseReg
     g.curProcFootprint = fp * x64VolatileGprs
-    # A promising proc saves what it would otherwise destroy, so it is no longer part
-    # of what it destroys. The prologue/epilogue pair is added in `computeFrameX64`.
-    # Only registers actually in the footprint are saved — promising to preserve one
-    # the proc never touches is free and needs no instruction.
-    g.curProcPreserve = g.curProcFootprint * PreservableRegs
-    if not g.promisesToPreserve(info.asmName): g.curProcPreserve = {}
-    # NEVER an incoming parameter register. It is already excluded from the
-    # `(clobber …)` declaration (`emitAbiClobber`/the narrow path drop the param regs,
-    # because nifasm reads a declared clobber as dead-on-entry), so promising it buys
-    # a caller nothing — and the declarative signature binds the param NAME to that
-    # register at entry, so the prologue's raw `(push (r8))` is rejected outright:
-    #   Register R8 is bound to variable `p2.0`, use the variable name instead
-    block:
-      var paramRegs: set[Reg] = {}
-      let n = g.numIncomingArgRegs(info.decl)
-      for i in 0 ..< min(n, g.md.intArgRegs.len): paramRegs.incl g.md.intArgRegs[i]
-      g.curProcPreserve = g.curProcPreserve - paramRegs
-    g.curProcFootprint = g.curProcFootprint - g.curProcPreserve
     g.curProcNarrow = true
     # Publish the CALL-SITE set, which is the footprint plus every incoming argument
     # register: the caller has to marshal those to make the call at all, so they are
@@ -9352,7 +9287,6 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   # what they touch.
   g.curProcNarrow = false
   g.curProcFootprint = {}
-  g.curProcPreserve = {}
   if info.isAsm:
     g.genAsmProc(info)
     return
