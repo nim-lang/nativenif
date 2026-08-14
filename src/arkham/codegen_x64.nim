@@ -1684,6 +1684,23 @@ proc genMemIntrinBody(g: var CodeGen; builtin: string) =
 
 const x64RetRegs = [RAX, RDX]   # SysV ≤16B aggregate result: rax (word 0), rdx (word 1)
 
+proc releaseRetRegs(g: var CodeGen) =
+  ## The ≤16B aggregate result pair (rax:rdx) is about to be written as the ABI result,
+  ## or read back as a call's result. Any name still bound to one of them is stale, and
+  ## `emReg` would move the ABI word through THAT name, at that name's type:
+  ##
+  ##   (var :`x.396 (rdx) (bool))            … the dead bool that once lived there
+  ##   (mov `x.396 (cast (u 64) (mem …)))    … the return sequence's word 1
+  ##   (mov (mem … `x.397 8) `x.396)         … and word 1 of a later call's result
+  ##   [Error] Access to variable `x.396` in register RDX which was clobbered
+  ##
+  ## Dead by construction on both sides: a call destroys rax/rdx (anything live there
+  ## was parked by the caller-save window first), and at a `ret` nothing outlives the
+  ## return. Same treatment `dropStaleBinding(RDI)` gives the hidden result pointer and
+  ## `releaseStaleName(divRemReg)` gives rdx at a div — this was the third fixed-role
+  ## use of a register that had not got it.
+  for r in x64RetRegs: g.releaseStaleName(r)
+
 proc emStackAddr(g: var CodeGen; dest: Reg; name: string) =   # dest ← &stackvar
   ## `dest` is often an ABI argument register that still carries a dead
   ## scalar local (x86-64 homes AllRegs locals in rdi/rsi/…). `emReg` would
@@ -5112,6 +5129,7 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
       else:
         var d = dontCare
         g.emitCall2(rhs, d)                              # ≤16B result in rax:rdx
+        g.releaseRetRegs()
         g.regsToStruct(dstVar, tn, x64RetRegs)
     elif rhs.kind == TagLit and rhs.exprKind == BaseobjC:
       g.genBaseobj2(rhs, dst)                   # object→base slice
@@ -5182,6 +5200,7 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
       elif rhs.kind == TagLit and rhs.exprKind == CallC:  # ≤16B result in rax:rdx
         var d = dontCare
         g.emitCall2(rhs, d)
+        g.releaseRetRegs()
         # lea AFTER the call (rax:rdx hold the result): a transient when spilled, sealing
         # the result regs so the pick avoids them; else the reserved survivor.
         var addrT: Reg
@@ -5778,6 +5797,7 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
             g.copyStructThroughPtr2(srcName, g.retAggrSym, g.indirectReg)
             g.movReg(RAX, g.indirectReg)                   # SysV: return the buffer pointer in rax
           else:
+            g.releaseRetRegs()
             g.structToRegs(srcName, g.retAggrSym, x64RetRegs)  # ≤16B → rax:rdx
         elif hasVal:                                       # scalar / float result → ret reg
           let retPos = cursorToPosition(g.buf[], cc)
@@ -6022,6 +6042,16 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     # by the marshaller — so only a temp is asserted.
     if g.rb.isBoundTemp(g.md.shiftCountReg):
       raiseAssert "arkham: variable shift while the count register holds a live value"
+    # A `ShiftRegOk` home in rcx is interval-proved DEAD here, but "dead" is arkham's
+    # word: nifasm still sees the NAME bound to the register, so `emitValue2` writes
+    # the count out under that name — at that name's type. `rawLineInfo` homes a
+    # `(ptr (u 32))` there and then shifts by 14: `(mov `cse.1 14)`, rejected as
+    # "cannot store the non-zero integer 14 into the pointer-typed destination".
+    # Retire the binding so the count lands in a raw `(rcx)` instead. Exactly what
+    # the div/mod path does for rdx (see `releaseStaleName` there) — this side was
+    # missing it, and only register pressure high enough to home a local in rcx at
+    # all made the difference visible.
+    g.releaseStaleName(g.md.shiftCountReg)
     rDest = regLoc(g.md.shiftCountReg, ScalarSlot)
   g.emitValue2(rhsC, rDest)                              # rhs → wherever (may stay imm/home)
   if lSeal: g.ra.unseal {lDest.r}                        # the partial is consumed below

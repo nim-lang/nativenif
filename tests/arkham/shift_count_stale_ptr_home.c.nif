@@ -1,0 +1,73 @@
+(.nif27)
+(stmts
+ (gvar :g.0 .
+  (i 64)7)
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :id.0
+  (params
+   (param :v.0 .
+    (i 64)))
+  (i 64).
+  (stmts
+   (ret v.0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :n1.0 .
+    (i 64)
+    (call id.0 40))
+   (var :n2.0 .
+    (i 64)
+    (call id.0 2))
+   (var :n3.0 .
+    (i 64)
+    (call id.0 1))
+   (var :n4.0 .
+    (i 64)
+    (call id.0 2))
+   (var :n5.0 .
+    (i 64)
+    (call id.0 3))
+   (var :t1.0 .
+    (i 64)
+    (add
+     (i 64)n3.0 5))
+   (var :t2.0 .
+    (i 64)
+    (add
+     (i 64)n4.0 6))
+   (var :q.0 .
+    (ptr
+     (i 64))
+    (addr g.0))
+   (var :pv.0 .
+    (i 64)
+    (deref q.0))
+   (var :t3.0 .
+    (i 64)
+    (add
+     (i 64)t1.0 t2.0))
+   (var :sv.0 .
+    (i 64)
+    (shr
+     (i 64)n1.0
+     (add
+      (i 64)1 1)))
+   (call exit.0
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (add
+       (i 64)
+       (add
+        (i 64)sv.0 pv.0)t3.0)n5.0)n2.0)))))(.index)

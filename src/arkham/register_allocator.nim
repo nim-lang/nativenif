@@ -235,6 +235,29 @@ proc spillTo(b: var Builder; name: string; slot: AsmSlot): Location =
   ## value in a register before the decision is final).
   namedStackLoc(name, slot)
 
+proc fixedRoleOk(b: Builder; r: Reg; props: VarProps): bool {.inline.} =
+  ## May a value with these props be homed in `r`?
+  ##
+  ## `allocStorage` hands out the div/rem and shift-count registers ONLY to a value
+  ## whose live range is interval-proved free of the instruction that claims them
+  ## (`DivRegOk` / `ShiftRegOk`) — an `idiv` destroys rdx and a variable shift's count
+  ## destroys rcx, neither of which names the register as an operand the emitter could
+  ## see. Every OTHER path that assigns a register has to ask the same question, and
+  ## two did not: the copy-inherit transfer and `trySteal`. `AllRegs` is not the same
+  ## proof — it says the range crosses no CALL — so a call-free value could inherit a
+  ## register that a shift in its own range then clobbers:
+  ##
+  ##   (var :`desugar.3 (rcx) (u 64))   … s[i], inherited rcx from a dead ShiftRegOk local
+  ##   (and `desugar.3 7)               … the shift count, computed IN PLACE on it
+  ##   (shl `tmp61.0 `desugar.3)
+  ##   (mov `tmp62.0 (rcx)) (shr `tmp62.0 3)   … reads the char back — now `char and 7`
+  ##
+  ## nifasm cannot catch that: every operand is well-typed and the register is bound.
+  ## It is `parseutils.rawParseInt` under register pressure, i.e. every integer literal
+  ## in every NIF file parsed as garbage.
+  (r != b.md.shiftCountReg or ShiftRegOk in props) and
+  (r != b.md.divRemReg or DivRegOk in props)
+
 proc allocStorage(b: var Builder; name: string; slot: AsmSlot; props: VarProps): Location =
   ## Decide where one local/param lives. Records reg use for scope freeing.
   if slot.isFloat:
@@ -458,6 +481,12 @@ proc trySteal(b: var Builder; curName: string; curSlot: AsmSlot;
         ",len=" & $b.rangeLen(curName) & ",dld=" & $vi.declLoopDepth & ")"
     return fallback                          # nothing colder to steal from
   let bestReg = b.ra.locs[b.ra.symPos[bestV]].r
+  if not b.fixedRoleOk(bestReg, curProps):
+    # The victim holds rdx/rcx under its OWN interval proof; this value has no such
+    # proof, so taking the register would put it across the div/shift that claims it.
+    # Declining costs one spill — `coldestVictim` is not re-run for a second choice,
+    # since a fixed-role victim is rare enough not to be worth the extra pass.
+    return fallback
   # evict the victim to its stack slot; current takes its register
   b.demoteToStack(bestV)
   when defined(arkhamHomeTrace):
@@ -677,7 +706,8 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
           let svi = b.an.vars.getOrDefault(srcName)
           if sh.kind == InReg and not sh.typ.isFloat and sh.typ.size == slot.size and
              svi.defs == 1 and svi.lastUsePos <= b.posOf(srcSym) and
-             (sh.r in b.md.intCalleeSavedSet or AllRegs in props):
+             (sh.r in b.md.intCalleeSavedSet or AllRegs in props) and
+             b.fixedRoleOk(sh.r, props):
             inheritSrc = srcName
       # NOTE: identity-cast value ALIASING (the c1-LIVE case) was reverted — it produced
       # nifasm-rejected `cmp (ptr object) (ptr object)` on the allocator (a value use of an
