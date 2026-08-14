@@ -78,25 +78,6 @@ const
                                      # leaf-param home in one of these is excluded in `allocParams`;
                                      # `pickStagingScratch` already routes staging around a live
                                      # local/param home (`regHoldsLiveLocal`).
-    intCrossCallVolatiles: @[R9, R8, RSI, RDI],
-                                     # Homes a value living ACROSS a call may take when every
-                                     # crossed call spares them. Same registers as
-                                     # `intLocalTempRegs`, in the OPPOSITE order: r9 is the last
-                                     # argument register, so it is written by the fewest calls'
-                                     # marshalling (80 % of this compiler's calls take 3 GPR
-                                     # arguments or fewer), and rdi by the most.
-                                     #
-                                     # MEASURED, DO NOT RESERVE THESE: making the pools disjoint
-                                     # (locals rdi/rsi, cross-call r8/r9) is the obvious
-                                     # "commit to it" move and it LOSES. Call-free locals are far
-                                     # more numerous, and taking two of their four volatile homes
-                                     # away put them on the stack — `rawLineInfo` alone went from
-                                     # 0 to 8 spill slots, whole-nimsem pushes 11,669 → 11,960 —
-                                     # while r8/r9 still did not become preserved, because 67 % of
-                                     # procs transitively reach the allocator (`rawAlloc`,
-                                     # `getBigChunk`, `requestOsChunks`), which genuinely uses
-                                     # every volatile. Constraining THOSE few procs is the version
-                                     # of the idea that could still pay.
     intCalleeSaved: @[RBX, R12, R13, R14, R15],
                                      # RBP is deliberately NOT here. arkham never sets up an
                                      # rbp frame, so it looks free, but adding it as a sixth
@@ -117,11 +98,6 @@ const
   ## The GPRs a SysV call clobbers — the caller-saved volatiles arkham manages
   ## (rax + the arg registers + r10/r11). Emitted as the proc's `(clobber …)`.
   x64ClobbersGpr* = [RAX, RDI, RSI, RDX, RCX, R8, R9, R10, R11]
-
-  x64ArgGprs* = {RDI, RSI, RDX, RCX, R8, R9}
-    ## The SysV integer argument registers as a set — what any call's argument
-    ## marshalling may write, INCLUDING a diverging call's (which is otherwise not a
-    ## call point at all).
 
   x64VolatileGprs* = {RAX, RDI, RSI, RDX, RCX, R8, R9, R10, R11}
     ## `x64ClobbersGpr` as a set — the WORST CASE a call site must assume, and what a

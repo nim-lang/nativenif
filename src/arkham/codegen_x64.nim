@@ -9323,8 +9323,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
                        procIsClean = isCleanSigProc(g.prog, info.decl),
                        noReturnCallees = g.noReturnProcs,
                        callClobbers = g.callSiteClobbers,
-                       volatileRegs = x64VolatileGprs,
-                       divergingClobbers = x64ArgGprs)
+                       volatileRegs = x64VolatileGprs)
   g.varType.clear()                           # reuse the backing storage across procs
   g.symType.clear()
   g.retAggrSym = NoTypeSym; g.retIndirect = false; g.retIsFloat = false
