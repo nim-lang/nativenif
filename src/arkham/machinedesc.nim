@@ -124,7 +124,22 @@ type
     InRegPair      ## ≤16B by-value aggregate in 1–2 GPRs (ABI eightbytes)
     InFReg         ## value in an FP/SIMD register
     NamedStack     ## a stack var/slot managed by nifasm, addressed by `name`
-                   ## (aggregate, spilled scalar, or synthetic spill — no cursor)
+                   ## (aggregate, spilled scalar, or synthetic spill — no cursor).
+                   ## The slot IS the value.
+    StackPtr       ## an 8-byte nifasm slot holding a POINTER to an aggregate: the
+                   ## value lives wherever the pointer points (the caller's buffer,
+                   ## or the incoming stack-arg area), and every access loads the
+                   ## pointer first. A >16B by-ref aggregate param whose pointer found
+                   ## no register home, or (AArch64) a stack-passed by-value aggregate
+                   ## addressed in place.
+                   ##
+                   ## `typ` is the AGGREGATE's slot, not the pointer's, so size/class
+                   ## questions read like any other aggregate location; the one extra
+                   ## load is what this KIND says. Formerly `NamedStack` plus the
+                   ## `spilledByRefPtr` predicate, which re-derived the distinction at
+                   ## ~30 sites from the home's slot shape and a `varType` side table —
+                   ## and a site that forgot to ask silently transferred the pointer's
+                   ## own bytes as if they were the struct.
     Mem            ## a foldable memory operand: the lvalue subtree `cur`
                    ## (`(dot …)`/`(at …)`/`(deref …)`) re-emitted on demand so
                    ## nifasm collapses the access chain to `base+offset`
@@ -190,6 +205,11 @@ type
       r1*: Reg            ## eightbyte 1 (offset 8); `NoReg` if the aggregate is 8 bytes
     of InFReg: f*: FReg
     of NamedStack, Glob, Tvar: name*: string
+    of StackPtr:
+      ptrName*: string       ## the 8-byte slot holding `&aggregate`
+      pointeeType*: string   ## the pointee's nominal type name (its layout/size).
+                             ## Not `aggrType`: `Field` already owns that name, and a
+                             ## variant's branches share one field namespace.
     of Mem: cur*: Cursor
     of Field:
       field*: string         ## the member name
@@ -237,6 +257,19 @@ proc namedStackLoc*(name: string; typ: AsmSlot; spillTemp = false): Location {.i
   ## (via a staging register), as opposed to a symbol's stack home left in place for
   ## folding. The emitter (`produceIntoMem2`) keys on it.
   Location(kind: NamedStack, name: name, typ: typ, spillTemp: spillTemp)
+proc stackPtrLoc*(name, pointeeType: string; typ: AsmSlot): Location {.inline.} =
+  ## An 8-byte `(s)` slot holding `&aggregate` — the aggregate itself is elsewhere.
+  ## `typ` is the AGGREGATE's slot (what the location's value IS), `pointeeType` its
+  ## nominal type name; the pointer's own 8-byte shape is implied by the kind and
+  ## never spelled out, so no consumer can mistake one for the other.
+  ##
+  ## The NAME (not the type cursor) because that is the key the whole layout layer
+  ## takes — `lookupType`, and `aggrLayout`/`aggrByteSize`/`fieldTypeByName` above it —
+  ## and the symbol `(ptr T)` emits. Which is also why it must not be EMPTY: an unnamed
+  ## inline aggregate type has no layout to look up, so it fails here, at construction,
+  ## rather than reaching nifasm as `(ptr )`.
+  assert pointeeType.len > 0, "arkham: by-ref aggregate " & name & " has no nominal type"
+  Location(kind: StackPtr, ptrName: name, pointeeType: pointeeType, typ: typ)
 proc globLoc*(name: string; typ: AsmSlot): Location {.inline.} =
   Location(kind: Glob, name: name, typ: typ)
 proc tvarLoc*(name: string; typ: AsmSlot): Location {.inline.} =

@@ -430,16 +430,6 @@ proc aggrByRef*(g: var CodeGen; typeName: string): bool {.inline.} =
   ## call-returned-aggregate var, param moves, incoming-arg-reg counting).
   aggrByteSize(g.prog, typeName) > g.md.aggrByRefThreshold
 
-proc spilledByRefPtr*(g: var CodeGen; name: string): bool {.inline.} =
-  ## `name` is a >16B by-ref aggregate whose POINTER was spilled to an 8-byte
-  ## `(s)` slot. Distinguished from a by-value stack struct (`NamedStack` +
-  ## `AMem` + `varType`) and from a spilled scalar pointer (`NamedStack` +
-  ## `AUInt`, no `varType`): the slot holds `&aggregate`, not the aggregate.
-  ## The HOME question — the slot is where the pointer lives for the whole proc.
-  let loc = g.ra.homeOfSym(name)
-  loc.kind == NamedStack and g.varType.hasKey(name) and
-    loc.typ.kind == AUInt and loc.typ.size == 8
-
 proc truncateImm*(v: int64; bits: int; signed: bool): int64 {.inline.} =
   ## Keep the low `bits` of `v`, sign-extending when `signed`. A Leng
   ## `cast[byte](4000)` is this truncation, not a nifasm-illegal
@@ -580,6 +570,7 @@ proc asLoc*(g: var CodeGen; c: var Cursor): Location =
       of InRegPair: result = loc
       of InFReg: result = fregLoc(loc.f, slot)
       of NamedStack: result = namedStackLoc(loc.name, slot)  # aggregate or scalar; `typ` tells apart
+      of StackPtr: result = stackPtrLoc(loc.ptrName, loc.pointeeType, slot)
       else: raiseAssert "arkham: symbol is not an lvalue: " & nm
   of TagLit:
     case c.exprKind

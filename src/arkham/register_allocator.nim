@@ -897,6 +897,13 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
           # the aggregate copy (by-ref), or to the incoming stack bytes (a64 stack-passed
           # by-value aggregate, `aggrStack`; on x86-64 those took the slot path above).
           let effSlot = if aggrByRef or aggrStack: AsmSlot(cls: AUInt, size: 8, align: 8) else: slot
+          # `viaPtr` names the spill shape for those two: the value is the AGGREGATE,
+          # but a memory home holds only its ADDRESS. `spillTo` would say `NamedStack`,
+          # which every consumer reads as "the slot IS the value" — `StackPtr` says the
+          # extra load outright, and carries the pointee's type so no side table has to.
+          let viaPtr = aggrByRef or aggrStack
+          template memHome(): Location =
+            if viaPtr: stackPtrLoc(name, typeNm, slot) else: b.spillTo(name, effSlot)
           let props = b.an.vars.getOrDefault(name).props
           var loc: Location
           if effSlot.isFloat:
@@ -967,7 +974,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
             let stayInArg = (ArgResident in props and not aggrByRef and not clobbered) or
                             (AllRegs in props and not clobbered)
             if AddrTaken in props and not aggrByRef:
-              loc = b.spillTo(name, effSlot)   # address taken → must be on the stack
+              loc = memHome()                  # address taken → must be on the stack
             elif (hasCall or aggrByRef or clobbered) and not stayInArg:
               # Live across a call (the incoming arg reg is volatile), or a by-ref
               # pointer that must survive repeated field loads in the body:
@@ -992,10 +999,10 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
                 loc = regLoc(victim.r, effSlot)
               else:
                 # Totality: no callee-saved reg and nothing colder to evict. A
-                # by-ref POINTER homes in an 8-byte `(s)` slot (`effSlot` is the
-                # pointer, not the aggregate). emitParamMoves stores the incoming
-                # arg register there; field access / `aggrAddr*` load it back.
-                loc = b.spillTo(name, effSlot)
+                # by-ref POINTER homes in an 8-byte `(s)` slot — a `StackPtr`, whose
+                # `typ` is the AGGREGATE it points at. emitParamMoves stores the
+                # incoming arg register there; field access / `aggrAddr*` load it back.
+                loc = memHome()
             else:
               loc = regLoc(arg, effSlot)       # leaf proc: stay in the arg reg
               b.freeVol.excl arg               # persistent home → not lendable to a call-free local
@@ -1021,12 +1028,12 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
               # stack param in its OWN `(s)` slot. The prologue loads it from the incoming
               # arg area into the slot through a staging bridge (`emitStackParamLoadsX64`),
               # so no register is held; correct by construction, never a hard fail.
-              loc = namedStackLoc(name, effSlot)
+              loc = memHome()
               b.ra.hasStackVars = true
             else:
               b.ra.usedCallee.incl r
               loc = regLoc(r, effSlot)
-          if loc.kind == NamedStack:
+          if loc.kind in {NamedStack, StackPtr}:
             # An address-taken / spilled param's `(s)` slot: the prologue fills it
             # from the incoming arg register (int or SIMD; see emitParamMoves).
             b.ra.hasStackVars = true
@@ -1037,8 +1044,12 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
   # to evict — the callee-saved pool is full but nothing in `scopeVars` holds it.
   # These params demote cleanly (`demoteToStack` → NamedStack scalar slot, which
   # `emitParamMoves` fills from the incoming arg register). by-ref aggregate params
-  # are EXCLUDED (not in `spillableRegParams`): demoting their pointer to a
-  # NamedStack slot would make `emitParamMoves` take its aggregate-by-value branch.
+  # are EXCLUDED (not in `spillableRegParams`): `demoteToStack` rebuilds the home as
+  # `namedStackLoc(victim, <its current typ>)`, and for a by-ref pointer that is the
+  # POINTER's slot — "the slot IS an 8-byte scalar", which is not what the pointer's
+  # readers mean. Lifting this now only needs `demoteToStack` to produce a `StackPtr`
+  # (pointee type + aggregate slot) instead; before that kind existed the shape was
+  # inexpressible, and the ban was the only way to stay correct.
   # A param already popped+demoted for a >8th stack param is now NamedStack, so
   # `coldestVictim` skips it (it tests `vloc.kind == InReg`) — harmless to list.
   for p in spillableRegParams:

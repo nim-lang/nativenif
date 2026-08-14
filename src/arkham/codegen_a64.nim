@@ -362,10 +362,9 @@ proc emAggrFieldMem(g: var CodeGen; base, field: string) =
   ## (a by-reference param) → through the pointer.
   let loc = g.ra.homeOfSym(base)
   case loc.kind
-  of NamedStack:
-    if g.spilledByRefPtr(base):
-      raiseAssert "arkham a64: spilled by-ref field must go through a loaded pointer: " & base
-    g.emFieldMem(base, field)
+  of NamedStack: g.emFieldMem(base, field)
+  of StackPtr:
+    raiseAssert "arkham a64: spilled by-ref field must go through a loaded pointer: " & base
   of InReg:      g.emPtrFieldMem(loc.r, g.varType[base], field)
   of InRegPair:
     raiseAssert "arkham a64: InRegPair field must go through pairFieldReg: " & base
@@ -381,11 +380,11 @@ proc emAggrDot(g: var CodeGen; base, field: string) =
   let loc = g.ra.homeOfSym(base)
   case loc.kind
   of NamedStack:
-    if g.spilledByRefPtr(base):
-      raiseAssert "arkham a64: spilled by-ref field must go through a loaded pointer: " & base
     g.ab.tree DotX:
       g.ab.sym base
       g.ab.sym field
+  of StackPtr:
+    raiseAssert "arkham a64: spilled by-ref field must go through a loaded pointer: " & base
   of InReg:
     g.ab.tree DotX:
       g.ab.tree CastX:
@@ -979,8 +978,8 @@ proc aggrWordsToFromRegs(g: var CodeGen; varName, typeName: string;
     of scGlobal: g.emGlobalAddr(bridge, varName)       # `(ret NoNifLineInfo)`: a global
     of scTvar: g.genTlvAddr(varName, bridge)           # source, addressed with `adr`
     else:
-      if loc.kind == NamedStack and g.spilledByRefPtr(varName):
-        g.emScalarLoad(bridge, varName)                # slot holds &aggregate
+      if loc.kind == StackPtr:
+        g.emScalarLoad(bridge, loc.ptrName)            # slot holds &aggregate
       else:
         g.ab.tree LeaA64: (g.emReg bridge; g.ab.sym varName)  # bridge ← &slot
     baseReg = bridge
@@ -1227,14 +1226,21 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
         if c.kind == Symbol and slotOf(g.prog, c).kind == AMem: tn = symName(c)
         while c.hasMore: skip c               # type (+ anything else)
       let loc = g.ra.homeOfSym(nm)
-      if tn.len > 0 and loc.kind == NamedStack:
+      if tn.len > 0 and loc.kind == StackPtr:
+        # A >16B by-ref aggregate whose POINTER found no register home: its slot is
+        # `(ptr T)`, filled from the incoming arg register. (The home's KIND says the
+        # slot holds an address — formerly this asked the ABI plan's `pl.byRef` while
+        # every reader asked `spilledByRefPtr`, two answers to one question.)
+        assert not pl.onStack, "arkham v1: stack-passed by-ref param without a register home"
         g.varType[nm] = tn
-        if pl.byRef:
-          g.emByRefPtrStackVar(nm, tn)
-          g.emScalarStore(nm, g.md.gprAt(pl))
-        else:
-          g.emStackVar(nm, tn)
-          g.regsToStruct(nm, tn, pl.gpFirst)
+        g.emByRefPtrStackVar(nm, tn)
+        g.emScalarStore(nm, g.md.gprAt(pl))
+      elif tn.len > 0 and loc.kind == NamedStack:
+        # A register-passed ≤16B by-value aggregate that could not stay in a GPR pair:
+        # its slot IS the struct, filled word by word from the arg registers.
+        g.varType[nm] = tn
+        g.emStackVar(nm, tn)
+        g.regsToStruct(nm, tn, pl.gpFirst)
       elif tn.len > 0 and loc.kind == InRegPair:
         # ≤16B by-value aggregate kept in GPRs (the ABI eightbytes ARE the fields).
         g.varType[nm] = tn
@@ -1397,7 +1403,7 @@ proc genStmt2(g: var CodeGen; c: Cursor)
 proc emLvalAddr2(g: var CodeGen; c: Cursor)
 proc prematLval2(g: var CodeGen; c: Cursor)
 proc unbindLvalTemps2(g: var CodeGen; c: Cursor)
-proc genConstr2(g: var CodeGen; c: Cursor; dstVar: string)
+proc genConstr2(g: var CodeGen; c: Cursor; dst: Location)
 proc genAconstr2(g: var CodeGen; c: Cursor; dstVar: string)
 
 # ── fused value core (step 3): decide-and-emit overloads ─────────────────────
@@ -1830,9 +1836,9 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
       g.ab.tree CastX:
         g.ab.ptrType: g.ab.sym g.varType[nm]
         g.emReg loc.r
-    elif loc.kind == NamedStack and g.spilledByRefPtr(nm):
+    elif loc.kind == StackPtr:
       g.ab.tree CastX:
-        g.ab.ptrType: g.ab.sym g.varType[nm]
+        g.ab.ptrType: g.ab.sym loc.pointeeType
         g.emReg g.lvalGlobBase[g.posOf(c)]
     elif loc.kind == InRegPair:
       raiseAssert "arkham a64n: address of InRegPair local " & nm
@@ -2003,10 +2009,12 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
       # materialization; pre-fuse it was bound by the caller).
       if loc.isTemp and not g.rb.isBoundTemp(loc.r): g.bindTemp(loc.r, ScalarSlot)
       g.emGlobalAddr(loc.r, symName(c))
-    elif g.spilledByRefPtr(symName(c)):
-      let s = g.takeBridge()
-      g.emScalarLoad(s, symName(c))
-      g.lvalGlobBase[g.posOf(c)] = s
+    else:
+      let home = g.ra.homeOfSym(symName(c))
+      if home.kind == StackPtr:                # the slot holds &aggregate: load it first
+        let s = g.takeBridge()
+        g.emScalarLoad(s, home.ptrName)
+        g.lvalGlobBase[g.posOf(c)] = s
     return
   if c.kind == TagLit:
     case c.exprKind
@@ -2206,12 +2214,10 @@ proc aggrAddrInto(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind:
     if doBind: g.bindTemp(dest, aslot)
     case home.kind
     of NamedStack:
-      if g.spilledByRefPtr(home.name):
-        g.emScalarLoad(dest, home.name)
-      else:
-        g.ab.tree LeaA64:
-          g.emReg dest
-          g.ab.sym home.name
+      g.ab.tree LeaA64:
+        g.emReg dest
+        g.ab.sym home.name
+    of StackPtr: g.emScalarLoad(dest, home.ptrName)     # the slot already IS the address
     of InReg: g.movReg(dest, home.r)                    # by-ref aggregate param: reg holds &it
     of InRegPair:
       raiseAssert "arkham a64n: aggrAddr of InRegPair local " & symName(lv)
@@ -2695,7 +2701,7 @@ proc copyStructThroughPtr2(g: var CodeGen; srcVar, typeName: string; ptrReg: Reg
   let sp = g.takeBridge()
   let home = g.ra.homeOfSym(srcVar)
   if home.kind == InReg: g.movReg(sp, home.r)
-  elif g.spilledByRefPtr(srcVar): g.emScalarLoad(sp, srcVar)
+  elif home.kind == StackPtr: g.emScalarLoad(sp, home.ptrName)
   else:
     g.ab.tree LeaA64: (g.emReg sp; g.ab.sym srcVar)        # sp = &srcVar
   let tmp = g.takeBridge(avoid = sp)
@@ -2742,7 +2748,7 @@ proc aggrArgAddr(g: var CodeGen; a: Cursor; dst: Reg) =
       let home = symName(a)
       let hl = g.ra.locationOfSym(home, cursorToPosition(g.buf[], a))
       if hl.kind == InReg: g.movReg(dst, hl.r)          # by-ref param: pointer already in a reg
-      elif g.spilledByRefPtr(home): g.emScalarLoad(dst, home)
+      elif hl.kind == StackPtr: g.emScalarLoad(dst, hl.ptrName)   # its slot holds the pointer
       else: g.ab.tree LeaA64: (g.emReg dst; g.ab.sym home)
   else:                                                 # oconstr/aconstr → build into a temp, then &temp
     let pos = g.posOf(a)
@@ -2971,9 +2977,9 @@ proc constrFieldStores(g: var CodeGen; c: Cursor; base: Location) =
   ## offset 0; `aggrLayout` lists base fields first). Mirrors the leng C backend.
   var base = base
   var loaded = NoReg
-  if base.kind == NamedStack and g.spilledByRefPtr(base.name):
+  if base.kind == StackPtr:
     loaded = g.takeBridge()
-    g.emScalarLoad(loaded, base.name)
+    g.emScalarLoad(loaded, base.ptrName)
     base = regLoc(loaded, ScalarSlot)
   var tc = c; inc tc                                    # the constructed type symbol
   let typeName = symName(tc)
@@ -3070,8 +3076,12 @@ template aconstrElemStores(g: var CodeGen; c: Cursor; destOp, addrOp: untyped) =
         inc i
         skip cc
 
-proc genConstr2(g: var CodeGen; c: Cursor; dstVar: string) =
-  g.constrFieldStores(c, namedStackLoc(dstVar, ScalarSlot))   # base = the stack slot
+proc genConstr2(g: var CodeGen; c: Cursor; dst: Location) =
+  ## `dst` is the destination aggregate's own location — a `NamedStack` slot, or a
+  ## `StackPtr` whose pointer `constrFieldStores` loads into a base register. (It used
+  ## to take the NAME and rebuild a `NamedStack` from it, which erased the difference
+  ## and left the pointer case to a predicate re-derived downstream.)
+  g.constrFieldStores(c, dst)
 
 proc genAconstr2(g: var CodeGen; c: Cursor; dstVar: string) =
   template dest(i) = g.emAggrElemMem(dstVar, i)
@@ -3123,12 +3133,10 @@ proc aggrAddrLoc(g: var CodeGen; loc: Location; dest: Reg) =
   ## of `aggrAddrInto`.
   case loc.kind
   of NamedStack:
-    if g.spilledByRefPtr(loc.name):
-      g.emScalarLoad(dest, loc.name)
-    else:
-      g.ab.tree LeaA64:
-        g.emReg dest
-        g.ab.sym loc.name
+    g.ab.tree LeaA64:
+      g.emReg dest
+      g.ab.sym loc.name
+  of StackPtr: g.emScalarLoad(dest, loc.ptrName)   # the slot already holds the address
   of Glob: g.emGlobalAddr(dest, loc.name)
   of Tvar: g.genTlvAddr(loc.name, dest)
   of Mem: g.aggrAddrInto(loc.cur, dest, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)
@@ -3139,11 +3147,8 @@ proc isAggrCopySrc(c: Cursor): bool =
 
 proc dstAggrInfo(g: var CodeGen; dst: Location): (bool, int) =
   case dst.kind
-  of NamedStack:
-    if g.spilledByRefPtr(dst.name):
-      (true, aggrByteSize(g.prog, g.varType[dst.name]))
-    else:
-      (dst.typ.kind == AMem, dst.typ.size)
+  of NamedStack: (dst.typ.kind == AMem, dst.typ.size)
+  of StackPtr: (true, dst.typ.size)      # `typ` is the pointee: always an aggregate
   of Glob, Tvar: (dst.typ.kind == AMem, dst.typ.size)
   of InRegPair: (true, dst.typ.size)
   of Mem:
@@ -3270,15 +3275,21 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
       g.genStore2(inner, dst)                        # the operand → same dest
       while inner.hasMore: skip inner
     return
-  if dst.kind == NamedStack and (dst.typ.kind == AMem or g.spilledByRefPtr(dst.name)):
-    let dstVar = dst.name
-    let tn = g.varType[dstVar]
-    if rhs.kind == TagLit and rhs.exprKind == OconstrC: g.genConstr2(rhs, dstVar)
-    elif rhs.kind == TagLit and rhs.exprKind == AconstrC: g.genAconstr2(rhs, dstVar)
+  if dst.kind in {NamedStack, StackPtr} and dst.typ.kind == AMem:
+    # `StackPtr` reaches its aggregate through the slot's pointer; `NamedStack` IS it.
+    let dstVar = (if dst.kind == StackPtr: dst.ptrName else: dst.name)
+    let tn = (if dst.kind == StackPtr: dst.pointeeType else: g.varType[dstVar])
+    if rhs.kind == TagLit and rhs.exprKind == OconstrC: g.genConstr2(rhs, dst)
+    elif rhs.kind == TagLit and rhs.exprKind == AconstrC:
+      if dst.kind == StackPtr:
+        # `emAggrElemMem` addresses `(at name idx)` — the SLOT — so this would fill the
+        # pointer's own 8 bytes with the elements. Unimplemented, not silently wrong.
+        raiseAssert "arkham a64n: array constructor into a spilled by-ref aggregate: " & dstVar
+      g.genAconstr2(rhs, dstVar)
     elif rhs.kind == TagLit and rhs.exprKind == CallC:
       if aggrByteSize(g.prog, tn) > 16:
-        if g.spilledByRefPtr(dstVar):
-          g.emScalarLoad(IndirectResultReg, dstVar)
+        if dst.kind == StackPtr:
+          g.emScalarLoad(IndirectResultReg, dst.ptrName)
         else:
           g.ab.tree LeaA64: (g.emReg IndirectResultReg; g.ab.sym dstVar)
         var d = dontCare
@@ -4842,11 +4853,17 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
               g.emTypedStackVar(home, g.getType(a))
               g.varType[home] = tn
               g.genStore2(a, namedStackLoc(home, callArgSlots[j]))
+            let hh = g.ra.homeOfSym(home)
             if pl.byRef:
               if isTvar: g.genTlvAddr(symName(a), g.md.gprAt(pl))
               elif isGlobal: g.emGlobalAddr(g.md.gprAt(pl), symName(a))
-              elif g.ra.homeOfSym(home).kind == InReg:
-                g.movReg(g.md.gprAt(pl), g.ra.homeOfSym(home).r)
+              elif hh.kind == InReg:
+                g.movReg(g.md.gprAt(pl), hh.r)
+              elif hh.kind == StackPtr:
+                # Forwarding a by-ref param whose own pointer spilled: pass the pointer
+                # the slot HOLDS. (`lea &slot` would pass the address OF the pointer —
+                # what this arm did before the home could say so.)
+                g.emScalarLoad(g.md.gprAt(pl), hh.ptrName)
               else: g.ab.tree LeaA64: (g.emReg g.md.gprAt(pl); g.ab.sym home)
             else:
               if isGlobal: g.globalToRegs(symName(a), tn, pl.gpFirst, isTvar)
@@ -4995,11 +5012,14 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
             g.emTypedStackVar(home, tcur)
             g.varType[home] = tn
             g.genStore2(a, namedStackLoc(home, g.exprSlot(a)))
+          let hh = g.ra.homeOfSym(home)
           if sz > 16:
             if isTvar: g.genTlvAddr(symName(a), IntArgRegs[intIdx])
             elif isGlobal: g.emGlobalAddr(IntArgRegs[intIdx], symName(a))
-            elif g.ra.homeOfSym(home).kind == InReg:
-              g.movReg(IntArgRegs[intIdx], g.ra.homeOfSym(home).r)
+            elif hh.kind == InReg:
+              g.movReg(IntArgRegs[intIdx], hh.r)
+            elif hh.kind == StackPtr:
+              g.emScalarLoad(IntArgRegs[intIdx], hh.ptrName)   # the slot holds &aggregate
             else: g.ab.tree LeaA64: (g.emReg IntArgRegs[intIdx]; g.ab.sym home)
             inc intIdx
           else:
