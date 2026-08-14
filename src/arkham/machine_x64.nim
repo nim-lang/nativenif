@@ -99,18 +99,6 @@ const
   ## (rax + the arg registers + r10/r11). Emitted as the proc's `(clobber …)`.
   x64ClobbersGpr* = [RAX, RDI, RSI, RDX, RCX, R8, R9, R10, R11]
 
-  x64VolatileGprs* = {RAX, RDI, RSI, RDX, RCX, R8, R9, R10, R11}
-    ## `x64ClobbersGpr` as a set — the WORST CASE a call site must assume, and what a
-    ## proc declares when its own footprint could not be established. Callsite-specific
-    ## clobber lists narrow this per callee (see `scanFootprint`); everything that
-    ## cannot be narrowed falls back here, so a miss costs performance, never
-    ## correctness.
-
-  x64AllGprs* = [RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI,
-                 R8, R9, R10, R11, R12, R13, R14, R15]
-    ## Every GPR that has an asm-NIF register-operand spelling, for interning the
-    ## scan's tag→register table.
-
   WinShadowSpace* = 32
     ## Win64 requires the caller to reserve 32 bytes below the return address that
     ## the callee may spill its four register arguments into — present whether or

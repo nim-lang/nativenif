@@ -18,7 +18,7 @@
 ## and shifts `raiseAssert` for now.
 
 import std / [assertions, tables, sets, os, algorithm, strutils]
-import nifcore, nifcdecl, nifcoreparse
+import nifcore, nifcdecl
 import slots, machinedesc, analyser, register_allocator, programs
 import asmbuf, codegen_common, machine_x64, stress
 
@@ -2313,168 +2313,6 @@ proc genType(g: var CodeGen; name: string; decl: Cursor) =
       g.ab.symDef name
       g.genTypeBody(c)
 
-# ── callsite-specific clobber lists ─────────────────────────────────────────
-#
-# A caller must treat a register as destroyed by a call unless it can prove
-# otherwise. Assuming the whole caller-saved set dies is why 90 % of arkham's
-# spills are cross-call values taken *while six volatiles sit free*. Almost every
-# call in Leng is STATIC, so the callee is known by name and its real footprint
-# can be stated in the `(clobber …)` its signature already carries — nifasm then
-# applies exactly that set at each call site and rejects a read of anything in it.
-#
-# The footprint is read back off the FINISHED body rather than accumulated during
-# emission. The body-buffer model puts `emitSignature` after the body is complete
-# (see `emitProcBody2`), so the answer is available exactly where it is needed,
-# and "which registers did we touch" is answered by the asm-NIF itself instead of
-# by a set every emit path would have to remember to update. The default is
-# `x64VolatileGprs`; the scan only ever SUBTRACTS, so a shape it does not model
-# costs a missed optimization, never a wrong answer.
-
-proc initClobberScan(g: var CodeGen) =
-  ## Intern the register-operand spellings once, so the scan compares `TagId`s.
-  if g.scanTagsReady: return
-  g.scanTagsReady = true
-  for r in x64AllGprs:
-    g.regTagIds[g.ab.tagIdFor(x64RegName r)] = r
-
-const ClobbersExt* = ".clobbers.nif"
-  ## The per-module footprint summary arkham writes beside its `.asm.nif`. It exists
-  ## because a call site in module B needs module A's answer, and A's Leng IR does not
-  ## carry it — only A's *generated code* does. Its own `(clobber …)` lists are in
-  ## `A.asm.nif`, but that file has no index and would have to be read whole; this one
-  ## is a few hundred bytes of exactly the question being asked.
-  ##
-  ## A missing summary means "assume the worst", which is what arkham did before this
-  ## existed — so a build that never wrote one is slower, never wrong.
-
-proc loadForeignClobbers(g: var CodeGen; module: string) =
-  ## Read `<module>.clobbers.nif` once. Recorded even on a miss, so a module without
-  ## a summary is not re-probed per call site.
-  if module.len == 0 or module in g.clobbersLoaded: return
-  g.clobbersLoaded.incl module
-  let path = siblingModulePath(g.prog, module, ClobbersExt)
-  if not fileExists(path): return
-  # `parseFromBuffer`, not `parseFromFile`: the summary is written with `toString`
-  # (no `(.nif27)` header / directives), which the file reader would reject.
-  var b = parseFromBuffer(readFile(path), path, sharedTags = g.buf[].tags)
-  var c = beginRead(b)
-  c.loopInto:                                     # (stmts (arch …) (p NAME (reg)…) …)
-    if c.kind == TagLit and tagName(b.tags, c.cursorTagId) == "p":
-      var e = c
-      var nm = ""
-      var regs: set[Reg] = {}
-      e.into:
-        if e.hasMore and e.kind == Symbol: (nm = symName(e); inc e)
-        while e.hasMore:
-          if e.kind == TagLit:
-            let r = tagName(b.tags, e.cursorTagId)
-            for cand in x64AllGprs:
-              if x64RegName(cand) == r: regs.incl cand
-          skip e
-      if nm.len > 0: g.foreignClobbers[nm] = regs
-    skip c
-
-proc calleeClobbersX64(g: var CodeGen; asmName: string): set[Reg] =
-  ## What a `(call asmName)` destroys, for the purposes of the CALLER's own
-  ## declaration. Not the call-site question the allocator asks — that one adds
-  ## the argument registers this particular call marshals into (see
-  ## `callSiteClobbers`); here we only need what the callee itself wrecks.
-  if asmName.len == 0: return x64VolatileGprs
-  if asmName in g.noReturnAsmNames: return {}       # returns to nobody: unobservable
-  if g.procClobbers.hasKey(asmName): return g.procClobbers[asmName]
-  let m = moduleOfSym(g.prog, asmName)
-  if m.len > 0:
-    g.loadForeignClobbers(m)
-    if g.foreignClobbers.hasKey(asmName): return g.foreignClobbers[asmName]
-  when defined(arkhamClobDbg):
-    stderr.writeLine "CLOBMISS in=" & g.curProcName & " target=" & asmName &
-      " module=" & (if m.len > 0: m else: "<local>")
-  result = x64VolatileGprs
-
-proc clobberSummaryText(g: var CodeGen): string =
-  ## Serialize `procClobbers` as the sidecar NIF. Keyed by ASM name, which for every
-  ## non-entry proc IS the fully-qualified NIF name a foreign call site spells — so
-  ## the reader looks a target up with the string it already has.
-  ##
-  ## Built as a real `TokenBuf` rather than concatenated text: a NIF symbol is quoted
-  ## when its spelling needs it (generic-instance names start with a backtick), and
-  ## getting that wrong produces a file that parses into unbalanced tags.
-  var b = createTokenBuf(64, g.buf[].pool, g.buf[].tags)
-  var names: seq[string] = @[]
-  for nm in g.procClobbers.keys: names.add nm
-  sort names                                      # deterministic: this is a build
-                                                  # artifact, and it gets diffed
-  b.openTag b.tags.registerTag("stmts")
-  for nm in names:
-    b.openTag b.tags.registerTag("p")
-    b.addSymUse nm
-    for r in x64ClobbersGpr:
-      if r in g.procClobbers[nm]:
-        b.openTag b.tags.registerTag(x64RegName r)
-        b.closeTag()
-    b.closeTag()
-  b.closeTag()
-  result = toString(b)
-
-proc scanFootprint(g: var CodeGen; c: var Cursor; acc: var set[Reg]) =
-  ## Union into `acc` every volatile GPR the emitted subtree at `c` can destroy:
-  ## every register OPERAND it mentions (a register named in an instruction may be
-  ## its destination — we do not distinguish, which is the conservative direction),
-  ## plus the implicit clobbers of the instructions that have them, plus what each
-  ## call target destroys.
-  ##
-  ## Named locals do NOT appear as registers here; their homes are added by the
-  ## caller from the allocator's own record.
-  case c.kind
-  of TagLit:
-    let t = c.cursorTagId
-    if g.regTagIds.hasKey(t):
-      acc.incl g.regTagIds[t]
-      skip c
-      return
-    let nm = tagName(g.ab.tagPool, t)
-    case nm
-    of "div", "idiv":
-      # x86 division is fixed-role: the dividend is sign/zero-extended into
-      # rdx:rax and rdx comes back holding the remainder, neither of which is
-      # written as an operand.
-      acc.incl {RAX, RDX}
-    of "repmovsb", "repmovsw", "repmovsd", "repmovsq":
-      acc.incl {RDI, RSI, RCX}                     # the string-move triple, all updated
-    of "shl", "shr", "sal", "sar", "rol", "ror", "rcl", "rcr":
-      # A *variable* count must sit in cl. A constant count names no register, but
-      # telling the two apart here would mean re-deriving the operand shape; rcx is
-      # one register and a shift is rare enough that the coarse answer is fine.
-      acc.incl RCX
-    of "prepare":
-      # `(prepare TARGET <args…> (call|extcall|iat|syscall))`
-      var b = c
-      var target = ""
-      var marker = ""
-      b.into:
-        if b.hasMore and b.kind == Symbol:
-          target = symName(b)
-          inc b
-        while b.hasMore:
-          if b.kind == TagLit:
-            let mk = tagName(g.ab.tagPool, b.cursorTagId)
-            if mk in ["call", "extcall", "iat", "syscall"]:
-              marker = mk
-              skip b
-              continue
-          scanFootprint(g, b, acc)                 # argument marshalling and its scratch
-      case marker
-      of "call": acc.incl calleeClobbersX64(g, target)
-      of "syscall": acc.incl {RAX, RCX, R11}       # the kernel's contract; args are operands
-      else: acc.incl x64VolatileGprs               # extcall/iat: a foreign C ABI, or indirect
-      skip c                                       # `b` walked a COPY; advance the real cursor
-      return
-    else: discard
-    c.loopInto:
-      scanFootprint(g, c, acc)
-  else:
-    inc c
-
 proc numIncomingArgRegs(g: var CodeGen; decl: Cursor): int =
   ## How many leading integer arg registers carry incoming values: a hidden
   ## result pointer (>16B return) + one per scalar / by-ref-aggregate param + one
@@ -2516,19 +2354,6 @@ proc emitSignature(g: var CodeGen; decl: Cursor) =
     # them in the prologue: `nifcore.kind` paid three pushes, three pops and a frame for
     # one `assert`.
     g.ab.tree ClobberD: discard
-  elif g.curProcNarrow:
-    # The callsite-specific list: exactly what the finished body destroys. The
-    # incoming argument registers are excluded for the same reason `emitAbiClobber`
-    # excludes them — nifasm reads a declared clobber as "already dead here", which
-    # would stop the body reading its own parameters. That exclusion stays sound for
-    # the CALLER too: it had to marshal those very registers to make the call, so it
-    # already treats them as gone.
-    var paramRegs: set[Reg] = {}
-    let n = g.numIncomingArgRegs(decl)
-    for i in 0 ..< min(n, g.md.intArgRegs.len): paramRegs.incl g.md.intArgRegs[i]
-    g.ab.tree ClobberD:
-      for r in x64ClobbersGpr:
-        if r in g.curProcFootprint and r notin paramRegs: g.ab.reg r
   else:
     # `numIncomingArgRegs` (not the param *count*) — it accounts for an aggregate
     # spanning several GPRs and a float consuming none.
@@ -8531,37 +8356,6 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
     for r in g.ra.homeRegs: inc maskN
     stderr.writeLine "HOMEDBG proc=" & g.curProcName & " regHomedSyms=" & $inReg &
                      " maskSize=" & $maskN
-  # The body is emitted, so the register footprint is final too: scan it before the
-  # signature is written (see `scanFootprint`). Two things the body's own text does
-  # NOT show and that are added here:
-  #  * a named local/param lives in its home register without the register ever being
-  #    spelled out — `homeRegs` is the allocator's own record of those;
-  #  * `stackArgBaseReg` is captured in the PROLOGUE, which is written after this into
-  #    the main buffer and so is not part of the scanned body.
-  # rax is included unconditionally: it is the return register and the accumulator, and
-  # nothing a caller keeps there survives a call in any case.
-  g.initClobberScan()
-  block:
-    var fp: set[Reg] = {RAX}
-    var bc = side.beginRead()
-    while bc.hasMore:
-      g.scanFootprint(bc, fp)
-    if g.ra.homesDirty: rebuildHomes(g.ra)
-    for r in g.ra.homeRegs: fp.incl r
-    fp.incl g.rawHomeRegs
-    if g.stackArgBaseReg != NoReg: fp.incl g.stackArgBaseReg
-    g.curProcFootprint = fp * x64VolatileGprs
-    g.curProcNarrow = true
-    # Publish the CALL-SITE set, which is the footprint plus every incoming argument
-    # register: the caller has to marshal those to make the call at all, so they are
-    # destroyed whether or not this callee reads them. (The `(clobber …)` declaration
-    # excludes them — nifasm reads a declared clobber as dead-on-entry — which is why
-    # the two sets are kept apart.) A later proc in this module, and any module built
-    # after it, asks this question and not the declaration's.
-    var callSite = g.curProcFootprint + {RAX}
-    let nargs = g.numIncomingArgRegs(info.decl)
-    for i in 0 ..< min(nargs, g.md.intArgRegs.len): callSite.incl g.md.intArgRegs[i]
-    g.procClobbers[info.asmName] = callSite
   # The body is emitted — `ra.usedCallee` / `hasStackVars` are final. Finalize the
   # frame and write the prologue, then splice the body after it.
   g.computeFrameX64(info.isEntry, frameHasCall)
@@ -9282,11 +9076,6 @@ proc genAsmProc(g: var CodeGen; info: ProcInfo) =
 # table (regLocal/boundTemps + the ra.locs snapshot) must be reset here or
 # RegisterBindingsMatchLoc breaks.
 proc genProc(g: var CodeGen; info: ProcInfo) =
-  # No narrow clobber list until this proc's own body has been scanned. Hand-written
-  # asm never gets one: arkham did not write those instructions and cannot vouch for
-  # what they touch.
-  g.curProcNarrow = false
-  g.curProcFootprint = {}
   if info.isAsm:
     g.genAsmProc(info)
     return
@@ -9296,34 +9085,11 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   if not g.cleanSigComputed:                   # compute the clean-signature set once
     g.cleanSigProcs = cleanSigProcNames(g.prog)
     g.noReturnProcs = noReturnProcs(g.prog)
-    # The same set by ASM name: `scanFootprint` meets call targets as they are spelled
-    # in the emitted output, not as pool ids.
-    for id in g.noReturnProcs:
-      let t = g.callTarget.getOrDefault(poolSym(g.buf[].pool, id))
-      if t.asmName.len > 0: g.noReturnAsmNames.incl t.asmName
     g.cleanSigComputed = true
-  # What each of this proc's DIRECT callees destroys at a call site. Resolved per
-  # callee (once), from procs already generated in this module and from the imported
-  # modules' `.clobbers.nif` summaries. Everything unresolved keeps the old answer.
-  block:
-    var seen = initHashSet[SymId]()
-    var callees: seq[(SymId, string)] = @[]
-    var b = info.decl
-    b.into:
-      inc b; skip b; skip b; skip b            # name, params, ret, pragmas
-      while b.hasMore: (collectCallees(b, seen, callees); skip b)
-    for (id, nifName) in callees:
-      if not g.callSiteClobbers.hasKey(id):
-        let asmName = g.callTarget.getOrDefault(nifName).asmName
-        g.callSiteClobbers[id] =
-          if asmName.len == 0: x64VolatileGprs
-          else: calleeClobbersX64(g, asmName)
   let an = analyseProc(g.buf[], info.decl,
                        cleanCallees = g.cleanSigProcs,
                        procIsClean = isCleanSigProc(g.prog, info.decl),
-                       noReturnCallees = g.noReturnProcs,
-                       callClobbers = g.callSiteClobbers,
-                       volatileRegs = x64VolatileGprs)
+                       noReturnCallees = g.noReturnProcs)
   g.varType.clear()                           # reuse the backing storage across procs
   g.symType.clear()
   g.retAggrSym = NoTypeSym; g.retIndirect = false; g.retIsFloat = false
@@ -9435,51 +9201,6 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     g.stagingPeakWhat = ""
     g.stagingLive.setLen 0
 
-proc calleeFirstOrder(g: var CodeGen): seq[int] =
-  ## Emission order for this module's procs: every proc after the local procs it
-  ## CALLS. A proc's register footprint is the union of its own and its callees',
-  ## and a callee is only known once it has been generated — so in declaration order
-  ## a forward call poisons the caller with the worst case, and that cascades up the
-  ## whole call graph. Emitting bottom-up resolves each module's graph in one pass.
-  ##
-  ## The entry proc stays FIRST regardless: it must begin the text section. It is
-  ## called once, so the worst case costs nothing there.
-  ##
-  ## Recursion (a cycle) is broken by visiting order, which leaves whichever member
-  ## is reached first with the worst case — sound, and the only alternative is a
-  ## fixpoint that this does not yet need.
-  let n = g.prog.procs.len
-  var idxOf = initTable[string, int]()
-  for i in 0 ..< n: idxOf[g.prog.procs[i].asmName] = i
-  var state = newSeq[int](n)                    # 0 = unvisited, 1 = on stack, 2 = done
-  result = @[]
-  var entry = -1
-  for i in 0 ..< n:
-    if g.prog.procs[i].isEntry: entry = i
-  proc visit(g: var CodeGen; i: int; idxOf: Table[string, int];
-             state: var seq[int]; order: var seq[int]) =
-    if state[i] != 0: return
-    state[i] = 1
-    if not g.prog.procs[i].isAsm:
-      var seen = initHashSet[SymId]()
-      var callees: seq[(SymId, string)] = @[]
-      var b = g.prog.procs[i].decl
-      b.into:
-        inc b; skip b; skip b; skip b           # name, params, ret, pragmas
-        while b.hasMore: (collectCallees(b, seen, callees); skip b)
-      for (_, nifName) in callees:
-        let asmName = g.callTarget.getOrDefault(nifName).asmName
-        if asmName.len > 0 and idxOf.hasKey(asmName):
-          let j = idxOf[asmName]
-          if state[j] == 0: visit(g, j, idxOf, state, order)
-    state[i] = 2
-    order.add i
-  if entry >= 0:
-    state[entry] = 2                            # pinned first; not a DFS target
-    result.add entry
-  for i in 0 ..< n:
-    visit(g, i, idxOf, state, result)
-
 proc genGlobal(g: var CodeGen; nifName: string; decl: Cursor) =
   ## `(gvar :name <type>)` — a zero-initialized `.bss` global (also `const`); any
   ## initializer is run at program entry by `emitGlobalInits`.
@@ -9526,7 +9247,7 @@ proc genGlobal(g: var CodeGen; nifName: string; decl: Cursor) =
     while c.hasMore: skip c                      # value (also handled at entry, if runtime)
 
 proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
-                  windows = false; clobberSummary: ptr string = nil): string =
+                  windows = false): string =
   ## Compile a parsed Leng module to x86-64 asm-NIF text — Linux/ELF by default, or
   ## Windows/PE when `windows`, which nifasm's `win_x64` target assembles to a static
   ## `.exe` whose imports bind through the import table (each extern's own
@@ -9577,11 +9298,10 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       g.genTvar(name, decl)
     for sp in g.prog.syscalls:                  # one `(syproc …)` per used syscall
       g.emitSyproc(sp)
-    for i in calleeFirstOrder(g):
-      genProc(g, g.prog.procs[i])
+    for info in g.prog.procs:
+      genProc(g, info)
     for (nm, bytes) in g.rodata:
       g.ab.tree RodataD:
         g.ab.symDef nm
         g.ab.str bytes
-  if clobberSummary != nil: clobberSummary[] = g.clobberSummaryText()
   result = g.ab.render("." & g.prog.thisModuleSuffix)

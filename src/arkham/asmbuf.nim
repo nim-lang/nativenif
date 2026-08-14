@@ -154,25 +154,6 @@ proc append*(a: var AsmBuf; other: var AsmBuf) =
     skip c
   endRead c
 
-proc beginRead*(a: var AsmBuf): Cursor {.inline.} =
-  ## A read cursor over everything written so far. The clobber scan
-  ## (`scanFootprint`) walks a finished proc BODY with this: the emitted asm-NIF
-  ## is the only place that knows every register the emitters actually touched,
-  ## and reading it back beats threading a "and I used this one too" set through
-  ## every emit path.
-  a.buf.beginRead()
-
-proc tagPool*(a: AsmBuf): TagPool {.inline.} =
-  ## The buffer's tag namespace, for a scanner that needs a tag's spelling
-  ## (`tagName`) rather than a precomputed id.
-  a.buf.tags
-
-proc tagIdFor*(a: var AsmBuf; spelling: string): TagId {.inline.} =
-  ## The interned tag id for `spelling`, using (and filling) the same cache
-  ## `openS` writes through — so a scanner can compare `cursorTagId` against a
-  ## precomputed id instead of re-deriving spellings per token.
-  a.ids.mgetOrPut(spelling, a.buf.tags.registerTag(spelling))
-
 proc render*(a: var AsmBuf; dottedSuffix = ""): string =
   ## Serialize to a full NIF module for nifasm: `(.nif27)` header, body, and a
   ## trailing embedded `(.index …)` (so nifasm resolves cross-module symbols

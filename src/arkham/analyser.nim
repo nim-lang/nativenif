@@ -29,7 +29,6 @@ import std / [tables, sets, assertions, os, strutils]
 import nifcore
 import nifcdecl
 import slots
-import machinedesc   # `Reg`: the per-callee clobber sets that drive `survivorRegs`
 
 let birthFilterEnv = getEnv("ARKHAM_BIRTH_FILTER")
   ## debug bisection toggle: "" = birth-point exemption everywhere (normal);
@@ -67,16 +66,6 @@ type
                                ## `freeAfter` crosses the range.
     lastUsePos*: int           ## PRECISE last-use position, tracked for ALL vars incl.
                                ## params (whose `freeAfter` is pinned to `high`).
-    survivorRegs*: set[Reg]    ## the volatile registers that survive EVERY call this
-                               ## value's live range crosses — i.e. that no crossed
-                               ## callee destroys and no crossed call's argument
-                               ## marshalling writes. A cross-call value homed in one
-                               ## of these needs neither a callee-saved register (a
-                               ## prologue push/pop) nor a stack slot; it is simply
-                               ## resident. Empty unless the backend supplied per-callee
-                               ## clobber sets, which makes the whole mechanism opt-in
-                               ## per architecture. Meaningless when `AllRegs` is set
-                               ## (nothing is crossed at all).
     usedAfterCall*: bool       ## a use occurred while a call had already RETURNED
                                ## (`completedCalls > 0`) → the value must survive that call.
                                ## Disqualifies a param from `ArgResident`.
@@ -115,9 +104,6 @@ type
                                 ## fp/lr frame decision is this same question
     callPositions*: seq[int]    ## token positions of every call — the allocator's
                                 ## caller-save cost model counts how many a var crosses
-    callClobberAt*: seq[set[Reg]] ## index-aligned with `callPositions`: what the call at
-                                ## that position destroys. Every append to one MUST append
-                                ## to the other.
     clobbersDivReg*: bool       ## body contains a div/mod → rdx is clobbered, so a
                                 ## leaf param must not be homed there (x86-64 only)
     clobbersBridgeReg*: bool    ## body contains an `(instr …)` row whose lowering claims
@@ -207,17 +193,6 @@ type
                                ## at its own index is a self-move. A call to anything else
                                ## (indirect, or an aggregate/float/retIndirect signature) can
                                ## shift ordinals, so param args there are `ArgResident`-unsafe.
-    callClobbers: Table[SymId, set[Reg]] ## per DIRECT callee, what a call to it destroys
-                               ## at the call site: the callee's own register footprint
-                               ## plus the argument registers the marshalling writes.
-                               ## A callee absent from the table destroys everything
-                               ## (`volatileRegs`), which is what arkham assumed for
-                               ## every call before callsite-specific lists existed.
-    volatileRegs: set[Reg]     ## the caller-saved pool of the target machine; `{}` turns
-                               ## the survivor analysis off entirely.
-    callClobberAt: seq[set[Reg]] ## aligned with `callPositions`: what the call at that
-                               ## position destroys. Kept parallel rather than folded into
-                               ## a tuple so the existing position loops stay untouched.
     noReturnCallees: HashSet[SymId] ## pool ids of `(attr "noreturn")` procs. A call to
                                ## one is NOT a call point for liveness: it never returns, so
                                ## nothing textually after it is reachable *through* it and no
@@ -486,10 +461,6 @@ proc analyse(c: var Context; n: var Cursor) =
       # treat it like a call point: locals live across it must avoid the volatile
       # argument registers.
       c.callPositions.add posOf(c, n)
-      # `callClobberAt` is index-aligned with `callPositions`; EVERY append to one
-      # must append to the other or the survivor analysis attributes one call's
-      # clobbers to another. The thunk is opaque here, so it destroys everything.
-      c.callClobberAt.add c.volatileRegs
       if c.loopStack.len > 0: c.loopStack[^1].sawCall = true
       inc c.completedCalls              # the thunk call clobbers the arg regs here and now
     inc n
@@ -639,15 +610,6 @@ proc analyse(c: var Context; n: var Cursor) =
         c.noReturnPositions.add posOf(c, n)
       else:
         c.callPositions.add posOf(c, n)
-        # What THIS call destroys. An unresolved target (indirect, foreign without a
-        # summary, or a module compiled before the summaries existed) answers with the
-        # whole caller-saved set — the pre-existing assumption for every call.
-        block:
-          var cl = c.volatileRegs
-          let probe = sub(n)
-          if probe.hasMore and probe.kind == Symbol and c.callClobbers.hasKey(probe.symId):
-            cl = c.callClobbers[probe.symId]
-          c.callClobberAt.add cl
         if c.loopStack.len > 0: c.loopStack[^1].sawCall = true
       # ArgResident safety walk (peek only; the real accounting is analyseChildren below).
       # A param P may stay in its arg register across its consuming call only if that call
@@ -822,19 +784,12 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
                   tvars: HashSet[string] = initHashSet[string]();
                   cleanCallees: HashSet[string] = initHashSet[string]();
                   procIsClean = false;
-                  noReturnCallees: HashSet[SymId] = initHashSet[SymId]();
-                  callClobbers: Table[SymId, set[Reg]] = initTable[SymId, set[Reg]]();
-                  volatileRegs: set[Reg] = {}): ProcAnalysis =
+                  noReturnCallees: HashSet[SymId] = initHashSet[SymId]()): ProcAnalysis =
   ## `procDecl` is at a `(proc name params rettype pragmas body)`. `tvars` names
   ## the module's thread-locals so their uses force a call-like analysis. `buf` is the
   ## buffer `procDecl` points into (for cursor → position mapping).
-  ##
-  ## `callClobbers`/`volatileRegs` drive `VarInfo.survivorRegs` — the per-callee clobber
-  ## information that lets a cross-call value stay in a volatile. Both default to empty,
-  ## which reproduces the old "every call destroys every caller-saved register" model.
   var c = Context(tvars: tvars, cleanCallees: cleanCallees,
                   noReturnCallees: noReturnCallees,
-                  callClobbers: callClobbers, volatileRegs: volatileRegs,
                   procIsClean: procIsClean, buf: addr buf)
   var n = procDecl
   assert n.stmtKind == ProcS
@@ -853,7 +808,6 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
       iterStmts(c, n): analyse(c, n)    # shares it rather than pushing its own)
   c.res.hasCall = c.callPositions.len > 0 or c.sawNoReturnCall
   c.res.callPositions = c.callPositions
-  c.res.callClobberAt = c.callClobberAt
   # Grant `AllRegs` (volatile/caller-saved eligible) to every local whose live
   # interval `(liveStart, freeAfter]` contains no call point. Loop-body locals
   # need no special span: their lifetime is per-iteration, and an OUTSIDE-
@@ -891,18 +845,8 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
              else: vi.liveStart
     let hi = if isParam: vi.lastUsePos else: vi.freeAfter
     var crossesCall = false
-    # …and, in the same sweep, which volatiles survive all of them. `AllRegs` answers
-    # "does this value cross a call at all"; `survivorRegs` answers the finer question
-    # the allocator actually wants once the answer is yes — WHICH registers the crossed
-    # calls leave alone. Almost every call in Leng is static, so most crossings subtract
-    # a small named set rather than the whole caller-saved file.
-    var surv = c.volatileRegs
-    for i in 0 ..< c.callPositions.len:
-      let p = c.callPositions[i]
-      if p > lo and p <= hi:
-        crossesCall = true
-        if i < c.callClobberAt.len: surv = surv - c.callClobberAt[i]
-    vi.survivorRegs = surv
+    for p in c.callPositions:
+      if p > lo and p <= hi: (crossesCall = true; break)
     when defined(arkhamStrictNoReturn):
       # EXPERIMENT: also deny `AllRegs` across a DIVERGING call. Machine-state-wise
       # that is pure pessimism — a call that never returns clobbers nothing anyone can

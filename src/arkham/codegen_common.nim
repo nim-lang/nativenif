@@ -239,43 +239,6 @@ type
                                              ## a call to one is not a liveness call point.
                                              ## Computed once, alongside `cleanSigProcs`.
     cleanSigComputed*: bool
-    noReturnAsmNames*: HashSet[string]       ## `noReturnProcs` by ASM name: a `(prepare NAME …
-                                             ## (call))` in the emitted output names its target
-                                             ## this way, and a callee that never returns destroys
-                                             ## nothing its caller can observe.
-    procClobbers*: Table[string, set[Reg]]   ## asm name → the volatile GPRs a proc GENERATED IN
-                                             ## THIS MODULE actually destroys, as scanned off its
-                                             ## finished body. Only procs that reach a narrow
-                                             ## answer are in here; everything else is assumed to
-                                             ## destroy the whole caller-saved set, so a missing
-                                             ## entry is the safe reading. See `scanFootprint`.
-    foreignClobbers*: Table[string, set[Reg]]## the same, for procs of OTHER modules, read from
-                                             ## their `<module>.clobbers.nif` summary. Keyed by
-                                             ## NIF name (what a call site spells), and only
-                                             ## populated for modules whose summary file exists —
-                                             ## a build that never wrote one degrades to the full
-                                             ## set rather than to a wrong one.
-    callSiteClobbers*: Table[SymId, set[Reg]]## per direct callee (by pool id, the way a call
-                                             ## site names it), what a call to it destroys —
-                                             ## its footprint plus the argument registers the
-                                             ## marshalling writes. Handed to `analyseProc`,
-                                             ## which turns it into `VarInfo.survivorRegs`.
-                                             ## Filled lazily and kept across procs: a callee
-                                             ## resolves once per module, not once per call.
-    clobbersLoaded*: HashSet[string]         ## module suffixes whose summary was already read
-                                             ## (or found missing); keeps the miss from re-hitting
-                                             ## the filesystem once per call site.
-    regTagIds*: Table[TagId, Reg]            ## asm-NIF register-operand tag → `Reg`, interned
-                                             ## once. `scanFootprint` compares ids, never
-                                             ## spellings.
-    scanTagsReady*: bool
-    curProcFootprint*: set[Reg]              ## the volatile GPRs the proc being emitted
-                                             ## destroys, scanned off its finished body.
-    curProcNarrow*: bool                     ## the scan reached a definite answer for this proc,
-                                             ## so `emitSignature` may declare `curProcFootprint`
-                                             ## instead of the whole ABI set. False is always the
-                                             ## safe reading and is what every unscanned path
-                                             ## (hand-written asm, an unresolved callee) leaves.
     savedHomes*: Table[int, Location]        ## value-core pure path: a deref/at/pat base or
                                              ## index left in its stack home by the allocator is
                                              ## loaded into a transient staging reg for the lval
