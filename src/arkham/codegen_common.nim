@@ -36,10 +36,44 @@ type
     ## How to re-emit the TYPE of a named local/param binding. `RegBind` keeps only
     ## the name and the pointer bit, but `(rebind :name TYPE (reg))` must name the
     ## same type the `(var …)` declared, so the two producers record theirs here.
-    aggrName*: string                        ## non-empty ⇒ `(ptr <aggrName>)`
+    aggrSym*: SymId                          ## set ⇒ `(ptr <that type>)`, by pool id
                                              ## (`emRegAggrPtrVar`: a pointer to an aggregate)
     isPtr*: bool                             ## else `emRegLocalVar`'s rule: a pointer keeps its
     typ*: Cursor                             ## declared `(ptr T)`, everything else is `(i 64)`
+
+  CondFusion* = object
+    ## The bool that is never materialised: `(asgn b <cmp>)` … `(if b …)` emits the
+    ## compare, skips the `setcc`/`and $1` that would build `b`, and lets the branch
+    ## read the FLAGS. **328 of the 511 `setcc`+`and` sites in a nifbench build are
+    ## this shape** — hexer's inliner turning a one-expression `proc (a, b: int):
+    ## bool` into a declaration, an `(asgn b (lt …))`, a return label and a branch.
+    ##
+    ## x86-64 ONLY: `tag` is an `X64Inst` (the `jcc` that means "true"), and AArch64
+    ## has its own condition handling. `scanCondFusions` and the emitter that reads
+    ## these both live in `codegen_x64`.
+    ##
+    ## Two halves, with different lifetimes — which is why they are one object but
+    ## not one table:
+    ##  * the PLAN — `cmp` / `link` / `decl`, token positions `scanCondFusions`
+    ##    decides ONCE per proc and only reads thereafter;
+    ##  * the in-flight STATE — `tag`, written when the compare is emitted and taken
+    ##    by the branch that consumes it, live only across statements that emit no
+    ##    machine code (an unreferenced `(lab …)`, a value-less declaration, a
+    ##    `(scope …)` boundary). Reset per proc, ahead of the scan.
+    cmp*: HashSet[int]                       ## `(asgn b <cmp>)` — the compare that STAYS put
+                                             ## (moving it to the branch would name operands
+                                             ## whose scope has closed); only the ANSWER travels,
+                                             ## in the flags, which is sound because `setcc`
+                                             ## never writes them
+    link*: HashSet[int]                      ## `(asgn b2 b1)` / `(asgn b2 (not b1))` LINKS in the
+                                             ## chain: the inliner renames the bool once per
+                                             ## splice level, so the compare and the branch are
+                                             ## rarely adjacent. A link emits nothing — it re-keys
+                                             ## (and maybe inverts) the pending tag
+    decl*: HashSet[int]                      ## the matching `(var :b . bool .)` declarations —
+                                             ## nothing reads `b`, so it need not reserve a
+                                             ## register either
+    tag*: Table[string, X64Inst]             ## bool symbol → the `jcc` that means "true"
 
   CodeGen* = object
     ab*: AsmBuf
@@ -99,7 +133,9 @@ type
     loopEnds*: seq[string]                   ## stack of enclosing-loop end labels (for `break`)
     retLabel2*: string                       ## value-core: shared epilogue label a mid-proc `ret` jumps to
     retLabelUsed2*: bool                     ## value-core: a `ret` jumped to retLabel2 ⇒ emit the label
-    retAggrName*: string                     ## current proc's aggregate return type (or "")
+    retAggrSym*: SymId                       ## POOL ID of the current proc's aggregate return
+                                             ## type, `NoTypeSym` when the result is not an
+                                             ## aggregate
     retIndirect*: bool                       ## return type is >16B (x8 indirect result)
     isEntryProc*: bool                       ## the proc currently emitted is the entry
     a64Linux*: bool                          ## a64 backend: target Linux/ELF (svc-based
@@ -114,7 +150,11 @@ type
                                               ## consistent as one atomic step (the historic
                                               ## Cat-1 bug source was ad-hoc partial updates).
     indirectReg*: Reg                        ## callee-saved reg holding the x8 dest pointer
-    varType*: Table[string, string]          ## aggregate var/param name → its type name
+    varType*: Table[string, SymId]           ## aggregate var/param name → the POOL ID of its
+                                             ## nominal type: the key every layout query takes
+                                             ## (`aggrLayout`/`aggrByteSize`/`lookupType`), so a
+                                             ## lookup here hands one straight on without
+                                             ## minting a name
     stackSlots*: HashSet[string]             ## names declared as a nifasm `(var :name (s) …)`
                                              ## slot, hence addressable straight off rsp. Same
                                              ## lifetime as `varType` (arkham symbol names are
@@ -141,21 +181,9 @@ type
                                              ## with. `RegBind` keeps only the name and the
                                              ## pointer bit, and a `(rebind …)` has to name the
                                              ## same type the register was bound with.
-    fuseCondAsgn*: HashSet[int]              ## token positions of `(asgn b <cmp>)` statements
-                                             ## whose bool is consumed ONLY by the branch that
-                                             ## follows: emit the compare, skip the `setcc`/
-                                             ## `and $1`, and let the branch read the FLAGS.
-    fuseCondCopy*: HashSet[int]              ## token positions of `(asgn b2 b1)` / `(asgn b2 (not b1))`
-                                             ## LINKS in such a chain: hexer's inliner renames the
-                                             ## bool once per splice level, so the compare and the
-                                             ## branch are rarely adjacent. A link emits nothing and
-                                             ## just re-keys (and maybe inverts) the pending tag.
-    fuseCondDecl*: HashSet[int]              ## token positions of the matching `(var :b . bool .)`
-                                             ## declarations — nothing reads `b`, so it need not
-                                             ## reserve a register either.
-    pendingCondTag*: Table[string, X64Inst]  ## bool symbol → the `jcc` that means "true", set by
-                                             ## the fused `(asgn …)` and consumed by `emitCondE`.
-                                             ## Live only across statements that emit no code.
+    condFuse*: CondFusion                    ## x64: the compare-into-branch fusion — its plan
+                                             ## (which statement positions to skip) and the
+                                             ## pending flags tag. See `CondFusion`.
     postDivergeBinds*: seq[tuple[r: Reg, name: string]]
                                              ## bindings on CALLER-SAVED registers that
                                              ## `restoreBindings` re-established after a diverging
@@ -302,6 +330,14 @@ type
     asmInfo*: string                          ## last `file(line, col)` seen while walking an
                                               ## `.assembler` body: the fallback location for a
                                               ## rejection on a node with no line info of its own
+
+proc resetPlan*(cf: var CondFusion) {.inline.} =
+  ## Drop the previous proc's fusion PLAN, ahead of `scanCondFusions` deciding this
+  ## one's. Deliberately not `tag`: that is emit-time state with its own reset, and
+  ## clearing it here would tie two different lifetimes to one call.
+  cf.cmp.clear()
+  cf.link.clear()
+  cf.decl.clear()
 
 # ── user-facing diagnostics ─────────────────────────────────────────────────
 # Most of arkham's internal consistency checks are `raiseAssert`s: they can only
@@ -460,12 +496,25 @@ proc isNilImm*(loc: Location): bool {.inline.} =
   ## A `nil` value resolved to an immediate (`p = nil`, `p == nil`): emit `(nil)`.
   loc.kind == Imm and isNilSlot(loc.typ)
 
-proc aggrByRef*(g: var CodeGen; typeName: string): bool {.inline.} =
+proc aggrByRef*(g: var CodeGen; typeSym: SymId): bool {.inline.} =
   ## SysV/AAPCS: an aggregate larger than the by-value threshold is passed AND
   ## returned by reference (a hidden pointer) instead of in registers — the single
   ## predicate behind every "by-ref vs by-value" branch (call marshalling, a
   ## call-returned-aggregate var, param moves, incoming-arg-reg counting).
-  aggrByteSize(g.prog, typeName) > g.md.aggrByRefThreshold
+  aggrByteSize(g.prog, typeSym) > g.md.aggrByRefThreshold
+
+proc emTypeSym*(g: var CodeGen; id: SymId) {.inline.} =
+  ## Emit the nominal type `id` as an asm-NIF symbol — THE boundary where a pool id
+  ## becomes text, and now the only one. The asm buffer gets its own pool
+  ## (`initAsmBuf` calls `createTokenBuf` with no `sharedPool`), so an INPUT-pool id
+  ## is meaningless there and the name has to cross as characters; `addSymUse`
+  ## re-interns it on the far side.
+  ##
+  ## Everything upstream of this call is keyed by the id: `lookupType` and the
+  ## layout API over it, `varType`, `Location.StackPtr.pointeeType` /
+  ## `Location.Field.aggrType`, `retAggrSym`. `pool.syms[]` yields `lent string`, so
+  ## the operand costs no copy.
+  g.ab.sym g.prog.pool.syms[id]
 
 proc truncateImm*(v: int64; bits: int; signed: bool): int64 {.inline.} =
   ## Keep the low `bits` of `v`, sign-extending when `signed`. A Leng
@@ -1456,8 +1505,8 @@ proc pairFieldReg*(g: var CodeGen; c: Cursor): Reg =
     skip cc
     if cc.kind != Symbol: return
     let field = symName(cc)
-    let tn = g.varType.getOrDefault(base)
-    if tn.len == 0: return
+    let tn = g.varType.getOrDefault(base, NoTypeSym)
+    if tn == NoTypeSym: return
     for f in aggrLayout(g.prog, tn):
       if f.name == field:
         if f.size == 8 and (f.off and 7) == 0:

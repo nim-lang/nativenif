@@ -871,7 +871,11 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
         assert params.kind == SymbolDef
         let name = symName(params); inc params
         skip params                          # pragmas
-        let typeNm = if params.kind == Symbol: symName(params) else: ""
+        # The param type's POOL ID: what a `StackPtr` home carries, and the key the
+        # layout API (`canHomeInRegPair` here) takes. `default(SymId)` for a param
+        # whose type is not a named symbol — an inline structural type, which has no
+        # nominal identity to look up.
+        let typeSym = if params.kind == Symbol: params.symId else: default(SymId)
         let slot = slotOf(b.prog[], params); skip params  # type (resolves named)
         # An aggregate param, per the plan:
         #  * ≤16B by-value that FITS the remaining arg registers → REGISTER-passed
@@ -889,8 +893,8 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
         let aggrByRef = pl.isAgg and pl.byRef
         if aggrSmall:
           let props = b.an.vars.getOrDefault(name).props
-          var pairOk = AddrTaken notin props and typeNm.len > 0 and
-                       canHomeInRegPair(b.prog[], typeNm)
+          var pairOk = AddrTaken notin props and typeSym != default(SymId) and
+                       canHomeInRegPair(b.prog[], typeSym)
           var r0 = NoReg
           var r1 = NoReg
           if pairOk:
@@ -946,7 +950,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
           # extra load outright, and carries the pointee's type so no side table has to.
           let viaPtr = aggrByRef or aggrStack
           template memHome(): Location =
-            if viaPtr: stackPtrLoc(name, typeNm, slot) else: b.spillTo(name, effSlot)
+            if viaPtr: stackPtrLoc(name, typeSym, slot) else: b.spillTo(name, effSlot)
           let props = b.an.vars.getOrDefault(name).props
           var loc: Location
           if effSlot.isFloat:
