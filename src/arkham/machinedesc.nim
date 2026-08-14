@@ -219,7 +219,8 @@ type
     of Mem: cur*: Cursor
     of Field:
       field*: string         ## the member name
-      aggrType*: string      ## the enclosing aggregate's nominal type name
+      aggrType*: SymId       ## POOL ID of the enclosing aggregate's nominal type — the
+                             ## key the layout API takes, like `StackPtr.pointeeType`
       base*: FieldBase       ## how the aggregate is reached (explicit kind)
     of Imm: ival*: int64
 
@@ -279,16 +280,16 @@ proc tvarLoc*(name: string; typ: AsmSlot): Location {.inline.} =
   Location(kind: Tvar, name: name, typ: typ)
 proc memLoc*(cur: Cursor; typ: AsmSlot): Location {.inline.} =
   Location(kind: Mem, cur: cur, typ: typ)
-proc fieldLoc*(aggrType, field, baseName: string; typ: AsmSlot): Location {.inline.} =
+proc fieldLoc*(aggrType: SymId; field, baseName: string; typ: AsmSlot): Location {.inline.} =
   ## Field `field` of a stack-slot aggregate named `baseName` (the genConstr2 base).
   Location(kind: Field, aggrType: aggrType, field: field,
            base: FieldBase(kind: FbSlot, sym: baseName), typ: typ)
-proc fieldLocReg*(aggrType, field: string; baseReg: Reg; typ: AsmSlot): Location {.inline.} =
+proc fieldLocReg*(aggrType: SymId; field: string; baseReg: Reg; typ: AsmSlot): Location {.inline.} =
   ## Field `field` of an aggregate whose address is held in `baseReg` (a by-ref
   ## param / hidden-result buffer / a nested field's computed address).
   Location(kind: Field, aggrType: aggrType, field: field,
            base: FieldBase(kind: FbReg, reg: baseReg), typ: typ)
-proc fieldLocGlob*(aggrType, field, globName: string; typ: AsmSlot;
+proc fieldLocGlob*(aggrType: SymId; field, globName: string; typ: AsmSlot;
                    isTvar = false): Location {.inline.} =
   ## Field `field` of a module-level aggregate `globName` (a global, or a thread-local
   ## if `isTvar`), whose address is RE-DERIVED into a fresh transient at each field store
@@ -299,7 +300,7 @@ proc fieldLocGlob*(aggrType, field, globName: string; typ: AsmSlot;
   let base = if isTvar: FieldBase(kind: FbTvar, sym: globName)
              else: FieldBase(kind: FbGlob, sym: globName)
   Location(kind: Field, aggrType: aggrType, field: field, base: base, typ: typ)
-proc fieldLocLval*(aggrType, field: string; baseLval: Cursor; typ: AsmSlot): Location {.inline.} =
+proc fieldLocLval*(aggrType: SymId; field: string; baseLval: Cursor; typ: AsmSlot): Location {.inline.} =
   ## Field `field` of an aggregate addressed by the lvalue subtree `baseLval` (the
   ## genConstrIntoLval2 base — its embedded temps must be pre-materialized).
   Location(kind: Field, aggrType: aggrType, field: field,

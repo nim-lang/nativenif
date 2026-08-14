@@ -828,10 +828,10 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
         assert params.kind == SymbolDef
         let name = symName(params); inc params
         skip params                          # pragmas
-        let typeNm = if params.kind == Symbol: symName(params) else: ""
-        # The type's POOL ID, for a `StackPtr` home to carry (see `stackPtrLoc`). Taken
-        # from the token, which already holds it — `symName` above is the string the
-        # name-keyed paths still want, not the identity.
+        # The param type's POOL ID: what a `StackPtr` home carries, and the key the
+        # layout API (`canHomeInRegPair` here) takes. `default(SymId)` for a param
+        # whose type is not a named symbol — an inline structural type, which has no
+        # nominal identity to look up.
         let typeSym = if params.kind == Symbol: params.symId else: default(SymId)
         let slot = slotOf(b.prog[], params); skip params  # type (resolves named)
         # An aggregate param, per the plan:
@@ -850,8 +850,8 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
         let aggrByRef = pl.isAgg and pl.byRef
         if aggrSmall:
           let props = b.an.vars.getOrDefault(name).props
-          var pairOk = AddrTaken notin props and typeNm.len > 0 and
-                       canHomeInRegPair(b.prog[], typeNm)
+          var pairOk = AddrTaken notin props and typeSym != default(SymId) and
+                       canHomeInRegPair(b.prog[], typeSym)
           var r0 = NoReg
           var r1 = NoReg
           if pairOk:

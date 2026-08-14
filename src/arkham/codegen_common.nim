@@ -36,7 +36,7 @@ type
     ## How to re-emit the TYPE of a named local/param binding. `RegBind` keeps only
     ## the name and the pointer bit, but `(rebind :name TYPE (reg))` must name the
     ## same type the `(var …)` declared, so the two producers record theirs here.
-    aggrName*: string                        ## non-empty ⇒ `(ptr <aggrName>)`
+    aggrSym*: SymId                          ## set ⇒ `(ptr <that type>)`, by pool id
                                              ## (`emRegAggrPtrVar`: a pointer to an aggregate)
     isPtr*: bool                             ## else `emRegLocalVar`'s rule: a pointer keeps its
     typ*: Cursor                             ## declared `(ptr T)`, everything else is `(i 64)`
@@ -99,7 +99,9 @@ type
     loopEnds*: seq[string]                   ## stack of enclosing-loop end labels (for `break`)
     retLabel2*: string                       ## value-core: shared epilogue label a mid-proc `ret` jumps to
     retLabelUsed2*: bool                     ## value-core: a `ret` jumped to retLabel2 ⇒ emit the label
-    retAggrName*: string                     ## current proc's aggregate return type (or "")
+    retAggrSym*: SymId                       ## POOL ID of the current proc's aggregate return
+                                             ## type, `NoTypeSym` when the result is not an
+                                             ## aggregate
     retIndirect*: bool                       ## return type is >16B (x8 indirect result)
     isEntryProc*: bool                       ## the proc currently emitted is the entry
     a64Linux*: bool                          ## a64 backend: target Linux/ELF (svc-based
@@ -114,7 +116,11 @@ type
                                               ## consistent as one atomic step (the historic
                                               ## Cat-1 bug source was ad-hoc partial updates).
     indirectReg*: Reg                        ## callee-saved reg holding the x8 dest pointer
-    varType*: Table[string, string]          ## aggregate var/param name → its type name
+    varType*: Table[string, SymId]           ## aggregate var/param name → the POOL ID of its
+                                             ## nominal type: the key every layout query takes
+                                             ## (`aggrLayout`/`aggrByteSize`/`lookupType`), so a
+                                             ## lookup here hands one straight on without
+                                             ## minting a name
     stackSlots*: HashSet[string]             ## names declared as a nifasm `(var :name (s) …)`
                                              ## slot, hence addressable straight off rsp. Same
                                              ## lifetime as `varType` (arkham symbol names are
@@ -423,22 +429,25 @@ proc isNilImm*(loc: Location): bool {.inline.} =
   ## A `nil` value resolved to an immediate (`p = nil`, `p == nil`): emit `(nil)`.
   loc.kind == Imm and isNilSlot(loc.typ)
 
-proc aggrByRef*(g: var CodeGen; typeName: string): bool {.inline.} =
+proc aggrByRef*(g: var CodeGen; typeSym: SymId): bool {.inline.} =
   ## SysV/AAPCS: an aggregate larger than the by-value threshold is passed AND
   ## returned by reference (a hidden pointer) instead of in registers — the single
   ## predicate behind every "by-ref vs by-value" branch (call marshalling, a
   ## call-returned-aggregate var, param moves, incoming-arg-reg counting).
-  aggrByteSize(g.prog, typeName) > g.md.aggrByRefThreshold
+  aggrByteSize(g.prog, typeSym) > g.md.aggrByRefThreshold
 
-proc typeNameOf*(g: var CodeGen; id: SymId): lent string {.inline.} =
-  ## The nominal type NAME behind a pool id (`StackPtr.pointeeType`). Text is minted
-  ## only where it is genuinely the currency: the name-keyed layout API
-  ## (`lookupType` → `aggrLayout`/`aggrByteSize`/`fieldTypeByName`), and the asm
-  ## buffer — which has its OWN pool (`initAsmBuf`), so an input-pool id means
-  ## nothing there and the symbol has to cross as characters.
+proc emTypeSym*(g: var CodeGen; id: SymId) {.inline.} =
+  ## Emit the nominal type `id` as an asm-NIF symbol — THE boundary where a pool id
+  ## becomes text, and now the only one. The asm buffer gets its own pool
+  ## (`initAsmBuf` calls `createTokenBuf` with no `sharedPool`), so an INPUT-pool id
+  ## is meaningless there and the name has to cross as characters; `addSymUse`
+  ## re-interns it on the far side.
   ##
-  ## `lent`, so a use in an operand costs no copy: the pool owns the string.
-  g.buf[].pool.syms[id]
+  ## Everything upstream of this call is keyed by the id: `lookupType` and the
+  ## layout API over it, `varType`, `Location.StackPtr.pointeeType` /
+  ## `Location.Field.aggrType`, `retAggrSym`. `pool.syms[]` yields `lent string`, so
+  ## the operand costs no copy.
+  g.ab.sym g.prog.pool.syms[id]
 
 proc truncateImm*(v: int64; bits: int; signed: bool): int64 {.inline.} =
   ## Keep the low `bits` of `v`, sign-extending when `signed`. A Leng
@@ -1429,8 +1438,8 @@ proc pairFieldReg*(g: var CodeGen; c: Cursor): Reg =
     skip cc
     if cc.kind != Symbol: return
     let field = symName(cc)
-    let tn = g.varType.getOrDefault(base)
-    if tn.len == 0: return
+    let tn = g.varType.getOrDefault(base, NoTypeSym)
+    if tn == NoTypeSym: return
     for f in aggrLayout(g.prog, tn):
       if f.name == field:
         if f.size == 8 and (f.off and 7) == 0:

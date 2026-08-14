@@ -134,6 +134,12 @@ type
     # ── cross-module machinery ──
     scheme: SplittedModulePath              ## path template (dir/<module>.ext)
     tags: TagPool                           ## shared tag pool for parsing foreign modules
+    pool*: Pool                             ## the shared literals pool every input buffer
+                                            ## uses (main module and each foreign one, which
+                                            ## `loadModule` parses against it) — so a `SymId`
+                                            ## is comparable across all of them, and this is
+                                            ## where a name is minted from one when a
+                                            ## string-keyed boundary genuinely needs text
     loaded: Table[string, ForeignModule]    ## module suffix → loaded foreign module
     procPtr*: Cursor                        ## a synthesized `(proctype)` — the code-pointer
                                             ## type of a proc used as a value. A nifcore
@@ -150,7 +156,18 @@ type
     floatType*: Cursor                      ## synthesized `(f 64)` — type of a bare FloatLit
     boolType*: Cursor                       ## synthesized `(bool)` — type of a `(true)`/`(false)` literal
 
-  TypeEnv* = Table[string, Cursor]          ## a type-symbol table
+  TypeEnv* = Table[SymId, Cursor]           ## a type-symbol table, keyed by POOL ID —
+                                            ## the identity a `Symbol` token already
+                                            ## carries. Every lookup on the hot path
+                                            ## (a cache hit) is an integer hash; a name
+                                            ## is materialised only on the MISS path,
+                                            ## which has to parse the module suffix and
+                                            ## load a foreign module anyway.
+
+const NoTypeSym* = default(SymId)
+  ## "no nominal type": a param/local whose type is an inline structural one (no name
+  ## to look up), or a `varType` miss. `bitabs` hands out ids from 1, so 0 is never a
+  ## real symbol — this cannot collide with one.
 
 # ── Linux syscall table (shared) ────────────────────────────────────────────
 # nifasm's ELF backend is static (no dynamic linker / PLT), so an `importc`'d libc
@@ -532,13 +549,14 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## consulting it here would silently turn e.g. an `importc: "read"` into a trap
   ## into the NT kernel with Linux argument registers.
   result = Program(callTarget: initTable[string, CallTarget](),
-                   typeDecls: initTable[string, Cursor](),
+                   typeDecls: initTable[SymId, Cursor](),
                    globals: initTable[string, Cursor](),
                    tvars: initTable[string, Cursor](),
                    loaded: initTable[string, ForeignModule](),
                    gvarCName: initTable[string, string](),
                    importcOnlyGvars: initHashSet[string](),
                    scheme: splitModulePath(inputPath), tags: tags,
+                   pool: buf.pool,
                    darwin: darwin, windows: windows)
   block:
     # A standalone `(proctype)` parsed against the shared tag pool; its cursor
@@ -571,9 +589,8 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         let typeStart = ct
         var tc = ct
         tc.into:
-          let nm = symName(tc)
-          result.typeDecls[nm] = typeStart
-          result.mainTypeList.add (nm, typeStart)
+          result.typeDecls[tc.symId] = typeStart
+          result.mainTypeList.add (symName(tc), typeStart)   # emitted as text
           while tc.hasMore: skip tc           # drain so `into` stays balanced
       skip ct
   # Pass 2: globals, thread-locals and procs.
@@ -751,12 +768,20 @@ proc loadModule(p: var Program; suffix: string): ForeignModule =
   p.loaded[suffix] = m
   result = m
 
-proc lookupType*(p: var Program; name: string): Cursor =
-  ## The `(type :name …)` declaration for `name`, resolving across modules. A
-  ## name with a module suffix (`Foo.0.othermod`) triggers loading that module
-  ## (via its `.indexat` index when present); the decl is cached in `typeDecls`
-  ## and recorded in `requestedForeign` as a cross-module dependency.
-  if p.typeDecls.hasKey(name): return p.typeDecls[name]
+proc lookupType*(p: var Program; id: SymId): Cursor =
+  ## The `(type :name …)` declaration for the type symbol `id`, resolving across
+  ## modules. A name with a module suffix (`Foo.0.othermod`) triggers loading that
+  ## module (via its `.indexat` index when present); the decl is cached in
+  ## `typeDecls` and recorded in `requestedForeign` as a cross-module dependency.
+  ##
+  ## Keyed by POOL ID, so the resolved case — every call after the first for a given
+  ## type, which is the overwhelming majority — is an integer hash. The NAME is
+  ## materialised only where the work is string work anyway: splitting the module
+  ## suffix off, and asking a foreign module's index for a symbol (that index is
+  ## keyed by text). Foreign decls are interned into `p.pool` (see `getDecl`), so an
+  ## id from a foreign type's body is comparable with a main-module one.
+  if p.typeDecls.hasKey(id): return p.typeDecls[id]
+  let name = p.pool.syms[id]
   let s = splitSymName(name)
   if s.module.len == 0:
     raiseAssert "arkham: unknown type " & name
@@ -766,13 +791,14 @@ proc lookupType*(p: var Program; name: string): Cursor =
   # module — generic-instance names like `t.0.I….<self>.<self>` are the case.
   if s.module == p.scheme.name:
     let localName = name[0 ..< name.len - s.module.len]
-    if p.typeDecls.hasKey(localName): return p.typeDecls[localName]
+    let localId = p.pool.syms.getOrIncl(localName)
+    if p.typeDecls.hasKey(localId): return p.typeDecls[localId]
     raiseAssert "arkham: unknown local type " & name
   let m = loadModule(p, s.module)
   if not hasDecl(m, name):
     raiseAssert "arkham: type " & name & " not found in module " & s.module
-  let d = getDecl(m, name, p.tags)
-  p.typeDecls[name] = d
+  let d = getDecl(m, name, p.tags, p.pool)
+  p.typeDecls[id] = d
   p.requestedForeign.add (name, d)
   result = d
 
@@ -788,7 +814,7 @@ proc lookupForeignDecl*(p: var Program; name: string; found: var bool): Cursor =
   if s.module.len == 0 or s.module == p.scheme.name: return
   let m = loadModule(p, s.module)
   if not hasDecl(m, name): return
-  result = getDecl(m, name, p.tags)
+  result = getDecl(m, name, p.tags, p.pool)
   p.requestedForeign.add (name, result)
   found = true
 
@@ -813,7 +839,7 @@ proc foreignCallTarget*(p: var Program; name: string): CallTarget =
     "arkham: not a foreign proc: " & name
   let m = loadModule(p, s.module)
   assert hasDecl(m, name), "arkham: foreign proc not found: " & name
-  let declCur = getDecl(m, name, p.tags)
+  let declCur = getDecl(m, name, p.tags, p.pool)
   var d = declCur
   var retFloat = false
   var retType: Cursor
@@ -899,7 +925,7 @@ proc gvarRefName*(p: var Program; nifName: string): string =
     let s = splitSymName(nifName)
     let m = loadModule(p, s.module)
     if hasDecl(m, nifName):
-      let declCur = getDecl(m, nifName, p.tags)
+      let declCur = getDecl(m, nifName, p.tags, p.pool)
       var d = declCur
       var importcN, exportcN = ""
       d.into:
@@ -918,9 +944,9 @@ proc gvarRefName*(p: var Program; nifName: string): string =
 
 # ── named-type resolution ───────────────────────────────────────────────────
 
-proc typeBody*(p: var Program; name: string): Cursor =
+proc typeBody*(p: var Program; typeSym: SymId): Cursor =
   ## The body (3rd child) of a named type decl `(type :name pragmas body)`.
-  var d = lookupType(p, name)
+  var d = lookupType(p, typeSym)
   d.into:
     inc d; skip d                             # name, type-pragmas
     result = d                                # the body (a copy)
@@ -932,7 +958,7 @@ proc resolveType*(p: var Program; c: Cursor): Cursor =
   result = c
   var guard = 0
   while result.kind == Symbol:
-    result = typeBody(p, symName(result))
+    result = typeBody(p, result.symId)   # the token carries the id; no string is minted
     inc guard
     assert guard < 1000, "arkham: cyclic type alias"
 
@@ -1004,7 +1030,7 @@ proc typeSizeAlign*(p: var Program; c: Cursor): (int, int) =
   ## Size and alignment (bytes) of a Leng type, mirroring nifasm's layout.
   case c.kind
   of Symbol:
-    var d = lookupType(p, symName(c))
+    var d = lookupType(p, c.symId)
     d.into:
       inc d; skip d                           # name, type-pragmas
       let r = typeSizeAlign(p, d); skip d
@@ -1199,24 +1225,8 @@ proc noReturnProcs*(p: var Program): HashSet[SymId] =
       let d = lookupForeignDecl(p, name, found)
       if found and d.stmtKind == ProcS and declIsNoReturn(d): result.incl id
 
-proc aggregateTypeNames*(p: var Program): HashSet[string] =
-  ## Names of all types whose ABI class is `AMem` (object/union/array, or an alias to
-  ## one) — passed by value across >1 register or by hidden reference. The analyser uses
-  ## this to spot aggregate CALL ARGUMENTS, which consume >1 arg register and so shift the
-  ## ABI ordinals of the arguments after them (breaking an `ArgResident` param's
-  ## same-position self-move assumption). Collect names first: `slotOf` resolves named
-  ## types and may cache foreign ones into `typeDecls`, which must not mutate mid-iteration.
-  result = initHashSet[string]()
-  var names: seq[string] = @[]
-  for name in p.typeDecls.keys: names.add name
-  for name in names:
-    var d = p.typeDecls[name]
-    d.into:
-      inc d; skip d                             # name, type-pragmas → body
-      if slotOf(p, d).cls == AMem: result.incl name
-
-proc aggrByteSize*(p: var Program; typeName: string): int =
-  var d = lookupType(p, typeName)
+proc aggrByteSize*(p: var Program; typeSym: SymId): int =
+  var d = lookupType(p, typeSym)
   d.into:
     inc d; skip d                             # name, type-pragmas
     let r = typeSizeAlign(p, d); skip d
@@ -1282,15 +1292,15 @@ proc innerType*(p: var Program; t: Cursor): Cursor =
       while tc.hasMore: skip tc
   else: raiseAssert "arkham: deref/index of a non-pointer/array type"
 
-proc aggrWordCount*(p: var Program; typeName: string): int =
+proc aggrWordCount*(p: var Program; typeSym: SymId): int =
   ## Number of 8-byte GPRs a ≤16-byte aggregate occupies (1 or 2).
-  let sz = aggrByteSize(p, typeName)
+  let sz = aggrByteSize(p, typeSym)
   assert sz <= 16, "arkham v1: >16-byte aggregate ABI (by-ref / x8) not yet supported"
   (sz + 7) div 8
 
-proc aggrLayout*(p: var Program; typeName: string): seq[FieldInfo] =
+proc aggrLayout*(p: var Program; typeSym: SymId): seq[FieldInfo] =
   result = @[]
-  var d = lookupType(p, typeName)
+  var d = lookupType(p, typeSym)
   var body: Cursor
   d.into:
     inc d; skip d                             # name, type-pragmas
@@ -1298,16 +1308,17 @@ proc aggrLayout*(p: var Program; typeName: string): seq[FieldInfo] =
   if body.kind == Symbol:
     # a DISTINCT type / type alias (`(type :Wrap . Inner)`) — its body is the underlying
     # nominal type, with the SAME layout. Resolve through to it (mirrors `aggrByteSize`,
-    # which already resolves via `typeSizeAlign`). Handles chains of distincts.
-    return aggrLayout(p, symName(body))
+    # which already resolves via `typeSizeAlign`). Handles chains of distincts. The
+    # underlying type is named by a `Symbol` token, which already carries its id.
+    return aggrLayout(p, body.symId)
   assert body.kind == TagLit and body.typeKind == ObjectT,
-    "arkham: aggregate ABI requires an object type: " & typeName
+    "arkham: aggregate ABI requires an object type: " & p.pool.syms[typeSym]
   var oc = body
   var off = 0
   oc.into:
     if oc.kind == Symbol:                     # inherited base: its fields come
-      result = aggrLayout(p, symName(oc))     # first, at their base offsets (the
-      off = aggrByteSize(p, symName(oc))      # base sits at offset 0 in derived)
+      result = aggrLayout(p, oc.symId)        # first, at their base offsets (the
+      off = aggrByteSize(p, oc.symId)         # base sits at offset 0 in derived)
     skip oc                                   # base / inheritance slot
     while oc.hasMore:
       oc.into:                                # (fld :name pragmas type)
@@ -1319,23 +1330,23 @@ proc aggrLayout*(p: var Program; typeName: string): seq[FieldInfo] =
         result.add (name: fn, off: off, size: fsz)
         off += fsz
 
-proc canHomeInRegPair*(p: var Program; typeName: string): bool =
+proc canHomeInRegPair*(p: var Program; typeSym: SymId): bool =
   ## True when every field is a full 8-byte integer/pointer word at an 8-byte
   ## offset, so the ABI eightbytes ARE the fields (a `string`, a `Point` of two
   ## `int64`s). Those can live in the incoming GPR pair; a packed `{int32; int32}`
   ## still goes through a stack slot so sub-word field access has a memory
   ## operand, and a float field stays on the stack (it travels in SIMD regs).
-  let sz = aggrByteSize(p, typeName)
+  let sz = aggrByteSize(p, typeSym)
   if sz != 8 and sz != 16: return false
-  var d = lookupType(p, typeName)
+  var d = lookupType(p, typeSym)
   var body: Cursor
   d.into:
     inc d; skip d                             # name, type-pragmas
     body = d; skip d
   if body.kind == Symbol:
-    return canHomeInRegPair(p, symName(body))
+    return canHomeInRegPair(p, body.symId)
   if body.kind != TagLit or body.typeKind != ObjectT: return false
-  let lay = aggrLayout(p, typeName)
+  let lay = aggrLayout(p, typeSym)
   if lay.len == 0: return false
   for f in lay:
     if f.size != 8 or (f.off and 7) != 0: return false
