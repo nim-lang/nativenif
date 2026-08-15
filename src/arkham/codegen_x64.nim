@@ -6097,6 +6097,33 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
      not g.exprReadsRegE(lhsC, dest.r) and not g.exprReadsRegE(rhsC, dest.r):
     lDest = dest                                         # compute lhs straight into dest
   g.emitValue2(lhsC, lDest)
+  # The rhs may be FORCED to overwrite a fixed register — `div`/`idiv` take rax and
+  # rdx, a variable shift takes cl — and the seal below is no defence against that.
+  # A seal keeps the POOLS and the staging picker off a register; it cannot keep the
+  # ISA off one, and `emitDivMod2` writes rax unconditionally. So a live lhs partial
+  # sitting in such a register has to MOVE, before the rhs runs.
+  #
+  # The call marshaller has parked its already-placed arguments off exactly these
+  # registers for as long as `fixedRegsClobberedByE` has existed; this side never
+  # did. Reaching it needs pressure high enough to leave a partial in rax at all:
+  #     (add (div a b) (div c d))       every pool register held by a live local
+  # left the first quotient in rax, and the second `div` overwrote it. The `add` then
+  # added the second quotient to itself. Not silent, but only by luck — the partial
+  # happened to carry a temp binding, so nifasm rejected the `div` ("clobbers RAX,
+  # still bound to `tmp1.0") instead of assembling the wrong answer.
+  if lDest.kind == InReg and lDest.r in g.fixedRegsClobberedByE(rhsC):
+    let old = lDest
+    var safe = g.takeTmp(old.typ)                        # R10, or an etmp slot when dry
+    assert not (safe.kind == InReg and
+                safe.r in g.fixedRegsClobberedByE(rhsC)),
+      "arkham x64n: the temp pool handed out a fixed-role register"
+    if safe.kind == InReg:
+      g.bindTemp(safe.r, old.typ)
+      g.movReg(safe.r, old.r)
+    else:
+      g.emitStoreLoc(safe, old.r)                        # pools dry: park it in the slot
+    g.freeVal(old)                                       # `(kill)`s the binding on rax
+    lDest = safe
   # The lhs partial is LIVE in `lDest` across the rhs evaluation, and that
   # evaluation recurses into arbitrary emission. A bound TEMP is already off
   # limits to a staging pick (`isBoundTemp`); a FIXED destination is not — the
@@ -7231,6 +7258,20 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
     if tmp.kind != InReg: g.giveBack s
     else: g.freeVal(tmp)
     return
+  if dest.kind == NamedStack and dest.spillTemp:
+    # A SPILL-SLOT destination (`takeTmp` found the pools dry). Threading the slot
+    # down as the inner's destination and returning is what the tail of this proc
+    # used to do — and the `extendTo` below IS the cast, so the conversion was
+    # simply dropped: `cast[uint32](z)` reached its consumer with all 64 bits. It
+    # hides behind `+`/`-`/`*`, which are congruent mod 2^n; `div`, `shr` and
+    # comparisons are not (`a64_cast_narrow_spilled` divides, which is why it
+    # catches this and ordinary arithmetic does not).
+    #
+    # Route the whole node through the bridge instead: `produceIntoMem2` re-enters
+    # with a REGISTER destination, so the cast takes the normal path below and its
+    # result is stored converted. Exactly the shape the two float arms above already
+    # use, and the x86 twin of `eaaafa7`'s AArch64 fix.
+    g.produceIntoMem2(c, dest); return
   # Pre-retype a register-homed named dest to the INNER's type while the inner
   # emits, and put the target type back after the extend below. Two reasons, one
   # rule: int arithmetic under an int→ptr reinterpret must run int-typed, and the
@@ -7282,7 +7323,19 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
       if tw < 64:
         dest.ival = truncateImm(dest.ival, tw, isSignedType(tc))
     return
-  if dest.kind == NamedStack and dest.spillTemp: return  # produced into its slot already
+  var innerSlot = default(Location)
+  if dest.kind == NamedStack and dest.spillTemp:
+    # The INNER produced into a spill slot despite the register demand above
+    # (`takeTmp` found the pools dry inside the recursion). Returning here is the
+    # same dropped conversion as the spilled-DESTINATION case, one level down, and
+    # it is not hypothetical: `shift_count_clobbers_mask` reaches it on x86-64
+    # today. The re-representation below is a register operation, so bring the
+    # value into the bridge, let the tail convert it there, and store it back.
+    innerSlot = dest
+    let s = g.pickStagingSealed("a spilled cast inner", ScalarSlot)
+    g.emitLoadLoc(innerSlot, s)
+    if not g.rb.isBoundTemp(s): g.bindTemp(s, ScalarSlot)
+    dest = regLoc(s, ScalarSlot, isTemp = true)
   assert dest.kind == InReg, "arkham x64n: cast result " & $dest.kind
   let res2 = dest
   let ptrTarget = isPtrType(tc)
@@ -7328,6 +7381,14 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
       if g.rb.isBoundTemp(res2.r): g.rebindTempAs(res2.r, targetCur)
       else: g.bindTemp(res2.r, slotOf(g.prog, targetCur))
       dest.typ = slotOf(g.prog, targetCur)
+  if innerSlot.kind == NamedStack:
+    # Converted in the bridge (see above): put it back in the slot the caller was
+    # handed, and give the Location back as that slot — now carrying the TARGET's
+    # type, which is what the value in it is.
+    g.emitStoreLoc(innerSlot, res2.r)
+    g.giveBack res2.r
+    innerSlot.typ = dest.typ
+    dest = innerSlot
 
 proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false) =
   ## FUSED call. allocCall's placement decisions run inline: each scalar arg
