@@ -108,7 +108,7 @@ const arkhamA64Unsupported: seq[string] = @[
   # AAPCS64 has TEN, so every pointer stays `InReg` and the same source reaches a
   # DIFFERENT, still-open a64 gap: `genStore2` serves an aggregate destination only
   # for `NamedStack`/`StackPtr`/`Glob`/`Tvar`, and an `InReg` by-ref pointer's home
-  # carries an 8-byte pointer slot (`effSlot`, register_allocator) rather than
+  # carries an 8-byte pointer slot (`effSlot`, planer) rather than
   # `AMem` — so the location cannot say "this register addresses an aggregate" and
   # the aconstr falls through to `emitValue2`'s scalar arm. Closing it means giving
   # that home its pointee type, as `StackPtr` already does, NOT re-deriving the fact
