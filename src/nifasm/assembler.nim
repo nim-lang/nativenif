@@ -834,6 +834,37 @@ proc parseObjectBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
 proc isRegTag(locTag: TagEnum): bool =
   rawTagIsX64Reg(locTag) or rawTagIsA64Reg(locTag)
 
+proc importOrdinal(ctx: var GenContext; libPath: string): int =
+  ## The ordinal of `libPath` in the image's import table, importing it if this is
+  ## the first mention. One accessor for all three callers so a library named by
+  ## the main module and by a foreign one lands in a single entry.
+  for lib in ctx.imports:
+    if lib.name == libPath: return lib.ordinal
+  result = ctx.imports.len + 1
+  ctx.imports.add ImportedLib(name: libPath, ordinal: result)
+
+proc extprocLib(ctx: var GenContext; n: var Cursor): int =
+  ## The import-table ordinal an `(extproc :name "extname" "dll"? …)` binds to,
+  ## consuming the optional dll operand.
+  ##
+  ## Every Windows extern carries it (arkham rejects one that names no library), so
+  ## the decl is self-contained — which is what lets it be read anywhere, including
+  ## the indexed jump `resolveForeignSym` reaches a foreign module's decls by, where
+  ## no enclosing `(imp …)` is on any stack to consult. The Darwin form omits it and
+  ## falls back to the module's single library.
+  var libName = ""
+  if n.kind == StrLit:
+    libName = getStr(n)
+    inc n
+  if libName.len > 0:
+    result = ctx.importOrdinal(libName)
+  elif ctx.imports.len > 0:
+    result = ctx.imports[0].ordinal        # Mach-O: libSystem, the only one
+  else:
+    result = ctx.importOrdinal(
+      if ctx.arch in {Arch.WinX64, Arch.WinA64}: WindowsKernelDll
+      else: "/usr/lib/libSystem.B.dylib")
+
 proc openForeignModule(ctx: var GenContext; modname: string; n: Cursor) =
   ## Open a foreign module for LAZY, on-demand symbol resolution: read just its
   ## embedded NIF `.index` (symbol → byte offset) and keep the stream open. The
@@ -988,15 +1019,8 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
     if c.kind != StrLit: return nil
     let extName = getStr(c)
     inc c
+    let libOrdinal = ctx.extprocLib(c)           # the decl's own dll operand
     let typ = parseExtprocSig(c, scope, ctx)     # the Windows form carries a signature
-    if ctx.imports.len == 0:
-      # No main-module `(imp …)` was seen (the main module had no externs itself);
-      # the extern must still bind against the platform's base library, so import it
-      # implicitly — the same default the backends use for their own extern decls.
-      ctx.imports.add ImportedLib(
-        name: (if ctx.arch in {Arch.WinX64, Arch.WinA64}: WindowsKernelDll
-               else: "/usr/lib/libSystem.B.dylib"), ordinal: 1)
-    let libOrdinal = ctx.imports[^1].ordinal
     let gotSlot = ctx.gotSlotCount
     ctx.gotSlotCount += 1
     result = Symbol(name: ctx.symIdOf(fullName), kind: skExtProc, typ: typ, extName: extName,
@@ -1518,16 +1542,12 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
           if n.kind != StrLit: error("Expected library path string", n)
           let libPath = getStr(n)
           inc n
-          # Add to imports list if not already there
-          var found = false
-          for lib in ctx.imports:
-            if lib.name == libPath:
-              found = true
-              break
-          if not found:
-            ctx.imports.add ImportedLib(name: libPath, ordinal: ctx.imports.len + 1)
+          # Load this library; `(imp …)` no longer decides what BINDS to it — each
+          # `(extproc …)` names its own, so an import that only needs loading (the
+          # Darwin TLV bootstrap, with no externs at all) is expressible too.
+          discard ctx.importOrdinal(libPath)
         of ExtprocD:
-          # (extproc :name "external_name" (params …)? (result …)? (clobber …)?)
+          # (extproc :name "external_name" "dll"? (params …)? (result …)? (clobber …)?)
           inc n
           if n.kind != SymbolDef: error("Expected extproc name", n)
           let name = symName(n)
@@ -1535,11 +1555,8 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
           if n.kind != StrLit: error("Expected external symbol name string", n)
           let extName = getStr(n)
           inc n
+          let libOrdinal = ctx.extprocLib(n)     # the optional dll operand
           let typ = parseExtprocSig(n, scope, ctx)
-          # Find the library (use last imported library, or default to libSystem)
-          var libOrdinal = 1
-          if ctx.imports.len > 0:
-            libOrdinal = ctx.imports[^1].ordinal
           # Allocate GOT slot
           let gotSlot = ctx.gotSlotCount
           ctx.gotSlotCount += 1
