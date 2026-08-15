@@ -406,6 +406,7 @@ proc prematLval2(g: var CodeGen; c: Cursor; asBase = false; hint = NoReg;
 proc emLvalAddr2(g: var CodeGen; c: Cursor)
 proc emMemLval2(g: var CodeGen; c: Cursor)
 proc unbindLvalTemps2(g: var CodeGen; c: Cursor)
+proc lvalGlobBaseReg(g: var CodeGen; c: Cursor): Reg
 proc copyAggr(g: var CodeGen; dst, src: Reg; size: int; tmp: Reg)
 
 # ── fused value core (step 3): decide-and-emit overloads ─────────────────────
@@ -1051,9 +1052,18 @@ proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg =
       return r
   for r in StagingCandidates.toOpenArray(0, stressLimit(StagingCandidates.len) - 1):
     if r != avoid and not g.ra.isSealed(r) and not g.rb.isAccum(r) and
-       not g.rb.isBoundTemp(r) and not g.regHoldsLiveLocal(r):
+       not g.rb.isBoundTemp(r) and not g.regHoldsLiveLocal(r) and
+       r notin g.rawHomeRegs:
       # not `isBoundTemp`: a register holding a live scratch temp (`bindTemp`'d)
       # must not be handed out as staging — that would clobber the temp's value.
+      #
+      # not `rawHomeRegs` either, for the same reason one register further out:
+      # a param whose home is written and read as a bare `(reg)` carries NO `rb`
+      # binding, so every filter above answers "free" for it. `regFreeForTemp`
+      # guards the pool and callee-saved loops with exactly this set; this loop
+      # walked the ABI arg registers without it, and an `openArray`'s data
+      # pointer lives in one of them (rdi) — `s[i] in Digits` staged the set byte
+      # into rdi and the next `s[i]` dereferenced the byte.
       g.releaseStaleName(r)
       return r
   for r in g.md.intCalleeSaved:
@@ -2910,11 +2920,38 @@ proc binFold(g: var CodeGen; op: X64Inst; dest: Reg; loc: Location; opCur: Curso
       g.giveBack s
     else:                                         # Mem: load via the lvalue (premat base)
       g.prematLval2(opCur, foldDisp = true)
-      let s = g.pickStagingSealed("a sub-width operand", wide, avoid = dest)
-      g.ab.tree MovX64: (g.emReg s; g.emMemLval2(opCur))
-      g.unbindLvalTemps2(opCur)
-      g.binReg(op, dest, s)
-      g.giveBack s
+      var s = g.pickStagingScratch(avoid = dest)
+      if s != NoReg:
+        g.ra.seal s
+        g.bindTemp(s, wide)
+        g.stagingNote(s, "a sub-width operand")
+        g.ab.tree MovX64: (g.emReg s; g.emMemLval2(opCur))
+        g.unbindLvalTemps2(opCur)
+        g.binReg(op, dest, s)
+        g.giveBack s
+      else:
+        # Nothing free, because the premat just took the last register for the
+        # global's address. That address is dead as soon as the `mov` below has
+        # read it, so let its register BE the destination — the zero-extra-demand
+        # trick `emitLoadLoc` already uses for a global scalar. `-d:danger`
+        # `parseBiggestFloat` tests a `set[char]` held in a `const` with every
+        # other register live, and hunting for a spare one is not an option here
+        # (design.md: the emitter has no spiller, so each step's demand must fit).
+        s = g.lvalGlobBaseReg(opCur)
+        if s == NoReg or s == dest:
+          raiseAssert "arkham x64n: no staging register for a sub-width operand" &
+                      " in proc " & g.curProcName & g.stagingCensus(dest)
+        # Bound as the VALUE's type across the `mov`: the address side reads `s`
+        # through the `(cast (ptr T) …)` `emLvalAddr2` wraps a global base in, so
+        # it does not care what the binding says.
+        g.releaseStaleName(s)
+        g.bindTemp(s, wide)
+        g.ab.tree MovX64: (g.emReg s; g.emMemLval2(opCur))
+        g.unbindLvalTemps2(opCur)                 # drops the base binding, `s` with it
+        g.releaseStaleName(s)
+        g.bindTemp(s, wide)                       # `s` now carries the loaded value
+        g.binReg(op, dest, s)
+        g.unbindTemp(s)
   elif loc.kind == NamedStack:
     g.binMem(op, dest, loc)
   else:
@@ -3866,6 +3903,27 @@ proc lvalUsesReg(g: var CodeGen; c: Cursor; r: Reg): bool =
         while cc.hasMore: skip cc
     else: result = false
   else: result = false
+
+proc lvalGlobBaseReg(g: var CodeGen; c: Cursor): Reg =
+  ## The emit-time staging register `prematLval2` parked for a TRANSIENT global
+  ## base (`lea s, &global`), or `NoReg` when this lvalue has no such base. The
+  ## address it holds is dead once the consuming `mov` has read it, so `s` can
+  ## double as that `mov`'s destination when nothing else is free. Only a base
+  ## reached through `dot`/`at` qualifies: a `deref`/`pat` pointer is a VALUE the
+  ## allocator homed, not a transient this walk owns.
+  result = NoReg
+  case c.kind
+  of Symbol:
+    result = g.lvalGlobBase.getOrDefault(cursorToPosition(g.buf[], c), NoReg)
+  of TagLit:
+    case c.exprKind
+    of DotC, AtC:
+      var cc = c
+      cc.into:
+        result = g.lvalGlobBaseReg(cc)
+        while cc.hasMore: skip cc
+    else: discard
+  else: discard
 
 proc takeLvalStride(g: var CodeGen; c: Cursor; atPos: int; asBase = false;
                     hint = NoReg) =
