@@ -1404,7 +1404,7 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor)
 proc prematLval2(g: var CodeGen; c: Cursor)
 proc unbindLvalTemps2(g: var CodeGen; c: Cursor)
 proc genConstr2(g: var CodeGen; c: Cursor; dst: Location)
-proc genAconstr2(g: var CodeGen; c: Cursor; dstVar: string)
+proc genAconstr2(g: var CodeGen; c: Cursor; dst: Location)
 
 # ── fused value core (step 3): decide-and-emit overloads ─────────────────────
 # The destination is a threaded parameter (constraint in, resolved location
@@ -3083,10 +3083,27 @@ proc genConstr2(g: var CodeGen; c: Cursor; dst: Location) =
   ## and left the pointer case to a predicate re-derived downstream.)
   g.constrFieldStores(c, dst)
 
-proc genAconstr2(g: var CodeGen; c: Cursor; dstVar: string) =
-  template dest(i) = g.emAggrElemMem(dstVar, i)
-  template elemAddr(i) = g.emAggrElemAt(dstVar, i)
-  g.aconstrElemStores(c, dest, elemAddr)
+proc genAconstr2(g: var CodeGen; c: Cursor; dst: Location) =
+  ## Emit `(aconstr ArrayT e0 e1 …)` into the aggregate destination `dst`. The array
+  ## twin of `genConstr2`, and it takes the same `Location` for the same reason: a
+  ## `NamedStack` slot IS the array, while a `StackPtr` slot holds a POINTER to it (a
+  ## by-ref aggregate param whose pointer the allocator could not keep in a register).
+  ## Addressing `(at name idx)` in the second case would write the elements over the
+  ## pointer's own 8 bytes and on up the stack, so load the pointer and store through
+  ## it — exactly what `constrFieldStores` does for the `oconstr` twin.
+  if dst.kind == StackPtr:
+    let base = g.takeBridge()
+    g.emScalarLoad(base, dst.ptrName)
+    var atc = c; inc atc                                # the array type
+    let elemTy = innerType(g.prog, resolveType(g.prog, atc))
+    template destThroughPtr(i) = g.emPtrElemMem(base, elemTy, i)
+    template elemAddrThroughPtr(i) = g.emPtrElemAt(base, elemTy, i)
+    g.aconstrElemStores(c, destThroughPtr, elemAddrThroughPtr)
+    g.dropBridge base
+  else:
+    template destInSlot(i) = g.emAggrElemMem(dst.name, i)
+    template elemAddrInSlot(i) = g.emAggrElemAt(dst.name, i)
+    g.aconstrElemStores(c, destInSlot, elemAddrInSlot)
 
 proc genConstrIntoLval2(g: var CodeGen; c: Cursor; lhs: Cursor) =
   g.prematLval2(lhs)
@@ -3281,11 +3298,7 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
     let tn = (if dst.kind == StackPtr: dst.pointeeType else: g.varType[dstVar])
     if rhs.kind == TagLit and rhs.exprKind == OconstrC: g.genConstr2(rhs, dst)
     elif rhs.kind == TagLit and rhs.exprKind == AconstrC:
-      if dst.kind == StackPtr:
-        # `emAggrElemMem` addresses `(at name idx)` — the SLOT — so this would fill the
-        # pointer's own 8 bytes with the elements. Unimplemented, not silently wrong.
-        raiseAssert "arkham a64n: array constructor into a spilled by-ref aggregate: " & dstVar
-      g.genAconstr2(rhs, dstVar)
+      g.genAconstr2(rhs, dst)
     elif rhs.kind == TagLit and rhs.exprKind == CallC:
       if aggrByteSize(g.prog, tn) > 16:
         if dst.kind == StackPtr:

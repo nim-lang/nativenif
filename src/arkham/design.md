@@ -162,37 +162,44 @@ and of a right-nested spilled expression that holds its partial in the bridge wh
 evaluates the other side, grows with nesting depth, and no fixed reservation covers an
 unbounded demand.
 
-### The emergency borrow
+### Out of registers is an ERROR, not a second allocator
 
-So the transient staging picks have a last resort: `borrowEmergency` frees a register
-by **spilling its current owner to a frame slot** for the duration of the pick, and
-`giveBack` reloads it. One 8-byte slot per active borrow suffices because the borrows
-nest — depth is bounded by the expression, the slots are minted on demand
-(`mintSpillName`, so the prologue declares them after the body) and reused across the
-body. This is what makes those steps total at any pressure, rather than merely at the
-pressure the corpus happens to reach.
+The obvious answer to that unbounded demand — give the emitter a last resort — was
+built and then **removed**, and the reason it went is worth more than the mechanism
+was. It had two halves:
 
-Two conditions, and both are load-bearing:
+- `intEmergencyRegs` (rbp on x86-64): a private reserve the emitter drew from once the
+  real pools ran dry, invisible to the allocator that is supposed to own register
+  assignment.
+- `borrowEmergency`/`restoreEmergency`: freeing a register by picking a victim,
+  spilling it to a minted frame slot, killing and re-creating its binding, and
+  reloading on `giveBack`.
 
-- **The pick must be at STATEMENT position.** The borrow injects `mov` instructions;
-  a pick made while an operand tree is half-built would splice them into the middle of
-  it. So it is opt-in per site (`stmtPos = true`), granted only where the emitter is
-  between statements: `produceIntoMem2`, and `reloadMemBase2` (whose caller
-  `prematLval2` exists precisely to emit statements before the consuming instruction).
-- **The victim must be an unsealed BOUND TEMP.** Such a value is anonymous — reachable
-  only through a `Location` its owner captured further up the Nim call stack — and the
-  window is nested inside that owner's step, so the owner cannot read the register
-  before the value is back. A register homing a *named* local is excluded because code
-  inside the window can name it. A **sealed** register is excluded because the seal
-  means "the step now emitting still needs this": `genAggrCopyStore` seals its source
-  and destination addresses and then reads both throughout `copyAggr`, so displacing
-  one there is a silent miscompile — which is exactly what `ARKHAM_STRESS_EMERGENCY`
-  reported as `baseobj_slice` the first time that site was (wrongly) opted in.
+That second one **is spilling** — the allocator's job, done a second time in a second
+place with a second set of rules about who may be displaced (not sealed, not a named
+local, not an accumulator, only at statement position…). Two allocators disagreeing
+about who owns a register is a worse failure mode than running out of them, so
+`pickStaging`/`pickStagingSealed` are deliberately **not total**: out of registers
+fails loudly, and the fix belongs upstream in the allocator or in the demand of the
+step that asked.
+
+Removing the relief immediately exposed a real bug it had been masking, which is the
+usual shape of this argument: the `cmp` emitter gave its LEFT operand a precise slot
+when pointer-typed and never did the same for the RIGHT, so a pointer RHS that went
+pool-dry landed in an `etmp` DECLARED `(i 64)` and nifasm rejected the comparison. It
+only ever bit `nifreader`'s `while p < sentinel`, and only once the borrow stopped
+supplying a register. `dontCare` now carries an optional slot that `forceRegDestE`
+honours, so the register/immediate/memory folds are untouched and only the spilled
+temp is typed.
+
+The cost, measured and accepted: one register fewer. nifbench does not regress —
+the pool was a last resort, not a hot-path home — and the compiler builds itself to a
+byte-identical fixpoint with no emergency relief anywhere.
 
 What remains non-total is the step that wants a third register while holding two
 *sealed* addresses — `genAggrCopyStore`'s per-word transfer register. It has no
-eligible victim by construction, so it still asserts under extreme pressure; making it
-total means giving that step a way to release one of its two ends, not a bigger pool.
+eligible victim by construction; making it total means giving that step a way to
+release one of its two ends, not a bigger pool.
 
 ## How this deals with the ABI
 
@@ -262,15 +269,8 @@ fixtures: `ARKHAM_STRESS=k` keeps only the first `k` registers of each allocatab
 pool (`src/arkham/stress.nim`), so the *same* corpus runs against a starved
 register file.
 
-`ARKHAM_STRESS_EMERGENCY=1` is a second, independent knob for the emergency borrow
-above, and it deliberately does NOT shrink anything: the borrow fires only when every
-staging candidate is *occupied*, so taking registers away from the allocator makes it
-less reachable, not more. Instead it takes the borrow wherever one is available, in
-preference to a free register (binding an otherwise-free victim first, so the emitted
-sequence is byte-for-byte the production one). Without it that path would be exercised
-by nothing but full compiler builds — and it is what caught the sealed-victim
-miscompile above. The ABI and the reserved emitter bridges (r11/xmm15, x14/x15/v31)
-are not shrunk — they are the guarantee the emitters are written against.
+The ABI and the reserved emitter bridges (r11/xmm15, x14/x15/v31) are not shrunk —
+they are the guarantee the emitters are written against.
 
 Each fixture's own `.exitcode`/`.output` stays the oracle, which is the point:
 fewer registers may cost performance, or hit a documented out-of-registers assert,

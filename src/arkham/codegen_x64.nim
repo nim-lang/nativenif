@@ -275,7 +275,16 @@ proc binImm(g: var CodeGen; op: X64Inst; d: Reg; v: int64) =  # d op= imm
   ## multiply even after `sizeof` folds to 4/8, and GCC turns that into
   ## `shl` / a SIB scale. Catching it here covers both the canonical and
   ## swapped emitBin2 paths (and every other immediate-mul).
-  if op == ImulX64 and v >= 2 and (v and (v - 1)) == 0:
+  ##
+  ## NOT under `keepovf`: the two agree on the low 64 bits and DISAGREE on the
+  ## flags. `imul` sets OF/CF exactly when the product overflows, which is what
+  ## the mandatory `(ovf)` right after reads via `jo`/`jb`; `shl` leaves OF
+  ## UNDEFINED for counts > 1 and puts the last bit shifted out in CF, so `x * 8`
+  ## would read a garbage overflow answer. `noFoldPos >= 0` marks exactly that
+  ## emission window (genStmt2's KeepovfS sets it around its store).
+  ## The a64 twin needs no such gate: its `KeepovfS` builds the `mul` + `smulh`/
+  ## `umulh` sequence itself via `binReg`, never through this immediate fold.
+  if op == ImulX64 and v >= 2 and (v and (v - 1)) == 0 and g.noFoldPos < 0:
     var k = 0'i64
     var t = v
     while t > 1: (t = t shr 1; inc k)
@@ -4880,11 +4889,26 @@ proc genConstr2(g: var CodeGen; c: Cursor; dst: Location) =
   ## erasing that difference for a predicate to re-derive downstream.)
   g.constrFieldStores(c, dst)
 
-proc genAconstr2(g: var CodeGen; c: Cursor; dstVar: string) =
-  ## Emit `(aconstr ArrayT e0 e1 …)` into the stack array `dstVar`: store each (bare)
-  ## element value at `(mem (at (rsp) dstVar i))`. The array twin of `genConstr2`.
-  template dest(i) = g.emAggrElemMem(dstVar, i)
-  g.aconstrElemStores(c, dest)
+proc genAconstr2(g: var CodeGen; c: Cursor; dst: Location) =
+  ## Emit `(aconstr ArrayT e0 e1 …)` into the aggregate destination `dst`: store each
+  ## (bare) element value at its index. The array twin of `genConstr2`, and it takes
+  ## the same `Location` for the same reason — a `NamedStack` slot IS the array, while
+  ## a `StackPtr` slot holds a POINTER to it (a by-ref aggregate param whose pointer
+  ## the allocator could not keep in a register). Addressing `(at (rsp) name idx)` in
+  ## the second case would write the elements over the pointer's own 8 bytes and on up
+  ## the stack, so load the pointer and store through it — exactly what
+  ## `constrFieldStores` does for the `oconstr` twin.
+  if dst.kind == StackPtr:
+    let base = g.pickStagingSealed("an aconstr spilled by-ref base", AddrSlot)
+    g.ab.tree MovX64: (g.emReg base; g.emStackMem(dst.ptrName))
+    var atc = c; inc atc                                # the array type
+    let elemTy = innerType(g.prog, resolveType(g.prog, atc))
+    template destThroughPtr(i) = g.emPtrElemMem(base, elemTy, i)
+    g.aconstrElemStores(c, destThroughPtr)
+    g.giveBack base
+  else:
+    template destInSlot(i) = g.emAggrElemMem(dst.name, i)
+    g.aconstrElemStores(c, destInSlot)
 
 proc genBaseobj2(g: var CodeGen; c: Cursor; dst: Location) =
   ## `(baseobj BaseType depth value)` — an object→base up-conversion (slicing). Inheritance
@@ -5104,11 +5128,7 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
     if rhs.kind == TagLit and rhs.exprKind == OconstrC:
       g.genConstr2(rhs, dst)                             # build object field-by-field
     elif rhs.kind == TagLit and rhs.exprKind == AconstrC:
-      if dst.kind == StackPtr:
-        # `emAggrElemMem` addresses `(at (rsp) name idx)` — the SLOT — so this would
-        # fill the pointer's own 8 bytes with the elements. Unimplemented, not wrong.
-        raiseAssert "arkham x64n: array constructor into a spilled by-ref aggregate: " & dstVar
-      g.genAconstr2(rhs, dstVar)                          # build array element-by-element
+      g.genAconstr2(rhs, dst)                             # build array element-by-element
     elif rhs.kind == TagLit and rhs.exprKind == CallC:   # call-returned aggregate
       if g.aggrByRef(tn):                                # >16B: pass &dst as the hidden result ptr
         # The window opens BEFORE `&dst` is written into rdi. rdi is an ABI argument
