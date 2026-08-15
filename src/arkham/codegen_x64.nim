@@ -1060,7 +1060,7 @@ proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg =
       g.releaseStaleName(r)
       return r
   for r in StagingCandidates.toOpenArray(0, stressLimit(StagingCandidates.len) - 1):
-    if r != avoid and not g.ra.isSealed(r) and not g.rb.isAccum(r) and
+    if r != avoid and not g.plan.isSealed(r) and not g.rb.isAccum(r) and
        not g.rb.isBoundTemp(r) and not g.regHoldsLiveLocal(r) and
        r notin g.rawHomeRegs:
       # not `isBoundTemp`: a register holding a live scratch temp (`bindTemp`'d)
@@ -2931,7 +2931,7 @@ proc binFold(g: var CodeGen; op: X64Inst; dest: Reg; loc: Location; opCur: Curso
       g.prematLval2(opCur, foldDisp = true)
       var s = g.pickStagingScratch(avoid = dest)
       if s != NoReg:
-        g.ra.seal s
+        g.plan.seal s
         g.bindTemp(s, wide)
         g.stagingNote(s, "a sub-width operand")
         g.ab.tree MovX64: (g.emReg s; g.emMemLval2(opCur))
