@@ -1,7 +1,7 @@
 
 import std / [tables, sets, streams, os, osproc, strutils, algorithm]
 import nifcore, nifcoreparse, nifmodules
-import "../../../nimony/src/lib" / [nifreader, symparser]
+import "../../../nimony/src/lib" / [nifreader, symparser, stringviews]
 import tags, model, tagconv
 import buffers, relocs, x86, arm64, elf, macho, pe
 import sem, slots
@@ -376,6 +376,8 @@ type
     buf: TokenBuf                          # whole-module tree (main module only)
     foreign: ForeignModule                 # lazy per-symbol loader (foreign only)
     loaded: bool  # True if already loaded into scope
+    externDll: Table[string, string]       # extproc name → its `(imp …)` library
+                                           # (foreign only, see `scanExternDlls`)
 
   Arch = enum
     X64        # Linux x86-64 (ELF)
@@ -500,6 +502,12 @@ type
                         # symbol's type. Reset per proc.
     # Dynamic linking
     imports: seq[ImportedLib]  # Imported libraries
+    curImportLib: int          # ordinal of the `(imp …)` currently in scope, 0 = none.
+                               # Every `(extproc …)` binds to THIS rather than to
+                               # `imports[^1]`: `imports` is deduped across the whole
+                               # bundle, so its last ENTRY is the last dll first seen
+                               # ANYWHERE, which stops matching the last dll named HERE
+                               # the moment a second module imports one already listed.
     extProcs: seq[ExtProcInfo]  # External procs to bind
     gotSlotCount: int  # Number of GOT slots allocated
     # Module system / dead code elimination
@@ -834,6 +842,53 @@ proc parseObjectBody(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
 proc isRegTag(locTag: TagEnum): bool =
   rawTagIsX64Reg(locTag) or rawTagIsA64Reg(locTag)
 
+proc importOrdinal(ctx: var GenContext; libPath: string): int =
+  ## The ordinal of `libPath` in the image's import table, importing it if this is
+  ## the first mention. One accessor for all three callers so a library named by
+  ## the main module and by a foreign one lands in a single entry.
+  for lib in ctx.imports:
+    if lib.name == libPath: return lib.ordinal
+  result = ctx.imports.len + 1
+  ctx.imports.add ImportedLib(name: libPath, ordinal: result)
+
+proc scanExternDlls(modfile: string): Table[string, string] =
+  ## Map every `(extproc …)` a module declares to the `(imp "…")` it sits under.
+  ##
+  ## That association is POSITIONAL in the asm-NIF — an `(imp …)` opens a group and
+  ## the extprocs that follow belong to it — which survives fine in the main module,
+  ## read front to back. A foreign module is read the other way: `resolveForeignSym`
+  ## jumps straight to one indexed decl, so by the time an `(extproc …)` is parsed
+  ## its group is not on any stack to consult, and binding it to the last library
+  ## imported ANYWHERE is wrong as soon as two modules import different ones. So
+  ## recover the grouping here, once per module.
+  ##
+  ## arkham emits the entire import section immediately after `(arch …)` and before
+  ## the first type, so this stops at the first decl that is neither — it reads a
+  ## prefix, not the file.
+  result = initTable[string, string]()
+  var r = nifreader.open(modfile)
+  var t = default(ExpandedToken)
+  var depth = 0
+  var curDll = ""
+  while true:
+    next(r, t)
+    case t.tk
+    of EofToken: break
+    of ParLe:
+      inc depth
+      if depth == 2:                      # a top-level decl inside `(stmts …)`
+        if t.data == "imp":
+          next(r, t)
+          if t.tk == StrLit: curDll = decodeStr(r, t)
+        elif t.data == "extproc":
+          next(r, t)
+          if t.tk == SymbolDef and curDll.len > 0:
+            result[decodeStr(r, t)] = curDll
+        elif t.data != "arch":
+          break
+    of ParRi: dec depth
+    else: discard
+
 proc openForeignModule(ctx: var GenContext; modname: string; n: Cursor) =
   ## Open a foreign module for LAZY, on-demand symbol resolution: read just its
   ## embedded NIF `.index` (symbol → byte offset) and keep the stream open. The
@@ -854,7 +909,8 @@ proc openForeignModule(ctx: var GenContext; modname: string; n: Cursor) =
   let fm = nifmodules.openForeignModule(modfile)
   if not fm.hasEmbeddedIndex:
     error("Foreign module has no embedded NIF index (reindex it): " & modfile, n)
-  ctx.modules[modname] = LoadedModule(foreign: fm, loaded: true)
+  ctx.modules[modname] = LoadedModule(foreign: fm, loaded: true,
+                                      externDll: scanExternDlls(modfile))
 
 proc allocTlsSlotX64(ctx: var GenContext; sym: Symbol; decl: Cursor) =
   ## x86-64: give a thread-local its displacement inside the unified
@@ -989,14 +1045,18 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
     let extName = getStr(c)
     inc c
     let typ = parseExtprocSig(c, scope, ctx)     # the Windows form carries a signature
-    if ctx.imports.len == 0:
-      # No main-module `(imp …)` was seen (the main module had no externs itself);
-      # the extern must still bind against the platform's base library, so import it
-      # implicitly — the same default the backends use for their own extern decls.
-      ctx.imports.add ImportedLib(
-        name: (if ctx.arch in {Arch.WinX64, Arch.WinA64}: WindowsKernelDll
-               else: "/usr/lib/libSystem.B.dylib"), ordinal: 1)
-    let libOrdinal = ctx.imports[^1].ordinal
+    # Bind against the library THIS module imported the extern from (recovered by
+    # `scanExternDlls`, since the `(imp …)` group is out of reach here). Only when
+    # the module names none — no Windows module does, arkham rejects that — does the
+    # platform's base library stand in, the same default the backends use for their
+    # own extern decls.
+    var libName = ""
+    if ctx.modules.hasKey(modname):
+      libName = ctx.modules[modname].externDll.getOrDefault(fullName, "")
+    if libName.len == 0:
+      libName = (if ctx.arch in {Arch.WinX64, Arch.WinA64}: WindowsKernelDll
+                 else: "/usr/lib/libSystem.B.dylib")
+    let libOrdinal = ctx.importOrdinal(libName)
     let gotSlot = ctx.gotSlotCount
     ctx.gotSlotCount += 1
     result = Symbol(name: ctx.symIdOf(fullName), kind: skExtProc, typ: typ, extName: extName,
@@ -1518,14 +1578,10 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
           if n.kind != StrLit: error("Expected library path string", n)
           let libPath = getStr(n)
           inc n
-          # Add to imports list if not already there
-          var found = false
-          for lib in ctx.imports:
-            if lib.name == libPath:
-              found = true
-              break
-          if not found:
-            ctx.imports.add ImportedLib(name: libPath, ordinal: ctx.imports.len + 1)
+          # Import it if new; either way this `(imp …)` is what the extprocs that
+          # follow bind to — including when it names a library another module
+          # already introduced.
+          ctx.curImportLib = ctx.importOrdinal(libPath)
         of ExtprocD:
           # (extproc :name "external_name" (params …)? (result …)? (clobber …)?)
           inc n
@@ -1536,10 +1592,13 @@ proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string;
           let extName = getStr(n)
           inc n
           let typ = parseExtprocSig(n, scope, ctx)
-          # Find the library (use last imported library, or default to libSystem)
+          # Bind to the `(imp …)` in scope; with none seen at all, the platform's
+          # implicit library (ordinal 1, libSystem on Mach-O) still applies —
+          # arkham rejects a Windows extern that names no dll, so a PE never
+          # reaches here without one.
           var libOrdinal = 1
-          if ctx.imports.len > 0:
-            libOrdinal = ctx.imports[^1].ordinal
+          if ctx.curImportLib > 0:
+            libOrdinal = ctx.curImportLib
           # Allocate GOT slot
           let gotSlot = ctx.gotSlotCount
           ctx.gotSlotCount += 1
