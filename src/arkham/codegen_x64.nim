@@ -2132,8 +2132,14 @@ proc emitSyproc(g: var CodeGen; sp: SyscallProc) =
 
 proc emitWinExtproc(g: var CodeGen; ex: Extern) =
   ## Emit a Windows extern's declaration:
-  ## `(extproc :<name>.c.<mod> "<name>" (params (param :pN.0 <reg|s> T)…) (result …)?
-  ##  (clobber …))`.
+  ## `(extproc :<name>.c.<mod> "<name>" "<dll>" (params (param :pN.0 <reg|s> T)…)
+  ##  (result …)? (clobber …))`.
+  ##
+  ## The dll is named ON the decl, not merely inferred from the `(imp …)` this sits
+  ## under. Enclosure is a property of a POSITION in the stream, and a module's
+  ## decls do not stay in a stream: nifasm reaches a foreign module's by indexed
+  ## jump, one at a time, where no enclosing group exists to consult. So the decl
+  ## states it. (The Darwin form omits the operand — one library, no grouping.)
   ##
   ## Unlike the Darwin extern decl — a bare name/string pair whose call sites marshal
   ## into raw ABI registers — this carries the callee's FULL Win64 signature, so the
@@ -2153,6 +2159,7 @@ proc emitWinExtproc(g: var CodeGen; ex: Extern) =
     g.ab.tree ExtprocD:
       g.ab.symDef ex.asmName
       g.ab.str ex.extName
+      g.ab.str ex.dll
       var idx = 0
       g.ab.tree ParamsD:
         if pc.kind == TagLit:                    # (params (param …) …)
