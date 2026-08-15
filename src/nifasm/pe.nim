@@ -246,8 +246,27 @@ proc initOptionalHeader64*(
                               IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE or
                               IMAGE_DLLCHARACTERISTICS_NX_COMPAT or
                               IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE
-  result.SizeOfStackReserve = 0x100000  # 1MB
-  result.SizeOfStackCommit = 0x1000     # 4KB
+  # The stack is committed IN FULL, not grown on demand. Windows commits a
+  # thread stack lazily: only `SizeOfStackCommit` is mapped, with a PAGE_GUARD
+  # page below it, and the region grows one page at a time as that guard page is
+  # touched. A prologue may only rely on that if it walks down its frame a page
+  # at a time (MSVC's `__chkstk`, gcc's `-fstack-clash-protection`) — arkham's
+  # `emitFrameSub` lowers rsp by the whole `(ssize)` in ONE `sub`, so any frame
+  # bigger than a page lands PAST the guard page, on reserved-but-uncommitted
+  # memory, and the first slot write takes an access violation. That is not
+  # hypothetical: nimsem's own frames reach 24KB (six pages), which is what made
+  # a native Windows boot die in stage 2 while linux/amd64 stayed green — Linux
+  # grows the main thread's stack on any fault within the guard gap, so the same
+  # single `sub` needs no probe there.
+  #
+  # Committing the whole reserve removes the guard-page protocol from the
+  # picture entirely. It costs commit charge (pagefile accounting), not resident
+  # memory — untouched pages are never backed. Emitting probes in `emitFrameSub`
+  # would be the narrower fix, but the frame size is not known until nifasm's
+  # `finalize` patches the `(ssize)` imm32, i.e. after the prologue bytes are
+  # already emitted.
+  result.SizeOfStackReserve = 0x800000  # 8MB, matching the usual Linux default
+  result.SizeOfStackCommit = 0x800000   # == reserve: no lazy growth, no probes
   result.SizeOfHeapReserve = 0x100000   # 1MB
   result.SizeOfHeapCommit = 0x1000      # 4KB
   result.NumberOfRvaAndSizes = 16
