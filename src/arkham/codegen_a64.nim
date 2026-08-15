@@ -2073,6 +2073,23 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
         g.genStore2(c, namedStackLoc(home, g.exprSlot(c)))
     else: discard
 
+proc freeExpr(g: var CodeGen; c: Cursor) =
+  ## PHASE B release: give back whatever `getExpr` homed at `c`'s position, once the
+  ## consuming `(mem …)`/`(lea …)` has read it. The counterpart of the planner's
+  ## `freeSym`, and the asymmetry between the two is the phase difference itself.
+  ##
+  ## `freeSym` takes a NAME because a local may have been demoted out from under its
+  ## register between acquire and release. Nothing can demote an expression home — it
+  ## is minted and released inside one lvalue emission — so this one can be strict:
+  ## look the position up and release exactly what is there. `restoreMemBase2` first,
+  ## because a memory-homed base is on loan to a staging register at this point and the
+  ## loan has to be unwound before the home is read back. A home that is not a temp
+  ## (the common case: the value sat in its own register) releases nothing.
+  let pos = g.posOf(c)
+  g.restoreMemBase2(pos)                             # demoted (stolen) base/index reload
+  let l = g.plan.planned(pos)
+  if l.kind == InReg and l.isTemp: g.unbindTemp(l.r)
+
 proc unbindLvalTemps2(g: var CodeGen; c: Cursor) =
   ## Release scratch an lvalue's embedded value used (a reloaded base/index), AFTER
   ## the consuming `(mem …)`/`(lea …)` instruction.
@@ -2094,36 +2111,22 @@ proc unbindLvalTemps2(g: var CodeGen; c: Cursor) =
       var cc = c
       cc.into:
         g.unbindLvalTemps2(cc); skip cc
-        if cc.kind notin {IntLit, UIntLit}:
-          let idxPos = g.posOf(cc)
-          g.restoreMemBase2(idxPos)
-          let il = g.plan.planned(idxPos)
-          if il.kind == InReg and il.isTemp: g.unbindTemp(il.r)
+        if cc.kind notin {IntLit, UIntLit}: g.freeExpr(cc)   # register index temp
         while cc.hasMore: skip cc
       if g.plan.aux.hasKey(atPos) and g.plan.aux[atPos].scratch.len > 0:
         g.unbindTemp(g.plan.aux[atPos].scratch[0])
     of DerefC:
       var cc = c
       cc.into:
-        let pPos = g.posOf(cc)
-        g.restoreMemBase2(pPos)
-        let ploc = g.plan.planned(pPos)
-        if ploc.kind == InReg and ploc.isTemp: g.unbindTemp(ploc.r)
+        g.freeExpr(cc)                                       # the pointer
         while cc.hasMore: skip cc
     of PatC:
       let patPos = g.posOf(c)
       var cc = c
       cc.into:
-        let pPos = g.posOf(cc)
-        g.restoreMemBase2(pPos)
-        let ploc = g.plan.planned(pPos)
-        if ploc.kind == InReg and ploc.isTemp: g.unbindTemp(ploc.r)
+        g.freeExpr(cc)                                       # the pointer
         skip cc
-        if cc.kind notin {IntLit, UIntLit}:
-          let idxPos = g.posOf(cc)
-          g.restoreMemBase2(idxPos)
-          let il = g.plan.planned(idxPos)
-          if il.kind == InReg and il.isTemp: g.unbindTemp(il.r)
+        if cc.kind notin {IntLit, UIntLit}: g.freeExpr(cc)   # register index temp
         while cc.hasMore: skip cc
       if g.plan.aux.hasKey(patPos) and g.plan.aux[patPos].scratch.len > 0:
         g.unbindTemp(g.plan.aux[patPos].scratch[0])
@@ -3577,6 +3580,27 @@ proc reserveStrideScratch(g: var CodeGen; atPos: int) =
     t = regLoc(r, ScalarSlot, isTemp = true)
   g.plan.aux[atPos] = ExprAux(scratch: @[t.r])
 
+proc getExpr(g: var CodeGen; n: var Cursor; held: bool; what: string) =
+  ## PHASE B acquire: home the lvalue-embedded value at `n` and plan it there,
+  ## advancing `n` past it. The twin of the planner's `getSym`, and the difference is
+  ## the KEY: a declaration has a name, an expression has only a POSITION. Everything
+  ## else follows from that — no `symPos` alias, and no undo, because phase A is over
+  ## and every local home this reads is already final.
+  ##
+  ## `held` = an enclosing index CALLS, so the scratch must be a callee-saved survivor
+  ## rather than a volatile that call would clobber; `what` names it for the
+  ## out-of-registers message.
+  ##
+  ## This lives in the backend rather than in `planer` only because the phase-B pool
+  ## (`takeHeld`) still does. It is a relocation away, not a redesign: the door already
+  ## speaks positions, and `emitLvalWalk` — which calls it — is already a pure
+  ## pick-and-record pass with no emission in it.
+  let pos = g.posOf(n)
+  var d = if held: g.takeHeld(what) else: needsReg(ScalarSlot)
+  g.resolveLvalVal(n, d)
+  g.plan.planAtEmitTime(pos, d)
+  skip n
+
 proc emitLvalWalk(g: var CodeGen; n: var Cursor; globBase: Location; isStore: bool;
                   heldBase = false; asBase = false) =
   ## FUSED port of the allocator's `allocLvalue2` (a64 flavour): decide the
@@ -3615,12 +3639,7 @@ proc emitLvalWalk(g: var CodeGen; n: var Cursor; globBase: Location; isStore: bo
         while n.hasMore: skip n
     of DerefC:
       n.into:
-        let pPos = g.posOf(n)
-        var d = if heldBase: g.takeHeld("a deref base held across an index call")
-                else: needsReg(ScalarSlot)
-        g.resolveLvalVal(n, d)
-        g.plan.planAtEmitTime(pPos, d)
-        skip n
+        g.getExpr(n, heldBase, "a deref base held across an index call")
         while n.hasMore: skip n
     of AtC:
       let atPos = g.posOf(n)
@@ -3630,12 +3649,7 @@ proc emitLvalWalk(g: var CodeGen; n: var Cursor; globBase: Location; isStore: bo
         let held = heldBase or subtreeHasCallE(idxPeek)
         g.emitLvalWalk(n, globBase, isStore, held, asBase = true)  # the indexed base
         if n.kind in {IntLit, UIntLit}: skip n
-        else:
-          let iPos = g.posOf(n)
-          var idx = needsReg(ScalarSlot)
-          g.resolveLvalVal(n, idx)
-          g.plan.planAtEmitTime(iPos, idx)
-          skip n
+        else: g.getExpr(n, false, "")
         while n.hasMore: skip n
       if needsScratch:
         g.reserveStrideScratch(atPos)
@@ -3645,19 +3659,9 @@ proc emitLvalWalk(g: var CodeGen; n: var Cursor; globBase: Location; isStore: bo
       n.into:
         var idxPeek = n; skip idxPeek
         let held = heldBase or subtreeHasCallE(idxPeek)
-        let pPos = g.posOf(n)
-        var d = if held: g.takeHeld("a pat base held across an index call")
-                else: needsReg(ScalarSlot)
-        g.resolveLvalVal(n, d)                       # the pointer (a clean value base)
-        g.plan.planAtEmitTime(pPos, d)
-        skip n
+        g.getExpr(n, held, "a pat base held across an index call")   # a clean value base
         if n.kind in {IntLit, UIntLit}: skip n
-        else:
-          let iPos = g.posOf(n)
-          var idx = needsReg(ScalarSlot)
-          g.resolveLvalVal(n, idx)
-          g.plan.planAtEmitTime(iPos, idx)
-          skip n
+        else: g.getExpr(n, false, "")
         while n.hasMore: skip n
       if needsScratch:
         g.reserveStrideScratch(patPos)

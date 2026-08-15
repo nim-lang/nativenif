@@ -20,13 +20,40 @@
 ## `planStmt` walks statements and plans what they DECLARE — parameters (ABI
 ## pre-coloring) and locals (scope-based). Expression positions are left `Undef`,
 ## and the emitter picks their temps itself as it walks (`takeTmp`/`pickStaging`,
-## threading `dest: var Location`); codegen_a64 goes further and WRITES expression
-## locations back into `locs` at emit time for its fused lvalue walk — the
-## planner's decision, currently made by the emitter. Planning expressions here
-## instead means adding a `planValue` twin to `planStmt` that recurses into the
-## value positions it skips and calls `recordValue`. Nothing downstream has to
-## change to allow it: the storage is already sized to the proc's whole token
-## span, and both sides of the API already speak positions.
+## threading `dest: var Location`).
+##
+## PHASE A and PHASE B. Those two halves are named, so which one a call site belongs
+## to is visible without reading the body:
+##
+##   phase A (here)              `getSym(name, …)`   `freeSym(name)`
+##   phase B (the backends)      `getExpr(pos, …)`   `freeExpr(pos)`
+##
+## Same register pools, different key — and the key IS the phase, since a declaration
+## has a name and an expression has only a position. The dependency runs ONE WAY:
+## phase B reads homes phase A settled, and can never perturb them. That is what keeps
+## the classic instruction-selection-vs-register-allocation ordering hazard out of the
+## design rather than merely managed. `getSym` may be undone (`demoteToStack`, a steal)
+## and so releases by NAME, reading the home current at release time; nothing can undo
+## a `getExpr`, so `freeExpr` is strict. Anything phase B needs that WOULD perturb
+## homes has to be hoisted ahead of phase A as a demand — a count or a flag, which
+## commutes — never as a placement; `stackArgBaseReg`'s callee-saved reservation in
+## `allocateProc` and the `presealed` set are the two existing examples.
+##
+## Phase B lives in codegen_x64/codegen_a64 today, next to the pool it draws from
+## (`takeHeld`), and it already has a home of its own there: `emitLvalWalk` is a pure
+## pick-and-record walk with no emission in it. Moving it here means a `planValue`
+## twin to `planStmt` that recurses into the value positions this walk skips, calling
+## `recordValue`. Nothing downstream has to change to allow it: the storage is already
+## sized to the proc's whole token span, and both sides of the API already speak
+## positions.
+##
+## `planned(pos) == Undef` means the planner has NO answer there and the emitter
+## decides for itself. Keep that permanent. It is what lets this module stay
+## deliberately incomplete — any expression whose planning turns out hairy simply
+## stays `Undef` — so every position phase B takes over is a strict improvement and
+## never a new obligation. Losing that escape valve is how the emitter grew a second
+## register allocator inside itself once before (`borrowEmergency`, removed in
+## `a5b8fd1`): two authorities over registers, and every bugfix patching the seam.
 ##
 ## There is no Sethi–Ullman numbering — registers are handed out in the natural
 ## traversal order.
@@ -210,20 +237,30 @@ proc planned*(plan: Plan; pos: int): Location {.inline.} =
   ## about declarations: a fused lvalue walk asks for the base, index and stride
   ## registers of an `(at …)` by position, and an intrinsic asks where its operands
   ## landed. The read side is therefore already what it needs to be — it is the
-  ## write side for those positions that sits in the wrong module
-  ## (`planAtEmitTime`).
+  ## write side for those positions that sits in the wrong module (`getExpr`, and
+  ## `planAtEmitTime` class 1).
   plan.locs[pos]
 
 proc planAtEmitTime*(plan: var Plan; pos: int; loc: Location) {.inline.} =
-  ## The EMITTER planning an expression position, mid-walk — the one write side that
-  ## is not `recordValue`, and the reason this module is called a planner and not yet
-  ## a complete one. Both emitters do this for the base / index / stride registers of
-  ## a fused lvalue walk and for a materialized global base: they decide where the
-  ## value goes, stash it here, and read it back through `planned` a few nodes later.
+  ## The raw write for an expression position, from the backends. Named rather than
+  ## left as a bare table write so the worklist is one grep, and so the plan's storage
+  ## can stay private.
   ##
-  ## That is a planning decision taken at emit time, and every call is a site a
-  ## `planValue` pass would subsume. It is named rather than left as a bare table
-  ## write so the worklist is one grep, and so the plan's storage can stay private.
+  ## Its callers are NOT all the same kind of thing, and the difference is the whole
+  ## review question for this module. Three classes:
+  ##
+  ##  1. a PLACEMENT — `getExpr` and `emitLvalWalk`'s global base decide where a value
+  ##     will go before anything is emitted. Real phase B, in the wrong module; a
+  ##     `planValue` pass subsumes exactly these.
+  ##  2. a WRITE-BACK of a resolution — `prematAddrVal2` and the intrinsic operand
+  ##     loops hand `emitValue2` a `NeedsReg`/`RegOrImm` and store the concrete answer
+  ##     back. The decision was already made; this only records how it came out.
+  ##  3. a scoped MATERIALIZATION — `reloadMemBase2`/`restoreMemBase2` lend a spilled
+  ##     home to a staging register for the length of one addressing mode and put it
+  ##     back. A peephole, not an allocation. It stays at emit time whatever else moves.
+  ##
+  ## Only (1) migrates. Confusing (3) for (1) is how the emitter grows a second
+  ## register allocator, so ask which class a new call belongs to before adding one.
   plan.locs[pos] = loc
 
 proc rebuildHomes*(plan: var Plan) =
@@ -293,7 +330,7 @@ proc spillTo(b: var Builder; name: string; slot: AsmSlot): Location =
 proc fixedRoleOk(b: Builder; r: Reg; props: VarProps): bool {.inline.} =
   ## May a value with these props be homed in `r`?
   ##
-  ## `allocStorage` hands out the div/rem and shift-count registers ONLY to a value
+  ## `getSym` hands out the div/rem and shift-count registers ONLY to a value
   ## whose live range is interval-proved free of the instruction that claims them
   ## (`DivRegOk` / `ShiftRegOk`) — an `idiv` destroys rdx and a variable shift's count
   ## destroys rcx, neither of which names the register as an operand the emitter could
@@ -313,8 +350,16 @@ proc fixedRoleOk(b: Builder; r: Reg; props: VarProps): bool {.inline.} =
   (r != b.md.shiftCountReg or ShiftRegOk in props) and
   (r != b.md.divRemReg or DivRegOk in props)
 
-proc allocStorage(b: var Builder; name: string; slot: AsmSlot; props: VarProps): Location =
-  ## Decide where one local/param lives. Records reg use for scope freeing.
+proc getSym(b: var Builder; name: string; slot: AsmSlot; props: VarProps): Location =
+  ## PHASE A acquire: decide where one declared local/param lives, and take the
+  ## register for it. Paired with `freeSym`.
+  ##
+  ## The phase shows in the KEY: this door is named — a declaration has a name, and
+  ## the plan entry it writes gets a `symPos` alias so every later use resolves through
+  ## it. That alias is what makes phase A's one undo (`demoteToStack`) a single-point
+  ## rewrite. `getExpr`/`freeExpr` in the backends are the phase-B twins: same pools,
+  ## keyed by POSITION, and with no undo — by the time they run, everything this door
+  ## decided is final.
   if slot.isFloat:
     # A float local lives only in a callee-saved register (saved in the prologue),
     # or it spills. The volatile float pool (v16–v31 on arm64, xmm8–15 on x64) is
@@ -405,6 +450,26 @@ proc giveBackF(b: var Builder; f: FReg) {.inline.} =
   if f in b.md.floatCalleeSavedSet: b.freeCalleeF.incl f
   elif f != NoFReg: b.freeVolF.incl f
 
+proc freeSym(b: var Builder; name: string) =
+  ## PHASE A release: return whatever registers `name` currently occupies. The
+  ## counterpart of `getSym`, and it takes the NAME rather than the register on
+  ## purpose — that is not a convenience, it is the correctness rule.
+  ##
+  ## Between the `getSym` and here, a steal may have moved `name` to the stack
+  ## (`demoteToStack`); the register it was given now belongs to the thief, which will
+  ## release it when its OWN range ends. So the release has to read the home that is
+  ## current AT RELEASE TIME, and a demoted var must free nothing. Taking a `Reg`
+  ## argument would let a caller pass the stale one and silently double-free it into
+  ## the pool. Both callers (`flushFree`, `closeScope`) had this ladder open-coded.
+  let loc = b.homeOf(name)
+  case loc.kind
+  of InReg: b.giveBack loc.r
+  of InRegPair:
+    b.giveBack loc.r0
+    if loc.r1 != NoReg: b.giveBack loc.r1
+  of InFReg: b.giveBackF loc.f
+  else: discard
+
 proc weightOf(b: Builder; name: string): int {.inline.} =
   b.an.vars.getOrDefault(name).weight
 
@@ -429,12 +494,7 @@ proc flushFree(b: var Builder; curpos: int) =
   while i < b.pendingFree.len:
     if b.pendingFree[i].pos <= curpos:
       let name = b.pendingFree[i].name
-      let loc = b.homeOf(name)
-      if loc.kind == InReg: b.giveBack loc.r
-      elif loc.kind == InRegPair:
-        b.giveBack loc.r0
-        if loc.r1 != NoReg: b.giveBack loc.r1
-      elif loc.kind == InFReg: b.giveBackF loc.f
+      b.freeSym name
       b.freedSyms.incl name
       b.pendingFree.del i              # swap-remove; order is irrelevant
     else: inc i
@@ -447,12 +507,7 @@ proc closeScope(b: var Builder) =
   ## Already early-freed vars are skipped (their reg may now belong to a reuser).
   for v in b.scopeVars.pop():
     if v in b.freedSyms: continue
-    let loc = b.homeOf(v)
-    if loc.kind == InReg: b.giveBack loc.r
-    elif loc.kind == InRegPair:
-      b.giveBack loc.r0
-      if loc.r1 != NoReg: b.giveBack loc.r1
-    elif loc.kind == InFReg: b.giveBackF loc.f
+    b.freeSym v
 
 proc recordValue(b: var Builder; pos: int; loc: Location) {.inline.} =
   ## Plan the value produced AT `pos` into `loc`. This is the position-keyed
@@ -633,7 +688,7 @@ proc callerSaveRescue(b: var Builder; name: string; slot: AsmSlot;
                       fallback: Location): Location =
   ## The third option between "callee-saved register" and "memory".
   ##
-  ## `allocStorage` gives a value that crosses a call the callee-saved pool or the
+  ## `getSym` gives a value that crosses a call the callee-saved pool or the
   ## stack — and 90 % of arkham's spills take the stack while 6-7 VOLATILE registers
   ## sit free, because a volatile is clobbered by the call. A caller-saved home closes
   ## that: the value lives in a volatile and the emitter brackets each crossed call
@@ -803,7 +858,7 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
         elif takeRet:
           excl b.freeVol, b.md.intRetReg
           regLoc(b.md.intRetReg, slot)
-        else: b.allocStorage(name, slot, props)
+        else: b.getSym(name, slot, props)
       if inheritSrc.len > 0:
         # Transfer the register's free obligation from the (now-dead) source to this var:
         # drop the source's pending early-free and mark it freed so `closeScope` skips it;
@@ -1163,13 +1218,13 @@ proc seedPools(b: var Builder) =
   for r in b.md.intTempRegs: b.freeVol.incl r
   # Call-free locals may also draw from `intLocalTempRegs` (the arg registers with
   # no fixed instruction role). `reserveTmp` still filters on `intTempRegs` so these
-  # never serve as emitter transient scratch; only `allocStorage`'s `AllRegs` fall-
+  # never serve as emitter transient scratch; only `getSym`'s `AllRegs` fall-
   # back (which filters on `intLocalTempRegs`) can hand them to a local. A leaf param
   # that persistently occupies one is removed from this pool in `allocParams`.
   for r in b.md.intLocalTempRegs: b.freeVol.incl r
   # The fixed-role registers (rdx = div/rem, rcx = shift count) also join `freeVol`
   # so a `DivRegOk`/`ShiftRegOk` local can be homed there. They are handed out ONLY
-  # via those props' candidate list in `allocStorage` (never in `intLocalTempRegs`
+  # via those props' candidate list in `getSym` (never in `intLocalTempRegs`
   # nor `intTempRegs`), so no ordinary local/temp draws them; and the interval
   # analysis guarantees their fixed role never overlaps such a local (asserted by
   # `divRemOccupied`/`regOccupied` at the div/shift sites). `NoReg` on RISC (a64).
