@@ -5,18 +5,60 @@
 #    See the file "license.txt", included in this distribution.
 #
 
-## Pass 2: register allocation.
+## Pass 2: THE PLAN — where every value in a proc body belongs.
 ##
-## Every value-producing position in a proc body gets a `Location`, looked up
-## by `cursorToPosition` (the `SymId→position` mapping for locals is kept
-## *inside* the allocator — that is its job). This module assigns the
-## long-lived storage: parameters (ABI pre-coloring) and locals (scope-based).
-## Per-expression temporaries are filled into the same `locs` table by the
-## code generator as it walks the tree (it borrows registers via `borrowReg`
-## / `giveBack`); see codegen. There is no Sethi–Ullman numbering — registers
-## are handed out in the natural traversal order.
+## The unit this module deals in is a POSITION, not a variable. `locs` maps a
+## token position (`cursorToPosition`) to the `Location` the value produced there
+## belongs in; `planned` is the whole read side, `recordValue` the whole write
+## side, and neither mentions a name. A local's name is an ALIAS for the position
+## of its declaration (`symPos`), which is why `homeOfSym`/`locationOfSym` are a
+## convenience layer over `planned` rather than a parallel mechanism, and why
+## undoing a home (a steal, `demoteToStack`) is a single-point rewrite that every
+## use sees.
 ##
-## Strategy for locals (after `analyser`):
+## That shape is the point, because the module does not yet plan everything.
+## `planStmt` walks statements and plans what they DECLARE — parameters (ABI
+## pre-coloring) and locals (scope-based). Expression positions are left `Undef`,
+## and the emitter picks their temps itself as it walks (`takeTmp`/`pickStaging`,
+## threading `dest: var Location`).
+##
+## PHASE A and PHASE B. Those two halves are named, so which one a call site belongs
+## to is visible without reading the body:
+##
+##   phase A (here)              `getSym(name, …)`   `freeSym(name)`
+##   phase B (the backends)      `getExpr(pos, …)`   `freeExpr(pos)`
+##
+## Same register pools, different key — and the key IS the phase, since a declaration
+## has a name and an expression has only a position. The dependency runs ONE WAY:
+## phase B reads homes phase A settled, and can never perturb them. That is what keeps
+## the classic instruction-selection-vs-register-allocation ordering hazard out of the
+## design rather than merely managed. `getSym` may be undone (`demoteToStack`, a steal)
+## and so releases by NAME, reading the home current at release time; nothing can undo
+## a `getExpr`, so `freeExpr` is strict. Anything phase B needs that WOULD perturb
+## homes has to be hoisted ahead of phase A as a demand — a count or a flag, which
+## commutes — never as a placement; `stackArgBaseReg`'s callee-saved reservation in
+## `allocateProc` and the `presealed` set are the two existing examples.
+##
+## Phase B lives in codegen_x64/codegen_a64 today, next to the pool it draws from
+## (`takeHeld`), and it already has a home of its own there: `emitLvalWalk` is a pure
+## pick-and-record walk with no emission in it. Moving it here means a `planValue`
+## twin to `planStmt` that recurses into the value positions this walk skips, calling
+## `recordValue`. Nothing downstream has to change to allow it: the storage is already
+## sized to the proc's whole token span, and both sides of the API already speak
+## positions.
+##
+## `planned(pos) == Undef` means the planner has NO answer there and the emitter
+## decides for itself. Keep that permanent. It is what lets this module stay
+## deliberately incomplete — any expression whose planning turns out hairy simply
+## stays `Undef` — so every position phase B takes over is a strict improvement and
+## never a new obligation. Losing that escape valve is how the emitter grew a second
+## register allocator inside itself once before (`borrowEmergency`, removed in
+## `a5b8fd1`): two authorities over registers, and every bugfix patching the seam.
+##
+## There is no Sethi–Ullman numbering — registers are handed out in the natural
+## traversal order.
+##
+## Strategy for the locals it does plan (after `analyser`):
 ##  * address-taken / aggregate / float (v1)        → stack slot
 ##  * confined to a call-free scope (`AllRegs`)      → a volatile temp register
 ##  * otherwise (may be live across a call)          → a callee-saved register
@@ -39,7 +81,7 @@ var gArkhamCurProc* = ""   # debug: the proc arkham is currently allocating (for
 
 type
   ExprAux* = object
-    ## Per-expression-position scratch memo (kept in `RegAlloc.aux`, sparse).
+    ## Per-expression-position scratch memo (kept in `Plan.aux`, sparse).
     ## Written by the a64 fused lvalue walk (`emitLvalWalk`) for the `(at base
     ## idx scratch)` non-scale stride register; read back by `emLvalAddr2` and
     ## the lvalue release helpers.
@@ -54,7 +96,7 @@ type
     fromPos*: int
     loc*: Location
 
-  LocSpan* = object
+  LocSpan = object
     ## Position-indexed `Location` storage for ONE proc. Token positions are
     ## ABSOLUTE module-buffer offsets (`cursorToPosition`), but a proc only ever
     ## touches positions inside its own contiguous subtree span `[base, base+data.len)`.
@@ -67,8 +109,8 @@ type
     base*: int
     data*: seq[Location]
 
-  RegAlloc* = object
-    locs*: LocSpan                    ## indexed by cursorToPosition. Currently filled
+  Plan* = object
+    locs: LocSpan                     ## indexed by cursorToPosition. Currently filled
                                       ## for symbol defs; the rewrite fills it for EVERY
                                       ## value-producing position (its result location).
     aux*: Table[int, ExprAux]         ## pos → per-op selection aux (see `ExprAux`)
@@ -134,7 +176,7 @@ type
                                       ## procs).
 
   Builder = object
-    ra: RegAlloc
+    plan: Plan
     buf: ptr TokenBuf
     an: ptr ProcAnalysis
     prog: ptr Program                 ## program (for cross-module type resolution / sizing)
@@ -176,27 +218,77 @@ proc initLocSpan(base, len: int): LocSpan {.inline.} =
   ## Zero-inits `len` `Location`s (kind `Undef`, ordinal 0 — an unwritten position).
   LocSpan(base: base, data: newSeq[Location](len))
 
-proc `[]`*(s: LocSpan; pos: int): lent Location {.inline.} = s.data[pos - s.base]
-proc `[]`*(s: var LocSpan; pos: int): var Location {.inline.} = s.data[pos - s.base]
-proc `[]=`*(s: var LocSpan; pos: int; v: Location) {.inline.} = s.data[pos - s.base] = v
+proc `[]`(s: LocSpan; pos: int): lent Location {.inline.} = s.data[pos - s.base]
+proc `[]`(s: var LocSpan; pos: int): var Location {.inline.} = s.data[pos - s.base]
+proc `[]=`(s: var LocSpan; pos: int; v: Location) {.inline.} = s.data[pos - s.base] = v
 
-proc rebuildHomes*(ra: var RegAlloc) =
+proc planned*(plan: Plan; pos: int): Location {.inline.} =
+  ## THE plan for the value produced at token position `pos`.
+  ##
+  ## `Undef` means the planner has no answer there and the emitter decides for
+  ## itself. Today that is EVERY expression position: `planStmt` records only
+  ## declarations, so the emitter picks expression temps as it walks
+  ## (`takeTmp`/`pickStaging`, threading `dest: var Location`). Filling those
+  ## positions in is the extension this shape exists for — the read side, the
+  ## storage (`locs`, sized to the proc's whole token span) and the write side
+  ## (`recordValue`) already take a bare position and never ask for a name.
+  ##
+  ## Note that both emitters ALREADY ask this about EXPRESSION positions, not just
+  ## about declarations: a fused lvalue walk asks for the base, index and stride
+  ## registers of an `(at …)` by position, and an intrinsic asks where its operands
+  ## landed. The read side is therefore already what it needs to be — it is the
+  ## write side for those positions that sits in the wrong module (`getExpr`, and
+  ## `planAtEmitTime` class 1).
+  plan.locs[pos]
+
+proc planAtEmitTime*(plan: var Plan; pos: int; loc: Location) {.inline.} =
+  ## The raw write for an expression position, from the backends. Named rather than
+  ## left as a bare table write so the worklist is one grep, and so the plan's storage
+  ## can stay private.
+  ##
+  ## Its callers are NOT all the same kind of thing, and the difference is the whole
+  ## review question for this module. Three classes:
+  ##
+  ##  1. a PLACEMENT — `getExpr` and `emitLvalWalk`'s global base decide where a value
+  ##     will go before anything is emitted. Real phase B, in the wrong module; a
+  ##     `planValue` pass subsumes exactly these.
+  ##  2. a WRITE-BACK of a resolution — `prematAddrVal2` and the intrinsic operand
+  ##     loops hand `emitValue2` a `NeedsReg`/`RegOrImm` and store the concrete answer
+  ##     back. The decision was already made; this only records how it came out.
+  ##  3. a scoped MATERIALIZATION — `reloadMemBase2`/`restoreMemBase2` lend a spilled
+  ##     home to a staging register for the length of one addressing mode and put it
+  ##     back. A peephole, not an allocation. It stays at emit time whatever else moves.
+  ##
+  ## Only (1) migrates. Confusing (3) for (1) is how the emitter grows a second
+  ## register allocator, so ask which class a new call belongs to before adding one.
+  plan.locs[pos] = loc
+
+proc rebuildHomes*(plan: var Plan) =
   ## Recompute `homeRegs`/`homeFRegs` from `symPos`/`locs`. Runs at most once per
   ## pre-pass mutation (in practice: once per proc, on the first freeness query).
-  ra.homeRegs = {}
-  ra.homeFRegs = {}
-  for pos in ra.symPos.values:
-    case ra.locs[pos].kind
-    of InReg: ra.homeRegs.incl ra.locs[pos].r
+  plan.homeRegs = {}
+  plan.homeFRegs = {}
+  for pos in plan.symPos.values:
+    let loc = plan.planned(pos)
+    case loc.kind
+    of InReg: plan.homeRegs.incl loc.r
     of InRegPair:
-      ra.homeRegs.incl ra.locs[pos].r0
-      if ra.locs[pos].r1 != NoReg: ra.homeRegs.incl ra.locs[pos].r1
-    of InFReg: ra.homeFRegs.incl ra.locs[pos].f
+      plan.homeRegs.incl loc.r0
+      if loc.r1 != NoReg: plan.homeRegs.incl loc.r1
+    of InFReg: plan.homeFRegs.incl loc.f
     else: discard
-  ra.homesDirty = false
+  plan.homesDirty = false
 
 proc posOf(b: Builder; c: Cursor): int {.inline.} =
   cursorToPosition(b.buf[], c)
+
+proc homeOf(b: Builder; name: string): Location {.inline.} =
+  ## The planner-side twin of `homeOfSym`: resolve a name to its position, then ask
+  ## the plan. Not "look up a name in a name table" — the name table holds POSITIONS
+  ## (`symPos`), and this is the one place inside the builder that follows the alias.
+  ## `NoLoc` for a module-level symbol, which has no entry (the emitter resolves it).
+  let p = b.plan.symPos.getOrDefault(name, -1)
+  if p >= 0: b.plan.planned(p) else: noLoc
 
 # ── physical register pools ────────────────────────────────────────────────
 
@@ -204,7 +296,7 @@ proc takeReg(b: var Builder; pool: var set[Reg]; cands: openArray[Reg]): Reg =
   ## Take the first free, non-sealed register from `cands`. A sealed register
   ## is committed to an in-flight ABI call and must never be h(re)allocated.
   for r in cands:
-    if r in pool and r notin b.ra.sealed:
+    if r in pool and r notin b.plan.sealed:
       excl pool, r
       return r
   result = NoReg
@@ -214,7 +306,7 @@ proc takeReg(b: var Builder; pool: var set[Reg]; cands: set[Reg]): Reg =
   ## slot. For a candidate pool with no ABI preference order (`callerSaveHomeCandidates`)
   ## the choice among equals is arbitrary anyway.
   for r in cands:
-    if r in pool and r notin b.ra.sealed:
+    if r in pool and r notin b.plan.sealed:
       excl pool, r
       return r
   result = NoReg
@@ -238,7 +330,7 @@ proc spillTo(b: var Builder; name: string; slot: AsmSlot): Location =
 proc fixedRoleOk(b: Builder; r: Reg; props: VarProps): bool {.inline.} =
   ## May a value with these props be homed in `r`?
   ##
-  ## `allocStorage` hands out the div/rem and shift-count registers ONLY to a value
+  ## `getSym` hands out the div/rem and shift-count registers ONLY to a value
   ## whose live range is interval-proved free of the instruction that claims them
   ## (`DivRegOk` / `ShiftRegOk`) — an `idiv` destroys rdx and a variable shift's count
   ## destroys rcx, neither of which names the register as an operand the emitter could
@@ -258,8 +350,16 @@ proc fixedRoleOk(b: Builder; r: Reg; props: VarProps): bool {.inline.} =
   (r != b.md.shiftCountReg or ShiftRegOk in props) and
   (r != b.md.divRemReg or DivRegOk in props)
 
-proc allocStorage(b: var Builder; name: string; slot: AsmSlot; props: VarProps): Location =
-  ## Decide where one local/param lives. Records reg use for scope freeing.
+proc getSym(b: var Builder; name: string; slot: AsmSlot; props: VarProps): Location =
+  ## PHASE A acquire: decide where one declared local/param lives, and take the
+  ## register for it. Paired with `freeSym`.
+  ##
+  ## The phase shows in the KEY: this door is named — a declaration has a name, and
+  ## the plan entry it writes gets a `symPos` alias so every later use resolves through
+  ## it. That alias is what makes phase A's one undo (`demoteToStack`) a single-point
+  ## rewrite. `getExpr`/`freeExpr` in the backends are the phase-B twins: same pools,
+  ## keyed by POSITION, and with no undo — by the time they run, everything this door
+  ## decided is final.
   if slot.isFloat:
     # A float local lives only in a callee-saved register (saved in the prologue),
     # or it spills. The volatile float pool (v16–v31 on arm64, xmm8–15 on x64) is
@@ -273,7 +373,7 @@ proc allocStorage(b: var Builder; name: string; slot: AsmSlot; props: VarProps):
     if AddrTaken in props: return b.spillTo(name, slot)
     let f = b.takeFReg(b.freeCalleeF, b.md.floatCalleeSaved)
     if f == NoFReg: return b.spillTo(name, slot)
-    b.ra.usedCalleeF.incl f
+    b.plan.usedCalleeF.incl f
     return fregLoc(f, slot)
   if AddrTaken in props or not slot.inRegClass:
     return b.spillTo(name, slot)
@@ -339,7 +439,7 @@ proc allocStorage(b: var Builder; name: string; slot: AsmSlot; props: VarProps):
         " span=" & $(hi - lo) &
         " callee=" & $(5 - b.freeCallee.card) & "/5 vol=" & $b.freeVol.card & "free"
     return b.spillTo(name, slot)
-  if r in b.md.intCalleeSavedSet: b.ra.usedCallee.incl r
+  if r in b.md.intCalleeSavedSet: b.plan.usedCallee.incl r
   result = regLoc(r, slot)
 
 proc giveBack(b: var Builder; r: Reg) {.inline.} =
@@ -349,6 +449,26 @@ proc giveBack(b: var Builder; r: Reg) {.inline.} =
 proc giveBackF(b: var Builder; f: FReg) {.inline.} =
   if f in b.md.floatCalleeSavedSet: b.freeCalleeF.incl f
   elif f != NoFReg: b.freeVolF.incl f
+
+proc freeSym(b: var Builder; name: string) =
+  ## PHASE A release: return whatever registers `name` currently occupies. The
+  ## counterpart of `getSym`, and it takes the NAME rather than the register on
+  ## purpose — that is not a convenience, it is the correctness rule.
+  ##
+  ## Between the `getSym` and here, a steal may have moved `name` to the stack
+  ## (`demoteToStack`); the register it was given now belongs to the thief, which will
+  ## release it when its OWN range ends. So the release has to read the home that is
+  ## current AT RELEASE TIME, and a demoted var must free nothing. Taking a `Reg`
+  ## argument would let a caller pass the stale one and silently double-free it into
+  ## the pool. Both callers (`flushFree`, `closeScope`) had this ladder open-coded.
+  let loc = b.homeOf(name)
+  case loc.kind
+  of InReg: b.giveBack loc.r
+  of InRegPair:
+    b.giveBack loc.r0
+    if loc.r1 != NoReg: b.giveBack loc.r1
+  of InFReg: b.giveBackF loc.f
+  else: discard
 
 proc weightOf(b: Builder; name: string): int {.inline.} =
   b.an.vars.getOrDefault(name).weight
@@ -362,7 +482,7 @@ proc rangeLen(b: Builder; name: string): int {.inline.} =
   if vi.freeAfter == high(int): return high(int)
   max(1, vi.freeAfter - vi.liveStart)
 
-# ── scope-based walk that allocates locals ──────────────────────────────────
+# ── scope-based statement walk that plans declarations ──────────────────────
 
 proc flushFree(b: var Builder; curpos: int) =
   ## Return to the pool the registers of locals whose coarse last-use end position
@@ -374,12 +494,7 @@ proc flushFree(b: var Builder; curpos: int) =
   while i < b.pendingFree.len:
     if b.pendingFree[i].pos <= curpos:
       let name = b.pendingFree[i].name
-      let loc = b.ra.locs[b.ra.symPos[name]]
-      if loc.kind == InReg: b.giveBack loc.r
-      elif loc.kind == InRegPair:
-        b.giveBack loc.r0
-        if loc.r1 != NoReg: b.giveBack loc.r1
-      elif loc.kind == InFReg: b.giveBackF loc.f
+      b.freeSym name
       b.freedSyms.incl name
       b.pendingFree.del i              # swap-remove; order is irrelevant
     else: inc i
@@ -392,17 +507,23 @@ proc closeScope(b: var Builder) =
   ## Already early-freed vars are skipped (their reg may now belong to a reuser).
   for v in b.scopeVars.pop():
     if v in b.freedSyms: continue
-    let loc = b.ra.locs[b.ra.symPos[v]]
-    if loc.kind == InReg: b.giveBack loc.r
-    elif loc.kind == InRegPair:
-      b.giveBack loc.r0
-      if loc.r1 != NoReg: b.giveBack loc.r1
-    elif loc.kind == InFReg: b.giveBackF loc.f
+    b.freeSym v
 
-proc record(b: var Builder; pos: int; name: string; loc: Location) =
-  b.ra.symPos[name] = pos
-  b.ra.locs[pos] = loc
-  b.ra.homesDirty = true
+proc recordValue(b: var Builder; pos: int; loc: Location) {.inline.} =
+  ## Plan the value produced AT `pos` into `loc`. This is the position-keyed
+  ## primitive every other recording form is built on, and it needs no name —
+  ## which is the point: an expression has a position and no name, so this is the
+  ## call an expression-homing planner makes. See `planned` for the read side.
+  b.plan.locs[pos] = loc
+
+proc recordSym(b: var Builder; pos: int; name: string; loc: Location) =
+  ## `recordValue` plus a NAME ALIAS for that position. A local's home is not a
+  ## different kind of thing from an expression's — it is the same plan entry with
+  ## a name pointing at it, which is why undoing one (`demoteToStack`, a steal) is
+  ## a single-point rewrite that every use sees.
+  b.recordValue(pos, loc)
+  b.plan.symPos[name] = pos
+  b.plan.homesDirty = true
 
 proc coldestVictim(b: var Builder; maxW, ceilLen, thiefDepth: int;
                    calleeOnly, wantFloat: bool): string =
@@ -420,18 +541,18 @@ proc coldestVictim(b: var Builder; maxW, ceilLen, thiefDepth: int;
     for v in scope:
       if v in b.freedSyms: continue             # already dead (early-freed)
       if v in b.inheritedHomes: continue        # its store was never allocated; must stay InReg
-      let vloc = b.ra.locs[b.ra.symPos[v]]
+      let vloc = b.homeOf(v)
       if wantFloat:
         if vloc.kind != InFReg: continue
       else:
         if vloc.kind != InReg: continue
-        if vloc.r in b.ra.sealed: continue      # pinned to an in-flight ABI call
+        if vloc.r in b.plan.sealed: continue      # pinned to an in-flight ABI call
         if calleeOnly and vloc.r notin b.md.intCalleeSavedSet: continue
       let vw = b.weightOf(v)
       if vw < bestW or (vw == bestW and b.rangeLen(v) > bestLen):
         bestW = vw; bestLen = b.rangeLen(v); result = v
 
-proc addSpillTemp*(ra: var RegAlloc; name: string; typ: AsmSlot; isFloat = false) =
+proc addSpillTemp*(plan: var Plan; name: string; typ: AsmSlot; isFloat = false) =
   ## Register a totality spill slot. `hasStackVars` comes WITH it: a spill temp is a
   ## nifasm `(s)` slot like any other, and the frame `sub` is emitted from that flag.
   ##
@@ -441,8 +562,8 @@ proc addSpillTemp*(ra: var RegAlloc; name: string; typ: AsmSlot; isFloat = false
   ## minted under register exhaustion, which no proc reaches without stack vars of its
   ## own; the caller-saved save slot is the first one a register-only proc can have, and
   ## it produced a proc with a slot and NO frame — every save writing below `rsp`.
-  ra.spillTemps.add (name: name, typ: typ, isFloat: isFloat)
-  ra.hasStackVars = true
+  plan.spillTemps.add (name: name, typ: typ, isFloat: isFloat)
+  plan.hasStackVars = true
 
 proc demoteToStack(b: var Builder; victim: string) =
   ## Undo `victim`'s optimistic register assignment: move it to a nifasm-managed `(s)`
@@ -450,11 +571,11 @@ proc demoteToStack(b: var Builder; victim: string) =
   ## of `locs[symPos[victim]]` — and because every use reads through `symPos` (the
   ## emitter late-binds via `locationOfSym`), every use, walked or not, sees the new
   ## home. Sound across every control-flow path: the home is memory everywhere.
-  let vpos = b.ra.symPos[victim]
-  b.ra.callerSaveHomes.del victim     # its home is memory now: nothing to save/restore
-  b.ra.locs[vpos] = namedStackLoc(victim, b.ra.locs[vpos].typ)
-  b.ra.hasStackVars = true
-  b.ra.homesDirty = true
+  let vpos = b.plan.symPos[victim]
+  b.plan.callerSaveHomes.del victim     # its home is memory now: nothing to save/restore
+  b.plan.locs[vpos] = namedStackLoc(victim, b.plan.planned(vpos).typ)
+  b.plan.hasStackVars = true
+  b.plan.homesDirty = true
 
 proc trySteal(b: var Builder; curName: string; curSlot: AsmSlot;
               curProps: VarProps; fallback: Location): Location =
@@ -480,7 +601,7 @@ proc trySteal(b: var Builder; curName: string; curSlot: AsmSlot;
         "(w=" & $vi.weight & ",u=" & $vi.usages & ",d=" & $vi.defs &
         ",len=" & $b.rangeLen(curName) & ",dld=" & $vi.declLoopDepth & ")"
     return fallback                          # nothing colder to steal from
-  let bestReg = b.ra.locs[b.ra.symPos[bestV]].r
+  let bestReg = b.homeOf(bestV).r
   if not b.fixedRoleOk(bestReg, curProps):
     # The victim holds rdx/rcx under its OWN interval proof; this value has no such
     # proof, so taking the register would put it across the div/shift that claims it.
@@ -496,7 +617,7 @@ proc trySteal(b: var Builder; curName: string; curSlot: AsmSlot;
       " victim=" & bestV & "(w=" & $b.weightOf(bestV) & ",len=" & $b.rangeLen(bestV) &
       ",u=" & $b.an.vars.getOrDefault(bestV).usages &
       ",dld=" & $b.an.vars.getOrDefault(bestV).declLoopDepth & ")"
-  if bestReg in b.md.intCalleeSavedSet: b.ra.usedCallee.incl bestReg
+  if bestReg in b.md.intCalleeSavedSet: b.plan.usedCallee.incl bestReg
   result = regLoc(bestReg, curSlot)
 
 # A computed temporary NEVER steals a live local. codegen.c proves ~2 registers
@@ -567,7 +688,7 @@ proc callerSaveRescue(b: var Builder; name: string; slot: AsmSlot;
                       fallback: Location): Location =
   ## The third option between "callee-saved register" and "memory".
   ##
-  ## `allocStorage` gives a value that crosses a call the callee-saved pool or the
+  ## `getSym` gives a value that crosses a call the callee-saved pool or the
   ## stack — and 90 % of arkham's spills take the stack while 6-7 VOLATILE registers
   ## sit free, because a volatile is clobbered by the call. A caller-saved home closes
   ## that: the value lives in a volatile and the emitter brackets each crossed call
@@ -579,7 +700,7 @@ proc callerSaveRescue(b: var Builder; name: string; slot: AsmSlot;
   ## caller-saved value is never live in its register across the call — it is stored
   ## before marshalling begins and reloaded after the call returns. The one residual
   ## hazard, that this value is itself the SOURCE of an argument to the same call, is
-  ## closed by `RegAlloc.callerSaveActive`: inside the call window every read resolves
+  ## closed by `Plan.callerSaveActive`: inside the call window every read resolves
   ## to the save slot. So the partition still holds where the design needs it, and no
   ## shuffle analysis appears.
   ##
@@ -629,7 +750,7 @@ proc callerSaveRescue(b: var Builder; name: string; slot: AsmSlot;
   if not b.an.clobbersBridgeReg: r = b.takeReg(b.freeVol, [b.md.stagingBridgeReg])
   if r == NoReg: r = b.takeReg(b.freeVol, b.md.intLocalTempRegs)
   if r == NoReg: return fallback
-  b.ra.callerSaveHomes[name] = vi.freeAfter
+  b.plan.callerSaveHomes[name] = vi.freeAfter
   # The save slot is declared in the PROLOGUE, not at the decl. arkham emits by a
   # textual walk, so a binding made inside one branch is still live when the sibling
   # branch is emitted, and the sibling's calls save through this slot too. A slot
@@ -637,15 +758,9 @@ proc callerSaveRescue(b: var Builder; name: string; slot: AsmSlot;
   # the save would then corrupt an unrelated variable. (Saving a value the sibling
   # path never defined is harmless in itself: it is dead there, so the reload is dead
   # too. Aliasing the slot is what was fatal.)
-  b.ra.addSpillTemp("csave." & name, slot)
+  b.plan.addSpillTemp("csave." & name, slot)
   result = regLoc(r, slot)
 
-proc symLoc(b: var Builder; name: string): Location =
-  ## A symbol reference reads where the symbol is stored. A module-level
-  ## global/proc is not in `symPos`; the emitter resolves those (Glob / `lea`), so
-  ## return `NoLoc` and let it.
-  let p = b.ra.symPos.getOrDefault(name, -1)
-  if p >= 0: b.ra.locs[p] else: noLoc
 proc copyCastSrcSym*(n: Cursor): Cursor =
   ## If `n` is a bare `Symbol`, or a `(cast T sym)` / `(conv T sym)` relabel, return a
   ## cursor at the inner `Symbol`; otherwise return a cursor whose `.kind != Symbol`
@@ -680,8 +795,8 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
       # an aggregate (object/array/named type): a nifasm-managed `(s)` stack
       # var, addressed by name — arkham does not register-allocate it. (No
       # early `return` here: that would skip the `into` epilogue and desync.)
-      b.record(pos, name, namedStackLoc(name, slot))
-      b.ra.hasStackVars = true
+      b.recordSym(pos, name, namedStackLoc(name, slot))
+      b.plan.hasStackVars = true
     else:
       let props = b.an.vars.getOrDefault(name).props
       # ── same-width cast/copy home inheritance ──────────────────────────────────
@@ -702,7 +817,7 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
         let srcSym = copyCastSrcSym(valCur)
         if srcSym.kind == Symbol:
           let srcName = symName(srcSym)
-          let sh = b.symLoc(srcName)
+          let sh = b.homeOf(srcName)
           let svi = b.an.vars.getOrDefault(srcName)
           if sh.kind == InReg and not sh.typ.isFloat and sh.typ.size == slot.size and
              svi.defs == 1 and svi.lastUsePos <= b.posOf(srcSym) and
@@ -739,11 +854,11 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
                     slot.inRegClass and b.md.intRetReg in b.freeVol
       var loc =
         if aliasSrc.len > 0: dontCare                                 # c2 is a pure view of c1
-        elif inheritSrc.len > 0: regLoc(b.symLoc(inheritSrc).r, slot) # c2 takes c1's reg
+        elif inheritSrc.len > 0: regLoc(b.homeOf(inheritSrc).r, slot) # c2 takes c1's reg
         elif takeRet:
           excl b.freeVol, b.md.intRetReg
           regLoc(b.md.intRetReg, slot)
-        else: b.allocStorage(name, slot, props)
+        else: b.getSym(name, slot, props)
       if inheritSrc.len > 0:
         # Transfer the register's free obligation from the (now-dead) source to this var:
         # drop the source's pending early-free and mark it freed so `closeScope` skips it;
@@ -766,7 +881,7 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
          slot.inRegClass and not slot.isFloat:
         loc = b.trySteal(name, slot, props, loc)  # hot var evicts a colder one
       if loc.kind == NamedStack:
-        b.ra.hasStackVars = true
+        b.plan.hasStackVars = true
       when defined(arkhamSSAStats):
         if loc.kind == NamedStack and AddrTaken notin props and
            slot.inRegClass and not slot.isFloat:
@@ -777,11 +892,11 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
             " init=" & $svi.initClass & " weight=" & $svi.weight &
             " inloop=" & $svi.declInLoop & "\n"
       if aliasSrc.len > 0:
-        b.ra.symPos[name] = b.ra.symPos[aliasSrc]   # c2 resolves to c1's LIVE home (no own reg)
-        b.ra.aliasedCasts.incl name                 # emitter emits neither decl nor store for it
-        b.ra.homesDirty = true
+        b.plan.symPos[name] = b.plan.symPos[aliasSrc]   # c2 resolves to c1's LIVE home (no own reg)
+        b.plan.aliasedCasts.incl name                 # emitter emits neither decl nor store for it
+        b.plan.homesDirty = true
       else:
-        b.record(pos, name, loc)
+        b.recordSym(pos, name, loc)
         b.scopeVars[^1].add name
       # Register the coarse early-free. In-loop decls participate too: a loop-body
       # local's lifetime is per-iteration (no loop-carrying semantics — its scope
@@ -796,7 +911,13 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
       if loc.kind == InReg:
         b.pendingFree.add (pos: vi.freeAfter, name: name)
 
-proc walk(b: var Builder; n: var Cursor) =
+proc planStmt(b: var Builder; n: var Cursor) =
+  ## Walk the STATEMENTS of a body and plan what they declare. There is deliberately
+  ## no `planValue` twin yet: an expression position gets no plan entry, and the
+  ## emitter picks its temps itself as it walks (see `planned`). Adding one means
+  ## recursing into the value positions this pass currently skips over and calling
+  ## `recordValue` — the storage, the write side and the read side already take a
+  ## bare position, so it is an addition here rather than a change everywhere.
   case n.stmtKind
   of ProcS, TypeS:
     skip n                                   # nested decls allocate separately
@@ -806,28 +927,28 @@ proc walk(b: var Builder; n: var Cursor) =
     openScope(b)
     n.into:
       while n.hasMore:
-        walk(b, n)
+        planStmt(b, n)
         flushFree(b, b.posOf(n))             # free locals dead as of this boundary
     closeScope(b)
   of StmtsS:                                  # a statement list — NOT a fresh scope
     n.into:
       while n.hasMore:
-        walk(b, n)
+        planStmt(b, n)
         flushFree(b, b.posOf(n))
   of RetS:
     skip n
   of CallS, InstrS:
     if n.kind == TagLit:
       n.into:
-        while n.hasMore: walk(b, n)
+        while n.hasMore: planStmt(b, n)
     else: inc n
   of AsgnS, KeepovfS, WhileS, IfS, CaseS:
     n.into:
-      while n.hasMore: walk(b, n)
+      while n.hasMore: planStmt(b, n)
   else:
     if n.kind == TagLit:
       n.into:
-        while n.hasMore: walk(b, n)          # recurse (var decls may nest)
+        while n.hasMore: planStmt(b, n)          # recurse (var decls may nest)
     else:
       inc n
 
@@ -898,7 +1019,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
                 if r == NoReg:
                   pairOk = false
                   break
-                b.ra.usedCallee.incl r
+                b.plan.usedCallee.incl r
               else:
                 r = arg
                 b.freeVol.excl arg
@@ -906,16 +1027,16 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
             if not pairOk:
               if r0 != NoReg:
                 b.giveBack r0
-                b.ra.usedCallee.excl r0
+                b.plan.usedCallee.excl r0
               if r1 != NoReg:
                 b.giveBack r1
-                b.ra.usedCallee.excl r1
+                b.plan.usedCallee.excl r1
               r0 = NoReg; r1 = NoReg
           if pairOk:
-            b.record(pos, name, regPairLoc(r0, r1, slot))
+            b.recordSym(pos, name, regPairLoc(r0, r1, slot))
           else:
-            b.record(pos, name, namedStackLoc(name, slot))
-            b.ra.hasStackVars = true
+            b.recordSym(pos, name, namedStackLoc(name, slot))
+            b.plan.hasStackVars = true
         elif aggrStack and b.md.arch == X86:
           # (No early `continue`/`return`: that skips the `into` epilogue.) These home the
           # aggregate in its own `(s)` slot; only a register-passed one consumes GPRs.
@@ -924,8 +1045,8 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
           # a stack-passed by-value aggregate instead gets a POINTER home in a register
           # (below, like a by-ref aggregate): `emitStackParamLoads` computes `&incoming`
           # with `Lea` and the body reads fields through it — no copy.
-          b.record(pos, name, namedStackLoc(name, slot))
-          b.ra.hasStackVars = true
+          b.recordSym(pos, name, namedStackLoc(name, slot))
+          b.plan.hasStackVars = true
         else:
           # `effSlot` is the in-register value: the scalar itself, or a pointer — to
           # the aggregate copy (by-ref), or to the incoming stack bytes (a64 stack-passed
@@ -951,7 +1072,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
               elif hasCall:
                 let f = b.takeFReg(b.freeCalleeF, b.md.floatCalleeSaved)
                 if f != NoFReg:
-                  b.ra.usedCalleeF.incl f
+                  b.plan.usedCalleeF.incl f
                   loc = fregLoc(f, effSlot)
                 else:
                   loc = b.spillTo(name, effSlot)
@@ -1015,7 +1136,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
               # a callee-saved home the prologue fills with `mov home, argReg`.
               let r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
               if r != NoReg:
-                b.ra.usedCallee.incl r
+                b.plan.usedCallee.incl r
                 loc = regLoc(r, effSlot)
                 if not aggrByRef:
                   # Evictable in favour of a later stack param (a by-ref aggregate's
@@ -1027,9 +1148,9 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
                 # from the incoming arg register) and reusing its register — the
                 # pointer stays InReg, which every consumer already handles.
                 let victim = spillableRegParams.pop()
-                b.record(victim.pos, victim.name,
+                b.recordSym(victim.pos, victim.name,
                          namedStackLoc(victim.name, victim.effSlot))
-                b.ra.hasStackVars = true
+                b.plan.hasStackVars = true
                 loc = regLoc(victim.r, effSlot)
               else:
                 # Totality: no callee-saved reg and nothing colder to evict. A
@@ -1053,9 +1174,9 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
               # No free callee-saved register: evict an earlier scalar register
               # param to its stack slot and reuse its register for this stack param.
               let victim = spillableRegParams.pop()
-              b.record(victim.pos, victim.name,
+              b.recordSym(victim.pos, victim.name,
                        namedStackLoc(victim.name, victim.effSlot))
-              b.ra.hasStackVars = true
+              b.plan.hasStackVars = true
               r = victim.r                        # already in usedCallee
             if r == NoReg:
               # Totality: no callee-saved reg and nothing colder to evict — home this
@@ -1063,15 +1184,15 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
               # arg area into the slot through a staging bridge (`emitStackParamLoadsX64`),
               # so no register is held; correct by construction, never a hard fail.
               loc = memHome()
-              b.ra.hasStackVars = true
+              b.plan.hasStackVars = true
             else:
-              b.ra.usedCallee.incl r
+              b.plan.usedCallee.incl r
               loc = regLoc(r, effSlot)
           if loc.kind in {NamedStack, StackPtr}:
             # An address-taken / spilled param's `(s)` slot: the prologue fills it
             # from the incoming arg register (int or SIMD; see emitParamMoves).
-            b.ra.hasStackVars = true
-          b.record(pos, name, loc)
+            b.plan.hasStackVars = true
+          b.recordSym(pos, name, loc)
   # Make the scalar register-homed params visible to `coldestVictim`: a proc whose
   # params all take callee-saved homes (every reg param crosses a call) would
   # otherwise leave `reserveHeldScratch`/`trySteal` with no register-resident LOCAL
@@ -1097,13 +1218,13 @@ proc seedPools(b: var Builder) =
   for r in b.md.intTempRegs: b.freeVol.incl r
   # Call-free locals may also draw from `intLocalTempRegs` (the arg registers with
   # no fixed instruction role). `reserveTmp` still filters on `intTempRegs` so these
-  # never serve as emitter transient scratch; only `allocStorage`'s `AllRegs` fall-
+  # never serve as emitter transient scratch; only `getSym`'s `AllRegs` fall-
   # back (which filters on `intLocalTempRegs`) can hand them to a local. A leaf param
   # that persistently occupies one is removed from this pool in `allocParams`.
   for r in b.md.intLocalTempRegs: b.freeVol.incl r
   # The fixed-role registers (rdx = div/rem, rcx = shift count) also join `freeVol`
   # so a `DivRegOk`/`ShiftRegOk` local can be homed there. They are handed out ONLY
-  # via those props' candidate list in `allocStorage` (never in `intLocalTempRegs`
+  # via those props' candidate list in `getSym` (never in `intLocalTempRegs`
   # nor `intTempRegs`), so no ordinary local/temp draws them; and the interval
   # analysis guarantees their fixed role never overlaps such a local (asserted by
   # `divRemOccupied`/`regOccupied` at the div/shift sites). `NoReg` on RISC (a64).
@@ -1144,7 +1265,7 @@ proc findReturnedVar(body: Cursor): string =
 
 proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
                    prog: var Program; md: MachineDesc; tc: TypeCtx;
-                   presealed: set[Reg] = {}): RegAlloc =
+                   presealed: set[Reg] = {}): Plan =
   ## Allocate storage for the params and locals of `procDecl` in a SINGLE walk
   ## over the tree (the decl-only pre-pass of the fused value core; expression
   ## temporaries are decided at emission). The model (codegen.c + optimistic
@@ -1171,12 +1292,12 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
   let procStart = cursorToPosition(buf, procDecl)
   var procEndCur = procDecl; skip procEndCur
   let procEnd = cursorToPosition(buf, procEndCur)
-  b.ra = RegAlloc(locs: initLocSpan(procStart, procEnd - procStart),
+  b.plan = Plan(locs: initLocSpan(procStart, procEnd - procStart),
                   aux: initTable[int, ExprAux](),
                   symPos: initTable[string, int]())
-  b.ra.sealed = presealed
-  b.ra.divRegClobbered = an.clobbersDivReg
-  b.ra.shiftRegClobbered = an.clobbersShiftReg
+  b.plan.sealed = presealed
+  b.plan.divRegClobbered = an.clobbersDivReg
+  b.plan.shiftRegClobbered = an.clobbersShiftReg
   b.scopeVars = @[]; b.pendingFree = @[]; b.freedSyms = initHashSet[string]()
   b.seedPools()
   var n = procDecl
@@ -1213,14 +1334,14 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
     # GUARANTEE one stays free; which one is the emitter's choice (any unused callee-saved).
     block:
       let plan = planCall(b.md, paramSlots(b.prog[], n), b.retIndirect)
-      b.ra.hasStackParams = plan.hasStackArgs  # single source of truth for the emitter
+      b.plan.hasStackParams = plan.hasStackArgs  # single source of truth for the emitter
       if plan.hasStackArgs:
         # Reserve a callee-saved reg the body cannot use, for the emitter's
         # `stackArgBaseReg`. Skip any SEALED reg (e.g. `RBX` presealed for a >16B-return
         # hidden pointer) — excluding that one reserves nothing extra, leaving the base
         # `NoReg` under full callee-saved pressure.
         for r in b.md.intCalleeSaved:
-          if r in b.freeCallee and r notin b.ra.sealed: (b.freeCallee.excl r; break)
+          if r in b.freeCallee and r notin b.plan.sealed: (b.freeCallee.excl r; break)
     allocParams(b, n, an.hasCall)            # advances n past params → return type
     skip n                                    # return type
     skip n                                    # pragmas
@@ -1229,13 +1350,19 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
     # var-decl path). An aggregate/float/indirect return marshals differently.
     if not b.retAggr and b.retFloatBits == 0 and not b.retIndirect:
       b.returnedVar = findReturnedVar(n)
-    walk(b, n)                                # body
+    planStmt(b, n)                                # body
   b.closeScope()
-  result = ensureMove b.ra
+  result = ensureMove b.plan
 
 # ── lookup API (used by codegen) ────────────────────────────────────────────
+#
+# A Location belongs to a POSITION. `planned` is that question and the whole of
+# it; the two name-keyed lookups below are a convenience layer over it, because a
+# local's name is an alias for the position of its declaration (`symPos`). Keeping
+# it in that order is what lets an expression — which has a position and no name —
+# be planned by exactly the same machinery.
 
-proc homeOfSym*(ra: RegAlloc; name: string): Location {.inline.} =
+proc homeOfSym*(plan: Plan; name: string): Location {.inline.} =
   ## The DECLARED STORAGE of a local/param — the one place its value lives when it
   ## is not in flight. `NoLoc` if the name is not an allocator-known local/param (a
   ## module-level symbol or a synthesized slot).
@@ -1251,13 +1378,13 @@ proc homeOfSym*(ra: RegAlloc; name: string): Location {.inline.} =
   ## is this very value. Redirecting here covers every read uniformly, which is
   ## why no shuffle/cycle-breaking analysis is needed (`design.md` "How this deals
   ## with the ABI").
-  if ra.callerSaveActive.len > 0:
-    let act = ra.callerSaveActive.getOrDefault(name, noLoc)
+  if plan.callerSaveActive.len > 0:
+    let act = plan.callerSaveActive.getOrDefault(name, noLoc)
     if act.kind != NoLoc: return act
-  let p = ra.symPos.getOrDefault(name, -1)
-  if p >= 0: ra.locs[p] else: noLoc
+  let p = plan.symPos.getOrDefault(name, -1)
+  if p >= 0: plan.planned(p) else: noLoc      # the name is an alias for that position
 
-proc locationOfSym*(ra: RegAlloc; name: string; pos: int): Location {.inline.} =
+proc locationOfSym*(plan: Plan; name: string; pos: int): Location {.inline.} =
   ## Where the VALUE of `name` is at token position `pos`.
   ##
   ## Today every local has exactly one location for its whole live range, so this
@@ -1271,17 +1398,17 @@ proc locationOfSym*(ra: RegAlloc; name: string; pos: int): Location {.inline.} =
   ## Segments are sorted by `fromPos` and cover the range from there to the next
   ## one; a position before the first segment means the value is not live yet,
   ## which is the declared home by construction.
-  if ra.callerSaveActive.len > 0:
-    let act = ra.callerSaveActive.getOrDefault(name, noLoc)
+  if plan.callerSaveActive.len > 0:
+    let act = plan.callerSaveActive.getOrDefault(name, noLoc)
     if act.kind != NoLoc: return act
-  if ra.segs.len > 0 and ra.segs.hasKey(name):
-    let s = ra.segs[name]
+  if plan.segs.len > 0 and plan.segs.hasKey(name):
+    let s = plan.segs[name]
     if s.len > 0:
       var i = s.len - 1
       while i > 0 and s[i].fromPos > pos: dec i
       if s[i].fromPos <= pos: return s[i].loc
-  let p = ra.symPos.getOrDefault(name, -1)
-  if p >= 0: ra.locs[p] else: noLoc
+  let p = plan.symPos.getOrDefault(name, -1)
+  if p >= 0: plan.planned(p) else: noLoc      # the name is an alias for that position
 
 # ── sealing (driven by codegen during ABI call marshalling) ─────────────────
 # Before codegen places an argument in `xN` (or `x8` for an indirect result),
@@ -1292,13 +1419,13 @@ when defined(arkhamBindTrace):
   var dbgRegSite*: Table[int, string] = initTable[int, string]()
     ## TEMP DIAGNOSTIC: per-register stack trace of the last bind/seal.
 
-proc seal*(ra: var RegAlloc; r: Reg) {.inline.} =
-  ra.sealed.incl r
+proc seal*(plan: var Plan; r: Reg) {.inline.} =
+  plan.sealed.incl r
   when defined(arkhamBindTrace): dbgRegSite[ord(r)] = getStackTrace()
-proc unseal*(ra: var RegAlloc; r: Reg) {.inline.} = ra.sealed.excl r
-proc seal*(ra: var RegAlloc; regs: set[Reg]) {.inline.} =
-  ra.sealed = ra.sealed + regs
+proc unseal*(plan: var Plan; r: Reg) {.inline.} = plan.sealed.excl r
+proc seal*(plan: var Plan; regs: set[Reg]) {.inline.} =
+  plan.sealed = plan.sealed + regs
   when defined(arkhamBindTrace):
     for r in regs: dbgRegSite[ord(r)] = getStackTrace()
-proc unseal*(ra: var RegAlloc; regs: set[Reg]) {.inline.} = ra.sealed = ra.sealed - regs
-proc isSealed*(ra: RegAlloc; r: Reg): bool {.inline.} = r in ra.sealed
+proc unseal*(plan: var Plan; regs: set[Reg]) {.inline.} = plan.sealed = plan.sealed - regs
+proc isSealed*(plan: Plan; r: Reg): bool {.inline.} = r in plan.sealed

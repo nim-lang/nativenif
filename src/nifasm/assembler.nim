@@ -1884,8 +1884,22 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
           # index before the multiply; X16 keeps the index intact, so `scratch==idx` stays
           # correct (`scratch = idx*stride` reads idx, writes scratch). X16/X17 are never
           # allocated by arkham, so this can't collide with base/index/scratch.
-          arm64.emitMovImm64(ctx.buf.data, arm64.X16, uint64(stride))
-          arm64.emitMul(ctx.buf.data, scratchReg, indexOp.reg, arm64.X16) # scratch = idx*stride
+          # A power-of-two stride — which every aggregate whose size the layout rounded
+          # up is — is a SHIFT, so it needs neither the constant nor the multiply:
+          # `lsl scratch, idx, #k` replaces `mov x16,#stride; mul scratch, idx, x16`.
+          # This is the 3-operand `(at …)` used for a non-scale element size, i.e. an
+          # ADDRESS computation inside a loop, so the pair was paying twice over.
+          if stride > 0 and (stride and (stride - 1)) == 0:
+            var k = 0'u8
+            var t = stride
+            while t > 1: (t = t shr 1; inc k)
+            if k == 0:
+              arm64.emitMov(ctx.buf.data, scratchReg, indexOp.reg)      # stride 1
+            else:
+              arm64.emitLslImm(ctx.buf.data, scratchReg, indexOp.reg, k)
+          else:
+            arm64.emitMovImm64(ctx.buf.data, arm64.X16, uint64(stride))
+            arm64.emitMul(ctx.buf.data, scratchReg, indexOp.reg, arm64.X16) # scratch = idx*stride
           # scratch = base + that. A SP base (a stack array) needs the EXTENDED-register
           # ADD — the shifted-register `emitAdd` would read register 31 as XZR, not SP,
           # zeroing the base (→ a wild address). Other bases use the plain register ADD.
@@ -3159,7 +3173,15 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseCompatible(dest.typ, op.typ, "and", start)
     if dest.kind == okMem: error("AND to memory not supported yet", n)
     else:
-      if op.kind == okImm: error("AND immediate not supported yet", n)
+      if op.kind == okImm:
+        # AArch64 takes the mask directly when it is a "bitmask immediate" — which
+        # every bitfield mask is. Otherwise it has to reach a register; X17 is the
+        # assembler's own scratch (never allocated by arkham), same as `add3` above.
+        if arm64.isLogicalImm(cast[uint64](op.immVal)):
+          arm64.emitAndImm(ctx.buf.data, dest.reg, dest.reg, cast[uint64](op.immVal))
+        else:
+          arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](op.immVal))
+          arm64.emitAnd(ctx.buf.data, dest.reg, dest.reg, arm64.X17)
       elif op.kind == okMem: error("AND from memory not supported yet", n)
       else:
         arm64.emitAnd(ctx.buf.data, dest.reg, dest.reg, op.reg)
@@ -3173,7 +3195,15 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseCompatible(dest.typ, op.typ, "orr", start)
     if dest.kind == okMem: error("ORR to memory not supported yet", n)
     else:
-      if op.kind == okImm: error("ORR immediate not supported yet", n)
+      if op.kind == okImm:
+        # AArch64 takes the mask directly when it is a "bitmask immediate" — which
+        # every bitfield mask is. Otherwise it has to reach a register; X17 is the
+        # assembler's own scratch (never allocated by arkham), same as `add3` above.
+        if arm64.isLogicalImm(cast[uint64](op.immVal)):
+          arm64.emitOrrImm(ctx.buf.data, dest.reg, dest.reg, cast[uint64](op.immVal))
+        else:
+          arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](op.immVal))
+          arm64.emitOrr(ctx.buf.data, dest.reg, dest.reg, arm64.X17)
       elif op.kind == okMem: error("ORR from memory not supported yet", n)
       else:
         arm64.emitOrr(ctx.buf.data, dest.reg, dest.reg, op.reg)
@@ -3187,7 +3217,15 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     checkBitwiseCompatible(dest.typ, op.typ, "eor", start)
     if dest.kind == okMem: error("EOR to memory not supported yet", n)
     else:
-      if op.kind == okImm: error("EOR immediate not supported yet", n)
+      if op.kind == okImm:
+        # AArch64 takes the mask directly when it is a "bitmask immediate" — which
+        # every bitfield mask is. Otherwise it has to reach a register; X17 is the
+        # assembler's own scratch (never allocated by arkham), same as `add3` above.
+        if arm64.isLogicalImm(cast[uint64](op.immVal)):
+          arm64.emitEorImm(ctx.buf.data, dest.reg, dest.reg, cast[uint64](op.immVal))
+        else:
+          arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](op.immVal))
+          arm64.emitEor(ctx.buf.data, dest.reg, dest.reg, arm64.X17)
       elif op.kind == okMem: error("EOR from memory not supported yet", n)
       else:
         arm64.emitEor(ctx.buf.data, dest.reg, dest.reg, op.reg)
@@ -3275,24 +3313,42 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "and3")
     checkBitwiseType(dstT, "and", start)
     checkBitwiseType(rm.typ, "and", start)
-    if rm.kind != okReg: error("and3 second source must be a register", n)
-    arm64.emitAnd(ctx.buf.data, rd, rn, rm.reg)
+    if rm.kind == okImm:
+      if arm64.isLogicalImm(cast[uint64](rm.immVal)):
+        arm64.emitAndImm(ctx.buf.data, rd, rn, cast[uint64](rm.immVal))
+      else:
+        arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](rm.immVal))
+        arm64.emitAnd(ctx.buf.data, rd, rn, arm64.X17)
+    elif rm.kind != okReg: error("and3 second source must be a register or immediate", n)
+    else: arm64.emitAnd(ctx.buf.data, rd, rn, rm.reg)
 
   of Orr3A64:
     inc n
     let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "orr3")
     checkBitwiseType(dstT, "orr", start)
     checkBitwiseType(rm.typ, "orr", start)
-    if rm.kind != okReg: error("orr3 second source must be a register", n)
-    arm64.emitOrr(ctx.buf.data, rd, rn, rm.reg)
+    if rm.kind == okImm:
+      if arm64.isLogicalImm(cast[uint64](rm.immVal)):
+        arm64.emitOrrImm(ctx.buf.data, rd, rn, cast[uint64](rm.immVal))
+      else:
+        arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](rm.immVal))
+        arm64.emitOrr(ctx.buf.data, rd, rn, arm64.X17)
+    elif rm.kind != okReg: error("orr3 second source must be a register or immediate", n)
+    else: arm64.emitOrr(ctx.buf.data, rd, rn, rm.reg)
 
   of Eor3A64:
     inc n
     let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "eor3")
     checkBitwiseType(dstT, "eor", start)
     checkBitwiseType(rm.typ, "eor", start)
-    if rm.kind != okReg: error("eor3 second source must be a register", n)
-    arm64.emitEor(ctx.buf.data, rd, rn, rm.reg)
+    if rm.kind == okImm:
+      if arm64.isLogicalImm(cast[uint64](rm.immVal)):
+        arm64.emitEorImm(ctx.buf.data, rd, rn, cast[uint64](rm.immVal))
+      else:
+        arm64.emitMovImm64(ctx.buf.data, arm64.X17, cast[uint64](rm.immVal))
+        arm64.emitEor(ctx.buf.data, rd, rn, arm64.X17)
+    elif rm.kind != okReg: error("eor3 second source must be a register or immediate", n)
+    else: arm64.emitEor(ctx.buf.data, rd, rn, rm.reg)
 
   of Lsl3A64:
     inc n
@@ -3935,6 +3991,8 @@ proc scanStackArgArea(n: var Cursor; ctx: var GenContext; scope: Scope; acc: var
   else:
     inc n
 
+proc shiftCodePositions(ctx: var GenContext; at, by: int)   # defined below
+
 proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   let oldScope = ctx.scope
   ctx.scope = newScope(oldScope)
@@ -4053,6 +4111,7 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   let peakStackSize = max(ctx.slots.stackSize, ctx.slots.maxStackSize)
   let alignedStackSize = (peakStackSize + 15) and not 15
   let isA64 = ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64}
+  var deadFrameAdjusts: seq[int] = @[]   ## frame `add`/`sub` halves that patch to #0
   for (pos, pad) in ctx.ssizePatches:
     # `pad` is the caller-supplied alignment correction from `(ssize N)`: the frame
     # `sub`/`add` folds the 16-alignment pad into the SAME instruction instead of
@@ -4079,6 +4138,15 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
         let half = if (instr and arm64.ShBit12) != 0: (v shr 12) and 0xFFF'u32
                    else: v and 0xFFF'u32
         instr = (instr and not (0xFFF'u32 shl 10)) or (half shl 10)
+        # Either half of the pair can patch to ZERO, and then that whole instruction
+        # does nothing: the HIGH one for every frame of 4095 bytes or less (the
+        # common case — `sub sp, sp, #0, lsl #12`), the LOW one for a frame that is
+        # an exact multiple of 4096 (`sub sp, sp, #0`, which disassembles as
+        # `mov sp, sp`). It sits in every prologue AND every epilogue, so twice per
+        # call, which is where it is least affordable. The frame size is only known
+        # HERE, so it cannot be skipped at emit time — but it can be pruned now.
+        if half == 0'u32 and not inFixedRange(ctx.buf, pos):
+          deadFrameAdjusts.add pos
       ctx.buf.data[pos]   = byte(instr and 0xFF)
       ctx.buf.data[pos+1] = byte((instr shr 8) and 0xFF)
       ctx.buf.data[pos+2] = byte((instr shr 16) and 0xFF)
@@ -4088,6 +4156,14 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
       ctx.buf.data[pos+1] = byte((v shr 8) and 0xFF)
       ctx.buf.data[pos+2] = byte((v shr 16) and 0xFF)
       ctx.buf.data[pos+3] = byte((v shr 24) and 0xFF)
+
+  # Drop them HIGHEST position first: a removal only rebases positions after
+  # itself, so the lower ones stay valid as we go.
+  if deadFrameAdjusts.len > 0:
+    deadFrameAdjusts.sort(Descending)
+    for pos in deadFrameAdjusts:
+      ctx.buf.data.removeRange(pos, 4)
+      shiftCodePositions(ctx, pos + 4, -4)
 
   ctx.scope = oldScope
 
@@ -5520,6 +5596,17 @@ proc shiftCodePositions(ctx: var GenContext; at, by: int) =
     if ctx.csizePatches[k][0] >= at: ctx.csizePatches[k] = (ctx.csizePatches[k][0] + by, ctx.csizePatches[k][1])
   for k in 0 ..< ctx.tlvSites.len:
     if ctx.tlvSites[k][0] >= at: ctx.tlvSites[k] = (ctx.tlvSites[k][0] + by, ctx.tlvSites[k][1])
+  # An EXTERNAL call's `bl` is not a reloc — its position is recorded per extproc and
+  # patched at image layout — so it needs rebasing here too. Missing it left the `bl`
+  # unpatched (a branch to itself) and wrote the IAT displacement over whatever had
+  # moved into the stale slot, which for a pruned frame `add` was the epilogue's
+  # `add sp, sp, #frame`.
+  for e in 0 ..< ctx.extProcs.len:
+    for k in 0 ..< ctx.extProcs[e].callSites.len:
+      if ctx.extProcs[e].callSites[k] >= at: ctx.extProcs[e].callSites[k] += by
+  for k in 0 ..< ctx.listRows.len:      # `--listing` byte ranges
+    if ctx.listRows[k].start >= at: ctx.listRows[k].start += by
+    if ctx.listRows[k].stop >= at: ctx.listRows[k].stop += by
 
 proc genCasejmpX64(n: var Cursor; ctx: var GenContext) =
   ## `(casejmp S T (stmts …)+)` — computed-goto case dispatch (issue #32). The

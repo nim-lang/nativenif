@@ -16,7 +16,7 @@
 import std / [tables, sets, assertions, algorithm, strutils, os]
 import symparser
 import nifcore, nifcdecl
-import slots, machinedesc, analyser, register_allocator, programs
+import slots, machinedesc, analyser, planer, programs
 import asmbuf
 import typenav
 export typenav   # SymCat / SymInfo / getType / exprSlot moved here; re-export so
@@ -77,7 +77,7 @@ type
 
   CodeGen* = object
     ab*: AsmBuf
-    ra*: RegAlloc
+    plan*: Plan
     buf*: ptr TokenBuf
     md*: MachineDesc                         ## target register file + ABI
     prog*: Program                           ## the whole program (cross-module type env)
@@ -175,7 +175,7 @@ type
                                              ## param binds its arg reg to the signature alias
                                              ## `pN.0`, which is NOT a `symPos` key; this lets
                                              ## `recordEviction` recover the decl name from the
-                                             ## point-in-time binding with no `ra.locs`
+                                             ## point-in-time binding with no `plan.locs`
                                              ## reverse scan. Populated at the param prologue.
     tmpBindTyp*: Table[Reg, AsmSlot]         ## the `AsmSlot` each `bindTemp` bound a register
                                              ## with. `RegBind` keeps only the name and the
@@ -507,6 +507,68 @@ proc getType*(g: var CodeGen; c: Cursor): Cursor {.inline.} =
 proc exprSlot*(g: var CodeGen; c: Cursor): AsmSlot {.inline.} =
   g.typeCtx.exprSlot(c)
 
+let ScalarSlot* = AsmSlot(cls: AInt, size: 8, align: 8)
+  ## THE dont-care scalar slot: one full integer register, carrying no Leng type
+  ## cursor. Not a missing type — it is arkham's canonical register form for an
+  ## integer, whose width lives in explicit extends rather than in the register.
+  ## See `valueSlot` for when a value may take it and when it may not. No consumer of
+  ## an `InReg`/`Imm` value reads `.typ`, so it is also the register/immediate
+  ## dont-care result. A `let` (not `const`) because `AsmSlot` holds a `Cursor`.
+  ## (Both backends used to define this separately.)
+
+proc slotIsPointer*(g: var CodeGen; s: AsmSlot): bool =
+  ## Does `s` describe a POINTER-KIND value — a real `(ptr T)`/`(aptr T)`/`(proctype …)`,
+  ## or the `(nil)` literal? The one place that answers this, so the emitters stop
+  ## spelling `not cursorIsNil(s.typ) and isPtrType(resolveType(…))` out by hand.
+  ##
+  ## A dont-care `ScalarSlot` carries no cursor and is NOT one: that is the deliberate
+  ## "canonical 64-bit integer register" marker, not a missing type — see `valueSlot`.
+  if isNilSlot(s): return true
+  if cursorIsNil(s.typ): return false
+  isPtrType(resolveType(g.prog, s.typ))
+
+proc valueSlot*(g: var CodeGen; c: Cursor): AsmSlot =
+  ## THE slot to bind a register temp that is about to hold the VALUE of `c`.
+  ##
+  ## Two different things get called "the type" of a register here, and only one of
+  ## them may be dropped:
+  ##
+  ## * An integer's WIDTH is not carried by its register. arkham keeps every integer
+  ##   full-register-width and expresses narrowness with explicit extends, so an
+  ##   integer value temp is canonically `ScalarSlot`. Binding it at the value's own
+  ##   narrow width makes the very move that brings a 64-bit value in a NARROWING
+  ##   move, which nifasm rejects — see `emitCast2`'s canonical-width rule, which
+  ##   exists for exactly that reason.
+  ## * A pointer's POINTER-NESS is not a width, and it must survive. Losing it is what
+  ##   turns `cmp tmp, (nil)` and `mov (mem &ptrGlobal), tmp` into type errors, and it
+  ##   is what nifasm's strictness is there to catch.
+  ##
+  ## So: pointer/`nil` values keep their real type, integers keep the canonical
+  ## register width. `c` having no type node at all is not a failure — a Leng literal
+  ## is typed by where it GOES, and `ScalarSlot` is the right answer for it.
+  let s = g.exprSlot(c)
+  if g.slotIsPointer(s): s else: ScalarSlot
+
+proc globalDeclType*(g: var CodeGen; name: string): Cursor =
+  ## The DECLARED type of a module-level `gvar` / `tvar` / `const` — the third child
+  ## of its `SymInfo.decl`, which every global has.
+  ##
+  ## This is where a global's type LIVES, so a `Glob`/`Tvar` `Location` never has to
+  ## fall back on a guess when its own `AsmSlot` was built from a dont-care
+  ## `ScalarSlot` and carries no cursor. The emitters used to branch on
+  ## `cursorIsNil(loc.typ.typ)` and emit an untyped `(mem reg)` on the nil side —
+  ## which nifasm reads as a bare `(i 64)` access, exactly the imprecision that made
+  ## `exc = nil` (a `ptr Exception` threadvar) a type error.
+  let si = g.lookupSym(name)
+  assert si.cat in {scGlobal, scTvar},
+         "arkham: globalDeclType of a non-global symbol: " & name
+  var d = si.decl
+  result = si.decl                              # overwritten below (always present)
+  d.into:
+    inc d; skip d                               # name, pragmas → the declared type
+    result = d
+    while d.hasMore: skip d
+
 proc declType*(g: var CodeGen; typeCur, valueCur: Cursor): Cursor =
   ## The type a local should be DECLARED with. Shoggoth's SROA / cse /
   ## induction-variable passes synthesize `(var :t . . <value>)` with the type
@@ -551,7 +613,7 @@ proc srcWidthSigned*(g: var CodeGen; c: Cursor): tuple[width: int, signed: bool]
   case c.kind
   of Symbol:
     let nm = symName(c)
-    let loc = g.ra.locationOfSym(nm, cursorToPosition(g.buf[], c))
+    let loc = g.plan.locationOfSym(nm, cursorToPosition(g.buf[], c))
     if loc.kind != NoLoc:
       return slotWidthSigned(loc.typ)        # a local/param: the allocator knows it
     let si = g.lookupSym(nm)                   # a global / thread-local: read its decl type
@@ -613,7 +675,7 @@ proc asLoc*(g: var CodeGen; c: var Cursor): Location =
       # A proc as a value is its address, not an lvalue; `genVal` emits the `lea`.
       raiseAssert "arkham: proc used as an lvalue: " & nm
     of scNone:
-      let loc = g.ra.homeOfSym(nm)
+      let loc = g.plan.homeOfSym(nm)
       case loc.kind
       of InReg: result = regLoc(loc.r, slot)
       of InRegPair: result = loc
@@ -945,7 +1007,7 @@ proc operandInReg*(g: var CodeGen; operand: Cursor; dest: Reg): bool =
   ## expression is materialized into a fresh scratch (never a live local's home).
   result = false
   if operand.kind == Symbol:
-    let loc = g.ra.locationOfSym(symName(operand), cursorToPosition(g.buf[], operand))
+    let loc = g.plan.locationOfSym(symName(operand), cursorToPosition(g.buf[], operand))
     result = loc.kind == InReg and loc.r == dest
 
 # ── select-diamond recognition (shared by a64 `csel` & x64 `cmov`) ────────────
@@ -974,7 +1036,7 @@ proc simpleSelectValue(g: var CodeGen; rhs: Cursor): bool =
     else: inc v                                        # descend to the wrapped value
   case v.kind
   of IntLit, UIntLit, CharLit: true
-  of Symbol: g.ra.locationOfSym(symName(v), cursorToPosition(g.buf[], v)).kind in {InReg, NamedStack}
+  of Symbol: g.plan.locationOfSym(symName(v), cursorToPosition(g.buf[], v)).kind in {InReg, NamedStack}
   else: false
 
 proc selectAsgnDstRhs(asgn: Cursor; dstName: var string; rhs: var Cursor): bool =
@@ -1053,7 +1115,7 @@ proc matchSelectDiamond*(g: var CodeGen; c: Cursor; sd: var SelectDiamond): bool
   if not selectAsgnDstRhs(thenBody, thenDst, thenRhs): return false
   if not selectAsgnDstRhs(elseBody, elseDst, elseRhs): return false
   if thenDst != elseDst: return false
-  let dst = g.ra.homeOfSym(thenDst)
+  let dst = g.plan.homeOfSym(thenDst)
   if dst.kind != InReg: return false
   if not g.simpleSelectValue(thenRhs) or not g.simpleSelectValue(elseRhs): return false
   sd = SelectDiamond(ek: condC.exprKind, a: aC, b: bC, dst: dst,
@@ -1063,16 +1125,14 @@ proc matchSelectDiamond*(g: var CodeGen; c: Cursor; sd: var SelectDiamond): bool
 
 proc selectStagingSlot*(g: var CodeGen; sd: SelectDiamond): AsmSlot =
   ## The slot for the register that stages the THEN value. It receives a COPY of DST,
-  ## so it must be bound with DST's *asm* type — and a register-homed scalar local is
-  ## declared `(i 64)` whatever its logical width (see `emRegLocalVar`, same rule in
-  ## both backends). DST's own precise slot is the wrong answer: an `enum` DST would
-  ## bind the staging register `(u 8)` and nifasm then rejects the `mov` that copies
-  ## the `(i 64)`-declared DST into it. A POINTER DST keeps its real type, which is
-  ## exactly what its declaration keeps too.
-  if not cursorIsNil(sd.dst.typ.typ) and isPtrType(resolveType(g.prog, sd.dst.typ.typ)):
-    sd.dst.typ
-  else:
-    AsmSlot(cls: AInt, size: 8, align: 8)
+  ## so it must be bound with DST's *asm* type — which is simply DST's own slot: both
+  ## backends' `emRegLocalVar` declares a register-homed local with its OWN type
+  ## (`(u 8)` stays `(u 8)`). This used to answer a flat `(i 64)` for every
+  ## non-pointer, matching the older declaration rule; once that rule changed, an
+  ## `enum`/`uint8` DST declared `(u 8)` made the `csel DST, staging, DST` against an
+  ## `(i 64)` staging register a type error (`posixToErrorCode`, whose `ErrorCode`
+  ## result the select-diamond lowering reaches).
+  sd.dst.typ
 
 # ── emit-time temp allocation (step-3 merged value core) ─────────────────────
 # The merged emitter DECIDES expression registers at the point of emission
@@ -1087,13 +1147,13 @@ proc regHoldsHome*(g: var CodeGen; r: Reg): bool =
   ## A named local/param is homed in `r` (a pre-pass decision, immutable for the
   ## whole proc — steals/demotes resolve before emission starts). Served from the
   ## cached mask: a full `symPos` scan per query made emission quadratic in proc size.
-  if g.ra.homesDirty: rebuildHomes(g.ra)
-  r in g.ra.homeRegs
+  if g.plan.homesDirty: rebuildHomes(g.plan)
+  r in g.plan.homeRegs
 
 proc fregHoldsHome*(g: var CodeGen; f: FReg): bool =
   ## The SIMD twin of `regHoldsHome`.
-  if g.ra.homesDirty: rebuildHomes(g.ra)
-  f in g.ra.homeFRegs
+  if g.plan.homesDirty: rebuildHomes(g.plan)
+  f in g.plan.homeFRegs
 
 when not defined(arkhamNoNarrowHomes):
   let nhRegs = getEnv("ARKHAM_NH_REGS", "*")
@@ -1141,7 +1201,7 @@ proc regFreeForTemp*(g: var CodeGen; r: Reg): bool =
   ## register the narrow filter admits that the union would refuse, and `ARKHAM_NH` /
   ## `ARKHAM_NH_REGS` narrow it to named procs / registers, which is how each of the
   ## four shapes above was bisected out of a whole-program segfault.
-  result = r notin g.pickedRegs and not g.ra.isSealed(r) and not g.rb.isAccum(r) and
+  result = r notin g.pickedRegs and not g.plan.isSealed(r) and not g.rb.isAccum(r) and
     not g.rb.isBound(r) and
     (if g.narrowHomes: r notin g.rawHomeRegs and nhRegAllowed(r, g.regHoldsHome(r))
      else: not g.regHoldsHome(r))
@@ -1152,8 +1212,8 @@ proc regFreeForTemp*(g: var CodeGen; r: Reg): bool =
     # shapes were enumerated (a `(ptr object)` param read raw is the classic one).
     if result and g.narrowHomes and g.regHoldsHome(r):
       var who = ""
-      for name, pos in g.ra.symPos:
-        let l = g.ra.locs[pos]
+      for name, pos in g.plan.symPos:
+        let l = g.plan.planned(pos)
         if l.kind == InReg and l.r == r:
           who.add (if who.len > 0: "," else: "") & name & ":" & $l.typ.kind &
                   (if l.typ.size > 0: "/" & $l.typ.size else: "")
@@ -1183,9 +1243,9 @@ template forEachVolatileTempCand(g: var CodeGen; r, body: untyped) =
   block:
     for r in g.md.intTempRegs: body            # r10
     for r in g.md.intLocalTempRegs: body       # rdi, rsi, r8, r9 — no fixed role
-    if g.md.divRemReg != NoReg and not g.ra.divRegClobbered:
+    if g.md.divRemReg != NoReg and not g.plan.divRegClobbered:
       let r = g.md.divRemReg; body
-    if g.md.shiftCountReg != NoReg and not g.ra.shiftRegClobbered:
+    if g.md.shiftCountReg != NoReg and not g.plan.shiftRegClobbered:
       let r = g.md.shiftCountReg; body
     # R11, the staging bridge, is NOT here — TRIED AND REVERTED. Adding it last (only
     # where the alternative is a callee-saved push and pop) looks free, because
@@ -1206,7 +1266,7 @@ proc tempCensus*(g: var CodeGen): string =
   forEachVolatileTempCand(g, r):
     result.add "\n    " & $r & ": "
     if r in g.pickedRegs: result.add "picked (reserve->bind gap)"
-    elif g.ra.isSealed(r): result.add "sealed (in-flight call)"
+    elif g.plan.isSealed(r): result.add "sealed (in-flight call)"
     elif g.rb.isAccum(r): result.add "liveAccum"
     elif g.rb.isBound(r): result.add "bound " & g.rb.boundName(r)
     elif g.regHoldsHome(r): result.add "HOME UNION (per-proc, not liveness)"
@@ -1214,7 +1274,7 @@ proc tempCensus*(g: var CodeGen): string =
   for r in g.md.intCalleeSaved:
     result.add "\n    " & $r & ": "
     if r in g.pickedRegs: result.add "picked (reserve->bind gap)"
-    elif g.ra.isSealed(r): result.add "sealed (in-flight call)"
+    elif g.plan.isSealed(r): result.add "sealed (in-flight call)"
     elif g.rb.isAccum(r): result.add "liveAccum"
     elif g.rb.isBound(r): result.add "bound " & g.rb.boundName(r)
     elif g.regHoldsHome(r): result.add "HOME UNION (per-proc, not liveness)"
@@ -1239,7 +1299,7 @@ when defined(arkhamTempDbg):
 
 proc pickTempReg*(g: var CodeGen): Reg =
   ## An expression-temp GPR: the volatile temp pool first, then a callee-saved
-  ## register (recorded in `ra.usedCallee` so the prologue saves it — the frame
+  ## register (recorded in `plan.usedCallee` so the prologue saves it — the frame
   ## is finalized AFTER body emission in the merged core). `NoReg` when every
   ## candidate is live; the caller then mints a spill slot (`mintSpillName` +
   ## the backend's produce-into path), keeping temp allocation total exactly
@@ -1254,13 +1314,13 @@ proc pickTempReg*(g: var CodeGen): Reg =
     inc tempFallbacks
     forEachVolatileTempCand(g, r):
       if r in g.pickedRegs: inc tempRefusals[0]
-      elif g.ra.isSealed(r): inc tempRefusals[1]
+      elif g.plan.isSealed(r): inc tempRefusals[1]
       elif g.rb.isAccum(r): inc tempRefusals[2]
       elif g.rb.isBound(r): inc tempRefusals[3]
       elif g.regHoldsHome(r): inc tempRefusals[4]
   for r in g.md.intCalleeSaved:
     if regFreeForTemp(g, r):
-      g.ra.usedCallee.incl r
+      g.plan.usedCallee.incl r
       return r
   NoReg
 
@@ -1282,7 +1342,7 @@ proc pickFTempReg*(g: var CodeGen): FReg =
     if f notin g.pickedFRegs and not g.rb.isSealedF(f) and
        g.rb.boundFName(f).len == 0 and
        not g.rb.isBoundFTmp(f) and not g.fregHoldsHome(f):
-      if f in g.md.floatCalleeSavedSet: g.ra.usedCalleeF.incl f
+      if f in g.md.floatCalleeSavedSet: g.plan.usedCalleeF.incl f
       return f
   NoFReg
 
@@ -1294,7 +1354,7 @@ proc pickHeldReg*(g: var CodeGen): Reg =
   ## emitted), and the corpus needed that demotion exactly once.
   for r in g.md.intCalleeSaved:
     if regFreeForTemp(g, r):
-      g.ra.usedCallee.incl r
+      g.plan.usedCallee.incl r
       return r
   NoReg
 
@@ -1302,11 +1362,11 @@ proc mintSpillName*(g: var CodeGen; prefix: string): string =
   ## A fresh emit-time spill-slot name (`etmp`/`eftmp`/`held` + counter). The
   ## backend declares the `(var :name (s) T)` inline at first use — mid-body
   ## slot decls are legal nifasm (the aggtmp constructor temps already rely on
-  ## that) — and flags `ra.hasStackVars` so the frame `sub` is emitted when the
+  ## that) — and flags `plan.hasStackVars` so the frame `sub` is emitted when the
   ## prologue is finalized.
   result = synth(prefix) & $g.emitTmpSpills & ".0"
   inc g.emitTmpSpills
-  g.ra.hasStackVars = true
+  g.plan.hasStackVars = true
 
 # ── fused value core: syntactic operand predicates (shared by both backends) ─
 # Ports of the allocator's private Builder predicates; these become the only
@@ -1329,19 +1389,19 @@ proc isFoldableLeafE*(g: var CodeGen; n: Cursor): bool =
   ## or a function-local symbol read (folds as its reg / stack-home operand).
   case n.kind
   of IntLit, UIntLit, CharLit: true
-  of Symbol: g.ra.locationOfSym(symName(n), cursorToPosition(g.buf[], n)).kind in {InReg, NamedStack}
+  of Symbol: g.plan.locationOfSym(symName(n), cursorToPosition(g.buf[], n)).kind in {InReg, NamedStack}
   else: false
 
 proc symInRegE*(g: var CodeGen; n: Cursor; reg: Reg): bool {.inline.} =
   ## Is `n` a symbol homed in `reg`? (Forbids a Sethi–Ullman swap whose
   ## rhs-into-dest evaluation would clobber a lhs homed in dest.)
   if n.kind != Symbol: return false
-  let h = g.ra.locationOfSym(symName(n), cursorToPosition(g.buf[], n))
+  let h = g.plan.locationOfSym(symName(n), cursorToPosition(g.buf[], n))
   h.kind == InReg and h.r == reg
 
 proc exprReadsRegImplE(g: var CodeGen; n: var Cursor; reg: Reg): bool =
   if n.kind == Symbol:
-    let h = g.ra.locationOfSym(symName(n), cursorToPosition(g.buf[], n))
+    let h = g.plan.locationOfSym(symName(n), cursorToPosition(g.buf[], n))
     inc n
     return h.kind == InReg and h.r == reg
   elif n.kind == TagLit:
@@ -1366,7 +1426,7 @@ proc lvalueGlobalBaseE*(g: var CodeGen; n: Cursor): bool =
   ## private `lvalueGlobalBase`.)
   var c = n
   case c.kind
-  of Symbol: result = g.ra.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind == NoLoc
+  of Symbol: result = g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind == NoLoc
   of TagLit:
     case c.exprKind
     of DotC, AtC:
@@ -1423,7 +1483,7 @@ proc subtreeHasCallE*(n: Cursor): bool =
       if subtreeHasCallE(cc): return true
       skip cc
   return false
-# ── caller-save rescue (see `RegAlloc.callerSaveHomes`) ─────────────────────
+# ── caller-save rescue (see `Plan.callerSaveHomes`) ─────────────────────
 
 proc callerSaveSetAt*(g: var CodeGen): seq[tuple[reg: Reg, name: string]] =
   ## The caller-saved locals currently BOUND to a register — the ones this call is
@@ -1432,9 +1492,9 @@ proc callerSaveSetAt*(g: var CodeGen): seq[tuple[reg: Reg, name: string]] =
   ## predecessor branch, which an interval test under-approximates. The allocator only
   ## hands out a caller-saved home to a value that is valid wherever it is bound, so
   ## "save whenever bound" is always well-defined. Sorted for deterministic output.
-  if g.ra.callerSaveHomes.len == 0: return
+  if g.plan.callerSaveHomes.len == 0: return
   for reg, name in g.rb.gprBindings:
-    if g.ra.callerSaveHomes.hasKey(name):
+    if g.plan.callerSaveHomes.hasKey(name):
       result.add (reg: reg, name: name)
   result.sort(proc (a, b: tuple[reg: Reg, name: string]): int = cmp(ord(a.reg), ord(b.reg)))
 
@@ -1463,7 +1523,7 @@ proc pairFieldReg*(g: var CodeGen; c: Cursor): Reg =
   cc.into:
     if cc.kind != Symbol: return
     let base = symName(cc)
-    let home = g.ra.homeOfSym(base)
+    let home = g.plan.homeOfSym(base)
     if home.kind != InRegPair: return
     skip cc
     if cc.kind != Symbol: return

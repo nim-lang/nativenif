@@ -6,7 +6,7 @@
 #
 
 ## The single source of truth for "what is the type/slot of this value?", shared
-## by BOTH the register allocator (`register_allocator`) and the emitters
+## by BOTH the register allocator (`planer`) and the emitters
 ## (`codegen_x64` / `codegen_a64` via `codegen_common`). It used to live on
 ## `CodeGen` — i.e. inside the emitter — so the allocator could not reach it and
 ## grew a degraded shadow (`isFloatVal`, hand-rolled form-ladders). Lifting it

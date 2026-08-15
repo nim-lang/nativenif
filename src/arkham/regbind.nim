@@ -55,7 +55,7 @@ type
                                       ## staging pick must avoid these
     sealedF: set[FReg]                ## SIMD arg regs pinned to an in-flight value (a
                                       ## float arg being marshalled, a held staging reg);
-                                      ## the float analogue of `liveAccums`/`ra.sealed`
+                                      ## the float analogue of `liveAccums`/`plan.sealed`
 
 # ── queries ─────────────────────────────────────────────────────────────────
 

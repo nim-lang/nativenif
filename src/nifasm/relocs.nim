@@ -336,7 +336,7 @@ proc updateRelocDisplacements*(buf: var Buffer) =
       buf.data[currentPos + 2] = byte((instr shr 16) and 0xFF)
       buf.data[currentPos + 3] = byte((instr shr 24) and 0xFF)
 
-proc inFixedRange(buf: Buffer; pos: int): bool {.inline.} =
+proc inFixedRange*(buf: Buffer; pos: int): bool {.inline.} =
   ## Whether byte position `pos` lies inside a layout-frozen `casejmp` region
   ## (see `fixedRanges`). Instructions there keep their exact size and position
   ## relative to the region start; the optimizers only patch their displacements.

@@ -102,6 +102,20 @@ const arkhamA64Unsupported: seq[string] = @[
   # mode's premise ("no fallbacks", doc/intrinsics.md §8), not a gap: an AArch64
   # version is a different `when` branch the user writes, with `x0`/`x9` in it.
   "assembler_x64",
+  # Six by-ref array params exhaust x86-64's FIVE callee-saved registers, so the
+  # sixth pointer spills to a `StackPtr` slot — the shape this fixture exists to
+  # pin (`genAconstr2` must store through that pointer, not over the slot).
+  # AAPCS64 has TEN, so every pointer stays `InReg` and the same source reaches a
+  # DIFFERENT, still-open a64 gap: `genStore2` serves an aggregate destination only
+  # for `NamedStack`/`StackPtr`/`Glob`/`Tvar`, and an `InReg` by-ref pointer's home
+  # carries an 8-byte pointer slot (`effSlot`, planer) rather than
+  # `AMem` — so the location cannot say "this register addresses an aggregate" and
+  # the aconstr falls through to `emitValue2`'s scalar arm. Closing it means giving
+  # that home its pointee type, as `StackPtr` already does, NOT re-deriving the fact
+  # from `varType` at the use site (the "two answers to one question" shape the
+  # `spilledByRefPtr` predicate was retired for). The a64 `genAconstr2` StackPtr arm
+  # is in place and mirrors x86-64; it is what this gap currently keeps unreachable.
+  "aconstr_byref_spilled",
 ]
 
 const arkhamDarwinUnsupported: seq[string] =
