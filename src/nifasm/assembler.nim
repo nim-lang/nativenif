@@ -3974,6 +3974,8 @@ proc scanStackArgArea(n: var Cursor; ctx: var GenContext; scope: Scope; acc: var
   else:
     inc n
 
+proc shiftCodePositions(ctx: var GenContext; at, by: int)   # defined below
+
 proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   let oldScope = ctx.scope
   ctx.scope = newScope(oldScope)
@@ -4092,6 +4094,7 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
   let peakStackSize = max(ctx.slots.stackSize, ctx.slots.maxStackSize)
   let alignedStackSize = (peakStackSize + 15) and not 15
   let isA64 = ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64}
+  var deadFrameAdjusts: seq[int] = @[]   ## frame `add`/`sub` halves that patch to #0
   for (pos, pad) in ctx.ssizePatches:
     # `pad` is the caller-supplied alignment correction from `(ssize N)`: the frame
     # `sub`/`add` folds the 16-alignment pad into the SAME instruction instead of
@@ -4118,6 +4121,15 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
         let half = if (instr and arm64.ShBit12) != 0: (v shr 12) and 0xFFF'u32
                    else: v and 0xFFF'u32
         instr = (instr and not (0xFFF'u32 shl 10)) or (half shl 10)
+        # Either half of the pair can patch to ZERO, and then that whole instruction
+        # does nothing: the HIGH one for every frame of 4095 bytes or less (the
+        # common case — `sub sp, sp, #0, lsl #12`), the LOW one for a frame that is
+        # an exact multiple of 4096 (`sub sp, sp, #0`, which disassembles as
+        # `mov sp, sp`). It sits in every prologue AND every epilogue, so twice per
+        # call, which is where it is least affordable. The frame size is only known
+        # HERE, so it cannot be skipped at emit time — but it can be pruned now.
+        if half == 0'u32 and not inFixedRange(ctx.buf, pos):
+          deadFrameAdjusts.add pos
       ctx.buf.data[pos]   = byte(instr and 0xFF)
       ctx.buf.data[pos+1] = byte((instr shr 8) and 0xFF)
       ctx.buf.data[pos+2] = byte((instr shr 16) and 0xFF)
@@ -4127,6 +4139,14 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
       ctx.buf.data[pos+1] = byte((v shr 8) and 0xFF)
       ctx.buf.data[pos+2] = byte((v shr 16) and 0xFF)
       ctx.buf.data[pos+3] = byte((v shr 24) and 0xFF)
+
+  # Drop them HIGHEST position first: a removal only rebases positions after
+  # itself, so the lower ones stay valid as we go.
+  if deadFrameAdjusts.len > 0:
+    deadFrameAdjusts.sort(Descending)
+    for pos in deadFrameAdjusts:
+      ctx.buf.data.removeRange(pos, 4)
+      shiftCodePositions(ctx, pos + 4, -4)
 
   ctx.scope = oldScope
 
@@ -5559,6 +5579,17 @@ proc shiftCodePositions(ctx: var GenContext; at, by: int) =
     if ctx.csizePatches[k][0] >= at: ctx.csizePatches[k] = (ctx.csizePatches[k][0] + by, ctx.csizePatches[k][1])
   for k in 0 ..< ctx.tlvSites.len:
     if ctx.tlvSites[k][0] >= at: ctx.tlvSites[k] = (ctx.tlvSites[k][0] + by, ctx.tlvSites[k][1])
+  # An EXTERNAL call's `bl` is not a reloc — its position is recorded per extproc and
+  # patched at image layout — so it needs rebasing here too. Missing it left the `bl`
+  # unpatched (a branch to itself) and wrote the IAT displacement over whatever had
+  # moved into the stale slot, which for a pruned frame `add` was the epilogue's
+  # `add sp, sp, #frame`.
+  for e in 0 ..< ctx.extProcs.len:
+    for k in 0 ..< ctx.extProcs[e].callSites.len:
+      if ctx.extProcs[e].callSites[k] >= at: ctx.extProcs[e].callSites[k] += by
+  for k in 0 ..< ctx.listRows.len:      # `--listing` byte ranges
+    if ctx.listRows[k].start >= at: ctx.listRows[k].start += by
+    if ctx.listRows[k].stop >= at: ctx.listRows[k].stop += by
 
 proc genCasejmpX64(n: var Cursor; ctx: var GenContext) =
   ## `(casejmp S T (stmts …)+)` — computed-goto case dispatch (issue #32). The

@@ -50,6 +50,16 @@ proc insertRepeated*(buf: var Bytes; at: int; b: byte; count: int) =
   for i in 0 ..< count:
     buf.data[at + i] = b
 
+proc removeRange*(buf: var Bytes; at, count: int) =
+  ## Delete `count` bytes at position `at`, shifting later bytes down. The inverse
+  ## of `insertRepeated`; the caller must rebase every recorded byte position after
+  ## `at` itself (see `shiftCodePositions`).
+  if count <= 0: return
+  let oldLen = buf.data.len
+  for i in at + count ..< oldLen:
+    buf.data[i - count] = buf.data[i]
+  buf.data.setLen(oldLen - count)
+
 proc `[]=`*(buf: var Bytes; i: int; b: byte) {.inline.} =
   buf.data[i] = b
 
