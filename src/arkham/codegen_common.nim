@@ -507,6 +507,68 @@ proc getType*(g: var CodeGen; c: Cursor): Cursor {.inline.} =
 proc exprSlot*(g: var CodeGen; c: Cursor): AsmSlot {.inline.} =
   g.typeCtx.exprSlot(c)
 
+let ScalarSlot* = AsmSlot(cls: AInt, size: 8, align: 8)
+  ## THE dont-care scalar slot: one full integer register, carrying no Leng type
+  ## cursor. Not a missing type — it is arkham's canonical register form for an
+  ## integer, whose width lives in explicit extends rather than in the register.
+  ## See `valueSlot` for when a value may take it and when it may not. No consumer of
+  ## an `InReg`/`Imm` value reads `.typ`, so it is also the register/immediate
+  ## dont-care result. A `let` (not `const`) because `AsmSlot` holds a `Cursor`.
+  ## (Both backends used to define this separately.)
+
+proc slotIsPointer*(g: var CodeGen; s: AsmSlot): bool =
+  ## Does `s` describe a POINTER-KIND value — a real `(ptr T)`/`(aptr T)`/`(proctype …)`,
+  ## or the `(nil)` literal? The one place that answers this, so the emitters stop
+  ## spelling `not cursorIsNil(s.typ) and isPtrType(resolveType(…))` out by hand.
+  ##
+  ## A dont-care `ScalarSlot` carries no cursor and is NOT one: that is the deliberate
+  ## "canonical 64-bit integer register" marker, not a missing type — see `valueSlot`.
+  if isNilSlot(s): return true
+  if cursorIsNil(s.typ): return false
+  isPtrType(resolveType(g.prog, s.typ))
+
+proc valueSlot*(g: var CodeGen; c: Cursor): AsmSlot =
+  ## THE slot to bind a register temp that is about to hold the VALUE of `c`.
+  ##
+  ## Two different things get called "the type" of a register here, and only one of
+  ## them may be dropped:
+  ##
+  ## * An integer's WIDTH is not carried by its register. arkham keeps every integer
+  ##   full-register-width and expresses narrowness with explicit extends, so an
+  ##   integer value temp is canonically `ScalarSlot`. Binding it at the value's own
+  ##   narrow width makes the very move that brings a 64-bit value in a NARROWING
+  ##   move, which nifasm rejects — see `emitCast2`'s canonical-width rule, which
+  ##   exists for exactly that reason.
+  ## * A pointer's POINTER-NESS is not a width, and it must survive. Losing it is what
+  ##   turns `cmp tmp, (nil)` and `mov (mem &ptrGlobal), tmp` into type errors, and it
+  ##   is what nifasm's strictness is there to catch.
+  ##
+  ## So: pointer/`nil` values keep their real type, integers keep the canonical
+  ## register width. `c` having no type node at all is not a failure — a Leng literal
+  ## is typed by where it GOES, and `ScalarSlot` is the right answer for it.
+  let s = g.exprSlot(c)
+  if g.slotIsPointer(s): s else: ScalarSlot
+
+proc globalDeclType*(g: var CodeGen; name: string): Cursor =
+  ## The DECLARED type of a module-level `gvar` / `tvar` / `const` — the third child
+  ## of its `SymInfo.decl`, which every global has.
+  ##
+  ## This is where a global's type LIVES, so a `Glob`/`Tvar` `Location` never has to
+  ## fall back on a guess when its own `AsmSlot` was built from a dont-care
+  ## `ScalarSlot` and carries no cursor. The emitters used to branch on
+  ## `cursorIsNil(loc.typ.typ)` and emit an untyped `(mem reg)` on the nil side —
+  ## which nifasm reads as a bare `(i 64)` access, exactly the imprecision that made
+  ## `exc = nil` (a `ptr Exception` threadvar) a type error.
+  let si = g.lookupSym(name)
+  assert si.cat in {scGlobal, scTvar},
+         "arkham: globalDeclType of a non-global symbol: " & name
+  var d = si.decl
+  result = si.decl                              # overwritten below (always present)
+  d.into:
+    inc d; skip d                               # name, pragmas → the declared type
+    result = d
+    while d.hasMore: skip d
+
 proc declType*(g: var CodeGen; typeCur, valueCur: Cursor): Cursor =
   ## The type a local should be DECLARED with. Shoggoth's SROA / cse /
   ## induction-variable passes synthesize `(var :t . . <value>)` with the type
@@ -1063,16 +1125,14 @@ proc matchSelectDiamond*(g: var CodeGen; c: Cursor; sd: var SelectDiamond): bool
 
 proc selectStagingSlot*(g: var CodeGen; sd: SelectDiamond): AsmSlot =
   ## The slot for the register that stages the THEN value. It receives a COPY of DST,
-  ## so it must be bound with DST's *asm* type — and a register-homed scalar local is
-  ## declared `(i 64)` whatever its logical width (see `emRegLocalVar`, same rule in
-  ## both backends). DST's own precise slot is the wrong answer: an `enum` DST would
-  ## bind the staging register `(u 8)` and nifasm then rejects the `mov` that copies
-  ## the `(i 64)`-declared DST into it. A POINTER DST keeps its real type, which is
-  ## exactly what its declaration keeps too.
-  if not cursorIsNil(sd.dst.typ.typ) and isPtrType(resolveType(g.prog, sd.dst.typ.typ)):
-    sd.dst.typ
-  else:
-    AsmSlot(cls: AInt, size: 8, align: 8)
+  ## so it must be bound with DST's *asm* type — which is simply DST's own slot: both
+  ## backends' `emRegLocalVar` declares a register-homed local with its OWN type
+  ## (`(u 8)` stays `(u 8)`). This used to answer a flat `(i 64)` for every
+  ## non-pointer, matching the older declaration rule; once that rule changed, an
+  ## `enum`/`uint8` DST declared `(u 8)` made the `csel DST, staging, DST` against an
+  ## `(i 64)` staging register a type error (`posixToErrorCode`, whose `ErrorCode`
+  ## result the select-diamond lowering reaches).
+  sd.dst.typ
 
 # ── emit-time temp allocation (step-3 merged value core) ─────────────────────
 # The merged emitter DECIDES expression registers at the point of emission

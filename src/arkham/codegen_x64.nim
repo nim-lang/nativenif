@@ -34,12 +34,6 @@ const TlsBlockName = "arkham.tls.0"
 
 # ── scratch register pool ────────────────────────────────────────────────────
 
-let ScalarSlot = AsmSlot(cls: AInt, size: 8, align: 8)
-  ## The placeholder slot for a register/immediate dont-care result: the old `Val`
-  ## carried no type at all, and no consumer of an `InReg`/`Imm` value reads `.typ`.
-  ## As a scratch-binding type it carries no cursor, so `bindTemp` falls back to
-  ## `(i 64)`. A `let` (not `const`) because `AsmSlot` now holds a `Cursor`.
-
 proc bindTemp(g: var CodeGen; r: Reg; typ: AsmSlot)
 proc unbindTemp(g: var CodeGen; r: Reg)
 proc emWordThroughPtr(g: var CodeGen; p: Reg; idx: int)

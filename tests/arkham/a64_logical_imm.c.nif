@@ -1,0 +1,124 @@
+(.nif27)
+(.indexat 1)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :x.0 .
+    (u 64)9223372036854775807)
+   (var :y.0 .
+    (u 64)255)
+   (var :z.0 .
+    (u 64)0)
+   (var :rc.0 .
+    (i 32)0)
+   (var :t0.0 .
+    (u 64)
+    (bitand
+     (u 64)x.0 255))
+   (if
+    (elif
+     (eq t0.0 255)
+     (stmts
+      (asgn rc.0
+       (add
+        (i 32)rc.0 1)))))
+   (var :t1.0 .
+    (u 64)
+    (bitand
+     (u 64)x.0 15))
+   (if
+    (elif
+     (eq t1.0 15)
+     (stmts
+      (asgn rc.0
+       (add
+        (i 32)rc.0 1)))))
+   (var :t2.0 .
+    (u 64)
+    (bitand
+     (u 64)x.0 511))
+   (if
+    (elif
+     (eq t2.0 511)
+     (stmts
+      (asgn rc.0
+       (add
+        (i 32)rc.0 1)))))
+   (var :t3.0 .
+    (u 64)
+    (bitand
+     (u 64)x.0 16383))
+   (if
+    (elif
+     (eq t3.0 16383)
+     (stmts
+      (asgn rc.0
+       (add
+        (i 32)rc.0 1)))))
+   (var :t4.0 .
+    (u 64)
+    (bitand
+     (u 64)x.0 31))
+   (if
+    (elif
+     (eq t4.0 31)
+     (stmts
+      (asgn rc.0
+       (add
+        (i 32)rc.0 1)))))
+   (var :t5.0 .
+    (u 64)
+    (bitand
+     (u 64)x.0 (suf 6148914691236517205u "u64")))
+   (if
+    (elif
+     (eq t5.0 (suf 6148914691236517205u "u64"))
+     (stmts
+      (asgn rc.0
+       (add
+        (i 32)rc.0 1)))))
+   (var :t6.0 .
+    (u 64)
+    (bitand
+     (u 64)x.0 (suf 12297829382473034410u "u64")))
+   (if
+    (elif
+     (eq t6.0 (suf 3074457345618258602u "u64"))
+     (stmts
+      (asgn rc.0
+       (add
+        (i 32)rc.0 1)))))
+   (var :t7.0 .
+    (u 64)
+    (bitor
+     (u 64)z.0 255))
+   (if
+    (elif
+     (eq t7.0 255)
+     (stmts
+      (asgn rc.0
+       (add
+        (i 32)rc.0 1)))))
+   (var :t8.0 .
+    (u 64)
+    (bitxor
+     (u 64)y.0 15))
+   (if
+    (elif
+     (eq t8.0 240)
+     (stmts
+      (asgn rc.0
+       (add
+        (i 32)rc.0 1)))))
+   (call exit.0 rc.0))))(.index)
