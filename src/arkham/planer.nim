@@ -628,7 +628,16 @@ proc trySteal(b: var Builder; curName: string; curSlot: AsmSlot;
 # allocating locals; that is the whole "we optimistically gave a local a register, then
 # found we have too many, so we undo it" story, and it can never collide with a temp.
 
-let callerSaveOn = existsEnv("ARKHAM_CALLERSAVE")
+let callerSaveOn = not existsEnv("ARKHAM_NO_CALLERSAVE")
+  ## ON by default (2026-08-15). The historical blocker — a segfault in a natively
+  ## built nimsem — no longer reproduces: `hastur boot` (full native self-host,
+  ## stages converging byte-identical), the whole tester corpus + both stress runs,
+  ## `hastur native` and the nifbench checksum oracle are all green with the rescue
+  ## enabled. The likeliest killed-in-the-meantime culprit is the by-ref-aggregate
+  ## register-pointer store bug (a whole-aggregate `asgn` to a register-homed by-ref
+  ## param copied the POINTER, silently aliasing the params — see the AsgnS
+  ## reclassification in both emitters). `ARKHAM_NO_CALLERSAVE=1` is the off switch
+  ## for A/B measurement; the bisect knobs below still work.
 let csBisectMod = (if existsEnv("ARKHAM_CS_MOD"): parseInt(getEnv("ARKHAM_CS_MOD")) else: 0)
 let csBisectRem = (if existsEnv("ARKHAM_CS_REM"): parseInt(getEnv("ARKHAM_CS_REM")) else: 0)
 proc readCsProcList(): HashSet[string] =
@@ -650,10 +659,7 @@ let csIgnoreCost = existsEnv("ARKHAM_CS_ALL")
   ## the mechanism is what limits the payoff.
   ## Bisect knob: with `ARKHAM_CS_MOD=N ARKHAM_CS_REM=r` the rescue fires only in procs
   ## whose name hashes to `r mod N`, so a miscompile can be halved down to one proc.
-  ## OPT-IN, and off by default: the rescue is correct on the whole test corpus, the
-  ## stress runs and all 77 native tests, but still miscompiles nimsem (a segfault in
-  ## the produced compiler). Until that is found, `ARKHAM_CALLERSAVE=1` is how you run
-  ## it. See `callerSaveRescue` for what it does and why.
+  ## See `callerSaveRescue` for what the rescue does and why it is sound.
 
 proc initHasCallImpl(n: var Cursor): bool =
   ## Advances `n` past the subtree; true iff it contains a call anywhere.
@@ -727,28 +733,23 @@ proc callerSaveRescue(b: var Builder; name: string; slot: AsmSlot;
   let crossings = b.callsCrossedAfterInit(vi)
   if crossings == 0: return fallback
   if not csIgnoreCost and vi.weight <= 2 * crossings: return fallback
-  # The bridge FIRST, and only here. It is the emitter's staging register and stays
-  # out of every general pool: the stress corpus shows why — put it in
-  # `intLocalTempRegs` and `chain.0`, whose six parameters are all live, exhausts
-  # every `StagingCandidates` entry and the pick fails. The guarantee it provides is
-  # needed exactly in the procs where the other candidates are live.
+  # NEVER the staging bridge (r11). An earlier revision handed it out FIRST (gated
+  # only against `(instr …)` rows via `clobbersBridgeReg`), reasoning that it is the
+  # one volatile with no ABI role — but the gate covered only the STATIC bridge
+  # claims. The emitter also grabs the bridge REACTIVELY under register pressure
+  # (`produceIntoMem2`, the mem-base reload staging, the aggregate-copy transfer):
+  # those sites `releaseStaleName(R11)` and write it raw, because the bridge's whole
+  # contract is "always free for the emitter" — a contract a rescued value homed
+  # there silently violates. The corpus never had enough simultaneous pressure to
+  # hit the combination; a shoggoth-unswitched `nifbuilder` (duplicated loops, every
+  # pool dry) did: the bridge grab dropped the rescued local's binding and its next
+  # read reached `emReg` as a raw r11 — the checker catching a real clobber.
+  # A home must come from a pool the emitter treats as allocatable, full stop.
   #
-  # A RESCUED value is different in kind: single-def, bounded interval, only exists
-  # because the callee-saved pool ran out, and it pays for itself only above
-  # `weight > 2 * crossings` — so it is both rare and short. And the bridge is the
-  # only volatile with NO ABI role, which is what the others lack: a rescued value
-  # homed in an argument register collides with the marshalling of every call it is
-  # saved around, which is why this rescue won nothing while 85 % of spills happened
-  # with six volatiles idle.
-  #
-  # NOT in a proc containing an `(instr …)`: those rows take the bridge DIRECTLY as
-  # their `work` register. `emitInstr2` seals it, which keeps the operand PICKS off
-  # it, but a value already homed there is just released (`releaseStaleName`) — sound
-  # only while nothing could be homed there. Same shape as `clobbersDivReg` keeping a
-  # leaf param out of rdx.
-  var r = NoReg
-  if not b.an.clobbersBridgeReg: r = b.takeReg(b.freeVol, [b.md.stagingBridgeReg])
-  if r == NoReg: r = b.takeReg(b.freeVol, b.md.intLocalTempRegs)
+  # The argument registers are fine: a rescued value is stored to its `csave` slot
+  # and its reads redirected there before any marshalling writes them
+  # (`emCallerSaveOpen`), which is the mechanism's whole point.
+  var r = b.takeReg(b.freeVol, b.md.intLocalTempRegs)
   if r == NoReg: return fallback
   b.plan.callerSaveHomes[name] = vi.freeAfter
   # The save slot is declared in the PROLOGUE, not at the decl. arkham emits by a

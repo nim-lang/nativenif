@@ -32,6 +32,7 @@
 | `(movsx D S N)`        | X64Inst                  | D = the low `N` bits of S, SIGN-extended into the full 64-bit D (`N` is 8, 16 or 32) |
 | `(movapd D S)`         | X64Inst                  | move aligned packed double |
 | `(movsd D S)`          | X64Inst                  | move scalar double |
+| `(movdqu D S)`         | X64Inst                  | move unaligned 128 bits (xmm/mem both sides; the access is inherently 16 bytes — the mem operand's scalar type is not consulted, matching the hardware) |
 | `(add D S)`            | X64Inst, A64Inst         | add instruction |
 | `(sub D S)`            | X64Inst, A64Inst         | subtract instruction |
 | `(mul S)`              | X64Inst, A64Inst         | unsigned multiply |

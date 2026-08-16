@@ -59,6 +59,7 @@ proc emReg(g: var CodeGen; r: Reg) {.inline.} =
     # byte-copy loops is nonetheless bound there, for extra checker coverage.)
     assert r notin g.md.intTempRegs and r != R11,
       "arkham x64: unbound scratch/bridge register reached emReg: " & x64RegName(r) &
+      " in " & gArkhamCurProc &
       " — every value/address-carrying R10/R11 use must be a typed binding (pickStagingSealed/bindTemp)"
     g.ab.reg r
 
@@ -4477,6 +4478,18 @@ proc copyAggr(g: var CodeGen; dst, src: AggrEnd; size: int; tmp: Reg) =
   ## is TOTAL for any aggregate regardless of field packing. nifasm's sized mem↔reg move
   ## extends a byte load / truncates a byte store, so `tmp` stays a plain `(u 64)`.
   ## (`tmp` and any register end are bound by the caller.)
+  ##
+  ## MEASURED NEGATIVE RESULT (2026-08-16) — do NOT "optimize" this into 16-byte
+  ## `movdqu` chunks while arkham's WRITERS stay word-granular. It was tried (nifasm
+  ## kept the `movdqu` instruction): instruction count dropped ~1% across every
+  ## nifbench bench, but wall time went +10.7% TOTAL — parse +28%, bif-load +39% —
+  ## because a 16-byte load over an aggregate that was just built with 8-byte field
+  ## stores cannot STORE-FORWARD (narrow-stores→wide-load always stalls, ~12+ cycles
+  ## per hot copy, dwarfing the two saved moves). The benches that copy stable,
+  ## long-written data (walk/skim/clone) did win ~3%, but the copy sites are shared,
+  ## so there is no static split. gcc -O3 copies aggregates with movdqu profitably
+  ## only because it vectorizes the CONSTRUCTION side too, so its wide loads forward
+  ## from wide stores. Revisit only together with SIMD-building constructors.
   let words = size div 8
   for i in 0 ..< words:
     g.ab.tree MovX64: (g.emReg tmp; g.emWordAt(src, i))
@@ -5794,6 +5807,15 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         if dst.kind == NoLoc:                               # module-level global / threadvar
           var lc = lhsCur
           dst = g.asLoc(lc)                                 # Glob/Tvar with precise type
+        elif dst.kind == InReg and g.varType.hasKey(symName(lhsCur)):
+          # A by-ref aggregate param whose POINTER is register-homed: the assignment's
+          # destination is the pointee, not the pointer. An `InReg` home says nothing
+          # about that (its `typ` is the pointer's), so reclassify to the `Mem` lvalue
+          # form — every aggregate path already reaches a bare Symbol through
+          # `aggrAddrInto`/`emLvalAddr2`'s InReg case. Without this the store fell into
+          # the scalar arm and a whole-aggregate copy moved the POINTER (the params
+          # aliased from then on) — the register twin of the pre-`StackPtr` bug.
+          dst = memLoc(lhsCur, g.exprSlot(lhsCur))
         g.genStore2(cc, dst)                       # the one general store path
       else:
         # A memory store through a complex lvalue (dot/deref/at).
@@ -6433,6 +6455,12 @@ proc emitScalarCmpE(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
     g.emitLoadLoc(aLoc, cmpStaging)
     aLoc = regLoc(cmpStaging, aLoc.typ)
   assert aLoc.kind == InReg, "arkham x64n: cmp lhs " & $aLoc.kind
+  when defined(arkhamR11Dbg):
+    if aLoc.r == R11:
+      stderr.writeLine "R11DBG cmp lhs in " & gArkhamCurProc &
+        " isTemp=" & $aLoc.isTemp & " exprKind=" & $aC.exprKind &
+        " kind=" & $aC.kind &
+        (if aC.kind == Symbol: " sym=" & symName(aC) else: "")
   if rhsMemFold:
     var bBound: seq[Reg] = @[]
     g.bindLvalGlobalBases(bC, bBound)

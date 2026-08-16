@@ -1,7 +1,7 @@
 # Nifasm - Relocation System
 # A system for tracking and managing relocations in the instruction stream
 
-import std/[tables, algorithm, sets]
+import std/[tables, algorithm, sets, sequtils]
 import buffers
 
 type
@@ -626,7 +626,114 @@ proc invertCondJumps*(buf: var Buffer): seq[int] =
     for o in 0 .. origLen: result[o] = iterMap[result[o]]
     changed = true
 
-proc shortenX64Jumps*(buf: var Buffer): seq[int] =
+proc emitX64Nops(data: var Bytes; n: int) =
+  ## `n` bytes of x86 no-ops in as FEW instructions as possible (Intel's canonical
+  ## multi-byte NOP forms, up to 9 bytes each). A pad before a loop head is executed
+  ## on the fall-in path, so 11 × `0x90` would cost 11 decode slots where two long
+  ## NOPs cost two.
+  const Forms: array[1..9, seq[byte]] = [
+    @[0x90'u8],
+    @[0x66'u8, 0x90],
+    @[0x0F'u8, 0x1F, 0x00],
+    @[0x0F'u8, 0x1F, 0x40, 0x00],
+    @[0x0F'u8, 0x1F, 0x44, 0x00, 0x00],
+    @[0x66'u8, 0x0F, 0x1F, 0x44, 0x00, 0x00],
+    @[0x0F'u8, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],
+    @[0x0F'u8, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+    @[0x66'u8, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]]
+  var r = n
+  while r > 0:
+    let k = min(r, 9)
+    for b in Forms[k]: data.add b
+    r -= k
+
+proc alignPointPositions(buf: Buffer; alignLabels: seq[int]): seq[int] =
+  ## Resolve alignment-candidate label IDS to byte positions in `buf`'s CURRENT
+  ## layout: undefined labels are dropped, positions inside a layout-frozen
+  ## `casejmp` region are dropped (nothing may be inserted there), duplicates
+  ## collapse. Sorted ascending. Used both by `shortenX64Jumps` (to know which
+  ## jumps a future pad would invalidate) and by `alignCodeX64` (to insert the
+  ## pads) — one resolution rule, so the two views cannot drift.
+  let lp = buf.labelPositions
+  result = @[]
+  for id in alignLabels:
+    if id >= 0 and id < lp.len and lp[id] >= 0 and not inFixedRange(buf, lp[id]):
+      result.add lp[id]
+  result.sort()
+  result = deduplicate(result, isSorted = true)
+
+proc backwardBranchTargets*(buf: Buffer): seq[int] =
+  ## Label ids targeted by a BACKWARD x86 `jmp`/`jcc` — loop heads, the alignment
+  ## candidates `alignCodeX64` pads to a 16-byte boundary. Collect from the reloc
+  ## list right before `shortenX64Jumps` (afterwards the shortened jumps are
+  ## patched inline and no longer tracked).
+  let lp = buf.labelPositions
+  var seen = initHashSet[int]()
+  for r in buf.relocs:
+    if isShrinkableX64(r.kind) and int(r.target) < lp.len:
+      let tp = lp[int(r.target)]
+      if tp >= 0 and tp < r.position and int(r.target) notin seen:
+        seen.incl int(r.target)
+        result.add int(r.target)
+
+proc crossesAlignPoint(points: seq[int]; a, b: int): bool {.inline.} =
+  ## Would a pad inserted at one of the (sorted) `points` change the displacement
+  ## between instruction position `a` and label position `b`? A pad at `p` shifts
+  ## every byte — and every label — at position ≥ `p`, so the displacement changes
+  ## iff a point lies in `(min(a,b), max(a,b)]`: a jump and a target that shift
+  ## TOGETHER (both ≥ p, including a backward jump to the padded label itself)
+  ## keep their distance; only a jump on the far side of the pad from its target
+  ## sees the layout move.
+  let lo = min(a, b)
+  let hi = max(a, b)
+  let i = upperBound(points, lo)          # first point > lo
+  i < points.len and points[i] <= hi
+
+proc alignCodeX64*(buf: var Buffer; alignLabels: seq[int]; alignment = 16): seq[int] =
+  ## Pad the positions of `alignLabels` (proc entries, loop heads) to `alignment`
+  ## with multi-byte NOPs, rewriting `buf` in place. Returns the old→new byte-
+  ## position map (length `data.len + 1`) for the caller's external offsets, the
+  ## same contract as `threadJumps`/`shortenX64Jumps`.
+  ##
+  ## MUST run AFTER `shortenX64Jumps`, and only with the SAME `alignLabels` that
+  ## pass was given: the shortener keeps every jump whose displacement window
+  ## crosses one of these points in rel32 form (a tracked reloc `finalize` patches
+  ## from the remapped labels), so the rel8 jumps it patched inline are exactly
+  ## the ones whose distances a pad here cannot change. The code base offset in
+  ## the executable must itself be `alignment`-aligned for offset alignment to be
+  ## address alignment (the static ELF's text starts at 0x400000+176, 176 = 16·11).
+  let points = alignPointPositions(buf, alignLabels)
+  let oldLen = buf.data.len
+  # Pad size per point, in ascending order (earlier pads shift later points).
+  var pads = newSeq[int](points.len)
+  var shift = 0
+  for i in 0 ..< points.len:
+    pads[i] = (alignment - (points[i] + shift) mod alignment) mod alignment
+    shift += pads[i]
+  # Rebuild the bytes with the pads in, building the old→new map alongside.
+  result = newSeq[int](oldLen + 1)
+  var newData = initBytes()
+  var pi = 0
+  for oldI in 0 ..< oldLen:
+    if pi < points.len and points[pi] == oldI:
+      emitX64Nops(newData, pads[pi])
+      inc pi
+    result[oldI] = newData.len
+    newData.add buf.data[oldI]
+  if pi < points.len and points[pi] == oldLen:   # a point at the very end (degenerate)
+    emitX64Nops(newData, pads[pi])
+  result[oldLen] = newData.len
+  # Remap everything the buffer itself tracks; a label AT a point moves to the
+  # aligned boundary (its pad sits before it).
+  for k in 0 ..< buf.labels.len:
+    buf.labels[k].position = result[buf.labels[k].position]
+  for k in 0 ..< buf.relocs.len:
+    buf.relocs[k].position = result[buf.relocs[k].position]
+  for k in 0 ..< buf.fixedRanges.len:
+    buf.fixedRanges[k] = (result[buf.fixedRanges[k][0]], result[buf.fixedRanges[k][1]])
+  buf.data = newData
+
+proc shortenX64Jumps*(buf: var Buffer; alignLabels: seq[int] = @[]): seq[int] =
   ## Shrink x86 `jmp`/`jcc rel32` to `rel8` wherever the displacement fits a signed
   ## byte, rewriting `buf` in place. Returns an old→new byte-position map (length
   ## `buf.data.len + 1`, indexed by *original* offset) so the caller can remap any
@@ -665,10 +772,20 @@ proc shortenX64Jumps*(buf: var Buffer): seq[int] =
   # Every shrinkable jump starts short; non-shrinkable relocs are permanently long.
   # A jump inside a layout-frozen `casejmp` region must keep its emitted (long)
   # size — the computed `base + idx*N` target arithmetic depends on it.
+  # A jump whose displacement window crosses an `alignLabels` point also stays
+  # long: `alignCodeX64` will insert a NOP pad there AFTER this pass, and a rel8
+  # patched inline here could not be re-patched (it is dropped from the reloc
+  # list) — while a rel32 stays tracked and `finalize` recomputes it from the
+  # padded labels. Jumps that shift TOGETHER with their target (the common
+  # intra-proc/intra-loop case, including the loop back-jump to the padded head
+  # itself) do not cross and stay shrinkable — see `crossesAlignPoint`.
+  let alignPts = alignPointPositions(buf, alignLabels)
   var isShort = newSeq[bool](relocs.len)
   for i in 0 ..< relocs.len:
     isShort[i] = isShrinkableX64(relocs[i].kind) and
-                 not inFixedRange(buf, relocs[i].position)
+                 not inFixedRange(buf, relocs[i].position) and
+                 not crossesAlignPoint(alignPts, relocs[i].position,
+                                       labelPos.getOrDefault(int(relocs[i].target), relocs[i].position))
 
   # Old reloc positions in ascending order (== relocs order, already sorted), for
   # the per-pass binary search.

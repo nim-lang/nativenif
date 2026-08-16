@@ -1,0 +1,59 @@
+(.nif27)
+(.indexat 960              )
+(stmts
+ (type :IntArr4.0 .
+  (array
+   (i 64)4))
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :barrier.0
+  (params)
+  (i 64).
+  (stmts
+   (ret 0)))
+ (proc :fill2.0
+  (params
+   (param :a.0 . IntArr4.0)
+   (param :f.0 . IntArr4.0))
+  (i 64).
+  (stmts
+   (var :z.0 .
+    (i 64)
+    (call barrier.0))
+   (asgn f.0
+    (aconstr IntArr4.0 4 5 6 7))
+   (ret
+    (add
+     (i 64)z.0
+     (add
+      (i 64)
+      (at a.0 0)
+      (add
+       (i 64)
+       (add
+        (i 64)
+        (at f.0 0)
+        (at f.0 1))
+       (add
+        (i 64)
+        (at f.0 2)
+        (at f.0 3))))))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :va.0 . IntArr4.0
+    (aconstr IntArr4.0 1 0 0 0))
+   (var :vf.0 . IntArr4.0
+    (aconstr IntArr4.0 99 99 99 99))
+   (var :s.0 .
+    (i 64)
+    (call fill2.0 va.0 vf.0))
+   (call exit.0 s.0))))(.index)
