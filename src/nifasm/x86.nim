@@ -658,8 +658,13 @@ proc emitTest*(dest: var Bytes; a, b: Register) =
   dest.add(encodeModRM(amDirect, int(b), int(a)))  # reg=b, rm=a
 
 # Arithmetic with immediate values
-proc emitAddImm*(dest: var Bytes; reg: Register; imm: int32) =
-  ## Emit ADD instruction: ADD reg, imm32
+proc emitAluImmReg(dest: var Bytes; ext: int; reg: Register; imm: int32) =
+  ## Group-1 `<alu> r/m64, imm`. `ext` is the ModRM.reg opcode-extension digit
+  ## (ADD=0, OR=1, AND=4, SUB=5, XOR=6, CMP=7). An immediate that fits a
+  ## sign-extended byte takes the short 0x83+imm8 form (4 bytes instead of 7 —
+  ## `add reg, 1` is the most emitted ALU op there is); anything wider takes
+  ## 0x81+imm32. NOT used for back-patched immediates (`(ssize)`), which need
+  ## the fixed imm32 field — see `emitAddImm32`/`emitSubImm32`.
   var rex = RexPrefix(w: true)
 
   if needsRex(reg): rex.b = true
@@ -667,74 +672,59 @@ proc emitAddImm*(dest: var Bytes; reg: Register; imm: int32) =
   if rex.b or rex.w:
     dest.add(encodeRex(rex))
 
+  if imm >= -128 and imm <= 127:
+    dest.add(0x83)  # group-1 r/m64, imm8 (sign-extended)
+    dest.add(encodeModRM(amDirect, ext, int(reg)))
+    dest.add(byte(imm and 0xFF))
+  else:
+    dest.add(0x81)  # group-1 r/m64, imm32
+    dest.add(encodeModRM(amDirect, ext, int(reg)))
+    dest.addt32(imm)
+
+proc emitAddImm*(dest: var Bytes; reg: Register; imm: int32) =
+  ## ADD reg, imm (imm8 short form when it fits)
+  emitAluImmReg(dest, 0, reg, imm)
+
+proc emitAddImm32*(dest: var Bytes; reg: Register; imm: int32) =
+  ## ADD reg, imm32 — ALWAYS the 0x81 form with a full 4-byte immediate field,
+  ## for `(ssize)` placeholders that are back-patched after frame layout.
+  var rex = RexPrefix(w: true)
+  if needsRex(reg): rex.b = true
+  if rex.b or rex.w:
+    dest.add(encodeRex(rex))
   dest.add(0x81)  # ADD r/m64, imm32 opcode
   dest.add(encodeModRM(amDirect, 0, int(reg)))  # /0 extension
   dest.addt32(imm)
 
 proc emitSubImm*(dest: var Bytes; reg: Register; imm: int32) =
-  ## Emit SUB instruction: SUB reg, imm32
+  ## SUB reg, imm (imm8 short form when it fits)
+  emitAluImmReg(dest, 5, reg, imm)
+
+proc emitSubImm32*(dest: var Bytes; reg: Register; imm: int32) =
+  ## SUB reg, imm32 — ALWAYS the 0x81 form; see `emitAddImm32`.
   var rex = RexPrefix(w: true)
-
   if needsRex(reg): rex.b = true
-
   if rex.b or rex.w:
     dest.add(encodeRex(rex))
-
   dest.add(0x81)  # SUB r/m64, imm32 opcode
   dest.add(encodeModRM(amDirect, 5, int(reg)))  # /5 extension
   dest.addt32(imm)
 
 proc emitAndImm*(dest: var Bytes; reg: Register; imm: int32) =
-  ## Emit AND instruction: AND reg, imm32
-  var rex = RexPrefix(w: true)
-
-  if needsRex(reg): rex.b = true
-
-  if rex.b or rex.w:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x81)  # AND r/m64, imm32 opcode
-  dest.add(encodeModRM(amDirect, 4, int(reg)))  # /4 extension
-  dest.addt32(imm)
+  ## AND reg, imm (imm8 short form when it fits)
+  emitAluImmReg(dest, 4, reg, imm)
 
 proc emitOrImm*(dest: var Bytes; reg: Register; imm: int32) =
-  ## Emit OR instruction: OR reg, imm32
-  var rex = RexPrefix(w: true)
-
-  if needsRex(reg): rex.b = true
-
-  if rex.b or rex.w:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x81)  # OR r/m64, imm32 opcode
-  dest.add(encodeModRM(amDirect, 1, int(reg)))  # /1 extension
-  dest.addt32(imm)
+  ## OR reg, imm (imm8 short form when it fits)
+  emitAluImmReg(dest, 1, reg, imm)
 
 proc emitXorImm*(dest: var Bytes; reg: Register; imm: int32) =
-  ## Emit XOR instruction: XOR reg, imm32
-  var rex = RexPrefix(w: true)
-
-  if needsRex(reg): rex.b = true
-
-  if rex.b or rex.w:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x81)  # XOR r/m64, imm32 opcode
-  dest.add(encodeModRM(amDirect, 6, int(reg)))  # /6 extension
-  dest.addt32(imm)
+  ## XOR reg, imm (imm8 short form when it fits)
+  emitAluImmReg(dest, 6, reg, imm)
 
 proc emitCmpImm*(dest: var Bytes; reg: Register; imm: int32) =
-  ## Emit CMP instruction: CMP reg, imm32
-  var rex = RexPrefix(w: true)
-
-  if needsRex(reg): rex.b = true
-
-  if rex.b or rex.w:
-    dest.add(encodeRex(rex))
-
-  dest.add(0x81)  # CMP r/m64, imm32 opcode
-  dest.add(encodeModRM(amDirect, 7, int(reg)))  # /7 extension
-  dest.addt32(imm)
+  ## CMP reg, imm (imm8 short form when it fits)
+  emitAluImmReg(dest, 7, reg, imm)
 
 proc emitAluImmMem(dest: var Bytes; ext: int; mem: MemoryOperand; imm: int32; bits = 64) =
   ## `<alu> r/m, imm` with a MEMORY destination, SIZED to `bits` (8/16/32/64). `ext`
@@ -752,6 +742,10 @@ proc emitAluImmMem(dest: var Bytes; ext: int; mem: MemoryOperand; imm: int32; bi
     dest.add(encodeRex(rex))
   if bits == 8:
     dest.add(0x80)                               # group-1 r/m8, imm8
+    dest.emitMem(ext, mem)
+    dest.add(byte(imm and 0xFF))
+  elif imm >= -128 and imm <= 127:
+    dest.add(0x83)                               # group-1 r/m{16,32,64}, imm8 (sign-extended)
     dest.emitMem(ext, mem)
     dest.add(byte(imm and 0xFF))
   else:
@@ -1171,6 +1165,9 @@ proc emitMovssLoad*(dest: var Bytes; destReg: XmmRegister; mem: MemoryOperand) =
 proc emitMovsdLoad*(dest: var Bytes; destReg: XmmRegister; mem: MemoryOperand) = emitSseRM(dest, 0xF2, 0x10, int(destReg), mem)
 proc emitMovssStore*(dest: var Bytes; mem: MemoryOperand; srcReg: XmmRegister) = emitSseRM(dest, 0xF3, 0x11, int(srcReg), mem)
 proc emitMovsdStore*(dest: var Bytes; mem: MemoryOperand; srcReg: XmmRegister) = emitSseRM(dest, 0xF2, 0x11, int(srcReg), mem)
+proc emitMovdqu*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF3, 0x6F, int(destReg), int(srcReg))
+proc emitMovdquLoad*(dest: var Bytes; destReg: XmmRegister; mem: MemoryOperand) = emitSseRM(dest, 0xF3, 0x6F, int(destReg), mem)
+proc emitMovdquStore*(dest: var Bytes; mem: MemoryOperand; srcReg: XmmRegister) = emitSseRM(dest, 0xF3, 0x7F, int(srcReg), mem)
 proc emitAddss*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF3, 0x58, int(destReg), int(srcReg))
 proc emitAddsd*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF2, 0x58, int(destReg), int(srcReg))
 proc emitSubss*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF3, 0x5C, int(destReg), int(srcReg))

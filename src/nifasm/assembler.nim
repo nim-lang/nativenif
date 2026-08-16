@@ -5814,7 +5814,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         x86.emitAdd(ctx.buf.data, dest.mem, op.reg)
     else:
       if op.kind == okSsize:
-        x86.emitAddImm(ctx.buf.data, dest.reg, 0)
+        x86.emitAddImm32(ctx.buf.data, dest.reg, 0)   # forced imm32: back-patched
         ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
       elif op.kind == okCsize:
         x86.emitAddImm(ctx.buf.data, dest.reg, int32(op.immVal))
@@ -5846,7 +5846,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         x86.emitSub(ctx.buf.data, dest.mem, op.reg)
     else:
       if op.kind == okSsize:
-        x86.emitSubImm(ctx.buf.data, dest.reg, 0)
+        x86.emitSubImm32(ctx.buf.data, dest.reg, 0)   # forced imm32: back-patched
         ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
       elif op.kind == okCsize:
         x86.emitSubImm(ctx.buf.data, dest.reg, int32(op.immVal))
@@ -6755,6 +6755,30 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       if isD: x86.emitMovsdStore(ctx.buf.data, d.mem, s)
       else:   x86.emitMovssStore(ctx.buf.data, d.mem, s)
 
+  of MovdquX64:
+    # `(movdqu D S)`: unaligned 128-bit move, one side may be memory —
+    #   (movdqu (xmmD) (xmmS)) reg→reg; (movdqu (xmmD) (mem …)) load;
+    #   (movdqu (mem …) (xmmS)) store.
+    # The access is inherently 16 bytes: the mem operand's declared scalar type is
+    # NOT consulted (the hardware instruction has no operand-size field either), so
+    # a word-typed `(cast (u 64) (mem …))` operand is fine — the aggregate copier
+    # addresses its 16-byte chunks with the same operand shapes as its word moves.
+    inc n
+    if isXmmOperand(n, ctx):
+      let d = parseXmmOperand(n, ctx)
+      if isXmmOperand(n, ctx):
+        let s = parseXmmOperand(n, ctx)
+        x86.emitMovdqu(ctx.buf.data, d, s)
+      else:
+        let s = parseOperand(n, ctx)
+        if s.kind != okMem: error("movdqu source must be xmm or memory", n)
+        x86.emitMovdquLoad(ctx.buf.data, d, s.mem)
+    else:
+      let d = parseOperand(n, ctx)
+      if d.kind != okMem: error("movdqu destination must be xmm or memory", n)
+      let s = parseXmmOperand(n, ctx)
+      x86.emitMovdquStore(ctx.buf.data, d.mem, s)
+
   of AddsdX64, AddssX64, SubsdX64, SubssX64,
      MulsdX64, MulssX64, DivsdX64, DivssX64, Cvtsd2ssX64, Cvtss2sdX64,
      ComisdX64, ComissX64:
@@ -7126,12 +7150,31 @@ proc writeElf(a: var GenContext; outfile: string) =
       a.entryStubOffset = invMap[a.entryStubOffset]
     a.remapListing(invMap)
   if a.arch == Arch.X64:
-    let posMap = shortenX64Jumps(a.buf)
+    # Code-alignment candidates, as LABEL IDS (stable across the layout passes):
+    # every generated proc's entry + every loop head (= target of a backward
+    # jmp/jcc, collected now — after shortening those jumps are patched inline
+    # and no longer tracked). The shortener keeps any jump whose displacement a
+    # pad would change in rel32 form; `alignCodeX64` then inserts the NOP pads
+    # so entries and loop heads start on a 16-byte boundary (gcc pads ~2.7k NOPs
+    # into the same workload; nifasm previously aligned nothing, which both
+    # costs fetch bandwidth on hot loop heads and made wall-clock timings swing
+    # with incidental layout shifts).
+    var alignLabels: seq[int] = @[]
+    for name, sym in a.rootScope.syms:
+      if sym.kind == skProc: alignLabels.add sym.offset
+    for id in backwardBranchTargets(a.buf): alignLabels.add id
+    let posMap = shortenX64Jumps(a.buf, alignLabels)
     for k in 0 ..< a.gvarSites.len:
       a.gvarSites[k] = (posMap[a.gvarSites[k][0]], a.gvarSites[k][1])
     if a.entryStubOffset >= 0:
       a.entryStubOffset = posMap[a.entryStubOffset]
     a.remapListing(posMap)
+    let alignMap = alignCodeX64(a.buf, alignLabels)
+    for k in 0 ..< a.gvarSites.len:
+      a.gvarSites[k] = (alignMap[a.gvarSites[k][0]], a.gvarSites[k][1])
+    if a.entryStubOffset >= 0:
+      a.entryStubOffset = alignMap[a.entryStubOffset]
+    a.remapListing(alignMap)
   when defined(arkhamDbgReloc):
     block validateRelocs:
       var defined = initHashSet[int]()

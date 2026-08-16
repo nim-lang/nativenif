@@ -78,15 +78,11 @@ const
                                      # leaf-param home in one of these is excluded in `allocParams`;
                                      # `pickStagingScratch` already routes staging around a live
                                      # local/param home (`regHoldsLiveLocal`).
-    intCalleeSaved: @[RBX, R12, R13, R14, R15],
-                                     # RBP is deliberately NOT here. arkham never sets up an
-                                     # rbp frame, so it looks free, but adding it as a sixth
-                                     # callee-saved home exposes a latent miscompile under
-                                     # precise live ranges: a value living in rbp across a call
-                                     # comes back clobbered even though the frame push/pop of
-                                     # rbp is correct — so the fault is elsewhere (a callee not
-                                     # preserving rbp, or a nifasm mem/TLS encoding path).
-                                     # Root-cause that before reaching for it.
+    intCalleeSaved: @[RBX, R12, R13, R14, R15, RBP],
+                                     # RBP last: arkham never sets up an rbp frame, so it is
+                                     # a genuine 6th callee-saved home — but only reached
+                                     # under full pressure, so the 5 ABI-conventional homes
+                                     # keep their familiar assignments.
     floatTempRegs: @[F8, F9, F10, F11, F12, F13, F14],   # F15 RESERVED as the float
                                                          # staging bridge (FloatStagingBridge)
                                                          # — the SIMD twin of R11.
@@ -134,9 +130,9 @@ const
     intTempRegs: @[R10],
     stagingBridgeReg: R11,
     intLocalTempRegs: @[RDI, RSI, R8, R9],
-    intCalleeSaved: @[RBX, R12, R13, R14, R15],
+    intCalleeSaved: @[RBX, R12, R13, R14, R15, RBP],
     floatTempRegs: @[F8, F9, F10, F11, F12, F13, F14],
     floatCalleeSaved: @[],
-    intCalleeSavedSet: {RBX, R12, R13, R14, R15},
+    intCalleeSavedSet: {RBX, R12, R13, R14, R15, RBP},
     floatCalleeSavedSet: {},
     aggrByRefThreshold: 8)

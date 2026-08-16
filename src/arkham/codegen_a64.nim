@@ -5374,6 +5374,10 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         if dst.kind == NoLoc:
           var lc = lhsCur
           dst = g.asLoc(lc)
+        elif dst.kind == InReg and g.varType.hasKey(symName(lhsCur)):
+          # By-ref aggregate param, pointer register-homed: the destination is the
+          # POINTEE — reclassify to the `Mem` lvalue form (see the x64 twin).
+          dst = memLoc(lhsCur, g.exprSlot(lhsCur))
         g.genStore2(cc, dst)
       else:
         let lhsCur = cc
