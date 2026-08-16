@@ -1298,7 +1298,70 @@ proc aggrWordCount*(p: var Program; typeSym: SymId): int =
   assert sz <= 16, "arkham v1: >16-byte aggregate ABI (by-ref / x8) not yet supported"
   (sz + 7) div 8
 
+proc layoutObjBody(p: var Program; bodyc: Cursor; base: int;
+                   res: var seq[FieldInfo]) =
+  ## Append `bodyc`'s fields to `res`, each at `base` plus its offset within the
+  ## body. This walk must stay in lockstep with `objSizeAlign`'s — the two answer
+  ## "where is field f" and "how big is the object", and a disagreement puts a
+  ## field's address outside its own object.
+  assert bodyc.kind == TagLit and bodyc.typeKind == ObjectT,
+    "arkham: object layout requires an object body, got " &
+    toString(bodyc, includeLineInfo = false)
+  var oc = bodyc
+  var off = base
+  oc.into:
+    if oc.kind == Symbol:                     # inherited base: its fields come
+      layoutObjBody(p, resolveType(p, oc), base, res)   # first, at their base
+      off = base + aggrByteSize(p, oc.symId)  # offsets (base sits at offset 0)
+    skip oc                                   # base / inheritance slot
+    while oc.hasMore:
+      if oc.kind == TagLit and oc.typeKind == UnionT:
+        # An object VARIANT's union part. Its branches OVERLAP, so each is laid
+        # out from the SAME offset — which is exactly how `fieldType` resolves a
+        # name across all of them, and the layout `objSizeAlign` sizes. Without
+        # this case the `(union …)` node fell into the `(fld …)` arm below and
+        # `symName` asserted on its first child, an `(object …)` TagLit: any
+        # variant type reaching the aggregate-ABI path killed arkham outright.
+        let (usz, ual) = unionSizeAlign(p, oc)
+        off = align(off, ual)
+        var u = oc
+        u.into:
+          while u.hasMore:
+            let br = unionBranchBody(u)
+            if br.kind != DotToken:           # `.` ⇒ branch declares no fields
+              layoutObjBody(p, br, off, res)
+            skip u
+        off += usz
+        skip oc
+      else:
+        oc.into:                              # (fld :name pragmas type)
+          let fn = symName(oc); inc oc
+          skip oc                             # field-pragmas
+          let (fsz, fal) = typeSizeAlign(p, oc)
+          skip oc
+          off = align(off, fal)
+          res.add (name: fn, off: off, size: fsz)
+          off += fsz
+
+proc objBodyHasUnion(p: var Program; bodyc: Cursor): bool =
+  ## Does this object body — or anything it inherits — carry a variant /
+  ## `{.union.}` part? No early `return`: an unbalanced `into` body trips
+  ## nifcore's "did not consume all children" assert.
+  var oc = bodyc
+  result = false
+  oc.into:
+    if oc.kind == Symbol and objBodyHasUnion(p, resolveType(p, oc)):
+      result = true
+    skip oc                                   # base / inheritance slot
+    while oc.hasMore:
+      if oc.kind == TagLit and oc.typeKind == UnionT: result = true
+      skip oc
+
 proc aggrLayout*(p: var Program; typeSym: SymId): seq[FieldInfo] =
+  ## Every field of `typeSym`, at its byte offset. A variant type contributes
+  ## each branch's fields at the SAME offset, so the result can hold two entries
+  ## for one offset — `fieldAtOffset` answers with the first, which is why
+  ## `canHomeInRegPair` refuses variants rather than picking between them.
   result = @[]
   var d = lookupType(p, typeSym)
   var body: Cursor
@@ -1313,22 +1376,7 @@ proc aggrLayout*(p: var Program; typeSym: SymId): seq[FieldInfo] =
     return aggrLayout(p, body.symId)
   assert body.kind == TagLit and body.typeKind == ObjectT,
     "arkham: aggregate ABI requires an object type: " & p.pool.syms[typeSym]
-  var oc = body
-  var off = 0
-  oc.into:
-    if oc.kind == Symbol:                     # inherited base: its fields come
-      result = aggrLayout(p, oc.symId)        # first, at their base offsets (the
-      off = aggrByteSize(p, oc.symId)         # base sits at offset 0 in derived)
-    skip oc                                   # base / inheritance slot
-    while oc.hasMore:
-      oc.into:                                # (fld :name pragmas type)
-        let fn = symName(oc); inc oc
-        skip oc                               # field-pragmas
-        let (fsz, fal) = typeSizeAlign(p, oc)
-        skip oc
-        off = align(off, fal)
-        result.add (name: fn, off: off, size: fsz)
-        off += fsz
+  layoutObjBody(p, body, 0, result)
 
 proc canHomeInRegPair*(p: var Program; typeSym: SymId): bool =
   ## True when every field is a full 8-byte integer/pointer word at an 8-byte
@@ -1346,6 +1394,12 @@ proc canHomeInRegPair*(p: var Program; typeSym: SymId): bool =
   if body.kind == Symbol:
     return canHomeInRegPair(p, body.symId)
   if body.kind != TagLit or body.typeKind != ObjectT: return false
+  # A VARIANT never homes in registers. Its branches overlap, so `aggrLayout`
+  # reports several fields at one offset and `fieldAtOffset` would have to pick
+  # one — but the deciding reason is the same one the `AMem` test below states:
+  # a variant's `=destroy` reaches its payload as `(dot dest val)` and hands
+  # that lvalue to the field's own hook, and a register has no address.
+  if objBodyHasUnion(p, body): return false
   let lay = aggrLayout(p, typeSym)
   if lay.len == 0: return false
   for f in lay:

@@ -139,6 +139,13 @@ proc takeLocal*(c: var Cursor): Local =
       result.val = c
       result.hasVal = true
       skip c
+    # An AGGREGATE constant initializer carries one trailing `(reloc <off>
+    # <sym>)` per field holding a symbol ADDRESS, which only the final layout can
+    # fill in — `(gvar :name type "bytes" (reloc …)*)`. They are no part of the
+    # three slots captured above, and `generateSymbol` re-walks the node to read
+    # them, but `into` demands the WHOLE body be consumed, so leaving them made
+    # every such gvar an assertion failure rather than a decl this could bound.
+    while c.hasMore: skip c
 
 type
   TypeDecl* = object
