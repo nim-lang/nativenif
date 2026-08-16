@@ -500,6 +500,13 @@ exec "nim c -r src/nifasm/nifasm tests/dot_at_access.nif"
 exec "nim c -r src/nifasm/nifasm tests/nested_dot_at.nif"
 exec "nim c -r src/nifasm/nifasm tests/pointer_dot_store.nif"
 exec "nim c -r src/nifasm/nifasm tests/array_i64_register_index.nif"
+exec "nim c -r src/nifasm/nifasm tests/mem_reg_index.nif"
+exec "nim c -r src/nifasm/nifasm tests/jcc_sign.nif"
+exec "nim c -r src/nifasm/nifasm tests/alu_subwidth.nif"
+exec "nim c -r src/nifasm/nifasm tests/alu_memreg.nif"
+exec "nim c -r src/nifasm/nifasm tests/lenient_port.nif"
+exec "nim c -r src/nifasm/nifasm tests/lenient_xmm.nif"
+exec "nim c -r src/nifasm/nifasm tests/lea_scaled.nif"
 exec "nim c -r src/nifasm/nifasm tests/pointer_field_at.nif"
 exec "nim c -r src/nifasm/nifasm tests/pointer_roundtrip.nif"
 exec "nim c -r src/nifasm/nifasm tests/string_pointer_field.nif"
@@ -532,6 +539,28 @@ when defined(linux) and defined(amd64):
   execRun "tests/nested_dot_at"
   execRun "tests/pointer_dot_store"
   execRun "tests/array_i64_register_index"
+  # `(mem base index scale [disp])` with a RAW register index (the general SIB
+  # form, what distilled gcc bodies spell) + a sub-width cast load over it.
+  execRun "tests/mem_reg_index"
+  # js/jns: sign-flag conditional jumps; exits 0 only when both are taken.
+  execRun "tests/jcc_sign"
+  # Sub-width register ALU via explicit `(cast (u N) (reg))`: 32-bit ops
+  # zero-extend, 8/16-bit ops preserve the upper bits, flags at the operation
+  # width, shift counts masked to it, REX-sensitive byte registers (sil/r14b).
+  execRun "tests/alu_subwidth"
+  # Sized mem±reg ALU (32/8-bit add/or into a cast-typed slot; reg += mem32)
+  # and rotate-by-CL.
+  execRun "tests/alu_memreg"
+  # `(lenient)` proc pragma: backward jump, raw r11, bare (call P), tail (jmp P)
+  # inside one ported proc, called normally from a strict main.
+  execRun "tests/lenient_port"
+  # The xmm splice-glue shapes inside a lenient proc: raw rsp arithmetic for a
+  # spill area, movdqu save/restore through (mem (rsp) N), movfq gpr→xmm and
+  # punpcklqdq packing two quadwords for one 16-byte store.
+  execRun "tests/lenient_xmm"
+  # lea over the general mem forms with NAMED locals: base+index (`[a+a]`,
+  # `[a+b*4-3]`) and the no-base scaled form `(mem 0 a 8)` = `[a*8]`.
+  execRun "tests/lea_scaled"
   execRun "tests/pointer_field_at"
   execRun "tests/pointer_roundtrip"
   execExpectOutput("tests/string_pointer_field", "Hello\n")
@@ -594,6 +623,11 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_at_base_index_collision.
 execExpectFailure("nim c -r src/nifasm/nifasm tests/ptr_store_nonzero.nif", "cannot store the non-zero integer 32 into the pointer-typed destination")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/mem_slot_offset_range.nif", "offset 16 is outside stack slot 'buf.0' (16 bytes)")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/cast_dest_reg.nif", "Expected memory destination")
+# The sub-width width-cast destination is an ALU-only exception: `mov` keeps the
+# strict rule, so the pointer-store protection cannot be casted away.
+execExpectFailure("nim c -r src/nifasm/nifasm tests/mov_cast_dest_subwidth.nif", "Expected memory destination")
+# The same backward-jump shape WITHOUT the (lenient) pragma must stay rejected.
+execExpectFailure("nim c -r src/nifasm/nifasm tests/lenient_missing.nif", "backward jump to an already-defined label")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/missing_result_binding.nif", "Missing result binding: ret.0")
 # `(mov <stack slot> (res ret.0))` — a call result stored straight into its stack home.
 # This USED to be an expected failure, but only by accident: x86-64's mov check did not

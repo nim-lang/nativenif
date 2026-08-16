@@ -25,6 +25,9 @@ type
     scale*: int  # 1, 2, 4, or 8
     displacement*: int32
     hasIndex*: bool
+    noBase*: bool        # `[index*scale + disp32]` with NO base register (SIB
+                         # base=101 under mod=00). `base` must be left RAX so the
+                         # emitters' REX.B-from-base computations stay silent.
     useFsSegment*: bool  # Use FS segment register (for thread-local storage)
 
 # REX prefix encoding
@@ -75,6 +78,13 @@ proc emitMem(dest: var Bytes; reg: int; mem: MemoryOperand) =
   if mem.useFsSegment:
     dest.add(encodeModRM(amIndirect, reg, 0b100))   # mod=00, rm=100 → SIB follows
     dest.add(encodeSIB(1, 0b100, 0b101))            # index=none, base=none → [disp32]
+    dest.addt32(mem.displacement)
+    return
+  if mem.noBase:
+    # `[index*scale + disp32]`: mod=00 rm=100 → SIB, SIB.base=101 means "no base,
+    # disp32 follows" under mod=00 — the disp32 is mandatory even when zero.
+    dest.add(encodeModRM(amIndirect, reg, 0b100))
+    dest.add(encodeSIB(mem.scale, int(mem.index), 0b101))
     dest.addt32(mem.displacement)
     return
   # Emit ModRM (and SIB/Disp) for memory operand
@@ -429,6 +439,28 @@ proc emitImulImm*(dest: var Bytes; reg: Register; imm: int32) =
   dest.add(encodeModRM(amDirect, int(reg), int(reg)))
   dest.addt32(imm)
 
+proc emitImulImm3*(dest: var Bytes; dst, src: Register; imm: int32; bits: int) =
+  ## Three-operand IMUL: dst = src * imm (0x69 /r id, 0x6B /r ib when the
+  ## immediate fits a signed byte). `bits` 32 drops REX.W (result zero-extends).
+  if bits == 16: dest.add(0x66)
+  var rex = RexPrefix(w: bits >= 64)
+  if needsRex(dst): rex.r = true
+  if needsRex(src): rex.b = true
+  if rex.r or rex.b or rex.w:
+    dest.add(encodeRex(rex))
+  if imm >= -128 and imm <= 127:
+    dest.add(0x6B)
+    dest.add(encodeModRM(amDirect, int(dst), int(src)))
+    dest.add(byte(imm and 0xFF))
+  else:
+    dest.add(0x69)
+    dest.add(encodeModRM(amDirect, int(dst), int(src)))
+    if bits == 16:
+      dest.add(byte(imm and 0xFF))
+      dest.add(byte((imm shr 8) and 0xFF))
+    else:
+      dest.addt32(imm)
+
 # Additional arithmetic operations
 proc emitMul*(dest: var Bytes; reg: Register) =
   ## Emit MUL instruction: MUL reg (unsigned multiply)
@@ -641,6 +673,157 @@ proc emitCmpSized*(dest: var Bytes; reg: Register; mem: MemoryOperand; bits: int
   dest.add(if bits == 8: 0x3A else: 0x3B)       # CMP r8,r/m8 / CMP r,r/m(16|32)
   dest.emitMem(int(reg), mem)
 
+# ---- sub-width (8/16/32-bit) register ALU --------------------------------
+# One generic emitter per operand shape instead of a proc per instruction: the
+# whole classic ALU family shares its encoding scheme (MR opcode pair for
+# reg-reg, 0x80/0x81 /digit for reg-imm), differing only in the opcode bytes /
+# digit the caller passes. 32-bit ops zero-extend the destination, 8/16-bit
+# ops preserve its upper bits, flags are computed at the operation width —
+# i.e. exactly the hardware's sub-width semantics, which is the point.
+
+proc force8Rex(a: Register): bool {.inline.} =
+  ## SPL/BPL/SIL/DIL need a REX prefix in 8-bit operand position (a REX-less
+  ## encoding would address AH/CH/DH/BH instead).
+  int(a) in 4..7
+
+proc emitAluSizedRR*(dest: var Bytes; a, b: Register; opcMR8, opcMR: byte;
+                     bits: int) =
+  ## Sized reg-reg ALU in MR form: r/m = `a` (destination), reg = `b` (source).
+  ## `bits` ∈ {8,16,32}; 64-bit callers use the classic unsized emitters.
+  if bits == 16: dest.add(0x66)
+  var rex = RexPrefix(w: false)
+  if needsRex(b): rex.r = true
+  if needsRex(a): rex.b = true
+  if rex.r or rex.b or (bits == 8 and (force8Rex(a) or force8Rex(b))):
+    dest.add(encodeRex(rex))
+  dest.add(if bits == 8: opcMR8 else: opcMR)
+  dest.add(encodeModRM(amDirect, int(b), int(a)))
+
+proc emitAluImmSizedR*(dest: var Bytes; reg: Register; imm: int32; digit: int;
+                       bits: int) =
+  ## Sized reg-imm ALU: 0x80 (8-bit) / 0x81 (16/32-bit) /digit, with the
+  ## sign-extended-imm8 shortcut 0x83 where the value allows it. The caller
+  ## has range-checked `imm` against `bits`; only its low `bits` are encoded.
+  if bits == 16: dest.add(0x66)
+  var rex = RexPrefix(w: false)
+  if needsRex(reg): rex.b = true
+  if rex.b or (bits == 8 and force8Rex(reg)):
+    dest.add(encodeRex(rex))
+  if bits == 8:
+    dest.add(0x80)
+    dest.add(encodeModRM(amDirect, digit, int(reg)))
+    dest.add(byte(imm and 0xFF))
+  elif imm >= -128 and imm <= 127:
+    dest.add(0x83)
+    dest.add(encodeModRM(amDirect, digit, int(reg)))
+    dest.add(byte(imm and 0xFF))
+  else:
+    dest.add(0x81)
+    dest.add(encodeModRM(amDirect, digit, int(reg)))
+    if bits == 16:
+      dest.add(byte(imm and 0xFF))
+      dest.add(byte((imm shr 8) and 0xFF))
+    else:
+      dest.addt32(imm)
+
+proc emitBtxRR*(dest: var Bytes; a, b: Register; opc: byte; bits: int) =
+  ## Bit-test family with a REGISTER bit index: 0F A3 (bt) / AB (bts) /
+  ## B3 (btr) / BB (btc), r/m = `a` (the value), reg = `b` (the bit index,
+  ## taken modulo the operand width).
+  if bits == 16: dest.add(0x66)
+  var rex = RexPrefix(w: bits >= 64)
+  if needsRex(b): rex.r = true
+  if needsRex(a): rex.b = true
+  if rex.r or rex.b or rex.w:
+    dest.add(encodeRex(rex))
+  dest.add(0x0F)
+  dest.add(opc)
+  dest.add(encodeModRM(amDirect, int(b), int(a)))
+
+proc emitAluSizedMR*(dest: var Bytes; mem: MemoryOperand; reg: Register;
+                     opc8, opc: byte; bits: int) =
+  ## Sized ALU with a MEMORY destination and register source (MR form).
+  ## `bits` sizes the access — the sub-width twin of the already-sized
+  ## `emitAddImm(mem, imm, bits)` family; 64 works too (REX.W).
+  emitSegPrefix(dest, mem)
+  if bits == 16: dest.add(0x66)
+  var rex = RexPrefix(w: bits >= 64)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  if rex.r or rex.b or rex.x or rex.w or (bits == 8 and force8Rex(reg)):
+    dest.add(encodeRex(rex))
+  dest.add(if bits == 8: opc8 else: opc)
+  dest.emitMem(int(reg), mem)
+
+proc emitAluSizedRM*(dest: var Bytes; reg: Register; mem: MemoryOperand;
+                     opc8, opc: byte; bits: int) =
+  ## Sized ALU with a register destination and MEMORY source (RM form).
+  emitSegPrefix(dest, mem)
+  if bits == 16: dest.add(0x66)
+  var rex = RexPrefix(w: bits >= 64)
+  if needsRex(reg): rex.r = true
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  if rex.r or rex.b or rex.x or rex.w or (bits == 8 and force8Rex(reg)):
+    dest.add(encodeRex(rex))
+  dest.add(if bits == 8: opc8 else: opc)
+  dest.emitMem(int(reg), mem)
+
+proc emitTestSizedRR*(dest: var Bytes; a, b: Register; bits: int) =
+  ## TEST has its own opcodes (0x84/0x85) but the same MR shape.
+  emitAluSizedRR(dest, a, b, 0x84, 0x85, bits)
+
+proc emitTestImmSizedR*(dest: var Bytes; reg: Register; imm: int32; bits: int) =
+  ## TEST r/mN, immN — 0xF6/0xF7 /0; no imm8 shortcut exists for TEST.
+  if bits == 16: dest.add(0x66)
+  var rex = RexPrefix(w: false)
+  if needsRex(reg): rex.b = true
+  if rex.b or (bits == 8 and force8Rex(reg)):
+    dest.add(encodeRex(rex))
+  dest.add(if bits == 8: 0xF6 else: 0xF7)
+  dest.add(encodeModRM(amDirect, 0, int(reg)))
+  if bits == 8:
+    dest.add(byte(imm and 0xFF))
+  elif bits == 16:
+    dest.add(byte(imm and 0xFF))
+    dest.add(byte((imm shr 8) and 0xFF))
+  else:
+    dest.addt32(imm)
+
+proc emitShiftImmSizedR*(dest: var Bytes; reg: Register; count: int;
+                         digit: int; bits: int) =
+  ## Sized shift/rotate by immediate: 0xC0/0xC1 /digit (shl /4, shr /5, sar /7).
+  ## The hardware masks the count to the operand width (mod 32 for 8/16/32).
+  if bits == 16: dest.add(0x66)
+  var rex = RexPrefix(w: false)
+  if needsRex(reg): rex.b = true
+  if rex.b or (bits == 8 and force8Rex(reg)):
+    dest.add(encodeRex(rex))
+  dest.add(if bits == 8: 0xC0 else: 0xC1)
+  dest.add(encodeModRM(amDirect, digit, int(reg)))
+  dest.add(byte(count and 0xFF))
+
+proc emitShiftClSizedR*(dest: var Bytes; reg: Register; digit: int; bits: int) =
+  ## Sized shift/rotate by CL: 0xD2/0xD3 /digit.
+  if bits == 16: dest.add(0x66)
+  var rex = RexPrefix(w: false)
+  if needsRex(reg): rex.b = true
+  if rex.b or (bits == 8 and force8Rex(reg)):
+    dest.add(encodeRex(rex))
+  dest.add(if bits == 8: 0xD2 else: 0xD3)
+  dest.add(encodeModRM(amDirect, digit, int(reg)))
+
+proc emitUnarySizedR*(dest: var Bytes; reg: Register; digit: int; bits: int) =
+  ## Sized single-operand group 3: 0xF6/0xF7 /digit (NOT /2, NEG /3).
+  if bits == 16: dest.add(0x66)
+  var rex = RexPrefix(w: false)
+  if needsRex(reg): rex.b = true
+  if rex.b or (bits == 8 and force8Rex(reg)):
+    dest.add(encodeRex(rex))
+  dest.add(if bits == 8: 0xF6 else: 0xF7)
+  dest.add(encodeModRM(amDirect, digit, int(reg)))
+
 proc emitTest*(dest: var Bytes; a, b: Register) =
   ## Emit TEST instruction: TEST a, b (compute a AND b, set flags)
   ## Opcode 0x85: TEST r/m64, r64 - reg field is source, r/m field is destination
@@ -832,7 +1015,7 @@ proc emitSar*(dest: var Bytes; reg: Register; count: int) =
     dest.add(encodeModRM(amDirect, 7, int(reg)))  # /7 extension
     dest.add(byte(count))
 
-proc emitShiftCl(dest: var Bytes; reg: Register; ext: int) =
+proc emitShiftCl*(dest: var Bytes; reg: Register; ext: int) =
   ## Shift `reg` by the count in CL: `D3 /ext` (REX.W for 64-bit). `ext` selects the
   ## operation (4=shl/sal, 5=shr, 7=sar). The count lives in CL by ISA mandate.
   var rex = RexPrefix(w: true)
@@ -1168,6 +1351,7 @@ proc emitMovsdStore*(dest: var Bytes; mem: MemoryOperand; srcReg: XmmRegister) =
 proc emitMovdqu*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF3, 0x6F, int(destReg), int(srcReg))
 proc emitMovdquLoad*(dest: var Bytes; destReg: XmmRegister; mem: MemoryOperand) = emitSseRM(dest, 0xF3, 0x6F, int(destReg), mem)
 proc emitMovdquStore*(dest: var Bytes; mem: MemoryOperand; srcReg: XmmRegister) = emitSseRM(dest, 0xF3, 0x7F, int(srcReg), mem)
+proc emitPunpcklqdq*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0x66, 0x6C, int(destReg), int(srcReg))
 proc emitAddss*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF3, 0x58, int(destReg), int(srcReg))
 proc emitAddsd*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF2, 0x58, int(destReg), int(srcReg))
 proc emitSubss*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF3, 0x5C, int(destReg), int(srcReg))
