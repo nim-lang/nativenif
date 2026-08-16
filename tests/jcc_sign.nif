@@ -1,0 +1,31 @@
+(.nif27)
+(stmts
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (mov
+    (rbx)5)
+   (sub
+    (rbx)10)
+   (js neg.0)
+   (jmp fail.0)
+   (lab :neg.0)
+   (mov
+    (rbx)5)
+   (sub
+    (rbx)2)
+   (jns pos.0)
+   (jmp fail.0)
+   (lab :pos.0)
+   (mov
+    (rdi)0)
+   (jmp exit.0)
+   (lab :fail.0)
+   (mov
+    (rdi)1)
+   (lab :exit.0)
+   (mov
+    (rax)60)
+   (syscall))))
