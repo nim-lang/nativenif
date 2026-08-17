@@ -27,8 +27,9 @@
 ## fact lives only inside one sibling list, and the liveness question it needs
 ## is answered from the whole proc, not from the window.
 
-import std / [tables, assertions, strutils]
-import nifcore
+import std / [tables, sets, assertions, strutils, os, syncio]
+import nifcore, nifcoreparse
+import bodylib
 
 when defined(arkhamPeepDbg):
   import std / syncio
@@ -294,6 +295,128 @@ proc flagsDeadAfter(buf: var TokenBuf; after: Cursor): bool =
     inc steps
   result = steps < 64
 
+# ── whole-proc body replacement ("the cheat") ────────────────────────────────
+# `bodylib` holds distilled gcc -O3 bodies for a handful of known-hot procs,
+# keyed by a STRUCTURAL fingerprint of the proc arkham just generated. The
+# fingerprint is alpha-blind: every symbol DEFINED inside the proc (params,
+# result, locals, labels) is numbered by first occurrence instead of hashed by
+# name, so the global counters in `x.47`-style names cannot break a match.
+# Symbols NOT defined inside the proc (types, fields, called procs) keep their
+# names — a same-shaped proc over different types must not match.
+#
+# Fail-safe by construction: any codegen change alters the fingerprint and the
+# entry silently stops matching — the proc then just compiles as generated.
+# Refresh workflow: set ARKHAM_BODYFP=1, recompile the module, and copy the
+# printed `BODYFP` line for the proc into `bodylib.nim`.
+
+let bodyFpDump = getEnv("ARKHAM_BODYFP").len > 0
+
+proc fpDefs(buf: var TokenBuf; c: var Cursor; defs: var HashSet[SymId]) =
+  case c.kind
+  of SymbolDef:
+    defs.incl c.symId
+    inc c
+  of TagLit:
+    c.loopInto:
+      fpDefs(buf, c, defs)
+  else:
+    inc c
+
+proc fpMix(h: var uint64; s: string) {.inline.} =
+  for ch in s:
+    h = (h xor uint64(ch)) * 0x100000001b3'u64
+
+proc fpWalk(buf: var TokenBuf; c: var Cursor; defs: HashSet[SymId];
+            ids: var Table[SymId, int]; h: var uint64; toks: var int) =
+  inc toks
+  case c.kind
+  of TagLit:
+    fpMix h, "("
+    fpMix h, buf.tags.tagName(c.cursorTagId)
+    c.loopInto:
+      fpWalk(buf, c, defs, ids, h, toks)
+    fpMix h, ")"
+  of SymbolDef, Symbol:
+    let marker = if c.kind == SymbolDef: ":" else: "&"
+    if c.symId in defs:
+      let n = ids.mgetOrPut(c.symId, ids.len)
+      fpMix h, marker & $n
+    else:
+      # External name, hashed module-blind: the reader completes a trailing-dot
+      # symbol with the CURRENT module's suffix, so the same generic instance
+      # spells `seq.0.Izimvvd1.<moduleA>` in one build and `.<moduleB>` in the
+      # next. Drop that final segment (empty for a raw trailing-dot spelling,
+      # non-numeric for a completed one); a numeric final segment is an overload
+      # ordinal and stays.
+      var name = buf.pool.syms[c.symId]
+      let k = rfind(name, '.')
+      if k >= 0:
+        var numericTail = k < name.len - 1
+        for i in k + 1 ..< name.len:
+          if name[i] notin {'0' .. '9'}:
+            numericTail = false
+            break
+        if not numericTail: name.setLen k
+      fpMix h, "@" & name
+    inc c
+  of IntLit, UIntLit:
+    fpMix h, "#" & $c.intVal
+    inc c
+  else:
+    fpMix h, "|" & $c.kind
+    inc c
+
+proc procFingerprint(buf: var TokenBuf; procNode: Cursor): tuple[fp: uint64; toks: int] =
+  var defs = initHashSet[SymId]()
+  var d = procNode
+  fpDefs(buf, d, defs)
+  var ids = initTable[SymId, int]()
+  var h = 0xcbf29ce484222325'u64          # FNV-1a offset basis
+  var toks = 0
+  var w = procNode
+  fpWalk(buf, w, defs, ids, h, toks)
+  (h, toks)
+
+proc procDeclName(buf: var TokenBuf; procNode: Cursor): string =
+  var d = sub(procNode)
+  if d.hasMore and d.kind == SymbolDef:
+    result = buf.pool.syms[d.symId]
+  else:
+    result = "?"
+
+proc emitBodyReplacement(buf: var TokenBuf; c: var Cursor; dest: var TokenBuf;
+                         entry: int) =
+  ## Emit the proc at `c` with its header (name, params, result, clobber) kept
+  ## verbatim and its body swapped for the library's `(lenient)`-mode text.
+  dest.openTag c.cursorTagId
+  var child = 0
+  c.loopInto:
+    if child < 4:                # :name (params …) (result …) (clobber …)
+      dest.addSubtree c
+    skip c
+    inc child
+  var rep = parseFromBuffer(BodyLib[entry].body, "bodylib", 4096,
+                            buf.pool, buf.tags)
+  var rc = beginRead(rep)
+  var d = sub(rc)                # unwrap the `(stmts …)` shipping container
+  while d.hasMore:
+    dest.addSubtree d
+    skip d
+  endRead rc
+  dest.closeTag()
+
+proc matchBody(buf: var TokenBuf; procNode: Cursor): int =
+  ## Library index whose fingerprint matches the proc at `procNode`, or -1.
+  result = -1
+  if BodyLib.len == 0 and not bodyFpDump: return
+  let (fp, toks) = procFingerprint(buf, procNode)
+  if bodyFpDump:
+    stderr.writeLine "BODYFP " & procDeclName(buf, procNode) &
+      " fp=0x" & toHex(fp) & " toks=" & $toks
+  for i in 0 ..< BodyLib.len:
+    if BodyLib[i].fp == fp and BodyLib[i].toks == toks:
+      return i
+
 proc emitSubst(buf: var TokenBuf; c: var Cursor; dest: var TokenBuf; t, s: SymId) =
   ## Copy the node at `c`, replacing every read of `t` with `s`.
   case c.kind
@@ -319,6 +442,10 @@ proc trNode(buf: var TokenBuf; c: var Cursor; dest: var TokenBuf; occs: Occs;
             homes: Homes; folded: var int) =
   if c.kind == TagLit:
     if buf.tags.tagName(c.cursorTagId) == "proc":
+      let mi = matchBody(buf, c)
+      if mi >= 0:
+        emitBodyReplacement(buf, c, dest, mi)
+        return
       # Rescope the fact tables to THIS proc: locals of different procs share
       # names (`x.47`, `ap.1`, …), so module-wide tables poison almost every
       # register home and blur liveness across proc boundaries.

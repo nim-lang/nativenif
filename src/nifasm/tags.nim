@@ -494,6 +494,15 @@ type
     JnsTagId
     LenientTagId
     PunpcklqdqTagId
+    MovupdTagId
+    MovupsTagId
+    AddpdTagId
+    MulpdTagId
+    AddpsTagId
+    MulpsTagId
+    ShufpsTagId
+    RepstosbTagId
+    RepstosqTagId
 const
   TagData*: array[TagEnum, (string, int)] = [
     ("InvalidTagId", 0),
@@ -987,5 +996,14 @@ const
     ("js", 488),
     ("jns", 489),
     ("lenient", 490),
-    ("punpcklqdq", 491)
+    ("punpcklqdq", 491),
+    ("movupd", 492),
+    ("movups", 493),
+    ("addpd", 494),
+    ("mulpd", 495),
+    ("addps", 496),
+    ("mulps", 497),
+    ("shufps", 498),
+    ("repstosb", 499),
+    ("repstosq", 500)
   ]

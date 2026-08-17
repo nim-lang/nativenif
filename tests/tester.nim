@@ -507,6 +507,7 @@ exec "nim c -r src/nifasm/nifasm tests/alu_memreg.nif"
 exec "nim c -r src/nifasm/nifasm tests/lenient_port.nif"
 exec "nim c -r src/nifasm/nifasm tests/lenient_xmm.nif"
 exec "nim c -r src/nifasm/nifasm tests/lea_scaled.nif"
+exec "nim c -r src/nifasm/nifasm tests/packed_sse.nif"
 exec "nim c -r src/nifasm/nifasm tests/pointer_field_at.nif"
 exec "nim c -r src/nifasm/nifasm tests/pointer_roundtrip.nif"
 exec "nim c -r src/nifasm/nifasm tests/string_pointer_field.nif"
@@ -561,6 +562,10 @@ when defined(linux) and defined(amd64):
   # lea over the general mem forms with NAMED locals: base+index (`[a+a]`,
   # `[a+b*4-3]`) and the no-base scaled form `(mem 0 a 8)` = `[a*8]`.
   execRun "tests/lea_scaled"
+  # The packed-SSE vocabulary for the axpy vectorization plan: movupd/movups
+  # loads+stores, mulpd/addpd on 2 f64 lanes, mulps/addps on 4 f32 lanes,
+  # punpcklqdq f64 broadcast and shufps f32 broadcast; checks both lane sums.
+  execRun "tests/packed_sse"
   execRun "tests/pointer_field_at"
   execRun "tests/pointer_roundtrip"
   execExpectOutput("tests/string_pointer_field", "Hello\n")

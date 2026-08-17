@@ -73,6 +73,8 @@ let x64InstTags = tagsFor("X64Inst")   ## every instruction tag the model has
 
 # ------------------------------------------------------------------- plumbing
 
+var dangerMode* = false   ## --danger: build BOTH sides with -d:danger
+
 proc repoDir(): string =
   ## Repository root: the tool lives in <repo>/tools or <repo>/bin.
   result = getAppDir().parentDir
@@ -135,8 +137,11 @@ proc buildNative(src, work: string): tuple[elf: string; spans: seq[SymSpan]] =
   ## per-proc address spans recovered from the (symbol-table-free) binary.
   let nc = work / "nat"
   createDir nc
-  discard run(@[tool("nimony"), "n", "--silentMake", "--isMain", "--opt:speed",
-                "--nimcache:" & nc, src])
+  var cmd = @[tool("nimony"), "n", "--silentMake", "--isMain", "--opt:speed"]
+  if dangerMode: cmd.add "-d:danger"
+  cmd.add "--nimcache:" & nc
+  cmd.add src
+  discard run(cmd)
   var asmFiles: seq[string] = @[]
   for f in walkDirRec(nc):
     if f.endsWith(".asm.nif"): asmFiles.add f
@@ -231,6 +236,7 @@ proc buildGcc(src, work: string; extraFlags: seq[string]): string =
   createDir nc
   var cmd = @[tool("nimony"), "c", "--silentMake", "--isMain", "--opt:speed",
               "--passC:-O3"]
+  if dangerMode: cmd.add "-d:danger"
   cmd.add extraFlags
   cmd.add "--nimcache:" & nc
   cmd.add src
@@ -1325,18 +1331,38 @@ proc translateInsn(c: var TransCtx; ins: Insn) =
           # `lea r, [r + r*scale]` is just r * (scale+1) — 3-operand imul.
           c.emit "  (imul " & wdest & " " & d & " " & $(src.scale + 1) & ")"
           addImm(src.disp)
+        elif leaBits == 64:
+          # `lea r, [r + idx*scale + disp]` with a scaled index: no decomposition
+          # can avoid clobbering the base, but none is needed — nifasm's general
+          # SIB mem form spells the real instruction directly (and a real `lea`
+          # leaves EFLAGS alone, so no flags guard either).
+          c.emit "  (lea " & d & " (mem " & gccRegToNif(src.base) & " " &
+            gccRegToNif(idx) & " " & $src.scale &
+            (if src.disp != 0: " " & $src.disp else: "") & "))"
         else:
-          unsupported("lea-index-alias")   # would need a scratch register
+          unsupported("lea-index-alias")   # 32-bit alias form: would need zext care
       else:
         if dreg != idx: mov(idx)
         shlImm()
         addReg(src.base)
         addImm(src.disp)
   of "movq", "movd":
-    let tag = if m == "movq": "movfq" else: "movfd"
-    let (okD, d) = opToNif(c, ins.ops[0], ins.address)
-    let (okS, s) = opToNif(c, ins.ops[1], ins.address)
-    if okD and okS: c.emit "  (" & tag & " " & d & " " & s & ")"
+    let dst = ins.ops[0]
+    let src = ins.ops[1]
+    if dst.kind == opMem or src.kind == opMem:
+      # movq xmm↔mem64 moves 8 bytes and (on load) zeroes the high lane —
+      # bit-identical to movsd; movd xmm↔mem32 likewise matches movss.
+      let scalarTag = if m == "movq": "movsd" else: "movss"
+      let bits = if m == "movq": 64 else: 32
+      let (okD, d) = opToNif(c, dst, ins.address, bits)
+      let (okS, s) = opToNif(c, src, ins.address, bits)
+      if okD and okS: c.emit "  (" & scalarTag & " " & d & " " & s & ")"
+    else:
+      if dst.kind == opXmm: c.zeroXmm.excl dst.reg
+      let tag = if m == "movq": "movfq" else: "movfd"
+      let (okD, d) = opToNif(c, dst, ins.address)
+      let (okS, s) = opToNif(c, src, ins.address)
+      if okD and okS: c.emit "  (" & tag & " " & d & " " & s & ")"
   of "ucomisd", "ucomiss":
     # Same EFLAGS as the ordered compare; they differ only in NaN exception
     # signalling, which this code does not use.
@@ -1397,7 +1423,42 @@ proc translateInsn(c: var TransCtx; ins: Insn) =
       c.zeroXmm.incl ins.ops[0].reg
     else:
       unsupported("insn-" & m)
-  of "movups", "movaps", "movdqa", "movdqu":
+  of "addpd", "mulpd", "addps", "mulps":
+    # Packed float ALU — the model's tags are xmm-reg-only, exactly the forms
+    # gcc's vectorized kernels use.
+    if ins.ops.len == 2 and ins.ops[0].kind == opXmm and ins.ops[1].kind == opXmm:
+      c.zeroXmm.excl ins.ops[0].reg
+      c.emit "  (" & m & " " & gccRegToNif(ins.ops[0].reg) & " " &
+        gccRegToNif(ins.ops[1].reg) & ")"
+    else:
+      unsupported("insn-" & m & "-mem")
+  of "shufps":
+    if ins.ops.len == 3 and ins.ops[0].kind == opXmm and
+       ins.ops[1].kind == opXmm and ins.ops[2].kind == opImm:
+      c.zeroXmm.excl ins.ops[0].reg
+      c.emit "  (shufps " & gccRegToNif(ins.ops[0].reg) & " " &
+        gccRegToNif(ins.ops[1].reg) & " " & $ins.ops[2].imm & ")"
+    else:
+      unsupported("insn-shufps-form")
+  of "unpcklpd":
+    # unpcklpd D,S = [D.lo, S.lo] — bit-identical to punpcklqdq (the fp/int
+    # domain split is a scheduling hint, not a semantic one).
+    if ins.ops.len == 2 and ins.ops[0].kind == opXmm and ins.ops[1].kind == opXmm:
+      c.zeroXmm.excl ins.ops[0].reg
+      c.emit "  (punpcklqdq " & gccRegToNif(ins.ops[0].reg) & " " &
+        gccRegToNif(ins.ops[1].reg) & ")"
+    else:
+      unsupported("insn-unpcklpd-form")
+  of "movlps":
+    # movlps [mem],X stores X's LOW 8 bytes — exactly a movsd store. (The load
+    # form is NOT movsd: it merges instead of zeroing the high lane; bail.)
+    if ins.ops.len == 2 and ins.ops[0].kind == opMem and ins.ops[1].kind == opXmm:
+      let (okD, d) = opToNif(c, ins.ops[0], ins.address, 64)
+      if okD:
+        c.emit "  (movsd " & d & " " & gccRegToNif(ins.ops[1].reg) & ")"
+    else:
+      unsupported("insn-movlps-load")
+  of "movups", "movaps", "movdqa", "movdqu", "movupd":
     let dst = ins.ops[0]
     let src = ins.ops[1]
     if src.kind == opXmm and dst.kind == opMem and src.reg in c.zeroXmm:
@@ -2178,7 +2239,10 @@ proc main() =
   let cmd = args[0]
   var src = args[1]
   if not src.isAbsolute: src = getCurrentDir() / src
-  let rest = args[2..^1]
+  var rest = args[2..^1]
+  if "--danger" in rest:
+    dangerMode = true
+    rest = rest.filterIt(it != "--danger")
   case cmd
   of "compare":
     cmdCompare(src, if rest.len > 0: rest

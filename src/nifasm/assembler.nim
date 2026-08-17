@@ -6465,11 +6465,16 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     if dest.kind == okReg and dest.castBits != 0:
       genAluSubWidth(ctx, dest, op, saTest, start)
     elif dest.kind == okMem:
-      if op.kind != okReg:
-        error("TEST memory requires a register source", n)
-      # TEST mem, reg — sized by the memory operand's type (0x84/0x85 MR).
-      x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x84, 0x85,
-                         intMemAccess(dest.typ).bits)
+      if op.kind == okImm:
+        # TEST mem, imm — 0xF6/0xF7 /0, sized by the memory operand's type.
+        x86.emitTestImmSizedM(ctx.buf.data, dest.mem, int32(op.immVal),
+                              intMemAccess(dest.typ).bits)
+      elif op.kind == okReg:
+        # TEST mem, reg — sized by the memory operand's type (0x84/0x85 MR).
+        x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x84, 0x85,
+                           intMemAccess(dest.typ).bits)
+      else:
+        error("TEST memory requires a register or immediate source", n)
     elif op.kind == okImm:
       # emitTestImm
       error("TEST immediate not supported yet", n)
@@ -6967,6 +6972,14 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     x86.emitNop(ctx.buf.data)
   of CasejmpX64:
     genCasejmpX64(n, ctx)
+  of RepstosbX64, RepstosqX64:
+    # `rep stos`: fills `rcx` units at `[rdi]` with al/rax, advancing rdi and
+    # zeroing rcx — record those clobbers like the `rep movs` family below.
+    let stosOp = n.tag
+    inc n
+    ctx.clobbered.incl {x86.RDI, x86.RCX}
+    if stosOp == RepstosbTagId: x86.emitRepStosb(ctx.buf.data)
+    else:                       x86.emitRepStosq(ctx.buf.data)
   of RepmovsbX64, RepmovswX64, RepmovsdX64, RepmovsqX64:
     # The `rep movs` family names NONE of its operands in the tree: it copies `rcx`
     # units from `[rsi]` to `[rdi]`, advancing both pointers and leaving `rcx` at 0.
@@ -7017,14 +7030,23 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
 
   of MovapdX64:
-    # (movapd dest src)
+    # `(movapd D S)`: aligned 128-bit float move, one side may be memory —
+    # same shape as movdqu; the aligned form faults on a misaligned address.
     inc n
-    let dest = parseDest(n, ctx) # Should check if XMM
-    let op = parseOperand(n, ctx) # Should check if XMM/Mem
-    # Need to support XMM registers in parseRegister/Operand
-    # And emitMovapd (likely similar to movsd but packed)
-    # For now, placeholder error or implement if x86 supports it
-    error("MOVAPD not supported yet", n)
+    if isXmmOperand(n, ctx):
+      let d = parseXmmOperand(n, ctx)
+      if isXmmOperand(n, ctx):
+        let s = parseXmmOperand(n, ctx)
+        x86.emitMovapd(ctx.buf.data, d, s)
+      else:
+        let s = parseOperand(n, ctx)
+        if s.kind != okMem: error("movapd source must be xmm or memory", n)
+        x86.emitMovapdLoad(ctx.buf.data, d, s.mem)
+    else:
+      let d = parseOperand(n, ctx)
+      if d.kind != okMem: error("movapd destination must be xmm or memory", n)
+      let s = parseXmmOperand(n, ctx)
+      x86.emitMovapdStore(ctx.buf.data, d.mem, s)
   of MovsdX64, MovssX64:
     # `(movsd D S)`: a scalar-float move where one side may be memory:
     #   (movsd (xmmD) (xmmS))   reg→reg ;  (movsd (xmmD) (mem …))  load
@@ -7081,6 +7103,52 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let s = parseXmmOperand(n, ctx)
     x86.emitPunpcklqdq(ctx.buf.data, d, s)
 
+  of MovupdX64, MovupsX64:
+    # `(movupd D S)` / `(movups D S)`: unaligned 128-bit float move, one side may
+    # be memory. Like `movdqu`, the access is inherently 16 bytes and the mem
+    # operand's declared scalar type is not consulted.
+    let packedSingle = instTag == MovupsX64
+    inc n
+    if isXmmOperand(n, ctx):
+      let d = parseXmmOperand(n, ctx)
+      if isXmmOperand(n, ctx):
+        let s = parseXmmOperand(n, ctx)
+        if packedSingle: x86.emitMovups(ctx.buf.data, d, s)
+        else: x86.emitMovupd(ctx.buf.data, d, s)
+      else:
+        let s = parseOperand(n, ctx)
+        if s.kind != okMem: error("movupd/movups source must be xmm or memory", n)
+        if packedSingle: x86.emitMovupsLoad(ctx.buf.data, d, s.mem)
+        else: x86.emitMovupdLoad(ctx.buf.data, d, s.mem)
+    else:
+      let d = parseOperand(n, ctx)
+      if d.kind != okMem: error("movupd/movups destination must be xmm or memory", n)
+      let s = parseXmmOperand(n, ctx)
+      if packedSingle: x86.emitMovupsStore(ctx.buf.data, d.mem, s)
+      else: x86.emitMovupdStore(ctx.buf.data, d.mem, s)
+
+  of AddpdX64, MulpdX64, AddpsX64, MulpsX64:
+    # Packed float ALU — xmm registers only.
+    inc n
+    let d = parseXmmOperand(n, ctx)
+    let s = parseXmmOperand(n, ctx)
+    case instTag
+    of AddpdX64: x86.emitAddpd(ctx.buf.data, d, s)
+    of MulpdX64: x86.emitMulpd(ctx.buf.data, d, s)
+    of AddpsX64: x86.emitAddps(ctx.buf.data, d, s)
+    else: x86.emitMulps(ctx.buf.data, d, s)
+
+  of ShufpsX64:
+    # `(shufps D S N)`: xmm registers + an 8-bit immediate lane selector.
+    inc n
+    let d = parseXmmOperand(n, ctx)
+    let s = parseXmmOperand(n, ctx)
+    if n.kind != IntLit: error("shufps needs an integer immediate", n)
+    let imm = getInt(n)
+    if imm < 0 or imm > 255: error("shufps immediate out of range", n)
+    inc n
+    x86.emitShufps(ctx.buf.data, d, s, byte(imm))
+
   of AddsdX64, AddssX64, SubsdX64, SubssX64,
      MulsdX64, MulssX64, DivsdX64, DivssX64, Cvtsd2ssX64, Cvtss2sdX64,
      ComisdX64, ComissX64:
@@ -7089,21 +7157,41 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let it = instTag
     inc n
     let d = parseXmmOperand(n, ctx)
-    let s = parseXmmOperand(n, ctx)
-    case it
-    of AddsdX64:   x86.emitAddsd(ctx.buf.data, d, s)
-    of AddssX64:   x86.emitAddss(ctx.buf.data, d, s)
-    of SubsdX64:   x86.emitSubsd(ctx.buf.data, d, s)
-    of SubssX64:   x86.emitSubss(ctx.buf.data, d, s)
-    of MulsdX64:   x86.emitMulsd(ctx.buf.data, d, s)
-    of MulssX64:   x86.emitMulss(ctx.buf.data, d, s)
-    of DivsdX64:   x86.emitDivsd(ctx.buf.data, d, s)
-    of DivssX64:   x86.emitDivss(ctx.buf.data, d, s)
-    of Cvtsd2ssX64: x86.emitCvtsd2ss(ctx.buf.data, d, s)
-    of Cvtss2sdX64: x86.emitCvtss2sd(ctx.buf.data, d, s)
-    of ComisdX64:  x86.emitComisd(ctx.buf.data, d, s)
-    of ComissX64:  x86.emitComiss(ctx.buf.data, d, s)
-    else: discard
+    if isXmmOperand(n, ctx):
+      let s = parseXmmOperand(n, ctx)
+      case it
+      of AddsdX64:   x86.emitAddsd(ctx.buf.data, d, s)
+      of AddssX64:   x86.emitAddss(ctx.buf.data, d, s)
+      of SubsdX64:   x86.emitSubsd(ctx.buf.data, d, s)
+      of SubssX64:   x86.emitSubss(ctx.buf.data, d, s)
+      of MulsdX64:   x86.emitMulsd(ctx.buf.data, d, s)
+      of MulssX64:   x86.emitMulss(ctx.buf.data, d, s)
+      of DivsdX64:   x86.emitDivsd(ctx.buf.data, d, s)
+      of DivssX64:   x86.emitDivss(ctx.buf.data, d, s)
+      of Cvtsd2ssX64: x86.emitCvtsd2ss(ctx.buf.data, d, s)
+      of Cvtss2sdX64: x86.emitCvtss2sd(ctx.buf.data, d, s)
+      of ComisdX64:  x86.emitComisd(ctx.buf.data, d, s)
+      of ComissX64:  x86.emitComiss(ctx.buf.data, d, s)
+      else: discard
+    else:
+      # Folded memory source: `op xmm, m32/m64` — same opcode bytes, RM form.
+      let s = parseOperand(n, ctx)
+      if s.kind != okMem:
+        error("scalar SSE source must be an xmm register or memory", n)
+      let (prefix, opcode) = case it
+        of AddsdX64:    (0xF2u8, 0x58u8)
+        of AddssX64:    (0xF3u8, 0x58u8)
+        of SubsdX64:    (0xF2u8, 0x5Cu8)
+        of SubssX64:    (0xF3u8, 0x5Cu8)
+        of MulsdX64:    (0xF2u8, 0x59u8)
+        of MulssX64:    (0xF3u8, 0x59u8)
+        of DivsdX64:    (0xF2u8, 0x5Eu8)
+        of DivssX64:    (0xF3u8, 0x5Eu8)
+        of Cvtsd2ssX64: (0xF2u8, 0x5Au8)
+        of Cvtss2sdX64: (0xF3u8, 0x5Au8)
+        of ComisdX64:   (0x66u8, 0x2Fu8)
+        else:           (0x00u8, 0x2Fu8)   # ComissX64
+      x86.emitSseOpMem(ctx.buf.data, prefix, opcode, d, s.mem)
 
   of Cvtsi2sdX64, Cvtsi2ssX64:
     # int -> float: `(cvtsi2sd (xmmD) gprS)`; the GPR source may be a named local.
@@ -7126,14 +7214,21 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
   of MovfqX64, MovfdX64:
     # Bit-transfer between a GPR and an XMM register; direction by operand kinds.
     # `(movfq (xmmD) gprS)` = gpr→xmm; `(movfq gprD (xmmS))` = xmm→gpr. The GPR
-    # side may be a raw register or a named local.
+    # side may be a raw register or a named local. `(movfq (xmmD) (xmmS))` is the
+    # SSE `movq xmm,xmm` (F3 0F 7E): D.lo = S.lo, D's HIGH lane zeroed — the lane
+    # sanitizer gcc emits before packed ops on a scalar value (movfq only).
     let it = instTag
     inc n
     if isXmmOperand(n, ctx):
       let d = parseXmmOperand(n, ctx)
-      let s = parseOperand(n, ctx).reg
-      if it == MovfqX64: x86.emitMovqGprToXmm(ctx.buf.data, d, s)
-      else:              x86.emitMovdGprToXmm(ctx.buf.data, d, s)
+      if isXmmOperand(n, ctx):
+        if it != MovfqX64: error("movfd between two xmm registers is not encodable", n)
+        let s = parseXmmOperand(n, ctx)
+        x86.emitMovqXmmToXmm(ctx.buf.data, d, s)
+      else:
+        let s = parseOperand(n, ctx).reg
+        if it == MovfqX64: x86.emitMovqGprToXmm(ctx.buf.data, d, s)
+        else:              x86.emitMovdGprToXmm(ctx.buf.data, d, s)
     else:
       let d = parseDest(n, ctx).reg
       let s = parseXmmOperand(n, ctx)

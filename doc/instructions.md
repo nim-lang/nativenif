@@ -77,7 +77,7 @@
 | `(cvtss2sd D S)`       | X64Inst                  | scalar single -> scalar double convert |
 | `(comisd D S)`         | X64Inst                  | compare scalar double, set EFLAGS |
 | `(comiss D S)`         | X64Inst                  | compare scalar single, set EFLAGS |
-| `(movfq D S)`          | X64Inst                  | move 64 bits between gpr and xmm |
+| `(movfq D S)`          | X64Inst                  | move 64 bits between gpr and xmm; `(movfq (xmmD) (xmmS))` is SSE `movq xmm,xmm` — D.lo = S.lo with D's high lane ZEROED (gcc's lane sanitizer before packed ops) |
 | `(movfd D S)`          | X64Inst                  | move 32 bits between gpr and xmm |
 | `(and D S)`            | X64Inst, A64Inst         | bitwise and |
 | `(or D S)`             | X64Inst                  | bitwise or |
@@ -491,3 +491,12 @@
 | `(jns L)`             | X64Inst                     | jump if not sign (SF=0) |
 | `(lenient)`           | NifasmDecl                  | proc pragma (after the clobber section): the body is MACHINE-PORTED code (e.g. distilled from gcc), so the structural disciplines are off for this one proc — backward jumps to labels are allowed (no `(loop)` required), registers may be used raw even when bound (params, r11), a bare `(call P)`/`(jmp P)` to a proc needs no `(prepare)`, and the type/clobber checks are skipped. The checks exist to catch code-GENERATOR bugs; ported code was already correct on the machine it came from |
 | `(punpcklqdq D S)`    | X64Inst                     | interleave low quadwords: D = [D.lo, S.lo] (xmm registers only; `(punpcklqdq X X)` broadcasts X's low quadword to both halves) |
+| `(movupd D S)`        | X64Inst                     | move unaligned packed double (xmm/mem either side; the access is inherently 16 bytes — the mem operand's scalar type is not consulted, matching the hardware) |
+| `(movups D S)`        | X64Inst                     | move unaligned packed single (xmm/mem either side; 16-byte access like `movupd`) |
+| `(addpd D S)`         | X64Inst                     | packed double add, 2 lanes (xmm registers only) |
+| `(mulpd D S)`         | X64Inst                     | packed double multiply, 2 lanes (xmm registers only) |
+| `(addps D S)`         | X64Inst                     | packed single add, 4 lanes (xmm registers only) |
+| `(mulps D S)`         | X64Inst                     | packed single multiply, 4 lanes (xmm registers only) |
+| `(shufps D S N)`      | X64Inst                     | shuffle packed singles: each of D's 4 lanes picks a source lane by the 2-bit fields of immediate N (low two from D, high two from S); `(shufps X X 0)` broadcasts lane 0 to all 4 |
+| `(repstosb)`          | X64Inst                     | repeat store byte string: fills `rcx` bytes at `[rdi]` with `al`, advancing `rdi`; `rcx` ends 0 (DF=0 per SysV) |
+| `(repstosq)`          | X64Inst                     | repeat store qword string: fills `rcx` qwords at `[rdi]` with `rax`, advancing `rdi`; `rcx` ends 0 |

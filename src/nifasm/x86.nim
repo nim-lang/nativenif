@@ -774,6 +774,24 @@ proc emitTestSizedRR*(dest: var Bytes; a, b: Register; bits: int) =
   ## TEST has its own opcodes (0x84/0x85) but the same MR shape.
   emitAluSizedRR(dest, a, b, 0x84, 0x85, bits)
 
+proc emitTestImmSizedM*(dest: var Bytes; mem: MemoryOperand; imm: int32; bits: int) =
+  ## TEST mN, immN — 0xF6/0xF7 /0 with a memory operand.
+  emitSegPrefix(dest, mem)
+  if bits == 16: dest.add(0x66)
+  var rex = RexPrefix(w: bits >= 64)
+  if needsRex(mem.base): rex.b = true
+  if mem.hasIndex and needsRex(mem.index): rex.x = true
+  if rex.b or rex.x or rex.w: dest.add(encodeRex(rex))
+  dest.add(if bits == 8: 0xF6 else: 0xF7)
+  dest.emitMem(0, mem)
+  if bits == 8:
+    dest.add(byte(imm and 0xFF))
+  elif bits == 16:
+    dest.add(byte(imm and 0xFF))
+    dest.add(byte((imm shr 8) and 0xFF))
+  else:
+    dest.addt32(imm)
+
 proc emitTestImmSizedR*(dest: var Bytes; reg: Register; imm: int32; bits: int) =
   ## TEST r/mN, immN — 0xF6/0xF7 /0; no imm8 shortcut exists for TEST.
   if bits == 16: dest.add(0x66)
@@ -1352,6 +1370,27 @@ proc emitMovdqu*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest
 proc emitMovdquLoad*(dest: var Bytes; destReg: XmmRegister; mem: MemoryOperand) = emitSseRM(dest, 0xF3, 0x6F, int(destReg), mem)
 proc emitMovdquStore*(dest: var Bytes; mem: MemoryOperand; srcReg: XmmRegister) = emitSseRM(dest, 0xF3, 0x7F, int(srcReg), mem)
 proc emitPunpcklqdq*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0x66, 0x6C, int(destReg), int(srcReg))
+proc emitMovqXmmToXmm*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF3, 0x7E, int(destReg), int(srcReg))
+proc emitMovapd*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0x66, 0x28, int(destReg), int(srcReg))
+proc emitMovapdLoad*(dest: var Bytes; destReg: XmmRegister; mem: MemoryOperand) = emitSseRM(dest, 0x66, 0x28, int(destReg), mem)
+proc emitMovapdStore*(dest: var Bytes; mem: MemoryOperand; srcReg: XmmRegister) = emitSseRM(dest, 0x66, 0x29, int(srcReg), mem)
+proc emitSseOpMem*(dest: var Bytes; prefix, opcode: byte; reg: XmmRegister; mem: MemoryOperand) =
+  ## Generic `[prefix] 0F <opcode> xmm, m` — the folded-memory-source form of
+  ## the scalar/packed SSE ALU family (same opcode bytes as the RR form).
+  emitSseRM(dest, prefix, opcode, int(reg), mem)
+proc emitMovupd*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0x66, 0x10, int(destReg), int(srcReg))
+proc emitMovupdLoad*(dest: var Bytes; destReg: XmmRegister; mem: MemoryOperand) = emitSseRM(dest, 0x66, 0x10, int(destReg), mem)
+proc emitMovupdStore*(dest: var Bytes; mem: MemoryOperand; srcReg: XmmRegister) = emitSseRM(dest, 0x66, 0x11, int(srcReg), mem)
+proc emitMovups*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0x00, 0x10, int(destReg), int(srcReg))
+proc emitMovupsLoad*(dest: var Bytes; destReg: XmmRegister; mem: MemoryOperand) = emitSseRM(dest, 0x00, 0x10, int(destReg), mem)
+proc emitMovupsStore*(dest: var Bytes; mem: MemoryOperand; srcReg: XmmRegister) = emitSseRM(dest, 0x00, 0x11, int(srcReg), mem)
+proc emitAddpd*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0x66, 0x58, int(destReg), int(srcReg))
+proc emitMulpd*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0x66, 0x59, int(destReg), int(srcReg))
+proc emitAddps*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0x00, 0x58, int(destReg), int(srcReg))
+proc emitMulps*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0x00, 0x59, int(destReg), int(srcReg))
+proc emitShufps*(dest: var Bytes; destReg, srcReg: XmmRegister; imm: byte) =
+  emitSseRR(dest, 0x00, 0xC6, int(destReg), int(srcReg))
+  dest.add(imm)
 proc emitAddss*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF3, 0x58, int(destReg), int(srcReg))
 proc emitAddsd*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF2, 0x58, int(destReg), int(srcReg))
 proc emitSubss*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF3, 0x5C, int(destReg), int(srcReg))
@@ -2098,6 +2137,14 @@ proc emitNop*(dest: var Bytes) =
   dest.add(0x90)
 
 # REP MOVS string copy instructions
+proc emitRepStosb*(dest: var Bytes) =
+  ## F3 AA — rep stosb: fill rcx bytes at [rdi] with al.
+  dest.add(0xF3); dest.add(0xAA)
+
+proc emitRepStosq*(dest: var Bytes) =
+  ## F3 REX.W AB — rep stosq: fill rcx qwords at [rdi] with rax.
+  dest.add(0xF3); dest.add(0x48); dest.add(0xAB)
+
 proc emitRepMovsb*(dest: var Bytes) =
   ## Emit REP MOVSB instruction
   dest.add(0xF3)
