@@ -469,6 +469,11 @@ proc emScalarLoad(g: var CodeGen; dest: Reg; name: string) =
 
 proc emScalarStore(g: var CodeGen; name: string; src: Reg) =
   ## `[slot] ← src` — store to a spilled scalar's `(s)` var.
+  ##
+  ## THE invalidation point for a store: whatever mirrored this slot's old value
+  ## is stale from here on. It sits at the lowest level on purpose — every scalar
+  ## store to a slot funnels through here, so no store path can forget it.
+  g.killMirrorsOf name
   g.ab.tree MovA64: (g.ab.sym name; g.emReg src)
 
 proc emBindType(g: var CodeGen; typ: AsmSlot) =
@@ -495,6 +500,10 @@ proc bindTemp(g: var CodeGen; r: Reg; typ: AsmSlot) =
     g.emBindType(typ)
     g.ab.reg r
   g.rb.bindScratch(r, name, g.slotIsPointer(typ))
+  g.tmpBindTyp[r] = typ                 # what the register is TYPED as, for a later
+                                        # `(rebind …)` and for `mirrorStored`, which
+                                        # may only forward a value whose binding type
+                                        # is the slot's own (x64's `bindTemp` twin)
 
 proc unbindTemp(g: var CodeGen; r: Reg) =
   ## Release a scratch binding made by `bindTemp`: `(kill)` the name and drop the
@@ -522,6 +531,7 @@ proc emFloatScalarLoad(g: var CodeGen; dest: FReg; name: string; bits: int) =
 
 proc emFloatScalarStore(g: var CodeGen; name: string; src: FReg; bits: int) =
   ## `[slot] ← src` — store to a spilled float's `(s)` var.
+  g.killMirrorsOf name                                  # see `emScalarStore`
   g.ab.tree FstrA64: (g.ab.sym name; g.emFReg(src, bits))
 
 # MODEL: the `pickStaging` action in proofs/arkham_bindings.tla — only ever returns a
@@ -563,7 +573,17 @@ proc emGlobalAddr(g: var CodeGen; dest: Reg; name: string) =
   ## address). AArch64 has no typed PC-relative memory operand, so a global is
   ## always accessed by first materializing its address. An importc/exportc gvar is
   ## referenced by its bare C name (cross-module linkage), like on x86-64.
-  g.emAdr(dest, g.prog.gvarRefName(name))
+  ##
+  ## THE read side of the ADDRESS mirrors: when a register in this straight-line
+  ## region still holds `&name`, the two-instruction materialization collapses to
+  ## one `mov`. This is the whole reason address mirrors exist on AArch64 and not
+  ## on x86-64, where the address is a single RIP-relative `lea` and copying one
+  ## register to another would save nothing.
+  let asmName = g.prog.gvarRefName(name)
+  g.killMirror(dest)                            # `dest` is written either way
+  let m = g.rb.addrMirror(asmName)
+  if m != NoReg and m != dest: g.movReg(dest, m)
+  else: g.emAdr(dest, asmName)
 
 proc rebindLocalAs(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   ## Re-establish register `r`'s binding to the named local `name`, retyped to
@@ -1075,6 +1095,13 @@ proc freshLabel(g: var CodeGen): string =
   inc g.labelCount
 
 proc emLab(g: var CodeGen; name: string) =
+  ## THE control-flow invalidation point for the store-forwarding mirrors: what a
+  ## register holds at a label does not follow from the instructions above it —
+  ## some other path branched here. Hooking it at the label DEFINITION rather
+  ## than at each of `if`/`case`/`and`/`or` is what makes this one line instead
+  ## of a survey: arkham emits no merge point that is not a label. (The one
+  ## exception is `(loop …)`, whose back edge nifasm emits internally.)
+  g.killAllMirrors()
   g.ab.tree LabA64: g.ab.symDef name        # (lab :L)
 
 proc emBr(g: var CodeGen; tag: A64Inst; name: string) =
@@ -1084,7 +1111,12 @@ template emitLoop(g: var CodeGen; body: untyped) =
   ## Structured infinite loop `(loop (stmts …))`: nifasm emits the back-edge INTERNALLY,
   ## so no backward branch reaches the asm-NIF (keeps "every branch forward, back-edges
   ## are loops" true). `body` must branch FORWARD to a break/exit label defined AFTER the
-  ## loop. (a64 has no reg-mirror cache — nothing else to manage, unlike x64's `emitLoop`.)
+  ## loop.
+  ##
+  ## The implicit back edge is why the store-forwarding mirrors are cleared here: the
+  ## top of the body is a merge point with no label of its own, so nothing a register
+  ## held before the loop may be assumed inside it.
+  g.killAllMirrors()
   g.ab.tree LoopA64:
     g.ab.tree StmtsA64:
       body
@@ -1419,7 +1451,7 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
 proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitLvalue2(g: var CodeGen; c: Cursor; globBase = dontCare; isStore = false)
-proc freeLvalTemps2(g: var CodeGen; c: Cursor)
+proc freeLvalTemps2(g: var CodeGen; c: Cursor; addrIntact = false)
 proc resolveLvalVal(g: var CodeGen; c: Cursor; dest: var Location)
 proc produceIntoMem2(g: var CodeGen; c: Cursor; dst: Location)
 proc produceIntoFMem2(g: var CodeGen; c: Cursor; dst: Location)
@@ -1529,10 +1561,12 @@ proc pickStagingA64(g: var CodeGen): Reg =
   ## `pickStagingScratch`'s reasoning, ported.
   ##
   ## A register carrying ANY binding — a live local or an anonymous in-flight temp —
-  ## is still refused, so nothing owned can be clobbered.
+  ## is still refused, so nothing owned can be clobbered. A MIRROR is not owned
+  ## (`RegMapping` rule 1): its value is still in memory, and `releaseStaleName`
+  ## below retires it as the register is handed over.
   for r in g.md.intTempRegs:
     if r notin g.pickedRegs and not g.plan.isSealed(r) and not g.rb.isAccum(r) and
-       not g.rb.isBound(r):
+       (not g.rb.isBound(r) or g.rb.isMirror(r)):
       g.releaseStaleName(r); return r
   for r in g.md.intCalleeSaved:
     if r notin g.pickedRegs and not g.plan.isSealed(r) and not g.rb.isAccum(r) and
@@ -1578,12 +1612,17 @@ proc freeVal(g: var CodeGen; loc: Location) {.inline.} =
   ## Release a reserved/resolved temp — the emit-time `releaseTmp`: clear the
   ## pick flag and, if a consumer bound it, `(kill)` the binding. A no-op for
   ## every other location kind.
+  ##
+  ## A register that has become a MIRROR was already released — by the store that
+  ## made it one — and its binding is now the map's, not this value's. Killing it
+  ## here would undo the forwarding at the very moment it becomes useful (the
+  ## caller of `storeScalar2` frees the value it just stored).
   if loc.kind == InReg and loc.isTemp:
     g.pickedRegs.excl loc.r
-    g.unbindTemp(loc.r)
+    if not g.rb.isMirror(loc.r): g.unbindTemp(loc.r)
   elif loc.kind == InFReg and loc.isTemp:
     g.pickedFRegs.excl loc.f
-    g.unbindFTmp(loc.f)
+    if not g.rb.isFMirror(loc.f): g.unbindFTmp(loc.f)
 
 proc resolveDestE(g: var CodeGen; dest: var Location; natural: Location) =
   ## Resolve a LEAF destination constraint against the value's natural location
@@ -1650,6 +1689,13 @@ proc place2(g: var CodeGen; src: Location; dest: Reg) =
   ## `dest ← <scalar Location src>`. The pure-emit analogue of `emitLoad`: a
   ## global/threadvar address is formed straight into `dest` (no borrowed temp),
   ## a complex lvalue routes through the `*2` address machinery.
+  ##
+  ## `dest` is about to be WRITTEN, so whatever it mirrored is stale — and a
+  ## memory `src` may still be in a register, which turns the load into a move.
+  ## The invalidation is the half that is not optional.
+  let src = g.forwardOf(src)
+  if src.kind == InReg and src.r == dest: (g.killMirror(dest); return)  # already there
+  g.killMirror(dest)
   case src.kind
   of InReg: g.movReg(dest, src.r)
   of Imm: g.placeImm(dest, src)
@@ -2017,8 +2063,17 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
       # a module-level global aggregate base: `lea reg, &g` into the address register
       # the walk reserved (fused: a lazy-bound pick — bind it here, at
       # materialization; pre-fuse it was bound by the caller).
+      #
+      # Ask the address mirrors BEFORE binding, because binding retires them: when
+      # the walk's pick landed on the very register that still holds `&g` — which is
+      # exactly what happens for a run of accesses to the same global, since a
+      # mirror leaves its register allocatable — the materialization is already
+      # done and costs NOTHING. Otherwise `emGlobalAddr` still turns the `adrp`+`add`
+      # into a `mov` off the mirroring register.
+      let already = g.lookupSym(symName(c)).cat == scGlobal and
+                    g.rb.addrMirror(g.prog.gvarRefName(symName(c))) == loc.r
       if loc.isTemp and not g.rb.isBoundTemp(loc.r): g.bindTemp(loc.r, ScalarSlot)
-      g.emGlobalAddr(loc.r, symName(c))
+      if not already: g.emGlobalAddr(loc.r, symName(c))
     else:
       let home = g.plan.homeOfSym(symName(c))
       if home.kind == StackPtr:                # the slot holds &aggregate: load it first
@@ -2664,7 +2719,9 @@ proc storeScalar2(g: var CodeGen; dst, v: Location) =
         g.dropFBridge()
       elif v.kind == InFReg:
         g.emFloatScalarStore(dst.name, v.f, bits)
-        if v.isTemp: g.unbindFTmp(v.f)
+        # The register still holds what the slot now holds: keep that instead of
+        # killing the binding, and the next read of `dst` comes from the register.
+        if v.isTemp and not g.mirrorFStored(v.f, dst): g.unbindFTmp(v.f)
       else: raiseAssert "arkham a64n: float scalar store rhs " & $v.kind
     else:
       if need.gprs > 0:
@@ -2674,7 +2731,7 @@ proc storeScalar2(g: var CodeGen; dst, v: Location) =
         g.dropBridge b
       elif v.kind == InReg:
         g.emScalarStore(dst.name, v.r)
-        if v.isTemp: g.unbindTemp(v.r)
+        if v.isTemp and not g.mirrorStored(v.r, dst): g.unbindTemp(v.r)
       else: raiseAssert "arkham a64n: scalar store rhs " & $v.kind
   else: raiseAssert "arkham a64n: scalar store dst " & $dst.kind
 
@@ -3480,7 +3537,10 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
         if vBridge != NoReg: g.dropBridge vBridge
         elif v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
       g.unbindLvalTemps2(lhs)
-      g.freeLvalTemps2(lhs)
+      # A STORE: the `(mem …)` was the destination operand, so every register in
+      # the address was only read and a global base still holds `&g` — keep it as
+      # an address mirror for the next access to the same global.
+      g.freeLvalTemps2(lhs, addrIntact = true)
     if globScratch != NoReg: g.unbindTemp(globScratch)
     g.freeVal(globHeld)
   elif dst.kind == Field:                                    # a field within an aggregate
@@ -3721,21 +3781,34 @@ proc emitLvalue2(g: var CodeGen; c: Cursor; globBase = dontCare; isStore = false
   var n = c
   g.emitLvalWalk(n, globBase, isStore)
 
-proc freeLvalTemps2(g: var CodeGen; c: Cursor) =
+proc freeLvalTemps2(g: var CodeGen; c: Cursor; addrIntact = false) =
   ## FUSED port of `releaseLvalTemps`: release the reserved picks of an
   ## lvalue's address computation — computed index/pointer temps, the a64
   ## stride scratch, and a global-base temp. (`unbindLvalTemps2` already
   ## unbinds; this clears the pick flags and frees the pool.)
+  ##
+  ## `addrIntact` says the consuming instruction only READ this address — a
+  ## STORE through it, where the `(mem …)` is the destination operand. Then the
+  ## global-base register still holds `&g` and is kept as an address mirror
+  ## instead of being killed, so the next access to the same global is a `mov`
+  ## rather than another `adrp`+`add`. A LOAD must never pass it: `mov base,
+  ## [base]` reuses the base register as its destination.
   case c.kind
   of Symbol:
     if g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind == NoLoc:
-      g.freeVal(g.plan.planned(g.posOf(c)))               # the global base temp/survivor
+      let base = g.plan.planned(g.posOf(c))               # the global base temp/survivor
+      if addrIntact and base.kind == InReg and base.isTemp and
+         g.lookupSym(symName(c)).cat == scGlobal and
+         g.mirrorAddrStored(base.r, g.prog.gvarRefName(symName(c))):
+        discard                                          # kept as an address mirror
+      else:
+        g.freeVal(base)
   of TagLit:
     case c.exprKind
     of DotC:
       var cc = c
       cc.into:
-        g.freeLvalTemps2(cc)
+        g.freeLvalTemps2(cc, addrIntact)
         while cc.hasMore: skip cc
     of DerefC:
       var cc = c
@@ -3746,7 +3819,7 @@ proc freeLvalTemps2(g: var CodeGen; c: Cursor) =
       let atPos = g.posOf(c)
       var cc = c
       cc.into:
-        g.freeLvalTemps2(cc)
+        g.freeLvalTemps2(cc, addrIntact)
         skip cc
         if cc.kind notin {IntLit, UIntLit}:
           g.freeVal(g.plan.planned(g.posOf(cc)))
@@ -3768,7 +3841,7 @@ proc freeLvalTemps2(g: var CodeGen; c: Cursor) =
       var cc = c
       cc.into:
         skip cc; skip cc
-        g.freeLvalTemps2(cc)
+        g.freeLvalTemps2(cc, addrIntact)
         while cc.hasMore: skip cc
     else: discard
   else: discard
@@ -3785,11 +3858,27 @@ proc emitValue2(g: var CodeGen; c: Cursor; dest: var Location) =
   of UIntLit: g.emitLeafImm(dest, immLoc(cast[int64](uintVal(c)), ScalarSlot))
   of CharLit: g.emitLeafImm(dest, immLoc(int64(ord(charLit(c))), ScalarSlot))
   of Symbol:
-    let home = g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c))
+    # THE read side of store forwarding: a value whose home is a stack slot may
+    # still be in the register that stored it there. Which door depends on where
+    # the location GOES — an unconstrained `dest` is returned to the caller, which
+    # may emit more code before consuming it, so the register is handed over
+    # (`takeForwarded`, released by the caller's `freeVal` like any temp); a FIXED
+    # destination is served by the very next instruction, where the cheaper
+    # unowned read is enough and leaves the mirror alive for later reads.
+    let symHome = g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c))
+    let home = (if dest.kind in {Undef, NeedsReg, RegOrImm}: g.takeForwarded(symHome)
+                else: g.forwardOf(symHome))
     if home.kind != NoLoc:
       g.resolveDestE(dest, home)
       if dest.kind == NamedStack and dest.spillTemp:
         g.produceIntoMem2(c, dest); return
+      if dest.kind == InReg and dest.isTemp and home.kind == InReg and
+         home.r == dest.r and g.rb.isMirror(dest.r):
+        # The accumulator IS the register still mirroring this value — the load is
+        # already done. Take the register over from the mirror (a `(rebind …)`,
+        # zero machine code): the consumer may now write it in place, and a mirror
+        # the consumer overwrites is the one way this map goes wrong.
+        g.bindTemp(dest.r, dest.typ)
       if dest.kind == InReg and not (home.kind == InReg and home.r == dest.r):
         if dest.isTemp and not g.rb.isBoundTemp(dest.r):
           g.bindTemp(dest.r, dest.typ)
@@ -4216,6 +4305,8 @@ proc emitFValue2(g: var CodeGen; c: Cursor; dest: var Location) =
     if home.kind == NoLoc:                             # a module-level float global / tvar
       var cc = c
       home = g.asLoc(cc)
+    # store forwarding, the float half — see `emitValue2` for the two doors
+    home = (if dest.kind != InFReg: g.takeFForwarded(home) else: g.forwardFOf(home))
     case home.kind
     of InFReg:
       if dest.kind != InFReg:
@@ -4224,6 +4315,9 @@ proc emitFValue2(g: var CodeGen; c: Cursor; dest: var Location) =
         let bits = if dest.typ.size == 4: 32 else: 64
         if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f, bits)
         g.fmovF(dest.f, home.f, bits)
+      elif dest.isTemp and g.rb.isFMirror(dest.f):
+        # the accumulator IS the mirroring register: take it over (see the GPR twin)
+        g.bindFTmp(dest.f, if dest.typ.size == 4: 32 else: 64)
     else:
       if dest.kind != InFReg:
         dest = g.takeFTmp(if home.typ.kind == AFloat: home.typ else: g.exprSlot(c))
@@ -4804,6 +4898,12 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
   ## straight into their ABI registers, aggregate sources reach their words
   ## via `aggrAddrInto`/`structToRegs`, the result settles from x0/v0.
   discard hiddenPtr                            # the x8 hidden pointer is set by the caller
+  # Every store-forwarding mirror dies at a call, and BEFORE the marshalling: the
+  # callee clobbers the volatiles a mirror lives in, and — for a value whose
+  # address escaped — could write the slot itself. (Address-taken locals are never
+  # mirrored, so only the clobber is load-bearing; clearing the whole map anyway
+  # costs a call-free straight-line region nothing.)
+  g.killAllMirrors()
   var argCurs: seq[Cursor] = @[]
   var fsym = ""
   var targetCur: Cursor
@@ -5179,6 +5279,11 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED a64 `(instr SYM X*)`: operand placement inline (pool → survivor,
   ## never a bridge — the atomics own x14/x15/x16); resolved operand Locations
   ## go to the `plan.locs` memo so `emitAtomicInstr2` reads them unchanged.
+  ##
+  ## An intrinsic row may write memory (the atomics), claim registers of its own
+  ## and run an LL/SC retry loop — none of which the mirror map models. It clears,
+  ## like a call.
+  g.killAllMirrors()
   var fsym = ""
   var argCurs: seq[Cursor] = @[]
   block:

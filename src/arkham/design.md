@@ -298,6 +298,83 @@ only for the rows that spin on a `cmpxchg` and r11 only for the rows that need a
 A blanket claim would have made three-operand atomics stop compiling under
 pressure instead.
 
+## Store forwarding: the value is in memory AND in a register
+
+A value that lives in a stack slot got there somehow — a register held it and
+stored it. Reading it back the way the allocator describes it (`NamedStack`)
+reloads what a register still contains. The `RegMapping` in `regbind.nim` is the
+one table that remembers otherwise: *which registers currently MIRROR a value
+whose home is memory*. `mirrorStored` writes an entry at the release of a store's
+source register; `forwardOf`/`takeForwarded` read it; every read site already
+asks the right question, because `locationOfSym(name, pos)` is "where is the
+VALUE, here" and this is a third answer to it, next to `callerSaveActive`
+(dynamic, window-scoped) and `segs` (static, still empty).
+
+Four rules carry the correctness, and each is structural rather than a discipline
+to remember:
+
+1. **An entry is an observation, never a reservation.** A mirrored register stays
+   fully allocatable — `regFreeForTemp`/`regHoldsLiveLocal` consult `isMirror`
+   for exactly that — so forwarding can never cause an out-of-registers. What it
+   removes is a *load*, never a register.
+2. **An entry keeps its nifasm binding alive.** The register still carries the
+   `tmpN.0` it was bound with, so a read of it is a checked symbol and any write
+   that does not go through a `RegBind` transition is an assembly-time error
+   rather than a silent clobber.
+3. **Only the pool and the bridge may hold one** (`mirrorableReg`). That is the
+   whole safety argument: most registers have structural RAW uses — ABI
+   marshalling, the syscall registers, a frame push — that no transition sees,
+   while `emReg`/`emFReg` ASSERT that every use of the pool and the bridge is a
+   typed binding. Machine-checked, not argued.
+4. **A location that outlives the next instruction transfers ownership**
+   (`takeForwarded`: `isTemp` + a `pickedRegs` reservation, released by the
+   consumer's own `freeVal`). Handing out an unowned register instead is wrong in
+   a way that looks right — the consumer holds it, evaluates the other operand,
+   that evaluation legitimately takes the free mirror register, and the held
+   location now names a different value.
+
+Invalidation is deliberately coarse, because a missed kill is a miscompile and a
+spurious one costs a reload:
+
+ * a store to the name re-keys it (hooked at `emitStoreLoc`/`emScalarStore`, the
+   one place every scalar store funnels through);
+ * a CALL or an `(instr …)` row clears the map;
+ * **every label DEFINITION clears the map** — which is what makes structured
+   control flow a non-issue here. arkham emits no merge point that is not a
+   label, so `emLab` is the single hook that covers `if`/`case`/`and`/`or`/the
+   cond-fusion/`break`, and the one exception (`(loop …)`, whose back edge nifasm
+   emits internally) clears in `emitLoop`.
+ * a register event needs no hook at all: the entry lives in `RegBind`, so each
+   of its ~10 transitions drops what it invalidates as one atomic step. A
+   separate table invalidated by hand at those sites is the Cat-1 bug class that
+   module exists to close.
+
+**ADDRESS-taken locals are never mirrored** (`Plan.aliasable`, copied from the
+analyser's props). They are the only ones a store through a pointer — or a callee
+handed that pointer — can write without naming, and arkham has no points-to
+analysis to bound that. Every other memory-homed local is alias-immune by
+definition, and that one filter is what keeps the invalidation rules finite
+instead of requiring a store classifier.
+
+The second kind of entry is an **address** mirror: `r` holds `&g`. AArch64 has no
+PC-relative memory operand, so a global's address costs `adrp`+`add` *every* time
+it is needed; remembering it makes the next access to the same global a `mov`, or
+free when the walk's pick lands on the register that already holds it. It has no
+counterpart on x86-64, where the address is a single RIP-relative `lea`. Its
+create site is narrower than a value mirror's, and for a reason worth keeping:
+the address is only known to survive where the consuming instruction merely READ
+it — a store through the address (`freeLvalTemps2`'s `addrIntact`), never a load,
+whose `mov base, [base]` reuses the base register as its destination.
+
+Measured on the fixture corpus: about 0.9 % fewer emitted instructions on both
+targets, concentrated exactly where the model predicts — every float local on
+x86-64 is stack-homed (SysV has no callee-saved xmm), so every float read was a
+reload. `ARKHAM_NO_FORWARD=1` is the A/B switch. What is NOT implemented is
+load→load forwarding: an entry is created only at a store's release point, where
+the previous owner provably cannot modify the register again. Recording one at a
+load means knowing that nothing wrote the register between the load and the
+release, and that question has no cheap chokepoint today.
+
 ## Two questions, not one: `homeOfSym` vs `locationOfSym`
 
 A local used to be looked up one way — `locationOfSym(name)` — because there was
