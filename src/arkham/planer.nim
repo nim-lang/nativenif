@@ -47,6 +47,14 @@
 ## sized to the proc's whole token span, and both sides of the API already speak
 ## positions.
 ##
+## One thing this module deliberately does NOT answer: whether a value whose home
+## is a stack slot is ALSO still in a register. That is a property of the emission
+## walk, not of the plan — which register a value passes through is phase B's
+## choice — so it lives in `RegBind`'s `RegMapping` and reaches the read side as a
+## third answer to `locationOfSym`, next to `callerSaveActive` and `segs`. What
+## the plan contributes is the one whole-proc fact the map cannot derive:
+## `aliasable`, the locals a store through a pointer could write.
+##
 ## `planned(pos) == Undef` means the planner has NO answer there and the emitter
 ## decides for itself. Keep that permanent. It is what lets this module stay
 ## deliberately incomplete — any expression whose planning turns out hairy simply
@@ -132,6 +140,15 @@ type
                                       ## allocator reserved a callee-saved reg for the
                                       ## emitter's `stackArgBaseReg` (single source of
                                       ## truth; the emitter must NOT re-classify)
+    aliasable*: HashSet[string]       ## locals whose ADDRESS is taken. They are the ones
+                                      ## a store through a pointer — or a callee handed
+                                      ## that pointer — can write behind the emitter's
+                                      ## back, so no store-forwarding mirror may ever be
+                                      ## kept for them (`RegMapping` in regbind.nim). Every
+                                      ## OTHER memory-homed local is alias-immune by
+                                      ## definition, which is what makes the mirror map's
+                                      ## invalidation a matter of registers and stores
+                                      ## rather than of a points-to analysis.
     aliasedCasts*: HashSet[string]    ## identity-cast value aliases (`let c2 = cast[T](c1)`,
                                       ## c1 LIVE): `c2` has NO home of its own — its `symPos`
                                       ## points at `c1`'s decl, so it resolves to `c1`'s live
@@ -1299,6 +1316,11 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
   b.plan.sealed = presealed
   b.plan.divRegClobbered = an.clobbersDivReg
   b.plan.shiftRegClobbered = an.clobbersShiftReg
+  # The alias set, straight from the analyser's per-var props: the emitter's
+  # store-forwarding mirrors need it, and it is a whole-proc fact, so it is copied
+  # once here rather than re-derived per query (see `Plan.aliasable`).
+  for name, vi in an.vars:
+    if AddrTaken in vi.props: b.plan.aliasable.incl name
   b.scopeVars = @[]; b.pendingFree = @[]; b.freedSyms = initHashSet[string]()
   b.seedPools()
   var n = procDecl
