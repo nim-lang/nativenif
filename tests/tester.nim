@@ -180,6 +180,72 @@ proc arkhamRejectionTests(arkham: string) =
     inc passed
   echo passed, " / ", arkhamRejections.len, " arkham rejection tests successful"
 
+proc arkhamDebugInfoTests() =
+  ## nifasm emits `.symtab` + `.eh_frame`, so a debugger can name and unwind
+  ## frames in code that keeps NO frame pointer. Assert that end to end, through
+  ## GDB itself: break in the innermost proc of a four-deep chain and demand the
+  ## whole chain back, in order, by name.
+  ##
+  ## Worth an external tool in the harness because the two halves fail
+  ## independently and quietly: wrong DWARF register numbers still produce a
+  ## plausible-looking trace, and a prologue whose CFA states are not recorded
+  ## unwinds correctly right up until the crash happens in a frame that has one.
+  ## Only the debugger's own reader can tell us the tables mean what we think.
+  if findExe("gdb").len == 0:
+    echo "0 / 0 arkham debug-info tests (gdb not installed)"
+    return
+  let exe = "tests" / "arkham" / "nimcache" / "debuginfo_chain.out"
+  if not fileExists(exe):
+    quit "FAILURE arkham debug-info: " & exe & " was not built"
+  let (s, _) = execCmdEx("gdb -batch -ex \"break leaf.0\" -ex run -ex bt " &
+                         quoteShell(exe))
+  # GDB prints one `#N 0x… in NAME ()` per frame; it renders `leaf.0` as `leaf`.
+  var at = 0
+  for want in ["in leaf ", "in middle ", "in outer ", "in main "]:
+    let idx = s.find(want, at)
+    if idx < 0:
+      quit "FAILURE arkham debug-info: no `" & want & "` frame in the backtrace\n" & s
+    at = idx
+  if s.contains("?? ()"):
+    quit "FAILURE arkham debug-info: unnamed frame in the backtrace\n" & s
+  echo "1 / 1 arkham debug-info tests successful"
+
+proc arkhamWinUnwindTests() =
+  ## The Win64 half of the same story: `.pdata` + `.xdata`, checked by the ONLY
+  ## authority that matters — the operating system's own unwinder.
+  ##
+  ## `tests/win_stacktrace.c.nif` calls `RtlCaptureStackBackTrace` from four
+  ## frames down and exits with the number of frames the OS could walk. Wine
+  ## implements that through `RtlVirtualUnwind`, which reads the exception
+  ## directory, so the exit code IS the answer to "does our unwind info work".
+  ## The `--no-debug-info` control run is what makes it a measurement rather
+  ## than a hope: without `.pdata` every proc looks like a leaf and the walk
+  ## stops at 1.
+  if findExe("wine").len == 0:
+    echo "0 / 0 arkham win64 unwind tests (wine not installed)"
+    return
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasm = ("src" / "nifasm" / "nifasm").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham" / "nimcache"
+  let asmNif = workDir / "win_stacktrace.asm.nif"
+  let exe = workDir / "win_stacktrace.exe"
+  let bare = workDir / "win_stacktrace_nodbg.exe"
+  exec quoteShell(arkham) & " -a:win_x64 -o:" & quoteShell(asmNif) & " " &
+       quoteShell("tests" / "win_stacktrace.c.nif")
+  exec quoteShell(nifasm) & " -o:" & quoteShell(exe) & " " & quoteShell(asmNif)
+  exec quoteShell(nifasm) & " --no-debug-info -o:" & quoteShell(bare) & " " &
+       quoteShell(asmNif)
+  let (_, frames) = execCmdEx("wine " & quoteShell(exe) & " 2>/dev/null")
+  let (_, bareFrames) = execCmdEx("wine " & quoteShell(bare) & " 2>/dev/null")
+  if frames < 4:
+    quit "FAILURE arkham win64 unwind: the OS walked only " & $frames &
+         " frames of a four-deep stack — .pdata/.xdata is wrong or missing"
+  if bareFrames >= frames:
+    quit "FAILURE arkham win64 unwind: --no-debug-info walked " & $bareFrames &
+         " frames too, so the " & $frames & " prove nothing"
+  echo "1 / 1 arkham win64 unwind tests successful (", frames, " frames vs ",
+       bareFrames, " without)"
+
 proc arkhamTests() =
   ## Each `tests/arkham/*.c.nif` is hand-written Leng: arkham generates asm-NIF,
   ## nifasm assembles+links it to a native executable, and we check the run's exit
@@ -631,6 +697,11 @@ when (defined(linux) and defined(amd64)) or (defined(macosx) and defined(arm64))
 # The `{.assembler.}` rejections are x86-64-only (see `arkhamRejectionTests`).
 when defined(linux) and defined(amd64):
   arkhamRejectionTests(("bin" / "arkham").addFileExt(ExeExt))
+  # The debug-info check runs on the x86-64 host binaries `arkhamTests` just
+  # built; the AArch64 half of the same tables is covered by the qemu pass only
+  # as far as "the program still runs" — a host GDB cannot read its registers.
+  arkhamDebugInfoTests()
+  arkhamWinUnwindTests()
 
 # Additionally exercise the AArch64 backend on an x86-64 Linux host by emitting the
 # `linux_arm64` ELF variant and running it under qemu-aarch64 (no-op if qemu is

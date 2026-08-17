@@ -3,6 +3,8 @@
 import std / [streams, os, strutils]
 
 import buffers
+import dwarf   # the per-proc unwind FACTS; `__TEXT,__eh_frame` below is the same
+               # DWARF encoding the ELF path emits
 
 type
   # Import info for dynamic linking
@@ -378,7 +380,8 @@ proc writeMachO*(code: Bytes; bssSize: int;
                  tlv: TlvInfo = TlvInfo();
                  bssInits: seq[tuple[off: int64, val: int64, size: int]] = @[];
                  rebases: seq[RodataRebase] = @[];
-                 symMap: seq[(int, string)] = @[]) =
+                 symMap: seq[(int, string)] = @[];
+                 unwind: seq[ProcUnwind] = @[]) =
   let pageSize = 0x4000.uint64  # 16KB page size for arm64 macOS
   let baseAddr = 0x100000000.uint64  # macOS default base address
 
@@ -418,11 +421,18 @@ proc writeMachO*(code: Bytes; bssSize: int;
 
   # Calculate sizes
   let headerSize = sizeof(MachO_Header).uint64
-  let codeSize = modifiedCode.len.uint64
+  let textOnlySize = modifiedCode.len.uint64   # `__text` proper; `__eh_frame` is
+                                               # appended to the same blob below
 
   # Calculate load command sizes first (needed to determine code offset)
   let pageZeroSegSize = sizeof(MachO_Segment64)  # No sections in __PAGEZERO
-  let textSegSize = sizeof(MachO_Segment64) + sizeof(MachO_Section64)
+  # `__TEXT` holds `__text` and — when there is unwind data — `__eh_frame`. The
+  # extra section header has to be counted HERE, before `codeFileOffset` is
+  # derived from the command sizes, because the FDEs' absolute addresses are
+  # computed from the resulting `__text` vaddr.
+  let hasEhFrame = unwind.len > 0
+  let textSectionCount = if hasEhFrame: 2 else: 1
+  let textSegSize = sizeof(MachO_Segment64) + textSectionCount * sizeof(MachO_Section64)
   # DATA segment is needed for GOT (external procs), TLV descriptors/data, or bss.
   # Its sections, in vm order: __got, __thread_vars, __thread_data, __bss.
   let needsData = bssSize > 0 or hasExtProcs or hasTlv
@@ -457,13 +467,29 @@ proc writeMachO*(code: Bytes; bssSize: int;
   # Code starts after header and reserved command space, aligned to 16 bytes
   let codeFileOffset = (headerSize + totalCmdsSpaceNeeded.uint64 + 15) and not 15'u64
 
+  # Virtual addresses
+  let textVmaddr = baseAddr
+  let textSectionVmaddr = textVmaddr + codeFileOffset  # Section starts after headers
+
+  # `__TEXT,__eh_frame`: the same DWARF CFI the ELF path emits, with absolute
+  # (`DW_EH_PE_absptr`) addresses — which is why it can only be built now, once
+  # `__text`'s vaddr is known. It is appended to the code blob and described by
+  # its own section header, so every file-offset and segment-size computation
+  # below keeps working unchanged.
+  var ehFrame: seq[byte] = @[]
+  var ehOff = 0'u64
+  if hasEhFrame:
+    ehOff = (textOnlySize + 7) and not 7'u64
+    while modifiedCode.len.uint64 < ehOff: modifiedCode.add(0)
+    ehFrame = buildEhFrame(unwind, dwA64, textSectionVmaddr, @[])
+    for b in ehFrame: modifiedCode.add b
+  let codeSize = modifiedCode.len.uint64
+
   # __TEXT segment starts at file offset 0 (includes header in segment)
   # The segment size includes header + commands + code, page-aligned
   let textSegmentFileSize = (codeFileOffset + codeSize + pageSize - 1) and not (pageSize - 1)
 
-  # Virtual addresses
-  let textVmaddr = baseAddr
-  let textSectionVmaddr = textVmaddr + codeFileOffset  # Section starts after headers
+
 
   # `--symmap`: the executable carries no symbol table, so dump each generated
   # proc's virtual address for a disassembler to name frames by. Only here is the
@@ -514,8 +540,34 @@ proc writeMachO*(code: Bytes; bssSize: int;
   else:
     @[]
 
-  # Linkedit contains: rebase info + bind info + string table (1 byte null term).
-  let linkeditFilesize = (if rebaseInfo.len + bindInfo.len > 0:
+  # The debugger's half of the linkedit: one LOCAL `N_SECT` symbol per generated
+  # proc, plus its string table. Local (no `N_EXT`) on purpose — these exist to
+  # name frames, not to participate in dynamic linking, so dyld's export/undefined
+  # bookkeeping stays exactly as empty as it was.
+  var symEntries: seq[MachO_Nlist64] = @[]
+  var strTab: seq[byte] = @[]
+  if unwind.len > 0:
+    strTab.add 0'u8                       # string index 0 is the empty name
+    for p in unwind:
+      if p.stop <= p.start: continue
+      var nl: MachO_Nlist64
+      nl.n_strx = uint32(strTab.len)
+      nl.n_type = N_SECT
+      nl.n_sect = 1                       # `__text` is section 1
+      nl.n_desc = 0
+      nl.n_value = textSectionVmaddr + uint64(p.start)
+      symEntries.add nl
+      strTab.add byte('_')                # the platform's C-symbol convention
+      for ch in p.name: strTab.add byte(ch)
+      strTab.add 0'u8
+    while (strTab.len and 7) != 0: strTab.add 0'u8
+  let symTabBytes = symEntries.len * sizeof(MachO_Nlist64)
+  # Linkedit contains: rebase info + bind info + symbols + strings.
+  let symTabOff = (uint64(rebaseInfo.len + bindInfo.len) + 7) and not 7'u64
+  let strTabOff = symTabOff + uint64(symTabBytes)
+  let linkeditFilesize = (if symEntries.len > 0:
+                            strTabOff + uint64(strTab.len)
+                          elif rebaseInfo.len + bindInfo.len > 0:
                             uint64(rebaseInfo.len + bindInfo.len) + 8
                           else: 32.uint64)
   let linkeditVmsize = (linkeditFilesize + pageSize - 1) and not (pageSize - 1)
@@ -528,12 +580,20 @@ proc writeMachO*(code: Bytes; bssSize: int;
   # fileoff=0 means segment starts at beginning of file (includes header)
   var textSegment = initSegment64("__TEXT", textVmaddr, textSegmentFileSize, 0, textSegmentFileSize,
                                    VM_PROT_READ or VM_PROT_EXECUTE,
-                                   VM_PROT_READ or VM_PROT_EXECUTE, 1)
+                                   VM_PROT_READ or VM_PROT_EXECUTE,
+                                   uint32(textSectionCount))
 
   # Section flags: S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
   let textSectionFlags = S_ATTR_PURE_INSTRUCTIONS or S_ATTR_SOME_INSTRUCTIONS
-  var textSection = initSection64("__text", "__TEXT", textSectionVmaddr, codeSize,
+  var textSection = initSection64("__text", "__TEXT", textSectionVmaddr, textOnlySize,
                                   uint32(codeFileOffset), 2, textSectionFlags)  # align 2^2 = 4
+  # `__eh_frame` is data, not instructions: no `S_ATTR_PURE_INSTRUCTIONS`, or a
+  # disassembler walks the CFI as code.
+  var ehSection: MachO_Section64
+  if hasEhFrame:
+    ehSection = initSection64("__eh_frame", "__TEXT", textSectionVmaddr + ehOff,
+                              uint64(ehFrame.len),
+                              uint32(codeFileOffset + ehOff), 3, 0)
 
   # Create DATA segment and its sections (__got, __thread_vars, __thread_data,
   # __bss — only those that are present), in vm order.
@@ -602,17 +662,29 @@ proc writeMachO*(code: Bytes; bssSize: int;
   var symtab: MachO_Symtab
   symtab.cmd = LC_SYMTAB
   symtab.cmdsize = uint32(sizeof(MachO_Symtab))
-  let symtabOffset = linkeditFileoff + uint64(rebaseInfo.len + bindInfo.len)
-  symtab.symoff = uint32(symtabOffset)
-  symtab.nsyms = 0
-  symtab.stroff = uint32(symtabOffset)
-  symtab.strsize = 1  # At least 1 byte for null terminator
+  if symEntries.len > 0:
+    symtab.symoff = uint32(linkeditFileoff + symTabOff)
+    symtab.nsyms = uint32(symEntries.len)
+    symtab.stroff = uint32(linkeditFileoff + strTabOff)
+    symtab.strsize = uint32(strTab.len)
+  else:
+    let symtabOffset = linkeditFileoff + uint64(rebaseInfo.len + bindInfo.len)
+    symtab.symoff = uint32(symtabOffset)
+    symtab.nsyms = 0
+    symtab.stroff = uint32(symtabOffset)
+    symtab.strsize = 1  # At least 1 byte for null terminator
 
   # Create LC_DYSYMTAB (dynamic symbol table, minimal)
   var dysymtab: MachO_DySymtab
   dysymtab.cmd = LC_DYSYMTAB
   dysymtab.cmdsize = uint32(sizeof(MachO_DySymtab))
-  # All fields 0 - no dynamic symbols
+  # All fields 0 - no dynamic symbols, except that the proc symbols above are all
+  # LOCAL: `[0, nsyms)` is the local range and the external/undefined ranges stay
+  # empty, which is what keeps this table consistent with an untouched dyld path.
+  if symEntries.len > 0:
+    dysymtab.nlocalsym = uint32(symEntries.len)
+    dysymtab.iextdefsym = uint32(symEntries.len)
+    dysymtab.iundefsym = uint32(symEntries.len)
 
   # Create LC_LOAD_DYLINKER
   var dylinker: MachO_DyLinker
@@ -653,6 +725,7 @@ proc writeMachO*(code: Bytes; bssSize: int;
   # Write TEXT segment command
   f.write(textSegment)
   f.write(textSection)
+  if hasEhFrame: f.write(ehSection)
 
   # Write DATA segment command (if needed)
   if hasData:
@@ -871,8 +944,12 @@ proc writeMachO*(code: Bytes; bssSize: int;
     linkeditData[i] = b
   for i, b in bindInfo:
     linkeditData[rebaseInfo.len + i] = b
-  # Add null terminator for empty string table at the end
-  linkeditData[^1] = 0
+  if symEntries.len > 0:
+    copyMem(addr linkeditData[symTabOff.int], addr symEntries[0], symTabBytes)
+    for i, b in strTab: linkeditData[strTabOff.int + i] = b
+  else:
+    # Add null terminator for empty string table at the end
+    linkeditData[^1] = 0
   f.writeData(unsafeAddr linkeditData[0], linkeditData.len)
 
   # BSS is not written to file (zero-initialized by loader)
