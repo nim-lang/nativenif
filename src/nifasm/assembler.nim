@@ -4,6 +4,7 @@ import nifcore, nifcoreparse, nifmodules
 import "../../../nimony/src/lib" / [nifreader, symparser]
 import tags, model, tagconv
 import buffers, relocs, x86, arm64, elf, macho, pe
+import dwarf
 import sem, slots
 import decls
 
@@ -449,6 +450,11 @@ type
     symMap: bool        # `--symmap`: dump each generated proc's vaddr to stderr
     listing: bool       # `--listing:FILE`: record one row per asm-NIF instruction node
     listingPath: string # where to write it
+    debugInfo: bool     # emit `.symtab` + `.eh_frame` (default on). Both are
+                        # non-`SHF_ALLOC` and outside every PT_LOAD, so they change
+                        # neither the loaded image nor its behaviour — only the
+                        # file size — and they are what lets a debugger name and
+                        # unwind frames in code that keeps no frame pointer.
     listDepth: int      # nesting depth of the current `genInst` (a compound node such as
                         # `(ite …)`/`(loop …)` recurses); the DEEPEST row covering a byte
                         # is the instruction that actually emitted it
@@ -464,6 +470,18 @@ type
                         # merged across `ite` branches.
     slots: SlotManager
     ssizePatches: seq[tuple[pos: int; pad: int]]
+    unwind: seq[ProcUnwind]       # per-proc name + code range + prologue CFI states,
+                                  # for `.symtab` and `.eh_frame` (see dwarf.nim). Grown
+                                  # by `pass2Proc`; every position in it is remapped by
+                                  # the post-emission layout passes, exactly like
+                                  # `gvarSites`.
+    inPrologue: bool              # still inside the current proc's prologue: the run of
+                                  # pushes / frame `sub` whose CFA effects the FDE records.
+                                  # `genInst` clears it at the first instruction that emits
+                                  # code and is not one of those (a zero-byte node — a slot
+                                  # declaration, a `kill` — is transparent).
+    prologueOp: bool              # the instruction just dispatched recorded a CFI step
+    cfaOff: int32                 # CFA offset in effect at the current point of the prologue
     reservedArgArea: int          # AArch64 fixed-frame: bytes reserved at the frame bottom
                                   # for the largest outgoing stack-argument area (see
                                   # scanStackArgArea). Locals sit above it; the caller writes
@@ -2774,6 +2792,29 @@ proc a64CondOf(inst: A64Inst): arm64.Condition =
   of CselhsA64, CsethsA64: arm64.CondHS
   else: raiseAssert("not a conditional-select mnemonic: " & $inst)
 
+proc cfiStep(ctx: var GenContext; cfaDelta: int32;
+             savedRegs: openArray[int32] = []; ssizeSlot = false;
+             floats = false) =
+  ## Record one prologue instruction's effect on the unwind state. Called from
+  ## the handlers that emit a push / a pair-store / the frame `sub`, and only
+  ## while `inPrologue` — see `genInst` for what ends that run.
+  ##
+  ## `savedRegs` are in STORE order: the first lands at the new bottom of the
+  ## frame (CFA − the offset this step establishes), each next one 8 bytes above.
+  ## That one rule covers both a single `push` and a `stp` pair.
+  ##
+  ## `ssizeSlot` marks the frame `sub`, whose immediate nifasm only knows once
+  ## the proc's slots are laid out; `pass2Proc` fills the CFA offset in then.
+  if ctx.unwind.len == 0: return
+  ctx.cfaOff += cfaDelta
+  var saves: seq[CfiSave] = @[]
+  for i in 0 ..< savedRegs.len:
+    saves.add CfiSave(reg: savedRegs[i], isFloat: floats,
+                      cfaOff: -ctx.cfaOff + int32(8 * i))
+  ctx.unwind[^1].steps.add CfiStep(at: ctx.buf.data.len, cfaOff: ctx.cfaOff,
+                                   saves: saves, ssizeSlot: ssizeSlot)
+  ctx.prologueOp = true
+
 proc genInstA64(n: var Cursor; ctx: var GenContext) =
   if n.kind != TagLit: error("Expected instruction", n)
   let instTag = tagToA64Inst(n.tag)
@@ -3103,6 +3144,10 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
         ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
         arm64.emitSubImmShifted12(ctx.buf.data, dest.reg, dest.reg, 0'u16)  # hi12
         ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
+        if ctx.inPrologue and dest.reg == arm64.SP:
+          # Both halves of the pair are one CFA event; record it after the second
+          # so the FDE's `advance_loc` covers them together.
+          ctx.cfiStep(0, [], ssizeSlot = true)        # delta filled in at proc end
       elif op.kind == okImm or op.kind == okCsize:
         if op.immVal >= 0 and op.immVal <= 4095:
           arm64.emitSubImm(ctx.buf.data, dest.reg, dest.reg, uint16(op.immVal))
@@ -3821,6 +3866,10 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     if n.kind != IntLit: error("stp expects an integer offset", n)
     let off = int32(getInt(n)); inc n
     arm64.emitStp(ctx.buf.data, rt1, rt2, rn, off)
+    if ctx.inPrologue and rn == arm64.SP and off < 0:
+      # `stp rt1, rt2, [sp, #-N]!` — the AArch64 prologue's pair push. rt1 lands
+      # at the new bottom of the frame, rt2 8 bytes above it.
+      ctx.cfiStep(-off, [int32(ord(rt1)), int32(ord(rt2))])
 
   of LdpA64:
     # (ldp (rt1) (rt2) (rn) offset) → LDP rt1, rt2, [rn], #offset  (post-index)
@@ -3841,6 +3890,8 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     if n.kind != IntLit: error("fstp expects an integer offset", n)
     let off = int32(getInt(n)); inc n
     arm64.emitFstpPre(ctx.buf.data, rt1, rt2, rn, off)
+    if ctx.inPrologue and rn == arm64.SP and off < 0:
+      ctx.cfiStep(-off, [int32(ord(rt1)), int32(ord(rt2))], floats = true)  # see `StpA64`
 
   of FldpA64:
     # (fldp (dt1) (dt2) (rn) offset) → LDP Dt1, Dt2, [Xn], #offset  (post-index)
@@ -3863,6 +3914,8 @@ proc genInstDispatch(n: var Cursor; ctx: var GenContext) {.inline.} =
     genInstA64(n, ctx)
 
 proc genInst(n: var Cursor; ctx: var GenContext) =
+  let cfiBefore = ctx.buf.data.len
+  ctx.prologueOp = false
   if not ctx.listing:
     genInstDispatch(n, ctx)
   else:
@@ -3891,6 +3944,12 @@ proc genInst(n: var Cursor; ctx: var GenContext) =
     if stop > start:                       # a node that emitted no bytes is not a row
       ctx.listRows.add ListingRow(start: start, stop: stop, depth: depth,
                                   procName: ctx.procName, text: text)
+  # The prologue ends at the first instruction that EMITS CODE and is not one of
+  # the frame-building forms. Judging it by emitted bytes rather than by tag is
+  # what keeps the zero-code nodes between them — a `(var :x (s) T)` slot
+  # declaration, a `(kill …)` — from cutting the run short.
+  if ctx.inPrologue and not ctx.prologueOp and ctx.buf.data.len != cfiBefore:
+    ctx.inPrologue = false
 
 proc remapListing(ctx: var GenContext; posMap: seq[int]) =
   ## Carry the listing through one of the post-emission layout passes
@@ -3914,6 +3973,17 @@ proc remapListing(ctx: var GenContext; posMap: seq[int]) =
       ctx.listRows[keep].stop = e
       inc keep
   ctx.listRows.setLen keep
+
+proc remapUnwind(ctx: var GenContext; posMap: seq[int]) =
+  ## The debug-info twin of `remapListing`: carry every recorded proc range and
+  ## CFI step through one layout pass. A `.symtab` entry or an FDE that still
+  ## names a pre-relaxation address is worse than none — GDB would attribute the
+  ## crash to a neighbouring proc rather than admit it does not know.
+  for k in 0 ..< ctx.unwind.len:
+    ctx.unwind[k].start = posMap[ctx.unwind[k].start]
+    ctx.unwind[k].stop = posMap[ctx.unwind[k].stop]
+    for s in 0 ..< ctx.unwind[k].steps.len:
+      ctx.unwind[k].steps[s].at = posMap[ctx.unwind[k].steps[s].at]
 
 proc writeListing(ctx: GenContext; path: string; textVaddr: int) =
   ## `--listing:FILE`: one TSV row per asm-NIF instruction node that survived into
@@ -4021,6 +4091,14 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
       sym.offset = int(lab)
     ctx.buf.defineLabel(LabelId(sym.offset))
     ctx.definedLabels.clear()   # fresh backward-jump tracking per proc
+
+    # Open this proc's debug-info record. The CFA at a proc's entry is fixed by
+    # the ABI: on x86-64 the `call` has pushed the return address (CFA = SP+8),
+    # on AArch64 it is still in the link register (CFA = SP).
+    ctx.unwind.add ProcUnwind(name: ctx.nameOf(getSymId(n)),
+                              start: ctx.buf.data.len, stop: -1)
+    ctx.inPrologue = true
+    ctx.cfaOff = if ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64}: 0'i32 else: 8'i32
 
     # Initialize stack context
     ctx.slots = initSlotManager()
@@ -4164,6 +4242,20 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
     for pos in deadFrameAdjusts:
       ctx.buf.data.removeRange(pos, 4)
       shiftCodePositions(ctx, pos + 4, -4)
+
+  # Close this proc's debug-info record. The frame `sub`'s CFA delta is exactly
+  # the immediate just patched into it, which is why the FDE could not be
+  # finished at the instruction itself.
+  if ctx.unwind.len > 0 and ctx.unwind[^1].stop < 0:
+    var carry = 0'i32
+    for k in 0 ..< ctx.unwind[^1].steps.len:
+      if ctx.unwind[^1].steps[k].ssizeSlot:
+        carry += int32(alignedStackSize) +
+                 int32(if ctx.ssizePatches.len > 0: ctx.ssizePatches[0].pad else: 0)
+        ctx.unwind[^1].steps[k].ssizeSlot = false
+      ctx.unwind[^1].steps[k].cfaOff += carry
+    ctx.unwind[^1].stop = ctx.buf.data.len
+  ctx.inPrologue = false
 
   ctx.scope = oldScope
 
@@ -5607,6 +5699,11 @@ proc shiftCodePositions(ctx: var GenContext; at, by: int) =
   for k in 0 ..< ctx.listRows.len:      # `--listing` byte ranges
     if ctx.listRows[k].start >= at: ctx.listRows[k].start += by
     if ctx.listRows[k].stop >= at: ctx.listRows[k].stop += by
+  for k in 0 ..< ctx.unwind.len:        # `.symtab` / `.eh_frame` proc + CFI positions
+    if ctx.unwind[k].start >= at: ctx.unwind[k].start += by
+    if ctx.unwind[k].stop >= at: ctx.unwind[k].stop += by
+    for s in 0 ..< ctx.unwind[k].steps.len:
+      if ctx.unwind[k].steps[s].at >= at: ctx.unwind[k].steps[s].at += by
 
 proc genCasejmpX64(n: var Cursor; ctx: var GenContext) =
   ## `(casejmp S T (stmts …)+)` — computed-goto case dispatch (issue #32). The
@@ -5848,10 +5945,15 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       if op.kind == okSsize:
         x86.emitSubImm32(ctx.buf.data, dest.reg, 0)   # forced imm32: back-patched
         ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
+        if ctx.inPrologue and dest.reg == x86.RSP:
+          ctx.cfiStep(0, [], ssizeSlot = true)        # delta filled in at proc end
       elif op.kind == okCsize:
         x86.emitSubImm(ctx.buf.data, dest.reg, int32(op.immVal))
       elif op.kind == okImm:
         x86.emitSubImm(ctx.buf.data, dest.reg, int32(op.immVal))
+        if ctx.inPrologue and dest.reg == x86.RSP:
+          # the alignment-pad-only frame (`hasStackVars` false, `framePad` 8)
+          ctx.cfiStep(int32(op.immVal))
       elif op.kind == okMem:
         x86.emitSub(ctx.buf.data, dest.reg, op.mem)
       else:
@@ -6439,6 +6541,10 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       error("PUSH memory not supported yet", n)
     else:
       x86.emitPush(ctx.buf.data, op.reg)
+      if ctx.inPrologue:
+        # A callee-saved register saved by the prologue: the CFA moves 8 further
+        # from SP and the register now lives at the new bottom of the frame.
+        ctx.cfiStep(8, [int32(ord(op.reg))])
 
   of PopX64:
     inc n
@@ -7139,6 +7245,7 @@ proc writeElf(a: var GenContext; outfile: string) =
     if a.entryStubOffset >= 0:
       a.entryStubOffset = threadMap[a.entryStubOffset]
     a.remapListing(threadMap)
+    a.remapUnwind(threadMap)
   block:
     # `jcc L; jmp M; L:` ⇒ `jncc M` — folds a conditional branch and its fall-through
     # unconditional jump into one branch. Pattern detection is arch-agnostic (runs on
@@ -7149,6 +7256,7 @@ proc writeElf(a: var GenContext; outfile: string) =
     if a.entryStubOffset >= 0:
       a.entryStubOffset = invMap[a.entryStubOffset]
     a.remapListing(invMap)
+    a.remapUnwind(invMap)
   if a.arch == Arch.X64:
     # Code-alignment candidates, as LABEL IDS (stable across the layout passes):
     # every generated proc's entry + every loop head (= target of a backward
@@ -7169,12 +7277,14 @@ proc writeElf(a: var GenContext; outfile: string) =
     if a.entryStubOffset >= 0:
       a.entryStubOffset = posMap[a.entryStubOffset]
     a.remapListing(posMap)
+    a.remapUnwind(posMap)
     let alignMap = alignCodeX64(a.buf, alignLabels)
     for k in 0 ..< a.gvarSites.len:
       a.gvarSites[k] = (alignMap[a.gvarSites[k][0]], a.gvarSites[k][1])
     if a.entryStubOffset >= 0:
       a.entryStubOffset = alignMap[a.entryStubOffset]
     a.remapListing(alignMap)
+    a.remapUnwind(alignMap)
   when defined(arkhamDbgReloc):
     block validateRelocs:
       var defined = initHashSet[int]()
@@ -7313,6 +7423,47 @@ proc writeElf(a: var GenContext; outfile: string) =
     else:
       EM_X86_64  # fallback
 
+  # ── debug info: `.symtab` (proc names) and `.eh_frame` (unwind) ─────────────
+  # Both are pure METADATA: their sections are not `SHF_ALLOC` and sit past the
+  # end of the single PT_LOAD, so the loaded image is byte-for-byte what it was
+  # without them and the run-time cost is exactly zero. They exist so a debugger
+  # can name a frame and walk past it — arkham keeps no frame pointer, so
+  # without CFI even GDB's prologue heuristic loses the chain after a frame or
+  # two (measured: `#2 0x0000000000000000 in ?? ()`).
+  #
+  # Everything they need is already known here: the proc's final code range (the
+  # layout passes above have remapped it), its NIF name, and the CFA states its
+  # prologue passes through. See dwarf.nim for why that is only a handful of
+  # bytes per proc — SP is constant inside an arkham frame.
+  let procVaddrBase = baseAddr + headersSize.uint64
+  var ehFrame: seq[byte] = @[]
+  var symtab: seq[byte] = @[]
+  var strtab: seq[byte] = @[]
+  if a.debugInfo:
+    # The image's entry, and — when a synthesized stub holds it — the entry PROC
+    # the stub tail-jumps to; both are "nothing called me" frames for the FDEs.
+    var entryOffs = @[int(entryOff)]
+    if a.entrySym != nil:
+      for ld in a.buf.labels:
+        if int(ld.id) == a.entrySym.offset: entryOffs.add ld.position
+    ehFrame = buildEhFrame(a.unwind,
+                           (if a.arch == Arch.LinuxA64: dwA64 else: dwX64),
+                           procVaddrBase, entryOffs)
+    strtab.add 0'u8                                   # index 0 is the empty name
+    symtab.setLen sizeof(Elf64_Sym)                   # index 0 is the null symbol
+    for p in a.unwind:
+      if p.stop <= p.start: continue
+      var sym = Elf64_Sym(st_name: Elf64_Word(strtab.len),
+                          st_info: (STB_GLOBAL shl 4) or STT_FUNC,
+                          st_other: 0, st_shndx: 1,   # section 1 is `.text`
+                          st_value: procVaddrBase + uint64(p.start),
+                          st_size: uint64(p.stop - p.start))
+      for ch in p.name: strtab.add byte(ch)
+      strtab.add 0'u8
+      let at = symtab.len
+      symtab.setLen at + sizeof(Elf64_Sym)
+      copyMem(addr symtab[at], addr sym, sizeof(Elf64_Sym))
+
   var ehdr = initHeader(entryAddr, machine)
   ehdr.e_phnum = 2  # Two program headers: .text and .bss
   ehdr.e_phoff = 64  # Program headers start after ELF header
@@ -7386,6 +7537,60 @@ proc writeElf(a: var GenContext; outfile: string) =
   # remaining memsz beyond bssSize is zero-filled by the loader.
   if bssImage.len > 0:
     f.writeData(unsafeAddr bssImage[0], bssImage.len)
+
+  if a.debugInfo:
+    # The non-loaded tail: section contents, then the section header table. Only
+    # `.text` is `SHF_ALLOC` (it describes bytes that ARE loaded, and the symbols
+    # point into it); everything else is debugger-only.
+    var pos = uint64(f.getPosition())
+    template pad8() =
+      while (pos and 7) != 0:
+        f.write 0'u8; inc pos
+    pad8()
+    let ehFrameOff = pos
+    if ehFrame.len > 0:
+      f.writeData(unsafeAddr ehFrame[0], ehFrame.len); pos += ehFrame.len.uint64
+    pad8()
+    let symtabOff = pos
+    if symtab.len > 0:
+      f.writeData(unsafeAddr symtab[0], symtab.len); pos += symtab.len.uint64
+    let strtabOff = pos
+    if strtab.len > 0:
+      f.writeData(unsafeAddr strtab[0], strtab.len); pos += strtab.len.uint64
+    # `.shstrtab` — the section NAME strings, in the order the headers below use.
+    var shstr: seq[byte] = @[]
+    var shName: seq[uint32] = @[]
+    shstr.add 0'u8
+    for nm in [".text", ".eh_frame", ".symtab", ".strtab", ".shstrtab"]:
+      shName.add uint32(shstr.len)
+      for ch in nm: shstr.add byte(ch)
+      shstr.add 0'u8
+    let shstrOff = pos
+    f.writeData(unsafeAddr shstr[0], shstr.len); pos += shstr.len.uint64
+    pad8()
+    let shoff = pos
+    var shdrs: seq[Elf64_Shdr] = @[]
+    shdrs.add initShdr(0, SHT_NULL, 0, 0, 0, 0, 0, 0, 0, 0)
+    shdrs.add initShdr(shName[0], SHT_PROGBITS, SHF_ALLOC or SHF_EXECINSTR,
+                       baseAddr + headersSize.uint64, headersSize.uint64,
+                       code.len.uint64, 0, 0, 16, 0)
+    shdrs.add initShdr(shName[1], SHT_PROGBITS, 0, 0, ehFrameOff,
+                       ehFrame.len.uint64, 0, 0, 8, 0)
+    # `sh_link` of a symtab is its string table; `sh_info` is the index of the
+    # first non-local symbol — every symbol here is global, so that is 1.
+    shdrs.add initShdr(shName[2], SHT_SYMTAB, 0, 0, symtabOff,
+                       symtab.len.uint64, 4, 1, 8, uint64(sizeof(Elf64_Sym)))
+    shdrs.add initShdr(shName[3], SHT_STRTAB, 0, 0, strtabOff,
+                       strtab.len.uint64, 0, 0, 1, 0)
+    shdrs.add initShdr(shName[4], SHT_STRTAB, 0, 0, shstrOff,
+                       shstr.len.uint64, 0, 0, 1, 0)
+    for sh in shdrs: f.write(sh)
+    # Re-write the ELF header now that the section table's offset is known.
+    ehdr.e_shoff = shoff
+    ehdr.e_shnum = Elf64_Half(shdrs.len)
+    ehdr.e_shstrndx = Elf64_Half(shdrs.len - 1)
+    f.setPosition(0)
+    f.write(ehdr)
 
   let perms = {fpUserExec, fpGroupExec, fpOthersExec, fpUserRead, fpUserWrite}
   setFilePermissions(outfile, perms)
@@ -7481,8 +7686,12 @@ proc writeMachO(a: var GenContext; outfile: string) =
     # the header line says so.
     a.writeListing(a.listingPath, 0)
 
+  # `LC_SYMTAB` + `__TEXT,__eh_frame` from the same per-proc facts the ELF path
+  # encodes: proc names for lldb, and CFI so it can unwind a frame-pointer-less
+  # stack. Both are debugger-only; `--no-debug-info` drops them.
   macho.writeMachO(code, a.bssOffset, cputype, cpusubtype, outfile, dynlink, gsites, tlv,
-                   a.bssInits, rebases, symMapRows)
+                   a.bssInits, rebases, symMapRows,
+                   (if a.debugInfo: a.unwind else: @[]))
 
   # macOS arm64 requires code signing for all executables
   when defined(macosx):
@@ -7726,8 +7935,11 @@ proc writeExe(a: var GenContext; outfile: string) =
   # starts at the first byte of `.text`, which is the entry proc.
   let entryOff = if a.winEntryOffset >= 0: a.winEntryOffset.uint32 else: 0'u32
 
+  # `.pdata`/`.xdata` from the same per-proc facts the ELF path encodes as
+  # `.eh_frame`. Win64 has no frame pointer either, so this is what lets the OS
+  # unwind at all — a backtrace, and any future SEH, both hang off it.
   writePE(a.buf, dataImage, a.bssOffset, entryOff, machine, outfile, dynlink,
-          absSites, patchAddrs)
+          absSites, patchAddrs, (if a.debugInfo: a.unwind else: @[]))
 
 
 proc generateSymbol(ctx: var GenContext; sym: Symbol) =
@@ -8004,7 +8216,7 @@ proc setupTls(ctx: var GenContext) =
   x86.emitJmp(ctx.buf, LabelId(ctx.entrySym.offset))        # → real entry
 
 proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
-               listing = "") =
+               listing = ""; debugInfo = true) =
   var buf = parseFromFile(filename, sharedTags = asmTags)
   # The main module's pool is shared with every foreign module (getDecl is passed
   # `ctx.pool`), so a `SymId` from ANY cursor is a valid key in the one scope table.
@@ -8042,7 +8254,8 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
     symMap: symMap,
     listing: listing.len > 0,
     listingPath: listing,
-    emitObj: emitObj
+    emitObj: emitObj,
+    debugInfo: debugInfo
   )
 
   # Store main module. `beginRead` BEFORE the move forces the buffer's

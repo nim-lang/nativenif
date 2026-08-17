@@ -1,0 +1,60 @@
+(.nif27)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :leaf.0
+  (params
+   (param :a.0 .
+    (i 64)))
+  (i 64).
+  (stmts
+   (ret
+    (add
+     (i 64)a.0 1))))
+ (proc :middle.0
+  (params
+   (param :a.0 .
+    (i 64)))
+  (i 64).
+  (stmts
+   (var :x.0 .
+    (i 64)
+    (call leaf.0 a.0))
+   (var :y.0 .
+    (i 64)
+    (call leaf.0 x.0))
+   (ret
+    (add
+     (i 64)x.0 y.0))))
+ (proc :outer.0
+  (params
+   (param :a.0 .
+    (i 64)))
+  (i 64).
+  (stmts
+   (var :p.0 .
+    (i 64)
+    (call middle.0 a.0))
+   (var :q.0 .
+    (i 64)
+    (call middle.0 p.0))
+   (ret
+    (add
+     (i 64)p.0 q.0))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :r.0 .
+    (i 64)
+    (call outer.0 1))
+   (call exit.0
+    (conv
+     (i 32)r.0)))))

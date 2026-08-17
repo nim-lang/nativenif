@@ -34,6 +34,17 @@ type
     p_memsz*: Elf64_Xword
     p_align*: Elf64_Xword
 
+  Elf64_Sym* = object
+    ## A `.symtab` entry. The field ORDER is the ELF64 one (name, info, other,
+    ## shndx, value, size) — not the ELF32 one, which puts value/size first; the
+    ## two are a classic source of symbol tables that read as garbage.
+    st_name*: Elf64_Word
+    st_info*: uint8
+    st_other*: uint8
+    st_shndx*: Elf64_Half
+    st_value*: Elf64_Addr
+    st_size*: Elf64_Xword
+
   Elf64_Shdr* = object
     sh_name*: Elf64_Word
     sh_type*: Elf64_Word
@@ -77,14 +88,22 @@ const
   PF_R* = 4.Elf64_Word
 
   # Section types
-  SHT_NULL = 0.Elf64_Word
-  SHT_PROGBITS = 1.Elf64_Word
+  SHT_NULL* = 0.Elf64_Word
+  SHT_PROGBITS* = 1.Elf64_Word
+  SHT_SYMTAB* = 2.Elf64_Word
+  SHT_STRTAB* = 3.Elf64_Word
   SHT_NOBITS = 8.Elf64_Word
 
   # Section flags
   SHF_WRITE = 1.Elf64_Xword
-  SHF_ALLOC = 2.Elf64_Xword
-  SHF_EXECINSTR = 4.Elf64_Xword
+  SHF_ALLOC* = 2.Elf64_Xword
+  SHF_EXECINSTR* = 4.Elf64_Xword
+
+  # Symbol binding / type, packed into `st_info` as `(bind shl 4) or typ`.
+  STB_LOCAL* = 0'u8
+  STB_GLOBAL* = 1'u8
+  STT_NOTYPE* = 0'u8
+  STT_FUNC* = 2'u8
 
 proc initHeader*(entry: uint64; machine: Elf64_Half): Elf64_Ehdr =
   result.e_ident[EI_MAG0] = ELFMAG0

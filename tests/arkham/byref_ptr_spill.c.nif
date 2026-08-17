@@ -1,0 +1,93 @@
+(.nif27)
+(.indexat 1)
+(stmts
+ (type :Big.0 .
+  (object .
+   (fld :a.0 .
+    (i 64))
+   (fld :b.0 .
+    (i 64))
+   (fld :c.0 .
+    (i 64))))
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :id.0
+  (params
+   (param :x.0 .
+    (i 64)))
+  (i 64)
+  (pragmas)
+  (stmts
+   (ret x.0)))
+ (proc :sum6.0
+  (params
+   (param :p0.0 . Big.0)
+   (param :p1.0 . Big.0)
+   (param :p2.0 . Big.0)
+   (param :p3.0 . Big.0)
+   (param :p4.0 . Big.0)
+   (param :p5.0 . Big.0))
+  (i 64)
+  (pragmas)
+  (stmts
+   (var :k.0 .
+    (i 64)
+    (call id.0 1))
+   (ret
+    (add
+     (i 64)k.0
+     (add
+      (i 64)
+      (add
+       (i 64)
+       (add
+        (i 64)
+        (add
+         (i 64)
+         (add
+          (i 64)
+          (dot p0.0 a.0 0)
+          (dot p1.0 a.0 0))
+         (dot p2.0 a.0 0))
+        (dot p3.0 a.0 0))
+       (dot p4.0 a.0 0))
+      (dot p5.0 a.0 0))))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :r.0 .
+    (i 64)
+    (call sum6.0
+     (oconstr Big.0
+      (kv a.0 10)
+      (kv b.0 0)
+      (kv c.0 0))
+     (oconstr Big.0
+      (kv a.0 20)
+      (kv b.0 0)
+      (kv c.0 0))
+     (oconstr Big.0
+      (kv a.0 30)
+      (kv b.0 0)
+      (kv c.0 0))
+     (oconstr Big.0
+      (kv a.0 40)
+      (kv b.0 0)
+      (kv c.0 0))
+     (oconstr Big.0
+      (kv a.0 50)
+      (kv b.0 0)
+      (kv c.0 0))
+     (oconstr Big.0
+      (kv a.0 60)
+      (kv b.0 0)
+      (kv c.0 0))))
+   (call exit.0 r.0))))(.index)
