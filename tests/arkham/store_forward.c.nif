@@ -1,0 +1,73 @@
+(.nif27)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :f.0 .
+    (f 64)3.0)
+   (var :s.0 .
+    (f 64)
+    (add
+     (f 64)f.0 f.0))
+   (asgn f.0
+    (add
+     (f 64)f.0 1.0))
+   (asgn s.0
+    (add
+     (f 64)s.0 f.0))
+   (var :g.0 .
+    (f 64)5.0)
+   (var :pg.0 .
+    (ptr
+     (f 64))
+    (addr g.0))
+   (asgn
+    (deref pg.0)7.0)
+   (asgn s.0
+    (add
+     (f 64)s.0 g.0))
+   (var :n.0 .
+    (i 64)1)
+   (if
+    (elif
+     (lt
+      (conv
+       (i 64)s.0)100)
+     (stmts
+      (asgn n.0 2))))
+   (var :m.0 .
+    (i 64)
+    (add
+     (i 64)n.0 n.0))
+   (var :i.0 .
+    (i 64)0)
+   (var :acc.0 .
+    (i 64)0)
+   (while
+    (lt i.0 3)
+    (stmts
+     (asgn acc.0
+      (add
+       (i 64)acc.0 i.0))
+     (asgn i.0
+      (add
+       (i 64)i.0 1))))
+   (call exit.0
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (conv
+       (i 64)s.0)m.0)
+     (add
+      (i 64)acc.0 i.0))))))

@@ -1,0 +1,84 @@
+(.nif27)
+(stmts
+ (type :Frames.0 .
+  (array
+   (ptr
+    (i 64))16))
+ (type :Big.0 .
+  (array
+   (i 64)512))
+ (proc :RtlCaptureStackBackTrace.0
+  (params
+   (param :skip.0 .
+    (u 32))
+   (param :capture.0 .
+    (u 32))
+   (param :backtrace.0 .
+    (ptr
+     (ptr
+      (i 64))))
+   (param :hash.0 .
+    (ptr
+     (u 32))))
+  (u 16)
+  (pragmas
+   (importc "RtlCaptureStackBackTrace")
+   (dynlib "ntdll"))
+  (stmts .))
+ (proc :ExitProcess.0
+  (params
+   (param :code.0 .
+    (u 32))).
+  (pragmas
+   (importc "ExitProcess")
+   (dynlib "kernel32"))
+  (stmts .))
+ (proc :leaf.0
+  (params
+   (param :a.0 .
+    (i 64)))
+  (i 64).
+  (stmts
+   (var :fr.0 . Frames.0 .)
+   (var :n.0 .
+    (u 16)
+    (call RtlCaptureStackBackTrace.0 0 16
+     (addr
+      (at fr.0 0))
+     (nil)))
+   (ret
+    (add
+     (i 64)
+     (conv
+      (i 64)n.0)a.0))))
+ (proc :middle.0
+  (params
+   (param :a.0 .
+    (i 64)))
+  (i 64).
+  (stmts
+   (var :big.0 . Big.0 .)
+   (asgn
+    (at big.0 400)7)
+   (ret
+    (call leaf.0 a.0))))
+ (proc :outer.0
+  (params
+   (param :a.0 .
+    (i 64)))
+  (i 64).
+  (stmts
+   (ret
+    (call middle.0 a.0))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :r.0 .
+    (i 64)
+    (call outer.0 0))
+   (call ExitProcess.0
+    (conv
+     (u 32)r.0)))))

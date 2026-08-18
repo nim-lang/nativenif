@@ -21,6 +21,7 @@ import std / [assertions, tables, sets, os, algorithm, strutils]
 import nifcore, nifcdecl
 import slots, machinedesc, analyser, planer, programs
 import asmbuf, codegen_common, machine_x64, stress
+import tracetable            # the trace table's wire format: `TraceInfoSymbol`
 
 let x64MachineA = stressed(x64Machine)
   ## The machine arkham allocates against: `x64Machine` itself, unless the
@@ -3360,6 +3361,21 @@ proc emitIntrinsicOps(g: var CodeGen; op: IntrinsicOp; argBits: int;
     g.ab.tree RolX64: (g.emReg dst; g.ab.intLit rotCount)
   of RorOp:
     g.ab.tree RorX64: (g.emReg dst; g.ab.intLit rotCount)
+  of StackPointerOp:
+    # The one register arkham otherwise never lets a value be read out of: `rsp`
+    # is the frame, and `asmPinReg` rejects it as a home for exactly that reason.
+    # READING it is a different act — the value is copied out, the frame is
+    # untouched — and it is the only way a program can say where it is on its own
+    # stack.
+    g.ab.tree MovX64: (g.emReg dst; g.ab.reg RSP)
+  of TraceTableOp:
+    # A RIP-relative `lea` against the label nifasm defines for the trace table
+    # (`nifasm/tracetable.nim`). nifasm synthesizes both the label and the bytes;
+    # arkham only has to name it, and naming it is what makes nifasm emit it at
+    # all.
+    g.ab.tree LeaX64:
+      g.emReg dst
+      g.ab.tree LabX64: g.ab.sym TraceInfoSymbol
   else:
     raiseAssert "arkham x64n: no lowering for intrinsic `" & IntrinsicNames[op] & "`"
 
@@ -8192,6 +8208,19 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
       if d.kind == InReg: g.giveBack d.r
     dest = Location(kind: Undef)                # no value: nothing consumes this node
     return
+  if tgt.op.isMachineQuery:
+    # No operands to place and no flags to preserve: the whole node is "put this
+    # machine fact in a register". Taken before the seal/pick machinery below
+    # because that machinery is written around `argCurs[0]` existing.
+    case dest.kind
+    of NeedsReg, RegOrImm: dest = g.takeInstrReg(dest.typ)
+    of Undef: dest = g.takeInstrReg(ScalarSlot)
+    else: discard
+    if dest.kind != InReg:
+      raiseAssert "arkham x64n: intrinsic result is not in a register"
+    if dest.isTemp and not g.rb.isBoundTemp(dest.r): g.bindTemp(dest.r, dest.typ)
+    g.emitIntrinsicOps(tgt.op, tgt.argBits, dest.r, dest.r, 0)
+    return
   # Seal what the LOWERING claims, before anything is picked. `takeInstrReg`'s
   # staging fallback draws from `StagingCandidates`, and RAX sits second there — so
   # starve the pools and a compare-exchange's `desired` lands in RAX, the
@@ -9040,6 +9069,13 @@ proc asmInstr(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor) =
   if row.inoutOperand >= 0:
     lengError c, "`" & IntrinsicNames[tgt.op] & "` writes through its first " &
               "operand and returns nothing; use it as a statement", g.asmInfo
+  if tgt.op.isMachineQuery:
+    # A zero-operand row whose result IS a register value. It is the shape the
+    # operand loop below cannot express (it starts at `argCurs[0]`), and the one
+    # an `.assembler` body most wants: `result = stackPointer()` in a `{.naked.}`
+    # proc reads the caller's frame, which nothing else can.
+    g.emitIntrinsicOps(tgt.op, tgt.argBits, dst, dst, 0)
+    return
   if argCurs.len == 0:
     lengError c, "`" & IntrinsicNames[tgt.op] & "` takes no operands here", g.asmInfo
   var rotCount = 0'i64
@@ -9346,6 +9382,24 @@ proc genAsmProc(g: var CodeGen; info: ProcInfo) =
       while bc.hasMore: skip bc
   g.plan.usedCallee = used * g.md.intCalleeSavedSet
   g.plan.hasStackVars = anyStack
+  if info.isNaked:
+    # `{.naked.}` is a promise about SP, and these two are the only ways an
+    # `.assembler` body can break it. Both are rejected rather than silently
+    # honoured: a `{.stack.}` local would need the frame the pragma just removed,
+    # and a callee-saved register whose `push` never happened is a value returned
+    # to the caller's own home — corruption that surfaces arbitrarily far away.
+    if anyStack:
+      lengError info.decl, "a `{.naked.}` proc has no stack frame, so it cannot " &
+                "declare a `{.stack.}` local", g.asmInfo
+    if g.plan.usedCallee != {}:
+      var names = ""
+      for r in g.md.intCalleeSaved:
+        if r in g.plan.usedCallee:
+          if names.len > 0: names.add ", "
+          names.add x64RegName(r)
+      lengError info.decl, "a `{.naked.}` proc emits no prologue, so it cannot " &
+                "use the callee-saved register(s) " & names &
+                " — the caller's value there would be destroyed", g.asmInfo
   g.pickStackArgBaseX64(hasStackParams = false)
   g.computeFrameX64(isEntry = false, hasCall = false)
   g.ab.tree ProcD:
@@ -9353,8 +9407,9 @@ proc genAsmProc(g: var CodeGen; info: ProcInfo) =
     g.emitSignature(info.decl)
     g.ab.tree StmtsX64:
       g.enterScope()
-      g.framePush()
-      g.emitFrameSub()
+      if not info.isNaked:
+        g.framePush()
+        g.emitFrameSub()
       g.retLabel2 = g.freshLabel()
       g.retLabelUsed2 = false
       var c = info.decl
@@ -9368,7 +9423,10 @@ proc genAsmProc(g: var CodeGen; info: ProcInfo) =
       # the label would leave them stranded after the body's final `jmp`).
       if g.retLabelUsed2: g.emLab(g.retLabel2)
       g.exitScope()
-      g.framePop()
+      # `{.naked.}` drops the epilogue but NOT the `ret`: without a return the
+      # proc would fall into whatever code the linker put next, and "no
+      # prologue/epilogue" is a statement about the frame, not about returning.
+      if not info.isNaked: g.framePop()
       g.ab.keyword RetX64
 
 # MODEL: the `StartEmit` per-proc reset in proofs/arkham_bindings.tla. Every per-proc
@@ -9378,6 +9436,14 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   if info.isAsm:
     g.genAsmProc(info)
     return
+  if info.isNaked:
+    # An allocated body assumes a frame everywhere: a spill goes to an `(s)` slot,
+    # a call needs the outgoing-argument area, a parameter past the sixth is read
+    # relative to the frame. Removing the prologue under it does not produce a
+    # smaller proc, it produces a wrong one — so `{.naked.}` is only ever legal
+    # where every location is declared.
+    lengError info.decl, "`{.naked.}` requires `{.assembler.}`: without a frame " &
+              "the register allocator has nowhere to spill", lengInfo(info.decl)
   # Unlike A64 (where a thread-local goes through a TLV-descriptor thunk call), x64
   # reads/writes a tvar directly as an FS-segment operand — no call — so tvar
   # accesses must NOT mark the proc non-leaf. Hence the empty tvar set here.

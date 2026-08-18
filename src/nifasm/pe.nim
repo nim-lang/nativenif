@@ -6,6 +6,8 @@ when not defined(windows):
   import std / os
 
 import buffers, relocs
+import dwarf   # the per-proc unwind FACTS (`ProcUnwind`); `.pdata`/`.xdata` below
+               # is the third encoding of them, next to `.eh_frame` and Mach-O's
 
 type
   # Import info for dynamic linking (same as macho.nim)
@@ -290,11 +292,85 @@ proc initSectionHeader*(
 proc alignTo(value, alignment: uint32): uint32 =
   (value + alignment - 1) and not (alignment - 1)
 
+# ── x64 exception data: `.pdata` (function table) + `.xdata` (unwind info) ───
+#
+# Windows does not read DWARF. Its unwinder walks a SORTED array of
+# `RUNTIME_FUNCTION{begin, end, unwindInfo}` RVAs found through the PE's
+# exception directory, and each `UNWIND_INFO` describes the prologue as a list
+# of operations in REVERSE order — "to undo this frame from a PC inside it,
+# apply the ops whose offset is ≤ the PC". That is the same fact `.eh_frame`
+# states as a CFA program; only the encoding differs, which is why both come
+# from one `ProcUnwind`.
+#
+# It is not optional on Win64: the ABI has no frame pointer either, so without
+# `.pdata` the OS cannot unwind at all — no backtrace, and (once the runtime
+# grows them) no SEH.
+
+const
+  UWOP_PUSH_NONVOL = 0'u8
+  UWOP_ALLOC_LARGE = 1'u8
+  UWOP_ALLOC_SMALL = 2'u8
+
+proc unwindInfoFor*(p: ProcUnwind): seq[byte] =
+  ## One `UNWIND_INFO` for `p`, or an empty seq when the proc is a LEAF — no
+  ## pushes, no frame — which needs no entry at all: the OS then assumes the
+  ## return address is at `[rsp]`, which for such a proc is exactly true.
+  if p.steps.len == 0: return @[]
+  var codes: seq[byte] = @[]                  # 2 bytes per slot
+  var count = 0
+  # Descending offset order is required: the unwinder replays the prologue
+  # backwards, stopping at the first op that has not executed yet.
+  for i in countdown(p.steps.len - 1, 0):
+    let s = p.steps[i]
+    let off = s.at - p.start
+    if off > 0xFF:
+      # Loud rather than silent: an omitted record does not mean "unknown", it
+      # means "LEAF" to the OS unwinder, which would then read the return address
+      # from the wrong slot. arkham's prologue is a handful of pushes and one
+      # `sub`, so reaching this is a shape change, not a size.
+      quit "nifasm: unwind info: prologue of " & p.name & " exceeds 255 bytes"
+    let prev = (if i > 0: p.steps[i-1].cfaOff else: 8'i32)   # entry: the pushed RA
+    let delta = s.cfaOff - prev
+    if s.saves.len == 1 and delta == 8:
+      codes.add byte(off)
+      codes.add byte(UWOP_PUSH_NONVOL or (uint8(s.saves[0].reg) shl 4))
+      inc count
+    elif s.saves.len == 0 and delta > 0 and (delta and 7) == 0:
+      if delta <= 128:
+        codes.add byte(off)
+        codes.add byte(UWOP_ALLOC_SMALL or (uint8((delta div 8) - 1) shl 4))
+        inc count
+      elif delta < 512 * 1024:
+        codes.add byte(off)
+        codes.add byte(UWOP_ALLOC_LARGE or (0'u8 shl 4))
+        let slots = uint16(delta div 8)
+        codes.add byte(slots and 0xFF); codes.add byte((slots shr 8) and 0xFF)
+        count += 2
+      else:
+        codes.add byte(off)
+        codes.add byte(UWOP_ALLOC_LARGE or (1'u8 shl 4))
+        let v = uint32(delta)
+        codes.add byte(v and 0xFF); codes.add byte((v shr 8) and 0xFF)
+        codes.add byte((v shr 16) and 0xFF); codes.add byte((v shr 24) and 0xFF)
+        count += 3
+    else:
+      quit "nifasm: unwind info: unmodelled prologue step in " & p.name &
+           " (cfa delta " & $delta & ", " & $s.saves.len & " saves)"
+  result = @[]
+  result.add 1'u8                             # version 1, no flags
+  result.add byte(p.steps[^1].at - p.start)   # SizeOfProlog
+  result.add byte(count)                      # CountOfCodes
+  result.add 0'u8                             # no frame register
+  for b in codes: result.add b
+  if (count and 1) != 0:                      # the code array is DWORD-aligned
+    result.add 0'u8; result.add 0'u8
+
 proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
               entryOffset: uint32; machine: uint16; outfile: string;
               dynlink: DynLinkInfo = DynLinkInfo();
               absSites: seq[AbsSite] = @[];
-              patch: PePatchProc = nil) =
+              patch: PePatchProc = nil;
+              unwind: seq[ProcUnwind] = @[]) =
   ## Write a PE executable file.
   ##
   ## `dataImage` is the writable data section's initial contents (`bssSize` bytes; a
@@ -340,6 +416,21 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
   if hasData:
     inc numSections  # .data: globals (zero-filled unless statically initialized)
   inc numSections  # .reloc for ASLR support
+  # `.pdata`: the x64 function table plus the `UNWIND_INFO` blobs it points at.
+  # One section for both — the exception directory addresses the table by RVA and
+  # each record addresses its own blob the same way, so nothing requires them to
+  # be apart. Collected here because it decides the section COUNT; the bytes are
+  # filled in once the RVAs are known.
+  var pdataFns: seq[(int, int, seq[byte])] = @[]     # (begin, end, unwind info)
+  # x86-64 only: ARM64 Windows encodes its unwind data with a different opcode
+  # set entirely, so emitting these there would be worse than emitting nothing.
+  if machine == IMAGE_FILE_MACHINE_AMD64:
+    for p in unwind:
+      if p.stop <= p.start: continue
+      let ui = unwindInfoFor(p)
+      if ui.len > 0: pdataFns.add (p.start, p.stop, ui)
+  let hasPdata = pdataFns.len > 0
+  if hasPdata: inc numSections
 
   let sectionHeadersSize = uint32(numSections) * sizeof(IMAGE_SECTION_HEADER).uint32
 
@@ -553,6 +644,29 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
   let relocRva = sizeOfImage
   sizeOfImage = relocRva + alignTo(relocSize, SECTION_ALIGNMENT)
 
+  # `.pdata` last: now that `textRva` and its own RVA are known, the three RVAs of
+  # each `RUNTIME_FUNCTION` can be baked in. The array must be SORTED by start
+  # address — the OS binary-searches it — which it is, because procs are recorded
+  # in emission order and that is address order.
+  let pdataRva = sizeOfImage
+  var pdataBytes: seq[byte] = @[]
+  if hasPdata:
+    let tableSize = pdataFns.len * 12
+    var blobs: seq[byte] = @[]
+    var blobOff: seq[int] = @[]
+    for it in pdataFns:
+      while (blobs.len and 3) != 0: blobs.add 0'u8   # UNWIND_INFO is DWORD-aligned
+      blobOff.add tableSize + blobs.len
+      for b in it[2]: blobs.add b
+    template addRva(v: uint32) =
+      for i in 0 ..< 4: pdataBytes.add byte((v shr (8 * i)) and 0xFF)
+    for i in 0 ..< pdataFns.len:
+      addRva(textRva + uint32(pdataFns[i][0]))
+      addRva(textRva + uint32(pdataFns[i][1]))
+      addRva(pdataRva + uint32(blobOff[i]))
+    for b in blobs: pdataBytes.add b
+    sizeOfImage = pdataRva + alignTo(uint32(pdataBytes.len), SECTION_ALIGNMENT)
+
   # Create headers
   var dosHeader = initDosHeader(peSignatureOffset)
   var fileHeader = initFileHeader(machine, numSections, uint16(optHeaderSize))
@@ -574,6 +688,13 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
   # Set base relocation directory
   optHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress = relocRva
   optHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size = relocSize
+
+  # The exception directory addresses the FUNCTION TABLE only — its size is the
+  # table's, not the section's, since the `UNWIND_INFO` blobs share the section
+  # but are reached through each record's third RVA.
+  if hasPdata:
+    optHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress = pdataRva
+    optHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size = uint32(pdataFns.len * 12)
 
   # Create section headers
   var textSection = initSectionHeader(
@@ -632,6 +753,21 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
     IMAGE_SCN_CNT_INITIALIZED_DATA or IMAGE_SCN_MEM_READ or IMAGE_SCN_MEM_DISCARDABLE
   )
 
+  var pdataSection: IMAGE_SECTION_HEADER
+  var pdataFileOffset = 0'u32
+  var pdataRawSize = 0'u32
+  if hasPdata:
+    pdataFileOffset = relocFileOffset + relocRawSize
+    pdataRawSize = alignTo(uint32(pdataBytes.len), FILE_ALIGNMENT)
+    pdataSection = initSectionHeader(
+      ".pdata",
+      uint32(pdataBytes.len),
+      pdataRva,
+      pdataRawSize,
+      pdataFileOffset,
+      IMAGE_SCN_CNT_INITIALIZED_DATA or IMAGE_SCN_MEM_READ
+    )
+
   # Write file
   var f = newFileStream(outfile, fmWrite)
   if f == nil:
@@ -661,6 +797,8 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
   if hasData:
     f.writeData(unsafeAddr dataSection, sizeof(dataSection))
   f.writeData(unsafeAddr relocSection, sizeof(relocSection))
+  if hasPdata:
+    f.writeData(unsafeAddr pdataSection, sizeof(pdataSection))
 
   # Padding to first section
   let currentPos = peSignatureOffset + peSignatureSize + fileHeaderSize + optHeaderSize + sectionHeadersSize
@@ -735,6 +873,14 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
   if relocPadding > 0:
     var zeros = newSeq[byte](relocPadding)
     f.writeData(unsafeAddr zeros[0], relocPadding)
+
+  # .pdata section: the function table, then the `UNWIND_INFO` blobs
+  if hasPdata:
+    f.writeData(unsafeAddr pdataBytes[0], pdataBytes.len)
+    let pdataPadding = int(pdataRawSize) - pdataBytes.len
+    if pdataPadding > 0:
+      var zeros = newSeq[byte](pdataPadding)
+      f.writeData(unsafeAddr zeros[0], pdataPadding)
 
   f.close()
 

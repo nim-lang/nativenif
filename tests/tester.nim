@@ -102,6 +102,11 @@ const arkhamA64Unsupported: seq[string] = @[
   # mode's premise ("no fallbacks", doc/intrinsics.md §8), not a gap: an AArch64
   # version is a different `when` branch the user writes, with `x0`/`x9` in it.
   "assembler_x64",
+  # `{.naked.}` — the same story as `assembler_x64` (it may only accompany it),
+  # plus the `TraceTable` row, whose `targets` is x86-64 alone until the AArch64
+  # stack walk exists. The table itself IS emitted on every target; what is
+  # missing is the walk that reads it (`lib/std/stacktraces`).
+  "naked_stacktrace_x64",
   # Six by-ref array params exhaust x86-64's FIVE callee-saved registers, so the
   # sixth pointer spills to a `StackPtr` slot — the shape this fixture exists to
   # pin (`genAconstr2` must store through that pointer, not over the slot).
@@ -166,6 +171,14 @@ const arkhamRejections: seq[(string, string)] = @[
   # meant eight of them. Offsetting an array pointer is `(at …)`/`(pat …)`.
   ("err_ptr_arith", "arithmetic result type is a pointer (ptr)"),
   ("err_aptr_arith", "arithmetic result type is a pointer (aptr)"),
+  # `{.naked.}` is a promise about SP, and each of these three breaks it in a way
+  # that produces no diagnostic of its own: an allocated body would spill into a
+  # frame that is not there, a `{.stack.}` local names a slot in that same frame,
+  # and a callee-saved register whose `push` never happened hands the caller back
+  # a destroyed value — corruption that surfaces arbitrarily far from the cause.
+  ("err_naked_alone", "`{.naked.}` requires `{.assembler.}`"),
+  ("err_naked_stack", "cannot declare a `{.stack.}` local"),
+  ("err_naked_callee", "cannot use the callee-saved register(s) rbx"),
 ]
 
 proc arkhamRejectionTests(arkham: string) =
@@ -179,6 +192,103 @@ proc arkhamRejectionTests(arkham: string) =
                       " " & quoteShell("tests" / "arkham" / (name & ".c.nif")), expected)
     inc passed
   echo passed, " / ", arkhamRejections.len, " arkham rejection tests successful"
+
+proc arkhamDebugInfoTests() =
+  ## nifasm emits `.symtab` + `.eh_frame`, so a debugger can name and unwind
+  ## frames in code that keeps NO frame pointer. Assert that end to end, through
+  ## GDB itself: break in the innermost proc of a four-deep chain and demand the
+  ## whole chain back, in order, by name.
+  ##
+  ## Worth an external tool in the harness because the two halves fail
+  ## independently and quietly: wrong DWARF register numbers still produce a
+  ## plausible-looking trace, and a prologue whose CFA states are not recorded
+  ## unwinds correctly right up until the crash happens in a frame that has one.
+  ## Only the debugger's own reader can tell us the tables mean what we think.
+  if findExe("gdb").len == 0:
+    echo "0 / 0 arkham debug-info tests (gdb not installed)"
+    return
+  let exe = "tests" / "arkham" / "nimcache" / "debuginfo_chain.out"
+  if not fileExists(exe):
+    quit "FAILURE arkham debug-info: " & exe & " was not built"
+  let (s, _) = execCmdEx("gdb -batch -ex \"break leaf.0\" -ex run -ex bt " &
+                         quoteShell(exe))
+  # GDB prints one `#N 0x… in NAME ()` per frame; it renders `leaf.0` as `leaf`.
+  var at = 0
+  for want in ["in leaf ", "in middle ", "in outer ", "in main "]:
+    let idx = s.find(want, at)
+    if idx < 0:
+      quit "FAILURE arkham debug-info: no `" & want & "` frame in the backtrace\n" & s
+    at = idx
+  if s.contains("?? ()"):
+    quit "FAILURE arkham debug-info: unnamed frame in the backtrace\n" & s
+  echo "1 / 1 arkham debug-info tests successful"
+
+proc arkhamWinUnwindTests() =
+  ## The Win64 half of the same story: `.pdata` + `.xdata`, checked by the ONLY
+  ## authority that matters — the operating system's own unwinder.
+  ##
+  ## `tests/win_stacktrace.c.nif` calls `RtlCaptureStackBackTrace` from four
+  ## frames down and exits with the number of frames the OS could walk. Wine
+  ## implements that through `RtlVirtualUnwind`, which reads the exception
+  ## directory, so the exit code IS the answer to "does our unwind info work".
+  ## The `--no-debug-info` control run is what makes it a measurement rather
+  ## than a hope: without `.pdata` every proc looks like a leaf and the walk
+  ## stops at 1.
+  if findExe("wine").len == 0:
+    echo "0 / 0 arkham win64 unwind tests (wine not installed)"
+    return
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasm = ("src" / "nifasm" / "nifasm").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham" / "nimcache"
+  let asmNif = workDir / "win_stacktrace.asm.nif"
+  let exe = workDir / "win_stacktrace.exe"
+  let bare = workDir / "win_stacktrace_nodbg.exe"
+  exec quoteShell(arkham) & " -a:win_x64 -o:" & quoteShell(asmNif) & " " &
+       quoteShell("tests" / "win_stacktrace.c.nif")
+  exec quoteShell(nifasm) & " -o:" & quoteShell(exe) & " " & quoteShell(asmNif)
+  exec quoteShell(nifasm) & " --no-debug-info -o:" & quoteShell(bare) & " " &
+       quoteShell(asmNif)
+  let (_, frames) = execCmdEx("wine " & quoteShell(exe) & " 2>/dev/null")
+  let (_, bareFrames) = execCmdEx("wine " & quoteShell(bare) & " 2>/dev/null")
+  if frames < 4:
+    quit "FAILURE arkham win64 unwind: the OS walked only " & $frames &
+         " frames of a four-deep stack — .pdata/.xdata is wrong or missing"
+  if bareFrames >= frames:
+    quit "FAILURE arkham win64 unwind: --no-debug-info walked " & $bareFrames &
+         " frames too, so the " & $frames & " prove nothing"
+  echo "1 / 1 arkham win64 unwind tests successful (", frames, " frames vs ",
+       bareFrames, " without)"
+
+proc arkhamWinTraceTableTests() =
+  ## The runtime trace table (`doc/tracetable.md`) on the PE path, checked under
+  ## Wine. Worth its own run because the table is written by each object writer
+  ## SEPARATELY, after that writer's own layout passes: `writeElf` fills it after
+  ## the jump shortener and the alignment pass have moved every proc, `writeExe`
+  ## before either exists. A table whose offsets were computed against the wrong
+  ## layout still has the right magic and the right count — it just names the
+  ## wrong procs — so only running the walk catches it.
+  ##
+  ## `tests/win_tracetable.c.nif` is the ELF fixture `naked_stacktrace_x64` with
+  ## `ExitProcess` in place of `exit`: a `{.naked.}` proc hands back its caller's
+  ## frame, and the program exits with 1|2|4 for the three things that must hold
+  ## — the table's magic, the return address lying below the table, and lying
+  ## within a megabyte of it.
+  if findExe("wine").len == 0:
+    echo "0 / 0 arkham win64 trace-table tests (wine not installed)"
+    return
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasm = ("src" / "nifasm" / "nifasm").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham" / "nimcache"
+  let asmNif = workDir / "win_tracetable.asm.nif"
+  let exe = workDir / "win_tracetable.exe"
+  exec quoteShell(arkham) & " -a:win_x64 -o:" & quoteShell(asmNif) & " " &
+       quoteShell("tests" / "win_tracetable.c.nif")
+  exec quoteShell(nifasm) & " -o:" & quoteShell(exe) & " " & quoteShell(asmNif)
+  let (_, code) = execCmdEx("wine " & quoteShell(exe) & " 2>/dev/null")
+  if code != 7:
+    quit "FAILURE arkham win64 trace table: exit code " & $code &
+         " (want 7 = magic|below-table|near-table)"
+  echo "1 / 1 arkham win64 trace-table tests successful"
 
 proc arkhamTests() =
   ## Each `tests/arkham/*.c.nif` is hand-written Leng: arkham generates asm-NIF,
@@ -681,6 +791,12 @@ when (defined(linux) and defined(amd64)) or (defined(macosx) and defined(arm64))
 # The `{.assembler.}` rejections are x86-64-only (see `arkhamRejectionTests`).
 when defined(linux) and defined(amd64):
   arkhamRejectionTests(("bin" / "arkham").addFileExt(ExeExt))
+  # The debug-info check runs on the x86-64 host binaries `arkhamTests` just
+  # built; the AArch64 half of the same tables is covered by the qemu pass only
+  # as far as "the program still runs" — a host GDB cannot read its registers.
+  arkhamDebugInfoTests()
+  arkhamWinUnwindTests()
+  arkhamWinTraceTableTests()
 
 # Additionally exercise the AArch64 backend on an x86-64 Linux host by emitting the
 # `linux_arm64` ELF variant and running it under qemu-aarch64 (no-op if qemu is
