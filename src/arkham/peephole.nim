@@ -311,6 +311,14 @@ proc flagsDeadAfter(buf: var TokenBuf; after: Cursor): bool =
 
 let bodyFpDump = getEnv("ARKHAM_BODYFP").len > 0
 
+var gArch = "x64"
+  ## The target the buffer being rewritten is code for; set once per `peephole`
+  ## call (the pass is not reentrant, same as `bodyFpDump`). Only `BodyLib`
+  ## entries of this arch may splice.
+var gFold = true
+  ## Whether the mov/lea folding rules run. They are x86-64 shapes (`immAnyDest`);
+  ## on AArch64 the walk still runs for the whole-proc body replacement alone.
+
 proc fpDefs(buf: var TokenBuf; c: var Cursor; defs: var HashSet[SymId]) =
   case c.kind
   of SymbolDef:
@@ -414,7 +422,7 @@ proc matchBody(buf: var TokenBuf; procNode: Cursor): int =
     stderr.writeLine "BODYFP " & procDeclName(buf, procNode) &
       " fp=0x" & toHex(fp) & " toks=" & $toks
   for i in 0 ..< BodyLib.len:
-    if BodyLib[i].fp == fp and BodyLib[i].toks == toks:
+    if BodyLib[i].arch == gArch and BodyLib[i].fp == fp and BodyLib[i].toks == toks:
       return i
 
 proc emitSubst(buf: var TokenBuf; c: var Cursor; dest: var TokenBuf; t, s: SymId) =
@@ -449,10 +457,11 @@ proc trNode(buf: var TokenBuf; c: var Cursor; dest: var TokenBuf; occs: Occs;
       # Rescope the fact tables to THIS proc: locals of different procs share
       # names (`x.47`, `ap.1`, …), so module-wide tables poison almost every
       # register home and blur liveness across proc boundaries.
-      var scan = c
       var procOccs = initTable[SymId, seq[Occ]]()
       var procHomes = initTable[SymId, string]()
-      collectOccs(buf, scan, false, procOccs, procHomes)
+      if gFold:
+        var scan = c
+        collectOccs(buf, scan, false, procOccs, procHomes)
       dest.openTag c.cursorTagId
       c.loopInto:
         trList(buf, c, dest, procOccs, procHomes, folded)
@@ -469,6 +478,10 @@ proc trNode(buf: var TokenBuf; c: var Cursor; dest: var TokenBuf; occs: Occs;
 proc trList(buf: var TokenBuf; c: var Cursor; dest: var TokenBuf; occs: Occs;
             homes: Homes; folded: var int) =
   ## One step of a sibling walk, with the one-node lookahead the rules need.
+  if not gFold:
+    # Replacement-only mode (AArch64): the walk exists for `matchBody` alone.
+    trNode(buf, c, dest, occs, homes, folded)
+    return
   var dst: SymId
   var immNode: Cursor
   if movImmDest(buf, c, dst, immNode):
@@ -618,7 +631,7 @@ proc trList(buf: var TokenBuf; c: var Cursor; dest: var TokenBuf; occs: Occs;
                     dest.closeTag()
   trNode(buf, c, dest, occs, homes, folded)
 
-proc peephole*(buf: var TokenBuf; immAnyDest: bool): int =
+proc peephole*(buf: var TokenBuf; immAnyDest: bool; arch: string): int =
   ## Rewrite `buf` in place; returns the number of instructions removed.
   ##
   ## `immAnyDest` states that the target can carry an immediate into ANY `mov`
@@ -627,11 +640,18 @@ proc peephole*(buf: var TokenBuf; immAnyDest: bool): int =
   ## a register regardless and folding would only move the work, not remove it.
   ## Since a bare-symbol destination is a stack slot or a register home depending
   ## on a `(var …)` far above, the two cannot be told apart HERE; the target
-  ## answers for both.
-  if not immAnyDest: return 0
+  ## answers for both. The whole-proc body replacement is NOT gated on it: it
+  ## runs on every target that has `BodyLib` entries (keyed by `arch`).
+  gArch = arch
+  gFold = immAnyDest
+  if not gFold:
+    var anyEntry = bodyFpDump
+    for e in BodyLib:
+      if e.arch == arch: anyEntry = true
+    if not anyEntry: return 0
   var occs = initTable[SymId, seq[Occ]]()
   var homes = initTable[SymId, string]()
-  block:
+  if gFold:
     var c = beginRead(buf)
     while c.hasMore:
       collectOccs(buf, c, false, occs, homes)

@@ -3743,6 +3743,62 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     if dstSingle: arm64.emitFcvtToSingle(ctx.buf.data, rd, rn)  # double → single
     else:         arm64.emitFcvtToDouble(ctx.buf.data, rd, rn)  # single → double
 
+  of FldrqA64:
+    # (fldrq D <mem>) — 128-bit q load; D names the v register by its d/s tag.
+    inc n
+    let rt = parseFloatOperandA64(n, ctx)
+    let op = parseOperandA64(n, ctx)
+    if op.kind != okMem: error("FLDRQ source must be memory", n)
+    arm64.emitLdrQ(ctx.buf.data, rt, op.mem.base, op.mem.offset)
+
+  of FstrqA64:
+    # (fstrq <mem> D) — 128-bit q store, operand order as `fstr`.
+    inc n
+    let dest = parseOperandA64(n, ctx)
+    if dest.kind != okMem: error("FSTRQ destination must be memory", n)
+    let rt = parseFloatOperandA64(n, ctx)
+    arm64.emitStrQ(ctx.buf.data, rt, dest.mem.base, dest.mem.offset)
+
+  of VfaddA64, VfsubA64, VfmulA64, VfmlaA64:
+    # (vop D A B bits?) — lane-wise vector fp; `.2d` when d-spelled, `.4s` when
+    # s-spelled. The optional trailing lane-bits literal (32/64) overrides the
+    # spelling-derived arrangement: a 128-bit VALUE binding (`(f 128)`, arkham's
+    # vector locals) names the register without naming a lane width, so the
+    # instruction carries it explicitly — the same shape as `(clz D S N)`.
+    inc n
+    var single = isA64FpSingle(n, ctx)
+    let rd = parseFloatOperandA64(n, ctx)
+    let ra = parseFloatOperandA64(n, ctx)
+    let rb = parseFloatOperandA64(n, ctx)
+    if n.kind == IntLit:
+      single = int(n.intVal) == 32
+      inc n
+    case instTag
+    of VfaddA64: arm64.emitVFadd(ctx.buf.data, rd, ra, rb, single)
+    of VfsubA64: arm64.emitVFsub(ctx.buf.data, rd, ra, rb, single)
+    of VfmulA64: arm64.emitVFmul(ctx.buf.data, rd, ra, rb, single)
+    else:        arm64.emitVFmla(ctx.buf.data, rd, ra, rb, single)
+
+  of VdupA64:
+    # (vdup D S bits?) — broadcast S's lane 0 to every lane of D; trailing
+    # lane-bits literal as in `vfadd`.
+    inc n
+    var single = isA64FpSingle(n, ctx)
+    let rd = parseFloatOperandA64(n, ctx)
+    let rn = parseFloatOperandA64(n, ctx)
+    if n.kind == IntLit:
+      single = int(n.intVal) == 32
+      inc n
+    arm64.emitVDup(ctx.buf.data, rd, rn, single)
+
+  of VeorA64:
+    # (veor D A B) — 16-byte xor; `(veor X X X)` zeroes X.
+    inc n
+    let rd = parseFloatOperandA64(n, ctx)
+    let ra = parseFloatOperandA64(n, ctx)
+    let rb = parseFloatOperandA64(n, ctx)
+    arm64.emitVEor(ctx.buf.data, rd, ra, rb)
+
   of BA64:
     inc n
     let op = parseOperandA64(n, ctx)

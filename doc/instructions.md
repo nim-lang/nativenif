@@ -500,3 +500,11 @@
 | `(shufps D S N)`      | X64Inst                     | shuffle packed singles: each of D's 4 lanes picks a source lane by the 2-bit fields of immediate N (low two from D, high two from S); `(shufps X X 0)` broadcasts lane 0 to all 4 |
 | `(repstosb)`          | X64Inst                     | repeat store byte string: fills `rcx` bytes at `[rdi]` with `al`, advancing `rdi`; `rcx` ends 0 (DF=0 per SysV) |
 | `(repstosq)`          | X64Inst                     | repeat store qword string: fills `rcx` qwords at `[rdi]` with `rax`, advancing `rdi`; `rcx` ends 0 |
+| `(fldrq D S)`         | A64Inst                     | load a 128-bit q register from memory (`ldr Qt, [Xn, #imm]`, imm a multiple of 16). `D` is spelled as the register's d/s tag — the q width is the instruction's, exactly as `movdqu`'s 16-byte access is on x64 |
+| `(fstrq D S)`         | A64Inst                     | store a 128-bit q register: `(fstrq <mem> <fpreg>)`, operand order as `fstr` |
+| `(vfadd D A B)`       | A64Inst                     | vector fp add, lane-wise (D = A + B): arrangement `.2d` when the registers are d-spelled, `.4s` when s-spelled |
+| `(vfsub D A B)`       | A64Inst                     | vector fp subtract, lane-wise (D = A - B), arrangement as `vfadd` |
+| `(vfmul D A B)`       | A64Inst                     | vector fp multiply, lane-wise (D = A * B), arrangement as `vfadd` |
+| `(vfmla D A B)`       | A64Inst                     | vector fp fused multiply-add, lane-wise (D = D + A * B), arrangement as `vfadd` |
+| `(vdup D S)`          | A64Inst                     | broadcast lane 0 of S to every lane of D (`dup Vd.2d, Vn.d[0]` when d-spelled, `.4s/.s[0]` when s-spelled) |
+| `(veor D A B)`        | A64Inst                     | vector bitwise xor over all 16 bytes (`eor Vd.16b`); `(veor X X X)` zeroes X |

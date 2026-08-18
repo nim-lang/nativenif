@@ -288,6 +288,12 @@ const arkhamStressA64Known: seq[string] = @[
   # out-of-registers assert, but can never legitimately change what a program
   # computes, so a wrong answer here is a codegen bug by construction.
   "spill_produce_float",    # float produce-into-spill reads a clobbered register
+  # `a64_vec_instr` holds six 128-bit vector locals live at once; a `(f 128)`
+  # local has NO spill form (the scalar float spill moves 8 bytes and would
+  # silently truncate the upper lane), so when the stress-starved SIMD pool
+  # cannot home one, arkham fails LOUDLY at the declaration — the designed
+  # out-of-registers error, not a miscompile. See `genVarDecl2`'s vec guard.
+  "a64_vec_instr",
   # (`atomic_cas_regpressure` lived here for the missing steal/spill arm on the
   # intrinsic-operand pick, and now passes at this list's own k=3.)
   # `instrOperandInPlace` — read a register-homed symbol operand where it lies
@@ -482,6 +488,11 @@ when defined(macosx):
   # materialization from the NZCV flags. Exits 0 only if every result is correct.
   exec "nim c -r src/nifasm/nifasm tests/a64_csel.nif"
   exec "tests/a64_csel"
+  # AdvSIMD/NEON q-register forms (fldrq/fstrq/vfadd/vfsub/vfmul/vfmla/vdup/veor),
+  # both arrangements (.2d via d-spelled regs, .4s via s-spelled). Exits 0 only if
+  # every lane computes correctly.
+  exec "nim c -r src/nifasm/nifasm tests/a64_neon.nif"
+  exec "tests/a64_neon"
 elif defined(windows):
   exec "nim c -r src/nifasm/nifasm tests/hello_win64.nif"
   execRun("tests" / "hello_win64.exe")

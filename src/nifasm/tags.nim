@@ -503,6 +503,14 @@ type
     ShufpsTagId
     RepstosbTagId
     RepstosqTagId
+    FldrqTagId
+    FstrqTagId
+    VfaddTagId
+    VfsubTagId
+    VfmulTagId
+    VfmlaTagId
+    VdupTagId
+    VeorTagId
 const
   TagData*: array[TagEnum, (string, int)] = [
     ("InvalidTagId", 0),
@@ -1005,5 +1013,13 @@ const
     ("mulps", 497),
     ("shufps", 498),
     ("repstosb", 499),
-    ("repstosq", 500)
+    ("repstosq", 500),
+    ("fldrq", 501),
+    ("fstrq", 502),
+    ("vfadd", 503),
+    ("vfsub", 504),
+    ("vfmul", 505),
+    ("vfmla", 506),
+    ("vdup", 507),
+    ("veor", 508)
   ]

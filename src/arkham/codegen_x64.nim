@@ -9566,6 +9566,7 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: x64MachineA)
   g.ab.renderReg = x64RegName                 # render register slots as x86 names
   g.ab.immAnyDest = true                      # `mov r/m, imm32` exists here
+  g.ab.arch = "x64"                           # BodyLib entries this target may splice
   g.prog = collect(buf, inputPath, tags, windows = windows)
   g.callTarget = g.prog.callTarget
   g.globals = g.prog.globals
