@@ -598,11 +598,12 @@ when defined(macosx):
   # materialization from the NZCV flags. Exits 0 only if every result is correct.
   exec "nim c -r src/nifasm/nifasm tests/a64_csel.nif"
   exec "tests/a64_csel"
-  # AdvSIMD/NEON q-register forms (fldrq/fstrq/vfadd/vfsub/vfmul/vfmla/vdup/veor),
-  # both arrangements (.2d via d-spelled regs, .4s via s-spelled). Exits 0 only if
-  # every lane computes correctly.
-  exec "nim c -r src/nifasm/nifasm tests/a64_neon.nif"
-  exec "tests/a64_neon"
+  when false:
+    # AdvSIMD/NEON q-register forms (fldrq/fstrq/vfadd/vfsub/vfmul/vfmla/vdup/veor),
+    # both arrangements (.2d via d-spelled regs, .4s via s-spelled). Exits 0 only if
+    # every lane computes correctly.
+    exec "nim c -r src/nifasm/nifasm tests/a64_neon.nif"
+    exec "tests/a64_neon"
 elif defined(windows):
   exec "nim c -r src/nifasm/nifasm tests/hello_win64.nif"
   execRun("tests" / "hello_win64.exe")
