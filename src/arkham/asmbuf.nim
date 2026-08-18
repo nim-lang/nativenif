@@ -168,5 +168,5 @@ proc render*(a: var AsmBuf; dottedSuffix = ""): string =
   ## emitters produce rather than the intentions behind them (see peephole.nim).
   ## `-d:arkhamNoPeephole` turns it off for a bisect.
   when not defined(arkhamNoPeephole):
-    discard peephole(a.buf, a.immAnyDest, a.arch)
+    discard peephole(a.buf, a.immAnyDest)
   toModuleString(a.buf, dottedSuffix)
