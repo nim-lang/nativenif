@@ -5735,15 +5735,20 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         else: skip cc
       if selBridge != NoReg: g.dropBridge selBridge
       elif selLoc.isTemp: g.unbindTemp(selReg)
-      if hasElse:
-        var e = elseBody
-        e.into:
-          while e.hasMore: (g.genStmt2(e); skip e)
-      g.emBr(BA64, lEnd)
+      # EMISSION ORDER MUST FOLLOW LENG ORDER — see the x64 twin. The `else` body is
+      # Leng-LAST, so emitting it before the of-bodies retires every binding whose
+      # last use lies inside an of-branch.
+      let lElse = if hasElse: g.freshLabel() else: lEnd
+      g.emBr(BA64, lElse)
       for (lBody, bc) in bodies:
         g.emLab(lBody)
         g.genStmt2(bc)
         g.emBr(BA64, lEnd)
+      if hasElse:
+        g.emLab(lElse)
+        var e = elseBody
+        e.into:
+          while e.hasMore: (g.genStmt2(e); skip e)
     g.emLab(lEnd)
   of LabS:
     var cc = c

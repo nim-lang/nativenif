@@ -119,13 +119,36 @@ proc collectOccs(buf: var TokenBuf; c: var Cursor; parentIsKill: bool; occs: var
     inc c
 
 proc deadAfter(occs: Occs; s: SymId; pos: int): bool =
-  ## Is `s` dead after token `pos`? True when its next mention is not a read.
-  ## Conservative by construction: an unknown symbol, or one whose next mention
-  ## is a plain operand, answers false.
+  ## Is `s` dead after token `pos`? True when EVERY later mention is a `(kill …)`
+  ## or a definition — never a read.
+  ##
+  ## The first later mention is not the answer, because the token stream is not a
+  ## straight line: arkham emits jumps and labels, so a `(kill x)` can sit on a
+  ## path this position jumps OVER, and a `(rebind :x …)` past it revives the name
+  ## for reads on the other path. That is exactly the bounds-check shape —
+  ##
+  ##     (mov idx S) (test idx idx) (jge L)
+  ##     (prepare panic (kill idx) … (call)) (rebind :idx …)
+  ##     (lab :L) (cmp idx len)          <- reads it
+  ##
+  ## — where taking the `kill` as the liveness statement deleted the copy and left
+  ## `idx` holding whatever was in the register (nifasm cannot catch it: every
+  ## operand stays well-typed and properly bound). Requiring ALL later mentions to
+  ## be benign needs no control-flow analysis of our own and still fires for the
+  ## scratch temps the rule exists for — arkham kills those once and never mentions
+  ## them again.
+  ##
+  ## Still assumed, and true of everything arkham emits: no BACK edge re-reads `s`
+  ## at a position before `pos` without the copy being re-executed with it (a
+  ## loop-carried read has its producer inside the same loop body).
+  ## Conservative by construction: an unknown symbol answers false.
   let lst = occs.getOrDefault(s)
+  var sawLater = false
   for o in lst:
-    if o.pos > pos: return o.benign
-  false                       # nothing follows: the binding outlives the proc's
+    if o.pos > pos:
+      if not o.benign: return false
+      sawLater = true
+  sawLater                    # nothing follows: the binding outlives the proc's
                               # view here, so do not assume it is dead
 
 proc movImmDest(buf: var TokenBuf; c: Cursor; dst: var SymId; imm: var Cursor): bool =
