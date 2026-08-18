@@ -31,7 +31,9 @@
 ##    address, which a non-allocated section does not have. Keeping the section
 ##    out of every `PT_LOAD` is what makes this cost exactly zero at run time.
 
-import std / assertions
+import std / [assertions, algorithm]
+import tracetable
+export tracetable
 
 type
   CfiSave* = object
@@ -228,3 +230,23 @@ proc buildEhFrame*(procs: openArray[ProcUnwind]; arch: DwarfArch;
     result.addU32 uint32(fdeAt + 4 - cieAt)         # CIE pointer: BACKWARD distance
     for x in body: result.add x
   result.addU32 0                                   # terminator
+
+proc bodyCfaOff*(p: ProcUnwind; arch: DwarfArch): int =
+  ## The CFA offset that holds for the whole body: the state the LAST prologue
+  ## step left behind, or — for a proc with no prologue at all (a leaf that
+  ## needed no frame, a `{.naked.}` proc) — the ABI's entry state, which is what
+  ## `pass2Proc` seeds `cfaOff` with.
+  result = (if arch == dwA64: 0 else: 8)
+  if p.steps.len > 0: result = int(p.steps[^1].cfaOff)
+
+proc collectTraceProcs*(unwind: openArray[ProcUnwind]; arch: DwarfArch): seq[TraceProc] =
+  ## The runtime trace table's rows, in ascending code order — which is what lets
+  ## the runtime binary search. Emission order already is address order, but the
+  ## table's contract says sorted, so it is sorted here rather than assumed by the
+  ## reader.
+  result = @[]
+  for p in unwind:
+    if p.stop <= p.start: continue
+    result.add TraceProc(codeOff: p.start, codeLen: p.stop - p.start,
+                         cfaOff: bodyCfaOff(p, arch), name: p.name)
+  result.sort(proc (a, b: TraceProc): int = cmp(a.codeOff, b.codeOff))

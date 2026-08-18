@@ -5866,6 +5866,12 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
     # a different `when` branch the user must write.
     lengError info.decl, "an `.assembler` proc is not supported by the AArch64 " &
               "backend yet; its register pins name x86-64 registers", lengInfo(info.decl)
+  if info.isNaked:
+    # `{.naked.}` only ever comes with `{.assembler.}` (x86-64 rejects the pair
+    # otherwise), so reaching here means the pragma alone — still worth naming,
+    # since the AArch64 answer is the same and for the same reason.
+    lengError info.decl, "`{.naked.}` requires `{.assembler.}`, which the AArch64 " &
+              "backend does not support yet", lengInfo(info.decl)
   if not g.cleanSigComputed:                   # compute the clean-signature set once
     g.cleanSigProcs = cleanSigProcNames(g.prog)
     g.noReturnProcs = noReturnProcs(g.prog)
