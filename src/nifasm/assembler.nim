@@ -4,7 +4,7 @@ import nifcore, nifcoreparse, nifmodules
 import "../../../nimony/src/lib" / [nifreader, symparser]
 import tags, model, tagconv
 import buffers, relocs, x86, arm64, elf, macho, pe
-import dwarf
+import dwarf, tracetable
 import sem, slots
 import decls
 
@@ -536,6 +536,16 @@ type
     # entry prologue that points FS at it (`arch_prctl`). Nim thread-locals have no
     # initializers, so the block is just zeroed `.bss`.
     tlsBlockSym: Symbol          # the synthetic `arkham.tls.0` gvar (FS base block)
+    # The runtime stack-trace table (`doc/tracetable.md`): the same per-proc facts
+    # `.eh_frame` carries, in a form the RUNNING PROGRAM can read — arkham lowers the
+    # `traceTable` intrinsic to `lea D, arkham.traceinfo.0`, and `lib/std/stacktraces`
+    # walks the stack with it. It is deliberately NOT gated on `debugInfo`: that flag
+    # governs what a debugger reads from the file, this is a program feature, and a
+    # program that asks for it must get it. Emitted only when something references
+    # the symbol, so a program that never calls `getStackTrace` pays nothing.
+    traceSym: Symbol             # the synthetic `arkham.traceinfo.0` label
+    traceLabel: LabelId          # its label in `buf` — defined where the table lands
+    traceUsed: bool              # something referenced it, so `appendTraceTable` runs
     entrySym: Symbol             # the entry proc (`_start`/`main.0`) — prologue jumps here
     entryStubOffset: int          # .text offset of the synthesized ELF entry stub, or -1.
                                   # x86-64: the FS-setup prologue (setupTls); AArch64:
@@ -1964,6 +1974,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       let name = getSym(n)
       let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
       if sym == nil or sym.kind != skLabel: error("Unknown label: " & name, n)
+      if sym == ctx.traceSym: ctx.traceUsed = true   # emit the table (appendTraceTable)
       inc n
       result.reg = arm64.X0
       result.label = LabelId(sym.offset)
@@ -4566,6 +4577,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
       let name = getSym(n)
       let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
       if sym == nil or sym.kind != skLabel: error("Unknown label: " & name, n)
+      if sym == ctx.traceSym: ctx.traceUsed = true   # emit the table (appendTraceTable)
       inc n
       result.reg = RAX
       result.label = LabelId(sym.offset)
@@ -6594,6 +6606,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       let name = getSym(n)
       let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
       if sym == nil or sym.kind != skLabel: error("Unknown label: " & name, n)
+      if sym == ctx.traceSym: ctx.traceUsed = true   # emit the table (appendTraceTable)
       inc n
       x86.emitLea(ctx.buf, dest, LabelId(sym.offset))
     elif leaRegBase(n, ctx, baseReg):
@@ -7228,6 +7241,45 @@ proc pass2(n: Cursor; ctx: var GenContext) =
   else:
     error("Expected stmts", n)
 
+proc dwarfArchOf(arch: Arch): DwarfArch {.inline.} =
+  if arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64}: dwA64 else: dwX64
+
+proc appendTraceTable(ctx: var GenContext) =
+  ## Reserve the stack-trace table at the end of `.text` and define the label that
+  ## addresses it. Only the SPACE is reserved here: the proc positions it records
+  ## are still going to move under the jump shortener and the alignment pass, so
+  ## the bytes are written by `fillTraceTable` once those are done. The size does
+  ## not move — layout changes where a proc is, never how many there are or what
+  ## they are called.
+  ##
+  ## Called for every target, from `assemble`, and only when something referenced
+  ## the symbol: a program that never asks for a stack trace carries no table.
+  if not ctx.traceUsed: return
+  # Start the blob on an 8-byte boundary. A courtesy, not a guarantee: the layout
+  # passes shift it by whatever they add or remove ahead of it, so the reader must
+  # tolerate an unaligned table anyway — which it does, since every field is a
+  # `u32` and both targets permit unaligned word loads.
+  while (ctx.buf.data.len and 7) != 0: ctx.buf.data.add 0'u8
+  ctx.buf.defineLabel(ctx.traceLabel)
+  let n = traceTableSize(collectTraceProcs(ctx.unwind, dwarfArchOf(ctx.arch)))
+  for i in 0 ..< n: ctx.buf.data.add 0'u8
+
+proc fillTraceTable(a: var GenContext) =
+  ## Write the reserved table, now that every proc's final code position is known.
+  ## Runs after each writer's layout passes and before it copies `a.buf.data` out.
+  if not a.traceUsed: return
+  var at = -1
+  for ld in a.buf.labels:
+    if ld.id == a.traceLabel: at = ld.position
+  if at < 0: return
+  let bytes = encodeTraceTable(collectTraceProcs(a.unwind, dwarfArchOf(a.arch)), at)
+  # The reservation is computed from the same `collectTraceProcs`, so a mismatch
+  # means a layout pass grew or dropped a proc between the two calls — silently
+  # writing a truncated table would produce a stack trace with invented names.
+  if at + bytes.len > a.buf.data.len:
+    quit "nifasm: trace table outgrew its reservation (" & $bytes.len & " bytes at " & $at & ")"
+  for i in 0 ..< bytes.len: a.buf.data[at + i] = bytes[i]
+
 proc writeElf(a: var GenContext; outfile: string) =
   # Shorten x86 rel32 jumps to rel8 where they fit (static-ELF x64 only: no IAT
   # call-site bookkeeping to invalidate, and AArch64 forms are fixed-size). This
@@ -7327,6 +7379,7 @@ proc writeElf(a: var GenContext; outfile: string) =
     # `.text` byte 0 lands right after the ELF header + the two program headers,
     # the same arithmetic `--symmap` above does.
     a.writeListing(a.listingPath, 0x400000 + 64 + 56 * 2)
+  fillTraceTable(a)
   var code = a.buf.data
   let baseAddr = 0x400000.uint64
   let headersSize = 64 + (56 * 2)  # ELF header + 2 program headers
@@ -7596,6 +7649,7 @@ proc writeElf(a: var GenContext; outfile: string) =
   setFilePermissions(outfile, perms)
 
 proc writeMachO(a: var GenContext; outfile: string) =
+  fillTraceTable(a)
   finalize(a.buf)
   finalize(a.bssBuf)
   let code = a.buf.data
@@ -7711,6 +7765,7 @@ proc writeMachOObject(a: var GenContext; outfile: string) =
   ## symbols, and every fixup the executable path would resolve in-place (external
   ## calls, gvar `adrp`/`add`, symbol-address initializers) becomes a relocation the
   ## system linker resolves. The standalone `writeMachO` above is left untouched.
+  fillTraceTable(a)
   finalize(a.buf)
   finalize(a.bssBuf)
   let code = a.buf.data
@@ -7838,6 +7893,7 @@ proc writeMachOObject(a: var GenContext; outfile: string) =
                          cputype, cpusubtype, outfile)
 
 proc writeExe(a: var GenContext; outfile: string) =
+  fillTraceTable(a)
   finalize(a.buf)
   finalize(a.bssBuf)
 
@@ -8275,6 +8331,15 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
   scope.define(ctx.tlsBlockSym)
   ctx.generatedSymbols.incl "arkham.tls.0"
 
+  # Same treatment for the stack-trace table's label: nifasm owns the data, so it
+  # owns the symbol. Defining it up front is what lets `lea D, (lab arkham.traceinfo.0)`
+  # resolve like any other label instead of sending `lookupWithAutoImport` off to
+  # look for a module named `traceinfo`. Its LabelId is created after the pass-2
+  # buffer reset below (the reset restarts label numbering).
+  ctx.traceSym = Symbol(name: ctx.symIdOf(TraceInfoSymbol), kind: skLabel, offset: -1)
+  scope.define(ctx.traceSym)
+  ctx.generatedSymbols.incl TraceInfoSymbol
+
   var n1 = beginRead(ctx.modules[MainModuleName].buf)
   pass1(n1, scope, ctx, MainModuleName, ctx.modules[MainModuleName].buf)
 
@@ -8301,6 +8366,8 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
   # Update ctx with proper buffers for pass2
   ctx.buf = initBuffer()
   ctx.bssBuf = initBuffer()
+  ctx.traceLabel = ctx.buf.createLabel()
+  ctx.traceSym.offset = int(ctx.traceLabel)
 
   # Generate code for entry point (top-level instructions only)
   # This marks symbols as used via lookupWithAutoImport when they are referenced
@@ -8314,6 +8381,7 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
   # Now that every bundled tvar has an FS offset, reserve the unified TLS block and
   # synthesize the per-target entry stub: the FS base (x86-64), zeroed arguments
   # (Windows), the kernel's argument block (AArch64/Linux). At most one applies.
+  appendTraceTable(ctx)
   setupTls(ctx)
   setupWinEntry(ctx)
   setupLinuxA64Entry(ctx)

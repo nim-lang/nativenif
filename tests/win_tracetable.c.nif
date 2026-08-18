@@ -1,0 +1,98 @@
+(.nif27)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (u 32))).
+  (pragmas
+   (importc "ExitProcess")
+   (dynlib "kernel32"))
+  (stmts .))
+ (proc :stackPointer.0
+  (params)
+  (aptr
+   (u 64))
+  (pragmas
+   (intrinsic "StackPointer"))
+  (stmts .))
+ (proc :traceTable.0
+  (params)
+  (aptr
+   (u 32))
+  (pragmas
+   (intrinsic "TraceTable"))
+  (stmts .))
+ (proc :callerFrame.0
+  (params)
+  (aptr
+   (u 64))
+  (pragmas
+   (assembler)
+   (naked))
+  (stmts
+   (var :result.0 .
+    (aptr
+     (u 64)).)
+   (asgn result.0
+    (instr stackPointer.0))
+   (ret result.0)))
+ (proc :probe.0
+  (params)
+  (i 64).
+  (stmts
+   (var :fr.0 .
+    (aptr
+     (u 64))
+    (call callerFrame.0))
+   (var :ra.0 .
+    (u 64)
+    (pat fr.0 0))
+   (var :tt.0 .
+    (aptr
+     (u 32))
+    (instr traceTable.0))
+   (var :magic.0 .
+    (u 64)
+    (pat tt.0 0))
+   (var :tbl.0 .
+    (u 64)
+    (cast
+     (u 64)tt.0))
+   (var :r.0 .
+    (i 64)0)
+   (if
+    (elif
+     (eq magic.0 1129469006)
+     (stmts
+      (asgn r.0
+       (add
+        (i 64)r.0 1)))))
+   (if
+    (elif
+     (lt ra.0 tbl.0)
+     (stmts
+      (asgn r.0
+       (add
+        (i 64)r.0 2)))))
+   (if
+    (elif
+     (lt
+      (sub
+       (u 64)tbl.0 ra.0)1048576)
+     (stmts
+      (asgn r.0
+       (add
+        (i 64)r.0 4)))))
+   (ret r.0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :v.0 .
+    (i 64)
+    (call probe.0))
+   (call exit.0
+    (conv
+     (u 32)v.0)))))

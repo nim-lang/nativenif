@@ -102,6 +102,11 @@ const arkhamA64Unsupported: seq[string] = @[
   # mode's premise ("no fallbacks", doc/intrinsics.md §8), not a gap: an AArch64
   # version is a different `when` branch the user writes, with `x0`/`x9` in it.
   "assembler_x64",
+  # `{.naked.}` — the same story as `assembler_x64` (it may only accompany it),
+  # plus the `TraceTable` row, whose `targets` is x86-64 alone until the AArch64
+  # stack walk exists. The table itself IS emitted on every target; what is
+  # missing is the walk that reads it (`lib/std/stacktraces`).
+  "naked_stacktrace_x64",
   # Six by-ref array params exhaust x86-64's FIVE callee-saved registers, so the
   # sixth pointer spills to a `StackPtr` slot — the shape this fixture exists to
   # pin (`genAconstr2` must store through that pointer, not over the slot).
@@ -166,6 +171,14 @@ const arkhamRejections: seq[(string, string)] = @[
   # meant eight of them. Offsetting an array pointer is `(at …)`/`(pat …)`.
   ("err_ptr_arith", "arithmetic result type is a pointer (ptr)"),
   ("err_aptr_arith", "arithmetic result type is a pointer (aptr)"),
+  # `{.naked.}` is a promise about SP, and each of these three breaks it in a way
+  # that produces no diagnostic of its own: an allocated body would spill into a
+  # frame that is not there, a `{.stack.}` local names a slot in that same frame,
+  # and a callee-saved register whose `push` never happened hands the caller back
+  # a destroyed value — corruption that surfaces arbitrarily far from the cause.
+  ("err_naked_alone", "`{.naked.}` requires `{.assembler.}`"),
+  ("err_naked_stack", "cannot declare a `{.stack.}` local"),
+  ("err_naked_callee", "cannot use the callee-saved register(s) rbx"),
 ]
 
 proc arkhamRejectionTests(arkham: string) =
@@ -245,6 +258,37 @@ proc arkhamWinUnwindTests() =
          " frames too, so the " & $frames & " prove nothing"
   echo "1 / 1 arkham win64 unwind tests successful (", frames, " frames vs ",
        bareFrames, " without)"
+
+proc arkhamWinTraceTableTests() =
+  ## The runtime trace table (`doc/tracetable.md`) on the PE path, checked under
+  ## Wine. Worth its own run because the table is written by each object writer
+  ## SEPARATELY, after that writer's own layout passes: `writeElf` fills it after
+  ## the jump shortener and the alignment pass have moved every proc, `writeExe`
+  ## before either exists. A table whose offsets were computed against the wrong
+  ## layout still has the right magic and the right count — it just names the
+  ## wrong procs — so only running the walk catches it.
+  ##
+  ## `tests/win_tracetable.c.nif` is the ELF fixture `naked_stacktrace_x64` with
+  ## `ExitProcess` in place of `exit`: a `{.naked.}` proc hands back its caller's
+  ## frame, and the program exits with 1|2|4 for the three things that must hold
+  ## — the table's magic, the return address lying below the table, and lying
+  ## within a megabyte of it.
+  if findExe("wine").len == 0:
+    echo "0 / 0 arkham win64 trace-table tests (wine not installed)"
+    return
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasm = ("src" / "nifasm" / "nifasm").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham" / "nimcache"
+  let asmNif = workDir / "win_tracetable.asm.nif"
+  let exe = workDir / "win_tracetable.exe"
+  exec quoteShell(arkham) & " -a:win_x64 -o:" & quoteShell(asmNif) & " " &
+       quoteShell("tests" / "win_tracetable.c.nif")
+  exec quoteShell(nifasm) & " -o:" & quoteShell(exe) & " " & quoteShell(asmNif)
+  let (_, code) = execCmdEx("wine " & quoteShell(exe) & " 2>/dev/null")
+  if code != 7:
+    quit "FAILURE arkham win64 trace table: exit code " & $code &
+         " (want 7 = magic|below-table|near-table)"
+  echo "1 / 1 arkham win64 trace-table tests successful"
 
 proc arkhamTests() =
   ## Each `tests/arkham/*.c.nif` is hand-written Leng: arkham generates asm-NIF,
@@ -702,6 +746,7 @@ when defined(linux) and defined(amd64):
   # as far as "the program still runs" — a host GDB cannot read its registers.
   arkhamDebugInfoTests()
   arkhamWinUnwindTests()
+  arkhamWinTraceTableTests()
 
 # Additionally exercise the AArch64 backend on an x86-64 Linux host by emitting the
 # `linux_arm64` ELF variant and running it under qemu-aarch64 (no-op if qemu is

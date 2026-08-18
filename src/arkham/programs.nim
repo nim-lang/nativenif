@@ -88,6 +88,14 @@ type
                              ## construct maps one-to-one to an instruction and every
                              ## location is declared, so it bypasses the register
                              ## allocator entirely. See `doc/intrinsics.md` §8.
+    isNaked*: bool           ## `(naked)`: emit NO prologue and NO epilogue. The proc
+                             ## does not touch SP, so on entry SP still points at the
+                             ## return address — which is the only way a routine can
+                             ## hand its CALLER's frame back (`stacktraces.getStackTrace`)
+                             ## rather than describe its own. Only legal together with
+                             ## `(assembler)`: with the frame gone, every location the
+                             ## allocator would have spilled has nowhere to go, so the
+                             ## body must be one that declares all of them.
 
   SyscallProc* = object
     asmName*: string         ## the `(syproc …)` symbol name (e.g. "mmap.0")
@@ -309,7 +317,7 @@ proc lookupSyscall*(name: string): tuple[found: bool, x64, a64: int] =
 
 proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
                   intrinsic: var IntrinsicOp; asmProc: var bool;
-                  dllN: var string) =
+                  dllN: var string; nakedProc: var bool) =
   if c.substructureKind == PragmasU:
     c.into:
       while c.hasMore:
@@ -317,6 +325,9 @@ proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
         case pk
         of AssemblerP:
           asmProc = true
+          skip c
+        of NakedP:
+          nakedProc = true
           skip c
         of ImportcP:
           c.into:
@@ -348,6 +359,12 @@ proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
         else: skip c
   else:
     skip c
+
+proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
+                  intrinsic: var IntrinsicOp; asmProc: var bool;
+                  dllN: var string) {.inline.} =
+  var ignoredNaked = false
+  parsePragmas(c, importcN, exportcN, intrinsic, asmProc, dllN, ignoredNaked)
 
 proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
                   intrinsic: var IntrinsicOp; asmProc: var bool) {.inline.} =
@@ -648,13 +665,14 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         var retType: Cursor
         var intrinsic = NoIntrinsicOp
         var asmProc = false
+        var nakedProc = false
         c.into:
           pname = symName(c); inc c           # name
           skip c                              # params
           retType = c                         # return-type cursor (for getType)
           retFloat = c.kind == TagLit and c.typeKind == FT   # `(f N)` return → v0
           skip c                              # return type
-          parsePragmas(c, importcN, exportcN, intrinsic, asmProc, dllN)
+          parsePragmas(c, importcN, exportcN, intrinsic, asmProc, dllN, nakedProc)
           skip c                              # body
         let sigType = procSigType(procStart)  # the proc-value's `(proctype …)` (for getType)
         if intrinsic != NoIntrinsicOp:
@@ -741,7 +759,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                                                 retFloat: retFloat, retType: retType, sigType: sigType,
                                                 declarative: isDeclarativeAbi(result, procStart))
           result.procs.add ProcInfo(asmName: asmN, decl: procStart, isEntry: entry,
-                                    isAsm: asmProc)
+                                    isAsm: asmProc, isNaked: nakedProc)
       else:
         skip c
   # Emit the entry proc first so it begins the text section.
