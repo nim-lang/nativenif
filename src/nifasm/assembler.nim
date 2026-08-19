@@ -73,11 +73,6 @@ proc infoStr(n: Cursor): string =
 
 var gCurProc = ""
 var gLenient = false
-  ## Mirrors the current proc's `(lenient)` pragma for the ctx-less check
-  ## helpers (checkType & friends) — same pattern as `gCurProc`. The pragma
-  ## marks MACHINE-PORTED bodies (distilled gcc code): the structural checks
-  ## exist to catch code-generator bugs, and ported code was already correct
-  ## on the machine it came from.
   ## The proc currently being assembled. arkham's asm-NIF carries no line info, so
   ## `infoStr` degrades to `???` and a bare type error names nothing you can act on;
   ## the proc's mangled symbol pins it to one module and one routine.
@@ -4771,7 +4766,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
               if pt != nil and pt.kind notin {TypeKind.ObjectT, TypeKind.ArrayT, TypeKind.UnionT}:
                 stackVarType = pt
           elif n.hasMore and n.kind == TagLit and rawTagIsX64Reg(n.tag):
-            # `(mem <base> <index-reg> [scale [disp]])` with a RAW register index —
+            # `(mem <base> <index-reg> [scale [disp]])` with a raw register index —
             # the general SIB form `[base + index*scale + disp]`. Parsing the index
             # through parseOperand keeps the binding guards (a bound register must be
             # named, r11 stays a typed binding). Base==index is legal here: unlike
@@ -6012,7 +6007,7 @@ proc checkSubWidthImm(imm: int64; bits: int; n: Cursor) =
 
 proc genAluSubWidth(ctx: var GenContext; dest, op: Operand; kind: SizedAluKind;
                     n: Cursor) =
-  ## Two-operand ALU whose destination is an explicitly width-cast REGISTER:
+  ## Two-operand ALU whose destination is an explicitly width-cast register:
   ## the operation runs at `dest.castBits` (8/16/32). A 32-bit op zero-extends
   ## the destination, 8/16-bit ops preserve its upper bits, flags are set at
   ## the operation width — the hardware's own sub-width semantics. The source
