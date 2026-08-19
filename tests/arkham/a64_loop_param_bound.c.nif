@@ -1,6 +1,6 @@
 (.nif27)
 (stmts
- (proc :exit.c
+ (proc :exit.0
   (params
    (param :code.0 .
     (i 32))).
@@ -44,4 +44,4 @@
    (var :r.0 .
     (i 64)
     (call f.0 5))
-   (call exit.c r.0))))
+   (call exit.0 r.0))))

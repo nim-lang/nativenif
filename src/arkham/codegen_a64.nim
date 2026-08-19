@@ -5283,7 +5283,8 @@ when declared(FldrqOp):
   # nothing below is reachable. Compiling it anyway is what broke the build: this
   # repo must build against the intrinsic table as it stands today. The guard flips
   # the whole path on by itself the moment the rows land — no edit here.
-  const VecOps = {FldrqOp, FstrqOp, VfaddOp, VfsubOp, VfmulOp, VfmlaOp, VdupOp}
+  const VecOps = {FldrqOp, FstrqOp, VfaddOp, VfsubOp, VfmulOp, VfmlaOp, VdupOp,
+                  VaddvOp}
 
   template Vec128Slot(): AsmSlot = AsmSlot(cls: AFloat, size: 16, align: 16)
 
@@ -5372,6 +5373,21 @@ when declared(FldrqOp):
         g.ab.intLit bits
       if viaBridge: g.dropFBridge()
       elif fv.kind == InFReg and fv.isTemp and fv.f != dest.f: g.unbindFTmp(fv.f)
+    of VaddvOp:
+      # scalar = horizontal add of every lane — the reduction epilogue. The
+      # result is an ORDINARY scalar float (an `(f W)` value in the float pool),
+      # so it composes with the surrounding scalar expression tree.
+      let bits = g.vecLaneBits(argCurs[1])
+      let srcF = g.vecHomeF(argCurs[0])
+      if dest.kind != InFReg:
+        dest = g.takeFTmp(AsmSlot(cls: AFloat, size: bits div 8, align: bits div 8))
+        if dest.kind == NamedStack:
+          lengError c, "out of SIMD registers for a vaddv result"
+      if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f, bits)
+      g.ab.tree VaddvA64:
+        g.emFReg(dest.f, bits)
+        g.emFReg(srcF, 64)
+        g.ab.intLit bits
     of VfmlaOp:
       # dest = acc + a*b, fused, accumulating IN PLACE (tie = 0): the vectorizer
       # spells every use as `acc = vfmla(acc, a, b, bits)`, so the destination IS
