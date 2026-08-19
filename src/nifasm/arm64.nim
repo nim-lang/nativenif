@@ -900,6 +900,18 @@ proc emitVDup*(dest: var Bytes; rd, rn: FloatRegister; single = false) =
   let base = if single: 0x4E040400'u32 else: 0x4E080400'u32
   dest.addUint32(base or (encodeFReg(rn) shl 5) or encodeFReg(rd))
 
+proc emitVAddv*(dest: var Bytes; rd, rn: FloatRegister; single = false) =
+  ## Horizontal fp add of every lane of Vn into the scalar Rd.
+  ## Double: FADDP Dd, Vn.2D. Single has 4 lanes and no one-step form:
+  ## FADDP Vd.4S, Vn.4S, Vn.4S then FADDP Sd, Vd.2S — Vd doubles as the
+  ## scratch, which stays correct when rd == rn.
+  if single:
+    dest.addUint32(0x6E20D400'u32 or (encodeFReg(rn) shl 16) or
+                   (encodeFReg(rn) shl 5) or encodeFReg(rd))
+    dest.addUint32(0x7E30D800'u32 or (encodeFReg(rd) shl 5) or encodeFReg(rd))
+  else:
+    dest.addUint32(0x7E70D800'u32 or (encodeFReg(rn) shl 5) or encodeFReg(rd))
+
 proc emitFstpPre*(dest: var Bytes; rt1, rt2: FloatRegister; rn: Register; offset: int32) =
   ## STP Dt1, Dt2, [Xn, #offset]! — pre-indexed store pair of doubles.
   let scaled = offset div 8

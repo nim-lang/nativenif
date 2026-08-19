@@ -511,6 +511,7 @@ type
     VfmlaTagId
     VdupTagId
     VeorTagId
+    VaddvTagId
 const
   TagData*: array[TagEnum, (string, int)] = [
     ("InvalidTagId", 0),
@@ -1021,5 +1022,6 @@ const
     ("vfmul", 505),
     ("vfmla", 506),
     ("vdup", 507),
-    ("veor", 508)
+    ("veor", 508),
+    ("vaddv", 509)
   ]

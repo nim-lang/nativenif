@@ -398,12 +398,11 @@ const arkhamStressA64Known: seq[string] = @[
   # out-of-registers assert, but can never legitimately change what a program
   # computes, so a wrong answer here is a codegen bug by construction.
   "spill_produce_float",    # float produce-into-spill reads a clobbered register
-  # `a64_vec_instr` holds six 128-bit vector locals live at once; a `(f 128)`
-  # local has NO spill form (the scalar float spill moves 8 bytes and would
-  # silently truncate the upper lane), so when the stress-starved SIMD pool
-  # cannot home one, arkham fails LOUDLY at the declaration — the designed
-  # out-of-registers error, not a miscompile. See `genVarDecl2`'s vec guard.
-  "a64_vec_instr",
+  # (`a64_vec_instr` lived here — six 128-bit vector locals live at once
+  # overran the stress-starved SIMD pool into the designed loud
+  # out-of-registers error. The planer's early-free now covers `InFReg`
+  # homes too, so the dead vector temps hand their registers back in time
+  # and the fixture passes even stressed.)
   # (`atomic_cas_regpressure` lived here for the missing steal/spill arm on the
   # intrinsic-operand pick, and now passes at this list's own k=3.)
   # `instrOperandInPlace` — read a register-homed symbol operand where it lies

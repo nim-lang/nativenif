@@ -3842,6 +3842,18 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       inc n
     arm64.emitVDup(ctx.buf.data, rd, rn, single)
 
+  of VaddvA64:
+    # (vaddv D S bits?) — horizontal fp add of S's lanes into the scalar D;
+    # trailing lane-bits literal as in `vfadd`.
+    inc n
+    var single = isA64FpSingle(n, ctx)
+    let rd = parseFloatOperandA64(n, ctx)
+    let rn = parseFloatOperandA64(n, ctx)
+    if n.kind == IntLit:
+      single = int(n.intVal) == 32
+      inc n
+    arm64.emitVAddv(ctx.buf.data, rd, rn, single)
+
   of VeorA64:
     # (veor D A B) — 16-byte xor; `(veor X X X)` zeroes X.
     inc n
