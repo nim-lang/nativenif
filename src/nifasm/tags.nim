@@ -490,6 +490,27 @@ type
     RbitTagId
     RevTagId
     CasejmpTagId
+    JsTagId
+    JnsTagId
+    LenientTagId
+    PunpcklqdqTagId
+    MovupdTagId
+    MovupsTagId
+    AddpdTagId
+    MulpdTagId
+    AddpsTagId
+    MulpsTagId
+    ShufpsTagId
+    RepstosbTagId
+    RepstosqTagId
+    FldrqTagId
+    FstrqTagId
+    VfaddTagId
+    VfsubTagId
+    VfmulTagId
+    VfmlaTagId
+    VdupTagId
+    VeorTagId
 const
   TagData*: array[TagEnum, (string, int)] = [
     ("InvalidTagId", 0),
@@ -979,5 +1000,26 @@ const
     ("clz", 484),
     ("rbit", 485),
     ("rev", 486),
-    ("casejmp", 487)
+    ("casejmp", 487),
+    ("js", 488),
+    ("jns", 489),
+    ("lenient", 490),
+    ("punpcklqdq", 491),
+    ("movupd", 492),
+    ("movups", 493),
+    ("addpd", 494),
+    ("mulpd", 495),
+    ("addps", 496),
+    ("mulps", 497),
+    ("shufps", 498),
+    ("repstosb", 499),
+    ("repstosq", 500),
+    ("fldrq", 501),
+    ("fstrq", 502),
+    ("vfadd", 503),
+    ("vfsub", 504),
+    ("vfmul", 505),
+    ("vfmla", 506),
+    ("vdup", 507),
+    ("veor", 508)
   ]

@@ -4364,6 +4364,7 @@ proc emitFValue2(g: var CodeGen; c: Cursor; dest: var Location) =
       g.dropBridge gpr
     of ConvC, CastC: g.emitCast2(c, dest)
     of CallC: g.emitCall2(c, dest)
+    of InstrC: g.emitInstr2(c, dest)             # a vector row / float intrinsic
     of DotC, AtC, DerefC, PatC:
       # float lvalue load → fldr res, [addr]
       if dest.kind != InFReg:
@@ -5275,6 +5276,136 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
     for h in heldArgs: g.freeVal(h)
     g.settleCallResult(dest)
 
+when declared(FldrqOp):
+  # STAGED, INERT until the shared `lib/intrinsics` table carries the AdvSIMD rows.
+  # `instrTargetOf` resolves an `(instr …)` through `intrinsicOpByName`, so without
+  # those rows a `{.instruction: "fldrq".}` declaration cannot even be spelled and
+  # nothing below is reachable. Compiling it anyway is what broke the build: this
+  # repo must build against the intrinsic table as it stands today. The guard flips
+  # the whole path on by itself the moment the rows land — no edit here.
+  const VecOps = {FldrqOp, FstrqOp, VfaddOp, VfsubOp, VfmulOp, VfmlaOp, VdupOp}
+
+  template Vec128Slot(): AsmSlot = AsmSlot(cls: AFloat, size: 16, align: 16)
+
+  proc vecHomeF(g: var CodeGen; a: Cursor): FReg =
+    ## A 128-bit vector operand: the vectorizer spells every one as a plain local,
+    ## and a local of type `(f 128)` lives in a SIMD register or fails loudly at
+    ## its declaration (`genVarDecl2`), so the home lookup here cannot miss.
+    if a.kind != Symbol:
+      lengError a, "a 128-bit vector operand must be a plain local"
+    let home = g.plan.locationOfSym(symName(a), cursorToPosition(g.buf[], a))
+    if home.kind != InFReg:
+      lengError a, "128-bit vector local `" & symName(a) &
+                "` has no SIMD register home"
+    result = home.f
+
+  proc vecLaneBits(g: var CodeGen; a: Cursor): int =
+    ## The trailing lane-width knob: an int LITERAL, read here and folded into the
+    ## emitted instruction — never evaluated into a register (see `ptLaneBits`).
+    if a.kind != IntLit or int(intVal(a)) notin {32, 64}:
+      lengError a, "a vector op's lane-bits operand must be the literal 32 or 64"
+    result = int(intVal(a))
+
+  proc vecByteOff(g: var CodeGen; a: Cursor): int =
+    ## A vector load/store's byte-offset operand: an int literal, multiple of 16.
+    if a.kind != IntLit or (int(intVal(a)) and 15) != 0 or intVal(a) < 0:
+      lengError a, "a vector load/store offset must be a non-negative literal multiple of 16"
+    result = int(intVal(a))
+
+  proc emitVecInstr2(g: var CodeGen; c: Cursor; op: IntrinsicOp;
+                     argCurs: seq[Cursor]; dest: var Location) =
+    ## The AdvSIMD rows. Vector VALUES are `(f 128)` locals homed in SIMD
+    ## registers; the ops read those homes directly and write the destination
+    ## register in place — there is no 128-bit register-register move anywhere,
+    ## by construction (`vfmla`'s tie is asserted, not repaired with a copy).
+    ##
+    ## The nifasm tags carry an explicit trailing lane-bits literal because a
+    ## 128-bit binding names the register without naming a lane width.
+    case op
+    of FstrqOp:
+      # (instr fstrq p off v) — statement position, no result.
+      let off = g.vecByteOff(argCurs[1])
+      let vf = g.vecHomeF(argCurs[2])
+      var pd = g.takeInstrReg(g.exprSlot(argCurs[0]), false)
+      g.emitValue2(argCurs[0], pd)
+      g.ab.tree FstrqA64:
+        g.ab.tree MemX:
+          g.emReg pd.r
+          if off != 0: g.ab.intLit off
+        g.emFReg(vf, 64)
+      g.freeVal(pd)
+    of FldrqOp:
+      let off = g.vecByteOff(argCurs[1])
+      var pd = g.takeInstrReg(g.exprSlot(argCurs[0]), false)
+      g.emitValue2(argCurs[0], pd)
+      if dest.kind != InFReg:
+        dest = g.takeFTmp(Vec128Slot)
+        if dest.kind == NamedStack:
+          lengError c, "out of SIMD registers for a 128-bit vector value"
+      if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f, 128)
+      g.ab.tree FldrqA64:
+        g.emFReg(dest.f, 64)
+        g.ab.tree MemX:
+          g.emReg pd.r
+          if off != 0: g.ab.intLit off
+      g.freeVal(pd)
+    of VdupOp:
+      let bits = g.vecLaneBits(argCurs[1])
+      var fv = dontCare
+      g.emitFValue2(argCurs[0], fv)
+      if dest.kind != InFReg:
+        dest = g.takeFTmp(Vec128Slot)
+        if dest.kind == NamedStack:
+          lengError c, "out of SIMD registers for a 128-bit vector value"
+      if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f, 128)
+      var srcF = NoFReg
+      var viaBridge = false
+      if fv.kind == InFReg:
+        srcF = fv.f
+      else:                                        # an eftmp spill (float pool dry)
+        srcF = g.takeFBridge(bits)
+        g.placeF2(fv, srcF, bits)
+        viaBridge = true
+      g.ab.tree VdupA64:
+        g.emFReg(dest.f, 64)
+        g.emFReg(srcF, bits)
+        g.ab.intLit bits
+      if viaBridge: g.dropFBridge()
+      elif fv.kind == InFReg and fv.isTemp and fv.f != dest.f: g.unbindFTmp(fv.f)
+    of VfmlaOp:
+      # dest = acc + a*b, fused, accumulating IN PLACE (tie = 0): the vectorizer
+      # spells every use as `acc = vfmla(acc, a, b, bits)`, so the destination IS
+      # the accumulator's home and the machine op needs no 128-bit copy.
+      let bits = g.vecLaneBits(argCurs[3])
+      let accF = g.vecHomeF(argCurs[0])
+      if dest.kind != InFReg or dest.f != accF:
+        lengError c, "vfmla accumulates in place: spell it `acc = vfmla(acc, a, b, bits)`"
+      g.ab.tree VfmlaA64:
+        g.emFReg(accF, 64)
+        g.emFReg(g.vecHomeF(argCurs[1]), 64)
+        g.emFReg(g.vecHomeF(argCurs[2]), 64)
+        g.ab.intLit bits
+    of VfaddOp, VfsubOp, VfmulOp:
+      let bits = g.vecLaneBits(argCurs[2])
+      let aF = g.vecHomeF(argCurs[0])
+      let bF = g.vecHomeF(argCurs[1])
+      if dest.kind != InFReg:
+        dest = g.takeFTmp(Vec128Slot)
+        if dest.kind == NamedStack:
+          lengError c, "out of SIMD registers for a 128-bit vector value"
+      if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f, 128)
+      let tag = case op
+                of VfaddOp: VfaddA64
+                of VfsubOp: VfsubA64
+                else: VfmulA64
+      g.ab.tree tag:
+        g.emFReg(dest.f, 64)
+        g.emFReg(aF, 64)
+        g.emFReg(bF, 64)
+        g.ab.intLit bits
+    else:
+      raiseAssert "arkham a64n: not a vector op: " & IntrinsicNames[op]
+
 proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED a64 `(instr SYM X*)`: operand placement inline (pool → survivor,
   ## never a bridge — the atomics own x14/x15/x16); resolved operand Locations
@@ -5300,6 +5431,10 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
   if tgA64 notin row.targets:
     lengError c, "`" & IntrinsicNames[tgt.op] & "` has no AArch64 lowering — " &
               "guard the call with a `when`"
+  when declared(VecOps):                         # see the staging guard above
+    if tgt.op in VecOps:
+      g.emitVecInstr2(c, tgt.op, argCurs, dest)
+      return
   # Resolve the result FIRST and seal it, so an operand pick cannot land on it.
   var res = Location(kind: Undef)
   if not row.isVoidResult:
@@ -5368,6 +5503,13 @@ proc genVarDecl2(g: var CodeGen; c: Cursor) =
     let typeCur = g.declType(declaredCur, cc)                # infer from the initializer
     g.symType[nm] = typeCur
     let loc = g.plan.homeOfSym(nm)
+    if typeCur.kind == TagLit and typeCur.typeKind == FT and
+       typeBits(typeCur) == 128 and loc.kind != InFReg:
+      # A 128-bit vector local (`(f 128)`) has no spill form: the scalar float
+      # spill machinery moves 8 bytes and would silently truncate it. The
+      # vectorizer keeps vector live ranges short precisely so this cannot
+      # happen; failing loudly beats corrupting the upper lane.
+      lengError c, "128-bit vector local `" & nm & "` did not get a SIMD register home"
     let hasVal = cc.hasMore and cc.kind != DotToken
     case loc.kind
     of InReg: g.emRegLocalVar(nm, loc.r, typeCur)
@@ -5601,15 +5743,20 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         else: skip cc
       if selBridge != NoReg: g.dropBridge selBridge
       elif selLoc.isTemp: g.unbindTemp(selReg)
-      if hasElse:
-        var e = elseBody
-        e.into:
-          while e.hasMore: (g.genStmt2(e); skip e)
-      g.emBr(BA64, lEnd)
+      # EMISSION ORDER MUST FOLLOW LENG ORDER — see the x64 twin. The `else` body is
+      # Leng-LAST, so emitting it before the of-bodies retires every binding whose
+      # last use lies inside an of-branch.
+      let lElse = if hasElse: g.freshLabel() else: lEnd
+      g.emBr(BA64, lElse)
       for (lBody, bc) in bodies:
         g.emLab(lBody)
         g.genStmt2(bc)
         g.emBr(BA64, lEnd)
+      if hasElse:
+        g.emLab(lElse)
+        var e = elseBody
+        e.into:
+          while e.hasMore: (g.genStmt2(e); skip e)
     g.emLab(lEnd)
   of LabS:
     var cc = c
@@ -6033,6 +6180,7 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## to resolve cross-module symbols (`Foo.0.othermod`).
   var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: aarch64MachineA,
                   a64Linux: linux)
+  g.ab.arch = "a64"                # BodyLib entries this target may splice
   g.prog = collect(buf, inputPath, tags, darwin = not linux)
   g.callTarget = g.prog.callTarget
   g.globals = g.prog.globals

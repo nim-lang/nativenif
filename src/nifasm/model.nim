@@ -36,7 +36,7 @@ type
     Cvtss2sdX64 = (ord(Cvtss2sdTagId), "cvtss2sd")  ## scalar single -> scalar double convert
     ComisdX64 = (ord(ComisdTagId), "comisd")  ## compare scalar double, set EFLAGS
     ComissX64 = (ord(ComissTagId), "comiss")  ## compare scalar single, set EFLAGS
-    MovfqX64 = (ord(MovfqTagId), "movfq")  ## move 64 bits between gpr and xmm
+    MovfqX64 = (ord(MovfqTagId), "movfq")  ## move 64 bits between gpr and xmm; `(movfq (xmmD) (xmmS))` is SSE `movq xmm,xmm` — D.lo = S.lo with D's high lane ZEROED (gcc's lane sanitizer before packed ops)
     MovfdX64 = (ord(MovfdTagId), "movfd")  ## move 32 bits between gpr and xmm
     AndX64 = (ord(AndTagId), "and")  ## bitwise and
     OrX64 = (ord(OrTagId), "or")  ## bitwise or
@@ -175,9 +175,21 @@ type
     ScopeX64 = (ord(ScopeTagId), "scope")  ## statement block with a reclaimable stack-slot arena: `(s)` locals declared inside are freed at scope end so sibling scopes reuse the frame bytes
     PopcntX64 = (ord(PopcntTagId), "popcnt")  ## population count: D = number of set bits in S; `N` is the operand size in bits (32 or 64)
     CasejmpX64 = (ord(CasejmpTagId), "casejmp")  ## computed-goto case dispatch (`imul S,S,N; lea T,[rip+slots]; add T,S; jmp T`): the `(stmts ...)` children are the branch bodies, NOP-padded to the measured uniform slot size N, so no lookup table and no memory load. S holds the 0-based slot index; S and T are destroyed. Every branch must end in a terminating jump (the pad NOPs are never executed) and must not define a label at its very end
+    JsX64 = (ord(JsTagId), "js")  ## jump if sign (SF=1: the result was negative)
+    JnsX64 = (ord(JnsTagId), "jns")  ## jump if not sign (SF=0)
+    PunpcklqdqX64 = (ord(PunpcklqdqTagId), "punpcklqdq")  ## interleave low quadwords: D = [D.lo, S.lo] (xmm registers only; `(punpcklqdq X X)` broadcasts X's low quadword to both halves)
+    MovupdX64 = (ord(MovupdTagId), "movupd")  ## move unaligned packed double (xmm/mem either side; the access is inherently 16 bytes — the mem operand's scalar type is not consulted, matching the hardware)
+    MovupsX64 = (ord(MovupsTagId), "movups")  ## move unaligned packed single (xmm/mem either side; 16-byte access like `movupd`)
+    AddpdX64 = (ord(AddpdTagId), "addpd")  ## packed double add, 2 lanes (xmm registers only)
+    MulpdX64 = (ord(MulpdTagId), "mulpd")  ## packed double multiply, 2 lanes (xmm registers only)
+    AddpsX64 = (ord(AddpsTagId), "addps")  ## packed single add, 4 lanes (xmm registers only)
+    MulpsX64 = (ord(MulpsTagId), "mulps")  ## packed single multiply, 4 lanes (xmm registers only)
+    ShufpsX64 = (ord(ShufpsTagId), "shufps")  ## shuffle packed singles: each of D's 4 lanes picks a source lane by the 2-bit fields of immediate N (low two from D, high two from S); `(shufps X X 0)` broadcasts lane 0 to all 4
+    RepstosbX64 = (ord(RepstosbTagId), "repstosb")  ## repeat store byte string: fills `rcx` bytes at `[rdi]` with `al`, advancing `rdi`; `rcx` ends 0 (DF=0 per SysV)
+    RepstosqX64 = (ord(RepstosqTagId), "repstosq")  ## repeat store qword string: fills `rcx` qwords at `[rdi]` with `rax`, advancing `rdi`; `rcx` ends 0
 
 proc rawTagIsX64Inst*(raw: TagEnum): bool {.inline.} =
-  raw in {PrepareTagId, MovTagId, LeaTagId, MovzxTagId, MovsxTagId, MovapdTagId, MovsdTagId, MovdquTagId, AddTagId, SubTagId, MulTagId, ImulTagId, DivTagId, IdivTagId, AddsdTagId, SubsdTagId, MulsdTagId, DivsdTagId, MovssTagId, AddssTagId, SubssTagId, MulssTagId, DivssTagId, Cvtsi2sdTagId, Cvtsi2ssTagId, Cvttsd2siTagId, Cvttss2siTagId, Cvtsd2ssTagId, Cvtss2sdTagId, ComisdTagId, ComissTagId, MovfqTagId, MovfdTagId, AndTagId, OrTagId, XorTagId, ShlTagId, ShrTagId, SalTagId, SarTagId, IncTagId, DecTagId, NegTagId, NotTagId, RolTagId, RorTagId, RclTagId, RcrTagId, BsfTagId, BsrTagId, BtTagId, BtsTagId, BtrTagId, BtcTagId, CmpTagId, TestTagId, SeteTagId, SetzTagId, SetneTagId, SetnzTagId, SetaTagId, SetnbeTagId, SetaeTagId, SetnbTagId, SetncTagId, SetbTagId, SetnaeTagId, SetcTagId, SetbeTagId, SetnaTagId, SetgTagId, SetnleTagId, SetgeTagId, SetnlTagId, SetlTagId, SetngeTagId, SetleTagId, SetngTagId, SetoTagId, SetsTagId, SetpTagId, CmoveTagId, CmovzTagId, CmovneTagId, CmovnzTagId, CmovaTagId, CmovnbeTagId, CmovaeTagId, CmovnbTagId, CmovncTagId, CmovbTagId, CmovnaeTagId, CmovcTagId, CmovbeTagId, CmovnaTagId, CmovgTagId, CmovnleTagId, CmovgeTagId, CmovnlTagId, CmovlTagId, CmovngeTagId, CmovleTagId, CmovngTagId, CmovoTagId, CmovnoTagId, CmovsTagId, CmovnsTagId, CmovpTagId, CmovnpTagId, CmovpeTagId, CmovpoTagId, JmpTagId, JeTagId, JzTagId, JneTagId, JnzTagId, JgTagId, JngTagId, JgeTagId, JngeTagId, JaTagId, JnaTagId, JaeTagId, JnaeTagId, JlTagId, JleTagId, JbTagId, JbeTagId, JoTagId, JnoTagId, JpTagId, CallTagId, ExtcallTagId, IatTagId, RetTagId, PushTagId, PopTagId, NopTagId, SyscallTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, LockTagId, XchgTagId, CmpxchgTagId, XaddTagId, Cmpxchg8bTagId, MfenceTagId, SfenceTagId, LfenceTagId, PauseTagId, ClflushTagId, ClflushoptTagId, Prefetcht0TagId, Prefetcht1TagId, Prefetcht2TagId, PrefetchntaTagId, RepmovsbTagId, RepmovswTagId, RepmovsdTagId, RepmovsqTagId, RebindTagId, WithregTagId, BswapTagId, ScopeTagId, PopcntTagId, CasejmpTagId}
+  raw in {PrepareTagId, MovTagId, LeaTagId, MovzxTagId, MovsxTagId, MovapdTagId, MovsdTagId, MovdquTagId, AddTagId, SubTagId, MulTagId, ImulTagId, DivTagId, IdivTagId, AddsdTagId, SubsdTagId, MulsdTagId, DivsdTagId, MovssTagId, AddssTagId, SubssTagId, MulssTagId, DivssTagId, Cvtsi2sdTagId, Cvtsi2ssTagId, Cvttsd2siTagId, Cvttss2siTagId, Cvtsd2ssTagId, Cvtss2sdTagId, ComisdTagId, ComissTagId, MovfqTagId, MovfdTagId, AndTagId, OrTagId, XorTagId, ShlTagId, ShrTagId, SalTagId, SarTagId, IncTagId, DecTagId, NegTagId, NotTagId, RolTagId, RorTagId, RclTagId, RcrTagId, BsfTagId, BsrTagId, BtTagId, BtsTagId, BtrTagId, BtcTagId, CmpTagId, TestTagId, SeteTagId, SetzTagId, SetneTagId, SetnzTagId, SetaTagId, SetnbeTagId, SetaeTagId, SetnbTagId, SetncTagId, SetbTagId, SetnaeTagId, SetcTagId, SetbeTagId, SetnaTagId, SetgTagId, SetnleTagId, SetgeTagId, SetnlTagId, SetlTagId, SetngeTagId, SetleTagId, SetngTagId, SetoTagId, SetsTagId, SetpTagId, CmoveTagId, CmovzTagId, CmovneTagId, CmovnzTagId, CmovaTagId, CmovnbeTagId, CmovaeTagId, CmovnbTagId, CmovncTagId, CmovbTagId, CmovnaeTagId, CmovcTagId, CmovbeTagId, CmovnaTagId, CmovgTagId, CmovnleTagId, CmovgeTagId, CmovnlTagId, CmovlTagId, CmovngeTagId, CmovleTagId, CmovngTagId, CmovoTagId, CmovnoTagId, CmovsTagId, CmovnsTagId, CmovpTagId, CmovnpTagId, CmovpeTagId, CmovpoTagId, JmpTagId, JeTagId, JzTagId, JneTagId, JnzTagId, JgTagId, JngTagId, JgeTagId, JngeTagId, JaTagId, JnaTagId, JaeTagId, JnaeTagId, JlTagId, JleTagId, JbTagId, JbeTagId, JoTagId, JnoTagId, JpTagId, CallTagId, ExtcallTagId, IatTagId, RetTagId, PushTagId, PopTagId, NopTagId, SyscallTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, LockTagId, XchgTagId, CmpxchgTagId, XaddTagId, Cmpxchg8bTagId, MfenceTagId, SfenceTagId, LfenceTagId, PauseTagId, ClflushTagId, ClflushoptTagId, Prefetcht0TagId, Prefetcht1TagId, Prefetcht2TagId, PrefetchntaTagId, RepmovsbTagId, RepmovswTagId, RepmovsdTagId, RepmovsqTagId, RebindTagId, WithregTagId, BswapTagId, ScopeTagId, PopcntTagId, CasejmpTagId, JsTagId, JnsTagId, PunpcklqdqTagId, MovupdTagId, MovupsTagId, AddpdTagId, MulpdTagId, AddpsTagId, MulpsTagId, ShufpsTagId, RepstosbTagId, RepstosqTagId}
 
 type
   A64Inst* = enum
@@ -295,9 +307,17 @@ type
     ClzA64 = (ord(ClzTagId), "clz")  ## count leading zeros: D = number of leading zero bits of S; `N` is the operand size in bits (32 or 64)
     RbitA64 = (ord(RbitTagId), "rbit")  ## reverse bit order of S into D (with `clz` this is a count-trailing-zeros); `N` is the operand size in bits
     RevA64 = (ord(RevTagId), "rev")  ## reverse byte order of S into D; `N` is the operand size in bits (32 or 64)
+    FldrqA64 = (ord(FldrqTagId), "fldrq")  ## load a 128-bit q register from memory (`ldr Qt, [Xn, #imm]`, imm a multiple of 16). `D` is spelled as the register's d/s tag — the q width is the instruction's, exactly as `movdqu`'s 16-byte access is on x64
+    FstrqA64 = (ord(FstrqTagId), "fstrq")  ## store a 128-bit q register: `(fstrq <mem> <fpreg>)`, operand order as `fstr`
+    VfaddA64 = (ord(VfaddTagId), "vfadd")  ## vector fp add, lane-wise (D = A + B): arrangement `.2d` when the registers are d-spelled, `.4s` when s-spelled
+    VfsubA64 = (ord(VfsubTagId), "vfsub")  ## vector fp subtract, lane-wise (D = A - B), arrangement as `vfadd`
+    VfmulA64 = (ord(VfmulTagId), "vfmul")  ## vector fp multiply, lane-wise (D = A * B), arrangement as `vfadd`
+    VfmlaA64 = (ord(VfmlaTagId), "vfmla")  ## vector fp fused multiply-add, lane-wise (D = D + A * B), arrangement as `vfadd`
+    VdupA64 = (ord(VdupTagId), "vdup")  ## broadcast lane 0 of S to every lane of D (`dup Vd.2d, Vn.d[0]` when d-spelled, `.4s/.s[0]` when s-spelled)
+    VeorA64 = (ord(VeorTagId), "veor")  ## vector bitwise xor over all 16 bytes (`eor Vd.16b`); `(veor X X X)` zeroes X
 
 proc rawTagIsA64Inst*(raw: TagEnum): bool {.inline.} =
-  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, SmulhTagId, UmulhTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, AddwTagId, SubwTagId, MulwTagId, Addw3TagId, Subw3TagId, Mulw3TagId, GloadTagId, GstoreTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, SvcTagId, AdrTagId, LdrTagId, StrTagId, StpTagId, LdpTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, CseleqTagId, CselneTagId, CselltTagId, CselleTagId, CselgtTagId, CselgeTagId, CselloTagId, CsellsTagId, CselhiTagId, CselhsTagId, CseteqTagId, CsetneTagId, CsetltTagId, CsetleTagId, CsetgtTagId, CsetgeTagId, CsetloTagId, CsetlsTagId, CsethiTagId, CsethsTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, LdaxrTagId, StlxrTagId, LdarTagId, StlrTagId, DmbTagId, ClrexTagId, FmovTagId, FaddTagId, FsubTagId, FmulTagId, FdivTagId, FnegTagId, FcmpTagId, FldrTagId, FstrTagId, ScvtfTagId, UcvtfTagId, FcvtzsTagId, FcvtzuTagId, FcvtTagId, FstpTagId, FldpTagId, LdrbTagId, StrbTagId, RebindTagId, WithregTagId, ScopeTagId, ClzTagId, RbitTagId, RevTagId}
+  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, SmulhTagId, UmulhTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, AddwTagId, SubwTagId, MulwTagId, Addw3TagId, Subw3TagId, Mulw3TagId, GloadTagId, GstoreTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, SvcTagId, AdrTagId, LdrTagId, StrTagId, StpTagId, LdpTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, CseleqTagId, CselneTagId, CselltTagId, CselleTagId, CselgtTagId, CselgeTagId, CselloTagId, CsellsTagId, CselhiTagId, CselhsTagId, CseteqTagId, CsetneTagId, CsetltTagId, CsetleTagId, CsetgtTagId, CsetgeTagId, CsetloTagId, CsetlsTagId, CsethiTagId, CsethsTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, LdaxrTagId, StlxrTagId, LdarTagId, StlrTagId, DmbTagId, ClrexTagId, FmovTagId, FaddTagId, FsubTagId, FmulTagId, FdivTagId, FnegTagId, FcmpTagId, FldrTagId, FstrTagId, ScvtfTagId, UcvtfTagId, FcvtzsTagId, FcvtzuTagId, FcvtTagId, FstpTagId, FldpTagId, LdrbTagId, StrbTagId, RebindTagId, WithregTagId, ScopeTagId, ClzTagId, RbitTagId, RevTagId, FldrqTagId, FstrqTagId, VfaddTagId, VfsubTagId, VfmulTagId, VfmlaTagId, VdupTagId, VeorTagId}
 
 type
   NifasmType* = enum
@@ -343,9 +363,10 @@ type
     ExtprocD = (ord(ExtprocTagId), "extproc")  ## external proc from imported library
     SyprocD = (ord(SyprocTagId), "syproc")  ## system-call proc declaration (proctype + clobbers + number)
     RegsD = (ord(RegsTagId), "regs")  ## multi-register param/result location: `(regs (rdi) (rsi))`
+    LenientD = (ord(LenientTagId), "lenient")  ## proc pragma (after the clobber section): the body is MACHINE-PORTED code (e.g. distilled from gcc), so the structural disciplines are off for this one proc — backward jumps to labels are allowed (no `(loop)` required), registers may be used raw even when bound (params, r11), a bare `(call P)`/`(jmp P)` to a proc needs no `(prepare)`, and the type/clobber checks are skipped. The checks exist to catch code-GENERATOR bugs; ported code was already correct on the machine it came from
 
 proc rawTagIsNifasmDecl*(raw: TagEnum): bool {.inline.} =
-  raw in {TypeTagId, ProcTagId, ParamsTagId, ParamTagId, ResultTagId, ClobberTagId, VarTagId, ArchTagId, CfvarTagId, RodataTagId, GvarTagId, TvarTagId, ImpTagId, ExtprocTagId, SyprocTagId, RegsTagId}
+  raw in {TypeTagId, ProcTagId, ParamsTagId, ParamTagId, ResultTagId, ClobberTagId, VarTagId, ArchTagId, CfvarTagId, RodataTagId, GvarTagId, TvarTagId, ImpTagId, ExtprocTagId, SyprocTagId, RegsTagId, LenientTagId}
 
 type
   NifasmExpr* = enum
@@ -357,8 +378,8 @@ type
     ResX = (ord(ResTagId), "res")  ## result reference in prepare block
     DotX = (ord(DotTagId), "dot")  ## field access
     AtX = (ord(AtTagId), "at")  ## array index
-    MemX = (ord(MemTagId), "mem")  ## memory reference
-    CastX = (ord(CastTagId), "cast")  ## type cast
+    MemX = (ord(MemTagId), "mem")  ## memory reference: `(mem base)`, `(mem base disp)`, `(mem base index scale [disp])` (base/index are raw registers or register-homed locals/params), or the no-base scaled form `(mem 0 index scale [disp])` = `[index*scale + disp]` (x64: SIB base=101; the literal `0` base is unambiguous since a real base is never an immediate)
+    CastX = (ord(CastTagId), "cast")  ## type cast; over a memory operand it retypes (and thereby sizes) the access; over a REGISTER operand of an x64 ALU instruction (add/sub/and/or/xor/cmp/test/shl/shr/sar/neg/not) an explicit sub-width int type (8/16/32 bits) sizes the OPERATION: 32-bit zero-extends the destination, 8/16-bit preserve its upper bits, flags and shift-count masking follow the width. Never inferred from a symbol's declared type, and `mov` still rejects a cast register destination
     RelocX = (ord(RelocTagId), "reloc")  ## rodata relocation: bake symbol S's address at byte offset O
 
 proc rawTagIsNifasmExpr*(raw: TagEnum): bool {.inline.} =

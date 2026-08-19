@@ -44,6 +44,7 @@ type
     res*: Cursor
     clobber*: Cursor
     hasParams*, hasResult*, hasClobber*: bool
+    lenient*: bool     ## the `(lenient)` proc pragma was present
 
 proc takeSig*(c: var Cursor): RoutineSig =
   ## `c` is positioned at the first optional section of a routine signature
@@ -60,6 +61,8 @@ proc takeSig*(c: var Cursor): RoutineSig =
       result.res = c; result.hasResult = true; skip c
     of ClobberD:
       result.clobber = c; result.hasClobber = true; skip c
+    of LenientD:
+      result.lenient = true; skip c
     else:
       break
 

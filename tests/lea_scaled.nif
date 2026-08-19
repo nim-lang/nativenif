@@ -1,0 +1,63 @@
+(.nif27)
+(stmts
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (var :status.0
+    (rbx)
+    (i 64))
+   (prepare compute.0
+    (call)
+    (mov status.0
+     (res ret.0)))
+   (sub status.0 64)
+   (mov
+    (rax)60)
+   (mov
+    (rdi)status.0)
+   (syscall)))
+ (proc :compute.0
+  (params)
+  (result :ret.0
+   (rax)
+   (i 64))
+  (clobber
+   (rcx)
+   (rdx)
+   (rsi)
+   (rdi)
+   (r8)
+   (r9)
+   (r10)
+   (r11))
+  (stmts
+   (var :a.0
+    (rcx)
+    (i 64))
+   (mov a.0 5)
+   (var :b.0
+    (rsi)
+    (i 64))
+   (mov b.0 3)
+   (var :t.0
+    (rdi)
+    (i 64))
+   (lea t.0
+    (mem 0 a.0 8))
+   (var :u.0
+    (r8)
+    (i 64))
+   (lea u.0
+    (mem a.0 a.0 1))
+   (add t.0 u.0)
+   (var :v.0
+    (r9)
+    (i 64))
+   (lea v.0
+    (mem a.0 b.0 4 -3))
+   (add t.0 v.0)
+   (mov
+    (rax)t.0)
+   (ret))))

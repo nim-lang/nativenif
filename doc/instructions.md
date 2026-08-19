@@ -77,7 +77,7 @@
 | `(cvtss2sd D S)`       | X64Inst                  | scalar single -> scalar double convert |
 | `(comisd D S)`         | X64Inst                  | compare scalar double, set EFLAGS |
 | `(comiss D S)`         | X64Inst                  | compare scalar single, set EFLAGS |
-| `(movfq D S)`          | X64Inst                  | move 64 bits between gpr and xmm |
+| `(movfq D S)`          | X64Inst                  | move 64 bits between gpr and xmm; `(movfq (xmmD) (xmmS))` is SSE `movq xmm,xmm` — D.lo = S.lo with D's high lane ZEROED (gcc's lane sanitizer before packed ops) |
 | `(movfd D S)`          | X64Inst                  | move 32 bits between gpr and xmm |
 | `(and D S)`            | X64Inst, A64Inst         | bitwise and |
 | `(or D S)`             | X64Inst                  | bitwise or |
@@ -236,7 +236,7 @@
 | `(jtrue ...)`          | X64Inst, A64Inst            | set control flow variable(s) to true |
 | `(dot B F)`            | NifasmExpr                  | field access |
 | `(at B I)`             | NifasmExpr                  | array index |
-| `(mem ...)`            | NifasmExpr                  | memory reference |
+| `(mem ...)`            | NifasmExpr                  | memory reference: `(mem base)`, `(mem base disp)`, `(mem base index scale [disp])` (base/index are raw registers or register-homed locals/params), or the no-base scaled form `(mem 0 index scale [disp])` = `[index*scale + disp]` (x64: SIB base=101; the literal `0` base is unambiguous since a real base is never an immediate) |
 | `(rodata L S)`         | NifasmDecl                  | read-only data (string/bytes) |
 | `(gvar D L T)`         | NifasmDecl                  | global variable |
 | `(tvar D L T)`         | NifasmDecl                  | thread local variable |
@@ -244,7 +244,7 @@
 | `(extproc D S)`        | NifasmDecl                  | external proc from imported library |
 | `(syproc D ...)`       | NifasmDecl                  | system-call proc declaration (proctype + clobbers + number) |
 | `(kill S)`             | X64Inst, A64Inst            | kill variable |
-| `(cast T E)`         | NifasmExpr                  | type cast |
+| `(cast T E)`         | NifasmExpr                  | type cast; over a memory operand it retypes (and thereby sizes) the access; over a REGISTER operand of an x64 ALU instruction (add/sub/and/or/xor/cmp/test/shl/shr/sar/neg/not) an explicit sub-width int type (8/16/32 bits) sizes the OPERATION: 32-bit zero-extends the destination, 8/16-bit preserve its upper bits, flags and shift-count masking follow the width. Never inferred from a symbol's declared type, and `mov` still rejects a cast register destination |
 | `(reloc O S)`          | NifasmExpr                  | rodata relocation: bake symbol S's address at byte offset O |
 | `(lock I)`             | X64Inst                  | atomic lock prefix |
 | `(xchg D S)`           | X64Inst                  | atomic exchange |
@@ -487,3 +487,24 @@
 | `(rbit D S N)`        | A64Inst                     | reverse bit order of S into D (with `clz` this is a count-trailing-zeros); `N` is the operand size in bits |
 | `(rev D S N)`         | A64Inst                     | reverse byte order of S into D; `N` is the operand size in bits (32 or 64) |
 | `(casejmp S T ...)`   | X64Inst                     | computed-goto case dispatch (`imul S,S,N; lea T,[rip+slots]; add T,S; jmp T`): the `(stmts ...)` children are the branch bodies, NOP-padded to the measured uniform slot size N, so no lookup table and no memory load. S holds the 0-based slot index; S and T are destroyed. Every branch must end in a terminating jump (the pad NOPs are never executed) and must not define a label at its very end |
+| `(js L)`              | X64Inst                     | jump if sign (SF=1: the result was negative) |
+| `(jns L)`             | X64Inst                     | jump if not sign (SF=0) |
+| `(lenient)`           | NifasmDecl                  | proc pragma (after the clobber section): the body is MACHINE-PORTED code (e.g. distilled from gcc), so the structural disciplines are off for this one proc — backward jumps to labels are allowed (no `(loop)` required), registers may be used raw even when bound (params, r11), a bare `(call P)`/`(jmp P)` to a proc needs no `(prepare)`, and the type/clobber checks are skipped. The checks exist to catch code-GENERATOR bugs; ported code was already correct on the machine it came from |
+| `(punpcklqdq D S)`    | X64Inst                     | interleave low quadwords: D = [D.lo, S.lo] (xmm registers only; `(punpcklqdq X X)` broadcasts X's low quadword to both halves) |
+| `(movupd D S)`        | X64Inst                     | move unaligned packed double (xmm/mem either side; the access is inherently 16 bytes — the mem operand's scalar type is not consulted, matching the hardware) |
+| `(movups D S)`        | X64Inst                     | move unaligned packed single (xmm/mem either side; 16-byte access like `movupd`) |
+| `(addpd D S)`         | X64Inst                     | packed double add, 2 lanes (xmm registers only) |
+| `(mulpd D S)`         | X64Inst                     | packed double multiply, 2 lanes (xmm registers only) |
+| `(addps D S)`         | X64Inst                     | packed single add, 4 lanes (xmm registers only) |
+| `(mulps D S)`         | X64Inst                     | packed single multiply, 4 lanes (xmm registers only) |
+| `(shufps D S N)`      | X64Inst                     | shuffle packed singles: each of D's 4 lanes picks a source lane by the 2-bit fields of immediate N (low two from D, high two from S); `(shufps X X 0)` broadcasts lane 0 to all 4 |
+| `(repstosb)`          | X64Inst                     | repeat store byte string: fills `rcx` bytes at `[rdi]` with `al`, advancing `rdi`; `rcx` ends 0 (DF=0 per SysV) |
+| `(repstosq)`          | X64Inst                     | repeat store qword string: fills `rcx` qwords at `[rdi]` with `rax`, advancing `rdi`; `rcx` ends 0 |
+| `(fldrq D S)`         | A64Inst                     | load a 128-bit q register from memory (`ldr Qt, [Xn, #imm]`, imm a multiple of 16). `D` is spelled as the register's d/s tag — the q width is the instruction's, exactly as `movdqu`'s 16-byte access is on x64 |
+| `(fstrq D S)`         | A64Inst                     | store a 128-bit q register: `(fstrq <mem> <fpreg>)`, operand order as `fstr` |
+| `(vfadd D A B)`       | A64Inst                     | vector fp add, lane-wise (D = A + B): arrangement `.2d` when the registers are d-spelled, `.4s` when s-spelled |
+| `(vfsub D A B)`       | A64Inst                     | vector fp subtract, lane-wise (D = A - B), arrangement as `vfadd` |
+| `(vfmul D A B)`       | A64Inst                     | vector fp multiply, lane-wise (D = A * B), arrangement as `vfadd` |
+| `(vfmla D A B)`       | A64Inst                     | vector fp fused multiply-add, lane-wise (D = D + A * B), arrangement as `vfadd` |
+| `(vdup D S)`          | A64Inst                     | broadcast lane 0 of S to every lane of D (`dup Vd.2d, Vn.d[0]` when d-spelled, `.4s/.s[0]` when s-spelled) |
+| `(veor D A B)`        | A64Inst                     | vector bitwise xor over all 16 bytes (`eor Vd.16b`); `(veor X X X)` zeroes X |

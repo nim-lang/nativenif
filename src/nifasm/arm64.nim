@@ -850,6 +850,56 @@ proc emitFstr*(dest: var Bytes; rt: FloatRegister; rn: Register; offset: int32; 
   let base = if single: 0xBD000000'u32 else: 0xFD000000'u32
   dest.addUint32(base or (uint32(scaled) shl 10) or (encodeReg(rn) shl 5) or encodeFReg(rt))
 
+# ── AdvSIMD (NEON), 128-bit q-register forms ────────────────────────────────
+# The FloatRegister names the v register; the arrangement (`.2d` vs `.4s`)
+# follows the caller's `single` flag, exactly like the scalar fp emitters.
+
+proc emitLdrQ*(dest: var Bytes; rt: FloatRegister; rn: Register; offset: int32) =
+  ## LDR Qt, [Xn, #offset] — 128-bit load (unsigned offset, scaled by 16).
+  let scaled = offset div 16
+  if (offset and 15) != 0 or scaled < 0 or scaled > 0xFFF:
+    raise newException(ValueError, "Q LDR offset out of range")
+  dest.addUint32(0x3DC00000'u32 or (uint32(scaled) shl 10) or
+                 (encodeReg(rn) shl 5) or encodeFReg(rt))
+
+proc emitStrQ*(dest: var Bytes; rt: FloatRegister; rn: Register; offset: int32) =
+  ## STR Qt, [Xn, #offset] — 128-bit store (unsigned offset, scaled by 16).
+  let scaled = offset div 16
+  if (offset and 15) != 0 or scaled < 0 or scaled > 0xFFF:
+    raise newException(ValueError, "Q STR offset out of range")
+  dest.addUint32(0x3D800000'u32 or (uint32(scaled) shl 10) or
+                 (encodeReg(rn) shl 5) or encodeFReg(rt))
+
+proc vec3(base2d, base4s: uint32; rd, rn, rm: FloatRegister; single: bool): uint32 {.inline.} =
+  (if single: base4s else: base2d) or
+    (encodeFReg(rm) shl 16) or (encodeFReg(rn) shl 5) or encodeFReg(rd)
+
+proc emitVFadd*(dest: var Bytes; rd, rn, rm: FloatRegister; single = false) =
+  ## FADD Vd.2D, Vn.2D, Vm.2D / .4S
+  dest.addUint32(vec3(0x4E60D400'u32, 0x4E20D400'u32, rd, rn, rm, single))
+
+proc emitVFsub*(dest: var Bytes; rd, rn, rm: FloatRegister; single = false) =
+  ## FSUB Vd.2D, Vn.2D, Vm.2D / .4S
+  dest.addUint32(vec3(0x4EE0D400'u32, 0x4EA0D400'u32, rd, rn, rm, single))
+
+proc emitVFmul*(dest: var Bytes; rd, rn, rm: FloatRegister; single = false) =
+  ## FMUL Vd.2D, Vn.2D, Vm.2D / .4S
+  dest.addUint32(vec3(0x6E60DC00'u32, 0x6E20DC00'u32, rd, rn, rm, single))
+
+proc emitVFmla*(dest: var Bytes; rd, rn, rm: FloatRegister; single = false) =
+  ## FMLA Vd.2D, Vn.2D, Vm.2D / .4S — Vd += Vn * Vm, lane-wise, fused.
+  dest.addUint32(vec3(0x4E60CC00'u32, 0x4E20CC00'u32, rd, rn, rm, single))
+
+proc emitVEor*(dest: var Bytes; rd, rn, rm: FloatRegister) =
+  ## EOR Vd.16B, Vn.16B, Vm.16B — arrangement-blind bitwise xor.
+  dest.addUint32(0x6E201C00'u32 or (encodeFReg(rm) shl 16) or
+                 (encodeFReg(rn) shl 5) or encodeFReg(rd))
+
+proc emitVDup*(dest: var Bytes; rd, rn: FloatRegister; single = false) =
+  ## DUP Vd.2D, Vn.D[0] / Vd.4S, Vn.S[0] — broadcast lane 0.
+  let base = if single: 0x4E040400'u32 else: 0x4E080400'u32
+  dest.addUint32(base or (encodeFReg(rn) shl 5) or encodeFReg(rd))
+
 proc emitFstpPre*(dest: var Bytes; rt1, rt2: FloatRegister; rn: Register; offset: int32) =
   ## STP Dt1, Dt2, [Xn, #offset]! — pre-indexed store pair of doubles.
   let scaled = offset div 8

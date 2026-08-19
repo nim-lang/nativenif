@@ -451,7 +451,8 @@ proc getSym(b: var Builder; name: string; slot: AsmSlot; props: VarProps): Locat
       var crossed = 0
       for p in b.an.callPositions:
         if p > lo and p <= hi: inc crossed
-      stderr.writeLine "SPILL allregs=" & $(AllRegs in props) &
+      stderr.writeLine "SPILL proc=" & gArkhamCurProc & " var=" & name &
+        " allregs=" & $(AllRegs in props) &
         " crossed=" & $crossed & " weight=" & $vi.weight &
         " span=" & $(hi - lo) &
         " callee=" & $(5 - b.freeCallee.card) & "/5 vol=" & $b.freeVol.card & "free"
@@ -581,6 +582,9 @@ proc addSpillTemp*(plan: var Plan; name: string; typ: AsmSlot; isFloat = false) 
   ## it produced a proc with a slot and NO frame — every save writing below `rsp`.
   plan.spillTemps.add (name: name, typ: typ, isFloat: isFloat)
   plan.hasStackVars = true
+  when defined(arkhamSpillDbg):
+    stderr.writeLine "SPILLTEMP proc=" & gArkhamCurProc & " name=" & name &
+      " float=" & $isFloat
 
 proc demoteToStack(b: var Builder; victim: string) =
   ## Undo `victim`'s optimistic register assignment: move it to a nifasm-managed `(s)`

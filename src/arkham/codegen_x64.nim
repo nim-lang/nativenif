@@ -6054,15 +6054,25 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         else: skip cc
       if ownSelReg: g.giveBack(selReg)                    # release the staging reg we loaded into
       else: g.freeVal(selLoc)                             # selector dead after the tests
-      if hasElse:
-        var e = elseBody
-        e.into:
-          while e.hasMore: (g.genStmt2(e); skip e)
-      g.emJmp(lEnd)
+      # EMISSION ORDER MUST FOLLOW LENG ORDER. The emitter's binding state is a
+      # single linear walk while every liveness question (`freeAfter`, and hence
+      # "may this register be taken for a staging temp") is keyed on the Leng token
+      # POSITION. Emitting the `else` body — which is Leng-LAST — before the
+      # of-bodies retires every binding whose last use lies inside an of-branch, and
+      # the of-bodies then read a register nothing keeps for them any more. So the
+      # non-match jumps FORWARD over the bodies to the else, which is emitted last.
+      let lElse = if hasElse: g.freshLabel() else: lEnd
+      g.emJmp(lElse)
       for idx in 0 ..< bodies.len:
         g.emLab(bodies[idx][0])
         g.genStmt2(bodies[idx][1])                        # body (a stmts node)
-        if idx < bodies.len - 1: g.emJmp(lEnd)            # last body falls through to lEnd
+        # only the last body may fall through, and only when no else follows it
+        if idx < bodies.len - 1 or hasElse: g.emJmp(lEnd)
+      if hasElse:
+        g.emLab(lElse)
+        var e = elseBody
+        e.into:
+          while e.hasMore: (g.genStmt2(e); skip e)
     g.emLab(lEnd)
   of LabS:                                                # `(lab :name)` — a goto target
     var cc = c
@@ -9632,6 +9642,7 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: x64MachineA)
   g.ab.renderReg = x64RegName                 # render register slots as x86 names
   g.ab.immAnyDest = true                      # `mov r/m, imm32` exists here
+  g.ab.arch = "x64"                           # BodyLib entries this target may splice
   g.prog = collect(buf, inputPath, tags, windows = windows)
   g.callTarget = g.prog.callTarget
   g.globals = g.prog.globals

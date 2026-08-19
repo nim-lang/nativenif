@@ -30,6 +30,9 @@ type
     renderReg*: proc (r: Reg): string {.nimcall.}  ## GPR slot → arch spelling shim
     immAnyDest*: bool           ## target carries an immediate into any `mov`
                                 ## destination (x86-64 does, AArch64 does not)
+    arch*: string               ## "x64"/"a64": selects the BodyLib entries the
+                                ## peephole may splice (a body is target machine
+                                ## code; a fingerprint match alone must not do)
 
 proc initAsmBuf*(): AsmBuf =
   ## Defaults the register shim to AArch64 spellings; the x86-64 backend
@@ -143,7 +146,8 @@ proc sideBuf*(a: AsmBuf): AsmBuf =
   ## final once the body has been emitted — into the main buffer, and appends
   ## the body after it.
   AsmBuf(buf: createTokenBuf(256, a.buf.pool, a.buf.tags),
-         ids: a.ids, renderReg: a.renderReg, immAnyDest: a.immAnyDest)
+         ids: a.ids, renderReg: a.renderReg, immAnyDest: a.immAnyDest,
+         arch: a.arch)
 
 proc append*(a: var AsmBuf; other: var AsmBuf) =
   ## Append every top-level node of `other` (a `sideBuf` of `a`; the shared

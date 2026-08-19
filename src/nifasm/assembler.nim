@@ -72,6 +72,7 @@ proc infoStr(n: Cursor): string =
     result = "???"
 
 var gCurProc = ""
+var gLenient = false
   ## The proc currently being assembled. arkham's asm-NIF carries no line info, so
   ## `infoStr` degrades to `???` and a bare type error names nothing you can act on;
   ## the proc's mangled symbol pins it to one module and one routine.
@@ -448,6 +449,7 @@ type
                         # linker (foreign `.o`/framework linking) instead of a
                         # standalone executable. Mach-O / arm64 only for now.
     symMap: bool        # `--symmap`: dump each generated proc's vaddr to stderr
+    lenient: bool       # current proc carries the `(lenient)` pragma
     listing: bool       # `--listing:FILE`: record one row per asm-NIF instruction node
     listingPath: string # where to write it
     debugInfo: bool     # emit `.symtab` + `.eh_frame` (default on). Both are
@@ -599,6 +601,10 @@ type
     kind: OperandKind
     typ: Type
     reg: x86.Register
+    castBits: int             # non-zero only for an okReg operand under an EXPLICIT
+                              # sub-width int `(cast …)`: the ALU family then operates
+                              # at that width (8/16/32). Never inferred from a
+                              # symbol's declared type — existing output is unchanged.
     immVal: int64
     mem: x86.MemoryOperand
     argName: SymId
@@ -607,6 +613,7 @@ type
                               # ELF backend patches its `lea` against the .bss segment
 
 proc checkPtrStore(dest: Type; srcKind: OperandKind; srcTyp: Type; n: Cursor) =
+  if gLenient: return
   ## A `mov` STORES, so it can leave a pointer-typed name holding a non-pointer. The
   ## only integer literals that may be stored into a pointer are `0` and `(nil)`; any
   ## other is a type error. Arch-neutral: both `genMovX64` and the a64 `mov` call it.
@@ -2155,7 +2162,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
         # would read garbage (the value the call overwrote): reject it. The allocator
         # homes cross-call values in callee-saved registers, so this only fires on a
         # code-generator bug — the call-safety guarantee.
-        if result.reg in ctx.clobberedA64:
+        if result.reg in ctx.clobberedA64 and not ctx.lenient:
           error("Access to variable '" & name & "' in register " & $result.reg &
                 " which was clobbered by a call", n)
         result.typ = sym.typ
@@ -2740,6 +2747,7 @@ proc checkForwardJump(ctx: GenContext; label: LabelId; n: Cursor) =
   ## emitted internally (bypassing this check). Only *local* labels are tracked
   ## (`ctx.definedLabels`), so branches/tail-calls to proc/rodata/gvar targets — which
   ## are never added — are never flagged.
+  if ctx.lenient: return    # ported code keeps its original jump structure
   if int(label) in ctx.definedLabels:
     error("backward jump to an already-defined label is forbidden; " &
           "express the back-edge as a (loop …) instead", n)
@@ -2894,7 +2902,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     return
   of NoDecl:
     discard "handle via `case instTag`"
-  of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD,
+  of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, LenientD,
      ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD:
     raiseAssert("Unhandled declaration tag: " & $declTag)
 
@@ -3786,6 +3794,62 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     if dstSingle: arm64.emitFcvtToSingle(ctx.buf.data, rd, rn)  # double → single
     else:         arm64.emitFcvtToDouble(ctx.buf.data, rd, rn)  # single → double
 
+  of FldrqA64:
+    # (fldrq D <mem>) — 128-bit q load; D names the v register by its d/s tag.
+    inc n
+    let rt = parseFloatOperandA64(n, ctx)
+    let op = parseOperandA64(n, ctx)
+    if op.kind != okMem: error("FLDRQ source must be memory", n)
+    arm64.emitLdrQ(ctx.buf.data, rt, op.mem.base, op.mem.offset)
+
+  of FstrqA64:
+    # (fstrq <mem> D) — 128-bit q store, operand order as `fstr`.
+    inc n
+    let dest = parseOperandA64(n, ctx)
+    if dest.kind != okMem: error("FSTRQ destination must be memory", n)
+    let rt = parseFloatOperandA64(n, ctx)
+    arm64.emitStrQ(ctx.buf.data, rt, dest.mem.base, dest.mem.offset)
+
+  of VfaddA64, VfsubA64, VfmulA64, VfmlaA64:
+    # (vop D A B bits?) — lane-wise vector fp; `.2d` when d-spelled, `.4s` when
+    # s-spelled. The optional trailing lane-bits literal (32/64) overrides the
+    # spelling-derived arrangement: a 128-bit VALUE binding (`(f 128)`, arkham's
+    # vector locals) names the register without naming a lane width, so the
+    # instruction carries it explicitly — the same shape as `(clz D S N)`.
+    inc n
+    var single = isA64FpSingle(n, ctx)
+    let rd = parseFloatOperandA64(n, ctx)
+    let ra = parseFloatOperandA64(n, ctx)
+    let rb = parseFloatOperandA64(n, ctx)
+    if n.kind == IntLit:
+      single = int(n.intVal) == 32
+      inc n
+    case instTag
+    of VfaddA64: arm64.emitVFadd(ctx.buf.data, rd, ra, rb, single)
+    of VfsubA64: arm64.emitVFsub(ctx.buf.data, rd, ra, rb, single)
+    of VfmulA64: arm64.emitVFmul(ctx.buf.data, rd, ra, rb, single)
+    else:        arm64.emitVFmla(ctx.buf.data, rd, ra, rb, single)
+
+  of VdupA64:
+    # (vdup D S bits?) — broadcast S's lane 0 to every lane of D; trailing
+    # lane-bits literal as in `vfadd`.
+    inc n
+    var single = isA64FpSingle(n, ctx)
+    let rd = parseFloatOperandA64(n, ctx)
+    let rn = parseFloatOperandA64(n, ctx)
+    if n.kind == IntLit:
+      single = int(n.intVal) == 32
+      inc n
+    arm64.emitVDup(ctx.buf.data, rd, rn, single)
+
+  of VeorA64:
+    # (veor D A B) — 16-byte xor; `(veor X X X)` zeroes X.
+    inc n
+    let rd = parseFloatOperandA64(n, ctx)
+    let ra = parseFloatOperandA64(n, ctx)
+    let rb = parseFloatOperandA64(n, ctx)
+    arm64.emitVEor(ctx.buf.data, rd, ra, rb)
+
   of BA64:
     inc n
     let op = parseOperandA64(n, ctx)
@@ -4123,6 +4187,8 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
     # (Matters now that proc bodies are emitted back-to-back when bundling.)
     ctx.clobbered = {}
     ctx.clobberedA64 = {}
+    ctx.lenient = false
+    gLenient = false
 
     # Add params to scope.
     #
@@ -4178,7 +4244,13 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
     # (already consumed in pass1). The `while hasMore` is bounded by the proc's
     # `into`, so it stops at the proc end naturally.
     while n.hasMore:
-      if atTag(n, StmtsTagId):
+      if atTag(n, LenientTagId):
+        # `(lenient)` precedes the body (takeSig consumed it in pass1); it
+        # relaxes the structural checks for THIS proc only.
+        ctx.lenient = true
+        gLenient = true
+        skip n
+      elif atTag(n, StmtsTagId):
         var scan = n
         collectLabels(scan, ctx, ctx.scope)
         loopInto n:
@@ -4284,7 +4356,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
       result.reg = parseRegister(n)
       result.typ = Type(kind: RegisterT, regBits: 64) # Pure register - accepts any type
       # Check if this register is bound to a variable
-      if result.reg in ctx.regBindings:
+      if result.reg in ctx.regBindings and not ctx.lenient:
         error("Register " & $result.reg & " is bound to variable '" &
               ctx.regBindings[result.reg] & "', use the variable name instead", n)
       # R11 is the codegen's RESERVED staging bridge — never a syscall/call argument
@@ -4293,7 +4365,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
       # must hand it out as a typed `(rebind)` binding (see arkham `pickStagingSealed`).
       # Rejecting it here keeps the staging bridge inside the typed-binding model so a
       # dropped/clobbered operand is an assemble-time error, not a runtime miscompile.
-      if result.reg == x86.R11:
+      if result.reg == x86.R11 and not ctx.lenient:
         error("raw r11 operand: the staging bridge must be a typed (rebind) binding, " &
               "never a bare (reg) — untracked value/address in the bridge", n)
     elif t == NilTagId:
@@ -4589,6 +4661,16 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
       # Cast allows us to opt-out of type system, so we don't check against expectedType here
       var op = parseOperand(n, ctx)
       op.typ = castType
+      # An explicit sub-width int cast over a REGISTER is a width annotation:
+      # the ALU family operates on the low `castBits` of the register (32-bit
+      # zero-extends the destination, 8/16 preserve its upper bits, flags at
+      # that width). Recorded only here — a symbol's declared sub-width type
+      # never sizes a register operation, so existing output is byte-identical.
+      if op.kind == okReg and castType != nil and
+         castType.kind in {IntT, UIntT} and castType.bits in [8, 16, 32]:
+        op.castBits = castType.bits
+      else:
+        op.castBits = 0
       result = op
     elif t == MemTagId:
       # (mem <address-expr>) or (mem <base> <offset>) or (mem <base> <index> <scale>) etc.
@@ -4609,6 +4691,47 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
 
           result = addrOp
           result.typ = resolvedBase(addrOp.typ, ctx, n)  # Dereference: ptr T -> T
+        elif n.kind == IntLit and getInt(n) == 0:
+          # `(mem 0 index scale [disp])` — the NO-BASE scaled form
+          # `[index*scale + disp]` (SIB base=101). The literal 0 base is
+          # unambiguous: a plain base is never an immediate. This is how a pure
+          # scaled index (`lea D, [S*8]`, gcc's `[rax*4+0]`) is spelled.
+          inc n
+          var indexReg: x86.Register
+          if n.kind == TagLit and rawTagIsX64Reg(n.tag):
+            let idxOp = parseOperand(n, ctx)   # keeps the binding guards
+            indexReg = idxOp.reg
+          elif n.kind == Symbol:
+            let indexName = getSym(n)
+            let indexSym = lookupWithAutoImport(ctx, ctx.scope, indexName, n)
+            if indexSym != nil and indexSym.kind in {skVar, skParam} and
+               indexSym.reg != InvalidTagId:
+              indexReg = tagToRegister(indexSym.reg, n)
+              inc n
+            else:
+              error("Expected register index in no-base mem", n)
+          else:
+            error("Expected register index in no-base mem", n)
+          if not (n.hasMore and n.kind == IntLit):
+            error("no-base mem requires an explicit scale", n)
+          let scale0 = int(getInt(n))
+          if scale0 notin [1, 2, 4, 8]:
+            error("mem scale must be 1, 2, 4, or 8", n)
+          inc n
+          var disp0: int32 = 0
+          if n.hasMore and n.kind == IntLit:
+            disp0 = int32(getInt(n))
+            inc n
+          result.kind = okMem
+          result.mem = x86.MemoryOperand(
+            base: x86.RAX,          # unused; RAX keeps REX.B-from-base silent
+            index: indexReg,
+            scale: scale0,
+            displacement: disp0,
+            hasIndex: true,
+            noBase: true
+          )
+          result.typ = Type(kind: IntT, bits: 64)
         else:
           # Explicit addressing: (mem base) or (mem base offset) or (mem base index scale [offset])
           var baseOp = parseOperand(n, ctx)
@@ -4642,6 +4765,24 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
               let pt = if argOff.typ.kind == StackOffT: argOff.typ.offType else: argOff.typ
               if pt != nil and pt.kind notin {TypeKind.ObjectT, TypeKind.ArrayT, TypeKind.UnionT}:
                 stackVarType = pt
+          elif n.hasMore and n.kind == TagLit and rawTagIsX64Reg(n.tag):
+            # `(mem <base> <index-reg> [scale [disp]])` with a raw register index —
+            # the general SIB form `[base + index*scale + disp]`. Parsing the index
+            # through parseOperand keeps the binding guards (a bound register must be
+            # named, r11 stays a typed binding). Base==index is legal here: unlike
+            # `(at)`, this form makes no claim that the two are distinct values — it
+            # IS the encoding, as a distilled gcc body may spell it.
+            let idxOp = parseOperand(n, ctx)
+            hasIndex = true
+            indexReg = idxOp.reg
+            if n.hasMore and n.kind == IntLit:
+              scale = int(getInt(n))
+              if scale notin [1, 2, 4, 8]:
+                error("mem scale must be 1, 2, 4, or 8", n)
+              inc n
+              if n.hasMore and n.kind == IntLit:
+                displacement = int32(getInt(n))
+                inc n
           elif n.hasMore and (n.kind == IntLit or n.kind == Symbol):
             if n.kind == IntLit:
               displacement = int32(getInt(n))
@@ -4674,8 +4815,10 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
                           "' (" & $slotSize & " bytes)", n)
                   displacement += int32(extra)
                   inc n
-              elif indexSym != nil and indexSym.kind == skVar and indexSym.reg != InvalidTagId:
-                # This is the index register
+              elif indexSym != nil and indexSym.kind in {skVar, skParam} and
+                   indexSym.reg != InvalidTagId:
+                # This is the index register (a register-homed local or param —
+                # the same {skVar, skParam} convention as every operand path)
                 hasIndex = true
                 indexReg = tagToRegister(indexSym.reg, n)
                 inc n
@@ -4827,7 +4970,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
         result.reg = tagToRegister(sym.reg, n)
 
         # Check if clobbered
-        if result.reg in ctx.clobbered:
+        if result.reg in ctx.clobbered and not ctx.lenient:
           error("Access to variable '" & name & "' in register " & $result.reg & " which was clobbered", n)
 
       result.typ = sym.typ
@@ -4895,15 +5038,16 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
   else:
     error("Unexpected operand kind", n)
 
-proc parseDest(n: var Cursor; ctx: var GenContext): Operand =
+proc parseDest(n: var Cursor; ctx: var GenContext;
+               allowWidthCast = false): Operand =
   if n.kind == TagLit and rawTagIsX64Reg(n.tag):
     result.reg = parseRegister(n)
     result.typ = Type(kind: RegisterT, regBits: 64)
     # Check if this register is bound to a variable
-    if result.reg in ctx.regBindings:
+    if result.reg in ctx.regBindings and not ctx.lenient:
       error("Register " & $result.reg & " is bound to variable '" &
             ctx.regBindings[result.reg] & "', use the variable name instead", n)
-    if result.reg == x86.R11:           # the reserved staging bridge (see parseOperand)
+    if result.reg == x86.R11 and not ctx.lenient:   # the reserved staging bridge
       error("raw r11 destination: the staging bridge must be a typed (rebind) binding, " &
             "never a bare (reg)", n)
   elif n.kind == TagLit and n.tag == ArgTagId:
@@ -4956,8 +5100,17 @@ proc parseDest(n: var Cursor; ctx: var GenContext): Operand =
     # v 8))` — where the slot's own declared (aggregate) type would otherwise size the
     # access. `okMem` is still required, so `(cast T (reg))` remains rejected: a register
     # destination must be a typed binding, never a retyped raw register.
+    #
+    # ONE exception, and only where the instruction opts in (`allowWidthCast` —
+    # the ALU family, never `mov`): an explicit SUB-WIDTH int cast over a
+    # register destination is a width annotation on the operation, not a
+    # retyping — `(add (cast (u 32) (rax)) …)` is a 32-bit add. A 64-bit cast
+    # stays rejected everywhere (that is the escape hatch this guard exists
+    # for), and `mov` keeps the strict rule so the pointer-store protection
+    # cannot be casted away.
     let op = parseOperand(n, ctx)
-    if op.kind != okMem:
+    if op.kind != okMem and not (allowWidthCast and op.kind == okReg and
+                                 op.castBits != 0):
       error("Expected memory destination", n)
     result = op
   elif n.kind == Symbol:
@@ -4998,10 +5151,12 @@ proc parseDest(n: var Cursor; ctx: var GenContext): Operand =
     error("Expected destination", n)
 
 proc checkType(want, got: Type; n: Cursor) =
+  if gLenient: return
   if not compatible(want, got):
     typeError(want, got, n)
 
 proc checkIntegerArithmetic(t: Type; op: string; n: Cursor) =
+  if gLenient: return
   if not canDoIntegerArithmetic(t):
     # NOT "integer or pointer": `canDoIntegerArithmetic` admits no pointer of any
     # kind, and saying otherwise sends the reader looking for which pointer was
@@ -5012,10 +5167,12 @@ proc checkIntegerArithmetic(t: Type; op: string; n: Cursor) =
           "`(at …)`/`(pat …)`, or cast to an integer, compute, and cast back", n)
 
 proc checkComparable(t: Type; op: string; n: Cursor) =
+  if gLenient: return
   if not canCompare(t):
     error("Operation '" & op & "' requires a comparable type, got " & $t, n)
 
 proc checkIntegerType(t: Type; op: string; n: Cursor) =
+  if gLenient: return
   if not isIntegerType(t):
     error("Operation '" & op & "' requires integer type, got " & $t, n)
 
@@ -5062,6 +5219,7 @@ proc parseXmmOperand(n: var Cursor; ctx: var GenContext): x86.XmmRegister =
     error("expected xmm register or float variable", n)
 
 proc checkBitwiseType(t: Type; op: string; n: Cursor) =
+  if gLenient: return
   if not canDoBitwiseOps(t):
     error("Operation '" & op & "' requires integer type, got " & $t, n)
 
@@ -5071,6 +5229,7 @@ proc checkCompatibleTypes(t1, t2: Type; op: string; n: Cursor) =
     error("Operation '" & op & "' requires compatible types, got " & $t1 & " and " & $t2, n)
 
 proc checkCmpCompatible(t1, t2: Type; n: Cursor) =
+  if gLenient: return
   ## Compatibility rule for `cmp` — looser than arithmetic. Two SIZED integers of
   ## ANY width/signedness compare fine (x86 `cmp` runs at register width; a `u32`
   ## value vs an `i64` constant is a perfectly valid comparison — arkham computes
@@ -5082,6 +5241,7 @@ proc checkCmpCompatible(t1, t2: Type; n: Cursor) =
   error("Operation 'cmp' requires compatible types, got " & $t1 & " and " & $t2, n)
 
 proc checkBitwiseCompatible(t1, t2: Type; op: string; n: Cursor) =
+  if gLenient: return
   ## Compatibility rule for `and`/`or`/`xor` — looser than arithmetic, like `cmp`. Two
   ## SIZED integers of ANY width/signedness combine fine: bitwise ops run at register
   ## width on both x86 and AArch64, and arkham canonicalizes integers in 64-bit
@@ -5095,6 +5255,7 @@ proc checkBitwiseCompatible(t1, t2: Type; op: string; n: Cursor) =
   error("Operation '" & op & "' requires compatible types, got " & $t1 & " and " & $t2, n)
 
 proc checkArithCompatible(t1, t2: Type; op: string; n: Cursor) =
+  if gLenient: return
   ## Compatibility rule for `add`/`sub` — same as `cmp`/bitwise, on x86 and AArch64
   ## alike: two SIZED integers of ANY width/signedness add fine, because arkham
   ## canonicalizes every integer into a full 64-bit register (a narrow load is
@@ -5231,6 +5392,36 @@ proc genCallMarkerX64(n: var Cursor; ctx: var GenContext) =
   ## to the prepared proc, or — when the prepare target is a function-pointer
   ## variable — an indirect call that loads the pointer and `call`s through it.
   if not ctx.inCall:
+    if ctx.lenient:
+      # Lenient bare call: `(call P)` with no `(prepare)` ceremony — the
+      # ported body has already marshalled its arguments (arkham's ABI is
+      # plain SysV, so gcc code's registers line up as-is).
+      into n:
+        if n.kind != Symbol: error("bare (call P) requires a proc symbol", n)
+        let sym = lookupWithAutoImport(ctx, ctx.scope, getSym(n), n)
+        if sym == nil:
+          error("bare (call P): unknown proc: " & getSym(n), n)
+        inc n
+        if sym.kind == skProc:
+          var labId: LabelId
+          if sym.offset == -1:
+            labId = ctx.buf.createLabel()
+            sym.offset = int(labId)
+          else:
+            labId = LabelId(sym.offset)
+          ctx.buf.emitCall(labId)
+        elif sym.kind == skGvar:
+          # A GLOBAL holding a function pointer: same lowering as the prepare
+          # path — lea the global's address (patched by writeElf), load the
+          # pointer, call through RAX (volatile at any call site).
+          let pos = x86.emitLeaRipPlaceholder(ctx.buf, x86.RAX)
+          ctx.gvarSites.add (pos, sym)
+          x86.emitMov(ctx.buf.data, x86.RAX,
+                      x86.MemoryOperand(base: x86.RAX))
+          x86.emitCallReg(ctx.buf.data, x86.RAX)
+        else:
+          error("bare (call P): not a proc or fn-pointer global: " & $sym.kind, n)
+      return
     error("(call) can only be used inside a prepare block", n)
 
   if ctx.callContext.callEmitted:
@@ -5564,6 +5755,7 @@ proc genKillX64(n: var Cursor; ctx: var GenContext) =
   inc n
 
 proc checkFixedRegFree(ctx: GenContext; reg: x86.Register; insn: string; n: Cursor) =
+  if ctx.lenient: return
   ## A fixed-register instruction (`idiv`/`div` write RDX:RAX) is about to clobber
   ## `reg`. If a live variable is still bound to it, that is a code-generator bug —
   ## the clobber would silently destroy the value. Reject it: the value must be moved
@@ -5666,6 +5858,7 @@ proc leaRegBase(n: var Cursor; ctx: var GenContext; baseReg: var x86.Register): 
   return false
 
 proc checkDistinctAluRegs(dest, op: Operand; mnemonic: string; n: Cursor) =
+  if gLenient: return
   ## A register `and`/`or`/`sub` whose two operands are the SAME register is never
   ## intentional in arkham's codegen: `x and x == x`, `x or x == x`, `x - x == 0`,
   ## so the real source operand has been dropped — the signature of a staging /
@@ -5789,6 +5982,65 @@ proc genCasejmpX64(n: var Cursor; ctx: var GenContext) =
     ctx.buf.data[immPos + 3] = byte((nv shr 24) and 0xFF)
     ctx.buf.fixedRanges.add (slotsStart, slotsStart + bounds.len * slotSize)
 
+type
+  SizedAluKind = enum
+    saAdd, saSub, saAnd, saOr, saXor, saCmp, saTest
+
+const
+  # MR-form opcode pairs (8-bit / 16-32-bit) and the /digit of the imm form,
+  # indexed by SizedAluKind. TEST's imm form is special-cased (0xF6/0xF7 /0).
+  sizedAluOpcMR8: array[SizedAluKind, byte] = [0x00'u8, 0x28, 0x20, 0x08, 0x30, 0x38, 0x84]
+  sizedAluOpcMR:  array[SizedAluKind, byte] = [0x01'u8, 0x29, 0x21, 0x09, 0x31, 0x39, 0x85]
+  sizedAluOpcRM8: array[SizedAluKind, byte] = [0x02'u8, 0x2A, 0x22, 0x0A, 0x32, 0x3A, 0x84]
+  sizedAluOpcRM:  array[SizedAluKind, byte] = [0x03'u8, 0x2B, 0x23, 0x0B, 0x33, 0x3B, 0x85]
+  sizedAluDigit:  array[SizedAluKind, int]  = [0, 5, 4, 1, 6, 7, 0]
+
+proc checkSubWidthImm(imm: int64; bits: int; n: Cursor) =
+  ## The immediate must fit the operation width under EITHER signedness —
+  ## only its low `bits` reach the hardware, so `(cmp (cast (u 8) r) 255)`
+  ## and `(cmp (cast (i 8) r) -1)` are both meaningful (and identical).
+  let lo = -(1'i64 shl (bits - 1))
+  let hi = (1'i64 shl bits) - 1
+  if imm < lo or imm > hi:
+    error("immediate " & $imm & " does not fit a " & $bits &
+          "-bit sub-width operation", n)
+
+proc genAluSubWidth(ctx: var GenContext; dest, op: Operand; kind: SizedAluKind;
+                    n: Cursor) =
+  ## Two-operand ALU whose destination is an explicitly width-cast register:
+  ## the operation runs at `dest.castBits` (8/16/32). A 32-bit op zero-extends
+  ## the destination, 8/16-bit ops preserve its upper bits, flags are set at
+  ## the operation width — the hardware's own sub-width semantics. The source
+  ## may be an immediate or a register; a cast on the source register must
+  ## agree (an uncast one contributes its low bits, which is what the
+  ## instruction reads anyway).
+  let bits = dest.castBits
+  case op.kind
+  of okImm:
+    checkSubWidthImm(op.immVal, bits, n)
+    let imm = cast[int32](uint32(op.immVal and 0xFFFFFFFF'i64))
+    if kind == saTest:
+      x86.emitTestImmSizedR(ctx.buf.data, dest.reg, imm, bits)
+    else:
+      x86.emitAluImmSizedR(ctx.buf.data, dest.reg, imm, sizedAluDigit[kind], bits)
+  of okReg:
+    if op.castBits != 0 and op.castBits != bits:
+      error("sub-width operand widths disagree: " & $bits & " vs " &
+            $op.castBits, n)
+    if kind == saTest:
+      x86.emitTestSizedRR(ctx.buf.data, dest.reg, op.reg, bits)
+    else:
+      x86.emitAluSizedRR(ctx.buf.data, dest.reg, op.reg,
+                         sizedAluOpcMR8[kind], sizedAluOpcMR[kind], bits)
+  of okMem:
+    # reg(cast) OP mem — the memory side is read at the same width.
+    if kind == saTest:
+      error("TEST with memory operand not supported yet", n)
+    x86.emitAluSizedRM(ctx.buf.data, dest.reg, op.mem,
+                       sizedAluOpcRM8[kind], sizedAluOpcRM[kind], bits)
+  else:
+    error("sub-width ALU source must be a register or immediate", n)
+
 proc genInstX64(n: var Cursor; ctx: var GenContext) =
   if n.kind != TagLit: error("Expected instruction", n)
   let instTag = tagToX64Inst(n.tag)
@@ -5858,7 +6110,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     return
   of NoDecl:
     discard "continue with case instTag"
-  of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD:
+  of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, LenientD, ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD:
     error("Unexpected declaration: " & $declTag, n)
 
   case instTag
@@ -5904,7 +6156,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     genWithregX64(n, ctx)
   of AddX64:
     inc n
-    let dest = parseDest(n, ctx)
+    let dest = parseDest(n, ctx, allowWidthCast = true)
     let op = parseOperand(n, ctx)
 
     # Type check: add works on integers and pointers
@@ -5912,7 +6164,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkIntegerArithmetic(op.typ, "add", start)
     checkArithCompatible(dest.typ, op.typ, "add", start)  # sized ints of any width (64-bit reg)
 
-    if dest.kind == okMem:
+    if dest.kind == okReg and dest.castBits != 0:
+      genAluSubWidth(ctx, dest, op, saAdd, start)
+    elif dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
         x86.emitAddImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)  # ADD m, imm (sized)
       elif op.kind == okSsize:
@@ -5920,7 +6174,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       elif op.kind == okMem:
         error("Cannot add memory to memory", n)
       else:
-        x86.emitAdd(ctx.buf.data, dest.mem, op.reg)
+        x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x00, 0x01, intMemAccess(dest.typ).bits)
     else:
       if op.kind == okSsize:
         x86.emitAddImm32(ctx.buf.data, dest.reg, 0)   # forced imm32: back-patched
@@ -5936,7 +6190,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
 
   of SubX64:
     inc n
-    let dest = parseDest(n, ctx)
+    let dest = parseDest(n, ctx, allowWidthCast = true)
     let op = parseOperand(n, ctx)
 
     # Type check: sub works on integers and pointers
@@ -5944,7 +6198,9 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkIntegerArithmetic(op.typ, "sub", start)
     checkArithCompatible(dest.typ, op.typ, "sub", start)  # sized ints of any width (64-bit reg)
 
-    if dest.kind == okMem:
+    if dest.kind == okReg and dest.castBits != 0:
+      genAluSubWidth(ctx, dest, op, saSub, start)
+    elif dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
         x86.emitSubImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)  # SUB m, imm (sized)
       elif op.kind == okSsize:
@@ -5952,7 +6208,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       elif op.kind == okMem:
         error("Cannot subtract memory from memory", n)
       else:
-        x86.emitSub(ctx.buf.data, dest.mem, op.reg)
+        x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x28, 0x29, intMemAccess(dest.typ).bits)
     else:
       if op.kind == okSsize:
         x86.emitSubImm32(ctx.buf.data, dest.reg, 0)   # forced imm32: back-patched
@@ -5984,14 +6240,20 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
 
   of ImulX64:
     inc n
-    # (imul dest src) or (imul dest src imm) - but we only support binary or unary?
-    # doc says (imul D S)
-    let dest = parseDest(n, ctx)
+    # `(imul D S)` or the three-operand `(imul D S imm)` (D = S * imm). An
+    # explicit sub-width cast on D sizes the operation like the ALU family.
+    let dest = parseDest(n, ctx, allowWidthCast = true)
     let op = parseOperand(n, ctx)
     checkIntegerType(dest.typ, "imul", start)
     checkIntegerType(op.typ, "imul", start)
     if dest.kind == okMem: error("IMUL destination cannot be memory", n)
-    if op.kind == okImm:
+    if n.kind == IntLit:
+      # (imul D S imm)
+      if op.kind != okReg: error("3-operand imul source must be a register", n)
+      let bits = if dest.castBits != 0: dest.castBits else: 64
+      x86.emitImulImm3(ctx.buf.data, dest.reg, op.reg, int32(getInt(n)), bits)
+      inc n
+    elif op.kind == okImm:
       x86.emitImulImm(ctx.buf.data, dest.reg, int32(op.immVal))
     elif op.kind == okMem:
       x86.emitImul(ctx.buf.data, dest.reg, op.mem)
@@ -6043,18 +6305,20 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
   # Bitwise
   of AndX64:
     inc n
-    let dest = parseDest(n, ctx)
+    let dest = parseDest(n, ctx, allowWidthCast = true)
     let op = parseOperand(n, ctx)
     checkBitwiseType(dest.typ, "and", start)
     checkBitwiseType(op.typ, "and", start)
     checkBitwiseCompatible(dest.typ, op.typ, "and", start)
-    if dest.kind == okMem:
+    if dest.kind == okReg and dest.castBits != 0:
+      genAluSubWidth(ctx, dest, op, saAnd, start)
+    elif dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
         x86.emitAndImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)  # AND m, imm (sized)
       elif op.kind == okMem:
         error("Cannot AND memory to memory", n)
       else:
-        x86.emitAnd(ctx.buf.data, dest.mem, op.reg)
+        x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x20, 0x21, intMemAccess(dest.typ).bits)
     else:
       if op.kind == okImm:
         x86.emitAndImm(ctx.buf.data, dest.reg, int32(op.immVal))
@@ -6066,18 +6330,20 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
 
   of OrX64:
     inc n
-    let dest = parseDest(n, ctx)
+    let dest = parseDest(n, ctx, allowWidthCast = true)
     let op = parseOperand(n, ctx)
     checkBitwiseType(dest.typ, "or", start)
     checkBitwiseType(op.typ, "or", start)
     checkBitwiseCompatible(dest.typ, op.typ, "or", start)
-    if dest.kind == okMem:
+    if dest.kind == okReg and dest.castBits != 0:
+      genAluSubWidth(ctx, dest, op, saOr, start)
+    elif dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
         x86.emitOrImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)   # OR m, imm (sized)
       elif op.kind == okMem:
         error("Cannot OR memory to memory", n)
       else:
-        x86.emitOr(ctx.buf.data, dest.mem, op.reg)
+        x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x08, 0x09, intMemAccess(dest.typ).bits)
     else:
       if op.kind == okImm:
         x86.emitOrImm(ctx.buf.data, dest.reg, int32(op.immVal))
@@ -6089,18 +6355,20 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
 
   of XorX64:
     inc n
-    let dest = parseDest(n, ctx)
+    let dest = parseDest(n, ctx, allowWidthCast = true)
     let op = parseOperand(n, ctx)
     checkBitwiseType(dest.typ, "xor", start)
     checkBitwiseType(op.typ, "xor", start)
     checkBitwiseCompatible(dest.typ, op.typ, "xor", start)
-    if dest.kind == okMem:
+    if dest.kind == okReg and dest.castBits != 0:
+      genAluSubWidth(ctx, dest, op, saXor, start)
+    elif dest.kind == okMem:
       if op.kind == okImm or op.kind == okCsize:
         x86.emitXorImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)  # XOR m, imm (sized)
       elif op.kind == okMem:
         error("Cannot XOR memory to memory", n)
       else:
-        x86.emitXor(ctx.buf.data, dest.mem, op.reg)
+        x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x30, 0x31, intMemAccess(dest.typ).bits)
     else:
       if op.kind == okImm:
         x86.emitXorImm(ctx.buf.data, dest.reg, int32(op.immVal))
@@ -6111,40 +6379,58 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
 
   of ShlX64, SalX64:
     inc n
-    let dest = parseDest(n, ctx)
+    let dest = parseDest(n, ctx, allowWidthCast = true)
     let op = parseOperand(n, ctx)
     checkBitwiseType(dest.typ, "shl", start)
     if dest.kind == okMem: error("Shift destination cannot be memory", n)
     if op.kind == okImm:
-      x86.emitShl(ctx.buf.data, dest.reg, int(op.immVal))
+      if dest.castBits != 0:
+        x86.emitShiftImmSizedR(ctx.buf.data, dest.reg, int(op.immVal), 4, dest.castBits)
+      else:
+        x86.emitShl(ctx.buf.data, dest.reg, int(op.immVal))
     elif op.kind == okReg and op.reg == RCX:
-      x86.emitShlCl(ctx.buf.data, dest.reg)        # shl dest, cl
+      if dest.castBits != 0:
+        x86.emitShiftClSizedR(ctx.buf.data, dest.reg, 4, dest.castBits)
+      else:
+        x86.emitShlCl(ctx.buf.data, dest.reg)      # shl dest, cl
     else:
       error("Shift count must be immediate or CL", n)
 
   of ShrX64:
     inc n
-    let dest = parseDest(n, ctx)
+    let dest = parseDest(n, ctx, allowWidthCast = true)
     let op = parseOperand(n, ctx)
     checkBitwiseType(dest.typ, "shr", start)
     if dest.kind == okMem: error("Shift destination cannot be memory", n)
     if op.kind == okImm:
-      x86.emitShr(ctx.buf.data, dest.reg, int(op.immVal))
+      if dest.castBits != 0:
+        x86.emitShiftImmSizedR(ctx.buf.data, dest.reg, int(op.immVal), 5, dest.castBits)
+      else:
+        x86.emitShr(ctx.buf.data, dest.reg, int(op.immVal))
     elif op.kind == okReg and op.reg == RCX:
-      x86.emitShrCl(ctx.buf.data, dest.reg)        # shr dest, cl
+      if dest.castBits != 0:
+        x86.emitShiftClSizedR(ctx.buf.data, dest.reg, 5, dest.castBits)
+      else:
+        x86.emitShrCl(ctx.buf.data, dest.reg)      # shr dest, cl
     else:
       error("Shift count must be immediate or CL", n)
 
   of SarX64:
     inc n
-    let dest = parseDest(n, ctx)
+    let dest = parseDest(n, ctx, allowWidthCast = true)
     let op = parseOperand(n, ctx)
     checkBitwiseType(dest.typ, "sar", start)
     if dest.kind == okMem: error("Shift destination cannot be memory", n)
     if op.kind == okImm:
-      x86.emitSar(ctx.buf.data, dest.reg, int(op.immVal))
+      if dest.castBits != 0:
+        x86.emitShiftImmSizedR(ctx.buf.data, dest.reg, int(op.immVal), 7, dest.castBits)
+      else:
+        x86.emitSar(ctx.buf.data, dest.reg, int(op.immVal))
     elif op.kind == okReg and op.reg == RCX:
-      x86.emitSarCl(ctx.buf.data, dest.reg)        # sar dest, cl
+      if dest.castBits != 0:
+        x86.emitShiftClSizedR(ctx.buf.data, dest.reg, 7, dest.castBits)
+      else:
+        x86.emitSarCl(ctx.buf.data, dest.reg)      # sar dest, cl
     else:
       error("Shift count must be immediate or CL", n)
 
@@ -6165,17 +6451,23 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
 
   of NegX64:
     inc n
-    let op = parseDest(n, ctx)
+    let op = parseDest(n, ctx, allowWidthCast = true)
     checkIntegerArithmetic(op.typ, "neg", start)
     if op.kind == okMem: error("NEG memory not supported yet", n)
-    x86.emitNeg(ctx.buf.data, op.reg)
+    if op.castBits != 0:
+      x86.emitUnarySizedR(ctx.buf.data, op.reg, 3, op.castBits)   # NEG = /3
+    else:
+      x86.emitNeg(ctx.buf.data, op.reg)
 
   of NotX64:
     inc n
-    let op = parseDest(n, ctx)
+    let op = parseDest(n, ctx, allowWidthCast = true)
     checkBitwiseType(op.typ, "not", start)
     if op.kind == okMem: error("NOT memory not supported yet", n)
-    x86.emitNot(ctx.buf.data, op.reg)
+    if op.castBits != 0:
+      x86.emitUnarySizedR(ctx.buf.data, op.reg, 2, op.castBits)   # NOT = /2
+    else:
+      x86.emitNot(ctx.buf.data, op.reg)
 
   # Rotates: `(rol D S)` etc. D is a register, S an immediate count (the CL
   # form has no emitter yet). Mirrors the shift dispatch above.
@@ -6186,13 +6478,18 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let op = parseOperand(n, ctx)
     checkBitwiseType(dest.typ, name, start)
     if dest.kind == okMem: error("Rotate destination cannot be memory", n)
-    if op.kind != okImm: error("Rotate count must be immediate", n)
-    let count = int(op.immVal)
-    case instTag
-    of RolX64: x86.emitRol(ctx.buf.data, dest.reg, count)
-    of RorX64: x86.emitRor(ctx.buf.data, dest.reg, count)
-    of RclX64: x86.emitRcl(ctx.buf.data, dest.reg, count)
-    else:      x86.emitRcr(ctx.buf.data, dest.reg, count)
+    if op.kind == okReg and op.reg == RCX and instTag in {RolX64, RorX64}:
+      # Rotate by CL — same 0xD3 group as the shifts, digits /0 and /1.
+      x86.emitShiftCl(ctx.buf.data, dest.reg, if instTag == RolX64: 0 else: 1)
+    elif op.kind != okImm:
+      error("Rotate count must be immediate or CL", n)
+    else:
+      let count = int(op.immVal)
+      case instTag
+      of RolX64: x86.emitRol(ctx.buf.data, dest.reg, count)
+      of RorX64: x86.emitRor(ctx.buf.data, dest.reg, count)
+      of RclX64: x86.emitRcl(ctx.buf.data, dest.reg, count)
+      else:      x86.emitRcr(ctx.buf.data, dest.reg, count)
 
   # Bit scan: `(bsf D S)` / `(bsr D S)` — D and S are both registers.
   of BsfX64, BsrX64:
@@ -6235,31 +6532,48 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     if bits != 32 and bits != 64: error("bswap width must be 32 or 64", n)
     x86.emitBswap(ctx.buf.data, dest.reg, bits)
 
-  # Bit test family: `(bt D S)` etc. D is a register, S an immediate bit index.
+  # Bit test family: `(bt D S)` etc. D is a register, S an immediate bit
+  # index or a REGISTER bit index (taken modulo the operand width). An
+  # explicit sub-width cast on D sizes the operation like the ALU family.
   of BtX64, BtsX64, BtrX64, BtcX64:
     inc n
-    let dest = parseDest(n, ctx)
+    let dest = parseDest(n, ctx, allowWidthCast = true)
     let op = parseOperand(n, ctx)
     checkBitwiseType(dest.typ, $instTag, start)
     if dest.kind != okReg: error("Bit-test destination must be a register", n)
-    if op.kind != okImm: error("Bit-test bit index must be immediate", n)
-    let bit = int(op.immVal)
-    case instTag
-    of BtX64:  x86.emitBt(ctx.buf.data, dest.reg, bit)
-    of BtsX64: x86.emitBts(ctx.buf.data, dest.reg, bit)
-    of BtrX64: x86.emitBtr(ctx.buf.data, dest.reg, bit)
-    else:      x86.emitBtc(ctx.buf.data, dest.reg, bit)
+    if op.kind == okReg:
+      let bits = if dest.castBits != 0: dest.castBits else: 64
+      if op.castBits != 0 and op.castBits != bits:
+        error("sub-width operand widths disagree: " & $bits & " vs " &
+              $op.castBits, n)
+      let opc = case instTag
+                of BtX64: 0xA3'u8
+                of BtsX64: 0xAB'u8
+                of BtrX64: 0xB3'u8
+                else: 0xBB'u8
+      x86.emitBtxRR(ctx.buf.data, dest.reg, op.reg, opc, bits)
+    elif op.kind != okImm:
+      error("Bit-test bit index must be immediate or a register", n)
+    else:
+      let bit = int(op.immVal)
+      case instTag
+      of BtX64:  x86.emitBt(ctx.buf.data, dest.reg, bit)
+      of BtsX64: x86.emitBts(ctx.buf.data, dest.reg, bit)
+      of BtrX64: x86.emitBtr(ctx.buf.data, dest.reg, bit)
+      else:      x86.emitBtc(ctx.buf.data, dest.reg, bit)
 
   # Comparison
   of CmpX64:
     inc n
-    let dest = parseDest(n, ctx) # Actually just operand 1
+    let dest = parseDest(n, ctx, allowWidthCast = true) # Actually just operand 1
     let op = parseOperand(n, ctx)
     # Comparisons work on integers, pointers, and bool (the "if bool" test).
     checkComparable(dest.typ, "cmp", start)
     checkComparable(op.typ, "cmp", start)
     checkCmpCompatible(dest.typ, op.typ, start)
-    if dest.kind == okMem:
+    if dest.kind == okReg and dest.castBits != 0:
+      genAluSubWidth(ctx, dest, op, saCmp, start)
+    elif dest.kind == okMem:
       if op.kind == okImm:
         x86.emitCmpImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)  # CMP m, imm (sized)
       elif op.kind == okMem:
@@ -6304,7 +6618,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
 
   of TestX64:
     inc n
-    let dest = parseDest(n, ctx)
+    let dest = parseDest(n, ctx, allowWidthCast = true)
     let op = parseOperand(n, ctx)
     # `checkComparable`, not `checkBitwiseType`: `test r, r` is the canonical
     # zero-test and so has exactly `cmp`'s operand domain — a bool ("is this flag
@@ -6313,8 +6627,19 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     checkComparable(dest.typ, "test", start)
     checkComparable(op.typ, "test", start)
     checkCmpCompatible(dest.typ, op.typ, start)
-    if dest.kind == okMem:
-      error("TEST memory not supported yet", n)
+    if dest.kind == okReg and dest.castBits != 0:
+      genAluSubWidth(ctx, dest, op, saTest, start)
+    elif dest.kind == okMem:
+      if op.kind == okImm:
+        # TEST mem, imm — 0xF6/0xF7 /0, sized by the memory operand's type.
+        x86.emitTestImmSizedM(ctx.buf.data, dest.mem, int32(op.immVal),
+                              intMemAccess(dest.typ).bits)
+      elif op.kind == okReg:
+        # TEST mem, reg — sized by the memory operand's type (0x84/0x85 MR).
+        x86.emitAluSizedMR(ctx.buf.data, dest.mem, op.reg, 0x84, 0x85,
+                           intMemAccess(dest.typ).bits)
+      else:
+        error("TEST memory requires a register or immediate source", n)
     elif op.kind == okImm:
       # emitTestImm
       error("TEST immediate not supported yet", n)
@@ -6670,6 +6995,19 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         error("lea requires an address expression (base-reg offset, mem, dot, at, or label)", n)
   of JmpX64:
     inc n
+    if ctx.lenient and n.kind == Symbol:
+      # Lenient tail call: `(jmp P)` straight to another proc's entry.
+      let tsym = lookupWithAutoImport(ctx, ctx.scope, getSym(n), n)
+      if tsym != nil and tsym.kind == skProc:
+        inc n
+        var labId: LabelId
+        if tsym.offset == -1:
+          labId = ctx.buf.createLabel()
+          tsym.offset = int(labId)
+        else:
+          labId = LabelId(tsym.offset)
+        ctx.buf.emitJmp(labId)
+        return
     let op = parseOperand(n, ctx)
     if op.kind == okMem:
       error("JMP memory not supported yet", n)
@@ -6754,6 +7092,18 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     if op.typ.kind != UIntT: error("Jump target must be label", n)
     checkForwardJump(ctx, op.label, n)
     x86.emitJno(ctx.buf, op.label)
+  of JsX64:
+    inc n
+    let op = parseOperand(n, ctx)
+    if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
+    x86.emitJs(ctx.buf, op.label)
+  of JnsX64:
+    inc n
+    let op = parseOperand(n, ctx)
+    if op.typ.kind != UIntT: error("Jump target must be label", n)
+    checkForwardJump(ctx, op.label, n)
+    x86.emitJns(ctx.buf, op.label)
   of JpX64:
     # PF=1. After `comisd`/`comiss` that is the UNORDERED result (an operand was
     # NaN), which is how a float comparison tells "equal" from "either is NaN" —
@@ -6792,6 +7142,14 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     x86.emitNop(ctx.buf.data)
   of CasejmpX64:
     genCasejmpX64(n, ctx)
+  of RepstosbX64, RepstosqX64:
+    # `rep stos`: fills `rcx` units at `[rdi]` with al/rax, advancing rdi and
+    # zeroing rcx — record those clobbers like the `rep movs` family below.
+    let stosOp = n.tag
+    inc n
+    ctx.clobbered.incl {x86.RDI, x86.RCX}
+    if stosOp == RepstosbTagId: x86.emitRepStosb(ctx.buf.data)
+    else:                       x86.emitRepStosq(ctx.buf.data)
   of RepmovsbX64, RepmovswX64, RepmovsdX64, RepmovsqX64:
     # The `rep movs` family names NONE of its operands in the tree: it copies `rcx`
     # units from `[rsi]` to `[rdi]`, advancing both pointers and leaving `rcx` at 0.
@@ -6842,14 +7200,23 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
 
   of MovapdX64:
-    # (movapd dest src)
+    # `(movapd D S)`: aligned 128-bit float move, one side may be memory —
+    # same shape as movdqu; the aligned form faults on a misaligned address.
     inc n
-    let dest = parseDest(n, ctx) # Should check if XMM
-    let op = parseOperand(n, ctx) # Should check if XMM/Mem
-    # Need to support XMM registers in parseRegister/Operand
-    # And emitMovapd (likely similar to movsd but packed)
-    # For now, placeholder error or implement if x86 supports it
-    error("MOVAPD not supported yet", n)
+    if isXmmOperand(n, ctx):
+      let d = parseXmmOperand(n, ctx)
+      if isXmmOperand(n, ctx):
+        let s = parseXmmOperand(n, ctx)
+        x86.emitMovapd(ctx.buf.data, d, s)
+      else:
+        let s = parseOperand(n, ctx)
+        if s.kind != okMem: error("movapd source must be xmm or memory", n)
+        x86.emitMovapdLoad(ctx.buf.data, d, s.mem)
+    else:
+      let d = parseOperand(n, ctx)
+      if d.kind != okMem: error("movapd destination must be xmm or memory", n)
+      let s = parseXmmOperand(n, ctx)
+      x86.emitMovapdStore(ctx.buf.data, d.mem, s)
   of MovsdX64, MovssX64:
     # `(movsd D S)`: a scalar-float move where one side may be memory:
     #   (movsd (xmmD) (xmmS))   reg→reg ;  (movsd (xmmD) (mem …))  load
@@ -6898,6 +7265,60 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       let s = parseXmmOperand(n, ctx)
       x86.emitMovdquStore(ctx.buf.data, d.mem, s)
 
+  of PunpcklqdqX64:
+    # `(punpcklqdq D S)`: D = [D.lo, S.lo] — xmm registers only. gcc uses the
+    # self form to broadcast a quadword before a 16-byte store.
+    inc n
+    let d = parseXmmOperand(n, ctx)
+    let s = parseXmmOperand(n, ctx)
+    x86.emitPunpcklqdq(ctx.buf.data, d, s)
+
+  of MovupdX64, MovupsX64:
+    # `(movupd D S)` / `(movups D S)`: unaligned 128-bit float move, one side may
+    # be memory. Like `movdqu`, the access is inherently 16 bytes and the mem
+    # operand's declared scalar type is not consulted.
+    let packedSingle = instTag == MovupsX64
+    inc n
+    if isXmmOperand(n, ctx):
+      let d = parseXmmOperand(n, ctx)
+      if isXmmOperand(n, ctx):
+        let s = parseXmmOperand(n, ctx)
+        if packedSingle: x86.emitMovups(ctx.buf.data, d, s)
+        else: x86.emitMovupd(ctx.buf.data, d, s)
+      else:
+        let s = parseOperand(n, ctx)
+        if s.kind != okMem: error("movupd/movups source must be xmm or memory", n)
+        if packedSingle: x86.emitMovupsLoad(ctx.buf.data, d, s.mem)
+        else: x86.emitMovupdLoad(ctx.buf.data, d, s.mem)
+    else:
+      let d = parseOperand(n, ctx)
+      if d.kind != okMem: error("movupd/movups destination must be xmm or memory", n)
+      let s = parseXmmOperand(n, ctx)
+      if packedSingle: x86.emitMovupsStore(ctx.buf.data, d.mem, s)
+      else: x86.emitMovupdStore(ctx.buf.data, d.mem, s)
+
+  of AddpdX64, MulpdX64, AddpsX64, MulpsX64:
+    # Packed float ALU — xmm registers only.
+    inc n
+    let d = parseXmmOperand(n, ctx)
+    let s = parseXmmOperand(n, ctx)
+    case instTag
+    of AddpdX64: x86.emitAddpd(ctx.buf.data, d, s)
+    of MulpdX64: x86.emitMulpd(ctx.buf.data, d, s)
+    of AddpsX64: x86.emitAddps(ctx.buf.data, d, s)
+    else: x86.emitMulps(ctx.buf.data, d, s)
+
+  of ShufpsX64:
+    # `(shufps D S N)`: xmm registers + an 8-bit immediate lane selector.
+    inc n
+    let d = parseXmmOperand(n, ctx)
+    let s = parseXmmOperand(n, ctx)
+    if n.kind != IntLit: error("shufps needs an integer immediate", n)
+    let imm = getInt(n)
+    if imm < 0 or imm > 255: error("shufps immediate out of range", n)
+    inc n
+    x86.emitShufps(ctx.buf.data, d, s, byte(imm))
+
   of AddsdX64, AddssX64, SubsdX64, SubssX64,
      MulsdX64, MulssX64, DivsdX64, DivssX64, Cvtsd2ssX64, Cvtss2sdX64,
      ComisdX64, ComissX64:
@@ -6906,21 +7327,41 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let it = instTag
     inc n
     let d = parseXmmOperand(n, ctx)
-    let s = parseXmmOperand(n, ctx)
-    case it
-    of AddsdX64:   x86.emitAddsd(ctx.buf.data, d, s)
-    of AddssX64:   x86.emitAddss(ctx.buf.data, d, s)
-    of SubsdX64:   x86.emitSubsd(ctx.buf.data, d, s)
-    of SubssX64:   x86.emitSubss(ctx.buf.data, d, s)
-    of MulsdX64:   x86.emitMulsd(ctx.buf.data, d, s)
-    of MulssX64:   x86.emitMulss(ctx.buf.data, d, s)
-    of DivsdX64:   x86.emitDivsd(ctx.buf.data, d, s)
-    of DivssX64:   x86.emitDivss(ctx.buf.data, d, s)
-    of Cvtsd2ssX64: x86.emitCvtsd2ss(ctx.buf.data, d, s)
-    of Cvtss2sdX64: x86.emitCvtss2sd(ctx.buf.data, d, s)
-    of ComisdX64:  x86.emitComisd(ctx.buf.data, d, s)
-    of ComissX64:  x86.emitComiss(ctx.buf.data, d, s)
-    else: discard
+    if isXmmOperand(n, ctx):
+      let s = parseXmmOperand(n, ctx)
+      case it
+      of AddsdX64:   x86.emitAddsd(ctx.buf.data, d, s)
+      of AddssX64:   x86.emitAddss(ctx.buf.data, d, s)
+      of SubsdX64:   x86.emitSubsd(ctx.buf.data, d, s)
+      of SubssX64:   x86.emitSubss(ctx.buf.data, d, s)
+      of MulsdX64:   x86.emitMulsd(ctx.buf.data, d, s)
+      of MulssX64:   x86.emitMulss(ctx.buf.data, d, s)
+      of DivsdX64:   x86.emitDivsd(ctx.buf.data, d, s)
+      of DivssX64:   x86.emitDivss(ctx.buf.data, d, s)
+      of Cvtsd2ssX64: x86.emitCvtsd2ss(ctx.buf.data, d, s)
+      of Cvtss2sdX64: x86.emitCvtss2sd(ctx.buf.data, d, s)
+      of ComisdX64:  x86.emitComisd(ctx.buf.data, d, s)
+      of ComissX64:  x86.emitComiss(ctx.buf.data, d, s)
+      else: discard
+    else:
+      # Folded memory source: `op xmm, m32/m64` — same opcode bytes, RM form.
+      let s = parseOperand(n, ctx)
+      if s.kind != okMem:
+        error("scalar SSE source must be an xmm register or memory", n)
+      let (prefix, opcode) = case it
+        of AddsdX64:    (0xF2u8, 0x58u8)
+        of AddssX64:    (0xF3u8, 0x58u8)
+        of SubsdX64:    (0xF2u8, 0x5Cu8)
+        of SubssX64:    (0xF3u8, 0x5Cu8)
+        of MulsdX64:    (0xF2u8, 0x59u8)
+        of MulssX64:    (0xF3u8, 0x59u8)
+        of DivsdX64:    (0xF2u8, 0x5Eu8)
+        of DivssX64:    (0xF3u8, 0x5Eu8)
+        of Cvtsd2ssX64: (0xF2u8, 0x5Au8)
+        of Cvtss2sdX64: (0xF3u8, 0x5Au8)
+        of ComisdX64:   (0x66u8, 0x2Fu8)
+        else:           (0x00u8, 0x2Fu8)   # ComissX64
+      x86.emitSseOpMem(ctx.buf.data, prefix, opcode, d, s.mem)
 
   of Cvtsi2sdX64, Cvtsi2ssX64:
     # int -> float: `(cvtsi2sd (xmmD) gprS)`; the GPR source may be a named local.
@@ -6943,14 +7384,21 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
   of MovfqX64, MovfdX64:
     # Bit-transfer between a GPR and an XMM register; direction by operand kinds.
     # `(movfq (xmmD) gprS)` = gpr→xmm; `(movfq gprD (xmmS))` = xmm→gpr. The GPR
-    # side may be a raw register or a named local.
+    # side may be a raw register or a named local. `(movfq (xmmD) (xmmS))` is the
+    # SSE `movq xmm,xmm` (F3 0F 7E): D.lo = S.lo, D's HIGH lane zeroed — the lane
+    # sanitizer gcc emits before packed ops on a scalar value (movfq only).
     let it = instTag
     inc n
     if isXmmOperand(n, ctx):
       let d = parseXmmOperand(n, ctx)
-      let s = parseOperand(n, ctx).reg
-      if it == MovfqX64: x86.emitMovqGprToXmm(ctx.buf.data, d, s)
-      else:              x86.emitMovdGprToXmm(ctx.buf.data, d, s)
+      if isXmmOperand(n, ctx):
+        if it != MovfqX64: error("movfd between two xmm registers is not encodable", n)
+        let s = parseXmmOperand(n, ctx)
+        x86.emitMovqXmmToXmm(ctx.buf.data, d, s)
+      else:
+        let s = parseOperand(n, ctx).reg
+        if it == MovfqX64: x86.emitMovqGprToXmm(ctx.buf.data, d, s)
+        else:              x86.emitMovdGprToXmm(ctx.buf.data, d, s)
     else:
       let d = parseDest(n, ctx).reg
       let s = parseXmmOperand(n, ctx)
@@ -6970,8 +7418,13 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       checkIntegerArithmetic(op.typ, "lock add", start)
       checkCompatibleTypes(dest.typ, op.typ, "lock add", start)
       if dest.kind != okMem: error("Atomic ADD requires memory destination", n)
-      if op.kind == okImm: error("Atomic ADD immediate not supported yet", n)
       if op.kind == okMem: error("Atomic ADD memory source not supported", n)
+      if op.kind == okImm:
+        # `lock <alu> [mem], imm` — the sized imm emitters already exist;
+        # ARC refcounting compiles to exactly this shape (`lock add [r], 1`).
+        x86.emitLock(ctx.buf.data)
+        x86.emitAddImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)
+        return
       x86.emitLock(ctx.buf.data)
       x86.emitAdd(ctx.buf.data, dest.mem, op.reg)
     of SubX64:
@@ -6982,8 +7435,13 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       checkIntegerArithmetic(op.typ, "lock sub", start)
       checkCompatibleTypes(dest.typ, op.typ, "lock sub", start)
       if dest.kind != okMem: error("Atomic SUB requires memory destination", n)
-      if op.kind == okImm: error("Atomic SUB immediate not supported yet", n)
       if op.kind == okMem: error("Atomic SUB memory source not supported", n)
+      if op.kind == okImm:
+        # `lock <alu> [mem], imm` — the sized imm emitters already exist;
+        # ARC refcounting compiles to exactly this shape (`lock add [r], 1`).
+        x86.emitLock(ctx.buf.data)
+        x86.emitSubImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)
+        return
       x86.emitLock(ctx.buf.data)
       x86.emitSub(ctx.buf.data, dest.mem, op.reg)
     of AndX64:
@@ -6994,8 +7452,13 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       checkBitwiseType(op.typ, "lock and", start)
       checkCompatibleTypes(dest.typ, op.typ, "lock and", start)
       if dest.kind != okMem: error("Atomic AND requires memory destination", n)
-      if op.kind == okImm: error("Atomic AND immediate not supported yet", n)
       if op.kind == okMem: error("Atomic AND memory source not supported", n)
+      if op.kind == okImm:
+        # `lock <alu> [mem], imm` — the sized imm emitters already exist;
+        # ARC refcounting compiles to exactly this shape (`lock add [r], 1`).
+        x86.emitLock(ctx.buf.data)
+        x86.emitAndImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)
+        return
       x86.emitLock(ctx.buf.data)
       x86.emitAnd(ctx.buf.data, dest.mem, op.reg)
     of OrX64:
@@ -7006,8 +7469,13 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       checkBitwiseType(op.typ, "lock or", start)
       checkCompatibleTypes(dest.typ, op.typ, "lock or", start)
       if dest.kind != okMem: error("Atomic OR requires memory destination", n)
-      if op.kind == okImm: error("Atomic OR immediate not supported yet", n)
       if op.kind == okMem: error("Atomic OR memory source not supported", n)
+      if op.kind == okImm:
+        # `lock <alu> [mem], imm` — the sized imm emitters already exist;
+        # ARC refcounting compiles to exactly this shape (`lock add [r], 1`).
+        x86.emitLock(ctx.buf.data)
+        x86.emitOrImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)
+        return
       x86.emitLock(ctx.buf.data)
       x86.emitOr(ctx.buf.data, dest.mem, op.reg)
     of XorX64:
@@ -7018,8 +7486,13 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       checkBitwiseType(op.typ, "lock xor", start)
       checkCompatibleTypes(dest.typ, op.typ, "lock xor", start)
       if dest.kind != okMem: error("Atomic XOR requires memory destination", n)
-      if op.kind == okImm: error("Atomic XOR immediate not supported yet", n)
       if op.kind == okMem: error("Atomic XOR memory source not supported", n)
+      if op.kind == okImm:
+        # `lock <alu> [mem], imm` — the sized imm emitters already exist;
+        # ARC refcounting compiles to exactly this shape (`lock add [r], 1`).
+        x86.emitLock(ctx.buf.data)
+        x86.emitXorImm(ctx.buf.data, dest.mem, int32(op.immVal), intMemAccess(dest.typ).bits)
+        return
       x86.emitLock(ctx.buf.data)
       x86.emitXor(ctx.buf.data, dest.mem, op.reg)
     of IncX64:

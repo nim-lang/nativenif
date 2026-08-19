@@ -1,0 +1,168 @@
+(.nif27)
+(stmts
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (mov
+    (rbx)4294967295)
+   (add
+    (cast
+     (u 32)
+     (rbx))1)
+   (cmp
+    (rbx)0)
+   (jne fail.0)
+   (mov
+    (rcx)511)
+   (cmp
+    (cast
+     (u 8)
+     (rcx))255)
+   (jne fail.0)
+   (mov
+    (rdx)256)
+   (add
+    (cast
+     (u 8)
+     (rdx))1)
+   (cmp
+    (rdx)257)
+   (jne fail.0)
+   (mov
+    (r8)2147483648)
+   (test
+    (cast
+     (u 32)
+     (r8))
+    (cast
+     (u 32)
+     (r8)))
+   (js ok4.0)
+   (jmp fail.0)
+   (lab :ok4.0)
+   (mov
+    (r9)4294967295)
+   (shl
+    (cast
+     (u 32)
+     (r9))4)
+   (shr
+    (cast
+     (u 32)
+     (r9))28)
+   (cmp
+    (r9)15)
+   (jne fail.0)
+   (mov
+    (rsi)256)
+   (test
+    (cast
+     (u 8)
+     (rsi))
+    (cast
+     (u 8)
+     (rsi)))
+   (je ok6.0)
+   (jmp fail.0)
+   (lab :ok6.0)
+   (mov
+    (r14)526)
+   (cmp
+    (cast
+     (u 8)
+     (r14))14)
+   (jne fail.0)
+   (mov
+    (rbx)7)
+   (mov
+    (rcx)5)
+   (sub
+    (cast
+     (u 32)
+     (rbx))
+    (rcx))
+   (cmp
+    (rbx)2)
+   (jne fail.0)
+   (mov
+    (rdx)131071)
+   (and
+    (cast
+     (u 16)
+     (rdx))65280)
+   (cmp
+    (rdx)130816)
+   (jne fail.0)
+   (mov
+    (rbx)1)
+   (mov
+    (rcx)36)
+   (shl
+    (cast
+     (u 32)
+     (rbx))
+    (rcx))
+   (cmp
+    (rbx)16)
+   (jne fail.0)
+   (mov
+    (rsi)8)
+   (or
+    (cast
+     (u 32)
+     (rsi))1)
+   (cmp
+    (rsi)9)
+   (jne fail.0)
+   (mov
+    (rdx)5)
+   (neg
+    (cast
+     (u 32)
+     (rdx)))
+   (shr
+    (cast
+     (u 32)
+     (rdx))2)
+   (cmp
+    (rdx)1073741822)
+   (jne fail.0)
+   (mov
+    (r8)0)
+   (not
+    (cast
+     (u 32)
+     (r8)))
+   (shr
+    (cast
+     (u 32)
+     (r8))4)
+   (cmp
+    (r8)268435455)
+   (jne fail.0)
+   (mov
+    (rbx)240)
+   (mov
+    (rcx)255)
+   (xor
+    (cast
+     (u 32)
+     (rbx))
+    (cast
+     (u 32)
+     (rcx)))
+   (cmp
+    (rbx)15)
+   (jne fail.0)
+   (mov
+    (rdi)0)
+   (jmp exit.0)
+   (lab :fail.0)
+   (mov
+    (rdi)1)
+   (lab :exit.0)
+   (mov
+    (rax)60)
+   (syscall))))

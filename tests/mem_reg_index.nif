@@ -1,0 +1,87 @@
+(.nif27)
+(stmts
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (var :arr.0
+    (s)
+    (array
+     (i 64)3))
+   (mov
+    (rbx)1000)
+   (mov
+    (mem
+     (at
+      (rsp)arr.0 0))
+    (rbx))
+   (mov
+    (rbx)2000)
+   (mov
+    (mem
+     (at
+      (rsp)arr.0 1))
+    (rbx))
+   (mov
+    (rbx)3000)
+   (mov
+    (mem
+     (at
+      (rsp)arr.0 2))
+    (rbx))
+   (lea
+    (rsi)
+    (rsp)arr.0)
+   (mov
+    (rcx)2)
+   (mov
+    (r8)
+    (mem
+     (rsi)
+     (rcx)8))
+   (cmp
+    (r8)3000)
+   (jne fail.0)
+   (mov
+    (rcx)1)
+   (mov
+    (r9)
+    (mem
+     (rsi)
+     (rcx)8 8))
+   (cmp
+    (r9)3000)
+   (jne fail.0)
+   (mov
+    (rcx)8)
+   (mov
+    (r8)
+    (mem
+     (rsi)
+     (rcx)1 8))
+   (cmp
+    (r8)3000)
+   (jne fail.0)
+   (mov
+    (rcx)2)
+   (mov
+    (rbx)
+    (cast
+     (u 8)
+     (mem
+      (rsi)
+      (rcx)8)))
+   (cmp
+    (rbx)184)
+   (jne fail.0)
+   (mov
+    (rdi)0)
+   (jmp exit.0)
+   (lab :fail.0)
+   (mov
+    (rdi)1)
+   (lab :exit.0)
+   (mov
+    (rax)60)
+   (syscall))))
