@@ -2,7 +2,7 @@
 import std / [tables, sets, streams, os, osproc, strutils, algorithm]
 import nifcore, nifcoreparse, nifmodules
 import "../../../nimony/src/lib" / [nifreader, symparser]
-import tags, model, tagconv
+import tags, model, tagconv, tagpool
 import buffers, relocs, x86, arm64, elf, macho, pe
 import dwarf, tracetable
 import sem, slots
@@ -31,30 +31,22 @@ const
     ## reserving uniformly is what makes the layout agree on both sides regardless.
     ## Mirrored in arkham's `machine_x64.WinShadowSpace`.
 
-proc createAsmTagPool(): TagPool =
-  ## A `nifcore` tag pool seeded so each asm-NIF tag's `TagId` equals its
-  ## `TagEnum` ordinal — the same scheme arkham uses (`nifcdecl.createLengTagPool`).
-  ## `cursorTagId` then decodes by ordinal via `cast[TagEnum](…)`. Shared across
-  ## the main module and every lazily-parsed foreign decl so ordinals line up.
-  result = newTagPool()
-  for e in TagEnum:
-    if e == InvalidTagId: continue
-    let id = result.registerTag(TagData[e][0])
-    assert uint32(id) == uint32(TagData[e][1]),
-      "nifasm tag pool misalignment for " & TagData[e][0]
-
 var asmTags: TagPool = createAsmTagPool()
   ## The one seeded tag pool; `assemble` re-creates it per run is unnecessary —
   ## a single process assembles one program.
 
-proc tag(n: Cursor): TagEnum = cast[TagEnum](uint32(n.cursorTagId))
+proc tag(n: Cursor): TagEnum = cast[TagEnum](uint32(resolvedTagId(n)))
+  ## `resolvedTagId`, not `cursorTagId`: asm-NIF's vocabulary overflows the
+  ## 9-bit tag field, so the mnemonics past it carry their id in a leading child
+  ## (see `tagpool`). Everything downstream — `tagToX64Inst`, `tagToA64Inst`,
+  ## `tagToNifasmDecl`, every `n.tag == …TagId` — reads the same either way.
 
 proc nodeRepr(n: Cursor): string =
   ## A compact rendering of the token at `n` for error messages (nifcore has no
   ## whole-subtree `toString` over a bare Cursor, and the diagnostic only needs
   ## the head). Negative tests match on the message text, not this.
   case n.kind
-  of TagLit: "(" & tagName(n.tags, n.cursorTagId)
+  of TagLit: "(" & tagName(n.tags, resolvedTagId(n))
   of Symbol, SymbolDef: "@" & n.symName
   of Ident: n.strVal
   of StrLit: "\"" & n.strVal & "\""
@@ -1370,7 +1362,7 @@ proc parseResult(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] =
       # `:name (reg) Type` inline. Either way we consume them linearly, so the
       # loop's bound stays correct; the (elided) wrapper close needs no skip.
       if n.kind == TagLit:
-        inc n                       # enter the (ret …) wrapper
+        enterNode n                 # enter the (ret …) wrapper
       if n.kind != SymbolDef: error("Expected result definition", n)
       let name = getSymId(n)
       skip n
@@ -2495,7 +2487,7 @@ proc genSyscallMarkerA64(n: var Cursor; ctx: var GenContext) =
   ## register except x0 (the result), so only x0 is marked clobbered.
   if ctx.callContext.callEmitted:
     error("Multiple call/syscall instructions in prepare block", n)
-  into n:                                # `(svc 0)` — consume and ignore the immediate
+  intoOperands n:                        # `(svc 0)` — consume and ignore the immediate
     skip n
     while n.hasMore: skip n
   arm64.emitMovImm64(ctx.buf.data, arm64.X8, uint64(ctx.callContext.syscallNr))
@@ -2905,6 +2897,11 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, LenientD,
      ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD:
     raiseAssert("Unhandled declaration tag: " & $declTag)
+
+  # See the same step in `genInstX64`: an overflowing mnemonic's id is a leading
+  # child, so skip it once here and every arm's own `inc n` still lands on the
+  # first operand.
+  if isEscapedTag(n): inc n
 
   case instTag
   of StmtsA64:
@@ -3618,6 +3615,9 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
 
   of SvcA64:
     if ctx.inCall and ctx.callContext.isSyscall:
+      # Consumes the whole node (`intoOperands`), so it wants the head back
+      # rather than the escaped-id step-over `genInstA64` already did.
+      n = start
       genSyscallMarkerA64(n, ctx)   # `(svc)` as the prepare invocation marker
     else:
       inc n
@@ -3991,7 +3991,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     arm64.emitFldpPost(ctx.buf.data, rt1, rt2, rn, off)
 
   of NoA64Inst:
-    error("Invalid ARM64 instruction", n)
+    error("Invalid ARM64 instruction", start)
 
 proc genInstDispatch(n: var Cursor; ctx: var GenContext) {.inline.} =
   case ctx.arch
@@ -5936,7 +5936,8 @@ proc genCasejmpX64(n: var Cursor; ctx: var GenContext) =
   ## registered as a layout-frozen `fixedRange`: the jump optimizers must not
   ## delete/invert/shrink instructions inside, or `T + S*N` lands mid-instruction.
   let start = n
-  n.into:
+  intoOperands n:                # `casejmp` is an x86-64-only mnemonic, so its
+                                 # id may not fit a tag — see tagpool.nim
     # S: the slot-index register (read, then destroyed by the imul). A raw `(reg)`
     # or a register-bound local name; parseOperand also runs the clobber check.
     let selOp = parseOperand(n, ctx)
@@ -6125,9 +6126,18 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
   of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, LenientD, ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD:
     error("Unexpected declaration: " & $declTag, n)
 
+  # A mnemonic whose id overflowed the 9-bit tag field carries that id in a
+  # leading child (see tagpool.nim), so step over it HERE, once, rather than in
+  # each of the ~90 arms below: nifcore has no closing token, so a node is
+  # consumed by walking its children, and every arm's own `inc n` then lands on
+  # the first operand either way. Only the tags numbered up front reach an arm
+  # that treats `n` as a whole node again (`(stmts …)`, `(scope …)`, `(ite …)`),
+  # and those can never overflow — `gen_instructions` numbers them first.
+  if isEscapedTag(n): inc n
+
   case instTag
   of NoX64Inst:
-    error("No x86 instruction", n)
+    error("No x86 instruction", start)
   of StmtsX64:
     loopInto n:
       genInstX64(n, ctx)
@@ -7153,15 +7163,17 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     x86.emitNop(ctx.buf.data)
   of CasejmpX64:
+    # The one escaped arm that consumes the WHOLE node itself (`n.into`) rather
+    # than walking operands, so it wants the head back, not the step-over above.
+    n = start
     genCasejmpX64(n, ctx)
   of RepstosbX64, RepstosqX64:
     # `rep stos`: fills `rcx` units at `[rdi]` with al/rax, advancing rdi and
     # zeroing rcx — record those clobbers like the `rep movs` family below.
-    let stosOp = n.tag
     inc n
     ctx.clobbered.incl {x86.RDI, x86.RCX}
-    if stosOp == RepstosbTagId: x86.emitRepStosb(ctx.buf.data)
-    else:                       x86.emitRepStosq(ctx.buf.data)
+    if instTag == RepstosbX64: x86.emitRepStosb(ctx.buf.data)
+    else:                      x86.emitRepStosq(ctx.buf.data)
   of RepmovsbX64, RepmovswX64, RepmovsdX64, RepmovsqX64:
     # The `rep movs` family names NONE of its operands in the tree: it copies `rcx`
     # units from `[rsi]` to `[rdi]`, advancing both pointers and leaving `rcx` at 0.
@@ -7169,13 +7181,12 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     # rdi/rsi/rcx would silently see a destroyed value instead of raising here.
     # (DF is 0 throughout: SysV guarantees it clear at entry and at every call, and
     # nothing in this assembler emits `std`, so `movs` always steps upward.)
-    let stringOp = n.tag
     inc n
     ctx.clobbered.incl {x86.RDI, x86.RSI, x86.RCX}
-    if stringOp == RepmovsbTagId:   x86.emitRepMovsb(ctx.buf.data)
-    elif stringOp == RepmovswTagId: x86.emitRepMovsw(ctx.buf.data)
-    elif stringOp == RepmovsdTagId: x86.emitRepMovsd(ctx.buf.data)
-    else:                           x86.emitRepMovsq(ctx.buf.data)
+    if instTag == RepmovsbX64:   x86.emitRepMovsb(ctx.buf.data)
+    elif instTag == RepmovswX64: x86.emitRepMovsw(ctx.buf.data)
+    elif instTag == RepmovsdX64: x86.emitRepMovsd(ctx.buf.data)
+    else:                        x86.emitRepMovsq(ctx.buf.data)
   of RetX64:
     inc n
     x86.emitRet(ctx.buf.data)
@@ -7421,6 +7432,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     if n.kind != TagLit: error("Expected instruction to lock", n)
     let innerInstTag = tagToX64Inst(n.tag)
+    if isEscapedTag(n): inc n  # as in `genInstX64`: step over the escaped id
     case innerInstTag
     of AddX64:
       inc n

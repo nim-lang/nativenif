@@ -89,16 +89,27 @@ proc writeModel(basename: string; data: EnumImpls; first, last: EnumList; input:
   f.write "\n"
   f.close()
 
-proc writeTagsFile(output: string; data: seq[(string, int)]; input: string) =
+proc writeTagsFile(output: string; data: seq[(string, int)]; input: string;
+                   anonHead = false) =
+  ## `anonHead` emits `AnonTagId` at ordinal 1 for the tag with no spelling:
+  ## a tree whose head is a SymbolDef rather than a tag (`(:ret.0 (rax) (i 64))`)
+  ## interns under the EMPTY name. It has no row in the document — there is
+  ## nothing to write there — but it must be SEEDED all the same, or the parser
+  ## interns it at whatever id is free, and past 511 that id no longer fits a
+  ## token and takes the escape (see nifasm/tagpool.nim). Its ordinal has to be
+  ## a real enum member because every decoder here is `cast[TagEnum](tagId)`,
+  ## which needs ordinal and id to stay equal.
   let f = open(output, fmWrite)
   f.writeLine Header % input
   f.writeLine "type\n  TagEnum* = enum"
   f.writeLine "    InvalidTagId"
+  if anonHead: f.writeLine "    AnonTagId"
   for d in data:
     f.writeLine "    " & toNimName(d[0], "TagId")
   f.writeLine "const"
   f.writeLine "  TagData*: array[TagEnum, (string, int)] = ["
   f.write "    (" & escape("InvalidTagId") & ", 0)"
+  if anonHead: f.write ",\n    (" & escape("") & ", 1)"
   for d in data:
     f.write ",\n"
     f.write "    (" & escape(d[0]) & ", " & $d[1] & ")"
@@ -118,11 +129,32 @@ proc extractTagName(s: string): string =
   else:
     quit "Cannot extract tag name from: " & s
 
+const
+  LateEnums = {X64Inst, A64Inst}
+    ## Enums whose SINGLE-target members are numbered LAST (see `genTags`).
+
 proc genTags(inp: File; inputName: string) =
+  ## Tag ids are assigned here, and the order matters for one reason: a NIF tag
+  ## id is 9 bits in the token, so the first 511 tags cost one token and the
+  ## rest cost two (nifcore spells them through the `other` escape, which is why
+  ## the pool is not capped at 511 — see `TagPool.escapeTag`).
+  ##
+  ## So the overflow is placed deliberately rather than left to document order.
+  ## A row naming EXACTLY ONE of `X64Inst`/`A64Inst` is one target's machine
+  ## mnemonic, and those are numbered last: there are hundreds of them, each
+  ## target's are dead weight to every other target, and a mnemonic appears once
+  ## per instruction where a register appears two or three times. A row naming
+  ## BOTH is the cross-target vocabulary (`mov`, `add`, `ret`, `lab`, `stmts`,
+  ## `scope`, `ite`, …) and stays with the types, decls and registers up front.
+  ##
+  ## The practical effect: today only the very tail of the mnemonics overflows,
+  ## and adding a target (Cortex-M, RISC-V) can never push a register or a
+  ## structural tag over — it only lengthens the tail.
   var i = -2
   var enumDecls = default EnumImpls
   var tags: seq[(string, int)] = @[]
   var knownTags = initHashSet[string]()
+  var rows: seq[tuple[tag, desc: string; enums: seq[EnumList]; late: bool]] = @[]
   for line in lines(inp):
     inc i
     if i <= 0: continue # skip header
@@ -134,23 +166,39 @@ proc genTags(inp: File; inputName: string) =
     let tagName = extractTagName parts[1]
     if knownTags.containsOrIncl(tagName):
       quit "DUPLICATE TAG: " & tagName
-    tags.add (tagName, i)
 
     let desc = parts[3].strip()
-    let affectedEnums = parts[2].split(",")
-    assert affectedEnums.len > 0
-    for a in affectedEnums:
-      let e = shortcutToEnumList(a)
+    var affectedEnums: seq[EnumList] = @[]
+    if parts[2].strip() != "-":            # `-` = a tag that belongs to no enum
+      for a in parts[2].split(","):
+        affectedEnums.add shortcutToEnumList(a)
+      assert affectedEnums.len > 0
+    rows.add (tagName, desc, affectedEnums,
+              affectedEnums.len == 1 and affectedEnums[0] in LateEnums)
+
+  var ordered: seq[int] = @[]
+  for late in [false, true]:
+    for idx in 0 ..< rows.len:
+      if rows[idx].late == late: ordered.add idx
+  # Id 1 belongs to the anonymous tree head when this document has one; see
+  # `writeTagsFile`'s `anonHead`.
+  let anonHead = inputName.endsWith("instructions.md")
+  var id = (if anonHead: 1 else: 0)
+  for idx in ordered:
+    inc id
+    let r = rows[idx]
+    tags.add (r.tag, id)
+    for e in r.enums:
       enumDecls[e].add EnumField(
-        name: toNimName(tagName, toSuffix(e)[0]),
-        tag: tagName,
-        value: i,
-        desc: desc
+        name: toNimName(r.tag, toSuffix(e)[0]),
+        tag: r.tag,
+        value: id,
+        desc: r.desc
       )
 
   if inputName.endsWith("instructions.md"):
     createDir "src/nifasm"
-    writeTagsFile "src/nifasm/tags.nim", tags, inputName
+    writeTagsFile "src/nifasm/tags.nim", tags, inputName, anonHead = true
 
     writeModel "src/nifasm/model.nim", enumDecls, X64Inst, A64Reg, inputName
   elif inputName.endsWith("nj.md"):

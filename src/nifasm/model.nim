@@ -8,14 +8,30 @@ type
     PrepareX64 = (ord(PrepareTagId), "prepare")  ## prepare block for function call
     MovX64 = (ord(MovTagId), "mov")  ## move instruction
     LeaX64 = (ord(LeaTagId), "lea")  ## load effective address
+    AddX64 = (ord(AddTagId), "add")  ## add instruction
+    SubX64 = (ord(SubTagId), "sub")  ## subtract instruction
+    MulX64 = (ord(MulTagId), "mul")  ## unsigned multiply
+    AndX64 = (ord(AndTagId), "and")  ## bitwise and
+    NegX64 = (ord(NegTagId), "neg")  ## negate
+    CmpX64 = (ord(CmpTagId), "cmp")  ## compare
+    CallX64 = (ord(CallTagId), "call")  ## function call marker inside prepare
+    ExtcallX64 = (ord(ExtcallTagId), "extcall")  ## external call marker inside prepare
+    RetX64 = (ord(RetTagId), "ret")  ## return instruction
+    NopX64 = (ord(NopTagId), "nop")  ## no operation
+    LabX64 = (ord(LabTagId), "lab")  ## label definition
+    IteX64 = (ord(IteTagId), "ite")  ## if-then-else structure
+    LoopX64 = (ord(LoopTagId), "loop")  ## loop structure
+    StmtsX64 = (ord(StmtsTagId), "stmts")  ## statement block
+    JtrueX64 = (ord(JtrueTagId), "jtrue")  ## set control flow variable(s) to true
+    KillX64 = (ord(KillTagId), "kill")  ## kill variable
+    RebindX64 = (ord(RebindTagId), "rebind")  ## bind a phys reg to a typed name, killing its prior tenant
+    WithregX64 = (ord(WithregTagId), "withreg")  ## block-scoped rebind; auto-killed at block end
+    ScopeX64 = (ord(ScopeTagId), "scope")  ## statement block with a reclaimable stack-slot arena: `(s)` locals declared inside are freed at scope end so sibling scopes reuse the frame bytes
     MovzxX64 = (ord(MovzxTagId), "movzx")  ## D = the low `N` bits of S, ZERO-extended into the full 64-bit D (`N` is 8, 16 or 32)
     MovsxX64 = (ord(MovsxTagId), "movsx")  ## D = the low `N` bits of S, SIGN-extended into the full 64-bit D (`N` is 8, 16 or 32)
     MovapdX64 = (ord(MovapdTagId), "movapd")  ## move aligned packed double
     MovsdX64 = (ord(MovsdTagId), "movsd")  ## move scalar double
     MovdquX64 = (ord(MovdquTagId), "movdqu")  ## move unaligned 128 bits (xmm/mem both sides; the access is inherently 16 bytes — the mem operand's scalar type is not consulted, matching the hardware)
-    AddX64 = (ord(AddTagId), "add")  ## add instruction
-    SubX64 = (ord(SubTagId), "sub")  ## subtract instruction
-    MulX64 = (ord(MulTagId), "mul")  ## unsigned multiply
     ImulX64 = (ord(ImulTagId), "imul")  ## signed multiply
     DivX64 = (ord(DivTagId), "div")  ## unsigned divide
     IdivX64 = (ord(IdivTagId), "idiv")  ## signed divide
@@ -38,7 +54,6 @@ type
     ComissX64 = (ord(ComissTagId), "comiss")  ## compare scalar single, set EFLAGS
     MovfqX64 = (ord(MovfqTagId), "movfq")  ## move 64 bits between gpr and xmm; `(movfq (xmmD) (xmmS))` is SSE `movq xmm,xmm` — D.lo = S.lo with D's high lane ZEROED (gcc's lane sanitizer before packed ops)
     MovfdX64 = (ord(MovfdTagId), "movfd")  ## move 32 bits between gpr and xmm
-    AndX64 = (ord(AndTagId), "and")  ## bitwise and
     OrX64 = (ord(OrTagId), "or")  ## bitwise or
     XorX64 = (ord(XorTagId), "xor")  ## bitwise xor
     ShlX64 = (ord(ShlTagId), "shl")  ## shift left
@@ -47,7 +62,6 @@ type
     SarX64 = (ord(SarTagId), "sar")  ## shift arithmetic right
     IncX64 = (ord(IncTagId), "inc")  ## increment
     DecX64 = (ord(DecTagId), "dec")  ## decrement
-    NegX64 = (ord(NegTagId), "neg")  ## negate
     NotX64 = (ord(NotTagId), "not")  ## bitwise not
     RolX64 = (ord(RolTagId), "rol")  ## rotate left
     RorX64 = (ord(RorTagId), "ror")  ## rotate right
@@ -59,7 +73,6 @@ type
     BtsX64 = (ord(BtsTagId), "bts")  ## bit test and set
     BtrX64 = (ord(BtrTagId), "btr")  ## bit test and reset
     BtcX64 = (ord(BtcTagId), "btc")  ## bit test and complement
-    CmpX64 = (ord(CmpTagId), "cmp")  ## compare
     TestX64 = (ord(TestTagId), "test")  ## test
     SeteX64 = (ord(SeteTagId), "sete")  ## set byte if equal
     SetzX64 = (ord(SetzTagId), "setz")  ## set byte if zero
@@ -136,20 +149,10 @@ type
     JoX64 = (ord(JoTagId), "jo")  ## jump if overflow
     JnoX64 = (ord(JnoTagId), "jno")  ## jump if not overflow
     JpX64 = (ord(JpTagId), "jp")  ## jump if parity (unordered float compare)
-    CallX64 = (ord(CallTagId), "call")  ## function call marker inside prepare
-    ExtcallX64 = (ord(ExtcallTagId), "extcall")  ## external call marker inside prepare
     IatX64 = (ord(IatTagId), "iat")  ## indirect call through IAT (Import Address Table)
-    RetX64 = (ord(RetTagId), "ret")  ## return instruction
     PushX64 = (ord(PushTagId), "push")  ## push to stack
     PopX64 = (ord(PopTagId), "pop")  ## pop from stack
-    NopX64 = (ord(NopTagId), "nop")  ## no operation
     SyscallX64 = (ord(SyscallTagId), "syscall")  ## system call
-    LabX64 = (ord(LabTagId), "lab")  ## label definition
-    IteX64 = (ord(IteTagId), "ite")  ## if-then-else structure
-    LoopX64 = (ord(LoopTagId), "loop")  ## loop structure
-    StmtsX64 = (ord(StmtsTagId), "stmts")  ## statement block
-    JtrueX64 = (ord(JtrueTagId), "jtrue")  ## set control flow variable(s) to true
-    KillX64 = (ord(KillTagId), "kill")  ## kill variable
     LockX64 = (ord(LockTagId), "lock")  ## atomic lock prefix
     XchgX64 = (ord(XchgTagId), "xchg")  ## atomic exchange
     CmpxchgX64 = (ord(CmpxchgTagId), "cmpxchg")  ## atomic compare and exchange
@@ -169,10 +172,7 @@ type
     RepmovswX64 = (ord(RepmovswTagId), "repmovsw")  ## repeat move word string
     RepmovsdX64 = (ord(RepmovsdTagId), "repmovsd")  ## repeat move doubleword string
     RepmovsqX64 = (ord(RepmovsqTagId), "repmovsq")  ## repeat move quadword string
-    RebindX64 = (ord(RebindTagId), "rebind")  ## bind a phys reg to a typed name, killing its prior tenant
-    WithregX64 = (ord(WithregTagId), "withreg")  ## block-scoped rebind; auto-killed at block end
     BswapX64 = (ord(BswapTagId), "bswap")  ## reverse byte order of D in place; `N` is the operand size in bits (32 or 64)
-    ScopeX64 = (ord(ScopeTagId), "scope")  ## statement block with a reclaimable stack-slot arena: `(s)` locals declared inside are freed at scope end so sibling scopes reuse the frame bytes
     PopcntX64 = (ord(PopcntTagId), "popcnt")  ## population count: D = number of set bits in S; `N` is the operand size in bits (32 or 64)
     CasejmpX64 = (ord(CasejmpTagId), "casejmp")  ## computed-goto case dispatch (`imul S,S,N; lea T,[rip+slots]; add T,S; jmp T`): the `(stmts ...)` children are the branch bodies, NOP-padded to the measured uniform slot size N, so no lookup table and no memory load. S holds the 0-based slot index; S and T are destroyed. Every branch must end in a terminating jump (the pad NOPs are never executed) and must not define a label at its very end
     JsX64 = (ord(JsTagId), "js")  ## jump if sign (SF=1: the result was negative)
@@ -189,7 +189,7 @@ type
     RepstosqX64 = (ord(RepstosqTagId), "repstosq")  ## repeat store qword string: fills `rcx` qwords at `[rdi]` with `rax`, advancing `rdi`; `rcx` ends 0
 
 proc rawTagIsX64Inst*(raw: TagEnum): bool {.inline.} =
-  raw in {PrepareTagId, MovTagId, LeaTagId, MovzxTagId, MovsxTagId, MovapdTagId, MovsdTagId, MovdquTagId, AddTagId, SubTagId, MulTagId, ImulTagId, DivTagId, IdivTagId, AddsdTagId, SubsdTagId, MulsdTagId, DivsdTagId, MovssTagId, AddssTagId, SubssTagId, MulssTagId, DivssTagId, Cvtsi2sdTagId, Cvtsi2ssTagId, Cvttsd2siTagId, Cvttss2siTagId, Cvtsd2ssTagId, Cvtss2sdTagId, ComisdTagId, ComissTagId, MovfqTagId, MovfdTagId, AndTagId, OrTagId, XorTagId, ShlTagId, ShrTagId, SalTagId, SarTagId, IncTagId, DecTagId, NegTagId, NotTagId, RolTagId, RorTagId, RclTagId, RcrTagId, BsfTagId, BsrTagId, BtTagId, BtsTagId, BtrTagId, BtcTagId, CmpTagId, TestTagId, SeteTagId, SetzTagId, SetneTagId, SetnzTagId, SetaTagId, SetnbeTagId, SetaeTagId, SetnbTagId, SetncTagId, SetbTagId, SetnaeTagId, SetcTagId, SetbeTagId, SetnaTagId, SetgTagId, SetnleTagId, SetgeTagId, SetnlTagId, SetlTagId, SetngeTagId, SetleTagId, SetngTagId, SetoTagId, SetsTagId, SetpTagId, CmoveTagId, CmovzTagId, CmovneTagId, CmovnzTagId, CmovaTagId, CmovnbeTagId, CmovaeTagId, CmovnbTagId, CmovncTagId, CmovbTagId, CmovnaeTagId, CmovcTagId, CmovbeTagId, CmovnaTagId, CmovgTagId, CmovnleTagId, CmovgeTagId, CmovnlTagId, CmovlTagId, CmovngeTagId, CmovleTagId, CmovngTagId, CmovoTagId, CmovnoTagId, CmovsTagId, CmovnsTagId, CmovpTagId, CmovnpTagId, CmovpeTagId, CmovpoTagId, JmpTagId, JeTagId, JzTagId, JneTagId, JnzTagId, JgTagId, JngTagId, JgeTagId, JngeTagId, JaTagId, JnaTagId, JaeTagId, JnaeTagId, JlTagId, JleTagId, JbTagId, JbeTagId, JoTagId, JnoTagId, JpTagId, CallTagId, ExtcallTagId, IatTagId, RetTagId, PushTagId, PopTagId, NopTagId, SyscallTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, LockTagId, XchgTagId, CmpxchgTagId, XaddTagId, Cmpxchg8bTagId, MfenceTagId, SfenceTagId, LfenceTagId, PauseTagId, ClflushTagId, ClflushoptTagId, Prefetcht0TagId, Prefetcht1TagId, Prefetcht2TagId, PrefetchntaTagId, RepmovsbTagId, RepmovswTagId, RepmovsdTagId, RepmovsqTagId, RebindTagId, WithregTagId, BswapTagId, ScopeTagId, PopcntTagId, CasejmpTagId, JsTagId, JnsTagId, PunpcklqdqTagId, MovupdTagId, MovupsTagId, AddpdTagId, MulpdTagId, AddpsTagId, MulpsTagId, ShufpsTagId, RepstosbTagId, RepstosqTagId}
+  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, AndTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, RebindTagId, WithregTagId, ScopeTagId, MovzxTagId, MovsxTagId, MovapdTagId, MovsdTagId, MovdquTagId, ImulTagId, DivTagId, IdivTagId, AddsdTagId, SubsdTagId, MulsdTagId, DivsdTagId, MovssTagId, AddssTagId, SubssTagId, MulssTagId, DivssTagId, Cvtsi2sdTagId, Cvtsi2ssTagId, Cvttsd2siTagId, Cvttss2siTagId, Cvtsd2ssTagId, Cvtss2sdTagId, ComisdTagId, ComissTagId, MovfqTagId, MovfdTagId, OrTagId, XorTagId, ShlTagId, ShrTagId, SalTagId, SarTagId, IncTagId, DecTagId, NotTagId, RolTagId, RorTagId, RclTagId, RcrTagId, BsfTagId, BsrTagId, BtTagId, BtsTagId, BtrTagId, BtcTagId, TestTagId, SeteTagId, SetzTagId, SetneTagId, SetnzTagId, SetaTagId, SetnbeTagId, SetaeTagId, SetnbTagId, SetncTagId, SetbTagId, SetnaeTagId, SetcTagId, SetbeTagId, SetnaTagId, SetgTagId, SetnleTagId, SetgeTagId, SetnlTagId, SetlTagId, SetngeTagId, SetleTagId, SetngTagId, SetoTagId, SetsTagId, SetpTagId, CmoveTagId, CmovzTagId, CmovneTagId, CmovnzTagId, CmovaTagId, CmovnbeTagId, CmovaeTagId, CmovnbTagId, CmovncTagId, CmovbTagId, CmovnaeTagId, CmovcTagId, CmovbeTagId, CmovnaTagId, CmovgTagId, CmovnleTagId, CmovgeTagId, CmovnlTagId, CmovlTagId, CmovngeTagId, CmovleTagId, CmovngTagId, CmovoTagId, CmovnoTagId, CmovsTagId, CmovnsTagId, CmovpTagId, CmovnpTagId, CmovpeTagId, CmovpoTagId, JmpTagId, JeTagId, JzTagId, JneTagId, JnzTagId, JgTagId, JngTagId, JgeTagId, JngeTagId, JaTagId, JnaTagId, JaeTagId, JnaeTagId, JlTagId, JleTagId, JbTagId, JbeTagId, JoTagId, JnoTagId, JpTagId, IatTagId, PushTagId, PopTagId, SyscallTagId, LockTagId, XchgTagId, CmpxchgTagId, XaddTagId, Cmpxchg8bTagId, MfenceTagId, SfenceTagId, LfenceTagId, PauseTagId, ClflushTagId, ClflushoptTagId, Prefetcht0TagId, Prefetcht1TagId, Prefetcht2TagId, PrefetchntaTagId, RepmovsbTagId, RepmovswTagId, RepmovsdTagId, RepmovsqTagId, BswapTagId, PopcntTagId, CasejmpTagId, JsTagId, JnsTagId, PunpcklqdqTagId, MovupdTagId, MovupsTagId, AddpdTagId, MulpdTagId, AddpsTagId, MulpsTagId, ShufpsTagId, RepstosbTagId, RepstosqTagId}
 
 type
   A64Inst* = enum
@@ -200,6 +200,22 @@ type
     AddA64 = (ord(AddTagId), "add")  ## add instruction
     SubA64 = (ord(SubTagId), "sub")  ## subtract instruction
     MulA64 = (ord(MulTagId), "mul")  ## unsigned multiply
+    AndA64 = (ord(AndTagId), "and")  ## bitwise and
+    NegA64 = (ord(NegTagId), "neg")  ## negate
+    CmpA64 = (ord(CmpTagId), "cmp")  ## compare
+    CallA64 = (ord(CallTagId), "call")  ## function call marker inside prepare
+    ExtcallA64 = (ord(ExtcallTagId), "extcall")  ## external call marker inside prepare
+    RetA64 = (ord(RetTagId), "ret")  ## return instruction
+    NopA64 = (ord(NopTagId), "nop")  ## no operation
+    LabA64 = (ord(LabTagId), "lab")  ## label definition
+    IteA64 = (ord(IteTagId), "ite")  ## if-then-else structure
+    LoopA64 = (ord(LoopTagId), "loop")  ## loop structure
+    StmtsA64 = (ord(StmtsTagId), "stmts")  ## statement block
+    JtrueA64 = (ord(JtrueTagId), "jtrue")  ## set control flow variable(s) to true
+    KillA64 = (ord(KillTagId), "kill")  ## kill variable
+    RebindA64 = (ord(RebindTagId), "rebind")  ## bind a phys reg to a typed name, killing its prior tenant
+    WithregA64 = (ord(WithregTagId), "withreg")  ## block-scoped rebind; auto-killed at block end
+    ScopeA64 = (ord(ScopeTagId), "scope")  ## statement block with a reclaimable stack-slot arena: `(s)` locals declared inside are freed at scope end so sibling scopes reuse the frame bytes
     SdivA64 = (ord(SdivTagId), "sdiv")  ## signed divide
     UdivA64 = (ord(UdivTagId), "udiv")  ## unsigned divide
     SmulhA64 = (ord(SmulhTagId), "smulh")  ## signed multiply high (top 64 bits of D*S)
@@ -221,18 +237,11 @@ type
     Mulw3A64 = (ord(Mulw3TagId), "mulw3")  ## 32-bit 3-operand multiply (D = A * B, W-form)
     GloadA64 = (ord(GloadTagId), "gload")  ## load scalar from global S: adrp + folded ldr (drops the address `add`)
     GstoreA64 = (ord(GstoreTagId), "gstore")  ## store scalar D to global S: adrp + folded str
-    AndA64 = (ord(AndTagId), "and")  ## bitwise and
     OrrA64 = (ord(OrrTagId), "orr")  ## bitwise or
     EorA64 = (ord(EorTagId), "eor")  ## bitwise xor
     LslA64 = (ord(LslTagId), "lsl")  ## logical shift left
     LsrA64 = (ord(LsrTagId), "lsr")  ## logical shift right
     AsrA64 = (ord(AsrTagId), "asr")  ## arithmetic shift right
-    NegA64 = (ord(NegTagId), "neg")  ## negate
-    CmpA64 = (ord(CmpTagId), "cmp")  ## compare
-    CallA64 = (ord(CallTagId), "call")  ## function call marker inside prepare
-    ExtcallA64 = (ord(ExtcallTagId), "extcall")  ## external call marker inside prepare
-    RetA64 = (ord(RetTagId), "ret")  ## return instruction
-    NopA64 = (ord(NopTagId), "nop")  ## no operation
     SvcA64 = (ord(SvcTagId), "svc")  ## supervisor call (system call)
     AdrA64 = (ord(AdrTagId), "adr")  ## load address of label
     LdrA64 = (ord(LdrTagId), "ldr")  ## load register
@@ -271,12 +280,6 @@ type
     CsetlsA64 = (ord(CsetlsTagId), "csetls")  ## conditional set: D = if lower or same (unsigned <=) then 1 else 0
     CsethiA64 = (ord(CsethiTagId), "csethi")  ## conditional set: D = if higher (unsigned >) then 1 else 0
     CsethsA64 = (ord(CsethsTagId), "cseths")  ## conditional set: D = if higher or same (unsigned >=) then 1 else 0
-    LabA64 = (ord(LabTagId), "lab")  ## label definition
-    IteA64 = (ord(IteTagId), "ite")  ## if-then-else structure
-    LoopA64 = (ord(LoopTagId), "loop")  ## loop structure
-    StmtsA64 = (ord(StmtsTagId), "stmts")  ## statement block
-    JtrueA64 = (ord(JtrueTagId), "jtrue")  ## set control flow variable(s) to true
-    KillA64 = (ord(KillTagId), "kill")  ## kill variable
     LdaxrA64 = (ord(LdaxrTagId), "ldaxr")  ## load-acquire exclusive register
     StlxrA64 = (ord(StlxrTagId), "stlxr")  ## store-release exclusive register (St = status)
     LdarA64 = (ord(LdarTagId), "ldar")  ## load-acquire register
@@ -301,9 +304,6 @@ type
     FldpA64 = (ord(FldpTagId), "fldp")  ## fp load pair (post-indexed)
     LdrbA64 = (ord(LdrbTagId), "ldrb")  ## load byte (zero-extend), register offset [B,I]
     StrbA64 = (ord(StrbTagId), "strb")  ## store low byte, register offset [B,I]
-    RebindA64 = (ord(RebindTagId), "rebind")  ## bind a phys reg to a typed name, killing its prior tenant
-    WithregA64 = (ord(WithregTagId), "withreg")  ## block-scoped rebind; auto-killed at block end
-    ScopeA64 = (ord(ScopeTagId), "scope")  ## statement block with a reclaimable stack-slot arena: `(s)` locals declared inside are freed at scope end so sibling scopes reuse the frame bytes
     ClzA64 = (ord(ClzTagId), "clz")  ## count leading zeros: D = number of leading zero bits of S; `N` is the operand size in bits (32 or 64)
     RbitA64 = (ord(RbitTagId), "rbit")  ## reverse bit order of S into D (with `clz` this is a count-trailing-zeros); `N` is the operand size in bits
     RevA64 = (ord(RevTagId), "rev")  ## reverse byte order of S into D; `N` is the operand size in bits (32 or 64)
@@ -318,7 +318,7 @@ type
     VaddvA64 = (ord(VaddvTagId), "vaddv")  ## horizontal fp add of S's lanes into the scalar D (`faddp Dd, Vn.2d` when d-spelled; `faddp Vd.4s, Vn.4s, Vn.4s` + `faddp Sd, Vd.2s` when s-spelled)
 
 proc rawTagIsA64Inst*(raw: TagEnum): bool {.inline.} =
-  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, SmulhTagId, UmulhTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, AddwTagId, SubwTagId, MulwTagId, Addw3TagId, Subw3TagId, Mulw3TagId, GloadTagId, GstoreTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, SvcTagId, AdrTagId, LdrTagId, StrTagId, StpTagId, LdpTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, CseleqTagId, CselneTagId, CselltTagId, CselleTagId, CselgtTagId, CselgeTagId, CselloTagId, CsellsTagId, CselhiTagId, CselhsTagId, CseteqTagId, CsetneTagId, CsetltTagId, CsetleTagId, CsetgtTagId, CsetgeTagId, CsetloTagId, CsetlsTagId, CsethiTagId, CsethsTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, LdaxrTagId, StlxrTagId, LdarTagId, StlrTagId, DmbTagId, ClrexTagId, FmovTagId, FaddTagId, FsubTagId, FmulTagId, FdivTagId, FnegTagId, FcmpTagId, FldrTagId, FstrTagId, ScvtfTagId, UcvtfTagId, FcvtzsTagId, FcvtzuTagId, FcvtTagId, FstpTagId, FldpTagId, LdrbTagId, StrbTagId, RebindTagId, WithregTagId, ScopeTagId, ClzTagId, RbitTagId, RevTagId, FldrqTagId, FstrqTagId, VfaddTagId, VfsubTagId, VfmulTagId, VfmlaTagId, VdupTagId, VeorTagId, VaddvTagId}
+  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, AndTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, RebindTagId, WithregTagId, ScopeTagId, SdivTagId, UdivTagId, SmulhTagId, UmulhTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, AddwTagId, SubwTagId, MulwTagId, Addw3TagId, Subw3TagId, Mulw3TagId, GloadTagId, GstoreTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, SvcTagId, AdrTagId, LdrTagId, StrTagId, StpTagId, LdpTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, CseleqTagId, CselneTagId, CselltTagId, CselleTagId, CselgtTagId, CselgeTagId, CselloTagId, CsellsTagId, CselhiTagId, CselhsTagId, CseteqTagId, CsetneTagId, CsetltTagId, CsetleTagId, CsetgtTagId, CsetgeTagId, CsetloTagId, CsetlsTagId, CsethiTagId, CsethsTagId, LdaxrTagId, StlxrTagId, LdarTagId, StlrTagId, DmbTagId, ClrexTagId, FmovTagId, FaddTagId, FsubTagId, FmulTagId, FdivTagId, FnegTagId, FcmpTagId, FldrTagId, FstrTagId, ScvtfTagId, UcvtfTagId, FcvtzsTagId, FcvtzuTagId, FcvtTagId, FstpTagId, FldpTagId, LdrbTagId, StrbTagId, ClzTagId, RbitTagId, RevTagId, FldrqTagId, FstrqTagId, VfaddTagId, VfsubTagId, VfmulTagId, VfmlaTagId, VdupTagId, VeorTagId, VaddvTagId}
 
 type
   NifasmType* = enum
