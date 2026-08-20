@@ -388,10 +388,25 @@ proc getSym(b: var Builder; name: string; slot: AsmSlot; props: VarProps): Locat
     # xmm regs at all (SysV), so a float local always spills there — exactly the
     # behavior before precise `AllRegs`, when the empty callee pool forced a spill.
     if AddrTaken in props: return b.spillTo(name, slot)
-    let f = b.takeFReg(b.freeCalleeF, b.md.floatCalleeSaved)
-    if f == NoFReg: return b.spillTo(name, slot)
-    b.plan.usedCalleeF.incl f
-    return fregLoc(f, slot)
+    var f = b.takeFReg(b.freeCalleeF, b.md.floatCalleeSaved)
+    if f != NoFReg:
+      b.plan.usedCalleeF.incl f
+      return fregLoc(f, slot)
+    if slot.size == 16 and AllRegs in props:
+      # A 128-bit VECTOR local — the loop vectorizer's `(f 128)` values. The
+      # rule above would spill every one of them on x86-64, where the
+      # callee-saved float pool is empty, and a spilled vector value has no
+      # lowering at all: the SSE rows address registers, not memory. `AllRegs`
+      # is precisely "never live across a call", which is the condition under
+      # which a caller-saved register is safe to hand to a local — so the
+      # volatile pool can be lent out here and only here. It is NOT recorded in
+      # `usedCalleeF`: a caller-saved register needs no prologue save. The
+      # emitter's own float scratch shrinks by one per vector local; when it
+      # runs dry the vector rows fail loudly ("out of SIMD registers") rather
+      # than miscompiling.
+      f = b.takeFReg(b.freeVolF, b.md.floatTempRegs)
+      if f != NoFReg: return fregLoc(f, slot)
+    return b.spillTo(name, slot)
   if AddrTaken in props or not slot.inRegClass:
     return b.spillTo(name, slot)
   var r = NoReg
