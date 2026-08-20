@@ -928,9 +928,11 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
       # iteration overwrites only dead values. An OUTSIDE-declared var used in the
       # loop is protected by its `freeAfter` extension over the whole loop span.
       # Stored by name so the flush frees the var's *current* reg (it may have
-      # been evicted to the stack).
+      # been evicted to the stack). Float homes participate like integer ones:
+      # the callee-saved SIMD pool is only 8 wide, and the vectorizer's
+      # per-iteration `(f 128)` temps drain it without the early-free.
       let vi = b.an.vars.getOrDefault(name)
-      if loc.kind == InReg:
+      if loc.kind in {InReg, InFReg}:
         b.pendingFree.add (pos: vi.freeAfter, name: name)
 
 proc planStmt(b: var Builder; n: var Cursor) =

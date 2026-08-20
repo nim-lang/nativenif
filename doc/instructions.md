@@ -508,3 +508,4 @@
 | `(vfmla D A B)`       | A64Inst                     | vector fp fused multiply-add, lane-wise (D = D + A * B), arrangement as `vfadd` |
 | `(vdup D S)`          | A64Inst                     | broadcast lane 0 of S to every lane of D (`dup Vd.2d, Vn.d[0]` when d-spelled, `.4s/.s[0]` when s-spelled) |
 | `(veor D A B)`        | A64Inst                     | vector bitwise xor over all 16 bytes (`eor Vd.16b`); `(veor X X X)` zeroes X |
+| `(vaddv D S)`         | A64Inst                     | horizontal fp add of S's lanes into the scalar D (`faddp Dd, Vn.2d` when d-spelled; `faddp Vd.4s, Vn.4s, Vn.4s` + `faddp Sd, Vd.2s` when s-spelled) |

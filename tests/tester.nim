@@ -1,4 +1,8 @@
 import std/[os, osproc, streams, strutils]
+# The SHARED intrinsic table arkham itself compiles against — imported for
+# `declared(intrinsics.FldrqOp)` alone, to stage the vector fixtures (see
+# `arkhamStagedVec`) in lock-step with codegen_a64's staged AdvSIMD block.
+from "../../nimony/src/lib/intrinsics" import nil
 
 const
   runTimeoutMs = 30_000
@@ -86,6 +90,17 @@ const arkhamKnownUnsupported: seq[string] =
   # runtime `(aconstr …)`/`(oconstr …)` constructor as a direct call argument are both
   # handled on x86-64 AND AArch64. No quarantine remains.
   @[]
+
+const arkhamStagedVec: seq[string] =
+  # Staged exactly like codegen_a64's AdvSIMD block (`when declared(FldrqOp)`):
+  # these fixtures declare `{.instruction: "fldrq".}`-family rows, which resolve
+  # through the shared `nimony/src/lib/intrinsics` table. Against a nimony
+  # checkout whose table lacks the vector rows (CI pins nimony's default
+  # branch), arkham compiles with the vec path inert and the fixture cannot
+  # even NAME its instructions — so every pass skips it here, and it un-skips
+  # by itself the moment the rows land. No edit needed then, same as the guard.
+  when declared(intrinsics.FldrqOp): @[]
+  else: @["a64_vec_instr"]
 
 # Tests that cannot run on ANY AArch64 target, whichever OS hosts it: the Linux
 # `linux_arm64` qemu pass and the macOS native pass both skip these. Keep the two
@@ -316,6 +331,7 @@ proc arkhamTests() =
     if base.startsWith("mod_"): continue   # foreign helper, not standalone
     if base.startsWith("err_"): continue   # must NOT compile — see arkhamRejectionTests
     let name = base[0 ..< base.len - ".c.nif".len]
+    if name in arkhamStagedVec: continue   # vector rows not in the intrinsic table yet
     when defined(macosx):
       # The macOS run targets arm64, so BOTH lists apply: the fixture may be
       # x86-64-pinned, or it may be portable but depend on a Linux-only symbol.
@@ -398,12 +414,11 @@ const arkhamStressA64Known: seq[string] = @[
   # out-of-registers assert, but can never legitimately change what a program
   # computes, so a wrong answer here is a codegen bug by construction.
   "spill_produce_float",    # float produce-into-spill reads a clobbered register
-  # `a64_vec_instr` holds six 128-bit vector locals live at once; a `(f 128)`
-  # local has NO spill form (the scalar float spill moves 8 bytes and would
-  # silently truncate the upper lane), so when the stress-starved SIMD pool
-  # cannot home one, arkham fails LOUDLY at the declaration — the designed
-  # out-of-registers error, not a miscompile. See `genVarDecl2`'s vec guard.
-  "a64_vec_instr",
+  # (`a64_vec_instr` lived here — six 128-bit vector locals live at once
+  # overran the stress-starved SIMD pool into the designed loud
+  # out-of-registers error. The planer's early-free now covers `InFReg`
+  # homes too, so the dead vector temps hand their registers back in time
+  # and the fixture passes even stressed.)
   # (`atomic_cas_regpressure` lived here for the missing steal/spill arm on the
   # intrinsic-operand pick, and now passes at this list's own k=3.)
   # `instrOperandInPlace` — read a register-homed symbol operand where it lies
@@ -456,7 +471,7 @@ proc arkhamStressTests(arch: string; runner = ""; skip: seq[string] = @[];
     let base = extractFilename(file)
     if base.startsWith("mod_") or base.startsWith("err_"): continue
     let name = base[0 ..< base.len - ".c.nif".len]
-    if name in skip: continue
+    if name in skip or name in arkhamStagedVec: continue
     inc total
     let stem = file[0 ..< file.len - ".c.nif".len]
     let asmNif = workDir / (name & ".stress.nif")
@@ -555,7 +570,7 @@ proc arkhamQemuTests() =
     if base.startsWith("err_"): continue   # must NOT compile — see arkhamRejectionTests
     let name = base[0 ..< base.len - ".c.nif".len]
     if name in arkhamLinuxA64Unsupported or name in arkhamA64Unsupported or
-       name in arkhamOsxOnly:
+       name in arkhamOsxOnly or name in arkhamStagedVec:
       (inc skipped; continue)                        # arm64-TODO or macOS-only symbol
     inc total
     let stem = file[0 ..< file.len - ".c.nif".len]
