@@ -19,6 +19,7 @@
 import std / tables
 import nifcore, nifcoreparse
 import model                 # nifasm: A64Inst, NifasmDecl, NifasmType, NifasmExpr
+import tagpool               # nifasm: the seeded tag pool (and its escape tag)
 import machine               # arkham: Reg, regName
 import peephole              # the finished-shape rewrites, applied in `render`
 export A64Inst, X64Inst, NifasmDecl, NifasmType, NifasmExpr, X64Flag
@@ -37,8 +38,13 @@ type
 proc initAsmBuf*(): AsmBuf =
   ## Defaults the register shim to AArch64 spellings; the x86-64 backend
   ## overrides `renderReg` after construction.
-  AsmBuf(buf: createTokenBuf(256), ids: initTable[string, TagId](),
-         renderReg: regName)
+  ##
+  ## The buffer takes nifasm's SEEDED tag pool rather than a fresh one: that
+  ## pool is the one that nominates an escape tag, and asm-NIF's vocabulary
+  ## overflows the 9-bit tag field (see `nifasm/tagpool`). With a fresh pool the
+  ## overflowing spellings would have nowhere to go.
+  AsmBuf(buf: createTokenBuf(256, sharedTags = createAsmTagPool()),
+         ids: initTable[string, TagId](), renderReg: regName)
 
 proc openS(a: var AsmBuf; spelling: string) {.inline.} =
   a.buf.openTag a.ids.mgetOrPut(spelling, a.buf.tags.registerTag(spelling))

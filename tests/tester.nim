@@ -91,13 +91,6 @@ const arkhamKnownUnsupported: seq[string] =
   # handled on x86-64 AND AArch64. No quarantine remains.
   @[]
 
-const arkhamA64OnlyVec: seq[string] = @["a64_vec_instr"]
-  ## Vector fixtures the x86-64 back end cannot take. `a64_vec_instr` exercises
-  ## `vfsub`, and there is no x86-64 lowering for it: the nifasm tag id space is
-  ## 9 bits and full, so no id was left for `subpd`/`subps`. Once the `(other …)`
-  ## escape lands and the row gains `tgX64`, delete this list and let the fixture
-  ## run on both targets.
-
 const arkhamStagedVec: seq[string] =
   # Staged exactly like codegen_a64's AdvSIMD block (`when declared(FldrqOp)`):
   # these fixtures declare `{.instruction: "fldrq".}`-family rows, which resolve
@@ -339,9 +332,6 @@ proc arkhamTests() =
     if base.startsWith("err_"): continue   # must NOT compile — see arkhamRejectionTests
     let name = base[0 ..< base.len - ".c.nif".len]
     if name in arkhamStagedVec: continue   # vector rows not in the intrinsic table yet
-    when not defined(macosx):
-      # The Linux/Windows pass targets x86-64 unless it is the qemu arm64 run.
-      if hostCPU != "arm64" and name in arkhamA64OnlyVec: continue
     when defined(macosx):
       # The macOS run targets arm64, so BOTH lists apply: the fixture may be
       # x86-64-pinned, or it may be portable but depend on a Linux-only symbol.

@@ -494,8 +494,10 @@
 | `(movupd D S)`        | X64Inst                     | move unaligned packed double (xmm/mem either side; the access is inherently 16 bytes — the mem operand's scalar type is not consulted, matching the hardware) |
 | `(movups D S)`        | X64Inst                     | move unaligned packed single (xmm/mem either side; 16-byte access like `movupd`) |
 | `(addpd D S)`         | X64Inst                     | packed double add, 2 lanes (xmm registers only) |
+| `(subpd D S)`         | X64Inst                     | packed double subtract, 2 lanes, `D = D - S` (xmm registers only) |
 | `(mulpd D S)`         | X64Inst                     | packed double multiply, 2 lanes (xmm registers only) |
 | `(addps D S)`         | X64Inst                     | packed single add, 4 lanes (xmm registers only) |
+| `(subps D S)`         | X64Inst                     | packed single subtract, 4 lanes, `D = D - S` (xmm registers only) |
 | `(mulps D S)`         | X64Inst                     | packed single multiply, 4 lanes (xmm registers only) |
 | `(shufps D S N)`      | X64Inst                     | shuffle packed singles: each of D's 4 lanes picks a source lane by the 2-bit fields of immediate N (low two from D, high two from S); `(shufps X X 0)` broadcasts lane 0 to all 4 |
 | `(repstosb)`          | X64Inst                     | repeat store byte string: fills `rcx` bytes at `[rdi]` with `al`, advancing `rdi`; `rcx` ends 0 (DF=0 per SysV) |
@@ -509,3 +511,4 @@
 | `(vdup D S)`          | A64Inst                     | broadcast lane 0 of S to every lane of D (`dup Vd.2d, Vn.d[0]` when d-spelled, `.4s/.s[0]` when s-spelled) |
 | `(veor D A B)`        | A64Inst                     | vector bitwise xor over all 16 bytes (`eor Vd.16b`); `(veor X X X)` zeroes X |
 | `(vaddv D S)`         | A64Inst                     | horizontal fp add of S's lanes into the scalar D (`faddp Dd, Vn.2d` when d-spelled; `faddp Vd.4s, Vn.4s, Vn.4s` + `faddp Sd, Vd.2s` when s-spelled) |
+| `(other N ...)`       | -                           | escape header: the tag whose id no longer fits NIF's 9-bit tag field. `N` is an inline int carrying the real id out of nifcore's 28-bit escape space, and the remaining children are the node's own. Every row above that names EXACTLY ONE of `X64Inst`/`A64Inst` — i.e. one target's machine mnemonics, 282 of them — is spelled this way in the token buffer, which is what keeps the shared 511 for the cross-target vocabulary and makes a new target (Cortex-M, RISC-V) cost zero shared ids. Never written or read as text: `parse` folds `(movzx …)` into it and the serializers unfold it back, so both the NIF text and the binary token format are unchanged |
