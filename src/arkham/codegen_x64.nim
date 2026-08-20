@@ -8174,6 +8174,199 @@ proc atomicValueMayBeImmE(op: IntrinsicOp; i: int): bool {.inline.} =
                     AtomicFetchSubOp, AtomicAddFetchOp, AtomicSubFetchOp,
                     AtomicFetchAndOp, AtomicFetchOrOp, AtomicFetchXorOp}
 
+when declared(FldrqOp):
+  # The SSE lowering of the vectorizer's 128-bit rows (`lib/intrinsics`,
+  # `shoggoth/vectorizer.nim`). Same rows as the AArch64 back end, but SSE is a
+  # TWO-ADDRESS ISA: `addpd D, S` computes `D = D + S`, so where AdvSIMD reads
+  # three registers and writes a fourth, every non-destructive op here needs a
+  # 128-bit register-register copy first. That copy is what `vecMove` is; the
+  # a64 path deliberately has none.
+  # `VfsubOp` is deliberately absent: the nifasm tag id space is 9 bits and full,
+  # so there is no id left for `subpd`/`subps`. The vectorizer's `vecSse` mode
+  # therefore never emits one — it leaves a loop containing a `sub` to the scalar
+  # code rather than failing to compile (see `shoggoth/vectorizer.nim`).
+  const VecOps = {FldrqOp, FstrqOp, VfaddOp, VfmulOp, VfmlaOp, VdupOp, VaddvOp}
+
+  template Vec128Slot(): AsmSlot = AsmSlot(cls: AFloat, size: 16, align: 16)
+
+  proc vecHomeF(g: var CodeGen; a: Cursor): FReg =
+    ## A 128-bit vector operand: the vectorizer spells every one as a plain local,
+    ## and a local of type `(f 128)` lives in an xmm register or fails loudly at
+    ## its declaration, so the home lookup here cannot miss.
+    if a.kind != Symbol:
+      lengError a, "a 128-bit vector operand must be a plain local"
+    let home = g.plan.locationOfSym(symName(a), cursorToPosition(g.buf[], a))
+    if home.kind != InFReg:
+      lengError a, "128-bit vector local `" & symName(a) &
+                "` has no SIMD register home"
+    result = home.f
+
+  proc vecLaneBits(g: var CodeGen; a: Cursor): int =
+    ## The trailing lane-width knob: an int LITERAL, read here and folded into the
+    ## chosen opcode — never evaluated into a register.
+    if a.kind != IntLit or int(intVal(a)) notin {32, 64}:
+      lengError a, "a vector op's lane-bits operand must be the literal 32 or 64"
+    result = int(intVal(a))
+
+  proc vecByteOff(g: var CodeGen; a: Cursor): int =
+    ## A vector load/store's byte-offset operand: an int literal, multiple of 16.
+    if a.kind != IntLit or (int(intVal(a)) and 15) != 0 or intVal(a) < 0:
+      lengError a, "a vector load/store offset must be a non-negative literal multiple of 16"
+    result = int(intVal(a))
+
+  proc vecTakeDest(g: var CodeGen; c: Cursor; dest: var Location; slot: AsmSlot) =
+    ## Resolve `dest` to an xmm register, minting a pool temp when the caller had
+    ## no home for it.
+    if dest.kind != InFReg:
+      dest = g.takeFTmp(slot)
+      if dest.kind == NamedStack:
+        lengError c, "out of SIMD registers for a 128-bit vector value"
+    if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f)
+
+  proc vecMove(g: var CodeGen; dst, src: FReg) =
+    ## 128-bit register-register copy, elided when the registers coincide.
+    if dst != src:
+      g.ab.tree MovupsX64:
+        g.emFReg dst
+        g.emFReg src
+
+  proc vecShuf(g: var CodeGen; d: FReg; imm: int) =
+    g.ab.tree ShufpsX64:
+      g.emFReg d
+      g.emFReg d
+      g.ab.intLit imm
+
+  proc emitVecInstr2(g: var CodeGen; c: Cursor; op: IntrinsicOp;
+                     argCurs: seq[Cursor]; dest: var Location) =
+    case op
+    of FstrqOp:
+      # (instr fstrq p off v) — statement position, no result.
+      let off = g.vecByteOff(argCurs[1])
+      let vf = g.vecHomeF(argCurs[2])
+      var pd = g.takeInstrReg(g.exprSlot(argCurs[0]))
+      g.emitValue2(argCurs[0], pd)
+      g.ab.tree MovupsX64:
+        g.ab.tree MemX:
+          g.emReg pd.r
+          if off != 0: g.ab.intLit off
+        g.emFReg vf
+      g.freeVal(pd)
+    of FldrqOp:
+      let off = g.vecByteOff(argCurs[1])
+      var pd = g.takeInstrReg(g.exprSlot(argCurs[0]))
+      g.emitValue2(argCurs[0], pd)
+      g.vecTakeDest(c, dest, Vec128Slot)
+      g.ab.tree MovupsX64:
+        g.emFReg dest.f
+        g.ab.tree MemX:
+          g.emReg pd.r
+          if off != 0: g.ab.intLit off
+      g.freeVal(pd)
+    of VdupOp:
+      # Scalar into lane 0, then splat. `punpcklqdq X, X` = [X.lo, X.lo] for
+      # doubles; `shufps X, X, 0` picks lane 0 four times for singles.
+      let bits = g.vecLaneBits(argCurs[1])
+      var fv = dontCare
+      g.emitFValue2(argCurs[0], fv)
+      g.vecTakeDest(c, dest, Vec128Slot)
+      # `dontCare` always resolves to an xmm on this target (the x64 float path
+      # has no eftmp fallback the way AArch64's does), so there is no bridge.
+      if fv.kind != InFReg:
+        lengError c, "a vdup scalar operand must resolve to a SIMD register"
+      let srcF = fv.f
+      if srcF != dest.f:
+        g.ab.tree (if bits == 32: MovssX64 else: MovsdX64):
+          g.emFReg dest.f
+          g.emFReg srcF
+      if bits == 64:
+        g.ab.tree PunpcklqdqX64:
+          g.emFReg dest.f
+          g.emFReg dest.f
+      else:
+        g.vecShuf(dest.f, 0)
+      if fv.isTemp and fv.f != dest.f: g.unbindFTmp(fv.f)
+    of VaddvOp:
+      # Horizontal add — the reduction epilogue. The result is an ORDINARY scalar
+      # float, so it composes with the surrounding scalar expression tree.
+      # f64: dest = [v.hi, v.hi]; dest.lo += v.lo.
+      # f32: fold [a b c d] -> [a+c b+d ..] -> (a+c)+(b+d), which needs one
+      # scratch for the final lane-1 pick.
+      let bits = g.vecLaneBits(argCurs[1])
+      let srcF = g.vecHomeF(argCurs[0])
+      g.vecTakeDest(c, dest, AsmSlot(cls: AFloat, size: bits div 8, align: bits div 8))
+      if bits == 64:
+        g.vecMove(dest.f, srcF)
+        # `shufps X, X, 0xEE` selects 32-bit lanes 2,3,2,3 — i.e. it duplicates
+        # the HIGH 8 bytes down into the low half, which is `punpckhqdq X, X`
+        # bit for bit. Spelled with `shufps` because the nifasm tag id space is
+        # 9 bits and full: there was no room for another instruction tag.
+        g.vecShuf(dest.f, 0xEE)
+        g.ab.tree AddsdX64:
+          g.emFReg dest.f
+          g.emFReg srcF
+      else:
+        g.vecMove(dest.f, srcF)
+        g.vecShuf(dest.f, 0xEE)                    # [c d c d]
+        g.ab.tree AddpsX64:
+          g.emFReg dest.f
+          g.emFReg srcF                            # [a+c b+d ..]
+        var tmp = g.takeFTmp(Vec128Slot)
+        if tmp.kind == NamedStack:
+          lengError c, "out of SIMD registers for a vaddv result"
+        if tmp.isTemp and not g.rb.isBoundFTmp(tmp.f): g.bindFTmp(tmp.f)
+        g.vecMove(tmp.f, dest.f)
+        g.vecShuf(tmp.f, 0x55)                     # lane 1 -> lane 0
+        g.ab.tree AddssX64:
+          g.emFReg dest.f
+          g.emFReg tmp.f
+        if tmp.isTemp: g.unbindFTmp(tmp.f)
+        g.freeVal(tmp)
+    of VfmlaOp:
+      # acc += a*b. SSE has no FMA (that is AVX2/FMA3), so this is a multiply
+      # into a scratch followed by an add — TWO roundings where AArch64's `fmla`
+      # has one. The vectorizer already documents that its lane split reorders a
+      # float sum; this is a second, smaller deviation on this target only.
+      let bits = g.vecLaneBits(argCurs[3])
+      let accF = g.vecHomeF(argCurs[0])
+      if dest.kind != InFReg or dest.f != accF:
+        lengError c, "vfmla accumulates in place: spell it `acc = vfmla(acc, a, b, bits)`"
+      let aF = g.vecHomeF(argCurs[1])
+      let bF = g.vecHomeF(argCurs[2])
+      var tmp = g.takeFTmp(Vec128Slot)
+      if tmp.kind == NamedStack:
+        lengError c, "out of SIMD registers for a vfmla product"
+      if tmp.isTemp and not g.rb.isBoundFTmp(tmp.f): g.bindFTmp(tmp.f)
+      g.vecMove(tmp.f, aF)
+      g.ab.tree (if bits == 32: MulpsX64 else: MulpdX64):
+        g.emFReg tmp.f
+        g.emFReg bF
+      g.ab.tree (if bits == 32: AddpsX64 else: AddpdX64):
+        g.emFReg accF
+        g.emFReg tmp.f
+      if tmp.isTemp: g.unbindFTmp(tmp.f)
+      g.freeVal(tmp)
+    of VfaddOp, VfmulOp:
+      let bits = g.vecLaneBits(argCurs[2])
+      let aF = g.vecHomeF(argCurs[0])
+      let bF = g.vecHomeF(argCurs[1])
+      g.vecTakeDest(c, dest, Vec128Slot)
+      let tag = if op == VfaddOp: (if bits == 32: AddpsX64 else: AddpdX64)
+                else: (if bits == 32: MulpsX64 else: MulpdX64)
+      if dest.f == bF and aF != bF:
+        # Both rows are commutative, so a destination that already holds B needs
+        # no scratch: `D = D op A` is the same value. (`vfsub` would need one —
+        # it has no x86-64 lowering, see `VecOps`.)
+        g.ab.tree tag:
+          g.emFReg dest.f
+          g.emFReg aF
+      else:
+        g.vecMove(dest.f, aF)
+        g.ab.tree tag:
+          g.emFReg dest.f
+          g.emFReg bF
+    else:
+      lengError c, "not a vector row"
+
 proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED `(instr SYM X*)`: allocInstr's operand/result placement decided
   ## inline; each evaluated operand's resolved Location is written to the
@@ -8196,6 +8389,10 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
   if tgX64 notin row.targets:
     lengError c, "`" & IntrinsicNames[tgt.op] & "` has no x86-64 lowering — " &
               "guard the call with a `when`"
+  when declared(VecOps):
+    if tgt.op in VecOps:
+      g.emitVecInstr2(c, tgt.op, argCurs, dest)
+      return
   if row.isFlagRead or row.isFlagWrite:
     lengError c, "`" & IntrinsicNames[tgt.op] & "` is a flag instruction; flags " &
               "are only legal inside an `{.assembler.}` proc, where no " &
@@ -8429,6 +8626,7 @@ proc emitFValue2(g: var CodeGen; c: Cursor; dest: var Location) =
         g.emMemLval2(c)
       g.unbindLvalTemps2(c)
       g.freeLvalTemps2(c)
+    of InstrC: g.emitInstr2(c, dest)             # a vector row / float intrinsic
     of SufC, ParC:
       var inner: Cursor
       block:
