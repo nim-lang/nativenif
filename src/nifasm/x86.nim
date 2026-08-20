@@ -1385,8 +1385,10 @@ proc emitMovups*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest
 proc emitMovupsLoad*(dest: var Bytes; destReg: XmmRegister; mem: MemoryOperand) = emitSseRM(dest, 0x00, 0x10, int(destReg), mem)
 proc emitMovupsStore*(dest: var Bytes; mem: MemoryOperand; srcReg: XmmRegister) = emitSseRM(dest, 0x00, 0x11, int(srcReg), mem)
 proc emitAddpd*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0x66, 0x58, int(destReg), int(srcReg))
+proc emitSubpd*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0x66, 0x5C, int(destReg), int(srcReg))
 proc emitMulpd*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0x66, 0x59, int(destReg), int(srcReg))
 proc emitAddps*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0x00, 0x58, int(destReg), int(srcReg))
+proc emitSubps*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0x00, 0x5C, int(destReg), int(srcReg))
 proc emitMulps*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0x00, 0x59, int(destReg), int(srcReg))
 proc emitShufps*(dest: var Bytes; destReg, srcReg: XmmRegister; imm: byte) =
   emitSseRR(dest, 0x00, 0xC6, int(destReg), int(srcReg))

@@ -8181,11 +8181,8 @@ when declared(FldrqOp):
   # three registers and writes a fourth, every non-destructive op here needs a
   # 128-bit register-register copy first. That copy is what `vecMove` is; the
   # a64 path deliberately has none.
-  # `VfsubOp` is deliberately absent: the nifasm tag id space is 9 bits and full,
-  # so there is no id left for `subpd`/`subps`. The vectorizer's `vecSse` mode
-  # therefore never emits one — it leaves a loop containing a `sub` to the scalar
-  # code rather than failing to compile (see `shoggoth/vectorizer.nim`).
-  const VecOps = {FldrqOp, FstrqOp, VfaddOp, VfmulOp, VfmlaOp, VdupOp, VaddvOp}
+  const VecOps = {FldrqOp, FstrqOp, VfaddOp, VfsubOp, VfmulOp, VfmlaOp, VdupOp,
+                  VaddvOp}
 
   template Vec128Slot(): AsmSlot = AsmSlot(cls: AFloat, size: 16, align: 16)
 
@@ -8298,8 +8295,8 @@ when declared(FldrqOp):
         g.vecMove(dest.f, srcF)
         # `shufps X, X, 0xEE` selects 32-bit lanes 2,3,2,3 — i.e. it duplicates
         # the HIGH 8 bytes down into the low half, which is `punpckhqdq X, X`
-        # bit for bit. Spelled with `shufps` because the nifasm tag id space is
-        # 9 bits and full: there was no room for another instruction tag.
+        # bit for bit. Spelled with `shufps` so the lowering needs one packed
+        # shuffle mnemonic rather than two; `punpckhqdq` would buy nothing.
         g.vecShuf(dest.f, 0xEE)
         g.ab.tree AddsdX64:
           g.emFReg dest.f
@@ -8345,20 +8342,37 @@ when declared(FldrqOp):
         g.emFReg tmp.f
       if tmp.isTemp: g.unbindFTmp(tmp.f)
       g.freeVal(tmp)
-    of VfaddOp, VfmulOp:
+    of VfaddOp, VfsubOp, VfmulOp:
       let bits = g.vecLaneBits(argCurs[2])
       let aF = g.vecHomeF(argCurs[0])
       let bF = g.vecHomeF(argCurs[1])
       g.vecTakeDest(c, dest, Vec128Slot)
-      let tag = if op == VfaddOp: (if bits == 32: AddpsX64 else: AddpdX64)
+      let tag = case op
+                of VfaddOp: (if bits == 32: AddpsX64 else: AddpdX64)
+                of VfsubOp: (if bits == 32: SubpsX64 else: SubpdX64)
                 else: (if bits == 32: MulpsX64 else: MulpdX64)
       if dest.f == bF and aF != bF:
-        # Both rows are commutative, so a destination that already holds B needs
-        # no scratch: `D = D op A` is the same value. (`vfsub` would need one —
-        # it has no x86-64 lowering, see `VecOps`.)
-        g.ab.tree tag:
-          g.emFReg dest.f
-          g.emFReg aF
+        if op == VfsubOp:
+          # `subp[sd]` is not commutative, so a destination already holding B
+          # cannot absorb the operation: compute `A - B` in a scratch and move
+          # it over. The two commutative rows below need neither.
+          var tmp = g.takeFTmp(Vec128Slot)
+          if tmp.kind == NamedStack:
+            lengError c, "out of SIMD registers for a vfsub operand"
+          if tmp.isTemp and not g.rb.isBoundFTmp(tmp.f): g.bindFTmp(tmp.f)
+          g.vecMove(tmp.f, aF)
+          g.ab.tree tag:
+            g.emFReg tmp.f
+            g.emFReg bF
+          g.vecMove(dest.f, tmp.f)
+          if tmp.isTemp: g.unbindFTmp(tmp.f)
+          g.freeVal(tmp)
+        else:
+          # Commutative, so a destination that already holds B needs no
+          # scratch: `D = D op A` is the same value.
+          g.ab.tree tag:
+            g.emFReg dest.f
+            g.emFReg aF
       else:
         g.vecMove(dest.f, aF)
         g.ab.tree tag:

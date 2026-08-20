@@ -499,8 +499,10 @@ type
     MovupdTagId
     MovupsTagId
     AddpdTagId
+    SubpdTagId
     MulpdTagId
     AddpsTagId
+    SubpsTagId
     MulpsTagId
     ShufpsTagId
     RepstosbTagId
@@ -1013,19 +1015,21 @@ const
     ("movupd", 494),
     ("movups", 495),
     ("addpd", 496),
-    ("mulpd", 497),
-    ("addps", 498),
-    ("mulps", 499),
-    ("shufps", 500),
-    ("repstosb", 501),
-    ("repstosq", 502),
-    ("fldrq", 503),
-    ("fstrq", 504),
-    ("vfadd", 505),
-    ("vfsub", 506),
-    ("vfmul", 507),
-    ("vfmla", 508),
-    ("vdup", 509),
-    ("veor", 510),
-    ("vaddv", 511)
+    ("subpd", 497),
+    ("mulpd", 498),
+    ("addps", 499),
+    ("subps", 500),
+    ("mulps", 501),
+    ("shufps", 502),
+    ("repstosb", 503),
+    ("repstosq", 504),
+    ("fldrq", 505),
+    ("fstrq", 506),
+    ("vfadd", 507),
+    ("vfsub", 508),
+    ("vfmul", 509),
+    ("vfmla", 510),
+    ("vdup", 511),
+    ("veor", 512),
+    ("vaddv", 513)
   ]

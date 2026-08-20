@@ -494,8 +494,10 @@
 | `(movupd D S)`        | X64Inst                     | move unaligned packed double (xmm/mem either side; the access is inherently 16 bytes — the mem operand's scalar type is not consulted, matching the hardware) |
 | `(movups D S)`        | X64Inst                     | move unaligned packed single (xmm/mem either side; 16-byte access like `movupd`) |
 | `(addpd D S)`         | X64Inst                     | packed double add, 2 lanes (xmm registers only) |
+| `(subpd D S)`         | X64Inst                     | packed double subtract, 2 lanes, `D = D - S` (xmm registers only) |
 | `(mulpd D S)`         | X64Inst                     | packed double multiply, 2 lanes (xmm registers only) |
 | `(addps D S)`         | X64Inst                     | packed single add, 4 lanes (xmm registers only) |
+| `(subps D S)`         | X64Inst                     | packed single subtract, 4 lanes, `D = D - S` (xmm registers only) |
 | `(mulps D S)`         | X64Inst                     | packed single multiply, 4 lanes (xmm registers only) |
 | `(shufps D S N)`      | X64Inst                     | shuffle packed singles: each of D's 4 lanes picks a source lane by the 2-bit fields of immediate N (low two from D, high two from S); `(shufps X X 0)` broadcasts lane 0 to all 4 |
 | `(repstosb)`          | X64Inst                     | repeat store byte string: fills `rcx` bytes at `[rdi]` with `al`, advancing `rdi`; `rcx` ends 0 (DF=0 per SysV) |

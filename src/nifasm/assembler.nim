@@ -7320,15 +7320,17 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       if packedSingle: x86.emitMovupsStore(ctx.buf.data, d.mem, s)
       else: x86.emitMovupdStore(ctx.buf.data, d.mem, s)
 
-  of AddpdX64, MulpdX64, AddpsX64, MulpsX64:
+  of AddpdX64, SubpdX64, MulpdX64, AddpsX64, SubpsX64, MulpsX64:
     # Packed float ALU — xmm registers only.
     inc n
     let d = parseXmmOperand(n, ctx)
     let s = parseXmmOperand(n, ctx)
     case instTag
     of AddpdX64: x86.emitAddpd(ctx.buf.data, d, s)
+    of SubpdX64: x86.emitSubpd(ctx.buf.data, d, s)
     of MulpdX64: x86.emitMulpd(ctx.buf.data, d, s)
     of AddpsX64: x86.emitAddps(ctx.buf.data, d, s)
+    of SubpsX64: x86.emitSubps(ctx.buf.data, d, s)
     else: x86.emitMulps(ctx.buf.data, d, s)
 
   of ShufpsX64:
