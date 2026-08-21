@@ -3133,7 +3133,12 @@ template aconstrElemStores(g: var CodeGen; c: Cursor; destOp, addrOp: untyped) =
           continue
         var v: Location
         if g.isFloatExpr(valC):
-          v = dontCare
+          # The ELEMENT's slot, not `dontCare`: `elemSlot` is the authority
+          # for a float literal's bit pattern and for the `fstr` width below,
+          # so an unseeded `[1.5'f32, …]` initializer wrote the double
+          # pattern and every element read back as 0.0.
+          v = (if elemSlot.kind == AFloat: Location(kind: Undef, typ: elemSlot)
+               else: dontCare)
           g.emitFValue2(valC, v)
         else:
           v = needsReg(ScalarSlot)
@@ -3450,7 +3455,11 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
       g.freeVal(heldLoc)
   elif dst.kind in {Glob, Tvar}:                             # scalar/float/pointer global/tvar
     if dst.typ.kind == AFloat:
-      var fv = dontCare
+      # `dst.typ` is the global's own float slot and the `bits` below already
+      # trusts it; the VALUE has to trust it too, or a float literal builds
+      # the double pattern and `emFStore` writes its low half — `gf = 3.5'f32`
+      # on a `float32` global stored 0.0.
+      var fv = Location(kind: Undef, typ: dst.typ)
       g.emitFValue2(rhs, fv)
       let bits = if dst.typ.size == 4: 32 else: 64
       var fr = NoFReg
