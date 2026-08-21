@@ -3014,7 +3014,16 @@ proc genFieldStore2(g: var CodeGen; dst: Location; valC: Cursor) =
   else:                                                 # scalar / float / pointer field
     var v: Location
     if g.isFloatExpr(valC):
-      v = dontCare
+      # Seed the rhs target with the FIELD's slot rather than leaving it
+      # `dontCare` — the same lesson as the `Mem` destination in `genStore2`,
+      # which this path had not learned. A float LITERAL picks its bit pattern
+      # from the destination slot (`emitFValue2`) and the `fstr` below takes its
+      # width from `v.typ`; with neither known both default to 64, so a
+      # `float32` field gets the DOUBLE pattern written EIGHT bytes wide, over
+      # whatever field follows it. `dst.typ` is the field's own slot here (the
+      # `AMem` case returned above), so the destination type is the authority.
+      v = (if dst.typ.kind == AFloat: Location(kind: Undef, typ: dst.typ)
+           else: dontCare)
       g.emitFValue2(valC, v)
     else:
       v = needsReg(g.valueSlot(valC))                   # single-use (allocSingleUse's shape)
@@ -4562,9 +4571,20 @@ proc emitCondE(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
         of LtC:  (if whenTrue: BloA64 else: BhsA64)
         of LeC:  (if whenTrue: BlsA64 else: BhiA64)
         else: raiseAssert "arkham a64n: float cond " & $ek
-      var fa = dontCare
+      # Both operands are seeded with the compare's OWN float slot rather
+      # than `dontCare`. `emitFValue2` picks a float LITERAL's bit pattern
+      # from the destination slot, so an unseeded one builds the DOUBLE
+      # pattern — and the `fcmp` below, correctly `fbits` wide, then reads
+      # the wrong half of it. That is why `f > 1.4'f32` compared garbage
+      # while `f > g` with a `float32` variable was right: only the literal
+      # operand had no width to go on. Same lesson as the `Mem` destination
+      # in `genStore2` and the field destination in `genFieldStore2`.
+      let cmpSlot = g.exprSlot(aC)
+      let seed = (if cmpSlot.kind == AFloat: Location(kind: Undef, typ: cmpSlot)
+                  else: dontCare)
+      var fa = seed
       g.emitFValue2(aC, fa)
-      var fb = dontCare
+      var fb = seed
       g.emitFValue2(bC, fb)
       assert fa.kind == InFReg and fb.kind == InFReg, "arkham a64n: float cmp operands"
       g.ab.tree FcmpA64: g.emFReg(fa.f, fbits); g.emFReg(fb.f, fbits)
