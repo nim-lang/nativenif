@@ -207,8 +207,36 @@ proc exprSlot*(tc: TypeCtx; c: Cursor): AsmSlot =
     of NilC: AsmSlot(cls: AUInt, size: 8, align: 8, typ: tc.prog[].nilLit)  # nil → the `(nil)` type
     of TrueC, FalseC: AsmSlot(cls: AUInt, size: 1, align: 1)        # a bool
     of SizeofC, AlignofC: AsmSlot(cls: AInt, size: 8, align: 8)     # an integer constant
-    of SufC, ParC:                                                   # wrappers → the inner value
+    of ParC:                                                         # wrapper → the inner value
       var t = c; inc t
       tc.exprSlot(t)
+    of SufC:
+      # `(suf 1.0 "f32")` — the SUFFIX is where a literal's width lives, and for a
+      # float it is the only place it lives: a bare `FloatLit` above defaults to
+      # f64 and leaves the width "to be refined by context". Recursing straight
+      # into the value threw the suffix away, so every consumer saw f64.
+      #
+      # For a float that is not a harmless approximation, because the width picks
+      # the literal's BIT PATTERN rather than just a register class. A `float32`
+      # argument literal was materialized as the double pattern and passed in
+      # `v0`; the callee read the low half with `fmov s, s` and got the zero
+      # mantissa tail, so `a[0] = 1.0'f32` on a `seq[float32]` stored 0.0.
+      #
+      # Integer suffixes are deliberately NOT honoured here: arkham's canonical
+      # form for an integer is a full register with the width carried by explicit
+      # extends (see `ScalarSlot`), so narrowing the slot would change a
+      # representation the rest of the backend depends on. A float has no such
+      # convention — `s` and `d` are different registers.
+      var t = c; inc t
+      let inner = tc.exprSlot(t)
+      if inner.cls == AFloat:
+        var sfx = t
+        skip sfx
+        if sfx.kind == StrLit and strVal(sfx) == "f32":
+          AsmSlot(cls: AFloat, size: 4, align: 4)
+        else:
+          inner                    # `f64`, or a suffix that names no float width
+      else:
+        inner
     else: slotOf(tc.prog[], tc.getType(c))
   else: AsmSlot(cls: AMem)

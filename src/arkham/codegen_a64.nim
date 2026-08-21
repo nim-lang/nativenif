@@ -3496,7 +3496,20 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
     else:
       var v: Location
       if g.isFloatExpr(rhs):
-        v = dontCare
+        # Seed the rhs target with the DESTINATION's slot rather than leaving it
+        # `dontCare`. Two things downstream read a width that `dontCare` does not
+        # carry: a float LITERAL picks its bit pattern from the destination slot
+        # (`emitFValue2`), and the `fstr` below takes its width from `v.typ`. With
+        # neither known both defaulted to 64, so `a[0] = 1.0'f32` on a
+        # `float32` element wrote the DOUBLE pattern, eight bytes wide, over its
+        # neighbour — and read back as 0.0 because the low half of `1.0` is zero.
+        #
+        # The destination type is the authority here, exactly as it is for a
+        # conversion's target type (see the same lesson recorded in
+        # `codegen_x64.emitCast2`).
+        let lhsSlot = g.exprSlot(lhs)
+        v = (if lhsSlot.kind == AFloat: Location(kind: Undef, typ: lhsSlot)
+             else: dontCare)
         g.emitFValue2(rhs, v)                            # rhs value FIRST
       else:
         v = needsReg(ScalarSlot)
@@ -5171,7 +5184,23 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
           varTail.add (IntArgRegs[intIdx], NoFReg, off)
           inc intIdx
       elif g.isFloatExpr(a):
-        var fD = fregLoc(FloatArgRegs[fIdx], AsmSlot(cls: AFloat, size: 8, align: 8))
+        # The argument's OWN float width, not a fixed 8. AAPCS64 passes a `float`
+        # in the low half of `v0`-`v7` and a `double` in the whole register, so a
+        # register-to-register move is right either way and this looked harmless —
+        # but `emitFValue2` picks a LITERAL's bit pattern from the destination
+        # slot's width. With the width hardcoded to 8 a `float32` literal was
+        # materialized as the `double` pattern, whose low 32 bits (the half the
+        # callee reads with `fmov s, s`) are zero for every value with an empty
+        # mantissa tail: `a[0] = 1.0'f32` stored 0.0.
+        #
+        # It stayed hidden because it needs a REAL call with a float32 literal
+        # argument — a small proc gets inlined and the literal folded — which is
+        # why it surfaced through `seq[float32]`'s out-of-line `[]=` instantiation
+        # rather than in any direct call.
+        var fSlot = g.exprSlot(a)
+        if fSlot.kind != AFloat:
+          fSlot = AsmSlot(cls: AFloat, size: 8, align: 8)
+        var fD = fregLoc(FloatArgRegs[fIdx], fSlot)
         g.emitFValue2(a, fD)
         inc fIdx
       elif g.exprSlot(a).kind == AMem:
@@ -5501,6 +5530,21 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
     g.ab.tree RevA64: (g.emReg res.r; g.emReg src; g.ab.intLit bits)
     if tgt.argBits == 16:
       g.binImm(LsrA64, res.r, 16)
+  of VgClientRequestOp:
+    # `(vgreq D S)` — one node, because valgrind only recognizes its request
+    # sequence when the instructions arrive INTACT and adjacent. Emitting the
+    # rotates and the `orr x10, x10, x10` marker as ordinary instructions would
+    # expose them to exactly the passes that are right about everything else: the
+    # marker is a provable no-op and the rotates cancel, so a peephole would be
+    # correct to delete the lot, and would silently turn every request into
+    # nothing. Handing nifasm the whole sequence as one opcode puts it out of
+    # reach of the optimizer instead of asking the optimizer to make an exception.
+    #
+    # The encoder stages x3/x4 through x14/x15/x16, which the allocator never hands
+    # out — the same reason an atomic's LL/SC loop needs no clobber analysis — so
+    # only their stale NAMES have to go, exactly as `emitAtomicInstr2` does.
+    for r in AtomicScratchRegs: g.releaseStaleName(r)
+    g.ab.tree VgreqA64: (g.emReg res.r; g.emReg src)
   else:
     raiseAssert "arkham a64n: no lowering for intrinsic `" & IntrinsicNames[tgt.op] & "`"
   for d in ops:

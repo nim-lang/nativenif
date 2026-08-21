@@ -3,6 +3,11 @@ import std/[os, osproc, streams, strutils]
 # `declared(intrinsics.FldrqOp)` alone, to stage the vector fixtures (see
 # `arkhamStagedVec`) in lock-step with codegen_a64's staged AdvSIMD block.
 from "../../nimony/src/lib/intrinsics" import nil
+# The AArch64 encoders, for the byte-level checks below. Importing the module is
+# what lets a test assert an ENCODING rather than a program's output — the only
+# way to check a sequence whose whole point is that running it changes nothing.
+import "../src/nifasm/arm64"
+import "../src/nifasm/buffers"
 
 const
   runTimeoutMs = 30_000
@@ -794,6 +799,73 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/module_missing_symbol.nif", 
 # A foreign global is now bundled into the same image and accessed directly
 # (nifasm links the whole program in one invocation), so this succeeds.
 exec "nim c -r src/nifasm/nifasm tests/module_gvar_access.nif"
+
+proc vgClientRequestEncodingTests() =
+  ## The valgrind client request, checked as BYTES.
+  ##
+  ## Ungated, unlike everything below it: this executes nothing, it compares an
+  ## encoder's output to constants, so it is as meaningful on an AArch64 host as on
+  ## an x86-64 one. That matters here more than usual, because the two things this
+  ## sequence can get wrong are both invisible to a program that runs it.
+  ##
+  ## The first is the sequence itself. Valgrind recognizes these five instructions
+  ## and nothing else; one wrong bit and the request silently becomes what it already
+  ## pretends to be — a no-op — so every downstream leak report is simply absent
+  ## rather than wrong. The constants below are `valgrind/valgrind.h`'s arm64
+  ## `__SPECIAL_INSTRUCTION_PREAMBLE` and marker, assembled and disassembled to
+  ## confirm them rather than transcribed.
+  ##
+  ## The second is the register staging around it, and specifically the two aliasing
+  ## cases: the request block arriving in x3 or x4 (the registers the protocol takes),
+  ## and the destination BEING one of them. A test that runs a program cannot reach
+  ## these — arkham's planner never leaves a live value in x3/x4 — so if they are not
+  ## checked here they are not checked at all.
+  proc words(b: Bytes): seq[uint32] =
+    result = @[]
+    let p = cast[ptr UncheckedArray[uint32]](b.rawData)
+    for i in 0 ..< b.len div 4: result.add p[i]
+
+  const
+    Mov = 0xAA0003E0'u32   ## `mov Xd, Xm` = `orr Xd, XZR, Xm`
+    Preamble = [0x93CC0D8C'u32, 0x93CC358C'u32, 0x93CCCD8C'u32, 0x93CCF58C'u32]
+    Marker = 0xAA0A014A'u32
+  proc mov(rd, rm: Register): uint32 =
+    Mov or (uint32(ord(rm)) shl 16) or uint32(ord(rd))
+
+  proc check(rd, rargs: Register; staged: Register; what: string) =
+    ## `staged` is the register x4 must be loaded FROM: the operand itself, or the
+    ## saved copy when the operand is one of the two the sequence overwrites.
+    var b = default(Bytes)
+    emitVgClientRequest(b, rd, rargs)
+    let got = words(b)
+    var want = @[mov(X16, X3), mov(X14, X4), 0xD2800003'u32, mov(X4, staged)]
+    for w in Preamble: want.add w
+    want.add Marker
+    want.add mov(X15, X3)
+    want.add mov(X3, X16)
+    want.add mov(X4, X14)
+    want.add mov(rd, X15)
+    if got != want:
+      var msg = "FAILURE vgreq encoding (" & what & "):\n  got  "
+      for w in got: msg.add "0x" & toHex(w, 8) & " "
+      msg.add "\n  want "
+      for w in want: msg.add "0x" & toHex(w, 8) & " "
+      quit msg
+
+  # Ordinary: neither operand is one of the protocol's registers.
+  check(X9, X11, X11, "plain")
+  # The request block arrives in x3 / x4 — it must be read back from the SAVED copy,
+  # or staging x4 would destroy the very address being staged.
+  check(X9, X3, X16, "block in x3")
+  check(X9, X4, X14, "block in x4")
+  # The destination IS a protocol register. Legal, and it must be written after the
+  # restores: the allocator chose x3/x4 to hold the result, so the old value is dead,
+  # but a result written before the restore would be overwritten by it.
+  check(X3, X11, X11, "dest in x3")
+  check(X4, X3, X16, "dest in x4, block in x3")
+  echo "5 / 5 vgreq encoding tests successful"
+
+vgClientRequestEncodingTests()
 
 # arkham native-codegen tests: arkham emits the host arch (x86-64 on Linux,
 # AArch64/Darwin on macOS), so we run them only where the binaries execute.
