@@ -22,8 +22,9 @@ Options:
                             `__TEXT,__eh_frame` (Mach-O), `.pdata`+`.xdata` (PE).
                             Nothing generated keeps a frame pointer, so these are
                             what lets a debugger — or, on Windows, the OS itself —
-                            name a frame and walk past it. They cost only file
-                            size on ELF and Mach-O, where nothing loads them
+                            name a frame and walk past it. On ELF `.symtab`
+                            costs only file size, while `.eh_frame` is mapped
+                            read-only (valgrind rejects CFI it cannot map)
   --listing:file            write one TSV row per asm-NIF instruction node —
                             vaddr, length, nesting depth, proc, and the node
                             rendered as NIF — for the FINISHED image, so an

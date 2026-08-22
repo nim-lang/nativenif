@@ -776,6 +776,7 @@ proc checkIntegerArithmetic(t: Type; op: string; n: Cursor)
 proc checkIntegerType(t: Type; op: string; n: Cursor)
 proc checkBitwiseType(t: Type; op: string; n: Cursor)
 proc checkComparable(t: Type; op: string; n: Cursor)
+proc checkExchangeType(t: Type; op: string; n: Cursor)
 proc checkCompatibleTypes(t1, t2: Type; op: string; n: Cursor)
 proc checkCmpCompatible(t1, t2: Type; n: Cursor)
 proc checkBitwiseCompatible(t1, t2: Type; op: string; n: Cursor)
@@ -2787,6 +2788,37 @@ proc a64FpMemBase(ctx: var GenContext; m: arm64.MemoryOperand;
     emitAddOffsetA64(ctx, arm64.X16, m.base, m.offset, arm64.X17)
   result = (arm64.X16, 0'i32)
 
+proc a64IntMemBase(ctx: var GenContext; m: arm64.MemoryOperand;
+                   size: int): arm64.MemoryOperand =
+  ## Reduce an integer load/store's memory operand to one the register-offset form can
+  ## actually encode.
+  ##
+  ## `[Xn, Xm, LSL #k]` has a single SCALE bit, and it means "shift by the ACCESS
+  ## width's log2" — it is not a general shift amount. So the only strides that form
+  ## can say are 1 (S=0) and the transfer size itself (S=1). `(at …)` hands us the
+  ## ELEMENT stride, which is the same number only while the access IS the element;
+  ## an enclosing `(dot …)` narrows it, and `(dot (at arrayOfTuples i) fld)` then wants
+  ## stride 8 with a 4-byte load. That was emitted as `LSL #2` — silently reading
+  ## element `i/2` — and as `LSL #0` for a `bool` field, reading element `i/8`. It cost
+  ## a self-hosted hexer its `processMethods` loop: a `seq[(SymId, bool)]` walked at a
+  ## 4-byte stride visited elements 0, 2, 2, 2, … and handed `getOrQuit` a key that was
+  ## half a tuple.
+  ##
+  ## When the stride is not expressible, compute `base + index<<shift (+ offset)` into
+  ## the reserved X16 veneer and access `[X16, #0]` — what `a64FpMemBase` and `lea`
+  ## already do for the same reason. X16/X17 are never allocated by arkham.
+  result = m
+  if not m.hasIndex: return
+  if m.shift == 0 or m.shift == size: return    # the S bit says what we mean
+  if m.base == arm64.SP:
+    # A SP base needs the EXTENDED-register ADD; the shifted form reads reg 31 as XZR.
+    arm64.emitAddExtended(ctx.buf.data, arm64.X16, m.base, m.index, uint8(m.shift))
+  else:
+    arm64.emitAddShifted(ctx.buf.data, arm64.X16, m.base, m.index, uint8(m.shift))
+  if m.offset != 0:
+    emitAddOffsetA64(ctx, arm64.X16, arm64.X16, m.offset, arm64.X17)
+  result = arm64.MemoryOperand(base: arm64.X16, offset: 0, hasIndex: false)
+
 proc a64CondOf(inst: A64Inst): arm64.Condition =
   ## The condition code baked into a `csel*`/`cset*` mnemonic (same condition
   ## vocabulary as the `b*` branches).
@@ -2975,12 +3007,16 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       elif op.kind == okMem:
         error("Cannot move memory to memory", n)
       elif dest.mem.hasIndex:
-        var base = dest.mem.base
-        if dest.mem.offset != 0:
-          emitAddOffsetA64(ctx, arm64.X16, base, dest.mem.offset, arm64.X16)
-          base = arm64.X16
         let (size, opc) = memWidthOpc(dest.typ, isLoad = false)
-        arm64.emitLoadStoreReg(ctx.buf.data, op.reg, base, dest.mem.index, size, opc, dest.mem.shift)
+        let m = a64IntMemBase(ctx, dest.mem, size)
+        if not m.hasIndex:
+          arm64.emitLoadStoreUImm(ctx.buf.data, op.reg, m.base, m.offset, size, opc)
+        else:
+          var base = m.base
+          if m.offset != 0:
+            emitAddOffsetA64(ctx, arm64.X16, base, m.offset, arm64.X16)
+            base = arm64.X16
+          arm64.emitLoadStoreReg(ctx.buf.data, op.reg, base, m.index, size, opc, m.shift)
       else:
         let (size, opc) = memWidthOpc(dest.typ, isLoad = false)
         arm64.emitLoadStoreUImm(ctx.buf.data, op.reg, dest.mem.base, dest.mem.offset, size, opc)
@@ -2996,12 +3032,16 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
           # the raw bit patterns of floating-point constants.
           arm64.emitMovImm64(ctx.buf.data, dest.reg, cast[uint64](op.immVal))
       elif op.kind == okMem and op.mem.hasIndex:
-        var base = op.mem.base
-        if op.mem.offset != 0:
-          emitAddOffsetA64(ctx, arm64.X16, base, op.mem.offset, arm64.X16)
-          base = arm64.X16
         let (size, opc) = memWidthOpc(op.typ, isLoad = true)
-        arm64.emitLoadStoreReg(ctx.buf.data, dest.reg, base, op.mem.index, size, opc, op.mem.shift)
+        let m = a64IntMemBase(ctx, op.mem, size)
+        if not m.hasIndex:
+          arm64.emitLoadStoreUImm(ctx.buf.data, dest.reg, m.base, m.offset, size, opc)
+        else:
+          var base = m.base
+          if m.offset != 0:
+            emitAddOffsetA64(ctx, arm64.X16, base, m.offset, arm64.X16)
+            base = arm64.X16
+          arm64.emitLoadStoreReg(ctx.buf.data, dest.reg, base, m.index, size, opc, m.shift)
       elif op.kind == okMem:
         let (size, opc) = memWidthOpc(op.typ, isLoad = true)
         arm64.emitLoadStoreUImm(ctx.buf.data, dest.reg, op.mem.base, op.mem.offset, size, opc)
@@ -3705,6 +3745,22 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of ClrexA64:
     inc n
     arm64.emitClrex(ctx.buf.data)
+
+  of VgreqA64:
+    # (vgreq D S) — D = valgrind's answer to the request block at S.
+    #
+    # Nothing here is checked against valgrind's protocol because nothing here can
+    # get it wrong: the register assignment is fixed inside the encoder, not read
+    # off these operands. What IS checked is the only thing the caller chooses — two
+    # registers of a plausible type — since the encoder writes through both.
+    inc n
+    let dest = parseDestA64(n, ctx)
+    let op = parseOperandA64(n, ctx)
+    checkExchangeType(dest.typ, "vgreq", start)
+    checkExchangeType(op.typ, "vgreq", start)
+    if dest.kind != okReg: error("vgreq destination must be a register", n)
+    if op.kind != okReg: error("vgreq request-block operand must be a register", n)
+    arm64.emitVgClientRequest(ctx.buf.data, dest.reg, op.reg)
 
   of FmovA64:
     # (fmov D S): D=fp,S=fp → reg copy; D=fp,S=gpr / D=gpr,S=fp → bit move.
@@ -7867,7 +7923,7 @@ proc writeElf(a: var GenContext; outfile: string) =
   if a.symMap:
     var labelPos = initTable[int, int]()
     for ld in a.buf.labels: labelPos[int(ld.id)] = ld.position
-    let hdrBytes = 64 + 56 * 2
+    let hdrBytes = 64 + 56 * 3
     var rows: seq[(int, string)]
     for name, sym in a.rootScope.syms:
       if sym.kind == skProc and labelPos.hasKey(sym.offset):
@@ -7875,13 +7931,13 @@ proc writeElf(a: var GenContext; outfile: string) =
     rows.sort(proc (x, y: (int, string)): int = cmp(x[0], y[0]))
     for (va, name) in rows: stderr.writeLine "0x" & toHex(va, 6) & "  " & name
   if a.listing:
-    # `.text` byte 0 lands right after the ELF header + the two program headers,
+    # `.text` byte 0 lands right after the ELF header + the three program headers,
     # the same arithmetic `--symmap` above does.
-    a.writeListing(a.listingPath, 0x400000 + 64 + 56 * 2)
+    a.writeListing(a.listingPath, 0x400000 + 64 + 56 * 3)
   fillTraceTable(a)
   var code = a.buf.data
   let baseAddr = 0x400000.uint64
-  let headersSize = 64 + (56 * 2)  # ELF header + 2 program headers
+  let headersSize = 64 + (56 * 3)  # ELF header + 3 program headers
   let pageSize = 0x1000.uint64
 
   # Calculate addresses and sizes
@@ -7976,12 +8032,15 @@ proc writeElf(a: var GenContext; outfile: string) =
       EM_X86_64  # fallback
 
   # ── debug info: `.symtab` (proc names) and `.eh_frame` (unwind) ─────────────
-  # Both are pure METADATA: their sections are not `SHF_ALLOC` and sit past the
-  # end of the single PT_LOAD, so the loaded image is byte-for-byte what it was
-  # without them and the run-time cost is exactly zero. They exist so a debugger
-  # can name a frame and walk past it — arkham keeps no frame pointer, so
-  # without CFI even GDB's prologue heuristic loses the chain after a frame or
-  # two (measured: `#2 0x0000000000000000 in ?? ()`).
+  # Both are METADATA: nothing the program executes reads either, and they exist so a
+  # debugger can name a frame and walk past it — arkham keeps no frame pointer, so
+  # without CFI even GDB's prologue heuristic loses the chain after a frame or two
+  # (measured: `#2 0x0000000000000000 in ?? ()`).
+  #
+  # `.symtab`/`.strtab` sit past the last PT_LOAD and cost the running image nothing.
+  # `.eh_frame` is the exception: it is `SHF_ALLOC` in a read-only PT_LOAD of its own,
+  # because valgrind will not accept CFI it cannot map (see the segment comment below).
+  # The cost is a few demand-paged read-only KB no execution path touches.
   #
   # Everything they need is already known here: the proc's final code range (the
   # layout passes above have remapped it), its NIF name, and the CFA states its
@@ -8017,11 +8076,11 @@ proc writeElf(a: var GenContext; outfile: string) =
       copyMem(addr symtab[at], addr sym, sizeof(Elf64_Sym))
 
   var ehdr = initHeader(entryAddr, machine)
-  ehdr.e_phnum = 2  # Two program headers: .text and .bss
+  ehdr.e_phnum = 3  # Three program headers: .text, .bss and .eh_frame
   ehdr.e_phoff = 64  # Program headers start after ELF header
 
   # Build the initialized .bss image (constant static initializers — e.g. `stdout = 1`,
-  # or a gvar's compile-time value) FIRST, so the single LOAD segment below can size its
+  # or a gvar's compile-time value) FIRST, so the data LOAD segment below can size its
   # file/mem extents to cover it. The on-disk image holds those bytes (the rest zero),
   # so the slots start initialized with no entry-time code (correct in a bundle).
   var bssImage: seq[byte]
@@ -8051,20 +8110,48 @@ proc writeElf(a: var GenContext; outfile: string) =
             bssImage[it.off.int + i] = byte((targetVaddr shr (8 * i)) and 0xFF)
   let bssFileSz = if bssImage.len > 0: bssSize else: 0'u64
 
-  # ONE PT_LOAD covering headers + code AND the data/bss. Two separate PT_LOADs (an R+X
-  # text and an R+W bss) load fine under qemu-user, but the real Linux kernel maps the
-  # whole range with the *data* segment's permissions, leaving the code page non-
-  # executable (instruction-abort at the entry — every globals test SIGSEGVs on real
-  # AArch64). A single contiguous segment — the shape a gvar-less program (e.g. `hello`)
-  # already loads correctly — avoids it. R+X when there is no writable data, else R+W+X
-  # (writable, so the kernel accepts the `memsz > filesz` zero-fill bss tail).
-  let segFileSz = textMemSize + bssFileSz
-  let segMemSz = textMemSize + bssAlignedSize
-  let segFlags = if bssAlignedSize > 0: PF_R or PF_W or PF_X else: PF_R or PF_X
-  var textPhdr = initPhdr(textOffset, textVaddr, segFileSz, segMemSz, segFlags)
-  # Second header kept empty (e_phnum stays 2 ⇒ header size unchanged): a
-  # zero-filesz/zero-memsz PT_LOAD the kernel ignores (mirrors the gvar-less layout).
-  var bssPhdr = initPhdr(0'u64, bssVaddr, 0'u64, 0'u64, PF_R or PF_W)
+  # THREE PT_LOADs, one per permission class:
+  #
+  #   R-X   headers + code       [0, textMemSize)
+  #   RW-   data/bss             [textMemSize, +bssFileSz), zero-filled to bssAlignedSize
+  #   R--   .eh_frame            page-aligned, so a debugger can MAP the unwind tables
+  #
+  # An earlier revision merged all three into ONE R+W+X segment, blaming the AArch64
+  # kernel for applying the data segment's permissions to the whole range. That is no
+  # longer reproducible (re-tested on Linux 6.12/AArch64: the split layout below loads
+  # and runs correctly), and the merged shape cost two things worth having back.
+  #
+  # It gave up W^X: every code page was writable. And it made the image opaque to
+  # valgrind, whose ELF reader classifies a mapping as the "text" map only when it is
+  # R+X and *not* writable — so it skipped the object entirely and every frame of every
+  # report came out as `???`, which is most of the value of running valgrind at all.
+  #
+  # `.eh_frame` gets its own read-only segment for the second half of that story:
+  # valgrind refuses an `.eh_frame` whose section mapping it cannot place inside a
+  # loaded segment ("Can't make sense of .eh_frame section mapping") and treats that as
+  # a FATAL debug-info error, which takes `.symtab` down with it. So unlike `.symtab`
+  # and `.strtab` — which stay in the unloaded tail, read from the file by section
+  # header — the CFI has to be genuinely mapped. It costs a few demand-paged read-only
+  # KB that nothing reads unless a debugger walks the stack.
+  #
+  # Each segment's p_offset is congruent to its p_vaddr modulo the page size, which is
+  # what the kernel's mmap of the file requires: the first two are page multiples by
+  # construction, and the third is page-aligned on both sides below.
+  let ehSize = ehFrame.len.uint64
+  let ehSegOff = (textMemSize + bssFileSz + pageSize - 1) and not (pageSize - 1)
+  let ehVaddr = bssVaddr + bssAlignedSize
+
+  var textPhdr = initPhdr(textOffset, textVaddr, textMemSize, textMemSize,
+                          PF_R or PF_X)
+  # `memsz > filesz` is the bss zero-fill tail; the segment is writable, so the kernel
+  # accepts it.
+  var bssPhdr = initPhdr(textMemSize, bssVaddr, bssFileSz, bssAlignedSize,
+                         PF_R or PF_W)
+  # Kept empty (filesz = memsz = 0) when there is no debug info: a PT_LOAD the kernel
+  # ignores, so `e_phnum` — and with it `headersSize` — stays constant either way.
+  var ehPhdr =
+    if ehSize > 0: initPhdr(ehSegOff, ehVaddr, ehSize, ehSize, PF_R)
+    else: initPhdr(0'u64, ehVaddr, 0'u64, 0'u64, PF_R)
 
   var f = newFileStream(outfile, fmWrite)
   defer: f.close()
@@ -8075,6 +8162,7 @@ proc writeElf(a: var GenContext; outfile: string) =
   # Write program headers
   f.write(textPhdr)
   f.write(bssPhdr)
+  f.write(ehPhdr)
 
   # Write .text section (code)
   if code.len > 0:
@@ -8091,15 +8179,21 @@ proc writeElf(a: var GenContext; outfile: string) =
     f.writeData(unsafeAddr bssImage[0], bssImage.len)
 
   if a.debugInfo:
-    # The non-loaded tail: section contents, then the section header table. Only
-    # `.text` is `SHF_ALLOC` (it describes bytes that ARE loaded, and the symbols
-    # point into it); everything else is debugger-only.
+    # `.text` and `.eh_frame` are `SHF_ALLOC` — they describe bytes that are LOADED
+    # (the symbols point into the first, a debugger maps the second). `.symtab`,
+    # `.strtab` and `.shstrtab` follow in the non-loaded tail, read straight from the
+    # file by section header, then the section header table itself.
     var pos = uint64(f.getPosition())
     template pad8() =
       while (pos and 7) != 0:
         f.write 0'u8; inc pos
-    pad8()
+    # `.eh_frame` starts its own PT_LOAD, so it is padded to a PAGE, not to 8: the
+    # kernel maps a segment from a page-aligned file offset, and `ehSegOff` above
+    # computed that same boundary.
+    while (pos and (pageSize - 1)) != 0:
+      f.write 0'u8; inc pos
     let ehFrameOff = pos
+    doAssert ehFrameOff == ehSegOff, "`.eh_frame` file offset disagrees with its PT_LOAD"
     if ehFrame.len > 0:
       f.writeData(unsafeAddr ehFrame[0], ehFrame.len); pos += ehFrame.len.uint64
     pad8()
@@ -8126,7 +8220,7 @@ proc writeElf(a: var GenContext; outfile: string) =
     shdrs.add initShdr(shName[0], SHT_PROGBITS, SHF_ALLOC or SHF_EXECINSTR,
                        baseAddr + headersSize.uint64, headersSize.uint64,
                        code.len.uint64, 0, 0, 16, 0)
-    shdrs.add initShdr(shName[1], SHT_PROGBITS, 0, 0, ehFrameOff,
+    shdrs.add initShdr(shName[1], SHT_PROGBITS, SHF_ALLOC, ehVaddr, ehFrameOff,
                        ehFrame.len.uint64, 0, 0, 8, 0)
     # `sh_link` of a symtab is its string table; `sh_info` is the index of the
     # first non-local symbol — every symbol here is global, so that is 1.

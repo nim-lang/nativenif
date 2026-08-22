@@ -770,6 +770,67 @@ proc emitClrex*(dest: var Bytes) =
   ## CLREX — clear the local exclusive monitor.
   dest.addUint32(0xD5033F5F'u32)
 
+# ── valgrind client request ────────────────────────────────────────────────
+
+const
+  VgPreamble = [0x93CC0D8C'u32,   # ror x12, x12, #3
+                0x93CC358C'u32,   # ror x12, x12, #13
+                0x93CCCD8C'u32,   # ror x12, x12, #51
+                0x93CCF58C'u32]   # ror x12, x12, #61
+    ## Valgrind's magic preamble, verbatim from `valgrind/valgrind.h`
+    ## (`__SPECIAL_INSTRUCTION_PREAMBLE`, arm64). The four rotate counts sum to
+    ## 3 + 13 + 51 + 61 = 128 ≡ 0 (mod 64), so x12 comes out of the sequence holding
+    ## exactly what it went in with. That is not a coincidence to preserve carefully —
+    ## it is the design: the whole request has to be a NO-OP on real hardware, because
+    ## the same instruction bytes execute whether or not anyone is watching.
+  VgMarker = 0xAA0A014A'u32       # orr x10, x10, x10
+    ## The instruction valgrind actually keys on. Also a no-op (`x10 |= x10`), and also
+    ## deliberately so.
+
+proc emitVgClientRequest*(dest: var Bytes; rd, rargs: Register) =
+  ## `D = valgrind_client_request(S)` — S holds the address of the 6-word request
+  ## block, D receives valgrind's answer (or 0 if the sequence executed for real).
+  ##
+  ## Valgrind's protocol fixes the registers: x4 must hold the block's address and
+  ## x3 the caller's default on entry, and x3 holds the result on exit. Both are
+  ## saved and restored around the sequence.
+  ##
+  ## Under arkham's CURRENT planner that saving is dead weight — measured, not
+  ## assumed: removing the x4 restore changes no observable result, because the ABI
+  ## planner evaluates call arguments into temps and stages x0–x7 only immediately
+  ## before the call, so nothing of the caller's is ever live in x3/x4 across an
+  ## expression. The saving stays anyway, because that is a property of one pass in
+  ## one repository and nothing states or checks it, while this encoder is reachable
+  ## from hand-written asm-NIF as well. Five instructions in a build that exists to
+  ## be slow and observed is the wrong place to spend an invariant.
+  ##
+  ## x14/x15/x16 do the staging precisely because arkham never hands them out (see
+  ## `AtomicScratchRegs` in `arkham/machine.nim`): x14/x15 are the emitter's staging
+  ## bridges, withheld from the temp pool, and x16 is in `ReservedRegs`. The same
+  ## property that makes an atomic's LL/SC loop cheap makes this cheap — the clobber
+  ## set cannot overlap anything the allocator owns, so nothing has to prove it.
+  ##
+  ## The order below is what makes every aliasing case come out right, and each step
+  ## is load-bearing:
+  ##
+  ## * `rargs` is read through its SAVED copy when it happens to BE x3 or x4, so
+  ##   staging the block address cannot destroy the value being staged;
+  ## * the answer is parked in x15 BEFORE x3/x4 are restored, so restoring cannot
+  ##   overwrite it;
+  ## * `rd` is written LAST, so `rd` may legitimately be x3 or x4 — the allocator
+  ##   picked it to hold the result, which means whatever was there is already dead.
+  emitMov(dest, X16, X3)                    # save x3
+  emitMov(dest, X14, X4)                    # save x4
+  emitMovImm(dest, X3, 0)                   # default = 0 ⇒ "not under valgrind"
+  let src = (if rargs == X3: X16 elif rargs == X4: X14 else: rargs)
+  emitMov(dest, X4, src)                    # x4 = &request block
+  for w in VgPreamble: dest.addUint32(w)
+  dest.addUint32(VgMarker)
+  emitMov(dest, X15, X3)                    # park the answer
+  emitMov(dest, X3, X16)                    # restore x3
+  emitMov(dest, X4, X14)                    # restore x4
+  emitMov(dest, rd, X15)
+
 # ── scalar double-precision floating point (ftype = 01) ─────────────────────
 # Dn is the 64-bit (double) view of Vn. Single-precision (Sn) is a future
 # addition; arkham emits doubles only for now.

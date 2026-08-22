@@ -25,11 +25,14 @@
 ## Encoding notes, since the format has three near-identical variants:
 ##  * this is `.eh_frame` (CIE id 0, FDE's CIE pointer is a BACKWARD distance),
 ##    not `.debug_frame` (CIE id 0xffffffff, absolute section offset);
-##  * addresses use `DW_EH_PE_absptr`, so the section needs no relocation and —
-##    the point — works while the section is NOT loaded (`sh_addr == 0`). The
-##    usual `pcrel` encoding computes its target from the section's own runtime
-##    address, which a non-allocated section does not have. Keeping the section
-##    out of every `PT_LOAD` is what makes this cost exactly zero at run time.
+##  * addresses use `DW_EH_PE_absptr`, so the section needs no relocation: an FDE
+##    names its proc's absolute vaddr outright. The usual `pcrel` encoding would
+##    compute that from the section's own runtime address, which buys nothing here
+##    (the image is not PIE) and costs a reader that has to know where the section
+##    landed. `absptr` is therefore correct whether or not the section is mapped —
+##    which matters, because it IS mapped: the ELF writer gives `.eh_frame` a
+##    read-only `PT_LOAD` of its own, since valgrind rejects CFI it cannot place in
+##    a loaded segment. See the segment comment in `assembler.nim`.
 
 import std / [assertions, algorithm]
 import tracetable

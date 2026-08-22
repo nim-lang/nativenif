@@ -4845,7 +4845,15 @@ proc genFieldStore2(g: var CodeGen; dst: Location; valC: Cursor) =
   else:                                                 # scalar / float / pointer field
     var v: Location
     if g.isFloatExpr(valC):
-      v = dontCare
+      # Seed the rhs target with the FIELD's slot rather than leaving it
+      # `dontCare`. `emitFValue2` picks a float LITERAL's bit pattern from the
+      # destination slot, and the `movss`/`movsd` choice below reads `v.typ`
+      # too; with neither known both default to 64, so a `float32` field got
+      # the DOUBLE pattern stored eight bytes wide, over whatever field
+      # follows it. `dst.typ` is the field's own slot here (the `AMem` case
+      # returned above), so the destination type is the authority.
+      v = (if dst.typ.kind == AFloat: Location(kind: Undef, typ: dst.typ)
+           else: dontCare)
       g.emitFValue2(valC, v)
     else:
       v = needsReg(ScalarSlot)                          # single-use (allocSingleUse's shape)
@@ -5002,7 +5010,12 @@ template aconstrElemStores(g: var CodeGen; c: Cursor; destOp: untyped) =
           continue
         var v: Location
         if g.isFloatExpr(valC):
-          v = dontCare
+          # The ELEMENT's slot, not `dontCare`: `elemSlot` is the authority
+          # for a float literal's bit pattern and for the store width below,
+          # so an unseeded `[1.5'f32, …]` initializer wrote the double
+          # pattern and every element read back as 0.0.
+          v = (if elemSlot.kind == AFloat: Location(kind: Undef, typ: elemSlot)
+               else: dontCare)
           g.emitFValue2(valC, v)
         else:
           v = needsReg(ScalarSlot)
@@ -5321,7 +5334,11 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
       g.genBaseobj2(rhs, dst)                   # object→base slice
     else: raiseAssert "arkham x64n: aggregate store rhs " & $rhs.exprKind
   elif dst.kind in {Glob, Tvar} and dst.typ.kind == AFloat:  # float global / threadvar
-    var fv = dontCare
+    # `dst.typ` is the global's own float slot and `gbits` below already
+    # trusts it; the VALUE has to trust it too, or a float literal builds the
+    # double pattern and the store writes its low half — `gf = 3.5'f32` on a
+    # `float32` global stored 0.0.
+    var fv = Location(kind: Undef, typ: dst.typ)
     g.emitFValue2(rhs, fv)                               # rhs → an xmm
     assert fv.kind == InFReg, "arkham x64n: float global store rhs " & $fv.kind
     let gbits = if dst.typ.size == 4: 32 else: 64
@@ -5487,7 +5504,14 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
         g.binNormSuppressPos = g.binStoreSuppressPos(rhs, w)
       var v: Location
       if g.isFloatExpr(rhs):
-        v = dontCare
+        # The DESTINATION's slot, not `dontCare` — the same reason as in
+        # `genFieldStore2`: a float literal takes its bit pattern from the
+        # destination slot and the store below takes its width from `v.typ`,
+        # so an unseeded `a[0] = 1.0'f32` wrote the double pattern over the
+        # element's neighbour and read back as 0.0.
+        let lhsSlot = g.exprSlot(lhs)
+        v = (if lhsSlot.kind == AFloat: Location(kind: Undef, typ: lhsSlot)
+             else: dontCare)
         g.emitFValue2(rhs, v)                             # rhs value FIRST
       else:
         v = needsReg(ScalarSlot)
@@ -6852,9 +6876,18 @@ proc emitCondE(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
       #     other combinations are a two-jump disjunction or a single jump.
       let fbits = g.floatBits(aC)
       let swapped = ek in {LtC, LeC}
-      var fa = dontCare
+      # Both operands take the compare's OWN float slot rather than
+      # `dontCare`: a float LITERAL picks its bit pattern from the
+      # destination slot, so an unseeded one builds the DOUBLE pattern and
+      # the `comiss` below — correctly `fbits` wide — reads the wrong half
+      # of it. `f > 1.4'f32` compared garbage while `f > g` with a `float32`
+      # variable was right, since only the literal had no width to go on.
+      let cmpSlot = g.exprSlot(aC)
+      let seed = (if cmpSlot.kind == AFloat: Location(kind: Undef, typ: cmpSlot)
+                  else: dontCare)
+      var fa = seed
       g.emitFValue2(aC, fa)
-      var fb = dontCare
+      var fb = seed
       g.emitFValue2(bC, fb)
       assert fa.kind == InFReg and fb.kind == InFReg, "arkham x64n: float cmp operands"
       g.ab.tree (if fbits == 32: ComissX64 else: ComisdX64):
@@ -7738,8 +7771,22 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
             elif home.len > 0: g.emStackAddr(marshalRegs[0], home)
             else: g.emGlobalAddr(marshalRegs[0], symName(a))
       elif g.isFloatExpr(a):
-        var fD = fregLoc(amd.floatArgRegs[pl.fpIndex],
-                         AsmSlot(cls: AFloat, size: 8, align: 8))
+        # The argument's OWN float width, not a fixed 8 — the twin of the same
+        # fix on a64, which this side never got. SysV passes a `float` in the
+        # low half of an xmm and a `double` in the whole register, so the move
+        # is right either way and the hardcoded 8 looked harmless; but
+        # `emitFValue2` picks a LITERAL's bit pattern from the destination
+        # slot's width, so a `float32` literal was materialized as the DOUBLE
+        # pattern, whose low 32 bits — the half the callee reads — are zero for
+        # every value with an empty mantissa tail.
+        #
+        # A variadic float argument reaches here already promoted to double by
+        # the front end, so its `exprSlot` is `(f 64)` and this keeps passing it
+        # full-width.
+        var fSlot = g.exprSlot(a)
+        if fSlot.kind != AFloat:
+          fSlot = AsmSlot(cls: AFloat, size: 8, align: 8)
+        var fD = fregLoc(amd.floatArgRegs[pl.fpIndex], fSlot)
         g.emitFValue2(a, fD)                       # → its xmm arg register
       else:
         let abiReg = amd.gprAt(pl)
