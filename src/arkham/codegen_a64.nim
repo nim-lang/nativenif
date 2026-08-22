@@ -2975,6 +2975,32 @@ proc aggrArgAddr(g: var CodeGen; a: Cursor; dst: Reg) =
       let hl = g.plan.locationOfSym(home, cursorToPosition(g.buf[], a))
       if hl.kind == InReg: g.movReg(dst, hl.r)          # by-ref param: pointer already in a reg
       elif hl.kind == StackPtr: g.emScalarLoad(dst, hl.ptrName)   # its slot holds the pointer
+      elif hl.kind == InRegPair:
+        # A ≤16B by-value aggregate the allocator kept in a GPR PAIR — it has no
+        # address at all, so there is nothing to `lea`. Give it one: a slot of its own,
+        # written from the pair.
+        #
+        # The fall-through used to emit `lea dst, <name>` for this, naming a `(s)` var
+        # that was never declared, because a pair home declares none — the eightbytes
+        # ARE the fields and every other reader gets at them positionally
+        # (`aggrWordsToFromRegs` returns early on `InRegPair` for exactly that reason).
+        # nifasm caught it as "Unknown or invalid symbol". `semos.runEval` is the shape
+        # that reaches it: its `sourceDir: string` is pair-homed, and the
+        # `runProgram(…)` call it feeds needs NINE argument words, so that one argument
+        # is marshalled onto the outgoing stack — the one path that wants an address.
+        #
+        # No extra scratch: `dst` is the bridge being filled, so take the slot's address
+        # into it first and store the pair words THROUGH it. And no partial tail to
+        # worry about — `canHomeInRegPair` admits only 8/16-byte aggregates whose every
+        # field is a full 8-byte word at an 8-byte offset, so whole eightbytes are exact.
+        let ptyp = g.getType(a)
+        if ptyp.kind != Symbol:
+          raiseAssert "arkham a64: register-pair aggregate of non-nominal type: " & home
+        let slot = synth("pairaddr") & $g.posOf(a) & ".0"
+        g.emStackVar(slot, ptyp.symId)
+        g.ab.tree LeaA64: (g.emReg dst; g.ab.sym slot)
+        for k in 0 ..< aggrWordCount(g.prog, ptyp.symId):
+          g.ab.tree MovA64: (g.emWordThroughPtr(dst, k); g.emReg pairWord(hl, k))
       else: g.ab.tree LeaA64: (g.emReg dst; g.ab.sym home)
   else:                                                 # oconstr/aconstr → build into a temp, then &temp
     let pos = g.posOf(a)
