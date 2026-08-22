@@ -2788,6 +2788,37 @@ proc a64FpMemBase(ctx: var GenContext; m: arm64.MemoryOperand;
     emitAddOffsetA64(ctx, arm64.X16, m.base, m.offset, arm64.X17)
   result = (arm64.X16, 0'i32)
 
+proc a64IntMemBase(ctx: var GenContext; m: arm64.MemoryOperand;
+                   size: int): arm64.MemoryOperand =
+  ## Reduce an integer load/store's memory operand to one the register-offset form can
+  ## actually encode.
+  ##
+  ## `[Xn, Xm, LSL #k]` has a single SCALE bit, and it means "shift by the ACCESS
+  ## width's log2" — it is not a general shift amount. So the only strides that form
+  ## can say are 1 (S=0) and the transfer size itself (S=1). `(at …)` hands us the
+  ## ELEMENT stride, which is the same number only while the access IS the element;
+  ## an enclosing `(dot …)` narrows it, and `(dot (at arrayOfTuples i) fld)` then wants
+  ## stride 8 with a 4-byte load. That was emitted as `LSL #2` — silently reading
+  ## element `i/2` — and as `LSL #0` for a `bool` field, reading element `i/8`. It cost
+  ## a self-hosted hexer its `processMethods` loop: a `seq[(SymId, bool)]` walked at a
+  ## 4-byte stride visited elements 0, 2, 2, 2, … and handed `getOrQuit` a key that was
+  ## half a tuple.
+  ##
+  ## When the stride is not expressible, compute `base + index<<shift (+ offset)` into
+  ## the reserved X16 veneer and access `[X16, #0]` — what `a64FpMemBase` and `lea`
+  ## already do for the same reason. X16/X17 are never allocated by arkham.
+  result = m
+  if not m.hasIndex: return
+  if m.shift == 0 or m.shift == size: return    # the S bit says what we mean
+  if m.base == arm64.SP:
+    # A SP base needs the EXTENDED-register ADD; the shifted form reads reg 31 as XZR.
+    arm64.emitAddExtended(ctx.buf.data, arm64.X16, m.base, m.index, uint8(m.shift))
+  else:
+    arm64.emitAddShifted(ctx.buf.data, arm64.X16, m.base, m.index, uint8(m.shift))
+  if m.offset != 0:
+    emitAddOffsetA64(ctx, arm64.X16, arm64.X16, m.offset, arm64.X17)
+  result = arm64.MemoryOperand(base: arm64.X16, offset: 0, hasIndex: false)
+
 proc a64CondOf(inst: A64Inst): arm64.Condition =
   ## The condition code baked into a `csel*`/`cset*` mnemonic (same condition
   ## vocabulary as the `b*` branches).
@@ -2976,12 +3007,16 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       elif op.kind == okMem:
         error("Cannot move memory to memory", n)
       elif dest.mem.hasIndex:
-        var base = dest.mem.base
-        if dest.mem.offset != 0:
-          emitAddOffsetA64(ctx, arm64.X16, base, dest.mem.offset, arm64.X16)
-          base = arm64.X16
         let (size, opc) = memWidthOpc(dest.typ, isLoad = false)
-        arm64.emitLoadStoreReg(ctx.buf.data, op.reg, base, dest.mem.index, size, opc, dest.mem.shift)
+        let m = a64IntMemBase(ctx, dest.mem, size)
+        if not m.hasIndex:
+          arm64.emitLoadStoreUImm(ctx.buf.data, op.reg, m.base, m.offset, size, opc)
+        else:
+          var base = m.base
+          if m.offset != 0:
+            emitAddOffsetA64(ctx, arm64.X16, base, m.offset, arm64.X16)
+            base = arm64.X16
+          arm64.emitLoadStoreReg(ctx.buf.data, op.reg, base, m.index, size, opc, m.shift)
       else:
         let (size, opc) = memWidthOpc(dest.typ, isLoad = false)
         arm64.emitLoadStoreUImm(ctx.buf.data, op.reg, dest.mem.base, dest.mem.offset, size, opc)
@@ -2997,12 +3032,16 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
           # the raw bit patterns of floating-point constants.
           arm64.emitMovImm64(ctx.buf.data, dest.reg, cast[uint64](op.immVal))
       elif op.kind == okMem and op.mem.hasIndex:
-        var base = op.mem.base
-        if op.mem.offset != 0:
-          emitAddOffsetA64(ctx, arm64.X16, base, op.mem.offset, arm64.X16)
-          base = arm64.X16
         let (size, opc) = memWidthOpc(op.typ, isLoad = true)
-        arm64.emitLoadStoreReg(ctx.buf.data, dest.reg, base, op.mem.index, size, opc, op.mem.shift)
+        let m = a64IntMemBase(ctx, op.mem, size)
+        if not m.hasIndex:
+          arm64.emitLoadStoreUImm(ctx.buf.data, dest.reg, m.base, m.offset, size, opc)
+        else:
+          var base = m.base
+          if m.offset != 0:
+            emitAddOffsetA64(ctx, arm64.X16, base, m.offset, arm64.X16)
+            base = arm64.X16
+          arm64.emitLoadStoreReg(ctx.buf.data, dest.reg, base, m.index, size, opc, m.shift)
       elif op.kind == okMem:
         let (size, opc) = memWidthOpc(op.typ, isLoad = true)
         arm64.emitLoadStoreUImm(ctx.buf.data, dest.reg, op.mem.base, op.mem.offset, size, opc)
