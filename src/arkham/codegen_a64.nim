@@ -1395,6 +1395,28 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
         if c.kind == Symbol and slotOf(g.prog, c).kind == AMem: tn = c.symId
         while c.hasMore: skip c               # type (+ anything else)
       let loc = g.plan.homeOfSym(nm)
+      # A PARAMETER's home register, stated where the claim is made rather than
+      # inferred from a pool it happens not to be in (design.md, "Fixed-register
+      # roles must be stated, not assumed" — the same rule the atomics broke).
+      #
+      # `takeHeld`'s second chance and `pickStagingA64` judge a callee-saved register
+      # by `rb.isBound`, deliberately bypassing the whole-proc `regHoldsHome` union
+      # because it is too conservative for an ordinary local (disjoint scopes). A
+      # plain scalar/pointer parameter is moved into its home with a raw `mov` and
+      # read raw after that — it is never `rb`-bound — so it was invisible to that
+      # test and those draws handed it out from under a live value.
+      #
+      # Measured in `nifconfig.isDefined` on a `-d:release` native build: the
+      # `config` pointer reads `cpu=15 os=4` at entry and `cpu=0 os=0` three
+      # conditions later, and the run dies in `platform.OS[targetOS]` with
+      # "index out of bounds: 0 notin 1..34". x64 reserves its own unnamed homes the
+      # same way and for the same reason; this is a64 catching up.
+      case loc.kind
+      of InReg: g.rawHomeRegs.incl loc.r
+      of InRegPair:
+        g.rawHomeRegs.incl loc.r0
+        g.rawHomeRegs.incl loc.r1
+      else: discard
       if tn != NoTypeSym and loc.kind == StackPtr:
         # A >16B by-ref aggregate whose POINTER found no register home: its slot is
         # `(ptr T)`, filled from the incoming arg register. (The home's KIND says the
@@ -1673,8 +1695,8 @@ proc takeHeld(g: var CodeGen; what: string; canSpill = false): Location =
   # LIVE bindings instead of the `regHoldsHome` union — see `pickStagingA64` for
   # why the union is what runs out under `-d:release`.
   for cs in g.md.intCalleeSaved:
-    if cs notin g.pickedRegs and not g.plan.isSealed(cs) and not g.rb.isAccum(cs) and
-       not g.rb.isBound(cs):
+    if cs notin g.pickedRegs and cs notin g.rawHomeRegs and not g.plan.isSealed(cs) and
+       not g.rb.isAccum(cs) and not g.rb.isBound(cs):
       g.plan.usedCallee.incl cs                    # the (post-body) prologue saves it
       g.releaseStaleName(cs)
       g.pickedRegs.incl cs
@@ -1686,6 +1708,17 @@ proc takeHeld(g: var CodeGen; what: string; canSpill = false): Location =
   raiseAssert "arkham a64n: out of registers for " & what &
               " in proc " & g.curProcName & " (nothing to spill), picked: " &
               $g.pickedRegs
+
+proc tryTakeHeld(g: var CodeGen): Location =
+  ## `takeHeld` for a caller that HAS another answer when no survivor is free:
+  ## reports exhaustion as an `Undef` Location instead of asserting. Reserves the
+  ## register exactly as `takeHeld` does — the `pickedRegs` flag is what closes the
+  ## reserve→bind gap, and dropping it lets the very next pick hand the same register
+  ## out from under the value this one is holding.
+  let r = g.pickHeldReg()
+  if r == NoReg: return dontCare
+  g.pickedRegs.incl r
+  result = regLoc(r, ScalarSlot, isTemp = true)
 
 proc pickStagingA64(g: var CodeGen): Reg =
   ## Last-resort transient GPR for an operand that MUST be in a register and cannot
@@ -1709,12 +1742,12 @@ proc pickStagingA64(g: var CodeGen): Reg =
   ## (`RegMapping` rule 1): its value is still in memory, and `releaseStaleName`
   ## below retires it as the register is handed over.
   for r in g.md.intTempRegs:
-    if r notin g.pickedRegs and not g.plan.isSealed(r) and not g.rb.isAccum(r) and
-       (not g.rb.isBound(r) or g.rb.isMirror(r)):
+    if r notin g.pickedRegs and r notin g.rawHomeRegs and not g.plan.isSealed(r) and
+       not g.rb.isAccum(r) and (not g.rb.isBound(r) or g.rb.isMirror(r)):
       g.releaseStaleName(r); return r
   for r in g.md.intCalleeSaved:
-    if r notin g.pickedRegs and not g.plan.isSealed(r) and not g.rb.isAccum(r) and
-       not g.rb.isBound(r):
+    if r notin g.pickedRegs and r notin g.rawHomeRegs and not g.plan.isSealed(r) and
+       not g.rb.isAccum(r) and not g.rb.isBound(r):
       g.plan.usedCallee.incl r                     # the (post-body) prologue saves it
       g.releaseStaleName(r); return r
   NoReg
@@ -2023,7 +2056,11 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
     let nm = symName(c)
     let loc = g.plan.locationOfSym(nm, cursorToPosition(g.buf[], c))
     if loc.kind == NoLoc:                                 # module-level global base
-      let baseReg = g.plan.planned(g.posOf(c))
+      let planned = g.plan.planned(g.posOf(c))
+      # An allocated register, or — when the walk had none to give — the bridge
+      # `prematLval2` derived `&g` into late (see `lateGlobalBase`).
+      let baseReg = if planned.kind == InReg: planned.r
+                    else: g.lvalGlobBase[g.posOf(c)]
       let si = g.lookupSym(nm)
       var d = si.decl
       inc d; skip d; skip d                               # (gvar …): name, pragmas → type
@@ -2031,7 +2068,7 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
         g.ab.ptrType:
           if d.kind == Symbol: g.ab.sym symName(d)
           else: g.genTypeBody(d)
-        g.emReg baseReg.r
+        g.emReg baseReg
     elif loc.kind == InReg and g.varType.hasKey(nm):      # by-ref aggregate param (pointer)
       g.ab.tree CastX:
         g.ab.ptrType: g.emTypeSym(g.varType[nm])
@@ -2197,6 +2234,21 @@ proc releaseStrideScratch(g: var CodeGen; atPos: int) =
   g.pickedRegs.excl r
   g.unbindTemp(r)
 
+proc lateGlobalBase(g: var CodeGen; c: Cursor): bool =
+  ## Is `c` a module-level global lvalue base that the walk could NOT give an
+  ## allocated register? Then its address is materialized LATE — after the index it
+  ## would otherwise have to survive — into a staging bridge.
+  ##
+  ## A global's address is RE-DERIVABLE: `adrp`+`add` of a link-time label, no inputs.
+  ## So the step never actually needed a register that outlives a call; it only needed
+  ## one because `prematLval2` materializes the base BEFORE the index. Deriving it
+  ## after instead costs nothing at run time and removes the demand entirely — the
+  ## same reasoning `fieldLocGlob` states on x64, and what design.md means by fixing
+  ## it "in the demand of the step that asked" rather than in a bigger pool.
+  c.kind == Symbol and
+    g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind == NoLoc and
+    g.plan.planned(g.posOf(c)).kind != InReg
+
 proc prematLval2(g: var CodeGen; c: Cursor) =
   ## Materialize an lvalue's embedded values (a deref pointer, an index, a global
   ## base address) into their allocated registers BEFORE the consuming `(mem …)`/
@@ -2218,6 +2270,22 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
                     g.rb.addrMirror(g.prog.gvarRefName(symName(c))) == loc.r
       if loc.isTemp and not g.rb.isBoundTemp(loc.r): g.bindTemp(loc.r, ScalarSlot)
       if not already: g.emGlobalAddr(loc.r, symName(c))
+    elif g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind == NoLoc:
+      # A global base with no allocated register (`lateGlobalBase`): derive `&g` here.
+      # The caller ordered this AFTER the index, so nothing between this point and the
+      # consuming `(mem …)` tree can clobber a volatile — any register with no live
+      # binding will do, and taking one leaves both bridges for the operand reloads
+      # that have no other answer. A bridge only if even that finds nothing.
+      # `freeLvalTemps2` drops it with the rest of the lvalue's temps either way
+      # (`dropBridge` is `unbindTemp`, which also clears the reserve flag).
+      var s = g.pickStagingA64()
+      if s != NoReg:
+        g.pickedRegs.incl s
+        g.bindTemp(s, ScalarSlot)
+      else:
+        s = g.takeBridge()
+      g.emGlobalAddr(s, symName(c))
+      g.lvalGlobBase[g.posOf(c)] = s
     else:
       let home = g.plan.homeOfSym(symName(c))
       if home.kind == StackPtr:                # the slot holds &aggregate: load it first
@@ -2243,10 +2311,16 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
       var recycle = NoReg
       cc.into:
         let baseCur = cc
-        g.prematLval2(cc); skip cc                        # base
+        # A re-derivable global base with no allocated register goes LAST: the index
+        # is what it would otherwise have to survive, and deriving `&g` after it needs
+        # no survivor at all (`lateGlobalBase`).
+        let late = g.lateGlobalBase(baseCur)
+        if not late: g.prematLval2(cc)
+        skip cc                                           # base
         if cc.kind notin {IntLit, UIntLit}:
           g.prematAddrVal2(cc)                            # follow steals
           recycle = g.strideRecycle(cc, baseCur)          # last-resort stride scratch
+        if late: g.prematLval2(baseCur)
         while cc.hasMore: skip cc
       if g.plan.aux.hasKey(atPos) and g.plan.aux[atPos].scratch.len > 0:
         g.bindStrideScratch(atPos, recycle)
@@ -3922,12 +3996,20 @@ proc emitLvalWalk(g: var CodeGen; n: var Cursor; globBase: Location; isStore: bo
         # (no x64-style staging marker): a survivor under a calling index or
         # for a store held across the rhs, else an ordinary temp.
         if isStore or heldBase:
-          g.plan.planAtEmitTime(pos, g.takeHeld("a global base address"))
+          # A survivor if one is going spare; otherwise record NOTHING and let
+          # `prematLval2` derive `&g` into a bridge after the index (`lateGlobalBase`).
+          # This step used to assert here, and it is the one place the assert was
+          # avoidable rather than a real shortage: the address has no inputs, so
+          # holding it across the call was a choice, not a requirement.
+          let h = g.tryTakeHeld()
+          if h.kind == InReg:
+            g.plan.planAtEmitTime(pos, h)
         else:
           var d = g.takeTmp(ScalarSlot)
           if d.kind != InReg:
-            d = g.takeHeld("a global base address")  # pool dry: survivor beats a bridge
-          g.plan.planAtEmitTime(pos, d)
+            d = g.tryTakeHeld()                 # pool dry: survivor beats a bridge
+          if d.kind == InReg:
+            g.plan.planAtEmitTime(pos, d)       # else: nothing recorded ⇒ late-derive
     inc n
   of TagLit:
     case n.exprKind
@@ -6330,6 +6412,7 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   # lvalue walk (emitLvalWalk → ra.aux memo).
   g.pickedRegs = {}
   g.pickedFRegs = {}
+  g.rawHomeRegs = {}
   g.emitTmpSpills = 0
   g.plan = allocateProc(g.buf[], info.decl, an, g.prog, aarch64MachineA, g.typeCtx, preseal)
   if g.retIndirect:

@@ -1386,6 +1386,28 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
         # `NoReg` under full callee-saved pressure.
         for r in b.md.intCalleeSaved:
           if r in b.freeCallee and r notin b.plan.sealed: (b.freeCallee.excl r; break)
+    # The emitter's SURVIVOR scratch, reserved on the same principle one line up.
+    #
+    # A handful of emit steps need a register that outlives a call — a global's base
+    # address held across a calling index, an aggregate `&g` held across the rhs that
+    # fills it, an atomic's operand. `pickHeldReg` draws those from the callee-saved
+    # registers the body did not use, and when the body used them all it returns
+    # `NoReg`. That was survivable only because `takeHeld` then took a SECOND chance
+    # that bypassed the home union and judged by `rb.isBound` — which does not see a
+    # parameter's home, so it handed out live parameters (see `emitParamMoves`).
+    #
+    # With that hole closed the guarantee has to come from here, which is where it
+    # belonged: out of registers is the allocator's problem, not a second allocator's
+    # (design.md, "Out of registers is an ERROR, not a second allocator"). Reserving
+    # one register up front costs a local home and makes `trySteal` spill the coldest
+    # local — one allocator, one set of rules about who gets displaced.
+    #
+    # Only for a proc that CALLS: a survivor is by definition a value that must cross
+    # a call, so a leaf proc can never need one, and leaves are where the register
+    # budget is tightest.
+    if an.hasCall:
+      for r in b.md.intCalleeSaved:
+        if r in b.freeCallee and r notin b.plan.sealed: (b.freeCallee.excl r; break)
     allocParams(b, n, an.hasCall)            # advances n past params → return type
     skip n                                    # return type
     skip n                                    # pragmas
