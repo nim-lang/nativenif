@@ -899,6 +899,14 @@ when defined(linux) and defined(amd64):
 when defined(linux) and defined(amd64):
   arkhamQemuTests()
 
+# On an AArch64 Linux host (a Raspberry Pi is the common one) the `linux_arm64`
+# binaries are NATIVE: the same corpus runs without an emulator, and it is the only
+# arkham coverage such a host gets — the x64 pass above needs an x86-64 CPU and the
+# Darwin pass a Mac. `arkhamQemuTests` still spells the runner `qemu-aarch64`, so
+# provide it as a shell shim that just execs its argument.
+when defined(linux) and defined(arm64):
+  arkhamQemuTests()
+
 # The AArch64 backend gets the same starved-pool pass, under qemu.
 when defined(linux) and defined(amd64):
   if findExe("qemu-aarch64").len > 0:
