@@ -74,23 +74,25 @@ const
     ## argument shift, costs an argument register on every such call and needs
     ## `planCall`'s `retByRef` threaded through sites that currently pass false.
 
-  ## The volatile scratch arkham manages. On AArch64 the argument registers are
-  ## kept OUT of this pool because seven other volatiles exist; here they are the
-  ## only volatiles there are, so — exactly as x86-64 does with its argument
-  ## registers in `intLocalTempRegs` — they double as the temp pool. The
-  ## analyser's `AllRegs` interval test is what makes that sound: a value homed
-  ## in one of these provably has no call in its live range.
+  ## EMPTY, and that is the whole answer to a register file this small.
   ##
-  ## r0 is EXCLUDED, as rax is on x86-64 and x0 on AArch64. The planner's
-  ## "returned local lives in the return register" optimization depends on the
-  ## return register being drawable ONLY by that local's home and by no temp; if
-  ## it were an ordinary temp here, a temp could take it and the elision would
-  ## silently stop happening.
-  IntTempRegs* = [R1, R2, R3]
-
-  ## Identical to `IntTempRegs`, as on AArch64: the bridges are already withheld
-  ## by not appearing in either list, so there is nothing further to subtract.
-  IntLocalTempRegs* = [R1, R2, R3]
+  ## This pool is emitter SCRATCH, and scratch is drawn while a call's arguments
+  ## are being staged. On x86-64 and AArch64 it is disjoint from the argument
+  ## registers (r10 vs rdi…r9; x9–x15 vs x0–x7), so that is safe without anyone
+  ## having to say so. Cortex-M's only volatiles ARE its four argument registers,
+  ## and an overlapping pool means the allocator hands out r1 as a temp while r1
+  ## already holds staged argument word 1 — which is exactly what happened: an
+  ## aggregate argument was marshalled into r0/r1, then the NEXT argument's
+  ## constructor took r1 as scratch and the callee read 1 where 10 belonged.
+  ##
+  ## With no volatile pool, temporaries come from the callee-saved homes
+  ## (r4–r7). That costs a prologue save in procs that would otherwise be leaves
+  ## and buys correctness that the register file cannot otherwise provide. A
+  ## narrower fix — teaching the scratch picker which argument registers are
+  ## currently staged — is the real answer, and belongs with the emitter rather
+  ## than in this table.
+  IntTempRegs*: array[0, Reg] = []
+  IntLocalTempRegs*: array[0, Reg] = []
 
   ## Emitter "staging bridges", withheld from every pool so a transient can
   ## always be drawn: a folded memory operand the 3-operand ALU must load first,

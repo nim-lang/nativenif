@@ -4648,6 +4648,34 @@ proc emitBranchM(ctx: var GenContext; cond: thumb2.Condition; target: LabelId) =
   if cond == thumb2.CondAL: thumb2.emitB(ctx.buf, target)
   else: thumb2.emitBcond(ctx.buf, cond, target)
 
+proc memWidthM(t: Type): tuple[width: thumb2.MemWidth; signed: bool] =
+  ## The ACCESS WIDTH a typed memory operand implies, and whether a load of it
+  ## sign-extends. A `(mem …)` carries the pointee / field / slot type, so a
+  ## narrow integer must load with `ldrb`/`ldrh` (sign- or zero-extending) and
+  ## store only its low bits.
+  ##
+  ## Without this every access was a full 32-bit `ldr`: reading one byte of a
+  ## `(u 8)` array returned that byte AND the three after it, which is not a
+  ## crash and not a type error — just a wrong value, and only for programs that
+  ## happen to look at sub-word data.
+  ##
+  ## A stack slot is its content type behind a `(stackoff …)` wrapper; unwrap it
+  ## and size by what the slot HOLDS, exactly as `memWidthOpc` does for AArch64.
+  var ty = t
+  if ty != nil and ty.kind == TypeKind.StackOffT: ty = ty.offType
+  if ty == nil: return (thumb2.MemWord, false)
+  case ty.kind
+  of TypeKind.BoolT: (thumb2.MemByte, false)
+  of TypeKind.IntT:
+    if ty.bits == 8: (thumb2.MemByte, true)
+    elif ty.bits == 16: (thumb2.MemHalf, true)
+    else: (thumb2.MemWord, false)
+  of TypeKind.UIntT:
+    if ty.bits == 8: (thumb2.MemByte, false)
+    elif ty.bits == 16: (thumb2.MemHalf, false)
+    else: (thumb2.MemWord, false)
+  else: (thumb2.MemWord, false)     # pointer, aggregate, register-typed: a word
+
 proc emitMemAccessM(ctx: var GenContext; rt: thumb2.Register;
                     mem: thumb2.MemoryOperand; width: thumb2.MemWidth;
                     isLoad: bool; signed = false; n: Cursor) =
@@ -4689,7 +4717,8 @@ proc loadToRegM(ctx: var GenContext; dest: thumb2.Register; op: OperandM; n: Cur
     thumb2.emitMovImm16(ctx.buf.data, dest, 0)
     thumb2.emitMovt(ctx.buf.data, dest, 0)
   of okMem:
-    ctx.emitMemAccessM(dest, op.mem, thumb2.MemWord, isLoad = true, n = n)
+    let (w, sx) = memWidthM(op.typ)
+    ctx.emitMemAccessM(dest, op.mem, w, isLoad = true, signed = sx, n = n)
   of okLabel:
     thumb2.emitMovwMovtAbs(ctx.buf, dest, op.label)
   else:
@@ -4697,7 +4726,10 @@ proc loadToRegM(ctx: var GenContext; dest: thumb2.Register; op: OperandM; n: Cur
 
 proc storeFromRegM(ctx: var GenContext; src: thumb2.Register; dst: OperandM; n: Cursor) =
   if dst.kind != okMem: error("Cortex-M: expected a memory destination", n)
-  ctx.emitMemAccessM(src, dst.mem, thumb2.MemWord, isLoad = false, n = n)
+  # Sized by the DESTINATION's type: a narrow store must write only its low
+  # bytes, or it takes the neighbouring fields with it.
+  let (w, _) = memWidthM(dst.typ)
+  ctx.emitMemAccessM(src, dst.mem, w, isLoad = false, n = n)
 
 proc scratchM(ctx: GenContext; avoid: varargs[thumb2.Register]): thumb2.Register =
   ## A register the selector may use as a transient. r12 (IP) is reserved for

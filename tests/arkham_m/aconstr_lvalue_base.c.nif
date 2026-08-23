@@ -1,0 +1,82 @@
+(.nif27)
+(stmts
+ (type :Tags2.0 .
+  (array
+   (u 8)2))
+ (type :Point.0 .
+  (object .
+   (fld :px.0 .
+    (i 32))
+   (fld :py.0 .
+    (i 32))))
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :pick.0
+  (params
+   (param :i.0 .
+    (i 32))
+   (param :j.0 .
+    (i 32)))
+  (i 32).
+  (stmts
+   (var :a.0 .
+    (i 32)
+    (conv
+     (i 32)
+     (at
+      (aconstr Tags2.0 103u 87u)i.0)))
+   (var :b.0 .
+    (i 32)
+    (conv
+     (i 32)
+     (at
+      (aconstr Tags2.0 103u 87u)j.0)))
+   (ret
+    (add
+     (i 32)
+     (mul
+      (i 32)a.0 1000)b.0))))
+ (proc :dotOf.0
+  (params
+   (param :k.0 .
+    (i 32)))
+  (i 32).
+  (stmts
+   (ret
+    (dot
+     (oconstr Point.0
+      (kv px.0 11)
+      (kv py.0 22))px.0))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :r.0 .
+    (i 32)
+    (call pick.0 0 1))
+   (if
+    (elif
+     (neq r.0 103087)
+     (stmts
+      (call exit.0 11))))
+   (asgn r.0
+    (call pick.0 1 0))
+   (if
+    (elif
+     (neq r.0 87103)
+     (stmts
+      (call exit.0 12))))
+   (if
+    (elif
+     (neq
+      (call dotOf.0 0)11)
+     (stmts
+      (call exit.0 13))))
+   (call exit.0 42))))

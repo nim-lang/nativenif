@@ -9,7 +9,7 @@ Status: **M0, M1, M2a/b complete; M2c in progress.**
 | M2a Thumb-2 encoder + relocations | done — `src/nifasm/thumb2.nim`, 45-check self-test |
 | M2b ELF32 firmware writer | done — `src/nifasm/elf32.nim` |
 | M2c assembler integration | done — selector, frames, calls, marshalling |
-| M3 arkham backend | **working** — 115 Leng fixtures run end to end |
+| M3 arkham backend | **working** — 119 Leng fixtures run end to end |
 | M4 64-bit integers | not started |
 | M5 floating point | not started |
 | M6 embedded features | not started |
@@ -178,10 +178,19 @@ fixtures, 225 `importc "exit"` and 3 `importc "write"`.
   image carries. `importc "exit"` and `importc "write"` become semihosting shims
   too, called like ordinary procs; anything else `importc`'d is refused by name.
 
-  **No fixture hangs.** Everything that does not work either refuses by name or
-  produces a wrong exit code the harness catches. 5 of the 216 converted
-  fixtures still give a wrong value; the rest are refused. The corpus in
-  `tests/arkham_m/` holds only what genuinely passes.
+  **No fixture hangs, and no fixture computes a wrong answer.** Everything that
+  does not work refuses BY NAME. The two converted fixtures that still produce a
+  wrong value are inapplicable rather than unsupported — `memcpy_tail` stores
+  2^32 into a slot conversion made 32-bit, and `stack_array_align` asserts a
+  16-byte stack alignment AAPCS32 does not promise; both are named in
+  `tests/arkham_m/README.md`.
+
+  The Cortex-M `intTempRegs` pool is deliberately EMPTY. Emitter scratch is
+  drawn while a call's arguments are being staged, and on this target the only
+  volatiles ARE the argument registers — so an overlapping pool hands out r1 as
+  a temp while r1 holds staged argument word 1. Temporaries come from the
+  callee-saved homes instead. The narrower fix is to teach the scratch picker
+  which argument registers are currently staged.
 * **M4 — 64-bit integers as register pairs.** `adds`/`adcs`, `umull`+`mla`,
   `__aeabi_ldivmod`. Un-skips most of the existing 236-fixture corpus (206 of
   them declare `(i 64)`).
