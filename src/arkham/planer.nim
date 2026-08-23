@@ -433,12 +433,26 @@ proc getSym(b: var Builder; name: string; slot: AsmSlot; props: VarProps): Locat
       if r == NoReg and DivRegOk in props and b.md.divRemReg != NoReg:
         r = b.takeReg(b.freeVol, [b.md.divRemReg])
       if r == NoReg: r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
+    elif not b.an.hasCall:
+      # AArch64, a LEAF: volatiles first. The whole prologue exists to save callee-saved
+      # registers, so a leaf that fits in the volatile pool needs no prologue at all —
+      # and nothing here can lose the race the general case worries about below, because
+      # in a leaf EVERY value is `AllRegs` and the two pools are interchangeable. What
+      # is at stake is 4 stack accesses per callee-saved PAIR (a `stp`, an `ldp`, and
+      # the `sub`/`add sp` when a frame is forced) in a proc that may run millions of
+      # times: `nifcore.leaveScope` is ten instructions of work behind six of them.
+      # Falling through to callee-saved when the volatile pool runs dry keeps the
+      # register count identical to before — a leaf never spills MORE because of this.
+      r = b.takeReg(b.freeVol, b.md.intLocalTempRegs)
+      if r == NoReg: r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
     else:
-      # AArch64: prefer callee-saved first (one prologue push, then resident). Volatile-
-      # first was tried for shrink-wrap but regressed rawAlloc/rawDealloc: the scarce
-      # volatile pool (x9–x13) spilled hot call-free temps that previously sat in x19+.
-      # Cutting the prologue needs true cold-path shrink-wrap / caller-save for params,
-      # not stealing volatiles from the hot path.
+      # AArch64 with calls: prefer callee-saved first (one prologue push, then
+      # resident). Volatile-first was tried for shrink-wrap but regressed
+      # rawAlloc/rawDealloc: the scarce volatile pool (x9–x13) spilled hot call-free
+      # temps that previously sat in x19+. Cutting the prologue THERE needs true
+      # cold-path shrink-wrap / caller-save for params, not stealing volatiles from
+      # the hot path — a call-free value and a cross-call value are competing for
+      # different things the moment a call exists.
       r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
       if r == NoReg: r = b.takeReg(b.freeVol, b.md.intLocalTempRegs)
     # Still nothing? A local whose interval crosses no variable shift / no div may

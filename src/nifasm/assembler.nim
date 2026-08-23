@@ -3930,6 +3930,23 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     if op.typ.kind != UIntT: error("Branch target must be label", n)
     arm64.emitBL(ctx.buf, op.label)
 
+  of CbzA64, CbnzA64:
+    # (cbz S L) / (cbnz S L) — branch on S being zero / non-zero. Unlike every
+    # `b.cc` above these read no flags, so they stand in for a whole `cmp S, #0`
+    # plus conditional branch. Register-only by encoding (no immediate, no memory);
+    # the value is compared as a full 64-bit register, which is what arkham's
+    # sign-/zero-extension invariant makes correct for a narrower type too.
+    let isZero = instTag == CbzA64
+    inc n
+    let src = parseOperandA64(n, ctx)
+    if src.kind != okReg: error("CBZ/CBNZ source must be a register", n)
+    checkComparable(src.typ, (if isZero: "cbz" else: "cbnz"), start)
+    let lab = parseOperandA64(n, ctx)
+    if lab.typ.kind != UIntT: error("Branch target must be label", n)
+    checkForwardJump(ctx, lab.label, n)
+    if isZero: arm64.emitCbz(ctx.buf, src.reg, lab.label)
+    else: arm64.emitCbnz(ctx.buf, src.reg, lab.label)
+
   of BeqA64:
     inc n
     let op = parseOperandA64(n, ctx)
