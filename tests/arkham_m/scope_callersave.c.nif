@@ -1,0 +1,35 @@
+(.nif27)
+(.indexat 330              )
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :id.0
+  (params
+   (param :a.0 .
+    (i 32)))
+  (i 32)
+  (pragmas)
+  (stmts
+   (ret a.0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :x.0 .
+    (i 32)10)
+   (asgn x.0
+    (add
+     (i 32)x.0
+     (call id.0 5)))
+   (asgn x.0
+    (add
+     (i 32)x.0
+     (call id.0 3)))
+   (call exit.0 x.0))))(.index)

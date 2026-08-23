@@ -24,14 +24,16 @@ Usage:
 
 Options:
   -o:file, --output:file   output asm-NIF file (default: <input>.asm.nif)
-  --os:SYMBOL              target OS: linux | windows | macosx (default: host)
-  --cpu:SYMBOL             target CPU: amd64 | arm64 (default: host)
+  --os:SYMBOL              target OS: linux | windows | macosx | standalone
+                           (default: host)
+  --cpu:SYMBOL             target CPU: amd64 | arm64 | arm (default: host)
   -a:arch, --arch:arch     legacy combined form: arm64 | x64 | linux_arm64 |
                            win_x64 (cannot be mixed with --os/--cpu)
   -h, --help               show this help
 
 Supported --os/--cpu combinations (same symbols as Nimony's flags):
-  linux/amd64  windows/amd64  linux/arm64  macosx/arm64
+  linux/amd64  windows/amd64  linux/arm64  macosx/arm64  standalone/arm
+  (standalone/arm is bare-metal Cortex-M4; see doc/cortex_m.md)
 """
 
 proc archOf(os, cpu: string): string =
@@ -44,22 +46,26 @@ proc archOf(os, cpu: string): string =
   let cpuC = case cpuN
              of "amd64", "x8664", "x86_64": "amd64"
              of "arm64", "aarch64": "arm64"
+             of "arm": "arm"
              else: quit("arkham: unknown --cpu:" & cpu &
-                        " (supported: amd64, arm64)", QuitFailure)
+                        " (supported: amd64, arm64, arm)", QuitFailure)
   let osC = case osN
             of "linux": "linux"
             of "windows": "windows"
             of "macosx", "macos", "osx": "macosx"
+            of "standalone", "none", "baremetal": "standalone"
             else: quit("arkham: unknown --os:" & os &
-                       " (supported: linux, windows, macosx)", QuitFailure)
+                       " (supported: linux, windows, macosx, standalone)", QuitFailure)
   case osC & "/" & cpuC
   of "linux/amd64": "x64"
   of "windows/amd64": "win_x64"
   of "linux/arm64": "linux_arm64"
   of "macosx/arm64": "arm64"
+  of "standalone/arm": "cortex_m"
   else:
     quit("arkham: unsupported --os/--cpu combination: " & osC & "/" & cpuC &
-         " (supported: linux/amd64, windows/amd64, linux/arm64, macosx/arm64)",
+         " (supported: linux/amd64, windows/amd64, linux/arm64, macosx/arm64," &
+         " standalone/arm)",
          QuitFailure)
 
 proc run(input, output, arch: string) =
@@ -73,6 +79,7 @@ proc run(input, output, arch: string) =
              of "win_x64", "windows_x64": generateX64(buf, input, tags, windows = true)
              of "arm64", "aarch64", "": generateA64(buf, input, tags)
              of "linux_arm64", "linux_aarch64": generateA64(buf, input, tags, linux = true)
+             of "cortex_m", "cortexm", "thumbm": generateM(buf, input, tags)
              else: quit("arkham: unknown --arch:" & arch, QuitFailure)
   writeFile(output, code)
 

@@ -4270,6 +4270,16 @@ proc parseOperandM(n: var Cursor; ctx: var GenContext): OperandM =
         if n.hasMore and n.kind == IntLit:
           result.immVal = getInt(n)
           inc n
+    elif t == CastTagId:
+      # `(cast T <operand>)` — a RETYPE, no instruction. Reinterpreting a register
+      # as `(aptr T)` is how the code generator reaches an array through a pointer,
+      # so this arm is what makes `(at (cast (aptr T) reg) idx)` resolve at all.
+      inc n
+      let castType = parseType(n, ctx.scope, ctx)
+      var op = parseOperandM(n, ctx)
+      op.typ = castType
+      result = op
+      return
     elif t == DotTagId:
       # `(dot <base> <field>)` — fold the field's offset onto the base address.
       # The result is typed `PtrT(fieldType)`: an embedded sub-object sits AT
@@ -4431,47 +4441,61 @@ proc parseOperandM(n: var Cursor; ctx: var GenContext): OperandM =
         while n.hasMore: skip n
       return
     elif t == MemTagId:
-      # `(mem <base> [offset | field-symbol])`. `into` BOUNDS the cursor to this
-      # node's children — without it the optional-offset check below reads into
-      # the following sibling, and a register-bound name after a `(mem base)`
-      # store destination gets eaten as if it were an offset. Same reasoning as
-      # the a64 and x64 handlers.
+      # `(mem <base> [offset | field-symbol | (arg name)])`, or `(mem <lvalue>)`
+      # where the lvalue is a `(dot …)`/`(at …)` that already folded to an address.
+      #
+      # `into` BOUNDS the cursor to this node's children — without it the
+      # optional-offset check reads into the following sibling, and a
+      # register-bound name after a `(mem base)` store destination gets eaten as
+      # if it were an offset. Same reasoning as the a64 and x64 handlers.
+      #
+      # Nothing inside the `into` may `return`: it is a template whose scope-exit
+      # bookkeeping a `return` jumps straight past, leaving the cursor inside a
+      # scope it has left. That surfaces later as nifcore's "advancing past end
+      # of scope", nowhere near the cause.
       into n:
-        let base = parseOperandM(n, ctx)
-        if base.kind == okMem:
-          # A stack variable used as a base: its slot IS the address.
-          result.mem = base.mem
-        elif base.kind != okReg:
-          error("(mem ...) base must be a register", n)
+        if n.kind == TagLit and (n.tag == DotTagId or n.tag == AtTagId):
+          # The fold already produced the address and typed it `PtrT(elem)`;
+          # dereferencing is just unwrapping that pointer to the value's type.
+          let addrOp = parseOperandM(n, ctx)
+          if addrOp.kind != okMem: error("mem requires an address expression", n)
+          if addrOp.typ.kind != TypeKind.PtrT:
+            error("mem requires pointer type, got " & $addrOp.typ, n)
+          result = addrOp
+          result.typ = resolvedBase(addrOp.typ, ctx, n)
         else:
-          result.mem = thumb2.MemoryOperand(base: base.reg, offset: 0)
-        if n.hasMore and n.kind == TagLit and n.tag == ArgTagId:
-          # `(mem (sp) (arg name))` — the slot of an OUTGOING stack argument.
-          # Its offset is the running byte position among the stack-passed
-          # params, which `(arg …)` yields as an immediate.
-          let argOff = parseOperandM(n, ctx)
-          if argOff.kind != okImm:
-            error("(arg ...) in mem must denote a stack argument", n)
-          result.mem.offset += int32(argOff.immVal)
-        elif n.hasMore and n.kind == IntLit:
-          result.mem.offset += int32(getInt(n))
-          inc n
-        elif n.hasMore and n.kind == Symbol:
-          # A stack PARAMETER's name: its declared offset within the incoming
-          # argument area.
-          let fname = getSym(n)
-          let fsym = lookupWithAutoImport(ctx, ctx.scope, fname, n)
-          if fsym == nil: error("Unknown symbol in (mem ...): " & fname, n)
-          result.mem.offset += int32(fsym.offset)
-          inc n
-        result.kind = okMem
-        result.typ =
-          if base.kind == okMem and base.typ != nil and
-             base.typ.kind == TypeKind.StackOffT:
-            base.typ.offType
-          elif base.typ != nil and base.typ.kind in {TypeKind.PtrT, TypeKind.AptrT}:
-            resolvedBase(base.typ, ctx, n)
-          else: mRegType()
+          let base = parseOperandM(n, ctx)
+          if base.kind == okMem:
+            # A stack variable used as a base: its slot IS the address.
+            result.mem = base.mem
+          elif base.kind notin {okReg, okArg}:
+            error("(mem ...) base must be a register", n)
+          else:
+            result.mem = thumb2.MemoryOperand(base: base.reg, offset: 0)
+          if n.hasMore and n.kind == TagLit and n.tag == ArgTagId:
+            # `(mem (sp) (arg name))` — the slot of an OUTGOING stack argument.
+            let argOff = parseOperandM(n, ctx)
+            if argOff.kind != okImm:
+              error("(arg ...) in mem must denote a stack argument", n)
+            result.mem.offset += int32(argOff.immVal)
+          elif n.hasMore and n.kind == IntLit:
+            result.mem.offset += int32(getInt(n))
+            inc n
+          elif n.hasMore and n.kind == Symbol:
+            # A stack PARAMETER's name: its offset in the incoming argument area.
+            let fname = getSym(n)
+            let fsym = lookupWithAutoImport(ctx, ctx.scope, fname, n)
+            if fsym == nil: error("Unknown symbol in (mem ...): " & fname, n)
+            result.mem.offset += int32(fsym.offset)
+            inc n
+          result.kind = okMem
+          result.typ =
+            if base.kind == okMem and base.typ != nil and
+               base.typ.kind == TypeKind.StackOffT:
+              base.typ.offType
+            elif base.typ != nil and base.typ.kind in {TypeKind.PtrT, TypeKind.AptrT}:
+              resolvedBase(base.typ, ctx, n)
+            else: mRegType()
         while n.hasMore: skip n
       return
     else:
@@ -4748,6 +4772,37 @@ proc genJtrueM(n: var Cursor; ctx: var GenContext) =
   let flagTag = tagToX64Flag(n.tag)
   inc n
   ctx.emitBranchM(condOfFlagM(flagTag, n), target)
+
+proc bindRegM(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
+              reg: thumb2.Register) =
+  ## Bind `reg` to the typed name `name`, KILLING its prior tenant first — so a
+  ## later use of a value wrongly left in that register is an "Unknown symbol"
+  ## error rather than a silent clobber. The "(re)bind implies a kill" rule that
+  ## `rebind` and `withreg` share; mirrors `bindRegA64`/`bindRegX64`.
+  if reg in ctx.mRegBindings:
+    ctx.scope.undefine(ctx.symIdOf(ctx.mRegBindings[reg]))
+    ctx.mRegBindings.del(reg)
+  ctx.clobberedM.excl(reg)   # a fresh binding abandons a prior call's clobber
+  let sym = Symbol(name: ctx.symIdOf(name), kind: skVar, typ: typ)
+  sym.reg = regTag
+  ctx.mRegBindings[reg] = name
+  ctx.scope.define(sym)
+
+proc parseRebindHeaderM(n: var Cursor; ctx: var GenContext):
+                       tuple[name: string; reg: thumb2.Register] =
+  ## Parse `:name TYPE (reg)` (cursor already inside the node) and establish the
+  ## binding. Shared by `rebind` and `withreg`.
+  if n.kind != SymbolDef: error("Expected name for rebind/withreg", n)
+  let name = symName(n); inc n
+  let typ = parseType(n, ctx.scope, ctx)
+  checkRegWidthM(typ, "rebind of '" & name & "'", n)
+  if n.kind != TagLit or not rawTagIsMReg(n.tag):
+    error("Expected a register for rebind/withreg", n)
+  let regTag = n.tag
+  let reg = tagToRegisterM(regTag, n)
+  inc n
+  bindRegM(ctx, name, typ, regTag, reg)
+  result = (name, reg)
 
 const MCallClobbers = {thumb2.R0 .. thumb2.R3, thumb2.IP, thumb2.LR}
   ## What a call destroys under AAPCS32: r0–r3 (arguments and return), r12 (IP,
@@ -5109,6 +5164,20 @@ proc genInstM(n: var Cursor; ctx: var GenContext) =
       br = ctx.scratchM(ar)
       ctx.loadToRegM(br, b, start)
     thumb2.emitTstReg(ctx.buf.data, ar, br)
+  of OrrM: bin2(thumb2.emitOrr3)
+  of EorM: bin2(thumb2.emitEor3)
+  of LslM: bin2(thumb2.emitLsl)
+  of LsrM: bin2(thumb2.emitLsr)
+  of AsrM: bin2(thumb2.emitAsr)
+  # The W-forms are AArch64's 32-bit views of a 64-bit register. On Cortex-M a
+  # register IS 32 bits, so each is simply its full-width counterpart — accepted
+  # rather than rejected so the code generator need not know the difference.
+  of AddwM: bin2(thumb2.emitAdd3)
+  of SubwM: bin2(thumb2.emitSub3)
+  of MulwM: bin2(thumb2.emitMul)
+  of Addw3M: bin3(thumb2.emitAdd3)
+  of Subw3M: bin3(thumb2.emitSub3)
+  of Mulw3M: bin3(thumb2.emitMul)
   of AddM: bin2(thumb2.emitAdd3)
   of SubM: bin2(thumb2.emitSub3)
   of MulM: bin2(thumb2.emitMul)
@@ -5172,6 +5241,39 @@ proc genInstM(n: var Cursor; ctx: var GenContext) =
   of StrhM:  loadStore(thumb2.MemHalf, false, false)
   of LdrsbM: loadStore(thumb2.MemByte, true, true)
   of LdrshM: loadStore(thumb2.MemHalf, true, true)
+  of RebindM:
+    # `(rebind :name TYPE (reg))` — bind until an explicit kill, the next rebind
+    # of the same register, or proc end.
+    into n:
+      discard parseRebindHeaderM(n, ctx)
+  of WithregM:
+    # `(withreg :name TYPE (reg) body…)` — a block-scoped rebind, auto-killed at
+    # the end of the body.
+    into n:
+      let h = parseRebindHeaderM(n, ctx)
+      while n.hasMore: genInstM(n, ctx)
+      if ctx.mRegBindings.getOrDefault(h.reg, "") == h.name:
+        ctx.mRegBindings.del(h.reg)
+      ctx.scope.undefine(ctx.symIdOf(h.name))
+  of BeqM, BneM, BhsM, BloM, BltM, BlsM, BhiM, BgtM, BgeM, BleM:
+    # The per-condition branch forms the code generator emits directly (as
+    # opposed to `ite`/`jtrue`, which take a flag tag). Each maps to one Thumb
+    # condition; the ±1 MB reach of B<cond>.W is the relocation's problem.
+    inc n
+    if n.kind != Symbol: error("conditional branch needs a label", start)
+    let lbl = parseOperandM(n, ctx)
+    let cond = case instTag
+               of BeqM: thumb2.CondEQ
+               of BneM: thumb2.CondNE
+               of BhsM: thumb2.CondHS
+               of BloM: thumb2.CondLO
+               of BltM: thumb2.CondLT
+               of BlsM: thumb2.CondLS
+               of BhiM: thumb2.CondHI
+               of BgtM: thumb2.CondGT
+               of BgeM: thumb2.CondGE
+               else: thumb2.CondLE
+    thumb2.emitBcond(ctx.buf, cond, lbl.label)
   of PrepareM: genPrepareM(n, ctx)
   of CallM: genCallMarkerM(n, ctx)
   of IteM:  genIteM(n, ctx)

@@ -87,6 +87,9 @@ proc setTargetWord*(t: TargetWord) =
 proc wordSize*(): int {.inline.} = targetWord.ptrSize
 proc wordAlign*(): int {.inline.} = targetWord.ptrAlign
 proc maxScalarSize*(): int {.inline.} = targetWord.maxScalar
+proc wordBits*(): int {.inline.} = targetWord.ptrSize * 8
+  ## The native register width in BITS — what a temp or a raw register operand is
+  ## declared at in the emitted asm-NIF. 64 on x86-64 and AArch64, 32 on Cortex-M.
 
 proc kind*(s: AsmSlot): AsmTypeKind {.inline.} =
   ## The value class of this slot. An accessor (not a field) on purpose: the goal

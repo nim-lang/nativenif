@@ -1,0 +1,44 @@
+(.nif27)
+(.indexat 722              )
+(stmts
+ (proc :deep.0
+  (params)
+  (i 32).
+  (stmts
+   (ret
+    (sub
+     (i 32)200
+     (sub
+      (i 32)17
+      (sub
+       (i 32)33
+       (sub
+        (i 32)8
+        (sub
+         (i 32)91
+         (sub
+          (i 32)4
+          (sub
+           (i 32)60
+           (sub
+            (i 32)7
+            (sub
+             (i 32)25
+             (sub
+              (i 32)9
+              (sub
+               (i 32)50
+               (sub
+                (i 32)3
+                (sub
+                 (i 32)19
+                 (sub
+                  (i 32)11 5)))))))))))))))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (ret
+    (call deep.0)))))(.index)

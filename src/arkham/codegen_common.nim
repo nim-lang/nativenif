@@ -138,6 +138,16 @@ type
                                              ## aggregate
     retIndirect*: bool                       ## return type is >16B (x8 indirect result)
     isEntryProc*: bool                       ## the proc currently emitted is the entry
+    thumbM*: bool                            ## the SAME emitter, targeting Cortex-M
+                                             ## (ARMv7E-M) instead of AArch64. The two
+                                             ## share the asm-NIF vocabulary by design —
+                                             ## `add3`, `cmp`, `beq`, `ldr`, `adr` mean
+                                             ## the same thing on both — so what differs
+                                             ## is the register file (`md`), the word
+                                             ## size (`slots.setTargetWord`), and the
+                                             ## features Cortex-M does not have, which
+                                             ## are rejected by name rather than
+                                             ## silently mis-emitted.
     a64Linux*: bool                          ## a64 backend: target Linux/ELF (svc-based
                                              ## syscalls, no Darwin TLV/dyld) instead of
                                              ## the default Darwin/Mach-O — lets the arm64

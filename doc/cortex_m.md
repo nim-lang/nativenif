@@ -9,7 +9,7 @@ Status: **M0, M1, M2a/b complete; M2c in progress.**
 | M2a Thumb-2 encoder + relocations | done — `src/nifasm/thumb2.nim`, 45-check self-test |
 | M2b ELF32 firmware writer | done — `src/nifasm/elf32.nim` |
 | M2c assembler integration | done — selector, frames, calls, marshalling |
-| M3 arkham backend | not started |
+| M3 arkham backend | **working** — 80 Leng fixtures run end to end |
 | M4 64-bit integers | not started |
 | M5 floating point | not started |
 | M6 embedded features | not started |
@@ -161,8 +161,22 @@ fixtures, 225 `importc "exit"` and 3 `importc "write"`.
 * **M2 — nifasm: `thumb2.nim` + bare-metal ELF32.** New `RelocKind`s for Thumb
   branches; note Thumb's PC is `insn_addr + 4` and `B.W`/`BL` use the split
   J1/J2 encoding, so `calculateRelocDistance` needs its own arm.
-* **M3 — arkham: `machine_m.nim` + `codegen_m.nim`.** 32-bit scalars first;
-  `(i 64)` and floats error out by name. New corpus `tests/arkham_m/`.
+* **M3 — the arkham backend.** Done for 32-bit scalars, pointers, control flow,
+  calls, globals and small aggregates: `tests/arkham_m/` holds 80 Leng fixtures
+  that compile, assemble and run under QEMU with the right exit code.
+
+  There is NO `codegen_m.nim`. `codegen_a64.nim` serves both targets, driven by
+  `md`, `slots.setTargetWord` and a `thumbM` flag — the asm-NIF vocabulary is
+  shared by design (`add3`, `cmp`, `beq`, `ldr`, `adr` mean the same on both),
+  so a third backend needs a register file and a word size, not a second
+  emitter. Reimplementing the fused value core would have meant reimplementing
+  its register-binding protocol, which is the part with a formal model behind it
+  (`proofs/arkham_bindings.tla`).
+
+  A bare-metal entry proc cannot RETURN — `lr` at reset holds no valid address —
+  so the entry tail-calls a semihosting exit shim (`` `mexit.0 ``) that every
+  image carries. `importc "exit"` and `importc "write"` become semihosting shims
+  too, called like ordinary procs; anything else `importc`'d is refused by name.
 * **M4 — 64-bit integers as register pairs.** `adds`/`adcs`, `umull`+`mla`,
   `__aeabi_ldivmod`. Un-skips most of the existing 236-fixture corpus (206 of
   them declare `(i 64)`).

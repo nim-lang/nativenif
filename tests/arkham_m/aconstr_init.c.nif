@@ -1,0 +1,36 @@
+(.nif27)
+(.indexat 541              )
+(stmts
+ (type :IntArr4.0 .
+  (array
+   (i 32)4))
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :x.0 .
+    (i 32)20)
+   (var :a.0 . IntArr4.0
+    (aconstr IntArr4.0 10 x.0
+     (add
+      (i 32)x.0 -8)0))
+   (call exit.0
+    (add
+     (i 32)
+     (add
+      (i 32)
+      (at a.0 0)
+      (at a.0 1))
+     (add
+      (i 32)
+      (at a.0 2)
+      (at a.0 3)))))))(.index)

@@ -23,6 +23,9 @@ import tagpool               # nifasm: the seeded tag pool (and its escape tag)
 import machine               # arkham: Reg, regName
 import peephole              # the finished-shape rewrites, applied in `render`
 export A64Inst, X64Inst, NifasmDecl, NifasmType, NifasmExpr, X64Flag
+export MInst   # the Cortex-M-only mnemonics (`bkpt`, `bx`, `uxtb`, …). Everything
+               # else the Cortex-M target uses is spelled with the SHARED tags, so
+               # `A64Inst` covers it — see doc/instructions.md.
 
 type
   AsmBuf* = object

@@ -952,12 +952,58 @@ proc cortexMAsmTests() =
   echo passed, " / ", fixtures.len, " Cortex-M assembler tests successful"
 
 
+proc arkhamCortexMTests() =
+  ## The Cortex-M end-to-end pass: Leng `.c.nif` → arkham → nifasm → firmware →
+  ## QEMU, checking each fixture's exit code.
+  ##
+  ## `tests/arkham_m/` is its OWN corpus, mechanically derived from
+  ## `tests/arkham/` with the 64-bit scalars rewritten to 32-bit. It has to be
+  ## separate: 206 of the 236 originals declare `(i 64)`, which on a 32-bit
+  ## target needs the register-pair lowering that is milestone M4. The corpus
+  ## grows as features land rather than carrying a skip list the size of itself.
+  let qemu = findExe(cortexMQemu)
+  if qemu.len == 0:
+    echo cortexMQemu, " not found - skipping arkham Cortex-M tests"
+    return
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  var total = 0
+  var passed = 0
+  for file in walkFiles("tests/arkham_m/*.c.nif"):
+    let stem = file.extractFilename.replace(".c.nif", "")
+    let expectedCode = parseInt(readFile("tests" / "arkham_m" / (stem & ".exitcode")).strip())
+    inc total
+    let asmFile = "tests" / "arkham_m" / (stem & ".asm.nif")
+    let exe = "tests" / "arkham_m" / (stem & ".elf")
+    let (ao, ac) = execCmdEx(quoteShell(arkham) & " -a:cortex_m -o:" &
+                             quoteShell(asmFile) & " " & quoteShell(file))
+    if ac != 0: quit "FAILURE arkham (cortex_m codegen) " & file & "\n" & ao
+    let (no, nc) = execCmdEx(quoteShell(nifasmExe) & " -o:" & quoteShell(exe) & " " &
+                             quoteShell(asmFile))
+    if nc != 0: quit "FAILURE nifasm (cortex_m assemble) " & file & "\n" & no
+    var args: seq[string] = @[]
+    for a in cortexMArgs: args.add a
+    args.add exe
+    let (po, pc) = runProgram(qemu, args)
+    if pc == timeoutExitCode:
+      quit "FAILURE (cortex-m) TIMEOUT after " & $(runTimeoutMs div 1000) &
+           "s for " & file & "\n"
+    if pc != expectedCode:
+      quit "FAILURE (cortex-m) exitcode " & $expectedCode & " but got " & $pc &
+           " for " & file & "\n" & po
+    removeFile asmFile
+    removeFile exe
+    inc passed
+  echo passed, " / ", total, " arkham cortex-m (qemu) tests successful"
+
+
 vgClientRequestEncodingTests()
 
 # Cortex-M: encoder-level coverage. Host-independent — it only needs
 # qemu-system-arm, so it runs wherever that is installed.
 thumb2SelfTest()
 cortexMAsmTests()
+arkhamCortexMTests()
 
 # arkham native-codegen tests: arkham emits the host arch (x86-64 on Linux,
 # AArch64/Darwin on macOS), so we run them only where the binaries execute.

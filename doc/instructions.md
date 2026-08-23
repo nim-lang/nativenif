@@ -52,14 +52,14 @@
 | `(lsl3 D A B)`         | A64Inst, MInst | 3-operand logical shift left (D = A shl B) |
 | `(lsr3 D A B)`         | A64Inst, MInst | 3-operand logical shift right (D = A shr B) |
 | `(asr3 D A B)`         | A64Inst, MInst | 3-operand arithmetic shift right (D = A sar B) |
-| `(addw D S)`           | A64Inst                  | 32-bit add (W-form, result zero-extended) |
-| `(subw D S)`           | A64Inst                  | 32-bit subtract (W-form, result zero-extended) |
-| `(mulw D S)`           | A64Inst                  | 32-bit multiply (W-form, result zero-extended) |
-| `(addw3 D A B)`        | A64Inst                  | 32-bit 3-operand add (D = A + B, W-form) |
-| `(subw3 D A B)`        | A64Inst                  | 32-bit 3-operand subtract (D = A - B, W-form) |
-| `(mulw3 D A B)`        | A64Inst                  | 32-bit 3-operand multiply (D = A * B, W-form) |
-| `(gload D S)`          | A64Inst                  | load scalar from global S: adrp + folded ldr (drops the address `add`) |
-| `(gstore D S)`         | A64Inst                  | store scalar D to global S: adrp + folded str |
+| `(addw D S)`           | A64Inst, MInst | 32-bit add (W-form, result zero-extended) |
+| `(subw D S)`           | A64Inst, MInst | 32-bit subtract (W-form, result zero-extended) |
+| `(mulw D S)`           | A64Inst, MInst | 32-bit multiply (W-form, result zero-extended) |
+| `(addw3 D A B)`        | A64Inst, MInst | 32-bit 3-operand add (D = A + B, W-form) |
+| `(subw3 D A B)`        | A64Inst, MInst | 32-bit 3-operand subtract (D = A - B, W-form) |
+| `(mulw3 D A B)`        | A64Inst, MInst | 32-bit 3-operand multiply (D = A * B, W-form) |
+| `(gload D S)`          | A64Inst, MInst | load scalar from global S: adrp + folded ldr (drops the address `add`) |
+| `(gstore D S)`         | A64Inst, MInst | store scalar D to global S: adrp + folded str |
 | `(addsd D S)`          | X64Inst                  | add scalar double |
 | `(subsd D S)`          | X64Inst                  | subtract scalar double |
 | `(mulsd D S)`          | X64Inst                  | multiply scalar double |
@@ -81,16 +81,16 @@
 | `(movfd D S)`          | X64Inst                  | move 32 bits between gpr and xmm |
 | `(and D S)`            | X64Inst, A64Inst, MInst | bitwise and |
 | `(or D S)`             | X64Inst                  | bitwise or |
-| `(orr D S)`            | A64Inst                  | bitwise or |
+| `(orr D S)`            | A64Inst, MInst | bitwise or |
 | `(xor D S)`            | X64Inst                  | bitwise xor |
-| `(eor D S)`            | A64Inst                  | bitwise xor |
+| `(eor D S)`            | A64Inst, MInst | bitwise xor |
 | `(shl D S)`            | X64Inst                  | shift left |
-| `(lsl D S)`            | A64Inst                  | logical shift left |
+| `(lsl D S)`            | A64Inst, MInst | logical shift left |
 | `(shr D S)`            | X64Inst                  | shift right |
-| `(lsr D S)`            | A64Inst                  | logical shift right |
+| `(lsr D S)`            | A64Inst, MInst | logical shift right |
 | `(sal D S)`            | X64Inst                  | shift arithmetic left |
 | `(sar D S)`            | X64Inst                  | shift arithmetic right |
-| `(asr D S)`            | A64Inst                  | arithmetic shift right |
+| `(asr D S)`            | A64Inst, MInst | arithmetic shift right |
 | `(inc O)`              | X64Inst                  | increment |
 | `(dec O)`              | X64Inst                  | decrement |
 | `(neg O)`              | X64Inst, A64Inst, MInst | negate |
@@ -198,21 +198,21 @@
 | `(ldp D1 D2 S)`        | A64Inst                  | load pair |
 | `(b L)`                | A64Inst, MInst | branch (unconditional jump) |
 | `(bl L)`               | A64Inst, MInst | branch with link (function call) |
-| `(beq L)`              | A64Inst                  | branch if equal |
-| `(bne L)`              | A64Inst                  | branch if not equal |
-| `(blt L)`              | A64Inst                  | branch if less than (signed) |
-| `(ble L)`              | A64Inst                  | branch if less or equal (signed) |
-| `(bgt L)`              | A64Inst                  | branch if greater than (signed) |
-| `(bge L)`              | A64Inst                  | branch if greater or equal (signed) |
-| `(blo L)`              | A64Inst                  | branch if lower (unsigned <) |
-| `(bls L)`              | A64Inst                  | branch if lower or same (unsigned <=) |
-| `(bhi L)`              | A64Inst                  | branch if higher (unsigned >) |
-| `(bhs L)`              | A64Inst                  | branch if higher or same (unsigned >=) |
+| `(beq L)`              | A64Inst, MInst | branch if equal |
+| `(bne L)`              | A64Inst, MInst | branch if not equal |
+| `(blt L)`              | A64Inst, MInst | branch if less than (signed) |
+| `(ble L)`              | A64Inst, MInst | branch if less or equal (signed) |
+| `(bgt L)`              | A64Inst, MInst | branch if greater than (signed) |
+| `(bge L)`              | A64Inst, MInst | branch if greater or equal (signed) |
+| `(blo L)`              | A64Inst, MInst | branch if lower (unsigned <) |
+| `(bls L)`              | A64Inst, MInst | branch if lower or same (unsigned <=) |
+| `(bhi L)`              | A64Inst, MInst | branch if higher (unsigned >) |
+| `(bhs L)`              | A64Inst, MInst | branch if higher or same (unsigned >=) |
 | `(cbz S L)`            | A64Inst, MInst | branch to L if S is zero (no flags read) |
 | `(cbnz S L)`           | A64Inst, MInst | branch to L if S is non-zero (no flags read) |
 | `(cseleq D S1 S2)`     | A64Inst                  | conditional select: D = if equal then S1 else S2 |
 | `(cselne D S1 S2)`     | A64Inst                  | conditional select: D = if not equal then S1 else S2 |
-| `(csellt D S1 S2)`     | A64Inst                  | conditional select: D = if less than (signed) then S1 else S2 |
+| `(csellt D S1 S2)`     | A64Inst, MInst | conditional select: D = if less than (signed) then S1 else S2 |
 | `(cselle D S1 S2)`     | A64Inst                  | conditional select: D = if less or equal (signed) then S1 else S2 |
 | `(cselgt D S1 S2)`     | A64Inst                  | conditional select: D = if greater than (signed) then S1 else S2 |
 | `(cselge D S1 S2)`     | A64Inst                  | conditional select: D = if greater or equal (signed) then S1 else S2 |
@@ -479,8 +479,8 @@
 | `(fldp D1 D2 S O)`  | A64Inst                 | fp load pair (post-indexed) |
 | `(ldrb D B I)`      | A64Inst, MInst | load byte (zero-extend), register offset [B,I] |
 | `(strb D B I)`      | A64Inst, MInst | store low byte, register offset [B,I] |
-| `(rebind D T S)`    | X64Inst, A64Inst        | bind a phys reg to a typed name, killing its prior tenant |
-| `(withreg D T S ...)` | X64Inst, A64Inst      | block-scoped rebind; auto-killed at block end |
+| `(rebind D T S)`    | X64Inst, A64Inst, MInst | bind a phys reg to a typed name, killing its prior tenant |
+| `(withreg D T S ...)` | X64Inst, A64Inst, MInst | block-scoped rebind; auto-killed at block end |
 | `(regs ...)`          | NifasmDecl                  | multi-register param/result location: `(regs (rdi) (rsi))` |
 | `(bswap D N)`         | X64Inst                     | reverse byte order of D in place; `N` is the operand size in bits (32 or 64) |
 | `(scope ...)`         | X64Inst, A64Inst, MInst | statement block with a reclaimable stack-slot arena: `(s)` locals declared inside are freed at scope end so sibling scopes reuse the frame bytes |
