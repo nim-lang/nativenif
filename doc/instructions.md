@@ -208,6 +208,8 @@
 | `(bls L)`              | A64Inst                  | branch if lower or same (unsigned <=) |
 | `(bhi L)`              | A64Inst                  | branch if higher (unsigned >) |
 | `(bhs L)`              | A64Inst                  | branch if higher or same (unsigned >=) |
+| `(cbz S L)`            | A64Inst                  | branch to L if S is zero (no flags read) |
+| `(cbnz S L)`           | A64Inst                  | branch to L if S is non-zero (no flags read) |
 | `(cseleq D S1 S2)`     | A64Inst                  | conditional select: D = if equal then S1 else S2 |
 | `(cselne D S1 S2)`     | A64Inst                  | conditional select: D = if not equal then S1 else S2 |
 | `(csellt D S1 S2)`     | A64Inst                  | conditional select: D = if less than (signed) then S1 else S2 |

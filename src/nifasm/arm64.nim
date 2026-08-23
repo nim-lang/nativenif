@@ -586,6 +586,20 @@ proc emitBne*(dest: var Buffer; target: LabelId) =
   dest.data.addUint32(0x54000001'u32)  # Placeholder, condition=0001 (NE)
   dest.addReloc(pos, target, rkBNE, 4)
 
+proc emitCbz*(dest: var Buffer; rt: Register; target: LabelId) =
+  ## CBZ Xt, target — branch when Xt is zero. Reads no flags and sets none, so it
+  ## replaces a `cmp Xt, #0` + `b.eq` pair outright. 64-bit form (sf=1).
+  let pos = dest.data.getCurrentPosition()
+  dest.data.addUint32(0xB4000000'u32 or encodeReg(rt))
+  dest.addReloc(pos, target, rkCBZ, 4)
+
+proc emitCbnz*(dest: var Buffer; rt: Register; target: LabelId) =
+  ## CBNZ Xt, target — the non-zero twin of `emitCbz`. Differs only in bit 24, which
+  ## is the bit `relocs.invertCondBytes` flips to turn one into the other.
+  let pos = dest.data.getCurrentPosition()
+  dest.data.addUint32(0xB5000000'u32 or encodeReg(rt))
+  dest.addReloc(pos, target, rkCBNZ, 4)
+
 # Signed ordering conditional branches. All B.cond share the imm19 patch
 # (rkBEQ); the condition code is baked into the placeholder.
 proc emitBlt*(dest: var Buffer; target: LabelId) =
