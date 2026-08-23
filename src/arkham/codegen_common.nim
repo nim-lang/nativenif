@@ -16,7 +16,7 @@
 import std / [tables, sets, assertions, algorithm, strutils, os]
 import symparser
 import nifcore, nifcdecl
-import slots, machinedesc, analyser, planer, programs
+import slots, machinedesc, analyser, planer, programs, abi
 import asmbuf
 import typenav
 export typenav   # SymCat / SymInfo / getType / exprSlot moved here; re-export so
@@ -138,6 +138,15 @@ type
                                              ## aggregate
     retIndirect*: bool                       ## return type is >16B (x8 indirect result)
     isEntryProc*: bool                       ## the proc currently emitted is the entry
+    helperCalls*: bool                       ## Cortex-M: the proc being emitted calls a
+                                             ## runtime helper (the 64-bit divider) with a
+                                             ## bare `bl`. `bl` overwrites lr, and nothing
+                                             ## in the analyser's view of a `div` node says
+                                             ## "call" — so the frame has to be forced from
+                                             ## here. Reset per proc; read by `computeFrame`.
+    needsUDiv64*, needsSDiv64*: bool         ## Cortex-M, MODULE-scope: emit the 64-bit
+                                             ## division routines, and only if something
+                                             ## divides
     thumbM*: bool                            ## the SAME emitter, targeting Cortex-M
                                              ## (ARMv7E-M) instead of AArch64. The two
                                              ## share the asm-NIF vocabulary by design —
@@ -527,14 +536,21 @@ proc getType*(g: var CodeGen; c: Cursor): Cursor {.inline.} =
 proc exprSlot*(g: var CodeGen; c: Cursor): AsmSlot {.inline.} =
   g.typeCtx.exprSlot(c)
 
-let ScalarSlot* = AsmSlot(cls: AInt, size: 8, align: 8)
+template ScalarSlot*(): AsmSlot =
+  ## The dont-care scalar placeholder: an integer of REGISTER width. A
+  ## template rather than a `let` because a module-level `let` is evaluated
+  ## before the backend entry point calls `setTargetWord`, so it would snapshot
+  ## the 64-bit default and describe every Cortex-M scratch as eight bytes —
+  ## which is exactly how a 32-bit dont-care becomes indistinguishable from a
+  ## genuine 64-bit value (`isWideSlot`).
+  ##
   ## THE dont-care scalar slot: one full integer register, carrying no Leng type
   ## cursor. Not a missing type — it is arkham's canonical register form for an
   ## integer, whose width lives in explicit extends rather than in the register.
-  ## See `valueSlot` for when a value may take it and when it may not. No consumer of
-  ## an `InReg`/`Imm` value reads `.typ`, so it is also the register/immediate
-  ## dont-care result. A `let` (not `const`) because `AsmSlot` holds a `Cursor`.
-  ## (Both backends used to define this separately.)
+  ## See `valueSlot` for when a value may take it and when it may not. No consumer
+  ## of an `InReg`/`Imm` value reads `.typ`, so it is also the register/immediate
+  ## dont-care result. (Both backends used to define this separately.)
+  AsmSlot(cls: AInt, size: wordSize(), align: wordAlign())
 
 proc slotIsPointer*(g: var CodeGen; s: AsmSlot): bool =
   ## Does `s` describe a POINTER-KIND value — a real `(ptr T)`/`(aptr T)`/`(proctype …)`,
@@ -1846,3 +1862,27 @@ proc isFoldableMemLeaf*(g: var CodeGen; n: Cursor): bool {.inline.} =
   ## IS a GPR, so folding it as `[mem]` would address a stack slot that does
   ## not exist.
   isMemLeaf(n) and g.pairFieldReg(n) == NoReg
+
+proc calleeParamSlots*(g: var CodeGen; fsym: string; tgt: CallTarget): seq[AsmSlot] =
+  ## The DECLARED parameter slots of a call target, from its `(proctype …)`
+  ## signature — empty when the target carries none (an indirect call built
+  ## without one, an intrinsic).
+  ##
+  ## The call site needs these because an argument expression's own type and the
+  ## parameter's declared type may differ in width, and it is the CALLEE that
+  ## decides the ABI. On a target where every scalar is one register that
+  ## difference is invisible; where a scalar can span two, it is the difference
+  ## between staging one register and staging two.
+  result = @[]
+  discard fsym
+  if cursorIsNil(tgt.sigType): return
+  var q = tgt.sigType
+  if q.kind != TagLit: return
+  var slots: seq[AsmSlot] = @[]
+  q.into:                    # (proctype . <params> <ret> <pragmas>) — see procSigType
+    skip q                             # the name slot a proctype does not have
+    if q.hasMore:
+      if q.kind == TagLit: slots = paramSlots(g.prog, q)
+      skip q
+    while q.hasMore: skip q
+  result = slots

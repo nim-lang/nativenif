@@ -129,11 +129,31 @@ proc wForm(op: A64Inst): A64Inst =
   of MulA64: MulwA64
   else: op
 
+proc destructive3(g: CodeGen; op: A64Inst): bool {.inline.} =
+  ## Ops whose 2-operand `D op= S` spelling AArch64 accepts but Cortex-M does
+  ## not: Thumb-2's `sdiv`/`udiv` are three-operand instructions and nifasm
+  ## parses them as such, so the same tag has to arrive with `D` repeated.
+  g.thumbM and op in {SdivA64, UdivA64}
+
 proc binReg(g: var CodeGen; op: A64Inst; d, s: Reg; w32 = false) =
-  g.ab.tree (if w32: wForm(op) else: op): g.emReg d; g.emReg s
+  if g.destructive3(op):
+    g.ab.tree op: (g.emReg d; g.emReg d; g.emReg s)
+  else:
+    g.ab.tree (if w32: wForm(op) else: op): g.emReg d; g.emReg s
 
 proc binImm(g: var CodeGen; op: A64Inst; d: Reg; v: int64; w32 = false) =
-  g.ab.tree (if w32: wForm(op) else: op): g.emReg d; g.ab.intLit v
+  if g.destructive3(op):
+    g.ab.tree op: (g.emReg d; g.emReg d; g.ab.intLit v)
+  else:
+    g.ab.tree (if w32: wForm(op) else: op): g.emReg d; g.ab.intLit v
+
+proc emNeg(g: var CodeGen; d: Reg) =
+  ## `d = -d`. AArch64 spells the destructive form with one operand; Thumb-2's
+  ## `neg`/`rsb` names its source, so the register is repeated there.
+  if g.thumbM:
+    g.ab.tree NegA64: (g.emReg d; g.emReg d)
+  else:
+    g.ab.tree NegA64: g.emReg d
 
 # 3-operand forms `(op3 D A B)` → `D = A op B` (arm64 native, non-destructive). Used
 # when the left source `A` is a still-live local in a register distinct from the
@@ -180,10 +200,29 @@ proc emStlr(g: var CodeGen; rt, rn: Reg; bits = 64) =   # release store rt→[rn
   g.ab.tree StlrA64:
     g.emReg rt; g.emReg rn
     if bits != 64: g.ab.intLit bits
+proc emByteAt(g: var CodeGen; base, idx: Reg) =
+  ## `(mem (at (cast (aptr (u 8)) base) idx))` — the byte at `base[idx]`.
+  g.ab.tree MemX:
+    g.ab.tree AtX:
+      g.ab.tree CastX:
+        g.ab.aptrType: g.ab.uintType(8)
+        g.emReg base
+      g.emReg idx
+
 proc emLdrb(g: var CodeGen; rt, base, idx: Reg) =  # rt ← zero-extended byte [base+idx]
-  g.ab.tree LdrbA64: g.emReg rt; g.emReg base; g.emReg idx
+  # AArch64 spells the register-offset byte access as three registers; Thumb-2's
+  # `ldrb`/`strb` take a memory OPERAND (and put the destination first either
+  # way), so the index is folded into an `(at …)` instead. Same instruction,
+  # different operand shape — see `genInstM`'s `loadStore`.
+  if g.thumbM:
+    g.ab.tree LdrbA64: (g.emReg rt; g.emByteAt(base, idx))
+  else:
+    g.ab.tree LdrbA64: g.emReg rt; g.emReg base; g.emReg idx
 proc emStrb(g: var CodeGen; rt, base, idx: Reg) =  # store low byte of rt → [base+idx]
-  g.ab.tree StrbA64: g.emReg rt; g.emReg base; g.emReg idx
+  if g.thumbM:
+    g.ab.tree StrbA64: (g.emByteAt(base, idx); g.emReg rt)
+  else:
+    g.ab.tree StrbA64: g.emReg rt; g.emReg base; g.emReg idx
 
 proc emQwordAt(g: var CodeGen; base, idx: Reg) =
   ## `(mem (at (cast (aptr (u 64)) base) idx))` — the quadword at `base[idx]`.
@@ -437,6 +476,32 @@ proc genTypeBody(g: var CodeGen; c: var Cursor)
 proc genPointee(g: var CodeGen; c: var Cursor)
 proc genProctypeSig(g: var CodeGen; c: var Cursor)
 proc indirectRetType(g: var CodeGen; gvarDecl: Cursor): Cursor
+
+# ── 64-bit scalars on Cortex-M (M4) ─────────────────────────────────────────
+# Defined in the INCLUDED `codegen_m64.nim` at the end of this file, because
+# they need the whole value core they dispatch out of. Every one of these is a
+# no-op on the 64-bit targets: `isWideSlot` is false there by construction, so
+# not one of the call sites below can fire.
+proc isWideSlot(g: CodeGen; s: AsmSlot): bool {.inline.}
+proc isWideExpr(g: var CodeGen; c: Cursor): bool {.inline.}
+proc isWideType(g: var CodeGen; t: Cursor): bool {.inline.}
+proc emitWideAsLoc(g: var CodeGen; c: Cursor; dest: var Location)
+proc emitWideIntoLoc(g: var CodeGen; c: Cursor; dst: Location)
+proc emitWideCmpE(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
+                  whenTrue: bool): A64Inst
+proc emitWideToNarrow(g: var CodeGen; innerC, targetC: Cursor;
+                      dest: var Location)
+proc wideRet(g: var CodeGen; c: Cursor)
+proc wideArgToRegs(g: var CodeGen; slotName: string; firstArg: int)
+proc wideArgToStack(g: var CodeGen; slotName, paramNm: string)
+proc wideParamToHome(g: var CodeGen; nm: string; firstArg: int)
+proc wideArgTruncated(g: var CodeGen; slotName: string; dest: Reg)
+proc wideValueIntoTemp(g: var CodeGen; valC: Cursor): string
+proc wideCopyToAddr(g: var CodeGen; slotName: string; addrReg: Reg)
+proc emitUDivMod64(g: var CodeGen)
+proc emitSDivMod64(g: var CodeGen)
+proc emWideStackVar(g: var CodeGen; name: string)
+
 proc emFieldMem(g: var CodeGen; base, field: string) =
   ## `(mem (dot base field))` — nifasm resolves the field offset from the
   ## aggregate's type. `base` is a `(s)` stack var.
@@ -838,9 +903,11 @@ proc genProctypeSig(g: var CodeGen; c: var Cursor) =
                 c.into:                         # (param :name pragmas type)
                   inc c                         # name → positional pN.0
                   skip c                        # pragmas
-                  if pl.isAgg:
+                  if pl.isAgg or pl.isWideScalar:
                     # Aggregate param: >16B by-ref pointer in one x-reg, ≤16B by-value
                     # over `pl.words` consecutive x-regs (`(arg pN k)` selects word k).
+                    # A scalar too wide for one register (`(i 64)` on Cortex-M) takes
+                    # the same `(regs …)` form and for the same reason.
                     g.ab.tree ParamD:
                       g.ab.symDef paramName(pl.ord)
                       g.ab.tree RegsD:
@@ -863,6 +930,8 @@ proc genProctypeSig(g: var CodeGen; c: var Cursor) =
           # The RetType is always the node after Params (a `.`/`(void)` for void).
           if retIsVoid(c) or retByRef:
             skip c                              # void, or returned via the x8 indirect pointer
+          elif g.isWideSlot(slotOf(g.prog, c)):
+            skip c                              # 64-bit result: r0:r1 raw (see emitSignature)
           elif slotOf(g.prog, c).kind == AMem:
             # ≤16B by-value aggregate result → x0:x1 raw, EMPTY result slot (see
             # emitSignature): the caller reads the return registers directly.
@@ -1331,6 +1400,11 @@ proc computeFrame(g: var CodeGen; hasCall: bool) =
   # a frame — a leaf with more arguments than registers is exactly that shape.
   g.hasFrame = hasCall or g.frameRegs.len > 0 or g.frameFRegs.len > 0 or
                g.plan.hasStackParams
+  if g.thumbM and g.plan.hasStackParams:
+    # `emIncomingArgBase` reads the caller's SP as `sp + (ssize) + pushes`, which
+    # is only true if that `sub sp, (ssize)` was actually emitted. Force it; when
+    # the frame is empty it is a `sub sp, #0`.
+    g.plan.hasStackVars = true
 
 proc pickStagingA64(g: var CodeGen): Reg                # defined below
 
@@ -1339,23 +1413,77 @@ const StackArgFpBias = 16
   ## sets `fp` right after `stp fp, lr, [sp, #-16]!`, so it sits exactly one pair below
   ## the SP the caller entered with — which is where the outgoing argument area starts.
 
+proc emIncomingArgBase(g: var CodeGen; dest: Reg) =
+  ## `dest ← the SP the caller entered this proc with` — the base nifasm numbers
+  ## the incoming stack arguments from (parameter `k` at byte offset `k`'s
+  ## `alignedSize` sum, starting at 0).
+  ##
+  ## AArch64 keeps that address in the frame pointer for the whole body. Cortex-M
+  ## has no register to spare for one — four allocatable homes, and r8/r9/r10/r11
+  ## already have jobs — so it is RE-DERIVED at each of the handful of prologue
+  ## sites that need it: the current SP, plus the frame nifasm sized (`(ssize)`),
+  ## plus the bytes this backend's own prologue pushed. That is only correct
+  ## AFTER both subs have run, which is why the Cortex-M stack-parameter loads
+  ## live in the prologue rather than at the top of the body.
+  g.ab.tree Add3A64:
+    g.emReg dest
+    g.ab.reg SP
+    g.ab.tree SsizeX: g.ab.intLit int64(g.framePushBytes)
+
+proc emIncomingArgMem(g: var CodeGen; base: Reg; byteOff: int) =
+  ## The memory operand of the incoming stack argument at `byteOff`.
+  if g.thumbM:
+    g.ab.tree MemX: (g.emReg base; g.ab.intLit int64(byteOff))
+  else:
+    g.ab.tree MemX: (g.ab.reg FP; g.ab.intLit int64(StackArgFpBias + byteOff))
+
+proc emLoadIncomingArg(g: var CodeGen; dest: Reg; byteOff: int) =
+  ## `dest ← [incoming stack argument area + byteOff]`.
+  if g.thumbM:
+    let b = g.takeBridge(avoid = dest)
+    g.emIncomingArgBase(b)
+    g.ab.tree MovA64: (g.emReg dest; g.emIncomingArgMem(b, byteOff))
+    g.dropBridge b
+  else:
+    g.ab.tree MovA64: (g.emReg dest; g.emIncomingArgMem(NoReg, byteOff))
+
+proc emLeaIncomingArg(g: var CodeGen; dest: Reg; byteOff: int) =
+  ## `dest ← &(incoming stack argument area + byteOff)`.
+  if g.thumbM:
+    g.emIncomingArgBase(dest)
+    if byteOff != 0:
+      g.ab.tree AddA64: (g.emReg dest; g.ab.intLit int64(byteOff))
+  else:
+    g.ab.tree LeaA64: (g.emReg dest; g.emIncomingArgMem(NoReg, byteOff))
+
 proc bridgeStackParam(g: var CodeGen; slotName: string; byteOff: int; typ: AsmSlot) =
   ## `[slotName] <- [fp + StackArgFpBias + byteOff]`, through a transient GPR: AArch64 has
   ## no memory-to-memory move, so a stack-passed parameter whose home is a stack slot
   ## has to be bridged. The bridge is BOUND (`bindTemp`) for its two instructions —
   ## `emReg` refuses a raw scratch-pool register, which is the invariant that keeps an
   ## unbound temp from being silently clobbered — and released immediately after.
+  if g.thumbM:
+    # A STAGING pick would be fatal here. Cortex-M emits these loads from the
+    # prologue (that is where the incoming-argument base is legible), and the
+    # prologue is written AFTER `computeFrame` has frozen `usedCallee` — so a
+    # callee-saved register taken now would be used without being saved, and the
+    # caller's value in it destroyed. The bridges are in no pool and need no
+    # save, which is exactly why they exist.
+    let base = g.takeBridge()
+    let v = g.takeBridge(typ, avoid = base)
+    g.emIncomingArgBase(base)
+    g.ab.tree MovA64: (g.emReg v; g.emIncomingArgMem(base, byteOff))
+    g.emScalarStore(slotName, v)
+    g.dropBridge v
+    g.dropBridge base
+    return
   let s = g.pickStagingA64()
   if s == NoReg:
     raiseAssert "arkham a64: no register to bridge stack parameter " & slotName &
                 " in proc " & g.curProcName
   g.pickedRegs.incl s
   g.bindTemp(s, typ)
-  g.ab.tree MovA64:
-    g.emReg s
-    g.ab.tree MemX:
-      g.ab.reg FP
-      g.ab.intLit (StackArgFpBias + byteOff)
+  g.emLoadIncomingArg(s, byteOff)
   g.emScalarStore(slotName, s)
   g.unbindTemp(s)
   g.pickedRegs.excl s
@@ -1403,8 +1531,34 @@ proc emitStackParamLoads(g: var CodeGen; decl: Cursor) =
         typeCur = c
         if c.kind == Symbol and slotOf(g.prog, c).kind == AMem: tn = c.symId
         while c.hasMore: skip c               # type (+ anything else)
-      if pl.isFloat or not pl.onStack: continue
+      if not pl.onStack: continue
+      if pl.isFloat:
+        # `emitParamMoves` skips every stack-passed parameter, so if this one is
+        # skipped here too it is silently never loaded. Say so instead.
+        lengError decl, "arkham: a stack-passed FLOAT parameter (`" & nm &
+                  "`) is not supported yet", lengInfo(decl)
       let loc = g.plan.homeOfSym(nm)
+      if g.thumbM and g.isWideType(typeCur):
+        # A stack-passed 64-bit parameter: eight bytes of the incoming area into
+        # the slot the allocator gave it (a scalar wider than a register never
+        # gets a register home).
+        if loc.kind != NamedStack:
+          raiseAssert "arkham cortex-m: stack-passed 64-bit parameter " & nm &
+                      " homed in " & $loc.kind
+        g.emTypedStackVar(nm, typeCur)
+        let b = g.takeBridge()
+        let v = g.takeBridge(avoid = b)
+        g.emIncomingArgBase(b)
+        for k in 0 .. 1:
+          g.ab.tree MovA64: (g.emReg v; g.emIncomingArgMem(b, pl.byteOff + 4 * k))
+          g.ab.tree MovA64:
+            g.ab.tree CastX:
+              g.ab.uintType(32)
+              g.ab.tree MemX: (g.ab.sym nm; g.ab.intLit int64(4 * k))
+            g.emReg v
+        g.dropBridge v
+        g.dropBridge b
+        continue
       if pl.isAgg and not pl.byRef:
         # A ≤16B by-value aggregate that went entirely on the stack. The incoming bytes
         # are the callee's own copy, so where the home is a POINTER nothing needs
@@ -1412,34 +1566,41 @@ proc emitStackParamLoads(g: var CodeGen; decl: Cursor) =
         g.varType[nm] = tn
         case loc.kind
         of InReg:
-          g.ab.tree LeaA64:                   # home ← base + byteOff
-            g.emReg loc.r
-            g.ab.tree MemX:
-              g.ab.reg FP
-              g.ab.intLit (StackArgFpBias + pl.byteOff)
+          g.emLeaIncomingArg(loc.r, pl.byteOff)          # home ← base + byteOff
         of InRegPair:
           # The aggregate lives IN a register pair (the ABI eightbytes ARE the
           # fields): load each eightbyte straight into its word register.
           for k in 0 ..< pl.words:
-            g.ab.tree MovA64:
-              g.emReg pairWord(loc, k)
-              g.ab.tree MemX:
-                g.ab.reg FP
-                g.ab.intLit (StackArgFpBias + pl.byteOff + k * 8)
+            g.emLoadIncomingArg(pairWord(loc, k), pl.byteOff + k * wordSize())
         of NamedStack:
           # The allocator gave it a real `(s)` slot: declare it and copy the incoming
           # eightbytes across, one reused value register at a time (as x64's twin does)
           # rather than a held register per word.
           g.emStackVar(nm, tn)
+          if g.thumbM:
+            # Two bridges is all this target has, and the incoming-argument base
+            # takes one — so the destination is addressed by SLOT NAME rather
+            # than through a third register holding its address.
+            let base = g.takeBridge()
+            let v = g.takeBridge(avoid = base)
+            g.emIncomingArgBase(base)
+            for k in 0 ..< pl.words:
+              g.ab.tree MovA64:
+                g.emReg v
+                g.emIncomingArgMem(base, pl.byteOff + k * wordSize())
+              g.ab.tree MovA64:
+                g.ab.tree CastX:
+                  g.ab.uintType(wordBits())
+                  g.ab.tree MemX: (g.ab.sym nm; g.ab.intLit int64(k * wordSize()))
+                g.emReg v
+            g.dropBridge v
+            g.dropBridge base
+            continue
           let homeAddr = g.takeBridge()
           g.ab.tree LeaA64: (g.emReg homeAddr; g.ab.sym nm)
           let v = g.takeBridge(avoid = homeAddr)
           for k in 0 ..< pl.words:
-            g.ab.tree MovA64:                 # v ← incoming word k
-              g.emReg v
-              g.ab.tree MemX:
-                g.ab.reg FP
-                g.ab.intLit (StackArgFpBias + pl.byteOff + k * 8)
+            g.emLoadIncomingArg(v, pl.byteOff + k * wordSize())   # v ← incoming word k
             g.ab.tree MovA64:                 # home word k ← v
               g.emWordThroughPtr(homeAddr, k)
               g.emReg v
@@ -1451,11 +1612,7 @@ proc emitStackParamLoads(g: var CodeGen; decl: Cursor) =
           # deal as `InReg`, one indirection further out.
           g.emByRefPtrStackVar(nm, tn)
           let a = g.takeBridge()
-          g.ab.tree LeaA64:                   # a ← base + byteOff
-            g.emReg a
-            g.ab.tree MemX:
-              g.ab.reg FP
-              g.ab.intLit (StackArgFpBias + pl.byteOff)
+          g.emLeaIncomingArg(a, pl.byteOff)   # a ← base + byteOff
           g.emScalarStore(loc.ptrName, a)
           g.dropBridge a
         else:
@@ -1464,11 +1621,7 @@ proc emitStackParamLoads(g: var CodeGen; decl: Cursor) =
         continue
       case loc.kind
       of InReg:
-        g.ab.tree MovA64:                     # home ← [base + byteOff]
-          g.emReg loc.r
-          g.ab.tree MemX:
-            g.ab.reg FP
-            g.ab.intLit (StackArgFpBias + pl.byteOff)
+        g.emLoadIncomingArg(loc.r, pl.byteOff)           # home ← [base + byteOff]
       of NamedStack:
         # A spilled / address-taken scalar: declare its `(s)` slot before filling it,
         # or the store — and every later body reference — names a slot nifasm never
@@ -1538,6 +1691,17 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
         g.rawHomeRegs.incl loc.r0
         g.rawHomeRegs.incl loc.r1
       else: discard
+      if pl.onStack:
+        # Loaded from the incoming argument area by `emitStackParamLoads`, which
+        # also declares the slot. Reaching the arms below would use `gprAt(pl)`,
+        # and a stack-passed place has no register — `gpFirst` is 0 — so the
+        # "move" would store argument ZERO's register over the value that was
+        # just loaded correctly. (It takes more than eight parameters to see this
+        # on AArch64, which is why it stayed hidden; Cortex-M has four argument
+        # registers.) The bookkeeping above still has to run: it is about where
+        # the parameter LIVES, not about how it got there.
+        if tn != NoTypeSym: g.varType[nm] = tn
+        continue
       if tn != NoTypeSym and loc.kind == StackPtr:
         # A >16B by-ref aggregate whose POINTER found no register home: its slot is
         # `(ptr T)`, filled from the incoming arg register. (The home's KIND says the
@@ -1569,6 +1733,18 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
         g.varType[nm] = tn
         if not pl.onStack:
           g.movReg(loc.r, g.md.gprAt(pl))
+      elif g.thumbM and g.isWideType(typeCur):
+        # A 64-bit parameter. Its home is ALWAYS a stack slot — a scalar wider
+        # than a register fails `inRegClass`, so the allocator never offers one
+        # — and it is filled from the two consecutive incoming argument
+        # registers the shared `CallPlan` assigned. A stack-PASSED one is left
+        # to `emitStackParamLoads`, which is where the incoming area is legible.
+        if loc.kind != NamedStack:
+          raiseAssert "arkham cortex-m: 64-bit parameter " & nm & " homed in " &
+                      $loc.kind
+        if not pl.onStack:
+          g.emTypedStackVar(nm, typeCur)
+          g.wideParamToHome(nm, pl.gpFirst)
       elif loc.kind == InFReg:
         # Float parameter: in a leaf proc it stays in its incoming v{fpIndex}; if
         # the allocator gave it a callee-saved home, move it there. A STACK-passed
@@ -1635,7 +1811,21 @@ proc emitSignature(g: var CodeGen; decl: Cursor; declarative: bool) =
                 skip c                        # pragmas
                 if pl.isFloat:
                   raiseAssert "arkham a64: float param in signature not yet supported"
-                if pl.isAgg:
+                if pl.isWideScalar:
+                  # A scalar too wide for one register (`(i 64)` on Cortex-M).
+                  # `(regs …)` is the SAME location form a multi-word aggregate
+                  # uses, and for the same reason: the halves have no Leng type
+                  # of their own, so the param is ABI-only and the body reads
+                  # `(arg pN k)`.
+                  g.ab.tree ParamD:
+                    g.ab.symDef paramName(pl.ord)
+                    if pl.onStack:
+                      g.ab.keyword SO
+                    else:
+                      g.ab.tree RegsD:
+                        for k in 0 ..< pl.words: g.ab.reg g.md.gprAt(pl, k)
+                    g.genTypeBody(c)
+                elif pl.isAgg:
                   # An aggregate param: a >16B aggregate is a by-ref pointer in one x-reg;
                   # a ≤16B by-value aggregate spans `pl.words` consecutive x-regs (one per
                   # eightbyte). Emitted with `(regs …)` (ABI-only); `(arg pN k)` at a call
@@ -1679,7 +1869,13 @@ proc emitSignature(g: var CodeGen; decl: Cursor; declarative: bool) =
           let rs = slotOf(g.prog, c)
           if rs.kind == AFloat:
             raiseAssert "arkham a64: float result in signature not yet supported"
-          if rs.kind == AMem:
+          if g.isWideSlot(rs):
+            # A 64-bit result travels in r0:r1 with an EMPTY result slot, exactly
+            # as a two-word aggregate does: nifasm's `(ret …)` names ONE register,
+            # and declaring only the low half is how a truncated return would look
+            # legal. Both sides read the pair raw instead.
+            skip c
+          elif rs.kind == AMem:
             # A ≤16B by-value aggregate result travels in x0:x1 with an EMPTY result slot
             # (like a >16B by-ref result via x8): the callee marshals it into x0:x1 (the
             # body's `structToRegs`) and the caller reads those raw after the call — no
@@ -1833,7 +2029,7 @@ proc takeHeld(g: var CodeGen; what: string; canSpill = false): Location =
       return regLoc(cs, ScalarSlot, isTemp = true)
   if canSpill:
     let nm = g.mintSpillName("held")
-    g.plan.addSpillTemp(nm, AsmSlot(cls: AInt, size: 8, align: 8))
+    g.plan.addSpillTemp(nm, ScalarSlot)
     return namedStackLoc(nm, ScalarSlot, spillTemp = true)
   raiseAssert "arkham a64n: out of registers for " & what &
               " in proc " & g.curProcName & " (nothing to spill), picked: " &
@@ -1985,6 +2181,10 @@ proc globalIsGvarSlot(g: var CodeGen; name: string): bool =
   ## page-offset patch site) — the `gload`/`gstore` fold target — rather than a
   ## read-only `const` blob (`RodataD`), which is a label with no gvar site. Mirrors
   ## `genGlobal`'s split exactly: rodata iff the decl is a `const` WITH a value.
+  # The fold is an `adrp`+folded-access pair. Cortex-M materializes a global's
+  # address absolutely (movw/movt, patched once the .bss layout is known) and has
+  # no such instruction, so the address and the access stay separate there.
+  if g.thumbM: return false
   let si = g.lookupSym(name)
   if si.cat != scGlobal: return false
   var d = si.decl
@@ -2615,7 +2815,8 @@ proc aggrAddrInto(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind:
     g.emitValue2(p, pLoc)
     g.plan.planAtEmitTime(g.posOf(p), pLoc)
     if doBind:
-      g.bindTemp(dest, AsmSlot(cls: AUInt, size: 8, align: 8, typ: g.getType(p)))
+      g.bindTemp(dest, AsmSlot(cls: AUInt, size: wordSize(), align: wordAlign(),
+                              typ: g.getType(p)))
     g.place2(pLoc, dest)
     if pLoc.kind == InReg and pLoc.isTemp and pLoc.r != dest: g.unbindTemp(pLoc.r)
   elif lv.kind == TagLit and lv.exprKind == BaseobjC:
@@ -3574,6 +3775,20 @@ template aconstrElemStores(g: var CodeGen; c: Cursor; destOp, addrOp: untyped) =
           inc i
           skip cc
           continue
+        if g.isWideSlot(elemSlot):
+          # A 64-bit array element. `destOp(i)` is an `(at …)` operand typed with
+          # the ELEMENT type, and a 64-bit-typed move is not one this target has
+          # — the eight bytes go through the element's address instead. The value
+          # is produced FIRST, because it may contain a call and the address
+          # register would not survive one.
+          let wnm = g.wideValueIntoTemp(valC)
+          let ew = g.takeBridge()
+          g.ab.tree LeaA64: (g.emReg ew; addrOp(i))
+          g.wideCopyToAddr(wnm, ew)
+          g.dropBridge ew
+          inc i
+          skip cc
+          continue
         var v: Location
         if g.isFloatExpr(valC):
           # The ELEMENT's slot, not `dontCare`: `elemSlot` is the authority
@@ -3822,6 +4037,22 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
   ## The general destination-passing store: emit `rhs` so its value lands at `dst`. An
   ## aggregate COPY goes through the ONE `genAggrCopyStore`; constructors/calls/baseobj
   ## PRODUCE per-form; a scalar/float destination through `storeScalar2`.
+  # A `Mem` destination's `typ` is often the dont-care `ScalarSlot` (the lvalue
+  # subtree is the authority, not the Location), so its width is read off the
+  # subtree — otherwise a 64-bit `obj.field` store looks like a word one.
+  let dstIsWide = (if dst.kind == Mem: g.isWideExpr(dst.cur)
+                   else: g.isWideSlot(dst.typ))
+  if g.thumbM and (dstIsWide or g.isWideExpr(rhs)):
+    if dst.kind == InReg:
+      # The one register destination a wide value can legitimately have is the
+      # ABI result register — `(ret …)` routes through here. Everything else
+      # would be a 64-bit value asked to fit in 32 bits.
+      if dst.r == g.md.intRetReg: g.wideRet(rhs)
+      else:
+        raiseAssert "arkham cortex-m: 64-bit value into register " & $dst.r
+    else:
+      g.emitWideIntoLoc(rhs, dst)
+    return
   let (dstAggr, aggrSize) = g.dstAggrInfo(dst)
   if dstAggr and isAggrCopySrc(rhs):                         # the ONE whole-aggregate copy path
     g.genAggrCopyStore(rhs, dst, aggrSize)
@@ -4331,6 +4562,12 @@ proc freeLvalTemps2(g: var CodeGen; c: Cursor; addrIntact = false) =
 proc emitValue2(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED decide-and-emit (a64): resolve `dest` against `c`, emit, return the
   ## resolved location. Callers route float-typed values to `emitFValue2`.
+  if g.thumbM and g.isWideExpr(c):
+    # A 64-bit value on a 32-bit target has no register to be resolved into: it
+    # is eight bytes at an address, and `codegen_m64` is the arm that knows how
+    # to put them there.
+    g.emitWideAsLoc(c, dest)
+    return
   if dest.kind == NamedStack and dest.spillTemp:
     g.produceIntoMem2(c, dest)
     return
@@ -4431,7 +4668,7 @@ proc emitValue2(g: var CodeGen; c: Cursor; dest: var Location) =
           g.bindTemp(dest.r, dest.typ)
         if iv.kind == InReg and iv.r != dest.r: g.movReg(dest.r, iv.r)
         elif iv.kind != InReg: g.place2(iv, dest.r)
-        g.ab.tree NegA64: g.emReg dest.r
+        g.emNeg(dest.r)
         if c.exprKind == BitnotC: g.binImm(SubA64, dest.r, 1)  # ~a = -a - 1
         g.normalizeUnaryWidth(resType, dest.r)
         if not (iv.kind == InReg and iv.r == dest.r): g.freeVal(iv)
@@ -4618,7 +4855,7 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
       g.resolveLvalVal(lhsC, lLoc)
     let foldOp = if op == SubA64: AddA64 else: op
     if op == SubA64:
-      g.ab.tree NegA64: g.emReg rD                       # rD := -rhs
+      g.emNeg(rD)                       # rD := -rhs
     g.foldRhs2(foldOp, rD, lLoc, lhsC)                   # bridges serve Imm/slot/Mem lhs
     if lhsMem: g.freeLvalTemps2(lhsC)
     g.normalizeBinWidth(resTypeC, rD, op)
@@ -4684,7 +4921,7 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
     else:
       g.binReg(op, rD, lDest.r)                          # dest := rhs op lhs
       if op == SubA64:
-        g.ab.tree NegA64: g.emReg rD                     # dest := lhs - rhs
+        g.emNeg(rD)                     # dest := lhs - rhs
   elif lDest.kind == InReg and lDest.r != rD and op in ThreeOpA64:
     g.foldRhs3(op, rD, lDest.r, rDest, rhsC, w32)        # dest := lhs op rhs (no mov)
   else:
@@ -5001,6 +5238,8 @@ proc emitScalarCmpE(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
   ## compare-and-branch for the ordering conditions.
   var aC = aC0
   var bC = bC0
+  if g.thumbM and (g.isWideExpr(aC) or g.isWideExpr(bC)):
+    return g.emitWideCmpE(aC, bC, ek, whenTrue)
   let signed = not (g.cmpOperandUnsigned(aC) or g.cmpOperandUnsigned(bC))
   result =
     case ek
@@ -5341,6 +5580,12 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
       tc = resolveType(g.prog, cc); skip cc
       inner = cc; skip cc
       while cc.hasMore: skip cc
+  if g.thumbM and g.isWideExpr(inner) and not g.isWideExpr(c):
+    # The NARROWING direction: `int32(x64)` / `cast[uint](x64)`. The widening one
+    # and wide→wide are produced by `emitWideAsLoc`, which `emitValue2` reached
+    # before this proc.
+    g.emitWideToNarrow(inner, targetCur, dest)
+    return
   if g.isFloatExpr(c):                          # → float result
     if dest.kind != InFReg:
       dest = g.takeFTmp(if dest.typ.kind == AFloat: dest.typ
@@ -5554,7 +5799,8 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
       fnptrLoc = regLoc(r, ScalarSlot, isTemp = true)
     fnptrReg = fnptrLoc.r
     if targetCur.kind == Symbol and g.rb.boundName(fnptrReg) == symName(targetCur):
-      tgt = CallTarget(declarative: declarative, asmName: symName(targetCur), retType: retType)
+      tgt = CallTarget(declarative: declarative, asmName: symName(targetCur),
+                       retType: retType, sigType: proctype)
     else:
       let nm = g.rb.freshTmpName("fntmp")
       g.ab.tree RebindA64:
@@ -5564,7 +5810,8 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
         g.ab.reg fnptrReg
       g.rb.bindScratch(fnptrReg, nm, isPtr = false)
       fnTargetName = nm
-      tgt = CallTarget(declarative: declarative, asmName: nm, retType: retType)
+      tgt = CallTarget(declarative: declarative, asmName: nm, retType: retType,
+                       sigType: proctype)
   else:
     if not g.callTarget.hasKey(fsym):
       let si = g.lookupSym(fsym)
@@ -5606,8 +5853,8 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
         if dest.f != FloatRet: g.fmovF(dest.f, FloatRet, rbits)
       else:
         g.emFloatScalarStore(dest.name, FloatRet, rbits)
-    elif resSlot.kind == AMem:
-      discard                                  # ≤16B aggregate result: caller reads x0:x1
+    elif resSlot.kind == AMem or g.isWideSlot(resSlot):
+      discard        # ≤16B aggregate / 64-bit scalar result: caller reads x0:x1
     else:
       case dest.kind
       of Undef, NeedsReg, RegOrImm:
@@ -5622,8 +5869,32 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
 
   if tgt.declarative:
     var callArgSlots: seq[AsmSlot] = @[]
-    for a in argCurs: callArgSlots.add g.exprSlot(a)
+    let declSlots = g.calleeParamSlots(fsym, tgt)
+    for j, a in argCurs:
+      var s = g.exprSlot(a)
+      # THE ABI follows the CALLEE's declaration, not the argument expression's
+      # type. They can disagree in WIDTH — Leng leaves the C truncation of
+      # `exit(x + y)` (an `int64` sum into a `cint` parameter) implicit — and on
+      # a target where a scalar can span two registers that disagreement is an
+      # ABI mismatch, not a rounding detail: the caller would stage two words
+      # where the callee declared one. Only the width is taken; the CLASS stays
+      # the expression's, so an aggregate or a float argument is untouched.
+      if j < declSlots.len and s.kind notin {AMem, AFloat} and
+         declSlots[j].kind notin {AMem, AFloat} and declSlots[j].size != s.size:
+        s.size = declSlots[j].size
+        s.align = declSlots[j].align
+      callArgSlots.add s
     let plan = planCall(g.md, callArgSlots, retByRef = false)
+    # Every 64-bit argument is produced into a stack slot BEFORE the `(prepare …)`
+    # block opens. Inside it, arguments are staged straight into r0–r3, and a
+    # 64-bit `div`/`mod` is a `bl` to the module's divider — which clobbers
+    # exactly those registers. Producing the value first turns the marshalling
+    # into loads, which clobber nothing.
+    var wideArgSlots = newSeq[string](argCurs.len)
+    if g.thumbM:
+      for j in 0 ..< argCurs.len:
+        if plan.args[j].isWideScalar or g.isWideExpr(argCurs[j]):
+          wideArgSlots[j] = g.wideValueIntoTemp(argCurs[j])
     g.ab.tree PrepareA64:
       g.ab.sym tgt.asmName
       var stackArgs: seq[int] = @[]
@@ -5702,6 +5973,20 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
               g.ab.tree MovA64:
                 g.ab.tree ArgX: (g.ab.sym paramName(j); g.ab.intLit k.int64)
                 g.emReg g.md.gprAt(pl, k)
+        elif g.thumbM and g.isWideExpr(a) and not pl.isWideScalar:
+          g.wideArgTruncated(wideArgSlots[j], g.md.gprAt(pl))
+          g.ab.tree MovA64:
+            g.ab.tree ArgX: g.ab.sym paramName(j)
+            g.emReg g.md.gprAt(pl)
+        elif pl.isWideScalar:
+          # Two consecutive argument registers, filled from the value's eight
+          # bytes and then bound as `(arg pN 0)` / `(arg pN 1)` — the same shape
+          # a two-eightbyte aggregate uses, because it is the same ABI question.
+          g.wideArgToRegs(wideArgSlots[j], pl.gpFirst)
+          for k in 0 ..< pl.words:
+            g.ab.tree MovA64:
+              g.ab.tree ArgX: (g.ab.sym paramName(j); g.ab.intLit k.int64)
+              g.emReg g.md.gprAt(pl, k)
         else:
           var aD = regLoc(g.md.gprAt(pl), ScalarSlot)
           g.emitValue2(a, aD)                  # → its ABI register directly
@@ -5721,6 +6006,8 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
         let a = argCurs[j]
         if g.exprSlot(a).kind == AMem:
           g.marshalStackAggrArg(a, paramName(j))
+        elif g.thumbM and g.isWideExpr(a):
+          g.wideArgToStack(wideArgSlots[j], paramName(j))
         else:
           var aD = needsReg(g.valueSlot(a))
           g.emitValue2(a, aD)
@@ -5745,7 +6032,8 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
         # `emitSemihostRuntime` emitted under the same name — there is no trap
         # instruction to reach an OS with, because there is no OS.
         g.ab.keyword CallA64
-      if hasResult and not resultByRef and not resultIsFloat and resSlot.kind != AMem:
+      if hasResult and not resultByRef and not resultIsFloat and
+         resSlot.kind != AMem and not g.isWideSlot(resSlot):
         g.ab.tree MovA64:
           g.emReg IntRet
           g.ab.tree ResX: g.ab.sym synth("ret.0")
@@ -5872,6 +6160,11 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
             if isGlobal: g.globalToRegs(symName(a), tn, intIdx, isTvar)
             else: g.structToRegs(home, tn, intIdx)
             intIdx += nw
+      elif g.thumbM and g.isWideExpr(a):
+        # Same rule as the declarative path: the value first, the staging after.
+        let wnm = g.wideValueIntoTemp(a)
+        g.wideArgToRegs(wnm, intIdx)
+        intIdx += 2                       # no declaration to narrow against here
       else:
         var aD = regLoc(IntArgRegs[intIdx], ScalarSlot)
         g.emitValue2(a, aD)                    # → its ABI register directly
@@ -6377,6 +6670,8 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
           if g.retIsFloat:
             let fb = g.retFloatBits
             g.genStore2(cc, fregLoc(FloatRet, AsmSlot(cls: AFloat, size: fb div 8, align: fb div 8)))
+          elif g.thumbM and g.isWideExpr(cc):
+            g.wideRet(cc)                    # 64-bit result: r0:r1, read raw
           else:
             g.genStore2(cc, regLoc(IntRet, ScalarSlot))
         g.emBr(BA64, g.retLabel2); g.retLabelUsed2 = true
@@ -6635,7 +6930,12 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool;
   g.enterScope()
   if g.retIndirect: g.movReg(g.indirectReg, g.indirectResultReg)
   g.emitParamMoves(info.decl)
-  g.emitStackParamLoads(info.decl)            # via fp; the arg registers are free now
+  # AArch64 addresses the caller's argument area through the frame pointer, so
+  # these loads can sit at the top of the body. Cortex-M re-derives the base from
+  # SP (see `emIncomingArgBase`), which is only final once the prologue has
+  # lowered it — so there they are emitted with the prologue instead.
+  if not g.thumbM:
+    g.emitStackParamLoads(info.decl)          # via fp; the arg registers are free now
   g.retLabel2 = g.freshLabel()
   g.retLabelUsed2 = false
   var c = info.decl
@@ -6656,7 +6956,9 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool;
   swap(g.ab, side)                        # back to the main buffer; `side` holds the body
   # The body is emitted — `plan.usedCallee`/`usedCalleeF`/`hasStackVars` are final.
   # Finalize the frame and write the prologue, then splice the body after it.
-  g.computeFrame(frameHasCall)
+  # `helperCalls` is only known now: the 64-bit divider is reached from an
+  # expression the analyser sees as arithmetic, and its `bl` overwrites lr.
+  g.computeFrame(frameHasCall or g.helperCalls)
   g.ab.tree ProcD:
     g.ab.symDef info.asmName
     g.emitSignature(info.decl, declarative)
@@ -6669,10 +6971,12 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool;
       # so they are declared here, in the prologue, not in the side buffer.
       for st in g.plan.spillTemps:
         if st.isFloat: g.emFloatStackVar(st.name, st.typ.size * 8)
+        elif g.isWideSlot(st.typ): g.emWideStackVar(st.name)
         elif g.slotIsPointer(st.typ):
           if isNilValue(st.typ.typ): g.emVoidPtrStackVar(st.name)
           else: g.emTypedStackVar(st.name, st.typ.typ)   # `(ptr T)` slot keeps its type
         else: g.emScalarStackVar(st.name)
+      if g.thumbM: g.emitStackParamLoads(info.decl)  # SP is final only here
       g.ab.append side                            # the body
       if not (info.isEntry and (g.a64Linux or g.thumbM)):
         if g.plan.hasStackVars:
@@ -6765,6 +7069,7 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   g.rb.resetProc(); g.aliasToDecl.clear(); g.savedHomes.clear()
   g.noFoldPos = -1
   g.curProcName = info.asmName            # names the proc in this backend's diagnostics
+  g.helperCalls = false
   g.emitProcBody2(info, declarative, frameHasCall = an.hasCall)
 
 # MODEL: the `StartEmit` per-proc reset in proofs/arkham_bindings.tla. The two-pass seam
@@ -6969,6 +7274,10 @@ proc emitSemihostRuntime(g: var CodeGen; sp: SyscallProc) =
          "`exit` and `write` are provided; bind anything else to an MMIO routine " &
          "of your own (see doc/cortex_m.md)."
 
+# The 64-bit-integer lowering (Cortex-M, M4). INCLUDED here, at the end, so it
+# sees the whole value core it dispatches out of and back into.
+include codegen_m64
+
 proc rejectForThumbM(g: var CodeGen) =
   ## Everything the Cortex-M target does NOT have, refused by name at the module
   ## level before a single instruction is emitted. Each of these would otherwise
@@ -7011,6 +7320,11 @@ proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool): string =
       g.emitSemihostRuntime(sp)
     for info in g.prog.procs:
       genProc2(g, info)
+    # AFTER the bodies: whether anything divides is only known once they are
+    # emitted. A firmware image has no `libgcc` to borrow `__aeabi_ldivmod`
+    # from, so it carries its own — once, and only if used.
+    if g.needsUDiv64: g.emitUDivMod64()
+    if g.needsSDiv64: g.emitSDivMod64()
     for (nm, bytes) in g.rodata:
       g.ab.tree RodataD:
         g.ab.symDef nm

@@ -38,7 +38,10 @@ type
     isFloat*: bool       ## a float (xmm / v-register if register-passed)
     isAgg*: bool         ## an aggregate (AMem slot)
     byRef*: bool         ## aggregate larger than the threshold → a single pointer
-    words*: int          ## eightbytes occupied (1 for a scalar / pointer / float)
+    words*: int          ## target WORDS occupied. 1 for a pointer, a float, or a
+                         ## by-ref aggregate; ceil(size/word) for a by-value
+                         ## aggregate AND for a scalar wider than one word (an
+                         ## `(i 64)` on a 32-bit target — a register pair)
     gpFirst*: int        ## register-passed int/aggregate: first GPR index
                          ## (registers = intArgRegs[gpFirst ..< gpFirst+words])
     fpIndex*: int        ## register-passed float: SIMD register index
@@ -85,10 +88,11 @@ proc planCall*(md: MachineDesc; slots: openArray[AsmSlot]; retByRef: bool;
       pp.isFloat = s.kind == AFloat
       pp.isAgg = s.kind == AMem
       pp.byRef = pp.isAgg and s.size > md.aggrByRefThreshold
-      pp.words = if pp.isAgg and not pp.byRef: (s.size + w - 1) div w else: 1
+      pp.words = if pp.byRef or pp.isFloat: 1
+                 else: max(1, (s.size + w - 1) div w)
       pp.onStack = true
       pp.byteOff = stackOff
-      stackOff += (if pp.isAgg and not pp.byRef: (s.size + w - 1) and not (w - 1) else: w)
+      stackOff += (if pp.byRef or pp.isFloat: w else: (s.size + w - 1) and not (w - 1))
       result.hasStackArgs = true
       result.args.add pp
       inc ord
@@ -111,11 +115,16 @@ proc planCall*(md: MachineDesc; slots: openArray[AsmSlot]; retByRef: bool;
       else:
         pp.onStack = true; pp.byteOff = stackOff; stackOff += w
     else:                               # scalar int / pointer
-      pp.words = 1
-      if gp < md.intArgRegs.len:
-        pp.gpFirst = gp; inc gp
+      # A scalar WIDER than one word travels in consecutive registers, exactly
+      # as a by-value aggregate of the same size does — an `(i 64)` on a 32-bit
+      # target is a register PAIR. On the 64-bit targets no scalar exceeds the
+      # word, so this is `words = 1` there and the arm is unchanged.
+      pp.words = max(1, (s.size + w - 1) div w)
+      if gp + pp.words <= md.intArgRegs.len:
+        pp.gpFirst = gp; gp += pp.words
       else:
-        pp.onStack = true; pp.byteOff = stackOff; stackOff += w
+        pp.onStack = true; pp.byteOff = stackOff
+        stackOff += (s.size + w - 1) and not (w - 1)
     if pp.onStack: result.hasStackArgs = true
     result.args.add pp
     inc ord
@@ -136,6 +145,14 @@ proc paramSlots*(prog: var Program; paramsSlot: Cursor): seq[AsmSlot] =
         inc pc; skip pc                 # name, pragmas
         result.add slotOf(prog, pc)
         while pc.hasMore: skip pc
+
+proc isWideScalar*(pl: ParamPlace): bool {.inline.} =
+  ## A non-aggregate that still spans several registers: a 64-bit integer on a
+  ## 32-bit target. Passed like a by-value aggregate (consecutive words), but it
+  ## is a VALUE — the emitters that ask `isAgg` to decide "copy bytes" must ask
+  ## this too, and the ones that ask it to decide "how many registers" want
+  ## `words` on its own.
+  not pl.isAgg and not pl.isFloat and pl.words > 1
 
 proc gprAt*(md: MachineDesc; pl: ParamPlace; k = 0): Reg {.inline.} =
   ## The k-th integer argument register of a register-passed place.

@@ -191,9 +191,59 @@ fixtures, 225 `importc "exit"` and 3 `importc "write"`.
   a temp while r1 holds staged argument word 1. Temporaries come from the
   callee-saved homes instead. The narrower fix is to teach the scratch picker
   which argument registers are currently staged.
-* **M4 — 64-bit integers as register pairs.** `adds`/`adcs`, `umull`+`mla`,
-  `__aeabi_ldivmod`. Un-skips most of the existing 236-fixture corpus (206 of
-  them declare `(i 64)`).
+* **M4 — 64-bit integers.** DONE. `tests/arkham/` — the full 64-bit corpus — is
+  compiled for Cortex-M and run under QEMU by `arkhamCortexM64Tests`, with a
+  named skip list (`cortexMUnsupported`) that states why each remaining fixture
+  cannot be served. 151 of 220 pass today.
+
+  **Not** register pairs. A 64-bit value here is EIGHT BYTES AT AN ADDRESS, and
+  the ops read and write it a word at a time (`arkham/codegen_m64.nim`, included
+  by `codegen_arm.nim`). The reason is the register file: four allocatable homes
+  and an EMPTY volatile temp pool, because on this ABI the only caller-saved
+  registers ARE the argument registers. A pair allocator would compete for two of
+  four homes per live value, and every consumer in the shared value core — which
+  has a formal model behind its binding protocol — would need a second-register
+  case. `slots.inRegClass` already refuses a 64-bit scalar a register home on a
+  32-bit target, so the allocator needed no change at all; what M4 added is the
+  arithmetic.
+
+  The cost is real (an `x + y` is six instructions, not two) and it is the price
+  of the register file, not of the representation. What it buys is that the one
+  thing a 64-bit lowering must never do — produce a plausible wrong number —
+  cannot happen by a register running out.
+
+  Each half is spelled `(cast (u 32) (mem <base> <byte offset>))`. The cast is
+  load-bearing: without it the access is 64-bit-typed and nifasm REFUSES it
+  (`checkRegWidthM`) rather than silently truncating, which is why an arm the
+  emitter forgets shows up as a type error and not as a wrong answer.
+
+  Division is a routine the image carries itself — a restoring shift-subtract
+  divider emitted once per module, and only when something divides, since a
+  firmware image has no `libgcc` to borrow `__aeabi_ldivmod` from. It is called
+  with a bare `bl`, so a proc that looked like a leaf until it divided has its
+  frame forced (`helperCalls`): `bl` overwrites lr, and nothing in the analyser's
+  view of a `div` node says "call". For the same reason every 64-bit ARGUMENT is
+  produced into its slot BEFORE the `(prepare …)` block opens — inside it,
+  arguments are staged straight into r0–r3, which is exactly what the divider
+  clobbers.
+
+  The ABI is the two-word aggregate's: consecutive argument registers, r0:r1 for
+  a result, `(regs …)` in the signature. That is not AAPCS32 — which would
+  even-align the register pair — and it does not have to be: a firmware image has
+  nothing to link against, so arkham owns both sides of every call. What DOES
+  matter is that the two sides agree, and they agree by reading the same
+  `CallPlan`. The plan follows the CALLEE's declared widths, not the argument
+  expression's type: Leng leaves the C truncation of `exit(x + y)` (an `int64`
+  sum into a `cint` parameter) implicit, and on a target where a scalar can span
+  two registers that is an ABI mismatch rather than a rounding detail.
+
+  Cortex-M also has no frame pointer to address the caller's stack-argument area
+  with, so the incoming base is re-derived from SP (`sp + (ssize) + the
+  prologue's own pushes`) — which is only final once the prologue has run. That
+  is why the Cortex-M stack-parameter loads are emitted WITH the prologue rather
+  than at the top of the body, and why they may only use the staging bridges:
+  the prologue is written after `computeFrame` has frozen `usedCallee`, so a
+  callee-saved register taken there would be used without being saved.
 * **M5 — floating point.** FPv4-SP hard-float for `(f 32)`; `(f 64)` rejected on
   M4F rather than dragged in via a softfloat library.
 * **M6 — actually embedded.** Exception/interrupt handlers with the right

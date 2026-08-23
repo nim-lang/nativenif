@@ -4182,6 +4182,17 @@ proc checkRegWidthM(t: Type; what: string; n: Cursor) =
     error("Cortex-M: " & what & " is a float; the FPv4-SP path is not implemented " &
           "yet (see M5 in doc/cortex_m.md)", n)
 
+proc argWordTypeM(p: ptr Param): Type =
+  ## The type of ONE argument register of `p`. An aggregate spread over several
+  ## registers has no per-word Leng type, and neither does a 64-bit scalar split
+  ## across a register PAIR — each half is a machine word. Reporting the param's
+  ## own `(i 64)` for such a half is what would make `(mov (arg x 0) …)` look
+  ## like a 64-bit register move to `checkRegWidthM`.
+  if p.typ.kind in {TypeKind.ObjectT, TypeKind.ArrayT, TypeKind.UnionT} or
+     p.regs.len > 1:
+    mRegType()
+  else: p.typ
+
 proc parseOperandM(n: var Cursor; ctx: var GenContext): OperandM =
   if n.kind == TagLit:
     let t = n.tag
@@ -4232,10 +4243,7 @@ proc parseOperandM(n: var Cursor; ctx: var GenContext): OperandM =
         result.kind = okArg
         result.argName = argName
         result.reg = tagToRegisterM(paramPtr.regs[wordIdx], n)
-        result.typ =
-          if paramPtr.typ.kind in {TypeKind.ObjectT, TypeKind.ArrayT, TypeKind.UnionT}:
-            mRegType()
-          else: paramPtr.typ
+        result.typ = argWordTypeM(paramPtr)
     elif t == ResTagId:
       # `(res name)` — a call's result, readable only after the call.
       if not ctx.inCall:
@@ -4592,11 +4600,13 @@ proc parseDestM(n: var Cursor; ctx: var GenContext): OperandM =
     result.kind = okArg
     result.argName = argName
     result.reg = tagToRegisterM(paramPtr.regs[wordIdx], n)
-    result.typ =
-      if paramPtr.typ.kind in {TypeKind.ObjectT, TypeKind.ArrayT, TypeKind.UnionT}:
-        mRegType()
-      else: paramPtr.typ
-  elif n.kind == TagLit and n.tag == MemTagId:
+    result.typ = argWordTypeM(paramPtr)
+  elif n.kind == TagLit and (n.tag == MemTagId or n.tag == CastTagId):
+    # `(cast T (mem …))` as a DESTINATION retypes — and thereby sizes — the
+    # store, exactly as it does on the read side. This is how a 64-bit value's
+    # two halves are addressed: the slot is `(i 64)`, each half is a
+    # `(cast (u 32) (mem slot 0|4))`, and the cast is what says so rather than a
+    # silent truncation of a 64-bit typed access down to one word.
     let op = parseOperandM(n, ctx)
     if op.kind != okMem: error("Expected memory destination", n)
     result = op
@@ -10242,6 +10252,34 @@ proc writeCortexMImage(a: var GenContext; code: seq[byte];
 
   let bssVaddr = elf32.SramBase
   let codeVaddr = elf32.FlashBase
+  # A global initialized with another SYMBOL's address — `var hook = twice`, `var
+  # alias = addr counter` — is a relocation, not a constant, so it is baked here
+  # once every label has a position. Without this the cell stays zero and the
+  # first indirect call through it branches to address 0; the failure is a
+  # lockup with nothing at the crash site to say which global was never filled.
+  #
+  # A proc's address carries the Thumb bit, for the same reason `rkTMovwMovtFunc`
+  # does: `blx` to an even address asks for ARM state, which M-profile has none of.
+  if a.bssSymInits.len > 0 and bssImage.len > 0:
+    var labelPos = initTable[int, int]()
+    for ld in a.buf.labels: labelPos[int(ld.id)] = ld.position
+    let codeBase = codeVaddr + uint32(elf32.VectorTableSize)
+    for it in a.bssSymInits:
+      var targetVaddr = 0'u32
+      case it.sym.kind
+      of skProc:
+        if not labelPos.hasKey(it.sym.offset): continue
+        targetVaddr = codeBase + uint32(labelPos[it.sym.offset]) + 1'u32
+      of skRodata:
+        if not labelPos.hasKey(it.sym.offset): continue
+        targetVaddr = codeBase + uint32(labelPos[it.sym.offset])
+      of skGvar:
+        targetVaddr = bssVaddr + uint32(it.sym.size)
+      else: continue
+      for i in 0 ..< it.size:
+        if it.off.int + i < bssImage.len:
+          bssImage[it.off.int + i] = byte((targetVaddr shr (8 * i)) and 0xFF)
+
   # The stack grows DOWN from `DefaultStackTop`, the globals UP from `SramBase`.
   # They share one RAM region, so say so when they would meet rather than letting
   # the first deep call frame quietly overwrite a global.
