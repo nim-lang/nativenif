@@ -431,8 +431,22 @@ const arkhamStressA64Known: seq[string] = @[
   # out-of-registers error. The planer's early-free now covers `InFReg`
   # homes too, so the dead vector temps hand their registers back in time
   # and the fixture passes even stressed.)
-  # (`atomic_cas_regpressure` lived here for the missing steal/spill arm on the
-  # intrinsic-operand pick, and now passes at this list's own k=3.)
+  # Back on this list at k=3 since the planer gives a call-free local a VOLATILE
+  # register first (see `getSym`). It is the emitter's OWN long-known gap — the
+  # intrinsic-operand pick has no arm that evicts a live local — and not a new one;
+  # what changed is only what used to mask it. Under callee-saved-first, `main.0`'s
+  # `a.0` found no home and spilled, which left one volatile over for the CAS's third
+  # operand register; volatile-first homes `a.0`/`b.0`/`c.0` in x9/x10/x11 instead, so
+  # at the `(instr acx.0 …)` every one of the six registers a k=3 machine has is taken:
+  # three by those live locals, x19/x21 by the two operand temps already reserved, and
+  # x20 sealed as the destination `ok.0`. Wanting a fourth, `takeInstrReg` reaches
+  # `takeHeld`, whose whole point is that demoting a local mid-emission is impossible
+  # in the merged core, and it fails LOUDLY. Verified across k=3..6 and unstressed:
+  # k=3 asserts, every higher k returns the correct 112 — a totality gap, never a
+  # wrong answer. Closing it is the same "evict a live local" arm the x86-64
+  # `aggr_arg_parked` entries above wait on; the fixture needs 7 live registers where
+  # a k=3 machine has 6, so nothing short of that arm makes it fit.
+  "atomic_cas_regpressure",
   # `instrOperandInPlace` — read a register-homed symbol operand where it lies
   # instead of copying it into a register the row then cannot find — is x86-64
   # ONLY, deliberately: that is the machine whose whole emitter budget is two

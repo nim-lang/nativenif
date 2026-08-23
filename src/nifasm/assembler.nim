@@ -395,7 +395,9 @@ type
 
   CallContext = object          ## Context for a `prepare` block - tracks call setup state
     state: CallContextState
-    callEmitted: bool           # True after (call) or (extcall) is emitted
+    callEmitted: bool           # True after (call), (tailcall) or (extcall)
+    isTailcall: bool            # the marker was `(tailcall)`: control does not come
+                                # back, so there is no result to bind
     target: string              # Target proc/symbol name (a qualified name whose
                                 # module suffix `lookupWithAutoImport` parses — string)
     typ: Type                   # ProcT type (contains params, results, clobbers)
@@ -2395,12 +2397,15 @@ proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
       if not param.typ.isOnStack and param.name notin ctx.callContext.argsSet:
         error("Missing argument: " & ctx.nameOf(param.name), hdr)
 
-    for res in ctx.callContext.typ.results:
-      if res.name notin ctx.callContext.resultsSet:
-        error("Missing result binding: " & ctx.nameOf(res.name), hdr)
+    if not ctx.callContext.isTailcall:
+      # A tail call binds no result: the callee's return value IS this proc's, and
+      # it is already in the return register when the callee's own `ret` runs.
+      for res in ctx.callContext.typ.results:
+        if res.name notin ctx.callContext.resultsSet:
+          error("Missing result binding: " & ctx.nameOf(res.name), hdr)
 
     if not ctx.callContext.callEmitted:
-      error("Missing (call) or (extcall) in prepare block", hdr)
+      error("Missing (call), (tailcall) or (extcall) in prepare block", hdr)
   else:
     if not ctx.callContext.callEmitted:
       error("Missing (extcall) in prepare block", hdr)
@@ -2479,6 +2484,41 @@ proc genCallMarkerA64(n: var Cursor; ctx: var GenContext) =
   ctx.buf.emitBL(labId)
   ctx.callContext.callEmitted = true
 
+  inc n
+
+proc genTailcallMarkerA64(n: var Cursor; ctx: var GenContext) =
+  ## `(tailcall)` — the `(call)` marker's no-link twin. Same prepared arguments,
+  ## same clobber declaration, `b`/`br` instead of `bl`/`blr`: control leaves this
+  ## proc for good, so the callee returns to OUR caller and its `ret` is ours.
+  ##
+  ## The frame is already gone. arkham tears it down between the last argument
+  ## store and this marker — the teardown touches only SP and callee-saved
+  ## registers, never x0–x7 — so nothing here may address a stack slot, which is
+  ## also why arkham refuses to form a tail call that needs stack arguments.
+  if not ctx.inCall:
+    error("(tailcall) can only be used inside a prepare block", n)
+  if ctx.callContext.callEmitted:
+    error("Multiple call instructions in prepare block", n)
+  let sym = lookupWithAutoImport(ctx, ctx.scope, ctx.callContext.target, n)
+  ctx.clobberedA64.incl callClobbersA64(ctx)
+  ctx.callContext.isTailcall = true
+  if ctx.callContext.indirect:
+    # An INDIRECT tail call would have to survive the `(popframe)` that precedes
+    # it, and the pointer is exactly what does not: it sits in a register the
+    # prologue saved, so restoring the frame restores the caller's value over it.
+    # Staging it in x16 first is possible but not expressible here — `(popframe)`
+    # is already emitted by the time this marker is read — so the backend must not
+    # form one, and this says so loudly rather than branching to whatever the
+    # caller happened to leave in that register.
+    error("indirect tail call: the target register does not survive (popframe)", n)
+  var labId: LabelId
+  if sym.offset == -1:
+    labId = ctx.buf.createLabel()
+    sym.offset = int(labId)
+  else:
+    labId = LabelId(sym.offset)
+  ctx.buf.emitB(labId)
+  ctx.callContext.callEmitted = true
   inc n
 
 proc genSyscallMarkerA64(n: var Cursor; ctx: var GenContext) =
@@ -2858,6 +2898,42 @@ proc cfiStep(ctx: var GenContext; cfaDelta: int32;
                                    saves: saves, ssizeSlot: ssizeSlot)
   ctx.prologueOp = true
 
+proc genPopframeA64(ctx: var GenContext) =
+  ## `(popframe)` — undo this proc's prologue, wherever we are in its body.
+  ##
+  ## The frame's shape is nifasm's to know, not the backend's: arkham finalizes
+  ## `usedCallee`/`hasStackVars` only AFTER it has emitted the body (a register
+  ## claimed by a last-resort pick mid-body still adds a prologue pair), so a
+  ## teardown written at a mid-body site would have to guess how many pairs to pop
+  ## and whether a frame `sub` exists at all. Here neither is a guess: the prologue
+  ## has already been assembled and `ctx.unwind[^1].steps` records every one of its
+  ## stores, in order, with the registers it saved. Replaying that in reverse is the
+  ## epilogue by construction.
+  ##
+  ## A tail call is the caller of this: arguments in place, frame gone, `b` to the
+  ## callee, whose `ret` returns to OUR caller.
+  if ctx.unwind.len == 0: return
+  let steps = ctx.unwind[^1].steps
+  for i in countdown(steps.len - 1, 0):
+    let st = steps[i]
+    if st.ssizeSlot:
+      # The frame `sub`'s twin — same two halves, same patch list, since the size
+      # is still unknown until the slots are laid out.
+      arm64.emitAddImm(ctx.buf.data, arm64.SP, arm64.SP, 0'u16)
+      ctx.ssizePatches.add((ctx.buf.data.len - 4, 0))
+      arm64.emitAddImmShifted12(ctx.buf.data, arm64.SP, arm64.SP, 0'u16)
+      ctx.ssizePatches.add((ctx.buf.data.len - 4, 0))
+    elif st.saves.len == 2:
+      # One pair push: `stp a, b, [sp, #-16]!` undone by `ldp a, b, [sp], #16`.
+      if st.saves[0].isFloat:
+        arm64.emitFldpPost(ctx.buf.data,
+                           arm64.FloatRegister(st.saves[0].reg),
+                           arm64.FloatRegister(st.saves[1].reg), arm64.SP, 16'i32)
+      else:
+        arm64.emitLdp(ctx.buf.data,
+                      arm64.Register(st.saves[0].reg),
+                      arm64.Register(st.saves[1].reg), arm64.SP, 16'i32)
+
 proc genInstA64(n: var Cursor; ctx: var GenContext) =
   if n.kind != TagLit: error("Expected instruction", n)
   let instTag = tagToA64Inst(n.tag)
@@ -2950,6 +3026,11 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     genPrepareA64(n, ctx)
   of CallA64:
     genCallMarkerA64(n, ctx)
+  of TailcallA64:
+    genTailcallMarkerA64(n, ctx)
+  of PopframeA64:
+    inc n
+    genPopframeA64(ctx)
   of ExtcallA64:
     genExtcallA64(n, ctx)
   of IteA64:
