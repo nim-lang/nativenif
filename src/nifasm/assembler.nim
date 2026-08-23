@@ -4755,7 +4755,20 @@ proc emitMemAccessM(ctx: var GenContext; rt: thumb2.Register;
   ## with BOTH an index and a non-zero offset is materialized into IP first. IP is
   ## the AAPCS32 scratch and hosts no value, so this needs no spill.
   if not mem.hasIndex:
-    thumb2.emitLoadStoreImm(ctx.buf.data, rt, mem.base, mem.offset, width,
+    if thumb2.fitsLoadStoreImm(mem.offset):
+      thumb2.emitLoadStoreImm(ctx.buf.data, rt, mem.base, mem.offset, width,
+                              isLoad = isLoad, signed = signed)
+      return
+    # Past the 12-bit displacement — a frame bigger than 4 KB. The address is
+    # computed into IP, the AAPCS32 scratch that hosts no value. Unless IP is
+    # already the value being moved, which is the one case with no register left
+    # and therefore an error rather than a wrong address.
+    if rt == thumb2.IP:
+      error("Cortex-M: a " & $mem.offset & "-byte displacement needs the IP " &
+            "scratch to compute, and IP already holds the value being moved", n)
+    thumb2.emitMovImm32(ctx.buf.data, thumb2.IP, uint32(mem.offset))
+    thumb2.emitAdd3(ctx.buf.data, thumb2.IP, mem.base, thumb2.IP)
+    thumb2.emitLoadStoreImm(ctx.buf.data, rt, thumb2.IP, 0, width,
                             isLoad = isLoad, signed = signed)
   elif mem.offset == 0:
     thumb2.emitLoadStoreReg(ctx.buf.data, rt, mem.base, mem.index, width,
@@ -4781,13 +4794,24 @@ proc emitVfpMemAccessM(ctx: var GenContext; sd: thumb2.FloatRegister;
   ## indexed operand is materialized into IP first — the AAPCS32 scratch, which
   ## hosts no value.
   if not mem.hasIndex:
-    thumb2.emitVldrVstr(ctx.buf.data, sd, mem.base, mem.offset, isLoad)
+    if thumb2.fitsVldrVstrImm(mem.offset):
+      thumb2.emitVldrVstr(ctx.buf.data, sd, mem.base, mem.offset, isLoad)
+    else:
+      # VLDR reaches only +/-1020, so this happens far sooner than it does for an
+      # integer access. IP is always free here: the value is in a FLOAT register.
+      thumb2.emitMovImm32(ctx.buf.data, thumb2.IP, uint32(mem.offset))
+      thumb2.emitAdd3(ctx.buf.data, thumb2.IP, mem.base, thumb2.IP)
+      thumb2.emitVldrVstr(ctx.buf.data, sd, thumb2.IP, 0, isLoad)
     return
   if mem.shift == 0:
     thumb2.emitAdd3(ctx.buf.data, thumb2.IP, mem.base, mem.index)
   else:
     thumb2.emitLslImm(ctx.buf.data, thumb2.IP, mem.index, mem.shift)
     thumb2.emitAdd3(ctx.buf.data, thumb2.IP, mem.base, thumb2.IP)
+  if not thumb2.fitsVldrVstrImm(mem.offset):
+    thumb2.emitAddImm(ctx.buf.data, thumb2.IP, thumb2.IP, uint32(mem.offset))
+    thumb2.emitVldrVstr(ctx.buf.data, sd, thumb2.IP, 0, isLoad)
+    return
   thumb2.emitVldrVstr(ctx.buf.data, sd, thumb2.IP, mem.offset, isLoad)
 
 proc loadToRegM(ctx: var GenContext; dest: thumb2.Register; op: OperandM; n: Cursor) =

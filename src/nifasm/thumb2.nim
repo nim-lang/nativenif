@@ -248,7 +248,12 @@ proc emitAddImm*(dest: var Bytes; rd, rn: Register; imm: uint32) =
     dest.emitWide(0xF200'u16 or (i shl 10) or reg(rn),
                   (imm3 shl 12) or (reg(rd) shl 8) or imm8)
     return
-  raise newException(ValueError, "thumb2: ADD immediate out of range: " & $imm)
+  # Past 4095 there is no immediate form at all: the constant goes into IP (the
+  # AAPCS32 scratch, which hosts no value) and the register form does the work.
+  # A frame bigger than 4 KB is what gets here.
+  assert rd != IP and rn != IP, "thumb2: emitAddImm needs IP as a scratch"
+  dest.emitMovImm32(IP, imm)
+  dest.emitAdd3(rd, rn, IP)
 
 proc emitSubImm*(dest: var Bytes; rd, rn: Register; imm: uint32) =
   ## SUB rd, rn, #imm, mirroring `emitAddImm`'s form selection.
@@ -272,7 +277,9 @@ proc emitSubImm*(dest: var Bytes; rd, rn: Register; imm: uint32) =
     dest.emitWide(0xF2A0'u16 or (i shl 10) or reg(rn),
                   (imm3 shl 12) or (reg(rd) shl 8) or imm8)
     return
-  raise newException(ValueError, "thumb2: SUB immediate out of range: " & $imm)
+  assert rd != IP and rn != IP, "thumb2: emitSubImm needs IP as a scratch"
+  dest.emitMovImm32(IP, imm)
+  dest.emitSub3(rd, rn, IP)
 
 proc emitMul*(dest: var Bytes; rd, rn, rm: Register) =
   ## MUL rd, rn, rm (32-bit result). ARMv7-M always has this.
@@ -390,6 +397,13 @@ proc emitTstReg*(dest: var Bytes; rn, rm: Register) =
 type
   MemWidth* = enum
     MemByte, MemHalf, MemWord
+
+proc fitsLoadStoreImm*(offset: int32): bool {.inline.} =
+  ## Whether `offset` fits an LDR/STR (immediate). The 32-bit forms take an
+  ## unsigned 12-bit displacement or a T4 "negative offset" down to -255; beyond
+  ## that the address has to be computed. `emitLoadStoreImm` RAISES rather than
+  ## encode something else, so this is the check a caller must make first.
+  offset >= -255 and offset < 4096
 
 proc emitLoadStoreImm*(dest: var Bytes; rt, rn: Register; offset: int32;
                        width: MemWidth; isLoad: bool; signed = false) =
@@ -638,6 +652,12 @@ proc emitVcvtToF32*(dest: var Bytes; sd, sm: FloatRegister; signed: bool) =
 proc emitVcvtFromF32*(dest: var Bytes; sd, sm: FloatRegister; signed: bool) =
   ## `VCVT.S32.F32` / `VCVT.U32.F32`, rounding TOWARD ZERO — C's rule, and Leng's.
   dest.emitVfpUnary((if signed: 0xD'u16 else: 0xC'u16), 0x00C0'u16, sd, sm)
+
+proc fitsVldrVstrImm*(offset: int32): bool {.inline.} =
+  ## VLDR/VSTR take a WORD-scaled 8-bit displacement: +/-1020, and 4-aligned.
+  ## Much narrower than the integer `ldr`'s 4095, so a float in a big frame needs
+  ## its address computed where an integer would not.
+  (offset and 3) == 0 and offset >= -1020 and offset <= 1020
 
 proc emitVldrVstr*(dest: var Bytes; sd: FloatRegister; rn: Register;
                    offset: int32; isLoad: bool) =

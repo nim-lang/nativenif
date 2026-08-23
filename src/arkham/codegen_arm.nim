@@ -3171,11 +3171,11 @@ proc emitMemIntrin2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
     let done = g.freshLabel()
     if builtin == "memmove":
       let fwd = g.freshLabel()
-      g.ab.tree CmpA64: (g.ab.reg dst; g.ab.reg src)
+      g.ab.tree CmpA64: (g.emReg dst; g.emReg src)
       g.emBr(BlsA64, fwd)
       g.movReg(i, n)
       g.emitLoop:
-        g.ab.tree CmpA64: (g.ab.reg i; g.ab.intLit 0)
+        g.ab.tree CmpA64: (g.emReg i; g.ab.intLit 0)
         g.emBr(BeqA64, done)
         g.binImm(SubA64, i, 1)
         g.emLdrb(b, src, i); g.emStrb(b, dst, i)
@@ -3186,7 +3186,7 @@ proc emitMemIntrin2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
     g.binImm(LsrA64, b2, 3)                              # quadwords = n div 8
     g.movImm(i, 0)
     g.emitLoop:
-      g.ab.tree CmpA64: (g.ab.reg i; g.ab.reg b2)
+      g.ab.tree CmpA64: (g.emReg i; g.emReg b2)
       g.emBr(BhsA64, tail)
       g.emLoadQwordAt(b, src, i)
       g.emStoreQwordAt(dst, i, b)
@@ -3194,7 +3194,7 @@ proc emitMemIntrin2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
     g.emLab(tail)
     g.binImm(LslA64, i, 3)                               # i = n and not 7, now bytes
     g.emitLoop:
-      g.ab.tree CmpA64: (g.ab.reg i; g.ab.reg n)
+      g.ab.tree CmpA64: (g.emReg i; g.emReg n)
       g.emBr(BhsA64, done)
       g.emLdrb(b, src, i); g.emStrb(b, dst, i)
       g.binImm(AddA64, i, 1)
@@ -3204,7 +3204,7 @@ proc emitMemIntrin2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
     let done = g.freshLabel()
     g.movImm(i, 0)
     g.emitLoop:
-      g.ab.tree CmpA64: (g.ab.reg i; g.ab.reg n)
+      g.ab.tree CmpA64: (g.emReg i; g.emReg n)
       g.emBr(BhsA64, done)
       g.emStrb(src, dst, i)                              # store low byte of `val` (in x1)
       g.binImm(AddA64, i, 1)
@@ -3215,10 +3215,10 @@ proc emitMemIntrin2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
     let equal = g.freshLabel(); let done = g.freshLabel()
     g.movImm(i, 0)
     g.emitLoop:
-      g.ab.tree CmpA64: (g.ab.reg i; g.ab.reg n)
+      g.ab.tree CmpA64: (g.emReg i; g.emReg n)
       g.emBr(BhsA64, equal)
       g.emLdrb(b, dst, i); g.emLdrb(b2, src, i)          # dst=pa, src=pb
-      g.ab.tree CmpA64: (g.ab.reg b; g.ab.reg b2)
+      g.ab.tree CmpA64: (g.emReg b; g.emReg b2)
       g.emBr(BneA64, diff)
       g.binImm(AddA64, i, 1)
     g.emLab(diff)
@@ -6717,7 +6717,12 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
     cc.into:
       let hasVal = cc.hasMore and cc.kind != DotToken
       if g.isEntryProc and (g.a64Linux or g.thumbM):
-        if hasVal:
+        if hasVal and g.thumbM and g.isWideExpr(cc):
+          # An entry that computes its exit code in 64 bits (`main` returns
+          # `(i 32)`, the expression does not). The exit code is the LOW word —
+          # the same truncation the ordinary narrowing return performs.
+          g.wideArgTruncated(g.wideValueIntoTemp(cc), IntRet)
+        elif hasVal:
           var d = needsReg(g.valueSlot(cc))
           g.emitValue2(cc, d)
           g.place2(d, IntRet)                            # exit code → x0 / r0
@@ -7256,6 +7261,10 @@ proc genTvar(g: var CodeGen; name: string; decl: Cursor) =
 
 const
   SemiWrite = 5           ## SYS_WRITE:  r1 = &{handle, buf, len}
+  SemiOpen = 1            ## SYS_OPEN:   r1 = &{&name, mode, namelen}
+  SemiOpenModeW = 4       ## the "w" mode; `:tt` opened with it is the console
+  SemiTtyName = "`shtty.0"    ## the `:tt` device name, in rodata
+  SemiTtyHandle = "`shwh.0"   ## the cached console handle, one `.bss` word
   SemiExitExtended = 0x20 ## SYS_EXIT_EXTENDED: r1 = &{reason, status}
   SemiBkpt = 0xAB         ## the `bkpt` immediate that IS the semihosting call
   AdpStoppedApplicationExit = 0x20026
@@ -7332,30 +7341,93 @@ proc emitSemihostRuntime(g: var CodeGen; sp: SyscallProc) =
   of "write":
     g.ab.tree NifasmDecl.ProcD:
       g.ab.symDef sp.asmName
+      # The signature has to be the one the CALL SITE plans, not three tidy
+      # single-register words: Leng's `write` declares `count` as an `int64`, and
+      # on this target that is a register PAIR (r2:r3). The body is unaffected —
+      # `fd` and `buf` are one word each either way, so the length's low word is
+      # in r2 regardless — but the DECLARATION must agree or the caller stages an
+      # `(arg p2.0 1)` the callee never declared.
+      var pslots: seq[AsmSlot] = @[]
+      var pc = sp.decl
+      inc pc                                   # (proc … → name
+      inc pc                                   # name → params slot
+      if pc.kind == TagLit: pslots = paramSlots(g.prog, pc)
+      let plan = planCall(g.md, pslots, retByRef = false)
       g.ab.tree NifasmDecl.ParamsD:
-        for i, r in [R0, R1, R2]:
+        for i, pl in plan.args:
           g.ab.tree NifasmDecl.ParamD:
             g.ab.symDef paramName(i)
-            g.ab.reg r
-            g.ab.intType(32)
+            if pl.words > 1:
+              g.ab.tree RegsD:
+                for k in 0 ..< pl.words: g.ab.reg g.md.gprAt(pl, k)
+            else:
+              g.ab.reg g.md.gprAt(pl)
+            g.ab.intType(if pl.words > 1: 64 else: 32)
+      var retC = sp.decl
+      inc retC; skip retC; skip retC           # name, params → return type
+      let wideRes = not retIsVoid(retC) and g.isWideSlot(slotOf(g.prog, retC))
       g.ab.tree NifasmDecl.ResultD:
-        g.ab.symDef synth("ret.0")
-        g.ab.reg R0
-        g.ab.intType(32)
+        # A 64-bit result travels in r0:r1 with an EMPTY result slot, as
+        # everywhere else on this target — see `emitSignature`.
+        if not wideRes:
+          g.ab.symDef synth("ret.0")
+          g.ab.reg R0
+          g.ab.intType(32)
       g.ab.tree NifasmDecl.ClobberD:
         for r in machine_m.ConvClobbersGpr: g.ab.reg r
       g.ab.tree StmtsA64:
-        for k in 0 ..< 3: g.semiBlockSlot(k)        # handle, buf, len
+        # Five words: the three-field semihosting parameter block, plus somewhere
+        # to keep `buf`/`len` across the SYS_OPEN that may run first (it needs the
+        # block for its own arguments).
+        for k in 0 ..< 5: g.semiBlockSlot(k)
         g.ab.tree SubA64: (g.ab.reg SP; g.ab.keyword SsizeX)
-        for i, r in [R0, R1, R2]:
-          g.ab.tree MovA64: (g.ab.sym synth("shblk" & $i & ".0"); g.ab.reg r)
+        # SYS_WRITE's first field is a semihosting HANDLE, not a POSIX fd. Passing
+        # a raw `1` writes NOTHING and reports success — the call returns "0 bytes
+        # not written", so a caller checking the return value sees a complete
+        # write of nothing. The handle comes from `SYS_OPEN(":tt")`, opened once
+        # and cached in a `.bss` word; that is also what makes the same image work
+        # against a hardware debug probe. Semihosting has ONE console, so the `fd`
+        # argument is ignored — stdout and stderr are the same stream here.
+        let lHave = g.freshLabel()
+        g.ab.tree MovA64: (g.ab.sym synth("shblk3.0"); g.ab.reg R1)   # save buf
+        g.ab.tree MovA64: (g.ab.sym synth("shblk4.0"); g.ab.reg R2)   # save len
+        g.ab.tree AdrA64: (g.ab.reg R0; g.ab.sym SemiTtyHandle)
+        g.ab.tree MovA64:
+          g.ab.reg R3
+          g.ab.tree MemX: g.ab.reg R0
+        g.ab.tree CmpA64: (g.ab.reg R3; g.ab.intLit 0)
+        g.emBr(BneA64, lHave)
+        g.ab.tree AdrA64: (g.ab.reg R3; g.ab.sym SemiTtyName)
+        g.ab.tree MovA64: (g.ab.sym synth("shblk0.0"); g.ab.reg R3)
+        g.ab.tree MovA64: (g.ab.reg R3; g.ab.intLit SemiOpenModeW)
+        g.ab.tree MovA64: (g.ab.sym synth("shblk1.0"); g.ab.reg R3)
+        g.ab.tree MovA64: (g.ab.reg R3; g.ab.intLit 3)                # len(":tt")
+        g.ab.tree MovA64: (g.ab.sym synth("shblk2.0"); g.ab.reg R3)
+        g.ab.tree LeaA64: (g.ab.reg R1; g.ab.sym synth("shblk0.0"))
+        g.ab.tree MovA64: (g.ab.reg R0; g.ab.intLit SemiOpen)
+        g.ab.tree BkptM: g.ab.intLit SemiBkpt
+        g.ab.tree MovA64: (g.ab.reg R3; g.ab.reg R0)                  # the handle
+        g.ab.tree AdrA64: (g.ab.reg R0; g.ab.sym SemiTtyHandle)
+        g.ab.tree MovA64:
+          g.ab.tree MemX: g.ab.reg R0
+          g.ab.reg R3
+        g.emLab(lHave)
+        g.ab.tree MovA64: (g.ab.sym synth("shblk0.0"); g.ab.reg R3)   # handle
+        g.ab.tree MovA64: (g.ab.reg R3; g.ab.sym synth("shblk3.0"))
+        g.ab.tree MovA64: (g.ab.sym synth("shblk1.0"); g.ab.reg R3)   # buf
+        g.ab.tree MovA64: (g.ab.reg R3; g.ab.sym synth("shblk4.0"))
+        g.ab.tree MovA64: (g.ab.sym synth("shblk2.0"); g.ab.reg R3)   # len
         g.ab.tree LeaA64: (g.ab.reg R1; g.ab.sym synth("shblk0.0"))
         g.ab.tree MovA64: (g.ab.reg R0; g.ab.intLit SemiWrite)
         g.ab.tree BkptM: g.ab.intLit SemiBkpt
         # Semihosting returns the count NOT written; POSIX `write` returns the
-        # count written. Converting here keeps every caller ordinary. r2 still
-        # holds the length: a semihosting call writes only r0.
+        # count written. Converting here keeps every caller ordinary.
+        g.ab.tree MovA64: (g.ab.reg R2; g.ab.sym synth("shblk4.0"))
         g.ab.tree Sub3A64: (g.ab.reg R0; g.ab.reg R2; g.ab.reg R0)
+        if wideRes:
+          # The caller reads r0:r1 raw. The count written is never negative, so
+          # the high word is zero.
+          g.ab.tree MovA64: (g.ab.reg R1; g.ab.intLit 0)
         g.ab.tree AddA64: (g.ab.reg SP; g.ab.keyword SsizeX)
         g.ab.keyword RetA64
   else:
@@ -7405,6 +7477,18 @@ proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool): string =
     for name, decl in g.prog.globals:
       g.genGlobal(name, decl)
     g.emitSemihostExitProc(EntryExitShim) # the entry's tail-call target, always
+    if g.prog.syscalls.len > 0:
+      # The `write` shim's console handle and the `:tt` device name it opens.
+      # Emitted whenever any shim is, rather than tracked: one word of .bss and
+      # four bytes of rodata is not worth a flag.
+      g.ab.tree RodataD:
+        g.ab.symDef SemiTtyName
+        g.ab.str ":tt\0"
+      g.ab.open NifasmDecl.GvarD
+      g.ab.symDef SemiTtyHandle
+      g.ab.intType(32)
+      g.ab.intLit 0
+      g.ab.close()
     for sp in g.prog.syscalls:            # semihosting shims, called like any proc
       g.emitSemihostRuntime(sp)
     for info in g.prog.procs:

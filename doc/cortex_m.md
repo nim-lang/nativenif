@@ -149,6 +149,14 @@ entry and cache the handle, so the same images run on real hardware.
 Both `exit` and `write` are all the existing arkham corpus needs: of 236
 fixtures, 225 `importc "exit"` and 3 `importc "write"`.
 
+`SYS_WRITE`'s first field is a semihosting HANDLE, not a POSIX fd. Passing a raw
+`1` writes nothing AND reports success — the call returns "0 bytes not written",
+so a caller checking the return value sees a complete write of nothing. The
+handle comes from `SYS_OPEN(":tt")`, which the `write` shim does once and caches
+in a `.bss` word; that is also what makes the same image work against a hardware
+debug probe. Semihosting has one console, so the `fd` argument is ignored —
+stdout and stderr are the same stream.
+
 ## Remaining milestones
 
 * **M1 — word-size parameterization.** The toolchain hardcodes a 64-bit word:
@@ -194,7 +202,9 @@ fixtures, 225 `importc "exit"` and 3 `importc "write"`.
 * **M4 — 64-bit integers.** DONE. `tests/arkham/` — the full 64-bit corpus — is
   compiled for Cortex-M and run under QEMU by `arkhamCortexM64Tests`, with a
   named skip list (`cortexMUnsupported`) that states why each remaining fixture
-  cannot be served. 151 of 220 pass today.
+  cannot be served. 165 of 220 pass today, and the ONLY one that computes a
+  wrong answer is `stack_array_align`, which asserts a 16-byte stack alignment
+  AAPCS32 does not promise. Everything else refuses by name.
 
   **Not** register pairs. A 64-bit value here is EIGHT BYTES AT AN ADDRESS, and
   the ops read and write it a word at a time (`arkham/codegen_m64.nim`, included

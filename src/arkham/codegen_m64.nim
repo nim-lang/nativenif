@@ -229,8 +229,18 @@ proc emitNarrowValueInto(g: var CodeGen; c: Cursor; dest: Reg) =
   g.freeVal(v)
 
 proc wideFromNarrowExpr(g: var CodeGen; dst: WideRef; c: Cursor; signed: bool) =
+  ## Widen a NARROWER expression to the 64-bit value at `dst`.
+  ##
+  ## The source's own width matters as much as its signedness: a `(i 16)` arrives
+  ## in a register in its CANONICAL (sign-extended) form, so widening it as
+  ## unsigned — which a `cast` does — has to re-normalize the low 32 bits first
+  ## or the value is already wrong before the high word is chosen. `cast[int64](
+  ## int16(64536))` is 64536, not -1000, and the difference survives into the
+  ## answer.
   let t = g.takeWideRegs(1, "a 64-bit widening operand")[0]
   g.emitNarrowValueInto(c, t)
+  let (srcW, _) = g.srcWidthSigned(c)
+  if srcW < wordBits(): g.extendTo(t, srcW, signed)
   g.wideFromNarrow(dst, t, signed)
   g.dropWideRegs(@[t])
 
@@ -342,7 +352,7 @@ proc wideShift(g: var CodeGen; dst, a: WideRef; amount: Cursor; ek: LengExpr;
   else:
     if signed:
       g.ab.tree Asr3A64: (g.emReg lo; g.emReg hi; g.emReg n)
-      g.ab.tree AsrA64: (g.emReg hi; g.emReg hi; g.ab.intLit 31)
+      g.ab.tree Asr3A64: (g.emReg hi; g.emReg hi; g.ab.intLit 31)
     else:
       g.ab.tree Lsr3A64: (g.emReg lo; g.emReg hi; g.emReg n)
       g.movImm(hi, 0)
@@ -535,14 +545,20 @@ proc emitWideInto(g: var CodeGen; c0: Cursor; dst: WideRef) =
           "a runtime routine this backend does not provide — FPv4-SP converts to " &
           "32 bits (see M5 in doc/cortex_m.md)", lengInfo(c)
       else:
-        # Widening a 32-bit value: the SOURCE's signedness decides the high word,
-        # not the target's. `uint32(x).int64` must be zero-extended even though
-        # `int64` is signed, and `int32(x).uint64` sign-extended even though
-        # `uint64` is not — this is the one place where taking the target's sign
-        # produces a number that is wrong by 2^32 and nothing downstream can tell.
+        # Widening a narrower value: the SOURCE's signedness decides the high
+        # word, not the target's. `uint32(x).int64` must be zero-extended even
+        # though `int64` is signed, and `int32(x).uint64` sign-extended even
+        # though `uint64` is not — this is the one place where taking the
+        # target's sign produces a number wrong by 2^32 that nothing downstream
+        # can tell.
+        #
+        # …and a `cast` is unsigned regardless. `cast` is a REINTERPRETATION of
+        # the source's bits, so it zero-extends where `conv` sign-extends; this
+        # is `reReprCast2`'s `(not isCast) and srcSigned`, stated again because
+        # the wide path does its own widening.
         let it = g.getType(innerC)
         let signedSrc = isSignedType(resolveType(g.prog, it))
-        g.wideFromNarrowExpr(dst, innerC, signedSrc)
+        g.wideFromNarrowExpr(dst, innerC, (c.exprKind != CastC) and signedSrc)
     of CallC: g.wideCallInto(c, dst)
     of AddrC, HaddrC, InstrC:
       lengError c, "arkham cortex-m: `" & $c.exprKind &

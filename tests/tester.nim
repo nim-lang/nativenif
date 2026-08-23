@@ -954,10 +954,10 @@ proc cortexMAsmTests() =
 
 const cortexMUnsupported: seq[string] = @[
   # `tests/arkham/` — the FULL 64-bit corpus — is run against Cortex-M as well.
-  # These are the fixtures it cannot serve yet, each parked under the reason it
-  # fails, so that any OTHER failure is fatal and a fixture that starts working
-  # is reported. Everything here refuses BY NAME (a compile-time error from
-  # arkham or nifasm); the one exception is called out at the bottom.
+  # These are the fixtures it cannot serve, each parked under the reason, so that
+  # any OTHER failure is fatal and a fixture that starts working is reported.
+  # Every one of them refuses BY NAME (a compile-time error from arkham or
+  # nifasm); the single exception is called out at the bottom.
 
   # ── float64 ─────────────────────────────────────────────────────────────────
   # Missing HARDWARE, not a missing feature: Cortex-M4F's FPv4-SP is single
@@ -974,16 +974,15 @@ const cortexMUnsupported: seq[string] = @[
   # ── float <-> 64-bit integer ────────────────────────────────────────────────
   # FPv4-SP converts to and from a THIRTY-TWO bit integer. `int64(f)` past 2^31
   # would need a runtime routine, and a `vcvt` plus a sign-extend would be
-  # quietly wrong exactly there — so it is refused instead. `int32(f)` and
-  # `float32(i)` are what this core has, and they work.
+  # quietly wrong exactly there — so it is refused. `int32(f)` and `float32(i32)`
+  # are what this core has, and they work.
   "div_floatparam", "float_const_conv", "fp32", "fpconv", "fpconv2",
 
   # ── no such hardware, no such OS ────────────────────────────────────────────
   # Thread-locals (no threads, no TLS register), `mmap`/`futex`/`___ulock_wake`
-  # (no kernel to ask), and the two x86-64-pinned fixtures.
+  # (no kernel to ask), and the x86-64-pinned stack-walk fixture.
   "tvar_addr", "tvar_aggregate", "tvar_arg_order",
-  "mmap_anon", "futex_wake", "ulock_wake",
-  "assembler_x64", "naked_stacktrace_x64",
+  "mmap_anon", "futex_wake", "ulock_wake", "naked_stacktrace_x64",
 
   # ── 64-bit intrinsics ───────────────────────────────────────────────────────
   # `clz`/`rbit`/`rev` and the atomics at 64 bits: ARMv7-M's are 32-bit, and its
@@ -998,18 +997,13 @@ const cortexMUnsupported: seq[string] = @[
   # of these fails LOUDLY at the pick — never with a wrong answer.
   "aconstr_byref_spilled", "aggr_arg_parked_manual", "array2d",
   "at_scratch_deref_base", "atomic_cas_operand_home", "atomic_ptr_cell",
-  "nested_at_read", "a64_big_frame",
+  "nested_at_read",
 
-  # ── still open in the 64-bit lowering ───────────────────────────────────────
-  # Known gaps, each with a named failure: a 64-bit value reaching a consumer
-  # that is not wide-aware (`leafret`, `deep_spill*`), the semihosting `write`
-  # shim's parameter widths (`hello`, `callret`, `calleeret`), a raw register use
-  # the binding checker rejects (`memcmp*`), and four arity mismatches between
-  # the AArch64 and Thumb-2 spellings of the same mnemonic.
-  "leafret", "deep_spill", "deep_spill_call",
-  "hello", "callret", "calleeret",
-  "memcmp", "memcmp_bulk",
-  "intops", "shift_count_stale_ptr_home", "cast_narrow_imm", "conv4",
+  # ── x86-64 assembly ─────────────────────────────────────────────────────────
+  # An `{.assembler.}` proc whose register pins name x86-64 registers. Refused on
+  # AArch64 too, and for the same reason: there is no target-neutral reading of
+  # `{.register: "rax".}`.
+  "assembler_x64",
 
   # ── INAPPLICABLE, not unsupported ───────────────────────────────────────────
   # The one entry that does not refuse: it runs and returns the wrong exit code,

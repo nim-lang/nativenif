@@ -584,13 +584,20 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     result.voidPtr = beginRead(npBuf)
     var nilBuf = parseFromBuffer("(nil)", "", sharedTags = tags)
     result.nilLit = beginRead(nilBuf)
-    var itBuf = parseFromBuffer("(i 64)", "", sharedTags = tags)
+    # The synthesized types a LITERAL gets. Target-width, not a fixed 64: an
+    # integer literal is a platform `int`, and a float literal is the widest
+    # float the target has. Hardcoding 64 made every literal's type wider than
+    # the machine on Cortex-M — visible as `(rebind :b.0 (i 64) …)` for a `(u 8)`
+    # local, which nifasm rightly refuses. `collect` runs after `setTargetWord`.
+    let iw = $wordBits()
+    var itBuf = parseFromBuffer("(i " & iw & ")", "", sharedTags = tags)
     result.intType = beginRead(itBuf)
-    var utBuf = parseFromBuffer("(u 64)", "", sharedTags = tags)
+    var utBuf = parseFromBuffer("(u " & iw & ")", "", sharedTags = tags)
     result.uintType = beginRead(utBuf)
     var ctBuf = parseFromBuffer("(c 8)", "", sharedTags = tags)
     result.charType = beginRead(ctBuf)
-    var ftBuf = parseFromBuffer("(f 64)", "", sharedTags = tags)
+    var ftBuf = parseFromBuffer("(f " & $(maxFloatSize() * 8) & ")", "",
+                                sharedTags = tags)
     result.floatType = beginRead(ftBuf)
     var btBuf = parseFromBuffer("(bool)", "", sharedTags = tags)
     result.boolType = beginRead(btBuf)
