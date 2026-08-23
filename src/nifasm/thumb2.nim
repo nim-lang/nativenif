@@ -538,6 +538,15 @@ proc emitAdr*(dest: var Buffer; rd: Register; target: LabelId) =
   dest.addReloc(pos, target, rkTADR, 4)
   dest.data.emitWide(0xF20F'u16, (reg(rd) shl 8))
 
+proc emitMovwMovtFunc*(dest: var Buffer; rd: Register; target: LabelId) =
+  ## MOVW+MOVT rd, =target|1 — a CODE address, with the Thumb-state bit set.
+  ## Use for anything that will be reached by `blx`/`bx`; `emitMovwMovtAbs` is
+  ## for data and must NOT set it.
+  let pos = dest.data.len
+  dest.addReloc(pos, target, rkTMovwMovtFunc, 8)
+  dest.data.emitMovImm16(rd, 0)
+  dest.data.emitMovt(rd, 0)
+
 proc emitMovwMovtAbs*(dest: var Buffer; rd: Register; target: LabelId) =
   ## MOVW+MOVT rd, =target — materialize a label's ABSOLUTE address, with no
   ## reach limit. What `emitAdr` cannot do beyond 4 KB, and what a bare-metal

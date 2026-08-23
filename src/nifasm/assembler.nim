@@ -4158,6 +4158,8 @@ type
     mem: thumb2.MemoryOperand
     argName: SymId
     label: LabelId
+    isCode: bool          ## the label names CODE (a proc), not data. Its address
+                          ## must carry the Thumb bit — see `rkTMovwMovtFunc`.
     gvarSym: Symbol       ## non-nil if the operand is a global's (.bss) address
 
 proc mRegType(): Type {.inline.} =
@@ -4536,6 +4538,7 @@ proc parseOperandM(n: var Cursor; ctx: var GenContext): OperandM =
         result.label = labId
       else:
         result.label = LabelId(sym.offset)
+      result.isCode = sym.kind == skProc
       result.reg = thumb2.R0
       result.typ = Type(kind: TypeKind.UIntT, bits: 32)
       inc n
@@ -5138,7 +5141,11 @@ proc genInstM(n: var Cursor; ctx: var GenContext) =
       # A code/rodata label. MOVW+MOVT carries the ABSOLUTE address, so unlike
       # ADR it has no ±4 KB reach limit — a firmware image's load address is
       # fixed at link time, so there is nothing to be relative to.
-      thumb2.emitMovwMovtAbs(ctx.buf, dr, op.label)
+      #
+      # A PROC's address additionally carries the Thumb bit: `blx` to an even
+      # address switches to ARM state, which M-profile does not have.
+      if op.isCode: thumb2.emitMovwMovtFunc(ctx.buf, dr, op.label)
+      else: thumb2.emitMovwMovtAbs(ctx.buf, dr, op.label)
   of CmpM:
     inc n
     let a = parseOperandM(n, ctx)

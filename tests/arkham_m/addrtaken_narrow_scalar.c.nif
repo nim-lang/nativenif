@@ -1,0 +1,57 @@
+(.nif27)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :setI8.0
+  (params
+   (param :p.0 .
+    (ptr
+     (i 8))))..
+  (stmts
+   (asgn
+    (deref p.0)-19)))
+ (proc :setU16.0
+  (params
+   (param :p.0 .
+    (ptr
+     (u 16))))..
+  (stmts
+   (asgn
+    (deref p.0)65520)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :a.0 .
+    (i 8)0)
+   (call setI8.0
+    (addr a.0))
+   (if
+    (elif
+     (neq
+      (conv
+       (i 32)a.0)-19)
+     (stmts
+      (call exit.0 11))))
+   (if
+    (elif
+     (neq a.0 -19)
+     (stmts
+      (call exit.0 12))))
+   (var :b.0 .
+    (u 16)0)
+   (call setU16.0
+    (addr b.0))
+   (if
+    (elif
+     (neq b.0 65520)
+     (stmts
+      (call exit.0 13))))
+   (call exit.0 42))))

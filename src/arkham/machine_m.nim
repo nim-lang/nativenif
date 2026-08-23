@@ -34,9 +34,26 @@ const
   IntArgRegs*   = [R0, R1, R2, R3]   ## AAPCS32 argument registers; r0 also returns
   IntRet*       = R0
 
-  ## Callee-saved homes for values that must survive a call. Six of AAPCS32's
-  ## eight: r10/r11 are withheld as the emitter's bridges (below).
-  IntCalleeSaved* = [R4, R5, R6, R7, R8, R9]
+  ## Callee-saved homes for values that must survive a call. Five of AAPCS32's
+  ## eight: r10/r11 are the emitter's bridges and r9 carries the hidden result
+  ## pointer (both below).
+  IntCalleeSaved* = [R4, R5, R6, R7, R8]
+
+  IndirectResultReg* = R9
+    ## Where a caller leaves `&result` for a callee returning an aggregate too
+    ## wide to fit in registers — the Cortex-M stand-in for AArch64's x8.
+    ##
+    ## AAPCS32 would pass that pointer as a hidden FIRST argument, shifting every
+    ## real parameter down one. Taking a register off the argument file instead
+    ## keeps the AArch64 shape the shared emitter already implements, and is
+    ## sound for the same reason it is sound there: arkham owns both sides of
+    ## every call. r9 works precisely because it is in NO allocation pool — no
+    ## proc ever writes it — so a callee-saved register is preserved across
+    ## arbitrary nesting without anyone saving it.
+    ##
+    ## It costs one allocator home. The alternative, r0 with the x86-style
+    ## argument shift, costs an argument register on every such call and needs
+    ## `planCall`'s `retByRef` threaded through sites that currently pass false.
 
   ## The volatile scratch arkham manages. On AArch64 the argument registers are
   ## kept OUT of this pool because seven other volatiles exist; here they are the
@@ -94,9 +111,15 @@ const
     intCalleeSaved: @IntCalleeSaved,
     floatTempRegs: @[],
     floatCalleeSaved: @[],
-    intCalleeSavedSet: {R4..R9},
+    intCalleeSavedSet: {R4..R8},
     floatCalleeSavedSet: {},
-    aggrByRefThreshold: 4)      # one word, as win64 uses one of its own (8)
+    aggrByRefThreshold: 8)      # TWO words, matching `slots.classifyArg`'s `2*w`.
+                                # These two decide the same thing and MUST agree:
+                                # `planCall` reads the threshold while the
+                                # classifier reads `2*w`, so a disagreement makes
+                                # the caller pass by value what the callee reads
+                                # as a pointer. (16 on both 64-bit targets — the
+                                # same rule, stated in words.)
 
 proc regNameM*(r: Reg): string =
   ## The asm-NIF spelling of a GPR slot. These are the tags nifasm's `MReg`

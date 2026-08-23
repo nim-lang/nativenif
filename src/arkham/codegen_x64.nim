@@ -66,7 +66,12 @@ proc emReg(g: var CodeGen; r: Reg) {.inline.} =
 
 proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg
 proc stagingCensus(g: var CodeGen; avoid: Reg): string
-let AddrSlot = AsmSlot(cls: AUInt, size: 8, align: 8)
+template AddrSlot(): AsmSlot = addrSlot()
+  ## A template, not a `let`: a module-level `let` is evaluated at module INIT,
+  ## before any backend has called `setTargetWord`, so it would snapshot whatever
+  ## the default happened to be. Harmless while x86-64 is the only user and the
+  ## default is already 64-bit — and exactly the kind of thing that stops being
+  ## harmless the day a second word size shares the file.
   ## The binding type for a staging register that holds a raw machine address / word
   ## (a pointer the consumer always `(cast (aptr T) …)`s before dereferencing, or a
   ## whole eightbyte copied verbatim). A well-typed `(u 64)` — NOT an untyped escape:
@@ -2905,7 +2910,7 @@ proc aggrArgAddr(g: var CodeGen; a: Cursor; recorded: Reg; avoid: openArray[Reg]
   ## `avoid` (the arg registers about to receive the words, not yet sealed here) so the
   ## pick cannot alias a word being written. Returns `(addr reg, wasSpilled)`; the caller
   ## releases with `giveBack` (spilled) or `unbindTemp`.
-  let slot = AsmSlot(cls: AUInt, size: 8, align: 8)
+  let slot = addrSlot()
   if recorded != NoReg:
     g.aggrAddrInto(a, recorded, slot, doBind = true)
     return (recorded, false)
@@ -4211,7 +4216,7 @@ proc prematLval2(g: var CodeGen; c: Cursor; asBase = false; hint = NoReg;
         let s = g.pickStagingScratch()
         if s == NoReg: raiseAssert "arkham x64: no staging register for a global base address"
         g.plan.seal s
-        g.bindTemp(s, AsmSlot(cls: AUInt, size: 8, align: 8))
+        g.bindTemp(s, addrSlot())
         g.lvalGlobBase[pos] = s
         g.emSymAddrByName(s, symName(c))                    # &global (RIP-rel) / &threadvar (FS+off)
     elif home.kind == StackPtr:
@@ -4712,7 +4717,7 @@ proc flatCopyToPtr(g: var CodeGen; srcVar: string; sizeBytes: int; dstPtr, tmp: 
   ## Three was the count that exhausted the staging pool in `toDecimal64` under
   ## `-d:danger`, and it was never a machine requirement — only a consequence of forcing
   ## every source into a register first.
-  g.bindTemp(tmp, AsmSlot(cls: AUInt, size: 8, align: 8))
+  g.bindTemp(tmp, addrSlot())
   var sp = NoReg
   let src = g.aggrSrcEnd(srcVar, sp)
   g.copyAggr(regEnd(dstPtr), src, sizeBytes, tmp)
@@ -5159,7 +5164,7 @@ proc aggrAddrLoc(g: var CodeGen; loc: Location; dest: Reg) =
   of StackPtr:
     g.ab.tree MovX64: (g.emReg dest; g.emStackMem(loc.ptrName))  # the slot IS the address
   of Glob, Tvar: g.emSymAddr(dest, loc)   # &global (RIP-rel) / &threadvar (FS base + offset)
-  of Mem: g.aggrAddrInto(loc.cur, dest, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)
+  of Mem: g.aggrAddrInto(loc.cur, dest, addrSlot(), doBind = false)
   else: raiseAssert "arkham x64n: aggrAddrLoc of " & $loc.kind
 
 proc aggrDstEnd(g: var CodeGen; loc: Location; staged: var Reg): AggrEnd =
@@ -5226,7 +5231,7 @@ proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
     else:
       g.emitLvalue2(rhs)
       let srcAddr = g.pickStagingSealed("an InRegPair copy src address", ScalarSlot)
-      g.aggrAddrInto(rhs, srcAddr, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)
+      g.aggrAddrInto(rhs, srcAddr, addrSlot(), doBind = false)
       g.marshalAggrFromAddr(srcAddr, tn, dwords)
       g.freeLvalTemps2(rhs)
       g.giveBack srcAddr
@@ -5259,7 +5264,7 @@ proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
     else:
       g.emitLvalue2(rhs)                   # pick the src lvalue's embedded values
       srcAddr = g.pickStagingSealed("an aggregate-copy src address", ScalarSlot)
-      g.aggrAddrInto(rhs, srcAddr, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)
+      g.aggrAddrInto(rhs, srcAddr, addrSlot(), doBind = false)
       g.freeLvalTemps2(rhs)
       regEnd(srcAddr)
   # In the top tier both addresses have already consumed the R11 bridge, so the per-word

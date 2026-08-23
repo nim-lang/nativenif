@@ -1311,10 +1311,17 @@ proc innerType*(p: var Program; t: Cursor): Cursor =
   else: raiseAssert "arkham: deref/index of a non-pointer/array type"
 
 proc aggrWordCount*(p: var Program; typeSym: SymId): int =
-  ## Number of 8-byte GPRs a ≤16-byte aggregate occupies (1 or 2).
+  ## Number of GPRs a small aggregate occupies (1 or 2), at the TARGET's word
+  ## size — 8 bytes on the 64-bit targets, 4 on Cortex-M. A two-`int32` struct is
+  ## one register there and two here; counting it in eightbytes on a 32-bit
+  ## target marshals only half of it, and the missing half reads as whatever the
+  ## register happened to hold.
   let sz = aggrByteSize(p, typeSym)
-  assert sz <= 16, "arkham v1: >16-byte aggregate ABI (by-ref / x8) not yet supported"
-  (sz + 7) div 8
+  let w = wordSize()
+  assert sz <= 2 * w,
+    "arkham: aggregate of " & $sz & " bytes reached the small-aggregate path, " &
+    "but the by-reference threshold is " & $(2 * w)
+  (sz + w - 1) div w
 
 proc layoutObjBody(p: var Program; bodyc: Cursor; base: int;
                    res: var seq[FieldInfo]) =

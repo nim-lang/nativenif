@@ -189,3 +189,10 @@ proc fieldAtOffset*(lay: seq[FieldInfo]; byteOff: int): string =
   for f in lay:
     if f.off == byteOff: return f.name
   result = ""
+
+proc addrSlot*(): AsmSlot {.inline.} =
+  ## A slot holding an ADDRESS, at the target's pointer width. Sites that build
+  ## one inline used to spell `AsmSlot(cls: AUInt, size: 8, align: 8)`, which is
+  ## a silent 8-byte slot on a 32-bit target — twice the space, and any
+  ## neighbouring slot's offset shifted with it.
+  AsmSlot(cls: AUInt, size: wordSize(), align: wordAlign())

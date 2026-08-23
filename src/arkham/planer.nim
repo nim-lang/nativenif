@@ -1104,7 +1104,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
           # `effSlot` is the in-register value: the scalar itself, or a pointer — to
           # the aggregate copy (by-ref), or to the incoming stack bytes (a64 stack-passed
           # by-value aggregate, `aggrStack`; on x86-64 those took the slot path above).
-          let effSlot = if aggrByRef or aggrStack: AsmSlot(cls: AUInt, size: 8, align: 8) else: slot
+          let effSlot = if aggrByRef or aggrStack: addrSlot() else: slot
           # `viaPtr` names the spill shape for those two: the value is the AGGREGATE,
           # but a memory home holds only its ADDRESS. `spillTo` would say `NamedStack`,
           # which every consumer reads as "the slot IS the value" — `StackPtr` says the

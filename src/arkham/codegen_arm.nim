@@ -210,6 +210,13 @@ proc genTlvAddr(g: var CodeGen; name: string; dest: Reg) =
     g.emReg dest
     g.ab.sym name
 
+proc indirectResultReg(g: CodeGen): Reg {.inline.} =
+  ## Where the caller leaves `&result` for an aggregate return too wide for
+  ## registers. AArch64 has a dedicated x8 off the argument file; Cortex-M has no
+  ## such register and dedicates r9 (see `machine_m.IndirectResultReg`), which
+  ## keeps this emitter's one code shape working on both.
+  if g.thumbM: machine_m.IndirectResultReg else: IndirectResultReg
+
 proc emConvClobbers(g: var CodeGen) =
   ## The caller-saved set this target's calling convention destroys, emitted as a
   ## `(clobber …)` DECLARATION — raw register locations, never variable names.
@@ -807,7 +814,7 @@ proc genProctypeSig(g: var CodeGen; c: var Cursor) =
         var retByRef = false
         if not retIsVoid(retC):
           let rs = slotOf(g.prog, retC)
-          retByRef = rs.kind == AMem and rs.size > 16
+          retByRef = rs.kind == AMem and rs.size > 2 * wordSize()
         g.ab.tree ParamsD:
           if c.kind == TagLit:                  # (params (param …) …)
             # THE plan (see abi.nim). AArch64's hidden result pointer travels in x8
@@ -1028,8 +1035,9 @@ proc genTypeBody(g: var CodeGen; c: var Cursor) =
 # slots.nim so the register allocator shares them.
 
 proc emWordThroughPtr(g: var CodeGen; p: Reg; idx: int) =
-  ## `(mem (at (cast (aptr (u 64)) p) idx))` — the `idx`-th raw 8-byte word at `[p]`,
-  ## typed `(u 64)` (ignores the aggregate's field layout). nifasm strides by 8.
+  ## `(mem (at (cast (aptr (u W)) p) idx))` — the `idx`-th raw WORD at `[p]`, typed
+  ## `(u W)` (ignores the aggregate's field layout). nifasm strides by the element
+  ## width, so the same node means 8-byte words on AArch64 and 4-byte on Cortex-M.
   g.ab.tree MemX:
     g.ab.tree AtX:
       g.ab.tree CastX:
@@ -1050,20 +1058,21 @@ proc emScalarAtOff(g: var CodeGen; p: Reg; off, size: int) =
 
 proc loadAggrTail(g: var CodeGen; dst, base: Reg; aggrSize, byteOff: int) =
   ## `dst ←` the aggregate's trailing `aggrSize - byteOff` bytes at `[base + byteOff]`,
-  ## right-justified in `dst` (the by-value ABI leaves the eightbyte's padding bits
+  ## right-justified in `dst` (the by-value ABI leaves the word's padding bits
   ## unspecified, so the high bytes are free).
   ##
-  ## Reads NOTHING outside the aggregate. The eightbyte a ≤16-byte value ends in may
-  ## be the last mapped bytes of a page — a heap `seq` payload, the tail of a `.bss`
-  ## section — and a lazy 8-byte over-read there is a segfault that only shows up on
-  ## the allocation that happens to land at the boundary.
+  ## Reads NOTHING outside the aggregate. The word a small value ends in may be the
+  ## last mapped bytes of a page — a heap `seq` payload, the tail of a `.bss`
+  ## section — and a lazy full-word over-read there is a segfault that only shows up
+  ## on the allocation that happens to land at the boundary.
   let n = aggrSize - byteOff
-  if byteOff >= 8:
-    # A whole eightbyte precedes this one, so the aggregate's LAST 8 bytes are all in
+  let w = wordSize()
+  if byteOff >= w:
+    # A whole word precedes this one, so the aggregate's LAST `w` bytes are all in
     # bounds: read them as one word and shift the tail down into place.
-    g.ab.tree MovA64: (g.emReg dst; g.emScalarAtOff(base, aggrSize - 8, 8))
-    g.binImm(LsrA64, dst, int64((8 - n) * 8))
-  elif n in {1, 2, 4}:
+    g.ab.tree MovA64: (g.emReg dst; g.emScalarAtOff(base, aggrSize - w, w))
+    g.binImm(LsrA64, dst, int64((w - n) * 8))
+  elif n in {1, 2, 4} and n <= w:
     g.ab.tree MovA64: (g.emReg dst; g.emScalarAtOff(base, byteOff, n))
   else:
     # A 3/5/6/7-byte aggregate: no single load covers it and there is no full word to
@@ -1081,7 +1090,7 @@ proc storeAggrTail(g: var CodeGen; base, src: Reg; aggrSize, byteOff: int) =
   ## twin of `loadAggrTail`, and the reason it cannot simply store a full word: the
   ## bytes past the aggregate belong to whatever sits next to it.
   let n = aggrSize - byteOff
-  if n in {1, 2, 4}:
+  if n in {1, 2, 4} and n <= wordSize():
     g.ab.tree MovA64: (g.emScalarAtOff(base, byteOff, n); g.emReg src)
   else:
     let tmp = g.takeBridge(avoid = base)
@@ -1127,15 +1136,17 @@ proc aggrWordsToFromRegs(g: var CodeGen; varName: string; typeSym: SymId;
       else:
         g.ab.tree LeaA64: (g.emReg bridge; g.ab.sym varName)  # bridge ← &slot
     baseReg = bridge
+  let w = wordSize()
   for i in 0 ..< aggrWordCount(g.prog, typeSym):
-    if byteSize - i * 8 >= 8:                          # a full eightbyte → raw u64 word
+    let argReg = g.md.intArgRegs[firstArg + i]
+    if byteSize - i * w >= w:                          # a full word → raw uWORD move
       g.ab.tree MovA64:
-        if toRegs: (g.emReg IntArgRegs[firstArg + i]; g.emWordThroughPtr(baseReg, i))
-        else: (g.emWordThroughPtr(baseReg, i); g.emReg IntArgRegs[firstArg + i])
+        if toRegs: (g.emReg argReg; g.emWordThroughPtr(baseReg, i))
+        else: (g.emWordThroughPtr(baseReg, i); g.emReg argReg)
     elif toRegs:
-      g.loadAggrTail(IntArgRegs[firstArg + i], baseReg, byteSize, i * 8)
+      g.loadAggrTail(argReg, baseReg, byteSize, i * w)
     else:
-      g.storeAggrTail(baseReg, IntArgRegs[firstArg + i], byteSize, i * 8)
+      g.storeAggrTail(baseReg, argReg, byteSize, i * w)
   if bridge != NoReg: g.dropBridge bridge
 
 proc structToRegs(g: var CodeGen; varName: string; typeSym: SymId; firstArg: int) =
@@ -1597,7 +1608,7 @@ proc emitSignature(g: var CodeGen; decl: Cursor; declarative: bool) =
       var retByRef = false
       if not retIsVoid(retC):
         let rs = slotOf(g.prog, retC)
-        retByRef = rs.kind == AMem and rs.size > 16
+        retByRef = rs.kind == AMem and rs.size > 2 * wordSize()
       g.ab.tree ParamsD:
         if c.kind == TagLit:                  # (params (param …) …)
           # THE plan (see abi.nim); AArch64's hidden result pointer is x8, off the
@@ -1728,21 +1739,30 @@ template posOf(g: CodeGen; cur: Cursor): int = cursorToPosition(g.buf[], cur)
 
 # ── staging bridges (always free; reserved out of the allocator pool) ────────
 
+proc bridgeRegs(g: CodeGen): array[2, Reg] {.inline.} =
+  ## The two staging bridges of the target being emitted. NOT a constant: the
+  ## AArch64 pair is x14/x15, and slot R14 is `lr` on Cortex-M — taking it as
+  ## scratch destroys the return address, which shows up as a hang at `bx lr`
+  ## with nothing at the crash site to suggest why.
+  if g.thumbM: [machine_m.IntBridgeRegs[0], machine_m.IntBridgeRegs[1]]
+  else: [IntBridgeRegs[0], IntBridgeRegs[1]]
+
 proc tryTakeBridge(g: var CodeGen; typ = ScalarSlot; avoid = NoReg): Reg =
   ## `takeBridge` for a caller that HAS another answer when both bridges are
   ## already staging: reports exhaustion as `NoReg` instead of asserting.
-  for r in IntBridgeRegs:
+  for r in g.bridgeRegs:
     if r != avoid and not g.rb.isBoundTemp(r):
       g.bindTemp(r, typ); return r
   NoReg
 
 proc takeBridge(g: var CodeGen; typ = ScalarSlot; avoid = NoReg): Reg =
-  ## A staging-bridge GPR (x14/x15). Bound to a typed name so `emReg` emits a
-  ## checked symbol and a typed memory base type-checks. Released by `dropBridge`.
+  ## A staging-bridge GPR (x14/x15 on AArch64, r10/r11 on Cortex-M). Bound to a
+  ## typed name so `emReg` emits a checked symbol and a typed memory base
+  ## type-checks. Released by `dropBridge`.
   ## Two bridges nest (e.g. a `cmp` of two spilled operands); a third asserts.
   result = g.tryTakeBridge(typ, avoid)
   if result == NoReg:
-    raiseAssert "arkham a64n: both staging bridges in use in proc " & g.curProcName
+    raiseAssert "arkham arm: both staging bridges in use in proc " & g.curProcName
 
 proc dropBridge(g: var CodeGen; r: Reg) =
   if r != NoReg: g.unbindTemp(r)
@@ -3144,7 +3164,7 @@ proc flatCopyToPtr2(g: var CodeGen; srcVar: string; sizeBytes: int; dstPtr, tmp:
   ## byte-accurate whatever the field layout — a PER-FIELD copy would mis-load a field
   ## that is itself an aggregate (e.g. a 16-byte `seq`) as one scalar.
   let srcPtr = R16
-  g.bindTemp(srcPtr, AsmSlot(cls: AUInt, size: 8, align: 8))
+  g.bindTemp(srcPtr, addrSlot())
   g.ab.tree LeaA64: (g.emReg srcPtr; g.ab.sym srcVar)
   g.copyAggr(dstPtr, srcPtr, sizeBytes, tmp)
   g.unbindTemp(srcPtr)
@@ -3197,7 +3217,7 @@ proc aggrArgAddr(g: var CodeGen; a: Cursor; dst: Reg) =
   ## a by-ref param pointer already in a register, an lvalue, or an `oconstr`/`aconstr`
   ## built into a temp — but yields an address, which the stack-passed path reads through.
   if a.kind == TagLit and a.exprKind in {DotC, DerefC, AtC, PatC}:
-    g.aggrAddrInto(a, dst, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)
+    g.aggrAddrInto(a, dst, addrSlot(), doBind = false)
   elif a.kind == Symbol:
     case g.lookupSym(symName(a)).cat
     of scGlobal: g.emGlobalAddr(dst, symName(a))
@@ -3654,7 +3674,7 @@ proc aggrAddrLoc(g: var CodeGen; loc: Location; dest: Reg) =
   of StackPtr: g.emScalarLoad(dest, loc.ptrName)   # the slot already holds the address
   of Glob: g.emGlobalAddr(dest, loc.name)
   of Tvar: g.genTlvAddr(loc.name, dest)
-  of Mem: g.aggrAddrInto(loc.cur, dest, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)
+  of Mem: g.aggrAddrInto(loc.cur, dest, addrSlot(), doBind = false)
   else: raiseAssert "arkham a64n: aggrAddrLoc of " & $loc.kind
 
 proc isAggrCopySrc(c: Cursor): bool =
@@ -3700,10 +3720,10 @@ proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
     elif dst.kind == InRegPair:
       let addrR = g.takeBridge()
       if rhs.kind == Symbol:
-        g.aggrAddrInto(rhs, addrR, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = true)
+        g.aggrAddrInto(rhs, addrR, addrSlot(), doBind = true)
       else:
         g.emitLvalue2(rhs)
-        g.aggrAddrInto(rhs, addrR, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = true)
+        g.aggrAddrInto(rhs, addrR, addrSlot(), doBind = true)
         g.freeLvalTemps2(rhs)
       for i in 0 ..< nwords:
         g.ab.tree MovA64:
@@ -3764,14 +3784,14 @@ proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
   g.bindTemp(a1, ScalarSlot)
   if rhs.kind == TagLit:
     g.emitLvalue2(rhs)                     # pick the src lvalue's embedded values
-  g.aggrAddrInto(rhs, a1, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = false)  # &rhs
+  g.aggrAddrInto(rhs, a1, addrSlot(), doBind = false)  # &rhs
   if rhs.kind == TagLit: g.freeLvalTemps2(rhs)
   var tmp: Reg
   if b0 != NoReg and b1 != NoReg:
     tmp = R16                        # total exhaustion: the produce bridge serves
-    g.bindTemp(tmp, AsmSlot(cls: AUInt, size: 8, align: 8))
+    g.bindTemp(tmp, addrSlot())
   else:
-    tmp = g.takeBridge(AsmSlot(cls: AUInt, size: 8, align: 8))
+    tmp = g.takeBridge(addrSlot())
   g.copyAggr(a0, a1, size, tmp)
   g.dropBridge tmp                   # unbind (uniform for a bridge or x16)
   g.unbindTemp(a1); g.unbindTemp(a0)
@@ -3804,11 +3824,11 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
     elif rhs.kind == TagLit and rhs.exprKind == AconstrC:
       g.genAconstr2(rhs, dst)
     elif rhs.kind == TagLit and rhs.exprKind == CallC:
-      if aggrByteSize(g.prog, tn) > 16:
+      if aggrByteSize(g.prog, tn) > 2 * wordSize():   # the same rule as `retIndirect`
         if dst.kind == StackPtr:
-          g.emScalarLoad(IndirectResultReg, dst.ptrName)
+          g.emScalarLoad(g.indirectResultReg, dst.ptrName)
         else:
-          g.ab.tree LeaA64: (g.emReg IndirectResultReg; g.ab.sym dstVar)
+          g.ab.tree LeaA64: (g.emReg g.indirectResultReg; g.ab.sym dstVar)
         var d = dontCare
         g.emitCall2(rhs, d, hiddenPtr = true)            # the callee writes through x8
       else:
@@ -3827,7 +3847,7 @@ proc genStore2(g: var CodeGen; rhs: Cursor; dst: Location) =
     # it also outlives the macOS TLV thunk behind a threadvar's `(adr …)`.
     if rhs.kind == TagLit and rhs.exprKind == CallC and
        dst.typ.size > g.md.aggrByRefThreshold:
-      g.emAdr(IndirectResultReg, dst.name)              # >16B: &g is the hidden result ptr
+      g.emAdr(g.indirectResultReg, dst.name)        # wide result: &g is the hidden ptr
       var d = dontCare
       g.emitCall2(rhs, d, hiddenPtr = true)
     else:
@@ -5616,7 +5636,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
               addrBridge = g.takeBridge()
               srcAddr = addrBridge
             g.emitLvalue2(a)                 # pick embedded base/index regs
-            g.aggrAddrInto(a, srcAddr, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = true)
+            g.aggrAddrInto(a, srcAddr, addrSlot(), doBind = true)
             if pl.byRef: g.movReg(g.md.gprAt(pl), srcAddr)
             else: g.marshalAggrFromAddr(srcAddr, tn, pl.gpFirst)
             if addrBridge != NoReg: g.dropBridge addrBridge
@@ -5792,7 +5812,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
             addrBridge = g.takeBridge()
             srcAddr = addrBridge
           g.emitLvalue2(a)                   # pick embedded base/index regs
-          g.aggrAddrInto(a, srcAddr, AsmSlot(cls: AUInt, size: 8, align: 8), doBind = true)
+          g.aggrAddrInto(a, srcAddr, addrSlot(), doBind = true)
           if sz > 16:
             g.movReg(IntArgRegs[intIdx], srcAddr); inc intIdx
           else:
@@ -6592,7 +6612,7 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool;
   # emitParamMoves) and the body locals — `scopeLocals` must be non-empty
   # before those param binds, and param kills must outlive the body.
   g.enterScope()
-  if g.retIndirect: g.movReg(g.indirectReg, IndirectResultReg)
+  if g.retIndirect: g.movReg(g.indirectReg, g.indirectResultReg)
   g.emitParamMoves(info.decl)
   g.emitStackParamLoads(info.decl)            # via fp; the arg registers are free now
   g.retLabel2 = g.freshLabel()
@@ -6676,7 +6696,11 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
     inc rc; inc rc; skip rc
     if rc.kind == Symbol and slotOf(g.prog, rc).kind == AMem:
       g.retAggrSym = rc.symId
-      g.retIndirect = aggrByteSize(g.prog, g.retAggrSym) > 16
+      # The indirect-result rule stated in WORDS, matching
+      # `slots.classifyResult`'s `> 2*wordSize()`: an aggregate result wider than
+      # two words is written through a caller-supplied pointer. 16 on the 64-bit
+      # targets, 8 on Cortex-M — one rule, not two constants that can drift.
+      g.retIndirect = aggrByteSize(g.prog, g.retAggrSym) > 2 * wordSize()
     elif rc.kind == TagLit and rc.typeKind == FT:
       g.retIsFloat = true
       g.retFloatBits = if slotOf(g.prog, rc).size == 4: 32 else: 64

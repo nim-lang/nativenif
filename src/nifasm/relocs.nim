@@ -29,7 +29,7 @@ type
       ## `adr` supplies the PC — so unlike `adrp`+`add` it needs no page arithmetic
       ## and no knowledge of the section's final vaddr, which is why it can live here
       ## and serve Mach-O, ELF and PE alike.
-    rkTB, rkTBL, rkTBcond, rkTADR, rkTMovwMovt
+    rkTB, rkTBL, rkTBcond, rkTADR, rkTMovwMovt, rkTMovwMovtFunc
       ## Thumb-2 (Cortex-M). All four branch forms are 32-bit encodings stored as
       ## two little-endian HALFWORDS, high halfword first.
       ##
@@ -49,6 +49,13 @@ type
       ## patcher swaps in the SUB form for a negative displacement). `rkTMovwMovt`
       ## is a MOVW+MOVT pair carrying a label's ABSOLUTE address — no reach limit,
       ## which a bare-metal image can rely on because its load address is fixed.
+      ##
+      ## `rkTMovwMovtFunc` is the same pair for a CODE address, and ORs in bit 0.
+      ## That bit is the Thumb-state marker, not part of the address: `blx` to an
+      ## even address switches the core to ARM state, which M-profile does not
+      ## have, so the call takes a UsageFault — and with no handler installed the
+      ## core simply locks up. A function pointer without it looks completely
+      ## ordinary right up until it is called.
 
   # Relocation entry for optimization and patching
   RelocEntry* = object
@@ -151,7 +158,7 @@ proc calculateRelocDistance*(fromPos: int; toPos: int; kind: RelocKind = rkJmp):
     toPos - fromPos  # ARM64: distance from start of instruction (will be divided by 4 later)
   of rkTB, rkTBL, rkTBcond, rkTADR:
     toPos - (fromPos + 4)   # Thumb: PC reads two halfwords ahead of the instruction
-  of rkTMovwMovt:
+  of rkTMovwMovt, rkTMovwMovtFunc:
     toPos                   # absolute: the patcher wants the target, not a distance
 
 # Jump optimization functions
@@ -186,7 +193,7 @@ proc updateRelocDisplacements*(buf: var Buffer) =
         currentPos + 8  # `adr` + `add|sub` pair
       of rkTB, rkTBL, rkTBcond, rkTADR:
         currentPos + 4  # a 32-bit Thumb-2 encoding: two halfwords
-      of rkTMovwMovt:
+      of rkTMovwMovt, rkTMovwMovtFunc:
         currentPos + 8  # MOVW + MOVT pair
 
     if requiredSize > buf.data.len:
@@ -397,11 +404,17 @@ proc updateRelocDisplacements*(buf: var Buffer) =
       buf.data[currentPos + 1] = byte((hi shr 8) and 0xFF)
       buf.data[currentPos + 2] = byte(lo and 0xFF)
       buf.data[currentPos + 3] = byte((lo shr 8) and 0xFF)
-    of rkTMovwMovt:
+    of rkTMovwMovt, rkTMovwMovtFunc:
       # MOVW rd, #lo16 ; MOVT rd, #hi16 — the label's ABSOLUTE address. `distance`
       # is the target position (see `calculateRelocDistance`); the section's load
       # address is added later by the image writer, which knows it.
-      buf.data.patchThumbMovwMovtPair(currentPos, uint32(distance) + buf.absBase)
+      #
+      # A CODE address additionally carries bit 0, the Thumb-state marker. See
+      # `rkTMovwMovtFunc` — omitting it produces a pointer that faults only when
+      # called, and on a core with no fault handler that is a silent lockup.
+      let thumbBit = if reloc.kind == rkTMovwMovtFunc: 1'u32 else: 0'u32
+      buf.data.patchThumbMovwMovtPair(currentPos,
+                                      uint32(distance) + buf.absBase + thumbBit)
     of rkADR:
       # ARM64 ADR: 21-bit signed immediate, byte offset from PC
       if distance < -(1 shl 20) or distance >= (1 shl 20):
@@ -468,7 +481,7 @@ proc longSizeOf(kind: RelocKind): int {.inline.} =
   of rkB, rkBL, rkBEQ, rkBNE, rkCBZ, rkCBNZ, rkTBZ, rkTBNZ, rkADR, rkADRP: 4
   of rkADRADD: 8
   of rkTB, rkTBL, rkTBcond, rkTADR: 4
-  of rkTMovwMovt: 8
+  of rkTMovwMovt, rkTMovwMovtFunc: 8
 
 proc shortJccOpcode(kind: RelocKind): byte =
   case kind

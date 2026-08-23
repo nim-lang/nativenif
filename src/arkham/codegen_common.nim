@@ -1274,7 +1274,7 @@ proc mirrorAddrStored*(g: var CodeGen; r: Reg; asmName: string): bool =
   if g.rb.addrMirror(asmName) != NoReg: return false     # already mirrored elsewhere
   g.pickedRegs.excl r
   g.plan.unseal {r}
-  g.rb.mirrorAddr(r, asmName, AsmSlot(cls: AUInt, size: 8, align: 8))
+  g.rb.mirrorAddr(r, asmName, addrSlot())
   true
 
 proc mirrorFStored*(g: var CodeGen; f: FReg; dst: Location): bool =
