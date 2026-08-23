@@ -9850,6 +9850,7 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## view of the callee-saved pool matches `allocateProc`'s under `-d:arkhamStress`.
   ## The foreign edge keeps the unshrunk `win64Machine` — that is an ABI, not an
   ## allocation choice (see `stress.nim`).
+  setTargetWord Word64             # x86-64: 8-byte pointers, 8-byte platform int
   var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: x64MachineA)
   g.ab.renderReg = x64RegName                 # render register slots as x86 names
   g.ab.immAnyDest = true                      # `mov r/m, imm32` exists here

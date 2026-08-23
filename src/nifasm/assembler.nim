@@ -212,8 +212,9 @@ proc normScalarBits(bits: int64): int =
   ## ⇒ 8 bytes); nifasm must agree or a `(i -1)` field is sized 0 and every later
   ## field's offset collapses (e.g. a ref payload's hidden header `(fld :r (i -1))`
   ## would put the real first field at offset 0, so `obj.field` reads the header).
-  ## x86-64 / AArch64 are both 64-bit, so the native word is 64 bits.
-  if bits > 0: int(bits) else: 64
+  ## The width comes from the `(arch …)` pragma via `setAsmWordSize`, so a 32-bit
+  ## target resolves it to 32 — see `asmWordBits`.
+  if bits > 0: int(bits) else: asmWordBits()
 
 template symName(n: Cursor): string =
   ## The symbol's fully-qualified name. The NIF reader already completes the
@@ -1469,6 +1470,10 @@ proc pass1Syproc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: s
   scope.define(sym)
 
 proc handleArch(n: var Cursor; ctx: var GenContext) =
+  ## Also fixes the target WORD SIZE for the whole assembly. asm-NIF always states
+  ## `(arch …)` before any declaration, so every type is built under the right
+  ## width — and arkham's `slots.setTargetWord` must have picked the same one, or
+  ## a `(i -1)` field is sized differently on the two sides of the pipe.
   inc n
   if n.kind != Ident: error("Expected architecture symbol", n)
   let arch = n.strVal
@@ -1484,6 +1489,8 @@ proc handleArch(n: var Cursor; ctx: var GenContext) =
     ctx.arch = Arch.WinA64
   else:
     error("Unknown architecture: " & arch, n)
+  setAsmWordSize(case ctx.arch
+                 of Arch.X64, Arch.LinuxA64, Arch.A64, Arch.WinX64, Arch.WinA64: 8)
   inc n
 
 proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string; buf: var TokenBuf) =
@@ -2102,7 +2109,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
             offset += slots.alignedSize(p.typ)
         result.kind = okImm
         result.argName = argName
-        result.immVal = int64(offset + wordIdx * 8)
+        result.immVal = int64(offset + wordIdx * asmWordSize())
         result.typ = paramPtr.typ
       else:
         if wordIdx >= paramPtr.regs.len:
@@ -2882,7 +2889,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     var reg = InvalidTagId
     var onStack = false
-    var slotAlign = 8
+    var slotAlign = asmWordSize()
     if n.kind == TagLit:
       let locTag = n.tag
       if rawTagIsA64Reg(locTag):
@@ -4997,7 +5004,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
             offset += slots.alignedSize(p.typ)
         result.kind = okImm
         result.argName = argName
-        result.immVal = int64(offset + wordIdx * 8)
+        result.immVal = int64(offset + wordIdx * asmWordSize())
         result.typ = paramPtr.typ
       else:
         # Register argument - return the (word-`wordIdx`) register
@@ -6156,7 +6163,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     inc n
     var reg = InvalidTagId
     var onStack = false
-    var slotAlign = 8
+    var slotAlign = asmWordSize()
     if n.kind == TagLit:
       let locTag = n.tag
       if rawTagIsX64Reg(locTag):

@@ -149,6 +149,26 @@ proc define*(s: Scope; sym: Symbol) =
 proc undefine*(s: Scope; name: SymId) =
   s.syms.del(name)
 
+# ── target word ─────────────────────────────────────────────────────────────
+# `asmSizeOf`/`asmAlignOf` used to answer 8 for every pointer, proc pointer and
+# `nil`, and to cap alignment at 8 — true of x86-64 and AArch64, of neither
+# 32-bit target. The width is now a value, set once from the `(arch …)` pragma
+# (see `handleArch`), which asm-NIF always states before any declaration.
+#
+# This MUST agree with arkham's `slots.wordSize()`. A disagreement is not caught
+# by anything: a `(fld :r (i -1))` sized under the wrong width puts every later
+# field at the wrong offset, and the program merely reads the wrong bytes.
+
+var asmWord = 8
+
+proc setAsmWordSize*(bytes: int) =
+  ## Set the target pointer/word size in BYTES. Called from `handleArch` before
+  ## any type is built.
+  asmWord = bytes
+
+proc asmWordSize*(): int {.inline.} = asmWord
+proc asmWordBits*(): int {.inline.} = asmWord * 8
+
 proc isOnStack*(t: Type): bool {.inline.} =
   ## Returns true if this type represents a stack location
   t != nil and t.kind == StackOffT
@@ -158,17 +178,18 @@ proc asmAlignOf*(t: Type): int =
   case t.kind
   of ErrorT, VoidT: 1
   of BoolT: 1
-  of NilT: 8 # a pointer-sized null
+  of NilT: asmWordSize() # a pointer-sized null
   of IntT, UIntT, FloatT, IntLitT:
     let size = t.bits div 8
-    # Alignment is typically the size, but capped at 8 for x86-64
-    if size <= 8: size else: 8
-  of PtrT, AptrT: 8 # x86-64 pointer alignment
+    # Alignment is typically the size, but capped at the target word: a 64-bit
+    # scalar on a 32-bit target is 4-aligned, not 8-aligned.
+    if size <= asmWordSize(): size else: asmWordSize()
+  of PtrT, AptrT: asmWordSize()
   of ArrayT: asmAlignOf(t.elem)
   of ObjectT, UnionT: t.align
   of RegisterT: t.regBits div 8
   of StackOffT: asmAlignOf(t.offType)
-  of ProcT: 8 # Function pointers are 8 bytes on x86-64
+  of ProcT: asmWordSize() # a function pointer is one word
 
 proc alignTo*(offset, alignment: int): int =
   ## Align offset up to the next multiple of alignment
@@ -178,14 +199,14 @@ proc asmSizeOf*(t: Type): int =
   case t.kind
   of ErrorT, VoidT: 0
   of BoolT: 1
-  of NilT: 8 # a pointer-sized null
+  of NilT: asmWordSize() # a pointer-sized null
   of IntT, UIntT, FloatT, IntLitT: t.bits div 8
-  of PtrT, AptrT: 8 # x86-64
+  of PtrT, AptrT: asmWordSize()
   of ArrayT: t.len.int * asmSizeOf(t.elem)
   of ObjectT, UnionT: t.size
   of RegisterT: t.regBits div 8
   of StackOffT: asmSizeOf(t.offType)
-  of ProcT: 8 # Function pointers are 8 bytes on x86-64
+  of ProcT: asmWordSize() # a function pointer is one word
 
 proc `$`*(t: Type): string =
   case t.kind

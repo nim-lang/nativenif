@@ -48,6 +48,46 @@ type
                 # makes the call-site marshal a self-move (elided). See allocParams.
   VarProps* = set[VarProp]
 
+# ── target word ─────────────────────────────────────────────────────────────
+# Everything below used to hardcode a 64-bit word: a pointer was 8 bytes, Leng's
+# platform `int` resolved to 8, and "fits in a register" meant "<= 8". That is
+# true of both existing targets and of neither 32-bit one, so the width is now a
+# value.
+#
+# It is PROCESS-GLOBAL rather than threaded through `typeToSlot`. arkham compiles
+# exactly one module for exactly one target per run (`arkham -a:x64 file.nif`),
+# and the classification is called from 19 sites across four modules that would
+# otherwise each have to carry a descriptor they do not otherwise need. The
+# single writer is the backend entry point (`generateX64` / `generateA64` / …),
+# which sets it before parsing anything — see `setTargetWord`.
+
+type
+  TargetWord* = object
+    ## The width facts a type classification needs, in BYTES.
+    ptrSize*: int     ## a pointer / proc pointer, and Leng's platform `int`
+    ptrAlign*: int    ## a pointer's natural alignment
+    maxScalar*: int   ## widest scalar one GPR holds (the `inRegClass` bound)
+
+const
+  Word64* = TargetWord(ptrSize: 8, ptrAlign: 8, maxScalar: 8)
+    ## x86-64 and AArch64.
+  Word32* = TargetWord(ptrSize: 4, ptrAlign: 4, maxScalar: 4)
+    ## ARMv7-M (Cortex-M) and any other 32-bit target.
+
+var targetWord = Word64
+  ## Defaults to 64-bit so a backend that never calls `setTargetWord` behaves
+  ## exactly as before this was configurable.
+
+proc setTargetWord*(t: TargetWord) =
+  ## Set the target's word facts. Call ONCE, from the backend entry point, before
+  ## any type is classified — a slot computed under the wrong width is not
+  ## detectably wrong later, it is just a field at the wrong offset.
+  targetWord = t
+
+proc wordSize*(): int {.inline.} = targetWord.ptrSize
+proc wordAlign*(): int {.inline.} = targetWord.ptrAlign
+proc maxScalarSize*(): int {.inline.} = targetWord.maxScalar
+
 proc kind*(s: AsmSlot): AsmTypeKind {.inline.} =
   ## The value class of this slot. An accessor (not a field) on purpose: the goal
   ## is that every slot carries a `typ` and this becomes `typeToSlot(s.typ).kind`,
@@ -61,7 +101,7 @@ proc align*(address, alignment: int): int {.inline.} =
 proc isFloat*(s: AsmSlot): bool {.inline.} = s.kind == AFloat
 proc inRegClass*(s: AsmSlot): bool {.inline.} =
   ## True if a value of this slot can live in a (single) register at all.
-  s.kind != AMem and s.size > 0 and s.size <= 8
+  s.kind != AMem and s.size > 0 and s.size <= maxScalarSize()
 
 # ── AAPCS64 argument / result classification ────────────────────────────────
 # Per the Arm 64-bit Procedure Call Standard: integer/pointer scalars go in one
@@ -84,19 +124,23 @@ type
     RcIndirect   ## caller passes x8 = address; callee writes there (> 16 bytes)
 
 proc classifyArg*(s: AsmSlot): ArgClass =
+  # The AAPCS64 thresholds stated in words: an aggregate wider than TWO words
+  # goes by reference, one wider than a single word packs into a GPR pair. On a
+  # 64-bit target these are the familiar 16 and 8.
+  let w = wordSize()
   case s.kind
   of AFloat: AcSimd
   of AMem:
-    if s.size > 16: AcByRef
-    elif s.size > 8: AcGprPair
+    if s.size > 2*w: AcByRef
+    elif s.size > w: AcGprPair
     else: AcGpr
   else:
-    if s.size > 8: AcGprPair else: AcGpr
+    if s.size > w: AcGprPair else: AcGpr
 
 proc classifyResult*(s: AsmSlot): ResultClass =
   case s.kind
   of AFloat: RcSimd
-  of AMem: (if s.size > 16: RcIndirect else: RcGpr)
+  of AMem: (if s.size > 2*wordSize(): RcIndirect else: RcGpr)
   else: RcGpr
 
 proc typeBits*(c: Cursor): int =
@@ -106,9 +150,12 @@ proc typeBits*(c: Cursor): int =
   if t.kind == IntLit: int(intVal(t)) else: 0
 
 proc scalarSlot(kind: AsmTypeKind; bits: int): AsmSlot =
-  # `(i -1)` etc. (platform int) → assume 64-bit for now.
-  let sz = if bits > 0: (bits + 7) div 8 else: 8
-  result = AsmSlot(cls: kind, size: sz, align: min(sz, 8))
+  # `(i -1)` etc. is Leng's platform-width scalar: it resolves to the target
+  # WORD, not to a fixed 64 bits. nifasm's `normScalarBits` must agree exactly —
+  # a disagreement does not fail loudly, it silently sizes a field to 0 and
+  # collapses every later field's offset.
+  let sz = if bits > 0: (bits + 7) div 8 else: wordSize()
+  result = AsmSlot(cls: kind, size: sz, align: min(sz, wordAlign()))
 
 proc typeToSlot*(c: Cursor): AsmSlot =
   ## Classify a Leng type at `c`. Aggregates and unknowns become `AMem`
@@ -122,7 +169,7 @@ proc typeToSlot*(c: Cursor): AsmSlot =
   of FT:   result = scalarSlot(AFloat, typeBits(c))
   of BoolT: result = AsmSlot(cls: ABool, size: 1, align: 1)
   of PtrT, AptrT, ProctypeT:
-    result = AsmSlot(cls: AUInt, size: 8, align: 8)           # an address
+    result = AsmSlot(cls: AUInt, size: wordSize(), align: wordAlign())  # an address
   else:
     result = AsmSlot(cls: AMem, size: 0, align: 1)            # object/array/union/void/…
   result.typ = c

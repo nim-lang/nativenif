@@ -6675,6 +6675,7 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## which `nifasm`'s `linux_arm64` target assembles to a qemu-runnable ELF.
   ## `inputPath` and `tags` let the program model load *other* modules on demand
   ## to resolve cross-module symbols (`Foo.0.othermod`).
+  setTargetWord Word64             # AArch64: 8-byte pointers, 8-byte platform int
   var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: aarch64MachineA,
                   a64Linux: linux)
   g.ab.arch = "a64"                # BodyLib entries this target may splice

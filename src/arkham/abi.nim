@@ -62,8 +62,10 @@ proc planCall*(md: MachineDesc; slots: openArray[AsmSlot]; retByRef: bool;
   ## declared parameter) against the target's argument registers. An aggregate
   ## that does not fit in the REMAINING integer arg registers goes ENTIRELY on
   ## the stack and consumes NO register (so a later, smaller arg can still take
-  ## a free one). Stack offsets round each slot up to 8 bytes, matching nifasm's
-  ## `alignedSize` (so the callee's load offset == the caller's `(arg)`).
+  ## a free one). Stack offsets round each slot up to one target WORD, matching
+  ## nifasm's `alignedSize` (so the callee's load offset == the caller's `(arg)`);
+  ## on the 64-bit targets that word is the familiar eightbyte.
+  let w = wordSize()
   result = CallPlan(retByRef: retByRef)
   var gp = if retByRef: 1 else: 0
   var fp = 0
@@ -83,10 +85,10 @@ proc planCall*(md: MachineDesc; slots: openArray[AsmSlot]; retByRef: bool;
       pp.isFloat = s.kind == AFloat
       pp.isAgg = s.kind == AMem
       pp.byRef = pp.isAgg and s.size > md.aggrByRefThreshold
-      pp.words = if pp.isAgg and not pp.byRef: (s.size + 7) div 8 else: 1
+      pp.words = if pp.isAgg and not pp.byRef: (s.size + w - 1) div w else: 1
       pp.onStack = true
       pp.byteOff = stackOff
-      stackOff += (if pp.isAgg and not pp.byRef: (s.size + 7) and not 7 else: 8)
+      stackOff += (if pp.isAgg and not pp.byRef: (s.size + w - 1) and not (w - 1) else: w)
       result.hasStackArgs = true
       result.args.add pp
       inc ord
@@ -96,24 +98,24 @@ proc planCall*(md: MachineDesc; slots: openArray[AsmSlot]; retByRef: bool;
     if s.kind == AMem:
       pp.isAgg = true
       pp.byRef = s.size > md.aggrByRefThreshold
-      pp.words = if pp.byRef: 1 else: (s.size + 7) div 8
+      pp.words = if pp.byRef: 1 else: (s.size + w - 1) div w
       if gp + pp.words <= md.intArgRegs.len:
         pp.gpFirst = gp; gp += pp.words
       else:
         pp.onStack = true; pp.byteOff = stackOff
-        stackOff += (if pp.byRef: 8 else: (s.size + 7) and not 7)
+        stackOff += (if pp.byRef: w else: (s.size + w - 1) and not (w - 1))
     elif s.kind == AFloat:
       pp.isFloat = true; pp.words = 1
       if fp < md.floatArgRegs.len:
         pp.fpIndex = fp; inc fp
       else:
-        pp.onStack = true; pp.byteOff = stackOff; stackOff += 8
+        pp.onStack = true; pp.byteOff = stackOff; stackOff += w
     else:                               # scalar int / pointer
       pp.words = 1
       if gp < md.intArgRegs.len:
         pp.gpFirst = gp; inc gp
       else:
-        pp.onStack = true; pp.byteOff = stackOff; stackOff += 8
+        pp.onStack = true; pp.byteOff = stackOff; stackOff += w
     if pp.onStack: result.hasStackArgs = true
     result.args.add pp
     inc ord
