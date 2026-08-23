@@ -4,6 +4,10 @@ import nifcore, nifcoreparse, nifmodules
 import "../../../nimony/src/lib" / [nifreader, symparser]
 import tags, model, tagconv, tagpool
 import buffers, relocs, x86, arm64, elf, macho, pe
+from thumb2 import nil   # qualified: Nim conflates `emitBL` (arm64) with `emitBl`
+                         # (thumb2), and `Register` would clash three ways
+from elf32 import writeFirmware  # qualified: `elf32` repeats ET_EXEC/PT_LOAD/PF_*
+                                 # under 32-bit types, which would shadow `elf`'s
 import dwarf, tracetable
 import sem, slots
 import decls
@@ -378,6 +382,7 @@ type
     A64        # macOS ARM64 (Mach-O)
     WinX64     # Windows x86-64 (PE)
     WinA64     # Windows ARM64 (PE)
+    CortexM    # Bare-metal ARMv7E-M / Cortex-M4 (ELF32 firmware image, no OS)
 
   ImportedLib = object
     name: string     # Library path (e.g. "/usr/lib/libSystem.B.dylib")
@@ -1487,10 +1492,13 @@ proc handleArch(n: var Cursor; ctx: var GenContext) =
     ctx.arch = Arch.WinX64
   elif arch == "win_arm64":
     ctx.arch = Arch.WinA64
+  elif arch == "cortex_m":
+    ctx.arch = Arch.CortexM
   else:
     error("Unknown architecture: " & arch, n)
   setAsmWordSize(case ctx.arch
-                 of Arch.X64, Arch.LinuxA64, Arch.A64, Arch.WinX64, Arch.WinA64: 8)
+                 of Arch.X64, Arch.LinuxA64, Arch.A64, Arch.WinX64, Arch.WinA64: 8
+                 of Arch.CortexM: 4)
   inc n
 
 proc pass1(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string; buf: var TokenBuf) =
@@ -4079,6 +4087,14 @@ proc genInstDispatch(n: var Cursor; ctx: var GenContext) {.inline.} =
     genInstX64(n, ctx)
   of Arch.A64, Arch.WinA64, Arch.LinuxA64:
     genInstA64(n, ctx)
+  of Arch.CortexM:
+    # The Thumb-2 ENCODER (`thumb2.nim`) and the firmware image writer
+    # (`elf32.nim`) are done and tested; what is missing is this middle layer —
+    # the typed operand model (`parseDestM`/`parseOperandM`), the register
+    # binding table and the per-mnemonic arms, i.e. the Cortex-M counterpart of
+    # `genInstA64`. Erroring by NAME beats a silent wrong encoding.
+    error("nifasm: the Cortex-M instruction selector is not implemented yet " &
+          "(the Thumb-2 encoder and ELF32 writer are; see doc/cortex_m.md)", n)
 
 proc genInst(n: var Cursor; ctx: var GenContext) =
   let cfiBefore = ctx.buf.data.len
@@ -8277,8 +8293,10 @@ proc writeMachO(a: var GenContext; outfile: string) =
       (CPU_TYPE_X86_64, CPU_SUBTYPE_X86_64_ALL)
     of Arch.A64, Arch.LinuxA64:
       (CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL)
-    of Arch.WinX64, Arch.WinA64:
-      # Should not be called for Windows, but need to cover all cases
+    of Arch.WinX64, Arch.WinA64, Arch.CortexM:
+      # Unreachable: Windows emits PE and Cortex-M emits a bare ELF32 firmware
+      # image, so neither ever reaches the Mach-O writer. Covered so the case
+      # stays exhaustive.
       (CPU_TYPE_X86_64, CPU_SUBTYPE_X86_64_ALL)
 
   # Build dynlink info for external procs
@@ -9019,6 +9037,11 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
       writeMachO(ctx, outfile)
     of Arch.WinX64, Arch.WinA64:
       writeExe(ctx, outfile.changeFileExt("exe"))
+    of Arch.CortexM:
+      # A firmware image, not a hosted executable: vector table, then code.
+      var code: seq[byte] = newSeq[byte](ctx.buf.data.len)
+      for i in 0 ..< ctx.buf.data.len: code[i] = ctx.buf.data[i]
+      writeFile(outfile, writeFirmware(code))
 
   # Close all foreign-module readers (the main module has no reader).
   for modname, module in ctx.modules.mpairs:

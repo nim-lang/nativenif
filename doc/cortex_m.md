@@ -1,7 +1,41 @@
 # Cortex-M support
 
-Status: **M0 complete** — the target contract below is verified end to end by
-`tools/cortexm_probe.nim`. No code generator exists yet.
+Status: **M0, M1, M2a/b complete; M2c in progress.**
+
+| Milestone | State |
+|---|---|
+| M0 target contract | done — `tools/cortexm_probe.nim` |
+| M1 word-size parameterization | done — `slots.setTargetWord` / `sem.setAsmWordSize` |
+| M2a Thumb-2 encoder + relocations | done — `src/nifasm/thumb2.nim`, 45-check self-test |
+| M2b ELF32 firmware writer | done — `src/nifasm/elf32.nim` |
+| M2c assembler integration | **partial** — see below |
+| M3 arkham backend | not started |
+| M4 64-bit integers | not started |
+| M5 floating point | not started |
+| M6 embedded features | not started |
+
+### What M2c still needs
+
+`(arch cortex_m)` is accepted, the word size switches to 4, `(rodata …)` and
+the rest of pass1/pass2 work, and the image writer is wired to
+`elf32.writeFirmware`. `tests/hello_cortex_m.nif` gets all the way to the first
+instruction and then reports, by name, that the selector is missing.
+
+What is missing is the MIDDLE layer — the Cortex-M counterpart of
+`genInstA64`, roughly:
+
+* `parseDestM` / `parseOperandM` and the `Operand` model (okReg / okMem / okImm)
+  against the `MReg` tag set,
+* the register-binding table (`mRegBindings`, the analogue of `a64RegBindings`)
+  so `(var :x (r4) (i 32))` type-checks and a raw `(r4)` use is rejected,
+* the per-mnemonic arms, which then call straight into the tested
+  `thumb2.emit*` encoders,
+* prologue/epilogue and stack-slot addressing for AAPCS32.
+
+The `MInst` enum in `doc/instructions.md` is declared but still EMPTY: the
+mnemonics should be added as MInst-only rows appended at the END of the
+document, which keeps them in the late-numbered tail and moves no existing
+tag id.
 
 ## Target
 
