@@ -2481,6 +2481,48 @@ proc genCallMarkerA64(n: var Cursor; ctx: var GenContext) =
 
   inc n
 
+proc genTailcallMarkerA64(n: var Cursor; ctx: var GenContext) =
+  ## `(tailcall)` — the `(call)` marker's no-link twin. Same prepared arguments,
+  ## same clobber declaration, `b`/`br` instead of `bl`/`blr`: control leaves this
+  ## proc for good, so the callee returns to OUR caller and its `ret` is ours.
+  ##
+  ## The frame is already gone. arkham tears it down between the last argument
+  ## store and this marker — the teardown touches only SP and callee-saved
+  ## registers, never x0–x7 — so nothing here may address a stack slot, which is
+  ## also why arkham refuses to form a tail call that needs stack arguments.
+  if not ctx.inCall:
+    error("(tailcall) can only be used inside a prepare block", n)
+  if ctx.callContext.callEmitted:
+    error("Multiple call instructions in prepare block", n)
+  let sym = lookupWithAutoImport(ctx, ctx.scope, ctx.callContext.target, n)
+  ctx.clobberedA64.incl callClobbersA64(ctx)
+  if ctx.callContext.indirect:
+    # x16 (IP0) is caller-saved and not an argument register, so loading the
+    # pointer there leaves the prepared x0–x7 alone — as in `genCallMarkerA64`.
+    if sym.kind in {skVar, skParam} and sym.reg != InvalidTagId:
+      arm64.emitBr(ctx.buf.data, tagToRegisterA64(sym.reg, n))
+    elif sym.kind == skGvar:
+      let pos = ctx.buf.data.getCurrentPosition()
+      arm64.emitAdrpAddGvar(ctx.buf.data, arm64.X16)
+      ctx.gvarSites.add (pos, sym)
+      arm64.emitLdr(ctx.buf.data, arm64.X16, arm64.X16, 0'i32)
+      arm64.emitBr(ctx.buf.data, arm64.X16)
+    else:
+      error("Tail call through unsupported function-pointer location: " &
+            $sym.kind, n)
+    ctx.callContext.callEmitted = true
+    inc n
+    return
+  var labId: LabelId
+  if sym.offset == -1:
+    labId = ctx.buf.createLabel()
+    sym.offset = int(labId)
+  else:
+    labId = LabelId(sym.offset)
+  ctx.buf.emitB(labId)
+  ctx.callContext.callEmitted = true
+  inc n
+
 proc genSyscallMarkerA64(n: var Cursor; ctx: var GenContext) =
   ## `(svc 0)` inside a `(prepare <syproc> …)` block: the syscall counterpart of
   ## `(call)`. The args are already in x0–x5 (the syproc's params); this loads the
@@ -2950,6 +2992,8 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     genPrepareA64(n, ctx)
   of CallA64:
     genCallMarkerA64(n, ctx)
+  of TailcallA64:
+    genTailcallMarkerA64(n, ctx)
   of ExtcallA64:
     genExtcallA64(n, ctx)
   of IteA64:

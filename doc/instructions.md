@@ -184,6 +184,7 @@
 | `(jp L)`               | X64Inst                  | jump if parity (unordered float compare) |
 | `(call T ...)`         | X64Inst, A64Inst         | function call marker inside prepare |
 | `(extcall)`            | X64Inst, A64Inst         | external call marker inside prepare |
+| `(tailcall T ...)`     | A64Inst                  | tail-call marker inside prepare: branch, no link |
 | `(iat S)`              | X64Inst                  | indirect call through IAT (Import Address Table) |
 | `(ret)`                | X64Inst, A64Inst         | return instruction |
 | `(push O)`             | X64Inst                  | push to stack |
