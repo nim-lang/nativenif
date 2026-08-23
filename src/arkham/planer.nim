@@ -39,7 +39,7 @@
 ## commutes — never as a placement; `stackArgBaseReg`'s callee-saved reservation in
 ## `allocateProc` and the `presealed` set are the two existing examples.
 ##
-## Phase B lives in codegen_x64/codegen_a64 today, next to the pool it draws from
+## Phase B lives in codegen_x64/codegen_arm today, next to the pool it draws from
 ## (`takeHeld`), and it already has a home of its own there: `emitLvalWalk` is a pure
 ## pick-and-record walk with no emission in it. Moving it here means a `planValue`
 ## twin to `planStmt` that recurses into the value positions this walk skips, calling

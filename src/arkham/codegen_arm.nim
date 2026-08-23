@@ -1,13 +1,24 @@
 #
-#           Arkham — native AArch64 code generator for Leng
+#           Arkham — native Arm code generator for Leng
 #        (c) Copyright 2026 Andreas Rumpf
 #
 #    See the file "license.txt", included in this distribution.
 #
 
 ## Pass 3: code generation. Walks a Leng module, runs the analyser + register
-## allocator per proc, and emits typed AArch64 / Darwin asm-NIF that `nifasm`
-## type-checks, assembles and links.
+## allocator per proc, and emits typed asm-NIF that `nifasm` type-checks,
+## assembles and links.
+##
+## ONE emitter, three targets: AArch64/Darwin, AArch64/Linux (`a64Linux`), and
+## bare-metal Cortex-M (`thumbM`). They share the asm-NIF vocabulary by
+## design — `add3`, `cmp`, `beq`, `ldr`, `adr` mean the same thing on all
+## three — so what actually varies is the register file (`md`), the word size
+## (`slots.setTargetWord`), and which features the target simply does not have,
+## every one of which is refused BY NAME rather than mis-emitted.
+##
+## That is why there is no separate `codegen_m`: a second emitter would have had
+## to reimplement the register-binding protocol, which is the part with a formal
+## model behind it (`proofs/arkham_bindings.tla`).
 ##
 ## All asm-NIF tags are emitted through nifasm's own enums (`A64Inst` /
 ## `NifasmDecl`, see asmbuf) — the single source of truth for the vocabulary.

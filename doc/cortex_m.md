@@ -165,7 +165,7 @@ fixtures, 225 `importc "exit"` and 3 `importc "write"`.
   calls, globals and small aggregates: `tests/arkham_m/` holds 80 Leng fixtures
   that compile, assemble and run under QEMU with the right exit code.
 
-  There is NO `codegen_m.nim`. `codegen_a64.nim` serves both targets, driven by
+  There is NO `codegen_m.nim`. `codegen_arm.nim` serves both targets, driven by
   `md`, `slots.setTargetWord` and a `thumbM` flag — the asm-NIF vocabulary is
   shared by design (`add3`, `cmp`, `beq`, `ldr`, `adr` mean the same on both),
   so a third backend needs a register file and a word size, not a second

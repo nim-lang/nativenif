@@ -6,7 +6,7 @@
 #
 
 ## Architecture-neutral front-end shared by the per-target backends
-## (`codegen_a64`, `codegen_x64`). Holds the `CodeGen` state object, the Leng
+## (`codegen_arm`, `codegen_x64`). Holds the `CodeGen` state object, the Leng
 ## type/lvalue analysis (`getType` / `exprSlot` / `asLoc` and friends) and
 ## the type predicates. None of this emits instructions — instruction selection
 ## and the machine frame live in the backends. The `md` field carries the

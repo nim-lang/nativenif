@@ -12,7 +12,8 @@ import std / [parseopt, syncio, strutils]
 import nifcoreparse              # parseFromFile + nifcore
 import lengdecl                  # createLengTagPool
 import codegen_common            # (arkhamTempDbg: dumpTempStats)
-import codegen_a64               # AArch64 / Darwin backend
+import codegen_arm               # BOTH Arm targets: AArch64 (Darwin/Linux) and
+                                # Cortex-M. One emitter, three machine models.
 import codegen_x64               # x86-64 / Linux backend
 
 const

@@ -1,7 +1,7 @@
 import std/[os, osproc, streams, strutils]
 # The SHARED intrinsic table arkham itself compiles against — imported for
 # `declared(intrinsics.FldrqOp)` alone, to stage the vector fixtures (see
-# `arkhamStagedVec`) in lock-step with codegen_a64's staged AdvSIMD block.
+# `arkhamStagedVec`) in lock-step with codegen_arm's staged AdvSIMD block.
 from "../../nimony/src/lib/intrinsics" import nil
 # The AArch64 encoders, for the byte-level checks below. Importing the module is
 # what lets a test assert an ENCODING rather than a program's output — the only
@@ -97,7 +97,7 @@ const arkhamKnownUnsupported: seq[string] =
   @[]
 
 const arkhamStagedVec: seq[string] =
-  # Staged exactly like codegen_a64's AdvSIMD block (`when declared(FldrqOp)`):
+  # Staged exactly like codegen_arm's AdvSIMD block (`when declared(FldrqOp)`):
   # these fixtures declare `{.instruction: "fldrq".}`-family rows, which resolve
   # through the shared `nimony/src/lib/intrinsics` table. Against a nimony
   # checkout whose table lacks the vector rows (CI pins nimony's default
@@ -539,7 +539,7 @@ const arkhamLinuxA64Unsupported: seq[string] = @[
   # (`keepovf`/`(ovf)` overflow checking now has a64 codegen too: the predicate is
   # computed into a staging bridge — xor/and sign trick for signed add/sub, unsigned
   # compare for carry/borrow, div-based check for mul — since the nifasm vocabulary
-  # has no flag-setting `adds`/`subs`. See codegen_a64's KeepovfS.)
+  # has no flag-setting `adds`/`subs`. See codegen_arm's KeepovfS.)
   #
   # The a64 backend otherwise reaches x86-64 parity on every arkham test, including
   # the value-core aggregate paths: object/array constructors as a var-init, a call
@@ -549,7 +549,7 @@ const arkhamLinuxA64Unsupported: seq[string] = @[
   # `(at (dot h arr) i)`) computed the wrong address; now folded like the x64 parser.
 ]
   # The arm64 backend reached parity with x86-64 on global / multi-dimensional array
-  # addressing: codegen_a64 now uses the same premat-before-tree two-pass
+  # addressing: codegen_arm now uses the same premat-before-tree two-pass
   # (`prematAccess`/`emAccessAddr`) as x86-64 to materialize a global base, a computed
   # index, and a non-scale stride's scratch into registers *before* the operand tree
   # opens, then re-emits `(at base idx [scratch])` for nifasm to fold. Add a test's
