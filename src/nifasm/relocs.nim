@@ -29,6 +29,26 @@ type
       ## `adr` supplies the PC — so unlike `adrp`+`add` it needs no page arithmetic
       ## and no knowledge of the section's final vaddr, which is why it can live here
       ## and serve Mach-O, ELF and PE alike.
+    rkTB, rkTBL, rkTBcond, rkTADR, rkTMovwMovt
+      ## Thumb-2 (Cortex-M). All four branch forms are 32-bit encodings stored as
+      ## two little-endian HALFWORDS, high halfword first.
+      ##
+      ## Thumb's PC is `instruction_address + 4` regardless of the instruction's own
+      ## width — two halfwords ahead, not one instruction ahead — so the displacement
+      ## is `target - (pos + 4)`, matching NEITHER x86 (from the end of the
+      ## instruction) nor AArch64 (from its start).
+      ##
+      ## `rkTB`/`rkTBL` reach ±16 MB via the S:I1:I2:imm10:imm11 encoding, where
+      ## `I1 = NOT(J1 XOR S)` and `I2 = NOT(J2 XOR S)` — the sign-dependent J-bit
+      ## inversion that makes these encodings notorious. `rkTBcond` spends four bits
+      ## on the condition and so reaches only ±1 MB, and encodes S:J2:J1:imm6:imm11
+      ## with NO inversion. The condition itself is preserved from the halfword
+      ## already in the buffer, so one kind covers all 14 conditions.
+      ##
+      ## `rkTADR` is `ADD rd, PC, #imm12` against `Align(PC, 4)` (±4 KB, and the
+      ## patcher swaps in the SUB form for a negative displacement). `rkTMovwMovt`
+      ## is a MOVW+MOVT pair carrying a label's ABSOLUTE address — no reach limit,
+      ## which a bare-metal image can rely on because its load address is fixed.
 
   # Relocation entry for optimization and patching
   RelocEntry* = object
@@ -124,6 +144,10 @@ proc calculateRelocDistance*(fromPos: int; toPos: int; kind: RelocKind = rkJmp):
      rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp: toPos - (fromPos + 6)
   of rkB, rkBL, rkBEQ, rkBNE, rkCBZ, rkCBNZ, rkTBZ, rkTBNZ, rkADR, rkADRP, rkADRADD:
     toPos - fromPos  # ARM64: distance from start of instruction (will be divided by 4 later)
+  of rkTB, rkTBL, rkTBcond, rkTADR:
+    toPos - (fromPos + 4)   # Thumb: PC reads two halfwords ahead of the instruction
+  of rkTMovwMovt:
+    toPos                   # absolute: the patcher wants the target, not a distance
 
 # Jump optimization functions
 proc updateRelocDisplacements*(buf: var Buffer) =
@@ -155,6 +179,10 @@ proc updateRelocDisplacements*(buf: var Buffer) =
         currentPos + 4  # All ARM64 instructions are 4 bytes
       of rkADRADD:
         currentPos + 8  # `adr` + `add|sub` pair
+      of rkTB, rkTBL, rkTBcond, rkTADR:
+        currentPos + 4  # a 32-bit Thumb-2 encoding: two halfwords
+      of rkTMovwMovt:
+        currentPos + 8  # MOVW + MOVT pair
 
     if requiredSize > buf.data.len:
       continue  # Skip this relocation if buffer is too small
@@ -299,6 +327,91 @@ proc updateRelocDisplacements*(buf: var Buffer) =
       if neg: addInstr = addInstr or 0x40000000'u32
       for i in 0 ..< 4:
         buf.data[currentPos + 4 + i] = byte((addInstr shr (8 * i)) and 0xFF)
+    of rkTB, rkTBL, rkTBcond:
+      # Thumb-2 32-bit branches. Two little-endian HALFWORDS, high one first.
+      #
+      # B.W / BL share the S:I1:I2:imm10:imm11 layout with the sign-dependent
+      # J-bit inversion (`I1 = NOT(J1 XOR S)`), so the J bits WRITTEN are
+      # `J = NOT(I) XOR S`. B<cond>.W instead stores S:J2:J1:imm6:imm11 straight,
+      # with no inversion and only ±1 MB of reach because four bits went to the
+      # condition — which is read back out of the existing halfword here, so one
+      # relocation kind serves all fourteen conditions.
+      let wide = reloc.kind != rkTBcond
+      let limit = if wide: 1 shl 24 else: 1 shl 20
+      if distance < -limit or distance >= limit or (distance and 1) != 0:
+        raise newException(ValueError,
+          "Thumb branch out of range or misaligned: " & $distance &
+          " bytes (limit ±" & $(limit div 1024 div 1024) & " MB)")
+      let off = int32(distance) shr 1              # in halfwords
+      let s0 = uint16((off shr 23) and 0x1)        # sign
+      let imm11 = uint16(off and 0x7FF)
+      var hi, lo: uint16
+      if wide:
+        let i1 = uint16((off shr 22) and 0x1)
+        let i2 = uint16((off shr 21) and 0x1)
+        let j1 = (not i1) and 0x1 xor s0
+        let j2 = (not i2) and 0x1 xor s0
+        let imm10 = uint16((off shr 11) and 0x3FF)
+        hi = 0xF000'u16 or (s0 shl 10) or imm10
+        lo = (if reloc.kind == rkTBL: 0xD000'u16 else: 0x9000'u16) or
+             (j1 shl 13) or (j2 shl 11) or imm11
+      else:
+        let oldHi = uint16(buf.data[currentPos]) or (uint16(buf.data[currentPos + 1]) shl 8)
+        let cond = (oldHi shr 6) and 0xF          # preserved from the placeholder
+        let j1 = uint16((off shr 17) and 0x1)
+        let j2 = uint16((off shr 18) and 0x1)
+        let imm6 = uint16((off shr 11) and 0x3F)
+        hi = 0xF000'u16 or (s0 shl 10) or (cond shl 6) or imm6
+        lo = 0x8000'u16 or (j1 shl 13) or (j2 shl 11) or imm11
+      buf.data[currentPos] = byte(hi and 0xFF)
+      buf.data[currentPos + 1] = byte((hi shr 8) and 0xFF)
+      buf.data[currentPos + 2] = byte(lo and 0xFF)
+      buf.data[currentPos + 3] = byte((lo shr 8) and 0xFF)
+    of rkTADR:
+      # ADR rd, label => ADD/SUB rd, PC, #imm12 against Align(PC, 4). The
+      # placeholder carries `rd` in the low halfword; a negative displacement
+      # selects the SUB form (T2) rather than negating an immediate that has no
+      # sign bit. The alignment matters: PC is `pos + 4`, which is only
+      # 4-aligned when the instruction itself is, so the addend is measured from
+      # the ALIGNED value and the difference folded into the immediate.
+      let pcAligned = ((currentPos + 4) div 4) * 4
+      let target = currentPos + 4 + distance
+      let delta = target - pcAligned
+      if delta < -4095 or delta > 4095:
+        raise newException(ValueError,
+          "Thumb ADR out of range: " & $delta & " bytes (limit ±4 KB)")
+      let mag = uint32(if delta < 0: -delta else: delta)
+      let i = uint16((mag shr 11) and 0x1)
+      let imm3 = uint16((mag shr 8) and 0x7)
+      let imm8 = uint16(mag and 0xFF)
+      let oldLo = uint16(buf.data[currentPos + 2]) or (uint16(buf.data[currentPos + 3]) shl 8)
+      let rd = (oldLo shr 8) and 0xF
+      let hi = (if delta < 0: 0xF2AF'u16 else: 0xF20F'u16) or (i shl 10)
+      let lo = (imm3 shl 12) or (rd shl 8) or imm8
+      buf.data[currentPos] = byte(hi and 0xFF)
+      buf.data[currentPos + 1] = byte((hi shr 8) and 0xFF)
+      buf.data[currentPos + 2] = byte(lo and 0xFF)
+      buf.data[currentPos + 3] = byte((lo shr 8) and 0xFF)
+    of rkTMovwMovt:
+      # MOVW rd, #lo16 ; MOVT rd, #hi16 — the label's ABSOLUTE address. `distance`
+      # is the target position (see `calculateRelocDistance`); the section's load
+      # address is added later by the image writer, which knows it.
+      let rd = (uint16(buf.data[currentPos + 2]) or
+                (uint16(buf.data[currentPos + 3]) shl 8)) shr 8 and 0xF
+      let addr32 = uint32(distance)
+      for half in 0 ..< 2:
+        let v = uint16((addr32 shr (16 * half)) and 0xFFFF)
+        let imm4 = uint16((v shr 12) and 0xF)
+        let i = uint16((v shr 11) and 0x1)
+        let imm3 = uint16((v shr 8) and 0x7)
+        let imm8 = uint16(v and 0xFF)
+        let hi = (if half == 0: 0xF240'u16 else: 0xF2C0'u16) or (i shl 10) or imm4
+        let lo = (imm3 shl 12) or (rd shl 8) or imm8
+        let at = currentPos + 4 * half
+        buf.data[at] = byte(hi and 0xFF)
+        buf.data[at + 1] = byte((hi shr 8) and 0xFF)
+        buf.data[at + 2] = byte(lo and 0xFF)
+        buf.data[at + 3] = byte((lo shr 8) and 0xFF)
     of rkADR:
       # ARM64 ADR: 21-bit signed immediate, byte offset from PC
       if distance < -(1 shl 20) or distance >= (1 shl 20):
@@ -364,6 +477,8 @@ proc longSizeOf(kind: RelocKind): int {.inline.} =
      rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp: 6
   of rkB, rkBL, rkBEQ, rkBNE, rkCBZ, rkCBNZ, rkTBZ, rkTBNZ, rkADR, rkADRP: 4
   of rkADRADD: 8
+  of rkTB, rkTBL, rkTBcond, rkTADR: 4
+  of rkTMovwMovt: 8
 
 proc shortJccOpcode(kind: RelocKind): byte =
   case kind
@@ -389,7 +504,7 @@ proc isUncondJump(kind: RelocKind): bool {.inline.} =
   ## An unconditional PC-relative transfer that ALWAYS falls to its target and never
   ## returns: x86 `jmp` and AArch64 `b`. (Calls `rkCall`/`rkBL` return; conditional
   ## branches may fall through — neither is unconditional.)
-  kind in {rkJmp, rkB}
+  kind in {rkJmp, rkB, rkTB}
 
 proc isThreadableBranch(kind: RelocKind): bool {.inline.} =
   ## A control transfer whose *target label* we may retarget to skip a jump hop:
@@ -398,7 +513,8 @@ proc isThreadableBranch(kind: RelocKind): bool {.inline.} =
   ## (`rkLea`/`rkADR`/`rkADRP`), whose "target" is a data/code address, not a hop.
   kind in {rkJmp, rkJe, rkJne, rkJg, rkJl, rkJge, rkJle, rkJa, rkJb, rkJae, rkJbe,
            rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp,
-           rkB, rkBEQ, rkBNE, rkCBZ, rkCBNZ, rkTBZ, rkTBNZ}
+           rkB, rkBEQ, rkBNE, rkCBZ, rkCBNZ, rkTBZ, rkTBNZ,
+           rkTB, rkTBcond}
 
 proc prunePositions(buf: var Buffer; deadPos: HashSet[int]): seq[int] =
   ## Delete the instruction starting at each position in `deadPos` (each MUST be the

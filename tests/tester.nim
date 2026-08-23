@@ -865,7 +865,56 @@ proc vgClientRequestEncodingTests() =
   check(X4, X3, X16, "dest in x4, block in x3")
   echo "5 / 5 vgreq encoding tests successful"
 
+const cortexMQemu = "qemu-system-arm"
+const cortexMArgs = ["-M", "mps2-an386", "-cpu", "cortex-m4",
+                     "-display", "none", "-serial", "none", "-monitor", "none",
+                     "-chardev", "stdio,id=semi",
+                     "-semihosting-config", "enable=on,target=native,chardev=semi",
+                     "-kernel"]
+  ## The canonical Cortex-M runner. The `-chardev stdio` routing is load-bearing:
+  ## without it QEMU writes the semihosting console to its own stderr, mixed in
+  ## with its diagnostics, where it cannot be compared against expected output.
+  ## See doc/cortex_m.md.
+
+proc thumb2SelfTest() =
+  ## Build the Thumb-2 encoder's self-checking image and run it. The image
+  ## computes ~45 expressions and exits with the 1-based index of the first whose
+  ## result differs from the expected value, so a failure NAMES the broken
+  ## encoding rather than just crashing.
+  ##
+  ## Executing the instructions is the strongest oracle available: QEMU ships no
+  ## disassembler in this configuration, but its DECODER is the one that will run
+  ## whatever the backend emits, so "the result is right" checks the encoding at
+  ## exactly the level that matters — and it exercises the branch encoders and the
+  ## relocation patcher too, which a byte-comparison could not.
+  let qemu = findExe(cortexMQemu)
+  if qemu.len == 0:
+    echo cortexMQemu, " not found - skipping Thumb-2 encoder self-test " &
+         "(install: sudo apt-get install qemu-system-arm)"
+    return
+  let gen = ("bin" / "thumb2_selftest").addFileExt(ExeExt)
+  exec "nim c --hints:off --warnings:off -o:" & gen & " tests/thumb2_selftest.nim"
+  let elf = "tests" / "thumb2_selftest.elf"
+  exec quoteShell(gen) & " " & quoteShell(elf)
+  var args: seq[string] = @[]
+  for a in cortexMArgs: args.add a
+  args.add elf
+  let (output, code) = runProgram(qemu, args)
+  if code == timeoutExitCode:
+    quit "FAILURE (TIMEOUT) Thumb-2 encoder self-test\n"
+  if code != 0:
+    quit "FAILURE Thumb-2 encoder self-test: check #" & $code &
+         " produced the wrong value\n" & output &
+         "\n(run `" & gen & " x.elf` to list the checks by index)"
+  removeFile elf
+  echo "Thumb-2 encoder self-test successful (all checks passed)"
+
+
 vgClientRequestEncodingTests()
+
+# Cortex-M: encoder-level coverage. Host-independent — it only needs
+# qemu-system-arm, so it runs wherever that is installed.
+thumb2SelfTest()
 
 # arkham native-codegen tests: arkham emits the host arch (x86-64 on Linux,
 # AArch64/Darwin on macOS), so we run them only where the binaries execute.
