@@ -1610,7 +1610,7 @@ proc emitFBinE(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCondValue2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCondE(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool)
 proc emitScalarCmpE(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
-                    whenTrue: bool): A64Inst
+                    whenTrue: bool; fuseBranchTo = ""): A64Inst
 proc emitMemLoad2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitAddr2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location)
@@ -1917,7 +1917,14 @@ proc place2(g: var CodeGen; src: Location; dest: Reg) =
     if wr != NoReg:
       g.movReg(dest, wr)
       return
+    # `dest` is written by the load below and nothing else, so as long as the ADDRESS
+    # does not read it, it is a legal home for a re-derivable global base the premat
+    # would otherwise have no register for (see `lateGlobalBase`).
+    let spare = if g.exprReadsRegE(src.cur, dest): NoReg else: dest
+    let savedSpare = g.lateBaseSpare
+    g.lateBaseSpare = spare
     g.prematLval2(src.cur)
+    g.lateBaseSpare = savedSpare
     g.ab.tree MovA64: (g.emReg dest; g.ab.tree MemX: g.emLvalAddr2(src.cur))
     g.unbindLvalTemps2(src.cur)
   else: raiseAssert "arkham a64n: place2 src " & $src.kind
@@ -2279,13 +2286,32 @@ proc prematLval2(g: var CodeGen; c: Cursor) =
       # `freeLvalTemps2` drops it with the rest of the lvalue's temps either way
       # (`dropBridge` is `unbindTemp`, which also clears the reserve flag).
       var s = g.pickStagingA64()
+      var borrowed = false
       if s != NoReg:
         g.pickedRegs.incl s
         g.bindTemp(s, ScalarSlot)
       else:
-        s = g.takeBridge()
+        s = g.tryTakeBridge()
+        if s == NoReg and g.lateBaseSpare != NoReg:
+          # Nothing free and both bridges are staging. The caller named one register
+          # it is about to OVERWRITE anyway — `place2`'s load destination, which it
+          # only offers after proving this address does not read it. `&g` goes there
+          # and the load consuming it reads `[s + idx]` back into `s`. Without this
+          # the shape `x op globalArray[i]` has no third register to stand in and the
+          # compilation stops outright; a set literal's membership test is exactly
+          # that shape, and inlining puts one inside an enclosing binary operator.
+          #
+          # BORROWED, not taken: the register stays the caller's, so the matching
+          # `unbindLvalTemps2` must not release it (it is still holding the loaded
+          # value the caller is about to consume).
+          s = g.lateBaseSpare
+          borrowed = true
+        elif s == NoReg:
+          s = g.takeBridge()                              # asserts: genuinely nothing left
       g.emGlobalAddr(s, symName(c))
-      g.lvalGlobBase[g.posOf(c)] = s
+      let gpos = g.posOf(c)
+      g.lvalGlobBase[gpos] = s
+      if borrowed: g.lateBaseBorrowedAt.incl gpos
     else:
       let home = g.plan.homeOfSym(symName(c))
       if home.kind == StackPtr:                # the slot holds &aggregate: load it first
@@ -2379,7 +2405,10 @@ proc unbindLvalTemps2(g: var CodeGen; c: Cursor) =
   if c.kind == Symbol:
     let pos = g.posOf(c)
     if g.lvalGlobBase.hasKey(pos):
-      g.dropBridge g.lvalGlobBase[pos]
+      if pos in g.lateBaseBorrowedAt:
+        g.lateBaseBorrowedAt.excl pos     # the caller's register; the caller releases it
+      else:
+        g.dropBridge g.lvalGlobBase[pos]
       g.lvalGlobBase.del pos
     return
   if c.kind == TagLit:
@@ -4286,6 +4315,89 @@ proc retypeBinDest(g: var CodeGen; rD: Reg; resTypeC: Cursor;
     elif nm.len > 0:
       g.rebindLocalAs(nm, rD, resTypeC)
 
+proc pow2Log(g: var CodeGen; c: Cursor): int =
+  ## `k` when the expression at `c` is the compile-time constant 2^k for k in 1..62,
+  ## else -1. Goes through `tryConstFold` rather than pattern-matching a literal: the
+  ## divisor that matters is spelled `sizeof(NifToken).uint`, not `4`, and the shared
+  ## folder is the one place that already knows how to evaluate that (and `(suf …)`,
+  ## `(conv …)`, and constant arithmetic besides). Folding here loses nothing — a
+  ## compile-time constant has no side effect to drop by not emitting it.
+  ##
+  ## STRICTLY POSITIVE, so `k` stops at 62: 2^63 folds to a negative `int64` and
+  ## `x div -9223372036854775808` is not `x lsr 63`. Excluding it costs an unsigned
+  ## divide by 2^63 that no real code performs.
+  let (ok, v) = g.tryConstFold(c)
+  if not ok or v <= 0: return -1
+  var u = uint64(v)
+  if (u and (u - 1)) != 0'u64: return -1                 # not a power of two
+  result = 0
+  while u > 1'u64:
+    u = u shr 1
+    inc result
+  if result < 1 or result > 62: result = -1
+
+proc emitDivPow2(g: var CodeGen; c, resTypeC, lhsC: Cursor; k: int;
+                 dest: var Location) =
+  ## `x div 2^k` without a divide. `udiv`/`sdiv` are 8–12 cycles and unpipelined on
+  ## the A76-class cores this targets, and `nifcore.leaveScope` — ten instructions
+  ## of work, run once per subtree the whole toolchain walks — spent one of them
+  ## dividing a byte count by `sizeof(NifToken)`.
+  ##
+  ## Unsigned is one `lsr`. Signed needs the round-toward-zero fixup: `asr` alone
+  ## rounds toward MINUS INFINITY, so `-1 div 2` would come out -1 instead of 0.
+  ## Bias by 2^k-1 first, but only when the value is negative — which `asr #63`
+  ## (all ones or all zeros) turns into a branchless mask.
+  ##
+  ## Both work at the full 64-bit register width whatever the type's own width is,
+  ## because a sub-64-bit value is already canonically extended into the register
+  ## (the invariant `normalizeBinWidth` maintains), and both `lsr` and `asr` of a
+  ## canonical value leave a canonical one.
+  let signed = isSignedType(resolveType(g.prog, resTypeC))
+  var acc = dest
+  if acc.kind != InReg: acc = g.takeTmp(g.binResultSlot(resTypeC))
+  if acc.kind == NamedStack and acc.spillTemp:
+    g.produceIntoMem2(c, acc)                            # pools dry: whole node via x16
+    dest = acc
+    return
+  let rD = acc.r
+  var ldst = acc
+  g.emitValue2(lhsC, ldst)                               # dividend → the accumulator
+  if acc.isTemp and not g.rb.isBoundTemp(rD): g.bindTemp(rD, acc.typ)
+  g.retypeBinDest(rD, resTypeC, inheritedOperand = false)
+  if signed:
+    let t = g.takeBridge(avoid = rD)
+    g.binImm3(AsrA64, t, rD, 63)                         # t := x < 0 ? -1 : 0
+    g.binImm3(LsrA64, t, t, 64 - k)                      # t := x < 0 ? 2^k-1 : 0
+    g.binReg(AddA64, rD, t)                              # x += bias
+    g.dropBridge t
+    g.binImm(AsrA64, rD, k)
+  else:
+    g.binImm(LsrA64, rD, k)
+  dest = acc
+
+proc emitModPow2(g: var CodeGen; c, resTypeC, lhsC: Cursor; k: int;
+                 dest: var Location) =
+  ## `x mod 2^k` for an UNSIGNED `x` — one `and` with the low-k mask, in place of a
+  ## divide, a multiply and a subtract. `2^k-1` is a run of ones, hence always a
+  ## valid AArch64 logical immediate for k in 1..63.
+  ##
+  ## Signed is deliberately NOT here: `-3 mod 2` is -1, which the mask does not
+  ## give, and the correction sequence is long enough that it stops being an
+  ## obvious win over `sdiv`+`msub`.
+  var acc = dest
+  if acc.kind != InReg: acc = g.takeTmp(g.binResultSlot(resTypeC))
+  if acc.kind == NamedStack and acc.spillTemp:
+    g.produceIntoMem2(c, acc)
+    dest = acc
+    return
+  let rD = acc.r
+  var ldst = acc
+  g.emitValue2(lhsC, ldst)
+  if acc.isTemp and not g.rb.isBoundTemp(rD): g.bindTemp(rD, acc.typ)
+  g.retypeBinDest(rD, resTypeC, inheritedOperand = false)
+  g.binImm(AndA64, rD, (1'i64 shl k) - 1)
+  dest = acc
+
 proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED a64 binary-arith: the shared allocBin policy decided inline
   ## (Sethi–Ullman swap, dest passthrough, rhs recycling, aliasRhs), emitted
@@ -4301,6 +4413,11 @@ proc emitBin2(g: var CodeGen; c: Cursor; dest: var Location) =
       rhsC = cc; skip cc
       while cc.hasMore: skip cc
   checkArithResultType(g.prog, resTypeC, lengInfo(c))
+  if ek == DivC:
+    let k = g.pow2Log(rhsC)
+    if k > 0:
+      g.emitDivPow2(c, resTypeC, lhsC, k, dest)
+      return
   let lhsMem = g.isFoldableMemLeaf(lhsC)
   let swap = ek notin {ShlC, ShrC} and (commutativeExpr(ek) or ek == SubC) and
              (g.isFoldableLeafE(lhsC) or lhsMem) and
@@ -4424,6 +4541,11 @@ proc emitMod2(g: var CodeGen; c: Cursor; dest: var Location) =
       dvsC = cc; skip cc
       while cc.hasMore: skip cc
   let signed = isSignedType(rt)
+  if not signed:
+    let k = g.pow2Log(dvsC)
+    if k > 0:
+      g.emitModPow2(c, rt, divC, k, dest)
+      return
   var lD = needsReg(g.valueSlot(divC))
   g.emitValue2(divC, lD)
   var rD0 = needsReg(g.valueSlot(dvsC))
@@ -4697,10 +4819,16 @@ proc isCmpImmLeaf(c: Cursor): bool =
   result = cur.kind in {IntLit, UIntLit, CharLit}
 
 proc emitScalarCmpE(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
-                    whenTrue: bool): A64Inst =
+                    whenTrue: bool; fuseBranchTo = ""): A64Inst =
   ## FUSED integer `cmp`: operands resolve dontCare (a home / immediate stays
   ## put; a computed subtree takes a temp) and the bridges serve everything
   ## else — 075b051's stackHomeSlot / placeImmTyped bridge typing preserved.
+  ##
+  ## `fuseBranchTo` names the label a conditional branch would jump to next. Given
+  ## one, an `== 0` / `!= 0` (`nil` included — it is the same zero) is emitted as a
+  ## single `cbz`/`cbnz` instead of `cmp`+`b.eq`, and `NoA64Inst` comes back to say
+  ## the branch is already emitted. Only equality fuses: AArch64 has no
+  ## compare-and-branch for the ordering conditions.
   var aC = aC0
   var bC = bC0
   let signed = not (g.cmpOperandUnsigned(aC) or g.cmpOperandUnsigned(bC))
@@ -4747,7 +4875,17 @@ proc emitScalarCmpE(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
     bMem = true
   else:
     g.emitValue2(bC, bD)
-  if bD.kind == Imm and bD.ival >= 0 and bD.ival <= 0xFFFF:
+  var fused = false
+  if bD.kind == Imm and bD.ival == 0 and ek in {EqC, NeqC} and fuseBranchTo.len > 0:
+    # `x == 0` / `x != 0` against a label: one `cbz`/`cbnz`, no flags involved.
+    # `result` already carries the sense (`whenTrue` folded in) and, for a swapped
+    # `0 == x`, the mirror — and mirroring leaves BeqA64/BneA64 alone, so reading
+    # it here is exactly reading "branch when equal / when not equal".
+    g.ab.tree (if result == BeqA64: CbzA64 else: CbnzA64):
+      g.emReg aReg
+      g.ab.sym fuseBranchTo
+    fused = true
+  elif bD.kind == Imm and bD.ival >= 0 and bD.ival <= 0xFFFF:
     g.ab.tree CmpA64: (g.emReg aReg; g.emImm(bD))
   else:
     var bReg = NoReg
@@ -4764,6 +4902,7 @@ proc emitScalarCmpE(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
   if aBridge != NoReg: g.dropBridge aBridge
   if aMem: g.freeLvalTemps2(aC)
   else: g.freeVal(aD)
+  if fused: result = NoA64Inst
 
 proc emitCondE(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
   ## FUSED branch test — the a64 twin of x64's emitCondE.
@@ -4853,20 +4992,21 @@ proc emitCondE(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
       g.freeVal(fb)
       g.freeVal(fa)
       return
-    let tag = g.emitScalarCmpE(aC, bC, ek, whenTrue)
-    g.emBr(tag, toLabel)
+    let tag = g.emitScalarCmpE(aC, bC, ek, whenTrue, fuseBranchTo = toLabel)
+    if tag != NoA64Inst: g.emBr(tag, toLabel)      # NoA64Inst: fused into a cbz/cbnz
     return
+  # A bare truthiness test — `if flag`, `while p` — is a zero test, so it is a
+  # `cbz`/`cbnz` too and never needs the flags.
   var v = needsReg(g.valueSlot(c))
   g.emitValue2(c, v)
+  let zTag = if whenTrue: CbnzA64 else: CbzA64
   if v.kind == InReg:
-    g.ab.tree CmpA64: (g.emReg v.r; g.ab.intLit 0)
-    g.emBr(if whenTrue: BneA64 else: BeqA64, toLabel)
+    g.ab.tree zTag: (g.emReg v.r; g.ab.sym toLabel)
     g.freeVal(v)
   else:                                            # pool-dry etmp bool: bridge reload
     let b = g.takeBridge(v.typ)
     g.place2(v, b)
-    g.ab.tree CmpA64: (g.emReg b; g.ab.intLit 0)
-    g.emBr(if whenTrue: BneA64 else: BeqA64, toLabel)
+    g.ab.tree zTag: (g.emReg b; g.ab.sym toLabel)
     g.dropBridge b
 
 proc emitCondValue2(g: var CodeGen; c: Cursor; dest: var Location) =
@@ -4996,13 +5136,19 @@ proc reReprCast2(g: var CodeGen; res: var Location; inner, targetCur, tc: Cursor
       if nm.len > 0: g.rebindLocalAs(nm, res.r, targetCur)
   let (srcW, srcSigned) = g.srcWidthSigned(inner)
   if kindChange:
-    if ptrTarget and not srcPtr and srcW < 64: g.extendTo(res.r, srcW, signed = false)
+    if ptrTarget and not srcPtr and srcW < 64 and
+       not g.arrivesNormalized(inner, srcW, signed = false):
+      g.extendTo(res.r, srcW, signed = false)
   else:
     let targetW = intTypeWidth(tc)
     if srcW < targetW:
-      g.extendTo(res.r, srcW, signed = (not isCast) and srcSigned)   # widen
+      let sgn = (not isCast) and srcSigned
+      if not g.arrivesNormalized(inner, srcW, sgn):
+        g.extendTo(res.r, srcW, sgn)                                 # widen
     else:
-      g.extendTo(res.r, targetW, signed = isSignedType(tc))          # narrow / equal
+      let sgn = isSignedType(tc)
+      if not g.arrivesNormalized(inner, targetW, sgn):
+        g.extendTo(res.r, targetW, sgn)                              # narrow / equal
   # The register now holds the TARGET's value, so put the target type back on the
   # name the pre-retype above widened. `kindChange` already did it.
   if not kindChange:

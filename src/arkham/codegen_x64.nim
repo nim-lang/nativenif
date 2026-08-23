@@ -7265,56 +7265,6 @@ proc fcvtU2F(g: var CodeGen; d: FReg; s: Reg; bits: int) =
   g.giveBack half
   g.emLab lDone
 
-proc arrivesNormalized(g: var CodeGen; src: Cursor; width: int; signed: bool): bool =
-  ## True when emitting `src` into a register ALREADY leaves the canonical 64-bit
-  ## form for (`width`, `signed`) — so the `extendTo` a conversion would append is
-  ## dead code. `extendTo` costs a `shl`/`shr` PAIR, and `nifcore.kind` carried two
-  ## of them (4 of its 14 instructions) around a body that is a load and a mask.
-  ##
-  ## Deliberately syntactic and deliberately narrow: it claims a fact only where
-  ## the fact is established by the very next instruction nifasm emits, never from
-  ## a whole-function invariant.
-  if width <= 0 or width >= 64: return false
-  # 1. The source's own scalar type ALREADY is (width, signed). arkham keeps every
-  #    sub-64-bit scalar normalized to its type's width in a register — that is the
-  #    invariant `normalizeBinWidth` restores after `add`/`sub`/`mul`/`shl` and that
-  #    it relies on when it skips the fixup for `and`/`or`/`xor`/`shr`. Re-extending
-  #    to a width the value already has is a pure no-op. `srcWidthSigned` answers
-  #    (64, true) for anything it cannot classify, and 64 never equals `width` here,
-  #    so an unknown source is excluded rather than assumed.
-  let (sw, ss) = g.srcWidthSigned(src)
-  if sw == width and ss == signed: return true
-  var c = src
-  case c.exprKind
-  of DerefC:
-    # A typed pointer deref becomes `(mem …)` whose type is the POINTEE, and
-    # nifasm sizes the load from it (`intMemAccess` → `emitLoadExt`): a sub-word
-    # integer is loaded sign-/zero-extending, a 4-byte one with a 32-bit `mov`
-    # that zeroes the upper half. So the value arrives already extended.
-    #
-    # ONLY a genuine deref: a stack SLOT operand carries `StackOffT`, which
-    # `intMemAccess` reads as a full 64-bit access — nothing is extended there.
-    let sl = typeToSlot(resolveType(g.prog, g.getType(c)))
-    result = sl.kind in {AInt, AUInt, ABool} and sl.size * 8 == width and
-             (sl.kind == AInt) == signed
-  of BitandC:
-    # `x and M` for a non-negative literal mask M < 2^width is bounded by M, hence
-    # already zero-extended. (Signed targets are excluded: a mask says nothing
-    # about sign extension.)
-    if signed: return false
-    var t = c
-    t.into:
-      skip t                                    # the result type
-      while t.hasMore:
-        var lit = t                             # a literal arrives `(suf 15u "u32")`
-        if lit.exprKind == SufC:
-          lit = sub(lit)
-        if lit.kind == IntLit or lit.kind == UIntLit:
-          let m = (if lit.kind == IntLit: intVal(lit) else: cast[int64](uintVal(lit)))
-          if m >= 0 and m < (1'i64 shl width): result = true
-        skip t
-  else: result = false
-
 proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED `(conv|cast Type inner)`. Decisions inline (allocValue CastC/ConvC):
   ## float targets/sources force the SIMD/GPR shapes; a NARROWING cast whose
@@ -7527,7 +7477,9 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
     dest.typ = reboundAs
   let (srcW, srcSigned) = g.srcWidthSigned(inner)
   if kindChange:
-    if ptrTarget and not srcPtr and srcW < 64: g.extendTo(res2.r, srcW, signed = false)
+    if ptrTarget and not srcPtr and srcW < 64 and
+       not g.arrivesNormalized(inner, srcW, signed = false):
+      g.extendTo(res2.r, srcW, signed = false)
   else:
     let targetW = intTypeWidth(tc)
     if srcW < targetW:

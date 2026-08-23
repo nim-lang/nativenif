@@ -282,6 +282,16 @@ type
                                              ## predicate; OvfCmpLo: the cmp's LHS
     ovfReg2*: Reg                             ## a64 OvfCmpLo: the cmp's RHS
     ovfBridges*: seq[Reg]                     ## a64: staging bridges the `(ovf)` test releases
+    lateBaseSpare*: Reg                       ## a64: a register the CALLER knows is dead across
+                                              ## the lvalue premat it is about to run — offered to
+                                              ## `lateGlobalBase` as a home for `&g` when neither a
+                                              ## free volatile nor a staging bridge is left. Set
+                                              ## around one `prematLval2` call and cleared right
+                                              ## after; never read anywhere else.
+    lateBaseBorrowedAt*: HashSet[int]         ## a64: lvalue positions whose global base went into
+                                              ## `lateBaseSpare` rather than into scratch of its
+                                              ## own. The register belongs to the CALLER, so the
+                                              ## matching `unbindLvalTemps2` must leave it bound.
     # ── `.assembler` transliteration (doc/intrinsics.md §8) ──
     # In an `.assembler` proc there is no allocator: every value's home is DECLARED
     # (`.register`/`.stack` on the param or local), so the register IS the identity
@@ -644,6 +654,91 @@ proc srcWidthSigned*(g: var CodeGen; c: Cursor): tuple[width: int, signed: bool]
     of TrueC, FalseC: return (64, false)
     else: return (64, true)
   else: return (64, true)
+
+proc literalArrivesNormalized(lit: Cursor; width: int; signed: bool): bool =
+  ## Is the integer literal at `lit` already in the canonical 64-bit register form
+  ## for (`width`, `signed`)? A literal reaches a register through `movImm`, which
+  ## writes its exact 64-bit two's-complement value — so the answer is simply
+  ## whether the value is in that type's range. `-1` IS canonical for a signed
+  ## 32-bit target (all ones is int32(-1) sign-extended) and is NOT for an unsigned
+  ## one. `width` is 1..63 here (the caller excluded 0 and 64), so both shifts fit.
+  let hi = 1'i64 shl (width - 1)
+  case lit.kind
+  of IntLit:
+    let v = intVal(lit)
+    if signed: v >= -hi and v < hi
+    else: v >= 0 and v < (1'i64 shl width)
+  of UIntLit:
+    let u = uintVal(lit)
+    if signed:
+      let v = cast[int64](u)
+      v >= -hi and v < hi
+    else: u < (1'u64 shl width)
+  else: false
+
+proc arrivesNormalized*(g: var CodeGen; src: Cursor; width: int; signed: bool): bool =
+  ## True when emitting `src` into a register ALREADY leaves the canonical 64-bit
+  ## form for (`width`, `signed`) — so the `extendTo` a conversion would append is
+  ## dead code. `extendTo` costs a shift PAIR on both targets, and `nifcore.kind`
+  ## carried two of them (4 of its 14 instructions) around a body that is a load
+  ## and a mask; `nifcore.Cursor`'s whole token-dispatch path carried twelve.
+  ##
+  ## Deliberately syntactic and deliberately narrow: it claims a fact only where
+  ## the fact is established by the very next instruction nifasm emits, never from
+  ## a whole-function invariant. Shared by both backends because every fact it
+  ## reads is a Leng-level or nifasm-level one, not an encoding-level one.
+  if width <= 0 or width >= 64: return false
+  # 1. The source's own scalar type ALREADY is (width, signed). arkham keeps every
+  #    sub-64-bit scalar normalized to its type's width in a register — that is the
+  #    invariant `normalizeBinWidth` restores after `add`/`sub`/`mul`/`shl` and that
+  #    it relies on when it skips the fixup for `and`/`or`/`xor`/`shr`. Re-extending
+  #    to a width the value already has is a pure no-op. `srcWidthSigned` answers
+  #    (64, true) for anything it cannot classify — a call result included, whose
+  #    upper half neither ABI promises — and 64 never equals `width` here, so an
+  #    unknown source is excluded rather than assumed.
+  let (sw, ss) = g.srcWidthSigned(src)
+  if sw == width and ss == signed: return true
+  var c = src
+  while c.kind == TagLit and c.exprKind in {SufC, ParC}:
+    c = sub(c)                                  # `(suf 255 "u32")`, `(par x)`
+  # 2. A LITERAL. `movImm` materializes it as its exact 64-bit two's-complement
+  #    value, so it is already canonical for (width, signed) exactly when it lies
+  #    in that type's range — and re-extending it is the purest dead code there is.
+  if literalArrivesNormalized(c, width, signed): return true
+  case c.exprKind
+  of DerefC:
+    # A typed pointer deref becomes `(mem …)` whose type is the POINTEE, and
+    # nifasm sizes the load from it: a sub-word integer is loaded sign-/zero-
+    # extending, a 4-byte one zeroing the upper half (x64 `intMemAccess` →
+    # `emitLoadExt`; a64 `memWidthOpc` → `ldrsb`/`ldrsh`/`ldrsw` vs
+    # `ldrb`/`ldrh`/`ldr w`). So the value arrives already extended.
+    #
+    # ONLY a genuine deref: a stack SLOT operand carries `StackOffT`, which x64's
+    # `intMemAccess` reads as a full 64-bit access — nothing is extended there.
+    # (a64's `memWidthOpc` does unwrap `StackOffT` and size by the slot's content
+    # type, but this stays the conservative intersection of the two.)
+    let sl = typeToSlot(resolveType(g.prog, g.getType(c)))
+    result = sl.kind in {AInt, AUInt, ABool} and sl.size * 8 == width and
+             (sl.kind == AInt) == signed
+  of BitandC:
+    # `x and M` for a non-negative literal mask M is bounded by M, hence already
+    # zero-extended when M < 2^width. A SIGNED target needs the stronger bound
+    # M < 2^(width-1): only below the sign bit do zero- and sign-extension agree.
+    # `char(x and 0x7f)` — the varint writers' shape — is exactly that, and Leng's
+    # `(c 8)` is a signed 8-bit type.
+    let bound = 1'i64 shl (width - ord(signed))
+    var t = c
+    t.into:
+      skip t                                    # the result type
+      while t.hasMore:
+        var lit = t                             # a literal arrives `(suf 15u "u32")`
+        if lit.exprKind == SufC:
+          lit = sub(lit)
+        if lit.kind == IntLit or lit.kind == UIntLit:
+          let m = (if lit.kind == IntLit: intVal(lit) else: cast[int64](uintVal(lit)))
+          if m >= 0 and m < bound: result = true
+        skip t
+  else: result = false
 
 # ── unified location model (addressing modes + computed values) ─────────────
 # `Location` (machinedesc) is THE descriptor for "where a value lives, or should
