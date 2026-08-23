@@ -1,0 +1,116 @@
+#
+#           Arkham — Cortex-M (ARMv7E-M / AAPCS32) backend machine model
+#        (c) Copyright 2026 Andreas Rumpf
+#
+#    See the file "license.txt", included in this distribution.
+#
+
+## The Cortex-M register file and calling convention as the (arch-neutral)
+## register allocator consumes it. The abstract `Reg` slots are reinterpreted as
+## the Thumb GPRs: `R0`..`R12` are r0–r12 and the `SP` slot is sp, so the low
+## thirteen slots are used and `R13`..`R30` stay unallocated — the same
+## subsetting x86-64 does with `R16`..`R30`.
+##
+## The register file is the tightest of the three targets and that drives every
+## choice below. AAPCS32 gives four argument registers (r0–r3), eight
+## callee-saved (r4–r11), and exactly ONE non-argument caller-saved register
+## (r12/IP) — which nifasm has already claimed as its own operand-folding
+## scratch. So unlike AArch64, where seven volatiles are free for temporaries,
+## there is no spare volatile here at all.
+
+import slots, machinedesc
+export machinedesc
+
+const
+  IP* = R12   ## AAPCS32's intra-procedure scratch — **nifasm's**, not arkham's.
+              ## The assembler folds a non-register operand into a 3-operand
+              ## form through it and materializes an indexed access with a
+              ## displacement through it, at sites arkham cannot see. arkham must
+              ## therefore never place a value here: it is absent from every pool
+              ## below and listed in `ReservedRegs`.
+  LR* = R14   ## the link register (hardware r14). Present only so `regName`
+              ## renders it; arkham never allocates it.
+
+  IntArgRegs*   = [R0, R1, R2, R3]   ## AAPCS32 argument registers; r0 also returns
+  IntRet*       = R0
+
+  ## Callee-saved homes for values that must survive a call. Six of AAPCS32's
+  ## eight: r10/r11 are withheld as the emitter's bridges (below).
+  IntCalleeSaved* = [R4, R5, R6, R7, R8, R9]
+
+  ## The volatile scratch arkham manages. On AArch64 the argument registers are
+  ## kept OUT of this pool because seven other volatiles exist; here they are the
+  ## only volatiles there are, so — exactly as x86-64 does with its argument
+  ## registers in `intLocalTempRegs` — they double as the temp pool. The
+  ## analyser's `AllRegs` interval test is what makes that sound: a value homed
+  ## in one of these provably has no call in its live range.
+  ##
+  ## r0 is EXCLUDED, as rax is on x86-64 and x0 on AArch64. The planner's
+  ## "returned local lives in the return register" optimization depends on the
+  ## return register being drawable ONLY by that local's home and by no temp; if
+  ## it were an ordinary temp here, a temp could take it and the elision would
+  ## silently stop happening.
+  IntTempRegs* = [R1, R2, R3]
+
+  ## Identical to `IntTempRegs`, as on AArch64: the bridges are already withheld
+  ## by not appearing in either list, so there is nothing further to subtract.
+  IntLocalTempRegs* = [R1, R2, R3]
+
+  ## Emitter "staging bridges", withheld from every pool so a transient can
+  ## always be drawn: a folded memory operand the 3-operand ALU must load first,
+  ## a global's address, and a produce-into-memory spill. Two are needed for the
+  ## same reason AArch64 needs two — a `cmp` whose BOTH operands spilled to the
+  ## stack has to load each into a register, and Thumb-2 has no memory-operand
+  ## compare.
+  ##
+  ## These are CALLEE-saved registers used as scratch, which is a private
+  ## convention: valid because arkham owns both sides of every call in a
+  ## self-contained image. Calling arkham-generated code FROM C would violate
+  ## AAPCS32 — that is an M6 concern, and the fix there is to save them in the
+  ## prologue of any `exportc`'d proc.
+  IntBridgeRegs* = [R10, R11]
+
+  ## Never allocate: nifasm's IP, the link register, sp, and the abstract slots
+  ## that map to no Cortex-M register.
+  ReservedRegs* = {R12, R13, R14, R15, R16..R30, SP, NoReg}
+
+  ## What a call destroys under AAPCS32 — emitted as the proc's `(clobber …)` so
+  ## the ABI is declared at the signature rather than re-derived at each site.
+  ## r12 and lr are included: `bl` overwrites lr, and IP is scratch for everyone.
+  ConvClobbersGpr* = [R0, R1, R2, R3]
+
+  ## The Cortex-M machine description handed to the register allocator.
+  cortexMMachine* = MachineDesc(
+    arch: ThumbM,
+    intRetReg: R0,
+    divRemReg: NoReg,           # sdiv/udiv are 3-operand; the remainder is `mls`
+    shiftCountReg: NoReg,       # Thumb-2 shifts take any register
+    intArgRegs: @IntArgRegs,
+    floatArgRegs: @[],          # the FPv4-SP path is M5
+    intTempRegs: @IntTempRegs,
+    stagingBridgeReg: NoReg,    # like AArch64: the bridges are withheld from the
+                                # pools instead (see IntBridgeRegs)
+    intLocalTempRegs: @IntLocalTempRegs,
+    intCalleeSaved: @IntCalleeSaved,
+    floatTempRegs: @[],
+    floatCalleeSaved: @[],
+    intCalleeSavedSet: {R4..R9},
+    floatCalleeSavedSet: {},
+    aggrByRefThreshold: 4)      # one word, as win64 uses one of its own (8)
+
+proc regNameM*(r: Reg): string =
+  ## The asm-NIF spelling of a GPR slot. These are the tags nifasm's `MReg`
+  ## enum accepts — `(r0)`..`(r12)`, `(sp)`, `(lr)` — which Cortex-M SHARES with
+  ## the other targets rather than minting its own (see doc/instructions.md).
+  case r
+  of SP: "sp"
+  of R14: "lr"
+  of NoReg: "<noreg>"
+  else:
+    if ord(r) <= ord(R12): "r" & $ord(r)
+    else: "<unmapped:" & $ord(r) & ">"
+
+proc isAllocatableM*(r: Reg): bool {.inline.} =
+  ## Whether arkham may place a value in `r`. Excludes nifasm's IP, the bridges'
+  ## role is enforced by their absence from the pools rather than here.
+  r notin ReservedRegs

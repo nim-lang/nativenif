@@ -62,7 +62,12 @@ type
     ## arch-neutral, but a few instruction-selection quirks (x86's destructive
     ## 2-operand RMW, `div` clobbering RDX, variable shift via RCX) are handled by
     ## `if md.arch == X86` branches in the expression walk rather than a callback.
-    X86, Arm64
+    ##
+    ## `ThumbM` (Cortex-M) shares AArch64's shape wherever those branches ask —
+    ## 3-operand ALU, no fixed div or shift-count register — so it groups with
+    ## `Arm64` at every one of them. What differs between the two is the word
+    ## size and the register file, and both of those are already values.
+    X86, Arm64, ThumbM
 
   MachineDesc* = object
     ## A target's register file + calling convention, as the allocator needs it.
@@ -349,12 +354,16 @@ proc memToMemBridgeDemand*(md: MachineDesc; dst, v: Location): ScratchDemand =
   if dst.typ.isFloat:
     let fromMem = (case md.arch
                    of X86: v.kind in {NamedStack, Mem}
-                   of Arm64: v.kind in {NamedStack, Mem, Glob})
+                   of Arm64, ThumbM: v.kind in {NamedStack, Mem, Glob})
     if fromMem: ScratchDemand(fregs: 1) else: ScratchDemand()
   else:
     let needsBridge = (case md.arch
                        of X86: v.kind in {NamedStack, Mem}
-                       of Arm64: v.kind in {NamedStack, Mem, Glob, Tvar, Imm})
+                       of Arm64, ThumbM: v.kind in {NamedStack, Mem, Glob, Tvar, Imm})
+                       # Cortex-M answers like AArch64 and for the same reasons:
+                       # no store-immediate, no PC-relative data operand, so an
+                       # immediate, a global and a thread-local each pass through
+                       # a register on the way to a stack home.
     if needsBridge:
       ScratchDemand(gprs: 1, slot: (if md.arch == X86: v.typ else: dst.typ))
     else:
