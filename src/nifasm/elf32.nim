@@ -139,15 +139,27 @@ proc writeElf32*(segments: openArray[Segment]; entry: uint32): seq[byte] =
   result = newSeq[byte](out0.len)
   for i in 0 ..< out0.len: result[i] = out0[i]
 
-proc writeFirmware*(code: seq[byte]; loadAddr = FlashBase;
+const VectorTableSize* = 8
+  ## The two words this writer emits: initial MSP and reset handler. Code is laid
+  ## out assuming it starts this far above the load address.
+
+proc writeFirmware*(code: seq[byte]; entryOffset = 0; loadAddr = FlashBase;
                     stackTop = DefaultStackTop): seq[byte] =
-  ## The single-segment case: a vector table followed by `code`, all in the
-  ## code region, entry at the first byte after the table.
+  ## The single-segment case: a vector table followed by `code`, all in the code
+  ## region.
+  ##
+  ## `entryOffset` is the reset handler's position WITHIN `code` — not within the
+  ## image — so the caller can hand over a byte position straight out of its
+  ## instruction buffer. Defaulting it to 0 means "the first thing emitted",
+  ## which is right for a top-level statement sequence and wrong for anything
+  ## with procs, where the entry is wherever its label landed.
   ##
   ## `code` must already have been laid out assuming it starts at
-  ## `loadAddr + 8` — the caller emits it that way, so nothing is relocated here.
-  var image = initVectorTable(stackTop, loadAddr + 8)
+  ## `loadAddr + VectorTableSize` — the caller emits it that way, so nothing is
+  ## relocated here.
+  let entry = loadAddr + uint32(VectorTableSize + entryOffset)
+  var image = initVectorTable(stackTop, entry)
   image.add code
   result = writeElf32([Segment(vaddr: loadAddr, data: image,
                                memSize: image.len,
-                               flags: PF_R or PF_W or PF_X)], loadAddr + 8)
+                               flags: PF_R or PF_W or PF_X)], entry)

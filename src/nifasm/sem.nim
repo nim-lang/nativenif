@@ -2,6 +2,7 @@
 import std / [tables]
 import tags, x86
 from arm64 import nil  # only `arm64.Register`, qualified: `Register` alone stays x86's
+from thumb2 import nil # ditto for the Cortex-M register enum
 import nifcore  # SymId: symbols are keyed by their interned id (main-module pool),
                 # not by re-hashing the qualified name string on every lookup.
 
@@ -78,6 +79,12 @@ type
         ## The AArch64 half of the same `(clobber …)` declaration. Kept apart from
         ## `clobbers` because the two register enums are unrelated types; a decl
         ## only ever lists one arch's registers, so the other set stays empty.
+      clobbersM*: set[thumb2.Register]
+        ## The Cortex-M half. Unlike the other two this one OVERLAPS `clobbers`:
+        ## `(r0)` is a valid spelling on x86-64 and on Cortex-M both, so the parser
+        ## records such a tag in BOTH sets and each arch reads its own. A
+        ## declaration only ever targets one arch, so the extra membership is
+        ## never consulted.
       hasClobberDecl*: bool
         ## Whether a `(clobber …)` was present at all. An EMPTY declared list is
         ## meaningful — arkham emits it for a `(attr "noreturn")` callee, whose

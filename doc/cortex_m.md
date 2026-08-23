@@ -8,7 +8,7 @@ Status: **M0, M1, M2a/b complete; M2c in progress.**
 | M1 word-size parameterization | done — `slots.setTargetWord` / `sem.setAsmWordSize` |
 | M2a Thumb-2 encoder + relocations | done — `src/nifasm/thumb2.nim`, 45-check self-test |
 | M2b ELF32 firmware writer | done — `src/nifasm/elf32.nim` |
-| M2c assembler integration | **mostly done** — selector works; frames/calls remain |
+| M2c assembler integration | done — selector, frames, calls, marshalling |
 | M3 arkham backend | not started |
 | M4 64-bit integers | not started |
 | M5 floating point | not started |
@@ -28,14 +28,29 @@ extends, `clz`/`rbit`/`rev`, `cmp`/`tst`, every load/store width including the
 sign-extending ones, `ite`/`loop`/`jtrue`, `b`/`bl`/`bx`/`blx`/`cbz`/`cbnz`,
 `bkpt`, `ret`, `nop`, `wfi` and `kill`.
 
+Frames and calls are in too: `(proc …)` with AAPCS32 register and stack
+parameters, `(ssize)`-sized frames, `(prepare …)`/`(call)`, `(arg …)`/`(res …)`
+marshalling, `(csize)`, and indirect calls through a register-held function
+pointer. Four fixtures run under QEMU in `tests/tester`.
+
+The frame follows AArch64's shape rather than x86-64's: the return address
+arrives in LR, the caller leaves SP at the first stack argument, and the
+outgoing argument area is reserved ONCE at the bottom of the frame so SP is
+constant from prologue to epilogue.
+
+`(ssize)` is emitted as a MOVW/MOVT pair with a zero immediate and patched once
+the frame size is known. The pair is a fixed 8 bytes whatever the value, so
+patching never resizes an instruction — and unlike the AArch64 path there is no
+12-/16-bit immediate ceiling on the frame.
+
 ### What M2c still needs
 
-* **Frames and calls.** `(ssize)`, `(csize)`, `(proc …)` prologue/epilogue,
-  `(prepare …)`/`(call)`/`(extcall)` and `(arg …)`/`(res …)` marshalling for
-  AAPCS32. `(ssize)` currently errors by name rather than emitting a frame size
-  of zero.
 * **Address-of-global** (`(adr D <gvar>)`) — errors by name.
 * **`(dot …)` / `(at …)`** address folding inside `(mem …)`.
+* Indirect calls through a global or a stack-held function pointer (a
+  register-held one works).
+* `extproc`/`syproc` are rejected by name: a bare-metal image has nothing to
+  link against and no OS to call.
 * 64-bit scalars and floats are rejected BY NAME (`checkRegWidthM`) rather than
   truncated; they are M4 and M5.
 

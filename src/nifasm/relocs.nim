@@ -401,22 +401,7 @@ proc updateRelocDisplacements*(buf: var Buffer) =
       # MOVW rd, #lo16 ; MOVT rd, #hi16 — the label's ABSOLUTE address. `distance`
       # is the target position (see `calculateRelocDistance`); the section's load
       # address is added later by the image writer, which knows it.
-      let rd = (uint16(buf.data[currentPos + 2]) or
-                (uint16(buf.data[currentPos + 3]) shl 8)) shr 8 and 0xF
-      let addr32 = uint32(distance) + buf.absBase
-      for half in 0 ..< 2:
-        let v = uint16((addr32 shr (16 * half)) and 0xFFFF)
-        let imm4 = uint16((v shr 12) and 0xF)
-        let i = uint16((v shr 11) and 0x1)
-        let imm3 = uint16((v shr 8) and 0x7)
-        let imm8 = uint16(v and 0xFF)
-        let hi = (if half == 0: 0xF240'u16 else: 0xF2C0'u16) or (i shl 10) or imm4
-        let lo = (imm3 shl 12) or (rd shl 8) or imm8
-        let at = currentPos + 4 * half
-        buf.data[at] = byte(hi and 0xFF)
-        buf.data[at + 1] = byte((hi shr 8) and 0xFF)
-        buf.data[at + 2] = byte(lo and 0xFF)
-        buf.data[at + 3] = byte((lo shr 8) and 0xFF)
+      buf.data.patchThumbMovwMovtPair(currentPos, uint32(distance) + buf.absBase)
     of rkADR:
       # ARM64 ADR: 21-bit signed immediate, byte offset from PC
       if distance < -(1 shl 20) or distance >= (1 shl 20):
