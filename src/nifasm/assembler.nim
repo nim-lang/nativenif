@@ -514,6 +514,9 @@ type
     clobberedM: set[thumb2.Register]
                         # Cortex-M counterpart of `clobberedA64`: caller-saved registers
                         # a call destroyed, so reading one before rewriting it is an error.
+    mFRegBindings: Table[thumb2.FloatRegister, string]
+                        # The FPv4-SP twin of `mRegBindings`: which s-register hosts a
+                        # named float local or scratch temp.
     a64RegBindings: Table[arm64.Register, string]  # AArch64 counterpart of `regBindings`:
                         # which physical x-register currently hosts which variable name. A
                         # raw `(xN)` use of a bound register is rejected (use the name);
@@ -784,6 +787,17 @@ proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type
 proc parsePtrType(kind: TypeKind; n: var Cursor; scope: Scope; ctx: var GenContext): Type
 proc parseParams(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param]
 proc parseResult(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param]
+proc rawTagIsMFloatReg(t: TagEnum): bool {.inline.} =
+  ## `(s0)`..`(s31)` — the FPv4-SP single-precision file. These spellings are
+  ## AArch64's too; `(arch …)` is what decides which machine they name.
+  t >= S0TagId and t <= S31TagId
+
+proc rawTagIsMGpr(t: TagEnum): bool {.inline.} =
+  ## A Cortex-M GENERAL-purpose register. `rawTagIsMReg` covers the float file
+  ## as well, so every site that means "an integer register" has to say so —
+  ## otherwise `(s3)` binds a variable to r3.
+  rawTagIsMReg(t) and not rawTagIsMFloatReg(t)
+
 proc parseClobbers(n: var Cursor; a64: var set[arm64.Register];
                    m: var set[thumb2.Register]): set[x86.Register]
 proc tagToRegisterA64(t: TagEnum; n: Cursor): arm64.Register
@@ -1414,9 +1428,9 @@ proc parseClobbers(n: var Cursor; a64: var set[arm64.Register];
   if declTag(n) == ClobberD:
     loopInto n:
       if n.kind == TagLit and rawTagIsX64Reg(rawTag(n)):
-        if rawTagIsMReg(rawTag(n)): m.incl tagToRegisterM(n.tag, n)
+        if rawTagIsMGpr(rawTag(n)): m.incl tagToRegisterM(n.tag, n)
         result.incl parseRegister(n)
-      elif n.kind == TagLit and rawTagIsMReg(rawTag(n)):
+      elif n.kind == TagLit and rawTagIsMGpr(rawTag(n)):
         m.incl tagToRegisterM(n.tag, n)
         skip n
       elif n.kind == TagLit and rawTagIsA64Reg(rawTag(n)):
@@ -4120,7 +4134,22 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
 #    exist for the other targets, so `rawTagIsMReg` — not the x86 or a64
 #    classifier — is what decides whether a tag is a register HERE.
 
+proc tagToFloatRegisterM(t: TagEnum; n: Cursor): thumb2.FloatRegister =
+  if not rawTagIsMFloatReg(t):
+    error("Expected a Cortex-M floating-point register", n)
+    return thumb2.S0
+  thumb2.FloatRegister(int(t) - int(S0TagId))
+
+proc parseFloatRegisterM(n: var Cursor): thumb2.FloatRegister =
+  if n.kind != TagLit or not rawTagIsMFloatReg(n.tag):
+    error("Expected a Cortex-M floating-point register", n)
+  result = tagToFloatRegisterM(n.tag, n)
+  inc n
+
 proc tagToRegisterM(t: TagEnum; n: Cursor): thumb2.Register =
+  if rawTagIsMFloatReg(t):
+    error("Expected an integer register, got a floating-point one", n)
+    return thumb2.R0
   let regTag = tagToMReg(t)
   result =
     case regTag
@@ -4139,12 +4168,12 @@ proc tagToRegisterM(t: TagEnum; n: Cursor): thumb2.Register =
     of R12MR: thumb2.R12
     of SpMR: thumb2.SP
     of LrMR: thumb2.LR
-    of NoMReg:
+    else:
       error("Expected a Cortex-M register", n)
       thumb2.R0
 
 proc parseRegisterM(n: var Cursor): thumb2.Register =
-  if n.kind != TagLit or not rawTagIsMReg(n.tag):
+  if n.kind != TagLit or not rawTagIsMGpr(n.tag):
     error("Expected a Cortex-M register", n)
   result = tagToRegisterM(n.tag, n)
   inc n
@@ -4153,6 +4182,8 @@ type
   OperandM = object
     kind: OperandKind
     reg: thumb2.Register
+    freg: thumb2.FloatRegister   ## the s-register, when `isFloat`
+    isFloat: bool                ## the operand names an FPv4-SP register
     typ: Type
     immVal: int64
     mem: thumb2.MemoryOperand
@@ -4174,13 +4205,18 @@ proc checkRegWidthM(t: Type; what: string; n: Cursor) =
   ## backend feature that does not exist yet (M4: register pairs, adds/adcs).
   ## Truncating them silently is the one outcome that must not happen.
   if t == nil: return
-  if t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.FloatT} and t.bits > 32:
-    error("Cortex-M: " & what & " is " & $t.bits & " bits; 64-bit scalars need " &
-          "register-pair lowering, which is not implemented yet (see M4 in " &
-          "doc/cortex_m.md)", n)
   if t.kind == TypeKind.FloatT:
-    error("Cortex-M: " & what & " is a float; the FPv4-SP path is not implemented " &
-          "yet (see M5 in doc/cortex_m.md)", n)
+    # A DOUBLE is not a missing feature, it is missing hardware: Cortex-M4F's
+    # FPv4-SP is single precision only, and there is no `.f64` instruction to
+    # lower to. Refusing beats dragging in a softfloat library nobody asked for.
+    if t.bits > 32:
+      error("Cortex-M: " & what & " is a " & $t.bits & "-bit float; this core's " &
+            "FPv4-SP unit is SINGLE precision only (see M5 in doc/cortex_m.md)", n)
+    return
+  if t.kind in {TypeKind.IntT, TypeKind.UIntT} and t.bits > 32:
+    error("Cortex-M: " & what & " is " & $t.bits & " bits; a 64-bit scalar lives " &
+          "in memory here and cannot be bound to a register (see M4 in " &
+          "doc/cortex_m.md)", n)
 
 proc argWordTypeM(p: ptr Param): Type =
   ## The type of ONE argument register of `p`. An aggregate spread over several
@@ -4196,7 +4232,14 @@ proc argWordTypeM(p: ptr Param): Type =
 proc parseOperandM(n: var Cursor; ctx: var GenContext): OperandM =
   if n.kind == TagLit:
     let t = n.tag
-    if rawTagIsMReg(t):
+    if rawTagIsMFloatReg(t):
+      result.isFloat = true
+      result.freg = parseFloatRegisterM(n)
+      result.typ = Type(kind: TypeKind.FloatT, bits: 32)
+      if result.freg in ctx.mFRegBindings:
+        error("Register " & $result.freg & " is bound to variable '" &
+              ctx.mFRegBindings[result.freg] & "', use the variable name instead", n)
+    elif rawTagIsMGpr(t):
       result.reg = parseRegisterM(n)
       result.typ = mRegType()
       # A raw use of a register that currently hosts a named local is a code
@@ -4525,6 +4568,10 @@ proc parseOperandM(n: var Cursor; ctx: var GenContext): OperandM =
         result.kind = okMem
         result.mem = thumb2.MemoryOperand(base: thumb2.SP, offset: int32(sym.offset))
         result.typ = sym.typ
+      elif sym.reg != InvalidTagId and rawTagIsMFloatReg(sym.reg):
+        result.isFloat = true
+        result.freg = tagToFloatRegisterM(sym.reg, n)
+        result.typ = sym.typ
       elif sym.reg != InvalidTagId:
         result.reg = tagToRegisterM(sym.reg, n)
         result.typ = sym.typ
@@ -4563,7 +4610,14 @@ proc parseOperandM(n: var Cursor; ctx: var GenContext): OperandM =
     error("Expected operand", n)
 
 proc parseDestM(n: var Cursor; ctx: var GenContext): OperandM =
-  if n.kind == TagLit and rawTagIsMReg(n.tag):
+  if n.kind == TagLit and rawTagIsMFloatReg(n.tag):
+    result.isFloat = true
+    result.freg = parseFloatRegisterM(n)
+    result.typ = Type(kind: TypeKind.FloatT, bits: 32)
+    if result.freg in ctx.mFRegBindings:
+      error("Register " & $result.freg & " is bound to variable '" &
+            ctx.mFRegBindings[result.freg] & "', use the variable name instead", n)
+  elif n.kind == TagLit and rawTagIsMGpr(n.tag):
     result.reg = parseRegisterM(n)
     result.typ = mRegType()
     if result.reg in ctx.mRegBindings:
@@ -4618,6 +4672,10 @@ proc parseDestM(n: var Cursor; ctx: var GenContext): OperandM =
       if sym.typ.isOnStack:
         result.kind = okMem
         result.mem = thumb2.MemoryOperand(base: thumb2.SP, offset: int32(sym.offset))
+        result.typ = sym.typ
+      elif sym.reg != InvalidTagId and rawTagIsMFloatReg(sym.reg):
+        result.isFloat = true
+        result.freg = tagToFloatRegisterM(sym.reg, n)
         result.typ = sym.typ
       elif sym.reg != InvalidTagId:
         result.reg = tagToRegisterM(sym.reg, n)
@@ -4708,6 +4766,29 @@ proc emitMemAccessM(ctx: var GenContext; rt: thumb2.Register;
     thumb2.emitAddImm(ctx.buf.data, thumb2.IP, mem.base, uint32(mem.offset))
     thumb2.emitLoadStoreReg(ctx.buf.data, rt, thumb2.IP, mem.index, width,
                             isLoad = isLoad, shift = mem.shift, signed = signed)
+
+const MFpScratch = thumb2.S30
+  ## The FPv4-SP counterpart of IP: a float register the SELECTOR may always use
+  ## as a transient. `vcvt` between an integer and a float goes through the FPU,
+  ## so `(fcvtzs <gpr> <sreg>)` needs somewhere to put the converted value before
+  ## moving it across — and the source may still be live. arkham keeps s30 out of
+  ## every pool for this, exactly as it keeps r12 out for IP.
+
+proc emitVfpMemAccessM(ctx: var GenContext; sd: thumb2.FloatRegister;
+                       mem: thumb2.MemoryOperand; isLoad: bool; n: Cursor) =
+  ## THE one place a `(mem …)` becomes a VLDR/VSTR, so a folded scaled index
+  ## cannot be silently dropped. VLDR has no register-index form at all, so an
+  ## indexed operand is materialized into IP first — the AAPCS32 scratch, which
+  ## hosts no value.
+  if not mem.hasIndex:
+    thumb2.emitVldrVstr(ctx.buf.data, sd, mem.base, mem.offset, isLoad)
+    return
+  if mem.shift == 0:
+    thumb2.emitAdd3(ctx.buf.data, thumb2.IP, mem.base, mem.index)
+  else:
+    thumb2.emitLslImm(ctx.buf.data, thumb2.IP, mem.index, mem.shift)
+    thumb2.emitAdd3(ctx.buf.data, thumb2.IP, mem.base, thumb2.IP)
+  thumb2.emitVldrVstr(ctx.buf.data, sd, thumb2.IP, mem.offset, isLoad)
 
 proc loadToRegM(ctx: var GenContext; dest: thumb2.Register; op: OperandM; n: Cursor) =
   ## Materialize `op` into `dest`. The one place that decides how each operand
@@ -4818,6 +4899,19 @@ proc genJtrueM(n: var Cursor; ctx: var GenContext) =
   inc n
   ctx.emitBranchM(condOfFlagM(flagTag, n), target)
 
+proc bindFRegM(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
+               freg: thumb2.FloatRegister) =
+  ## The FPv4-SP twin of `bindRegM`: bind an s-register to a typed name, killing
+  ## its prior tenant so a stale value shows up as "Unknown symbol" rather than
+  ## as a silent clobber.
+  if freg in ctx.mFRegBindings:
+    ctx.scope.undefine(ctx.symIdOf(ctx.mFRegBindings[freg]))
+    ctx.mFRegBindings.del(freg)
+  let sym = Symbol(name: ctx.symIdOf(name), kind: skVar, typ: typ)
+  sym.reg = regTag
+  ctx.mFRegBindings[freg] = name
+  ctx.scope.define(sym)
+
 proc bindRegM(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
               reg: thumb2.Register) =
   ## Bind `reg` to the typed name `name`, KILLING its prior tenant first — so a
@@ -4841,7 +4935,13 @@ proc parseRebindHeaderM(n: var Cursor; ctx: var GenContext):
   let name = symName(n); inc n
   let typ = parseType(n, ctx.scope, ctx)
   checkRegWidthM(typ, "rebind of '" & name & "'", n)
-  if n.kind != TagLit or not rawTagIsMReg(n.tag):
+  if n.kind == TagLit and rawTagIsMFloatReg(n.tag):
+    let fTag = n.tag
+    let f = tagToFloatRegisterM(fTag, n)
+    inc n
+    bindFRegM(ctx, name, typ, fTag, f)
+    return (name, thumb2.R0)          # the GPR half of the result is unused here
+  if n.kind != TagLit or not rawTagIsMGpr(n.tag):
     error("Expected a register for rebind/withreg", n)
   let regTag = n.tag
   let reg = tagToRegisterM(regTag, n)
@@ -4998,7 +5098,17 @@ proc genInstM(n: var Cursor; ctx: var GenContext) =
     var slotAlign = asmWordSize()
     if n.kind == TagLit:
       let locTag = n.tag
-      if rawTagIsMReg(locTag):
+      if rawTagIsMFloatReg(locTag):
+        let f = tagToFloatRegisterM(locTag, n)
+        inc n
+        let ftyp = parseType(n, ctx.scope, ctx)
+        checkRegWidthM(ftyp, "variable '" & name & "'", n)
+        if f in ctx.mFRegBindings:
+          error("Register " & $f & " is already bound to variable '" &
+                ctx.mFRegBindings[f] & "', kill it first before reusing", n)
+        bindFRegM(ctx, name, ftyp, locTag, f)
+        return
+      if rawTagIsMGpr(locTag):
         let r = tagToRegisterM(locTag, n)
         if r == thumb2.IP:
           error("Cannot bind a variable to r12 (reserved as the AAPCS32 IP scratch)", n)
@@ -5365,6 +5475,104 @@ proc genInstM(n: var Cursor; ctx: var GenContext) =
     if n.kind != IntLit: error("bkpt needs an immediate", start)
     thumb2.emitBkpt(ctx.buf.data, uint8(getInt(n) and 0xFF))
     inc n
+  # ── FPv4-SP ───────────────────────────────────────────────────────────────
+  # Single precision only; a double is refused by `checkRegWidthM` long before
+  # it can reach an encoder that has no `.f64` form to offer.
+  of FmovM:
+    # `(fmov D S)` is three instructions in one mnemonic, exactly as it is on
+    # AArch64: fp<-fp, fp<-gpr and gpr<-fp. Which one is decided by the operand
+    # REGISTER CLASSES, not by a separate tag.
+    inc n
+    let d = parseDestM(n, ctx)
+    let sOp = parseOperandM(n, ctx)
+    if d.isFloat and sOp.isFloat:
+      thumb2.emitVmovReg(ctx.buf.data, d.freg, sOp.freg)
+    elif d.isFloat:
+      var sr: thumb2.Register
+      if sOp.kind in {okReg, okArg} and not sOp.isFloat: sr = sOp.reg
+      else:
+        sr = ctx.scratchM()
+        ctx.loadToRegM(sr, sOp, start)
+      thumb2.emitVmovToFp(ctx.buf.data, d.freg, sr)
+    elif sOp.isFloat:
+      thumb2.emitVmovFromFp(ctx.buf.data, regOfM(d, "fmov destination", start),
+                            sOp.freg)
+    else:
+      error("fmov needs a floating-point register on one side", start)
+  of FaddM, FsubM, FmulM, FdivM:
+    # `(fop D S)` — destructive on AArch64, three-operand on Thumb-2, so `D` is
+    # repeated as the first source.
+    inc n
+    let d = parseDestM(n, ctx)
+    let sOp = parseOperandM(n, ctx)
+    if not d.isFloat or not sOp.isFloat:
+      error("fadd/fsub/fmul/fdiv need floating-point registers", start)
+    case instTag
+    of FaddM: thumb2.emitVadd(ctx.buf.data, d.freg, d.freg, sOp.freg)
+    of FsubM: thumb2.emitVsub(ctx.buf.data, d.freg, d.freg, sOp.freg)
+    of FmulM: thumb2.emitVmul(ctx.buf.data, d.freg, d.freg, sOp.freg)
+    else:     thumb2.emitVdiv(ctx.buf.data, d.freg, d.freg, sOp.freg)
+  of FnegM:
+    inc n
+    let d = parseDestM(n, ctx)
+    if not d.isFloat: error("fneg needs a floating-point register", start)
+    thumb2.emitVneg(ctx.buf.data, d.freg, d.freg)
+  of FcmpM:
+    # VCMP writes FPSCR and the conditional branches read APSR, so a float
+    # compare is always the PAIR. There is no float-condition branch to fuse it
+    # into, which is why this cannot be split.
+    inc n
+    let d = parseOperandM(n, ctx)
+    let sOp = parseOperandM(n, ctx)
+    if not d.isFloat or not sOp.isFloat:
+      error("fcmp needs floating-point registers", start)
+    thumb2.emitVcmp(ctx.buf.data, d.freg, sOp.freg)
+    thumb2.emitVmrsApsr(ctx.buf.data)
+  of FldrM:
+    inc n
+    let d = parseDestM(n, ctx)
+    let sOp = parseOperandM(n, ctx)
+    if not d.isFloat: error("fldr destination must be a floating-point register", start)
+    if sOp.kind != okMem: error("fldr source must be memory", start)
+    ctx.emitVfpMemAccessM(d.freg, sOp.mem, isLoad = true, n = start)
+  of FstrM:
+    inc n
+    let d = parseDestM(n, ctx)
+    let sOp = parseOperandM(n, ctx)
+    if d.kind != okMem: error("fstr destination must be memory", start)
+    if not sOp.isFloat: error("fstr source must be a floating-point register", start)
+    ctx.emitVfpMemAccessM(sOp.freg, d.mem, isLoad = false, n = start)
+  of ScvtfM, UcvtfM:
+    # `(scvtf D S)` — D fp, S integer. FPv4 converts inside the FPU, so the
+    # integer crosses with VMOV first and is converted in place in D.
+    inc n
+    let d = parseDestM(n, ctx)
+    let sOp = parseOperandM(n, ctx)
+    if not d.isFloat: error("scvtf/ucvtf destination must be a float register", start)
+    var sr: thumb2.Register
+    if sOp.kind in {okReg, okArg} and not sOp.isFloat: sr = sOp.reg
+    else:
+      sr = ctx.scratchM()
+      ctx.loadToRegM(sr, sOp, start)
+    thumb2.emitVmovToFp(ctx.buf.data, d.freg, sr)
+    thumb2.emitVcvtToF32(ctx.buf.data, d.freg, d.freg, signed = instTag == ScvtfM)
+  of FcvtzsM, FcvtzuM:
+    # `(fcvtzs D S)` — D integer, S fp. The converted value has to land in an fp
+    # register before it can cross, and S may still be live, so it lands in the
+    # selector's own float scratch.
+    inc n
+    let d = parseDestM(n, ctx)
+    let sOp = parseOperandM(n, ctx)
+    if not sOp.isFloat: error("fcvtzs/fcvtzu source must be a float register", start)
+    thumb2.emitVcvtFromF32(ctx.buf.data, MFpScratch, sOp.freg,
+                           signed = instTag == FcvtzsM)
+    thumb2.emitVmovFromFp(ctx.buf.data, regOfM(d, "destination", start), MFpScratch)
+  of DsbM:
+    inc n
+    thumb2.emitDsb(ctx.buf.data)
+  of IsbM:
+    inc n
+    thumb2.emitIsb(ctx.buf.data)
   of KillM:
     # `(kill name…)` — end a register binding so the register may be rebound.
     inc n
@@ -5372,7 +5580,10 @@ proc genInstM(n: var Cursor; ctx: var GenContext) =
       let name = getSym(n)
       let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
       if sym != nil and sym.reg != InvalidTagId:
-        ctx.mRegBindings.del(tagToRegisterM(sym.reg, n))
+        if rawTagIsMFloatReg(sym.reg):
+          ctx.mFRegBindings.del(tagToFloatRegisterM(sym.reg, n))
+        else:
+          ctx.mRegBindings.del(tagToRegisterM(sym.reg, n))
       inc n
   of NoMInst:
     error("Cortex-M: unsupported instruction", start)

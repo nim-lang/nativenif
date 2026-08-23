@@ -67,11 +67,15 @@ type
     ptrSize*: int     ## a pointer / proc pointer, and Leng's platform `int`
     ptrAlign*: int    ## a pointer's natural alignment
     maxScalar*: int   ## widest scalar one GPR holds (the `inRegClass` bound)
+    maxFloat*: int    ## widest float the FPU HAS — the width to assume when an
+                      ## expression's own type does not say (a bare literal).
+                      ## 8 where doubles exist; 4 on Cortex-M4F, whose FPv4-SP is
+                      ## single precision and has no `.f64` instruction at all
 
 const
-  Word64* = TargetWord(ptrSize: 8, ptrAlign: 8, maxScalar: 8)
+  Word64* = TargetWord(ptrSize: 8, ptrAlign: 8, maxScalar: 8, maxFloat: 8)
     ## x86-64 and AArch64.
-  Word32* = TargetWord(ptrSize: 4, ptrAlign: 4, maxScalar: 4)
+  Word32* = TargetWord(ptrSize: 4, ptrAlign: 4, maxScalar: 4, maxFloat: 4)
     ## ARMv7-M (Cortex-M) and any other 32-bit target.
 
 var targetWord = Word64
@@ -87,6 +91,12 @@ proc setTargetWord*(t: TargetWord) =
 proc wordSize*(): int {.inline.} = targetWord.ptrSize
 proc wordAlign*(): int {.inline.} = targetWord.ptrAlign
 proc maxScalarSize*(): int {.inline.} = targetWord.maxScalar
+proc maxFloatSize*(): int {.inline.} = targetWord.maxFloat
+proc defaultFloatSlot*(): AsmSlot {.inline.} =
+  ## The dont-care FLOAT placeholder: the widest float this target has. A bare
+  ## literal carries no width of its own, and picking one that the target cannot
+  ## encode turns "no width stated" into a refusal.
+  AsmSlot(cls: AFloat, size: maxFloatSize(), align: maxFloatSize())
 proc wordBits*(): int {.inline.} = targetWord.ptrSize * 8
   ## The native register width in BITS — what a temp or a raw register operand is
   ## declared at in the emitted asm-NIF. 64 on x86-64 and AArch64, 32 on Cortex-M.

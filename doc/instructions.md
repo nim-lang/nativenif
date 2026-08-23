@@ -429,51 +429,51 @@
 | `(d29)`            | A64Reg                   | fp register d29 |
 | `(d30)`            | A64Reg                   | fp register d30 |
 | `(d31)`            | A64Reg                   | fp register d31 |
-| `(s0)`             | A64Reg                   | fp register s0 |
-| `(s1)`             | A64Reg                   | fp register s1 |
-| `(s2)`             | A64Reg                   | fp register s2 |
-| `(s3)`             | A64Reg                   | fp register s3 |
-| `(s4)`             | A64Reg                   | fp register s4 |
-| `(s5)`             | A64Reg                   | fp register s5 |
-| `(s6)`             | A64Reg                   | fp register s6 |
-| `(s7)`             | A64Reg                   | fp register s7 |
-| `(s8)`             | A64Reg                   | fp register s8 |
-| `(s9)`             | A64Reg                   | fp register s9 |
-| `(s10)`            | A64Reg                   | fp register s10 |
-| `(s11)`            | A64Reg                   | fp register s11 |
-| `(s12)`            | A64Reg                   | fp register s12 |
-| `(s13)`            | A64Reg                   | fp register s13 |
-| `(s14)`            | A64Reg                   | fp register s14 |
-| `(s15)`            | A64Reg                   | fp register s15 |
-| `(s16)`            | A64Reg                   | fp register s16 |
-| `(s17)`            | A64Reg                   | fp register s17 |
-| `(s18)`            | A64Reg                   | fp register s18 |
-| `(s19)`            | A64Reg                   | fp register s19 |
-| `(s20)`            | A64Reg                   | fp register s20 |
-| `(s21)`            | A64Reg                   | fp register s21 |
-| `(s22)`            | A64Reg                   | fp register s22 |
-| `(s23)`            | A64Reg                   | fp register s23 |
-| `(s24)`            | A64Reg                   | fp register s24 |
-| `(s25)`            | A64Reg                   | fp register s25 |
-| `(s26)`            | A64Reg                   | fp register s26 |
-| `(s27)`            | A64Reg                   | fp register s27 |
-| `(s28)`            | A64Reg                   | fp register s28 |
-| `(s29)`            | A64Reg                   | fp register s29 |
-| `(s30)`            | A64Reg                   | fp register s30 |
-| `(s31)`            | A64Reg                   | fp register s31 |
-| `(fmov D S)`        | A64Inst                 | fp move (reg-reg / gpr<->fp bitcast) |
-| `(fadd D S)`        | A64Inst                 | fp add (D = D + S) |
-| `(fsub D S)`        | A64Inst                 | fp subtract (D = D - S) |
-| `(fmul D S)`        | A64Inst                 | fp multiply (D = D * S) |
-| `(fdiv D S)`        | A64Inst                 | fp divide (D = D / S) |
-| `(fneg D)`          | A64Inst                 | fp negate (D = -D) |
-| `(fcmp D S)`        | A64Inst                 | fp compare |
-| `(fldr D S)`        | A64Inst                 | fp load register |
-| `(fstr D S)`        | A64Inst                 | fp store register |
-| `(scvtf D S)`       | A64Inst                 | signed int -> fp convert |
-| `(ucvtf D S)`       | A64Inst                 | unsigned int -> fp convert |
-| `(fcvtzs D S)`      | A64Inst                 | fp -> signed int convert (toward zero) |
-| `(fcvtzu D S)`      | A64Inst                 | fp -> unsigned int convert (toward zero) |
+| `(s0)`             | A64Reg, MReg                   | fp register s0 |
+| `(s1)`             | A64Reg, MReg                   | fp register s1 |
+| `(s2)`             | A64Reg, MReg                   | fp register s2 |
+| `(s3)`             | A64Reg, MReg                   | fp register s3 |
+| `(s4)`             | A64Reg, MReg                   | fp register s4 |
+| `(s5)`             | A64Reg, MReg                   | fp register s5 |
+| `(s6)`             | A64Reg, MReg                   | fp register s6 |
+| `(s7)`             | A64Reg, MReg                   | fp register s7 |
+| `(s8)`             | A64Reg, MReg                   | fp register s8 |
+| `(s9)`             | A64Reg, MReg                   | fp register s9 |
+| `(s10)`            | A64Reg, MReg                   | fp register s10 |
+| `(s11)`            | A64Reg, MReg                   | fp register s11 |
+| `(s12)`            | A64Reg, MReg                   | fp register s12 |
+| `(s13)`            | A64Reg, MReg                   | fp register s13 |
+| `(s14)`            | A64Reg, MReg                   | fp register s14 |
+| `(s15)`            | A64Reg, MReg                   | fp register s15 |
+| `(s16)`            | A64Reg, MReg                   | fp register s16 |
+| `(s17)`            | A64Reg, MReg                   | fp register s17 |
+| `(s18)`            | A64Reg, MReg                   | fp register s18 |
+| `(s19)`            | A64Reg, MReg                   | fp register s19 |
+| `(s20)`            | A64Reg, MReg                   | fp register s20 |
+| `(s21)`            | A64Reg, MReg                   | fp register s21 |
+| `(s22)`            | A64Reg, MReg                   | fp register s22 |
+| `(s23)`            | A64Reg, MReg                   | fp register s23 |
+| `(s24)`            | A64Reg, MReg                   | fp register s24 |
+| `(s25)`            | A64Reg, MReg                   | fp register s25 |
+| `(s26)`            | A64Reg, MReg                   | fp register s26 |
+| `(s27)`            | A64Reg, MReg                   | fp register s27 |
+| `(s28)`            | A64Reg, MReg                   | fp register s28 |
+| `(s29)`            | A64Reg, MReg                   | fp register s29 |
+| `(s30)`            | A64Reg, MReg                   | fp register s30 |
+| `(s31)`            | A64Reg, MReg                   | fp register s31 |
+| `(fmov D S)`        | A64Inst, MInst                 | fp move (reg-reg / gpr<->fp bitcast) |
+| `(fadd D S)`        | A64Inst, MInst                 | fp add (D = D + S) |
+| `(fsub D S)`        | A64Inst, MInst                 | fp subtract (D = D - S) |
+| `(fmul D S)`        | A64Inst, MInst                 | fp multiply (D = D * S) |
+| `(fdiv D S)`        | A64Inst, MInst                 | fp divide (D = D / S) |
+| `(fneg D)`          | A64Inst, MInst                 | fp negate (D = -D) |
+| `(fcmp D S)`        | A64Inst, MInst                 | fp compare |
+| `(fldr D S)`        | A64Inst, MInst                 | fp load register |
+| `(fstr D S)`        | A64Inst, MInst                 | fp store register |
+| `(scvtf D S)`       | A64Inst, MInst                 | signed int -> fp convert |
+| `(ucvtf D S)`       | A64Inst, MInst                 | unsigned int -> fp convert |
+| `(fcvtzs D S)`      | A64Inst, MInst                 | fp -> signed int convert (toward zero) |
+| `(fcvtzu D S)`      | A64Inst, MInst                 | fp -> unsigned int convert (toward zero) |
 | `(fcvt D S)`        | A64Inst                 | fp precision convert (f32<->f64) |
 | `(fstp D1 D2 S O)`  | A64Inst                 | fp store pair (pre-indexed) |
 | `(fldp D1 D2 S O)`  | A64Inst                 | fp load pair (post-indexed) |
@@ -536,4 +536,6 @@
 | `(ldrsb D S)`        | MInst                       | load a byte, sign-extended |
 | `(ldrsh D S)`        | MInst                       | load a halfword, sign-extended |
 | `(wfi)`              | MInst                       | wait for interrupt — the idle trap a bare-metal image ends on |
+| `(dsb)`              | MInst                       | data synchronization barrier: nothing after it begins until every memory access before it has completed. Needed after writing a system register that changes how later instructions behave (CPACR, MPU) |
+| `(isb)`              | MInst                       | instruction synchronization barrier: flush the pipeline so instructions fetched before a context-changing write are re-fetched. Required between enabling the FPU and the first floating-point instruction |
 | `(other N ...)`       | -                           | escape header: the tag whose id no longer fits NIF's 9-bit tag field. `N` is an inline int carrying the real id out of nifcore's 28-bit escape space, and the remaining children are the node's own. Every row above that names EXACTLY ONE of `X64Inst`/`A64Inst` — i.e. one target's machine mnemonics, 282 of them — is spelled this way in the token buffer, which is what keeps the shared 511 for the cross-target vocabulary and makes a new target (Cortex-M, RISC-V) cost zero shared ids. Never written or read as text: `parse` folds `(movzx …)` into it and the serializers unfold it back, so both the NIF text and the binary token format are unchanged |

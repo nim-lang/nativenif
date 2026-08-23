@@ -298,6 +298,56 @@ proc frameSaveSlotM(g: var CodeGen; r: Reg; off: int; storing: bool) =
       g.ab.reg r
       g.ab.tree MemX: (g.ab.reg SP; g.ab.intLit off)
 
+proc frameSaveFSlotM(g: var CodeGen; f: FReg; off: int; storing: bool) =
+  ## One callee-saved FPv4-SP register into (or out of) its prologue slot. A raw
+  ## `(sN)`, not `emFReg`: this is the physical register being preserved, and it
+  ## may be a named local's home — the name would be wrong here and the binding
+  ## checker would be right to complain.
+  if storing:
+    g.ab.tree FstrA64:
+      g.ab.tree MemX: (g.ab.reg SP; g.ab.intLit off)
+      g.ab.freg(f, 32)
+  else:
+    g.ab.tree FldrA64:
+      g.ab.freg(f, 32)
+      g.ab.tree MemX: (g.ab.reg SP; g.ab.intLit off)
+
+proc framePushBytesM(g: CodeGen): int {.inline.} =
+  ## lr + every saved callee-saved register, integer and float, rounded to the
+  ## 8-byte alignment AAPCS32 wants at a public interface.
+  ((1 + g.frameRegs.len + g.frameFRegs.len) * 4 + 7) and not 7
+
+const
+  CpacrAddr = 0xE000ED88'i64
+    ## The Coprocessor Access Control Register.
+  CpacrFullAccessCp10Cp11 = 0x00F00000'i64
+    ## Full access for CP10 and CP11 — the two coprocessor slots the FPU lives in.
+
+proc emEnableFpuM(g: var CodeGen) =
+  ## Turn the FPU on, first thing in the entry proc.
+  ##
+  ## Cortex-M4F comes out of reset with the FPU DISABLED: CPACR grants no access
+  ## to CP10/CP11, and the first VFP instruction takes a UsageFault (NOCP) —
+  ## which, with no handler installed, is a lockup at the top of `main` with
+  ## nothing to say why. Every image gets this, because whether it uses a float
+  ## is not known when the entry proc is emitted, and twenty bytes once is not
+  ## worth being clever about.
+  ##
+  ## The DSB/ISB pair is not decoration: CPACR changes how LATER instructions
+  ## behave, so the write has to complete and the pipeline be re-fetched before
+  ## the first floating-point instruction. QEMU forgives its absence; silicon
+  ## does not.
+  g.ab.tree MovA64: (g.ab.reg R0; g.ab.intLit CpacrAddr)
+  g.ab.tree LdrA64:
+    g.ab.reg R1
+    g.ab.tree MemX: (g.ab.reg R0; g.ab.intLit 0)
+  g.ab.tree OrrA64: (g.ab.reg R1; g.ab.intLit CpacrFullAccessCp10Cp11)
+  g.ab.tree StrA64:
+    g.ab.tree MemX: (g.ab.reg R0; g.ab.intLit 0)
+    g.ab.reg R1
+  g.ab.keyword DsbM
+  g.ab.keyword IsbM
+
 proc framePushM(g: var CodeGen) =
   ## The Cortex-M prologue: lower SP once, then store lr and each used
   ## callee-saved register into the block just carved.
@@ -306,20 +356,20 @@ proc framePushM(g: var CodeGen) =
   ## just another word to save, and only when this proc actually calls something
   ## (`bl` is what overwrites it). AAPCS32 wants SP 8-aligned at a public
   ## interface, so the block is rounded up.
-  let n = 1 + g.frameRegs.len                    # lr + the callee-saved
-  let bytes = (n * 4 + 7) and not 7
-  g.ab.tree SubA64: (g.ab.reg SP; g.ab.intLit bytes)
+  g.ab.tree SubA64: (g.ab.reg SP; g.ab.intLit g.framePushBytesM)
   g.frameSaveSlotM(machine_m.LR, 0, storing = true)
   for i, r in g.frameRegs:
     g.frameSaveSlotM(r, 4 * (i + 1), storing = true)
+  for i, f in g.frameFRegs:
+    g.frameSaveFSlotM(f, 4 * (1 + g.frameRegs.len + i), storing = true)
 
 proc framePopM(g: var CodeGen) =
-  let n = 1 + g.frameRegs.len
-  let bytes = (n * 4 + 7) and not 7
+  for i, f in g.frameFRegs:
+    g.frameSaveFSlotM(f, 4 * (1 + g.frameRegs.len + i), storing = false)
   for i, r in g.frameRegs:
     g.frameSaveSlotM(r, 4 * (i + 1), storing = false)
   g.frameSaveSlotM(machine_m.LR, 0, storing = false)
-  g.ab.tree AddA64: (g.ab.reg SP; g.ab.intLit bytes)
+  g.ab.tree AddA64: (g.ab.reg SP; g.ab.intLit g.framePushBytesM)
 
 proc framePush(g: var CodeGen) =
   ## Push fp/lr, then the used callee-saved GPRs, then the callee-saved SIMD
@@ -382,7 +432,7 @@ proc framePushBytes(g: CodeGen): int =
   ## GPR / SIMD pair (16 bytes apiece). Used to address incoming stack arguments
   ## relative to SP right after the prologue's pushes (before locals are carved).
   if not g.hasFrame: 0
-  elif g.thumbM: ((1 + g.frameRegs.len) * 4 + 7) and not 7
+  elif g.thumbM: g.framePushBytesM
   else: 16 * (1 + g.frameRegs.len div 2 + g.frameFRegs.len div 2)
 
 # ── scratch register pool (volatile temps not held by a local) ──────────────
@@ -414,6 +464,15 @@ proc unbindFTmp(g: var CodeGen; f: FReg) =
 
 # `bits` (32 or 64) selects the s/d register view; nifasm reads the operand tag
 # to pick single- vs double-precision encodings.
+proc checkFloatWidthM(g: CodeGen; bits: int) =
+  ## Cortex-M4F's FPv4-SP is SINGLE PRECISION. There is no `.f64` instruction to
+  ## lower a double to, so this is missing HARDWARE rather than a missing
+  ## feature — refused by name, at the point the width first becomes visible,
+  ## instead of dragging in a softfloat library nobody asked for.
+  if g.thumbM and bits != 32:
+    quit "arkham cortex-m: a " & $bits & "-bit float has no hardware on this core " &
+         "(FPv4-SP is single precision); use `float32` — see M5 in doc/cortex_m.md"
+
 proc emFReg(g: var CodeGen; f: FReg; bits: int) {.inline.} =
   ## A float value operand: a v-register hosting a named float local / scratch temp →
   ## its checked name (nifasm recovers the precision from the binding's type);
@@ -423,6 +482,7 @@ proc emFReg(g: var CodeGen; f: FReg; bits: int) {.inline.} =
   ## pool register reaching here is an unbound scratch slipping past the binder. The
   ## v0–v7 arg/return registers and v8–v15 callee-saved homes (saved raw by fstp/fldp)
   ## keep their structural raw uses.
+  g.checkFloatWidthM(bits)
   let nm = g.rb.boundFName(f)
   if nm.len > 0: g.ab.sym nm
   else:
@@ -434,20 +494,34 @@ proc fmovF(g: var CodeGen; d, s: FReg; bits: int) =
   if d == s: return
   g.ab.tree FmovA64: g.emFReg(d, bits); g.emFReg(s, bits)
 
+# The GPR side of an `fmov` bitcast is spelled by NAME on Cortex-M and raw on
+# AArch64. nifasm's Cortex-M operand parser refuses a raw register that currently
+# hosts a named value — the invariant that catches a silent clobber — and the
+# register a float literal is materialized in is exactly such a bound temp. The
+# AArch64 selector does not make that check for `fmov`, and its spelling is left
+# alone so the byte-identity gate keeps its meaning.
 proc fmovFromGpr(g: var CodeGen; d: FReg; s: Reg; bits: int) =   # fmov dD/sD, xS/wS (bits)
-  g.ab.tree FmovA64: g.emFReg(d, bits); g.ab.reg s
+  g.ab.tree FmovA64:
+    g.emFReg(d, bits)
+    if g.thumbM: g.emReg s else: g.ab.reg s
 
 proc fmovToGpr(g: var CodeGen; d: Reg; s: FReg; bits: int) =     # fmov xD/wD, dS/sS (bits)
-  g.ab.tree FmovA64: g.ab.reg d; g.emFReg(s, bits)
+  g.ab.tree FmovA64:
+    (if g.thumbM: g.emReg d else: g.ab.reg d)
+    g.emFReg(s, bits)
 
 proc fbin(g: var CodeGen; op: A64Inst; d, s: FReg; bits: int) =  # d = d op s
   g.ab.tree op: g.emFReg(d, bits); g.emFReg(s, bits)
 
 proc fcvtI2F(g: var CodeGen; op: A64Inst; d: FReg; s: Reg; bits: int) =  # scvtf/ucvtf dD, xS
-  g.ab.tree op: g.emFReg(d, bits); g.ab.reg s
+  g.ab.tree op:
+    g.emFReg(d, bits)
+    if g.thumbM: g.emReg s else: g.ab.reg s      # see fmovFromGpr
 
 proc fcvtF2I(g: var CodeGen; op: A64Inst; d: Reg; s: FReg; bits: int) =  # fcvtzs/fcvtzu xD, dS
-  g.ab.tree op: g.ab.reg d; g.emFReg(s, bits)
+  g.ab.tree op:
+    (if g.thumbM: g.emReg d else: g.ab.reg d)
+    g.emFReg(s, bits)
 
 proc emFcvt(g: var CodeGen; d, s: FReg; dstBits, srcBits: int) =  # fcvt: precision convert
   g.ab.tree FcvtA64: g.emFReg(d, dstBits); g.emFReg(s, srcBits)
@@ -720,6 +794,7 @@ proc unbindTemp(g: var CodeGen; r: Reg) =
 proc emFloatStackVar(g: var CodeGen; name: string; bits: int) =
   ## Declare a spilled float scalar's stack slot `(var :name (s) (f N))`. nifasm
   ## sizes/aligns the slot and resolves the bare symbol to `[sp,#off]`.
+  g.checkFloatWidthM(bits)
   g.plan.hasStackVars = true                   # a `(s)` var exists ⇒ frame sub needed
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
@@ -1390,9 +1465,9 @@ proc computeFrame(g: var CodeGen; hasCall: bool) =
     for r in IntCalleeSaved:
       if r notin g.frameRegs: (g.frameRegs.add r; break)
   g.frameFRegs = @[]
-  for f in FloatCalleeSaved:
+  for f in g.md.floatCalleeSaved:
     if f in g.plan.usedCalleeF: g.frameFRegs.add f
-  if g.frameFRegs.len mod 2 == 1:             # pad SIMD saves to an even count too
+  if not g.thumbM and g.frameFRegs.len mod 2 == 1:  # pad SIMD saves to an even count too
     for f in FloatCalleeSaved:
       if f notin g.plan.usedCalleeF: (g.frameFRegs.add f; break)
   # Stack-passed parameters are addressed off the FRAME POINTER (see `framePush`),
@@ -5036,7 +5111,7 @@ proc emitFBinE(g: var CodeGen; c: Cursor; dest: var Location) =
   let op = fbinA64Op(c.exprKind)
   let ek = c.exprKind
   var lhsC, rhsC: Cursor
-  var fslot = AsmSlot(cls: AFloat, size: 8, align: 8)
+  var fslot = defaultFloatSlot()
   block:
     var cc = c
     cc.into:
@@ -5098,7 +5173,7 @@ proc emitFValue2(g: var CodeGen; c: Cursor; dest: var Location) =
   ## materialize the float value there.
   if dest.kind == NamedStack and dest.spillTemp:
     g.produceIntoFMem2(c, dest); return
-  let f64 = AsmSlot(cls: AFloat, size: 8, align: 8)
+  let f64 = defaultFloatSlot()
   case c.kind
   of FloatLit:
     if dest.kind != InFReg:
@@ -5580,16 +5655,26 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
       tc = resolveType(g.prog, cc); skip cc
       inner = cc; skip cc
       while cc.hasMore: skip cc
-  if g.thumbM and g.isWideExpr(inner) and not g.isWideExpr(c):
+  if g.thumbM and g.isWideExpr(inner) and not g.isWideExpr(c) and
+     not g.isFloatExpr(c):
     # The NARROWING direction: `int32(x64)` / `cast[uint](x64)`. The widening one
     # and wide→wide are produced by `emitWideAsLoc`, which `emitValue2` reached
-    # before this proc.
+    # before this proc; `float(x64)` is not a narrowing at all and is refused a
+    # few lines down (`isWideSlot` is about INTEGERS, so a 64-bit float does not
+    # answer to it and would otherwise fall in here).
     g.emitWideToNarrow(inner, targetCur, dest)
     return
   if g.isFloatExpr(c):                          # → float result
+    if g.thumbM and g.isWideExpr(inner):
+      # `float32(someInt64)` — the mirror of the float→int64 case. FPv4-SP
+      # converts FROM a 32-bit integer only, and narrowing the source first
+      # would be silently wrong for anything past 2^31.
+      lengError c, "arkham cortex-m: converting a 64-bit integer to a float needs " &
+        "a runtime routine this backend does not provide — FPv4-SP converts from " &
+        "32 bits (see M5 in doc/cortex_m.md)", lengInfo(c)
     if dest.kind != InFReg:
       dest = g.takeFTmp(if dest.typ.kind == AFloat: dest.typ
-                        else: AsmSlot(cls: AFloat, size: 8, align: 8))
+                        else: defaultFloatSlot())
     if dest.kind == NamedStack and dest.spillTemp:
       g.produceIntoFMem2(c, dest); return
     let res = dest
@@ -6071,7 +6156,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
           # HFA/indirect split would miscompile silently.
           raiseAssert "arkham a64: aggregate in the variadic tail of " & tgt.asmName
         elif g.isFloatExpr(a):
-          var fD = fregLoc(FloatArgRegs[fIdx], AsmSlot(cls: AFloat, size: 8, align: 8))
+          var fD = fregLoc(FloatArgRegs[fIdx], defaultFloatSlot())
           g.emitFValue2(a, fD)                 # promoted to double by the front end
           varTail.add (NoReg, FloatArgRegs[fIdx], off)
           inc fIdx
@@ -6096,7 +6181,7 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
         # rather than in any direct call.
         var fSlot = g.exprSlot(a)
         if fSlot.kind != AFloat:
-          fSlot = AsmSlot(cls: AFloat, size: 8, align: 8)
+          fSlot = defaultFloatSlot()
         var fD = fregLoc(FloatArgRegs[fIdx], fSlot)
         g.emitFValue2(a, fD)
         inc fIdx
@@ -6963,6 +7048,10 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool;
     g.ab.symDef info.asmName
     g.emitSignature(info.decl, declarative)
     g.ab.tree StmtsA64:
+      # Before anything else, including the prologue: the frame may already save
+      # a callee-saved FPv4-SP register, and that store is itself a floating-point
+      # instruction.
+      if g.thumbM and info.isEntry: g.emEnableFpuM()
       if g.hasFrame: framePush(g)
       if g.plan.hasStackVars:
         g.ab.tree SubA64: g.ab.reg SP; g.ab.keyword SsizeX

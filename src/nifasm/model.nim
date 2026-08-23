@@ -257,6 +257,19 @@ type
     StmtsA64 = (ord(StmtsTagId), "stmts")  ## statement block
     JtrueA64 = (ord(JtrueTagId), "jtrue")  ## set control flow variable(s) to true
     KillA64 = (ord(KillTagId), "kill")  ## kill variable
+    FmovA64 = (ord(FmovTagId), "fmov")  ## fp move (reg-reg / gpr<->fp bitcast)
+    FaddA64 = (ord(FaddTagId), "fadd")  ## fp add (D = D + S)
+    FsubA64 = (ord(FsubTagId), "fsub")  ## fp subtract (D = D - S)
+    FmulA64 = (ord(FmulTagId), "fmul")  ## fp multiply (D = D * S)
+    FdivA64 = (ord(FdivTagId), "fdiv")  ## fp divide (D = D / S)
+    FnegA64 = (ord(FnegTagId), "fneg")  ## fp negate (D = -D)
+    FcmpA64 = (ord(FcmpTagId), "fcmp")  ## fp compare
+    FldrA64 = (ord(FldrTagId), "fldr")  ## fp load register
+    FstrA64 = (ord(FstrTagId), "fstr")  ## fp store register
+    ScvtfA64 = (ord(ScvtfTagId), "scvtf")  ## signed int -> fp convert
+    UcvtfA64 = (ord(UcvtfTagId), "ucvtf")  ## unsigned int -> fp convert
+    FcvtzsA64 = (ord(FcvtzsTagId), "fcvtzs")  ## fp -> signed int convert (toward zero)
+    FcvtzuA64 = (ord(FcvtzuTagId), "fcvtzu")  ## fp -> unsigned int convert (toward zero)
     LdrbA64 = (ord(LdrbTagId), "ldrb")  ## load byte (zero-extend), register offset [B,I]
     StrbA64 = (ord(StrbTagId), "strb")  ## store low byte, register offset [B,I]
     RebindA64 = (ord(RebindTagId), "rebind")  ## bind a phys reg to a typed name, killing its prior tenant
@@ -295,19 +308,6 @@ type
     StlrA64 = (ord(StlrTagId), "stlr")  ## store-release register
     DmbA64 = (ord(DmbTagId), "dmb")  ## data memory barrier (inner shareable)
     ClrexA64 = (ord(ClrexTagId), "clrex")  ## clear exclusive monitor
-    FmovA64 = (ord(FmovTagId), "fmov")  ## fp move (reg-reg / gpr<->fp bitcast)
-    FaddA64 = (ord(FaddTagId), "fadd")  ## fp add (D = D + S)
-    FsubA64 = (ord(FsubTagId), "fsub")  ## fp subtract (D = D - S)
-    FmulA64 = (ord(FmulTagId), "fmul")  ## fp multiply (D = D * S)
-    FdivA64 = (ord(FdivTagId), "fdiv")  ## fp divide (D = D / S)
-    FnegA64 = (ord(FnegTagId), "fneg")  ## fp negate (D = -D)
-    FcmpA64 = (ord(FcmpTagId), "fcmp")  ## fp compare
-    FldrA64 = (ord(FldrTagId), "fldr")  ## fp load register
-    FstrA64 = (ord(FstrTagId), "fstr")  ## fp store register
-    ScvtfA64 = (ord(ScvtfTagId), "scvtf")  ## signed int -> fp convert
-    UcvtfA64 = (ord(UcvtfTagId), "ucvtf")  ## unsigned int -> fp convert
-    FcvtzsA64 = (ord(FcvtzsTagId), "fcvtzs")  ## fp -> signed int convert (toward zero)
-    FcvtzuA64 = (ord(FcvtzuTagId), "fcvtzu")  ## fp -> unsigned int convert (toward zero)
     FcvtA64 = (ord(FcvtTagId), "fcvt")  ## fp precision convert (f32<->f64)
     FstpA64 = (ord(FstpTagId), "fstp")  ## fp store pair (pre-indexed)
     FldpA64 = (ord(FldpTagId), "fldp")  ## fp load pair (post-indexed)
@@ -323,7 +323,7 @@ type
     VgreqA64 = (ord(VgreqTagId), "vgreq")  ## valgrind client request: `S` holds the address of the 6-word request block (`request, arg1 .. arg5`), `D` receives valgrind's answer — 0 when nothing intercepted the request, which is what a program NOT running under valgrind always sees. Expands to the fixed instruction sequence valgrind's JIT recognizes (four `ror x12` totalling a full 64-bit rotation, then the `orr x10, x10, x10` marker — architecturally a no-op, hence the zero cost when unobserved), wrapped in the moves that stage x3/x4 around it and stage the answer back out
 
 proc rawTagIsA64Inst*(raw: TagEnum): bool {.inline.} =
-  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, AddwTagId, SubwTagId, MulwTagId, Addw3TagId, Subw3TagId, Mulw3TagId, GloadTagId, GstoreTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, AdrTagId, LdrTagId, StrTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, CbzTagId, CbnzTagId, CselltTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, LdrbTagId, StrbTagId, RebindTagId, WithregTagId, ScopeTagId, ClzTagId, RbitTagId, RevTagId, SmulhTagId, UmulhTagId, SvcTagId, StpTagId, LdpTagId, CseleqTagId, CselneTagId, CselleTagId, CselgtTagId, CselgeTagId, CselloTagId, CsellsTagId, CselhiTagId, CselhsTagId, CseteqTagId, CsetneTagId, CsetltTagId, CsetleTagId, CsetgtTagId, CsetgeTagId, CsetloTagId, CsetlsTagId, CsethiTagId, CsethsTagId, LdaxrTagId, StlxrTagId, LdarTagId, StlrTagId, DmbTagId, ClrexTagId, FmovTagId, FaddTagId, FsubTagId, FmulTagId, FdivTagId, FnegTagId, FcmpTagId, FldrTagId, FstrTagId, ScvtfTagId, UcvtfTagId, FcvtzsTagId, FcvtzuTagId, FcvtTagId, FstpTagId, FldpTagId, FldrqTagId, FstrqTagId, VfaddTagId, VfsubTagId, VfmulTagId, VfmlaTagId, VdupTagId, VeorTagId, VaddvTagId, VgreqTagId}
+  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, AddwTagId, SubwTagId, MulwTagId, Addw3TagId, Subw3TagId, Mulw3TagId, GloadTagId, GstoreTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, AdrTagId, LdrTagId, StrTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, CbzTagId, CbnzTagId, CselltTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, FmovTagId, FaddTagId, FsubTagId, FmulTagId, FdivTagId, FnegTagId, FcmpTagId, FldrTagId, FstrTagId, ScvtfTagId, UcvtfTagId, FcvtzsTagId, FcvtzuTagId, LdrbTagId, StrbTagId, RebindTagId, WithregTagId, ScopeTagId, ClzTagId, RbitTagId, RevTagId, SmulhTagId, UmulhTagId, SvcTagId, StpTagId, LdpTagId, CseleqTagId, CselneTagId, CselleTagId, CselgtTagId, CselgeTagId, CselloTagId, CsellsTagId, CselhiTagId, CselhsTagId, CseteqTagId, CsetneTagId, CsetltTagId, CsetleTagId, CsetgtTagId, CsetgeTagId, CsetloTagId, CsetlsTagId, CsethiTagId, CsethsTagId, LdaxrTagId, StlxrTagId, LdarTagId, StlrTagId, DmbTagId, ClrexTagId, FcvtTagId, FstpTagId, FldpTagId, FldrqTagId, FstrqTagId, VfaddTagId, VfsubTagId, VfmulTagId, VfmlaTagId, VdupTagId, VeorTagId, VaddvTagId, VgreqTagId}
 
 type
   MInst* = enum
@@ -389,6 +389,19 @@ type
     StmtsM = (ord(StmtsTagId), "stmts")  ## statement block
     JtrueM = (ord(JtrueTagId), "jtrue")  ## set control flow variable(s) to true
     KillM = (ord(KillTagId), "kill")  ## kill variable
+    FmovM = (ord(FmovTagId), "fmov")  ## fp move (reg-reg / gpr<->fp bitcast)
+    FaddM = (ord(FaddTagId), "fadd")  ## fp add (D = D + S)
+    FsubM = (ord(FsubTagId), "fsub")  ## fp subtract (D = D - S)
+    FmulM = (ord(FmulTagId), "fmul")  ## fp multiply (D = D * S)
+    FdivM = (ord(FdivTagId), "fdiv")  ## fp divide (D = D / S)
+    FnegM = (ord(FnegTagId), "fneg")  ## fp negate (D = -D)
+    FcmpM = (ord(FcmpTagId), "fcmp")  ## fp compare
+    FldrM = (ord(FldrTagId), "fldr")  ## fp load register
+    FstrM = (ord(FstrTagId), "fstr")  ## fp store register
+    ScvtfM = (ord(ScvtfTagId), "scvtf")  ## signed int -> fp convert
+    UcvtfM = (ord(UcvtfTagId), "ucvtf")  ## unsigned int -> fp convert
+    FcvtzsM = (ord(FcvtzsTagId), "fcvtzs")  ## fp -> signed int convert (toward zero)
+    FcvtzuM = (ord(FcvtzuTagId), "fcvtzu")  ## fp -> unsigned int convert (toward zero)
     LdrbM = (ord(LdrbTagId), "ldrb")  ## load byte (zero-extend), register offset [B,I]
     StrbM = (ord(StrbTagId), "strb")  ## store low byte, register offset [B,I]
     RebindM = (ord(RebindTagId), "rebind")  ## bind a phys reg to a typed name, killing its prior tenant
@@ -419,9 +432,11 @@ type
     LdrsbM = (ord(LdrsbTagId), "ldrsb")  ## load a byte, sign-extended
     LdrshM = (ord(LdrshTagId), "ldrsh")  ## load a halfword, sign-extended
     WfiM = (ord(WfiTagId), "wfi")  ## wait for interrupt — the idle trap a bare-metal image ends on
+    DsbM = (ord(DsbTagId), "dsb")  ## data synchronization barrier: nothing after it begins until every memory access before it has completed. Needed after writing a system register that changes how later instructions behave (CPACR, MPU)
+    IsbM = (ord(IsbTagId), "isb")  ## instruction synchronization barrier: flush the pipeline so instructions fetched before a context-changing write are re-fetched. Required between enabling the FPU and the first floating-point instruction
 
 proc rawTagIsMInst*(raw: TagEnum): bool {.inline.} =
-  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, AddwTagId, SubwTagId, MulwTagId, Addw3TagId, Subw3TagId, Mulw3TagId, GloadTagId, GstoreTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, AdrTagId, LdrTagId, StrTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, CbzTagId, CbnzTagId, CselltTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, LdrbTagId, StrbTagId, RebindTagId, WithregTagId, ScopeTagId, ClzTagId, RbitTagId, RevTagId, BkptTagId, BxTagId, BlxTagId, MvnTagId, Bic3TagId, Adds3TagId, Adcs3TagId, Subs3TagId, Sbcs3TagId, MlsTagId, UmullTagId, SmullTagId, TstTagId, UxtbTagId, SxtbTagId, UxthTagId, SxthTagId, LdrhTagId, StrhTagId, LdrsbTagId, LdrshTagId, WfiTagId}
+  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, AddwTagId, SubwTagId, MulwTagId, Addw3TagId, Subw3TagId, Mulw3TagId, GloadTagId, GstoreTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, AdrTagId, LdrTagId, StrTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, CbzTagId, CbnzTagId, CselltTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, FmovTagId, FaddTagId, FsubTagId, FmulTagId, FdivTagId, FnegTagId, FcmpTagId, FldrTagId, FstrTagId, ScvtfTagId, UcvtfTagId, FcvtzsTagId, FcvtzuTagId, LdrbTagId, StrbTagId, RebindTagId, WithregTagId, ScopeTagId, ClzTagId, RbitTagId, RevTagId, BkptTagId, BxTagId, BlxTagId, MvnTagId, Bic3TagId, Adds3TagId, Adcs3TagId, Subs3TagId, Sbcs3TagId, MlsTagId, UmullTagId, SmullTagId, TstTagId, UxtbTagId, SxtbTagId, UxthTagId, SxthTagId, LdrhTagId, StrhTagId, LdrsbTagId, LdrshTagId, WfiTagId, DsbTagId, IsbTagId}
 
 type
   NifasmType* = enum
@@ -710,7 +725,39 @@ type
     R7MR = (ord(R7TagId), "r7")  ## register r7 (alias)
     SpMR = (ord(SpTagId), "sp")  ## stack pointer
     LrMR = (ord(LrTagId), "lr")  ## link register (alias for x30)
+    S0MR = (ord(S0TagId), "s0")  ## fp register s0
+    S1MR = (ord(S1TagId), "s1")  ## fp register s1
+    S2MR = (ord(S2TagId), "s2")  ## fp register s2
+    S3MR = (ord(S3TagId), "s3")  ## fp register s3
+    S4MR = (ord(S4TagId), "s4")  ## fp register s4
+    S5MR = (ord(S5TagId), "s5")  ## fp register s5
+    S6MR = (ord(S6TagId), "s6")  ## fp register s6
+    S7MR = (ord(S7TagId), "s7")  ## fp register s7
+    S8MR = (ord(S8TagId), "s8")  ## fp register s8
+    S9MR = (ord(S9TagId), "s9")  ## fp register s9
+    S10MR = (ord(S10TagId), "s10")  ## fp register s10
+    S11MR = (ord(S11TagId), "s11")  ## fp register s11
+    S12MR = (ord(S12TagId), "s12")  ## fp register s12
+    S13MR = (ord(S13TagId), "s13")  ## fp register s13
+    S14MR = (ord(S14TagId), "s14")  ## fp register s14
+    S15MR = (ord(S15TagId), "s15")  ## fp register s15
+    S16MR = (ord(S16TagId), "s16")  ## fp register s16
+    S17MR = (ord(S17TagId), "s17")  ## fp register s17
+    S18MR = (ord(S18TagId), "s18")  ## fp register s18
+    S19MR = (ord(S19TagId), "s19")  ## fp register s19
+    S20MR = (ord(S20TagId), "s20")  ## fp register s20
+    S21MR = (ord(S21TagId), "s21")  ## fp register s21
+    S22MR = (ord(S22TagId), "s22")  ## fp register s22
+    S23MR = (ord(S23TagId), "s23")  ## fp register s23
+    S24MR = (ord(S24TagId), "s24")  ## fp register s24
+    S25MR = (ord(S25TagId), "s25")  ## fp register s25
+    S26MR = (ord(S26TagId), "s26")  ## fp register s26
+    S27MR = (ord(S27TagId), "s27")  ## fp register s27
+    S28MR = (ord(S28TagId), "s28")  ## fp register s28
+    S29MR = (ord(S29TagId), "s29")  ## fp register s29
+    S30MR = (ord(S30TagId), "s30")  ## fp register s30
+    S31MR = (ord(S31TagId), "s31")  ## fp register s31
 
 proc rawTagIsMReg*(raw: TagEnum): bool {.inline.} =
-  raw in {R8TagId, R9TagId, R10TagId, R11TagId, R12TagId, R0TagId, R1TagId, R2TagId, R3TagId, R4TagId, R5TagId, R6TagId, R7TagId, SpTagId, LrTagId}
+  raw in {R8TagId, R9TagId, R10TagId, R11TagId, R12TagId, R0TagId, R1TagId, R2TagId, R3TagId, R4TagId, R5TagId, R6TagId, R7TagId, SpTagId, LrTagId, S0TagId, S1TagId, S2TagId, S3TagId, S4TagId, S5TagId, S6TagId, S7TagId, S8TagId, S9TagId, S10TagId, S11TagId, S12TagId, S13TagId, S14TagId, S15TagId, S16TagId, S17TagId, S18TagId, S19TagId, S20TagId, S21TagId, S22TagId, S23TagId, S24TagId, S25TagId, S26TagId, S27TagId, S28TagId, S29TagId, S30TagId, S31TagId}
 

@@ -415,6 +415,14 @@ proc emitWideInto(g: var CodeGen; c0: Cursor; dst: WideRef) =
   let isLiteral = c.kind in {IntLit, UIntLit, CharLit} or
                   (c.kind == TagLit and
                    c.exprKind in {TrueC, FalseC, NilC, SizeofC})
+  if not isLiteral and g.isFloatExpr(c):
+    # `int64(someFloat)`. FPv4-SP converts to a 32-bit integer and no wider, so
+    # this needs a runtime routine to be RIGHT for anything past 2^31 — and a
+    # `vcvt` plus a sign-extend would be quietly wrong exactly there. Refused by
+    # name; `int32(f)` is the conversion this core has.
+    lengError c, "arkham cortex-m: converting a float to a 64-bit integer needs a " &
+      "runtime routine this backend does not provide — FPv4-SP converts to 32 " &
+      "bits (see M5 in doc/cortex_m.md)", lengInfo(c)
   if not isLiteral and not g.isWideExpr(c):
     let sgn = isSignedType(resolveType(g.prog, g.getType(c)))
     g.wideFromNarrowExpr(dst, c, sgn)
@@ -522,6 +530,10 @@ proc emitWideInto(g: var CodeGen; c0: Cursor; dst: WideRef) =
       if g.isWideExpr(innerC):
         let src = g.wideValueSlot(innerC)
         g.wideCopy(dst, src)
+      elif g.isFloatExpr(innerC):
+        lengError c, "arkham cortex-m: converting a float to a 64-bit integer needs " &
+          "a runtime routine this backend does not provide — FPv4-SP converts to " &
+          "32 bits (see M5 in doc/cortex_m.md)", lengInfo(c)
       else:
         # Widening a 32-bit value: the SOURCE's signedness decides the high word,
         # not the target's. `uint32(x).int64` must be zero-extended even though

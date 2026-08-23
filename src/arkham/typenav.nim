@@ -196,7 +196,7 @@ proc exprSlot*(tc: TypeCtx; c: Cursor): AsmSlot =
   ## The classified slot of any expression — `getType` for structural forms,
   ## with literals/`addr` (which carry no type cursor) handled directly.
   case c.kind
-  of FloatLit: AsmSlot(cls: AFloat, size: 8, align: 8)   # default f64; width refined by context
+  of FloatLit: defaultFloatSlot()   # the widest float this target has; refined by context
   of IntLit, UIntLit: AsmSlot(cls: AInt, size: wordSize(), align: wordAlign())
   of CharLit: AsmSlot(cls: AUInt, size: 1, align: 1)
   of StrLit: addrSlot()                                   # a pointer

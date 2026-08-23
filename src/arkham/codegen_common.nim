@@ -639,7 +639,7 @@ proc isFloatExpr*(g: var CodeGen; c: Cursor): bool =
 proc floatBits*(g: var CodeGen; c: Cursor): int =
   ## Bit width (32 or 64) of a float expression; 64 when undeterminable (e.g. a
   ## bare literal — the caller's context width should be used instead).
-  if g.exprSlot(c).size == 4: 32 else: 64
+  if g.exprSlot(c).size == 4 or maxFloatSize() == 4: 32 else: 64
 
 proc srcWidthSigned*(g: var CodeGen; c: Cursor): tuple[width: int, signed: bool] =
   ## Best-effort source scalar (bit width, signedness) of the expression at `c`,

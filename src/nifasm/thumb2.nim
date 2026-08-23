@@ -556,7 +556,121 @@ proc emitMovwMovtAbs*(dest: var Buffer; rd: Register; target: LabelId) =
   dest.data.emitMovImm16(rd, 0)
   dest.data.emitMovt(rd, 0)
 
+# ── FPv4-SP (single precision) ──────────────────────────────────────────────
+#
+# Cortex-M4F's FPU is SINGLE PRECISION ONLY. The register file is s0–s31 and
+# every operation below is `.f32`; there is no `.f64` form to fall back on, so a
+# double must be refused rather than lowered (see `checkRegWidthM`).
+#
+# Every VFP instruction is 32-bit and encodes its register number SPLIT: the top
+# four bits go in the instruction's `Vd`/`Vn`/`Vm` field and the low bit in a
+# separate `D`/`N`/`M` bit — and, confusingly, the split is the OTHER way round
+# for double-precision registers. `hi`/`lo` below name the two halves so the
+# split is written once per operand rather than at each encoder.
+
+template fHi(r: FloatRegister): uint16 = uint16(ord(r) shr 1)   ## the Vd/Vn/Vm field
+template fLo(r: FloatRegister): uint16 = uint16(ord(r) and 1)   ## the D/N/M bit
+
+proc emitVfpData(dest: var Bytes; base: uint16; op2: uint16;
+                 sd, sn, sm: FloatRegister) =
+  ## The three-operand `.f32` data-processing shape: `<op> Sd, Sn, Sm`.
+  ## `base` carries bits 27..20 of the opcode, `op2` bit 6 (the add/sub bit).
+  dest.emitWide(base or (fLo(sd) shl 6) or fHi(sn),
+                (fHi(sd) shl 12) or 0x0A00'u16 or (fLo(sn) shl 7) or op2 or
+                (fLo(sm) shl 5) or fHi(sm))
+
+proc emitVadd*(dest: var Bytes; sd, sn, sm: FloatRegister) =
+  dest.emitVfpData(0xEE30'u16, 0'u16, sd, sn, sm)
+proc emitVsub*(dest: var Bytes; sd, sn, sm: FloatRegister) =
+  dest.emitVfpData(0xEE30'u16, 0x0040'u16, sd, sn, sm)
+proc emitVmul*(dest: var Bytes; sd, sn, sm: FloatRegister) =
+  dest.emitVfpData(0xEE20'u16, 0'u16, sd, sn, sm)
+proc emitVdiv*(dest: var Bytes; sd, sn, sm: FloatRegister) =
+  dest.emitVfpData(0xEE80'u16, 0'u16, sd, sn, sm)
+
+proc emitVfpUnary(dest: var Bytes; opc1: uint16; opc3: uint16;
+                  sd, sm: FloatRegister) =
+  ## The two-operand "other" group: `<op> Sd, Sm`, selected by `opc2` (bits
+  ## 19..16) and `opc3` (bits 7..6). The two pairs differ ONLY in `opc3`:
+  ## `vmov`/`vabs` share opc2 = 0 and `vneg`/`vsqrt` share opc2 = 1, so swapping
+  ## an opc3 turns a negate into a square root — which is exactly as quiet as it
+  ## sounds (`-3.0` came back as `1.732`).
+  dest.emitWide(0xEEB0'u16 or (fLo(sd) shl 6) or opc1,
+                (fHi(sd) shl 12) or 0x0A00'u16 or opc3 or (fLo(sm) shl 5) or fHi(sm))
+
+proc emitVmovReg*(dest: var Bytes; sd, sm: FloatRegister) =
+  if sd != sm: dest.emitVfpUnary(0x0'u16, 0x0040'u16, sd, sm)
+proc emitVneg*(dest: var Bytes; sd, sm: FloatRegister) =
+  dest.emitVfpUnary(0x1'u16, 0x0040'u16, sd, sm)
+proc emitVabs*(dest: var Bytes; sd, sm: FloatRegister) =
+  dest.emitVfpUnary(0x0'u16, 0x00C0'u16, sd, sm)
+proc emitVsqrt*(dest: var Bytes; sd, sm: FloatRegister) =
+  dest.emitVfpUnary(0x1'u16, 0x00C0'u16, sd, sm)
+
+proc emitVcmp*(dest: var Bytes; sd, sm: FloatRegister) =
+  ## VCMP.F32 — the QUIET compare (`vcmp`, not `vcmpe`): an unordered pair sets
+  ## the flags without raising Invalid Operation, which is what `==`/`<` on a NaN
+  ## must do.
+  dest.emitVfpUnary(0x4'u16, 0x0040'u16, sd, sm)
+
+proc emitVmrsApsr*(dest: var Bytes) =
+  ## `VMRS APSR_nzcv, FPSCR` — move the FPU's comparison result into the integer
+  ## flags. VCMP writes FPSCR, and the conditional branches read APSR, so every
+  ## float compare is this pair; there is no float-condition branch.
+  dest.emitWide(0xEEF1'u16, 0xFA10'u16)
+
+proc emitVmovToFp*(dest: var Bytes; sn: FloatRegister; rt: Register) =
+  ## `VMOV Sn, Rt` — the BIT PATTERN of a core register into an fp one.
+  dest.emitWide(0xEE00'u16 or fHi(sn),
+                (uint16(ord(rt)) shl 12) or 0x0A10'u16 or (fLo(sn) shl 7))
+
+proc emitVmovFromFp*(dest: var Bytes; rt: Register; sn: FloatRegister) =
+  ## `VMOV Rt, Sn` — and back.
+  dest.emitWide(0xEE10'u16 or fHi(sn),
+                (uint16(ord(rt)) shl 12) or 0x0A10'u16 or (fLo(sn) shl 7))
+
+proc emitVcvtToF32*(dest: var Bytes; sd, sm: FloatRegister; signed: bool) =
+  ## `VCVT.F32.S32` / `VCVT.F32.U32` — the integer in `sm`'s bit pattern to a
+  ## float in `sd`. The source is an fp REGISTER: FPv4 converts in the FPU, so an
+  ## integer has to be moved across with `VMOV` first.
+  dest.emitVfpUnary(0x8'u16, (if signed: 0x00C0'u16 else: 0x0040'u16), sd, sm)
+
+proc emitVcvtFromF32*(dest: var Bytes; sd, sm: FloatRegister; signed: bool) =
+  ## `VCVT.S32.F32` / `VCVT.U32.F32`, rounding TOWARD ZERO — C's rule, and Leng's.
+  dest.emitVfpUnary((if signed: 0xD'u16 else: 0xC'u16), 0x00C0'u16, sd, sm)
+
+proc emitVldrVstr*(dest: var Bytes; sd: FloatRegister; rn: Register;
+                   offset: int32; isLoad: bool) =
+  ## VLDR/VSTR `.32`. The displacement is a WORD offset in an 8-bit field, so the
+  ## reach is ±1020 bytes and it must be 4-aligned — narrower than the integer
+  ## `ldr`'s 4095, and a frame beyond it is an error rather than a wrong address.
+  if (offset and 3) != 0:
+    raise newException(ValueError, "thumb2: vldr/vstr offset not word-aligned: " & $offset)
+  let u = if offset >= 0: 1'u16 else: 0'u16
+  let mag = (if offset >= 0: offset else: -offset) shr 2
+  if mag > 255:
+    raise newException(ValueError, "thumb2: vldr/vstr offset out of range: " & $offset)
+  dest.emitWide(0xED00'u16 or (u shl 7) or (fLo(sd) shl 6) or
+                (if isLoad: 0x10'u16 else: 0'u16) or uint16(ord(rn)),
+                (fHi(sd) shl 12) or 0x0A00'u16 or uint16(mag))
+
+proc emitVldr*(dest: var Bytes; sd: FloatRegister; rn: Register; offset: int32) =
+  dest.emitVldrVstr(sd, rn, offset, isLoad = true)
+proc emitVstr*(dest: var Bytes; sd: FloatRegister; rn: Register; offset: int32) =
+  dest.emitVldrVstr(sd, rn, offset, isLoad = false)
+
 # ── disassembly aid ─────────────────────────────────────────────────────────
+
+proc emitDsb*(dest: var Bytes) =
+  ## DSB SY — every memory access before it completes before anything after it
+  ## starts.
+  dest.emitWide(0xF3BF'u16, 0x8F4F'u16)
+
+proc emitIsb*(dest: var Bytes) =
+  ## ISB SY — flush the pipeline. What makes a write to CPACR (enabling the FPU)
+  ## visible to the instruction that follows rather than to whatever the core has
+  ## already fetched.
+  dest.emitWide(0xF3BF'u16, 0x8F6F'u16)
 
 proc `$`*(r: Register): string =
   case r
@@ -564,3 +678,5 @@ proc `$`*(r: Register): string =
   of LR: "lr"
   of PC: "pc"
   else: "r" & $ord(r)
+
+proc `$`*(r: FloatRegister): string = "s" & $ord(r)

@@ -231,6 +231,139 @@ check "signed compare blt", 1:
     b.data.emitMovImm32(R0, 1)
     b.defineLabel(lEnd))
 
+# ── FPv4-SP ─────────────────────────────────────────────────────────────────
+# Every check below enables the FPU first: Cortex-M4F comes out of reset with
+# CP10/CP11 access denied, and the first VFP instruction would take a UsageFault.
+# Each check is self-contained, so it does the write itself rather than relying
+# on an earlier one having run.
+
+const
+  Cpacr = 0xE000ED88'u32
+  Cp10Cp11Full = 0x00F00000'u32
+  F1_5 = 0x3FC00000'u32     ## 1.5f
+  F2_25 = 0x40100000'u32    ## 2.25f
+  F3_75 = 0x40700000'u32    ## 3.75f
+  F7_0 = 0x40E00000'u32     ## 7.0f
+
+proc enableFpu(b: var Buffer) =
+  b.data.emitMovImm32(R1, Cpacr)
+  b.data.emitLdr(R2, R1, 0)
+  b.data.emitMovImm32(R3, Cp10Cp11Full)
+  b.data.emitOrr3(R2, R2, R3)
+  b.data.emitStr(R2, R1, 0)
+  b.data.emitDsb()
+  b.data.emitIsb()
+
+template fcheck(nm: string; expect: uint32; body: untyped) {.dirty.} =
+  ## `check`, with the FPU turned on first. `dirty` so the body can name `b`,
+  ## which is the emitting closure's own parameter.
+  check nm, expect:
+    (proc (b: var Buffer) =
+      enableFpu(b)
+      body)
+
+fcheck "vmov gpr->fp->gpr roundtrip", F1_5:
+  b.data.emitMovImm32(R1, F1_5)
+  b.data.emitVmovToFp(S0, R1)
+  b.data.emitVmovFromFp(R0, S0)
+fcheck "vadd.f32 1.5+2.25", F3_75:
+  b.data.emitMovImm32(R1, F1_5); b.data.emitVmovToFp(S1, R1)
+  b.data.emitMovImm32(R1, F2_25); b.data.emitVmovToFp(S2, R1)
+  b.data.emitVadd(S3, S1, S2)
+  b.data.emitVmovFromFp(R0, S3)
+fcheck "vsub.f32 3.75-1.5", F2_25:
+  b.data.emitMovImm32(R1, F3_75); b.data.emitVmovToFp(S1, R1)
+  b.data.emitMovImm32(R1, F1_5); b.data.emitVmovToFp(S2, R1)
+  b.data.emitVsub(S3, S1, S2)
+  b.data.emitVmovFromFp(R0, S3)
+fcheck "vmul.f32 1.5*1.5", F2_25:
+  b.data.emitMovImm32(R1, F1_5); b.data.emitVmovToFp(S1, R1)
+  b.data.emitVmul(S2, S1, S1)
+  b.data.emitVmovFromFp(R0, S2)
+fcheck "vdiv.f32 3.75/2.5", F1_5:
+  b.data.emitMovImm32(R1, F3_75); b.data.emitVmovToFp(S1, R1)
+  b.data.emitMovImm32(R1, 0x40200000'u32); b.data.emitVmovToFp(S2, R1)   # 2.5f
+  b.data.emitVdiv(S3, S1, S2)
+  b.data.emitVmovFromFp(R0, S3)
+# vneg and vsqrt differ ONLY in their opc3 field, so a swap turns `-3.0` into
+# `1.732` — which is why both are checked and why the values are chosen so that
+# one cannot pass for the other.
+fcheck "vneg.f32", 0xBFC00000'u32:
+  b.data.emitMovImm32(R1, F1_5); b.data.emitVmovToFp(S1, R1)
+  b.data.emitVneg(S2, S1)
+  b.data.emitVmovFromFp(R0, S2)
+fcheck "vabs.f32 of -1.5", F1_5:
+  b.data.emitMovImm32(R1, 0xBFC00000'u32); b.data.emitVmovToFp(S1, R1)
+  b.data.emitVabs(S2, S1)
+  b.data.emitVmovFromFp(R0, S2)
+fcheck "vsqrt.f32 of 2.25", F1_5:
+  b.data.emitMovImm32(R1, F2_25); b.data.emitVmovToFp(S1, R1)
+  b.data.emitVsqrt(S2, S1)
+  b.data.emitVmovFromFp(R0, S2)
+fcheck "vmov.f32 reg-reg", F7_0:
+  b.data.emitMovImm32(R1, F7_0); b.data.emitVmovToFp(S1, R1)
+  b.data.emitVmovReg(S9, S1)
+  b.data.emitVmovFromFp(R0, S9)
+fcheck "vcvt.f32.s32 of -5", 0xC0A00000'u32:
+  b.data.emitMovImm32(R1, 0xFFFFFFFB'u32)                 # -5
+  b.data.emitVmovToFp(S1, R1)
+  b.data.emitVcvtToF32(S2, S1, signed = true)
+  b.data.emitVmovFromFp(R0, S2)
+fcheck "vcvt.f32.u32 of 0x80000000", 0x4F000000'u32:      # 2147483648.0f
+  b.data.emitMovImm32(R1, 0x80000000'u32)
+  b.data.emitVmovToFp(S1, R1)
+  b.data.emitVcvtToF32(S2, S1, signed = false)
+  b.data.emitVmovFromFp(R0, S2)
+fcheck "vcvt.s32.f32 truncates toward zero", 0xFFFFFFFE'u32:   # -2
+  b.data.emitMovImm32(R1, 0xC0133333'u32)                 # -2.3f
+  b.data.emitVmovToFp(S1, R1)
+  b.data.emitVcvtFromF32(S2, S1, signed = true)
+  b.data.emitVmovFromFp(R0, S2)
+fcheck "vldr/vstr .32 roundtrip", F2_25:
+  b.data.emitMovImm32(R1, F2_25); b.data.emitVmovToFp(S4, R1)
+  b.data.emitSubImm(SP, SP, 8)
+  b.data.emitVstr(S4, SP, 4)
+  b.data.emitVldr(S5, SP, 4)
+  b.data.emitAddImm(SP, SP, 8)
+  b.data.emitVmovFromFp(R0, S5)
+fcheck "vldr negative offset", F7_0:
+  b.data.emitMovImm32(R1, F7_0); b.data.emitVmovToFp(S4, R1)
+  b.data.emitSubImm(SP, SP, 8)
+  b.data.emitVstr(S4, SP, 0)
+  b.data.emitAddImm(R2, SP, 8)
+  b.data.emitVldr(S5, R2, -8)
+  b.data.emitAddImm(SP, SP, 8)
+  b.data.emitVmovFromFp(R0, S5)
+fcheck "vcmp.f32 + vmrs: 1.5 < 2.25", 1:
+  let lTrue = b.createLabel()
+  let lEnd = b.createLabel()
+  b.data.emitMovImm32(R1, F1_5); b.data.emitVmovToFp(S1, R1)
+  b.data.emitMovImm32(R1, F2_25); b.data.emitVmovToFp(S2, R1)
+  b.data.emitVcmp(S1, S2)
+  b.data.emitVmrsApsr()
+  b.emitBcond(CondLT, lTrue)
+  b.data.emitMovImm32(R0, 0)
+  b.emitB(lEnd)
+  b.defineLabel(lTrue)
+  b.data.emitMovImm32(R0, 1)
+  b.defineLabel(lEnd)
+fcheck "vcmp.f32 + vmrs: equal sets Z", 1:
+  let lTrue = b.createLabel()
+  let lEnd = b.createLabel()
+  b.data.emitMovImm32(R1, F7_0); b.data.emitVmovToFp(S1, R1)
+  b.data.emitVcmp(S1, S1)
+  b.data.emitVmrsApsr()
+  b.emitBcond(CondEQ, lTrue)
+  b.data.emitMovImm32(R0, 0)
+  b.emitB(lEnd)
+  b.defineLabel(lTrue)
+  b.data.emitMovImm32(R0, 1)
+  b.defineLabel(lEnd)
+fcheck "high s-register (s17) survives the D-bit split", F3_75:
+  b.data.emitMovImm32(R1, F3_75); b.data.emitVmovToFp(S17, R1)
+  b.data.emitVmovReg(S30, S17)
+  b.data.emitVmovFromFp(R0, S30)
+
 # ── image construction ──────────────────────────────────────────────────────
 
 const

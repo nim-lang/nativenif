@@ -957,54 +957,63 @@ const cortexMUnsupported: seq[string] = @[
   # These are the fixtures it cannot serve yet, each parked under the reason it
   # fails, so that any OTHER failure is fatal and a fixture that starts working
   # is reported. Everything here refuses BY NAME (a compile-time error from
-  # arkham or nifasm); the one exception is called out below.
+  # arkham or nifasm); the one exception is called out at the bottom.
 
-  # ── M5: floating point (FPv4-SP) ────────────────────────────────────────────
-  # `(f 64)` has no hardware on Cortex-M4F at all, and the `(f 32)` path is not
-  # wired up. Both refuse in nifasm at the `(rebind … (dN)/(sN))`, or in arkham
-  # where the float value core assumes a SIMD home exists.
-  "addrfloat", "div_floatparam", "float_array_index", "float_const_conv",
-  "float_global_field", "float_global_read", "float_special_values", "fp32",
-  "fp3264", "fparg_spill", "fparith", "fparith2", "fparray", "fpasgn", "fpasgn2",
-  "fpcall", "fpcmp", "fpcmp2", "fpconv", "fpconv2", "fpdeep", "fpderef",
-  "fpfield", "fpfunc", "fpparamspill", "fpspill", "global_init_float",
-  "spill_produce_float", "store_forward", "uint_literal_to_float",
+  # ── float64 ─────────────────────────────────────────────────────────────────
+  # Missing HARDWARE, not a missing feature: Cortex-M4F's FPv4-SP is single
+  # precision and has no `.f64` instruction at all. `float32` works (M5) — see
+  # `tests/arkham_m/fp32_*` — and a double is refused rather than lowered through
+  # a softfloat library nobody asked for.
+  "a64_vec_instr", "addrfloat", "float_array_index", "float_global_field",
+  "float_global_read", "float_special_values", "fp3264", "fparg_spill",
+  "fparith", "fparith2", "fparray", "fpasgn", "fpasgn2", "fpcall", "fpcmp",
+  "fpdeep", "fpderef", "fpfield", "fpfunc", "fpparamspill", "fpspill",
+  "global_init_float", "spill_produce_float", "store_forward",
+  "uint_literal_to_float",
 
-  # ── no such hardware / no such OS ───────────────────────────────────────────
+  # ── float <-> 64-bit integer ────────────────────────────────────────────────
+  # FPv4-SP converts to and from a THIRTY-TWO bit integer. `int64(f)` past 2^31
+  # would need a runtime routine, and a `vcvt` plus a sign-extend would be
+  # quietly wrong exactly there — so it is refused instead. `int32(f)` and
+  # `float32(i)` are what this core has, and they work.
+  "div_floatparam", "float_const_conv", "fp32", "fpconv", "fpconv2",
+
+  # ── no such hardware, no such OS ────────────────────────────────────────────
   # Thread-locals (no threads, no TLS register), `mmap`/`futex`/`___ulock_wake`
-  # (no kernel to ask), and the x86-64-pinned `.assembler` / stack-walk fixtures.
+  # (no kernel to ask), and the two x86-64-pinned fixtures.
   "tvar_addr", "tvar_aggregate", "tvar_arg_order",
   "mmap_anon", "futex_wake", "ulock_wake",
-  "assembler_x64", "naked_stacktrace_x64", "a64_vec_instr",
+  "assembler_x64", "naked_stacktrace_x64",
 
   # ── 64-bit intrinsics ───────────────────────────────────────────────────────
   # `clz`/`rbit`/`rev` and the atomics at 64 bits: ARMv7-M's are 32-bit, and its
-  # exclusives (`ldrex`/`strex`) have no 64-bit form on this core either. The
-  # 64-bit overflow-checked multiply needs `smulh`, which does not exist.
-  "atomic", "atomic2", "atomic_cas", "atomic_subword_cas",
-  "intrinsics", "intrinsics_x64", "mul_overflow", "mul_overflow_pow2",
+  # exclusives have no 64-bit form on this core either. The overflow-checked
+  # 64-bit multiply wants `smulh`, which does not exist here.
+  "atomic", "atomic2", "atomic_cas", "atomic_cas_regpressure",
+  "atomic_subword_cas", "intrinsics", "intrinsics_x64",
+  "mul_overflow", "mul_overflow_pow2",
 
   # ── register pressure ───────────────────────────────────────────────────────
   # Four allocatable homes and an empty volatile pool (see machine_m.nim). Each
   # of these fails LOUDLY at the pick — never with a wrong answer.
-  "atomic_cas_operand_home", "atomic_cas_regpressure", "atomic_ptr_cell",
-  "at_scratch_deref_base", "array2d", "nested_at_read", "a64_big_frame",
-  "aconstr_byref_spilled", "aggr_arg_parked_manual",
+  "aconstr_byref_spilled", "aggr_arg_parked_manual", "array2d",
+  "at_scratch_deref_base", "atomic_cas_operand_home", "atomic_ptr_cell",
+  "nested_at_read", "a64_big_frame",
 
   # ── still open in the 64-bit lowering ───────────────────────────────────────
-  # Known gaps with a named failure: a 64-bit value reaching a consumer that is
-  # not wide-aware (`leafret`, `deep_spill*`), the semihosting `write` shim's
-  # parameter widths (`hello`, `callret`, `calleeret`), a raw register use the
-  # binding checker rejects (`memcmp*`), and three arity mismatches between the
-  # AArch64 and Thumb-2 spellings of the same mnemonic.
+  # Known gaps, each with a named failure: a 64-bit value reaching a consumer
+  # that is not wide-aware (`leafret`, `deep_spill*`), the semihosting `write`
+  # shim's parameter widths (`hello`, `callret`, `calleeret`), a raw register use
+  # the binding checker rejects (`memcmp*`), and four arity mismatches between
+  # the AArch64 and Thumb-2 spellings of the same mnemonic.
   "leafret", "deep_spill", "deep_spill_call",
   "hello", "callret", "calleeret",
   "memcmp", "memcmp_bulk",
   "intops", "shift_count_stale_ptr_home", "cast_narrow_imm", "conv4",
 
   # ── INAPPLICABLE, not unsupported ───────────────────────────────────────────
-  # The one entry here that does not refuse: it runs and returns the wrong exit
-  # code, because what it asserts is not true of this target. `stack_array_align`
+  # The one entry that does not refuse: it runs and returns the wrong exit code,
+  # because what it asserts is not true of this target. `stack_array_align`
   # checks `addr big and 15 == 0` — a 16-byte stack alignment that SysV and
   # AAPCS64 happen to give it. AAPCS32 promises 8, and over-aligning every frame
   # to buy it back would cost stack on a device that has kilobytes of it.

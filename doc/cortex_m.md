@@ -244,8 +244,42 @@ fixtures, 225 `importc "exit"` and 3 `importc "write"`.
   than at the top of the body, and why they may only use the staging bridges:
   the prologue is written after `computeFrame` has frozen `usedCallee`, so a
   callee-saved register taken there would be used without being saved.
-* **M5 — floating point.** FPv4-SP hard-float for `(f 32)`; `(f 64)` rejected on
-  M4F rather than dragged in via a softfloat library.
+* **M5 — floating point.** DONE for `float32`. `tests/arkham_m/fp32_*` cover
+  arithmetic, comparison, calls and returns, globals, arrays, object fields, and
+  spilling past the callee-saved registers; `tests/thumb2_selftest.nim` checks
+  all seventeen VFP encoders by RUNNING them.
+
+  Cortex-M4F's FPU is FPv4-SP: single precision, s0–s31, and **no `.f64`
+  instruction at all**. A `float64` is therefore refused by name — this is
+  missing hardware, not a missing feature, and the alternative (a softfloat
+  library nobody asked for) is not a decision a code generator should make
+  quietly. So is `int64(f)` / `float32(i64)`: `vcvt` converts to and from a
+  THIRTY-TWO bit integer, and a `vcvt` plus a sign-extend would be quietly wrong
+  exactly where it matters. `int32(f)` and `float32(i32)` are what this core has.
+
+  Two things about the target had to be learned the hard way:
+
+  * **The FPU is OFF at reset.** CPACR grants no access to CP10/CP11, and the
+    first VFP instruction takes a UsageFault — which, with no handler installed,
+    is a lockup at the top of `main` with nothing to say why. Every image now
+    enables it in the entry proc, DSB/ISB included (CPACR changes how LATER
+    instructions behave; QEMU forgives the missing barriers, silicon does not).
+  * **`vneg` and `vsqrt` differ only in their `opc3` field.** Getting them the
+    wrong way round turns `-3.0` into `1.732` — no fault, no type error, just a
+    number. Both are in the encoder self-test, with values chosen so neither can
+    pass for the other.
+
+  The float register file is roomy where the integer one is not, so the pools
+  follow AAPCS32 (s0–s15 caller-saved, s16–s31 callee-saved) and — crucially —
+  the temp pool is DISJOINT from the argument registers. That is the property
+  the integer side could not have, and it is why float scratch needs no special
+  care while a call's arguments are being staged. s30 is nifasm's (`vcvt` needs
+  a float register to convert INTO, the same way operand folding needs r12) and
+  s31 is the emitter's float staging bridge.
+
+  Float parameters and results stay on the empty-signature manual-marshalling
+  path, as they do on AArch64 — `isDeclarativeAbi` excludes them — so the
+  assembler never sees a float in a `(param …)`.
 * **M6 — actually embedded.** Exception/interrupt handlers with the right
   EXC_RETURN epilogue, volatile MMIO, memory-map configuration, `.data` init
   from flash, and a UART output backend so real hardware works without a

@@ -108,6 +108,27 @@ const
   ## prologue of any `exportc`'d proc.
   IntBridgeRegs* = [R10, R11]
 
+  ## ── FPv4-SP (M5) ──────────────────────────────────────────────────────────
+  ## Cortex-M4F's FPU is SINGLE PRECISION ONLY: s0–s31, no `.f64` instruction at
+  ## all. A `float64` is therefore refused BY NAME rather than lowered through a
+  ## softfloat library nobody asked for — see `rejectForThumbM`.
+  ##
+  ## Unlike the integer file this one is roomy, so the split follows AAPCS32's
+  ## (s0–s15 caller-saved, s16–s31 callee-saved) and — crucially — keeps the
+  ## temp pool DISJOINT from the argument registers. That is the property the
+  ## integer side could not have (see `IntTempRegs`), and it is why float scratch
+  ## needs no special care while a call's arguments are being staged.
+  FloatArgRegs*      = [F0, F1, F2, F3, F4, F5, F6, F7]    ## s0–s7; s0 also returns
+  FloatRet*          = F0
+  FloatTempRegs*     = [F8, F9, F10, F11, F12, F13, F14, F15]   ## s8–s15, volatile
+  FloatCalleeSaved*  = [F16, F17, F18, F19, F20, F21, F22, F23] ## s16–s23, saved
+
+  ## s30 is nifasm's, s31 is the emitter's float staging bridge
+  ## (`machine.FloatBridgeReg`), and s24–s29 are simply unused. nifasm needs one
+  ## because `vcvt` between an integer and a float goes through the FPU: turning
+  ## `(fcvtzs <gpr> <sreg>)` into machine code takes a float register to convert
+  ## INTO, and the source may still be live. Same reasoning as r12/IP.
+
   ## Never allocate: nifasm's IP, the link register, sp, and the abstract slots
   ## that map to no Cortex-M register.
   ReservedRegs* = {R12, R13, R14, R15, R16..R30, SP, NoReg}
@@ -124,16 +145,16 @@ const
     divRemReg: NoReg,           # sdiv/udiv are 3-operand; the remainder is `mls`
     shiftCountReg: NoReg,       # Thumb-2 shifts take any register
     intArgRegs: @IntArgRegs,
-    floatArgRegs: @[],          # the FPv4-SP path is M5
+    floatArgRegs: @FloatArgRegs,
     intTempRegs: @IntTempRegs,
     stagingBridgeReg: NoReg,    # like AArch64: the bridges are withheld from the
                                 # pools instead (see IntBridgeRegs)
     intLocalTempRegs: @IntLocalTempRegs,
     intCalleeSaved: @IntCalleeSaved,
-    floatTempRegs: @[],
-    floatCalleeSaved: @[],
+    floatTempRegs: @FloatTempRegs,
+    floatCalleeSaved: @FloatCalleeSaved,
     intCalleeSavedSet: {R4..R7},
-    floatCalleeSavedSet: {},
+    floatCalleeSavedSet: {F16..F23},
     aggrByRefThreshold: 8)      # TWO words, matching `slots.classifyArg`'s `2*w`.
                                 # These two decide the same thing and MUST agree:
                                 # `planCall` reads the threshold while the
