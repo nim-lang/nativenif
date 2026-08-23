@@ -43,16 +43,33 @@ the frame size is known. The pair is a fixed 8 bytes whatever the value, so
 patching never resizes an instruction — and unlike the AArch64 path there is no
 12-/16-bit immediate ceiling on the frame.
 
+Globals, aggregates and indirect calls are in too. A `.bss` region is emitted as
+a SECOND ELF32 segment at `SramBase` (0x20000000) while code stays at the flash
+base, and `(adr D <gvar>)` materializes a global's ABSOLUTE address with a
+MOVW/MOVT pair patched once that layout is fixed — the analogue of the AArch64
+backend's adrp+add patch. `(dot …)` and `(at …)` fold onto a base+offset(+scaled
+index) memory operand, nesting the way the other backends do.
+
+`.bss` is emitted FILE-BACKED (filesz == memsz) rather than as NOBITS. That costs
+image size but is correct everywhere: a NOBITS segment relies on the loader
+zeroing it, which QEMU's `-kernel` does and a real chip emphatically does not.
+Real firmware zeroes `.bss` in its reset handler — that startup code is M6, and
+until it exists the two behave identically.
+
+The stack grows DOWN from `DefaultStackTop` and the globals UP from `SramBase`;
+they share one RAM region, so the writer errors when they would meet rather than
+letting the first deep call frame quietly overwrite a global.
+
 ### What M2c still needs
 
-* **Address-of-global** (`(adr D <gvar>)`) — errors by name.
-* **`(dot …)` / `(at …)`** address folding inside `(mem …)`.
-* Indirect calls through a global or a stack-held function pointer (a
-  register-held one works).
-* `extproc`/`syproc` are rejected by name: a bare-metal image has nothing to
-  link against and no OS to call.
+Nothing structural. Remaining gaps are named at their sites:
+
+* `extproc`/`syproc` are rejected: a bare-metal image has nothing to link
+  against and no OS to call.
 * 64-bit scalars and floats are rejected BY NAME (`checkRegWidthM`) rather than
   truncated; they are M4 and M5.
+* An `(at …)` whose element stride is not 1/2/4/8 needs the 3-operand scratch
+  form, exactly as on AArch64.
 
 ## Target
 

@@ -6,7 +6,7 @@ import tags, model, tagconv, tagpool
 import buffers, relocs, x86, arm64, elf, macho, pe
 from thumb2 import nil   # qualified: Nim conflates `emitBL` (arm64) with `emitBl`
                          # (thumb2), and `Register` would clash three ways
-from elf32 import writeFirmware, FlashBase, VectorTableSize  # qualified: `elf32` repeats ET_EXEC/PT_LOAD/PF_*
+from elf32 import nil        # qualified: `elf32` repeats ET_EXEC/PT_LOAD/PF_*
                                  # under 32-bit types, which would shadow `elf`'s
 import dwarf, tracetable
 import sem, slots
@@ -4270,6 +4270,166 @@ proc parseOperandM(n: var Cursor; ctx: var GenContext): OperandM =
         if n.hasMore and n.kind == IntLit:
           result.immVal = getInt(n)
           inc n
+    elif t == DotTagId:
+      # `(dot <base> <field>)` — fold the field's offset onto the base address.
+      # The result is typed `PtrT(fieldType)`: an embedded sub-object sits AT
+      # base+offset rather than behind a loaded pointer, which is what lets
+      # `(dot (dot o inner) a)` keep accumulating instead of dereferencing.
+      inc n
+      let baseOp = parseOperandM(n, ctx)
+      if n.kind != Symbol: error("Expected field name in dot expression", n)
+      let fieldName = getSym(n)
+      inc n
+      var objType: Type
+      var baseReg = thumb2.R0
+      var baseOffset: int32 = 0
+      var baseIndex = thumb2.R0
+      var baseShift = 0
+      var baseHasIndex = false
+      if baseOp.typ.kind == TypeKind.PtrT:
+        objType = resolvedBase(baseOp.typ, ctx, n)
+        if objType.kind notin {TypeKind.ObjectT, TypeKind.UnionT}:
+          error("Cannot access field of non-object/union type " & $objType, n)
+        if baseOp.kind == okMem:
+          # A NESTED access: fold onto the inner base+offset(+index) rather than
+          # treating the inner base register as the pointer, which would lose the
+          # inner displacement.
+          baseReg = baseOp.mem.base
+          baseOffset = baseOp.mem.offset
+          baseIndex = baseOp.mem.index
+          baseShift = baseOp.mem.shift
+          baseHasIndex = baseOp.mem.hasIndex
+        else:
+          baseReg = baseOp.reg
+      elif baseOp.kind == okMem and baseOp.typ.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
+        objType = baseOp.typ
+        baseReg = baseOp.mem.base
+        baseOffset = baseOp.mem.offset
+      elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.StackOffT and
+           baseOp.typ.offType.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
+        objType = baseOp.typ.offType
+        baseReg = baseOp.mem.base
+        baseOffset = baseOp.mem.offset
+      else:
+        error("dot requires pointer to object/union or stack object/union, got " &
+              $baseOp.typ, n)
+      var fieldOffset = 0
+      var fieldType: Type = nil
+      for (fname, ftype, foff) in objType.fields:
+        if fname == fieldName:
+          fieldType = ftype
+          fieldOffset = foff
+          break
+      if fieldType == nil:
+        error("Field '" & fieldName & "' not found in " & $objType.kind, n)
+      result.kind = okMem
+      result.mem = thumb2.MemoryOperand(base: baseReg,
+                                        offset: baseOffset + int32(fieldOffset),
+                                        hasIndex: baseHasIndex, index: baseIndex,
+                                        shift: baseShift)
+      result.typ = Type(kind: TypeKind.PtrT, base: fieldType)
+    elif t == AtTagId:
+      # `(at <base> <index>)` folds to a scaled-index LDR/STR operand, or
+      # `(at <base> <index> <scratch>)` when the element stride is not one of the
+      # four LDR scales — then the caller supplies a register and WE compute
+      # `base + index*stride` into it.
+      into n:
+        let baseOp = parseOperandM(n, ctx)
+        let indexOp = parseOperandM(n, ctx)
+        if not isIntegerType(indexOp.typ):
+          error("Array index must be integer type, got " & $indexOp.typ, n)
+        var elemType: Type
+        var baseReg = thumb2.R0
+        var baseOffset: int32 = 0
+        var baseHasIndex = false
+        if baseOp.typ.kind == TypeKind.AptrT:
+          elemType = resolvedBase(baseOp.typ, ctx, n)
+          baseReg = baseOp.reg
+        elif baseOp.typ.kind == TypeKind.PtrT and
+             resolvedBase(baseOp.typ, ctx, n).kind == TypeKind.ArrayT:
+          elemType = resolvedBase(baseOp.typ, ctx, n).elem
+          if baseOp.kind == okMem:
+            baseReg = baseOp.mem.base
+            baseOffset = baseOp.mem.offset
+            baseHasIndex = baseOp.mem.hasIndex
+          else:
+            baseReg = baseOp.reg
+        elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.ArrayT:
+          elemType = baseOp.typ.elem
+          baseReg = baseOp.mem.base
+          baseOffset = baseOp.mem.offset
+        elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.StackOffT and
+             baseOp.typ.offType.kind == TypeKind.ArrayT:
+          elemType = baseOp.typ.offType.elem
+          baseReg = baseOp.mem.base
+          baseOffset = baseOp.mem.offset
+        else:
+          error("at requires aptr, pointer-to-array, or stack array, got " &
+                $baseOp.typ, n)
+        let stride = asmSizeOf(elemType)
+
+        var scratchReg = thumb2.R0
+        var hasScratch = false
+        if n.hasMore:
+          let scratchOp = parseOperandM(n, ctx)
+          if scratchOp.kind notin {okReg, okArg}:
+            error("at: 3-operand scratch must be a register", n)
+          scratchReg = scratchOp.reg
+          hasScratch = true
+
+        if hasScratch:
+          if indexOp.kind notin {okReg, okArg}:
+            error("at: 3-operand form expects a register index", n)
+          if baseHasIndex:
+            error("at: 3-operand form cannot extend a base that already has an index", n)
+          # `scratch == base` is fatal: the multiply writes scratch (== base)
+          # before the add reads the base, so the base is gone and the address is
+          # wild. `scratch == index` is fine — the stride goes through IP, so the
+          # index survives the multiply.
+          if scratchReg == baseReg:
+            error("at: 3-operand stride scratch aliases the base register (" &
+                  $baseReg & ") — the base is clobbered before use (codegen bug)", n)
+          if stride > 0 and (stride and (stride - 1)) == 0:
+            # A power-of-two stride is a SHIFT: no constant, no multiply.
+            var k = 0
+            var t2 = stride
+            while t2 > 1: (t2 = t2 shr 1; inc k)
+            if k == 0: thumb2.emitMovReg(ctx.buf.data, scratchReg, indexOp.reg)
+            else: thumb2.emitLslImm(ctx.buf.data, scratchReg, indexOp.reg, k)
+          else:
+            # The stride constant goes into IP, never into `scratchReg`: the caller
+            # may hand a scratch that ALIASES the index, and materializing the
+            # stride there would destroy the index before the multiply.
+            thumb2.emitMovImm32(ctx.buf.data, thumb2.IP, uint32(stride))
+            thumb2.emitMul(ctx.buf.data, scratchReg, indexOp.reg, thumb2.IP)
+          thumb2.emitAdd3(ctx.buf.data, scratchReg, baseReg, scratchReg)
+          result.kind = okMem
+          result.mem = thumb2.MemoryOperand(base: scratchReg, offset: baseOffset)
+          result.typ = Type(kind: TypeKind.PtrT, base: elemType)
+        elif indexOp.kind == okImm:
+          # A constant index folds straight into the displacement.
+          result.kind = okMem
+          result.mem = thumb2.MemoryOperand(
+            base: baseReg,
+            offset: baseOffset + int32(indexOp.immVal * stride),
+            hasIndex: baseHasIndex, index: thumb2.R0, shift: 0)
+          result.typ = Type(kind: TypeKind.PtrT, base: elemType)
+        else:
+          if baseHasIndex:
+            error("at: base already carries an index; use the 3-operand form", n)
+          if stride notin [1, 2, 4, 8]:
+            error("at: element stride " & $stride & " is not an LDR/STR scale; " &
+                  "use the 3-operand form with a scratch register", n)
+          var shift = 0
+          var t2 = stride
+          while t2 > 1: (t2 = t2 shr 1; inc shift)
+          result.kind = okMem
+          result.mem = thumb2.MemoryOperand(base: baseReg, offset: baseOffset,
+                                            hasIndex: true, index: indexOp.reg,
+                                            shift: shift)
+          result.typ = Type(kind: TypeKind.PtrT, base: elemType)
+        while n.hasMore: skip n
+      return
     elif t == MemTagId:
       # `(mem <base> [offset | field-symbol])`. `into` BOUNDS the cursor to this
       # node's children — without it the optional-offset check below reads into
@@ -4461,6 +4621,29 @@ proc emitBranchM(ctx: var GenContext; cond: thumb2.Condition; target: LabelId) =
   if cond == thumb2.CondAL: thumb2.emitB(ctx.buf, target)
   else: thumb2.emitBcond(ctx.buf, cond, target)
 
+proc emitMemAccessM(ctx: var GenContext; rt: thumb2.Register;
+                    mem: thumb2.MemoryOperand; width: thumb2.MemWidth;
+                    isLoad: bool; signed = false; n: Cursor) =
+  ## THE one place a `(mem …)` operand becomes a load or a store, so the scaled
+  ## index that `(at …)` folds in cannot be silently dropped by a caller that
+  ## only looked at base+offset.
+  ##
+  ## Thumb-2's register-index form carries no displacement, so a memory operand
+  ## with BOTH an index and a non-zero offset is materialized into IP first. IP is
+  ## the AAPCS32 scratch and hosts no value, so this needs no spill.
+  if not mem.hasIndex:
+    thumb2.emitLoadStoreImm(ctx.buf.data, rt, mem.base, mem.offset, width,
+                            isLoad = isLoad, signed = signed)
+  elif mem.offset == 0:
+    thumb2.emitLoadStoreReg(ctx.buf.data, rt, mem.base, mem.index, width,
+                            isLoad = isLoad, shift = mem.shift, signed = signed)
+  else:
+    if rt == thumb2.IP:
+      error("Cortex-M: indexed access with a displacement cannot target IP", n)
+    thumb2.emitAddImm(ctx.buf.data, thumb2.IP, mem.base, uint32(mem.offset))
+    thumb2.emitLoadStoreReg(ctx.buf.data, rt, thumb2.IP, mem.index, width,
+                            isLoad = isLoad, shift = mem.shift, signed = signed)
+
 proc loadToRegM(ctx: var GenContext; dest: thumb2.Register; op: OperandM; n: Cursor) =
   ## Materialize `op` into `dest`. The one place that decides how each operand
   ## KIND reaches a register, so no arm has to repeat it.
@@ -4479,7 +4662,7 @@ proc loadToRegM(ctx: var GenContext; dest: thumb2.Register; op: OperandM; n: Cur
     thumb2.emitMovImm16(ctx.buf.data, dest, 0)
     thumb2.emitMovt(ctx.buf.data, dest, 0)
   of okMem:
-    thumb2.emitLdr(ctx.buf.data, dest, op.mem.base, op.mem.offset)
+    ctx.emitMemAccessM(dest, op.mem, thumb2.MemWord, isLoad = true, n = n)
   of okLabel:
     thumb2.emitMovwMovtAbs(ctx.buf, dest, op.label)
   else:
@@ -4487,7 +4670,7 @@ proc loadToRegM(ctx: var GenContext; dest: thumb2.Register; op: OperandM; n: Cur
 
 proc storeFromRegM(ctx: var GenContext; src: thumb2.Register; dst: OperandM; n: Cursor) =
   if dst.kind != okMem: error("Cortex-M: expected a memory destination", n)
-  thumb2.emitStr(ctx.buf.data, src, dst.mem.base, dst.mem.offset)
+  ctx.emitMemAccessM(src, dst.mem, thumb2.MemWord, isLoad = false, n = n)
 
 proc scratchM(ctx: GenContext; avoid: varargs[thumb2.Register]): thumb2.Register =
   ## A register the selector may use as a transient. r12 (IP) is reserved for
@@ -4658,7 +4841,21 @@ proc genCallMarkerM(n: var Cursor; ctx: var GenContext) =
     # and never an argument register, so loading the target there cannot disturb
     # the arguments already staged in r0–r3.
     if sym.kind in {skVar, skParam} and sym.reg != InvalidTagId:
+      # The register holds the code address itself — call straight through it.
       thumb2.emitBlx(ctx.buf.data, tagToRegisterM(sym.reg, n))
+    elif sym.kind == skGvar:
+      # r12 = &fnptr (patched with the global's absolute address), then load the
+      # pointer and call it. IP is the AAPCS32 scratch and never an argument
+      # register, so the arguments already staged in r0–r3 are untouched.
+      ctx.gvarSites.add (ctx.buf.data.len, sym)
+      thumb2.emitMovImm16(ctx.buf.data, thumb2.IP, 0)
+      thumb2.emitMovt(ctx.buf.data, thumb2.IP, 0)
+      thumb2.emitLdr(ctx.buf.data, thumb2.IP, thumb2.IP, 0'i32)
+      thumb2.emitBlx(ctx.buf.data, thumb2.IP)
+    elif sym.kind in {skVar, skParam} and sym.typ.isOnStack:
+      # A function pointer in a stack slot: load it into IP and call through it.
+      thumb2.emitLdr(ctx.buf.data, thumb2.IP, thumb2.SP, int32(sym.offset))
+      thumb2.emitBlx(ctx.buf.data, thumb2.IP)
     else:
       error("Cortex-M: indirect call through " & $sym.kind & " is not supported yet", n)
     ctx.callContext.callEmitted = true
@@ -4794,20 +4991,18 @@ proc genInstM(n: var Cursor; ctx: var GenContext) =
       let d = parseDestM(n, ctx)
       let sOp = parseOperandM(n, ctx)
       if sOp.kind != okMem: error("load source must be memory", start)
-      thumb2.emitLoadStoreImm(ctx.buf.data, regOfM(d, "destination", start),
-                              sOp.mem.base, sOp.mem.offset, width,
-                              isLoad = true, signed = signExt)
+      ctx.emitMemAccessM(regOfM(d, "destination", start), sOp.mem, width,
+                         isLoad = true, signed = signExt, n = start)
     else:
       let d = parseDestM(n, ctx)
       let sOp = parseOperandM(n, ctx)
       if d.kind != okMem: error("store destination must be memory", start)
       var sr: thumb2.Register
-      if sOp.kind == okReg: sr = sOp.reg
+      if sOp.kind in {okReg, okArg}: sr = sOp.reg
       else:
-        sr = ctx.scratchM(d.mem.base)
+        sr = ctx.scratchM(d.mem.base, d.mem.index)
         ctx.loadToRegM(sr, sOp, start)
-      thumb2.emitLoadStoreImm(ctx.buf.data, sr, d.mem.base, d.mem.offset, width,
-                              isLoad = false, signed = false)
+      ctx.emitMemAccessM(sr, d.mem, width, isLoad = false, n = start)
 
   case instTag
   of StmtsM:
@@ -4864,12 +5059,26 @@ proc genInstM(n: var Cursor; ctx: var GenContext) =
     let op = parseOperandM(n, ctx)
     let dr = regOfM(dest, "adr destination", start)
     if op.kind == okMem:
-      # `(lea D (mem base off))` — the ADDRESS, not the contents.
+      # `(lea D <lvalue>)` — the ADDRESS, not the contents. A folded index has to
+      # be added in explicitly here; there is no address-computing instruction on
+      # Thumb-2 that takes a scaled index the way x86's `lea` does.
       if op.mem.base != dr: thumb2.emitMovReg(ctx.buf.data, dr, op.mem.base)
       if op.mem.offset != 0:
         thumb2.emitAddImm(ctx.buf.data, dr, dr, uint32(op.mem.offset))
+      if op.mem.hasIndex:
+        if op.mem.shift == 0:
+          thumb2.emitAdd3(ctx.buf.data, dr, dr, op.mem.index)
+        else:
+          thumb2.emitLslImm(ctx.buf.data, thumb2.IP, op.mem.index, op.mem.shift)
+          thumb2.emitAdd3(ctx.buf.data, dr, dr, thumb2.IP)
     elif op.gvarSym != nil:
-      error("Cortex-M: taking the address of a global is not implemented yet", start)
+      # A global lives in SRAM, nowhere near the code, so its address is
+      # materialized ABSOLUTELY (MOVW+MOVT) rather than PC-relatively. The pair is
+      # a fixed 8 bytes; the image writer patches its immediates once the .bss
+      # layout is known, exactly as the AArch64 backend patches its adrp+add.
+      ctx.gvarSites.add (ctx.buf.data.len, op.gvarSym)
+      thumb2.emitMovImm16(ctx.buf.data, dr, 0)
+      thumb2.emitMovt(ctx.buf.data, dr, 0)
     else:
       # A code/rodata label. MOVW+MOVT carries the ABSOLUTE address, so unlike
       # ADR it has no ±4 KB reach limit — a firmware image's load address is
@@ -9863,6 +10072,56 @@ proc setupTls(ctx: var GenContext) =
                                                        scale: 8, displacement: 8'i32, hasIndex: true))  # rdx = &envp[0]
   x86.emitJmp(ctx.buf, LabelId(ctx.entrySym.offset))        # → real entry
 
+proc writeCortexMImage(a: var GenContext; code: seq[byte];
+                       entryOff: int): seq[byte] =
+  ## The finished firmware: a vector table plus code at the flash base, and the
+  ## globals as a second segment in SRAM.
+  ##
+  ## `.bss` is emitted FILE-BACKED (filesz == memsz) rather than as a NOBITS
+  ## region. That costs image size but is correct everywhere: a NOBITS segment
+  ## relies on the loader zeroing it, which QEMU's `-kernel` does and a real chip
+  ## emphatically does not — real firmware zeroes `.bss` in its reset handler,
+  ## and that startup code is M6's business. Baking the bytes means the two
+  ## behave identically until then.
+  finalize(a.bssBuf)
+  var bssImage: seq[byte] = @[]
+  if a.bssOffset > 0:
+    bssImage = newSeq[byte](a.bssOffset)
+    for it in a.bssInits:
+      for i in 0 ..< it.size:
+        if it.off.int + i < bssImage.len:
+          bssImage[it.off.int + i] = byte((it.val shr (8 * i)) and 0xFF)
+
+  let bssVaddr = elf32.SramBase
+  let codeVaddr = elf32.FlashBase
+  # The stack grows DOWN from `DefaultStackTop`, the globals UP from `SramBase`.
+  # They share one RAM region, so say so when they would meet rather than letting
+  # the first deep call frame quietly overwrite a global.
+  if bssVaddr + uint32(a.bssOffset) >= elf32.DefaultStackTop:
+    quit "nifasm: " & $a.bssOffset & " bytes of globals would reach the stack at 0x" &
+         toHex(elf32.DefaultStackTop, 8)
+
+  # Patch every `(adr D <gvar>)` / indirect-call MOVW+MOVT pair with the global's
+  # absolute address, now that the .bss layout is fixed. `sym.size` is its byte
+  # offset within .bss — the same field the ELF64 and Mach-O backends read.
+  var patched = code
+  for (pos, sym) in a.gvarSites:
+    if pos + 8 > patched.len: continue
+    var bytes = initBytes()
+    for i in 0 ..< 8: bytes.add patched[pos + i]
+    bytes.patchThumbMovwMovtPair(0, bssVaddr + uint32(sym.size))
+    for i in 0 ..< 8: patched[pos + i] = bytes[i]
+
+  var image = elf32.initVectorTable(elf32.DefaultStackTop,
+                              codeVaddr + uint32(elf32.VectorTableSize + entryOff))
+  image.add patched
+  var segs = @[elf32.Segment(vaddr: codeVaddr, data: image, memSize: image.len,
+                       flags: elf32.PF_R or elf32.PF_W or elf32.PF_X)]
+  if bssImage.len > 0:
+    segs.add elf32.Segment(vaddr: bssVaddr, data: bssImage, memSize: bssImage.len,
+                     flags: elf32.PF_R or elf32.PF_W)
+  result = elf32.writeElf32(segs, codeVaddr + uint32(elf32.VectorTableSize + entryOff))
+
 proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
                listing = ""; debugInfo = true) =
   var buf = parseFromFile(filename, sharedTags = asmTags)
@@ -10019,7 +10278,7 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
           quit "nifasm: entry point '" & ctx.nameOf(ctx.entrySym.name) &
                "' has no address"
         entryOff = pos
-      writeFile(outfile, writeFirmware(code, entryOff))
+      writeFile(outfile, writeCortexMImage(ctx, code, entryOff))
 
   # Close all foreign-module readers (the main module has no reader).
   for modname, module in ctx.modules.mpairs:

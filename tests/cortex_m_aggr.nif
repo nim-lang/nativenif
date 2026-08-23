@@ -1,0 +1,85 @@
+(.nif27)
+(stmts
+ (arch cortex_m)
+ (type :Point.0
+  (object
+   (fld :x.0
+    (i 32))
+   (fld :y.0
+    (i 32))))
+ (type :Line.0
+  (object
+   (fld :a.0 Point.0)
+   (fld :b.0 Point.0)))
+ (proc :main.0
+  (params)
+  (result :mret.0
+   (r0)
+   (i 32))
+  (stmts
+   (var :ln.0
+    (s)Line.0)
+   (var :arr.0
+    (s)
+    (array
+     (i 32)4))
+   (var :blo.0
+    (s)
+    (i 32))
+   (var :bhi.0
+    (s)
+    (i 32))
+   (var :i.0
+    (r5)
+    (i 32))
+   (var :acc.0
+    (r4)
+    (i 32))
+   (sub
+    (sp)(ssize))
+   (mov
+    (r2)7)
+   (mov
+    (mem
+     (dot
+      (dot ln.0 b.0)x.0))(r2))
+   (mov
+    (r2)5)
+   (mov
+    (mem
+     (dot
+      (dot ln.0 b.0)y.0))(r2))
+   (mov
+    (r2)30)
+   (mov i.0 2)
+   (mov
+    (mem
+     (at arr.0 i.0))(r2))
+   (mov acc.0
+    (mem
+     (dot
+      (dot ln.0 b.0)x.0)))
+   (mov
+    (r2)
+    (mem
+     (dot
+      (dot ln.0 b.0)y.0)))
+   (add3 acc.0 acc.0
+    (r2))
+   (mov
+    (r2)
+    (mem
+     (at arr.0 i.0)))
+   (add3 acc.0 acc.0
+    (r2))
+   (mov
+    (r2)131110)
+   (mov blo.0
+    (r2))
+   (mov bhi.0 acc.0)
+   (lea
+    (r1)blo.0)
+   (mov
+    (r0)32)
+   (bkpt 171)
+   (ret))))

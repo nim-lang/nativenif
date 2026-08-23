@@ -927,7 +927,9 @@ proc cortexMAsmTests() =
   const fixtures = [("hello_cortex_m", 0, "Hello Cortex-M\n"),
                     ("cortex_m_alu", 42, ""),
                     ("cortex_m_call", 42, ""),
-                    ("cortex_m_stackargs", 42, "")]
+                    ("cortex_m_stackargs", 42, ""),
+                    ("cortex_m_global", 42, ""),
+                    ("cortex_m_aggr", 42, "")]
   var passed = 0
   for (stem, wantCode, wantOut) in fixtures:
     let src = "tests" / (stem & ".nif")
