@@ -12,6 +12,7 @@ import std / [os]
 import "../src/nifasm/thumb2"
 import "../src/nifasm/buffers"
 import "../src/nifasm/relocs"
+import "../src/nifasm/elf32"
 
 type Check = object
   name: string
@@ -233,30 +234,9 @@ check "signed compare blt", 1:
 # ── image construction ──────────────────────────────────────────────────────
 
 const
-  VecSize = 8
-  InitialSp = 0x20010000'u32
+  VecSize = 8              ## the two vector-table words `elf32.writeFirmware` prepends
   SysExitExtended = 0x20
   AdpStoppedApplicationExit = 0x20026'u32
-
-proc wrapElf32(image: seq[byte]; entryVa: int): seq[byte] =
-  const EhdrSize = 52
-  const PhdrSize = 32
-  var e: seq[byte] = @[]
-  proc u8(v: int) = e.add byte(v and 0xFF)
-  proc u16(v: int) = (u8 v; u8 (v shr 8))
-  proc u32(v: int) = (u16 v; u16 (v shr 16))
-  u8 0x7F; u8 ord('E'); u8 ord('L'); u8 ord('F')
-  u8 1; u8 1; u8 1
-  for _ in 0 ..< 9: u8 0
-  u16 2; u16 40; u32 1
-  u32 (entryVa or 1)
-  u32 EhdrSize; u32 0; u32 0x05000000
-  u16 EhdrSize; u16 PhdrSize; u16 1
-  u16 40; u16 0; u16 0
-  u32 1; u32 (EhdrSize + PhdrSize); u32 0; u32 0
-  u32 image.len; u32 image.len; u32 7; u32 4
-  e.add image
-  result = e
 
 when isMainModule:
   var b = initBuffer()
@@ -290,13 +270,10 @@ when isMainModule:
 
   b.updateRelocDisplacements()
 
-  var raw: seq[byte] = @[]
-  for i in 0 ..< b.data.len: raw.add b.data[i]
-  # real vector table
-  for k in 0 ..< 4: raw[k] = byte((InitialSp shr (8*k)) and 0xFF)
-  let entry = uint32(VecSize) or 1
-  for k in 0 ..< 4: raw[4 + k] = byte((entry shr (8*k)) and 0xFF)
-
-  writeFile(paramStr(1), wrapElf32(raw, VecSize))
-  echo "wrote ", paramStr(1), ": ", checks.len, " checks, ", raw.len, " image bytes"
+  # `writeFirmware` prepends the real vector table, so hand back only the code
+  # that followed the two placeholder words.
+  var code: seq[byte] = @[]
+  for i in VecSize ..< b.data.len: code.add b.data[i]
+  writeFile(paramStr(1), writeFirmware(code))
+  echo "wrote ", paramStr(1), ": ", checks.len, " checks, ", code.len, " code bytes"
   for i, c in checks: echo "  ", i + 1, "  ", c.name
