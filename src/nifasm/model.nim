@@ -202,26 +202,8 @@ type
     AddA64 = (ord(AddTagId), "add")  ## add instruction
     SubA64 = (ord(SubTagId), "sub")  ## subtract instruction
     MulA64 = (ord(MulTagId), "mul")  ## unsigned multiply
-    AndA64 = (ord(AndTagId), "and")  ## bitwise and
-    NegA64 = (ord(NegTagId), "neg")  ## negate
-    CmpA64 = (ord(CmpTagId), "cmp")  ## compare
-    CallA64 = (ord(CallTagId), "call")  ## function call marker inside prepare
-    ExtcallA64 = (ord(ExtcallTagId), "extcall")  ## external call marker inside prepare
-    RetA64 = (ord(RetTagId), "ret")  ## return instruction
-    NopA64 = (ord(NopTagId), "nop")  ## no operation
-    LabA64 = (ord(LabTagId), "lab")  ## label definition
-    IteA64 = (ord(IteTagId), "ite")  ## if-then-else structure
-    LoopA64 = (ord(LoopTagId), "loop")  ## loop structure
-    StmtsA64 = (ord(StmtsTagId), "stmts")  ## statement block
-    JtrueA64 = (ord(JtrueTagId), "jtrue")  ## set control flow variable(s) to true
-    KillA64 = (ord(KillTagId), "kill")  ## kill variable
-    RebindA64 = (ord(RebindTagId), "rebind")  ## bind a phys reg to a typed name, killing its prior tenant
-    WithregA64 = (ord(WithregTagId), "withreg")  ## block-scoped rebind; auto-killed at block end
-    ScopeA64 = (ord(ScopeTagId), "scope")  ## statement block with a reclaimable stack-slot arena: `(s)` locals declared inside are freed at scope end so sibling scopes reuse the frame bytes
     SdivA64 = (ord(SdivTagId), "sdiv")  ## signed divide
     UdivA64 = (ord(UdivTagId), "udiv")  ## unsigned divide
-    SmulhA64 = (ord(SmulhTagId), "smulh")  ## signed multiply high (top 64 bits of D*S)
-    UmulhA64 = (ord(UmulhTagId), "umulh")  ## unsigned multiply high (top 64 bits of D*S)
     Add3A64 = (ord(Add3TagId), "add3")  ## 3-operand add (D = A + B)
     Sub3A64 = (ord(Sub3TagId), "sub3")  ## 3-operand subtract (D = A - B)
     Mul3A64 = (ord(Mul3TagId), "mul3")  ## 3-operand multiply (D = A * B)
@@ -231,6 +213,36 @@ type
     Lsl3A64 = (ord(Lsl3TagId), "lsl3")  ## 3-operand logical shift left (D = A shl B)
     Lsr3A64 = (ord(Lsr3TagId), "lsr3")  ## 3-operand logical shift right (D = A shr B)
     Asr3A64 = (ord(Asr3TagId), "asr3")  ## 3-operand arithmetic shift right (D = A sar B)
+    AndA64 = (ord(AndTagId), "and")  ## bitwise and
+    NegA64 = (ord(NegTagId), "neg")  ## negate
+    CmpA64 = (ord(CmpTagId), "cmp")  ## compare
+    CallA64 = (ord(CallTagId), "call")  ## function call marker inside prepare
+    ExtcallA64 = (ord(ExtcallTagId), "extcall")  ## external call marker inside prepare
+    RetA64 = (ord(RetTagId), "ret")  ## return instruction
+    NopA64 = (ord(NopTagId), "nop")  ## no operation
+    AdrA64 = (ord(AdrTagId), "adr")  ## load address of label
+    LdrA64 = (ord(LdrTagId), "ldr")  ## load register
+    StrA64 = (ord(StrTagId), "str")  ## store register
+    BA64 = (ord(BTagId), "b")  ## branch (unconditional jump)
+    BlA64 = (ord(BlTagId), "bl")  ## branch with link (function call)
+    CbzA64 = (ord(CbzTagId), "cbz")  ## branch to L if S is zero (no flags read)
+    CbnzA64 = (ord(CbnzTagId), "cbnz")  ## branch to L if S is non-zero (no flags read)
+    LabA64 = (ord(LabTagId), "lab")  ## label definition
+    IteA64 = (ord(IteTagId), "ite")  ## if-then-else structure
+    LoopA64 = (ord(LoopTagId), "loop")  ## loop structure
+    StmtsA64 = (ord(StmtsTagId), "stmts")  ## statement block
+    JtrueA64 = (ord(JtrueTagId), "jtrue")  ## set control flow variable(s) to true
+    KillA64 = (ord(KillTagId), "kill")  ## kill variable
+    LdrbA64 = (ord(LdrbTagId), "ldrb")  ## load byte (zero-extend), register offset [B,I]
+    StrbA64 = (ord(StrbTagId), "strb")  ## store low byte, register offset [B,I]
+    RebindA64 = (ord(RebindTagId), "rebind")  ## bind a phys reg to a typed name, killing its prior tenant
+    WithregA64 = (ord(WithregTagId), "withreg")  ## block-scoped rebind; auto-killed at block end
+    ScopeA64 = (ord(ScopeTagId), "scope")  ## statement block with a reclaimable stack-slot arena: `(s)` locals declared inside are freed at scope end so sibling scopes reuse the frame bytes
+    ClzA64 = (ord(ClzTagId), "clz")  ## count leading zeros: D = number of leading zero bits of S; `N` is the operand size in bits (32 or 64)
+    RbitA64 = (ord(RbitTagId), "rbit")  ## reverse bit order of S into D (with `clz` this is a count-trailing-zeros); `N` is the operand size in bits
+    RevA64 = (ord(RevTagId), "rev")  ## reverse byte order of S into D; `N` is the operand size in bits (32 or 64)
+    SmulhA64 = (ord(SmulhTagId), "smulh")  ## signed multiply high (top 64 bits of D*S)
+    UmulhA64 = (ord(UmulhTagId), "umulh")  ## unsigned multiply high (top 64 bits of D*S)
     AddwA64 = (ord(AddwTagId), "addw")  ## 32-bit add (W-form, result zero-extended)
     SubwA64 = (ord(SubwTagId), "subw")  ## 32-bit subtract (W-form, result zero-extended)
     MulwA64 = (ord(MulwTagId), "mulw")  ## 32-bit multiply (W-form, result zero-extended)
@@ -245,13 +257,8 @@ type
     LsrA64 = (ord(LsrTagId), "lsr")  ## logical shift right
     AsrA64 = (ord(AsrTagId), "asr")  ## arithmetic shift right
     SvcA64 = (ord(SvcTagId), "svc")  ## supervisor call (system call)
-    AdrA64 = (ord(AdrTagId), "adr")  ## load address of label
-    LdrA64 = (ord(LdrTagId), "ldr")  ## load register
-    StrA64 = (ord(StrTagId), "str")  ## store register
     StpA64 = (ord(StpTagId), "stp")  ## store pair
     LdpA64 = (ord(LdpTagId), "ldp")  ## load pair
-    BA64 = (ord(BTagId), "b")  ## branch (unconditional jump)
-    BlA64 = (ord(BlTagId), "bl")  ## branch with link (function call)
     BeqA64 = (ord(BeqTagId), "beq")  ## branch if equal
     BneA64 = (ord(BneTagId), "bne")  ## branch if not equal
     BltA64 = (ord(BltTagId), "blt")  ## branch if less than (signed)
@@ -262,8 +269,6 @@ type
     BlsA64 = (ord(BlsTagId), "bls")  ## branch if lower or same (unsigned <=)
     BhiA64 = (ord(BhiTagId), "bhi")  ## branch if higher (unsigned >)
     BhsA64 = (ord(BhsTagId), "bhs")  ## branch if higher or same (unsigned >=)
-    CbzA64 = (ord(CbzTagId), "cbz")  ## branch to L if S is zero (no flags read)
-    CbnzA64 = (ord(CbnzTagId), "cbnz")  ## branch to L if S is non-zero (no flags read)
     CseleqA64 = (ord(CseleqTagId), "cseleq")  ## conditional select: D = if equal then S1 else S2
     CselneA64 = (ord(CselneTagId), "cselne")  ## conditional select: D = if not equal then S1 else S2
     CselltA64 = (ord(CselltTagId), "csellt")  ## conditional select: D = if less than (signed) then S1 else S2
@@ -306,11 +311,6 @@ type
     FcvtA64 = (ord(FcvtTagId), "fcvt")  ## fp precision convert (f32<->f64)
     FstpA64 = (ord(FstpTagId), "fstp")  ## fp store pair (pre-indexed)
     FldpA64 = (ord(FldpTagId), "fldp")  ## fp load pair (post-indexed)
-    LdrbA64 = (ord(LdrbTagId), "ldrb")  ## load byte (zero-extend), register offset [B,I]
-    StrbA64 = (ord(StrbTagId), "strb")  ## store low byte, register offset [B,I]
-    ClzA64 = (ord(ClzTagId), "clz")  ## count leading zeros: D = number of leading zero bits of S; `N` is the operand size in bits (32 or 64)
-    RbitA64 = (ord(RbitTagId), "rbit")  ## reverse bit order of S into D (with `clz` this is a count-trailing-zeros); `N` is the operand size in bits
-    RevA64 = (ord(RevTagId), "rev")  ## reverse byte order of S into D; `N` is the operand size in bits (32 or 64)
     FldrqA64 = (ord(FldrqTagId), "fldrq")  ## load a 128-bit q register from memory (`ldr Qt, [Xn, #imm]`, imm a multiple of 16). `D` is spelled as the register's d/s tag — the q width is the instruction's, exactly as `movdqu`'s 16-byte access is on x64
     FstrqA64 = (ord(FstrqTagId), "fstrq")  ## store a 128-bit q register: `(fstrq <mem> <fpreg>)`, operand order as `fstr`
     VfaddA64 = (ord(VfaddTagId), "vfadd")  ## vector fp add, lane-wise (D = A + B): arrangement `.2d` when the registers are d-spelled, `.4s` when s-spelled
@@ -323,14 +323,79 @@ type
     VgreqA64 = (ord(VgreqTagId), "vgreq")  ## valgrind client request: `S` holds the address of the 6-word request block (`request, arg1 .. arg5`), `D` receives valgrind's answer — 0 when nothing intercepted the request, which is what a program NOT running under valgrind always sees. Expands to the fixed instruction sequence valgrind's JIT recognizes (four `ror x12` totalling a full 64-bit rotation, then the `orr x10, x10, x10` marker — architecturally a no-op, hence the zero cost when unobserved), wrapped in the moves that stage x3/x4 around it and stage the answer back out
 
 proc rawTagIsA64Inst*(raw: TagEnum): bool {.inline.} =
-  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, AndTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, RebindTagId, WithregTagId, ScopeTagId, SdivTagId, UdivTagId, SmulhTagId, UmulhTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, AddwTagId, SubwTagId, MulwTagId, Addw3TagId, Subw3TagId, Mulw3TagId, GloadTagId, GstoreTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, SvcTagId, AdrTagId, LdrTagId, StrTagId, StpTagId, LdpTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, CbzTagId, CbnzTagId, CseleqTagId, CselneTagId, CselltTagId, CselleTagId, CselgtTagId, CselgeTagId, CselloTagId, CsellsTagId, CselhiTagId, CselhsTagId, CseteqTagId, CsetneTagId, CsetltTagId, CsetleTagId, CsetgtTagId, CsetgeTagId, CsetloTagId, CsetlsTagId, CsethiTagId, CsethsTagId, LdaxrTagId, StlxrTagId, LdarTagId, StlrTagId, DmbTagId, ClrexTagId, FmovTagId, FaddTagId, FsubTagId, FmulTagId, FdivTagId, FnegTagId, FcmpTagId, FldrTagId, FstrTagId, ScvtfTagId, UcvtfTagId, FcvtzsTagId, FcvtzuTagId, FcvtTagId, FstpTagId, FldpTagId, LdrbTagId, StrbTagId, ClzTagId, RbitTagId, RevTagId, FldrqTagId, FstrqTagId, VfaddTagId, VfsubTagId, VfmulTagId, VfmlaTagId, VdupTagId, VeorTagId, VaddvTagId, VgreqTagId}
+  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, AndTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, AdrTagId, LdrTagId, StrTagId, BTagId, BlTagId, CbzTagId, CbnzTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, LdrbTagId, StrbTagId, RebindTagId, WithregTagId, ScopeTagId, ClzTagId, RbitTagId, RevTagId, SmulhTagId, UmulhTagId, AddwTagId, SubwTagId, MulwTagId, Addw3TagId, Subw3TagId, Mulw3TagId, GloadTagId, GstoreTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, SvcTagId, StpTagId, LdpTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, CseleqTagId, CselneTagId, CselltTagId, CselleTagId, CselgtTagId, CselgeTagId, CselloTagId, CsellsTagId, CselhiTagId, CselhsTagId, CseteqTagId, CsetneTagId, CsetltTagId, CsetleTagId, CsetgtTagId, CsetgeTagId, CsetloTagId, CsetlsTagId, CsethiTagId, CsethsTagId, LdaxrTagId, StlxrTagId, LdarTagId, StlrTagId, DmbTagId, ClrexTagId, FmovTagId, FaddTagId, FsubTagId, FmulTagId, FdivTagId, FnegTagId, FcmpTagId, FldrTagId, FstrTagId, ScvtfTagId, UcvtfTagId, FcvtzsTagId, FcvtzuTagId, FcvtTagId, FstpTagId, FldpTagId, FldrqTagId, FstrqTagId, VfaddTagId, VfsubTagId, VfmulTagId, VfmlaTagId, VdupTagId, VeorTagId, VaddvTagId, VgreqTagId}
 
 type
   MInst* = enum
     NoMInst
+    PrepareM = (ord(PrepareTagId), "prepare")  ## prepare block for function call
+    MovM = (ord(MovTagId), "mov")  ## move instruction
+    LeaM = (ord(LeaTagId), "lea")  ## load effective address
+    AddM = (ord(AddTagId), "add")  ## add instruction
+    SubM = (ord(SubTagId), "sub")  ## subtract instruction
+    MulM = (ord(MulTagId), "mul")  ## unsigned multiply
+    SdivM = (ord(SdivTagId), "sdiv")  ## signed divide
+    UdivM = (ord(UdivTagId), "udiv")  ## unsigned divide
+    Add3M = (ord(Add3TagId), "add3")  ## 3-operand add (D = A + B)
+    Sub3M = (ord(Sub3TagId), "sub3")  ## 3-operand subtract (D = A - B)
+    Mul3M = (ord(Mul3TagId), "mul3")  ## 3-operand multiply (D = A * B)
+    And3M = (ord(And3TagId), "and3")  ## 3-operand bitwise and (D = A and B)
+    Orr3M = (ord(Orr3TagId), "orr3")  ## 3-operand bitwise or (D = A or B)
+    Eor3M = (ord(Eor3TagId), "eor3")  ## 3-operand bitwise xor (D = A xor B)
+    Lsl3M = (ord(Lsl3TagId), "lsl3")  ## 3-operand logical shift left (D = A shl B)
+    Lsr3M = (ord(Lsr3TagId), "lsr3")  ## 3-operand logical shift right (D = A shr B)
+    Asr3M = (ord(Asr3TagId), "asr3")  ## 3-operand arithmetic shift right (D = A sar B)
+    AndM = (ord(AndTagId), "and")  ## bitwise and
+    NegM = (ord(NegTagId), "neg")  ## negate
+    CmpM = (ord(CmpTagId), "cmp")  ## compare
+    CallM = (ord(CallTagId), "call")  ## function call marker inside prepare
+    ExtcallM = (ord(ExtcallTagId), "extcall")  ## external call marker inside prepare
+    RetM = (ord(RetTagId), "ret")  ## return instruction
+    NopM = (ord(NopTagId), "nop")  ## no operation
+    AdrM = (ord(AdrTagId), "adr")  ## load address of label
+    LdrM = (ord(LdrTagId), "ldr")  ## load register
+    StrM = (ord(StrTagId), "str")  ## store register
+    BM = (ord(BTagId), "b")  ## branch (unconditional jump)
+    BlM = (ord(BlTagId), "bl")  ## branch with link (function call)
+    CbzM = (ord(CbzTagId), "cbz")  ## branch to L if S is zero (no flags read)
+    CbnzM = (ord(CbnzTagId), "cbnz")  ## branch to L if S is non-zero (no flags read)
+    LabM = (ord(LabTagId), "lab")  ## label definition
+    IteM = (ord(IteTagId), "ite")  ## if-then-else structure
+    LoopM = (ord(LoopTagId), "loop")  ## loop structure
+    StmtsM = (ord(StmtsTagId), "stmts")  ## statement block
+    JtrueM = (ord(JtrueTagId), "jtrue")  ## set control flow variable(s) to true
+    KillM = (ord(KillTagId), "kill")  ## kill variable
+    LdrbM = (ord(LdrbTagId), "ldrb")  ## load byte (zero-extend), register offset [B,I]
+    StrbM = (ord(StrbTagId), "strb")  ## store low byte, register offset [B,I]
+    ScopeM = (ord(ScopeTagId), "scope")  ## statement block with a reclaimable stack-slot arena: `(s)` locals declared inside are freed at scope end so sibling scopes reuse the frame bytes
+    ClzM = (ord(ClzTagId), "clz")  ## count leading zeros: D = number of leading zero bits of S; `N` is the operand size in bits (32 or 64)
+    RbitM = (ord(RbitTagId), "rbit")  ## reverse bit order of S into D (with `clz` this is a count-trailing-zeros); `N` is the operand size in bits
+    RevM = (ord(RevTagId), "rev")  ## reverse byte order of S into D; `N` is the operand size in bits (32 or 64)
+    BkptM = (ord(BkptTagId), "bkpt")  ## breakpoint / semihosting call; `(bkpt 171)` is `bkpt #0xAB`, the ARM semihosting entry on M-profile (operation in r0, parameter block in r1, result back in r0)
+    BxM = (ord(BxTagId), "bx")  ## branch and exchange to the address in D; `(bx (lr))` is the ordinary Thumb return
+    BlxM = (ord(BlxTagId), "blx")  ## indirect call through the address in D
+    MvnM = (ord(MvnTagId), "mvn")  ## bitwise NOT (D = not S)
+    Bic3M = (ord(Bic3TagId), "bic3")  ## 3-operand bit clear (D = A and not B)
+    Adds3M = (ord(Adds3TagId), "adds3")  ## 3-operand add SETTING the flags — the low half of a 64-bit add
+    Adcs3M = (ord(Adcs3TagId), "adcs3")  ## 3-operand add with carry, setting the flags — the high half of a 64-bit add
+    Subs3M = (ord(Subs3TagId), "subs3")  ## 3-operand subtract setting the flags — the low half of a 64-bit subtract
+    Sbcs3M = (ord(Sbcs3TagId), "sbcs3")  ## 3-operand subtract with borrow, setting the flags — the high half of a 64-bit subtract
+    MlsM = (ord(MlsTagId), "mls")  ## multiply-subtract (D = C - A*B); ARMv7-M has no modulo, so `a mod b` is `sdiv` then `mls`
+    UmullM = (ord(UmullTagId), "umull")  ## unsigned 64-bit product of A and B into the register pair L (low) / H (high)
+    SmullM = (ord(SmullTagId), "smull")  ## signed 64-bit product of A and B into the register pair L (low) / H (high)
+    TstM = (ord(TstTagId), "tst")  ## set the flags from A and B, discarding the result
+    UxtbM = (ord(UxtbTagId), "uxtb")  ## zero-extend the low byte of S into D
+    SxtbM = (ord(SxtbTagId), "sxtb")  ## sign-extend the low byte of S into D
+    UxthM = (ord(UxthTagId), "uxth")  ## zero-extend the low halfword of S into D
+    SxthM = (ord(SxthTagId), "sxth")  ## sign-extend the low halfword of S into D
+    LdrhM = (ord(LdrhTagId), "ldrh")  ## load an unsigned halfword
+    StrhM = (ord(StrhTagId), "strh")  ## store a halfword
+    LdrsbM = (ord(LdrsbTagId), "ldrsb")  ## load a byte, sign-extended
+    LdrshM = (ord(LdrshTagId), "ldrsh")  ## load a halfword, sign-extended
+    WfiM = (ord(WfiTagId), "wfi")  ## wait for interrupt — the idle trap a bare-metal image ends on
 
 proc rawTagIsMInst*(raw: TagEnum): bool {.inline.} =
-  false
+  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, AndTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, AdrTagId, LdrTagId, StrTagId, BTagId, BlTagId, CbzTagId, CbnzTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, LdrbTagId, StrbTagId, ScopeTagId, ClzTagId, RbitTagId, RevTagId, BkptTagId, BxTagId, BlxTagId, MvnTagId, Bic3TagId, Adds3TagId, Adcs3TagId, Subs3TagId, Sbcs3TagId, MlsTagId, UmullTagId, SmullTagId, TstTagId, UxtbTagId, SxtbTagId, UxthTagId, SxthTagId, LdrhTagId, StrhTagId, LdrsbTagId, LdrshTagId, WfiTagId}
 
 type
   NifasmType* = enum

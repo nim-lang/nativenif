@@ -6,7 +6,7 @@ import tags, model, tagconv, tagpool
 import buffers, relocs, x86, arm64, elf, macho, pe
 from thumb2 import nil   # qualified: Nim conflates `emitBL` (arm64) with `emitBl`
                          # (thumb2), and `Register` would clash three ways
-from elf32 import writeFirmware  # qualified: `elf32` repeats ET_EXEC/PT_LOAD/PF_*
+from elf32 import writeFirmware, FlashBase  # qualified: `elf32` repeats ET_EXEC/PT_LOAD/PF_*
                                  # under 32-bit types, which would shadow `elf`'s
 import dwarf, tracetable
 import sem, slots
@@ -502,6 +502,13 @@ type
     thisModule: string  # The module being assembled (symbol suffix of the main file);
                         # a `name.0.<thisModule>` reference is local, not foreign
     regBindings: Table[x86.Register, string]  # Maps registers to variable names they're bound to (x64 only)
+    mRegBindings: Table[thumb2.Register, string]
+                        # Cortex-M counterpart of `regBindings`: which Thumb register
+                        # currently hosts a named local, so a raw `(r4)` use of a bound
+                        # register is rejected as the silent clobber it is.
+    clobberedM: set[thumb2.Register]
+                        # Cortex-M counterpart of `clobberedA64`: caller-saved registers
+                        # a call destroyed, so reading one before rewriting it is an error.
     a64RegBindings: Table[arm64.Register, string]  # AArch64 counterpart of `regBindings`:
                         # which physical x-register currently hosts which variable name. A
                         # raw `(xN)` use of a bound register is rejected (use the name);
@@ -1778,7 +1785,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
       # with any pointer, never a sized integer). See `compatible`'s NilT arm.
       result.kind = okImm
       result.immVal = 0
-      result.typ = Type(kind: NilT)
+      result.typ = Type(kind: TypeKind.NilT)
       inc n
     elif t == DotTagId:
       # (dot <base> <fieldname>) - similar to x64
@@ -4081,6 +4088,693 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of NoA64Inst:
     error("Invalid ARM64 instruction", start)
 
+# ── Cortex-M (ARMv7E-M / Thumb-2) instruction selection ─────────────────────
+#
+# The counterpart of `genInstA64`, against `thumb2.nim`'s encoders. Two things
+# differ from the AArch64 half and drive most of the shape below:
+#
+#  * the word is 4 bytes, so a "register" is 32 bits and `RegisterT` is declared
+#    at 32 — a `(i 64)` local genuinely does not fit one and is rejected by name
+#    rather than silently truncated (see M4 in doc/cortex_m.md);
+#  * Cortex-M reuses the `(r0)`..`(r12)`/`(sp)`/`(lr)` spellings that already
+#    exist for the other targets, so `rawTagIsMReg` — not the x86 or a64
+#    classifier — is what decides whether a tag is a register HERE.
+
+proc tagToRegisterM(t: TagEnum; n: Cursor): thumb2.Register =
+  let regTag = tagToMReg(t)
+  result =
+    case regTag
+    of R0MR: thumb2.R0
+    of R1MR: thumb2.R1
+    of R2MR: thumb2.R2
+    of R3MR: thumb2.R3
+    of R4MR: thumb2.R4
+    of R5MR: thumb2.R5
+    of R6MR: thumb2.R6
+    of R7MR: thumb2.R7
+    of R8MR: thumb2.R8
+    of R9MR: thumb2.R9
+    of R10MR: thumb2.R10
+    of R11MR: thumb2.R11
+    of R12MR: thumb2.R12
+    of SpMR: thumb2.SP
+    of LrMR: thumb2.LR
+    of NoMReg:
+      error("Expected a Cortex-M register", n)
+      thumb2.R0
+
+proc parseRegisterM(n: var Cursor): thumb2.Register =
+  if n.kind != TagLit or not rawTagIsMReg(n.tag):
+    error("Expected a Cortex-M register", n)
+  result = tagToRegisterM(n.tag, n)
+  inc n
+
+type
+  OperandM = object
+    kind: OperandKind
+    reg: thumb2.Register
+    typ: Type
+    immVal: int64
+    mem: thumb2.MemoryOperand
+    argName: SymId
+    label: LabelId
+    gvarSym: Symbol       ## non-nil if the operand is a global's (.bss) address
+
+proc mRegType(): Type {.inline.} =
+  ## The "any type that fits a register" type, at the Cortex-M width. 32, not 64:
+  ## `compatible` uses `regBits div 8` as the size bound, so declaring 64 here
+  ## would let a `(i 64)` value bind to a 32-bit register unnoticed.
+  Type(kind: RegisterT, regBits: 32)
+
+proc checkRegWidthM(t: Type; what: string; n: Cursor) =
+  ## Reject a value too wide for one Thumb register BY NAME. 64-bit scalars are
+  ## the expected case here and they are not an error in the input — they are a
+  ## backend feature that does not exist yet (M4: register pairs, adds/adcs).
+  ## Truncating them silently is the one outcome that must not happen.
+  if t == nil: return
+  if t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.FloatT} and t.bits > 32:
+    error("Cortex-M: " & what & " is " & $t.bits & " bits; 64-bit scalars need " &
+          "register-pair lowering, which is not implemented yet (see M4 in " &
+          "doc/cortex_m.md)", n)
+  if t.kind == TypeKind.FloatT:
+    error("Cortex-M: " & what & " is a float; the FPv4-SP path is not implemented " &
+          "yet (see M5 in doc/cortex_m.md)", n)
+
+proc parseOperandM(n: var Cursor; ctx: var GenContext): OperandM =
+  if n.kind == TagLit:
+    let t = n.tag
+    if rawTagIsMReg(t):
+      result.reg = parseRegisterM(n)
+      result.typ = mRegType()
+      # A raw use of a register that currently hosts a named local is a code
+      # generator bug — it silently clobbers the value. Spell the name instead.
+      if result.reg in ctx.mRegBindings:
+        error("Register " & $result.reg & " is bound to variable '" &
+              ctx.mRegBindings[result.reg] & "', use the variable name instead", n)
+    elif t == NilTagId:
+      result.kind = okImm
+      result.immVal = 0
+      result.typ = Type(kind: TypeKind.NilT)
+      inc n
+    elif t == SsizeTagId:
+      # `(ssize)` / `(ssize N)` — the frame size, patched once the frame is known.
+      result.kind = okSsize
+      result.typ = Type(kind: TypeKind.IntLitT, bits: 32)
+      into n:
+        if n.hasMore and n.kind == IntLit:
+          result.immVal = getInt(n)
+          inc n
+    elif t == MemTagId:
+      # `(mem <base> [offset | field-symbol])`. `into` BOUNDS the cursor to this
+      # node's children — without it the optional-offset check below reads into
+      # the following sibling, and a register-bound name after a `(mem base)`
+      # store destination gets eaten as if it were an offset. Same reasoning as
+      # the a64 and x64 handlers.
+      into n:
+        let base = parseOperandM(n, ctx)
+        if base.kind == okMem:
+          # A stack variable used as a base: its slot IS the address.
+          result.mem = base.mem
+        elif base.kind != okReg:
+          error("(mem ...) base must be a register", n)
+        else:
+          result.mem = thumb2.MemoryOperand(base: base.reg, offset: 0)
+        if n.hasMore and n.kind == IntLit:
+          result.mem.offset += int32(getInt(n))
+          inc n
+        elif n.hasMore and n.kind == Symbol:
+          let fname = getSym(n)
+          let fsym = lookupWithAutoImport(ctx, ctx.scope, fname, n)
+          if fsym == nil: error("Unknown symbol in (mem ...): " & fname, n)
+          result.mem.offset += int32(fsym.offset)
+          inc n
+        result.kind = okMem
+        result.typ =
+          if base.kind == okMem and base.typ != nil and
+             base.typ.kind == TypeKind.StackOffT:
+            base.typ.offType
+          elif base.typ != nil and base.typ.kind in {TypeKind.PtrT, TypeKind.AptrT}:
+            resolvedBase(base.typ, ctx, n)
+          else: mRegType()
+        while n.hasMore: skip n
+      return
+    else:
+      error("Unsupported Cortex-M operand", n)
+  elif n.kind == IntLit:
+    result.kind = okImm
+    result.immVal = getInt(n)
+    result.typ = Type(kind: IntLitT, bits: 32, litVal: result.immVal)
+    inc n
+  elif n.kind == Symbol:
+    let name = getSym(n)
+    let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+    if sym == nil: error("Unknown symbol: " & name, n)
+    case sym.kind
+    of skVar, skParam:
+      if sym.typ.isOnStack:
+        result.kind = okMem
+        result.mem = thumb2.MemoryOperand(base: thumb2.SP, offset: int32(sym.offset))
+        result.typ = sym.typ
+      elif sym.reg != InvalidTagId:
+        result.reg = tagToRegisterM(sym.reg, n)
+        result.typ = sym.typ
+        if result.reg in ctx.clobberedM:
+          error("Variable '" & name & "' lives in " & $result.reg &
+                ", which a call clobbered; its value is gone", n)
+      else:
+        error("Variable has no location: " & name, n)
+      inc n
+    of skLabel:
+      result.reg = thumb2.R0
+      result.label = LabelId(sym.offset)
+      result.typ = Type(kind: TypeKind.UIntT, bits: 32)
+      inc n
+    of skRodata, skProc:
+      if sym.offset == -1:
+        let labId = ctx.buf.createLabel()
+        sym.offset = int(labId)
+        result.label = labId
+      else:
+        result.label = LabelId(sym.offset)
+      result.reg = thumb2.R0
+      result.typ = Type(kind: TypeKind.UIntT, bits: 32)
+      inc n
+    of skGvar:
+      result.gvarSym = sym
+      result.reg = thumb2.R0
+      result.typ = Type(kind: TypeKind.UIntT, bits: 32)
+      inc n
+    of skTvar:
+      error("Cortex-M has no thread-local storage: '" & name & "'", n)
+    else:
+      error("Cannot use symbol '" & name & "' as an operand", n)
+  else:
+    error("Expected operand", n)
+
+proc parseDestM(n: var Cursor; ctx: var GenContext): OperandM =
+  if n.kind == TagLit and rawTagIsMReg(n.tag):
+    result.reg = parseRegisterM(n)
+    result.typ = mRegType()
+    if result.reg in ctx.mRegBindings:
+      error("Register " & $result.reg & " is bound to variable '" &
+            ctx.mRegBindings[result.reg] & "', use the variable name instead", n)
+  elif n.kind == TagLit and n.tag == MemTagId:
+    let op = parseOperandM(n, ctx)
+    if op.kind != okMem: error("Expected memory destination", n)
+    result = op
+  elif n.kind == Symbol:
+    let name = getSym(n)
+    let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+    if sym == nil: error("Unknown symbol: " & name, n)
+    if sym.kind in {skVar, skParam}:
+      if sym.typ.isOnStack:
+        result.kind = okMem
+        result.mem = thumb2.MemoryOperand(base: thumb2.SP, offset: int32(sym.offset))
+        result.typ = sym.typ
+      elif sym.reg != InvalidTagId:
+        result.reg = tagToRegisterM(sym.reg, n)
+        result.typ = sym.typ
+        ctx.clobberedM.excl(result.reg)   # writing a fresh value un-clobbers it
+      else:
+        error("Variable has no location: " & name, n)
+      inc n
+    else:
+      error("Expected variable or register as destination", n)
+  else:
+    error("Expected destination", n)
+
+proc regOfM(op: OperandM; what: string; n: Cursor): thumb2.Register =
+  if op.kind != okReg: error(what & " must be a register", n)
+  op.reg
+
+proc condOfFlagM(flag: X64Flag; n: Cursor): thumb2.Condition =
+  ## The Thumb condition a `(zf)`/`(nz)`/… flag tag selects. asm-NIF spells
+  ## conditions with the x86 flag vocabulary on every target (AArch64 does the
+  ## same); ARM's flags are N/Z/C/V, and the mapping is exact for the four.
+  case flag
+  of ZfO: thumb2.CondEQ
+  of NzO: thumb2.CondNE
+  of CfO: thumb2.CondHS      # C set == unsigned higher-or-same
+  of NcO: thumb2.CondLO
+  of SfO: thumb2.CondMI      # N set == negative
+  of NsO: thumb2.CondPL
+  of OfO: thumb2.CondVS
+  of NoO: thumb2.CondVC
+  else:
+    error("Cortex-M: unsupported flag condition " & $flag, n)
+    thumb2.CondEQ
+
+proc emitBranchM(ctx: var GenContext; cond: thumb2.Condition; target: LabelId) =
+  if cond == thumb2.CondAL: thumb2.emitB(ctx.buf, target)
+  else: thumb2.emitBcond(ctx.buf, cond, target)
+
+proc loadToRegM(ctx: var GenContext; dest: thumb2.Register; op: OperandM; n: Cursor) =
+  ## Materialize `op` into `dest`. The one place that decides how each operand
+  ## KIND reaches a register, so no arm has to repeat it.
+  case op.kind
+  of okReg:
+    if op.reg != dest: thumb2.emitMovReg(ctx.buf.data, dest, op.reg)
+  of okImm:
+    thumb2.emitMovImm32(ctx.buf.data, dest, uint32(op.immVal))
+  of okSsize:
+    # `(ssize)` is only meaningful inside a proc prologue/epilogue, which the
+    # Cortex-M frame layout does not build yet (M2c-4). Erroring here keeps the
+    # gap visible rather than emitting a frame size of zero.
+    error("Cortex-M: (ssize) needs the AAPCS32 frame layout, which is not " &
+          "implemented yet (see doc/cortex_m.md)", n)
+  of okMem:
+    thumb2.emitLdr(ctx.buf.data, dest, op.mem.base, op.mem.offset)
+  of okLabel:
+    thumb2.emitMovwMovtAbs(ctx.buf, dest, op.label)
+  else:
+    error("Cortex-M: operand cannot be loaded into a register", n)
+
+proc storeFromRegM(ctx: var GenContext; src: thumb2.Register; dst: OperandM; n: Cursor) =
+  if dst.kind != okMem: error("Cortex-M: expected a memory destination", n)
+  thumb2.emitStr(ctx.buf.data, src, dst.mem.base, dst.mem.offset)
+
+proc scratchM(ctx: GenContext; avoid: varargs[thumb2.Register]): thumb2.Register =
+  ## A register the selector may use as a transient. r12 (IP) is reserved for
+  ## exactly this by AAPCS32 — it is call-clobbered and no local is ever bound to
+  ## it — so a bridge never has to spill anything. Falls back to lr only if the
+  ## caller is already using IP for one of the operands.
+  result = thumb2.IP
+  for a in avoid:
+    if a == result: result = thumb2.LR
+  discard ctx
+
+proc genStmtM(n: var Cursor; ctx: var GenContext)
+
+proc genIteM(n: var Cursor; ctx: var GenContext) =
+  inc n
+  let lElse = ctx.buf.createLabel()
+  let lEnd = ctx.buf.createLabel()
+  let oldClobbered = ctx.clobberedM
+  if n.kind == Symbol:
+    let name = getSym(n)
+    let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+    if sym == nil or sym.kind != skCfvar:
+      error("Expected cfvar in ite condition: " & name, n)
+    if sym.used: error("Control flow variable '" & name & "' used more than once", n)
+    sym.used = true
+    inc n
+    thumb2.emitB(ctx.buf, lElse)
+    ctx.buf.defineLabel(LabelId(sym.offset))
+  elif n.kind == TagLit:
+    let flagTag = tagToX64Flag(n.tag)
+    inc n
+    # Branch to the ELSE arm when the condition does NOT hold, so the then-arm
+    # falls through.
+    ctx.emitBranchM(thumb2.invert(condOfFlagM(flagTag, n)), lElse)
+  else:
+    error("Expected cfvar or flag condition in ite", n)
+  genStmtM(n, ctx)
+  let thenClobbered = ctx.clobberedM
+  thumb2.emitB(ctx.buf, lEnd)
+  ctx.clobberedM = oldClobbered
+  ctx.buf.defineLabel(lElse)
+  genStmtM(n, ctx)
+  let elseClobbered = ctx.clobberedM
+  ctx.buf.defineLabel(lEnd)
+  # A register clobbered on EITHER branch is clobbered after the merge.
+  ctx.clobberedM = thenClobbered + elseClobbered
+
+proc genLoopM(n: var Cursor; ctx: var GenContext) =
+  inc n
+  # The only form arkham emits: `(loop (stmts …))`, whose back-edge nifasm adds
+  # here. The body carries a FORWARD branch to a break label defined after the
+  # loop, so no backward branch ever appears in the input.
+  if atTag(n, StmtsTagId):
+    let lStart = ctx.buf.createLabel()
+    ctx.buf.defineLabel(lStart)
+    genStmtM(n, ctx)
+    thumb2.emitB(ctx.buf, lStart)
+    return
+  error("Cortex-M: only the `(loop (stmts …))` form is supported", n)
+
+proc genJtrueM(n: var Cursor; ctx: var GenContext) =
+  ## `(jtrue <cfvar>… <flag>)` — branch to the cfvar's label when the flag holds.
+  inc n
+  var target = LabelId(-1)
+  while n.hasMore and n.kind == Symbol:
+    let name = getSym(n)
+    let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+    if sym == nil or sym.kind != skCfvar: error("Expected cfvar in jtrue: " & name, n)
+    if int(target) == -1: target = LabelId(sym.offset)
+    sym.used = true
+    inc n
+  if int(target) == -1: error("jtrue needs a cfvar", n)
+  if n.kind != TagLit: error("Expected a flag condition in jtrue", n)
+  let flagTag = tagToX64Flag(n.tag)
+  inc n
+  ctx.emitBranchM(condOfFlagM(flagTag, n), target)
+
+proc genInstM(n: var Cursor; ctx: var GenContext) =
+  if n.kind != TagLit: error("Expected instruction", n)
+  let instTag = tagToMInst(n.tag)
+  let start = n
+
+  case tagToNifasmDecl(n.tag)
+  of CfvarD:
+    inc n
+    if n.kind != SymbolDef: error("Expected cfvar name", n)
+    let name = symName(n)
+    inc n
+    let cfvarLabel = ctx.buf.createLabel()
+    ctx.scope.define(Symbol(name: ctx.symIdOf(name), kind: skCfvar,
+                            typ: Type(kind: TypeKind.BoolT),
+                            offset: int(cfvarLabel), used: false))
+    return
+  of VarD:
+    inc n
+    if n.kind != SymbolDef: error("Expected var name", n)
+    let name = symName(n)
+    inc n
+    var reg = InvalidTagId
+    var onStack = false
+    var slotAlign = asmWordSize()
+    if n.kind == TagLit:
+      let locTag = n.tag
+      if rawTagIsMReg(locTag):
+        let r = tagToRegisterM(locTag, n)
+        if r == thumb2.IP:
+          error("Cannot bind a variable to r12 (reserved as the AAPCS32 IP scratch)", n)
+        if r == thumb2.SP or r == thumb2.LR:
+          error("Cannot bind a variable to " & $r, n)
+        reg = locTag
+        inc n
+      elif locTag == STagId:
+        onStack = true
+        slotAlign = parseSlotAlign(n)
+      else:
+        error("Expected location", n)
+    else:
+      error("Expected location", n)
+    let baseTyp = parseType(n, ctx.scope, ctx)
+    let sym = Symbol(name: ctx.symIdOf(name), kind: skVar)
+    if onStack:
+      sym.typ = Type(kind: TypeKind.StackOffT, offType: baseTyp)
+      sym.offset = ctx.slots.allocSlotUp(baseTyp, slotAlign)
+    else:
+      checkRegWidthM(baseTyp, "variable '" & name & "'", n)
+      sym.typ = baseTyp
+      sym.reg = reg
+      let targetReg = tagToRegisterM(reg, n)
+      if targetReg in ctx.mRegBindings:
+        error("Register " & $targetReg & " is already bound to variable '" &
+              ctx.mRegBindings[targetReg] & "', kill it first before reusing", n)
+      ctx.mRegBindings[targetReg] = name
+      ctx.clobberedM.excl(targetReg)
+    ctx.scope.define(sym)
+    return
+  of NoDecl:
+    discard "handled by `case instTag` below"
+  else:
+    raiseAssert("Unhandled declaration tag in Cortex-M selector")
+
+  # An overflowing mnemonic's id is a leading child; skip it once so every arm's
+  # own `inc n` still lands on operand 0. Same step as genInstX64/genInstA64.
+  if isEscapedTag(n): inc n
+
+  template bin3(emitter: untyped) =
+    ## `(op3 D A B)` → `D = A op B`, with B folded through a scratch when it is
+    ## not already a register (Thumb-2's 3-operand forms take no immediate).
+    inc n
+    let d = parseDestM(n, ctx)
+    let a = parseOperandM(n, ctx)
+    let b = parseOperandM(n, ctx)
+    let dr = regOfM(d, "destination", start)
+    let ar = regOfM(a, "first source", start)
+    var br: thumb2.Register
+    if b.kind == okReg: br = b.reg
+    else:
+      br = ctx.scratchM(dr, ar)
+      ctx.loadToRegM(br, b, start)
+    emitter(ctx.buf.data, dr, ar, br)
+
+  template bin2(emitter: untyped) =
+    ## `(op D S)` → `D = D op S`, the two-operand spelling. Thumb-2 is a
+    ## three-operand ISA, so this is `op3 D, D, S`.
+    inc n
+    let d = parseDestM(n, ctx)
+    let sOp = parseOperandM(n, ctx)
+    let dr = regOfM(d, "destination", start)
+    var sr: thumb2.Register
+    if sOp.kind == okReg: sr = sOp.reg
+    else:
+      sr = ctx.scratchM(dr)
+      ctx.loadToRegM(sr, sOp, start)
+    emitter(ctx.buf.data, dr, dr, sr)
+
+  template unary(emitter: untyped) =
+    inc n
+    let d = parseDestM(n, ctx)
+    let sOp = parseOperandM(n, ctx)
+    let dr = regOfM(d, "destination", start)
+    var sr: thumb2.Register
+    if sOp.kind == okReg: sr = sOp.reg
+    else:
+      sr = ctx.scratchM(dr)
+      ctx.loadToRegM(sr, sOp, start)
+    emitter(ctx.buf.data, dr, sr)
+
+  template loadStore(width: thumb2.MemWidth; loading: bool; signExt: bool) =
+    ## The template parameters are deliberately NOT called `isLoad`/`signed`:
+    ## those are the encoder's own parameter names, and a template argument of
+    ## the same name substitutes into the named-argument syntax below, turning
+    ## `isLoad = true` into `true = true`.
+    inc n
+    if loading:
+      let d = parseDestM(n, ctx)
+      let sOp = parseOperandM(n, ctx)
+      if sOp.kind != okMem: error("load source must be memory", start)
+      thumb2.emitLoadStoreImm(ctx.buf.data, regOfM(d, "destination", start),
+                              sOp.mem.base, sOp.mem.offset, width,
+                              isLoad = true, signed = signExt)
+    else:
+      let d = parseDestM(n, ctx)
+      let sOp = parseOperandM(n, ctx)
+      if d.kind != okMem: error("store destination must be memory", start)
+      var sr: thumb2.Register
+      if sOp.kind == okReg: sr = sOp.reg
+      else:
+        sr = ctx.scratchM(d.mem.base)
+        ctx.loadToRegM(sr, sOp, start)
+      thumb2.emitLoadStoreImm(ctx.buf.data, sr, d.mem.base, d.mem.offset, width,
+                              isLoad = false, signed = false)
+
+  case instTag
+  of StmtsM:
+    loopInto n:
+      genInstM(n, ctx)
+  of ScopeM:
+    let savedStackSize = ctx.slots.stackSize
+    loopInto n:
+      genInstM(n, ctx)
+    ctx.slots.maxStackSize = max(ctx.slots.maxStackSize, ctx.slots.stackSize)
+    ctx.slots.stackSize = savedStackSize
+  of LabM:
+    inc n
+    if n.kind != SymbolDef: error("Expected label name", n)
+    let name = symName(n)
+    let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+    if sym == nil:
+      let labId = ctx.buf.createLabel()
+      ctx.scope.define(Symbol(name: ctx.symIdOf(name), kind: skLabel, offset: int(labId)))
+      ctx.buf.defineLabel(labId)
+      ctx.definedLabels.incl int(labId)
+    elif sym.kind == skLabel:
+      if sym.offset == -1:
+        let labId = ctx.buf.createLabel()
+        sym.offset = int(labId)
+        ctx.buf.defineLabel(labId)
+        ctx.definedLabels.incl int(labId)
+      else:
+        ctx.buf.defineLabel(LabelId(sym.offset))
+        ctx.definedLabels.incl sym.offset
+    else:
+      error("Symbol is not a label", n)
+    inc n
+  of MovM:
+    inc n
+    let dest = parseDestM(n, ctx)
+    let op = parseOperandM(n, ctx)
+    if not movTypeOk(dest.kind, dest.typ, op.kind, op.typ):
+      error("Type mismatch in mov: expected " & $dest.typ & ", got " & $op.typ, start)
+    checkPtrStore(dest.typ, op.kind, op.typ, start)
+    checkRegWidthM(dest.typ, "mov destination", start)
+    if dest.kind == okMem:
+      var sr: thumb2.Register
+      if op.kind == okReg: sr = op.reg
+      else:
+        sr = ctx.scratchM(dest.mem.base)
+        ctx.loadToRegM(sr, op, start)
+      ctx.storeFromRegM(sr, dest, start)
+    else:
+      ctx.loadToRegM(regOfM(dest, "mov destination", start), op, start)
+  of AdrM, LeaM:
+    inc n
+    let dest = parseDestM(n, ctx)
+    let op = parseOperandM(n, ctx)
+    let dr = regOfM(dest, "adr destination", start)
+    if op.kind == okMem:
+      # `(lea D (mem base off))` — the ADDRESS, not the contents.
+      if op.mem.base != dr: thumb2.emitMovReg(ctx.buf.data, dr, op.mem.base)
+      if op.mem.offset != 0:
+        thumb2.emitAddImm(ctx.buf.data, dr, dr, uint32(op.mem.offset))
+    elif op.gvarSym != nil:
+      error("Cortex-M: taking the address of a global is not implemented yet", start)
+    else:
+      # A code/rodata label. MOVW+MOVT carries the ABSOLUTE address, so unlike
+      # ADR it has no ±4 KB reach limit — a firmware image's load address is
+      # fixed at link time, so there is nothing to be relative to.
+      thumb2.emitMovwMovtAbs(ctx.buf, dr, op.label)
+  of CmpM:
+    inc n
+    let a = parseOperandM(n, ctx)
+    let b = parseOperandM(n, ctx)
+    let ar = regOfM(a, "cmp first operand", start)
+    if b.kind == okImm and b.immVal >= 0 and thumb2.isModifiedImm(uint32(b.immVal)):
+      thumb2.emitCmpImm(ctx.buf.data, ar, uint32(b.immVal))
+    else:
+      var br: thumb2.Register
+      if b.kind == okReg: br = b.reg
+      else:
+        br = ctx.scratchM(ar)
+        ctx.loadToRegM(br, b, start)
+      thumb2.emitCmpReg(ctx.buf.data, ar, br)
+  of TstM:
+    inc n
+    let a = parseOperandM(n, ctx)
+    let b = parseOperandM(n, ctx)
+    let ar = regOfM(a, "tst first operand", start)
+    var br: thumb2.Register
+    if b.kind == okReg: br = b.reg
+    else:
+      br = ctx.scratchM(ar)
+      ctx.loadToRegM(br, b, start)
+    thumb2.emitTstReg(ctx.buf.data, ar, br)
+  of AddM: bin2(thumb2.emitAdd3)
+  of SubM: bin2(thumb2.emitSub3)
+  of MulM: bin2(thumb2.emitMul)
+  of AndM: bin2(thumb2.emitAnd3)
+  of Add3M: bin3(thumb2.emitAdd3)
+  of Sub3M: bin3(thumb2.emitSub3)
+  of Mul3M: bin3(thumb2.emitMul)
+  of And3M: bin3(thumb2.emitAnd3)
+  of Orr3M: bin3(thumb2.emitOrr3)
+  of Eor3M: bin3(thumb2.emitEor3)
+  of Bic3M: bin3(thumb2.emitBic3)
+  of Lsl3M: bin3(thumb2.emitLsl)
+  of Lsr3M: bin3(thumb2.emitLsr)
+  of Asr3M: bin3(thumb2.emitAsr)
+  of Adds3M: bin3(thumb2.emitAddsCarry)
+  of Adcs3M: bin3(thumb2.emitAdcs)
+  of Subs3M: bin3(thumb2.emitSubsCarry)
+  of Sbcs3M: bin3(thumb2.emitSbcs)
+  of SdivM: bin3(thumb2.emitSdiv)
+  of UdivM: bin3(thumb2.emitUdiv)
+  of NegM: unary(thumb2.emitNeg)
+  of MvnM: unary(thumb2.emitMvn)
+  of ClzM: unary(thumb2.emitClz)
+  of RbitM: unary(thumb2.emitRbit)
+  of RevM: unary(thumb2.emitRev)
+  of UxtbM: unary(thumb2.emitUxtb)
+  of SxtbM: unary(thumb2.emitSxtb)
+  of UxthM: unary(thumb2.emitUxth)
+  of SxthM: unary(thumb2.emitSxth)
+  of MlsM:
+    # `(mls D A B C)` → D = C - A*B. The remainder half of a division.
+    inc n
+    let d = parseDestM(n, ctx)
+    let a = parseOperandM(n, ctx)
+    let b = parseOperandM(n, ctx)
+    let c = parseOperandM(n, ctx)
+    thumb2.emitMls(ctx.buf.data, regOfM(d, "destination", start),
+                   regOfM(a, "operand A", start), regOfM(b, "operand B", start),
+                   regOfM(c, "operand C", start))
+  of UmullM, SmullM:
+    # `(umull L H A B)` → the 64-bit product into the register PAIR L (low) / H (high).
+    inc n
+    let lo = parseDestM(n, ctx)
+    let hi = parseDestM(n, ctx)
+    let a = parseOperandM(n, ctx)
+    let b = parseOperandM(n, ctx)
+    let lr0 = regOfM(lo, "low destination", start)
+    let hr = regOfM(hi, "high destination", start)
+    if lr0 == hr: error("umull/smull need two DISTINCT destination registers", start)
+    if instTag == UmullM:
+      thumb2.emitUmull(ctx.buf.data, lr0, hr, regOfM(a, "operand A", start),
+                       regOfM(b, "operand B", start))
+    else:
+      thumb2.emitSmull(ctx.buf.data, lr0, hr, regOfM(a, "operand A", start),
+                       regOfM(b, "operand B", start))
+  of LdrM:   loadStore(thumb2.MemWord, true, false)
+  of StrM:   loadStore(thumb2.MemWord, false, false)
+  of LdrbM:  loadStore(thumb2.MemByte, true, false)
+  of StrbM:  loadStore(thumb2.MemByte, false, false)
+  of LdrhM:  loadStore(thumb2.MemHalf, true, false)
+  of StrhM:  loadStore(thumb2.MemHalf, false, false)
+  of LdrsbM: loadStore(thumb2.MemByte, true, true)
+  of LdrshM: loadStore(thumb2.MemHalf, true, true)
+  of IteM:  genIteM(n, ctx)
+  of LoopM: genLoopM(n, ctx)
+  of JtrueM: genJtrueM(n, ctx)
+  of BM, BlM:
+    inc n
+    if n.kind != Symbol: error("b/bl needs a label or proc symbol", start)
+    let op = parseOperandM(n, ctx)
+    if instTag == BM: thumb2.emitB(ctx.buf, op.label)
+    else: thumb2.emitBl(ctx.buf, op.label)
+  of CbzM, CbnzM:
+    # No CBZ/CBNZ encoder: their reach is +4..+126 bytes FORWARD only, which a
+    # relocation pass cannot honour once anything moves. `cmp #0` + `b<cond>` is
+    # two bytes larger and always correct.
+    inc n
+    let rOp = parseOperandM(n, ctx)
+    let rr = regOfM(rOp, "cbz operand", start)
+    if n.kind != Symbol: error("cbz/cbnz needs a label", start)
+    let lbl = parseOperandM(n, ctx)
+    thumb2.emitCmpImm(ctx.buf.data, rr, 0)
+    ctx.emitBranchM((if instTag == CbzM: thumb2.CondEQ else: thumb2.CondNE), lbl.label)
+  of BxM:
+    inc n
+    thumb2.emitBx(ctx.buf.data, parseRegisterM(n))
+  of BlxM:
+    inc n
+    thumb2.emitBlx(ctx.buf.data, parseRegisterM(n))
+  of RetM:
+    inc n
+    thumb2.emitRet(ctx.buf.data)
+  of NopM:
+    inc n
+    thumb2.emitNop(ctx.buf.data)
+  of WfiM:
+    inc n
+    thumb2.emitWfi(ctx.buf.data)
+  of BkptM:
+    inc n
+    if n.kind != IntLit: error("bkpt needs an immediate", start)
+    thumb2.emitBkpt(ctx.buf.data, uint8(getInt(n) and 0xFF))
+    inc n
+  of KillM:
+    # `(kill name…)` — end a register binding so the register may be rebound.
+    inc n
+    while n.hasMore and n.kind == Symbol:
+      let name = getSym(n)
+      let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
+      if sym != nil and sym.reg != InvalidTagId:
+        ctx.mRegBindings.del(tagToRegisterM(sym.reg, n))
+      inc n
+  of NoMInst:
+    error("Cortex-M: unsupported instruction", start)
+  else:
+    error("Cortex-M: instruction '" & $instTag & "' is not implemented yet " &
+          "(see doc/cortex_m.md)", start)
+
+proc genStmtM(n: var Cursor; ctx: var GenContext) =
+  genInstM(n, ctx)
+
 proc genInstDispatch(n: var Cursor; ctx: var GenContext) {.inline.} =
   case ctx.arch
   of Arch.X64, Arch.WinX64:
@@ -4088,13 +4782,7 @@ proc genInstDispatch(n: var Cursor; ctx: var GenContext) {.inline.} =
   of Arch.A64, Arch.WinA64, Arch.LinuxA64:
     genInstA64(n, ctx)
   of Arch.CortexM:
-    # The Thumb-2 ENCODER (`thumb2.nim`) and the firmware image writer
-    # (`elf32.nim`) are done and tested; what is missing is this middle layer —
-    # the typed operand model (`parseDestM`/`parseOperandM`), the register
-    # binding table and the per-mnemonic arms, i.e. the Cortex-M counterpart of
-    # `genInstA64`. Erroring by NAME beats a silent wrong encoding.
-    error("nifasm: the Cortex-M instruction selector is not implemented yet " &
-          "(the Thumb-2 encoder and ELF32 writer are; see doc/cortex_m.md)", n)
+    genInstM(n, ctx)
 
 proc genInst(n: var Cursor; ctx: var GenContext) =
   let cfiBefore = ctx.buf.data.len
@@ -4481,7 +5169,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
       # with any pointer, never a sized integer). See `compatible`'s NilT arm.
       result.kind = okImm
       result.immVal = 0
-      result.typ = Type(kind: NilT)
+      result.typ = Type(kind: TypeKind.NilT)
       inc n
     elif t == DotTagId:
       # (dot <base-reg> <stackvar> <fieldname>) for stack objects, or
@@ -9039,6 +9727,14 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
       writeExe(ctx, outfile.changeFileExt("exe"))
     of Arch.CortexM:
       # A firmware image, not a hosted executable: vector table, then code.
+      #
+      # `absBase` is what makes the MOVW+MOVT absolute relocations correct: those
+      # carry a label's real ADDRESS, and the code is loaded 8 bytes above the
+      # image base because the vector table sits there. Without it every
+      # `(adr …)` would resolve 8 bytes low — near enough to look plausible and
+      # read the wrong bytes.
+      ctx.buf.absBase = elf32.FlashBase + 8
+      finalize(ctx.buf)
       var code: seq[byte] = newSeq[byte](ctx.buf.data.len)
       for i in 0 ..< ctx.buf.data.len: code[i] = ctx.buf.data[i]
       writeFile(outfile, writeFirmware(code))

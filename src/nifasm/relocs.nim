@@ -63,6 +63,11 @@ type
     relocs*: seq[RelocEntry]  # Track instructions needing relocation
     labels*: seq[LabelDef]    # Track label definitions
     nextLabelId*: int         # Next available label ID
+    absBase*: uint32          # Added to every ABSOLUTE relocation's target. A
+                              # PC-relative branch needs no such thing, but a
+                              # MOVW+MOVT pair carries a real ADDRESS, so it has
+                              # to know where the section will be loaded. Zero for
+                              # every target that has no absolute relocation.
     fixedRanges*: seq[(int, int)] # [start, end) byte ranges whose LAYOUT is frozen:
                               # a `casejmp` computed-goto region (`jmp base + idx*N`)
                               # relies on every slot keeping its exact byte size, so
@@ -398,7 +403,7 @@ proc updateRelocDisplacements*(buf: var Buffer) =
       # address is added later by the image writer, which knows it.
       let rd = (uint16(buf.data[currentPos + 2]) or
                 (uint16(buf.data[currentPos + 3]) shl 8)) shr 8 and 0xF
-      let addr32 = uint32(distance)
+      let addr32 = uint32(distance) + buf.absBase
       for half in 0 ..< 2:
         let v = uint16((addr32 shr (16 * half)) and 0xFFFF)
         let imm4 = uint16((v shr 12) and 0xF)

@@ -910,11 +910,50 @@ proc thumb2SelfTest() =
   echo "Thumb-2 encoder self-test successful (all checks passed)"
 
 
+proc cortexMAsmTests() =
+  ## Assemble hand-written Cortex-M asm-NIF with nifasm and run the resulting
+  ## firmware under QEMU. This is the END-TO-END gate for the instruction
+  ## selector: the encoder self-test above proves the ENCODINGS, but only these
+  ## exercise the operand model, the register-binding table, the relocation
+  ## patching and the ELF32 image together.
+  ##
+  ## Each fixture exits with a value it COMPUTED, so a wrong encoding shows up as
+  ## a wrong exit code rather than as output that happens to look right.
+  let qemu = findExe(cortexMQemu)
+  if qemu.len == 0:
+    echo cortexMQemu, " not found - skipping Cortex-M assembler tests"
+    return
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  const fixtures = [("hello_cortex_m", 0, "Hello Cortex-M\n"),
+                    ("cortex_m_alu", 42, "")]
+  var passed = 0
+  for (stem, wantCode, wantOut) in fixtures:
+    let src = "tests" / (stem & ".nif")
+    let elf = "tests" / (stem & ".elf")
+    exec quoteShell(nifasmExe) & " -o:" & quoteShell(elf) & " " & quoteShell(src)
+    var args: seq[string] = @[]
+    for a in cortexMArgs: args.add a
+    args.add elf
+    let (output, code) = runProgram(qemu, args)
+    if code == timeoutExitCode:
+      quit "FAILURE (TIMEOUT) cortex-m " & stem & "\n"
+    if code != wantCode:
+      quit "FAILURE cortex-m " & stem & ": exit " & $code & ", want " &
+           $wantCode & "\n" & output
+    if output != wantOut:
+      quit "FAILURE cortex-m " & stem & " output\nExpected: " & escape(wantOut) &
+           "\nGot:      " & escape(output)
+    removeFile elf
+    inc passed
+  echo passed, " / ", fixtures.len, " Cortex-M assembler tests successful"
+
+
 vgClientRequestEncodingTests()
 
 # Cortex-M: encoder-level coverage. Host-independent — it only needs
 # qemu-system-arm, so it runs wherever that is installed.
 thumb2SelfTest()
+cortexMAsmTests()
 
 # arkham native-codegen tests: arkham emits the host arch (x86-64 on Linux,
 # AArch64/Darwin on macOS), so we run them only where the binaries execute.

@@ -39,6 +39,17 @@ type
     CondHI = 8, CondLS = 9, CondGE = 10, CondLT = 11,
     CondGT = 12, CondLE = 13, CondAL = 14
 
+type
+  MemoryOperand* = object
+    ## A resolved `[base, #offset]` or `[base, index, LSL #shift]` address.
+    ## Thumb-2 has no RIP-relative form and no segment override, so this is the
+    ## whole addressing vocabulary.
+    base*: Register
+    offset*: int32
+    hasIndex*: bool
+    index*: Register
+    shift*: int        ## 0..3, the LSL applied to `index`
+
 const
   IP* = R12   ## the AAPCS32 intra-procedure scratch register
   LowRegs* = {R0..R7}

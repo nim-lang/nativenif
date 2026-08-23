@@ -8,34 +8,36 @@ Status: **M0, M1, M2a/b complete; M2c in progress.**
 | M1 word-size parameterization | done — `slots.setTargetWord` / `sem.setAsmWordSize` |
 | M2a Thumb-2 encoder + relocations | done — `src/nifasm/thumb2.nim`, 45-check self-test |
 | M2b ELF32 firmware writer | done — `src/nifasm/elf32.nim` |
-| M2c assembler integration | **partial** — see below |
+| M2c assembler integration | **mostly done** — selector works; frames/calls remain |
 | M3 arkham backend | not started |
 | M4 64-bit integers | not started |
 | M5 floating point | not started |
 | M6 embedded features | not started |
 
+### What M2c has
+
+The instruction selector (`genInstM` in `assembler.nim`) works end to end:
+`tests/hello_cortex_m.nif` and `tests/cortex_m_alu.nif` are assembled by nifasm
+into firmware images that run under QEMU and exit with a value they computed.
+
+Implemented: the typed operand model (`parseOperandM` / `parseDestM`) over the
+`MReg` tag set, the `mRegBindings` register-binding table and `clobberedM`
+call-clobber tracking, `(var …)` in a register or a stack slot, `mov`, `adr`,
+2- and 3-operand ALU forms, `sdiv`/`udiv`/`mls`/`umull`/`smull`, the shifts,
+extends, `clz`/`rbit`/`rev`, `cmp`/`tst`, every load/store width including the
+sign-extending ones, `ite`/`loop`/`jtrue`, `b`/`bl`/`bx`/`blx`/`cbz`/`cbnz`,
+`bkpt`, `ret`, `nop`, `wfi` and `kill`.
+
 ### What M2c still needs
 
-`(arch cortex_m)` is accepted, the word size switches to 4, `(rodata …)` and
-the rest of pass1/pass2 work, and the image writer is wired to
-`elf32.writeFirmware`. `tests/hello_cortex_m.nif` gets all the way to the first
-instruction and then reports, by name, that the selector is missing.
-
-What is missing is the MIDDLE layer — the Cortex-M counterpart of
-`genInstA64`, roughly:
-
-* `parseDestM` / `parseOperandM` and the `Operand` model (okReg / okMem / okImm)
-  against the `MReg` tag set,
-* the register-binding table (`mRegBindings`, the analogue of `a64RegBindings`)
-  so `(var :x (r4) (i 32))` type-checks and a raw `(r4)` use is rejected,
-* the per-mnemonic arms, which then call straight into the tested
-  `thumb2.emit*` encoders,
-* prologue/epilogue and stack-slot addressing for AAPCS32.
-
-The `MInst` enum in `doc/instructions.md` is declared but still EMPTY: the
-mnemonics should be added as MInst-only rows appended at the END of the
-document, which keeps them in the late-numbered tail and moves no existing
-tag id.
+* **Frames and calls.** `(ssize)`, `(csize)`, `(proc …)` prologue/epilogue,
+  `(prepare …)`/`(call)`/`(extcall)` and `(arg …)`/`(res …)` marshalling for
+  AAPCS32. `(ssize)` currently errors by name rather than emitting a frame size
+  of zero.
+* **Address-of-global** (`(adr D <gvar>)`) — errors by name.
+* **`(dot …)` / `(at …)`** address folding inside `(mem …)`.
+* 64-bit scalars and floats are rejected BY NAME (`checkRegWidthM`) rather than
+  truncated; they are M4 and M5.
 
 ## Target
 
