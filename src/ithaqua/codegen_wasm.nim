@@ -999,7 +999,7 @@ proc genConv(g: var WasmGen; c: Cursor) =
         # cursor's live scope (typeBody/resolveType hand out a cursor copy
         # that does not survive for `into` — the typeSizeAlign pattern).
         var dstArity = -1
-        var d = lookupType(g.prog, symName(dstT))
+        var d = lookupType(g.prog, dstT.symId)
         d.into:
           inc d; skip d                        # name, type-pragmas
           if d.kind == TagLit and d.typeKind == ProctypeT:
