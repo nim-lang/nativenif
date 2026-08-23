@@ -18,7 +18,7 @@
 | `(result D L T)`       | NifasmDecl                  | result value declaration |
 | `(clobber ...)`        | NifasmDecl                  | clobbered registers list |
 | `(var D L T)`          | NifasmDecl                  | variable declaration |
-| `(arch x64/arm64)`     | NifasmDecl                  | architecture pragma |
+| `(arch x64/arm64)`     | NifasmDecl                  | architecture pragma: `x64`, `linux_arm64`, `arm64`, `win_x64`, `win_arm64`, `cortex_m` |
 | `(s)`                  | X64Flag                 | stack slot location tag |
 | `(align N)`            | NifasmExpr                  | stack-slot alignment annotation (child of `(s)`) |
 | `(ssize)` / `(ssize N)` | NifasmExpr                 | stack size expression; the optional `N` adds N bytes at THIS site only (the prologue folds its 16-alignment pad in) |
@@ -271,22 +271,22 @@
 | `(rdi)`              | X64Reg                   | register rdi |
 | `(rbp)`              | X64Reg                   | register rbp |
 | `(rsp)`              | X64Reg                   | register rsp |
-| `(r8)`               | X64Reg                   | register r8 |
-| `(r9)`               | X64Reg                   | register r9 |
-| `(r10)`              | X64Reg                   | register r10 |
-| `(r11)`              | X64Reg                   | register r11 |
-| `(r12)`              | X64Reg                   | register r12 |
+| `(r8)`               | X64Reg, MReg             | register r8 |
+| `(r9)`               | X64Reg, MReg             | register r9 |
+| `(r10)`              | X64Reg, MReg             | register r10 |
+| `(r11)`              | X64Reg, MReg             | register r11 |
+| `(r12)`              | X64Reg, MReg             | register r12 |
 | `(r13)`              | X64Reg                   | register r13 |
 | `(r14)`              | X64Reg                   | register r14 |
 | `(r15)`              | X64Reg                   | register r15 |
-| `(r0)`               | X64Reg                   | register r0 (alias) |
-| `(r1)`               | X64Reg                   | register r1 (alias) |
-| `(r2)`               | X64Reg                   | register r2 (alias) |
-| `(r3)`               | X64Reg                   | register r3 (alias) |
-| `(r4)`               | X64Reg                   | register r4 (alias) |
-| `(r5)`               | X64Reg                   | register r5 (alias) |
-| `(r6)`               | X64Reg                   | register r6 (alias) |
-| `(r7)`               | X64Reg                   | register r7 (alias) |
+| `(r0)`               | X64Reg, MReg             | register r0 (alias) |
+| `(r1)`               | X64Reg, MReg             | register r1 (alias) |
+| `(r2)`               | X64Reg, MReg             | register r2 (alias) |
+| `(r3)`               | X64Reg, MReg             | register r3 (alias) |
+| `(r4)`               | X64Reg, MReg             | register r4 (alias) |
+| `(r5)`               | X64Reg, MReg             | register r5 (alias) |
+| `(r6)`               | X64Reg, MReg             | register r6 (alias) |
+| `(r7)`               | X64Reg, MReg             | register r7 (alias) |
 | `(xmm0)`             | X64Reg                   | register xmm0 |
 | `(xmm1)`             | X64Reg                   | register xmm1 |
 | `(xmm2)`             | X64Reg                   | register xmm2 |
@@ -334,7 +334,7 @@
 | `(x28)`              | A64Reg                   | register x28 |
 | `(x29)`              | A64Reg                   | register x29 |
 | `(x30)`              | A64Reg                   | register x30 |
-| `(sp)`               | A64Reg                   | stack pointer |
+| `(sp)`               | A64Reg, MReg             | stack pointer |
 | `(w0)`               | A64Reg                   | register w0 (32-bit) |
 | `(w1)`               | A64Reg                   | register w1 (32-bit) |
 | `(w2)`               | A64Reg                   | register w2 (32-bit) |
@@ -367,7 +367,7 @@
 | `(w29)`              | A64Reg                   | register w29 (32-bit) |
 | `(w30)`              | A64Reg                   | register w30 (32-bit) |
 | `(wsp)`              | A64Reg                   | stack pointer (32-bit) |
-| `(lr)`               | A64Reg                   | link register (alias for x30) |
+| `(lr)`               | A64Reg, MReg             | link register (alias for x30) |
 | `(fp)`               | A64Reg                   | frame pointer (alias for x29) |
 | `(xzr)`              | A64Reg                   | zero register |
 | `(of)`               | X64Flag                 | overflow flag |

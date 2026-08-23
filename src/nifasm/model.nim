@@ -326,6 +326,13 @@ proc rawTagIsA64Inst*(raw: TagEnum): bool {.inline.} =
   raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, AndTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, RebindTagId, WithregTagId, ScopeTagId, SdivTagId, UdivTagId, SmulhTagId, UmulhTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, AddwTagId, SubwTagId, MulwTagId, Addw3TagId, Subw3TagId, Mulw3TagId, GloadTagId, GstoreTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, SvcTagId, AdrTagId, LdrTagId, StrTagId, StpTagId, LdpTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, CbzTagId, CbnzTagId, CseleqTagId, CselneTagId, CselltTagId, CselleTagId, CselgtTagId, CselgeTagId, CselloTagId, CsellsTagId, CselhiTagId, CselhsTagId, CseteqTagId, CsetneTagId, CsetltTagId, CsetleTagId, CsetgtTagId, CsetgeTagId, CsetloTagId, CsetlsTagId, CsethiTagId, CsethsTagId, LdaxrTagId, StlxrTagId, LdarTagId, StlrTagId, DmbTagId, ClrexTagId, FmovTagId, FaddTagId, FsubTagId, FmulTagId, FdivTagId, FnegTagId, FcmpTagId, FldrTagId, FstrTagId, ScvtfTagId, UcvtfTagId, FcvtzsTagId, FcvtzuTagId, FcvtTagId, FstpTagId, FldpTagId, LdrbTagId, StrbTagId, ClzTagId, RbitTagId, RevTagId, FldrqTagId, FstrqTagId, VfaddTagId, VfsubTagId, VfmulTagId, VfmlaTagId, VdupTagId, VeorTagId, VaddvTagId, VgreqTagId}
 
 type
+  MInst* = enum
+    NoMInst
+
+proc rawTagIsMInst*(raw: TagEnum): bool {.inline.} =
+  false
+
+type
   NifasmType* = enum
     NoType
     BoolT = (ord(BoolTagId), "bool")  ## boolean type
@@ -360,7 +367,7 @@ type
     ResultD = (ord(ResultTagId), "result")  ## result value declaration
     ClobberD = (ord(ClobberTagId), "clobber")  ## clobbered registers list
     VarD = (ord(VarTagId), "var")  ## variable declaration
-    ArchD = (ord(ArchTagId), "arch")  ## architecture pragma
+    ArchD = (ord(ArchTagId), "arch")  ## architecture pragma: `x64`, `linux_arm64`, `arm64`, `win_x64`, `win_arm64`, `cortex_m`
     CfvarD = (ord(CfvarTagId), "cfvar")  ## control flow variable declaration
     RodataD = (ord(RodataTagId), "rodata")  ## read-only data (string/bytes)
     GvarD = (ord(GvarTagId), "gvar")  ## global variable
@@ -593,4 +600,26 @@ type
 
 proc rawTagIsA64Reg*(raw: TagEnum): bool {.inline.} =
   raw in {X0TagId, X1TagId, X2TagId, X3TagId, X4TagId, X5TagId, X6TagId, X7TagId, X8TagId, X9TagId, X10TagId, X11TagId, X12TagId, X13TagId, X14TagId, X15TagId, X16TagId, X17TagId, X18TagId, X19TagId, X20TagId, X21TagId, X22TagId, X23TagId, X24TagId, X25TagId, X26TagId, X27TagId, X28TagId, X29TagId, X30TagId, SpTagId, W0TagId, W1TagId, W2TagId, W3TagId, W4TagId, W5TagId, W6TagId, W7TagId, W8TagId, W9TagId, W10TagId, W11TagId, W12TagId, W13TagId, W14TagId, W15TagId, W16TagId, W17TagId, W18TagId, W19TagId, W20TagId, W21TagId, W22TagId, W23TagId, W24TagId, W25TagId, W26TagId, W27TagId, W28TagId, W29TagId, W30TagId, WspTagId, LrTagId, FpTagId, XzrTagId, D0TagId, D1TagId, D2TagId, D3TagId, D4TagId, D5TagId, D6TagId, D7TagId, D8TagId, D9TagId, D10TagId, D11TagId, D12TagId, D13TagId, D14TagId, D15TagId, D16TagId, D17TagId, D18TagId, D19TagId, D20TagId, D21TagId, D22TagId, D23TagId, D24TagId, D25TagId, D26TagId, D27TagId, D28TagId, D29TagId, D30TagId, D31TagId, S0TagId, S1TagId, S2TagId, S3TagId, S4TagId, S5TagId, S6TagId, S7TagId, S8TagId, S9TagId, S10TagId, S11TagId, S12TagId, S13TagId, S14TagId, S15TagId, S16TagId, S17TagId, S18TagId, S19TagId, S20TagId, S21TagId, S22TagId, S23TagId, S24TagId, S25TagId, S26TagId, S27TagId, S28TagId, S29TagId, S30TagId, S31TagId}
+
+type
+  MReg* = enum
+    NoMReg
+    R8MR = (ord(R8TagId), "r8")  ## register r8
+    R9MR = (ord(R9TagId), "r9")  ## register r9
+    R10MR = (ord(R10TagId), "r10")  ## register r10
+    R11MR = (ord(R11TagId), "r11")  ## register r11
+    R12MR = (ord(R12TagId), "r12")  ## register r12
+    R0MR = (ord(R0TagId), "r0")  ## register r0 (alias)
+    R1MR = (ord(R1TagId), "r1")  ## register r1 (alias)
+    R2MR = (ord(R2TagId), "r2")  ## register r2 (alias)
+    R3MR = (ord(R3TagId), "r3")  ## register r3 (alias)
+    R4MR = (ord(R4TagId), "r4")  ## register r4 (alias)
+    R5MR = (ord(R5TagId), "r5")  ## register r5 (alias)
+    R6MR = (ord(R6TagId), "r6")  ## register r6 (alias)
+    R7MR = (ord(R7TagId), "r7")  ## register r7 (alias)
+    SpMR = (ord(SpTagId), "sp")  ## stack pointer
+    LrMR = (ord(LrTagId), "lr")  ## link register (alias for x30)
+
+proc rawTagIsMReg*(raw: TagEnum): bool {.inline.} =
+  raw in {R8TagId, R9TagId, R10TagId, R11TagId, R12TagId, R0TagId, R1TagId, R2TagId, R3TagId, R4TagId, R5TagId, R6TagId, R7TagId, SpTagId, LrTagId}
 
