@@ -971,7 +971,7 @@ proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string;
   ## A pointer/proc field whose value is a *symbol address* (e.g. a vtable/RTTI
   ## const pointing at another const or a proc — `(cast (ptr …) Foo.0.vt)`) cannot
   ## be baked at compile time; record `(blob-offset, symbol-name)` in `relocs` and
-  ## reserve 8 placeholder bytes. The backend emits these as `(reloc off sym)`
+  ## reserve one WORD of placeholder bytes. The backend emits these as `(reloc off sym)`
   ## children of the `(rodata …)` blob and nifasm bakes the resolved address into
   ## `.text` in `writeElf`. `relocs` offsets are relative to the blob start, so the
   ## top-level caller must pass a `buf` that begins empty (the blob).
@@ -985,9 +985,9 @@ proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string;
     let addrSym = constAddrSym(val)
     if addrSym.len > 0:
       relocs.add (buf.len, addrSym)          # link-time address (baked by nifasm)
-      for i in 0 ..< 8: buf.add '\0'         # placeholder reserved for the address
+      for i in 0 ..< wordSize(): buf.add '\0'  # placeholder for the address
     else:
-      appendLE(buf, constLitBits(val), 8)    # nil / integer-encoded address
+      appendLE(buf, constLitBits(val), wordSize())  # nil / integer-encoded address
   of FlexarrayT:
     var et = rt; inc et                      # element type
     if val.kind == StrLit:

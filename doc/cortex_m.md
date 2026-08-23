@@ -9,7 +9,7 @@ Status: **M0, M1, M2a/b complete; M2c in progress.**
 | M2a Thumb-2 encoder + relocations | done — `src/nifasm/thumb2.nim`, 45-check self-test |
 | M2b ELF32 firmware writer | done — `src/nifasm/elf32.nim` |
 | M2c assembler integration | done — selector, frames, calls, marshalling |
-| M3 arkham backend | **working** — 98 Leng fixtures run end to end |
+| M3 arkham backend | **working** — 115 Leng fixtures run end to end |
 | M4 64-bit integers | not started |
 | M5 floating point | not started |
 | M6 embedded features | not started |
@@ -179,10 +179,8 @@ fixtures, 225 `importc "exit"` and 3 `importc "write"`.
   too, called like ordinary procs; anything else `importc`'d is refused by name.
 
   **No fixture hangs.** Everything that does not work either refuses by name or
-  produces a wrong exit code the harness catches. 15 of the 216 converted
-  fixtures still give a wrong value, all in the aggregate ABI (`structcopy`,
-  `ret_oconstr_*`, `global_aggr_*`) or rodata relocations
-  (`const_rodata_reloc*`); the rest are refused. The corpus in
+  produces a wrong exit code the harness catches. 5 of the 216 converted
+  fixtures still give a wrong value; the rest are refused. The corpus in
   `tests/arkham_m/` holds only what genuinely passes.
 * **M4 — 64-bit integers as register pairs.** `adds`/`adcs`, `umull`+`mla`,
   `__aeabi_ldivmod`. Un-skips most of the existing 236-fixture corpus (206 of

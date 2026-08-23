@@ -34,10 +34,29 @@ const
   IntArgRegs*   = [R0, R1, R2, R3]   ## AAPCS32 argument registers; r0 also returns
   IntRet*       = R0
 
-  ## Callee-saved homes for values that must survive a call. Five of AAPCS32's
-  ## eight: r10/r11 are the emitter's bridges and r9 carries the hidden result
-  ## pointer (both below).
-  IntCalleeSaved* = [R4, R5, R6, R7, R8]
+  ## Callee-saved homes for values that must survive a call. Four of AAPCS32's
+  ## eight; the other four are dedicated below (r8 produce bridge, r9 hidden
+  ## result pointer, r10/r11 staging bridges).
+  ##
+  ## Four is thin, and deliberately so: every one of the dedicated registers
+  ## exists because the emitter needs a register it can ALWAYS take, and a
+  ## "usually free" register is worth nothing to a path that must be total.
+  ## x86-64 allocates from a comparable pool.
+  IntCalleeSaved* = [R4, R5, R6, R7]
+
+  ProduceBridge* = R8
+    ## A third always-free scratch, beyond the two staging bridges: the
+    ## Cortex-M stand-in for AArch64's x16 (IP0).
+    ##
+    ## AArch64 borrows the assembler's own scratch for this. Cortex-M cannot —
+    ## nifasm has claimed r12 for operand folding at sites arkham never sees, so
+    ## a value left there dies to an instruction the code generator did not emit
+    ## and cannot see. Hence a register of arkham's own, in no pool.
+    ##
+    ## Used where a value must be staged through a register with no bridge
+    ## available: producing into a spilled slot, the re-representation of a cast
+    ## whose value came back in memory, and the aggregate copy under total
+    ## register exhaustion.
 
   IndirectResultReg* = R9
     ## Where a caller leaves `&result` for a callee returning an aggregate too
@@ -111,7 +130,7 @@ const
     intCalleeSaved: @IntCalleeSaved,
     floatTempRegs: @[],
     floatCalleeSaved: @[],
-    intCalleeSavedSet: {R4..R8},
+    intCalleeSavedSet: {R4..R7},
     floatCalleeSavedSet: {},
     aggrByRefThreshold: 8)      # TWO words, matching `slots.classifyArg`'s `2*w`.
                                 # These two decide the same thing and MUST agree:

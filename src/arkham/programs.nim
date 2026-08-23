@@ -1057,11 +1057,15 @@ proc typeSizeAlign*(p: var Program; c: Cursor): (int, int) =
     case c.typeKind
     of IT, UT, FT, CT:
       let bits = typeBits(c)
-      let bytes = (if bits > 0: bits else: 64) div 8
+      # A non-positive bit count is Leng's platform-width scalar: the target
+      # WORD, not a fixed 64. This is the layout every field offset is computed
+      # from, so getting it wrong does not fail — it silently moves every later
+      # field, and the program reads the padding.
+      let bytes = (if bits > 0: bits else: wordBits()) div 8
       result = (bytes, bytes)
     of BoolT: result = (1, 1)
     of VoidT: result = (0, 1)
-    of PtrT, AptrT, ProctypeT: result = (8, 8)
+    of PtrT, AptrT, ProctypeT: result = (wordSize(), wordAlign())
     of FlexarrayT:
       # A flexible array member contributes no fixed size; its alignment is that
       # of the element type (so the enclosing struct's tail is aligned for it).

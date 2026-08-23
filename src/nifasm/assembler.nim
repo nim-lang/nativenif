@@ -9985,8 +9985,12 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
               let tsym = lookupWithAutoImport(ctx, ctx.scope, tname, relc)
               skip relc                       # past the target symbol
               if tsym != nil:
+                # One WORD, not a fixed eightbyte: arkham reserves exactly
+                # `wordSize()` placeholder bytes for the field (see
+                # `constToBytes`), and baking 8 over a 4-byte field overwrites
+                # whatever follows it in the blob.
                 ctx.rodataSymInits.add (labelId: sym.offset, blobOff: blobOff.int,
-                                        sym: tsym, size: 8)
+                                        sym: tsym, size: asmWordSize())
             skip rc
   of skGvar:
     if declTag == GvarD:
@@ -10042,7 +10046,10 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
               let tsym = lookupWithAutoImport(ctx, ctx.scope, tname, relc)
               skip relc                       # past the target symbol
               if tsym != nil:
-                ctx.bssSymInits.add (off: int64(sym.size) + blobOff, sym: tsym, size: 8)
+                # One WORD, matching the placeholder arkham reserved — the same
+                # rule as the rodata relocation above.
+                ctx.bssSymInits.add (off: int64(sym.size) + blobOff, sym: tsym,
+                                     size: asmWordSize())
             skip rc
       ctx.bssOffset += size
   of skTvar:
@@ -10210,10 +10217,40 @@ proc writeCortexMImage(a: var GenContext; code: seq[byte];
     quit "nifasm: " & $a.bssOffset & " bytes of globals would reach the stack at 0x" &
          toHex(elf32.DefaultStackTop, 8)
 
+  var patched = code
+
+  # Bake the symbol-address fields of a rodata blob — a vtable, an RTTI record, a
+  # `const` holding `addr other` — now that every label has a position. The blob
+  # lives in the code segment at its own label; each recorded field is a 4-byte
+  # ABSOLUTE address, and a proc's carries the Thumb bit for the same reason
+  # `rkTMovwMovtFunc` does: a function pointer read out of a table is called
+  # through `blx` like any other.
+  if a.rodataSymInits.len > 0:
+    var labelPos = initTable[int, int]()
+    for ld in a.buf.labels: labelPos[int(ld.id)] = ld.position
+    for it in a.rodataSymInits:
+      if not labelPos.hasKey(it.labelId): continue
+      let sitePos = labelPos[it.labelId] + it.blobOff
+      var targetVaddr = 0'u32
+      case it.sym.kind
+      of skProc:
+        if labelPos.hasKey(it.sym.offset):
+          targetVaddr = codeVaddr + uint32(elf32.VectorTableSize) +
+                        uint32(labelPos[it.sym.offset]) + 1'u32   # Thumb bit
+      of skRodata:
+        if labelPos.hasKey(it.sym.offset):
+          targetVaddr = codeVaddr + uint32(elf32.VectorTableSize) +
+                        uint32(labelPos[it.sym.offset])
+      of skGvar:
+        targetVaddr = bssVaddr + uint32(it.sym.size)
+      else: discard
+      for i in 0 ..< it.size:
+        if sitePos + i < patched.len:
+          patched[sitePos + i] = byte((targetVaddr shr (8 * i)) and 0xFF)
+
   # Patch every `(adr D <gvar>)` / indirect-call MOVW+MOVT pair with the global's
   # absolute address, now that the .bss layout is fixed. `sym.size` is its byte
   # offset within .bss — the same field the ELF64 and Mach-O backends read.
-  var patched = code
   for (pos, sym) in a.gvarSites:
     if pos + 8 > patched.len: continue
     var bytes = initBytes()

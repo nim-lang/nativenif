@@ -210,6 +210,16 @@ proc genTlvAddr(g: var CodeGen; name: string; dest: Reg) =
     g.emReg dest
     g.ab.sym name
 
+proc produceBridge(g: CodeGen): Reg {.inline.} =
+  ## The third always-free scratch, beyond the two staging bridges. AArch64
+  ## borrows the assembler's x16 (IP0); Cortex-M cannot borrow nifasm's r12,
+  ## because nifasm folds operands through it at sites this emitter never sees,
+  ## so it dedicates r8 instead (see `machine_m.ProduceBridge`).
+  ##
+  ## Slot R16 is not even MAPPED on Cortex-M — using it there emitted a register
+  ## name no assembler accepts, which at least failed loudly.
+  if g.thumbM: machine_m.ProduceBridge else: R16
+
 proc indirectResultReg(g: CodeGen): Reg {.inline.} =
   ## Where the caller leaves `&result` for an aggregate return too wide for
   ## registers. AArch64 has a dedicated x8 off the argument file; Cortex-M has no
@@ -1115,7 +1125,7 @@ proc aggrWordsToFromRegs(g: var CodeGen; varName: string; typeSym: SymId;
     # The aggregate IS the word registers — no memory round-trip.
     for i in 0 ..< aggrWordCount(g.prog, typeSym):
       let w = pairWord(loc, i)
-      let arg = IntArgRegs[firstArg + i]
+      let arg = g.md.intArgRegs[firstArg + i]
       if toRegs:
         if arg != w: g.movReg(arg, w)
       else:
@@ -1166,11 +1176,12 @@ proc globalToRegs(g: var CodeGen; name: string; typeSym: SymId; firstArg: int; i
   let bridge = g.takeBridge()
   if isTvar: g.genTlvAddr(name, bridge) else: g.emGlobalAddr(bridge, name)
   let byteSize = aggrByteSize(g.prog, typeSym)
+  let mw = wordSize()          # the ABI marshalling word (see aggrWordCount)
   for i in 0 ..< aggrWordCount(g.prog, typeSym):
-    if byteSize - i * 8 >= 8:
-      g.ab.tree MovA64: (g.emReg IntArgRegs[firstArg + i]; g.emWordThroughPtr(bridge, i))
+    if byteSize - i * mw >= mw:
+      g.ab.tree MovA64: (g.emReg g.md.intArgRegs[firstArg + i]; g.emWordThroughPtr(bridge, i))
     else:
-      g.loadAggrTail(IntArgRegs[firstArg + i], bridge, byteSize, i * 8)
+      g.loadAggrTail(g.md.intArgRegs[firstArg + i], bridge, byteSize, i * mw)
   g.dropBridge bridge
 
 # ── named register locals (typed nifasm vars; transient scratch stays `(xN)`) ─
@@ -3144,26 +3155,33 @@ proc emByteAtImm(g: var CodeGen; p: Reg; off: int) =
 
 proc copyAggr(g: var CodeGen; dst, src: Reg; size: int; tmp: Reg) =
   ## THE one aggregate memcpy (a struct/array `store`): copy `size` bytes from `[src]` to
-  ## `[dst]` through the bound scratch `tmp` — 8-byte words for the aligned bulk, then a
+  ## `[dst]` through the bound scratch `tmp` — whole WORDS for the aligned bulk, then a
   ## sized byte tail. Layout-agnostic and byte-accurate (mirrors the x64 `copyAggr`).
-  let words = size div 8
+  ##
+  ## The word here must be the TARGET's, and must agree with `emWordThroughPtr`'s
+  ## stride: that node emits `(aptr (u W))` and nifasm strides by the element
+  ## width, so counting 8-byte words while it strides 4 copies exactly half the
+  ## aggregate and reports no error at all.
+  let w = wordSize()
+  let words = size div w
   for i in 0 ..< words:
     g.ab.tree MovA64: (g.emReg tmp; g.emWordThroughPtr(src, i))
     g.ab.tree MovA64: (g.emWordThroughPtr(dst, i); g.emReg tmp)
-  for b in 0 ..< (size - words * 8):                     # sub-word tail, byte by byte
-    let off = words * 8 + b
+  for b in 0 ..< (size - words * w):                     # sub-word tail, byte by byte
+    let off = words * w + b
     g.ab.tree MovA64: (g.emReg tmp; g.emByteAtImm(src, off))
     g.ab.tree MovA64: (g.emByteAtImm(dst, off); g.emReg tmp)
 
 proc flatCopyToPtr2(g: var CodeGen; srcVar: string; sizeBytes: int; dstPtr, tmp: Reg) =
   ## Copy the `sizeBytes`-byte aggregate stack slot `srcVar` into `[dstPtr]` through the
   ## (already bound) word scratch `tmp` — the a64 twin of x64's `flatCopyToPtr`. The
-  ## source address goes into the reserved produce bridge x16: it is never allocator-
-  ## assigned, and the copy's own instructions synthesize only through X17 (large
-  ## load/store offsets), so it cannot be clobbered mid-copy. A flat word copy is
+  ## source address goes into the reserved produce bridge (x16 on AArch64, r8 on
+  ## Cortex-M): it is never allocator-assigned, and the copy's own instructions
+  ## synthesize only through the ASSEMBLER's scratch (x17 / r12) for large
+  ## load/store offsets, so it cannot be clobbered mid-copy. A flat word copy is
   ## byte-accurate whatever the field layout — a PER-FIELD copy would mis-load a field
   ## that is itself an aggregate (e.g. a 16-byte `seq`) as one scalar.
-  let srcPtr = R16
+  let srcPtr = g.produceBridge
   g.bindTemp(srcPtr, addrSlot())
   g.ab.tree LeaA64: (g.emReg srcPtr; g.ab.sym srcVar)
   g.copyAggr(dstPtr, srcPtr, sizeBytes, tmp)
@@ -3194,22 +3212,24 @@ proc regsToStructThroughPtr(g: var CodeGen; ptrReg: Reg; typeSym: SymId; firstAr
   ## through-pointer twin of `regsToStruct` — stores an aggregate call result into a
   ## global.
   let byteSize = aggrByteSize(g.prog, typeSym)
+  let mw = wordSize()          # the ABI marshalling word (see aggrWordCount)
   for i in 0 ..< aggrWordCount(g.prog, typeSym):
-    if byteSize - i * 8 >= 8:
-      g.ab.tree MovA64: (g.emWordThroughPtr(ptrReg, i); g.emReg IntArgRegs[firstArg + i])
+    if byteSize - i * mw >= mw:
+      g.ab.tree MovA64: (g.emWordThroughPtr(ptrReg, i); g.emReg g.md.intArgRegs[firstArg + i])
     else:
-      g.storeAggrTail(ptrReg, IntArgRegs[firstArg + i], byteSize, i * 8)
+      g.storeAggrTail(ptrReg, g.md.intArgRegs[firstArg + i], byteSize, i * mw)
 
 proc marshalAggrFromAddr(g: var CodeGen; addrReg: Reg; typeSym: SymId; firstArg: int) =
   ## `x{firstArg+i} ← [addrReg]` — load a ≤16B aggregate at `[addrReg]` into the by-value
   ## ABI argument registers (reverse of `regsToStructThroughPtr`); lets an aggregate CALL
   ## ARGUMENT marshal straight from its address (`aggrAddrInto`) with no copy temp.
   let byteSize = aggrByteSize(g.prog, typeSym)
+  let mw = wordSize()          # the ABI marshalling word (see aggrWordCount)
   for i in 0 ..< aggrWordCount(g.prog, typeSym):
-    if byteSize - i * 8 >= 8:
-      g.ab.tree MovA64: (g.emReg IntArgRegs[firstArg + i]; g.emWordThroughPtr(addrReg, i))
+    if byteSize - i * mw >= mw:
+      g.ab.tree MovA64: (g.emReg g.md.intArgRegs[firstArg + i]; g.emWordThroughPtr(addrReg, i))
     else:
-      g.loadAggrTail(IntArgRegs[firstArg + i], addrReg, byteSize, i * 8)
+      g.loadAggrTail(g.md.intArgRegs[firstArg + i], addrReg, byteSize, i * mw)
 
 proc aggrArgAddr(g: var CodeGen; a: Cursor; dst: Reg) =
   ## Put the ADDRESS of an aggregate call-argument SOURCE into `dst` (a usable scratch
@@ -3288,13 +3308,14 @@ proc marshalStackAggrArg(g: var CodeGen; a: Cursor; paramNm: string) =
       g.emReg src
   else:
     let w = g.takeBridge(avoid = src)
+    let mw = wordSize()          # the ABI marshalling word (see aggrWordCount)
     for i in 0 ..< aggrWordCount(g.prog, tn):
-      if sz - i * 8 >= 8:
+      if sz - i * mw >= mw:
         g.ab.tree MovA64: (g.emReg w; g.emWordThroughPtr(src, i))
       else:
         if i == 0 and sz notin {1, 2, 4}:
-          raiseAssert "arkham a64: " & $sz & "-byte aggregate stack-arg ABI unsupported"
-        g.loadAggrTail(w, src, sz, i * 8)
+          raiseAssert "arkham arm: " & $sz & "-byte aggregate stack-arg ABI unsupported"
+        g.loadAggrTail(w, src, sz, i * mw)
       g.ab.tree MovA64:
         g.ab.tree MemX:
           g.emReg SP
@@ -3788,7 +3809,7 @@ proc genAggrCopyStore(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
   if rhs.kind == TagLit: g.freeLvalTemps2(rhs)
   var tmp: Reg
   if b0 != NoReg and b1 != NoReg:
-    tmp = R16                        # total exhaustion: the produce bridge serves
+    tmp = g.produceBridge            # total exhaustion: the produce bridge serves
     g.bindTemp(tmp, addrSlot())
   else:
     tmp = g.takeBridge(addrSlot())
@@ -4042,7 +4063,7 @@ proc emitLeafImm(g: var CodeGen; dest: var Location; natural: Location) =
     # `needsReg` under a dry pool minted an etmp slot: the literal MUST be
     # stored into it (silently skipping it hands the consumer's reload
     # garbage) — through the produce bridge, like produceIntoMem2.
-    let s = R16
+    let s = g.produceBridge
     g.bindTemp(s, dest.typ)
     g.placeImm(s, natural)
     g.storeReg2(dest, s)
@@ -4067,7 +4088,7 @@ proc produceIntoMem2(g: var CodeGen; c: Cursor; dst: Location) =
   ## cannot be repaired from this side: handing the nested level a real bridge
   ## instead just moves the shortage (`takeBridge` then asserts with both x14/x15
   ## already serving the address the recursion is materializing).
-  let s = R16                                             # the produce bridge (IP0)
+  let s = g.produceBridge                                 # x16 (IP0) / r8
   # Stage at the canonical 64-bit width for a sub-word INTEGER destination. arkham
   # keeps every scalar full-width in a register (a narrowing is an explicit extend,
   # never the move), the `(s)` slot is declared `(i 64)` regardless, and the store
@@ -5471,7 +5492,7 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
     # x16 is free by the same argument that let it be used a moment ago: reaching
     # here means `emitValue2` routed the inner through `produceIntoMem2`, which took
     # and released it.
-    let s = R16
+    let s = g.produceBridge
     var rl = regLoc(s, ScalarSlot, isTemp = true)
     g.bindTemp(s, ScalarSlot)                  # canonical 64-bit: the extend narrows
     g.emScalarLoad(s, dest.name)

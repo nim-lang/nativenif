@@ -1,0 +1,334 @@
+(.nif27)
+(.indexat 4153             )
+(stmts
+ (arch cortex_m)
+ (type :Pair.0
+  (object
+   (fld :a.0
+    (i 32))
+   (fld :b.0
+    (i 32))))
+ (proc :`mexit.0
+  (params
+   (param :`p0.0
+    (r0)
+    (i 32)))
+  (clobber
+   (r0)
+   (r1)
+   (r2)
+   (r3))
+  (stmts
+   (var :`shblk0.0
+    (s)
+    (i 32))
+   (var :`shblk1.0
+    (s)
+    (i 32))
+   (sub
+    (sp)
+    (ssize))
+   (mov
+    (r2)131110)
+   (mov `shblk0.0
+    (r2))
+   (mov `shblk1.0
+    (r0))
+   (lea
+    (r1)`shblk0.0)
+   (mov
+    (r0)32)
+   (bkpt 171)
+   (ret)))
+ (proc :exit.sys.
+  (params
+   (param :`p0.0
+    (r0)
+    (i 32)))
+  (clobber
+   (r0)
+   (r1)
+   (r2)
+   (r3))
+  (stmts
+   (var :`shblk0.0
+    (s)
+    (i 32))
+   (var :`shblk1.0
+    (s)
+    (i 32))
+   (sub
+    (sp)
+    (ssize))
+   (mov
+    (r2)131110)
+   (mov `shblk0.0
+    (r2))
+   (mov `shblk1.0
+    (r0))
+   (lea
+    (r1)`shblk0.0)
+   (mov
+    (r0)32)
+   (bkpt 171)
+   (ret)))
+ (proc :main.0
+  (params)
+  (result :`ret.0
+   (r0)
+   (i 32))
+  (clobber
+   (r0)
+   (r1)
+   (r2)
+   (r3))
+  (stmts
+   (sub
+    (sp)16)
+   (str
+    (mem
+     (sp)0)
+    (lr))
+   (str
+    (mem
+     (sp)4)
+    (r5))
+   (str
+    (mem
+     (sp)8)
+    (r6))
+   (str
+    (mem
+     (sp)12)
+    (r7))
+   (sub
+    (sp)
+    (ssize))
+   (var :n1.0
+    (r5)
+    (i 32))
+   (prepare id.0
+    (mov
+     (r0)1)
+    (mov
+     (arg `p0.0)
+     (r0))
+    (call)
+    (mov
+     (r0)
+     (res `ret.0)))
+   (mov n1.0
+    (r0))
+   (var :n2.0
+    (r6)
+    (i 32))
+   (prepare id.0
+    (mov
+     (r0)2)
+    (mov
+     (arg `p0.0)
+     (r0))
+    (call)
+    (mov
+     (r0)
+     (res `ret.0)))
+   (mov n2.0
+    (r0))
+   (var :t1.0
+    (r7)
+    (i 32))
+   (rebind :t1.0
+    (i 32)
+    (r7))
+   (add3 t1.0 n1.0 1)
+   (kill n1.0)
+   (var :t2.0
+    (r5)
+    (i 32))
+   (rebind :t2.0
+    (i 32)
+    (r5))
+   (add3 t2.0 n2.0 1)
+   (var :t3.0
+    (s)
+    (i 32))
+   (rebind :`tmp0.0
+    (i 32)
+    (r2))
+   (add3 `tmp0.0 t1.0 2)
+   (mov t3.0 `tmp0.0)
+   (var :t4.0
+    (r1)
+    (i 32))
+   (rebind :t4.0
+    (i 32)
+    (r1))
+   (add3 t4.0 t2.0 2)
+   (kill n2.0)
+   (var :s.0
+    (r6)
+    (i 32))
+   (rebind :s.0
+    (i 32)
+    (r6))
+   (add3 s.0 t1.0 t2.0)
+   (rebind :`tmp1.0
+    (i 32)
+    (r2))
+   (rebind :s.0
+    (i 32)
+    (r6))
+   (add s.0 `tmp1.0)
+   (kill `tmp1.0)
+   (rebind :s.0
+    (i 32)
+    (r6))
+   (add s.0 t4.0)
+   (var :p.0
+    (s)Pair.0)
+   (prepare mk.0
+    (mov
+     (r0)s.0)
+    (mov
+     (arg `p0.0)
+     (r0))
+    (call))
+   (rebind :`tmp2.0
+    (i 32)
+    (r10))
+   (lea `tmp2.0 p.0)
+   (mov
+    (mem
+     (at
+      (cast
+       (aptr
+        (u 32))`tmp2.0)0))
+    (r0))
+   (mov
+    (mem
+     (at
+      (cast
+       (aptr
+        (u 32))`tmp2.0)1))t4.0)
+   (kill `tmp2.0)
+   (prepare exit.sys.
+    (mov
+     (r0)
+     (mem
+      (dot p.0 a.0)))
+    (rebind :`tmp3.0
+     (i 32)
+     (r2))
+    (mov `tmp3.0
+     (mem
+      (dot p.0 b.0)))
+    (add
+     (r0)`tmp3.0)
+    (kill `tmp3.0)
+    (mov
+     (arg `p0.0)
+     (r0))
+    (call))
+   (kill t1.0)
+   (kill t2.0)
+   (kill t4.0)
+   (kill s.0)
+   (mov
+    (r0)0)
+   (bl `mexit.0)))
+ (proc :mk.0
+  (params
+   (param :`p0.0
+    (r0)
+    (i 32)))
+  (result)
+  (clobber
+   (r0)
+   (r1)
+   (r2)
+   (r3))
+  (stmts
+   (sub
+    (sp)8)
+   (str
+    (mem
+     (sp)0)
+    (lr))
+   (str
+    (mem
+     (sp)4)
+    (r4))
+   (sub
+    (sp)
+    (ssize))
+   (mov
+    (r4)
+    (r0))
+   (var :`rettmp56.0
+    (s)Pair.0)
+   (mov
+    (mem
+     (dot `rettmp56.0 a.0))
+    (r4))
+   (rebind :`tmp0.0
+    (i 32)
+    (r1))
+   (add3 `tmp0.0
+    (r4)1)
+   (mov
+    (mem
+     (dot `rettmp56.0 b.0))`tmp0.0)
+   (kill `tmp0.0)
+   (rebind :`tmp1.0
+    (i 32)
+    (r10))
+   (lea `tmp1.0 `rettmp56.0)
+   (mov
+    (r0)
+    (mem
+     (at
+      (cast
+       (aptr
+        (u 32))`tmp1.0)0)))
+   (mov
+    (r1)
+    (mem
+     (at
+      (cast
+       (aptr
+        (u 32))`tmp1.0)1)))
+   (kill `tmp1.0)
+   (b `L1.0)
+   (lab :`L1.0)
+   (add
+    (sp)
+    (ssize))
+   (ldr
+    (r4)
+    (mem
+     (sp)4))
+   (ldr
+    (lr)
+    (mem
+     (sp)0))
+   (add
+    (sp)8)
+   (ret)))
+ (proc :id.0
+  (params
+   (param :`p0.0
+    (r0)
+    (i 32)))
+  (result :`ret.0
+   (r0)
+   (i 32))
+  (clobber
+   (r0)
+   (r1)
+   (r2)
+   (r3))
+  (stmts
+   (b `L2.0)
+   (lab :`L2.0)
+   (ret))))(.index
+ (x exit.sys. 517))
