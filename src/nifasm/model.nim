@@ -475,6 +475,13 @@ type
     ResultD = (ord(ResultTagId), "result")  ## result value declaration
     ClobberD = (ord(ClobberTagId), "clobber")  ## clobbered registers list
     VarD = (ord(VarTagId), "var")  ## variable declaration
+    MemmapD = (ord(MemmapTagId), "memmap")  ## Cortex-M: the board's memory layout, as arkham read it out of the `--layout:` file and forwarded. Children are the `region`/`place`/`console`/`stacks`/`heap`/`core` rows below. Supersedes the memory-map command-line flags
+    RegionD = (ord(RegionTagId), "region")  ## Cortex-M: a named memory region. The first `IDENT` is its name, the second is `rom` or `ram`, then an `(origin …)` and one size row. `rom` holds what the image ships with; `ram` holds nothing at reset
+    PlaceD = (ord(PlaceTagId), "place")  ## Cortex-M: which region a section lives in. the first `IDENT` is `text`, `rodata`, `data` or `bss`, the second names a region. `data`'s initializer image still ships in the region `text` is placed in — the startup copy is what puts it where this says
+    ConsoleD = (ord(ConsoleTagId), "console")  ## Cortex-M: where `write` goes and how `exit` ends. `IDENT` is `semihosting` (no further children) or `uart`, which takes an `(origin …)`
+    StacksD = (ord(StacksTagId), "stacks")  ## Cortex-M: the per-thread stack slots — a region name, a `(slots N)`, one size row for the SLOT, and a `(tls …)`. The slot size must be a power of two: a thread reaches its own TLS by masking SP with it
+    HeapD = (ord(HeapTagId), "heap")  ## Cortex-M: the heap — a region name and one size row. This is what the allocator gets pages from; there is no `.bss` array standing in for it
+    CoreD = (ord(CoreTagId), "core")  ## Cortex-M: which stack slot THIS image boots on. One image per core, so the number is a constant the author knows and not something read from a CPUID register — M-profile has no architectural core id
     InterruptsD = (ord(InterruptsTagId), "interrupts")  ## Cortex-M: the interrupt table, as `(irq N S)` children — handler `S` occupies architectural table slot `N`. Slots the module does not name stay zero. Slots 0 and 1 are the image writer's (initial MSP, reset) and may not appear
     IrqD = (ord(IrqTagId), "irq")  ## Cortex-M: one interrupt-table entry — slot number, then the handler symbol. Its address is baked with the Thumb bit, like every other code address on this target
     ArchD = (ord(ArchTagId), "arch")  ## architecture pragma: `x64`, `linux_arm64`, `arm64`, `win_x64`, `win_arm64`, `cortex_m`
@@ -489,11 +496,17 @@ type
     LenientD = (ord(LenientTagId), "lenient")  ## proc pragma (after the clobber section): the body is MACHINE-PORTED code (e.g. distilled from gcc), so the structural disciplines are off for this one proc — backward jumps to labels are allowed (no `(loop)` required), registers may be used raw even when bound (params, r11), a bare `(call P)`/`(jmp P)` to a proc needs no `(prepare)`, and the type/clobber checks are skipped. The checks exist to catch code-GENERATOR bugs; ported code was already correct on the machine it came from
 
 proc rawTagIsNifasmDecl*(raw: TagEnum): bool {.inline.} =
-  raw in {TypeTagId, ProcTagId, ParamsTagId, ParamTagId, ResultTagId, ClobberTagId, VarTagId, InterruptsTagId, IrqTagId, ArchTagId, CfvarTagId, RodataTagId, GvarTagId, TvarTagId, ImpTagId, ExtprocTagId, SyprocTagId, RegsTagId, LenientTagId}
+  raw in {TypeTagId, ProcTagId, ParamsTagId, ParamTagId, ResultTagId, ClobberTagId, VarTagId, MemmapTagId, RegionTagId, PlaceTagId, ConsoleTagId, StacksTagId, HeapTagId, CoreTagId, InterruptsTagId, IrqTagId, ArchTagId, CfvarTagId, RodataTagId, GvarTagId, TvarTagId, ImpTagId, ExtprocTagId, SyprocTagId, RegsTagId, LenientTagId}
 
 type
   NifasmExpr* = enum
     NoExpr
+    OriginX = (ord(OriginTagId), "origin")  ## Cortex-M: a region's, or a peripheral's, base address
+    BytesX = (ord(BytesTagId), "bytes")  ## Cortex-M: a size in bytes. NIF has no `4K` literal, so a size is a TAGGED quantity and the unit is never guessed from the number
+    KilobytesX = (ord(KilobytesTagId), "kilobytes")  ## Cortex-M: a size, times 1024
+    MegabytesX = (ord(MegabytesTagId), "megabytes")  ## Cortex-M: a size, times 1024*1024
+    SlotsX = (ord(SlotsTagId), "slots")  ## Cortex-M: how many stack slots the region holds
+    TlsX = (ord(TlsTagId), "tls")  ## Cortex-M: bytes reserved for thread-locals at the TOP of every stack slot, just below where SP starts. Takes one size row
     AlignX = (ord(AlignTagId), "align")  ## stack-slot alignment annotation (child of `(s)`)
     SsizeX = (ord(SsizeTagId), "ssize")  ## stack size expression; the optional `N` adds N bytes at THIS site only (the prologue folds its 16-alignment pad in)
     CsizeX = (ord(CsizeTagId), "csize")  ## call stack size expression
@@ -510,7 +523,7 @@ type
     RelocX = (ord(RelocTagId), "reloc")  ## rodata relocation: bake symbol S's address at byte offset O
 
 proc rawTagIsNifasmExpr*(raw: TagEnum): bool {.inline.} =
-  raw in {AlignTagId, SsizeTagId, CsizeTagId, DataloadTagId, DatavmaTagId, DatasizeTagId, BsssizeTagId, ArgTagId, ResTagId, DotTagId, AtTagId, MemTagId, CastTagId, RelocTagId}
+  raw in {OriginTagId, BytesTagId, KilobytesTagId, MegabytesTagId, SlotsTagId, TlsTagId, AlignTagId, SsizeTagId, CsizeTagId, DataloadTagId, DatavmaTagId, DatasizeTagId, BsssizeTagId, ArgTagId, ResTagId, DotTagId, AtTagId, MemTagId, CastTagId, RelocTagId}
 
 type
   X64Flag* = enum

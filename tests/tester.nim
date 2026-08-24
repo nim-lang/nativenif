@@ -1074,6 +1074,108 @@ proc cortexMUartTests() =
   echo passed, " / 3 Cortex-M UART console tests successful"
 
 
+proc cortexMLayoutTests() =
+  ## `--layout:<board.nif>` — the file that replaced a command-line namespace it
+  ## had outgrown. Regions are a LIST, a stack slot has a size and a count and a
+  ## thread-local reservation, and none of that survives being flattened into
+  ## `--flag:value` pairs.
+  ##
+  ## What is checked is that the FILE reaches the IMAGE, which means reading the
+  ## two words a cold core reads and the segment addresses back out of the ELF.
+  ## Running is not enough on its own: an image that ignored the file entirely
+  ## would still exit 42 from its compiled-in defaults.
+  let qemu = findExe(cortexMQemu)
+  if qemu.len == 0:
+    echo cortexMQemu, " not found - skipping Cortex-M layout tests"
+    return
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham_m" / "nimcache_m"
+  createDir workDir
+  let src = "tests" / "arkham_m" / "global_data_init.c.nif"
+  var passed = 0
+
+  proc u32At(img: string; off: int): uint32 =
+    for i in countdown(3, 0): result = (result shl 8) or uint32(img[off + i].byte)
+
+  proc build(board, stem: string): string =
+    let asmNif = workDir / (stem & ".asm.nif")
+    let elf = workDir / (stem & ".elf")
+    exec quoteShell(arkham) & " -a:cortex_m --layout:" & quoteShell(board) &
+         " -o:" & quoteShell(asmNif) & " " & quoteShell(src)
+    exec quoteShell(nifasmExe) & " -o:" & quoteShell(elf) & " " & quoteShell(asmNif)
+    result = elf
+
+  # ── 1. the MPS2 board: placed from the file, and RUNS ──
+  let mpsElf = build("tests" / "layout" / "mps2.nif", "layout_mps2")
+  var args: seq[string] = @[]
+  for a in cortexMArgs: args.add a
+  args.add mpsElf
+  let (mout, mcode) = runProgram(qemu, args)
+  if mcode != 42:
+    quit "FAILURE cortex-m layout: mps2 board exited " & $mcode & "\n" & mout
+  block:
+    let img = readFile(mpsElf)
+    # 16 bytes of globals, then a 16K heap, then the stacks rounded UP to the 8K
+    # slot size — 0x20006000 — so slot 0's top is 0x20008000 and SP starts below
+    # the 256-byte thread-local reservation at its top.
+    let msp = u32At(img, int(u32At(img, 52 + 4)))
+    if msp != 0x20007F00'u32:
+      quit "FAILURE cortex-m layout: mps2 initial MSP 0x" & toHex(msp, 8) &
+           ", want 0x20007F00 (globals + heap + slot - tls)"
+  inc passed
+
+  # ── 2. a DIFFERENT board moves everything ──
+  # An STM32F407: flash at 0x08000000, 128K of SRAM, a 32K heap and a 512-byte
+  # reservation. Nothing here can come from a compiled-in default.
+  let stmElf = build("tests" / "layout" / "stm32f407.nif", "layout_stm32")
+  block:
+    let img = readFile(stmElf)
+    let flashV = u32At(img, 52 + 8)
+    let msp = u32At(img, int(u32At(img, 52 + 4)))
+    if flashV != 0x08000000'u32:
+      quit "FAILURE cortex-m layout: stm32 text at 0x" & toHex(flashV, 8)
+    if msp != 0x2000BE00'u32:
+      quit "FAILURE cortex-m layout: stm32 initial MSP 0x" & toHex(msp, 8) &
+           ", want 0x2000BE00"
+  inc passed
+
+  # ── 3. what the file refuses ──
+  # The power-of-two rule is the one the whole thread-local scheme rests on: a
+  # thread reaches its own slot by masking SP with the slot size.
+  let bad = workDir / "bad_layout.nif"
+  proc reject(edit: (string, string); expected: string) =
+    var t = readFile("tests" / "layout" / "mps2.nif")
+    t = t.replace(edit[0], edit[1])
+    writeFile(bad, t)
+    execExpectFailure(quoteShell(arkham) & " -a:cortex_m --layout:" & quoteShell(bad) &
+                      " -o:" & quoteShell(workDir / "x.asm.nif") & " " & quoteShell(src),
+                      expected)
+  reject(("(kilobytes 8)", "(kilobytes 5)"), "power of two")
+  reject(("(place text flash)", "(place text sram)"), "`rom` region")
+  reject(("(place data sram)", "(place data ccm)"), "not declared")
+  reject(("(kilobytes 16)", "16"), "expected a size")
+  # A heap that does not fit is a LINK-time fact — arkham cannot know how many
+  # bytes of globals the module has — so this one is nifasm's to refuse.
+  block:
+    var t = readFile("tests" / "layout" / "mps2.nif")
+    t = t.replace("(kilobytes 16)", "(kilobytes 512)")
+    writeFile(bad, t)
+    let asmNif = workDir / "toobig.asm.nif"
+    exec quoteShell(arkham) & " -a:cortex_m --layout:" & quoteShell(bad) &
+         " -o:" & quoteShell(asmNif) & " " & quoteShell(src)
+    execExpectFailure(quoteShell(nifasmExe) & " -o:" & quoteShell(workDir / "x.elf") &
+                      " " & quoteShell(asmNif), "does not fit")
+  # A console in the file AND on the command line is a contradiction, not a
+  # precedence question.
+  execExpectFailure(quoteShell(arkham) & " -a:cortex_m --console:uart --layout:" &
+                    quoteShell("tests" / "layout" / "mps2.nif") & " -o:" &
+                    quoteShell(workDir / "x.asm.nif") & " " & quoteShell(src),
+                    "both name a console")
+  inc passed
+  echo passed, " / 3 Cortex-M layout-file tests successful"
+
+
 proc cortexMMemMapTests() =
   ## The board memory map (`--flash`/`--flash-size`/`--ram`/`--ram-size`/
   ## `--stack-top`) actually reaching the image.
@@ -1382,6 +1484,7 @@ cortexMAsmTests()
 cortexMMemMapTests()
 cortexMInterruptTests()
 cortexMUartTests()
+cortexMLayoutTests()
 arkhamCortexMTests()
 arkhamCortexM64Tests()
 

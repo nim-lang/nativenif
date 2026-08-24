@@ -1,0 +1,22 @@
+(.nif27)
+(memmap
+ (region flash rom
+  (origin 134217728)
+  (megabytes 1))
+ (region sram ram
+  (origin 536870912)
+  (kilobytes 128))
+ (place text flash)
+ (place rodata flash)
+ (place data sram)
+ (place bss sram)
+ (console uart
+  (origin 1073758208))
+ (stacks sram
+  (slots 4)
+  (kilobytes 8)
+  (tls
+   (bytes 512)))
+ (heap sram
+  (kilobytes 32))
+ (core 0))

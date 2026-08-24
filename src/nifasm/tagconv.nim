@@ -62,3 +62,10 @@ proc tagToMReg*(t: TagEnum): MReg {.inline.} =
     cast[MReg](t)
   else:
     NoMReg
+
+proc tagToNifasmExpr*(t: TagEnum): NifasmExpr {.inline.} =
+  ## Convert TagEnum to NifasmExpr. Returns NoExpr if not a valid NifasmExpr.
+  if rawTagIsNifasmExpr(t):
+    cast[NifasmExpr](t)
+  else:
+    NoExpr

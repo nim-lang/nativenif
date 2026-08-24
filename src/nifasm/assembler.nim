@@ -487,6 +487,8 @@ type
                                   # `(mem (sp)(arg pN))` with no per-call `sub sp`.
     csizePatches: seq[(int, int)] # (position, callStackDepth) for csize patches
     gvarSites: seq[(int, Symbol)] # (adrp position in .text, gvar symbol) for adrp+add patching
+    board: CortexMBoard           # the `(memmap …)` arkham forwarded, when one was
+                                  # given. Supersedes the memory-map flags.
     interrupts: seq[(int, Symbol)]
                                   # Cortex-M: (architectural table slot, handler).
                                   # Filled from `(interrupts …)`; the image writer
@@ -614,6 +616,17 @@ type
     okMimg      # Cortex-M: one of the four image-layout numbers (patched later)
     okArg       # Argument reference in prepare block
     okLabel     # Label reference
+
+  CortexMBoard = object
+    ## The board, reduced to what PLACEMENT needs. Derived from `(memmap …)`; see
+    ## `handleMemmap`.
+    given*: bool
+    flashOrigin*, flashSize*: uint32
+    ramOrigin*, ramSize*: uint32
+    slots*: int
+    slotSize*, tlsSize*: uint32
+    heapSize*: uint32
+    core*: int
 
   MimgKind = enum
     ## The four numbers the Cortex-M startup code needs and only the IMAGE WRITER
@@ -3074,7 +3087,8 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     discard "handle via `case instTag`"
   of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, LenientD,
      ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD,
-     InterruptsD, IrqD:
+     InterruptsD, IrqD, MemmapD, RegionD, PlaceD, ConsoleD, StacksD, HeapD,
+     CoreD:
     raiseAssert("Unhandled declaration tag: " & $declTag)
 
   # See the same step in `genInstX64`: an overflowing mnemonic's id is a leading
@@ -7887,7 +7901,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     return
   of NoDecl:
     discard "continue with case instTag"
-  of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, LenientD, ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD, InterruptsD, IrqD:
+  of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, LenientD, ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD, InterruptsD, IrqD, MemmapD, RegionD, PlaceD, ConsoleD, StacksD, HeapD, CoreD:
     error("Unexpected declaration: " & $declTag, n)
 
   # A mnemonic whose id overflowed the 9-bit tag field carries that id in a
@@ -9443,6 +9457,113 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     x86.emitPrefetchNta(ctx.buf.data, op.reg)
 
 
+proc readMemmapSize(n: var Cursor): uint32 =
+  ## `(bytes N)` — the only unit that reaches here. arkham normalizes
+  ## `(kilobytes …)`/`(megabytes …)` away before forwarding, so this reader never
+  ## multiplies and can never disagree with the one that did.
+  if n.kind != TagLit or tagToNifasmExpr(n.tag) != BytesX:
+    error("expected (bytes N) in (memmap …)", n)
+  var got = 0'u32
+  n.into:
+    if n.hasMore and n.kind == IntLit: (got = uint32(getInt(n)); inc n)
+    while n.hasMore: skip n
+  result = got
+
+proc readMemmapOrigin(n: var Cursor): uint32 =
+  if n.kind != TagLit or tagToNifasmExpr(n.tag) != OriginX:
+    error("expected (origin N) in (memmap …)", n)
+  var got = 0'u32
+  n.into:
+    if n.hasMore and n.kind == IntLit: (got = uint32(getInt(n)); inc n)
+    while n.hasMore: skip n
+  result = got
+
+proc handleMemmap(n: var Cursor; ctx: var GenContext) =
+  ## `(memmap …)` — the board, as arkham read it out of the `--layout:` file.
+  ##
+  ## nifasm does not open that file. It reads this, which arkham produced from it
+  ## with the sizes normalized: one description, one place it is interpreted, and
+  ## no way for the two tools to disagree about where a region is.
+  ##
+  ## What is taken is what PLACEMENT needs — the region `text` goes in, the region
+  ## `bss` goes in, and the stack/heap reservations inside the latter. The console
+  ## is arkham's and is already lowered into the shims by the time this arrives.
+  if ctx.arch != Arch.CortexM:
+    error("(memmap …) is a Cortex-M declaration", n)
+  var names: seq[string] = @[]
+  var origins: seq[uint32] = @[]
+  var sizes: seq[uint32] = @[]
+  var textRegion, bssRegion, dataRegion, stacksRegion, heapRegion = ""
+  proc regionIdx(nm: string): int =
+    for i, x in names:
+      if x == nm: return i
+    -1
+  n.into:
+   while n.hasMore:
+    if n.kind != TagLit: error("expected a declaration inside (memmap …)", n)
+    let d = tagToNifasmDecl(n.tag)
+    var e = n
+    skip n
+    case d
+    of RegionD:
+      e.into:
+        names.add e.strVal; inc e            # name
+        inc e                                # rom / ram: placement decides use
+        origins.add readMemmapOrigin(e)
+        sizes.add readMemmapSize(e)
+        while e.hasMore: skip e
+    of PlaceD:
+      e.into:
+        let sec = e.strVal; inc e
+        let reg = e.strVal; inc e
+        case sec
+        of "text": textRegion = reg
+        of "data": dataRegion = reg
+        of "bss": bssRegion = reg
+        else: discard                        # rodata rides with text
+        while e.hasMore: skip e
+    of StacksD:
+      e.into:
+        stacksRegion = e.strVal; inc e
+        if e.kind == TagLit and tagToNifasmExpr(e.tag) == SlotsX:
+          e.into:
+            if e.hasMore and e.kind == IntLit: (ctx.board.slots = int(getInt(e)); inc e)
+            while e.hasMore: skip e
+        ctx.board.slotSize = readMemmapSize(e)
+        if e.kind == TagLit and tagToNifasmExpr(e.tag) == TlsX:
+          e.into:
+            ctx.board.tlsSize = readMemmapSize(e)
+            while e.hasMore: skip e
+        while e.hasMore: skip e
+    of HeapD:
+      e.into:
+        heapRegion = e.strVal; inc e
+        ctx.board.heapSize = readMemmapSize(e)
+        while e.hasMore: skip e
+    of CoreD:
+      e.into:
+        if e.hasMore and e.kind == IntLit: (ctx.board.core = int(getInt(e)); inc e)
+        while e.hasMore: skip e
+    else: error("unexpected declaration inside (memmap …)", e)
+  # arkham validated the file; what is re-checked here is only what the FORWARD
+  # could get wrong, which is a region name that does not resolve.
+  let ti = regionIdx(textRegion)
+  let bi = regionIdx(bssRegion)
+  if ti < 0 or bi < 0: error("(memmap …) places a section in an undeclared region", n)
+  if dataRegion != bssRegion:
+    error("`data` and `bss` must be placed in the SAME region: they are one " &
+          "SRAM segment here, and the startup copy walks from one into the other", n)
+  if stacksRegion != bssRegion:
+    error("the stacks must be placed in the same region as `bss` — the image " &
+          "reserves them above the globals in that one region", n)
+  if heapRegion.len > 0 and heapRegion != bssRegion:
+    error("the heap must be placed in the same region as `bss`", n)
+  ctx.board.given = true
+  ctx.board.flashOrigin = origins[ti]
+  ctx.board.flashSize = sizes[ti]
+  ctx.board.ramOrigin = origins[bi]
+  ctx.board.ramSize = sizes[bi]
+
 proc handleInterrupts(n: var Cursor; ctx: var GenContext) =
   ## `(interrupts (irq N S)*)` — the Cortex-M interrupt table, as arkham resolved
   ## it.
@@ -9554,6 +9675,8 @@ proc pass2(n: Cursor; ctx: var GenContext) =
           skip n
         of ArchD:
           handleArch(n, ctx)
+        of MemmapD:
+          handleMemmap(n, ctx)
         of InterruptsD:
           handleInterrupts(n, ctx)
         of ImpD, ExtprocD, SyprocD:
@@ -10668,6 +10791,38 @@ proc writeCortexMImage(a: var GenContext; code: seq[byte];
         if it.off.int + i < bssImage.len:
           bssImage[it.off.int + i] = byte((it.val shr (8 * i)) and 0xFF)
 
+  # The BOARD wins when there is one: the `--layout:` file is the description of
+  # the part, and the flags are what it replaces. Their defaults would otherwise
+  # look like an answer.
+  var map = map
+  var stacksBase = 0'u32
+  var heapBase = 0'u32
+  if a.board.given:
+    map.flashBase = a.board.flashOrigin
+    map.flashSize = a.board.flashSize
+    map.ramBase = a.board.ramOrigin
+    map.ramSize = a.board.ramSize
+    # Inside the RAM region: globals from the base up (which is what every
+    # `movw/movt` site is already patched against), then the heap, then the
+    # stacks — which must start on a multiple of the SLOT SIZE, because a thread
+    # finds its own slot by masking SP with it. That alignment is the reason the
+    # stacks go last: rounding up wastes whatever is between them and the heap,
+    # and nothing after them has to pay for it.
+    let globalsEnd = map.ramBase + uint32((a.bssOffset + 3) and not 3)
+    heapBase = (globalsEnd + 7) and not 7'u32
+    let heapEnd = heapBase + a.board.heapSize
+    stacksBase = (heapEnd + a.board.slotSize - 1) and not (a.board.slotSize - 1)
+    let stacksEnd = stacksBase + uint32(a.board.slots) * a.board.slotSize
+    if stacksEnd > map.ramBase + map.ramSize or stacksEnd < stacksBase:
+      quit "nifasm: the layout does not fit: " & $a.bssOffset & " bytes of globals, " &
+           $a.board.heapSize & " of heap and " & $a.board.slots & " stack slot(s) of " &
+           $a.board.slotSize & " reach 0x" & toHex(stacksEnd, 8) & ", past the end " &
+           "of the " & $map.ramSize & "-byte region at 0x" & toHex(map.ramBase, 8)
+    # This image boots on ITS core's slot, and starts just below the slot's
+    # thread-local reservation — which lives at the TOP, so the stack grows DOWN
+    # away from it rather than into it.
+    map.stackTop = stacksBase + uint32(a.board.core + 1) * a.board.slotSize -
+                   a.board.tlsSize
   let bssVaddr = map.ramBase
   let codeVaddr = map.flashBase
   # NOT a constant any more: the table is two words when nothing handles an

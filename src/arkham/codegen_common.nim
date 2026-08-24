@@ -18,6 +18,7 @@ import symparser
 import nifcore, nifcdecl
 import slots, machinedesc, analyser, planer, programs, abi
 import machine_m                  # ConsoleKind: which console a Cortex-M image carries
+import layout                     # Layout: the `--layout:` board file
 import asmbuf
 import typenav
 export typenav   # SymCat / SymInfo / getType / exprSlot moved here; re-export so
@@ -152,6 +153,9 @@ type
                                              ## `exit` ends. `ckSemihosting` (the
                                              ## default) needs a debug agent for both;
                                              ## `ckUart` needs one for neither.
+    board*: layout.Layout                    ## the `--layout:` board, when one was
+                                             ## given. arkham reads it and forwards it;
+                                             ## nifasm places segments from the forward.
     uartBase*: int64                         ## the console UART's base address when
                                              ## `console == ckUart`. A BOARD fact — every
                                              ## real part puts its UART somewhere else —

@@ -16,6 +16,7 @@ import std / [parseopt, syncio, strutils]
 import nifcoreparse              # parseFromFile + nifcore
 import lengdecl                  # createLengTagPool
 import machine_m                  # ConsoleKind and the CMSDK UART defaults
+import layout                    # the --layout: board file
 import codegen_common            # (arkhamTempDbg: dumpTempStats)
 import codegen_arm               # BOTH Arm targets: AArch64 (Darwin/Linux) and
                                 # Cortex-M. One emitter, three machine models.
@@ -33,6 +34,13 @@ Options:
   --os:SYMBOL              target OS: linux | windows | macosx | embedded
                            (default: host)
   --cpu:SYMBOL             target CPU: amd64 | arm64 | arm32 (default: host)
+  --layout:FILE            cortex_m only: the BOARD — its memory regions, which
+                           region each section lives in, the console, the stack
+                           slots and their thread-local reservation, and the
+                           heap. A `(memmap …)` NIF tree; see doc/layout.md.
+                           Forwarded into the asm-NIF so nifasm places segments
+                           from the same description rather than reading the file
+                           a second time
   --console:WHERE          cortex_m only: where `write` goes and how `exit` ends.
                            `semihosting` (default) traps to a debug agent for
                            both — QEMU, or a probe. `uart` writes bytes to a
@@ -116,7 +124,8 @@ proc parseConsole(val: string; uartBase: var int64): machine_m.ConsoleKind =
        " (supported: semihosting, uart, uart:<addr>)", QuitFailure)
 
 proc run(input, output, arch: string;
-         console: machine_m.ConsoleKind; uartBase: int64) =
+         console: machine_m.ConsoleKind; uartBase: int64;
+         board: layout.Layout) =
   # One shared tag pool across the main module and any foreign modules the
   # program model loads on demand, so tag ordinals (hence stmtKind/typeKind
   # decoding) line up across modules.
@@ -128,7 +137,7 @@ proc run(input, output, arch: string;
              of "arm64", "aarch64", "": generateA64(buf, input, tags)
              of "linux_arm64", "linux_aarch64": generateA64(buf, input, tags, linux = true)
              of "cortex_m", "cortexm", "thumbm":
-               generateM(buf, input, tags, console, uartBase)
+               generateM(buf, input, tags, console, uartBase, board)
              else: quit("arkham: unknown --arch:" & arch, QuitFailure)
   writeFile(output, code)
 
@@ -137,6 +146,7 @@ proc main() =
   var console = machine_m.ckSemihosting
   var uartBase = machine_m.MpsUart0Base
   var consoleGiven = false
+  var board = Layout()
   for kind, key, val in getopt():
     case kind
     of cmdArgument:
@@ -150,6 +160,10 @@ proc main() =
       of "console":
         console = parseConsole(val, uartBase)
         consoleGiven = true
+      of "layout":
+        board = parseLayout(val)
+        let bad = layout.validate(board)
+        if bad.len > 0: quit("arkham --layout: " & bad, QuitFailure)
       of "help", "h": quit(Usage, QuitSuccess)
     of cmdEnd: discard
   if input.len == 0: quit(Usage, QuitSuccess)
@@ -166,7 +180,18 @@ proc main() =
     # peripheral for this flag to name. Silence would be the wrong answer for the
     # same reason the memory-map flags refuse it.
     quit("arkham: --console applies to the cortex_m target only", QuitFailure)
-  run(input, output, arch, console, uartBase)
+  # The layout's console is the board's own answer, so it wins over the flag —
+  # and giving both is a contradiction rather than a precedence question.
+  if board.given:
+    if consoleGiven:
+      quit("arkham: --console and --layout both name a console; the layout is " &
+           "the board's own description, so say it there", QuitFailure)
+    case board.console
+    of layout.ckSemihosting: console = machine_m.ckSemihosting
+    of layout.ckUart:
+      console = machine_m.ckUart
+      uartBase = int64(board.uartOrigin)
+  run(input, output, arch, console, uartBase, board)
   when defined(arkhamTempDbg): dumpTempStats()
 
 when isMainModule:

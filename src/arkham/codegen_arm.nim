@@ -30,7 +30,7 @@
 ## end-to-end; floats (HFAs in v0–v7), stack-passed args, and aggregate value
 ## codegen `raiseAssert` for now.
 
-import std / [assertions, tables, sets, strformat]
+import std / [assertions, tables, sets, strformat, strutils]
 import nifcore, nifcdecl
 import slots, machine, analyser, planer, programs
 from machine_m import nil
@@ -40,6 +40,7 @@ from machine_m import nil
   # visible at the use site, not decided by import order.
 import asmbuf
 import codegen_common
+import layout                    # the `--layout:` board file
 from arm64 import isLogicalImm   # nifasm: the bitmask-immediate predicate, so
                                  # arkham folds exactly the constants it can encode
 import stress
@@ -7772,7 +7773,8 @@ proc rejectForThumbM(g: var CodeGen) =
 
 proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                 console = machine_m.ckSemihosting;
-                uartBase = machine_m.MpsUart0Base): string =
+                uartBase = machine_m.MpsUart0Base;
+                board = layout.Layout()): string =
   ## Compile a parsed Leng module to Cortex-M (ARMv7E-M) asm-NIF, which nifasm's
   ## `cortex_m` target assembles into a bare-metal firmware image.
   ##
@@ -7785,7 +7787,8 @@ proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## the part with a formal model behind it (proofs/arkham_bindings.tla).
   setTargetWord Word32             # 4-byte pointers, 4-byte platform int
   var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: machine_m.cortexMMachine,
-                  thumbM: true, console: console, uartBase: uartBase)
+                  thumbM: true, console: console, uartBase: uartBase,
+                  board: board)
   g.ab.renderReg = machine_m.regNameM        # `(r0)`..`(r12)`/`(sp)`/`(lr)`
   g.ab.arch = "m"                  # no BodyLib entries apply to this target yet
   g.prog = collect(buf, inputPath, tags, darwin = false)
@@ -7813,6 +7816,33 @@ proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       g.ab.close()
     for sp in g.prog.syscalls:            # semihosting shims, called like any proc
       g.emitSemihostRuntime(sp)
+    # The board, forwarded for nifasm to place segments from — with every size
+    # NORMALIZED TO BYTES. The units are a convenience for whoever writes the
+    # file (`(kilobytes 8)` is what a datasheet says); a second reader that has to
+    # redo the multiplication is a second chance to get it wrong.
+    if g.board.given:
+      g.ab.tree NifasmDecl.MemmapD:
+        for r in g.board.regions:
+          g.ab.tree NifasmDecl.RegionD:
+            g.ab.ident r.name
+            g.ab.ident (if r.kind == layout.rkRom: "rom" else: "ram")
+            g.ab.tree OriginX: g.ab.intLit int64(r.origin)
+            g.ab.tree BytesX: g.ab.intLit int64(r.size)
+        for sec in layout.SectionKind:
+          g.ab.tree NifasmDecl.PlaceD:
+            g.ab.ident ($sec).substr(3).toLowerAscii
+            g.ab.ident g.board.place[sec]
+        g.ab.tree NifasmDecl.StacksD:
+          g.ab.ident g.board.stacksRegion
+          g.ab.tree SlotsX: g.ab.intLit int64(g.board.slotCount)
+          g.ab.tree BytesX: g.ab.intLit int64(g.board.slotSize)
+          g.ab.tree TlsX:
+            g.ab.tree BytesX: g.ab.intLit int64(g.board.tlsSize)
+        if g.board.heapRegion.len > 0:
+          g.ab.tree NifasmDecl.HeapD:
+            g.ab.ident g.board.heapRegion
+            g.ab.tree BytesX: g.ab.intLit int64(g.board.heapSize)
+        g.ab.tree NifasmDecl.CoreD: g.ab.intLit int64(g.board.core)
     # The interrupt table, as slots rather than names: WHICH slot a name denotes
     # is the machine model's answer (`machine_m.interruptSlot`), and nifasm's job
     # is to place an address in a word — so the name is resolved here and never

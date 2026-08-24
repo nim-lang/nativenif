@@ -37,6 +37,19 @@ nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
 | `(result D L T)`       | NifasmDecl                  | result value declaration |
 | `(clobber ...)`        | NifasmDecl                  | clobbered registers list |
 | `(var D L T)`          | NifasmDecl                  | variable declaration |
+| `(memmap ...)`         | NifasmDecl                  | Cortex-M: the board's memory layout, as arkham read it out of the `--layout:` file and forwarded. Children are the `region`/`place`/`console`/`stacks`/`heap`/`core` rows below. Supersedes the memory-map command-line flags |
+| `(region IDENT IDENT ...)` | NifasmDecl              | Cortex-M: a named memory region. The first `IDENT` is its name, the second is `rom` or `ram`, then an `(origin …)` and one size row. `rom` holds what the image ships with; `ram` holds nothing at reset |
+| `(origin N)`           | NifasmExpr                  | Cortex-M: a region's, or a peripheral's, base address |
+| `(bytes N)`            | NifasmExpr                  | Cortex-M: a size in bytes. NIF has no `4K` literal, so a size is a TAGGED quantity and the unit is never guessed from the number |
+| `(kilobytes N)`        | NifasmExpr                  | Cortex-M: a size, times 1024 |
+| `(megabytes N)`        | NifasmExpr                  | Cortex-M: a size, times 1024*1024 |
+| `(place IDENT IDENT)`  | NifasmDecl                  | Cortex-M: which region a section lives in. the first `IDENT` is `text`, `rodata`, `data` or `bss`, the second names a region. `data`'s initializer image still ships in the region `text` is placed in — the startup copy is what puts it where this says |
+| `(console IDENT ...)`  | NifasmDecl                  | Cortex-M: where `write` goes and how `exit` ends. `IDENT` is `semihosting` (no further children) or `uart`, which takes an `(origin …)` |
+| `(stacks IDENT ...)`   | NifasmDecl                  | Cortex-M: the per-thread stack slots — a region name, a `(slots N)`, one size row for the SLOT, and a `(tls …)`. The slot size must be a power of two: a thread reaches its own TLS by masking SP with it |
+| `(slots N)`            | NifasmExpr                  | Cortex-M: how many stack slots the region holds |
+| `(tls ...)`            | NifasmExpr                  | Cortex-M: bytes reserved for thread-locals at the TOP of every stack slot, just below where SP starts. Takes one size row |
+| `(heap IDENT ...)`     | NifasmDecl                  | Cortex-M: the heap — a region name and one size row. This is what the allocator gets pages from; there is no `.bss` array standing in for it |
+| `(core N)`             | NifasmDecl                  | Cortex-M: which stack slot THIS image boots on. One image per core, so the number is a constant the author knows and not something read from a CPUID register — M-profile has no architectural core id |
 | `(interrupts ...)`     | NifasmDecl                  | Cortex-M: the interrupt table, as `(irq N S)` children — handler `S` occupies architectural table slot `N`. Slots the module does not name stay zero. Slots 0 and 1 are the image writer's (initial MSP, reset) and may not appear |
 | `(irq N S)`            | NifasmDecl                  | Cortex-M: one interrupt-table entry — slot number, then the handler symbol. Its address is baked with the Thumb bit, like every other code address on this target |
 | `(arch x64/arm64)`     | NifasmDecl                  | architecture pragma: `x64`, `linux_arm64`, `arm64`, `win_x64`, `win_arm64`, `cortex_m` |
