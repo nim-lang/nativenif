@@ -3380,6 +3380,22 @@ proc emitIntrinsicOps(g: var CodeGen; op: IntrinsicOp; argBits: int;
   else:
     raiseAssert "arkham x64n: no lowering for intrinsic `" & IntrinsicNames[op] & "`"
 
+proc emitNullaryIntrinsicX64(g: var CodeGen; op: IntrinsicOp) =
+  ## A row with no operands and no result (`isNullaryVoid`): the opcode, and
+  ## nothing else. Kept apart from `emitIntrinsicOps` because there is no
+  ## `dst`/`src0` to hand it — nothing here is placed, sealed, bound or freed,
+  ## which is exactly why the two call sites below can take it before any of that
+  ## machinery runs.
+  case op
+  of CpuRelaxOp:
+    # `pause` is a `rep nop`: architecturally a no-op, so it needs no CPU feature
+    # test, and it clobbers nothing — not a register, not a flag, not memory. The
+    # register allocator therefore has nothing to hear about this node.
+    g.ab.keyword PauseX64
+  else:
+    raiseAssert "arkham x64n: no lowering for the nullary intrinsic `" &
+                IntrinsicNames[op] & "`"
+
 proc x64InoutTag(op: IntrinsicOp): X64Inst =
   ## The nifasm tag a two-address row emits. Name-for-name throughout — the row's
   ## name IS the assembler's mnemonic — so this crosses the two ENUMS and nothing
@@ -8510,6 +8526,15 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
       if d.kind == InReg: g.giveBack d.r
     dest = Location(kind: Undef)                # no value: nothing consumes this node
     return
+  if row.isNullaryVoid:
+    # Nothing to place, nothing to bind, nothing to give back. Taken before the
+    # seal/pick machinery below for the same reason `isMachineQuery` is: that
+    # machinery is written around `argCurs[0]` existing, and here there is no
+    # operand at all. `dest` stays `Undef` — the node yields no value, so nothing
+    # downstream consumes it.
+    g.emitNullaryIntrinsicX64(tgt.op)
+    dest = Location(kind: Undef)
+    return
   if tgt.op.isMachineQuery:
     # No operands to place and no flags to preserve: the whole node is "put this
     # machine fact in a register". Taken before the seal/pick machinery below
@@ -9496,13 +9521,19 @@ proc asmStmt(g: var CodeGen; c: Cursor) =
   of AsgnS: g.asmAsgn(c)
   of InstrS:
     # An instruction in statement position produces no value, so the rows that
-    # belong here are the two that have no result: one that writes through an
-    # `inout` operand, and one whose whole output is the flags.
+    # belong here are the three that have no result: one that writes through an
+    # `inout` operand, one whose whole output is the flags, and one that has no
+    # output of any kind (`cpuRelax`).
     let op = g.instrOpAt(c)
     if op != NoIntrinsicOp and IntrinsicRows[op].inoutOperand >= 0:
       g.asmInoutInstr(c, op)
     elif op != NoIntrinsicOp and IntrinsicRows[op].isFlagWrite:
       g.asmFlagInstr(c, op)
+    elif op != NoIntrinsicOp and IntrinsicRows[op].isNullaryVoid:
+      if tgX64 notin IntrinsicRows[op].targets:
+        lengError c, "`" & IntrinsicNames[op] & "` has no x86-64 lowering; an " &
+                  "`.assembler` proc has no fallback path", g.asmInfo
+      g.emitNullaryIntrinsicX64(op)
     else:
       lengError c, "an instruction used as a statement must have a destination",
                 g.asmInfo
