@@ -1,5 +1,5 @@
 #
-#           Arkham — native AArch64 code generator for Leng
+#           Arkham — native code generator for Leng
 #        (c) Copyright 2026 Andreas Rumpf
 #
 #    See the file "license.txt", included in this distribution.
@@ -7,12 +7,14 @@
 
 ## Enum-based builder for the typed asm-NIF that arkham feeds to `nifasm`.
 ##
-## The asm-NIF tag vocabulary is **nifasm's own generated enums** (`A64Inst`
-## for instructions/branches/`lab`/`stmts`, `NifasmDecl` for `proc`/`params`/
-## `extproc`/… — both from nativenif's `model.nim`, generated from
+## The asm-NIF tag vocabulary is **nifasm's own generated enums** (`A64Inst` /
+## `X64Inst` for instructions/branches/`lab`/`stmts`, `NifasmDecl` for `proc`/
+## `params`/`extproc`/… — all from nativenif's `model.nim`, generated from
 ## `doc/instructions.md`). Reusing them makes the assembler the single source
 ## of truth and compile-time-enforces that arkham only emits tags nifasm
-## accepts. Registers use arkham's own `machine.Reg`, rendered via `regName`.
+## accepts. Registers are arkham's arch-neutral `machine.Reg` slots, rendered
+## by the per-target `renderReg` shim (AArch64's `regName` unless a backend
+## overrides it — `codegen_x64` installs `x64RegName`).
 ## Built as a `nifcore` `TokenBuf` (the flexible NIF API) and serialized with
 ## `toString`.
 

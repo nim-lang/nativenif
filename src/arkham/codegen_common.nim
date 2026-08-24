@@ -301,6 +301,10 @@ type
                                              ## predicate; OvfCmpLo: the cmp's LHS
     ovfReg2*: Reg                             ## a64 OvfCmpLo: the cmp's RHS
     ovfBridges*: seq[Reg]                     ## a64: staging bridges the `(ovf)` test releases
+    tailCallEmitted*: bool                    ## a64: the call just emitted was a TAIL call
+                                              ## (`(popframe)` + `(tailcall)`), so control
+                                              ## has left the proc — the caller must not
+                                              ## also branch to the epilogue.
     lateBaseSpare*: Reg                       ## a64: a register the CALLER knows is dead across
                                               ## the lvalue premat it is about to run — offered to
                                               ## `lateGlobalBase` as a home for `&g` when neither a

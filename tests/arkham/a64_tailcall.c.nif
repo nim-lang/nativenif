@@ -1,0 +1,104 @@
+(.nif27)
+(.indexat 1)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :callee.0
+  (params
+   (param :a.0 .
+    (i 64))
+   (param :b.0 .
+    (i 64)))
+  (i 64)
+  (pragmas)
+  (stmts
+   (ret
+    (add
+     (i 64)
+     (mul
+      (i 64)a.0 10)
+     b.0))))
+ (proc :tailPlain.0
+  (params
+   (param :x.0 .
+    (i 64)))
+  (i 64)
+  (pragmas)
+  (stmts
+   (ret
+    (call callee.0 x.0 3))))
+ (proc :sink4.0
+  (params
+   (param :p.0 .
+    (i 64))
+   (param :q.0 .
+    (i 64))
+   (param :r.0 .
+    (i 64))
+   (param :s.0 .
+    (i 64)))
+  (i 64)
+  (pragmas)
+  (stmts
+   (ret
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (add
+       (i 64)p.0 q.0)
+      r.0)
+     s.0))))
+ (proc :tailBigFrame.0
+  (params
+   (param :n.0 .
+    (i 64)))
+  (i 64)
+  (pragmas)
+  (stmts
+   (var :arr.0 .
+    (array
+     (i 64) 4).)
+   (var :a.0 .
+    (i 64)
+    (call callee.0 n.0 1))
+   (var :b.0 .
+    (i 64)
+    (call callee.0 a.0 2))
+   (var :c.0 .
+    (i 64)
+    (call callee.0 b.0 3))
+   (asgn
+    (at arr.0 0)a.0)
+   (asgn
+    (at arr.0 3)c.0)
+   (ret
+    (call sink4.0 a.0 b.0 c.0
+     (add
+      (i 64)
+      (at arr.0 0)
+      (at arr.0 3))))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :t.0 .
+    (i 64)
+    (call tailPlain.0 4))
+   (var :u.0 .
+    (i 64)
+    (call tailBigFrame.0 1))
+   (call exit.0
+    (add
+     (i 64)
+     (sub
+      (i 64)t.0 40)
+     (mod
+      (i 64)u.0 100))))))(.index)

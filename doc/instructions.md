@@ -1,3 +1,22 @@
+# `nifasm` tag vocabulary
+
+The complete tag set of the asm-NIF dialect `nifasm` reads: types, declarations,
+addressing-mode expressions, registers, flags, and every machine instruction of
+every target. See [nifasm.md](nifasm.md) for what the language *means*; this is
+the authoritative list of what exists.
+
+The `Enums` column names the Nim enums a tag becomes a member of, and thereby
+which target it belongs to: `X64Inst` (x86-64), `A64Inst` (AArch64), `MInst`
+(Thumb-2 / Cortex-M), or several of them for the cross-target vocabulary. This
+table is the input to
+`tools/gen_instructions.nim`, which generates `src/nifasm/tags.nim` (the tag ids)
+and `src/nifasm/model.nim` (the enums). Both are generated — edit this file, not
+them, and regenerate from the repository root:
+
+```sh
+nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
+```
+
 | Tag                    | Enums                       |   Description |
 |------------------------|-----------------------------|---------------|
 | `(bool)`               | NifasmType                  | boolean type |
@@ -184,6 +203,8 @@
 | `(jp L)`               | X64Inst                  | jump if parity (unordered float compare) |
 | `(call T ...)`         | X64Inst, A64Inst, MInst | function call marker inside prepare |
 | `(extcall)`            | X64Inst, A64Inst, MInst | external call marker inside prepare |
+| `(tailcall T ...)`     | A64Inst                  | tail-call marker inside prepare: branch, no link |
+| `(popframe)`           | A64Inst                  | undo this proc's prologue (frame sub + saved pairs) |
 | `(iat S)`              | X64Inst                  | indirect call through IAT (Import Address Table) |
 | `(ret)`                | X64Inst, A64Inst, MInst | return instruction |
 | `(push O)`             | X64Inst                  | push to stack |
