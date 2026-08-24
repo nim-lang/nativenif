@@ -512,6 +512,12 @@ proc emitRet*(dest: var Bytes) = dest.emitBx(LR)
 
 proc emitNop*(dest: var Bytes) = dest.emitNarrow 0xBF00'u16
 
+proc emitYield*(dest: var Bytes) =
+  ## YIELD — the spin-wait hint, `hint #1`, encoded narrow exactly as `nop`
+  ## (`hint #0`) is. A core with no use for it executes it as a `nop`, which is
+  ## what every current Cortex-M does, so this needs no feature test.
+  dest.emitNarrow 0xBF10'u16
+
 proc emitBkpt*(dest: var Bytes; imm: uint8) =
   ## BKPT #imm8. With imm8 = 0xAB this IS the ARM semihosting call on M-profile:
   ## operation in r0, parameter block in r1, result back in r0.

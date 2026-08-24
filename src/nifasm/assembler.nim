@@ -3945,6 +3945,10 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     arm64.emitClrex(ctx.buf.data)
 
+  of YieldA64:
+    inc n
+    arm64.emitYield(ctx.buf.data)
+
   of VgreqA64:
     # (vgreq D S) — D = valgrind's answer to the request block at S.
     #
@@ -5660,6 +5664,9 @@ proc genInstM(n: var Cursor; ctx: var GenContext) =
   of NopM:
     inc n
     thumb2.emitNop(ctx.buf.data)
+  of YieldM:
+    inc n
+    thumb2.emitYield(ctx.buf.data)
   of WfiM:
     inc n
     thumb2.emitWfi(ctx.buf.data)

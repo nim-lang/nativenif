@@ -6580,6 +6580,23 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
     if tgt.op in VecOps:
       g.emitVecInstr2(c, tgt.op, argCurs, dest)
       return
+  if row.isNullaryVoid:
+    # No operands to place, no result to home, nothing to free — and taken here
+    # because everything below is written around `argCurs[0]` existing. `dest`
+    # stays `Undef`: the node yields no value.
+    case tgt.op
+    of CpuRelaxOp:
+      # `yield` is HINT #1: architecturally a NOP, so it needs no feature test,
+      # and it writes no register, no flag and no memory. Nothing to tell the
+      # allocator about. Both Arm profiles have it and both spell it `yield` —
+      # only the tag differs, because the tag names the instruction SET.
+      if g.thumbM: g.ab.keyword YieldM
+      else: g.ab.keyword YieldA64
+    else:
+      raiseAssert "arkham arm: no lowering for the nullary intrinsic `" &
+                  IntrinsicNames[tgt.op] & "`"
+    dest = Location(kind: Undef)
+    return
   # Resolve the result FIRST and seal it, so an operand pick cannot land on it.
   var res = Location(kind: Undef)
   if not row.isVoidResult:

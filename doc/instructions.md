@@ -441,6 +441,7 @@ nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
 | `(stlr D S)`         | A64Inst                 | store-release register |
 | `(dmb)`              | A64Inst                 | data memory barrier (inner shareable) |
 | `(clrex)`            | A64Inst                 | clear exclusive monitor |
+| `(yield)`            | A64Inst, MInst          | spin-wait hint (`hint #1`). One row for both Arm profiles because it is one instruction: `YIELD` is the same architectural hint on AArch64 and on ARMv7-M, and on both it is defined to execute as a `nop` where the implementation has nothing to do with it. That is what makes it safe to emit unconditionally — no feature test, no `when` at the call site |
 | `(d0)`             | A64Reg                   | fp register d0 |
 | `(d1)`             | A64Reg                   | fp register d1 |
 | `(d2)`             | A64Reg                   | fp register d2 |

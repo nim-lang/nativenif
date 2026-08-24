@@ -1,0 +1,79 @@
+(.nif27)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :cpuRelax.0
+  (params).
+  (pragmas
+   (intrinsic "CpuRelax"))
+  (stmts .))
+ (proc :spin.0
+  (params
+   (param :n.0 .
+    (i 64)))
+  (i 64)
+  (pragmas)
+  (stmts
+   (var :i.0 .
+    (i 64)0)
+   (var :acc.0 .
+    (i 64)0)
+   (while
+    (lt i.0 n.0)
+    (stmts
+     (instr cpuRelax.0)
+     (asgn acc.0
+      (add
+       (i 64)acc.0 i.0))
+     (asgn i.0
+      (add
+       (i 64)i.0 1))))
+   (ret acc.0)))
+ (proc :manylive.0
+  (params
+   (param :a.0 .
+    (i 64))
+   (param :b.0 .
+    (i 64))
+   (param :c.0 .
+    (i 64))
+   (param :d.0 .
+    (i 64)))
+  (i 64)
+  (pragmas)
+  (stmts
+   (instr cpuRelax.0)
+   (ret
+    (add
+     (i 64)
+     (add
+      (i 64)a.0 b.0)
+     (add
+      (i 64)c.0 d.0)))))
+ (proc :onlyHint.0
+  (params).
+  (pragmas)
+  (stmts
+   (instr cpuRelax.0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (call onlyHint.0)
+   (var :r.0 .
+    (i 64)
+    (call spin.0 8))
+   (var :m.0 .
+    (i 64)
+    (call manylive.0 1 2 3 4))
+   (instr cpuRelax.0)
+   (call exit.0
+    (add
+     (i 64)r.0 m.0)))))
