@@ -6,7 +6,7 @@ Design goals:
 - Complete control over the emitted binary. It is a real assembler, not an abstract machine!
 - Compute what is "easy enough" directly in the assembler (object field offsets, stack offsets)
   so that it does not even have to be verified.
-- Bring **structured programming** to assembler, the way nimony's NJVL IR does, so that
+- Bring **structured programming** to assembler, the way nimony's Leng IR does, so that
   validation passes can be done extremely cheaply without complex fixpoint computations.
 - Bring **type safety** to assembler so that code generator bugs can be found without even
   having to run the resulting programs.
@@ -35,8 +35,7 @@ The type system's goal is not only type checking but also facilitates the comput
 
 A key insight here is while assembler does not allow unnamed temporary expressions there is no reason it cannot keep field names instead of offsets (no control is lost). Likewise, structured control flow — `loop` and `ite` with forward-only `lab`/`jmp`, the shape Leng's Final IR already has — is easy enough to map to labels and offsets (no control is lost either).
 
-Note on notation: this document shows the NIF text format, and every integer literal is a
-plain number (`64`, not `+64`). The complete tag vocabulary — every type, declaration,
+Note on notation: this document shows the NIF text format. The complete tag vocabulary — every type, declaration,
 addressing mode, register, flag and machine instruction of both targets — is
 [instructions.md](instructions.md). What follows is what those tags *mean*.
 

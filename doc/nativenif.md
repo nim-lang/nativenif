@@ -1,10 +1,6 @@
 # nativenif
 
-`nativenif` translates NIF code directly to machine code. No external tools are
-required: the system ships with its own assembler and linker. Much complexity is
-avoided because it is not built on ELF and DWARF as a *compilation* interface —
-it exploits NIF's benefits instead and only emits the object formats at the very
-end, as output.
+`nativenif` is a toolchain to translate NIF code directly to machine code. No external tools are required, the system ships with an assembler and linker. Much complexity is avoided as the system is not based on ELF and DWARF but instead exploits NIF's many benefits.
 
 The input language is **Leng**, the mid-level NIF dialect nimony compiles to
 (nimony's [doc/leng-spec.md](https://github.com/nim-lang/nimony/blob/master/doc/leng-spec.md)).
@@ -52,13 +48,6 @@ system linker instead (macOS arm64).
 [doc/nifasm.md](nifasm.md) is the language; [doc/instructions.md](instructions.md)
 is the complete tag vocabulary.
 
-## Where the optimizer is
-
-Not here. An in-tree optimizer (`nativeopt`) was planned — inlining, copy
-propagation, CSE, induction variables — and those passes were built, but
-**upstream in nimony**, as `src/lengc/shoggoth`, operating on NJVL before Leng
-is emitted. arkham consumes the result (`.oc.nif`) and does not optimize beyond
-peephole work of its own.
 
 ## Also in this repository
 
