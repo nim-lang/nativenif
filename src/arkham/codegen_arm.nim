@@ -6565,8 +6565,13 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
     lengError c, "`" & IntrinsicNames[tgt.op] & "` is a flag instruction; flags " &
               "are only legal inside an `{.assembler.}` proc, which the AArch64 " &
               "backend does not support yet", lengInfo(c)
-  if tgA64 notin row.targets:
-    lengError c, "`" & IntrinsicNames[tgt.op] & "` has no AArch64 lowering — " &
+  # The target actually being emitted. `codegen_arm` serves both Arm targets, and
+  # reading `tgA64` for both was a proxy that held only while no row distinguished
+  # them. The volatile rows do.
+  let here = if g.thumbM: tgThumbM else: tgA64
+  if here notin row.targets:
+    lengError c, "`" & IntrinsicNames[tgt.op] & "` has no " &
+              (if g.thumbM: "Cortex-M" else: "AArch64") & " lowering — " &
               "guard the call with a `when`"
   when declared(VecOps):                         # see the staging guard above
     if tgt.op in VecOps:
@@ -6599,6 +6604,54 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
     g.emitAtomicInstr2(c, tgt.op, argCurs, res)
     for d in ops:
       if not (res.kind == InReg and d.kind == InReg and d.r == res.r): g.freeVal(d)
+    return
+  if tgt.op.isVolatile:
+    # ONE access, at exactly the pointee's width, and no more of a lowering than
+    # that: a volatile access is the one place where "the same value, fetched
+    # differently" is the wrong answer.
+    #
+    # The width comes from the TYPE at the call site, not from `tgt.argBits`,
+    # which reads the first declared parameter — here a `ptr T`, whose own bits
+    # say nothing about the cell.
+    #
+    # And it comes from the POINTER, not from the value or the result. Those agree
+    # whenever the source went through `volatileStore[T](dest: ptr T; val: T)`, so
+    # this only ever differs for hand-written asm-NIF — where the pointer is still
+    # the one operand that cannot be wrong about the cell it addresses.
+    var ptrTyp = g.getType(argCurs[0])
+    ptrTyp = g.prog.resolveType(ptrTyp)
+    let cellTyp =
+      if ptrTyp.kind == TagLit and ptrTyp.typeKind in {LengType.PtrT, LengType.AptrT}:
+        g.prog.innerType(ptrTyp)
+      elif tgt.op == VolatileLoadOp: g.getType(c)
+      else: g.getType(argCurs[1])
+    let cell = slotOf(g.prog, cellTyp)
+    if cell.kind == AMem or cell.kind == AFloat or cell.size > wordSize() or
+       cell.size notin {1, 2, 4, 8}:
+      lengError c, "a volatile access must be ONE machine access, and a " &
+                $cell.size & "-byte cell is not one on this target — no " &
+                "widening, no splitting into halves, because for a device " &
+                "register the difference is what the device sees",
+                lengInfo(c)
+    var pt = g.prog.ptrTypeOf(cellTyp)
+    # The base is `(cast (ptr T) <reg>)` rather than a bare `(mem <reg> 0)`,
+    # which nifasm reads as a plain machine word: the cast is what sizes the
+    # access, and a sub-word cell without it is silently widened.
+    if tgt.op == VolatileLoadOp:
+      g.ab.tree MovA64:
+        g.emReg res.r
+        g.ab.tree MemX:
+          g.ab.tree CastX: (g.genTypeBody(pt); g.emReg ops[0].r)
+          g.ab.intLit 0
+    else:
+      g.ab.tree MovA64:
+        g.ab.tree MemX:
+          g.ab.tree CastX: (g.genTypeBody(pt); g.emReg ops[0].r)
+          g.ab.intLit 0
+        g.emReg ops[1].r
+    for d in ops:
+      if not (res.kind == InReg and d.kind == InReg and d.r == res.r): g.freeVal(d)
+    dest = res
     return
   if res.kind != InReg:
     raiseAssert "arkham a64n: intrinsic result is not in a register"

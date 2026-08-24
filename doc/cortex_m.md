@@ -295,8 +295,40 @@ stdout and stderr are the same stream.
   Float parameters and results stay on the empty-signature manual-marshalling
   path, as they do on AArch64 — `isDeclarativeAbi` excludes them — so the
   assembler never sees a float in a `(param …)`.
-* **M6 — actually embedded.** Volatile MMIO, and a UART output backend so real
-  hardware works without a debugger attached.
+* **M6 — actually embedded.** A UART output backend, so real hardware works
+  without a debugger attached.
+
+  **Volatile MMIO is DONE.** `volatileLoad(p)` / `volatileStore(p, v)` from
+  `std/volatile` — Nim's names and Nim's signatures, so source written against
+  that module compiles here unchanged.
+
+  Deliberately NOT a type qualifier. A qualifier is viral: it reaches every type
+  comparison, every signature and every generic instantiation, in order to
+  express a property that belongs to the ACCESS and not to the memory. As
+  intrinsics it stays at the access site, which is where it is true.
+
+  What the rows promise: the access happens, exactly once, at exactly the
+  pointee's width, and is not reordered against another volatile access. What
+  they do NOT promise is a barrier or any order against ORDINARY memory — the
+  same line C draws, and drawn there because a peripheral write does not flush a
+  store buffer. `dmb`/`dsb` are their own instructions for when a device needs
+  more.
+
+  A cell too wide for one machine access is REFUSED, not split: `volatileLoad`
+  of a 64-bit cell on this target is two `ldr`s, and two accesses is not what a
+  device register was asked for. The width comes from the POINTER — the one
+  operand that cannot be wrong about the cell it addresses.
+
+  The half that was not the interface: `IntrinsicRow.effects` had been in the
+  table since it was written and NOTHING had ever read it, while the optimizer's
+  purity predicates tested `(call …)` and did not know `(instr …)` existed. So
+  `cse.isPureExpr` answered TRUE for every intrinsic. `shoggoth/intrinsiceffects`
+  is the reader; `Ctz` and friends still say `efPure` and stay optimisable.
+
+  This is also the first row to claim `tgThumbM`. Until it, arkham's Arm emitter
+  read `tgA64` for both Arm targets — a proxy that held only while no row
+  distinguished them, and one nothing had noticed because every fixture reaching
+  an `(instr …)` was already in `cortexMUnsupported` for an unrelated reason.
 
   **Interrupt handlers are DONE.** `proc onTick {.interrupt: "SysTick".}` in Leng
   becomes a word in the image's interrupt table. Three things had to be true for

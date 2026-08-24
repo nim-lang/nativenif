@@ -974,6 +974,10 @@ const cortexMRejections: seq[(string, string)] = @[
   # Two handlers for one entry. A table word holds one address, so the second
   # would silently win; refusing is the only reading that is not a coin toss.
   ("err_interrupt_dup", "a table word holds one address"),
+  # A volatile access wider than one machine access. Splitting it into halves is
+  # two accesses, which is not what a device register was asked for — and the
+  # 64-bit path exists on this target, so nothing but the row's meaning stops it.
+  ("err_volatile_wide", "must be ONE machine access"),
 ]
 
 proc cortexMInterruptTests() =
@@ -989,7 +993,7 @@ proc cortexMInterruptTests() =
                       " " & quoteShell("tests" / "arkham_m" / (name & ".c.nif")),
                       expected)
     inc passed
-  echo passed, " / ", cortexMRejections.len, " Cortex-M interrupt rejection tests successful"
+  echo passed, " / ", cortexMRejections.len, " Cortex-M interrupt/volatile rejection tests successful"
 
 
 proc cortexMMemMapTests() =

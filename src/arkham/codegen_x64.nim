@@ -8503,6 +8503,39 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
       if d.kind == InReg and d.isTemp and not (res.kind == InReg and d.r == res.r):
         g.giveBack d.r
     return
+  if tgt.op.isVolatile:
+    # ONE access, at exactly the pointee's width. `emMemAt` is the same typed
+    # deref the atomics use, and for the same reason: an untyped `(mem p)` is a
+    # 64-bit access, so a sub-word device register would be read or written eight
+    # bytes wide.
+    #
+    # The POINTER decides the width, not the value or the result — those agree
+    # whenever the source came through `volatileStore[T](dest: ptr T; val: T)`,
+    # and where they do not the pointer is still the operand that cannot be wrong
+    # about the cell it addresses.
+    var ptrTyp = g.prog.resolveType(g.getType(argCurs[0]))
+    let cellTyp =
+      if ptrTyp.kind == TagLit and ptrTyp.typeKind in {LengType.PtrT, LengType.AptrT}:
+        g.prog.innerType(ptrTyp)
+      elif tgt.op == VolatileLoadOp: g.getType(c)
+      else: g.getType(argCurs[1])
+    let cell = slotOf(g.prog, cellTyp)
+    if cell.kind == AMem or cell.kind == AFloat or cell.size > wordSize() or
+       cell.size notin {1, 2, 4, 8}:
+      lengError c, "a volatile access must be ONE machine access, and a " &
+                $cell.size & "-byte cell is not one on this target — no " &
+                "widening, no splitting into halves, because for a device " &
+                "register the difference is what the device sees",
+                lengInfo(c)
+    if tgt.op == VolatileLoadOp:
+      g.ab.tree MovX64: (g.emReg res.r; g.emMemAt(ops[0].r, cellTyp))
+    else:
+      g.ab.tree MovX64: (g.emMemAt(ops[0].r, cellTyp); g.emReg ops[1].r)
+    for d in ops:
+      if d.kind == InReg and d.isTemp and not (res.kind == InReg and d.r == res.r):
+        g.giveBack d.r
+    dest = res
+    return
   if res.kind != InReg:
     raiseAssert "arkham x64n: intrinsic result is not in a register"
   # The transliteration (the old emitInstr2 tail, over the fresh decisions).
