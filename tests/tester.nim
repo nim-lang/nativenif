@@ -265,7 +265,7 @@ proc arkhamWinUnwindTests() =
     echo "0 / 0 arkham win64 unwind tests (wine not installed)"
     return
   let arkham = ("bin" / "arkham").addFileExt(ExeExt)
-  let nifasm = ("src" / "nifasm" / "nifasm").addFileExt(ExeExt)
+  let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
   let workDir = "tests" / "arkham" / "nimcache"
   let asmNif = workDir / "win_stacktrace.asm.nif"
   let exe = workDir / "win_stacktrace.exe"
@@ -304,7 +304,7 @@ proc arkhamWinTraceTableTests() =
     echo "0 / 0 arkham win64 trace-table tests (wine not installed)"
     return
   let arkham = ("bin" / "arkham").addFileExt(ExeExt)
-  let nifasm = ("src" / "nifasm" / "nifasm").addFileExt(ExeExt)
+  let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
   let workDir = "tests" / "arkham" / "nimcache"
   let asmNif = workDir / "win_tracetable.asm.nif"
   let exe = workDir / "win_tracetable.exe"
@@ -317,6 +317,22 @@ proc arkhamWinTraceTableTests() =
          " (want 7 = magic|below-table|near-table)"
   echo "1 / 1 arkham win64 trace-table tests successful"
 
+proc buildToolchain() =
+  ## `bin/arkham` and `bin/nifasm`, built ONCE and BEFORE anything that runs them.
+  ##
+  ## They used to be built inside `arkhamTests`, which is two mistakes at once:
+  ## that proc runs AFTER every Cortex-M suite, and it is `when`-gated to the two
+  ## hosts whose output actually executes. So on a clean checkout the Cortex-M
+  ## suites found no binaries — the qemu-gated ones skipped and said nothing,
+  ## `cortexMInterruptTests` is a COMPILE-time rejection and rightly does not
+  ## skip, and it failed with `bin/arkham: not found`.
+  ##
+  ## It never showed in a developer's tree, where both binaries are always lying
+  ## around from the last manual build. That is exactly the class of thing CI is
+  ## for, and the fix is to stop having a build be a side effect of a test.
+  exec "nim c --hints:off src/arkham/arkham.nim"   # `--outdir: bin` in its nim.cfg
+  exec "nim c --hints:off -o:bin/nifasm src/nifasm/nifasm.nim"
+
 proc arkhamTests() =
   ## Each `tests/arkham/*.c.nif` is hand-written Leng: arkham generates asm-NIF,
   ## nifasm assembles+links it to a native executable, and we check the run's exit
@@ -324,10 +340,8 @@ proc arkhamTests() =
   ## empty). The target arch follows the host so the binaries actually run here:
   ## x86-64/ELF on Linux, AArch64/Mach-O on macOS.
   const arch = when defined(macosx): "arm64" else: "x64"
-  exec "nim c src/arkham/arkham.nim"
-  exec "nim c src/nifasm/nifasm.nim"
   let arkham = ("bin" / "arkham").addFileExt(ExeExt)
-  let nifasm = ("src" / "nifasm" / "nifasm").addFileExt(ExeExt)
+  let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
   let workDir = "tests" / "arkham" / "nimcache"
   createDir workDir
   # Foreign helper modules (`mod_*.c.nif`) are not standalone tests: compile each
@@ -489,7 +503,7 @@ proc arkhamStressTests(arch: string; runner = ""; skip: seq[string] = @[];
   ## prefixes the produced executable (`qemu-aarch64` for the `linux_arm64` pass).
   exec "nim c --hints:off -d:arkhamStress -o:bin/arkham_stress src/arkham/arkham.nim"
   let arkham = ("bin" / "arkham_stress").addFileExt(ExeExt)
-  let nifasm = ("src" / "nifasm" / "nifasm").addFileExt(ExeExt)
+  let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
   let workDir = "tests" / "arkham" / "nimcache"
   createDir workDir
   # Inherited by the arkham children.
@@ -589,7 +603,7 @@ proc arkhamQemuTests() =
          "(install: sudo apt-get install qemu-user)"
     return
   let arkham = ("bin" / "arkham").addFileExt(ExeExt)
-  let nifasm = ("src" / "nifasm" / "nifasm").addFileExt(ExeExt)
+  let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
   let workDir = "tests" / "arkham" / "nimcache"
   createDir workDir
   for file in walkFiles("tests" / "arkham" / "mod_*.c.nif"):
@@ -632,6 +646,10 @@ proc arkhamQemuTests() =
     inc passed
   echo passed, " / ", total, " arkham linux_arm64 (qemu) tests successful (",
        skipped, " Darwin-only skipped)"
+
+# BEFORE anything that runs them, and unconditionally: a suite that skips still
+# leaves the next one needing these, and not every suite here can skip.
+buildToolchain()
 
 when defined(macosx):
   exec "nim c -r src/nifasm/nifasm tests/hello_darwin.nif"
