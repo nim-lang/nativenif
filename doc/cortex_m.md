@@ -75,6 +75,7 @@ Nothing structural. Remaining gaps are named at their sites:
 
 | | |
 |---|---|
+| Spelled | `--os:embedded --cpu:arm32`, in nimony and arkham alike (`-a:cortex_m` still works). Not `--os:standalone`, which is Nim's word for a freestanding-with-a-`panicoverride` build nothing here offers; not `--os:none`, because the OS name becomes a `defined()` symbol and `defined(none)` says nothing about what is being built |
 | Core | Cortex-M4F, **ARMv7E-M** (Thumb-2 only — there is no A32 state on M-profile) |
 | Why this one | The dominant 32-bit MCU class: STM32F3/F4/L4, nRF52832/52840, SAMD51, Kinetis K, LPC4000. Binaries run unchanged on Cortex-M7 and M33; a Cortex-M3 subset is a config flag, not a second backend. |
 | Not this one | Cortex-M0/M0+ is ARMv6-M: no `sdiv`/`udiv`, crippled high registers, 16-bit Thumb-1 subset. That is a separate backend, not a subset of this one. |

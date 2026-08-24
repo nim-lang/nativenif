@@ -1078,19 +1078,19 @@ proc cortexMMemMapTests() =
   inc passed
 
   # ── 3. the target triple, which is how nimony names this target ──
-  # `--os:none --cpu:arm32` and the legacy `-a:cortex_m` must select the same
+  # `--os:embedded --cpu:arm32` and the legacy `-a:cortex_m` must select the same
   # backend, so compare the OUTPUT rather than trusting the mapping table: this
   # is the spelling `deps.nim` forwards verbatim from nimony's platform table,
   # and a mapping that quietly picked another arch would still exit 0.
   let byTriple = workDir / "memmap_triple.asm.nif"
-  exec quoteShell(arkham) & " --os:none --cpu:arm32 -o:" & quoteShell(byTriple) &
+  exec quoteShell(arkham) & " --os:embedded --cpu:arm32 -o:" & quoteShell(byTriple) &
        " " & quoteShell(src)
   if readFile(byTriple) != readFile(asmNif):
-    quit "FAILURE cortex-m: --os:none --cpu:arm32 does not select the same " &
+    quit "FAILURE cortex-m: --os:embedded --cpu:arm32 does not select the same " &
          "backend as -a:cortex_m"
   # `--cpu:arm` is what was written before the rename and still resolves.
   let byOldCpu = workDir / "memmap_triple_arm.asm.nif"
-  exec quoteShell(arkham) & " --os:none --cpu:arm -o:" & quoteShell(byOldCpu) &
+  exec quoteShell(arkham) & " --os:embedded --cpu:arm -o:" & quoteShell(byOldCpu) &
        " " & quoteShell(src)
   if readFile(byOldCpu) != readFile(asmNif):
     quit "FAILURE cortex-m: --cpu:arm no longer resolves to arm32"
