@@ -88,6 +88,10 @@ type
                              ## construct maps one-to-one to an instruction and every
                              ## location is declared, so it bypasses the register
                              ## allocator entirely. See `doc/intrinsics.md` §8.
+    irqName*: string         ## `(interrupt "SysTick")`: the exception or interrupt
+                             ## this proc handles. The name is the target's to read —
+                             ## `machine_m.interruptSlot` turns it into a slot in the
+                             ## interrupt table — and it is empty for an ordinary proc.
     isNaked*: bool           ## `(naked)`: emit NO prologue and NO epilogue. The proc
                              ## does not touch SP, so on entry SP still points at the
                              ## return address — which is the only way a routine can
@@ -317,7 +321,7 @@ proc lookupSyscall*(name: string): tuple[found: bool, x64, a64: int] =
 
 proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
                   intrinsic: var IntrinsicOp; asmProc: var bool;
-                  dllN: var string; nakedProc: var bool) =
+                  dllN: var string; nakedProc: var bool; irqN: var string) =
   if c.substructureKind == PragmasU:
     c.into:
       while c.hasMore:
@@ -329,6 +333,13 @@ proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
         of NakedP:
           nakedProc = true
           skip c
+        of InterruptP:
+          # `(interrupt "SysTick")` — the vector this proc handles. WHICH names
+          # exist is this back end's question (sem deliberately does not ask), so
+          # only the string is taken here; `generateM` resolves it against the
+          # target's table and refuses an unknown one BY NAME.
+          c.into:
+            if c.hasMore: (irqN = strVal(c); inc c)
         of ImportcP:
           c.into:
             if c.hasMore: (importcN = strVal(c); inc c)
@@ -364,7 +375,9 @@ proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
                   intrinsic: var IntrinsicOp; asmProc: var bool;
                   dllN: var string) {.inline.} =
   var ignoredNaked = false
-  parsePragmas(c, importcN, exportcN, intrinsic, asmProc, dllN, ignoredNaked)
+  var ignoredIrq = ""
+  parsePragmas(c, importcN, exportcN, intrinsic, asmProc, dllN, ignoredNaked,
+               ignoredIrq)
 
 proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
                   intrinsic: var IntrinsicOp; asmProc: var bool) {.inline.} =
@@ -673,13 +686,14 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         var intrinsic = NoIntrinsicOp
         var asmProc = false
         var nakedProc = false
+        var irqN = ""
         c.into:
           pname = symName(c); inc c           # name
           skip c                              # params
           retType = c                         # return-type cursor (for getType)
           retFloat = c.kind == TagLit and c.typeKind == FT   # `(f N)` return → v0
           skip c                              # return type
-          parsePragmas(c, importcN, exportcN, intrinsic, asmProc, dllN, nakedProc)
+          parsePragmas(c, importcN, exportcN, intrinsic, asmProc, dllN, nakedProc, irqN)
           skip c                              # body
         let sigType = procSigType(procStart)  # the proc-value's `(proctype …)` (for getType)
         if intrinsic != NoIntrinsicOp:
@@ -766,7 +780,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                                                 retFloat: retFloat, retType: retType, sigType: sigType,
                                                 declarative: isDeclarativeAbi(result, procStart))
           result.procs.add ProcInfo(asmName: asmN, decl: procStart, isEntry: entry,
-                                    isAsm: asmProc, isNaked: nakedProc)
+                                    isAsm: asmProc, isNaked: nakedProc, irqName: irqN)
       else:
         skip c
   # Emit the entry proc first so it begins the text section.

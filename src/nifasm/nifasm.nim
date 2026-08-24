@@ -32,7 +32,7 @@ Options:
   --ram:ADDR                Cortex-M only: base of the SRAM region
                             (default 0x20000000)
   --ram-size:N              its size (default 64K)
-  --stack-top:ADDR          initial MSP — vector-table word 0. Must lie inside
+  --stack-top:ADDR          initial MSP — interrupt-table word 0. Must lie inside
                             the RAM region (default: the top of it)
                             Sizes take a K/M/G suffix; addresses take 0x.
                             Together these are the two lines of linker script a

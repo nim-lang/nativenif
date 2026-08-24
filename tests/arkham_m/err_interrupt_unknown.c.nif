@@ -1,0 +1,14 @@
+(.nif27)
+(stmts
+ (proc :onWhat.0
+  (params).
+  (pragmas
+   (interrupt "Timer3"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (ret 0))))

@@ -7629,6 +7629,31 @@ proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool): string =
       g.ab.close()
     for sp in g.prog.syscalls:            # semihosting shims, called like any proc
       g.emitSemihostRuntime(sp)
+    # The interrupt table, as slots rather than names: WHICH slot a name denotes
+    # is the machine model's answer (`machine_m.interruptSlot`), and nifasm's job
+    # is to place an address in a word — so the name is resolved here and never
+    # leaves. Emitted before the bodies only so it reads first; it is a
+    # declaration and its position in the module carries no meaning.
+    var handlers: seq[(int, string)] = @[]
+    for info in g.prog.procs:
+      if info.irqName.len == 0: continue
+      let slot = machine_m.interruptSlot(info.irqName)
+      if slot < 0:
+        quit "arkham cortex-m: `" & info.irqName & "` is not an interrupt of " &
+             "this target. Expected one of NMI, HardFault, MemManage, BusFault, " &
+             "UsageFault, SVCall, DebugMon, PendSV, SysTick, or IRQ<n>."
+      for (s, other) in handlers:
+        if s == slot:
+          quit "arkham cortex-m: interrupt `" & info.irqName & "` is claimed by " &
+               "both " & other & " and " & info.asmName &
+               " — a table word holds one address."
+      handlers.add (slot, info.asmName)
+    if handlers.len > 0:
+      g.ab.tree NifasmDecl.InterruptsD:
+        for (slot, nm) in handlers:
+          g.ab.tree NifasmDecl.IrqD:
+            g.ab.intLit int64(slot)
+            g.ab.sym nm
     for info in g.prog.procs:
       genProc2(g, info)
     # AFTER the bodies: whether anything divides is only known once they are

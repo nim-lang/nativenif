@@ -966,6 +966,32 @@ proc cortexMAsmTests() =
   echo passed, " / ", fixtures.len, " Cortex-M assembler tests successful"
 
 
+const cortexMRejections: seq[(string, string)] = @[
+  # A name this target has no such thing as. WHICH names exist is arkham's
+  # question by design — sem deliberately does not ask — so this is the only
+  # place the answer can be given, and it is given BY NAME.
+  ("err_interrupt_unknown", "is not an interrupt of this target"),
+  # Two handlers for one entry. A table word holds one address, so the second
+  # would silently win; refusing is the only reading that is not a coin toss.
+  ("err_interrupt_dup", "a table word holds one address"),
+]
+
+proc cortexMInterruptTests() =
+  ## The two ways to name an interrupt handler wrong. The POSITIVE path is
+  ## `tests/arkham_m/interrupt_pendsv`, which pends PendSV through ICSR and exits
+  ## with what the handler wrote — so it runs the table, the Thumb bit and the
+  ## handler's return, not just the emission.
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  var passed = 0
+  for (name, expected) in cortexMRejections:
+    execExpectFailure(quoteShell(arkham) & " -a:cortex_m -o:" &
+                      quoteShell("tests" / "arkham_m" / (name & ".rej.nif")) &
+                      " " & quoteShell("tests" / "arkham_m" / (name & ".c.nif")),
+                      expected)
+    inc passed
+  echo passed, " / ", cortexMRejections.len, " Cortex-M interrupt rejection tests successful"
+
+
 proc cortexMMemMapTests() =
   ## The board memory map (`--flash`/`--flash-size`/`--ram`/`--ram-size`/
   ## `--stack-top`) actually reaching the image.
@@ -973,7 +999,7 @@ proc cortexMMemMapTests() =
   ## The load-bearing case is the RELOCATED one, and it is relocated within the
   ## address range QEMU's SSRAM covers so that it can be RUN rather than merely
   ## inspected: if any of the globals' `movw/movt` sites, the `(datavma)` the
-  ## startup copy writes to, or the vector table's initial-MSP word still carried
+  ## startup copy writes to, or the interrupt table's initial-MSP word still carried
   ## a compiled-in constant, the fixture reads a global that was never written or
   ## pushes onto a stack that is not there. It exits 42 only if all three follow
   ## the map.
@@ -1051,7 +1077,30 @@ proc cortexMMemMapTests() =
     quit "FAILURE cortex-m memmap: reset vector 0x" & toHex(reset, 8)
   inc passed
 
-  # ── 3. the bounds, which are the whole point of declaring a size ──
+  # ── 3. the target triple, which is how nimony names this target ──
+  # `--os:none --cpu:arm32` and the legacy `-a:cortex_m` must select the same
+  # backend, so compare the OUTPUT rather than trusting the mapping table: this
+  # is the spelling `deps.nim` forwards verbatim from nimony's platform table,
+  # and a mapping that quietly picked another arch would still exit 0.
+  let byTriple = workDir / "memmap_triple.asm.nif"
+  exec quoteShell(arkham) & " --os:none --cpu:arm32 -o:" & quoteShell(byTriple) &
+       " " & quoteShell(src)
+  if readFile(byTriple) != readFile(asmNif):
+    quit "FAILURE cortex-m: --os:none --cpu:arm32 does not select the same " &
+         "backend as -a:cortex_m"
+  # `--cpu:arm` is what was written before the rename and still resolves.
+  let byOldCpu = workDir / "memmap_triple_arm.asm.nif"
+  exec quoteShell(arkham) & " --os:none --cpu:arm -o:" & quoteShell(byOldCpu) &
+       " " & quoteShell(src)
+  if readFile(byOldCpu) != readFile(asmNif):
+    quit "FAILURE cortex-m: --cpu:arm no longer resolves to arm32"
+  # `standalone` is Nim's word for a different arrangement and must NOT be taken
+  # for this one.
+  execExpectFailure(quoteShell(arkham) & " --os:standalone --cpu:arm32 -o:" &
+                    quoteShell(workDir / "memmap_x.asm.nif") & " " & quoteShell(src),
+                    "unknown --os:standalone")
+
+  # ── 4. the bounds, which are the whole point of declaring a size ──
   execExpectFailure(quoteShell(nifasmExe) & " --flash-size:256 -o:" &
                     quoteShell(workDir / "memmap_x.elf") & " " & quoteShell(asmNif),
                     "holds 256")
@@ -1067,7 +1116,8 @@ proc cortexMMemMapTests() =
                     "outside the RAM region")
   inc passed
 
-  echo passed, " / 3 Cortex-M memory-map tests successful"
+  inc passed
+  echo passed, " / 4 Cortex-M memory-map and target-triple tests successful"
 
 
 const cortexMUnsupported: seq[string] = @[
@@ -1214,6 +1264,7 @@ proc arkhamCortexMTests() =
   var passed = 0
   for file in walkFiles("tests/arkham_m/*.c.nif"):
     let stem = file.extractFilename.replace(".c.nif", "")
+    if stem.startsWith("err_"): continue   # must NOT compile; see cortexMInterruptTests
     let expectedCode = parseInt(readFile("tests" / "arkham_m" / (stem & ".exitcode")).strip())
     inc total
     let asmFile = "tests" / "arkham_m" / (stem & ".asm.nif")
@@ -1247,6 +1298,7 @@ vgClientRequestEncodingTests()
 thumb2SelfTest()
 cortexMAsmTests()
 cortexMMemMapTests()
+cortexMInterruptTests()
 arkhamCortexMTests()
 arkhamCortexM64Tests()
 

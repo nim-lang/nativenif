@@ -16,11 +16,11 @@
 ## swapped pair — the loader just maps the wrong thing with the wrong
 ## permissions.
 ##
-## What this writes is not a hosted executable but a FIRMWARE IMAGE: a vector
+## What this writes is not a hosted executable but a FIRMWARE IMAGE: an interrupt
 ## table at the load address followed by code and rodata, with no interpreter, no
 ## dynamic section and no symbol resolution. QEMU's `-kernel` reads the program
 ## headers and copies each segment to its physical address; the M-profile core
-## then resets by reading the vector table, so `e_entry` is advisory and the
+## then resets by reading the interrupt table, so `e_entry` is advisory and the
 ## table is what actually decides where execution begins.
 
 import buffers
@@ -62,7 +62,7 @@ type
 
 const
   FlashBase* = 0x00000000'u32
-    ## Where the vector table must live out of reset (VTOR is 0 then). On MPS2
+    ## Where the interrupt table must live out of reset (VTOR is 0 then). On MPS2
     ## this region is ZBT SRAM rather than real flash, so an image may write to it.
   FlashSize* = 0x00400000'u32
     ## 4 MB — the MPS2 ZBT SRAM block at 0. Also the smallest number that is not
@@ -90,7 +90,7 @@ type
     flashBase*, flashSize*: uint32
     ramBase*, ramSize*: uint32
     stackTop*: uint32
-      ## The initial MSP — vector-table word 0. Defaults to the top of RAM; the
+      ## The initial MSP — interrupt-table word 0. Defaults to the top of RAM; the
       ## stack grows DOWN from here while the globals grow UP from `ramBase`.
     given*: bool
       ## Any of the above was set explicitly. Only so that setting them for a
@@ -122,14 +122,20 @@ proc validate*(m: MemoryMap): string =
     return "the stack top is outside the RAM region"
   return ""
 
-proc initVectorTable*(stackTop: uint32; resetHandler: uint32): seq[byte] =
-  ## The two words an M-profile core reads at reset.
+proc initInterruptTable*(stackTop: uint32; resetHandler: uint32;
+                         sizeInBytes = 8): seq[byte] =
+  ## The two words an M-profile core reads at reset, in a table of `sizeInBytes`.
   ##
   ## Word 1 MUST have bit 0 set: it is the Thumb-state bit, not part of the
   ## address. Clearing it does not branch to an odd address, it takes a
   ## UsageFault on the first instruction — and since the fault handler slot is
   ## also empty at that point, the core locks up with no diagnostic.
-  result = newSeq[byte](8)
+  ##
+  ## Every word past the second is left ZERO here; the caller fills the ones a
+  ## handler claimed. A slot nobody claimed keeps that zero, which faults on the
+  ## same INVSTATE rule and escalates to a lockup — deterministic and findable,
+  ## which a branch into whatever follows a too-short table is not.
+  result = newSeq[byte](max(sizeInBytes, 8))
   let entry = resetHandler or 1'u32
   for i in 0 ..< 4:
     result[i] = byte((stackTop shr (8 * i)) and 0xFF)
@@ -191,13 +197,16 @@ proc writeElf32*(segments: openArray[Segment]; entry: uint32): seq[byte] =
   result = newSeq[byte](out0.len)
   for i in 0 ..< out0.len: result[i] = out0[i]
 
-const VectorTableSize* = 8
-  ## The two words this writer emits: initial MSP and reset handler. Code is laid
-  ## out assuming it starts this far above the load address.
+const InterruptTableSize* = 8
+  ## The SMALLEST table: the two words a cold core reads. An image whose module
+  ## declares handlers gets a longer one — `assembler.interruptTableBytes`
+  ## decides, and every address in that image is measured from its answer rather
+  ## than from this. Still the default for `writeFirmware`, which serves the
+  ## encoder self-test's hand-assembled images and has no handlers to place.
 
 proc writeFirmware*(code: seq[byte]; entryOffset = 0; loadAddr = FlashBase;
                     stackTop = DefaultStackTop): seq[byte] =
-  ## The single-segment case: a vector table followed by `code`, all in the code
+  ## The single-segment case: a interrupt table followed by `code`, all in the code
   ## region.
   ##
   ## `entryOffset` is the reset handler's position WITHIN `code` — not within the
@@ -207,10 +216,10 @@ proc writeFirmware*(code: seq[byte]; entryOffset = 0; loadAddr = FlashBase;
   ## with procs, where the entry is wherever its label landed.
   ##
   ## `code` must already have been laid out assuming it starts at
-  ## `loadAddr + VectorTableSize` — the caller emits it that way, so nothing is
+  ## `loadAddr + InterruptTableSize` — the caller emits it that way, so nothing is
   ## relocated here.
-  let entry = loadAddr + uint32(VectorTableSize + entryOffset)
-  var image = initVectorTable(stackTop, entry)
+  let entry = loadAddr + uint32(InterruptTableSize + entryOffset)
+  var image = initInterruptTable(stackTop, entry)
   image.add code
   result = writeElf32([Segment(vaddr: loadAddr, data: image,
                                memSize: image.len,

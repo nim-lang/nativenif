@@ -475,6 +475,8 @@ type
     ResultD = (ord(ResultTagId), "result")  ## result value declaration
     ClobberD = (ord(ClobberTagId), "clobber")  ## clobbered registers list
     VarD = (ord(VarTagId), "var")  ## variable declaration
+    InterruptsD = (ord(InterruptsTagId), "interrupts")  ## Cortex-M: the interrupt table, as `(irq N S)` children — handler `S` occupies architectural table slot `N`. Slots the module does not name stay zero. Slots 0 and 1 are the image writer's (initial MSP, reset) and may not appear
+    IrqD = (ord(IrqTagId), "irq")  ## Cortex-M: one interrupt-table entry — slot number, then the handler symbol. Its address is baked with the Thumb bit, like every other code address on this target
     ArchD = (ord(ArchTagId), "arch")  ## architecture pragma: `x64`, `linux_arm64`, `arm64`, `win_x64`, `win_arm64`, `cortex_m`
     CfvarD = (ord(CfvarTagId), "cfvar")  ## control flow variable declaration
     RodataD = (ord(RodataTagId), "rodata")  ## read-only data (string/bytes)
@@ -487,7 +489,7 @@ type
     LenientD = (ord(LenientTagId), "lenient")  ## proc pragma (after the clobber section): the body is MACHINE-PORTED code (e.g. distilled from gcc), so the structural disciplines are off for this one proc — backward jumps to labels are allowed (no `(loop)` required), registers may be used raw even when bound (params, r11), a bare `(call P)`/`(jmp P)` to a proc needs no `(prepare)`, and the type/clobber checks are skipped. The checks exist to catch code-GENERATOR bugs; ported code was already correct on the machine it came from
 
 proc rawTagIsNifasmDecl*(raw: TagEnum): bool {.inline.} =
-  raw in {TypeTagId, ProcTagId, ParamsTagId, ParamTagId, ResultTagId, ClobberTagId, VarTagId, ArchTagId, CfvarTagId, RodataTagId, GvarTagId, TvarTagId, ImpTagId, ExtprocTagId, SyprocTagId, RegsTagId, LenientTagId}
+  raw in {TypeTagId, ProcTagId, ParamsTagId, ParamTagId, ResultTagId, ClobberTagId, VarTagId, InterruptsTagId, IrqTagId, ArchTagId, CfvarTagId, RodataTagId, GvarTagId, TvarTagId, ImpTagId, ExtprocTagId, SyprocTagId, RegsTagId, LenientTagId}
 
 type
   NifasmExpr* = enum

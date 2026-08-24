@@ -487,6 +487,10 @@ type
                                   # `(mem (sp)(arg pN))` with no per-call `sub sp`.
     csizePatches: seq[(int, int)] # (position, callStackDepth) for csize patches
     gvarSites: seq[(int, Symbol)] # (adrp position in .text, gvar symbol) for adrp+add patching
+    interrupts: seq[(int, Symbol)]
+                                  # Cortex-M: (architectural table slot, handler).
+                                  # Filled from `(interrupts …)`; the image writer
+                                  # bakes each address, Thumb bit set.
     mimgSites: seq[(int, MimgKind)]
                                   # Cortex-M: (MOVW position in .text, which layout number).
                                   # Patched by `writeCortexMImage` for the same reason
@@ -3069,7 +3073,8 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of NoDecl:
     discard "handle via `case instTag`"
   of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, LenientD,
-     ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD:
+     ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD,
+     InterruptsD, IrqD:
     raiseAssert("Unhandled declaration tag: " & $declTag)
 
   # See the same step in `genInstX64`: an overflowing mnemonic's id is a leading
@@ -7882,7 +7887,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     return
   of NoDecl:
     discard "continue with case instTag"
-  of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, LenientD, ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD:
+  of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, LenientD, ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD, InterruptsD, IrqD:
     error("Unexpected declaration: " & $declTag, n)
 
   # A mnemonic whose id overflowed the 9-bit tag field carries that id in a
@@ -9438,6 +9443,68 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     x86.emitPrefetchNta(ctx.buf.data, op.reg)
 
 
+proc handleInterrupts(n: var Cursor; ctx: var GenContext) =
+  ## `(interrupts (irq N S)*)` — the Cortex-M interrupt table, as arkham resolved
+  ## it.
+  ##
+  ## The SLOT is arkham's answer: which architectural entry a name denotes is a
+  ## machine-model fact, so nothing here maps names. What this owns is the
+  ## consequence — the table's size, and an address in each word it was given.
+  ##
+  ## Every handler is marked USED. Nothing in the program calls one — it is
+  ## reached only through this table — so without that it is dropped by the same
+  ## reachability walk that drops any unreferenced proc, and the image gets a
+  ## table word pointing at a proc that was never emitted.
+  if ctx.arch != Arch.CortexM:
+    error("(interrupts …) is a Cortex-M declaration", n)
+  # `into`, not a bare `inc`: `hasMore` on an unbounded cursor keeps reading into
+  # the declaration's SIBLINGS, so the loop below ran on into the next `(proc …)`.
+  n.into:
+   while n.hasMore:
+    if n.kind != TagLit or tagToNifasmDecl(n.tag) != IrqD:
+      error("Expected (irq <slot> <handler>) in (interrupts …)", n)
+    var e = n
+    skip n
+    e.into:
+      if e.kind != IntLit: error("Expected an interrupt slot number", e)
+      let slot = int(getInt(e))
+      inc e
+      if e.kind != Symbol: error("Expected a handler symbol in (irq …)", e)
+      # Slots 0 and 1 are the image writer's: word 0 is the initial MSP, a value
+      # and not a handler, and word 1 is reset, which IS the entry proc. A second
+      # claim on either would be silently overwritten by the writer.
+      if slot < 2:
+        error("interrupt slot " & $slot & " is the image writer's (initial MSP, reset)", e)
+      let name = getSym(e)
+      let sym = lookupWithAutoImport(ctx, ctx.scope, name, e)
+      if sym == nil: error("Unknown interrupt handler: " & name, e)
+      ctx.markSymbolUsed(name)
+      ctx.interrupts.add (slot, sym)
+      inc e
+
+const
+  CoreInterruptWords* = 16
+    ## Words 0..15: MSP, reset, and every ARCHITECTURAL exception through SysTick.
+    ## A table is never shorter than this once it is a table at all, because those
+    ## exceptions do not have to be enabled to be TAKEN — a fault reaching past the
+    ## end of a shorter table would read whatever code follows and branch into it.
+    ## A word no handler claimed stays zero, which faults, escalates, and locks the
+    ## core up: deterministic, findable on a debugger, and not arbitrary execution.
+  MinInterruptWords* = 2
+    ## What an image with NO handler carries: the two words a cold core reads. The
+    ## fault-slot argument above does not reach it — there is nothing to put in
+    ## those slots, and every image ever built by this assembler has had two.
+
+proc interruptTableBytes(a: GenContext): int =
+  ## The table's size, which is what every other layout number here is measured
+  ## from. Known once the declarations have been read, which is before `absBase`
+  ## is set and therefore before any address is computed.
+  if a.interrupts.len == 0: return MinInterruptWords * 4
+  var top = CoreInterruptWords
+  for (slot, _) in a.interrupts:
+    if slot + 1 > top: top = slot + 1
+  result = top * 4
+
 proc pass2(n: Cursor; ctx: var GenContext) =
   ## Pass2: Generate code only for top-level instructions (entry point).
   ## Declarations (procs, rodata, gvars, etc.) are NOT generated here,
@@ -9487,6 +9554,8 @@ proc pass2(n: Cursor; ctx: var GenContext) =
           skip n
         of ArchD:
           handleArch(n, ctx)
+        of InterruptsD:
+          handleInterrupts(n, ctx)
         of ImpD, ExtprocD, SyprocD:
           # Already handled in pass1, skip. A syproc emits no code: it is a
           # syscall's proctype + number, consulted by the `(syscall)`/`(svc)` marker.
@@ -10601,6 +10670,10 @@ proc writeCortexMImage(a: var GenContext; code: seq[byte];
 
   let bssVaddr = map.ramBase
   let codeVaddr = map.flashBase
+  # NOT a constant any more: the table is two words when nothing handles an
+  # exception and at least sixteen when something does, so every address below is
+  # measured from this rather than from a fixed 8.
+  let itBytes = a.interruptTableBytes
   # A global initialized with another SYMBOL's address — `var hook = twice`, `var
   # alias = addr counter` — is a relocation, not a constant, so it is baked here
   # once every label has a position. Without this the cell stays zero and the
@@ -10612,7 +10685,7 @@ proc writeCortexMImage(a: var GenContext; code: seq[byte];
   if a.bssSymInits.len > 0 and bssImage.len > 0:
     var labelPos = initTable[int, int]()
     for ld in a.buf.labels: labelPos[int(ld.id)] = ld.position
-    let codeBase = codeVaddr + uint32(elf32.VectorTableSize)
+    let codeBase = codeVaddr + uint32(itBytes)
     for it in a.bssSymInits:
       var targetVaddr = 0'u32
       case it.sym.kind
@@ -10654,11 +10727,11 @@ proc writeCortexMImage(a: var GenContext; code: seq[byte];
       case it.sym.kind
       of skProc:
         if labelPos.hasKey(it.sym.offset):
-          targetVaddr = codeVaddr + uint32(elf32.VectorTableSize) +
+          targetVaddr = codeVaddr + uint32(itBytes) +
                         uint32(labelPos[it.sym.offset]) + 1'u32   # Thumb bit
       of skRodata:
         if labelPos.hasKey(it.sym.offset):
-          targetVaddr = codeVaddr + uint32(elf32.VectorTableSize) +
+          targetVaddr = codeVaddr + uint32(itBytes) +
                         uint32(labelPos[it.sym.offset])
       of skGvar:
         targetVaddr = bssVaddr + uint32(it.sym.size)
@@ -10707,11 +10780,20 @@ proc writeCortexMImage(a: var GenContext; code: seq[byte];
   let dataInitSize = min((dataHigh + 3) and not 3, ramSize)
   let bssZeroSize = ramSize - dataInitSize
 
-  var image = elf32.initVectorTable(map.stackTop,
-                              codeVaddr + uint32(elf32.VectorTableSize + entryOff))
+  var image = elf32.initInterruptTable(map.stackTop,
+                              codeVaddr + uint32(itBytes + entryOff), itBytes)
+  # Every other word the module claimed. The Thumb bit for the same reason the
+  # reset vector carries one: a branch to an even address asks for ARM state,
+  # which M-profile does not have, and takes an INVSTATE UsageFault instead of
+  # entering the handler.
+  for (slot, sym) in a.interrupts:
+    let target = codeVaddr + uint32(itBytes) +
+                 uint32(a.buf.getLabelPosition(LabelId(sym.offset))) + 1'u32
+    for i in 0 ..< 4:
+      image[slot * 4 + i] = byte((target shr (8 * i)) and 0xFF)
   # The initializer image is appended AFTER the code, 4-aligned so the startup
   # copy — which moves whole words — reads aligned on both sides.
-  let codeEnd = elf32.VectorTableSize + patched.len
+  let codeEnd = itBytes + patched.len
   let dataLoadOff = (codeEnd + 3) and not 3
   let dataLoadAddr = codeVaddr + uint32(dataLoadOff)
 
@@ -10750,7 +10832,7 @@ proc writeCortexMImage(a: var GenContext; code: seq[byte];
     # broken copy would still pass every fixture in the corpus.
     segs.add elf32.Segment(vaddr: bssVaddr, data: @[], memSize: ramSize,
                      flags: elf32.PF_R or elf32.PF_W)
-  result = elf32.writeElf32(segs, codeVaddr + uint32(elf32.VectorTableSize + entryOff))
+  result = elf32.writeElf32(segs, codeVaddr + uint32(itBytes + entryOff))
 
 proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
                listing = ""; debugInfo = true;
@@ -10897,7 +10979,7 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
       # image base because the vector table sits there. Without it every
       # `(adr …)` would resolve 8 bytes low — near enough to look plausible and
       # read the wrong bytes.
-      ctx.buf.absBase = memMap.flashBase + uint32(elf32.VectorTableSize)
+      ctx.buf.absBase = memMap.flashBase + uint32(ctx.interruptTableBytes)
       finalize(ctx.buf)
       var code: seq[byte] = newSeq[byte](ctx.buf.data.len)
       for i in 0 ..< ctx.buf.data.len: code[i] = ctx.buf.data[i]

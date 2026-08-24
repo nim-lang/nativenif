@@ -37,6 +37,8 @@ nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
 | `(result D L T)`       | NifasmDecl                  | result value declaration |
 | `(clobber ...)`        | NifasmDecl                  | clobbered registers list |
 | `(var D L T)`          | NifasmDecl                  | variable declaration |
+| `(interrupts ...)`     | NifasmDecl                  | Cortex-M: the interrupt table, as `(irq N S)` children — handler `S` occupies architectural table slot `N`. Slots the module does not name stay zero. Slots 0 and 1 are the image writer's (initial MSP, reset) and may not appear |
+| `(irq N S)`            | NifasmDecl                  | Cortex-M: one interrupt-table entry — slot number, then the handler symbol. Its address is baked with the Thumb bit, like every other code address on this target |
 | `(arch x64/arm64)`     | NifasmDecl                  | architecture pragma: `x64`, `linux_arm64`, `arm64`, `win_x64`, `win_arm64`, `cortex_m` |
 | `(s)`                  | X64Flag                 | stack slot location tag |
 | `(align N)`            | NifasmExpr                  | stack-slot alignment annotation (child of `(s)`) |

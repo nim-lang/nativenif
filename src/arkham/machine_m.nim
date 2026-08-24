@@ -179,3 +179,50 @@ proc isAllocatableM*(r: Reg): bool {.inline.} =
   ## Whether arkham may place a value in `r`. Excludes nifasm's IP, the bridges'
   ## role is enforced by their absence from the pools rather than here.
   r notin ReservedRegs
+
+# ── the ARMv7-M interrupt table ─────────────────────────────────────────────
+# Slot numbers are ARCHITECTURAL, not a board's: the core reads word `n` of the
+# table at `VTOR` when exception `n` is taken, and which exception that is, is
+# fixed by ARMv7-M. So this table is the same on every Cortex-M part, and the
+# names are CMSIS's, which is what a datasheet and a vendor header both use.
+#
+# Slots 0 and 1 are not here. Word 0 is the initial MSP — a value, not a handler
+# — and word 1 is reset, which is the entry proc and not something a `{.interrupt
+# .}` pragma may claim: an image has exactly one, arkham already knows which, and
+# letting a second thing name it would produce two.
+#
+# EXTERNAL interrupts start at 16 and ARE board-specific — `TIM2_IRQn` is a
+# number STM32 chose, not one arkham can know — so they are spelled by number,
+# `IRQ0`..`IRQn`, and the board's own name for one belongs in a constant beside
+# the handler rather than in this table.
+
+const
+  SystemInterrupts*: array[9, tuple[name: string, slot: int]] = [
+    (name: "NMI", slot: 2),
+    (name: "HardFault", slot: 3),
+    (name: "MemManage", slot: 4),
+    (name: "BusFault", slot: 5),
+    (name: "UsageFault", slot: 6),
+    (name: "SVCall", slot: 11),
+    (name: "DebugMon", slot: 12),
+    (name: "PendSV", slot: 14),
+    (name: "SysTick", slot: 15)]
+
+  FirstIrqSlot* = 16
+    ## `IRQ0` is table word 16; slots 7–10 and 13 are Reserved and stay zero.
+
+proc interruptSlot*(name: string): int =
+  ## The table slot `name` denotes, or -1 if this target has no such interrupt.
+  ## Case-sensitive on purpose: these are the CMSIS spellings, and accepting
+  ## `systick` would invite `SYSTICK` and then a house style that differs from
+  ## every datasheet the reader has open.
+  for v in SystemInterrupts:
+    if v.name == name: return v.slot
+  if name.len > 3 and name[0 .. 2] == "IRQ":
+    var n = 0
+    for i in 3 ..< name.len:
+      if name[i] notin {'0' .. '9'}: return -1
+      n = n * 10 + (ord(name[i]) - ord('0'))
+      if n > 495: return -1        # ARMv7-M allows at most 496 external interrupts
+    return FirstIrqSlot + n
+  return -1

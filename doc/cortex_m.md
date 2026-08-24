@@ -112,7 +112,7 @@ Verified host behaviour (M0):
 
 ## Boot protocol
 
-M-profile has no reset vector *instruction*; the core reads a table at
+M-profile has no reset vector *instruction*; the core reads the INTERRUPT TABLE at
 `VTOR` (0x00000000 out of reset):
 
 * word 0 — initial MSP. Defaults to `0x20010000` (MPS2 SSRAM2/3 starts at
@@ -122,7 +122,7 @@ M-profile has no reset vector *instruction*; the core reads a table at
   bit, not part of the address; clearing it faults immediately.
 
 `e_entry` in the ELF header is essentially advisory for `-kernel` on M-profile —
-the vector table is what the core actually reads — but the probe sets both.
+the interrupt table is what the core actually reads — but the probe sets both.
 
 On the MPS2 boards the region at 0x00000000 is ZBT SRAM rather than real flash,
 so a first-cut image could put text, rodata and data all at 0 and skip the
@@ -294,9 +294,48 @@ stdout and stderr are the same stream.
   Float parameters and results stay on the empty-signature manual-marshalling
   path, as they do on AArch64 — `isDeclarativeAbi` excludes them — so the
   assembler never sees a float in a `(param …)`.
-* **M6 — actually embedded.** Exception/interrupt handlers with the right
-  EXC_RETURN epilogue, volatile MMIO, and a UART output backend so real hardware
-  works without a debugger attached.
+* **M6 — actually embedded.** Volatile MMIO, and a UART output backend so real
+  hardware works without a debugger attached.
+
+  **Interrupt handlers are DONE.** `proc onTick {.interrupt: "SysTick".}` in Leng
+  becomes a word in the image's interrupt table. Three things had to be true for
+  that, and only one of them is the table:
+
+  * **The handler survives to the back end at all.** Nothing in the program calls
+    it — it is reached only through a table built after every reachability pass
+    has run — so it is unreachable by construction and gets deleted. It is a DCE
+    root in nimony (`dce1`) and marked used in nifasm (`handleInterrupts`), and
+    both were verified by taking the marking out and watching the handler vanish
+    from the output with no diagnostic at all.
+  * **The body needs nothing special.** An M-profile handler IS an ordinary AAPCS
+    function: the hardware stacks r0–r3/r12/lr/pc/xPSR on entry and `bx lr` on the
+    EXC_RETURN value in lr unstacks them. So no `{.interrupt.}` prologue exists;
+    the proc arkham already emits is correct, which is why this milestone is a
+    table and not a calling convention.
+  * **The name means a slot.** `machine_m.interruptSlot` is the ARMv7-M table:
+    `NMI`=2 … `SysTick`=15, `IRQ<n>`=16+n. Those numbers are architectural, so
+    the table is the same on every Cortex-M part and the names are CMSIS's.
+    External interrupts are spelled by NUMBER because `TIM2_IRQn` is a number
+    STM32 chose, not one arkham can know.
+
+  Sem checks only what is true of every part — a handler takes no parameters and
+  returns nothing, because hardware passes no arguments and has nowhere to put a
+  result. Which names EXIST is arkham's, exactly as for `{.register.}`, and an
+  unknown one is refused by name, as is a second claim on one slot.
+
+  The table is now **at least sixteen words** whenever a module declares a
+  handler, where it was always two. The fault entries do not have to be enabled to
+  be TAKEN, so a fault reaching past the end of a shorter table would read
+  whatever code follows and branch into it. A word no handler claimed stays zero,
+  which faults on the Thumb-bit rule, escalates, and locks the core up:
+  deterministic and findable on a debugger, which arbitrary execution is not. An
+  image with NO handler still carries two words, so every existing fixture's
+  layout is untouched.
+
+  `tests/arkham_m/interrupt_pendsv` is the end-to-end gate: it pends PendSV by
+  writing ICSR and exits with what the handler wrote into a global. That runs the
+  table, the Thumb bit on the entry, and the handler's return — not just the
+  emission.
 
   **The memory map is DONE.** `nifasm --flash:ADDR --flash-size:N --ram:ADDR
   --ram-size:N --stack-top:ADDR` — the two lines of linker script a firmware
@@ -320,7 +359,7 @@ stdout and stderr are the same stream.
   the test does run it: `tests/tester.nim`'s `cortexMMemMapTests` relocates RAM to
   0x20001000 — still inside QEMU's SSRAM — and executes the fixture there. If the
   globals' `movw/movt` sites, the `(datavma)` the startup copy writes to, or the
-  vector table's initial-MSP word had kept a compiled-in constant, it reads a
+  interrupt table's initial-MSP word had kept a compiled-in constant, it reads a
   global that was never written or pushes onto a stack that is not there. And
   because an image that ignored the flag ENTIRELY is internally consistent and
   exits 42 just the same, the test also reads the addresses back out of the ELF
