@@ -226,3 +226,37 @@ proc interruptSlot*(name: string): int =
       if n > 495: return -1        # ARMv7-M allows at most 496 external interrupts
     return FirstIrqSlot + n
   return -1
+
+# ── the console ─────────────────────────────────────────────────────────────
+
+type
+  ConsoleKind* = enum
+    ## Where a Cortex-M image's `write` goes, and how its `exit` ends.
+    ##
+    ## These two travel together because they answer the same question — is a
+    ## debugger attached? Semihosting needs one for both; a UART needs one for
+    ## neither, and has nothing to hand a status TO.
+    ckSemihosting  ## `bkpt #0xAB`. Needs a debug agent (QEMU, or a probe).
+    ckUart         ## a CMSDK APB UART. Needs a wire.
+
+const
+  CmsdkUartData* = 0x00'i64
+    ## Write-to-transmit. Writing while `TXFULL` is set drops the byte.
+  CmsdkUartState* = 0x04'i64
+    ## bit 0 = TX buffer full, bit 1 = RX buffer full.
+  CmsdkUartCtrl* = 0x08'i64
+    ## bit 0 = TX enable, bit 1 = RX enable.
+  CmsdkUartBaudDiv* = 0x10'i64
+    ## The divider. Hardware rejects anything below 16; QEMU does not model the
+    ## baud rate at all, so this exists to be CORRECT on the part rather than to
+    ## be observed under emulation.
+
+  CmsdkUartTxFull* = 0x01'i64
+  CmsdkUartTxEnable* = 0x01'i64
+  CmsdkUartDefaultBaudDiv* = 16'i64
+
+  MpsUart0Base* = 0x4000_4000'i64
+    ## MPS2/MPS3 UART0 — the address `qemu-system-arm -M mps2-an386 -serial` puts
+    ## on stdout, and the one ARM's own reference designs use. It is a DEFAULT and
+    ## not a fact about Cortex-M: every real part puts its UART elsewhere, which
+    ## is why `--console:uart:<addr>` takes one.

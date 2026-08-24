@@ -17,6 +17,7 @@ import std / [tables, sets, assertions, algorithm, strutils, os]
 import symparser
 import nifcore, nifcdecl
 import slots, machinedesc, analyser, planer, programs, abi
+import machine_m                  # ConsoleKind: which console a Cortex-M image carries
 import asmbuf
 import typenav
 export typenav   # SymCat / SymInfo / getType / exprSlot moved here; re-export so
@@ -147,6 +148,14 @@ type
     needsUDiv64*, needsSDiv64*: bool         ## Cortex-M, MODULE-scope: emit the 64-bit
                                              ## division routines, and only if something
                                              ## divides
+    console*: machine_m.ConsoleKind          ## Cortex-M: where `write` goes and how
+                                             ## `exit` ends. `ckSemihosting` (the
+                                             ## default) needs a debug agent for both;
+                                             ## `ckUart` needs one for neither.
+    uartBase*: int64                         ## the console UART's base address when
+                                             ## `console == ckUart`. A BOARD fact — every
+                                             ## real part puts its UART somewhere else —
+                                             ## so it is given, never guessed.
     thumbM*: bool                            ## the SAME emitter, targeting Cortex-M
                                              ## (ARMv7E-M) instead of AArch64. The two
                                              ## share the asm-NIF vocabulary by design —

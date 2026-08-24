@@ -154,6 +154,10 @@ entry and cache the handle, so the same images run on real hardware.
 Both `exit` and `write` are all the existing arkham corpus needs: of 236
 fixtures, 225 `importc "exit"` and 3 `importc "write"`.
 
+Semihosting is the DEFAULT console, not the only one: `--console:uart` serves the
+same two names off a CMSDK UART instead, for a board with no debugger attached.
+See M6.
+
 `SYS_WRITE`'s first field is a semihosting HANDLE, not a POSIX fd. Passing a raw
 `1` writes nothing AND reports success — the call returns "0 bytes not written",
 so a caller checking the return value sees a complete write of nothing. The
@@ -295,8 +299,40 @@ stdout and stderr are the same stream.
   Float parameters and results stay on the empty-signature manual-marshalling
   path, as they do on AArch64 — `isDeclarativeAbi` excludes them — so the
   assembler never sees a float in a `(param …)`.
-* **M6 — actually embedded.** A UART output backend, so real hardware works
-  without a debugger attached.
+* **M6 — actually embedded.** DONE.
+
+  **The UART console** is the last piece: `arkham --console:uart[:<addr>]` makes
+  `write` push bytes into a CMSDK APB UART and `exit` park the core, so an image
+  needs no debugger for either. `--console:semihosting` is still the default and
+  still byte-identical to giving no flag at all — a console flag that quietly
+  changed every image would be the more expensive kind of wrong.
+
+  The two shims move together because they answer one question: is a debugger
+  attached? Semihosting needs one for output AND for exit; a UART needs one for
+  neither, and has nothing to hand a status TO. So `exit` under a UART console
+  does the only honest thing — `wfi` in a loop. Not a busy spin: `wfi` idles the
+  core until an interrupt, which is what a finished image owes a battery, and any
+  handler still fires. The status stays in r0 for whoever attaches a probe later.
+
+  The register layout is CMSDK's — ARM's own reference designs, and what QEMU's
+  MPS2 models. That is the only layout this can honestly carry: an STM32 USART is
+  a different peripheral, not a different address, and a part with one now writes
+  its own `write` on top of `volatileLoad`/`volatileStore`. The ADDRESS is the
+  part a board does get to choose, which is why it is an argument; bare `uart`
+  means MPS2's UART0 at 0x40004000.
+
+  The TX loop polls `STATE.TXFULL` before every byte. QEMU transmits instantly and
+  never sets that bit, so the poll is dead code under emulation and load-bearing
+  on the part — the usual shape of anything that talks to hardware, and the reason
+  it is written from the datasheet rather than from what the emulator accepts.
+
+  `cortexMUartTests` runs it with `-serial stdio` and NO semihosting configured at
+  all, which is the point: the image produces output with no debug agent. The run
+  is expected to TIME OUT, and that is the assertion rather than a tolerated
+  flake — a firmware image does not terminate, it idles. (`runProgram` had been
+  discarding a timed-out child's output; it now drains it after the kill, where
+  the read hits EOF instead of blocking. An image that deliberately never exits
+  has nothing but that output to be judged on.)
 
   **Volatile MMIO is DONE.** `volatileLoad(p)` / `volatileStore(p, v)` from
   `std/volatile` — Nim's names and Nim's signatures, so source written against

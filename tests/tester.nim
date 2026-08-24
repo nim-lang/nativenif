@@ -33,6 +33,12 @@ proc runProgram(exe: string; args: openArray[string] = [];
   ## than a pipe buffer holds would block in `write` and be reported as a timeout. Every
   ## fixture prints at most a line or two, which is why that trade is worth the
   ## simplicity of not needing a reader thread.
+  ##
+  ## A timed-out child's output is drained TOO, after the kill — by then its end of
+  ## the pipe is closed, so the read hits EOF instead of blocking. It used to be
+  ## thrown away, which made "what had it printed before it hung?" unanswerable
+  ## from a failure message; a firmware image that deliberately never exits has
+  ## nothing BUT that output to be judged on.
   let p = startProcess(exe, args = args, options = {poStdErrToStdOut, poUsePath})
   var waited = 0
   while waited < timeoutMs and p.running:
@@ -43,8 +49,9 @@ proc runProgram(exe: string; args: openArray[string] = [];
     sleep 50
     if p.running: p.kill()
     discard p.waitForExit()
+    let output = p.outputStream.readAll()
     p.close()
-    result = ("", timeoutExitCode)
+    result = (output, timeoutExitCode)
   else:
     # The child is gone and its end of the pipe with it, so `readAll` drains what it
     # wrote and stops at EOF rather than blocking.
@@ -996,6 +1003,77 @@ proc cortexMInterruptTests() =
   echo passed, " / ", cortexMRejections.len, " Cortex-M interrupt/volatile rejection tests successful"
 
 
+const cortexMUartArgs = ["-M", "mps2-an386", "-cpu", "cortex-m4",
+                         "-display", "none", "-monitor", "none",
+                         "-serial", "stdio", "-kernel"]
+  ## The UART runner: no semihosting at all, and UART0 routed to stdout. That is
+  ## the point — an image built `--console:uart` needs no debug agent, so the
+  ## thing under test is that it produces output with none configured.
+
+proc cortexMUartTests() =
+  ## `--console:uart` end to end: bytes out of a CMSDK UART, and an `exit` that
+  ## parks the core because there is nobody to hand a status to.
+  ##
+  ## The run is EXPECTED to time out, and that is the assertion rather than a
+  ## tolerated flake: a firmware image does not terminate, it idles on `wfi`. What
+  ## is checked is the output it produced before parking. The timeout is short and
+  ## local — the default 30s would make one test dominate the suite.
+  let qemu = findExe(cortexMQemu)
+  if qemu.len == 0:
+    echo cortexMQemu, " not found - skipping Cortex-M UART tests"
+    return
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham_m" / "nimcache_m"
+  createDir workDir
+  let src = "tests" / "arkham" / "hello.c.nif"
+  let asmNif = workDir / "uart_hello.asm.nif"
+  let elf = workDir / "uart_hello.elf"
+  var passed = 0
+
+  exec quoteShell(arkham) & " -a:cortex_m --console:uart -o:" & quoteShell(asmNif) &
+       " " & quoteShell(src)
+  exec quoteShell(nifasmExe) & " -o:" & quoteShell(elf) & " " & quoteShell(asmNif)
+  var args: seq[string] = @[]
+  for a in cortexMUartArgs: args.add a
+  args.add elf
+  let (output, code) = runProgram(qemu, args, timeoutMs = 5_000)
+  if code != timeoutExitCode:
+    quit "FAILURE cortex-m uart: the image ENDED (exit " & $code & "). " &
+         "`--console:uart` has no debug agent to exit through, so it must park " &
+         "on `wfi` instead.\n" & output
+  if not output.contains("Hello World"):
+    quit "FAILURE cortex-m uart: nothing reached UART0.\nGot: " & escape(output)
+  inc passed
+
+  # The DEFAULT is untouched: same input, no flag, still a semihosting image that
+  # runs to completion. A console flag that quietly changed every image would be
+  # the more expensive kind of wrong.
+  let semiAsm = workDir / "semi_hello.asm.nif"
+  let semiElf = workDir / "semi_hello.elf"
+  exec quoteShell(arkham) & " -a:cortex_m -o:" & quoteShell(semiAsm) & " " &
+       quoteShell(src)
+  exec quoteShell(nifasmExe) & " -o:" & quoteShell(semiElf) & " " & quoteShell(semiAsm)
+  var sargs: seq[string] = @[]
+  for a in cortexMArgs: sargs.add a
+  sargs.add semiElf
+  let (sout, scode) = runProgram(qemu, sargs)
+  if scode != 0 or sout != "Hello World\n":
+    quit "FAILURE cortex-m uart: the semihosting default regressed (exit " &
+         $scode & ")\nGot: " & escape(sout)
+  inc passed
+
+  # A console is a Cortex-M peripheral; every other target's is the OS's.
+  execExpectFailure(quoteShell(arkham) & " -a:x64 --console:uart -o:" &
+                    quoteShell(workDir / "x.asm.nif") & " " & quoteShell(src),
+                    "cortex_m target only")
+  execExpectFailure(quoteShell(arkham) & " -a:cortex_m --console:rs232 -o:" &
+                    quoteShell(workDir / "x.asm.nif") & " " & quoteShell(src),
+                    "unknown --console")
+  inc passed
+  echo passed, " / 3 Cortex-M UART console tests successful"
+
+
 proc cortexMMemMapTests() =
   ## The board memory map (`--flash`/`--flash-size`/`--ram`/`--ram-size`/
   ## `--stack-top`) actually reaching the image.
@@ -1303,6 +1381,7 @@ thumb2SelfTest()
 cortexMAsmTests()
 cortexMMemMapTests()
 cortexMInterruptTests()
+cortexMUartTests()
 arkhamCortexMTests()
 arkhamCortexM64Tests()
 

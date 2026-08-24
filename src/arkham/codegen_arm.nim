@@ -7502,6 +7502,131 @@ proc emitSemihostExitProc(g: var CodeGen; asmName: string) =
       g.ab.tree BkptM: g.ab.intLit SemiBkpt
       g.ab.keyword RetA64               # unreachable: SYS_EXIT does not return
 
+proc emitUartExitProc(g: var CodeGen; asmName: string) =
+  ## `exit(status)` with no debugger attached: park the core.
+  ##
+  ## There is nowhere to send a status. A hosted `exit` hands one to a parent
+  ## process, and semihosting hands one to the debug agent; a board with a UART
+  ## and nothing else has neither, and inventing a destination (printing it,
+  ## resetting) would be this back end deciding what the program meant.
+  ##
+  ## So: `wfi` in a loop. Not a busy spin — `wfi` idles the core until an
+  ## interrupt, which is what a finished firmware image should do to a battery,
+  ## and any handler that fires still runs. The status stays in r0 for whoever
+  ## attaches a probe later.
+  g.ab.tree NifasmDecl.ProcD:
+    g.ab.symDef asmName
+    g.ab.tree NifasmDecl.ParamsD:
+      g.ab.tree NifasmDecl.ParamD:
+        g.ab.symDef paramName(0)
+        g.ab.reg R0
+        g.ab.intType(32)
+    g.ab.tree NifasmDecl.ClobberD:
+      for r in machine_m.ConvClobbersGpr: g.ab.reg r
+    g.ab.tree StmtsA64:
+      g.emitLoop:
+        g.ab.keyword WfiM
+      g.ab.keyword RetA64             # unreachable: the loop has no exit
+
+proc emitUartWriteProc(g: var CodeGen; sp: SyscallProc) =
+  ## `write(fd, buf, len)` onto a CMSDK APB UART.
+  ##
+  ## One byte at a time, each preceded by a poll of `STATE.TXFULL`. QEMU
+  ## transmits instantly and never sets that bit, so the poll is dead code under
+  ## emulation and load-bearing on the part — which is the usual shape of
+  ## anything that talks to hardware, and the reason it is written from the
+  ## datasheet rather than from what the emulator accepts.
+  ##
+  ## `fd` is ignored: a UART is one wire, so stdout and stderr are the same
+  ## stream, exactly as they are under semihosting. The return value is `len` —
+  ## the bytes went out or the FIFO dropped them, and there is no third answer a
+  ## UART can give.
+  ##
+  ## Initialisation (BAUDDIV, CTRL) happens on every call rather than once at
+  ## entry. It is two stores against a syscall's worth of work, it needs no `.bss`
+  ## flag, and it makes the shim correct even if something else reset the
+  ## peripheral in between.
+  let base = g.uartBase
+  g.ab.tree NifasmDecl.ProcD:
+    g.ab.symDef sp.asmName
+    # The same signature dance as the semihosting shim: `count` is an `int64` in
+    # Leng's `write`, which is a register PAIR here, and the DECLARATION must
+    # agree with what the call site plans.
+    var pslots: seq[AsmSlot] = @[]
+    var pc = sp.decl
+    inc pc; inc pc
+    if pc.kind == TagLit: pslots = paramSlots(g.prog, pc)
+    let plan = planCall(g.md, pslots, retByRef = false)
+    g.ab.tree NifasmDecl.ParamsD:
+      for i, pl in plan.args:
+        g.ab.tree NifasmDecl.ParamD:
+          g.ab.symDef paramName(i)
+          if pl.words > 1:
+            g.ab.tree RegsD:
+              for k in 0 ..< pl.words: g.ab.reg g.md.gprAt(pl, k)
+          else:
+            g.ab.reg g.md.gprAt(pl)
+          g.ab.intType(if pl.words > 1: 64 else: 32)
+    var retC = sp.decl
+    inc retC; skip retC; skip retC
+    let wideRes = not retIsVoid(retC) and g.isWideSlot(slotOf(g.prog, retC))
+    g.ab.tree NifasmDecl.ResultD:
+      if not wideRes:
+        g.ab.symDef synth("ret.0")
+        g.ab.reg R0
+        g.ab.intType(32)
+    g.ab.tree NifasmDecl.ClobberD:
+      for r in machine_m.ConvClobbersGpr: g.ab.reg r
+    g.ab.tree StmtsA64:
+      let lDone = g.freshLabel()
+      let lReady = g.freshLabel()
+      # The count has to survive to the RETURN, and the loop needs every one of
+      # r0–r3 (base, buf, scratch, remaining). r12 is nifasm's own operand scratch
+      # and not ours to take, so it goes in a frame slot — the same answer the
+      # semihosting shim reaches for, for the same reason.
+      g.semiBlockSlot(0)
+      g.ab.tree SubA64: (g.ab.reg SP; g.ab.keyword SsizeX)
+      # r1 = buf, r2 = len on entry (r2:r3 for the 64-bit count — the low word is
+      # in r2 either way, and a write longer than 4 GB is not a thing).
+      g.ab.tree MovA64: (g.ab.sym synth("shblk0.0"); g.ab.reg R2)
+      g.ab.tree MovA64: (g.ab.reg R3; g.ab.reg R2)      # r3 = bytes left
+      g.ab.tree MovA64: (g.ab.reg R0; g.ab.intLit base) # r0 = UART base
+      g.ab.tree MovA64: (g.ab.reg R2; g.ab.intLit machine_m.CmsdkUartDefaultBaudDiv)
+      g.ab.tree StrA64:
+        g.ab.tree MemX: (g.ab.reg R0; g.ab.intLit machine_m.CmsdkUartBaudDiv)
+        g.ab.reg R2
+      g.ab.tree MovA64: (g.ab.reg R2; g.ab.intLit machine_m.CmsdkUartTxEnable)
+      g.ab.tree StrA64:
+        g.ab.tree MemX: (g.ab.reg R0; g.ab.intLit machine_m.CmsdkUartCtrl)
+        g.ab.reg R2
+      g.emitLoop:
+        g.ab.tree CmpA64: (g.ab.reg R3; g.ab.intLit 0)
+        g.emBr(BeqA64, lDone)
+        # Poll TXFULL. A nested loop, because the byte may not go out at once.
+        g.emitLoop:
+          g.ab.tree LdrA64:
+            g.ab.reg R2
+            g.ab.tree MemX: (g.ab.reg R0; g.ab.intLit machine_m.CmsdkUartState)
+          g.ab.tree AndA64: (g.ab.reg R2; g.ab.intLit machine_m.CmsdkUartTxFull)
+          g.ab.tree CmpA64: (g.ab.reg R2; g.ab.intLit 0)
+          g.emBr(BeqA64, lReady)
+        g.emLab(lReady)
+        g.ab.tree LdrbM:
+          g.ab.reg R2
+          g.ab.tree MemX: (g.ab.reg R1; g.ab.intLit 0)
+        g.ab.tree StrA64:
+          g.ab.tree MemX: (g.ab.reg R0; g.ab.intLit machine_m.CmsdkUartData)
+          g.ab.reg R2
+        g.ab.tree AddA64: (g.ab.reg R1; g.ab.intLit 1)
+        g.ab.tree SubA64: (g.ab.reg R3; g.ab.intLit 1)
+      g.emLab(lDone)
+      # Everything asked for went out; `write` returns the count.
+      g.ab.tree MovA64: (g.ab.reg R0; g.ab.sym synth("shblk0.0"))
+      if wideRes:
+        g.ab.tree MovA64: (g.ab.reg R1; g.ab.intLit 0)
+      g.ab.tree AddA64: (g.ab.reg SP; g.ab.keyword SsizeX)
+      g.ab.keyword RetA64
+
 proc emitSemihostRuntime(g: var CodeGen; sp: SyscallProc) =
   ## Emit the ARM-semihosting implementation of one "syscall".
   ##
@@ -7528,8 +7653,12 @@ proc emitSemihostRuntime(g: var CodeGen; sp: SyscallProc) =
         break
   case base
   of "exit":
-    g.emitSemihostExitProc(sp.asmName)
+    if g.console == machine_m.ckUart: g.emitUartExitProc(sp.asmName)
+    else: g.emitSemihostExitProc(sp.asmName)
   of "write":
+    if g.console == machine_m.ckUart:
+      g.emitUartWriteProc(sp)
+      return
     g.ab.tree NifasmDecl.ProcD:
       g.ab.symDef sp.asmName
       # The signature has to be the one the CALL SITE plans, not three tidy
@@ -7641,7 +7770,9 @@ proc rejectForThumbM(g: var CodeGen) =
     quit "arkham cortex-m: `importc` of \"" & g.prog.externOrder[0].extName &
          "\" cannot be satisfied — a firmware image has nothing to link against."
 
-proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool): string =
+proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
+                console = machine_m.ckSemihosting;
+                uartBase = machine_m.MpsUart0Base): string =
   ## Compile a parsed Leng module to Cortex-M (ARMv7E-M) asm-NIF, which nifasm's
   ## `cortex_m` target assembles into a bare-metal firmware image.
   ##
@@ -7654,7 +7785,7 @@ proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool): string =
   ## the part with a formal model behind it (proofs/arkham_bindings.tla).
   setTargetWord Word32             # 4-byte pointers, 4-byte platform int
   var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: machine_m.cortexMMachine,
-                  thumbM: true)
+                  thumbM: true, console: console, uartBase: uartBase)
   g.ab.renderReg = machine_m.regNameM        # `(r0)`..`(r12)`/`(sp)`/`(lr)`
   g.ab.arch = "m"                  # no BodyLib entries apply to this target yet
   g.prog = collect(buf, inputPath, tags, darwin = false)
