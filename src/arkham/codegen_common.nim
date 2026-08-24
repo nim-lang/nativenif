@@ -149,15 +149,15 @@ type
     needsUDiv64*, needsSDiv64*: bool         ## Cortex-M, MODULE-scope: emit the 64-bit
                                              ## division routines, and only if something
                                              ## divides
-    console*: machine_m.ConsoleKind          ## Cortex-M: where `write` goes and how
-                                             ## `exit` ends. `ckSemihosting` (the
+    writesTo*: machine_m.WritesToKind          ## Cortex-M: where `write` goes and how
+                                             ## `exit` ends. `wtDebugger` (the
                                              ## default) needs a debug agent for both;
-                                             ## `ckUart` needs one for neither.
+                                             ## `wtSerial` needs one for neither.
     board*: layout.Layout                    ## the `--layout:` board, when one was
                                              ## given. arkham reads it and forwards it;
                                              ## nifasm places segments from the forward.
-    uartBase*: int64                         ## the console UART's base address when
-                                             ## `console == ckUart`. A BOARD fact — every
+    serialBase*: int64                         ## the console UART's base address when
+                                             ## `writesTo == wtSerial`. A BOARD fact — every
                                              ## real part puts its UART somewhere else —
                                              ## so it is given, never guessed.
     thumbM*: bool                            ## the SAME emitter, targeting Cortex-M

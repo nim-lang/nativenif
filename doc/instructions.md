@@ -37,17 +37,16 @@ nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
 | `(result D L T)`       | NifasmDecl                  | result value declaration |
 | `(clobber ...)`        | NifasmDecl                  | clobbered registers list |
 | `(var D L T)`          | NifasmDecl                  | variable declaration |
-| `(memmap ...)`         | NifasmDecl                  | Cortex-M: the board's memory layout, as arkham read it out of the `--layout:` file and forwarded. Children are the `region`/`place`/`console`/`stacks`/`heap`/`core` rows below. Supersedes the memory-map command-line flags |
-| `(region IDENT IDENT ...)` | NifasmDecl              | Cortex-M: a named memory region. The first `IDENT` is its name, the second is `rom` or `ram`, then an `(origin …)` and one size row. `rom` holds what the image ships with; `ram` holds nothing at reset |
-| `(origin N)`           | NifasmExpr                  | Cortex-M: a region's, or a peripheral's, base address |
+| `(layout ...)`         | NifasmDecl                  | Cortex-M: the board's memory layout, as arkham read it out of the `--layout:` file and forwarded. Children are the `region`/`place`/`writesTo`/`stacks`/`heap`/`core` rows below. Supersedes the memory-map command-line flags |
+| `(region IDENT IDENT ...)` | NifasmDecl              | Cortex-M: a named memory region. The first `IDENT` is its name, the second is `rom` or `ram`, then a `(startAddress …)` and one size row. `rom` holds what the image ships with; `ram` holds nothing at reset |
+| `(startAddress N)`     | NifasmExpr                  | Cortex-M: a region's, or a peripheral's, first address. Spelled out rather than `origin` because a layout row holds two numbers and the reader should not have to remember which is which |
 | `(bytes N)`            | NifasmExpr                  | Cortex-M: a size in bytes. NIF has no `4K` literal, so a size is a TAGGED quantity and the unit is never guessed from the number |
 | `(kilobytes N)`        | NifasmExpr                  | Cortex-M: a size, times 1024 |
 | `(megabytes N)`        | NifasmExpr                  | Cortex-M: a size, times 1024*1024 |
-| `(place IDENT IDENT)`  | NifasmDecl                  | Cortex-M: which region a section lives in. the first `IDENT` is `text`, `rodata`, `data` or `bss`, the second names a region. `data`'s initializer image still ships in the region `text` is placed in — the startup copy is what puts it where this says |
-| `(console IDENT ...)`  | NifasmDecl                  | Cortex-M: where `write` goes and how `exit` ends. `IDENT` is `semihosting` (no further children) or `uart`, which takes an `(origin …)` |
-| `(stacks IDENT ...)`   | NifasmDecl                  | Cortex-M: the per-thread stack slots — a region name, a `(slots N)`, one size row for the SLOT, and a `(tls …)`. The slot size must be a power of two: a thread reaches its own TLS by masking SP with it |
+| `(place IDENT IDENT)`  | NifasmDecl                  | Cortex-M: which region a section lives in. The first `IDENT` is `code`, `const` or `gvar` — NIF's and Nimony's own words, so one vocabulary rather than the linker's — and the second names a region. `gvar` covers the initialized globals AND the zeroed ones: whether a global ships with a value is not something a layout has an opinion about, and the split inside the region is the image writer's. Their initializer image ships in the region `code` is placed in; the startup copy is what puts it where this says |
+| `(writesTo IDENT ...)` | NifasmDecl                  | Cortex-M: what `write` is implemented as, and with it how `exit` ends. `IDENT` is `debugger` (trap to a debug agent; no further children) or `serial`, which drives a CMSDK UART and takes its `(startAddress …)`. Both name what must be ATTACHED, which is the thing that is actually got wrong |
+| `(stacks IDENT ...)`   | NifasmDecl                  | Cortex-M: the per-thread stack slots — a region name, a `(slots N)`, one size row for the SLOT, and a `(tvar …)`. The slot size must be a power of two: a thread reaches its own TLS by masking SP with it |
 | `(slots N)`            | NifasmExpr                  | Cortex-M: how many stack slots the region holds |
-| `(tls ...)`            | NifasmExpr                  | Cortex-M: bytes reserved for thread-locals at the TOP of every stack slot, just below where SP starts. Takes one size row |
 | `(heap IDENT ...)`     | NifasmDecl                  | Cortex-M: the heap — a region name and one size row. This is what the allocator gets pages from; there is no `.bss` array standing in for it |
 | `(core N)`             | NifasmDecl                  | Cortex-M: which stack slot THIS image boots on. One image per core, so the number is a constant the author knows and not something read from a CPUID register — M-profile has no architectural core id |
 | `(interrupts ...)`     | NifasmDecl                  | Cortex-M: the interrupt table, as `(irq N S)` children — handler `S` occupies architectural table slot `N`. Slots the module does not name stay zero. Slots 0 and 1 are the image writer's (initial MSP, reset) and may not appear |
@@ -283,7 +282,7 @@ nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
 | `(mem ...)`            | NifasmExpr                  | memory reference: `(mem base)`, `(mem base disp)`, `(mem base index scale [disp])` (base/index are raw registers or register-homed locals/params), or the no-base scaled form `(mem 0 index scale [disp])` = `[index*scale + disp]` (x64: SIB base=101; the literal `0` base is unambiguous since a real base is never an immediate) |
 | `(rodata L S)`         | NifasmDecl                  | read-only data (string/bytes) |
 | `(gvar D L T)`         | NifasmDecl                  | global variable |
-| `(tvar D L T)`         | NifasmDecl                  | thread local variable |
+| `(tvar D L T)`; `(tvar SIZE)` | NifasmDecl, NifasmExpr | thread local variable. ONE tag, two readings, because both say the same thing at different scales: as a declaration it is one thread-local, and inside a Cortex-M `(stacks …)` it is the bytes reserved for ALL of them at the top of every stack slot, just below where SP starts |
 | `(imp S)`              | NifasmDecl                  | import dynamic library |
 | `(extproc D S)`        | NifasmDecl                  | external proc from imported library |
 | `(syproc D ...)`       | NifasmDecl                  | system-call proc declaration (proctype + clobbers + number) |

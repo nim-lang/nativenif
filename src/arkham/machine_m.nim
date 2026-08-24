@@ -230,14 +230,19 @@ proc interruptSlot*(name: string): int =
 # ── the console ─────────────────────────────────────────────────────────────
 
 type
-  ConsoleKind* = enum
-    ## Where a Cortex-M image's `write` goes, and how its `exit` ends.
+  WritesToKind* = enum
+    ## What a Cortex-M image's `write` is implemented as, and with it how its
+    ## `exit` ends.
     ##
     ## These two travel together because they answer the same question — is a
-    ## debugger attached? Semihosting needs one for both; a UART needs one for
-    ## neither, and has nothing to hand a status TO.
-    ckSemihosting  ## `bkpt #0xAB`. Needs a debug agent (QEMU, or a probe).
-    ckUart         ## a CMSDK APB UART. Needs a wire.
+    ## debugger attached? The debugger form needs one for both; the serial form
+    ## needs one for neither, and has nothing to hand a status TO.
+    ##
+    ## Both names say what must be ATTACHED rather than naming a mechanism, which
+    ## is the thing that is actually got wrong: "I flashed it and nothing printed".
+    wtDebugger  ## `bkpt #0xAB`, intercepted by a debug agent (QEMU, or a probe)
+                ## which does the I/O on the host.
+    wtSerial    ## a CMSDK APB UART. Needs a wire and nothing else.
 
 const
   CmsdkUartData* = 0x00'i64
@@ -259,4 +264,4 @@ const
     ## MPS2/MPS3 UART0 — the address `qemu-system-arm -M mps2-an386 -serial` puts
     ## on stdout, and the one ARM's own reference designs use. It is a DEFAULT and
     ## not a fact about Cortex-M: every real part puts its UART elsewhere, which
-    ## is why `--console:uart:<addr>` takes one.
+    ## is why `--writesTo:serial:<addr>` takes one.

@@ -1,20 +1,19 @@
 (.nif27)
-(memmap
+(layout
  (region flash rom
-  (origin 0)
+  (startAddress 0)
   (megabytes 4))
  (region sram ram
-  (origin 536870912)
+  (startAddress 536870912)
   (kilobytes 64))
- (place text flash)
- (place rodata flash)
- (place data sram)
- (place bss sram)
- (console semihosting)
+ (place code flash)
+ (place const flash)
+ (place gvar sram)
+ (writesTo debugger)
  (stacks sram
   (slots 1)
   (kilobytes 8)
-  (tls
+  (tvar
    (bytes 256)))
  (heap sram
   (kilobytes 16))

@@ -37,17 +37,18 @@ Options:
   --layout:FILE            cortex_m only: the BOARD — its memory regions, which
                            region each section lives in, the console, the stack
                            slots and their thread-local reservation, and the
-                           heap. A `(memmap …)` NIF tree; see doc/layout.md.
+                           heap. A `(layout …)` NIF tree; see doc/layout.md.
                            Forwarded into the asm-NIF so nifasm places segments
                            from the same description rather than reading the file
                            a second time
-  --console:WHERE          cortex_m only: where `write` goes and how `exit` ends.
-                           `semihosting` (default) traps to a debug agent for
-                           both — QEMU, or a probe. `uart` writes bytes to a
-                           CMSDK APB UART and ends by parking the core on `wfi`,
-                           which is what a board with no debugger can do.
-                           `uart:<addr>` gives the base address; bare `uart` is
-                           MPS2's UART0 at 0x40004000
+  --writesTo:WHERE         cortex_m only: what `write` is implemented as, and
+                           with it how `exit` ends. `debugger` (default) traps to
+                           a debug agent — QEMU, or a probe — which does the I/O
+                           on the host and takes the exit status. `serial` writes
+                           bytes to a CMSDK APB UART and ends by parking the core
+                           on `wfi`, needing nothing attached but a wire.
+                           `serial:<addr>` gives the port's address; bare `serial`
+                           is MPS2's UART0 at 0x40004000
   -a:arch, --arch:arch     legacy combined form: arm64 | x64 | linux_arm64 |
                            win_x64 (cannot be mixed with --os/--cpu)
   -h, --help               show this help
@@ -100,31 +101,31 @@ proc archOf(os, cpu: string): string =
          " embedded/arm32)",
          QuitFailure)
 
-proc parseConsole(val: string; uartBase: var int64): machine_m.ConsoleKind =
-  ## `--console:semihosting` | `--console:uart` | `--console:uart:<addr>`.
+proc parseWritesTo(val: string; serialBase: var int64): machine_m.WritesToKind =
+  ## `--writesTo:debugger` | `--writesTo:serial` | `--writesTo:serial:<addr>`.
   ##
-  ## The address is part of the console because it is the only part a BOARD gets
-  ## to decide: the register layout is CMSDK's, which is what ARM's own reference
-  ## designs and QEMU's MPS2 have, and a part with a different UART needs its own
-  ## `write` rather than a flag. `uart` alone means MPS2's UART0, which is what
+  ## The address rides along because it is the only part a BOARD gets to decide:
+  ## the register layout is CMSDK's, which is what ARM's own reference designs and
+  ## QEMU's MPS2 have, and a part with a different UART needs its own `write`
+  ## rather than a flag. `serial` alone means MPS2's UART0, which is what
   ## `qemu-system-arm -M mps2-an386 -serial` puts on stdout.
   let v = val.normalize
-  if v == "semihosting" or v == "semi": return machine_m.ckSemihosting
-  if v == "uart": return machine_m.ckUart
-  if v.startsWith("uart:"):
-    let a = val.substr(5).strip()
+  if v == "debugger": return machine_m.wtDebugger
+  if v == "serial": return machine_m.wtSerial
+  if v.startsWith("serial:"):
+    let a = val.substr(7).strip()
     try:
-      uartBase = if a.startsWith("0x") or a.startsWith("0X"):
+      serialBase = if a.startsWith("0x") or a.startsWith("0X"):
                    cast[int64](fromHex[uint64](a))
                  else: int64(parseBiggestUInt(a))
     except ValueError:
-      quit("arkham: --console:uart: not an address: " & a, QuitFailure)
-    return machine_m.ckUart
-  quit("arkham: unknown --console:" & val &
-       " (supported: semihosting, uart, uart:<addr>)", QuitFailure)
+      quit("arkham: --writesTo:serial: not an address: " & a, QuitFailure)
+    return machine_m.wtSerial
+  quit("arkham: unknown --writesTo:" & val &
+       " (supported: debugger, serial, serial:<addr>)", QuitFailure)
 
 proc run(input, output, arch: string;
-         console: machine_m.ConsoleKind; uartBase: int64;
+         writesTo: machine_m.WritesToKind; serialBase: int64;
          board: layout.Layout) =
   # One shared tag pool across the main module and any foreign modules the
   # program model loads on demand, so tag ordinals (hence stmtKind/typeKind
@@ -137,15 +138,15 @@ proc run(input, output, arch: string;
              of "arm64", "aarch64", "": generateA64(buf, input, tags)
              of "linux_arm64", "linux_aarch64": generateA64(buf, input, tags, linux = true)
              of "cortex_m", "cortexm", "thumbm":
-               generateM(buf, input, tags, console, uartBase, board)
+               generateM(buf, input, tags, writesTo, serialBase, board)
              else: quit("arkham: unknown --arch:" & arch, QuitFailure)
   writeFile(output, code)
 
 proc main() =
   var input, output, arch, os, cpu = ""
-  var console = machine_m.ckSemihosting
-  var uartBase = machine_m.MpsUart0Base
-  var consoleGiven = false
+  var writesTo = machine_m.wtDebugger
+  var serialBase = machine_m.MpsUart0Base
+  var writesToGiven = false
   var board = Layout()
   for kind, key, val in getopt():
     case kind
@@ -157,14 +158,21 @@ proc main() =
       of "arch", "a": arch = val
       of "os": os = val
       of "cpu": cpu = val
-      of "console":
-        console = parseConsole(val, uartBase)
-        consoleGiven = true
+      of "writesto":
+        writesTo = parseWritesTo(val, serialBase)
+        writesToGiven = true
       of "layout":
         board = parseLayout(val)
         let bad = layout.validate(board)
         if bad.len > 0: quit("arkham --layout: " & bad, QuitFailure)
       of "help", "h": quit(Usage, QuitSuccess)
+      else:
+        # An unknown option is an ERROR, not something to walk past. Silently
+        # ignoring one is how a flag that was renamed keeps "working": a stale
+        # `--console:serial` in a build script would have produced a debugger
+        # image and no complaint, which is a worse outcome than either spelling.
+        quit("arkham: unknown option --" & key &
+             " (see --help)", QuitFailure)
     of cmdEnd: discard
   if input.len == 0: quit(Usage, QuitSuccess)
   if output.len == 0: output = input & ".asm.nif"
@@ -175,23 +183,23 @@ proc main() =
     if os.len == 0: os = hostOS
     if cpu.len == 0: cpu = hostCPU
     arch = archOf(os, cpu)
-  if consoleGiven and arch notin ["cortex_m", "cortexm", "thumbm"]:
-    # Every other target is hosted: its console is the OS's, and there is no
+  if writesToGiven and arch notin ["cortex_m", "cortexm", "thumbm"]:
+    # Every other target is hosted: `write` is the OS's, and there is no
     # peripheral for this flag to name. Silence would be the wrong answer for the
     # same reason the memory-map flags refuse it.
-    quit("arkham: --console applies to the cortex_m target only", QuitFailure)
-  # The layout's console is the board's own answer, so it wins over the flag —
-  # and giving both is a contradiction rather than a precedence question.
+    quit("arkham: --writesTo applies to the cortex_m target only", QuitFailure)
+  # The layout's answer is the board's own, so it wins over the flag — and giving
+  # both is a contradiction rather than a precedence question.
   if board.given:
-    if consoleGiven:
-      quit("arkham: --console and --layout both name a console; the layout is " &
-           "the board's own description, so say it there", QuitFailure)
-    case board.console
-    of layout.ckSemihosting: console = machine_m.ckSemihosting
-    of layout.ckUart:
-      console = machine_m.ckUart
-      uartBase = int64(board.uartOrigin)
-  run(input, output, arch, console, uartBase, board)
+    if writesToGiven:
+      quit("arkham: --writesTo and --layout both say where `write` goes; the " &
+           "layout is the board's own description, so say it there", QuitFailure)
+    case board.writesTo
+    of layout.wtDebugger: writesTo = machine_m.wtDebugger
+    of layout.wtSerial:
+      writesTo = machine_m.wtSerial
+      serialBase = int64(board.serialAddress)
+  run(input, output, arch, writesTo, serialBase, board)
   when defined(arkhamTempDbg): dumpTempStats()
 
 when isMainModule:

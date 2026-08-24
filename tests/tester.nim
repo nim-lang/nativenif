@@ -1007,11 +1007,11 @@ const cortexMUartArgs = ["-M", "mps2-an386", "-cpu", "cortex-m4",
                          "-display", "none", "-monitor", "none",
                          "-serial", "stdio", "-kernel"]
   ## The UART runner: no semihosting at all, and UART0 routed to stdout. That is
-  ## the point — an image built `--console:uart` needs no debug agent, so the
+  ## the point — an image built `--writesTo:serial` needs no debug agent, so the
   ## thing under test is that it produces output with none configured.
 
-proc cortexMUartTests() =
-  ## `--console:uart` end to end: bytes out of a CMSDK UART, and an `exit` that
+proc cortexMSerialTests() =
+  ## `--writesTo:serial` end to end: bytes out of a CMSDK UART, and an `exit` that
   ## parks the core because there is nobody to hand a status to.
   ##
   ## The run is EXPECTED to time out, and that is the assertion rather than a
@@ -1031,7 +1031,7 @@ proc cortexMUartTests() =
   let elf = workDir / "uart_hello.elf"
   var passed = 0
 
-  exec quoteShell(arkham) & " -a:cortex_m --console:uart -o:" & quoteShell(asmNif) &
+  exec quoteShell(arkham) & " -a:cortex_m --writesTo:serial -o:" & quoteShell(asmNif) &
        " " & quoteShell(src)
   exec quoteShell(nifasmExe) & " -o:" & quoteShell(elf) & " " & quoteShell(asmNif)
   var args: seq[string] = @[]
@@ -1039,16 +1039,16 @@ proc cortexMUartTests() =
   args.add elf
   let (output, code) = runProgram(qemu, args, timeoutMs = 5_000)
   if code != timeoutExitCode:
-    quit "FAILURE cortex-m uart: the image ENDED (exit " & $code & "). " &
-         "`--console:uart` has no debug agent to exit through, so it must park " &
+    quit "FAILURE cortex-m serial: the image ENDED (exit " & $code & "). " &
+         "`--writesTo:serial` has no debug agent to exit through, so it must park " &
          "on `wfi` instead.\n" & output
   if not output.contains("Hello World"):
-    quit "FAILURE cortex-m uart: nothing reached UART0.\nGot: " & escape(output)
+    quit "FAILURE cortex-m serial: nothing reached UART0.\nGot: " & escape(output)
   inc passed
 
-  # The DEFAULT is untouched: same input, no flag, still a semihosting image that
-  # runs to completion. A console flag that quietly changed every image would be
-  # the more expensive kind of wrong.
+  # The DEFAULT is untouched: same input, no flag, still a debugger image that
+  # runs to completion. A flag that quietly changed every image would be the more
+  # expensive kind of wrong.
   let semiAsm = workDir / "semi_hello.asm.nif"
   let semiElf = workDir / "semi_hello.elf"
   exec quoteShell(arkham) & " -a:cortex_m -o:" & quoteShell(semiAsm) & " " &
@@ -1059,19 +1059,20 @@ proc cortexMUartTests() =
   sargs.add semiElf
   let (sout, scode) = runProgram(qemu, sargs)
   if scode != 0 or sout != "Hello World\n":
-    quit "FAILURE cortex-m uart: the semihosting default regressed (exit " &
+    quit "FAILURE cortex-m serial: the semihosting default regressed (exit " &
          $scode & ")\nGot: " & escape(sout)
   inc passed
 
-  # A console is a Cortex-M peripheral; every other target's is the OS's.
-  execExpectFailure(quoteShell(arkham) & " -a:x64 --console:uart -o:" &
+  # A serial port is a Cortex-M peripheral; every other target's `write` is the
+  # OS's.
+  execExpectFailure(quoteShell(arkham) & " -a:x64 --writesTo:serial -o:" &
                     quoteShell(workDir / "x.asm.nif") & " " & quoteShell(src),
                     "cortex_m target only")
-  execExpectFailure(quoteShell(arkham) & " -a:cortex_m --console:rs232 -o:" &
+  execExpectFailure(quoteShell(arkham) & " -a:cortex_m --writesTo:rs232 -o:" &
                     quoteShell(workDir / "x.asm.nif") & " " & quoteShell(src),
-                    "unknown --console")
+                    "unknown --writesTo")
   inc passed
-  echo passed, " / 3 Cortex-M UART console tests successful"
+  echo passed, " / 3 Cortex-M serial-output tests successful"
 
 
 proc cortexMLayoutTests() =
@@ -1181,8 +1182,8 @@ proc cortexMLayoutTests() =
                       " -o:" & quoteShell(workDir / "x.asm.nif") & " " & quoteShell(src),
                       expected)
   reject(("(kilobytes 8)", "(kilobytes 5)"), "power of two")
-  reject(("(place text flash)", "(place text sram)"), "`rom` region")
-  reject(("(place data sram)", "(place data ccm)"), "not declared")
+  reject(("(place code flash)", "(place code sram)"), "`rom` region")
+  reject(("(place gvar sram)", "(place gvar ccm)"), "not declared")
   reject(("(kilobytes 16)", "16"), "expected a size")
   # A heap that does not fit is a LINK-time fact — arkham cannot know how many
   # bytes of globals the module has — so this one is nifasm's to refuse.
@@ -1197,10 +1198,10 @@ proc cortexMLayoutTests() =
                       " " & quoteShell(asmNif), "does not fit")
   # A console in the file AND on the command line is a contradiction, not a
   # precedence question.
-  execExpectFailure(quoteShell(arkham) & " -a:cortex_m --console:uart --layout:" &
+  execExpectFailure(quoteShell(arkham) & " -a:cortex_m --writesTo:serial --layout:" &
                     quoteShell("tests" / "layout" / "mps2.nif") & " -o:" &
                     quoteShell(workDir / "x.asm.nif") & " " & quoteShell(src),
-                    "both name a console")
+                    "both say where `write` goes")
   inc passed
   echo passed, " / 4 Cortex-M layout-file tests successful"
 
@@ -1512,7 +1513,7 @@ thumb2SelfTest()
 cortexMAsmTests()
 cortexMMemMapTests()
 cortexMInterruptTests()
-cortexMUartTests()
+cortexMSerialTests()
 cortexMLayoutTests()
 arkhamCortexMTests()
 arkhamCortexM64Tests()

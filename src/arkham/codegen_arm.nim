@@ -7570,7 +7570,7 @@ proc emitUartWriteProc(g: var CodeGen; sp: SyscallProc) =
   ## entry. It is two stores against a syscall's worth of work, it needs no `.bss`
   ## flag, and it makes the shim correct even if something else reset the
   ## peripheral in between.
-  let base = g.uartBase
+  let base = g.serialBase
   g.ab.tree NifasmDecl.ProcD:
     g.ab.symDef sp.asmName
     # The same signature dance as the semihosting shim: `count` is an `int64` in
@@ -7677,10 +7677,10 @@ proc emitSemihostRuntime(g: var CodeGen; sp: SyscallProc) =
         break
   case base
   of "exit":
-    if g.console == machine_m.ckUart: g.emitUartExitProc(sp.asmName)
+    if g.writesTo == machine_m.wtSerial: g.emitUartExitProc(sp.asmName)
     else: g.emitSemihostExitProc(sp.asmName)
   of "write":
-    if g.console == machine_m.ckUart:
+    if g.writesTo == machine_m.wtSerial:
       g.emitUartWriteProc(sp)
       return
     g.ab.tree NifasmDecl.ProcD:
@@ -7795,8 +7795,8 @@ proc rejectForThumbM(g: var CodeGen) =
          "\" cannot be satisfied — a firmware image has nothing to link against."
 
 proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
-                console = machine_m.ckSemihosting;
-                uartBase = machine_m.MpsUart0Base;
+                writesTo = machine_m.wtDebugger;
+                serialBase = machine_m.MpsUart0Base;
                 board = layout.Layout()): string =
   ## Compile a parsed Leng module to Cortex-M (ARMv7E-M) asm-NIF, which nifasm's
   ## `cortex_m` target assembles into a bare-metal firmware image.
@@ -7810,7 +7810,7 @@ proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## the part with a formal model behind it (proofs/arkham_bindings.tla).
   setTargetWord Word32             # 4-byte pointers, 4-byte platform int
   var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: machine_m.cortexMMachine,
-                  thumbM: true, console: console, uartBase: uartBase,
+                  thumbM: true, writesTo: writesTo, serialBase: serialBase,
                   board: board)
   g.ab.renderReg = machine_m.regNameM        # `(r0)`..`(r12)`/`(sp)`/`(lr)`
   g.ab.arch = "m"                  # no BodyLib entries apply to this target yet
@@ -7844,12 +7844,12 @@ proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     # file (`(kilobytes 8)` is what a datasheet says); a second reader that has to
     # redo the multiplication is a second chance to get it wrong.
     if g.board.given:
-      g.ab.tree NifasmDecl.MemmapD:
+      g.ab.tree NifasmDecl.LayoutD:
         for r in g.board.regions:
           g.ab.tree NifasmDecl.RegionD:
             g.ab.ident r.name
             g.ab.ident (if r.kind == layout.rkRom: "rom" else: "ram")
-            g.ab.tree OriginX: g.ab.intLit int64(r.origin)
+            g.ab.tree StartAddressX: g.ab.intLit int64(r.origin)
             g.ab.tree BytesX: g.ab.intLit int64(r.size)
         for sec in layout.SectionKind:
           g.ab.tree NifasmDecl.PlaceD:
@@ -7859,7 +7859,7 @@ proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           g.ab.ident g.board.stacksRegion
           g.ab.tree SlotsX: g.ab.intLit int64(g.board.slotCount)
           g.ab.tree BytesX: g.ab.intLit int64(g.board.slotSize)
-          g.ab.tree TlsX:
+          g.ab.tree TvarX:
             g.ab.tree BytesX: g.ab.intLit int64(g.board.tlsSize)
         if g.board.heapRegion.len > 0:
           g.ab.tree NifasmDecl.HeapD:

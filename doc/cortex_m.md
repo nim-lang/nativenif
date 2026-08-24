@@ -154,7 +154,7 @@ entry and cache the handle, so the same images run on real hardware.
 Both `exit` and `write` are all the existing arkham corpus needs: of 236
 fixtures, 225 `importc "exit"` and 3 `importc "write"`.
 
-Semihosting is the DEFAULT console, not the only one: `--console:uart` serves the
+Semihosting is the DEFAULT console, not the only one: `--writesTo:serial` serves the
 same two names off a CMSDK UART instead, for a board with no debugger attached.
 See M6.
 
@@ -301,16 +301,15 @@ stdout and stderr are the same stream.
   assembler never sees a float in a `(param …)`.
 * **M6 — actually embedded.** DONE.
 
-  **The UART console** is the last piece: `arkham --console:uart[:<addr>]` makes
+  **Serial output** is the last piece: `arkham --writesTo:serial[:<addr>]` makes
   `write` push bytes into a CMSDK APB UART and `exit` park the core, so an image
-  needs no debugger for either. `--console:semihosting` is still the default and
-  still byte-identical to giving no flag at all — a console flag that quietly
-  changed every image would be the more expensive kind of wrong.
+  needs no debugger for either. `--writesTo:debugger` is still the default and
+  still byte-identical to giving no flag at all — a flag that quietly changed
+  every image would be the more expensive kind of wrong.
 
   The two shims move together because they answer one question: is a debugger
   attached? Semihosting needs one for output AND for exit; a UART needs one for
-  neither, and has nothing to hand a status TO. So `exit` under a UART console
-  does the only honest thing — `wfi` in a loop. Not a busy spin: `wfi` idles the
+  neither, and has nothing to hand a status TO. So `exit` under serial output does the only honest thing — `wfi` in a loop. Not a busy spin: `wfi` idles the
   core until an interrupt, which is what a finished image owes a battery, and any
   handler still fires. The status stays in r0 for whoever attaches a probe later.
 
@@ -318,8 +317,7 @@ stdout and stderr are the same stream.
   MPS2 models. That is the only layout this can honestly carry: an STM32 USART is
   a different peripheral, not a different address, and a part with one now writes
   its own `write` on top of `volatileLoad`/`volatileStore`. The ADDRESS is the
-  part a board does get to choose, which is why it is an argument; bare `uart`
-  means MPS2's UART0 at 0x40004000.
+  part a board does get to choose, which is why it is an argument; bare `serial` means MPS2's UART0 at 0x40004000.
 
   The TX loop polls `STATE.TXFULL` before every byte. QEMU transmits instantly and
   never sets that bit, so the poll is dead code under emulation and load-bearing

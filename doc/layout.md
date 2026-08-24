@@ -11,7 +11,7 @@ that survives being flattened into `--flag:value` pairs.
 
 ## One reader
 
-arkham parses the file and **forwards it into the asm-NIF** as a `(memmap …)`
+arkham parses the file and **forwards it into the asm-NIF** as a `(layout …)`
 declaration. nifasm — which needs the regions to place segments — reads that tree
 rather than opening the file a second time.
 
@@ -27,18 +27,17 @@ is what makes that forwarding a splice rather than a translation.
 
 ```
 (.nif27)
-(memmap
- (region flash rom (origin 134217728) (megabytes 1))
- (region sram  ram (origin 536870912) (kilobytes 128))
+(layout
+ (region flash rom (startAddress 134217728) (megabytes 1))
+ (region sram  ram (startAddress 536870912) (kilobytes 128))
 
- (place text   flash)
- (place rodata flash)
- (place data   sram)
- (place bss    sram)
+ (place code  flash)
+ (place const flash)
+ (place gvar  sram)
 
- (console uart (origin 1073758208))
+ (writesTo serial (startAddress 1073758208))
 
- (stacks sram (slots 4) (kilobytes 8) (tls (bytes 512)))
+ (stacks sram (slots 4) (kilobytes 8) (tvar (bytes 512)))
  (heap   sram (kilobytes 32))
  (core 0))
 ```
@@ -48,23 +47,33 @@ layout file is exactly the place where a reader guesses the unit and is wrong. S
 `(bytes N)`, `(kilobytes N)`, `(megabytes N)` — and an untagged number is an
 error, not a byte count.
 
-`(origin …)` is an address. Addresses and sizes are both plain integers in NIF, so
-they are told apart by their tag rather than by position.
+`(startAddress …)` is an address. Addresses and sizes are both plain integers in
+NIF, so they are told apart by their tag — and spelled out, because a row holds
+two numbers and the reader should not have to remember which is which.
 
 ## Regions and placement
 
 A region is `rom` (holds what the image ships with) or `ram` (holds nothing at
-reset). `text` must be placed in a `rom` region and `data`/`bss` in a `ram` one —
-placing code in RAM would mean an image with nothing to copy it *from*.
+reset). `code` and `const` must be placed in a `rom` region and `gvar` in a `ram`
+one — placing code in RAM would mean an image with nothing to copy it *from*.
 
-`data`'s initializer image ships in the region `text` is placed in; the startup
-copy is what puts it where `(place data …)` says. See `doc/cortex_m.md` M6a.
+**The section names are NIF's and Nimony's, not the linker's:** `code`, `const`,
+`gvar`. One vocabulary across the toolchain is worth more than matching a
+convention whose own names are accidents — `.bss` stands for *Block Started by
+Symbol*, a 1950s IBM assembler directive, and has meant "the zeroed globals" only
+by habit ever since.
 
-Today `data`, `bss`, the stacks and the heap must all name the **same** region:
-the image emits one SRAM segment and the startup copy walks from one into the
-other. A part with a separate CCM/DTCM is exactly why the file names regions
-individually, and lifting that restriction is a change to the image writer rather
-than to this vocabulary.
+`gvar` covers the initialized globals **and** the zeroed ones. Whether a global
+ships with a value is not something a layout has an opinion about; the split
+inside the region is the image writer's, and it is a high-water mark rather than
+two placements (see `doc/cortex_m.md` M6a). Their initializer image ships in the
+region `code` is placed in, and the startup copy is what puts it where `(place
+gvar …)` says.
+
+Today `gvar`, the stacks and the heap must all name the **same** region: the image
+emits one SRAM segment. A part with a separate CCM/DTCM is exactly why the file
+names regions individually, and lifting that restriction is a change to the image
+writer rather than to this vocabulary.
 
 ## Inside the RAM region
 
@@ -132,10 +141,25 @@ lock-free paths are behind `hasThreadSupport` — and ARMv7-M `ldrex`/`strex` ar
 not implemented yet. Single-threaded is what works today; a threaded image is
 refused by name at the first atomic rather than racing.
 
-## Console
+## Where `write` goes
 
-`(console semihosting)` traps to a debug agent; `(console uart (origin …))` writes
-to a CMSDK APB UART and ends by parking the core. Giving a console here **and** on
-the command line is refused — that is a contradiction, not a precedence question.
+A Leng program says `importc "write"` and `importc "exit"`. On a hosted target
+those come from libc; on a bare board there is no libc and no OS, so arkham
+synthesizes both — and `(writesTo …)` picks which bodies.
 
-See `doc/cortex_m.md` M6e for what each one costs.
+`(writesTo debugger)` emits `bkpt #0xAB` with the operation in r0: a debug agent
+(QEMU, or a probe) intercepts the breakpoint, performs the I/O **on your machine**
+and resumes. `exit` sets the process's status the same way. With nothing attached
+the breakpoint faults and the program dies silently.
+
+`(writesTo serial (startAddress …))` emits a real loop: poll the UART's status
+register, store the byte to its data register. The bytes leave a pin. `exit` has
+nowhere to report to, so it parks the core on `wfi`.
+
+Both names say **what must be attached**, because that is the thing that is
+actually got wrong — "I flashed it and nothing printed". Saying it here *and* on
+the command line is refused: a contradiction, not a precedence question.
+
+This is temporary. Implementing `write` is the standard library's job, not a code
+generator's — a driver compiled into the backend can only ever be one driver — and
+it moves there once `{.assembler.}` works on Cortex-M. See `doc/cortex_m.md` M6e.

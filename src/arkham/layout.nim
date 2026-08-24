@@ -13,7 +13,7 @@
 ## a count, and none of that survives being flattened into `--flag:value` pairs.
 ##
 ## ONE reader. arkham parses the file and forwards it into the asm-NIF as a
-## `(memmap …)` declaration, so nifasm — which needs the regions to place
+## `(layout …)` declaration, so nifasm — which needs the regions to place
 ## segments — reads a tree it already has a vocabulary for instead of opening the
 ## file a second time. Two parsers of one file is two chances to disagree about
 ## what a region means, and the disagreement would surface as an image that loads
@@ -45,18 +45,24 @@ type
     size*: uint32
 
   SectionKind* = enum
-    secText, secRodata, secData, secBss
+    ## NIF's and Nimony's own words, not the linker's. `gvar` covers the
+    ## initialized globals AND the zeroed ones on purpose: whether a global ships
+    ## with a value is not something a LAYOUT has an opinion about, and the split
+    ## inside the region is the image writer's (see `doc/cortex_m.md` M6a).
+    secCode, secConst, secGvar
 
-  ConsoleKind* = enum
-    ckSemihosting
-    ckUart
+  WritesToKind* = enum
+    ## What `write` is implemented as. Both names say what must be ATTACHED,
+    ## which is the thing that is actually got wrong.
+    wtDebugger   ## trap to a debug agent, which does the I/O on the host
+    wtSerial     ## drive a UART; nothing attached but a wire
 
   Layout* = object
     given*: bool                     ## a file was read at all
     regions*: seq[Region]
     place*: array[SectionKind, string]   ## section → region name ("" = unset)
-    console*: ConsoleKind
-    uartOrigin*: uint32
+    writesTo*: WritesToKind
+    serialAddress*: uint32
     stacksRegion*: string
     slotCount*: int
     slotSize*: uint32                ## a POWER OF TWO — it is the mask a thread
@@ -98,38 +104,37 @@ proc readSize(n: var Cursor): uint32 =
   if got > 0xFFFF_FFFF'u64: fail "size out of range"
   result = uint32(got)
 
-proc readOrigin(n: var Cursor): uint32 =
-  if n.kind != TagLit or tagToNifasmExpr(asmTag(n)) != OriginX:
-    fail "expected (origin <address>)"
+proc readStartAddress(n: var Cursor): uint32 =
+  if n.kind != TagLit or tagToNifasmExpr(asmTag(n)) != StartAddressX:
+    fail "expected (startAddress <address>)"
   var got = 0'u64
   var seen = false
   n.into:
     if n.hasMore and n.kind == IntLit:
       got = uint64(n.intVal); seen = true; inc n
     while n.hasMore: skip n
-  if not seen: fail "(origin …) takes one address"
+  if not seen: fail "(startAddress …) takes one address"
   if got > 0xFFFF_FFFF'u64: fail "origin out of range"
   result = uint32(got)
 
 proc sectionOf(name: string): SectionKind =
   case name
-  of "text": secText
-  of "rodata": secRodata
-  of "data": secData
-  of "bss": secBss
-  else: fail "unknown section `" & name & "` — expected text, rodata, data or bss"
+  of "code": secCode
+  of "const": secConst
+  of "gvar": secGvar
+  else: fail "unknown section `" & name & "` — expected code, const or gvar"
 
 proc parseLayout*(path: string): Layout =
   ## Read and CHECK the file. Everything that can be wrong about a layout is
   ## wrong here, by name, and not later as an image that boots into nothing.
-  result = Layout(given: true, console: ckSemihosting, slotCount: 1, core: 0)
+  result = Layout(given: true, writesTo: wtDebugger, slotCount: 1, core: 0)
   var buf = parseFromFile(path, sharedTags = asmTags)
   var n = beginRead(buf)
-  if n.kind != TagLit or tagToNifasmDecl(asmTag(n)) != MemmapD:
-    fail path & ": expected a (memmap …) tree"
+  if n.kind != TagLit or tagToNifasmDecl(asmTag(n)) != LayoutD:
+    fail path & ": expected a (layout …) tree"
   n.into:
     while n.hasMore:
-      if n.kind != TagLit: fail "expected a declaration inside (memmap …)"
+      if n.kind != TagLit: fail "expected a declaration inside (layout …)"
       let d = tagToNifasmDecl(asmTag(n))
       var e = n
       skip n
@@ -145,13 +150,13 @@ proc parseLayout*(path: string): Layout =
           of "ram": r.kind = rkRam
           else: fail "a region is `rom` or `ram`, not `" & e.strVal & "`"
           inc e
-          r.origin = readOrigin(e)
+          r.origin = readStartAddress(e)
           r.size = readSize(e)
           while e.hasMore: skip e
         if result.regionByName(r.name) >= 0: fail "duplicate region `" & r.name & "`"
         result.regions.add r
       of PlaceD:
-        var sec = secText
+        var sec = secCode
         var reg = ""
         e.into:
           if e.kind != Ident: fail "(place …) needs a section name"
@@ -160,15 +165,15 @@ proc parseLayout*(path: string): Layout =
           reg = e.strVal; inc e
           while e.hasMore: skip e
         result.place[sec] = reg
-      of ConsoleD:
+      of WritesToD:
         e.into:
-          if e.kind != Ident: fail "(console …) needs `semihosting` or `uart`"
+          if e.kind != Ident: fail "(writesTo …) needs `debugger` or `serial`"
           case e.strVal
-          of "semihosting": result.console = ckSemihosting; inc e
-          of "uart":
-            result.console = ckUart; inc e
-            result.uartOrigin = readOrigin(e)
-          else: fail "a console is `semihosting` or `uart`, not `" & e.strVal & "`"
+          of "debugger": result.writesTo = wtDebugger; inc e
+          of "serial":
+            result.writesTo = wtSerial; inc e
+            result.serialAddress = readStartAddress(e)
+          else: fail "`write` goes to `debugger` or `serial`, not `" & e.strVal & "`"
           while e.hasMore: skip e
       of StacksD:
         e.into:
@@ -183,8 +188,8 @@ proc parseLayout*(path: string): Layout =
           if cnt < 1: fail "(slots N) must be at least 1"
           result.slotCount = cnt
           result.slotSize = readSize(e)
-          if e.kind != TagLit or tagToNifasmExpr(asmTag(e)) != TlsX:
-            fail "(stacks …) needs (tls <size>)"
+          if e.kind != TagLit or tagToNifasmExpr(asmTag(e)) != TvarX:
+            fail "(stacks …) needs (tvar <size>)"
           e.into:
             result.tlsSize = readSize(e)
             while e.hasMore: skip e
@@ -200,7 +205,7 @@ proc parseLayout*(path: string): Layout =
           if e.hasMore and e.kind == IntLit: (result.core = int(e.intVal); inc e)
           while e.hasMore: skip e
       else:
-        fail "unexpected `" & $d & "` inside (memmap …)"
+        fail "unexpected `" & $d & "` inside (layout …)"
   endRead n
 
 proc validate*(l: Layout): string =
@@ -220,11 +225,12 @@ proc validate*(l: Layout): string =
     if l.place[s].len == 0: return "no (place " & ($s).substr(3).toLowerAscii & " …)"
     if l.regionByName(l.place[s]) < 0:
       return "(place …) names region `" & l.place[s] & "`, which is not declared"
-  let textR = l.regions[l.regionByName(l.place[secText])]
-  if textR.kind != rkRom: return "text must be placed in a `rom` region"
-  for s in [secData, secBss]:
-    if l.regions[l.regionByName(l.place[s])].kind != rkRam:
-      return "`" & ($s).substr(3).toLowerAscii & "` must be placed in a `ram` region"
+  for s in [secCode, secConst]:
+    if l.regions[l.regionByName(l.place[s])].kind != rkRom:
+      return "`" & ($s).substr(3).toLowerAscii & "` ships with the image, so it " &
+             "must be placed in a `rom` region"
+  if l.regions[l.regionByName(l.place[secGvar])].kind != rkRam:
+    return "`gvar` must be placed in a `ram` region"
   if l.stacksRegion.len == 0: return "no (stacks …)"
   let si = l.regionByName(l.stacksRegion)
   if si < 0: return "(stacks …) names region `" & l.stacksRegion & "`, which is not declared"
