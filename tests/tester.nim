@@ -966,6 +966,110 @@ proc cortexMAsmTests() =
   echo passed, " / ", fixtures.len, " Cortex-M assembler tests successful"
 
 
+proc cortexMMemMapTests() =
+  ## The board memory map (`--flash`/`--flash-size`/`--ram`/`--ram-size`/
+  ## `--stack-top`) actually reaching the image.
+  ##
+  ## The load-bearing case is the RELOCATED one, and it is relocated within the
+  ## address range QEMU's SSRAM covers so that it can be RUN rather than merely
+  ## inspected: if any of the globals' `movw/movt` sites, the `(datavma)` the
+  ## startup copy writes to, or the vector table's initial-MSP word still carried
+  ## a compiled-in constant, the fixture reads a global that was never written or
+  ## pushes onto a stack that is not there. It exits 42 only if all three follow
+  ## the map.
+  ##
+  ## The board case (an STM32F407) cannot be run — nothing in QEMU has flash at
+  ## 0x08000000 — so it is checked by reading the two words a cold core reads.
+  let qemu = findExe(cortexMQemu)
+  if qemu.len == 0:
+    echo cortexMQemu, " not found - skipping Cortex-M memory-map tests"
+    return
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham_m" / "nimcache_m"
+  createDir workDir
+  let src = "tests" / "arkham_m" / "global_data_init.c.nif"
+  let asmNif = workDir / "memmap.asm.nif"
+  exec quoteShell(arkham) & " -a:cortex_m -o:" & quoteShell(asmNif) & " " &
+       quoteShell(src)
+  var passed = 0
+
+  proc u32At(img: string; off: int): uint32 =
+    for i in countdown(3, 0): result = (result shl 8) or uint32(img[off + i].byte)
+
+  # ── 1. relocated RAM, run under QEMU ──
+  let relocElf = workDir / "memmap_reloc.elf"
+  exec quoteShell(nifasmExe) & " --ram:0x20001000 --ram-size:32K -o:" &
+       quoteShell(relocElf) & " " & quoteShell(asmNif)
+  var args: seq[string] = @[]
+  for a in cortexMArgs: args.add a
+  args.add relocElf
+  let (relocOut, relocCode) = runProgram(qemu, args)
+  if relocCode == timeoutExitCode:
+    quit "FAILURE (TIMEOUT) cortex-m memmap relocated RAM"
+  if relocCode != 42:
+    quit "FAILURE cortex-m memmap relocated RAM: exit " & $relocCode & "\n" & relocOut
+  # Running is not by itself evidence: an image that ignored `--ram` entirely and
+  # put everything back at the default base is INTERNALLY consistent and exits 42
+  # just the same. So read the addresses back and require that they moved.
+  block:
+    let relocImg = readFile(relocElf)
+    let ramV = u32At(relocImg, 52 + 32 + 8)
+    let mspV = u32At(relocImg, int(u32At(relocImg, 52 + 4)))
+    if ramV != 0x20001000'u32:
+      quit "FAILURE cortex-m memmap: relocated RAM segment at 0x" & toHex(ramV, 8) &
+           ", want 0x20001000 — the --ram flag did not reach the image"
+    if mspV != 0x20009000'u32:
+      quit "FAILURE cortex-m memmap: relocated initial MSP 0x" & toHex(mspV, 8) &
+           ", want 0x20009000"
+  inc passed
+
+  # ── 2. an STM32F407 map, read back out of the image ──
+  # Segment vaddrs live in the program headers, which this reads at their fixed
+  # ELF32 offsets rather than by shelling out to readelf.
+  let stmElf = workDir / "memmap_stm32.elf"
+  exec quoteShell(nifasmExe) &
+       " --flash:0x08000000 --flash-size:1M --ram-size:128K -o:" &
+       quoteShell(stmElf) & " " & quoteShell(asmNif)
+  let img = readFile(stmElf)
+  const PhOff = 52          # e_phoff: the headers follow the 52-byte ELF header
+  const PhSize = 32
+  let flashVaddr = u32At(img, PhOff + 8)
+  let ramVaddr = u32At(img, PhOff + PhSize + 8)
+  let flashFileOff = u32At(img, PhOff + 4)
+  if flashVaddr != 0x08000000'u32:
+    quit "FAILURE cortex-m memmap: flash segment at 0x" & toHex(flashVaddr, 8)
+  if ramVaddr != 0x20000000'u32:
+    quit "FAILURE cortex-m memmap: RAM segment at 0x" & toHex(ramVaddr, 8)
+  # The two words a cold M-profile core reads: initial MSP, then the reset
+  # handler WITH the Thumb bit — an even address here is a UsageFault at reset.
+  let msp = u32At(img, int(flashFileOff))
+  let reset = u32At(img, int(flashFileOff) + 4)
+  if msp != 0x20020000'u32:
+    quit "FAILURE cortex-m memmap: initial MSP 0x" & toHex(msp, 8) & ", want 0x20020000"
+  if (reset and 1) == 0 or reset < 0x08000000'u32 or reset >= 0x08100000'u32:
+    quit "FAILURE cortex-m memmap: reset vector 0x" & toHex(reset, 8)
+  inc passed
+
+  # ── 3. the bounds, which are the whole point of declaring a size ──
+  execExpectFailure(quoteShell(nifasmExe) & " --flash-size:256 -o:" &
+                    quoteShell(workDir / "memmap_x.elf") & " " & quoteShell(asmNif),
+                    "holds 256")
+  execExpectFailure(quoteShell(nifasmExe) &
+                    " --ram-size:8 --stack-top:0x20000008 -o:" &
+                    quoteShell(workDir / "memmap_x.elf") & " " & quoteShell(asmNif),
+                    "reach the stack top")
+  execExpectFailure(quoteShell(nifasmExe) & " --ram:0x00000000 -o:" &
+                    quoteShell(workDir / "memmap_x.elf") & " " & quoteShell(asmNif),
+                    "overlap")
+  execExpectFailure(quoteShell(nifasmExe) & " --stack-top:0x30000000 -o:" &
+                    quoteShell(workDir / "memmap_x.elf") & " " & quoteShell(asmNif),
+                    "outside the RAM region")
+  inc passed
+
+  echo passed, " / 3 Cortex-M memory-map tests successful"
+
+
 const cortexMUnsupported: seq[string] = @[
   # `tests/arkham/` — the FULL 64-bit corpus — is run against Cortex-M as well.
   # These are the fixtures it cannot serve, each parked under the reason, so that
@@ -1142,6 +1246,7 @@ vgClientRequestEncodingTests()
 # qemu-system-arm, so it runs wherever that is installed.
 thumb2SelfTest()
 cortexMAsmTests()
+cortexMMemMapTests()
 arkhamCortexMTests()
 arkhamCortexM64Tests()
 

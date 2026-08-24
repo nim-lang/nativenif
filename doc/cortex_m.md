@@ -115,8 +115,9 @@ Verified host behaviour (M0):
 M-profile has no reset vector *instruction*; the core reads a table at
 `VTOR` (0x00000000 out of reset):
 
-* word 0 — initial MSP. The probe uses `0x20010000` (MPS2 SSRAM2/3 starts at
-  0x20000000; the stack grows down from 64K in).
+* word 0 — initial MSP. Defaults to `0x20010000` (MPS2 SSRAM2/3 starts at
+  0x20000000; the stack grows down from 64K in), and follows `nifasm`'s
+  `--ram`/`--ram-size`/`--stack-top` for any other board.
 * word 1 — reset handler address **with bit 0 set**. Bit 0 is the Thumb-state
   bit, not part of the address; clearing it faults immediately.
 
@@ -294,8 +295,38 @@ stdout and stderr are the same stream.
   path, as they do on AArch64 — `isDeclarativeAbi` excludes them — so the
   assembler never sees a float in a `(param …)`.
 * **M6 — actually embedded.** Exception/interrupt handlers with the right
-  EXC_RETURN epilogue, volatile MMIO, memory-map configuration, and a UART
-  output backend so real hardware works without a debugger attached.
+  EXC_RETURN epilogue, volatile MMIO, and a UART output backend so real hardware
+  works without a debugger attached.
+
+  **The memory map is DONE.** `nifasm --flash:ADDR --flash-size:N --ram:ADDR
+  --ram-size:N --stack-top:ADDR` — the two lines of linker script a firmware
+  image actually needs, replacing the MPS2 constants that used to be compiled in.
+  Sizes take a K/M/G suffix and addresses take `0x`, because a datasheet is where
+  the numbers are read off. An STM32F407 is `--flash:0x08000000 --flash-size:1M
+  --ram-size:128K`. The defaults are the MPS2 values, so an image built without
+  any of them is byte-identical to one built before the flags existed, and giving
+  them to any other target is an error rather than silence.
+
+  The sizes are what makes them worth having: nothing bounded the image before.
+  An image larger than the part's flash was not a diagnostic, it was an ELF that
+  loads and a board that faults somewhere unrelated. Now both regions are checked
+  and both name themselves, as do an overlapping map and a stack top outside RAM.
+
+  Note the ORDER dependence the flags do not have: `--stack-top` defaults to the
+  top of RAM, which both `--ram` and `--ram-size` move, so it is settled once
+  after all flags are read rather than as each arrives.
+
+  What must be run rather than inspected is that the map reaches the IMAGE, and
+  the test does run it: `tests/tester.nim`'s `cortexMMemMapTests` relocates RAM to
+  0x20001000 — still inside QEMU's SSRAM — and executes the fixture there. If the
+  globals' `movw/movt` sites, the `(datavma)` the startup copy writes to, or the
+  vector table's initial-MSP word had kept a compiled-in constant, it reads a
+  global that was never written or pushes onto a stack that is not there. And
+  because an image that ignored the flag ENTIRELY is internally consistent and
+  exits 42 just the same, the test also reads the addresses back out of the ELF
+  and requires that they moved. The STM32F407 map cannot be run — nothing in QEMU
+  has flash at 0x08000000 — so it is checked by reading the two words a cold core
+  reads.
 
   **`.data` init from flash is DONE.** A hosted program is handed a laid-out
   address space by its loader. A firmware image is handed a chip: flash holds

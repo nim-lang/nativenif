@@ -63,12 +63,64 @@ type
 const
   FlashBase* = 0x00000000'u32
     ## Where the vector table must live out of reset (VTOR is 0 then). On MPS2
-    ## this region is ZBT SRAM rather thanreal flash, so an image may write to it —
-    ## which is what lets a first-cut image skip the flash→RAM `.data` copy.
+    ## this region is ZBT SRAM rather than real flash, so an image may write to it.
+  FlashSize* = 0x00400000'u32
+    ## 4 MB — the MPS2 ZBT SRAM block at 0. Also the smallest number that is not
+    ## a bound on any part existing fixtures reach, which is what a DEFAULT owes:
+    ## it must never be the reason something stops assembling.
   SramBase* = 0x20000000'u32
-  DefaultStackTop* = 0x20010000'u32
-    ## 64 KB into SRAM, growing down. Comfortably inside every MPS2 variant and
-    ## inside an STM32F407's 128 KB too.
+  SramSize* = 0x00010000'u32
+    ## 64 KB. The MPS2 block here is far larger, but 64 KB is what the stack top
+    ## has always implied and it is inside an STM32F407's 128 KB too.
+  DefaultStackTop* = SramBase + SramSize
+
+type
+  MemoryMap* = object
+    ## Where the image's two regions live on the target BOARD — a linker script,
+    ## in the two lines of it a firmware image actually needs.
+    ##
+    ## Compiled-in constants were fine while every image ran on one QEMU machine.
+    ## They stop being fine at the first real part: an STM32F407 has its flash at
+    ## 0x08000000 and 128 KB of SRAM, an nRF52840 has 256 KB, and an image that
+    ## overruns either is not a diagnostic today — it is an ELF that loads and a
+    ## board that faults somewhere else entirely.
+    ##
+    ## The defaults are the MPS2 ones above, so an image built without any of this
+    ## is byte-identical to one built before it existed.
+    flashBase*, flashSize*: uint32
+    ramBase*, ramSize*: uint32
+    stackTop*: uint32
+      ## The initial MSP — vector-table word 0. Defaults to the top of RAM; the
+      ## stack grows DOWN from here while the globals grow UP from `ramBase`.
+    given*: bool
+      ## Any of the above was set explicitly. Only so that setting them for a
+      ## target that has no use for them can be an error rather than silence.
+
+proc defaultMemoryMap*(): MemoryMap =
+  MemoryMap(flashBase: FlashBase, flashSize: FlashSize,
+            ramBase: SramBase, ramSize: SramSize,
+            stackTop: DefaultStackTop, given: false)
+
+proc validate*(m: MemoryMap): string =
+  ## `""` when the map describes a board that could exist. Checked once, where the
+  ## flags were read, so a typo names itself instead of surfacing as an image that
+  ## loads nowhere.
+  if m.flashSize == 0: return "the flash region has size 0"
+  if m.ramSize == 0: return "the RAM region has size 0"
+  # uint32 arithmetic: a base plus a size that wraps past 4 GB is a typo, and the
+  # containment tests below would silently pass for it.
+  if m.flashBase.uint64 + m.flashSize.uint64 > 0x1_0000_0000'u64:
+    return "the flash region runs past the end of the address space"
+  if m.ramBase.uint64 + m.ramSize.uint64 > 0x1_0000_0000'u64:
+    return "the RAM region runs past the end of the address space"
+  if m.flashBase < m.ramBase + m.ramSize and m.ramBase < m.flashBase + m.flashSize:
+    return "the flash and RAM regions overlap"
+  # The initial MSP is the address the first push writes BELOW, so the top of RAM
+  # is a legal value and `ramBase` itself is not: a stack with no room is a fault
+  # on the entry proc's own prologue.
+  if m.stackTop <= m.ramBase or m.stackTop > m.ramBase + m.ramSize:
+    return "the stack top is outside the RAM region"
+  return ""
 
 proc initVectorTable*(stackTop: uint32; resetHandler: uint32): seq[byte] =
   ## The two words an M-profile core reads at reset.

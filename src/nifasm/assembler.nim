@@ -10577,7 +10577,7 @@ proc setupTls(ctx: var GenContext) =
   x86.emitJmp(ctx.buf, LabelId(ctx.entrySym.offset))        # → real entry
 
 proc writeCortexMImage(a: var GenContext; code: seq[byte];
-                       entryOff: int): seq[byte] =
+                       entryOff: int; map: elf32.MemoryMap): seq[byte] =
   ## The finished firmware: a vector table, the code, and the `.data` initializer
   ## image all at the flash base, plus a second segment declaring the SRAM region
   ## the globals occupy at run time.
@@ -10599,8 +10599,8 @@ proc writeCortexMImage(a: var GenContext; code: seq[byte];
         if it.off.int + i < bssImage.len:
           bssImage[it.off.int + i] = byte((it.val shr (8 * i)) and 0xFF)
 
-  let bssVaddr = elf32.SramBase
-  let codeVaddr = elf32.FlashBase
+  let bssVaddr = map.ramBase
+  let codeVaddr = map.flashBase
   # A global initialized with another SYMBOL's address — `var hook = twice`, `var
   # alias = addr counter` — is a relocation, not a constant, so it is baked here
   # once every label has a position. Without this the cell stays zero and the
@@ -10629,12 +10629,12 @@ proc writeCortexMImage(a: var GenContext; code: seq[byte];
         if it.off.int + i < bssImage.len:
           bssImage[it.off.int + i] = byte((targetVaddr shr (8 * i)) and 0xFF)
 
-  # The stack grows DOWN from `DefaultStackTop`, the globals UP from `SramBase`.
+  # The stack grows DOWN from `map.stackTop`, the globals UP from `map.ramBase`.
   # They share one RAM region, so say so when they would meet rather than letting
   # the first deep call frame quietly overwrite a global.
-  if bssVaddr + uint32(a.bssOffset) >= elf32.DefaultStackTop:
-    quit "nifasm: " & $a.bssOffset & " bytes of globals would reach the stack at 0x" &
-         toHex(elf32.DefaultStackTop, 8)
+  if bssVaddr + uint32(a.bssOffset) > map.stackTop:
+    quit "nifasm: " & $a.bssOffset & " bytes of globals at 0x" &
+         toHex(bssVaddr, 8) & " reach the stack top at 0x" & toHex(map.stackTop, 8)
 
   var patched = code
 
@@ -10707,7 +10707,7 @@ proc writeCortexMImage(a: var GenContext; code: seq[byte];
   let dataInitSize = min((dataHigh + 3) and not 3, ramSize)
   let bssZeroSize = ramSize - dataInitSize
 
-  var image = elf32.initVectorTable(elf32.DefaultStackTop,
+  var image = elf32.initVectorTable(map.stackTop,
                               codeVaddr + uint32(elf32.VectorTableSize + entryOff))
   # The initializer image is appended AFTER the code, 4-aligned so the startup
   # copy — which moves whole words — reads aligned on both sides.
@@ -10733,6 +10733,14 @@ proc writeCortexMImage(a: var GenContext; code: seq[byte];
   for i in 0 ..< dataInitSize:
     image.add (if i < bssImage.len: bssImage[i] else: 0'u8)
 
+  # Nothing above bounds the image, and until now nothing did: an image larger
+  # than the part's flash produced an ELF that loads and a board that faults
+  # somewhere unrelated, at the first byte the loader could not place. Say it
+  # here, where both numbers are known.
+  if uint32(image.len) > map.flashSize:
+    quit "nifasm: the image is " & $image.len & " bytes and the flash region at 0x" &
+         toHex(map.flashBase, 8) & " holds " & $map.flashSize
+
   var segs = @[elf32.Segment(vaddr: codeVaddr, data: image, memSize: image.len,
                        flags: elf32.PF_R or elf32.PF_W or elf32.PF_X)]
   if ramSize > 0:
@@ -10745,7 +10753,8 @@ proc writeCortexMImage(a: var GenContext; code: seq[byte];
   result = elf32.writeElf32(segs, codeVaddr + uint32(elf32.VectorTableSize + entryOff))
 
 proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
-               listing = ""; debugInfo = true) =
+               listing = ""; debugInfo = true;
+               memMap = elf32.defaultMemoryMap()) =
   var buf = parseFromFile(filename, sharedTags = asmTags)
   # The main module's pool is shared with every foreign module (getDecl is passed
   # `ctx.pool`), so a `SymId` from ANY cursor is a valid key in the one scope table.
@@ -10868,6 +10877,11 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
     else:
       quit "nifasm: --emit-obj is only supported for macOS arm64"
   else:
+    # A memory map describes a BOARD, and only the firmware target has one. Every
+    # other arch is handed its address space by a loader, so honouring the flags
+    # there is impossible and ignoring them silently is worse than saying so.
+    if memMap.given and ctx.arch != Arch.CortexM:
+      quit "nifasm: the memory-map flags apply to the cortex_m target only"
     case ctx.arch
     of Arch.X64, Arch.LinuxA64:
       writeElf(ctx, outfile)
@@ -10883,7 +10897,7 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
       # image base because the vector table sits there. Without it every
       # `(adr …)` would resolve 8 bytes low — near enough to look plausible and
       # read the wrong bytes.
-      ctx.buf.absBase = elf32.FlashBase + uint32(elf32.VectorTableSize)
+      ctx.buf.absBase = memMap.flashBase + uint32(elf32.VectorTableSize)
       finalize(ctx.buf)
       var code: seq[byte] = newSeq[byte](ctx.buf.data.len)
       for i in 0 ..< ctx.buf.data.len: code[i] = ctx.buf.data[i]
@@ -10900,7 +10914,7 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
           quit "nifasm: entry point '" & ctx.nameOf(ctx.entrySym.name) &
                "' has no address"
         entryOff = pos
-      writeFile(outfile, writeCortexMImage(ctx, code, entryOff))
+      writeFile(outfile, writeCortexMImage(ctx, code, entryOff, memMap))
 
   # Close all foreign-module readers (the main module has no reader).
   for modname, module in ctx.modules.mpairs:
