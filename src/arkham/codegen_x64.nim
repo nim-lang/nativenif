@@ -442,7 +442,8 @@ proc emitScalarCmpE(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
 proc emitMemLoad2(g: var CodeGen; c: Cursor; dest: var Location; late = false)
 proc emitAddr2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location)
-proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
+proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
+               tail = false)
 proc emCallerSaveOpen(g: var CodeGen): CallerSaveWindow
 proc emCallerSaveClose(g: var CodeGen; w: CallerSaveWindow; dest: Location)
 proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location)
@@ -5995,6 +5996,7 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         else:
           g.emProcessExit(immLoc(0, ScalarSlot))
       else:
+        var tailed = false
         if g.retAggrSym != NoTypeSym:                          # aggregate return
           var srcName: string
           if cc.kind == Symbol:
@@ -6018,6 +6020,23 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
           else:
             g.releaseRetRegs()
             g.structToRegs(srcName, g.retAggrSym, x64RetRegs)  # ≤16B → rax:rdx
+        elif hasVal and cc.kind == TagLit and cc.exprKind == CallC and
+             not g.retIsFloat:
+          # `(ret (call …))` — the tail-call encoding. Leng binds every call and
+          # forbids nesting them, so a call sitting directly under a `ret` is not an
+          # expression that happens to be there: it is the producer saying
+          # "tail-call this". Hand it to `emitCall2`, which marshals the arguments
+          # exactly as for an ordinary call and then pops the frame and jumps.
+          #
+          # It may still decline — an external target, an outgoing stack argument, a
+          # by-reference result — in which case it emitted an ordinary call and left
+          # the value in `d`, and we return through the epilogue as usual.
+          var d = needsReg(g.valueSlot(cc))
+          g.emitCall2(cc, d, tail = true)
+          if not g.tailCallEmitted:
+            g.place2(d, g.md.intRetReg)
+            g.freeVal(d)
+          tailed = g.tailCallEmitted
         elif hasVal:                                       # scalar / float result → ret reg
           let retPos = cursorToPosition(g.buf[], cc)
           if g.retIsFloat:
@@ -6030,7 +6049,9 @@ proc genStmt2(g: var CodeGen; c: Cursor) =
         # through into the following statements (e.g. a mid-proc `if cond: return x`).
         # A tail `ret` falls straight through the (zero-byte) scope kills into the
         # epilogue, so it needs no jump and does not force the shared label.
-        if not myTail:
+        # A TAIL CALL has left the proc for good: no jump to the epilogue either,
+        # since nothing after it is reachable.
+        if not myTail and not tailed:
           g.emJmp(g.retLabel2); g.retLabelUsed2 = true
       while cc.hasMore: skip cc
   of CaseS:
@@ -7511,7 +7532,8 @@ proc emitCast2(g: var CodeGen; c: Cursor; dest: var Location) =
     innerSlot.typ = dest.typ
     dest = innerSlot
 
-proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false) =
+proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
+                    tail = false) =
   ## FUSED call. allocCall's placement decisions run inline: each scalar arg
   ## dest-threads straight into its ABI register (or a parked callee-saved
   ## survivor when a later argument's shift/div would clobber it — decided by
@@ -7519,6 +7541,19 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
   ## scratches at the point of use; the result settles from rax/xmm0 into
   ## `dest`. `hiddenPtr` documents a >16B-result call whose rdi the caller
   ## pre-loaded; the plan derives the same fact from the callee's return type.
+  ##
+  ## `tail` marks a call in `(ret (call …))` position. Leng binds every call and
+  ## forbids nesting them, so that shape is not an expression the backend gets to
+  ## second-guess — it is the producer saying "tail-call this", and the legality
+  ## question (nothing of ours may outlive the frame) was answered there. Here it
+  ## means only: after the arguments are in place, undo the prologue and JUMP. The
+  ## callee then returns to our caller with our return value already in rax/xmm0,
+  ## so nothing is bound afterwards and nothing follows.
+  ##
+  ## `(popframe)` rather than an inline teardown because arkham does not know its
+  ## own frame yet: `usedCallee`/`hasStackVars` are final only after the whole body
+  ## is emitted. nifasm has assembled the prologue by the time it reaches the
+  ## marker and can simply reverse it.
   discard hiddenPtr
   var argCurs: seq[Cursor] = @[]
   var fsym = ""
@@ -7616,6 +7651,23 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
     # but only when an argument actually spills; four arguments or fewer would leave
     # the callee spilling its registers over this frame's return address.)
     g.plan.hasStackVars = true
+  # A tail call is a DIRECTIVE, not a shape to be validated — whether anything of
+  # ours may outlive the frame was decided by whoever wrote `(ret (call …))`. What
+  # is checked here is only what arkham cannot MECHANICALLY do: an outgoing stack
+  # argument is written at `[rsp, …]` that `(popframe)` moves rsp out from under; an
+  # external target goes through the IAT/GOT and an indirect one through a register
+  # `(popframe)` restores, so neither reaches a plain `jmp rel32`; a syscall is not a
+  # branch at all; a >16B result travels through a hidden pointer that is not ours to
+  # forward; and a Win64 call always owns a 32-byte shadow area in this frame.
+  # Declining is silent and costs nothing — the call is emitted as an ordinary one.
+  # (`tailCallEmitted` is cleared by the WRAPPER, not here: the mem-intrinsic and
+  # bit-builtin paths above return early, and a stale `true` from an earlier call
+  # would make `RetS` skip the epilogue jump.)
+  var doTail = tail and not indirect and not tgt.extern and not tgt.syscall and
+               not tgt.indirect and not resultByRef and not foreignCall
+  if doTail:
+    for pl in plan.args:
+      if pl.onStack: doTail = false
   # Which ABI argument registers does a LATER argument overwrite by ISA fiat?
   var laterClob: seq[set[Reg]] = @[]
   block:
@@ -7755,6 +7807,15 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
       g.ab.sym tgt.asmName
       if isSyscall: g.emSyscall()
       elif tgt.extern: g.ab.keyword ExtcallX64   # dynamic import → indirect via the IAT/GOT
+      elif doTail:
+        # The arguments are in their ABI registers; from here nothing of ours is
+        # live, so undo the prologue and branch. `(popframe)` is inside the prepare
+        # block on purpose: it must follow the last argument store and precede the
+        # jump, and it touches only rsp and callee-saved registers — never the
+        # argument registers the arguments now sit in.
+        g.ab.keyword PopframeX64
+        g.ab.keyword TailcallX64
+        g.tailCallEmitted = true
       else: g.ab.keyword CallX64
     g.flushArgResidentParams()
     g.rb.unsealAccums(sealedArgs)
@@ -7764,7 +7825,7 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
     if stagedFnptr != NoReg: g.giveBack stagedFnptr
     g.freeVal(fnptrLoc)
     for h in heldArgs: g.freeVal(h)
-    g.settleCallResult(dest)
+    if not doTail: g.settleCallResult(dest)
     return
   # ── the unified declarative path: every argument binds via `(arg pN [k])`.
   var sealedArgs: set[Reg] = {}
@@ -7969,9 +8030,14 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
         g.emReg pb.src
     if isSyscall: g.emSyscall()
     elif tgt.extern: g.ab.keyword ExtcallX64     # dynamic import → indirect via the IAT/GOT
+    elif doTail:
+      g.ab.keyword PopframeX64                   # see the manual path above
+      g.ab.keyword TailcallX64
+      g.tailCallEmitted = true
     else: g.ab.keyword CallX64
     g.flushArgResidentParams()
-    if hasResult and not resultByRef and not resultIsFloat and resSlot.kind != AMem:
+    if not doTail and hasResult and not resultByRef and not resultIsFloat and
+       resSlot.kind != AMem:
       g.ab.tree MovX64:
         g.emReg RAX
         g.ab.tree ResX: g.ab.sym synth("ret.0")
@@ -7982,7 +8048,7 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
   if stagedFnptr != NoReg: g.giveBack stagedFnptr
   g.freeVal(fnptrLoc)
   for h in heldArgs: g.freeVal(h)
-  g.settleCallResult(dest)
+  if not doTail: g.settleCallResult(dest)
 
 proc emCallerSaveStore(g: var CodeGen; varName: string) =
   ## Save a caller-saved value into its permanent slot, then release the register.
@@ -8072,7 +8138,8 @@ proc emCallerSaveClose(g: var CodeGen; w: CallerSaveWindow; dest: Location) =
     if dest.kind == InReg and dest.r == it.reg: continue
     g.emCallerSaveRestore(callerSaveSlotName(it.name), it.name, it.reg)
 
-proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false) =
+proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
+               tail = false) =
   ## Caller-save wrapper: every caller-saved local bound right now is stored before
   ## this call's ABI marshalling clobbers its volatile home, and reloaded after the
   ## call returns. Between the two, `plan.callerSaveActive` redirects every read of
@@ -8111,13 +8178,28 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false)
   # whole map anyway costs a call-free straight-line region nothing and removes
   # the callee-saved case from the argument.)
   g.killAllMirrors()
-  let diverging = g.isDivergingCall(c)
+  g.tailCallEmitted = false               # every early return in `Inner` leaves it clear
+  # A TAIL call diverges in exactly the same way, and for the same reason wants the
+  # same treatment: control never comes back, so at whatever statement follows in the
+  # emission order — the other arm of the `if` this `return f(x)` sat in — every
+  # register still holds what it held before, and the names must still be there.
+  let diverging = g.isDivergingCall(c) or tail
   var savedBinds: seq[tuple[r: Reg, name: string]] = @[]
   if diverging: savedBinds = g.namedBindings()
   let w = g.emCallerSaveOpen()
-  g.emitCall2Inner(c, dest, hiddenPtr)
-  g.emCallerSaveClose(w, dest)
-  if diverging: g.restoreBindings(savedBinds)
+  g.emitCall2Inner(c, dest, hiddenPtr, tail)
+  if g.tailCallEmitted:
+    # The window still OPENED: the marshalling reads a caller-saved local through
+    # `plan.callerSaveActive`, which only redirects while the window is open, and
+    # the store is what makes that redirect true. It must not CLOSE as code — the
+    # reloads would land after the `jmp`, unreachable, addressing slots `(popframe)`
+    # has just given back. Only the redirect map is rolled back, and the bindings
+    # are re-established by `restoreBindings`, which is naming, not machine code.
+    g.plan.callerSaveActive = w.prevActive
+    g.restoreBindings(savedBinds)
+  else:
+    g.emCallerSaveClose(w, dest)
+    if diverging: g.restoreBindings(savedBinds)
 
 proc takeInstrReg(g: var CodeGen; slot: AsmSlot): Location =
   ## A register an `(instr …)` operand or result MUST have (no memory form).

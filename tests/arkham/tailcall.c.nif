@@ -83,6 +83,52 @@
       (i 64)
       (at arr.0 0)
       (at arr.0 3))))))
+ (proc :sink7.0
+  (params
+   (param :p.0 .
+    (i 64))
+   (param :q.0 .
+    (i 64))
+   (param :r.0 .
+    (i 64))
+   (param :s.0 .
+    (i 64))
+   (param :t.0 .
+    (i 64))
+   (param :u.0 .
+    (i 64))
+   (param :v.0 .
+    (i 64)))
+  (i 64)
+  (pragmas)
+  (stmts
+   (ret
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (add
+       (i 64)
+       (add
+        (i 64)
+        (add
+         (i 64)
+         (add
+          (i 64)p.0 q.0)
+         r.0)
+        s.0)
+       t.0)
+      u.0)
+     v.0))))
+ (proc :tailStackArgs.0
+  (params
+   (param :n.0 .
+    (i 64)))
+  (i 64)
+  (pragmas)
+  (stmts
+   (ret
+    (call sink7.0 n.0 1 2 3 4 5 6))))
  (proc :main.0
   (params)
   (i 32)
@@ -95,10 +141,17 @@
    (var :u.0 .
     (i 64)
     (call tailBigFrame.0 1))
+   (var :w.0 .
+    (i 64)
+    (call tailStackArgs.0 1))
    (call exit.0
     (add
      (i 64)
+     (add
+      (i 64)
+      (sub
+       (i 64)t.0 40)
+      (mod
+       (i 64)u.0 100))
      (sub
-      (i 64)t.0 40)
-     (mod
-      (i 64)u.0 100))))))(.index)
+      (i 64)w.0 22))))))(.index)

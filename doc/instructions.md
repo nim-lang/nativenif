@@ -202,8 +202,8 @@ nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
 | `(jp L)`               | X64Inst                  | jump if parity (unordered float compare) |
 | `(call T ...)`         | X64Inst, A64Inst         | function call marker inside prepare |
 | `(extcall)`            | X64Inst, A64Inst         | external call marker inside prepare |
-| `(tailcall T ...)`     | A64Inst                  | tail-call marker inside prepare: branch, no link |
-| `(popframe)`           | A64Inst                  | undo this proc's prologue (frame sub + saved pairs) |
+| `(tailcall T ...)`     | X64Inst, A64Inst         | tail-call marker inside prepare: branch/jmp, no return address pushed |
+| `(popframe)`           | X64Inst, A64Inst         | undo this proc's prologue (frame sub + saved registers) |
 | `(iat S)`              | X64Inst                  | indirect call through IAT (Import Address Table) |
 | `(ret)`                | X64Inst, A64Inst         | return instruction |
 | `(push O)`             | X64Inst                  | push to stack |
