@@ -784,6 +784,12 @@ proc emitClrex*(dest: var Bytes) =
   ## CLREX — clear the local exclusive monitor.
   dest.addUint32(0xD5033F5F'u32)
 
+proc emitYield*(dest: var Bytes) =
+  ## YIELD — HINT #1, the spin-wait hint. Architecturally a NOP: a core that has
+  ## nothing to do with it executes it as one, so this is safe on every AArch64
+  ## implementation and needs no feature test.
+  dest.addUint32(0xD503203F'u32)
+
 # ── valgrind client request ────────────────────────────────────────────────
 
 const

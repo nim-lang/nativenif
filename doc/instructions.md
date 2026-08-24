@@ -417,6 +417,7 @@ nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
 | `(stlr D S)`         | A64Inst                 | store-release register |
 | `(dmb)`              | A64Inst                 | data memory barrier (inner shareable) |
 | `(clrex)`            | A64Inst                 | clear exclusive monitor |
+| `(yield)`            | A64Inst                 | spin-wait hint (`hint #1`) |
 | `(d0)`             | A64Reg                   | fp register d0 |
 | `(d1)`             | A64Reg                   | fp register d1 |
 | `(d2)`             | A64Reg                   | fp register d2 |
