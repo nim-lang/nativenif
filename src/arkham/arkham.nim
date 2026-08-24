@@ -1,12 +1,14 @@
 #
-#           Arkham — native AArch64 code generator for Leng
+#           Arkham — native code generator for Leng
 #        (c) Copyright 2026 Andreas Rumpf
 #
 #    See the file "license.txt", included in this distribution.
 #
 
-## arkham translates a single Leng `.c.nif` file into typed `nifasm` NIF
-## (AArch64 / Darwin), which `nifasm` then type-checks, assembles and links.
+## arkham translates a single Leng `.c.nif` file into typed `nifasm` NIF for the
+## selected target (`--os`/`--cpu`: linux/amd64, windows/amd64, linux/arm64,
+## macosx/arm64), which `nifasm` then type-checks, assembles and links. The
+## backends are `codegen_x64` and `codegen_a64` over the shared `codegen_common`.
 
 import std / [parseopt, syncio, strutils]
 import nifcoreparse              # parseFromFile + nifcore
