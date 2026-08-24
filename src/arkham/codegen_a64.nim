@@ -1,5 +1,5 @@
 #
-#           Arkham — native AArch64 code generator for Leng
+#           Arkham — AArch64 / AAPCS64 code generator for Leng
 #        (c) Copyright 2026 Andreas Rumpf
 #
 #    See the file "license.txt", included in this distribution.

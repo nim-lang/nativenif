@@ -1,4 +1,6 @@
-## This tool generates the different enums from the doc/instructions.md file.
+## Generates `src/nifasm/tags.nim` (the tag ids) and `src/nifasm/model.nim`
+## (the per-target enums) from the table in `doc/instructions.md`, which is the
+## single source of truth for the asm-NIF vocabulary. Run from the repo root.
 
 import std / [strutils, sets, os]
 
@@ -7,8 +9,7 @@ proc toNimName(s: string; suffix: string): string =
 
 type
   EnumList = enum
-    X64Inst, A64Inst, NifasmType, NifasmDecl, NifasmExpr, X64Flag, X64Reg, A64Reg,
-    NjExpr, NjStmt, NjType, NjOther, NjTypeQualifier, NjPragma, CallConv
+    X64Inst, A64Inst, NifasmType, NifasmDecl, NifasmExpr, X64Flag, X64Reg, A64Reg
 
 proc toSuffix(e: EnumList): (string, string) =
   case e
@@ -20,13 +21,6 @@ proc toSuffix(e: EnumList): (string, string) =
   of X64Flag: ("O", "NoFlag")
   of X64Reg: ("R", "NoReg")
   of A64Reg: ("R", "NoReg")
-  of NjExpr: ("X", "NoExpr")
-  of NjStmt: ("S", "NoStmt")
-  of NjType: ("T", "NoType")
-  of NjOther: ("U", "NoOther")
-  of NjTypeQualifier: ("Q", "NoQual")
-  of NjPragma: ("P", "NoPragma")
-  of CallConv: ("C", "NoCallConv")
 
 proc shortcutToEnumList(shortcut: string): EnumList =
   try:
@@ -150,17 +144,18 @@ proc genTags(inp: File; inputName: string) =
   ## The practical effect: today only the very tail of the mnemonics overflows,
   ## and adding a target (Cortex-M, RISC-V) can never push a register or a
   ## structural tag over — it only lengthens the tail.
-  var i = -2
+  var tableRow = 0
   var enumDecls = default EnumImpls
   var tags: seq[(string, int)] = @[]
   var knownTags = initHashSet[string]()
   var rows: seq[tuple[tag, desc: string; enums: seq[EnumList]; late: bool]] = @[]
   for line in lines(inp):
-    inc i
-    if i <= 0: continue # skip header
-    if line.strip().len == 0: continue
+    # Anything that is not a table row is prose: the document is read by humans
+    # too, so a heading or a paragraph above the table must not be a parse error.
+    if not line.strip().startsWith("|"): continue
+    inc tableRow
+    if tableRow <= 2: continue # the table's header row and its `|---|` separator
     var parts = line.split("|")
-    if parts.len == 0: continue
     if parts.len < 5:
       quit "WRONG LINE: " & line
     let tagName = extractTagName parts[1]
@@ -180,10 +175,8 @@ proc genTags(inp: File; inputName: string) =
   for late in [false, true]:
     for idx in 0 ..< rows.len:
       if rows[idx].late == late: ordered.add idx
-  # Id 1 belongs to the anonymous tree head when this document has one; see
-  # `writeTagsFile`'s `anonHead`.
-  let anonHead = inputName.endsWith("instructions.md")
-  var id = (if anonHead: 1 else: 0)
+  # Id 1 belongs to the anonymous tree head; see `writeTagsFile`'s `anonHead`.
+  var id = 1
   for idx in ordered:
     inc id
     let r = rows[idx]
@@ -196,19 +189,9 @@ proc genTags(inp: File; inputName: string) =
         desc: r.desc
       )
 
-  if inputName.endsWith("instructions.md"):
-    createDir "src/nifasm"
-    writeTagsFile "src/nifasm/tags.nim", tags, inputName, anonHead = true
-
-    writeModel "src/nifasm/model.nim", enumDecls, X64Inst, A64Reg, inputName
-  elif inputName.endsWith("nj.md"):
-    createDir "src/nj"
-    writeTagsFile "src/nj/tags.nim", tags, inputName
-    # writeModel "src/nifasm/nifasm_model.nim", enumDecls, X64Inst, X64Flag
-    # For now I'll just rely on instructions.nim and manual casting or validation if needed,
-    # or I can generate the model file if I decide to use it.
-    # Let's generate the model file too, it's useful.
-    writeModel "src/nj/model.nim", enumDecls, NjExpr, CallConv, inputName
+  createDir "src/nifasm"
+  writeTagsFile "src/nifasm/tags.nim", tags, inputName, anonHead = true
+  writeModel "src/nifasm/model.nim", enumDecls, X64Inst, A64Reg, inputName
 
 proc main(inputName: string) =
   var inp = open(inputName, fmRead)
@@ -216,6 +199,8 @@ proc main(inputName: string) =
   inp.close()
 
 let inputName = if os.paramCount() == 0: "doc/instructions.md" else: os.paramStr(1)
+  ## The vocabulary table. Only `doc/instructions.md` exists; the parameter is
+  ## there so it can be given by an absolute path.
 
 main(inputName)
 

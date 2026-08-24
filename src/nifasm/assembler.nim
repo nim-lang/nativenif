@@ -95,36 +95,28 @@ proc extractDedupKey*(s: string): string =
   ## definition.
   ##
   ## The key is the name minus its module suffix, and dropping the module is only
-  ## sound when what remains is GLOBALLY unique. nimony guarantees that for one
-  ## family alone: an instantiation, whose name carries an `.I<hash>` segment that
-  ## canonicalizes the instantiated arguments (`sem.newInstSymId` mints
-  ## `abc.123.Iabcdefgh.instmod`, `symparser.genericTypeName` mints
-  ## `` `t.0.I<key>.<mod> ``). Requiring that segment is therefore the whole test.
+  ## sound when what remains is GLOBALLY unique. That is a property of the NAME
+  ## SHAPE, and nif-spec.md owns it: a global symbol is `<ident>.<disamb>.<mod>`
+  ## or `<ident>.<disamb>.<key>.<mod>`, "where `key` usually is the result from a
+  ## generic instantiation". The key slot answers WHICH instantiation of
+  ## `<ident>.<disamb>` this is, and because every importing module derives the
+  ## same key independently, `<ident>.<disamb>.<key>` means the same thing in all
+  ## of them.
   ##
-  ## Dot count alone is NOT: hexer's lambda-lifting environment types are
-  ## `<proc>.<counter>.env.<module>`, three dots like an instantiation but private
-  ## to their module. Two modules that each close over a variable in a proc named
-  ## `outer` (tests/nimony/closures `tgeneric_closure` + `tparam_capture`) both
-  ## produce key `outer.0.env`, and merging them made a field of the one resolve
-  ## against the layout of the other.
-  var dotCount = 0
-  var lastDotPos = -1
-  var prevDotPos = -1
-  for i in 0..<s.len:
-    if s[i] == '.':
-      inc dotCount
-      prevDotPos = lastDotPos
-      lastDotPos = i
-
-  if dotCount <= 2:
-    return ""  # a module-local or plain module-qualified name: nothing to merge
-
-  # The segment between the last two dots is the instantiation marker, or this is
-  # a compound name that merely looks like one.
-  if lastDotPos - prevDotPos < 2 or s[prevDotPos+1] != 'I':
-    return ""
-
-  result = s[0 ..< lastDotPos]
+  ## Which names occupy that slot is therefore NOT a question this assembler gets
+  ## to answer on its own — `symparser.isInstantiation` is the toolchain's single
+  ## answer, and it is nimony's too (DCE's `resolveSymbolConflicts` and
+  ## `lengcgen`'s content-hashed `strlit.0.I<hash>.<mod>` key on the same rule).
+  ## This module used to hand-roll a third copy of it, which is how it came to
+  ## disagree: it merged a double-keyed `foo.0.Ia.Ib.mod` the shared predicate
+  ## rejects. Roles that are private to one module — a closure environment, a
+  ## vtable, a coroutine frame — are kept OUT of the key slot at the mint site
+  ## (`symparser.derivedName` puts the tag inside the identifier: `` outer`env.0 ``),
+  ## so they never reach this test at all.
+  if isInstantiation(s):
+    result = s[0 ..< s.rfind('.')]
+  else:
+    result = ""
 
 proc typeError(want, got: Type; n: Cursor) =
   error("Type mismatch: expected " & $want & ", got " & $got, n)

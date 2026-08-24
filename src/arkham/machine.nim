@@ -1,11 +1,11 @@
 #
-#           Arkham — native AArch64 code generator for Leng
+#           Arkham — AArch64 / AAPCS64 backend machine model
 #        (c) Copyright 2026 Andreas Rumpf
 #
 #    See the file "license.txt", included in this distribution.
 #
 
-## AArch64 / Darwin backend machine model: the AAPCS64 register classes, the
+## AArch64 / AAPCS64 backend machine model (Darwin and Linux): the register classes, the
 ## `regName` shim that renders the abstract register slots to AArch64 spellings,
 ## and the `aarch64Machine` description handed to the (arch-neutral) register
 ## allocator. The slot enums and `MachineDesc`/`Location` types live in

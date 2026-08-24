@@ -6,8 +6,8 @@ Design goals:
 - Complete control over the emitted binary. It is a real assembler, not an abstract machine!
 - Compute what is "easy enough" directly in the assembler (object field offsets, stack offsets)
   so that it does not even have to be verified.
-- Bring **structured programming** as NJVL does it to assembler so that validation passes can
-  be done extremely cheaply without complex fixpoint computations.
+- Bring **structured programming** to assembler, the way nimony's NJVL IR does, so that
+  validation passes can be done extremely cheaply without complex fixpoint computations.
 - Bring **type safety** to assembler so that code generator bugs can be found without even
   having to run the resulting programs.
 - Keep the text format until linking! Only the linker needs to understand binary instruction encodings.
@@ -22,8 +22,9 @@ Non goals:
 - Abstract over the ABI and calling conventions. Instead the `call` instruction is made checkable
   yet so flexible that any calling convention can be followed. If your PL has unique demands, no
   problem, `nifasm` naturally supports it!
-- Compatibility with native object files and DWARF. Instead `nifasm` will eventually ship its own
-  debugger. Thanks to NIF we always have column precise source code information for every instruction!
+- Compatibility with native object files and DWARF as an *input* interface. `nifasm` reads only
+  NIF; it emits ELF, Mach-O and PE (with DWARF `.eh_frame` / `.pdata` unwind info, so ordinary
+  debuggers work) purely as its final output.
 
 
 ## Type system
@@ -32,22 +33,28 @@ The assembler is unlike any other in that it keeps the control flow structured a
 
 The type system's goal is not only type checking but also facilitates the computation of sizes, alignments and offsets. The idea is that both control flow as well as object field names can stay in the assembler so that everything is very readable. The architecture welcomes the idea that a programmer can optimize at the assembler level and yet everything stays as safe, readable and abstract as possible.
 
-A key insight here is while assembler does not allow unnamed temporary expressions there is no reason it cannot keep field names instead of offsets (no control is lost). Likewise thanks to the ideas of the NJ IR ("no jumps IR") structured control flow is easy enough to map to labels and offsets (no control is lost either).
+A key insight here is while assembler does not allow unnamed temporary expressions there is no reason it cannot keep field names instead of offsets (no control is lost). Likewise, structured control flow — `loop` and `ite` with forward-only `lab`/`jmp`, the shape Leng's Final IR already has — is easy enough to map to labels and offsets (no control is lost either).
+
+Note on notation: this document shows the NIF text format, and every integer literal is a
+plain number (`64`, not `+64`). The complete tag vocabulary — every type, declaration,
+addressing mode, register, flag and machine instruction of both targets — is
+[instructions.md](instructions.md). What follows is what those tags *mean*.
 
 
 ### Type atoms
 
-Type atoms are `(bool)`, `(i N)` (signed integer of N bits), `(u N)` (unsigned integer of N bits), `(f N)` (float of N bits). Hardware flags are typically mapped to the type `(bool)`.
+Type atoms are `(bool)`, `(i N)` (signed integer of N bits), `(u N)` (unsigned integer of N bits), `(c N)` (character of N bits), `(f N)` (float of N bits) and `(void)`. Hardware flags are typically mapped to the type `(bool)`.
 
 
 ### Compound types
 
-Compound types are `(ptr <ElementType>)`, `(aptr <ElementType>)`, `(array <ElementType> <count>)` and finally `Symbol` where `Symbol` has been declared via a `type` construct:
+Compound types are `(ptr <ElementType>)`, `(aptr <ElementType>)`, `(array <ElementType> <count>)`, `(flexarray <ElementType>)` and finally `Symbol` where `Symbol` has been declared via a `type` construct:
 
 ```
 (type :Name.0 (object (fld :Field.0 <Type 1>) ...) <optional_pragmas>)
 (type :Name.1 (union (fld :Field.0 <Type 1>) ...) <optional_pragmas>)
-(type :Name.2 (proc <ReturnType> <Type 1> <Type 2> ...))
+(type :Name.2 (enum <BaseType> (efld :Field.0 <value>) ...))
+(type :Name.3 (proctype (params (param :p.0 <Loc> <Type>) ...) (result :r.0 <Loc> <Type>)))
 ```
 
 **Object vs Union:**
@@ -68,17 +75,27 @@ Registers are typically not written directly, instead if they are used as local 
 
 Declarations are either bound to a register or to a stack slot. Instead of a register name the `(s)` tag is used then. The `(s)` tag explicitly indicates storage location (stack allocation), which is separate from the type information. Since we know the type of every declaration the slot's offset is computed by `nifasm`. Again, this keeps the code more readable. An instruction can use the tag `(ssize)` to access the maximum required stack size. This is typically used in function prologs and epilogs.
 
-Stack-allocated variables can have compound types (arrays, objects). When a variable name bound to a stack slot is used in address expressions (`(dot ...)`, `(at ...)`), the assembler treats the variable name as representing the address of the stack-allocated value (i.e., the stack pointer plus the computed offset). This allows natural access to stack-allocated arrays and objects without requiring explicit address computation.
+Stack-allocated variables can have compound types (arrays, objects). When a variable name bound to a stack slot is used in an address expression (`(dot ...)`, `(at ...)`), it stands for the *address* of the stack-allocated value — the frame base plus the computed offset — so arrays and objects on the stack are accessed by name, with no explicit address computation. The two targets spell the frame base differently: x86-64 wants it as an operand of its own, AArch64 takes it from the slot.
 
-Note: The `(s)` tag is required for clarity - it explicitly separates storage location from type. For example, `(var :arr (s) (array (i +32) +6))` makes it clear that `(s)` is about where the variable is stored (stack), while `(array (i +32) +6)` is about its type (array of 6 int32s).
+Note: The `(s)` tag is required for clarity - it explicitly separates storage location from type. For example, `(var :arr.0 (s) (array (i 32) 6))` makes it clear that `(s)` is about where the variable is stored (stack), while `(array (i 32) 6)` is about its type (array of 6 int32s). A slot can also demand a stricter alignment than its type implies, as `(s (align 16))`.
 
 ```
-(var :arr (s) (array (i +32) +6))  # stack array of 6 int32s
-(var :p (s) Point)                 # stack object of type Point
+(var :arr.0 (s) (array (i 32) 6))  # stack array of 6 int32s
+(var :p.0 (s) Point.0)             # stack object of type Point.0
 
-(mov (rax) (mem (at arr (rcx))))  # loads arr[index] - uses [rsp+offset+index*4]
-(mov (rbx) (mem (dot p x)))       # loads p.x - uses [rsp+offset+field_offset]
+# x86-64: the frame base register is written out
+(mov (rax) (mem (at (rsp) arr.0 (rcx))))  # loads arr[rcx] - [rsp+offset+rcx*4]
+(mov (rbx) (mem (dot (rsp) p.0 x.0)))     # loads p.x    - [rsp+offset+field_offset]
+
+# AArch64: the slot carries its own frame base, so it is left implicit
+(mov (x0) (mem (at arr.0 (x9))))
+(mov (x1) (mem (dot p.0 x.0)))
 ```
+
+`(ssize)` is the frame size the assembler computed for the current proc; the prologue and
+epilogue use it (`(sub (rsp) (ssize))` / `(add (rsp) (ssize))`). Slots declared inside a
+`(scope ...)` block are reclaimed at the end of that block, so sibling scopes share frame
+space.
 
 
 
@@ -89,39 +106,44 @@ In `nifasm` every callsite is type-checked, a proc declaration looks like:
 ```
 (proc :foo.0
   (params
-    (param :arg.0 (rax) (i +64))
-    (param :arg.1 (rcx) (u +1))
+    (param :arg.0 (rax) (i 64))
+    (param :arg.1 (rcx) (u 8))
   )
-  (ret :ret.0 (rax) (i +64))
+  (result :ret.0 (rax) (i 64))
   (clobber
     (rdi) (rbx)
   )
-  (body ...)
+  (stmts ...)
 )
 ```
 
+The four sections are positional and all four are present even when empty:
+`(params)`, `(result)` (a proc returning nothing has an empty one), `(clobber)`, and the
+body, which is a `(stmts ...)` block. A result that is returned in more than one register
+uses `(regs (rax) (rdx))` in place of the single register.
+
 ### Stack parameters
 
-Parameters can also be passed on the stack instead of in registers. Use `(s)` or `(s +N)` instead of a register name to indicate a stack-passed parameter:
+Parameters can also be passed on the stack instead of in registers. Use `(s)` or `(s N)` instead of a register name to indicate a stack-passed parameter:
 
 ```
 (proc :bar.0
   (params
-    (param :arg.0 (rdi) (i +64))        # register parameter
-    (param :arg.1 (rsi) (i +64))        # register parameter
-    (param :arg.2 (s +8) (i +64))       # first stack param at base offset 8
-    (param :arg.3 (s) (i +64))          # next stack param (offset computed)
-    (param :arg.4 (s) Point)            # next stack param (offset computed)
+    (param :arg.0 (rdi) (i 64))         # register parameter
+    (param :arg.1 (rsi) (i 64))         # register parameter
+    (param :arg.2 (s 8) (i 64))         # first stack param at base offset 8
+    (param :arg.3 (s) (i 64))           # next stack param (offset computed)
+    (param :arg.4 (s) Point.0)          # next stack param (offset computed)
   )
-  (ret :ret.0 (rax) (i +64))
+  (result :ret.0 (rax) (i 64))
   (clobber (r10))
-  (body ...)
+  (stmts ...)
 )
 ```
 
-The `(s +N)` syntax specifies the base offset for the first stack parameter. Common values:
-- `(s +8)` - after return address (x86-64 without frame pointer)
-- `(s +16)` - after return address and saved rbp (x86-64 with frame pointer)
+The `(s N)` syntax specifies the base offset for the first stack parameter. Common values:
+- `(s 8)` - after return address (x86-64 without frame pointer)
+- `(s 16)` - after return address and saved rbp (x86-64 with frame pointer)
 
 Subsequent `(s)` parameters without an explicit offset are computed from:
 - The offset of the preceding `(s)` parameter
@@ -137,12 +159,13 @@ Within the proc body, stack parameters are accessed using `(mem <base> <name>)` 
 ```
 (proc :bar.0
   (params
-    (param :arg.0 (rdi) (i +64))        # register parameter
-    (param :arg.1 (s +8) (i +64))       # stack param at offset 8
-    (param :arg.2 (s) (i +64))          # stack param at offset 16 (computed)
+    (param :arg.0 (rdi) (i 64))         # register parameter
+    (param :arg.1 (s 8) (i 64))         # stack param at offset 8
+    (param :arg.2 (s) (i 64))           # stack param at offset 16 (computed)
   )
-  (ret :ret.0 (rax) (i +64))
-  (body
+  (result :ret.0 (rax) (i 64))
+  (clobber)
+  (stmts
     # Register parameter: use the variable name directly
     (mov (rax) arg.0)
 
@@ -171,11 +194,15 @@ For example:
 
 ```
 (prepare foo.0
-  (mov (arg arg.0) +56)
-  (mov (arg arg.1) +1)
+  (mov (arg arg.0) 56)
+  (mov (arg arg.1) 1)
   (call)
+  (mov my.local (res ret.0))
 )
 ```
+
+A call to a proc imported from a dynamic library (declared with `(extproc :name.0 "_name")`)
+uses `(extcall)` in place of `(call)`; a tail call uses `(tailcall)`.
 
 ### Stack arguments with `(csize)`
 
@@ -186,47 +213,37 @@ For register parameters, `(arg name)` refers to the register. For stack paramete
 ```
 (prepare bar.0
   (sub (rsp) (csize))                       # reserve stack space for args
-  (mov (arg arg.0) +56)                     # register arg: (arg arg.0) is the register
-  (mov (arg arg.1) +78)                     # register arg: (arg arg.1) is the register
-  (mov (mem (rsp) (arg arg.2)) +123)        # stack arg: explicit [rsp + offset]
-  (mov (mem (rsp) (arg arg.3)) +456)        # stack arg: explicit [rsp + offset]
+  (mov (arg arg.0) 56)                      # register arg: (arg arg.0) is the register
+  (mov (arg arg.1) 78)                      # register arg: (arg arg.1) is the register
+  (mov (mem (rsp) (arg arg.2)) 123)         # stack arg: explicit [rsp + offset]
+  (mov (mem (rsp) (arg arg.3)) 456)         # stack arg: explicit [rsp + offset]
   (call)
+  (mov my.local (res ret.0))
   (add (rsp) (csize))                       # explicit cleanup
 )
 ```
-
-Alternatively, stack arguments can be set up using `push` with an `(arg)` annotation for type checking:
-
-```
-(prepare bar.0
-  (push (arg arg.3) +456)                   # push 456, annotated as arg.3
-  (push (arg arg.2) +123)                   # push 123, annotated as arg.2
-  (mov (arg arg.0) +56)                     # register arg
-  (mov (arg arg.1) +78)                     # register arg
-  (call)
-  (add (rsp) (csize))                       # explicit cleanup
-)
-```
-
-The `(arg name)` annotation in `(push (arg name) value)` is purely for type checking - it has no representation in the generated instruction. The assembler emits a plain `push` but verifies that:
-- The pushed value's type is compatible with the declared parameter type
-- Each stack argument is annotated exactly once
 
 The assembler verifies that:
 - Every register argument is assigned exactly once via `(mov (arg name) value)`
-- Every stack argument is annotated exactly once via `(push (arg name) value)` or assigned via `(mov (mem (rsp) (arg name)) value)`
+- Every stack argument is assigned exactly once via `(mov (mem (rsp) (arg name)) value)`
 - The types of assigned values are compatible with the parameter types
 - Stack management is explicit - no implicit code is generated
 
+A code generator does not have to move the stack pointer per call, and arkham does not:
+it sizes the frame once in the prologue to include the largest outgoing argument area any
+call in the body needs, so the `(sub (rsp) (csize))` / `(add (rsp) (csize))` bracket
+disappears and the stack arguments are written straight into the reserved region. See
+[../src/arkham/design.md](../src/arkham/design.md).
+
 ### Return values
 
-Return values are declared in a proc's `(ret ...)` section and must be bound at
+Return values are declared in a proc's `(result ...)` section and must be bound at
 each call site as well. After the `(call)` marker, use `(res name)` to access
 the result value:
 
 ```
 (prepare foo.0
-  (mov (arg arg.0) +56)
+  (mov (arg arg.0) 56)
   (call)
   (mov myResult (res ret.0))
 )
@@ -244,148 +261,172 @@ It is checked that every argument is assigned a value exactly once, and every re
 Since local variables are described precisely, it is possible to detect code generation bugs at translation time. Consider:
 
 ```
-(var :my.local (rdi) (i +64))
+(var :my.local (rdi) (i 64))
 (prepare foo.0
-  (mov (arg arg.0) +56)
-  (mov (arg arg.1) +1)
+  (mov (arg arg.0) 56)
+  (mov (arg arg.1) 1)
   (call)
 )
-(use my.local) # bug detected: foo.0 clobbers register rdi!
+(mov (rax) my.local) # bug detected: foo.0 clobbers register rdi!
 ```
+
+A local's register binding can also be changed explicitly: `(rebind :tmp.0 (i 64) (x9))`
+binds a physical register to a typed name, killing whatever name it held before,
+`(withreg ...)` does the same for the extent of a block, and `(kill name)` ends a binding
+early. Every read of a register that is currently bound to a name must go through the
+name — naming the register directly is an error, which is what makes an accidental
+clobber a translation-time failure rather than a wrong answer at run time.
 
 
 ## Control flow
 
-As in NJVL the control flow consists of `(loop)` and `(ite)` (if-then-else) constructs. Control flow variables are also supported via the `cfvar` and `jtrue` tags.
+Control flow is `(ite ...)` (if-then-else), `(loop ...)`, and `(lab ...)` /
+`(jmp ...)` — **forward** jumps only. Every backward edge is a `loop`, which is
+what lets the assembler see the control flow structurally, with no fixpoint.
 
-### Control flow variables
+That set is not nifasm's invention. It is the shape of Leng's **Final IR**
+(nimony's [doc/final_ir.md](https://github.com/nim-lang/nimony/blob/master/doc/final_ir.md)),
+which lowers `if`/`elif`/`and`/`or`/`break` to exactly `loop`/`ite`/`lab`/`jmp`
+with forward-only, scoped jumps — so a merge point is one shared `(lab)` that
+several `(jmp)`s target, rather than a nest of bracketing regions. Arkham
+receives that and emits the same three constructs.
 
-Control flow variables (`cfvar`) are special boolean variables used to represent control flow in a structured way. They bridge the gap between high-level structured control flow and low-level jumps.
+### Labels and jumps
 
-**Declaration:**
+```
+(lab :done.0)       # define a label
+(jmp done.0)        # jump to it — the target must be defined LATER
+(je done.0)         # ...or conditionally, on a flag
+```
+
+A `(jmp ...)` whose target is defined earlier is not legal: that is a back edge,
+and a back edge is a `loop`.
+
+### Testing hardware flags
+
+The `ite` construct tests hardware flags directly:
+
+```
+(ite (of) # test overflow flag
+  (stmts
+    (mov (rax) 1)
+  )
+  (stmts
+    (mov (rbx) 3)
+  )
+)
+```
+
+The flags are `(zf)` zero, `(of)` overflow, `(cf)` carry, `(sf)` sign and `(pf)` parity, each with a negated form: `(nz)`, `(no)`, `(nc)`, `(ns)`, `(np)`. There is deliberately no *signed comparison* flag — that is not one bit of the flags register — so a signed `>` is a `(jg ...)` jump, a `(setg ...)`, or a `(cmovg ...)`.
+
+### Loop construct
+
+A loop is an *infinite* loop over a single statement block:
+
+```
+(loop
+  (stmts ...)   # the body
+)
+```
+
+The back edge is emitted by the assembler, so it never appears in the input: the
+body carries a forward `jmp` to a label defined **after** the loop, and that is
+the exit. A `while` is therefore the condition test plus a conditional forward
+jump at the top of the body — which is also exactly what Final IR's "a `loop`
+has no condition slot" rule produces:
+
+```
+(mov (rcx) 3)
+(loop
+  (stmts
+    (cmp (rcx) 0)
+    (ite (zf) (stmts (jmp done.0)) (stmts))
+    (dec (rcx))))
+(lab :done.0)
+```
+
+This is what keeps "every `jmp` is forward, every back edge is a `loop`" true of
+the whole input, which in turn is what makes the assembler's validation passes
+cheap.
+
+### Control flow variables (legacy)
+
+**Nothing generates these any more.** `cfvar`/`jtrue` are the older *no-jumps*
+mechanism: a merge was named by a boolean variable that could only be set, never
+cleared, instead of by a label. Leng's Final IR replaced it with `lab`/`jmp`
+(see above) — arkham has never emitted a `cfvar`, and neither does any other
+Leng producer. nifasm still accepts them, and the rest of this section describes
+what they mean, but a new code generator should use labels.
+
+A control flow variable is declared as
 
 ```
 (cfvar :name.0)
 ```
 
-Declares a control flow variable named `name.0`. Control flow variables are always implicitly of type `(bool)` and implicitly initialized to `false`. No type annotation or initializer should be provided.
-
-**Properties:**
-- Always initialized to `false`
-- Can only be set to `true` via the `jtrue` instruction
-- Have monotonic behavior: once set to `true`, they stay `true`
-- Are **always virtual** in nifasm: they are never materialized into actual registers or memory
-- The assembler always maps them to jumps
-
-### The `jtrue` instruction
-
-The `jtrue` instruction sets one or more control flow variables to `true`:
+It is always of type `(bool)` and always initialized to `false`. No type
+annotation or initializer is given. It can only be set to `true`, by `jtrue`:
 
 ```
 (jtrue cfvar1.0)
-(jtrue cfvar1.0 cfvar2.0 cfvar3.0)  # Can set multiple cfvars at once
+(jtrue cfvar1.0 cfvar2.0 cfvar3.0)  # can set several at once
 ```
 
-**Semantics:**
-- Sets the specified control flow variable(s) to `true`
-- In nifasm, `jtrue` is **always lowered to an unconditional jump** to the appropriate target
-- The jump target is determined by the control flow structure containing the `jtrue`
+Once `true` it stays `true`. A cfvar is **always virtual**: it is never
+materialized into a register or memory, because `jtrue` is always lowered to an
+unconditional jump, whose target the surrounding control-flow structure
+determines.
 
-### Using `cfvar` with `ite`
-
-When a control flow variable is used as the condition in an `ite` construct, it has **special semantics** - it does not produce or evaluate a condition at all! Instead:
+Used as an `ite` condition, a cfvar therefore evaluates nothing at all:
 
 ```
 (ite cfvar.0
   (stmts
-    # "then" branch - executed if cfvar.0 was set to true
-    (mov (rax) +1)
+    # "then" — reached if cfvar.0 was set to true
+    (mov (rax) 1)
   )
   (stmts
-    # "else" branch - executed if cfvar.0 is still false
-    (mov (rbx) +3)
+    # "else" — reached if cfvar.0 is still false
+    (mov (rbx) 3)
   )
 )
 ```
 
-**Behavior:**
-- If `cfvar.0` was set to `true` (via `jtrue`), the "then" branch executes
-- If `cfvar.0` is still `false`, the "then" branch is skipped and the "else" branch executes
-- The assembler recognizes this pattern and generates appropriate jump instructions
-
-This is different from using a hardware flag or register as a condition. With a cfvar, there is no condition evaluation - the control flow was already determined by previous `jtrue` instructions.
-
-### Testing hardware flags
-
-The `ite` construct can also test hardware flags directly:
+Unlike a flag or a register condition, there is no test here: the control flow
+was already decided by the preceding `jtrue`s. Putting it together, `if cond1 or
+cond2` becomes:
 
 ```
-(ite (of) # test overflow flag
-  (stmts
-    (mov (rax) +1)
-  )
-  (stmts
-    (mov (rbx) +3)
-  )
-)
-```
-
-Common flags include:
-- `(zf)` - zero flag
-- `(of)` - overflow flag
-- `(cf)` - carry flag
-- `(sf)` - sign flag
-- `(pf)` - parity flag
-
-### Loop construct
-
-Loops follow the same pattern as in NJVL:
-
-```
-(loop
-  (stmts ...) # before the condition
-  (zf) # condition (can be a flag or cfvar)
-  (stmts ...) # body - executed when condition is true
-  (stmts ...) # after - executed when loop exits
-)
-```
-
-A `loop` always has 4 sections: setup, condition, body, and after.
-
-### Example: Control flow variable usage
-
-Here's how `cfvar` and `jtrue` work together:
-
-```
-# Translate: if cond1 or cond2: body else: otherwise
-
 (cfvar :tmp.0)
-(cmp (rax) +0)
+(cmp (rax) 0)
 (ite (zf)
   (stmts
-    (jtrue tmp.0)  # If cond1 is true, set tmp and jump
+    (jtrue tmp.0)  # cond1 held: set tmp and jump
   )
   (stmts
-    (cmp (rbx) +0)
+    (cmp (rbx) 0)
     (ite (zf)
       (stmts
-        (jtrue tmp.0)  # If cond2 is true, set tmp and jump
+        (jtrue tmp.0)  # cond2 held: set tmp and jump
       )
       (stmts)
     )
   )
 )
-(ite tmp.0  # Special case: test cfvar without condition
+(ite tmp.0
   (stmts
-    # body - executed if tmp.0 was set to true
+    # body — reached if tmp.0 was set
   )
   (stmts
-    # otherwise - executed if tmp.0 is still false
+    # otherwise
   )
 )
 ```
 
-The `jtrue` instructions are lowered to jumps that skip to the appropriate branch of the outer `ite tmp.0`. The assembler ensures this happens without materializing `tmp.0` into any register.
+The `jtrue`s become jumps into the appropriate branch of the outer `ite tmp.0`,
+with `tmp.0` never occupying a register. Compare the `lab`/`jmp` form, where the
+same merge is one label several branches jump to and no variable is invented for
+it.
 
 ## Addressing modes
 
@@ -398,29 +439,32 @@ All addressing mode constructs (`(dot ...)`, `(at ...)`, and `(mem ...)`) produc
 
 ### Object field access
 
-The `(dot <base> <fieldname>)` construct computes the address of an object field by name. The base can be a register, a variable name, or another addressing mode. The assembler computes the field offset from the type information.
+The `(dot <base> <fieldname>)` construct computes the address of an object field by name. The assembler computes the field offset from the type information.
 
 **Type rules:**
 - If `base` has type `(ptr Type)` where `Type` is an object type with field `fieldname` of type `T`, then `(dot base fieldname)` has type `(ptr T)` - a pointer to the field's type.
-- If `base` is a variable name bound to a stack slot with type `Type` (where `Type` is an object type), then `(dot base fieldname)` has type `(ptr T)`. The variable name is treated as representing the address of the stack-allocated object.
-- If `base` has type `Type` directly (not a pointer and not a stack variable), then `(dot base fieldname)` is invalid.
-- Example: If `p` has type `(ptr Point)` and `Point` has field `x` of type `(i +64)`, then `(dot p :x)` has type `(ptr (i +64))`.
-- Example: If `p` is a stack variable `(var :p (s) Point)`, then `(dot p x)` has type `(ptr (i +64))` and is lowered to `rsp+offset+field_offset`.
+- A **stack slot** is addressed relative to the frame, so its base is two operands on x86-64 — `(dot <framereg> <slot> <fieldname>)` — and one on AArch64, where the slot carries its own base: `(dot <slot> <fieldname>)`. Either way the result is `(ptr T)`.
+- If `base` has type `Type` directly (not a pointer and not a stack slot), then `(dot base fieldname)` is invalid.
+- Example: If `p.0` has type `(ptr Point.0)` and `Point.0` has field `x.0` of type `(i 64)`, then `(dot p.0 x.0)` has type `(ptr (i 64))`.
 
 To actually load from or store to this address, the `(mem ...)` construct must be used explicitly. This makes memory operations explicit and allows the assembler to distinguish between address computation (`lea`) and memory access (`mov`, `add`, etc.).
 
 ```
-(type :Point (object (fld :x (i +64)) (fld :y (i +64))))
-(var :p (rdi) (ptr :Point))
+(type :Point.0 (object (fld :x.0 (i 64)) (fld :y.0 (i 64))))
+(var :p.0 (rdi) (ptr Point.0))
 
-(mov (rax) (mem (dot p :x)))   # loads p.x into rax
-                               # lowered to: mov rax, [rdi+0]
-(mov (rbx) (mem (dot p :y)))   # loads p.y into rbx
-                               # lowered to: mov rbx, [rdi+8]
+(mov (rax) (mem (dot p.0 x.0)))   # loads p.x into rax
+                                  # lowered to: mov rax, [rdi+0]
+(mov (rbx) (mem (dot p.0 y.0)))   # loads p.y into rbx
+                                  # lowered to: mov rbx, [rdi+8]
 
 # Address computation (without loading):
-(lea (rax) (dot p :x))         # computes address of p.x into rax
-                               # lowered to: lea rax, [rdi+0]
+(lea (rax) (dot p.0 x.0))         # computes address of p.x into rax
+                                  # lowered to: lea rax, [rdi+0]
+
+# The same, for a stack-allocated Point on x86-64:
+(var :q.0 (s) Point.0)
+(mov (rax) (mem (dot (rsp) q.0 x.0)))
 ```
 
 ### Array indexing
@@ -429,38 +473,48 @@ The `(at <base> <index>)` construct computes the address of an array element. Th
 
 **Type rules:**
 - If `base` has type `(aptr T)` and `index` has an integer type, then `(at base index)` has type `(ptr T)` - a pointer to a single element.
-- If `base` is a variable name bound to a stack slot with type `(array T <count>)`, then `(at base index)` has type `(ptr T)`. The variable name is treated as representing the address of the stack-allocated array.
+- A stack slot of type `(array T <count>)` is indexed the same way its fields are selected: `(at <framereg> <slot> <index>)` on x86-64, `(at <slot> <index>)` on AArch64. The result is `(ptr T)`.
 - Note: `(at ...)` requires either `aptr` or a stack-allocated array type, not `ptr` to a single element. This enforces that pointer arithmetic (indexing) is only allowed on array pointers or stack arrays, not single-element pointers.
-- Example: If `arr` has type `(aptr (i +32))`, then `(at arr index)` has type `(ptr (i +32))`.
-- Example: If `:arr` is a stack variable `(var :arr (s) (array (i +32) +6))`, then `(at :arr index)` has type `(ptr (i +32))` and is lowered to `[rsp+offset+index*4]`.
+- Example: If `arr.0` has type `(aptr (i 32))`, then `(at arr.0 index)` has type `(ptr (i 32))`.
 
 ```
-(var :arr (rsi) (aptr (i +32)))  # array pointer to int32s
+(var :arr.0 (rsi) (aptr (i 32)))  # array pointer to int32s
 
-(mov (rax) (mem (at arr (rcx))))  # loads arr[cx] into rax
-                                  # lowered to: mov rax, [rsi+rcx*4]
-                                  # (element size 4 bytes used as scale)
+(mov (rax) (mem (at arr.0 (rcx))))  # loads arr[rcx] into rax
+                                    # lowered to: mov rax, [rsi+rcx*4]
+                                    # (element size 4 bytes used as scale)
 
 # Address computation (without loading):
-(lea (rax) (at arr (rcx)))        # computes address of arr[cx] into rax
-                                  # lowered to: lea rax, [rsi+rcx*4]
+(lea (rax) (at arr.0 (rcx)))        # computes address of arr[rcx] into rax
+                                    # lowered to: lea rax, [rsi+rcx*4]
+
+# A stack-allocated array on x86-64:
+(var :buf.0 (s) (array (i 32) 6))
+(mov (rax) (mem (at (rsp) buf.0 (rcx))))
 ```
 
-The index must be a register or variable. If the element size is not a power of two (or exceeds the maximum scale factor), the assembler rejects the program. It is not able to materialize the offset computation into a temporary register as the management of temporaries is not its job.
+An immediate index folds into the displacement for any element size. A **register** index has to become a scale factor in the addressing mode, and both targets accept the same four: 1, 2, 4 and 8 (x86-64's SIB scale, AArch64's shifted register offset). Anything else needs a multiply into a temporary — and managing temporaries is not the assembler's job, so it will not invent one. Either the code generator supplies it, as a third operand:
 
-Note that different architectures have different scale factor limitations. For example, ARM64 supports scales of 1, 2, 4, 8, or 16 (implemented as left shift operations), while x86-64 supports scales of 1, 2, 4, or 8. The assembler enforces these constraints for the target platform.
+```
+(mov (rax) (mem (at points.0 (rcx) (rdx))))   # rdx = scratch: rdx = points + rcx*16
+```
+
+or the assembler rejects the program. The scratch must not be the base register (it is written before the base is read); being the same register as the index is fine and is allowed on purpose, because under register pressure it may be the only free choice.
 
 ### Combined addressing
 
 These constructs can be nested to access fields of array elements or arrays within structs. Remember that `(dot ...)` and `(at ...)` produce address expressions, so `(mem ...)` is still required for memory operations:
 
 ```
-(type :Point (object (fld :x (i +64)) (fld :y (i +64))))
-(var :points (rdi) (aptr :Point))  # array pointer to Points
+(type :Point.0 (object (fld :x.0 (i 64)) (fld :y.0 (i 64))))
+(var :points.0 (rdi) (aptr Point.0))  # array pointer to Points
 
-(mov (rax) (mem (dot (at points (rcx)) :x)))  # loads points[i].x
-                                              # lowered to: mov rax, [rdi+rcx*16+0]
+(mov (rax) (mem (dot (at points.0 (rcx) (rdx)) x.0)))  # loads points[rcx].x
 ```
+
+`Point.0` is 16 bytes, which is not a legal scale, so this one needs the scratch register
+described above; with a 4- or 8-byte element the two-operand `(at points.0 (rcx))` folds
+into the addressing mode directly.
 
 ### Explicit addressing
 
@@ -478,214 +532,79 @@ Note that `(mem ...)` is required for all memory operations. It can wrap address
 
 **Type rules for `(mem ...)`:**
 - If `address` has type `(ptr T)` or `(aptr T)`, then `(mem address)` has type `T` - it dereferences the pointer to get the pointed-to type.
-- Example: `(mem (dot p :x))` where `(dot p :x)` is `(ptr (i +64))` has type `(i +64)`.
-- Example: `(mem (at arr index))` where `(at arr index)` is `(ptr (i +32))` has type `(i +32)`.
+- Example: `(mem (dot p.0 x.0))` where `(dot p.0 x.0)` is `(ptr (i 64))` has type `(i 64)`.
+- Example: `(mem (at arr.0 index))` where `(at arr.0 index)` is `(ptr (i 32))` has type `(i 32)`.
+- `(cast T <memoperand>)` retypes an access, and thereby sizes it.
 - Memory operations require explicit `(mem ...)` - address expressions are not automatically dereferenced.
 
 
-## Instructions (x86-64)
+## Instructions
 
-`nifasm` supports the following instruction categories needed by a typical code generator. All instructions follow the pattern `(instr <dest> <src>)` or `(instr <operand>)` for unary operations, unless otherwise noted.
+The complete instruction set of both targets — mnemonic, operand shape and meaning — is
+[instructions.md](instructions.md), which is also the file the enums are generated from.
+It is the authoritative list; there is deliberately no second copy of it here.
 
-### Data movement
+What is worth knowing about it in prose:
 
-- `(mov <dest> <src>)` - Move/copy data between registers, memory, and immediates
-- `(lea <dest> <address>)` - Load effective address (compute address without accessing memory)
-- `(movapd <dest> <src>)` - Move aligned packed double-precision floating-point (XMM register to XMM register)
-- `(movsd <dest> <src>)` - Move scalar double-precision floating-point
-
-### Arithmetic operations
-
-**Integer:**
-- `(add <dest> <src>)` - Add
-- `(sub <dest> <src>)` - Subtract
-- `(mul <src>)` - Unsigned multiply (dest is implicit: rax, result in rdx:rax)
-- `(imul <dest> <src>)` - Signed multiply
-- `(div (rdx) (rax) <src>)` - Unsigned divide. Dividend is taken from rdx:rax (concatenated as 128-bit value). Quotient is stored in rax, remainder in rdx. The target registers must be explicitly specified even though they are fixed.
-- `(idiv (rdx) (rax) <src>)` - Signed divide. Dividend is taken from rdx:rax (concatenated as 128-bit value). Quotient is stored in rax, remainder in rdx. The target registers must be explicitly specified even though they are fixed.
-
-**Floating-point:**
-- `(addsd <dest> <src>)` - Add scalar double-precision
-- `(subsd <dest> <src>)` - Subtract scalar double-precision
-- `(mulsd <dest> <src>)` - Multiply scalar double-precision
-- `(divsd <dest> <src>)` - Divide scalar double-precision
-
-### Bitwise operations
-
-- `(and <dest> <src>)` - Bitwise AND
-- `(or <dest> <src>)` - Bitwise OR
-- `(xor <dest> <src>)` - Bitwise XOR
-- `(shl <dest> <src>)` - Shift left (logical)
-- `(shr <dest> <src>)` - Shift right (logical)
-- `(sal <dest> <src>)` - Shift arithmetic left (alias for shl)
-- `(sar <dest> <src>)` - Shift arithmetic right (signed)
-
-### Unary operations
-
-- `(inc <operand>)` - Increment by 1
-- `(dec <operand>)` - Decrement by 1
-- `(neg <operand>)` - Two's complement negation
-- `(not <operand>)` - Bitwise NOT
-
-### Comparison
-
-- `(cmp <dest> <src>)` - Compare and set flags (subtract without storing result)
-- `(test <dest> <src>)` - Logical AND and set flags (without storing result)
-
-### Conditional set
-
-These instructions set a byte register or memory location to 0 or 1 based on CPU flags from a previous `cmp` or `test`:
-
-- `(sete <dest>)` / `(setz <dest>)` - Set if equal/zero (ZF = 1)
-- `(setne <dest>)` / `(setnz <dest>)` - Set if not equal/not zero (ZF = 0)
-- `(seta <dest>)` / `(setnbe <dest>)` - Set if above (unsigned >, CF=0 and ZF=0)
-- `(setae <dest>)` / `(setnb <dest>)` / `(setnc <dest>)` - Set if above or equal (unsigned >=, CF=0)
-- `(setb <dest>)` / `(setnae <dest>)` / `(setc <dest>)` - Set if below (unsigned <, CF=1)
-- `(setbe <dest>)` / `(setna <dest>)` - Set if below or equal (unsigned <=, CF=1 or ZF=1)
-- `(setg <dest>)` / `(setnle <dest>)` - Set if greater (signed >, ZF=0 and SF=OF)
-- `(setge <dest>)` / `(setnl <dest>)` - Set if greater or equal (signed >=, SF=OF)
-- `(setl <dest>)` / `(setnge <dest>)` - Set if less (signed <, SF≠OF)
-- `(setle <dest>)` / `(setng <dest>)` - Set if less or equal (signed <=, ZF=1 or SF≠OF)
-- `(seto <dest>)` - Set if overflow (OF=1)
-- `(sets <dest>)` - Set if sign (SF=1)
-- `(setp <dest>)` - Set if parity (PF=1)
-
-### Conditional moves
-
-These instructions move data if the condition is met. `dest` must be a register.
-
-- `(cmove <dest> <src>)` / `(cmovz ...)` - Move if equal/zero
-- `(cmovne <dest> <src>)` / `(cmovnz ...)` - Move if not equal/not zero
-- `(cmova <dest> <src>)` / `(cmovnbe ...)` - Move if above
-- `(cmovae <dest> <src>)` / `(cmovnb ...)` / `(cmovnc ...)` - Move if above or equal
-- `(cmovb <dest> <src>)` / `(cmovnae ...)` / `(cmovc ...)` - Move if below
-- `(cmovbe <dest> <src>)` / `(cmovna ...)` - Move if below or equal
-- `(cmovg <dest> <src>)` / `(cmovnle ...)` - Move if greater
-- `(cmovge <dest> <src>)` / `(cmovnl ...)` - Move if greater or equal
-- `(cmovl <dest> <src>)` / `(cmovnge ...)` - Move if less
-- `(cmovle <dest> <src>)` / `(cmovng ...)` - Move if less or equal
-- `(cmovo <dest> <src>)` - Move if overflow
-- `(cmovno <dest> <src>)` - Move if not overflow
-- `(cmovs <dest> <src>)` - Move if sign
-- `(cmovns <dest> <src>)` - Move if not sign
-- `(cmovp <dest> <src>)` / `(cmovpe ...)` - Move if parity
-- `(cmovnp <dest> <src>)` / `(cmovpo ...)` - Move if not parity
-
-### Control flow
-
-**Unconditional jumps:**
-- `(jmp <label>)` - Jump to label
-
-**Conditional jumps:**
-- `(je <label>)` / `(jz <label>)` - Jump if equal/zero
-- `(jne <label>)` / `(jnz <label>)` - Jump if not equal/not zero
-- `(jg <label>)` - Jump if greater (signed)
-- `(jng <label>)` - Jump if not greater (signed)
-- `(jge <label>)` - Jump if greater or equal (signed)
-- `(jnge <label>)` - Jump if not greater or equal (signed)
-- `(ja <label>)` - Jump if above (unsigned)
-- `(jna <label>)` - Jump if not above (unsigned)
-- `(jae <label>)` - Jump if above or equal (unsigned)
-- `(jnae <label>)` - Jump if not above or equal (unsigned)
-
-**Function calls and returns:**
-- `(prepare <target> ... (call))` - Call function (target can be label or register)
-- `(ret)` - Return from function
-
-### Stack operations
-
-- `(push <operand>)` - Push onto stack
-- `(pop <operand>)` - Pop from stack
-
-### Atomic operations
-
-Atomic operations on x86 are typically achieved by prefixing instructions with `(lock)`. This prefix is only valid for instructions that modify memory.
-
-- `(lock (add <mem> <reg>))` - Atomic add
-- `(lock (sub <mem> <reg>))` - Atomic subtract
-- `(lock (inc <mem>))` - Atomic increment
-- `(lock (dec <mem>))` - Atomic decrement
-- `(lock (not <mem>))` - Atomic bitwise not
-- `(lock (neg <mem>))` - Atomic negate
-- `(lock (and <mem> <reg>))` - Atomic and
-- `(lock (or <mem> <reg>))` - Atomic or
-- `(lock (xor <mem> <reg>))` - Atomic xor
-
-In addition, some instructions are inherently atomic or support atomic behavior:
-
-- `(xchg <dest> <src>)` - Exchange. Atomic if one operand is memory.
-- `(xadd <dest> <src>)` - Exchange and Add.
-- `(cmpxchg <dest> <src>)` - Compare and Exchange.
-- `(cmpxchg8b <mem>)` - Compare and Exchange 8 bytes.
-
-Memory barriers and cache control:
-
-- `(mfence)` - Memory Fence
-- `(sfence)` - Store Fence
-- `(lfence)` - Load Fence
-- `(pause)` - Pause (for spin loops)
-- `(clflush <addr>)` - Flush Cache Line
-- `(prefetcht0 <addr>)` - Prefetch to all cache levels
-- `(prefetchnta <addr>)` - Prefetch non-temporal
-
-### Special
-
-- `(nop)` - No operation
-- `(syscall)` - System call
-- `(lab <label>)` - Define label
-
-### Notes
-
-- Memory operands require the `(mem ...)` construct as described in the Addressing modes section
-- Instructions operate on typed operands; the assembler verifies type compatibility
-- The structured control flow constructs `(ite)` and `(loop)` are lowered to conditional jumps by the assembler
+- Instructions follow the pattern `(instr <dest> <src>)`, or `(instr <operand>)` for unary
+  ones, unless the table says otherwise. Two-operand forms read and write `dest`, and
+  AArch64's three-operand forms are spelled with a `3` suffix (`add3`, `mul3`, …).
+- The `Enums` column says which target a tag belongs to. A row naming both `X64Inst` and
+  `A64Inst` is the *cross-target* vocabulary — `mov`, `lea`, `add`, `sub`, `cmp`, `call`,
+  `ret`, `lab`, `ite`, `loop`, `stmts`, `scope`, `kill`, `rebind` — and it is what lets most
+  of a code generator stay platform independent.
+- Instructions whose register operands are fixed by the hardware still name them
+  explicitly: `(div (rdx) (rax) <src>)` and `(idiv (rdx) (rax) <src>)` spell out the
+  dividend/quotient/remainder registers even though the encoding has no choice, so the
+  type checker can see the clobber.
+- Memory operands always go through `(mem ...)`, as described under *Addressing modes*.
+- `(ite ...)` and `(loop ...)` are lowered to conditional and unconditional jumps by the
+  assembler.
+- x86-64 atomics are the `(lock <instr>)` prefix over a memory-modifying instruction, plus
+  the inherently atomic `xchg`/`xadd`/`cmpxchg`/`cmpxchg8b` and the `mfence`/`sfence`/
+  `lfence`/`pause` fences. AArch64 uses the exclusive-monitor pairs `ldaxr`/`stlxr`, the
+  acquire/release `ldar`/`stlr`, and `dmb`/`clrex`.
+- `(syscall)` (x86-64) and `(svc)` (AArch64) issue a raw kernel trap; `(syproc ...)`
+  declares a proc as one, so a call site is type-checked like any other.
 
 
 ## Generic register names
 
-It turns out that for a code generator targeting `nifasm` most of its logic can be kept platform independent; the most interesting instruction set (ARM, x86, ...) specific aspect is the number of available registers. Dedicated names like `(rax)` are an obstacle to the reusability of a code generator. Thus these aliases exist:
+It turns out that for a code generator targeting `nifasm` most of its logic can be kept platform independent; the most interesting instruction set (ARM, x86, ...) specific aspect is the number of available registers. Dedicated names like `(rax)` are an obstacle to the reusability of a code generator. Thus x86-64's first eight registers also answer to numeric names:
 
-The number of available registers varies by platform: x86-64 provides 16 general-purpose registers (r0-r15), while ARM64 provides 31 (r0-r30). Code generators should be aware of the target platform's register count when making allocation decisions. The generic naming scheme allows the same code generator logic to work across platforms with minimal changes.
+| register name | alias for |
+|---------------|-----------|
+| `(r0)`        | `(rax)`   |
+| `(r1)`        | `(rbx)`   |
+| `(r2)`        | `(rcx)`   |
+| `(r3)`        | `(rdx)`   |
+| `(r4)`        | `(rsi)`   |
+| `(r5)`        | `(rdi)`   |
+| `(r6)`        | `(rbp)`   |
+| `(r7)`        | `(rsp)`   |
+| `(r8)`..`(r15)` | already numeric |
 
-|----------------|-----------|
-| register name  | alias for |
-|----------------|-----------|
-| r0             | rax       |
-| r1             | rbx       |
-| r2             | rcx       |
-| r3             | rdx       |
-| r4             | rsi       |
-| r5             | rdi       |
-| r6             | rbp       |
-| r7             | rsp       |
-| r8..r15        | already have the proper names |
-|----------------|-----------|
+The number of available registers varies by platform: x86-64 provides 16 general-purpose registers, while AArch64 provides 31 (`(x0)`..`(x30)`, with `(w0)`..`(w30)` naming their 32-bit halves, plus `(sp)`, `(xzr)` and the aliases `(fp)` = x29 and `(lr)` = x30). Code generators should be aware of the target platform's register count when making allocation decisions.
+
+In practice a code generator abstracts over the register *file* anyway — arkham does it with a `MachineDesc` per target rather than by leaning on the numeric aliases — so this is a convenience, not the portability mechanism.
 
 
 ## Reserved registers
 
-Some architectures have limited immediate value ranges for memory addressing. When an offset computed by the assembler exceeds the encodable limit, the assembler must use a scratch register to compute the address. To avoid conflicts with user code, nifasm reserves specific registers that **cannot be used in assembler code**:
+Some architectures have limited immediate value ranges for memory addressing. When an offset the assembler computed exceeds the encodable limit, the assembler must use a scratch register to compute the address. It takes one without asking:
 
-| Architecture | Reserved registers | Immediate limit | Reason |
-|--------------|-------------------|-----------------|--------|
-| x86-64 | (none) | ±2GB | 32-bit displacements are sufficient |
-| ARM64 | x16, x17 | ±4KB / ±512B | ABI reserves IP0/IP1 for linker veneers |
-| RISC-V | t0, t1 | ±2KB | Convention for linker/assembler scratch |
+| Architecture | Assembler scratch | Immediate limit |
+|--------------|-------------------|-----------------|
+| x86-64 | (none needed) | ±2GB — 32-bit displacements always suffice |
+| AArch64 | x17, and x16 for the macOS TLV thunk | ±4KB / ±512B |
 
-**Why these registers?**
-
-On ARM64, the ABI already reserves `x16` (IP0) and `x17` (IP1) for linker-generated code (veneers for long branches, PLT entries). Any function call may corrupt these registers, so user code cannot rely on them across calls anyway. Nifasm exploits this by using them for internal address calculations.
-
-On RISC-V, `t0` and `t1` serve a similar conventional role for linker stubs, making them natural choices for assembler scratch use.
+On AArch64 the ABI already reserves `x16` (IP0) and `x17` (IP1) for linker-generated code — veneers for long branches, PLT entries — so any call may corrupt them and no code can rely on them across one anyway. nifasm exploits exactly that.
 
 **Implications for code generators:**
 
-- Do not allocate variables to reserved registers
-- Do not use reserved registers in instructions
-- The assembler will reject code that references reserved registers
-- This leaves the full set of remaining registers for the code generator's use
-
-The reserved registers are used transparently by the assembler when needed. User code does not need to account for large offsets - the assembler handles this automatically while preserving type checking.
+- Do not allocate variables to x16/x17, and do not expect a value put there to survive the next instruction the assembler expands. (This is a contract, not a check: nifasm does *not* reject code that names them. arkham keeps them out of its pools — `ReservedRegs` in `src/arkham/machine.nim`.)
+- Everything else is yours.
+- You do not have to account for large frame offsets. The assembler synthesizes the address through its scratch register when needed, with the type checking intact.
 
 
 ## Module System
@@ -733,26 +652,28 @@ Foreign modules are loaded **on-demand** when their symbols are first referenced
 
 1. When a symbol lookup fails in the current scope, nifasm checks if the symbol name contains a module suffix
 2. If a module suffix is detected, nifasm attempts to load the foreign module:
-   - First tries `<module-name>.s.nif` (semchecked/semantic-checked version)
-   - Falls back to `<module-name>.nif` (plain version)
+   - First tries `<module-name>.asm.nif` (what arkham writes)
+   - Falls back to `<module-name>.nif`
    - Searches in the same directory as the main module file
-3. The foreign module's declarations (types, procs, globals) are parsed and added to the current scope
-4. Only the **signatures** are loaded initially - function bodies are parsed but not generated until needed
+3. "Loading" means reading the module's embedded NIF `.index` (symbol → byte offset) and keeping the stream open. **No declaration is parsed at this point.** A foreign module without that index is rejected — it is what makes the loading lazy, so a hand-written module has to be run through a NIF indexer before it can be imported
+4. Each declaration is parsed the first time its own name is followed, and code is generated for it only if it is actually reachable (see *Dead Code Elimination* below)
 
 **Example:**
 
 ```nifasm
 # main.nif
 (stmts
-  (type :Point (object (fld :x (i +64)) (fld :y (i +64))))
+  (type :Point.0 (object (fld :x.0 (i 64)) (fld :y.0 (i 64))))
   (proc :main.0
     (params)
-    (ret :ret.0 (rax) (i +64))
-    (body
+    (result :ret.0 (rax) (i 64))
+    (clobber (rax))
+    (stmts
       (prepare foo.0.othermodule
         (call)
         (mov (rax) (res ret.0))
       )
+      (ret)
     )
   )
 )
@@ -763,16 +684,17 @@ Foreign modules are loaded **on-demand** when their symbols are first referenced
 (stmts
   (proc :foo.0.othermodule
     (params)
-    (ret :ret.0 (rax) (i +64))
-    (body
-      (mov (rax) +42)
+    (result :ret.0 (rax) (i 64))
+    (clobber)
+    (stmts
+      (mov (rax) 42)
       (ret)
     )
   )
 )
 ```
 
-When `main.nif` references `foo.0.othermodule`, nifasm automatically loads `othermodule.nif`.
+When `main.nif` references `foo.0.othermodule`, nifasm automatically loads `othermodule.nif` — provided that file carries its `(.index)`, as everything arkham writes does.
 
 ### Dead Code Elimination
 
@@ -797,8 +719,8 @@ This means unused functions, types, and globals from both the main module and fo
 
 When loading a foreign module, nifasm searches for module files in the following order:
 
-1. `<base-dir>/<module-name>.s.nif` - Semchecked version (preferred)
-2. `<base-dir>/<module-name>.nif` - Plain version (fallback)
+1. `<base-dir>/<module-name>.asm.nif` - what arkham writes (preferred)
+2. `<base-dir>/<module-name>.nif` - fallback
 
 Where `<base-dir>` is the directory containing the main module file being assembled.
 
@@ -807,18 +729,24 @@ If neither file is found, nifasm reports an error: `"Foreign module file not fou
 
 ## Generic Instance Deduplication
 
-nifasm automatically deduplicates generic instances across modules to avoid generating duplicate code for the same generic instantiation. This is based on extracting a deduplication key from the symbol's structure.
+nifasm automatically deduplicates generic instances across modules to avoid generating duplicate code for the same generic instantiation — the job a COMDAT section does in a classical object format. Every module that needs an instantiation emits its own copy, and the copies must collapse onto one definition. This is based on extracting a deduplication key from the symbol's structure.
 
 ### Deduplication Key Extraction
 
-A deduplication key is extracted from symbols with **more than 2 dots** in their name:
+The deduplication key is the symbol name **minus its module suffix**. Dropping the module is sound exactly when what remains means the same thing in every module, and that is a property of the name's *shape*, which the [NIF spec](https://github.com/nim-lang/nifspec/blob/master/doc/nif-spec.md) defines. A global symbol is
 
-- `foo.0` (1 dot) → No dedup key (local symbol)
-- `foo.0.mymodule` (2 dots) → No dedup key (module suffix only)
-- `foo.0.key1.mymodule` (3 dots) → Dedup key: `foo.0.key1`
-- `foo.0.key1.key2.othermodule` (4 dots) → Dedup key: `foo.0.key1.key2`
+```
+<ident>.<disamb>.<module>            # no key: this symbol belongs to this module
+<ident>.<disamb>.<key>.<module>      # keyed: `key` is a generic instantiation
+```
 
-The deduplication key is **everything before the last dot** (which is the module suffix).
+The **key slot** answers *which* instantiation of `<ident>.<disamb>` this is. Every importing module derives the same key independently, so `<ident>.<disamb>.<key>` is a cross-module identity — which is precisely what makes the copies mergeable:
+
+- `foo.0` → no dedup key (local symbol)
+- `foo.0.mymodule` → no dedup key (module suffix only)
+- `foo.0.Iabcdefgh.mymodule` → dedup key: `foo.0.Iabcdefgh`
+
+nifasm does not decide on its own which names occupy that slot. It calls `symparser.isInstantiation`, the toolchain's single implementation of the rule, shared with nimony (whose DCE and `lengcgen` key on the same one). A name that names a role private to one module — a closure environment, a vtable, a coroutine frame — never reaches this test, because the mint site keeps the tag *inside the identifier* (`` outer`env.0 ``, `symparser.derivedName`) rather than putting it in the key slot where it would promise a cross-module identity it does not have.
 
 ### Deduplication Process
 
@@ -837,23 +765,22 @@ The deduplication key is **everything before the last dot** (which is the module
 
 ### Example: Generic Function Deduplication
 
-Consider a generic `max` function that is instantiated for `int64` in multiple modules:
+Consider a generic `max` function instantiated for `int64` in two modules; `Ii64` stands in for the key nimony actually mints, a hash of the instantiated arguments:
 
 **Module A (`moduleA.nif`):**
 ```nifasm
 (stmts
-  (proc :max.0.int64.moduleA
+  (proc :max.0.Ii64.moduleA
     (params
-      (param :a.0 (rdi) (i +64))
-      (param :b.0 (rsi) (i +64))
+      (param :a.0 (rdi) (i 64))
+      (param :b.0 (rsi) (i 64))
     )
-    (ret :ret.0 (rax) (i +64))
-    (body
-      (cmp (rdi) (rsi))
-      (ite (jg)
-        (stmts (mov (rax) (rdi)))
-        (stmts (mov (rax) (rsi)))
-      )
+    (result :ret.0 (rax) (i 64))
+    (clobber)
+    (stmts
+      (cmp a.0 b.0)
+      (mov (rax) b.0)
+      (cmovg (rax) a.0)
       (ret)
     )
   )
@@ -863,18 +790,17 @@ Consider a generic `max` function that is instantiated for `int64` in multiple m
 **Module B (`moduleB.nif`):**
 ```nifasm
 (stmts
-  (proc :max.0.int64.moduleB
+  (proc :max.0.Ii64.moduleB
     (params
-      (param :a.0 (rdi) (i +64))
-      (param :b.0 (rsi) (i +64))
+      (param :a.0 (rdi) (i 64))
+      (param :b.0 (rsi) (i 64))
     )
-    (ret :ret.0 (rax) (i +64))
-    (body
-      (cmp (rdi) (rsi))
-      (ite (jg)
-        (stmts (mov (rax) (rdi)))
-        (stmts (mov (rax) (rsi)))
-      )
+    (result :ret.0 (rax) (i 64))
+    (clobber)
+    (stmts
+      (cmp a.0 b.0)
+      (mov (rax) b.0)
+      (cmovg (rax) a.0)
       (ret)
     )
   )
@@ -886,21 +812,22 @@ Consider a generic `max` function that is instantiated for `int64` in multiple m
 (stmts
   (proc :main.0
     (params)
-    (ret :ret.0 (rax) (i +64))
-    (body
-      (prepare max.0.int64.moduleA
-        (mov (arg a.0) +10)
-        (mov (arg b.0) +20)
+    (result :ret.0 (rax) (i 64))
+    (clobber (rdi) (rsi) (rax))
+    (stmts
+      (prepare max.0.Ii64.moduleA
+        (mov (arg a.0) 10)
+        (mov (arg b.0) 20)
         (call)
         (mov (rbx) (res ret.0))
       )
-      (prepare max.0.int64.moduleB
-        (mov (arg a.0) +30)
-        (mov (arg b.0) +40)
+      (prepare max.0.Ii64.moduleB
+        (mov (arg a.0) 30)
+        (mov (arg b.0) 40)
         (call)
         (mov (rcx) (res ret.0))
       )
-      (mov (rax) +0)
+      (mov (rax) 0)
       (ret)
     )
   )
@@ -909,15 +836,15 @@ Consider a generic `max` function that is instantiated for `int64` in multiple m
 
 **Deduplication Behavior:**
 
-1. When `max.0.int64.moduleA` is first referenced:
-   - Dedup key `max.0.int64` is extracted
-   - `max.0.int64.moduleA` becomes the canonical name
+1. When `max.0.Ii64.moduleA` is first referenced:
+   - Dedup key `max.0.Ii64` is extracted
+   - `max.0.Ii64.moduleA` becomes the canonical name
    - Symbol is added to pending list
 
-2. When `max.0.int64.moduleB` is referenced:
-   - Same dedup key `max.0.int64` is extracted
+2. When `max.0.Ii64.moduleB` is referenced:
+   - Same dedup key `max.0.Ii64` is extracted
    - Key already exists in dedup table
-   - `max.0.int64.moduleB` is merged with `max.0.int64.moduleA`
+   - `max.0.Ii64.moduleB` is merged with `max.0.Ii64.moduleA`
    - **Only one instance** of the function is generated (the canonical one)
 
 3. Both call sites resolve to the same generated function, avoiding code duplication.
@@ -931,8 +858,8 @@ Consider a generic `max` function that is instantiated for `int64` in multiple m
 
 ### Limitations
 
-- Deduplication only works for symbols with more than 2 dots (generic instances)
-- Local symbols (1 dot) and simple foreign symbols (2 dots) are not deduplicated
+- Deduplication only works for symbols with a key segment (see *Deduplication Key Extraction*)
+- Local symbols and plain module-qualified symbols are not deduplicated
 - The canonical symbol is determined by the **first occurrence** encountered during assembly
 - Modules must be available at assembly time (not link time) for deduplication to work
 
