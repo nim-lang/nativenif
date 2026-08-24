@@ -61,6 +61,12 @@ type
     ssizeSlot*: bool      ## the CFA delta is the frame size, which nifasm only
                           ## knows once the proc's slots are laid out; the
                           ## collector fills `cfaOff` in at that point
+    frameImm*: int32      ## the literal immediate this instruction carried: the
+                          ## `(ssize N)` alignment pad when `ssizeSlot`, the plain
+                          ## `sub rsp, N` otherwise. The CFA offset alone cannot
+                          ## reconstruct it once `pass2Proc` folds the frame size
+                          ## in, and `(popframe)` has to re-emit the SAME
+                          ## instruction the prologue did.
 
   ProcUnwind* = object
     name*: string         ## the NIF symbol — what a `bt` frame is labelled with

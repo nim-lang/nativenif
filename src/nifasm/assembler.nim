@@ -2962,7 +2962,7 @@ proc a64CondOf(inst: A64Inst): arm64.Condition =
 
 proc cfiStep(ctx: var GenContext; cfaDelta: int32;
              savedRegs: openArray[int32] = []; ssizeSlot = false;
-             floats = false) =
+             floats = false; frameImm: int32 = 0) =
   ## Record one prologue instruction's effect on the unwind state. Called from
   ## the handlers that emit a push / a pair-store / the frame `sub`, and only
   ## while `inPrologue` — see `genInst` for what ends that run.
@@ -2980,7 +2980,8 @@ proc cfiStep(ctx: var GenContext; cfaDelta: int32;
     saves.add CfiSave(reg: savedRegs[i], isFloat: floats,
                       cfaOff: -ctx.cfaOff + int32(8 * i))
   ctx.unwind[^1].steps.add CfiStep(at: ctx.buf.data.len, cfaOff: ctx.cfaOff,
-                                   saves: saves, ssizeSlot: ssizeSlot)
+                                   saves: saves, ssizeSlot: ssizeSlot,
+                                   frameImm: frameImm)
   ctx.prologueOp = true
 
 proc genPopframeA64(ctx: var GenContext) =
@@ -3018,6 +3019,33 @@ proc genPopframeA64(ctx: var GenContext) =
         arm64.emitLdp(ctx.buf.data,
                       arm64.Register(st.saves[0].reg),
                       arm64.Register(st.saves[1].reg), arm64.SP, 16'i32)
+
+proc genPopframeX64(ctx: var GenContext) =
+  ## `(popframe)` — the x86-64 twin of `genPopframeA64`, and for the same reason:
+  ## arkham finalizes `usedCallee` / `hasStackVars` only AFTER the body is emitted,
+  ## so a teardown written at a mid-body site would have to guess how many `pop`s
+  ## and whether a frame `sub` exists at all. Here nothing is guessed — the
+  ## prologue is already assembled and `ctx.unwind[^1].steps` records each of its
+  ## instructions in order. Replaying that in reverse is `framePop` by construction:
+  ## the frame `add` (the `sub`'s twin, same forced imm32, same patch list, since
+  ## the size is unknown until the slots are laid out), then each `pop` in reverse
+  ## push order.
+  ##
+  ## Afterwards rsp points at the return address exactly as it did at entry, which
+  ## is what makes the `jmp` a tail call: the callee is entered in a normal callee's
+  ## state and its `ret` returns to OUR caller.
+  if ctx.unwind.len == 0: return
+  let steps = ctx.unwind[^1].steps
+  for i in countdown(steps.len - 1, 0):
+    let st = steps[i]
+    if st.ssizeSlot:
+      x86.emitAddImm32(ctx.buf.data, x86.RSP, 0)     # forced imm32: back-patched
+      ctx.ssizePatches.add((ctx.buf.data.len - 4, int(st.frameImm)))
+    elif st.saves.len == 1:
+      x86.emitPop(ctx.buf.data, x86.Register(st.saves[0].reg))
+    elif st.saves.len == 0 and st.frameImm != 0:
+      # The alignment-pad-only frame: `sub rsp, 8` with no `(s)` region.
+      x86.emitAddImm(ctx.buf.data, x86.RSP, st.frameImm)
 
 proc genInstA64(n: var Cursor; ctx: var GenContext) =
   if n.kind != TagLit: error("Expected instruction", n)
@@ -7168,14 +7196,17 @@ proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
       if not param.typ.isOnStack and param.name notin ctx.callContext.argsSet:
         error("Missing argument: " & ctx.nameOf(param.name), hdr)
 
-    for res in ctx.callContext.typ.results:
-      if res.name notin ctx.callContext.resultsSet:
-        error("Missing result binding: " & ctx.nameOf(res.name), hdr)
+    if not ctx.callContext.isTailcall:
+      # A tail call binds no result: the callee's return value IS this proc's, and
+      # it is already in the return register when the callee's own `ret` runs.
+      for res in ctx.callContext.typ.results:
+        if res.name notin ctx.callContext.resultsSet:
+          error("Missing result binding: " & ctx.nameOf(res.name), hdr)
 
   # Verify call was emitted
   if not ctx.callContext.callEmitted:
     if ctx.callContext.state == CallContextState.NormalCall:
-      error("Missing (call) or (extcall) in prepare block", hdr)
+      error("Missing (call), (tailcall) or (extcall) in prepare block", hdr)
     else:
       error("Missing (extcall) in prepare block", hdr)
   ctx.callContext = outerCall                  # resume the enclosing call, if any
@@ -7253,6 +7284,46 @@ proc genCallMarkerX64(n: var Cursor; ctx: var GenContext) =
     ctx.buf.emitCall(labId)
   ctx.callContext.callEmitted = true
   inc n                   # past the `(call` head
+
+proc genTailcallMarkerX64(n: var Cursor; ctx: var GenContext) =
+  ## `(tailcall)` — the `(call)` marker's no-return-address twin: same prepared
+  ## arguments, same clobber declaration, `jmp rel32` instead of `call rel32`.
+  ## Control leaves this proc for good, so the callee returns to OUR caller and its
+  ## `ret` is ours.
+  ##
+  ## The frame is already gone: arkham emits `(popframe)` between the last argument
+  ## store and this marker — a teardown that touches only rsp and callee-saved
+  ## registers, never the argument registers the arguments now sit in — so nothing
+  ## here may address a stack slot. That is also why arkham refuses to form a tail
+  ## call that needs outgoing stack arguments.
+  if not ctx.inCall:
+    error("(tailcall) can only be used inside a prepare block", n)
+  if ctx.callContext.callEmitted:
+    error("Multiple call instructions in prepare block", n)
+  if ctx.callContext.state == CallContextState.ExternalCall:
+    error("(tailcall) cannot reach an external proc: the IAT/GOT call is indirect", n)
+  let sym = lookupWithAutoImport(ctx, ctx.scope, ctx.callContext.target, n)
+  if ctx.callContext.typ != nil:
+    ctx.clobbered.incl(ctx.callContext.typ.clobbers)
+  ctx.callContext.isTailcall = true
+  if ctx.callContext.indirect:
+    # An INDIRECT tail call would have to survive the `(popframe)` that precedes it,
+    # and the pointer is exactly what does not: it sits either in a register the
+    # prologue saved and `(popframe)` has just restored the caller's value into, or
+    # behind a load through rax that the same reasoning applies to. Staging it is not
+    # expressible here — `(popframe)` is already emitted by the time this marker is
+    # read — so the backend must not form one, and this says so loudly rather than
+    # jumping to whatever the caller happened to leave in that register.
+    error("indirect tail call: the target register does not survive (popframe)", n)
+  var labId: LabelId
+  if sym.offset == -1:
+    labId = ctx.buf.createLabel()
+    sym.offset = int(labId)
+  else:
+    labId = LabelId(sym.offset)
+  ctx.buf.emitJmp(labId)
+  ctx.callContext.callEmitted = true
+  inc n                   # past the `(tailcall)` head
 
 proc genSyscallMarkerX64(n: var Cursor; ctx: var GenContext) =
   ## `(syscall)` inside a `(prepare <syproc> …)` block: the syscall counterpart of
@@ -7940,6 +8011,11 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     genPrepareX64(n, ctx)
   of CallX64:
     genCallMarkerX64(n, ctx)
+  of TailcallX64:
+    genTailcallMarkerX64(n, ctx)
+  of PopframeX64:
+    inc n
+    genPopframeX64(ctx)
   of ExtcallX64:
     genExtcallX64(n, ctx)
   of IatX64:
@@ -8019,14 +8095,15 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         x86.emitSubImm32(ctx.buf.data, dest.reg, 0)   # forced imm32: back-patched
         ctx.ssizePatches.add((ctx.buf.data.len - 4, int(op.immVal)))
         if ctx.inPrologue and dest.reg == x86.RSP:
-          ctx.cfiStep(0, [], ssizeSlot = true)        # delta filled in at proc end
+          # delta filled in at proc end; `frameImm` keeps the pad `(popframe)` needs
+          ctx.cfiStep(0, [], ssizeSlot = true, frameImm = int32(op.immVal))
       elif op.kind == okCsize:
         x86.emitSubImm(ctx.buf.data, dest.reg, int32(op.immVal))
       elif op.kind == okImm:
         x86.emitSubImm(ctx.buf.data, dest.reg, int32(op.immVal))
         if ctx.inPrologue and dest.reg == x86.RSP:
           # the alignment-pad-only frame (`hasStackVars` false, `framePad` 8)
-          ctx.cfiStep(int32(op.immVal))
+          ctx.cfiStep(int32(op.immVal), frameImm = int32(op.immVal))
       elif op.kind == okMem:
         x86.emitSub(ctx.buf.data, dest.reg, op.mem)
       else:

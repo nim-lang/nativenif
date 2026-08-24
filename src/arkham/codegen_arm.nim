@@ -5909,6 +5909,9 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
   ## pair — in nimsem that happens in 2273 of 3906 procs). nifasm has assembled
   ## the prologue by the time it reaches the marker and can simply reverse it.
   discard hiddenPtr                            # the x8 hidden pointer is set by the caller
+  g.tailCallEmitted = false                    # BEFORE the mem-intrinsic early return
+                                               # below: a stale `true` from an earlier
+                                               # call would make `RetS` skip the epilogue
   # Every store-forwarding mirror dies at a call, and BEFORE the marshalling: the
   # callee clobbers the volatiles a mirror lives in, and — for a value whose
   # address escaped — could write the slot itself. (Address-taken locals are never
@@ -6002,7 +6005,6 @@ proc emitCall2(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
   # an external/syscall/indirect target does not reach the plain `b`; and a >16B
   # result travels through a hidden pointer that is not ours to forward yet.
   # Declining is silent and costs nothing — the call is emitted as an ordinary one.
-  g.tailCallEmitted = false
   # `indirect` is the local the target resolution above set — the `CallTarget`
   # built for an indirect call does not carry the flag, so `tgt.indirect` is not
   # the thing to ask. An indirect tail call is refused because the pointer lives in
