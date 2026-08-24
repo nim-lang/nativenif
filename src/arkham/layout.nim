@@ -34,23 +34,6 @@ proc asmTag(n: Cursor): TagEnum = cast[TagEnum](uint32(resolvedTagId(n)))
 var asmTags: TagPool = createAsmTagPool()
 
 type
-  RegionKind* = enum
-    rkRom     ## holds what the image ships with — flash, or a ZBT SRAM at 0
-    rkRam     ## holds nothing at reset
-
-  Region* = object
-    name*: string
-    kind*: RegionKind
-    origin*: uint32
-    size*: uint32
-
-  SectionKind* = enum
-    ## NIF's and Nimony's own words, not the linker's. `gvar` covers the
-    ## initialized globals AND the zeroed ones on purpose: whether a global ships
-    ## with a value is not something a LAYOUT has an opinion about, and the split
-    ## inside the region is the image writer's (see `doc/cortex_m.md` M6a).
-    secCode, secConst, secGvar
-
   WritesToKind* = enum
     ## What `write` is implemented as. Both names say what must be ATTACHED,
     ## which is the thing that is actually got wrong.
@@ -58,24 +41,27 @@ type
     wtSerial     ## drive a UART; nothing attached but a wire
 
   Layout* = object
+    ## The board, and only what is not already implied by it.
+    ##
+    ## There is no row saying which section lives where. Code and constants go
+    ## where the IMAGE is; mutable storage goes where nothing is. Those are the
+    ## definitions of the two regions rather than choices about them, and a row
+    ## restating a definition is only a chance to write it down wrong.
     given*: bool                     ## a file was read at all
-    regions*: seq[Region]
-    place*: array[SectionKind, string]   ## section → region name ("" = unset)
+    flashStart*, flashSize*: uint32  ## the region the image SHIPS IN. Named for
+                                     ## the part, not for a permission: MPS2's
+                                     ## region at 0 is ZBT SRAM and perfectly
+                                     ## writable. What matters is that its
+                                     ## contents survive reset.
+    sramStart*, sramSize*: uint32    ## the region that holds NOTHING at reset
     writesTo*: WritesToKind
     serialAddress*: uint32
-    stacksRegion*: string
     slotCount*: int
     slotSize*: uint32                ## a POWER OF TWO — it is the mask a thread
-                                     ## reaches its own TLS with
-    tlsSize*: uint32                 ## reserved at the TOP of every slot
-    heapRegion*: string
-    heapSize*: uint32
+                                     ## reaches its own thread-locals with
+    tvarSize*: uint32                ## reserved at the TOP of every slot
+    heapSize*: uint32                ## 0 when the file reserves no heap
     core*: int                       ## which slot this image boots on
-
-proc regionByName*(l: Layout; name: string): int =
-  for i, r in l.regions:
-    if r.name == name: return i
-  -1
 
 proc fail(msg: string) {.noreturn.} =
   quit "arkham --layout: " & msg, QuitFailure
@@ -117,13 +103,6 @@ proc readStartAddress(n: var Cursor): uint32 =
   if got > 0xFFFF_FFFF'u64: fail "origin out of range"
   result = uint32(got)
 
-proc sectionOf(name: string): SectionKind =
-  case name
-  of "code": secCode
-  of "const": secConst
-  of "gvar": secGvar
-  else: fail "unknown section `" & name & "` — expected code, const or gvar"
-
 proc parseLayout*(path: string): Layout =
   ## Read and CHECK the file. Everything that can be wrong about a layout is
   ## wrong here, by name, and not later as an image that boots into nothing.
@@ -132,6 +111,7 @@ proc parseLayout*(path: string): Layout =
   var n = beginRead(buf)
   if n.kind != TagLit or tagToNifasmDecl(asmTag(n)) != LayoutD:
     fail path & ": expected a (layout …) tree"
+  var sawFlash, sawSram, sawStacks = false
   n.into:
     while n.hasMore:
       if n.kind != TagLit: fail "expected a declaration inside (layout …)"
@@ -139,32 +119,18 @@ proc parseLayout*(path: string): Layout =
       var e = n
       skip n
       case d
-      of RegionD:
-        var r = Region()
+      of FlashD:
         e.into:
-          if e.kind != Ident: fail "(region …) needs a name"
-          r.name = e.strVal; inc e
-          if e.kind != Ident: fail "(region …) needs `rom` or `ram`"
-          case e.strVal
-          of "rom": r.kind = rkRom
-          of "ram": r.kind = rkRam
-          else: fail "a region is `rom` or `ram`, not `" & e.strVal & "`"
-          inc e
-          r.origin = readStartAddress(e)
-          r.size = readSize(e)
+          result.flashStart = readStartAddress(e)
+          result.flashSize = readSize(e)
           while e.hasMore: skip e
-        if result.regionByName(r.name) >= 0: fail "duplicate region `" & r.name & "`"
-        result.regions.add r
-      of PlaceD:
-        var sec = secCode
-        var reg = ""
+        sawFlash = true
+      of SramD:
         e.into:
-          if e.kind != Ident: fail "(place …) needs a section name"
-          sec = sectionOf(e.strVal); inc e
-          if e.kind != Ident: fail "(place …) needs a region"
-          reg = e.strVal; inc e
+          result.sramStart = readStartAddress(e)
+          result.sramSize = readSize(e)
           while e.hasMore: skip e
-        result.place[sec] = reg
+        sawSram = true
       of WritesToD:
         e.into:
           if e.kind != Ident: fail "(writesTo …) needs `debugger` or `serial`"
@@ -177,8 +143,6 @@ proc parseLayout*(path: string): Layout =
           while e.hasMore: skip e
       of StacksD:
         e.into:
-          if e.kind != Ident: fail "(stacks …) needs a region"
-          result.stacksRegion = e.strVal; inc e
           if e.kind != TagLit or tagToNifasmExpr(asmTag(e)) != SlotsX:
             fail "(stacks …) needs (slots N)"
           var cnt = 0
@@ -191,13 +155,12 @@ proc parseLayout*(path: string): Layout =
           if e.kind != TagLit or tagToNifasmExpr(asmTag(e)) != TvarX:
             fail "(stacks …) needs (tvar <size>)"
           e.into:
-            result.tlsSize = readSize(e)
+            result.tvarSize = readSize(e)
             while e.hasMore: skip e
           while e.hasMore: skip e
+        sawStacks = true
       of HeapD:
         e.into:
-          if e.kind != Ident: fail "(heap …) needs a region"
-          result.heapRegion = e.strVal; inc e
           result.heapSize = readSize(e)
           while e.hasMore: skip e
       of CoreD:
@@ -207,49 +170,32 @@ proc parseLayout*(path: string): Layout =
       else:
         fail "unexpected `" & $d & "` inside (layout …)"
   endRead n
+  if not sawFlash: fail "no (flash …): nothing says where the image ships"
+  if not sawSram: fail "no (sram …): nothing says where mutable storage goes"
+  if not sawStacks: fail "no (stacks …)"
 
 proc validate*(l: Layout): string =
   ## `""` when the layout describes a board that could exist. Separate from the
   ## parse so that every complaint is about the WHOLE file: "the stacks do not fit
   ## in sram" is not a statement any one row can make.
-  if l.regions.len == 0: return "no regions"
-  for i, r in l.regions:
-    if r.size == 0: return "region `" & r.name & "` has size 0"
-    if r.origin.uint64 + r.size.uint64 > 0x1_0000_0000'u64:
-      return "region `" & r.name & "` runs past the end of the address space"
-    for j in 0 ..< i:
-      let o = l.regions[j]
-      if r.origin < o.origin + o.size and o.origin < r.origin + r.size:
-        return "regions `" & r.name & "` and `" & o.name & "` overlap"
-  for s in SectionKind:
-    if l.place[s].len == 0: return "no (place " & ($s).substr(3).toLowerAscii & " …)"
-    if l.regionByName(l.place[s]) < 0:
-      return "(place …) names region `" & l.place[s] & "`, which is not declared"
-  for s in [secCode, secConst]:
-    if l.regions[l.regionByName(l.place[s])].kind != rkRom:
-      return "`" & ($s).substr(3).toLowerAscii & "` ships with the image, so it " &
-             "must be placed in a `rom` region"
-  if l.regions[l.regionByName(l.place[secGvar])].kind != rkRam:
-    return "`gvar` must be placed in a `ram` region"
-  if l.stacksRegion.len == 0: return "no (stacks …)"
-  let si = l.regionByName(l.stacksRegion)
-  if si < 0: return "(stacks …) names region `" & l.stacksRegion & "`, which is not declared"
-  if l.regions[si].kind != rkRam: return "the stacks must be in a `ram` region"
-  # THE constraint the whole TLS scheme rests on. A thread finds its own slot by
-  # masking SP, so the slot size must be a power of two AND every slot must be
-  # aligned to it — which is what makes `slotsBase` below a multiple of the size
-  # rather than merely inside the region.
+  if l.flashSize == 0: return "the flash region has size 0"
+  if l.sramSize == 0: return "the sram region has size 0"
+  if l.flashStart.uint64 + l.flashSize.uint64 > 0x1_0000_0000'u64:
+    return "the flash region runs past the end of the address space"
+  if l.sramStart.uint64 + l.sramSize.uint64 > 0x1_0000_0000'u64:
+    return "the sram region runs past the end of the address space"
+  if l.flashStart < l.sramStart + l.sramSize and
+     l.sramStart < l.flashStart + l.flashSize:
+    return "the flash and sram regions overlap"
+  # THE constraint the whole thread-local scheme rests on. A thread finds its own
+  # slot by masking SP, so the slot size must be a power of two AND every slot
+  # must be aligned to it — which is what lets the image writer place the stacks
+  # on a multiple of the size rather than merely inside the region.
   if l.slotSize == 0 or (l.slotSize and (l.slotSize - 1)) != 0:
     return "the stack slot size must be a power of two — a thread reaches its " &
            "thread-locals by masking SP with it"
-  if l.tlsSize >= l.slotSize:
+  if l.tvarSize >= l.slotSize:
     return "the thread-local reservation fills the whole stack slot"
   if l.core < 0 or l.core >= l.slotCount:
     return "(core " & $l.core & ") is outside the " & $l.slotCount & " slot(s) declared"
-  if l.heapRegion.len > 0:
-    let hi = l.regionByName(l.heapRegion)
-    if hi < 0: return "(heap …) names region `" & l.heapRegion & "`, which is not declared"
-    if l.regions[hi].kind != rkRam: return "the heap must be in a `ram` region"
-    if l.heapSize == 0: return "the heap has size 0"
   return ""
-

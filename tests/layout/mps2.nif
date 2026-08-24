@@ -1,20 +1,7 @@
-(.nif27)
 (layout
- (region flash rom
-  (startAddress 0)
-  (megabytes 4))
- (region sram ram
-  (startAddress 536870912)
-  (kilobytes 64))
- (place code flash)
- (place const flash)
- (place gvar sram)
+ (flash (startAddress 0) (megabytes 4))
+ (sram  (startAddress 536870912) (kilobytes 64))
  (writesTo debugger)
- (stacks sram
-  (slots 1)
-  (kilobytes 8)
-  (tvar
-   (bytes 256)))
- (heap sram
-  (kilobytes 16))
+ (stacks (slots 1) (kilobytes 8) (tvar (bytes 256)))
+ (heap   (kilobytes 16))
  (core 0))

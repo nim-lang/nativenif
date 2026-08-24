@@ -1,21 +1,8 @@
-(.nif27)
 (layout
- (region flash rom
-  (startAddress 134217728)
-  (megabytes 1))
- (region sram ram
-  (startAddress 536870912)
-  (kilobytes 128))
- (place code flash)
- (place const flash)
- (place gvar sram)
- (writesTo serial
-  (startAddress 1073758208))
- (stacks sram
-  (slots 4)
-  (kilobytes 8)
-  (tvar
-   (bytes 512)))
- (heap sram
-  (kilobytes 32))
+ (flash (startAddress 134217728) (megabytes 1))
+ (sram  (startAddress 536870912) (kilobytes 128))
+ (writesTo serial (startAddress 1073758208))
+ (stacks (slots 4) (kilobytes 8) (tvar (bytes 512)))
+ (heap   (kilobytes 32))
  (core 0))
+ 

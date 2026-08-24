@@ -1182,9 +1182,14 @@ proc cortexMLayoutTests() =
                       " -o:" & quoteShell(workDir / "x.asm.nif") & " " & quoteShell(src),
                       expected)
   reject(("(kilobytes 8)", "(kilobytes 5)"), "power of two")
-  reject(("(place code flash)", "(place code sram)"), "`rom` region")
-  reject(("(place gvar sram)", "(place gvar ccm)"), "not declared")
+  reject(("(startAddress 536870912)", "(startAddress 0)"), "overlap")
+  reject(("(bytes 256)", "(kilobytes 8)"), "fills the whole stack slot")
+  reject(("(core 0)", "(core 3)"), "outside the 1 slot")
   reject(("(kilobytes 16)", "16"), "expected a size")
+  # A file that says nothing about where the image ships is not a layout with a
+  # default — it is a layout with a hole in it.
+  reject((" (flash (startAddress 0) (megabytes 4))\n", ""),
+         "nothing says where the image ships")
   # A heap that does not fit is a LINK-time fact — arkham cannot know how many
   # bytes of globals the module has — so this one is nifasm's to refuse.
   block:

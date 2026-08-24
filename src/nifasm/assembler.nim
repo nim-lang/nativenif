@@ -621,10 +621,10 @@ type
     ## The board, reduced to what PLACEMENT needs. Derived from `(layout …)`; see
     ## `handleLayout`.
     given*: bool
-    flashOrigin*, flashSize*: uint32
-    ramOrigin*, ramSize*: uint32
+    flashStart*, flashSize*: uint32
+    sramStart*, sramSize*: uint32
     slots*: int
-    slotSize*, tlsSize*: uint32
+    slotSize*, tvarSize*: uint32
     heapSize*: uint32
     core*: int
 
@@ -3089,7 +3089,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     discard "handle via `case instTag`"
   of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, LenientD,
      ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD,
-     InterruptsD, IrqD, LayoutD, RegionD, PlaceD, WritesToD, StacksD, HeapD,
+     InterruptsD, IrqD, LayoutD, FlashD, SramD, WritesToD, StacksD, HeapD,
      CoreD:
     raiseAssert("Unhandled declaration tag: " & $declTag)
 
@@ -7906,7 +7906,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     return
   of NoDecl:
     discard "continue with case instTag"
-  of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, LenientD, ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD, InterruptsD, IrqD, LayoutD, RegionD, PlaceD, WritesToD, StacksD, HeapD, CoreD:
+  of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, LenientD, ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD, InterruptsD, IrqD, LayoutD, FlashD, SramD, WritesToD, StacksD, HeapD, CoreD:
     error("Unexpected declaration: " & $declTag, n)
 
   # A mnemonic whose id overflowed the 9-bit tag field carries that id in a
@@ -9490,20 +9490,11 @@ proc handleLayout(n: var Cursor; ctx: var GenContext) =
   ## with the sizes normalized: one description, one place it is interpreted, and
   ## no way for the two tools to disagree about where a region is.
   ##
-  ## What is taken is what PLACEMENT needs — the region `code` goes in, the region
-  ## `gvar` goes in, and the stack/heap reservations inside the latter. Where
-  ## `write` goes is arkham's and is already lowered into the shims by the time
-  ## this arrives.
+  ## Nothing here says which section goes where, because nothing needs to: code
+  ## and constants go in the region the image SHIPS IN, mutable storage in the one
+  ## that holds nothing at reset. Those are what the two regions ARE.
   if ctx.arch != Arch.CortexM:
     error("(layout …) is a Cortex-M declaration", n)
-  var names: seq[string] = @[]
-  var origins: seq[uint32] = @[]
-  var sizes: seq[uint32] = @[]
-  var codeRegion, gvarRegion, stacksRegion, heapRegion = ""
-  proc regionIdx(nm: string): int =
-    for i, x in names:
-      if x == nm: return i
-    -1
   n.into:
    while n.hasMore:
     if n.kind != TagLit: error("expected a declaration inside (layout …)", n)
@@ -9511,25 +9502,18 @@ proc handleLayout(n: var Cursor; ctx: var GenContext) =
     var e = n
     skip n
     case d
-    of RegionD:
+    of FlashD:
       e.into:
-        names.add e.strVal; inc e            # name
-        inc e                                # rom / ram: placement decides use
-        origins.add readLayoutStartAddress(e)
-        sizes.add readLayoutSize(e)
+        ctx.board.flashStart = readLayoutStartAddress(e)
+        ctx.board.flashSize = readLayoutSize(e)
         while e.hasMore: skip e
-    of PlaceD:
+    of SramD:
       e.into:
-        let sec = e.strVal; inc e
-        let reg = e.strVal; inc e
-        case sec
-        of "code": codeRegion = reg
-        of "gvar": gvarRegion = reg
-        else: discard                        # `const` rides with `code`
+        ctx.board.sramStart = readLayoutStartAddress(e)
+        ctx.board.sramSize = readLayoutSize(e)
         while e.hasMore: skip e
     of StacksD:
       e.into:
-        stacksRegion = e.strVal; inc e
         if e.kind == TagLit and tagToNifasmExpr(e.tag) == SlotsX:
           e.into:
             if e.hasMore and e.kind == IntLit: (ctx.board.slots = int(getInt(e)); inc e)
@@ -9537,34 +9521,21 @@ proc handleLayout(n: var Cursor; ctx: var GenContext) =
         ctx.board.slotSize = readLayoutSize(e)
         if e.kind == TagLit and tagToNifasmExpr(e.tag) == TvarX:
           e.into:
-            ctx.board.tlsSize = readLayoutSize(e)
+            ctx.board.tvarSize = readLayoutSize(e)
             while e.hasMore: skip e
         while e.hasMore: skip e
     of HeapD:
       e.into:
-        heapRegion = e.strVal; inc e
         ctx.board.heapSize = readLayoutSize(e)
         while e.hasMore: skip e
     of CoreD:
       e.into:
         if e.hasMore and e.kind == IntLit: (ctx.board.core = int(getInt(e)); inc e)
         while e.hasMore: skip e
+    of WritesToD:
+      skip e                                 # arkham's; already in the shims
     else: error("unexpected declaration inside (layout …)", e)
-  # arkham validated the file; what is re-checked here is only what the FORWARD
-  # could get wrong, which is a region name that does not resolve.
-  let ti = regionIdx(codeRegion)
-  let bi = regionIdx(gvarRegion)
-  if ti < 0 or bi < 0: error("(layout …) places a section in an undeclared region", n)
-  if stacksRegion != gvarRegion:
-    error("the stacks must be placed in the same region as `gvar` — the image " &
-          "reserves them above the globals in that one region", n)
-  if heapRegion.len > 0 and heapRegion != gvarRegion:
-    error("the heap must be placed in the same region as `gvar`", n)
   ctx.board.given = true
-  ctx.board.flashOrigin = origins[ti]
-  ctx.board.flashSize = sizes[ti]
-  ctx.board.ramOrigin = origins[bi]
-  ctx.board.ramSize = sizes[bi]
 
 proc handleInterrupts(n: var Cursor; ctx: var GenContext) =
   ## `(interrupts (irq N S)*)` — the Cortex-M interrupt table, as arkham resolved
@@ -10800,10 +10771,10 @@ proc writeCortexMImage(a: var GenContext; code: seq[byte];
   var stacksBase = 0'u32
   var heapBase = 0'u32
   if a.board.given:
-    map.flashBase = a.board.flashOrigin
+    map.flashBase = a.board.flashStart
     map.flashSize = a.board.flashSize
-    map.ramBase = a.board.ramOrigin
-    map.ramSize = a.board.ramSize
+    map.ramBase = a.board.sramStart
+    map.ramSize = a.board.sramSize
     # Inside the RAM region: globals from the base up (which is what every
     # `movw/movt` site is already patched against), then the heap, then the
     # stacks — which must start on a multiple of the SLOT SIZE, because a thread
@@ -10824,7 +10795,7 @@ proc writeCortexMImage(a: var GenContext; code: seq[byte];
     # thread-local reservation — which lives at the TOP, so the stack grows DOWN
     # away from it rather than into it.
     map.stackTop = stacksBase + uint32(a.board.core + 1) * a.board.slotSize -
-                   a.board.tlsSize
+                   a.board.tvarSize
   let bssVaddr = map.ramBase
   let codeVaddr = map.flashBase
   # NOT a constant any more: the table is two words when nothing handles an

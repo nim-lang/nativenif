@@ -6668,7 +6668,7 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
       lengError c, "`" & IntrinsicNames[tgt.op] & "` needs a board layout — pass " &
                 "`--layout:<file>` so there IS a reserved heap to name",
                 lengInfo(c)
-    if g.board.heapRegion.len == 0:
+    if g.board.heapSize == 0:
       lengError c, "the board layout reserves no heap, so `" &
                 IntrinsicNames[tgt.op] & "` has nothing to answer with",
                 lengInfo(c)
@@ -7845,25 +7845,19 @@ proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     # redo the multiplication is a second chance to get it wrong.
     if g.board.given:
       g.ab.tree NifasmDecl.LayoutD:
-        for r in g.board.regions:
-          g.ab.tree NifasmDecl.RegionD:
-            g.ab.ident r.name
-            g.ab.ident (if r.kind == layout.rkRom: "rom" else: "ram")
-            g.ab.tree StartAddressX: g.ab.intLit int64(r.origin)
-            g.ab.tree BytesX: g.ab.intLit int64(r.size)
-        for sec in layout.SectionKind:
-          g.ab.tree NifasmDecl.PlaceD:
-            g.ab.ident ($sec).substr(3).toLowerAscii
-            g.ab.ident g.board.place[sec]
+        g.ab.tree NifasmDecl.FlashD:
+          g.ab.tree StartAddressX: g.ab.intLit int64(g.board.flashStart)
+          g.ab.tree BytesX: g.ab.intLit int64(g.board.flashSize)
+        g.ab.tree NifasmDecl.SramD:
+          g.ab.tree StartAddressX: g.ab.intLit int64(g.board.sramStart)
+          g.ab.tree BytesX: g.ab.intLit int64(g.board.sramSize)
         g.ab.tree NifasmDecl.StacksD:
-          g.ab.ident g.board.stacksRegion
           g.ab.tree SlotsX: g.ab.intLit int64(g.board.slotCount)
           g.ab.tree BytesX: g.ab.intLit int64(g.board.slotSize)
           g.ab.tree TvarX:
-            g.ab.tree BytesX: g.ab.intLit int64(g.board.tlsSize)
-        if g.board.heapRegion.len > 0:
+            g.ab.tree BytesX: g.ab.intLit int64(g.board.tvarSize)
+        if g.board.heapSize > 0:
           g.ab.tree NifasmDecl.HeapD:
-            g.ab.ident g.board.heapRegion
             g.ab.tree BytesX: g.ab.intLit int64(g.board.heapSize)
         g.ab.tree NifasmDecl.CoreD: g.ab.intLit int64(g.board.core)
     # The interrupt table, as slots rather than names: WHICH slot a name denotes

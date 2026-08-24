@@ -23,12 +23,12 @@ type
     ClobberTagId
     VarTagId
     LayoutTagId
-    RegionTagId
+    FlashTagId
+    SramTagId
     StartAddressTagId
     BytesTagId
     KilobytesTagId
     MegabytesTagId
-    PlaceTagId
     WritesToTagId
     StacksTagId
     SlotsTagId
@@ -588,12 +588,12 @@ const
     ("clobber", 18),
     ("var", 19),
     ("layout", 20),
-    ("region", 21),
-    ("startAddress", 22),
-    ("bytes", 23),
-    ("kilobytes", 24),
-    ("megabytes", 25),
-    ("place", 26),
+    ("flash", 21),
+    ("sram", 22),
+    ("startAddress", 23),
+    ("bytes", 24),
+    ("kilobytes", 25),
+    ("megabytes", 26),
     ("writesTo", 27),
     ("stacks", 28),
     ("slots", 29),

@@ -26,58 +26,53 @@ is what makes that forwarding a splice rather than a translation.
 ## Shape
 
 ```
-(.nif27)
 (layout
- (region flash rom (startAddress 134217728) (megabytes 1))
- (region sram  ram (startAddress 536870912) (kilobytes 128))
-
- (place code  flash)
- (place const flash)
- (place gvar  sram)
-
+ (flash (startAddress 134217728) (megabytes 1))
+ (sram  (startAddress 536870912) (kilobytes 128))
  (writesTo serial (startAddress 1073758208))
-
- (stacks sram (slots 4) (kilobytes 8) (tvar (bytes 512)))
- (heap   sram (kilobytes 32))
+ (stacks (slots 4) (kilobytes 8) (tvar (bytes 512)))
+ (heap   (kilobytes 32))
  (core 0))
 ```
 
+That is the whole file. There is no row saying which section lives where, because
+there is nothing to say: **code and constants go where the image is; mutable
+storage goes where nothing is.** Those are what the two regions *are*, not choices
+about them, and a row restating a definition is only a chance to write it down
+wrong.
+
 **Sizes are tagged quantities.** NIF has no `4K` literal, and a bare number in a
 layout file is exactly the place where a reader guesses the unit and is wrong. So
-`(bytes N)`, `(kilobytes N)`, `(megabytes N)` — and an untagged number is an
-error, not a byte count.
+`(bytes N)`, `(kilobytes N)`, `(megabytes N)` — an untagged number is an error.
 
 `(startAddress …)` is an address. Addresses and sizes are both plain integers in
 NIF, so they are told apart by their tag — and spelled out, because a row holds
 two numbers and the reader should not have to remember which is which.
 
-## Regions and placement
+## The two regions
 
-A region is `rom` (holds what the image ships with) or `ram` (holds nothing at
-reset). `code` and `const` must be placed in a `rom` region and `gvar` in a `ram`
-one — placing code in RAM would mean an image with nothing to copy it *from*.
+`flash` is **the region the image ships in**: code, constants, and the initializer
+image for globals. `sram` is **the region that holds nothing at reset**: globals,
+stacks, heap, all established by the startup code.
 
-**The section names are NIF's and Nimony's, not the linker's:** `code`, `const`,
-`gvar`. One vocabulary across the toolchain is worth more than matching a
-convention whose own names are accidents — `.bss` stands for *Block Started by
-Symbol*, a 1950s IBM assembler directive, and has meant "the zeroed globals" only
-by habit ever since.
+They are named for the parts rather than for permissions, and the imprecision is
+deliberate. Whether the silicon is writable is beside the point — MPS2's region at
+0x00000000 is ZBT SRAM and perfectly writable, real flash is writable through a
+flash controller, and code can be run *from* RAM (an STM32 routine that erases
+flash has to be). None of that changes where the image ships, which is the only
+thing this file is deciding.
 
-`gvar` covers the initialized globals **and** the zeroed ones. Whether a global
+The initialized globals and the zeroed ones are one thing here. Whether a global
 ships with a value is not something a layout has an opinion about; the split
-inside the region is the image writer's, and it is a high-water mark rather than
-two placements (see `doc/cortex_m.md` M6a). Their initializer image ships in the
-region `code` is placed in, and the startup copy is what puts it where `(place
-gvar …)` says.
+inside `sram` is the image writer's high-water mark (see `doc/cortex_m.md` M6a).
 
-Today `gvar`, the stacks and the heap must all name the **same** region: the image
-emits one SRAM segment. A part with a separate CCM/DTCM is exactly why the file
-names regions individually, and lifting that restriction is a change to the image
-writer rather than to this vocabulary.
+One `flash` and one `sram` is what the format supports. A part with a second
+mutable region — a CCM or a DTCM — is when placement rows come back, and only for
+the part that is genuinely ambiguous.
 
-## Inside the RAM region
+## Inside `sram`
 
-Placed by nifasm, in this order:
+Placed by nifasm inside `sram`, in this order:
 
 1. **globals** from the region base up — which is what every `movw`/`movt` site is
    already patched against.
@@ -118,7 +113,7 @@ it would *appear* to work and break the day PSP is adopted.
 
 ## The heap
 
-`(heap <region> <size>)` is what the allocator gets pages from. There is no
+`(heap <size>)` is what the allocator gets pages from. There is no
 `.bss` array standing in for it: an array would be a second answer to "how much
 RAM may the allocator have?", and the file already answers that in the same place
 it sizes the stacks and bounds the globals — so the three cannot silently add up
