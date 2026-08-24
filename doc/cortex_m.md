@@ -124,8 +124,11 @@ M-profile has no reset vector *instruction*; the core reads a table at
 the vector table is what the core actually reads — but the probe sets both.
 
 On the MPS2 boards the region at 0x00000000 is ZBT SRAM rather than real flash,
-so a first-cut image can put text, rodata and data all at 0 and skip the
-flash→RAM `.data` copy loop. Real silicon needs the copy; see M6.
+so a first-cut image could put text, rodata and data all at 0 and skip the
+flash→RAM `.data` copy loop. It no longer does: the image carries an initializer
+blob after the code and the entry proc copies it into SRAM, because real silicon
+needs that and because a skipped copy is invisible on a host that pre-loads the
+data for you. See M6.
 
 ## Semihosting
 
@@ -291,6 +294,43 @@ stdout and stderr are the same stream.
   path, as they do on AArch64 — `isDeclarativeAbi` excludes them — so the
   assembler never sees a float in a `(param …)`.
 * **M6 — actually embedded.** Exception/interrupt handlers with the right
-  EXC_RETURN epilogue, volatile MMIO, memory-map configuration, `.data` init
-  from flash, and a UART output backend so real hardware works without a
-  debugger attached.
+  EXC_RETURN epilogue, volatile MMIO, memory-map configuration, and a UART
+  output backend so real hardware works without a debugger attached.
+
+  **`.data` init from flash is DONE.** A hosted program is handed a laid-out
+  address space by its loader. A firmware image is handed a chip: flash holds
+  everything the image shipped with, RAM holds nothing at all, and `var counter =
+  7` has to become a 7 in RAM by some instruction that actually runs. So the
+  initializer image travels in flash, appended after the code, and the entry
+  proc's first act is to copy it into SRAM and zero the rest of the region
+  (`emStartupInitM`).
+
+  The four numbers this needs — where the image landed in flash, where the region
+  sits in SRAM, and the size of each part — are `(dataload)`, `(datavma)`,
+  `(datasize)` and `(bsssize)`. They are nifasm's, in exactly the sense `(ssize)`
+  is: only `writeCortexMImage` knows the final layout, so it emits a MOVW/MOVT
+  pair of fixed width and patches it, the same way it patches every global's
+  address. Arkham writes the instructions; nifasm fills in its own numbers.
+
+  The cut between "copy" and "zero" is the HIGH-WATER MARK of the initialized
+  bytes, not a partition of the globals. Offsets are assigned as the gvar decls
+  are scanned and every address site is patched against them long before the
+  split is computed, so re-sorting is not available — and the scan order is not
+  the declaration order either. A zero global that lands between two initialized
+  ones is therefore copied rather than zeroed: flash wasted, never correctness,
+  since the byte copied is the zero the image already holds. Two offset cursors
+  at scan time would remove it.
+
+  What made this worth doing now rather than at the end is the SRAM segment:
+  it now declares `p_memsz` and **no file bytes at all**. Until then QEMU's
+  `-kernel` placed the initialized globals itself, so a copy loop that did
+  nothing would have passed every fixture in both corpora. It does not any more —
+  `gvar_fnptr_init` calls through a global function pointer that is zero without
+  the copy, and the fault is immediate. `tests/arkham_m/global_data_init` pins
+  down the split's arithmetic specifically.
+
+  The ZERO loop remains unobserved by the corpus: QEMU hands the guest zeroed
+  RAM, so a `.bss` that is never written reads correct anyway. It is right by
+  construction and by the layout arithmetic the fixture checks — not by
+  execution, and this note is here rather than in a comment because no test will
+  fail if it breaks.

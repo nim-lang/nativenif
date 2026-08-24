@@ -495,6 +495,10 @@ type
     AlignX = (ord(AlignTagId), "align")  ## stack-slot alignment annotation (child of `(s)`)
     SsizeX = (ord(SsizeTagId), "ssize")  ## stack size expression; the optional `N` adds N bytes at THIS site only (the prologue folds its 16-alignment pad in)
     CsizeX = (ord(CsizeTagId), "csize")  ## call stack size expression
+    DataloadX = (ord(DataloadTagId), "dataload")  ## Cortex-M: flash address the `.data` initializer image is loaded from
+    DatavmaX = (ord(DatavmaTagId), "datavma")  ## Cortex-M: SRAM address `.data` occupies at run time
+    DatasizeX = (ord(DatasizeTagId), "datasize")  ## Cortex-M: bytes to copy from `(dataload)` to `(datavma)`
+    BsssizeX = (ord(BsssizeTagId), "bsssize")  ## Cortex-M: bytes to zero immediately above `(datavma)` + `(datasize)`
     ArgX = (ord(ArgTagId), "arg")  ## argument reference in prepare block
     ResX = (ord(ResTagId), "res")  ## result reference in prepare block
     DotX = (ord(DotTagId), "dot")  ## field access
@@ -504,7 +508,7 @@ type
     RelocX = (ord(RelocTagId), "reloc")  ## rodata relocation: bake symbol S's address at byte offset O
 
 proc rawTagIsNifasmExpr*(raw: TagEnum): bool {.inline.} =
-  raw in {AlignTagId, SsizeTagId, CsizeTagId, ArgTagId, ResTagId, DotTagId, AtTagId, MemTagId, CastTagId, RelocTagId}
+  raw in {AlignTagId, SsizeTagId, CsizeTagId, DataloadTagId, DatavmaTagId, DatasizeTagId, BsssizeTagId, ArgTagId, ResTagId, DotTagId, AtTagId, MemTagId, CastTagId, RelocTagId}
 
 type
   X64Flag* = enum

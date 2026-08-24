@@ -487,6 +487,12 @@ type
                                   # `(mem (sp)(arg pN))` with no per-call `sub sp`.
     csizePatches: seq[(int, int)] # (position, callStackDepth) for csize patches
     gvarSites: seq[(int, Symbol)] # (adrp position in .text, gvar symbol) for adrp+add patching
+    mimgSites: seq[(int, MimgKind)]
+                                  # Cortex-M: (MOVW position in .text, which layout number).
+                                  # Patched by `writeCortexMImage` for the same reason
+                                  # `gvarSites` is — the value is a final-layout fact, and
+                                  # the MOVW+MOVT pair it patches is a fixed 8 bytes
+                                  # whatever the number turns out to be.
     tlvSites: seq[(int, Symbol)]  # (adrp position in .text, tvar symbol) for TLV descriptor adrp+add patching (arm64/macOS)
     tlvSyms: seq[Symbol]          # thread-local vars in descriptor order (arm64/macOS); sym.offset = descriptor index, sym.size = byte offset within the per-thread region
     tlvData: seq[byte]            # the __thread_data init template (concatenated per-thread initial values, arm64/macOS)
@@ -601,8 +607,20 @@ type
     okMem       # Memory operand
     okSsize     # Stack size placeholder (patched later)
     okCsize     # Call stack argument size
+    okMimg      # Cortex-M: one of the four image-layout numbers (patched later)
     okArg       # Argument reference in prepare block
     okLabel     # Label reference
+
+  MimgKind = enum
+    ## The four numbers the Cortex-M startup code needs and only the IMAGE WRITER
+    ## knows: where `.data`'s initializer image was placed in flash, where it
+    ## belongs at run time, and how many bytes of each region there are. They are
+    ## nifasm's own layout, exactly as `(ssize)` is nifasm's own frame — which is
+    ## why they are numbers arkham asks for rather than numbers arkham computes.
+    mikDataLoad     # LMA: the flash address the initializer image sits at
+    mikDataVma      # VMA: the SRAM address `.data` occupies at run time
+    mikDataSize     # bytes to copy from the LMA to the VMA
+    mikBssSize      # bytes to zero, immediately above VMA + dataSize
 
   Operand = object
     kind: OperandKind
@@ -4265,6 +4283,7 @@ type
     isCode: bool          ## the label names CODE (a proc), not data. Its address
                           ## must carry the Thumb bit — see `rkTMovwMovtFunc`.
     gvarSym: Symbol       ## non-nil if the operand is a global's (.bss) address
+    mimg: MimgKind        ## for an `okMimg` operand: WHICH layout number it is
 
 proc mRegType(): Type {.inline.} =
   ## The "any type that fits a register" type, at the Cortex-M width. 32, not 64:
@@ -4396,6 +4415,18 @@ proc parseOperandM(n: var Cursor; ctx: var GenContext): OperandM =
         if n.hasMore and n.kind == IntLit:
           result.immVal = getInt(n)
           inc n
+    elif t in {DataloadTagId, DatavmaTagId, DatasizeTagId, BsssizeTagId}:
+      # The four image-layout numbers the startup code copies and zeroes with.
+      # Same contract as `(ssize)`: a value only the final layout knows, so what
+      # is emitted here is a placeholder of FIXED width and a recorded site.
+      result.kind = okMimg
+      result.mimg =
+        if t == DataloadTagId: mikDataLoad
+        elif t == DatavmaTagId: mikDataVma
+        elif t == DatasizeTagId: mikDataSize
+        else: mikBssSize
+      result.typ = Type(kind: TypeKind.IntLitT, bits: 32)
+      inc n
     elif t == CastTagId:
       # `(cast T <operand>)` — a RETYPE, no instruction. Reinterpreting a register
       # as `(aptr T)` is how the code generator reaches an array through a pointer,
@@ -4902,6 +4933,13 @@ proc loadToRegM(ctx: var GenContext; dest: thumb2.Register; op: OperandM; n: Cur
     # instruction — which is what lets this work at all, since every label
     # position downstream is already fixed by then.
     ctx.ssizePatches.add((ctx.buf.data.len, int(op.immVal)))
+    thumb2.emitMovImm16(ctx.buf.data, dest, 0)
+    thumb2.emitMovt(ctx.buf.data, dest, 0)
+  of okMimg:
+    # An image-layout number, for the same reason and by the same means: the
+    # value is decided by `writeCortexMImage`, and the MOVW/MOVT pair reserves a
+    # fixed 8 bytes so patching never moves a label.
+    ctx.mimgSites.add((ctx.buf.data.len, op.mimg))
     thumb2.emitMovImm16(ctx.buf.data, dest, 0)
     thumb2.emitMovt(ctx.buf.data, dest, 0)
   of okMem:
@@ -10540,15 +10578,18 @@ proc setupTls(ctx: var GenContext) =
 
 proc writeCortexMImage(a: var GenContext; code: seq[byte];
                        entryOff: int): seq[byte] =
-  ## The finished firmware: a vector table plus code at the flash base, and the
-  ## globals as a second segment in SRAM.
+  ## The finished firmware: a vector table, the code, and the `.data` initializer
+  ## image all at the flash base, plus a second segment declaring the SRAM region
+  ## the globals occupy at run time.
   ##
-  ## `.bss` is emitted FILE-BACKED (filesz == memsz) rather than as a NOBITS
-  ## region. That costs image size but is correct everywhere: a NOBITS segment
-  ## relies on the loader zeroing it, which QEMU's `-kernel` does and a real chip
-  ## emphatically does not — real firmware zeroes `.bss` in its reset handler,
-  ## and that startup code is M6's business. Baking the bytes means the two
-  ## behave identically until then.
+  ## The SRAM segment carries NO file bytes — `p_filesz` is 0 and only `p_memsz`
+  ## is declared. Its contents are established by the image itself, in the startup
+  ## code arkham emits at the top of the entry proc: copy `(datasize)` bytes from
+  ## `(dataload)` to `(datavma)`, then zero `(bsssize)` bytes above them. That is
+  ## what a real chip needs (RAM holds nothing at reset and there is no loader to
+  ## ask), and it is also what makes the copy TESTED — a file-backed SRAM segment
+  ## let QEMU's `-kernel` place the initialized globals itself, so a broken copy
+  ## loop would pass every fixture in the corpus.
   finalize(a.bssBuf)
   var bssImage: seq[byte] = @[]
   if a.bssOffset > 0:
@@ -10636,13 +10677,70 @@ proc writeCortexMImage(a: var GenContext; code: seq[byte];
     bytes.patchThumbMovwMovtPair(0, bssVaddr + uint32(sym.size))
     for i in 0 ..< 8: patched[pos + i] = bytes[i]
 
+  # ── the .data / .bss split ────────────────────────────────────────────────
+  # Everything above lives in ONE flat SRAM region, and every `movw/movt` site
+  # just patched addresses it by offset from `bssVaddr`. That does not change.
+  # What changes is where the region's INITIAL CONTENTS come from: a chip's RAM
+  # holds nothing at reset, so the initialized part has to be a copy from flash
+  # and the rest has to be zeroed — by the image itself, since there is no loader
+  # to do it. `(dataload)`/`(datavma)`/`(datasize)`/`(bsssize)` are those four
+  # numbers, and this is the only place that knows them.
+  #
+  # The cut is the HIGH-WATER MARK of the initialized bytes, not a partition of
+  # the globals. Offsets were assigned as the gvar decls were scanned and every
+  # `movw/movt` site above has already been patched against them, so re-sorting
+  # here is not available — and the scan order is not the declaration order
+  # either (arkham walks a table), so there is no order to exploit. A zero global
+  # that lands between two initialized ones is therefore COPIED rather than
+  # zeroed. That costs flash and never correctness: the byte copied is the zero
+  # the image already holds for it. Assigning `.data` and `.bss` offsets from
+  # separate cursors AT SCAN TIME is what would remove the waste.
+  #
+  # A zero-VALUED entry in `bssInits` does not raise the mark: whichever side of
+  # the cut it lands on writes a zero there.
+  var dataHigh = 0
+  for it in a.bssInits:
+    if it.val != 0: dataHigh = max(dataHigh, int(it.off) + it.size)
+  for it in a.bssSymInits:
+    dataHigh = max(dataHigh, int(it.off) + it.size)
+  let ramSize = (a.bssOffset + 3) and not 3
+  let dataInitSize = min((dataHigh + 3) and not 3, ramSize)
+  let bssZeroSize = ramSize - dataInitSize
+
   var image = elf32.initVectorTable(elf32.DefaultStackTop,
                               codeVaddr + uint32(elf32.VectorTableSize + entryOff))
+  # The initializer image is appended AFTER the code, 4-aligned so the startup
+  # copy — which moves whole words — reads aligned on both sides.
+  let codeEnd = elf32.VectorTableSize + patched.len
+  let dataLoadOff = (codeEnd + 3) and not 3
+  let dataLoadAddr = codeVaddr + uint32(dataLoadOff)
+
+  # Now every number is known, so fill in the sites the startup code left blank.
+  for (pos, which) in a.mimgSites:
+    if pos + 8 > patched.len: continue
+    let v = case which
+            of mikDataLoad: dataLoadAddr
+            of mikDataVma: bssVaddr
+            of mikDataSize: uint32(dataInitSize)
+            of mikBssSize: uint32(bssZeroSize)
+    var bytes = initBytes()
+    for i in 0 ..< 8: bytes.add patched[pos + i]
+    bytes.patchThumbMovwMovtPair(0, v)
+    for i in 0 ..< 8: patched[pos + i] = bytes[i]
+
   image.add patched
+  while image.len < dataLoadOff: image.add 0'u8
+  for i in 0 ..< dataInitSize:
+    image.add (if i < bssImage.len: bssImage[i] else: 0'u8)
+
   var segs = @[elf32.Segment(vaddr: codeVaddr, data: image, memSize: image.len,
                        flags: elf32.PF_R or elf32.PF_W or elf32.PF_X)]
-  if bssImage.len > 0:
-    segs.add elf32.Segment(vaddr: bssVaddr, data: bssImage, memSize: bssImage.len,
+  if ramSize > 0:
+    # NO file-backed bytes: `data` is empty and only `memSize` is declared. That
+    # is what makes the copy loop above LOAD-BEARING rather than decorative —
+    # QEMU's `-kernel` would otherwise place the initialized globals itself and a
+    # broken copy would still pass every fixture in the corpus.
+    segs.add elf32.Segment(vaddr: bssVaddr, data: @[], memSize: ramSize,
                      flags: elf32.PF_R or elf32.PF_W)
   result = elf32.writeElf32(segs, codeVaddr + uint32(elf32.VectorTableSize + entryOff))
 

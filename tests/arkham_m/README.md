@@ -25,3 +25,12 @@ are excluded on purpose rather than counted as backend failures:
 
 A hand-written 32-bit equivalent of each would be worth having; the converted
 ones are not it.
+
+## Fixtures written by hand
+
+* **`global_data_init`** is the geometry of the `.data`/`.bss` split (M6). Four
+  globals — initialized, zero, initialized, zero — so that one zero global falls
+  INSIDE the copied region and one falls above it, and the fixture checks all
+  four values. It is the arithmetic of the split that this pins down; the copy
+  itself is exercised by every initialized-global fixture in both corpora, since
+  the SRAM segment carries no file bytes for QEMU to place.

@@ -42,6 +42,10 @@ nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
 | `(align N)`            | NifasmExpr                  | stack-slot alignment annotation (child of `(s)`) |
 | `(ssize)` / `(ssize N)` | NifasmExpr                 | stack size expression; the optional `N` adds N bytes at THIS site only (the prologue folds its 16-alignment pad in) |
 | `(csize)`              | NifasmExpr                  | call stack size expression |
+| `(dataload)`           | NifasmExpr                  | Cortex-M: flash address the `.data` initializer image is loaded from |
+| `(datavma)`            | NifasmExpr                  | Cortex-M: SRAM address `.data` occupies at run time |
+| `(datasize)`           | NifasmExpr                  | Cortex-M: bytes to copy from `(dataload)` to `(datavma)` |
+| `(bsssize)`            | NifasmExpr                  | Cortex-M: bytes to zero immediately above `(datavma)` + `(datasize)` |
 | `(arg S)`              | NifasmExpr                  | argument reference in prepare block |
 | `(res S)`              | NifasmExpr                  | result reference in prepare block |
 | `(prepare S ...)`      | X64Inst, A64Inst, MInst | prepare block for function call |

@@ -1417,6 +1417,58 @@ template emitLoop(g: var CodeGen; body: untyped) =
     g.ab.tree StmtsA64:
       body
 
+proc emStartupInitM(g: var CodeGen) =
+  ## The reset handler's first duty: give SRAM the contents the program expects
+  ## to find there.
+  ##
+  ## A hosted program is handed a laid-out address space by its loader. A firmware
+  ## image is handed a chip: flash holds everything the image shipped with, RAM
+  ## holds nothing at all, and `var counter = 7` has to become a 7 in RAM by some
+  ## instruction that actually runs. So the initialized globals travel in flash as
+  ## an image and are COPIED, and the rest of the region is ZEROED — the two loops
+  ## below, in that order, because the second starts where the first stopped.
+  ##
+  ## All four numbers come from nifasm (`writeCortexMImage`), which is the only
+  ## party that knows them: it decides where the initializer image lands in flash
+  ## and where the region sits in SRAM. Same contract as `(ssize)` — arkham writes
+  ## the instructions, nifasm fills in its own layout.
+  ##
+  ## r0–r3 only, and no frame: this runs before the prologue, where lr holds no
+  ## return address and RAM is not yet trustworthy enough to push onto. Both counts
+  ## are whole words, so the loops need no tail.
+  let lDataDone = g.freshLabel()
+  let lBssDone = g.freshLabel()
+  g.ab.tree MovA64: (g.ab.reg R0; g.ab.keyword DataloadX)   # flash source
+  g.ab.tree MovA64: (g.ab.reg R1; g.ab.keyword DatavmaX)    # SRAM destination
+  g.ab.tree MovA64: (g.ab.reg R2; g.ab.keyword DatasizeX)   # bytes to copy
+  g.emitLoop:
+    g.ab.tree CmpA64: (g.ab.reg R2; g.ab.intLit 0)
+    g.emBr(BeqA64, lDataDone)
+    g.ab.tree LdrA64:
+      g.ab.reg R3
+      g.ab.tree MemX: (g.ab.reg R0; g.ab.intLit 0)
+    g.ab.tree StrA64:
+      g.ab.tree MemX: (g.ab.reg R1; g.ab.intLit 0)
+      g.ab.reg R3
+    g.ab.tree AddA64: (g.ab.reg R0; g.ab.intLit 4)
+    g.ab.tree AddA64: (g.ab.reg R1; g.ab.intLit 4)
+    g.ab.tree SubA64: (g.ab.reg R2; g.ab.intLit 4)
+  g.emLab(lDataDone)
+  # r1 stopped exactly one byte past `.data`, which is where `.bss` begins — so
+  # the zero loop needs no address of its own, and cannot disagree with the copy
+  # about where the boundary was.
+  g.ab.tree MovA64: (g.ab.reg R2; g.ab.keyword BsssizeX)
+  g.ab.tree MovA64: (g.ab.reg R3; g.ab.intLit 0)
+  g.emitLoop:
+    g.ab.tree CmpA64: (g.ab.reg R2; g.ab.intLit 0)
+    g.emBr(BeqA64, lBssDone)
+    g.ab.tree StrA64:
+      g.ab.tree MemX: (g.ab.reg R1; g.ab.intLit 0)
+      g.ab.reg R3
+    g.ab.tree AddA64: (g.ab.reg R1; g.ab.intLit 4)
+    g.ab.tree SubA64: (g.ab.reg R2; g.ab.intLit 4)
+  g.emLab(lBssDone)
+
 # ── the atomic rows (`{.intrinsic: "AtomicX".}` → AArch64 LL/SC loops) ─────────
 # AArch64 has no lock prefix: every read-modify-write is a load-exclusive /
 # store-exclusive retry loop, and the acquire/release forms (`ldaxr`/`stlxr`)
@@ -7136,7 +7188,13 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; declarative: bool;
       # Before anything else, including the prologue: the frame may already save
       # a callee-saved FPv4-SP register, and that store is itself a floating-point
       # instruction.
-      if g.thumbM and info.isEntry: g.emEnableFpuM()
+      if g.thumbM and info.isEntry:
+        # Before the FPU, and before the frame: the prologue may save a
+        # callee-saved register into RAM this has not established yet, and
+        # `emEnableFpuM` reads and writes CPACR through r0/r1, which the copy
+        # loop is finished with by then.
+        g.emStartupInitM()
+        g.emEnableFpuM()
       if g.hasFrame: framePush(g)
       if g.plan.hasStackVars:
         g.ab.tree SubA64: g.ab.reg SP; g.ab.keyword SsizeX
