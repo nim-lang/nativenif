@@ -638,6 +638,8 @@ type
     mikDataVma      # VMA: the SRAM address `.data` occupies at run time
     mikDataSize     # bytes to copy from the LMA to the VMA
     mikBssSize      # bytes to zero, immediately above VMA + dataSize
+    mikHeapStart    # the heap the board layout reserved
+    mikHeapSize     # and how many bytes of it there are
 
   Operand = object
     kind: OperandKind
@@ -4434,7 +4436,8 @@ proc parseOperandM(n: var Cursor; ctx: var GenContext): OperandM =
         if n.hasMore and n.kind == IntLit:
           result.immVal = getInt(n)
           inc n
-    elif t in {DataloadTagId, DatavmaTagId, DatasizeTagId, BsssizeTagId}:
+    elif t in {DataloadTagId, DatavmaTagId, DatasizeTagId, BsssizeTagId,
+               HeapstartTagId, HeapsizeTagId}:
       # The four image-layout numbers the startup code copies and zeroes with.
       # Same contract as `(ssize)`: a value only the final layout knows, so what
       # is emitted here is a placeholder of FIXED width and a recorded site.
@@ -4443,7 +4446,9 @@ proc parseOperandM(n: var Cursor; ctx: var GenContext): OperandM =
         if t == DataloadTagId: mikDataLoad
         elif t == DatavmaTagId: mikDataVma
         elif t == DatasizeTagId: mikDataSize
-        else: mikBssSize
+        elif t == BsssizeTagId: mikBssSize
+        elif t == HeapstartTagId: mikHeapStart
+        else: mikHeapSize
       result.typ = Type(kind: TypeKind.IntLitT, bits: 32)
       inc n
     elif t == CastTagId:
@@ -10960,6 +10965,8 @@ proc writeCortexMImage(a: var GenContext; code: seq[byte];
             of mikDataVma: bssVaddr
             of mikDataSize: uint32(dataInitSize)
             of mikBssSize: uint32(bssZeroSize)
+            of mikHeapStart: heapBase
+            of mikHeapSize: a.board.heapSize
     var bytes = initBytes()
     for i in 0 ..< 8: bytes.add patched[pos + i]
     bytes.patchThumbMovwMovtPair(0, v)

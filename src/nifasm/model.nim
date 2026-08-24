@@ -513,6 +513,8 @@ type
     DataloadX = (ord(DataloadTagId), "dataload")  ## Cortex-M: flash address the `.data` initializer image is loaded from
     DatavmaX = (ord(DatavmaTagId), "datavma")  ## Cortex-M: SRAM address `.data` occupies at run time
     DatasizeX = (ord(DatasizeTagId), "datasize")  ## Cortex-M: bytes to copy from `(dataload)` to `(datavma)`
+    HeapstartX = (ord(HeapstartTagId), "heapstart")  ## Cortex-M: the address of the heap the board layout reserved. A link-time constant the runtime cannot compute — a firmware image has no OS to ask for pages
+    HeapsizeX = (ord(HeapsizeTagId), "heapsize")  ## Cortex-M: how many bytes of it there are
     BsssizeX = (ord(BsssizeTagId), "bsssize")  ## Cortex-M: bytes to zero immediately above `(datavma)` + `(datasize)`
     ArgX = (ord(ArgTagId), "arg")  ## argument reference in prepare block
     ResX = (ord(ResTagId), "res")  ## result reference in prepare block
@@ -523,7 +525,7 @@ type
     RelocX = (ord(RelocTagId), "reloc")  ## rodata relocation: bake symbol S's address at byte offset O
 
 proc rawTagIsNifasmExpr*(raw: TagEnum): bool {.inline.} =
-  raw in {OriginTagId, BytesTagId, KilobytesTagId, MegabytesTagId, SlotsTagId, TlsTagId, AlignTagId, SsizeTagId, CsizeTagId, DataloadTagId, DatavmaTagId, DatasizeTagId, BsssizeTagId, ArgTagId, ResTagId, DotTagId, AtTagId, MemTagId, CastTagId, RelocTagId}
+  raw in {OriginTagId, BytesTagId, KilobytesTagId, MegabytesTagId, SlotsTagId, TlsTagId, AlignTagId, SsizeTagId, CsizeTagId, DataloadTagId, DatavmaTagId, DatasizeTagId, HeapstartTagId, HeapsizeTagId, BsssizeTagId, ArgTagId, ResTagId, DotTagId, AtTagId, MemTagId, CastTagId, RelocTagId}
 
 type
   X64Flag* = enum

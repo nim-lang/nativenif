@@ -60,6 +60,8 @@ nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
 | `(dataload)`           | NifasmExpr                  | Cortex-M: flash address the `.data` initializer image is loaded from |
 | `(datavma)`            | NifasmExpr                  | Cortex-M: SRAM address `.data` occupies at run time |
 | `(datasize)`           | NifasmExpr                  | Cortex-M: bytes to copy from `(dataload)` to `(datavma)` |
+| `(heapstart)`          | NifasmExpr                  | Cortex-M: the address of the heap the board layout reserved. A link-time constant the runtime cannot compute — a firmware image has no OS to ask for pages |
+| `(heapsize)`           | NifasmExpr                  | Cortex-M: how many bytes of it there are |
 | `(bsssize)`            | NifasmExpr                  | Cortex-M: bytes to zero immediately above `(datavma)` + `(datasize)` |
 | `(arg S)`              | NifasmExpr                  | argument reference in prepare block |
 | `(res S)`              | NifasmExpr                  | result reference in prepare block |

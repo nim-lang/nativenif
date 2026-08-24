@@ -6654,6 +6654,29 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
       if not (res.kind == InReg and d.kind == InReg and d.r == res.r): g.freeVal(d)
     dest = res
     return
+  if tgt.op == HeapStartOp or tgt.op == HeapSizeOp:
+    # Before the generic tail, which reads `argCurs[0]`: these take no operands.
+    #
+    # A link-time constant: nifasm knows where the layout put the heap, and the
+    # runtime cannot compute it — a firmware image has no OS to ask. Same shape as
+    # `(dataload)`: a MOVW/MOVT pair the image writer patches.
+    if not g.thumbM:
+      lengError c, "`" & IntrinsicNames[tgt.op] & "` is the heap a BOARD LAYOUT " &
+                "reserved; a hosted target gets its pages from the OS instead",
+                lengInfo(c)
+    if not g.board.given:
+      lengError c, "`" & IntrinsicNames[tgt.op] & "` needs a board layout — pass " &
+                "`--layout:<file>` so there IS a reserved heap to name",
+                lengInfo(c)
+    if g.board.heapRegion.len == 0:
+      lengError c, "the board layout reserves no heap, so `" &
+                IntrinsicNames[tgt.op] & "` has nothing to answer with",
+                lengInfo(c)
+    g.ab.tree MovA64:
+      g.emReg res.r
+      g.ab.keyword (if tgt.op == HeapStartOp: HeapstartX else: HeapsizeX)
+    dest = res
+    return
   if res.kind != InReg:
     raiseAssert "arkham a64n: intrinsic result is not in a register"
   let a0 = g.plan.planned(cursorToPosition(g.buf[], argCurs[0]))

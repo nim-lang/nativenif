@@ -107,6 +107,31 @@ while threads may run on PSP, so masking SP inside one yields the handler's slot
 not the interrupted thread's — and in the simple case where everything runs on MSP
 it would *appear* to work and break the day PSP is adopted.
 
+## The heap
+
+`(heap <region> <size>)` is what the allocator gets pages from. There is no
+`.bss` array standing in for it: an array would be a second answer to "how much
+RAM may the allocator have?", and the file already answers that in the same place
+it sizes the stacks and bounds the globals — so the three cannot silently add up
+to more than the part has.
+
+`lib/std/system/osalloc` reaches it through two intrinsics, `HeapStart` and
+`HeapSize`, which arkham lowers to the same MOVW/MOVT pair the image writer
+patches for `(dataload)`. They are link-time constants: a firmware image has no OS
+to ask for pages, so the numbers cannot be computed at run time and are not the
+runtime's to invent. Naming one without a `--layout:` is an error rather than a
+default.
+
+The page allocator is a bump: `osDeallocPages` can only give back the last thing
+it handed out, and anything else stays lost until reset. That is the trade for a
+page allocator with no bookkeeping of its own, and `alloc.nim` recycles within its
+own chunks regardless.
+
+A heap SHARED between threads additionally needs atomics — `alloc.nim`'s
+lock-free paths are behind `hasThreadSupport` — and ARMv7-M `ldrex`/`strex` are
+not implemented yet. Single-threaded is what works today; a threaded image is
+refused by name at the first atomic rather than racing.
+
 ## Console
 
 `(console semihosting)` traps to a debug agent; `(console uart (origin …))` writes

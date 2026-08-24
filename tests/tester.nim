@@ -1140,7 +1140,36 @@ proc cortexMLayoutTests() =
            ", want 0x2000BE00"
   inc passed
 
-  # ── 3. what the file refuses ──
+  # ── 3. the heap the layout reserved, read back by the code that uses it ──
+  # `HeapStart`/`HeapSize` are link-time constants the image writer patches, and
+  # they are how `osalloc` gets pages on a target with no OS to ask. The probe
+  # exits with `heapStart - ramBase`, so a wrong ADDRESS is a wrong exit code
+  # rather than a crash somewhere later; a wrong SIZE exits 12.
+  block:
+    let asmNif = workDir / "heap_probe.asm.nif"
+    let elf = workDir / "heap_probe.elf"
+    exec quoteShell(arkham) & " -a:cortex_m --layout:" &
+         quoteShell("tests" / "layout" / "mps2.nif") & " -o:" & quoteShell(asmNif) &
+         " " & quoteShell("tests" / "layout" / "heap_probe.c.nif")
+    exec quoteShell(nifasmExe) & " -o:" & quoteShell(elf) & " " & quoteShell(asmNif)
+    var hargs: seq[string] = @[]
+    for a in cortexMArgs: hargs.add a
+    hargs.add elf
+    let (hout, hcode) = runProgram(qemu, hargs)
+    if hcode == 12:
+      quit "FAILURE cortex-m layout: HeapSize is not the 16K the board reserved"
+    if hcode != 0:
+      quit "FAILURE cortex-m layout: heap starts " & $hcode & " bytes above the " &
+           "RAM base; this module has no globals, so it should start AT it\n" & hout
+  # Without a layout there is no reserved heap to name, and saying so beats
+  # answering with a compiled-in default.
+  execExpectFailure(quoteShell(arkham) & " -a:cortex_m -o:" &
+                    quoteShell(workDir / "x.asm.nif") & " " &
+                    quoteShell("tests" / "layout" / "heap_probe.c.nif"),
+                    "needs a board layout")
+  inc passed
+
+  # ── 4. what the file refuses ──
   # The power-of-two rule is the one the whole thread-local scheme rests on: a
   # thread reaches its own slot by masking SP with the slot size.
   let bad = workDir / "bad_layout.nif"
@@ -1173,7 +1202,7 @@ proc cortexMLayoutTests() =
                     quoteShell(workDir / "x.asm.nif") & " " & quoteShell(src),
                     "both name a console")
   inc passed
-  echo passed, " / 3 Cortex-M layout-file tests successful"
+  echo passed, " / 4 Cortex-M layout-file tests successful"
 
 
 proc cortexMMemMapTests() =
