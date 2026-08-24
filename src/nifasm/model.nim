@@ -477,12 +477,13 @@ type
     ResultD = (ord(ResultTagId), "result")  ## result value declaration
     ClobberD = (ord(ClobberTagId), "clobber")  ## clobbered registers list
     VarD = (ord(VarTagId), "var")  ## variable declaration
-    LayoutD = (ord(LayoutTagId), "layout")  ## Cortex-M: the board's memory layout, as arkham read it out of the `--layout:` file and forwarded. Children are the `flash`/`sram`/`writesTo`/`stacks`/`heap`/`core` rows below. There is no row saying which region a section lives in: code and constants go where the image is, mutable storage goes where nothing is, and a row restating that would only be a chance to write it wrong. Supersedes the memory-map command-line flags
+    LayoutD = (ord(LayoutTagId), "layout")  ## Cortex-M: the board's memory layout, as arkham read it out of the `--layout:` file and forwarded. Children are the `flash`/`sram`/`writesTo`/`stacks`/`heap`/`noinit`/`core` rows below. There is no row saying which region a section lives in: code and constants go where the image is, mutable storage goes where nothing is, and a row restating that would only be a chance to write it wrong. Supersedes the memory-map command-line flags
     FlashD = (ord(FlashTagId), "flash")  ## Cortex-M: the region the IMAGE SHIPS IN — code, constants, and the initializer image for globals — as a `(startAddress …)` and one size row. Named for the part rather than for a permission: whether the silicon is writable is beside the point (MPS2's region at 0 is ZBT SRAM), what matters is that its contents survive reset
     SramD = (ord(SramTagId), "sram")  ## Cortex-M: the region that holds NOTHING at reset — globals, stacks, heap — as a `(startAddress …)` and one size row. Everything in it is established by the startup code
     WritesToD = (ord(WritesToTagId), "writesTo")  ## Cortex-M: what `write` is implemented as, and with it how `exit` ends. `IDENT` is `debugger` (trap to a debug agent; no further children) or `serial`, which drives a CMSDK UART and takes its `(startAddress …)`. Both name what must be ATTACHED, which is the thing that is actually got wrong
     StacksD = (ord(StacksTagId), "stacks")  ## Cortex-M: the per-thread stack slots, in `sram` — a `(slots N)`, one size row for the SLOT, and a `(tvar …)`. The slot size must be a power of two: a thread reaches its own thread-locals by masking SP with it
     HeapD = (ord(HeapTagId), "heap")  ## Cortex-M: the heap, in `sram` — one size row. This is what the allocator gets pages from; there is no array in the globals standing in for it
+    NoinitD = (ord(NoinitTagId), "noinit")  ## Cortex-M: bytes at the TOP of `sram` that the startup code neither copies into nor zeroes — one size row. Everything else in `sram` is established at reset, which is exactly what a reboot counter or a crash record must NOT be: it is written by the run that failed and read by the run after it. Survives a WARM reset only; a part with battery-backed SRAM keeps its contents across power loss too, and that is a different guarantee
     CoreD = (ord(CoreTagId), "core")  ## Cortex-M: which stack slot THIS image boots on. One image per core, so the number is a constant the author knows and not something read from a CPUID register — M-profile has no architectural core id
     InterruptsD = (ord(InterruptsTagId), "interrupts")  ## Cortex-M: the interrupt table, as `(irq N S)` children — handler `S` occupies architectural table slot `N`. Slots the module does not name stay zero. Slots 0 and 1 are the image writer's (initial MSP, reset) and may not appear
     IrqD = (ord(IrqTagId), "irq")  ## Cortex-M: one interrupt-table entry — slot number, then the handler symbol. Its address is baked with the Thumb bit, like every other code address on this target
@@ -498,7 +499,7 @@ type
     LenientD = (ord(LenientTagId), "lenient")  ## proc pragma (after the clobber section): the body is MACHINE-PORTED code (e.g. distilled from gcc), so the structural disciplines are off for this one proc — backward jumps to labels are allowed (no `(loop)` required), registers may be used raw even when bound (params, r11), a bare `(call P)`/`(jmp P)` to a proc needs no `(prepare)`, and the type/clobber checks are skipped. The checks exist to catch code-GENERATOR bugs; ported code was already correct on the machine it came from
 
 proc rawTagIsNifasmDecl*(raw: TagEnum): bool {.inline.} =
-  raw in {TypeTagId, ProcTagId, ParamsTagId, ParamTagId, ResultTagId, ClobberTagId, VarTagId, LayoutTagId, FlashTagId, SramTagId, WritesToTagId, StacksTagId, HeapTagId, CoreTagId, InterruptsTagId, IrqTagId, ArchTagId, CfvarTagId, RodataTagId, GvarTagId, TvarTagId, ImpTagId, ExtprocTagId, SyprocTagId, RegsTagId, LenientTagId}
+  raw in {TypeTagId, ProcTagId, ParamsTagId, ParamTagId, ResultTagId, ClobberTagId, VarTagId, LayoutTagId, FlashTagId, SramTagId, WritesToTagId, StacksTagId, HeapTagId, NoinitTagId, CoreTagId, InterruptsTagId, IrqTagId, ArchTagId, CfvarTagId, RodataTagId, GvarTagId, TvarTagId, ImpTagId, ExtprocTagId, SyprocTagId, RegsTagId, LenientTagId}
 
 type
   NifasmExpr* = enum
@@ -516,6 +517,8 @@ type
     DatasizeX = (ord(DatasizeTagId), "datasize")  ## Cortex-M: bytes to copy from `(dataload)` to `(datavma)`
     HeapstartX = (ord(HeapstartTagId), "heapstart")  ## Cortex-M: the address of the heap the board layout reserved. A link-time constant the runtime cannot compute — a firmware image has no OS to ask for pages
     HeapsizeX = (ord(HeapsizeTagId), "heapsize")  ## Cortex-M: how many bytes of it there are
+    NoinitstartX = (ord(NoinitstartTagId), "noinitstart")  ## Cortex-M: the address of the region the board layout kept back from the startup code. A link-time constant for the same reason `(heapstart)` is: only the image writer knows where it landed
+    NoinitsizeX = (ord(NoinitsizeTagId), "noinitsize")  ## Cortex-M: how many bytes of it there are
     BsssizeX = (ord(BsssizeTagId), "bsssize")  ## Cortex-M: bytes to zero immediately above `(datavma)` + `(datasize)`
     ArgX = (ord(ArgTagId), "arg")  ## argument reference in prepare block
     ResX = (ord(ResTagId), "res")  ## result reference in prepare block
@@ -527,7 +530,7 @@ type
     RelocX = (ord(RelocTagId), "reloc")  ## rodata relocation: bake symbol S's address at byte offset O
 
 proc rawTagIsNifasmExpr*(raw: TagEnum): bool {.inline.} =
-  raw in {StartAddressTagId, BytesTagId, KilobytesTagId, MegabytesTagId, SlotsTagId, AlignTagId, SsizeTagId, CsizeTagId, DataloadTagId, DatavmaTagId, DatasizeTagId, HeapstartTagId, HeapsizeTagId, BsssizeTagId, ArgTagId, ResTagId, DotTagId, AtTagId, MemTagId, TvarTagId, CastTagId, RelocTagId}
+  raw in {StartAddressTagId, BytesTagId, KilobytesTagId, MegabytesTagId, SlotsTagId, AlignTagId, SsizeTagId, CsizeTagId, DataloadTagId, DatavmaTagId, DatasizeTagId, HeapstartTagId, HeapsizeTagId, NoinitstartTagId, NoinitsizeTagId, BsssizeTagId, ArgTagId, ResTagId, DotTagId, AtTagId, MemTagId, TvarTagId, CastTagId, RelocTagId}
 
 type
   X64Flag* = enum

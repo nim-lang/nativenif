@@ -6,7 +6,7 @@
 #
 
 ## `arkham --layout:board.nif` — where this board's memory is, what its console
-## is, and where the stacks and the heap go.
+## is, and where the stacks, the heap and the region nothing initializes go.
 ##
 ## It replaces a command-line namespace that could not have grown into this:
 ## regions are a LIST, a stack slot has a size and a thread-local reservation and
@@ -61,6 +61,11 @@ type
                                      ## reaches its own thread-locals with
     tvarSize*: uint32                ## reserved at the TOP of every slot
     heapSize*: uint32                ## 0 when the file reserves no heap
+    noinitSize*: uint32              ## bytes at the TOP of sram that the startup
+                                     ## code leaves ALONE. 0 when the file keeps
+                                     ## nothing back, which is the default: a
+                                     ## region nothing initializes is a liability
+                                     ## unless something means to read it.
     core*: int                       ## which slot this image boots on
 
 proc fail(msg: string) {.noreturn.} =
@@ -163,6 +168,10 @@ proc parseLayout*(path: string): Layout =
         e.into:
           result.heapSize = readSize(e)
           while e.hasMore: skip e
+      of NoinitD:
+        e.into:
+          result.noinitSize = readSize(e)
+          while e.hasMore: skip e
       of CoreD:
         e.into:
           if e.hasMore and e.kind == IntLit: (result.core = int(e.intVal); inc e)
@@ -198,4 +207,13 @@ proc validate*(l: Layout): string =
     return "the thread-local reservation fills the whole stack slot"
   if l.core < 0 or l.core >= l.slotCount:
     return "(core " & $l.core & ") is outside the " & $l.slotCount & " slot(s) declared"
+  # Whether everything FITS is deliberately not asked here: how many bytes of
+  # globals the module has is a link-time fact, so nifasm owns that question and
+  # answers it with all of the numbers rather than some of them. What is asked is
+  # only the degenerate case, which no amount of link-time information could
+  # rescue — and which would otherwise wrap `sramEnd - noinitSize` past zero and
+  # be read as a region somewhere near the top of the address space.
+  if l.noinitSize >= l.sramSize:
+    return "the noinit region is " & $l.noinitSize & " bytes of a " & $l.sramSize &
+           "-byte sram region, leaving nothing for the image to establish"
   return ""

@@ -626,6 +626,7 @@ type
     slots*: int
     slotSize*, tvarSize*: uint32
     heapSize*: uint32
+    noinitSize*: uint32
     core*: int
 
   MimgKind = enum
@@ -640,6 +641,8 @@ type
     mikBssSize      # bytes to zero, immediately above VMA + dataSize
     mikHeapStart    # the heap the board layout reserved
     mikHeapSize     # and how many bytes of it there are
+    mikNoinitStart  # the region the startup code was told to leave alone
+    mikNoinitSize   # and how many bytes of THAT there are
 
   Operand = object
     kind: OperandKind
@@ -3118,7 +3121,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, LenientD,
      ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD,
      InterruptsD, IrqD, LayoutD, FlashD, SramD, WritesToD, StacksD, HeapD,
-     CoreD:
+     NoinitD, CoreD:
     raiseAssert("Unhandled declaration tag: " & $declTag)
 
   # See the same step in `genInstX64`: an overflowing mnemonic's id is a leading
@@ -4465,10 +4468,11 @@ proc parseOperandM(n: var Cursor; ctx: var GenContext): OperandM =
           result.immVal = getInt(n)
           inc n
     elif t in {DataloadTagId, DatavmaTagId, DatasizeTagId, BsssizeTagId,
-               HeapstartTagId, HeapsizeTagId}:
-      # The four image-layout numbers the startup code copies and zeroes with.
-      # Same contract as `(ssize)`: a value only the final layout knows, so what
-      # is emitted here is a placeholder of FIXED width and a recorded site.
+               HeapstartTagId, HeapsizeTagId, NoinitstartTagId, NoinitsizeTagId}:
+      # The image-layout numbers: the four the startup code copies and zeroes
+      # with, and the regions the layout reserved. Same contract as `(ssize)`: a
+      # value only the final layout knows, so what is emitted here is a
+      # placeholder of FIXED width and a recorded site.
       result.kind = okMimg
       result.mimg =
         if t == DataloadTagId: mikDataLoad
@@ -4476,7 +4480,9 @@ proc parseOperandM(n: var Cursor; ctx: var GenContext): OperandM =
         elif t == DatasizeTagId: mikDataSize
         elif t == BsssizeTagId: mikBssSize
         elif t == HeapstartTagId: mikHeapStart
-        else: mikHeapSize
+        elif t == HeapsizeTagId: mikHeapSize
+        elif t == NoinitstartTagId: mikNoinitStart
+        else: mikNoinitSize
       result.typ = Type(kind: TypeKind.IntLitT, bits: 32)
       inc n
     elif t == CastTagId:
@@ -7977,7 +7983,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     return
   of NoDecl:
     discard "continue with case instTag"
-  of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, LenientD, ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD, InterruptsD, IrqD, LayoutD, FlashD, SramD, WritesToD, StacksD, HeapD, CoreD:
+  of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, LenientD, ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD, InterruptsD, IrqD, LayoutD, FlashD, SramD, WritesToD, StacksD, HeapD, NoinitD, CoreD:
     error("Unexpected declaration: " & $declTag, n)
 
   # A mnemonic whose id overflowed the 9-bit tag field carries that id in a
@@ -9605,6 +9611,10 @@ proc handleLayout(n: var Cursor; ctx: var GenContext) =
       e.into:
         ctx.board.heapSize = readLayoutSize(e)
         while e.hasMore: skip e
+    of NoinitD:
+      e.into:
+        ctx.board.noinitSize = readLayoutSize(e)
+        while e.hasMore: skip e
     of CoreD:
       e.into:
         if e.hasMore and e.kind == IntLit: (ctx.board.core = int(getInt(e)); inc e)
@@ -10847,6 +10857,7 @@ proc writeCortexMImage(a: var GenContext; code: seq[byte];
   var map = map
   var stacksBase = 0'u32
   var heapBase = 0'u32
+  var noinitBase = 0'u32
   if a.board.given:
     map.flashBase = a.board.flashStart
     map.flashSize = a.board.flashSize
@@ -10858,16 +10869,29 @@ proc writeCortexMImage(a: var GenContext; code: seq[byte];
     # finds its own slot by masking SP with it. That alignment is the reason the
     # stacks go last: rounding up wastes whatever is between them and the heap,
     # and nothing after them has to pay for it.
+    #
+    # `(noinit …)` comes off the FAR END first, before any of that is placed. It
+    # has to be at a fixed address — the run that writes it and the run that reads
+    # it are different runs — and the top of the region is the only end that does
+    # not move when the globals or the heap change size. Aligned DOWN, so rounding
+    # can only give the region more than was asked for, never less.
+    let ramEnd = map.ramBase + map.ramSize
+    noinitBase = if a.board.noinitSize > 0: (ramEnd - a.board.noinitSize) and not 7'u32
+                 else: ramEnd
     let globalsEnd = map.ramBase + uint32((a.bssOffset + 3) and not 3)
     heapBase = (globalsEnd + 7) and not 7'u32
     let heapEnd = heapBase + a.board.heapSize
     stacksBase = (heapEnd + a.board.slotSize - 1) and not (a.board.slotSize - 1)
     let stacksEnd = stacksBase + uint32(a.board.slots) * a.board.slotSize
-    if stacksEnd > map.ramBase + map.ramSize or stacksEnd < stacksBase:
+    if stacksEnd > noinitBase or stacksEnd < stacksBase or noinitBase < map.ramBase:
       quit "nifasm: the layout does not fit: " & $a.bssOffset & " bytes of globals, " &
            $a.board.heapSize & " of heap and " & $a.board.slots & " stack slot(s) of " &
-           $a.board.slotSize & " reach 0x" & toHex(stacksEnd, 8) & ", past the end " &
-           "of the " & $map.ramSize & "-byte region at 0x" & toHex(map.ramBase, 8)
+           $a.board.slotSize & " reach 0x" & toHex(stacksEnd, 8) & ", past " &
+           (if a.board.noinitSize > 0:
+              "the noinit region at 0x" & toHex(noinitBase, 8) & " which is kept " &
+              "back from the top of the "
+            else: "the end of the ") &
+           $map.ramSize & "-byte region at 0x" & toHex(map.ramBase, 8)
     # This image boots on ITS core's slot, and starts just below the slot's
     # thread-local reservation — which lives at the TOP, so the stack grows DOWN
     # away from it rather than into it.
@@ -11012,6 +11036,8 @@ proc writeCortexMImage(a: var GenContext; code: seq[byte];
             of mikBssSize: uint32(bssZeroSize)
             of mikHeapStart: heapBase
             of mikHeapSize: a.board.heapSize
+            of mikNoinitStart: noinitBase
+            of mikNoinitSize: a.board.noinitSize
     var bytes = initBytes()
     for i in 0 ..< 8: bytes.add patched[pos + i]
     bytes.patchThumbMovwMovtPair(0, v)

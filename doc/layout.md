@@ -32,6 +32,7 @@ is what makes that forwarding a splice rather than a translation.
  (writesTo serial (startAddress 1073758208))
  (stacks (slots 4) (kilobytes 8) (tvar (bytes 512)))
  (heap   (kilobytes 32))
+ (noinit (bytes 256))
  (core 0))
 ```
 
@@ -53,7 +54,8 @@ two numbers and the reader should not have to remember which is which.
 
 `flash` is **the region the image ships in**: code, constants, and the initializer
 image for globals. `sram` is **the region that holds nothing at reset**: globals,
-stacks, heap, all established by the startup code.
+stacks, heap, all established by the startup code — except for whatever
+`(noinit …)` keeps back from it, which is the point of that row.
 
 They are named for the parts rather than for permissions, and the imprecision is
 deliberate. Whether the silicon is writable is beside the point — MPS2's region at
@@ -74,6 +76,7 @@ the part that is genuinely ambiguous.
 
 Placed by nifasm inside `sram`, in this order:
 
+0. **`noinit`** off the far END, before anything else is placed.
 1. **globals** from the region base up — which is what every `movw`/`movt` site is
    already patched against.
 2. **the heap**, 8-aligned above them.
@@ -82,6 +85,48 @@ Placed by nifasm inside `sram`, in this order:
 The stacks go last because their alignment is the expensive one: rounding up
 wastes whatever lies between them and the heap, and nothing after them pays for
 it. An overflow of the region is a link-time error naming all four numbers.
+
+`noinit` is placed from the other end for a reason given below: its address has to
+be the same in two different runs, and the top is the only end of the region that
+does not move when the globals or the heap change size.
+
+## `noinit` — the region nothing establishes
+
+Everything else in `sram` is established at reset: `.data` is copied in from
+flash, `.bss` is zeroed. `(noinit <size>)` is the exception — bytes the startup
+code is told to leave alone.
+
+That exists for the one kind of state that must *not* be established, because it
+is **written by the run that failed and read by the run after it**:
+
+- a reboot counter, so a device that watchdog-resets every four seconds is
+  detected rather than mistaken for one that works;
+- the reset cause, so power-on and watchdog can be told apart at all;
+- a crash record — the fault address, the last checkpoint reached.
+
+Reached with `NoinitStart`/`NoinitSize`, the same shape as the heap's pair: MOVW/
+MOVT sites the image writer patches, and naming one when the file keeps nothing
+back is an error rather than a zero.
+
+**It survives a WARM reset, not a power cycle.** The RAM is not re-initialized by
+the image; it is not battery-backed either. A part with genuine backup SRAM keeps
+its contents across power loss, which is a stronger guarantee and a different
+feature — this one costs nothing but the address, and it works on every part.
+
+Two consequences of where it goes:
+
+- **Its address is stable across rebuilds** — `sramStart + sramSize - size`,
+  rounded DOWN to 8 so rounding can only give the region more than was asked for.
+  It does not move when the globals or the heap change, which is what makes a
+  record readable by the *next* firmware and not just the next boot.
+- **It moves nothing else.** Adding the row to a layout that had room does not
+  shift a global, the heap or a stack slot; the `tests/layout/stm32f407.nif` MSP
+  assertion in the test suite exists to say so. When there is *no* room, the
+  stacks are seen to run into it at link time and the error names the region.
+
+Nothing zeroes it, so the first read after a cold boot returns whatever the SRAM
+powered up with. A record kept here needs its own validity marker — a magic word,
+a checksum — and that belongs to whoever writes the record, not here.
 
 ## Stacks and thread-locals
 

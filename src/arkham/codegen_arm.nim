@@ -6656,27 +6656,37 @@ proc emitInstr2(g: var CodeGen; c: Cursor; dest: var Location) =
       if not (res.kind == InReg and d.kind == InReg and d.r == res.r): g.freeVal(d)
     dest = res
     return
-  if tgt.op == HeapStartOp or tgt.op == HeapSizeOp:
+  if tgt.op in {HeapStartOp, HeapSizeOp, NoinitStartOp, NoinitSizeOp}:
     # Before the generic tail, which reads `argCurs[0]`: these take no operands.
     #
-    # A link-time constant: nifasm knows where the layout put the heap, and the
-    # runtime cannot compute it — a firmware image has no OS to ask. Same shape as
-    # `(dataload)`: a MOVW/MOVT pair the image writer patches.
+    # Link-time constants: nifasm knows where the layout put each region, and the
+    # runtime cannot compute either — a firmware image has no OS to ask. Same
+    # shape as `(dataload)`: a MOVW/MOVT pair the image writer patches.
+    let isHeap = tgt.op in {HeapStartOp, HeapSizeOp}
     if not g.thumbM:
-      lengError c, "`" & IntrinsicNames[tgt.op] & "` is the heap a BOARD LAYOUT " &
-                "reserved; a hosted target gets its pages from the OS instead",
+      lengError c, "`" & IntrinsicNames[tgt.op] & "` is a region a BOARD LAYOUT " &
+                "reserved; a hosted target has an OS to ask for memory instead",
                 lengInfo(c)
     if not g.board.given:
       lengError c, "`" & IntrinsicNames[tgt.op] & "` needs a board layout — pass " &
-                "`--layout:<file>` so there IS a reserved heap to name",
+                "`--layout:<file>` so there IS a reserved region to name",
                 lengInfo(c)
-    if g.board.heapSize == 0:
+    if isHeap and g.board.heapSize == 0:
       lengError c, "the board layout reserves no heap, so `" &
                 IntrinsicNames[tgt.op] & "` has nothing to answer with",
                 lengInfo(c)
+    if not isHeap and g.board.noinitSize == 0:
+      lengError c, "the board layout keeps nothing back from the startup code, " &
+                "so `" & IntrinsicNames[tgt.op] & "` has nothing to answer with — " &
+                "add a `(noinit …)` row",
+                lengInfo(c)
     g.ab.tree MovA64:
       g.emReg res.r
-      g.ab.keyword (if tgt.op == HeapStartOp: HeapstartX else: HeapsizeX)
+      g.ab.keyword (case tgt.op
+                    of HeapStartOp: HeapstartX
+                    of HeapSizeOp: HeapsizeX
+                    of NoinitStartOp: NoinitstartX
+                    else: NoinitsizeX)
     dest = res
     return
   if res.kind != InReg:
@@ -7861,6 +7871,9 @@ proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         if g.board.heapSize > 0:
           g.ab.tree NifasmDecl.HeapD:
             g.ab.tree BytesX: g.ab.intLit int64(g.board.heapSize)
+        if g.board.noinitSize > 0:
+          g.ab.tree NifasmDecl.NoinitD:
+            g.ab.tree BytesX: g.ab.intLit int64(g.board.noinitSize)
         g.ab.tree NifasmDecl.CoreD: g.ab.intLit int64(g.board.core)
     # The interrupt table, as slots rather than names: WHICH slot a name denotes
     # is the machine model's answer (`machine_m.interruptSlot`), and nifasm's job

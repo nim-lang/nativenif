@@ -1139,6 +1139,23 @@ proc cortexMLayoutTests() =
     if msp != 0x2000BE00'u32:
       quit "FAILURE cortex-m layout: stm32 initial MSP 0x" & toHex(msp, 8) &
            ", want 0x2000BE00"
+    # THE POINT of that unchanged number: this board also carries a `(noinit …)`
+    # row, and the region comes off the FAR END of sram. If it were taken from
+    # anywhere the globals, the heap or the stacks are placed, this MSP would have
+    # moved — so an unmoved MSP is what says the reservation is disjoint from
+    # everything else rather than merely declared.
+    #
+    # And the SRAM segment — the bytes the startup code establishes — must END
+    # below it. That is the part that cannot be shown by running: QEMU hands the
+    # guest zeroed RAM, so a zero loop that DID reach the region would look
+    # exactly like one that did not.
+    let ramVaddr = u32At(img, 52 + 32 + 8)
+    let ramMemSz = u32At(img, 52 + 32 + 20)
+    let noinitBase = 0x20020000'u32 - 256'u32
+    if ramVaddr + ramMemSz > noinitBase:
+      quit "FAILURE cortex-m layout: the startup code establishes 0x" &
+           toHex(ramVaddr, 8) & "+" & $ramMemSz & ", which reaches the noinit " &
+           "region at 0x" & toHex(noinitBase, 8)
   inc passed
 
   # ── 3. the heap the layout reserved, read back by the code that uses it ──
@@ -1208,7 +1225,60 @@ proc cortexMLayoutTests() =
                     quoteShell(workDir / "x.asm.nif") & " " & quoteShell(src),
                     "both say where `write` goes")
   inc passed
-  echo passed, " / 4 Cortex-M layout-file tests successful"
+
+  # ── 5. the region kept back from the startup code ──
+  # `(noinit …)` is bytes at the top of `sram` that nothing establishes at reset,
+  # for the one thing that must NOT be established: a record written by the run
+  # that failed and read by the run after it.
+  #
+  # What is checked here is the ADDRESS and the SIZE, from the code that would
+  # use them. Running proves less than it looks on this target — a reset the
+  # image ignored entirely would still exit 0 — so the disjointness claim is made
+  # in section 2 against the ELF, and the RESERVATION is proved by the rejection
+  # below rather than by anything a passing run shows.
+  block:
+    let board = "tests" / "layout" / "mps2_noinit.nif"
+    let asmNif = workDir / "noinit_probe.asm.nif"
+    let elf = workDir / "noinit_probe.elf"
+    exec quoteShell(arkham) & " -a:cortex_m --layout:" & quoteShell(board) &
+         " -o:" & quoteShell(asmNif) & " " &
+         quoteShell("tests" / "layout" / "noinit_probe.c.nif")
+    exec quoteShell(nifasmExe) & " -o:" & quoteShell(elf) & " " & quoteShell(asmNif)
+    var nargs: seq[string] = @[]
+    for a in cortexMArgs: nargs.add a
+    nargs.add elf
+    let (nout, ncode) = runProgram(qemu, nargs)
+    case ncode
+    of 12: quit "FAILURE cortex-m noinit: NoinitSize is not the 256 bytes reserved"
+    of 13: quit "FAILURE cortex-m noinit: NoinitStart is not 0x2000FF00 — the " &
+                "region is not the top 256 bytes of the 64K region at 0x20000000"
+    of 14: quit "FAILURE cortex-m noinit: the region did not hold what was stored " &
+                "in it, so it is not RAM the image owns"
+    of 0: discard
+    else: quit "FAILURE cortex-m noinit: probe exited " & $ncode & "\n" & nout
+  # THE test that the reservation is real. 36K of noinit still passes arkham's
+  # whole-file check (8K of stacks plus a 16K heap plus 36K fits in 64K), and it
+  # is only at link time — where the globals and the slot-size rounding are known
+  # — that the stacks are seen to run into it. Were the region merely declared and
+  # not reserved, this would assemble.
+  block:
+    var t = readFile("tests" / "layout" / "mps2_noinit.nif")
+    t = t.replace("(noinit (bytes 256))", "(noinit (kilobytes 36))")
+    writeFile(bad, t)
+    let asmNif = workDir / "noinit_toobig.asm.nif"
+    exec quoteShell(arkham) & " -a:cortex_m --layout:" & quoteShell(bad) &
+         " -o:" & quoteShell(asmNif) & " " & quoteShell(src)
+    execExpectFailure(quoteShell(nifasmExe) & " -o:" & quoteShell(workDir / "x.elf") &
+                      " " & quoteShell(asmNif), "past the noinit region")
+  # And naming the region when the file keeps nothing back is a question with no
+  # answer, not a zero.
+  execExpectFailure(quoteShell(arkham) & " -a:cortex_m --layout:" &
+                    quoteShell("tests" / "layout" / "mps2.nif") & " -o:" &
+                    quoteShell(workDir / "x.asm.nif") & " " &
+                    quoteShell("tests" / "layout" / "noinit_probe.c.nif"),
+                    "keeps nothing back")
+  inc passed
+  echo passed, " / 5 Cortex-M layout-file tests successful"
 
 
 proc cortexMMemMapTests() =

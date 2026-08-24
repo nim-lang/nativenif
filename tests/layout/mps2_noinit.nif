@@ -1,0 +1,8 @@
+(layout
+ (flash (startAddress 0) (megabytes 4))
+ (sram  (startAddress 536870912) (kilobytes 64))
+ (writesTo debugger)
+ (stacks (slots 1) (kilobytes 8) (tvar (bytes 256)))
+ (heap   (kilobytes 16))
+ (noinit (bytes 256))
+ (core 0))
