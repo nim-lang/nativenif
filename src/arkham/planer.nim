@@ -1,5 +1,5 @@
 #
-#           Arkham — native AArch64 code generator for Leng
+#           Arkham — native code generator for Leng
 #        (c) Copyright 2026 Andreas Rumpf
 #
 #    See the file "license.txt", included in this distribution.
@@ -433,28 +433,33 @@ proc getSym(b: var Builder; name: string; slot: AsmSlot; props: VarProps): Locat
       if r == NoReg and DivRegOk in props and b.md.divRemReg != NoReg:
         r = b.takeReg(b.freeVol, [b.md.divRemReg])
       if r == NoReg: r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
-    elif not b.an.hasCall:
-      # AArch64, a LEAF: volatiles first. The whole prologue exists to save callee-saved
-      # registers, so a leaf that fits in the volatile pool needs no prologue at all —
-      # and nothing here can lose the race the general case worries about below, because
-      # in a leaf EVERY value is `AllRegs` and the two pools are interchangeable. What
-      # is at stake is 4 stack accesses per callee-saved PAIR (a `stp`, an `ldp`, and
-      # the `sub`/`add sp` when a frame is forced) in a proc that may run millions of
-      # times: `nifcore.leaveScope` is ten instructions of work behind six of them.
-      # Falling through to callee-saved when the volatile pool runs dry keeps the
-      # register count identical to before — a leaf never spills MORE because of this.
+    else:
+      # AArch64: VOLATILES FIRST, callee-saved as the fallback — for `AllRegs` values,
+      # which is the branch we are in. `AllRegs` means the live range contains no call
+      # point, so a volatile is free for this value while a callee-saved register costs
+      # a `stp`/`ldp` pair in a prologue that may run millions of times: `nifcore.
+      # leaveScope` was ten instructions of work behind six stack accesses, and a proc
+      # whose whole body is `return f(x)` saved a pair to hold `f`'s result across
+      # nothing. In a LEAF the win is the whole prologue — every value there is
+      # `AllRegs`, so one that fits in the volatile pool needs no callee-saved PAIR
+      # saved at all (a `stp`, an `ldp`, and the `sub`/`add sp` when a frame is forced).
+      # That leaf rule used to be a branch of its own; volatiles-first for every
+      # `AllRegs` value subsumes it exactly.
+      #
+      # Only `AllRegs` values reach here; a value that DOES cross a call takes the
+      # `else` below and still gets callee-saved first, so the two never compete —
+      # which is what the earlier volatile-first attempt (reverted for regressing
+      # rawAlloc/rawDealloc) could not say, having applied to both. Falling back keeps
+      # the register count identical, so no LOCAL spills that did not spill before.
+      #
+      # What it does change is which pool is left over for the EMITTER's scratch: a
+      # call-free local now sits in x9–x13, where `pickTempReg` looks first, instead of
+      # in x19+, which it reaches only as a fallback. Under `k=3` stress that is enough
+      # to turn `tests/arkham/atomic_cas_regpressure` from "one local spilled, the CAS
+      # got its third operand register" into the emitter's documented out-of-registers
+      # assert — a totality gap (see `arkhamStressA64Known`), never a wrong answer.
       r = b.takeReg(b.freeVol, b.md.intLocalTempRegs)
       if r == NoReg: r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
-    else:
-      # AArch64 with calls: prefer callee-saved first (one prologue push, then
-      # resident). Volatile-first was tried for shrink-wrap but regressed
-      # rawAlloc/rawDealloc: the scarce volatile pool (x9–x13) spilled hot call-free
-      # temps that previously sat in x19+. Cutting the prologue THERE needs true
-      # cold-path shrink-wrap / caller-save for params, not stealing volatiles from
-      # the hot path — a call-free value and a cross-call value are competing for
-      # different things the moment a call exists.
-      r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
-      if r == NoReg: r = b.takeReg(b.freeVol, b.md.intLocalTempRegs)
     # Still nothing? A local whose interval crosses no variable shift / no div may
     # additionally home in the shift-count / div-rem register: their fixed role
     # never overlaps this local's life (guaranteed by the interval test that set

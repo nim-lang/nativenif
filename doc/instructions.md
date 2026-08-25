@@ -1,3 +1,21 @@
+# `nifasm` tag vocabulary
+
+The complete tag set of the asm-NIF dialect `nifasm` reads: types, declarations,
+addressing-mode expressions, registers, flags, and every machine instruction of
+both targets. See [nifasm.md](nifasm.md) for what the language *means*; this is
+the authoritative list of what exists.
+
+The `Enums` column names the Nim enums a tag becomes a member of, and thereby
+which target it belongs to: `X64Inst` only, `A64Inst` only, or both for the
+cross-target vocabulary. This table is the input to
+`tools/gen_instructions.nim`, which generates `src/nifasm/tags.nim` (the tag ids)
+and `src/nifasm/model.nim` (the enums). Both are generated — edit this file, not
+them, and regenerate from the repository root:
+
+```sh
+nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
+```
+
 | Tag                    | Enums                       |   Description |
 |------------------------|-----------------------------|---------------|
 | `(bool)`               | NifasmType                  | boolean type |
@@ -184,6 +202,8 @@
 | `(jp L)`               | X64Inst                  | jump if parity (unordered float compare) |
 | `(call T ...)`         | X64Inst, A64Inst         | function call marker inside prepare |
 | `(extcall)`            | X64Inst, A64Inst         | external call marker inside prepare |
+| `(tailcall T ...)`     | X64Inst, A64Inst         | tail-call marker inside prepare: branch/jmp, no return address pushed |
+| `(popframe)`           | X64Inst, A64Inst         | undo this proc's prologue (frame sub + saved registers) |
 | `(iat S)`              | X64Inst                  | indirect call through IAT (Import Address Table) |
 | `(ret)`                | X64Inst, A64Inst         | return instruction |
 | `(push O)`             | X64Inst                  | push to stack |
@@ -397,6 +417,7 @@
 | `(stlr D S)`         | A64Inst                 | store-release register |
 | `(dmb)`              | A64Inst                 | data memory barrier (inner shareable) |
 | `(clrex)`            | A64Inst                 | clear exclusive monitor |
+| `(yield)`            | A64Inst                 | spin-wait hint (`hint #1`) |
 | `(d0)`             | A64Reg                   | fp register d0 |
 | `(d1)`             | A64Reg                   | fp register d1 |
 | `(d2)`             | A64Reg                   | fp register d2 |
