@@ -1,0 +1,19 @@
+(.nif27)
+(stmts
+ (proc :exit.0
+  (params (param :code.0 . (i 32))). (pragmas (importc "exit")) (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas (exportc "main"))
+  (stmts
+   (var :a.0 . (f 32) 1.5)
+   (var :b.0 . (f 32) 2.5)
+   (var :r.0 . (i 32) 0)
+   (if (elif (lt a.0 b.0) (stmts (asgn r.0 (add (i 32) r.0 1)))))
+   (if (elif (lt b.0 a.0) (stmts (asgn r.0 (add (i 32) r.0 100)))))
+   (if (elif (le a.0 a.0) (stmts (asgn r.0 (add (i 32) r.0 2)))))
+   (if (elif (eq a.0 a.0) (stmts (asgn r.0 (add (i 32) r.0 4)))))
+   (if (elif (neq a.0 b.0) (stmts (asgn r.0 (add (i 32) r.0 8)))))
+   (if (elif (eq a.0 b.0) (stmts (asgn r.0 (add (i 32) r.0 200)))))
+   (call exit.0 r.0))))

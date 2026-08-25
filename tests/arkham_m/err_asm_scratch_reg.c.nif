@@ -1,0 +1,40 @@
+(.nif27)
+(.indexat 577               )
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :bad.0
+  (params
+   (param :x.0
+    (pragmas
+     (register "r0"))
+    (u 32)))
+  (u 32)
+  (pragmas
+   (assembler))
+  (stmts
+   (var :result.0 .
+    (u 32).)
+   (var :t.0
+    (pragmas
+     (register "r12"))
+    (u 32).)
+   (asgn t.0 x.0)
+   (asgn result.0 t.0)
+   (ret result.0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (call exit.0
+    (conv
+     (i 32)
+     (call bad.0 1))))))
+(.index)

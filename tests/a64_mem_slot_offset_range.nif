@@ -1,0 +1,26 @@
+(.nif27)
+(stmts
+ (arch linux_arm64)
+ (type :Point.0
+  (object
+   (fld :x.0
+    (i 64))
+   (fld :y.0
+    (i 64))))
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (var :p.0
+    (s)Point.0)
+   (mov
+    (x2)
+    (cast
+     (u 64)
+     (mem p.0 16)))
+   (mov
+    (x0)0)
+   (mov
+    (x8)93)
+   (svc 0))))

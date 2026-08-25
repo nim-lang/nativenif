@@ -1,0 +1,236 @@
+(.nif27)
+(.indexat 3604              )
+(stmts
+ (gvar :cell.0 .
+  (i 32).)
+ (gvar :bcell.0 .
+  (u 8).)
+ (gvar :expect.0 .
+  (i 32).)
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :aln.0
+  (params
+   (param :p.0 .
+    (ptr
+     (i 32)))
+   (param :mo.0 .
+    (i 32)))
+  (i 32)
+  (pragmas
+   (intrinsic "AtomicLoad"))
+  (stmts .))
+ (proc :asn.0
+  (params
+   (param :p.0 .
+    (ptr
+     (i 32)))
+   (param :v.0 .
+    (i 32))
+   (param :mo.0 .
+    (i 32))).
+  (pragmas
+   (intrinsic "AtomicStore"))
+  (stmts .))
+ (proc :axc.0
+  (params
+   (param :p.0 .
+    (ptr
+     (i 32)))
+   (param :v.0 .
+    (i 32))
+   (param :mo.0 .
+    (i 32)))
+  (i 32)
+  (pragmas
+   (intrinsic "AtomicExchange"))
+  (stmts .))
+ (proc :afa.0
+  (params
+   (param :p.0 .
+    (ptr
+     (i 32)))
+   (param :v.0 .
+    (i 32))
+   (param :mo.0 .
+    (i 32)))
+  (i 32)
+  (pragmas
+   (intrinsic "AtomicFetchAdd"))
+  (stmts .))
+ (proc :aaf.0
+  (params
+   (param :p.0 .
+    (ptr
+     (i 32)))
+   (param :v.0 .
+    (i 32))
+   (param :mo.0 .
+    (i 32)))
+  (i 32)
+  (pragmas
+   (intrinsic "AtomicAddFetch"))
+  (stmts .))
+ (proc :afo.0
+  (params
+   (param :p.0 .
+    (ptr
+     (i 32)))
+   (param :v.0 .
+    (i 32))
+   (param :mo.0 .
+    (i 32)))
+  (i 32)
+  (pragmas
+   (intrinsic "AtomicFetchOr"))
+  (stmts .))
+ (proc :abfa.0
+  (params
+   (param :p.0 .
+    (ptr
+     (u 8)))
+   (param :v.0 .
+    (u 8))
+   (param :mo.0 .
+    (i 32)))
+  (u 8)
+  (pragmas
+   (intrinsic "AtomicFetchAdd"))
+  (stmts .))
+ (proc :acas.0
+  (params
+   (param :p.0 .
+    (ptr
+     (i 32)))
+   (param :e.0 .
+    (ptr
+     (i 32)))
+   (param :d.0 .
+    (i 32))
+   (param :w.0 .
+    (bool))
+   (param :so.0 .
+    (i 32))
+   (param :fo.0 .
+    (i 32)))
+  (bool)
+  (pragmas
+   (intrinsic "AtomicCompareExchange"))
+  (stmts .))
+ (proc :afence.0
+  (params
+   (param :mo.0 .
+    (i 32))).
+  (pragmas
+   (intrinsic "AtomicThreadFence"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (instr asn.0
+    (addr cell.0)10 0)
+   (var :a.0 .
+    (i 32)
+    (instr aln.0
+     (addr cell.0)0))
+   (var :b.0 .
+    (i 32)
+    (instr afa.0
+     (addr cell.0)5 0))
+   (var :c.0 .
+    (i 32)
+    (instr aaf.0
+     (addr cell.0)3 0))
+   (var :d.0 .
+    (i 32)
+    (instr axc.0
+     (addr cell.0)7 0))
+   (var :e.0 .
+    (i 32)
+    (instr afo.0
+     (addr cell.0)8 0))
+   (instr afence.0 0)
+   (instr asn.0
+    (addr expect.0)15 0)
+   (var :ok.0 .
+    (bool)
+    (instr acas.0
+     (addr cell.0)
+     (addr expect.0)20 false 0 0))
+   (var :f.0 .
+    (i 32)
+    (instr aln.0
+     (addr cell.0)0))
+   (var :g.0 .
+    (bool)
+    (instr acas.0
+     (addr cell.0)
+     (addr expect.0)30 false 0 0))
+   (var :h.0 .
+    (i 32)
+    (instr aln.0
+     (addr expect.0)0))
+   (var :bb.0 .
+    (u 8)
+    (instr abfa.0
+     (addr bcell.0)200 0))
+   (var :bc.0 .
+    (u 8)
+    (instr abfa.0
+     (addr bcell.0)100 0))
+   (var :bd.0 .
+    (u 8)
+    (instr abfa.0
+     (addr bcell.0)0 0))
+   (var :s0.0 .
+    (i 32)
+    (add
+     (i 32)a.0 b.0))
+   (var :s1.0 .
+    (i 32)
+    (add
+     (i 32)s0.0 c.0))
+   (var :s2.0 .
+    (i 32)
+    (add
+     (i 32)s1.0 d.0))
+   (var :s3.0 .
+    (i 32)
+    (add
+     (i 32)s2.0 e.0))
+   (var :s4.0 .
+    (i 32)
+    (add
+     (i 32)s3.0 f.0))
+   (var :s5.0 .
+    (i 32)
+    (add
+     (i 32)s4.0 h.0))
+   (var :s6.0 .
+    (i 32)
+    (add
+     (i 32)s5.0
+     (conv
+      (i 32)bd.0)))
+   (var :s7.0 .
+    (i 32)
+    (add
+     (i 32)s6.0
+     (conv
+      (i 32)ok.0)))
+   (var :s.0 .
+    (i 32)
+    (add
+     (i 32)s7.0
+     (conv
+      (i 32)g.0)))
+   (call exit.0 s.0))))
+(.index)

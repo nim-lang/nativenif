@@ -1,0 +1,41 @@
+(.nif27)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :heapStart.0
+  (params)
+  (u 32)
+  (pragmas
+   (intrinsic "HeapStart"))
+  (stmts .))
+ (proc :heapSize.0
+  (params)
+  (u 32)
+  (pragmas
+   (intrinsic "HeapSize"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :p.0 .
+    (u 32)
+    (instr heapStart.0))
+   (var :n.0 .
+    (u 32)
+    (instr heapSize.0))
+   (if
+    (elif
+     (neq n.0 16384)
+     (stmts
+      (call exit.0 12))))
+   (call exit.0
+    (sub
+     (u 32)p.0 536870912)))))

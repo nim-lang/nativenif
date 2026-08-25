@@ -9,18 +9,21 @@ proc toNimName(s: string; suffix: string): string =
 
 type
   EnumList = enum
-    X64Inst, A64Inst, NifasmType, NifasmDecl, NifasmExpr, X64Flag, X64Reg, A64Reg
+    X64Inst, A64Inst, MInst, NifasmType, NifasmDecl, NifasmExpr, X64Flag, X64Reg,
+    A64Reg, MReg
 
 proc toSuffix(e: EnumList): (string, string) =
   case e
   of X64Inst: ("X64", "NoX64Inst")
   of A64Inst: ("A64", "NoA64Inst")
+  of MInst: ("M", "NoMInst")
   of NifasmType: ("T", "NoType")
   of NifasmDecl: ("D", "NoDecl")
   of NifasmExpr: ("X", "NoExpr")
   of X64Flag: ("O", "NoFlag")
   of X64Reg: ("R", "NoReg")
   of A64Reg: ("R", "NoReg")
+  of MReg: ("MR", "NoMReg")
 
 proc shortcutToEnumList(shortcut: string): EnumList =
   try:
@@ -40,6 +43,12 @@ type
   EnumImpls = array[EnumList, seq[EnumField]]
 
 proc writeClassifier(f: File; e: EnumList; fields: seq[EnumField]) =
+  if fields.len == 0:
+    # An enum no row references yet — a target whose vocabulary is still being
+    # added. Emit a classifier that is simply always false rather than indexing
+    # an empty `first`/`last` spelling, which read out of bounds and crashed.
+    f.write "\n\nproc rawTagIs" & $e & "*(raw: TagEnum): bool {.inline.} =\n  false\n"
+    return
   var first = ""
   var last = ""
   var prev = -1
@@ -124,7 +133,7 @@ proc extractTagName(s: string): string =
     quit "Cannot extract tag name from: " & s
 
 const
-  LateEnums = {X64Inst, A64Inst}
+  LateEnums = {X64Inst, A64Inst, MInst}
     ## Enums whose SINGLE-target members are numbered LAST (see `genTags`).
 
 proc genTags(inp: File; inputName: string) =
@@ -134,12 +143,19 @@ proc genTags(inp: File; inputName: string) =
   ## the pool is not capped at 511 — see `TagPool.escapeTag`).
   ##
   ## So the overflow is placed deliberately rather than left to document order.
-  ## A row naming EXACTLY ONE of `X64Inst`/`A64Inst` is one target's machine
-  ## mnemonic, and those are numbered last: there are hundreds of them, each
-  ## target's are dead weight to every other target, and a mnemonic appears once
-  ## per instruction where a register appears two or three times. A row naming
-  ## BOTH is the cross-target vocabulary (`mov`, `add`, `ret`, `lab`, `stmts`,
-  ## `scope`, `ite`, …) and stays with the types, decls and registers up front.
+  ## A row naming EXACTLY ONE of `X64Inst`/`A64Inst`/`MInst` is one target's
+  ## machine mnemonic, and those are numbered last: there are hundreds of them,
+  ## each target's are dead weight to every other target, and a mnemonic appears
+  ## once per instruction where a register appears two or three times. A row
+  ## naming SEVERAL is the cross-target vocabulary (`mov`, `add`, `ret`, `lab`,
+  ## `stmts`, `scope`, `ite`, …) and stays with the types, decls and registers up
+  ## front.
+  ##
+  ## Cortex-M reuses the register spellings that already exist rather than
+  ## minting its own: `(r0)`..`(r12)` are already there as x86-64 aliases and
+  ## `(sp)`/`(lr)` as AArch64 ones, so those rows simply gain `MReg` and no tag
+  ## id moves. Which register file `(r0)` names is decided by `(arch …)`, the
+  ## same way `(mov …)` already means different encodings per target.
   ##
   ## The practical effect: today only the very tail of the mnemonics overflows,
   ## and adding a target (Cortex-M, RISC-V) can never push a register or a
@@ -191,7 +207,7 @@ proc genTags(inp: File; inputName: string) =
 
   createDir "src/nifasm"
   writeTagsFile "src/nifasm/tags.nim", tags, inputName, anonHead = true
-  writeModel "src/nifasm/model.nim", enumDecls, X64Inst, A64Reg, inputName
+  writeModel "src/nifasm/model.nim", enumDecls, X64Inst, MReg, inputName
 
 proc main(inputName: string) =
   var inp = open(inputName, fmRead)

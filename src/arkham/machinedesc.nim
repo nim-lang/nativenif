@@ -62,7 +62,91 @@ type
     ## arch-neutral, but a few instruction-selection quirks (x86's destructive
     ## 2-operand RMW, `div` clobbering RDX, variable shift via RCX) are handled by
     ## `if md.arch == X86` branches in the expression walk rather than a callback.
-    X86, Arm64
+    ##
+    ## `ThumbM` (Cortex-M) shares AArch64's shape wherever those branches ask —
+    ## 3-operand ALU, no fixed div or shift-count register — so it groups with
+    ## `Arm64` at every one of them. What differs between the two is the word
+    ## size and the register file, and both of those are already values.
+    X86, Arm64, ThumbM
+
+  TargetFeature* = enum
+    ## What this target's asm-NIF vocabulary OFFERS. Read as `X in md.caps` in
+    ## place of the `if g.thumbM` that used to stand for it — the difference
+    ## being that a fourth back end answers a question it was asked, instead of
+    ## inheriting whichever arm of a two-target branch it was not named in.
+    ##
+    ## These are facts about the assembler's vocabulary, not about the silicon.
+    ## AArch64 HAS `sxtb`, but nifasm's a64 selector has no tag for it and lowers
+    ## the extend as a shift pair — so `SubwordExtend` is absent there. What a
+    ## capability answers is "may the emitter write this down", which is the only
+    ## question it ever asks.
+    CondSelect        ## a branchless conditional select (`csel` / `cmov`). Without
+                      ## it a select-diamond lowers to a branch, which is correct
+                      ## everywhere and merely longer.
+    TailCall          ## a call in tail position may become a plain branch
+                      ## (`(tailcall)`/`(popframe)`).
+    Float64           ## the FPU has double precision AT ALL. Absent on Cortex-M4F,
+                      ## whose FPv4-SP has no `.f64` instruction — which is missing
+                      ## hardware, so a `float64` is refused by name rather than
+                      ## lowered through a softfloat library nobody asked for.
+    SubwordExtend     ## a one-instruction sign/zero extend from 8/16 bits
+                      ## (`uxtb`/`sxth`); otherwise a `lsl`+`asr|lsr` pair.
+    RegOffsetMem      ## a load/store takes base and index as two REGISTER operands
+                      ## (`ldrb rt, base, idx`); otherwise the index folds into a
+                      ## memory operand instead.
+    PcRelGlobalFold   ## a global's address folds into the access that uses it
+                      ## (`adrp` + page offset). Cortex-M materializes an address
+                      ## absolutely (movw/movt, patched once .bss is laid out) and
+                      ## has no such instruction, so address and access stay apart.
+    AcqRelExclusives  ## the exclusive pair CARRIES its ordering (`ldaxr`/`stlxr`).
+                      ## Without it an atomic is the LL/SC loop plus explicit
+                      ## barriers on either side (ARMv7-M's `ldrex`/`strex`+`dmb`).
+    TwoAddrForms      ## the assembler accepts a DESTRUCTIVE two-operand spelling
+                      ## (`(neg D)`, `(sdiv D S)`). Without it the destination is
+                      ## repeated as the first source, because the instruction is
+                      ## three-operand and the assembler parses it as such.
+    AllFlagBranches   ## the assembler can turn ANY condition into a branch, not
+                      ## just the zero flag. An `{.assembler.}` body asks before
+                      ## emitting, so an unimplemented condition is a named
+                      ## compile error rather than a nifasm crash halfway through
+                      ## an otherwise valid image.
+    Freestanding      ## no OS: the image owns the machine, so a board layout — not
+                      ## a system call — answers where memory is.
+
+  FrameStyle* = enum
+    ## The SHAPE of the prologue and epilogue, and with it how the caller's
+    ## argument area is reached. Named for the shape rather than for a target,
+    ## because the next 32-bit back end wants `BlockFrame` verbatim: RISC-V has no
+    ## paired store either, and its frame is the same "lower SP once, then one
+    ## store per saved register".
+    PairFrame    ## fp/lr pushed as a PAIR and each callee-saved register in pairs
+                 ## (`stp`/`ldp`, so the saved list is padded to an even count).
+                 ## The frame pointer then addresses the caller's stack arguments
+                 ## for the whole body, at a fixed bias.
+    BlockFrame   ## SP lowered ONCE, then one store per saved register. No frame
+                 ## pointer — a register file this small has none to spare — so
+                 ## the incoming-argument base is RE-DERIVED from SP wherever it
+                 ## is needed, which is only correct after the prologue has
+                 ## finished lowering it. That is why a `BlockFrame` target loads
+                 ## its stack parameters in the prologue and not at the top of
+                 ## the body.
+    PushFrame    ## the `call` instruction pushed the return address; one
+                 ## `push`/`pop` per saved register. `codegen_x64` builds its own
+                 ## prologue and does not consult this yet.
+
+  ImmStyle* = enum
+    ## How this target encodes an ALU immediate, hence which constants may ride
+    ## along in `and`/`orr`/`eor` instead of being materialized into a register
+    ## first. The predicates themselves live with the code that already depends on
+    ## the encoder; naming the STYLE here keeps the machine model free of the
+    ## assembler's byte-emission machinery while still stating the fact. (A proc
+    ## field would need `machine` to import `nifasm/arm64`, and with it `relocs`,
+    ## for one predicate.)
+    A64Bitmask        ## AArch64's replicated bitmask immediate: every bitfield
+                      ## mask is one (0xff, 0x1ff, 0x3fff, …)
+    ThumbExpandImm    ## Thumb-2: a byte replicated across lanes, or an 8-bit value
+                      ## with bit 7 set rotated anywhere. A DIFFERENT set
+    X86Imm32          ## any 32-bit constant, sign-extended
 
   MachineDesc* = object
     ## A target's register file + calling convention, as the allocator needs it.
@@ -94,6 +178,81 @@ type
     intCalleeSavedSet*: set[Reg]     ## membership form of `intCalleeSaved`
     floatCalleeSavedSet*: set[FReg]  ## membership form of `floatCalleeSaved`
     aggrByRefThreshold*: int         ## aggregates larger than this go by reference
+
+    # ── register ROLES ────────────────────────────────────────────────────────
+    # Registers the EMITTER needs BY NAME rather than by drawing them from a
+    # pool. They used to be per-target `const`s reached through
+    # `if g.thumbM: machine_m.X else: X`, and that shape is what let a slot which
+    # is not even MAPPED on the target (`R16` on Cortex-M) reach the output. A
+    # role a target does not have is `NoReg`/`NoFReg`/`@[]`, never a plausible
+    # substitute — every one of these is read unconditionally by code that has
+    # already decided the target has it.
+    linkReg*: Reg                    ## return-address register (x30/lr, r14 on
+                                     ## Cortex-M). `NoReg` where the call
+                                     ## instruction pushes it instead (x86-64).
+    framePtrReg*: Reg                ## frame pointer (x29). `NoReg` where no fp
+                                     ## frame is established — Cortex-M addresses
+                                     ## everything off SP, and arkham never sets
+                                     ## up an rbp frame on x86-64.
+    indirectResultReg*: Reg          ## where a caller leaves `&result` for an
+                                     ## aggregate return too wide for registers
+                                     ## (x8; r9 on Cortex-M — see
+                                     ## `machine_m.IndirectResultReg` for why a
+                                     ## register is taken off the file instead of
+                                     ## shifting the arguments). `NoReg` where it
+                                     ## IS a hidden first argument (x86-64).
+    produceBridge*: Reg              ## the emitter scratch used to stage a value
+                                     ## on its way INTO memory: x16 (the
+                                     ## assembler's own IP0) on AArch64, a
+                                     ## dedicated r8 on Cortex-M, where nifasm has
+                                     ## already claimed r12. Always the last entry
+                                     ## of `bridgeRegs`.
+    bridgeRegs*: seq[Reg]            ## every GPR withheld from all allocation
+                                     ## pools so the emitter can ALWAYS draw a
+                                     ## transient — a folded memory operand a
+                                     ## 3-operand ALU must load first, a global's
+                                     ## address, a produce-into-memory spill, and
+                                     ## the three registers an LL/SC atomic takes
+                                     ## for itself. Because no value ever lives
+                                     ## here, an atomic's clobber set cannot
+                                     ## overlap anything the allocator owns and no
+                                     ## analysis has to prove that it doesn't.
+                                     ## Empty on x86-64, which reserves a single
+                                     ## `stagingBridgeReg` instead.
+    floatBridgeReg*: FReg            ## the SIMD/FP twin of `produceBridge`.
+    abiCalleeSaved*: seq[Reg]        ## the callee-saved registers the ABI
+                                     ## DEFINES, as opposed to the ones the
+                                     ## allocator draws homes from
+                                     ## (`intCalleeSaved`). The two are the same
+                                     ## list in a shipped build and differ under
+                                     ## `-d:arkhamStress`, which shrinks the pools
+                                     ## to force spilling: a `.assembler` body
+                                     ## does not allocate at all, so a register it
+                                     ## NAMES has to be legal — and saved —
+                                     ## whatever the pools were cut down to.
+                                     ## `stressed` leaves this field alone.
+    abiFloatCalleeSaved*: seq[FReg]  ## the float twin of `abiCalleeSaved`.
+    caps*: set[TargetFeature]        ## what this target's vocabulary offers
+    frameStyle*: FrameStyle          ## the prologue/epilogue shape
+    immStyle*: ImmStyle              ## which constants are ALU immediates here
+    gprRangeText*: string            ## the general-purpose registers a
+                                     ## `{.register: "…"}` pin may name, spelled
+                                     ## for a diagnostic ("`x0`..`x30`")
+    targetName*: string              ## how a DIAGNOSTIC names this target
+                                     ## ("AArch64", "Cortex-M"), so a rejection
+                                     ## reads as prose rather than as a flag
+    intCallerSavedSet*: set[Reg]     ## every GPR a callee may destroy without
+                                     ## saving. A superset of `convClobbersGpr`
+                                     ## where the ABI reserves volatiles the
+                                     ## convention does not name (AArch64's
+                                     ## x16/x17 veneers).
+    convClobbersGpr*: seq[Reg]       ## the caller-saved GPRs this calling
+                                     ## convention destroys, emitted as a proc's
+                                     ## `(clobber …)` so the ABI is DECLARED at
+                                     ## the signature rather than re-derived at
+                                     ## every call site. Sixteen under AAPCS64,
+                                     ## four under AAPCS32 — which is the whole
+                                     ## reason it is a field.
 
 type
   LocKind* = enum
@@ -349,12 +508,16 @@ proc memToMemBridgeDemand*(md: MachineDesc; dst, v: Location): ScratchDemand =
   if dst.typ.isFloat:
     let fromMem = (case md.arch
                    of X86: v.kind in {NamedStack, Mem}
-                   of Arm64: v.kind in {NamedStack, Mem, Glob})
+                   of Arm64, ThumbM: v.kind in {NamedStack, Mem, Glob})
     if fromMem: ScratchDemand(fregs: 1) else: ScratchDemand()
   else:
     let needsBridge = (case md.arch
                        of X86: v.kind in {NamedStack, Mem}
-                       of Arm64: v.kind in {NamedStack, Mem, Glob, Tvar, Imm})
+                       of Arm64, ThumbM: v.kind in {NamedStack, Mem, Glob, Tvar, Imm})
+                       # Cortex-M answers like AArch64 and for the same reasons:
+                       # no store-immediate, no PC-relative data operand, so an
+                       # immediate, a global and a thread-local each pass through
+                       # a register on the way to a stack home.
     if needsBridge:
       ScratchDemand(gprs: 1, slot: (if md.arch == X86: v.typ else: dst.typ))
     else:

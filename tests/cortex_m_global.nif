@@ -1,0 +1,74 @@
+(.nif27)
+(stmts
+ (arch cortex_m)
+ (gvar :counter.0
+  (i 32))
+ (proc :bump.0
+  (params
+   (param :d.0
+    (r0)
+    (i 32)))
+  (result :ret.0
+   (r0)
+   (i 32))
+  (clobber
+   (r0)
+   (r1)
+   (r2)
+   (r3))
+  (stmts
+   (adr
+    (r1)counter.0)
+   (mov
+    (r2)
+    (mem
+     (r1)))
+   (add3
+    (r2)(r2)(r0))
+   (mov
+    (mem
+     (r1))(r2))
+   (mov
+    (r0)(r2))
+   (ret)))
+ (proc :main.0
+  (params)
+  (result :mret.0
+   (r0)
+   (i 32))
+  (stmts
+   (var :acc.0
+    (r4)
+    (i 32))
+   (var :blo.0
+    (s)
+    (i 32))
+   (var :bhi.0
+    (s)
+    (i 32))
+   (sub
+    (sp)(ssize))
+   (adr
+    (r1)counter.0)
+   (mov
+    (r2)10)
+   (mov
+    (mem
+     (r1))(r2))
+   (prepare bump.0
+    (mov
+     (arg d.0)32)
+    (call)
+    (mov acc.0
+     (res ret.0)))
+   (mov
+    (r2)131110)
+   (mov blo.0
+    (r2))
+   (mov bhi.0 acc.0)
+   (lea
+    (r1)blo.0)
+   (mov
+    (r0)32)
+   (bkpt 171)
+   (ret))))

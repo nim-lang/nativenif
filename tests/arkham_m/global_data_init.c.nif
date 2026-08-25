@@ -1,0 +1,44 @@
+(.nif27)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (gvar :a.0 .
+  (i 32)287454020)
+ (gvar :hole.0 .
+  (i 32).)
+ (gvar :b.0 .
+  (i 32)1432778632)
+ (gvar :tail.0 .
+  (i 32).)
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (if
+    (elif
+     (neq a.0 287454020)
+     (stmts
+      (call exit.0 11))))
+   (if
+    (elif
+     (neq hole.0 0)
+     (stmts
+      (call exit.0 12))))
+   (if
+    (elif
+     (neq b.0 1432778632)
+     (stmts
+      (call exit.0 13))))
+   (if
+    (elif
+     (neq tail.0 0)
+     (stmts
+      (call exit.0 14))))
+   (call exit.0 42))))

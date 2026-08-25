@@ -39,7 +39,7 @@
 ## commutes — never as a placement; `stackArgBaseReg`'s callee-saved reservation in
 ## `allocateProc` and the `presealed` set are the two existing examples.
 ##
-## Phase B lives in codegen_x64/codegen_a64 today, next to the pool it draws from
+## Phase B lives in codegen_x64/codegen_arm today, next to the pool it draws from
 ## (`takeHeld`), and it already has a home of its own there: `emitLvalWalk` is a pure
 ## pick-and-record walk with no emission in it. Moving it here means a `planValue`
 ## twin to `planStmt` that recurses into the value positions this walk skips, calling
@@ -904,7 +904,7 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
       # rejects (osproc's `close`, 6 modules of `nimony n` on nimsem). In a call-free
       # proc x0 has no second role, and that is exactly where the payoff is anyway —
       # eliding the trailing `mov` and, with it, the frame.
-      let takeRet = b.md.arch == Arm64 and name.len > 0 and name == b.returnedVar and
+      let takeRet = b.md.arch in {Arm64, ThumbM} and name.len > 0 and name == b.returnedVar and
                     AllRegs in props and not b.an.hasCall and
                     not slot.isFloat and AddrTaken notin props and
                     slot.inRegClass and b.md.intRetReg in b.freeVol
@@ -1109,7 +1109,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
           # `effSlot` is the in-register value: the scalar itself, or a pointer — to
           # the aggregate copy (by-ref), or to the incoming stack bytes (a64 stack-passed
           # by-value aggregate, `aggrStack`; on x86-64 those took the slot path above).
-          let effSlot = if aggrByRef or aggrStack: AsmSlot(cls: AUInt, size: 8, align: 8) else: slot
+          let effSlot = if aggrByRef or aggrStack: addrSlot() else: slot
           # `viaPtr` names the spill shape for those two: the value is the AGGREGATE,
           # but a memory home holds only its ADDRESS. `spillTo` would say `NamedStack`,
           # which every consumer reads as "the slot IS the value" — `StackPtr` says the
@@ -1296,7 +1296,11 @@ proc seedPools(b: var Builder) =
   # returned local exactly when x0 is otherwise free. Homing a call-free returned local
   # there elides the trailing `mov x0, result` (and the whole frame when it is the only
   # callee-saved user). Not on x86-64: there rax IS an ordinary scratch/temp register.
-  if b.md.arch == Arm64 and b.md.intRetReg != NoReg: b.freeVol.incl b.md.intRetReg
+  # Cortex-M answers like AArch64 — r0 is its return register and is likewise kept
+  # out of both temp pools, so the same "drawn only by the returned local" property
+  # holds.
+  if b.md.arch in {Arm64, ThumbM} and b.md.intRetReg != NoReg:
+    b.freeVol.incl b.md.intRetReg
   for r in b.md.intCalleeSaved: b.freeCallee.incl r
   for f in b.md.floatTempRegs: b.freeVolF.incl f
   for f in b.md.floatCalleeSaved: b.freeCalleeF.incl f

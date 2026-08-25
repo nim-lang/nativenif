@@ -1,0 +1,51 @@
+(.nif27)
+(.indexat 1)
+(stmts
+ (type :Box.0 .
+  (object .
+   (fld :a.0 .
+    (i 32))
+   (fld :b.0 .
+    (i 32))
+   (fld :c.0 .
+    (i 32))))
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :take.0
+  (params
+   (param :p.0 .
+    (ptr Box.0)))
+  (i 32)
+  (pragmas)
+  (stmts
+   (ret
+    (conv
+     (i 32)
+     (dot
+      (deref p.0)a.0)))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :f.0 .
+    (bool)1)
+   (if
+    (elif f.0
+     (stmts
+      (var :b.0 .
+       Box.0
+       (oconstr Box.0
+        (kv a.0 7)
+        (kv b.0 0)
+        (kv c.0 0)))
+      (call exit.0
+       (call take.0
+        (addr b.0))))))
+   (call exit.0 1)))))(.index)

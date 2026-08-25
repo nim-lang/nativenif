@@ -56,7 +56,12 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y valgrind gcc-14 g++-14
+          # `qemu-system-arm` is what runs the Cortex-M images: that whole target
+          # has no host to execute on, so without it every Cortex-M suite SKIPS
+          # and reports success. Installed on Linux only — those tests are
+          # host-independent (the image runs under qemu either way), so running
+          # them on all three runners would be the same coverage three times.
+          sudo apt-get install -y valgrind gcc-14 g++-14 qemu-system-arm
           sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 60 --slave /usr/bin/g++ g++ /usr/bin/g++-14
 
       - name: Install dependencies (Linux i386)

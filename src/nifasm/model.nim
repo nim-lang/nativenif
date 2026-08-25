@@ -204,28 +204,8 @@ type
     AddA64 = (ord(AddTagId), "add")  ## add instruction
     SubA64 = (ord(SubTagId), "sub")  ## subtract instruction
     MulA64 = (ord(MulTagId), "mul")  ## unsigned multiply
-    AndA64 = (ord(AndTagId), "and")  ## bitwise and
-    NegA64 = (ord(NegTagId), "neg")  ## negate
-    CmpA64 = (ord(CmpTagId), "cmp")  ## compare
-    CallA64 = (ord(CallTagId), "call")  ## function call marker inside prepare
-    ExtcallA64 = (ord(ExtcallTagId), "extcall")  ## external call marker inside prepare
-    TailcallA64 = (ord(TailcallTagId), "tailcall")  ## tail-call marker inside prepare: branch/jmp, no return address pushed
-    PopframeA64 = (ord(PopframeTagId), "popframe")  ## undo this proc's prologue (frame sub + saved registers)
-    RetA64 = (ord(RetTagId), "ret")  ## return instruction
-    NopA64 = (ord(NopTagId), "nop")  ## no operation
-    LabA64 = (ord(LabTagId), "lab")  ## label definition
-    IteA64 = (ord(IteTagId), "ite")  ## if-then-else structure
-    LoopA64 = (ord(LoopTagId), "loop")  ## loop structure
-    StmtsA64 = (ord(StmtsTagId), "stmts")  ## statement block
-    JtrueA64 = (ord(JtrueTagId), "jtrue")  ## set control flow variable(s) to true
-    KillA64 = (ord(KillTagId), "kill")  ## kill variable
-    RebindA64 = (ord(RebindTagId), "rebind")  ## bind a phys reg to a typed name, killing its prior tenant
-    WithregA64 = (ord(WithregTagId), "withreg")  ## block-scoped rebind; auto-killed at block end
-    ScopeA64 = (ord(ScopeTagId), "scope")  ## statement block with a reclaimable stack-slot arena: `(s)` locals declared inside are freed at scope end so sibling scopes reuse the frame bytes
     SdivA64 = (ord(SdivTagId), "sdiv")  ## signed divide
     UdivA64 = (ord(UdivTagId), "udiv")  ## unsigned divide
-    SmulhA64 = (ord(SmulhTagId), "smulh")  ## signed multiply high (top 64 bits of D*S)
-    UmulhA64 = (ord(UmulhTagId), "umulh")  ## unsigned multiply high (top 64 bits of D*S)
     Add3A64 = (ord(Add3TagId), "add3")  ## 3-operand add (D = A + B)
     Sub3A64 = (ord(Sub3TagId), "sub3")  ## 3-operand subtract (D = A - B)
     Mul3A64 = (ord(Mul3TagId), "mul3")  ## 3-operand multiply (D = A * B)
@@ -243,17 +223,23 @@ type
     Mulw3A64 = (ord(Mulw3TagId), "mulw3")  ## 32-bit 3-operand multiply (D = A * B, W-form)
     GloadA64 = (ord(GloadTagId), "gload")  ## load scalar from global S: adrp + folded ldr (drops the address `add`)
     GstoreA64 = (ord(GstoreTagId), "gstore")  ## store scalar D to global S: adrp + folded str
+    AndA64 = (ord(AndTagId), "and")  ## bitwise and
     OrrA64 = (ord(OrrTagId), "orr")  ## bitwise or
     EorA64 = (ord(EorTagId), "eor")  ## bitwise xor
     LslA64 = (ord(LslTagId), "lsl")  ## logical shift left
     LsrA64 = (ord(LsrTagId), "lsr")  ## logical shift right
     AsrA64 = (ord(AsrTagId), "asr")  ## arithmetic shift right
-    SvcA64 = (ord(SvcTagId), "svc")  ## supervisor call (system call)
+    NegA64 = (ord(NegTagId), "neg")  ## negate
+    CmpA64 = (ord(CmpTagId), "cmp")  ## compare
+    CallA64 = (ord(CallTagId), "call")  ## function call marker inside prepare
+    ExtcallA64 = (ord(ExtcallTagId), "extcall")  ## external call marker inside prepare
+    TailcallA64 = (ord(TailcallTagId), "tailcall")  ## tail-call marker inside prepare: branch/jmp, no return address pushed
+    PopframeA64 = (ord(PopframeTagId), "popframe")  ## undo this proc's prologue (frame sub + saved registers)
+    RetA64 = (ord(RetTagId), "ret")  ## return instruction
+    NopA64 = (ord(NopTagId), "nop")  ## no operation
     AdrA64 = (ord(AdrTagId), "adr")  ## load address of label
     LdrA64 = (ord(LdrTagId), "ldr")  ## load register
     StrA64 = (ord(StrTagId), "str")  ## store register
-    StpA64 = (ord(StpTagId), "stp")  ## store pair
-    LdpA64 = (ord(LdpTagId), "ldp")  ## load pair
     BA64 = (ord(BTagId), "b")  ## branch (unconditional jump)
     BlA64 = (ord(BlTagId), "bl")  ## branch with link (function call)
     BeqA64 = (ord(BeqTagId), "beq")  ## branch if equal
@@ -268,9 +254,44 @@ type
     BhsA64 = (ord(BhsTagId), "bhs")  ## branch if higher or same (unsigned >=)
     CbzA64 = (ord(CbzTagId), "cbz")  ## branch to L if S is zero (no flags read)
     CbnzA64 = (ord(CbnzTagId), "cbnz")  ## branch to L if S is non-zero (no flags read)
+    CselltA64 = (ord(CselltTagId), "csellt")  ## conditional select: D = if less than (signed) then S1 else S2
+    LabA64 = (ord(LabTagId), "lab")  ## label definition
+    IteA64 = (ord(IteTagId), "ite")  ## if-then-else structure
+    LoopA64 = (ord(LoopTagId), "loop")  ## loop structure
+    StmtsA64 = (ord(StmtsTagId), "stmts")  ## statement block
+    JtrueA64 = (ord(JtrueTagId), "jtrue")  ## set control flow variable(s) to true
+    KillA64 = (ord(KillTagId), "kill")  ## kill variable
+    DmbA64 = (ord(DmbTagId), "dmb")  ## data memory barrier: every access before it is observed before any after it. One row for both Arm profiles because it is one instruction — but it is load-bearing on only one of them: AArch64 folds ordering into `ldaxr`/`stlxr`, while ARMv7-M has no acquire/release form at all, so a Cortex-M atomic is a `dmb`-bracketed `ldrex`/`strex` pair and the barrier is a separate instruction the emitter places
+    ClrexA64 = (ord(ClrexTagId), "clrex")  ## clear exclusive monitor — abandon the claim the last exclusive load took. Emitted on every path that leaves a load-exclusive/store-exclusive pair WITHOUT the store, so a later unrelated exclusive store cannot succeed against a claim nobody still means
+    YieldA64 = (ord(YieldTagId), "yield")  ## spin-wait hint (`hint #1`). One row for both Arm profiles because it is one instruction: `YIELD` is the same architectural hint on AArch64 and on ARMv7-M, and on both it is defined to execute as a `nop` where the implementation has nothing to do with it. That is what makes it safe to emit unconditionally — no feature test, no `when` at the call site
+    FmovA64 = (ord(FmovTagId), "fmov")  ## fp move (reg-reg / gpr<->fp bitcast)
+    FaddA64 = (ord(FaddTagId), "fadd")  ## fp add (D = D + S)
+    FsubA64 = (ord(FsubTagId), "fsub")  ## fp subtract (D = D - S)
+    FmulA64 = (ord(FmulTagId), "fmul")  ## fp multiply (D = D * S)
+    FdivA64 = (ord(FdivTagId), "fdiv")  ## fp divide (D = D / S)
+    FnegA64 = (ord(FnegTagId), "fneg")  ## fp negate (D = -D)
+    FcmpA64 = (ord(FcmpTagId), "fcmp")  ## fp compare
+    FldrA64 = (ord(FldrTagId), "fldr")  ## fp load register
+    FstrA64 = (ord(FstrTagId), "fstr")  ## fp store register
+    ScvtfA64 = (ord(ScvtfTagId), "scvtf")  ## signed int -> fp convert
+    UcvtfA64 = (ord(UcvtfTagId), "ucvtf")  ## unsigned int -> fp convert
+    FcvtzsA64 = (ord(FcvtzsTagId), "fcvtzs")  ## fp -> signed int convert (toward zero)
+    FcvtzuA64 = (ord(FcvtzuTagId), "fcvtzu")  ## fp -> unsigned int convert (toward zero)
+    LdrbA64 = (ord(LdrbTagId), "ldrb")  ## load byte (zero-extend), register offset [B,I]
+    StrbA64 = (ord(StrbTagId), "strb")  ## store low byte, register offset [B,I]
+    RebindA64 = (ord(RebindTagId), "rebind")  ## bind a phys reg to a typed name, killing its prior tenant
+    WithregA64 = (ord(WithregTagId), "withreg")  ## block-scoped rebind; auto-killed at block end
+    ScopeA64 = (ord(ScopeTagId), "scope")  ## statement block with a reclaimable stack-slot arena: `(s)` locals declared inside are freed at scope end so sibling scopes reuse the frame bytes
+    ClzA64 = (ord(ClzTagId), "clz")  ## count leading zeros: D = number of leading zero bits of S; `N` is the operand size in bits (32 or 64)
+    RbitA64 = (ord(RbitTagId), "rbit")  ## reverse bit order of S into D (with `clz` this is a count-trailing-zeros); `N` is the operand size in bits
+    RevA64 = (ord(RevTagId), "rev")  ## reverse byte order of S into D; `N` is the operand size in bits (32 or 64)
+    SmulhA64 = (ord(SmulhTagId), "smulh")  ## signed multiply high (top 64 bits of D*S)
+    UmulhA64 = (ord(UmulhTagId), "umulh")  ## unsigned multiply high (top 64 bits of D*S)
+    SvcA64 = (ord(SvcTagId), "svc")  ## supervisor call (system call)
+    StpA64 = (ord(StpTagId), "stp")  ## store pair
+    LdpA64 = (ord(LdpTagId), "ldp")  ## load pair
     CseleqA64 = (ord(CseleqTagId), "cseleq")  ## conditional select: D = if equal then S1 else S2
     CselneA64 = (ord(CselneTagId), "cselne")  ## conditional select: D = if not equal then S1 else S2
-    CselltA64 = (ord(CselltTagId), "csellt")  ## conditional select: D = if less than (signed) then S1 else S2
     CselleA64 = (ord(CselleTagId), "cselle")  ## conditional select: D = if less or equal (signed) then S1 else S2
     CselgtA64 = (ord(CselgtTagId), "cselgt")  ## conditional select: D = if greater than (signed) then S1 else S2
     CselgeA64 = (ord(CselgeTagId), "cselge")  ## conditional select: D = if greater or equal (signed) then S1 else S2
@@ -292,30 +313,9 @@ type
     StlxrA64 = (ord(StlxrTagId), "stlxr")  ## store-release exclusive register (St = status)
     LdarA64 = (ord(LdarTagId), "ldar")  ## load-acquire register
     StlrA64 = (ord(StlrTagId), "stlr")  ## store-release register
-    DmbA64 = (ord(DmbTagId), "dmb")  ## data memory barrier (inner shareable)
-    ClrexA64 = (ord(ClrexTagId), "clrex")  ## clear exclusive monitor
-    YieldA64 = (ord(YieldTagId), "yield")  ## spin-wait hint (`hint #1`)
-    FmovA64 = (ord(FmovTagId), "fmov")  ## fp move (reg-reg / gpr<->fp bitcast)
-    FaddA64 = (ord(FaddTagId), "fadd")  ## fp add (D = D + S)
-    FsubA64 = (ord(FsubTagId), "fsub")  ## fp subtract (D = D - S)
-    FmulA64 = (ord(FmulTagId), "fmul")  ## fp multiply (D = D * S)
-    FdivA64 = (ord(FdivTagId), "fdiv")  ## fp divide (D = D / S)
-    FnegA64 = (ord(FnegTagId), "fneg")  ## fp negate (D = -D)
-    FcmpA64 = (ord(FcmpTagId), "fcmp")  ## fp compare
-    FldrA64 = (ord(FldrTagId), "fldr")  ## fp load register
-    FstrA64 = (ord(FstrTagId), "fstr")  ## fp store register
-    ScvtfA64 = (ord(ScvtfTagId), "scvtf")  ## signed int -> fp convert
-    UcvtfA64 = (ord(UcvtfTagId), "ucvtf")  ## unsigned int -> fp convert
-    FcvtzsA64 = (ord(FcvtzsTagId), "fcvtzs")  ## fp -> signed int convert (toward zero)
-    FcvtzuA64 = (ord(FcvtzuTagId), "fcvtzu")  ## fp -> unsigned int convert (toward zero)
     FcvtA64 = (ord(FcvtTagId), "fcvt")  ## fp precision convert (f32<->f64)
     FstpA64 = (ord(FstpTagId), "fstp")  ## fp store pair (pre-indexed)
     FldpA64 = (ord(FldpTagId), "fldp")  ## fp load pair (post-indexed)
-    LdrbA64 = (ord(LdrbTagId), "ldrb")  ## load byte (zero-extend), register offset [B,I]
-    StrbA64 = (ord(StrbTagId), "strb")  ## store low byte, register offset [B,I]
-    ClzA64 = (ord(ClzTagId), "clz")  ## count leading zeros: D = number of leading zero bits of S; `N` is the operand size in bits (32 or 64)
-    RbitA64 = (ord(RbitTagId), "rbit")  ## reverse bit order of S into D (with `clz` this is a count-trailing-zeros); `N` is the operand size in bits
-    RevA64 = (ord(RevTagId), "rev")  ## reverse byte order of S into D; `N` is the operand size in bits (32 or 64)
     FldrqA64 = (ord(FldrqTagId), "fldrq")  ## load a 128-bit q register from memory (`ldr Qt, [Xn, #imm]`, imm a multiple of 16). `D` is spelled as the register's d/s tag — the q width is the instruction's, exactly as `movdqu`'s 16-byte access is on x64
     FstrqA64 = (ord(FstrqTagId), "fstrq")  ## store a 128-bit q register: `(fstrq <mem> <fpreg>)`, operand order as `fstr`
     VfaddA64 = (ord(VfaddTagId), "vfadd")  ## vector fp add, lane-wise (D = A + B): arrangement `.2d` when the registers are d-spelled, `.4s` when s-spelled
@@ -328,7 +328,125 @@ type
     VgreqA64 = (ord(VgreqTagId), "vgreq")  ## valgrind client request: `S` holds the address of the 6-word request block (`request, arg1 .. arg5`), `D` receives valgrind's answer — 0 when nothing intercepted the request, which is what a program NOT running under valgrind always sees. Expands to the fixed instruction sequence valgrind's JIT recognizes (four `ror x12` totalling a full 64-bit rotation, then the `orr x10, x10, x10` marker — architecturally a no-op, hence the zero cost when unobserved), wrapped in the moves that stage x3/x4 around it and stage the answer back out
 
 proc rawTagIsA64Inst*(raw: TagEnum): bool {.inline.} =
-  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, AndTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, TailcallTagId, PopframeTagId, RetTagId, NopTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, RebindTagId, WithregTagId, ScopeTagId, SdivTagId, UdivTagId, SmulhTagId, UmulhTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, AddwTagId, SubwTagId, MulwTagId, Addw3TagId, Subw3TagId, Mulw3TagId, GloadTagId, GstoreTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, SvcTagId, AdrTagId, LdrTagId, StrTagId, StpTagId, LdpTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, CbzTagId, CbnzTagId, CseleqTagId, CselneTagId, CselltTagId, CselleTagId, CselgtTagId, CselgeTagId, CselloTagId, CsellsTagId, CselhiTagId, CselhsTagId, CseteqTagId, CsetneTagId, CsetltTagId, CsetleTagId, CsetgtTagId, CsetgeTagId, CsetloTagId, CsetlsTagId, CsethiTagId, CsethsTagId, LdaxrTagId, StlxrTagId, LdarTagId, StlrTagId, DmbTagId, ClrexTagId, YieldTagId, FmovTagId, FaddTagId, FsubTagId, FmulTagId, FdivTagId, FnegTagId, FcmpTagId, FldrTagId, FstrTagId, ScvtfTagId, UcvtfTagId, FcvtzsTagId, FcvtzuTagId, FcvtTagId, FstpTagId, FldpTagId, LdrbTagId, StrbTagId, ClzTagId, RbitTagId, RevTagId, FldrqTagId, FstrqTagId, VfaddTagId, VfsubTagId, VfmulTagId, VfmlaTagId, VdupTagId, VeorTagId, VaddvTagId, VgreqTagId}
+  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, AddwTagId, SubwTagId, MulwTagId, Addw3TagId, Subw3TagId, Mulw3TagId, GloadTagId, GstoreTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, TailcallTagId, PopframeTagId, RetTagId, NopTagId, AdrTagId, LdrTagId, StrTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, CbzTagId, CbnzTagId, CselltTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, DmbTagId, ClrexTagId, YieldTagId, FmovTagId, FaddTagId, FsubTagId, FmulTagId, FdivTagId, FnegTagId, FcmpTagId, FldrTagId, FstrTagId, ScvtfTagId, UcvtfTagId, FcvtzsTagId, FcvtzuTagId, LdrbTagId, StrbTagId, RebindTagId, WithregTagId, ScopeTagId, ClzTagId, RbitTagId, RevTagId, SmulhTagId, UmulhTagId, SvcTagId, StpTagId, LdpTagId, CseleqTagId, CselneTagId, CselleTagId, CselgtTagId, CselgeTagId, CselloTagId, CsellsTagId, CselhiTagId, CselhsTagId, CseteqTagId, CsetneTagId, CsetltTagId, CsetleTagId, CsetgtTagId, CsetgeTagId, CsetloTagId, CsetlsTagId, CsethiTagId, CsethsTagId, LdaxrTagId, StlxrTagId, LdarTagId, StlrTagId, FcvtTagId, FstpTagId, FldpTagId, FldrqTagId, FstrqTagId, VfaddTagId, VfsubTagId, VfmulTagId, VfmlaTagId, VdupTagId, VeorTagId, VaddvTagId, VgreqTagId}
+
+type
+  MInst* = enum
+    NoMInst
+    PrepareM = (ord(PrepareTagId), "prepare")  ## prepare block for function call
+    MovM = (ord(MovTagId), "mov")  ## move instruction
+    LeaM = (ord(LeaTagId), "lea")  ## load effective address
+    AddM = (ord(AddTagId), "add")  ## add instruction
+    SubM = (ord(SubTagId), "sub")  ## subtract instruction
+    MulM = (ord(MulTagId), "mul")  ## unsigned multiply
+    SdivM = (ord(SdivTagId), "sdiv")  ## signed divide
+    UdivM = (ord(UdivTagId), "udiv")  ## unsigned divide
+    Add3M = (ord(Add3TagId), "add3")  ## 3-operand add (D = A + B)
+    Sub3M = (ord(Sub3TagId), "sub3")  ## 3-operand subtract (D = A - B)
+    Mul3M = (ord(Mul3TagId), "mul3")  ## 3-operand multiply (D = A * B)
+    And3M = (ord(And3TagId), "and3")  ## 3-operand bitwise and (D = A and B)
+    Orr3M = (ord(Orr3TagId), "orr3")  ## 3-operand bitwise or (D = A or B)
+    Eor3M = (ord(Eor3TagId), "eor3")  ## 3-operand bitwise xor (D = A xor B)
+    Lsl3M = (ord(Lsl3TagId), "lsl3")  ## 3-operand logical shift left (D = A shl B)
+    Lsr3M = (ord(Lsr3TagId), "lsr3")  ## 3-operand logical shift right (D = A shr B)
+    Asr3M = (ord(Asr3TagId), "asr3")  ## 3-operand arithmetic shift right (D = A sar B)
+    AddwM = (ord(AddwTagId), "addw")  ## 32-bit add (W-form, result zero-extended)
+    SubwM = (ord(SubwTagId), "subw")  ## 32-bit subtract (W-form, result zero-extended)
+    MulwM = (ord(MulwTagId), "mulw")  ## 32-bit multiply (W-form, result zero-extended)
+    Addw3M = (ord(Addw3TagId), "addw3")  ## 32-bit 3-operand add (D = A + B, W-form)
+    Subw3M = (ord(Subw3TagId), "subw3")  ## 32-bit 3-operand subtract (D = A - B, W-form)
+    Mulw3M = (ord(Mulw3TagId), "mulw3")  ## 32-bit 3-operand multiply (D = A * B, W-form)
+    GloadM = (ord(GloadTagId), "gload")  ## load scalar from global S: adrp + folded ldr (drops the address `add`)
+    GstoreM = (ord(GstoreTagId), "gstore")  ## store scalar D to global S: adrp + folded str
+    AndM = (ord(AndTagId), "and")  ## bitwise and
+    OrrM = (ord(OrrTagId), "orr")  ## bitwise or
+    EorM = (ord(EorTagId), "eor")  ## bitwise xor
+    LslM = (ord(LslTagId), "lsl")  ## logical shift left
+    LsrM = (ord(LsrTagId), "lsr")  ## logical shift right
+    AsrM = (ord(AsrTagId), "asr")  ## arithmetic shift right
+    NegM = (ord(NegTagId), "neg")  ## negate
+    CmpM = (ord(CmpTagId), "cmp")  ## compare
+    CallM = (ord(CallTagId), "call")  ## function call marker inside prepare
+    ExtcallM = (ord(ExtcallTagId), "extcall")  ## external call marker inside prepare
+    RetM = (ord(RetTagId), "ret")  ## return instruction
+    NopM = (ord(NopTagId), "nop")  ## no operation
+    AdrM = (ord(AdrTagId), "adr")  ## load address of label
+    LdrM = (ord(LdrTagId), "ldr")  ## load register
+    StrM = (ord(StrTagId), "str")  ## store register
+    BM = (ord(BTagId), "b")  ## branch (unconditional jump)
+    BlM = (ord(BlTagId), "bl")  ## branch with link (function call)
+    BeqM = (ord(BeqTagId), "beq")  ## branch if equal
+    BneM = (ord(BneTagId), "bne")  ## branch if not equal
+    BltM = (ord(BltTagId), "blt")  ## branch if less than (signed)
+    BleM = (ord(BleTagId), "ble")  ## branch if less or equal (signed)
+    BgtM = (ord(BgtTagId), "bgt")  ## branch if greater than (signed)
+    BgeM = (ord(BgeTagId), "bge")  ## branch if greater or equal (signed)
+    BloM = (ord(BloTagId), "blo")  ## branch if lower (unsigned <)
+    BlsM = (ord(BlsTagId), "bls")  ## branch if lower or same (unsigned <=)
+    BhiM = (ord(BhiTagId), "bhi")  ## branch if higher (unsigned >)
+    BhsM = (ord(BhsTagId), "bhs")  ## branch if higher or same (unsigned >=)
+    CbzM = (ord(CbzTagId), "cbz")  ## branch to L if S is zero (no flags read)
+    CbnzM = (ord(CbnzTagId), "cbnz")  ## branch to L if S is non-zero (no flags read)
+    CselltM = (ord(CselltTagId), "csellt")  ## conditional select: D = if less than (signed) then S1 else S2
+    LabM = (ord(LabTagId), "lab")  ## label definition
+    IteM = (ord(IteTagId), "ite")  ## if-then-else structure
+    LoopM = (ord(LoopTagId), "loop")  ## loop structure
+    StmtsM = (ord(StmtsTagId), "stmts")  ## statement block
+    JtrueM = (ord(JtrueTagId), "jtrue")  ## set control flow variable(s) to true
+    KillM = (ord(KillTagId), "kill")  ## kill variable
+    DmbM = (ord(DmbTagId), "dmb")  ## data memory barrier: every access before it is observed before any after it. One row for both Arm profiles because it is one instruction — but it is load-bearing on only one of them: AArch64 folds ordering into `ldaxr`/`stlxr`, while ARMv7-M has no acquire/release form at all, so a Cortex-M atomic is a `dmb`-bracketed `ldrex`/`strex` pair and the barrier is a separate instruction the emitter places
+    ClrexM = (ord(ClrexTagId), "clrex")  ## clear exclusive monitor — abandon the claim the last exclusive load took. Emitted on every path that leaves a load-exclusive/store-exclusive pair WITHOUT the store, so a later unrelated exclusive store cannot succeed against a claim nobody still means
+    YieldM = (ord(YieldTagId), "yield")  ## spin-wait hint (`hint #1`). One row for both Arm profiles because it is one instruction: `YIELD` is the same architectural hint on AArch64 and on ARMv7-M, and on both it is defined to execute as a `nop` where the implementation has nothing to do with it. That is what makes it safe to emit unconditionally — no feature test, no `when` at the call site
+    FmovM = (ord(FmovTagId), "fmov")  ## fp move (reg-reg / gpr<->fp bitcast)
+    FaddM = (ord(FaddTagId), "fadd")  ## fp add (D = D + S)
+    FsubM = (ord(FsubTagId), "fsub")  ## fp subtract (D = D - S)
+    FmulM = (ord(FmulTagId), "fmul")  ## fp multiply (D = D * S)
+    FdivM = (ord(FdivTagId), "fdiv")  ## fp divide (D = D / S)
+    FnegM = (ord(FnegTagId), "fneg")  ## fp negate (D = -D)
+    FcmpM = (ord(FcmpTagId), "fcmp")  ## fp compare
+    FldrM = (ord(FldrTagId), "fldr")  ## fp load register
+    FstrM = (ord(FstrTagId), "fstr")  ## fp store register
+    ScvtfM = (ord(ScvtfTagId), "scvtf")  ## signed int -> fp convert
+    UcvtfM = (ord(UcvtfTagId), "ucvtf")  ## unsigned int -> fp convert
+    FcvtzsM = (ord(FcvtzsTagId), "fcvtzs")  ## fp -> signed int convert (toward zero)
+    FcvtzuM = (ord(FcvtzuTagId), "fcvtzu")  ## fp -> unsigned int convert (toward zero)
+    LdrbM = (ord(LdrbTagId), "ldrb")  ## load byte (zero-extend), register offset [B,I]
+    StrbM = (ord(StrbTagId), "strb")  ## store low byte, register offset [B,I]
+    RebindM = (ord(RebindTagId), "rebind")  ## bind a phys reg to a typed name, killing its prior tenant
+    WithregM = (ord(WithregTagId), "withreg")  ## block-scoped rebind; auto-killed at block end
+    ScopeM = (ord(ScopeTagId), "scope")  ## statement block with a reclaimable stack-slot arena: `(s)` locals declared inside are freed at scope end so sibling scopes reuse the frame bytes
+    ClzM = (ord(ClzTagId), "clz")  ## count leading zeros: D = number of leading zero bits of S; `N` is the operand size in bits (32 or 64)
+    RbitM = (ord(RbitTagId), "rbit")  ## reverse bit order of S into D (with `clz` this is a count-trailing-zeros); `N` is the operand size in bits
+    RevM = (ord(RevTagId), "rev")  ## reverse byte order of S into D; `N` is the operand size in bits (32 or 64)
+    LdrexM = (ord(LdrexTagId), "ldrex")  ## ARMv7-M exclusive load: `D` ← the `N`-bit cell at `[S]`, taking the monitor's claim on that address. `N` is 8, 16 or 32 and selects `ldrexb`/`ldrexh`/`ldrex`; there is no 64-bit form on this profile (no `ldrexd`), which is why a 64-bit atomic is refused by name rather than split into halves — two claims are not one atom
+    StrexM = (ord(StrexTagId), "strex")  ## ARMv7-M exclusive store: store the `N`-bit `D` into `[S]` if the claim still holds, and put the outcome in `St` (0 = stored, 1 = another agent won the line). `St` must differ from `D` and `S` — the architecture leaves it UNPREDICTABLE otherwise, and since the retry loop branches on `St`, getting it wrong is an infinite loop rather than a wrong value
+    BkptM = (ord(BkptTagId), "bkpt")  ## breakpoint / semihosting call; `(bkpt 171)` is `bkpt #0xAB`, the ARM semihosting entry on M-profile (operation in r0, parameter block in r1, result back in r0)
+    BxM = (ord(BxTagId), "bx")  ## branch and exchange to the address in D; `(bx (lr))` is the ordinary Thumb return
+    BlxM = (ord(BlxTagId), "blx")  ## indirect call through the address in D
+    MvnM = (ord(MvnTagId), "mvn")  ## bitwise NOT (D = not S)
+    Bic3M = (ord(Bic3TagId), "bic3")  ## 3-operand bit clear (D = A and not B)
+    Adds3M = (ord(Adds3TagId), "adds3")  ## 3-operand add SETTING the flags — the low half of a 64-bit add
+    Adcs3M = (ord(Adcs3TagId), "adcs3")  ## 3-operand add with carry, setting the flags — the high half of a 64-bit add
+    Subs3M = (ord(Subs3TagId), "subs3")  ## 3-operand subtract setting the flags — the low half of a 64-bit subtract
+    Sbcs3M = (ord(Sbcs3TagId), "sbcs3")  ## 3-operand subtract with borrow, setting the flags — the high half of a 64-bit subtract
+    MlsM = (ord(MlsTagId), "mls")  ## multiply-subtract (D = C - A*B); ARMv7-M has no modulo, so `a mod b` is `sdiv` then `mls`
+    UmullM = (ord(UmullTagId), "umull")  ## unsigned 64-bit product of A and B into the register pair L (low) / H (high)
+    SmullM = (ord(SmullTagId), "smull")  ## signed 64-bit product of A and B into the register pair L (low) / H (high)
+    TstM = (ord(TstTagId), "tst")  ## set the flags from A and B, discarding the result
+    UxtbM = (ord(UxtbTagId), "uxtb")  ## zero-extend the low byte of S into D
+    SxtbM = (ord(SxtbTagId), "sxtb")  ## sign-extend the low byte of S into D
+    UxthM = (ord(UxthTagId), "uxth")  ## zero-extend the low halfword of S into D
+    SxthM = (ord(SxthTagId), "sxth")  ## sign-extend the low halfword of S into D
+    LdrhM = (ord(LdrhTagId), "ldrh")  ## load an unsigned halfword
+    StrhM = (ord(StrhTagId), "strh")  ## store a halfword
+    LdrsbM = (ord(LdrsbTagId), "ldrsb")  ## load a byte, sign-extended
+    LdrshM = (ord(LdrshTagId), "ldrsh")  ## load a halfword, sign-extended
+    WfiM = (ord(WfiTagId), "wfi")  ## wait for interrupt — the idle trap a bare-metal image ends on
+    DsbM = (ord(DsbTagId), "dsb")  ## data synchronization barrier: nothing after it begins until every memory access before it has completed. Needed after writing a system register that changes how later instructions behave (CPACR, MPU)
+    IsbM = (ord(IsbTagId), "isb")  ## instruction synchronization barrier: flush the pipeline so instructions fetched before a context-changing write are re-fetched. Required between enabling the FPU and the first floating-point instruction
+
+proc rawTagIsMInst*(raw: TagEnum): bool {.inline.} =
+  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, AddwTagId, SubwTagId, MulwTagId, Addw3TagId, Subw3TagId, Mulw3TagId, GloadTagId, GstoreTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, AdrTagId, LdrTagId, StrTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, CbzTagId, CbnzTagId, CselltTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, DmbTagId, ClrexTagId, YieldTagId, FmovTagId, FaddTagId, FsubTagId, FmulTagId, FdivTagId, FnegTagId, FcmpTagId, FldrTagId, FstrTagId, ScvtfTagId, UcvtfTagId, FcvtzsTagId, FcvtzuTagId, LdrbTagId, StrbTagId, RebindTagId, WithregTagId, ScopeTagId, ClzTagId, RbitTagId, RevTagId, LdrexTagId, StrexTagId, BkptTagId, BxTagId, BlxTagId, MvnTagId, Bic3TagId, Adds3TagId, Adcs3TagId, Subs3TagId, Sbcs3TagId, MlsTagId, UmullTagId, SmullTagId, TstTagId, UxtbTagId, SxtbTagId, UxthTagId, SxthTagId, LdrhTagId, StrhTagId, LdrsbTagId, LdrshTagId, WfiTagId, DsbTagId, IsbTagId}
 
 type
   NifasmType* = enum
@@ -365,11 +483,20 @@ type
     ResultD = (ord(ResultTagId), "result")  ## result value declaration
     ClobberD = (ord(ClobberTagId), "clobber")  ## clobbered registers list
     VarD = (ord(VarTagId), "var")  ## variable declaration
-    ArchD = (ord(ArchTagId), "arch")  ## architecture pragma
+    LayoutD = (ord(LayoutTagId), "layout")  ## Cortex-M: the board's memory layout, as arkham read it out of the `--layout:` file and forwarded. Children are the `flash`/`sram`/`stacks`/`heap`/`noinit`/`core` rows below. There is no row saying which region a section lives in: code and constants go where the image is, mutable storage goes where nothing is, and a row restating that would only be a chance to write it wrong. Supersedes the memory-map command-line flags
+    FlashD = (ord(FlashTagId), "flash")  ## Cortex-M: the region the IMAGE SHIPS IN — code, constants, and the initializer image for globals — as a `(startAddress …)` and one size row. Named for the part rather than for a permission: whether the silicon is writable is beside the point (MPS2's region at 0 is ZBT SRAM), what matters is that its contents survive reset
+    SramD = (ord(SramTagId), "sram")  ## Cortex-M: the region that holds NOTHING at reset — globals, stacks, heap — as a `(startAddress …)` and one size row. Everything in it is established by the startup code
+    StacksD = (ord(StacksTagId), "stacks")  ## Cortex-M: the per-thread stack slots, in `sram` — a `(slots N)`, one size row for the SLOT, and a `(tvar …)`. The slot size must be a power of two: a thread reaches its own thread-locals by masking SP with it
+    HeapD = (ord(HeapTagId), "heap")  ## Cortex-M: the heap, in `sram` — one size row. This is what the allocator gets pages from; there is no array in the globals standing in for it
+    NoinitD = (ord(NoinitTagId), "noinit")  ## Cortex-M: bytes at the TOP of `sram` that the startup code neither copies into nor zeroes — one size row. Everything else in `sram` is established at reset, which is exactly what a reboot counter or a crash record must NOT be: it is written by the run that failed and read by the run after it. Survives a WARM reset only; a part with battery-backed SRAM keeps its contents across power loss too, and that is a different guarantee
+    CoreD = (ord(CoreTagId), "core")  ## Cortex-M: which stack slot THIS image boots on. One image per core, so the number is a constant the author knows and not something read from a CPUID register — M-profile has no architectural core id
+    InterruptsD = (ord(InterruptsTagId), "interrupts")  ## Cortex-M: the interrupt table, as `(irq N S)` children — handler `S` occupies architectural table slot `N`. Slots the module does not name stay zero. Slots 0 and 1 are the image writer's (initial MSP, reset) and may not appear
+    IrqD = (ord(IrqTagId), "irq")  ## Cortex-M: one interrupt-table entry — slot number, then the handler symbol. Its address is baked with the Thumb bit, like every other code address on this target
+    ArchD = (ord(ArchTagId), "arch")  ## architecture pragma: `x64`, `linux_arm64`, `arm64`, `win_x64`, `win_arm64`, `cortex_m`
     CfvarD = (ord(CfvarTagId), "cfvar")  ## control flow variable declaration
     RodataD = (ord(RodataTagId), "rodata")  ## read-only data (string/bytes)
     GvarD = (ord(GvarTagId), "gvar")  ## global variable
-    TvarD = (ord(TvarTagId), "tvar")  ## thread local variable
+    TvarD = (ord(TvarTagId), "tvar")  ## thread local variable. ONE tag, two readings, because both say the same thing at different scales: as a declaration it is one thread-local, and inside a Cortex-M `(stacks …)` it is the bytes reserved for ALL of them at the top of every stack slot, just below where SP starts
     ImpD = (ord(ImpTagId), "imp")  ## import dynamic library
     ExtprocD = (ord(ExtprocTagId), "extproc")  ## external proc from imported library
     SyprocD = (ord(SyprocTagId), "syproc")  ## system-call proc declaration (proctype + clobbers + number)
@@ -377,24 +504,38 @@ type
     LenientD = (ord(LenientTagId), "lenient")  ## proc pragma (after the clobber section): the body is MACHINE-PORTED code (e.g. distilled from gcc), so the structural disciplines are off for this one proc — backward jumps to labels are allowed (no `(loop)` required), registers may be used raw even when bound (params, r11), a bare `(call P)`/`(jmp P)` to a proc needs no `(prepare)`, and the type/clobber checks are skipped. The checks exist to catch code-GENERATOR bugs; ported code was already correct on the machine it came from
 
 proc rawTagIsNifasmDecl*(raw: TagEnum): bool {.inline.} =
-  raw in {TypeTagId, ProcTagId, ParamsTagId, ParamTagId, ResultTagId, ClobberTagId, VarTagId, ArchTagId, CfvarTagId, RodataTagId, GvarTagId, TvarTagId, ImpTagId, ExtprocTagId, SyprocTagId, RegsTagId, LenientTagId}
+  raw in {TypeTagId, ProcTagId, ParamsTagId, ParamTagId, ResultTagId, ClobberTagId, VarTagId, LayoutTagId, FlashTagId, SramTagId, StacksTagId, HeapTagId, NoinitTagId, CoreTagId, InterruptsTagId, IrqTagId, ArchTagId, CfvarTagId, RodataTagId, GvarTagId, TvarTagId, ImpTagId, ExtprocTagId, SyprocTagId, RegsTagId, LenientTagId}
 
 type
   NifasmExpr* = enum
     NoExpr
+    StartAddressX = (ord(StartAddressTagId), "startAddress")  ## Cortex-M: a region's, or a peripheral's, first address. Spelled out rather than `origin` because a layout row holds two numbers and the reader should not have to remember which is which
+    BytesX = (ord(BytesTagId), "bytes")  ## Cortex-M: a size in bytes. NIF has no `4K` literal, so a size is a TAGGED quantity and the unit is never guessed from the number
+    KilobytesX = (ord(KilobytesTagId), "kilobytes")  ## Cortex-M: a size, times 1024
+    MegabytesX = (ord(MegabytesTagId), "megabytes")  ## Cortex-M: a size, times 1024*1024
+    SlotsX = (ord(SlotsTagId), "slots")  ## Cortex-M: how many stack slots the region holds
     AlignX = (ord(AlignTagId), "align")  ## stack-slot alignment annotation (child of `(s)`)
     SsizeX = (ord(SsizeTagId), "ssize")  ## stack size expression; the optional `N` adds N bytes at THIS site only (the prologue folds its 16-alignment pad in)
     CsizeX = (ord(CsizeTagId), "csize")  ## call stack size expression
+    DataloadX = (ord(DataloadTagId), "dataload")  ## Cortex-M: flash address the `.data` initializer image is loaded from
+    DatavmaX = (ord(DatavmaTagId), "datavma")  ## Cortex-M: SRAM address `.data` occupies at run time
+    DatasizeX = (ord(DatasizeTagId), "datasize")  ## Cortex-M: bytes to copy from `(dataload)` to `(datavma)`
+    HeapstartX = (ord(HeapstartTagId), "heapstart")  ## Cortex-M: the address of the heap the board layout reserved. A link-time constant the runtime cannot compute — a firmware image has no OS to ask for pages
+    HeapsizeX = (ord(HeapsizeTagId), "heapsize")  ## Cortex-M: how many bytes of it there are
+    NoinitstartX = (ord(NoinitstartTagId), "noinitstart")  ## Cortex-M: the address of the region the board layout kept back from the startup code. A link-time constant for the same reason `(heapstart)` is: only the image writer knows where it landed
+    NoinitsizeX = (ord(NoinitsizeTagId), "noinitsize")  ## Cortex-M: how many bytes of it there are
+    BsssizeX = (ord(BsssizeTagId), "bsssize")  ## Cortex-M: bytes to zero immediately above `(datavma)` + `(datasize)`
     ArgX = (ord(ArgTagId), "arg")  ## argument reference in prepare block
     ResX = (ord(ResTagId), "res")  ## result reference in prepare block
     DotX = (ord(DotTagId), "dot")  ## field access
     AtX = (ord(AtTagId), "at")  ## array index
     MemX = (ord(MemTagId), "mem")  ## memory reference: `(mem base)`, `(mem base disp)`, `(mem base index scale [disp])` (base/index are raw registers or register-homed locals/params), or the no-base scaled form `(mem 0 index scale [disp])` = `[index*scale + disp]` (x64: SIB base=101; the literal `0` base is unambiguous since a real base is never an immediate)
+    TvarX = (ord(TvarTagId), "tvar")  ## thread local variable. ONE tag, two readings, because both say the same thing at different scales: as a declaration it is one thread-local, and inside a Cortex-M `(stacks …)` it is the bytes reserved for ALL of them at the top of every stack slot, just below where SP starts
     CastX = (ord(CastTagId), "cast")  ## type cast; over a memory operand it retypes (and thereby sizes) the access; over a REGISTER operand of an x64 ALU instruction (add/sub/and/or/xor/cmp/test/shl/shr/sar/neg/not) an explicit sub-width int type (8/16/32 bits) sizes the OPERATION: 32-bit zero-extends the destination, 8/16-bit preserve its upper bits, flags and shift-count masking follow the width. Never inferred from a symbol's declared type, and `mov` still rejects a cast register destination
     RelocX = (ord(RelocTagId), "reloc")  ## rodata relocation: bake symbol S's address at byte offset O
 
 proc rawTagIsNifasmExpr*(raw: TagEnum): bool {.inline.} =
-  raw in {AlignTagId, SsizeTagId, CsizeTagId, ArgTagId, ResTagId, DotTagId, AtTagId, MemTagId, CastTagId, RelocTagId}
+  raw in {StartAddressTagId, BytesTagId, KilobytesTagId, MegabytesTagId, SlotsTagId, AlignTagId, SsizeTagId, CsizeTagId, DataloadTagId, DatavmaTagId, DatasizeTagId, HeapstartTagId, HeapsizeTagId, NoinitstartTagId, NoinitsizeTagId, BsssizeTagId, ArgTagId, ResTagId, DotTagId, AtTagId, MemTagId, TvarTagId, CastTagId, RelocTagId}
 
 type
   X64Flag* = enum
@@ -598,4 +739,58 @@ type
 
 proc rawTagIsA64Reg*(raw: TagEnum): bool {.inline.} =
   raw in {X0TagId, X1TagId, X2TagId, X3TagId, X4TagId, X5TagId, X6TagId, X7TagId, X8TagId, X9TagId, X10TagId, X11TagId, X12TagId, X13TagId, X14TagId, X15TagId, X16TagId, X17TagId, X18TagId, X19TagId, X20TagId, X21TagId, X22TagId, X23TagId, X24TagId, X25TagId, X26TagId, X27TagId, X28TagId, X29TagId, X30TagId, SpTagId, W0TagId, W1TagId, W2TagId, W3TagId, W4TagId, W5TagId, W6TagId, W7TagId, W8TagId, W9TagId, W10TagId, W11TagId, W12TagId, W13TagId, W14TagId, W15TagId, W16TagId, W17TagId, W18TagId, W19TagId, W20TagId, W21TagId, W22TagId, W23TagId, W24TagId, W25TagId, W26TagId, W27TagId, W28TagId, W29TagId, W30TagId, WspTagId, LrTagId, FpTagId, XzrTagId, D0TagId, D1TagId, D2TagId, D3TagId, D4TagId, D5TagId, D6TagId, D7TagId, D8TagId, D9TagId, D10TagId, D11TagId, D12TagId, D13TagId, D14TagId, D15TagId, D16TagId, D17TagId, D18TagId, D19TagId, D20TagId, D21TagId, D22TagId, D23TagId, D24TagId, D25TagId, D26TagId, D27TagId, D28TagId, D29TagId, D30TagId, D31TagId, S0TagId, S1TagId, S2TagId, S3TagId, S4TagId, S5TagId, S6TagId, S7TagId, S8TagId, S9TagId, S10TagId, S11TagId, S12TagId, S13TagId, S14TagId, S15TagId, S16TagId, S17TagId, S18TagId, S19TagId, S20TagId, S21TagId, S22TagId, S23TagId, S24TagId, S25TagId, S26TagId, S27TagId, S28TagId, S29TagId, S30TagId, S31TagId}
+
+type
+  MReg* = enum
+    NoMReg
+    R8MR = (ord(R8TagId), "r8")  ## register r8
+    R9MR = (ord(R9TagId), "r9")  ## register r9
+    R10MR = (ord(R10TagId), "r10")  ## register r10
+    R11MR = (ord(R11TagId), "r11")  ## register r11
+    R12MR = (ord(R12TagId), "r12")  ## register r12
+    R0MR = (ord(R0TagId), "r0")  ## register r0 (alias)
+    R1MR = (ord(R1TagId), "r1")  ## register r1 (alias)
+    R2MR = (ord(R2TagId), "r2")  ## register r2 (alias)
+    R3MR = (ord(R3TagId), "r3")  ## register r3 (alias)
+    R4MR = (ord(R4TagId), "r4")  ## register r4 (alias)
+    R5MR = (ord(R5TagId), "r5")  ## register r5 (alias)
+    R6MR = (ord(R6TagId), "r6")  ## register r6 (alias)
+    R7MR = (ord(R7TagId), "r7")  ## register r7 (alias)
+    SpMR = (ord(SpTagId), "sp")  ## stack pointer
+    LrMR = (ord(LrTagId), "lr")  ## link register (alias for x30)
+    S0MR = (ord(S0TagId), "s0")  ## fp register s0
+    S1MR = (ord(S1TagId), "s1")  ## fp register s1
+    S2MR = (ord(S2TagId), "s2")  ## fp register s2
+    S3MR = (ord(S3TagId), "s3")  ## fp register s3
+    S4MR = (ord(S4TagId), "s4")  ## fp register s4
+    S5MR = (ord(S5TagId), "s5")  ## fp register s5
+    S6MR = (ord(S6TagId), "s6")  ## fp register s6
+    S7MR = (ord(S7TagId), "s7")  ## fp register s7
+    S8MR = (ord(S8TagId), "s8")  ## fp register s8
+    S9MR = (ord(S9TagId), "s9")  ## fp register s9
+    S10MR = (ord(S10TagId), "s10")  ## fp register s10
+    S11MR = (ord(S11TagId), "s11")  ## fp register s11
+    S12MR = (ord(S12TagId), "s12")  ## fp register s12
+    S13MR = (ord(S13TagId), "s13")  ## fp register s13
+    S14MR = (ord(S14TagId), "s14")  ## fp register s14
+    S15MR = (ord(S15TagId), "s15")  ## fp register s15
+    S16MR = (ord(S16TagId), "s16")  ## fp register s16
+    S17MR = (ord(S17TagId), "s17")  ## fp register s17
+    S18MR = (ord(S18TagId), "s18")  ## fp register s18
+    S19MR = (ord(S19TagId), "s19")  ## fp register s19
+    S20MR = (ord(S20TagId), "s20")  ## fp register s20
+    S21MR = (ord(S21TagId), "s21")  ## fp register s21
+    S22MR = (ord(S22TagId), "s22")  ## fp register s22
+    S23MR = (ord(S23TagId), "s23")  ## fp register s23
+    S24MR = (ord(S24TagId), "s24")  ## fp register s24
+    S25MR = (ord(S25TagId), "s25")  ## fp register s25
+    S26MR = (ord(S26TagId), "s26")  ## fp register s26
+    S27MR = (ord(S27TagId), "s27")  ## fp register s27
+    S28MR = (ord(S28TagId), "s28")  ## fp register s28
+    S29MR = (ord(S29TagId), "s29")  ## fp register s29
+    S30MR = (ord(S30TagId), "s30")  ## fp register s30
+    S31MR = (ord(S31TagId), "s31")  ## fp register s31
+
+proc rawTagIsMReg*(raw: TagEnum): bool {.inline.} =
+  raw in {R8TagId, R9TagId, R10TagId, R11TagId, R12TagId, R0TagId, R1TagId, R2TagId, R3TagId, R4TagId, R5TagId, R6TagId, R7TagId, SpTagId, LrTagId, S0TagId, S1TagId, S2TagId, S3TagId, S4TagId, S5TagId, S6TagId, S7TagId, S8TagId, S9TagId, S10TagId, S11TagId, S12TagId, S13TagId, S14TagId, S15TagId, S16TagId, S17TagId, S18TagId, S19TagId, S20TagId, S21TagId, S22TagId, S23TagId, S24TagId, S25TagId, S26TagId, S27TagId, S28TagId, S29TagId, S30TagId, S31TagId}
 

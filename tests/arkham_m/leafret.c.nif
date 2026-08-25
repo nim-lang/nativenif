@@ -1,0 +1,16 @@
+(.nif27)
+(.indexat 218              )
+(stmts
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :x.0 .
+    (i 32)40)
+   (var :y.0 .
+    (i 32)2)
+   (ret
+    (add
+     (i 32)x.0 y.0)))))(.index)

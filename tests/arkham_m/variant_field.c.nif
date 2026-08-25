@@ -1,0 +1,48 @@
+(.nif27)
+(.indexat 733              )
+(stmts
+ (type :V.0 .
+  (object .
+   (fld :tag.0 .
+    (i 32))
+   (union
+    (object .
+     (fld :a.0 .
+      (i 32))
+     (fld :b.0 .
+      (i 32)))
+    (object .
+     (fld :c.0 .
+      (i 32))))
+   (fld :last.0 .
+    (i 32))))
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :v.0 . V.0 .)
+   (asgn
+    (dot v.0 tag.0 0)1)
+   (asgn
+    (dot v.0 a.0 0)10)
+   (asgn
+    (dot v.0 b.0 0)20)
+   (asgn
+    (dot v.0 last.0 0)12)
+   (call exit.0
+    (add
+     (i 32)
+     (add
+      (i 32)
+      (dot v.0 a.0 0)
+      (dot v.0 b.0 0))
+     (dot v.0 last.0 0))))))(.index)

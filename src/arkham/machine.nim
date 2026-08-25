@@ -103,7 +103,29 @@ const
     floatCalleeSaved: @FloatCalleeSaved,
     intCalleeSavedSet: {R19..R28},
     floatCalleeSavedSet: {F8..F15},
-    aggrByRefThreshold: 16)
+    aggrByRefThreshold: 16,
+    linkReg: LR,
+    framePtrReg: FP,
+    indirectResultReg: IndirectResultReg,
+    produceBridge: R16,
+    bridgeRegs: @AtomicScratchRegs,
+    floatBridgeReg: FloatBridgeReg,
+    caps: {CondSelect, TailCall, Float64, RegOffsetMem, PcRelGlobalFold,
+           AcqRelExclusives, TwoAddrForms},
+                                     # NOT AllFlagBranches: nifasm's `genIteA64`
+                                     # implements the zero flag only, so far.
+                                     # NOT SubwordExtend: the hardware has `sxtb`,
+                                     # but nifasm's a64 selector has no tag for it
+                                     # and lowers an extend as a shift pair.
+                                     # NOT Freestanding: both a64 hosts have an OS.
+    frameStyle: PairFrame,
+    immStyle: A64Bitmask,
+    gprRangeText: "`x0`..`x30`",
+    targetName: "AArch64",
+    abiFloatCalleeSaved: @FloatCalleeSaved,
+    abiCalleeSaved: @IntCalleeSaved,
+    intCallerSavedSet: IntCallerSaved,
+    convClobbersGpr: @ConvClobbersGpr)
 
   ## The machine description for the NEW pure-emit value core (`genProc2`): identical
   ## to `aarch64Machine` except the two integer bridges (x14/x15) and the float bridge
@@ -124,7 +146,29 @@ const
     floatCalleeSaved: @FloatCalleeSaved,
     intCalleeSavedSet: {R19..R28},
     floatCalleeSavedSet: {F8..F15},
-    aggrByRefThreshold: 16)
+    aggrByRefThreshold: 16,
+    linkReg: LR,
+    framePtrReg: FP,
+    indirectResultReg: IndirectResultReg,
+    produceBridge: R16,
+    bridgeRegs: @AtomicScratchRegs,
+    floatBridgeReg: FloatBridgeReg,
+    caps: {CondSelect, TailCall, Float64, RegOffsetMem, PcRelGlobalFold,
+           AcqRelExclusives, TwoAddrForms},
+                                     # NOT AllFlagBranches: nifasm's `genIteA64`
+                                     # implements the zero flag only, so far.
+                                     # NOT SubwordExtend: the hardware has `sxtb`,
+                                     # but nifasm's a64 selector has no tag for it
+                                     # and lowers an extend as a shift pair.
+                                     # NOT Freestanding: both a64 hosts have an OS.
+    frameStyle: PairFrame,
+    immStyle: A64Bitmask,
+    gprRangeText: "`x0`..`x30`",
+    targetName: "AArch64",
+    abiFloatCalleeSaved: @FloatCalleeSaved,
+    abiCalleeSaved: @IntCalleeSaved,
+    intCallerSavedSet: IntCallerSaved,
+    convClobbersGpr: @ConvClobbersGpr)
 
 proc regName*(r: Reg): string =
   case r

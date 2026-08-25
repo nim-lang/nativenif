@@ -1,0 +1,263 @@
+(.nif27)
+(.indexat 3886              )
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :clz64.0
+  (params
+   (param :x.0 .
+    (u 64)))
+  (u 64)
+  (pragmas
+   (instruction "clz"))
+  (stmts .))
+ (proc :ctz64.0
+  (params
+   (param :x.0 .
+    (u 64)))
+  (i 32)
+  (pragmas
+   (intrinsic "Ctz"))
+  (stmts .))
+ (proc :cmp64.0
+  (params
+   (param :a.0 .
+    (u 64))
+   (param :b.0 .
+    (u 64))).
+  (pragmas
+   (instruction "cmp"))
+  (stmts .))
+ (proc :zf.0
+  (params)
+  (bool)
+  (pragmas
+   (instruction "zf"))
+  (stmts .))
+ (gvar :g.0 .
+  (u 64)42)
+ (proc :addx.0
+  (params
+   (param :d.0 .
+    (ptr
+     (u 64)))
+   (param :s.0 .
+    (u 64))).
+  (pragmas
+   (instruction "add"))
+  (stmts .))
+ (proc :subx.0
+  (params
+   (param :d.0 .
+    (ptr
+     (u 64)))
+   (param :s.0 .
+    (u 64))).
+  (pragmas
+   (instruction "sub"))
+  (stmts .))
+ (proc :allocated.0
+  (params
+   (param :a.0 .
+    (u 64)))
+  (u 64)
+  (pragmas)
+  (stmts
+   (var :t.0 .
+    (u 64)a.0)
+   (instr addx.0
+    (haddr t.0)15)
+   (instr subx.0
+    (haddr t.0)5)
+   (ret t.0)))
+ (proc :addrG.0
+  (params)
+  (ptr
+   (u 64))
+  (pragmas
+   (assembler))
+  (stmts
+   (var :result.0 .
+    (ptr
+     (u 64)).)
+   (asgn result.0
+    (addr g.0))
+   (ret result.0)))
+ (proc :lead.0
+  (params
+   (param :x.0
+    (pragmas
+     (register "x0"))
+    (u 64)))
+  (u 64)
+  (pragmas
+   (assembler))
+  (stmts
+   (var :result.0 .
+    (u 64).)
+   (var :r.0
+    (pragmas
+     (register "x9"))
+    (u 64).)
+   (asgn r.0
+    (instr clz64.0 x.0))
+   (asgn result.0 r.0)
+   (ret result.0)))
+ (proc :trail.0
+  (params
+   (param :x.0
+    (pragmas
+     (register "x0"))
+    (u 64)))
+  (i 32)
+  (pragmas
+   (assembler))
+  (stmts
+   (var :result.0 .
+    (i 32).)
+   (var :r.0
+    (pragmas
+     (register "x9"))
+    (i 32).)
+   (asgn r.0
+    (instr ctz64.0 x.0))
+   (asgn result.0 r.0)
+   (ret result.0)))
+ (proc :pick.0
+  (params
+   (param :x.0
+    (pragmas
+     (register "x0"))
+    (u 64))
+   (param :y.0
+    (pragmas
+     (register "x1"))
+    (u 64)))
+  (u 64)
+  (pragmas
+   (assembler))
+  (stmts
+   (var :result.0 .
+    (u 64).)
+   (instr cmp64.0 x.0 y.0)
+   (if
+    (elif
+     (instr zf.0)
+     (stmts
+      (asgn result.0 3)))
+    (else
+     (stmts
+      (asgn result.0 1))))
+   (ret result.0)))
+ (proc :viaStack.0
+  (params
+   (param :x.0
+    (pragmas
+     (register "x0"))
+    (u 64)))
+  (u 64)
+  (pragmas
+   (assembler))
+  (stmts
+   (var :result.0 .
+    (u 64).)
+   (var :t.0
+    (pragmas
+     (stack))
+    (u 64).)
+   (var :r.0
+    (pragmas
+     (register "x19"))
+    (u 64).)
+   (asgn t.0 x.0)
+   (asgn r.0 t.0)
+   (asgn result.0 r.0)
+   (ret result.0)))
+ (proc :same.0
+  (params
+   (param :x.0
+    (pragmas
+     (register "x0"))
+    (u 64)))
+  (u 64)
+  (pragmas
+   (assembler)
+   (naked))
+  (stmts
+   (var :result.0 .
+    (u 64).)
+   (asgn result.0 x.0)
+   (ret result.0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :a.0 .
+    (u 64)
+    (call lead.0 65536))
+   (var :b.0 .
+    (u 64)
+    (conv
+     (u 64)
+     (call trail.0 1024)))
+   (var :c.0 .
+    (u 64)
+    (call pick.0 9 9))
+   (var :d.0 .
+    (u 64)
+    (call pick.0 9 8))
+   (var :e.0 .
+    (u 64)
+    (call viaStack.0 5))
+   (var :f.0 .
+    (u 64)
+    (call same.0 4))
+   (var :p.0 .
+    (ptr
+     (u 64))
+    (call addrG.0))
+   (var :h.0 .
+    (u 64)
+    (deref p.0))
+   (var :k.0 .
+    (u 64)
+    (call allocated.0 20))
+   (var :s0.0 .
+    (u 64)
+    (add
+     (u 64)a.0 b.0))
+   (var :s1.0 .
+    (u 64)
+    (add
+     (u 64)s0.0 c.0))
+   (var :s2.0 .
+    (u 64)
+    (add
+     (u 64)s1.0 d.0))
+   (var :s3.0 .
+    (u 64)
+    (add
+     (u 64)s2.0 e.0))
+   (var :s4.0 .
+    (u 64)
+    (add
+     (u 64)s3.0 f.0))
+   (var :s5.0 .
+    (u 64)
+    (add
+     (u 64)s4.0 h.0))
+   (var :s.0 .
+    (u 64)
+    (add
+     (u 64)s5.0 k.0))
+   (call exit.0
+    (conv
+     (i 32)s.0)))))
+(.index)

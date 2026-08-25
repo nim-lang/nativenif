@@ -1,0 +1,51 @@
+(.nif27)
+(.indexat 728              )
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :memcpy.0
+  (params
+   (param :d.0 .
+    (ptr
+     (i 32)))
+   (param :s.0 .
+    (ptr
+     (i 32)))
+   (param :n.0 .
+    (i 32)))
+  (ptr
+   (i 32))
+  (pragmas
+   (importc "memcpy"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :src.0 .
+    (array
+     (i 32)2).)
+   (var :dst.0 .
+    (array
+     (i 32)2).)
+   (asgn
+    (at src.0 0)40)
+   (asgn
+    (at src.0 1)2)
+   (call memcpy.0
+    (addr
+     (at dst.0 0))
+    (addr
+     (at src.0 0))16)
+   (call exit.0
+    (add
+     (i 32)
+     (at dst.0 0)
+     (at dst.0 1))))))(.index)

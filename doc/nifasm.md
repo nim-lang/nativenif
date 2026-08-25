@@ -36,7 +36,7 @@ The type system's goal is not only type checking but also facilitates the comput
 A key insight here is while assembler does not allow unnamed temporary expressions there is no reason it cannot keep field names instead of offsets (no control is lost). Likewise, structured control flow — `loop` and `ite` with forward-only `lab`/`jmp`, the shape Leng's Final IR already has — is easy enough to map to labels and offsets (no control is lost either).
 
 Note on notation: this document shows the NIF text format. The complete tag vocabulary — every type, declaration,
-addressing mode, register, flag and machine instruction of both targets — is
+addressing mode, register, flag and machine instruction of every target — is
 [instructions.md](instructions.md). What follows is what those tags *mean*.
 
 
@@ -74,7 +74,7 @@ Registers are typically not written directly, instead if they are used as local 
 
 Declarations are either bound to a register or to a stack slot. Instead of a register name the `(s)` tag is used then. The `(s)` tag explicitly indicates storage location (stack allocation), which is separate from the type information. Since we know the type of every declaration the slot's offset is computed by `nifasm`. Again, this keeps the code more readable. An instruction can use the tag `(ssize)` to access the maximum required stack size. This is typically used in function prologs and epilogs.
 
-Stack-allocated variables can have compound types (arrays, objects). When a variable name bound to a stack slot is used in an address expression (`(dot ...)`, `(at ...)`), it stands for the *address* of the stack-allocated value — the frame base plus the computed offset — so arrays and objects on the stack are accessed by name, with no explicit address computation. The two targets spell the frame base differently: x86-64 wants it as an operand of its own, AArch64 takes it from the slot.
+Stack-allocated variables can have compound types (arrays, objects). When a variable name bound to a stack slot is used in an address expression (`(dot ...)`, `(at ...)`, `(mem ...)`), it stands for the *address* of the stack-allocated value — the frame base plus the computed offset — so arrays and objects on the stack are accessed by name, with no explicit address computation. The frame base is never written out: the slot carries it, on every target.
 
 Note: The `(s)` tag is required for clarity - it explicitly separates storage location from type. For example, `(var :arr.0 (s) (array (i 32) 6))` makes it clear that `(s)` is about where the variable is stored (stack), while `(array (i 32) 6)` is about its type (array of 6 int32s). A slot can also demand a stricter alignment than its type implies, as `(s (align 16))`.
 
@@ -82,14 +82,31 @@ Note: The `(s)` tag is required for clarity - it explicitly separates storage lo
 (var :arr.0 (s) (array (i 32) 6))  # stack array of 6 int32s
 (var :p.0 (s) Point.0)             # stack object of type Point.0
 
-# x86-64: the frame base register is written out
-(mov (rax) (mem (at (rsp) arr.0 (rcx))))  # loads arr[rcx] - [rsp+offset+rcx*4]
-(mov (rbx) (mem (dot (rsp) p.0 x.0)))     # loads p.x    - [rsp+offset+field_offset]
+# x86-64
+(mov (rax) (mem (at arr.0 (rcx))))  # loads arr[rcx] - [rsp+offset+rcx*4]
+(mov (rbx) (mem (dot p.0 x.0)))     # loads p.x    - [rsp+offset+field_offset]
 
-# AArch64: the slot carries its own frame base, so it is left implicit
+# AArch64 / Cortex-M: the same spelling
 (mov (x0) (mem (at arr.0 (x9))))
 (mov (x1) (mem (dot p.0 x.0)))
 ```
+
+A slot can also be addressed with a raw byte offset inside it, `(mem <slot> <off>)`.
+This is what lets one word of a stack aggregate be read or written without first
+materializing the aggregate's address in a register, so a copy out of a named slot
+costs zero address registers instead of one. The access *width* still comes from the
+operand's type, so a caller reading a raw eightbyte wraps it in a cast:
+
+```
+(mov (rax) (cast (u 64) (mem p.0 8)))   # the second eightbyte of the slot `p.0`
+```
+
+`off` is bounds-checked against the slot — the one safety a `(cast (aptr T) <reg>)`
+access can never have, since the register form has no object to check against.
+
+For x86-64 the older explicit-base spellings `(mem (rsp) <slot> [off])`,
+`(dot (rsp) <slot> <field>)` and `(at (rsp) <slot> <index>)` remain accepted, but
+carry no information: `rsp` is the only base a slot ever has there.
 
 `(ssize)` is the frame size the assembler computed for the current proc; the prologue and
 epilogue use it (`(sub (rsp) (ssize))` / `(add (rsp) (ssize))`). Slots declared inside a
@@ -492,7 +509,7 @@ The `(at <base> <index>)` construct computes the address of an array element. Th
 (mov (rax) (mem (at (rsp) buf.0 (rcx))))
 ```
 
-An immediate index folds into the displacement for any element size. A **register** index has to become a scale factor in the addressing mode, and both targets accept the same four: 1, 2, 4 and 8 (x86-64's SIB scale, AArch64's shifted register offset). Anything else needs a multiply into a temporary — and managing temporaries is not the assembler's job, so it will not invent one. Either the code generator supplies it, as a third operand:
+An immediate index folds into the displacement for any element size. A **register** index has to become a scale factor in the addressing mode, and every target accepts the same four: 1, 2, 4 and 8 (x86-64's SIB scale, AArch64's and Thumb-2's shifted register offset). Anything else needs a multiply into a temporary — and managing temporaries is not the assembler's job, so it will not invent one. Either the code generator supplies it, as a third operand:
 
 ```
 (mov (rax) (mem (at points.0 (rcx) (rdx))))   # rdx = scratch: rdx = points + rcx*16
@@ -539,7 +556,7 @@ Note that `(mem ...)` is required for all memory operations. It can wrap address
 
 ## Instructions
 
-The complete instruction set of both targets — mnemonic, operand shape and meaning — is
+The complete instruction set of every target — mnemonic, operand shape and meaning — is
 [instructions.md](instructions.md), which is also the file the enums are generated from.
 It is the authoritative list; there is deliberately no second copy of it here.
 
@@ -548,10 +565,11 @@ What is worth knowing about it in prose:
 - Instructions follow the pattern `(instr <dest> <src>)`, or `(instr <operand>)` for unary
   ones, unless the table says otherwise. Two-operand forms read and write `dest`, and
   AArch64's three-operand forms are spelled with a `3` suffix (`add3`, `mul3`, …).
-- The `Enums` column says which target a tag belongs to. A row naming both `X64Inst` and
-  `A64Inst` is the *cross-target* vocabulary — `mov`, `lea`, `add`, `sub`, `cmp`, `call`,
-  `ret`, `lab`, `ite`, `loop`, `stmts`, `scope`, `kill`, `rebind` — and it is what lets most
-  of a code generator stay platform independent.
+- The `Enums` column says which target a tag belongs to: `X64Inst` (x86-64), `A64Inst`
+  (AArch64), `MInst` (Thumb-2 / Cortex-M). A row naming more than one is the
+  *cross-target* vocabulary — `mov`, `lea`, `add`, `sub`, `cmp`, `call`, `ret`, `lab`,
+  `ite`, `loop`, `stmts`, `scope`, `kill`, `rebind` — and it is what lets most of a code
+  generator stay platform independent.
 - Instructions whose register operands are fixed by the hardware still name them
   explicitly: `(div (rdx) (rax) <src>)` and `(idiv (rdx) (rax) <src>)` spell out the
   dividend/quotient/remainder registers even though the encoding has no choice, so the

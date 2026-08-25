@@ -1,0 +1,64 @@
+(.nif27)
+(.indexat 330              )
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :id.0
+  (params
+   (param :a.0 .
+    (i 32)))
+  (i 32)
+  (pragmas)
+  (stmts
+   (ret a.0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :v0.0 .
+    (i 32)1)
+   (var :v1.0 .
+    (i 32)2)
+   (var :v2.0 .
+    (i 32)3)
+   (var :v3.0 .
+    (i 32)4)
+   (var :v4.0 .
+    (i 32)5)
+   (var :v5.0 .
+    (i 32)6)
+   (var :v6.0 .
+    (i 32)7)
+   (var :r.0 .
+    (i 32)
+    (call id.0 100))
+   (call exit.0
+    (add
+     (i 32)(add
+     (i 32)(add
+     (i 32)(add
+     (i 32)(add
+     (i 32)(add
+     (i 32)(add
+     (i 32)(add
+     (i 32)(add
+     (i 32)(add
+     (i 32)(add
+     (i 32)(add
+     (i 32)(add
+     (i 32)(add
+     (i 32)(add
+     (i 32)(add
+     (i 32)(add
+     (i 32)(add
+     (i 32)(add
+     (i 32)(add
+     (i 32)(add
+     (i 32)v0.0 v1.0) v2.0) v3.0) v4.0) v5.0) v6.0) v0.0) v1.0) v2.0) v3.0) v4.0) v5.0) v6.0) v0.0) v1.0) v2.0) v3.0) v4.0) v5.0) v6.0) r.0)))))(.index)

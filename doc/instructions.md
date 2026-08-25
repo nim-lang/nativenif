@@ -2,12 +2,13 @@
 
 The complete tag set of the asm-NIF dialect `nifasm` reads: types, declarations,
 addressing-mode expressions, registers, flags, and every machine instruction of
-both targets. See [nifasm.md](nifasm.md) for what the language *means*; this is
+every target. See [nifasm.md](nifasm.md) for what the language *means*; this is
 the authoritative list of what exists.
 
 The `Enums` column names the Nim enums a tag becomes a member of, and thereby
-which target it belongs to: `X64Inst` only, `A64Inst` only, or both for the
-cross-target vocabulary. This table is the input to
+which target it belongs to: `X64Inst` (x86-64), `A64Inst` (AArch64), `MInst`
+(Thumb-2 / Cortex-M), or several of them for the cross-target vocabulary. This
+table is the input to
 `tools/gen_instructions.nim`, which generates `src/nifasm/tags.nim` (the tag ids)
 and `src/nifasm/model.nim` (the enums). Both are generated — edit this file, not
 them, and regenerate from the repository root:
@@ -36,48 +37,70 @@ nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
 | `(result D L T)`       | NifasmDecl                  | result value declaration |
 | `(clobber ...)`        | NifasmDecl                  | clobbered registers list |
 | `(var D L T)`          | NifasmDecl                  | variable declaration |
-| `(arch x64/arm64)`     | NifasmDecl                  | architecture pragma |
+| `(layout ...)`         | NifasmDecl                  | Cortex-M: the board's memory layout, as arkham read it out of the `--layout:` file and forwarded. Children are the `flash`/`sram`/`stacks`/`heap`/`noinit`/`core` rows below. There is no row saying which region a section lives in: code and constants go where the image is, mutable storage goes where nothing is, and a row restating that would only be a chance to write it wrong. Supersedes the memory-map command-line flags |
+| `(flash ...)`          | NifasmDecl                  | Cortex-M: the region the IMAGE SHIPS IN — code, constants, and the initializer image for globals — as a `(startAddress …)` and one size row. Named for the part rather than for a permission: whether the silicon is writable is beside the point (MPS2's region at 0 is ZBT SRAM), what matters is that its contents survive reset |
+| `(sram ...)`           | NifasmDecl                  | Cortex-M: the region that holds NOTHING at reset — globals, stacks, heap — as a `(startAddress …)` and one size row. Everything in it is established by the startup code |
+| `(startAddress N)`     | NifasmExpr                  | Cortex-M: a region's, or a peripheral's, first address. Spelled out rather than `origin` because a layout row holds two numbers and the reader should not have to remember which is which |
+| `(bytes N)`            | NifasmExpr                  | Cortex-M: a size in bytes. NIF has no `4K` literal, so a size is a TAGGED quantity and the unit is never guessed from the number |
+| `(kilobytes N)`        | NifasmExpr                  | Cortex-M: a size, times 1024 |
+| `(megabytes N)`        | NifasmExpr                  | Cortex-M: a size, times 1024*1024 |
+| `(stacks ...)`         | NifasmDecl                  | Cortex-M: the per-thread stack slots, in `sram` — a `(slots N)`, one size row for the SLOT, and a `(tvar …)`. The slot size must be a power of two: a thread reaches its own thread-locals by masking SP with it |
+| `(slots N)`            | NifasmExpr                  | Cortex-M: how many stack slots the region holds |
+| `(heap ...)`           | NifasmDecl                  | Cortex-M: the heap, in `sram` — one size row. This is what the allocator gets pages from; there is no array in the globals standing in for it |
+| `(noinit ...)`         | NifasmDecl                  | Cortex-M: bytes at the TOP of `sram` that the startup code neither copies into nor zeroes — one size row. Everything else in `sram` is established at reset, which is exactly what a reboot counter or a crash record must NOT be: it is written by the run that failed and read by the run after it. Survives a WARM reset only; a part with battery-backed SRAM keeps its contents across power loss too, and that is a different guarantee |
+| `(core N)`             | NifasmDecl                  | Cortex-M: which stack slot THIS image boots on. One image per core, so the number is a constant the author knows and not something read from a CPUID register — M-profile has no architectural core id |
+| `(interrupts ...)`     | NifasmDecl                  | Cortex-M: the interrupt table, as `(irq N S)` children — handler `S` occupies architectural table slot `N`. Slots the module does not name stay zero. Slots 0 and 1 are the image writer's (initial MSP, reset) and may not appear |
+| `(irq N S)`            | NifasmDecl                  | Cortex-M: one interrupt-table entry — slot number, then the handler symbol. Its address is baked with the Thumb bit, like every other code address on this target |
+| `(arch x64/arm64)`     | NifasmDecl                  | architecture pragma: `x64`, `linux_arm64`, `arm64`, `win_x64`, `win_arm64`, `cortex_m` |
 | `(s)`                  | X64Flag                 | stack slot location tag |
 | `(align N)`            | NifasmExpr                  | stack-slot alignment annotation (child of `(s)`) |
 | `(ssize)` / `(ssize N)` | NifasmExpr                 | stack size expression; the optional `N` adds N bytes at THIS site only (the prologue folds its 16-alignment pad in) |
 | `(csize)`              | NifasmExpr                  | call stack size expression |
+| `(dataload)`           | NifasmExpr                  | Cortex-M: flash address the `.data` initializer image is loaded from |
+| `(datavma)`            | NifasmExpr                  | Cortex-M: SRAM address `.data` occupies at run time |
+| `(datasize)`           | NifasmExpr                  | Cortex-M: bytes to copy from `(dataload)` to `(datavma)` |
+| `(heapstart)`          | NifasmExpr                  | Cortex-M: the address of the heap the board layout reserved. A link-time constant the runtime cannot compute — a firmware image has no OS to ask for pages |
+| `(heapsize)`           | NifasmExpr                  | Cortex-M: how many bytes of it there are |
+| `(noinitstart)`        | NifasmExpr                  | Cortex-M: the address of the region the board layout kept back from the startup code. A link-time constant for the same reason `(heapstart)` is: only the image writer knows where it landed |
+| `(noinitsize)`         | NifasmExpr                  | Cortex-M: how many bytes of it there are |
+| `(bsssize)`            | NifasmExpr                  | Cortex-M: bytes to zero immediately above `(datavma)` + `(datasize)` |
 | `(arg S)`              | NifasmExpr                  | argument reference in prepare block |
 | `(res S)`              | NifasmExpr                  | result reference in prepare block |
-| `(prepare S ...)`      | X64Inst, A64Inst            | prepare block for function call |
-| `(mov D S)`            | X64Inst, A64Inst         | move instruction |
-| `(lea D S)`            | X64Inst, A64Inst         | load effective address |
+| `(prepare S ...)`      | X64Inst, A64Inst, MInst | prepare block for function call |
+| `(mov D S)`            | X64Inst, A64Inst, MInst | move instruction |
+| `(lea D S)`            | X64Inst, A64Inst, MInst | load effective address |
 | `(movzx D S N)`        | X64Inst                  | D = the low `N` bits of S, ZERO-extended into the full 64-bit D (`N` is 8, 16 or 32) |
 | `(movsx D S N)`        | X64Inst                  | D = the low `N` bits of S, SIGN-extended into the full 64-bit D (`N` is 8, 16 or 32) |
 | `(movapd D S)`         | X64Inst                  | move aligned packed double |
 | `(movsd D S)`          | X64Inst                  | move scalar double |
 | `(movdqu D S)`         | X64Inst                  | move unaligned 128 bits (xmm/mem both sides; the access is inherently 16 bytes — the mem operand's scalar type is not consulted, matching the hardware) |
-| `(add D S)`            | X64Inst, A64Inst         | add instruction |
-| `(sub D S)`            | X64Inst, A64Inst         | subtract instruction |
-| `(mul S)`              | X64Inst, A64Inst         | unsigned multiply |
+| `(add D S)`            | X64Inst, A64Inst, MInst | add instruction |
+| `(sub D S)`            | X64Inst, A64Inst, MInst | subtract instruction |
+| `(mul S)`              | X64Inst, A64Inst, MInst | unsigned multiply |
 | `(imul D S)`           | X64Inst                  | signed multiply |
 | `(div D S R)`          | X64Inst                  | unsigned divide |
 | `(idiv D S R)`         | X64Inst                  | signed divide |
-| `(sdiv D S)`           | A64Inst                  | signed divide |
-| `(udiv D S)`           | A64Inst                  | unsigned divide |
+| `(sdiv D S)`           | A64Inst, MInst | signed divide |
+| `(udiv D S)`           | A64Inst, MInst | unsigned divide |
 | `(smulh D S)`          | A64Inst                  | signed multiply high (top 64 bits of D*S) |
 | `(umulh D S)`          | A64Inst                  | unsigned multiply high (top 64 bits of D*S) |
-| `(add3 D A B)`         | A64Inst                  | 3-operand add (D = A + B) |
-| `(sub3 D A B)`         | A64Inst                  | 3-operand subtract (D = A - B) |
-| `(mul3 D A B)`         | A64Inst                  | 3-operand multiply (D = A * B) |
-| `(and3 D A B)`         | A64Inst                  | 3-operand bitwise and (D = A and B) |
-| `(orr3 D A B)`         | A64Inst                  | 3-operand bitwise or (D = A or B) |
-| `(eor3 D A B)`         | A64Inst                  | 3-operand bitwise xor (D = A xor B) |
-| `(lsl3 D A B)`         | A64Inst                  | 3-operand logical shift left (D = A shl B) |
-| `(lsr3 D A B)`         | A64Inst                  | 3-operand logical shift right (D = A shr B) |
-| `(asr3 D A B)`         | A64Inst                  | 3-operand arithmetic shift right (D = A sar B) |
-| `(addw D S)`           | A64Inst                  | 32-bit add (W-form, result zero-extended) |
-| `(subw D S)`           | A64Inst                  | 32-bit subtract (W-form, result zero-extended) |
-| `(mulw D S)`           | A64Inst                  | 32-bit multiply (W-form, result zero-extended) |
-| `(addw3 D A B)`        | A64Inst                  | 32-bit 3-operand add (D = A + B, W-form) |
-| `(subw3 D A B)`        | A64Inst                  | 32-bit 3-operand subtract (D = A - B, W-form) |
-| `(mulw3 D A B)`        | A64Inst                  | 32-bit 3-operand multiply (D = A * B, W-form) |
-| `(gload D S)`          | A64Inst                  | load scalar from global S: adrp + folded ldr (drops the address `add`) |
-| `(gstore D S)`         | A64Inst                  | store scalar D to global S: adrp + folded str |
+| `(add3 D A B)`         | A64Inst, MInst | 3-operand add (D = A + B) |
+| `(sub3 D A B)`         | A64Inst, MInst | 3-operand subtract (D = A - B) |
+| `(mul3 D A B)`         | A64Inst, MInst | 3-operand multiply (D = A * B) |
+| `(and3 D A B)`         | A64Inst, MInst | 3-operand bitwise and (D = A and B) |
+| `(orr3 D A B)`         | A64Inst, MInst | 3-operand bitwise or (D = A or B) |
+| `(eor3 D A B)`         | A64Inst, MInst | 3-operand bitwise xor (D = A xor B) |
+| `(lsl3 D A B)`         | A64Inst, MInst | 3-operand logical shift left (D = A shl B) |
+| `(lsr3 D A B)`         | A64Inst, MInst | 3-operand logical shift right (D = A shr B) |
+| `(asr3 D A B)`         | A64Inst, MInst | 3-operand arithmetic shift right (D = A sar B) |
+| `(addw D S)`           | A64Inst, MInst | 32-bit add (W-form, result zero-extended) |
+| `(subw D S)`           | A64Inst, MInst | 32-bit subtract (W-form, result zero-extended) |
+| `(mulw D S)`           | A64Inst, MInst | 32-bit multiply (W-form, result zero-extended) |
+| `(addw3 D A B)`        | A64Inst, MInst | 32-bit 3-operand add (D = A + B, W-form) |
+| `(subw3 D A B)`        | A64Inst, MInst | 32-bit 3-operand subtract (D = A - B, W-form) |
+| `(mulw3 D A B)`        | A64Inst, MInst | 32-bit 3-operand multiply (D = A * B, W-form) |
+| `(gload D S)`          | A64Inst, MInst | load scalar from global S: adrp + folded ldr (drops the address `add`) |
+| `(gstore D S)`         | A64Inst, MInst | store scalar D to global S: adrp + folded str |
 | `(addsd D S)`          | X64Inst                  | add scalar double |
 | `(subsd D S)`          | X64Inst                  | subtract scalar double |
 | `(mulsd D S)`          | X64Inst                  | multiply scalar double |
@@ -97,21 +120,21 @@ nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
 | `(comiss D S)`         | X64Inst                  | compare scalar single, set EFLAGS |
 | `(movfq D S)`          | X64Inst                  | move 64 bits between gpr and xmm; `(movfq (xmmD) (xmmS))` is SSE `movq xmm,xmm` — D.lo = S.lo with D's high lane ZEROED (gcc's lane sanitizer before packed ops) |
 | `(movfd D S)`          | X64Inst                  | move 32 bits between gpr and xmm |
-| `(and D S)`            | X64Inst, A64Inst         | bitwise and |
+| `(and D S)`            | X64Inst, A64Inst, MInst | bitwise and |
 | `(or D S)`             | X64Inst                  | bitwise or |
-| `(orr D S)`            | A64Inst                  | bitwise or |
+| `(orr D S)`            | A64Inst, MInst | bitwise or |
 | `(xor D S)`            | X64Inst                  | bitwise xor |
-| `(eor D S)`            | A64Inst                  | bitwise xor |
+| `(eor D S)`            | A64Inst, MInst | bitwise xor |
 | `(shl D S)`            | X64Inst                  | shift left |
-| `(lsl D S)`            | A64Inst                  | logical shift left |
+| `(lsl D S)`            | A64Inst, MInst | logical shift left |
 | `(shr D S)`            | X64Inst                  | shift right |
-| `(lsr D S)`            | A64Inst                  | logical shift right |
+| `(lsr D S)`            | A64Inst, MInst | logical shift right |
 | `(sal D S)`            | X64Inst                  | shift arithmetic left |
 | `(sar D S)`            | X64Inst                  | shift arithmetic right |
-| `(asr D S)`            | A64Inst                  | arithmetic shift right |
+| `(asr D S)`            | A64Inst, MInst | arithmetic shift right |
 | `(inc O)`              | X64Inst                  | increment |
 | `(dec O)`              | X64Inst                  | decrement |
-| `(neg O)`              | X64Inst, A64Inst         | negate |
+| `(neg O)`              | X64Inst, A64Inst, MInst | negate |
 | `(not O)`              | X64Inst                  | bitwise not |
 | `(rol D S)`            | X64Inst                  | rotate left |
 | `(ror D S)`            | X64Inst                  | rotate right |
@@ -123,7 +146,7 @@ nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
 | `(bts D S)`            | X64Inst                  | bit test and set |
 | `(btr D S)`            | X64Inst                  | bit test and reset |
 | `(btc D S)`            | X64Inst                  | bit test and complement |
-| `(cmp D S)`            | X64Inst, A64Inst         | compare |
+| `(cmp D S)`            | X64Inst, A64Inst, MInst | compare |
 | `(test D S)`           | X64Inst                  | test |
 | `(sete D)`             | X64Inst                  | set byte if equal |
 | `(setz D)`             | X64Inst                  | set byte if zero |
@@ -200,39 +223,39 @@ nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
 | `(jo L)`               | X64Inst                  | jump if overflow |
 | `(jno L)`              | X64Inst                  | jump if not overflow |
 | `(jp L)`               | X64Inst                  | jump if parity (unordered float compare) |
-| `(call T ...)`         | X64Inst, A64Inst         | function call marker inside prepare |
-| `(extcall)`            | X64Inst, A64Inst         | external call marker inside prepare |
+| `(call T ...)`         | X64Inst, A64Inst, MInst | function call marker inside prepare |
+| `(extcall)`            | X64Inst, A64Inst, MInst | external call marker inside prepare |
 | `(tailcall T ...)`     | X64Inst, A64Inst         | tail-call marker inside prepare: branch/jmp, no return address pushed |
 | `(popframe)`           | X64Inst, A64Inst         | undo this proc's prologue (frame sub + saved registers) |
 | `(iat S)`              | X64Inst                  | indirect call through IAT (Import Address Table) |
-| `(ret)`                | X64Inst, A64Inst         | return instruction |
+| `(ret)`                | X64Inst, A64Inst, MInst | return instruction |
 | `(push O)`             | X64Inst                  | push to stack |
 | `(pop O)`              | X64Inst                  | pop from stack |
-| `(nop)`                | X64Inst, A64Inst         | no operation |
+| `(nop)`                | X64Inst, A64Inst, MInst | no operation |
 | `(syscall)`            | X64Inst                  | system call |
 | `(svc N)`              | A64Inst                  | supervisor call (system call) |
-| `(adr D L)`            | A64Inst                  | load address of label |
-| `(ldr D S)`            | A64Inst                  | load register |
-| `(str D S)`            | A64Inst                  | store register |
+| `(adr D L)`            | A64Inst, MInst | load address of label |
+| `(ldr D S)`            | A64Inst, MInst | load register |
+| `(str D S)`            | A64Inst, MInst | store register |
 | `(stp D1 D2 S)`        | A64Inst                  | store pair |
 | `(ldp D1 D2 S)`        | A64Inst                  | load pair |
-| `(b L)`                | A64Inst                  | branch (unconditional jump) |
-| `(bl L)`               | A64Inst                  | branch with link (function call) |
-| `(beq L)`              | A64Inst                  | branch if equal |
-| `(bne L)`              | A64Inst                  | branch if not equal |
-| `(blt L)`              | A64Inst                  | branch if less than (signed) |
-| `(ble L)`              | A64Inst                  | branch if less or equal (signed) |
-| `(bgt L)`              | A64Inst                  | branch if greater than (signed) |
-| `(bge L)`              | A64Inst                  | branch if greater or equal (signed) |
-| `(blo L)`              | A64Inst                  | branch if lower (unsigned <) |
-| `(bls L)`              | A64Inst                  | branch if lower or same (unsigned <=) |
-| `(bhi L)`              | A64Inst                  | branch if higher (unsigned >) |
-| `(bhs L)`              | A64Inst                  | branch if higher or same (unsigned >=) |
-| `(cbz S L)`            | A64Inst                  | branch to L if S is zero (no flags read) |
-| `(cbnz S L)`           | A64Inst                  | branch to L if S is non-zero (no flags read) |
+| `(b L)`                | A64Inst, MInst | branch (unconditional jump) |
+| `(bl L)`               | A64Inst, MInst | branch with link (function call) |
+| `(beq L)`              | A64Inst, MInst | branch if equal |
+| `(bne L)`              | A64Inst, MInst | branch if not equal |
+| `(blt L)`              | A64Inst, MInst | branch if less than (signed) |
+| `(ble L)`              | A64Inst, MInst | branch if less or equal (signed) |
+| `(bgt L)`              | A64Inst, MInst | branch if greater than (signed) |
+| `(bge L)`              | A64Inst, MInst | branch if greater or equal (signed) |
+| `(blo L)`              | A64Inst, MInst | branch if lower (unsigned <) |
+| `(bls L)`              | A64Inst, MInst | branch if lower or same (unsigned <=) |
+| `(bhi L)`              | A64Inst, MInst | branch if higher (unsigned >) |
+| `(bhs L)`              | A64Inst, MInst | branch if higher or same (unsigned >=) |
+| `(cbz S L)`            | A64Inst, MInst | branch to L if S is zero (no flags read) |
+| `(cbnz S L)`           | A64Inst, MInst | branch to L if S is non-zero (no flags read) |
 | `(cseleq D S1 S2)`     | A64Inst                  | conditional select: D = if equal then S1 else S2 |
 | `(cselne D S1 S2)`     | A64Inst                  | conditional select: D = if not equal then S1 else S2 |
-| `(csellt D S1 S2)`     | A64Inst                  | conditional select: D = if less than (signed) then S1 else S2 |
+| `(csellt D S1 S2)`     | A64Inst, MInst | conditional select: D = if less than (signed) then S1 else S2 |
 | `(cselle D S1 S2)`     | A64Inst                  | conditional select: D = if less or equal (signed) then S1 else S2 |
 | `(cselgt D S1 S2)`     | A64Inst                  | conditional select: D = if greater than (signed) then S1 else S2 |
 | `(cselge D S1 S2)`     | A64Inst                  | conditional select: D = if greater or equal (signed) then S1 else S2 |
@@ -250,22 +273,22 @@ nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
 | `(csetls D)`           | A64Inst                  | conditional set: D = if lower or same (unsigned <=) then 1 else 0 |
 | `(csethi D)`           | A64Inst                  | conditional set: D = if higher (unsigned >) then 1 else 0 |
 | `(cseths D)`           | A64Inst                  | conditional set: D = if higher or same (unsigned >=) then 1 else 0 |
-| `(lab L)`              | X64Inst, A64Inst         | label definition |
-| `(ite ...)`            | X64Inst, A64Inst         | if-then-else structure |
-| `(loop ...)`           | X64Inst, A64Inst         | loop structure |
-| `(stmts ...)`          | X64Inst, A64Inst         | statement block |
+| `(lab L)`              | X64Inst, A64Inst, MInst | label definition |
+| `(ite ...)`            | X64Inst, A64Inst, MInst | if-then-else structure |
+| `(loop ...)`           | X64Inst, A64Inst, MInst | loop structure |
+| `(stmts ...)`          | X64Inst, A64Inst, MInst | statement block |
 | `(cfvar D)`            | NifasmDecl                  | control flow variable declaration |
-| `(jtrue ...)`          | X64Inst, A64Inst            | set control flow variable(s) to true |
+| `(jtrue ...)`          | X64Inst, A64Inst, MInst | set control flow variable(s) to true |
 | `(dot B F)`            | NifasmExpr                  | field access |
 | `(at B I)`             | NifasmExpr                  | array index |
 | `(mem ...)`            | NifasmExpr                  | memory reference: `(mem base)`, `(mem base disp)`, `(mem base index scale [disp])` (base/index are raw registers or register-homed locals/params), or the no-base scaled form `(mem 0 index scale [disp])` = `[index*scale + disp]` (x64: SIB base=101; the literal `0` base is unambiguous since a real base is never an immediate) |
 | `(rodata L S)`         | NifasmDecl                  | read-only data (string/bytes) |
 | `(gvar D L T)`         | NifasmDecl                  | global variable |
-| `(tvar D L T)`         | NifasmDecl                  | thread local variable |
+| `(tvar D L T)`; `(tvar SIZE)` | NifasmDecl, NifasmExpr | thread local variable. ONE tag, two readings, because both say the same thing at different scales: as a declaration it is one thread-local, and inside a Cortex-M `(stacks …)` it is the bytes reserved for ALL of them at the top of every stack slot, just below where SP starts |
 | `(imp S)`              | NifasmDecl                  | import dynamic library |
 | `(extproc D S)`        | NifasmDecl                  | external proc from imported library |
 | `(syproc D ...)`       | NifasmDecl                  | system-call proc declaration (proctype + clobbers + number) |
-| `(kill S)`             | X64Inst, A64Inst            | kill variable |
+| `(kill S)`             | X64Inst, A64Inst, MInst | kill variable |
 | `(cast T E)`         | NifasmExpr                  | type cast; over a memory operand it retypes (and thereby sizes) the access; over a REGISTER operand of an x64 ALU instruction (add/sub/and/or/xor/cmp/test/shl/shr/sar/neg/not) an explicit sub-width int type (8/16/32 bits) sizes the OPERATION: 32-bit zero-extends the destination, 8/16-bit preserve its upper bits, flags and shift-count masking follow the width. Never inferred from a symbol's declared type, and `mov` still rejects a cast register destination |
 | `(reloc O S)`          | NifasmExpr                  | rodata relocation: bake symbol S's address at byte offset O |
 | `(lock I)`             | X64Inst                  | atomic lock prefix |
@@ -291,22 +314,22 @@ nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
 | `(rdi)`              | X64Reg                   | register rdi |
 | `(rbp)`              | X64Reg                   | register rbp |
 | `(rsp)`              | X64Reg                   | register rsp |
-| `(r8)`               | X64Reg                   | register r8 |
-| `(r9)`               | X64Reg                   | register r9 |
-| `(r10)`              | X64Reg                   | register r10 |
-| `(r11)`              | X64Reg                   | register r11 |
-| `(r12)`              | X64Reg                   | register r12 |
+| `(r8)`               | X64Reg, MReg             | register r8 |
+| `(r9)`               | X64Reg, MReg             | register r9 |
+| `(r10)`              | X64Reg, MReg             | register r10 |
+| `(r11)`              | X64Reg, MReg             | register r11 |
+| `(r12)`              | X64Reg, MReg             | register r12 |
 | `(r13)`              | X64Reg                   | register r13 |
 | `(r14)`              | X64Reg                   | register r14 |
 | `(r15)`              | X64Reg                   | register r15 |
-| `(r0)`               | X64Reg                   | register r0 (alias) |
-| `(r1)`               | X64Reg                   | register r1 (alias) |
-| `(r2)`               | X64Reg                   | register r2 (alias) |
-| `(r3)`               | X64Reg                   | register r3 (alias) |
-| `(r4)`               | X64Reg                   | register r4 (alias) |
-| `(r5)`               | X64Reg                   | register r5 (alias) |
-| `(r6)`               | X64Reg                   | register r6 (alias) |
-| `(r7)`               | X64Reg                   | register r7 (alias) |
+| `(r0)`               | X64Reg, MReg             | register r0 (alias) |
+| `(r1)`               | X64Reg, MReg             | register r1 (alias) |
+| `(r2)`               | X64Reg, MReg             | register r2 (alias) |
+| `(r3)`               | X64Reg, MReg             | register r3 (alias) |
+| `(r4)`               | X64Reg, MReg             | register r4 (alias) |
+| `(r5)`               | X64Reg, MReg             | register r5 (alias) |
+| `(r6)`               | X64Reg, MReg             | register r6 (alias) |
+| `(r7)`               | X64Reg, MReg             | register r7 (alias) |
 | `(xmm0)`             | X64Reg                   | register xmm0 |
 | `(xmm1)`             | X64Reg                   | register xmm1 |
 | `(xmm2)`             | X64Reg                   | register xmm2 |
@@ -354,7 +377,7 @@ nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
 | `(x28)`              | A64Reg                   | register x28 |
 | `(x29)`              | A64Reg                   | register x29 |
 | `(x30)`              | A64Reg                   | register x30 |
-| `(sp)`               | A64Reg                   | stack pointer |
+| `(sp)`               | A64Reg, MReg             | stack pointer |
 | `(w0)`               | A64Reg                   | register w0 (32-bit) |
 | `(w1)`               | A64Reg                   | register w1 (32-bit) |
 | `(w2)`               | A64Reg                   | register w2 (32-bit) |
@@ -387,7 +410,7 @@ nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
 | `(w29)`              | A64Reg                   | register w29 (32-bit) |
 | `(w30)`              | A64Reg                   | register w30 (32-bit) |
 | `(wsp)`              | A64Reg                   | stack pointer (32-bit) |
-| `(lr)`               | A64Reg                   | link register (alias for x30) |
+| `(lr)`               | A64Reg, MReg             | link register (alias for x30) |
 | `(fp)`               | A64Reg                   | frame pointer (alias for x29) |
 | `(xzr)`              | A64Reg                   | zero register |
 | `(of)`               | X64Flag                 | overflow flag |
@@ -415,9 +438,11 @@ nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
 | `(stlxr St D S)`     | A64Inst                 | store-release exclusive register (St = status) |
 | `(ldar D S)`         | A64Inst                 | load-acquire register |
 | `(stlr D S)`         | A64Inst                 | store-release register |
-| `(dmb)`              | A64Inst                 | data memory barrier (inner shareable) |
-| `(clrex)`            | A64Inst                 | clear exclusive monitor |
-| `(yield)`            | A64Inst                 | spin-wait hint (`hint #1`) |
+| `(dmb)`              | A64Inst, MInst          | data memory barrier: every access before it is observed before any after it. One row for both Arm profiles because it is one instruction — but it is load-bearing on only one of them: AArch64 folds ordering into `ldaxr`/`stlxr`, while ARMv7-M has no acquire/release form at all, so a Cortex-M atomic is a `dmb`-bracketed `ldrex`/`strex` pair and the barrier is a separate instruction the emitter places |
+| `(clrex)`            | A64Inst, MInst          | clear exclusive monitor — abandon the claim the last exclusive load took. Emitted on every path that leaves a load-exclusive/store-exclusive pair WITHOUT the store, so a later unrelated exclusive store cannot succeed against a claim nobody still means |
+| `(ldrex D S N)`      | MInst                   | ARMv7-M exclusive load: `D` ← the `N`-bit cell at `[S]`, taking the monitor's claim on that address. `N` is 8, 16 or 32 and selects `ldrexb`/`ldrexh`/`ldrex`; there is no 64-bit form on this profile (no `ldrexd`), which is why a 64-bit atomic is refused by name rather than split into halves — two claims are not one atom |
+| `(strex St D S N)`   | MInst                   | ARMv7-M exclusive store: store the `N`-bit `D` into `[S]` if the claim still holds, and put the outcome in `St` (0 = stored, 1 = another agent won the line). `St` must differ from `D` and `S` — the architecture leaves it UNPREDICTABLE otherwise, and since the retry loop branches on `St`, getting it wrong is an infinite loop rather than a wrong value |
+| `(yield)`            | A64Inst, MInst          | spin-wait hint (`hint #1`). One row for both Arm profiles because it is one instruction: `YIELD` is the same architectural hint on AArch64 and on ARMv7-M, and on both it is defined to execute as a `nop` where the implementation has nothing to do with it. That is what makes it safe to emit unconditionally — no feature test, no `when` at the call site |
 | `(d0)`             | A64Reg                   | fp register d0 |
 | `(d1)`             | A64Reg                   | fp register d1 |
 | `(d2)`             | A64Reg                   | fp register d2 |
@@ -450,65 +475,65 @@ nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
 | `(d29)`            | A64Reg                   | fp register d29 |
 | `(d30)`            | A64Reg                   | fp register d30 |
 | `(d31)`            | A64Reg                   | fp register d31 |
-| `(s0)`             | A64Reg                   | fp register s0 |
-| `(s1)`             | A64Reg                   | fp register s1 |
-| `(s2)`             | A64Reg                   | fp register s2 |
-| `(s3)`             | A64Reg                   | fp register s3 |
-| `(s4)`             | A64Reg                   | fp register s4 |
-| `(s5)`             | A64Reg                   | fp register s5 |
-| `(s6)`             | A64Reg                   | fp register s6 |
-| `(s7)`             | A64Reg                   | fp register s7 |
-| `(s8)`             | A64Reg                   | fp register s8 |
-| `(s9)`             | A64Reg                   | fp register s9 |
-| `(s10)`            | A64Reg                   | fp register s10 |
-| `(s11)`            | A64Reg                   | fp register s11 |
-| `(s12)`            | A64Reg                   | fp register s12 |
-| `(s13)`            | A64Reg                   | fp register s13 |
-| `(s14)`            | A64Reg                   | fp register s14 |
-| `(s15)`            | A64Reg                   | fp register s15 |
-| `(s16)`            | A64Reg                   | fp register s16 |
-| `(s17)`            | A64Reg                   | fp register s17 |
-| `(s18)`            | A64Reg                   | fp register s18 |
-| `(s19)`            | A64Reg                   | fp register s19 |
-| `(s20)`            | A64Reg                   | fp register s20 |
-| `(s21)`            | A64Reg                   | fp register s21 |
-| `(s22)`            | A64Reg                   | fp register s22 |
-| `(s23)`            | A64Reg                   | fp register s23 |
-| `(s24)`            | A64Reg                   | fp register s24 |
-| `(s25)`            | A64Reg                   | fp register s25 |
-| `(s26)`            | A64Reg                   | fp register s26 |
-| `(s27)`            | A64Reg                   | fp register s27 |
-| `(s28)`            | A64Reg                   | fp register s28 |
-| `(s29)`            | A64Reg                   | fp register s29 |
-| `(s30)`            | A64Reg                   | fp register s30 |
-| `(s31)`            | A64Reg                   | fp register s31 |
-| `(fmov D S)`        | A64Inst                 | fp move (reg-reg / gpr<->fp bitcast) |
-| `(fadd D S)`        | A64Inst                 | fp add (D = D + S) |
-| `(fsub D S)`        | A64Inst                 | fp subtract (D = D - S) |
-| `(fmul D S)`        | A64Inst                 | fp multiply (D = D * S) |
-| `(fdiv D S)`        | A64Inst                 | fp divide (D = D / S) |
-| `(fneg D)`          | A64Inst                 | fp negate (D = -D) |
-| `(fcmp D S)`        | A64Inst                 | fp compare |
-| `(fldr D S)`        | A64Inst                 | fp load register |
-| `(fstr D S)`        | A64Inst                 | fp store register |
-| `(scvtf D S)`       | A64Inst                 | signed int -> fp convert |
-| `(ucvtf D S)`       | A64Inst                 | unsigned int -> fp convert |
-| `(fcvtzs D S)`      | A64Inst                 | fp -> signed int convert (toward zero) |
-| `(fcvtzu D S)`      | A64Inst                 | fp -> unsigned int convert (toward zero) |
+| `(s0)`             | A64Reg, MReg                   | fp register s0 |
+| `(s1)`             | A64Reg, MReg                   | fp register s1 |
+| `(s2)`             | A64Reg, MReg                   | fp register s2 |
+| `(s3)`             | A64Reg, MReg                   | fp register s3 |
+| `(s4)`             | A64Reg, MReg                   | fp register s4 |
+| `(s5)`             | A64Reg, MReg                   | fp register s5 |
+| `(s6)`             | A64Reg, MReg                   | fp register s6 |
+| `(s7)`             | A64Reg, MReg                   | fp register s7 |
+| `(s8)`             | A64Reg, MReg                   | fp register s8 |
+| `(s9)`             | A64Reg, MReg                   | fp register s9 |
+| `(s10)`            | A64Reg, MReg                   | fp register s10 |
+| `(s11)`            | A64Reg, MReg                   | fp register s11 |
+| `(s12)`            | A64Reg, MReg                   | fp register s12 |
+| `(s13)`            | A64Reg, MReg                   | fp register s13 |
+| `(s14)`            | A64Reg, MReg                   | fp register s14 |
+| `(s15)`            | A64Reg, MReg                   | fp register s15 |
+| `(s16)`            | A64Reg, MReg                   | fp register s16 |
+| `(s17)`            | A64Reg, MReg                   | fp register s17 |
+| `(s18)`            | A64Reg, MReg                   | fp register s18 |
+| `(s19)`            | A64Reg, MReg                   | fp register s19 |
+| `(s20)`            | A64Reg, MReg                   | fp register s20 |
+| `(s21)`            | A64Reg, MReg                   | fp register s21 |
+| `(s22)`            | A64Reg, MReg                   | fp register s22 |
+| `(s23)`            | A64Reg, MReg                   | fp register s23 |
+| `(s24)`            | A64Reg, MReg                   | fp register s24 |
+| `(s25)`            | A64Reg, MReg                   | fp register s25 |
+| `(s26)`            | A64Reg, MReg                   | fp register s26 |
+| `(s27)`            | A64Reg, MReg                   | fp register s27 |
+| `(s28)`            | A64Reg, MReg                   | fp register s28 |
+| `(s29)`            | A64Reg, MReg                   | fp register s29 |
+| `(s30)`            | A64Reg, MReg                   | fp register s30 |
+| `(s31)`            | A64Reg, MReg                   | fp register s31 |
+| `(fmov D S)`        | A64Inst, MInst                 | fp move (reg-reg / gpr<->fp bitcast) |
+| `(fadd D S)`        | A64Inst, MInst                 | fp add (D = D + S) |
+| `(fsub D S)`        | A64Inst, MInst                 | fp subtract (D = D - S) |
+| `(fmul D S)`        | A64Inst, MInst                 | fp multiply (D = D * S) |
+| `(fdiv D S)`        | A64Inst, MInst                 | fp divide (D = D / S) |
+| `(fneg D)`          | A64Inst, MInst                 | fp negate (D = -D) |
+| `(fcmp D S)`        | A64Inst, MInst                 | fp compare |
+| `(fldr D S)`        | A64Inst, MInst                 | fp load register |
+| `(fstr D S)`        | A64Inst, MInst                 | fp store register |
+| `(scvtf D S)`       | A64Inst, MInst                 | signed int -> fp convert |
+| `(ucvtf D S)`       | A64Inst, MInst                 | unsigned int -> fp convert |
+| `(fcvtzs D S)`      | A64Inst, MInst                 | fp -> signed int convert (toward zero) |
+| `(fcvtzu D S)`      | A64Inst, MInst                 | fp -> unsigned int convert (toward zero) |
 | `(fcvt D S)`        | A64Inst                 | fp precision convert (f32<->f64) |
 | `(fstp D1 D2 S O)`  | A64Inst                 | fp store pair (pre-indexed) |
 | `(fldp D1 D2 S O)`  | A64Inst                 | fp load pair (post-indexed) |
-| `(ldrb D B I)`      | A64Inst                 | load byte (zero-extend), register offset [B,I] |
-| `(strb D B I)`      | A64Inst                 | store low byte, register offset [B,I] |
-| `(rebind D T S)`    | X64Inst, A64Inst        | bind a phys reg to a typed name, killing its prior tenant |
-| `(withreg D T S ...)` | X64Inst, A64Inst      | block-scoped rebind; auto-killed at block end |
+| `(ldrb D B I)`      | A64Inst, MInst | load byte (zero-extend), register offset [B,I] |
+| `(strb D B I)`      | A64Inst, MInst | store low byte, register offset [B,I] |
+| `(rebind D T S)`    | X64Inst, A64Inst, MInst | bind a phys reg to a typed name, killing its prior tenant |
+| `(withreg D T S ...)` | X64Inst, A64Inst, MInst | block-scoped rebind; auto-killed at block end |
 | `(regs ...)`          | NifasmDecl                  | multi-register param/result location: `(regs (rdi) (rsi))` |
 | `(bswap D N)`         | X64Inst                     | reverse byte order of D in place; `N` is the operand size in bits (32 or 64) |
-| `(scope ...)`         | X64Inst, A64Inst            | statement block with a reclaimable stack-slot arena: `(s)` locals declared inside are freed at scope end so sibling scopes reuse the frame bytes |
+| `(scope ...)`         | X64Inst, A64Inst, MInst | statement block with a reclaimable stack-slot arena: `(s)` locals declared inside are freed at scope end so sibling scopes reuse the frame bytes |
 | `(popcnt D S N)`      | X64Inst                     | population count: D = number of set bits in S; `N` is the operand size in bits (32 or 64) |
-| `(clz D S N)`         | A64Inst                     | count leading zeros: D = number of leading zero bits of S; `N` is the operand size in bits (32 or 64) |
-| `(rbit D S N)`        | A64Inst                     | reverse bit order of S into D (with `clz` this is a count-trailing-zeros); `N` is the operand size in bits |
-| `(rev D S N)`         | A64Inst                     | reverse byte order of S into D; `N` is the operand size in bits (32 or 64) |
+| `(clz D S N)`         | A64Inst, MInst | count leading zeros: D = number of leading zero bits of S; `N` is the operand size in bits (32 or 64) |
+| `(rbit D S N)`        | A64Inst, MInst | reverse bit order of S into D (with `clz` this is a count-trailing-zeros); `N` is the operand size in bits |
+| `(rev D S N)`         | A64Inst, MInst | reverse byte order of S into D; `N` is the operand size in bits (32 or 64) |
 | `(casejmp S T ...)`   | X64Inst                     | computed-goto case dispatch (`imul S,S,N; lea T,[rip+slots]; add T,S; jmp T`): the `(stmts ...)` children are the branch bodies, NOP-padded to the measured uniform slot size N, so no lookup table and no memory load. S holds the 0-based slot index; S and T are destroyed. Every branch must end in a terminating jump (the pad NOPs are never executed) and must not define a label at its very end |
 | `(js L)`              | X64Inst                     | jump if sign (SF=1: the result was negative) |
 | `(jns L)`             | X64Inst                     | jump if not sign (SF=0) |
@@ -535,4 +560,28 @@ nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
 | `(veor D A B)`        | A64Inst                     | vector bitwise xor over all 16 bytes (`eor Vd.16b`); `(veor X X X)` zeroes X |
 | `(vaddv D S)`         | A64Inst                     | horizontal fp add of S's lanes into the scalar D (`faddp Dd, Vn.2d` when d-spelled; `faddp Vd.4s, Vn.4s, Vn.4s` + `faddp Sd, Vd.2s` when s-spelled) |
 | `(vgreq D S)`         | A64Inst                     | valgrind client request: `S` holds the address of the 6-word request block (`request, arg1 .. arg5`), `D` receives valgrind's answer — 0 when nothing intercepted the request, which is what a program NOT running under valgrind always sees. Expands to the fixed instruction sequence valgrind's JIT recognizes (four `ror x12` totalling a full 64-bit rotation, then the `orr x10, x10, x10` marker — architecturally a no-op, hence the zero cost when unobserved), wrapped in the moves that stage x3/x4 around it and stage the answer back out |
+| `(bkpt N)`           | MInst                       | breakpoint / semihosting call; `(bkpt 171)` is `bkpt #0xAB`, the ARM semihosting entry on M-profile (operation in r0, parameter block in r1, result back in r0) |
+| `(bx D)`             | MInst                       | branch and exchange to the address in D; `(bx (lr))` is the ordinary Thumb return |
+| `(blx D)`            | MInst                       | indirect call through the address in D |
+| `(mvn D S)`          | MInst                       | bitwise NOT (D = not S) |
+| `(bic3 D A B)`       | MInst                       | 3-operand bit clear (D = A and not B) |
+| `(adds3 D A B)`      | MInst                       | 3-operand add SETTING the flags — the low half of a 64-bit add |
+| `(adcs3 D A B)`      | MInst                       | 3-operand add with carry, setting the flags — the high half of a 64-bit add |
+| `(subs3 D A B)`      | MInst                       | 3-operand subtract setting the flags — the low half of a 64-bit subtract |
+| `(sbcs3 D A B)`      | MInst                       | 3-operand subtract with borrow, setting the flags — the high half of a 64-bit subtract |
+| `(mls D A B C)`      | MInst                       | multiply-subtract (D = C - A*B); ARMv7-M has no modulo, so `a mod b` is `sdiv` then `mls` |
+| `(umull L H A B)`    | MInst                       | unsigned 64-bit product of A and B into the register pair L (low) / H (high) |
+| `(smull L H A B)`    | MInst                       | signed 64-bit product of A and B into the register pair L (low) / H (high) |
+| `(tst A B)`          | MInst                       | set the flags from A and B, discarding the result |
+| `(uxtb D S)`         | MInst                       | zero-extend the low byte of S into D |
+| `(sxtb D S)`         | MInst                       | sign-extend the low byte of S into D |
+| `(uxth D S)`         | MInst                       | zero-extend the low halfword of S into D |
+| `(sxth D S)`         | MInst                       | sign-extend the low halfword of S into D |
+| `(ldrh D S)`         | MInst                       | load an unsigned halfword |
+| `(strh D S)`         | MInst                       | store a halfword |
+| `(ldrsb D S)`        | MInst                       | load a byte, sign-extended |
+| `(ldrsh D S)`        | MInst                       | load a halfword, sign-extended |
+| `(wfi)`              | MInst                       | wait for interrupt — the idle trap a bare-metal image ends on |
+| `(dsb)`              | MInst                       | data synchronization barrier: nothing after it begins until every memory access before it has completed. Needed after writing a system register that changes how later instructions behave (CPACR, MPU) |
+| `(isb)`              | MInst                       | instruction synchronization barrier: flush the pipeline so instructions fetched before a context-changing write are re-fetched. Required between enabling the FPU and the first floating-point instruction |
 | `(other N ...)`       | -                           | escape header: the tag whose id no longer fits NIF's 9-bit tag field. `N` is an inline int carrying the real id out of nifcore's 28-bit escape space, and the remaining children are the node's own. Every row above that names EXACTLY ONE of `X64Inst`/`A64Inst` — i.e. one target's machine mnemonics, 282 of them — is spelled this way in the token buffer, which is what keeps the shared 511 for the cross-target vocabulary and makes a new target (Cortex-M, RISC-V) cost zero shared ids. Never written or read as text: `parse` folds `(movzx …)` into it and the serializers unfold it back, so both the NIF text and the binary token format are unchanged |
