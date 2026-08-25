@@ -122,7 +122,10 @@ procs hit them: nested-aggregate-field pointer + copy word (495), aggregate-copy
 dst + src address (39), stack-param aggregate home + word (35), casejmp index +
 base (15), aconstr element pointer + copy word (15).
 
-This is the number the allocator needs in order to take over the guarantee that a
+Three is therefore the size of the Arm scratch set: the measurement above is what
+says a fixed reservation of that size covers the enumerated shapes, and the Arm
+targets can afford it because their third register (x16 / r8) was already spoken
+for and idle. This is the number the allocator needs in order to take over the guarantee that a
 staging pick can never fail. R11 is reserved today precisely because nobody knew
 it; reserving THREE where these shapes occur, and nothing elsewhere, is what lets
 the reservation go — and with it the register the spill census wants back.
@@ -139,10 +142,12 @@ where one suffices, and that was a measured out-of-registers failure, not a
 hypothetical. `tests/arkham/addr_chain_depth` is the fixture; it passes at
 `ARKHAM_STRESS=2` at chain depth 5 and at depth 10.
 
-**Only one of the two is guaranteed.** R11 is reserved; the second is whichever ABI
-volatile happens to be free, falling back to `pickStagingScratch`'s callee-saved draw.
-Closing that gap means taking a register from the allocator, and on x86-64 nothing is
-going spare: rax is the return/div/mul register, rcx and rdx have fixed instruction
+**On x86-64, only one of the two is guaranteed.** R11 is reserved; the second is
+whichever ABI volatile happens to be free, falling back to `pickStagingScratch`'s
+callee-saved draw. The Arm targets no longer have that gap — all three of their
+scratch registers are reserved outright, so a draw there never depends on what the
+allocator left over. Closing it on x86-64 means taking a register from the
+allocator, and nothing is going spare: rax is the return/div/mul register, rcx and rdx have fixed instruction
 roles, rdi–r9 are argument registers that hold live *parameters* (R9 was tried as a
 second reserved bridge and is a live param home in any six-parameter proc), rbx/r12–r15
 are the callee-saved local homes, and r10 is the allocator's entire temp pool. The

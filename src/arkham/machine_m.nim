@@ -45,8 +45,10 @@ const
   IntCalleeSaved* = [R4, R5, R6, R7]
 
   ProduceBridge* = R8
-    ## A third always-free scratch, beyond the two staging bridges: the
-    ## Cortex-M stand-in for AArch64's x16 (IP0).
+    ## The third reserved scratch, beyond the two staging bridges: the Cortex-M
+    ## stand-in for AArch64's x16 (IP0). Named for what it is USED for — staging a
+    ## value on its way into memory — not for a claim on it: `bridgeRegs` lists all
+    ## three, so a staging draw that finds r10/r11 busy reaches this one too.
     ##
     ## AArch64 borrows the assembler's own scratch for this. Cortex-M cannot —
     ## nifasm has claimed r12 for operand folding at sites arkham never sees, so
@@ -226,42 +228,3 @@ proc interruptSlot*(name: string): int =
       if n > 495: return -1        # ARMv7-M allows at most 496 external interrupts
     return FirstIrqSlot + n
   return -1
-
-# ── the console ─────────────────────────────────────────────────────────────
-
-type
-  WritesToKind* = enum
-    ## What a Cortex-M image's `write` is implemented as, and with it how its
-    ## `exit` ends.
-    ##
-    ## These two travel together because they answer the same question — is a
-    ## debugger attached? The debugger form needs one for both; the serial form
-    ## needs one for neither, and has nothing to hand a status TO.
-    ##
-    ## Both names say what must be ATTACHED rather than naming a mechanism, which
-    ## is the thing that is actually got wrong: "I flashed it and nothing printed".
-    wtDebugger  ## `bkpt #0xAB`, intercepted by a debug agent (QEMU, or a probe)
-                ## which does the I/O on the host.
-    wtSerial    ## a CMSDK APB UART. Needs a wire and nothing else.
-
-const
-  CmsdkUartData* = 0x00'i64
-    ## Write-to-transmit. Writing while `TXFULL` is set drops the byte.
-  CmsdkUartState* = 0x04'i64
-    ## bit 0 = TX buffer full, bit 1 = RX buffer full.
-  CmsdkUartCtrl* = 0x08'i64
-    ## bit 0 = TX enable, bit 1 = RX enable.
-  CmsdkUartBaudDiv* = 0x10'i64
-    ## The divider. Hardware rejects anything below 16; QEMU does not model the
-    ## baud rate at all, so this exists to be CORRECT on the part rather than to
-    ## be observed under emulation.
-
-  CmsdkUartTxFull* = 0x01'i64
-  CmsdkUartTxEnable* = 0x01'i64
-  CmsdkUartDefaultBaudDiv* = 16'i64
-
-  MpsUart0Base* = 0x4000_4000'i64
-    ## MPS2/MPS3 UART0 — the address `qemu-system-arm -M mps2-an386 -serial` puts
-    ## on stdout, and the one ARM's own reference designs use. It is a DEFAULT and
-    ## not a fact about Cortex-M: every real part puts its UART elsewhere, which
-    ## is why `--writesTo:serial:<addr>` takes one.

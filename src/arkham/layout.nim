@@ -34,12 +34,6 @@ proc asmTag(n: Cursor): TagEnum = cast[TagEnum](uint32(resolvedTagId(n)))
 var asmTags: TagPool = createAsmTagPool()
 
 type
-  WritesToKind* = enum
-    ## What `write` is implemented as. Both names say what must be ATTACHED,
-    ## which is the thing that is actually got wrong.
-    wtDebugger   ## trap to a debug agent, which does the I/O on the host
-    wtSerial     ## drive a UART; nothing attached but a wire
-
   Layout* = object
     ## The board, and only what is not already implied by it.
     ##
@@ -54,8 +48,6 @@ type
                                      ## writable. What matters is that its
                                      ## contents survive reset.
     sramStart*, sramSize*: uint32    ## the region that holds NOTHING at reset
-    writesTo*: WritesToKind
-    serialAddress*: uint32
     slotCount*: int
     slotSize*: uint32                ## a POWER OF TWO — it is the mask a thread
                                      ## reaches its own thread-locals with
@@ -111,7 +103,7 @@ proc readStartAddress(n: var Cursor): uint32 =
 proc parseLayout*(path: string): Layout =
   ## Read and CHECK the file. Everything that can be wrong about a layout is
   ## wrong here, by name, and not later as an image that boots into nothing.
-  result = Layout(given: true, writesTo: wtDebugger, slotCount: 1, core: 0)
+  result = Layout(given: true, slotCount: 1, core: 0)
   var buf = parseFromFile(path, sharedTags = asmTags)
   var n = beginRead(buf)
   if n.kind != TagLit or tagToNifasmDecl(asmTag(n)) != LayoutD:
@@ -136,16 +128,6 @@ proc parseLayout*(path: string): Layout =
           result.sramSize = readSize(e)
           while e.hasMore: skip e
         sawSram = true
-      of WritesToD:
-        e.into:
-          if e.kind != Ident: fail "(writesTo …) needs `debugger` or `serial`"
-          case e.strVal
-          of "debugger": result.writesTo = wtDebugger; inc e
-          of "serial":
-            result.writesTo = wtSerial; inc e
-            result.serialAddress = readStartAddress(e)
-          else: fail "`write` goes to `debugger` or `serial`, not `" & e.strVal & "`"
-          while e.hasMore: skip e
       of StacksD:
         e.into:
           if e.kind != TagLit or tagToNifasmExpr(asmTag(e)) != SlotsX:

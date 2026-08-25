@@ -3120,7 +3120,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     discard "handle via `case instTag`"
   of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, LenientD,
      ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD,
-     InterruptsD, IrqD, LayoutD, FlashD, SramD, WritesToD, StacksD, HeapD,
+     InterruptsD, IrqD, LayoutD, FlashD, SramD, StacksD, HeapD,
      NoinitD, CoreD:
     raiseAssert("Unhandled declaration tag: " & $declTag)
 
@@ -5767,6 +5767,42 @@ proc genInstM(n: var Cursor; ctx: var GenContext) =
     thumb2.emitVcvtFromF32(ctx.buf.data, MFpScratch, sOp.freg,
                            signed = instTag == FcvtzsM)
     thumb2.emitVmovFromFp(ctx.buf.data, regOfM(d, "destination", start), MFpScratch)
+  of LdrexM:
+    # `(ldrex D S N)` — D ← the N-bit cell at [S], taking the monitor's claim.
+    # Both operands may be `rebind`-bound scratch names: the atomics lowering
+    # binds every register it stages through, so this goes through the same
+    # operand parser as an ordinary load rather than a raw-register one.
+    inc n
+    let rt = regOfM(parseOperandM(n, ctx), "ldrex destination", start)
+    let rn = regOfM(parseOperandM(n, ctx), "ldrex address", start)
+    if n.kind != IntLit: error("ldrex needs an access width (8, 16 or 32)", start)
+    let bits = int(getInt(n)); inc n
+    if bits notin [8, 16, 32]:
+      error("ARMv7-M has no " & $bits & "-bit exclusive load", start)
+    thumb2.emitLdrex(ctx.buf.data, rt, rn, bits)
+  of StrexM:
+    # `(strex St D S N)` — store D into [S] if the claim holds; St ← 0 on success.
+    inc n
+    let rd = regOfM(parseOperandM(n, ctx), "strex status", start)
+    let rt = regOfM(parseOperandM(n, ctx), "strex value", start)
+    let rn = regOfM(parseOperandM(n, ctx), "strex address", start)
+    if n.kind != IntLit: error("strex needs an access width (8, 16 or 32)", start)
+    let bits = int(getInt(n)); inc n
+    if bits notin [8, 16, 32]:
+      error("ARMv7-M has no " & $bits & "-bit exclusive store", start)
+    if rd == rt or rd == rn:
+      # UNPREDICTABLE per the architecture, and the retry loop branches on the
+      # status — so this is an infinite loop rather than a wrong value, which is
+      # exactly the kind of thing a typed assembler exists to refuse.
+      error("strex status register must differ from its value and address registers",
+            start)
+    thumb2.emitStrex(ctx.buf.data, rd, rt, rn, bits)
+  of DmbM:
+    inc n
+    thumb2.emitDmb(ctx.buf.data)
+  of ClrexM:
+    inc n
+    thumb2.emitClrex(ctx.buf.data)
   of DsbM:
     inc n
     thumb2.emitDsb(ctx.buf.data)
@@ -7990,7 +8026,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     return
   of NoDecl:
     discard "continue with case instTag"
-  of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, LenientD, ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD, InterruptsD, IrqD, LayoutD, FlashD, SramD, WritesToD, StacksD, HeapD, NoinitD, CoreD:
+  of TypeD, ProcD, ParamsD, ParamD, ResultD, ClobberD, LenientD, ArchD, RodataD, GvarD, TvarD, ImpD, ExtprocD, SyprocD, RegsD, InterruptsD, IrqD, LayoutD, FlashD, SramD, StacksD, HeapD, NoinitD, CoreD:
     error("Unexpected declaration: " & $declTag, n)
 
   # A mnemonic whose id overflowed the 9-bit tag field carries that id in a
@@ -9626,8 +9662,6 @@ proc handleLayout(n: var Cursor; ctx: var GenContext) =
       e.into:
         if e.hasMore and e.kind == IntLit: (ctx.board.core = int(getInt(e)); inc e)
         while e.hasMore: skip e
-    of WritesToD:
-      skip e                                 # arkham's; already in the shims
     else: error("unexpected declaration inside (layout …)", e)
   ctx.board.given = true
 

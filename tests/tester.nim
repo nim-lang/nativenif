@@ -126,8 +126,9 @@ const arkhamA64Unsupported: seq[string] = @[
   "intrinsics_x64",
   # `{.assembler.}` transliteration. Its `{.register: "rdi".}` pins name x86-64
   # registers, so there is no target-neutral reading of the body — that is the
-  # mode's premise ("no fallbacks", doc/intrinsics.md §8), not a gap: an AArch64
-  # version is a different `when` branch the user writes, with `x0`/`x9` in it.
+  # mode's premise ("no fallbacks", doc/intrinsics.md §8), not a gap. The AArch64
+  # version is the different `when` branch the user writes, and it exists:
+  # `assembler_a64`, with `x0`/`x9`/`x19` in it.
   "assembler_x64",
   # `{.naked.}` — the same story as `assembler_x64` (it may only accompany it),
   # plus the `TraceTable` row, whose `targets` is x86-64 alone until the AArch64
@@ -148,6 +149,15 @@ const arkhamA64Unsupported: seq[string] = @[
   # `spilledByRefPtr` predicate was retired for). The a64 `genAconstr2` StackPtr arm
   # is in place and mirrors x86-64; it is what this gap currently keeps unreachable.
   "aconstr_byref_spilled",
+]
+
+const arkhamX64Unsupported: seq[string] = @[
+  # The mirror of `arkhamA64Unsupported`: a fixture whose `{.register: "…".}`
+  # pins name ARM registers has no x86-64 reading either, and the native pass
+  # targets x86-64 everywhere except macOS (where it targets arm64 and this
+  # fixture is exactly what should run). Two lists, one rule — an `.assembler`
+  # body belongs to the target it names.
+  "assembler_a64",
 ]
 
 const arkhamDarwinUnsupported: seq[string] =
@@ -364,6 +374,7 @@ proc arkhamTests() =
       if name in arkhamDarwinUnsupported or name in arkhamA64Unsupported: continue
     else:
       if name in arkhamOsxOnly: continue            # macOS-only libSystem symbol
+      if name in arkhamX64Unsupported: continue     # Arm-pinned `.assembler` body
     inc total
     let stem = file[0 ..< file.len - ".c.nif".len]
     let known = name in arkhamKnownUnsupported
@@ -1003,6 +1014,29 @@ const cortexMRejections: seq[(string, string)] = @[
   # two accesses, which is not what a device register was asked for — and the
   # 64-bit path exists on this target, so nothing but the row's meaning stops it.
   ("err_volatile_wide", "must be ONE machine access"),
+  # ── `{.assembler.}` pins (doc/intrinsics.md §8) ────────────────────────────
+  # Arkham owns these rules outright — nimony's sem only forwards the pragmas —
+  # and every one of them is target-specific, which is precisely why the Arm mode
+  # needs its own rejection coverage rather than inheriting x86-64's.
+  #
+  # A register spelling from the other target. It is the mode's premise that a
+  # body names ONE machine, so the useful answer says which names this one has.
+  ("err_asm_foreign_reg", "is not a Cortex-M general-purpose register"),
+  # r12 is nifasm's operand-folding scratch, written at sites arkham never sees:
+  # a value pinned there dies to an instruction the code generator did not emit.
+  ("err_asm_scratch_reg", "is the assembler's own scratch"),
+  # r10/r11 are arkham's staging bridges, and r8/r9 its produce bridge and
+  # indirect-result pointer. All four are callee-saved under AAPCS32 but absent
+  # from `md.intCalleeSaved`, so the prologue saves none of them — a pin there
+  # destroys the caller's value with no local symptom.
+  ("err_asm_bridge_reg", "staging bridges"),
+  # A frame slot wider than the machine word. A 64-bit `(s)` slot would be a
+  # 64-bit-typed access, which nifasm refuses on this target — naming the LOCAL
+  # here beats pointing at a `(mov …)` the user never wrote.
+  ("err_asm_wide_stack", "moves one 4-byte word at a time"),
+  # A pin that contradicts the ABI. In an `.assembler` proc a location
+  # constraint is an assertion, not a request, so the two must agree.
+  ("err_asm_param_reg", "is passed in r0 by this target's ABI"),
 ]
 
 proc cortexMInterruptTests() =
@@ -1019,78 +1053,6 @@ proc cortexMInterruptTests() =
                       expected)
     inc passed
   echo passed, " / ", cortexMRejections.len, " Cortex-M interrupt/volatile rejection tests successful"
-
-
-const cortexMUartArgs = ["-M", "mps2-an386", "-cpu", "cortex-m4",
-                         "-display", "none", "-monitor", "none",
-                         "-serial", "stdio", "-kernel"]
-  ## The UART runner: no semihosting at all, and UART0 routed to stdout. That is
-  ## the point — an image built `--writesTo:serial` needs no debug agent, so the
-  ## thing under test is that it produces output with none configured.
-
-proc cortexMSerialTests() =
-  ## `--writesTo:serial` end to end: bytes out of a CMSDK UART, and an `exit` that
-  ## parks the core because there is nobody to hand a status to.
-  ##
-  ## The run is EXPECTED to time out, and that is the assertion rather than a
-  ## tolerated flake: a firmware image does not terminate, it idles on `wfi`. What
-  ## is checked is the output it produced before parking. The timeout is short and
-  ## local — the default 30s would make one test dominate the suite.
-  let qemu = findExe(cortexMQemu)
-  if qemu.len == 0:
-    echo cortexMQemu, " not found - skipping Cortex-M UART tests"
-    return
-  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
-  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
-  let workDir = "tests" / "arkham_m" / "nimcache_m"
-  createDir workDir
-  let src = "tests" / "arkham" / "hello.c.nif"
-  let asmNif = workDir / "uart_hello.asm.nif"
-  let elf = workDir / "uart_hello.elf"
-  var passed = 0
-
-  exec quoteShell(arkham) & " -a:cortex_m --writesTo:serial -o:" & quoteShell(asmNif) &
-       " " & quoteShell(src)
-  exec quoteShell(nifasmExe) & " -o:" & quoteShell(elf) & " " & quoteShell(asmNif)
-  var args: seq[string] = @[]
-  for a in cortexMUartArgs: args.add a
-  args.add elf
-  let (output, code) = runProgram(qemu, args, timeoutMs = 5_000)
-  if code != timeoutExitCode:
-    quit "FAILURE cortex-m serial: the image ENDED (exit " & $code & "). " &
-         "`--writesTo:serial` has no debug agent to exit through, so it must park " &
-         "on `wfi` instead.\n" & output
-  if not output.contains("Hello World"):
-    quit "FAILURE cortex-m serial: nothing reached UART0.\nGot: " & escape(output)
-  inc passed
-
-  # The DEFAULT is untouched: same input, no flag, still a debugger image that
-  # runs to completion. A flag that quietly changed every image would be the more
-  # expensive kind of wrong.
-  let semiAsm = workDir / "semi_hello.asm.nif"
-  let semiElf = workDir / "semi_hello.elf"
-  exec quoteShell(arkham) & " -a:cortex_m -o:" & quoteShell(semiAsm) & " " &
-       quoteShell(src)
-  exec quoteShell(nifasmExe) & " -o:" & quoteShell(semiElf) & " " & quoteShell(semiAsm)
-  var sargs: seq[string] = @[]
-  for a in cortexMArgs: sargs.add a
-  sargs.add semiElf
-  let (sout, scode) = runProgram(qemu, sargs)
-  if scode != 0 or sout != "Hello World\n":
-    quit "FAILURE cortex-m serial: the semihosting default regressed (exit " &
-         $scode & ")\nGot: " & escape(sout)
-  inc passed
-
-  # A serial port is a Cortex-M peripheral; every other target's `write` is the
-  # OS's.
-  execExpectFailure(quoteShell(arkham) & " -a:x64 --writesTo:serial -o:" &
-                    quoteShell(workDir / "x.asm.nif") & " " & quoteShell(src),
-                    "cortex_m target only")
-  execExpectFailure(quoteShell(arkham) & " -a:cortex_m --writesTo:rs232 -o:" &
-                    quoteShell(workDir / "x.asm.nif") & " " & quoteShell(src),
-                    "unknown --writesTo")
-  inc passed
-  echo passed, " / 3 Cortex-M serial-output tests successful"
 
 
 proc cortexMLayoutTests() =
@@ -1236,14 +1198,6 @@ proc cortexMLayoutTests() =
          " -o:" & quoteShell(asmNif) & " " & quoteShell(src)
     execExpectFailure(quoteShell(nifasmExe) & " -o:" & quoteShell(workDir / "x.elf") &
                       " " & quoteShell(asmNif), "does not fit")
-  # A console in the file AND on the command line is a contradiction, not a
-  # precedence question.
-  execExpectFailure(quoteShell(arkham) & " -a:cortex_m --writesTo:serial --layout:" &
-                    quoteShell("tests" / "layout" / "mps2.nif") & " -o:" &
-                    quoteShell(workDir / "x.asm.nif") & " " & quoteShell(src),
-                    "both say where `write` goes")
-  inc passed
-
   # ── 5. the region kept back from the startup code ──
   # `(noinit …)` is bytes at the top of `sram` that nothing establishes at reset,
   # for the one thing that must NOT be established: a record written by the run
@@ -1296,7 +1250,7 @@ proc cortexMLayoutTests() =
                     quoteShell("tests" / "layout" / "noinit_probe.c.nif"),
                     "keeps nothing back")
   inc passed
-  echo passed, " / 5 Cortex-M layout-file tests successful"
+  echo passed, " / 4 Cortex-M layout-file tests successful"
 
 
 proc cortexMMemMapTests() =
@@ -1461,24 +1415,62 @@ const cortexMUnsupported: seq[string] = @[
 
   # ── 64-bit intrinsics ───────────────────────────────────────────────────────
   # `clz`/`rbit`/`rev` and the atomics at 64 bits: ARMv7-M's are 32-bit, and its
-  # exclusives have no 64-bit form on this core either. The overflow-checked
+  # exclusives have no 64-bit form on this core either — there is no `ldrexd`, and
+  # two exclusive pairs over the halves would be two claims rather than one atom,
+  # so a 64-bit cell is refused BY NAME. The 8/16/32-bit atomics are lowered
+  # (`ldrex`/`strex` bracketed by `dmb`): `atomic_subword_cas` runs here, and
+  # `tests/arkham_m/atomics` covers every row at 32 bits. The overflow-checked
   # 64-bit multiply wants `smulh`, which does not exist here.
   "atomic", "atomic2", "atomic_cas", "atomic_cas_regpressure",
-  "atomic_subword_cas", "intrinsics", "intrinsics_x64",
+  "intrinsics", "intrinsics_x64",
   "mul_overflow", "mul_overflow_pow2",
 
   # ── register pressure ───────────────────────────────────────────────────────
   # Four allocatable homes and an empty volatile pool (see machine_m.nim). Each
   # of these fails LOUDLY at the pick — never with a wrong answer.
-  "aconstr_byref_spilled", "aggr_arg_parked_manual", "array2d",
-  "at_scratch_deref_base", "atomic_cas_operand_home", "atomic_ptr_cell",
-  "nested_at_read",
+  #
+  # The list shrank again when the last-resort scratch draw learned which
+  # argument registers are actually STAGED (`stagedArgs`): r0–r3 are this
+  # target's only volatiles, and outside a call's marshalling window and the
+  # prologue, nothing has a claim on them. `atomic_ptr_cell` runs on that alone.
+  #
+  # The list SHRANK when the produce bridge (r8) joined the staging set:
+  # `at_scratch_deref_base` and `nested_at_read` are address chains that need a
+  # third scratch register, and a third was reserved all along — it just was not
+  # reachable from the staging draw. What is left is demand of a different KIND —
+  # an ATOMIC's operands, which may not use a bridge at all because the LL/SC loop
+  # owns them, and an aggregate whose two ends are both computed.
+  "aconstr_byref_spilled", "aggr_arg_parked_manual",
+  "atomic_cas_operand_home",
+
+  # ── WRONG ANSWER, and the second one in this list ───────────────────────────
+  # `array2d` used to fail loudly for register pressure. It compiles now, and
+  # computes 1 where it should compute 24 — so it is parked next to
+  # `stack_array_align` rather than among the refusals, because a tolerated wrong
+  # answer is the one thing this list must not hide.
+  #
+  # The cause is NOT the register draw that let it compile: the same shape with
+  # no register pressure at all — a 3x3 `array[array[i 64]]`, one store, one read
+  # — makes zero last-resort draws and still breaks, with nifasm refusing the
+  # STORE outright: "element stride 24 is not an LDR/STR scale; use the
+  # 3-operand form with a scratch register". The read of the same lvalue emits
+  # the 3-operand form correctly, so the wide (64-bit) store path reaches the
+  # `(at …)` without the stride-scratch reservation `emitLvalWalk` makes for the
+  # read. That is a Cortex-M 64-bit addressing bug that was unreachable while the
+  # fixture refused earlier, not a consequence of reaching it.
+  "array2d",
 
   # ── x86-64 assembly ─────────────────────────────────────────────────────────
   # An `{.assembler.}` proc whose register pins name x86-64 registers. Refused on
   # AArch64 too, and for the same reason: there is no target-neutral reading of
   # `{.register: "rax".}`.
   "assembler_x64",
+
+  # The AArch64 `.assembler` fixture, for the same reason in the other
+  # direction: its pins are `x0`/`x9`/`x19`, which this target does not have.
+  # The Cortex-M half of that mode is `tests/arkham_m/assembler_m`, whose pins
+  # are `r0`..`r7` and which runs in the 32-bit corpus.
+  "assembler_a64",
 
   # ── INAPPLICABLE, not unsupported ───────────────────────────────────────────
   # The one entry that does not refuse: it runs and returns the wrong exit code,
@@ -1592,6 +1584,17 @@ proc arkhamCortexMTests() =
     if pc != expectedCode:
       quit "FAILURE (cortex-m) exitcode " & $expectedCode & " but got " & $pc &
            " for " & file & "\n" & po
+    # An `.output` file makes the fixture's OUTPUT part of the assertion. Most of
+    # this corpus is judged by its exit code alone — a firmware image has one
+    # number to report — but a fixture whose whole point is that something reached
+    # the console (`semihost_writec` writes through `bkpt`) has nothing else to be
+    # judged on. Optional, so the other 128 fixtures need no empty file.
+    let outFile = "tests" / "arkham_m" / (stem & ".output")
+    if fileExists(outFile):
+      let expectedOut = readFile(outFile).strip
+      if po.strip != expectedOut:
+        quit "FAILURE (cortex-m) output mismatch for " & file &
+             "\nexpected:\n" & expectedOut & "\ngot:\n" & escape(po)
     removeFile asmFile
     removeFile exe
     inc passed
@@ -1606,7 +1609,6 @@ thumb2SelfTest()
 cortexMAsmTests()
 cortexMMemMapTests()
 cortexMInterruptTests()
-cortexMSerialTests()
 cortexMLayoutTests()
 arkhamCortexMTests()
 arkhamCortexM64Tests()
@@ -1621,7 +1623,7 @@ when (defined(linux) and defined(amd64)) or (defined(macosx) and defined(arm64))
   arkhamStressTests(arch = (when defined(macosx): "arm64" else: "x64"),
                     skip = (when defined(macosx): arkhamDarwinUnsupported &
                                                   arkhamA64Unsupported
-                            else: arkhamOsxOnly),
+                            else: arkhamOsxOnly & arkhamX64Unsupported),
                     known = (when defined(macosx): arkhamStressA64Known
                              else: arkhamStressKnown),
                     level = (when defined(macosx): arkhamStressA64Level

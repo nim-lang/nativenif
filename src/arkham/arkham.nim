@@ -15,7 +15,7 @@
 import std / [parseopt, syncio, strutils]
 import nifcoreparse              # parseFromFile + nifcore
 import lengdecl                  # createLengTagPool
-import machine_m                  # ConsoleKind and the CMSDK UART defaults
+import machine_m                  # the Cortex-M machine model
 import layout                    # the --layout: board file
 import codegen_common            # (arkhamTempDbg: dumpTempStats)
 import codegen_arm               # BOTH Arm targets: AArch64 (Darwin/Linux) and
@@ -35,20 +35,11 @@ Options:
                            (default: host)
   --cpu:SYMBOL             target CPU: amd64 | arm64 | arm32 (default: host)
   --layout:FILE            cortex_m only: the BOARD — its memory regions, which
-                           region each section lives in, the console, the stack
-                           slots and their thread-local reservation, and the
-                           heap. A `(layout …)` NIF tree; see doc/layout.md.
+                           region each section lives in, the stack slots and
+                           their thread-local reservation, and the heap. A `(layout …)` NIF tree; see doc/layout.md.
                            Forwarded into the asm-NIF so nifasm places segments
                            from the same description rather than reading the file
                            a second time
-  --writesTo:WHERE         cortex_m only: what `write` is implemented as, and
-                           with it how `exit` ends. `debugger` (default) traps to
-                           a debug agent — QEMU, or a probe — which does the I/O
-                           on the host and takes the exit status. `serial` writes
-                           bytes to a CMSDK APB UART and ends by parking the core
-                           on `wfi`, needing nothing attached but a wire.
-                           `serial:<addr>` gives the port's address; bare `serial`
-                           is MPS2's UART0 at 0x40004000
   -a:arch, --arch:arch     legacy combined form: arm64 | x64 | linux_arm64 |
                            win_x64 (cannot be mixed with --os/--cpu)
   -h, --help               show this help
@@ -101,32 +92,7 @@ proc archOf(os, cpu: string): string =
          " embedded/arm32)",
          QuitFailure)
 
-proc parseWritesTo(val: string; serialBase: var int64): machine_m.WritesToKind =
-  ## `--writesTo:debugger` | `--writesTo:serial` | `--writesTo:serial:<addr>`.
-  ##
-  ## The address rides along because it is the only part a BOARD gets to decide:
-  ## the register layout is CMSDK's, which is what ARM's own reference designs and
-  ## QEMU's MPS2 have, and a part with a different UART needs its own `write`
-  ## rather than a flag. `serial` alone means MPS2's UART0, which is what
-  ## `qemu-system-arm -M mps2-an386 -serial` puts on stdout.
-  let v = val.normalize
-  if v == "debugger": return machine_m.wtDebugger
-  if v == "serial": return machine_m.wtSerial
-  if v.startsWith("serial:"):
-    let a = val.substr(7).strip()
-    try:
-      serialBase = if a.startsWith("0x") or a.startsWith("0X"):
-                   cast[int64](fromHex[uint64](a))
-                 else: int64(parseBiggestUInt(a))
-    except ValueError:
-      quit("arkham: --writesTo:serial: not an address: " & a, QuitFailure)
-    return machine_m.wtSerial
-  quit("arkham: unknown --writesTo:" & val &
-       " (supported: debugger, serial, serial:<addr>)", QuitFailure)
-
-proc run(input, output, arch: string;
-         writesTo: machine_m.WritesToKind; serialBase: int64;
-         board: layout.Layout) =
+proc run(input, output, arch: string; board: layout.Layout) =
   # One shared tag pool across the main module and any foreign modules the
   # program model loads on demand, so tag ordinals (hence stmtKind/typeKind
   # decoding) line up across modules.
@@ -138,15 +104,12 @@ proc run(input, output, arch: string;
              of "arm64", "aarch64", "": generateA64(buf, input, tags)
              of "linux_arm64", "linux_aarch64": generateA64(buf, input, tags, linux = true)
              of "cortex_m", "cortexm", "thumbm":
-               generateM(buf, input, tags, writesTo, serialBase, board)
+               generateM(buf, input, tags, board)
              else: quit("arkham: unknown --arch:" & arch, QuitFailure)
   writeFile(output, code)
 
 proc main() =
   var input, output, arch, os, cpu = ""
-  var writesTo = machine_m.wtDebugger
-  var serialBase = machine_m.MpsUart0Base
-  var writesToGiven = false
   var board = Layout()
   for kind, key, val in getopt():
     case kind
@@ -158,9 +121,6 @@ proc main() =
       of "arch", "a": arch = val
       of "os": os = val
       of "cpu": cpu = val
-      of "writesto":
-        writesTo = parseWritesTo(val, serialBase)
-        writesToGiven = true
       of "layout":
         board = parseLayout(val)
         let bad = layout.validate(board)
@@ -183,23 +143,7 @@ proc main() =
     if os.len == 0: os = hostOS
     if cpu.len == 0: cpu = hostCPU
     arch = archOf(os, cpu)
-  if writesToGiven and arch notin ["cortex_m", "cortexm", "thumbm"]:
-    # Every other target is hosted: `write` is the OS's, and there is no
-    # peripheral for this flag to name. Silence would be the wrong answer for the
-    # same reason the memory-map flags refuse it.
-    quit("arkham: --writesTo applies to the cortex_m target only", QuitFailure)
-  # The layout's answer is the board's own, so it wins over the flag — and giving
-  # both is a contradiction rather than a precedence question.
-  if board.given:
-    if writesToGiven:
-      quit("arkham: --writesTo and --layout both say where `write` goes; the " &
-           "layout is the board's own description, so say it there", QuitFailure)
-    case board.writesTo
-    of layout.wtDebugger: writesTo = machine_m.wtDebugger
-    of layout.wtSerial:
-      writesTo = machine_m.wtSerial
-      serialBase = int64(board.serialAddress)
-  run(input, output, arch, writesTo, serialBase, board)
+  run(input, output, arch, board)
   when defined(arkhamTempDbg): dumpTempStats()
 
 when isMainModule:

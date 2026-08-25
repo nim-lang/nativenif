@@ -371,6 +371,77 @@ const
   SysExitExtended = 0x20
   AdpStoppedApplicationExit = 0x20026'u32
 
+# ── exclusive access, the ARMv7-M synchronization primitive ─────────────────
+# These are what an atomic is built from here, and every one of them is checked
+# by RUNNING it: the exclusive monitor is modelled by QEMU, so a claim that is
+# taken, honoured or abandoned shows up in the status register and in memory,
+# which is exactly what the retry loop branches on.
+check "ldrex/strex word roundtrip", 0x11223344'u32:
+  (proc (b: var Buffer) =
+    b.data.emitSubImm(SP, SP, 8)
+    b.data.emitMovImm32(R1, 0xDEADBEEF'u32)
+    b.data.emitStr(R1, SP, 0)
+    b.data.emitMovReg(R2, SP)
+    b.data.emitLdrex(R3, R2, 32)               # claim the address
+    b.data.emitMovImm32(R1, 0x11223344'u32)
+    b.data.emitStrex(R4, R1, R2, 32)           # honoured: the store lands
+    b.data.emitLdr(R0, SP, 0)
+    b.data.emitAddImm(SP, SP, 8))
+check "ldrex reads the cell", 0xDEADBEEF'u32:
+  (proc (b: var Buffer) =
+    b.data.emitSubImm(SP, SP, 8)
+    b.data.emitMovImm32(R1, 0xDEADBEEF'u32)
+    b.data.emitStr(R1, SP, 0)
+    b.data.emitMovReg(R2, SP)
+    b.data.emitLdrex(R0, R2, 32)
+    b.data.emitClrex()                         # drop the claim we do not use
+    b.data.emitAddImm(SP, SP, 8))
+check "strex reports success as 0", 0:
+  (proc (b: var Buffer) =
+    b.data.emitSubImm(SP, SP, 8)
+    b.data.emitMovReg(R2, SP)
+    b.data.emitLdrex(R3, R2, 32)
+    b.data.emitMovImm32(R1, 1)
+    b.data.emitStrex(R0, R1, R2, 32)
+    b.data.emitAddImm(SP, SP, 8))
+check "clrex makes the next strex fail", 1:
+  (proc (b: var Buffer) =
+    b.data.emitSubImm(SP, SP, 8)
+    b.data.emitMovReg(R2, SP)
+    b.data.emitLdrex(R3, R2, 32)
+    b.data.emitClrex()                         # the claim is abandoned...
+    b.data.emitMovImm32(R1, 1)
+    b.data.emitStrex(R0, R1, R2, 32)           # ...so this must not store
+    b.data.emitAddImm(SP, SP, 8))
+check "ldrexb/strexb touch ONE byte", 0x12AB55CD'u32:
+  (proc (b: var Buffer) =
+    b.data.emitSubImm(SP, SP, 8)
+    b.data.emitMovImm32(R1, 0x12ABCDCD'u32)
+    b.data.emitStr(R1, SP, 0)
+    b.data.emitMovReg(R2, SP)
+    b.data.emitAddImm(R2, R2, 1)               # the second byte of the word
+    b.data.emitLdrex(R3, R2, 8)
+    b.data.emitMovImm32(R1, 0x55)
+    b.data.emitStrex(R4, R1, R2, 8)
+    b.data.emitLdr(R0, SP, 0)
+    b.data.emitAddImm(SP, SP, 8))
+check "ldrexh/strexh touch ONE halfword", 0xBEEFCDCD'u32:
+  (proc (b: var Buffer) =
+    b.data.emitSubImm(SP, SP, 8)
+    b.data.emitMovImm32(R1, 0x12ABCDCD'u32)
+    b.data.emitStr(R1, SP, 0)
+    b.data.emitMovReg(R2, SP)
+    b.data.emitAddImm(R2, R2, 2)               # the high halfword
+    b.data.emitLdrex(R3, R2, 16)
+    b.data.emitMovImm32(R1, 0xBEEF)
+    b.data.emitStrex(R4, R1, R2, 16)
+    b.data.emitLdr(R0, SP, 0)
+    b.data.emitAddImm(SP, SP, 8))
+check "dmb computes nothing and breaks nothing", 5:
+  (proc (b: var Buffer) =
+    b.data.emitMovImm32(R0, 5)
+    b.data.emitDmb())
+
 when isMainModule:
   var b = initBuffer()
   # The vector table occupies the first 8 bytes; emit placeholders that the

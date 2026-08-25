@@ -154,9 +154,14 @@ entry and cache the handle, so the same images run on real hardware.
 Both `exit` and `write` are all the existing arkham corpus needs: of 236
 fixtures, 225 `importc "exit"` and 3 `importc "write"`.
 
-Semihosting is the DEFAULT console, not the only one: `--writesTo:serial` serves the
-same two names off a CMSDK UART instead, for a board with no debugger attached.
-See M6.
+Semihosting is the console arkham SYNTHESIZES, and the only one. A program that
+`importc`s `write`/`exit` — which is what the hand-written fixture corpus does —
+gets these shims; anything else is a driver, and a driver belongs in the
+program. That is now sayable: `{.assembler.}` procs work on this target (M7), so
+a board with a UART writes its console in Nimony over `volatileLoad`/
+`volatileStore`, and a board with a debug probe can write the semihosting
+sequence itself with `bkpt`. See M8 for why the back end stopped carrying a
+second one.
 
 `SYS_WRITE`'s first field is a semihosting HANDLE, not a POSIX fd. Passing a raw
 `1` writes nothing AND reports success — the call returns "0 bytes not written",
@@ -215,6 +220,13 @@ stdout and stderr are the same stream.
   wrong answer is `stack_array_align`, which asserts a 16-byte stack alignment
   AAPCS32 does not promise. Everything else refuses by name.
 
+  Read that corpus for what it is. Nimony maps `int` to the target's width, so
+  under `--cpu:arm32` it is 32 bits and 64-bit lowering is off the path of
+  ordinary integer code entirely. `tests/arkham/` was authored for x86-64 and
+  AArch64, where `int` WAS 64 bits, so nearly every integer in it reaches the
+  Cortex-M backend as `(i 64)` — a deliberate stress test, and a poor model of a
+  firmware image. `tests/arkham_m/` is the corpus with a 32-bit `int`.
+
   **Not** register pairs. A 64-bit value here is EIGHT BYTES AT AN ADDRESS, and
   the ops read and write it a word at a time (`arkham/codegen_m64.nim`, included
   by `codegen_arm.nim`). The reason is the register file: four allocatable homes
@@ -226,10 +238,10 @@ stdout and stderr are the same stream.
   32-bit target, so the allocator needed no change at all; what M4 added is the
   arithmetic.
 
-  The cost is real (an `x + y` is six instructions, not two) and it is the price
-  of the register file, not of the representation. What it buys is that the one
-  thing a 64-bit lowering must never do — produce a plausible wrong number —
-  cannot happen by a register running out.
+  The cost is real (an `int64` `x + y` is six instructions, not two) and it is
+  the price of the register file, not of the representation. What it buys is
+  that the one thing a 64-bit lowering must never do — produce a plausible wrong
+  number — cannot happen by a register running out.
 
   Each half is spelled `(cast (u 32) (mem <base> <byte offset>))`. The cast is
   load-bearing: without it the access is 64-bit-typed and nifasm REFUSES it
@@ -301,36 +313,11 @@ stdout and stderr are the same stream.
   assembler never sees a float in a `(param …)`.
 * **M6 — actually embedded.** DONE.
 
-  **Serial output** is the last piece: `arkham --writesTo:serial[:<addr>]` makes
-  `write` push bytes into a CMSDK APB UART and `exit` park the core, so an image
-  needs no debugger for either. `--writesTo:debugger` is still the default and
-  still byte-identical to giving no flag at all — a flag that quietly changed
-  every image would be the more expensive kind of wrong.
+  **Output** is semihosting, and only semihosting: `write` and `exit` go through
+  a debug agent, which is the one console a bare-metal image can have without a
+  driver. The back end briefly carried a second — a CMSDK UART behind
+  `--writesTo:serial` — and M8 removed it.
 
-  The two shims move together because they answer one question: is a debugger
-  attached? Semihosting needs one for output AND for exit; a UART needs one for
-  neither, and has nothing to hand a status TO. So `exit` under serial output does the only honest thing — `wfi` in a loop. Not a busy spin: `wfi` idles the
-  core until an interrupt, which is what a finished image owes a battery, and any
-  handler still fires. The status stays in r0 for whoever attaches a probe later.
-
-  The register layout is CMSDK's — ARM's own reference designs, and what QEMU's
-  MPS2 models. That is the only layout this can honestly carry: an STM32 USART is
-  a different peripheral, not a different address, and a part with one now writes
-  its own `write` on top of `volatileLoad`/`volatileStore`. The ADDRESS is the
-  part a board does get to choose, which is why it is an argument; bare `serial` means MPS2's UART0 at 0x40004000.
-
-  The TX loop polls `STATE.TXFULL` before every byte. QEMU transmits instantly and
-  never sets that bit, so the poll is dead code under emulation and load-bearing
-  on the part — the usual shape of anything that talks to hardware, and the reason
-  it is written from the datasheet rather than from what the emulator accepts.
-
-  `cortexMUartTests` runs it with `-serial stdio` and NO semihosting configured at
-  all, which is the point: the image produces output with no debug agent. The run
-  is expected to TIME OUT, and that is the assertion rather than a tolerated
-  flake — a firmware image does not terminate, it idles. (`runProgram` had been
-  discarding a timed-out child's output; it now drains it after the kill, where
-  the read hits EOF instead of blocking. An image that deliberately never exits
-  has nothing but that output to be judged on.)
 
   **Volatile MMIO is DONE.** `volatileLoad(p)` / `volatileStore(p, v)` from
   `std/volatile` — Nim's names and Nim's signatures, so source written against
@@ -471,3 +458,208 @@ stdout and stderr are the same stream.
   construction and by the layout arithmetic the fixture checks — not by
   execution, and this note is here rather than in a comment because no test will
   fail if it breaks.
+
+* **M7 — `{.assembler.}` procs.** DONE. `arkham/codegen_arm_asm.nim` (included by
+  `codegen_arm.nim`) gives both Arm profiles the transliteration mode
+  `doc/intrinsics.md` §8 describes and x86-64 already had: no allocator, no value
+  core, every location DECLARED, one instruction per statement.
+
+  What Cortex-M gets out of it is the ability to say things this back end cannot
+  be asked to infer. A `bkpt` sequence, an MMIO poll, a handler prologue — code
+  whose whole content is WHICH instruction runs and in what order. Nothing about
+  the register file changes: pins are `r0`..`r7`, conditions go through
+  `(ite <flag> …)` (Cortex-M maps all eight of Arm's; AArch64's assembler
+  implements the zero flag alone), and `{.naked.}` drops the prologue but never
+  the `ret`.
+
+  Which registers a body may claim is the part that needed care rather than
+  translation. r12 is nifasm's own operand-folding scratch, written at sites
+  arkham never sees. r8 is the produce bridge, r9 the indirect result pointer,
+  r10/r11 the two staging bridges — all four callee-saved under AAPCS32, and none
+  of them saved by a prologue that walks r4–r7. A value pinned there is preserved
+  by nobody, and the damage shows up in the CALLER. So each is refused by the
+  ROLE that already owns it, and `armFrameSaved` — one list — answers both "may
+  this be pinned?" and "does the prologue save it?", which is also what keeps the
+  mode sound under `-d:arkhamStress`, where the allocator's pools shrink but a
+  body that names its own registers still needs them saved.
+
+  Three things a shim actually needs came with it, each of which had been a
+  documented gap rather than a decision:
+
+  * **`bkpt`** — a pinned row (`{tgThumbM}`) whose one operand the INSTRUCTION
+    encodes, which is a new operand pattern (`ptImmLit`): there is no register
+    form of an 8-bit comment field, so a non-literal argument is refused by
+    name. Its effects are the widest honest ones (`efReads`, `efWrites`,
+    `efBarrier`) — whatever the debug agent does is invisible from here, and an
+    `efPure` trap would be DCE's to delete. What it CANNOT say is that the answer
+    comes back in r0, which is exactly why a semihosting call is written in a
+    body that can name r0.
+  * **Two-address arithmetic** — `add`/`sub`/`and`/`or`/`xor`/`shl`/`shr`/`sar`/
+    `neg` now claim both Arm targets, in `{.assembler.}` bodies AND in ordinary
+    procs. The allocated path serves a spilled destination through a staging
+    bridge (load, operate, store back) rather than refusing it: Arm is a
+    load/store machine, and a rejection there would fire only under register
+    pressure, which is the worst possible shape for a diagnostic.
+  * **`addr`** — `(lea D slot)` for a `{.stack.}` local, `(adr D sym)` for a
+    global. A register is refused, because it has no address and spilling it
+    behind the author's back is the one thing this mode never does.
+
+  The flags needed a rule of their own. Arm has a flag-setting and a
+  non-flag-setting form of every arithmetic instruction, and which one an
+  assembler picks is an ENCODING decision — nifasm asks for the non-setting form,
+  but Thumb's narrow 16-bit encoding, the one it prefers when every operand is a
+  low register, sets them anyway. So after an `add` the flags depend on which
+  registers the body pinned, which is no basis for reading one. A flag may
+  therefore only be read by the `if` that IMMEDIATELY follows its `cmp`; a label,
+  a branch, a loop boundary and every other instruction invalidate it. x86-64
+  needs no such rule, and does not have one.
+
+  `tests/arkham_m/assembler_m` covers the positive path end to end under QEMU
+  (flag branch, `(s)` slot, callee-saved pin, `while true`/`break`, a `{.naked.}`
+  proc that emits exactly one instruction, `addr` of a global);
+  `tests/arkham_m/semihost_writec` prints through a `bkpt` SYS_WRITEC written in
+  an `.assembler` body and checks both the exit code and the output;
+  `tests/arkham_m/err_asm_*` covers the five rejections. The AArch64 twin is
+  `tests/arkham/assembler_a64`.
+
+* **M8 — one console, and it is not the back end's.** DONE. The `writesTo`
+  mechanism is gone: the `--writesTo` flag, the `(writesTo …)` layout row and its
+  asm-NIF tag, `WritesToKind` on both sides, the CMSDK register map, and the two
+  UART shims (`emitUartWriteProc`, `emitUartExitProc`).
+
+  It was a code generator carrying a device driver. The register layout was
+  CMSDK's — ARM's own reference designs, and what QEMU's MPS2 models — which is
+  the only layout it could honestly carry, so every real part was one `#ifdef`
+  away from needing another. A flag that selects between two drivers is a
+  question the back end should not be asked, and until M7 there was no other
+  place to put the answer.
+
+  Now there is. A board's console is a driver, and a driver is a program:
+  `volatileLoad`/`volatileStore` for the registers, `{.assembler.}` where the
+  instruction matters, and the whole thing in Nimony where it can be read, tested
+  and changed without rebuilding the compiler. What the back end still
+  synthesizes is the semihosting `write`/`exit` behind an `importc` — the one
+  console that needs no driver, because the driver is on the other end of the
+  wire — which is also what keeps a hand-written `.c.nif` fixture runnable.
+
+  **The stdlib half is written** (`nimony/lib/std/system/semihosting.nim`,
+  included by `system.nim` under `--os:embedded`). The whole of the assembler in
+  it is one proc:
+
+  ```nim
+  proc semihostCall(op {.register: "r0".}: int32;
+                    arg {.register: "r1".}: pointer): int32 {.assembler.} =
+    bkpt(0xAB)
+  ```
+
+  One instruction, because the ABI has already done the rest — the operation is
+  in r0 and the parameter block address in r1 because that is where AAPCS32 puts
+  the first two arguments, and the agent's answer is in r0 because that is where
+  a result is returned from. What the pins add is that this stays true: they are
+  checked against the ABI, so a change on either side is a compile error rather
+  than a trap taken with the wrong registers loaded. Above it, `SYS_OPEN(":tt")`
+  with its cached handle, the parameter blocks, and the conversion from
+  semihosting's "bytes NOT written" to POSIX's "bytes written" are ordinary
+  Nimony. `syncio`'s `sysWrite` and `exits`' `cExit`/`cAbort` route to it under
+  `defined(embedded)`.
+
+  Two more things were needed to get an `--os:embedded` build that far, and both
+  are the target's own truth rather than workarounds: the four `{.threadvar.}`s
+  in `system` become plain globals there (one thread of execution means a
+  thread-local IS a global, and this target has no TLS register for the back end
+  to reach one through), and `nimony` gained a `--layout:FILE` flag that forwards
+  the board description to arkham — a bare-metal image has no OS to ask how much
+  RAM it may have, so that file IS the answer.
+
+  What still stops a complete image is two Cortex-M gaps in code that has nothing
+  to do with the console, both reachable for the first time now that the build
+  gets past `system`'s thread-locals: the atomic rows have no Cortex-M lowering
+  (ARC's refcount `AtomicAddFetch`), and `findSuitableBlock` in the allocator
+  exhausts the register file (`reloadMemBase2` finds no register to reload a
+  spilled memory base — r8 is the candidate, being in no pool, but whether the
+  produce bridge is free across an address chain needs checking rather than
+  assuming). arkham compiles a module WHOLE, so every proc `system` defines has
+  to be servable before any bare-metal program links.
+
+* **M9 — atomics.** DONE for 8, 16 and 32 bits. ARMv7-M's synchronization
+  primitive is the exclusive pair and nothing else: `ldrex` takes the monitor's
+  claim on an address, `strex` stores only if the claim still holds and reports
+  in a status register whether it did. There is no acquire/release form of a load
+  or a store — that is ARMv8-M — so the ordering an atomic owes is a separate
+  instruction, and every sequence here is bracketed by `dmb`.
+
+  What that costs, spelled out, is the difference from AArch64: `ldaxr`/`stlxr`
+  carry their ordering, so the a64 lowering is the loop and nothing else. The
+  Cortex-M one is `dmb` + the loop + `dmb`, and the CAS failure path must
+  `clrex` — it leaves the pair WITHOUT the store, and the monitor would otherwise
+  stay armed on that address for a later, unrelated `strex` to succeed against.
+
+  The scratch is `bridgeRegs` (r10/r11/r8), which is the same choice AArch64
+  makes (x14/x15/x16) and for the same reason: the sequence needs exactly three
+  registers nothing else may hold — the observed value, the value to store, and
+  the status — and those three are the ones the allocator never assigns. It is
+  also why an atomic's OPERANDS may not use a bridge (`takeInstrReg`): parked
+  there, one would be destroyed between the exclusive load and the store.
+
+  **64 bits is refused by name.** ARMv7-M has no `ldrexd`, and two exclusive
+  pairs over the halves would be two claims rather than one atom — so the answer
+  is the message, not a lowering that is atomic per word and racy per value.
+  `widths` in the row table cannot say "every width but one, on one target", and
+  a per-target width column would be a second place for the same fact to be
+  wrong, so the check lives at the emission site.
+
+  Four `strex` rules are enforced where they can be: the status register must
+  differ from the value and address registers (UNPREDICTABLE otherwise, and since
+  the loop branches on the status, getting it wrong is an infinite loop rather
+  than a wrong value) — checked in `thumb2.emitStrex` and again in nifasm's
+  operand parser, because a typed assembler is where an encoding rule belongs.
+
+  Tests: `tests/thumb2_selftest` gained seven checks that RUN the new encodings —
+  a claim taken and honoured, a claim taken and abandoned by `clrex` (the next
+  `strex` must then report failure), and the byte and halfword forms touching
+  exactly one byte and one halfword of a word. `tests/arkham_m/atomics` covers
+  every lowered row at 32 bits plus an 8-bit fetch-add with wraparound, and
+  checks the C11 semantics that are easy to get backwards: which forms return the
+  value BEFORE the update, and that a FAILING compare-exchange publishes what the
+  cell actually held through its `expected` pointer. `atomic_subword_cas` came out
+  of `cortexMUnsupported`.
+
+  What is NOT served is an atomic whose OPERANDS cannot be placed. With four
+  allocatable homes, an empty volatile pool and three registers the sequence
+  claims for itself, a compare-exchange in a proc whose homes are already full
+  has nowhere to put its three pointers — `takeInstrReg` refuses a bridge for
+  them by the rule above, and there is nothing else. That is the shape
+  `atomic_ptr_cell` and `atomic_cas_operand_home` are parked under, and it is a
+  property of the register file rather than of this lowering: the narrower fix is
+  the one `machine_m.IntTempRegs` already names — teach the scratch picker which
+  argument registers are currently staged, so r0–r3 can serve where no call is in
+  flight.
+
+* **A complete image, from Nim source.** `nimony n --os:embedded --cpu:arm32
+  --layout:board.nif t.nim` now produces a running firmware image: it prints
+  through the stdlib's own semihosting console (M7/M8) and exits with the status
+  the program asked for. Four one-line-ish holes stood between the atomics and
+  that, and every one of them was unreachable until the whole of `system`
+  compiled — which is why they are worth naming rather than just fixing:
+
+  * **Module-local names in shared code.** The semihosting shim's `:tt` name and
+    console handle, and the 64-bit divider routines, were spelled with ONE dot.
+    A one-dot symbol is module-LOCAL: the render compresses it and the embedded
+    index leaves it out, so a module that IMPORTS the shim cannot resolve what
+    the shim names. They carry the module suffix now, exactly as the `.sys.`
+    syprocs beside them do. Single-module fixtures never noticed, because there
+    was nobody to import them.
+  * **`csel` on a target that has none.** The branchless select-diamond fusion
+    was attempted on both Arm profiles; ARMv7-M has no conditional select at all
+    (its equivalent is an IT block, a shape this emitter does not build), so it
+    now takes the branch lowering that every other `if` on this target already
+    uses.
+  * **An AArch64 register name in a Cortex-M module.** `emOp` — the text-path
+    twin of `emReg`, used by the splice lowerings — spelled an UNBOUND register
+    with `machine.regName` rather than through `ab.renderReg`. Invisible while
+    every register reaching a splice happened to be bound; the first one that was
+    not (`extendTo` narrowing a raw argument register during a call's
+    marshalling) emitted `(uxtb (x0) (x0))` into a Thumb module.
+
+  What that leaves is not a gap in the back end but the surface above it: `echo`
+  and the rest of `syncio` pull in far more of `system` than this test does.

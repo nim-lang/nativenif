@@ -698,6 +698,74 @@ proc emitIsb*(dest: var Bytes) =
   ## already fetched.
   dest.emitWide(0xF3BF'u16, 0x8F6F'u16)
 
+proc emitDmb*(dest: var Bytes) =
+  ## DMB SY — every memory ACCESS before it is observed before any after it.
+  ##
+  ## Weaker than `DSB`, which waits for completion; this only orders. It is what
+  ## an acquire or a release costs on ARMv7-M, which — unlike AArch64 and unlike
+  ## ARMv8-M — has no load-acquire/store-release instruction to fold the ordering
+  ## into the access itself. So an atomic sequence here is `dmb`-bracketed rather
+  ## than `ldaxr`/`stlxr`, and the barrier is a separate instruction the emitter
+  ## has to place.
+  dest.emitWide(0xF3BF'u16, 0x8F5F'u16)
+
+proc emitClrex*(dest: var Bytes) =
+  ## CLREX — abandon the exclusive monitor's claim on the address the last LDREX
+  ## took. Needed on every path that leaves a load-exclusive/store-exclusive pair
+  ## WITHOUT the store: the monitor would otherwise stay armed on this address,
+  ## and a later unrelated STREX could succeed against a claim nobody still means.
+  dest.emitWide(0xF3BF'u16, 0x8F2F'u16)
+
+# ── exclusive access (LDREX/STREX) ──────────────────────────────────────────
+# The ARMv7-M synchronization primitive, and the whole of what an atomic is built
+# from here: LDREX takes a claim on the address, STREX stores only if the claim
+# still holds and reports in a status register whether it did. Everything else —
+# the retry loop, the arithmetic between them, the ordering — is instructions the
+# emitter places around them.
+#
+# Note what is NOT here: LDREXD/STREXD (the 64-bit pair) do not exist on
+# ARMv7-M, which is why a 64-bit atomic is refused by name rather than lowered
+# through two halves — two exclusive pairs are two claims, and the value would
+# not be atomic.
+
+proc emitLdrex*(dest: var Bytes; rt, rn: Register; bits: int; offset = 0'u32) =
+  ## LDREX/LDREXB/LDREXH rt, [rn{, #offset}] — an exclusive load of `bits` bits.
+  ##
+  ## Only the word form takes an offset (a byte offset, encoded in words), and the
+  ## atomics lowering always passes 0; the byte and halfword forms have no offset
+  ## field at all in their encoding.
+  case bits
+  of 8:  dest.emitWide(0xE8D0'u16 or reg(rn), (reg(rt) shl 12) or 0x0F4F'u16)
+  of 16: dest.emitWide(0xE8D0'u16 or reg(rn), (reg(rt) shl 12) or 0x0F5F'u16)
+  of 32:
+    assert offset < 1024 and (offset and 3) == 0,
+      "thumb2: ldrex offset must be a word-aligned imm8*4"
+    dest.emitWide(0xE850'u16 or reg(rn),
+                  (reg(rt) shl 12) or 0x0F00'u16 or uint16(offset shr 2))
+  else:
+    raiseAssert "thumb2: no exclusive load of " & $bits & " bits on ARMv7-M"
+
+proc emitStrex*(dest: var Bytes; rd, rt, rn: Register; bits: int; offset = 0'u32) =
+  ## STREX/STREXB/STREXH rd, rt, [rn{, #offset}] — store `rt` if the exclusive
+  ## claim still holds; `rd` receives 0 on success and 1 on failure.
+  ##
+  ## `rd` must differ from both `rt` and `rn`: the architecture leaves the result
+  ## UNPREDICTABLE otherwise, and it is the status register the retry loop then
+  ## branches on, so getting it wrong is an infinite loop rather than a wrong
+  ## value. The caller draws all three from disjoint scratch, and this checks it.
+  assert rd != rt and rd != rn,
+    "thumb2: strex status register must differ from its value and address registers"
+  case bits
+  of 8:  dest.emitWide(0xE8C0'u16 or reg(rn), (reg(rt) shl 12) or 0x0F40'u16 or reg(rd))
+  of 16: dest.emitWide(0xE8C0'u16 or reg(rn), (reg(rt) shl 12) or 0x0F50'u16 or reg(rd))
+  of 32:
+    assert offset < 1024 and (offset and 3) == 0,
+      "thumb2: strex offset must be a word-aligned imm8*4"
+    dest.emitWide(0xE840'u16 or reg(rn),
+                  (reg(rt) shl 12) or (reg(rd) shl 8) or uint16(offset shr 2))
+  else:
+    raiseAssert "thumb2: no exclusive store of " & $bits & " bits on ARMv7-M"
+
 proc `$`*(r: Register): string =
   case r
   of SP: "sp"

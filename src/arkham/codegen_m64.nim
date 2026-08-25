@@ -9,6 +9,17 @@
 ## more emitter arm rather than a second code generator, and it needs the whole
 ## `*2` value core it dispatches out of and back into.
 ##
+## ## `int` is 32 bits on this target
+##
+## Nimony maps `int` to the target's width, so under `--cpu:arm32` it is a
+## 32-bit type (`nifconfig.nim` takes `bits` from the CPU table). NOTHING here
+## is on the path of ordinary integer code: this file serves values declared
+## explicitly 64-bit, which is why `isWideSlot` asks about a SIZE and never
+## about a type's name. The `tests/arkham/` corpus is misleading on the point —
+## it was authored for x86-64 and AArch64, where `int` WAS 64 bits, so every
+## `int` in it arrives here as `(i 64)`. That makes it a good stress test and a
+## bad model of a firmware image.
+##
 ## ## Why 64-bit values live in MEMORY
 ##
 ## The obvious lowering is a register PAIR, and on a target with a normal
@@ -27,10 +38,10 @@
 ## local a stack home without being told anything new. What this file adds is
 ## the arithmetic.
 ##
-## The cost is real (an `x + y` is 6 instructions instead of 2) and it is the
-## price of the target's register file, not of the representation. What it buys
-## is that the ONE thing a 64-bit lowering must never do — produce a plausible
-## wrong number — cannot happen by a register running out.
+## The cost is real (an `int64` `x + y` is 6 instructions instead of 2) and it
+## is the price of the target's register file, not of the representation. What
+## it buys is that the ONE thing a 64-bit lowering must never do — produce a
+## plausible wrong number — cannot happen by a register running out.
 ##
 ## ## The addressing contract
 ##
@@ -747,12 +758,24 @@ proc wideCopyToAddr(g: var CodeGen; slotName: string; addrReg: Reg) =
 # has to be told (see `helperCalls`).
 
 const
-  UDivMod64Proc = "`udivmod64.0"
+  UDivMod64Base = "`udivmod64.0"
     ## `(N: r0:r1, D: r2:r3)` → quotient in r0:r1, remainder in r2:r3.
-  SDivMod64Proc = "`sdivmod64.0"
+  SDivMod64Base = "`sdivmod64.0"
     ## The signed wrapper: |N| div |D| through the unsigned routine, then the
     ## signs put back. Truncating toward zero, and the remainder takes the
     ## DIVIDEND's sign — C's rule, and Leng's.
+
+proc uDivMod64Proc(g: CodeGen): string {.inline.} =
+  ## The divider routines, MODULE-QUALIFIED — the same rule the semihosting
+  ## globals follow, and for the same reason: a one-dot symbol is module-LOCAL,
+  ## so the render compresses it out of the embedded index and nothing outside
+  ## the module can resolve it. These are emitted once per module that divides,
+  ## and any OTHER module that imports such a proc has to be able to name the
+  ## routine it calls.
+  UDivMod64Base & "." & thisModuleSuffix(g.prog)
+
+proc sDivMod64Proc(g: CodeGen): string {.inline.} =
+  SDivMod64Base & "." & thisModuleSuffix(g.prog)
 
 proc mReg(g: var CodeGen; r: Reg) {.inline.} = g.ab.reg r
   ## A RAW register in a hand-written body. Not `emReg`: these bodies are not
@@ -775,7 +798,7 @@ proc emitUDivMod64(g: var CodeGen) =
   let lLoopEnd = g.freshLabel()
   let lDone = g.freshLabel()
   g.ab.tree NifasmDecl.ProcD:
-    g.ab.symDef UDivMod64Proc
+    g.ab.symDef g.uDivMod64Proc
     g.ab.keyword NifasmDecl.ParamsD
     g.ab.keyword NifasmDecl.ResultD
     g.ab.tree NifasmDecl.ClobberD:
@@ -844,7 +867,7 @@ proc emitSDivMod64(g: var CodeGen) =
   ## 0/-1 mask, which is branchless and — unlike a compare-and-negate — right
   ## for the most negative value too.
   g.ab.tree NifasmDecl.ProcD:
-    g.ab.symDef SDivMod64Proc
+    g.ab.symDef g.sDivMod64Proc
     g.ab.keyword NifasmDecl.ParamsD
     g.ab.keyword NifasmDecl.ResultD
     g.ab.tree NifasmDecl.ClobberD:
@@ -870,7 +893,7 @@ proc emitSDivMod64(g: var CodeGen) =
       g.ab.tree EorA64:  (g.mReg R3; g.mReg R6)
       g.ab.tree Subs3M:  (g.mReg R2; g.mReg R2; g.mReg R6)
       g.ab.tree Sbcs3M:  (g.mReg R3; g.mReg R3; g.mReg R6)
-      g.ab.tree BlA64: g.ab.sym UDivMod64Proc
+      g.ab.tree BlA64: g.ab.sym g.uDivMod64Proc
       g.ab.tree EorA64:  (g.mReg R0; g.mReg R4)
       g.ab.tree EorA64:  (g.mReg R1; g.mReg R4)
       g.ab.tree Subs3M:  (g.mReg R0; g.mReg R0; g.mReg R4)
@@ -904,7 +927,7 @@ proc wideDivMod(g: var CodeGen; dst, a, b: WideRef; signed, wantRem: bool) =
   g.wideLoad(g.md.intArgRegs[1], a, 1)
   g.wideLoad(g.md.intArgRegs[2], b, 0)
   g.wideLoad(g.md.intArgRegs[3], b, 1)
-  g.ab.tree BlA64: g.ab.sym (if signed: SDivMod64Proc else: UDivMod64Proc)
+  g.ab.tree BlA64: g.ab.sym (if signed: g.sDivMod64Proc else: g.uDivMod64Proc)
   let lo = if wantRem: g.md.intArgRegs[2] else: g.md.intArgRegs[0]
   let hi = if wantRem: g.md.intArgRegs[3] else: g.md.intArgRegs[1]
   if dst.kind == wrSlot:

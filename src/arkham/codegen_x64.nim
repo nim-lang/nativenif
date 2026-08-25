@@ -9142,40 +9142,21 @@ proc asmPinReg(g: var CodeGen; at: Cursor; name: string): Reg =
               g.asmInfo
 
 type
-  AsmDeclKind = enum
-    aslNone,       ## no location pragma at all
-    aslReg,        ## `{.register: "rax".}`
-    aslStack       ## `{.stack.}`
   AsmDeclLoc = object
-    ## Where a `.assembler` param/local was DECLARED to live.
+    ## Where a `.assembler` param/local was DECLARED to live — the shared
+    ## `AsmDeclSpec` with its register name resolved against THIS target's file.
     kind: AsmDeclKind
     r: Reg
 
 proc asmDeclLoc(g: var CodeGen; prag: Cursor): AsmDeclLoc =
-  ## Read `(pragmas (register "rax"))` / `(pragmas (stack))` off a param or local.
-  result = AsmDeclLoc(kind: aslNone, r: NoReg)
-  if prag.substructureKind != PragmasU: return
-  var p = prag
-  p.into:
-    while p.hasMore:
-      case p.pragmaKind
-      of RegisterP:
-        let at = p
-        var nm = ""
-        p.into:
-          if p.hasMore and p.kind == StrLit: (nm = strVal(p); inc p)
-          while p.hasMore: skip p
-        result = AsmDeclLoc(kind: aslReg, r: g.asmPinReg(at, nm))
-      of StackP:
-        result = AsmDeclLoc(kind: aslStack, r: NoReg)
-        skip p
-      else: skip p
-
-proc isResultName(nm: string): bool {.inline.} =
-  ## Nimony names a routine's implicit result `result.<n>[.<module>]`. It is the one
-  ## local a user cannot annotate — `result` is not a declaration they write — so
-  ## `.assembler` pins it to the ABI return register instead of demanding a pragma.
-  nm.startsWith("result.")
+  ## `(pragmas (register "rax"))` / `(pragmas (stack))`, read by `asmDeclSpec` and
+  ## resolved here: which spelling names a register is the one part of a location
+  ## pragma that is not target-neutral.
+  let spec = asmDeclSpec(prag)
+  case spec.kind
+  of aslNone: AsmDeclLoc(kind: aslNone, r: NoReg)
+  of aslReg: AsmDeclLoc(kind: aslReg, r: g.asmPinReg(spec.at, spec.name))
+  of aslStack: AsmDeclLoc(kind: aslStack, r: NoReg)
 
 proc x64FlagOf(op: IntrinsicOp): X64Flag =
   ## The nifasm condition tag a flag-read row denotes. `(ite (zf) …)` already
@@ -9195,38 +9176,6 @@ proc x64FlagOf(op: IntrinsicOp): X64Flag =
   of PfOp: PfO
   of NotPfOp: NpO
   else: NoFlag
-
-proc instrOpAt(g: var CodeGen; c: Cursor): IntrinsicOp =
-  ## The row an `(instr SYM …)` node names, or `NoIntrinsicOp` if `c` is not one.
-  result = NoIntrinsicOp
-  if c.kind != TagLit or c.exprKind != InstrC: return
-  var fc = c
-  var sym = ""
-  fc.into:
-    sym = symName(fc); skip fc
-    while fc.hasMore: skip fc
-  result = instrTargetOf(g.prog, sym).op
-
-proc asmNoteInfo(g: var CodeGen; c: Cursor) {.inline.} =
-  ## Remember the innermost node that carried line info, so a rejection deeper in
-  ## (NIF line info is sparse) still points at the right statement.
-  let li = lengInfo(c)
-  if li.len > 0: g.asmInfo = li
-
-proc asmRegOf(g: var CodeGen; c: Cursor): Reg =
-  ## The register an operand names. `.assembler` operands must be ATOMS, so this is
-  ## a table lookup and nothing else — no evaluation, no materialization.
-  if c.kind != Symbol:
-    lengError c, "an `.assembler` operand must be a variable or a literal, not " &
-              "a computed expression", g.asmInfo
-  let nm = symName(c)
-  if nm in g.asmStack:
-    lengError c, "`" & userName(nm) & "` lives on the stack; this operand needs a register",
-              g.asmInfo
-  if not g.asmReg.hasKey(nm):
-    lengError c, "`" & userName(nm) & "` has no declared location — every local in an " &
-              "`.assembler` proc needs `{.register: \"…\".}` or `{.stack.}`", g.asmInfo
-  result = g.asmReg[nm]
 
 proc asmScanLocs(g: var CodeGen; c: Cursor; used: var set[Reg]; anyStack: var bool) =
   ## Pre-pass over the body: which registers the locals pin (so the prologue knows
@@ -9253,30 +9202,6 @@ proc asmScanLocs(g: var CodeGen; c: Cursor; used: var set[Reg]; anyStack: var bo
 
 proc asmStmt(g: var CodeGen; c: Cursor)
 proc asmInstr(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor)
-
-proc isAsmStackSym(g: CodeGen; c: Cursor): bool {.inline.} =
-  c.kind == Symbol and symName(c) in g.asmStack
-
-proc asmAtom(c: Cursor): Cursor =
-  ## Peel the type-only wrappers the front end puts around a literal: `result = 100`
-  ## in a `uint64` context arrives as `(conv (u 64) 100)`. A conversion of a
-  ## CONSTANT is a fact about the constant — the assembler encodes the immediate
-  ## at the operand's width and no instruction exists to emit — so folding it is
-  ## what "one-to-one" means here. A `conv` of a *value* is a real sign/zero
-  ## extension and is left alone, so it still reaches the rejection below.
-  result = c
-  while result.kind == TagLit and result.exprKind in {ConvC, CastC}:
-    var inner = result
-    var got = result
-    var count = 0
-    inner.into:
-      skip inner                                 # the target type
-      while inner.hasMore:
-        if count == 0: got = inner
-        inc count
-        skip inner
-    if count != 1 or got.kind notin {IntLit, UIntLit, CharLit}: return
-    result = got
 
 proc asmOperand(g: var CodeGen; cur: Cursor) =
   ## One source operand of a flag-defining instruction: a register local, a stack
