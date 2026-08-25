@@ -234,13 +234,20 @@ expression evaluator:
 - **Whole-aggregate copies are tiered by operand FORM, not given a fixed budget.** A
   copy needs a per-word transfer register plus one register per end whose address
   must be computed. A *named* `(s)` slot is not such an end: nifasm folds a byte
-  offset into the slot's own frame displacement (`(mem (rsp) name off)`, bounds-checked
+  offset into the slot's own frame displacement (`(mem name off)`, bounds-checked
   against the slot), so each named end costs **zero** registers. Two named ends
   therefore cost one register, one named end two, and only a copy between two computed
   addresses costs three. Reducing every source to an address in a register first —
   "one path for all forms" — made three the price of *every* copy, which is what ran
   the emit-time staging pool dry once optimization filled the volatiles with call-free
   locals. The tier is picked by `aggrSrcEnd`/`aggrDstEnd` and carried in `AggrEnd`.
+
+  **`codegen_arm` does not do this yet.** Its `copyAggr` takes two `Reg`s, so a named
+  slot end is always lea'd into a bridge first — the untiered shape x86-64 used to
+  have. nifasm accepts `(mem name off)` on both Arm targets now, so what is missing is
+  the arkham half: port `AggrEnd`/`slotEnd`/`regEnd` across. Unlike the x86-64 spelling
+  change that unblocked it, that one CHANGES the emitted code, so it wants its own
+  measurement rather than a byte-identity gate.
 
 - **Aggregate results.** A ≤16-byte aggregate is returned by value in the result
   registers (x0:x1 / rax:rdx); a larger one is returned through a hidden pointer

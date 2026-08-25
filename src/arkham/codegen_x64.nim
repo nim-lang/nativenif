@@ -230,12 +230,12 @@ proc emFloatScalarLoad(g: var CodeGen; dest: FReg; name: string; bits: int) =
   let op = if bits == 32: MovssX64 else: MovsdX64
   g.ab.tree op:
     g.emFReg dest
-    g.ab.tree MemX: (g.ab.rawReg RSP; g.ab.sym name)
+    g.ab.tree MemX: g.ab.sym name
 
 proc emFloatScalarStore(g: var CodeGen; name: string; src: FReg; bits: int) =
   let op = if bits == 32: MovssX64 else: MovsdX64
   g.ab.tree op:
-    g.ab.tree MemX: (g.ab.rawReg RSP; g.ab.sym name)
+    g.ab.tree MemX: g.ab.sym name
     g.emFReg src
 
 # ── low-level emit helpers ───────────────────────────────────────────────────
@@ -734,12 +734,13 @@ proc releaseAsMirror(g: var CodeGen; r: Reg; dst: Location): bool =
 proc releaseFAsMirror(g: var CodeGen; f: FReg; dst: Location): bool {.inline.} =
   g.mirrorFStored(f, dst)
 
-proc emStackMem(g: var CodeGen; name: string) =       # (mem (rsp) name)
+proc emStackMem(g: var CodeGen; name: string) =       # (mem name)
+  ## The slot symbol carries its own rsp displacement, so the frame base is
+  ## implicit — the same spelling both Arm backends use.
   g.ab.tree MemX:
-    g.ab.rawReg RSP
     g.ab.sym name
 
-proc emFieldMem(g: var CodeGen; base, field: string) =   # (mem (dot (rsp) base field))
+proc emFieldMem(g: var CodeGen; base, field: string) =   # (mem (dot base field))
   # A sub-word field (e.g. a `cint`) is fine: nifasm sizes the `(mem (dot …))` access
   # from the field's declared type (a 4-byte mov for a 32-bit field, sign/zero-extended
   # on load). A field-by-field aggregate copy (copyStructThroughPtr2 / genConstr2)
@@ -747,17 +748,15 @@ proc emFieldMem(g: var CodeGen; base, field: string) =   # (mem (dot (rsp) base 
   # own `fieldAtOffset` guard for genuinely word-misaligned packing.
   g.ab.tree MemX:
     g.ab.tree DotX:
-      g.ab.rawReg RSP
       g.ab.sym base
       g.ab.sym field
 
-proc emAggrElemMem(g: var CodeGen; base: string; idx: int) =  # (mem (at (rsp) base idx))
+proc emAggrElemMem(g: var CodeGen; base: string; idx: int) =  # (mem (at base idx))
   ## Element `idx` of the stack array `base`; nifasm folds the constant `idx*elemSize`
   ## into the displacement (an immediate index needs no stride scratch) and sizes the
   ## access from the array's element type.
   g.ab.tree MemX:
     g.ab.tree AtX:
-      g.ab.rawReg RSP
       g.ab.sym base
       g.ab.intLit idx
 
@@ -1773,7 +1772,7 @@ proc emStackAddr(g: var CodeGen; dest: Reg; name: string) =   # dest ← &stackv
   ## is kept.
   if g.rb.isBound(dest) and not g.rb.isBoundTemp(dest) and not g.rb.isPtrBound(dest):
     g.releaseStaleName(dest)
-  g.ab.tree LeaX64: (g.emReg dest; g.ab.rawReg RSP; g.ab.sym name)
+  g.ab.tree LeaX64: (g.emReg dest; g.ab.sym name)
 
 proc emAggrHomeAddr(g: var CodeGen; dest: Reg; name: string) =
   ## `dest ← &<the aggregate stored under `name`>`, for a name that is a stack home:
@@ -3873,7 +3872,9 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
     elif loc.kind == InRegPair:
       raiseAssert "arkham x64n: address of InRegPair local " & nm
     else:                                               # a `(s)` stack-var base
-      g.ab.rawReg RSP
+      # ONE node, like every other arm: the slot symbol already means
+      # `[rsp + slotOffset]`. This emitter is spliced into `(dot …)`/`(at …)`/
+      # `(lea …)` operand positions, so it must never write two siblings.
       g.ab.sym nm
   of TagLit:
     case c.exprKind
@@ -3955,9 +3956,8 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
         while cc.hasMore: skip cc
     of AconstrC, OconstrC:
       # A constructor base materialized into `aggtmp<pos>` by `prematLval2`: address it as
-      # an ordinary `(rsp) name` stack-var base.
+      # an ordinary stack-var base.
       let pos = cursorToPosition(g.buf[], c)
-      g.ab.rawReg RSP
       g.ab.sym (synth("aggtmp") & $pos & ".0")
     else: raiseAssert "arkham x64n: emLvalAddr2 expr " & $c.exprKind
   else: raiseAssert "arkham x64n: emLvalAddr2 kind " & $c.kind
@@ -4536,15 +4536,14 @@ proc emByteAtImm(g: var CodeGen; p: Reg; off: int) =
       g.ab.intLit off.int64
 
 proc emWordAtSlot(g: var CodeGen; name: string; off: int) =
-  ## `(cast (u 64) (mem (rsp) name off))` — the eightbyte at byte offset `off` of the
+  ## `(cast (u 64) (mem name off))` — the eightbyte at byte offset `off` of the
   ## NAMED stack slot `name`, typed as a raw word. The pointer twin `emWordThroughPtr`
   ## needs the slot's ADDRESS in a register first; this needs no register at all,
-  ## because nifasm folds `off` into the slot's own rsp displacement (and bounds-checks
+  ## because nifasm folds `off` into the slot's own frame displacement (and bounds-checks
   ## it against the slot, which the register form cannot).
   g.ab.tree CastX:
     g.ab.uintType(64)
     g.ab.tree MemX:
-      g.ab.rawReg RSP
       g.ab.sym name
       g.ab.intLit off.int64
 
@@ -4553,7 +4552,6 @@ proc emByteAtSlot(g: var CodeGen; name: string; off: int) =
   g.ab.tree CastX:
     g.ab.uintType(8)
     g.ab.tree MemX:
-      g.ab.rawReg RSP
       g.ab.sym name
       g.ab.intLit off.int64
 

@@ -696,6 +696,11 @@ exec "nim c -r src/nifasm/nifasm tests/kill_reuse.nif"
 exec "nim c -r src/nifasm/nifasm tests/kill_reuse_multi.nif"
 exec "nim c -r src/nifasm/nifasm tests/kill_reuse_types.nif"
 exec "nim c -r src/nifasm/nifasm tests/dot_at_access.nif"
+# The BASE-FREE slot spellings — `(mem slot)`, `(mem slot off)`, `(dot slot field)`,
+# `(at slot idx)`, `(lea D slot)`. Every target spells a slot access this way now; the
+# frame base is the slot's own and is never written out. `dot_at_access` above pins the
+# older explicit-`(rsp)` forms, which stay accepted on x86-64.
+exec "nim c -r src/nifasm/nifasm tests/slot_base_free.nif"
 exec "nim c -r src/nifasm/nifasm tests/nested_dot_at.nif"
 exec "nim c -r src/nifasm/nifasm tests/pointer_dot_store.nif"
 exec "nim c -r src/nifasm/nifasm tests/array_i64_register_index.nif"
@@ -736,6 +741,7 @@ when defined(linux) and defined(amd64):
   execRun "tests/bitops_rotate_scan"
   execRun "tests/bitops_bittest"
   execRun "tests/dot_at_access"
+  execRun "tests/slot_base_free"
   execRun "tests/nested_dot_at"
   execRun "tests/pointer_dot_store"
   execRun "tests/array_i64_register_index"
@@ -798,6 +804,11 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_clobber_after_call.nif",
 # destroyed. Taking the empty list at face value is what lets a value stay in a
 # caller-saved register across a cold guard instead of paying a callee-saved home.
 exec "nim c -r src/nifasm/nifasm tests/a64_noreturn_clobber.nif"
+# The AArch64 twin of `slot_base_free`: the base-free slot spellings, including the
+# `(mem <slot> <off>)` form that reads one word of a stack aggregate with NO address
+# register. It targets `linux_arm64`, so unlike the Darwin a64 fixtures it produces an
+# ELF this host can run under qemu (see the guarded `execRun` further down).
+exec "nim c -r src/nifasm/nifasm tests/a64_slot_base_free.nif"
 # The `rep movs` family names none of its operands in the tree, yet destroys rdi/rsi/rcx.
 # Reading a local homed in one of them afterwards must be rejected here — otherwise the
 # only symptom is a silently wrong value at run time.
@@ -826,6 +837,13 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_at_base_index_collision.
 # (MAP_FAILED) stays legal too, because a COMPARE cannot corrupt a binding.
 execExpectFailure("nim c -r src/nifasm/nifasm tests/ptr_store_nonzero.nif", "cannot store the non-zero integer 32 into the pointer-typed destination")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/mem_slot_offset_range.nif", "offset 16 is outside stack slot 'buf.0' (16 bytes)")
+# The same check over the BASE-FREE spelling `(mem <slot> <off>)` — and on all three
+# targets, because all three now accept it. The bounds check is the whole reason the
+# named form is preferable to `(cast (aptr T) <reg>)`, so it must not be reachable
+# only through x86-64's older explicit-`(rsp)` spelling.
+execExpectFailure("nim c -r src/nifasm/nifasm tests/mem_slot_offset_range_basefree.nif", "offset 16 is outside stack slot 'p.0' (16 bytes)")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_mem_slot_offset_range.nif", "offset 16 is outside stack slot 'p.0' (16 bytes)")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/cortex_m_mem_slot_offset_range.nif", "offset 8 is outside stack slot 'p.0' (8 bytes)")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/cast_dest_reg.nif", "Expected memory destination")
 # The sub-width width-cast destination is an ALU-only exception: `mov` keeps the
 # strict rule, so the pointer-store protection cannot be casted away.
@@ -1655,6 +1673,17 @@ when defined(linux) and defined(amd64):
 # provide it as a shell shim that just execs its argument.
 when defined(linux) and defined(arm64):
   arkhamQemuTests()
+
+# The hand-written AArch64 fixture assembled above is a `linux_arm64` ELF: run it.
+when defined(linux):
+  if findExe("qemu-aarch64").len > 0:
+    let (sbfOut, sbfCode) = runProgram(findExe("qemu-aarch64"),
+                                       ["tests" / "a64_slot_base_free"])
+    if sbfCode != 0:
+      quit "FAILURE a64_slot_base_free: exit " & $sbfCode & "\n" & sbfOut
+    echo "1 / 1 a64 base-free slot addressing tests successful"
+  else:
+    echo "qemu-aarch64 not found - skipping a64_slot_base_free"
 
 # The AArch64 backend gets the same starved-pool pass, under qemu.
 when defined(linux) and defined(amd64):

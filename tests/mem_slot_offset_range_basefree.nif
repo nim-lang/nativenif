@@ -1,0 +1,25 @@
+(.nif27)
+(stmts
+ (type :Point.0
+  (object
+   (fld :x.0
+    (i 64))
+   (fld :y.0
+    (i 64))))
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (var :p.0
+    (s)Point.0)
+   (mov
+    (rdx)
+    (cast
+     (u 64)
+     (mem p.0 16)))
+   (mov
+    (rdi)0)
+   (mov
+    (rax)60)
+   (syscall))))

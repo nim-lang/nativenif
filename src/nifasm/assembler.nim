@@ -2091,14 +2091,43 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
           result = addrOp
           result.typ = resolvedBase(addrOp.typ, ctx, n)
         else:
+          let baseTok = n                      # peeked for the slot diagnostics
           var baseOp = parseOperandA64(n, ctx)
-          if baseOp.kind == okImm or baseOp.kind == okMem:
+          if baseOp.kind == okImm:
             error("mem base must be a register", n)
+          var memBase = baseOp.reg
           var offset: int32 = 0
           var hasIndex = false
           var indexReg: arm64.Register = arm64.X0
           var shift: int = 0
-          if n.hasMore and n.kind == TagLit and n.tag == ArgTagId:
+          var stackVarType: Type = nil
+          if baseOp.kind == okMem:
+            # `(mem name)` / `(mem name off)` — the base-free slot form. A slot symbol
+            # already parses to `[sp + slotOffset]` (the `Symbol` arm of
+            # `parseOperandA64`), so the frame base needs no operand of its own. This
+            # is what lets a word of a stack aggregate be read or written without
+            # first materializing the aggregate's address in a register: the copy
+            # costs zero address registers instead of one. The access WIDTH still
+            # comes from the operand's type, so a caller reading a raw eightbyte
+            # wraps this in `(cast (u 64) …)`.
+            if baseOp.typ == nil or baseOp.typ.kind != StackOffT:
+              error("mem base must be a register", n)
+            memBase = baseOp.mem.base
+            offset = baseOp.mem.offset
+            stackVarType = baseOp.typ.offType
+            if n.hasMore and n.kind == IntLit:
+              # Bounds-checked against the slot — the one safety a `(cast (aptr T)
+              # <reg>)` access can never have, since the register form has no object
+              # to check against.
+              let extra = getInt(n)
+              let slotSize = asmSizeOf(baseOp.typ)
+              if extra < 0 or extra >= slotSize:
+                error("offset " & $extra & " is outside stack slot '" &
+                      (if baseTok.kind == Symbol: getSym(baseTok) else: "?") &
+                      "' (" & $slotSize & " bytes)", n)
+              offset += int32(extra)
+              inc n
+          elif n.hasMore and n.kind == TagLit and n.tag == ArgTagId:
             # (mem (sp) (arg name)) - address of an outgoing stack argument slot
             let argOff = parseOperandA64(n, ctx)
             if argOff.kind != okImm:
@@ -2127,7 +2156,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
                 error("Expected index register or offset in mem", n)
           result.kind = okMem
           result.mem = arm64.MemoryOperand(
-            base: baseOp.reg,
+            base: memBase,
             index: indexReg,
             shift: shift,
             offset: offset,
@@ -2137,7 +2166,9 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
           # handler). `memWidthOpc` sizes it from T (a sub-word int/bool → a narrow ldrb/
           # ldrh, e.g. the SSO `(ptr (u 8))` `s[i]` char read; everything ≥8 bytes → a
           # word); `movCompatible` decides whether T can move to/from the chosen register.
-          if baseOp.typ != nil and baseOp.typ.kind in {TypeKind.PtrT, TypeKind.AptrT}:
+          if stackVarType != nil:
+            result.typ = stackVarType
+          elif baseOp.typ != nil and baseOp.typ.kind in {TypeKind.PtrT, TypeKind.AptrT}:
             result.typ = resolvedBase(baseOp.typ, ctx, n)
           else:
             result.typ = Type(kind: IntT, bits: 64)
@@ -4689,6 +4720,7 @@ proc parseOperandM(n: var Cursor; ctx: var GenContext): OperandM =
           result = addrOp
           result.typ = resolvedBase(addrOp.typ, ctx, n)
         else:
+          let baseTok = n                    # peeked for the slot diagnostics
           let base = parseOperandM(n, ctx)
           if base.kind == okMem:
             # A stack variable used as a base: its slot IS the address.
@@ -4704,7 +4736,19 @@ proc parseOperandM(n: var Cursor; ctx: var GenContext): OperandM =
               error("(arg ...) in mem must denote a stack argument", n)
             result.mem.offset += int32(argOff.immVal)
           elif n.hasMore and n.kind == IntLit:
-            result.mem.offset += int32(getInt(n))
+            let extra = getInt(n)
+            if base.kind == okMem and base.typ != nil and
+               base.typ.kind == TypeKind.StackOffT:
+              # `(mem name off)` — a raw byte offset WITHIN the named slot. Bounds-
+              # checked against it, the one safety a `(cast (aptr T) <reg>)` access
+              # can never have. A register base gets no check: there is no object to
+              # check against.
+              let slotSize = asmSizeOf(base.typ)
+              if extra < 0 or extra >= slotSize:
+                error("offset " & $extra & " is outside stack slot '" &
+                      (if baseTok.kind == Symbol: getSym(baseTok) else: "?") &
+                      "' (" & $slotSize & " bytes)", n)
+            result.mem.offset += int32(extra)
             inc n
           elif n.hasMore and n.kind == Symbol:
             # A stack PARAMETER's name: its offset in the incoming argument area.
@@ -6315,8 +6359,22 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
             useFsSegment = baseOp.mem.useFsSegment
           else:
             baseReg = baseOp.reg
+        elif baseOp.kind == okMem and baseOp.typ.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
+          objType = baseOp.typ
+          baseReg = baseOp.mem.base
+          baseDisp = baseOp.mem.displacement
+        elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.StackOffT and
+             baseOp.typ.offType.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
+          # A stack-resident object/union named DIRECTLY: `(dot p.0 x.0)`. The slot
+          # symbol already parses to `[rsp+offset]` (see the `Symbol` arm below), so
+          # the frame base needs no operand of its own — same as the Arm parsers.
+          # The older `(dot (rsp) p.0 x.0)` spelling above stays accepted.
+          objType = baseOp.typ.offType
+          baseReg = baseOp.mem.base
+          baseDisp = baseOp.mem.displacement
         else:
-          error("dot requires (base-reg stackvar field) or (ptr-var field), got " & $baseOp.typ, n)
+          error("dot requires a stack object/union, a pointer to one, or (base-reg stackvar field), got " &
+                $baseOp.typ, n)
 
       # Find field in object/union type. Offsets are precomputed in
       # parseObjectBody/parseUnionBody — inherited (base) fields carry their base
@@ -6401,8 +6459,21 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
               baseHasIndex = baseOp.mem.hasIndex
             else:
               baseReg = baseOp.reg
+          elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.ArrayT:
+            elemType = baseOp.typ.elem
+            baseReg = baseOp.mem.base
+            baseDisp = baseOp.mem.displacement
+          elif baseOp.kind == okMem and baseOp.typ.kind == TypeKind.StackOffT and
+               baseOp.typ.offType.kind == TypeKind.ArrayT:
+            # A stack-resident array named DIRECTLY: `(at arr.0 (rcx))`. The slot
+            # symbol carries its own `[rsp+offset]`, so the frame base is implicit —
+            # same as the Arm parsers. `(at (rsp) arr.0 (rcx))` stays accepted.
+            elemType = baseOp.typ.offType.elem
+            baseReg = baseOp.mem.base
+            baseDisp = baseOp.mem.displacement
           else:
-            error("at requires (base-reg stackvar index) or a pointer-to-array base, got " & $baseOp.typ, n)
+            error("at requires a stack array, an aptr, a pointer-to-array base, or (base-reg stackvar index), got " &
+                  $baseOp.typ, n)
 
         if not isIntegerType(indexOp.typ):
           error("Array index must be integer type, got " & $indexOp.typ, n)
@@ -6611,11 +6682,15 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
           )
           result.typ = Type(kind: IntT, bits: 64)
         else:
-          # Explicit addressing: (mem base) or (mem base offset) or (mem base index scale [offset])
+          # Explicit addressing: (mem base) or (mem base offset) or
+          # (mem base index scale [offset]) — or the BASE-FREE slot form
+          # `(mem <stackvar> [offset])` handled first below.
+          let baseTok = n                      # peeked for the slot diagnostics
           var baseOp = parseOperand(n, ctx)
-          if baseOp.kind == okImm or baseOp.kind == okMem:
+          if baseOp.kind == okImm:
             error("mem base must be a register", n)
 
+          var memBase = baseOp.reg
           var displacement: int32 = 0
           var hasIndex = false
           var indexReg: x86.Register = x86.RAX
@@ -6624,7 +6699,31 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
           # Check for an optional offset/index (present only if the mem node has
           # more children).
           var stackVarType: Type = nil
-          if n.hasMore and n.kind == TagLit and n.tag == ArgTagId:
+          if baseOp.kind == okMem:
+            # `(mem name)` / `(mem name off)` — the base-free slot form. A slot
+            # symbol already parses to `[rsp + slotOffset]` (the `Symbol` arm of
+            # `parseOperand`), so the frame base carries no information and needs no
+            # operand of its own. This is the Thumb-2 and AArch64 spelling; the older
+            # `(mem (rsp) name [off])` goes through the `Symbol` branch further down
+            # and stays accepted.
+            if baseOp.typ == nil or baseOp.typ.kind != StackOffT:
+              error("mem base must be a register", n)
+            memBase = baseOp.mem.base
+            displacement = baseOp.mem.displacement
+            stackVarType = baseOp.typ.offType
+            if n.hasMore and n.kind == IntLit:
+              # A raw byte offset WITHIN the named slot, bounds-checked against it —
+              # the one safety a `(cast (aptr T) <reg>)` access can never have. See
+              # the twin check in the `(mem <base> <stackvar> <disp>)` branch below.
+              let extra = getInt(n)
+              let slotSize = asmSizeOf(baseOp.typ)
+              if extra < 0 or extra >= slotSize:
+                error("offset " & $extra & " is outside stack slot '" &
+                      (if baseTok.kind == Symbol: getSym(baseTok) else: "?") &
+                      "' (" & $slotSize & " bytes)", n)
+              displacement += int32(extra)
+              inc n
+          elif n.hasMore and n.kind == TagLit and n.tag == ArgTagId:
             # (mem (rsp) (arg name)) — an outgoing stack-argument slot. The arg's
             # byte offset within the reserved area becomes the displacement.
             var an = n; inc an                  # peek the arg name before consuming
@@ -6717,7 +6816,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
 
           result.kind = okMem
           result.mem = x86.MemoryOperand(
-            base: baseOp.reg,
+            base: memBase,
             index: indexReg,
             scale: scale,
             displacement: displacement,

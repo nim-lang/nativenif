@@ -1,0 +1,25 @@
+(.nif27)
+(stmts
+ (arch cortex_m)
+ (type :Point.0
+  (object
+   (fld :x.0
+    (i 32))
+   (fld :y.0
+    (i 32))))
+ (proc :main.0
+  (params)
+  (result :mret.0
+   (r0)
+   (i 32))
+  (stmts
+   (var :p.0
+    (s)Point.0)
+   (mov
+    (r1)
+    (cast
+     (u 32)
+     (mem p.0 8)))
+   (mov
+    (r0)0)
+   (ret))))

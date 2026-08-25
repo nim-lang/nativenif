@@ -1,0 +1,103 @@
+(.nif27)
+(.indexat 1226             )
+(stmts
+ (arch linux_arm64)
+ (type :Point.0
+  (object
+   (fld :x.0
+    (i 64))
+   (fld :y.0
+    (i 64))))
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (var :p.0
+    (s)Point.0)
+   (var :arr.0
+    (s)
+    (array
+     (i 64)5))
+   (var :v.0
+    (s)
+    (i 64))
+   (var :arrptr.0
+    (x5)
+    (aptr
+     (i 64)))
+   (mov
+    (x1)10)
+   (mov
+    (mem
+     (dot p.0 x.0))
+    (x1))
+   (mov
+    (x1)20)
+   (mov
+    (mem
+     (dot p.0 y.0))
+    (x1))
+   (mov
+    (x2)
+    (cast
+     (u 64)
+     (mem p.0 0)))
+   (mov
+    (x3)
+    (cast
+     (u 64)
+     (mem p.0 8)))
+   (mov
+    (x1)77)
+   (mov
+    (mem v.0)
+    (x1))
+   (mov
+    (x4)
+    (mem v.0))
+   (mov
+    (x1)300)
+   (mov
+    (mem
+     (at arr.0 2))
+    (x1))
+   (mov
+    (x9)2)
+   (mov
+    (x10)
+    (mem
+     (at arr.0
+      (x9))))
+   (lea arrptr.0 arr.0)
+   (mov
+    (x11)
+    (mem
+     (at arrptr.0
+      (x9))))
+   (cmp
+    (x2)10)
+   (bne fail.0)
+   (cmp
+    (x3)20)
+   (bne fail.0)
+   (cmp
+    (x4)77)
+   (bne fail.0)
+   (cmp
+    (x10)300)
+   (bne fail.0)
+   (cmp
+    (x11)300)
+   (bne fail.0)
+   (mov
+    (x0)0)
+   (b exit.0)
+   (lab :fail.0)
+   (mov
+    (x0)1)
+   (lab :exit.0)
+   (mov
+    (x8)93)
+   (svc 0))))
+(.index)

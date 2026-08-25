@@ -74,7 +74,7 @@ Registers are typically not written directly, instead if they are used as local 
 
 Declarations are either bound to a register or to a stack slot. Instead of a register name the `(s)` tag is used then. The `(s)` tag explicitly indicates storage location (stack allocation), which is separate from the type information. Since we know the type of every declaration the slot's offset is computed by `nifasm`. Again, this keeps the code more readable. An instruction can use the tag `(ssize)` to access the maximum required stack size. This is typically used in function prologs and epilogs.
 
-Stack-allocated variables can have compound types (arrays, objects). When a variable name bound to a stack slot is used in an address expression (`(dot ...)`, `(at ...)`), it stands for the *address* of the stack-allocated value — the frame base plus the computed offset — so arrays and objects on the stack are accessed by name, with no explicit address computation. The targets spell the frame base differently: x86-64 wants it as an operand of its own, while both Arm targets take it from the slot.
+Stack-allocated variables can have compound types (arrays, objects). When a variable name bound to a stack slot is used in an address expression (`(dot ...)`, `(at ...)`, `(mem ...)`), it stands for the *address* of the stack-allocated value — the frame base plus the computed offset — so arrays and objects on the stack are accessed by name, with no explicit address computation. The frame base is never written out: the slot carries it, on every target.
 
 Note: The `(s)` tag is required for clarity - it explicitly separates storage location from type. For example, `(var :arr.0 (s) (array (i 32) 6))` makes it clear that `(s)` is about where the variable is stored (stack), while `(array (i 32) 6)` is about its type (array of 6 int32s). A slot can also demand a stricter alignment than its type implies, as `(s (align 16))`.
 
@@ -82,14 +82,31 @@ Note: The `(s)` tag is required for clarity - it explicitly separates storage lo
 (var :arr.0 (s) (array (i 32) 6))  # stack array of 6 int32s
 (var :p.0 (s) Point.0)             # stack object of type Point.0
 
-# x86-64: the frame base register is written out
-(mov (rax) (mem (at (rsp) arr.0 (rcx))))  # loads arr[rcx] - [rsp+offset+rcx*4]
-(mov (rbx) (mem (dot (rsp) p.0 x.0)))     # loads p.x    - [rsp+offset+field_offset]
+# x86-64
+(mov (rax) (mem (at arr.0 (rcx))))  # loads arr[rcx] - [rsp+offset+rcx*4]
+(mov (rbx) (mem (dot p.0 x.0)))     # loads p.x    - [rsp+offset+field_offset]
 
-# AArch64: the slot carries its own frame base, so it is left implicit
+# AArch64 / Cortex-M: the same spelling
 (mov (x0) (mem (at arr.0 (x9))))
 (mov (x1) (mem (dot p.0 x.0)))
 ```
+
+A slot can also be addressed with a raw byte offset inside it, `(mem <slot> <off>)`.
+This is what lets one word of a stack aggregate be read or written without first
+materializing the aggregate's address in a register, so a copy out of a named slot
+costs zero address registers instead of one. The access *width* still comes from the
+operand's type, so a caller reading a raw eightbyte wraps it in a cast:
+
+```
+(mov (rax) (cast (u 64) (mem p.0 8)))   # the second eightbyte of the slot `p.0`
+```
+
+`off` is bounds-checked against the slot — the one safety a `(cast (aptr T) <reg>)`
+access can never have, since the register form has no object to check against.
+
+For x86-64 the older explicit-base spellings `(mem (rsp) <slot> [off])`,
+`(dot (rsp) <slot> <field>)` and `(at (rsp) <slot> <index>)` remain accepted, but
+carry no information: `rsp` is the only base a slot ever has there.
 
 `(ssize)` is the frame size the assembler computed for the current proc; the prologue and
 epilogue use it (`(sub (rsp) (ssize))` / `(add (rsp) (ssize))`). Slots declared inside a
