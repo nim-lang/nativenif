@@ -465,10 +465,45 @@ The first three are not target questions and are gone:
    terms of the wrong fact. `codegen_m64`'s `int64` arithmetic is now inherited by
    the next 32-bit back end rather than rewritten for it.
 
-Two kinds remain, and they are the honest ones: **capability** (hardware divide,
-`csel`, tail calls, the modified-immediate predicate — a target either has the
-instruction or does not) and **frame shape** (pair saves with their padding
-versus a register at a time, fp-relative versus SP-relative stack arguments).
-The first wants a set and a couple of predicates in the description; the second
-wants a handful of overridable procs. Neither is a place where a third target
-should have to re-derive what the second already knows.
+The last two are the honest ones, and both are now named in the description
+rather than inferred from which of two targets is being emitted:
+
+ * **Capability** — `md.caps`, a `set[TargetFeature]`. A conditional select, a
+   tail call, double precision, a one-instruction sub-word extend, a
+   register-offset memory operand, a pc-relative address fold, acquire/release
+   exclusives, a destructive two-operand ALU spelling, branches on conditions
+   other than zero, and whether there is an OS underneath at all. These are facts
+   about the ASSEMBLER'S VOCABULARY, not about the silicon: AArch64 has `sxtb`,
+   but nifasm's a64 selector has no tag for it and lowers an extend as a shift
+   pair, so `SubwordExtend` is absent there. What a capability answers is "may
+   the emitter write this down", which is the only question it ever asks.
+
+   Two related facts are enums rather than set members because they are choices
+   among alternatives, not presence or absence: `immStyle` (which constants may
+   ride along as an ALU immediate — a bitmask immediate, a ThumbExpandImm, an
+   imm32) and `targetName`/`gprRangeText`, which let a rejection read as prose.
+   `immStyle` is an enum rather than a predicate FIELD for one concrete reason:
+   a proc there would make `machine` import `nifasm/arm64`, and with it `relocs`,
+   for one predicate.
+
+ * **Frame shape** — `md.frameStyle`. `PairFrame` pushes fp/lr and the saved
+   registers in pairs and addresses the caller's arguments off the frame pointer;
+   `BlockFrame` lowers SP once and stores one register at a time, has no frame
+   pointer to spare, and therefore RE-DERIVES the incoming-argument base from SP
+   — which is only correct after the prologue has finished, and is why a
+   `BlockFrame` target loads its stack parameters in the prologue rather than at
+   the top of the body. That single field decides eleven sites that each used to
+   ask which target this was. It is named for the shape because the next 32-bit
+   back end wants `BlockFrame` verbatim: RISC-V has no paired store either.
+
+   Beside it, `CodeGen.entryExits` says the entry proc EXITS instead of returning
+   — true on static Linux and on bare metal, false on Darwin, which is a property
+   of the runtime and not of the ISA, so it does not belong in the machine model.
+
+What is LEFT on `thumbM` is three branches, and each is genuinely about this one
+target rather than about a class of them: the `{.register: "…"}` rejection
+cascade, whose whole value is naming in prose which other thing already lives in
+the register the user asked for; one diagnostic that distinguishes the assembler
+from the architecture; and the Cortex-M reset path, which initialises RAM and
+enables the FPU. A fourth back end will want its own third item and will share
+the first two.

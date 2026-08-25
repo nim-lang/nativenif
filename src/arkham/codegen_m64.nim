@@ -186,6 +186,15 @@ proc wideSymRef(g: var CodeGen; c: Cursor; scratch: var Reg): WideRef =
       scratch = g.takeWideRegs(1, "a 64-bit global address")[0]
       g.emGlobalAddr(scratch, loc.name)
       return baseWide(scratch)
+    if loc.kind == Tvar:
+      # A thread-local, which on this target is a global (`genTvar` emitted a
+      # `(gvar …)` because the board declares one thread) — but addressed the way
+      # every other thread-local reference is, so the one decision stays in the
+      # declaration. `genTlvAddr` is the plain `(adr …)`; `emGlobalAddr`'s
+      # importc-name mapping and address mirror belong to gvars.
+      scratch = g.takeWideRegs(1, "a 64-bit thread-local address")[0]
+      g.genTlvAddr(loc.name, scratch)
+      return baseWide(scratch)
     raiseAssert "arkham cortex-m: 64-bit symbol " & symName(c) & " at " & $loc.kind
   else:
     raiseAssert "arkham cortex-m: 64-bit local " & symName(c) & " homed in " & $home.kind

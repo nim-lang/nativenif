@@ -106,6 +106,18 @@ const
     produceBridge: NoReg,
     bridgeRegs: @[],
     floatBridgeReg: NoFReg,
+    caps: {CondSelect, TailCall, Float64, SubwordExtend, RegOffsetMem,
+           PcRelGlobalFold, TwoAddrForms, AllFlagBranches},
+                                     # `codegen_x64` does not consult this set
+                                     # yet — it predates the seam — so these say
+                                     # what is true of the x86-64 vocabulary
+                                     # rather than what any branch reads. No
+                                     # AcqRelExclusives: x86 orders through the
+                                     # `lock` prefix, not an LL/SC pair.
+    frameStyle: PushFrame,
+    immStyle: X86Imm32,
+    gprRangeText: "`rax`..`r15`",
+    targetName: "x86-64",
     abiFloatCalleeSaved: @[],
     abiCalleeSaved: @[RBX, R12, R13, R14, R15, RBP],
     intCallerSavedSet: {RAX, RDI, RSI, RDX, RCX, R8, R9, R10, R11},
@@ -164,6 +176,18 @@ const
     produceBridge: NoReg,
     bridgeRegs: @[],
     floatBridgeReg: NoFReg,
+    caps: {CondSelect, TailCall, Float64, SubwordExtend, RegOffsetMem,
+           PcRelGlobalFold, TwoAddrForms, AllFlagBranches},
+                                     # `codegen_x64` does not consult this set
+                                     # yet — it predates the seam — so these say
+                                     # what is true of the x86-64 vocabulary
+                                     # rather than what any branch reads. No
+                                     # AcqRelExclusives: x86 orders through the
+                                     # `lock` prefix, not an LL/SC pair.
+    frameStyle: PushFrame,
+    immStyle: X86Imm32,
+    gprRangeText: "`rax`..`r15`",
+    targetName: "x86-64",
     abiFloatCalleeSaved: @[],
     abiCalleeSaved: @[RBX, R12, R13, R14, R15, RBP],
     intCallerSavedSet: {RAX, RDI, RSI, RDX, RCX, R8, R9, R10, R11},

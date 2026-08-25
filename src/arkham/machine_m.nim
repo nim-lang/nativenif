@@ -181,6 +181,21 @@ const
     produceBridge: ProduceBridge,
     bridgeRegs: @BridgeRegs,
     floatBridgeReg: F31,        # `machine.FloatBridgeReg`; s31 here
+    caps: {SubwordExtend, Freestanding, AllFlagBranches},
+                                # ARMv7E-M has none of the rest: no conditional
+                                # select (its equivalent is an IT block, a shape
+                                # this emitter does not build), no `(tailcall)`
+                                # spelling, no double precision (FPv4-SP), no
+                                # register-offset load/store operand form, no
+                                # pc-relative address fold, no acquire/release
+                                # exclusives (`ldrex`/`strex` + `dmb` instead),
+                                # and a three-operand ALU the assembler parses as
+                                # such — so a destructive op repeats its
+                                # destination.
+    frameStyle: BlockFrame,
+    immStyle: ThumbExpandImm,
+    gprRangeText: "`r0`..`r12`",
+    targetName: "Cortex-M",
     abiFloatCalleeSaved: @FloatCalleeSaved,
     abiCalleeSaved: @IntCalleeSaved,
     intCallerSavedSet: {R0, R1, R2, R3},   # AAPCS32's four; r12 is volatile too,

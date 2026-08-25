@@ -110,6 +110,18 @@ const
     produceBridge: R16,
     bridgeRegs: @AtomicScratchRegs,
     floatBridgeReg: FloatBridgeReg,
+    caps: {CondSelect, TailCall, Float64, RegOffsetMem, PcRelGlobalFold,
+           AcqRelExclusives, TwoAddrForms},
+                                     # NOT AllFlagBranches: nifasm's `genIteA64`
+                                     # implements the zero flag only, so far.
+                                     # NOT SubwordExtend: the hardware has `sxtb`,
+                                     # but nifasm's a64 selector has no tag for it
+                                     # and lowers an extend as a shift pair.
+                                     # NOT Freestanding: both a64 hosts have an OS.
+    frameStyle: PairFrame,
+    immStyle: A64Bitmask,
+    gprRangeText: "`x0`..`x30`",
+    targetName: "AArch64",
     abiFloatCalleeSaved: @FloatCalleeSaved,
     abiCalleeSaved: @IntCalleeSaved,
     intCallerSavedSet: IntCallerSaved,
@@ -141,6 +153,18 @@ const
     produceBridge: R16,
     bridgeRegs: @AtomicScratchRegs,
     floatBridgeReg: FloatBridgeReg,
+    caps: {CondSelect, TailCall, Float64, RegOffsetMem, PcRelGlobalFold,
+           AcqRelExclusives, TwoAddrForms},
+                                     # NOT AllFlagBranches: nifasm's `genIteA64`
+                                     # implements the zero flag only, so far.
+                                     # NOT SubwordExtend: the hardware has `sxtb`,
+                                     # but nifasm's a64 selector has no tag for it
+                                     # and lowers an extend as a shift pair.
+                                     # NOT Freestanding: both a64 hosts have an OS.
+    frameStyle: PairFrame,
+    immStyle: A64Bitmask,
+    gprRangeText: "`x0`..`x30`",
+    targetName: "AArch64",
     abiFloatCalleeSaved: @FloatCalleeSaved,
     abiCalleeSaved: @IntCalleeSaved,
     intCallerSavedSet: IntCallerSaved,

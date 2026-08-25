@@ -162,6 +162,28 @@ type
                                              ## features Cortex-M does not have, which
                                              ## are rejected by name rather than
                                              ## silently mis-emitted.
+    oneThread*: bool                         ## this image has exactly ONE thread of
+                                             ## execution, so a thread-local IS a
+                                             ## global and is emitted as one. True
+                                             ## for a static ELF (per-thread ==
+                                             ## per-process) and for a bare-metal
+                                             ## image whose board declares a single
+                                             ## stack slot. NOT a property of the
+                                             ## ISA: a Cortex-M part with four cores
+                                             ## has four threads and needs real
+                                             ## thread-local storage, which is why
+                                             ## this is asked of the BOARD rather
+                                             ## than assumed of the target.
+    entryExits*: bool                        ## the ENTRY proc exits instead of
+                                             ## returning: there is nobody to return
+                                             ## TO. True on static Linux (the kernel
+                                             ## entered `_start`, so the epilogue is
+                                             ## replaced by an exit syscall) and on
+                                             ## bare metal (reset entered it, and a
+                                             ## `bx lr` from there returns into
+                                             ## nothing). False on Darwin, where the
+                                             ## entry is called by libSystem's start
+                                             ## and returns its status normally.
     a64Linux*: bool                          ## a64 backend: target Linux/ELF (svc-based
                                              ## syscalls, no Darwin TLV/dyld) instead of
                                              ## the default Darwin/Mach-O — lets the arm64

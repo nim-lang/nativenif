@@ -1408,9 +1408,12 @@ const cortexMUnsupported: seq[string] = @[
   "div_floatparam", "float_const_conv", "fp32", "fpconv", "fpconv2",
 
   # ── no such hardware, no such OS ────────────────────────────────────────────
-  # Thread-locals (no threads, no TLS register), `mmap`/`futex`/`___ulock_wake`
-  # (no kernel to ask), and the x86-64-pinned stack-walk fixture.
-  "tvar_addr", "tvar_aggregate", "tvar_arg_order",
+  # `mmap`/`futex`/`___ulock_wake` (no kernel to ask) and the x86-64-pinned
+  # stack-walk fixture. The three `tvar_*` fixtures used to be here too: a
+  # thread-local is now emitted as a global on a board that declares ONE stack
+  # slot, which is a decision about the board and not about the ISA — a Cortex-M
+  # part with four cores has four threads and is refused by name until the
+  # SP-masked thread-local base exists.
   "mmap_anon", "futex_wake", "ulock_wake", "naked_stacktrace_x64",
 
   # ── 64-bit intrinsics ───────────────────────────────────────────────────────
