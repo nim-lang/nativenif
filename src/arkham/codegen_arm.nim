@@ -43,6 +43,8 @@ import codegen_common
 import layout                    # the `--layout:` board file
 from arm64 import isLogicalImm   # nifasm: the bitmask-immediate predicate, so
                                  # arkham folds exactly the constants it can encode
+from thumbimm import nil         # the Thumb-2 twin of the above, shared with
+                                 # `nifasm/thumb2` so the two cannot drift apart
 import stress
 
 let aarch64MachineA = stressed(aarch64MachineN)
@@ -3114,30 +3116,6 @@ proc binA64Op(g: var CodeGen; c: Cursor): A64Inst =
   of BitxorC: EorA64
   else: raiseAssert "arkham a64n: binA64Op " & $c.exprKind
 
-proc thumbModifiedImm(v: int64): bool =
-  ## Thumb-2's "ThumbExpandImm": a small value replicated across byte lanes, or an
-  ## 8-bit value with bit 7 set rotated anywhere. The Cortex-M analogue of
-  ## AArch64's bitmask immediate — a DIFFERENT set, so the two predicates cannot
-  ## be shared even though both answer "can this constant be an ALU operand".
-  ##
-  ## Reimplemented here rather than imported from `nifasm/thumb2`, which pulls in
-  ## `buffers`/`relocs` and would make the code generator depend on the
-  ## assembler's byte-emission machinery for one predicate.
-  if v < 0 or v > 0xFFFFFFFF'i64: return false
-  let u = uint32(v)
-  if u < 256: return true
-  let b0 = u and 0xFF
-  let b1 = (u shr 8) and 0xFF
-  let b2 = (u shr 16) and 0xFF
-  let b3 = (u shr 24) and 0xFF
-  if b0 == b2 and b1 == 0 and b3 == 0 and b0 != 0: return true
-  if b1 == b3 and b0 == 0 and b2 == 0 and b1 != 0: return true
-  if b0 == b1 and b1 == b2 and b2 == b3 and b0 != 0: return true
-  for rot in 8 .. 31:
-    let rotated = (u shl rot) or (u shr (32 - rot))
-    if rotated < 0x100 and (rotated and 0x80) != 0: return true
-  false
-
 proc isLogicalImmA64(v: int64): bool =
   ## Is `v` an AArch64 "bitmask immediate" — the form `and`/`orr`/`eor` take
   ## directly? Every bitfield mask is one (0xff, 0xf, 0x1ff, 0x3fff, …), so this
@@ -3151,7 +3129,7 @@ proc logicalImmOk(g: CodeGen; v: int64): bool {.inline.} =
   ## The targets encode constants completely differently, so this asks the
   ## description which set the one being emitted for uses.
   case g.md.immStyle
-  of ThumbExpandImm: thumbModifiedImm(v)
+  of ThumbExpandImm: thumbimm.isModifiedImm(v)
   of A64Bitmask: isLogicalImmA64(v)
   of X86Imm32: v >= low(int32) and v <= high(int32)
 

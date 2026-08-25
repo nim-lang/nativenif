@@ -20,6 +20,8 @@
 
 import std/[strutils]
 import buffers, relocs
+import thumbimm
+export thumbimm.encodeModifiedImm, thumbimm.isModifiedImm
 
 type
   Register* = enum
@@ -79,48 +81,11 @@ proc emitWide*(dest: var Bytes; hi, lo: uint16) {.inline.} =
 
 proc reg(r: Register): uint16 {.inline.} = uint16(ord(r))
 
-# ── the Thumb-2 modified immediate ──────────────────────────────────────────
-
-proc encodeModifiedImm*(value: uint32; encoding: var uint32): bool =
-  ## The "ThumbExpandImm" 12-bit immediate used by the 32-bit data-processing
-  ## forms (i:imm3:imm8). It represents either a small value replicated across
-  ## byte lanes, or an 8-bit value with its top bit set rotated to any position —
-  ## the direct analogue of AArch64's `isLogicalImm`, and the reason a great many
-  ## constants need no literal pool.
-  ##
-  ## Returns false when `value` is not representable, in which case the caller
-  ## must fall back to MOVW/MOVT.
-  # Form 1: 0000_00XY where the 12-bit field is 0000 xxxxxxxx (value < 256)
-  if value < 256:
-    encoding = value
-    return true
-  # Form 2..4: byte-replicated patterns.
-  let b0 = value and 0xFF
-  let b1 = (value shr 8) and 0xFF
-  let b2 = (value shr 16) and 0xFF
-  let b3 = (value shr 24) and 0xFF
-  if b0 == b2 and b1 == 0 and b3 == 0 and b0 != 0:
-    encoding = (0x1'u32 shl 8) or b0        # 0x00XY00XY
-    return true
-  if b1 == b3 and b0 == 0 and b2 == 0 and b1 != 0:
-    encoding = (0x2'u32 shl 8) or b1        # 0xXY00XY00
-    return true
-  if b0 == b1 and b1 == b2 and b2 == b3 and b0 != 0:
-    encoding = (0x3'u32 shl 8) or b0        # 0xXYXYXYXY
-    return true
-  # Form 5: an 8-bit value with bit 7 SET, rotated right by 8..31.
-  for rot in 8 .. 31:
-    let rotated = (value shl rot) or (value shr (32 - rot))
-    if rotated < 0x100 and (rotated and 0x80) != 0:
-      # `rotated` is the unrotated 8-bit constant; the field stores the amount
-      # needed to rotate it back into place.
-      encoding = (uint32(rot) shl 7) or (rotated and 0x7F)
-      return true
-  return false
-
-proc isModifiedImm*(value: uint32): bool {.inline.} =
-  var enc: uint32
-  encodeModifiedImm(value, enc)
+# ── the Thumb-2 modified immediate ──────────────────────────────────
+# `encodeModifiedImm`/`isModifiedImm` come from `common/thumbimm` and are
+# re-exported here, so `thumb2.foo` keeps working for every existing caller. The
+# rule lives there because arkham needs the same predicate and cannot import this
+# module (it pulls in `buffers`/`relocs`) — see that module's header.
 
 proc splitImm12(enc: uint32): tuple[i, imm3, imm8: uint16] {.inline.} =
   ## Scatter a 12-bit modified immediate into the i / imm3 / imm8 fields.
