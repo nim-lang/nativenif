@@ -416,3 +416,59 @@ correctness could then only be argued, not diffed.
 It is also what lets the allocator eventually decide locations for *expression*
 positions and not just for symbol definitions: `locs` is already indexed by token
 position, and the query is now asked that way too.
+
+## What belongs in the machine description
+
+The allocator has always been arch-neutral: `planer`, `regbind`, `analyser` and
+`programs` contain no target test at all, and the whole planner asks `md.arch`
+seven times, every one of them x86-vs-RISC. The seam is real. What leaked past it
+is the EMITTER, and one flag — `CodeGen.thumbM` — was carrying facts of five
+quite different kinds.
+
+The first three are not target questions and are gone:
+
+ * **Register roles.** Which register carries `&result` for a wide aggregate
+   return, which one the emitter stages a value through, which is the link
+   register, which set a call clobbers, which registers are withheld from every
+   pool. These read `if g.thumbM: machine_m.X else: X`, which is how slot `R16`
+   — not even MAPPED on Cortex-M — once reached the output. They are
+   `MachineDesc` fields now, and a role a target lacks is `NoReg`, stated rather
+   than defaulted: `Reg`'s zero value is `R0`, so an omitted role would silently
+   name a register in use.
+
+   Two of them are deliberately NOT the allocator's pools. `abiCalleeSaved` is
+   what the ABI defines, `intCalleeSaved` what the allocator draws homes from;
+   they coincide in a shipped build and differ under `-d:arkhamStress`. An
+   `.assembler` body does not allocate, so a register it NAMES must still be
+   legal and still be saved; and an AArch64 pair-save PAD is a slot in an `stp`,
+   not a home, so it too comes from the ABI list. Conflating the two is a bug
+   that byte-identical output cannot catch — only the stress suite can.
+
+ * **One spelling per job.** There are exactly two ways to write a register down.
+   `ab.rawReg` is the PHYSICAL register — a `(clobber …)` or `(param …)`
+   declaration, a frame save, `SP`, a hand-written body. `emReg` is the VALUE:
+   a bound register by its checked name, a raw tag otherwise, and in between the
+   assertion that catches a temporary which escaped the binder. They are not
+   interchangeable, and reaching for the wrong one compiles. The names now say
+   which is which — `reg`, `mReg` and the raw arm of `emReg` were three names for
+   one of them — and the float `fmov`/`fcvt` operand, which used to be raw on
+   AArch64 and named on Cortex-M, is a value on both. That split was never
+   arkham's decision: nifasm's AArch64 handlers read it with `parseRegisterA64`,
+   which takes a tag and nothing else, while its Thumb-2 handlers had always
+   taken either. The emitter was carrying a branch to paper over an asymmetry one
+   level down, and the value check had a hole on the target with the LARGER
+   register file.
+
+ * **Narrow words.** A value too wide for one register is `size > wordSize()`,
+   false by construction wherever the word is eight bytes. Every call site used
+   to write `g.thumbM and g.isWideExpr(…)`, which said it twice and said it in
+   terms of the wrong fact. `codegen_m64`'s `int64` arithmetic is now inherited by
+   the next 32-bit back end rather than rewritten for it.
+
+Two kinds remain, and they are the honest ones: **capability** (hardware divide,
+`csel`, tail calls, the modified-immediate predicate — a target either has the
+instruction or does not) and **frame shape** (pair saves with their padding
+versus a register at a time, fp-relative versus SP-relative stack arguments).
+The first wants a set and a couple of predicates in the description; the second
+wants a handful of overridable procs. Neither is a place where a third target
+should have to re-derive what the second already knows.

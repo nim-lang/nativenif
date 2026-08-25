@@ -62,7 +62,7 @@ proc emReg(g: var CodeGen; r: Reg) {.inline.} =
       "arkham x64: unbound scratch/bridge register reached emReg: " & x64RegName(r) &
       " in " & gArkhamCurProc &
       " — every value/address-carrying R10/R11 use must be a typed binding (pickStagingSealed/bindTemp)"
-    g.ab.reg r
+    g.ab.rawReg r
 
 proc pickStagingScratch(g: var CodeGen; avoid: Reg = NoReg): Reg
 proc stagingCensus(g: var CodeGen; avoid: Reg): string
@@ -230,12 +230,12 @@ proc emFloatScalarLoad(g: var CodeGen; dest: FReg; name: string; bits: int) =
   let op = if bits == 32: MovssX64 else: MovsdX64
   g.ab.tree op:
     g.emFReg dest
-    g.ab.tree MemX: (g.ab.reg RSP; g.ab.sym name)
+    g.ab.tree MemX: (g.ab.rawReg RSP; g.ab.sym name)
 
 proc emFloatScalarStore(g: var CodeGen; name: string; src: FReg; bits: int) =
   let op = if bits == 32: MovssX64 else: MovsdX64
   g.ab.tree op:
-    g.ab.tree MemX: (g.ab.reg RSP; g.ab.sym name)
+    g.ab.tree MemX: (g.ab.rawReg RSP; g.ab.sym name)
     g.emFReg src
 
 # ── low-level emit helpers ───────────────────────────────────────────────────
@@ -500,7 +500,7 @@ proc emRegLocalVar(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
     g.ab.tree KillX64: g.ab.sym dead
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
-  g.ab.reg r                                   # the concrete register (the binding)
+  g.ab.rawReg r                                   # the concrete register (the binding)
   # A local is declared with its OWN type — `(u 8)` stays `(u 8)`. arkham still keeps
   # every scalar 64-bit-wide in the register and normalizes with explicit extends;
   # the declared type is what the VARIABLE is, and a register operand's type never
@@ -533,7 +533,7 @@ proc emRegAggrPtrVar(g: var CodeGen; name: string; r: Reg; typeSym: SymId) =
     g.ab.tree KillX64: g.ab.sym dead
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
-  g.ab.reg r
+  g.ab.rawReg r
   g.ab.ptrType: g.emTypeSym(typeSym)
   g.ab.close()
   g.rb.bindLocal(r, name, isPtr = true)
@@ -579,7 +579,7 @@ proc restoreBindings(g: var CodeGen; saved: seq[tuple[r: Reg, name: string]]) =
         # read after a diverging `failVal` call — was rejected outright.
         var tc = bt.typ
         g.genTypeBody(tc)
-      g.ab.reg it.r
+      g.ab.rawReg it.r
     g.rb.rebindLocal(it.r, it.name, bt.isPtr)
     if it.r notin g.md.intCalleeSaved:
       # A caller-saved home: the name is good until a call that RETURNS clobbers the
@@ -702,7 +702,7 @@ proc bindTemp(g: var CodeGen; r: Reg; typ: AsmSlot) =
   g.ab.tree RebindX64:
     g.ab.symDef name
     g.emBindType(typ)
-    g.ab.reg r
+    g.ab.rawReg r
   let isPtr = isNilSlot(typ) or
               (not cursorIsNil(typ.typ) and isPtrType(resolveType(g.prog, typ.typ)))
   g.rb.bindScratch(r, name, isPtr)
@@ -736,7 +736,7 @@ proc releaseFAsMirror(g: var CodeGen; f: FReg; dst: Location): bool {.inline.} =
 
 proc emStackMem(g: var CodeGen; name: string) =       # (mem (rsp) name)
   g.ab.tree MemX:
-    g.ab.reg RSP
+    g.ab.rawReg RSP
     g.ab.sym name
 
 proc emFieldMem(g: var CodeGen; base, field: string) =   # (mem (dot (rsp) base field))
@@ -747,7 +747,7 @@ proc emFieldMem(g: var CodeGen; base, field: string) =   # (mem (dot (rsp) base 
   # own `fieldAtOffset` guard for genuinely word-misaligned packing.
   g.ab.tree MemX:
     g.ab.tree DotX:
-      g.ab.reg RSP
+      g.ab.rawReg RSP
       g.ab.sym base
       g.ab.sym field
 
@@ -757,7 +757,7 @@ proc emAggrElemMem(g: var CodeGen; base: string; idx: int) =  # (mem (at (rsp) b
   ## access from the array's element type.
   g.ab.tree MemX:
     g.ab.tree AtX:
-      g.ab.reg RSP
+      g.ab.rawReg RSP
       g.ab.sym base
       g.ab.intLit idx
 
@@ -1318,7 +1318,7 @@ proc rebindLocalAs(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
     g.ab.symDef name
     var t = typeCur
     g.genTypeBody(t)
-    g.ab.reg r
+    g.ab.rawReg r
   g.rb.rebindLocal(r, name, isPtr)
   # The name's binding type is now `typeCur`, so the record has to move with it:
   # `restoreBindings` re-emits from it after a diverging call, and `bindTypeOf`
@@ -1354,7 +1354,7 @@ proc rebindTempAs(g: var CodeGen; r: Reg; typeCur: Cursor) =
     g.ab.symDef name
     var t = typeCur
     g.genTypeBody(t)
-    g.ab.reg r
+    g.ab.rawReg r
   g.rb.bindScratch(r, name, isPtr)
   g.tmpBindTyp[r] = slot
 
@@ -1773,7 +1773,7 @@ proc emStackAddr(g: var CodeGen; dest: Reg; name: string) =   # dest ← &stackv
   ## is kept.
   if g.rb.isBound(dest) and not g.rb.isBoundTemp(dest) and not g.rb.isPtrBound(dest):
     g.releaseStaleName(dest)
-  g.ab.tree LeaX64: (g.emReg dest; g.ab.reg RSP; g.ab.sym name)
+  g.ab.tree LeaX64: (g.emReg dest; g.ab.rawReg RSP; g.ab.sym name)
 
 proc emAggrHomeAddr(g: var CodeGen; dest: Reg; name: string) =
   ## `dest ← &<the aggregate stored under `name`>`, for a name that is a stack home:
@@ -2066,7 +2066,7 @@ proc emitParamsAndResult(g: var CodeGen; c: var Cursor; byRef: bool;
     if retByRef:                                # synthetic hidden result pointer in rdi
       g.ab.tree ParamD:
         g.ab.symDef paramName(0)
-        g.ab.reg amd.intArgRegs[0]
+        g.ab.rawReg amd.intArgRegs[0]
         g.ab.ptrType:
           var rc = retC
           if byRef: g.genPointee(rc) else: g.genTypeBody(rc)
@@ -2092,7 +2092,7 @@ proc emitParamsAndResult(g: var CodeGen; c: var Cursor; byRef: bool;
                 g.ab.symDef paramName(pl.ord)
                 if not pl.onStack:
                   g.ab.tree RegsD:
-                    for k in 0 ..< pl.words: g.ab.reg amd.gprAt(pl, k)
+                    for k in 0 ..< pl.words: g.ab.rawReg amd.gprAt(pl, k)
                 else:
                   g.ab.keyword SO              # doesn't fit → entirely on the stack
                 if pl.byRef:
@@ -2103,7 +2103,7 @@ proc emitParamsAndResult(g: var CodeGen; c: var Cursor; byRef: bool;
             else:
               g.ab.tree ParamD:
                 g.ab.symDef paramName(pl.ord)
-                if not pl.onStack: g.ab.reg amd.gprAt(pl)
+                if not pl.onStack: g.ab.rawReg amd.gprAt(pl)
                 else: g.ab.keyword SO           # past the arg registers → stack-passed
                 if byRef: g.genPointee(c) else: g.genTypeBody(c)
             while c.hasMore: skip c
@@ -2123,7 +2123,7 @@ proc emitParamsAndResult(g: var CodeGen; c: var Cursor; byRef: bool;
         skip c
       else:
         g.ab.symDef synth("ret.0")
-        g.ab.reg RAX
+        g.ab.rawReg RAX
         if byRef: g.genPointee(c) else: g.genTypeBody(c)
   result = plan.gpUsed
 
@@ -2137,7 +2137,7 @@ proc emitAbiClobber(g: var CodeGen; numArgRegs: int;
   for i in 0 ..< min(numArgRegs, amd.intArgRegs.len): paramRegs.incl amd.intArgRegs[i]
   g.ab.tree ClobberD:
     for r in x64ClobbersGpr:
-      if r notin paramRegs: g.ab.reg r
+      if r notin paramRegs: g.ab.rawReg r
 
 const X64SyscallArgRegs = [RDI, RSI, RDX, R10, R8, R9]
   ## The x86-64 Linux syscall argument registers. Identical to the C ABI EXCEPT
@@ -2169,18 +2169,18 @@ proc emitSyproc(g: var CodeGen; sp: SyscallProc) =
                   raiseAssert "arkham x64: syscall with more than 6 arguments"
                 g.ab.tree ParamD:
                   g.ab.symDef paramName(idx)
-                  g.ab.reg X64SyscallArgRegs[idx]
+                  g.ab.rawReg X64SyscallArgRegs[idx]
                   g.genTypeBody(pc)
                 while pc.hasMore: skip pc
               inc idx
       g.ab.tree ResultD:                         # c at the return type
         if not retIsVoid(c):
           g.ab.symDef synth("ret.0")
-          g.ab.reg RAX
+          g.ab.rawReg RAX
           g.genTypeBody(c)
       g.ab.tree ClobberD:                        # x86-64 `syscall` destroys rcx, r11
-        g.ab.reg RCX
-        g.ab.reg R11
+        g.ab.rawReg RCX
+        g.ab.rawReg R11
       g.ab.intLit sp.sysNr.int64
     while c.hasMore: skip c                       # drain the importc decl's pragmas + body
 
@@ -2230,7 +2230,7 @@ proc emitWinExtproc(g: var CodeGen; ex: Extern) =
                               ex.extName
                 g.ab.tree ParamD:
                   g.ab.symDef paramName(pl.ord)
-                  if not pl.onStack: g.ab.reg win64Machine.gprAt(pl)
+                  if not pl.onStack: g.ab.rawReg win64Machine.gprAt(pl)
                   else: g.ab.keyword SO          # past rcx/rdx/r8/r9 → stack-passed
                   g.genTypeBody(pc)
                 while pc.hasMore: skip pc
@@ -2240,7 +2240,7 @@ proc emitWinExtproc(g: var CodeGen; ex: Extern) =
           if slotOf(g.prog, c).kind in {AFloat, AMem}:
             raiseAssert "arkham win_x64: float/aggregate result in extern " & ex.extName
           g.ab.symDef synth("ret.0")
-          g.ab.reg RAX
+          g.ab.rawReg RAX
           g.genTypeBody(c)
       # The volatiles a Win64 call destroys, EXCEPT this callee's own argument
       # registers (nifasm treats a declared clobber as already dead, so listing one
@@ -2253,7 +2253,7 @@ proc emitWinExtproc(g: var CodeGen; ex: Extern) =
         paramRegs.incl win64Machine.intArgRegs[i]
       g.ab.tree ClobberD:
         for r in x64ClobbersGpr:
-          if r notin paramRegs: g.ab.reg r
+          if r notin paramRegs: g.ab.rawReg r
     while c.hasMore: skip c                       # drain the importc decl's pragmas + body
 
 proc genProctypeSig(g: var CodeGen; c: var Cursor) =
@@ -2489,7 +2489,7 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
         let argReg = g.md.gprAt(pl)
         g.ab.tree MovX64:
           g.emStackMem(nm)
-          if declarative: g.ab.sym paramName(pl.ord) else: g.ab.reg argReg
+          if declarative: g.ab.sym paramName(pl.ord) else: g.ab.rawReg argReg
         if declarative: g.ab.tree KillX64: g.ab.sym paramName(pl.ord)
       elif tn != NoTypeSym and loc.kind == NamedStack and not pl.onStack:
         # A register-passed ≤16B by-value aggregate in a `(s)` home: the slot IS the
@@ -2607,7 +2607,7 @@ proc emitParamMoves(g: var CodeGen; decl: Cursor) =
           g.emTypedStackVar(nm, typeCur)        # (var :nm (s) <param type>)
           g.ab.tree MovX64:
             g.emStackMem(nm)
-            if declarative: g.ab.sym paramName(pl.ord) else: g.ab.reg argReg
+            if declarative: g.ab.sym paramName(pl.ord) else: g.ab.rawReg argReg
           if declarative: g.ab.tree KillX64: g.ab.sym paramName(pl.ord)
         else:
           raiseAssert "arkham x64 v0: spilled / float parameter: " & nm
@@ -2665,7 +2665,7 @@ proc framePushBytesX64(g: CodeGen): int =
 
 proc framePush(g: var CodeGen) =
   for r in g.frameRegs:
-    g.ab.tree PushX64: g.ab.reg r                          # raw push
+    g.ab.tree PushX64: g.ab.rawReg r                          # raw push
 
 proc emitFrameSub(g: var CodeGen) =
   ## Lower rsp by the `(s)` slot region PLUS the 16-alignment pad, in ONE
@@ -2678,7 +2678,7 @@ proc emitFrameSub(g: var CodeGen) =
   ## half cost 107 M instructions — 1.2 % of the whole program — for an addition.
   if g.plan.hasStackVars:
     g.ab.tree SubX64:
-      g.ab.reg RSP
+      g.ab.rawReg RSP
       g.ab.tree SsizeX:
         if g.framePad > 0: g.ab.intLit g.framePad.int64
   elif g.framePad > 0:
@@ -2688,7 +2688,7 @@ proc emitFrameAdd(g: var CodeGen) =
   ## Exact mirror of `emitFrameSub`.
   if g.plan.hasStackVars:
     g.ab.tree AddX64:
-      g.ab.reg RSP
+      g.ab.rawReg RSP
       g.ab.tree SsizeX:
         if g.framePad > 0: g.ab.intLit g.framePad.int64
   elif g.framePad > 0:
@@ -2710,7 +2710,7 @@ proc framePop(g: var CodeGen) =
     if dead.len > 0:
       g.ab.tree KillX64: g.ab.sym dead
   for i in countdown(g.frameRegs.high, 0):
-    g.ab.tree PopX64: g.ab.reg g.frameRegs[i]             # raw pop, reverse order
+    g.ab.tree PopX64: g.ab.rawReg g.frameRegs[i]             # raw pop, reverse order
 
 proc emitStackParamLoadsX64(g: var CodeGen; decl: Cursor) =
   ## Load the 7th+ integer/pointer parameters from the caller's outgoing argument
@@ -2768,7 +2768,7 @@ proc emitStackParamLoadsX64(g: var CodeGen; decl: Cursor) =
       for k in 0 ..< pl.words:
         g.ab.tree MovX64:                       # v ← incoming word k
           g.emReg v
-          g.ab.tree MemX: (g.ab.reg g.stackArgBaseReg; g.ab.intLit (off + (k * 8).int64))
+          g.ab.tree MemX: (g.ab.rawReg g.stackArgBaseReg; g.ab.intLit (off + (k * 8).int64))
         g.ab.tree MovX64:                       # home word k ← v
           g.emWordThroughPtr(homeAddr, k)
           g.emReg v
@@ -2784,7 +2784,7 @@ proc emitStackParamLoadsX64(g: var CodeGen; decl: Cursor) =
         g.rawHomeRegs.incl loc.r               # RAW home (see `emitParamMoves`)
         g.ab.tree MovX64:
           g.emReg loc.r
-          g.ab.tree MemX: (g.ab.reg g.stackArgBaseReg; g.ab.intLit off)
+          g.ab.tree MemX: (g.ab.rawReg g.stackArgBaseReg; g.ab.intLit off)
         if arkhamNameAggrBase and g.varType.hasKey(nm):
           # A by-reference aggregate whose pointer arrived on the stack: name it, for
           # the same reason `emitParamMoves` does (see `emRegAggrPtrVar`).
@@ -2807,7 +2807,7 @@ proc emitStackParamLoadsX64(g: var CodeGen; decl: Cursor) =
         let s = g.pickStagingSealed("a spilled stack-param bridge", loc.typ)
         g.ab.tree MovX64:
           g.emReg s
-          g.ab.tree MemX: (g.ab.reg g.stackArgBaseReg; g.ab.intLit off)
+          g.ab.tree MemX: (g.ab.rawReg g.stackArgBaseReg; g.ab.intLit off)
         g.emitStoreLoc(loc, s)
         g.giveBack s
       of StackPtr:
@@ -2821,7 +2821,7 @@ proc emitStackParamLoadsX64(g: var CodeGen; decl: Cursor) =
         let s = g.pickStagingSealed("a spilled stack-param pointer bridge", AddrSlot)
         g.ab.tree MovX64:
           g.emReg s
-          g.ab.tree MemX: (g.ab.reg g.stackArgBaseReg; g.ab.intLit off)
+          g.ab.tree MemX: (g.ab.rawReg g.stackArgBaseReg; g.ab.intLit off)
         g.ab.tree MovX64: (g.emStackMem(loc.ptrName); g.emReg s)
         g.giveBack s
       else:
@@ -3373,7 +3373,7 @@ proc emitIntrinsicOps(g: var CodeGen; op: IntrinsicOp; argBits: int;
     # READING it is a different act — the value is copied out, the frame is
     # untouched — and it is the only way a program can say where it is on its own
     # stack.
-    g.ab.tree MovX64: (g.emReg dst; g.ab.reg RSP)
+    g.ab.tree MovX64: (g.emReg dst; g.ab.rawReg RSP)
   of TraceTableOp:
     # A RIP-relative `lea` against the label nifasm defines for the trace table
     # (`nifasm/tracetable.nim`). nifasm synthesizes both the label and the bytes;
@@ -3873,7 +3873,7 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
     elif loc.kind == InRegPair:
       raiseAssert "arkham x64n: address of InRegPair local " & nm
     else:                                               # a `(s)` stack-var base
-      g.ab.reg RSP
+      g.ab.rawReg RSP
       g.ab.sym nm
   of TagLit:
     case c.exprKind
@@ -3957,7 +3957,7 @@ proc emLvalAddr2(g: var CodeGen; c: Cursor) =
       # A constructor base materialized into `aggtmp<pos>` by `prematLval2`: address it as
       # an ordinary `(rsp) name` stack-var base.
       let pos = cursorToPosition(g.buf[], c)
-      g.ab.reg RSP
+      g.ab.rawReg RSP
       g.ab.sym (synth("aggtmp") & $pos & ".0")
     else: raiseAssert "arkham x64n: emLvalAddr2 expr " & $c.exprKind
   else: raiseAssert "arkham x64n: emLvalAddr2 kind " & $c.kind
@@ -4544,7 +4544,7 @@ proc emWordAtSlot(g: var CodeGen; name: string; off: int) =
   g.ab.tree CastX:
     g.ab.uintType(64)
     g.ab.tree MemX:
-      g.ab.reg RSP
+      g.ab.rawReg RSP
       g.ab.sym name
       g.ab.intLit off.int64
 
@@ -4553,7 +4553,7 @@ proc emByteAtSlot(g: var CodeGen; name: string; off: int) =
   g.ab.tree CastX:
     g.ab.uintType(8)
     g.ab.tree MemX:
-      g.ab.reg RSP
+      g.ab.rawReg RSP
       g.ab.sym name
       g.ab.intLit off.int64
 
@@ -6530,8 +6530,8 @@ proc emitDivMod2(g: var CodeGen; c: Cursor; dest: var Location) =
     dvsLoc = regLoc(dvsStaging, dvsLoc.typ)
   let op = if signed: IdivX64 else: DivX64
   g.ab.tree op:
-    g.ab.reg g.md.divRemReg                             # (rdx): high half / remainder
-    g.ab.reg g.md.intRetReg                             # (rax): low half / quotient
+    g.ab.rawReg g.md.divRemReg                             # (rdx): high half / remainder
+    g.ab.rawReg g.md.intRetReg                             # (rax): low half / quotient
     g.emReg dvsLoc.r                                    # divisor, by its bound name
   if dvsStaging != NoReg: g.giveBack dvsStaging
   else: g.freeVal(dD)
@@ -7622,7 +7622,7 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
         g.ab.symDef nm
         var pc = proctype
         g.genTypeBody(pc)
-        g.ab.reg fnptrReg
+        g.ab.rawReg fnptrReg
       g.rb.bindScratch(fnptrReg, nm, isPtr = false)
       fnTargetName = nm
       tgt = CallTarget(declarative: declarative, asmName: nm, retType: retType,
@@ -7917,7 +7917,7 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
               else: g.emGlobalAddr(srcAddr, symName(a))
           template outgoingSlot(k: int; indexed: bool) =
             g.ab.tree MemX:
-              g.ab.reg RSP
+              g.ab.rawReg RSP
               g.ab.tree ArgX:
                 g.ab.sym paramName(nameIdx)
                 if indexed: g.ab.intLit k.int64
@@ -8025,7 +8025,7 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
             g.plan.hasStackVars = true         # outgoing stack-arg area ⇒ frame sub
             g.ab.tree MovX64:
               g.ab.tree MemX:
-                g.ab.reg RSP
+                g.ab.rawReg RSP
                 g.ab.tree ArgX: g.ab.sym paramName(nameIdx)
               g.emReg srcReg
             if not ownSrc: g.freeVal(aD)           # the stack-arg temp dies with its store
@@ -8103,7 +8103,7 @@ proc emCallerSaveRestore(g: var CodeGen; slotName, varName: string; r: Reg) =
       g.genTypeBody(tc)
     else:
       g.ab.intType(64)
-    g.ab.reg r
+    g.ab.rawReg r
   g.rb.rebindLocal(r, varName, isPtr)
   g.ab.tree MovX64:
     g.ab.sym varName
@@ -9065,9 +9065,9 @@ proc emitProcBody2(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
       # so `emReg`/`binImm` would render whatever binding the reg carries post-body —
       # a name that, in program order, is not bound yet at this point.
       if g.stackArgBaseReg != NoReg:
-        g.ab.tree MovX64: (g.ab.reg g.stackArgBaseReg; g.ab.reg RSP)
+        g.ab.tree MovX64: (g.ab.rawReg g.stackArgBaseReg; g.ab.rawReg RSP)
         g.ab.tree AddX64:
-          g.ab.reg g.stackArgBaseReg
+          g.ab.rawReg g.stackArgBaseReg
           g.ab.intLit g.framePushBytesX64().int64
       g.emitFrameSub()
       # Declare the totality spill slots (`etmp`/`eftmp`/`held`) — minted INLINE

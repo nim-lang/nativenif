@@ -69,9 +69,24 @@ proc keyword*[T: enum](a: var AsmBuf; t: T) {.inline.} =
   ## A childless tag, e.g. `(extcall)` / `(params)`.
   a.openS($t); a.close()
 
-proc reg*(a: var AsmBuf; r: Reg) {.inline.} =
-  ## A register operand `(xN)`/`(rax)` — a childless tag named after the
-  ## register via the (per-target) `renderReg` shim.
+proc rawReg*(a: var AsmBuf; r: Reg) {.inline.} =
+  ## The PHYSICAL register `(xN)`/`(r5)`/`(rax)` — a childless tag named after
+  ## the register via the (per-target) `renderReg` shim.
+  ##
+  ## Raw is a claim, not a default. A backend has exactly two ways to write a
+  ## register down and they are not interchangeable: this one, which says "the
+  ## hardware register itself", and the emitters' `emReg`, which says "whatever
+  ## value currently lives there" and spells a bound register by its checked
+  ## name. Reaching for this one where a value was meant emits a raw register
+  ## where nifasm expected a symbol, and — worse — walks straight past the
+  ## unbound-scratch assertion that exists to catch a temporary which escaped
+  ## the binder. Hence the name: every call site below is a deliberate statement
+  ## that no value is being named here.
+  ##
+  ## Legitimately raw: a `(clobber …)` or `(param …)` DECLARATION, the frame
+  ## save/restore of a callee-saved register, `SP`, and the hand-written bodies
+  ## (the 64-bit dividers, the semihosting shims) that are not allocator output
+  ## at all.
   a.openS(a.renderReg r); a.close()
 
 proc dreg*(a: var AsmBuf; f: FReg) {.inline.} =

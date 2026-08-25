@@ -140,6 +140,14 @@ const
   ## r12 and lr are included: `bl` overwrites lr, and IP is scratch for everyone.
   ConvClobbersGpr* = [R0, R1, R2, R3]
 
+  ## Every register withheld from all three pools, in the order the staging draw
+  ## walks them: the two bridges first, then the produce bridge — so a site with
+  ## its own claim on the latter (`takeProduceBridge`) still finds it free, and
+  ## the draw reaches it only where it would otherwise have had nothing. The
+  ## AArch64 twin is `machine.AtomicScratchRegs`, and both are read through
+  ## `MachineDesc.bridgeRegs`.
+  BridgeRegs* = [IntBridgeRegs[0], IntBridgeRegs[1], ProduceBridge]
+
   ## The Cortex-M machine description handed to the register allocator.
   cortexMMachine* = MachineDesc(
     arch: ThumbM,
@@ -157,13 +165,27 @@ const
     floatCalleeSaved: @FloatCalleeSaved,
     intCalleeSavedSet: {R4..R7},
     floatCalleeSavedSet: {F16..F23},
-    aggrByRefThreshold: 8)      # TWO words, matching `slots.classifyArg`'s `2*w`.
+    aggrByRefThreshold: 8,      # TWO words, matching `slots.classifyArg`'s `2*w`.
                                 # These two decide the same thing and MUST agree:
                                 # `planCall` reads the threshold while the
                                 # classifier reads `2*w`, so a disagreement makes
                                 # the caller pass by value what the callee reads
                                 # as a pointer. (16 on both 64-bit targets — the
                                 # same rule, stated in words.)
+    linkReg: LR,
+    framePtrReg: NoReg,         # Cortex-M addresses everything off SP: there is
+                                # no fp/lr PAIR instruction to establish one with,
+                                # and stack parameters are reached from SP once
+                                # the prologue has finished lowering it.
+    indirectResultReg: IndirectResultReg,
+    produceBridge: ProduceBridge,
+    bridgeRegs: @BridgeRegs,
+    floatBridgeReg: F31,        # `machine.FloatBridgeReg`; s31 here
+    abiFloatCalleeSaved: @FloatCalleeSaved,
+    abiCalleeSaved: @IntCalleeSaved,
+    intCallerSavedSet: {R0, R1, R2, R3},   # AAPCS32's four; r12 is volatile too,
+                                           # but it is nifasm's (see `IP`)
+    convClobbersGpr: @ConvClobbersGpr)
 
 proc regNameM*(r: Reg): string =
   ## The asm-NIF spelling of a GPR slot. These are the tags nifasm's `MReg`

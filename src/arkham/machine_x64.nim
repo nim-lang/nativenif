@@ -47,6 +47,10 @@ proc x64RegName*(r: Reg): string =
   else: "<noreg>"
 
 const
+  ## The GPRs a SysV call clobbers — the caller-saved volatiles arkham manages
+  ## (rax + the arg registers + r10/r11). Emitted as the proc's `(clobber …)`.
+  x64ClobbersGpr* = [RAX, RDI, RSI, RDX, RCX, R8, R9, R10, R11]
+
   ## System V AMD64 calling convention, as the arch-neutral allocator needs it.
   ##  * integer args:   rdi, rsi, rdx, rcx, r8, r9
   ##  * integer return: rax
@@ -89,11 +93,23 @@ const
     floatCalleeSaved: @[],
     intCalleeSavedSet: {RBX, R12, R13, R14, R15, RBP},
     floatCalleeSavedSet: {},
-    aggrByRefThreshold: 16)
-
-  ## The GPRs a SysV call clobbers — the caller-saved volatiles arkham manages
-  ## (rax + the arg registers + r10/r11). Emitted as the proc's `(clobber …)`.
-  x64ClobbersGpr* = [RAX, RDI, RSI, RDX, RCX, R8, R9, R10, R11]
+    aggrByRefThreshold: 16,
+    # ── roles ── x86-64 has none of these: the `call` pushes the return address
+    # (no link register), arkham establishes no rbp frame, an indirect result is
+    # a hidden FIRST argument rather than a register off the file, and the
+    # emitter's always-free scratch is the single `stagingBridgeReg` above rather
+    # than a withheld set. Stated rather than defaulted: `Reg`'s zero value is
+    # `R0` — rax — so an omitted role would silently name a register in use.
+    linkReg: NoReg,
+    framePtrReg: NoReg,
+    indirectResultReg: NoReg,
+    produceBridge: NoReg,
+    bridgeRegs: @[],
+    floatBridgeReg: NoFReg,
+    abiFloatCalleeSaved: @[],
+    abiCalleeSaved: @[RBX, R12, R13, R14, R15, RBP],
+    intCallerSavedSet: {RAX, RDI, RSI, RDX, RCX, R8, R9, R10, R11},
+    convClobbersGpr: @x64ClobbersGpr)
 
   WinShadowSpace* = 32
     ## Win64 requires the caller to reserve 32 bytes below the return address that
@@ -135,4 +151,20 @@ const
     floatCalleeSaved: @[],
     intCalleeSavedSet: {RBX, R12, R13, R14, R15, RBP},
     floatCalleeSavedSet: {},
-    aggrByRefThreshold: 8)
+    aggrByRefThreshold: 8,
+    # ── roles ── x86-64 has none of these: the `call` pushes the return address
+    # (no link register), arkham establishes no rbp frame, an indirect result is
+    # a hidden FIRST argument rather than a register off the file, and the
+    # emitter's always-free scratch is the single `stagingBridgeReg` above rather
+    # than a withheld set. Stated rather than defaulted: `Reg`'s zero value is
+    # `R0` — rax — so an omitted role would silently name a register in use.
+    linkReg: NoReg,
+    framePtrReg: NoReg,
+    indirectResultReg: NoReg,
+    produceBridge: NoReg,
+    bridgeRegs: @[],
+    floatBridgeReg: NoFReg,
+    abiFloatCalleeSaved: @[],
+    abiCalleeSaved: @[RBX, R12, R13, R14, R15, RBP],
+    intCallerSavedSet: {RAX, RDI, RSI, RDX, RCX, R8, R9, R10, R11},
+    convClobbersGpr: @x64ClobbersGpr)

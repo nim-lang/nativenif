@@ -100,6 +100,72 @@ type
     floatCalleeSavedSet*: set[FReg]  ## membership form of `floatCalleeSaved`
     aggrByRefThreshold*: int         ## aggregates larger than this go by reference
 
+    # ── register ROLES ────────────────────────────────────────────────────────
+    # Registers the EMITTER needs BY NAME rather than by drawing them from a
+    # pool. They used to be per-target `const`s reached through
+    # `if g.thumbM: machine_m.X else: X`, and that shape is what let a slot which
+    # is not even MAPPED on the target (`R16` on Cortex-M) reach the output. A
+    # role a target does not have is `NoReg`/`NoFReg`/`@[]`, never a plausible
+    # substitute — every one of these is read unconditionally by code that has
+    # already decided the target has it.
+    linkReg*: Reg                    ## return-address register (x30/lr, r14 on
+                                     ## Cortex-M). `NoReg` where the call
+                                     ## instruction pushes it instead (x86-64).
+    framePtrReg*: Reg                ## frame pointer (x29). `NoReg` where no fp
+                                     ## frame is established — Cortex-M addresses
+                                     ## everything off SP, and arkham never sets
+                                     ## up an rbp frame on x86-64.
+    indirectResultReg*: Reg          ## where a caller leaves `&result` for an
+                                     ## aggregate return too wide for registers
+                                     ## (x8; r9 on Cortex-M — see
+                                     ## `machine_m.IndirectResultReg` for why a
+                                     ## register is taken off the file instead of
+                                     ## shifting the arguments). `NoReg` where it
+                                     ## IS a hidden first argument (x86-64).
+    produceBridge*: Reg              ## the emitter scratch used to stage a value
+                                     ## on its way INTO memory: x16 (the
+                                     ## assembler's own IP0) on AArch64, a
+                                     ## dedicated r8 on Cortex-M, where nifasm has
+                                     ## already claimed r12. Always the last entry
+                                     ## of `bridgeRegs`.
+    bridgeRegs*: seq[Reg]            ## every GPR withheld from all allocation
+                                     ## pools so the emitter can ALWAYS draw a
+                                     ## transient — a folded memory operand a
+                                     ## 3-operand ALU must load first, a global's
+                                     ## address, a produce-into-memory spill, and
+                                     ## the three registers an LL/SC atomic takes
+                                     ## for itself. Because no value ever lives
+                                     ## here, an atomic's clobber set cannot
+                                     ## overlap anything the allocator owns and no
+                                     ## analysis has to prove that it doesn't.
+                                     ## Empty on x86-64, which reserves a single
+                                     ## `stagingBridgeReg` instead.
+    floatBridgeReg*: FReg            ## the SIMD/FP twin of `produceBridge`.
+    abiCalleeSaved*: seq[Reg]        ## the callee-saved registers the ABI
+                                     ## DEFINES, as opposed to the ones the
+                                     ## allocator draws homes from
+                                     ## (`intCalleeSaved`). The two are the same
+                                     ## list in a shipped build and differ under
+                                     ## `-d:arkhamStress`, which shrinks the pools
+                                     ## to force spilling: a `.assembler` body
+                                     ## does not allocate at all, so a register it
+                                     ## NAMES has to be legal — and saved —
+                                     ## whatever the pools were cut down to.
+                                     ## `stressed` leaves this field alone.
+    abiFloatCalleeSaved*: seq[FReg]  ## the float twin of `abiCalleeSaved`.
+    intCallerSavedSet*: set[Reg]     ## every GPR a callee may destroy without
+                                     ## saving. A superset of `convClobbersGpr`
+                                     ## where the ABI reserves volatiles the
+                                     ## convention does not name (AArch64's
+                                     ## x16/x17 veneers).
+    convClobbersGpr*: seq[Reg]       ## the caller-saved GPRs this calling
+                                     ## convention destroys, emitted as a proc's
+                                     ## `(clobber …)` so the ABI is DECLARED at
+                                     ## the signature rather than re-derived at
+                                     ## every call site. Sixteen under AAPCS64,
+                                     ## four under AAPCS32 — which is the whole
+                                     ## reason it is a field.
+
 type
   LocKind* = enum
     Undef          ## the dontCare target (fill me in), and the "produces no value"

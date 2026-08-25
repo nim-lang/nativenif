@@ -3968,6 +3968,12 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of FmovA64:
     # (fmov D S): D=fp,S=fp → reg copy; D=fp,S=gpr / D=gpr,S=fp → bit move.
     # The size (s/d) comes from whichever operand is an fp register.
+    #
+    # The GPR side goes through `parseGprA64`, not `parseRegisterA64`: it is a
+    # VALUE, so a register bound to a local or a scratch temp arrives as its
+    # name — the same spelling the Thumb-2 handler has always accepted, and the
+    # one that lets a raw use of a bound register stay an error. Same for the
+    # `scvtf`/`ucvtf`/`fcvtzs`/`fcvtzu` GPR operand below.
     inc n
     if isA64FpOperand(n, ctx):
       let single = isA64FpSingle(n, ctx)
@@ -3975,9 +3981,9 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
       if isA64FpOperand(n, ctx):
         arm64.emitFmov(ctx.buf.data, rd, parseFloatOperandA64(n, ctx), single)
       else:
-        arm64.emitFmovFromGpr(ctx.buf.data, rd, parseRegisterA64(n), single)
+        arm64.emitFmovFromGpr(ctx.buf.data, rd, parseGprA64(n, ctx), single)
     else:
-      let rd = parseRegisterA64(n)
+      let rd = parseGprA64(n, ctx)
       let single = isA64FpSingle(n, ctx)
       arm64.emitFmovToGpr(ctx.buf.data, rd, parseFloatOperandA64(n, ctx), single)
 
@@ -4031,14 +4037,14 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let single = isA64FpSingle(n, ctx)
     let rd = parseFloatOperandA64(n, ctx)
-    let rn = parseRegisterA64(n)
+    let rn = parseGprA64(n, ctx)
     if instTag == ScvtfA64: arm64.emitScvtf(ctx.buf.data, rd, rn, single)
     else:                   arm64.emitUcvtf(ctx.buf.data, rd, rn, single)
 
   of FcvtzsA64, FcvtzuA64:
     # (fcvtzs Dgpr Sfp) — double/single → int (toward zero).
     inc n
-    let rd = parseRegisterA64(n)
+    let rd = parseGprA64(n, ctx)
     let single = isA64FpSingle(n, ctx)
     let rn = parseFloatOperandA64(n, ctx)
     if instTag == FcvtzsA64: arm64.emitFcvtzs(ctx.buf.data, rd, rn, single)

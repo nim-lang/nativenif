@@ -86,15 +86,22 @@ template WideSlot(): AsmSlot = AsmSlot(cls: AInt, size: 8, align: 8)
   ## the type's natural alignment; nifasm rounds the slot to the target granule.
 
 proc isWideSlot(g: CodeGen; s: AsmSlot): bool {.inline.} =
-  ## A scalar too wide for one register on this target — the whole trigger for
-  ## everything in this file. False on the 64-bit targets by construction.
-  g.thumbM and s.kind in {AInt, AUInt, ABool} and s.size > wordSize()
+  ## A scalar too wide for ONE REGISTER ON THIS TARGET — the whole trigger for
+  ## everything in this file.
+  ##
+  ## Not a Cortex-M question, though it arrived as one. The test is
+  ## `size > wordSize()`, which is false by construction wherever the word is
+  ## eight bytes and true on any 32-bit target — so this file's `int64`
+  ## arithmetic is inherited by the next 32-bit back end rather than rewritten
+  ## for it. Every call site used to write `g.thumbM and g.isWideExpr(…)`, which
+  ## said the same thing twice and said it in terms of the wrong fact.
+  s.kind in {AInt, AUInt, ABool} and s.size > wordSize()
 
 proc isWideExpr(g: var CodeGen; c: Cursor): bool {.inline.} =
-  g.thumbM and g.isWideSlot(g.exprSlot(c))
+  g.isWideSlot(g.exprSlot(c))
 
 proc isWideType(g: var CodeGen; t: Cursor): bool {.inline.} =
-  g.thumbM and g.isWideSlot(slotOf(g.prog, t))
+  g.isWideSlot(slotOf(g.prog, t))
 
 # ── scratch ─────────────────────────────────────────────────────────────────
 
@@ -777,12 +784,6 @@ proc uDivMod64Proc(g: CodeGen): string {.inline.} =
 proc sDivMod64Proc(g: CodeGen): string {.inline.} =
   SDivMod64Base & "." & thisModuleSuffix(g.prog)
 
-proc mReg(g: var CodeGen; r: Reg) {.inline.} = g.ab.reg r
-  ## A RAW register in a hand-written body. Not `emReg`: these bodies are not
-  ## allocator output, so their r0–r7 uses are correct by construction and must
-  ## not trip the unbound-scratch assertion that exists to catch a temp which
-  ## escaped the binder.
-
 proc emitUDivMod64(g: var CodeGen) =
   ## The unsigned 64-bit divider.
   ##
@@ -802,64 +803,64 @@ proc emitUDivMod64(g: var CodeGen) =
     g.ab.keyword NifasmDecl.ParamsD
     g.ab.keyword NifasmDecl.ResultD
     g.ab.tree NifasmDecl.ClobberD:
-      for r in machine_m.ConvClobbersGpr: g.ab.reg r
+      for r in g.md.convClobbersGpr: g.ab.rawReg r
     g.ab.tree StmtsA64:
-      g.ab.tree SubA64: (g.mReg SP; g.ab.intLit 16)
+      g.ab.tree SubA64: (g.ab.rawReg SP; g.ab.intLit 16)
       for i, r in [R4, R5, R6, R7]:
         g.ab.tree StrA64:
-          g.ab.tree MemX: (g.mReg SP; g.ab.intLit int64(4 * i))
-          g.mReg r
+          g.ab.tree MemX: (g.ab.rawReg SP; g.ab.intLit int64(4 * i))
+          g.ab.rawReg r
       # D == 0 → everything zero, like `udiv`.
-      g.ab.tree MovA64: (g.mReg R7; g.mReg R2)
-      g.ab.tree OrrA64: (g.mReg R7; g.mReg R3)
-      g.ab.tree CmpA64: (g.mReg R7; g.ab.intLit 0)
+      g.ab.tree MovA64: (g.ab.rawReg R7; g.ab.rawReg R2)
+      g.ab.tree OrrA64: (g.ab.rawReg R7; g.ab.rawReg R3)
+      g.ab.tree CmpA64: (g.ab.rawReg R7; g.ab.intLit 0)
       g.emBr(BneA64, lZero)
-      g.ab.tree MovA64: (g.mReg R0; g.ab.intLit 0)
-      g.ab.tree MovA64: (g.mReg R1; g.ab.intLit 0)
+      g.ab.tree MovA64: (g.ab.rawReg R0; g.ab.intLit 0)
+      g.ab.tree MovA64: (g.ab.rawReg R1; g.ab.intLit 0)
       g.emBr(BA64, lDone)
       g.emLab(lZero)
-      g.ab.tree MovA64: (g.mReg R4; g.ab.intLit 0)     # R.lo
-      g.ab.tree MovA64: (g.mReg R5; g.ab.intLit 0)     # R.hi
-      g.ab.tree MovA64: (g.mReg R6; g.ab.intLit 64)    # bits to go
+      g.ab.tree MovA64: (g.ab.rawReg R4; g.ab.intLit 0)     # R.lo
+      g.ab.tree MovA64: (g.ab.rawReg R5; g.ab.intLit 0)     # R.hi
+      g.ab.tree MovA64: (g.ab.rawReg R6; g.ab.intLit 64)    # bits to go
       g.ab.tree LoopA64:
         g.ab.tree StmtsA64:
           let lSub = g.freshLabel()
           let lSkip = g.freshLabel()
           # R:N <<= 1
-          g.ab.tree Lsr3A64: (g.mReg R7; g.mReg R4; g.ab.intLit 31)
-          g.ab.tree LslA64:  (g.mReg R5; g.ab.intLit 1)
-          g.ab.tree OrrA64:  (g.mReg R5; g.mReg R7)
-          g.ab.tree Lsr3A64: (g.mReg R7; g.mReg R1; g.ab.intLit 31)
-          g.ab.tree LslA64:  (g.mReg R4; g.ab.intLit 1)
-          g.ab.tree OrrA64:  (g.mReg R4; g.mReg R7)
-          g.ab.tree Lsr3A64: (g.mReg R7; g.mReg R0; g.ab.intLit 31)
-          g.ab.tree LslA64:  (g.mReg R1; g.ab.intLit 1)
-          g.ab.tree OrrA64:  (g.mReg R1; g.mReg R7)
-          g.ab.tree LslA64:  (g.mReg R0; g.ab.intLit 1)
+          g.ab.tree Lsr3A64: (g.ab.rawReg R7; g.ab.rawReg R4; g.ab.intLit 31)
+          g.ab.tree LslA64:  (g.ab.rawReg R5; g.ab.intLit 1)
+          g.ab.tree OrrA64:  (g.ab.rawReg R5; g.ab.rawReg R7)
+          g.ab.tree Lsr3A64: (g.ab.rawReg R7; g.ab.rawReg R1; g.ab.intLit 31)
+          g.ab.tree LslA64:  (g.ab.rawReg R4; g.ab.intLit 1)
+          g.ab.tree OrrA64:  (g.ab.rawReg R4; g.ab.rawReg R7)
+          g.ab.tree Lsr3A64: (g.ab.rawReg R7; g.ab.rawReg R0; g.ab.intLit 31)
+          g.ab.tree LslA64:  (g.ab.rawReg R1; g.ab.intLit 1)
+          g.ab.tree OrrA64:  (g.ab.rawReg R1; g.ab.rawReg R7)
+          g.ab.tree LslA64:  (g.ab.rawReg R0; g.ab.intLit 1)
           # if R >= D
-          g.ab.tree CmpA64: (g.mReg R5; g.mReg R3)
+          g.ab.tree CmpA64: (g.ab.rawReg R5; g.ab.rawReg R3)
           g.emBr(BloA64, lSkip)
           g.emBr(BhiA64, lSub)
-          g.ab.tree CmpA64: (g.mReg R4; g.mReg R2)
+          g.ab.tree CmpA64: (g.ab.rawReg R4; g.ab.rawReg R2)
           g.emBr(BhsA64, lSub)
           g.emBr(BA64, lSkip)
           g.emLab(lSub)
-          g.ab.tree Subs3M: (g.mReg R4; g.mReg R4; g.mReg R2)
-          g.ab.tree Sbcs3M: (g.mReg R5; g.mReg R5; g.mReg R3)
-          g.ab.tree OrrA64: (g.mReg R0; g.ab.intLit 1)
+          g.ab.tree Subs3M: (g.ab.rawReg R4; g.ab.rawReg R4; g.ab.rawReg R2)
+          g.ab.tree Sbcs3M: (g.ab.rawReg R5; g.ab.rawReg R5; g.ab.rawReg R3)
+          g.ab.tree OrrA64: (g.ab.rawReg R0; g.ab.intLit 1)
           g.emLab(lSkip)
-          g.ab.tree SubA64: (g.mReg R6; g.ab.intLit 1)
-          g.ab.tree CmpA64: (g.mReg R6; g.ab.intLit 0)
+          g.ab.tree SubA64: (g.ab.rawReg R6; g.ab.intLit 1)
+          g.ab.tree CmpA64: (g.ab.rawReg R6; g.ab.intLit 0)
           g.emBr(BeqA64, lLoopEnd)               # the ONLY way out of the loop
       g.emLab(lLoopEnd)
-      g.ab.tree MovA64: (g.mReg R2; g.mReg R4)   # the remainder
-      g.ab.tree MovA64: (g.mReg R3; g.mReg R5)
+      g.ab.tree MovA64: (g.ab.rawReg R2; g.ab.rawReg R4)   # the remainder
+      g.ab.tree MovA64: (g.ab.rawReg R3; g.ab.rawReg R5)
       g.emLab(lDone)
       for i, r in [R4, R5, R6, R7]:
         g.ab.tree LdrA64:
-          g.mReg r
-          g.ab.tree MemX: (g.mReg SP; g.ab.intLit int64(4 * i))
-      g.ab.tree AddA64: (g.mReg SP; g.ab.intLit 16)
+          g.ab.rawReg r
+          g.ab.tree MemX: (g.ab.rawReg SP; g.ab.intLit int64(4 * i))
+      g.ab.tree AddA64: (g.ab.rawReg SP; g.ab.intLit 16)
       g.ab.keyword RetA64
 
 proc emitSDivMod64(g: var CodeGen) =
@@ -871,45 +872,45 @@ proc emitSDivMod64(g: var CodeGen) =
     g.ab.keyword NifasmDecl.ParamsD
     g.ab.keyword NifasmDecl.ResultD
     g.ab.tree NifasmDecl.ClobberD:
-      for r in machine_m.ConvClobbersGpr: g.ab.reg r
+      for r in g.md.convClobbersGpr: g.ab.rawReg r
     g.ab.tree StmtsA64:
-      g.ab.tree SubA64: (g.mReg SP; g.ab.intLit 16)
+      g.ab.tree SubA64: (g.ab.rawReg SP; g.ab.intLit 16)
       for i, r in [R4, R5, R6]:
         g.ab.tree StrA64:
-          g.ab.tree MemX: (g.mReg SP; g.ab.intLit int64(4 * i))
-          g.mReg r
+          g.ab.tree MemX: (g.ab.rawReg SP; g.ab.intLit int64(4 * i))
+          g.ab.rawReg r
       g.ab.tree StrA64:
-        g.ab.tree MemX: (g.mReg SP; g.ab.intLit 12)
-        g.mReg machine_m.LR
-      g.ab.tree Asr3A64: (g.mReg R4; g.mReg R1; g.ab.intLit 31)   # sign of N
-      g.ab.tree MovA64:  (g.mReg R5; g.mReg R4)                   # remainder's sign
-      g.ab.tree EorA64:  (g.mReg R0; g.mReg R4)                   # N = |N|
-      g.ab.tree EorA64:  (g.mReg R1; g.mReg R4)
-      g.ab.tree Subs3M:  (g.mReg R0; g.mReg R0; g.mReg R4)
-      g.ab.tree Sbcs3M:  (g.mReg R1; g.mReg R1; g.mReg R4)
-      g.ab.tree Asr3A64: (g.mReg R6; g.mReg R3; g.ab.intLit 31)   # sign of D
-      g.ab.tree EorA64:  (g.mReg R4; g.mReg R6)                   # quotient's sign
-      g.ab.tree EorA64:  (g.mReg R2; g.mReg R6)                   # D = |D|
-      g.ab.tree EorA64:  (g.mReg R3; g.mReg R6)
-      g.ab.tree Subs3M:  (g.mReg R2; g.mReg R2; g.mReg R6)
-      g.ab.tree Sbcs3M:  (g.mReg R3; g.mReg R3; g.mReg R6)
+        g.ab.tree MemX: (g.ab.rawReg SP; g.ab.intLit 12)
+        g.ab.rawReg g.md.linkReg
+      g.ab.tree Asr3A64: (g.ab.rawReg R4; g.ab.rawReg R1; g.ab.intLit 31)   # sign of N
+      g.ab.tree MovA64:  (g.ab.rawReg R5; g.ab.rawReg R4)                   # remainder's sign
+      g.ab.tree EorA64:  (g.ab.rawReg R0; g.ab.rawReg R4)                   # N = |N|
+      g.ab.tree EorA64:  (g.ab.rawReg R1; g.ab.rawReg R4)
+      g.ab.tree Subs3M:  (g.ab.rawReg R0; g.ab.rawReg R0; g.ab.rawReg R4)
+      g.ab.tree Sbcs3M:  (g.ab.rawReg R1; g.ab.rawReg R1; g.ab.rawReg R4)
+      g.ab.tree Asr3A64: (g.ab.rawReg R6; g.ab.rawReg R3; g.ab.intLit 31)   # sign of D
+      g.ab.tree EorA64:  (g.ab.rawReg R4; g.ab.rawReg R6)                   # quotient's sign
+      g.ab.tree EorA64:  (g.ab.rawReg R2; g.ab.rawReg R6)                   # D = |D|
+      g.ab.tree EorA64:  (g.ab.rawReg R3; g.ab.rawReg R6)
+      g.ab.tree Subs3M:  (g.ab.rawReg R2; g.ab.rawReg R2; g.ab.rawReg R6)
+      g.ab.tree Sbcs3M:  (g.ab.rawReg R3; g.ab.rawReg R3; g.ab.rawReg R6)
       g.ab.tree BlA64: g.ab.sym g.uDivMod64Proc
-      g.ab.tree EorA64:  (g.mReg R0; g.mReg R4)
-      g.ab.tree EorA64:  (g.mReg R1; g.mReg R4)
-      g.ab.tree Subs3M:  (g.mReg R0; g.mReg R0; g.mReg R4)
-      g.ab.tree Sbcs3M:  (g.mReg R1; g.mReg R1; g.mReg R4)
-      g.ab.tree EorA64:  (g.mReg R2; g.mReg R5)
-      g.ab.tree EorA64:  (g.mReg R3; g.mReg R5)
-      g.ab.tree Subs3M:  (g.mReg R2; g.mReg R2; g.mReg R5)
-      g.ab.tree Sbcs3M:  (g.mReg R3; g.mReg R3; g.mReg R5)
+      g.ab.tree EorA64:  (g.ab.rawReg R0; g.ab.rawReg R4)
+      g.ab.tree EorA64:  (g.ab.rawReg R1; g.ab.rawReg R4)
+      g.ab.tree Subs3M:  (g.ab.rawReg R0; g.ab.rawReg R0; g.ab.rawReg R4)
+      g.ab.tree Sbcs3M:  (g.ab.rawReg R1; g.ab.rawReg R1; g.ab.rawReg R4)
+      g.ab.tree EorA64:  (g.ab.rawReg R2; g.ab.rawReg R5)
+      g.ab.tree EorA64:  (g.ab.rawReg R3; g.ab.rawReg R5)
+      g.ab.tree Subs3M:  (g.ab.rawReg R2; g.ab.rawReg R2; g.ab.rawReg R5)
+      g.ab.tree Sbcs3M:  (g.ab.rawReg R3; g.ab.rawReg R3; g.ab.rawReg R5)
       for i, r in [R4, R5, R6]:
         g.ab.tree LdrA64:
-          g.mReg r
-          g.ab.tree MemX: (g.mReg SP; g.ab.intLit int64(4 * i))
+          g.ab.rawReg r
+          g.ab.tree MemX: (g.ab.rawReg SP; g.ab.intLit int64(4 * i))
       g.ab.tree LdrA64:
-        g.mReg machine_m.LR
-        g.ab.tree MemX: (g.mReg SP; g.ab.intLit 12)
-      g.ab.tree AddA64: (g.mReg SP; g.ab.intLit 16)
+        g.ab.rawReg g.md.linkReg
+        g.ab.tree MemX: (g.ab.rawReg SP; g.ab.intLit 12)
+      g.ab.tree AddA64: (g.ab.rawReg SP; g.ab.intLit 16)
       g.ab.keyword RetA64
 
 proc wideDivMod(g: var CodeGen; dst, a, b: WideRef; signed, wantRem: bool) =
