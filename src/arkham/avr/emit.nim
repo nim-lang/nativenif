@@ -90,6 +90,29 @@ proc emStoreSlot*(g: var CodeGen; name: string; s: Reg) =
     g.ab.tree MemX: (g.ab.sym name; g.ab.intLit 1)
     g.emHi s
 
+proc emLoadSlotW*(g: var CodeGen; d: Reg; name: string; width: int; signed: bool) =
+  ## A slot whose width is the LOCAL's, not this machine's. The two-byte form
+  ## reads `name+1` as the high half, and for a one-byte local that byte belongs
+  ## to whatever the slot manager put next to it — so an `(i 8)` local answered
+  ## with its neighbour in the high bits.
+  if width >= 2:
+    g.emLoadSlot(d, name)
+    return
+  g.ab.tree LdbAvr: (g.emLo d; g.ab.sym name)
+  g.ab.tree XorAvr: (g.emHi d; g.emHi d)      # the high half is zero…
+  if signed:
+    # …unless bit 7 of the byte is set, in which case it is 0xFF. `sbrc` SKIPS
+    # the `com` when the bit is clear, which is how this machine spells a
+    # conditional one-instruction fixup — there is no `sxtb` here.
+    g.ab.tree SbrcAvr: (g.emLo d; g.ab.intLit 7)
+    g.ab.tree NotAvr: g.emHi d
+
+proc emStoreSlotW*(g: var CodeGen; name: string; s: Reg; width: int) =
+  if width >= 2:
+    g.emStoreSlot(name, s)
+  else:
+    g.ab.tree StbAvr: (g.ab.sym name; g.emLo s)
+
 proc emLeaSlot*(g: var CodeGen; d: Reg; name: string) =
   ## The ADDRESS of a frame slot. One asm-NIF node; nifasm turns it into a `movw`
   ## from Y plus the displacement, because that displacement is ITS number.

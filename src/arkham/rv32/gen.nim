@@ -143,10 +143,27 @@ proc materializeB(g: var CodeGen; p: BPlan; dst: Reg): Reg =
 
 # ── comparisons ─────────────────────────────────────────────────────────────
 
-proc isSignedCmp(c: Cursor): bool =
-  var t = c
-  inc t                       # into the node, at the operand type
-  typeToSlot(t).cls != AUInt
+proc cmpOperandUnsigned(g: var CodeGen; c: Cursor): bool =
+  ## Does one comparison operand carry an unsigned (or char) type? A bare signed
+  ## literal is AMBIGUOUS — it answers false and lets the other operand decide,
+  ## which is the whole point: `(lt 5 u)` is an unsigned comparison and only the
+  ## second operand says so.
+  case c.kind
+  of UIntLit, CharLit: true
+  of IntLit: false
+  else: g.exprSlot(c).cls == AUInt
+
+proc isSignedCmp(g: var CodeGen; c: Cursor): bool =
+  ## Read off the FIRST OPERAND's own type, because a comparison carries NO type
+  ## child — unlike `(add T a b)` and every other arithmetic node. That asymmetry
+  ## is easy to miss and this backend missed it: reading a type where the first
+  ## OPERAND is left every comparison one child out of step, and `(lt x 5)` — the
+  ## form the frontend actually emits — compared `5` against whatever followed
+  ## the node. Twenty-three fixtures in the Cortex-M corpus refused on it.
+  var a = c
+  inc a                       # into the node, at the first operand
+  var b = a; skip b
+  not (g.cmpOperandUnsigned(a) or g.cmpOperandUnsigned(b))
 
 proc condOf(c: Cursor; signed: bool): tuple[cond: RvCond; swap: bool] =
   ## The branch that HOLDS when the comparison is true, and whether the operands
@@ -162,7 +179,7 @@ proc condOf(c: Cursor; signed: bool): tuple[cond: RvCond; swap: bool] =
 proc cmpOperands(g: var CodeGen; c: Cursor; dst: Reg; swap: bool):
     tuple[a, b: Reg] =
   var x = c
-  inc x; skip x               # into the node, past the operand type
+  inc x                       # into the node, at the first operand
   var y = x; skip y
   let lhs = if swap: y else: x
   let rhs = if swap: x else: y
@@ -176,7 +193,7 @@ proc emitCond(g: var CodeGen; c: Cursor; target: string; whenTrue: bool) =
   ## comparison IS.
   case c.exprKind
   of EqC, NeqC, LtC, LeC:
-    let signed = isSignedCmp(c)
+    let signed = g.isSignedCmp(c)
     let (cond, swap) = condOf(c, signed)
     let (a, b) = g.cmpOperands(c, StagingBridge, swap)
     g.emBranch((if whenTrue: cond else: invert(cond)), a, b, target)
@@ -198,9 +215,9 @@ proc emitCmpValue(g: var CodeGen; c: Cursor; dst: Reg) =
   ## `a == b` is `(a xor b) == 0`, which is `seqz`; `a != b` is `snez` of the
   ## same; `a <= b` is `not (b < a)`, which is the `slt` with the operands
   ## exchanged and bit 0 flipped.
-  let signed = isSignedCmp(c)
+  let signed = g.isSignedCmp(c)
   var x = c
-  inc x; skip x
+  inc x
   var y = x; skip y
   case c.exprKind
   of LtC:
@@ -420,7 +437,7 @@ proc emitLval(g: var CodeGen; c: Cursor; scratch: Reg): Lval =
 proc storeTo(g: var CodeGen; lv: Lval; src: Reg) =
   case lv.kind
   of lvReg: g.emMv(lv.r, src)
-  of lvSlot: g.emStoreSlot(lv.slot, src)
+  of lvSlot: g.emStoreSlotW(lv.slot, src, lv.width)
   of lvPtr: g.emStorePtr(lv.r, lv.off, src, lv.width)
   of lvNode: g.emStoreNode(lv.node, src, lv.width)
 
@@ -581,7 +598,9 @@ proc emitValue(g: var CodeGen; c: Cursor; dst: Reg) =
     let home = g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c))
     case home.kind
     of InReg: g.emMv(dst, home.r)
-    of NamedStack: g.emLoadSlot(dst, home.name)
+    of NamedStack:
+      let (w, signed) = g.accessWidth(c)
+      g.emLoadSlotW(dst, home.name, w, signed)
     else:
       # A GLOBAL. Its address is a `lui`+`addi` pair, so a read is that plus one
       # load — there is no PC-relative operand to fold it into.
@@ -859,7 +878,9 @@ proc genVarDecl(g: var CodeGen; c: Cursor) =
       return
     let dst = g.destOfSym(name, pos)
     g.emitValue(v, dst)
-    if home.kind != InReg: g.emStoreSlot(home.name, dst)
+    if home.kind != InReg:
+      var tc0 = typeCur
+      g.emStoreSlotW(home.name, dst, slotOf(g.prog, tc0).size)
 
 proc genAsgn(g: var CodeGen; c: Cursor) =
   var lhs = c
@@ -877,7 +898,8 @@ proc genAsgn(g: var CodeGen; c: Cursor) =
     let dst = g.destOfSym(name, pos)
     g.emitValue(rhs, dst)
     let home = g.plan.locationOfSym(name, pos)
-    if home.kind != InReg: g.emStoreSlot(home.name, dst)
+    if home.kind != InReg:
+      g.emStoreSlotW(home.name, dst, g.accessWidth(lhs).bytes)
     return
   # A store through an address. The ADDRESS is computed first and parked, and
   # then the value: the other order would need the address to survive the value's
@@ -1251,8 +1273,9 @@ proc genProcRv*(g: var CodeGen; info: ProcInfo) =
         g.emRegVar(nm, home.r, params[i].typ)  # kills `pN.0` when it IS this reg
         g.emMv(home.r, src)
       of NamedStack:
+        var ptc0 = params[i].typ
         g.emSlotVar(home.name, params[i].typ)
-        g.emStoreSlot(home.name, src)
+        g.emStoreSlotW(home.name, src, slotOf(g.prog, ptc0).size)
       else:
         lengError info.decl, "RV32: the parameter `" & nm & "` was given no storage",
                   lengInfo(info.decl)

@@ -13,7 +13,7 @@
    (if
     (elif
      (lt
-      (i 32)x.0 10)
+      x.0 10)
      (stmts
       (asgn r.0 40)))
     (else
@@ -22,7 +22,7 @@
    (if
     (elif
      (eq
-      (i 32)x.0 7)
+      x.0 7)
      (stmts
       (asgn r.0
        (add

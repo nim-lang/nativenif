@@ -9,7 +9,7 @@
    (if
     (elif
      (lt
-      (i 32)n.0 2)
+      n.0 2)
      (stmts
       (ret 1))))
    (ret

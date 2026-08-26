@@ -77,6 +77,23 @@ proc emLoadSlot*(g: var CodeGen; d: Reg; name: string) =
 proc emStoreSlot*(g: var CodeGen; name: string; s: Reg) =
   g.ab.tree SwrRv: (g.ab.sym name; g.emReg s)
 
+proc emLoadSlotW*(g: var CodeGen; d: Reg; name: string; width: int; signed: bool) =
+  ## A slot whose width is the LOCAL's, not the machine's. `lw` on a one-byte
+  ## slot reads three bytes that belong to something else and answers with them;
+  ## `sw` writes over them. That is what an `(i 8)` local did until this existed.
+  let t = case width
+          of 1: (if signed: LbrRv else: LburRv)
+          of 2: (if signed: LhrRv else: LhurRv)
+          else: LwrRv
+  g.ab.tree t: (g.emReg d; g.ab.sym name)
+
+proc emStoreSlotW*(g: var CodeGen; name: string; s: Reg; width: int) =
+  let t = case width
+          of 1: SbrRv
+          of 2: Shr32Rv
+          else: SwrRv
+  g.ab.tree t: (g.ab.sym name; g.emReg s)
+
 proc emLeaSlot*(g: var CodeGen; d: Reg; name: string) =
   ## The ADDRESS of a frame slot — `addi d, sp, q`, with `q` nifasm's own number.
   g.ab.tree LeaRv: (g.emReg d; g.ab.sym name)

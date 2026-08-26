@@ -165,14 +165,31 @@ proc materializeB(g: var CodeGen; p: BPlan): Reg =
 
 # ── conditions ──────────────────────────────────────────────────────────────
 
+proc cmpOperandUnsigned(g: var CodeGen; c: Cursor): bool =
+  ## Does one comparison operand carry an unsigned (or char) type? A bare signed
+  ## literal is AMBIGUOUS — it answers false and lets the other operand decide,
+  ## which is the whole point: `(lt 5 u)` is an unsigned comparison and only the
+  ## second operand says so.
+  case c.kind
+  of UIntLit, CharLit: true
+  of IntLit: false
+  else: g.exprSlot(c).cls == AUInt
+
 proc isSignedCmp(g: var CodeGen; c: Cursor): bool =
-  ## The comparison's SIGNEDNESS, read off the operand type the node carries. It
+  ## The comparison's SIGNEDNESS, read off the FIRST OPERAND's own type. It
   ## decides between two different instructions here — an unsigned `<` leaves its
   ## answer in the carry and a signed one in S — so guessing is not available.
-  var t = c
-  inc t                       # into the node, at the operand type
-  let s = typeToSlot(t)
-  result = s.cls != AUInt
+  ##
+  ## A comparison carries NO type child, unlike `(add T a b)` and every other
+  ## arithmetic node. That asymmetry is easy to miss and this backend missed it:
+  ## reading a type where the first OPERAND is left every comparison one child
+  ## out of step, and `(lt x 5)` — the form the frontend actually emits —
+  ## compared `5` against whatever followed the node. Twenty-three fixtures in
+  ## the Cortex-M corpus refused on it.
+  var a = c
+  inc a                       # into the node, at the first operand
+  var b = a; skip b
+  result = not (g.cmpOperandUnsigned(a) or g.cmpOperandUnsigned(b))
 
 proc cmpBranchOf(g: var CodeGen; c: Cursor; signed: bool):
     tuple[cond: AvrCond; swap: bool] =
@@ -197,7 +214,7 @@ proc emitCmpFlags(g: var CodeGen; c: Cursor; dst: Reg): AvrCond =
   let signed = g.isSignedCmp(c)
   let (cond, swap) = g.cmpBranchOf(c, signed)
   var a = c
-  inc a; skip a               # into the node, past the operand type
+  inc a                       # into the node, at the first operand
   var b = a; skip b
   let lhs = if swap: b else: a
   let rhs = if swap: a else: b
@@ -582,7 +599,9 @@ proc emitValue(g: var CodeGen; c: Cursor; dst: Reg) =
     let home = g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c))
     case home.kind
     of InReg: g.emMovw(dst, home.r)
-    of NamedStack: g.emLoadSlot(dst, home.name)
+    of NamedStack:
+      let w = g.accessWidth(c)
+      g.emLoadSlotW(dst, home.name, w, g.exprSlot(c).cls != AUInt)
     else:
       # A GLOBAL. Its address is a pair of `ldi`s, so a read is that plus one
       # load — there is no absolute operand this backend folds it into.
@@ -916,7 +935,9 @@ proc genVarDecl(g: var CodeGen; c: Cursor) =
       return
     let dst = g.destOfSym(name, pos)
     g.emitValue(v, dst)
-    if home.kind != InReg: g.emStoreSlot(home.name, dst)
+    if home.kind != InReg:
+      var tc0 = typeCur
+      g.emStoreSlotW(home.name, dst, slotOf(g.prog, tc0).size)
 
 proc genAsgn(g: var CodeGen; c: Cursor) =
   var lhs = c
@@ -934,7 +955,8 @@ proc genAsgn(g: var CodeGen; c: Cursor) =
     let dst = g.destOfSym(name, pos)
     g.emitValue(rhs, dst)
     let home = g.plan.locationOfSym(name, pos)
-    if home.kind != InReg: g.emStoreSlot(home.name, dst)
+    if home.kind != InReg:
+      g.emStoreSlotW(home.name, dst, g.accessWidth(lhs))
     return
   # A store through an address. Both the address and the value are parked: each
   # is computed into the value bridge, and neither could survive the other's walk
@@ -1292,8 +1314,9 @@ proc genProcAvr*(g: var CodeGen; info: ProcInfo) =
         g.emRegPairVar(nm, home.r, params[i].typ)  # kills `pN.0` when it IS this pair
         g.emMovw(home.r, src)
       of NamedStack:
+        var ptc0 = params[i].typ
         g.emSlotVar(home.name, params[i].typ)
-        g.emStoreSlot(home.name, src)
+        g.emStoreSlotW(home.name, src, slotOf(g.prog, ptc0).size)
       else:
         lengError info.decl, "AVR: the parameter `" & nm & "` was given no storage",
                   lengInfo(info.decl)
