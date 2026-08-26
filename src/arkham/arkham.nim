@@ -20,7 +20,7 @@ import core/layout               # the --layout: board file
 import core/temps                # (arkhamTempDbg: dumpTempStats)
 import codegen_arm               # BOTH Arm targets: AArch64 (Darwin/Linux) and
                                 # Cortex-M. One emitter, three machine models.
-import codegen_x64               # x86-64 / Linux backend
+import x64/driver                # x86-64 / Linux backend
 
 const
   Version = "0.1.0"

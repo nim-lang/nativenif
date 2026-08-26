@@ -192,3 +192,8 @@ const
     abiCalleeSaved: @[RBX, R12, R13, R14, R15, RBP],
     intCallerSavedSet: {RAX, RDI, RSI, RDX, RCX, R8, R9, R10, R11},
     convClobbersGpr: @x64ClobbersGpr)
+
+const TlsBlockName* = "arkham.tls.0"
+  ## The static block FS points at (see `emitTlsSetup`); a tvar lives at
+  ## `FS:[offset]`, i.e. `&arkham.tls.0 + offset`. Distinct basename so nifasm's
+  ## scope keys it uniquely.
