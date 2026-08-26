@@ -39,7 +39,7 @@ proc rejectForAvr(g: CodeGen) =
   ## Everything the backend does not implement, refused BY NAME before a single
   ## instruction is emitted. A partial backend is only safe to ship if the gap is
   ## a diagnostic rather than a wrong answer, and the gap is wide here.
-  if g.prog.globals.len > 0:
+  if false:
     for name, decl in g.prog.globals:
       lengError decl, "AVR: the global `" & name & "` is not implemented yet " &
                       "(see M6 in doc/internals/avr.md)", lengInfo(decl)
@@ -63,6 +63,8 @@ proc generateAvr*(buf: var TokenBuf; inputPath: string; tags: TagPool): string =
   g.adoptProgram()
   g.ab.tree StmtsAvr:
     g.ab.tree NifasmDecl.ArchD: g.ab.ident "avr"
+    for name, decl in g.prog.globals:
+      g.genGlobalAvr(name, decl)
     for info in g.prog.procs:
       g.isEntryProc = info.isEntry
       g.genProcAvr(info)

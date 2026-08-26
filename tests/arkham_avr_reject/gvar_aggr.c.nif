@@ -1,0 +1,17 @@
+(.nif27)
+(stmts
+ (type :Pt.0 .
+  (object .
+   (fld :x.0 .
+    (i 16))
+   (fld :y.0 .
+    (i 16))))
+ (gvar :origin.0 . Pt.0 .)
+ (proc :main.0
+  (params)
+  (i 16)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (ret
+    (dot origin.0 x.0 0)))))

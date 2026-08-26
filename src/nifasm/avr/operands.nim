@@ -51,6 +51,8 @@ type
     argName*: SymId
     label*: LabelId
     isCode*: bool       ## the label names a proc, so its address is a WORD address
+    gvarSym*: Symbol    ## non-nil when the operand names a GLOBAL, whose SRAM
+                        ## address is a final-layout fact — see `LeaAvr`
 
 const
   FramePtr* = avr.Y
@@ -439,8 +441,9 @@ proc parseOperandAvr*(n: var Cursor; ctx: var GenContext): OperandAvr =
       result.typ = Type(kind: TypeKind.UIntT, bits: 16)
       inc n
     of skGvar:
-      error("AVR: globals are not implemented yet: '" & name &
-            "' (see M6 in doc/internals/avr.md)", n)
+      result.gvarSym = sym
+      result.typ = Type(kind: TypeKind.UIntT, bits: 16)
+      inc n
     of skTvar:
       error("AVR has no thread-local storage: '" & name & "'", n)
     else:

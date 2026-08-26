@@ -632,8 +632,30 @@ proc genInstAvr(n: var Cursor; ctx: var GenContext) =
     inc n
     let d = parseDestAvr(n, ctx)
     let sOp = parseOperandAvr(n, ctx)
+    if sOp.gvarSym != nil:
+      # A GLOBAL's address. Two `ldi`s — low half then high — because SRAM is
+      # only 16 bits wide here and `ldi` is the one instruction that carries an
+      # immediate. The VALUE is not known until the image is laid out, so the
+      # site is recorded and patched there, exactly as RV32 and Cortex-M do.
+      let dp = pairOfAvr(d, "destination", start)
+      if Register(ord(dp)) notin avr.ImmRegs:
+        error("AVR: a global's address arrives through two `ldi`s, which reach " &
+              "r16..r31 only; " & pairName(dp) & " cannot receive one", start)
+      ctx.gvarSites.add (ctx.buf.data.len, sOp.gvarSym)
+      avr.emitLdi(ctx.buf.data, Register(ord(dp)), 0)
+      avr.emitLdi(ctx.buf.data, Register(ord(dp) + 1), 0)
+      return
+    if sOp.kind == okLabel:
+      # A RODATA blob, which on this Harvard machine lives in FLASH: what lands
+      # in the pair is a byte address in program space, and reading through it
+      # needs `lpm`, not `ld`. Refused rather than silently produced, because a
+      # `ld` through it would read SRAM at the same number.
+      error("AVR: the address of `" & (if sOp.isCode: "a proc" else: "a rodata " &
+            "blob") & "` is a FLASH address; reading through it needs `(lpm)` " &
+            "and no path here emits that yet (see M6 in doc/internals/avr.md)",
+            start)
     if sOp.kind != okMem or sOp.mem.kind != amPtr:
-      error("AVR: `(lea D S)` takes a frame slot", start)
+      error("AVR: `(lea D S)` takes a frame slot or a global", start)
     let dp = pairOfAvr(d, "destination", start)
     let base = case sOp.mem.p
                of avr.PX: avr.X

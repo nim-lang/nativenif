@@ -16,7 +16,7 @@
 ## top of some local. An unbound pair (a bridge) is spelled raw, which is exactly
 ## the claim `rawReg`'s doc comment describes.
 
-import std / [tables]
+import std / [tables, sets]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
                     context, typeutil, regbind, diag]
@@ -544,6 +544,36 @@ proc emSlotVar*(g: var CodeGen; name: string; typeCur: Cursor) =
   var tc = typeCur
   g.genTypeBodyAvr(tc)
   g.ab.close()
+
+proc genGlobalAvr*(g: var CodeGen; nifName: string; decl: Cursor) =
+  ## A top-level `gvar`/`const`, declared with NO static image.
+  ##
+  ## That is the AVR-specific part. Everywhere else the initializer is baked into
+  ## a writable segment the loader maps; here the writable space is SRAM, which
+  ## no loader touches, and the bytes would have to travel in flash and be copied
+  ## at startup. So the initial value is a STORE the entry proc's preamble emits
+  ## (see `emGlobalInits`), and what is declared here is the storage alone.
+  if nifName in g.prog.importcOnlyGvars: return
+  let name = g.prog.gvarAsmName(nifName)
+  var c = decl
+  c.into:
+    inc c                                       # the name
+    skip c                                      # the var's pragmas
+    let typeCur = c
+    skip c
+    g.ab.open NifasmDecl.GvarD
+    g.ab.symDef name
+    var tc = typeCur
+    g.genTypeBodyAvr(tc)
+    g.ab.close()
+    while c.hasMore: skip c
+
+proc emGlobalAddr*(g: var CodeGen; d: Reg; name: string) =
+  ## A global's SRAM address into a pair. Two `ldi`s, patched once the data
+  ## block is placed — the address is a final-layout fact, so nifasm carries it
+  ## rather than arkham guessing. Spelled `(lea …)` because that is already this
+  ## target's "the address of a thing whose offset nifasm assigned".
+  g.ab.tree LeaAvr: (g.emPair d; g.ab.sym name)
 
 proc emPtrSlot*(g: var CodeGen; name: string) =
   ## A two-byte slot the EMITTER minted for an ADDRESS — the parked hidden

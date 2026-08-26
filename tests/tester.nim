@@ -1299,7 +1299,11 @@ proc arkhamAvrRejections() =
     ("tests/arkham_avr_reject/varshift.c.nif", "variable-shift"),
     # A syscall. Refused for what it IS rather than as an unimplemented feature:
     # a firmware image has no OS underneath it, on this target or any other.
-    ("tests/arkham/hello.c.nif", "no OS to call into")]
+    ("tests/arkham/hello.c.nif", "no OS to call into"),
+    # An AGGREGATE global. Refused because its initial IMAGE would have to ship
+    # in flash and be copied into SRAM at startup — a scalar's initial value is
+    # a store the entry proc emits, and an array's would be hundreds of them.
+    ("tests/arkham_avr_reject/gvar_aggr.c.nif", "is an aggregate")]
   var passed = 0
   for (file, want) in cases:
     let (output, code) = runProgram(arkhamExe,

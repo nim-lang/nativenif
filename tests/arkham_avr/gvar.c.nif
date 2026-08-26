@@ -1,0 +1,28 @@
+(.nif27)
+(stmts
+ (gvar :counter.0 .
+  (i 16)7)
+ (gvar :acc.0 .
+  (i 16).)
+ (proc :bump.0
+  (params
+   (param :n.0 .
+    (i 16))).
+  .
+  (stmts
+   (asgn acc.0
+    (add
+     (i 16)acc.0 n.0))
+   (ret .)))
+ (proc :main.0
+  (params)
+  (i 16)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (call bump.0 counter.0)
+   (call bump.0 5)
+   (asgn counter.0
+    (add
+     (i 16)counter.0 acc.0))
+   (ret counter.0))))

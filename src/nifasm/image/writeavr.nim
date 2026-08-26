@@ -78,14 +78,35 @@ proc writeAvrImage*(a: var GenContext; code: seq[byte]; entryOff: int): seq[byte
     quit "nifasm: the image is " & $image.len & " bytes and this part's flash " &
          "holds " & $FlashSize
 
-  # `.data`/`.bss` are M6: nothing allocates a global yet, and the operand parser
-  # refuses one by name. When they arrive the initializer image goes here, as a
-  # second segment whose `p_paddr` is its place in flash and whose `p_vaddr`
-  # carries `DataVaddrMarker` — and the startup code copies between the two,
-  # because on this machine nothing else will.
-  if a.bssOffset > 0:
-    quit "nifasm: AVR globals are not implemented yet (see M6 in " &
-         "doc/internals/avr.md); this module declares " & $a.bssOffset & " bytes"
+  # ── the globals ─────────────────────────────────────────────────────────
+  # SRAM starts at `SramBase` and every global's `sym.size` is its byte offset
+  # within the block, so the address is known here and nowhere earlier — which
+  # is why `(lea D <gvar>)` left two empty `ldi`s behind for this loop.
+  if a.bssSymInits.len > 0:
+    quit "nifasm: an AVR global initialized with another symbol's ADDRESS is " &
+         "not implemented yet (see M6 in doc/internals/avr.md): a proc's " &
+         "address is a flash address and a global's is a data address, and " &
+         "nothing here records which one was meant"
+  if a.bssOffset > SramSize:
+    quit "nifasm: this module declares " & $a.bssOffset & " bytes of globals " &
+         "and this part's SRAM holds " & $SramSize
+
+  for (pos, sym) in a.gvarSites:
+    # `pos` is an offset within `code`, and the reset vector sits in front of it
+    # in the image — the same four bytes `absBase` carries for every relocation.
+    let base = ResetVectorBytes + pos
+    if base + 4 > image.len: continue
+    let v = SramBase + sym.size
+    # `ldi` splits its 8-bit immediate across bits 11:8 and 3:0, and the two
+    # halves of the address go low first — the order `emitLdiAddr` established
+    # and `rkAvrLdiAddr` patches.
+    for half in 0 .. 1:
+      let k = uint16((v shr (8 * half)) and 0xFF)
+      let at = base + 2 * half
+      var w = uint16(image[at]) or (uint16(image[at + 1]) shl 8)
+      w = (w and 0xF0F0'u16) or (((k shr 4) and 0xF) shl 8) or (k and 0xF)
+      image[at] = byte(w and 0xFF)
+      image[at + 1] = byte((w shr 8) and 0xFF)
 
   # `entryTag = 0`: bit 0 of an ARM code address is the Thumb-state marker, and
   # the same bit here would name an odd address — see `writeElf32`.
@@ -95,8 +116,22 @@ proc writeAvrImage*(a: var GenContext; code: seq[byte]; entryOff: int): seq[byte
   # `jmp` placed there above is what sends it to the entry proc. Declaring the
   # proc's address instead would work under a simulator that honours `e_entry`
   # and fail on silicon, which is the worse of the two.
+  var segs = @[elf32.Segment(vaddr: 0, data: image, memSize: image.len,
+                             flags: elf32.PF_R or elf32.PF_X)]
+  if a.bssOffset > 0:
+    # `p_vaddr` carries `DataVaddrMarker`, the AVR toolchain's way of saying
+    # "this address is in the DATA space" — a tool that understands it subtracts
+    # the marker, and a chip never sees the header at all.
+    #
+    # No file image and no `p_paddr` copy: the initial VALUE of every global is
+    # stored by the entry proc's preamble, which arkham emits. That is more code
+    # than a flash-to-SRAM copy loop for a large array, and it is the only form
+    # that needs no instruction nifasm would have to invent — the same line
+    # `(lea …)` and `(ssize)` are drawn along.
+    segs.add elf32.Segment(vaddr: DataVaddrMarker + uint32(SramBase),
+                           data: @[], memSize: a.bssOffset,
+                           flags: elf32.PF_R or elf32.PF_W)
+
   result = elf32.writeElf32(
-    [elf32.Segment(vaddr: 0, data: image, memSize: image.len,
-                   flags: elf32.PF_R or elf32.PF_X)],
-    entry = 0, machine = elf32.EM_AVR, flags = elf32.EF_AVR_MACH_AVR5,
+    segs, entry = 0, machine = elf32.EM_AVR, flags = elf32.EF_AVR_MACH_AVR5,
     entryTag = 0)

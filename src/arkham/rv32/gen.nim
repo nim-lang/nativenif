@@ -496,7 +496,23 @@ proc aggrSize(g: var CodeGen; c: Cursor): int =
   if s.size <= 0: 0 else: s.size
 
 proc isAggrCall(g: var CodeGen; c: Cursor): bool =
-  c.kind == TagLit and c.exprKind == CallC and g.exprSlot(c).cls == AMem
+  ## Whether a `(call …)` returns an AGGREGATE — the only kind of call that
+  ## needs somewhere told to it in advance.
+  ##
+  ## Read off the CALLEE's declared result type rather than off `exprSlot` of the
+  ## call node, and the difference is not academic: a VOID result is `.` in the
+  ## decl and `slotOf` of that answers `AMem`, so `exprSlot` calls every void
+  ## call an aggregate one. Every discarded void call minted a zero-byte frame
+  ## slot on the strength of it.
+  if c.kind != TagLit or c.exprKind != CallC: return false
+  var f = c; inc f
+  if f.kind != Symbol: return false
+  let target = g.callTarget.getOrDefault(symName(f))
+  if target.asmName.len == 0: return false
+  var rtc = target.retType
+  result = not cursorIsNil(rtc) and rtc.kind != DotToken and
+           not (rtc.kind == TagLit and rtc.typeKind == VoidT) and
+           slotOf(g.prog, rtc).cls == AMem
 
 proc tryAggrAssign(g: var CodeGen; lhs, rhs: Cursor): bool =
   ## `b = a` where both are aggregates. Returns false when this is not one.
@@ -961,7 +977,7 @@ proc genStmt(g: var CodeGen; c: Cursor) =
   of CallS:
     # A discarded call. An aggregate result still has to go SOMEWHERE — the
     # callee writes through the pointer whether anyone reads it or not.
-    if g.exprSlot(c).cls == AMem:
+    if g.isAggrCall(c):
       let tmp = g.mintAggrSlot(g.aggrSize(c))
       g.emitCall(c, StagingBridge, wantResult = false, aggrDst = tmp)
     else:

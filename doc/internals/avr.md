@@ -13,9 +13,10 @@ Status: **M0–M4d complete.**
 | M4b arkham driver + the return path | done — the program walk and the exit path |
 | M4c the value core | done — 8 Leng fixtures run end to end |
 | M4d aggregates, arrays, pointers | done — 5 more Leng fixtures |
+| M4e aggregate parameters and returns | done — a hidden result pointer |
+| M5a scalar globals | done — SRAM storage, values stored at entry |
 | M5 wide scalars, stack arguments, divide | not started |
-
-| M6 globals, flash constants, interrupts, startup | not started |
+| M6 aggregate globals, flash constants, interrupts | not started |
 
 ### What M4c has
 
@@ -114,7 +115,25 @@ register, a pair or a stack slot, every ALU form, the one-bit shifts,
   the frame size in six bits, and 63 is also the whole displacement range of
   `ldd`/`std`. A larger frame needs the pointer advanced, which is not one
   instruction.
-* **Globals** are rejected by name — M6.
+* **A global's initial value is a STORE, not an image** (M5a). Everywhere else
+  in this tree the initializer is baked into a writable segment and the loader
+  maps it, and `.bss` is zero because a segment whose `p_memsz` exceeds its
+  `p_filesz` is zero-filled by definition. On a chip there is no loader: the
+  writable space is SRAM, whose contents at reset are whatever the last power
+  cycle left there, and the bytes would have to ship in FLASH and be copied
+  across — a different address space, reached by `lpm`. So the entry proc's
+  preamble stores every global's initial value, zero included, and nothing in
+  the image is relied on to be anything. An AGGREGATE global is refused by name
+  for the same reason: its image would be hundreds of stores, and copying it
+  from flash is M6.
+* **A global's ADDRESS is two `ldi`s**, spelled `(lea D <gvar>)` and patched by
+  the image writer once the SRAM block is placed — the same exception `(ssize)`
+  and a frame slot's displacement live under. It reaches r16..r31 only, which
+  `ldi` decides and not this backend.
+* **A rodata blob's address is refused.** It is a FLASH address, and a `ld`
+  through it would read SRAM at the same number — so the value is never
+  produced rather than produced and misused. Reading one needs `lpm`, which is
+  M6, and it is why a string literal is refused too.
 * **A conditional branch always costs two words**: the direct form reaches ±128
   bytes and the assembler cannot know the distance when it emits one, so it
   inverts the condition and branches over an `rjmp`. Shrinking that back down is

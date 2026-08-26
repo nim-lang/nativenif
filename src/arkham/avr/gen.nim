@@ -34,7 +34,7 @@
 ##    memory, and the accumulator of the multiply.
 ##  * `ProduceBridge` (Z) is the indirect-call target and the flash pointer.
 
-import std / [tables]
+import std / [tables, sets]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
                     context, typeutil, regbind, diag, mirrors, analyser]
@@ -331,6 +331,9 @@ proc emitAddrOf(g: var CodeGen; c: Cursor; dst: Reg) =
     if home.kind == InReg:
       g.emMovw(dst, home.r)                 # already a pointer VALUE
       return
+    if home.kind == NoLoc and g.prog.globals.hasKey(symName(c)):
+      g.emGlobalAddr(dst, g.prog.gvarAsmName(symName(c)))
+      return
     refuse(c, "the address of `" & symName(c) & "`")
   if c.kind == TagLit:
     case c.exprKind
@@ -364,7 +367,11 @@ proc emitLval(g: var CodeGen; c: Cursor; scratch: Reg): Lval =
       if g.exprSlot(c).cls == AMem: Lval(kind: lvPtr, r: home.r, off: 0, width: 1)
       else: Lval(kind: lvReg, r: home.r)
     of NamedStack: Lval(kind: lvSlot, slot: home.name)
-    else: refuse(c, "a store to `" & name & "`, whose location is " & $home.kind)
+    else:
+      if not g.prog.globals.hasKey(name):
+        refuse(c, "a store to `" & name & "`, whose location is " & $home.kind)
+      g.emGlobalAddr(scratch, g.prog.gvarAsmName(name))
+      Lval(kind: lvPtr, r: scratch, off: 0, width: g.accessWidth(c))
   of TagLit:
     case c.exprKind
     of DerefC, HaddrC:
@@ -455,7 +462,23 @@ proc aggrSize(g: var CodeGen; c: Cursor): int =
   if s.size <= 0: 0 else: s.size
 
 proc isAggrCall(g: var CodeGen; c: Cursor): bool =
-  c.kind == TagLit and c.exprKind == CallC and g.exprSlot(c).cls == AMem
+  ## Whether a `(call …)` returns an AGGREGATE — the only kind of call that
+  ## needs somewhere told to it in advance.
+  ##
+  ## Read off the CALLEE's declared result type rather than off `exprSlot` of the
+  ## call node, and the difference is not academic: a VOID result is `.` in the
+  ## decl and `slotOf` of that answers `AMem`, so `exprSlot` calls every void
+  ## call an aggregate one. Every discarded void call minted a zero-byte frame
+  ## slot on the strength of it.
+  if c.kind != TagLit or c.exprKind != CallC: return false
+  var f = c; inc f
+  if f.kind != Symbol: return false
+  let target = g.callTarget.getOrDefault(symName(f))
+  if target.asmName.len == 0: return false
+  var rtc = target.retType
+  result = not cursorIsNil(rtc) and rtc.kind != DotToken and
+           not (rtc.kind == TagLit and rtc.typeKind == VoidT) and
+           slotOf(g.prog, rtc).cls == AMem
 
 proc tryAggrAssign(g: var CodeGen; lhs, rhs: Cursor): bool =
   if g.exprSlot(rhs).cls != AMem: return false
@@ -560,7 +583,14 @@ proc emitValue(g: var CodeGen; c: Cursor; dst: Reg) =
     case home.kind
     of InReg: g.emMovw(dst, home.r)
     of NamedStack: g.emLoadSlot(dst, home.name)
-    else: refuse(c, "a read of `" & symName(c) & "`, whose location is " & $home.kind)
+    else:
+      # A GLOBAL. Its address is a pair of `ldi`s, so a read is that plus one
+      # load — there is no absolute operand this backend folds it into.
+      let name = symName(c)
+      if not g.prog.globals.hasKey(name):
+        refuse(c, "a read of `" & name & "`, whose location is " & $home.kind)
+      g.emGlobalAddr(dst, g.prog.gvarAsmName(name))
+      g.emLoadPtr(dst, dst, 0, g.accessWidth(c))
   of StrLit:
     refuse(c, "a string literal — this is a HARVARD machine, so a constant lives " &
               "in flash and is read by `lpm` rather than by `ld`, which is a " &
@@ -804,6 +834,51 @@ proc emitAggrInit(g: var CodeGen; c: Cursor; slot: string) =
   else:
     refuse(c, "this aggregate initializer")
 
+proc emGlobalInits(g: var CodeGen) =
+  ## The initial value of every global, stored by the ENTRY proc before its own
+  ## body runs.
+  ##
+  ## This is where AVR parts company with every other target here. Elsewhere a
+  ## global's image is baked into a writable segment and the loader maps it;
+  ## `.bss` is zero because a segment whose `p_memsz` exceeds its `p_filesz` is
+  ## zero-filled by definition. On a chip there is no loader and no mapping: the
+  ## writable space is SRAM, whose contents at reset are whatever the last power
+  ## cycle left there, and the bytes would have to ship in FLASH and be copied
+  ## across at startup — a different address space, reached by `lpm`.
+  ##
+  ## So the initial value is a STORE rather than an image. That costs more code
+  ## than a copy loop would for a large array, which is exactly why an aggregate
+  ## global is refused by name here; and it needs no instruction nifasm would
+  ## have to invent, which is why it is the form chosen.
+  for nifName, decl in g.prog.globals:
+    if nifName in g.prog.importcOnlyGvars: continue
+    var c = decl
+    c.into:
+      inc c                                     # the name
+      skip c                                    # the var's pragmas
+      let typeCur = c
+      skip c
+      var tc = typeCur
+      let sl = slotOf(g.prog, tc)
+      if sl.cls == AMem:
+        lengError decl, "AVR: the global `" & nifName & "` is an aggregate — " &
+                  "its initial image would have to travel in flash and be " &
+                  "copied into SRAM at startup, which is M6 in " &
+                  "doc/internals/avr.md", lengInfo(decl)
+      if sl.size > 2:
+        lengError decl, "AVR: the global `" & nifName & "` is " & $sl.size &
+                  " bytes; a value here is 16 bits (see M5 in " &
+                  "doc/internals/avr.md)", lengInfo(decl)
+      let asmName = g.prog.gvarAsmName(nifName)
+      if c.hasMore and c.kind != DotToken:
+        g.emitValue(c, ValueBridge)
+      else:
+        # No initializer is not "no store": SRAM is not zeroed for us.
+        g.emLdi16(ValueBridge, 0)
+      g.emGlobalAddr(StagingBridge, asmName)
+      g.emStorePtr(StagingBridge, 0, ValueBridge, sl.size)
+      while c.hasMore: skip c
+
 proc genVarDecl(g: var CodeGen; c: Cursor) =
   var v = c
   inc v                                   # into `(var …)`, at the name
@@ -849,7 +924,11 @@ proc genAsgn(g: var CodeGen; c: Cursor) =
   var rhs = lhs
   skip rhs
   if g.tryAggrAssign(lhs, rhs): return
-  if lhs.kind == Symbol:
+  if lhs.kind == Symbol and
+     g.plan.locationOfSym(symName(lhs), cursorToPosition(g.buf[], lhs)).kind !=
+       NoLoc:
+    # A LOCAL, kept separate because it needs no address at all. A GLOBAL falls
+    # through to the address path below.
     let name = symName(lhs)
     let pos = cursorToPosition(g.buf[], lhs)
     let dst = g.destOfSym(name, pos)
@@ -962,7 +1041,7 @@ proc genStmt(g: var CodeGen; c: Cursor) =
   of CallS:
     # A discarded call. An aggregate result still has to go SOMEWHERE — the
     # callee writes through the pointer whether anyone reads it or not.
-    if g.exprSlot(c).cls == AMem:
+    if g.isAggrCall(c):
       let tmp = g.mintAggrSlot(g.aggrSize(c))
       g.emitCall(c, ValueBridge, wantResult = false, aggrDst = tmp)
     else:
@@ -1221,6 +1300,8 @@ proc genProcAvr*(g: var CodeGen; info: ProcInfo) =
     if g.rb.boundName(src) == paramName(i + shift):
       g.ab.tree KillAvr: g.ab.sym paramName(i + shift)
       discard g.rb.takeBinding(src)
+
+  if info.isEntry: g.emGlobalInits()
 
   var body = info.decl
   inc body; inc body; skip body; skip body; skip body   # name params rettype pragmas
