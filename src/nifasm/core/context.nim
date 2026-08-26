@@ -29,6 +29,21 @@ from "../thumb/encoder" as thumb2 import nil
 
 const MainModuleName* = ""  # Special name for main module
 
+const
+  WinShadowSpace* = 32
+    ## Win64 makes the CALLER reserve 32 bytes at the bottom of the outgoing argument
+    ## area that the callee may spill its four register arguments into, whether or not
+    ## it has four parameters. So a call's stack arguments start at `[rsp+32]`, not
+    ## `[rsp+0]`, and even a no-stack-argument call occupies 32 bytes of frame.
+    ##
+    ## Reserved for EVERY call in a `win_x64` image, not only the ones that leave it.
+    ## arkham's own procs never touch the area (their convention is SysV-shaped —
+    ## see arkham's `generateX64`), so those 32 bytes are pure frame waste there; but
+    ## a call THROUGH a function pointer cannot be told apart from an internal one at
+    ## this level — `winlean` reaches every one of its `dynlib` imports that way — and
+    ## reserving uniformly is what makes the layout agree on both sides regardless.
+    ## Mirrored in arkham's `machine_x64.WinShadowSpace`.
+
 type
   LoadedModule* = ref object
     ## A loaded module. The MAIN module is parsed whole into `buf` (local symbols

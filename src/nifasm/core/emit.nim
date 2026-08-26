@@ -53,3 +53,41 @@ proc cfiStep*(ctx: var GenContext; cfaDelta: int32;
                                    saves: saves, ssizeSlot: ssizeSlot,
                                    frameImm: frameImm)
   ctx.prologueOp = true
+
+proc shiftCodePositions*(ctx: var GenContext; at, by: int) =
+  ## Rebase every recorded byte position `>= at` by `by` freshly inserted bytes
+  ## (the `casejmp` NOP padding). A label/reloc exactly AT the insert point
+  ## belongs to the code AFTER the padding (the next slot), so `>=` is right —
+  ## which is also why a casejmp branch body must not define a label at its very
+  ## end (see doc/instructions.md).
+  for k in 0 ..< ctx.buf.relocs.len:
+    if ctx.buf.relocs[k].position >= at: ctx.buf.relocs[k].position += by
+  for k in 0 ..< ctx.buf.labels.len:
+    if ctx.buf.labels[k].position >= at: ctx.buf.labels[k].position += by
+  for k in 0 ..< ctx.buf.fixedRanges.len:      # a NESTED casejmp region inside a slot
+    let (s, e) = ctx.buf.fixedRanges[k]
+    ctx.buf.fixedRanges[k] = ((if s >= at: s + by else: s), (if e >= at: e + by else: e))
+  for k in 0 ..< ctx.gvarSites.len:
+    if ctx.gvarSites[k][0] >= at: ctx.gvarSites[k] = (ctx.gvarSites[k][0] + by, ctx.gvarSites[k][1])
+  for k in 0 ..< ctx.ssizePatches.len:
+    if ctx.ssizePatches[k].pos >= at: ctx.ssizePatches[k].pos += by
+  for k in 0 ..< ctx.csizePatches.len:
+    if ctx.csizePatches[k][0] >= at: ctx.csizePatches[k] = (ctx.csizePatches[k][0] + by, ctx.csizePatches[k][1])
+  for k in 0 ..< ctx.tlvSites.len:
+    if ctx.tlvSites[k][0] >= at: ctx.tlvSites[k] = (ctx.tlvSites[k][0] + by, ctx.tlvSites[k][1])
+  # An EXTERNAL call's `bl` is not a reloc — its position is recorded per extproc and
+  # patched at image layout — so it needs rebasing here too. Missing it left the `bl`
+  # unpatched (a branch to itself) and wrote the IAT displacement over whatever had
+  # moved into the stale slot, which for a pruned frame `add` was the epilogue's
+  # `add sp, sp, #frame`.
+  for e in 0 ..< ctx.extProcs.len:
+    for k in 0 ..< ctx.extProcs[e].callSites.len:
+      if ctx.extProcs[e].callSites[k] >= at: ctx.extProcs[e].callSites[k] += by
+  for k in 0 ..< ctx.listRows.len:      # `--listing` byte ranges
+    if ctx.listRows[k].start >= at: ctx.listRows[k].start += by
+    if ctx.listRows[k].stop >= at: ctx.listRows[k].stop += by
+  for k in 0 ..< ctx.unwind.len:        # `.symtab` / `.eh_frame` proc + CFI positions
+    if ctx.unwind[k].start >= at: ctx.unwind[k].start += by
+    if ctx.unwind[k].stop >= at: ctx.unwind[k].stop += by
+    for s in 0 ..< ctx.unwind[k].steps.len:
+      if ctx.unwind[k].steps[s].at >= at: ctx.unwind[k].steps[s].at += by
