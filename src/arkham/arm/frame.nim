@@ -16,18 +16,14 @@
 ## which registers are callee-saved and how wide a word is, and both are facts
 ## in `g.md`.
 
-import std / [assertions, tables, sets, strformat, strutils]
-import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, analyser, planer, programs, asmbuf,
-                    stress, context, diag, asmcommon, typeutil, constdata,
-                    mirrors, select, temps, exprpred, typenav, regbind, abi,
-                    layout, peephole]
+import std / [assertions, tables]
+import nifcore
+import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+                    context, diag, typeutil, 
+                    mirrors, regbind, abi]
 import machine_a64 as machine
 from machine_m as machine_m import nil
-from "../../nifasm/arm64/encoder" as arm64 import isLogicalImm
-from thumbimm import nil
 import emit, mem, aggr, value
-import "../cortexm/runtime"
 
 proc wideParamToHome*(g: var CodeGen; nm: string; firstArg: int)
 

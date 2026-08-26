@@ -17,7 +17,7 @@
 import std / [tables, sets, os, strutils]
 import nifcore, nifmodules
 import "../../../../nimony/src/lib" / symparser
-import sem, context, diagnostics, cursors, decls, tags
+import context, diagnostics, cursors
 
 const
   WindowsKernelDll* = "kernel32.dll"

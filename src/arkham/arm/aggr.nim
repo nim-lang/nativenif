@@ -14,16 +14,13 @@
 ## atomic lowerings: AArch64's LDAXR/STLXR pairs and Cortex-M's LDREX/STREX,
 ## where the barrier is a separate instruction rather than part of the access.
 
-import std / [assertions, tables, sets, strformat, strutils]
+import std / [assertions]
 import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, analyser, planer, programs, asmbuf,
-                    stress, context, diag, asmcommon, typeutil, constdata,
-                    mirrors, select, temps, exprpred, typenav, regbind, abi,
-                    layout, peephole]
+import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+                    context, diag, typeutil, 
+                    mirrors, temps, typenav, regbind]
 import machine_a64 as machine
 from machine_m as machine_m import nil
-from "../../nifasm/arm64/encoder" as arm64 import isLogicalImm
-from thumbimm import nil
 import emit, mem
 
 proc loadAggrTail*(g: var CodeGen; dst, base: Reg; aggrSize, byteOff: int) =

@@ -12,12 +12,12 @@
 ## intrinsic row an instruction is — all decided here. The transliteration into
 ## actual instructions is per-target and lives beside each selector.
 
-import std / [tables, sets, assertions, algorithm, strutils, os]
-import symparser
+import std / [tables, sets, strutils]
+
 import nifcore, nifcdecl
-import asmslots, machinedesc, analyser, planer, programs, abi
+import machinedesc, programs
 import "../arm/machine_m"
-import layout, asmbuf, typenav, regbind, context
+import context
 import diag
 
 

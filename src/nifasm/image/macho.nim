@@ -490,7 +490,6 @@ proc writeMachO*(code: Bytes; bssSize: int;
   let textSegmentFileSize = (codeFileOffset + codeSize + pageSize - 1) and not (pageSize - 1)
 
 
-
   # `--symmap`: the executable carries no symbol table, so dump each generated
   # proc's virtual address for a disassembler to name frames by. Only here is the
   # __text vaddr known (it depends on the load-command space reserved above).

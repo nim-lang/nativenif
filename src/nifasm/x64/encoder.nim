@@ -1,7 +1,6 @@
 # Nifasm - x86_64 Binary Assembler
 # A dependency-free x86_64 assembler that emits binary instruction bytes
 
-import std/tables
 
 import ../core/[buffers, relocs]
 

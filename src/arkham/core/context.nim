@@ -21,12 +21,12 @@
 ## that identical part is what a divergence would hide in.
 
 import std / [tables, sets]
-import nifcore, nifcdecl
-import asmslots, machinedesc, analyser, planer, programs, abi
+import nifcore
+import asmslots, machinedesc, planer, programs
 import "../arm/machine_m"                # the Cortex-M machine model
 import layout                            # Layout: the `--layout:` board file
 import asmbuf
-import typenav
+
 import regbind
 import "../../nifasm/core/model"         # X64Inst: the fused-compare tag
 

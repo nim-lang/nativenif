@@ -14,13 +14,11 @@
 ## listing rows and the gvar/adrp patch sites are carried through. That is why
 ## the trace table is filled at the end rather than where it was reserved.
 
-import std / [streams, os, tables, sets, algorithm, strutils]
+import std / [streams, os, tables, algorithm, strutils]
 import nifcore
-import "../core" / [context, sem, relocs, buffers, diagnostics, modules, stackslots, listing]
-import "../x64/encoder" as x86
+import "../core" / [context, sem, relocs, buffers, listing]
 import "../x64/relax"                 # the rel32 -> rel8 shrink and the 16-byte pad
-import "../arm64/encoder" as arm64
-import elf, dwarf, tracetable, writecommon
+import elf, dwarf, writecommon
 
 proc writeElf*(a: var GenContext; outfile: string) =
   # Shorten x86 rel32 jumps to rel8 where they fit (static-ELF x64 only: no IAT

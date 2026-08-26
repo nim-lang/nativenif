@@ -20,7 +20,7 @@
 ## a template each selector expands its own copy instead of routing the
 ## recursion through a shared dispatcher.
 
-import std / [os, strutils, algorithm]
+import std / [strutils, algorithm]
 import nifcore, nifcoreparse
 import context
 

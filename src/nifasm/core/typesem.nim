@@ -20,7 +20,7 @@ import std / [tables, sets]
 import nifcore, nifmodules
 import "../../../../nimony/src/lib" / foreignmodules   # `hasDecl` on a lazily-opened module
 import "../../../../nimony/src/lib" / symparser
-import sem, context, diagnostics, cursors, typecheck, modules
+import sem, context, diagnostics, cursors, modules
 import tags, model, tagconv, tagpool, decls, stackslots
 import "../x64/regs" as x64regs
 import "../arm64/regs" as a64regs

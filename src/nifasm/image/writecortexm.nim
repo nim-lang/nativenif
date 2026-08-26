@@ -13,12 +13,11 @@
 ## the image is laid out, which is why arkham ASKS for them (`(mimg …)`) instead
 ## of computing them. They are patched into fixed-width MOVW/MOVT pairs here.
 
-import std / [streams, os, tables, sets, algorithm, strutils]
-import nifcore
-import "../core" / [context, sem, relocs, buffers, diagnostics, modules, stackslots, listing]
-import "../thumb/encoder" as thumb2
+import std / [tables, strutils]
+
+import "../core" / [context, sem, relocs, buffers]
 import "../thumb/board"
-import elf32, dwarf, tracetable, writecommon
+import elf32
 
 proc interruptTableBytes*(a: GenContext): int =
   ## The table's size, which is what every other layout number here is measured

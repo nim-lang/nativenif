@@ -13,13 +13,12 @@
 ## rescue that reads the last of them: what has to be spilled around a call, and
 ## where each spilled value goes.
 
-import std / [tables, sets, assertions, algorithm, strutils, os]
-import symparser
+import std / [tables, assertions, algorithm]
+
 import nifcore, nifcdecl
 import asmslots, machinedesc, analyser, planer, programs, abi
 import "../arm/machine_m"
-import layout, asmbuf, typenav, regbind, context
-import diag, asmcommon, typeutil, constdata, mirrors, select, temps
+import regbind, context
 
 
 # ── fused value core: syntactic operand predicates (shared by both backends) ─

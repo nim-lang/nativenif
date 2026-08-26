@@ -13,12 +13,10 @@
 ## different: arkham is the ONLY checker of that source-level subset, so its
 ## rejections are ordinary user errors and have to read like one.
 
-import std / [tables, sets, assertions, algorithm, strutils, os]
+
 import symparser
-import nifcore, nifcdecl
-import asmslots, machinedesc, analyser, planer, programs, abi
-import "../arm/machine_m"
-import layout, asmbuf, typenav, regbind, context
+import nifcore
+
 
 
 # ── user-facing diagnostics ─────────────────────────────────────────────────

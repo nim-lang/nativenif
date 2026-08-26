@@ -18,17 +18,14 @@
 ##
 ## All three are emitted only for the target that needs them.
 
-import std / [assertions, tables, sets, strformat, strutils]
-import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, analyser, planer, programs, asmbuf,
-                    stress, context, diag, asmcommon, typeutil, constdata,
-                    mirrors, select, temps, exprpred, typenav, regbind, abi,
-                    layout, peephole]
+import std / [assertions]
+import nifcore
+import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+                    context, typeutil, 
+                    mirrors, abi]
 import "../arm/machine_a64" as machine
 from "../arm/machine_m" as machine_m import nil
-from "../../nifasm/arm64/encoder" as arm64 import isLogicalImm
-from thumbimm import nil
-import "../arm" / [emit, mem, aggr, value]
+import "../arm" / [emit, value]
 
 proc emEnableFpuM*(g: var CodeGen) =
   ## Turn the FPU on, first thing in the entry proc.

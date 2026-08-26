@@ -15,14 +15,13 @@
 import std / [tables, sets]
 import nifcore
 import "../core" / [context, sem, cursors, diagnostics, typecheck, typesem,
-                    modules, listing, tags, model, tagconv, decls, tagpool,
+                    listing, tags, model, tagconv, decls, 
                     stackslots, relocs, buffers]
 import encoder as thumb2
 import regs, operands
 
 proc genStmtM*(n: var Cursor; ctx: var GenContext)
 proc genInstM*(n: var Cursor; ctx: var GenContext)
-
 
 
 proc genIteM*(n: var Cursor; ctx: var GenContext) =

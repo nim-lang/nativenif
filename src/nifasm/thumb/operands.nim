@@ -22,7 +22,7 @@
 import std / [tables, sets]
 import nifcore
 import "../core" / [context, sem, cursors, diagnostics, typecheck, typesem,
-                    modules, tags, model, tagconv, decls, tagpool, stackslots, relocs, buffers]
+                    tags, model, decls, stackslots, relocs, buffers]
 import encoder as thumb2
 import regs
 

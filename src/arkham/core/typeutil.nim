@@ -15,13 +15,13 @@
 ## whether a sub-word value still needs its extend — the difference between
 ## correct narrow arithmetic and a silent 32-bit answer.
 
-import std / [tables, sets, assertions, algorithm, strutils, os]
-import symparser
+import std / [assertions, strutils]
+
 import nifcore, nifcdecl
-import asmslots, machinedesc, analyser, planer, programs, abi
+import asmslots, machinedesc, planer, programs
 import "../arm/machine_m"
-import layout, asmbuf, typenav, regbind, context
-import diag, asmcommon
+import asmbuf, typenav, context
+import diag
 
 
 # ── type predicates ─────────────────────────────────────────────────────────

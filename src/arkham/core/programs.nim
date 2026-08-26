@@ -18,10 +18,10 @@
 ## named type defined in any module classifies correctly (e.g. a cross-module
 ## `enum` parameter is a scalar in a register, not a stack aggregate).
 
-import std / [tables, assertions, sets, strutils]
+import std / [tables, assertions, sets]
 import nifcore, nifcdecl, nifcoreparse
 import asmslots, nifmodules
-import "../../../../nimony/src/lib" / [symparser, nifreader, stringviews, intrinsics]
+import "../../../../nimony/src/lib" / [symparser, nifreader, intrinsics]
 export intrinsics
 
 type

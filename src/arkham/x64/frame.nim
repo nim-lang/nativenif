@@ -14,13 +14,11 @@
 ## once the body has been assembled — which is why the prologue emits a
 ## placeholder and the epilogue emits the matching one.
 
-import std / [assertions, tables, sets, os, algorithm, strutils]
-import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, analyser, planer, programs, asmbuf,
-                    stress, context, diag, asmcommon, typeutil, constdata,
-                    mirrors, select, temps, exprpred, typenav, regbind, abi,
-                    layout, peephole]
-import "../../nifasm/image/tracetable"
+import std / [assertions, tables, sets]
+import nifcore
+import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+                    context, typeutil, 
+                    mirrors, regbind, abi]
 import machine as machine_x64
 import emit, mem, aggr, value
 

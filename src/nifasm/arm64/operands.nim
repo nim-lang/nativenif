@@ -17,8 +17,8 @@
 import std / [tables, sets]
 import nifcore
 import "../core" / [context, sem, cursors, diagnostics, typecheck, typesem,
-                    modules, emit, tags, model, tagconv, decls, tagpool,
-                    stackslots, relocs, buffers]
+                    tags, model, decls, 
+                    stackslots, relocs]
 import encoder as arm64
 import regs
 

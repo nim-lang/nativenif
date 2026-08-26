@@ -49,18 +49,14 @@
 ## value in it is destroyed. That is a corruption with no local symptom, which is
 ## why it is a rejection naming the register rather than a rule left implicit.
 
-import std / [assertions, tables, sets, strformat, strutils]
+import std / [tables, sets]
 import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, analyser, planer, programs, asmbuf,
-                    stress, context, diag, asmcommon, typeutil, constdata,
-                    mirrors, select, temps, exprpred, typenav, regbind, abi,
-                    layout, peephole]
+import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+                    context, diag, asmcommon, 
+                    mirrors, regbind, abi]
 import machine_a64 as machine
 from machine_m as machine_m import nil
-from "../../nifasm/arm64/encoder" as arm64 import isLogicalImm
-from thumbimm import nil
-import emit, mem, aggr, value, frame, stmt
-import "../cortexm/runtime"
+import emit, value, frame
 
 proc armFrameSaved*(g: CodeGen): set[Reg] =
   ## The callee-saved registers this back end's prologue actually saves — the

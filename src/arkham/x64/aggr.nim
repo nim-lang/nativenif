@@ -13,13 +13,11 @@
 ## inline `mem*` intrinsics — arkham emits its own loops rather than calling
 ## libc, because there is no libc — and the lock-prefixed atomic sequences.
 
-import std / [assertions, tables, sets, os, algorithm, strutils]
-import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, analyser, planer, programs, asmbuf,
-                    stress, context, diag, asmcommon, typeutil, constdata,
-                    mirrors, select, temps, exprpred, typenav, regbind, abi,
-                    layout, peephole]
-import "../../nifasm/image/tracetable"
+import std / [assertions, sets]
+import nifcore
+import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+                    context, diag, typeutil, 
+                    mirrors, regbind]
 import machine as machine_x64
 import emit, mem
 

@@ -1,7 +1,6 @@
 # Nifasm - ARM64 Binary Assembler
 # A dependency-free ARM64 assembler that emits binary instruction bytes
 
-import std/[strutils, tables]
 
 import ../core/[buffers, relocs]
 

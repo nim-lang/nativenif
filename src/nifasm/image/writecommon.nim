@@ -12,7 +12,7 @@
 ## and each writer runs its own layout passes, so each fills the table itself.
 ## `appendTraceTable` reserves the space; `fillTraceTable` writes the bytes.
 
-import "../core" / [context, sem, relocs, buffers]
+import "../core" / [context, relocs, buffers]
 import dwarf, tracetable
 
 proc dwarfArchOf*(arch: Arch): DwarfArch {.inline.} =

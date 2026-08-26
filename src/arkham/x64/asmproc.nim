@@ -13,15 +13,13 @@
 ## local is pinned where its pragma says, no temp pool is consulted, and an
 ## instruction arkham does not recognise is a refusal rather than a lowering.
 
-import std / [assertions, tables, sets, os, algorithm, strutils]
+import std / [tables, sets]
 import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, analyser, planer, programs, asmbuf,
-                    stress, context, diag, asmcommon, typeutil, constdata,
-                    mirrors, select, temps, exprpred, typenav, regbind, abi,
-                    layout, peephole]
-import "../../nifasm/image/tracetable"
+import "../core" / [machinedesc, planer, programs, asmbuf,
+                    context, diag, asmcommon, 
+                    mirrors, regbind]
 import machine as machine_x64
-import emit, mem, aggr, value, frame, stmt
+import emit, mem, value, frame
 
 type
   AsmDeclLoc* = object

@@ -14,13 +14,12 @@
 ## the mirror map and the plan at once — hence `tempCensus`, which exists to
 ## make a pool-dry failure say WHY rather than just that.
 
-import std / [tables, sets, assertions, algorithm, strutils, os]
-import symparser
-import nifcore, nifcdecl
-import asmslots, machinedesc, analyser, planer, programs, abi
+import std / [strutils, os]
+
+
+import machinedesc, planer
 import "../arm/machine_m"
-import layout, asmbuf, typenav, regbind, context
-import diag, asmcommon, typeutil, constdata, mirrors, select
+import regbind, context
 
 
 # ── emit-time temp allocation (step-3 merged value core) ─────────────────────

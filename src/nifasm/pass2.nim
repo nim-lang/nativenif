@@ -19,8 +19,8 @@
 
 import std / [tables, sets, algorithm]
 import nifcore
-import core / [context, sem, cursors, diagnostics, typesem, modules, listing,
-               emit, tags, model, tagconv, decls, tagpool, stackslots, relocs,
+import core / [context, sem, cursors, diagnostics, typesem, 
+               emit, tags, model, tagconv, decls, stackslots, relocs,
                buffers]
 import image/dwarf                    # ProcUnwind: the per-proc CFI record
 import x64/encoder as x86

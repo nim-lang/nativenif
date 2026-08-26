@@ -18,7 +18,7 @@
 ## stored as two little-endian HALFWORDS, high halfword first — NOT as one
 ## little-endian 32-bit word. `0xF7FF 0xFFFE` is written `FF F7 FE FF`.
 
-import std/[strutils]
+
 import ../core/[buffers, relocs]
 import thumbimm
 export thumbimm.encodeModifiedImm, thumbimm.isModifiedImm

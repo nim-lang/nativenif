@@ -13,11 +13,10 @@
 ## ELF: a tvar goes through a TLV descriptor dyld resolves, and a pointer inside
 ## a writable const is a rebase opcode rather than a baked address.
 
-import std / [streams, os, tables, sets, algorithm, strutils]
+import std / [tables, sets, algorithm]
 import nifcore
-import "../core" / [context, sem, relocs, buffers, diagnostics, modules, stackslots, listing]
-import "../arm64/encoder" as arm64
-import macho, dwarf, tracetable, writecommon
+import "../core" / [context, sem, relocs, listing]
+import macho, writecommon
 
 proc writeMachO*(a: var GenContext; outfile: string) =
   fillTraceTable(a)

@@ -22,7 +22,7 @@
 ## The file is in nifasm's tag vocabulary (`doc/instructions.md`), which is what
 ## makes that forwarding a splice rather than a translation.
 
-import std / [strutils]
+
 import nifcore, nifcoreparse
 import "../../nifasm/core" / [model, tagconv, tagpool, tags]
 

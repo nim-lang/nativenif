@@ -1,7 +1,7 @@
 # Nifasm - Relocation System
 # A system for tracking and managing relocations in the instruction stream
 
-import std/[tables, algorithm, sets, sequtils]
+import std/[tables, sets]
 import buffers
 
 type

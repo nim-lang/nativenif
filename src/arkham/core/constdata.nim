@@ -13,13 +13,12 @@
 ## inside a blob names a symbol whose address is a layout fact, so it is emitted
 ## as a relocation for nifasm to bake in.
 
-import std / [tables, sets, assertions, algorithm, strutils, os]
-import symparser
+import std / [assertions]
+
 import nifcore, nifcdecl
-import asmslots, machinedesc, analyser, planer, programs, abi
-import "../arm/machine_m"
-import layout, asmbuf, typenav, regbind, context
-import diag, asmcommon, typeutil
+import asmslots, programs
+import asmbuf, context
+import diag
 
 
 # ── static constant data layout (shared) ───────────────────────────────────

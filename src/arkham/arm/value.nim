@@ -32,10 +32,10 @@
 
 import std / [assertions, tables, sets, strformat, strutils]
 import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, analyser, planer, programs, asmbuf,
-                    stress, context, diag, asmcommon, typeutil, constdata,
-                    mirrors, select, temps, exprpred, typenav, regbind, abi,
-                    layout, peephole]
+import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+                    context, diag, typeutil, constdata,
+                    mirrors, temps, exprpred, typenav, regbind, abi,
+                    layout]
 import machine_a64 as machine
 from machine_m as machine_m import nil
   # Fully qualified: `machine_m` names its own `LR`/`IP`/`IntCalleeSaved` for the
@@ -46,15 +46,10 @@ export typenav   # SymCat / SymInfo / getType / exprSlot; re-exported so the
                  # backends' `g.lookupSym(...).cat` keeps resolving
 export regbind   # the emitter's register-binding state (`g.rb`) — the single
                  # owner of reg<->name bindings, see regbind.nim
-from "../../nifasm/arm64/encoder" as arm64 import isLogicalImm
                                  # nifasm: the bitmask-immediate predicate, so
                                  # arkham folds exactly the constants it can encode
 import emit, mem, aggr
-from thumbimm import nil         # the Thumb-2 twin of the above, shared with
                                  # `nifasm/thumb2` so the two cannot drift apart
-
-
-
 
 
 # When the backend targets Linux (`g.a64Linux`), an `importc`'d libc function

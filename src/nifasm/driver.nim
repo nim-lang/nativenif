@@ -19,15 +19,14 @@
 ## Windows. They are nifasm's own code rather than any module's, which is why
 ## they are built after every real proc has been emitted.
 
-import std / [tables, sets, os, strutils]
+import std / [tables, sets, os]
 import nifcore, nifcoreparse, nifmodules
-import "../../../nimony/src/lib" / [symparser, nifreader]
-import core / [context, sem, cursors, diagnostics, typesem, modules, listing,
+import "../../../nimony/src/lib" / [nifreader]
+import core / [context, sem, cursors, typesem, modules, 
                tags, model, tagconv, decls, tagpool, stackslots, relocs,
                buffers]
 import x64/encoder as x86
 import arm64/encoder as arm64
-from thumb/encoder as thumb2 import nil
 from image/elf32 as elf32 import nil
 import image / [dwarf, tracetable]
 import image / [writecommon, writeelf, writemacho, writepe, writecortexm]

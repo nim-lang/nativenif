@@ -21,13 +21,11 @@
 ## or invert one), because they are pure lookup and everything branch-shaped
 ## needs them.
 
-import std / [assertions, tables, sets, os, algorithm, strutils]
+import std / [assertions, tables, sets]
 import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, analyser, planer, programs, asmbuf,
-                    stress, context, diag, asmcommon, typeutil, constdata,
-                    mirrors, select, temps, exprpred, typenav, regbind, abi,
-                    layout, peephole]
-import "../../nifasm/image/tracetable"
+import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+                    stress, context, typeutil, 
+                    mirrors, temps, exprpred, regbind, abi]
 import machine as machine_x64
 
 const FloatRet* = F0    # xmm0: SysV scalar-float return + first float argument
@@ -88,7 +86,6 @@ template AddrSlot*(): AsmSlot = addrSlot()
   ## whole eightbyte copied verbatim). A well-typed `(u 64)` — NOT an untyped escape:
   ## nifasm still tracks the register and rejects a raw reuse; the cast supplies the
   ## element type at the point of the actual load/store.
-
 
 
 proc slotEnd*(name: string): AggrEnd {.inline.} = AggrEnd(slot: name, reg: NoReg)

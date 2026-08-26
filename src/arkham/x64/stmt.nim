@@ -18,13 +18,11 @@
 ## that are only ever branched on, so the compare's answer can travel in the
 ## flags and the `setcc` that would materialise them never happens.
 
-import std / [assertions, tables, sets, os, algorithm, strutils]
+import std / [assertions, tables, sets, algorithm]
 import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, analyser, planer, programs, asmbuf,
-                    stress, context, diag, asmcommon, typeutil, constdata,
-                    mirrors, select, temps, exprpred, typenav, regbind, abi,
-                    layout, peephole]
-import "../../nifasm/image/tracetable"
+import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+                    context, typeutil, constdata,
+                    mirrors, select, exprpred]
 import machine as machine_x64
 import emit, mem, aggr, value, frame
 

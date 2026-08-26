@@ -15,17 +15,15 @@
 ## have had to reimplement the register-binding protocol, which is the part with
 ## a formal model behind it (`proofs/arkham_bindings.tla`).
 
-import std / [assertions, tables, sets, strformat, strutils]
+import std / [assertions, tables, sets]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, analyser, planer, programs, asmbuf,
-                    stress, context, diag, asmcommon, typeutil, constdata,
-                    mirrors, select, temps, exprpred, typenav, regbind, abi,
-                    layout, peephole]
+                    context, diag, typeutil, constdata,
+                    regbind, 
+                    layout]
 import "../arm/machine_a64" as machine
 from "../arm/machine_m" as machine_m import nil
-from "../../nifasm/arm64/encoder" as arm64 import isLogicalImm
-from thumbimm import nil
-import emit, mem, aggr, value, frame, stmt, asmproc
+import emit, value, frame, stmt, asmproc
 import "../cortexm/runtime"
 
 proc genProc2*(g: var CodeGen; info: ProcInfo) =

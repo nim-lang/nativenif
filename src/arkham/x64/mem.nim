@@ -15,12 +15,11 @@
 ## materialises on the way has to be released again in the same order
 ## (`unbindLvalTemps2`), or the pool leaks across statements.
 
-import std / [assertions, tables, sets, os, algorithm, strutils]
+import std / [assertions, tables, sets]
 import nifcore, nifcdecl
-import "../core" / [asmslots, machinedesc, analyser, planer, programs, asmbuf,
-                    stress, context, diag, asmcommon, typeutil, constdata,
-                    mirrors, select, temps, exprpred, typenav, regbind, abi,
-                    layout, peephole]
+import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+                    context, diag, typeutil, 
+                    mirrors, exprpred, typenav, regbind]
 import "../../nifasm/image/tracetable"
 import machine as machine_x64
 import emit

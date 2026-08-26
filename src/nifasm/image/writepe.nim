@@ -11,11 +11,10 @@
 ## ELF: nothing generated keeps a frame pointer, and on Windows it is the OS
 ## itself — not just a debugger — that walks frames with them.
 
-import std / [streams, os, tables, sets, algorithm, strutils]
-import nifcore
-import "../core" / [context, sem, relocs, buffers, diagnostics, modules, stackslots, listing]
-import "../x64/encoder" as x86
-import pe, dwarf, tracetable, writecommon
+import std / [tables]
+
+import "../core" / [context, sem, relocs, buffers]
+import pe, writecommon
 
 proc writeExe*(a: var GenContext; outfile: string) =
   fillTraceTable(a)

@@ -14,13 +14,12 @@
 ## the memory is written by something else, a call clobbers it, or the name goes
 ## out of scope. Getting the invalidation right is the whole content here.
 
-import std / [tables, sets, assertions, algorithm, strutils, os]
-import symparser
-import nifcore, nifcdecl
-import asmslots, machinedesc, analyser, planer, programs, abi
+import std / [tables, sets, os]
+
+import nifcore
+import asmslots, machinedesc, planer
 import "../arm/machine_m"
-import layout, asmbuf, typenav, regbind, context
-import diag, asmcommon, typeutil, constdata
+import asmbuf, regbind, context
 
 
 # ── store forwarding: the target-neutral half of the mirror map ─────────────

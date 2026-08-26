@@ -15,11 +15,10 @@
 ## exist before it can check a call to a proc declared further down, and the
 ## dead-code walk needs every name before it can decide which ones owe a body.
 
-import std / [tables]
+
 import nifcore
 import core / [context, sem, cursors, diagnostics, typesem, modules,
-               tags, model, tagconv, decls, tagpool, stackslots]
-import thumb/board                    # `(layout …)` / `(interrupts …)`
+               tags, model, tagconv, decls]
 
 proc pass1Proc*(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string; declStart: int) =
   # (proc :Name (params ...) (result ...) (clobber ...) (body ...))

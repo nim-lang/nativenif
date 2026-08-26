@@ -12,13 +12,12 @@
 ## `cmov` on x86-64 — and the RECOGNITION is identical, so it lives here and
 ## each backend only supplies its own tag.
 
-import std / [tables, sets, assertions, algorithm, strutils, os]
-import symparser
+
 import nifcore, nifcdecl
-import asmslots, machinedesc, analyser, planer, programs, abi
+import asmslots, machinedesc, planer
 import "../arm/machine_m"
-import layout, asmbuf, typenav, regbind, context
-import diag, asmcommon, typeutil, constdata, mirrors
+import context
+import typeutil
 
 
 # ── select-diamond recognition (shared by a64 `csel` & x64 `cmov`) ────────────

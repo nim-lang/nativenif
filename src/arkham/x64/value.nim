@@ -17,11 +17,11 @@
 ## `exit`s. Floats, aggregates, memory lvalues, parameters, `if`/`case`, div/mod
 ## and shifts `raiseAssert` for now.
 
-import std / [assertions, tables, sets, os, algorithm, strutils]
+import std / [assertions, tables, sets, os, strutils]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, analyser, planer, programs, asmbuf,
-                    stress, context, diag, asmcommon, typeutil, constdata,
-                    mirrors, select, temps, exprpred, abi, layout, peephole]
+                    stress, context, diag, typeutil, constdata,
+                    mirrors, temps, exprpred, abi]
 import "../core/typenav"
 export typenav   # SymCat / SymInfo / getType / exprSlot; re-exported so the
                  # backends' `g.lookupSym(...).cat` keeps resolving
@@ -30,7 +30,6 @@ export regbind   # the emitter's register-binding state (`g.rb`) — the single
                  # owner of reg<->name bindings, see regbind.nim
 import machine as machine_x64
 import emit, mem, aggr
-import "../../nifasm/image/tracetable"   # the trace table's wire format
 
 let x64MachineA* = stressed(x64Machine)
   ## The machine arkham allocates against: `x64Machine` itself, unless the

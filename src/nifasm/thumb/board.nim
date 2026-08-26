@@ -15,7 +15,7 @@
 ## writer bakes in with the Thumb bit set.
 
 import nifcore
-import "../core" / [context, sem, cursors, diagnostics, tags, model, tagconv, decls, modules, typesem]
+import "../core" / [context, cursors, diagnostics, model, tagconv, decls, modules, typesem]
 
 const
   CoreInterruptWords* = 16
