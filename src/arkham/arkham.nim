@@ -8,19 +8,19 @@
 ## arkham translates a single Leng `.c.nif` file into typed `nifasm` NIF for the
 ## selected target (`--os`/`--cpu`: linux/amd64, windows/amd64, linux/arm64,
 ## macosx/arm64, embedded/arm32), which `nifasm` then type-checks, assembles and
-## links. The backends are `codegen_x64` and `codegen_arm` over the shared
-## `codegen_common`; `codegen_arm` serves BOTH Arm targets — AArch64 and the
-## bare-metal Cortex-M — from one emitter over three machine models.
+## links. The backends are `x64/` and `arm/` over the shared
+## `core/`; `arm/` serves BOTH Arm targets — AArch64 and the bare-metal
+## Cortex-M — from one emitter over three machine models.
 
 import std / [parseopt, syncio, strutils]
 import nifcoreparse              # parseFromFile + nifcore
-import lengdecl                  # createLengTagPool
-import machine_m                  # the Cortex-M machine model
-import layout                    # the --layout: board file
-import codegen_common            # (arkhamTempDbg: dumpTempStats)
-import codegen_arm               # BOTH Arm targets: AArch64 (Darwin/Linux) and
+import core/lengdecl             # createLengTagPool
+import core/layout               # the --layout: board file
+import core/temps                # `dumpTempStats`, under -d:arkhamTempDbg only —
+                                # which is why it reads as an unused import
+import arm/driver                # BOTH Arm targets: AArch64 (Darwin/Linux) and
                                 # Cortex-M. One emitter, three machine models.
-import codegen_x64               # x86-64 / Linux backend
+import x64/driver                # x86-64 / Linux backend
 
 const
   Version = "0.1.0"

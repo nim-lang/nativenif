@@ -3,3 +3,8 @@ nimblecache/
 htmldocs/
 *.exe
 nimcache_m/
+# `nim c src/arkham/arkham.nim` without -o drops its binary beside the source;
+# two of them reached a commit before this line existed.
+src/arkham/arkham
+src/nifasm/nifasm
+bin/

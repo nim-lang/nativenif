@@ -6,8 +6,8 @@ from "../../nimony/src/lib/intrinsics" import nil
 # The AArch64 encoders, for the byte-level checks below. Importing the module is
 # what lets a test assert an ENCODING rather than a program's output — the only
 # way to check a sequence whose whole point is that running it changes nothing.
-import "../src/nifasm/arm64"
-import "../src/nifasm/buffers"
+import "../src/nifasm/arm64/encoder"
+import "../src/nifasm/core/buffers"
 
 const
   runTimeoutMs = 30_000

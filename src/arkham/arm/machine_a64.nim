@@ -1,0 +1,204 @@
+#
+#           Arkham — AArch64 / AAPCS64 backend machine model
+#        (c) Copyright 2026 Andreas Rumpf
+#
+#    See the file "license.txt", included in this distribution.
+#
+
+## AArch64 / AAPCS64 backend machine model (Darwin and Linux): the register classes, the
+## `regName` shim that renders the abstract register slots to AArch64 spellings,
+## and the `aarch64Machine` description handed to the (arch-neutral) register
+## allocator. The slot enums and `MachineDesc`/`Location` types live in
+## `machinedesc` and are re-exported, so downstream modules keep importing
+## `machine`.
+
+import ../core/[machinedesc]
+export machinedesc
+
+const
+  FP* = R29   ## frame pointer
+  LR* = R30   ## link register
+
+  # ── AAPCS64 / Darwin register classes ──────────────────────────────────
+  IntArgRegs*   = [R0, R1, R2, R3, R4, R5, R6, R7]   ## int args + return (x0)
+  FloatArgRegs* = [F0, F1, F2, F3, F4, F5, F6, F7]   ## fp args + return (v0)
+  IntRet*   = R0
+  FloatRet* = F0
+  IndirectResultReg* = R8
+
+  ## Volatile (caller-saved) scratch usable for temporaries that do not
+  ## need to survive a call. (x0–x7 are also volatile but reserved here for
+  ## arg/return shuffling; x16/x17/x18 are reserved by the platform.)
+  IntTempRegs* = [R9, R10, R11, R12, R13, R14, R15]
+  ## The pure-emit value core reserves the two integer bridges out of the pool.
+  IntTempRegsN* = [R9, R10, R11, R12, R13]
+  ## Callee-saved: for values that must survive a call.
+  IntCalleeSaved* = [R19, R20, R21, R22, R23, R24, R25, R26, R27, R28]
+  ## Caller-saved set clobbered across any call (incl. an extcall).
+  IntCallerSaved* = {R0..R17}
+
+  ## Emitter "staging bridge" registers — reserved OUT of the allocator's temp
+  ## pools (the pure-emit value core's analogue of x86-64's r11/xmm15). They are
+  ## never assigned to a value position, so the emitter can always draw a free
+  ## transient for: a folded memory operand a64's 3-operand ALU must first load,
+  ## a global/tvar address temp, and a produce-into-memory spill. Two integer
+  ## bridges are needed because a `cmp` whose BOTH operands spilled to the stack
+  ## must load each into a register (a64 has no memory-operand compare).
+  IntBridgeRegs* = [R14, R15]
+  FloatBridgeReg* = F31
+
+  ## The three GPRs an atomic's LL/SC sequence takes for itself: the loaded value,
+  ## the computed value, and the store-exclusive status. None of them can ever hold
+  ## a live value — x14/x15 are the staging bridges just above, withheld from the
+  ## allocator's pools, and x16 (IP0) is in `ReservedRegs`, which arkham never
+  ## allocates. That is what makes an atomic cheap now that it is an INSTRUCTION
+  ## rather than a call: its clobber set cannot overlap anything the allocator
+  ## owns, so no analysis has to prove that it doesn't. It also removes every
+  ## aliasing question — the sequence reads the caller's cell/value registers and
+  ## writes only its own, so the destination may coincide with either.
+  ##
+  ## x16's other use is nifasm's: an indirect-call veneer (`blr x16`) and the macOS
+  ## TLV thunk. Neither can occur inside one of these sequences — they contain no
+  ## call and address no global.
+  AtomicScratchRegs* = [R14, R15, R16]
+
+  ## Caller-saved SIMD/FP scratch: v16–v31 are fully caller-saved (and v0–v7
+  ## are argument/return registers, also caller-saved). arkham keeps float
+  ## values in these; a float that must survive a call (v8–v15 callee-saved)
+  ## is not yet supported.
+  FloatTempRegs* = [F16, F17, F18, F19, F20, F21, F22, F23,
+                    F24, F25, F26, F27, F28, F29, F30, F31]
+  ## The pure-emit value core reserves v31 out of the pool as the float bridge.
+  FloatTempRegsN* = [F16, F17, F18, F19, F20, F21, F22, F23,
+                     F24, F25, F26, F27, F28, F29, F30]
+  ## Callee-saved (low 64 bits of v8–v15) — reserved for a future FP frame.
+  FloatCalleeSaved* = [F8, F9, F10, F11, F12, F13, F14, F15]
+
+  ## Never allocate: x16/x17 (IP0/IP1 veneers), x18 (Darwin platform reg),
+  ## x8 (indirect result), fp/lr/sp.
+  ReservedRegs* = {R8, R16, R17, R18, R29, R30, SP, NoReg}
+
+  ## The GPRs a call clobbers under the C/AAPCS64 convention — the caller-saved
+  ## volatiles arkham manages (args x0–x7 + temps x9–x15, and x8). Emitted as the
+  ## proc's `(clobber …)` so the ABI is declared at the signature rather than
+  ## re-derived; x16/x17 (assembler veneers) and x18 (platform) are excluded.
+  ConvClobbersGpr* = [R0, R1, R2, R3, R4, R5, R6, R7, R8,
+                      R9, R10, R11, R12, R13, R14, R15]
+
+  ## The AArch64 / AAPCS64 register file and calling convention, as the
+  ## arch-neutral register allocator consumes it.
+  aarch64Machine* = MachineDesc(
+    arch: Arm64,
+    intRetReg: R0,
+    divRemReg: NoReg,                # aarch64 sdiv/msub use ordinary scratch — no fixed reg
+    shiftCountReg: NoReg,            # aarch64 shifts take any register
+    intArgRegs: @IntArgRegs,
+    floatArgRegs: @FloatArgRegs,
+    intTempRegs: @IntTempRegs,
+    stagingBridgeReg: NoReg,
+    intLocalTempRegs: @IntTempRegs,  # AArch64 has 7 volatile int regs — scratch to spare,
+                                     # so a call-free local may be homed in the temp pool
+    intCalleeSaved: @IntCalleeSaved,
+    floatTempRegs: @FloatTempRegs,
+    floatCalleeSaved: @FloatCalleeSaved,
+    intCalleeSavedSet: {R19..R28},
+    floatCalleeSavedSet: {F8..F15},
+    aggrByRefThreshold: 16,
+    linkReg: LR,
+    framePtrReg: FP,
+    indirectResultReg: IndirectResultReg,
+    produceBridge: R16,
+    bridgeRegs: @AtomicScratchRegs,
+    floatBridgeReg: FloatBridgeReg,
+    caps: {CondSelect, TailCall, Float64, RegOffsetMem, PcRelGlobalFold,
+           AcqRelExclusives, TwoAddrForms},
+                                     # NOT AllFlagBranches: nifasm's `genIteA64`
+                                     # implements the zero flag only, so far.
+                                     # NOT SubwordExtend: the hardware has `sxtb`,
+                                     # but nifasm's a64 selector has no tag for it
+                                     # and lowers an extend as a shift pair.
+                                     # NOT Freestanding: both a64 hosts have an OS.
+    frameStyle: PairFrame,
+    immStyle: A64Bitmask,
+    gprRangeText: "`x0`..`x30`",
+    targetName: "AArch64",
+    abiFloatCalleeSaved: @FloatCalleeSaved,
+    abiCalleeSaved: @IntCalleeSaved,
+    intCallerSavedSet: IntCallerSaved,
+    convClobbersGpr: @ConvClobbersGpr)
+
+  ## The machine description for the NEW pure-emit value core (`genProc2`): identical
+  ## to `aarch64Machine` except the two integer bridges (x14/x15) and the float bridge
+  ## (v31) are withheld from the allocator's temp pools, so the emitter can always draw
+  ## a free transient (see `IntBridgeRegs`/`FloatBridgeReg`).
+  aarch64MachineN* = MachineDesc(
+    arch: Arm64,
+    intRetReg: R0,
+    divRemReg: NoReg,
+    shiftCountReg: NoReg,
+    intArgRegs: @IntArgRegs,
+    floatArgRegs: @FloatArgRegs,
+    intTempRegs: @IntTempRegsN,
+    stagingBridgeReg: NoReg,
+    intLocalTempRegs: @IntTempRegsN,
+    intCalleeSaved: @IntCalleeSaved,
+    floatTempRegs: @FloatTempRegsN,
+    floatCalleeSaved: @FloatCalleeSaved,
+    intCalleeSavedSet: {R19..R28},
+    floatCalleeSavedSet: {F8..F15},
+    aggrByRefThreshold: 16,
+    linkReg: LR,
+    framePtrReg: FP,
+    indirectResultReg: IndirectResultReg,
+    produceBridge: R16,
+    bridgeRegs: @AtomicScratchRegs,
+    floatBridgeReg: FloatBridgeReg,
+    caps: {CondSelect, TailCall, Float64, RegOffsetMem, PcRelGlobalFold,
+           AcqRelExclusives, TwoAddrForms},
+                                     # NOT AllFlagBranches: nifasm's `genIteA64`
+                                     # implements the zero flag only, so far.
+                                     # NOT SubwordExtend: the hardware has `sxtb`,
+                                     # but nifasm's a64 selector has no tag for it
+                                     # and lowers an extend as a shift pair.
+                                     # NOT Freestanding: both a64 hosts have an OS.
+    frameStyle: PairFrame,
+    immStyle: A64Bitmask,
+    gprRangeText: "`x0`..`x30`",
+    targetName: "AArch64",
+    abiFloatCalleeSaved: @FloatCalleeSaved,
+    abiCalleeSaved: @IntCalleeSaved,
+    intCallerSavedSet: IntCallerSaved,
+    convClobbersGpr: @ConvClobbersGpr)
+
+proc regName*(r: Reg): string =
+  case r
+  of SP: "sp"
+  of NoReg: "<noreg>"
+  else: "x" & $ord(r)
+
+proc regName*(f: FReg): string =
+  if f == NoFReg: "<nofreg>" else: "v" & $ord(f)
+
+proc `$`*(loc: Location): string =
+  case loc.kind
+  of Undef: "undef"
+  of NoLoc: "noloc"
+  of NeedsReg: "needsreg"
+  of RegOrImm: "regorimm"
+  of InReg: regName(loc.r)
+  of InRegPair:
+    "{" & regName(loc.r0) & (if loc.r1 != NoReg: "," & regName(loc.r1) else: "") & "}"
+  of InFReg: regName(loc.f)
+  of NamedStack: "&" & loc.name
+  of StackPtr: "*" & loc.ptrName
+  of Mem: "[mem]"
+  of Field:
+    (case loc.base.kind
+     of FbReg: "[" & regName(loc.base.reg) & "]"
+     of FbSlot: "&" & loc.base.sym
+     of FbGlob: "@" & loc.base.sym
+     of FbTvar: "%fs:" & loc.base.sym
+     of FbLval: "[lval]") & "." & loc.field
+  of Glob: "@" & loc.name
+  of Tvar: "%fs:" & loc.name
+  of Imm: "#" & $loc.ival

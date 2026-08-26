@@ -6,8 +6,8 @@ Status: **M0, M1, M2a/b complete; M2c in progress.**
 |---|---|
 | M0 target contract | done — `tools/cortexm_probe.nim` |
 | M1 word-size parameterization | done — `slots.setTargetWord` / `sem.setAsmWordSize` |
-| M2a Thumb-2 encoder + relocations | done — `src/nifasm/thumb2.nim`, 45-check self-test |
-| M2b ELF32 firmware writer | done — `src/nifasm/elf32.nim` |
+| M2a Thumb-2 encoder + relocations | done — `src/nifasm/thumb/encoder.nim`, 45-check self-test |
+| M2b ELF32 firmware writer | done — `src/nifasm/image/elf32.nim` |
 | M2c assembler integration | done — selector, frames, calls, marshalling |
 | M3 arkham backend | **working** — 119 Leng fixtures run end to end |
 | M4 64-bit integers | not started |
@@ -16,7 +16,7 @@ Status: **M0, M1, M2a/b complete; M2c in progress.**
 
 ### What M2c has
 
-The instruction selector (`genInstM` in `assembler.nim`) works end to end:
+The instruction selector (`genInstM` in `nifasm/thumb/instr.nim`) works end to end:
 `tests/hello_cortex_m.nif` and `tests/cortex_m_alu.nif` are assembled by nifasm
 into firmware images that run under QEMU and exit with a value they computed.
 
@@ -174,20 +174,20 @@ stdout and stderr are the same stream.
 ## Remaining milestones
 
 * **M1 — word-size parameterization.** The toolchain hardcodes a 64-bit word:
-  `arkham/slots.nim` (`scalarSlot` default, `PtrT`/`AptrT`/`ProctypeT` size 8,
-  `inRegClass`), `arkham/abi.nim` (the eightbyte granule throughout),
-  `nifasm/sem.nim` (`asmSizeOf`/`asmAlignOf` for `PtrT`/`NilT`/`ProcT`),
-  `nifasm/slots.nim` (`max(8, slotAlign)`), `nifasm/assembler.nim`
+  `arkham/core/asmslots.nim` (`scalarSlot` default, `PtrT`/`AptrT`/`ProctypeT` size 8,
+  `inRegClass`), `arkham/core/abi.nim` (the eightbyte granule throughout),
+  `nifasm/core/sem.nim` (`asmSizeOf`/`asmAlignOf` for `PtrT`/`NilT`/`ProcT`),
+  `nifasm/core/stackslots.nim` (`max(8, slotAlign)`), `nifasm/pass2.nim`
   (`normScalarBits` → 64, the `(arg name k)` word stride). Must be provably
   inert for x64 and a64 — byte-identity gate against a saved baseline.
-* **M2 — nifasm: `thumb2.nim` + bare-metal ELF32.** New `RelocKind`s for Thumb
+* **M2 — nifasm: `thumb/encoder.nim` + bare-metal ELF32.** New `RelocKind`s for Thumb
   branches; note Thumb's PC is `insn_addr + 4` and `B.W`/`BL` use the split
   J1/J2 encoding, so `calculateRelocDistance` needs its own arm.
 * **M3 — the arkham backend.** Done for 32-bit scalars, pointers, control flow,
   calls, globals and small aggregates: `tests/arkham_m/` holds 80 Leng fixtures
   that compile, assemble and run under QEMU with the right exit code.
 
-  There is NO `codegen_m.nim`. `codegen_arm.nim` serves both targets, driven by
+  There is NO separate Cortex-M emitter. `arkham/arm/` serves both targets, driven by
   `md`, `slots.setTargetWord` and a `thumbM` flag — the asm-NIF vocabulary is
   shared by design (`add3`, `cmp`, `beq`, `ldr`, `adr` mean the same on both),
   so a third backend needs a register file and a word size, not a second
@@ -228,8 +228,8 @@ stdout and stderr are the same stream.
   firmware image. `tests/arkham_m/` is the corpus with a 32-bit `int`.
 
   **Not** register pairs. A 64-bit value here is EIGHT BYTES AT AN ADDRESS, and
-  the ops read and write it a word at a time (`arkham/codegen_m64.nim`, included
-  by `codegen_arm.nim`). The reason is the register file: four allocatable homes
+  the ops read and write it a word at a time (`arkham/arm/value.nim` for the half
+  inside the value core's cycle, `arm/emit.nim` and `arm/aggr.nim` for the rest). The reason is the register file: four allocatable homes
   and an EMPTY volatile temp pool, because on this ABI the only caller-saved
   registers ARE the argument registers. A pair allocator would compete for two of
   four homes per live value, and every consumer in the shared value core — which
@@ -459,8 +459,7 @@ stdout and stderr are the same stream.
   execution, and this note is here rather than in a comment because no test will
   fail if it breaks.
 
-* **M7 — `{.assembler.}` procs.** DONE. `arkham/codegen_arm_asm.nim` (included by
-  `codegen_arm.nim`) gives both Arm profiles the transliteration mode
+* **M7 — `{.assembler.}` procs.** DONE. `arkham/arm/asmproc.nim` gives both Arm profiles the transliteration mode
   `doc/intrinsics.md` §8 describes and x86-64 already had: no allocator, no value
   core, every location DECLARED, one instruction per statement.
 
