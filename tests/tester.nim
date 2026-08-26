@@ -1159,7 +1159,7 @@ proc rv32CorpusSweep() =
   ##
   ## `MinPass` is a ratchet, not a target: it exists so that a change which turns
   ## a working fixture into a refusal is noticed.
-  const MinPass = 82
+  const MinPass = 95
   let qemu = findExe(rvSim)
   if qemu.len == 0:
     echo rvSim, " not found - skipping the RV32 corpus sweep"

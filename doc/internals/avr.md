@@ -15,7 +15,8 @@ Status: **M0–M4d complete.**
 | M4d aggregates, arrays, pointers | done — 5 more Leng fixtures |
 | M4e aggregate parameters and returns | done — a hidden result pointer |
 | M5a scalar globals | done — SRAM storage, values stored at entry |
-| M5b constructors as values, nested aggregates | done — 19 Leng fixtures |
+| M5b constructors as values, nested aggregates | done |
+| M5c `case`, short-circuit `and`/`or`, enums | done — 20 Leng fixtures |
 | M5 wide scalars, stack arguments, divide | not started |
 | M6 aggregate globals, flash constants, interrupts | not started |
 
@@ -143,6 +144,11 @@ register, a pair or a stack slot, every ALU form, the one-bit shifts,
   whatever the slot manager put next to it. A signed byte is widened with
   `sbrc`+`com`, which is how this machine spells a conditional one-instruction
   fixup — there is no `sxtb` here.
+* **`case` is a comparison CHAIN, not a jump table.** A table is a flash
+  relocation per entry plus an indexed read through `lpm`, on a part whose whole
+  flash is 32 KB. The chain is smaller and this target's budget is size before
+  speed. The selector is parked in a slot and staged through X for each test,
+  because the value bridge is where the compared value has to be produced.
 * **An aggregate parameter passed by REFERENCE is refused** when the allocator
   homes its pointer in an ordinary pair. Only X, Y and Z address memory here and
   Y is the frame pointer, so a pointer cannot be followed where it sits — and

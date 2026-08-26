@@ -200,6 +200,24 @@ proc emitCond(g: var CodeGen; c: Cursor; target: string; whenTrue: bool) =
   of NotC:
     var inner = c; inc inner
     g.emitCond(inner, target, not whenTrue)
+  of AndC, OrC:
+    # SHORT-CIRCUIT, which is not an optimization: `(and (neq p nil) (deref p))`
+    # must not evaluate the second operand when the first is false. So this is
+    # branches all the way down and no bool is ever materialized.
+    var a = c; inc a
+    var b = a; skip b
+    let isAnd = c.exprKind == AndC
+    if isAnd == whenTrue:
+      # `and`-taken and `or`-not-taken: both operands must agree, so the first
+      # one disagreeing jumps PAST the second.
+      let lSkip = g.freshLabel("sc")
+      g.emitCond(a, lSkip, not whenTrue)
+      g.emitCond(b, target, whenTrue)
+      g.emLab(lSkip)
+    else:
+      # `or`-taken and `and`-not-taken: either operand suffices.
+      g.emitCond(a, target, whenTrue)
+      g.emitCond(b, target, whenTrue)
   of TrueC:
     if whenTrue: g.emJmp(target)
   of FalseC:
@@ -677,6 +695,18 @@ proc emitValue(g: var CodeGen; c: Cursor; dst: Reg) =
     of AddC, SubC, MulC, DivC, ModC, BitandC, BitorC, BitxorC, ShlC, ShrC:
       g.emitBin(c, dst)
     of EqC, NeqC, LtC, LeC: g.emitCmpValue(c, dst)
+    of AndC, OrC:
+      # A short-circuit bool as a VALUE. Built from the branch form rather than
+      # from bitwise `and`/`or`, because the operands must not both be
+      # evaluated — and once it is a branch, the 0/1 is two loads and a jump.
+      let lFalse = g.freshLabel("bool")
+      let lEnd = g.freshLabel("boolend")
+      g.emitCond(c, lFalse, whenTrue = false)
+      g.emLi(dst, 1)
+      g.emJmp(lEnd)
+      g.emLab(lFalse)
+      g.emLi(dst, 0)
+      g.emLab(lEnd)
     of NotC:
       # A BOOL not: the value is 0 or 1, so `seqz` is exactly it — and it is one
       # instruction, where a flag machine needs a compare and a set.
@@ -1026,6 +1056,68 @@ proc genIf(g: var CodeGen; c: Cursor) =
       skip cc
   g.emLab(lEnd)
 
+proc genCase(g: var CodeGen; c: Cursor) =
+  ## `(case sel (of (ranges v… ) stmts)… (else stmts))` as a comparison CHAIN.
+  ##
+  ## A jump table is what a dense case deserves and is deliberately not what this
+  ## emits: a table is a code-segment relocation per entry plus an indexed load
+  ## through the one addressing mode this machine has, which is more machinery
+  ## than the chain costs to run at the sizes a case actually reaches here. Named
+  ## rather than assumed, so the decision can be revisited with a measurement.
+  let lEnd = g.freshLabel("caseend")
+  # The selector is evaluated ONCE and parked: every arm compares against it, and
+  # an arm's body may contain a call, which would destroy a register copy.
+  let selSlot = g.mintSlot("esel")
+  var cc = c
+  cc.into:
+    g.emitValue(cc, StagingBridge)
+    let signed = g.exprSlot(cc).cls != AUInt
+    g.emStoreSlot(selSlot, StagingBridge)
+    skip cc                                     # past the selector
+    while cc.hasMore:
+      case cc.substructureKind
+      of OfU:
+        let lBody = g.freshLabel("of")
+        let lNext = g.freshLabel("ofnext")
+        var oc = cc
+        oc.into:
+          var rc = oc
+          skip oc                               # past `(ranges …)` → the body
+          rc.into:
+            while rc.hasMore:
+              if rc.kind == TagLit and rc.substructureKind == RangeU:
+                # `lo..hi`: two branches, and the pair only holds when BOTH do —
+                # so the low test jumps past the high one rather than to the body.
+                var lo = rc; inc lo
+                var hi = lo; skip hi
+                let lSkip = g.freshLabel("rng")
+                g.emLoadSlot(StagingBridge, selSlot)
+                g.emitValue(lo, StagingBridge2)
+                g.emBranch((if signed: rcLt else: rcLtu), StagingBridge,
+                           StagingBridge2, lSkip)
+                g.emLoadSlot(StagingBridge, selSlot)
+                g.emitValue(hi, StagingBridge2)
+                g.emBranch((if signed: rcGe else: rcGeu), StagingBridge2,
+                           StagingBridge, lBody)
+                g.emLab(lSkip)
+              else:
+                g.emLoadSlot(StagingBridge, selSlot)
+                g.emitValue(rc, StagingBridge2)
+                g.emBranch(rcEq, StagingBridge, StagingBridge2, lBody)
+              skip rc
+          g.emJmp(lNext)
+          g.emLab(lBody)
+          while oc.hasMore: (g.genStmt(oc); skip oc)
+          g.emJmp(lEnd)
+        g.emLab(lNext)
+      of ElseU:
+        var oc = cc
+        oc.into:
+          while oc.hasMore: (g.genStmt(oc); skip oc)
+      else: discard
+      skip cc
+  g.emLab(lEnd)
+
 proc genWhile(g: var CodeGen; c: Cursor) =
   let lEnd = g.freshLabel("wend")
   g.loopEnds.add lEnd
@@ -1049,6 +1141,7 @@ proc genStmt(g: var CodeGen; c: Cursor) =
   of AsgnS: g.genAsgn(c)
   of RetS: g.genRet(c)
   of IfS: g.genIf(c)
+  of CaseS: g.genCase(c)
   of WhileS: g.genWhile(c)
   of BreakS:
     if g.loopEnds.len == 0:

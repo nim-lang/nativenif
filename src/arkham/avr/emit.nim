@@ -519,6 +519,13 @@ proc genTypeBodyAvr*(g: var CodeGen; c: var Cursor) =
     of AptrT:
       g.ab.aptrType: g.ab.voidType()
       skip c
+    of EnumT:
+      # An enum IS its base integer type. The `(efld …)` declarations name
+      # constants and nothing here reads them: sem has already replaced every use
+      # with its value.
+      c.into:
+        g.genTypeBodyAvr(c)
+        while c.hasMore: skip c
     of ArrayT:
       c.into:
         g.ab.arrayType:
