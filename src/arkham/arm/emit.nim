@@ -190,11 +190,12 @@ proc hereTarget*(g: CodeGen): IntrinsicTarget {.inline.} =
   of X86: tgX64
   of Arm64: tgA64
   of ThumbM: tgThumbM
-  of Avr:
-    # Unreachable: this is the ARM backend's table, and AVR has its own emitter.
-    # Named rather than folded into an arm with a plausible substitute — a wrong
-    # intrinsic target silently selects a row written for another machine.
-    raiseAssert "arkham: AVR does not reach the Arm intrinsic table"
+  of Avr, Rv32:
+    # Unreachable: this is the ARM backend's table, and both of those targets
+    # have their own emitter. Named rather than folded into an arm with a
+    # plausible substitute — a wrong intrinsic target silently selects a row
+    # written for another machine.
+    raiseAssert "arkham: this target does not reach the Arm intrinsic table"
 
 proc destructive3(g: CodeGen; op: A64Inst): bool {.inline.} =
   ## Ops with no destructive `D op= S` spelling on this target: Thumb-2's
@@ -1390,11 +1391,12 @@ proc logicalImmOk*(g: CodeGen; v: int64): bool {.inline.} =
   of ThumbExpandImm: thumbimm.isModifiedImm(v)
   of A64Bitmask: isLogicalImmA64(v)
   of X86Imm32: v >= low(int32) and v <= high(int32)
-  of AvrImm8:
-    # Unreachable: this is the Arm backend's predicate and AVR has its own
-    # emitter. Named rather than folded in with a plausible answer — a wrong one
-    # here lets a constant ride along in an instruction that cannot carry it.
-    raiseAssert "arkham: AVR does not reach the Arm immediate predicate"
+  of AvrImm8, Rv32Imm12:
+    # Unreachable: this is the Arm backend's predicate and both of those targets
+    # have their own emitter. Named rather than folded in with a plausible answer
+    # — a wrong one here lets a constant ride along in an instruction that cannot
+    # carry it.
+    raiseAssert "arkham: this target does not reach the Arm immediate predicate"
 
 proc normalizeUnaryWidth*(g: var CodeGen; resTypeC: Cursor; rD: Reg) =
   ## The `neg`/`bitnot` twin of `normalizeBinWidth`. Both are computed 64-bit wide,

@@ -74,7 +74,12 @@ type
     ## BE one of the sources" — has x86's answer. It parts company only at
     ## `scratchDemand`, where it answers like the ARM targets because it has no
     ## store-immediate and no PC-relative data operand either.
-    X86, Arm64, ThumbM, Avr
+    ##
+    ## `Rv32` groups with `Arm64`/`ThumbM` wherever the question is about the ALU
+    ## — it is three-operand and register-rich — and with `X86` at the aggregate
+    ## return, where ilp32 passes a hidden first pointer rather than reserving a
+    ## register for it.
+    X86, Arm64, ThumbM, Avr, Rv32
 
   TargetFeature* = enum
     ## What this target's asm-NIF vocabulary OFFERS. Read as `X in md.caps` in
@@ -162,6 +167,9 @@ type
     ThumbExpandImm    ## Thumb-2: a byte replicated across lanes, or an 8-bit value
                       ## with bit 7 set rotated anywhere. A DIFFERENT set
     X86Imm32          ## any 32-bit constant, sign-extended
+    Rv32Imm12         ## a 12-bit SIGNED immediate, and only in the `i`-suffixed
+                      ## forms. Anything wider is `lui`+`addi`, which is two
+                      ## instructions and therefore the code generator's business
     AvrImm8           ## an 8-bit constant, and only into r16..r31. Nothing wider
                       ## is an immediate here at all: a 16-bit constant is two
                       ## `ldi`s, and the pair-wide `adiw`/`sbiw` carry six bits
@@ -526,19 +534,20 @@ proc memToMemBridgeDemand*(md: MachineDesc; dst, v: Location): ScratchDemand =
   if dst.typ.isFloat:
     let fromMem = (case md.arch
                    of X86: v.kind in {NamedStack, Mem}
-                   of Arm64, ThumbM, Avr: v.kind in {NamedStack, Mem, Glob})
+                   of Arm64, ThumbM, Avr, Rv32: v.kind in {NamedStack, Mem, Glob})
     if fromMem: ScratchDemand(fregs: 1) else: ScratchDemand()
   else:
     let needsBridge = (case md.arch
                        of X86: v.kind in {NamedStack, Mem}
-                       of Arm64, ThumbM, Avr:
+                       of Arm64, ThumbM, Avr, Rv32:
                          v.kind in {NamedStack, Mem, Glob, Tvar, Imm})
                        # Cortex-M answers like AArch64 and for the same reasons:
                        # no store-immediate, no PC-relative data operand, so an
                        # immediate, a global and a thread-local each pass through
                        # a register on the way to a stack home. AVR is the same
                        # again — and the ONE branch where it does not follow
-                       # x86-64.
+                       # x86-64. RV32 too: `lui`+`addi` is two instructions, so a
+                       # constant does not ride into a store here either.
     if needsBridge:
       ScratchDemand(gprs: 1, slot: (if md.arch == X86: v.typ else: dst.typ))
     else:

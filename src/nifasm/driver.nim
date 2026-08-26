@@ -477,6 +477,12 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
                "' has no address"
         entryOff = pos
       writeFile(outfile, writeAvrImage(ctx, code, entryOff))
+    of Arch.Rv32:
+      # Unreachable while `genInst` refuses the target: no instruction can have
+      # been selected. Named rather than folded into another arm so that R3 has
+      # one place to fill in.
+      quit "nifasm: the RV32 image writer is not implemented yet " &
+           "(R3 in doc/internals/rv32.md)"
 
   # Close all foreign-module readers (the main module has no reader).
   for modname, module in ctx.modules.mpairs:

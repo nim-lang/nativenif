@@ -95,12 +95,15 @@ proc handleArch*(n: var Cursor; ctx: var GenContext) =
     ctx.arch = Arch.CortexM
   elif arch == "avr":
     ctx.arch = Arch.Avr
+  elif arch == "rv32":
+    ctx.arch = Arch.Rv32
   else:
     error("Unknown architecture: " & arch, n)
   setAsmWordSize(case ctx.arch
                  of Arch.X64, Arch.LinuxA64, Arch.A64, Arch.WinX64, Arch.WinA64: 8
                  of Arch.CortexM: 4
-                 of Arch.Avr: 2)
+                 of Arch.Avr: 2
+                 of Arch.Rv32: 4)
   inc n
 
 proc pass1*(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string; buf: var TokenBuf) =

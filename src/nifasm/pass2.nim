@@ -364,6 +364,9 @@ proc genInst(n: var Cursor; ctx: var GenContext) =
     genInstNodeM(n, ctx)
   of Arch.Avr:
     genInstNodeAvr(n, ctx)
+  of Arch.Rv32:
+    error("the RV32 instruction selector is not implemented yet " &
+          "(R3 in doc/internals/rv32.md)", n)
 
 proc pass2*(n: Cursor; ctx: var GenContext) =
   ## Pass2: Generate code only for top-level instructions (entry point).

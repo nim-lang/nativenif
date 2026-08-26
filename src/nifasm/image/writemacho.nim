@@ -30,7 +30,7 @@ proc writeMachO*(a: var GenContext; outfile: string) =
       (CPU_TYPE_X86_64, CPU_SUBTYPE_X86_64_ALL)
     of Arch.A64, Arch.LinuxA64:
       (CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL)
-    of Arch.WinX64, Arch.WinA64, Arch.CortexM, Arch.Avr:
+    of Arch.WinX64, Arch.WinA64, Arch.CortexM, Arch.Avr, Arch.Rv32:
       # Unreachable: Windows emits PE, and Cortex-M and AVR each emit a bare
       # ELF32 firmware image, so none of them ever reaches the Mach-O writer.
       # Covered so the case stays exhaustive.
