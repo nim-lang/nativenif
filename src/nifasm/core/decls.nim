@@ -25,6 +25,12 @@ template rawTag*(c: Cursor): TagEnum =
   ## The cursor's tag as a `TagEnum` (only meaningful at a `TagLit`).
   cast[TagEnum](uint32(c.cursorTagId))
 
+proc tag*(n: Cursor): TagEnum = cast[TagEnum](uint32(resolvedTagId(n)))
+  ## `resolvedTagId`, not `cursorTagId`: asm-NIF's vocabulary overflows the
+  ## 9-bit tag field, so the mnemonics past it carry their id in a leading child
+  ## (see `tagpool`). Everything downstream — `tagToX64Inst`, `tagToA64Inst`,
+  ## `tagToNifasmDecl`, every `n.tag == …TagId` — reads the same either way.
+
 template declTag*(c: Cursor): NifasmDecl =
   ## The cursor's tag decoded as a `NifasmDecl`, or `NoDecl` if it is not one
   ## (or the cursor is not at a tag).
