@@ -1146,6 +1146,38 @@ proc rv32AsmTests() =
   echo passed, " / ", fixtures.len, " RV32 assembler tests successful"
 
 
+proc arkhamRv32Tests() =
+  ## The RV32 Leng corpus: `arkham -a:rv32` → `nifasm` → `qemu-riscv32`, checking
+  ## each fixture's exit code against its `.exitcode` file.
+  let qemu = findExe(rvSim)
+  if qemu.len == 0:
+    echo rvSim, " not found - skipping arkham RV32 tests"
+    return
+  let arkhamExe = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  var passed = 0
+  var total = 0
+  for file in walkFiles("tests/arkham_rv32/*.c.nif"):
+    inc total
+    let stem = file.extractFilename.changeFileExt("").changeFileExt("")
+    let asmFile = "tests" / "arkham_rv32" / (stem & ".asm.nif")
+    let elf = "tests" / "arkham_rv32" / (stem & ".elf")
+    exec quoteShell(arkhamExe) & " -a:rv32 -o:" & quoteShell(asmFile) & " " &
+         quoteShell(file)
+    exec quoteShell(nifasmExe) & " -o:" & quoteShell(elf) & " " & quoteShell(asmFile)
+    let (output, code) = runProgram(qemu, @[elf])
+    if code == timeoutExitCode:
+      quit "FAILURE (TIMEOUT) arkham rv32 " & stem & "\n"
+    let want = parseInt(readFile("tests" / "arkham_rv32" / (stem & ".exitcode")).strip)
+    if code != want:
+      quit "FAILURE arkham rv32 " & stem & ": exit " & $code & ", want " & $want &
+           "\n" & output
+    removeFile asmFile
+    removeFile elf
+    inc passed
+  echo passed, " / ", total, " arkham RV32 tests successful"
+
+
 proc arkhamAvrTests() =
   ## The AVR Leng corpus: `arkham -a:avr` → `nifasm` → AVRtest, checking each
   ## fixture's exit code against its `.exitcode` file — the same oracle every
@@ -1875,6 +1907,7 @@ avrAsmTests()
 # RISC-V 32: encoder-level coverage. Hosted, so it needs only `qemu-riscv32`.
 rv32SelfTest()
 rv32AsmTests()
+arkhamRv32Tests()
 arkhamAvrTests()
 arkhamAvrRejections()
 

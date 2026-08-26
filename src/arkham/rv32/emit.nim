@@ -1,0 +1,264 @@
+#
+#           Arkham — RV32 asm-NIF emission primitives
+#        (c) Copyright 2026 Andreas Rumpf
+#
+#    See the file "license.txt", included in this distribution.
+#
+
+## The layer that knows RV32's shape, which is mostly a matter of knowing how
+## little shape there is: three-operand ALU, one addressing mode, and `x0` doing
+## the work four separate instructions do elsewhere.
+##
+## The one real decision here is `emLi`. A constant that fits twelve signed bits
+## is one `addi` against `x0`; anything wider is `lui`+`addi`, and the `+0x800`
+## compensation is not optional — `addi`'s immediate is SIGNED, so a low half
+## above 0x7FF is a negative addend and the upper half has to be one higher. The
+## split is done HERE rather than in the assembler because it is two
+## instructions, and choosing between one and two is code generation.
+
+import std / [tables]
+import nifcore, nifcdecl
+import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
+                    context, typeutil, regbind, diag]
+import machine
+
+proc emReg*(g: var CodeGen; r: Reg) =
+  ## A value register: the local's name when one lives here, the raw `(xN)`
+  ## otherwise. `x0` is always raw — nothing is ever bound to a register that
+  ## discards its writes.
+  if r == Zero:
+    g.ab.rawReg r
+    return
+  let nm = g.rb.boundName(r)
+  if nm.len > 0: g.ab.sym nm
+  else:
+    # Legitimately raw: the two bridges, the ABI argument and return registers,
+    # the temp pool, SP, `ra`, and a callee-saved register being SAVED or
+    # RESTORED by the frame — which is a store of the register itself, not of any
+    # value that lives in it.
+    assert r in {StagingBridge, StagingBridge2} or r in g.md.intArgRegs or
+           r == g.md.intRetReg or r in g.md.intTempRegs or
+           r in g.md.intCalleeSavedSet or r == SP or r == Ra,
+      "arkham rv32: unbound register reached emReg: " & abiName(r) &
+      " in " & g.curProcName
+    g.ab.rawReg r
+
+proc emZero*(g: var CodeGen) = g.ab.rawReg Zero
+
+proc fitsImm12*(v: int64): bool {.inline.} = v >= -2048 and v <= 2047
+
+proc emMv*(g: var CodeGen; d, s: Reg) =
+  ## `mv` IS `addi d, s, 0`, and the asm-NIF `(mov D S)` says so.
+  if d == s: return
+  g.ab.tree MovRv: (g.emReg d; g.emReg s)
+
+proc emLi*(g: var CodeGen; d: Reg; v: int64) =
+  ## One instruction or two, decided here — see the module header.
+  let w = cast[int32](uint32(v and 0xFFFFFFFF))
+  if fitsImm12(int64(w)):
+    g.ab.tree AddiRv: (g.emReg d; g.emZero(); g.ab.intLit int64(w))
+  else:
+    let u = uint32(w)
+    let hi = (u + 0x800) shr 12
+    let lo = cast[int32](u - (hi shl 12))
+    g.ab.tree LuiRv: (g.emReg d; g.ab.intLit int64(hi and 0xFFFFF))
+    if lo != 0:
+      g.ab.tree AddiRv: (g.emReg d; g.emReg d; g.ab.intLit int64(lo))
+
+# ── memory ──────────────────────────────────────────────────────────────────
+# One mode for the whole machine: a base register plus a 12-bit signed offset.
+# A frame slot is `sp + q` like any other access — there is no special case and
+# no frame pointer.
+
+proc emLoadSlot*(g: var CodeGen; d: Reg; name: string) =
+  g.ab.tree LwrRv: (g.emReg d; g.ab.sym name)
+
+proc emStoreSlot*(g: var CodeGen; name: string; s: Reg) =
+  g.ab.tree SwrRv: (g.ab.sym name; g.emReg s)
+
+# ── ALU ─────────────────────────────────────────────────────────────────────
+
+type
+  RvBinOp* = enum
+    boAdd, boSub, boMul, boAnd, boOr, boXor, boShl, boShr, boSar,
+    boDiv, boDivu, boRem, boRemu
+
+proc emBin*(g: var CodeGen; op: RvBinOp; d, a, b: Reg) =
+  ## `d = a op b`. Three operands, so nothing has to be moved into place first —
+  ## which is the single biggest difference from every other backend here.
+  let t = case op
+          of boAdd: Add3Rv
+          of boSub: Sub3Rv
+          of boMul: Mul3Rv
+          of boAnd: And3Rv
+          of boOr: Orr3Rv
+          of boXor: Eor3Rv
+          of boShl: Lsl3Rv
+          of boShr: Lsr3Rv
+          of boSar: Asr3Rv
+          of boDiv: DivsRv
+          of boDivu: Divu3Rv
+          of boRem: RemsRv
+          of boRemu: RemuRv
+  g.ab.tree t: (g.emReg d; g.emReg a; g.emReg b)
+
+proc immFormOf(op: RvBinOp): Rv32Inst =
+  ## The `i`-suffixed twin, or `NoRv32Inst` where the machine has none. There is
+  ## no `subi` and no `muli`: subtracting a constant is adding its negation, and
+  ## a multiply by a constant is a multiply.
+  case op
+  of boAdd: AddiRv
+  of boAnd: AndiRv
+  of boOr: OriRv
+  of boXor: XoriRv
+  of boShl: SlliRv
+  of boShr: SrliRv
+  of boSar: SraiRv
+  else: NoRv32Inst
+
+proc emBinImm*(g: var CodeGen; op: RvBinOp; d, a: Reg; v: int64): bool =
+  ## `d = a op <constant>` in one instruction where the machine has a form for
+  ## it. Returns false when it does not, and then the caller materializes the
+  ## constant into a register first.
+  var op = op
+  var v = v
+  if op == boSub:
+    # No `subi` exists. Adding the negation is the same instruction, and the
+    # range check below is what stops `-(-2048)` from silently wrapping.
+    op = boAdd
+    v = -v
+  let t = immFormOf(op)
+  if t == NoRv32Inst: return false
+  if op in {boShl, boShr, boSar}:
+    if v < 0 or v > 31: return false
+  elif not fitsImm12(v):
+    return false
+  g.ab.tree t: (g.emReg d; g.emReg a; g.ab.intLit v)
+  true
+
+# ── comparison ──────────────────────────────────────────────────────────────
+# There are no flags, so a comparison PRODUCES a value. `slt`/`sltu` give
+# "less than" directly; the other five are built from it and from `x0`.
+
+proc emSlt*(g: var CodeGen; d, a, b: Reg; signed: bool) =
+  g.ab.tree (if signed: SltRv else: SltuRv): (g.emReg d; g.emReg a; g.emReg b)
+
+proc emSeqz*(g: var CodeGen; d, a: Reg) =
+  ## 1 when `a` is zero. `sltiu d, a, 1` is true exactly then — a value is
+  ## unsigned-less-than one precisely when it is zero.
+  g.ab.tree SltiuRv: (g.emReg d; g.emReg a; g.ab.intLit 1)
+
+proc emSnez*(g: var CodeGen; d, a: Reg) =
+  g.ab.tree SltuRv: (g.emReg d; g.emZero(); g.emReg a)
+
+proc emXorReg*(g: var CodeGen; d, a, b: Reg) =
+  g.ab.tree Eor3Rv: (g.emReg d; g.emReg a; g.emReg b)
+
+# ── control flow ────────────────────────────────────────────────────────────
+
+type
+  RvCond* = enum
+    ## The six the hardware branches on. `>` and `<=` are these with the operands
+    ## exchanged, which costs nothing because the exchange happens while
+    ## selecting rather than while running.
+    rcEq, rcNe, rcLt, rcGe, rcLtu, rcGeu
+
+proc invert*(c: RvCond): RvCond =
+  case c
+  of rcEq: rcNe
+  of rcNe: rcEq
+  of rcLt: rcGe
+  of rcGe: rcLt
+  of rcLtu: rcGeu
+  of rcGeu: rcLtu
+
+proc emBranch*(g: var CodeGen; cond: RvCond; a, b: Reg; target: string) =
+  ## Compare AND branch, in one instruction. Nothing is left in a flag between
+  ## them because there is no flag to leave anything in.
+  let t = case cond
+          of rcEq: BeqrRv
+          of rcNe: BnerRv
+          of rcLt: BltrRv
+          of rcGe: BgerRv
+          of rcLtu: BlturRv
+          of rcGeu: BgeurRv
+  g.ab.tree t: (g.emReg a; g.emReg b; g.ab.sym target)
+
+proc emLab*(g: var CodeGen; name: string) =
+  g.ab.tree LabRv: g.ab.symDef name
+
+proc emJmp*(g: var CodeGen; name: string) =
+  g.ab.tree BRv: g.ab.sym name
+
+proc freshLabel*(g: var CodeGen; prefix: string): string =
+  inc g.labelCount
+  result = SynthMark & prefix & $g.labelCount & ".0"
+
+# ── types and declarations ──────────────────────────────────────────────────
+
+proc genTypeBodyRv*(g: var CodeGen; c: var Cursor) =
+  ## Scalars and pointers only — everything else is refused BY NAME, which is
+  ## what makes a partial backend safe to ship.
+  case c.kind
+  of Symbol:
+    var d = lookupType(g.prog, c.symId)
+    d.into:
+      inc d; skip d
+      g.genTypeBodyRv(d)
+    inc c
+  of TagLit:
+    case c.typeKind
+    of IT:
+      var t = c; inc t
+      g.ab.intType(if t.kind == IntLit: int(intVal(t)) else: 32); skip c
+    of UT:
+      var t = c; inc t
+      g.ab.uintType(if t.kind == IntLit: int(intVal(t)) else: 32); skip c
+    of CT:
+      var t = c; inc t
+      g.ab.charType(if t.kind == IntLit: int(intVal(t)) else: 8); skip c
+    of BoolT:
+      g.ab.boolType(); skip c
+    of VoidT:
+      g.ab.voidType(); skip c
+    of PtrT:
+      g.ab.ptrType: g.ab.voidType()
+      skip c
+    of AptrT:
+      g.ab.aptrType: g.ab.voidType()
+      skip c
+    else:
+      lengError c, "RV32: the type `" & $c.typeKind & "` is not implemented yet " &
+                   "(R5: aggregates, arrays and function pointers)", lengInfo(c)
+  else:
+    lengError c, "RV32: unsupported type", lengInfo(c)
+
+proc emRegVar*(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
+  let dead = g.rb.takeBinding(r)
+  if dead.len > 0:
+    g.ab.tree KillRv: g.ab.sym dead
+  g.ab.open NifasmDecl.VarD
+  g.ab.symDef name
+  g.ab.rawReg r
+  var tc = typeCur
+  g.genTypeBodyRv(tc)
+  g.ab.close()
+  g.rb.bindLocal(r, name, isPtr = false)
+
+proc emSlotVar*(g: var CodeGen; name: string; typeCur: Cursor) =
+  g.ab.open NifasmDecl.VarD
+  g.ab.symDef name
+  g.ab.keyword SO
+  var tc = typeCur
+  g.genTypeBodyRv(tc)
+  g.ab.close()
+
+proc emWordSlot*(g: var CodeGen; name: string) =
+  ## A machine-word slot the EMITTER minted — a saved register, or a parked
+  ## operand. Typed `(i 32)` because that is what it holds: one word, whatever
+  ## the value it came from was.
+  g.ab.open NifasmDecl.VarD
+  g.ab.symDef name
+  g.ab.keyword SO
+  g.ab.intType 32
+  g.ab.close()

@@ -1,0 +1,25 @@
+(.nif27)
+(stmts
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :a.0 .
+    (i 32)100)
+   (var :b.0 .
+    (i 32)7)
+   (var :q.0 .
+    (i 32)
+    (div
+     (i 32)a.0 b.0))
+   (var :r.0 .
+    (i 32)
+    (mod
+     (i 32)a.0 b.0))
+   (ret
+    (add
+     (i 32)
+     (mul
+      (i 32)q.0 3)r.0)))))

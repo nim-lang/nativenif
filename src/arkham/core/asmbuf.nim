@@ -28,7 +28,7 @@ import ../arm/machine_a64 as machine
                              # `regName`. The x64 and Cortex-M backends install their
                              # own, so this edge is only about the default argument.
 import peephole              # the finished-shape rewrites, applied in `render`
-export A64Inst, X64Inst, AvrInst, NifasmDecl, NifasmType, NifasmExpr, X64Flag
+export A64Inst, X64Inst, AvrInst, Rv32Inst, NifasmDecl, NifasmType, NifasmExpr, X64Flag
 export MInst   # the Cortex-M-only mnemonics (`bkpt`, `bx`, `uxtb`, …). Everything
                # else the Cortex-M target uses is spelled with the SHARED tags, so
                # `A64Inst` covers it — see doc/instructions.md.

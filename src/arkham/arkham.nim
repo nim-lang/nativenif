@@ -22,6 +22,7 @@ import arm/driver                # BOTH Arm targets: AArch64 (Darwin/Linux) and
                                 # Cortex-M. One emitter, three machine models.
 import x64/driver                # x86-64 / Linux backend
 import avr/driver                # AVR / avr5, bare metal
+import rv32/driver               # RISC-V 32 / RV32IM, hosted Linux
 
 const
   Version = "0.1.0"
@@ -115,9 +116,7 @@ proc run(input, output, arch: string; board: layout.Layout) =
              of "cortex_m", "cortexm", "thumbm":
                generateM(buf, input, tags, board)
              of "avr": generateAvr(buf, input, tags)
-             of "rv32", "riscv32":
-               quit("arkham: the RV32 backend is not implemented yet " &
-                    "(R4 in doc/internals/rv32.md)", QuitFailure)
+             of "rv32", "riscv32": generateRv32(buf, input, tags)
              else: quit("arkham: unknown --arch:" & arch, QuitFailure)
   writeFile(output, code)
 
