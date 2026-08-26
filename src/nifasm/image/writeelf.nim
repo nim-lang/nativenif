@@ -18,6 +18,7 @@ import std / [streams, os, tables, sets, algorithm, strutils]
 import nifcore
 import "../core" / [context, sem, relocs, buffers, diagnostics, modules, stackslots, listing]
 import "../x64/encoder" as x86
+import "../x64/relax"                 # the rel32 -> rel8 shrink and the 16-byte pad
 import "../arm64/encoder" as arm64
 import elf, dwarf, tracetable, writecommon
 
