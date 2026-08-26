@@ -49,6 +49,12 @@ proc createAsmTagPool*(): TagPool =
       "nifasm tag pool misalignment for " & TagData[e][0]
   result.escapeTag = OtherTag
 
+let asmTags*: TagPool = createAsmTagPool()
+  ## The one seeded tag pool. A single process assembles one program, and every
+  ## module of it — the main tree and every foreign decl pulled in on demand —
+  ## must be read against the SAME pool or the tag ordinals stop agreeing. So it
+  ## is created once, here, rather than per `assemble` call.
+
 proc enterNode*(n: var Cursor) {.inline.} =
   ## Step from a node head onto its first child, past the id of a tag that did
   ## not fit the 9-bit field. Use it instead of a bare `inc n` wherever the node

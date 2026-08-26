@@ -276,6 +276,18 @@ type
     # it. Targets in __TEXT and __DATA are both supported.
     rodataRebases*: seq[tuple[owner: Symbol, blobOff: int, target: Symbol]]
 
+  OperandKind* = enum
+    ## What an operand IS, before any target says how to encode it: the x64,
+    ## AArch64 and Thumb operand records all classify themselves with this.
+    okReg       # Register operand
+    okImm       # Immediate value
+    okMem       # Memory operand
+    okSsize     # Stack size placeholder (patched later)
+    okCsize     # Call stack argument size
+    okMimg      # Cortex-M: one of the four image-layout numbers (patched later)
+    okArg       # Argument reference in prepare block
+    okLabel     # Label reference
+
   CortexMBoard* = object
     ## The board, reduced to what PLACEMENT needs. Derived from `(layout …)`; see
     ## `handleLayout`.
@@ -302,6 +314,22 @@ type
     mikHeapSize     # and how many bytes of it there are
     mikNoinitStart  # the region the startup code was told to leave alone
     mikNoinitSize   # and how many bytes of THAT there are
+
+# ── reading the record ───────────────────────────────────────────────────────
+
+proc inCall*(ctx: GenContext): bool {.inline.} =
+  ## Returns true if we're inside a prepare block
+  ctx.callContext.state != CallContextState.Disabled
+
+template nameOf*(ctx: GenContext; s: SymId): string =
+  ## Render a `SymId` back to its qualified name string (for the foreign-index
+  ## lookup, dedup keys, diagnostics and extern emission — the genuine string sinks).
+  poolSym(ctx.pool, s)
+
+template symIdOf*(ctx: GenContext; s: string): SymId =
+  ## Intern a qualified name into the main pool, yielding its scope key. Cheap for a
+  ## name already interned (parsing interned every symbol) — a single hash + probe.
+  ctx.pool.syms.getOrIncl(s)
 
 proc newGenContext*(mainPool: Pool; baseDir, thisModule: string;
                     symMap, emitObj, debugInfo: bool; listing: string): GenContext =
