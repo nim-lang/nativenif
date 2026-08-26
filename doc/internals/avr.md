@@ -1,6 +1,6 @@
 # AVR support
 
-Status: **M0, M1, M2, M3 complete.**
+Status: **M0, M1, M2, M3, M4a/b complete.**
 
 | Milestone | State |
 |---|---|
@@ -9,9 +9,51 @@ Status: **M0, M1, M2, M3 complete.**
 | M2a encoder + relocations | done — `src/nifasm/avr/encoder.nim`, 59-check self-test |
 | M2b ELF32 image writer | done — `src/nifasm/image/writeavr.nim` |
 | M3 assembler integration | **working** — 6 fixtures run end to end |
-| M4 arkham backend | not started |
+| M4a arkham machine model | done — `src/arkham/avr/machine.nim` |
+| M4b arkham driver + the return path | done — 2 Leng fixtures run end to end |
+| M4c the value core | not started |
 | M5 wide frames, stack arguments, divide | not started |
 | M6 globals, flash constants, interrupts, startup | not started |
+
+### Why M4 is not the Cortex-M arrangement
+
+`generateM` is the AArch64 emitter driven with a different machine model, not a
+second code generator — Thumb-2 and AArch64 share the asm-NIF vocabulary at the
+instruction level, so a third target needed only a register file, a word size
+and honest refusals.
+
+**AVR cannot be reached that way**, and the reason is the thing that makes the
+target interesting. One asm-NIF node is one 8-bit instruction here, so a 16-bit
+add is `(add)` + `(adc)` on the halves and a 16-bit compare is `(cmp)` + `(cpc)`.
+That decomposition has to happen inside the value core, and the value core is not
+layered over a primitive emitter a machine model could redirect: `x64/value.nim`
+and `arm/value.nim` emit directly in 114 and 143 places respectively.
+
+So AVR needs its own value core. That is the irreducible piece
+[module_layout.md](module_layout.md) measures at roughly four thousand lines per
+backend, and the piece whose register-binding protocol has a formal model behind
+it. It is M4c, and it is the largest single item left on this list.
+
+The register ALLOCATOR is reusable as it stands — `planer.allocateProc` is
+arch-neutral and takes a `MachineDesc` — so M4c is the emitter, not the
+allocator.
+
+### What M4b has
+
+The spine: the program walk, the proc signature, the ABI clobber list emitted at
+the signature, and the entry proc's exit path. A proc whose body is `ret <const>`
+compiles, assembles and runs — `tests/arkham_avr`, two fixtures with `.exitcode`
+files, driven exactly like every other target's corpus.
+
+Everything else is refused BY NAME with the milestone that covers it, and
+`tester.nim`'s `arkhamAvrRejections` pins the refusals. That is the property that
+makes a partial backend safe to ship: the gap has to be a diagnostic rather than
+a wrong answer.
+
+The entry proc's `ret` becomes `(bkpt 30)` rather than a return, for the reason
+Cortex-M's becomes a semihosting `SYS_EXIT_EXTENDED`: this is a freestanding
+image and there is nothing to return to, so the entry's result IS the exit
+status.
 
 ### What M3 has
 

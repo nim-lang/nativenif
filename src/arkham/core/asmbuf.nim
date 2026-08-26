@@ -28,7 +28,7 @@ import ../arm/machine_a64 as machine
                              # `regName`. The x64 and Cortex-M backends install their
                              # own, so this edge is only about the default argument.
 import peephole              # the finished-shape rewrites, applied in `render`
-export A64Inst, X64Inst, NifasmDecl, NifasmType, NifasmExpr, X64Flag
+export A64Inst, X64Inst, AvrInst, NifasmDecl, NifasmType, NifasmExpr, X64Flag
 export MInst   # the Cortex-M-only mnemonics (`bkpt`, `bx`, `uxtb`, …). Everything
                # else the Cortex-M target uses is spelled with the SHARED tags, so
                # `A64Inst` covers it — see doc/instructions.md.
@@ -92,6 +92,16 @@ proc rawReg*(a: var AsmBuf; r: Reg) {.inline.} =
   ## (the 64-bit dividers, the semihosting shims) that are not allocator output
   ## at all.
   a.openS(a.renderReg r); a.close()
+
+proc regNamed*(a: var AsmBuf; spelling: string) {.inline.} =
+  ## A physical register named DIRECTLY rather than through `renderReg`.
+  ##
+  ## AVR is the one caller and the reason this exists: a `Reg` slot there is a
+  ## register PAIR, because the machine's word is 16 bits and its registers are
+  ## 8, while every ALU instruction names one 8-bit HALF of a pair — a spelling
+  ## no `Reg` value denotes. Everything `rawReg`'s doc comment says about raw
+  ## being a claim rather than a default applies here too.
+  a.openS(spelling); a.close()
 
 proc dreg*(a: var AsmBuf; f: FReg) {.inline.} =
   ## A double-precision fp register operand `(dN)` (the 64-bit view of `vN`).

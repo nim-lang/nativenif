@@ -1067,6 +1067,64 @@ proc avrAsmTests() =
   echo passed, " / ", fixtures.len, " AVR assembler tests successful"
 
 
+proc arkhamAvrTests() =
+  ## The AVR Leng corpus: `arkham -a:avr` → `nifasm` → AVRtest, checking each
+  ## fixture's exit code against its `.exitcode` file — the same oracle every
+  ## other target's corpus uses.
+  if not fileExists(avrSim):
+    echo avrSim, " not found - skipping arkham AVR tests"
+    return
+  let arkhamExe = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  var passed = 0
+  var total = 0
+  for file in walkFiles("tests/arkham_avr/*.c.nif"):
+    inc total
+    let stem = file.extractFilename.changeFileExt("").changeFileExt("")
+    let asmFile = "tests" / "arkham_avr" / (stem & ".asm.nif")
+    let elf = "tests" / "arkham_avr" / (stem & ".elf")
+    exec quoteShell(arkhamExe) & " -a:avr -o:" & quoteShell(asmFile) & " " &
+         quoteShell(file)
+    exec quoteShell(nifasmExe) & " -o:" & quoteShell(elf) & " " & quoteShell(asmFile)
+    let (output, code) = runProgram(avrSim, @["-q", "-mmcu=avr5", "-s", "32k", elf])
+    if code == timeoutExitCode:
+      quit "FAILURE (TIMEOUT) arkham avr " & stem & "\n"
+    let want = parseInt(readFile("tests" / "arkham_avr" / (stem & ".exitcode")).strip)
+    if code != want:
+      quit "FAILURE arkham avr " & stem & ": exit " & $code & ", want " & $want &
+           "\n" & output
+    removeFile asmFile
+    removeFile elf
+    inc passed
+  echo passed, " / ", total, " arkham AVR tests successful"
+
+
+proc arkhamAvrRejections() =
+  ## A partial backend is only safe to ship if the gap is a DIAGNOSTIC rather
+  ## than a wrong answer, and this backend's gap is wide. So the diagnostics are
+  ## what these pin: each input names a construct the emitter does not implement,
+  ## and the refusal has to say which one and where to look.
+  let arkhamExe = ("bin" / "arkham").addFileExt(ExeExt)
+  const cases = [
+    # A body richer than `ret <const>`. The failure a user is most likely to hit,
+    # so it names the milestone rather than the construct.
+    ("tests/arkham_m/leafret.c.nif", "not yet supported"),
+    # A syscall. Refused for what it IS rather than as an unimplemented feature:
+    # a firmware image has no OS underneath it, on this target or any other.
+    ("tests/arkham/hello.c.nif", "no OS to call into")]
+  var passed = 0
+  for (file, want) in cases:
+    let (output, code) = runProgram(arkhamExe,
+      @["-a:avr", "-o:" & (getTempDir() / "avr_reject.asm.nif"), file])
+    if code == 0:
+      quit "FAILURE arkham avr rejection: " & file & " was ACCEPTED"
+    if not output.contains(want):
+      quit "FAILURE arkham avr rejection: " & file & "\nexpected to mention: " &
+           want & "\ngot: " & output
+    inc passed
+  echo passed, " / ", cases.len, " arkham AVR rejection tests successful"
+
+
 proc cortexMAsmTests() =
   ## Assemble hand-written Cortex-M asm-NIF with nifasm and run the resulting
   ## firmware under QEMU. This is the END-TO-END gate for the instruction
@@ -1727,6 +1785,8 @@ arkhamCortexM64Tests()
 # both need only `bin/avrtest`.
 avrSelfTest()
 avrAsmTests()
+arkhamAvrTests()
+arkhamAvrRejections()
 
 # arkham native-codegen tests: arkham emits the host arch (x86-64 on Linux,
 # AArch64/Darwin on macOS), so we run them only where the binaries execute.

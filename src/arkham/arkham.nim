@@ -21,6 +21,7 @@ import core/temps                # `dumpTempStats`, under -d:arkhamTempDbg only 
 import arm/driver                # BOTH Arm targets: AArch64 (Darwin/Linux) and
                                 # Cortex-M. One emitter, three machine models.
 import x64/driver                # x86-64 / Linux backend
+import avr/driver                # AVR / avr5, bare metal
 
 const
   Version = "0.1.0"
@@ -109,9 +110,7 @@ proc run(input, output, arch: string; board: layout.Layout) =
              of "linux_arm64", "linux_aarch64": generateA64(buf, input, tags, linux = true)
              of "cortex_m", "cortexm", "thumbm":
                generateM(buf, input, tags, board)
-             of "avr":
-               quit("arkham: the AVR backend is not implemented yet " &
-                    "(M4 in doc/internals/avr.md)", QuitFailure)
+             of "avr": generateAvr(buf, input, tags)
              else: quit("arkham: unknown --arch:" & arch, QuitFailure)
   writeFile(output, code)
 
