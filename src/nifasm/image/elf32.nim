@@ -23,7 +23,7 @@
 ## then resets by reading the interrupt table, so `e_entry` is advisory and the
 ## table is what actually decides where execution begins.
 
-import buffers
+import ../core/buffers
 
 type
   Elf32_Addr* = uint32

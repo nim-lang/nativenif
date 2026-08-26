@@ -28,7 +28,7 @@
 import std / [tables, sets, assertions, os, strutils]
 import nifcore
 import nifcdecl
-import slots
+import asmslots
 
 let birthFilterEnv = getEnv("ARKHAM_BIRTH_FILTER")
   ## debug bisection toggle: "" = birth-point exemption everywhere (normal);

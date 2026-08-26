@@ -28,7 +28,7 @@
 ## visible instead of being silently re-derived differently in six places.)
 
 import nifcore
-import slots, machinedesc, programs
+import asmslots, machinedesc, programs
 
 type
   ParamPlace* = object

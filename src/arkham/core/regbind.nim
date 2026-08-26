@@ -37,7 +37,7 @@
 ## the same object makes the invalidation part of each transition instead.
 
 import std / [tables, assertions]
-import machinedesc, slots
+import machinedesc, asmslots
 
 type
   MirrorKind* = enum

@@ -19,7 +19,7 @@
 ## little-endian 32-bit word. `0xF7FF 0xFFFE` is written `FF F7 FE FF`.
 
 import std/[strutils]
-import buffers, relocs
+import ../core/[buffers, relocs]
 import thumbimm
 export thumbimm.encodeModifiedImm, thumbimm.isModifiedImm
 

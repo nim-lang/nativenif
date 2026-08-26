@@ -80,7 +80,7 @@ import std / [tables, sets, assertions, os, strutils]
 let copyInheritDisabled = existsEnv("ARKHAM_NO_COPYINHERIT")
   ## measurement toggle: `ARKHAM_NO_COPYINHERIT=1` disables same-width cast/copy home
   ## inheritance (`allocVarDecl`), so the eliminated reg→reg moves can be A/B compared.
-import nifcore, nifcdecl, slots, machinedesc, analyser, programs, typenav
+import nifcore, nifcdecl, asmslots, machinedesc, analyser, programs, typenav
 import abi
 export abi         # CallPlan / planCall / ParamPlace: the one ABI classifier the
                    # allocator and both emitters consume (see abi.nim)

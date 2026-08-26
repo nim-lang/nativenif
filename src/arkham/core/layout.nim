@@ -24,7 +24,7 @@
 
 import std / [strutils]
 import nifcore, nifcoreparse
-import "../nifasm" / [model, tagconv, tagpool, tags]
+import "../../nifasm/core" / [model, tagconv, tagpool, tags]
 
 proc asmTag(n: Cursor): TagEnum = cast[TagEnum](uint32(resolvedTagId(n)))
   ## `resolvedTagId`, not `cursorTagId`: asm-NIF's vocabulary overflows the 9-bit

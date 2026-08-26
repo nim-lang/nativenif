@@ -17,7 +17,7 @@
 
 import std / tables
 import nifcore, nifcdecl
-import slots, programs
+import asmslots, programs
 when defined(fieldDebug):
   import nifcoreparse
 

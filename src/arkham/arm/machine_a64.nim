@@ -12,7 +12,7 @@
 ## `machinedesc` and are re-exported, so downstream modules keep importing
 ## `machine`.
 
-import slots, machinedesc
+import ../core/[asmslots, machinedesc]
 export machinedesc
 
 const

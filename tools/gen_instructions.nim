@@ -1,4 +1,4 @@
-## Generates `src/nifasm/tags.nim` (the tag ids) and `src/nifasm/model.nim`
+## Generates `src/nifasm/core/tags.nim` (the tag ids) and `src/nifasm/core/model.nim`
 ## (the per-target enums) from the table in `doc/instructions.md`, which is the
 ## single source of truth for the asm-NIF vocabulary. Run from the repo root.
 
@@ -205,9 +205,9 @@ proc genTags(inp: File; inputName: string) =
         desc: r.desc
       )
 
-  createDir "src/nifasm"
-  writeTagsFile "src/nifasm/tags.nim", tags, inputName, anonHead = true
-  writeModel "src/nifasm/model.nim", enumDecls, X64Inst, MReg, inputName
+  createDir "src/nifasm/core"
+  writeTagsFile "src/nifasm/core/tags.nim", tags, inputName, anonHead = true
+  writeModel "src/nifasm/core/model.nim", enumDecls, X64Inst, MReg, inputName
 
 proc main(inputName: string) =
   var inp = open(inputName, fmRead)

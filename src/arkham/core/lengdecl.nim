@@ -18,7 +18,7 @@
 
 import std / assertions
 import nifcore
-import "../../../nimony/src/models" / [leng_tags, tags]
+import "../../../../nimony/src/models" / [leng_tags, tags]
 export leng_tags
 
 proc createLengTagPool*(): TagPool =

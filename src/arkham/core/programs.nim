@@ -20,8 +20,8 @@
 
 import std / [tables, assertions, sets, strutils]
 import nifcore, nifcdecl, nifcoreparse
-import slots, nifmodules
-import "../../../nimony/src/lib" / [symparser, nifreader, stringviews, intrinsics]
+import asmslots, nifmodules
+import "../../../../nimony/src/lib" / [symparser, nifreader, stringviews, intrinsics]
 export intrinsics
 
 type

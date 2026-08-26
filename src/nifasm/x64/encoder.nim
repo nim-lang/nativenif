@@ -3,7 +3,7 @@
 
 import std/tables
 
-import buffers, relocs
+import ../core/[buffers, relocs]
 
 type
   # x86_64 64-bit general purpose registers

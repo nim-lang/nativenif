@@ -1,8 +1,9 @@
 
 import std / [tables]
-import tags, x86
-from arm64 import nil  # only `arm64.Register`, qualified: `Register` alone stays x86's
-from thumb2 import nil # ditto for the Cortex-M register enum
+import tags
+import ../x64/encoder as x86
+from ../arm64/encoder as arm64 import nil  # only `arm64.Register`, qualified: `Register` alone stays x86's
+from ../thumb/encoder as thumb2 import nil # ditto for the Cortex-M register enum
 import nifcore  # SymId: symbols are keyed by their interned id (main-module pool),
                 # not by re-hashing the qualified name string on every lookup.
 

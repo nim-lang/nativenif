@@ -16,14 +16,14 @@
 import std / [tables, sets, assertions, algorithm, strutils, os]
 import symparser
 import nifcore, nifcdecl
-import slots, machinedesc, analyser, planer, programs, abi
-import machine_m                  # the Cortex-M machine model
-import layout                     # Layout: the `--layout:` board file
-import asmbuf
-import typenav
+import core / [asmslots, machinedesc, analyser, planer, programs, abi]
+import arm/machine_m              # the Cortex-M machine model
+import core/layout                # Layout: the `--layout:` board file
+import core/asmbuf
+import core/typenav
 export typenav   # SymCat / SymInfo / getType / exprSlot moved here; re-export so
                  # the backends' `g.lookupSym(...).cat` etc. keep resolving
-import regbind
+import core/regbind
 export regbind   # the emitter's register-binding state (`g.rb`); the single
                  # owner of reg↔name bindings — see regbind.nim
 

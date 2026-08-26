@@ -5,7 +5,7 @@ import std / [streams, tables]
 when not defined(windows):
   import std / os
 
-import buffers, relocs
+import ../core/[buffers, relocs]
 import dwarf   # the per-proc unwind FACTS (`ProcUnwind`); `.pdata`/`.xdata` below
                # is the third encoding of them, next to `.eh_frame` and Mach-O's
 

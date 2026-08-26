@@ -32,20 +32,22 @@
 
 import std / [assertions, tables, sets, strformat, strutils]
 import nifcore, nifcdecl
-import slots, machine, analyser, planer, programs
-from machine_m import nil
+import core / [asmslots, analyser, planer, programs]
+import arm/machine_a64 as machine
+from arm/machine_m as machine_m import nil
   # Fully qualified: `machine_m` names its own `LR`/`IP`/`IntCalleeSaved` for the
   # Cortex-M register file, every one of which would collide with `machine`'s
   # AArch64 spelling of the same idea. Which target a name refers to should be
   # visible at the use site, not decided by import order.
-import asmbuf
+import core/asmbuf
 import codegen_common
-import layout                    # the `--layout:` board file
-from arm64 import isLogicalImm   # nifasm: the bitmask-immediate predicate, so
+import core/layout               # the `--layout:` board file
+from "../nifasm/arm64/encoder" as arm64 import isLogicalImm
+                                 # nifasm: the bitmask-immediate predicate, so
                                  # arkham folds exactly the constants it can encode
 from thumbimm import nil         # the Thumb-2 twin of the above, shared with
                                  # `nifasm/thumb2` so the two cannot drift apart
-import stress
+import core/stress
 
 let aarch64MachineA = stressed(aarch64MachineN)
   ## The machine arkham allocates against: `aarch64MachineN` itself, unless the

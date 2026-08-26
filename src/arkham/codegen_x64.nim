@@ -19,9 +19,10 @@
 
 import std / [assertions, tables, sets, os, algorithm, strutils]
 import nifcore, nifcdecl
-import slots, machinedesc, analyser, planer, programs
-import asmbuf, codegen_common, machine_x64, stress
-import tracetable            # the trace table's wire format: `TraceInfoSymbol`
+import core / [asmslots, machinedesc, analyser, planer, programs, asmbuf, stress]
+import codegen_common
+import x64/machine as machine_x64
+import "../nifasm/image/tracetable"   # the trace table's wire format: `TraceInfoSymbol`
 
 let x64MachineA = stressed(x64Machine)
   ## The machine arkham allocates against: `x64Machine` itself, unless the

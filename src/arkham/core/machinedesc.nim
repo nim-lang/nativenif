@@ -21,7 +21,7 @@
 ## knowledge of any concrete ABI. A backend describes its register file and
 ## calling convention by populating a `MachineDesc`.
 
-import slots
+import asmslots
 import nifcore   # `Cursor`: a `Mem` location captures the lvalue subtree to re-emit
 
 const SynthMark* = "`"

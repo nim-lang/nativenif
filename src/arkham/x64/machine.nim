@@ -12,7 +12,7 @@
 ## the low 16 `Reg` slots; the slot↔hardware mapping follows the ModRM encoding
 ## order (R0=rax, R1=rcx, …, R7=rdi, R8..R15=r8..r15).
 
-import machinedesc
+import ../core/machinedesc
 
 const
   RAX* = R0

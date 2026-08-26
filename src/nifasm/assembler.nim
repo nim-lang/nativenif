@@ -2,15 +2,16 @@
 import std / [tables, sets, streams, os, osproc, strutils, algorithm]
 import nifcore, nifcoreparse, nifmodules
 import "../../../nimony/src/lib" / [nifreader, symparser]
-import tags, model, tagconv, tagpool
-import buffers, relocs, x86, arm64, elf, macho, pe
-from thumb2 import nil   # qualified: Nim conflates `emitBL` (arm64) with `emitBl`
+import core / [tags, model, tagconv, tagpool, buffers, relocs]
+import x64/encoder as x86
+import arm64/encoder as arm64
+import image / [elf, macho, pe]
+from thumb/encoder as thumb2 import nil   # qualified: Nim conflates `emitBL` (arm64) with `emitBl`
                          # (thumb2), and `Register` would clash three ways
-from elf32 import nil        # qualified: `elf32` repeats ET_EXEC/PT_LOAD/PF_*
+from image/elf32 as elf32 import nil        # qualified: `elf32` repeats ET_EXEC/PT_LOAD/PF_*
                                  # under 32-bit types, which would shadow `elf`'s
-import dwarf, tracetable
-import sem, slots
-import decls
+import image / [dwarf, tracetable]
+import core / [sem, stackslots, decls]
 
 const
   WindowsKernelDll = "kernel32.dll"
@@ -814,7 +815,7 @@ proc computeStackArgSize(t: Type): int =
   result = 0
   for param in t.params:
     if param.typ.isOnStack:
-      result += slots.alignedSize(param.typ)
+      result += stackslots.alignedSize(param.typ)
   result = (result + 15) and not 15
 
 proc parseType(n: var Cursor; scope: Scope; ctx: var GenContext): Type
@@ -992,7 +993,7 @@ proc allocTlsSlotX64(ctx: var GenContext; sym: Symbol; decl: Cursor) =
   ## (foreign decl, main-module pre-pass, `generateSymbol`); all three come here so
   ## the initializer cannot be honoured by only some of them.
   sym.offset = ctx.tlsOffset
-  ctx.tlsOffset += slots.alignedSize(sym.typ)
+  ctx.tlsOffset += stackslots.alignedSize(sym.typ)
   var dn = decl
   let lc = takeLocal(dn)
   if lc.hasVal and lc.val.kind == IntLit:
@@ -2220,7 +2221,7 @@ proc parseOperandA64(n: var Cursor; ctx: var GenContext): OperandA64 =
           if p.typ.isOnStack:
             if p.name == argName:
               break
-            offset += slots.alignedSize(p.typ)
+            offset += stackslots.alignedSize(p.typ)
         result.kind = okImm
         result.argName = argName
         result.immVal = int64(offset + wordIdx * asmWordSize())
@@ -4460,7 +4461,7 @@ proc parseOperandM(n: var Cursor; ctx: var GenContext): OperandM =
         for p in ctx.callContext.typ.params:
           if p.typ.isOnStack:
             if p.name == argName: break
-            offset += slots.alignedSize(p.typ)
+            offset += stackslots.alignedSize(p.typ)
         result.kind = okImm
         result.argName = argName
         result.immVal = int64(offset + wordIdx * asmWordSize())
@@ -6119,7 +6120,7 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
       if param.typ.isOnStack:
         # param.typ is already StackOffT
         ctx.scope.define(Symbol(name: param.name, kind: skParam, typ: param.typ, offset: paramOffset))
-        paramOffset += slots.alignedSize(param.typ.offType)
+        paramOffset += stackslots.alignedSize(param.typ.offType)
       else:
         ctx.scope.define(Symbol(name: param.name, kind: skParam, typ: param.typ, reg: param.reg))
         # Track register-passed params for the bound-register check. x86 spells a
@@ -6886,7 +6887,7 @@ proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
           if p.typ.isOnStack:
             if p.name == argName:
               break
-            offset += slots.alignedSize(p.typ)
+            offset += stackslots.alignedSize(p.typ)
         result.kind = okImm
         result.argName = argName
         result.immVal = int64(offset + wordIdx * asmWordSize())
@@ -10781,7 +10782,7 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
   of skGvar:
     if declTag == GvarD:
       # Allocate space in .bss section
-      let size = slots.alignedSize(sym.typ)
+      let size = stackslots.alignedSize(sym.typ)
       let align = asmSizeOf(sym.typ)
       if align > 1:
         ctx.bssOffset = (ctx.bssOffset + align - 1) and not (align - 1)
@@ -10840,7 +10841,7 @@ proc generateSymbol(ctx: var GenContext; sym: Symbol) =
       ctx.bssOffset += size
   of skTvar:
     if declTag == TvarD:
-      let size = slots.alignedSize(sym.typ)
+      let size = stackslots.alignedSize(sym.typ)
       case ctx.arch
       of Arch.A64:
         # macOS TLV: give the variable a descriptor index and a byte offset in

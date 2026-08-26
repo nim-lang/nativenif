@@ -2,7 +2,7 @@
 
 import std / [streams, os, strutils]
 
-import buffers
+import ../core/buffers
 import dwarf   # the per-proc unwind FACTS; `__TEXT,__eh_frame` below is the same
                # DWARF encoding the ELF path emits
 

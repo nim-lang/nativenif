@@ -1,6 +1,6 @@
 # Refactoring plan: per-CPU subdirectories, `import` instead of `include`
 
-Status: **plan only — nothing moved yet.**
+Status: **S0–S1 done.** See §12 for the running log.
 
 ## 1. Why
 
@@ -149,7 +149,7 @@ src/nifasm/
                           interruptTableBytes                           ~130
     instr.nim       NEW   genInstM + ite/loop/jtrue + genStmtM          ~700
   image/
-    elf64.nim (was elf.nim)  elf32.nim  macho.nim  pe.nim
+    elf.nim  elf32.nim  macho.nim  pe.nim
     dwarf.nim  tracetable.nim                        154/226/1109/894/261/94
     writeelf.nim     NEW  writeElf + appendTraceTable / fillTraceTable   ~450
     writemacho.nim   NEW  writeMachO, writeMachOObject, machoName        ~250
@@ -347,3 +347,33 @@ rather than moving text; it should not be bundled with a move.
   refactoring — both are design changes that deserve their own proposal, with
   the register-binding proof re-checked afterwards.
 * `src/ghast` and `src/common` are out of scope.
+
+## 12. Log
+
+| stage | commit | gate |
+|---|---|---|
+| S0 plan + `tools/refactor_gate.sh` | `0c51e8c` | baseline: 2052 hashes + 405 diagnostics, deterministic across two runs |
+| S1 directories, moves, import rewrite | | clean — 2457/2457 identical; `tests/tester` green |
+
+### Decisions taken while executing
+
+* **The encoders keep their old module names at the use site.** The files are
+  `x64/encoder.nim`, `arm64/encoder.nim`, `thumb/encoder.nim` as planned, but
+  they are imported `as x86` / `as arm64` / `as thumb2`, because the several
+  hundred qualified references (`x86.Register`, `arm64.Condition`,
+  `thumb2.MemWidth`) say which *instruction set* they mean — `encoder.Register`
+  would not. Same for `from image/elf32 as elf32 import nil`. Verified that both
+  `import a/b as c` and `from a/b as c import nil` compile under Nim 2.3.1.
+* **`elf.nim` was not renamed to `elf64.nim`.** It is imported unqualified and
+  the rename bought nothing.
+* **`core/asmbuf.nim` keeps a lone `core → arm` edge**: its `renderReg` field
+  defaults to AArch64's `regName`. The x64 and Cortex-M backends install their
+  own, so this is a default-argument dependency and nothing more. Removing it
+  means naming the renderer at each construction site — a behaviour-visible
+  edit, so it waits for its own stage rather than riding along with a move.
+* **`--path: "../nifasm"` is gone from `src/arkham/nim.cfg`**, as planned. The
+  four cross-tree imports are path-qualified, and with it goes the ambiguity
+  that let `import slots` resolve to either tool's module.
+* `core/lengdecl.nim` and `core/programs.nim` reach nimony by relative path, so
+  their `../../../nimony` became `../../../../nimony` — the one edit a move of
+  this kind always needs and always forgets.

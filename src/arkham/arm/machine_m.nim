@@ -18,7 +18,7 @@
 ## scratch. So unlike AArch64, where seven volatiles are free for temporaries,
 ## there is no spare volatile here at all.
 
-import slots, machinedesc
+import ../core/[asmslots, machinedesc]
 export machinedesc
 
 const

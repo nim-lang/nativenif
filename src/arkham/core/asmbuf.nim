@@ -20,9 +20,13 @@
 
 import std / tables
 import nifcore, nifcoreparse
-import model                 # nifasm: A64Inst, NifasmDecl, NifasmType, NifasmExpr
-import tagpool               # nifasm: the seeded tag pool (and its escape tag)
-import machine               # arkham: Reg, regName
+import "../../nifasm/core" / [model, tagpool]
+                             # nifasm: A64Inst/NifasmDecl/NifasmType/NifasmExpr,
+                             # and the seeded tag pool (with its escape tag)
+import ../arm/machine_a64 as machine
+                             # arkham: Reg, and the DEFAULT `renderReg` — AArch64's
+                             # `regName`. The x64 and Cortex-M backends install their
+                             # own, so this edge is only about the default argument.
 import peephole              # the finished-shape rewrites, applied in `render`
 export A64Inst, X64Inst, NifasmDecl, NifasmType, NifasmExpr, X64Flag
 export MInst   # the Cortex-M-only mnemonics (`bkpt`, `bx`, `uxtb`, …). Everything
