@@ -619,7 +619,7 @@ On AArch64 the ABI already reserves `x16` (IP0) and `x17` (IP1) for linker-gener
 
 **Implications for code generators:**
 
-- Do not allocate variables to x16/x17, and do not expect a value put there to survive the next instruction the assembler expands. (This is a contract, not a check: nifasm does *not* reject code that names them. arkham keeps them out of its pools — `ReservedRegs` in `src/arkham/machine.nim`.)
+- Do not allocate variables to x16/x17, and do not expect a value put there to survive the next instruction the assembler expands. (This is a contract, not a check: nifasm does *not* reject code that names them. arkham keeps them out of its pools — `ReservedRegs` in `src/arkham/arm/machine_a64.nim`.)
 - Everything else is yours.
 - You do not have to account for large frame offsets. The assembler synthesizes the address through its scratch register when needed, with the type checking intact.
 

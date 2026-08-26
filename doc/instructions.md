@@ -9,8 +9,8 @@ The `Enums` column names the Nim enums a tag becomes a member of, and thereby
 which target it belongs to: `X64Inst` (x86-64), `A64Inst` (AArch64), `MInst`
 (Thumb-2 / Cortex-M), or several of them for the cross-target vocabulary. This
 table is the input to
-`tools/gen_instructions.nim`, which generates `src/nifasm/tags.nim` (the tag ids)
-and `src/nifasm/model.nim` (the enums). Both are generated — edit this file, not
+`tools/gen_instructions.nim`, which generates `src/nifasm/core/tags.nim` (the tag
+ids) and `src/nifasm/core/model.nim` (the enums). Both are generated — edit this file, not
 them, and regenerate from the repository root:
 
 ```sh
