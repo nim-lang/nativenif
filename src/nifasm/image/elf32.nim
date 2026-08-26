@@ -34,6 +34,7 @@ type
 const
   ET_EXEC* = 2.Elf32_Half
   EM_ARM* = 40.Elf32_Half
+  EM_AVR* = 83.Elf32_Half
   PT_LOAD* = 1.Elf32_Word
   PF_X* = 1.Elf32_Word
   PF_W* = 2.Elf32_Word
@@ -42,6 +43,11 @@ const
   EF_ARM_EABI_VER5* = 0x05000000.Elf32_Word
     ## `e_flags` for an EABI 5 object. Nothing in QEMU checks it, but a real
     ## toolchain's `readelf`/`gdb` reads the ABI version from here.
+
+  EF_AVR_MACH_AVR5* = 5.Elf32_Word
+    ## `e_flags` naming the avr5 instruction set. `avr-objdump` reads it to pick
+    ## a disassembly table, so a wrong value produces plausible-looking nonsense
+    ## rather than an error.
 
   Elf32EhdrSize* = 52
   Elf32PhdrSize* = 32
@@ -141,8 +147,15 @@ proc initInterruptTable*(stackTop: uint32; resetHandler: uint32;
     result[i] = byte((stackTop shr (8 * i)) and 0xFF)
     result[4 + i] = byte((entry shr (8 * i)) and 0xFF)
 
-proc writeElf32*(segments: openArray[Segment]; entry: uint32): seq[byte] =
-  ## Serialize `segments` as an ET_EXEC ELF32 for EM_ARM.
+proc writeElf32*(segments: openArray[Segment]; entry: uint32;
+                 machine = EM_ARM; flags = EF_ARM_EABI_VER5;
+                 entryTag: uint32 = 1): seq[byte] =
+  ## Serialize `segments` as an ET_EXEC ELF32.
+  ##
+  ## The three optional parameters are what the AVR target varies, and each of
+  ## them is wrong-by-default for it: `entryTag` is OR'd into `e_entry` and is 1
+  ## on ARM, where bit 0 of a code address is the Thumb-state marker — on AVR it
+  ## would name an odd address, which is not a valid instruction address at all.
   var out0 = initBytes()
   let phCount = segments.len
   var fileOff = Elf32EhdrSize + Elf32PhdrSize * phCount
@@ -162,12 +175,12 @@ proc writeElf32*(segments: openArray[Segment]; entry: uint32): seq[byte] =
   out0.add 1'u8            # EI_VERSION
   for _ in 0 ..< 9: out0.add 0'u8
   out0.addUint16 uint16(ET_EXEC)
-  out0.addUint16 uint16(EM_ARM)
+  out0.addUint16 uint16(machine)
   out0.addUint32 1'u32                      # e_version
-  out0.addUint32 entry or 1'u32             # e_entry, Thumb bit set
+  out0.addUint32 entry or entryTag          # e_entry (+ the Thumb bit on ARM)
   out0.addUint32 uint32(Elf32EhdrSize)      # e_phoff
   out0.addUint32 0'u32                      # e_shoff: no section headers
-  out0.addUint32 uint32(EF_ARM_EABI_VER5)   # e_flags
+  out0.addUint32 uint32(flags)              # e_flags
   out0.addUint16 uint16(Elf32EhdrSize)
   out0.addUint16 uint16(Elf32PhdrSize)
   out0.addUint16 uint16(phCount)

@@ -978,6 +978,56 @@ proc thumb2SelfTest() =
   echo "Thumb-2 encoder self-test successful (all checks passed)"
 
 
+const avrSim = "bin" / "avrtest"
+
+proc avrSelfTest() =
+  ## Build the AVR encoder's self-checking image and run it. The image computes
+  ## 59 expressions and exits with the 1-based index of the first whose result
+  ## differs from the expected value, so a failure NAMES the broken encoding.
+  ##
+  ## Then the same image is built 59 more times, each with one check's EXPECTED
+  ## value corrupted, and each of those must fail with exactly that index. That
+  ## sweep is what makes the first run mean something: a check whose emitter
+  ## writes no bytes at all, or which compares against a value the harness itself
+  ## left in the pair, passes the plain run and says nothing.
+  ##
+  ## AVRtest is built from source rather than installed — see doc/internals/avr.md.
+  if not fileExists(avrSim):
+    echo avrSim, " not found - skipping AVR encoder self-test ",
+         "(build it: see doc/internals/avr.md)"
+    return
+  let gen = ("bin" / "avr_selftest").addFileExt(ExeExt)
+  exec "nim c --hints:off --warnings:off -o:" & gen & " tests/avr_selftest.nim"
+  let elf = "tests" / "avr_selftest.elf"
+
+  proc runImage(): (string, int) =
+    var args = @["-q", "-mmcu=avr5", "-s", "32k", elf]
+    runProgram(avrSim, args)
+
+  exec quoteShell(gen) & " " & quoteShell(elf)
+  let (output, code) = runImage()
+  if code == timeoutExitCode:
+    quit "FAILURE (TIMEOUT) AVR encoder self-test\n"
+  if code != 0:
+    quit "FAILURE AVR encoder self-test: check #" & $code &
+         " produced the wrong value\n" & output &
+         "\n(run `" & gen & " --list` to name the checks by index)"
+
+  let (listing, listCode) = runProgram(gen, @["--list"])
+  if listCode != 0: quit "FAILURE AVR encoder self-test: --list failed"
+  let total = listing.strip.splitLines.len
+  for i in 1 .. total:
+    exec quoteShell(gen) & " " & quoteShell(elf) & " --mutate:" & $i
+    let (_, mutCode) = runImage()
+    if mutCode != i:
+      quit "FAILURE AVR encoder self-test: check #" & $i &
+           " does not detect its own mutation (exited " & $mutCode &
+           ", expected " & $i & ") — it is passing vacuously"
+  removeFile elf
+  echo "AVR encoder self-test successful (", total,
+       " checks, each verified to detect its own mutation)"
+
+
 proc cortexMAsmTests() =
   ## Assemble hand-written Cortex-M asm-NIF with nifasm and run the resulting
   ## firmware under QEMU. This is the END-TO-END gate for the instruction
@@ -1633,6 +1683,9 @@ cortexMInterruptTests()
 cortexMLayoutTests()
 arkhamCortexMTests()
 arkhamCortexM64Tests()
+
+# AVR: encoder-level coverage. Host-independent — it needs only `bin/avrtest`.
+avrSelfTest()
 
 # arkham native-codegen tests: arkham emits the host arch (x86-64 on Linux,
 # AArch64/Darwin on macOS), so we run them only where the binaries execute.

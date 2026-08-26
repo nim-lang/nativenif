@@ -44,6 +44,8 @@ proc longSizeOf(kind: RelocKind): int {.inline.} =
   of rkADRADD: 8
   of rkTB, rkTBL, rkTBcond, rkTADR: 4
   of rkTMovwMovt, rkTMovwMovtFunc: 8
+  of rkAvrRjmp, rkAvrRcall, rkAvrBrcond: 2
+  of rkAvrJmp, rkAvrCall, rkAvrLdiAddr: 4
 
 proc shortJccOpcode(kind: RelocKind): byte =
   case kind

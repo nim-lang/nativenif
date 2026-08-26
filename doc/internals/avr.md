@@ -1,12 +1,13 @@
 # AVR support
 
-Status: **M0 complete.**
+Status: **M0, M1, M2a complete.**
 
 | Milestone | State |
 |---|---|
 | M0 target contract | done — `tools/avr_probe.nim`, 18 checks |
-| M1 arch + word-size plumbing | not started |
-| M2 AVR encoder + ELF32 writer | not started |
+| M1 arch + word-size plumbing | done — `Arch.Avr`, `TargetArch.Avr`, `Word16` |
+| M2a encoder + relocations | done — `src/nifasm/avr/encoder.nim`, 59-check self-test |
+| M2b ELF32 image writer | not started |
 | M3 assembler integration | not started |
 | M4 arkham backend | not started |
 | M5 multiply, divide, variable shifts | not started |
@@ -170,6 +171,33 @@ RAM but make every read of it a different instruction (`lpm`) selected by where
 the pointer came from — a distinction Leng does not draw and the type system
 here has no way to carry. AVR-GCC makes the same default choice and offers
 `PROGMEM` as the opt-out; an equivalent is M6, not a precondition.
+
+## What M2a established
+
+`src/nifasm/avr/encoder.nim` is dependency-free, in the shape of
+`thumb/encoder.nim`: `emitXxx(dest: var Bytes; …)` for everything that needs no
+relocation, `emitXxx(dest: var Buffer; …; target: LabelId)` for everything that
+does. Six relocation kinds carry the word-vs-byte conversion that is this
+target's signature hazard, and their reach is short enough to matter:
+
+| kind | form | reach |
+|---|---|---|
+| `rkAvrBrcond` | one word, all 14 conditions | ±128 **bytes** |
+| `rkAvrRjmp` / `rkAvrRcall` | one word | ±4 KB |
+| `rkAvrJmp` / `rkAvrCall` | two words, absolute | all of flash |
+| `rkAvrLdiAddr` | an `ldi` pair carrying a data address | none |
+
+`tests/avr_selftest.nim` builds one image that computes 59 expressions and exits
+with the index of the first wrong one. It then rebuilds that image 59 more times
+with one check's *expected* value corrupted each time, and requires every one of
+those runs to fail with exactly that index — so a check whose emitter writes no
+bytes, or which compares against a value the harness itself left in the pair,
+cannot pass quietly. `tests/tester` runs the whole sweep.
+
+It has already earned its keep. `ld rd, Z` was encoded on the 0x9000 opcode,
+where the plain `ld` exists only for X; on Y and Z it is the `q = 0` case of
+`ldd`, on 0x8000. The wrong value is `lds` — a two-word direct load that
+swallows the following instruction as its address operand.
 
 ## What M0 established
 
