@@ -22,11 +22,33 @@ type
     ResultTagId
     ClobberTagId
     VarTagId
+    LayoutTagId
+    FlashTagId
+    SramTagId
+    StartAddressTagId
+    BytesTagId
+    KilobytesTagId
+    MegabytesTagId
+    StacksTagId
+    SlotsTagId
+    HeapTagId
+    NoinitTagId
+    CoreTagId
+    InterruptsTagId
+    IrqTagId
     ArchTagId
     STagId
     AlignTagId
     SsizeTagId
     CsizeTagId
+    DataloadTagId
+    DatavmaTagId
+    DatasizeTagId
+    HeapstartTagId
+    HeapsizeTagId
+    NoinitstartTagId
+    NoinitsizeTagId
+    BsssizeTagId
     ArgTagId
     ResTagId
     PrepareTagId
@@ -35,7 +57,31 @@ type
     AddTagId
     SubTagId
     MulTagId
+    SdivTagId
+    UdivTagId
+    Add3TagId
+    Sub3TagId
+    Mul3TagId
+    And3TagId
+    Orr3TagId
+    Eor3TagId
+    Lsl3TagId
+    Lsr3TagId
+    Asr3TagId
+    AddwTagId
+    SubwTagId
+    MulwTagId
+    Addw3TagId
+    Subw3TagId
+    Mulw3TagId
+    GloadTagId
+    GstoreTagId
     AndTagId
+    OrrTagId
+    EorTagId
+    LslTagId
+    LsrTagId
+    AsrTagId
     NegTagId
     CmpTagId
     CallTagId
@@ -44,6 +90,24 @@ type
     PopframeTagId
     RetTagId
     NopTagId
+    AdrTagId
+    LdrTagId
+    StrTagId
+    BTagId
+    BlTagId
+    BeqTagId
+    BneTagId
+    BltTagId
+    BleTagId
+    BgtTagId
+    BgeTagId
+    BloTagId
+    BlsTagId
+    BhiTagId
+    BhsTagId
+    CbzTagId
+    CbnzTagId
+    CselltTagId
     LabTagId
     IteTagId
     LoopTagId
@@ -186,6 +250,9 @@ type
     EnumTagId
     EfldTagId
     ProctypeTagId
+    DmbTagId
+    ClrexTagId
+    YieldTagId
     D0TagId
     D1TagId
     D2TagId
@@ -250,10 +317,28 @@ type
     S29TagId
     S30TagId
     S31TagId
+    FmovTagId
+    FaddTagId
+    FsubTagId
+    FmulTagId
+    FdivTagId
+    FnegTagId
+    FcmpTagId
+    FldrTagId
+    FstrTagId
+    ScvtfTagId
+    UcvtfTagId
+    FcvtzsTagId
+    FcvtzuTagId
+    LdrbTagId
+    StrbTagId
     RebindTagId
     WithregTagId
     RegsTagId
     ScopeTagId
+    ClzTagId
+    RbitTagId
+    RevTagId
     LenientTagId
     OtherTagId
     MovzxTagId
@@ -264,27 +349,8 @@ type
     ImulTagId
     DivTagId
     IdivTagId
-    SdivTagId
-    UdivTagId
     SmulhTagId
     UmulhTagId
-    Add3TagId
-    Sub3TagId
-    Mul3TagId
-    And3TagId
-    Orr3TagId
-    Eor3TagId
-    Lsl3TagId
-    Lsr3TagId
-    Asr3TagId
-    AddwTagId
-    SubwTagId
-    MulwTagId
-    Addw3TagId
-    Subw3TagId
-    Mulw3TagId
-    GloadTagId
-    GstoreTagId
     AddsdTagId
     SubsdTagId
     MulsdTagId
@@ -305,16 +371,11 @@ type
     MovfqTagId
     MovfdTagId
     OrTagId
-    OrrTagId
     XorTagId
-    EorTagId
     ShlTagId
-    LslTagId
     ShrTagId
-    LsrTagId
     SalTagId
     SarTagId
-    AsrTagId
     IncTagId
     DecTagId
     NotTagId
@@ -409,28 +470,10 @@ type
     PopTagId
     SyscallTagId
     SvcTagId
-    AdrTagId
-    LdrTagId
-    StrTagId
     StpTagId
     LdpTagId
-    BTagId
-    BlTagId
-    BeqTagId
-    BneTagId
-    BltTagId
-    BleTagId
-    BgtTagId
-    BgeTagId
-    BloTagId
-    BlsTagId
-    BhiTagId
-    BhsTagId
-    CbzTagId
-    CbnzTagId
     CseleqTagId
     CselneTagId
-    CselltTagId
     CselleTagId
     CselgtTagId
     CselgeTagId
@@ -471,32 +514,13 @@ type
     StlxrTagId
     LdarTagId
     StlrTagId
-    DmbTagId
-    ClrexTagId
-    YieldTagId
-    FmovTagId
-    FaddTagId
-    FsubTagId
-    FmulTagId
-    FdivTagId
-    FnegTagId
-    FcmpTagId
-    FldrTagId
-    FstrTagId
-    ScvtfTagId
-    UcvtfTagId
-    FcvtzsTagId
-    FcvtzuTagId
+    LdrexTagId
+    StrexTagId
     FcvtTagId
     FstpTagId
     FldpTagId
-    LdrbTagId
-    StrbTagId
     BswapTagId
     PopcntTagId
-    ClzTagId
-    RbitTagId
-    RevTagId
     CasejmpTagId
     JsTagId
     JnsTagId
@@ -522,6 +546,30 @@ type
     VeorTagId
     VaddvTagId
     VgreqTagId
+    BkptTagId
+    BxTagId
+    BlxTagId
+    MvnTagId
+    Bic3TagId
+    Adds3TagId
+    Adcs3TagId
+    Subs3TagId
+    Sbcs3TagId
+    MlsTagId
+    UmullTagId
+    SmullTagId
+    TstTagId
+    UxtbTagId
+    SxtbTagId
+    UxthTagId
+    SxthTagId
+    LdrhTagId
+    StrhTagId
+    LdrsbTagId
+    LdrshTagId
+    WfiTagId
+    DsbTagId
+    IsbTagId
 const
   TagData*: array[TagEnum, (string, int)] = [
     ("InvalidTagId", 0),
@@ -544,504 +592,552 @@ const
     ("result", 17),
     ("clobber", 18),
     ("var", 19),
-    ("arch", 20),
-    ("s", 21),
-    ("align", 22),
-    ("ssize", 23),
-    ("csize", 24),
-    ("arg", 25),
-    ("res", 26),
-    ("prepare", 27),
-    ("mov", 28),
-    ("lea", 29),
-    ("add", 30),
-    ("sub", 31),
-    ("mul", 32),
-    ("and", 33),
-    ("neg", 34),
-    ("cmp", 35),
-    ("call", 36),
-    ("extcall", 37),
-    ("tailcall", 38),
-    ("popframe", 39),
-    ("ret", 40),
-    ("nop", 41),
-    ("lab", 42),
-    ("ite", 43),
-    ("loop", 44),
-    ("stmts", 45),
-    ("cfvar", 46),
-    ("jtrue", 47),
-    ("dot", 48),
-    ("at", 49),
-    ("mem", 50),
-    ("rodata", 51),
-    ("gvar", 52),
-    ("tvar", 53),
-    ("imp", 54),
-    ("extproc", 55),
-    ("syproc", 56),
-    ("kill", 57),
-    ("cast", 58),
-    ("reloc", 59),
-    ("rax", 60),
-    ("rbx", 61),
-    ("rcx", 62),
-    ("rdx", 63),
-    ("rsi", 64),
-    ("rdi", 65),
-    ("rbp", 66),
-    ("rsp", 67),
-    ("r8", 68),
-    ("r9", 69),
-    ("r10", 70),
-    ("r11", 71),
-    ("r12", 72),
-    ("r13", 73),
-    ("r14", 74),
-    ("r15", 75),
-    ("r0", 76),
-    ("r1", 77),
-    ("r2", 78),
-    ("r3", 79),
-    ("r4", 80),
-    ("r5", 81),
-    ("r6", 82),
-    ("r7", 83),
-    ("xmm0", 84),
-    ("xmm1", 85),
-    ("xmm2", 86),
-    ("xmm3", 87),
-    ("xmm4", 88),
-    ("xmm5", 89),
-    ("xmm6", 90),
-    ("xmm7", 91),
-    ("xmm8", 92),
-    ("xmm9", 93),
-    ("xmm10", 94),
-    ("xmm11", 95),
-    ("xmm12", 96),
-    ("xmm13", 97),
-    ("xmm14", 98),
-    ("xmm15", 99),
-    ("x0", 100),
-    ("x1", 101),
-    ("x2", 102),
-    ("x3", 103),
-    ("x4", 104),
-    ("x5", 105),
-    ("x6", 106),
-    ("x7", 107),
-    ("x8", 108),
-    ("x9", 109),
-    ("x10", 110),
-    ("x11", 111),
-    ("x12", 112),
-    ("x13", 113),
-    ("x14", 114),
-    ("x15", 115),
-    ("x16", 116),
-    ("x17", 117),
-    ("x18", 118),
-    ("x19", 119),
-    ("x20", 120),
-    ("x21", 121),
-    ("x22", 122),
-    ("x23", 123),
-    ("x24", 124),
-    ("x25", 125),
-    ("x26", 126),
-    ("x27", 127),
-    ("x28", 128),
-    ("x29", 129),
-    ("x30", 130),
-    ("sp", 131),
-    ("w0", 132),
-    ("w1", 133),
-    ("w2", 134),
-    ("w3", 135),
-    ("w4", 136),
-    ("w5", 137),
-    ("w6", 138),
-    ("w7", 139),
-    ("w8", 140),
-    ("w9", 141),
-    ("w10", 142),
-    ("w11", 143),
-    ("w12", 144),
-    ("w13", 145),
-    ("w14", 146),
-    ("w15", 147),
-    ("w16", 148),
-    ("w17", 149),
-    ("w18", 150),
-    ("w19", 151),
-    ("w20", 152),
-    ("w21", 153),
-    ("w22", 154),
-    ("w23", 155),
-    ("w24", 156),
-    ("w25", 157),
-    ("w26", 158),
-    ("w27", 159),
-    ("w28", 160),
-    ("w29", 161),
-    ("w30", 162),
-    ("wsp", 163),
-    ("lr", 164),
-    ("fp", 165),
-    ("xzr", 166),
-    ("of", 167),
-    ("no", 168),
-    ("zf", 169),
-    ("nz", 170),
-    ("sf", 171),
-    ("ns", 172),
-    ("cf", 173),
-    ("nc", 174),
-    ("pf", 175),
-    ("np", 176),
-    ("c", 177),
-    ("void", 178),
-    ("varargs", 179),
-    ("flexarray", 180),
-    ("enum", 181),
-    ("efld", 182),
-    ("proctype", 183),
-    ("d0", 184),
-    ("d1", 185),
-    ("d2", 186),
-    ("d3", 187),
-    ("d4", 188),
-    ("d5", 189),
-    ("d6", 190),
-    ("d7", 191),
-    ("d8", 192),
-    ("d9", 193),
-    ("d10", 194),
-    ("d11", 195),
-    ("d12", 196),
-    ("d13", 197),
-    ("d14", 198),
-    ("d15", 199),
-    ("d16", 200),
-    ("d17", 201),
-    ("d18", 202),
-    ("d19", 203),
-    ("d20", 204),
-    ("d21", 205),
-    ("d22", 206),
-    ("d23", 207),
-    ("d24", 208),
-    ("d25", 209),
-    ("d26", 210),
-    ("d27", 211),
-    ("d28", 212),
-    ("d29", 213),
-    ("d30", 214),
-    ("d31", 215),
-    ("s0", 216),
-    ("s1", 217),
-    ("s2", 218),
-    ("s3", 219),
-    ("s4", 220),
-    ("s5", 221),
-    ("s6", 222),
-    ("s7", 223),
-    ("s8", 224),
-    ("s9", 225),
-    ("s10", 226),
-    ("s11", 227),
-    ("s12", 228),
-    ("s13", 229),
-    ("s14", 230),
-    ("s15", 231),
-    ("s16", 232),
-    ("s17", 233),
-    ("s18", 234),
-    ("s19", 235),
-    ("s20", 236),
-    ("s21", 237),
-    ("s22", 238),
-    ("s23", 239),
-    ("s24", 240),
-    ("s25", 241),
-    ("s26", 242),
-    ("s27", 243),
-    ("s28", 244),
-    ("s29", 245),
-    ("s30", 246),
-    ("s31", 247),
-    ("rebind", 248),
-    ("withreg", 249),
-    ("regs", 250),
-    ("scope", 251),
-    ("lenient", 252),
-    ("other", 253),
-    ("movzx", 254),
-    ("movsx", 255),
-    ("movapd", 256),
-    ("movsd", 257),
-    ("movdqu", 258),
-    ("imul", 259),
-    ("div", 260),
-    ("idiv", 261),
-    ("sdiv", 262),
-    ("udiv", 263),
-    ("smulh", 264),
-    ("umulh", 265),
-    ("add3", 266),
-    ("sub3", 267),
-    ("mul3", 268),
-    ("and3", 269),
-    ("orr3", 270),
-    ("eor3", 271),
-    ("lsl3", 272),
-    ("lsr3", 273),
-    ("asr3", 274),
-    ("addw", 275),
-    ("subw", 276),
-    ("mulw", 277),
-    ("addw3", 278),
-    ("subw3", 279),
-    ("mulw3", 280),
-    ("gload", 281),
-    ("gstore", 282),
-    ("addsd", 283),
-    ("subsd", 284),
-    ("mulsd", 285),
-    ("divsd", 286),
-    ("movss", 287),
-    ("addss", 288),
-    ("subss", 289),
-    ("mulss", 290),
-    ("divss", 291),
-    ("cvtsi2sd", 292),
-    ("cvtsi2ss", 293),
-    ("cvttsd2si", 294),
-    ("cvttss2si", 295),
-    ("cvtsd2ss", 296),
-    ("cvtss2sd", 297),
-    ("comisd", 298),
-    ("comiss", 299),
-    ("movfq", 300),
-    ("movfd", 301),
-    ("or", 302),
-    ("orr", 303),
-    ("xor", 304),
-    ("eor", 305),
-    ("shl", 306),
-    ("lsl", 307),
-    ("shr", 308),
-    ("lsr", 309),
-    ("sal", 310),
-    ("sar", 311),
-    ("asr", 312),
-    ("inc", 313),
-    ("dec", 314),
-    ("not", 315),
-    ("rol", 316),
-    ("ror", 317),
-    ("rcl", 318),
-    ("rcr", 319),
-    ("bsf", 320),
-    ("bsr", 321),
-    ("bt", 322),
-    ("bts", 323),
-    ("btr", 324),
-    ("btc", 325),
-    ("test", 326),
-    ("sete", 327),
-    ("setz", 328),
-    ("setne", 329),
-    ("setnz", 330),
-    ("seta", 331),
-    ("setnbe", 332),
-    ("setae", 333),
-    ("setnb", 334),
-    ("setnc", 335),
-    ("setb", 336),
-    ("setnae", 337),
-    ("setc", 338),
-    ("setbe", 339),
-    ("setna", 340),
-    ("setg", 341),
-    ("setnle", 342),
-    ("setge", 343),
-    ("setnl", 344),
-    ("setl", 345),
-    ("setnge", 346),
-    ("setle", 347),
-    ("setng", 348),
-    ("seto", 349),
-    ("sets", 350),
-    ("setp", 351),
-    ("cmove", 352),
-    ("cmovz", 353),
-    ("cmovne", 354),
-    ("cmovnz", 355),
-    ("cmova", 356),
-    ("cmovnbe", 357),
-    ("cmovae", 358),
-    ("cmovnb", 359),
-    ("cmovnc", 360),
-    ("cmovb", 361),
-    ("cmovnae", 362),
-    ("cmovc", 363),
-    ("cmovbe", 364),
-    ("cmovna", 365),
-    ("cmovg", 366),
-    ("cmovnle", 367),
-    ("cmovge", 368),
-    ("cmovnl", 369),
-    ("cmovl", 370),
-    ("cmovnge", 371),
-    ("cmovle", 372),
-    ("cmovng", 373),
-    ("cmovo", 374),
-    ("cmovno", 375),
-    ("cmovs", 376),
-    ("cmovns", 377),
-    ("cmovp", 378),
-    ("cmovnp", 379),
-    ("cmovpe", 380),
-    ("cmovpo", 381),
-    ("jmp", 382),
-    ("je", 383),
-    ("jz", 384),
-    ("jne", 385),
-    ("jnz", 386),
-    ("jg", 387),
-    ("jng", 388),
-    ("jge", 389),
-    ("jnge", 390),
-    ("ja", 391),
-    ("jna", 392),
-    ("jae", 393),
-    ("jnae", 394),
-    ("jl", 395),
-    ("jle", 396),
-    ("jb", 397),
-    ("jbe", 398),
-    ("jo", 399),
-    ("jno", 400),
-    ("jp", 401),
-    ("iat", 402),
-    ("push", 403),
-    ("pop", 404),
-    ("syscall", 405),
-    ("svc", 406),
-    ("adr", 407),
-    ("ldr", 408),
-    ("str", 409),
-    ("stp", 410),
-    ("ldp", 411),
-    ("b", 412),
-    ("bl", 413),
-    ("beq", 414),
-    ("bne", 415),
-    ("blt", 416),
-    ("ble", 417),
-    ("bgt", 418),
-    ("bge", 419),
-    ("blo", 420),
-    ("bls", 421),
-    ("bhi", 422),
-    ("bhs", 423),
-    ("cbz", 424),
-    ("cbnz", 425),
-    ("cseleq", 426),
-    ("cselne", 427),
-    ("csellt", 428),
-    ("cselle", 429),
-    ("cselgt", 430),
-    ("cselge", 431),
-    ("csello", 432),
-    ("csells", 433),
-    ("cselhi", 434),
-    ("cselhs", 435),
-    ("cseteq", 436),
-    ("csetne", 437),
-    ("csetlt", 438),
-    ("csetle", 439),
-    ("csetgt", 440),
-    ("csetge", 441),
-    ("csetlo", 442),
-    ("csetls", 443),
-    ("csethi", 444),
-    ("cseths", 445),
-    ("lock", 446),
-    ("xchg", 447),
-    ("cmpxchg", 448),
-    ("xadd", 449),
-    ("cmpxchg8b", 450),
-    ("mfence", 451),
-    ("sfence", 452),
-    ("lfence", 453),
-    ("pause", 454),
-    ("clflush", 455),
-    ("clflushopt", 456),
-    ("prefetcht0", 457),
-    ("prefetcht1", 458),
-    ("prefetcht2", 459),
-    ("prefetchnta", 460),
-    ("repmovsb", 461),
-    ("repmovsw", 462),
-    ("repmovsd", 463),
-    ("repmovsq", 464),
-    ("ldaxr", 465),
-    ("stlxr", 466),
-    ("ldar", 467),
-    ("stlr", 468),
-    ("dmb", 469),
-    ("clrex", 470),
-    ("yield", 471),
-    ("fmov", 472),
-    ("fadd", 473),
-    ("fsub", 474),
-    ("fmul", 475),
-    ("fdiv", 476),
-    ("fneg", 477),
-    ("fcmp", 478),
-    ("fldr", 479),
-    ("fstr", 480),
-    ("scvtf", 481),
-    ("ucvtf", 482),
-    ("fcvtzs", 483),
-    ("fcvtzu", 484),
-    ("fcvt", 485),
-    ("fstp", 486),
-    ("fldp", 487),
-    ("ldrb", 488),
-    ("strb", 489),
-    ("bswap", 490),
-    ("popcnt", 491),
-    ("clz", 492),
-    ("rbit", 493),
-    ("rev", 494),
-    ("casejmp", 495),
-    ("js", 496),
-    ("jns", 497),
-    ("punpcklqdq", 498),
-    ("movupd", 499),
-    ("movups", 500),
-    ("addpd", 501),
-    ("subpd", 502),
-    ("mulpd", 503),
-    ("addps", 504),
-    ("subps", 505),
-    ("mulps", 506),
-    ("shufps", 507),
-    ("repstosb", 508),
-    ("repstosq", 509),
-    ("fldrq", 510),
-    ("fstrq", 511),
-    ("vfadd", 512),
-    ("vfsub", 513),
-    ("vfmul", 514),
-    ("vfmla", 515),
-    ("vdup", 516),
-    ("veor", 517),
-    ("vaddv", 518),
-    ("vgreq", 519)
+    ("layout", 20),
+    ("flash", 21),
+    ("sram", 22),
+    ("startAddress", 23),
+    ("bytes", 24),
+    ("kilobytes", 25),
+    ("megabytes", 26),
+    ("stacks", 27),
+    ("slots", 28),
+    ("heap", 29),
+    ("noinit", 30),
+    ("core", 31),
+    ("interrupts", 32),
+    ("irq", 33),
+    ("arch", 34),
+    ("s", 35),
+    ("align", 36),
+    ("ssize", 37),
+    ("csize", 38),
+    ("dataload", 39),
+    ("datavma", 40),
+    ("datasize", 41),
+    ("heapstart", 42),
+    ("heapsize", 43),
+    ("noinitstart", 44),
+    ("noinitsize", 45),
+    ("bsssize", 46),
+    ("arg", 47),
+    ("res", 48),
+    ("prepare", 49),
+    ("mov", 50),
+    ("lea", 51),
+    ("add", 52),
+    ("sub", 53),
+    ("mul", 54),
+    ("sdiv", 55),
+    ("udiv", 56),
+    ("add3", 57),
+    ("sub3", 58),
+    ("mul3", 59),
+    ("and3", 60),
+    ("orr3", 61),
+    ("eor3", 62),
+    ("lsl3", 63),
+    ("lsr3", 64),
+    ("asr3", 65),
+    ("addw", 66),
+    ("subw", 67),
+    ("mulw", 68),
+    ("addw3", 69),
+    ("subw3", 70),
+    ("mulw3", 71),
+    ("gload", 72),
+    ("gstore", 73),
+    ("and", 74),
+    ("orr", 75),
+    ("eor", 76),
+    ("lsl", 77),
+    ("lsr", 78),
+    ("asr", 79),
+    ("neg", 80),
+    ("cmp", 81),
+    ("call", 82),
+    ("extcall", 83),
+    ("tailcall", 84),
+    ("popframe", 85),
+    ("ret", 86),
+    ("nop", 87),
+    ("adr", 88),
+    ("ldr", 89),
+    ("str", 90),
+    ("b", 91),
+    ("bl", 92),
+    ("beq", 93),
+    ("bne", 94),
+    ("blt", 95),
+    ("ble", 96),
+    ("bgt", 97),
+    ("bge", 98),
+    ("blo", 99),
+    ("bls", 100),
+    ("bhi", 101),
+    ("bhs", 102),
+    ("cbz", 103),
+    ("cbnz", 104),
+    ("csellt", 105),
+    ("lab", 106),
+    ("ite", 107),
+    ("loop", 108),
+    ("stmts", 109),
+    ("cfvar", 110),
+    ("jtrue", 111),
+    ("dot", 112),
+    ("at", 113),
+    ("mem", 114),
+    ("rodata", 115),
+    ("gvar", 116),
+    ("tvar", 117),
+    ("imp", 118),
+    ("extproc", 119),
+    ("syproc", 120),
+    ("kill", 121),
+    ("cast", 122),
+    ("reloc", 123),
+    ("rax", 124),
+    ("rbx", 125),
+    ("rcx", 126),
+    ("rdx", 127),
+    ("rsi", 128),
+    ("rdi", 129),
+    ("rbp", 130),
+    ("rsp", 131),
+    ("r8", 132),
+    ("r9", 133),
+    ("r10", 134),
+    ("r11", 135),
+    ("r12", 136),
+    ("r13", 137),
+    ("r14", 138),
+    ("r15", 139),
+    ("r0", 140),
+    ("r1", 141),
+    ("r2", 142),
+    ("r3", 143),
+    ("r4", 144),
+    ("r5", 145),
+    ("r6", 146),
+    ("r7", 147),
+    ("xmm0", 148),
+    ("xmm1", 149),
+    ("xmm2", 150),
+    ("xmm3", 151),
+    ("xmm4", 152),
+    ("xmm5", 153),
+    ("xmm6", 154),
+    ("xmm7", 155),
+    ("xmm8", 156),
+    ("xmm9", 157),
+    ("xmm10", 158),
+    ("xmm11", 159),
+    ("xmm12", 160),
+    ("xmm13", 161),
+    ("xmm14", 162),
+    ("xmm15", 163),
+    ("x0", 164),
+    ("x1", 165),
+    ("x2", 166),
+    ("x3", 167),
+    ("x4", 168),
+    ("x5", 169),
+    ("x6", 170),
+    ("x7", 171),
+    ("x8", 172),
+    ("x9", 173),
+    ("x10", 174),
+    ("x11", 175),
+    ("x12", 176),
+    ("x13", 177),
+    ("x14", 178),
+    ("x15", 179),
+    ("x16", 180),
+    ("x17", 181),
+    ("x18", 182),
+    ("x19", 183),
+    ("x20", 184),
+    ("x21", 185),
+    ("x22", 186),
+    ("x23", 187),
+    ("x24", 188),
+    ("x25", 189),
+    ("x26", 190),
+    ("x27", 191),
+    ("x28", 192),
+    ("x29", 193),
+    ("x30", 194),
+    ("sp", 195),
+    ("w0", 196),
+    ("w1", 197),
+    ("w2", 198),
+    ("w3", 199),
+    ("w4", 200),
+    ("w5", 201),
+    ("w6", 202),
+    ("w7", 203),
+    ("w8", 204),
+    ("w9", 205),
+    ("w10", 206),
+    ("w11", 207),
+    ("w12", 208),
+    ("w13", 209),
+    ("w14", 210),
+    ("w15", 211),
+    ("w16", 212),
+    ("w17", 213),
+    ("w18", 214),
+    ("w19", 215),
+    ("w20", 216),
+    ("w21", 217),
+    ("w22", 218),
+    ("w23", 219),
+    ("w24", 220),
+    ("w25", 221),
+    ("w26", 222),
+    ("w27", 223),
+    ("w28", 224),
+    ("w29", 225),
+    ("w30", 226),
+    ("wsp", 227),
+    ("lr", 228),
+    ("fp", 229),
+    ("xzr", 230),
+    ("of", 231),
+    ("no", 232),
+    ("zf", 233),
+    ("nz", 234),
+    ("sf", 235),
+    ("ns", 236),
+    ("cf", 237),
+    ("nc", 238),
+    ("pf", 239),
+    ("np", 240),
+    ("c", 241),
+    ("void", 242),
+    ("varargs", 243),
+    ("flexarray", 244),
+    ("enum", 245),
+    ("efld", 246),
+    ("proctype", 247),
+    ("dmb", 248),
+    ("clrex", 249),
+    ("yield", 250),
+    ("d0", 251),
+    ("d1", 252),
+    ("d2", 253),
+    ("d3", 254),
+    ("d4", 255),
+    ("d5", 256),
+    ("d6", 257),
+    ("d7", 258),
+    ("d8", 259),
+    ("d9", 260),
+    ("d10", 261),
+    ("d11", 262),
+    ("d12", 263),
+    ("d13", 264),
+    ("d14", 265),
+    ("d15", 266),
+    ("d16", 267),
+    ("d17", 268),
+    ("d18", 269),
+    ("d19", 270),
+    ("d20", 271),
+    ("d21", 272),
+    ("d22", 273),
+    ("d23", 274),
+    ("d24", 275),
+    ("d25", 276),
+    ("d26", 277),
+    ("d27", 278),
+    ("d28", 279),
+    ("d29", 280),
+    ("d30", 281),
+    ("d31", 282),
+    ("s0", 283),
+    ("s1", 284),
+    ("s2", 285),
+    ("s3", 286),
+    ("s4", 287),
+    ("s5", 288),
+    ("s6", 289),
+    ("s7", 290),
+    ("s8", 291),
+    ("s9", 292),
+    ("s10", 293),
+    ("s11", 294),
+    ("s12", 295),
+    ("s13", 296),
+    ("s14", 297),
+    ("s15", 298),
+    ("s16", 299),
+    ("s17", 300),
+    ("s18", 301),
+    ("s19", 302),
+    ("s20", 303),
+    ("s21", 304),
+    ("s22", 305),
+    ("s23", 306),
+    ("s24", 307),
+    ("s25", 308),
+    ("s26", 309),
+    ("s27", 310),
+    ("s28", 311),
+    ("s29", 312),
+    ("s30", 313),
+    ("s31", 314),
+    ("fmov", 315),
+    ("fadd", 316),
+    ("fsub", 317),
+    ("fmul", 318),
+    ("fdiv", 319),
+    ("fneg", 320),
+    ("fcmp", 321),
+    ("fldr", 322),
+    ("fstr", 323),
+    ("scvtf", 324),
+    ("ucvtf", 325),
+    ("fcvtzs", 326),
+    ("fcvtzu", 327),
+    ("ldrb", 328),
+    ("strb", 329),
+    ("rebind", 330),
+    ("withreg", 331),
+    ("regs", 332),
+    ("scope", 333),
+    ("clz", 334),
+    ("rbit", 335),
+    ("rev", 336),
+    ("lenient", 337),
+    ("other", 338),
+    ("movzx", 339),
+    ("movsx", 340),
+    ("movapd", 341),
+    ("movsd", 342),
+    ("movdqu", 343),
+    ("imul", 344),
+    ("div", 345),
+    ("idiv", 346),
+    ("smulh", 347),
+    ("umulh", 348),
+    ("addsd", 349),
+    ("subsd", 350),
+    ("mulsd", 351),
+    ("divsd", 352),
+    ("movss", 353),
+    ("addss", 354),
+    ("subss", 355),
+    ("mulss", 356),
+    ("divss", 357),
+    ("cvtsi2sd", 358),
+    ("cvtsi2ss", 359),
+    ("cvttsd2si", 360),
+    ("cvttss2si", 361),
+    ("cvtsd2ss", 362),
+    ("cvtss2sd", 363),
+    ("comisd", 364),
+    ("comiss", 365),
+    ("movfq", 366),
+    ("movfd", 367),
+    ("or", 368),
+    ("xor", 369),
+    ("shl", 370),
+    ("shr", 371),
+    ("sal", 372),
+    ("sar", 373),
+    ("inc", 374),
+    ("dec", 375),
+    ("not", 376),
+    ("rol", 377),
+    ("ror", 378),
+    ("rcl", 379),
+    ("rcr", 380),
+    ("bsf", 381),
+    ("bsr", 382),
+    ("bt", 383),
+    ("bts", 384),
+    ("btr", 385),
+    ("btc", 386),
+    ("test", 387),
+    ("sete", 388),
+    ("setz", 389),
+    ("setne", 390),
+    ("setnz", 391),
+    ("seta", 392),
+    ("setnbe", 393),
+    ("setae", 394),
+    ("setnb", 395),
+    ("setnc", 396),
+    ("setb", 397),
+    ("setnae", 398),
+    ("setc", 399),
+    ("setbe", 400),
+    ("setna", 401),
+    ("setg", 402),
+    ("setnle", 403),
+    ("setge", 404),
+    ("setnl", 405),
+    ("setl", 406),
+    ("setnge", 407),
+    ("setle", 408),
+    ("setng", 409),
+    ("seto", 410),
+    ("sets", 411),
+    ("setp", 412),
+    ("cmove", 413),
+    ("cmovz", 414),
+    ("cmovne", 415),
+    ("cmovnz", 416),
+    ("cmova", 417),
+    ("cmovnbe", 418),
+    ("cmovae", 419),
+    ("cmovnb", 420),
+    ("cmovnc", 421),
+    ("cmovb", 422),
+    ("cmovnae", 423),
+    ("cmovc", 424),
+    ("cmovbe", 425),
+    ("cmovna", 426),
+    ("cmovg", 427),
+    ("cmovnle", 428),
+    ("cmovge", 429),
+    ("cmovnl", 430),
+    ("cmovl", 431),
+    ("cmovnge", 432),
+    ("cmovle", 433),
+    ("cmovng", 434),
+    ("cmovo", 435),
+    ("cmovno", 436),
+    ("cmovs", 437),
+    ("cmovns", 438),
+    ("cmovp", 439),
+    ("cmovnp", 440),
+    ("cmovpe", 441),
+    ("cmovpo", 442),
+    ("jmp", 443),
+    ("je", 444),
+    ("jz", 445),
+    ("jne", 446),
+    ("jnz", 447),
+    ("jg", 448),
+    ("jng", 449),
+    ("jge", 450),
+    ("jnge", 451),
+    ("ja", 452),
+    ("jna", 453),
+    ("jae", 454),
+    ("jnae", 455),
+    ("jl", 456),
+    ("jle", 457),
+    ("jb", 458),
+    ("jbe", 459),
+    ("jo", 460),
+    ("jno", 461),
+    ("jp", 462),
+    ("iat", 463),
+    ("push", 464),
+    ("pop", 465),
+    ("syscall", 466),
+    ("svc", 467),
+    ("stp", 468),
+    ("ldp", 469),
+    ("cseleq", 470),
+    ("cselne", 471),
+    ("cselle", 472),
+    ("cselgt", 473),
+    ("cselge", 474),
+    ("csello", 475),
+    ("csells", 476),
+    ("cselhi", 477),
+    ("cselhs", 478),
+    ("cseteq", 479),
+    ("csetne", 480),
+    ("csetlt", 481),
+    ("csetle", 482),
+    ("csetgt", 483),
+    ("csetge", 484),
+    ("csetlo", 485),
+    ("csetls", 486),
+    ("csethi", 487),
+    ("cseths", 488),
+    ("lock", 489),
+    ("xchg", 490),
+    ("cmpxchg", 491),
+    ("xadd", 492),
+    ("cmpxchg8b", 493),
+    ("mfence", 494),
+    ("sfence", 495),
+    ("lfence", 496),
+    ("pause", 497),
+    ("clflush", 498),
+    ("clflushopt", 499),
+    ("prefetcht0", 500),
+    ("prefetcht1", 501),
+    ("prefetcht2", 502),
+    ("prefetchnta", 503),
+    ("repmovsb", 504),
+    ("repmovsw", 505),
+    ("repmovsd", 506),
+    ("repmovsq", 507),
+    ("ldaxr", 508),
+    ("stlxr", 509),
+    ("ldar", 510),
+    ("stlr", 511),
+    ("ldrex", 512),
+    ("strex", 513),
+    ("fcvt", 514),
+    ("fstp", 515),
+    ("fldp", 516),
+    ("bswap", 517),
+    ("popcnt", 518),
+    ("casejmp", 519),
+    ("js", 520),
+    ("jns", 521),
+    ("punpcklqdq", 522),
+    ("movupd", 523),
+    ("movups", 524),
+    ("addpd", 525),
+    ("subpd", 526),
+    ("mulpd", 527),
+    ("addps", 528),
+    ("subps", 529),
+    ("mulps", 530),
+    ("shufps", 531),
+    ("repstosb", 532),
+    ("repstosq", 533),
+    ("fldrq", 534),
+    ("fstrq", 535),
+    ("vfadd", 536),
+    ("vfsub", 537),
+    ("vfmul", 538),
+    ("vfmla", 539),
+    ("vdup", 540),
+    ("veor", 541),
+    ("vaddv", 542),
+    ("vgreq", 543),
+    ("bkpt", 544),
+    ("bx", 545),
+    ("blx", 546),
+    ("mvn", 547),
+    ("bic3", 548),
+    ("adds3", 549),
+    ("adcs3", 550),
+    ("subs3", 551),
+    ("sbcs3", 552),
+    ("mls", 553),
+    ("umull", 554),
+    ("smull", 555),
+    ("tst", 556),
+    ("uxtb", 557),
+    ("sxtb", 558),
+    ("uxth", 559),
+    ("sxth", 560),
+    ("ldrh", 561),
+    ("strh", 562),
+    ("ldrsb", 563),
+    ("ldrsh", 564),
+    ("wfi", 565),
+    ("dsb", 566),
+    ("isb", 567)
   ]

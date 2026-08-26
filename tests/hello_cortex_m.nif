@@ -1,0 +1,26 @@
+(.nif27)
+(stmts
+ (arch cortex_m)
+ (mov
+  (r0)4)
+ (adr
+  (r1)msg.0)
+ (bkpt 171)
+ (mov
+  (r2)131110)
+ (sub
+  (sp)8)
+ (mov
+  (mem
+   (sp))(r2))
+ (mov
+  (r2)0)
+ (mov
+  (mem
+   (sp)4)(r2))
+ (mov
+  (r1)(sp))
+ (mov
+  (r0)32)
+ (bkpt 171)
+ (rodata :msg.0 "Hello Cortex-M\0A\00"))

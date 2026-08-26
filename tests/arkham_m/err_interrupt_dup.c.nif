@@ -1,0 +1,19 @@
+(.nif27)
+(stmts
+ (proc :first.0
+  (params).
+  (pragmas
+   (interrupt "SysTick"))
+  (stmts .))
+ (proc :second.0
+  (params).
+  (pragmas
+   (interrupt "SysTick"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (ret 0))))

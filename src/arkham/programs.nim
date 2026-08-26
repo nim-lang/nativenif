@@ -88,6 +88,10 @@ type
                              ## construct maps one-to-one to an instruction and every
                              ## location is declared, so it bypasses the register
                              ## allocator entirely. See `doc/intrinsics.md` §8.
+    irqName*: string         ## `(interrupt "SysTick")`: the exception or interrupt
+                             ## this proc handles. The name is the target's to read —
+                             ## `machine_m.interruptSlot` turns it into a slot in the
+                             ## interrupt table — and it is empty for an ordinary proc.
     isNaked*: bool           ## `(naked)`: emit NO prologue and NO epilogue. The proc
                              ## does not touch SP, so on entry SP still points at the
                              ## return address — which is the only way a routine can
@@ -320,7 +324,7 @@ proc lookupSyscall*(name: string): tuple[found: bool, x64, a64: int] =
 
 proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
                   intrinsic: var IntrinsicOp; asmProc: var bool;
-                  dllN: var string; nakedProc: var bool) =
+                  dllN: var string; nakedProc: var bool; irqN: var string) =
   if c.substructureKind == PragmasU:
     c.into:
       while c.hasMore:
@@ -332,6 +336,13 @@ proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
         of NakedP:
           nakedProc = true
           skip c
+        of InterruptP:
+          # `(interrupt "SysTick")` — the vector this proc handles. WHICH names
+          # exist is this back end's question (sem deliberately does not ask), so
+          # only the string is taken here; `generateM` resolves it against the
+          # target's table and refuses an unknown one BY NAME.
+          c.into:
+            if c.hasMore: (irqN = strVal(c); inc c)
         of ImportcP:
           c.into:
             if c.hasMore: (importcN = strVal(c); inc c)
@@ -367,7 +378,9 @@ proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
                   intrinsic: var IntrinsicOp; asmProc: var bool;
                   dllN: var string) {.inline.} =
   var ignoredNaked = false
-  parsePragmas(c, importcN, exportcN, intrinsic, asmProc, dllN, ignoredNaked)
+  var ignoredIrq = ""
+  parsePragmas(c, importcN, exportcN, intrinsic, asmProc, dllN, ignoredNaked,
+               ignoredIrq)
 
 proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
                   intrinsic: var IntrinsicOp; asmProc: var bool) {.inline.} =
@@ -587,14 +600,20 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     result.voidPtr = beginRead(npBuf)
     var nilBuf = parseFromBuffer("(nil)", "", sharedTags = tags)
     result.nilLit = beginRead(nilBuf)
-    let wordBits = $max(ptrSize * 8, 8)
-    var itBuf = parseFromBuffer("(i " & wordBits & ")", "", sharedTags = tags)
+    # The synthesized types a LITERAL gets. Target-width, not a fixed 64: an
+    # integer literal is a platform `int`, and a float literal is the widest
+    # float the target has. Hardcoding 64 made every literal's type wider than
+    # the machine on Cortex-M — visible as `(rebind :b.0 (i 64) …)` for a `(u 8)`
+    # local, which nifasm rightly refuses. `collect` runs after `setTargetWord`.
+    let iw = $wordBits()
+    var itBuf = parseFromBuffer("(i " & iw & ")", "", sharedTags = tags)
     result.intType = beginRead(itBuf)
-    var utBuf = parseFromBuffer("(u " & wordBits & ")", "", sharedTags = tags)
+    var utBuf = parseFromBuffer("(u " & iw & ")", "", sharedTags = tags)
     result.uintType = beginRead(utBuf)
     var ctBuf = parseFromBuffer("(c 8)", "", sharedTags = tags)
     result.charType = beginRead(ctBuf)
-    var ftBuf = parseFromBuffer("(f 64)", "", sharedTags = tags)
+    var ftBuf = parseFromBuffer("(f " & $(maxFloatSize() * 8) & ")", "",
+                                sharedTags = tags)
     result.floatType = beginRead(ftBuf)
     var btBuf = parseFromBuffer("(bool)", "", sharedTags = tags)
     result.boolType = beginRead(btBuf)
@@ -670,13 +689,14 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         var intrinsic = NoIntrinsicOp
         var asmProc = false
         var nakedProc = false
+        var irqN = ""
         c.into:
           pname = symName(c); inc c           # name
           skip c                              # params
           retType = c                         # return-type cursor (for getType)
           retFloat = c.kind == TagLit and c.typeKind == FT   # `(f N)` return → v0
           skip c                              # return type
-          parsePragmas(c, importcN, exportcN, intrinsic, asmProc, dllN, nakedProc)
+          parsePragmas(c, importcN, exportcN, intrinsic, asmProc, dllN, nakedProc, irqN)
           skip c                              # body
         let sigType = procSigType(procStart)  # the proc-value's `(proctype …)` (for getType)
         if intrinsic != NoIntrinsicOp:
@@ -764,7 +784,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                                                 retFloat: retFloat, retType: retType, sigType: sigType,
                                                 declarative: isDeclarativeAbi(result, procStart))
           result.procs.add ProcInfo(asmName: asmN, decl: procStart, isEntry: entry,
-                                    isAsm: asmProc, isNaked: nakedProc)
+                                    isAsm: asmProc, isNaked: nakedProc, irqName: irqN)
       else:
         skip c
   # Emit the entry proc first so it begins the text section.
@@ -1081,11 +1101,15 @@ proc typeSizeAlign*(p: var Program; c: Cursor): (int, int) =
     case c.typeKind
     of IT, UT, FT, CT:
       let bits = typeBits(c)
-      let bytes = (if bits > 0: bits else: p.ptrSize * 8) div 8
+      # A non-positive bit count is Leng's platform-width scalar: the target
+      # WORD, not a fixed 64. This is the layout every field offset is computed
+      # from, so getting it wrong does not fail — it silently moves every later
+      # field, and the program reads the padding.
+      let bytes = (if bits > 0: bits else: wordBits()) div 8
       result = (bytes, bytes)
     of BoolT: result = (1, 1)
     of VoidT: result = (0, 1)
-    of PtrT, AptrT, ProctypeT: result = (p.ptrSize, p.ptrSize)
+    of PtrT, AptrT, ProctypeT: result = (wordSize(), wordAlign())
     of FlexarrayT:
       # A flexible array member contributes no fixed size; its alignment is that
       # of the element type (so the enclosing struct's tail is aligned for it).
@@ -1352,10 +1376,17 @@ proc innerType*(p: var Program; t: Cursor): Cursor =
   else: raiseAssert "arkham: deref/index of a non-pointer/array type"
 
 proc aggrWordCount*(p: var Program; typeSym: SymId): int =
-  ## Number of 8-byte GPRs a ≤16-byte aggregate occupies (1 or 2).
+  ## Number of GPRs a small aggregate occupies (1 or 2), at the TARGET's word
+  ## size — 8 bytes on the 64-bit targets, 4 on Cortex-M. A two-`int32` struct is
+  ## one register there and two here; counting it in eightbytes on a 32-bit
+  ## target marshals only half of it, and the missing half reads as whatever the
+  ## register happened to hold.
   let sz = aggrByteSize(p, typeSym)
-  assert sz <= 16, "arkham v1: >16-byte aggregate ABI (by-ref / x8) not yet supported"
-  (sz + 7) div 8
+  let w = wordSize()
+  assert sz <= 2 * w,
+    "arkham: aggregate of " & $sz & " bytes reached the small-aggregate path, " &
+    "but the by-reference threshold is " & $(2 * w)
+  (sz + w - 1) div w
 
 proc layoutObjBody(p: var Program; bodyc: Cursor; base: int;
                    res: var seq[FieldInfo]) =

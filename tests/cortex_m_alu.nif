@@ -1,0 +1,50 @@
+(.nif27)
+(stmts
+ (arch cortex_m)
+ (var :a.0
+  (r4)
+  (i 32))
+ (var :b.0
+  (r5)
+  (i 32))
+ (var :q.0
+  (r6)
+  (i 32))
+ (var :r.0
+  (r7)
+  (i 32))
+ (var :s.0
+  (r8)
+  (i 32))
+ (mov a.0 100)
+ (mov b.0 7)
+ (sdiv q.0 a.0 b.0)
+ (mls r.0 q.0 b.0 a.0)
+ (add3 s.0 q.0 r.0)
+ (orr3 s.0 s.0 32)
+ (sub3 s.0 s.0 6)
+ (cmp s.0 42)
+ (cfvar :ok.0)
+ (ite
+  (zf)
+  (stmts
+   (mov
+    (r3)s.0))
+  (stmts
+   (mov
+    (r3)99)))
+ (mov
+  (r2)131110)
+ (sub
+  (sp)8)
+ (mov
+  (mem
+   (sp))(r2))
+ (mov
+  (mem
+   (sp)4)(r3))
+ (mov
+  (r1)(sp))
+ (mov
+  (r0)32)
+ (bkpt 171))

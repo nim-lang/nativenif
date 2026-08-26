@@ -1,0 +1,79 @@
+(.nif27)
+(.indexat 1168              )
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :bkpt.0
+  (params
+   (param :imm.0 .
+    (i 32))).
+  (pragmas
+   (instruction "bkpt"))
+  (stmts .))
+ (proc :addx.0
+  (params
+   (param :d.0 .
+    (ptr
+     (u 32)))
+   (param :s.0 .
+    (u 32))).
+  (pragmas
+   (instruction "add"))
+  (stmts .))
+ (proc :subx.0
+  (params
+   (param :d.0 .
+    (ptr
+     (u 32)))
+   (param :s.0 .
+    (u 32))).
+  (pragmas
+   (instruction "sub"))
+  (stmts .))
+ (proc :putc.0
+  (params
+   (param :ch.0
+    (pragmas
+     (register "r0"))
+    (u 32))).
+  (pragmas
+   (assembler))
+  (stmts
+   (var :c.0
+    (pragmas
+     (stack))
+    (u 32).)
+   (var :p.0
+    (pragmas
+     (register "r1"))
+    (ptr
+     (u 32)).)
+   (asgn c.0 ch.0)
+   (asgn p.0
+    (addr c.0))
+   (asgn ch.0 3)
+   (instr bkpt.0 171)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (call putc.0 72)
+   (call putc.0 105)
+   (call putc.0 10)
+   (var :n.0 .
+    (u 32)20)
+   (instr addx.0
+    (haddr n.0)15)
+   (instr subx.0
+    (haddr n.0)5)
+   (call exit.0
+    (conv
+     (i 32)n.0)))))
+(.index)

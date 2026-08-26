@@ -122,7 +122,10 @@ procs hit them: nested-aggregate-field pointer + copy word (495), aggregate-copy
 dst + src address (39), stack-param aggregate home + word (35), casejmp index +
 base (15), aconstr element pointer + copy word (15).
 
-This is the number the allocator needs in order to take over the guarantee that a
+Three is therefore the size of the Arm scratch set: the measurement above is what
+says a fixed reservation of that size covers the enumerated shapes, and the Arm
+targets can afford it because their third register (x16 / r8) was already spoken
+for and idle. This is the number the allocator needs in order to take over the guarantee that a
 staging pick can never fail. R11 is reserved today precisely because nobody knew
 it; reserving THREE where these shapes occur, and nothing elsewhere, is what lets
 the reservation go — and with it the register the spill census wants back.
@@ -139,10 +142,12 @@ where one suffices, and that was a measured out-of-registers failure, not a
 hypothetical. `tests/arkham/addr_chain_depth` is the fixture; it passes at
 `ARKHAM_STRESS=2` at chain depth 5 and at depth 10.
 
-**Only one of the two is guaranteed.** R11 is reserved; the second is whichever ABI
-volatile happens to be free, falling back to `pickStagingScratch`'s callee-saved draw.
-Closing that gap means taking a register from the allocator, and on x86-64 nothing is
-going spare: rax is the return/div/mul register, rcx and rdx have fixed instruction
+**On x86-64, only one of the two is guaranteed.** R11 is reserved; the second is
+whichever ABI volatile happens to be free, falling back to `pickStagingScratch`'s
+callee-saved draw. The Arm targets no longer have that gap — all three of their
+scratch registers are reserved outright, so a draw there never depends on what the
+allocator left over. Closing it on x86-64 means taking a register from the
+allocator, and nothing is going spare: rax is the return/div/mul register, rcx and rdx have fixed instruction
 roles, rdi–r9 are argument registers that hold live *parameters* (R9 was tried as a
 second reserved bridge and is a live param home in any six-parameter proc), rbx/r12–r15
 are the callee-saved local homes, and r10 is the allocator's entire temp pool. The
@@ -229,13 +234,20 @@ expression evaluator:
 - **Whole-aggregate copies are tiered by operand FORM, not given a fixed budget.** A
   copy needs a per-word transfer register plus one register per end whose address
   must be computed. A *named* `(s)` slot is not such an end: nifasm folds a byte
-  offset into the slot's own frame displacement (`(mem (rsp) name off)`, bounds-checked
+  offset into the slot's own frame displacement (`(mem name off)`, bounds-checked
   against the slot), so each named end costs **zero** registers. Two named ends
   therefore cost one register, one named end two, and only a copy between two computed
   addresses costs three. Reducing every source to an address in a register first —
   "one path for all forms" — made three the price of *every* copy, which is what ran
   the emit-time staging pool dry once optimization filled the volatiles with call-free
   locals. The tier is picked by `aggrSrcEnd`/`aggrDstEnd` and carried in `AggrEnd`.
+
+  **`codegen_arm` does not do this yet.** Its `copyAggr` takes two `Reg`s, so a named
+  slot end is always lea'd into a bridge first — the untiered shape x86-64 used to
+  have. nifasm accepts `(mem name off)` on both Arm targets now, so what is missing is
+  the arkham half: port `AggrEnd`/`slotEnd`/`regEnd` across. Unlike the x86-64 spelling
+  change that unblocked it, that one CHANGES the emitted code, so it wants its own
+  measurement rather than a byte-identity gate.
 
 - **Aggregate results.** A ≤16-byte aggregate is returned by value in the result
   registers (x0:x1 / rax:rdx); a larger one is returned through a hidden pointer
@@ -411,3 +423,94 @@ correctness could then only be argued, not diffed.
 It is also what lets the allocator eventually decide locations for *expression*
 positions and not just for symbol definitions: `locs` is already indexed by token
 position, and the query is now asked that way too.
+
+## What belongs in the machine description
+
+The allocator has always been arch-neutral: `planer`, `regbind`, `analyser` and
+`programs` contain no target test at all, and the whole planner asks `md.arch`
+seven times, every one of them x86-vs-RISC. The seam is real. What leaked past it
+is the EMITTER, and one flag — `CodeGen.thumbM` — was carrying facts of five
+quite different kinds.
+
+The first three are not target questions and are gone:
+
+ * **Register roles.** Which register carries `&result` for a wide aggregate
+   return, which one the emitter stages a value through, which is the link
+   register, which set a call clobbers, which registers are withheld from every
+   pool. These read `if g.thumbM: machine_m.X else: X`, which is how slot `R16`
+   — not even MAPPED on Cortex-M — once reached the output. They are
+   `MachineDesc` fields now, and a role a target lacks is `NoReg`, stated rather
+   than defaulted: `Reg`'s zero value is `R0`, so an omitted role would silently
+   name a register in use.
+
+   Two of them are deliberately NOT the allocator's pools. `abiCalleeSaved` is
+   what the ABI defines, `intCalleeSaved` what the allocator draws homes from;
+   they coincide in a shipped build and differ under `-d:arkhamStress`. An
+   `.assembler` body does not allocate, so a register it NAMES must still be
+   legal and still be saved; and an AArch64 pair-save PAD is a slot in an `stp`,
+   not a home, so it too comes from the ABI list. Conflating the two is a bug
+   that byte-identical output cannot catch — only the stress suite can.
+
+ * **One spelling per job.** There are exactly two ways to write a register down.
+   `ab.rawReg` is the PHYSICAL register — a `(clobber …)` or `(param …)`
+   declaration, a frame save, `SP`, a hand-written body. `emReg` is the VALUE:
+   a bound register by its checked name, a raw tag otherwise, and in between the
+   assertion that catches a temporary which escaped the binder. They are not
+   interchangeable, and reaching for the wrong one compiles. The names now say
+   which is which — `reg`, `mReg` and the raw arm of `emReg` were three names for
+   one of them — and the float `fmov`/`fcvt` operand, which used to be raw on
+   AArch64 and named on Cortex-M, is a value on both. That split was never
+   arkham's decision: nifasm's AArch64 handlers read it with `parseRegisterA64`,
+   which takes a tag and nothing else, while its Thumb-2 handlers had always
+   taken either. The emitter was carrying a branch to paper over an asymmetry one
+   level down, and the value check had a hole on the target with the LARGER
+   register file.
+
+ * **Narrow words.** A value too wide for one register is `size > wordSize()`,
+   false by construction wherever the word is eight bytes. Every call site used
+   to write `g.thumbM and g.isWideExpr(…)`, which said it twice and said it in
+   terms of the wrong fact. `codegen_m64`'s `int64` arithmetic is now inherited by
+   the next 32-bit back end rather than rewritten for it.
+
+The last two are the honest ones, and both are now named in the description
+rather than inferred from which of two targets is being emitted:
+
+ * **Capability** — `md.caps`, a `set[TargetFeature]`. A conditional select, a
+   tail call, double precision, a one-instruction sub-word extend, a
+   register-offset memory operand, a pc-relative address fold, acquire/release
+   exclusives, a destructive two-operand ALU spelling, branches on conditions
+   other than zero, and whether there is an OS underneath at all. These are facts
+   about the ASSEMBLER'S VOCABULARY, not about the silicon: AArch64 has `sxtb`,
+   but nifasm's a64 selector has no tag for it and lowers an extend as a shift
+   pair, so `SubwordExtend` is absent there. What a capability answers is "may
+   the emitter write this down", which is the only question it ever asks.
+
+   Two related facts are enums rather than set members because they are choices
+   among alternatives, not presence or absence: `immStyle` (which constants may
+   ride along as an ALU immediate — a bitmask immediate, a ThumbExpandImm, an
+   imm32) and `targetName`/`gprRangeText`, which let a rejection read as prose.
+   `immStyle` is an enum rather than a predicate FIELD for one concrete reason:
+   a proc there would make `machine` import `nifasm/arm64`, and with it `relocs`,
+   for one predicate.
+
+ * **Frame shape** — `md.frameStyle`. `PairFrame` pushes fp/lr and the saved
+   registers in pairs and addresses the caller's arguments off the frame pointer;
+   `BlockFrame` lowers SP once and stores one register at a time, has no frame
+   pointer to spare, and therefore RE-DERIVES the incoming-argument base from SP
+   — which is only correct after the prologue has finished, and is why a
+   `BlockFrame` target loads its stack parameters in the prologue rather than at
+   the top of the body. That single field decides eleven sites that each used to
+   ask which target this was. It is named for the shape because the next 32-bit
+   back end wants `BlockFrame` verbatim: RISC-V has no paired store either.
+
+   Beside it, `CodeGen.entryExits` says the entry proc EXITS instead of returning
+   — true on static Linux and on bare metal, false on Darwin, which is a property
+   of the runtime and not of the ISA, so it does not belong in the machine model.
+
+What is LEFT on `thumbM` is three branches, and each is genuinely about this one
+target rather than about a class of them: the `{.register: "…"}` rejection
+cascade, whose whole value is naming in prose which other thing already lives in
+the register the user asked for; one diagnostic that distinguishes the assembler
+from the architecture; and the Cortex-M reset path, which initialises RAM and
+enables the FPU. A fourth back end will want its own third item and will share
+the first two.

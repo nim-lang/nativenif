@@ -6,7 +6,7 @@
 #
 
 ## Architecture-neutral front-end shared by the per-target backends
-## (`codegen_a64`, `codegen_x64`). Holds the `CodeGen` state object, the Leng
+## (`codegen_arm`, `codegen_x64`). Holds the `CodeGen` state object, the Leng
 ## type/lvalue analysis (`getType` / `exprSlot` / `asLoc` and friends) and
 ## the type predicates. None of this emits instructions — instruction selection
 ## and the machine frame live in the backends. The `md` field carries the
@@ -16,7 +16,9 @@
 import std / [tables, sets, assertions, algorithm, strutils, os]
 import symparser
 import nifcore, nifcdecl
-import slots, machinedesc, analyser, planer, programs
+import slots, machinedesc, analyser, planer, programs, abi
+import machine_m                  # the Cortex-M machine model
+import layout                     # Layout: the `--layout:` board file
 import asmbuf
 import typenav
 export typenav   # SymCat / SymInfo / getType / exprSlot moved here; re-export so
@@ -138,6 +140,50 @@ type
                                              ## aggregate
     retIndirect*: bool                       ## return type is >16B (x8 indirect result)
     isEntryProc*: bool                       ## the proc currently emitted is the entry
+    helperCalls*: bool                       ## Cortex-M: the proc being emitted calls a
+                                             ## runtime helper (the 64-bit divider) with a
+                                             ## bare `bl`. `bl` overwrites lr, and nothing
+                                             ## in the analyser's view of a `div` node says
+                                             ## "call" — so the frame has to be forced from
+                                             ## here. Reset per proc; read by `computeFrame`.
+    needsUDiv64*, needsSDiv64*: bool         ## Cortex-M, MODULE-scope: emit the 64-bit
+                                             ## division routines, and only if something
+                                             ## divides
+    board*: layout.Layout                    ## the `--layout:` board, when one was
+                                             ## given. arkham reads it and forwards it;
+                                             ## nifasm places segments from the forward.
+    thumbM*: bool                            ## the SAME emitter, targeting Cortex-M
+                                             ## (ARMv7E-M) instead of AArch64. The two
+                                             ## share the asm-NIF vocabulary by design —
+                                             ## `add3`, `cmp`, `beq`, `ldr`, `adr` mean
+                                             ## the same thing on both — so what differs
+                                             ## is the register file (`md`), the word
+                                             ## size (`slots.setTargetWord`), and the
+                                             ## features Cortex-M does not have, which
+                                             ## are rejected by name rather than
+                                             ## silently mis-emitted.
+    oneThread*: bool                         ## this image has exactly ONE thread of
+                                             ## execution, so a thread-local IS a
+                                             ## global and is emitted as one. True
+                                             ## for a static ELF (per-thread ==
+                                             ## per-process) and for a bare-metal
+                                             ## image whose board declares a single
+                                             ## stack slot. NOT a property of the
+                                             ## ISA: a Cortex-M part with four cores
+                                             ## has four threads and needs real
+                                             ## thread-local storage, which is why
+                                             ## this is asked of the BOARD rather
+                                             ## than assumed of the target.
+    entryExits*: bool                        ## the ENTRY proc exits instead of
+                                             ## returning: there is nobody to return
+                                             ## TO. True on static Linux (the kernel
+                                             ## entered `_start`, so the epilogue is
+                                             ## replaced by an exit syscall) and on
+                                             ## bare metal (reset entered it, and a
+                                             ## `bx lr` from there returns into
+                                             ## nothing). False on Darwin, where the
+                                             ## entry is called by libSystem's start
+                                             ## and returns its status normally.
     a64Linux*: bool                          ## a64 backend: target Linux/ELF (svc-based
                                              ## syscalls, no Darwin TLV/dyld) instead of
                                              ## the default Darwin/Mach-O — lets the arm64
@@ -307,6 +353,26 @@ type
     asmInfo*: string                          ## last `file(line, col)` seen while walking an
                                               ## `.assembler` body: the fallback location for a
                                               ## rejection on a node with no line info of its own
+    stagedArgs*: set[Reg]                     ## ABI argument registers whose value is
+                                              ## CLAIMED right now: a call's arguments
+                                              ## between the `(prepare …)` and its `(call)`,
+                                              ## and the incoming parameters for as long as
+                                              ## the prologue runs. Emit-time only — argument
+                                              ## marshalling is an emitter activity, and the
+                                              ## allocator never sees it. Read by the
+                                              ## last-resort scratch draw on a target whose
+                                              ## only volatiles ARE the argument registers.
+    asmFlagsFresh*: bool                      ## Arm only: the flags were set by the instruction
+                                              ## JUST emitted (a `cmp`) and nothing has run since.
+                                              ## Arm has a flag-setting and a non-flag-setting form
+                                              ## of every arithmetic instruction, and which one an
+                                              ## assembler picks is an ENCODING choice — Thumb's
+                                              ## narrow 16-bit forms set the flags whether or not
+                                              ## anyone asked. So "what is in NZCV here" is only
+                                              ## answerable immediately after the compare, and this
+                                              ## is what makes reading them anywhere else an error
+                                              ## instead of a value that depends on which registers
+                                              ## the body happened to pin.
 
 proc resetPlan*(cf: var CondFusion) {.inline.} =
   ## Drop the previous proc's fusion PLAN, ahead of `scanCondFusions` deciding this
@@ -348,6 +414,123 @@ proc lengError*(c: Cursor; msg: string; fallback = "") {.noreturn.} =
   if where.len == 0: where = fallback
   if where.len == 0: where = "arkham"
   quit where & " Error: " & msg, QuitFailure
+
+# ── `.assembler` bodies: the target-neutral half ────────────────────────────
+# doc/intrinsics.md §8. What a location pragma SAYS, what counts as an ATOM, and
+# which row a call names are the same three questions on every target; only the
+# register vocabulary and the opcodes differ. Both back ends read the answers
+# from here and add their own `asmPinReg`, so a rule stated once cannot drift
+# into two subtly different subsets of the same source language.
+
+type
+  AsmDeclKind* = enum
+    aslNone,       ## no location pragma at all
+    aslReg,        ## `{.register: "rax".}`
+    aslStack       ## `{.stack.}`
+
+  AsmDeclSpec* = object
+    ## A param's or local's DECLARED location, with the register name still
+    ## UNRESOLVED — resolving it is exactly where the targets differ. The pragma
+    ## node travels along so a rejection points at the annotation the user wrote
+    ## rather than at the declaration that carries it.
+    kind*: AsmDeclKind
+    name*: string
+    at*: Cursor
+
+proc asmDeclSpec*(prag: Cursor): AsmDeclSpec =
+  ## Read `(pragmas (register "…"))` / `(pragmas (stack))` off a param or local.
+  result = AsmDeclSpec(kind: aslNone, name: "", at: prag)
+  if prag.substructureKind != PragmasU: return
+  var p = prag
+  p.into:
+    while p.hasMore:
+      case p.pragmaKind
+      of RegisterP:
+        let at = p
+        var nm = ""
+        p.into:
+          if p.hasMore and p.kind == StrLit: (nm = strVal(p); inc p)
+          while p.hasMore: skip p
+        result = AsmDeclSpec(kind: aslReg, name: nm, at: at)
+      of StackP:
+        result = AsmDeclSpec(kind: aslStack, name: "", at: p)
+        skip p
+      else: skip p
+
+proc isResultName*(nm: string): bool {.inline.} =
+  ## Nimony names a routine's implicit result `result.<n>[.<module>]`. It is the one
+  ## local a user cannot annotate — `result` is not a declaration they write — so
+  ## `.assembler` pins it to the ABI return register instead of demanding a pragma.
+  nm.startsWith("result.")
+
+proc asmAtom*(c: Cursor): Cursor =
+  ## Peel the type-only wrappers the front end puts around a literal: `result = 100`
+  ## in a `uint64` context arrives as `(conv (u 64) 100)`, and a literal that
+  ## carried a type suffix in the source (`0xAB'i32`) as `(suf 171 "i32")`. A
+  ## conversion of a CONSTANT is a fact about the constant — the assembler encodes
+  ## the immediate at the operand's width and no instruction exists to emit — so
+  ## folding it is what "one-to-one" means here. A `conv` of a *value* is a real
+  ## sign/zero extension and is left alone, so it still reaches its back end's
+  ## rejection.
+  result = c
+  while result.kind == TagLit and result.exprKind in {SufC, ParC}:
+    # `(suf value "type")` / `(par value)`: the wrapped value is the first child
+    # and the wrapper says nothing an instruction could encode.
+    inc result
+  while result.kind == TagLit and result.exprKind in {ConvC, CastC}:
+    var inner = result
+    var got = result
+    var count = 0
+    inner.into:
+      skip inner                                 # the target type
+      while inner.hasMore:
+        if count == 0: got = inner
+        inc count
+        skip inner
+    if count != 1: return
+    # Peel into a temporary and commit only if a LITERAL came out: a `conv` whose
+    # operand is a value is a real sign/zero extension, and returning its inner
+    # node would drop the extension instead of reaching the rejection.
+    var peeled = got
+    while peeled.kind == TagLit and peeled.exprKind in {SufC, ParC}: inc peeled
+    if peeled.kind notin {IntLit, UIntLit, CharLit}: return
+    result = peeled
+    return
+
+proc asmNoteInfo*(g: var CodeGen; c: Cursor) {.inline.} =
+  ## Remember the innermost node that carried line info, so a rejection deeper in
+  ## (NIF line info is sparse) still points at the right statement.
+  let li = lengInfo(c)
+  if li.len > 0: g.asmInfo = li
+
+proc isAsmStackSym*(g: CodeGen; c: Cursor): bool {.inline.} =
+  c.kind == Symbol and symName(c) in g.asmStack
+
+proc asmRegOf*(g: var CodeGen; c: Cursor): Reg =
+  ## The register an operand names. `.assembler` operands must be ATOMS, so this is
+  ## a table lookup and nothing else — no evaluation, no materialization.
+  if c.kind != Symbol:
+    lengError c, "an `.assembler` operand must be a variable or a literal, not " &
+              "a computed expression", g.asmInfo
+  let nm = symName(c)
+  if nm in g.asmStack:
+    lengError c, "`" & userName(nm) & "` lives on the stack; this operand needs a register",
+              g.asmInfo
+  if not g.asmReg.hasKey(nm):
+    lengError c, "`" & userName(nm) & "` has no declared location — every local in an " &
+              "`.assembler` proc needs `{.register: \"…\".}` or `{.stack.}`", g.asmInfo
+  result = g.asmReg[nm]
+
+proc instrOpAt*(g: var CodeGen; c: Cursor): IntrinsicOp =
+  ## The row an `(instr SYM …)` node names, or `NoIntrinsicOp` if `c` is not one.
+  result = NoIntrinsicOp
+  if c.kind != TagLit or c.exprKind != InstrC: return
+  var fc = c
+  var sym = ""
+  fc.into:
+    sym = symName(fc); skip fc
+    while fc.hasMore: skip fc
+  result = instrTargetOf(g.prog, sym).op
 
 # ── type predicates ─────────────────────────────────────────────────────────
 
@@ -521,14 +704,21 @@ proc getType*(g: var CodeGen; c: Cursor): Cursor {.inline.} =
 proc exprSlot*(g: var CodeGen; c: Cursor): AsmSlot {.inline.} =
   g.typeCtx.exprSlot(c)
 
-let ScalarSlot* = AsmSlot(cls: AInt, size: 8, align: 8)
+template ScalarSlot*(): AsmSlot =
+  ## The dont-care scalar placeholder: an integer of REGISTER width. A
+  ## template rather than a `let` because a module-level `let` is evaluated
+  ## before the backend entry point calls `setTargetWord`, so it would snapshot
+  ## the 64-bit default and describe every Cortex-M scratch as eight bytes —
+  ## which is exactly how a 32-bit dont-care becomes indistinguishable from a
+  ## genuine 64-bit value (`isWideSlot`).
+  ##
   ## THE dont-care scalar slot: one full integer register, carrying no Leng type
   ## cursor. Not a missing type — it is arkham's canonical register form for an
   ## integer, whose width lives in explicit extends rather than in the register.
-  ## See `valueSlot` for when a value may take it and when it may not. No consumer of
-  ## an `InReg`/`Imm` value reads `.typ`, so it is also the register/immediate
-  ## dont-care result. A `let` (not `const`) because `AsmSlot` holds a `Cursor`.
-  ## (Both backends used to define this separately.)
+  ## See `valueSlot` for when a value may take it and when it may not. No consumer
+  ## of an `InReg`/`Imm` value reads `.typ`, so it is also the register/immediate
+  ## dont-care result. (Both backends used to define this separately.)
+  AsmSlot(cls: AInt, size: wordSize(), align: wordAlign())
 
 proc slotIsPointer*(g: var CodeGen; s: AsmSlot): bool =
   ## Does `s` describe a POINTER-KIND value — a real `(ptr T)`/`(aptr T)`/`(proctype …)`,
@@ -617,7 +807,7 @@ proc isFloatExpr*(g: var CodeGen; c: Cursor): bool =
 proc floatBits*(g: var CodeGen; c: Cursor): int =
   ## Bit width (32 or 64) of a float expression; 64 when undeterminable (e.g. a
   ## bare literal — the caller's context width should be used instead).
-  if g.exprSlot(c).size == 4: 32 else: 64
+  if g.exprSlot(c).size == 4 or maxFloatSize() == 4: 32 else: 64
 
 proc srcWidthSigned*(g: var CodeGen; c: Cursor): tuple[width: int, signed: bool] =
   ## Best-effort source scalar (bit width, signedness) of the expression at `c`,
@@ -965,7 +1155,7 @@ proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string;
   ## A pointer/proc field whose value is a *symbol address* (e.g. a vtable/RTTI
   ## const pointing at another const or a proc — `(cast (ptr …) Foo.0.vt)`) cannot
   ## be baked at compile time; record `(blob-offset, symbol-name)` in `relocs` and
-  ## reserve 8 placeholder bytes. The backend emits these as `(reloc off sym)`
+  ## reserve one WORD of placeholder bytes. The backend emits these as `(reloc off sym)`
   ## children of the `(rodata …)` blob and nifasm bakes the resolved address into
   ## `.text` in `writeElf`. `relocs` offsets are relative to the blob start, so the
   ## top-level caller must pass a `buf` that begins empty (the blob).
@@ -979,9 +1169,9 @@ proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string;
     let addrSym = constAddrSym(val)
     if addrSym.len > 0:
       relocs.add (buf.len, addrSym)          # link-time address (baked by nifasm)
-      for i in 0 ..< 8: buf.add '\0'         # placeholder reserved for the address
+      for i in 0 ..< wordSize(): buf.add '\0'  # placeholder for the address
     else:
-      appendLE(buf, constLitBits(val), 8)    # nil / integer-encoded address
+      appendLE(buf, constLitBits(val), wordSize())  # nil / integer-encoded address
   of FlexarrayT:
     var et = rt; inc et                      # element type
     if val.kind == StrLit:
@@ -1268,7 +1458,7 @@ proc mirrorAddrStored*(g: var CodeGen; r: Reg; asmName: string): bool =
   if g.rb.addrMirror(asmName) != NoReg: return false     # already mirrored elsewhere
   g.pickedRegs.excl r
   g.plan.unseal {r}
-  g.rb.mirrorAddr(r, asmName, AsmSlot(cls: AUInt, size: 8, align: 8))
+  g.rb.mirrorAddr(r, asmName, addrSlot())
   true
 
 proc mirrorFStored*(g: var CodeGen; f: FReg; dst: Location): bool =
@@ -1840,3 +2030,27 @@ proc isFoldableMemLeaf*(g: var CodeGen; n: Cursor): bool {.inline.} =
   ## IS a GPR, so folding it as `[mem]` would address a stack slot that does
   ## not exist.
   isMemLeaf(n) and g.pairFieldReg(n) == NoReg
+
+proc calleeParamSlots*(g: var CodeGen; fsym: string; tgt: CallTarget): seq[AsmSlot] =
+  ## The DECLARED parameter slots of a call target, from its `(proctype …)`
+  ## signature — empty when the target carries none (an indirect call built
+  ## without one, an intrinsic).
+  ##
+  ## The call site needs these because an argument expression's own type and the
+  ## parameter's declared type may differ in width, and it is the CALLEE that
+  ## decides the ABI. On a target where every scalar is one register that
+  ## difference is invisible; where a scalar can span two, it is the difference
+  ## between staging one register and staging two.
+  result = @[]
+  discard fsym
+  if cursorIsNil(tgt.sigType): return
+  var q = tgt.sigType
+  if q.kind != TagLit: return
+  var slots: seq[AsmSlot] = @[]
+  q.into:                    # (proctype . <params> <ret> <pragmas>) — see procSigType
+    skip q                             # the name slot a proctype does not have
+    if q.hasMore:
+      if q.kind == TagLit: slots = paramSlots(g.prog, q)
+      skip q
+    while q.hasMore: skip q
+  result = slots

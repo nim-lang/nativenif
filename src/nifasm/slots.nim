@@ -17,21 +17,22 @@ proc initSlotManager*(): SlotManager =
   result.maxStackSize = 0
   result.freeSlots = @[]
 
-proc alignedSize*(t: Type; slotAlign = 8): int =
+proc alignedSize*(t: Type; slotAlign = 0): int =
   ## Slot footprint, rounded up to the slot's granularity. `slotAlign` is the
-  ## STACK-slot alignment (≥ 8) — distinct from the type's natural alignment, which
-  ## drives struct-field layout. A bigger slot alignment also pads the footprint so
-  ## the NEXT slot stays aligned.
-  let a = max(8, slotAlign)
+  ## STACK-slot alignment (≥ one target word) — distinct from the type's natural
+  ## alignment, which drives struct-field layout. A bigger slot alignment also pads
+  ## the footprint so the NEXT slot stays aligned. `slotAlign = 0` means "the
+  ## target's own granule", which is what every caller that does not care wants.
+  let a = max(asmWordSize(), slotAlign)
   (asmSizeOf(t) + a - 1) and not (a - 1)
 
-proc allocSlotUp*(m: var SlotManager; t: Type; slotAlign = 8): int =
+proc allocSlotUp*(m: var SlotManager; t: Type; slotAlign = 0): int =
   ## Positive, base-relative slot offset for architectures that address locals
   ## upward from a stack pointer lowered by `sub sp, sp, #stackSize` (AArch64; also
-  ## x86-64 here). Offsets grow 0, 8, 16, … so they fit the unsigned-immediate
-  ## LDR/STR forms. With `slotAlign > 8` the slot START is aligned first (SP is kept
-  ## 16-aligned, so a 16-aligned offset yields a 16-aligned address).
-  let a = max(8, slotAlign)
+  ## x86-64 here). Offsets grow by whole words so they fit the unsigned-immediate
+  ## LDR/STR forms. With `slotAlign` above the word the slot START is aligned first
+  ## (SP is kept 16-aligned, so a 16-aligned offset yields a 16-aligned address).
+  let a = max(asmWordSize(), slotAlign)
   m.stackSize = alignTo(m.stackSize, a)
   result = m.stackSize
   m.stackSize += alignedSize(t, a)

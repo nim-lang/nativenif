@@ -44,3 +44,28 @@ proc tagToNifasmDecl*(t: TagEnum): NifasmDecl {.inline.} =
     cast[NifasmDecl](t)
   else:
     NoDecl
+
+proc tagToMInst*(t: TagEnum): MInst {.inline.} =
+  ## Convert TagEnum to MInst (Cortex-M). Returns NoMInst if not a valid MInst.
+  if rawTagIsMInst(t):
+    cast[MInst](t)
+  else:
+    NoMInst
+
+proc tagToMReg*(t: TagEnum): MReg {.inline.} =
+  ## Convert TagEnum to MReg (Cortex-M). Returns NoMReg if not a valid MReg.
+  ##
+  ## Cortex-M shares its register SPELLINGS with the other targets — `(r0)` is
+  ## also an x86-64 alias for rax — so a tag can be a valid `X64Reg` and a valid
+  ## `MReg` at once. Which one it means is decided by `(arch …)`, not by the tag.
+  if rawTagIsMReg(t):
+    cast[MReg](t)
+  else:
+    NoMReg
+
+proc tagToNifasmExpr*(t: TagEnum): NifasmExpr {.inline.} =
+  ## Convert TagEnum to NifasmExpr. Returns NoExpr if not a valid NifasmExpr.
+  if rawTagIsNifasmExpr(t):
+    cast[NifasmExpr](t)
+  else:
+    NoExpr

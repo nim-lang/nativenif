@@ -1,0 +1,20 @@
+(.nif27)
+(stmts
+ (type :P.0 . (object . (fld :x.0 . (f 32)) (fld :y.0 . (f 32))))
+ (gvar :gf.0 . (f 32) 6.5)
+ (proc :exit.0
+  (params (param :code.0 . (i 32))). (pragmas (importc "exit")) (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas (exportc "main"))
+  (stmts
+   (var :arr.0 . (array (f 32) 3) .)
+   (asgn (at arr.0 0) 1.25)
+   (asgn (at arr.0 1) 2.5)
+   (asgn (at arr.0 2) (add (f 32) (at arr.0 0) (at arr.0 1)))
+   (var :p.0 . P.0 (oconstr P.0 (kv x.0 0.5) (kv y.0 1.5)))
+   (asgn gf.0 (add (f 32) gf.0 (dot p.0 y.0)))
+   (var :s.0 . (f 32) (add (f 32) (at arr.0 2) (add (f 32) (dot p.0 x.0) gf.0)))
+   (var :r.0 . (i 32) (conv (i 32) (mul (f 32) s.0 (suf 4.0 "f32"))))
+   (call exit.0 r.0))))

@@ -1,0 +1,8 @@
+(layout
+ (flash (startAddress 134217728) (megabytes 1))
+ (sram  (startAddress 536870912) (kilobytes 128))
+ (stacks (slots 4) (kilobytes 8) (tvar (bytes 512)))
+ (heap   (kilobytes 32))
+ (noinit (bytes 256))
+ (core 0))
+ 

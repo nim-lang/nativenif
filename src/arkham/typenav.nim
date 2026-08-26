@@ -7,7 +7,7 @@
 
 ## The single source of truth for "what is the type/slot of this value?", shared
 ## by BOTH the register allocator (`planer`) and the emitters
-## (`codegen_x64` / `codegen_a64` via `codegen_common`). It used to live on
+## (`codegen_x64` / `codegen_arm` via `codegen_common`). It used to live on
 ## `CodeGen` — i.e. inside the emitter — so the allocator could not reach it and
 ## grew a degraded shadow (`isFloatVal`, hand-rolled form-ladders). Lifting it
 ## here, below both, lets every pass call the same `getType` / `exprSlot`.
@@ -196,17 +196,18 @@ proc exprSlot*(tc: TypeCtx; c: Cursor): AsmSlot =
   ## The classified slot of any expression — `getType` for structural forms,
   ## with literals/`addr` (which carry no type cursor) handled directly.
   case c.kind
-  of FloatLit: AsmSlot(cls: AFloat, size: 8, align: 8)   # default f64; width refined by context
-  of IntLit, UIntLit: AsmSlot(cls: AInt, size: 8, align: 8)
+  of FloatLit: defaultFloatSlot()   # the widest float this target has; refined by context
+  of IntLit, UIntLit: AsmSlot(cls: AInt, size: wordSize(), align: wordAlign())
   of CharLit: AsmSlot(cls: AUInt, size: 1, align: 1)
-  of StrLit: AsmSlot(cls: AUInt, size: 8, align: 8)      # a pointer
+  of StrLit: addrSlot()                                   # a pointer
   of Symbol: slotOf(tc.prog[], tc.getType(c))
   of TagLit:
     case c.exprKind
     of AddrC, HaddrC: slotOf(tc.prog[], tc.getType(c))               # &lvalue → precise (ptr <elem>)
-    of NilC: AsmSlot(cls: AUInt, size: 8, align: 8, typ: tc.prog[].nilLit)  # nil → the `(nil)` type
+    of NilC: AsmSlot(cls: AUInt, size: wordSize(), align: wordAlign(),
+                     typ: tc.prog[].nilLit)                        # nil → the `(nil)` type
     of TrueC, FalseC: AsmSlot(cls: AUInt, size: 1, align: 1)        # a bool
-    of SizeofC, AlignofC: AsmSlot(cls: AInt, size: 8, align: 8)     # an integer constant
+    of SizeofC, AlignofC: AsmSlot(cls: AInt, size: wordSize(), align: wordAlign())
     of ParC:                                                         # wrapper → the inner value
       var t = c; inc t
       tc.exprSlot(t)

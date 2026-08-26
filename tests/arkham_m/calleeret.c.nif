@@ -1,0 +1,30 @@
+(.nif27)
+(.indexat 430              )
+(stmts
+ (proc :write.0
+  (params
+   (param :fd.0 .
+    (i 32))
+   (param :buf.0 .
+    (ptr
+     (c 8)))
+   (param :n.0 .
+    (i 32)))
+  (i 32)
+  (pragmas
+   (importc "write"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :x.0 .
+    (i 32)40)
+   (var :y.0 .
+    (i 32)2)
+   (call write.0 1 "hi\0A" 3)
+   (ret
+    (add
+     (i 32)x.0 y.0)))))(.index)

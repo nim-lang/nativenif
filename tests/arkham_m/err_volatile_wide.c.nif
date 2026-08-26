@@ -1,0 +1,45 @@
+(.nif27)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :vload.0
+  (params
+   (param :p.0 .
+    (ptr
+     (u 64))))
+  (u 64)
+  (pragmas
+   (intrinsic "VolatileLoad"))
+  (stmts .))
+ (proc :vstore.0
+  (params
+   (param :p.0 .
+    (ptr
+     (u 64)))
+   (param :v.0 .
+    (u 64))).
+  (pragmas
+   (intrinsic "VolatileStore"))
+  (stmts .))
+ (gvar :cell.0 .
+  (u 64).)
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :p.0 .
+    (ptr
+     (u 64))
+    (addr cell.0))
+   (instr vstore.0 p.0 42)
+   (var :r.0 .
+    (u 64)
+    (instr vload.0 p.0))
+   (call exit.0 r.0))))

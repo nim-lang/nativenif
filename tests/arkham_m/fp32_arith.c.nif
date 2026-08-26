@@ -1,0 +1,18 @@
+(.nif27)
+(stmts
+ (proc :exit.0
+  (params (param :code.0 . (i 32))). (pragmas (importc "exit")) (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas (exportc "main"))
+  (stmts
+   (var :a.0 . (f 32) 1.5)
+   (var :b.0 . (f 32) 2.25)
+   (var :s.0 . (f 32) (add (f 32) a.0 b.0))
+   (var :d.0 . (f 32) (sub (f 32) s.0 a.0))
+   (var :m.0 . (f 32) (mul (f 32) d.0 a.0))
+   (var :q.0 . (f 32) (div (f 32) m.0 b.0))
+   (var :n.0 . (f 32) (neg (f 32) q.0))
+   (var :r.0 . (i 32) (conv (i 32) (mul (f 32) n.0 (suf -20.0 "f32"))))
+   (call exit.0 r.0))))

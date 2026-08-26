@@ -1,0 +1,83 @@
+(.nif27)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :noinitPtr.0
+  (params)
+  (ptr
+   (u 32))
+  (pragmas
+   (intrinsic "NoinitStart"))
+  (stmts .))
+ (proc :noinitAddr.0
+  (params)
+  (u 32)
+  (pragmas
+   (intrinsic "NoinitStart"))
+  (stmts .))
+ (proc :noinitSize.0
+  (params)
+  (u 32)
+  (pragmas
+   (intrinsic "NoinitSize"))
+  (stmts .))
+ (proc :vload.0
+  (params
+   (param :p.0 .
+    (ptr
+     (u 32))))
+  (u 32)
+  (pragmas
+   (intrinsic "VolatileLoad"))
+  (stmts .))
+ (proc :vstore.0
+  (params
+   (param :p.0 .
+    (ptr
+     (u 32)))
+   (param :v.0 .
+    (u 32))).
+  (pragmas
+   (intrinsic "VolatileStore"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :n.0 .
+    (u 32)
+    (instr noinitSize.0))
+   (if
+    (elif
+     (neq n.0 256)
+     (stmts
+      (call exit.0 12))))
+   (var :a.0 .
+    (u 32)
+    (instr noinitAddr.0))
+   (if
+    (elif
+     (neq a.0 536936192)
+     (stmts
+      (call exit.0 13))))
+   (var :p.0 .
+    (ptr
+     (u 32))
+    (instr noinitPtr.0))
+   (instr vstore.0 p.0 23130)
+   (var :r.0 .
+    (u 32)
+    (instr vload.0 p.0))
+   (if
+    (elif
+     (neq r.0 23130)
+     (stmts
+      (call exit.0 14))))
+   (call exit.0 0))))

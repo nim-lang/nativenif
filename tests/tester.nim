@@ -1,7 +1,7 @@
 import std/[os, osproc, streams, strutils]
 # The SHARED intrinsic table arkham itself compiles against — imported for
 # `declared(intrinsics.FldrqOp)` alone, to stage the vector fixtures (see
-# `arkhamStagedVec`) in lock-step with codegen_a64's staged AdvSIMD block.
+# `arkhamStagedVec`) in lock-step with codegen_arm's staged AdvSIMD block.
 from "../../nimony/src/lib/intrinsics" import nil
 # The AArch64 encoders, for the byte-level checks below. Importing the module is
 # what lets a test assert an ENCODING rather than a program's output — the only
@@ -33,6 +33,12 @@ proc runProgram(exe: string; args: openArray[string] = [];
   ## than a pipe buffer holds would block in `write` and be reported as a timeout. Every
   ## fixture prints at most a line or two, which is why that trade is worth the
   ## simplicity of not needing a reader thread.
+  ##
+  ## A timed-out child's output is drained TOO, after the kill — by then its end of
+  ## the pipe is closed, so the read hits EOF instead of blocking. It used to be
+  ## thrown away, which made "what had it printed before it hung?" unanswerable
+  ## from a failure message; a firmware image that deliberately never exits has
+  ## nothing BUT that output to be judged on.
   let p = startProcess(exe, args = args, options = {poStdErrToStdOut, poUsePath})
   var waited = 0
   while waited < timeoutMs and p.running:
@@ -43,8 +49,9 @@ proc runProgram(exe: string; args: openArray[string] = [];
     sleep 50
     if p.running: p.kill()
     discard p.waitForExit()
+    let output = p.outputStream.readAll()
     p.close()
-    result = ("", timeoutExitCode)
+    result = (output, timeoutExitCode)
   else:
     # The child is gone and its end of the pipe with it, so `readAll` drains what it
     # wrote and stops at EOF rather than blocking.
@@ -97,7 +104,7 @@ const arkhamKnownUnsupported: seq[string] =
   @[]
 
 const arkhamStagedVec: seq[string] =
-  # Staged exactly like codegen_a64's AdvSIMD block (`when declared(FldrqOp)`):
+  # Staged exactly like codegen_arm's AdvSIMD block (`when declared(FldrqOp)`):
   # these fixtures declare `{.instruction: "fldrq".}`-family rows, which resolve
   # through the shared `nimony/src/lib/intrinsics` table. Against a nimony
   # checkout whose table lacks the vector rows (CI pins nimony's default
@@ -119,8 +126,9 @@ const arkhamA64Unsupported: seq[string] = @[
   "intrinsics_x64",
   # `{.assembler.}` transliteration. Its `{.register: "rdi".}` pins name x86-64
   # registers, so there is no target-neutral reading of the body — that is the
-  # mode's premise ("no fallbacks", doc/intrinsics.md §8), not a gap: an AArch64
-  # version is a different `when` branch the user writes, with `x0`/`x9` in it.
+  # mode's premise ("no fallbacks", doc/intrinsics.md §8), not a gap. The AArch64
+  # version is the different `when` branch the user writes, and it exists:
+  # `assembler_a64`, with `x0`/`x9`/`x19` in it.
   "assembler_x64",
   # `{.naked.}` — the same story as `assembler_x64` (it may only accompany it),
   # plus the `TraceTable` row, whose `targets` is x86-64 alone until the AArch64
@@ -141,6 +149,15 @@ const arkhamA64Unsupported: seq[string] = @[
   # `spilledByRefPtr` predicate was retired for). The a64 `genAconstr2` StackPtr arm
   # is in place and mirrors x86-64; it is what this gap currently keeps unreachable.
   "aconstr_byref_spilled",
+]
+
+const arkhamX64Unsupported: seq[string] = @[
+  # The mirror of `arkhamA64Unsupported`: a fixture whose `{.register: "…".}`
+  # pins name ARM registers has no x86-64 reading either, and the native pass
+  # targets x86-64 everywhere except macOS (where it targets arm64 and this
+  # fixture is exactly what should run). Two lists, one rule — an `.assembler`
+  # body belongs to the target it names.
+  "assembler_a64",
 ]
 
 const arkhamDarwinUnsupported: seq[string] =
@@ -258,7 +275,7 @@ proc arkhamWinUnwindTests() =
     echo "0 / 0 arkham win64 unwind tests (wine not installed)"
     return
   let arkham = ("bin" / "arkham").addFileExt(ExeExt)
-  let nifasm = ("src" / "nifasm" / "nifasm").addFileExt(ExeExt)
+  let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
   let workDir = "tests" / "arkham" / "nimcache"
   let asmNif = workDir / "win_stacktrace.asm.nif"
   let exe = workDir / "win_stacktrace.exe"
@@ -297,7 +314,7 @@ proc arkhamWinTraceTableTests() =
     echo "0 / 0 arkham win64 trace-table tests (wine not installed)"
     return
   let arkham = ("bin" / "arkham").addFileExt(ExeExt)
-  let nifasm = ("src" / "nifasm" / "nifasm").addFileExt(ExeExt)
+  let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
   let workDir = "tests" / "arkham" / "nimcache"
   let asmNif = workDir / "win_tracetable.asm.nif"
   let exe = workDir / "win_tracetable.exe"
@@ -310,6 +327,22 @@ proc arkhamWinTraceTableTests() =
          " (want 7 = magic|below-table|near-table)"
   echo "1 / 1 arkham win64 trace-table tests successful"
 
+proc buildToolchain() =
+  ## `bin/arkham` and `bin/nifasm`, built ONCE and BEFORE anything that runs them.
+  ##
+  ## They used to be built inside `arkhamTests`, which is two mistakes at once:
+  ## that proc runs AFTER every Cortex-M suite, and it is `when`-gated to the two
+  ## hosts whose output actually executes. So on a clean checkout the Cortex-M
+  ## suites found no binaries — the qemu-gated ones skipped and said nothing,
+  ## `cortexMInterruptTests` is a COMPILE-time rejection and rightly does not
+  ## skip, and it failed with `bin/arkham: not found`.
+  ##
+  ## It never showed in a developer's tree, where both binaries are always lying
+  ## around from the last manual build. That is exactly the class of thing CI is
+  ## for, and the fix is to stop having a build be a side effect of a test.
+  exec "nim c --hints:off src/arkham/arkham.nim"   # `--outdir: bin` in its nim.cfg
+  exec "nim c --hints:off -o:bin/nifasm src/nifasm/nifasm.nim"
+
 proc arkhamTests() =
   ## Each `tests/arkham/*.c.nif` is hand-written Leng: arkham generates asm-NIF,
   ## nifasm assembles+links it to a native executable, and we check the run's exit
@@ -317,10 +350,8 @@ proc arkhamTests() =
   ## empty). The target arch follows the host so the binaries actually run here:
   ## x86-64/ELF on Linux, AArch64/Mach-O on macOS.
   const arch = when defined(macosx): "arm64" else: "x64"
-  exec "nim c src/arkham/arkham.nim"
-  exec "nim c src/nifasm/nifasm.nim"
   let arkham = ("bin" / "arkham").addFileExt(ExeExt)
-  let nifasm = ("src" / "nifasm" / "nifasm").addFileExt(ExeExt)
+  let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
   let workDir = "tests" / "arkham" / "nimcache"
   createDir workDir
   # Foreign helper modules (`mod_*.c.nif`) are not standalone tests: compile each
@@ -343,6 +374,7 @@ proc arkhamTests() =
       if name in arkhamDarwinUnsupported or name in arkhamA64Unsupported: continue
     else:
       if name in arkhamOsxOnly: continue            # macOS-only libSystem symbol
+      if name in arkhamX64Unsupported: continue     # Arm-pinned `.assembler` body
     inc total
     let stem = file[0 ..< file.len - ".c.nif".len]
     let known = name in arkhamKnownUnsupported
@@ -482,7 +514,7 @@ proc arkhamStressTests(arch: string; runner = ""; skip: seq[string] = @[];
   ## prefixes the produced executable (`qemu-aarch64` for the `linux_arm64` pass).
   exec "nim c --hints:off -d:arkhamStress -o:bin/arkham_stress src/arkham/arkham.nim"
   let arkham = ("bin" / "arkham_stress").addFileExt(ExeExt)
-  let nifasm = ("src" / "nifasm" / "nifasm").addFileExt(ExeExt)
+  let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
   let workDir = "tests" / "arkham" / "nimcache"
   createDir workDir
   # Inherited by the arkham children.
@@ -553,7 +585,7 @@ const arkhamLinuxA64Unsupported: seq[string] = @[
   # (`keepovf`/`(ovf)` overflow checking now has a64 codegen too: the predicate is
   # computed into a staging bridge — xor/and sign trick for signed add/sub, unsigned
   # compare for carry/borrow, div-based check for mul — since the nifasm vocabulary
-  # has no flag-setting `adds`/`subs`. See codegen_a64's KeepovfS.)
+  # has no flag-setting `adds`/`subs`. See codegen_arm's KeepovfS.)
   #
   # The a64 backend otherwise reaches x86-64 parity on every arkham test, including
   # the value-core aggregate paths: object/array constructors as a var-init, a call
@@ -563,7 +595,7 @@ const arkhamLinuxA64Unsupported: seq[string] = @[
   # `(at (dot h arr) i)`) computed the wrong address; now folded like the x64 parser.
 ]
   # The arm64 backend reached parity with x86-64 on global / multi-dimensional array
-  # addressing: codegen_a64 now uses the same premat-before-tree two-pass
+  # addressing: codegen_arm now uses the same premat-before-tree two-pass
   # (`prematAccess`/`emAccessAddr`) as x86-64 to materialize a global base, a computed
   # index, and a non-scale stride's scratch into registers *before* the operand tree
   # opens, then re-emits `(at base idx [scratch])` for nifasm to fold. Add a test's
@@ -582,7 +614,7 @@ proc arkhamQemuTests() =
          "(install: sudo apt-get install qemu-user)"
     return
   let arkham = ("bin" / "arkham").addFileExt(ExeExt)
-  let nifasm = ("src" / "nifasm" / "nifasm").addFileExt(ExeExt)
+  let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
   let workDir = "tests" / "arkham" / "nimcache"
   createDir workDir
   for file in walkFiles("tests" / "arkham" / "mod_*.c.nif"):
@@ -626,6 +658,10 @@ proc arkhamQemuTests() =
   echo passed, " / ", total, " arkham linux_arm64 (qemu) tests successful (",
        skipped, " Darwin-only skipped)"
 
+# BEFORE anything that runs them, and unconditionally: a suite that skips still
+# leaves the next one needing these, and not every suite here can skip.
+buildToolchain()
+
 when defined(macosx):
   exec "nim c -r src/nifasm/nifasm tests/hello_darwin.nif"
   exec "tests/hello_darwin"
@@ -660,6 +696,11 @@ exec "nim c -r src/nifasm/nifasm tests/kill_reuse.nif"
 exec "nim c -r src/nifasm/nifasm tests/kill_reuse_multi.nif"
 exec "nim c -r src/nifasm/nifasm tests/kill_reuse_types.nif"
 exec "nim c -r src/nifasm/nifasm tests/dot_at_access.nif"
+# The BASE-FREE slot spellings — `(mem slot)`, `(mem slot off)`, `(dot slot field)`,
+# `(at slot idx)`, `(lea D slot)`. Every target spells a slot access this way now; the
+# frame base is the slot's own and is never written out. `dot_at_access` above pins the
+# older explicit-`(rsp)` forms, which stay accepted on x86-64.
+exec "nim c -r src/nifasm/nifasm tests/slot_base_free.nif"
 exec "nim c -r src/nifasm/nifasm tests/nested_dot_at.nif"
 exec "nim c -r src/nifasm/nifasm tests/pointer_dot_store.nif"
 exec "nim c -r src/nifasm/nifasm tests/array_i64_register_index.nif"
@@ -700,6 +741,7 @@ when defined(linux) and defined(amd64):
   execRun "tests/bitops_rotate_scan"
   execRun "tests/bitops_bittest"
   execRun "tests/dot_at_access"
+  execRun "tests/slot_base_free"
   execRun "tests/nested_dot_at"
   execRun "tests/pointer_dot_store"
   execRun "tests/array_i64_register_index"
@@ -762,6 +804,11 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_clobber_after_call.nif",
 # destroyed. Taking the empty list at face value is what lets a value stay in a
 # caller-saved register across a cold guard instead of paying a callee-saved home.
 exec "nim c -r src/nifasm/nifasm tests/a64_noreturn_clobber.nif"
+# The AArch64 twin of `slot_base_free`: the base-free slot spellings, including the
+# `(mem <slot> <off>)` form that reads one word of a stack aggregate with NO address
+# register. It targets `linux_arm64`, so unlike the Darwin a64 fixtures it produces an
+# ELF this host can run under qemu (see the guarded `execRun` further down).
+exec "nim c -r src/nifasm/nifasm tests/a64_slot_base_free.nif"
 # The `rep movs` family names none of its operands in the tree, yet destroys rdi/rsi/rcx.
 # Reading a local homed in one of them afterwards must be rejected here — otherwise the
 # only symptom is a silently wrong value at run time.
@@ -790,6 +837,13 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_at_base_index_collision.
 # (MAP_FAILED) stays legal too, because a COMPARE cannot corrupt a binding.
 execExpectFailure("nim c -r src/nifasm/nifasm tests/ptr_store_nonzero.nif", "cannot store the non-zero integer 32 into the pointer-typed destination")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/mem_slot_offset_range.nif", "offset 16 is outside stack slot 'buf.0' (16 bytes)")
+# The same check over the BASE-FREE spelling `(mem <slot> <off>)` — and on all three
+# targets, because all three now accept it. The bounds check is the whole reason the
+# named form is preferable to `(cast (aptr T) <reg>)`, so it must not be reachable
+# only through x86-64's older explicit-`(rsp)` spelling.
+execExpectFailure("nim c -r src/nifasm/nifasm tests/mem_slot_offset_range_basefree.nif", "offset 16 is outside stack slot 'p.0' (16 bytes)")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_mem_slot_offset_range.nif", "offset 16 is outside stack slot 'p.0' (16 bytes)")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/cortex_m_mem_slot_offset_range.nif", "offset 8 is outside stack slot 'p.0' (8 bytes)")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/cast_dest_reg.nif", "Expected memory destination")
 # The sub-width width-cast destination is an ALU-only exception: `mov` keeps the
 # strict rule, so the pointer-store protection cannot be casted away.
@@ -879,7 +933,706 @@ proc vgClientRequestEncodingTests() =
   check(X4, X3, X16, "dest in x4, block in x3")
   echo "5 / 5 vgreq encoding tests successful"
 
+const cortexMQemu = "qemu-system-arm"
+const cortexMArgs = ["-M", "mps2-an386", "-cpu", "cortex-m4",
+                     "-display", "none", "-serial", "none", "-monitor", "none",
+                     "-chardev", "stdio,id=semi",
+                     "-semihosting-config", "enable=on,target=native,chardev=semi",
+                     "-kernel"]
+  ## The canonical Cortex-M runner. The `-chardev stdio` routing is load-bearing:
+  ## without it QEMU writes the semihosting console to its own stderr, mixed in
+  ## with its diagnostics, where it cannot be compared against expected output.
+  ## See doc/cortex_m.md.
+
+proc thumb2SelfTest() =
+  ## Build the Thumb-2 encoder's self-checking image and run it. The image
+  ## computes ~45 expressions and exits with the 1-based index of the first whose
+  ## result differs from the expected value, so a failure NAMES the broken
+  ## encoding rather than just crashing.
+  ##
+  ## Executing the instructions is the strongest oracle available: QEMU ships no
+  ## disassembler in this configuration, but its DECODER is the one that will run
+  ## whatever the backend emits, so "the result is right" checks the encoding at
+  ## exactly the level that matters — and it exercises the branch encoders and the
+  ## relocation patcher too, which a byte-comparison could not.
+  let qemu = findExe(cortexMQemu)
+  if qemu.len == 0:
+    echo cortexMQemu, " not found - skipping Thumb-2 encoder self-test " &
+         "(install: sudo apt-get install qemu-system-arm)"
+    return
+  let gen = ("bin" / "thumb2_selftest").addFileExt(ExeExt)
+  exec "nim c --hints:off --warnings:off -o:" & gen & " tests/thumb2_selftest.nim"
+  let elf = "tests" / "thumb2_selftest.elf"
+  exec quoteShell(gen) & " " & quoteShell(elf)
+  var args: seq[string] = @[]
+  for a in cortexMArgs: args.add a
+  args.add elf
+  let (output, code) = runProgram(qemu, args)
+  if code == timeoutExitCode:
+    quit "FAILURE (TIMEOUT) Thumb-2 encoder self-test\n"
+  if code != 0:
+    quit "FAILURE Thumb-2 encoder self-test: check #" & $code &
+         " produced the wrong value\n" & output &
+         "\n(run `" & gen & " x.elf` to list the checks by index)"
+  removeFile elf
+  echo "Thumb-2 encoder self-test successful (all checks passed)"
+
+
+proc cortexMAsmTests() =
+  ## Assemble hand-written Cortex-M asm-NIF with nifasm and run the resulting
+  ## firmware under QEMU. This is the END-TO-END gate for the instruction
+  ## selector: the encoder self-test above proves the ENCODINGS, but only these
+  ## exercise the operand model, the register-binding table, the relocation
+  ## patching and the ELF32 image together.
+  ##
+  ## Each fixture exits with a value it COMPUTED, so a wrong encoding shows up as
+  ## a wrong exit code rather than as output that happens to look right.
+  let qemu = findExe(cortexMQemu)
+  if qemu.len == 0:
+    echo cortexMQemu, " not found - skipping Cortex-M assembler tests"
+    return
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  const fixtures = [("hello_cortex_m", 0, "Hello Cortex-M\n"),
+                    ("cortex_m_alu", 42, ""),
+                    ("cortex_m_call", 42, ""),
+                    ("cortex_m_stackargs", 42, ""),
+                    ("cortex_m_global", 42, ""),
+                    ("cortex_m_aggr", 42, "")]
+  var passed = 0
+  for (stem, wantCode, wantOut) in fixtures:
+    let src = "tests" / (stem & ".nif")
+    let elf = "tests" / (stem & ".elf")
+    exec quoteShell(nifasmExe) & " -o:" & quoteShell(elf) & " " & quoteShell(src)
+    var args: seq[string] = @[]
+    for a in cortexMArgs: args.add a
+    args.add elf
+    let (output, code) = runProgram(qemu, args)
+    if code == timeoutExitCode:
+      quit "FAILURE (TIMEOUT) cortex-m " & stem & "\n"
+    if code != wantCode:
+      quit "FAILURE cortex-m " & stem & ": exit " & $code & ", want " &
+           $wantCode & "\n" & output
+    if output != wantOut:
+      quit "FAILURE cortex-m " & stem & " output\nExpected: " & escape(wantOut) &
+           "\nGot:      " & escape(output)
+    removeFile elf
+    inc passed
+  echo passed, " / ", fixtures.len, " Cortex-M assembler tests successful"
+
+
+const cortexMRejections: seq[(string, string)] = @[
+  # A name this target has no such thing as. WHICH names exist is arkham's
+  # question by design — sem deliberately does not ask — so this is the only
+  # place the answer can be given, and it is given BY NAME.
+  ("err_interrupt_unknown", "is not an interrupt of this target"),
+  # Two handlers for one entry. A table word holds one address, so the second
+  # would silently win; refusing is the only reading that is not a coin toss.
+  ("err_interrupt_dup", "a table word holds one address"),
+  # A volatile access wider than one machine access. Splitting it into halves is
+  # two accesses, which is not what a device register was asked for — and the
+  # 64-bit path exists on this target, so nothing but the row's meaning stops it.
+  ("err_volatile_wide", "must be ONE machine access"),
+  # ── `{.assembler.}` pins (doc/intrinsics.md §8) ────────────────────────────
+  # Arkham owns these rules outright — nimony's sem only forwards the pragmas —
+  # and every one of them is target-specific, which is precisely why the Arm mode
+  # needs its own rejection coverage rather than inheriting x86-64's.
+  #
+  # A register spelling from the other target. It is the mode's premise that a
+  # body names ONE machine, so the useful answer says which names this one has.
+  ("err_asm_foreign_reg", "is not a Cortex-M general-purpose register"),
+  # r12 is nifasm's operand-folding scratch, written at sites arkham never sees:
+  # a value pinned there dies to an instruction the code generator did not emit.
+  ("err_asm_scratch_reg", "is the assembler's own scratch"),
+  # r10/r11 are arkham's staging bridges, and r8/r9 its produce bridge and
+  # indirect-result pointer. All four are callee-saved under AAPCS32 but absent
+  # from `md.intCalleeSaved`, so the prologue saves none of them — a pin there
+  # destroys the caller's value with no local symptom.
+  ("err_asm_bridge_reg", "staging bridges"),
+  # A frame slot wider than the machine word. A 64-bit `(s)` slot would be a
+  # 64-bit-typed access, which nifasm refuses on this target — naming the LOCAL
+  # here beats pointing at a `(mov …)` the user never wrote.
+  ("err_asm_wide_stack", "moves one 4-byte word at a time"),
+  # A pin that contradicts the ABI. In an `.assembler` proc a location
+  # constraint is an assertion, not a request, so the two must agree.
+  ("err_asm_param_reg", "is passed in r0 by this target's ABI"),
+]
+
+proc cortexMInterruptTests() =
+  ## The two ways to name an interrupt handler wrong. The POSITIVE path is
+  ## `tests/arkham_m/interrupt_pendsv`, which pends PendSV through ICSR and exits
+  ## with what the handler wrote — so it runs the table, the Thumb bit and the
+  ## handler's return, not just the emission.
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  var passed = 0
+  for (name, expected) in cortexMRejections:
+    execExpectFailure(quoteShell(arkham) & " -a:cortex_m -o:" &
+                      quoteShell("tests" / "arkham_m" / (name & ".rej.nif")) &
+                      " " & quoteShell("tests" / "arkham_m" / (name & ".c.nif")),
+                      expected)
+    inc passed
+  echo passed, " / ", cortexMRejections.len, " Cortex-M interrupt/volatile rejection tests successful"
+
+
+proc cortexMLayoutTests() =
+  ## `--layout:<board.nif>` — the file that replaced a command-line namespace it
+  ## had outgrown. Regions are a LIST, a stack slot has a size and a count and a
+  ## thread-local reservation, and none of that survives being flattened into
+  ## `--flag:value` pairs.
+  ##
+  ## What is checked is that the FILE reaches the IMAGE, which means reading the
+  ## two words a cold core reads and the segment addresses back out of the ELF.
+  ## Running is not enough on its own: an image that ignored the file entirely
+  ## would still exit 42 from its compiled-in defaults.
+  let qemu = findExe(cortexMQemu)
+  if qemu.len == 0:
+    echo cortexMQemu, " not found - skipping Cortex-M layout tests"
+    return
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham_m" / "nimcache_m"
+  createDir workDir
+  let src = "tests" / "arkham_m" / "global_data_init.c.nif"
+  var passed = 0
+
+  proc u32At(img: string; off: int): uint32 =
+    for i in countdown(3, 0): result = (result shl 8) or uint32(img[off + i].byte)
+
+  proc build(board, stem: string): string =
+    let asmNif = workDir / (stem & ".asm.nif")
+    let elf = workDir / (stem & ".elf")
+    exec quoteShell(arkham) & " -a:cortex_m --layout:" & quoteShell(board) &
+         " -o:" & quoteShell(asmNif) & " " & quoteShell(src)
+    exec quoteShell(nifasmExe) & " -o:" & quoteShell(elf) & " " & quoteShell(asmNif)
+    result = elf
+
+  # ── 1. the MPS2 board: placed from the file, and RUNS ──
+  let mpsElf = build("tests" / "layout" / "mps2.nif", "layout_mps2")
+  var args: seq[string] = @[]
+  for a in cortexMArgs: args.add a
+  args.add mpsElf
+  let (mout, mcode) = runProgram(qemu, args)
+  if mcode != 42:
+    quit "FAILURE cortex-m layout: mps2 board exited " & $mcode & "\n" & mout
+  block:
+    let img = readFile(mpsElf)
+    # 16 bytes of globals, then a 16K heap, then the stacks rounded UP to the 8K
+    # slot size — 0x20006000 — so slot 0's top is 0x20008000 and SP starts below
+    # the 256-byte thread-local reservation at its top.
+    let msp = u32At(img, int(u32At(img, 52 + 4)))
+    if msp != 0x20007F00'u32:
+      quit "FAILURE cortex-m layout: mps2 initial MSP 0x" & toHex(msp, 8) &
+           ", want 0x20007F00 (globals + heap + slot - tls)"
+  inc passed
+
+  # ── 2. a DIFFERENT board moves everything ──
+  # An STM32F407: flash at 0x08000000, 128K of SRAM, a 32K heap and a 512-byte
+  # reservation. Nothing here can come from a compiled-in default.
+  let stmElf = build("tests" / "layout" / "stm32f407.nif", "layout_stm32")
+  block:
+    let img = readFile(stmElf)
+    let flashV = u32At(img, 52 + 8)
+    let msp = u32At(img, int(u32At(img, 52 + 4)))
+    if flashV != 0x08000000'u32:
+      quit "FAILURE cortex-m layout: stm32 text at 0x" & toHex(flashV, 8)
+    if msp != 0x2000BE00'u32:
+      quit "FAILURE cortex-m layout: stm32 initial MSP 0x" & toHex(msp, 8) &
+           ", want 0x2000BE00"
+    # THE POINT of that unchanged number: this board also carries a `(noinit …)`
+    # row, and the region comes off the FAR END of sram. If it were taken from
+    # anywhere the globals, the heap or the stacks are placed, this MSP would have
+    # moved — so an unmoved MSP is what says the reservation is disjoint from
+    # everything else rather than merely declared.
+    #
+    # And the SRAM segment — the bytes the startup code establishes — must END
+    # below it. That is the part that cannot be shown by running: QEMU hands the
+    # guest zeroed RAM, so a zero loop that DID reach the region would look
+    # exactly like one that did not.
+    let ramVaddr = u32At(img, 52 + 32 + 8)
+    let ramMemSz = u32At(img, 52 + 32 + 20)
+    let noinitBase = 0x20020000'u32 - 256'u32
+    if ramVaddr + ramMemSz > noinitBase:
+      quit "FAILURE cortex-m layout: the startup code establishes 0x" &
+           toHex(ramVaddr, 8) & "+" & $ramMemSz & ", which reaches the noinit " &
+           "region at 0x" & toHex(noinitBase, 8)
+  inc passed
+
+  # ── 3. the heap the layout reserved, read back by the code that uses it ──
+  # `HeapStart`/`HeapSize` are link-time constants the image writer patches, and
+  # they are how `osalloc` gets pages on a target with no OS to ask. The probe
+  # exits with `heapStart - ramBase`, so a wrong ADDRESS is a wrong exit code
+  # rather than a crash somewhere later; a wrong SIZE exits 12.
+  block:
+    let asmNif = workDir / "heap_probe.asm.nif"
+    let elf = workDir / "heap_probe.elf"
+    exec quoteShell(arkham) & " -a:cortex_m --layout:" &
+         quoteShell("tests" / "layout" / "mps2.nif") & " -o:" & quoteShell(asmNif) &
+         " " & quoteShell("tests" / "layout" / "heap_probe.c.nif")
+    exec quoteShell(nifasmExe) & " -o:" & quoteShell(elf) & " " & quoteShell(asmNif)
+    var hargs: seq[string] = @[]
+    for a in cortexMArgs: hargs.add a
+    hargs.add elf
+    let (hout, hcode) = runProgram(qemu, hargs)
+    if hcode == 12:
+      quit "FAILURE cortex-m layout: HeapSize is not the 16K the board reserved"
+    if hcode != 0:
+      quit "FAILURE cortex-m layout: heap starts " & $hcode & " bytes above the " &
+           "RAM base; this module has no globals, so it should start AT it\n" & hout
+  # Without a layout there is no reserved heap to name, and saying so beats
+  # answering with a compiled-in default.
+  execExpectFailure(quoteShell(arkham) & " -a:cortex_m -o:" &
+                    quoteShell(workDir / "x.asm.nif") & " " &
+                    quoteShell("tests" / "layout" / "heap_probe.c.nif"),
+                    "needs a board layout")
+  inc passed
+
+  # ── 4. what the file refuses ──
+  # The power-of-two rule is the one the whole thread-local scheme rests on: a
+  # thread reaches its own slot by masking SP with the slot size.
+  let bad = workDir / "bad_layout.nif"
+  proc reject(edit: (string, string); expected: string) =
+    var t = readFile("tests" / "layout" / "mps2.nif")
+    t = t.replace(edit[0], edit[1])
+    writeFile(bad, t)
+    execExpectFailure(quoteShell(arkham) & " -a:cortex_m --layout:" & quoteShell(bad) &
+                      " -o:" & quoteShell(workDir / "x.asm.nif") & " " & quoteShell(src),
+                      expected)
+  reject(("(kilobytes 8)", "(kilobytes 5)"), "power of two")
+  reject(("(startAddress 536870912)", "(startAddress 0)"), "overlap")
+  reject(("(bytes 256)", "(kilobytes 8)"), "fills the whole stack slot")
+  reject(("(core 0)", "(core 3)"), "outside the 1 slot")
+  reject(("(kilobytes 16)", "16"), "expected a size")
+  # A file that says nothing about where the image ships is not a layout with a
+  # default — it is a layout with a hole in it.
+  reject((" (flash (startAddress 0) (megabytes 4))\n", ""),
+         "nothing says where the image ships")
+  # A heap that does not fit is a LINK-time fact — arkham cannot know how many
+  # bytes of globals the module has — so this one is nifasm's to refuse.
+  block:
+    var t = readFile("tests" / "layout" / "mps2.nif")
+    t = t.replace("(kilobytes 16)", "(kilobytes 512)")
+    writeFile(bad, t)
+    let asmNif = workDir / "toobig.asm.nif"
+    exec quoteShell(arkham) & " -a:cortex_m --layout:" & quoteShell(bad) &
+         " -o:" & quoteShell(asmNif) & " " & quoteShell(src)
+    execExpectFailure(quoteShell(nifasmExe) & " -o:" & quoteShell(workDir / "x.elf") &
+                      " " & quoteShell(asmNif), "does not fit")
+  # ── 5. the region kept back from the startup code ──
+  # `(noinit …)` is bytes at the top of `sram` that nothing establishes at reset,
+  # for the one thing that must NOT be established: a record written by the run
+  # that failed and read by the run after it.
+  #
+  # What is checked here is the ADDRESS and the SIZE, from the code that would
+  # use them. Running proves less than it looks on this target — a reset the
+  # image ignored entirely would still exit 0 — so the disjointness claim is made
+  # in section 2 against the ELF, and the RESERVATION is proved by the rejection
+  # below rather than by anything a passing run shows.
+  block:
+    let board = "tests" / "layout" / "mps2_noinit.nif"
+    let asmNif = workDir / "noinit_probe.asm.nif"
+    let elf = workDir / "noinit_probe.elf"
+    exec quoteShell(arkham) & " -a:cortex_m --layout:" & quoteShell(board) &
+         " -o:" & quoteShell(asmNif) & " " &
+         quoteShell("tests" / "layout" / "noinit_probe.c.nif")
+    exec quoteShell(nifasmExe) & " -o:" & quoteShell(elf) & " " & quoteShell(asmNif)
+    var nargs: seq[string] = @[]
+    for a in cortexMArgs: nargs.add a
+    nargs.add elf
+    let (nout, ncode) = runProgram(qemu, nargs)
+    case ncode
+    of 12: quit "FAILURE cortex-m noinit: NoinitSize is not the 256 bytes reserved"
+    of 13: quit "FAILURE cortex-m noinit: NoinitStart is not 0x2000FF00 — the " &
+                "region is not the top 256 bytes of the 64K region at 0x20000000"
+    of 14: quit "FAILURE cortex-m noinit: the region did not hold what was stored " &
+                "in it, so it is not RAM the image owns"
+    of 0: discard
+    else: quit "FAILURE cortex-m noinit: probe exited " & $ncode & "\n" & nout
+  # THE test that the reservation is real. 36K of noinit still passes arkham's
+  # whole-file check (8K of stacks plus a 16K heap plus 36K fits in 64K), and it
+  # is only at link time — where the globals and the slot-size rounding are known
+  # — that the stacks are seen to run into it. Were the region merely declared and
+  # not reserved, this would assemble.
+  block:
+    var t = readFile("tests" / "layout" / "mps2_noinit.nif")
+    t = t.replace("(noinit (bytes 256))", "(noinit (kilobytes 36))")
+    writeFile(bad, t)
+    let asmNif = workDir / "noinit_toobig.asm.nif"
+    exec quoteShell(arkham) & " -a:cortex_m --layout:" & quoteShell(bad) &
+         " -o:" & quoteShell(asmNif) & " " & quoteShell(src)
+    execExpectFailure(quoteShell(nifasmExe) & " -o:" & quoteShell(workDir / "x.elf") &
+                      " " & quoteShell(asmNif), "past the noinit region")
+  # And naming the region when the file keeps nothing back is a question with no
+  # answer, not a zero.
+  execExpectFailure(quoteShell(arkham) & " -a:cortex_m --layout:" &
+                    quoteShell("tests" / "layout" / "mps2.nif") & " -o:" &
+                    quoteShell(workDir / "x.asm.nif") & " " &
+                    quoteShell("tests" / "layout" / "noinit_probe.c.nif"),
+                    "keeps nothing back")
+  inc passed
+  echo passed, " / 4 Cortex-M layout-file tests successful"
+
+
+proc cortexMMemMapTests() =
+  ## The board memory map (`--flash`/`--flash-size`/`--ram`/`--ram-size`/
+  ## `--stack-top`) actually reaching the image.
+  ##
+  ## The load-bearing case is the RELOCATED one, and it is relocated within the
+  ## address range QEMU's SSRAM covers so that it can be RUN rather than merely
+  ## inspected: if any of the globals' `movw/movt` sites, the `(datavma)` the
+  ## startup copy writes to, or the interrupt table's initial-MSP word still carried
+  ## a compiled-in constant, the fixture reads a global that was never written or
+  ## pushes onto a stack that is not there. It exits 42 only if all three follow
+  ## the map.
+  ##
+  ## The board case (an STM32F407) cannot be run — nothing in QEMU has flash at
+  ## 0x08000000 — so it is checked by reading the two words a cold core reads.
+  let qemu = findExe(cortexMQemu)
+  if qemu.len == 0:
+    echo cortexMQemu, " not found - skipping Cortex-M memory-map tests"
+    return
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham_m" / "nimcache_m"
+  createDir workDir
+  let src = "tests" / "arkham_m" / "global_data_init.c.nif"
+  let asmNif = workDir / "memmap.asm.nif"
+  exec quoteShell(arkham) & " -a:cortex_m -o:" & quoteShell(asmNif) & " " &
+       quoteShell(src)
+  var passed = 0
+
+  proc u32At(img: string; off: int): uint32 =
+    for i in countdown(3, 0): result = (result shl 8) or uint32(img[off + i].byte)
+
+  # ── 1. relocated RAM, run under QEMU ──
+  let relocElf = workDir / "memmap_reloc.elf"
+  exec quoteShell(nifasmExe) & " --ram:0x20001000 --ram-size:32K -o:" &
+       quoteShell(relocElf) & " " & quoteShell(asmNif)
+  var args: seq[string] = @[]
+  for a in cortexMArgs: args.add a
+  args.add relocElf
+  let (relocOut, relocCode) = runProgram(qemu, args)
+  if relocCode == timeoutExitCode:
+    quit "FAILURE (TIMEOUT) cortex-m memmap relocated RAM"
+  if relocCode != 42:
+    quit "FAILURE cortex-m memmap relocated RAM: exit " & $relocCode & "\n" & relocOut
+  # Running is not by itself evidence: an image that ignored `--ram` entirely and
+  # put everything back at the default base is INTERNALLY consistent and exits 42
+  # just the same. So read the addresses back and require that they moved.
+  block:
+    let relocImg = readFile(relocElf)
+    let ramV = u32At(relocImg, 52 + 32 + 8)
+    let mspV = u32At(relocImg, int(u32At(relocImg, 52 + 4)))
+    if ramV != 0x20001000'u32:
+      quit "FAILURE cortex-m memmap: relocated RAM segment at 0x" & toHex(ramV, 8) &
+           ", want 0x20001000 — the --ram flag did not reach the image"
+    if mspV != 0x20009000'u32:
+      quit "FAILURE cortex-m memmap: relocated initial MSP 0x" & toHex(mspV, 8) &
+           ", want 0x20009000"
+  inc passed
+
+  # ── 2. an STM32F407 map, read back out of the image ──
+  # Segment vaddrs live in the program headers, which this reads at their fixed
+  # ELF32 offsets rather than by shelling out to readelf.
+  let stmElf = workDir / "memmap_stm32.elf"
+  exec quoteShell(nifasmExe) &
+       " --flash:0x08000000 --flash-size:1M --ram-size:128K -o:" &
+       quoteShell(stmElf) & " " & quoteShell(asmNif)
+  let img = readFile(stmElf)
+  const PhOff = 52          # e_phoff: the headers follow the 52-byte ELF header
+  const PhSize = 32
+  let flashVaddr = u32At(img, PhOff + 8)
+  let ramVaddr = u32At(img, PhOff + PhSize + 8)
+  let flashFileOff = u32At(img, PhOff + 4)
+  if flashVaddr != 0x08000000'u32:
+    quit "FAILURE cortex-m memmap: flash segment at 0x" & toHex(flashVaddr, 8)
+  if ramVaddr != 0x20000000'u32:
+    quit "FAILURE cortex-m memmap: RAM segment at 0x" & toHex(ramVaddr, 8)
+  # The two words a cold M-profile core reads: initial MSP, then the reset
+  # handler WITH the Thumb bit — an even address here is a UsageFault at reset.
+  let msp = u32At(img, int(flashFileOff))
+  let reset = u32At(img, int(flashFileOff) + 4)
+  if msp != 0x20020000'u32:
+    quit "FAILURE cortex-m memmap: initial MSP 0x" & toHex(msp, 8) & ", want 0x20020000"
+  if (reset and 1) == 0 or reset < 0x08000000'u32 or reset >= 0x08100000'u32:
+    quit "FAILURE cortex-m memmap: reset vector 0x" & toHex(reset, 8)
+  inc passed
+
+  # ── 3. the target triple, which is how nimony names this target ──
+  # `--os:embedded --cpu:arm32` and the legacy `-a:cortex_m` must select the same
+  # backend, so compare the OUTPUT rather than trusting the mapping table: this
+  # is the spelling `deps.nim` forwards verbatim from nimony's platform table,
+  # and a mapping that quietly picked another arch would still exit 0.
+  let byTriple = workDir / "memmap_triple.asm.nif"
+  exec quoteShell(arkham) & " --os:embedded --cpu:arm32 -o:" & quoteShell(byTriple) &
+       " " & quoteShell(src)
+  if readFile(byTriple) != readFile(asmNif):
+    quit "FAILURE cortex-m: --os:embedded --cpu:arm32 does not select the same " &
+         "backend as -a:cortex_m"
+  # `--cpu:arm` is what was written before the rename and still resolves.
+  let byOldCpu = workDir / "memmap_triple_arm.asm.nif"
+  exec quoteShell(arkham) & " --os:embedded --cpu:arm -o:" & quoteShell(byOldCpu) &
+       " " & quoteShell(src)
+  if readFile(byOldCpu) != readFile(asmNif):
+    quit "FAILURE cortex-m: --cpu:arm no longer resolves to arm32"
+  # `standalone` is Nim's word for a different arrangement and must NOT be taken
+  # for this one.
+  execExpectFailure(quoteShell(arkham) & " --os:standalone --cpu:arm32 -o:" &
+                    quoteShell(workDir / "memmap_x.asm.nif") & " " & quoteShell(src),
+                    "unknown --os:standalone")
+
+  # ── 4. the bounds, which are the whole point of declaring a size ──
+  execExpectFailure(quoteShell(nifasmExe) & " --flash-size:256 -o:" &
+                    quoteShell(workDir / "memmap_x.elf") & " " & quoteShell(asmNif),
+                    "holds 256")
+  execExpectFailure(quoteShell(nifasmExe) &
+                    " --ram-size:8 --stack-top:0x20000008 -o:" &
+                    quoteShell(workDir / "memmap_x.elf") & " " & quoteShell(asmNif),
+                    "reach the stack top")
+  execExpectFailure(quoteShell(nifasmExe) & " --ram:0x00000000 -o:" &
+                    quoteShell(workDir / "memmap_x.elf") & " " & quoteShell(asmNif),
+                    "overlap")
+  execExpectFailure(quoteShell(nifasmExe) & " --stack-top:0x30000000 -o:" &
+                    quoteShell(workDir / "memmap_x.elf") & " " & quoteShell(asmNif),
+                    "outside the RAM region")
+  inc passed
+
+  inc passed
+  echo passed, " / 4 Cortex-M memory-map and target-triple tests successful"
+
+
+const cortexMUnsupported: seq[string] = @[
+  # `tests/arkham/` — the FULL 64-bit corpus — is run against Cortex-M as well.
+  # These are the fixtures it cannot serve, each parked under the reason, so that
+  # any OTHER failure is fatal and a fixture that starts working is reported.
+  # Every one of them refuses BY NAME (a compile-time error from arkham or
+  # nifasm); the single exception is called out at the bottom.
+
+  # ── float64 ─────────────────────────────────────────────────────────────────
+  # Missing HARDWARE, not a missing feature: Cortex-M4F's FPv4-SP is single
+  # precision and has no `.f64` instruction at all. `float32` works (M5) — see
+  # `tests/arkham_m/fp32_*` — and a double is refused rather than lowered through
+  # a softfloat library nobody asked for.
+  "a64_vec_instr", "addrfloat", "float_array_index", "float_global_field",
+  "float_global_read", "float_special_values", "fp3264", "fparg_spill",
+  "fparith", "fparith2", "fparray", "fpasgn", "fpasgn2", "fpcall", "fpcmp",
+  "fpdeep", "fpderef", "fpfield", "fpfunc", "fpparamspill", "fpspill",
+  "global_init_float", "spill_produce_float", "store_forward",
+  "uint_literal_to_float",
+
+  # ── float <-> 64-bit integer ────────────────────────────────────────────────
+  # FPv4-SP converts to and from a THIRTY-TWO bit integer. `int64(f)` past 2^31
+  # would need a runtime routine, and a `vcvt` plus a sign-extend would be
+  # quietly wrong exactly there — so it is refused. `int32(f)` and `float32(i32)`
+  # are what this core has, and they work.
+  "div_floatparam", "float_const_conv", "fp32", "fpconv", "fpconv2",
+
+  # ── no such hardware, no such OS ────────────────────────────────────────────
+  # `mmap`/`futex`/`___ulock_wake` (no kernel to ask) and the x86-64-pinned
+  # stack-walk fixture. The three `tvar_*` fixtures used to be here too: a
+  # thread-local is now emitted as a global on a board that declares ONE stack
+  # slot, which is a decision about the board and not about the ISA — a Cortex-M
+  # part with four cores has four threads and is refused by name until the
+  # SP-masked thread-local base exists.
+  "mmap_anon", "futex_wake", "ulock_wake", "naked_stacktrace_x64",
+
+  # ── 64-bit intrinsics ───────────────────────────────────────────────────────
+  # `clz`/`rbit`/`rev` and the atomics at 64 bits: ARMv7-M's are 32-bit, and its
+  # exclusives have no 64-bit form on this core either — there is no `ldrexd`, and
+  # two exclusive pairs over the halves would be two claims rather than one atom,
+  # so a 64-bit cell is refused BY NAME. The 8/16/32-bit atomics are lowered
+  # (`ldrex`/`strex` bracketed by `dmb`): `atomic_subword_cas` runs here, and
+  # `tests/arkham_m/atomics` covers every row at 32 bits. The overflow-checked
+  # 64-bit multiply wants `smulh`, which does not exist here.
+  "atomic", "atomic2", "atomic_cas", "atomic_cas_regpressure",
+  "intrinsics", "intrinsics_x64",
+  "mul_overflow", "mul_overflow_pow2",
+
+  # ── register pressure ───────────────────────────────────────────────────────
+  # Four allocatable homes and an empty volatile pool (see machine_m.nim). Each
+  # of these fails LOUDLY at the pick — never with a wrong answer.
+  #
+  # The list shrank again when the last-resort scratch draw learned which
+  # argument registers are actually STAGED (`stagedArgs`): r0–r3 are this
+  # target's only volatiles, and outside a call's marshalling window and the
+  # prologue, nothing has a claim on them. `atomic_ptr_cell` runs on that alone.
+  #
+  # The list SHRANK when the produce bridge (r8) joined the staging set:
+  # `at_scratch_deref_base` and `nested_at_read` are address chains that need a
+  # third scratch register, and a third was reserved all along — it just was not
+  # reachable from the staging draw. What is left is demand of a different KIND —
+  # an ATOMIC's operands, which may not use a bridge at all because the LL/SC loop
+  # owns them, and an aggregate whose two ends are both computed.
+  "aconstr_byref_spilled", "aggr_arg_parked_manual",
+  "atomic_cas_operand_home",
+
+  # ── WRONG ANSWER, and the second one in this list ───────────────────────────
+  # `array2d` used to fail loudly for register pressure. It compiles now, and
+  # computes 1 where it should compute 24 — so it is parked next to
+  # `stack_array_align` rather than among the refusals, because a tolerated wrong
+  # answer is the one thing this list must not hide.
+  #
+  # The cause is NOT the register draw that let it compile: the same shape with
+  # no register pressure at all — a 3x3 `array[array[i 64]]`, one store, one read
+  # — makes zero last-resort draws and still breaks, with nifasm refusing the
+  # STORE outright: "element stride 24 is not an LDR/STR scale; use the
+  # 3-operand form with a scratch register". The read of the same lvalue emits
+  # the 3-operand form correctly, so the wide (64-bit) store path reaches the
+  # `(at …)` without the stride-scratch reservation `emitLvalWalk` makes for the
+  # read. That is a Cortex-M 64-bit addressing bug that was unreachable while the
+  # fixture refused earlier, not a consequence of reaching it.
+  "array2d",
+
+  # ── x86-64 assembly ─────────────────────────────────────────────────────────
+  # An `{.assembler.}` proc whose register pins name x86-64 registers. Refused on
+  # AArch64 too, and for the same reason: there is no target-neutral reading of
+  # `{.register: "rax".}`.
+  "assembler_x64",
+
+  # The AArch64 `.assembler` fixture, for the same reason in the other
+  # direction: its pins are `x0`/`x9`/`x19`, which this target does not have.
+  # The Cortex-M half of that mode is `tests/arkham_m/assembler_m`, whose pins
+  # are `r0`..`r7` and which runs in the 32-bit corpus.
+  "assembler_a64",
+
+  # ── INAPPLICABLE, not unsupported ───────────────────────────────────────────
+  # The one entry that does not refuse: it runs and returns the wrong exit code,
+  # because what it asserts is not true of this target. `stack_array_align`
+  # checks `addr big and 15 == 0` — a 16-byte stack alignment that SysV and
+  # AAPCS64 happen to give it. AAPCS32 promises 8, and over-aligning every frame
+  # to buy it back would cost stack on a device that has kilobytes of it.
+  "stack_array_align",
+]
+
+proc arkhamCortexM64Tests() =
+  ## The FULL `tests/arkham/` corpus — the 64-bit one — compiled for Cortex-M and
+  ## run under QEMU. This is what M4 (64-bit integers on a 32-bit target) is
+  ## measured by; `tests/arkham_m/` stays as the 32-bit-specific corpus.
+  ##
+  ## A fixture in `cortexMUnsupported` may fail; anything else may not, and a
+  ## parked fixture that starts passing is reported so the list shrinks with the
+  ## backend instead of drifting.
+  let qemu = findExe(cortexMQemu)
+  if qemu.len == 0:
+    echo cortexMQemu, " not found - skipping the arkham cortex-m 64-bit corpus"
+    return
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham" / "nimcache_m"
+  createDir workDir
+  # Foreign helper modules first, so a cross-module fixture can auto-import them.
+  for file in walkFiles("tests" / "arkham" / "mod_*.c.nif"):
+    let name = extractFilename(file)[0 ..< extractFilename(file).len - ".c.nif".len]
+    discard execCmdEx(quoteShell(arkham) & " -a:cortex_m -o:" &
+                      quoteShell(workDir / (name & ".asm.nif")) & " " & quoteShell(file))
+  var total, passed, skipped = 0
+  for file in walkFiles("tests" / "arkham" / "*.c.nif"):
+    let base = extractFilename(file)
+    if base.startsWith("mod_"): continue        # foreign helper, not standalone
+    if base.startsWith("err_"): continue        # must NOT compile
+    let name = base[0 ..< base.len - ".c.nif".len]
+    inc total
+    let stem = file[0 ..< file.len - ".c.nif".len]
+    let known = name in cortexMUnsupported
+    let asmNif = workDir / (name & ".asm.nif")
+    let exe = workDir / (name & ".elf")
+    template tolerate(what, output: string) =
+      if known: inc skipped; continue
+      quit "FAILURE (cortex-m 64) " & what & " " & file & "\n" & output
+    let (ao, ac) = execCmdEx(quoteShell(arkham) & " -a:cortex_m -o:" &
+                             quoteShell(asmNif) & " " & quoteShell(file))
+    if ac != 0: tolerate("arkham (codegen)", ao)
+    let (no, nc) = execCmdEx(quoteShell(nifasmExe) & " -o:" & quoteShell(exe) & " " &
+                             quoteShell(asmNif))
+    if nc != 0: tolerate("nifasm (assemble)", no)
+    var args: seq[string] = @[]
+    for a in cortexMArgs: args.add a
+    args.add exe
+    let (po, pc) = runProgram(qemu, args)
+    if pc == timeoutExitCode: tolerate("TIMEOUT running", "")
+    let ecFile = stem & ".exitcode"
+    let expectedCode = if fileExists(ecFile): parseInt(readFile(ecFile).strip) else: 0
+    if pc != expectedCode:
+      tolerate("exitcode " & $expectedCode & " but got " & $pc & " for", po)
+    let outFile = stem & ".output"
+    let expectedOut = if fileExists(outFile): readFile(outFile).strip else: ""
+    if po.strip != expectedOut:
+      tolerate("output mismatch (expected:\n" & expectedOut & "\ngot:\n" &
+               po.strip & "\n) for", "")
+    if known:
+      echo "NOTE: ", name, " now passes on cortex-m - remove it from cortexMUnsupported"
+    removeFile asmNif
+    removeFile exe
+    inc passed
+  echo passed, " / ", total, " arkham cortex-m 64-bit corpus tests successful (",
+       skipped, " known-unsupported skipped)"
+
+proc arkhamCortexMTests() =
+  ## The Cortex-M end-to-end pass: Leng `.c.nif` → arkham → nifasm → firmware →
+  ## QEMU, checking each fixture's exit code.
+  ##
+  ## `tests/arkham_m/` is its OWN corpus, mechanically derived from
+  ## `tests/arkham/` with the 64-bit scalars rewritten to 32-bit. It has to be
+  ## separate: 206 of the 236 originals declare `(i 64)`, which on a 32-bit
+  ## target needs the register-pair lowering that is milestone M4. The corpus
+  ## grows as features land rather than carrying a skip list the size of itself.
+  let qemu = findExe(cortexMQemu)
+  if qemu.len == 0:
+    echo cortexMQemu, " not found - skipping arkham Cortex-M tests"
+    return
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  var total = 0
+  var passed = 0
+  for file in walkFiles("tests/arkham_m/*.c.nif"):
+    let stem = file.extractFilename.replace(".c.nif", "")
+    if stem.startsWith("err_"): continue   # must NOT compile; see cortexMInterruptTests
+    let expectedCode = parseInt(readFile("tests" / "arkham_m" / (stem & ".exitcode")).strip())
+    inc total
+    let asmFile = "tests" / "arkham_m" / (stem & ".asm.nif")
+    let exe = "tests" / "arkham_m" / (stem & ".elf")
+    let (ao, ac) = execCmdEx(quoteShell(arkham) & " -a:cortex_m -o:" &
+                             quoteShell(asmFile) & " " & quoteShell(file))
+    if ac != 0: quit "FAILURE arkham (cortex_m codegen) " & file & "\n" & ao
+    let (no, nc) = execCmdEx(quoteShell(nifasmExe) & " -o:" & quoteShell(exe) & " " &
+                             quoteShell(asmFile))
+    if nc != 0: quit "FAILURE nifasm (cortex_m assemble) " & file & "\n" & no
+    var args: seq[string] = @[]
+    for a in cortexMArgs: args.add a
+    args.add exe
+    let (po, pc) = runProgram(qemu, args)
+    if pc == timeoutExitCode:
+      quit "FAILURE (cortex-m) TIMEOUT after " & $(runTimeoutMs div 1000) &
+           "s for " & file & "\n"
+    if pc != expectedCode:
+      quit "FAILURE (cortex-m) exitcode " & $expectedCode & " but got " & $pc &
+           " for " & file & "\n" & po
+    # An `.output` file makes the fixture's OUTPUT part of the assertion. Most of
+    # this corpus is judged by its exit code alone — a firmware image has one
+    # number to report — but a fixture whose whole point is that something reached
+    # the console (`semihost_writec` writes through `bkpt`) has nothing else to be
+    # judged on. Optional, so the other 128 fixtures need no empty file.
+    let outFile = "tests" / "arkham_m" / (stem & ".output")
+    if fileExists(outFile):
+      let expectedOut = readFile(outFile).strip
+      if po.strip != expectedOut:
+        quit "FAILURE (cortex-m) output mismatch for " & file &
+             "\nexpected:\n" & expectedOut & "\ngot:\n" & escape(po)
+    removeFile asmFile
+    removeFile exe
+    inc passed
+  echo passed, " / ", total, " arkham cortex-m (qemu) tests successful"
+
+
 vgClientRequestEncodingTests()
+
+# Cortex-M: encoder-level coverage. Host-independent — it only needs
+# qemu-system-arm, so it runs wherever that is installed.
+thumb2SelfTest()
+cortexMAsmTests()
+cortexMMemMapTests()
+cortexMInterruptTests()
+cortexMLayoutTests()
+arkhamCortexMTests()
+arkhamCortexM64Tests()
 
 # arkham native-codegen tests: arkham emits the host arch (x86-64 on Linux,
 # AArch64/Darwin on macOS), so we run them only where the binaries execute.
@@ -891,7 +1644,7 @@ when (defined(linux) and defined(amd64)) or (defined(macosx) and defined(arm64))
   arkhamStressTests(arch = (when defined(macosx): "arm64" else: "x64"),
                     skip = (when defined(macosx): arkhamDarwinUnsupported &
                                                   arkhamA64Unsupported
-                            else: arkhamOsxOnly),
+                            else: arkhamOsxOnly & arkhamX64Unsupported),
                     known = (when defined(macosx): arkhamStressA64Known
                              else: arkhamStressKnown),
                     level = (when defined(macosx): arkhamStressA64Level
@@ -920,6 +1673,17 @@ when defined(linux) and defined(amd64):
 # provide it as a shell shim that just execs its argument.
 when defined(linux) and defined(arm64):
   arkhamQemuTests()
+
+# The hand-written AArch64 fixture assembled above is a `linux_arm64` ELF: run it.
+when defined(linux):
+  if findExe("qemu-aarch64").len > 0:
+    let (sbfOut, sbfCode) = runProgram(findExe("qemu-aarch64"),
+                                       ["tests" / "a64_slot_base_free"])
+    if sbfCode != 0:
+      quit "FAILURE a64_slot_base_free: exit " & $sbfCode & "\n" & sbfOut
+    echo "1 / 1 a64 base-free slot addressing tests successful"
+  else:
+    echo "qemu-aarch64 not found - skipping a64_slot_base_free"
 
 # The AArch64 backend gets the same starved-pool pass, under qemu.
 when defined(linux) and defined(amd64):
