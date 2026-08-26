@@ -1,6 +1,7 @@
 # Refactoring plan: per-CPU subdirectories, `import` instead of `include`
 
-Status: **S0–S1 done.** See §12 for the running log.
+Status: **done** — S0 through S11, each gated. §12 is the log, §13 the
+finished tree.
 
 ## 1. Why
 
@@ -350,12 +351,51 @@ rather than moving text; it should not be bundled with a move.
 
 ## 12. Log
 
-| stage | commit | gate |
-|---|---|---|
-| S0 plan + `tools/refactor_gate.sh` | `0c51e8c` | baseline: 2052 hashes + 405 diagnostics, deterministic across two runs |
-| S1 directories, moves, import rewrite | | clean — 2457/2457 identical; `tests/tester` green |
+| commit | stage |
+|---|---|
+| `0c51e8c` | refactor S0: the plan, and the byte-identity gate it is verified against |
+| `18af711` | refactor S1: per-CPU subdirectories for nifasm and arkham |
+| `c72396d` | refactor S2: nifasm's GenContext and diagnostics get their own modules |
+| `08ae052` | refactor S3a: peel nifasm's leaves — cursors, typecheck, modules, typesem, regs |
+| `05e1b35` | refactor S3b: the four image writers, the listing, and the Cortex-M board |
+| `1d72787` | refactor S4a: break the cross-arch cycle in the instruction selectors |
+| `a9b7a4c` | refactor S4b: the Cortex-M selector becomes thumb/operands.nim + thumb/instr.nim |
+| `73b90a2` | refactor S4c: the AArch64 selector becomes arm64/operands.nim + arm64/instr.nim |
+| `ad4ca67` | refactor S4d: the x86-64 selector becomes x64/operands.nim + x64/instr.nim |
+| `d73e454` | refactor S5: pass1, pass2 and the driver — assembler.nim is gone |
+| `f4147b0` | refactor S6: split relocs.nim — x64/relax.nim takes the variable-length half |
+| `ed709ed` | refactor S7: arkham's codegen_common.nim becomes core/context.nim + 8 leaves |
+| `993e6fd` | refactor S8: the x86-64 backend becomes nine modules under x64/ |
+| `91b519a` | refactor S9: the Arm backend becomes ten modules, and the last two includes die |
+| `07a297c` | refactor S10: trim the imports the split left behind |
+| `347af34` | refactor S11: trim the module surfaces the split inflated |
+
+Every row is gated: the artifact hashes and the listing hashes both
+compared clean against the S0 baseline before it was committed.
 
 ### Decisions taken while executing
+
+* **The passes and the driver sit at `src/nifasm/` top level, not under
+  `core/`.** They import the per-CPU selectors, and `core/` is the layer that
+  must never do that; calling a module that reaches into `x64/`, `arm64/` and
+  `thumb/` "core" would have said the opposite of what the layering is.
+* **The encoders kept their old module names** (`arm64.nim` -> `arm64/encoder.nim`
+  imported `as arm64`, and so on) — see the S1 note above.
+* **`codegen_m64.nim` did not survive as a file.** 36% of it is inside the value
+  core's cycle; only what is genuinely standalone (the reset path, semihosting,
+  the 64-bit divide helpers) became `cortexm/runtime.nim`.
+* **arkham's `arm/` was not split into `arm64/` + `thumb/`**, for the reason §7
+  gives and the measurement confirmed.
+* **The stage order changed twice.** The per-CPU `regs` modules came forward
+  into S3, because `resolveForeignSym` parses `(clobber …)` and could not move
+  until the three tag->register tables were leaves. And the arkham backends
+  (S9/S10 in the plan) had to precede converting the two `include`s, not follow
+  them: an included file can only become an `import` once the helpers it calls
+  are below it.
+* **The gate grew a second half.** `--listing` output is emitted-code metadata
+  no image hash can see, and S4a rewrote exactly the code that produces it, so
+  the gate now records 740 listing files too. Its baseline was validated against
+  a binary built from the previous commit: 68 fixtures, 1058 rows, identical.
 
 * **The encoders keep their old module names at the use site.** The files are
   `x64/encoder.nim`, `arm64/encoder.nim`, `thumb/encoder.nim` as planned, but
@@ -377,3 +417,130 @@ rather than moving text; it should not be bundled with a move.
 * `core/lengdecl.nim` and `core/programs.nim` reach nimony by relative path, so
   their `../../../nimony` became `../../../../nimony` — the one edit a move of
   this kind always needs and always forgets.
+
+## 13. What it came out as
+
+Every stage was gated by `tools/refactor_gate.sh`: 2457 artifacts (2052 image
+hashes + 405 diagnostics) and 740 `--listing` files, byte-identical to the
+pre-refactor build at every single commit. `tests/tester` was green at each
+stage that changed enough to be worth a full run.
+
+```
+  nifasm/arm64/encoder.nim                    1039
+  nifasm/arm64/instr.nim                      1716
+  nifasm/arm64/operands.nim                    810
+  nifasm/arm64/regs.nim                         92
+  nifasm/core/buffers.nim                      106
+  nifasm/core/context.nim                      380
+  nifasm/core/cursors.nim                       91
+  nifasm/core/decls.nim                        202
+  nifasm/core/diagnostics.nim                   76
+  nifasm/core/emit.nim                          93
+  nifasm/core/listing.nim                      140
+  nifasm/core/model.nim                        796
+  nifasm/core/modules.nim                      139
+  nifasm/core/relocs.nim                       710
+  nifasm/core/sem.nim                          332
+  nifasm/core/stackslots.nim                    88
+  nifasm/core/tagconv.nim                       71
+  nifasm/core/tagpool.nim                       76
+  nifasm/core/tags.nim                        1143
+  nifasm/core/typecheck.nim                    295
+  nifasm/core/typesem.nim                      669
+  nifasm/driver.nim                            458
+  nifasm/image/dwarf.nim                       261
+  nifasm/image/elf.nim                         154
+  nifasm/image/elf32.nim                       226
+  nifasm/image/macho.nim                      1108
+  nifasm/image/pe.nim                          894
+  nifasm/image/tracetable.nim                   94
+  nifasm/image/writecommon.nim                  55
+  nifasm/image/writecortexm.nim                269
+  nifasm/image/writeelf.nim                    427
+  nifasm/image/writemacho.nim                  265
+  nifasm/image/writepe.nim                     122
+  nifasm/nifasm.nim                            124
+  nifasm/pass1.nim                             219
+  nifasm/pass2.nim                             383
+  nifasm/thumb/board.nim                       147
+  nifasm/thumb/encoder.nim                     741
+  nifasm/thumb/instr.nim                       826
+  nifasm/thumb/operands.nim                    745
+  nifasm/thumb/regs.nim                         72
+  nifasm/x64/encoder.nim                      2227
+  nifasm/x64/instr.nim                        2428
+  nifasm/x64/operands.nim                      970
+  nifasm/x64/regs.nim                           64
+  nifasm/x64/relax.nim                         301
+```
+
+```
+  arkham/arkham.nim                            150
+  arkham/arm/aggr.nim                          459
+  arkham/arm/asmproc.nim                       927
+  arkham/arm/driver.nim                        390
+  arkham/arm/emit.nim                         1934
+  arkham/arm/frame.nim                         874
+  arkham/arm/machine_a64.nim                   204
+  arkham/arm/machine_m.nim                     267
+  arkham/arm/mem.nim                           630
+  arkham/arm/stmt.nim                          574
+  arkham/arm/value.nim                        4138
+  arkham/core/abi.nim                          159
+  arkham/core/analyser.nim                     961
+  arkham/core/asmbuf.nim                       202
+  arkham/core/asmcommon.nim                    139
+  arkham/core/asmslots.nim                     208
+  arkham/core/constdata.nim                    320
+  arkham/core/context.nim                      412
+  arkham/core/diag.nim                          53
+  arkham/core/exprpred.nim                     212
+  arkham/core/layout.nim                       201
+  arkham/core/lengdecl.nim                      57
+  arkham/core/machinedesc.nim                  524
+  arkham/core/mirrors.nim                      237
+  arkham/core/peephole.nim                     186
+  arkham/core/planer.nim                      1520
+  arkham/core/programs.nim                    1588
+  arkham/core/regbind.nim                      457
+  arkham/core/select.nim                       145
+  arkham/core/stress.nim                        99
+  arkham/core/temps.nim                        263
+  arkham/core/typenav.nim                      243
+  arkham/core/typeutil.nim                     474
+  arkham/cortexm/runtime.nim                   422
+  arkham/x64/aggr.nim                          492
+  arkham/x64/asmproc.nim                       625
+  arkham/x64/driver.nim                        287
+  arkham/x64/emit.nim                         1836
+  arkham/x64/frame.nim                         762
+  arkham/x64/machine.nim                       199
+  arkham/x64/mem.nim                          1105
+  arkham/x64/stmt.nim                          902
+  arkham/x64/value.nim                        4108
+```
+
+Four files held 78% of the tree; now none holds more than 8%:
+
+| was | lines | is now | largest survivor |
+|---|---|---|---|
+| `nifasm/assembler.nim` | 11383 | 22 modules across `core/ x64/ arm64/ thumb/ image/` + 3 at top level | `x64/instr.nim` 2428 |
+| `arkham/codegen_x64.nim` | 9969 | 9 modules under `x64/` | `x64/value.nim` 4107 |
+| `arkham/codegen_arm.nim` | 8295 + 1867 `include`d | 8 under `arm/` + 1 under `cortexm/` | `arm/value.nim` 4138 |
+| `arkham/codegen_common.nim` | 2056 | `core/context.nim` + 8 leaves | `core/typeutil.nim` 465 |
+
+`src/` contains no `include`. The two ~4100-line value cores are the floor the
+call graph sets, not a stopping point chosen for convenience: each IS a single
+strongly connected component of ~50 mutually recursive routines, and Nim has no
+cyclic imports.
+
+### What did not happen
+
+* **S11 as planned (splitting the `genInstX64` / `genInstA64` mega-`case` by
+  instruction family) was not done.** After S4 those modules are 2428 and 1716
+  lines, inside the target, and the plan itself flagged that stage as the first
+  one that edits control flow rather than moving text. It is still available;
+  it is just no longer paying for itself.
+* The S11 slot went instead to two cleanups the split created and owed back:
+  trimming the ~520 unused imports and the 311 unnecessary exports that
+  "export everything so the pieces can see each other" left behind.
