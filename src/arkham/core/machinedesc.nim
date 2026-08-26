@@ -140,6 +140,14 @@ type
     PushFrame    ## the `call` instruction pushed the return address; one
                  ## `push`/`pop` per saved register. `codegen_x64` builds its own
                  ## prologue and does not consult this yet.
+    AvrFrame     ## `push`/`pop` per saved register like `PushFrame`, but WITH a
+                 ## frame pointer — and not as a convenience. AVR's SP lives in
+                 ## the I/O space and cannot address memory at all, so Y is the
+                 ## only way to reach a stack slot, and establishing it is not
+                 ## optional the way an rbp frame is. Lowering SP is also three
+                 ## instructions rather than one (`in`/`in`, arithmetic,
+                 ## `out`/`out`), which is why the frame is set up once and left
+                 ## alone.
 
   ImmStyle* = enum
     ## How this target encodes an ALU immediate, hence which constants may ride
@@ -154,6 +162,9 @@ type
     ThumbExpandImm    ## Thumb-2: a byte replicated across lanes, or an 8-bit value
                       ## with bit 7 set rotated anywhere. A DIFFERENT set
     X86Imm32          ## any 32-bit constant, sign-extended
+    AvrImm8           ## an 8-bit constant, and only into r16..r31. Nothing wider
+                      ## is an immediate here at all: a 16-bit constant is two
+                      ## `ldi`s, and the pair-wide `adiw`/`sbiw` carry six bits
 
   MachineDesc* = object
     ## A target's register file + calling convention, as the allocator needs it.

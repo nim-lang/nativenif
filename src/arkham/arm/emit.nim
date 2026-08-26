@@ -1390,6 +1390,11 @@ proc logicalImmOk*(g: CodeGen; v: int64): bool {.inline.} =
   of ThumbExpandImm: thumbimm.isModifiedImm(v)
   of A64Bitmask: isLogicalImmA64(v)
   of X86Imm32: v >= low(int32) and v <= high(int32)
+  of AvrImm8:
+    # Unreachable: this is the Arm backend's predicate and AVR has its own
+    # emitter. Named rather than folded in with a plausible answer — a wrong one
+    # here lets a constant ride along in an instruction that cannot carry it.
+    raiseAssert "arkham: AVR does not reach the Arm immediate predicate"
 
 proc normalizeUnaryWidth*(g: var CodeGen; resTypeC: Cursor; rD: Reg) =
   ## The `neg`/`bitnot` twin of `normalizeBinWidth`. Both are computed 64-bit wide,
