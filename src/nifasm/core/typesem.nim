@@ -25,7 +25,9 @@ import tags, model, tagconv, tagpool, decls, stackslots
 import "../x64/regs" as x64regs
 import "../arm64/regs" as a64regs
 import "../thumb/regs" as mregs
+import "../avr/regs" as avrregs
 import "../x64/encoder" as x86
+from "../avr/encoder" as avr import nil
 import "../arm64/encoder" as arm64
 from "../thumb/encoder" as thumb2 import nil
   # `(clobber …)` is part of a signature, so parsing one is type parsing —
@@ -48,28 +50,48 @@ proc lookupWithAutoImport*(ctx: var GenContext; scope: Scope; name: string;
                            n: Cursor): Symbol
 
 proc isRegTag(locTag: TagEnum): bool =
-  rawTagIsX64Reg(locTag) or rawTagIsA64Reg(locTag)
+  ## Callers pass a RESOLVED tag (`n.tag`), which matters for AVR: its register
+  ## tags are numbered past the 511 that fit NIF's 9-bit field, so `rawTag` would
+  ## read the escape's id instead of the register's.
+  rawTagIsX64Reg(locTag) or rawTagIsA64Reg(locTag) or rawTagIsAvrReg(locTag)
 
 proc parseClobbers*(n: var Cursor; a64: var set[arm64.Register];
-                   m: var set[thumb2.Register]): set[x86.Register]
+                   m: var set[thumb2.Register];
+                   av: var set[avr.Register]): set[x86.Register]
 
 proc parseClobbers*(n: var Cursor; a64: var set[arm64.Register];
-                   m: var set[thumb2.Register]): set[x86.Register] =
+                   m: var set[thumb2.Register];
+                   av: var set[avr.Register]): set[x86.Register] =
   # (clobber (rax) (rbx) ...) — or its AArch64 twin (clobber (x0) (x1) ...), or
-  # Cortex-M's (clobber (r0) (r1) ...).
+  # Cortex-M's (clobber (r0) (r1) ...), or AVR's (clobber (rp24) (r18) ...).
   #
-  # A Cortex-M register tag is ALSO a valid x86-64 one (`(r0)` is an alias for
-  # rax there), so such a tag is recorded in BOTH sets rather than routed by a
-  # target this proc cannot see. Each arch then reads its own set, and since a
-  # declaration only ever names one arch's registers the extra membership is
-  # never consulted.
+  # A Cortex-M or AVR register tag is ALSO a valid x86-64 one (`(r0)` is an alias
+  # for rax there), so such a tag is recorded in EVERY set it is valid in rather
+  # than routed by a target this proc cannot see. Each arch then reads its own
+  # set, and since a declaration only ever names one arch's registers the extra
+  # membership is never consulted.
+  #
+  # AVR's `(rpN)` is the one spelling that names TWO registers. It is recorded as
+  # both halves, because what a clobber check asks is whether the register some
+  # value's half sits in was destroyed.
   if declTag(n) == ClobberD:
     loopInto n:
-      if n.kind == TagLit and rawTagIsX64Reg(rawTag(n)):
+      if n.kind == TagLit and rawTagIsAvrPair(n.tag):
+        # `n.tag`, not `rawTag`: AVR's register tags are escaped (see `isRegTag`).
+        let p = tagToPairAvr(n.tag, n)
+        av.incl avr.Register(ord(p))
+        av.incl avr.Register(ord(p) + 1)
+        skip n
+      elif n.kind == TagLit and rawTagIsX64Reg(rawTag(n)):
         if rawTagIsMGpr(rawTag(n)): m.incl tagToRegisterM(n.tag, n)
+        if rawTagIsAvrGpr(n.tag): av.incl tagToRegisterAvr(n.tag, n)
         result.incl parseRegister(n)
       elif n.kind == TagLit and rawTagIsMGpr(rawTag(n)):
         m.incl tagToRegisterM(n.tag, n)
+        if rawTagIsAvrGpr(n.tag): av.incl tagToRegisterAvr(n.tag, n)
+        skip n
+      elif n.kind == TagLit and rawTagIsAvrGpr(n.tag):
+        av.incl tagToRegisterAvr(n.tag, n)
         skip n
       elif n.kind == TagLit and rawTagIsA64Reg(rawTag(n)):
         a64.incl tagToRegisterA64(n.tag, n)
@@ -245,7 +267,7 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
         var r = sig.res; procTyp.results = parseResult(r, scope, ctx)
       if sig.hasClobber:
         var cl = sig.clobber
-        procTyp.clobbers = parseClobbers(cl, procTyp.clobbersA64, procTyp.clobbersM)
+        procTyp.clobbers = parseClobbers(cl, procTyp.clobbersA64, procTyp.clobbersM, procTyp.clobbersAvr)
         procTyp.hasClobberDecl = true
     result = Symbol(name: ctx.symIdOf(fullName), kind: skProc, typ: procTyp, offset: -1,
                     isForeign: true, moduleName: modname)
@@ -337,7 +359,7 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
         var r = sig.res; procTyp.results = parseResult(r, scope, ctx)
       if sig.hasClobber:
         var cl = sig.clobber
-        procTyp.clobbers = parseClobbers(cl, procTyp.clobbersA64, procTyp.clobbersM)
+        procTyp.clobbers = parseClobbers(cl, procTyp.clobbersA64, procTyp.clobbersM, procTyp.clobbersAvr)
         procTyp.hasClobberDecl = true
     let sysNr = if c.kind == IntLit: int(getInt(c)) else: 0
     result = Symbol(name: ctx.symIdOf(fullName), kind: skSysProc, typ: procTyp, offset: sysNr,
@@ -477,7 +499,7 @@ proc parseType*(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
         var r = sig.res; procTyp.results = parseResult(r, scope, ctx)
       if sig.hasClobber:
         var cl = sig.clobber
-        procTyp.clobbers = parseClobbers(cl, procTyp.clobbersA64, procTyp.clobbersM)
+        procTyp.clobbers = parseClobbers(cl, procTyp.clobbersA64, procTyp.clobbersM, procTyp.clobbersAvr)
         procTyp.hasClobberDecl = true
       result = procTyp
     of CTagId:
@@ -513,6 +535,7 @@ proc parseType*(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
       var ptClobbers: set[x86.Register] = {}
       var ptClobbersA64: set[arm64.Register] = {}
       var ptClobbersM: set[thumb2.Register] = {}
+      var ptClobbersAvr: set[avr.Register] = {}
       var ptHasClobberDecl = false
       let sig = takeSig(n)
       if sig.hasParams:
@@ -520,10 +543,16 @@ proc parseType*(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
       if sig.hasResult:
         var r = sig.res; ptResults = parseResult(r, scope, ctx)
       if sig.hasClobber:
-        var cl = sig.clobber; ptClobbers = parseClobbers(cl, ptClobbersA64, ptClobbersM)
+        var cl = sig.clobber
+        ptClobbers = parseClobbers(cl, ptClobbersA64, ptClobbersM, ptClobbersAvr)
         ptHasClobberDecl = true
+      # All four sets are carried, `clobbersM` included: `hasClobberDecl` is what
+      # a caller reads to mean "trust the declared list", so dropping one arch's
+      # half here would turn a declared list into an empty one and tell that
+      # caller the callee destroys nothing.
       result = Type(kind: ProcT, params: ptParams, results: ptResults, clobbers: ptClobbers,
-                    clobbersA64: ptClobbersA64, hasClobberDecl: ptHasClobberDecl)
+                    clobbersA64: ptClobbersA64, clobbersM: ptClobbersM,
+                    clobbersAvr: ptClobbersAvr, hasClobberDecl: ptHasClobberDecl)
     else:
       error("Unknown type tag: " & $t, n)
     # Jump to the precomputed node end: this consumes any Leng type qualifiers we
@@ -592,6 +621,13 @@ proc parseParams*(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param] 
       if rawTagIsX64Reg(locTag) or rawTagIsA64Reg(locTag):
         reg = locTag
         regs = @[locTag]
+      elif rawTagIsAvrReg(loc.tag):
+        # `loc.tag`, not `locTag`: AVR's own register tags are numbered past the
+        # 511 that fit NIF's 9-bit field, so `(rp24)` arrives spelled through the
+        # escape and `rawTag` reads the escape's id rather than the register's.
+        # What is STORED is the resolved id, which is what every reader expects.
+        reg = loc.tag
+        regs = @[loc.tag]
       elif locTag == STagId:
         onStack = true
       elif locTag == RegsTagId:
@@ -665,5 +701,5 @@ proc parseExtprocSig*(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
     var r = sig.res; result.results = parseResult(r, scope, ctx)
   if sig.hasClobber:
     var cl = sig.clobber
-    result.clobbers = parseClobbers(cl, result.clobbersA64, result.clobbersM)
+    result.clobbers = parseClobbers(cl, result.clobbersA64, result.clobbersM, result.clobbersAvr)
     result.hasClobberDecl = true

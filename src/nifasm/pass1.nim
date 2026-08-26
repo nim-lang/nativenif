@@ -36,7 +36,7 @@ proc pass1Proc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: str
     var r = sig.res; procTyp.results = parseResult(r, scope, ctx)
   if sig.hasClobber:
     var cl = sig.clobber
-    procTyp.clobbers = parseClobbers(cl, procTyp.clobbersA64, procTyp.clobbersM)
+    procTyp.clobbers = parseClobbers(cl, procTyp.clobbersA64, procTyp.clobbersM, procTyp.clobbersAvr)
     procTyp.hasClobberDecl = true
 
   let sym = Symbol(name: ctx.symIdOf(name), kind: skProc, typ: procTyp, offset: -1,
@@ -63,7 +63,7 @@ proc pass1Syproc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: s
     var r = sig.res; procTyp.results = parseResult(r, scope, ctx)
   if sig.hasClobber:
     var cl = sig.clobber
-    procTyp.clobbers = parseClobbers(cl, procTyp.clobbersA64, procTyp.clobbersM)
+    procTyp.clobbers = parseClobbers(cl, procTyp.clobbersA64, procTyp.clobbersM, procTyp.clobbersAvr)
     procTyp.hasClobberDecl = true
 
   if n.kind != IntLit: error("Expected syscall number in syproc", n)

@@ -63,6 +63,25 @@ proc tagToMReg*(t: TagEnum): MReg {.inline.} =
   else:
     NoMReg
 
+proc tagToAvrInst*(t: TagEnum): AvrInst {.inline.} =
+  ## Convert TagEnum to AvrInst. Returns NoAvrInst if not a valid AvrInst.
+  if rawTagIsAvrInst(t):
+    cast[AvrInst](t)
+  else:
+    NoAvrInst
+
+proc tagToAvrReg*(t: TagEnum): AvrReg {.inline.} =
+  ## Convert TagEnum to AvrReg. Returns NoAvrReg if not a valid AvrReg.
+  ##
+  ## AVR shares r0..r15 with the spellings that already existed and mints
+  ## r16..r31 and the sixteen `(rpN)` PAIR tags of its own, so — as on Cortex-M —
+  ## a tag can be a valid `X64Reg` and a valid `AvrReg` at once, and `(arch …)`
+  ## is what decides which file it names.
+  if rawTagIsAvrReg(t):
+    cast[AvrReg](t)
+  else:
+    NoAvrReg
+
 proc tagToNifasmExpr*(t: TagEnum): NifasmExpr {.inline.} =
   ## Convert TagEnum to NifasmExpr. Returns NoExpr if not a valid NifasmExpr.
   if rawTagIsNifasmExpr(t):

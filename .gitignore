@@ -8,3 +8,6 @@ nimcache_m/
 src/arkham/arkham
 src/nifasm/nifasm
 bin/
+
+# Built by `nim c tools/gen_instructions.nim`; the generator, not its output.
+tools/gen_instructions

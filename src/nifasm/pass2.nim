@@ -25,11 +25,14 @@ import core / [context, sem, cursors, diagnostics, typesem,
 import image/dwarf                    # ProcUnwind: the per-proc CFI record
 import x64/encoder as x86
 import arm64/encoder as arm64
+from avr/encoder as avr import nil
 from thumb/encoder as thumb2 import nil
 import x64/regs as x64regs
 import x64/instr
 import arm64/instr
 import thumb/instr
+import avr/instr
+import avr/regs as avrregs
 import thumb/board
 import pass1                          # `handleArch`: `(arch …)` also appears in pass 2
 
@@ -104,6 +107,11 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
       # straddling a word boundary costs a cycle on some cores and nothing here
       # benefits from the two saved bytes, so it aligns like the others.
       while (ctx.buf.data.len and 3) != 0: ctx.buf.data.add 0'u8
+    elif ctx.arch == Arch.Avr:
+      # Two, not four: an AVR instruction IS a 16-bit word and the PC counts
+      # words, so an odd position is not merely slow, it is unaddressable — every
+      # branch and call displacement here is a byte distance divided by two.
+      while (ctx.buf.data.len and 1) != 0: ctx.buf.data.add 0'u8
 
     # Find/Create label for proc
     let sym = oldScope.lookup(getSymId(n))
@@ -122,6 +130,7 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     # CFA at entry: on x86-64 the `call` pushed the return address (SP+8); on
     # AArch64 and Cortex-M it is still in the link register, so the CFA is SP.
     ctx.cfaOff = if ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64, Arch.CortexM}: 0'i32
+                 elif ctx.arch == Arch.Avr: 2'i32   # `call` pushed a 2-byte return address
                  else: 8'i32
 
     # Initialize stack context
@@ -131,6 +140,7 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     ctx.regBindings = initTable[x86.Register, string]()
     ctx.a64RegBindings = initTable[arm64.Register, string]()
     ctx.mRegBindings = initTable[thumb2.Register, string]()
+    ctx.avrRegBindings = initTable[avr.Register, string]()
     ctx.xmmBindings = initTable[x86.XmmRegister, string]()
     ctx.a64FRegBindings = initTable[arm64.FloatRegister, string]()
     # Each proc is a fresh control flow: no registers are clobbered on entry.
@@ -138,6 +148,7 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     ctx.clobbered = {}
     ctx.clobberedA64 = {}
     ctx.clobberedM = {}
+    ctx.clobberedAvr = {}
     setLenient false
 
     # Add params to scope.
@@ -153,7 +164,8 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     let isA64Proc = ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64, Arch.CortexM}
     # …and on Win64 the caller's stack arguments start above the shadow space it also
     # reserved, so the callee's view of them shifts by the same amount.
-    var paramOffset = if isA64Proc: 0
+    var paramOffset = if ctx.arch == Arch.Avr: 0   # stack params are refused by name here
+                      elif isA64Proc: 0
                       elif ctx.arch == Arch.WinX64: 16 + WinShadowSpace
                       else: 16
     for param in sym.typ.params:
@@ -169,7 +181,21 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
         # (a leaf param stays unnamed in its incoming arg register), so params are NOT
         # tracked there — only A64 register *locals* and `rebind`-bound scratch enter
         # `a64RegBindings`.
-        if not isA64Proc and param.reg != InvalidTagId and not param.viaRegs:
+        if ctx.arch == Arch.Avr:
+          # AVR spells a register param by its NAME in the body, like x86-64 and
+          # unlike the Arm targets — so a raw use of the register it arrived in
+          # is a code-generator bug and gets tracked. Both halves when it is a
+          # pair, which is what makes `(r25)` on the top of a 16-bit parameter an
+          # error rather than a silent read of someone else's value.
+          if param.reg != InvalidTagId and not param.viaRegs:
+            let nm = ctx.nameOf(param.name)
+            if rawTagIsAvrPair(param.reg):
+              let p = tagToPairAvr(param.reg, n)
+              ctx.avrRegBindings[avr.Register(ord(p))] = nm
+              ctx.avrRegBindings[avr.Register(ord(p) + 1)] = nm
+            else:
+              ctx.avrRegBindings[tagToRegisterAvr(param.reg, n)] = nm
+        elif not isA64Proc and param.reg != InvalidTagId and not param.viaRegs:
           ctx.regBindings[tagToRegister(param.reg, n)] = ctx.nameOf(param.name)
 
     skip n   # past the proc name
@@ -222,7 +248,12 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
   # `(scope …)` blocks reclaim their slots (reset `stackSize`), so the FINAL
   # `stackSize` under-counts the frame. Reserve the peak seen at any point.
   let peakStackSize = max(ctx.slots.stackSize, ctx.slots.maxStackSize)
-  let alignedStackSize = (peakStackSize + 15) and not 15
+  # AVR has no stack-alignment requirement of any kind — every access is a byte
+  # and there is no unaligned trap to avoid — and rounding to 16 there would both
+  # waste the RAM of a part that has kilobytes of it and burn the `adiw`
+  # immediate that carries the frame size, which reaches 63.
+  let frameAlign = if ctx.arch == Arch.Avr: 1 else: 16
+  let alignedStackSize = (peakStackSize + frameAlign - 1) and not (frameAlign - 1)
   let isA64 = ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64}
   let isM = ctx.arch == Arch.CortexM
   var deadFrameAdjusts: seq[int] = @[]   ## frame `add`/`sub` halves that patch to #0
@@ -233,6 +264,21 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     # 16-aligned, so `+ pad` lands the frame exactly where the separate pair did.
     let v = uint32(alignedStackSize + pad)
     if pos + 4 > ctx.buf.data.len: continue
+    if ctx.arch == Arch.Avr:
+      # The 6-bit immediate of the `adiw`/`sbiw` at this position: `1001 011x
+      # KKdd KKKK`, with K5:K4 in bits 7:6 and K3:K0 in bits 3:0. Fixed width, so
+      # patching never resizes an instruction and no position downstream moves.
+      if pos + 2 > ctx.buf.data.len: continue
+      if v > 63'u32:
+        quit "nifasm: this proc's frame is " & $alignedStackSize &
+             " bytes, past the 63 an `adiw`/`sbiw` immediate reaches — which is " &
+             "also the whole displacement range of `ldd`/`std`, so a frame this " &
+             "large is unaddressable on AVR (see M5 in doc/internals/avr.md)"
+      var w = uint16(ctx.buf.data[pos]) or (uint16(ctx.buf.data[pos + 1]) shl 8)
+      w = (w and 0xFF30'u16) or ((uint16(v) and 0x30) shl 2) or (uint16(v) and 0xF)
+      ctx.buf.data[pos] = byte(w and 0xFF)
+      ctx.buf.data[pos + 1] = byte((w shr 8) and 0xFF)
+      continue
     if isM:
       # A MOVW/MOVT pair, always 8 bytes, so no instruction changes length and no
       # position downstream moves. That is why the Cortex-M frame needs none of
@@ -317,8 +363,7 @@ proc genInst(n: var Cursor; ctx: var GenContext) =
   of Arch.CortexM:
     genInstNodeM(n, ctx)
   of Arch.Avr:
-    error("the AVR instruction selector is not implemented yet " &
-          "(M2 in doc/internals/avr.md)", n)
+    genInstNodeAvr(n, ctx)
 
 proc pass2*(n: Cursor; ctx: var GenContext) =
   ## Pass2: Generate code only for top-level instructions (entry point).

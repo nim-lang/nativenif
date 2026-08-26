@@ -12,13 +12,21 @@ type
     SubX64 = (ord(SubTagId), "sub")  ## subtract instruction
     MulX64 = (ord(MulTagId), "mul")  ## unsigned multiply
     AndX64 = (ord(AndTagId), "and")  ## bitwise and
+    OrX64 = (ord(OrTagId), "or")  ## bitwise or
+    XorX64 = (ord(XorTagId), "xor")  ## bitwise xor
+    IncX64 = (ord(IncTagId), "inc")  ## increment
+    DecX64 = (ord(DecTagId), "dec")  ## decrement
     NegX64 = (ord(NegTagId), "neg")  ## negate
+    NotX64 = (ord(NotTagId), "not")  ## bitwise not
     CmpX64 = (ord(CmpTagId), "cmp")  ## compare
+    JmpX64 = (ord(JmpTagId), "jmp")  ## unconditional jump
     CallX64 = (ord(CallTagId), "call")  ## function call marker inside prepare
     ExtcallX64 = (ord(ExtcallTagId), "extcall")  ## external call marker inside prepare
     TailcallX64 = (ord(TailcallTagId), "tailcall")  ## tail-call marker inside prepare: branch/jmp, no return address pushed
     PopframeX64 = (ord(PopframeTagId), "popframe")  ## undo this proc's prologue (frame sub + saved registers)
     RetX64 = (ord(RetTagId), "ret")  ## return instruction
+    PushX64 = (ord(PushTagId), "push")  ## push to stack
+    PopX64 = (ord(PopTagId), "pop")  ## pop from stack
     NopX64 = (ord(NopTagId), "nop")  ## no operation
     LabX64 = (ord(LabTagId), "lab")  ## label definition
     IteX64 = (ord(IteTagId), "ite")  ## if-then-else structure
@@ -56,15 +64,10 @@ type
     ComissX64 = (ord(ComissTagId), "comiss")  ## compare scalar single, set EFLAGS
     MovfqX64 = (ord(MovfqTagId), "movfq")  ## move 64 bits between gpr and xmm; `(movfq (xmmD) (xmmS))` is SSE `movq xmm,xmm` — D.lo = S.lo with D's high lane ZEROED (gcc's lane sanitizer before packed ops)
     MovfdX64 = (ord(MovfdTagId), "movfd")  ## move 32 bits between gpr and xmm
-    OrX64 = (ord(OrTagId), "or")  ## bitwise or
-    XorX64 = (ord(XorTagId), "xor")  ## bitwise xor
     ShlX64 = (ord(ShlTagId), "shl")  ## shift left
     ShrX64 = (ord(ShrTagId), "shr")  ## shift right
     SalX64 = (ord(SalTagId), "sal")  ## shift arithmetic left
     SarX64 = (ord(SarTagId), "sar")  ## shift arithmetic right
-    IncX64 = (ord(IncTagId), "inc")  ## increment
-    DecX64 = (ord(DecTagId), "dec")  ## decrement
-    NotX64 = (ord(NotTagId), "not")  ## bitwise not
     RolX64 = (ord(RolTagId), "rol")  ## rotate left
     RorX64 = (ord(RorTagId), "ror")  ## rotate right
     RclX64 = (ord(RclTagId), "rcl")  ## rotate left through carry
@@ -131,7 +134,6 @@ type
     CmovnpX64 = (ord(CmovnpTagId), "cmovnp")  ## conditional move if not parity
     CmovpeX64 = (ord(CmovpeTagId), "cmovpe")  ## conditional move if parity even (alias for p)
     CmovpoX64 = (ord(CmovpoTagId), "cmovpo")  ## conditional move if parity odd (alias for np)
-    JmpX64 = (ord(JmpTagId), "jmp")  ## unconditional jump
     JeX64 = (ord(JeTagId), "je")  ## jump if equal
     JzX64 = (ord(JzTagId), "jz")  ## jump if zero
     JneX64 = (ord(JneTagId), "jne")  ## jump if not equal
@@ -152,8 +154,6 @@ type
     JnoX64 = (ord(JnoTagId), "jno")  ## jump if not overflow
     JpX64 = (ord(JpTagId), "jp")  ## jump if parity (unordered float compare)
     IatX64 = (ord(IatTagId), "iat")  ## indirect call through IAT (Import Address Table)
-    PushX64 = (ord(PushTagId), "push")  ## push to stack
-    PopX64 = (ord(PopTagId), "pop")  ## pop from stack
     SyscallX64 = (ord(SyscallTagId), "syscall")  ## system call
     LockX64 = (ord(LockTagId), "lock")  ## atomic lock prefix
     XchgX64 = (ord(XchgTagId), "xchg")  ## atomic exchange
@@ -193,7 +193,7 @@ type
     RepstosqX64 = (ord(RepstosqTagId), "repstosq")  ## repeat store qword string: fills `rcx` qwords at `[rdi]` with `rax`, advancing `rdi`; `rcx` ends 0
 
 proc rawTagIsX64Inst*(raw: TagEnum): bool {.inline.} =
-  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, AndTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, TailcallTagId, PopframeTagId, RetTagId, NopTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, RebindTagId, WithregTagId, ScopeTagId, MovzxTagId, MovsxTagId, MovapdTagId, MovsdTagId, MovdquTagId, ImulTagId, DivTagId, IdivTagId, AddsdTagId, SubsdTagId, MulsdTagId, DivsdTagId, MovssTagId, AddssTagId, SubssTagId, MulssTagId, DivssTagId, Cvtsi2sdTagId, Cvtsi2ssTagId, Cvttsd2siTagId, Cvttss2siTagId, Cvtsd2ssTagId, Cvtss2sdTagId, ComisdTagId, ComissTagId, MovfqTagId, MovfdTagId, OrTagId, XorTagId, ShlTagId, ShrTagId, SalTagId, SarTagId, IncTagId, DecTagId, NotTagId, RolTagId, RorTagId, RclTagId, RcrTagId, BsfTagId, BsrTagId, BtTagId, BtsTagId, BtrTagId, BtcTagId, TestTagId, SeteTagId, SetzTagId, SetneTagId, SetnzTagId, SetaTagId, SetnbeTagId, SetaeTagId, SetnbTagId, SetncTagId, SetbTagId, SetnaeTagId, SetcTagId, SetbeTagId, SetnaTagId, SetgTagId, SetnleTagId, SetgeTagId, SetnlTagId, SetlTagId, SetngeTagId, SetleTagId, SetngTagId, SetoTagId, SetsTagId, SetpTagId, CmoveTagId, CmovzTagId, CmovneTagId, CmovnzTagId, CmovaTagId, CmovnbeTagId, CmovaeTagId, CmovnbTagId, CmovncTagId, CmovbTagId, CmovnaeTagId, CmovcTagId, CmovbeTagId, CmovnaTagId, CmovgTagId, CmovnleTagId, CmovgeTagId, CmovnlTagId, CmovlTagId, CmovngeTagId, CmovleTagId, CmovngTagId, CmovoTagId, CmovnoTagId, CmovsTagId, CmovnsTagId, CmovpTagId, CmovnpTagId, CmovpeTagId, CmovpoTagId, JmpTagId, JeTagId, JzTagId, JneTagId, JnzTagId, JgTagId, JngTagId, JgeTagId, JngeTagId, JaTagId, JnaTagId, JaeTagId, JnaeTagId, JlTagId, JleTagId, JbTagId, JbeTagId, JoTagId, JnoTagId, JpTagId, IatTagId, PushTagId, PopTagId, SyscallTagId, LockTagId, XchgTagId, CmpxchgTagId, XaddTagId, Cmpxchg8bTagId, MfenceTagId, SfenceTagId, LfenceTagId, PauseTagId, ClflushTagId, ClflushoptTagId, Prefetcht0TagId, Prefetcht1TagId, Prefetcht2TagId, PrefetchntaTagId, RepmovsbTagId, RepmovswTagId, RepmovsdTagId, RepmovsqTagId, BswapTagId, PopcntTagId, CasejmpTagId, JsTagId, JnsTagId, PunpcklqdqTagId, MovupdTagId, MovupsTagId, AddpdTagId, SubpdTagId, MulpdTagId, AddpsTagId, SubpsTagId, MulpsTagId, ShufpsTagId, RepstosbTagId, RepstosqTagId}
+  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, AndTagId, OrTagId, XorTagId, IncTagId, DecTagId, NegTagId, NotTagId, CmpTagId, JmpTagId, CallTagId, ExtcallTagId, TailcallTagId, PopframeTagId, RetTagId, PushTagId, PopTagId, NopTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, RebindTagId, WithregTagId, ScopeTagId, MovzxTagId, MovsxTagId, MovapdTagId, MovsdTagId, MovdquTagId, ImulTagId, DivTagId, IdivTagId, AddsdTagId, SubsdTagId, MulsdTagId, DivsdTagId, MovssTagId, AddssTagId, SubssTagId, MulssTagId, DivssTagId, Cvtsi2sdTagId, Cvtsi2ssTagId, Cvttsd2siTagId, Cvttss2siTagId, Cvtsd2ssTagId, Cvtss2sdTagId, ComisdTagId, ComissTagId, MovfqTagId, MovfdTagId, ShlTagId, ShrTagId, SalTagId, SarTagId, RolTagId, RorTagId, RclTagId, RcrTagId, BsfTagId, BsrTagId, BtTagId, BtsTagId, BtrTagId, BtcTagId, TestTagId, SeteTagId, SetzTagId, SetneTagId, SetnzTagId, SetaTagId, SetnbeTagId, SetaeTagId, SetnbTagId, SetncTagId, SetbTagId, SetnaeTagId, SetcTagId, SetbeTagId, SetnaTagId, SetgTagId, SetnleTagId, SetgeTagId, SetnlTagId, SetlTagId, SetngeTagId, SetleTagId, SetngTagId, SetoTagId, SetsTagId, SetpTagId, CmoveTagId, CmovzTagId, CmovneTagId, CmovnzTagId, CmovaTagId, CmovnbeTagId, CmovaeTagId, CmovnbTagId, CmovncTagId, CmovbTagId, CmovnaeTagId, CmovcTagId, CmovbeTagId, CmovnaTagId, CmovgTagId, CmovnleTagId, CmovgeTagId, CmovnlTagId, CmovlTagId, CmovngeTagId, CmovleTagId, CmovngTagId, CmovoTagId, CmovnoTagId, CmovsTagId, CmovnsTagId, CmovpTagId, CmovnpTagId, CmovpeTagId, CmovpoTagId, JeTagId, JzTagId, JneTagId, JnzTagId, JgTagId, JngTagId, JgeTagId, JngeTagId, JaTagId, JnaTagId, JaeTagId, JnaeTagId, JlTagId, JleTagId, JbTagId, JbeTagId, JoTagId, JnoTagId, JpTagId, IatTagId, SyscallTagId, LockTagId, XchgTagId, CmpxchgTagId, XaddTagId, Cmpxchg8bTagId, MfenceTagId, SfenceTagId, LfenceTagId, PauseTagId, ClflushTagId, ClflushoptTagId, Prefetcht0TagId, Prefetcht1TagId, Prefetcht2TagId, PrefetchntaTagId, RepmovsbTagId, RepmovswTagId, RepmovsdTagId, RepmovsqTagId, BswapTagId, PopcntTagId, CasejmpTagId, JsTagId, JnsTagId, PunpcklqdqTagId, MovupdTagId, MovupsTagId, AddpdTagId, SubpdTagId, MulpdTagId, AddpsTagId, SubpsTagId, MulpsTagId, ShufpsTagId, RepstosbTagId, RepstosqTagId}
 
 type
   A64Inst* = enum
@@ -418,9 +418,9 @@ type
     ClzM = (ord(ClzTagId), "clz")  ## count leading zeros: D = number of leading zero bits of S; `N` is the operand size in bits (32 or 64)
     RbitM = (ord(RbitTagId), "rbit")  ## reverse bit order of S into D (with `clz` this is a count-trailing-zeros); `N` is the operand size in bits
     RevM = (ord(RevTagId), "rev")  ## reverse byte order of S into D; `N` is the operand size in bits (32 or 64)
+    BkptM = (ord(BkptTagId), "bkpt")  ## breakpoint / host trap. On Cortex-M, `(bkpt 171)` is `bkpt #0xAB`, the ARM semihosting entry on M-profile (operation in r0, parameter block in r1, result back in r0). On AVR it is the simulator's `SYSCALL N` — `cpse rN, rN` followed by the invalid opcode `0xFFFF`, i.e. an instruction that ALWAYS skips the word after it. That word is data, never executed, which is why this is still one instruction: `(bkpt 30)` exits with r25:r24 and `(bkpt 29)` prints r24
     LdrexM = (ord(LdrexTagId), "ldrex")  ## ARMv7-M exclusive load: `D` ← the `N`-bit cell at `[S]`, taking the monitor's claim on that address. `N` is 8, 16 or 32 and selects `ldrexb`/`ldrexh`/`ldrex`; there is no 64-bit form on this profile (no `ldrexd`), which is why a 64-bit atomic is refused by name rather than split into halves — two claims are not one atom
     StrexM = (ord(StrexTagId), "strex")  ## ARMv7-M exclusive store: store the `N`-bit `D` into `[S]` if the claim still holds, and put the outcome in `St` (0 = stored, 1 = another agent won the line). `St` must differ from `D` and `S` — the architecture leaves it UNPREDICTABLE otherwise, and since the retry loop branches on `St`, getting it wrong is an infinite loop rather than a wrong value
-    BkptM = (ord(BkptTagId), "bkpt")  ## breakpoint / semihosting call; `(bkpt 171)` is `bkpt #0xAB`, the ARM semihosting entry on M-profile (operation in r0, parameter block in r1, result back in r0)
     BxM = (ord(BxTagId), "bx")  ## branch and exchange to the address in D; `(bx (lr))` is the ordinary Thumb return
     BlxM = (ord(BlxTagId), "blx")  ## indirect call through the address in D
     MvnM = (ord(MvnTagId), "mvn")  ## bitwise NOT (D = not S)
@@ -446,7 +446,7 @@ type
     IsbM = (ord(IsbTagId), "isb")  ## instruction synchronization barrier: flush the pipeline so instructions fetched before a context-changing write are re-fetched. Required between enabling the FPU and the first floating-point instruction
 
 proc rawTagIsMInst*(raw: TagEnum): bool {.inline.} =
-  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, AddwTagId, SubwTagId, MulwTagId, Addw3TagId, Subw3TagId, Mulw3TagId, GloadTagId, GstoreTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, AdrTagId, LdrTagId, StrTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, CbzTagId, CbnzTagId, CselltTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, DmbTagId, ClrexTagId, YieldTagId, FmovTagId, FaddTagId, FsubTagId, FmulTagId, FdivTagId, FnegTagId, FcmpTagId, FldrTagId, FstrTagId, ScvtfTagId, UcvtfTagId, FcvtzsTagId, FcvtzuTagId, LdrbTagId, StrbTagId, RebindTagId, WithregTagId, ScopeTagId, ClzTagId, RbitTagId, RevTagId, LdrexTagId, StrexTagId, BkptTagId, BxTagId, BlxTagId, MvnTagId, Bic3TagId, Adds3TagId, Adcs3TagId, Subs3TagId, Sbcs3TagId, MlsTagId, UmullTagId, SmullTagId, TstTagId, UxtbTagId, SxtbTagId, UxthTagId, SxthTagId, LdrhTagId, StrhTagId, LdrsbTagId, LdrshTagId, WfiTagId, DsbTagId, IsbTagId}
+  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, AddwTagId, SubwTagId, MulwTagId, Addw3TagId, Subw3TagId, Mulw3TagId, GloadTagId, GstoreTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, AdrTagId, LdrTagId, StrTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, CbzTagId, CbnzTagId, CselltTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, DmbTagId, ClrexTagId, YieldTagId, FmovTagId, FaddTagId, FsubTagId, FmulTagId, FdivTagId, FnegTagId, FcmpTagId, FldrTagId, FstrTagId, ScvtfTagId, UcvtfTagId, FcvtzsTagId, FcvtzuTagId, LdrbTagId, StrbTagId, RebindTagId, WithregTagId, ScopeTagId, ClzTagId, RbitTagId, RevTagId, BkptTagId, LdrexTagId, StrexTagId, BxTagId, BlxTagId, MvnTagId, Bic3TagId, Adds3TagId, Adcs3TagId, Subs3TagId, Sbcs3TagId, MlsTagId, UmullTagId, SmullTagId, TstTagId, UxtbTagId, SxtbTagId, UxthTagId, SxthTagId, LdrhTagId, StrhTagId, LdrsbTagId, LdrshTagId, WfiTagId, DsbTagId, IsbTagId}
 
 type
   NifasmType* = enum
@@ -527,6 +527,8 @@ type
     BsssizeX = (ord(BsssizeTagId), "bsssize")  ## Cortex-M: bytes to zero immediately above `(datavma)` + `(datasize)`
     ArgX = (ord(ArgTagId), "arg")  ## argument reference in prepare block
     ResX = (ord(ResTagId), "res")  ## result reference in prepare block
+    LoX = (ord(LoTagId), "lo")  ## AVR: the LOW 8-bit half of a value bound to a register pair. Every ALU instruction on this machine works on one half, so a 16-bit add is `(add (lo d) (lo s))` then `(adc (hi d) (hi s))` — naming the halves is what lets that be written without spelling a raw register, which the binding table rejects for exactly the reason it exists
+    HiX = (ord(HiTagId), "hi")  ## AVR: the HIGH half of a pair-bound value. See `(lo S)`
     DotX = (ord(DotTagId), "dot")  ## field access
     AtX = (ord(AtTagId), "at")  ## array index
     MemX = (ord(MemTagId), "mem")  ## memory reference: `(mem base)`, `(mem base disp)`, `(mem base index scale [disp])` (base/index are raw registers or register-homed locals/params), or the no-base scaled form `(mem 0 index scale [disp])` = `[index*scale + disp]` (x64: SIB base=101; the literal `0` base is unambiguous since a real base is never an immediate)
@@ -535,7 +537,7 @@ type
     RelocX = (ord(RelocTagId), "reloc")  ## rodata relocation: bake symbol S's address at byte offset O
 
 proc rawTagIsNifasmExpr*(raw: TagEnum): bool {.inline.} =
-  raw in {StartAddressTagId, BytesTagId, KilobytesTagId, MegabytesTagId, SlotsTagId, AlignTagId, SsizeTagId, CsizeTagId, DataloadTagId, DatavmaTagId, DatasizeTagId, HeapstartTagId, HeapsizeTagId, NoinitstartTagId, NoinitsizeTagId, BsssizeTagId, ArgTagId, ResTagId, DotTagId, AtTagId, MemTagId, TvarTagId, CastTagId, RelocTagId}
+  raw in {StartAddressTagId, BytesTagId, KilobytesTagId, MegabytesTagId, SlotsTagId, AlignTagId, SsizeTagId, CsizeTagId, DataloadTagId, DatavmaTagId, DatasizeTagId, HeapstartTagId, HeapsizeTagId, NoinitstartTagId, NoinitsizeTagId, BsssizeTagId, ArgTagId, ResTagId, LoTagId, HiTagId, DotTagId, AtTagId, MemTagId, TvarTagId, CastTagId, RelocTagId}
 
 type
   X64Flag* = enum
@@ -793,4 +795,146 @@ type
 
 proc rawTagIsMReg*(raw: TagEnum): bool {.inline.} =
   raw in {R8TagId, R9TagId, R10TagId, R11TagId, R12TagId, R0TagId, R1TagId, R2TagId, R3TagId, R4TagId, R5TagId, R6TagId, R7TagId, SpTagId, LrTagId, S0TagId, S1TagId, S2TagId, S3TagId, S4TagId, S5TagId, S6TagId, S7TagId, S8TagId, S9TagId, S10TagId, S11TagId, S12TagId, S13TagId, S14TagId, S15TagId, S16TagId, S17TagId, S18TagId, S19TagId, S20TagId, S21TagId, S22TagId, S23TagId, S24TagId, S25TagId, S26TagId, S27TagId, S28TagId, S29TagId, S30TagId, S31TagId}
+
+type
+  AvrInst* = enum
+    NoAvrInst
+    PrepareAvr = (ord(PrepareTagId), "prepare")  ## prepare block for function call
+    MovAvr = (ord(MovTagId), "mov")  ## move instruction
+    AddAvr = (ord(AddTagId), "add")  ## add instruction
+    SubAvr = (ord(SubTagId), "sub")  ## subtract instruction
+    AndAvr = (ord(AndTagId), "and")  ## bitwise and
+    OrAvr = (ord(OrTagId), "or")  ## bitwise or
+    XorAvr = (ord(XorTagId), "xor")  ## bitwise xor
+    IncAvr = (ord(IncTagId), "inc")  ## increment
+    DecAvr = (ord(DecTagId), "dec")  ## decrement
+    NegAvr = (ord(NegTagId), "neg")  ## negate
+    NotAvr = (ord(NotTagId), "not")  ## bitwise not
+    CmpAvr = (ord(CmpTagId), "cmp")  ## compare
+    JmpAvr = (ord(JmpTagId), "jmp")  ## unconditional jump
+    CallAvr = (ord(CallTagId), "call")  ## function call marker inside prepare
+    ExtcallAvr = (ord(ExtcallTagId), "extcall")  ## external call marker inside prepare
+    RetAvr = (ord(RetTagId), "ret")  ## return instruction
+    PushAvr = (ord(PushTagId), "push")  ## push to stack
+    PopAvr = (ord(PopTagId), "pop")  ## pop from stack
+    NopAvr = (ord(NopTagId), "nop")  ## no operation
+    AdrAvr = (ord(AdrTagId), "adr")  ## load address of label
+    BAvr = (ord(BTagId), "b")  ## branch (unconditional jump)
+    BlAvr = (ord(BlTagId), "bl")  ## branch with link (function call)
+    BeqAvr = (ord(BeqTagId), "beq")  ## branch if equal
+    BneAvr = (ord(BneTagId), "bne")  ## branch if not equal
+    BltAvr = (ord(BltTagId), "blt")  ## branch if less than (signed)
+    BleAvr = (ord(BleTagId), "ble")  ## branch if less or equal (signed)
+    BgtAvr = (ord(BgtTagId), "bgt")  ## branch if greater than (signed)
+    BgeAvr = (ord(BgeTagId), "bge")  ## branch if greater or equal (signed)
+    BloAvr = (ord(BloTagId), "blo")  ## branch if lower (unsigned <)
+    BlsAvr = (ord(BlsTagId), "bls")  ## branch if lower or same (unsigned <=)
+    BhiAvr = (ord(BhiTagId), "bhi")  ## branch if higher (unsigned >)
+    BhsAvr = (ord(BhsTagId), "bhs")  ## branch if higher or same (unsigned >=)
+    LabAvr = (ord(LabTagId), "lab")  ## label definition
+    IteAvr = (ord(IteTagId), "ite")  ## if-then-else structure
+    LoopAvr = (ord(LoopTagId), "loop")  ## loop structure
+    StmtsAvr = (ord(StmtsTagId), "stmts")  ## statement block
+    JtrueAvr = (ord(JtrueTagId), "jtrue")  ## set control flow variable(s) to true
+    KillAvr = (ord(KillTagId), "kill")  ## kill variable
+    RebindAvr = (ord(RebindTagId), "rebind")  ## bind a phys reg to a typed name, killing its prior tenant
+    WithregAvr = (ord(WithregTagId), "withreg")  ## block-scoped rebind; auto-killed at block end
+    ScopeAvr = (ord(ScopeTagId), "scope")  ## statement block with a reclaimable stack-slot arena: `(s)` locals declared inside are freed at scope end so sibling scopes reuse the frame bytes
+    BkptAvr = (ord(BkptTagId), "bkpt")  ## breakpoint / host trap. On Cortex-M, `(bkpt 171)` is `bkpt #0xAB`, the ARM semihosting entry on M-profile (operation in r0, parameter block in r1, result back in r0). On AVR it is the simulator's `SYSCALL N` — `cpse rN, rN` followed by the invalid opcode `0xFFFF`, i.e. an instruction that ALWAYS skips the word after it. That word is data, never executed, which is why this is still one instruction: `(bkpt 30)` exits with r25:r24 and `(bkpt 29)` prints r24
+    LdiAvr = (ord(LdiTagId), "ldi")  ## AVR: load an 8-bit immediate. The only way to materialize a constant, and it reaches r16..r31 only — a constant destined for a low register goes through a high one and `(mov)`/`(movw)`
+    MovwAvr = (ord(MovwTagId), "movw")  ## AVR: copy a whole 16-bit PAIR in one instruction. Both operands are pair tags and both must be even. This is what makes a pair cheap enough to be the unit the allocator hands out
+    AdcAvr = (ord(AdcTagId), "adc")  ## AVR: add with carry — the HIGH half of a 16-bit add, whose low half is `(add)`. The two are separate tags because they are separate instructions; the carry between them is the reason neither is useful alone
+    SbcAvr = (ord(SbcTagId), "sbc")  ## AVR: subtract with borrow — the high half of a 16-bit subtract
+    SubiAvr = (ord(SubiTagId), "subi")  ## AVR: subtract an 8-bit immediate, r16..r31 only. There is no `addi` on this machine: adding a constant is subtracting its negation
+    SbciAvr = (ord(SbciTagId), "sbci")  ## AVR: subtract an immediate with borrow — the high half of the above, and also the third instruction of a 16-bit negation (`(not)` high, `(neg)` low, `(sbci)` high by -1)
+    AndiAvr = (ord(AndiTagId), "andi")  ## AVR: and with an 8-bit immediate, r16..r31 only
+    OriAvr = (ord(OriTagId), "ori")  ## AVR: or with an 8-bit immediate, r16..r31 only
+    CpiAvr = (ord(CpiTagId), "cpi")  ## AVR: compare against an 8-bit immediate, r16..r31 only
+    CpcAvr = (ord(CpcTagId), "cpc")  ## AVR: compare with carry — the high half of a 16-bit comparison, whose low half is `(cmp)`
+    CpseAvr = (ord(CpseTagId), "cpse")  ## AVR: compare and skip the next INSTRUCTION if equal. It counts instructions, not statements: loading a 16-bit constant is two of them, so a `(cpse)` before an `(ldi)` pair skips only the low half
+    AdiwAvr = (ord(AdiwTagId), "adiw")  ## AVR: add 0..63 to a whole pair in one instruction — on `rp24`, X, Y and Z only. Anywhere else the same effect is `(subi)`+`(sbci)` with the negation
+    SbiwAvr = (ord(SbiwTagId), "sbiw")  ## AVR: subtract 0..63 from a pair, same four pairs
+    Lsl1Avr = (ord(Lsl1TagId), "lsl1")  ## AVR: shift left ONE bit. Named for the count because that is the whole of it — there is no multi-bit shift on this machine, so a shift by n is n instructions and a variable shift is a loop, both of which arkham writes out
+    Rol1Avr = (ord(Rol1TagId), "rol1")  ## AVR: rotate left through carry one bit — the high half of a 16-bit left shift, whose low half is `(lsl1)`
+    Lsr1Avr = (ord(Lsr1TagId), "lsr1")  ## AVR: shift right one bit, zero into the top — the HIGH half of a 16-bit unsigned right shift
+    Ror1Avr = (ord(Ror1TagId), "ror1")  ## AVR: rotate right through carry one bit — the low half of a 16-bit right shift, and emitted AFTER its high half so the carry is the bit that fell out
+    Asr1Avr = (ord(Asr1TagId), "asr1")  ## AVR: arithmetic shift right one bit, sign preserved — the high half of a 16-bit signed right shift
+    SwapAvr = (ord(SwapTagId), "swap")  ## AVR: exchange the two nibbles of a byte
+    MulbAvr = (ord(MulbTagId), "mulb")  ## AVR: 8x8 unsigned multiply. The product lands in the FIXED pair r1:r0, which is why `rp0` is never allocated, and it destroys r1 — so every use is followed by a `(xor (r1) (r1))` to restore the zero register
+    MulsbAvr = (ord(MulsbTagId), "mulsb")  ## AVR: 8x8 signed multiply, both operands r16..r31, product in r1:r0
+    LdbAvr = (ord(LdbTagId), "ldb")  ## AVR: load ONE byte. The source is a stack slot, a pointer pair, or a direct address; the assembler picks `ld`, `ldd` or `lds` accordingly and refuses anything that is not one of them, since a wider access is not an instruction here
+    StbAvr = (ord(StbTagId), "stb")  ## AVR: store one byte, same addressing
+    LdpiAvr = (ord(LdpiTagId), "ldpi")  ## AVR: load a byte through pointer pair P and post-increment it. What a byte-at-a-time aggregate copy walks with
+    StpiAvr = (ord(StpiTagId), "stpi")  ## AVR: store a byte through P and post-increment it
+    InbAvr = (ord(InbTagId), "inb")  ## AVR: read I/O address A (0..63). SP and SREG live there and `in`/`out` are the only way to reach them
+    OutbAvr = (ord(OutbTagId), "outb")  ## AVR: write I/O address A
+    SbrcAvr = (ord(SbrcTagId), "sbrc")  ## AVR: skip the next instruction if bit B of S is clear
+    SbrsAvr = (ord(SbrsTagId), "sbrs")  ## AVR: skip the next instruction if bit B of S is set
+    IcallAvr = (ord(IcallTagId), "icall")  ## AVR: call the address in Z — the only indirect call, which is why Z is a bridge and never a value's home
+    IjmpAvr = (ord(IjmpTagId), "ijmp")  ## AVR: jump to the address in Z
+    RetiAvr = (ord(RetiTagId), "reti")  ## AVR: return from an interrupt handler, re-enabling interrupts
+    SeiAvr = (ord(SeiTagId), "sei")  ## AVR: enable interrupts
+    CliAvr = (ord(CliTagId), "cli")  ## AVR: disable interrupts
+    SleepAvr = (ord(SleepTagId), "sleep")  ## AVR: enter the sleep mode the control register selects — the idle trap a bare-metal image ends on
+    WdrAvr = (ord(WdrTagId), "wdr")  ## AVR: reset the watchdog timer
+    LpmAvr = (ord(LpmTagId), "lpm")  ## AVR: read the flash byte at Z. Program memory is a SEPARATE address space here, so this is not `(ldb)` with a different operand — it is the only instruction that can reach a constant left in flash
+    LpmpiAvr = (ord(LpmpiTagId), "lpmpi")  ## AVR: read the flash byte at Z and post-increment Z
+
+proc rawTagIsAvrInst*(raw: TagEnum): bool {.inline.} =
+  raw in {PrepareTagId, MovTagId, AddTagId, SubTagId, AndTagId, OrTagId, XorTagId, IncTagId, DecTagId, NegTagId, NotTagId, CmpTagId, JmpTagId, CallTagId, ExtcallTagId, RetTagId, PushTagId, PopTagId, NopTagId, AdrTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, RebindTagId, WithregTagId, ScopeTagId, BkptTagId, LdiTagId, MovwTagId, AdcTagId, SbcTagId, SubiTagId, SbciTagId, AndiTagId, OriTagId, CpiTagId, CpcTagId, CpseTagId, AdiwTagId, SbiwTagId, Lsl1TagId, Rol1TagId, Lsr1TagId, Ror1TagId, Asr1TagId, SwapTagId, MulbTagId, MulsbTagId, LdbTagId, StbTagId, LdpiTagId, StpiTagId, InbTagId, OutbTagId, SbrcTagId, SbrsTagId, IcallTagId, IjmpTagId, RetiTagId, SeiTagId, CliTagId, SleepTagId, WdrTagId, LpmTagId, LpmpiTagId}
+
+type
+  AvrReg* = enum
+    NoAvrReg
+    R8AR = (ord(R8TagId), "r8")  ## register r8
+    R9AR = (ord(R9TagId), "r9")  ## register r9
+    R10AR = (ord(R10TagId), "r10")  ## register r10
+    R11AR = (ord(R11TagId), "r11")  ## register r11
+    R12AR = (ord(R12TagId), "r12")  ## register r12
+    R13AR = (ord(R13TagId), "r13")  ## register r13
+    R14AR = (ord(R14TagId), "r14")  ## register r14
+    R15AR = (ord(R15TagId), "r15")  ## register r15
+    R0AR = (ord(R0TagId), "r0")  ## register r0 (alias)
+    R1AR = (ord(R1TagId), "r1")  ## register r1 (alias)
+    R2AR = (ord(R2TagId), "r2")  ## register r2 (alias)
+    R3AR = (ord(R3TagId), "r3")  ## register r3 (alias)
+    R4AR = (ord(R4TagId), "r4")  ## register r4 (alias)
+    R5AR = (ord(R5TagId), "r5")  ## register r5 (alias)
+    R6AR = (ord(R6TagId), "r6")  ## register r6 (alias)
+    R7AR = (ord(R7TagId), "r7")  ## register r7 (alias)
+    R16AR = (ord(R16TagId), "r16")  ## AVR: register r16
+    R17AR = (ord(R17TagId), "r17")  ## AVR: register r17
+    R18AR = (ord(R18TagId), "r18")  ## AVR: register r18
+    R19AR = (ord(R19TagId), "r19")  ## AVR: register r19
+    R20AR = (ord(R20TagId), "r20")  ## AVR: register r20
+    R21AR = (ord(R21TagId), "r21")  ## AVR: register r21
+    R22AR = (ord(R22TagId), "r22")  ## AVR: register r22
+    R23AR = (ord(R23TagId), "r23")  ## AVR: register r23
+    R24AR = (ord(R24TagId), "r24")  ## AVR: register r24
+    R25AR = (ord(R25TagId), "r25")  ## AVR: register r25
+    R26AR = (ord(R26TagId), "r26")  ## AVR: register r26
+    R27AR = (ord(R27TagId), "r27")  ## AVR: register r27
+    R28AR = (ord(R28TagId), "r28")  ## AVR: register r28
+    R29AR = (ord(R29TagId), "r29")  ## AVR: register r29
+    R30AR = (ord(R30TagId), "r30")  ## AVR: register r30
+    R31AR = (ord(R31TagId), "r31")  ## AVR: register r31
+    Rp0AR = (ord(Rp0TagId), "rp0")  ## AVR: the register PAIR r1:r0 — one 16-bit logical register (`mul` writes it, so it is never allocated)
+    Rp2AR = (ord(Rp2TagId), "rp2")  ## AVR: the register PAIR r3:r2 — one 16-bit logical register
+    Rp4AR = (ord(Rp4TagId), "rp4")  ## AVR: the register PAIR r5:r4 — one 16-bit logical register
+    Rp6AR = (ord(Rp6TagId), "rp6")  ## AVR: the register PAIR r7:r6 — one 16-bit logical register
+    Rp8AR = (ord(Rp8TagId), "rp8")  ## AVR: the register PAIR r9:r8 — one 16-bit logical register
+    Rp10AR = (ord(Rp10TagId), "rp10")  ## AVR: the register PAIR r11:r10 — one 16-bit logical register
+    Rp12AR = (ord(Rp12TagId), "rp12")  ## AVR: the register PAIR r13:r12 — one 16-bit logical register
+    Rp14AR = (ord(Rp14TagId), "rp14")  ## AVR: the register PAIR r15:r14 — one 16-bit logical register
+    Rp16AR = (ord(Rp16TagId), "rp16")  ## AVR: the register PAIR r17:r16 — one 16-bit logical register
+    Rp18AR = (ord(Rp18TagId), "rp18")  ## AVR: the register PAIR r19:r18 — one 16-bit logical register
+    Rp20AR = (ord(Rp20TagId), "rp20")  ## AVR: the register PAIR r21:r20 — one 16-bit logical register
+    Rp22AR = (ord(Rp22TagId), "rp22")  ## AVR: the register PAIR r23:r22 — one 16-bit logical register
+    Rp24AR = (ord(Rp24TagId), "rp24")  ## AVR: the register PAIR r25:r24 — one 16-bit logical register
+    Rp26AR = (ord(Rp26TagId), "rp26")  ## AVR: the register PAIR r27:r26 — one 16-bit logical register — X, a pointer register
+    Rp28AR = (ord(Rp28TagId), "rp28")  ## AVR: the register PAIR r29:r28 — one 16-bit logical register — Y, a pointer register with a displaced form; the frame pointer
+    Rp30AR = (ord(Rp30TagId), "rp30")  ## AVR: the register PAIR r31:r30 — one 16-bit logical register — Z, a pointer register with a displaced form; the only indirect call target
+
+proc rawTagIsAvrReg*(raw: TagEnum): bool {.inline.} =
+  raw in {R8TagId, R9TagId, R10TagId, R11TagId, R12TagId, R13TagId, R14TagId, R15TagId, R0TagId, R1TagId, R2TagId, R3TagId, R4TagId, R5TagId, R6TagId, R7TagId, R16TagId, R17TagId, R18TagId, R19TagId, R20TagId, R21TagId, R22TagId, R23TagId, R24TagId, R25TagId, R26TagId, R27TagId, R28TagId, R29TagId, R30TagId, R31TagId, Rp0TagId, Rp2TagId, Rp4TagId, Rp6TagId, Rp8TagId, Rp10TagId, Rp12TagId, Rp14TagId, Rp16TagId, Rp18TagId, Rp20TagId, Rp22TagId, Rp24TagId, Rp26TagId, Rp28TagId, Rp30TagId}
 

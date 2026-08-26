@@ -10,7 +10,7 @@ proc toNimName(s: string; suffix: string): string =
 type
   EnumList = enum
     X64Inst, A64Inst, MInst, NifasmType, NifasmDecl, NifasmExpr, X64Flag, X64Reg,
-    A64Reg, MReg
+    A64Reg, MReg, AvrInst, AvrReg
 
 proc toSuffix(e: EnumList): (string, string) =
   case e
@@ -24,6 +24,8 @@ proc toSuffix(e: EnumList): (string, string) =
   of X64Reg: ("R", "NoReg")
   of A64Reg: ("R", "NoReg")
   of MReg: ("MR", "NoMReg")
+  of AvrInst: ("Avr", "NoAvrInst")
+  of AvrReg: ("AR", "NoAvrReg")
 
 proc shortcutToEnumList(shortcut: string): EnumList =
   try:
@@ -133,8 +135,16 @@ proc extractTagName(s: string): string =
     quit "Cannot extract tag name from: " & s
 
 const
-  LateEnums = {X64Inst, A64Inst, MInst}
+  LateEnums = {X64Inst, A64Inst, MInst, AvrInst, AvrReg}
     ## Enums whose SINGLE-target members are numbered LAST (see `genTags`).
+    ##
+    ## `AvrReg` is the one REGISTER enum in here, and deliberately. Cortex-M
+    ## could reuse the spellings that already existed (`(r0)`..`(r12)` were there
+    ## as x86-64 aliases), so it cost no ids at all. AVR has 32 registers and 16
+    ## pairs, and only half the plain ones exist already — putting the other 48
+    ## up front would push 48 of the CURRENT targets' mnemonics past 511 and make
+    ## them cost two tokens each, which is exactly the invariant `genTags`
+    ## promises below. AVR pays for its own file instead.
 
 proc genTags(inp: File; inputName: string) =
   ## Tag ids are assigned here, and the order matters for one reason: a NIF tag
@@ -207,7 +217,7 @@ proc genTags(inp: File; inputName: string) =
 
   createDir "src/nifasm/core"
   writeTagsFile "src/nifasm/core/tags.nim", tags, inputName, anonHead = true
-  writeModel "src/nifasm/core/model.nim", enumDecls, X64Inst, MReg, inputName
+  writeModel "src/nifasm/core/model.nim", enumDecls, X64Inst, AvrReg, inputName
 
 proc main(inputName: string) =
   var inp = open(inputName, fmRead)

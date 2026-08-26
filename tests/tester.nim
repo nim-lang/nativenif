@@ -1028,6 +1028,45 @@ proc avrSelfTest() =
        " checks, each verified to detect its own mutation)"
 
 
+proc avrAsmTests() =
+  ## Assemble hand-written AVR asm-NIF with nifasm and run the resulting firmware
+  ## under AVRtest. This is the END-TO-END gate for the instruction selector: the
+  ## encoder self-test proves the ENCODINGS, but only these exercise the operand
+  ## model, the register-binding table, the relocation patching and the ELF32
+  ## image together.
+  ##
+  ## Each fixture exits with a value it COMPUTED, so a wrong encoding shows up as
+  ## a wrong exit code rather than as output that happens to look right.
+  if not fileExists(avrSim):
+    echo avrSim, " not found - skipping AVR assembler tests"
+    return
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  const fixtures = [("hello_avr", 0, "Hello AVR\n"),
+                    ("avr_alu", 158, ""),
+                    ("avr_branch", 42, ""),
+                    ("avr_loop", 45, ""),
+                    ("avr_frame", 42, ""),
+                    ("avr_call", 42, "")]
+  var passed = 0
+  for (stem, wantCode, wantOut) in fixtures:
+    let src = "tests" / (stem & ".nif")
+    let elf = "tests" / (stem & ".elf")
+    exec quoteShell(nifasmExe) & " -o:" & quoteShell(elf) & " " & quoteShell(src)
+    let (output, code) = runProgram(avrSim,
+      @["-q", "-mmcu=avr5", "-s", "32k", elf])
+    if code == timeoutExitCode:
+      quit "FAILURE (TIMEOUT) avr " & stem & "\n"
+    if code != wantCode:
+      quit "FAILURE avr " & stem & ": exit " & $code & ", want " &
+           $wantCode & "\n" & output
+    if output != wantOut:
+      quit "FAILURE avr " & stem & " output\nExpected: " & escape(wantOut) &
+           "\nGot:      " & escape(output)
+    removeFile elf
+    inc passed
+  echo passed, " / ", fixtures.len, " AVR assembler tests successful"
+
+
 proc cortexMAsmTests() =
   ## Assemble hand-written Cortex-M asm-NIF with nifasm and run the resulting
   ## firmware under QEMU. This is the END-TO-END gate for the instruction
@@ -1684,8 +1723,10 @@ cortexMLayoutTests()
 arkhamCortexMTests()
 arkhamCortexM64Tests()
 
-# AVR: encoder-level coverage. Host-independent — it needs only `bin/avrtest`.
+# AVR: encoder-level coverage, then the selector end to end. Host-independent —
+# both need only `bin/avrtest`.
 avrSelfTest()
+avrAsmTests()
 
 # arkham native-codegen tests: arkham emits the host arch (x86-64 on Linux,
 # AArch64/Darwin on macOS), so we run them only where the binaries execute.

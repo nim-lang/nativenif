@@ -29,7 +29,7 @@ import x64/encoder as x86
 import arm64/encoder as arm64
 from image/elf32 as elf32 import nil
 import image / [dwarf, tracetable]
-import image / [writecommon, writeelf, writemacho, writepe, writecortexm]
+import image / [writecommon, writeelf, writemacho, writepe, writecortexm, writeavr]
 import pass1, pass2
 
 proc generateSymbol(ctx: var GenContext; sym: Symbol) =
@@ -452,11 +452,31 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
         entryOff = pos
       writeFile(outfile, writeCortexMImage(ctx, code, entryOff, memMap))
     of Arch.Avr:
-      # Unreachable while `genInst` refuses the target: no instruction can have
-      # been selected, so there is nothing to write. Named rather than folded
-      # into another arm so that M2 has one place to fill in.
-      quit "nifasm: the AVR image writer is not implemented yet " &
-           "(M2 in doc/internals/avr.md)"
+      # A firmware image: a reset `jmp`, then the code.
+      #
+      # `absBase` is the reset vector's four bytes, and it is load-bearing: a
+      # label's position is measured inside `ctx.buf`, which does not contain the
+      # vector, while the finished image prepends it. Without this every `call`
+      # and `jmp` resolves four bytes low — which on this machine is two words,
+      # so it lands on a real instruction in the middle of the intended proc and
+      # runs. The flash base itself contributes nothing: the core begins
+      # executing at 0 and no board says otherwise.
+      ctx.buf.absBase = uint32(ResetVectorBytes)
+      finalize(ctx.buf)
+      var code: seq[byte] = newSeq[byte](ctx.buf.data.len)
+      for i in 0 ..< ctx.buf.data.len: code[i] = ctx.buf.data[i]
+      # The reset vector points at the ENTRY PROC, not at the first byte emitted.
+      # Those coincide today only because `pass2` generates the entry eagerly the
+      # moment it sees it; nothing guarantees that, and a wrong reset vector
+      # starts executing some other proc's prologue with no diagnostic.
+      var entryOff = 0
+      if ctx.entrySym != nil:
+        let pos = ctx.buf.getLabelPosition(LabelId(ctx.entrySym.offset))
+        if pos < 0:
+          quit "nifasm: entry point '" & ctx.nameOf(ctx.entrySym.name) &
+               "' has no address"
+        entryOff = pos
+      writeFile(outfile, writeAvrImage(ctx, code, entryOff))
 
   # Close all foreign-module readers (the main module has no reader).
   for modname, module in ctx.modules.mpairs:

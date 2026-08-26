@@ -1,17 +1,65 @@
 # AVR support
 
-Status: **M0, M1, M2a complete.**
+Status: **M0, M1, M2, M3 complete.**
 
 | Milestone | State |
 |---|---|
 | M0 target contract | done — `tools/avr_probe.nim`, 18 checks |
 | M1 arch + word-size plumbing | done — `Arch.Avr`, `TargetArch.Avr`, `Word16` |
 | M2a encoder + relocations | done — `src/nifasm/avr/encoder.nim`, 59-check self-test |
-| M2b ELF32 image writer | not started |
-| M3 assembler integration | not started |
+| M2b ELF32 image writer | done — `src/nifasm/image/writeavr.nim` |
+| M3 assembler integration | **working** — 6 fixtures run end to end |
 | M4 arkham backend | not started |
-| M5 multiply, divide, variable shifts | not started |
-| M6 flash constants, interrupts, layout | not started |
+| M5 wide frames, stack arguments, divide | not started |
+| M6 globals, flash constants, interrupts, startup | not started |
+
+### What M3 has
+
+`src/nifasm/avr/` — `regs.nim`, `operands.nim`, `instr.nim` — assembles
+hand-written AVR asm-NIF into a firmware image that runs under AVRtest and exits
+with a value it computed. Six fixtures in `tests/tester`: the ALU, an `ite`, a
+`loop` closed by a forward `beq`, a frame with a slot addressed through Y, a
+proc call with register arguments, and a `hello` that prints.
+
+Implemented: the typed operand model over the `(rN)`/`(rpN)` tag set, the
+`avrRegBindings` table and `clobberedAvr` call-clobber tracking, `(var …)` in a
+register, a pair or a stack slot, every ALU form, the one-bit shifts,
+`movw`/`adiw`/`sbiw`, `ldb`/`stb`/`ldpi`/`stpi`/`inb`/`outb`/`lpm`, the skips,
+`ite`/`loop`/`jtrue`/`lab`, the branches, `(proc …)` with register parameters,
+`(prepare …)`/`(call)`/`(arg …)`/`(res …)`, and `(ssize)`-sized frames.
+
+### What M3 still needs
+
+* **Stack-passed arguments** are rejected by name. Four pairs go in registers;
+  the rest need the incoming-argument area, which is `Y + framesize + 5` — a
+  distance only the frame patch knows, so the `ldd` displacement would have to
+  be a patch site of its own.
+* **A frame over 63 bytes** is rejected by name, twice over: `adiw`/`sbiw` carry
+  the frame size in six bits, and 63 is also the whole displacement range of
+  `ldd`/`std`. A larger frame needs the pointer advanced, which is not one
+  instruction.
+* **Globals** are rejected by name — M6.
+* **A conditional branch always costs two words**: the direct form reaches ±128
+  bytes and the assembler cannot know the distance when it emits one, so it
+  inverts the condition and branches over an `rjmp`. Shrinking that back down is
+  a relaxation pass, exactly like `x64/relax.nim`.
+
+### Two things M3 changed outside the AVR tree
+
+**AVR's register tags are escaped.** They are numbered past the 511 that fit
+NIF's 9-bit tag field — see `LateEnums` in `tools/gen_instructions.nim` for why
+AVR pays for its own register file rather than pushing the current targets'
+mnemonics over — so `(rp24)` arrives spelled through the `(other …)` escape with
+its real id in a leading child. Every site that reads a register tag therefore
+has to use the RESOLVED `n.tag` rather than `rawTag`, and step past such a node
+with `skip` rather than `inc`. The other targets never met this because all
+their register spellings predate the overflow.
+
+**`(lo S)` and `(hi S)`.** A 16-bit value lives in a pair and every ALU
+instruction works on one half, so a 16-bit add is `(add (lo d) (lo s))` then
+`(adc (hi d) (hi s))`. Naming the halves is what lets that be written at all:
+spelling `(r25)` raw is rejected by the binding table, and rightly — it cannot
+tell that the register is the top of some local.
 
 ## Target
 
@@ -171,6 +219,28 @@ RAM but make every read of it a different instruction (`lpm`) selected by where
 the pointer came from — a distinction Leng does not draw and the type system
 here has no way to carry. AVR-GCC makes the same default choice and offers
 `PROGMEM` as the opt-out; an equivalent is M6, not a precondition.
+
+## What M2b established
+
+`src/nifasm/image/writeavr.nim`. Two things differ from every other image writer
+here.
+
+The **reset vector is an instruction**, not an address: an AVR core begins
+executing at flash 0, so word 0 is a `jmp` to the entry proc. `e_entry` in the
+ELF header stays 0 for the same reason — a real part reads no ELF header, and
+declaring the proc's address there would work under a simulator that honours it
+and fail on silicon.
+
+Those four bytes are also why `buf.absBase` is `ResetVectorBytes`: a label's
+position is measured inside the code buffer, which does not contain the vector,
+while the image prepends it. Without that every `call` resolves four bytes low —
+two words on this machine, so it lands on a real instruction inside the intended
+proc and runs. That is precisely the bug the first `avr_call` run had.
+
+`writeElf32` grew `machine`/`flags`/`entryTag` parameters, all defaulting to what
+ARM already passed. `entryTag` is the interesting one: bit 0 of an ARM code
+address is the Thumb-state marker, and the same bit here would name an odd
+address, which is not an instruction address at all.
 
 ## What M2a established
 
