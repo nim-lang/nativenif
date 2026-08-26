@@ -1106,9 +1106,16 @@ proc arkhamAvrRejections() =
   ## and the refusal has to say which one and where to look.
   let arkhamExe = ("bin" / "arkham").addFileExt(ExeExt)
   const cases = [
-    # A body richer than `ret <const>`. The failure a user is most likely to hit,
-    # so it names the milestone rather than the construct.
-    ("tests/arkham_m/leafret.c.nif", "not yet supported"),
+    # A 32-bit value. The failure a user is most likely to hit, because the
+    # frontend's default `int` is wider than this machine's word — and the one
+    # that must never be silently truncated, since every load and store the
+    # emitter writes moves exactly two bytes.
+    ("tests/arkham_m/leafret.c.nif", "32 bits wide"),
+    # An aggregate: a shape the value core has no representation for at all.
+    ("tests/arkham_avr_reject/aggr.c.nif", "is an aggregate"),
+    # A shift by a value rather than a constant. Refused for what the MACHINE is
+    # — there is no variable-shift instruction — not for a missing feature.
+    ("tests/arkham_avr_reject/varshift.c.nif", "variable-shift"),
     # A syscall. Refused for what it IS rather than as an unimplemented feature:
     # a firmware image has no OS underneath it, on this target or any other.
     ("tests/arkham/hello.c.nif", "no OS to call into")]

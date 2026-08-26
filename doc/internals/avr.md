@@ -1,6 +1,6 @@
 # AVR support
 
-Status: **M0, M1, M2, M3, M4a/b complete.**
+Status: **M0, M1, M2, M3, M4 complete.**
 
 | Milestone | State |
 |---|---|
@@ -10,10 +10,43 @@ Status: **M0, M1, M2, M3, M4a/b complete.**
 | M2b ELF32 image writer | done — `src/nifasm/image/writeavr.nim` |
 | M3 assembler integration | **working** — 6 fixtures run end to end |
 | M4a arkham machine model | done — `src/arkham/avr/machine.nim` |
-| M4b arkham driver + the return path | done — 2 Leng fixtures run end to end |
-| M4c the value core | not started |
-| M5 wide frames, stack arguments, divide | not started |
+| M4b arkham driver + the return path | done — the program walk and the exit path |
+| M4c the value core | done — 8 Leng fixtures run end to end |
+| M4d aggregates, arrays, pointers | not started |
+| M5 wide scalars, stack arguments, divide | not started |
 | M6 globals, flash constants, interrupts, startup | not started |
+
+### What M4c has
+
+`src/arkham/avr/gen.nim`, driven by the arch-neutral `allocateProc`. Locals in
+pairs or frame slots, 16-bit arithmetic and logic, the multiply, shifts by a
+constant, comparisons both as values and as branches, `if`/`while`/`break`,
+calls with up to four register arguments, and recursion. Eight fixtures in
+`tests/arkham_avr`, checked by `.exitcode` like every other corpus, including one
+with twelve live locals — more than the seven callee-saved pairs, so the
+allocator spills and every access goes through `Y+q`.
+
+**It is a destination-passing walker, not a fused decide-and-emit.** The other
+two backends thread a `Location` constraint through the walk, which buys store
+forwarding, in-place immediates and register-level fusion. This one takes a
+concrete pair and materializes into it.
+
+That is a deliberate trade. The fused core is four thousand lines whose
+register-binding protocol has a formal model behind it, and the machine it would
+be buying code quality for has 32 KB of flash and no pipeline to speak of. What
+matters here is that the answer is right and that every gap is a diagnostic. The
+optimizations are recoverable later; a wrong 16-bit carry is not.
+
+**Totality without a spiller.** An operand that has to be computed rather than
+read is parked in a frame slot the emitter mints, so the register demand of a
+nested expression is constant: the destination, plus the staging bridge for the
+one operand being loaded. That is why this core cannot run out of registers, and
+why it needs none of the reserve/steal machinery the fused one has.
+
+The one case worth naming, because it is easy to get wrong: `x - y` where the
+destination already IS `y`'s home would compute `x` into `y` and then subtract
+the result from itself. `classifyB` parks the second operand whenever its home
+is the destination.
 
 ### Why M4 is not the Cortex-M arrangement
 

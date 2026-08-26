@@ -1,0 +1,29 @@
+(.nif27)
+(stmts
+ (proc :main.0
+  (params)
+  (i 16)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :a.0 .
+    (i 16)100)
+   (var :b.0 .
+    (i 16)7)
+   (var :c.0 .
+    (i 16)
+    (sub
+     (i 16)a.0 b.0))
+   (var :d.0 .
+    (i 16)
+    (mul
+     (i 16)b.0 6))
+   (var :e.0 .
+    (i 16)
+    (bitand
+     (i 16)a.0 15))
+   (ret
+    (add
+     (i 16)
+     (add
+      (i 16)c.0 d.0)e.0))))) 

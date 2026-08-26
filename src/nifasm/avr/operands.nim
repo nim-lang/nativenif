@@ -186,10 +186,12 @@ proc parseOperandAvr*(n: var Cursor; ctx: var GenContext): OperandAvr =
     elif t == ArgTagId:
       if not ctx.inCall:
         error("(arg ...) can only be used inside a prepare block", n)
-      inc n
-      if n.kind != Symbol: error("Expected argument name in (arg ...)", n)
-      let argName = getSymId(n)
-      inc n
+      var argName: SymId
+      into n:
+        if n.kind != Symbol: error("Expected argument name in (arg ...)", n)
+        argName = getSymId(n)
+        inc n
+        while n.hasMore: skip n
       let p = findParam(ctx.callContext.typ, argName)
       if p == nil: error("Unknown argument: " & ctx.nameOf(argName), n)
       if p.typ.isOnStack:
@@ -212,14 +214,15 @@ proc parseOperandAvr*(n: var Cursor; ctx: var GenContext): OperandAvr =
       else:
         result.reg = tagToRegisterAvr(regTag, n)
       result.typ = p.typ
-      while n.hasMore: skip n
     elif t == ResTagId:
       if not ctx.inCall:
         error("(res ...) can only be used inside a prepare block", n)
-      inc n
-      if n.kind != Symbol: error("Expected result name in (res ...)", n)
-      let resName = getSymId(n)
-      inc n
+      var resName: SymId
+      into n:
+        if n.kind != Symbol: error("Expected result name in (res ...)", n)
+        resName = getSymId(n)
+        inc n
+        while n.hasMore: skip n
       if not ctx.callContext.callEmitted:
         error("(res ...) can only be used after (call)", n)
       let resPtr = findResult(ctx.callContext.typ, resName)
@@ -239,22 +242,40 @@ proc parseOperandAvr*(n: var Cursor; ctx: var GenContext): OperandAvr =
       # `(mem <pointer pair> [offset])` — the indirect forms. The base must
       # ALREADY be X, Y or Z: this target has three address registers and the
       # assembler does not spend one behind the code generator's back.
-      inc n
-      var base = parseOperandAvr(n, ctx)
-      if base.kind notin {okReg, okArg} or not base.isPair:
-        error("AVR: (mem ...) needs a pointer PAIR — X (`rp26`), Y (`rp28`) or " &
-              "Z (`rp30`)", n)
-      result.kind = okMem
-      result.mem = AvrMem(kind: amPtr, p: ptrRegOf(base.pair, n), disp: 0)
-      if n.hasMore and n.kind == IntLit:
-        result.mem.disp = int(getInt(n))
-        inc n
-        if result.mem.p == avr.PX and result.mem.disp != 0:
+      var base: OperandAvr
+      var extra = 0
+      into n:
+        base = parseOperandAvr(n, ctx)
+        if n.hasMore and n.kind == IntLit:
+          extra = int(getInt(n))
+          inc n
+        while n.hasMore: skip n
+      if base.kind == okMem:
+        # `(mem <stack slot> K)` — the slot's own displacement PLUS K, both in
+        # the same instruction's 6-bit field. The slot's part is nifasm's own
+        # number; K is the code generator's, and the high half of a 16-bit value
+        # is exactly `K = 1`. Nothing is synthesized: it is still one `ldd`.
+        result.kind = okMem
+        result.mem = base.mem
+        result.mem.disp += extra
+        if result.mem.kind == amPtr and result.mem.p == avr.PX and result.mem.disp != 0:
           error("AVR: X has no displaced form; only Y and Z take `+q`", n)
-        elif result.mem.disp < 0 or result.mem.disp > MaxDisp:
-          error("AVR: the displacement " & $result.mem.disp & " is outside 0..63", n)
-      result.typ = avrRegType()
-      while n.hasMore: skip n
+        elif result.mem.kind == amPtr and
+             (result.mem.disp < 0 or result.mem.disp > MaxDisp):
+          error("AVR: the displacement " & $result.mem.disp & " is outside 0..63 — " &
+                "this proc's frame is too large (see M5 in doc/internals/avr.md)", n)
+        result.typ = base.typ
+      elif base.kind in {okReg, okArg} and base.isPair:
+        result.kind = okMem
+        result.mem = AvrMem(kind: amPtr, p: ptrRegOf(base.pair, n), disp: extra)
+        if result.mem.p == avr.PX and extra != 0:
+          error("AVR: X has no displaced form; only Y and Z take `+q`", n)
+        elif extra < 0 or extra > MaxDisp:
+          error("AVR: the displacement " & $extra & " is outside 0..63", n)
+        result.typ = avrRegType()
+      else:
+        error("AVR: (mem ...) needs a pointer PAIR — X (`rp26`), Y (`rp28`) or " &
+              "Z (`rp30`) — or a stack slot", n)
     elif t == LoTagId or t == HiTagId:
       # `(lo x)` / `(hi x)` — one half of a value that lives in a pair. This is
       # how a 16-bit add is written: `(add (lo d) (lo s))` then

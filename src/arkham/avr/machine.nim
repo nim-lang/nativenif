@@ -66,9 +66,9 @@ const
     ## which this backend refuses by name for now (M5).
   IntRet* = P24
 
-  IntCalleeSaved* = [P2, P4, P6, P8, P10, P12, P14, P16]
-    ## r2..r17: eight pairs, which is roomy compared to the other targets and is
-    ## the whole reason this file can afford three dedicated registers.
+  IntCalleeSaved* = [P2, P4, P6, P8, P10, P12, P14]
+    ## r2..r15: seven pairs, which is still roomy compared to the other targets
+    ## and is the whole reason this file can afford three dedicated registers.
     ##
     ## They are not free, though. Saving one costs two `push`es and two `pop`s —
     ## four instructions per pair — so the planner should still prefer a volatile
@@ -84,11 +84,22 @@ const
     ## that must live in a register therefore takes a callee-saved pair or a
     ## stack slot — which is what AVR-GCC does too.
 
+  ValueBridge* = P16
+    ## r17:r16, withheld from every pool: the pair a VALUE is produced into when
+    ## its home is memory, and the scratch pair of any sequence that needs one.
+    ##
+    ## `mul` is what forces it to exist. A 16-bit product is three `mul`s
+    ## accumulated, and each of them lands in the fixed r1:r0, so the partial sum
+    ## needs somewhere to live that is neither operand — three live pairs at once
+    ## where the other bridges are already the destination and the operand
+    ## loader. It is `ldi`-capable, which the low callee-saved pairs are not, so
+    ## a constant produced into memory needs no second staging step.
+
   StagingBridge* = X
-    ## The pair the emitter can always take to hold an ADDRESS. Every non-frame
-    ## memory access needs one, because there is no base-plus-offset operand and
-    ## no SP-relative form: the address has to be in X, Y or Z, and Y is spoken
-    ## for.
+    ## The pair the emitter can always take to hold an OPERAND being loaded out
+    ## of memory. Every non-frame memory access needs one, because there is no
+    ## base-plus-offset operand and no SP-relative form: the address has to be in
+    ## X, Y or Z, and Y is spoken for.
   ProduceBridge* = Z
     ## The second one, and the one used to stage a value on its way INTO memory.
     ## Always the last entry of `bridgeRegs`, as on the other targets.
@@ -98,20 +109,19 @@ const
     ## (`lpm`). Both are fine precisely BECAUSE it is a bridge — no value ever
     ## lives here, so nothing has to prove that using it is safe.
 
-  BridgeRegs* = [StagingBridge, ProduceBridge]
+  BridgeRegs* = [ValueBridge, StagingBridge, ProduceBridge]
     ## In the order a staging draw walks them, so a site with its own claim on
     ## the produce bridge still finds it free.
     ##
-    ## Two is also the minimum, and for a reason particular to this machine: a
-    ## 16-bit compare whose operands are both in memory has to load each one, and
-    ## loading needs a POINTER pair as well as somewhere to put the byte. The two
-    ## bridges supply four scratch bytes between them, which is enough for an
-    ## address in one and a value in the halves of the other.
+    ## Three, like both Arm targets, and reached the same way — by asking what
+    ## the widest sequence needs live at once rather than by picking a number.
+    ## Here that sequence is the 16-bit multiply: a destination, an operand
+    ## loaded out of memory, and an accumulator that is neither.
 
-  ReservedRegs* = {R0, R13, R14, R15, R16..R30, SP, NoReg}
+  ReservedRegs* = {R0, R8, R13, R14, R15, R16..R30, SP, NoReg}
     ## Never allocated: r1:r0 (`mul`'s destination and the zero register), the
-    ## two bridges, the frame pointer, and the abstract slots that map to no AVR
-    ## pair.
+    ## three bridges, the frame pointer, and the abstract slots that map to no
+    ## AVR pair.
 
   ConvClobbersGpr* = [P0, P18, P20, P22, P24, X, Z]
     ## What a call destroys, emitted as the proc's `(clobber …)` so the ABI is
@@ -136,7 +146,7 @@ const
     intCalleeSaved: @IntCalleeSaved,
     floatTempRegs: @[],
     floatCalleeSaved: @[],
-    intCalleeSavedSet: {P2, P4, P6, P8, P10, P12, P14, P16},
+    intCalleeSavedSet: {P2, P4, P6, P8, P10, P12, P14},
     floatCalleeSavedSet: {},
     aggrByRefThreshold: 4,      # TWO words, matching `slots.classifyArg`'s `2*w`
                                 # at w = 2. The two decide the same thing and
