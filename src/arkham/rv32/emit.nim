@@ -19,7 +19,8 @@
 import std / [tables]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
-                    context, typeutil, regbind, diag]
+                    context, typeutil, regbind, diag, constdata]
+import std / [sets]
 import machine
 
 proc emReg*(g: var CodeGen; r: Reg) =
@@ -112,6 +113,7 @@ proc emMemNode*(g: var CodeGen; c: Cursor) =
     let home = g.plan.locationOfSym(name, cursorToPosition(g.buf[], c))
     if home.kind == NamedStack: g.ab.sym home.name
     elif home.kind == InReg: g.emReg home.r      # already a pointer VALUE
+    elif g.prog.globals.hasKey(name): g.ab.sym g.prog.gvarAsmName(name)
     else:
       lengError c, "RV32: `" & name & "` cannot be addressed (" & $home.kind & ")",
                 lengInfo(c)
@@ -150,6 +152,17 @@ proc storeTagFor(width: int): Rv32Inst =
   of 2: Shr32Rv
   else: SwrRv
 
+proc emGlobalAddr*(g: var CodeGen; d: Reg; name: string) =
+  ## A global's address into a register. `lui`+`addi`, patched once the data
+  ## segment is placed — the address is a final-layout fact, so nifasm carries it
+  ## rather than arkham guessing.
+  g.ab.tree AdrRv: (g.emReg d; g.ab.sym name)
+
+proc emGlobalAddrLabel*(g: var CodeGen; d: Reg; name: string) =
+  ## The address of a CODE-segment label (a rodata blob). Same `(adr …)` node as
+  ## a global's, and nifasm tells the two apart by what the symbol resolves to.
+  g.ab.tree AdrRv: (g.emReg d; g.ab.sym name)
+
 proc emStoreField*(g: var CodeGen; slot, field: string; s: Reg; width: int) =
   ## Store into `slot.field`. Built from PARTS rather than copied from a node,
   ## because a constructor's destination is not written anywhere in the input —
@@ -162,6 +175,12 @@ proc emStoreElem*(g: var CodeGen; slot: string; idx: int; s: Reg; width: int) =
   g.ab.tree storeTagFor(width):
     g.ab.tree AtX: (g.ab.sym slot; g.ab.intLit idx)
     g.emReg s
+
+proc emLeaNode*(g: var CodeGen; d: Reg; node: Cursor) =
+  ## The ADDRESS of a folded access. `(dot …)` and `(at …)` are memory operands
+  ## to nifasm, so `(lea …)` over one is a single `addi` against whatever base
+  ## the fold resolved to.
+  g.ab.tree LeaRv: (g.emReg d; g.emMemNode node)
 
 proc emLoadNode*(g: var CodeGen; d: Reg; node: Cursor; width: int; signed: bool) =
   let t = case width
@@ -297,6 +316,29 @@ proc freshLabel*(g: var CodeGen; prefix: string): string =
 
 # ── types and declarations ──────────────────────────────────────────────────
 
+proc genTypeBodyRv*(g: var CodeGen; c: var Cursor)
+
+proc genGlobalRv*(g: var CodeGen; nifName: string; decl: Cursor) =
+  ## A top-level `gvar`/`const`. Only a compile-time constant scalar initializer
+  ## is laid out statically; a runtime one would need entry-time code that this
+  ## backend does not emit yet.
+  if nifName in g.prog.importcOnlyGvars: return
+  let name = g.prog.gvarAsmName(nifName)
+  var c = decl
+  c.into:
+    inc c                                       # the name
+    skip c                                      # the var's pragmas
+    let typeCur = c
+    skip c
+    let hasValue = c.hasMore and c.kind != DotToken
+    g.ab.open NifasmDecl.GvarD
+    g.ab.symDef name
+    var tc = typeCur
+    g.genTypeBodyRv(tc)
+    g.genGlobalInitValue(name, typeCur, c, hasValue)
+    g.ab.close()
+    while c.hasMore: skip c
+
 proc genTypeBodyRv*(g: var CodeGen; c: var Cursor) =
   ## Scalars and pointers only — everything else is refused BY NAME, which is
   ## what makes a partial backend safe to ship.
@@ -345,6 +387,14 @@ proc genTypeBodyRv*(g: var CodeGen; c: var Cursor) =
         skip c                                  # the base slot
         g.ab.objectType:
           while c.hasMore:
+            # Every child must be a `(fld …)`. An object may also contain a
+            # `(union …)` or an anonymous group, and walking one of those as a
+            # field asks a tag for its symbol name — which used to be an
+            # assertion failure rather than a diagnostic.
+            if c.substructureKind != FldU:
+              lengError c, "RV32: an object member that is not a plain field " &
+                        "(a union or an anonymous group) is not implemented yet " &
+                        "(see R5c in doc/internals/rv32.md)", lengInfo(c)
             var f = c
             f.into:
               let fname = symName(f); inc f

@@ -432,15 +432,24 @@ proc genInstRv(n: var Cursor; ctx: var GenContext) =
     rv.emitJalr(ctx.buf.data, regOfRv(d, "destination", start),
                 regOfRv(a, "base", start), immOfRv(k, "offset", start))
   of AdrRv:
-    ## `lui`+`addi` carrying a label's absolute address. Two instructions, and
-    ## legal here for the reason Cortex-M's MOVW/MOVT pair is: the VALUE is a
-    ## final-layout fact only nifasm knows, so it is nifasm encoding its own
-    ## operand rather than lowering one the code generator supplied.
+    ## `lui`+`addi` carrying an absolute address. Two instructions, and legal here
+    ## for the reason Cortex-M's MOVW/MOVT pair is: the VALUE is a final-layout
+    ## fact only nifasm knows, so it is nifasm encoding its own operand rather
+    ## than lowering one the code generator supplied.
     inc n
     let d = parseDestRv(n, ctx)
     let t = parseOperandRv(n, ctx)
-    if t.kind != okLabel: error("RV32: `(adr)` needs a label", start)
-    rv.emitLa(ctx.buf, regOfRv(d, "destination", start), t.label)
+    let dr = regOfRv(d, "destination", start)
+    if t.gvarSym != nil:
+      # A GLOBAL: the data segment's base is not known until the image is laid
+      # out, so the site is recorded and patched there, exactly as Cortex-M does.
+      ctx.gvarSites.add (ctx.buf.data.len, t.gvarSym)
+      rv.emitLui(ctx.buf.data, dr, 0)
+      rv.emitAddi(ctx.buf.data, dr, dr, 0)
+    elif t.kind == okLabel:
+      rv.emitLa(ctx.buf, dr, t.label)
+    else:
+      error("RV32: `(adr)` needs a label or a global", start)
 
   of AddRv, SubRv:
     ## The two-operand spelling, and it exists on this three-operand machine for

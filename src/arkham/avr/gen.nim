@@ -68,6 +68,17 @@ proc checkWidth(g: var CodeGen; typeCur: Cursor; what: string) =
               "this backend's word is 16 and a wider value is not truncated " &
               "silently (see M5 in doc/internals/avr.md)", lengInfo(typeCur)
 
+proc refuseAggr(g: var CodeGen; c: Cursor; what: string) =
+  ## An aggregate where only a SCALAR is handled. This has to be a refusal and
+  ## not a silent partial job: a struct copy, a struct argument and a struct
+  ## return all look like ordinary moves to a value core that only knows how to
+  ## move one word, so the answer comes out WRONG rather than missing. Ten
+  ## fixtures did exactly that before this check existed.
+  if g.exprSlot(c).cls == AMem:
+    lengError c, "AVR: " & what & " is an aggregate — copying, passing and " &
+              "returning one are not implemented yet (see M5 in " &
+              "doc/internals/avr.md)", lengInfo(c)
+
 proc mintSlot(g: var CodeGen; c: Cursor): string =
   ## A frame slot for one parked operand. Declared where it is used: nifasm
   ## assigns the offset, and `(scope …)` is not needed because these never
@@ -119,9 +130,14 @@ proc classifyB(g: var CodeGen; c: Cursor; dst: Reg): BPlan =
   else: discard
   # Anything else — a nested expression, or a local whose home IS the
   # destination — is computed into the destination and parked.
+  # Into the value BRIDGE, not into `dst`. `dst` is very often a local's home —
+  # `x = x + f(5)` computes into `x`'s pair — and parking there destroys that
+  # local BEFORE the first operand is read, which then reads the parked value
+  # instead of itself. A bridge is scratch and belongs to nobody.
+  let parkReg = if dst == ValueBridge: dst else: ValueBridge
   let slot = g.mintSlot(c)
-  g.emitValue(c, dst)
-  g.emStoreSlot(slot, dst)
+  g.emitValue(c, parkReg)
+  g.emStoreSlot(slot, parkReg)
   BPlan(kind: bkSlot, slot: slot)
 
 proc materializeB(g: var CodeGen; p: BPlan): Reg =
@@ -243,9 +259,19 @@ proc scaledIndex(g: var CodeGen; p: BPlan; elemW: int): Reg =
     result = StagingBridge
   g.emShl16(result, 1)
 
+proc strideOf(g: var CodeGen; c: Cursor): int =
+  ## The size of what `c` denotes, UNCLAMPED. `accessWidth` caps at a pair
+  ## because it sizes a load; a stride must not be capped, or an array of
+  ## two-word rows indexes by one word.
+  let s = g.exprSlot(c)
+  if s.size <= 0: 2 else: s.size
+
 proc emitAddrOf(g: var CodeGen; c: Cursor; dst: Reg) =
-  ## The ADDRESS of an lvalue, in a pair. Only needed where an offset has to be
-  ## added at run time — the one case nifasm cannot fold.
+  ## The ADDRESS of an lvalue, in a pair.
+  ##
+  ## The recursive cases are the point: `(at (at m i) j)` asks for the address of
+  ## an inner ROW, and falling back to `emitValue` there would LOAD the row's
+  ## first word and use it as a pointer.
   if c.kind == Symbol:
     let home = g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c))
     if home.kind == NamedStack:
@@ -255,6 +281,28 @@ proc emitAddrOf(g: var CodeGen; c: Cursor; dst: Reg) =
       g.emMovw(dst, home.r)                 # already a pointer VALUE
       return
     refuse(c, "the address of `" & symName(c) & "`")
+  if c.kind == TagLit:
+    case c.exprKind
+    of DotC:
+      g.emLeaNode(dst, c)
+      return
+    of AtC:
+      var idx = c; inc idx; skip idx
+      if idx.kind in {IntLit, UIntLit}:
+        g.emLeaNode(dst, c)
+        return
+      let stride = g.strideOf(c)
+      var base = c; inc base
+      g.emitAddrOf(base, dst)
+      let plan = g.classifyB(idx, dst)
+      let ir = g.scaledIndex(plan, stride)
+      g.emBin16(boAdd, dst, ir)
+      return
+    of DerefC, HaddrC:
+      var v = c; inc v
+      g.emitValue(v, dst)                   # the pointer IS the address
+      return
+    else: discard
   g.emitValue(c, dst)
 
 proc emitLval(g: var CodeGen; c: Cursor; scratch: Reg): Lval =
@@ -279,13 +327,13 @@ proc emitLval(g: var CodeGen; c: Cursor; scratch: Reg): Lval =
       var idx = c; inc idx; skip idx
       if idx.kind in {IntLit, UIntLit}:
         return Lval(kind: lvNode, node: c, width: g.accessWidth(c))
-      let elemW = g.accessWidth(c)
+      let stride = g.strideOf(c)
       var base = c; inc base
       g.emitAddrOf(base, scratch)
       let plan = g.classifyB(idx, scratch)
-      let ir = g.scaledIndex(plan, elemW)
+      let ir = g.scaledIndex(plan, stride)
       g.emBin16(boAdd, scratch, ir)
-      Lval(kind: lvPtr, r: scratch, off: 0, width: elemW)
+      Lval(kind: lvPtr, r: scratch, off: 0, width: g.accessWidth(c))
     of PatC:
       # `(pat p idx)` — the element size is a SHIFT here, not a scale in an
       # address mode, because this machine has no scaled addressing at all.
@@ -389,6 +437,10 @@ proc emitValue(g: var CodeGen; c: Cursor; dst: Reg) =
     of InReg: g.emMovw(dst, home.r)
     of NamedStack: g.emLoadSlot(dst, home.name)
     else: refuse(c, "a read of `" & symName(c) & "`, whose location is " & $home.kind)
+  of StrLit:
+    refuse(c, "a string literal — this is a HARVARD machine, so a constant lives " &
+              "in flash and is read by `lpm` rather than by `ld`, which is a " &
+              "different address space and a different instruction (M6)")
   of TagLit:
     case c.exprKind
     of SufC:
@@ -435,16 +487,10 @@ proc emitValue(g: var CodeGen; c: Cursor; dst: Reg) =
                   $(toSlot.size * 8) & " bits)")
       g.emitValue(v, dst)
     of AddrC, HaddrC:
+      # `emitAddrOf` covers every case: a local (already spilled by the analyser,
+      # since taking an address marks it `AddrTaken`) and a field or element.
       var v = c; inc v
-      if v.kind != Symbol:
-        refuse(c, "the address of anything but a local")
-      let name = symName(v)
-      let home = g.plan.locationOfSym(name, cursorToPosition(g.buf[], v))
-      if home.kind != NamedStack:
-        lengError c, "AVR: `" & name & "` had its address taken but lives in " &
-                  $home.kind & " — the allocator was supposed to spill it",
-                  lengInfo(c)
-      g.emLeaSlot(dst, home.name)
+      g.emitAddrOf(v, dst)
     of DotC:
       g.emLoadNode(dst, c, g.accessWidth(c))
     of AtC:
@@ -456,7 +502,7 @@ proc emitValue(g: var CodeGen; c: Cursor; dst: Reg) =
         var base = c; inc base
         g.emitAddrOf(base, dst)
         let plan = g.classifyB(idx, dst)
-        let ir = g.scaledIndex(plan, w)
+        let ir = g.scaledIndex(plan, g.strideOf(c))
         g.emBin16(boAdd, dst, ir)
         g.emLoadPtr(dst, dst, 0, w)
     of DerefC:
@@ -507,6 +553,9 @@ proc emitCall(g: var CodeGen; c: Cursor; dst: Reg; wantResult: bool) =
     refuse(c, "a call with " & $args.len & " arguments — this target passes " &
               $g.md.intArgRegs.len & " pairs in registers and the rest on the " &
               "stack (M5)")
+
+  for i in 0 ..< args.len:
+    g.refuseAggr(args[i], "argument " & $i & " of `" & callee & "`")
 
   var slots: seq[string] = @[]
   for i in 0 ..< args.len:
@@ -584,6 +633,7 @@ proc emitAggrInit(g: var CodeGen; c: Cursor; slot: string) =
           refuse(kv, "an object constructor without a field name")
         let fieldName = symName(kv)
         skip kv                                  # the field name
+        g.refuseAggr(kv, "the value of field `" & fieldName & "`")
         let w = g.accessWidth(kv)
         g.emitValue(kv, ValueBridge)
         g.emStoreField(slot, fieldName, ValueBridge, w)
@@ -594,6 +644,7 @@ proc emitAggrInit(g: var CodeGen; c: Cursor; slot: string) =
     e.into:
       skip e                                     # the type
       while e.hasMore:
+        g.refuseAggr(e, "element " & $i & " of this array constructor")
         let w = g.accessWidth(e)
         g.emitValue(e, ValueBridge)
         g.emStoreElem(slot, i, ValueBridge, w)
@@ -620,6 +671,10 @@ proc genVarDecl(g: var CodeGen; c: Cursor) =
     lengError c, "AVR: the local `" & name & "` was given no storage",
               lengInfo(c)
   if v.hasMore and v.kind != DotToken:
+    if not (v.kind == TagLit and v.exprKind in {OconstrC, AconstrC}):
+      # An aggregate INITIALIZER that is not a constructor is a COPY —
+      # `var b = a` where both are structs — and copying is not implemented.
+      g.refuseAggr(v, "the initializer of `" & name & "`")
     if v.kind == TagLit and v.exprKind in {OconstrC, AconstrC}:
       if home.kind != NamedStack:
         lengError c, "an aggregate local must live in a frame slot", lengInfo(c)
@@ -634,6 +689,7 @@ proc genAsgn(g: var CodeGen; c: Cursor) =
   inc lhs
   var rhs = lhs
   skip rhs
+  g.refuseAggr(rhs, "the right-hand side of this assignment")
   if lhs.kind == Symbol:
     let name = symName(lhs)
     let pos = cursorToPosition(g.buf[], lhs)
@@ -670,6 +726,7 @@ proc genRet(g: var CodeGen; c: Cursor) =
   var v = c
   inc v
   if v.hasMore and v.kind != DotToken:
+    g.refuseAggr(v, "this returned value")
     g.emitValue(v, g.md.intRetReg)
   g.retLabelUsed2 = true
   g.emJmp(g.retLabel2)
@@ -900,6 +957,12 @@ proc genProcAvr*(g: var CodeGen; info: ProcInfo) =
         var tc = params[i].typ
         g.genTypeBodyAvr(tc)
   if hasResult:
+    var rtc = rt
+    if typeToSlot(rtc).cls == AMem:
+      lengError info.decl,
+        "AVR: `" & info.asmName & "` returns an aggregate — that is a hidden " &
+        "pointer argument and a copy at every `ret`, neither of which is " &
+        "implemented yet (see M5 in doc/internals/avr.md)", lengInfo(info.decl)
     g.checkWidth(rt, "the result of `" & info.asmName & "`")
     g.ab.tree NifasmDecl.ResultD:
       g.ab.symDef synth("ret.0")
@@ -921,6 +984,12 @@ proc genProcAvr*(g: var CodeGen; info: ProcInfo) =
     g.rb.bindParam(g.md.intArgRegs[i], paramName(i))
   for i in 0 ..< params.len:
     let nm = params[i].name
+    var ptc = params[i].typ
+    if typeToSlot(ptc).cls == AMem:
+      lengError info.decl,
+        "AVR: the parameter `" & nm & "` is an aggregate — passing one is a copy " &
+        "or a hidden pointer, neither implemented yet (see M5 in " &
+        "doc/internals/avr.md)", lengInfo(info.decl)
     g.checkWidth(params[i].typ, "the parameter `" & nm & "`")
     let home = g.plan.homeOfSym(nm)
     let src = g.md.intArgRegs[i]

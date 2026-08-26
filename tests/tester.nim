@@ -1146,6 +1146,74 @@ proc rv32AsmTests() =
   echo passed, " / ", fixtures.len, " RV32 assembler tests successful"
 
 
+proc rv32CorpusSweep() =
+  ## Drive the WHOLE 32-bit Cortex-M corpus through RV32 and assert the property
+  ## that actually matters for a partial backend: **every fixture either refuses
+  ## by name or gets the right answer.** A wrong answer is not a missing feature,
+  ## it is a bug, and the difference is invisible from a pass count alone.
+  ##
+  ## It found ten of them the first time it ran — struct copies, struct
+  ## arguments and struct returns all look like ordinary moves to a value core
+  ## that only knows how to move one word, so they came out wrong rather than
+  ## missing. Every one is a named refusal now.
+  ##
+  ## `MinPass` is a ratchet, not a target: it exists so that a change which turns
+  ## a working fixture into a refusal is noticed.
+  const MinPass = 40
+  let qemu = findExe(rvSim)
+  if qemu.len == 0:
+    echo rvSim, " not found - skipping the RV32 corpus sweep"
+    return
+  let arkhamExe = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  let work = getTempDir() / "rv32sweep"
+  createDir work
+  var passed = 0
+  var refused = 0
+  var wrong: seq[string] = @[]
+  for file in walkFiles("tests/arkham_m/*.c.nif"):
+    let stem = file.extractFilename.changeFileExt("").changeFileExt("")
+    let ecFile = "tests/arkham_m" / (stem & ".exitcode")
+    if not fileExists(ecFile): continue
+    let asmFile = work / (stem & ".asm.nif")
+    let elf = work / (stem & ".elf")
+    removeFile elf
+    let (aOut, aCode) = runProgram(arkhamExe,
+      @["-a:rv32", "-o:" & asmFile, file])
+    if aCode != 0:
+      # A refusal must SAY something. A silent nonzero exit is indistinguishable
+      # from a crash, which is the thing this sweep exists to tell apart.
+      if not aOut.contains("RV32") and not aOut.contains("nifasm"):
+        quit "FAILURE rv32 sweep: `" & stem & "` was rejected without naming a " &
+             "reason:\n" & aOut
+      inc refused
+      continue
+    let (nOut, nCode) = runProgram(nifasmExe, @["-o:" & elf, asmFile])
+    if nCode != 0:
+      if not nOut.contains("RV32") and not nOut.contains("nifasm"):
+        quit "FAILURE rv32 sweep: nifasm rejected `" & stem & "` without naming " &
+             "a reason:\n" & nOut
+      inc refused
+      continue
+    let (_, code) = runProgram(qemu, @[elf])
+    if code == timeoutExitCode:
+      wrong.add stem & " (timeout)"
+      continue
+    let want = parseInt(readFile(ecFile).strip)
+    if code == want: inc passed
+    else: wrong.add stem & " (got " & $code & ", want " & $want & ")"
+  removeDir work
+  if wrong.len > 0:
+    quit "FAILURE rv32 sweep: " & $wrong.len & " fixture(s) produced a WRONG " &
+         "ANSWER rather than a refusal:\n  " & wrong.join("\n  ")
+  if passed < MinPass:
+    quit "FAILURE rv32 sweep: only " & $passed & " fixtures pass, down from " &
+         $MinPass & " — something that used to work now refuses"
+  echo passed, " / ", passed + refused,
+       " Cortex-M corpus fixtures run on RV32 (", refused,
+       " refused by name, 0 wrong answers)"
+
+
 proc arkhamRv32Tests() =
   ## The RV32 Leng corpus: `arkham -a:rv32` → `nifasm` → `qemu-riscv32`, checking
   ## each fixture's exit code against its `.exitcode` file.
@@ -1910,6 +1978,7 @@ avrAsmTests()
 rv32SelfTest()
 rv32AsmTests()
 arkhamRv32Tests()
+rv32CorpusSweep()
 arkhamAvrTests()
 arkhamAvrRejections()
 

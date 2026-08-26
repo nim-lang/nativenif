@@ -45,7 +45,7 @@ proc writeRv32Image*(a: var GenContext; code: seq[byte]; entryOff: int): seq[byt
 
   if a.bssSymInits.len > 0:
     quit "nifasm: RV32 globals initialized with another symbol's address are " &
-         "not implemented yet (see R5 in doc/internals/rv32.md)"
+         "not implemented yet (see R5b in doc/internals/rv32.md)"
 
   # The header's size depends on how many segments there are, and every address
   # below is measured from it — so the count has to be settled first. Getting
@@ -58,11 +58,39 @@ proc writeRv32Image*(a: var GenContext; code: seq[byte]; entryOff: int): seq[byt
   # A whole page above the code, not merely past it — see the module header.
   let dataVa = LoadBase + uint32(PageSize) + uint32(dataOff)
 
-  var segs = @[elf32.Segment(vaddr: codeVa, data: code, memSize: code.len,
+  # Every `(adr … <gvar>)` is a `lui`+`addi` pair whose value is the global's
+  # address, and that address is only known now: `sym.size` is the global's byte
+  # offset within the data image — the same field the ELF64 and Mach-O writers
+  # read — and `dataVa` is where that image lands.
+  #
+  # The `+0x800` is `addi`'s SIGNED immediate again: a low half above 0x7FF is a
+  # negative addend, so the upper half has to be one higher. Omitting it puts
+  # every second global 0x1000 away from itself.
+  var patched = code
+  for (pos, sym) in a.gvarSites:
+    if pos + 8 > patched.len: continue
+    let v = dataVa + uint32(sym.size)
+    let hi = (v + 0x800) shr 12
+    let lo = v - (hi shl 12)
+    var w0 = uint32(patched[pos]) or (uint32(patched[pos+1]) shl 8) or
+             (uint32(patched[pos+2]) shl 16) or (uint32(patched[pos+3]) shl 24)
+    w0 = (w0 and 0x00000FFF'u32) or ((hi and 0xFFFFF) shl 12)
+    var w1 = uint32(patched[pos+4]) or (uint32(patched[pos+5]) shl 8) or
+             (uint32(patched[pos+6]) shl 16) or (uint32(patched[pos+7]) shl 24)
+    w1 = (w1 and 0x000FFFFF'u32) or ((lo and 0xFFF) shl 20)
+    for i in 0 ..< 4:
+      patched[pos + i] = byte((w0 shr (8 * i)) and 0xFF)
+      patched[pos + 4 + i] = byte((w1 shr (8 * i)) and 0xFF)
+
+  var segs = @[elf32.Segment(vaddr: codeVa, data: patched, memSize: patched.len,
                              flags: elf32.PF_R or elf32.PF_X)]
-  if dataImage.len > 0:
+  if a.bssOffset > 0:
+    # `p_memsz` is the whole of the globals and `p_filesz` only the part with a
+    # nonzero image: a segment whose memory size exceeds its file size is
+    # zero-filled by definition, which is what makes `.bss` free here. A
+    # freestanding target has to copy and zero it by hand; this one does not.
     segs.add elf32.Segment(vaddr: dataVa, data: dataImage,
-                           memSize: dataImage.len,
+                           memSize: a.bssOffset,
                            flags: elf32.PF_R or elf32.PF_W)
 
   # `entryTag = 0`: bit 0 of an ARM code address is the Thumb-state marker, and

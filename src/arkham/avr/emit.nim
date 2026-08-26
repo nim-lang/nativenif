@@ -204,6 +204,16 @@ proc emStoreElem*(g: var CodeGen; slot: string; idx: int; s: Reg; width: int) =
         g.ab.intLit 1
       g.emHi s
 
+proc emLeaNode*(g: var CodeGen; d: Reg; node: Cursor) =
+  ## The ADDRESS of a folded access. `(dot …)`/`(at …)` are memory operands to
+  ## nifasm, so `(lea …)` over one resolves against whatever base the fold gave.
+  ## A destination below r16 goes through the value bridge, as every offset does.
+  if ldiOk(d):
+    g.ab.tree LeaAvr: (g.emPair d; g.emMemNode node)
+  else:
+    g.ab.tree LeaAvr: (g.emPair ValueBridge; g.emMemNode node)
+    g.emMovw(d, ValueBridge)
+
 proc emLoadNode*(g: var CodeGen; d: Reg; node: Cursor; width: int) =
   ## A 16-bit value out of a folded address is TWO `ldb`s, and the `+1` for the
   ## high byte rides in the same instruction's displacement field — which is why
@@ -453,6 +463,14 @@ proc genTypeBodyAvr*(g: var CodeGen; c: var Cursor) =
         skip c                                  # the base slot
         g.ab.objectType:
           while c.hasMore:
+            # Every child must be a `(fld …)`. An object may also contain a
+            # `(union …)` or an anonymous group, and walking one of those as a
+            # field asks a tag for its symbol name — which used to be an
+            # assertion failure rather than a diagnostic.
+            if c.substructureKind != FldU:
+              lengError c, "AVR: an object member that is not a plain field " &
+                        "(a union or an anonymous group) is not implemented yet " &
+                        "(see M5 in doc/internals/avr.md)", lengInfo(c)
             var f = c
             f.into:
               let fname = symName(f); inc f

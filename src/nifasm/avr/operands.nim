@@ -365,7 +365,12 @@ proc parseOperandAvr*(n: var Cursor; ctx: var GenContext): OperandAvr =
            baseOp.typ.kind == TypeKind.ArrayT:
         elemType = baseOp.typ.elem; baseMem = baseOp.mem
       elif baseOp.typ != nil and baseOp.typ.kind in {TypeKind.PtrT, TypeKind.AptrT}:
-        elemType = resolvedBase(baseOp.typ, ctx, n)
+        # A NESTED `(at …)`: the inner fold typed itself `ptr <row>`, and
+        # indexing that again indexes WITHIN the row — so the stride is the
+        # row's element, not the row. Reading it as the row strides by the whole
+        # inner array and lands on the wrong element of the wrong one.
+        let bt = resolvedBase(baseOp.typ, ctx, n)
+        elemType = (if bt != nil and bt.kind == TypeKind.ArrayT: bt.elem else: bt)
         if baseOp.kind == okMem: baseMem = baseOp.mem
         else: baseMem = AvrMem(kind: amPtr, p: ptrRegOf(baseOp.pair, n), disp: 0)
       else:

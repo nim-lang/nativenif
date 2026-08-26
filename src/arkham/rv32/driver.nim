@@ -25,16 +25,9 @@ import gen
 proc rejectForRv32(g: CodeGen) =
   ## Everything this backend does not implement, refused BY NAME before a single
   ## instruction is emitted.
-  for name, decl in g.prog.globals:
-    lengError decl, "RV32: the global `" & name & "` is not implemented yet " &
-                    "(see R5 in doc/internals/rv32.md)", lengInfo(decl)
   for name, decl in g.prog.tvars:
     lengError decl, "RV32: thread-local storage is not implemented yet: `" &
                     name & "`", lengInfo(decl)
-  if g.prog.syscalls.len > 0:
-    lengError default(Cursor),
-      "RV32: a syscall is `(ecall)` with the number in a7, and the emitter does " &
-      "not lower one yet (see R5 in doc/internals/rv32.md)"
 
 proc generateRv32*(buf: var TokenBuf; inputPath: string; tags: TagPool): string =
   ## Compile a parsed Leng module to RV32 asm-NIF, which nifasm's `rv32` target
@@ -48,6 +41,17 @@ proc generateRv32*(buf: var TokenBuf; inputPath: string; tags: TagPool): string 
   g.adoptProgram()
   g.ab.tree StmtsRv:
     g.ab.tree NifasmDecl.ArchD: g.ab.ident "rv32"
+    # No `(type …)` declarations: `genTypeBodyRv` INLINES a named type wherever
+    # it is used, so nifasm sees the layout at the point it needs it. That costs
+    # some asm-NIF size and buys one less thing to keep in agreement.
+    for name, decl in g.prog.globals:
+      g.genGlobalRv(name, decl)
+    for sp in g.prog.syscalls:            # one shim each, called like any proc
+      g.emitSyscallShim(sp)
     for info in g.prog.procs:
       g.genProcRv(info)
+    for (nm, bytes) in g.rodata:
+      g.ab.tree NifasmDecl.RodataD:
+        g.ab.symDef nm
+        g.ab.str bytes
   result = g.ab.render("." & g.prog.thisModuleSuffix)

@@ -159,6 +159,16 @@ The bug worth recording: scaling a variable index in place destroys the index.
 by two — so the read got the wrong element AND `i` came back multiplied by four.
 `scaledIndex` copies into a bridge first whenever the index is not already in one.
 
+### What the RV32 sweep found here too
+
+Three of the bugs `rv32CorpusSweep` turned up were in code this backend shares
+the shape of, and were fixed in both: parking a binary op's second operand into
+the destination (which destroys the local whose home it is), taking a nested
+array's VALUE where its address was wanted, and asking a tag for its symbol name
+when an object contains a union. AVR has no corpus wide enough to have found
+them on its own — its word is 16 bits, so the 32-bit fixtures refuse on width
+long before they reach any of this.
+
 ## Target
 
 | | |
