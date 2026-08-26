@@ -214,6 +214,41 @@ proc emLeaNode*(g: var CodeGen; d: Reg; node: Cursor) =
     g.ab.tree LeaAvr: (g.emPair ValueBridge; g.emMemNode node)
     g.emMovw(d, ValueBridge)
 
+proc emLoadByteAt*(g: var CodeGen; d: Reg; lvSlotName: string; off: int) =
+  ## ONE byte out of a frame slot, into the low half of `d`. An aggregate copy on
+  ## this machine moves bytes: the word is two of them and the odd sizes are
+  ## common, so a byte at a time is both simplest and always right.
+  g.ab.tree LdbAvr:
+    g.emLo d
+    g.ab.tree MemX: (g.ab.sym lvSlotName; g.ab.intLit off)
+
+proc emStoreByteAt*(g: var CodeGen; lvSlotName: string; off: int; s: Reg) =
+  g.ab.tree StbAvr:
+    g.ab.tree MemX: (g.ab.sym lvSlotName; g.ab.intLit off)
+    g.emLo s
+
+proc emLoadByteNode*(g: var CodeGen; d: Reg; node: Cursor; off: int) =
+  g.ab.tree LdbAvr:
+    g.emLo d
+    g.ab.tree MemX: (g.emMemNode node; g.ab.intLit off)
+
+proc emStoreByteNode*(g: var CodeGen; node: Cursor; off: int; s: Reg) =
+  g.ab.tree StbAvr:
+    g.ab.tree MemX: (g.emMemNode node; g.ab.intLit off)
+    g.emLo s
+
+proc emLoadBytePtr*(g: var CodeGen; d, p: Reg; off: int) =
+  g.emMovw(ProduceBridge, p)
+  g.ab.tree LdbAvr:
+    g.emLo d
+    g.ab.tree MemX: (g.emPair ProduceBridge; g.ab.intLit off)
+
+proc emStoreBytePtr*(g: var CodeGen; p: Reg; off: int; s: Reg) =
+  g.emMovw(ProduceBridge, p)
+  g.ab.tree StbAvr:
+    g.ab.tree MemX: (g.emPair ProduceBridge; g.ab.intLit off)
+    g.emLo s
+
 proc emLoadNode*(g: var CodeGen; d: Reg; node: Cursor; width: int) =
   ## A 16-bit value out of a folded address is TWO `ldb`s, and the `+1` for the
   ## high byte rides in the same instruction's displacement field — which is why
@@ -508,4 +543,14 @@ proc emSlotVar*(g: var CodeGen; name: string; typeCur: Cursor) =
   g.ab.keyword SO
   var tc = typeCur
   g.genTypeBodyAvr(tc)
+  g.ab.close()
+
+proc emPtrSlot*(g: var CodeGen; name: string) =
+  ## A two-byte slot the EMITTER minted for an ADDRESS — the parked hidden
+  ## result pointer. Typed `(ptr (void))` rather than `(u 16)` so nifasm knows
+  ## what it holds even though the two have the same size here.
+  g.ab.open NifasmDecl.VarD
+  g.ab.symDef name
+  g.ab.keyword SO
+  g.ab.ptrType: g.ab.voidType()
   g.ab.close()

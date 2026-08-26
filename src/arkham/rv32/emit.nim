@@ -182,6 +182,34 @@ proc emLeaNode*(g: var CodeGen; d: Reg; node: Cursor) =
   ## the fold resolved to.
   g.ab.tree LeaRv: (g.emReg d; g.emMemNode node)
 
+proc emLoadSlotOff*(g: var CodeGen; d: Reg; name: string; off: int) =
+  g.ab.tree LwrRv:
+    g.emReg d
+    g.ab.tree MemX: (g.ab.sym name; g.ab.intLit off)
+
+proc emStoreSlotOff*(g: var CodeGen; name: string; off: int; s: Reg) =
+  g.ab.tree SwrRv:
+    g.ab.tree MemX: (g.ab.sym name; g.ab.intLit off)
+    g.emReg s
+
+proc emLoadNodeOff*(g: var CodeGen; d: Reg; node: Cursor; off: int; width: int) =
+  let t = case width
+          of 1: LburRv
+          of 2: LhurRv
+          else: LwrRv
+  g.ab.tree t:
+    g.emReg d
+    g.ab.tree MemX: (g.emMemNode node; g.ab.intLit off)
+
+proc emStoreNodeOff*(g: var CodeGen; node: Cursor; off: int; s: Reg; width: int) =
+  let t = case width
+          of 1: SbrRv
+          of 2: Shr32Rv
+          else: SwrRv
+  g.ab.tree t:
+    g.ab.tree MemX: (g.emMemNode node; g.ab.intLit off)
+    g.emReg s
+
 proc emLoadNode*(g: var CodeGen; d: Reg; node: Cursor; width: int; signed: bool) =
   let t = case width
           of 1: (if signed: LbrRv else: LburRv)

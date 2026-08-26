@@ -43,6 +43,17 @@ import emit
 
 proc emitValue(g: var CodeGen; c: Cursor; dst: Reg)
 proc genStmt(g: var CodeGen; c: Cursor)
+proc emitCall(g: var CodeGen; c: Cursor; dst: Reg; wantResult: bool;
+              aggrDst = "")
+
+
+var gRetAggrSlot = ""
+  ## The frame slot holding this proc's hidden result pointer, or empty. A
+  ## module-level `var` rather than a `CodeGen` field: `CodeGen` is shared with
+  ## three other backends that have no such thing, and arkham compiles one proc
+  ## at a time — the reasoning `gArkhamCurProc` already rests on.
+
+template retAggrSlot(g: CodeGen): string = gRetAggrSlot
 
 proc refuse(c: Cursor; what: string) {.noreturn.} =
   lengError c, "AVR: " & what & " is not implemented yet " &
@@ -246,18 +257,32 @@ proc accessWidth(g: var CodeGen; c: Cursor): int =
   let s = g.exprSlot(c)
   if s.size <= 0 or s.size > 2: 2 else: s.size
 
+proc isPow2(n: int): bool {.inline.} = n > 0 and (n and (n - 1)) == 0
+
+proc log2i(n: int): int =
+  var w = n
+  while w > 1: (w = w shr 1; inc result)
+
 proc scaledIndex(g: var CodeGen; p: BPlan; elemW: int): Reg =
-  ## The index, scaled by the element size and left somewhere it is safe to have
-  ## scaled. `materializeB` may hand back a local's HOME pair, and shifting that
-  ## in place would destroy the local.
+  ## The index, scaled by the element size and left in the staging bridge.
+  ## `materializeB` may hand back a local's HOME pair, and shifting that in place
+  ## would destroy the local.
+  ##
+  ## The stride is NOT always a power of two — an array of three-word structs
+  ## strides by six — and shifting by `log2` of that quietly multiplies by four,
+  ## which is a wrong answer rather than a crash.
   result = g.materializeB(p)
   if elemW <= 1: return
-  if elemW != 2:
-    raiseAssert "arkham avr: element size " & $elemW & " is not a power of two"
   if result != StagingBridge:
     g.emMovw(StagingBridge, result)
     result = StagingBridge
-  g.emShl16(result, 1)
+  if isPow2(elemW):
+    g.emShl16(result, log2i(elemW))
+  else:
+    # A real multiply. Its accumulator is the value bridge, so the stride goes
+    # into the produce bridge — free here, since nothing is being addressed yet.
+    g.emLdi16(ProduceBridge, int64(elemW))
+    g.emMul16(result, ProduceBridge)
 
 proc strideOf(g: var CodeGen; c: Cursor): int =
   ## The size of what `c` denotes, UNCLAMPED. `accessWidth` caps at a pair
@@ -265,6 +290,32 @@ proc strideOf(g: var CodeGen; c: Cursor): int =
   ## two-word rows indexes by one word.
   let s = g.exprSlot(c)
   if s.size <= 0: 2 else: s.size
+
+proc emitAddrOf(g: var CodeGen; c: Cursor; dst: Reg)
+
+proc emitIndexedAddr(g: var CodeGen; c: Cursor; dst: Reg) =
+  ## The address of `(at base idx)` with a COMPUTED index. One procedure rather
+  ## than three copies, because the ordering is what goes wrong: the base address
+  ## and the scaled index are both live at the add, and a non-power-of-two stride
+  ## needs the multiply's own registers in between.
+  let stride = g.strideOf(c)
+  var base = c; inc base
+  var idx = base; skip idx
+  g.emitAddrOf(base, dst)
+  if isPow2(stride):
+    let plan = g.classifyB(idx, dst)
+    let ir = g.scaledIndex(plan, stride)
+    g.emBin16(boAdd, dst, ir)
+    return
+  let addrSlot = g.mintSlot(c)
+  g.emStoreSlot(addrSlot, dst)
+  let plan = g.classifyB(idx, dst)
+  var ir = g.scaledIndex(plan, stride)
+  if ir == dst:
+    g.emMovw(ProduceBridge, ir)
+    ir = ProduceBridge
+  g.emLoadSlot(dst, addrSlot)
+  g.emBin16(boAdd, dst, ir)
 
 proc emitAddrOf(g: var CodeGen; c: Cursor; dst: Reg) =
   ## The ADDRESS of an lvalue, in a pair.
@@ -291,12 +342,7 @@ proc emitAddrOf(g: var CodeGen; c: Cursor; dst: Reg) =
       if idx.kind in {IntLit, UIntLit}:
         g.emLeaNode(dst, c)
         return
-      let stride = g.strideOf(c)
-      var base = c; inc base
-      g.emitAddrOf(base, dst)
-      let plan = g.classifyB(idx, dst)
-      let ir = g.scaledIndex(plan, stride)
-      g.emBin16(boAdd, dst, ir)
+      g.emitIndexedAddr(c, dst)
       return
     of DerefC, HaddrC:
       var v = c; inc v
@@ -311,7 +357,12 @@ proc emitLval(g: var CodeGen; c: Cursor; scratch: Reg): Lval =
     let name = symName(c)
     let home = g.plan.locationOfSym(name, cursorToPosition(g.buf[], c))
     case home.kind
-    of InReg: Lval(kind: lvReg, r: home.r)
+    of InReg:
+      # A register-homed AGGREGATE is not the aggregate: it is a POINTER to one.
+      # The allocator only gives an aggregate a pair when Leng passed it by
+      # reference, which it does above `aggrByRefThreshold`.
+      if g.exprSlot(c).cls == AMem: Lval(kind: lvPtr, r: home.r, off: 0, width: 1)
+      else: Lval(kind: lvReg, r: home.r)
     of NamedStack: Lval(kind: lvSlot, slot: home.name)
     else: refuse(c, "a store to `" & name & "`, whose location is " & $home.kind)
   of TagLit:
@@ -327,12 +378,7 @@ proc emitLval(g: var CodeGen; c: Cursor; scratch: Reg): Lval =
       var idx = c; inc idx; skip idx
       if idx.kind in {IntLit, UIntLit}:
         return Lval(kind: lvNode, node: c, width: g.accessWidth(c))
-      let stride = g.strideOf(c)
-      var base = c; inc base
-      g.emitAddrOf(base, scratch)
-      let plan = g.classifyB(idx, scratch)
-      let ir = g.scaledIndex(plan, stride)
-      g.emBin16(boAdd, scratch, ir)
+      g.emitIndexedAddr(c, scratch)
       Lval(kind: lvPtr, r: scratch, off: 0, width: g.accessWidth(c))
     of PatC:
       # `(pat p idx)` — the element size is a SHIFT here, not a scale in an
@@ -349,6 +395,86 @@ proc emitLval(g: var CodeGen; c: Cursor; scratch: Reg): Lval =
       refuse(c, "a store to the expression `" & $c.exprKind & "`")
   else:
     refuse(c, "this store destination")
+
+# ── aggregate copy ──────────────────────────────────────────────────────────
+
+proc emitByteLoad(g: var CodeGen; lv: Lval; off: int; into: Reg) =
+  case lv.kind
+  of lvSlot: g.emLoadByteAt(into, lv.slot, off)
+  of lvNode: g.emLoadByteNode(into, lv.node, off)
+  of lvPtr: g.emLoadBytePtr(into, lv.r, off)
+  of lvReg: raiseAssert "arkham avr: an aggregate cannot live in a pair"
+
+proc emitByteStore(g: var CodeGen; lv: Lval; off: int; src: Reg) =
+  case lv.kind
+  of lvSlot: g.emStoreByteAt(lv.slot, off, src)
+  of lvNode: g.emStoreByteNode(lv.node, off, src)
+  of lvPtr: g.emStoreBytePtr(lv.r, off, src)
+  of lvReg: raiseAssert "arkham avr: an aggregate cannot live in a pair"
+
+proc emitAggrCopy(g: var CodeGen; dst, src: Lval; size: int) =
+  ## Copy `size` bytes, one at a time and fully unrolled.
+  ##
+  ## A byte at a time because this IS a byte machine — the word is two of them
+  ## and an odd size is common, so a word-at-a-time copy would need a tail for no
+  ## saving worth the code. Unrolled because a loop needs a counter and two live
+  ## pointers, which is more than the emitter owns; the sizes reaching here are
+  ## struct sizes, not buffer sizes.
+  const MaxUnroll = 32
+  if size > MaxUnroll:
+    lengError default(Cursor),
+      "AVR: an aggregate copy of " & $size & " bytes would unroll to " & $size &
+      " byte moves; a copy that large wants a runtime routine (see M5 in " &
+      "doc/internals/avr.md)"
+  # The data pair must be neither address pair. Choosing it against the
+  # destination alone is not enough: a load into the pair holding the SOURCE
+  # pointer destroys that pointer after the first byte.
+  let into = (if (dst.kind == lvPtr and dst.r == ValueBridge) or
+                 (src.kind == lvPtr and src.r == ValueBridge): StagingBridge
+              else: ValueBridge)
+  for off in 0 ..< size:
+    g.emitByteLoad(src, off, into)
+    g.emitByteStore(dst, off, into)
+
+proc mintAggrSlot(g: var CodeGen; size: int): string =
+  ## A frame slot sized to hold an aggregate, declared as an ARRAY OF BYTES: what
+  ## is wanted is `size` bytes, and repeating the type would make this a second
+  ## place the layout has to agree.
+  inc g.emitTmpSpills
+  result = SynthMark & "eagg" & $g.emitTmpSpills & ".0"
+  g.ab.open NifasmDecl.VarD
+  g.ab.symDef result
+  g.ab.keyword SO
+  g.ab.arrayType:
+    g.ab.uintType 8
+    g.ab.intLit size
+  g.ab.close()
+
+proc aggrSize(g: var CodeGen; c: Cursor): int =
+  let s = g.exprSlot(c)
+  if s.size <= 0: 0 else: s.size
+
+proc isAggrCall(g: var CodeGen; c: Cursor): bool =
+  c.kind == TagLit and c.exprKind == CallC and g.exprSlot(c).cls == AMem
+
+proc tryAggrAssign(g: var CodeGen; lhs, rhs: Cursor): bool =
+  if g.exprSlot(rhs).cls != AMem: return false
+  if g.isAggrCall(rhs):
+    # The callee writes THROUGH a pointer, so the destination is handed over
+    # rather than copied afterwards.
+    let dstLv = g.emitLval(lhs, ValueBridge)
+    if dstLv.kind != lvSlot:
+      refuse(lhs, "an aggregate call result stored anywhere but a frame slot")
+    g.emitCall(rhs, ValueBridge, wantResult = false, aggrDst = dstLv.slot)
+    return true
+  let size = g.aggrSize(rhs)
+  if size <= 0: refuse(rhs, "an aggregate of unknown size")
+  let srcLv = g.emitLval(rhs, StagingBridge)
+  let dstLv = g.emitLval(lhs, ValueBridge)
+  if srcLv.kind == lvPtr and dstLv.kind == lvPtr:
+    refuse(lhs, "an aggregate copy where BOTH sides are computed addresses")
+  g.emitAggrCopy(dstLv, srcLv, size)
+  true
 
 # ── expressions ─────────────────────────────────────────────────────────────
 
@@ -419,8 +545,6 @@ proc emitCmpValue(g: var CodeGen; c: Cursor; dst: Reg) =
   g.emBranch(invert(cond), lEnd)
   g.emLdi16(dst, 1)
   g.emLab(lEnd)
-
-proc emitCall(g: var CodeGen; c: Cursor; dst: Reg; wantResult: bool)
 
 proc emitValue(g: var CodeGen; c: Cursor; dst: Reg) =
   ## Materialize `c` into the pair `dst`.
@@ -499,11 +623,7 @@ proc emitValue(g: var CodeGen; c: Cursor; dst: Reg) =
       if idx.kind in {IntLit, UIntLit}:
         g.emLoadNode(dst, c, w)
       else:
-        var base = c; inc base
-        g.emitAddrOf(base, dst)
-        let plan = g.classifyB(idx, dst)
-        let ir = g.scaledIndex(plan, g.strideOf(c))
-        g.emBin16(boAdd, dst, ir)
+        g.emitIndexedAddr(c, dst)
         g.emLoadPtr(dst, dst, 0, w)
     of DerefC:
       let w = g.accessWidth(c)
@@ -527,7 +647,15 @@ proc emitValue(g: var CodeGen; c: Cursor; dst: Reg) =
 
 # ── calls ───────────────────────────────────────────────────────────────────
 
-proc emitCall(g: var CodeGen; c: Cursor; dst: Reg; wantResult: bool) =
+proc emitCall(g: var CodeGen; c: Cursor; dst: Reg; wantResult: bool;
+              aggrDst = "") =
+  ## `aggrDst` names the frame slot an AGGREGATE result must be written into.
+  ## This target's aggregate convention is by-REFERENCE at every size: an
+  ## aggregate argument is a pointer to a copy the caller made, and an aggregate
+  ## result is written through a hidden first pointer. Uniform, because arkham
+  ## owns both ends of every call here and one rule with no size threshold cannot
+  ## be applied differently by the two.
+  ##
   ## `(call f a b …)` — arguments into the ABI pairs, then `(prepare …)`.
   ##
   ## Every argument is parked in a slot first. That is heavier than the other
@@ -549,21 +677,6 @@ proc emitCall(g: var CodeGen; c: Cursor; dst: Reg; wantResult: bool) =
     while a.hasMore:
       args.add a
       skip a
-  if args.len > g.md.intArgRegs.len:
-    refuse(c, "a call with " & $args.len & " arguments — this target passes " &
-              $g.md.intArgRegs.len & " pairs in registers and the rest on the " &
-              "stack (M5)")
-
-  for i in 0 ..< args.len:
-    g.refuseAggr(args[i], "argument " & $i & " of `" & callee & "`")
-
-  var slots: seq[string] = @[]
-  for i in 0 ..< args.len:
-    let s = g.mintSlot(args[i])
-    g.emitValue(args[i], ValueBridge)
-    g.emStoreSlot(s, ValueBridge)
-    slots.add s
-
   let target = g.callTarget.getOrDefault(callee)
   if target.asmName.len == 0:
     refuse(c, "a call to `" & callee & "`, which is not a known proc")
@@ -572,22 +685,60 @@ proc emitCall(g: var CodeGen; c: Cursor; dst: Reg; wantResult: bool) =
     refuse(c, "a call to `" & callee & "`: externs, syscalls and inlined " &
               "intrinsics have no meaning on a bare-metal target")
 
+  var rtc = target.retType
+  # A VOID result is `.` in the decl and `slotOf` of that answers `AMem`, so
+  # without the two guards every call to a void proc would think it needed a
+  # hidden result pointer and shift every argument by one.
+  let retsAggr = not cursorIsNil(rtc) and rtc.kind != DotToken and
+                 not (rtc.kind == TagLit and rtc.typeKind == VoidT) and
+                 slotOf(g.prog, rtc).cls == AMem
+  if retsAggr and aggrDst.len == 0:
+    refuse(c, "the result of `" & callee & "`, which is an aggregate, used " &
+              "somewhere with no place to put it")
+  let shift = if retsAggr: 1 else: 0
+  if args.len + shift > g.md.intArgRegs.len:
+    refuse(c, "a call with " & $args.len & " arguments plus a hidden result " &
+              "pointer — more than this target passes in registers (M5)")
+
+  var slots: seq[string] = @[]
+  for i in 0 ..< args.len:
+    let sl = g.mintSlot(args[i])
+    if g.exprSlot(args[i]).cls == AMem:
+      # The callee gets a pointer to the CALLER's copy, so it may write through
+      # it without the caller seeing that.
+      let size = g.aggrSize(args[i])
+      let tmp = g.mintAggrSlot(size)
+      let srcLv = g.emitLval(args[i], StagingBridge)
+      g.emitAggrCopy(Lval(kind: lvSlot, slot: tmp), srcLv, size)
+      g.emLeaSlot(ValueBridge, tmp)
+    else:
+      g.emitValue(args[i], ValueBridge)
+    g.emStoreSlot(sl, ValueBridge)
+    slots.add sl
+
   # The declarative call ABI: arguments are written to `(arg pN.0)` by NAME and
   # the result read from `(res ret.0)`, so nifasm checks both against the
   # callee's signature. Positional names, because that is what this backend
   # emits at the other end too — see `genProcAvr`.
   g.ab.open PrepareAvr
   g.ab.sym target.asmName
+  if retsAggr:
+    g.emLeaSlot(ValueBridge, aggrDst)
+    g.ab.tree MovwAvr:
+      g.ab.tree ArgX: g.ab.sym paramName(0)
+      g.emPair ValueBridge
   for i in 0 ..< args.len:
     g.emLoadSlot(ValueBridge, slots[i])
     g.ab.tree MovwAvr:
-      g.ab.tree ArgX: g.ab.sym paramName(i)
+      g.ab.tree ArgX: g.ab.sym paramName(i + shift)
       g.emPair ValueBridge
   g.ab.keyword CallAvr
   # The result is bound whether or not the caller wants it: nifasm checks that
   # every result the signature declares was read exactly once, and a discarded
   # call still returned one. It goes to the value bridge when nobody asked.
-  if not cursorIsNil(target.retType) and target.retType.typeKind != VoidT:
+  if retsAggr:
+    discard                                   # already written into `aggrDst`
+  elif not cursorIsNil(target.retType) and target.retType.typeKind != VoidT:
     g.ab.tree MovwAvr:
       (if wantResult: g.emPair dst else: g.emPair ValueBridge)
       g.ab.tree ResX: g.ab.sym synth("ret.0")
@@ -671,10 +822,18 @@ proc genVarDecl(g: var CodeGen; c: Cursor) =
     lengError c, "AVR: the local `" & name & "` was given no storage",
               lengInfo(c)
   if v.hasMore and v.kind != DotToken:
-    if not (v.kind == TagLit and v.exprKind in {OconstrC, AconstrC}):
-      # An aggregate INITIALIZER that is not a constructor is a COPY —
-      # `var b = a` where both are structs — and copying is not implemented.
-      g.refuseAggr(v, "the initializer of `" & name & "`")
+    if not (v.kind == TagLit and v.exprKind in {OconstrC, AconstrC}) and
+       g.exprSlot(v).cls == AMem:
+      if home.kind != NamedStack:
+        lengError c, "an aggregate local must live in a frame slot", lengInfo(c)
+      if g.isAggrCall(v):
+        # The callee writes straight into this local, with no copy in between.
+        g.emitCall(v, ValueBridge, wantResult = false, aggrDst = home.name)
+        return
+      # Any other aggregate initializer IS a copy.
+      let srcLv = g.emitLval(v, StagingBridge)
+      g.emitAggrCopy(Lval(kind: lvSlot, slot: home.name), srcLv, g.aggrSize(v))
+      return
     if v.kind == TagLit and v.exprKind in {OconstrC, AconstrC}:
       if home.kind != NamedStack:
         lengError c, "an aggregate local must live in a frame slot", lengInfo(c)
@@ -689,7 +848,7 @@ proc genAsgn(g: var CodeGen; c: Cursor) =
   inc lhs
   var rhs = lhs
   skip rhs
-  g.refuseAggr(rhs, "the right-hand side of this assignment")
+  if g.tryAggrAssign(lhs, rhs): return
   if lhs.kind == Symbol:
     let name = symName(lhs)
     let pos = cursorToPosition(g.buf[], lhs)
@@ -726,8 +885,18 @@ proc genRet(g: var CodeGen; c: Cursor) =
   var v = c
   inc v
   if v.hasMore and v.kind != DotToken:
-    g.refuseAggr(v, "this returned value")
-    g.emitValue(v, g.md.intRetReg)
+    if g.exprSlot(v).cls == AMem:
+      # An aggregate result is written through the hidden pointer the caller
+      # supplied, which the prologue parked in `retAggrSlot`.
+      if g.retAggrSlot.len == 0:
+        refuse(v, "an aggregate return from a proc with no hidden result pointer")
+      let size = g.aggrSize(v)
+      let srcLv = g.emitLval(v, ValueBridge)
+      g.emLoadSlot(StagingBridge, g.retAggrSlot)
+      g.emitAggrCopy(Lval(kind: lvPtr, r: StagingBridge, off: 0, width: 1),
+                     srcLv, size)
+    else:
+      g.emitValue(v, g.md.intRetReg)
   g.retLabelUsed2 = true
   g.emJmp(g.retLabel2)
 
@@ -791,7 +960,13 @@ proc genStmt(g: var CodeGen; c: Cursor) =
       lengError c, "AVR: `break` outside a loop", lengInfo(c)
     g.emJmp(g.loopEnds[^1])
   of CallS:
-    g.emitCall(c, ValueBridge, wantResult = false)
+    # A discarded call. An aggregate result still has to go SOMEWHERE — the
+    # callee writes through the pointer whether anyone reads it or not.
+    if g.exprSlot(c).cls == AMem:
+      let tmp = g.mintAggrSlot(g.aggrSize(c))
+      g.emitCall(c, ValueBridge, wantResult = false, aggrDst = tmp)
+    else:
+      g.emitCall(c, ValueBridge, wantResult = false)
   of DiscardS:
     var v = c
     inc v
@@ -935,34 +1110,48 @@ proc genProcAvr*(g: var CodeGen; info: ProcInfo) =
   g.plan = allocateProc(g.buf[], info.decl, an, g.prog, avrMachine, g.typeCtx)
 
   let params = g.collectParams(info.decl)
-  if params.len > g.md.intArgRegs.len:
-    lengError info.decl,
-      "AVR: this proc takes " & $params.len & " parameters; the target passes " &
-      $g.md.intArgRegs.len & " pairs in registers and the rest on the stack (M5)",
-      lengInfo(info.decl)
 
   # The return type, read off the decl.
   var rt = info.decl
   inc rt; inc rt; skip rt      # name, params → the result type
   let hasResult = not (rt.kind == DotToken or
                        (rt.kind == TagLit and rt.typeKind == VoidT))
+  var rtc0 = rt
+  let retsAggr = hasResult and slotOf(g.prog, rtc0).cls == AMem
+  gRetAggrSlot = ""
+  let shift = if retsAggr: 1 else: 0
+  if params.len + shift > g.md.intArgRegs.len:
+    lengError info.decl,
+      "AVR: this proc takes " & $params.len & " parameters" &
+      (if retsAggr: " plus a hidden result pointer" else: "") &
+      "; the target passes " & $g.md.intArgRegs.len &
+      " pairs in registers and the rest on the stack (M5)", lengInfo(info.decl)
 
   g.ab.open NifasmDecl.ProcD
   g.ab.symDef info.asmName
   g.ab.tree NifasmDecl.ParamsD:
+    if retsAggr:
+      # The hidden result pointer, first. Its TYPE is a pointer, not the
+      # aggregate — what arrives in the pair is an address.
+      g.ab.tree NifasmDecl.ParamD:
+        g.ab.symDef paramName(0)
+        g.ab.rawReg g.md.intArgRegs[0]
+        g.ab.ptrType: g.ab.voidType()
     for i in 0 ..< params.len:
       g.ab.tree NifasmDecl.ParamD:
-        g.ab.symDef paramName(i)
-        g.ab.rawReg g.md.intArgRegs[i]
-        var tc = params[i].typ
-        g.genTypeBodyAvr(tc)
-  if hasResult:
-    var rtc = rt
-    if typeToSlot(rtc).cls == AMem:
-      lengError info.decl,
-        "AVR: `" & info.asmName & "` returns an aggregate — that is a hidden " &
-        "pointer argument and a copy at every `ret`, neither of which is " &
-        "implemented yet (see M5 in doc/internals/avr.md)", lengInfo(info.decl)
+        g.ab.symDef paramName(i + shift)
+        g.ab.rawReg g.md.intArgRegs[i + shift]
+        var ptc0 = params[i].typ
+        if slotOf(g.prog, ptc0).cls == AMem:
+          # `(ptr <the object>)`, not `(ptr (void))`: nifasm folds `(dot p f)`
+          # against the POINTEE's layout, and an opaque pointer has none.
+          g.ab.ptrType:
+            var inner = params[i].typ
+            g.genTypeBodyAvr(inner)
+        else:
+          var tc = params[i].typ
+          g.genTypeBodyAvr(tc)
+  if hasResult and not retsAggr:
     g.checkWidth(rt, "the result of `" & info.asmName & "`")
     g.ab.tree NifasmDecl.ResultD:
       g.ab.symDef synth("ret.0")
@@ -980,31 +1169,57 @@ proc genProcAvr*(g: var CodeGen; info: ProcInfo) =
   swap(g.ab, side)
   g.rb.enterScope()
 
+  if retsAggr: g.rb.bindParam(g.md.intArgRegs[0], paramName(0))
   for i in 0 ..< params.len:
-    g.rb.bindParam(g.md.intArgRegs[i], paramName(i))
+    g.rb.bindParam(g.md.intArgRegs[i + shift], paramName(i + shift))
+  if retsAggr:
+    # Park the hidden pointer for the proc's lifetime: it is needed at every
+    # `ret`, and the first argument pair is caller-saved and also the first
+    # argument of any call the body makes.
+    gRetAggrSlot = SynthMark & "retp.0"
+    g.emPtrSlot gRetAggrSlot
+    g.emStoreSlot(gRetAggrSlot, g.md.intArgRegs[0])
+    g.ab.tree KillAvr: g.ab.sym paramName(0)
+    discard g.rb.takeBinding(g.md.intArgRegs[0])
   for i in 0 ..< params.len:
     let nm = params[i].name
     var ptc = params[i].typ
-    if typeToSlot(ptc).cls == AMem:
-      lengError info.decl,
-        "AVR: the parameter `" & nm & "` is an aggregate — passing one is a copy " &
-        "or a hidden pointer, neither implemented yet (see M5 in " &
-        "doc/internals/avr.md)", lengInfo(info.decl)
-    g.checkWidth(params[i].typ, "the parameter `" & nm & "`")
     let home = g.plan.homeOfSym(nm)
-    let src = g.md.intArgRegs[i]
-    case home.kind
-    of InReg:
-      g.emRegPairVar(nm, home.r, params[i].typ)   # kills `pN.0` when it IS this pair
-      g.emMovw(home.r, src)
-    of NamedStack:
+    let src = g.md.intArgRegs[i + shift]
+    if slotOf(g.prog, ptc).cls == AMem and home.kind == NamedStack:
+      # An aggregate arrives as a POINTER to the caller's copy and is copied into
+      # this proc's own slot. That is what makes it call-by-value: the callee may
+      # write to its parameter and the caller must not see it.
+      var stc = params[i].typ
       g.emSlotVar(home.name, params[i].typ)
-      g.emStoreSlot(home.name, src)
+      g.emMovw(StagingBridge, src)
+      g.emitAggrCopy(Lval(kind: lvSlot, slot: home.name),
+                     Lval(kind: lvPtr, r: StagingBridge, off: 0, width: 1),
+                     slotOf(g.prog, stc).size)
+    elif slotOf(g.prog, ptc).cls == AMem:
+      # The ALLOCATOR gave this aggregate a pair home, which it only does for one
+      # above `aggrByRefThreshold` — Leng passes those by reference already, so
+      # what arrives is a pointer and the pair holds it for the proc's life.
+      if home.kind != InReg:
+        lengError info.decl, "AVR: the aggregate parameter `" & nm &
+                  "` was given neither a slot nor a pair (" & $home.kind & ")",
+                  lengInfo(info.decl)
+      g.emRegPairVar(nm, home.r, params[i].typ)
+      g.emMovw(home.r, src)
     else:
-      lengError info.decl, "AVR: the parameter `" & nm & "` was given no storage",
-                lengInfo(info.decl)
-    if g.rb.boundName(src) == paramName(i):
-      g.ab.tree KillAvr: g.ab.sym paramName(i)
+      g.checkWidth(params[i].typ, "the parameter `" & nm & "`")
+      case home.kind
+      of InReg:
+        g.emRegPairVar(nm, home.r, params[i].typ)  # kills `pN.0` when it IS this pair
+        g.emMovw(home.r, src)
+      of NamedStack:
+        g.emSlotVar(home.name, params[i].typ)
+        g.emStoreSlot(home.name, src)
+      else:
+        lengError info.decl, "AVR: the parameter `" & nm & "` was given no storage",
+                  lengInfo(info.decl)
+    if g.rb.boundName(src) == paramName(i + shift):
+      g.ab.tree KillAvr: g.ab.sym paramName(i + shift)
       discard g.rb.takeBinding(src)
 
   var body = info.decl
