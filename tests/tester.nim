@@ -1222,8 +1222,10 @@ proc arkhamAvrRejections() =
     # that must never be silently truncated, since every load and store the
     # emitter writes moves exactly two bytes.
     ("tests/arkham_m/leafret.c.nif", "32 bits wide"),
-    # An aggregate: a shape the value core has no representation for at all.
-    ("tests/arkham_avr_reject/aggr.c.nif", "is an aggregate"),
+    # A 32-bit result, in its own file rather than borrowed from another
+    # corpus — the width refusal is the one a user meets first and it should not
+    # depend on what some other target's fixtures happen to contain.
+    ("tests/arkham_avr_reject/wide.c.nif", "32 bits wide"),
     # A shift by a value rather than a constant. Refused for what the MACHINE is
     # — there is no variable-shift instruction — not for a missing feature.
     ("tests/arkham_avr_reject/varshift.c.nif", "variable-shift"),

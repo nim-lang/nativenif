@@ -801,6 +801,7 @@ type
     NoAvrInst
     PrepareAvr = (ord(PrepareTagId), "prepare")  ## prepare block for function call
     MovAvr = (ord(MovTagId), "mov")  ## move instruction
+    LeaAvr = (ord(LeaTagId), "lea")  ## load effective address
     AddAvr = (ord(AddTagId), "add")  ## add instruction
     SubAvr = (ord(SubTagId), "sub")  ## subtract instruction
     AndAvr = (ord(AndTagId), "and")  ## bitwise and
@@ -881,7 +882,7 @@ type
     LpmpiAvr = (ord(LpmpiTagId), "lpmpi")  ## AVR: read the flash byte at Z and post-increment Z
 
 proc rawTagIsAvrInst*(raw: TagEnum): bool {.inline.} =
-  raw in {PrepareTagId, MovTagId, AddTagId, SubTagId, AndTagId, OrTagId, XorTagId, IncTagId, DecTagId, NegTagId, NotTagId, CmpTagId, JmpTagId, CallTagId, ExtcallTagId, RetTagId, PushTagId, PopTagId, NopTagId, AdrTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, RebindTagId, WithregTagId, ScopeTagId, BkptTagId, AndiTagId, OriTagId, LdiTagId, MovwTagId, AdcTagId, SbcTagId, SubiTagId, SbciTagId, CpiTagId, CpcTagId, CpseTagId, AdiwTagId, SbiwTagId, Lsl1TagId, Rol1TagId, Lsr1TagId, Ror1TagId, Asr1TagId, SwapTagId, MulbTagId, MulsbTagId, LdbTagId, StbTagId, LdpiTagId, StpiTagId, InbTagId, OutbTagId, SbrcTagId, SbrsTagId, IcallTagId, IjmpTagId, RetiTagId, SeiTagId, CliTagId, SleepTagId, WdrTagId, LpmTagId, LpmpiTagId}
+  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, AndTagId, OrTagId, XorTagId, IncTagId, DecTagId, NegTagId, NotTagId, CmpTagId, JmpTagId, CallTagId, ExtcallTagId, RetTagId, PushTagId, PopTagId, NopTagId, AdrTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, RebindTagId, WithregTagId, ScopeTagId, BkptTagId, AndiTagId, OriTagId, LdiTagId, MovwTagId, AdcTagId, SbcTagId, SubiTagId, SbciTagId, CpiTagId, CpcTagId, CpseTagId, AdiwTagId, SbiwTagId, Lsl1TagId, Rol1TagId, Lsr1TagId, Ror1TagId, Asr1TagId, SwapTagId, MulbTagId, MulsbTagId, LdbTagId, StbTagId, LdpiTagId, StpiTagId, InbTagId, OutbTagId, SbrcTagId, SbrsTagId, IcallTagId, IjmpTagId, RetiTagId, SeiTagId, CliTagId, SleepTagId, WdrTagId, LpmTagId, LpmpiTagId}
 
 type
   AvrReg* = enum
@@ -943,6 +944,7 @@ type
     NoRv32Inst
     PrepareRv = (ord(PrepareTagId), "prepare")  ## prepare block for function call
     MovRv = (ord(MovTagId), "mov")  ## move instruction
+    LeaRv = (ord(LeaTagId), "lea")  ## load effective address
     AddRv = (ord(AddTagId), "add")  ## add instruction
     SubRv = (ord(SubTagId), "sub")  ## subtract instruction
     Add3Rv = (ord(Add3TagId), "add3")  ## 3-operand add (D = A + B)
@@ -1008,7 +1010,7 @@ type
     SbrRv = (ord(SbrTagId), "sbr")  ## RV32: store a byte
 
 proc rawTagIsRv32Inst*(raw: TagEnum): bool {.inline.} =
-  raw in {PrepareTagId, MovTagId, AddTagId, SubTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, AdrTagId, LdrTagId, StrTagId, BTagId, BlTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, RebindTagId, WithregTagId, ScopeTagId, AndiTagId, OriTagId, LuiTagId, AuipcTagId, AddiTagId, SltiTagId, SltiuTagId, XoriTagId, SlliTagId, SrliTagId, SraiTagId, SltTagId, SltuTagId, DivsTagId, Divu3TagId, RemsTagId, RemuTagId, BeqrTagId, BnerTagId, BltrTagId, BgerTagId, BlturTagId, BgeurTagId, JalrTagId, EcallTagId, EbreakTagId, LwrTagId, LhrTagId, LhurTagId, LbrTagId, LburTagId, SwrTagId, Shr32TagId, SbrTagId}
+  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, AdrTagId, LdrTagId, StrTagId, BTagId, BlTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, RebindTagId, WithregTagId, ScopeTagId, AndiTagId, OriTagId, LuiTagId, AuipcTagId, AddiTagId, SltiTagId, SltiuTagId, XoriTagId, SlliTagId, SrliTagId, SraiTagId, SltTagId, SltuTagId, DivsTagId, Divu3TagId, RemsTagId, RemuTagId, BeqrTagId, BnerTagId, BltrTagId, BgerTagId, BlturTagId, BgeurTagId, JalrTagId, EcallTagId, EbreakTagId, LwrTagId, LhrTagId, LhurTagId, LbrTagId, LburTagId, SwrTagId, Shr32TagId, SbrTagId}
 
 type
   Rv32Reg* = enum

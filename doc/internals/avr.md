@@ -1,6 +1,6 @@
 # AVR support
 
-Status: **M0, M1, M2, M3, M4 complete.**
+Status: **M0–M4d complete.**
 
 | Milestone | State |
 |---|---|
@@ -12,8 +12,9 @@ Status: **M0, M1, M2, M3, M4 complete.**
 | M4a arkham machine model | done — `src/arkham/avr/machine.nim` |
 | M4b arkham driver + the return path | done — the program walk and the exit path |
 | M4c the value core | done — 8 Leng fixtures run end to end |
-| M4d aggregates, arrays, pointers | not started |
+| M4d aggregates, arrays, pointers | done — 5 more Leng fixtures |
 | M5 wide scalars, stack arguments, divide | not started |
+
 | M6 globals, flash constants, interrupts, startup | not started |
 
 ### What M4c has
@@ -135,6 +136,28 @@ instruction works on one half, so a 16-bit add is `(add (lo d) (lo s))` then
 `(adc (hi d) (hi s))`. Naming the halves is what lets that be written at all:
 spelling `(r25)` raw is rejected by the binding table, and rightly — it cannot
 tell that the register is the top of some local.
+
+### Pointers and aggregates
+
+A pointer is an ordinary value; `(addr x)` is the address of a local, which the
+analyser has already forced into a frame slot by marking it `AddrTaken`.
+
+**The offsets are nifasm's to compute, not arkham's.** A `(dot p f)` or
+`(at a 2)` is re-emitted as an asm-NIF memory operand of the same shape and
+folded by the assembler, which has the layout — the same division x86-64 already
+uses. So a field access is ONE instruction, and arkham never learns a field
+offset at all. A computed index is the exception: there is no scaled address mode
+on either of these machines, so arkham emits the shift and the add itself.
+
+Constructors are built from PARTS rather than copied from a node, because a
+constructor's destination is not written anywhere in the input — `(oconstr …)`
+names the fields and the local, never the access. They are also TOTAL: sem names
+every field of the type, so nothing has to be zeroed first.
+
+The bug worth recording: scaling a variable index in place destroys the index.
+`materializeB` may hand back a local's HOME register, and `a[i]` shifted it left
+by two — so the read got the wrong element AND `i` came back multiplied by four.
+`scaledIndex` copies into a bridge first whenever the index is not already in one.
 
 ## Target
 

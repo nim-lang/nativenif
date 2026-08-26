@@ -1,0 +1,22 @@
+(.nif27)
+(stmts
+ (type :A4.0 .
+  (array
+   (i 32)4))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :a.0 . A4.0 .)
+   (var :p.0 .
+    (aptr
+     (i 32))
+    (addr a.0))
+   (var :i.0 .
+    (i 32)3)
+   (asgn
+    (at a.0 3)42)
+   (ret
+    (pat p.0 i.0)))))

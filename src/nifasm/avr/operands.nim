@@ -295,6 +295,89 @@ proc parseOperandAvr*(n: var Cursor; ctx: var GenContext): OperandAvr =
       result.reg = if wantHigh: highOf(inner.pair) else: lowOf(inner.pair)
       result.typ = avrRegType()
       result.argName = inner.argName
+    elif t == DotTagId:
+      # `(dot <base> <field>)` — the field's offset folded onto the base address,
+      # resolved HERE because nifasm is what knows the layout. arkham names the
+      # field and never computes an offset for it.
+      var baseOp: OperandAvr
+      var fieldName: string
+      into n:
+        baseOp = parseOperandAvr(n, ctx)
+        if n.kind != Symbol: error("Expected field name in dot expression", n)
+        fieldName = getSym(n)
+        inc n
+        while n.hasMore: skip n
+      var objType: Type
+      var baseMem: AvrMem
+      if baseOp.typ != nil and baseOp.typ.kind == TypeKind.PtrT:
+        objType = resolvedBase(baseOp.typ, ctx, n)
+        if objType == nil or objType.kind notin {TypeKind.ObjectT, TypeKind.UnionT}:
+          error("AVR: `(dot …)` on a pointer to a non-object type", n)
+        if baseOp.kind == okMem: baseMem = baseOp.mem
+        else:
+          baseMem = AvrMem(kind: amPtr, p: ptrRegOf(baseOp.pair, n), disp: 0)
+      elif baseOp.kind == okMem and baseOp.typ != nil and
+           baseOp.typ.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
+        objType = baseOp.typ; baseMem = baseOp.mem
+      elif baseOp.kind == okMem and baseOp.typ != nil and
+           baseOp.typ.kind == TypeKind.StackOffT and
+           baseOp.typ.offType.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
+        objType = baseOp.typ.offType; baseMem = baseOp.mem
+      else:
+        error("AVR: `(dot …)` needs a pointer to an object or a stack object", n)
+      var fieldOffset = -1
+      var fieldType: Type = nil
+      for (fname, ftype, foff) in objType.fields:
+        if fname == fieldName:
+          fieldType = ftype; fieldOffset = foff; break
+      if fieldType == nil:
+        error("Field '" & fieldName & "' not found", n)
+      result.kind = okMem
+      result.mem = baseMem
+      result.mem.disp += fieldOffset
+      result.typ = Type(kind: TypeKind.PtrT, base: fieldType)
+      if result.mem.kind == amPtr and result.mem.p == avr.PX and result.mem.disp != 0:
+        error("AVR: X has no displaced form, so a field cannot be reached " &
+              "through it; use Z", n)
+      elif result.mem.kind == amPtr and
+           (result.mem.disp < 0 or result.mem.disp > MaxDisp):
+        error("AVR: the field offset " & $result.mem.disp & " is past the 63-byte " &
+              "displacement range of `ldd`/`std`", n)
+    elif t == AtTagId:
+      # A CONSTANT index folds; a computed one does not, because this machine has
+      # no scaled address mode — arkham adds that itself and hands over a `(mem …)`.
+      var baseOp: OperandAvr
+      var idxOp: OperandAvr
+      into n:
+        baseOp = parseOperandAvr(n, ctx)
+        idxOp = parseOperandAvr(n, ctx)
+        while n.hasMore: skip n
+      if idxOp.kind != okImm:
+        error("AVR: `(at …)` folds only a CONSTANT index — there is no scaled " &
+              "address mode here, so a computed one is arkham's to add", n)
+      var elemType: Type = nil
+      var baseMem: AvrMem
+      if baseOp.kind == okMem and baseOp.typ != nil and
+         baseOp.typ.kind == TypeKind.StackOffT and
+         baseOp.typ.offType.kind == TypeKind.ArrayT:
+        elemType = baseOp.typ.offType.elem; baseMem = baseOp.mem
+      elif baseOp.kind == okMem and baseOp.typ != nil and
+           baseOp.typ.kind == TypeKind.ArrayT:
+        elemType = baseOp.typ.elem; baseMem = baseOp.mem
+      elif baseOp.typ != nil and baseOp.typ.kind in {TypeKind.PtrT, TypeKind.AptrT}:
+        elemType = resolvedBase(baseOp.typ, ctx, n)
+        if baseOp.kind == okMem: baseMem = baseOp.mem
+        else: baseMem = AvrMem(kind: amPtr, p: ptrRegOf(baseOp.pair, n), disp: 0)
+      else:
+        error("AVR: `(at …)` needs an array or a pointer", n)
+      result.kind = okMem
+      result.mem = baseMem
+      result.mem.disp += int(idxOp.immVal) * asmSizeOf(elemType)
+      result.typ = Type(kind: TypeKind.PtrT, base: elemType)
+      if result.mem.kind == amPtr and
+         (result.mem.disp < 0 or result.mem.disp > MaxDisp):
+        error("AVR: the element offset " & $result.mem.disp & " is past the " &
+              "63-byte displacement range", n)
     elif t == CastTagId:
       inc n
       let castType = parseType(n, ctx.scope, ctx)

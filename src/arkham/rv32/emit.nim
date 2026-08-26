@@ -76,6 +76,107 @@ proc emLoadSlot*(g: var CodeGen; d: Reg; name: string) =
 proc emStoreSlot*(g: var CodeGen; name: string; s: Reg) =
   g.ab.tree SwrRv: (g.ab.sym name; g.emReg s)
 
+proc emLeaSlot*(g: var CodeGen; d: Reg; name: string) =
+  ## The ADDRESS of a frame slot — `addi d, sp, q`, with `q` nifasm's own number.
+  g.ab.tree LeaRv: (g.emReg d; g.ab.sym name)
+
+proc emLoadPtr*(g: var CodeGen; d, p: Reg; off: int; width: int; signed: bool) =
+  ## Load through a pointer register. One addressing mode, so this is one
+  ## instruction whatever the width — and the width is what decides whether the
+  ## high bits are copies of bit 7 or zeros, which is the whole reason a narrow
+  ## load has two spellings.
+  let t = case width
+          of 1: (if signed: LbrRv else: LburRv)
+          of 2: (if signed: LhrRv else: LhurRv)
+          else: LwrRv
+  g.ab.tree t:
+    g.emReg d
+    g.ab.tree MemX: (g.emReg p; g.ab.intLit off)
+
+proc emStorePtr*(g: var CodeGen; p: Reg; off: int; s: Reg; width: int) =
+  let t = case width
+          of 1: SbrRv
+          of 2: Shr32Rv
+          else: SwrRv
+  g.ab.tree t:
+    g.ab.tree MemX: (g.emReg p; g.ab.intLit off)
+    g.emReg s
+
+proc emMemNode*(g: var CodeGen; c: Cursor) =
+  ## Re-emit a Leng `(dot …)`/`(at …)` as the asm-NIF memory operand of the same
+  ## shape. The offsets are NOT computed here: nifasm has the layout, so arkham
+  ## names the field or the index and nothing more. Same division x86-64 uses.
+  case c.kind
+  of Symbol:
+    let name = symName(c)
+    let home = g.plan.locationOfSym(name, cursorToPosition(g.buf[], c))
+    if home.kind == NamedStack: g.ab.sym home.name
+    elif home.kind == InReg: g.emReg home.r      # already a pointer VALUE
+    else:
+      lengError c, "RV32: `" & name & "` cannot be addressed (" & $home.kind & ")",
+                lengInfo(c)
+  of TagLit:
+    case c.exprKind
+    of DotC:
+      var b = c; inc b
+      var f = b; skip f
+      g.ab.tree DotX:
+        g.emMemNode(b)
+        if f.kind != Symbol:
+          lengError c, "RV32: a field access needs a field name", lengInfo(c)
+        g.ab.sym symName(f)
+    of AtC:
+      var b = c; inc b
+      var i = b; skip i
+      g.ab.tree AtX:
+        g.emMemNode(b)
+        if i.kind == IntLit: g.ab.intLit intVal(i)
+        elif i.kind == UIntLit: g.ab.intLit cast[int64](uintVal(i))
+        else:
+          lengError c, "RV32: only a CONSTANT index folds into an address here",
+                    lengInfo(c)
+    of DerefC, HaddrC:
+      var v = c; inc v
+      g.emMemNode(v)
+    else:
+      lengError c, "RV32: `" & $c.exprKind & "` is not an address expression",
+                lengInfo(c)
+  else:
+    lengError c, "RV32: not an address expression", lengInfo(c)
+
+proc storeTagFor(width: int): Rv32Inst =
+  case width
+  of 1: SbrRv
+  of 2: Shr32Rv
+  else: SwrRv
+
+proc emStoreField*(g: var CodeGen; slot, field: string; s: Reg; width: int) =
+  ## Store into `slot.field`. Built from PARTS rather than copied from a node,
+  ## because a constructor's destination is not written anywhere in the input —
+  ## `(oconstr …)` names the fields and the local, never the access.
+  g.ab.tree storeTagFor(width):
+    g.ab.tree DotX: (g.ab.sym slot; g.ab.sym field)
+    g.emReg s
+
+proc emStoreElem*(g: var CodeGen; slot: string; idx: int; s: Reg; width: int) =
+  g.ab.tree storeTagFor(width):
+    g.ab.tree AtX: (g.ab.sym slot; g.ab.intLit idx)
+    g.emReg s
+
+proc emLoadNode*(g: var CodeGen; d: Reg; node: Cursor; width: int; signed: bool) =
+  let t = case width
+          of 1: (if signed: LbrRv else: LburRv)
+          of 2: (if signed: LhrRv else: LhurRv)
+          else: LwrRv
+  g.ab.tree t: (g.emReg d; g.emMemNode node)
+
+proc emStoreNode*(g: var CodeGen; node: Cursor; s: Reg; width: int) =
+  let t = case width
+          of 1: SbrRv
+          of 2: Shr32Rv
+          else: SwrRv
+  g.ab.tree t: (g.emMemNode node; g.emReg s)
+
 # ── ALU ─────────────────────────────────────────────────────────────────────
 
 type
@@ -227,9 +328,34 @@ proc genTypeBodyRv*(g: var CodeGen; c: var Cursor) =
     of AptrT:
       g.ab.aptrType: g.ab.voidType()
       skip c
+    of ArrayT:
+      c.into:
+        g.ab.arrayType:
+          g.genTypeBodyRv(c)
+          if c.kind == IntLit: (g.ab.intLit intVal(c); inc c)
+          else:
+            lengError c, "RV32: an array length must be a literal", lengInfo(c)
+    of ObjectT:
+      c.into:
+        # A `.` base means no inheritance; a Symbol base would need the base laid
+        # out first, which R5's aggregate work covers.
+        if c.kind == Symbol:
+          lengError c, "RV32: object inheritance is not implemented yet",
+                    lengInfo(c)
+        skip c                                  # the base slot
+        g.ab.objectType:
+          while c.hasMore:
+            var f = c
+            f.into:
+              let fname = symName(f); inc f
+              skip f                            # the field's pragmas
+              g.ab.fldDef fname:
+                g.genTypeBodyRv(f)
+              while f.hasMore: skip f
+            skip c
     else:
       lengError c, "RV32: the type `" & $c.typeKind & "` is not implemented yet " &
-                   "(R5: aggregates, arrays and function pointers)", lengInfo(c)
+                   "(R5: unions and function pointers)", lengInfo(c)
   else:
     lengError c, "RV32: unsupported type", lengInfo(c)
 

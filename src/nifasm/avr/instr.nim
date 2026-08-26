@@ -623,6 +623,35 @@ proc genInstAvr(n: var Cursor; ctx: var GenContext) =
   of IjmpAvr: plain(avr.emitIjmp)
 
   # ── the rest ─────────────────────────────────────────────────────────────
+  of LeaAvr:
+    ## The ADDRESS of a frame slot. Three instructions rather than one, and this
+    ## is the one place in this file where that is allowed: the displacement is
+    ## nifasm's OWN number — the slot manager assigned it, and the code generator
+    ## cannot know it — which is the same exception `(ssize)` lives under.
+    ## `emitAddOffsetA64` is the existing precedent.
+    inc n
+    let d = parseDestAvr(n, ctx)
+    let sOp = parseOperandAvr(n, ctx)
+    if sOp.kind != okMem or sOp.mem.kind != amPtr:
+      error("AVR: `(lea D S)` takes a frame slot", start)
+    let dp = pairOfAvr(d, "destination", start)
+    let base = case sOp.mem.p
+               of avr.PX: avr.X
+               of avr.PY: avr.Y
+               of avr.PZ: avr.Z
+    avr.emitMovw(ctx.buf.data, dp, base)
+    if sOp.mem.disp != 0:
+      if dp in avr.WordRegs and avr.fitsWordImm(sOp.mem.disp):
+        avr.emitAdiw(ctx.buf.data, dp, sOp.mem.disp)
+      elif Register(ord(dp)) in avr.ImmRegs:
+        # `subi`/`sbci` with the NEGATION, since there is no `addi` here.
+        let neg = (-sOp.mem.disp) and 0xFFFF
+        avr.emitSubi(ctx.buf.data, Register(ord(dp)), neg and 0xFF)
+        avr.emitSbci(ctx.buf.data, Register(ord(dp) + 1), (neg shr 8) and 0xFF)
+      else:
+        error("AVR: `(lea …)` into " & pairName(dp) & " cannot carry an offset — " &
+              "the pair reaches neither `adiw` nor `subi`", start)
+
   of RetAvr: plain(avr.emitRet)
   of RetiAvr: plain(avr.emitReti)
   of NopAvr: plain(avr.emitNop)

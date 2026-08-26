@@ -90,6 +90,139 @@ proc emStoreSlot*(g: var CodeGen; name: string; s: Reg) =
     g.ab.tree MemX: (g.ab.sym name; g.ab.intLit 1)
     g.emHi s
 
+proc emLeaSlot*(g: var CodeGen; d: Reg; name: string) =
+  ## The ADDRESS of a frame slot. One asm-NIF node; nifasm turns it into a `movw`
+  ## from Y plus the displacement, because that displacement is ITS number.
+  ##
+  ## Adding that displacement needs `adiw` or `subi`, and neither reaches the low
+  ## callee-saved pairs — so a destination below r16 is served through the value
+  ## bridge and a `movw`, exactly as a constant is.
+  if ldiOk(d):
+    g.ab.tree LeaAvr: (g.emPair d; g.ab.sym name)
+  else:
+    g.ab.tree LeaAvr: (g.emPair ValueBridge; g.ab.sym name)
+    g.emMovw(d, ValueBridge)
+
+# ── through a pointer ───────────────────────────────────────────────────────
+# Memory is reachable only through X, Y and Z, and Y is the frame pointer. So a
+# pointer VALUE has to be moved into one of the other two before it can be
+# followed — which is one `movw`, and then the access itself.
+
+proc emLoadPtr*(g: var CodeGen; d, p: Reg; off: int; width: int) =
+  ## Load `width` bytes through the pointer in `p`. The pointer is staged in the
+  ## produce bridge (Z) rather than used where it sits: an arbitrary pair cannot
+  ## address memory at all.
+  g.emMovw(ProduceBridge, p)
+  if width >= 2:
+    g.ab.tree LdbAvr:
+      g.emLo d
+      g.ab.tree MemX: (g.emPair ProduceBridge; g.ab.intLit off)
+    g.ab.tree LdbAvr:
+      g.emHi d
+      g.ab.tree MemX: (g.emPair ProduceBridge; g.ab.intLit(off + 1))
+  else:
+    g.ab.tree LdbAvr:
+      g.emLo d
+      g.ab.tree MemX: (g.emPair ProduceBridge; g.ab.intLit off)
+    # A byte read into a 16-bit value: the high half is zero, and `eor` against
+    # itself is how a register is zeroed here.
+    g.ab.tree XorAvr: (g.emHi d; g.emHi d)
+
+proc emStorePtr*(g: var CodeGen; p: Reg; off: int; s: Reg; width: int) =
+  g.emMovw(ProduceBridge, p)
+  g.ab.tree StbAvr:
+    g.ab.tree MemX: (g.emPair ProduceBridge; g.ab.intLit off)
+    g.emLo s
+  if width >= 2:
+    g.ab.tree StbAvr:
+      g.ab.tree MemX: (g.emPair ProduceBridge; g.ab.intLit(off + 1))
+      g.emHi s
+
+proc emMemNode*(g: var CodeGen; c: Cursor) =
+  ## Re-emit a Leng `(dot …)`/`(at …)` as the asm-NIF memory operand of the same
+  ## shape. The offsets are nifasm's to compute: it has the layout, so arkham
+  ## names the field or the index and nothing more.
+  case c.kind
+  of Symbol:
+    let name = symName(c)
+    let home = g.plan.locationOfSym(name, cursorToPosition(g.buf[], c))
+    if home.kind == NamedStack: g.ab.sym home.name
+    elif home.kind == InReg: g.emPair home.r     # already a pointer VALUE
+    else:
+      lengError c, "AVR: `" & name & "` cannot be addressed (" & $home.kind & ")",
+                lengInfo(c)
+  of TagLit:
+    case c.exprKind
+    of DotC:
+      var b = c; inc b
+      var f = b; skip f
+      g.ab.tree DotX:
+        g.emMemNode(b)
+        if f.kind != Symbol:
+          lengError c, "AVR: a field access needs a field name", lengInfo(c)
+        g.ab.sym symName(f)
+    of AtC:
+      var b = c; inc b
+      var i = b; skip i
+      g.ab.tree AtX:
+        g.emMemNode(b)
+        if i.kind == IntLit: g.ab.intLit intVal(i)
+        elif i.kind == UIntLit: g.ab.intLit cast[int64](uintVal(i))
+        else:
+          lengError c, "AVR: only a CONSTANT index folds into an address here",
+                    lengInfo(c)
+    of DerefC, HaddrC:
+      var v = c; inc v
+      g.emMemNode(v)
+    else:
+      lengError c, "AVR: `" & $c.exprKind & "` is not an address expression",
+                lengInfo(c)
+  else:
+    lengError c, "AVR: not an address expression", lengInfo(c)
+
+proc emStoreField*(g: var CodeGen; slot, field: string; s: Reg; width: int) =
+  ## Store into `slot.field`. Built from PARTS rather than copied from a node: a
+  ## constructor's destination is not written anywhere in the input.
+  g.ab.tree StbAvr:
+    g.ab.tree DotX: (g.ab.sym slot; g.ab.sym field)
+    g.emLo s
+  if width >= 2:
+    g.ab.tree StbAvr:
+      g.ab.tree MemX:
+        g.ab.tree DotX: (g.ab.sym slot; g.ab.sym field)
+        g.ab.intLit 1
+      g.emHi s
+
+proc emStoreElem*(g: var CodeGen; slot: string; idx: int; s: Reg; width: int) =
+  g.ab.tree StbAvr:
+    g.ab.tree AtX: (g.ab.sym slot; g.ab.intLit idx)
+    g.emLo s
+  if width >= 2:
+    g.ab.tree StbAvr:
+      g.ab.tree MemX:
+        g.ab.tree AtX: (g.ab.sym slot; g.ab.intLit idx)
+        g.ab.intLit 1
+      g.emHi s
+
+proc emLoadNode*(g: var CodeGen; d: Reg; node: Cursor; width: int) =
+  ## A 16-bit value out of a folded address is TWO `ldb`s, and the `+1` for the
+  ## high byte rides in the same instruction's displacement field — which is why
+  ## `(mem <addr> 1)` exists.
+  g.ab.tree LdbAvr: (g.emLo d; g.emMemNode node)
+  if width >= 2:
+    g.ab.tree LdbAvr:
+      g.emHi d
+      g.ab.tree MemX: (g.emMemNode node; g.ab.intLit 1)
+  else:
+    g.ab.tree XorAvr: (g.emHi d; g.emHi d)
+
+proc emStoreNode*(g: var CodeGen; node: Cursor; s: Reg; width: int) =
+  g.ab.tree StbAvr: (g.emMemNode node; g.emLo s)
+  if width >= 2:
+    g.ab.tree StbAvr:
+      g.ab.tree MemX: (g.emMemNode node; g.ab.intLit 1)
+      g.emHi s
+
 # ── 16-bit arithmetic and logic ─────────────────────────────────────────────
 
 type
@@ -306,9 +439,31 @@ proc genTypeBodyAvr*(g: var CodeGen; c: var Cursor) =
     of AptrT:
       g.ab.aptrType: g.ab.voidType()
       skip c
+    of ArrayT:
+      c.into:
+        g.ab.arrayType:
+          g.genTypeBodyAvr(c)
+          if c.kind == IntLit: (g.ab.intLit intVal(c); inc c)
+          else:
+            lengError c, "AVR: an array length must be a literal", lengInfo(c)
+    of ObjectT:
+      c.into:
+        if c.kind == Symbol:
+          lengError c, "AVR: object inheritance is not implemented yet", lengInfo(c)
+        skip c                                  # the base slot
+        g.ab.objectType:
+          while c.hasMore:
+            var f = c
+            f.into:
+              let fname = symName(f); inc f
+              skip f                            # the field's pragmas
+              g.ab.fldDef fname:
+                g.genTypeBodyAvr(f)
+              while f.hasMore: skip f
+            skip c
     else:
       lengError c, "AVR: the type `" & $c.typeKind & "` is not implemented yet " &
-                   "(M4d: aggregates, arrays and function pointers)", lengInfo(c)
+                   "(M5: unions and function pointers)", lengInfo(c)
   else:
     lengError c, "AVR: unsupported type", lengInfo(c)
 

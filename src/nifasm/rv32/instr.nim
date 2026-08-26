@@ -470,6 +470,18 @@ proc genInstRv(n: var Cursor; ctx: var GenContext) =
       if instTag == SubRv: rv.emitSub(ctx.buf.data, dr, dr, sr)
       else: rv.emitAdd(ctx.buf.data, dr, dr, sr)
 
+  of LeaRv:
+    ## The ADDRESS of a frame slot: `addi d, sp, q`. One instruction, and `q` is
+    ## nifasm's own number — the slot manager assigned it — so nothing is being
+    ## invented on the code generator's behalf.
+    inc n
+    let d = parseDestRv(n, ctx)
+    let sOp = parseOperandRv(n, ctx)
+    if sOp.kind != okMem:
+      error("RV32: `(lea D S)` takes an address expression", start)
+    rv.emitAddi(ctx.buf.data, regOfRv(d, "destination", start), sOp.mem.base,
+                int64(sOp.mem.off))
+
   of RetRv: plain(rv.emitRet)
   of NopRv: plain(rv.emitNop)
   of EcallRv: plain(rv.emitEcall)

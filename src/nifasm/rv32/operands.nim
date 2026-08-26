@@ -185,6 +185,94 @@ proc parseOperandRv*(n: var Cursor; ctx: var GenContext): OperandRv =
         error("RV32: (mem ...) needs a base register or a stack slot", n)
       if not rv.fitsImm12(int64(result.mem.off)):
         error("RV32: the offset " & $result.mem.off & " is past the 12-bit field", n)
+    elif t == DotTagId:
+      # `(dot <base> <field>)` — fold the field's offset onto the base address.
+      # nifasm resolves it because nifasm is what knows the layout: arkham names
+      # the field and never computes an offset for it, which is the same division
+      # x86-64 and Cortex-M already use.
+      var baseOp: OperandRv
+      var fieldName: string
+      into n:
+        baseOp = parseOperandRv(n, ctx)
+        if n.kind != Symbol: error("Expected field name in dot expression", n)
+        fieldName = getSym(n)
+        inc n
+        while n.hasMore: skip n
+      var objType: Type
+      var baseReg = rv.X0
+      var baseOff = 0
+      if baseOp.typ != nil and baseOp.typ.kind == TypeKind.PtrT:
+        objType = resolvedBase(baseOp.typ, ctx, n)
+        if objType == nil or objType.kind notin {TypeKind.ObjectT, TypeKind.UnionT}:
+          error("RV32: `(dot …)` on a pointer to a non-object type", n)
+        if baseOp.kind == okMem:
+          baseReg = baseOp.mem.base; baseOff = baseOp.mem.off
+        else:
+          baseReg = baseOp.reg
+      elif baseOp.kind == okMem and baseOp.typ != nil and
+           baseOp.typ.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
+        objType = baseOp.typ
+        baseReg = baseOp.mem.base; baseOff = baseOp.mem.off
+      elif baseOp.kind == okMem and baseOp.typ != nil and
+           baseOp.typ.kind == TypeKind.StackOffT and
+           baseOp.typ.offType.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
+        objType = baseOp.typ.offType
+        baseReg = baseOp.mem.base; baseOff = baseOp.mem.off
+      else:
+        error("RV32: `(dot …)` needs a pointer to an object or a stack object", n)
+      var fieldOffset = -1
+      var fieldType: Type = nil
+      for (fname, ftype, foff) in objType.fields:
+        if fname == fieldName:
+          fieldType = ftype; fieldOffset = foff; break
+      if fieldType == nil:
+        error("Field '" & fieldName & "' not found", n)
+      result.kind = okMem
+      result.mem = Rv32Mem(base: baseReg, off: baseOff + fieldOffset)
+      result.typ = Type(kind: TypeKind.PtrT, base: fieldType)
+      if not rv.fitsImm12(int64(result.mem.off)):
+        error("RV32: the field offset " & $result.mem.off & " is past the 12-bit " &
+              "field; the base has to be advanced first", n)
+    elif t == AtTagId:
+      # `(at <base> <index>)` with a CONSTANT index folds; a register index does
+      # not, because this machine has no scaled address mode at all — arkham
+      # computes that address itself and hands over a plain `(mem …)`.
+      var baseOp: OperandRv
+      var idxOp: OperandRv
+      into n:
+        baseOp = parseOperandRv(n, ctx)
+        idxOp = parseOperandRv(n, ctx)
+        while n.hasMore: skip n
+      if idxOp.kind != okImm:
+        error("RV32: `(at …)` folds only a CONSTANT index — this machine has no " &
+              "scaled address mode, so a computed one is arkham's to add", n)
+      var elemType: Type = nil
+      var baseReg = rv.X0
+      var baseOff = 0
+      if baseOp.kind == okMem and baseOp.typ != nil and
+         baseOp.typ.kind == TypeKind.StackOffT and
+         baseOp.typ.offType.kind == TypeKind.ArrayT:
+        elemType = baseOp.typ.offType.elem
+        baseReg = baseOp.mem.base; baseOff = baseOp.mem.off
+      elif baseOp.kind == okMem and baseOp.typ != nil and
+           baseOp.typ.kind == TypeKind.ArrayT:
+        elemType = baseOp.typ.elem
+        baseReg = baseOp.mem.base; baseOff = baseOp.mem.off
+      elif baseOp.typ != nil and baseOp.typ.kind in {TypeKind.PtrT, TypeKind.AptrT}:
+        elemType = resolvedBase(baseOp.typ, ctx, n)
+        if baseOp.kind == okMem:
+          baseReg = baseOp.mem.base; baseOff = baseOp.mem.off
+        else:
+          baseReg = baseOp.reg
+      else:
+        error("RV32: `(at …)` needs an array or a pointer", n)
+      let stride = asmSizeOf(elemType)
+      result.kind = okMem
+      result.mem = Rv32Mem(base: baseReg, off: baseOff + int(idxOp.immVal) * stride)
+      result.typ = Type(kind: TypeKind.PtrT, base: elemType)
+      if not rv.fitsImm12(int64(result.mem.off)):
+        error("RV32: the element offset " & $result.mem.off & " is past the " &
+              "12-bit field", n)
     elif t == CastTagId:
       inc n
       let castType = parseType(n, ctx.scope, ctx)

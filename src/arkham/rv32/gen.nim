@@ -45,8 +45,9 @@ proc checkWidth(g: var CodeGen; typeCur: Cursor; what: string) =
     lengError typeCur, "RV32: " & what & " is a float; this target is `ilp32` " &
               "soft-float and has no FPU registers (see R5)", lengInfo(typeCur)
   if s.cls == AMem:
-    lengError typeCur, "RV32: " & what & " is an aggregate; R5 covers those",
-              lengInfo(typeCur)
+    # An aggregate lives in a frame slot sized by its own type, and is never in a
+    # register — so the width check below does not apply to it.
+    return
   if s.size > 4:
     lengError typeCur, "RV32: " & what & " is " & $(s.size * 8) & " bits wide; " &
               "this backend's word is 32 and a wider value lives in a register " &
@@ -198,6 +199,123 @@ proc emitCmpValue(g: var CodeGen; c: Cursor; dst: Reg) =
   else:
     refuse(c, "the comparison `" & $c.exprKind & "`")
 
+# ── lvalues ─────────────────────────────────────────────────────────────────
+
+type
+  LvalKind = enum
+    lvReg        ## a local living in a register: the store is a move
+    lvSlot       ## a local living in a frame slot
+    lvPtr        ## through a pointer held in a register, at an offset
+    lvNode       ## a `(dot …)`/`(at …)` node, handed to nifasm to fold
+
+  Lval = object
+    kind: LvalKind
+    r: Reg              ## `lvReg`: the home. `lvPtr`: the pointer.
+    slot: string
+    off: int
+    node: Cursor        ## `lvNode`: the `(dot …)`/`(at …)` itself, emitted
+                        ## verbatim as a memory operand — nifasm folds it
+    width: int          ## bytes: a narrow store writes only its own
+
+proc accessWidth(g: var CodeGen; c: Cursor): tuple[bytes: int; signed: bool] =
+  ## How wide the ACCESS at `c` is, and whether a load of it sign-extends. Read
+  ## off the expression's own type rather than its operand's: `(deref p)` is a T,
+  ## not a `ptr T`, and getting that backwards makes every byte load a word load.
+  let s = g.exprSlot(c)
+  let w = if s.size <= 0 or s.size > 4: 4 else: s.size
+  (w, s.cls != AUInt)
+
+proc scaledIndex(g: var CodeGen; p: BPlan; dst: Reg; elemW: int): Reg =
+  ## The index, scaled by the element size and left somewhere it is safe to have
+  ## scaled. `materializeB` may hand back a local's HOME register — shifting that
+  ## in place would destroy the local, which is exactly how `a[i]` first read the
+  ## wrong element and left `i` multiplied by four.
+  result = g.materializeB(p, dst)
+  if elemW <= 1: return
+  var sh = 0
+  var w = elemW
+  while w > 1: (w = w shr 1; inc sh)
+  if result notin {StagingBridge, StagingBridge2}:
+    let into = otherBridge(dst)
+    g.emMv(into, result)
+    result = into
+  discard g.emBinImm(boShl, result, result, int64(sh))
+
+proc emitAddrOf(g: var CodeGen; c: Cursor; dst: Reg) =
+  ## The ADDRESS of an lvalue, in a register. Used where an offset has to be
+  ## added at run time, which is the one case nifasm cannot fold.
+  if c.kind == Symbol:
+    let home = g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c))
+    if home.kind == NamedStack:
+      g.emLeaSlot(dst, home.name)
+      return
+    if home.kind == InReg:
+      g.emMv(dst, home.r)                 # already a pointer VALUE
+      return
+    refuse(c, "the address of `" & symName(c) & "`")
+  g.emitValue(c, dst)
+
+proc emitLval(g: var CodeGen; c: Cursor; scratch: Reg): Lval =
+  ## Resolve where a store GOES, emitting whatever address arithmetic that takes.
+  ## `scratch` is where a computed pointer lands; it must not be the register the
+  ## value being stored will live in.
+  case c.kind
+  of Symbol:
+    let name = symName(c)
+    let home = g.plan.locationOfSym(name, cursorToPosition(g.buf[], c))
+    case home.kind
+    of InReg: Lval(kind: lvReg, r: home.r)
+    of NamedStack: Lval(kind: lvSlot, slot: home.name)
+    else: refuse(c, "a store to `" & name & "`, whose location is " & $home.kind)
+  of TagLit:
+    case c.exprKind
+    of DerefC, HaddrC:
+      let (w, _) = g.accessWidth(c)
+      var v = c; inc v
+      g.emitValue(v, scratch)
+      Lval(kind: lvPtr, r: scratch, off: 0, width: w)
+    of DotC:
+      # The field's offset is NIFASM's to compute — it has the layout, arkham
+      # only names the field. So this is not an address computation at all: the
+      # whole `(dot …)` becomes one memory operand.
+      Lval(kind: lvNode, node: c, width: g.accessWidth(c).bytes)
+    of AtC:
+      # A CONSTANT index folds the same way. A computed one cannot: there is no
+      # scaled address mode, so the multiply is arkham's and the result is a
+      # plain pointer.
+      var idx = c; inc idx; skip idx
+      if idx.kind in {IntLit, UIntLit}:
+        return Lval(kind: lvNode, node: c, width: g.accessWidth(c).bytes)
+      let (elemW, _) = g.accessWidth(c)
+      var base = c; inc base
+      g.emitAddrOf(base, scratch)
+      let plan = g.classifyB(idx, scratch)
+      let ir = g.scaledIndex(plan, scratch, elemW)
+      g.emBin(boAdd, scratch, scratch, ir)
+      Lval(kind: lvPtr, r: scratch, off: 0, width: elemW)
+    of PatC:
+      # `(pat p idx)` — a pointer indexed by an element count, which is a shift
+      # the emitter writes out because the machine has no scaled address mode.
+      let (elemW, _) = g.accessWidth(c)
+      var base = c; inc base
+      var idx = base; skip idx
+      g.emitValue(base, scratch)
+      let plan = g.classifyB(idx, scratch)
+      let ir = g.scaledIndex(plan, scratch, elemW)
+      g.emBin(boAdd, scratch, scratch, ir)
+      Lval(kind: lvPtr, r: scratch, off: 0, width: elemW)
+    else:
+      refuse(c, "a store to the expression `" & $c.exprKind & "`")
+  else:
+    refuse(c, "this store destination")
+
+proc storeTo(g: var CodeGen; lv: Lval; src: Reg) =
+  case lv.kind
+  of lvReg: g.emMv(lv.r, src)
+  of lvSlot: g.emStoreSlot(lv.slot, src)
+  of lvPtr: g.emStorePtr(lv.r, lv.off, src, lv.width)
+  of lvNode: g.emStoreNode(lv.node, src, lv.width)
+
 # ── expressions ─────────────────────────────────────────────────────────────
 
 proc binOpOf(c: Cursor; signed: bool): RvBinOp =
@@ -276,6 +394,49 @@ proc emitValue(g: var CodeGen; c: Cursor; dst: Reg) =
         refuse(c, "a narrowing conversion (" & $(fromSlot.size * 8) & " to " &
                   $(toSlot.size * 8) & " bits)")
       g.emitValue(v, dst)
+    of AddrC, HaddrC:
+      # The address of a local. Its home must be MEMORY, which the analyser
+      # guarantees: taking a local's address marks it `AddrTaken`, and the
+      # planner spills such a local rather than giving it a register.
+      var v = c; inc v
+      if v.kind != Symbol:
+        refuse(c, "the address of anything but a local")
+      let name = symName(v)
+      let home = g.plan.locationOfSym(name, cursorToPosition(g.buf[], v))
+      if home.kind != NamedStack:
+        lengError c, "RV32: `" & name & "` had its address taken but lives in " &
+                  $home.kind & " — the allocator was supposed to spill it",
+                  lengInfo(c)
+      g.emLeaSlot(dst, home.name)
+    of DotC:
+      let (w, signed) = g.accessWidth(c)
+      g.emLoadNode(dst, c, w, signed)
+    of AtC:
+      var idx = c; inc idx; skip idx
+      let (w, signed) = g.accessWidth(c)
+      if idx.kind in {IntLit, UIntLit}:
+        g.emLoadNode(dst, c, w, signed)
+      else:
+        var base = c; inc base
+        g.emitAddrOf(base, dst)
+        let plan = g.classifyB(idx, dst)
+        let ir = g.scaledIndex(plan, dst, w)
+        g.emBin(boAdd, dst, dst, ir)
+        g.emLoadPtr(dst, dst, 0, w, signed)
+    of DerefC:
+      let (w, signed) = g.accessWidth(c)
+      var v = c; inc v
+      g.emitValue(v, dst)
+      g.emLoadPtr(dst, dst, 0, w, signed)
+    of PatC:
+      let (elemW, signed) = g.accessWidth(c)
+      var base = c; inc base
+      var idx = base; skip idx
+      g.emitValue(base, dst)
+      let plan = g.classifyB(idx, dst)
+      let ir = g.scaledIndex(plan, dst, elemW)
+      g.emBin(boAdd, dst, dst, ir)
+      g.emLoadPtr(dst, dst, 0, elemW, signed)
     of CallC: g.emitCall(c, dst, wantResult = true)
     else:
       refuse(c, "the expression `" & $c.exprKind & "`")
@@ -291,10 +452,14 @@ proc emitCall(g: var CodeGen; c: Cursor; dst: Reg; wantResult: bool) =
   let callee = symName(f)
   var args: seq[Cursor] = @[]
   var a = c
-  inc a; skip a
-  while a.hasMore:
-    args.add a
-    skip a
+  # `into`, not `inc`: after `inc` a cursor's `hasMore` is relative to the
+  # ENCLOSING node, so the loop would collect the statements after the call as
+  # arguments. The same trap the `plain(…)` template fell into.
+  a.into:
+    skip a                                     # the callee
+    while a.hasMore:
+      args.add a
+      skip a
   if args.len > g.md.intArgRegs.len:
     refuse(c, "a call with " & $args.len & " arguments — this target passes " &
               $g.md.intArgRegs.len & " in registers and the rest on the stack (R5)")
@@ -340,6 +505,44 @@ proc destOfSym(g: var CodeGen; name: string; pos: int): Reg =
   let home = g.plan.locationOfSym(name, pos)
   if home.kind == InReg: home.r else: StagingBridge
 
+proc emitAggrInit(g: var CodeGen; c: Cursor; slot: string) =
+  ## `(oconstr T (kv f v)…)` / `(aconstr T v…)` into a frame slot, one field or
+  ## element at a time.
+  ##
+  ## A constructor is TOTAL — sem names every field of the type, in any order —
+  ## so nothing has to be zeroed first and nothing can be left uninitialized.
+  case c.exprKind
+  of OconstrC:
+    var f = c
+    f.into:
+      skip f                                     # the type
+      while f.hasMore:
+        if f.substructureKind != KvU:
+          refuse(f, "a non-`kv` entry in an object constructor")
+        var kv = f
+        inc kv
+        if kv.kind != Symbol:
+          refuse(kv, "an object constructor without a field name")
+        let fieldName = symName(kv)
+        skip kv                                  # the field name
+        let w = g.accessWidth(kv).bytes
+        g.emitValue(kv, StagingBridge)
+        g.emStoreField(slot, fieldName, StagingBridge, w)
+        skip f
+  of AconstrC:
+    var e = c
+    var i = 0
+    e.into:
+      skip e                                     # the type
+      while e.hasMore:
+        let w = g.accessWidth(e).bytes
+        g.emitValue(e, StagingBridge)
+        g.emStoreElem(slot, i, StagingBridge, w)
+        inc i
+        skip e
+  else:
+    refuse(c, "this aggregate initializer")
+
 proc genVarDecl(g: var CodeGen; c: Cursor) =
   var v = c
   inc v
@@ -357,6 +560,11 @@ proc genVarDecl(g: var CodeGen; c: Cursor) =
   else:
     lengError c, "RV32: the local `" & name & "` was given no storage", lengInfo(c)
   if v.hasMore and v.kind != DotToken:
+    if v.kind == TagLit and v.exprKind in {OconstrC, AconstrC}:
+      if home.kind != NamedStack:
+        lengError c, "an aggregate local must live in a frame slot", lengInfo(c)
+      g.emitAggrInit(v, home.name)
+      return
     let dst = g.destOfSym(name, pos)
     g.emitValue(v, dst)
     if home.kind != InReg: g.emStoreSlot(home.name, dst)
@@ -366,13 +574,37 @@ proc genAsgn(g: var CodeGen; c: Cursor) =
   inc lhs
   var rhs = lhs
   skip rhs
-  if lhs.kind != Symbol: refuse(lhs, "an assignment to anything but a local")
-  let name = symName(lhs)
-  let pos = cursorToPosition(g.buf[], lhs)
-  let dst = g.destOfSym(name, pos)
-  g.emitValue(rhs, dst)
-  let home = g.plan.locationOfSym(name, pos)
-  if home.kind != InReg: g.emStoreSlot(home.name, dst)
+  if lhs.kind == Symbol:
+    # The common case, kept separate because it needs no address at all.
+    let name = symName(lhs)
+    let pos = cursorToPosition(g.buf[], lhs)
+    let dst = g.destOfSym(name, pos)
+    g.emitValue(rhs, dst)
+    let home = g.plan.locationOfSym(name, pos)
+    if home.kind != InReg: g.emStoreSlot(home.name, dst)
+    return
+  # A store through an address. The ADDRESS is computed first and parked, and
+  # then the value: the other order would need the address to survive the value's
+  # own walk, which may use every bridge there is.
+  let addrSlot = g.mintSlot("eaddr")
+  let lv = g.emitLval(lhs, StagingBridge)
+  case lv.kind
+  of lvNode:
+    # nifasm folds the address, so nothing has to survive the value's walk.
+    g.emitValue(rhs, StagingBridge)
+    g.emStoreNode(lv.node, StagingBridge, lv.width)
+  of lvPtr:
+    # A computed address. It is parked before the value is evaluated: the other
+    # order would need it to survive that walk, which uses every bridge there is.
+    g.emStoreSlot(addrSlot, lv.r)
+    g.emitValue(rhs, StagingBridge)
+    let valSlot = g.mintSlot("eval")
+    g.emStoreSlot(valSlot, StagingBridge)
+    g.emLoadSlot(StagingBridge, addrSlot)
+    g.emLoadSlot(StagingBridge2, valSlot)
+    g.emStorePtr(StagingBridge, lv.off, StagingBridge2, lv.width)
+  else:
+    refuse(lhs, "an assignment to this destination")
 
 proc genRet(g: var CodeGen; c: Cursor) =
   var v = c
@@ -472,12 +704,54 @@ proc collectParams(g: var CodeGen; decl: Cursor): seq[tuple[name: string; typ: C
         while d.hasMore: skip d
       skip p
 
+proc recordVarType(g: var CodeGen; c: Cursor) =
+  ## `(param :nm . type)` / `(var :nm pragmas type …)` → `symType[nm] = type`.
+  var cc = c
+  cc.into:
+    if cc.kind == SymbolDef:
+      let nm = symName(cc); inc cc
+      skip cc                                    # pragmas
+      let typeCur = cc; skip cc
+      g.symType[nm] = g.declType(typeCur, cc)    # `.` ⇒ inferred from the initializer
+    while cc.hasMore: skip cc
+
+proc recordSymTypes(g: var CodeGen; c: Cursor) =
+  ## Pre-pass: fill `symType` for every local before emission starts, so that
+  ## asking an expression its own type works from the first node. Without it a
+  ## `(deref p)` cannot be sized — and sizing it by the POINTER instead of the
+  ## pointee makes every byte access a word access.
+  if c.kind != TagLit: return
+  case c.stmtKind
+  of VarS, GvarS, TvarS, ConstS: g.recordVarType(c)
+  of ProcS, TypeS: discard
+  else:
+    var cc = c
+    cc.into:
+      while cc.hasMore:
+        g.recordSymTypes(cc)
+        skip cc
+
 proc genProcRv*(g: var CodeGen; info: ProcInfo) =
   if info.isAsm or info.isNaked or info.irqName.len > 0:
     lengError info.decl,
       "RV32: `{.assembler.}`, `{.naked.}` and `{.interrupt.}` are not " &
       "implemented yet (see R5 in doc/internals/rv32.md)", lengInfo(info.decl)
 
+  g.varType.clear()
+  g.symType.clear()
+  block:                                  # every local's type, before anything asks
+    var pc = info.decl
+    pc.into:
+      inc pc                              # the name
+      if pc.kind == TagLit:               # (params …)
+        var p = pc
+        p.into:
+          while p.hasMore: (g.recordVarType(p); skip p)
+      skip pc                             # params
+      skip pc                             # the result type
+      skip pc                             # pragmas
+      if pc.stmtKind == StmtsS: g.recordSymTypes(pc)
+      while pc.hasMore: skip pc
   g.curProcName = info.asmName
   g.isEntryProc = info.isEntry
   g.rb.resetProc()

@@ -70,7 +70,7 @@ nim c tools/gen_instructions.nim && ./tools/gen_instructions doc/instructions.md
 | `(hi S)`               | NifasmExpr                  | AVR: the HIGH half of a pair-bound value. See `(lo S)` |
 | `(prepare S ...)`      | X64Inst, A64Inst, MInst, AvrInst, Rv32Inst | prepare block for function call |
 | `(mov D S)`            | X64Inst, A64Inst, MInst, AvrInst, Rv32Inst | move instruction |
-| `(lea D S)`            | X64Inst, A64Inst, MInst | load effective address |
+| `(lea D S)`            | X64Inst, A64Inst, MInst, AvrInst, Rv32Inst | load effective address |
 | `(movzx D S N)`        | X64Inst                  | D = the low `N` bits of S, ZERO-extended into the full 64-bit D (`N` is 8, 16 or 32) |
 | `(movsx D S N)`        | X64Inst                  | D = the low `N` bits of S, SIGN-extended into the full 64-bit D (`N` is 8, 16 or 32) |
 | `(movapd D S)`         | X64Inst                  | move aligned packed double |

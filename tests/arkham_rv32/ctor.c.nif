@@ -1,0 +1,37 @@
+(.nif27)
+(stmts
+ (type :Pt.0 .
+  (object .
+   (fld :x.0 .
+    (i 32))
+   (fld :y.0 .
+    (i 32))))
+ (type :A3.0 .
+  (array
+   (i 32)3))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :p.0 . Pt.0
+    (oconstr Pt.0
+     (kv x.0 30)
+     (kv y.0 5)))
+   (var :a.0 . A3.0
+    (aconstr A3.0 1 2 4))
+   (ret
+    (add
+     (i 32)
+     (add
+      (i 32)
+      (dot p.0 x.0 0)
+      (dot p.0 y.0 0))
+     (add
+      (i 32)
+      (add
+       (i 32)
+       (at a.0 0)
+       (at a.0 1))
+      (at a.0 2)))))))
