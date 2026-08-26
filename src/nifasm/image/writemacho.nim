@@ -18,6 +18,9 @@ import nifcore
 import "../core" / [context, sem, relocs, listing]
 import macho, writecommon
 
+when defined(macosx):
+  import std / [osproc]
+
 proc writeMachO*(a: var GenContext; outfile: string) =
   fillTraceTable(a)
   finalize(a.buf)
