@@ -30,6 +30,51 @@ const
     ## `(ite …)`, a `(prepare …)` with every argument) can be enormous and its
     ## deeper rows carry the detail anyway, so the text is capped.
 
+template withListingRow*(ctx: var GenContext; n: var Cursor; dispatch: untyped) =
+  ## Wrap ONE instruction node: record its listing row, and close the
+  ## prologue at the first node that emits code and is not a frame-builder.
+  ##
+  ## A template, not a proc, and that is the whole point: each of the three
+  ## instruction selectors expands its own copy, so none of them has to call
+  ## a shared dispatcher — which is what used to weld all three into one
+  ## strongly connected component and force them to share a module.
+  let cfiBefore = ctx.buf.data.len
+  ctx.prologueOp = false
+  if not ctx.listing:
+    dispatch
+  else:
+    # Render BEFORE the dispatch: `n` is advanced past the node by it. The NIF
+    # renderer breaks lines; the listing is one TSV row per node, so flatten
+    # runs of whitespace to single spaces (and drop the tabs a string literal
+    # could otherwise smuggle into a column separator).
+    var text = ""
+    var sawSpace = true                          # leading whitespace is dropped
+    for ch in toString(n, includeLineInfo = false):
+      if ch in {' ', '\t', '\n', '\r'}:
+        if not sawSpace: text.add ' '
+        sawSpace = true
+      else:
+        text.add ch
+        sawSpace = false
+      if text.len >= ListingTextCap:
+        text.add "…"
+        break
+    let start = ctx.buf.data.len
+    let depth = ctx.listDepth
+    inc ctx.listDepth
+    dispatch
+    dec ctx.listDepth
+    let stop = ctx.buf.data.len
+    if stop > start:                       # a node that emitted no bytes is not a row
+      ctx.listRows.add ListingRow(start: start, stop: stop, depth: depth,
+                                  procName: ctx.procName, text: text)
+  # The prologue ends at the first instruction that EMITS CODE and is not one of
+  # the frame-building forms. Judging it by emitted bytes rather than by tag is
+  # what keeps the zero-code nodes between them — a `(var :x (s) T)` slot
+  # declaration, a `(kill …)` — from cutting the run short.
+  if ctx.inPrologue and not ctx.prologueOp and ctx.buf.data.len != cfiBefore:
+    ctx.inPrologue = false
+
 proc remapListing*(ctx: var GenContext; posMap: seq[int]) =
   ## Carry the listing through one of the post-emission layout passes
   ## (`threadJumps` / `invertCondJumps` / `shortenX64Jumps`), each of which

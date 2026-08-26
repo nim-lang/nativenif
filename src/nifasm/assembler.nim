@@ -55,7 +55,9 @@ type
     gvarSym: Symbol           # non-nil when the operand is a global's address; the
                               # ELF backend patches its `lea` against the .bss segment
 
-proc genStmt(n: var Cursor; ctx: var GenContext)
+proc genStmtX64(n: var Cursor; ctx: var GenContext)
+proc genStmtA64(n: var Cursor; ctx: var GenContext)
+proc genInst(n: var Cursor; ctx: var GenContext)
 proc genInstA64(n: var Cursor; ctx: var GenContext)
 
 proc pass1Proc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string; declStart: int) =
@@ -1188,14 +1190,14 @@ proc genIteA64(n: var Cursor; ctx: var GenContext) =
     else: error("Unsupported ARM64 flag condition: " & $flagTag, n)
   else:
     error("Expected cfvar or flag condition in ite", n)
-  genStmt(n, ctx)
+  genStmtA64(n, ctx)
   let thenClobbered = ctx.clobbered
   let thenClobberedA64 = ctx.clobberedA64
   ctx.buf.emitB(lEnd)
   ctx.clobbered = oldClobbered
   ctx.clobberedA64 = oldClobberedA64
   ctx.buf.defineLabel(lElse)
-  genStmt(n, ctx)
+  genStmtA64(n, ctx)
   let elseClobbered = ctx.clobbered
   let elseClobberedA64 = ctx.clobberedA64
   ctx.buf.defineLabel(lEnd)
@@ -1212,11 +1214,11 @@ proc genLoopA64(n: var Cursor; ctx: var GenContext) =
   if atTag(n, StmtsTagId):
     let lStart = ctx.buf.createLabel()
     ctx.buf.defineLabel(lStart)
-    genStmt(n, ctx)                 # the body (contains the forward break/exit branch)
+    genStmtA64(n, ctx)                 # the body (contains the forward break/exit branch)
     ctx.buf.emitB(lStart)           # the loop back-edge — emitted by nifasm, not the input
     return
 
-  genStmt(n, ctx)
+  genStmtA64(n, ctx)
   let lStart = ctx.buf.createLabel()
   let lEnd = ctx.buf.createLabel()
   ctx.buf.defineLabel(lStart)
@@ -1231,7 +1233,7 @@ proc genLoopA64(n: var Cursor; ctx: var GenContext) =
   of NzO: ctx.buf.emitBeq(lEnd)   # if ZF clear wanted, exit if ZF set
   else: error("Unsupported ARM64 loop condition: " & $loopFlagTag, n)
 
-  genStmt(n, ctx)
+  genStmtA64(n, ctx)
   ctx.buf.emitB(lStart)
   ctx.buf.defineLabel(lEnd)
 
@@ -2791,6 +2793,16 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
   of NoA64Inst:
     error("Invalid ARM64 instruction", start)
 
+proc genInstNodeA64(n: var Cursor; ctx: var GenContext) =
+  withListingRow(ctx, n): genInstA64(n, ctx)
+
+proc genStmtA64(n: var Cursor; ctx: var GenContext) =
+  if atTag(n, StmtsTagId):
+    loopInto n:
+      genInstNodeA64(n, ctx)
+  else:
+    genInstNodeA64(n, ctx)
+
 # ── Cortex-M (ARMv7E-M / Thumb-2) instruction selection ─────────────────────
 #
 # The counterpart of `genInstA64`, against `thumb2.nim`'s encoders. Two things
@@ -4321,52 +4333,8 @@ proc genInstM(n: var Cursor; ctx: var GenContext) =
 proc genStmtM(n: var Cursor; ctx: var GenContext) =
   genInstM(n, ctx)
 
-proc genInstDispatch(n: var Cursor; ctx: var GenContext) {.inline.} =
-  case ctx.arch
-  of Arch.X64, Arch.WinX64:
-    genInstX64(n, ctx)
-  of Arch.A64, Arch.WinA64, Arch.LinuxA64:
-    genInstA64(n, ctx)
-  of Arch.CortexM:
-    genInstM(n, ctx)
-
-proc genInst(n: var Cursor; ctx: var GenContext) =
-  let cfiBefore = ctx.buf.data.len
-  ctx.prologueOp = false
-  if not ctx.listing:
-    genInstDispatch(n, ctx)
-  else:
-    # Render BEFORE the dispatch: `n` is advanced past the node by it. The NIF
-    # renderer breaks lines; the listing is one TSV row per node, so flatten
-    # runs of whitespace to single spaces (and drop the tabs a string literal
-    # could otherwise smuggle into a column separator).
-    var text = ""
-    var sawSpace = true                          # leading whitespace is dropped
-    for ch in toString(n, includeLineInfo = false):
-      if ch in {' ', '\t', '\n', '\r'}:
-        if not sawSpace: text.add ' '
-        sawSpace = true
-      else:
-        text.add ch
-        sawSpace = false
-      if text.len >= ListingTextCap:
-        text.add "…"
-        break
-    let start = ctx.buf.data.len
-    let depth = ctx.listDepth
-    inc ctx.listDepth
-    genInstDispatch(n, ctx)
-    dec ctx.listDepth
-    let stop = ctx.buf.data.len
-    if stop > start:                       # a node that emitted no bytes is not a row
-      ctx.listRows.add ListingRow(start: start, stop: stop, depth: depth,
-                                  procName: ctx.procName, text: text)
-  # The prologue ends at the first instruction that EMITS CODE and is not one of
-  # the frame-building forms. Judging it by emitted bytes rather than by tag is
-  # what keeps the zero-code nodes between them — a `(var :x (s) T)` slot
-  # declaration, a `(kill …)` — from cutting the run short.
-  if ctx.inPrologue and not ctx.prologueOp and ctx.buf.data.len != cfiBefore:
-    ctx.inPrologue = false
+proc genInstNodeM(n: var Cursor; ctx: var GenContext) =
+  withListingRow(ctx, n): genInstM(n, ctx)
 
 proc collectLabels(n: var Cursor; ctx: var GenContext; scope: Scope) =
   ## Pre-scan a cursor subtree and create placeholder symbols for labels.
@@ -4639,12 +4607,6 @@ proc pass2Proc(n: var Cursor; ctx: var GenContext) =
 
   ctx.scope = oldScope
 
-proc genStmt(n: var Cursor; ctx: var GenContext) =
-  if atTag(n, StmtsTagId):
-    loopInto n:
-      genInst(n, ctx)
-  else:
-    genInst(n, ctx)
 
 proc parseOperand(n: var Cursor; ctx: var GenContext): Operand =
   if n.kind == TagLit:
@@ -5947,7 +5909,7 @@ proc genIteX64(n: var Cursor; ctx: var GenContext) =
   else:
     error("Expected cfvar or flag condition in ite", n)
 
-  genStmt(n, ctx) # Then block
+  genStmtX64(n, ctx) # Then block
   # Clobbered state propagates?
   # Control flow merge: union of clobbered sets?
   # If a register is clobbered in THEN but not ELSE, it is clobbered after? Yes.
@@ -5957,7 +5919,7 @@ proc genIteX64(n: var Cursor; ctx: var GenContext) =
 
   ctx.clobbered = oldClobbered # Reset for Else
   ctx.buf.defineLabel(lElse)
-  genStmt(n, ctx) # Else block
+  genStmtX64(n, ctx) # Else block
   let elseClobbered = ctx.clobbered
 
   ctx.buf.defineLabel(lEnd)
@@ -5977,12 +5939,12 @@ proc genLoopX64(n: var Cursor; ctx: var GenContext) =
   if atTag(n, StmtsTagId):
     let lStart = ctx.buf.createLabel()
     ctx.buf.defineLabel(lStart)
-    genStmt(n, ctx)                 # the body (contains the forward break/exit jmp)
+    genStmtX64(n, ctx)                 # the body (contains the forward break/exit jmp)
     ctx.buf.emitJmp(lStart)         # the loop back-edge — emitted by nifasm, not the input
     return
 
   # Pre-loop
-  genStmt(n, ctx)
+  genStmtX64(n, ctx)
   let lStart = ctx.buf.createLabel()
   let lEnd = ctx.buf.createLabel()
 
@@ -5999,7 +5961,7 @@ proc genLoopX64(n: var Cursor; ctx: var GenContext) =
   else: error("Unsupported loop condition: " & $loopFlagTag, n)
 
   # Body
-  genStmt(n, ctx)
+  genStmtX64(n, ctx)
   ctx.buf.emitJmp(lStart)
   ctx.buf.defineLabel(lEnd)
 
@@ -7983,6 +7945,29 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     let op = parseDest(n, ctx)
     x86.emitPrefetchNta(ctx.buf.data, op.reg)
 
+
+proc genInstNodeX64(n: var Cursor; ctx: var GenContext) =
+  withListingRow(ctx, n): genInstX64(n, ctx)
+
+proc genStmtX64(n: var Cursor; ctx: var GenContext) =
+  if atTag(n, StmtsTagId):
+    loopInto n:
+      genInstNodeX64(n, ctx)
+  else:
+    genInstNodeX64(n, ctx)
+
+proc genInst(n: var Cursor; ctx: var GenContext) =
+  ## ONE asm-NIF instruction node, for whichever target this assembly is for.
+  ## The listing row is recorded inside each arm rather than around this call:
+  ## `withListingRow` is a template, so the three selectors stay independent of
+  ## each other and of this dispatcher.
+  case ctx.arch
+  of Arch.X64, Arch.WinX64:
+    genInstNodeX64(n, ctx)
+  of Arch.A64, Arch.WinA64, Arch.LinuxA64:
+    genInstNodeA64(n, ctx)
+  of Arch.CortexM:
+    genInstNodeM(n, ctx)
 
 proc pass2(n: Cursor; ctx: var GenContext) =
   ## Pass2: Generate code only for top-level instructions (entry point).

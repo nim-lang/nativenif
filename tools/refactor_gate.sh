@@ -7,9 +7,15 @@
 # tool printed. Capture it once on a known-good tree, re-run it after every
 # stage, `diff` the two.
 #
+# A companion file `<out>.listings` gets the same treatment for `--listing`
+# output, which is emitted-code metadata no image hash can see. It is written by
+# a SECOND nifasm run per fixture, into a throwaway image, so enabling the flag
+# can never perturb what the artifact half recorded.
+#
 #   tools/refactor_gate.sh baseline.sums     # before
 #   tools/refactor_gate.sh after.sums        # after a stage
 #   diff baseline.sums after.sums            # must be empty
+#   diff baseline.sums.listings after.sums.listings
 #
 # SKIP_BUILD=1 reuses bin/arkham and bin/nifasm as they are.
 set -u
@@ -29,6 +35,7 @@ fi
 
 rm -rf "$work"
 tmp=$(mktemp)
+lst=$(mktemp)
 
 # A tool's diagnostic is part of its observable behaviour, so a failing fixture
 # is recorded too — but the Nim stack trace `nifasm`'s `error` prints names
@@ -69,6 +76,12 @@ run_corpus() { # <srcdir> <arch> [extra arkham flags]
     img="$dir/$name.img"
     "$nifasm" -o:"$img" "$asmnif" > "$log" 2>&1
     record "nifasm/$arch/$name" "$?" "$log" "$img"
+    # A separate run, into a throwaway image: the flag must not be able to
+    # perturb the artifact recorded above.
+    "$nifasm" --listing:"$dir/$name.lst" -o:"$dir/$name.limg" "$asmnif" \
+        > "$log" 2>&1 && [ -f "$dir/$name.lst" ] && \
+      printf 'listing/%s/%s\t%s\n' "$arch" "$name" \
+             "$(sha256sum < "$dir/$name.lst" | cut -d' ' -f1)" >> "$lst"
   done
   rm -f "$log"
 }
@@ -93,6 +106,15 @@ for f in tests/*.nif; do
 done
 rm -f "$log"
 
+for f in tests/*.nif; do
+  name=$(basename "$f" .nif)
+  "$nifasm" --listing:"$work/asmnif/$name.lst" -o:"$work/asmnif/$name.limg" "$f" \
+      > /dev/null 2>&1 && [ -f "$work/asmnif/$name.lst" ] && \
+    printf 'listing/raw/%s\t%s\n' "$name" \
+           "$(sha256sum < "$work/asmnif/$name.lst" | cut -d' ' -f1)" >> "$lst"
+done
+
 LC_ALL=C sort "$tmp" > "$out"
-rm -f "$tmp"
-echo "$(wc -l < "$out") artifacts -> $out"
+LC_ALL=C sort "$lst" > "$out.listings"
+rm -f "$tmp" "$lst"
+echo "$(wc -l < "$out") artifacts, $(wc -l < "$out.listings") listings -> $out"
