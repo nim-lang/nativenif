@@ -50,3 +50,4 @@ nim r tests/tester.nim           # builds both and runs the whole corpus
 | [doc/instructions.md](doc/instructions.md) | the complete asm-NIF tag vocabulary (generated from) |
 | [doc/tracetable.md](doc/tracetable.md) | the runtime stack-trace table `getStackTrace()` reads |
 | [src/arkham/design.md](src/arkham/design.md) | arkham's register strategy |
+| [doc/internals/terms.md](doc/internals/terms.md) | glossary: `bridge`, `home`, `volatile`, `eightbyte`, … |

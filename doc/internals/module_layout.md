@@ -1,5 +1,8 @@
 # Refactoring plan: per-CPU subdirectories, `import` instead of `include`
 
+(For the vocabulary this document uses — `bridge`, `home`, value core — see
+[terms.md](terms.md).)
+
 Status: **done** — S0 through S11, each gated. §12 is the log, §13 the
 finished tree.
 
