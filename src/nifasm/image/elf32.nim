@@ -35,6 +35,7 @@ const
   ET_EXEC* = 2.Elf32_Half
   EM_ARM* = 40.Elf32_Half
   EM_AVR* = 83.Elf32_Half
+  EM_RISCV* = 243.Elf32_Half
   PT_LOAD* = 1.Elf32_Word
   PF_X* = 1.Elf32_Word
   PF_W* = 2.Elf32_Word

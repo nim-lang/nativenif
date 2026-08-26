@@ -1067,6 +1067,48 @@ proc avrAsmTests() =
   echo passed, " / ", fixtures.len, " AVR assembler tests successful"
 
 
+const rvSim = "qemu-riscv32"
+
+proc rv32SelfTest() =
+  ## Build the RV32 encoder's self-checking image and run it. 51 expressions,
+  ## each exiting with its own index on mismatch, then the same image rebuilt 51
+  ## more times with one check's EXPECTED value corrupted — every one of those
+  ## must fail with exactly that index, or the check was passing vacuously.
+  ##
+  ## The target is HOSTED, so this is a plain Linux binary under `qemu-riscv32`:
+  ## no board, no semihosting, and the exit status is a real `exit` syscall.
+  let qemu = findExe(rvSim)
+  if qemu.len == 0:
+    echo rvSim, " not found - skipping RV32 encoder self-test ",
+         "(install: sudo apt-get install qemu-user)"
+    return
+  let gen = ("bin" / "rv32_selftest").addFileExt(ExeExt)
+  exec "nim c --hints:off --warnings:off -o:" & gen & " tests/rv32_selftest.nim"
+  let elf = "tests" / "rv32_selftest.elf"
+  exec quoteShell(gen) & " " & quoteShell(elf)
+  let (output, code) = runProgram(qemu, @[elf])
+  if code == timeoutExitCode:
+    quit "FAILURE (TIMEOUT) RV32 encoder self-test\n"
+  if code != 0:
+    quit "FAILURE RV32 encoder self-test: check #" & $code &
+         " produced the wrong value\n" & output &
+         "\n(run `" & gen & " --list` to name the checks by index)"
+
+  let (listing, listCode) = runProgram(gen, @["--list"])
+  if listCode != 0: quit "FAILURE RV32 encoder self-test: --list failed"
+  let total = listing.strip.splitLines.len
+  for i in 1 .. total:
+    exec quoteShell(gen) & " " & quoteShell(elf) & " --mutate:" & $i
+    let (_, mutCode) = runProgram(qemu, @[elf])
+    if mutCode != i:
+      quit "FAILURE RV32 encoder self-test: check #" & $i &
+           " does not detect its own mutation (exited " & $mutCode &
+           ", expected " & $i & ") — it is passing vacuously"
+  removeFile elf
+  echo "RV32 encoder self-test successful (", total,
+       " checks, each verified to detect its own mutation)"
+
+
 proc arkhamAvrTests() =
   ## The AVR Leng corpus: `arkham -a:avr` → `nifasm` → AVRtest, checking each
   ## fixture's exit code against its `.exitcode` file — the same oracle every
@@ -1792,6 +1834,9 @@ arkhamCortexM64Tests()
 # both need only `bin/avrtest`.
 avrSelfTest()
 avrAsmTests()
+
+# RISC-V 32: encoder-level coverage. Hosted, so it needs only `qemu-riscv32`.
+rv32SelfTest()
 arkhamAvrTests()
 arkhamAvrRejections()
 

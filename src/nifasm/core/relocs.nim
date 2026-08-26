@@ -30,7 +30,25 @@ type
       ## and no knowledge of the section's final vaddr, which is why it can live here
       ## and serve Mach-O, ELF and PE alike.
     rkTB, rkTBL, rkTBcond, rkTADR, rkTMovwMovt, rkTMovwMovtFunc,
-    rkAvrRjmp, rkAvrRcall, rkAvrBrcond, rkAvrJmp, rkAvrCall, rkAvrLdiAddr
+    rkAvrRjmp, rkAvrRcall, rkAvrBrcond, rkAvrJmp, rkAvrCall, rkAvrLdiAddr,
+    rkRvBranch, rkRvJal, rkRvAbsPair
+      ## RV32. Every instruction is four bytes, so unlike AVR nothing here is
+      ## halved — but the immediates are PERMUTED rather than shifted, which is
+      ## this target's own trap.
+      ##
+      ## `rkRvBranch` is B-format: `imm[12|10:5]` above the registers and
+      ## `imm[4:1|11]` below them, in halfword units with bit 0 implicit. Bit 11
+      ## crosses the two halves, in the field a careless reading gives to bit 4.
+      ## ±4 KB. The condition rides in the word already in the buffer, so one
+      ## kind serves all six.
+      ##
+      ## `rkRvJal` is J-format: `imm[20|10:1|11|19:12]`, ±1 MB, and the link
+      ## register likewise stays in the buffer — so the same kind covers a jump
+      ## (`rd` = x0) and a call (`rd` = ra).
+      ##
+      ## `rkRvAbsPair` is `lui`+`addi` carrying an absolute address, with the
+      ## `+0x800` compensation `addi`'s SIGNED immediate forces. Two words, fixed
+      ## size, the twin of Cortex-M's `rkTMovwMovt`.
       ## AVR. Flash is addressed in WORDS and everything `relocs` measures is in
       ## BYTES, so every displacement here is halved before it is encoded — a
       ## step with no analogue on the other targets, and one that fails silently
@@ -185,6 +203,10 @@ proc calculateRelocDistance(fromPos: int; toPos: int; kind: RelocKind = rkJmp): 
     toPos - (fromPos + 2)   # AVR: the PC is the next WORD; halved by the patcher
   of rkAvrJmp, rkAvrCall, rkAvrLdiAddr:
     toPos                   # absolute, like the Thumb pair above
+  of rkRvBranch, rkRvJal:
+    toPos - fromPos         # RV32: from the instruction's own address
+  of rkRvAbsPair:
+    toPos                   # absolute
 
 proc patchAvrWord(buf: var Buffer; at: int; keep, bits: uint16) =
   ## Rewrite one AVR word in place, preserving every bit outside `keep`'s
@@ -242,6 +264,58 @@ proc patchAvrReloc(buf: var Buffer; at: int; kind: RelocKind; distance: int) =
   else:
     raise newException(ValueError, "not an AVR relocation: " & $kind)
 
+proc readRvWord(buf: Buffer; at: int): uint32 =
+  uint32(buf.data[at]) or (uint32(buf.data[at + 1]) shl 8) or
+    (uint32(buf.data[at + 2]) shl 16) or (uint32(buf.data[at + 3]) shl 24)
+
+proc writeRvWord(buf: var Buffer; at: int; w: uint32) =
+  buf.data[at] = byte(w and 0xFF)
+  buf.data[at + 1] = byte((w shr 8) and 0xFF)
+  buf.data[at + 2] = byte((w shr 16) and 0xFF)
+  buf.data[at + 3] = byte((w shr 24) and 0xFF)
+
+proc patchRvReloc(buf: var Buffer; at: int; kind: RelocKind; distance: int) =
+  ## The immediate is REBUILT from the distance and OR'd back over the fields it
+  ## owns, so the opcode, the registers and (for a branch) the condition survive
+  ## from the placeholder. That is what lets one kind serve all six branches and
+  ## both `jal` forms.
+  case kind
+  of rkRvBranch:
+    if distance < -4096 or distance > 4094 or (distance and 1) != 0:
+      raise newException(ValueError,
+        "RV32 branch out of range or misaligned: " & $distance &
+        " bytes (limit ±4 KB); invert the condition and jump over a `jal`")
+    let u = uint32(distance)
+    let old = readRvWord(buf, at)
+    let imm = (((u shr 12) and 1) shl 31) or (((u shr 5) and 0x3F) shl 25) or
+              (((u shr 1) and 0xF) shl 8) or (((u shr 11) and 1) shl 7)
+    # Keep rs2, rs1, funct3 and the opcode; replace only the immediate fields.
+    writeRvWord(buf, at, (old and 0x01FFF07F'u32) or imm)
+  of rkRvJal:
+    if distance < -1048576 or distance > 1048574 or (distance and 1) != 0:
+      raise newException(ValueError,
+        "RV32 `jal` out of range or misaligned: " & $distance &
+        " bytes (limit ±1 MB); a longer call is `auipc`+`jalr`")
+    let u = uint32(distance)
+    let old = readRvWord(buf, at)
+    let imm = (((u shr 20) and 1) shl 31) or (((u shr 1) and 0x3FF) shl 21) or
+              (((u shr 11) and 1) shl 20) or (((u shr 12) and 0xFF) shl 12)
+    writeRvWord(buf, at, (old and 0x00000FFF'u32) or imm)
+  of rkRvAbsPair:
+    # `lui rd, hi` then `addi rd, rd, lo`. The `+0x800` is the compensation
+    # `addi`'s SIGNED immediate forces: a low half above 0x7FF is a NEGATIVE
+    # addend, so the upper half has to be one higher to make up for it. Omitting
+    # it is wrong by exactly 0x1000, for a bit under half of all addresses.
+    let v = uint32(distance) + buf.absBase
+    let hi = (v + 0x800) shr 12
+    let lo = v - (hi shl 12)
+    let oldHi = readRvWord(buf, at)
+    writeRvWord(buf, at, (oldHi and 0x00000FFF'u32) or ((hi and 0xFFFFF) shl 12))
+    let oldLo = readRvWord(buf, at + 4)
+    writeRvWord(buf, at + 4, (oldLo and 0x000FFFFF'u32) or ((lo and 0xFFF) shl 20))
+  else:
+    raise newException(ValueError, "not an RV32 relocation: " & $kind)
+
 # Jump optimization functions
 proc updateRelocDisplacements*(buf: var Buffer) =
   ## Update all relocation displacements based on current label positions
@@ -280,6 +354,10 @@ proc updateRelocDisplacements*(buf: var Buffer) =
         currentPos + 2  # one AVR word
       of rkAvrJmp, rkAvrCall, rkAvrLdiAddr:
         currentPos + 4  # two words: an absolute branch, or the `ldi` pair
+      of rkRvBranch, rkRvJal:
+        currentPos + 4
+      of rkRvAbsPair:
+        currentPos + 8  # `lui` + `addi`
 
     if requiredSize > buf.data.len:
       continue  # Skip this relocation if buffer is too small
@@ -502,6 +580,8 @@ proc updateRelocDisplacements*(buf: var Buffer) =
                                       uint32(distance) + buf.absBase + thumbBit)
     of rkAvrRjmp, rkAvrRcall, rkAvrBrcond, rkAvrJmp, rkAvrCall, rkAvrLdiAddr:
       patchAvrReloc(buf, currentPos, reloc.kind, distance)
+    of rkRvBranch, rkRvJal, rkRvAbsPair:
+      patchRvReloc(buf, currentPos, reloc.kind, distance)
     of rkADR:
       # ARM64 ADR: 21-bit signed immediate, byte offset from PC
       if distance < -(1 shl 20) or distance >= (1 shl 20):
