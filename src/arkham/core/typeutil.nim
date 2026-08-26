@@ -44,7 +44,7 @@ proc intTypeWidth*(c: Cursor): int =
     if t.kind == IntLit and intVal(t) > 0: int(intVal(t)) else: 64
   else: 64
 
-proc slotWidthSigned*(s: AsmSlot): tuple[width: int, signed: bool] =
+proc slotWidthSigned(s: AsmSlot): tuple[width: int, signed: bool] =
   ## A scalar slot's significant bit width and signedness (for extension).
   case s.kind
   of AInt:  (s.size * 8, true)

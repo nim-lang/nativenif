@@ -126,7 +126,7 @@ proc semiTtyName*(g: CodeGen): string {.inline.} =
 proc semiTtyHandle*(g: CodeGen): string {.inline.} =
   SemiTtyHandleBase & "." & thisModuleSuffix(g.prog)
 
-proc semiBlockSlot*(g: var CodeGen; idx: int) =
+proc semiBlockSlot(g: var CodeGen; idx: int) =
   ## Declare one word of a semihosting parameter block as its own `(s)` slot.
   ##
   ## Individually, not as one `(array (i 32) N)`: a store into an array-typed slot

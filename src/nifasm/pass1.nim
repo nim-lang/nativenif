@@ -20,7 +20,7 @@ import nifcore
 import core / [context, sem, cursors, diagnostics, typesem, modules,
                tags, model, tagconv, decls]
 
-proc pass1Proc*(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string; declStart: int) =
+proc pass1Proc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string; declStart: int) =
   # (proc :Name (params ...) (result ...) (clobber ...) (body ...))
   inc n
   if n.kind != SymbolDef: error("Expected proc name", n)
@@ -43,7 +43,7 @@ proc pass1Proc*(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: st
                    moduleName: moduleName, declStart: declStart)
   scope.define(sym)
 
-proc pass1Syproc*(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string; declStart: int) =
+proc pass1Syproc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string; declStart: int) =
   # (syproc :Name (params ...) (result ...) (clobber ...) NR) — a Linux syscall with a
   # full proctype: params bound to the syscall ABI registers (so an `(arg pN)` binding
   # in a `(prepare …)` lands in the right register, e.g. x86-64 arg4 → r10), a result in

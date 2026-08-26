@@ -121,7 +121,7 @@ proc isConstScalarInit*(c: Cursor): bool =
   of TagLit: v.exprKind in {TrueC, FalseC, NilC}
   else: false
 
-proc constAddrSym*(c: Cursor): string =
+proc constAddrSym(c: Cursor): string =
   ## If `c` is a static-ADDRESS initializer — a bare symbol naming a proc or
   ## global (a link-time constant address), possibly wrapped in the same
   ## conv/cast/par peels as `isConstScalarInit` — return that symbol's name; else
@@ -146,7 +146,7 @@ proc constAddrSym*(c: Cursor): string =
       else: inc v
   if v.kind == Symbol: result = symName(v)
 
-proc isStaticConstInit*(c: Cursor): bool =
+proc isStaticConstInit(c: Cursor): bool =
   ## Whether an initializer is a compile-time constant that `constToBytes` can lay
   ## out as raw bytes: a scalar literal, a static address, a string, or an
   ## `(aconstr …)`/`(oconstr …)` built recursively out of those.
@@ -179,7 +179,7 @@ proc isStaticConstInit*(c: Cursor): bool =
 proc appendLE(buf: var string; bits: uint64; size: int) =
   for i in 0 ..< size: buf.add char((bits shr (8 * i)) and 0xFF'u64)
 
-proc constScalarBits*(p: var Program; typ, val: Cursor): uint64 =
+proc constScalarBits(p: var Program; typ, val: Cursor): uint64 =
   ## `constLitBits`, narrowed to the width of the DECLARED type. `constLitBits`
   ## speaks f64 throughout, so an `(f 32)` constant needs its value ROUNDED to
   ## single precision: truncating the double bits to four bytes yields 0 for

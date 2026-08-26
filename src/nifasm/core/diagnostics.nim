@@ -32,7 +32,7 @@ proc lenient*(): bool {.inline.} = gLenient
   ## The `(lenient)` pragma of the proc being assembled: ported code whose
   ## register discipline predates ours, checked less strictly by design.
 
-proc nodeRepr*(n: Cursor): string =
+proc nodeRepr(n: Cursor): string =
   ## A compact rendering of the token at `n` for error messages (nifcore has no
   ## whole-subtree `toString` over a bare Cursor, and the diagnostic only needs
   ## the head). Negative tests match on the message text, not this.
@@ -47,7 +47,7 @@ proc nodeRepr*(n: Cursor): string =
   of DotToken: "."
   else: $n.kind
 
-proc infoStr*(n: Cursor): string =
+proc infoStr(n: Cursor): string =
   let li = n.rawLineInfo
   if li.isValid:
     result = n.lineInfoFile & "(" & $li.line & ", " & $li.col & ")"

@@ -53,7 +53,7 @@ proc isXmmTagEnum*(t: TagEnum): bool {.inline.} =
 proc tagToXmm*(t: TagEnum): x86.XmmRegister {.inline.} =
   x86.XmmRegister(ord(t) - ord(Xmm0TagId))
 
-proc parseXmm*(n: var Cursor): x86.XmmRegister =
+proc parseXmm(n: var Cursor): x86.XmmRegister =
   ## Parse a *raw* `(xmmN)` SSE register operand (N in 0..15). Used only where a
   ## bare register is required (the `rebind`/`withreg` target). Operand reads in the
   ## scalar-float instructions go through `parseXmmOperand`, which also accepts a

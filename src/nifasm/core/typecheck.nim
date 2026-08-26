@@ -16,7 +16,7 @@
 import nifcore
 import sem, context, diagnostics
 
-proc addrWidthMove*(a, b: Type): bool {.inline.} =
+proc addrWidthMove(a, b: Type): bool {.inline.} =
   ## A pointer — a function pointer (`ProcT`), a data pointer (`PtrT`/`AptrT`) — is an
   ## 8-byte address. Moving it to/from a general 64-bit register, an integer, or
   ## another pointer is a plain address move: loading an indirect-call target or a
@@ -29,7 +29,7 @@ proc addrWidthMove*(a, b: Type): bool {.inline.} =
   const AddrLike = {ProcT, PtrT, AptrT, IntT, UIntT}
   (a.kind in PtrLike and b.kind in AddrLike) or (b.kind in PtrLike and a.kind in AddrLike)
 
-proc litFitsWidth*(v: int64; bits: int): bool {.inline.} =
+proc litFitsWidth(v: int64; bits: int): bool {.inline.} =
   ## Does integer literal `v` fit a `bits`-wide destination, read as either
   ## signed or unsigned? (`0..2^bits-1` ∪ `-2^(bits-1)..-1`.) Both readings are
   ## the same bit pattern in the same register, and which one a value "is" is the
@@ -73,11 +73,11 @@ proc isIntegerType*(t: Type): bool =
   ## Check if type is an integer type (int, uint, literal) or a register (which is untyped)
   t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.RegisterT}
 
-proc isFloatType*(t: Type): bool =
+proc isFloatType(t: Type): bool =
   ## Check if type is a floating point type
   t.kind == TypeKind.FloatT
 
-proc canDoIntegerArithmetic*(t: Type): bool =
+proc canDoIntegerArithmetic(t: Type): bool =
   ## May `t` be an operand of `add`/`sub`/`neg`? Integers, integer literals and raw
   ## (untyped) registers — no pointer of any kind.
   ##
@@ -92,7 +92,7 @@ proc canDoIntegerArithmetic*(t: Type): bool =
   ## covers hand-written asm-NIF.
   t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.RegisterT}
 
-proc canCompare*(t: Type): bool =
+proc canCompare(t: Type): bool =
   ## Check if a type may be a `cmp` operand. A superset of integer arithmetic:
   ## any pointer (a comparison, not arithmetic) and — crucially — `bool`, since a
   ## bool is a 0/1 integer and `cmp reg, 0` is the canonical "if bool" test. This is
@@ -102,7 +102,7 @@ proc canCompare*(t: Type): bool =
              TypeKind.PtrT, TypeKind.AptrT, TypeKind.RegisterT, TypeKind.BoolT,
              TypeKind.NilT}  # `cmp ptr, nil` / `cmp nil, ptr` null tests
 
-proc canDoBitwiseOps*(t: Type): bool =
+proc canDoBitwiseOps(t: Type): bool =
   ## May `t` be an operand of `and`/`or`/`xor`/`not`? Integers, literals, raw
   ## registers — and `bool`, for the same reason `canCompare` admits it: a bool is
   ## an 8-bit 0/1 integer, and masking one is meaningful. `and reg, 1` after a
@@ -115,7 +115,7 @@ proc canDoBitwiseOps*(t: Type): bool =
   t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.RegisterT,
              TypeKind.BoolT}
 
-proc canExchange*(t: Type): bool =
+proc canExchange(t: Type): bool =
   ## Check if a type may be an `xchg` operand: any register-sized scalar — integer
   ## OR pointer. `xchg` swaps 8 bytes irrespective of the logical type, and an atomic
   ## pointer exchange (lock-free list head swap) is a legitimate, common use. Like
@@ -210,7 +210,7 @@ proc movTypeOk*(destKind: OperandKind; destTyp: Type;
                      opTyp.bits > intMemAccess(destTyp).bits
   result = narrowingArg
 
-proc checkType*(want, got: Type; n: Cursor) =
+proc checkType(want, got: Type; n: Cursor) =
   if lenient(): return
   if not compatible(want, got):
     typeError(want, got, n)
@@ -240,7 +240,7 @@ proc checkExchangeType*(t: Type; op: string; n: Cursor) =
   if not canExchange(t):
     error("Operation '" & op & "' requires an integer or pointer type, got " & $t, n)
 
-proc checkFloatType*(t: Type; op: string; n: Cursor) =
+proc checkFloatType(t: Type; op: string; n: Cursor) =
   if not isFloatType(t):
     error("Operation '" & op & "' requires floating point type, got " & $t, n)
 

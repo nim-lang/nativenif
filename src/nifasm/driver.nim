@@ -32,7 +32,7 @@ import image / [dwarf, tracetable]
 import image / [writecommon, writeelf, writemacho, writepe, writecortexm]
 import pass1, pass2
 
-proc generateSymbol*(ctx: var GenContext; sym: Symbol) =
+proc generateSymbol(ctx: var GenContext; sym: Symbol) =
   ## Generate code for a single reachable symbol on-demand. nifasm is the linker:
   ## a reachable FOREIGN symbol is bundled into this same output (its body/storage
   ## emitted, cross-module references resolved as ordinary direct relocations) —
@@ -201,7 +201,7 @@ proc generateSymbol*(ctx: var GenContext; sym: Symbol) =
   else:
     discard  # Types and other symbols don't need code generation
 
-proc processReachableSymbols*(ctx: var GenContext) =
+proc processReachableSymbols(ctx: var GenContext) =
   ## Process all pending symbols until queue is empty
   while ctx.pendingSymbols.len > 0:
     let fullName = ctx.pendingSymbols.pop()
@@ -218,7 +218,7 @@ proc processReachableSymbols*(ctx: var GenContext) =
     if sym != nil:
       generateSymbol(ctx, sym)
 
-proc setupWinEntry*(ctx: var GenContext) =
+proc setupWinEntry(ctx: var GenContext) =
   ## Synthesize the PE entry stub — the Windows counterpart of `setupTls`'s prologue.
   ##
   ## arkham's `main.0` has the C signature `main(argc, argv, envp)` and reads those
@@ -236,7 +236,7 @@ proc setupWinEntry*(ctx: var GenContext) =
   x86.emitMovImmToReg(ctx.buf.data, x86.RDX, 0)             # envp = nil
   x86.emitJmp(ctx.buf, LabelId(ctx.entrySym.offset))        # → real entry
 
-proc setupLinuxA64Entry*(ctx: var GenContext) =
+proc setupLinuxA64Entry(ctx: var GenContext) =
   ## Synthesize the AArch64/Linux entry stub — the counterpart of `setupTls`'s
   ## argc/argv tail on x86-64.
   ##
@@ -266,7 +266,7 @@ proc setupLinuxA64Entry*(ctx: var GenContext) =
   arm64.emitAddImm(ctx.buf.data, arm64.X2, arm64.X2, 8'u16)   # x2 = &envp[0]
   arm64.emitB(ctx.buf, LabelId(ctx.entrySym.offset))          # → real entry
 
-proc setupTls*(ctx: var GenContext) =
+proc setupTls(ctx: var GenContext) =
   ## nifasm owns the per-thread TLS. After every bundled tvar has an FS offset
   ## (`ctx.tlsOffset`), reserve the unified `arkham.tls.0` block in `.bss` (sized
   ## for all modules' tvars) and synthesize the entry prologue that points FS at it

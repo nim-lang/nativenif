@@ -37,7 +37,7 @@ proc allocSlotUp*(m: var SlotManager; t: Type; slotAlign = 0): int =
   result = m.stackSize
   m.stackSize += alignedSize(t, a)
 
-proc allocSlot*(m: var SlotManager; t: Type): int =
+proc allocSlot(m: var SlotManager; t: Type): int =
   let size = alignedSize(t)
   var foundSlot = -1
   for i in 0..<m.freeSlots.len:

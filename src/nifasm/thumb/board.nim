@@ -30,7 +30,7 @@ const
     ## fault-slot argument above does not reach it — there is nothing to put in
     ## those slots, and every image ever built by this assembler has had two.
 
-proc readLayoutSize*(n: var Cursor): uint32 =
+proc readLayoutSize(n: var Cursor): uint32 =
   ## `(bytes N)` — the only unit that reaches here. arkham normalizes
   ## `(kilobytes …)`/`(megabytes …)` away before forwarding, so this reader never
   ## multiplies and can never disagree with the one that did.
@@ -42,7 +42,7 @@ proc readLayoutSize*(n: var Cursor): uint32 =
     while n.hasMore: skip n
   result = got
 
-proc readLayoutStartAddress*(n: var Cursor): uint32 =
+proc readLayoutStartAddress(n: var Cursor): uint32 =
   if n.kind != TagLit or tagToNifasmExpr(n.tag) != StartAddressX:
     error("expected (startAddress N) in (layout …)", n)
   var got = 0'u32

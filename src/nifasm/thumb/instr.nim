@@ -20,11 +20,11 @@ import "../core" / [context, sem, cursors, diagnostics, typecheck, typesem,
 import encoder as thumb2
 import regs, operands
 
-proc genStmtM*(n: var Cursor; ctx: var GenContext)
-proc genInstM*(n: var Cursor; ctx: var GenContext)
+proc genStmtM(n: var Cursor; ctx: var GenContext)
+proc genInstM(n: var Cursor; ctx: var GenContext)
 
 
-proc genIteM*(n: var Cursor; ctx: var GenContext) =
+proc genIteM(n: var Cursor; ctx: var GenContext) =
   inc n
   let lElse = ctx.buf.createLabel()
   let lEnd = ctx.buf.createLabel()
@@ -58,7 +58,7 @@ proc genIteM*(n: var Cursor; ctx: var GenContext) =
   # A register clobbered on EITHER branch is clobbered after the merge.
   ctx.clobberedM = thenClobbered + elseClobbered
 
-proc genLoopM*(n: var Cursor; ctx: var GenContext) =
+proc genLoopM(n: var Cursor; ctx: var GenContext) =
   inc n
   # The only form arkham emits: `(loop (stmts …))`, whose back-edge nifasm adds
   # here. The body carries a FORWARD branch to a break label defined after the
@@ -71,7 +71,7 @@ proc genLoopM*(n: var Cursor; ctx: var GenContext) =
     return
   error("Cortex-M: only the `(loop (stmts …))` form is supported", n)
 
-proc genJtrueM*(n: var Cursor; ctx: var GenContext) =
+proc genJtrueM(n: var Cursor; ctx: var GenContext) =
   ## `(jtrue <cfvar>… <flag>)` — branch to the cfvar's label when the flag holds.
   inc n
   var target = LabelId(-1)
@@ -88,7 +88,7 @@ proc genJtrueM*(n: var Cursor; ctx: var GenContext) =
   inc n
   ctx.emitBranchM(condOfFlagM(flagTag, n), target)
 
-proc bindFRegM*(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
+proc bindFRegM(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
                freg: thumb2.FloatRegister) =
   ## The FPv4-SP twin of `bindRegM`: bind an s-register to a typed name, killing
   ## its prior tenant so a stale value shows up as "Unknown symbol" rather than
@@ -101,7 +101,7 @@ proc bindFRegM*(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
   ctx.mFRegBindings[freg] = name
   ctx.scope.define(sym)
 
-proc bindRegM*(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
+proc bindRegM(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
               reg: thumb2.Register) =
   ## Bind `reg` to the typed name `name`, KILLING its prior tenant first — so a
   ## later use of a value wrongly left in that register is an "Unknown symbol"
@@ -116,7 +116,7 @@ proc bindRegM*(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
   ctx.mRegBindings[reg] = name
   ctx.scope.define(sym)
 
-proc parseRebindHeaderM*(n: var Cursor; ctx: var GenContext):
+proc parseRebindHeaderM(n: var Cursor; ctx: var GenContext):
                        tuple[name: string; reg: thumb2.Register] =
   ## Parse `:name TYPE (reg)` (cursor already inside the node) and establish the
   ## binding. Shared by `rebind` and `withreg`.
@@ -144,7 +144,7 @@ const MCallClobbers* = {thumb2.R0 .. thumb2.R3, thumb2.IP, thumb2.LR}
   ## address). r4–r11 are callee-saved, which is where a value that must survive
   ## a call belongs.
 
-proc callClobbersM*(ctx: GenContext): set[thumb2.Register] =
+proc callClobbersM(ctx: GenContext): set[thumb2.Register] =
   ## What THIS callee declares it destroys, falling back to the full volatile set
   ## when the signature declared nothing. An empty declared list is meaningful —
   ## it is what lets a caller keep a value in a caller-saved register across a
@@ -153,7 +153,7 @@ proc callClobbersM*(ctx: GenContext): set[thumb2.Register] =
   if t != nil and t.kind == ProcT and t.hasClobberDecl: t.clobbersM
   else: MCallClobbers
 
-proc genPrepareM*(n: var Cursor; ctx: var GenContext) =
+proc genPrepareM(n: var Cursor; ctx: var GenContext) =
   ## `(prepare target … (call) …)` — the call-site protocol. Sets up the call
   ## context so every `(arg …)` is checked against the target's signature, then
   ## verifies on the way out that every register parameter was bound and that a
@@ -217,7 +217,7 @@ proc genPrepareM*(n: var Cursor; ctx: var GenContext) =
   if outerCall.state == CallContextState.Disabled:
     ctx.callContext.state = CallContextState.Disabled
 
-proc genCallMarkerM*(n: var Cursor; ctx: var GenContext) =
+proc genCallMarkerM(n: var Cursor; ctx: var GenContext) =
   if not ctx.inCall:
     error("(call) can only be used inside a prepare block", n)
   if ctx.callContext.callEmitted:
@@ -261,7 +261,7 @@ proc genCallMarkerM*(n: var Cursor; ctx: var GenContext) =
   ctx.callContext.callEmitted = true
   inc n
 
-proc genInstM*(n: var Cursor; ctx: var GenContext) =
+proc genInstM(n: var Cursor; ctx: var GenContext) =
   if n.kind != TagLit: error("Expected instruction", n)
   let instTag = tagToMInst(n.tag)
   let start = n
@@ -819,7 +819,7 @@ proc genInstM*(n: var Cursor; ctx: var GenContext) =
     error("Cortex-M: instruction '" & $instTag & "' is not implemented yet " &
           "(see doc/cortex_m.md)", start)
 
-proc genStmtM*(n: var Cursor; ctx: var GenContext) =
+proc genStmtM(n: var Cursor; ctx: var GenContext) =
   genInstM(n, ctx)
 
 proc genInstNodeM*(n: var Cursor; ctx: var GenContext) =

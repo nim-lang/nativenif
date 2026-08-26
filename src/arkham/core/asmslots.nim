@@ -90,7 +90,7 @@ proc setTargetWord*(t: TargetWord) =
 
 proc wordSize*(): int {.inline.} = targetWord.ptrSize
 proc wordAlign*(): int {.inline.} = targetWord.ptrAlign
-proc maxScalarSize*(): int {.inline.} = targetWord.maxScalar
+proc maxScalarSize(): int {.inline.} = targetWord.maxScalar
 proc maxFloatSize*(): int {.inline.} = targetWord.maxFloat
 proc defaultFloatSlot*(): AsmSlot {.inline.} =
   ## The dont-care FLOAT placeholder: the widest float this target has. A bare
@@ -136,7 +136,7 @@ type
     RcSimd       ## v0… : float / HFA
     RcIndirect   ## caller passes x8 = address; callee writes there (> 16 bytes)
 
-proc classifyArg*(s: AsmSlot): ArgClass =
+proc classifyArg(s: AsmSlot): ArgClass =
   # The AAPCS64 thresholds stated in words: an aggregate wider than TWO words
   # goes by reference, one wider than a single word packs into a GPR pair. On a
   # 64-bit target these are the familiar 16 and 8.
@@ -150,7 +150,7 @@ proc classifyArg*(s: AsmSlot): ArgClass =
   else:
     if s.size > w: AcGprPair else: AcGpr
 
-proc classifyResult*(s: AsmSlot): ResultClass =
+proc classifyResult(s: AsmSlot): ResultClass =
   case s.kind
   of AFloat: RcSimd
   of AMem: (if s.size > 2*wordSize(): RcIndirect else: RcGpr)

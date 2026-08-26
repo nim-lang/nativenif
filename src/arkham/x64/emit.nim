@@ -117,7 +117,7 @@ proc stagingNote*(g: var CodeGen; r: Reg; what: string) {.inline.} =
   else:
     discard
 
-proc stagingRelease*(g: var CodeGen; r: Reg) {.inline.} =
+proc stagingRelease(g: var CodeGen; r: Reg) {.inline.} =
   when defined(arkhamStagingDbg):
     for i in countdown(g.stagingLive.high, 0):
       if g.stagingLive[i][0] == r:
@@ -495,7 +495,7 @@ proc releaseStaleName*(g: var CodeGen; r: Reg) =
     if dead.len > 0:
       g.ab.tree KillX64: g.ab.sym dead
 
-proc regHoldsLiveLocal*(g: var CodeGen; r: Reg): bool =
+proc regHoldsLiveLocal(g: var CodeGen; r: Reg): bool =
   ## Is a local/param LIVE in `r` right now? A *param* can sit in a caller-saved
   ## arg register (`p0.0` in rdi), so staging must not clobber it just because it
   ## is caller-saved.
@@ -628,7 +628,7 @@ proc pickStaging*(g: var CodeGen; what: string; avoid: Reg = NoReg): Reg =
                 " in proc " & g.curProcName & g.stagingCensus(avoid)
   g.stagingNote(result, what)
 
-proc regHoldsLiveFLoc*(g: var CodeGen; f: FReg): bool =
+proc regHoldsLiveFLoc(g: var CodeGen; f: FReg): bool =
   ## True if a float local/param currently lives in SIMD register `f` (per the
   ## allocator's view). A leaf-proc float param sits in its incoming arg register
   ## (xmm0–7), so the float staging pick must not clobber it.
@@ -636,7 +636,7 @@ proc regHoldsLiveFLoc*(g: var CodeGen; f: FReg): bool =
     let loc = g.plan.planned(pos)
     if loc.kind == InFReg and loc.f == f: return true
 
-proc pickFStaging*(g: var CodeGen; avoid: FReg = NoFReg): FReg =
+proc pickFStaging(g: var CodeGen; avoid: FReg = NoFReg): FReg =
   ## The float analogue of `pickStagingScratch`: the first SIMD arg register
   ## (xmm0–7) that is not the scratch pool (xmm8–15, exhausted by the time we get
   ## here), not an in-flight float arg / held staging reg (`sealedF`), not a live
@@ -1616,7 +1616,7 @@ proc dstAggrInfo*(g: var CodeGen; dst: Location): (bool, int) =
 proc foldableFloatLeafE*(g: var CodeGen; c: Cursor): bool =
   c.kind == Symbol and g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind in {InFReg, NamedStack}
 
-proc emCallerSaveStore*(g: var CodeGen; varName: string) =
+proc emCallerSaveStore(g: var CodeGen; varName: string) =
   ## Save a caller-saved value into its permanent slot, then release the register.
   g.ab.tree MovX64:                                  # (mov (mem (rsp) slot) name)
     g.emStackMem(callerSaveSlotName(varName))
@@ -1629,7 +1629,7 @@ proc emCallerSaveStore*(g: var CodeGen; varName: string) =
   g.ab.tree KillX64: g.ab.sym varName
   discard g.rb.takeBinding(g.plan.homeOfSym(varName).r)
 
-proc emCallerSaveRestore*(g: var CodeGen; slotName, varName: string; r: Reg) =
+proc emCallerSaveRestore(g: var CodeGen; slotName, varName: string; r: Reg) =
   ## Reload a caller-saved value after the call. The call CLOBBERS every volatile, and
   ## nifasm drops the bindings of clobbered registers with it — so the name is no longer
   ## a legal destination and must be re-bound first (same register, same type it was

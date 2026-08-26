@@ -26,7 +26,7 @@ from "../arm/machine_m" as machine_m import nil
 import emit, value, frame, stmt, asmproc
 import "../cortexm/runtime"
 
-proc genProc2*(g: var CodeGen; info: ProcInfo) =
+proc genProc2(g: var CodeGen; info: ProcInfo) =
   when defined(arkhamTraceProcs):
     stderr.writeLine "arkham genProc2: " & info.asmName
   if info.isAsm:
@@ -207,7 +207,7 @@ proc genTvar*(g: var CodeGen; name: string; decl: Cursor) =
     g.ab.close()
     while c.hasMore: skip c
 
-proc rejectForThumbM*(g: var CodeGen) =
+proc rejectForThumbM(g: var CodeGen) =
   ## Everything the Cortex-M target does NOT have, refused by name at the module
   ## level before a single instruction is emitted. Each of these would otherwise
   ## reach an AArch64-shaped emitter and produce something plausible and wrong.

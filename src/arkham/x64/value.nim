@@ -64,7 +64,7 @@ proc prematLval2*(g: var CodeGen; c: Cursor; asBase = false; hint = NoReg;
 # emission.
 proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location)
-proc emitDivMod2*(g: var CodeGen; c: Cursor; dest: var Location)
+proc emitDivMod2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCondValue2*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCondE*(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool)
 proc emitScalarCmpE*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
@@ -112,7 +112,7 @@ when not defined(arkhamNoNarrowHomes):
 # regbind.nim / codegen_common.nim; these are the two doors the x86-64 emitter
 # uses them through.
 
-proc scalarMemMov*(g: var CodeGen; loc: Location; reg: Reg; load: bool) =
+proc scalarMemMov(g: var CodeGen; loc: Location; reg: Reg; load: bool) =
   ## The one GPR scalar memory move over every lvalue kind, both directions:
   ## `load` → `reg ← <loc>`; else `<loc> ← reg`. Load and store are mirror images
   ## — the value register and the memory operand swap order in the `(mov …)` — apart
@@ -222,7 +222,7 @@ proc emitStoreLoc*(g: var CodeGen; loc: Location; src: Reg) =
   if loc.kind == NamedStack: g.killMirrorsOf loc.name
   g.scalarMemMov(loc, src, load = false)
 
-proc floatMemMov*(g: var CodeGen; loc: Location; reg: FReg; bits: int; load: bool) =
+proc floatMemMov(g: var CodeGen; loc: Location; reg: FReg; bits: int; load: bool) =
   ## The one SIMD scalar memory move, both directions: `load` → `reg ← <loc>`; else
   ## `<loc> ← reg`. The float twin of `scalarMemMov`; floats occur only as InFReg /
   ## NamedStack / Mem (no Tvar/Glob), and the `Mem` arm is the mirror-image swap.
@@ -267,7 +267,7 @@ proc floatMemMov*(g: var CodeGen; loc: Location; reg: FReg; bits: int; load: boo
     g.unbindLvalTemps2(loc.cur)
   else: raiseAssert "arkham x64: floatMemMov on location kind " & $loc.kind
 
-proc emitStoreFLoc*(g: var CodeGen; loc: Location; src: FReg; bits: int) =
+proc emitStoreFLoc(g: var CodeGen; loc: Location; src: FReg; bits: int) =
   ## `<float Location> ← src`.
   if loc.kind == NamedStack: g.killMirrorsOf loc.name   # see `emitStoreLoc`
   g.floatMemMov(loc, src, bits, load = false)
@@ -396,9 +396,9 @@ proc aggrArgAddr*(g: var CodeGen; a: Cursor; recorded: Reg; avoid: openArray[Reg
   (s, true)
 proc genConstr2*(g: var CodeGen; c: Cursor; dst: Location)
 proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location)
-proc binMemLval2*(g: var CodeGen; op: X64Inst; dest: Reg; c: Cursor)
+proc binMemLval2(g: var CodeGen; op: X64Inst; dest: Reg; c: Cursor)
 
-proc aggrArgSource*(g: var CodeGen; a: Cursor; tcur: Cursor; tn: SymId):
+proc aggrArgSource(g: var CodeGen; a: Cursor; tcur: Cursor; tn: SymId):
                   (string, Reg, bool) =
   ## Reach the bytes of a NON-LVALUE aggregate call argument `a` of nominal type `tn`,
   ## and describe where they are as `(home, ptrReg, isTvar)`: a named stack slot
@@ -436,7 +436,7 @@ proc aggrArgSource*(g: var CodeGen; a: Cursor; tcur: Cursor; tn: SymId):
     g.genStore2(a, namedStackLoc(home, g.exprSlot(a)))
   (home, ptrReg, isTvar)
 
-proc binFold*(g: var CodeGen; op: X64Inst; dest: Reg; loc: Location; opCur: Cursor) =
+proc binFold(g: var CodeGen; op: X64Inst; dest: Reg; loc: Location; opCur: Cursor) =
   ## `dest op= <memory operand>` (a `NamedStack` slot or a `Mem` access chain `opCur`),
   ## EXCEPT a sub-8-byte field: it has no 64-bit ALU memory form (`add r64, m32` doesn't
   ## exist, and a folded 64-bit read would over-read the field). Such a field is loaded
@@ -532,9 +532,9 @@ proc emitMemIntrin2*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
     g.bindTemp(RSI, s); g.bindTemp(RDX, s); g.bindTemp(RCX, s)
     g.genMemIntrinBody(builtin)
 
-proc atomicValueIsImm*(loc: Location): bool {.inline.} = loc.kind == Imm
+proc atomicValueIsImm(loc: Location): bool {.inline.} = loc.kind == Imm
 
-proc emitBitBuiltin2*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
+proc emitBitBuiltin2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
   ## Value-core GCC bit builtin: the single integer argument goes to rdi (a
   ## normal int-arg call), then the inline scan. Result → rax (moved to its
   ## home by emitCall2). The legacy twin is `genBitBuiltin`.
@@ -847,7 +847,7 @@ proc prematAddrVal2*(g: var CodeGen; c: Cursor) =
   g.plan.planAtEmitTime(pos, d)
   g.reloadMemBase2(pos)
 
-proc prematAddrValAs2*(g: var CodeGen; c, valueCur: Cursor) =
+proc prematAddrValAs2(g: var CodeGen; c, valueCur: Cursor) =
   ## `prematAddrVal2` with the emitted VALUE decoupled from the POSITION whose register
   ## receives it: the address operand of a displacement-folded `(deref (… + K))` holds
   ## only the base, but it lives in the register the allocator reserved for the whole
@@ -955,7 +955,7 @@ proc prematLval2*(g: var CodeGen; c: Cursor; asBase = false; hint = NoReg;
       g.genStore2(c, namedStackLoc(home, g.exprSlot(c)))
     else: discard
 
-proc binMemLval2*(g: var CodeGen; op: X64Inst; dest: Reg; c: Cursor) =
+proc binMemLval2(g: var CodeGen; op: X64Inst; dest: Reg; c: Cursor) =
   ## `dest op= [<lvalue c>]` — fold a memory-load operand into an ALU op via the
   ## value-core address machinery (prematLval2 / emLvalAddr2 / unbindLvalTemps2).
   ## The mirror of emitMemLoad2 with an ALU op in place of the load `mov`.
@@ -1057,7 +1057,7 @@ proc aggrAddrInto*(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind
     g.unbindLvalTemps2(lv)
     for r in bound: g.unbindTemp(r)
 
-proc buildNestedAggrTemp*(g: var CodeGen; valC, fty: Cursor): (string, int) =
+proc buildNestedAggrTemp(g: var CodeGen; valC, fty: Cursor): (string, int) =
   ## Build an aggregate field/element value `valC` (an inline `(oconstr/aconstr …)`, an
   ## aggregate symbol, or a memory lvalue) — of declared nominal type `fty` — into a
   ## synthetic stack temp through the general `genStore2` (which recurses for deeper
@@ -1411,7 +1411,7 @@ proc aggrAddrLoc*(g: var CodeGen; loc: Location; dest: Reg) =
   of Mem: g.aggrAddrInto(loc.cur, dest, addrSlot(), doBind = false)
   else: raiseAssert "arkham x64n: aggrAddrLoc of " & $loc.kind
 
-proc aggrDstEnd*(g: var CodeGen; loc: Location; staged: var Reg): AggrEnd =
+proc aggrDstEnd(g: var CodeGen; loc: Location; staged: var Reg): AggrEnd =
   ## The copy-destination twin of `aggrSrcEnd`: a `NamedStack` slot is written straight
   ## through `(mem (rsp) name off)` and costs no register; a global/threadvar/computed
   ## lvalue must have its address materialized. `staged` receives the register to
@@ -2083,7 +2083,7 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
     g.emitStoreLoc(res, resStaging)
     g.giveBack resStaging
   dest = res
-proc settleResultReg*(g: var CodeGen; dest: var Location; resReg: Reg) =
+proc settleResultReg(g: var CodeGen; dest: var Location; resReg: Reg) =
   ## FUSED result settling: move/store a value produced in the fixed register
   ## `resReg` (rax after a div/mem-intrinsic, rdx for a remainder) into `dest`,
   ## resolving an unconstrained dest to `resReg` itself as a bound temp.
@@ -2101,7 +2101,7 @@ proc settleResultReg*(g: var CodeGen; dest: var Location; resReg: Reg) =
     if not bound: g.unbindTemp(resReg)
   else: raiseAssert "arkham x64n: fixed-reg result dest " & $dest.kind
 
-proc emitDivMod2*(g: var CodeGen; c: Cursor; dest: var Location) =
+proc emitDivMod2(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED x86 `idiv`/`div`: dividend → rax (fixed), divisor → a register
   ## (never rax/rdx — the temp pools exclude both); the result (rax quotient /
   ## rdx remainder) moves/stores to `dest`. A constant power-of-two divisor
@@ -2973,7 +2973,7 @@ proc emitCast2*(g: var CodeGen; c: Cursor; dest: var Location) =
     innerSlot.typ = dest.typ
     dest = innerSlot
 
-proc emitCall2Inner*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
+proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
                     tail = false) =
   ## FUSED call. allocCall's placement decisions run inline: each scalar arg
   ## dest-threads straight into its ABI register (or a parked callee-saved

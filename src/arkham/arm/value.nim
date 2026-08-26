@@ -86,17 +86,17 @@ import emit, mem, aggr
 # spelled raw, which nifasm resolves back to the same register.
 # ── expressions: target-into-register ───────────────────────────────────────
 
-proc marshalStackAggrArg*(g: var CodeGen; a: Cursor; paramNm: string)    # defined below
+proc marshalStackAggrArg(g: var CodeGen; a: Cursor; paramNm: string)    # defined below
 # ── 64-bit scalars on Cortex-M (M4) ─────────────────────────────────────────
 # Defined in the INCLUDED `codegen_m64.nim` at the end of this file, because
 # they need the whole value core they dispatch out of. Every one of these is a
 # no-op on the 64-bit targets: `isWideSlot` is false there by construction, so
 # not one of the call sites below can fire.
-proc emitWideAsLoc*(g: var CodeGen; c: Cursor; dest: var Location)
-proc emitWideIntoLoc*(g: var CodeGen; c: Cursor; dst: Location)
-proc emitWideCmpE*(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
+proc emitWideAsLoc(g: var CodeGen; c: Cursor; dest: var Location)
+proc emitWideIntoLoc(g: var CodeGen; c: Cursor; dst: Location)
+proc emitWideCmpE(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
                   whenTrue: bool): A64Inst
-proc emitWideToNarrow*(g: var CodeGen; innerC, targetC: Cursor;
+proc emitWideToNarrow(g: var CodeGen; innerC, targetC: Cursor;
                       dest: var Location)
 proc wideRet*(g: var CodeGen; c: Cursor)
 proc wideValueIntoTemp*(g: var CodeGen; valC: Cursor): string
@@ -194,7 +194,7 @@ proc genAconstr2*(g: var CodeGen; c: Cursor; dst: Location)
 proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitFValue2*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location)
-proc emitMod2*(g: var CodeGen; c: Cursor; dest: var Location)
+proc emitMod2(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitFBinE*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCondValue2*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCondE*(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool)
@@ -289,7 +289,7 @@ proc place2*(g: var CodeGen; src: Location; dest: Reg) =
     g.unbindLvalTemps2(src.cur)
   else: raiseAssert "arkham a64n: place2 src " & $src.kind
 
-proc placeF2*(g: var CodeGen; src: Location; dest: FReg; bits: int) =
+proc placeF2(g: var CodeGen; src: Location; dest: FReg; bits: int) =
   ## `dest ← <float Location src>`.
   case src.kind
   of InFReg: g.fmovF(dest, src.f, bits)
@@ -586,7 +586,7 @@ proc aggrAddrInto*(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind
 
 # ── integer arithmetic ───────────────────────────────────────────────────────
 
-proc foldRhs2*(g: var CodeGen; op: A64Inst; dest: Reg; rhsLoc: Location; rhsC: Cursor;
+proc foldRhs2(g: var CodeGen; op: A64Inst; dest: Reg; rhsLoc: Location; rhsC: Cursor;
               w32 = false) =
   ## `dest = dest op rhs`, materializing the rhs as a64 needs (no memory operand; a
   ## large/non-add immediate goes through a bridge). `dest` already holds the lhs.
@@ -622,7 +622,7 @@ proc foldRhs2*(g: var CodeGen; op: A64Inst; dest: Reg; rhsLoc: Location; rhsC: C
   else: raiseAssert "arkham a64n: foldRhs2 " & $rhsLoc.kind
 
 
-proc foldRhs3*(g: var CodeGen; op: A64Inst; dest, rn: Reg; rhsLoc: Location; rhsC: Cursor;
+proc foldRhs3(g: var CodeGen; op: A64Inst; dest, rn: Reg; rhsLoc: Location; rhsC: Cursor;
               w32 = false) =
   ## `dest = rn op rhs` — the 3-operand twin of `foldRhs2`. `rn` holds the left
   ## source (a live local's register, distinct from `dest`); nothing is moved into
@@ -851,7 +851,7 @@ proc aggrArgAddr*(g: var CodeGen; a: Cursor; dst: Reg) =
     g.genStore2(a, namedStackLoc(home, g.exprSlot(a)))
     g.ab.tree LeaA64: (g.emReg dst; g.ab.sym home)
 
-proc marshalStackAggrArg*(g: var CodeGen; a: Cursor; paramNm: string) =
+proc marshalStackAggrArg(g: var CodeGen; a: Cursor; paramNm: string) =
   ## Write an aggregate call argument that did NOT fit the integer arg registers to its
   ## outgoing stack slot(s) `(mem (sp) (arg paramNm [k]))`. The fixed frame keeps SP
   ## constant, so the source is read and the slots written at stable offsets — no
@@ -893,7 +893,7 @@ proc marshalStackAggrArg*(g: var CodeGen; a: Cursor; paramNm: string) =
     g.dropBridge w
   g.dropBridge src
 
-proc genNestedAggrField*(g: var CodeGen; dst: Location; valC, fty: Cursor) =
+proc genNestedAggrField(g: var CodeGen; dst: Location; valC, fty: Cursor) =
   ## Materialize an aggregate field value `valC` (a nested `oconstr`/`aconstr`, an
   ## aggregate symbol, …) of declared field type `fty` into the sub-aggregate at field
   ## `dst`: build it into a synthetic temp through the general `genStore2` (which
@@ -1744,7 +1744,7 @@ proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
   else: raiseAssert "arkham a64n: emitValue2(fused) kind " & $c.kind
 
 # ── fused value core: unconverted-proc stubs (die as each case lands) ────────
-proc emitDivPow2*(g: var CodeGen; c, resTypeC, lhsC: Cursor; k: int;
+proc emitDivPow2(g: var CodeGen; c, resTypeC, lhsC: Cursor; k: int;
                  dest: var Location) =
   ## `x div 2^k` without a divide. `udiv`/`sdiv` are 8–12 cycles and unpipelined on
   ## the A76-class cores this targets, and `nifcore.leaveScope` — ten instructions
@@ -1783,7 +1783,7 @@ proc emitDivPow2*(g: var CodeGen; c, resTypeC, lhsC: Cursor; k: int;
     g.binImm(LsrA64, rD, k)
   dest = acc
 
-proc emitModPow2*(g: var CodeGen; c, resTypeC, lhsC: Cursor; k: int;
+proc emitModPow2(g: var CodeGen; c, resTypeC, lhsC: Cursor; k: int;
                  dest: var Location) =
   ## `x mod 2^k` for an UNSIGNED `x` — one `and` with the low-k mask, in place of a
   ## divide, a multiply and a subtract. `2^k-1` is a run of ones, hence always a
@@ -1937,7 +1937,7 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
     g.dropBridge resStaging
   dest = res
 
-proc emitMod2*(g: var CodeGen; c: Cursor; dest: var Location) =
+proc emitMod2(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED `(mod T a b)` → `dest = a - (a div b)*b` (allocDivModRisc's placement
   ## decided inline).
   var rt, divC, dvsC: Cursor
@@ -3701,8 +3701,8 @@ const
 
 # ── minting and resolving ───────────────────────────────────────────────────
 
-proc emitWideInto*(g: var CodeGen; c0: Cursor; dst: WideRef)
-proc wideLvalRef*(g: var CodeGen; c: Cursor; scratch: var Reg): WideRef =
+proc emitWideInto(g: var CodeGen; c0: Cursor; dst: WideRef)
+proc wideLvalRef(g: var CodeGen; c: Cursor; scratch: var Reg): WideRef =
   ## The eight bytes an lvalue expression denotes: `(deref p)`, `(dot o f)`,
   ## `(at a i)`. The address goes into a scratch register; the caller frees it.
   scratch = g.takeWideRegs(1, "a 64-bit lvalue address")[0]
@@ -3711,7 +3711,7 @@ proc wideLvalRef*(g: var CodeGen; c: Cursor; scratch: var Reg): WideRef =
   g.freeLvalTemps2(c)
   baseWide(scratch)
 
-proc wideValueSlot*(g: var CodeGen; c: Cursor): WideRef =
+proc wideValueSlot(g: var CodeGen; c: Cursor): WideRef =
   ## The eight bytes of ANY 64-bit expression, **in a stack slot**.
   ##
   ## Never a register-relative reference, even when the value already has an
@@ -3731,14 +3731,14 @@ proc wideValueSlot*(g: var CodeGen; c: Cursor): WideRef =
 
 # ── narrow ↔ wide ───────────────────────────────────────────────────────────
 
-proc emitNarrowValueInto*(g: var CodeGen; c: Cursor; dest: Reg) =
+proc emitNarrowValueInto(g: var CodeGen; c: Cursor; dest: Reg) =
   ## Emit a NON-wide expression so its value lands in `dest`.
   var v = needsReg(g.valueSlot(c))
   g.emitValue2(c, v)
   g.place2(v, dest)
   g.freeVal(v)
 
-proc wideFromNarrowExpr*(g: var CodeGen; dst: WideRef; c: Cursor; signed: bool) =
+proc wideFromNarrowExpr(g: var CodeGen; dst: WideRef; c: Cursor; signed: bool) =
   ## Widen a NARROWER expression to the 64-bit value at `dst`.
   ##
   ## The source's own width matters as much as its signedness: a `(i 16)` arrives
@@ -3756,7 +3756,7 @@ proc wideFromNarrowExpr*(g: var CodeGen; dst: WideRef; c: Cursor; signed: bool) 
 
 # ── arithmetic ──────────────────────────────────────────────────────────────
 
-proc wideShift*(g: var CodeGen; dst, a: WideRef; amount: Cursor; ek: LengExpr;
+proc wideShift(g: var CodeGen; dst, a: WideRef; amount: Cursor; ek: LengExpr;
                signed: bool) =
   ## `dst = a shl/shr n` for a RUNTIME shift count. Branching on `n >= 32` rather
   ## than the branchless mask sequence: this costs two forward branches and saves
@@ -3811,7 +3811,7 @@ proc wideShift*(g: var CodeGen; dst, a: WideRef; amount: Cursor; ek: LengExpr;
 
 # ── comparison ──────────────────────────────────────────────────────────────
 
-proc emitWideCmpE*(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
+proc emitWideCmpE(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
                   whenTrue: bool): A64Inst =
   ## The 64-bit twin of `emitScalarCmpE`: emit the compare, return the branch
   ## that means "the condition holds".
@@ -3856,9 +3856,9 @@ proc emitWideCmpE*(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
 
 # ── the wide producer ───────────────────────────────────────────────────────
 
-proc wideCallInto*(g: var CodeGen; c: Cursor; dst: WideRef)
+proc wideCallInto(g: var CodeGen; c: Cursor; dst: WideRef)
 
-proc emitWideInto*(g: var CodeGen; c0: Cursor; dst: WideRef) =
+proc emitWideInto(g: var CodeGen; c0: Cursor; dst: WideRef) =
   ## Produce the 64-bit value of `c` into the eight bytes at `dst`. THE entry
   ## point: every wide expression form is one arm here, and a form with no arm
   ## is refused by name rather than routed to the 32-bit emitter, which would
@@ -4031,7 +4031,7 @@ proc emitWideInto*(g: var CodeGen; c0: Cursor; dst: WideRef) =
 # The rule that DOES matter is that the two sides agree, and they agree by
 # reading the same `CallPlan`.
 
-proc wideCallInto*(g: var CodeGen; c: Cursor; dst: WideRef) =
+proc wideCallInto(g: var CodeGen; c: Cursor; dst: WideRef) =
   ## A 64-bit call result: raw out of r0:r1, straight into memory.
   ##
   ## `dst` must be a SLOT. An address in a register is not a survivor across the
@@ -4050,7 +4050,7 @@ proc wideCallInto*(g: var CodeGen; c: Cursor; dst: WideRef) =
     g.wideStore(tmp, 1, hi)
     g.wideCopy(dst, tmp)
 
-proc emitWideIntoLoc*(g: var CodeGen; c: Cursor; dst: Location) =
+proc emitWideIntoLoc(g: var CodeGen; c: Cursor; dst: Location) =
   ## Produce a 64-bit value into a resolved destination `Location` — the
   ## `genStore2` arm for wide values.
   if dst.kind == NamedStack:
@@ -4069,7 +4069,7 @@ proc emitWideIntoLoc*(g: var CodeGen; c: Cursor; dst: Location) =
   g.wideCopy(baseWide(a), tmp)
   g.dropWideRegs(@[a])
 
-proc emitWideAsLoc*(g: var CodeGen; c: Cursor; dest: var Location) =
+proc emitWideAsLoc(g: var CodeGen; c: Cursor; dest: var Location) =
   ## The `emitValue2` arm: a 64-bit value has no register to be resolved into,
   ## so it lands in a temp slot and `dest` names that slot.
   ##
@@ -4091,7 +4091,7 @@ proc wideRet*(g: var CodeGen; c: Cursor) =
 
 # ── the narrowing direction ─────────────────────────────────────────────────
 
-proc emitWideToNarrow*(g: var CodeGen; innerC, targetC: Cursor;
+proc emitWideToNarrow(g: var CodeGen; innerC, targetC: Cursor;
                       dest: var Location) =
   ## `(conv (i 32) <64-bit>)` and friends: the low word IS the answer, then
   ## re-normalized to the target's own width so a sub-word result stays

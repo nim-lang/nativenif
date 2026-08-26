@@ -21,8 +21,8 @@ import "../core" / [context, sem, cursors, diagnostics, typecheck, typesem,
 import encoder as x86
 import regs, operands
 
-proc genStmtX64*(n: var Cursor; ctx: var GenContext)
-proc genInstX64*(n: var Cursor; ctx: var GenContext)
+proc genStmtX64(n: var Cursor; ctx: var GenContext)
+proc genInstX64(n: var Cursor; ctx: var GenContext)
 
 type
   SizedAluKind* = enum
@@ -37,7 +37,7 @@ const
   sizedAluOpcRM:  array[SizedAluKind, byte] = [0x03'u8, 0x2B, 0x23, 0x0B, 0x33, 0x3B, 0x85]
   sizedAluDigit:  array[SizedAluKind, int]  = [0, 5, 4, 1, 6, 7, 0]
 
-proc genPopframeX64*(ctx: var GenContext) =
+proc genPopframeX64(ctx: var GenContext) =
   ## `(popframe)` — the x86-64 twin of `genPopframeA64`, and for the same reason:
   ## arkham finalizes `usedCallee` / `hasStackVars` only AFTER the body is emitted,
   ## so a teardown written at a mid-body site would have to guess how many `pop`s
@@ -64,7 +64,7 @@ proc genPopframeX64*(ctx: var GenContext) =
       # The alignment-pad-only frame: `sub rsp, 8` with no `(s)` region.
       x86.emitAddImm(ctx.buf.data, x86.RSP, st.frameImm)
 
-proc genPrepareX64*(n: var Cursor; ctx: var GenContext) =
+proc genPrepareX64(n: var Cursor; ctx: var GenContext) =
   ## Handle (prepare target ... (call) ...) or (prepare target ... (extcall) ...)
   ## The prepare block sets up a call context for type checking and argument tracking.
   var hdr = n
@@ -186,7 +186,7 @@ proc genPrepareX64*(n: var Cursor; ctx: var GenContext) =
   if outerCall.state == CallContextState.Disabled:
     ctx.callContext.state = CallContextState.Disabled
 
-proc genCallMarkerX64*(n: var Cursor; ctx: var GenContext) =
+proc genCallMarkerX64(n: var Cursor; ctx: var GenContext) =
   ## `(call)` inside a `prepare` block emits the actual call: a direct `call rel32`
   ## to the prepared proc, or — when the prepare target is a function-pointer
   ## variable — an indirect call that loads the pointer and `call`s through it.
@@ -258,7 +258,7 @@ proc genCallMarkerX64*(n: var Cursor; ctx: var GenContext) =
   ctx.callContext.callEmitted = true
   inc n                   # past the `(call` head
 
-proc genTailcallMarkerX64*(n: var Cursor; ctx: var GenContext) =
+proc genTailcallMarkerX64(n: var Cursor; ctx: var GenContext) =
   ## `(tailcall)` — the `(call)` marker's no-return-address twin: same prepared
   ## arguments, same clobber declaration, `jmp rel32` instead of `call rel32`.
   ## Control leaves this proc for good, so the callee returns to OUR caller and its
@@ -298,7 +298,7 @@ proc genTailcallMarkerX64*(n: var Cursor; ctx: var GenContext) =
   ctx.callContext.callEmitted = true
   inc n                   # past the `(tailcall)` head
 
-proc genSyscallMarkerX64*(n: var Cursor; ctx: var GenContext) =
+proc genSyscallMarkerX64(n: var Cursor; ctx: var GenContext) =
   ## `(syscall)` inside a `(prepare <syproc> …)` block: the syscall counterpart of
   ## `(call)`. The args are already in the syscall ABI registers (the syproc's
   ## params), so this just loads the number into rax and traps into the kernel,
@@ -312,7 +312,7 @@ proc genSyscallMarkerX64*(n: var Cursor; ctx: var GenContext) =
   ctx.callContext.callEmitted = true
   inc n                   # past the `(syscall)` head
 
-proc genExtcallX64*(n: var Cursor; ctx: var GenContext) =
+proc genExtcallX64(n: var Cursor; ctx: var GenContext) =
   ## Handle (extcall) marker inside a prepare block - emits external call via IAT
   if not ctx.inCall:
     error("(extcall) can only be used inside a prepare block", n)
@@ -342,7 +342,7 @@ proc genExtcallX64*(n: var Cursor; ctx: var GenContext) =
   #  if dest.reg != resReg:
   #    x86.emitMov(ctx.buf.data, dest.reg, resReg)
 
-proc genIatX64*(n: var Cursor; ctx: var GenContext) =
+proc genIatX64(n: var Cursor; ctx: var GenContext) =
   # (iat symbol) - Indirect call through IAT for external procs
   inc n
   if n.kind != Symbol: error("Expected proc symbol for iat", n)
@@ -361,7 +361,7 @@ proc genIatX64*(n: var Cursor; ctx: var GenContext) =
   # Emit indirect call through IAT using relocation system
   ctx.buf.emitIatCall(iatSlot)
 
-proc genMovX64*(n: var Cursor; ctx: var GenContext) =
+proc genMovX64(n: var Cursor; ctx: var GenContext) =
   let start = n
   inc n
   let dest = parseDest(n, ctx)
@@ -420,7 +420,7 @@ proc genMovX64*(n: var Cursor; ctx: var GenContext) =
     # `parseOperand` still rejects reading a clobbered SOURCE; a mov defines its dest.
     ctx.clobbered.excl(dest.reg)
 
-proc genIteX64*(n: var Cursor; ctx: var GenContext) =
+proc genIteX64(n: var Cursor; ctx: var GenContext) =
   inc n
 
   # Check if condition is a cfvar (symbol) or a hardware flag (parens)
@@ -493,7 +493,7 @@ proc genIteX64*(n: var Cursor; ctx: var GenContext) =
   # Merge clobbered
   ctx.clobbered = thenClobbered + elseClobbered
 
-proc genLoopX64*(n: var Cursor; ctx: var GenContext) =
+proc genLoopX64(n: var Cursor; ctx: var GenContext) =
   inc n
 
   # Bare infinite-loop form `(loop (stmts …))` — the body is a single statement block. The
@@ -543,7 +543,7 @@ proc genLoopX64*(n: var Cursor; ctx: var GenContext) =
   # But `ctx.clobbered` accumulates.
   # So whatever happened in body is added.
 
-proc genJtrueX64*(n: var Cursor; ctx: var GenContext) =
+proc genJtrueX64(n: var Cursor; ctx: var GenContext) =
   # (jtrue cfvar1.0 cfvar2.0 ...)
   # Set control flow variable(s) to true by emitting an unconditional jump
   # The jump targets are stored in the cfvar symbols
@@ -570,7 +570,7 @@ proc genJtrueX64*(n: var Cursor; ctx: var GenContext) =
   # Emit unconditional jump to the cfvar's target label
   ctx.buf.emitJmp(jumpTarget)
 
-proc genKillX64*(n: var Cursor; ctx: var GenContext) =
+proc genKillX64(n: var Cursor; ctx: var GenContext) =
   inc n
   if n.kind != Symbol: error("Expected symbol to kill", n)
   let name = getSym(n)
@@ -591,7 +591,7 @@ proc genKillX64*(n: var Cursor; ctx: var GenContext) =
 
   inc n
 
-proc bindRegX64*(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
+proc bindRegX64(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
                 reg: x86.Register) =
   ## Bind physical register `reg` to the typed name `name`, *killing its prior
   ## tenant first*: the previous binding's name is undefined, so a later use of a
@@ -611,7 +611,7 @@ proc bindRegX64*(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
   ctx.regBindings[reg] = name
   ctx.scope.define(sym)
 
-proc bindXmmX64*(ctx: var GenContext; name: string; typ: Type; xmmTag: TagEnum;
+proc bindXmmX64(ctx: var GenContext; name: string; typ: Type; xmmTag: TagEnum;
                 xmm: x86.XmmRegister) =
   ## The SIMD twin of `bindRegX64`: bind xmm register `xmm` to the typed float name
   ## `name`, killing its prior tenant first. Used for float register locals and
@@ -624,7 +624,7 @@ proc bindXmmX64*(ctx: var GenContext; name: string; typ: Type; xmmTag: TagEnum;
   ctx.xmmBindings[xmm] = name
   ctx.scope.define(sym)
 
-proc parseRebindHeader*(n: var Cursor; ctx: var GenContext):
+proc parseRebindHeader(n: var Cursor; ctx: var GenContext):
                        tuple[name: string; typ: Type; isXmm: bool;
                              regTag: TagEnum; reg: x86.Register; xmm: x86.XmmRegister] =
   ## Parse `:name TYPE (reg)` (the cursor is past the rebind/withreg tag, inside the
@@ -647,14 +647,14 @@ proc parseRebindHeader*(n: var Cursor; ctx: var GenContext):
   else:
     error("Expected a register for rebind/withreg", n)
 
-proc genRebindX64*(n: var Cursor; ctx: var GenContext) =
+proc genRebindX64(n: var Cursor; ctx: var GenContext) =
   ## `(rebind :name TYPE (reg))` — bind `reg` to `name`, killing its prior tenant.
   ## The binding lives until an explicit `kill`, the next `rebind` of `reg`, or the
   ## end of the proc (`regBindings` is reset per proc — the auto-kill backstop).
   into n:
     discard parseRebindHeader(n, ctx)
 
-proc genWithregX64*(n: var Cursor; ctx: var GenContext) =
+proc genWithregX64(n: var Cursor; ctx: var GenContext) =
   ## `(withreg :name TYPE (reg) body…)` — a block-scoped `rebind`: the binding is
   ## auto-killed at the end of the body (its own implied kill), in addition to
   ## killing `reg`'s prior tenant on entry.
@@ -668,7 +668,7 @@ proc genWithregX64*(n: var Cursor; ctx: var GenContext) =
       ctx.regBindings.del(h.reg)
     ctx.scope.undefine(ctx.symIdOf(h.name))
 
-proc genCasejmpX64*(n: var Cursor; ctx: var GenContext) =
+proc genCasejmpX64(n: var Cursor; ctx: var GenContext) =
   ## `(casejmp S T (stmts …)+)` — computed-goto case dispatch (issue #32). The
   ## k-th `(stmts …)` child is slot k's branch body. Bodies are emitted
   ## back-to-back and NOP-padded to the measured uniform slot size N, so the
@@ -741,7 +741,7 @@ proc genCasejmpX64*(n: var Cursor; ctx: var GenContext) =
     ctx.buf.data[immPos + 3] = byte((nv shr 24) and 0xFF)
     ctx.buf.fixedRanges.add (slotsStart, slotsStart + bounds.len * slotSize)
 
-proc checkSubWidthImm*(imm: int64; bits: int; n: Cursor) =
+proc checkSubWidthImm(imm: int64; bits: int; n: Cursor) =
   ## The immediate must fit the operation width under EITHER signedness —
   ## only its low `bits` reach the hardware, so `(cmp (cast (u 8) r) 255)`
   ## and `(cmp (cast (i 8) r) -1)` are both meaningful (and identical).
@@ -751,7 +751,7 @@ proc checkSubWidthImm*(imm: int64; bits: int; n: Cursor) =
     error("immediate " & $imm & " does not fit a " & $bits &
           "-bit sub-width operation", n)
 
-proc genAluSubWidth*(ctx: var GenContext; dest, op: Operand; kind: SizedAluKind;
+proc genAluSubWidth(ctx: var GenContext; dest, op: Operand; kind: SizedAluKind;
                     n: Cursor) =
   ## Two-operand ALU whose destination is an explicitly width-cast register:
   ## the operation runs at `dest.castBits` (8/16/32). A 32-bit op zero-extends
@@ -787,7 +787,7 @@ proc genAluSubWidth*(ctx: var GenContext; dest, op: Operand; kind: SizedAluKind;
   else:
     error("sub-width ALU source must be a register or immediate", n)
 
-proc genInstX64*(n: var Cursor; ctx: var GenContext) =
+proc genInstX64(n: var Cursor; ctx: var GenContext) =
   if n.kind != TagLit: error("Expected instruction", n)
   let instTag = tagToX64Inst(n.tag)
   let start = n
@@ -2420,7 +2420,7 @@ proc genInstX64*(n: var Cursor; ctx: var GenContext) =
 proc genInstNodeX64*(n: var Cursor; ctx: var GenContext) =
   withListingRow(ctx, n): genInstX64(n, ctx)
 
-proc genStmtX64*(n: var Cursor; ctx: var GenContext) =
+proc genStmtX64(n: var Cursor; ctx: var GenContext) =
   if atTag(n, StmtsTagId):
     loopInto n:
       genInstNodeX64(n, ctx)

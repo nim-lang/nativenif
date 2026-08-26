@@ -25,19 +25,19 @@ import machine_a64 as machine
 from machine_m as machine_m import nil
 import emit, mem, aggr, value
 
-proc wideParamToHome*(g: var CodeGen; nm: string; firstArg: int)
+proc wideParamToHome(g: var CodeGen; nm: string; firstArg: int)
 
-proc isWideType*(g: var CodeGen; t: Cursor): bool {.inline.}
+proc isWideType(g: var CodeGen; t: Cursor): bool {.inline.}
 
-proc emPair*(g: var CodeGen; op: A64Inst; r1, r2: Reg; off: int) =
+proc emPair(g: var CodeGen; op: A64Inst; r1, r2: Reg; off: int) =
   # stp/ldp save/restore *physical* callee-saved registers (which may also be
   # named-local homes), so emit raw register nodes, not the local names.
   g.ab.tree op: g.ab.rawReg r1; g.ab.rawReg r2; g.ab.rawReg SP; g.ab.intLit off
 
-proc emFPair*(g: var CodeGen; op: A64Inst; f1, f2: FReg; off: int) =
+proc emFPair(g: var CodeGen; op: A64Inst; f1, f2: FReg; off: int) =
   g.ab.tree op: g.ab.dreg f1; g.ab.dreg f2; g.emReg SP; g.ab.intLit off
 
-proc frameSaveSlot*(g: var CodeGen; r: Reg; off: int; storing: bool) =
+proc frameSaveSlot(g: var CodeGen; r: Reg; off: int; storing: bool) =
   ## One callee-saved register into (or out of) its prologue slot. Thumb-2 has
   ## PUSH/POP with a register list, which would be shorter, but asm-NIF has no
   ## register-list operand shape — and a plain `str`/`ldr` per register needs no
@@ -51,7 +51,7 @@ proc frameSaveSlot*(g: var CodeGen; r: Reg; off: int; storing: bool) =
       g.ab.rawReg r
       g.ab.tree MemX: (g.ab.rawReg SP; g.ab.intLit off)
 
-proc frameSaveFSlot*(g: var CodeGen; f: FReg; off: int; storing: bool) =
+proc frameSaveFSlot(g: var CodeGen; f: FReg; off: int; storing: bool) =
   ## One callee-saved FPv4-SP register into (or out of) its prologue slot. A raw
   ## `(sN)`, not `emFReg`: this is the physical register being preserved, and it
   ## may be a named local's home — the name would be wrong here and the binding
@@ -65,12 +65,12 @@ proc frameSaveFSlot*(g: var CodeGen; f: FReg; off: int; storing: bool) =
       g.ab.freg(f, 32)
       g.ab.tree MemX: (g.ab.rawReg SP; g.ab.intLit off)
 
-proc framePushBytesBlock*(g: CodeGen): int {.inline.} =
+proc framePushBytesBlock(g: CodeGen): int {.inline.} =
   ## lr + every saved callee-saved register, integer and float, rounded to the
   ## 8-byte alignment AAPCS32 wants at a public interface.
   ((1 + g.frameRegs.len + g.frameFRegs.len) * 4 + 7) and not 7
 
-proc framePushBlock*(g: var CodeGen) =
+proc framePushBlock(g: var CodeGen) =
   ## The `BlockFrame` prologue: lower SP once, then store the link register and
   ## each used callee-saved register into the block just carved.
   ##
@@ -85,7 +85,7 @@ proc framePushBlock*(g: var CodeGen) =
   for i, f in g.frameFRegs:
     g.frameSaveFSlot(f, 4 * (1 + g.frameRegs.len + i), storing = true)
 
-proc framePopBlock*(g: var CodeGen) =
+proc framePopBlock(g: var CodeGen) =
   for i, f in g.frameFRegs:
     g.frameSaveFSlot(f, 4 * (1 + g.frameRegs.len + i), storing = false)
   for i, r in g.frameRegs:
@@ -137,7 +137,7 @@ proc framePop*(g: var CodeGen) =
     i -= 2
   g.emPair(LdpA64, g.md.framePtrReg, g.md.linkReg, 16)
 
-proc killFrameRegLocals*(g: var CodeGen) =
+proc killFrameRegLocals(g: var CodeGen) =
   ## Before an explicit-`ret` `framePop`, release any register-local bound to a
   ## callee-saved register the epilogue restores raw — nifasm forbids a raw use of
   ## a still-bound register, and at a return every local is dead. The binding is
@@ -149,7 +149,7 @@ proc killFrameRegLocals*(g: var CodeGen) =
     if dead.len > 0:
       g.ab.tree KillA64: g.ab.sym dead
 
-proc framePushBytes*(g: CodeGen): int =
+proc framePushBytes(g: CodeGen): int =
   ## Bytes `framePush` lowers SP by: the fp/lr pair plus each saved callee-saved
   ## GPR / SIMD pair (16 bytes apiece). Used to address incoming stack arguments
   ## relative to SP right after the prologue's pushes (before locals are carved).
@@ -335,7 +335,7 @@ proc computeFrame*(g: var CodeGen; hasCall: bool) =
     # the frame is empty it is a `sub sp, #0`.
     g.plan.hasStackVars = true
 
-proc emIncomingArgBase*(g: var CodeGen; dest: Reg) =
+proc emIncomingArgBase(g: var CodeGen; dest: Reg) =
   ## `dest ← the SP the caller entered this proc with` — the base nifasm numbers
   ## the incoming stack arguments from (parameter `k` at byte offset `k`'s
   ## `alignedSize` sum, starting at 0).
@@ -353,14 +353,14 @@ proc emIncomingArgBase*(g: var CodeGen; dest: Reg) =
     g.ab.rawReg SP
     g.ab.tree SsizeX: g.ab.intLit int64(g.framePushBytes)
 
-proc emIncomingArgMem*(g: var CodeGen; base: Reg; byteOff: int) =
+proc emIncomingArgMem(g: var CodeGen; base: Reg; byteOff: int) =
   ## The memory operand of the incoming stack argument at `byteOff`.
   if g.md.frameStyle == BlockFrame:
     g.ab.tree MemX: (g.emReg base; g.ab.intLit int64(byteOff))
   else:
     g.ab.tree MemX: (g.ab.rawReg g.md.framePtrReg; g.ab.intLit int64(StackArgFpBias + byteOff))
 
-proc emLoadIncomingArg*(g: var CodeGen; dest: Reg; byteOff: int) =
+proc emLoadIncomingArg(g: var CodeGen; dest: Reg; byteOff: int) =
   ## `dest ← [incoming stack argument area + byteOff]`.
   if g.md.frameStyle == BlockFrame:
     let b = g.takeBridge(avoid = dest)
@@ -370,7 +370,7 @@ proc emLoadIncomingArg*(g: var CodeGen; dest: Reg; byteOff: int) =
   else:
     g.ab.tree MovA64: (g.emReg dest; g.emIncomingArgMem(NoReg, byteOff))
 
-proc emLeaIncomingArg*(g: var CodeGen; dest: Reg; byteOff: int) =
+proc emLeaIncomingArg(g: var CodeGen; dest: Reg; byteOff: int) =
   ## `dest ← &(incoming stack argument area + byteOff)`.
   if g.md.frameStyle == BlockFrame:
     g.emIncomingArgBase(dest)
@@ -379,7 +379,7 @@ proc emLeaIncomingArg*(g: var CodeGen; dest: Reg; byteOff: int) =
   else:
     g.ab.tree LeaA64: (g.emReg dest; g.emIncomingArgMem(NoReg, byteOff))
 
-proc bridgeStackParam*(g: var CodeGen; slotName: string; byteOff: int; typ: AsmSlot) =
+proc bridgeStackParam(g: var CodeGen; slotName: string; byteOff: int; typ: AsmSlot) =
   ## `[slotName] <- [fp + StackArgFpBias + byteOff]`, through a transient GPR: AArch64 has
   ## no memory-to-memory move, so a stack-passed parameter whose home is a stack slot
   ## has to be bridged. The bridge is BOUND (`bindTemp`) for its two instructions —
@@ -819,7 +819,7 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; declarative: bool) =
     if not declIsNoReturn(decl):
       g.emConvClobbers()
 
-proc storeFReg2*(g: var CodeGen; dst: Location; src: FReg; bits: int) =
+proc storeFReg2(g: var CodeGen; dst: Location; src: FReg; bits: int) =
   case dst.kind
   of InFReg: g.fmovF(dst.f, src, bits)
   of NamedStack: g.emFloatScalarStore(dst.name, src, bits)
@@ -852,10 +852,10 @@ proc copyStructThroughPtr2*(g: var CodeGen; srcVar: string; typeSym: SymId; ptrR
   g.dropBridge tmp
   g.dropBridge sp
 
-proc isWideType*(g: var CodeGen; t: Cursor): bool {.inline.} =
+proc isWideType(g: var CodeGen; t: Cursor): bool {.inline.} =
   g.isWideSlot(slotOf(g.prog, t))
 
-proc wideParamToHome*(g: var CodeGen; nm: string; firstArg: int) =
+proc wideParamToHome(g: var CodeGen; nm: string; firstArg: int) =
   ## The callee side: the two incoming argument registers into the parameter's
   ## stack home. (Its slot was declared by the caller of this proc.)
   let home = slotWide(nm)

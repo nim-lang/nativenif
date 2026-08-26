@@ -175,7 +175,7 @@ proc movReg*(g: var CodeGen; d, s: Reg) =
   if d == s: return
   g.ab.tree MovA64: g.emReg d; g.emReg s
 
-proc wForm*(op: A64Inst): A64Inst =
+proc wForm(op: A64Inst): A64Inst =
   case op
   of AddA64: AddwA64
   of SubA64: SubwA64
@@ -191,7 +191,7 @@ proc hereTarget*(g: CodeGen): IntrinsicTarget {.inline.} =
   of Arm64: tgA64
   of ThumbM: tgThumbM
 
-proc destructive3*(g: CodeGen; op: A64Inst): bool {.inline.} =
+proc destructive3(g: CodeGen; op: A64Inst): bool {.inline.} =
   ## Ops with no destructive `D op= S` spelling on this target: Thumb-2's
   ## `sdiv`/`udiv` are three-operand instructions and nifasm parses them as such,
   ## so the same tag has to arrive with `D` repeated.
@@ -217,7 +217,7 @@ proc emNeg*(g: var CodeGen; d: Reg) =
   else:
     g.ab.tree NegA64: (g.emReg d; g.emReg d)
 
-proc threeOpTag*(op: A64Inst; w32 = false): A64Inst =
+proc threeOpTag(op: A64Inst; w32 = false): A64Inst =
   if w32:
     case op
     of AddA64: return Addw3A64
@@ -245,10 +245,10 @@ proc binImm3*(g: var CodeGen; op: A64Inst; d, a: Reg; v: int64; w32 = false) =
 proc emAdr*(g: var CodeGen; d: Reg; sym: string) =
   g.ab.tree AdrA64: g.emReg d; g.ab.sym sym
 
-proc emLdaxr*(g: var CodeGen; rt, rn: Reg) =        # rt ← exclusive-acquire [rn]
+proc emLdaxr(g: var CodeGen; rt, rn: Reg) =        # rt ← exclusive-acquire [rn]
   g.ab.tree LdaxrA64: g.emReg rt; g.emReg rn
 
-proc emStlxr*(g: var CodeGen; rs, rt, rn: Reg) =    # store-release-exclusive rt→[rn]; rs←status
+proc emStlxr(g: var CodeGen; rs, rt, rn: Reg) =    # store-release-exclusive rt→[rn]; rs←status
   g.ab.tree StlxrA64: g.emReg rs; g.emReg rt; g.emReg rn
 
 proc emLdar*(g: var CodeGen; rt, rn: Reg; bits = 64) =   # rt ← acquire [rn] (sized)
@@ -1294,7 +1294,7 @@ proc emLvalAddr2*(g: var CodeGen; c: Cursor) =
     else: raiseAssert "arkham a64n: emLvalAddr2 expr " & $c.exprKind
   else: raiseAssert "arkham a64n: emLvalAddr2 kind " & $c.kind
 
-proc lvalMaterializedRegs*(g: CodeGen; c: Cursor; acc: var set[Reg]) =
+proc lvalMaterializedRegs(g: CodeGen; c: Cursor; acc: var set[Reg]) =
   ## Every register the lvalue/value subtree `c` has materialized something into (a
   ## deref pointer, an index, a global base address). `locs` is position-indexed
   ## over the proc's whole token span, so the subtree is a plain range scan — no
@@ -1324,7 +1324,7 @@ proc strideRecycle*(g: CodeGen; idxCur, baseCur: Cursor): Reg =
   g.lvalMaterializedRegs(baseCur, baseRegs)
   if l.r in baseRegs: NoReg else: l.r
 
-proc releaseStrideScratch*(g: var CodeGen; atPos: int) =
+proc releaseStrideScratch(g: var CodeGen; atPos: int) =
   ## Release it after the consuming `(mem …)`/`(lea …)`. `dropBridge` and the pool
   ## release are the same two operations, so the only difference a bridge makes is
   ## that the position stops being marked.
@@ -1369,7 +1369,7 @@ proc binA64Op*(g: var CodeGen; c: Cursor): A64Inst =
   of BitxorC: EorA64
   else: raiseAssert "arkham a64n: binA64Op " & $c.exprKind
 
-proc isLogicalImmA64*(v: int64): bool =
+proc isLogicalImmA64(v: int64): bool =
   ## Is `v` an AArch64 "bitmask immediate" — the form `and`/`orr`/`eor` take
   ## directly? Every bitfield mask is one (0xff, 0xf, 0x1ff, 0x3fff, …), so this
   ## is the difference between `and x, y, #0xff` and materializing the constant

@@ -37,17 +37,17 @@ from "../thumb/encoder" as thumb2 import nil
 # symbol, resolving one parses a declaration, and that is more type parsing.
 # The forward block is what lets them be written in a readable order.
 proc parseType*(n: var Cursor; scope: Scope; ctx: var GenContext): Type
-proc parsePtrType*(kind: TypeKind; n: var Cursor; scope: Scope; ctx: var GenContext): Type
+proc parsePtrType(kind: TypeKind; n: var Cursor; scope: Scope; ctx: var GenContext): Type
 proc parseParams*(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param]
 proc parseResult*(n: var Cursor; scope: Scope; ctx: var GenContext): seq[Param]
 proc parseExtprocSig*(n: var Cursor; scope: Scope; ctx: var GenContext): Type
 proc parseUnionBody*(n: var Cursor; scope: Scope; ctx: var GenContext): Type
-proc resolveForeignSym*(ctx: var GenContext; modname, fullName: string;
+proc resolveForeignSym(ctx: var GenContext; modname, fullName: string;
                         scope: Scope; n: Cursor): Symbol
 proc lookupWithAutoImport*(ctx: var GenContext; scope: Scope; name: string;
                            n: Cursor): Symbol
 
-proc isRegTag*(locTag: TagEnum): bool =
+proc isRegTag(locTag: TagEnum): bool =
   rawTagIsX64Reg(locTag) or rawTagIsA64Reg(locTag)
 
 proc parseClobbers*(n: var Cursor; a64: var set[arm64.Register];
@@ -196,7 +196,7 @@ proc allocTlsSlotX64*(ctx: var GenContext; sym: Symbol; decl: Cursor) =
     ctx.tlsInits.add (off: int64(sym.offset), val: getInt(lc.val),
                       size: asmSizeOf(sym.typ))
 
-proc resolveForeignSym*(ctx: var GenContext; modname, fullName: string; scope: Scope; n: Cursor): Symbol =
+proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Scope; n: Cursor): Symbol =
   ## Resolve ONE foreign declaration by following its qualified name through the
   ## shared `nifmodules` loader: `getDecl` jumps to the indexed byte offset and
   ## parses just that decl (cached, its buffer kept alive in the ForeignModule),
@@ -386,7 +386,7 @@ proc lookupWithAutoImport*(ctx: var GenContext; scope: Scope; name: string; n: C
     # first-seen (canonical) name; we only READ the table above to redirect duplicates.
     markSymbolUsed(ctx, resultName)
 
-proc parsePtrType*(kind: TypeKind; n: var Cursor; scope: Scope; ctx: var GenContext): Type =
+proc parsePtrType(kind: TypeKind; n: var Cursor; scope: Scope; ctx: var GenContext): Type =
   ## Parse the pointee of a `(ptr X)` / `(aptr X)`. A pointer is 8 bytes whatever
   ## it points at, so a bare-symbol pointee carries its qualified NAME in
   ## `baseName` — this is its nominal identity (used for strict, name-based

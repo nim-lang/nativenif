@@ -264,7 +264,7 @@ proc emQwordAt*(g: var CodeGen; base, idx: Reg) =
         g.emReg base
       g.emReg idx
 
-proc emQwordThru*(g: var CodeGen; base: Reg) =
+proc emQwordThru(g: var CodeGen; base: Reg) =
   ## `(mem (cast (ptr (u 64)) base))` — the quadword at `[base]`, no index.
   g.ab.tree MemX:
     g.ab.tree CastX:
@@ -352,7 +352,7 @@ proc emPtrFieldMem*(g: var CodeGen; ptrReg: Reg; typeSym: SymId; field: string) 
         g.emReg ptrReg
       g.ab.sym field
 
-proc emAggrPtrBase*(g: var CodeGen; nm: string) =
+proc emAggrPtrBase(g: var CodeGen; nm: string) =
   ## Name the register that carries the pointer to aggregate `nm` — or, when the
   ## register carries no binding for it, fall back to the bare register.
   ##
@@ -383,7 +383,7 @@ proc emAggrPtrBase*(g: var CodeGen; nm: string) =
       g.emReg loc.r
     else: g.ab.sym nm
 
-proc emPtrFieldMemSym*(g: var CodeGen; ptrSym: string; typeSym: SymId; field: string) =
+proc emPtrFieldMemSym(g: var CodeGen; ptrSym: string; typeSym: SymId; field: string) =
   ## `(mem (dot (cast (ptr T) name) field))` — the same operand as `emPtrFieldMem`
   ## but naming the SYMBOL that owns the pointer instead of its register.
   ##
@@ -864,7 +864,7 @@ proc emByteAtImm*(g: var CodeGen; p: Reg; off: int) =
         g.emReg p
       g.ab.intLit off.int64
 
-proc emWordAt*(g: var CodeGen; e: AggrEnd; idx: int) =
+proc emWordAt(g: var CodeGen; e: AggrEnd; idx: int) =
   if e.slot.len > 0: g.emWordAtSlot(e.slot, idx * 8)
   else: g.emWordThroughPtr(e.reg, idx)
 

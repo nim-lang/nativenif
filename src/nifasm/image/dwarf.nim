@@ -240,7 +240,7 @@ proc buildEhFrame*(procs: openArray[ProcUnwind]; arch: DwarfArch;
     for x in body: result.add x
   result.addU32 0                                   # terminator
 
-proc bodyCfaOff*(p: ProcUnwind; arch: DwarfArch): int =
+proc bodyCfaOff(p: ProcUnwind; arch: DwarfArch): int =
   ## The CFA offset that holds for the whole body: the state the LAST prologue
   ## step left behind, or — for a proc with no prologue at all (a leaf that
   ## needed no frame, a `{.naked.}` proc) — the ABI's entry state, which is what

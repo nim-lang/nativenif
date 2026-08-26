@@ -35,7 +35,7 @@ let forwardingOff* = existsEnv("ARKHAM_NO_FORWARD")
   ## set, no mirror is ever created and every read of a memory-homed value goes
   ## back to its slot.
 
-proc emKill*(g: var CodeGen; name: string) {.inline.} =
+proc emKill(g: var CodeGen; name: string) {.inline.} =
   ## `(kill name)`. `KillX64` and `KillA64` are two spellings of ONE tag id, so
   ## the tree is identical on both targets and this needs no arch dispatch.
   g.ab.tree KillX64: g.ab.sym name
@@ -45,7 +45,7 @@ proc killMirror*(g: var CodeGen; r: Reg) =
   let dead = g.rb.dropMirror(r)
   if dead.len > 0: g.emKill dead
 
-proc killFMirror*(g: var CodeGen; f: FReg) =
+proc killFMirror(g: var CodeGen; f: FReg) =
   let dead = g.rb.dropFMirror(f)
   if dead.len > 0: g.emKill dead
 
@@ -65,7 +65,7 @@ proc killAllMirrors*(g: var CodeGen) =
   for nm in dead.gprs: g.emKill nm
   for nm in dead.fprs: g.emKill nm
 
-proc mirrorableReg*(g: CodeGen; r: Reg): bool {.inline.} =
+proc mirrorableReg(g: CodeGen; r: Reg): bool {.inline.} =
   ## May `r` hold a mirror? ONLY the emitter's own temp pool and staging bridge.
   ##
   ## This is the one restriction that makes the whole mechanism safe rather than
@@ -78,11 +78,11 @@ proc mirrorableReg*(g: CodeGen; r: Reg): bool {.inline.} =
   ## drop the mirror. Machine-checked, not argued.
   r in g.md.intTempRegs or (g.md.stagingBridgeReg != NoReg and r == g.md.stagingBridgeReg)
 
-proc mirrorableFReg*(g: CodeGen; f: FReg): bool {.inline.} =
+proc mirrorableFReg(g: CodeGen; f: FReg): bool {.inline.} =
   ## The SIMD twin: `emFReg` carries the same assert for `floatTempRegs`.
   f in g.md.floatTempRegs
 
-proc mayMirror*(g: CodeGen; name: string): bool =
+proc mayMirror(g: CodeGen; name: string): bool =
   ## May the value of the memory-homed `name` be forwarded from a register?
   ##
   ## Not when its ADDRESS IS TAKEN: a store through any pointer, and any callee
@@ -224,7 +224,7 @@ proc paramName*(idx: int): string {.inline.} =
   ## of the Leng namespace — see its doc comment for the bug that proved it must.
   result = synth("p") & $idx & ".0"
 
-proc operandInReg*(g: var CodeGen; operand: Cursor; dest: Reg): bool =
+proc operandInReg(g: var CodeGen; operand: Cursor; dest: Reg): bool =
   ## Does the (peeked, not consumed) `operand` resolve to a register-resident
   ## local whose home register is `dest`? The accumulator codegen evaluates a
   ## binary op's left operand into `dest`; if the *right* operand lives in `dest`

@@ -38,7 +38,7 @@ type
                           # (arm64/macOS): `adr` lowers it to the TLV descriptor
                           # call sequence, leaving the variable's address in x0
 
-proc fpSymReg*(ctx: GenContext; n: Cursor): Symbol =
+proc fpSymReg(ctx: GenContext; n: Cursor): Symbol =
   ## If `n` is a `Symbol` naming a float local bound to a v-register, return its
   ## symbol; else nil. Float locals are never foreign, so a plain scope lookup suffices.
   if n.kind == Symbol:

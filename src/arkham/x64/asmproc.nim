@@ -31,7 +31,7 @@ type
 proc asmStmt*(g: var CodeGen; c: Cursor)
 proc asmInstr*(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor)
 
-proc x64RegByName*(name: string): Reg =
+proc x64RegByName(name: string): Reg =
   ## `"rdi"` → `RDI`. The inverse of `x64RegName`, over the 16 GPRs; `NoReg` for
   ## anything else (including `rsp`/`rbp`, which the frame owns — see `asmPinReg`).
   result = NoReg
@@ -59,7 +59,7 @@ proc asmDeclLoc*(g: var CodeGen; prag: Cursor): AsmDeclLoc =
   of aslReg: AsmDeclLoc(kind: aslReg, r: g.asmPinReg(spec.at, spec.name))
   of aslStack: AsmDeclLoc(kind: aslStack, r: NoReg)
 
-proc x64FlagOf*(op: IntrinsicOp): X64Flag =
+proc x64FlagOf(op: IntrinsicOp): X64Flag =
   ## The nifasm condition tag a flag-read row denotes. `(ite (zf) …)` already
   ## exists in the assembler with all ten x86 conditions, so a flag intrinsic is
   ## no new mechanism — the row says which bit and which polarity, and this maps

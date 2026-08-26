@@ -310,7 +310,7 @@ const
   LinuxX64ExitNr* = 60
   LinuxA64ExitNr* = 93
 
-proc lookupSyscall*(name: string): tuple[found: bool, x64, a64: int] =
+proc lookupSyscall(name: string): tuple[found: bool, x64, a64: int] =
   ## Resolve libc `name` to its (x86-64, AArch64) syscall numbers, or `found=false`
   ## if arkham does not lower it (the call then goes through the normal extern path).
   for (n, nr) in LinuxSyscalls:
@@ -543,7 +543,7 @@ proc ptrTypeOf*(p: Program; elem: Cursor): Cursor =
   buf.closeTag()
   result = beginRead(buf)
 
-proc procSigType*(declStart: Cursor): Cursor =
+proc procSigType(declStart: Cursor): Cursor =
   ## The TYPE of a proc used as a VALUE: its signature `(proctype . <params> <ret>
   ## <pragmas>)`, synthesized from the `(proc :name params ret pragmas body)` decl. Shares
   ## the decl's literal/tag pools so copied symbol/literal ids stay valid, and the owner
@@ -983,7 +983,7 @@ proc gvarRefName*(p: var Program; nifName: string): string =
 
 # ── named-type resolution ───────────────────────────────────────────────────
 
-proc typeBody*(p: var Program; typeSym: SymId): Cursor =
+proc typeBody(p: var Program; typeSym: SymId): Cursor =
   ## The body (3rd child) of a named type decl `(type :name pragmas body)`.
   var d = lookupType(p, typeSym)
   d.into:

@@ -58,7 +58,7 @@ when StressEnabled:
 else:
   const stressKeep* = 0
 
-proc stressActive*(): bool {.inline.} =
+proc stressActive(): bool {.inline.} =
   when StressEnabled: stressKeep > 0
   else: false
 

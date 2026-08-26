@@ -52,7 +52,7 @@ proc loadAggrTail*(g: var CodeGen; dst, base: Reg; aggrSize, byteOff: int) =
       g.binReg(OrrA64, dst, tmp)
     g.dropBridge tmp
 
-proc storeAggrTail*(g: var CodeGen; base, src: Reg; aggrSize, byteOff: int) =
+proc storeAggrTail(g: var CodeGen; base, src: Reg; aggrSize, byteOff: int) =
   ## `[base + byteOff] ←` the low `aggrSize - byteOff` bytes of `src`. The write-side
   ## twin of `loadAggrTail`, and the reason it cannot simply store a full word: the
   ## bytes past the aggregate belong to whatever sits next to it.
@@ -67,7 +67,7 @@ proc storeAggrTail*(g: var CodeGen; base, src: Reg; aggrSize, byteOff: int) =
       g.ab.tree MovA64: (g.emScalarAtOff(base, byteOff + b, 1); g.emReg tmp)
     g.dropBridge tmp
 
-proc aggrWordsToFromRegs*(g: var CodeGen; varName: string; typeSym: SymId;
+proc aggrWordsToFromRegs(g: var CodeGen; varName: string; typeSym: SymId;
                          firstArg: int; toRegs: bool) =
   ## Move a ≤16-byte aggregate between its memory home and x{firstArg+i} (the by-value
   ## aggregate ABI). The whole transfer is positional: the slot's address goes into a

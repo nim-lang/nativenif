@@ -64,7 +64,7 @@ proc parseRegisterA64*(n: var Cursor): arm64.Register =
   result = tagToRegisterA64(n.tag, n)
   inc n
 
-proc isA64DoubleRegTag*(t: TagEnum): bool {.inline.} =
+proc isA64DoubleRegTag(t: TagEnum): bool {.inline.} =
   ord(t) >= ord(D0TagId) and ord(t) <= ord(D31TagId)
 
 proc isA64SingleRegTag*(t: TagEnum): bool {.inline.} =
@@ -77,7 +77,7 @@ proc isA64FpRegTag*(t: TagEnum): bool {.inline.} =
 proc isA64FpRegOperand*(n: Cursor): bool {.inline.} =
   n.kind == TagLit and isA64FpRegTag(n.tag)
 
-proc isA64SingleOperand*(n: Cursor): bool {.inline.} =
+proc isA64SingleOperand(n: Cursor): bool {.inline.} =
   ## Whether the fp register operand `n` is single-precision `(sN)`.
   n.kind == TagLit and isA64SingleRegTag(n.tag)
 

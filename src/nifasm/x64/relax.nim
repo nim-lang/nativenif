@@ -22,18 +22,18 @@
 import std / [tables, sets, algorithm, sequtils]
 import "../core" / [buffers, relocs]
 
-proc canUseShortJump*(distance: int): bool {.inline.} =
+proc canUseShortJump(distance: int): bool {.inline.} =
   ## Whether a displacement fits x86's signed 8-bit (rel8) jump form.
   distance >= -128 and distance <= 127
 
-proc isShrinkableX64*(kind: RelocKind): bool {.inline.} =
+proc isShrinkableX64(kind: RelocKind): bool {.inline.} =
   ## x86 `jmp rel32` (5B) and the `0F 8x` conditional jumps (6B) have a 2-byte
   ## rel8 form; `call` has no rel8 form, and `lea`/IAT-call/all ARM64 forms are
   ## fixed size — so only these shrink.
   kind in {rkJmp, rkJe, rkJne, rkJg, rkJl, rkJge, rkJle, rkJa, rkJb, rkJae, rkJbe,
            rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp}
 
-proc longSizeOf*(kind: RelocKind): int {.inline.} =
+proc longSizeOf(kind: RelocKind): int {.inline.} =
   case kind
   of rkCall, rkJmp: 5
   of rkLea: 7
@@ -45,7 +45,7 @@ proc longSizeOf*(kind: RelocKind): int {.inline.} =
   of rkTB, rkTBL, rkTBcond, rkTADR: 4
   of rkTMovwMovt, rkTMovwMovtFunc: 8
 
-proc shortJccOpcode*(kind: RelocKind): byte =
+proc shortJccOpcode(kind: RelocKind): byte =
   case kind
   of rkJe: 0x74
   of rkJne: 0x75
@@ -65,7 +65,7 @@ proc shortJccOpcode*(kind: RelocKind): byte =
   of rkJnp: 0x7B
   else: 0x74  # unreachable (guarded by isShrinkableX64)
 
-proc emitX64Nops*(data: var Bytes; n: int) =
+proc emitX64Nops(data: var Bytes; n: int) =
   ## `n` bytes of x86 no-ops in as FEW instructions as possible (Intel's canonical
   ## multi-byte NOP forms, up to 9 bytes each). A pad before a loop head is executed
   ## on the fall-in path, so 11 × `0x90` would cost 11 decode slots where two long
@@ -86,7 +86,7 @@ proc emitX64Nops*(data: var Bytes; n: int) =
     for b in Forms[k]: data.add b
     r -= k
 
-proc alignPointPositions*(buf: Buffer; alignLabels: seq[int]): seq[int] =
+proc alignPointPositions(buf: Buffer; alignLabels: seq[int]): seq[int] =
   ## Resolve alignment-candidate label IDS to byte positions in `buf`'s CURRENT
   ## layout: undefined labels are dropped, positions inside a layout-frozen
   ## `casejmp` region are dropped (nothing may be inserted there), duplicates
@@ -115,7 +115,7 @@ proc backwardBranchTargets*(buf: Buffer): seq[int] =
         seen.incl int(r.target)
         result.add int(r.target)
 
-proc crossesAlignPoint*(points: seq[int]; a, b: int): bool {.inline.} =
+proc crossesAlignPoint(points: seq[int]; a, b: int): bool {.inline.} =
   ## Would a pad inserted at one of the (sorted) `points` change the displacement
   ## between instruction position `a` and label position `b`? A pad at `p` shifts
   ## every byte — and every label — at position ≥ `p`, so the displacement changes

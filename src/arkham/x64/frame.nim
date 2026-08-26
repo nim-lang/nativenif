@@ -268,7 +268,7 @@ proc genType*(g: var CodeGen; name: string; decl: Cursor) =
       g.ab.symDef name
       g.genTypeBody(c)
 
-proc numIncomingArgRegs*(g: var CodeGen; decl: Cursor): int =
+proc numIncomingArgRegs(g: var CodeGen; decl: Cursor): int =
   ## How many leading integer arg registers carry incoming values: a hidden
   ## result pointer (>16B return) + one per scalar / by-ref-aggregate param + one
   ## per 8-byte word of a ≤16B by-value aggregate param. These hold live values on
@@ -545,7 +545,7 @@ proc emitFrameSub*(g: var CodeGen) =
   elif g.framePad > 0:
     g.binImm(SubX64, RSP, g.framePad.int64)
 
-proc emitFrameAdd*(g: var CodeGen) =
+proc emitFrameAdd(g: var CodeGen) =
   ## Exact mirror of `emitFrameSub`.
   if g.plan.hasStackVars:
     g.ab.tree AddX64:
@@ -716,7 +716,7 @@ proc emProcessExit*(g: var CodeGen; code: Location) =
   g.place2(code, RDI)
   g.movImm(RAX, LinuxX64ExitNr); g.emSyscall()
 
-proc ensureFAccum*(g: var CodeGen; resF: FReg; loc: Location; bits: int) =
+proc ensureFAccum(g: var CodeGen; resF: FReg; loc: Location; bits: int) =
   ## Make the destructive-SSE accumulator `resF` hold the value just produced at
   ## `loc`. Normally the allocator fixed the producing operand's dest to the result
   ## register, so `loc` IS `resF` and this is a no-op; but when `resF` is a produce-into
@@ -730,7 +730,7 @@ proc ensureFAccum*(g: var CodeGen; resF: FReg; loc: Location; bits: int) =
   of NamedStack: g.emFloatScalarLoad(resF, loc.name, bits)
   else: raiseAssert "arkham x64n: float accumulator source " & $loc.kind
 
-proc emAggrSrcAddr*(g: var CodeGen; dest: Reg; name: string) =
+proc emAggrSrcAddr(g: var CodeGen; dest: Reg; name: string) =
   ## `dest ← &name` for an aggregate SOURCE that may be a local stack slot, a by-ref
   ## aggregate param (its pointer is already in a register), OR a module-level
   ## global / `const` / threadvar. `locationOfSym` yields NamedStack/InReg for a local

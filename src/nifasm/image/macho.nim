@@ -264,7 +264,7 @@ const
   REBASE_OPCODE_DO_REBASE_IMM_TIMES* = 0x50'u8
   REBASE_TYPE_POINTER* = 1'u8
 
-proc initMachOHeader*(cputype, cpusubtype: uint32; ncmds, sizeofcmds: uint32; flags: uint32 = 0): MachO_Header =
+proc initMachOHeader(cputype, cpusubtype: uint32; ncmds, sizeofcmds: uint32; flags: uint32 = 0): MachO_Header =
   result.magic = MH_MAGIC_64
   result.cputype = cputype
   result.cpusubtype = cpusubtype
@@ -274,7 +274,7 @@ proc initMachOHeader*(cputype, cpusubtype: uint32; ncmds, sizeofcmds: uint32; fl
   result.flags = flags
   result.reserved = 0
 
-proc initSegment64*(segname: string; vmaddr, vmsize, fileoff, filesz: uint64;
+proc initSegment64(segname: string; vmaddr, vmsize, fileoff, filesz: uint64;
                     maxprot, initprot: uint32; nsects: uint32): MachO_Segment64 =
   result.cmd = LC_SEGMENT_64
   result.cmdsize = uint32(sizeof(MachO_Segment64) + nsects.int * sizeof(MachO_Section64))
@@ -291,7 +291,7 @@ proc initSegment64*(segname: string; vmaddr, vmsize, fileoff, filesz: uint64;
   result.nsects = nsects
   result.flags = 0
 
-proc initSection64*(sectname, segname: string; address, size: uint64;
+proc initSection64(sectname, segname: string; address, size: uint64;
                     offset: uint32; align: uint32; flags: uint32): MachO_Section64 =
   result.sectname = default(typeof(result.sectname))
   for i, c in sectname:
@@ -312,7 +312,7 @@ proc initSection64*(sectname, segname: string; address, size: uint64;
   result.reserved2 = 0
   result.reserved3 = 0
 
-proc initEntryPoint*(entryoff: uint64): MachO_EntryPoint =
+proc initEntryPoint(entryoff: uint64): MachO_EntryPoint =
   result.cmd = LC_MAIN
   result.cmdsize = uint32(sizeof(MachO_EntryPoint))
   result.entryoff = entryoff

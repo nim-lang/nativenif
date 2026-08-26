@@ -64,15 +64,15 @@ proc invert*(c: Condition): Condition =
   assert c != CondAL
   Condition(ord(c) xor 1)
 
-proc isLow*(r: Register): bool {.inline.} = r in LowRegs
+proc isLow(r: Register): bool {.inline.} = r in LowRegs
 
 # ── emission primitives ─────────────────────────────────────────────────────
 
-proc emitNarrow*(dest: var Bytes; hw: uint16) {.inline.} =
+proc emitNarrow(dest: var Bytes; hw: uint16) {.inline.} =
   ## One 16-bit instruction, little-endian.
   dest.addUint16 hw
 
-proc emitWide*(dest: var Bytes; hi, lo: uint16) {.inline.} =
+proc emitWide(dest: var Bytes; hi, lo: uint16) {.inline.} =
   ## One 32-bit instruction as two little-endian halfwords, HIGH halfword first.
   ## Writing it as a single `addUint32` would swap them and encode a different
   ## instruction entirely.
@@ -416,11 +416,11 @@ proc emitLdrb*(dest: var Bytes; rt, rn: Register; offset: int32) =
   dest.emitLoadStoreImm(rt, rn, offset, MemByte, isLoad = true)
 proc emitStrb*(dest: var Bytes; rt, rn: Register; offset: int32) =
   dest.emitLoadStoreImm(rt, rn, offset, MemByte, isLoad = false)
-proc emitLdrh*(dest: var Bytes; rt, rn: Register; offset: int32) =
+proc emitLdrh(dest: var Bytes; rt, rn: Register; offset: int32) =
   dest.emitLoadStoreImm(rt, rn, offset, MemHalf, isLoad = true)
 proc emitStrh*(dest: var Bytes; rt, rn: Register; offset: int32) =
   dest.emitLoadStoreImm(rt, rn, offset, MemHalf, isLoad = false)
-proc emitLdrsb*(dest: var Bytes; rt, rn: Register; offset: int32) =
+proc emitLdrsb(dest: var Bytes; rt, rn: Register; offset: int32) =
   dest.emitLoadStoreImm(rt, rn, offset, MemByte, isLoad = true, signed = true)
 proc emitLdrsh*(dest: var Bytes; rt, rn: Register; offset: int32) =
   dest.emitLoadStoreImm(rt, rn, offset, MemHalf, isLoad = true, signed = true)

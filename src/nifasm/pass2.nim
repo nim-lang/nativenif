@@ -33,9 +33,9 @@ import thumb/instr
 import thumb/board
 import pass1                          # `handleArch`: `(arch …)` also appears in pass 2
 
-proc genInst*(n: var Cursor; ctx: var GenContext)
+proc genInst(n: var Cursor; ctx: var GenContext)
 
-proc collectLabels*(n: var Cursor; ctx: var GenContext; scope: Scope) =
+proc collectLabels(n: var Cursor; ctx: var GenContext; scope: Scope) =
   ## Pre-scan a cursor subtree and create placeholder symbols for labels.
   if n.kind == TagLit:
     if n.tag == LabTagId:
@@ -55,7 +55,7 @@ proc collectLabels*(n: var Cursor; ctx: var GenContext; scope: Scope) =
   else:
     inc n
 
-proc scanStackArgArea*(n: var Cursor; ctx: var GenContext; scope: Scope; acc: var int) =
+proc scanStackArgArea(n: var Cursor; ctx: var GenContext; scope: Scope; acc: var int) =
   ## Pre-scan a proc body for the largest outgoing stack-argument area any `(prepare …)`
   ## needs (AArch64 fixed-frame model). The result seeds the slot allocator so the area is
   ## reserved ONCE at the frame bottom: local `(s)` slots then sit ABOVE it and `(ssize)`
@@ -304,7 +304,7 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
 
   ctx.scope = oldScope
 
-proc genInst*(n: var Cursor; ctx: var GenContext) =
+proc genInst(n: var Cursor; ctx: var GenContext) =
   ## ONE asm-NIF instruction node, for whichever target this assembly is for.
   ## The listing row is recorded inside each arm rather than around this call:
   ## `withListingRow` is a template, so the three selectors stay independent of

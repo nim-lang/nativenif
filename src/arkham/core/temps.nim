@@ -38,7 +38,7 @@ proc regHoldsHome*(g: var CodeGen; r: Reg): bool =
   if g.plan.homesDirty: rebuildHomes(g.plan)
   r in g.plan.homeRegs
 
-proc fregHoldsHome*(g: var CodeGen; f: FReg): bool =
+proc fregHoldsHome(g: var CodeGen; f: FReg): bool =
   ## The SIMD twin of `regHoldsHome`.
   if g.plan.homesDirty: rebuildHomes(g.plan)
   f in g.plan.homeFRegs

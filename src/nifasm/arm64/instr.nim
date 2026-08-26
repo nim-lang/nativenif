@@ -20,8 +20,8 @@ import "../core" / [context, sem, cursors, diagnostics, typecheck, typesem,
 import encoder as arm64
 import regs, operands
 
-proc genStmtA64*(n: var Cursor; ctx: var GenContext)
-proc genInstA64*(n: var Cursor; ctx: var GenContext)
+proc genStmtA64(n: var Cursor; ctx: var GenContext)
+proc genInstA64(n: var Cursor; ctx: var GenContext)
 
 const A64CallClobbers* = {arm64.X0 .. arm64.X15}
   ## The caller-saved GPRs a call destroys (AAPCS64; x16/x17 are assembler veneers
@@ -30,7 +30,7 @@ const A64CallClobbers* = {arm64.X0 .. arm64.X15}
   ## avoids by homing cross-call values in callee-saved x19–x28, and what the clobber
   ## check guards against. Matches arkham's emitted `(clobber …)` (`ConvClobbersGpr`).
 
-proc genPrepareA64*(n: var Cursor; ctx: var GenContext) =
+proc genPrepareA64(n: var Cursor; ctx: var GenContext) =
   ## Handle (prepare target ... (call) ...) or (prepare target ... (extcall) ...)
   ## The prepare block sets up a call context for type checking and argument tracking.
   var hdr = n
@@ -131,7 +131,7 @@ proc genPrepareA64*(n: var Cursor; ctx: var GenContext) =
   if outerCall.state == CallContextState.Disabled:
     ctx.callContext.state = CallContextState.Disabled
 
-proc callClobbersA64*(ctx: GenContext): set[arm64.Register] =
+proc callClobbersA64(ctx: GenContext): set[arm64.Register] =
   ## What the callee currently being `prepare`d actually destroys. The signature's
   ## own `(clobber …)` wins when it declared one: arkham emits an EMPTY list for a
   ## `(attr "noreturn")` callee (panic, raiseAssert, the bounds-check failure path),
@@ -144,7 +144,7 @@ proc callClobbersA64*(ctx: GenContext): set[arm64.Register] =
   if t != nil and t.kind == ProcT and t.hasClobberDecl: t.clobbersA64
   else: A64CallClobbers
 
-proc genCallMarkerA64*(n: var Cursor; ctx: var GenContext) =
+proc genCallMarkerA64(n: var Cursor; ctx: var GenContext) =
   ## Handle (call) marker inside a prepare block - emits the actual call instruction
   if not ctx.inCall:
     error("(call) can only be used inside a prepare block", n)
@@ -192,7 +192,7 @@ proc genCallMarkerA64*(n: var Cursor; ctx: var GenContext) =
 
   inc n
 
-proc genTailcallMarkerA64*(n: var Cursor; ctx: var GenContext) =
+proc genTailcallMarkerA64(n: var Cursor; ctx: var GenContext) =
   ## `(tailcall)` — the `(call)` marker's no-link twin. Same prepared arguments,
   ## same clobber declaration, `b`/`br` instead of `bl`/`blr`: control leaves this
   ## proc for good, so the callee returns to OUR caller and its `ret` is ours.
@@ -227,7 +227,7 @@ proc genTailcallMarkerA64*(n: var Cursor; ctx: var GenContext) =
   ctx.callContext.callEmitted = true
   inc n
 
-proc genSyscallMarkerA64*(n: var Cursor; ctx: var GenContext) =
+proc genSyscallMarkerA64(n: var Cursor; ctx: var GenContext) =
   ## `(svc 0)` inside a `(prepare <syproc> …)` block: the syscall counterpart of
   ## `(call)`. The args are already in x0–x5 (the syproc's params); this loads the
   ## number into x8 and traps. Unlike a `bl`, a Linux/AArch64 `svc` preserves every
@@ -242,7 +242,7 @@ proc genSyscallMarkerA64*(n: var Cursor; ctx: var GenContext) =
   ctx.clobberedA64.incl arm64.X0
   ctx.callContext.callEmitted = true
 
-proc genExtcallA64*(n: var Cursor; ctx: var GenContext) =
+proc genExtcallA64(n: var Cursor; ctx: var GenContext) =
   ## Handle (extcall) marker inside a prepare block - emits external call
   if not ctx.inCall:
     error("(extcall) can only be used inside a prepare block", n)
@@ -262,7 +262,7 @@ proc genExtcallA64*(n: var Cursor; ctx: var GenContext) =
 
   inc n
 
-proc genIteA64*(n: var Cursor; ctx: var GenContext) =
+proc genIteA64(n: var Cursor; ctx: var GenContext) =
   inc n
   let lElse = ctx.buf.createLabel()
   let lEnd = ctx.buf.createLabel()
@@ -305,7 +305,7 @@ proc genIteA64*(n: var Cursor; ctx: var GenContext) =
   ctx.clobbered = thenClobbered + elseClobbered
   ctx.clobberedA64 = thenClobberedA64 + elseClobberedA64
 
-proc genLoopA64*(n: var Cursor; ctx: var GenContext) =
+proc genLoopA64(n: var Cursor; ctx: var GenContext) =
   inc n
   # Bare infinite-loop form `(loop (stmts …))` — the back-edge is emitted INTERNALLY here,
   # so no backward branch reaches the input; the body carries a FORWARD branch to a break/
@@ -337,7 +337,7 @@ proc genLoopA64*(n: var Cursor; ctx: var GenContext) =
   ctx.buf.emitB(lStart)
   ctx.buf.defineLabel(lEnd)
 
-proc genJtrueA64*(n: var Cursor; ctx: var GenContext) =
+proc genJtrueA64(n: var Cursor; ctx: var GenContext) =
   let start = n
   inc n
   var jumpTarget: LabelId
@@ -354,7 +354,7 @@ proc genJtrueA64*(n: var Cursor; ctx: var GenContext) =
   if firstCfvar: error("jtrue requires at least one cfvar", start)
   ctx.buf.emitB(jumpTarget)
 
-proc genKillA64*(n: var Cursor; ctx: var GenContext) =
+proc genKillA64(n: var Cursor; ctx: var GenContext) =
   inc n
   if n.kind != Symbol: error("Expected symbol to kill", n)
   let name = getSym(n)
@@ -370,7 +370,7 @@ proc genKillA64*(n: var Cursor; ctx: var GenContext) =
   ctx.scope.undefine(sym.name)
   inc n
 
-proc bindRegA64*(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
+proc bindRegA64(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
                 reg: arm64.Register) =
   ## Bind physical register `reg` to the typed name `name`, *killing its prior tenant
   ## first* (the previous binding's name is undefined, so a later use of a value
@@ -386,7 +386,7 @@ proc bindRegA64*(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
   ctx.a64RegBindings[reg] = name
   ctx.scope.define(sym)
 
-proc bindFRegA64*(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
+proc bindFRegA64(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
                  reg: arm64.FloatRegister) =
   ## The SIMD twin of `bindRegA64`: bind v-register `reg` to the typed float name
   ## `name`, killing its prior tenant first. The binding's type carries the precision
@@ -400,7 +400,7 @@ proc bindFRegA64*(ctx: var GenContext; name: string; typ: Type; regTag: TagEnum;
   ctx.a64FRegBindings[reg] = name
   ctx.scope.define(sym)
 
-proc parseRebindHeaderA64*(n: var Cursor; ctx: var GenContext):
+proc parseRebindHeaderA64(n: var Cursor; ctx: var GenContext):
                           tuple[name: string; isFp: bool; reg: arm64.Register;
                                 freg: arm64.FloatRegister] =
   ## Parse `:name TYPE (reg)` (cursor past the rebind/withreg tag, inside the node)
@@ -424,14 +424,14 @@ proc parseRebindHeaderA64*(n: var Cursor; ctx: var GenContext):
   else:
     error("Expected a register for rebind/withreg", n)
 
-proc genRebindA64*(n: var Cursor; ctx: var GenContext) =
+proc genRebindA64(n: var Cursor; ctx: var GenContext) =
   ## `(rebind :name TYPE (reg))` — bind `reg` to `name`, killing its prior tenant. The
   ## binding lives until an explicit `kill`, the next `rebind` of `reg`, or proc end
   ## (`a64RegBindings` is reset per proc).
   into n:
     discard parseRebindHeaderA64(n, ctx)
 
-proc genWithregA64*(n: var Cursor; ctx: var GenContext) =
+proc genWithregA64(n: var Cursor; ctx: var GenContext) =
   ## `(withreg :name TYPE (reg) body…)` — a block-scoped `rebind`: the binding is
   ## auto-killed at the end of the body, in addition to killing `reg`'s prior tenant.
   into n:
@@ -444,7 +444,7 @@ proc genWithregA64*(n: var Cursor; ctx: var GenContext) =
       ctx.a64RegBindings.del(h.reg)
     ctx.scope.undefine(ctx.symIdOf(h.name))
 
-proc genPopframeA64*(ctx: var GenContext) =
+proc genPopframeA64(ctx: var GenContext) =
   ## `(popframe)` — undo this proc's prologue, wherever we are in its body.
   ##
   ## The frame's shape is nifasm's to know, not the backend's: arkham finalizes
@@ -480,7 +480,7 @@ proc genPopframeA64*(ctx: var GenContext) =
                       arm64.Register(st.saves[0].reg),
                       arm64.Register(st.saves[1].reg), arm64.SP, 16'i32)
 
-proc genInstA64*(n: var Cursor; ctx: var GenContext) =
+proc genInstA64(n: var Cursor; ctx: var GenContext) =
   if n.kind != TagLit: error("Expected instruction", n)
   let instTag = tagToA64Inst(n.tag)
   let start = n
@@ -1708,7 +1708,7 @@ proc genInstA64*(n: var Cursor; ctx: var GenContext) =
 proc genInstNodeA64*(n: var Cursor; ctx: var GenContext) =
   withListingRow(ctx, n): genInstA64(n, ctx)
 
-proc genStmtA64*(n: var Cursor; ctx: var GenContext) =
+proc genStmtA64(n: var Cursor; ctx: var GenContext) =
   if atTag(n, StmtsTagId):
     loopInto n:
       genInstNodeA64(n, ctx)

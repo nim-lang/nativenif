@@ -187,7 +187,7 @@ proc takeMirrors*(rb: var RegBind): tuple[gprs, fprs: seq[string]] =
   rb.m.fmirror.clear()
   rb.m.fofVal.clear()
 
-proc clearMirrors*(rb: var RegBind) =
+proc clearMirrors(rb: var RegBind) =
   ## `takeMirrors` for the per-proc reset, where there is no buffer left to emit
   ## a `(kill …)` into and the bindings die with the proc anyway.
   rb.m.mirror.clear()
@@ -400,7 +400,7 @@ proc bindFLocal*(rb: var RegBind; f: FReg; name: string) =
   rb.boundFTmps.excl f
   rb.scopeFLocals[^1].add (name: name, f: f)
 
-proc takeFBindingIf*(rb: var RegBind; f: FReg; name: string): bool =
+proc takeFBindingIf(rb: var RegBind; f: FReg; name: string): bool =
   result = rb.fregLocal.getOrDefault(f, "") == name
   if result:
     rb.fregLocal.del f

@@ -97,7 +97,7 @@ proc dreg*(a: var AsmBuf; f: FReg) {.inline.} =
   ## A double-precision fp register operand `(dN)` (the 64-bit view of `vN`).
   a.openS("d" & $ord(f)); a.close()
 
-proc sreg*(a: var AsmBuf; f: FReg) {.inline.} =
+proc sreg(a: var AsmBuf; f: FReg) {.inline.} =
   ## A single-precision fp register operand `(sN)` (the 32-bit view of `vN`).
   a.openS("s" & $ord(f)); a.close()
 

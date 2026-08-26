@@ -15,7 +15,7 @@
 import "../core" / [context, relocs, buffers]
 import dwarf, tracetable
 
-proc dwarfArchOf*(arch: Arch): DwarfArch {.inline.} =
+proc dwarfArchOf(arch: Arch): DwarfArch {.inline.} =
   if arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64}: dwA64 else: dwX64
 
 proc appendTraceTable*(ctx: var GenContext) =

@@ -125,7 +125,7 @@ proc writeMachO*(a: var GenContext; outfile: string) =
     if codesignResult != 0:
       raise newException(OSError, "codesign failed with exit code " & $codesignResult)
 
-proc machoName*(name: string): string =
+proc machoName(name: string): string =
   ## Mangle a nifasm symbol into a Mach-O symbol. macOS C ABI prefixes globals
   ## with `_`; nifasm's internal names (e.g. `foo.0.mod`) only need a stable,
   ## collision-free spelling, and `.` is valid in Mach-O symbol names.

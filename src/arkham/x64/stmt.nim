@@ -31,7 +31,7 @@ const CaseJmpMinBranches* = 4
   ## dispatch preamble (mov+sub+cmp+ja+imul+lea+add+jmp).
 
 proc genStmt2*(g: var CodeGen; c: Cursor)
-proc condFuseSym*(g: CodeGen; c: Cursor): string
+proc condFuseSym(g: CodeGen; c: Cursor): string
 
 proc genVarDecl2*(g: var CodeGen; c: Cursor) =
   var cc = c
@@ -124,7 +124,7 @@ proc emitCaseTest2*(g: var CodeGen; selReg: Reg; c: var Cursor; lBody: string; s
     g.ab.tree CmpX64: (g.emReg selReg; g.ab.intLit branchImm(c))
     g.emJcc(JeX64, lBody)
 
-proc cmovTagFor*(jccTag: X64Inst): X64Inst =
+proc cmovTagFor(jccTag: X64Inst): X64Inst =
   ## The `cmov<cc>` whose condition matches `jccTag` (taken when the relation holds):
   ## `cmov<cc> D, S` performs `D = cc ? S : D`.
   case jccTag
@@ -140,7 +140,7 @@ proc cmovTagFor*(jccTag: X64Inst): X64Inst =
   of JaeX64: CmovaeX64
   else: raiseAssert "arkham x64: no cmov for " & $jccTag
 
-proc readsReg*(g: var CodeGen; n: Cursor; r: Reg): bool =
+proc readsReg(g: var CodeGen; n: Cursor; r: Reg): bool =
   ## Does expression `n` read a symbol whose home is register `r`? A
   ## register-homed local cannot be reached any other way (no memory aliases it),
   ## so scanning the symbols is exact.
@@ -155,7 +155,7 @@ proc readsReg*(g: var CodeGen; n: Cursor; r: Reg): bool =
         if not result and g.readsReg(c, r): result = true
         skip c
 
-proc tryEmitCmov*(g: var CodeGen; c: Cursor): bool =
+proc tryEmitCmov(g: var CodeGen; c: Cursor): bool =
   ## Lower a select diamond (see `matchSelectDiamond`) branchlessly to
   ## `cmp; cmov<cc> DST, A` — no forward jumps, no label. Returns false for anything
   ## that does not fit; the caller then falls back to branch lowering.
@@ -187,7 +187,7 @@ proc tryEmitCmov*(g: var CodeGen; c: Cursor): bool =
   g.giveBack rT
   return true
 
-proc tryEmitCaseJmp*(g: var CodeGen; c: Cursor): bool =
+proc tryEmitCaseJmp(g: var CodeGen; c: Cursor): bool =
   ## Lower a DENSE `case` as a computed goto (`(casejmp …)`, see nifasm): the
   ## branch bodies become uniform NOP-padded slots and the dispatch is
   ## `jmp base + (sel-lo)*N` — no compare chain, no lookup table, no memory
@@ -598,7 +598,7 @@ proc genStmt2*(g: var CodeGen; c: Cursor) =
       while cc.hasMore: skip cc
   else: raiseAssert "arkham x64n: genStmt2 " & $c.stmtKind
 
-proc condFuseSym*(g: CodeGen; c: Cursor): string =
+proc condFuseSym(g: CodeGen; c: Cursor): string =
   ## The bool symbol an `(if …)`'s FIRST branch tests, when that branch's condition is
   ## a bare symbol — the only shape `scanCondFusions` fuses.
   result = ""
@@ -622,7 +622,7 @@ proc condFuseSym*(g: CodeGen; c: Cursor): string =
         while bc.hasMore: skip bc
     while cc.hasMore: skip cc
 
-proc scanCondFusions*(g: var CodeGen; body: Cursor) =
+proc scanCondFusions(g: var CodeGen; body: Cursor) =
   ## A materialized bool that is branched on straight away costs FIVE instructions:
   ##
   ##     (test `sroa.8 `sroa.8)     ← the compare

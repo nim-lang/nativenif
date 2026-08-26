@@ -211,7 +211,7 @@ proc ensureFAccum2*(g: var CodeGen; resF: FReg; loc: Location; bits: int) =
   of NamedStack: g.emFloatScalarLoad(resF, loc.name, bits)
   else: raiseAssert "arkham a64n: float accumulator source " & $loc.kind
 
-proc emitAtomicInstrM*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
+proc emitAtomicInstrM(g: var CodeGen; c: Cursor; op: IntrinsicOp;
                       argCurs: seq[Cursor]; res: Location) =
   ## The Cortex-M twin of `emitAtomicInstr2`. Every variant is bracketed by `dmb`
   ## — the strongest ordering this profile can express, and the one every memory
@@ -382,7 +382,7 @@ proc emFieldOperand*(g: var CodeGen; dst: Location) =
   of FbGlob, FbTvar:
     raiseAssert "arkham a64n: FbGlob/FbTvar field base must be pre-materialized"
 
-proc emFieldDot*(g: var CodeGen; dst: Location) =
+proc emFieldDot(g: var CodeGen; dst: Location) =
   ## The bare `(dot <base> field)` ADDRESS tree (no `(mem …)` wrapper) — what a64's
   ## `lea` takes (unlike x86, which leas a memory operand).
   case dst.base.kind

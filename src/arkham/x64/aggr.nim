@@ -181,7 +181,7 @@ proc genMemIntrinBody*(g: var CodeGen; builtin: string) =
     raiseAssert "arkham x64 v0: unsupported mem intrinsic: " & builtin
   g.unbindTemp(RCX); g.unbindTemp(RDX); g.unbindTemp(RSI)
 
-proc transferAggrWords*(g: var CodeGen; varName: string; typeSym: SymId;
+proc transferAggrWords(g: var CodeGen; varName: string; typeSym: SymId;
                        regs: openArray[Reg]; toRegs: bool) =
   ## Move an aggregate between memory and the GPRs that carry it, one register per
   ## 8-byte ABI eightbyte (the by-value aggregate ABI). `toRegs` picks the direction
@@ -253,7 +253,7 @@ proc regsToStruct*(g: var CodeGen; varName: string; typeSym: SymId; regs: openAr
   ## regs[i] → aggregate (one GPR per 8-byte word).
   g.transferAggrWords(varName, typeSym, regs, toRegs = false)
 
-proc genAtomicXadd*(g: var CodeGen; dst, pReg, work: Reg; val: Location;
+proc genAtomicXadd(g: var CodeGen; dst, pReg, work: Reg; val: Location;
                    pointee: Cursor; returnNew, sub: bool) =
   ## `lock xadd [p], work` with `work` seeded from `val` — the exchange leaves the
   ## OLD value in `work`. For `sub` the addend is negated first, so memory is
@@ -434,7 +434,7 @@ proc aggrSrcEnd*(g: var CodeGen; name: string; staged: var Reg): AggrEnd =
     g.emSymAddrByName(staged, name)
     return regEnd(staged)
 
-proc flatCopyToPtr*(g: var CodeGen; srcVar: string; sizeBytes: int; dstPtr, tmp: Reg) =
+proc flatCopyToPtr(g: var CodeGen; srcVar: string; sizeBytes: int; dstPtr, tmp: Reg) =
   ## Copy the `sizeBytes`-byte aggregate stack slot `srcVar` into `[dstPtr]`, through
   ## scratch `tmp`, by the one `copyAggr` (word bulk + byte tail — any size,
   ## layout-agnostic). `srcVar` is a synthetic `(s)` slot at every call site, so the

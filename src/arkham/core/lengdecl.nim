@@ -32,7 +32,7 @@ proc createLengTagPool*(): TagPool =
     assert uint32(id) == uint32(TagData[e][1]),
       "leng tag pool misalignment for " & TagData[e][0]
 
-template tagEnumOf*(c: Cursor): TagEnum =
+template tagEnumOf(c: Cursor): TagEnum =
   (if c.kind == TagLit: cast[TagEnum](uint32(c.cursorTagId)) else: InvalidTagId)
 
 proc stmtKind*(c: Cursor): LengStmt {.inline.} =

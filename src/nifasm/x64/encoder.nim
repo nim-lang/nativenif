@@ -36,22 +36,22 @@ type RexPrefix* = object
   x*: bool  # Extension of SIB index field
   b*: bool  # Extension of ModR/M r/m field
 
-proc encodeRex*(rex: RexPrefix): byte =
+proc encodeRex(rex: RexPrefix): byte =
   result = 0x40  # Base REX prefix
   if rex.w: result = result or 0x08
   if rex.r: result = result or 0x04
   if rex.x: result = result or 0x02
   if rex.b: result = result or 0x01
 
-proc needsRex*(reg: Register): bool =
+proc needsRex(reg: Register): bool =
   int(reg) >= 8
 
 # ModR/M byte encoding
-proc encodeModRM*(mode: AddressingMode; reg: int; rm: int): byte =
+proc encodeModRM(mode: AddressingMode; reg: int; rm: int): byte =
   byte((int(mode) shl 6) or ((reg and 0x07) shl 3) or (rm and 0x07))
 
 # SIB byte encoding
-proc encodeSIB*(scale: int; index: int; base: int): byte =
+proc encodeSIB(scale: int; index: int; base: int): byte =
   let scaleBits =
     case scale
     of 1: 0b00
@@ -61,7 +61,7 @@ proc encodeSIB*(scale: int; index: int; base: int): byte =
     else: 0b00
   byte((scaleBits shl 6) or ((index and 0x07) shl 3) or (base and 0x07))
 
-proc emitSegPrefix*(dest: var Bytes; mem: MemoryOperand) =
+proc emitSegPrefix(dest: var Bytes; mem: MemoryOperand) =
   ## A legacy segment-override prefix (FS = 0x64, for thread-local storage) must
   ## precede the REX prefix and opcode, so it is emitted by the instruction
   ## encoder *before* anything else — NOT inside `emitMem` (which runs last, after
@@ -998,7 +998,7 @@ proc emitShr*(dest: var Bytes; reg: Register; count: int) =
     dest.add(encodeModRM(amDirect, 5, int(reg)))  # /5 extension
     dest.add(byte(count))
 
-proc emitSal*(dest: var Bytes; reg: Register; count: int) =
+proc emitSal(dest: var Bytes; reg: Register; count: int) =
   ## Emit SAL instruction: SAL reg, count (shift arithmetic left)
   var rex = RexPrefix(w: true)
 
@@ -1256,21 +1256,21 @@ type XmmRegister* = enum
   XMM0 = 0, XMM1 = 1, XMM2 = 2, XMM3 = 3, XMM4 = 4, XMM5 = 5, XMM6 = 6, XMM7 = 7,
   XMM8 = 8, XMM9 = 9, XMM10 = 10, XMM11 = 11, XMM12 = 12, XMM13 = 13, XMM14 = 14, XMM15 = 15
 
-proc needsRex*(reg: XmmRegister): bool =
+proc needsRex(reg: XmmRegister): bool =
   int(reg) >= 8
 
 # x87 FPU operations
-proc emitFld*(dest: var Bytes; reg: FpuRegister) =
+proc emitFld(dest: var Bytes; reg: FpuRegister) =
   ## Emit FLD instruction: FLD reg (load floating point)
   dest.add(0xD9)  # FLD opcode
   dest.add(encodeModRM(amDirect, 0, int(reg)))  # /0 extension
 
-proc emitFst*(dest: var Bytes; reg: FpuRegister) =
+proc emitFst(dest: var Bytes; reg: FpuRegister) =
   ## Emit FST instruction: FST reg (store floating point)
   dest.add(0xDD)  # FST opcode
   dest.add(encodeModRM(amDirect, 2, int(reg)))  # /2 extension
 
-proc emitFstp*(dest: var Bytes; reg: FpuRegister) =
+proc emitFstp(dest: var Bytes; reg: FpuRegister) =
   ## Emit FSTP instruction: FSTP reg (store floating point and pop)
   dest.add(0xDD)  # FSTP opcode
   dest.add(encodeModRM(amDirect, 3, int(reg)))  # /3 extension
@@ -1295,37 +1295,37 @@ proc emitFdiv*(dest: var Bytes; reg: FpuRegister) =
   dest.add(0xD8)  # FDIV opcode
   dest.add(encodeModRM(amDirect, 6, int(reg)))  # /6 extension
 
-proc emitFcom*(dest: var Bytes; reg: FpuRegister) =
+proc emitFcom(dest: var Bytes; reg: FpuRegister) =
   ## Emit FCOM instruction: FCOM reg (floating point compare)
   dest.add(0xD8)  # FCOM opcode
   dest.add(encodeModRM(amDirect, 2, int(reg)))  # /2 extension
 
-proc emitFcomp*(dest: var Bytes; reg: FpuRegister) =
+proc emitFcomp(dest: var Bytes; reg: FpuRegister) =
   ## Emit FCOMP instruction: FCOMP reg (floating point compare and pop)
   dest.add(0xD8)  # FCOMP opcode
   dest.add(encodeModRM(amDirect, 3, int(reg)))  # /3 extension
 
-proc emitFsin*(dest: var Bytes) =
+proc emitFsin(dest: var Bytes) =
   ## Emit FSIN instruction: FSIN (sine)
   dest.add(0xD9)  # FSIN opcode
   dest.add(0xFE)  # /6 extension
 
-proc emitFcos*(dest: var Bytes) =
+proc emitFcos(dest: var Bytes) =
   ## Emit FCOS instruction: FCOS (cosine)
   dest.add(0xD9)  # FCOS opcode
   dest.add(0xFF)  # /7 extension
 
-proc emitFsqrt*(dest: var Bytes) =
+proc emitFsqrt(dest: var Bytes) =
   ## Emit FSQRT instruction: FSQRT (square root)
   dest.add(0xD9)  # FSQRT opcode
   dest.add(0xFA)  # /2 extension
 
-proc emitFabs*(dest: var Bytes) =
+proc emitFabs(dest: var Bytes) =
   ## Emit FABS instruction: FABS (absolute value)
   dest.add(0xD9)  # FABS opcode
   dest.add(0xE1)  # /4 extension
 
-proc emitFchs*(dest: var Bytes) =
+proc emitFchs(dest: var Bytes) =
   ## Emit FCHS instruction: FCHS (change sign)
   dest.add(0xD9)  # FCHS opcode
   dest.add(0xE0)  # /4 extension
@@ -1400,16 +1400,16 @@ proc emitMulss*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest,
 proc emitMulsd*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF2, 0x59, int(destReg), int(srcReg))
 proc emitDivss*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF3, 0x5E, int(destReg), int(srcReg))
 proc emitDivsd*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF2, 0x5E, int(destReg), int(srcReg))
-proc emitSqrtss*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF3, 0x51, int(destReg), int(srcReg))
-proc emitSqrtsd*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF2, 0x51, int(destReg), int(srcReg))
+proc emitSqrtss(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF3, 0x51, int(destReg), int(srcReg))
+proc emitSqrtsd(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF2, 0x51, int(destReg), int(srcReg))
 proc emitComiss*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0x00, 0x2F, int(destReg), int(srcReg))
 proc emitComisd*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0x66, 0x2F, int(destReg), int(srcReg))
 proc emitCvtss2sd*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF3, 0x5A, int(destReg), int(srcReg))
 proc emitCvtsd2ss*(dest: var Bytes; destReg, srcReg: XmmRegister) = emitSseRR(dest, 0xF2, 0x5A, int(destReg), int(srcReg))
 proc emitCvtsi2ss*(dest: var Bytes; destReg: XmmRegister; srcReg: Register) = emitSseRR(dest, 0xF3, 0x2A, int(destReg), int(srcReg), w = true)
 proc emitCvtsi2sd*(dest: var Bytes; destReg: XmmRegister; srcReg: Register) = emitSseRR(dest, 0xF2, 0x2A, int(destReg), int(srcReg), w = true)
-proc emitCvtss2si*(dest: var Bytes; destReg: Register; srcReg: XmmRegister) = emitSseRR(dest, 0xF3, 0x2D, int(destReg), int(srcReg), w = true)
-proc emitCvtsd2si*(dest: var Bytes; destReg: Register; srcReg: XmmRegister) = emitSseRR(dest, 0xF2, 0x2D, int(destReg), int(srcReg), w = true)
+proc emitCvtss2si(dest: var Bytes; destReg: Register; srcReg: XmmRegister) = emitSseRR(dest, 0xF3, 0x2D, int(destReg), int(srcReg), w = true)
+proc emitCvtsd2si(dest: var Bytes; destReg: Register; srcReg: XmmRegister) = emitSseRR(dest, 0xF2, 0x2D, int(destReg), int(srcReg), w = true)
 proc emitCvttss2si*(dest: var Bytes; destReg: Register; srcReg: XmmRegister) = emitSseRR(dest, 0xF3, 0x2C, int(destReg), int(srcReg), w = true)
 proc emitCvttsd2si*(dest: var Bytes; destReg: Register; srcReg: XmmRegister) = emitSseRR(dest, 0xF2, 0x2C, int(destReg), int(srcReg), w = true)
 proc emitMovqGprToXmm*(dest: var Bytes; destReg: XmmRegister; srcReg: Register) = emitSseRR(dest, 0x66, 0x6E, int(destReg), int(srcReg), w = true)
@@ -1554,17 +1554,17 @@ proc emitCmpxchg8b*(dest: var Bytes; mem: MemoryOperand) =
   dest.emitMem(1, mem) # /1 extension
 
 # Atomic bit operations
-proc emitBtsAtomic*(dest: var Bytes; reg: Register; bit: int) =
+proc emitBtsAtomic(dest: var Bytes; reg: Register; bit: int) =
   ## Emit atomic BTS instruction: LOCK BTS reg, bit (atomic bit test and set)
   dest.emitLock()
   dest.emitBts(reg, bit)
 
-proc emitBtrAtomic*(dest: var Bytes; reg: Register; bit: int) =
+proc emitBtrAtomic(dest: var Bytes; reg: Register; bit: int) =
   ## Emit atomic BTR instruction: LOCK BTR reg, bit (atomic bit test and reset)
   dest.emitLock()
   dest.emitBtr(reg, bit)
 
-proc emitBtcAtomic*(dest: var Bytes; reg: Register; bit: int) =
+proc emitBtcAtomic(dest: var Bytes; reg: Register; bit: int) =
   ## Emit atomic BTC instruction: LOCK BTC reg, bit (atomic bit test and complement)
   dest.emitLock()
   dest.emitBtc(reg, bit)
@@ -1678,7 +1678,7 @@ proc emitPrefetchNta*(dest: var Bytes; reg: Register) =
 
 
 # Conditional set instructions
-proc emitSetcc*(dest: var Bytes; code: byte; reg: Register) =
+proc emitSetcc(dest: var Bytes; code: byte; reg: Register) =
   ## Emit SETcc reg (set byte if condition). The destination is an r/m8: to
   ## address SPL/BPL/SIL/DIL (reg 4..7) rather than the legacy AH/CH/DH/BH, a
   ## REX prefix MUST be present, so emit a (possibly bare) REX for any reg >= 4.
@@ -1705,7 +1705,7 @@ proc emitSets*(dest: var Bytes; reg: Register) = dest.emitSetcc(0x98, reg)
 proc emitSetp*(dest: var Bytes; reg: Register) = dest.emitSetcc(0x9A, reg)
 
 # Conditional move instructions
-proc emitCmovcc*(dest: var Bytes; code: byte; destReg, srcReg: Register) =
+proc emitCmovcc(dest: var Bytes; code: byte; destReg, srcReg: Register) =
   ## Emit CMOVcc destReg, srcReg
   var rex = RexPrefix(w: true)
   if needsRex(destReg): rex.r = true
@@ -1718,7 +1718,7 @@ proc emitCmovcc*(dest: var Bytes; code: byte; destReg, srcReg: Register) =
   dest.add(code)
   dest.add(encodeModRM(amDirect, int(destReg), int(srcReg)))
 
-proc emitCmovcc*(dest: var Bytes; code: byte; destReg: Register; srcMem: MemoryOperand) =
+proc emitCmovcc(dest: var Bytes; code: byte; destReg: Register; srcMem: MemoryOperand) =
   ## Emit CMOVcc destReg, mem
   emitSegPrefix(dest, srcMem)
   var rex = RexPrefix(w: true)
@@ -2090,38 +2090,38 @@ proc emitXorMem*(dest: var Bytes; reg: Register; mem: MemoryOperand) =
   dest.emitMem(int(reg), mem)
 
 # Atomic arithmetic operations
-proc emitAddAtomic*(dest: var Bytes; a, b: Register) =
+proc emitAddAtomic(dest: var Bytes; a, b: Register) =
   ## Emit atomic ADD instruction: LOCK ADD a, b (atomic add)
   dest.emitLock()
   dest.emitAdd(a, b)
 
-proc emitSubAtomic*(dest: var Bytes; a, b: Register) =
+proc emitSubAtomic(dest: var Bytes; a, b: Register) =
   ## Emit atomic SUB instruction: LOCK SUB a, b (atomic subtract)
   dest.emitLock()
   dest.emitSub(a, b)
 
-proc emitAndAtomic*(dest: var Bytes; a, b: Register) =
+proc emitAndAtomic(dest: var Bytes; a, b: Register) =
   ## Emit atomic AND instruction: LOCK AND a, b (atomic and)
   dest.emitLock()
   dest.emitAnd(a, b)
 
-proc emitOrAtomic*(dest: var Bytes; a, b: Register) =
+proc emitOrAtomic(dest: var Bytes; a, b: Register) =
   ## Emit atomic OR instruction: LOCK OR a, b (atomic or)
   dest.emitLock()
   dest.emitOr(a, b)
 
-proc emitXorAtomic*(dest: var Bytes; a, b: Register) =
+proc emitXorAtomic(dest: var Bytes; a, b: Register) =
   ## Emit atomic XOR instruction: LOCK XOR a, b (atomic xor)
   dest.emitLock()
   dest.emitXor(a, b)
 
 # Atomic increment and decrement
-proc emitIncAtomic*(dest: var Bytes; reg: Register) =
+proc emitIncAtomic(dest: var Bytes; reg: Register) =
   ## Emit atomic INC instruction: LOCK INC reg (atomic increment)
   dest.emitLock()
   dest.emitInc(reg)
 
-proc emitDecAtomic*(dest: var Bytes; reg: Register) =
+proc emitDecAtomic(dest: var Bytes; reg: Register) =
   ## Emit atomic DEC instruction: LOCK DEC reg (atomic decrement)
   dest.emitLock()
   dest.emitDec(reg)

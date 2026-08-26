@@ -144,7 +144,7 @@ proc getCurrentPosition*(buf: Bytes): int =
   ## Get the current position in the buffer
   buf.len
 
-proc calculateRelocDistance*(fromPos: int; toPos: int; kind: RelocKind = rkJmp): int =
+proc calculateRelocDistance(fromPos: int; toPos: int; kind: RelocKind = rkJmp): int =
   ## Calculate the distance for a relative instruction
   ## For x86-64, the distance is calculated from after the entire instruction
   ## For ARM64, the distance is calculated from the start of the instruction
@@ -476,7 +476,7 @@ proc isThreadableBranch(kind: RelocKind): bool {.inline.} =
            rkB, rkBEQ, rkBNE, rkCBZ, rkCBNZ, rkTBZ, rkTBNZ,
            rkTB, rkTBcond}
 
-proc prunePositions*(buf: var Buffer; deadPos: HashSet[int]): seq[int] =
+proc prunePositions(buf: var Buffer; deadPos: HashSet[int]): seq[int] =
   ## Delete the instruction starting at each position in `deadPos` (each MUST be the
   ## start of a reloc whose `originalSize` bytes are removed), then rebase every label
   ## and surviving reloc and drop the pruned relocs. Returns this step's old→new

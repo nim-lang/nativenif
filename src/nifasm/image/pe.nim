@@ -199,7 +199,7 @@ type
 
   PePatchProc* = proc (lay: PeLayout) {.closure.}
 
-proc initDosHeader*(peHeaderOffset: uint32): IMAGE_DOS_HEADER =
+proc initDosHeader(peHeaderOffset: uint32): IMAGE_DOS_HEADER =
   result.e_magic = IMAGE_DOS_SIGNATURE
   result.e_cblp = 0x90
   result.e_cp = 0x03
@@ -209,7 +209,7 @@ proc initDosHeader*(peHeaderOffset: uint32): IMAGE_DOS_HEADER =
   result.e_lfarlc = 0x40
   result.e_lfanew = peHeaderOffset
 
-proc initFileHeader*(machine: uint16; numSections: uint16; optHeaderSize: uint16): IMAGE_FILE_HEADER =
+proc initFileHeader(machine: uint16; numSections: uint16; optHeaderSize: uint16): IMAGE_FILE_HEADER =
   result.Machine = machine
   result.NumberOfSections = numSections
   result.TimeDateStamp = 0  # Can be set to current time
@@ -218,7 +218,7 @@ proc initFileHeader*(machine: uint16; numSections: uint16; optHeaderSize: uint16
   result.SizeOfOptionalHeader = optHeaderSize
   result.Characteristics = IMAGE_FILE_EXECUTABLE_IMAGE or IMAGE_FILE_LARGE_ADDRESS_AWARE
 
-proc initOptionalHeader64*(
+proc initOptionalHeader64(
   entryPoint: uint32;
   codeSize: uint32;
   imageBase: uint64;
@@ -273,7 +273,7 @@ proc initOptionalHeader64*(
   result.SizeOfHeapCommit = 0x1000      # 4KB
   result.NumberOfRvaAndSizes = 16
 
-proc initSectionHeader*(
+proc initSectionHeader(
   name: string;
   virtualSize: uint32;
   virtualAddress: uint32;
@@ -311,7 +311,7 @@ const
   UWOP_ALLOC_LARGE = 1'u8
   UWOP_ALLOC_SMALL = 2'u8
 
-proc unwindInfoFor*(p: ProcUnwind): seq[byte] =
+proc unwindInfoFor(p: ProcUnwind): seq[byte] =
   ## One `UNWIND_INFO` for `p`, or an empty seq when the proc is a LEAF — no
   ## pushes, no frame — which needs no entry at all: the OS then assumes the
   ## return address is at `[rsp]`, which for such a proc is exactly true.

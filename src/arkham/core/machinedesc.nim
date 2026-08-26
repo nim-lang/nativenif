@@ -467,7 +467,7 @@ proc fieldLocLval*(aggrType: SymId; field: string; baseLval: Cursor; typ: AsmSlo
 proc immLoc*(ival: int64; typ: AsmSlot): Location {.inline.} =
   Location(kind: Imm, ival: ival, typ: typ)
 
-proc sameReg*(a, b: Location): bool {.inline.} =
+proc sameReg(a, b: Location): bool {.inline.} =
   ## True if both name the same physical register (for move coalescing).
   (a.kind == InReg and b.kind == InReg and a.r == b.r) or
   (a.kind == InFReg and b.kind == InFReg and a.f == b.f)

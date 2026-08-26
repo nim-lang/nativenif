@@ -214,7 +214,7 @@ proc regNameM*(r: Reg): string =
     if ord(r) <= ord(R12): "r" & $ord(r)
     else: "<unmapped:" & $ord(r) & ">"
 
-proc isAllocatableM*(r: Reg): bool {.inline.} =
+proc isAllocatableM(r: Reg): bool {.inline.} =
   ## Whether arkham may place a value in `r`. Excludes nifasm's IP, the bridges'
   ## role is enforced by their absence from the pools rather than here.
   r notin ReservedRegs

@@ -22,7 +22,7 @@ import machine as machine_x64
 import emit, value, frame, stmt, asmproc
 import asmproc
 
-proc recordVarType*(g: var CodeGen; c: Cursor) =
+proc recordVarType(g: var CodeGen; c: Cursor) =
   ## `(param :nm . type)` / `(var :nm pragmas type …)` → record `symType[nm] = type`.
   var cc = c
   cc.into:
@@ -33,7 +33,7 @@ proc recordVarType*(g: var CodeGen; c: Cursor) =
       g.symType[nm] = g.declType(typeCur, cc)    # `.` ⇒ inferred from the initializer
     while cc.hasMore: skip cc
 
-proc recordSymTypes*(g: var CodeGen; c: Cursor) =
+proc recordSymTypes(g: var CodeGen; c: Cursor) =
   ## Pre-pass: populate `symType` for every local var decl so `getType` works during
   ## allocation, before emission fills them in incrementally. Recurses statement
   ## containers; nested proc/type decls are allocated separately.
@@ -48,7 +48,7 @@ proc recordSymTypes*(g: var CodeGen; c: Cursor) =
         g.recordSymTypes(cc)
         skip cc
 
-proc genProc*(g: var CodeGen; info: ProcInfo) =
+proc genProc(g: var CodeGen; info: ProcInfo) =
   if info.isAsm:
     g.genAsmProc(info)
     return

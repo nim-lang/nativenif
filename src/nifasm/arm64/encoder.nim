@@ -83,7 +83,7 @@ proc emitMovImm*(dest: var Bytes; rd: Register; imm: uint16) =
   dest.addUint32(instr)
 
 # MOVK instruction (move with keep)
-proc emitMovK*(dest: var Bytes; rd: Register; imm: uint16; shift: uint8) =
+proc emitMovK(dest: var Bytes; rd: Register; imm: uint16; shift: uint8) =
   ## Emit MOVK instruction: MOVK rd, #imm, LSL #shift
   ## shift must be 0, 16, 32, or 48
   # MOVK Xd, #imm, LSL #shift: 1111 0010 100i iiii iiii iiii iiid dddd
@@ -287,7 +287,7 @@ proc emitEor*(dest: var Bytes; rd, rn, rm: Register) =
 # 0x3fff — is one, which is why the form exists and why materializing the
 # constant into a register first (`mov b,#0xff; and x,b`) is pure waste.
 
-proc encodeLogicalImm*(value: uint64; encoding: var uint32): bool =
+proc encodeLogicalImm(value: uint64; encoding: var uint32): bool =
   ## Compute the `N:immr:imms` field (13 bits, N in bit 12) for the 64-bit
   ## logical-immediate forms, or return false when `value` is not representable.
   ## All-zeros and all-ones are the two excluded patterns — they need no mask.
@@ -489,14 +489,14 @@ proc emitLdr*(dest: var Bytes; rt: Register; rn: Register; offset: int32) =
               encodeReg(rt)
   dest.addUint32(instr)
 
-proc emitLdrReg*(dest: var Bytes; rt, rn, rm: Register; shift: int) =
+proc emitLdrReg(dest: var Bytes; rt, rn, rm: Register; shift: int) =
   ## LDR rt, [rn, rm, LSL #shift] — register offset (shift 0 or 3 for 64-bit).
   let s = if shift == 3: 1'u32 else: 0'u32
   let instr = 0xF8606800'u32 or (s shl 12) or
               (encodeReg(rm) shl 16) or (encodeReg(rn) shl 5) or encodeReg(rt)
   dest.addUint32(instr)
 
-proc emitStrReg*(dest: var Bytes; rt, rn, rm: Register; shift: int) =
+proc emitStrReg(dest: var Bytes; rt, rn, rm: Register; shift: int) =
   ## STR rt, [rn, rm, LSL #shift] — register offset (shift 0 or 3 for 64-bit).
   let s = if shift == 3: 1'u32 else: 0'u32
   let instr = 0xF8206800'u32 or (s shl 12) or
@@ -720,7 +720,7 @@ proc emitAdrpGvarPage*(dest: var Bytes; rd: Register) =
   ## the pos+4 opcode.
   dest.addUint32(0x90000000'u32 or encodeReg(rd))                       # adrp rd, 0
 
-proc emitAdrp*(dest: var Buffer; rd: Register; target: LabelId) =
+proc emitAdrp(dest: var Buffer; rd: Register; target: LabelId) =
   ## Emit ADRP instruction: ADRP rd, target (load page address of label)
   # ADRP Xd, label: 1001 0000 00ii iiii iiii iiii iiii dddd
   # The immediate will be patched later via relocation
@@ -729,7 +729,7 @@ proc emitAdrp*(dest: var Buffer; rd: Register; target: LabelId) =
   dest.addReloc(pos, target, rkADRP, 4)
 
 # BR instruction (branch to register)
-proc emitBr*(dest: var Bytes; rn: Register) =
+proc emitBr(dest: var Bytes; rn: Register) =
   ## Emit BR instruction: BR rn (unconditional branch to address in register)
   # BR Xn: 1101 0110 0001 1111 0000 00nn nnn0 0000
   let instr = 0xD61F0000'u32 or (encodeReg(rn) shl 5)

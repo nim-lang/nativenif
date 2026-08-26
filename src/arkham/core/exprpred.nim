@@ -31,7 +31,7 @@ proc commutativeExpr*(ek: LengExpr): bool {.inline.} =
   ## via a `neg` after the swap — but is NOT commutative, so it is separate.
   ek in {AddC, MulC, BitandC, BitorC, BitxorC}
 
-proc isMemLeaf*(n: Cursor): bool {.inline.} =
+proc isMemLeaf(n: Cursor): bool {.inline.} =
   ## A foldable memory-load operand: a `dot`/`deref`/`at`/`pat` addressing
   ## chain in value position (folds as `op reg, [mem]` instead of pinning a
   ## register across a sibling — operands are pure, hexer un-nests calls).

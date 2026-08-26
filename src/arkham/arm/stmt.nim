@@ -53,7 +53,7 @@ proc genVarDecl2*(g: var CodeGen; c: Cursor) =
     if hasVal: g.genStore2(cc, loc)
     while cc.hasMore: skip cc
 
-proc cmpImm2*(g: var CodeGen; selReg: Reg; v: int64) =
+proc cmpImm2(g: var CodeGen; selReg: Reg; v: int64) =
   if v >= 0 and v <= 0xFFFF:
     g.ab.tree CmpA64: (g.emReg selReg; g.ab.intLit v)
   else:
@@ -74,7 +74,7 @@ proc emitCaseTest2*(g: var CodeGen; selReg: Reg; c: var Cursor; lBody: string; s
   else:
     g.cmpImm2(selReg, branchImm(c)); g.emBr(BeqA64, lBody)
 
-proc cselTagFor*(branchTag: A64Inst): A64Inst =
+proc cselTagFor(branchTag: A64Inst): A64Inst =
   ## The `csel<cc>` whose condition matches branch tag `branchTag` (which fires
   ## when the relation holds): `csel<cc> D, S1, S2` yields `D = cc ? S1 : S2`.
   case branchTag
@@ -90,7 +90,7 @@ proc cselTagFor*(branchTag: A64Inst): A64Inst =
   of BhsA64: CselhsA64
   else: raiseAssert "arkham a64n: no csel for " & $branchTag
 
-proc tryEmitCsel*(g: var CodeGen; c: Cursor): bool =
+proc tryEmitCsel(g: var CodeGen; c: Cursor): bool =
   ## Lower a select diamond (see `matchSelectDiamond`) branchlessly to
   ## `cmp; csel<cc> DST, A, B` — no forward jumps, no label. Returns false for
   ## anything that does not fit; the caller then falls back to branch lowering.

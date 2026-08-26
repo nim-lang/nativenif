@@ -81,7 +81,7 @@ type
                        ## proc decl carries only the signature)
     hasBody*: bool
 
-proc takeRoutine*(c: var Cursor): Routine =
+proc takeRoutine(c: var Cursor): Routine =
   ## `c` is positioned at a `(proc …)`/`(proctype …)` node. Captures the name,
   ## the signature sections and the body, advancing `c` past the whole node.
   result = Routine()
@@ -159,7 +159,7 @@ type
     name*: Cursor   ## the `SymbolDef`
     body*: Cursor   ## the type body (`(object …)`, `(union …)` or a plain type)
 
-proc takeTypeDecl*(c: var Cursor): TypeDecl =
+proc takeTypeDecl(c: var Cursor): TypeDecl =
   ## `c` at a `(type …)` node. Captures the name and body, advancing `c` past
   ## the node.
   result = TypeDecl()

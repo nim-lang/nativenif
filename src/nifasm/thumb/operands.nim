@@ -43,7 +43,7 @@ type
     mimg*: MimgKind        ## for an `okMimg` operand: WHICH layout number it is
 
 
-proc mRegType*(): Type {.inline.} =
+proc mRegType(): Type {.inline.} =
   ## The "any type that fits a register" type, at the Cortex-M width. 32, not 64:
   ## `compatible` uses `regBits div 8` as the size bound, so declaring 64 here
   ## would let a `(i 64)` value bind to a 32-bit register unnoticed.
@@ -68,7 +68,7 @@ proc checkRegWidthM*(t: Type; what: string; n: Cursor) =
           "in memory here and cannot be bound to a register (see M4 in " &
           "doc/cortex_m.md)", n)
 
-proc argWordTypeM*(p: ptr Param): Type =
+proc argWordTypeM(p: ptr Param): Type =
   ## The type of ONE argument register of `p`. An aggregate spread over several
   ## registers has no per-word Leng type, and neither does a 64-bit scalar split
   ## across a register PAIR — each half is a machine word. Reporting the param's
@@ -597,7 +597,7 @@ proc emitBranchM*(ctx: var GenContext; cond: thumb2.Condition; target: LabelId) 
   if cond == thumb2.CondAL: thumb2.emitB(ctx.buf, target)
   else: thumb2.emitBcond(ctx.buf, cond, target)
 
-proc memWidthM*(t: Type): tuple[width: thumb2.MemWidth; signed: bool] =
+proc memWidthM(t: Type): tuple[width: thumb2.MemWidth; signed: bool] =
   ## The ACCESS WIDTH a typed memory operand implies, and whether a load of it
   ## sign-extends. A `(mem …)` carries the pointee / field / slot type, so a
   ## narrow integer must load with `ldrb`/`ldrh` (sign- or zero-extending) and
