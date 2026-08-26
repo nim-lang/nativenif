@@ -20,7 +20,7 @@
 ## node's own file/line/col, never a `raiseAssert`.
 ##
 ## The target-neutral half — what a location pragma says, what counts as an atom,
-## which row a call names — lives in `codegen_common`, so the x86-64 and Arm
+## which row a call names — lives in `core/asmcommon`, so the x86-64 and Arm
 ## modes accept the same source language rather than two subsets that drift.
 ##
 ## ## Why one file serves both Arm targets
@@ -49,7 +49,20 @@
 ## value in it is destroyed. That is a corruption with no local symptom, which is
 ## why it is a rejection naming the register rather than a rule left implicit.
 
-proc armFrameSaved(g: CodeGen): set[Reg] =
+import std / [assertions, tables, sets, strformat, strutils]
+import nifcore, nifcdecl
+import "../core" / [asmslots, machinedesc, analyser, planer, programs, asmbuf,
+                    stress, context, diag, asmcommon, typeutil, constdata,
+                    mirrors, select, temps, exprpred, typenav, regbind, abi,
+                    layout, peephole]
+import machine_a64 as machine
+from machine_m as machine_m import nil
+from "../../nifasm/arm64/encoder" as arm64 import isLogicalImm
+from thumbimm import nil
+import emit, mem, aggr, value, frame, stmt
+import "../cortexm/runtime"
+
+proc armFrameSaved*(g: CodeGen): set[Reg] =
   ## The callee-saved registers this back end's prologue actually saves — the
   ## same list `computeFrame` walks, which is the ARCHITECTURAL one and not
   ## `md.intCalleeSaved`. The two differ under `-d:arkhamStress`, where the
@@ -60,13 +73,13 @@ proc armFrameSaved(g: CodeGen): set[Reg] =
   result = {}
   for r in g.md.abiCalleeSaved: result.incl r
 
-proc armVolatile(g: CodeGen): set[Reg] =
+proc armVolatile*(g: CodeGen): set[Reg] =
   ## The registers a callee may destroy without saving. AAPCS32 gives Cortex-M
   ## exactly four (its argument registers; r12 is volatile too but is nifasm's),
   ## AAPCS64 gives x0–x17.
   g.md.intCallerSavedSet
 
-proc armRegByName(g: CodeGen; name: string): Reg =
+proc armRegByName*(g: CodeGen; name: string): Reg =
   ## `"x9"` → `R9` on AArch64, `"r5"` → `R5` on Cortex-M. `NoReg` for a spelling
   ## this target does not have — including the OTHER Arm target's, which is why
   ## the lookup goes through the very renderer the emitter spells registers with
@@ -79,7 +92,7 @@ proc armRegByName(g: CodeGen; name: string): Reg =
     if g.ab.renderReg(r) == name: return r
   if name == "sp": return SP
 
-proc asmPinReg(g: var CodeGen; at: Cursor; name: string): Reg =
+proc asmPinReg*(g: var CodeGen; at: Cursor; name: string): Reg =
   ## Resolve a `{.register: "…"}` spelling, rejecting every register a body may
   ## not own. Each rejection names the ROLE rather than saying "reserved": the
   ## user picked that register for a reason, and what they need to know is which
@@ -145,7 +158,7 @@ type
     kind: AsmDeclKind
     r: Reg
 
-proc asmDeclLoc(g: var CodeGen; prag: Cursor): AsmDeclLoc =
+proc asmDeclLoc*(g: var CodeGen; prag: Cursor): AsmDeclLoc =
   ## `(pragmas (register "x9"))` / `(pragmas (stack))`, read by `asmDeclSpec` and
   ## resolved here: which spelling names a register is the one part of a location
   ## pragma that is not target-neutral.
@@ -155,7 +168,7 @@ proc asmDeclLoc(g: var CodeGen; prag: Cursor): AsmDeclLoc =
   of aslReg: AsmDeclLoc(kind: aslReg, r: g.asmPinReg(spec.at, spec.name))
   of aslStack: AsmDeclLoc(kind: aslStack, r: NoReg)
 
-proc armFlagOf(op: IntrinsicOp): X64Flag =
+proc armFlagOf*(op: IntrinsicOp): X64Flag =
   ## The nifasm condition tag a flag-read row denotes. asm-NIF spells conditions
   ## with the x86 flag vocabulary on EVERY target (that is what `tagToX64Flag`
   ## reads), so this is the same one-enum-to-another map the x64 backend has —
@@ -173,7 +186,7 @@ proc armFlagOf(op: IntrinsicOp): X64Flag =
   of NotOfOp: NoO
   else: NoFlag
 
-proc armFlagSupported(g: CodeGen; f: X64Flag): bool {.inline.} =
+proc armFlagSupported*(g: CodeGen; f: X64Flag): bool {.inline.} =
   ## Which conditions the ASSEMBLER can turn into a branch. Cortex-M maps all
   ## eight of Arm's (`condOfFlagM`); AArch64's `genIteA64` implements only the
   ## zero flag so far. Asking here rather than emitting and hoping is what keeps
@@ -183,19 +196,19 @@ proc armFlagSupported(g: CodeGen; f: X64Flag): bool {.inline.} =
   elif AllFlagBranches in g.md.caps: f in {ZfO, NzO, CfO, NcO, SfO, NsO, OfO, NoO}
   else: f in {ZfO, NzO}
 
-proc asmStmt(g: var CodeGen; c: Cursor)
-proc asmInstr(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor)
+proc asmStmt*(g: var CodeGen; c: Cursor)
+proc asmInstr*(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor)
 
-proc emAsmSlot(g: var CodeGen; name: string) {.inline.} =
+proc emAsmSlot*(g: var CodeGen; name: string) {.inline.} =
   ## A `{.stack.}` local as an OPERAND. On Arm a frame slot is addressed by its
   ## own symbol — `(mov t.0 (r2))` stores, `(mov (r2) t.0)` loads — which is what
   ## every hand-written body in this back end already does.
   g.ab.sym name
 
-proc asmMovReg(g: var CodeGen; d, s: Reg) {.inline.} =
+proc asmMovReg*(g: var CodeGen; d, s: Reg) {.inline.} =
   if d != s: g.ab.tree MovA64: (g.emReg d; g.emReg s)
 
-proc asmAddrOf(g: var CodeGen; dst: Reg; c: Cursor) =
+proc asmAddrOf*(g: var CodeGen; dst: Reg; c: Cursor) =
   ## `p = addr(x)` — §8's one operand that is neither a register nor a literal.
   ##
   ## Two spellings, because Arm addresses the two kinds of storage differently
@@ -226,7 +239,7 @@ proc asmAddrOf(g: var CodeGen; dst: Reg; c: Cursor) =
     lengError sym, "`" & userName(nm) & "` is neither a local of this proc nor a " &
               "global, so it has no address to take", g.asmInfo
 
-proc asmScanLocs(g: var CodeGen; c: Cursor; used: var set[Reg]; anyStack: var bool) =
+proc asmScanLocs*(g: var CodeGen; c: Cursor; used: var set[Reg]; anyStack: var bool) =
   ## Pre-pass over the body: which registers the locals pin (so the prologue knows
   ## which callee-saved ones to save) and whether any `(s)` slot exists (so the
   ## prologue reserves the `(ssize)` region the epilogue releases). Both facts are
@@ -249,7 +262,7 @@ proc asmScanLocs(g: var CodeGen; c: Cursor; used: var set[Reg]; anyStack: var bo
   cc.into:
     while cc.hasMore: (g.asmScanLocs(cc, used, anyStack); skip cc)
 
-proc asmOperand(g: var CodeGen; cur: Cursor) =
+proc asmOperand*(g: var CodeGen; cur: Cursor) =
   ## One source operand of a flag-defining instruction: a register local, a stack
   ## slot, or a literal. Unlike `asmRegOf` this permits memory and immediates,
   ## because `(cmp …)` takes them directly — no materialisation involved.
@@ -263,7 +276,7 @@ proc asmOperand(g: var CodeGen; cur: Cursor) =
   else:
     lengError c, "an `.assembler` operand must be a variable or a literal", g.asmInfo
 
-proc asmInoutDest(g: var CodeGen; c: Cursor) =
+proc asmInoutDest*(g: var CodeGen; c: Cursor) =
   ## The destination of a two-address row. It arrives as `(haddr d)` — the
   ## compiler binding d's LOCATION for a `var` parameter, not the user taking a
   ## pointer — so it resolves to d's declared home and nothing is materialised.
@@ -288,7 +301,7 @@ proc asmInoutDest(g: var CodeGen; c: Cursor) =
               "`{.register: \"…\".}` local first", g.asmInfo
   g.emReg g.asmRegOf(sym)
 
-proc asmInoutInstr(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
+proc asmInoutInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
   ## `add(d, s)` / `neg(d)` — a row that writes THROUGH operand 0 and returns
   ## nothing. Statement-only, since there is no value to bind.
   var argCurs: seq[Cursor] = @[]
@@ -315,7 +328,7 @@ proc asmInoutInstr(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
   # depend on which registers the body pinned, which is not something to read.
   g.asmFlagsFresh = false
 
-proc asmVoidInstr(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
+proc asmVoidInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
   ## A row with no result and no `inout` operand, whose operands the INSTRUCTION
   ## encodes rather than reads from registers: `bkpt #imm8`. It is a statement
   ## for the same reason a flag row is — there is nothing to bind — but for the
@@ -361,7 +374,7 @@ proc asmVoidInstr(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
   # end's sight is worth claiming a flag is still readable after.
   g.asmFlagsFresh = false
 
-proc asmFlagInstr(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
+proc asmFlagInstr*(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
   ## `cmp(a, b)` — an instruction whose entire output is flags. A statement,
   ## never a value: there is nothing to bind.
   var argCurs: seq[Cursor] = @[]
@@ -383,7 +396,7 @@ proc asmFlagInstr(g: var CodeGen; c: Cursor; op: IntrinsicOp) =
   g.ab.tree CmpA64: (g.asmOperand(argCurs[0]); g.asmOperand(argCurs[1]))
   g.asmFlagsFresh = true
 
-proc asmStore(g: var CodeGen; nm: string; srcC: Cursor) =
+proc asmStore*(g: var CodeGen; nm: string; srcC: Cursor) =
   ## `slot = <atom>`. Memory on both sides would take a scratch register no one
   ## declared — the one thing this mode will not invent.
   g.asmFlagsFresh = false
@@ -401,7 +414,7 @@ proc asmStore(g: var CodeGen; nm: string; srcC: Cursor) =
     lengError srcC, "a `{.stack.}` local can only be assigned a variable or a literal",
               g.asmInfo
 
-proc asmLoad(g: var CodeGen; dst: Reg; srcC: Cursor) =
+proc asmLoad*(g: var CodeGen; dst: Reg; srcC: Cursor) =
   ## `reg = <atom>`, where the atom is not an `(instr …)`.
   case srcC.kind
   of Symbol:
@@ -414,7 +427,7 @@ proc asmLoad(g: var CodeGen; dst: Reg; srcC: Cursor) =
   else:
     lengError srcC, "unsupported `.assembler` operand", g.asmInfo
 
-proc asmAsgn(g: var CodeGen; c: Cursor) =
+proc asmAsgn*(g: var CodeGen; c: Cursor) =
   ## `(asgn dest src)` — the only shape that produces a value. `dest` is an atom
   ## with a declared home; `src` is an atom, a literal, or ONE `(instr …)`.
   var cc = c
@@ -443,7 +456,7 @@ proc asmAsgn(g: var CodeGen; c: Cursor) =
     skip cc
     while cc.hasMore: skip cc
 
-proc asmInstr(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor) =
+proc asmInstr*(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor) =
   ## `(instr SYM X*)` in an `.assembler` body: the operands are already where the
   ## user put them, so this is the row's opcode over `dst` and the operand
   ## registers — no placement, no freeing, none of `emitInstr2`'s machinery.
@@ -496,7 +509,7 @@ proc asmInstr(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor) =
               "on this target yet", g.asmInfo
   g.asmFlagsFresh = false
 
-proc asmVarDecl(g: var CodeGen; c: Cursor) =
+proc asmVarDecl*(g: var CodeGen; c: Cursor) =
   ## `(var :nm (pragmas (register "x9")) T init?)` — a DECLARATION of a location,
   ## not an allocation request. Several locals may name the same register (the
   ## user pinned them together); only the first declares a nifasm binding.
@@ -557,7 +570,7 @@ proc asmVarDecl(g: var CodeGen; c: Cursor) =
       skip cc
     while cc.hasMore: skip cc
 
-proc asmIf(g: var CodeGen; c: Cursor) =
+proc asmIf*(g: var CodeGen; c: Cursor) =
   ## `if <flag>(): … else: …` → `(ite <flag> then else)`. A flag is the ONLY
   ## condition allowed: anything else would have to be computed into a register
   ## first, and the instruction that computed it would clobber the very bit an
@@ -628,7 +641,7 @@ proc asmIf(g: var CodeGen; c: Cursor) =
         lengError cc, "unsupported `if` shape in an `.assembler` proc", g.asmInfo
       skip cc
 
-proc asmStmt(g: var CodeGen; c: Cursor) =
+proc asmStmt*(g: var CodeGen; c: Cursor) =
   if c.kind == DotToken: return
   g.asmNoteInfo(c)
   # Tail position, tracked exactly as `genStmt2` does: only the LAST statement of
@@ -747,7 +760,7 @@ proc asmStmt(g: var CodeGen; c: Cursor) =
   else:
     lengError c, "`" & $c.stmtKind & "` is not allowed in an `.assembler` proc", g.asmInfo
 
-proc asmCheckAbi(g: var CodeGen; info: ProcInfo; used: var set[Reg]) =
+proc asmCheckAbi*(g: var CodeGen; info: ProcInfo; used: var set[Reg]) =
   ## Check every `.register` pin on a parameter against the ABI, and bind the
   ## incoming registers to the signature's `pN.0` names.
   ##
@@ -820,12 +833,13 @@ proc asmCheckAbi(g: var CodeGen; info: ProcInfo; used: var set[Reg]) =
         while pc.hasMore: skip pc
       inc ord
 
-proc genAsmProc2(g: var CodeGen; info: ProcInfo) =
+proc genAsmProc2*(g: var CodeGen; info: ProcInfo) =
   ## Emit an `.assembler` proc: no allocator, no analyser, no value core. The
   ## signature is the ordinary declarative one (that is what lets ordinary Nimony
   ## call it), and the `.register` annotations on the parameters are checked
   ## AGAINST it — in an `.assembler` proc a location constraint is an assertion,
   ## not a request.
+
   g.varType.clear(); g.symType.clear()
   g.rb.resetProc(); g.aliasToDecl.clear(); g.savedHomes.clear()
   g.rawHomeRegs = {}

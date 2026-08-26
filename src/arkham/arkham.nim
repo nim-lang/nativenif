@@ -18,7 +18,7 @@ import core/lengdecl             # createLengTagPool
 import arm/machine_m             # the Cortex-M machine model
 import core/layout               # the --layout: board file
 import core/temps                # (arkhamTempDbg: dumpTempStats)
-import codegen_arm               # BOTH Arm targets: AArch64 (Darwin/Linux) and
+import arm/driver                # BOTH Arm targets: AArch64 (Darwin/Linux) and
                                 # Cortex-M. One emitter, three machine models.
 import x64/driver                # x86-64 / Linux backend
 
