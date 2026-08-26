@@ -17,7 +17,7 @@ import nifcoreparse              # parseFromFile + nifcore
 import core/lengdecl             # createLengTagPool
 import arm/machine_m             # the Cortex-M machine model
 import core/layout               # the --layout: board file
-import codegen_common            # (arkhamTempDbg: dumpTempStats)
+import core/temps                # (arkhamTempDbg: dumpTempStats)
 import codegen_arm               # BOTH Arm targets: AArch64 (Darwin/Linux) and
                                 # Cortex-M. One emitter, three machine models.
 import codegen_x64               # x86-64 / Linux backend

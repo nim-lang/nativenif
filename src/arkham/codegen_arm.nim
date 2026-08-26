@@ -40,7 +40,15 @@ from arm/machine_m as machine_m import nil
   # AArch64 spelling of the same idea. Which target a name refers to should be
   # visible at the use site, not decided by import order.
 import core/asmbuf
-import codegen_common
+import core/context
+import core / [diag, asmcommon, typeutil, constdata, mirrors, select,
+               temps, exprpred]
+import core/typenav
+export typenav   # SymCat / SymInfo / getType / exprSlot; re-exported so the
+                 # backends' `g.lookupSym(...).cat` keeps resolving
+import core/regbind
+export regbind   # the emitter's register-binding state (`g.rb`) — the single
+                 # owner of reg<->name bindings, see regbind.nim
 import core/layout               # the `--layout:` board file
 from "../nifasm/arm64/encoder" as arm64 import isLogicalImm
                                  # nifasm: the bitmask-immediate predicate, so
@@ -8147,20 +8155,19 @@ proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## value core would mean reimplementing its register-binding protocol, which is
   ## the part with a formal model behind it (proofs/arkham_bindings.tla).
   setTargetWord Word32             # 4-byte pointers, 4-byte platform int
-  var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: machine_m.cortexMMachine,
-                  thumbM: true, entryExits: true, board: board,
-                  # A board that declares one stack slot has one thread; so does
-                  # an image with no board file at all, which declares no stacks
-                  # and therefore no second thread for anything to run on.
-                  oneThread: not board.given or board.slotCount <= 1)
+  var g = newCodeGen(buf, machine_m.cortexMMachine)
+  g.thumbM = true
+  g.entryExits = true
+  g.board = board
+  # A board that declares one stack slot has one thread; so does an image with no
+  # board file at all, which declares no stacks and therefore no second thread for
+  # anything to run on.
+  g.oneThread = not board.given or board.slotCount <= 1
   g.ab.renderReg = machine_m.regNameM        # `(r0)`..`(r12)`/`(sp)`/`(lr)`
   g.ab.arch = "m"                  # no BodyLib entries apply to this target yet
   g.prog = collect(buf, inputPath, tags, darwin = false)
   g.rejectForThumbM()
-  g.callTarget = g.prog.callTarget
-  g.globals = g.prog.globals
-  g.tvars = g.prog.tvars
-  for nm in g.tvars.keys: g.tvarNames.incl nm
+  g.adoptProgram()
   g.ab.tree StmtsA64:
     g.ab.tree ArchD: g.ab.ident "cortex_m"
     for (name, decl) in g.prog.mainTypeList:
@@ -8254,14 +8261,13 @@ proc generateA64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## `inputPath` and `tags` let the program model load *other* modules on demand
   ## to resolve cross-module symbols (`Foo.0.othermod`).
   setTargetWord Word64             # AArch64: 8-byte pointers, 8-byte platform int
-  var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: aarch64MachineA,
-                  a64Linux: linux, entryExits: linux, oneThread: linux)
+  var g = newCodeGen(buf, aarch64MachineA)
+  g.a64Linux = linux
+  g.entryExits = linux
+  g.oneThread = linux
   g.ab.arch = "a64"                # BodyLib entries this target may splice
   g.prog = collect(buf, inputPath, tags, darwin = not linux)
-  g.callTarget = g.prog.callTarget
-  g.globals = g.prog.globals
-  g.tvars = g.prog.tvars
-  for nm in g.tvars.keys: g.tvarNames.incl nm
+  g.adoptProgram()
   g.ab.tree StmtsA64:
     g.ab.tree ArchD: g.ab.ident (if linux: "linux_arm64" else: "arm64")
     if not linux:

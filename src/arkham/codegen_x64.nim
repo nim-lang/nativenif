@@ -20,7 +20,15 @@
 import std / [assertions, tables, sets, os, algorithm, strutils]
 import nifcore, nifcdecl
 import core / [asmslots, machinedesc, analyser, planer, programs, asmbuf, stress]
-import codegen_common
+import core/context
+import core / [diag, asmcommon, typeutil, constdata, mirrors, select,
+               temps, exprpred]
+import core/typenav
+export typenav   # SymCat / SymInfo / getType / exprSlot; re-exported so the
+                 # backends' `g.lookupSym(...).cat` keeps resolving
+import core/regbind
+export regbind   # the emitter's register-binding state (`g.rb`) — the single
+                 # owner of reg<->name bindings, see regbind.nim
 import x64/machine as machine_x64
 import "../nifasm/image/tracetable"   # the trace table's wire format: `TraceInfoSymbol`
 
@@ -9926,15 +9934,12 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## The foreign edge keeps the unshrunk `win64Machine` — that is an ABI, not an
   ## allocation choice (see `stress.nim`).
   setTargetWord Word64             # x86-64: 8-byte pointers, 8-byte platform int
-  var g = CodeGen(ab: initAsmBuf(), buf: addr buf, md: x64MachineA)
+  var g = newCodeGen(buf, x64MachineA)
   g.ab.renderReg = x64RegName                 # render register slots as x86 names
   g.ab.immAnyDest = true                      # `mov r/m, imm32` exists here
   g.ab.arch = "x64"                           # BodyLib entries this target may splice
   g.prog = collect(buf, inputPath, tags, windows = windows)
-  g.callTarget = g.prog.callTarget
-  g.globals = g.prog.globals
-  g.tvars = g.prog.tvars
-  for nm in g.tvars.keys: g.tvarNames.incl nm
+  g.adoptProgram()
   g.ab.tree StmtsX64:
     g.ab.tree ArchD: g.ab.ident (if windows: "win_x64" else: "x64")
     if windows:
