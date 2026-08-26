@@ -67,7 +67,14 @@ type
     ## 3-operand ALU, no fixed div or shift-count register — so it groups with
     ## `Arm64` at every one of them. What differs between the two is the word
     ## size and the register file, and both of those are already values.
-    X86, Arm64, ThumbM
+    ##
+    ## `Rv32` groups with `Arm64`/`ThumbM` at every one of those branches too: it
+    ## is a three-operand ALU with no fixed division or shift-count register, and
+    ## the questions the planner asks are exactly the ones that separates from
+    ## x86. What differs between it and the two Arm targets is the word size, the
+    ## register file and a handful of capabilities — and all three are already
+    ## values rather than branches.
+    X86, Arm64, ThumbM, Rv32
 
   TargetFeature* = enum
     ## What this target's asm-NIF vocabulary OFFERS. Read as `X in md.caps` in
@@ -112,6 +119,27 @@ type
                       ## an otherwise valid image.
     Freestanding      ## no OS: the image owns the machine, so a board layout — not
                       ## a system call — answers where memory is.
+    BitScanOps        ## the assembler has `clz`/`rbit`/`rev`. Arm does; RV32I does
+                      ## NOT — counting and reversing bits is the Zbb extension
+                      ## there, and the baseline has no encoding for any of the
+                      ## three. Asked by the `{.assembler.}` intrinsic lowering,
+                      ## which is the one place they are written down, so a target
+                      ## without them refuses the intrinsic BY NAME rather than
+                      ## emitting a tag its selector will not recognise.
+    FloatConvert      ## a one-instruction convert BETWEEN float precisions
+                      ## (`fcvt`). Reachable only where `Float64` is also present —
+                      ## with one precision there is nothing to convert to — but it
+                      ## is a separate fact: RV32 has both precisions and spells the
+                      ## convert `fcvt.s.d`/`fcvt.d.s`, which is not the `(fcvt …)`
+                      ## row AArch64 uses.
+    SimdVector        ## the 128-bit AdvSIMD vocabulary (`(vfadd …)`, `(vdup …)`,
+                      ## `(fldrq …)`, …). NEON is AArch64's; RV32's vector
+                      ## extension is not baseline and would not share these
+                      ## spellings anyway. The path behind this is staged and inert
+                      ## until the shared intrinsic table carries the rows — which
+                      ## is exactly why the capability goes in NOW: when it wakes
+                      ## up it must wake up for the targets that have it, not for
+                      ## whichever ones were not named in a two-target branch.
 
   FrameStyle* = enum
     ## The SHAPE of the prologue and epilogue, and with it how the caller's
@@ -147,13 +175,26 @@ type
     ThumbExpandImm    ## Thumb-2: a byte replicated across lanes, or an 8-bit value
                       ## with bit 7 set rotated anywhere. A DIFFERENT set
     X86Imm32          ## any 32-bit constant, sign-extended
+    RvImm12           ## RISC-V: a 12-bit SIGNED field, and the same one in every
+                      ## ALU op and every memory operand. Not a range with a
+                      ## special shape like the other three — which is the point:
+                      ## there is exactly one rule to check, and anything outside
+                      ## ±2048 is `lui`+`addi` into a register.
 
   MachineDesc* = object
     ## A target's register file + calling convention, as the allocator needs it.
     ## All registers are slots from a *subset* of `Reg`/`FReg` (a narrower ISA
     ## like x86-64 leaves the high slots unused).
     arch*: TargetArch                ## the ISA, for the few arch-specific walk branches
-    intRetReg*: Reg                  ## integer/pointer return register (rax / x0 = R0)
+    intRetReg*: Reg                  ## integer/pointer return register (rax / x0 = R0;
+                                     ## a0 = R10 on RV32, which is what makes reading
+                                     ## it from HERE rather than from a module-level
+                                     ## constant load-bearing — the two Arm targets
+                                     ## and x86-64 all answer R0, so a site that
+                                     ## hardcoded it looked correct on every target
+                                     ## that existed)
+    floatRetReg*: FReg               ## float return register (xmm0 / v0 = F0; fa0 = F10
+                                     ## on RV32). Same reasoning as `intRetReg`.
     divRemReg*: Reg                  ## x86 idiv's clobbered high-half / remainder reg
                                      ## (rdx = R2); `NoReg` on ISAs without the constraint
                                      ## (arm64 sdiv/msub use ordinary scratch)
@@ -220,6 +261,19 @@ type
                                      ## Empty on x86-64, which reserves a single
                                      ## `stagingBridgeReg` instead.
     floatBridgeReg*: FReg            ## the SIMD/FP twin of `produceBridge`.
+    memIntrinScratch*: array[3, Reg] ## three volatiles the inline `memcpy`/`memset`
+                                     ## lowering uses for its loop counter and its
+                                     ## two byte temporaries, on top of the three
+                                     ## argument registers it reads.
+                                     ##
+                                     ## Named here because it was `(R3, R4, R5)` —
+                                     ## AArch64's, written as literal slots. Those
+                                     ## are volatile scratch on Arm and `gp`, `tp`
+                                     ## and `t0` on RISC-V, two of which the ABI
+                                     ## reserves for the whole program. A slot
+                                     ## literal in shared code is only ever right
+                                     ## by coincidence, and this is the second one
+                                     ## found after `intRetReg`.
     abiCalleeSaved*: seq[Reg]        ## the callee-saved registers the ABI
                                      ## DEFINES, as opposed to the ones the
                                      ## allocator draws homes from
@@ -508,12 +562,12 @@ proc memToMemBridgeDemand*(md: MachineDesc; dst, v: Location): ScratchDemand =
   if dst.typ.isFloat:
     let fromMem = (case md.arch
                    of X86: v.kind in {NamedStack, Mem}
-                   of Arm64, ThumbM: v.kind in {NamedStack, Mem, Glob})
+                   of Arm64, ThumbM, Rv32: v.kind in {NamedStack, Mem, Glob})
     if fromMem: ScratchDemand(fregs: 1) else: ScratchDemand()
   else:
     let needsBridge = (case md.arch
                        of X86: v.kind in {NamedStack, Mem}
-                       of Arm64, ThumbM: v.kind in {NamedStack, Mem, Glob, Tvar, Imm})
+                       of Arm64, ThumbM, Rv32: v.kind in {NamedStack, Mem, Glob, Tvar, Imm})
                        # Cortex-M answers like AArch64 and for the same reasons:
                        # no store-immediate, no PC-relative data operand, so an
                        # immediate, a global and a thread-local each pass through

@@ -29,12 +29,12 @@ proc wideParamToHome(g: var CodeGen; nm: string; firstArg: int)
 
 proc isWideType(g: var CodeGen; t: Cursor): bool {.inline.}
 
-proc emPair(g: var CodeGen; op: A64Inst; r1, r2: Reg; off: int) =
+proc emPair(g: var CodeGen; op: RiscInst; r1, r2: Reg; off: int) =
   # stp/ldp save/restore *physical* callee-saved registers (which may also be
   # named-local homes), so emit raw register nodes, not the local names.
   g.ab.tree op: g.ab.rawReg r1; g.ab.rawReg r2; g.ab.rawReg SP; g.ab.intLit off
 
-proc emFPair(g: var CodeGen; op: A64Inst; f1, f2: FReg; off: int) =
+proc emFPair(g: var CodeGen; op: RiscInst; f1, f2: FReg; off: int) =
   g.ab.tree op: g.ab.dreg f1; g.ab.dreg f2; g.emReg SP; g.ab.intLit off
 
 proc frameSaveSlot(g: var CodeGen; r: Reg; off: int; storing: bool) =
@@ -244,7 +244,7 @@ proc emitSyprocA64*(g: var CodeGen; sp: SyscallProc) =
       g.ab.tree ResultD:                         # c at the return type
         if not retIsVoid(c):
           g.ab.symDef synth("ret.0")
-          g.ab.rawReg IntRet
+          g.ab.rawReg g.md.intRetReg
           g.genTypeBody(c)
       if sp.sysNrA64 < 0:
         # A row whose AArch64 column is `-1` (a legacy call the asm-generic ABI
@@ -806,7 +806,7 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; declarative: bool) =
             skip c
           else:
             g.ab.symDef synth("ret.0")
-            g.ab.rawReg IntRet                   # raw reg *location* of the result
+            g.ab.rawReg g.md.intRetReg                   # raw reg *location* of the result
             g.genTypeBody(c)                  # the result type (consumes it)
       while c.hasMore: skip c                 # pragmas, body
   else:

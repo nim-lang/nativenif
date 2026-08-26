@@ -464,8 +464,7 @@ proc asmInstr*(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor) =
     while fc.hasMore: (argCurs.add asmAtom(fc); skip fc)
   let tgt = instrTargetOf(g.prog, fsym)
   let row = IntrinsicRows[tgt.op]
-  let here = g.hereTarget
-  if here notin row.targets:
+  if not g.hasHereLowering(row.targets):
     lengError c, "`" & IntrinsicNames[tgt.op] & "` has no " &
               g.md.targetName & " lowering; an " &
               "`.assembler` proc has no fallback path", g.asmInfo
@@ -486,6 +485,16 @@ proc asmInstr*(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor) =
   # nothing else, so a row asking for 64 there is refused by nifasm's width check
   # rather than encoded as something narrower.
   let bits = if tgt.argBits in {8, 16, 32}: 32 else: 64
+  if tgt.op in {ClzPinnedOp, ClzOp, RbitOp, CtzOp, RevOp, BswapOp} and
+     BitScanOps notin g.md.caps:
+    # Refused BY NAME rather than lowered. There is a software sequence for each
+    # of these, but this is `{.assembler.}` — the mode whose whole contract is
+    # that every construct maps one-to-one and nothing is materialised — so
+    # expanding one row into a loop is the one thing it must not do. The
+    # ORDINARY path may lower them in software; this one says no.
+    lengError c, "`" & IntrinsicNames[tgt.op] & "` has no single instruction on " &
+              g.md.targetName & ", and `.assembler` will not expand one row into " &
+              "a sequence; use it outside an `{.assembler.}` proc", g.asmInfo
   case tgt.op
   of ClzPinnedOp, ClzOp:
     g.ab.tree ClzA64: (g.emReg dst; g.emReg src; g.ab.intLit bits)
@@ -590,8 +599,7 @@ proc asmIf(g: var CodeGen; c: Cursor) =
             lengError condC, "an `.assembler` condition must be a flag " &
                       "intrinsic such as `zf()`; any other condition would " &
                       "need an instruction that clobbers the flags", g.asmInfo
-          let here = g.hereTarget
-          if here notin IntrinsicRows[op].targets:
+          if not g.hasHereLowering(IntrinsicRows[op].targets):
             lengError condC, "`" & IntrinsicNames[op] & "` has no " &
                       g.md.targetName & " lowering",
                       g.asmInfo
@@ -674,23 +682,20 @@ proc asmStmt*(g: var CodeGen; c: Cursor) =
     if op != NoIntrinsicOp and IntrinsicRows[op].inoutOperand >= 0:
       g.asmInoutInstr(c, op)
     elif op != NoIntrinsicOp and IntrinsicRows[op].isFlagWrite:
-      let here = g.hereTarget
-      if here notin IntrinsicRows[op].targets:
+      if not g.hasHereLowering(IntrinsicRows[op].targets):
         lengError c, "`" & IntrinsicNames[op] & "` has no " &
                   g.md.targetName & " lowering; an " &
                   "`.assembler` proc has no fallback path", g.asmInfo
       g.asmFlagInstr(c, op)
     elif op != NoIntrinsicOp and IntrinsicRows[op].isVoidResult and
          IntrinsicRows[op].arity > 0:
-      let here = g.hereTarget
-      if here notin IntrinsicRows[op].targets:
+      if not g.hasHereLowering(IntrinsicRows[op].targets):
         lengError c, "`" & IntrinsicNames[op] & "` has no " &
                   g.md.targetName & " lowering; an " &
                   "`.assembler` proc has no fallback path", g.asmInfo
       g.asmVoidInstr(c, op)
     elif op != NoIntrinsicOp and IntrinsicRows[op].isNullaryVoid:
-      let here = g.hereTarget
-      if here notin IntrinsicRows[op].targets:
+      if not g.hasHereLowering(IntrinsicRows[op].targets):
         lengError c, "`" & IntrinsicNames[op] & "` has no " &
                   g.md.targetName & " lowering; an " &
                   "`.assembler` proc has no fallback path", g.asmInfo

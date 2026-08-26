@@ -20,7 +20,7 @@ import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
 import machine_a64 as machine
 from machine_m as machine_m import nil
 import emit, mem, aggr, value, frame
-import "../cortexm/runtime"
+import runtime
 
 proc genVarDecl2*(g: var CodeGen; c: Cursor) =
   var cc = c
@@ -74,7 +74,7 @@ proc emitCaseTest2*(g: var CodeGen; selReg: Reg; c: var Cursor; lBody: string; s
   else:
     g.cmpImm2(selReg, branchImm(c)); g.emBr(BeqA64, lBody)
 
-proc cselTagFor(branchTag: A64Inst): A64Inst =
+proc cselTagFor(branchTag: RiscInst): RiscInst =
   ## The `csel<cc>` whose condition matches branch tag `branchTag` (which fires
   ## when the relation holds): `csel<cc> D, S1, S2` yields `D = cc ? S1 : S2`.
   case branchTag
@@ -201,13 +201,13 @@ proc genStmt2*(g: var CodeGen; c: Cursor) =
           # An entry that computes its exit code in 64 bits (`main` returns
           # `(i 32)`, the expression does not). The exit code is the LOW word —
           # the same truncation the ordinary narrowing return performs.
-          g.wideArgTruncated(g.wideValueIntoTemp(cc), IntRet)
+          g.wideArgTruncated(g.wideValueIntoTemp(cc), g.md.intRetReg)
         elif hasVal:
           var d = needsReg(g.valueSlot(cc))
           g.emitValue2(cc, d)
-          g.place2(d, IntRet)                            # exit code → x0 / r0
+          g.place2(d, g.md.intRetReg)                            # exit code → x0 / r0
           g.freeVal(d)
-        else: g.movImm(IntRet, 0)
+        else: g.movImm(g.md.intRetReg, 0)
         if Freestanding in g.md.caps:
           g.ab.tree BlA64: g.ab.sym EntryExitShim
         else:
@@ -240,7 +240,7 @@ proc genStmt2*(g: var CodeGen; c: Cursor) =
             g.genStore2(cc, namedStackLoc(srcName, slotOf(g.prog, tcur)))
           if g.retIndirect:
             g.copyStructThroughPtr2(srcName, g.retAggrSym, g.indirectReg)
-            g.movReg(IntRet, g.indirectReg)
+            g.movReg(g.md.intRetReg, g.indirectReg)
           else:
             g.structToRegs(srcName, g.retAggrSym, 0)
         elif hasVal and cc.kind == TagLit and cc.exprKind == CallC and
@@ -257,18 +257,18 @@ proc genStmt2*(g: var CodeGen; c: Cursor) =
           var d = needsReg(g.valueSlot(cc))
           g.emitCall2(cc, d, tail = true)
           if not g.tailCallEmitted:
-            g.place2(d, IntRet)
+            g.place2(d, g.md.intRetReg)
             g.freeVal(d)
           tailed = g.tailCallEmitted
         elif hasVal:
           let retPos = g.posOf(cc)
           if g.retIsFloat:
             let fb = g.retFloatBits
-            g.genStore2(cc, fregLoc(FloatRet, AsmSlot(cls: AFloat, size: fb div 8, align: fb div 8)))
+            g.genStore2(cc, fregLoc(g.md.floatRetReg, AsmSlot(cls: AFloat, size: fb div 8, align: fb div 8)))
           elif g.isWideExpr(cc):
             g.wideRet(cc)                    # 64-bit result: r0:r1, read raw
           else:
-            g.genStore2(cc, regLoc(IntRet, ScalarSlot))
+            g.genStore2(cc, regLoc(g.md.intRetReg, ScalarSlot))
         if not tailed:
           # A tail call has left the proc for good: no branch to the epilogue, and
           # nothing after it is reachable.
@@ -516,7 +516,7 @@ proc emitProcBody2*(g: var CodeGen; info: ProcInfo; declarative: bool;
   g.exitScope()
   if g.retLabelUsed2: g.emLab(g.retLabel2)
   if info.isEntry and g.entryExits:              # the entry EXITS (no epilogue)
-    g.movImm(IntRet, 0)
+    g.movImm(g.md.intRetReg, 0)
     if Freestanding in g.md.caps:
       g.ab.tree BlA64: g.ab.sym EntryExitShim
     else:
@@ -543,13 +543,18 @@ proc emitProcBody2*(g: var CodeGen; info: ProcInfo; declarative: bool;
       # here must not take one, and `stagedArgs` is how it is told.
       let outerStaged = g.stagedArgs
       for r in g.md.intArgRegs: g.stagedArgs.incl r
-      if g.thumbM and info.isEntry:
-        # Before the FPU, and before the frame: the prologue may save a
-        # callee-saved register into RAM this has not established yet, and
-        # `emEnableFpuM` reads and writes CPACR through r0/r1, which the copy
-        # loop is finished with by then.
+      if Freestanding in g.md.caps and info.isEntry:
+        # Bare metal: the image owns the machine, so whatever the program expects
+        # to find established has to be established HERE — before the frame,
+        # because the prologue may save a callee-saved register into RAM this has
+        # not made trustworthy yet.
+        #
+        # RV32 goes first with `sp` and the FPU, because unlike Cortex-M it is
+        # handed neither, and the copy loop below is itself a stack-free but
+        # register-using sequence that wants a valid `sp` for anything after it.
+        if g.md.arch == Rv32: g.emResetPathRv(g.rvStackTop)
         g.emStartupInitM()
-        g.emEnableFpuM()
+        if g.md.arch == ThumbM: g.emEnableFpuM()
       if g.hasFrame: framePush(g)
       if g.plan.hasStackVars:
         g.ab.tree SubA64: g.ab.rawReg SP; g.ab.keyword SsizeX

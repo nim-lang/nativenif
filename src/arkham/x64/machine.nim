@@ -62,6 +62,7 @@ const
   x64Machine* = MachineDesc(
     arch: X86,
     intRetReg: RAX,
+    floatRetReg: F0,
     divRemReg: RDX,                  # idiv clobbers rdx (remainder / sign-extend high half)
     shiftCountReg: RCX,              # x86 variable shift count must be in cl (rcx)
     intArgRegs: @[RDI, RSI, RDX, RCX, R8, R9],
@@ -106,6 +107,7 @@ const
     produceBridge: NoReg,
     bridgeRegs: @[],
     floatBridgeReg: NoFReg,
+    memIntrinScratch: [R3, R4, R5],
     caps: {CondSelect, TailCall, Float64, SubwordExtend, RegOffsetMem,
            PcRelGlobalFold, TwoAddrForms, AllFlagBranches},
                                      # `codegen_x64` does not consult this set
@@ -151,6 +153,7 @@ const
   win64Machine* = MachineDesc(
     arch: X86,
     intRetReg: RAX,
+    floatRetReg: F0,
     divRemReg: RDX,
     shiftCountReg: RCX,
     intArgRegs: @[RCX, RDX, R8, R9],
@@ -176,6 +179,7 @@ const
     produceBridge: NoReg,
     bridgeRegs: @[],
     floatBridgeReg: NoFReg,
+    memIntrinScratch: [R3, R4, R5],
     caps: {CondSelect, TailCall, Float64, SubwordExtend, RegOffsetMem,
            PcRelGlobalFold, TwoAddrForms, AllFlagBranches},
                                      # `codegen_x64` does not consult this set

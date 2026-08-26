@@ -31,6 +31,24 @@ from "../../nifasm/arm64/encoder" as arm64 import isLogicalImm
 from thumbimm import nil
 
 type
+  RiscInst* = A64Inst
+    ## An instruction tag, as the SHARED load/store emitter sees one.
+    ##
+    ## The alias is not decoration. `RiscInst` is the right name in
+    ## `nifasm/arm64`, where the enum genuinely is AArch64's — but this emitter
+    ## serves three targets going on four, and 75 of the tags it writes are the
+    ## SAME tag id on every one of them (`(add3 …)` is `Add3A64`, `Add3M` and
+    ## `Add3Rv` at one ordinal; the suffix is which enum you reached it through,
+    ## not which machine it means). A signature reading `op: RiscInst` says the
+    ## emitter is AArch64's, which is the fact this whole directory exists to
+    ## deny.
+    ##
+    ## The MEMBER names stay `AddA64` and so on, because they are generated from
+    ## `doc/instructions.md` and renaming them would churn nifasm's a64 selector
+    ## for no behavioural gain. Read the suffix as "the shared row", and read a
+    ## tag that is genuinely one target's — `(csel…)`, `(stp)`, `(vfadd)` — as
+    ## guarded by a `TargetFeature`, because every one of them now is.
+
   WideRefKind* = enum
     wrSlot        ## a nifasm `(s)` stack slot, addressed by name
     wrBase        ## `[base + off]`, the address already in a register
@@ -104,7 +122,7 @@ const
     ## DIVIDEND's sign — C's rule, and Leng's.
 
 # The names of the two software-division helpers. Only the NAMES: the bodies
-# are `cortexm/runtime`'s, but a call site is far below it, so the two would
+# are `risc/runtime`'s, but a call site is far below it, so the two would
 # otherwise be a cycle.
 proc uDivMod64Proc*(g: CodeGen): string {.inline.} =
   ## The divider routines, MODULE-QUALIFIED — the same rule the semihosting
@@ -175,7 +193,7 @@ proc movReg*(g: var CodeGen; d, s: Reg) =
   if d == s: return
   g.ab.tree MovA64: g.emReg d; g.emReg s
 
-proc wForm(op: A64Inst): A64Inst =
+proc wForm(op: RiscInst): RiscInst =
   case op
   of AddA64: AddwA64
   of SubA64: SubwA64
@@ -190,20 +208,37 @@ proc hereTarget*(g: CodeGen): IntrinsicTarget {.inline.} =
   of X86: tgX64
   of Arm64: tgA64
   of ThumbM: tgThumbM
+  of Rv32:
+    # Never reached: every membership test goes through `hasHereLowering`, which
+    # answers for RV32 before asking this. Spelled as a failure rather than a
+    # plausible substitute, because a substitute would silently claim some other
+    # target's lowerings.
+    quit "arkham: hereTarget has no RV32 value (use hasHereLowering)"
 
-proc destructive3(g: CodeGen; op: A64Inst): bool {.inline.} =
+proc hasHereLowering*(g: CodeGen; targets: set[IntrinsicTarget]): bool {.inline.} =
+  ## Whether the intrinsic table claims a lowering for the target being emitted.
+  ##
+  ## Always false on RV32, and not because the lowerings are missing: nimony's
+  ## `IntrinsicTarget` has no `tgRv32` member for a row to NAME, so no row can
+  ## claim it. That enum lives in the shared library and adding a member is
+  ## nimony's change to make. Until it does, `{.instruction.}` and `{.intrinsic.}`
+  ## are refused on this target by name — which is the correct answer, and the one
+  ## the call sites already phrase, since each reports `md.targetName`.
+  g.md.arch != Rv32 and g.hereTarget in targets
+
+proc destructive3(g: CodeGen; op: RiscInst): bool {.inline.} =
   ## Ops with no destructive `D op= S` spelling on this target: Thumb-2's
   ## `sdiv`/`udiv` are three-operand instructions and nifasm parses them as such,
   ## so the same tag has to arrive with `D` repeated.
   TwoAddrForms notin g.md.caps and op in {SdivA64, UdivA64}
 
-proc binReg*(g: var CodeGen; op: A64Inst; d, s: Reg; w32 = false) =
+proc binReg*(g: var CodeGen; op: RiscInst; d, s: Reg; w32 = false) =
   if g.destructive3(op):
     g.ab.tree op: (g.emReg d; g.emReg d; g.emReg s)
   else:
     g.ab.tree (if w32: wForm(op) else: op): g.emReg d; g.emReg s
 
-proc binImm*(g: var CodeGen; op: A64Inst; d: Reg; v: int64; w32 = false) =
+proc binImm*(g: var CodeGen; op: RiscInst; d: Reg; v: int64; w32 = false) =
   if g.destructive3(op):
     g.ab.tree op: (g.emReg d; g.emReg d; g.ab.intLit v)
   else:
@@ -217,7 +252,7 @@ proc emNeg*(g: var CodeGen; d: Reg) =
   else:
     g.ab.tree NegA64: (g.emReg d; g.emReg d)
 
-proc threeOpTag(op: A64Inst; w32 = false): A64Inst =
+proc threeOpTag(op: RiscInst; w32 = false): RiscInst =
   if w32:
     case op
     of AddA64: return Addw3A64
@@ -236,10 +271,10 @@ proc threeOpTag(op: A64Inst; w32 = false): A64Inst =
   of AsrA64: Asr3A64
   else: op
 
-proc binReg3*(g: var CodeGen; op: A64Inst; d, a, b: Reg; w32 = false) =
+proc binReg3*(g: var CodeGen; op: RiscInst; d, a, b: Reg; w32 = false) =
   g.ab.tree threeOpTag(op, w32): g.emReg d; g.emReg a; g.emReg b
 
-proc binImm3*(g: var CodeGen; op: A64Inst; d, a: Reg; v: int64; w32 = false) =
+proc binImm3*(g: var CodeGen; op: RiscInst; d, a: Reg; v: int64; w32 = false) =
   g.ab.tree threeOpTag(op, w32): g.emReg d; g.emReg a; g.ab.intLit v
 
 proc emAdr*(g: var CodeGen; d: Reg; sym: string) =
@@ -406,20 +441,27 @@ proc fmovToGpr*(g: var CodeGen; d: Reg; s: FReg; bits: int) =     # fmov xD/wD, 
     g.emReg d
     g.emFReg(s, bits)
 
-proc fbin*(g: var CodeGen; op: A64Inst; d, s: FReg; bits: int) =  # d = d op s
+proc fbin*(g: var CodeGen; op: RiscInst; d, s: FReg; bits: int) =  # d = d op s
   g.ab.tree op: g.emFReg(d, bits); g.emFReg(s, bits)
 
-proc fcvtI2F*(g: var CodeGen; op: A64Inst; d: FReg; s: Reg; bits: int) =  # scvtf/ucvtf dD, xS
+proc fcvtI2F*(g: var CodeGen; op: RiscInst; d: FReg; s: Reg; bits: int) =  # scvtf/ucvtf dD, xS
   g.ab.tree op:
     g.emFReg(d, bits)
     g.emReg s                                      # see fmovFromGpr
 
-proc fcvtF2I*(g: var CodeGen; op: A64Inst; d: Reg; s: FReg; bits: int) =  # fcvtzs/fcvtzu xD, dS
+proc fcvtF2I*(g: var CodeGen; op: RiscInst; d: Reg; s: FReg; bits: int) =  # fcvtzs/fcvtzu xD, dS
   g.ab.tree op:
     g.emReg d
     g.emFReg(s, bits)
 
 proc emFcvt*(g: var CodeGen; d, s: FReg; dstBits, srcBits: int) =  # fcvt: precision convert
+  ## Only reachable where there are two precisions to convert between, so a target
+  ## without `Float64` never arrives — but having both is not the same fact as
+  ## spelling the convert `(fcvt …)`, and a target that spells it otherwise must
+  ## say so rather than inherit AArch64's row.
+  if FloatConvert notin g.md.caps:
+    quit "arkham " & g.md.targetName & ": no `(fcvt …)` row for a " & $srcBits &
+         "-to-" & $dstBits & "-bit float conversion on this target"
   g.ab.tree FcvtA64: g.emFReg(d, dstBits); g.emFReg(s, srcBits)
 
 proc emFLoad*(g: var CodeGen; d: FReg; addrReg: Reg; bits: int) =  # fldr dD/sD, [addrReg]
@@ -764,7 +806,7 @@ proc genProctypeSig*(g: var CodeGen; c: var Cursor) =
             skip c
           else:
             g.ab.symDef synth("ret.0")
-            g.ab.rawReg IntRet                     # raw reg *location* of the result
+            g.ab.rawReg g.md.intRetReg                     # raw reg *location* of the result
             g.genPointee(c)                     # return type BY REFERENCE (named → sym)
         while c.hasMore: skip c                  # pragmas
     else:
@@ -924,7 +966,7 @@ proc emLab*(g: var CodeGen; name: string) =
   g.killAllMirrors()
   g.ab.tree LabA64: g.ab.symDef name        # (lab :L)
 
-proc emBr*(g: var CodeGen; tag: A64Inst; name: string) =
+proc emBr*(g: var CodeGen; tag: RiscInst; name: string) =
   g.ab.tree tag: g.ab.sym name              # (b L) / (beq L) / …
 
 template emitLoop*(g: var CodeGen; body: untyped) =
@@ -1348,7 +1390,7 @@ proc lateGlobalBase*(g: var CodeGen; c: Cursor): bool =
     g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind == NoLoc and
     g.plan.planned(g.posOf(c)).kind != InReg
 
-proc binA64Op*(g: var CodeGen; c: Cursor): A64Inst =
+proc binA64Op*(g: var CodeGen; c: Cursor): RiscInst =
   ## The a64 opcode for a binary-arith node; div/shift signedness from the result type.
   var rt: Cursor
   block:
@@ -1385,6 +1427,7 @@ proc logicalImmOk*(g: CodeGen; v: int64): bool {.inline.} =
   of ThumbExpandImm: thumbimm.isModifiedImm(v)
   of A64Bitmask: isLogicalImmA64(v)
   of X86Imm32: v >= low(int32) and v <= high(int32)
+  of RvImm12: v >= -2048 and v <= 2047
 
 proc normalizeUnaryWidth*(g: var CodeGen; resTypeC: Cursor; rD: Reg) =
   ## The `neg`/`bitnot` twin of `normalizeBinWidth`. Both are computed 64-bit wide,
@@ -1403,7 +1446,7 @@ proc isUnsigned32*(resTypeC: Cursor): bool =
   let slot = typeToSlot(resTypeC)
   slot.kind == AUInt and slot.size == 4
 
-proc normalizeBinWidth*(g: var CodeGen; resTypeC: Cursor; rD: Reg; op: A64Inst) =
+proc normalizeBinWidth*(g: var CodeGen; resTypeC: Cursor; rD: Reg; op: RiscInst) =
   ## arkham keeps register values canonically sign/zero-extended to their full
   ## 64-bit form. `add`/`sub`/`mul`/`lsl` on a sub-64-bit type can leave nonzero
   ## bits ABOVE the type width (lsl overflow, add carry, unsigned sub borrow) — a
@@ -1417,7 +1460,7 @@ proc normalizeBinWidth*(g: var CodeGen; resTypeC: Cursor; rD: Reg; op: A64Inst) 
   if slot.kind in {AInt, AUInt} and slot.size > 0 and slot.size < 8:
     g.extendTo(rD, slot.size * 8, signed = slot.kind == AInt)
 
-proc fbinA64Op*(ek: LengExpr): A64Inst =
+proc fbinA64Op*(ek: LengExpr): RiscInst =
   case ek
   of AddC: FaddA64
   of SubC: FsubA64
@@ -1487,7 +1530,7 @@ proc emAtomicLoadM*(g: var CodeGen; dst, p: Reg; bits: int) =
   ## `dst ← the bits-wide cell at [p]`, zero-extended. Not an exclusive load:
   ## nothing is claimed, because nothing is going to be stored back.
   # Each arm emits its own tree: `ldrb`/`ldrh` are `MInst` members and `ldr` is an
-  # `A64Inst` one (the shared spelling lives in the A64 enum), so there is no
+  # `RiscInst` one (the shared spelling lives in the A64 enum), so there is no
   # common variable to select into — the tag IDS are what nifasm reads, and those
   # agree.
   case bits
@@ -1519,7 +1562,7 @@ proc emAtomicStoreM*(g: var CodeGen; p, src: Reg; bits: int) =
       g.ab.tree MemX: (g.emReg p; g.ab.intLit 0)
       g.emReg src
 
-proc emitAtomicRmwM*(g: var CodeGen; dst, p, v: Reg; opTag: A64Inst;
+proc emitAtomicRmwM*(g: var CodeGen; dst, p, v: Reg; opTag: RiscInst;
                     isXchg, returnNew: bool; bits: int) =
   ## `loop: ldrex old,[p]; new = old op v (or v); strex st,new,[p]; cmp st,0;
   ## beq done` — a non-zero status means another agent won the line, so the loop
@@ -1801,7 +1844,7 @@ proc pow2Log*(g: var CodeGen; c: Cursor): int =
 proc foldableFloatLeafE*(g: var CodeGen; c: Cursor): bool =
   c.kind == Symbol and g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind in {InFReg, NamedStack}
 
-proc mirrorBranch*(t: A64Inst): A64Inst =
+proc mirrorBranch*(t: RiscInst): RiscInst =
   ## The condition that holds for `cmp b, a` given `t` holds for `cmp a, b`.
   ## Equality is symmetric; the orderings change side.
   case t
@@ -1824,7 +1867,7 @@ proc isCmpImmLeaf*(c: Cursor): bool =
   if cur.kind == TagLit and cur.exprKind in {SufC, ParC}: inc cur
   result = cur.kind in {IntLit, UIntLit, CharLit}
 
-proc armInoutTag*(op: IntrinsicOp): A64Inst =
+proc armInoutTag*(op: IntrinsicOp): RiscInst =
   ## The two-address Arm form of a row that writes through operand 0. `(add D S)`
   ## is one tag for both Arm targets — nifasm dispatches on the arch — so only
   ## `not` differs: Thumb-2 spells it `mvn` and the AArch64 vocabulary has no

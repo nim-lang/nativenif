@@ -69,3 +69,22 @@ proc tagToNifasmExpr*(t: TagEnum): NifasmExpr {.inline.} =
     cast[NifasmExpr](t)
   else:
     NoExpr
+
+proc tagToRvInst*(t: TagEnum): RvInst {.inline.} =
+  ## Convert TagEnum to RvInst (RV32). Returns NoRvInst if not a valid RvInst.
+  if rawTagIsRvInst(t):
+    cast[RvInst](t)
+  else:
+    NoRvInst
+
+proc tagToRvReg*(t: TagEnum): RvReg {.inline.} =
+  ## Convert TagEnum to RvReg (RV32). Returns NoRvReg if not a valid RvReg.
+  ##
+  ## RV32 shares its ENTIRE register file with AArch64 — `(x0)`, `(sp)`, `(d0)`,
+  ## `(s0)` are the same tags on both — so every valid `RvReg` is also a valid
+  ## `A64Reg`. Which machine one names is decided by `(arch …)`, exactly as it is
+  ## for the `(r0)` that Cortex-M and x86-64 share.
+  if rawTagIsRvReg(t):
+    cast[RvReg](t)
+  else:
+    NoRvReg

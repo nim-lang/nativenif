@@ -8,9 +8,12 @@
 ## arkham translates a single Leng `.c.nif` file into typed `nifasm` NIF for the
 ## selected target (`--os`/`--cpu`: linux/amd64, windows/amd64, linux/arm64,
 ## macosx/arm64, embedded/arm32), which `nifasm` then type-checks, assembles and
-## links. The backends are `x64/` and `arm/` over the shared
-## `core/`; `arm/` serves BOTH Arm targets — AArch64 and the bare-metal
-## Cortex-M — from one emitter over three machine models.
+## links. The backends are `x64/` and `risc/` over the shared `core/`.
+##
+## `risc/` is named for the SHAPE it emits for, not for an ISA: a load/store
+## machine with a three-operand ALU, a link register and no memory operands.
+## AArch64 and the bare-metal Cortex-M already share it, over three machine
+## models, and RV32 joins them over a fourth.
 
 import std / [parseopt, syncio, strutils]
 import nifcoreparse              # parseFromFile + nifcore
@@ -18,8 +21,8 @@ import core/lengdecl             # createLengTagPool
 import core/layout               # the --layout: board file
 import core/temps                # `dumpTempStats`, under -d:arkhamTempDbg only —
                                 # which is why it reads as an unused import
-import arm/driver                # BOTH Arm targets: AArch64 (Darwin/Linux) and
-                                # Cortex-M. One emitter, three machine models.
+import risc/driver               # every load/store target: AArch64 (Darwin/Linux),
+                                # Cortex-M, RV32. One emitter, one machine model each.
 import x64/driver                # x86-64 / Linux backend
 
 const
@@ -33,8 +36,9 @@ Options:
   -o:file, --output:file   output asm-NIF file (default: <input>.asm.nif)
   --os:SYMBOL              target OS: linux | windows | macosx | embedded
                            (default: host)
-  --cpu:SYMBOL             target CPU: amd64 | arm64 | arm32 (default: host)
-  --layout:FILE            cortex_m only: the BOARD — its memory regions, which
+  --cpu:SYMBOL             target CPU: amd64 | arm64 | arm32 | riscv32
+                           (default: host)
+  --layout:FILE            bare-metal targets only: the BOARD — its memory regions, which
                            region each section lives in, the stack slots and
                            their thread-local reservation, and the heap. A `(layout …)` NIF tree; see doc/layout.md.
                            Forwarded into the asm-NIF so nifasm places segments
@@ -46,7 +50,9 @@ Options:
 
 Supported --os/--cpu combinations (same symbols as Nimony's flags):
   linux/amd64  windows/amd64  linux/arm64  macosx/arm64  embedded/arm32
+  embedded/riscv32
   (embedded/arm32 is bare-metal Cortex-M4; see doc/cortex_m.md)
+  (embedded/riscv32 is bare-metal RV32IMAFD)
 """
 
 proc archOf(os, cpu: string): string =
@@ -63,8 +69,12 @@ proc archOf(os, cpu: string): string =
              # table, because next to `arm64` the bare word never says which one
              # it is. `arm` stays accepted for what is already written.
              of "arm32", "arm": "arm32"
+             # `riscv32` is nimony's platform spelling. `rv32` is accepted too:
+             # it is what the ISA manual, the QEMU machine names and every
+             # toolchain triple actually say.
+             of "riscv32", "rv32": "riscv32"
              else: quit("arkham: unknown --cpu:" & cpu &
-                        " (supported: amd64, arm64, arm32)", QuitFailure)
+                        " (supported: amd64, arm64, arm32, riscv32)", QuitFailure)
   let osC = case osN
             of "linux": "linux"
             of "windows": "windows"
@@ -86,10 +96,11 @@ proc archOf(os, cpu: string): string =
   of "linux/arm64": "linux_arm64"
   of "macosx/arm64": "arm64"
   of "embedded/arm32": "cortex_m"
+  of "embedded/riscv32": "riscv32"
   else:
     quit("arkham: unsupported --os/--cpu combination: " & osC & "/" & cpuC &
          " (supported: linux/amd64, windows/amd64, linux/arm64, macosx/arm64," &
-         " embedded/arm32)",
+         " embedded/arm32, embedded/riscv32)",
          QuitFailure)
 
 proc run(input, output, arch: string; board: layout.Layout) =
@@ -105,6 +116,8 @@ proc run(input, output, arch: string; board: layout.Layout) =
              of "linux_arm64", "linux_aarch64": generateA64(buf, input, tags, linux = true)
              of "cortex_m", "cortexm", "thumbm":
                generateM(buf, input, tags, board)
+             of "riscv32", "rv32":
+               generateRv32(buf, input, tags, board)
              else: quit("arkham: unknown --arch:" & arch, QuitFailure)
   writeFile(output, code)
 

@@ -17,7 +17,7 @@ import std / [tables, assertions, algorithm]
 
 import nifcore, nifcdecl
 import asmslots, machinedesc, analyser, planer, programs, abi
-import "../arm/machine_m"
+import "../risc/machine_m"
 import regbind, context
 
 

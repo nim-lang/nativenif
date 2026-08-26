@@ -20,7 +20,7 @@
 ## to reimplement the register-binding protocol, which is the part with a formal
 ## model behind it (`proofs/arkham_bindings.tla`).
 ##
-## All asm-NIF tags are emitted through nifasm's own enums (`A64Inst` /
+## All asm-NIF tags are emitted through nifasm's own enums (`RiscInst` /
 ## `NifasmDecl`, see asmbuf) — the single source of truth for the vocabulary.
 ##
 ## ABI: AAPCS64. Integer/pointer arguments and the integer return go in x0–x7 /
@@ -95,7 +95,7 @@ proc marshalStackAggrArg(g: var CodeGen; a: Cursor; paramNm: string)    # define
 proc emitWideAsLoc(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitWideIntoLoc(g: var CodeGen; c: Cursor; dst: Location)
 proc emitWideCmpE(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
-                  whenTrue: bool): A64Inst
+                  whenTrue: bool): RiscInst
 proc emitWideToNarrow(g: var CodeGen; innerC, targetC: Cursor;
                       dest: var Location)
 proc wideRet*(g: var CodeGen; c: Cursor)
@@ -199,7 +199,7 @@ proc emitFBinE*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCondValue2*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCondE*(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool)
 proc emitScalarCmpE*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
-                    whenTrue: bool; fuseBranchTo = ""): A64Inst
+                    whenTrue: bool; fuseBranchTo = ""): RiscInst
 proc emitMemLoad2*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitAddr2*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCast2*(g: var CodeGen; c: Cursor; dest: var Location)
@@ -586,7 +586,7 @@ proc aggrAddrInto*(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind
 
 # ── integer arithmetic ───────────────────────────────────────────────────────
 
-proc foldRhs2(g: var CodeGen; op: A64Inst; dest: Reg; rhsLoc: Location; rhsC: Cursor;
+proc foldRhs2(g: var CodeGen; op: RiscInst; dest: Reg; rhsLoc: Location; rhsC: Cursor;
               w32 = false) =
   ## `dest = dest op rhs`, materializing the rhs as a64 needs (no memory operand; a
   ## large/non-add immediate goes through a bridge). `dest` already holds the lhs.
@@ -622,7 +622,7 @@ proc foldRhs2(g: var CodeGen; op: A64Inst; dest: Reg; rhsLoc: Location; rhsC: Cu
   else: raiseAssert "arkham a64n: foldRhs2 " & $rhsLoc.kind
 
 
-proc foldRhs3(g: var CodeGen; op: A64Inst; dest, rn: Reg; rhsLoc: Location; rhsC: Cursor;
+proc foldRhs3(g: var CodeGen; op: RiscInst; dest, rn: Reg; rhsLoc: Location; rhsC: Cursor;
               w32 = false) =
   ## `dest = rn op rhs` — the 3-operand twin of `foldRhs2`. `rn` holds the left
   ## source (a live local's register, distinct from `dest`); nothing is moved into
@@ -672,15 +672,19 @@ proc emitMemIntrin2*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
       nUnroll = n
   let nArgs = if unroll: 2 else: min(3, argCurs.len)
   for idx in 0 ..< nArgs:
-    var aD = regLoc(IntArgRegs[idx], ScalarSlot)
+    var aD = regLoc(g.md.intArgRegs[idx], ScalarSlot)
     g.emitValue2(argCurs[idx], aD)                       # → x0 / x1 / x2 directly
     g.unbindTemp(aD.r)                                   # used raw below
-  let (dst, src, n) = (R0, R1, R2)                       # for memset: src holds `val`
-  let (i, b, b2) = (R3, R4, R5)
+  # The three ARGUMENT registers, read off the machine rather than written as
+  # slot literals: `a0`/`a1`/`a2` are `x0`/`x1`/`x2` on Arm and `x10`/`x11`/`x12`
+  # on RISC-V, where those literals name `zero`, `ra` and `sp` instead.
+  let (dst, src, n) = (g.md.intArgRegs[0], g.md.intArgRegs[1], g.md.intArgRegs[2])
+  let (i, b, b2) = (g.md.memIntrinScratch[0], g.md.memIntrinScratch[1],
+                    g.md.memIntrinScratch[2])
   if unroll:
     if nUnroll > 0:
       g.copyAggr(dst, src, int(nUnroll), i)
-    g.movReg(IntRet, dst)
+    g.movReg(g.md.intRetReg, dst)
     return
   case builtin
   of "memcpy", "memmove":
@@ -715,7 +719,7 @@ proc emitMemIntrin2*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
       g.emLdrb(b, src, i); g.emStrb(b, dst, i)
       g.binImm(AddA64, i, 1)
     g.emLab(done)
-    g.movReg(IntRet, dst)
+    g.movReg(g.md.intRetReg, dst)
   of "memset":
     let done = g.freshLabel()
     g.movImm(i, 0)
@@ -725,7 +729,7 @@ proc emitMemIntrin2*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
       g.emStrb(src, dst, i)                              # store low byte of `val` (in x1)
       g.binImm(AddA64, i, 1)
     g.emLab(done)
-    g.movReg(IntRet, dst)
+    g.movReg(g.md.intRetReg, dst)
   of "memcmp":
     let diff = g.freshLabel()
     let equal = g.freshLabel(); let done = g.freshLabel()
@@ -738,10 +742,10 @@ proc emitMemIntrin2*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
       g.emBr(BneA64, diff)
       g.binImm(AddA64, i, 1)
     g.emLab(diff)
-    g.movReg(IntRet, b); g.binReg(SubA64, IntRet, b2)
+    g.movReg(g.md.intRetReg, b); g.binReg(SubA64, g.md.intRetReg, b2)
     g.emBr(BA64, done)
     g.emLab(equal)
-    g.movImm(IntRet, 0)
+    g.movImm(g.md.intRetReg, 0)
     g.emLab(done)
   else: raiseAssert "arkham a64n: unsupported mem intrinsic: " & builtin
 
@@ -2201,7 +2205,7 @@ proc emitFValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
     else: raiseAssert "arkham a64n: emitFValue2(fused) expr " & $c.exprKind
   else: raiseAssert "arkham a64n: emitFValue2(fused) kind " & $c.kind
 proc emitScalarCmpE*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
-                    whenTrue: bool; fuseBranchTo = ""): A64Inst =
+                    whenTrue: bool; fuseBranchTo = ""): RiscInst =
   ## FUSED integer `cmp`: operands resolve dontCare (a home / immediate stays
   ## put; a computed subtree takes a temp) and the bridges serve everything
   ## else — 075b051's stackHomeSlot / placeImmTyped bridge typing preserved.
@@ -2778,9 +2782,9 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
     if tgt.memIntrin.len > 0:
       g.emitMemIntrin2(argCurs, tgt.memIntrin)   # (fused arg emission inside)
       if not (dest.kind == InReg and not dest.isTemp):
-        dest = regLoc(IntRet, ScalarSlot, isTemp = true)
-      elif dest.r != IntRet:
-        g.movReg(dest.r, IntRet)
+        dest = regLoc(g.md.intRetReg, ScalarSlot, isTemp = true)
+      elif dest.r != g.md.intRetReg:
+        g.movReg(dest.r, g.md.intRetReg)
       return
     if tgt.bitBuiltin.len > 0:
       raiseAssert "arkham a64n: bit builtin not yet implemented: " & tgt.bitBuiltin
@@ -2800,7 +2804,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
   # the thing to ask. An indirect tail call is refused because the pointer lives in
   # a register `(popframe)` may restore out from under the branch.
   # A target without `TailCall` declines unconditionally: `(tailcall)`/`(popframe)`
-  # are A64Inst-only tags, so the Thumb-2 selector has no spelling for either and
+  # are RiscInst-only tags, so the Thumb-2 selector has no spelling for either and
   # the prologue it builds is not the one `(popframe)` knows how to walk back.
   var doTail = tail and TailCall in g.md.caps and
                not indirect and not tgt.extern and not tgt.syscall and
@@ -2816,21 +2820,21 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
         dest = g.takeFTmp(resSlot)             # the float pool excludes v0
       if dest.kind == InFReg:
         if dest.isTemp and not g.rb.isBoundFTmp(dest.f): g.bindFTmp(dest.f, rbits)
-        if dest.f != FloatRet: g.fmovF(dest.f, FloatRet, rbits)
+        if dest.f != g.md.floatRetReg: g.fmovF(dest.f, g.md.floatRetReg, rbits)
       else:
-        g.emFloatScalarStore(dest.name, FloatRet, rbits)
+        g.emFloatScalarStore(dest.name, g.md.floatRetReg, rbits)
     elif resSlot.kind == AMem or g.isWideSlot(resSlot):
       discard        # ≤16B aggregate / 64-bit scalar result: caller reads x0:x1
     else:
       case dest.kind
       of Undef, NeedsReg, RegOrImm:
-        dest = regLoc(IntRet, resSlot, isTemp = true)   # x0 itself is raw-usable
+        dest = regLoc(g.md.intRetReg, resSlot, isTemp = true)   # x0 itself is raw-usable
       of InReg:
-        if dest.r != IntRet:
+        if dest.r != g.md.intRetReg:
           if dest.isTemp and not g.rb.isBoundTemp(dest.r): g.bindTemp(dest.r, resSlot)
-          g.movReg(dest.r, IntRet)
+          g.movReg(dest.r, g.md.intRetReg)
       of NamedStack, Mem:
-        g.storeReg2(dest, IntRet)
+        g.storeReg2(dest, g.md.intRetReg)
       else: raiseAssert "arkham a64n: call result dest " & $dest.kind
 
   if tgt.declarative:
@@ -3027,7 +3031,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
       if not doTail and hasResult and not resultByRef and not resultIsFloat and
          resSlot.kind != AMem and not g.isWideSlot(resSlot):
         g.ab.tree MovA64:
-          g.emReg IntRet
+          g.emReg g.md.intRetReg
           g.ab.tree ResX: g.ab.sym synth("ret.0")
     if fnTargetName.len > 0:
       g.ab.tree KillA64: g.ab.sym fnTargetName
@@ -3382,12 +3386,19 @@ proc emitInstr2*(g: var CodeGen; c: Cursor; dest: var Location) =
               "are only legal inside an `{.assembler.}` proc, where the body — " &
               "not the allocator — decides what runs between the compare and " &
               "the branch", lengInfo(c)
-  let here = g.hereTarget
-  if here notin row.targets:
+  if not g.hasHereLowering(row.targets):
     lengError c, "`" & IntrinsicNames[tgt.op] & "` has no " &
               g.md.targetName & " lowering — " &
               "guard the call with a `when`"
   when declared(VecOps):                         # see the staging guard above
+    if tgt.op in VecOps and SimdVector notin g.md.caps:
+      # The rows below are AArch64 AdvSIMD spellings, and nothing makes them
+      # neutral. A target without them must be told so here, at the one place
+      # that knows which op was asked for — the alternative is that the day the
+      # intrinsic table carries these rows, every load/store target starts
+      # emitting `(vfadd …)` because it was not named in a branch.
+      lengError c, "`" & IntrinsicNames[tgt.op] & "` is a 128-bit vector " &
+                "operation and " & g.md.targetName & " has no SIMD vocabulary"
     if tgt.op in VecOps:
       g.emitVecInstr2(c, tgt.op, argCurs, dest)
       return
@@ -3812,7 +3823,7 @@ proc wideShift(g: var CodeGen; dst, a: WideRef; amount: Cursor; ek: LengExpr;
 # ── comparison ──────────────────────────────────────────────────────────────
 
 proc emitWideCmpE(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
-                  whenTrue: bool): A64Inst =
+                  whenTrue: bool): RiscInst =
   ## The 64-bit twin of `emitScalarCmpE`: emit the compare, return the branch
   ## that means "the condition holds".
   ##

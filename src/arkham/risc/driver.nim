@@ -21,10 +21,16 @@ import "../core" / [asmslots, machinedesc, analyser, planer, programs, asmbuf,
                     context, diag, typeutil, constdata,
                     regbind, 
                     layout]
-import "../arm/machine_a64" as machine
-from "../arm/machine_m" as machine_m import nil
+import "../risc/machine_a64" as machine
+from "../risc/machine_m" as machine_m import nil
+import "../risc/machine_rv32" as machine_rv32
+  # Imported although `generateRv32` does not exist yet, so the RV32 machine model
+  # is TYPE-CHECKED by every build rather than only when someone remembers to
+  # compile it. A machine description is a table of register slots and set
+  # members; the way it goes wrong is by naming a slot the target does not map,
+  # and that is a compile error only if something compiles it.
 import emit, value, frame, stmt, asmproc
-import "../cortexm/runtime"
+import runtime
 
 proc genProc2(g: var CodeGen; info: ProcInfo) =
   when defined(arkhamTraceProcs):
@@ -332,6 +338,78 @@ proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     # AFTER the bodies: whether anything divides is only known once they are
     # emitted. A firmware image has no `libgcc` to borrow `__aeabi_ldivmod`
     # from, so it carries its own — once, and only if used.
+    if g.needsUDiv64: g.emitUDivMod64()
+    if g.needsSDiv64: g.emitSDivMod64()
+    for (nm, bytes) in g.rodata:
+      g.ab.tree RodataD:
+        g.ab.symDef nm
+        g.ab.str bytes
+  result = g.ab.render("." & g.prog.thisModuleSuffix)
+
+proc rejectForRv32(g: var CodeGen) =
+  ## What RV32 does not have, refused BY NAME at the declaration rather than
+  ## discovered as a missing tag halfway through an otherwise valid image.
+  ##
+  ## Deliberately short. Cortex-M's twin has to turn away `float64` (its FPU is
+  ## single-precision) and a good deal besides; RV32IMAFD has both precisions,
+  ## hardware divide, and atomics that carry their own ordering, so the list is
+  ## what the ISA genuinely lacks rather than what the backend has not reached.
+  for info in g.prog.procs:
+    if info.irqName.len > 0:
+      quit "arkham rv32: `{.interrupt: \"" & info.irqName & "\".}` is not " &
+           "supported yet — a RISC-V core reaches its handlers through `mtvec`, " &
+           "which holds JUMPS rather than addresses, and the trampoline table " &
+           "that builds is outstanding."
+
+proc generateRv32*(buf: var TokenBuf; inputPath: string; tags: TagPool;
+                   board = layout.Layout()): string =
+  ## Compile a parsed Leng module to RV32IMAFD asm-NIF, which nifasm's `riscv32`
+  ## target assembles into a bare-metal firmware image.
+  ##
+  ## The same emitter again, driven by a fourth machine model — which is what the
+  ## whole `risc/` directory exists to make possible. 75 of the mnemonics it
+  ## writes are the same tag id here as on AArch64, and everything the ISAs
+  ## genuinely disagree about is a `TargetFeature` this model answers rather than
+  ## a branch on which target is being emitted.
+  setTargetWord Word32             # 4-byte pointers, 4-byte platform int
+  var g = newCodeGen(buf, machine_rv32.rv32Machine)
+  g.entryExits = true              # bare metal: the entry cannot RETURN, because
+                                   # `ra` at reset holds no valid address
+  g.board = board
+  g.oneThread = not board.given or board.slotCount <= 1
+  # Where the reset path points `sp`. From the board when there is one; otherwise
+  # the top of QEMU `virt`'s SRAM region, which is the default `writerv32.nim`
+  # lays out against. The two MUST agree — a stack pointer above the region the
+  # image declares is not a diagnosable error, it is a store into nothing.
+  g.rvStackTop = if board.given: int64(board.sramStart) + int64(board.sramSize)
+                 else: Rv32DefaultStackTop
+  g.ab.renderReg = machine_rv32.regNameRv     # `(x0)`..`(x30)`/`(sp)`
+  g.ab.arch = "rv32"               # no BodyLib entries apply to this target yet
+  g.prog = collect(buf, inputPath, tags, darwin = false)
+  g.rejectForRv32()
+  g.adoptProgram()
+  g.ab.tree StmtsA64:
+    g.ab.tree ArchD: g.ab.ident "riscv32"
+    for (name, decl) in g.prog.mainTypeList:
+      g.genType(name, decl)
+    for name, decl in g.prog.globals:
+      g.genGlobal(name, decl)
+    for name, decl in g.prog.tvars:
+      g.genTvar(name, decl)             # one thread here, so each becomes a gvar
+    g.emitSemihostExitProc(EntryExitShim) # the entry's tail-call target, always
+    if g.prog.syscalls.len > 0:
+      g.ab.tree RodataD:
+        g.ab.symDef g.semiTtyName
+        g.ab.str ":tt\0"
+      g.ab.open NifasmDecl.GvarD
+      g.ab.symDef g.semiTtyHandle
+      g.ab.intType(32)
+      g.ab.intLit 0
+      g.ab.close()
+    for sp in g.prog.syscalls:            # semihosting shims, called like any proc
+      g.emitSemihostRuntime(sp)
+    for info in g.prog.procs:
+      genProc2(g, info)
     if g.needsUDiv64: g.emitUDivMod64()
     if g.needsSDiv64: g.emitSDivMod64()
     for (nm, bytes) in g.rodata:

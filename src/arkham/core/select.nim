@@ -15,7 +15,7 @@
 
 import nifcore, nifcdecl
 import asmslots, machinedesc, planer
-import "../arm/machine_m"
+import "../risc/machine_m"
 import context
 import typeutil
 

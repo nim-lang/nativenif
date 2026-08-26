@@ -23,7 +23,7 @@
 import std / [tables, sets]
 import nifcore
 import asmslots, machinedesc, planer, programs
-import "../arm/machine_m"                # the Cortex-M machine model
+import "../risc/machine_m"                # the Cortex-M machine model
 import layout                            # Layout: the `--layout:` board file
 import asmbuf
 
@@ -155,6 +155,17 @@ type
     board*: layout.Layout                    ## the `--layout:` board, when one was
                                              ## given. arkham reads it and forwards it;
                                              ## nifasm places segments from the forward.
+    rvStackTop*: int64                       ## RV32 only: the value the reset path
+                                             ## loads into `sp`.
+                                             ##
+                                             ## A number arkham must know at CODEGEN
+                                             ## time, because on this target the
+                                             ## initial stack pointer is an
+                                             ## INSTRUCTION rather than a word the
+                                             ## image writer fills in. Cortex-M gets
+                                             ## its from vector-table slot 0, which
+                                             ## is why nothing like this exists
+                                             ## there.
     thumbM*: bool                            ## the SAME emitter, targeting Cortex-M
                                              ## (ARMv7E-M) instead of AArch64. The two
                                              ## share the asm-NIF vocabulary by design —

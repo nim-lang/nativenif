@@ -152,6 +152,7 @@ const
   cortexMMachine* = MachineDesc(
     arch: ThumbM,
     intRetReg: R0,
+    floatRetReg: F0,
     divRemReg: NoReg,           # sdiv/udiv are 3-operand; the remainder is `mls`
     shiftCountReg: NoReg,       # Thumb-2 shifts take any register
     intArgRegs: @IntArgRegs,
@@ -180,8 +181,14 @@ const
     indirectResultReg: IndirectResultReg,
     produceBridge: ProduceBridge,
     bridgeRegs: @BridgeRegs,
-    floatBridgeReg: F31,        # `machine.FloatBridgeReg`; s31 here
-    caps: {SubwordExtend, Freestanding, AllFlagBranches},
+    floatBridgeReg: F31,
+    memIntrinScratch: [R3, R4, R5],        # `machine.FloatBridgeReg`; s31 here
+    caps: {SubwordExtend, Freestanding, AllFlagBranches, BitScanOps},
+                                # `BitScanOps`: ARMv7E-M HAS `clz`/`rbit`/`rev`,
+                                # and nifasm's Thumb selector has rows for all
+                                # three. NOT `FloatConvert` — with no double
+                                # precision there is nothing to convert between —
+                                # and NOT `SimdVector`: the FPU is scalar.
                                 # ARMv7E-M has none of the rest: no conditional
                                 # select (its equivalent is an IT block, a shape
                                 # this emitter does not build), no `(tailcall)`

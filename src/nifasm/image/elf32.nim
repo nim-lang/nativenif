@@ -34,6 +34,7 @@ type
 const
   ET_EXEC* = 2.Elf32_Half
   EM_ARM* = 40.Elf32_Half
+  EM_RISCV* = 243.Elf32_Half
   PT_LOAD* = 1.Elf32_Word
   PF_X* = 1.Elf32_Word
   PF_W* = 2.Elf32_Word
@@ -42,6 +43,15 @@ const
   EF_ARM_EABI_VER5* = 0x05000000.Elf32_Word
     ## `e_flags` for an EABI 5 object. Nothing in QEMU checks it, but a real
     ## toolchain's `readelf`/`gdb` reads the ABI version from here.
+
+  EF_RISCV_RVC* = 0x0001.Elf32_Word
+    ## the image contains compressed (C-extension) instructions. Not set: the
+    ## baseline here is fixed 32-bit encodings.
+  EF_RISCV_FLOAT_ABI_DOUBLE* = 0x0004.Elf32_Word
+    ## ilp32d — FP arguments and returns travel in `f` registers at double
+    ## precision. The `e_flags` field is where a linker checks that two objects
+    ## agree about that, and disagreeing about it is not a diagnosable mismatch at
+    ## any later point: the caller writes `fa0` and the callee reads `a0`.
 
   Elf32EhdrSize* = 52
   Elf32PhdrSize* = 32
@@ -141,8 +151,15 @@ proc initInterruptTable*(stackTop: uint32; resetHandler: uint32;
     result[i] = byte((stackTop shr (8 * i)) and 0xFF)
     result[4 + i] = byte((entry shr (8 * i)) and 0xFF)
 
-proc writeElf32*(segments: openArray[Segment]; entry: uint32): seq[byte] =
-  ## Serialize `segments` as an ET_EXEC ELF32 for EM_ARM.
+proc writeElf32*(segments: openArray[Segment]; entry: uint32;
+                 machine = EM_ARM): seq[byte] =
+  ## Serialize `segments` as an ET_EXEC ELF32 for `machine`.
+  ##
+  ## `machine` defaults to EM_ARM so every Cortex-M caller is unchanged. Only two
+  ## header fields actually depend on it, and both are traps if left at the Arm
+  ## value: `e_entry` carries the Thumb-state bit on Arm and MUST NOT on RISC-V
+  ## (an odd entry address there is simply misaligned), and `e_flags` names a
+  ## different ABI on each.
   var out0 = initBytes()
   let phCount = segments.len
   var fileOff = Elf32EhdrSize + Elf32PhdrSize * phCount
@@ -162,12 +179,15 @@ proc writeElf32*(segments: openArray[Segment]; entry: uint32): seq[byte] =
   out0.add 1'u8            # EI_VERSION
   for _ in 0 ..< 9: out0.add 0'u8
   out0.addUint16 uint16(ET_EXEC)
-  out0.addUint16 uint16(EM_ARM)
+  out0.addUint16 uint16(machine)
   out0.addUint32 1'u32                      # e_version
-  out0.addUint32 entry or 1'u32             # e_entry, Thumb bit set
+  # The Thumb-state bit belongs to Arm and to nothing else: on RISC-V an odd
+  # entry address is a misaligned one.
+  out0.addUint32 (if machine == EM_ARM: entry or 1'u32 else: entry)
   out0.addUint32 uint32(Elf32EhdrSize)      # e_phoff
   out0.addUint32 0'u32                      # e_shoff: no section headers
-  out0.addUint32 uint32(EF_ARM_EABI_VER5)   # e_flags
+  out0.addUint32 (if machine == EM_ARM: uint32(EF_ARM_EABI_VER5)
+                  else: uint32(EF_RISCV_FLOAT_ABI_DOUBLE))   # e_flags
   out0.addUint16 uint16(Elf32EhdrSize)
   out0.addUint16 uint16(Elf32PhdrSize)
   out0.addUint16 uint16(phCount)

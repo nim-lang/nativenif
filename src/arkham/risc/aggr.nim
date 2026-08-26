@@ -364,7 +364,7 @@ proc wideCarryChain*(g: var CodeGen; loOp, hiOp: MInst; dst, a, b: WideRef) =
   g.wideStore(dst, 1, t)
   g.dropWideRegs(@[t])
 
-proc wideWordwise*(g: var CodeGen; op: A64Inst; dst, a, b: WideRef) =
+proc wideWordwise*(g: var CodeGen; op: RiscInst; dst, a, b: WideRef) =
   ## `dst = a <op> b` for the bitwise ops, which have no inter-half dependency.
   let t = g.takeWideRegs(1, "a 64-bit bitwise accumulator")[0]
   for i in 0 .. 1:
