@@ -1159,7 +1159,7 @@ proc rv32CorpusSweep() =
   ##
   ## `MinPass` is a ratchet, not a target: it exists so that a change which turns
   ## a working fixture into a refusal is noticed.
-  const MinPass = 64
+  const MinPass = 82
   let qemu = findExe(rvSim)
   if qemu.len == 0:
     echo rvSim, " not found - skipping the RV32 corpus sweep"
@@ -1303,7 +1303,12 @@ proc arkhamAvrRejections() =
     # An AGGREGATE global. Refused because its initial IMAGE would have to ship
     # in flash and be copied into SRAM at startup — a scalar's initial value is
     # a store the entry proc emits, and an array's would be hundreds of them.
-    ("tests/arkham_avr_reject/gvar_aggr.c.nif", "is an aggregate")]
+    ("tests/arkham_avr_reject/gvar_aggr.c.nif", "is an aggregate"),
+    # An aggregate parameter passed by REFERENCE whose pointer the allocator put
+    # in an ordinary pair. Refused for what the MACHINE is: only X, Y and Z
+    # address memory here, and the staging would have to happen inside a memory
+    # operand — which is not a place instructions can be emitted.
+    ("tests/arkham_avr_reject/aggr_byref_pair.c.nif", "only X, Y and Z")]
   var passed = 0
   for (file, want) in cases:
     let (output, code) = runProgram(arkhamExe,

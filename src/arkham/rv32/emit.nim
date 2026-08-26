@@ -193,6 +193,18 @@ proc emStoreElem*(g: var CodeGen; slot: string; idx: int; s: Reg; width: int) =
     g.ab.tree AtX: (g.ab.sym slot; g.ab.intLit idx)
     g.emReg s
 
+proc emLeaField*(g: var CodeGen; d: Reg; slot, field: string) =
+  ## The ADDRESS of `slot.field`, built from PARTS for the reason `emStoreField`
+  ## is: a constructor's destination is not written anywhere in the input.
+  g.ab.tree LeaRv:
+    g.emReg d
+    g.ab.tree DotX: (g.ab.sym slot; g.ab.sym field)
+
+proc emLeaElem*(g: var CodeGen; d: Reg; slot: string; idx: int) =
+  g.ab.tree LeaRv:
+    g.emReg d
+    g.ab.tree AtX: (g.ab.sym slot; g.ab.intLit idx)
+
 proc emLeaNode*(g: var CodeGen; d: Reg; node: Cursor) =
   ## The ADDRESS of a folded access. `(dot …)` and `(at …)` are memory operands
   ## to nifasm, so `(lea …)` over one is a single `addi` against whatever base
@@ -465,6 +477,27 @@ proc emRegVar*(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   g.genTypeBodyRv(tc)
   g.ab.close()
   g.rb.bindLocal(r, name, isPtr = false)
+
+proc emRegPtrVar*(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
+  ## A register holding a POINTER to an aggregate, declared as `(ptr T)` rather
+  ## than as the aggregate.
+  ##
+  ## The distinction is nifasm's to act on, not decoration: `(dot w f)` folds
+  ## against the POINTEE's layout, and a register declared with the object type
+  ## says the object is IN the register — which on no machine here it is. A
+  ## by-reference parameter looked like that and every field access through it
+  ## was rejected.
+  let dead = g.rb.takeBinding(r)
+  if dead.len > 0:
+    g.ab.tree KillRv: g.ab.sym dead
+  g.ab.open NifasmDecl.VarD
+  g.ab.symDef name
+  g.ab.rawReg r
+  g.ab.ptrType:
+    var tc = typeCur
+    g.genTypeBodyRv(tc)
+  g.ab.close()
+  g.rb.bindLocal(r, name, isPtr = true)
 
 proc emSlotVar*(g: var CodeGen; name: string; typeCur: Cursor) =
   g.ab.open NifasmDecl.VarD

@@ -376,6 +376,12 @@ proc emitAddrOf(g: var CodeGen; c: Cursor; dst: Reg) =
     else: discard
   g.emitValue(c, dst)
 
+proc mintCtorSlot(g: var CodeGen; c: Cursor): string
+proc mintAggrSlot(g: var CodeGen; size: int): string
+proc aggrSize(g: var CodeGen; c: Cursor): int
+proc isAggrCall(g: var CodeGen; c: Cursor): bool
+proc emitAggrInit(g: var CodeGen; c: Cursor; slot: string)
+
 proc emitLval(g: var CodeGen; c: Cursor; scratch: Reg): Lval =
   ## Resolve where a store GOES, emitting whatever address arithmetic that takes.
   ## `scratch` is where a computed pointer lands; it must not be the register the
@@ -399,6 +405,25 @@ proc emitLval(g: var CodeGen; c: Cursor; scratch: Reg): Lval =
       Lval(kind: lvPtr, r: scratch, off: 0, width: g.accessWidth(c).bytes)
   of TagLit:
     case c.exprKind
+    of CallC:
+      # A call whose result is an AGGREGATE, used as a value. The callee writes
+      # through a pointer, so it is handed a minted slot and the slot IS the
+      # lvalue — which is what makes `f(g())` and `(kv p (g))` work without a
+      # case of their own at either site.
+      if not g.isAggrCall(c):
+        refuse(c, "a store to the expression `call`")
+      let slot = g.mintAggrSlot(g.aggrSize(c))
+      g.emitCall(c, StagingBridge, wantResult = false, aggrDst = slot)
+      Lval(kind: lvSlot, slot: slot)
+    of OconstrC, AconstrC:
+      # A constructor used as a VALUE — a returned one, a call argument, or the
+      # value of an enclosing constructor's field. It has no home of its own, so
+      # it gets one: a minted slot, built in place, handed back as an lvalue like
+      # any other. That is what makes `f((oconstr T …))` a copy of a real object
+      # rather than a shape with nowhere to live.
+      let slot = g.mintCtorSlot(c)
+      g.emitAggrInit(c, slot)
+      Lval(kind: lvSlot, slot: slot)
     of DerefC, HaddrC:
       let (w, _) = g.accessWidth(c)
       var v = c; inc v
@@ -506,6 +531,24 @@ proc mintAggrSlot(g: var CodeGen; size: int): string =
   g.ab.arrayType:
     g.ab.uintType 8
     g.ab.intLit size
+  g.ab.close()
+
+proc mintCtorSlot(g: var CodeGen; c: Cursor): string =
+  ## A frame slot for a CONSTRUCTOR's result, declared with the constructor's own
+  ## type rather than as bytes.
+  ##
+  ## The type matters here where it does not in `mintAggrSlot`: a constructor is
+  ## filled in by `(dot slot f)` and `(at slot i)`, and nifasm scales an index by
+  ## the ELEMENT — so a byte-array slot made `(at slot 1)` mean byte 1. An
+  ## `(aconstr IntArr3 20 15 7)` wrote 20, 15 and 7 into the first three bytes of
+  ## the first element and the sum came out 20.
+  inc g.emitTmpSpills
+  result = SynthMark & "ector" & $g.emitTmpSpills & ".0"
+  var tc = c; inc tc                        # into the constructor, at its type
+  g.ab.open NifasmDecl.VarD
+  g.ab.symDef result
+  g.ab.keyword SO
+  g.genTypeBodyRv(tc)
   g.ab.close()
 
 proc aggrSize(g: var CodeGen; c: Cursor): int =
@@ -822,10 +865,19 @@ proc emitAggrInit(g: var CodeGen; c: Cursor; slot: string) =
           refuse(kv, "an object constructor without a field name")
         let fieldName = symName(kv)
         skip kv                                  # the field name
-        g.refuseAggr(kv, "the value of field `" & fieldName & "`")
-        let w = g.accessWidth(kv).bytes
-        g.emitValue(kv, StagingBridge)
-        g.emStoreField(slot, fieldName, StagingBridge, w)
+        if g.exprSlot(kv).cls == AMem:
+          # A NESTED aggregate — a struct inside a struct, or a constructor for
+          # one. The field is an address like any other destination, so this is
+          # the ordinary copy rather than a case of its own.
+          let size = g.aggrSize(kv)
+          let srcLv = g.emitLval(kv, StagingBridge2)
+          g.emLeaField(StagingBridge, slot, fieldName)
+          g.emitAggrCopy(Lval(kind: lvPtr, r: StagingBridge, off: 0, width: 4),
+                         srcLv, size)
+        else:
+          let w = g.accessWidth(kv).bytes
+          g.emitValue(kv, StagingBridge)
+          g.emStoreField(slot, fieldName, StagingBridge, w)
         skip f
   of AconstrC:
     var e = c
@@ -833,10 +885,16 @@ proc emitAggrInit(g: var CodeGen; c: Cursor; slot: string) =
     e.into:
       skip e                                     # the type
       while e.hasMore:
-        g.refuseAggr(e, "element " & $i & " of this array constructor")
-        let w = g.accessWidth(e).bytes
-        g.emitValue(e, StagingBridge)
-        g.emStoreElem(slot, i, StagingBridge, w)
+        if g.exprSlot(e).cls == AMem:
+          let size = g.aggrSize(e)
+          let srcLv = g.emitLval(e, StagingBridge2)
+          g.emLeaElem(StagingBridge, slot, i)
+          g.emitAggrCopy(Lval(kind: lvPtr, r: StagingBridge, off: 0, width: 4),
+                         srcLv, size)
+        else:
+          let w = g.accessWidth(e).bytes
+          g.emitValue(e, StagingBridge)
+          g.emStoreElem(slot, i, StagingBridge, w)
         inc i
         skip e
   else:
@@ -1264,7 +1322,7 @@ proc genProcRv*(g: var CodeGen; info: ProcInfo) =
         lengError info.decl, "RV32: the aggregate parameter `" & nm &
                   "` was given neither a slot nor a register (" & $home.kind & ")",
                   lengInfo(info.decl)
-      g.emRegVar(nm, home.r, params[i].typ)
+      g.emRegPtrVar(nm, home.r, params[i].typ)
       g.emMv(home.r, src)
     else:
       g.checkWidth(params[i].typ, "the parameter `" & nm & "`")

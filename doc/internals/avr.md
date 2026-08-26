@@ -15,6 +15,7 @@ Status: **M0–M4d complete.**
 | M4d aggregates, arrays, pointers | done — 5 more Leng fixtures |
 | M4e aggregate parameters and returns | done — a hidden result pointer |
 | M5a scalar globals | done — SRAM storage, values stored at entry |
+| M5b constructors as values, nested aggregates | done — 19 Leng fixtures |
 | M5 wide scalars, stack arguments, divide | not started |
 | M6 aggregate globals, flash constants, interrupts | not started |
 
@@ -142,6 +143,12 @@ register, a pair or a stack slot, every ALU form, the one-bit shifts,
   whatever the slot manager put next to it. A signed byte is widened with
   `sbrc`+`com`, which is how this machine spells a conditional one-instruction
   fixup — there is no `sxtb` here.
+* **An aggregate parameter passed by REFERENCE is refused** when the allocator
+  homes its pointer in an ordinary pair. Only X, Y and Z address memory here and
+  Y is the frame pointer, so a pointer cannot be followed where it sits — and
+  staging it through Z would have to happen INSIDE a memory operand, which is
+  not a place instructions can be emitted. Aggregates at or below
+  `aggrByRefThreshold` (4 bytes) are passed by value and unaffected.
 * **A conditional branch always costs two words**: the direct form reaches ±128
   bytes and the assembler cannot know the distance when it emits one, so it
   inverts the condition and branches over an `rjmp`. Shrinking that back down is

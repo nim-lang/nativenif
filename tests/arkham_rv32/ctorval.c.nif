@@ -1,0 +1,73 @@
+(.nif27)
+(stmts
+ (type :Pt.0 .
+  (object .
+   (fld :x.0 .
+    (i 32))
+   (fld :y.0 .
+    (i 32))))
+ (type :Arr3.0 .
+  (array
+   (i 32)3))
+ (type :Wrap.0 .
+  (object .
+   (fld :n.0 .
+    (i 32))
+   (fld :p.0 . Pt.0)))
+ (proc :mk.0
+  (params)Pt.0
+  (pragmas)
+  (stmts
+   (ret
+    (oconstr Pt.0
+     (kv x.0 8)
+     (kv y.0 2)))))
+ (proc :ptsum.0
+  (params
+   (param :p.0 . Pt.0))
+  (i 32)
+  (pragmas)
+  (stmts
+   (ret
+    (add
+     (i 32)
+     (dot p.0 x.0 0)
+     (dot p.0 y.0 0)))))
+ (proc :sum.0
+  (params
+   (param :w.0 . Wrap.0))
+  (i 32)
+  (pragmas)
+  (stmts
+   (ret
+    (add
+     (i 32)
+     (dot w.0 n.0 0)
+     (call ptsum.0
+      (dot w.0 p.0 0))))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :a.0 . Arr3.0 .)
+   (asgn a.0
+    (aconstr Arr3.0 20 15 7))
+   (var :s.0 .
+    (i 32)
+    (call sum.0
+     (oconstr Wrap.0
+      (kv n.0 5)
+      (kv p.0
+       (call mk.0)))))
+   (ret
+    (add
+     (i 32)s.0
+     (add
+      (i 32)
+      (at a.0 0)
+      (add
+       (i 32)
+       (at a.0 1)
+       (at a.0 2))))))))
