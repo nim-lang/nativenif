@@ -27,6 +27,7 @@ import "../x64/encoder" as x86
 import "../arm64/encoder" as arm64
 from "../thumb/encoder" as thumb2 import nil
 from "../avr/encoder" as avr import nil
+from "../rv32/encoder" as rv32 import nil
 
 const MainModuleName* = ""  # Special name for main module
 
@@ -220,6 +221,12 @@ type
     clobberedAvr*: set[avr.Register]
                         # AVR counterpart of `clobberedM`: caller-saved registers a call
                         # destroyed, so reading one before rewriting it is an error.
+    rv32RegBindings*: Table[rv32.Register, string]
+                        # RV32 counterpart of `regBindings`: which physical register
+                        # currently hosts which local, so a raw `(xN)` use of a bound
+                        # one is rejected as the silent clobber it is.
+    clobberedRv32*: set[rv32.Register]
+                        # RV32 counterpart of `clobberedA64`.
     a64RegBindings*: Table[arm64.Register, string]  # AArch64 counterpart of `regBindings`:
                         # which physical x-register currently hosts which variable name. A
                         # raw `(xN)` use of a bound register is rejected (use the name);

@@ -1109,6 +1109,43 @@ proc rv32SelfTest() =
        " checks, each verified to detect its own mutation)"
 
 
+proc rv32AsmTests() =
+  ## Assemble hand-written RV32 asm-NIF and run the result under `qemu-riscv32`.
+  ## The END-TO-END gate for the instruction selector: the encoder self-test
+  ## proves the ENCODINGS, but only these exercise the operand model, the
+  ## register-binding table, the relocation patching and the ELF32 image
+  ## together — including the two-PT_LOAD page separation, which is invisible to
+  ## everything except actually running the file.
+  let qemu = findExe(rvSim)
+  if qemu.len == 0:
+    echo rvSim, " not found - skipping RV32 assembler tests"
+    return
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  const fixtures = [("hello_rv32", 0, "Hello RISC-V\n"),
+                    ("rv32_alu", 158, ""),
+                    ("rv32_branch", 42, ""),
+                    ("rv32_loop", 45, ""),
+                    ("rv32_mem", 42, ""),
+                    ("rv32_call", 42, "")]
+  var passed = 0
+  for (stem, wantCode, wantOut) in fixtures:
+    let src = "tests" / (stem & ".nif")
+    let elf = "tests" / (stem & ".elf")
+    exec quoteShell(nifasmExe) & " -o:" & quoteShell(elf) & " " & quoteShell(src)
+    let (output, code) = runProgram(qemu, @[elf])
+    if code == timeoutExitCode:
+      quit "FAILURE (TIMEOUT) rv32 " & stem & "\n"
+    if code != wantCode:
+      quit "FAILURE rv32 " & stem & ": exit " & $code & ", want " & $wantCode &
+           "\n" & output
+    if output != wantOut:
+      quit "FAILURE rv32 " & stem & " output\nExpected: " & escape(wantOut) &
+           "\nGot:      " & escape(output)
+    removeFile elf
+    inc passed
+  echo passed, " / ", fixtures.len, " RV32 assembler tests successful"
+
+
 proc arkhamAvrTests() =
   ## The AVR Leng corpus: `arkham -a:avr` → `nifasm` → AVRtest, checking each
   ## fixture's exit code against its `.exitcode` file — the same oracle every
@@ -1837,6 +1874,7 @@ avrAsmTests()
 
 # RISC-V 32: encoder-level coverage. Hosted, so it needs only `qemu-riscv32`.
 rv32SelfTest()
+rv32AsmTests()
 arkhamAvrTests()
 arkhamAvrRejections()
 

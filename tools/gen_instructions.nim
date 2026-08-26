@@ -10,7 +10,7 @@ proc toNimName(s: string; suffix: string): string =
 type
   EnumList = enum
     X64Inst, A64Inst, MInst, NifasmType, NifasmDecl, NifasmExpr, X64Flag, X64Reg,
-    A64Reg, MReg, AvrInst, AvrReg
+    A64Reg, MReg, AvrInst, AvrReg, Rv32Inst, Rv32Reg
 
 proc toSuffix(e: EnumList): (string, string) =
   case e
@@ -26,6 +26,8 @@ proc toSuffix(e: EnumList): (string, string) =
   of MReg: ("MR", "NoMReg")
   of AvrInst: ("Avr", "NoAvrInst")
   of AvrReg: ("AR", "NoAvrReg")
+  of Rv32Inst: ("Rv", "NoRv32Inst")
+  of Rv32Reg: ("RvR", "NoRv32Reg")
 
 proc shortcutToEnumList(shortcut: string): EnumList =
   try:
@@ -135,8 +137,14 @@ proc extractTagName(s: string): string =
     quit "Cannot extract tag name from: " & s
 
 const
-  LateEnums = {X64Inst, A64Inst, MInst, AvrInst, AvrReg}
+  LateEnums = {X64Inst, A64Inst, MInst, AvrInst, AvrReg, Rv32Inst}
     ## Enums whose SINGLE-target members are numbered LAST (see `genTags`).
+    ##
+    ## `Rv32Reg` is deliberately NOT here, unlike `AvrReg`: RISC-V reuses
+    ## `(x0)`..`(x30)` and `(sp)`, which already exist as AArch64 spellings, so
+    ## it mints no register tag at all and costs nothing. `x31` simply stays
+    ## unmapped — at thirty allocatable registers that is free, and it buys the
+    ## whole target out of the escape handling AVR needed at every operand site.
     ##
     ## `AvrReg` is the one REGISTER enum in here, and deliberately. Cortex-M
     ## could reuse the spellings that already existed (`(r0)`..`(r12)` were there
@@ -217,7 +225,7 @@ proc genTags(inp: File; inputName: string) =
 
   createDir "src/nifasm/core"
   writeTagsFile "src/nifasm/core/tags.nim", tags, inputName, anonHead = true
-  writeModel "src/nifasm/core/model.nim", enumDecls, X64Inst, AvrReg, inputName
+  writeModel "src/nifasm/core/model.nim", enumDecls, X64Inst, Rv32Reg, inputName
 
 proc main(inputName: string) =
   var inp = open(inputName, fmRead)

@@ -1,0 +1,10 @@
+(.nif27)
+(stmts
+ (arch rv32)
+ (var :a.0 (x5) (i 32))
+ (var :b.0 (x6) (i 32))
+ (addi a.0 (x0) 100)
+ (addi b.0 (x0) 58)
+ (add3 (x10) a.0 b.0)
+ (addi (x17) (x0) 93)
+ (ecall))

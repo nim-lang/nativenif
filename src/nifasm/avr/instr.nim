@@ -392,9 +392,12 @@ proc genInstAvr(n: var Cursor; ctx: var GenContext) =
     emitter(ctx.buf.data, regOfAvr(d, "destination", start))
 
   template plain(emitter: untyped) =
+    ## `skip n`, NOT `inc n` followed by draining `hasMore`: `inc` steps INTO the
+    ## node, and `hasMore` is then relative to the enclosing `(stmts …)` — so the
+    ## drain swallowed every statement after this one. It only ever showed up
+    ## where such an instruction was not the last in its block.
     emitter(ctx.buf.data)
-    inc n
-    while n.hasMore: skip n
+    skip n
 
   template branch(cond: avr.Condition) =
     inc n

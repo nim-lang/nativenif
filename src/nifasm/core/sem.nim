@@ -5,6 +5,7 @@ import ../x64/encoder as x86
 from ../arm64/encoder as arm64 import nil  # only `arm64.Register`, qualified: `Register` alone stays x86's
 from ../thumb/encoder as thumb2 import nil # ditto for the Cortex-M register enum
 from "../avr/encoder" as avr import nil
+from "../rv32/encoder" as rv32 import nil
 import nifcore  # SymId: symbols are keyed by their interned id (main-module pool),
                 # not by re-hashing the qualified name string on every lookup.
 
@@ -92,6 +93,10 @@ type
         ## are spelled the same on both machines; and unlike either, a `(clobber
         ## (rpN))` names a PAIR, which is recorded as both of its halves — the
         ## unit a clobber check asks about is the register a value's half sits in.
+      clobbersRv32*: set[rv32.Register]
+        ## The RV32 half. Overlaps `clobbersA64` for the reason `clobbersM`
+        ## overlaps `clobbers`: `(x0)`..`(x30)` are AArch64 spellings this target
+        ## reuses, so a tag can be valid in both and `(arch …)` decides.
       hasClobberDecl*: bool
         ## Whether a `(clobber …)` was present at all. An EMPTY declared list is
         ## meaningful — arkham emits it for a `(attr "noreturn")` callee, whose

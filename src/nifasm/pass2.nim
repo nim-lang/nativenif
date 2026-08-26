@@ -26,6 +26,7 @@ import image/dwarf                    # ProcUnwind: the per-proc CFI record
 import x64/encoder as x86
 import arm64/encoder as arm64
 from avr/encoder as avr import nil
+from rv32/encoder as rv32 import nil
 from thumb/encoder as thumb2 import nil
 import x64/regs as x64regs
 import x64/instr
@@ -33,6 +34,8 @@ import arm64/instr
 import thumb/instr
 import avr/instr
 import avr/regs as avrregs
+import rv32/instr
+import rv32/regs as rvregs
 import thumb/board
 import pass1                          # `handleArch`: `(arch …)` also appears in pass 2
 
@@ -107,6 +110,10 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
       # straddling a word boundary costs a cycle on some cores and nothing here
       # benefits from the two saved bytes, so it aligns like the others.
       while (ctx.buf.data.len and 3) != 0: ctx.buf.data.add 0'u8
+    elif ctx.arch == Arch.Rv32:
+      # Every RV32 instruction is a 4-byte word and the PC must stay aligned to
+      # one; a misaligned fetch is an architectural exception, not a slow path.
+      while (ctx.buf.data.len and 3) != 0: ctx.buf.data.add 0'u8
     elif ctx.arch == Arch.Avr:
       # Two, not four: an AVR instruction IS a 16-bit word and the PC counts
       # words, so an odd position is not merely slow, it is unaddressable — every
@@ -131,6 +138,7 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     # AArch64 and Cortex-M it is still in the link register, so the CFA is SP.
     ctx.cfaOff = if ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64, Arch.CortexM}: 0'i32
                  elif ctx.arch == Arch.Avr: 2'i32   # `call` pushed a 2-byte return address
+                 elif ctx.arch == Arch.Rv32: 0'i32  # `jal` leaves it in `ra`, as on AArch64
                  else: 8'i32
 
     # Initialize stack context
@@ -141,6 +149,7 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     ctx.a64RegBindings = initTable[arm64.Register, string]()
     ctx.mRegBindings = initTable[thumb2.Register, string]()
     ctx.avrRegBindings = initTable[avr.Register, string]()
+    ctx.rv32RegBindings = initTable[rv32.Register, string]()
     ctx.xmmBindings = initTable[x86.XmmRegister, string]()
     ctx.a64FRegBindings = initTable[arm64.FloatRegister, string]()
     # Each proc is a fresh control flow: no registers are clobbered on entry.
@@ -149,6 +158,7 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     ctx.clobberedA64 = {}
     ctx.clobberedM = {}
     ctx.clobberedAvr = {}
+    ctx.clobberedRv32 = {}
     setLenient false
 
     # Add params to scope.
@@ -164,7 +174,8 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     let isA64Proc = ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64, Arch.CortexM}
     # …and on Win64 the caller's stack arguments start above the shadow space it also
     # reserved, so the callee's view of them shifts by the same amount.
-    var paramOffset = if ctx.arch == Arch.Avr: 0   # stack params are refused by name here
+    var paramOffset = if ctx.arch in {Arch.Avr, Arch.Rv32}: 0
+                                                  # stack params refused by name on both
                       elif isA64Proc: 0
                       elif ctx.arch == Arch.WinX64: 16 + WinShadowSpace
                       else: 16
@@ -181,7 +192,14 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
         # (a leaf param stays unnamed in its incoming arg register), so params are NOT
         # tracked there — only A64 register *locals* and `rebind`-bound scratch enter
         # `a64RegBindings`.
-        if ctx.arch == Arch.Avr:
+        if ctx.arch == Arch.Rv32:
+          # Like x86-64 and AVR, RV32 spells a register parameter by its NAME in
+          # the body, so a raw `(aN)` use of the register it arrived in is a
+          # code-generator bug and gets tracked.
+          if param.reg != InvalidTagId and not param.viaRegs:
+            ctx.rv32RegBindings[tagToRegisterRv32(param.reg, n)] =
+              ctx.nameOf(param.name)
+        elif ctx.arch == Arch.Avr:
           # AVR spells a register param by its NAME in the body, like x86-64 and
           # unlike the Arm targets — so a raw use of the register it arrived in
           # is a code-generator bug and gets tracked. Both halves when it is a
@@ -264,6 +282,26 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     # 16-aligned, so `+ pad` lands the frame exactly where the separate pair did.
     let v = uint32(alignedStackSize + pad)
     if pos + 4 > ctx.buf.data.len: continue
+    if ctx.arch == Arch.Rv32:
+      # The 12-bit immediate of the `addi` that moves SP, at bits 31:20. The
+      # placeholder's own immediate carries the SIGN — `-1` for a `(sub …)`, 0
+      # for an `(add …)` — because the two are the same instruction here and the
+      # patcher has no other way to tell which one it is looking at.
+      if pos + 4 > ctx.buf.data.len: continue
+      var w = uint32(ctx.buf.data[pos]) or (uint32(ctx.buf.data[pos+1]) shl 8) or
+              (uint32(ctx.buf.data[pos+2]) shl 16) or (uint32(ctx.buf.data[pos+3]) shl 24)
+      let negate = ((w shr 20) and 0xFFF) == 0xFFF
+      let signed = (if negate: -int32(v) else: int32(v))
+      if signed < -2048 or signed > 2047:
+        quit "nifasm: this proc's frame is " & $alignedStackSize &
+             " bytes, past the 12-bit immediate an `addi` carries — a larger " &
+             "frame needs `lui`+`add` (see R5 in doc/internals/rv32.md)"
+      w = (w and 0x000FFFFF'u32) or ((cast[uint32](signed) and 0xFFF) shl 20)
+      ctx.buf.data[pos]   = byte(w and 0xFF)
+      ctx.buf.data[pos+1] = byte((w shr 8) and 0xFF)
+      ctx.buf.data[pos+2] = byte((w shr 16) and 0xFF)
+      ctx.buf.data[pos+3] = byte((w shr 24) and 0xFF)
+      continue
     if ctx.arch == Arch.Avr:
       # The 6-bit immediate of the `adiw`/`sbiw` at this position: `1001 011x
       # KKdd KKKK`, with K5:K4 in bits 7:6 and K3:K0 in bits 3:0. Fixed width, so
@@ -365,8 +403,7 @@ proc genInst(n: var Cursor; ctx: var GenContext) =
   of Arch.Avr:
     genInstNodeAvr(n, ctx)
   of Arch.Rv32:
-    error("the RV32 instruction selector is not implemented yet " &
-          "(R3 in doc/internals/rv32.md)", n)
+    genInstNodeRv(n, ctx)
 
 proc pass2*(n: Cursor; ctx: var GenContext) =
   ## Pass2: Generate code only for top-level instructions (entry point).

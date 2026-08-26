@@ -29,7 +29,7 @@ import x64/encoder as x86
 import arm64/encoder as arm64
 from image/elf32 as elf32 import nil
 import image / [dwarf, tracetable]
-import image / [writecommon, writeelf, writemacho, writepe, writecortexm, writeavr]
+import image / [writecommon, writeelf, writemacho, writepe, writecortexm, writeavr, writerv32]
 import pass1, pass2
 
 proc generateSymbol(ctx: var GenContext; sym: Symbol) =
@@ -478,11 +478,31 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
         entryOff = pos
       writeFile(outfile, writeAvrImage(ctx, code, entryOff))
     of Arch.Rv32:
-      # Unreachable while `genInst` refuses the target: no instruction can have
-      # been selected. Named rather than folded into another arm so that R3 has
-      # one place to fill in.
-      quit "nifasm: the RV32 image writer is not implemented yet " &
-           "(R3 in doc/internals/rv32.md)"
+      # A static Linux ELF32. `absBase` is where the CODE lands, because that is
+      # what an `(adr …)` — a `lui`+`addi` pair carrying an absolute address —
+      # resolves against; without it every such pair names a buffer position and
+      # the `jalr` through one jumps into nothing.
+      # The segment count decides the header's size and therefore where the code
+      # lands, so it is settled here — before `finalize` resolves any `(adr …)`
+      # against it — and the writer is handed the same answer.
+      ctx.buf.absBase = rv32CodeVa(if ctx.bssOffset > 0: 2 else: 1)
+      finalize(ctx.buf)
+      var code: seq[byte] = newSeq[byte](ctx.buf.data.len)
+      for i in 0 ..< ctx.buf.data.len: code[i] = ctx.buf.data[i]
+      var entryOff = 0
+      if ctx.entrySym != nil:
+        let pos = ctx.buf.getLabelPosition(LabelId(ctx.entrySym.offset))
+        if pos < 0:
+          quit "nifasm: entry point '" & ctx.nameOf(ctx.entrySym.name) &
+               "' has no address"
+        entryOff = pos
+      writeFile(outfile, writeRv32Image(ctx, code, entryOff))
+      when defined(posix):
+        # A hosted image is EXECUTED rather than loaded by a simulator, so it has
+        # to be marked executable — the bare-metal targets never needed this.
+        setFilePermissions(outfile, {fpUserRead, fpUserWrite, fpUserExec,
+                                     fpGroupRead, fpGroupExec,
+                                     fpOthersRead, fpOthersExec})
 
   # Close all foreign-module readers (the main module has no reader).
   for modname, module in ctx.modules.mpairs:

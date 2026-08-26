@@ -1,0 +1,30 @@
+(.nif27)
+(stmts
+ (arch rv32)
+ (proc :addup.0
+  (params
+   (param :a.0 (x10) (i 32))
+   (param :b.0 (x11) (i 32)))
+  (result :ret.0 (x10) (i 32))
+  (clobber (x10) (x11) (x5) (x6) (x1))
+  (stmts
+   (add3 (x10) a.0 b.0)
+   (ret)))
+ (proc :main.0
+  (params)
+  (result :`mret.0 (x10) (i 32))
+  (stmts
+   (var :acc.0 (x18) (i 32))
+   (var :ra.0 (s) (i 32))
+   (sub (sp) (ssize))
+   (swr ra.0 (x1))
+   (prepare addup.0
+    (addi (arg a.0) (x0) 33)
+    (addi (arg b.0) (x0) 9)
+    (call)
+    (add3 acc.0 (res ret.0) (x0)))
+   (lwr (x1) ra.0)
+   (add (sp) (ssize))
+   (add3 (x10) acc.0 (x0))
+   (addi (x17) (x0) 93)
+   (ecall))))
