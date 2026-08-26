@@ -1,6 +1,6 @@
 
 import std / [parseopt, strutils, os]
-import assembler
+import driver
 import image/elf32
 
 const
