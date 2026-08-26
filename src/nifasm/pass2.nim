@@ -316,6 +316,9 @@ proc genInst(n: var Cursor; ctx: var GenContext) =
     genInstNodeA64(n, ctx)
   of Arch.CortexM:
     genInstNodeM(n, ctx)
+  of Arch.Avr:
+    error("the AVR instruction selector is not implemented yet " &
+          "(M2 in doc/internals/avr.md)", n)
 
 proc pass2*(n: Cursor; ctx: var GenContext) =
   ## Pass2: Generate code only for top-level instructions (entry point).

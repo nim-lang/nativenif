@@ -190,6 +190,11 @@ proc hereTarget*(g: CodeGen): IntrinsicTarget {.inline.} =
   of X86: tgX64
   of Arm64: tgA64
   of ThumbM: tgThumbM
+  of Avr:
+    # Unreachable: this is the ARM backend's table, and AVR has its own emitter.
+    # Named rather than folded into an arm with a plausible substitute — a wrong
+    # intrinsic target silently selects a row written for another machine.
+    raiseAssert "arkham: AVR does not reach the Arm intrinsic table"
 
 proc destructive3(g: CodeGen; op: A64Inst): bool {.inline.} =
   ## Ops with no destructive `D op= S` spelling on this target: Thumb-2's

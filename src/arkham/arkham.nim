@@ -33,7 +33,7 @@ Options:
   -o:file, --output:file   output asm-NIF file (default: <input>.asm.nif)
   --os:SYMBOL              target OS: linux | windows | macosx | embedded
                            (default: host)
-  --cpu:SYMBOL             target CPU: amd64 | arm64 | arm32 (default: host)
+  --cpu:SYMBOL             target CPU: amd64 | arm64 | arm32 | avr (default: host)
   --layout:FILE            cortex_m only: the BOARD — its memory regions, which
                            region each section lives in, the stack slots and
                            their thread-local reservation, and the heap. A `(layout …)` NIF tree; see doc/layout.md.
@@ -46,7 +46,9 @@ Options:
 
 Supported --os/--cpu combinations (same symbols as Nimony's flags):
   linux/amd64  windows/amd64  linux/arm64  macosx/arm64  embedded/arm32
-  (embedded/arm32 is bare-metal Cortex-M4; see doc/cortex_m.md)
+  embedded/avr
+  (embedded/arm32 is bare-metal Cortex-M4; see doc/internals/cortex_m.md.
+   embedded/avr is bare-metal avr5; see doc/internals/avr.md)
 """
 
 proc archOf(os, cpu: string): string =
@@ -63,8 +65,9 @@ proc archOf(os, cpu: string): string =
              # table, because next to `arm64` the bare word never says which one
              # it is. `arm` stays accepted for what is already written.
              of "arm32", "arm": "arm32"
+             of "avr": "avr"
              else: quit("arkham: unknown --cpu:" & cpu &
-                        " (supported: amd64, arm64, arm32)", QuitFailure)
+                        " (supported: amd64, arm64, arm32, avr)", QuitFailure)
   let osC = case osN
             of "linux": "linux"
             of "windows": "windows"
@@ -86,10 +89,11 @@ proc archOf(os, cpu: string): string =
   of "linux/arm64": "linux_arm64"
   of "macosx/arm64": "arm64"
   of "embedded/arm32": "cortex_m"
+  of "embedded/avr": "avr"
   else:
     quit("arkham: unsupported --os/--cpu combination: " & osC & "/" & cpuC &
          " (supported: linux/amd64, windows/amd64, linux/arm64, macosx/arm64," &
-         " embedded/arm32)",
+         " embedded/arm32, embedded/avr)",
          QuitFailure)
 
 proc run(input, output, arch: string; board: layout.Layout) =
@@ -105,6 +109,9 @@ proc run(input, output, arch: string; board: layout.Layout) =
              of "linux_arm64", "linux_aarch64": generateA64(buf, input, tags, linux = true)
              of "cortex_m", "cortexm", "thumbm":
                generateM(buf, input, tags, board)
+             of "avr":
+               quit("arkham: the AVR backend is not implemented yet " &
+                    "(M4 in doc/internals/avr.md)", QuitFailure)
              else: quit("arkham: unknown --arch:" & arch, QuitFailure)
   writeFile(output, code)
 

@@ -65,6 +65,7 @@ type
     WinX64     # Windows x86-64 (PE)
     WinA64     # Windows ARM64 (PE)
     CortexM    # Bare-metal ARMv7E-M / Cortex-M4 (ELF32 firmware image, no OS)
+    Avr        # Bare-metal AVR / avr5 (ELF32 firmware image, no OS)
 
   ImportedLib* = object
     name*: string     # Library path (e.g. "/usr/lib/libSystem.B.dylib")

@@ -67,7 +67,14 @@ type
     ## 3-operand ALU, no fixed div or shift-count register — so it groups with
     ## `Arm64` at every one of them. What differs between the two is the word
     ## size and the register file, and both of those are already values.
-    X86, Arm64, ThumbM
+    ##
+    ## `Avr` groups with `X86` at every one of them, and for the reason the user
+    ## of this backend gave: its ALU is destructive and two-operand, so the
+    ## question those branches are really asking — "does the destination have to
+    ## BE one of the sources" — has x86's answer. It parts company only at
+    ## `scratchDemand`, where it answers like the ARM targets because it has no
+    ## store-immediate and no PC-relative data operand either.
+    X86, Arm64, ThumbM, Avr
 
   TargetFeature* = enum
     ## What this target's asm-NIF vocabulary OFFERS. Read as `X in md.caps` in
@@ -508,16 +515,19 @@ proc memToMemBridgeDemand*(md: MachineDesc; dst, v: Location): ScratchDemand =
   if dst.typ.isFloat:
     let fromMem = (case md.arch
                    of X86: v.kind in {NamedStack, Mem}
-                   of Arm64, ThumbM: v.kind in {NamedStack, Mem, Glob})
+                   of Arm64, ThumbM, Avr: v.kind in {NamedStack, Mem, Glob})
     if fromMem: ScratchDemand(fregs: 1) else: ScratchDemand()
   else:
     let needsBridge = (case md.arch
                        of X86: v.kind in {NamedStack, Mem}
-                       of Arm64, ThumbM: v.kind in {NamedStack, Mem, Glob, Tvar, Imm})
+                       of Arm64, ThumbM, Avr:
+                         v.kind in {NamedStack, Mem, Glob, Tvar, Imm})
                        # Cortex-M answers like AArch64 and for the same reasons:
                        # no store-immediate, no PC-relative data operand, so an
                        # immediate, a global and a thread-local each pass through
-                       # a register on the way to a stack home.
+                       # a register on the way to a stack home. AVR is the same
+                       # again — and the ONE branch where it does not follow
+                       # x86-64.
     if needsBridge:
       ScratchDemand(gprs: 1, slot: (if md.arch == X86: v.typ else: dst.typ))
     else:

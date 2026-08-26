@@ -451,6 +451,12 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
                "' has no address"
         entryOff = pos
       writeFile(outfile, writeCortexMImage(ctx, code, entryOff, memMap))
+    of Arch.Avr:
+      # Unreachable while `genInst` refuses the target: no instruction can have
+      # been selected, so there is nothing to write. Named rather than folded
+      # into another arm so that M2 has one place to fill in.
+      quit "nifasm: the AVR image writer is not implemented yet " &
+           "(M2 in doc/internals/avr.md)"
 
   # Close all foreign-module readers (the main module has no reader).
   for modname, module in ctx.modules.mpairs:
