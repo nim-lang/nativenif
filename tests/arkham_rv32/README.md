@@ -15,10 +15,10 @@ here against `x0`..`x30` — see "Rejections, checked by message" below.
 each fixture's exit code against its `.exitcode` file. The quarantine list lives
 in `tester.nim` beside the pass.
 
-## 123 of 130 pass
+## 126 of 130 pass
 
 The pass no longer runs `err_*` fixtures — those must NOT compile, on any target,
-and `rv32RejectionTests` checks them by message instead. Of the seven that remain
+and `rv32RejectionTests` checks them by message instead. Of the four that remain
 quarantined, every one is an explicit REFUSAL. Nothing hangs and nothing computes
 a wrong answer, which is the property worth protecting: a quarantine of refusals
 is a to-do list, and a quarantine of wrong answers is a pile of unfound bugs.
@@ -34,12 +34,6 @@ not the obstacle: arkham has no lowering for them (its two are AArch64's
 `atomicScratch` triple for one — it spent its third bridge. Whoever lowers RV32
 atomics has to reserve three registers explicitly and say so; `checkMachine`
 refuses a partial triple.
-
-**64-bit constants (3).** `a64_logical_imm`, `bitand_imm64`, `overflow_check`. A
-literal wider than 32 bits reaches the selector as a single `(mov reg <imm>)`
-rather than split across the register pair the wide-integer lowering uses
-elsewhere. nifasm refuses it by name, which is the right failure — the fix is
-upstream of it, in the emitter.
 
 ## Rejections, checked by message
 
@@ -69,6 +63,27 @@ stand. Two Cortex-M rejections have no RV32 counterpart for the same reason —
 there is no "assembler's own scratch" pin to refuse (nifasm's `x31` has no asm-NIF
 tag, so a code generator cannot spell it even by mistake), and no callee-saved
 register outside the prologue's saved set.
+
+## The "64-bit constants" group was not about 64-bit values
+
+Three fixtures (`a64_logical_imm`, `bitand_imm64`, `overflow_check`) were parked
+here as "a literal wider than 32 bits is not split across the register pair". It
+was nothing to do with the wide path. Each declares a `(u 32)` local and
+initialises it out of range — `(var :x.0 . (u 32) 9223372036854775807)` — and
+arkham passed the literal through unclamped into `(mov x.0 …)` on a register that
+holds 32 bits.
+
+Both 32-bit back ends were handed the SAME asm-NIF and disagreed about it: the
+Thumb selector truncated with a bare `uint32(…)` conversion, silent only because
+release builds have range checks off, and the RV32 selector refused it by name.
+Neither has the Leng type to decide with. `emit.movImm` does, and clamps there —
+the single place a literal becomes `(mov reg <imm>)`. The wide path is unaffected:
+`wideConstHalf` splits a 64-bit constant before it reaches `movImm`, and each half
+fits by construction.
+
+The emitted code moved on Cortex-M for exactly those three fixtures — the literal
+is now written truncated instead of being truncated later — and all three still
+pass there. Both 64-bit targets are byte-identical, since `wordSize()` is 8.
 
 ## What the corpus found
 

@@ -1081,9 +1081,7 @@ proc rv32AsmTests() =
 
 
 const rv32Quarantine = [
-    "a64_logical_imm", "assembler_m", "atomics",
-    "bitand_imm64", "interrupt_pendsv", "overflow_check",
-    "semihost_writec"]
+    "assembler_m", "atomics", "interrupt_pendsv", "semihost_writec"]
 
   ## Fixtures the RV32 pass does not yet run. Every entry is a NAMED gap, grouped
   ## and argued in tests/arkham_rv32/README.md. A list this long is only tolerable

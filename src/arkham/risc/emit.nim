@@ -187,6 +187,25 @@ proc emOp*(g: CodeGen; r: Reg): string =
   else: "(" & g.ab.renderReg(r) & ")"
 
 proc movImm*(g: var CodeGen; d: Reg; v: int64) =
+  ## THE place a literal becomes `(mov reg <imm>)`, which is why the width clamp
+  ## belongs here and nowhere else.
+  ##
+  ## A register on a 4-byte-word target holds 32 bits, so a literal that fits
+  ## neither reading of one — signed to -2^31, unsigned to 2^32-1 — cannot be
+  ## placed in it. The low 32 bits ARE the value: the front end already typed the
+  ## expression `(u 32)`, and a `(u 32)` initialised with 2^63-1 means what C means
+  ## by it. Arriving here unclamped, the same asm-NIF was accepted by one 32-bit
+  ## back end and refused by the other — nifasm's Thumb selector truncated it with
+  ## a bare `uint32(…)` conversion, which is silent only because release builds
+  ## have range checks off, while the RV32 selector refused it by name. Neither
+  ## back end has the Leng type to decide with; this one does.
+  ##
+  ## Not the 64-bit VALUE path: a wide constant is split by `wideConstHalf`
+  ## before it reaches here, and each half fits by construction.
+  var v = v
+  if wordSize() == 4 and not (v >= low(int32) and v <= high(int32)) and
+     not (v >= 0 and v <= 0xFFFF_FFFF):
+    v = v and 0xFFFF_FFFF
   g.ab.tree MovA64: g.emReg d; g.ab.intLit v
 
 proc movReg*(g: var CodeGen; d, s: Reg) =
