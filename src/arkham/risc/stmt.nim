@@ -576,4 +576,5 @@ proc emitProcBody2*(g: var CodeGen; info: ProcInfo; declarative: bool;
         if g.plan.hasStackVars:
           g.ab.tree AddA64: g.ab.rawReg SP; g.ab.keyword SsizeX
         if g.hasFrame: framePop(g)
-        g.ab.keyword RetA64
+        if g.isInterrupt: g.ab.keyword MretRv
+        else: g.ab.keyword RetA64

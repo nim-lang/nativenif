@@ -15,17 +15,18 @@ here against `x0`..`x30` — see "Rejections, checked by message" below.
 each fixture's exit code against its `.exitcode` file. The quarantine list lives
 in `tester.nim` beside the pass.
 
-## 126 of 130 shared, plus 2 RV32-native
+## 126 of 130 shared, plus 3 RV32-native
 
 The pass no longer runs `err_*` fixtures — those must NOT compile, on any target,
-and `rv32RejectionTests` checks them by message instead. Two of the four still
+and `rv32RejectionTests` checks them by message instead. Three of the four still
 quarantined are Cortex-M's telling of a test this directory now has its own of;
-the other two are genuinely absent features.
+the fourth is a genuinely absent feature.
 
-**Replaced, not missing (2).** `assembler_m` and `semihost_writec` pin Cortex-M
-registers and use a Thumb `bkpt`. `assembler_rv32` and `semihost_writec_rv32`
-here are the same tests told in RV32's register file and instruction set. Both
-targets keep theirs.
+**Replaced, not missing (3).** `assembler_m`, `semihost_writec` and
+`interrupt_pendsv` pin Cortex-M registers, use a Thumb `bkpt`, and name a
+Cortex-M exception. `assembler_rv32`, `semihost_writec_rv32` and
+`interrupt_msip` here are the same tests told in RV32's register file,
+instruction set and trap model. Both targets keep theirs.
 
 **Atomics (1).** `atomics`. RV32's `A` extension has `lr.w`/`sc.w`, so the ISA is
 not the obstacle: arkham has no lowering for them (its two are AArch64's
@@ -33,13 +34,6 @@ not the obstacle: arkham has no lowering for them (its two are AArch64's
 `atomicScratch` triple for one — it spent its third bridge. Whoever lowers RV32
 atomics has to reserve three registers explicitly and say so; `checkMachine`
 refuses a partial triple.
-
-**Interrupts (1).** `interrupt_pendsv`. `rejectForRv32` turns `{.interrupt.}` away
-by name: a RISC-V core reaches its handlers through `mtvec`, which in vectored
-mode holds JUMP INSTRUCTIONS rather than addresses, and the trampoline table that
-builds is outstanding (see `writerv32.nim`). This is the one of the four with no
-fixture to write — the feature has to exist first, and a fixture asserting the
-refusal is already what `rv32Rejections` covers through `err_interrupt_*`.
 
 ## The RV32-native positive fixtures
 
@@ -54,6 +48,38 @@ of a difference agrees with `<` only when the subtraction did not overflow. The
 intrinsic rows say so now, and `armFlagSupported` grew a third arm for it: the
 `{ZfO, NzO}` default was safe but told `cf` it did not exist, which is the wrong
 sentence about a target whose branches ARE comparisons.
+
+`interrupt_msip` pends a machine software interrupt through CLINT and exits with
+what the handler wrote — the same shape as `interrupt_pendsv`, and a different
+mechanism end to end. Three things differ from Cortex-M and each cost a piece of
+the implementation:
+
+ * **The table is code, not addresses.** `mtvec` holds a base plus a two-bit
+   MODE, and in vectored mode cause `c` jumps to `base + 4*c` — one WORD that has
+   to be an INSTRUCTION. So the "vector table" is a run of `j handler`, emitted
+   as an ordinary proc (`runtime.emTrapTableRv`) and pointed at with the same
+   `(adr …)` any other symbol gets. Nothing in the image writer knows about it,
+   which was the point: the alternative — a new image-layout number for the base
+   — would have cost a shared tag id on every target to describe something only
+   this one has, and pushed one more shared tag past 511 into the escape space.
+ * **Nothing is stacked in hardware.** M-profile stacks r0-r3/r12/lr/pc and
+   returns through an EXC_RETURN value in `lr`; a RISC-V trap saves nothing at
+   all. So a handler saves everything a CALL would destroy — `convClobbersGpr`,
+   which is the ABI's own answer and the only description that does not require
+   knowing what the body and the emitter between them happened to touch — and
+   returns with `(mret)`, not `(ret)`. `ret` is `jalr x0, 0(ra)`, and `ra` in a
+   handler holds whatever the interrupted code left there.
+ * **Declaring the handler IS the enable.** A RISC-V core resets with
+   `mstatus.MIE` clear and `mie` empty, so a handler with no CSR writes never
+   runs. Cortex-M's `{.interrupt.}` for a core exception needs no enable at all,
+   so leaving this to the program would be a difference between the targets with
+   nothing in the source to explain it. The reset path sets `mtvec` and enables
+   exactly the causes the module declared; a program wanting finer control clears
+   the bit itself.
+
+An unclaimed cause jumps to a PARK loop rather than falling through. Falling
+through would run the next cause's handler — an unexpected trap silently
+misrouted to code written for something else, and only sometimes.
 
 `semihost_writec_rv32` prints through the RISC-V semihosting protocol. It needed a
 `semihost` intrinsic row of its own rather than `bkpt` with another encoding,

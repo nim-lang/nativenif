@@ -228,3 +228,40 @@ proc regNameRv*(r: Reg): string =
 proc isAllocatableRv*(r: Reg): bool {.inline.} =
   ## Whether arkham may place a value in `r`.
   r notin ReservedRegs
+
+# ── interrupts ───────────────────────────────────────────────────────────────
+# A RISC-V core does not read a table of ADDRESSES the way an M-profile one does.
+# `mtvec` holds a base plus a two-bit MODE, and in vectored mode (mode 1) a trap
+# with cause `c` jumps to `base + 4*c` — one WORD, which has to be an instruction
+# and not a pointer. So this target's "vector table" is a run of `j handler`
+# instructions, built by the image writer, and the slot numbers below are trap
+# CAUSES rather than word indices into a table of addresses.
+#
+# Only the three MACHINE-mode interrupts are named. Supervisor and user modes do
+# not exist in an image that never leaves M-mode, and the EXCEPTION causes (0..15
+# of the non-interrupt half) are a different column of the same table reached
+# through mode 0 — a handler for a misaligned load is a different kind of thing
+# from a handler for a timer, and naming them here would make the two look alike.
+
+const
+  MachineInterrupts*: array[3, tuple[name: string, cause: int]] = [
+    (name: "MachineSoftware", cause: 3),
+    (name: "MachineTimer", cause: 7),
+    (name: "MachineExternal", cause: 11)]
+    ## The three standard M-mode interrupt causes. The names are the ones the
+    ## privileged spec uses, not an abbreviation of them: `MTIP` is the bit, and
+    ## a reader with the spec open is looking at the words.
+
+  InterruptCauseCount* = 16
+    ## How many words the trampoline table has. Sixteen because that is where the
+    ## standard causes stop; a platform-specific interrupt above 15 would extend
+    ## it, and nothing here has one.
+
+proc interruptCauseRv*(name: string): int =
+  ## The trap cause `name` denotes, or -1 if this target has no such interrupt.
+  ## Case-sensitive for the same reason Cortex-M's is: these are the spec's
+  ## spellings, and accepting `machinetimer` invites a house style that differs
+  ## from the document the reader has open.
+  for v in MachineInterrupts:
+    if v.name == name: return v.cause
+  return -1

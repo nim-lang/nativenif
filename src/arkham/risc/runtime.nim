@@ -24,6 +24,7 @@ import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
                     context, typeutil, 
                     mirrors, abi]
 import machine_a64 as machine
+import machine_rv32 as machine_rv32_m
 from machine_m as machine_m import nil
 import emit, value
 
@@ -95,6 +96,69 @@ proc emEnableFpuM*(g: var CodeGen) =
   g.ab.keyword DsbM
   g.ab.keyword IsbM
 
+const TrapTableName* = "`mtvec.0"
+  ## The trampoline table's symbol. Back-quoted like the other runtime shims so it
+  ## cannot collide with a Leng name.
+
+const MstatusMie* = 0x8'i64      ## `mstatus.MIE`: interrupts enabled in M-mode at all
+const CsrMie* = 0x304'i64        ## the per-cause enable register
+const CsrMtvec* = 0x305'i64      ## trap vector base + mode
+const MtvecVectored* = 1'i64     ## mode 1: cause `c` traps to base + 4*c
+
+proc emTrapTableRv*(g: var CodeGen; handlers: seq[(int, string)]) =
+  ## The `mtvec` trampoline table, emitted as ORDINARY CODE under a symbol.
+  ##
+  ## This is where RISC-V and Cortex-M stop resembling each other. An M-profile
+  ## core reads a table of ADDRESSES that the image writer bakes at the flash
+  ## base, and the reset vector is one of its words. A RISC-V core resets to a
+  ## fixed PC, and `mtvec` — written by the code that runs there — holds a base
+  ## plus a two-bit MODE. In vectored mode a trap with cause `c` jumps to
+  ## `base + 4*c`, so each entry is one WORD that has to be an INSTRUCTION.
+  ##
+  ## A table of jumps is therefore just code, which is why nothing in the image
+  ## writer knows about this: it is emitted like any other proc, and the reset
+  ## path takes its address with the same `(adr …)` any other symbol gets. The
+  ## alternative — a new image-layout number for the base — would have cost a
+  ## shared tag id on every target to describe something only this one has.
+  ##
+  ## Sixteen entries, one per standard cause, and every cause the module did not
+  ## claim jumps to a PARK loop rather than falling through. Falling through would
+  ## run the next cause's handler, which is the worst available answer: an
+  ## unexpected trap would be silently misrouted to a handler written for
+  ## something else, and only sometimes.
+  g.ab.tree NifasmDecl.ProcD:
+    g.ab.symDef TrapTableName
+    g.ab.tree NifasmDecl.ParamsD: discard
+    g.ab.tree StmtsA64:
+      let park = g.freshLabel()
+      for cause in 0 ..< machine_rv32_m.InterruptCauseCount:
+        var target = park
+        for (c, nm) in handlers:
+          if c == cause: target = nm
+        g.emBr(BA64, target)
+      g.emLab(park)
+      g.emBr(BA64, park)             # an unclaimed trap stops here, visibly
+
+proc emEnableInterruptsRv*(g: var CodeGen; causes: set[uint8]) =
+  ## Point `mtvec` at the table and enable exactly the causes the module declared.
+  ##
+  ## Enabling is done HERE, at reset, and not left to the program, because on this
+  ## target the two halves of "this handler runs" are a CSR write and a pragma,
+  ## and only one of them is visible in the source. Cortex-M's `{.interrupt.}` for
+  ## a core exception needs no enable at all — PendSV is pended and taken — so a
+  ## handler that never ran would be a difference between the targets with nothing
+  ## in the program to explain it. Declaring the handler IS the enable; a program
+  ## that wants finer control clears the bit itself.
+  g.ab.tree AdrA64: (g.ab.rawReg g.argReg(0); g.ab.sym TrapTableName)
+  g.ab.tree OrrA64: (g.ab.rawReg g.argReg(0); g.ab.intLit MtvecVectored)
+  g.ab.tree CsrwRv: (g.ab.intLit CsrMtvec; g.ab.rawReg g.argReg(0))
+  var mie = 0'i64
+  for c in causes: mie = mie or (1'i64 shl int(c))
+  g.ab.tree MovA64: (g.ab.rawReg g.argReg(0); g.ab.intLit mie)
+  g.ab.tree CsrsRv: (g.ab.intLit CsrMie; g.ab.rawReg g.argReg(0))
+  g.ab.tree MovA64: (g.ab.rawReg g.argReg(0); g.ab.intLit MstatusMie)
+  g.ab.tree CsrsRv: (g.ab.intLit CsrMstatus; g.ab.rawReg g.argReg(0))
+
 proc emResetPathRv*(g: var CodeGen; stackTop: int64) =
   ## What a RISC-V core does NOT do for an image, in the order it must be done.
   ##
@@ -112,6 +176,8 @@ proc emResetPathRv*(g: var CodeGen; stackTop: int64) =
   g.ab.tree MovA64: (g.ab.rawReg SP; g.ab.intLit stackTop)
   g.ab.tree MovA64: (g.ab.rawReg g.argReg(0); g.ab.intLit MstatusFsDirty)
   g.ab.tree CsrsRv: (g.ab.intLit CsrMstatus; g.ab.rawReg g.argReg(0))
+  if g.rvIrqCauses != {}: g.emEnableInterruptsRv(g.rvIrqCauses)
+
 
 proc emStartupInitM*(g: var CodeGen) =
   ## The reset handler's first duty: give SRAM the contents the program expects

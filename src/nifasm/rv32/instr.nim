@@ -911,6 +911,9 @@ proc genInstRv(n: var Cursor; ctx: var GenContext) =
       let r = toRegRv(ctx, src, n)
       if instTag == CsrwRv: rv.emitCsrw(ctx.buf.data, int32(csrOp.immVal), r)
       else: rv.emitCsrs(ctx.buf.data, int32(csrOp.immVal), r)
+  of MretRv:
+    inc n
+    rv.emitMret(ctx.buf.data)
   of RetRv:
     inc n
     rv.emitRet(ctx.buf.data)

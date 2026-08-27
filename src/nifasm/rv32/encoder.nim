@@ -407,6 +407,16 @@ proc emitEcall*(dest: var Bytes) =
 proc emitEbreak*(dest: var Bytes) =
   dest.word encI(OpSystem, 0, rn(X0), rn(X0), 1)
 
+proc emitMret*(dest: var Bytes) =
+  ## `mret` — return from a machine-mode trap. `SYSTEM` with funct12 = 0x302 and
+  ## every register field zero, i.e. the whole word is 0x30200073.
+  ##
+  ## It restores the privilege the trap interrupted from `mstatus.MPP`, restores
+  ## the interrupt-enable bit it saved in `mstatus.MPIE`, and jumps to `mepc`.
+  ## None of that is what `ret` does: `ret` is `jalr x0, 0(ra)`, and `ra` in a
+  ## handler holds whatever the interrupted code happened to leave there.
+  dest.word encI(OpSystem, 0, rn(X0), rn(X0), 0x302)
+
 proc emitSemihostCall*(dest: var Bytes) =
   ## The RISC-V semihosting sequence: `slli x0,x0,0x1f` / `ebreak` / `srai x0,x0,7`.
   ##

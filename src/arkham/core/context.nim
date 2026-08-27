@@ -289,6 +289,22 @@ type
                                         ## back, with the label of what asked for each
       stagingPeak*: int                 ## the most that were ever live AT ONCE in this proc
       stagingPeakWhat*: string          ## and which labels those were — the SHAPE to reserve for
+    rvIrqCauses*: set[uint8]                 ## RV32: the trap causes this module declared
+                                             ## a handler for. The reset path enables
+                                             ## exactly these in `mie` — see
+                                             ## `runtime.emEnableInterruptsRv` for why
+                                             ## declaring the handler IS the enable.
+    isInterrupt*: bool                       ## the proc being emitted is an
+                                             ## `{.interrupt.}` handler. On RV32 that
+                                             ## changes both ends of the frame: nothing
+                                             ## stacks registers for it in hardware, so
+                                             ## everything a CALL would destroy has to be
+                                             ## saved by the handler itself, and it
+                                             ## returns with `mret` rather than `ret`.
+                                             ## Cortex-M needs neither — M-profile stacks
+                                             ## r0-r3/r12/lr/pc and `bx lr` on an
+                                             ## EXC_RETURN value unwinds that — which is
+                                             ## why the flag has no effect there.
     curProcName*: string                     ## the proc currently being emitted. arkham's input
                                              ## carries no line info, so a bare register-pressure
                                              ## or typing assert names nothing actionable; this

@@ -1085,12 +1085,10 @@ const rv32Quarantine = [
     # deleted: each is the other target's telling of the same story, and both
     # targets should keep theirs. See `tests/arkham_rv32/assembler_rv32` and
     # `semihost_writec_rv32`.
-    "assembler_m", "semihost_writec",
-    # Genuinely absent, both named in tests/arkham_rv32/README.md: RV32 has no
-    # LL/SC lowering and reserves no `atomicScratch` triple for one, and it
-    # refuses `{.interrupt.}` outright because the `mtvec` trampoline table a
-    # RISC-V core reaches its handlers through is not built yet.
-    "atomics", "interrupt_pendsv"]
+    "assembler_m", "semihost_writec", "interrupt_pendsv",
+    # Genuinely absent, and named in tests/arkham_rv32/README.md: RV32 has no
+    # LL/SC lowering, and reserves no `atomicScratch` triple for one.
+    "atomics"]
 
   ## Fixtures the RV32 pass does not yet run. Every entry is a NAMED gap, grouped
   ## and argued in tests/arkham_rv32/README.md. A list this long is only tolerable
@@ -1114,16 +1112,6 @@ const rv32Rejections: seq[(string, string)] = @[
   # that a body names ONE machine, so the useful answer says which names this one
   # has — and on RV32 those are `x5`..`x7`, `x10`..`x30`.
   ("err_asm_foreign_reg", "is not a RV32 general-purpose register"),
-  # ── `rejectForRv32` ────────────────────────────────────────────────────────
-  # These two are NOT testing what they test on Cortex-M (an unknown interrupt
-  # name; two handlers on one entry). RV32 refuses the pragma outright, before
-  # either question is reachable, so what they cover here is `rejectForRv32` — the
-  # one path that turns away a whole feature by name at the declaration. That is
-  # worth a test precisely because nothing else exercises it, and when RV32 grows
-  # an `mtvec` trampoline table both of these will start failing, which is the
-  # right moment to give them their real expectations.
-  ("err_interrupt_unknown", "is not supported yet"),
-  ("err_interrupt_dup", "is not supported yet"),
 ]
 
 const rv32OwnRejections: seq[(string, string)] = @[
@@ -1150,6 +1138,12 @@ const rv32OwnRejections: seq[(string, string)] = @[
   ("err_asm_abi_reg", "reserved by the RISC-V ABI"),
   ("err_asm_frame_reg", "is the ABI's frame pointer"),
   ("err_asm_link_reg", "is the link register (`ra`)"),
+  # The two interrupt rejections, in RV32's own vocabulary. They used to sit in
+  # the list above asserting "is not supported yet" — the whole feature refused by
+  # name — and became these the moment the trampoline table existed, which is
+  # exactly the moment that entry said to revisit them.
+  ("err_interrupt_unknown", "is not an interrupt of this target"),
+  ("err_interrupt_dup", "a table word holds one jump"),
 ]
 
 proc rv32RejectionTests() =

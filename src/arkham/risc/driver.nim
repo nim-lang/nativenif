@@ -116,6 +116,7 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   g.noFoldPos = -1
   g.curProcName = info.asmName            # names the proc in this backend's diagnostics
   g.helperCalls = false
+  g.isInterrupt = info.irqName.len > 0 and g.md.arch == Rv32
   when defined(arkhamBridgeDbg):
     dbgPeakBridges = 0
     dbgPeakHeldAtRecursion = 0
@@ -364,12 +365,46 @@ proc rejectForRv32(g: var CodeGen) =
   ## single-precision) and a good deal besides; RV32IMAFD has both precisions,
   ## hardware divide, and atomics that carry their own ordering, so the list is
   ## what the ISA genuinely lacks rather than what the backend has not reached.
+  discard
+
+proc rv32InterruptTable(g: var CodeGen) =
+  ## `(interrupts (irq <cause> <handler>)*)` for RV32 — the same declaration
+  ## Cortex-M emits, carrying a different number.
+  ##
+  ## The slot is a trap CAUSE here, not a word index into a table of addresses:
+  ## `mtvec` in vectored mode sends cause `c` to `base + 4*c`, and a word there
+  ## has to be an INSTRUCTION. Which name denotes which cause stays a machine
+  ## model question (`machine_rv32.interruptCauseRv`), exactly as it is on
+  ## Cortex-M, so the name is resolved here and never reaches nifasm.
+  var handlers: seq[(int, string)] = @[]
   for info in g.prog.procs:
-    if info.irqName.len > 0:
-      quit "arkham rv32: `{.interrupt: \"" & info.irqName & "\".}` is not " &
-           "supported yet — a RISC-V core reaches its handlers through `mtvec`, " &
-           "which holds JUMPS rather than addresses, and the trampoline table " &
-           "that builds is outstanding."
+    if info.irqName.len == 0: continue
+    let cause = machine_rv32.interruptCauseRv(info.irqName)
+    if cause < 0:
+      quit "arkham rv32: `" & info.irqName & "` is not an interrupt of this " &
+           "target. Expected one of MachineSoftware, MachineTimer or " &
+           "MachineExternal — the three M-mode interrupts of the privileged " &
+           "spec. Supervisor and user modes do not exist in an image that never " &
+           "leaves M-mode, and an EXCEPTION (a misaligned load, an illegal " &
+           "instruction) is reached through mtvec's other mode, not this table."
+    for (c, other) in handlers:
+      if c == cause:
+        quit "arkham rv32: interrupt `" & info.irqName & "` is claimed by both " &
+             other & " and " & info.asmName &
+             " — a table word holds one jump."
+    handlers.add (cause, info.asmName)
+  if handlers.len > 0:
+    # The declaration is what makes nifasm mark each handler USED: nothing CALLS
+    # one, so the reachability walk would otherwise drop it and leave the table
+    # jumping at a proc that was never emitted. Its Cortex-M meaning — build a
+    # table of addresses — does not apply here and `writeRv32Image` ignores it.
+    g.ab.tree NifasmDecl.InterruptsD:
+      for (cause, nm) in handlers:
+        g.ab.tree NifasmDecl.IrqD:
+          g.ab.intLit int64(cause)
+          g.ab.sym nm
+    g.emTrapTableRv(handlers)
+    for (cause, _) in handlers: g.rvIrqCauses.incl uint8(cause)
 
 proc generateRv32*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                    board = layout.Layout()): string =
@@ -418,6 +453,7 @@ proc generateRv32*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       g.ab.close()
     for sp in g.prog.syscalls:            # semihosting shims, called like any proc
       g.emitSemihostRuntime(sp)
+    g.rv32InterruptTable()                # before the bodies only so it reads first
     for info in g.prog.procs:
       genProc2(g, info)
     if g.needsUDiv64: g.emitUDivMod64()

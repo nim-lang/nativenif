@@ -318,6 +318,15 @@ proc computeFrame*(g: var CodeGen; hasCall: bool) =
     # walking off the end of an odd-length list.
     for r in g.md.abiCalleeSaved:
       if r notin g.frameRegs: (g.frameRegs.add r; break)
+  if g.isInterrupt:
+    # A trap arrives on top of arbitrary code and NOTHING was stacked for it, so
+    # what an ordinary proc may destroy freely is exactly what a handler may not.
+    # `convClobbersGpr` is that set — the ABI's own answer to "what does a call
+    # destroy" — and saving all of it is the only description that does not
+    # require knowing which registers the body and the emitter between them
+    # happened to touch. `linkReg` is already word 0 of the block.
+    for r in g.md.convClobbersGpr:
+      if r != g.md.linkReg and r notin g.frameRegs: g.frameRegs.add r
   g.frameFRegs = @[]
   for f in g.md.floatCalleeSaved:
     if f in g.plan.usedCalleeF: g.frameFRegs.add f
