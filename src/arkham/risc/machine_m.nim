@@ -59,6 +59,28 @@ const
     ## available: producing into a spilled slot, the re-representation of a cast
     ## whose value came back in memory, and the aggregate copy under total
     ## register exhaustion.
+    ##
+    ## NOT SPENDABLE, unlike RV32's third — measured twice, and each measurement
+    ## is enough on its own. RV32 gave its third back to the allocator once
+    ## `AggrEnd` tiering dropped `EmitterBridgeDemand` to two; the same move here
+    ## fails for two reasons this file's own shape explains.
+    ##
+    ##  * **`r8` is CALLEE-saved under AAPCS32, where RV32's `t3` is caller-saved.**
+    ##    So it could only join `IntCalleeSaved`, and every use costs a prologue
+    ##    save and an epilogue restore rather than nothing. Tried: the corpus came
+    ##    out 761 lines LONGER with exactly as many spills (129 either way). The
+    ##    scarce class is real; a fifth home in it is not worth what the frame
+    ##    charges.
+    ##  * **`IntTempRegs` is EMPTY here.** That is the deeper one. On every other
+    ##    target a transient that cannot get a bridge falls back to a volatile
+    ##    (`pickStagingA64`), and RV32 has four; this target has none, so a bridge
+    ##    is the ONLY answer and compositions run three deep. Reserving two and
+    ##    moving `r8` to `atomicScratch` alone breaks `addr_chain_depth` at once —
+    ##    two bridges held by an enclosing step and a third genuinely needed.
+    ##
+    ## So the reservation here has to cover a step's own demand PLUS what a
+    ## composition holds, where a target with a temp pool only has to cover the
+    ## first. `bridgeRegs` lists all three deliberately.
 
   IndirectResultReg* = R9
     ## Where a caller leaves `&result` for a callee returning an aggregate too

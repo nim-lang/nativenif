@@ -477,31 +477,47 @@ finding — the same thing `StagingFloor` says about `k=1` on x86-64 — and the
 is now named: the pools must offer at least `EmitterBridgeDemand` registers, so
 `rv32StressLevel` is 2. Verified at k=2,3,4,6,8 and unstressed, 122/122 at every one.
 
-**Not spendable on either Arm target, and `checkMachine` is what says so.** The
-guess here was that Cortex-M's `r8` would go the same way as RV32's `t3` — and it
-would matter more there, where `intCalleeSaved` is four registers and the file
-calls that "thin, and deliberately so". It does not go the same way. Moving `r8`
-into `intCalleeSaved` is refused before a single instruction is emitted:
+**Not spendable on either Arm target — and the reasons are different.** The guess
+was that Cortex-M's `r8` would go the same way as RV32's `t3`, and it would matter
+more there, where `intCalleeSaved` is four registers and the file calls that "thin,
+and deliberately so". Both parts turned out wrong, each for a measured reason.
 
-    machine Cortex-M allocates R8, which its atomic sequences claim for the
-    whole retry loop
+AArch64's `x16` is the third leg of its `ldaxr`/`stlxr` triple, so spending it
+means finding the atomic another register, and AArch64 is not short of them —
+there is nothing to buy.
 
-`r8` is the third leg of the `ldrex`/`strex` triple, exactly as `x16` is of
-AArch64's `ldaxr`/`stlxr`. RV32 could spend its third precisely *because* it has
-no load-reserved/store-conditional lowering — `atomicScratch` there is all
-`NoReg`. So the rule is not "the third bridge is slack now that no step holds
-three"; it is **the third register belongs to whichever claim is larger, and on a
-target with LL/SC that claim is the atomic triple, not the emitter's staging.**
+Cortex-M's `r8` is the third leg of `ldrex`/`strex` too, and RV32 showed how that
+part can be answered: give atomics a register that is reserved but idle. RV32's
+`atomicScratch` is the two bridges plus `x8`, the ABI frame pointer this backend
+never establishes, so its triple cost no allocatable register at all. Cortex-M has
+no such register: `r9` carries `&result` and is live across argument evaluation
+(the caller stages it BEFORE `emitCall2`, so `f(atomicLoad(p))` would destroy it),
+`r12` is nifasm's own scratch, and `r13`–`r15` are architectural.
 
-Whether an atomic could instead take its third from `intCalleeSaved` and let the
-prologue save it — free in every proc that has no atomics — is a real question
-with an answer already written down two files away: *every one of the dedicated
-registers exists because the emitter needs a register it can ALWAYS take, and a
-"usually free" register is worth nothing to a path that must be total.* That
-trade buys one register and sells the property the whole reservation exists for.
+But two independent measurements say not to bother even if one were found:
+
+ * **`r8` is CALLEE-saved under AAPCS32, where RV32's `t3` is caller-saved.** It
+   could only join `intCalleeSaved`, so every use costs a prologue save and an
+   epilogue restore rather than nothing. Tried: **761 lines longer** across both
+   corpora, with exactly as many spills (129 either way). RV32's `t3` went back to
+   `IntTempRegs` and cost nothing to use — that difference, not the register count,
+   is why the same move pays there and not here.
+ * **`intTempRegs` is EMPTY on Cortex-M.** The deeper one. Everywhere else a
+   transient that cannot get a bridge falls back to a volatile
+   (`pickStagingA64`) — RV32 has four — and here there are none, so a bridge is the
+   only answer and compositions run three deep. Reserving two breaks
+   `addr_chain_depth` immediately: two bridges held by an enclosing step and a
+   third genuinely needed.
+
+So the rule is not "the third register belongs to whichever claim is larger". It
+is that **a target with no temp pool must reserve a step's own demand PLUS what a
+composition holds**, where a target with one only has to cover the first. That is
+the same asymmetry `tightCompositions` measures on x86-64, seen from the other
+end: x86-64 has so many opportunistic volatiles that one guaranteed register
+suffices, and Cortex-M has none at all.
 
 This is what making `atomicScratch` its own field bought, one section up: the
-question stopped needing an argument and became a check.
+question stopped needing an argument and became a measurement.
 
 The emitted code changed, as this kind of fix must: 21 of 814 files, all of them
 Arm/RISC aggregate copies, **327 lines shorter**, with x86-64 byte-identical. The
