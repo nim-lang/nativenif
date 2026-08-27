@@ -1085,15 +1085,14 @@ const rv32Quarantine = [
     # deleted: each is the other target's telling of the same story, and both
     # targets should keep theirs. See `tests/arkham_rv32/assembler_rv32` and
     # `semihost_writec_rv32`.
-    "assembler_m", "semihost_writec", "interrupt_pendsv",
-    # Genuinely absent, and named in tests/arkham_rv32/README.md: RV32 has no
-    # LL/SC lowering, and reserves no `atomicScratch` triple for one.
-    "atomics"]
+    "assembler_m", "semihost_writec", "interrupt_pendsv", "atomics"]
 
-  ## Fixtures the RV32 pass does not yet run. Every entry is a NAMED gap, grouped
-  ## and argued in tests/arkham_rv32/README.md. A list this long is only tolerable
-  ## because it is explained; when an entry stops needing an explanation it should
-  ## stop being an entry.
+  ## Cortex-M fixtures the RV32 pass does not run, because this directory has its
+  ## own version of each: `assembler_rv32`, `semihost_writec_rv32`,
+  ## `interrupt_msip`, `atomics_rv32`. Every one of the four is a test whose
+  ## content IS the machine — a register name, a breakpoint encoding, a trap
+  ## model, an access width — so a shared fixture could only ever have tested one
+  ## of the two targets. Argued in tests/arkham_rv32/README.md.
 
 const rv32Rejections: seq[(string, string)] = @[
   # The `err_*` fixtures of `tests/arkham_m/`, judged by what RV32 says rather
@@ -1144,6 +1143,11 @@ const rv32OwnRejections: seq[(string, string)] = @[
   # exactly the moment that entry said to revisit them.
   ("err_interrupt_unknown", "is not an interrupt of this target"),
   ("err_interrupt_dup", "a table word holds one jump"),
+  # The width RV32 cannot do. `lr.w`/`sc.w` are the whole A extension on this XLEN
+  # — no byte, halfword or doubleword form — so the one refusal this target owes
+  # that the others do not is at the OTHER end of the range from Cortex-M's, which
+  # turns away 64 bits for want of `ldrexd`.
+  ("err_atomic_narrow", "no byte, halfword or doubleword form"),
 ]
 
 proc rv32RejectionTests() =

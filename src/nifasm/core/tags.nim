@@ -573,6 +573,8 @@ type
     CsrwTagId
     CsrsTagId
     MretTagId
+    LrwTagId
+    ScwTagId
     SemihostTagId
 const
   TagData*: array[TagEnum, (string, int)] = [
@@ -1147,5 +1149,7 @@ const
     ("csrw", 568),
     ("csrs", 569),
     ("mret", 570),
-    ("semihost", 571)
+    ("lrw", 571),
+    ("scw", 572),
+    ("semihost", 573)
   ]

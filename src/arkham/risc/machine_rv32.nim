@@ -162,13 +162,23 @@ const
     indirectResultReg: IndirectResultReg,
     produceBridge: ProduceBridge,
     bridgeRegs: @BridgeRegs,
-    atomicScratch: [NoReg, NoReg, NoReg],
-      # No LL/SC triple. RV32 reserves two bridges (see `ProduceBridge`), and an
-      # `lr.w`/`sc.w` retry loop needs THREE registers held across instructions the
-      # allocator knows nothing about — so the day RV32 atomics are lowered, this
-      # target has to reserve them explicitly rather than borrow the bridges.
-      # `emitAtomicInstr2` refuses by name meanwhile, and `checkMachine` refuses a
-      # partial triple.
+    atomicScratch: [IntBridgeRegs[0], IntBridgeRegs[1], R8],
+      # The LL/SC triple: `old`, `new`/`expected`, and the store STATUS, all held
+      # across a retry loop the allocator knows nothing about.
+      #
+      # The two bridges plus `x8`. `x8` is `s0`, the ABI's frame pointer, and this
+      # file already keeps it off every pool — so making it the third costs no
+      # allocatable register at all, which is why spending the third BRIDGE
+      # (`ProduceBridge`) did not have to be undone to get atomics. What it does
+      # cost is stated rather than hidden: a proc containing an atomic no longer
+      # leaves `s0` intact, so a debugger walking frames through that proc loses
+      # the convention this file otherwise preserves for it. Nothing arkham emits
+      # establishes an `s0` frame chain, so nothing generated is affected.
+      #
+      # Not `x1`/`x9`: `ra` is live to the epilogue in a frameless leaf, and `x9`
+      # carries `&result` across the body of an aggregate-returning proc. Not
+      # `gp`/`tp` either — this image establishes neither, but a proc that
+      # clobbered one would break any object linked in that does.
     floatBridgeReg: FloatBridgeReg,
     memIntrinScratch: [R13, R14, R15],
     caps: {Float64, Freestanding, AcqRelExclusives, TwoAddrForms},

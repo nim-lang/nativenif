@@ -15,25 +15,19 @@ here against `x0`..`x30` — see "Rejections, checked by message" below.
 each fixture's exit code against its `.exitcode` file. The quarantine list lives
 in `tester.nim` beside the pass.
 
-## 126 of 130 shared, plus 3 RV32-native
+## 126 of 130 shared, plus 4 RV32-native — and nothing left unsupported
 
 The pass no longer runs `err_*` fixtures — those must NOT compile, on any target,
-and `rv32RejectionTests` checks them by message instead. Three of the four still
-quarantined are Cortex-M's telling of a test this directory now has its own of;
-the fourth is a genuinely absent feature.
+and `rv32RejectionTests` checks them by message instead. All four remaining
+quarantine entries are now Cortex-M's telling of a test this directory has its own
+of. **There is no longer an entry standing for a missing feature.**
 
-**Replaced, not missing (3).** `assembler_m`, `semihost_writec` and
-`interrupt_pendsv` pin Cortex-M registers, use a Thumb `bkpt`, and name a
-Cortex-M exception. `assembler_rv32`, `semihost_writec_rv32` and
-`interrupt_msip` here are the same tests told in RV32's register file,
-instruction set and trap model. Both targets keep theirs.
-
-**Atomics (1).** `atomics`. RV32's `A` extension has `lr.w`/`sc.w`, so the ISA is
-not the obstacle: arkham has no lowering for them (its two are AArch64's
-`ldaxr`/`stlxr` and ARMv7-M's `ldrex`/`strex`), and this target reserves no
-`atomicScratch` triple for one — it spent its third bridge. Whoever lowers RV32
-atomics has to reserve three registers explicitly and say so; `checkMachine`
-refuses a partial triple.
+`assembler_m`, `semihost_writec`, `interrupt_pendsv` and `atomics` pin Cortex-M
+registers, use a Thumb `bkpt`, name a Cortex-M exception, and take a BYTE atomic.
+`assembler_rv32`, `semihost_writec_rv32`, `interrupt_msip` and `atomics_rv32` are
+the same tests in RV32's register file, instruction set, trap model and access
+widths. Each is a test whose content IS the machine, so a shared fixture could
+only ever have tested one of the two targets.
 
 ## The RV32-native positive fixtures
 
@@ -48,6 +42,30 @@ of a difference agrees with `<` only when the subtraction did not overflow. The
 intrinsic rows say so now, and `armFlagSupported` grew a third arm for it: the
 `{ZfO, NzO}` default was safe but told `cf` it did not exist, which is the wrong
 sentence about a target whose branches ARE comparisons.
+
+`atomics_rv32` is the shared `atomics` fixture with its byte cell removed, and it
+exits 104 on RV32, Cortex-M and linux_arm64 alike — which is the check worth
+having, since the value is a chain of nine atomic results and agreement across
+three lowerings is not something a single target can fake.
+
+The byte is the one thing RV32 cannot do: `lr.w`/`sc.w` are the whole A extension
+at this XLEN, with no byte, halfword or doubleword form. Widening a byte cell to
+the word it sits in would make the access a read-modify-write of its three
+neighbours, which is not the atom that was asked for, so it is refused by name
+(`err_atomic_narrow`). Cortex-M owes the mirror-image refusal at the other end of
+the range, for want of `ldrexd`.
+
+Two decisions worth recording. `(lrw …)`/`(scw …)` are RV32's OWN rows rather
+than a second enum on AArch64's `(ldaxr …)`/`(stlxr …)`: those four are
+`A64Inst`-only, so naming them twice lifts them out of the generator's late block
+and shifts every shared tag id after them — the cost `doc/instructions.md` warned
+about, and the same one that sent the `mtvec` base back to being ordinary code.
+And the scratch triple is the two staging bridges plus `x8`, which this file
+already kept off every pool: making it the third costs **no allocatable register
+at all**, so spending the third BRIDGE did not have to be undone to get atomics.
+What it costs is that a proc containing an atomic no longer leaves `s0` intact
+for a debugger's frame walk — stated rather than hidden, and nothing arkham emits
+establishes an `s0` chain anyway.
 
 `interrupt_msip` pends a machine software interrupt through CLINT and exits with
 what the handler wrote — the same shape as `interrupt_pendsv`, and a different

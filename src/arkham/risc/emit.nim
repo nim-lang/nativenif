@@ -1691,6 +1691,74 @@ proc emitAtomicRmw2*(g: var CodeGen; dst, p, v: Reg; opStr: string;
               &"(stlxr {st} {neu} {pS}{w}) (cmp {st} 0) (beq {lDone}))) (lab :{lDone})"
   g.movReg(dst, g.md.atomicScratch[if returnNew: 1 else: 0])
 
+proc emitAtomicRmwRv*(g: var CodeGen; dst, p, v: Reg; opTag: RiscInst;
+                     isXchg, returnNew: bool) =
+  ## `loop: lr.w old,(p); new = old op v (or v); sc.w st,new,(p); cmp st,0;
+  ## beq done` — a non-zero status means the reservation was lost, so the loop
+  ## falls through to nifasm's internal back-edge and re-reads.
+  ##
+  ## Structurally the Cortex-M twin, and deliberately so: `ldrex`/`strex` and
+  ## `lr.w`/`sc.w` are the same instruction pair with different names, down to
+  ## the status register's sense (zero is success on both). What differs is the
+  ## ORDERING — RISC-V carries it in the `aq`/`rl` bits of the pair, which is what
+  ## `AcqRelExclusives` names, so no fence is emitted around the loop.
+  ##
+  ## Word-only. RV32's A extension has `lr.w`/`sc.w` and no byte or halfword form
+  ## at all, so a narrower atomic is refused by name before reaching here rather
+  ## than widened — a byte cell widened to a word is a read-modify-write of the
+  ## three neighbours it shares the word with.
+  let old = g.md.atomicScratch[0]
+  let neu = g.md.atomicScratch[1]
+  let st = g.md.atomicScratch[2]
+  let lDone = g.freshLabel()
+  g.emitLoop:
+    g.ab.tree LrwRv: (g.emReg old; g.emReg p)
+    if isXchg:
+      g.ab.tree MovA64: (g.emReg neu; g.emReg v)
+    else:
+      g.ab.tree MovA64: (g.emReg neu; g.emReg old)
+      g.ab.tree opTag: (g.emReg neu; g.emReg v)
+    g.ab.tree ScwRv: (g.emReg st; g.emReg neu; g.emReg p)
+    g.ab.tree CmpA64: (g.emReg st; g.ab.intLit 0)
+    g.emBr(BeqA64, lDone)
+  g.emLab(lDone)
+  g.movReg(dst, if returnNew: neu else: old)
+
+proc emitAtomicCasRv*(g: var CodeGen; ret, p, ep, d: Reg) =
+  ## Compare-and-exchange. `ep` points at the EXPECTED value and the failure path
+  ## must publish what was actually there — that is the protocol, not a detail:
+  ## the caller retries against the value it now holds.
+  ##
+  ## No `clrex` on the failure path. AArch64 and ARMv7-M both have to abandon the
+  ## claim their exclusive load took; on RISC-V a reservation is broken implicitly
+  ## — by any `sc.w`, by a trap, and in the worst case by the next `lr.w` — so
+  ## there is no instruction to emit and nothing left holding a line.
+  let exp = g.md.atomicScratch[0]
+  let old = g.md.atomicScratch[1]
+  let st = g.md.atomicScratch[2]
+  let lSucc = g.freshLabel()
+  let lFail = g.freshLabel()
+  let lDone = g.freshLabel()
+  g.ab.tree MovA64:
+    g.emReg exp
+    g.ab.tree MemX: (g.emReg ep; g.ab.intLit 0)
+  g.emitLoop:
+    g.ab.tree LrwRv: (g.emReg old; g.emReg p)
+    g.ab.tree CmpA64: (g.emReg old; g.emReg exp)
+    g.emBr(BneA64, lFail)
+    g.ab.tree ScwRv: (g.emReg st; g.emReg d; g.emReg p)
+    g.ab.tree CmpA64: (g.emReg st; g.ab.intLit 0)
+    g.emBr(BeqA64, lSucc)
+  g.emLab(lSucc)
+  g.movImm(ret, 1)
+  g.emBr(BA64, lDone)
+  g.emLab(lFail)
+  g.ab.tree MovA64:
+    g.ab.tree MemX: (g.emReg ep; g.ab.intLit 0)
+    g.emReg old
+  g.movImm(ret, 0)
+  g.emLab(lDone)
+
 proc emAtomicLoadM*(g: var CodeGen; dst, p: Reg; bits: int) =
   ## `dst ← the bits-wide cell at [p]`, zero-extended. Not an exclusive load:
   ## nothing is claimed, because nothing is going to be stored back.

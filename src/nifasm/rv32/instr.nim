@@ -911,6 +911,26 @@ proc genInstRv(n: var Cursor; ctx: var GenContext) =
       let r = toRegRv(ctx, src, n)
       if instTag == CsrwRv: rv.emitCsrw(ctx.buf.data, int32(csrOp.immVal), r)
       else: rv.emitCsrs(ctx.buf.data, int32(csrOp.immVal), r)
+  of LrwRv:
+    # `(lrw D S)` → `lr.w D, (S)`. `S` is an ADDRESS in a register; there is no
+    # offset form, which is why nothing here parses a `(mem …)`.
+    inc n
+    let d = parseDestRv(n, ctx)
+    let a = parseOperandRv(n, ctx)
+    rv.emitLrW(ctx.buf.data, toRegRv(ctx, d, n), toRegRv(ctx, a, n))
+  of ScwRv:
+    # `(scw St D S)` → `sc.w St, D, (S)`. `St` is the DESTINATION — zero on
+    # success — so it is parsed first and must differ from `D`, which is read.
+    inc n
+    let st = parseDestRv(n, ctx)
+    let d = parseOperandRv(n, ctx)
+    let a = parseOperandRv(n, ctx)
+    let (stR, dR, aR) = (toRegRv(ctx, st, n), toRegRv(ctx, d, n), toRegRv(ctx, a, n))
+    if stR == dR:
+      error("RV32: `sc.w`'s status and value registers must differ — the status " &
+            "is written and the value is read by the same instruction", n)
+    else:
+      rv.emitScW(ctx.buf.data, stR, aR, dR)
   of MretRv:
     inc n
     rv.emitMret(ctx.buf.data)

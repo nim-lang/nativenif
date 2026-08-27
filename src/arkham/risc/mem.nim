@@ -241,6 +241,69 @@ proc ensureFAccum2*(g: var CodeGen; resF: FReg; loc: Location; bits: int) =
   of NamedStack: g.emFloatScalarLoad(resF, loc.name, bits)
   else: raiseAssert "arkham a64n: float accumulator source " & $loc.kind
 
+proc emitAtomicInstrRv(g: var CodeGen; c: Cursor; op: IntrinsicOp;
+                       argCurs: seq[Cursor]; res: Location) =
+  ## RV32's atomics. `lr.w`/`sc.w` carry their own ordering in the `aq`/`rl` bits
+  ## — which is what `AcqRelExclusives` names — so unlike the Cortex-M twin there
+  ## is no `dmb` bracketing anything; the pair IS the ordering.
+  ##
+  ## A plain load and a plain store are the load/store cases, and each is a single
+  ## machine access, which is the only property an atomic load or store of a
+  ## naturally-aligned word has to have on this ISA.
+  case op
+  of AtomicThreadFenceOp:
+    g.ab.keyword DmbA64                    # `fence rw,rw`
+    return
+  of AtomicSignalFenceOp:
+    return                                 # a compiler barrier only; see the a64 twin
+  else: discard
+  let bits = g.atomicBits(argCurs[0])
+  if bits != 32:
+    lengError c, "a " & $bits & "-bit atomic has no RV32 lowering: the A " &
+              "extension has `lr.w`/`sc.w` and no byte, halfword or doubleword " &
+              "form at all. Widening a byte cell to the word it sits in would " &
+              "make the access a read-modify-write of its three neighbours, " &
+              "which is not the atom that was asked for", lengInfo(c)
+  let p = g.instrOperandReg(argCurs[0])
+  if res.kind == InReg and res.isTemp and not g.rb.isBoundTemp(res.r):
+    g.bindTemp(res.r, res.typ)
+  case op
+  of AtomicLoadOp:
+    g.ab.tree MovA64:
+      g.emReg res.r
+      g.ab.tree MemX: (g.emReg p; g.ab.intLit 0)
+  of AtomicStoreOp:
+    g.ab.tree MovA64:
+      g.ab.tree MemX: (g.emReg p; g.ab.intLit 0)
+      g.emReg g.instrOperandReg(argCurs[1])
+  of AtomicExchangeOp:
+    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), NopA64, true, false)
+  of AtomicFetchAddOp:
+    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), AddA64, false, false)
+  of AtomicFetchSubOp:
+    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), SubA64, false, false)
+  of AtomicFetchAndOp:
+    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), AndA64, false, false)
+  of AtomicFetchOrOp:
+    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), OrrA64, false, false)
+  of AtomicFetchXorOp:
+    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), EorA64, false, false)
+  of AtomicAddFetchOp:
+    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), AddA64, false, true)
+  of AtomicSubFetchOp:
+    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), SubA64, false, true)
+  of AtomicCompareExchangeOp:
+    g.emitAtomicCasRv(res.r, p, g.instrOperandReg(argCurs[1]),
+                      g.instrOperandReg(argCurs[2]))
+  else:
+    lengError c, "`" & IntrinsicNames[op] & "` has no RV32 lowering — " &
+              "guard the call with a `when`", lengInfo(c)
+  # Release the operand temps' bindings, exactly as the other two arms do.
+  for i in 0 ..< min(IntrinsicRows[op].evaluatedOperands, argCurs.len):
+    let a = g.plan.planned(g.posOf(argCurs[i]))
+    if a.kind == InReg and a.isTemp and not (res.kind == InReg and a.r == res.r):
+      g.unbindTemp(a.r)
+
 proc emitAtomicInstrM(g: var CodeGen; c: Cursor; op: IntrinsicOp;
                       argCurs: seq[Cursor]; res: Location) =
   ## The Cortex-M twin of `emitAtomicInstr2`. Every variant is bracketed by `dmb`
@@ -313,6 +376,9 @@ proc emitAtomicInstr2*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
       " lowering — this target reserves no atomic scratch triple, so its " &
       "load-reserved/store-conditional loop cannot be built; guard the call " &
       "with a `when`"
+    return
+  if g.md.arch == Rv32:
+    g.emitAtomicInstrRv(c, op, argCurs, res)
     return
   if AcqRelExclusives notin g.md.caps:
     # A different instruction set, not a different width: ARMv7-M has `ldrex`/
