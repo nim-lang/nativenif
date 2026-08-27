@@ -181,6 +181,7 @@ const
     indirectResultReg: IndirectResultReg,
     produceBridge: ProduceBridge,
     bridgeRegs: @BridgeRegs,
+    atomicScratch: [IntBridgeRegs[0], IntBridgeRegs[1], ProduceBridge],
     floatBridgeReg: F31,
     memIntrinScratch: [R3, R4, R5],        # `machine.FloatBridgeReg`; s31 here
     caps: {SubwordExtend, Freestanding, AllFlagBranches, BitScanOps},

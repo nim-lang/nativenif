@@ -60,15 +60,35 @@ const
 
   ## Emitter staging bridges: `t4`/`t5`, withheld from every pool so a transient
   ## can always be drawn — a folded memory operand the three-operand ALU must load
-  ## first, a global's address, a produce-into-memory spill. Two, for the same
-  ## reason both Arm targets need two: a `cmp` whose BOTH operands spilled has to
-  ## load each into a register, and there is no memory-operand compare here either.
+  ## first, a global's address, a produce-into-memory spill. TWO, which is exactly
+  ## `EmitterBridgeDemand`: a `cmp` whose BOTH operands spilled has to load each
+  ## into a register, and there is no memory-operand compare here either. Nothing
+  ## in this emitter holds three at once any more, so two is the whole reservation
+  ## and `ProduceBridge` below is one of these rather than a third.
   IntBridgeRegs* = [R29, R30]
 
   ProduceBridge* = R30
-    ## The value-on-its-way-into-memory bridge. `t5`, which is also the second
-    ## staging bridge — the draw walks the list and reaches this one only when the
-    ## other is busy, exactly as on Cortex-M.
+    ## The value-on-its-way-into-memory bridge — `t5`, the SECOND staging bridge
+    ## rather than a third register of its own. `takeProduceBridge` prefers it and
+    ## falls back to the other, so its own call sites still get the register they
+    ## expect; what it no longer gets is a reservation nobody else may draw from.
+    ##
+    ## This target reserves TWO where both Arm targets reserve three, and that is a
+    ## deliberate spend, not an oversight — `checkMachine` would reject it if
+    ## `EmitterBridgeDemand` were still three. It was: an aggregate copy between two
+    ## COMPUTED ends held a destination pointer, a source pointer and the word
+    ## passing between them. `AggrEnd` tiering removed that shape (the source is a
+    ## NAMED slot, addressed as `(mem name off)` for no register at all), the demand
+    ## fell to two, and the third became slack.
+    ##
+    ## Spending it returns `t3` to `IntTempRegs`, which is where it came from: it
+    ## was taken out of the pool earlier only to give this target the third bridge
+    ## the untiered copy needed. On a 32-bit target with eight argument registers
+    ## and ten callee-saved homes, the scarce class is exactly this one — the
+    ## call-free volatiles — so the register is worth more there than idle.
+    ##
+    ## The cost is stated rather than hidden: with two bridges, `ARKHAM_STRESS=1`
+    ## describes a machine below what the emitter claims (see `rv32StressLevel`).
 
   IndirectResultReg* = R9
     ## Where a caller leaves `&result` for a callee returning an aggregate too
@@ -107,7 +127,7 @@ const
   ConvClobbersGpr* = [R1, R5, R6, R7, R10, R11, R12, R13, R14, R15, R16, R17,
                       R28, R29, R30]
 
-  BridgeRegs* = [IntBridgeRegs[0], IntBridgeRegs[1], ProduceBridge]
+  BridgeRegs* = [IntBridgeRegs[0], IntBridgeRegs[1]]
 
   ## The RV32 machine description handed to the register allocator.
   rv32Machine* = MachineDesc(
@@ -142,13 +162,24 @@ const
     indirectResultReg: IndirectResultReg,
     produceBridge: ProduceBridge,
     bridgeRegs: @BridgeRegs,
+    atomicScratch: [NoReg, NoReg, NoReg],
+      # No LL/SC triple. RV32 reserves two bridges (see `ProduceBridge`), and an
+      # `lr.w`/`sc.w` retry loop needs THREE registers held across instructions the
+      # allocator knows nothing about — so the day RV32 atomics are lowered, this
+      # target has to reserve them explicitly rather than borrow the bridges.
+      # `emitAtomicInstr2` refuses by name meanwhile, and `checkMachine` refuses a
+      # partial triple.
     floatBridgeReg: FloatBridgeReg,
     memIntrinScratch: [R13, R14, R15],
     caps: {Float64, Freestanding, AcqRelExclusives, TwoAddrForms},
       # `Float64`: RV32D is in the baseline, both precisions in one file.
       # `AcqRelExclusives`: `lr.w`/`sc.w` CARRY their ordering in the `aq`/`rl`
       #   bits, which is exactly what the capability names — unlike ARMv7-M's
-      #   `ldrex`/`strex`, which need `dmb` on either side.
+      #   `ldrex`/`strex`, which need `dmb` on either side. The capability is a
+      #   statement about the ISA and stays true; whether this BACKEND can emit an
+      #   atomic is a separate question, answered by `atomicScratch` above, which
+      #   is empty. `emitAtomicInstr2` checks the reservation, not the capability,
+      #   because a triple it does not hold is what actually stops it.
       # `TwoAddrForms`: the nifasm selector accepts the destructive `(op D S)`
       #   spelling and encodes it as `op rd, rd, rs`.
       #

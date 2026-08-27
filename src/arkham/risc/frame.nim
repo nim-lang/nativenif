@@ -233,11 +233,11 @@ proc emitSyprocA64*(g: var CodeGen; sp: SyscallProc) =
               pc.into:                           # (param :name pragmas type)
                 inc pc                           # name → positional pN.0
                 skip pc                          # pragmas
-                if idx >= IntArgRegs.len:
+                if idx >= g.md.intArgRegs.len:
                   raiseAssert "arkham a64: syscall with too many arguments"
                 g.ab.tree ParamD:
                   g.ab.symDef paramName(idx)
-                  g.ab.rawReg IntArgRegs[idx]
+                  g.ab.rawReg g.md.intArgRegs[idx]
                   g.genTypeBody(pc)
                 while pc.hasMore: skip pc
               inc idx
@@ -676,7 +676,7 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
         # instead. (>8 float params; the integer side is handled above.)
         assert not pl.onStack, "arkham v1: >8 float params (stack TODO): " & nm &
           " in " & g.curProcName
-        g.fmovF(loc.f, FloatArgRegs[pl.fpIndex], loc.typ.size * 8)
+        g.fmovF(loc.f, g.md.floatArgRegs[pl.fpIndex], loc.typ.size * 8)
       elif loc.kind == NamedStack and loc.typ.kind == AFloat:
         # An address-taken / spilled float param: declare its `(s) (f N)` slot and
         # spill the incoming SIMD arg register into it so `addr`/loads/stores work.
@@ -684,7 +684,7 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
           " in " & g.curProcName
         let bits = loc.typ.size * 8
         g.emFloatStackVar(nm, bits)
-        g.emFloatScalarStore(nm, FloatArgRegs[pl.fpIndex], bits)
+        g.emFloatScalarStore(nm, g.md.floatArgRegs[pl.fpIndex], bits)
       elif loc.kind == NamedStack:
         # An address-taken scalar param: declare its `(s)` slot and spill the
         # incoming argument register into it so `addr`/loads/stores work. The slot

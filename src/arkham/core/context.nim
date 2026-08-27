@@ -107,6 +107,28 @@ type
                                              ## minted spill slots (`etmpN.0`/`eftmpN.0`/
                                              ## `heldN.0`) — the merged emitter's analogue of
                                              ## the allocator's `tmpSpills`. Reset per proc.
+    lastResortBridges*: set[Reg]             ## bridges taken PAST a step's declaration
+                                             ## because every alternative was gone.
+                                             ## While one is held the emitter is
+                                             ## knowingly past its budget, so the I1
+                                             ## progress check downgrades to a count
+                                             ## rather than asserting: the shortfall
+                                             ## is the escape working, not a
+                                             ## composition nobody accounted for.
+                                             ## Cleared by `unbindTemp`, the single
+                                             ## release point.
+    bridgeScopes*: seq[tuple[base, cap: int; what: string]]
+                                             ## I2: the declared bridge budget of each emitter
+                                             ## step currently on the stack. `base` is how many
+                                             ## reserved bridges were already live when the step
+                                             ## was entered (its ENCLOSING holders), `cap` how
+                                             ## many it declared for itself. `emit.takeBridge`
+                                             ## refuses a take past `base + cap`, so an
+                                             ## over-budget step is caught AT the step that is
+                                             ## wrong rather than at whichever later take found
+                                             ## nothing left. Empty in a release build, where
+                                             ## `emit.BridgeCheck` compiles the whole mechanism
+                                             ## out.
     pickedRegs*: set[Reg]                    ## step-3 value core: GPRs handed out by `takeTmp`/
                                              ## `takeHeld` but not yet BOUND — the reserve→bind
                                              ## gap of the lazy-bind convention (a consumer
@@ -410,6 +432,7 @@ proc newCodeGen*(buf: var TokenBuf; md: MachineDesc): CodeGen =
   ## register renderer, whether immediates may address memory, which target the
   ## `BodyLib` splices are keyed on — is set by the caller, because it IS the
   ## difference between the targets.
+  checkMachine(md)
   CodeGen(ab: initAsmBuf(), buf: addr buf, md: md)
 
 proc adoptProgram*(g: var CodeGen) =

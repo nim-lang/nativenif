@@ -248,6 +248,26 @@ type
                                      ## dedicated r8 on Cortex-M, where nifasm has
                                      ## already claimed r12. Always the last entry
                                      ## of `bridgeRegs`.
+    atomicScratch*: array[3, Reg]    ## the three registers an LL/SC atomic sequence
+                                     ## claims for itself — `old`, `new`/`expected`
+                                     ## and the store STATUS — for the whole
+                                     ## `ldaxr`/`stlxr` retry loop.
+                                     ##
+                                     ## Its OWN reservation, not `bridgeRegs[0..2]`,
+                                     ## which is what it used to read. Those are two
+                                     ## unrelated claims that merely coincided while
+                                     ## every RISC target reserved exactly three
+                                     ## bridges: the moment one spent its third, the
+                                     ## atomic lowering indexed off the end of a
+                                     ## two-element seq. This is the rule design.md
+                                     ## states after the `cmpxchg`/rax bug — a
+                                     ## register an emitter CLAIMS must be excluded
+                                     ## where the claim is made, never inferred from
+                                     ## a pool it happens to sit in.
+                                     ##
+                                     ## `NoReg`s mean the target reserves no triple
+                                     ## and therefore has no LL/SC lowering;
+                                     ## `emitAtomicInstr2` refuses by name.
     bridgeRegs*: seq[Reg]            ## every GPR withheld from all allocation
                                      ## pools so the emitter can ALWAYS draw a
                                      ## transient — a folded memory operand a
@@ -576,3 +596,116 @@ proc memToMemBridgeDemand*(md: MachineDesc; dst, v: Location): ScratchDemand =
       ScratchDemand(gprs: 1, slot: (if md.arch == X86: v.typ else: dst.typ))
     else:
       ScratchDemand()
+
+type BridgeDemand* = enum
+  ## How many reserved bridges one emitter step holds AT ONCE, named by the shape
+  ## that needs them. A step declares its demand with `emit.withBridges` above its
+  ## first take; `emit.takeBridge` refuses a take beyond the declaration.
+  ##
+  ## The ordinal IS the count, and `EmitterBridgeDemand` below is the max over
+  ## this enum — so the number a machine model must reserve is DERIVED from the
+  ## declarations rather than maintained beside them. Adding a member here
+  ## immediately makes `checkMachine` demand another bridge of every target, which
+  ## is the forcing function: a step cannot quietly want a fourth register.
+  bdTransient = 1
+    ## One transient: a folded memory operand a three-operand ALU must load first,
+    ## an immediate too wide for the instruction's field, a global's address, a
+    ## value on its way into a stack slot. The overwhelming majority.
+  bdTwoInRegs = 2
+    ## TWO values that must sit in registers at the same instant while both live
+    ## in memory. Measured, this is one class with several faces: an ADDRESS held
+    ## while a word passes through (`marshalStackAggrArg`, `genAggrCopyStore`, the
+    ## aggregate tail loads), a spilled RESULT staged in one bridge while a spilled
+    ## operand is loaded into another (`emitBin2`, `emitMod2`), a `cmp` whose both
+    ## operands spilled (this ISA has no memory-operand compare), an `(at …)`
+    ## stride scratch live across the index it multiplies, and a demoted memory
+    ## base being reloaded. Every one of them is "no memory operand on this side
+    ## either", which is why x86-64 needs one bridge where the RISC targets need
+    ## two.
+  # There is deliberately NO member with ordinal 3. The only shape that ever held
+  # three was an aggregate copy between two COMPUTED ends — a destination address
+  # and a source address live together while a word passed between them — and
+  # `AggrEnd` removed it: `flatCopyToPtr2`'s source is a NAMED slot, addressed as
+  # `(mem name off)` with the offset folded into the slot's own frame displacement,
+  # which costs no register at all. Adding a `= 3` member back would raise
+  # `EmitterBridgeDemand` and make `checkMachine` demand a third bridge of every
+  # target again; that is the forcing function working, not an obstacle to route
+  # around.
+
+const EmitterBridgeDemand* = ord(high(BridgeDemand))
+  ## The largest number of reserved bridges any single emitter step holds at
+  ## once, and therefore the size a `bridgeRegs` reservation must have.
+  ##
+  ## TWO. It was three until `AggrEnd` tiering reached the RISC emitter: the only
+  ## step that ever held three was an aggregate copy between two COMPUTED ends, and
+  ## `flatCopyToPtr2`'s source is a NAMED slot, so addressing it as `(mem name off)`
+  ## costs no register — and one instruction fewer than the `lea` it replaced.
+  ##
+  ## What makes this a bound and not an average: a bridge is withheld from every
+  ## allocation pool, so bridge demand is a property of the SHAPE of one emitter
+  ## step, never of how much pressure the allocator is under. Starving the pools
+  ## changes how OFTEN a bridge is taken, not how many one step wants — measured,
+  ## the peak does not move between `ARKHAM_STRESS=1` and unstressed, nor between
+  ## aggregate nesting depth 1 and 16.
+  ##
+  ## A step's demand is only half of it, though: a step also inherits whatever an
+  ## ENCLOSING step still holds across the recursion that reached it.
+  ## `emit.bridgeScopePush` checks the sum rather than trusting it, and the RISC
+  ## targets reserve THREE while needing two — one register of slack, which is what
+  ## makes every step reachable with its full declaration free
+  ## (`tightCompositions == 0`). See design.md, "Making the reservation a bound
+  ## instead of a measurement".
+  ##
+  ## That slack is now spendable: a target could reserve two and return the third
+  ## to the allocator. Not done here — it changes register assignment on every
+  ## target at once and wants its own measurement, not this one.
+
+proc checkMachine*(md: MachineDesc) =
+  ## Consistency of a machine model against what the shared emitter assumes.
+  ## Cheap, once per target, and each arm is here because its absence cost real
+  ## debugging time — the reservation invariants were all STATED in the field
+  ## docs above and none of them was checked.
+  if md.bridgeRegs.len == 0:
+    # x86-64 reserves a single `stagingBridgeReg` instead of a bridge list.
+    doAssert md.stagingBridgeReg != NoReg,
+      "machine " & md.targetName & " reserves no emitter scratch at all"
+    return
+  doAssert md.bridgeRegs.len >= EmitterBridgeDemand,
+    "machine " & md.targetName & " reserves " & $md.bridgeRegs.len &
+    " emitter bridges; the shared emitter holds up to " & $EmitterBridgeDemand
+  var seen: set[Reg] = {}
+  for r in md.bridgeRegs:
+    doAssert r != NoReg, "machine " & md.targetName & " has a NoReg bridge"
+    doAssert r notin seen,
+      "machine " & md.targetName & " lists the same register twice in " &
+      "`bridgeRegs`, so it has fewer bridges than it claims — this is how RV32 " &
+      "shipped `[R29, R30, R30]` and asserted on every two-ended aggregate copy"
+    seen.incl r
+  doAssert md.produceBridge == md.bridgeRegs[^1],
+    "machine " & md.targetName & "'s produce bridge is not the last `bridgeRegs` entry"
+  # A bridge the allocator can also hand out is not a reservation.
+  for pool in [md.intArgRegs, md.intTempRegs, md.intLocalTempRegs,
+               md.intCalleeSaved]:
+    for r in pool:
+      doAssert r notin seen,
+        "machine " & md.targetName & " allocates " & $r & ", which it also " &
+        "reserves as an emitter bridge"
+  # The atomic triple, if the target claims one, is subject to the same rule: an
+  # LL/SC loop holds all three across instructions no allocator knows about.
+  if md.atomicScratch[0] != NoReg:
+    var atom: set[Reg] = {}
+    for r in md.atomicScratch:
+      doAssert r != NoReg,
+        "machine " & md.targetName & " reserves a PARTIAL atomic scratch triple; " &
+        "an LL/SC loop needs old, new and status together, or none at all"
+      doAssert r notin atom,
+        "machine " & md.targetName & " names the same register twice in " &
+        "`atomicScratch`, so its `ldaxr`/`stlxr` loop would use one register for " &
+        "two of old/new/status"
+      atom.incl r
+    for pool in [md.intArgRegs, md.intTempRegs, md.intLocalTempRegs,
+                 md.intCalleeSaved]:
+      for r in pool:
+        doAssert r notin atom,
+          "machine " & md.targetName & " allocates " & $r & ", which its atomic " &
+          "sequences claim for the whole retry loop"

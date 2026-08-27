@@ -20,7 +20,7 @@ import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, analyser, planer, programs, asmbuf,
                     context, diag, typeutil, constdata,
                     regbind, 
-                    layout]
+                    layout, stress]
 import "../risc/machine_a64" as machine
 from "../risc/machine_m" as machine_m import nil
 import "../risc/machine_rv32" as machine_rv32
@@ -116,7 +116,17 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   g.noFoldPos = -1
   g.curProcName = info.asmName            # names the proc in this backend's diagnostics
   g.helperCalls = false
+  when defined(arkhamBridgeDbg):
+    dbgPeakBridges = 0
+    dbgPeakHeldAtRecursion = 0
+    tightCompositions = 0
+    lastResortTakes = 0
   g.emitProcBody2(info, declarative, frameHasCall = an.hasCall)
+  when defined(arkhamBridgeDbg):
+    stderr.writeLine "BRIDGE peak=" & $dbgPeakBridges & " heldAtRecursion=" &
+                     $dbgPeakHeldAtRecursion & " tight=" & $tightCompositions &
+                     " lastResort=" & $lastResortTakes &
+                     " " & g.curProcName
 
 proc genType*(g: var CodeGen; name: string; decl: Cursor) =
   ## Emit `(type :name <translated body>)` — a top-level type definition that
@@ -248,7 +258,7 @@ proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## value core would mean reimplementing its register-binding protocol, which is
   ## the part with a formal model behind it (proofs/arkham_bindings.tla).
   setTargetWord Word32             # 4-byte pointers, 4-byte platform int
-  var g = newCodeGen(buf, machine_m.cortexMMachine)
+  var g = newCodeGen(buf, stressed(machine_m.cortexMMachine))
   g.thumbM = true
   g.entryExits = true
   g.board = board
@@ -372,7 +382,7 @@ proc generateRv32*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## genuinely disagree about is a `TargetFeature` this model answers rather than
   ## a branch on which target is being emitted.
   setTargetWord Word32             # 4-byte pointers, 4-byte platform int
-  var g = newCodeGen(buf, machine_rv32.rv32Machine)
+  var g = newCodeGen(buf, stressed(machine_rv32.rv32Machine))
   g.entryExits = true              # bare metal: the entry cannot RETURN, because
                                    # `ra` at reset holds no valid address
   g.board = board

@@ -346,19 +346,27 @@ proc reloadMemBase2*(g: var CodeGen; pos: int) =
   ## homed base returns immediately — no steal can move it under us anymore.)
   let loc = g.plan.planned(pos)
   if loc.kind notin {NamedStack, Mem}: return
-  var s = g.tryTakeBridge(loc.typ)
+  # A bridge, but never the LAST one while there is another answer. Any register
+  # with no live binding serves just as well — the reload dies with the operand —
+  # and `pickStagingA64` finds those the whole-proc home union hides. Taking the
+  # last bridge here is what leaves a step with no alternative holding nothing:
+  # under a 64-bit lowering (which juggles pairs) this is reached with one already
+  # gone, and on the `cortex-m 64` corpus it was the last over-budget take left.
+  var s = NoReg
+  if g.liveBridges() + 1 < g.distinctBridges():
+    s = g.tryTakeBridge(loc.typ)
   if s == NoReg:
-    # Both bridges are already staging inside this one address chain (a `(mem …)`
-    # with a spilled base AND a spilled index, under an aggregate copy that put its
-    # two end addresses there first). Any register with no live binding serves — the
-    # reload dies with the operand — and `pickStagingA64` finds those the whole-proc
-    # home union hides.
     s = g.pickStagingA64()
-    if s == NoReg:
-      raiseAssert "arkham a64n: no register to reload a spilled memory base in proc " &
-                  g.curProcName
-    g.pickedRegs.incl s
-    g.bindTemp(s, loc.typ)
+    if s != NoReg:
+      g.pickedRegs.incl s
+      g.bindTemp(s, loc.typ)
+    else:
+      # Nothing in the pools either: now the last bridge is the right answer, and
+      # this operand genuinely has no other.
+      s = g.tryTakeBridge(loc.typ, lastResort = true)
+      if s == NoReg:
+        raiseAssert "arkham a64n: no register to reload a spilled memory base in proc " &
+                    g.curProcName
   g.place2(loc, s)
   g.savedHomes[pos] = loc
   g.plan.planAtEmitTime(pos, regLoc(s, loc.typ))
@@ -375,7 +383,36 @@ proc prematAddrVal2*(g: var CodeGen; c: Cursor) =
   g.plan.planAtEmitTime(pos, d)
   g.reloadMemBase2(pos)
 
+proc raiseForIndexedBase*(g: var CodeGen; c: Cursor; lateBase: bool) =
+  ## I2/I3: the honest bridge demand of an `(at …)` / `(pat …)` address chain.
+  ##
+  ## TWO only when both ends really need a bridge of their own — a computed index
+  ## AND a base that must be reloaded into one. It is one otherwise, and saying two
+  ## unconditionally is not merely pessimistic: this chain is reached with two
+  ## bridges already held (`foldRhs2`'s load destination plus `produceIntoMem2`'s
+  ## produce bridge), so an unconditional two made every such composition look like
+  ## it needed four of three.
+  ##
+  ## A LATE base costs no bridge here. It is materialized after the index, by which
+  ## point `emLvalGlobalBase`'s cascade has a staging-pool register, a freed bridge,
+  ## or the caller's `lateBaseSpare` — the load destination the consumer is about to
+  ## overwrite anyway — to put it in.
+  ##
+  ## Under-stating this is SAFE in the sense that matters: `tryTakeBridge` refuses a
+  ## take past the declaration, so a chain that turns out to want two where one was
+  ## declared fails at the declaration rather than silently.
+  var idx = c
+  skip idx                                   # the base; `idx` now names the index
+  let idxComputed = idx.kind notin {IntLit, UIntLit}
+  if idxComputed and not lateBase:
+    g.bridgeRaise(bdTwoInRegs, "an indexed lvalue with a spilled base and a computed index")
+
 proc prematLval2*(g: var CodeGen; c: Cursor) =
+  # A `(mem …)` whose base AND index both spilled reloads each into a bridge
+  # (`reloadMemBase2`), and an `(at …)` stride scratch that found the pools dry
+  # takes one that lives until the operand is emitted (`bindStrideScratch`). Both
+  # outlive this proc — the consumer's `freeLvalTemps2` releases them — so the
+  # demand is the enclosing STEP's, and this is where it becomes known.
   ## Materialize an lvalue's embedded values (a deref pointer, an index, a global
   ## base address) into their allocated registers BEFORE the consuming `(mem …)`/
   ## `(lea …)` tree opens.
@@ -459,7 +496,8 @@ proc prematLval2*(g: var CodeGen; c: Cursor) =
         # A re-derivable global base with no allocated register goes LAST: the index
         # is what it would otherwise have to survive, and deriving `&g` after it needs
         # no survivor at all (`lateGlobalBase`).
-        let late = g.lateGlobalBase(baseCur)
+        let late = g.lateGlobalBase(baseCur) or g.lateSpilledBase(baseCur)
+        g.raiseForIndexedBase(cc, late)
         if not late: g.prematLval2(cc)
         skip cc                                           # base
         if cc.kind notin {IntLit, UIntLit}:
@@ -475,11 +513,19 @@ proc prematLval2*(g: var CodeGen; c: Cursor) =
       var recycle = NoReg
       cc.into:
         let baseCur = cc
-        g.prematAddrVal2(cc)                              # the pointer → its reg (follow steals)
+        # A SPILLED base pointer goes last, exactly as a global's address does in
+        # `AtC` above: reloading it is one `ldr` from a fixed frame offset, so
+        # materializing it before the index only buys a bridge held across the
+        # index's whole evaluation. `PatC` never had this arm, and it is the one
+        # composition `tightCompositions` still counted.
+        let late = g.lateSpilledBase(baseCur)
+        g.raiseForIndexedBase(cc, late)
+        if not late: g.prematAddrVal2(cc)                 # the pointer → its reg
         skip cc
         if cc.kind notin {IntLit, UIntLit}:
           g.prematAddrVal2(cc)                            # follow steals
           recycle = g.strideRecycle(cc, baseCur)          # last-resort stride scratch
+        if late: g.prematAddrVal2(baseCur)
         while cc.hasMore: skip cc
       if g.plan.aux.hasKey(patPos) and g.plan.aux[patPos].scratch.len > 0:
         g.bindStrideScratch(patPos, recycle)
@@ -856,6 +902,7 @@ proc aggrArgAddr*(g: var CodeGen; a: Cursor; dst: Reg) =
     g.ab.tree LeaA64: (g.emReg dst; g.ab.sym home)
 
 proc marshalStackAggrArg(g: var CodeGen; a: Cursor; paramNm: string) =
+  g.bridgeStep("a stack-passed aggregate argument", bdTwoInRegs)
   ## Write an aggregate call argument that did NOT fit the integer arg registers to its
   ## outgoing stack slot(s) `(mem (sp) (arg paramNm [k]))`. The fixed frame keeps SP
   ## constant, so the source is read and the slots written at stable offsets — no
@@ -913,12 +960,15 @@ proc genNestedAggrField(g: var CodeGen; dst: Location; valC, fty: Cursor) =
   g.emTypedStackVar(tmpName, fty)
   g.varType[tmpName] = ntn
   g.genStore2(valC, namedStackLoc(tmpName, slotOf(g.prog, fty)))   # build (no bridge held)
-  let fptr = g.takeBridge()
-  g.emFieldAddr(dst, fptr)
-  let tmp = g.takeBridge(avoid = fptr)
-  g.flatCopyToPtr2(tmpName, aggrByteSize(g.prog, ntn), fptr, tmp)
-  g.dropBridge tmp
-  g.dropBridge fptr
+  # The field pointer, the word temp and (inside `flatCopyToPtr2`) the source
+  # pointer are live together — this is THE three-bridge step.
+  g.withBridges(bdTwoInRegs, "a nested-aggregate field copy"):
+    let fptr = g.takeBridge()
+    g.emFieldAddr(dst, fptr)
+    let tmp = g.takeBridge(avoid = fptr)
+    g.flatCopyToPtr2(tmpName, aggrByteSize(g.prog, ntn), fptr, tmp)
+    g.dropBridge tmp
+    g.dropBridge fptr
 
 proc genFieldStore2*(g: var CodeGen; dst: Location; valC: Cursor) =
   ## Store value `valC` into the aggregate-field destination `dst` — the `Field` case of
@@ -1040,12 +1090,13 @@ template aconstrElemStores*(g: var CodeGen; c: Cursor; destOp, addrOp: untyped) 
           g.emTypedStackVar(tmpName, elemTyRaw)
           g.varType[tmpName] = ntn
           g.genStore2(valC, namedStackLoc(tmpName, elemSlot))  # build (no bridge held)
-          let eptr = g.takeBridge()
-          g.ab.tree LeaA64: (g.emReg eptr; addrOp(i))   # &element[i]
-          let tmp = g.takeBridge(avoid = eptr)
-          g.flatCopyToPtr2(tmpName, aggrByteSize(g.prog, ntn), eptr, tmp)
-          g.dropBridge tmp
-          g.dropBridge eptr
+          g.withBridges(bdTwoInRegs, "an `aconstr` aggregate element copy"):
+            let eptr = g.takeBridge()
+            g.ab.tree LeaA64: (g.emReg eptr; addrOp(i))   # &element[i]
+            let tmp = g.takeBridge(avoid = eptr)
+            g.flatCopyToPtr2(tmpName, aggrByteSize(g.prog, ntn), eptr, tmp)
+            g.dropBridge tmp
+            g.dropBridge eptr
           inc i
           skip cc
           continue
@@ -1165,12 +1216,13 @@ proc genBaseobj2*(g: var CodeGen; c: Cursor; dst: Location) =
     # The base view is the derived value's PREFIX (base fields first, offset 0), so a
     # flat copy of `sizeof(BaseType)` bytes is exact — and unlike a per-field copy it
     # stays correct when a base field is itself an aggregate.
-    let dptr = g.takeBridge()
-    g.ab.tree LeaA64: (g.emReg dptr; g.ab.sym dst.name)
-    let tmp = g.takeBridge(avoid = dptr)
-    g.flatCopyToPtr2(dtmp, aggrByteSize(g.prog, baseTy.symId), dptr, tmp)
-    g.dropBridge tmp
-    g.dropBridge dptr
+    g.withBridges(bdTwoInRegs, "a `baseobj` prefix copy"):
+      let dptr = g.takeBridge()
+      g.ab.tree LeaA64: (g.emReg dptr; g.ab.sym dst.name)
+      let tmp = g.takeBridge(avoid = dptr)
+      g.flatCopyToPtr2(dtmp, aggrByteSize(g.prog, baseTy.symId), dptr, tmp)
+      g.dropBridge tmp
+      g.dropBridge dptr
     while cc.hasMore: skip cc
 
 proc aggrAddrLoc*(g: var CodeGen; loc: Location; dest: Reg) =
@@ -1188,6 +1240,7 @@ proc aggrAddrLoc*(g: var CodeGen; loc: Location; dest: Reg) =
   else: raiseAssert "arkham a64n: aggrAddrLoc of " & $loc.kind
 
 proc genAggrCopyStore*(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
+  g.bridgeStep("a whole-aggregate copy", bdTwoInRegs)
   ## THE whole-aggregate copy `dst = rhs`: reduce BOTH sides to an address in a register
   ## (`aggrAddrLoc`/`aggrAddrInto`), then `copyAggr`. The allocator reserved
   ## `[dstAddr, srcAddr]`; the per-field transfer register is a staging bridge (x14/x15),
@@ -1293,6 +1346,7 @@ proc genAggrCopyStore*(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
   g.freeVal(h1); g.freeVal(h0)
 
 proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location) =
+  g.bridgeStep("`genStore2`")                           # I1 + I2
   ## The general destination-passing store: emit `rhs` so its value lands at `dst`. An
   ## aggregate COPY goes through the ONE `genAggrCopyStore`; constructors/calls/baseobj
   ## PRODUCE per-form; a scalar/float destination through `storeScalar2`.
@@ -1609,6 +1663,7 @@ proc produceIntoFMem2*(g: var CodeGen; c: Cursor; dst: Location) =
   g.unbindFTmp(fs)
 
 proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
+  g.bridgeStep("`emitValue2`")                          # I1 + I2
   ## FUSED decide-and-emit (a64): resolve `dest` against `c`, emit, return the
   ## resolved location. Callers route float-typed values to `emitFValue2`.
   if g.isWideExpr(c):
@@ -1811,6 +1866,7 @@ proc emitModPow2(g: var CodeGen; c, resTypeC, lhsC: Cursor; k: int;
   dest = acc
 
 proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
+  g.bridgeStep("a binary op with a spilled result", bdTwoInRegs)
   ## FUSED a64 binary-arith: the shared allocBin policy decided inline
   ## (Sethi–Ullman swap, dest passthrough, rhs recycling, aliasRhs), emitted
   ## with the a64 non-destructive 3-op / W-form machinery.
@@ -1942,6 +1998,7 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
   dest = res
 
 proc emitMod2(g: var CodeGen; c: Cursor; dest: var Location) =
+  g.bridgeStep("a `mod` with a spilled result", bdTwoInRegs)
   ## FUSED `(mod T a b)` → `dest = a - (a div b)*b` (allocDivModRisc's placement
   ## decided inline).
   var rt, divC, dvsC: Cursor
@@ -2206,6 +2263,7 @@ proc emitFValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
   else: raiseAssert "arkham a64n: emitFValue2(fused) kind " & $c.kind
 proc emitScalarCmpE*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
                     whenTrue: bool; fuseBranchTo = ""): RiscInst =
+  g.bridgeStep("a `cmp` with both operands spilled", bdTwoInRegs)
   ## FUSED integer `cmp`: operands resolve dontCare (a home / immediate stays
   ## put; a computed subtree takes a temp) and the bridges serve everything
   ## else — 075b051's stackHomeSlot / placeImmTyped bridge typing preserved.
@@ -3075,14 +3133,14 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
           # HFA/indirect split would miscompile silently.
           raiseAssert "arkham a64: aggregate in the variadic tail of " & tgt.asmName
         elif g.isFloatExpr(a):
-          var fD = fregLoc(FloatArgRegs[fIdx], defaultFloatSlot())
+          var fD = fregLoc(g.md.floatArgRegs[fIdx], defaultFloatSlot())
           g.emitFValue2(a, fD)                 # promoted to double by the front end
-          varTail.add (NoReg, FloatArgRegs[fIdx], off)
+          varTail.add (NoReg, g.md.floatArgRegs[fIdx], off)
           inc fIdx
         else:
-          var aD = regLoc(IntArgRegs[intIdx], ScalarSlot)
+          var aD = regLoc(g.md.intArgRegs[intIdx], ScalarSlot)
           g.emitValue2(a, aD)
-          varTail.add (IntArgRegs[intIdx], NoFReg, off)
+          varTail.add (g.md.intArgRegs[intIdx], NoFReg, off)
           inc intIdx
       elif g.isFloatExpr(a):
         # The argument's OWN float width, not a fixed 8. AAPCS64 passes a `float`
@@ -3101,7 +3159,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
         var fSlot = g.exprSlot(a)
         if fSlot.kind != AFloat:
           fSlot = defaultFloatSlot()
-        var fD = fregLoc(FloatArgRegs[fIdx], fSlot)
+        var fD = fregLoc(g.md.floatArgRegs[fIdx], fSlot)
         g.emitFValue2(a, fD)
         inc fIdx
       elif g.exprSlot(a).kind == AMem:
@@ -3127,7 +3185,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
           g.emitLvalue2(a)                   # pick embedded base/index regs
           g.aggrAddrInto(a, srcAddr, addrSlot(), doBind = true)
           if sz > 16:
-            g.movReg(IntArgRegs[intIdx], srcAddr); inc intIdx
+            g.movReg(g.md.intArgRegs[intIdx], srcAddr); inc intIdx
           else:
             g.marshalAggrFromAddr(srcAddr, tn, intIdx)
             intIdx += aggrWordCount(g.prog, tn)
@@ -3151,13 +3209,13 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
             g.genStore2(a, namedStackLoc(home, g.exprSlot(a)))
           let hh = g.plan.homeOfSym(home)
           if sz > 16:
-            if isTvar: g.genTlvAddr(symName(a), IntArgRegs[intIdx])
-            elif isGlobal: g.emGlobalAddr(IntArgRegs[intIdx], symName(a))
+            if isTvar: g.genTlvAddr(symName(a), g.md.intArgRegs[intIdx])
+            elif isGlobal: g.emGlobalAddr(g.md.intArgRegs[intIdx], symName(a))
             elif hh.kind == InReg:
-              g.movReg(IntArgRegs[intIdx], hh.r)
+              g.movReg(g.md.intArgRegs[intIdx], hh.r)
             elif hh.kind == StackPtr:
-              g.emScalarLoad(IntArgRegs[intIdx], hh.ptrName)   # the slot holds &aggregate
-            else: g.ab.tree LeaA64: (g.emReg IntArgRegs[intIdx]; g.ab.sym home)
+              g.emScalarLoad(g.md.intArgRegs[intIdx], hh.ptrName)   # the slot holds &aggregate
+            else: g.ab.tree LeaA64: (g.emReg g.md.intArgRegs[intIdx]; g.ab.sym home)
             inc intIdx
           else:
             let nw = aggrWordCount(g.prog, tn)
@@ -3170,7 +3228,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
         g.wideArgToRegs(wnm, intIdx)
         intIdx += 2                       # no declaration to narrow against here
       else:
-        var aD = regLoc(IntArgRegs[intIdx], ScalarSlot)
+        var aD = regLoc(g.md.intArgRegs[intIdx], ScalarSlot)
         g.emitValue2(a, aD)                    # → its ABI register directly
         inc intIdx
     # Drop the variadic tail into a freshly reserved outgoing area at [sp+0…]. The
@@ -3208,8 +3266,8 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
     # further. Left bound, `emReg` keeps spelling it: in `memfiles.open` a `(u 16)`
     # `mode_t` temp stayed on x2 and a later `mmap` argument came out as
     # `(mov tmp54.0 x.2)` — an `(i 32)` into a `(u 16)` name, which nifasm rejects.
-    for i in 0 ..< intIdx: g.unbindTemp(IntArgRegs[i])
-    for i in 0 ..< fIdx: g.unbindFTmp(FloatArgRegs[i])
+    for i in 0 ..< intIdx: g.unbindTemp(g.md.intArgRegs[i])
+    for i in 0 ..< fIdx: g.unbindFTmp(g.md.floatArgRegs[i])
     if fnTargetName.len > 0:
       g.ab.tree KillA64: g.ab.sym fnTargetName
       discard g.rb.takeBinding(fnptrReg)

@@ -1081,14 +1081,11 @@ proc rv32AsmTests() =
 
 
 const rv32Quarantine = [
-    "a64_logical_imm", "a64_param_ret_alias", "aconstr_nested_obj",
-    "aggr_copy_regpressure", "aggr_store_conv", "assembler_m",
-    "atomics", "baseobj_slice", "bitand_imm64",
-    "err_asm_bridge_reg", "err_asm_foreign_reg", "err_asm_param_reg",
-    "err_asm_scratch_reg", "err_asm_wide_stack", "err_interrupt_dup",
-    "err_interrupt_unknown", "err_volatile_wide", "fp32_call",
-    "fp32_spill", "interrupt_pendsv", "oconstr_arg_clobber",
-    "oconstr_nested", "overflow_check", "semihost_writec",
+    "a64_logical_imm", "assembler_m", "atomics",
+    "bitand_imm64", "err_asm_bridge_reg", "err_asm_foreign_reg",
+    "err_asm_param_reg", "err_asm_scratch_reg", "err_asm_wide_stack",
+    "err_interrupt_dup", "err_interrupt_unknown", "err_volatile_wide",
+    "interrupt_pendsv", "overflow_check", "semihost_writec",
     "volatile_mmio"]
 
   ## Fixtures the RV32 pass does not yet run. Every entry is a NAMED gap, grouped
@@ -1144,6 +1141,85 @@ proc rv32CodegenTests() =
     inc passed
   echo passed, " / ", total, " RV32 codegen tests successful (",
        rv32Quarantine.len, " quarantined — see tests/arkham_rv32/README.md)"
+
+
+const rv32StressLevel = 2
+  ## `ARKHAM_STRESS=k` for the RV32 pass below. TWO, and the number is
+  ## `EmitterBridgeDemand` — the same relation `StagingFloor` states for x86-64.
+  ##
+  ## It was one while RV32 reserved three bridges: the emitter's reserved bridges
+  ## are never shrunk by the stress mode, so a spare one absorbed the case where
+  ## the pools had nothing left for a scratch that could have used either. Spending
+  ## the third (see `machine_rv32.ProduceBridge`) removed that absorber, and `k=1`
+  ## — which leaves ONE temp — then describes a machine below what the emitter is
+  ## written against: `array2d` reaches an `(at …)` whose stride scratch finds no
+  ## pool register, takes a bridge, and leaves an enclosed step with none while
+  ## `produceIntoMem2` holds the other.
+  ##
+  ## That is a demand statement, not a finding, which is exactly what `StagingFloor`
+  ## says about `k=1` on x86-64. `k=2` is the real floor: the pools must be able to
+  ## offer at least as many registers as one emitter step may hold at once.
+  ## Verified at k=2,3,4,6,8 and unstressed — 122/122 at every one.
+
+proc rv32StressTests() =
+  ## The RV32 corpus again with the register file starved, against a
+  ## `-d:arkhamStress` binary of its own so a stray environment variable cannot
+  ## perturb the shipped `bin/arkham`.
+  ##
+  ## This pass is what makes the I1/I2 bridge-budget assertions LIVE. `BridgeCheck`
+  ## compiles them out of a release build, so the shipped binary the codegen pass
+  ## above runs never evaluates one; `-d:arkhamStress` compiles them in, and this
+  ## is the only pass on this host that runs such a binary. Without it the check
+  ## is written down and never executed.
+  ##
+  ## The fixtures' own `.exitcode` files stay the oracle. Fewer registers may cost
+  ## performance or reach a documented out-of-registers refusal, but can never
+  ## legitimately change what a program computes — so a changed answer here is a
+  ## codegen bug by construction. That is the half a totality argument cannot
+  ## supply: it proves a register is always available, not that the value arriving
+  ## in it is the right one.
+  let qemu = findExe(rv32Qemu)
+  if qemu.len == 0:
+    echo rv32Qemu, " not found - skipping RV32 stress tests"
+    return
+  exec "nim c --hints:off -d:arkhamStress -o:bin/arkham_stress src/arkham/arkham.nim"
+  let arkhamExe = ("bin" / "arkham_stress").addFileExt(ExeExt)
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  putEnv("ARKHAM_STRESS", $rv32StressLevel)
+  var passed = 0
+  var total = 0
+  for file in walkFiles("tests/arkham_m/*.c.nif"):
+    let base = file.extractFilename.changeFileExt("").changeFileExt("")
+    if base in rv32Quarantine: continue
+    inc total
+    let asmNif = "tests" / "arkham_rv32" / (base & ".stress.nif")
+    let elf = "tests" / "arkham_rv32" / (base & ".stress.elf")
+    let (ao, ac) = execCmdEx(quoteShell(arkhamExe) &
+      " --os:embedded --cpu:riscv32 -o:" & quoteShell(asmNif) & " " & quoteShell(file))
+    if ac != 0:
+      quit "FAILURE (RV32 stress codegen) " & base & "\n" & ao
+    let (no, nc) = execCmdEx(quoteShell(nifasmExe) & " -o:" & quoteShell(elf) &
+                             " " & quoteShell(asmNif))
+    if nc != 0:
+      quit "FAILURE (RV32 stress assemble) " & base & "\n" & no
+    var args: seq[string] = @[]
+    for a in rv32Args: args.add a
+    args.add elf
+    let (output, code) = runProgram(qemu, args)
+    let want = try: parseInt(readFile("tests/arkham_m" / (base & ".exitcode")).strip())
+               except CatchableError: 0
+    if code == timeoutExitCode:
+      quit "FAILURE (TIMEOUT) RV32 stress " & base & "\n" & output
+    if code != want:
+      quit "FAILURE (RV32 stress) " & base & ": exit code " & $code &
+           ", expected " & $want & " at ARKHAM_STRESS=" & $rv32StressLevel &
+           "\n" & output
+    removeFile asmNif
+    removeFile elf
+    inc passed
+  putEnv("ARKHAM_STRESS", "")
+  echo passed, " / ", total, " RV32 stress tests successful (ARKHAM_STRESS=",
+       rv32StressLevel, ", I1/I2 bridge-budget assertions compiled in)"
 
 
 proc cortexMAsmTests() =
@@ -1798,6 +1874,7 @@ thumb2SelfTest()
 rv32SelfTest()
 rv32AsmTests()
 rv32CodegenTests()
+rv32StressTests()
 cortexMAsmTests()
 cortexMMemMapTests()
 cortexMInterruptTests()

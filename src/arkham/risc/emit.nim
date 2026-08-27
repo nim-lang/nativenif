@@ -618,12 +618,20 @@ proc emBindType*(g: var CodeGen; typ: AsmSlot) =
     if tc.kind == Symbol: g.ab.sym symName(tc)
     else: g.genTypeBody(tc)
 
+when defined(arkhamBridgeDbg):
+  ## `-d:arkhamBridgeDbg`: the evidence apparatus behind `EmitterBridgeDemand`.
+  ## Reports, per proc, the peak number of reserved bridges live at once and the
+  ## peak number still held when a RECURSIVE emit call is entered. The second is
+  ## the one that decides whether a fixed reservation composes; see design.md.
+  var dbgPeakBridges*: int = 0
+  var dbgPeakHeldAtRecursion*: int = 0
 proc unbindTemp*(g: var CodeGen; r: Reg) =
   ## Release a scratch binding made by `bindTemp`: `(kill)` the name and drop the
   ## binding. A no-op when `r` carries no temp binding (so it is safe on every
   ## `giveBack`, whether or not the reg was a bound temp). Also clears the fused
   ## core's reserve flag, so every legacy release site frees a `takeTmp` pick.
   g.pickedRegs.excl r
+  g.lastResortBridges.excl r
   let dead = g.rb.takeScratch(r)
   if dead.len > 0:
     g.ab.tree KillA64: g.ab.sym dead
@@ -997,6 +1005,27 @@ proc cmpOperandUnsigned*(g: var CodeGen; c: Cursor): bool =
 
 proc freeLvalTemps2*(g: var CodeGen; c: Cursor; addrIntact = false)
 
+type AggrEnd* = object
+  ## One end (source or destination) of a whole-aggregate copy, in the form the
+  ## MACHINE can actually address it:
+  ##   * a NAMED stack `(s)` slot — costs ZERO registers, each word addressed as
+  ##     `(mem name off)` with the offset folded into the slot's own frame
+  ##     displacement;
+  ##   * an address already materialized in a register — costs one.
+  ##
+  ## Making the form explicit is what TIERS the copy's register demand: two named
+  ## ends need only the transfer register, one named end needs two, and only a copy
+  ## between two computed addresses needs three. Reducing every source to an address
+  ## in a register first — "one path for all forms" — made three the price of EVERY
+  ## copy, and three is one more bridge than any other step in this emitter wants.
+  ## Ported from x86-64, where the same change is what stopped the emit-time staging
+  ## pool running dry under `-d:danger`.
+  slot*: string        ## non-empty ⇒ a named stack slot
+  reg*: Reg            ## else, the register holding the aggregate's address
+
+proc slotEnd*(name: string): AggrEnd {.inline.} = AggrEnd(slot: name, reg: NoReg)
+proc regEnd*(r: Reg): AggrEnd {.inline.} = AggrEnd(slot: "", reg: r)
+
 proc bridgeRegs*(g: CodeGen): seq[Reg] {.inline.} =
   ## THE emitter's scratch: every register this back end may take transiently and
   ## the allocator may never assign. NOT a constant — the AArch64 registers are
@@ -1004,14 +1033,219 @@ proc bridgeRegs*(g: CodeGen): seq[Reg] {.inline.} =
   ## destroys the return address and shows up as a hang at `bx lr` with nothing at
   ## the crash site to suggest why.
   ##
-  ## THREE, not two. The third is the produce bridge (x16 / r8), which was always
-  ## reserved and always free — it just was not reachable from the staging draw,
-  ## so a step that needed a third register asserted next to an idle one. It is
-  ## last in the order deliberately: its own call sites (`produceIntoMem2` and
-  ## friends, via `takeProduceBridge`) still get it first, so nothing that
-  ## compiles today changes register, and the staging draw reaches it only where
-  ## it would otherwise have had nothing.
+  ## THREE, while `EmitterBridgeDemand` is two — one register of SLACK, and that
+  ## slack is what makes every step reachable with its full declaration free
+  ## (`tightCompositions == 0`, checked on every emission under `-d:arkhamStress`).
+  ## It was not always slack: until `AggrEnd` tiering landed, an aggregate copy
+  ## between two computed ends really did hold three at once.
+  ##
+  ## The third is the produce bridge (x16 / r8), last in the order deliberately: its
+  ## own call sites (`produceIntoMem2` and friends, via `takeProduceBridge`) still
+  ## get it first, and the staging draw reaches it only where it would otherwise
+  ## have had nothing.
   g.md.bridgeRegs
+
+proc liveBridges*(g: CodeGen): int =
+  ## How many DISTINCT reserved bridges are live right now. BOUND or merely
+  ## RESERVED: `produceIntoMem2` threads its bridge into `emitValue2` UNBOUND on
+  ## purpose (a leaf may produce raw into it, and only then is it bound for the
+  ## store), holding it with `pickedRegs` alone — so a bound-only count would miss
+  ## precisely the site whose invariant this is. Counting bound-only reports a
+  ## peak-across-recursion of 1 where the truth is 2.
+  var seen: set[Reg] = {}
+  for r in g.md.bridgeRegs:
+    if r notin seen and (g.rb.isBoundTemp(r) or r in g.pickedRegs):
+      seen.incl r; inc result
+
+proc distinctBridges*(g: CodeGen): int =
+  var seen: set[Reg] = {}
+  for r in g.md.bridgeRegs:
+    if r notin seen: seen.incl r; inc result
+
+proc heldBridgeNames*(g: CodeGen): string =
+  var seen: set[Reg] = {}
+  for r in g.md.bridgeRegs:
+    if r notin seen and (g.rb.isBoundTemp(r) or r in g.pickedRegs):
+      seen.incl r
+      if result.len > 0: result.add ", "
+      result.add $r
+
+const BridgeCheck* = defined(arkhamStress) or defined(arkhamBridgeCheck) or
+                     not defined(release)
+  ## Whether the I1 budget assertions are compiled in. ON in a debug build and in
+  ## every `-d:arkhamStress` binary — the pool-dry pass is exactly where the margin
+  ## is thin — and OFF in a shipped release build, where they would cost a walk of
+  ## three registers per recursive emit call for a property the stress pass has
+  ## already established over the whole corpus.
+
+proc bridgeBudgetFailed(g: CodeGen; what: string; need: int) {.noinline.} =
+  ## Two different failures wear this assertion, and they want different fixes.
+  let head = "arkham " & g.md.targetName & ": I1 bridge budget — " & what &
+             " needs " & $need & " of " & $g.distinctBridges() &
+             " reserved bridges"
+  if need > g.distinctBridges():
+    # Not a composition at all: the step does not fit this machine even alone.
+    raiseAssert head & ", which is more than this target reserves at all, in " &
+      "proc " & g.curProcName & ". Either the machine model is short a bridge " &
+      "(RV32 shipped `[R29, R30, R30]` and had two where it claimed three — see " &
+      "`machinedesc.checkMachine`) or the step must be written to a smaller " &
+      "budget: see design.md, \"Making the reservation a bound instead of a " &
+      "measurement\", I3."
+  raiseAssert head & ", but " & $g.liveBridges() & " (" & g.heldBridgeNames() &
+    ") are already held by an ENCLOSING step, in proc " & g.curProcName &
+    ". A COMPOSITION failure, not pressure: the allocator never owns these " &
+    "registers, so no amount of spilling elsewhere frees one, and the step that " &
+    "fails is not the step that is wrong. The fix belongs to the HOLDER — it " &
+    "must release across the recursion, the way `genNestedAggrField` builds its " &
+    "value into a frame slot BEFORE taking its bridges. See design.md, " &
+    "\"Making the reservation a bound instead of a measurement\", I1."
+
+var tightCompositions*: int = 0
+  ## How many times a step was entered with less than its DECLARED worst case
+  ## free. See `bridgeScopePush`.
+
+var lastResortTakes*: int = 0
+  ## How many times a step took a bridge past its declaration BECAUSE every
+  ## alternative was gone. Counted, never asserted — see `tryTakeBridge`'s
+  ## `lastResort`.
+
+proc bridgeScopePush*(g: var CodeGen; demand: BridgeDemand; what: string) =
+  ## Open a declared bridge scope.
+  ##
+  ## Two conditions, and keeping them apart is the whole content of this proc.
+  ##
+  ##  * **Progress (I1), an ERROR.** A step entered with every bridge already held
+  ##    cannot emit anything at all, whatever it turns out to be. One free is the
+  ##    weakest requirement that rules that out, and it is the one that holds.
+  ##  * **Worst case (I2), a COUNT.** A declaration is static; demand is not. A
+  ##    step that declares two is not obliged to take two on this path, so being
+  ##    entered with only one free is not yet wrong — it is only *unproven*. Made
+  ##    an error, it would reject compositions that provably never bite; ignored,
+  ##    it would hide the ones that eventually will.
+  ##
+  ## The gap between the two is therefore counted, not asserted, and that count is
+  ## the work queue for I3: each one is a place where a fixed reservation stops
+  ## being demonstrably sufficient and starts being merely lucky. Measured on the
+  ## corpus it is reached only under `ARKHAM_STRESS`, and only by `emitLvalue2`
+  ## entered from inside another two-bridge step.
+  if g.liveBridges() + 1 > g.distinctBridges():
+    if g.lastResortBridges == {}:
+      bridgeBudgetFailed(g, what, 1)
+    else:
+      # A step already went past its declaration because it had nothing else. The
+      # emitter is knowingly outside its budget until that bridge comes back, so
+      # this shortfall is the escape working rather than an unaccounted
+      # composition — counted, like a tight one, and not asserted.
+      inc tightCompositions
+  if g.liveBridges() + ord(demand) > g.distinctBridges():
+    inc tightCompositions
+  when defined(arkhamBridgeDbg):
+    if g.liveBridges() > dbgPeakHeldAtRecursion:
+      dbgPeakHeldAtRecursion = g.liveBridges()
+  g.bridgeScopes.add (base: g.liveBridges(), cap: ord(demand), what: what)
+
+proc bridgeScopePop*(g: var CodeGen) =
+  ## Close it, checking the step gave back exactly what it took. A LEAK is not a
+  ## crash here and never would be — the register simply stays bound, and the next
+  ## step silently runs with one fewer, until something far away asserts. This is
+  ## the only place that difference is visible.
+  let sc = g.bridgeScopes.pop()
+  if getCurrentException() != nil:
+    # Unwinding already. A step abandoned mid-way has of course not released its
+    # bridges, so the leak below is a CONSEQUENCE of the failure in flight, and
+    # raising it here would replace the real diagnostic with a derived one — which
+    # is exactly what it did on first use: an under-declared `genAconstr2` reported
+    # itself as a leak in `genStore2` three frames out.
+    return
+  let live = g.liveBridges()
+  if live > sc.base:
+    raiseAssert "arkham " & g.md.targetName & ": I2 bridge leak — " & sc.what &
+      " left " & $(live - sc.base) & " of its " & $sc.cap &
+      " declared bridge(s) still held (" & g.heldBridgeNames() &
+      ") in proc " & g.curProcName &
+      ". Every `takeBridge` needs its `dropBridge` on every path out."
+
+proc bridgeOverDeclared*(g: CodeGen) {.noinline.} =
+  let sc = g.bridgeScopes[^1]
+  raiseAssert "arkham " & g.md.targetName & ": I2 bridge budget — " & sc.what &
+    " declared " & $sc.cap & " bridge(s) and is taking " &
+    $(g.liveBridges() - sc.base + 1) & ", in proc " & g.curProcName &
+    ". Raise the declaration to the matching `BridgeDemand` member if the step " &
+    "really holds that many at once — which forces every machine model to " &
+    "reserve one more (`machinedesc.checkMachine`) and is meant to be a decision, " &
+    "not a default. Otherwise the step is holding a bridge it could have " &
+    "released: see design.md, \"Making the reservation a bound instead of a " &
+    "measurement\", I2."
+
+proc bridgeRaise*(g: var CodeGen; demand: BridgeDemand; what: string) =
+  ## Widen the innermost declaration for the rest of the current step.
+  ##
+  ## For a demand a step only discovers as it runs. `prematLval2` is the case:
+  ## whether an lvalue's address chain needs a second bridge depends on whether
+  ## its base or index turned out to be SPILLED, which the walk that planned the
+  ## lvalue could not say. Raising is not a new scope — the registers are taken by
+  ## `prematLval2` and released by the consumer's `freeLvalTemps2`, a lifetime that
+  ## deliberately spans several procs and belongs to the enclosing step — so it is
+  ## that step's declaration that has to grow, and it reverts when the step's own
+  ## scope pops.
+  when BridgeCheck:
+    if g.bridgeScopes.len > 0 and ord(demand) > g.bridgeScopes[^1].cap:
+      g.bridgeScopes[^1].cap = ord(demand)
+      g.bridgeScopes[^1].what = what
+      if g.bridgeScopes[^1].base + ord(demand) > g.distinctBridges():
+        inc tightCompositions
+
+proc bridgeTakeAllowed*(g: CodeGen): bool {.inline.} =
+  ## Whether one more take fits the innermost declaration.
+  g.bridgeScopes.len == 0 or
+    g.liveBridges() - g.bridgeScopes[^1].base < g.bridgeScopes[^1].cap
+
+template withBridges*(g: var CodeGen; demand: BridgeDemand; what: string;
+                      body: untyped) =
+  ## I2: declare this step's bridge demand around the takes that realise it.
+  ##
+  ## `bdTransient` is the DEFAULT — every recursive emit entry opens one — so only
+  ## a step that holds two or three at once needs to say so. Placing the
+  ## declaration above the first take is the point: the assertion then names the
+  ## step and its budget, instead of blaming whichever take happened to be the one
+  ## that found nothing left.
+  when BridgeCheck:
+    g.bridgeScopePush(demand, what)
+    try:
+      body
+    finally:
+      g.bridgeScopePop()
+  else:
+    body
+
+template bridgeStep*(g: var CodeGen; what: string; demand = bdTransient) =
+  ## The implicit scope every RECURSIVE emit entry opens (`emitValue2`,
+  ## `genStore2`, `emitLvalue2`). Scoped to the rest of the enclosing proc via
+  ## `defer`, because those procs return from many places.
+  when BridgeCheck:
+    g.bridgeScopePush(demand, what)
+    defer: g.bridgeScopePop()
+
+
+when defined(arkhamBridgeDbg):
+  proc dbgNoteBridges*(g: CodeGen; r: Reg) =
+    let n = g.liveBridges()
+    if n > dbgPeakBridges: dbgPeakBridges = n
+    if n >= 2:
+      var frames: seq[string] = @[]
+      for ln in getStackTrace().splitLines():
+        if "arkham/risc" in ln or "arkham/core" in ln:
+          let i = ln.rfind(") ")
+          if i >= 0: frames.add ln[i+2 .. ^1]
+      # innermost first, skipping the take machinery itself
+      var chain: seq[string] = @[]
+      for k in countdown(frames.high, 0):
+        let f = frames[k]
+        if f in ["dbgNoteBridges", "tryTakeBridge", "takeBridge",
+                 "takeProduceBridge"]: continue
+        chain.add f
+        if chain.len >= 3: break
+      stderr.writeLine "CONC " & $n & " " & chain.join(" <- ")
 
 proc dropBridge*(g: var CodeGen; r: Reg) =
   if r != NoReg: g.unbindTemp(r)
@@ -1390,6 +1624,29 @@ proc lateGlobalBase*(g: var CodeGen; c: Cursor): bool =
     g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind == NoLoc and
     g.plan.planned(g.posOf(c)).kind != InReg
 
+proc lateSpilledBase*(g: var CodeGen; c: Cursor): bool =
+  ## The same argument as `lateGlobalBase`, for a base that is not a global: a base
+  ## the allocator SPILLED is re-derivable too. Its value sits at a fixed frame
+  ## offset and reloading it is one `ldr` with no inputs, so materializing it before
+  ## the index it must then survive buys nothing and costs a bridge held across the
+  ## whole index evaluation.
+  ##
+  ## That holding is the composition I3 exists to remove. Measured, it is the ONLY
+  ## one left: an outer `p[i]` whose pointer spilled holds a bridge, a
+  ## `produceIntoMem2` inside the index holds the produce bridge, and the inner
+  ## address chain then declares two with one free. Deriving the base late drops the
+  ## outer holder and with it the composition — at no run-time cost, because the
+  ## `ldr` happens either way and only its POSITION changes.
+  ##
+  ## Restricted to a spill TEMP (`etmp`/`held`, minted per value position) rather
+  ## than any stack home. Moving a load later is only sound if nothing in between
+  ## can write the slot, and a minted temp is unnameable — no source-level store and
+  ## no callee can reach it. A named local's home would need `Plan.aliasable`
+  ## consulted, and address-taken locals are exactly what arkham has no points-to
+  ## analysis to bound; the temps are where the demand actually is.
+  let loc = g.plan.planned(g.posOf(c))
+  loc.kind == NamedStack and loc.spillTemp
+
 proc binA64Op*(g: var CodeGen; c: Cursor): RiscInst =
   ## The a64 opcode for a binary-arith node; div/shift signedness from the result type.
   var rt: Cursor
@@ -1515,16 +1772,16 @@ proc emitAtomicRmw2*(g: var CodeGen; dst, p, v: Reg; opStr: string;
   ## are only ever read, which is what lets `dst` alias either of them.
   let lDone = g.freshLabel()
   let (pS, vS) = (g.emOp p, g.emOp v)
-  let old = g.emOp g.md.bridgeRegs[0]
-  let neu = g.emOp g.md.bridgeRegs[1]
-  let st = g.emOp g.md.bridgeRegs[2]
+  let old = g.emOp g.md.atomicScratch[0]
+  let neu = g.emOp g.md.atomicScratch[1]
+  let st = g.emOp g.md.atomicScratch[2]
   let w = wsfx(bits)
   let update = if isXchg: &"(mov {neu} {vS})" else: &"(mov {neu} {old}) ({opStr} {neu} {vS})"
   # Structured `(loop …)`: nifasm emits the back-edge internally. The exclusive
   # store SUCCEEDS when `st == 0` → the forward `(beq lDone)` leaves the loop.
   g.ab.splice &"(loop (stmts (ldaxr {old} {pS}{w}) " & update & " " &
               &"(stlxr {st} {neu} {pS}{w}) (cmp {st} 0) (beq {lDone}))) (lab :{lDone})"
-  g.movReg(dst, g.md.bridgeRegs[if returnNew: 1 else: 0])
+  g.movReg(dst, g.md.atomicScratch[if returnNew: 1 else: 0])
 
 proc emAtomicLoadM*(g: var CodeGen; dst, p: Reg; bits: int) =
   ## `dst ← the bits-wide cell at [p]`, zero-extended. Not an exclusive load:
@@ -1570,9 +1827,9 @@ proc emitAtomicRmwM*(g: var CodeGen; dst, p, v: Reg; opTag: RiscInst;
   ##
   ## `old`/`new`/`st` are the three reserved bridges; `p` and `v` are only ever
   ## read, which is what lets `dst` alias either of them.
-  let old = g.bridgeRegs[0]
-  let neu = g.bridgeRegs[1]
-  let st = g.bridgeRegs[2]
+  let old = g.md.atomicScratch[0]
+  let neu = g.md.atomicScratch[1]
+  let st = g.md.atomicScratch[2]
   let lDone = g.freshLabel()
   g.emitLoop:
     g.ab.tree LdrexM: (g.emReg old; g.emReg p; g.ab.intLit bits)
@@ -1595,9 +1852,9 @@ proc emitAtomicCasM*(g: var CodeGen; ret, p, ep, d: Reg; bits: int) =
   ## the cell actually held through `ep`, so the caller retries against the value
   ## it now holds — and it must `clrex` first, because it leaves the pair without
   ## the store and the monitor would otherwise stay armed on this address.
-  let exp = g.bridgeRegs[0]
-  let old = g.bridgeRegs[1]
-  let st = g.bridgeRegs[2]
+  let exp = g.md.atomicScratch[0]
+  let old = g.md.atomicScratch[1]
+  let st = g.md.atomicScratch[2]
   let lSucc = g.freshLabel()
   let lFail = g.freshLabel()
   let lDone = g.freshLabel()
@@ -1639,9 +1896,37 @@ proc emByteAtImm*(g: var CodeGen; p: Reg; off: int) =
         g.emReg p
       g.ab.intLit off
 
-proc copyAggr*(g: var CodeGen; dst, src: Reg; size: int; tmp: Reg) =
-  ## THE one aggregate memcpy (a struct/array `store`): copy `size` bytes from `[src]` to
-  ## `[dst]` through the bound scratch `tmp` — whole WORDS for the aligned bulk, then a
+proc emWordAtSlot*(g: var CodeGen; name: string; off: int) =
+  ## `(cast (u W) (mem name off))` — the word at byte offset `off` of the NAMED stack
+  ## slot `name`. The pointer twin `emWordThroughPtr` needs the slot's ADDRESS in a
+  ## register first; this needs no register at all, because nifasm folds `off` into
+  ## the slot's own frame displacement — and bounds-checks it against the slot, which
+  ## the register form cannot. (x64's `emWordAtSlot`, at the target's word width.)
+  g.ab.tree CastX:
+    g.ab.uintType(wordBits())
+    g.ab.tree MemX:
+      g.ab.sym name
+      g.ab.intLit off.int64
+
+proc emByteAtSlot*(g: var CodeGen; name: string; off: int) =
+  ## The byte-granular `emWordAtSlot`, for a copy's sub-word tail.
+  g.ab.tree CastX:
+    g.ab.uintType(8)
+    g.ab.tree MemX:
+      g.ab.sym name
+      g.ab.intLit off.int64
+
+proc emWordAt(g: var CodeGen; e: AggrEnd; idx: int) =
+  if e.slot.len > 0: g.emWordAtSlot(e.slot, idx * wordSize())
+  else: g.emWordThroughPtr(e.reg, idx)
+
+proc emByteAt(g: var CodeGen; e: AggrEnd; off: int) =
+  if e.slot.len > 0: g.emByteAtSlot(e.slot, off)
+  else: g.emByteAtImm(e.reg, off)
+
+proc copyAggr*(g: var CodeGen; dst, src: AggrEnd; size: int; tmp: Reg) =
+  ## THE one aggregate memcpy (a struct/array `store`): copy `size` bytes from `src` to
+  ## `dst` through the bound scratch `tmp` — whole WORDS for the aligned bulk, then a
   ## sized byte tail. Layout-agnostic and byte-accurate (mirrors the x64 `copyAggr`).
   ##
   ## The word here must be the TARGET's, and must agree with `emWordThroughPtr`'s
@@ -1651,12 +1936,16 @@ proc copyAggr*(g: var CodeGen; dst, src: Reg; size: int; tmp: Reg) =
   let w = wordSize()
   let words = size div w
   for i in 0 ..< words:
-    g.ab.tree MovA64: (g.emReg tmp; g.emWordThroughPtr(src, i))
-    g.ab.tree MovA64: (g.emWordThroughPtr(dst, i); g.emReg tmp)
+    g.ab.tree MovA64: (g.emReg tmp; g.emWordAt(src, i))
+    g.ab.tree MovA64: (g.emWordAt(dst, i); g.emReg tmp)
   for b in 0 ..< (size - words * w):                     # sub-word tail, byte by byte
     let off = words * w + b
-    g.ab.tree MovA64: (g.emReg tmp; g.emByteAtImm(src, off))
-    g.ab.tree MovA64: (g.emByteAtImm(dst, off); g.emReg tmp)
+    g.ab.tree MovA64: (g.emReg tmp; g.emByteAt(src, off))
+    g.ab.tree MovA64: (g.emByteAt(dst, off); g.emReg tmp)
+
+proc copyAggr*(g: var CodeGen; dst, src: Reg; size: int; tmp: Reg) =
+  ## Both ends are addresses in registers — the historical shape.
+  g.copyAggr(regEnd(dst), regEnd(src), size, tmp)
 
 proc emAggrElemAt*(g: var CodeGen; base: string; idx: int) =
   ## Bare `(at base idx)` ADDRESS tree (no `(mem …)` wrapper) — what a64's `lea` takes

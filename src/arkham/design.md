@@ -206,6 +206,254 @@ What remains non-total is the step that wants a third register while holding two
 eligible victim by construction; making it total means giving that step a way to
 release one of its two ends, not a bigger pool.
 
+### Making the reservation a bound instead of a measurement
+
+Three different things travel under the name "out of registers", and only one of
+them is a design problem. Separating them is most of the work.
+
+**A machine model that reserves fewer bridges than it claims.** RV32 shipped
+`bridgeRegs = [R29, R30, R30]` — `ProduceBridge` spelled as `IntBridgeRegs[1]` —
+so the target had two bridges where the shared emitter is written against three.
+Seven corpus fixtures asserted, all at one call site. This is not pressure; it is
+a typo in a table whose invariants were stated in the field documentation and
+checked nowhere. `machinedesc.checkMachine` now checks them: distinct entries, at
+least `EmitterBridgeDemand` of them, `produceBridge` last, and no overlap with any
+allocation pool.
+
+**A number that is measured rather than derived.** The table above says the peak
+is three because 3,792 procs were counted. A corpus is not a bound. What makes
+three a bound is the reason it does not move:
+
+> A bridge is withheld from every allocation pool, so bridge demand is a property
+> of the SHAPE of one emitter step, never of how much pressure the allocator is
+> under.
+
+That is testable, and it holds. `-d:arkhamBridgeDbg` reports the peak count of
+DISTINCT bound bridges per proc. Over `tests/arkham_m` the peak is exactly 3 on
+all three RISC targets, and it does not move between `ARKHAM_STRESS=1` and
+unstressed — starving the allocator from eight registers to one changes how OFTEN
+a bridge is taken (129 procs need none unstressed, 116 at k=1) and never how many
+one step wants. Nor does it move with input size: a synthetic `oconstr` nested 1,
+2, 4, 8 and 16 deep peaks at 3 every time.
+
+That last one is not luck. It is the invariant to hold onto:
+
+**I1 — the bridge budget is checked where a step is ENTERED, not where it runs
+out.** `bridgeBudget(g, what, need)` in `risc/emit.nim`, asserting that `need`
+reserved bridges are still free, at two kinds of site:
+
+ * `need = 1` at every recursive emit entry — `emitValue2`, `genStore2`,
+   `emitLvalue2`. A step entered with every bridge already held cannot make
+   progress whatever it turns out to be, so this is the weakest condition that
+   still guarantees one.
+ * `need = <the step's own demand>` at any step that takes more than one, above
+   its first take. `genNestedAggrField` declares 3. A failure then names the step
+   and its budget, instead of blaming whichever of the three happened to be the
+   take that found nothing left.
+
+It is compiled in under `-d:arkhamStress` and in debug builds and out of a shipped
+release (`BridgeCheck`), which puts it exactly where the margin is thin — the
+pool-dry pass — and nowhere it would cost a three-register walk per recursive call
+for a property that pass has already established over the whole corpus.
+
+**The first statement of I1 here was "no bridge is held across a recursive emit
+call", and implementing it is what showed that to be wrong.** `produceIntoMem2`
+holds the produce bridge across `emitValue2` of a whole node BY CONTRACT — the
+bridge IS the destination the value is produced into — so "zero held" would delete
+the mechanism rather than fix it. What can be enforced is not that nothing is
+held, but that what is held always leaves the next step enough.
+
+**And the earlier count was optimistic.** `produceIntoMem2` threads its bridge
+into the recursion deliberately UNBOUND (a leaf may produce raw into it, and only
+then is it bound for the store), holding it with `pickedRegs` alone — so a count
+that asks `isBoundTemp` misses precisely the site whose invariant this is.
+`liveBridges` counts reserved-or-bound, and on that honest count the peak held
+across a recursion is **2**, not 1, reached at `ARKHAM_STRESS=1` on all three RISC
+targets by one composition: an `(at …)` stride scratch that fell back to a staging
+bridge, live across the index premat, while `produceIntoMem2` holds the produce
+bridge for a nested node. Two held out of three reserved leaves the step entered
+there exactly ONE — and several enumerated steps want two.
+
+That is the whole case for checking it rather than measuring it. The margin is one
+register, the corpus never spends it, and nothing but this assertion would say so
+if an input did.
+
+Measured after wiring it up: **zero failures over 4 target configs × 7 stress
+levels (unstressed and `ARKHAM_STRESS=1..8`)**, plus synthetic `oconstr` nesting
+to depth 16 and `a[a[a[…i…]]]` indexing to depth 12 under starvation. Emitted
+asm-NIF is byte-identical with the check compiled in and compiled out, which is
+what says it observes and never steers.
+
+`genNestedAggrField` remains the model for how a holder gets fixed when this does
+fire: it builds its value into a frame slot BEFORE taking any bridge, so its
+recursion runs with none held ("Computing the field pointer AFTER the recursive
+build keeps only two bridges live at once ... so nesting is not depth-bounded by
+the bridge count"). The depth-16 measurement is that comment being true.
+
+**I2 — a step declares its demand, and the declaration is what is checked.**
+`takeBridge` used to fail at the moment the N+1st register was *asked for*, which
+names the unlucky caller rather than the step that was over budget. Now every step
+carries a `BridgeDemand` — `bdTransient` and `bdTwoInRegs`, whose
+ORDINAL is the count — declared with `emit.bridgeStep` (the whole proc, via
+`defer`) or `emit.withBridges` (a region), and three things follow from it.
+
+**`EmitterBridgeDemand` is derived, not maintained.** It is `ord(high(BridgeDemand))`.
+Adding a member immediately makes `machinedesc.checkMachine` demand another bridge
+of every target, so a step cannot quietly come to want a fourth register — the
+cost lands on the machine models, where it is a decision rather than a default.
+
+**A take past the declaration fails at the declaration.** `tryTakeBridge` — the one
+choke point every bridge take goes through — refuses BEFORE searching, so an
+over-budget step is caught even on a machine roomy enough to have satisfied it.
+That is precisely the bug a fixed reservation hides until some unrelated target or
+stress level runs out, which is how RV32 met it.
+
+**A scope also checks that the step gave its bridges back.** A leak is not a crash
+and never would be: the register stays bound and the next step silently runs with
+one fewer, until something far away asserts. `bridgeScopePop` is the only place
+that difference is visible — though it must stay quiet while an exception is
+already unwinding, or it replaces the real diagnostic with a derived one. It did
+exactly that on first use, reporting an under-declared `genAconstr2` as a leak in
+`genStore2` three frames out.
+
+Two things the declarations had to get right, and both are lessons about *where* a
+demand lives rather than what it is:
+
+ * **The declaration belongs to the HOLDER, not the taker.** `loadAggrTail` takes
+   the second bridge, but it is `aggrWordsToFromRegs` — holding the aggregate's
+   base address across the call — that needs two. Declaring it on the taker made
+   every unrelated caller of the tail loads look like a two-bridge step.
+ * **A demand discovered mid-step raises the step's declaration** (`bridgeRaise`)
+   rather than opening a scope of its own. Whether an lvalue address chain needs a
+   second bridge depends on whether its base or index turned out to be SPILLED,
+   which the walk that planned the lvalue could not say; and the registers are
+   taken by `prematLval2` but released by the consumer's `freeLvalTemps2`, a
+   lifetime that deliberately spans several procs. A scope cannot bracket that. The
+   enclosing step's declaration can grow to cover it, and reverts when that step
+   ends.
+
+**What the declarations then revealed, which is the point of making them.** A
+declaration is static; demand is not, so a step that declares two is not obliged to
+take two on a given path. Being ENTERED with only one free is therefore not yet
+wrong — it is *unproven*. Made an error it would reject compositions that provably
+never bite; ignored it would hide the ones that eventually will. So the two
+conditions are kept apart: **progress** (one bridge free, an error — that is I1)
+and **worst case** (the full declaration free, a COUNT: `tightCompositions`).
+
+That count is the work queue for I3, and declaring the demands shrank it from "we
+have not found an input that breaks it" to a single named place: over
+`tests/arkham` × `tests/arkham_m` × `ARKHAM_STRESS=1..8` on all three RISC targets,
+it was reached **four times, in one proc — `chain.0` of `addr_chain_depth`, on
+AArch64, only under stress**. Peak live there stayed 2, so the second bridge was
+never actually wanted; the composition was unproven rather than broken. That
+fixture is already the one this section names for depth-independence, which was
+some evidence the queue pointed at the right thing. I3 below drives it to zero.
+
+Measured after wiring it up: **0 over-declarations, 0 leaks, 0 I1 failures** over 4
+target configs × 7 stress levels, with emitted asm-NIF byte-identical whether the
+checks are compiled in or out. Both arms were shown non-vacuous by lowering a real
+declaration and by deleting a real `dropBridge`.
+
+**I3 — the residual step stops needing the register.** With I1 and I2 the residual
+set is no longer an enumeration to trust but a COUNT to drive to zero:
+`tightCompositions` names every place a declared worst case exceeded what was free
+on entry. It started at four, in one proc, and it is now **zero** — over both
+corpora × 4 target configs × `ARKHAM_STRESS` unstressed and 1..8. Two changes got
+it there, and neither is the spill-to-a-frame-slot this section used to propose.
+
+**The three-bridge step no longer exists.** `flatCopyToPtr2`'s source is a NAMED
+stack slot, and it was being `lea`'d into the produce bridge before every copy —
+which is what made the destination address, the source address and the transfer
+word live together, and therefore the only reason the reservation had to be three.
+`AggrEnd` (ported from x86-64, where the identical change is what stopped the
+staging pool running dry under `-d:danger`) addresses a named end as
+`(mem name off)`, folding the offset into the slot's own frame displacement. That
+costs **no** register, emits **one instruction fewer** per copy, and lets nifasm
+bounds-check the offset against the slot, which the register form cannot. Measured
+peak bridge demand fell from 3 to 2 on all three RISC targets at every stress
+level, and `BridgeDemand` lost its `= 3` member — so `EmitterBridgeDemand`, being
+`ord(high(BridgeDemand))`, fell with it.
+
+This is what "degrades through memory" turned out to mean in practice, and it is
+better than the two-register copy loop sketched earlier: no extra load per word, no
+minted slot, strictly less code. The earlier sketch assumed both ends were computed
+addresses. One of them never was.
+
+**The lvalue address chain stopped over-declaring.** `prematLval2` raised every
+enclosing step to two, but an `(at …)`/`(pat …)` chain needs a second bridge only
+when a computed index meets a base that must be reloaded into one. A LATE base
+costs no bridge here at all — by the time it is materialised,
+`emLvalGlobalBase`'s cascade has a staging-pool register, a freed bridge, or the
+caller's `lateBaseSpare` (the load destination the consumer is about to overwrite
+anyway) to put it in. `raiseForIndexedBase` states that condition. Under-stating it
+would not be silent: `tryTakeBridge` refuses a take past the declaration, so a
+chain that wanted two where one was declared fails at the declaration.
+
+`lateSpilledBase` extends `lateGlobalBase`'s argument to a base the allocator
+SPILLED — reloading it is one `ldr` from a fixed frame offset, no inputs, so
+materialising it before the index it must then survive buys nothing — and gives
+`PatC` the late arm it never had. Restricted to a spill TEMP rather than any stack
+home: moving a load later is sound only if nothing in between can write the slot,
+and a minted temp is unnameable, where a named local's home would need
+`Plan.aliasable` and the address-taken case is exactly what arkham has no points-to
+analysis to bound.
+
+**Where that leaves totality.** Max declared demand 2, max held across a recursion
+1 — so every step is entered with its full declaration free and `tryTakeBridge`
+cannot fail. That is checked on every emission under `-d:arkhamStress`, not argued.
+
+### Spending the third bridge
+
+The reservation was three because one step held three. It no longer does, so on
+**RV32 the third is spent**: `ProduceBridge` is now `IntBridgeRegs[1]` rather than a
+register of its own, `t3` goes back to `IntTempRegs`, and the target reserves two —
+exactly `EmitterBridgeDemand`. The register returns to the class that is scarce on
+that target (the call-free volatiles: three, now four), not to one that was already
+roomy. `checkMachine` would refuse the reservation if the demand were still three,
+which is what makes this a spend rather than a gamble.
+
+Two things had to be true first, and both were worth finding:
+
+ * **A scratch with alternatives must not take a bridge first.** `bindStrideScratch`
+   asked `tryTakeBridge` before `pickStagingA64`, which was free while a third bridge
+   sat idle and stopped being free the moment it did not: the `(at …)` stride scratch
+   would hold a bridge for the whole `(mem …)` while `produceIntoMem2` held the other.
+   Pool first, bridge only if there is none — the preference `emLvalGlobalBase`'s
+   late-base cascade already states. Three Cortex-M fixtures moved a stride scratch
+   from `r10` to `r0`/`r1`/`r7`; nothing else in the corpus changed.
+
+ * **The atomic triple is NOT the bridges.** `emitAtomicRmw2` and the compare-exchange
+   read `bridgeRegs[0..2]` — an LL/SC loop holds `old`, `new` and the store STATUS
+   across instructions no allocator sees. That coincided with the bridges only while
+   every RISC target reserved exactly three, and a two-element `bridgeRegs` makes it
+   an out-of-bounds index. It is `md.atomicScratch` now, its own array, validated by
+   `checkMachine` (all three or none; none of them allocatable) — which is the rule
+   this document already states after the `cmpxchg`/rax bug: *a register an emitter
+   claims must be excluded where the claim is made, not inferred from a pool it
+   happens to be in.* RV32 reserves no triple and `emitAtomicInstr2` refuses by name;
+   when RV32 atomics are lowered, that target must reserve three registers and say so.
+   The split moved no register on any target — emitted asm-NIF byte-identical.
+
+**What it costs, stated rather than hidden.** With two bridges, `ARKHAM_STRESS=1`
+describes a machine below what the emitter claims: one temp in the pool and one
+step that may hold two. `array2d` reaches it. That is a demand statement, not a
+finding — the same thing `StagingFloor` says about `k=1` on x86-64 — and the floor
+is now named: the pools must offer at least `EmitterBridgeDemand` registers, so
+`rv32StressLevel` is 2. Verified at k=2,3,4,6,8 and unstressed, 122/122 at every one.
+
+**Not spent on the Arm targets.** AArch64's third (`x16`) is also its atomic scratch,
+so spending it there means reserving a triple separately first, and AArch64 is not
+short of registers. Cortex-M's (`r8`) is spendable by the same argument as RV32's and
+would matter more there — its `intTempRegs` is empty — but no `qemu-system-arm` on
+this host means the change could only be diffed, never run, and this one changes
+emitted code. Both keep three.
+
+The emitted code changed, as this kind of fix must: 21 of 814 files, all of them
+Arm/RISC aggregate copies, **327 lines shorter**, with x86-64 byte-identical. The
+gates are the runtime ones — 219/219 `linux_arm64` executed natively and 122/122
+RV32 under QEMU, the latter covering the 32-bit word width that Cortex-M shares and
+that no emulator here can run directly.
+
 ## How this deals with the ABI
 
 The calling convention is handled by *partitioning*, not by special-casing the
