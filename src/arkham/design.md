@@ -275,8 +275,9 @@ one step wants. Nor does it move with input size: a synthetic `oconstr` nested 1
 That last one is not luck. It is the invariant to hold onto:
 
 **I1 — the bridge budget is checked where a step is ENTERED, not where it runs
-out.** `bridgeBudget(g, what, need)` in `risc/emit.nim`, asserting that `need`
-reserved bridges are still free, at two kinds of site:
+out.** `bridgeScopePush` in `core/bridges.nim`, reached through `bridgeStep` /
+`withBridges` in each emitter, asserting that `need` reserved bridges are still
+free, at two kinds of site:
 
  * `need = 1` at every recursive emit entry — `emitValue2`, `genStore2`,
    `emitLvalue2`. A step entered with every bridge already held cannot make
@@ -466,8 +467,8 @@ Two things had to be true first, and both were worth finding:
    `checkMachine` (all three or none; none of them allocatable) — which is the rule
    this document already states after the `cmpxchg`/rax bug: *a register an emitter
    claims must be excluded where the claim is made, not inferred from a pool it
-   happens to be in.* RV32 reserves no triple and `emitAtomicInstr2` refuses by name;
-   when RV32 atomics are lowered, that target must reserve three registers and say so.
+   happens to be in.* A target without a triple has `emitAtomicInstr2` refuse by
+   name; RV32's triple is the two bridges plus `x8` (see below).
    The split moved no register on any target — emitted asm-NIF byte-identical.
 
 **What it costs, stated rather than hidden.** With two bridges, `ARKHAM_STRESS=1`
@@ -475,7 +476,7 @@ describes a machine below what the emitter claims: one temp in the pool and one
 step that may hold two. `array2d` reaches it. That is a demand statement, not a
 finding — the same thing `StagingFloor` says about `k=1` on x86-64 — and the floor
 is now named: the pools must offer at least `EmitterBridgeDemand` registers, so
-`rv32StressLevel` is 2. Verified at k=2,3,4,6,8 and unstressed, 122/122 at every one.
+`rv32StressLevel` (`tests/tester.nim`) is 2. Verified at k=2,3,4,6,8 and unstressed, 122/122 at every one.
 
 **Not spendable on either Arm target — and the reasons are different.** The guess
 was that Cortex-M's `r8` would go the same way as RV32's `t3`, and it would matter

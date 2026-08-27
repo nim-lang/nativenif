@@ -69,7 +69,6 @@ proc storeAggrTail(g: var CodeGen; base, src: Reg; aggrSize, byteOff: int) =
 
 proc aggrWordsToFromRegs(g: var CodeGen; varName: string; typeSym: SymId;
                          firstArg: int; toRegs: bool) =
-  g.bridgeStep("an aggregate marshalled word by word", bdTwoInRegs)
   ## Move a ≤16-byte aggregate between its memory home and x{firstArg+i} (the by-value
   ## aggregate ABI). The whole transfer is positional: the slot's address goes into a
   ## staging bridge (a by-ref aggregate already has its pointer in a reg) and each
@@ -77,6 +76,7 @@ proc aggrWordsToFromRegs(g: var CodeGen; varName: string; typeSym: SymId;
   ## (`{int32; int32}`) all transfer and a non-object aggregate — a tuple, an array —
   ## needs no layout at all. A trailing PARTIAL eightbyte goes through
   ## `loadAggrTail` / `storeAggrTail`: exact bytes, no over-read, no over-write.
+  g.bridgeStep("an aggregate marshalled word by word", bdTwoInRegs)
   let byteSize = aggrByteSize(g.prog, typeSym)
   let loc = g.plan.homeOfSym(varName)
   if loc.kind == InRegPair:

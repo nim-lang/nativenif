@@ -585,6 +585,9 @@ proc isThreadableBranch(kind: RelocKind): bool {.inline.} =
            rkB, rkBEQ, rkBNE, rkCBZ, rkCBNZ, rkTBZ, rkTBNZ,
            rkTB, rkTBcond,
            rkRvJ, rkRvBranch}
+  # RV32: `threadJumps` is only run from `writeelf`, never on the RV32 path, so
+  # these two are inert today. Should threading reach RV32, `rkRvBranch` has no
+  # relaxation — retargeting one past ±4 KiB fails in `patchRvBranch`.
 
 proc prunePositions(buf: var Buffer; deadPos: HashSet[int]): seq[int] =
   ## Delete the instruction starting at each position in `deadPos` (each MUST be the

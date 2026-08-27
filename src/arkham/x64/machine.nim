@@ -107,7 +107,9 @@ const
     produceBridge: NoReg,
     bridgeRegs: @[],
     floatBridgeReg: NoFReg,
-    memIntrinScratch: [R3, R4, R5],
+    memIntrinScratch: [NoReg, NoReg, NoReg], # the inline memcpy/memset lowering is
+                                     # `risc/`-only; x86-64 uses `rep movs`. [R3, R4,
+                                     # R5] here would name rbx/rsp/rbp.
     caps: {CondSelect, TailCall, Float64, SubwordExtend, RegOffsetMem,
            PcRelGlobalFold, TwoAddrForms, AllFlagBranches},
                                      # `codegen_x64` does not consult this set
@@ -179,7 +181,9 @@ const
     produceBridge: NoReg,
     bridgeRegs: @[],
     floatBridgeReg: NoFReg,
-    memIntrinScratch: [R3, R4, R5],
+    memIntrinScratch: [NoReg, NoReg, NoReg], # the inline memcpy/memset lowering is
+                                     # `risc/`-only; x86-64 uses `rep movs`. [R3, R4,
+                                     # R5] here would name rbx/rsp/rbp.
     caps: {CondSelect, TailCall, Float64, SubwordExtend, RegOffsetMem,
            PcRelGlobalFold, TwoAddrForms, AllFlagBranches},
                                      # `codegen_x64` does not consult this set

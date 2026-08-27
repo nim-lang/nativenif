@@ -282,8 +282,9 @@ type
                                              ## not yet given back. The debug-only
                                              ## `stagingLive` below records WHAT each is
                                              ## for; this one is the COUNT, and it has to
-                                             ## exist in every build because the budget
-                                             ## checks read it (`core/bridges`).
+                                             ## exist in every build because the x86-64
+                                             ## budget checks read it (`x64/emit.liveStaging`
+                                             ## feeding `core/bridges`).
     when defined(arkhamStagingDbg):
       stagingLive*: seq[(Reg, string)]  ## staging registers handed out and not yet given
                                         ## back, with the label of what asked for each

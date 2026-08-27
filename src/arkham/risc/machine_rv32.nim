@@ -88,7 +88,8 @@ const
     ## call-free volatiles — so the register is worth more there than idle.
     ##
     ## The cost is stated rather than hidden: with two bridges, `ARKHAM_STRESS=1`
-    ## describes a machine below what the emitter claims (see `rv32StressLevel`).
+    ## describes a machine below what the emitter claims (`rv32StressLevel` in
+    ## `tests/tester.nim` is 2 for that reason).
 
   IndirectResultReg* = R9
     ## Where a caller leaves `&result` for a callee returning an aggregate too
@@ -124,8 +125,10 @@ const
   ## What a call destroys, emitted as the proc's `(clobber …)` so the ABI is
   ## DECLARED at the signature rather than re-derived at every call site: `ra`,
   ## the temporaries, and the argument/return registers.
-  ConvClobbersGpr* = [R1, R5, R6, R7, R10, R11, R12, R13, R14, R15, R16, R17,
+  ConvClobbersGpr* = [R1, R5, R6, R7, R8, R10, R11, R12, R13, R14, R15, R16, R17,
                       R28, R29, R30]
+    ## `R8` (x8): not an ABI volatile, but the third leg of `atomicScratch`, so
+    ## any proc with an atomic destroys it and the declaration must say so.
 
   BridgeRegs* = [IntBridgeRegs[0], IntBridgeRegs[1]]
 
@@ -210,9 +213,8 @@ const
       # NOT `TailCall`: deferred rather than blocked, for the first landing.
       # NOT `AllFlagBranches`: there are no flags AT ALL. The four conditions that
       #   fuse (`zf`/`nz`/`cf`/`nc`) are fewer than this capability's "any of the
-      #   eight" and more than its absence's "the zero flag only", so neither arm
-      #   of `asmproc.asmFlagOk` fits and the `{.assembler.}` flag path needs a
-      #   third one before it is enabled here.
+      #   eight" and more than its absence's "the zero flag only", so `asmproc.armFlagSupported`
+      #   answers the `{.assembler.}` flag path with its own third arm.
     frameStyle: BlockFrame,     # inherited verbatim from Cortex-M: SP lowered
                                 # once, one store per saved register, no paired
                                 # store to build a frame pointer with.

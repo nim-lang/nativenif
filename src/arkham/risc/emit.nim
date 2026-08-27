@@ -34,7 +34,7 @@ type
   RiscInst* = A64Inst
     ## An instruction tag, as the SHARED load/store emitter sees one.
     ##
-    ## The alias is not decoration. `RiscInst` is the right name in
+    ## The alias is not decoration. `A64Inst` is the right name in
     ## `nifasm/arm64`, where the enum genuinely is AArch64's — but this emitter
     ## serves three targets going on four, and 75 of the tags it writes are the
     ## SAME tag id on every one of them (`(add3 …)` is `Add3A64`, `Add3M` and
@@ -1049,7 +1049,8 @@ proc bridgeRegs*(g: CodeGen): seq[Reg] {.inline.} =
   ## destroys the return address and shows up as a hang at `bx lr` with nothing at
   ## the crash site to suggest why.
   ##
-  ## THREE, while `EmitterBridgeDemand` is two — one register of SLACK, and that
+  ## THREE on both Arm targets while `EmitterBridgeDemand` is two — one register
+  ## of SLACK (RV32 spent its third: see "Spending the third bridge"), and that
   ## slack is what makes every step reachable with its full declaration free
   ## (`tightCompositions == 0`, checked on every emission under `-d:arkhamStress`).
   ## It was not always slack: until `AggrEnd` tiering landed, an aggregate copy

@@ -11,7 +11,8 @@
 ## set is spelled and how much of it is GUARANTEED.
 ##
 ##  * the RISC targets reserve `md.bridgeRegs` outright — capacity and guarantee
-##    are the same number, and it is `EmitterBridgeDemand`;
+##    are the same number, at least `EmitterBridgeDemand` (exactly that on RV32,
+##    one more on both Arm targets);
 ##  * x86-64 reserves ONE (R11) and treats the ABI volatiles as extra capacity
 ##    when they happen to be free, so its capacity is dynamic and larger than its
 ##    guarantee.

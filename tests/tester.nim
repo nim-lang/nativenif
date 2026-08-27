@@ -1101,10 +1101,6 @@ proc rv32AsmTests() =
 
 
 const rv32Quarantine = [
-    # Cortex-M's versions of tests RV32 now has its own of, kept rather than
-    # deleted: each is the other target's telling of the same story, and both
-    # targets should keep theirs. See `tests/arkham_rv32/assembler_rv32` and
-    # `semihost_writec_rv32`.
     "assembler_m", "semihost_writec", "interrupt_pendsv", "atomics"]
 
   ## Cortex-M fixtures the RV32 pass does not run, because this directory has its

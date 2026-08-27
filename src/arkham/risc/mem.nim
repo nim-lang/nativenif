@@ -132,15 +132,14 @@ proc bindStrideScratch*(g: var CodeGen; atPos: int; recycle: Reg) =
     else:
       r = g.tryTakeBridge()
     if r == NoReg:
-      block:
-        if recycle == NoReg:
-          raiseAssert "arkham a64n: no stride scratch for the indexed access in proc " &
-                      g.curProcName
-        # nifasm ALLOWS `scratch == index`: it stages the stride constant in its own
-        # reserved x16, so `scratch = idx*stride` reads the index in the very
-        # instruction that overwrites it. Only `scratch == base` is rejected there
-        # (that one would destroy the base before `add scratch, base, scratch`).
-        r = recycle
+      if recycle == NoReg:
+        raiseAssert "arkham a64n: no stride scratch for the indexed access in proc " &
+                    g.curProcName
+      # nifasm ALLOWS `scratch == index`: it stages the stride constant in its own
+      # reserved x16, so `scratch = idx*stride` reads the index in the very
+      # instruction that overwrites it. Only `scratch == base` is rejected there
+      # (that one would destroy the base before `add scratch, base, scratch`).
+      r = recycle
       g.lvalStrideOnBridge.excl atPos   # no bridge of its own to release
     g.plan.aux[atPos] = ExprAux(scratch: @[r])
   else:
@@ -376,7 +375,6 @@ proc emitAtomicInstr2*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
       " lowering — this target reserves no atomic scratch triple, so its " &
       "load-reserved/store-conditional loop cannot be built; guard the call " &
       "with a `when`"
-    return
   if g.md.arch == Rv32:
     g.emitAtomicInstrRv(c, op, argCurs, res)
     return
@@ -722,11 +720,11 @@ proc takeWideRegs*(g: var CodeGen; n: int; what: string): seq[Reg] =
   ## worth finding: it only shows up on the 64-bit-on-32-bit corpus, which is the
   ## `cortex-m 64` pass that needs `qemu-system-arm` to run.
   g.bridgeRaise(bdTwoInRegs, "a 64-bit lowering juggling register pairs")
-  ## The cascade is PREFERENCE, not restriction: declining the last bridge must
-  ## never turn into a failure. Bridge while one is still left, then a survivor,
-  ## then the last bridge after all, and only then the loud `takeHeld`. Written the
-  ## short way — decline, then `takeHeld` — it traded a budget overrun for a hard
-  ## out-of-registers in `setit.0` of `at_scratch_deref_base`, which is worse.
+  # The cascade is PREFERENCE, not restriction: declining the last bridge must
+  # never turn into a failure. Bridge while one is still left, then a survivor,
+  # then the last bridge after all, and only then the loud `takeHeld`. Written the
+  # short way — decline, then `takeHeld` — it traded a budget overrun for a hard
+  # out-of-registers in `setit.0` of `at_scratch_deref_base`, which is worse.
   result = @[]
   for _ in 0 ..< n:
     var r = NoReg

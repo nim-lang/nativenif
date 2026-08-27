@@ -24,11 +24,6 @@ import "../core" / [asmslots, machinedesc, analyser, planer, programs, asmbuf,
 import "../risc/machine_a64" as machine
 from "../risc/machine_m" as machine_m import nil
 import "../risc/machine_rv32" as machine_rv32
-  # Imported although `generateRv32` does not exist yet, so the RV32 machine model
-  # is TYPE-CHECKED by every build rather than only when someone remembers to
-  # compile it. A machine description is a table of register slots and set
-  # members; the way it goes wrong is by naming a slot the target does not map,
-  # and that is a compile error only if something compiles it.
 import emit, value, frame, stmt, asmproc
 import runtime
 
@@ -357,16 +352,6 @@ proc generateM*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         g.ab.str bytes
   result = g.ab.render("." & g.prog.thisModuleSuffix)
 
-proc rejectForRv32(g: var CodeGen) =
-  ## What RV32 does not have, refused BY NAME at the declaration rather than
-  ## discovered as a missing tag halfway through an otherwise valid image.
-  ##
-  ## Deliberately short. Cortex-M's twin has to turn away `float64` (its FPU is
-  ## single-precision) and a good deal besides; RV32IMAFD has both precisions,
-  ## hardware divide, and atomics that carry their own ordering, so the list is
-  ## what the ISA genuinely lacks rather than what the backend has not reached.
-  discard
-
 proc rv32InterruptTable(g: var CodeGen) =
   ## `(interrupts (irq <cause> <handler>)*)` for RV32 — the same declaration
   ## Cortex-M emits, carrying a different number.
@@ -431,7 +416,9 @@ proc generateRv32*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   g.ab.renderReg = machine_rv32.regNameRv     # `(x0)`..`(x30)`/`(sp)`
   g.ab.arch = "rv32"               # no BodyLib entries apply to this target yet
   g.prog = collect(buf, inputPath, tags, darwin = false)
-  g.rejectForRv32()
+  # No `rejectForRv32` twin of Cortex-M's declaration-time refusals: RV32IMAFD
+  # has both float precisions, hardware divide and self-ordering atomics, so what
+  # it lacks is refused per intrinsic (`BitScanOps`, narrow atomics) instead.
   g.adoptProgram()
   g.ab.tree StmtsA64:
     g.ab.tree ArchD: g.ab.ident "riscv32"

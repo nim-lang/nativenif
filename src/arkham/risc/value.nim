@@ -20,7 +20,7 @@
 ## to reimplement the register-binding protocol, which is the part with a formal
 ## model behind it (`proofs/arkham_bindings.tla`).
 ##
-## All asm-NIF tags are emitted through nifasm's own enums (`RiscInst` /
+## All asm-NIF tags are emitted through nifasm's own enums (`A64Inst` /
 ## `NifasmDecl`, see asmbuf) — the single source of truth for the vocabulary.
 ##
 ## ABI: AAPCS64. Integer/pointer arguments and the integer return go in x0–x7 /
@@ -902,7 +902,6 @@ proc aggrArgAddr*(g: var CodeGen; a: Cursor; dst: Reg) =
     g.ab.tree LeaA64: (g.emReg dst; g.ab.sym home)
 
 proc marshalStackAggrArg(g: var CodeGen; a: Cursor; paramNm: string) =
-  g.bridgeStep("a stack-passed aggregate argument", bdTwoInRegs)
   ## Write an aggregate call argument that did NOT fit the integer arg registers to its
   ## outgoing stack slot(s) `(mem (sp) (arg paramNm [k]))`. The fixed frame keeps SP
   ## constant, so the source is read and the slots written at stable offsets — no
@@ -914,6 +913,7 @@ proc marshalStackAggrArg(g: var CodeGen; a: Cursor; paramNm: string) =
   ## the one tail shape that needs a third scratch — a 3/5/6/7-byte aggregate, which has
   ## neither a single covering load nor a full word to borrow from — is refused rather
   ## than silently mis-marshalled. It takes a call with 8+ integer arguments to reach.
+  g.bridgeStep("a stack-passed aggregate argument", bdTwoInRegs)
   let tcur = g.getType(a)
   if tcur.kind != Symbol:
     raiseAssert "arkham a64: aggregate stack-arg of non-nominal type"
@@ -960,8 +960,9 @@ proc genNestedAggrField(g: var CodeGen; dst: Location; valC, fty: Cursor) =
   g.emTypedStackVar(tmpName, fty)
   g.varType[tmpName] = ntn
   g.genStore2(valC, namedStackLoc(tmpName, slotOf(g.prog, fty)))   # build (no bridge held)
-  # The field pointer, the word temp and (inside `flatCopyToPtr2`) the source
-  # pointer are live together — this is THE three-bridge step.
+  # The field pointer and the word temp are live together; the source inside
+  # `flatCopyToPtr2` is a NAMED slot and costs no register (`AggrEnd`), which is
+  # what took this step from three bridges to two.
   g.withBridges(bdTwoInRegs, "a nested-aggregate field copy"):
     let fptr = g.takeBridge()
     g.emFieldAddr(dst, fptr)
@@ -1240,12 +1241,12 @@ proc aggrAddrLoc*(g: var CodeGen; loc: Location; dest: Reg) =
   else: raiseAssert "arkham a64n: aggrAddrLoc of " & $loc.kind
 
 proc genAggrCopyStore*(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
-  g.bridgeStep("a whole-aggregate copy", bdTwoInRegs)
   ## THE whole-aggregate copy `dst = rhs`: reduce BOTH sides to an address in a register
   ## (`aggrAddrLoc`/`aggrAddrInto`), then `copyAggr`. The allocator reserved
   ## `[dstAddr, srcAddr]`; the per-field transfer register is a staging bridge (x14/x15),
   ## taken here — both addresses are already in `a[0]`/`a[1]`, so a bridge is free — sparing
   ## a pool GPR so the copy fits under high register pressure.
+  g.bridgeStep("a whole-aggregate copy", bdTwoInRegs)
   # Emit-time picks: pool temp, else callee-saved survivor, else a staging
   # bridge — the copy crosses no call, so even a bridge-backed address is safe
   # and the acquisition is total. (When both bridges serve as addresses, the
@@ -1346,10 +1347,10 @@ proc genAggrCopyStore*(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
   g.freeVal(h1); g.freeVal(h0)
 
 proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location) =
-  g.bridgeStep("`genStore2`")                           # I1 + I2
   ## The general destination-passing store: emit `rhs` so its value lands at `dst`. An
   ## aggregate COPY goes through the ONE `genAggrCopyStore`; constructors/calls/baseobj
   ## PRODUCE per-form; a scalar/float destination through `storeScalar2`.
+  g.bridgeStep("`genStore2`")                           # I1 + I2
   # A `Mem` destination's `typ` is often the dont-care `ScalarSlot` (the lvalue
   # subtree is the authority, not the Location), so its width is read off the
   # subtree — otherwise a 64-bit `obj.field` store looks like a word one.
@@ -1663,9 +1664,9 @@ proc produceIntoFMem2*(g: var CodeGen; c: Cursor; dst: Location) =
   g.unbindFTmp(fs)
 
 proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
-  g.bridgeStep("`emitValue2`")                          # I1 + I2
   ## FUSED decide-and-emit (a64): resolve `dest` against `c`, emit, return the
   ## resolved location. Callers route float-typed values to `emitFValue2`.
+  g.bridgeStep("`emitValue2`")                          # I1 + I2
   if g.isWideExpr(c):
     # A 64-bit value on a 32-bit target has no register to be resolved into: it
     # is eight bytes at an address, and `codegen_m64` is the arm that knows how
@@ -1866,10 +1867,10 @@ proc emitModPow2(g: var CodeGen; c, resTypeC, lhsC: Cursor; k: int;
   dest = acc
 
 proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
-  g.bridgeStep("a binary op with a spilled result", bdTwoInRegs)
   ## FUSED a64 binary-arith: the shared allocBin policy decided inline
   ## (Sethi–Ullman swap, dest passthrough, rhs recycling, aliasRhs), emitted
   ## with the a64 non-destructive 3-op / W-form machinery.
+  g.bridgeStep("a binary op with a spilled result", bdTwoInRegs)
   let op = g.binA64Op(c)
   let ek = c.exprKind
   var lhsC, rhsC, resTypeC: Cursor
@@ -1998,9 +1999,9 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
   dest = res
 
 proc emitMod2(g: var CodeGen; c: Cursor; dest: var Location) =
-  g.bridgeStep("a `mod` with a spilled result", bdTwoInRegs)
   ## FUSED `(mod T a b)` → `dest = a - (a div b)*b` (allocDivModRisc's placement
   ## decided inline).
+  g.bridgeStep("a `mod` with a spilled result", bdTwoInRegs)
   var rt, divC, dvsC: Cursor
   block:
     var cc = c
@@ -2263,7 +2264,6 @@ proc emitFValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
   else: raiseAssert "arkham a64n: emitFValue2(fused) kind " & $c.kind
 proc emitScalarCmpE*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
                     whenTrue: bool; fuseBranchTo = ""): RiscInst =
-  g.bridgeStep("a `cmp` with both operands spilled", bdTwoInRegs)
   ## FUSED integer `cmp`: operands resolve dontCare (a home / immediate stays
   ## put; a computed subtree takes a temp) and the bridges serve everything
   ## else — 075b051's stackHomeSlot / placeImmTyped bridge typing preserved.
@@ -2273,6 +2273,7 @@ proc emitScalarCmpE*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
   ## single `cbz`/`cbnz` instead of `cmp`+`b.eq`, and `NoA64Inst` comes back to say
   ## the branch is already emitted. Only equality fuses: AArch64 has no
   ## compare-and-branch for the ordering conditions.
+  g.bridgeStep("a `cmp` with both operands spilled", bdTwoInRegs)
   var aC = aC0
   var bC = bC0
   if g.isWideExpr(aC) or g.isWideExpr(bC):
@@ -2862,7 +2863,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
   # the thing to ask. An indirect tail call is refused because the pointer lives in
   # a register `(popframe)` may restore out from under the branch.
   # A target without `TailCall` declines unconditionally: `(tailcall)`/`(popframe)`
-  # are RiscInst-only tags, so the Thumb-2 selector has no spelling for either and
+  # are AArch64-only tags (`A64Inst`), so the Thumb-2 selector has no spelling for either and
   # the prologue it builds is not the one `(popframe)` knows how to walk back.
   var doTail = tail and TailCall in g.md.caps and
                not indirect and not tgt.extern and not tgt.syscall and

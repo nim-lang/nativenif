@@ -650,21 +650,36 @@ const EmitterBridgeDemand* = ord(high(BridgeDemand))
   ##
   ## A step's demand is only half of it, though: a step also inherits whatever an
   ## ENCLOSING step still holds across the recursion that reached it.
-  ## `emit.bridgeScopePush` checks the sum rather than trusting it, and the RISC
-  ## targets reserve THREE while needing two — one register of slack, which is what
-  ## makes every step reachable with its full declaration free
-  ## (`tightCompositions == 0`). See design.md, "Making the reservation a bound
-  ## instead of a measurement".
-  ##
-  ## That slack is now spendable: a target could reserve two and return the third
-  ## to the allocator. Not done here — it changes register assignment on every
-  ## target at once and wants its own measurement, not this one.
+  ## `emit.bridgeScopePush` checks the sum rather than trusting it. The two Arm
+  ## targets reserve THREE while needing two — one register of slack, which is
+  ## what makes every step reachable with its full declaration free
+  ## (`tightCompositions == 0`); RV32 reserves exactly two and spent the third.
+  ## See design.md, "Making the reservation a bound instead of a measurement" and
+  ## "Spending the third bridge" for why the spend transfers to RV32 and not to
+  ## either Arm target.
 
 proc checkMachine*(md: MachineDesc) =
   ## Consistency of a machine model against what the shared emitter assumes.
   ## Cheap, once per target, and each arm is here because its absence cost real
   ## debugging time — the reservation invariants were all STATED in the field
   ## docs above and none of them was checked.
+  # The memcpy/memset scratch triple is read by the `risc/` lowering only, and a
+  # slot literal there is right by coincidence (design.md, "Fixed-register roles
+  # must be stated, not assumed"): all three or none, distinct, and each one an
+  # register the allocator hands out — anything else (`gp`/`tp` on RISC-V, rsp/rbp
+  # were x86-64 to read it) is a register the lowering has no right to.
+  if md.memIntrinScratch[0] != NoReg:
+    var mem: set[Reg] = {}
+    for r in md.memIntrinScratch:
+      doAssert r != NoReg,
+        "machine " & md.targetName & " reserves a PARTIAL memIntrinScratch triple"
+      doAssert r notin mem,
+        "machine " & md.targetName & " names the same register twice in `memIntrinScratch`"
+      mem.incl r
+      doAssert r in md.intArgRegs or r in md.intTempRegs or
+               r in md.intLocalTempRegs or r in md.intCalleeSaved,
+        "machine " & md.targetName & " names " & $r & " as memcpy scratch, which is " &
+        "not a register its allocator hands out"
   if md.bridgeRegs.len == 0:
     # x86-64 reserves a single `stagingBridgeReg` instead of a bridge list.
     doAssert md.stagingBridgeReg != NoReg,

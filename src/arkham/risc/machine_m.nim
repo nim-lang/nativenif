@@ -204,8 +204,8 @@ const
     produceBridge: ProduceBridge,
     bridgeRegs: @BridgeRegs,
     atomicScratch: [IntBridgeRegs[0], IntBridgeRegs[1], ProduceBridge],
-    floatBridgeReg: F31,
-    memIntrinScratch: [R3, R4, R5],        # `machine.FloatBridgeReg`; s31 here
+    floatBridgeReg: F31,                   # `machine.FloatBridgeReg`; s31 here
+    memIntrinScratch: [R3, R4, R5],
     caps: {SubwordExtend, Freestanding, AllFlagBranches, BitScanOps},
                                 # `BitScanOps`: ARMv7E-M HAS `clz`/`rbit`/`rev`,
                                 # and nifasm's Thumb selector has rows for all

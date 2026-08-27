@@ -19,10 +19,13 @@
 ## What this writes today is the MINIMUM that makes a computed answer observable:
 ## one PT_LOAD segment holding the code, a second declaring the SRAM the globals
 ## occupy, and the absolute `lui`+`addi` pairs patched to point into it. Still
-## outstanding, and what makes this "minimal" rather than "done":
+## outstanding, and what makes this "minimal" rather than "done": the
+## `(layout …)` board description — regions come from constants here.
 ##
-##  * the `(layout …)` board description — regions come from constants here;
-##  * the `mtvec` trampoline table built from `(interrupts …)`.
+## The `mtvec` trampoline table is NOT this writer's: arkham builds it in code
+## (`risc/driver.rv32InterruptTable`), so the `(interrupts …)` declaration that
+## `thumb/board` accepts for RV32 only keeps the handlers reachable — nothing
+## here reads `ctx.interrupts`, unlike `writecortexm`.
 
 import std / [tables]
 

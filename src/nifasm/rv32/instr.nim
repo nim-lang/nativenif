@@ -31,8 +31,8 @@
 ##    Declarations emit no bytes and so stay transparent, which is what lets
 ##    `(cmp …) (cfvar …) (ite (zf) …)` work.
 ##  * **The immediate operand goes through `RvScratch`.** RISC-V branches are
-##    register-register only, so `(cmp x 42)` materializes the 42 at the BRANCH,
-##    not at the compare — which is the other reason the compare emits nothing.
+##    register-register only, so `(cmp x 42)` materializes the 42 into `x31` AT the
+##    compare (the only bytes it emits) and the branch reads it from there.
 ##
 ## `(fcmp …)` fuses the same way. Its instructions (`feq`/`flt`/`fle`) write a
 ## GPR rather than a flag, so the branch becomes a comparison followed by a
