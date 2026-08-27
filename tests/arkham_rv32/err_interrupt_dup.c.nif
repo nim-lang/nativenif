@@ -1,0 +1,30 @@
+(.nif27)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (gvar :flag.0 .
+  (i 32).)
+ (proc :first.0
+  (params).
+  (pragmas
+   (interrupt "MachineTimer"))
+  (stmts
+   (asgn flag.0 1)))
+ (proc :second.0
+  (params).
+  (pragmas
+   (interrupt "MachineTimer"))
+  (stmts
+   (asgn flag.0 2)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (call exit.0 flag.0))))

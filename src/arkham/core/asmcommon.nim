@@ -16,7 +16,7 @@ import std / [tables, sets, strutils]
 
 import nifcore, nifcdecl
 import machinedesc, programs
-import "../arm/machine_m"
+import "../risc/machine_m"
 import context
 import diag
 

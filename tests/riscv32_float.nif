@@ -1,0 +1,111 @@
+(.nif27)
+(stmts
+ (arch riscv32)
+ (var :bits.0
+  (x18)
+  (i 32))
+ (var :acc.0
+  (x19)
+  (i 32))
+ (var :one.0
+  (x20)
+  (i 32))
+ (mov
+  (sp)2148532224)
+ (mov bits.0 24576)
+ (csrs 768 bits.0)
+ (mov acc.0 0)
+ (mov one.0 1)
+ (mov bits.0 1065353216)
+ (mov
+  (s0)bits.0)
+ (mov bits.0 1073741824)
+ (mov
+  (s1)bits.0)
+ (mov
+  (s2)
+  (s0))
+ (fadd
+  (s2)
+  (s1))
+ (mov bits.0
+  (s2))
+ (var :want.0
+  (x21)
+  (i 32))
+ (mov want.0 1077936128)
+ (cmp bits.0 want.0)
+ (cfvar :c1.0)
+ (ite
+  (zf)
+  (stmts
+   (add3 acc.0 acc.0 one.0))
+  (stmts))
+ (fmul
+  (s2)
+  (s1))
+ (mov bits.0
+  (s2))
+ (mov want.0 1086324736)
+ (cmp bits.0 want.0)
+ (cfvar :c2.0)
+ (ite
+  (zf)
+  (stmts
+   (add3 acc.0 acc.0 one.0))
+  (stmts))
+ (fcvtzs bits.0
+  (s2))
+ (mov want.0 6)
+ (cmp bits.0 want.0)
+ (cfvar :c3.0)
+ (ite
+  (zf)
+  (stmts
+   (add3 acc.0 acc.0 one.0))
+  (stmts))
+ (mov bits.0 3)
+ (scvtf
+  (s3)bits.0)
+ (fcmp
+  (s3)
+  (s1))
+ (bhi fgt.0)
+ (b fend.0)
+ (lab :fgt.0)
+ (add3 acc.0 acc.0 one.0)
+ (lab :fend.0)
+ (fcmp
+  (s0)
+  (s0))
+ (beq feq.0)
+ (b fend2.0)
+ (lab :feq.0)
+ (add3 acc.0 acc.0 one.0)
+ (lab :fend2.0)
+ (mov want.0 5)
+ (cmp acc.0 want.0)
+ (cfvar :cf.0)
+ (ite
+  (zf)
+  (stmts
+   (mov
+    (x22)42))
+  (stmts
+   (mov
+    (x22)acc.0)))
+ (sub
+  (sp)16)
+ (mov
+  (x23)131110)
+ (mov
+  (mem
+   (sp))(x23))
+ (mov
+  (mem
+   (sp)4)(x22))
+ (mov
+  (x11)(sp))
+ (mov
+  (x10)32)
+ (semihost))

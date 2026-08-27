@@ -76,6 +76,7 @@ proc aggrWordsToFromRegs(g: var CodeGen; varName: string; typeSym: SymId;
   ## (`{int32; int32}`) all transfer and a non-object aggregate — a tuple, an array —
   ## needs no layout at all. A trailing PARTIAL eightbyte goes through
   ## `loadAggrTail` / `storeAggrTail`: exact bytes, no over-read, no over-write.
+  g.bridgeStep("an aggregate marshalled word by word", bdTwoInRegs)
   let byteSize = aggrByteSize(g.prog, typeSym)
   let loc = g.plan.homeOfSym(varName)
   if loc.kind == InRegPair:
@@ -156,6 +157,7 @@ proc takeProduceBridge*(g: var CodeGen; typ = ScalarSlot): Reg =
   let p = g.produceBridge
   if not g.rb.isBoundTemp(p):
     g.bindTemp(p, typ)
+    when defined(arkhamBridgeDbg): g.dbgNoteBridges(p)
     return p
   result = g.takeBridge(typ)
 
@@ -194,17 +196,20 @@ proc takeInstrReg*(g: var CodeGen; slot: AsmSlot; atomic: bool): Location =
 
 proc flatCopyToPtr2*(g: var CodeGen; srcVar: string; sizeBytes: int; dstPtr, tmp: Reg) =
   ## Copy the `sizeBytes`-byte aggregate stack slot `srcVar` into `[dstPtr]` through the
-  ## (already bound) word scratch `tmp` — the a64 twin of x64's `flatCopyToPtr`. The
-  ## source address goes into the reserved produce bridge (x16 on AArch64, r8 on
-  ## Cortex-M): it is never allocator-assigned, and the copy's own instructions
-  ## synthesize only through the ASSEMBLER's scratch (x17 / r12) for large
-  ## load/store offsets, so it cannot be clobbered mid-copy. A flat word copy is
-  ## byte-accurate whatever the field layout — a PER-FIELD copy would mis-load a field
-  ## that is itself an aggregate (e.g. a 16-byte `seq`) as one scalar.
-  let srcPtr = g.takeProduceBridge(addrSlot())
-  g.ab.tree LeaA64: (g.emReg srcPtr; g.ab.sym srcVar)
-  g.copyAggr(dstPtr, srcPtr, sizeBytes, tmp)
-  g.unbindTemp(srcPtr)
+  ## (already bound) word scratch `tmp` — the a64 twin of x64's `flatCopyToPtr`. A flat
+  ## word copy is byte-accurate whatever the field layout; a PER-FIELD copy would
+  ## mis-load a field that is itself an aggregate (e.g. a 16-byte `seq`) as one scalar.
+  ##
+  ## The source is a NAMED slot and is addressed as one — `slotEnd`, so each word is
+  ## `(mem srcVar off)` with the offset folded into the slot's own frame displacement.
+  ## It used to be lea'd into the reserved produce bridge first, which made this the
+  ## ONLY step in the emitter holding three bridges at once (destination address,
+  ## source address, transfer word) and therefore the only reason the reservation had
+  ## to be three. Addressing the named end directly costs no register AND one
+  ## instruction fewer, and nifasm bounds-checks the offset against the slot, which
+  ## the register form cannot. This is the `AggrEnd` tiering design.md describes,
+  ## ported from x86-64 — where it was likewise the fix for a staging pool running dry.
+  g.copyAggr(regEnd(dstPtr), slotEnd(srcVar), sizeBytes, tmp)
 
 proc regsToStructThroughPtr*(g: var CodeGen; ptrReg: Reg; typeSym: SymId; firstArg: int) =
   ## `[ptrReg] ← x{firstArg+i}` — marshal a ≤16B aggregate held in the return registers
@@ -364,7 +369,7 @@ proc wideCarryChain*(g: var CodeGen; loOp, hiOp: MInst; dst, a, b: WideRef) =
   g.wideStore(dst, 1, t)
   g.dropWideRegs(@[t])
 
-proc wideWordwise*(g: var CodeGen; op: A64Inst; dst, a, b: WideRef) =
+proc wideWordwise*(g: var CodeGen; op: RiscInst; dst, a, b: WideRef) =
   ## `dst = a <op> b` for the bitwise ops, which have no inter-half dependency.
   let t = g.takeWideRegs(1, "a 64-bit bitwise accumulator")[0]
   for i in 0 .. 1:

@@ -14,7 +14,7 @@
 ## below, and it is why so much of this asks the binding tables which register is
 ## free rather than picking one.
 
-import std / [assertions, tables, sets, strformat]
+import std / [assertions, tables, sets, strformat, strutils]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
                     context, diag, typeutil, 
@@ -43,12 +43,33 @@ proc bindTemp*(g: var CodeGen; r: Reg; typ: AsmSlot) =
 
 proc emitLvalue2*(g: var CodeGen; c: Cursor; globBase = dontCare; isStore = false)
 
-proc tryTakeBridge*(g: var CodeGen; typ = ScalarSlot; avoid = NoReg): Reg =
+proc tryTakeBridge*(g: var CodeGen; typ = ScalarSlot; avoid = NoReg;
+                   lastResort = false): Reg =
   ## `takeBridge` for a caller that HAS another answer when every bridge is
   ## already staging: reports exhaustion as `NoReg` instead of asserting.
+  ##
+  ## I2 is enforced HERE, the one choke point every bridge take goes through, and
+  ## it is checked BEFORE the search rather than after it fails: a step that
+  ## exceeds its declaration is wrong even on a machine roomy enough to have
+  ## satisfied it, and that is precisely the bug a fixed reservation hides until
+  ## some unrelated target or stress level runs out.
+  ## `lastResort` says the caller has already tried everything else it has — a
+  ## pool register, a callee-saved survivor — and this take is the difference
+  ## between emitting and failing. That is NOT the quiet overrun the cap exists to
+  ## catch, so it is counted rather than asserted: a step that exhausts its
+  ## alternatives and says so is behaving correctly, and refusing it here would
+  ## trade a budget overrun for a hard out-of-registers, which is strictly worse.
+  ## `lastResortBridges` is what makes the escape visible instead of silent.
+  when BridgeCheck:
+    if not g.bridgeTakeAllowed():
+      if lastResort: inc lastResortTakes
+      else: bridgeOverDeclared(g)
   for r in g.bridgeRegs:
     if r != avoid and not g.rb.isBoundTemp(r) and r notin g.pickedRegs:
-      g.bindTemp(r, typ); return r
+      g.bindTemp(r, typ)
+      if lastResort: g.lastResortBridges.incl r
+      when defined(arkhamBridgeDbg): g.dbgNoteBridges(r)
+      return r
   NoReg
 
 proc takeBridge*(g: var CodeGen; typ = ScalarSlot; avoid = NoReg): Reg =
@@ -90,27 +111,35 @@ proc bindStrideScratch*(g: var CodeGen; atPos: int; recycle: Reg) =
   ## the last resort when BOTH bridges already carry this same operand's reloaded
   ## base and index. Three spilled operands in one `(mem …)` is what a `-d:release`
   ## build reaches (shoggoth's inlining and CSE make expressions dense enough that
-  ## nothing is left in the pools), and there is no third bridge.
+  ## nothing is left in the pools).
+  ##
+  ## A POOL REGISTER FIRST, a bridge only if there is none. This scratch has other
+  ## answers; a reloaded base or a spilled compare operand does not. Taking the
+  ## bridge first was free while three were reserved and one was always idle, and it
+  ## stopped being free the moment the third was spent: the stride scratch would sit
+  ## on a bridge for the whole `(mem …)`, and a `produceIntoMem2` inside the index
+  ## then left an enclosed step with none. `pickStagingA64` judges by what is BOUND
+  ## right now rather than by the whole-proc home union `reserveStrideScratch`
+  ## consulted, so it routinely finds a register that walk could not — this is the
+  ## same preference `emLvalGlobalBase`'s late-base cascade already states, for the
+  ## same reason.
   if atPos in g.lvalStrideOnBridge:
-    var r = g.tryTakeBridge()
+    var r = g.pickStagingA64()
+    if r != NoReg:
+      g.pickedRegs.incl r
+      g.bindTemp(r, ScalarSlot)
+      g.lvalStrideOnBridge.excl atPos   # not a bridge: nothing for the release to drop
+    else:
+      r = g.tryTakeBridge()
     if r == NoReg:
-      # No bridge left (both already carry this operand's reloaded base and index).
-      # Any register with NO live binding still serves — the scratch is a plain
-      # transient — and `pickStagingA64` judges that by what is bound right now
-      # instead of by the whole-proc home union `reserveStrideScratch` consulted.
-      r = g.pickStagingA64()
-      if r != NoReg:
-        g.pickedRegs.incl r
-        g.bindTemp(r, ScalarSlot)
-      else:
-        if recycle == NoReg:
-          raiseAssert "arkham a64n: no stride scratch for the indexed access in proc " &
-                      g.curProcName
-        # nifasm ALLOWS `scratch == index`: it stages the stride constant in its own
-        # reserved x16, so `scratch = idx*stride` reads the index in the very
-        # instruction that overwrites it. Only `scratch == base` is rejected there
-        # (that one would destroy the base before `add scratch, base, scratch`).
-        r = recycle
+      if recycle == NoReg:
+        raiseAssert "arkham a64n: no stride scratch for the indexed access in proc " &
+                    g.curProcName
+      # nifasm ALLOWS `scratch == index`: it stages the stride constant in its own
+      # reserved x16, so `scratch = idx*stride` reads the index in the very
+      # instruction that overwrites it. Only `scratch == base` is rejected there
+      # (that one would destroy the base before `add scratch, base, scratch`).
+      r = recycle
       g.lvalStrideOnBridge.excl atPos   # no bridge of its own to release
     g.plan.aux[atPos] = ExprAux(scratch: @[r])
   else:
@@ -211,6 +240,69 @@ proc ensureFAccum2*(g: var CodeGen; resF: FReg; loc: Location; bits: int) =
   of NamedStack: g.emFloatScalarLoad(resF, loc.name, bits)
   else: raiseAssert "arkham a64n: float accumulator source " & $loc.kind
 
+proc emitAtomicInstrRv(g: var CodeGen; c: Cursor; op: IntrinsicOp;
+                       argCurs: seq[Cursor]; res: Location) =
+  ## RV32's atomics. `lr.w`/`sc.w` carry their own ordering in the `aq`/`rl` bits
+  ## — which is what `AcqRelExclusives` names — so unlike the Cortex-M twin there
+  ## is no `dmb` bracketing anything; the pair IS the ordering.
+  ##
+  ## A plain load and a plain store are the load/store cases, and each is a single
+  ## machine access, which is the only property an atomic load or store of a
+  ## naturally-aligned word has to have on this ISA.
+  case op
+  of AtomicThreadFenceOp:
+    g.ab.keyword DmbA64                    # `fence rw,rw`
+    return
+  of AtomicSignalFenceOp:
+    return                                 # a compiler barrier only; see the a64 twin
+  else: discard
+  let bits = g.atomicBits(argCurs[0])
+  if bits != 32:
+    lengError c, "a " & $bits & "-bit atomic has no RV32 lowering: the A " &
+              "extension has `lr.w`/`sc.w` and no byte, halfword or doubleword " &
+              "form at all. Widening a byte cell to the word it sits in would " &
+              "make the access a read-modify-write of its three neighbours, " &
+              "which is not the atom that was asked for", lengInfo(c)
+  let p = g.instrOperandReg(argCurs[0])
+  if res.kind == InReg and res.isTemp and not g.rb.isBoundTemp(res.r):
+    g.bindTemp(res.r, res.typ)
+  case op
+  of AtomicLoadOp:
+    g.ab.tree MovA64:
+      g.emReg res.r
+      g.ab.tree MemX: (g.emReg p; g.ab.intLit 0)
+  of AtomicStoreOp:
+    g.ab.tree MovA64:
+      g.ab.tree MemX: (g.emReg p; g.ab.intLit 0)
+      g.emReg g.instrOperandReg(argCurs[1])
+  of AtomicExchangeOp:
+    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), NopA64, true, false)
+  of AtomicFetchAddOp:
+    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), AddA64, false, false)
+  of AtomicFetchSubOp:
+    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), SubA64, false, false)
+  of AtomicFetchAndOp:
+    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), AndA64, false, false)
+  of AtomicFetchOrOp:
+    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), OrrA64, false, false)
+  of AtomicFetchXorOp:
+    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), EorA64, false, false)
+  of AtomicAddFetchOp:
+    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), AddA64, false, true)
+  of AtomicSubFetchOp:
+    g.emitAtomicRmwRv(res.r, p, g.instrOperandReg(argCurs[1]), SubA64, false, true)
+  of AtomicCompareExchangeOp:
+    g.emitAtomicCasRv(res.r, p, g.instrOperandReg(argCurs[1]),
+                      g.instrOperandReg(argCurs[2]))
+  else:
+    lengError c, "`" & IntrinsicNames[op] & "` has no RV32 lowering — " &
+              "guard the call with a `when`", lengInfo(c)
+  # Release the operand temps' bindings, exactly as the other two arms do.
+  for i in 0 ..< min(IntrinsicRows[op].evaluatedOperands, argCurs.len):
+    let a = g.plan.planned(g.posOf(argCurs[i]))
+    if a.kind == InReg and a.isTemp and not (res.kind == InReg and a.r == res.r):
+      g.unbindTemp(a.r)
+
 proc emitAtomicInstrM(g: var CodeGen; c: Cursor; op: IntrinsicOp;
                       argCurs: seq[Cursor]; res: Location) =
   ## The Cortex-M twin of `emitAtomicInstr2`. Every variant is bracketed by `dmb`
@@ -275,6 +367,17 @@ proc emitAtomicInstr2*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
   ## variant is the strong acquire/release form, so the memory-order operands are
   ## not evaluated at all (see `evaluatedOperands`) — whatever order was asked for,
   ## this satisfies it.
+  if g.md.atomicScratch[2] == NoReg:
+    # No reserved triple, so there is no lowering to reach — and reaching one
+    # anyway would emit another ISA's exclusives. Refused by NAME here rather than
+    # discovered as a wrong mnemonic in an otherwise valid image.
+    lengError c, "`" & IntrinsicNames[op] & "` has no " & g.md.targetName &
+      " lowering — this target reserves no atomic scratch triple, so its " &
+      "load-reserved/store-conditional loop cannot be built; guard the call " &
+      "with a `when`"
+  if g.md.arch == Rv32:
+    g.emitAtomicInstrRv(c, op, argCurs, res)
+    return
   if AcqRelExclusives notin g.md.caps:
     # A different instruction set, not a different width: ARMv7-M has `ldrex`/
     # `strex` and an explicit `dmb` where AArch64 has `ldaxr`/`stlxr`.
@@ -322,9 +425,9 @@ proc emitAtomicInstr2*(g: var CodeGen; c: Cursor; op: IntrinsicOp;
     let pp = g.emOp p
     let ep = g.emOp g.instrOperandReg(argCurs[1])   # `expected`, a POINTER
     let d = g.emOp g.instrOperandReg(argCurs[2])
-    let exp = g.emOp g.md.bridgeRegs[0]
-    let old = g.emOp g.md.bridgeRegs[1]
-    let st = g.emOp g.md.bridgeRegs[2]
+    let exp = g.emOp g.md.atomicScratch[0]
+    let old = g.emOp g.md.atomicScratch[1]
+    let st = g.emOp g.md.atomicScratch[2]
     let ret = g.emOp res.r
     let w = wsfx(bits)
     # Two FORWARD exits from the loop body: `(bne lFail)` when the cell no longer
@@ -514,6 +617,7 @@ proc emitLvalWalk*(g: var CodeGen; n: var Cursor; globBase: Location; isStore: b
     inc n
 
 proc emitLvalue2*(g: var CodeGen; c: Cursor; globBase = dontCare; isStore = false) =
+  g.bridgeStep("`emitLvalue2`")                         # I1 + I2
   var n = c
   g.emitLvalWalk(n, globBase, isStore)
 
@@ -600,11 +704,42 @@ proc takeWideRegs*(g: var CodeGen; n: int; what: string): seq[Reg] =
   ## are withheld from the allocator's pools, so they are the cheap ones), then
   ## callee-saved survivors — which `takeHeld` fails loudly on rather than
   ## handing out a register something else is holding.
+  ## A wide lowering juggles PAIRS — the low and high halves of one 64-bit value
+  ## live at once, by definition, on a target whose word is four bytes — so it
+  ## raises the enclosing step's declaration to two the way `prematLval2` does:
+  ## the demand is discovered here, the registers are released by the CALLER, and
+  ## the scope that has to cover them is therefore the caller's.
+  ##
+  ## But it never takes the LAST bridge. `n` reaches four here (a 64-bit multiply,
+  ## a 64-bit shift) and this proc has an alternative that no bridge-taker in the
+  ## `(mem …)` or `cmp` paths has: a callee-saved survivor, or failing that a
+  ## `heldN.0` slot. Spending the reservation down to nothing on a step that could
+  ## have used something else is what leaves a nested step — a spilled compare
+  ## operand, a reloaded memory base — with no answer at all. Same preference
+  ## `bindStrideScratch` and `emLvalGlobalBase` state, and the reason this one was
+  ## worth finding: it only shows up on the 64-bit-on-32-bit corpus, which is the
+  ## `cortex-m 64` pass that needs `qemu-system-arm` to run.
+  g.bridgeRaise(bdTwoInRegs, "a 64-bit lowering juggling register pairs")
+  # The cascade is PREFERENCE, not restriction: declining the last bridge must
+  # never turn into a failure. Bridge while one is still left, then a survivor,
+  # then the last bridge after all, and only then the loud `takeHeld`. Written the
+  # short way — decline, then `takeHeld` — it traded a budget overrun for a hard
+  # out-of-registers in `setit.0` of `at_scratch_deref_base`, which is worse.
   result = @[]
   for _ in 0 ..< n:
-    var r = g.tryTakeBridge(ScalarSlot)
+    var r = NoReg
+    if g.liveBridges() + 1 < g.distinctBridges():
+      r = g.tryTakeBridge(ScalarSlot)
     if r == NoReg:
-      r = g.takeHeld(what).r
+      let h = g.tryTakeHeld()
+      if h.kind == InReg:
+        r = h.r
+        g.bindTemp(r, ScalarSlot)
+    if r == NoReg:
+      # The last one, after a pool register and a survivor both came up empty.
+      r = g.tryTakeBridge(ScalarSlot, lastResort = true)
+    if r == NoReg:
+      r = g.takeHeld(what).r              # fails loudly, as it always did
       g.bindTemp(r, ScalarSlot)
     result.add r
 

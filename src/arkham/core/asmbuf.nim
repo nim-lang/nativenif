@@ -23,12 +23,16 @@ import nifcore, nifcoreparse
 import "../../nifasm/core" / [model, tagpool]
                              # nifasm: A64Inst/NifasmDecl/NifasmType/NifasmExpr,
                              # and the seeded tag pool (with its escape tag)
-import ../arm/machine_a64 as machine
+import ../risc/machine_a64 as machine
                              # arkham: Reg, and the DEFAULT `renderReg` — AArch64's
                              # `regName`. The x64 and Cortex-M backends install their
                              # own, so this edge is only about the default argument.
 import peephole              # the finished-shape rewrites, applied in `render`
 export A64Inst, X64Inst, NifasmDecl, NifasmType, NifasmExpr, X64Flag
+export RvInst  # the RV32-only mnemonics (`semihost`, `csrw`, `csrs`). Three, and
+               # all three are things no other target here has: the semihosting
+               # escape is a sequence rather than a breakpoint, and a CSR write is
+               # how a RISC-V image turns its own FPU on.
 export MInst   # the Cortex-M-only mnemonics (`bkpt`, `bx`, `uxtb`, …). Everything
                # else the Cortex-M target uses is spelled with the SHARED tags, so
                # `A64Inst` covers it — see doc/instructions.md.

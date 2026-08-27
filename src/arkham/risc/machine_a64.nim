@@ -90,6 +90,7 @@ const
   aarch64Machine* = MachineDesc(
     arch: Arm64,
     intRetReg: R0,
+    floatRetReg: F0,
     divRemReg: NoReg,                # aarch64 sdiv/msub use ordinary scratch — no fixed reg
     shiftCountReg: NoReg,            # aarch64 shifts take any register
     intArgRegs: @IntArgRegs,
@@ -109,9 +110,12 @@ const
     indirectResultReg: IndirectResultReg,
     produceBridge: R16,
     bridgeRegs: @AtomicScratchRegs,
+    atomicScratch: AtomicScratchRegs,
     floatBridgeReg: FloatBridgeReg,
+    memIntrinScratch: [R3, R4, R5],
     caps: {CondSelect, TailCall, Float64, RegOffsetMem, PcRelGlobalFold,
-           AcqRelExclusives, TwoAddrForms},
+           AcqRelExclusives, TwoAddrForms, BitScanOps, FloatConvert,
+           SimdVector},
                                      # NOT AllFlagBranches: nifasm's `genIteA64`
                                      # implements the zero flag only, so far.
                                      # NOT SubwordExtend: the hardware has `sxtb`,
@@ -134,6 +138,7 @@ const
   aarch64MachineN* = MachineDesc(
     arch: Arm64,
     intRetReg: R0,
+    floatRetReg: F0,
     divRemReg: NoReg,
     shiftCountReg: NoReg,
     intArgRegs: @IntArgRegs,
@@ -152,9 +157,12 @@ const
     indirectResultReg: IndirectResultReg,
     produceBridge: R16,
     bridgeRegs: @AtomicScratchRegs,
+    atomicScratch: AtomicScratchRegs,
     floatBridgeReg: FloatBridgeReg,
+    memIntrinScratch: [R3, R4, R5],
     caps: {CondSelect, TailCall, Float64, RegOffsetMem, PcRelGlobalFold,
-           AcqRelExclusives, TwoAddrForms},
+           AcqRelExclusives, TwoAddrForms, BitScanOps, FloatConvert,
+           SimdVector},
                                      # NOT AllFlagBranches: nifasm's `genIteA64`
                                      # implements the zero flag only, so far.
                                      # NOT SubwordExtend: the hardware has `sxtb`,

@@ -18,7 +18,7 @@ import std / [tables, sets, os]
 
 import nifcore
 import asmslots, machinedesc, planer
-import "../arm/machine_m"
+import "../risc/machine_m"
 import asmbuf, regbind, context
 
 

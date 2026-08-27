@@ -1,0 +1,287 @@
+(.nif27)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :cmp32.0
+  (params
+   (param :a.0 .
+    (u 32))
+   (param :b.0 .
+    (u 32))).
+  (pragmas
+   (instruction "cmp"))
+  (stmts .))
+ (proc :zf.0
+  (params)
+  (bool)
+  (pragmas
+   (instruction "zf"))
+  (stmts .))
+ (proc :nz.0
+  (params)
+  (bool)
+  (pragmas
+   (instruction "nz"))
+  (stmts .))
+ (proc :cf.0
+  (params)
+  (bool)
+  (pragmas
+   (instruction "cf"))
+  (stmts .))
+ (proc :nc.0
+  (params)
+  (bool)
+  (pragmas
+   (instruction "nc"))
+  (stmts .))
+ (gvar :g.0 .
+  (i 32)42)
+ (proc :addrG.0
+  (params)
+  (ptr
+   (i 32))
+  (pragmas
+   (assembler))
+  (stmts
+   (var :result.0 .
+    (ptr
+     (i 32)).)
+   (asgn result.0
+    (addr g.0))
+   (ret result.0)))
+ (proc :eq.0
+  (params
+   (param :x.0
+    (pragmas
+     (register "x10"))
+    (u 32))
+   (param :y.0
+    (pragmas
+     (register "x11"))
+    (u 32)))
+  (u 32)
+  (pragmas
+   (assembler))
+  (stmts
+   (var :result.0 .
+    (u 32).)
+   (instr cmp32.0 x.0 y.0)
+   (if
+    (elif
+     (instr zf.0)
+     (stmts
+      (asgn result.0 3)))
+    (else
+     (stmts
+      (asgn result.0 1))))
+   (ret result.0)))
+ (proc :ne.0
+  (params
+   (param :x.0
+    (pragmas
+     (register "x10"))
+    (u 32))
+   (param :y.0
+    (pragmas
+     (register "x11"))
+    (u 32)))
+  (u 32)
+  (pragmas
+   (assembler))
+  (stmts
+   (var :result.0 .
+    (u 32).)
+   (instr cmp32.0 x.0 y.0)
+   (if
+    (elif
+     (instr nz.0)
+     (stmts
+      (asgn result.0 5)))
+    (else
+     (stmts
+      (asgn result.0 2))))
+   (ret result.0)))
+ (proc :below.0
+  (params
+   (param :x.0
+    (pragmas
+     (register "x10"))
+    (u 32))
+   (param :y.0
+    (pragmas
+     (register "x11"))
+    (u 32)))
+  (u 32)
+  (pragmas
+   (assembler))
+  (stmts
+   (var :result.0 .
+    (u 32).)
+   (instr cmp32.0 x.0 y.0)
+   (if
+    (elif
+     (instr cf.0)
+     (stmts
+      (asgn result.0 7)))
+    (else
+     (stmts
+      (asgn result.0 4))))
+   (ret result.0)))
+ (proc :atLeast.0
+  (params
+   (param :x.0
+    (pragmas
+     (register "x10"))
+    (u 32))
+   (param :y.0
+    (pragmas
+     (register "x11"))
+    (u 32)))
+  (u 32)
+  (pragmas
+   (assembler))
+  (stmts
+   (var :result.0 .
+    (u 32).)
+   (instr cmp32.0 x.0 y.0)
+   (if
+    (elif
+     (instr nc.0)
+     (stmts
+      (asgn result.0 6)))
+    (else
+     (stmts
+      (asgn result.0 8))))
+   (ret result.0)))
+ (proc :viaStack.0
+  (params
+   (param :x.0
+    (pragmas
+     (register "x10"))
+    (u 32)))
+  (u 32)
+  (pragmas
+   (assembler))
+  (stmts
+   (var :result.0 .
+    (u 32).)
+   (var :t.0
+    (pragmas
+     (stack))
+    (u 32).)
+   (var :r.0
+    (pragmas
+     (register "x18"))
+    (u 32).)
+   (asgn t.0 x.0)
+   (asgn r.0 t.0)
+   (asgn result.0 r.0)
+   (ret result.0)))
+ (proc :loopBreak.0
+  (params)
+  (u 32)
+  (pragmas
+   (assembler))
+  (stmts
+   (var :result.0 .
+    (u 32).)
+   (var :r.0
+    (pragmas
+     (register "x11"))
+    (u 32).)
+   (while
+    (true)
+    (stmts
+     (asgn r.0 7)
+     (break)))
+   (asgn result.0 r.0)
+   (ret result.0)))
+ (proc :same.0
+  (params
+   (param :x.0
+    (pragmas
+     (register "x10"))
+    (u 32)))
+  (u 32)
+  (pragmas
+   (assembler)
+   (naked))
+  (stmts
+   (var :result.0 .
+    (u 32).)
+   (asgn result.0 x.0)
+   (ret result.0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :a.0 .
+    (u 32)
+    (call eq.0 9 9))
+   (var :b.0 .
+    (u 32)
+    (call ne.0 9 8))
+   (var :c.0 .
+    (u 32)
+    (call below.0 3 8))
+   (var :d.0 .
+    (u 32)
+    (call atLeast.0 8 3))
+   (var :e.0 .
+    (u 32)
+    (call viaStack.0 5))
+   (var :f.0 .
+    (u 32)
+    (call loopBreak.0))
+   (var :h.0 .
+    (u 32)
+    (call same.0 4))
+   (var :p.0 .
+    (ptr
+     (i 32))
+    (call addrG.0))
+   (var :k.0 .
+    (u 32)
+    (conv
+     (u 32)
+     (deref p.0)))
+   (var :s0.0 .
+    (u 32)
+    (add
+     (u 32)a.0 b.0))
+   (var :s1.0 .
+    (u 32)
+    (add
+     (u 32)s0.0 c.0))
+   (var :s2.0 .
+    (u 32)
+    (add
+     (u 32)s1.0 d.0))
+   (var :s3.0 .
+    (u 32)
+    (add
+     (u 32)s2.0 e.0))
+   (var :s4.0 .
+    (u 32)
+    (add
+     (u 32)s3.0 f.0))
+   (var :s5.0 .
+    (u 32)
+    (add
+     (u 32)s4.0 h.0))
+   (var :s.0 .
+    (u 32)
+    (add
+     (u 32)s5.0 k.0))
+   (call exit.0
+    (conv
+     (i 32)s.0)))))
+(.index)

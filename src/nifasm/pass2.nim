@@ -31,6 +31,7 @@ import x64/instr
 import arm64/instr
 import thumb/instr
 import thumb/board
+import rv32/instr
 import pass1                          # `handleArch`: `(arch …)` also appears in pass 2
 
 proc genInst(n: var Cursor; ctx: var GenContext)
@@ -99,10 +100,11 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     # length, e.g. a 2-byte string constant) may immediately precede this proc in
     # the text stream, and AArch64 instructions are fixed 4-byte words — a
     # misaligned body desynchronizes the whole following instruction stream.
-    if ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64, Arch.CortexM}:
+    if ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64, Arch.CortexM, Arch.Rv32}:
       # Cortex-M needs only halfword alignment, but a 32-bit Thumb encoding
       # straddling a word boundary costs a cycle on some cores and nothing here
-      # benefits from the two saved bytes, so it aligns like the others.
+      # benefits from the two saved bytes, so it aligns like the others. RV32
+      # without the C extension is fixed 4-byte words, so it needs this outright.
       while (ctx.buf.data.len and 3) != 0: ctx.buf.data.add 0'u8
 
     # Find/Create label for proc
@@ -120,8 +122,10 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
                               start: ctx.buf.data.len, stop: -1)
     ctx.inPrologue = true
     # CFA at entry: on x86-64 the `call` pushed the return address (SP+8); on
-    # AArch64 and Cortex-M it is still in the link register, so the CFA is SP.
-    ctx.cfaOff = if ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64, Arch.CortexM}: 0'i32
+    # AArch64, Cortex-M and RV32 it is still in the link register (`lr`, `ra`),
+    # so the CFA is SP.
+    ctx.cfaOff = if ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64, Arch.CortexM,
+                                 Arch.Rv32}: 0'i32
                  else: 8'i32
 
     # Initialize stack context
@@ -138,6 +142,7 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     ctx.clobbered = {}
     ctx.clobberedA64 = {}
     ctx.clobberedM = {}
+    ctx.clobberedRv = {}
     setLenient false
 
     # Add params to scope.
@@ -147,10 +152,12 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     # address is in LR (not on the stack) and the caller leaves SP pointing right
     # at the first stack arg, so incoming stack params are addressed SP-relative
     # from offset 0 (valid before the callee shifts SP).
-    # Cortex-M shares AArch64's frame shape here: the return address is in LR
-    # rather than on the stack, and the caller leaves SP pointing at the first
-    # stack argument, so incoming stack params are SP-relative from offset 0.
-    let isA64Proc = ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64, Arch.CortexM}
+    # Cortex-M and RV32 share AArch64's frame shape here: the return address is
+    # in the link register rather than on the stack, and the caller leaves SP
+    # pointing at the first stack argument, so incoming stack params are
+    # SP-relative from offset 0.
+    let isA64Proc = ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64, Arch.CortexM,
+                                 Arch.Rv32}
     # …and on Win64 the caller's stack arguments start above the shadow space it also
     # reserved, so the callee's view of them shifts by the same amount.
     var paramOffset = if isA64Proc: 0
@@ -233,6 +240,19 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     # 16-aligned, so `+ pad` lands the frame exactly where the separate pair did.
     let v = uint32(alignedStackSize + pad)
     if pos + 4 > ctx.buf.data.len: continue
+    if ctx.arch == Arch.Rv32:
+      # A `lui`+`addi` pair, always 8 bytes, so no instruction changes length and
+      # no position downstream moves — the same property that lets the Cortex-M
+      # arm below patch in place, and for the same reason it was chosen over a
+      # bare `addi`: `addi` reaches only ±2048, so picking between the forms would
+      # make the instruction's WIDTH depend on a number that is not known until
+      # here. See `operands.emitSsizeRv`.
+      #
+      # Any frame size fits, unlike the 12- or 16-bit immediates the Arm targets
+      # are limited to.
+      if pos + 8 > ctx.buf.data.len: continue
+      ctx.buf.data.patchRvLuiAddiPair(pos, v)
+      continue
     if isM:
       # A MOVW/MOVT pair, always 8 bytes, so no instruction changes length and no
       # position downstream moves. That is why the Cortex-M frame needs none of
@@ -316,6 +336,8 @@ proc genInst(n: var Cursor; ctx: var GenContext) =
     genInstNodeA64(n, ctx)
   of Arch.CortexM:
     genInstNodeM(n, ctx)
+  of Arch.Rv32:
+    genInstNodeRv(n, ctx)
 
 proc pass2*(n: Cursor; ctx: var GenContext) =
   ## Pass2: Generate code only for top-level instructions (entry point).

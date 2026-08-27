@@ -29,6 +29,33 @@ type
       ## `adr` supplies the PC — so unlike `adrp`+`add` it needs no page arithmetic
       ## and no knowledge of the section's final vaddr, which is why it can live here
       ## and serve Mach-O, ELF and PE alike.
+    rkRvJ, rkRvJal, rkRvBranch, rkRvAuipcAddi, rkRvLuiAddi
+      ## RV32. Every one is a fixed 32-bit little-endian word (no C extension), and
+      ## every PC-relative form measures from the instruction's OWN address — like
+      ## AArch64, unlike Thumb (PC+4) and unlike x86 (end of instruction).
+      ##
+      ## `rkRvJ` and `rkRvJal` are the SAME `jal` encoding differing only in `rd`
+      ## (`x0` discards the return address, `ra` keeps it), which is why they are
+      ## two kinds rather than one: `isUncondJump` must say yes to the first and no
+      ## to the second, exactly as it does for `rkB` against `rkBL`. Both reach
+      ## ±1 MiB through J-type's scattered imm[20|10:1|11|19:12].
+      ##
+      ## `rkRvBranch` is B-type — ±4 KiB, imm[12|10:5|4:1|11] — and carries its
+      ## condition in the `funct3` already sitting in the buffer, so one kind
+      ## covers all six of `beq`/`bne`/`blt`/`bge`/`bltu`/`bgeu`. It is absent from
+      ## `isInvertibleCond` for now: flipping a RISC-V branch is a single funct3
+      ## bit, but nothing yet needs the optimization and a wrong flip is silent.
+      ##
+      ## `rkRvAuipcAddi` is the `auipc`+`addi` pair every PC-relative address goes
+      ## through, and `rkRvLuiAddi` the `lui`+`addi` pair carrying an ABSOLUTE one
+      ## (the RV32 twin of `rkTMovwMovt`, and like it usable only because a
+      ## bare-metal image's load address is fixed). Both split a 32-bit value as
+      ## `hi20 = (v + 0x800) shr 12` and `lo12 = v - (hi20 shl 12)`: the `addi`'s
+      ## 12-bit field is SIGN-EXTENDED, so a `lo12` with bit 11 set subtracts
+      ## 0x1000, and the `+ 0x800` is what pre-compensates for it. Dropping that
+      ## round-up is the classic RISC-V relocation bug — it is correct for every
+      ## address whose low 12 bits are under 0x800 and off by 4096 for the rest.
+
     rkTB, rkTBL, rkTBcond, rkTADR, rkTMovwMovt, rkTMovwMovtFunc
       ## Thumb-2 (Cortex-M). All four branch forms are 32-bit encodings stored as
       ## two little-endian HALFWORDS, high halfword first.
@@ -160,6 +187,10 @@ proc calculateRelocDistance(fromPos: int; toPos: int; kind: RelocKind = rkJmp): 
     toPos - (fromPos + 4)   # Thumb: PC reads two halfwords ahead of the instruction
   of rkTMovwMovt, rkTMovwMovtFunc:
     toPos                   # absolute: the patcher wants the target, not a distance
+  of rkRvJ, rkRvJal, rkRvBranch, rkRvAuipcAddi:
+    toPos - fromPos         # RV32: PC-relative from the instruction's own address
+  of rkRvLuiAddi:
+    toPos                   # absolute, like the Thumb MOVW/MOVT pair
 
 # Jump optimization functions
 proc updateRelocDisplacements*(buf: var Buffer) =
@@ -195,6 +226,10 @@ proc updateRelocDisplacements*(buf: var Buffer) =
         currentPos + 4  # a 32-bit Thumb-2 encoding: two halfwords
       of rkTMovwMovt, rkTMovwMovtFunc:
         currentPos + 8  # MOVW + MOVT pair
+      of rkRvJ, rkRvJal, rkRvBranch:
+        currentPos + 4  # one 32-bit RV32 word
+      of rkRvAuipcAddi, rkRvLuiAddi:
+        currentPos + 8  # the two-instruction address pair
 
     if requiredSize > buf.data.len:
       continue  # Skip this relocation if buffer is too small
@@ -415,6 +450,80 @@ proc updateRelocDisplacements*(buf: var Buffer) =
       let thumbBit = if reloc.kind == rkTMovwMovtFunc: 1'u32 else: 0'u32
       buf.data.patchThumbMovwMovtPair(currentPos,
                                       uint32(distance) + buf.absBase + thumbBit)
+    of rkRvJ, rkRvJal:
+      # RV32 J-type `jal rd, label`. The 20-bit field is scattered as
+      # imm[20|10:1|11|19:12] and the low bit is IMPLICIT — a target address is
+      # always even — so the reach is ±1 MiB, not ±512 KiB. `rd` is already in the
+      # placeholder (`x0` for a jump, `ra` for a call), which is the whole
+      # difference between the two kinds, so it is preserved rather than re-derived.
+      if (distance and 1) != 0:
+        raise newException(ValueError, "RV32 jal to an odd address: " & $distance)
+      if distance < -(1 shl 20) or distance >= (1 shl 20):
+        raise newException(ValueError,
+          "RV32 jal out of range: " & $distance & " bytes (limit ±1 MB)")
+      let d = cast[uint32](int32(distance))
+      var instr = uint32(buf.data[currentPos]) or
+                  (uint32(buf.data[currentPos + 1]) shl 8) or
+                  (uint32(buf.data[currentPos + 2]) shl 16) or
+                  (uint32(buf.data[currentPos + 3]) shl 24)
+      instr = instr and 0x0000_0FFF'u32           # keep rd and the opcode
+      instr = instr or (((d shr 20) and 0x1'u32) shl 31)
+      instr = instr or (((d shr 1) and 0x3FF'u32) shl 21)
+      instr = instr or (((d shr 11) and 0x1'u32) shl 20)
+      instr = instr or (((d shr 12) and 0xFF'u32) shl 12)
+      buf.data[currentPos]     = byte(instr and 0xFF)
+      buf.data[currentPos + 1] = byte((instr shr 8) and 0xFF)
+      buf.data[currentPos + 2] = byte((instr shr 16) and 0xFF)
+      buf.data[currentPos + 3] = byte((instr shr 24) and 0xFF)
+    of rkRvBranch:
+      # RV32 B-type. imm[12|10:5] in [31:25] and imm[4:1|11] in [11:7], with the
+      # low bit implicit again — so ±4 KiB. Everything else in the word (funct3,
+      # which IS the condition, and both source registers) is preserved.
+      if (distance and 1) != 0:
+        raise newException(ValueError, "RV32 branch to an odd address: " & $distance)
+      if distance < -4096 or distance > 4094:
+        raise newException(ValueError,
+          "RV32 branch out of range: " & $distance & " bytes (limit ±4 KB); " &
+          "the selector must invert it over a `jal`")
+      let d = cast[uint32](int32(distance))
+      var instr = uint32(buf.data[currentPos]) or
+                  (uint32(buf.data[currentPos + 1]) shl 8) or
+                  (uint32(buf.data[currentPos + 2]) shl 16) or
+                  (uint32(buf.data[currentPos + 3]) shl 24)
+      instr = instr and 0x01FF_F07F'u32           # keep rs2, rs1, funct3, opcode
+      instr = instr or (((d shr 12) and 0x1'u32) shl 31)
+      instr = instr or (((d shr 5) and 0x3F'u32) shl 25)
+      instr = instr or (((d shr 1) and 0xF'u32) shl 8)
+      instr = instr or (((d shr 11) and 0x1'u32) shl 7)
+      buf.data[currentPos]     = byte(instr and 0xFF)
+      buf.data[currentPos + 1] = byte((instr shr 8) and 0xFF)
+      buf.data[currentPos + 2] = byte((instr shr 16) and 0xFF)
+      buf.data[currentPos + 3] = byte((instr shr 24) and 0xFF)
+    of rkRvAuipcAddi, rkRvLuiAddi:
+      # The two-instruction address pair. `auipc` adds its hi20 to the pair's OWN
+      # address, so the value split here is a displacement; `lui` loads hi20
+      # outright, so it is an absolute address and `absBase` applies — the same
+      # split the Thumb MOVW/MOVT pair makes between its two kinds.
+      #
+      # `+ 0x800` before the shift is load-bearing: the `addi` field is
+      # sign-extended, so a `lo12` at or above 0x800 reads as negative and
+      # subtracts 0x1000 from the result. Rounding hi20 up cancels it exactly.
+      let v = (if reloc.kind == rkRvLuiAddi: cast[uint32](int32(distance)) + buf.absBase
+               else: cast[uint32](int32(distance)))
+      let hi20 = (v + 0x800'u32) shr 12
+      let lo12 = v - (hi20 shl 12)
+      for half in 0 ..< 2:
+        let o = currentPos + 4 * half
+        var instr = uint32(buf.data[o]) or (uint32(buf.data[o + 1]) shl 8) or
+                    (uint32(buf.data[o + 2]) shl 16) or (uint32(buf.data[o + 3]) shl 24)
+        if half == 0:
+          instr = (instr and 0x0000_0FFF'u32) or ((hi20 and 0xFFFFF'u32) shl 12)
+        else:
+          instr = (instr and 0x000F_FFFF'u32) or ((lo12 and 0xFFF'u32) shl 20)
+        buf.data[o]     = byte(instr and 0xFF)
+        buf.data[o + 1] = byte((instr shr 8) and 0xFF)
+        buf.data[o + 2] = byte((instr shr 16) and 0xFF)
+        buf.data[o + 3] = byte((instr shr 24) and 0xFF)
     of rkADR:
       # ARM64 ADR: 21-bit signed immediate, byte offset from PC
       if distance < -(1 shl 20) or distance >= (1 shl 20):
@@ -464,7 +573,7 @@ proc isUncondJump(kind: RelocKind): bool {.inline.} =
   ## An unconditional PC-relative transfer that ALWAYS falls to its target and never
   ## returns: x86 `jmp` and AArch64 `b`. (Calls `rkCall`/`rkBL` return; conditional
   ## branches may fall through — neither is unconditional.)
-  kind in {rkJmp, rkB, rkTB}
+  kind in {rkJmp, rkB, rkTB, rkRvJ}
 
 proc isThreadableBranch(kind: RelocKind): bool {.inline.} =
   ## A control transfer whose *target label* we may retarget to skip a jump hop:
@@ -474,7 +583,11 @@ proc isThreadableBranch(kind: RelocKind): bool {.inline.} =
   kind in {rkJmp, rkJe, rkJne, rkJg, rkJl, rkJge, rkJle, rkJa, rkJb, rkJae, rkJbe,
            rkJo, rkJno, rkJs, rkJns, rkJp, rkJnp,
            rkB, rkBEQ, rkBNE, rkCBZ, rkCBNZ, rkTBZ, rkTBNZ,
-           rkTB, rkTBcond}
+           rkTB, rkTBcond,
+           rkRvJ, rkRvBranch}
+  # RV32: `threadJumps` is only run from `writeelf`, never on the RV32 path, so
+  # these two are inert today. Should threading reach RV32, `rkRvBranch` has no
+  # relaxation — retargeting one past ±4 KiB fails in `patchRvBranch`.
 
 proc prunePositions(buf: var Buffer; deadPos: HashSet[int]): seq[int] =
   ## Delete the instruction starting at each position in `deadPos` (each MUST be the

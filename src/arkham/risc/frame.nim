@@ -29,12 +29,12 @@ proc wideParamToHome(g: var CodeGen; nm: string; firstArg: int)
 
 proc isWideType(g: var CodeGen; t: Cursor): bool {.inline.}
 
-proc emPair(g: var CodeGen; op: A64Inst; r1, r2: Reg; off: int) =
+proc emPair(g: var CodeGen; op: RiscInst; r1, r2: Reg; off: int) =
   # stp/ldp save/restore *physical* callee-saved registers (which may also be
   # named-local homes), so emit raw register nodes, not the local names.
   g.ab.tree op: g.ab.rawReg r1; g.ab.rawReg r2; g.ab.rawReg SP; g.ab.intLit off
 
-proc emFPair(g: var CodeGen; op: A64Inst; f1, f2: FReg; off: int) =
+proc emFPair(g: var CodeGen; op: RiscInst; f1, f2: FReg; off: int) =
   g.ab.tree op: g.ab.dreg f1; g.ab.dreg f2; g.emReg SP; g.ab.intLit off
 
 proc frameSaveSlot(g: var CodeGen; r: Reg; off: int; storing: bool) =
@@ -233,18 +233,18 @@ proc emitSyprocA64*(g: var CodeGen; sp: SyscallProc) =
               pc.into:                           # (param :name pragmas type)
                 inc pc                           # name → positional pN.0
                 skip pc                          # pragmas
-                if idx >= IntArgRegs.len:
+                if idx >= g.md.intArgRegs.len:
                   raiseAssert "arkham a64: syscall with too many arguments"
                 g.ab.tree ParamD:
                   g.ab.symDef paramName(idx)
-                  g.ab.rawReg IntArgRegs[idx]
+                  g.ab.rawReg g.md.intArgRegs[idx]
                   g.genTypeBody(pc)
                 while pc.hasMore: skip pc
               inc idx
       g.ab.tree ResultD:                         # c at the return type
         if not retIsVoid(c):
           g.ab.symDef synth("ret.0")
-          g.ab.rawReg IntRet
+          g.ab.rawReg g.md.intRetReg
           g.genTypeBody(c)
       if sp.sysNrA64 < 0:
         # A row whose AArch64 column is `-1` (a legacy call the asm-generic ABI
@@ -318,6 +318,15 @@ proc computeFrame*(g: var CodeGen; hasCall: bool) =
     # walking off the end of an odd-length list.
     for r in g.md.abiCalleeSaved:
       if r notin g.frameRegs: (g.frameRegs.add r; break)
+  if g.isInterrupt:
+    # A trap arrives on top of arbitrary code and NOTHING was stacked for it, so
+    # what an ordinary proc may destroy freely is exactly what a handler may not.
+    # `convClobbersGpr` is that set — the ABI's own answer to "what does a call
+    # destroy" — and saving all of it is the only description that does not
+    # require knowing which registers the body and the emitter between them
+    # happened to touch. `linkReg` is already word 0 of the block.
+    for r in g.md.convClobbersGpr:
+      if r != g.md.linkReg and r notin g.frameRegs: g.frameRegs.add r
   g.frameFRegs = @[]
   for f in g.md.floatCalleeSaved:
     if f in g.plan.usedCalleeF: g.frameFRegs.add f
@@ -676,7 +685,7 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
         # instead. (>8 float params; the integer side is handled above.)
         assert not pl.onStack, "arkham v1: >8 float params (stack TODO): " & nm &
           " in " & g.curProcName
-        g.fmovF(loc.f, FloatArgRegs[pl.fpIndex], loc.typ.size * 8)
+        g.fmovF(loc.f, g.md.floatArgRegs[pl.fpIndex], loc.typ.size * 8)
       elif loc.kind == NamedStack and loc.typ.kind == AFloat:
         # An address-taken / spilled float param: declare its `(s) (f N)` slot and
         # spill the incoming SIMD arg register into it so `addr`/loads/stores work.
@@ -684,7 +693,7 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
           " in " & g.curProcName
         let bits = loc.typ.size * 8
         g.emFloatStackVar(nm, bits)
-        g.emFloatScalarStore(nm, FloatArgRegs[pl.fpIndex], bits)
+        g.emFloatScalarStore(nm, g.md.floatArgRegs[pl.fpIndex], bits)
       elif loc.kind == NamedStack:
         # An address-taken scalar param: declare its `(s)` slot and spill the
         # incoming argument register into it so `addr`/loads/stores work. The slot
@@ -806,7 +815,7 @@ proc emitSignature*(g: var CodeGen; decl: Cursor; declarative: bool) =
             skip c
           else:
             g.ab.symDef synth("ret.0")
-            g.ab.rawReg IntRet                   # raw reg *location* of the result
+            g.ab.rawReg g.md.intRetReg                   # raw reg *location* of the result
             g.genTypeBody(c)                  # the result type (consumes it)
       while c.hasMore: skip c                 # pragmas, body
   else:

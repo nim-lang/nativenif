@@ -120,6 +120,35 @@ proc asmPinReg*(g: var CodeGen; at: Cursor; name: string): Reg =
       lengError at, "`" & name & "` is one of arkham's two staging bridges " &
                 "(r10/r11): a folded memory operand has to be loaded somewhere, " &
                 "and this target has no spare volatile at all", g.asmInfo
+  elif g.md.arch == Rv32:
+    # RV32's own arm. It used to fall into the AArch64 `else` below, which answers
+    # about a different register file: `x16`/`x17` are IP0/IP1 there and the
+    # ARGUMENT registers a6/a7 here, `x18` is the platform register there and the
+    # callee-saved home `s2` here, and the link-register message names `x30` in
+    # prose while `md.linkReg` is `x1`. Every one of those is a confident sentence
+    # about the wrong register.
+    if result == g.md.linkReg:
+      lengError at, "`x1` is the link register (`ra`): every `jal` overwrites it " &
+                "and the epilogue reads it back", g.asmInfo
+    if result == R0:
+      lengError at, "`x0` reads as zero and discards every write — a value put " &
+                "there is not stored, it is deleted", g.asmInfo
+    if result in {R3, R4}:
+      lengError at, "`" & name & "` is reserved by the RISC-V ABI (`gp`/`tp`); " &
+                "nothing here establishes one, but a proc that clobbered it " &
+                "would break any object linked in that does", g.asmInfo
+    if result == g.md.indirectResultReg:
+      lengError at, "`x9` carries `&result` for a callee returning an aggregate " &
+                "too wide for registers", g.asmInfo
+    if result == R8:
+      lengError at, "`x8` is the ABI's frame pointer (`s0`), kept off the file " &
+                "so a debugger's frame walk and a hand-written body have a fixed " &
+                "place to stand", g.asmInfo
+    if result in {g.md.bridgeRegs[0], g.md.bridgeRegs[1]}:
+      lengError at, "`" & name & "` is one of arkham's two staging bridges " &
+                "(x29/x30): a folded memory operand has to be loaded somewhere, " &
+                "and this target reserves exactly as many as one emitter step " &
+                "may hold at once", g.asmInfo
   else:
     if result == g.md.linkReg:
       lengError at, "`x30` is the link register: every `bl` overwrites it and " &
@@ -190,6 +219,17 @@ proc armFlagSupported(g: CodeGen; f: X64Flag): bool {.inline.} =
   ## in the middle of an otherwise valid image.
   if f == NoFlag: false
   elif AllFlagBranches in g.md.caps: f in {ZfO, NzO, CfO, NcO, SfO, NsO, OfO, NoO}
+  elif g.md.arch == Rv32:
+    # FOUR, which is why neither arm above fits and this one exists. RV32 has no
+    # condition flags at all: its selector fuses `(cmp a b)` into the branch that
+    # consumes it, so `zf`/`nz` are equality and `cf`/`nc` are the unsigned
+    # `<`/`>=` a borrow denotes. `sf`/`of` have no equivalent — the sign of a
+    # difference agrees with `<` only when the subtraction did not overflow, which
+    # is why AArch64's `blt` tests `N != V` — and `relOfFlagRv` refuses them by
+    # name. Answering `{ZfO, NzO}` here (the pre-RV32 default) was SAFE but a
+    # subset: it turned `cf` into "this target has no such thing", which is the
+    # wrong sentence about a target whose branches are exactly comparisons.
+    f in {ZfO, NzO, CfO, NcO}
   else: f in {ZfO, NzO}
 
 proc asmStmt*(g: var CodeGen; c: Cursor)
@@ -464,8 +504,7 @@ proc asmInstr*(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor) =
     while fc.hasMore: (argCurs.add asmAtom(fc); skip fc)
   let tgt = instrTargetOf(g.prog, fsym)
   let row = IntrinsicRows[tgt.op]
-  let here = g.hereTarget
-  if here notin row.targets:
+  if not g.hasHereLowering(row.targets):
     lengError c, "`" & IntrinsicNames[tgt.op] & "` has no " &
               g.md.targetName & " lowering; an " &
               "`.assembler` proc has no fallback path", g.asmInfo
@@ -486,6 +525,16 @@ proc asmInstr*(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor) =
   # nothing else, so a row asking for 64 there is refused by nifasm's width check
   # rather than encoded as something narrower.
   let bits = if tgt.argBits in {8, 16, 32}: 32 else: 64
+  if tgt.op in {ClzPinnedOp, ClzOp, RbitOp, CtzOp, RevOp, BswapOp} and
+     BitScanOps notin g.md.caps:
+    # Refused BY NAME rather than lowered. There is a software sequence for each
+    # of these, but this is `{.assembler.}` — the mode whose whole contract is
+    # that every construct maps one-to-one and nothing is materialised — so
+    # expanding one row into a loop is the one thing it must not do. The
+    # ORDINARY path may lower them in software; this one says no.
+    lengError c, "`" & IntrinsicNames[tgt.op] & "` has no single instruction on " &
+              g.md.targetName & ", and `.assembler` will not expand one row into " &
+              "a sequence; use it outside an `{.assembler.}` proc", g.asmInfo
   case tgt.op
   of ClzPinnedOp, ClzOp:
     g.ab.tree ClzA64: (g.emReg dst; g.emReg src; g.ab.intLit bits)
@@ -535,7 +584,8 @@ proc asmVarDecl*(g: var CodeGen; c: Cursor) =
         # truncating. Saying so here names the local instead of pointing at a
         # `(mov …)` the user did not write.
         lengError nameC, "`" & userName(nm) & "` is " & $s.size & " bytes, and a " &
-                  "Cortex-M `.assembler` body moves one 4-byte word at a time — " &
+                  g.md.targetName & " `.assembler` body moves one " &
+                  $wordSize() & "-byte word at a time — " &
                   "declare the halves", g.asmInfo
       g.asmStack.incl nm
       g.emTypedStackVar(nm, typeCur)
@@ -590,8 +640,7 @@ proc asmIf(g: var CodeGen; c: Cursor) =
             lengError condC, "an `.assembler` condition must be a flag " &
                       "intrinsic such as `zf()`; any other condition would " &
                       "need an instruction that clobbers the flags", g.asmInfo
-          let here = g.hereTarget
-          if here notin IntrinsicRows[op].targets:
+          if not g.hasHereLowering(IntrinsicRows[op].targets):
             lengError condC, "`" & IntrinsicNames[op] & "` has no " &
                       g.md.targetName & " lowering",
                       g.asmInfo
@@ -674,31 +723,38 @@ proc asmStmt*(g: var CodeGen; c: Cursor) =
     if op != NoIntrinsicOp and IntrinsicRows[op].inoutOperand >= 0:
       g.asmInoutInstr(c, op)
     elif op != NoIntrinsicOp and IntrinsicRows[op].isFlagWrite:
-      let here = g.hereTarget
-      if here notin IntrinsicRows[op].targets:
+      if not g.hasHereLowering(IntrinsicRows[op].targets):
         lengError c, "`" & IntrinsicNames[op] & "` has no " &
                   g.md.targetName & " lowering; an " &
                   "`.assembler` proc has no fallback path", g.asmInfo
       g.asmFlagInstr(c, op)
     elif op != NoIntrinsicOp and IntrinsicRows[op].isVoidResult and
          IntrinsicRows[op].arity > 0:
-      let here = g.hereTarget
-      if here notin IntrinsicRows[op].targets:
+      if not g.hasHereLowering(IntrinsicRows[op].targets):
         lengError c, "`" & IntrinsicNames[op] & "` has no " &
                   g.md.targetName & " lowering; an " &
                   "`.assembler` proc has no fallback path", g.asmInfo
       g.asmVoidInstr(c, op)
     elif op != NoIntrinsicOp and IntrinsicRows[op].isNullaryVoid:
-      let here = g.hereTarget
-      if here notin IntrinsicRows[op].targets:
+      if not g.hasHereLowering(IntrinsicRows[op].targets):
         lengError c, "`" & IntrinsicNames[op] & "` has no " &
                   g.md.targetName & " lowering; an " &
                   "`.assembler` proc has no fallback path", g.asmInfo
       case op
       of CpuRelaxOp:
         g.ab.keyword YieldA64      # one spelling, hence one interned tag
+      of SemihostOp:
+        # RISC-V semihosting: nifasm emits the whole `slli x0,x0,0x1f` / `ebreak`
+        # / `srai x0,x0,7` triple from this one keyword. The outer two are
+        # architectural no-ops that exist only so a debug agent recognises the
+        # middle one as a request rather than an ordinary breakpoint, so they are
+        # not separable and there is nothing to give an operand to. a0/a1 were set
+        # by the surrounding `.assembler` body, which is the whole reason a
+        # semihosting call is written in one.
+        g.ab.keyword SemihostRv
       else:
-        lengError c, "`" & IntrinsicNames[op] & "` has no Arm lowering", g.asmInfo
+        lengError c, "`" & IntrinsicNames[op] & "` has no " & g.md.targetName &
+                  " lowering", g.asmInfo
     else:
       lengError c, "an instruction used as a statement must have a destination",
                 g.asmInfo

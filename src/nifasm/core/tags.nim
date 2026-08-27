@@ -570,6 +570,12 @@ type
     WfiTagId
     DsbTagId
     IsbTagId
+    CsrwTagId
+    CsrsTagId
+    MretTagId
+    LrwTagId
+    ScwTagId
+    SemihostTagId
 const
   TagData*: array[TagEnum, (string, int)] = [
     ("InvalidTagId", 0),
@@ -1139,5 +1145,11 @@ const
     ("ldrsh", 564),
     ("wfi", 565),
     ("dsb", 566),
-    ("isb", 567)
+    ("isb", 567),
+    ("csrw", 568),
+    ("csrs", 569),
+    ("mret", 570),
+    ("lrw", 571),
+    ("scw", 572),
+    ("semihost", 573)
   ]

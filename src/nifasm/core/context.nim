@@ -26,6 +26,7 @@ import "../image/dwarf"                 # ProcUnwind: the per-proc CFI the write
 import "../x64/encoder" as x86
 import "../arm64/encoder" as arm64
 from "../thumb/encoder" as thumb2 import nil
+from "../rv32/encoder" as rv32 import nil
 
 const MainModuleName* = ""  # Special name for main module
 
@@ -65,6 +66,7 @@ type
     WinX64     # Windows x86-64 (PE)
     WinA64     # Windows ARM64 (PE)
     CortexM    # Bare-metal ARMv7E-M / Cortex-M4 (ELF32 firmware image, no OS)
+    Rv32       # Bare-metal RV32IMAFD / ilp32d (ELF32 firmware image, no OS)
 
   ImportedLib* = object
     name*: string     # Library path (e.g. "/usr/lib/libSystem.B.dylib")
@@ -207,6 +209,22 @@ type
     mFRegBindings*: Table[thumb2.FloatRegister, string]
                         # The FPv4-SP twin of `mRegBindings`: which s-register hosts a
                         # named float local or scratch temp.
+    rvRegBindings*: Table[rv32.Register, string]
+                        # RV32 counterpart of `regBindings`: which integer register
+                        # currently hosts a named local.
+    rvFRegBindings*: Table[rv32.FloatRegister, string]
+                        # …and its floating-point twin. One file serves both
+                        # precisions on RISC-V, so `(d3)` and `(s3)` name the SAME
+                        # entry here — which is why the width lives on the operand
+                        # and not in the binding.
+    clobberedRv*: set[rv32.Register]
+                        # RV32 twin of `clobberedM`.
+    pendingCmp*: PendingCmp
+                        # RV32 only: the operands of a `(cmp …)`/`(fcmp …)` that has
+                        # been READ but not yet emitted. RISC-V has no condition
+                        # flags — its branches compare two registers on the spot —
+                        # so a compare emits nothing and the branch that consumes it
+                        # emits both. See `rv32/instr.nim`.
     a64RegBindings*: Table[arm64.Register, string]  # AArch64 counterpart of `regBindings`:
                         # which physical x-register currently hosts which variable name. A
                         # raw `(xN)` use of a bound register is rejected (use the name);
@@ -303,6 +321,29 @@ type
     okArg       # Argument reference in prepare block
     okLabel     # Label reference
 
+  PendingCmp* = object
+    ## A `(cmp A B)` that has been read and deliberately NOT emitted.
+    ##
+    ## Every other target here sets condition flags and branches on them later.
+    ## RISC-V has no flags at all: `beq`/`bne`/`blt`/`bge`/`bltu`/`bgeu` each take
+    ## two source registers and compare them on the spot, so the pair `cmp` +
+    ## branch is ONE instruction and the compare has nothing of its own to emit.
+    ##
+    ## `at` is the buffer length when the compare was recorded. Consuming a
+    ## condition checks it: arkham always emits a compare IMMEDIATELY before the
+    ## branch that reads it, and if anything emitted bytes in between, the recorded
+    ## registers may no longer hold what was compared. That is a wrong answer
+    ## rather than a crash, so it is checked rather than assumed. Declarations
+    ## (`(cfvar …)`, `(var …)`) emit no bytes and are therefore transparent, which
+    ## is what lets `(cmp …) (cfvar …) (ite (zf) …)` work.
+    live*: bool
+    isFloat*: bool          ## the pending compare was `(fcmp …)`
+    at*: int                ## buffer length when it was recorded
+    lhs*, rhs*: rv32.Register
+    flhs*, frhs*: rv32.FloatRegister
+    width*: rv32.FpWidth    ## for a float compare
+    node*: Cursor           ## where it was written, for the diagnostic
+
   CortexMBoard* = object
     ## The board, reduced to what PLACEMENT needs. Derived from `(layout …)`; see
     ## `handleLayout`.
@@ -329,6 +370,7 @@ type
     mikHeapSize     # and how many bytes of it there are
     mikNoinitStart  # the region the startup code was told to leave alone
     mikNoinitSize   # and how many bytes of THAT there are
+
 
 # ── reading the record ───────────────────────────────────────────────────────
 

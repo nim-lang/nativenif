@@ -29,7 +29,7 @@ import x64/encoder as x86
 import arm64/encoder as arm64
 from image/elf32 as elf32 import nil
 import image / [dwarf, tracetable]
-import image / [writecommon, writeelf, writemacho, writepe, writecortexm]
+import image / [writecommon, writeelf, writemacho, writepe, writecortexm, writerv32]
 import pass1, pass2
 
 proc generateSymbol(ctx: var GenContext; sym: Symbol) =
@@ -425,6 +425,26 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
       writeMachO(ctx, outfile)
     of Arch.WinX64, Arch.WinA64:
       writeExe(ctx, outfile.changeFileExt("exe"))
+    of Arch.Rv32:
+      # A firmware image, not a hosted executable — but unlike Cortex-M there is
+      # no vector table at its head, so the code starts at the load address and
+      # `absBase` is that address exactly. See `writerv32.nim`.
+      ctx.buf.absBase = Rv32LoadAddr
+      finalize(ctx.buf)
+      var code: seq[byte] = newSeq[byte](ctx.buf.data.len)
+      for i in 0 ..< ctx.buf.data.len: code[i] = ctx.buf.data[i]
+      # The entry is the ENTRY PROC, not the first byte emitted. Those coincide
+      # today only because `pass2` generates `_start`/`main.0` eagerly the moment
+      # it sees one; nothing guarantees it, and a wrong entry starts executing
+      # some other proc's prologue with no diagnostic.
+      var entryOff = 0
+      if ctx.entrySym != nil:
+        let pos = ctx.buf.getLabelPosition(LabelId(ctx.entrySym.offset))
+        if pos < 0:
+          quit "nifasm: entry point '" & ctx.nameOf(ctx.entrySym.name) &
+               "' has no address"
+        entryOff = pos
+      writeFile(outfile, writeRv32Image(ctx, code, entryOff))
     of Arch.CortexM:
       # A firmware image, not a hosted executable: vector table, then code.
       #

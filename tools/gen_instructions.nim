@@ -9,14 +9,15 @@ proc toNimName(s: string; suffix: string): string =
 
 type
   EnumList = enum
-    X64Inst, A64Inst, MInst, NifasmType, NifasmDecl, NifasmExpr, X64Flag, X64Reg,
-    A64Reg, MReg
+    X64Inst, A64Inst, MInst, RvInst, NifasmType, NifasmDecl, NifasmExpr, X64Flag,
+    X64Reg, A64Reg, MReg, RvReg
 
 proc toSuffix(e: EnumList): (string, string) =
   case e
   of X64Inst: ("X64", "NoX64Inst")
   of A64Inst: ("A64", "NoA64Inst")
   of MInst: ("M", "NoMInst")
+  of RvInst: ("Rv", "NoRvInst")
   of NifasmType: ("T", "NoType")
   of NifasmDecl: ("D", "NoDecl")
   of NifasmExpr: ("X", "NoExpr")
@@ -24,6 +25,12 @@ proc toSuffix(e: EnumList): (string, string) =
   of X64Reg: ("R", "NoReg")
   of A64Reg: ("R", "NoReg")
   of MReg: ("MR", "NoMReg")
+  # NOT "R": RV32 REUSES AArch64's register spellings — `(x0)`..`(x30)`, `(sp)`,
+  # `(d0)`..`(d31)` and `(s0)`..`(s31)` are the SAME tags, so a shared suffix would
+  # put `X0R` in both `A64Reg` and `RvReg` and make every unqualified use
+  # ambiguous. X64Reg and A64Reg get away with sharing "R" only because no tag is
+  # in both of them.
+  of RvReg: ("RV", "NoRvReg")
 
 proc shortcutToEnumList(shortcut: string): EnumList =
   try:
@@ -133,7 +140,7 @@ proc extractTagName(s: string): string =
     quit "Cannot extract tag name from: " & s
 
 const
-  LateEnums = {X64Inst, A64Inst, MInst}
+  LateEnums = {X64Inst, A64Inst, MInst, RvInst}
     ## Enums whose SINGLE-target members are numbered LAST (see `genTags`).
 
 proc genTags(inp: File; inputName: string) =
@@ -143,7 +150,7 @@ proc genTags(inp: File; inputName: string) =
   ## the pool is not capped at 511 — see `TagPool.escapeTag`).
   ##
   ## So the overflow is placed deliberately rather than left to document order.
-  ## A row naming EXACTLY ONE of `X64Inst`/`A64Inst`/`MInst` is one target's
+  ## A row naming EXACTLY ONE of `X64Inst`/`A64Inst`/`MInst`/`RvInst` is one target's
   ## machine mnemonic, and those are numbered last: there are hundreds of them,
   ## each target's are dead weight to every other target, and a mnemonic appears
   ## once per instruction where a register appears two or three times. A row
@@ -156,6 +163,15 @@ proc genTags(inp: File; inputName: string) =
   ## `(sp)`/`(lr)` as AArch64 ones, so those rows simply gain `MReg` and no tag
   ## id moves. Which register file `(r0)` names is decided by `(arch …)`, the
   ## same way `(mov …)` already means different encodings per target.
+  ##
+  ## RV32 goes further and reuses AArch64's ENTIRE file: `(x0)`..`(x30)` for the
+  ## GPRs (RISC-V's `x2` is `(sp)`, and `x31` is simply not mapped — 31 slots is
+  ## already more than the allocator needs) and `(d0)`/`(s0)` for the two views of
+  ## one FP register, which is the same double/single spelling AArch64 uses and
+  ## therefore the one `AsmBuf.freg` already emits from a width. Not `(f0)`, and
+  ## emphatically not RISC-V's ABI names: `s0`..`s11` are INTEGER saved registers
+  ## there while `(s0)` here is a float, and one tag meaning two different
+  ## register FILES is a different order of hazard from one meaning two machines.
   ##
   ## The practical effect: today only the very tail of the mnemonics overflows,
   ## and adding a target (Cortex-M, RISC-V) can never push a register or a
@@ -207,7 +223,7 @@ proc genTags(inp: File; inputName: string) =
 
   createDir "src/nifasm/core"
   writeTagsFile "src/nifasm/core/tags.nim", tags, inputName, anonHead = true
-  writeModel "src/nifasm/core/model.nim", enumDecls, X64Inst, MReg, inputName
+  writeModel "src/nifasm/core/model.nim", enumDecls, X64Inst, RvReg, inputName
 
 proc main(inputName: string) =
   var inp = open(inputName, fmRead)

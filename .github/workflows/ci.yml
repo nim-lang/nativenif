@@ -55,13 +55,31 @@ jobs:
         if: runner.os == 'Linux' && matrix.target.cpu == 'amd64'
         shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update
-          # `qemu-system-arm` is what runs the Cortex-M images: that whole target
-          # has no host to execute on, so without it every Cortex-M suite SKIPS
-          # and reports success. Installed on Linux only — those tests are
-          # host-independent (the image runs under qemu either way), so running
-          # them on all three runners would be the same coverage three times.
-          sudo apt-get install -y valgrind gcc-14 g++-14 qemu-system-arm
+          # THREE emulators, because three of arkham's four back ends have no host
+          # here to execute on. Without one the matching suites SKIP and the run
+          # reports success, which is the failure mode this whole step exists to
+          # avoid — see `NIFASM_REQUIRE_QEMU` below.
+          #
+          #   qemu-system-arm   the Cortex-M firmware images
+          #   qemu-user         `qemu-aarch64`, for the linux_arm64 corpus, the
+          #                     a64 stress pass and `a64_slot_base_free`
+          #   (riscv system)    the RV32 firmware images
+          #
+          # Installed on Linux only: these run an emulated image either way, so
+          # repeating them on the macOS and Windows runners would be the same
+          # coverage three times.
+          sudo apt-get install -y valgrind gcc-14 g++-14 qemu-system-arm qemu-user
+          # `qemu-system-riscv32` ships in `qemu-system-misc` up to Ubuntu 24.04
+          # and in `qemu-system-riscv` from Debian trixie / Ubuntu 25.04 onward.
+          # Ask for whichever this runner packages rather than pinning a name that
+          # was already renamed once — the binary did not move, only the package.
+          if apt-cache show qemu-system-riscv >/dev/null 2>&1; then
+            sudo apt-get install -y qemu-system-riscv
+          else
+            sudo apt-get install -y qemu-system-misc
+          fi
           sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 60 --slave /usr/bin/g++ g++ /usr/bin/g++-14
 
       - name: Install dependencies (Linux i386)
@@ -306,6 +324,20 @@ jobs:
           repository: nim-lang/nimony
 
       - name: Run tester
+        env:
+          # Turn every "emulator not found — skipping" into a failure. The tester
+          # skips by design so a developer without a cross-emulator can still run
+          # what their machine can; in CI that same skip is silent coverage loss,
+          # and it has already happened — before this variable existed the
+          # workflow installed `qemu-system-arm` alone, so all four RV32 suites,
+          # all 219 linux_arm64 run tests and the a64 stress pass skipped on every
+          # push and the run was green.
+          #
+          # Set on the runner that installs the emulators, and only there: the
+          # macOS and Windows jobs are expected to skip these, and demanding
+          # emulators of them would be demanding coverage they were never meant
+          # to provide.
+          NIFASM_REQUIRE_QEMU: ${{ (runner.os == 'Linux' && matrix.target.cpu == 'amd64') && '1' || '' }}
         run: |
           cd nifasm
           nim c -r tests/tester.nim

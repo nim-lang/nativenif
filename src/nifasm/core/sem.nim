@@ -4,6 +4,7 @@ import tags
 import ../x64/encoder as x86
 from ../arm64/encoder as arm64 import nil  # only `arm64.Register`, qualified: `Register` alone stays x86's
 from ../thumb/encoder as thumb2 import nil # ditto for the Cortex-M register enum
+from ../rv32/encoder as rv32 import nil    # ditto for the RV32 one
 import nifcore  # SymId: symbols are keyed by their interned id (main-module pool),
                 # not by re-hashing the qualified name string on every lookup.
 
@@ -86,6 +87,12 @@ type
         ## records such a tag in BOTH sets and each arch reads its own. A
         ## declaration only ever targets one arch, so the extra membership is
         ## never consulted.
+      clobbersRv*: set[rv32.Register]
+        ## The RV32 half. Overlaps `clobbersA64` for the same reason `clobbersM`
+        ## overlaps `clobbers`: `(x0)` is a valid spelling on AArch64 and on RV32
+        ## both, so the parser records such a tag in BOTH sets and each arch reads
+        ## its own. A declaration only ever targets one arch, so the extra
+        ## membership is never consulted.
       hasClobberDecl*: bool
         ## Whether a `(clobber …)` was present at all. An EMPTY declared list is
         ## meaningful — arkham emits it for a `(attr "noreturn")` callee, whose
