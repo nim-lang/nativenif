@@ -26,6 +26,14 @@
 ## degenerate (straight-line) case of that — it never merges branches — so a
 ## fact lives only inside one sibling list, and the liveness question it needs
 ## is answered from the whole proc, not from the window.
+##
+## "From the whole PROC" is load-bearing and was not free: the scratch names are
+## `tmpN.0`, and the counter behind them RESTARTS in every proc, so one SymId is
+## every proc's `tmp0.0` at once. Answered from the whole buffer, `deadAfter`
+## reads the next proc's `(rebind :tmp0.0 …)` — a definition, therefore benign —
+## as proof that THIS proc's `tmp0.0` is dead, and folds away a store the value
+## is still read from. `procLimit` is what confines the answer; see it for what
+## that miscompiled.
 
 import std / [tables, assertions]
 import nifcore
@@ -60,13 +68,15 @@ proc collectOccs(buf: var TokenBuf; c: var Cursor; parentIsKill: bool; occs: var
   else:
     inc c
 
-proc deadAfter(occs: Occs; s: SymId; pos: int): bool =
-  ## Is `s` dead after token `pos`? True when its next mention is not a read.
-  ## Conservative by construction: an unknown symbol, or one whose next mention
-  ## is a plain operand, answers false.
+proc deadAfter(occs: Occs; s: SymId; pos, limit: int): bool =
+  ## Is `s` dead after token `pos`, asking only up to `limit` (the end of the
+  ## enclosing proc)? True when its next mention there is not a read.
+  ## Conservative by construction: an unknown symbol, one whose next mention is
+  ## a plain operand, and one with no further mention IN THIS PROC all answer
+  ## false.
   let lst = occs.getOrDefault(s)
   for o in lst:
-    if o.pos > pos: return o.benign
+    if o.pos > pos: return o.pos < limit and o.benign
   false                       # nothing follows: the binding outlives the proc's
                               # view here, so do not assume it is dead
 
@@ -114,21 +124,28 @@ proc movFromSym(buf: var TokenBuf; c: Cursor; src: SymId; destNode: var Cursor):
   result = not b.hasMore
 
 proc trList(buf: var TokenBuf; c: var Cursor; dest: var TokenBuf; occs: Occs;
-            folded: var int)
+            limit: int; folded: var int)
 
 proc trNode(buf: var TokenBuf; c: var Cursor; dest: var TokenBuf; occs: Occs;
-            folded: var int) =
+            limit: int; folded: var int) =
   if c.kind == TagLit:
+    # A `(proc …)` head is where the scratch-name counter restarts, so it is
+    # also where the liveness question has to stop looking: everything inside
+    # this subtree asks about `tmp0.0` and means THIS proc's.
+    let inner =
+      if buf.tags.tagName(c.cursorTagId) == "proc":
+        cursorToPosition(buf, c) + subtreeWidth(c)
+      else: limit
     dest.openTag c.cursorTagId
     c.loopInto:
-      trList(buf, c, dest, occs, folded)
+      trList(buf, c, dest, occs, inner, folded)
     dest.closeTag()
   else:
     dest.addSubtree c
     inc c
 
 proc trList(buf: var TokenBuf; c: var Cursor; dest: var TokenBuf; occs: Occs;
-            folded: var int) =
+            limit: int; folded: var int) =
   ## One step of a sibling walk, with the one-node lookahead the rules need.
   var dst: SymId
   var immNode: Cursor
@@ -143,7 +160,7 @@ proc trList(buf: var TokenBuf; c: var Cursor; dest: var TokenBuf; occs: Occs;
        immFoldable(immNode) and
        # PAST the consumer, not at it: the consumer's own source operand is a
        # mention of `dst`, and asking from its start position finds that one.
-       deadAfter(occs, dst, cursorToPosition(buf, la) + subtreeWidth(la) - 1):
+       deadAfter(occs, dst, cursorToPosition(buf, la) + subtreeWidth(la) - 1, limit):
       # `(mov D imm)` + `(mov X D)` with D dead ⇒ `(mov X imm)`. The scratch
       # register's `(rebind …)` above stays: it is a naming directive, costs no
       # machine code, and its `(kill …)` below still balances it.
@@ -155,7 +172,7 @@ proc trList(buf: var TokenBuf; c: var Cursor; dest: var TokenBuf; occs: Occs;
       skip c                 # the materializing mov
       skip c                 # the consumer
       return
-  trNode(buf, c, dest, occs, folded)
+  trNode(buf, c, dest, occs, limit, folded)
 
 proc peephole*(buf: var TokenBuf; immAnyDest: bool): int =
   ## Rewrite `buf` in place; returns the number of instructions removed.
@@ -179,7 +196,7 @@ proc peephole*(buf: var TokenBuf; immAnyDest: bool): int =
   block:
     var c = beginRead(buf)
     while c.hasMore:
-      trList(buf, c, res, occs, result)
+      trList(buf, c, res, occs, buf.len, result)
     endRead c
   buf = ensureMove res
   when defined(arkhamPeepDbg):
