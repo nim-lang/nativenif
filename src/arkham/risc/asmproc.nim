@@ -120,6 +120,35 @@ proc asmPinReg*(g: var CodeGen; at: Cursor; name: string): Reg =
       lengError at, "`" & name & "` is one of arkham's two staging bridges " &
                 "(r10/r11): a folded memory operand has to be loaded somewhere, " &
                 "and this target has no spare volatile at all", g.asmInfo
+  elif g.md.arch == Rv32:
+    # RV32's own arm. It used to fall into the AArch64 `else` below, which answers
+    # about a different register file: `x16`/`x17` are IP0/IP1 there and the
+    # ARGUMENT registers a6/a7 here, `x18` is the platform register there and the
+    # callee-saved home `s2` here, and the link-register message names `x30` in
+    # prose while `md.linkReg` is `x1`. Every one of those is a confident sentence
+    # about the wrong register.
+    if result == g.md.linkReg:
+      lengError at, "`x1` is the link register (`ra`): every `jal` overwrites it " &
+                "and the epilogue reads it back", g.asmInfo
+    if result == R0:
+      lengError at, "`x0` reads as zero and discards every write — a value put " &
+                "there is not stored, it is deleted", g.asmInfo
+    if result in {R3, R4}:
+      lengError at, "`" & name & "` is reserved by the RISC-V ABI (`gp`/`tp`); " &
+                "nothing here establishes one, but a proc that clobbered it " &
+                "would break any object linked in that does", g.asmInfo
+    if result == g.md.indirectResultReg:
+      lengError at, "`x9` carries `&result` for a callee returning an aggregate " &
+                "too wide for registers", g.asmInfo
+    if result == R8:
+      lengError at, "`x8` is the ABI's frame pointer (`s0`), kept off the file " &
+                "so a debugger's frame walk and a hand-written body have a fixed " &
+                "place to stand", g.asmInfo
+    if result in {g.md.bridgeRegs[0], g.md.bridgeRegs[1]}:
+      lengError at, "`" & name & "` is one of arkham's two staging bridges " &
+                "(x29/x30): a folded memory operand has to be loaded somewhere, " &
+                "and this target reserves exactly as many as one emitter step " &
+                "may hold at once", g.asmInfo
   else:
     if result == g.md.linkReg:
       lengError at, "`x30` is the link register: every `bl` overwrites it and " &
@@ -544,7 +573,8 @@ proc asmVarDecl*(g: var CodeGen; c: Cursor) =
         # truncating. Saying so here names the local instead of pointing at a
         # `(mov …)` the user did not write.
         lengError nameC, "`" & userName(nm) & "` is " & $s.size & " bytes, and a " &
-                  "Cortex-M `.assembler` body moves one 4-byte word at a time — " &
+                  g.md.targetName & " `.assembler` body moves one " &
+                  $wordSize() & "-byte word at a time — " &
                   "declare the halves", g.asmInfo
       g.asmStack.incl nm
       g.emTypedStackVar(nm, typeCur)

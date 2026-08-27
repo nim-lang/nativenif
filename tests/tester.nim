@@ -1082,16 +1082,88 @@ proc rv32AsmTests() =
 
 const rv32Quarantine = [
     "a64_logical_imm", "assembler_m", "atomics",
-    "bitand_imm64", "err_asm_bridge_reg", "err_asm_foreign_reg",
-    "err_asm_param_reg", "err_asm_scratch_reg", "err_asm_wide_stack",
-    "err_interrupt_dup", "err_interrupt_unknown", "err_volatile_wide",
-    "interrupt_pendsv", "overflow_check", "semihost_writec",
-    "volatile_mmio"]
+    "bitand_imm64", "interrupt_pendsv", "overflow_check",
+    "semihost_writec"]
 
   ## Fixtures the RV32 pass does not yet run. Every entry is a NAMED gap, grouped
   ## and argued in tests/arkham_rv32/README.md. A list this long is only tolerable
   ## because it is explained; when an entry stops needing an explanation it should
   ## stop being an entry.
+
+const rv32Rejections: seq[(string, string)] = @[
+  # The `err_*` fixtures of `tests/arkham_m/`, judged by what RV32 says rather
+  # than by what Cortex-M says. Four of the eight give an answer that is about
+  # this target; the other four pin Cortex-M register NAMES and so are refused
+  # here for the wrong reason ("`r0` is not a RV32 register"), which tests
+  # nothing. Those want RV32-native fixtures — see `tests/arkham_rv32/README.md`.
+
+  # A volatile access wider than one machine access. Identical reasoning and
+  # identical wording to Cortex-M's: the rule is the ROW's, not the target's, and
+  # this is the fixture that proves RV32 now reaches it at all — until `tgRv32`
+  # existed for a row to claim, the refusal came from "no RV32 lowering" three
+  # steps earlier and said nothing about widths.
+  ("err_volatile_wide", "must be ONE machine access"),
+  # A register spelling from another target. The `{.assembler.}` mode's premise is
+  # that a body names ONE machine, so the useful answer says which names this one
+  # has — and on RV32 those are `x5`..`x7`, `x10`..`x30`.
+  ("err_asm_foreign_reg", "is not a RV32 general-purpose register"),
+  # ── `rejectForRv32` ────────────────────────────────────────────────────────
+  # These two are NOT testing what they test on Cortex-M (an unknown interrupt
+  # name; two handlers on one entry). RV32 refuses the pragma outright, before
+  # either question is reachable, so what they cover here is `rejectForRv32` — the
+  # one path that turns away a whole feature by name at the declaration. That is
+  # worth a test precisely because nothing else exercises it, and when RV32 grows
+  # an `mtvec` trampoline table both of these will start failing, which is the
+  # right moment to give them their real expectations.
+  ("err_interrupt_unknown", "is not supported yet"),
+  ("err_interrupt_dup", "is not supported yet"),
+]
+
+const rv32OwnRejections: seq[(string, string)] = @[
+  # RV32-NATIVE fixtures, in `tests/arkham_rv32/`. The four `err_asm_*` of
+  # `tests/arkham_m/` that these replace pin Cortex-M register NAMES, so on this
+  # target they are refused by the first arm of the cascade ("`r0` is not a RV32
+  # general-purpose register") and never reach the rule they exist to test. A
+  # fixture that fails for the wrong reason is worse than no fixture: it reports
+  # green.
+  #
+  # Writing them found that `asmPinReg`'s cascade had a Thumb arm and an AArch64
+  # `else`, and RV32 fell into the second — which answers about a different
+  # register file. `x16`/`x17` are IP0/IP1 there and the ARGUMENT registers a6/a7
+  # here; `x18` is the platform register there and the callee-saved home `s2`
+  # here; the link-register message names `x30` in prose while `md.linkReg` is
+  # `x1`. Confident sentences about the wrong register, on every one.
+  ("err_asm_bridge_reg", "one of arkham's two staging bridges"),
+  ("err_asm_param_reg", "is passed in x10 by this target's ABI"),
+  ("err_asm_wide_stack", "a RV32 `.assembler` body moves one 4-byte word"),
+  # Three with no Cortex-M counterpart, because the register file differs rather
+  # than the rule: `x0` discards writes, `gp`/`tp` belong to the whole program,
+  # and `s0` is kept off the file for a debugger's frame walk.
+  ("err_asm_zero_reg", "reads as zero and discards every write"),
+  ("err_asm_abi_reg", "reserved by the RISC-V ABI"),
+  ("err_asm_frame_reg", "is the ABI's frame pointer"),
+  ("err_asm_link_reg", "is the link register (`ra`)"),
+]
+
+proc rv32RejectionTests() =
+  ## What RV32 turns away, checked BY MESSAGE. A refusal is behaviour: a
+  ## diagnostic that silently changes wording is a diagnostic nobody is testing,
+  ## and one that starts pointing at the wrong thing is worse than none.
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  for (name, expected) in rv32Rejections:
+    execExpectFailure(quoteShell(arkham) & " --os:embedded --cpu:riscv32 -o:" &
+                      quoteShell("tests" / "arkham_rv32" / (name & ".rej.nif")) &
+                      " " & quoteShell("tests" / "arkham_m" / (name & ".c.nif")),
+                      expected)
+  for (name, expected) in rv32OwnRejections:
+    execExpectFailure(quoteShell(arkham) & " --os:embedded --cpu:riscv32 -o:" &
+                      quoteShell("tests" / "arkham_rv32" / (name & ".rej.nif")) &
+                      " " & quoteShell("tests" / "arkham_rv32" / (name & ".c.nif")),
+                      expected)
+  echo rv32Rejections.len + rv32OwnRejections.len, " / ",
+       rv32Rejections.len + rv32OwnRejections.len,
+       " RV32 rejection tests successful (", rv32OwnRejections.len,
+       " RV32-native)"
 
 proc rv32CodegenTests() =
   ## The RV32 back end end to end: Leng in, exit code out.
@@ -1111,6 +1183,7 @@ proc rv32CodegenTests() =
   var total = 0
   for file in walkFiles("tests/arkham_m/*.c.nif"):
     let base = file.extractFilename.changeFileExt("").changeFileExt("")
+    if base.startsWith("err_"): continue   # must NOT compile; see rv32RejectionTests
     if base in rv32Quarantine: continue
     inc total
     let asmNif = "tests" / "arkham_rv32" / (base & ".asm.nif")
@@ -1190,6 +1263,7 @@ proc rv32StressTests() =
   var total = 0
   for file in walkFiles("tests/arkham_m/*.c.nif"):
     let base = file.extractFilename.changeFileExt("").changeFileExt("")
+    if base.startsWith("err_"): continue   # must NOT compile
     if base in rv32Quarantine: continue
     inc total
     let asmNif = "tests" / "arkham_rv32" / (base & ".stress.nif")
@@ -1874,6 +1948,7 @@ thumb2SelfTest()
 rv32SelfTest()
 rv32AsmTests()
 rv32CodegenTests()
+rv32RejectionTests()
 rv32StressTests()
 cortexMAsmTests()
 cortexMMemMapTests()

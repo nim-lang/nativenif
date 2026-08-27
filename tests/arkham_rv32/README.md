@@ -1,33 +1,39 @@
 # The RV32 codegen pass
 
-There are no fixtures in this directory, on purpose. The RV32 back end is
-exercised against **`tests/arkham_m/`** — the Cortex-M corpus — because the two
-targets are the same shape (32-bit word, `BlockFrame`, bare metal, semihosting
-exit) and a second copy of 138 fixtures would drift from the first rather than
-test anything the first does not.
+The POSITIVE fixtures live in **`tests/arkham_m/`** — the Cortex-M corpus — because
+the two targets are the same shape (32-bit word, `BlockFrame`, bare metal,
+semihosting exit) and a second copy of 130 fixtures would drift from the first
+rather than test anything the first does not.
+
+What IS in this directory is the set that cannot be shared: rejection fixtures
+whose whole content is a register name. A `{.register: "r0".}` pin says nothing
+about RV32 except that `r0` is not one of its registers, so those are written
+here against `x0`..`x30` — see "Rejections, checked by message" below.
 
 `tester.rv32CodegenTests` runs that corpus through
 `arkham --os:embedded --cpu:riscv32` → `nifasm` → `qemu-system-riscv32`, checking
 each fixture's exit code against its `.exitcode` file. The quarantine list lives
 in `tester.nim` beside the pass.
 
-## 122 of 138 pass
+## 123 of 130 pass
 
-Every one of the 16 that do not is an explicit REFUSAL — a named diagnostic from
-arkham or from nifasm. Nothing hangs and nothing computes a wrong answer, which
-is the property worth protecting: a quarantine of refusals is a to-do list, and a
-quarantine of wrong answers is a pile of unfound bugs.
+The pass no longer runs `err_*` fixtures — those must NOT compile, on any target,
+and `rv32RejectionTests` checks them by message instead. Of the seven that remain
+quarantined, every one is an explicit REFUSAL. Nothing hangs and nothing computes
+a wrong answer, which is the property worth protecting: a quarantine of refusals
+is a to-do list, and a quarantine of wrong answers is a pile of unfound bugs.
 
-**Cortex-M-specific by construction (11).** `err_asm_*`, `err_interrupt_*`,
-`assembler_m`, `interrupt_pendsv`, `volatile_mmio`, `semihost_writec`. These pin
-`{.register: "r4".}`, name Cortex-M interrupts, or assert a Cortex-M diagnostic.
-They are not RV32 tests and never will be; the RV32 equivalents belong here as
-their own files.
+**Cortex-M-specific by construction (3).** `assembler_m` pins `{.register: "r0".}`,
+`interrupt_pendsv` names a Cortex-M interrupt, `semihost_writec` uses
+`{.instruction: "add".}` and a Thumb `bkpt`. The RV32 equivalents belong here as
+their own files, the way the `err_asm_*` ones now do.
 
-**Intrinsics (2).** `atomics`, `err_volatile_wide`. nimony's `IntrinsicTarget`
-has no `tgRv32` member, so no row in the shared table can *claim* RV32 and
-`{.instruction.}` / `{.intrinsic.}` are refused by name. That enum lives in the
-nimony repo; adding a member is its change to make.
+**Atomics (1).** `atomics`. RV32's `A` extension has `lr.w`/`sc.w`, so the ISA is
+not the obstacle: arkham has no lowering for them (its two are AArch64's
+`ldaxr`/`stlxr` and ARMv7-M's `ldrex`/`strex`), and this target reserves no
+`atomicScratch` triple for one — it spent its third bridge. Whoever lowers RV32
+atomics has to reserve three registers explicitly and say so; `checkMachine`
+refuses a partial triple.
 
 **64-bit constants (3).** `a64_logical_imm`, `bitand_imm64`, `overflow_check`. A
 literal wider than 32 bits reaches the selector as a single `(mov reg <imm>)`
@@ -35,13 +41,34 @@ rather than split across the register pair the wide-integer lowering uses
 elsewhere. nifasm refuses it by name, which is the right failure — the fix is
 upstream of it, in the emitter.
 
-## Two passes, not one
+## Rejections, checked by message
 
-`rv32CodegenTests` runs the shipped `bin/arkham`. `rv32StressTests` re-runs the
-same corpus at `ARKHAM_STRESS=1` against a `-d:arkhamStress` build, and that
-second pass is the only one on this host that executes a binary with the **I1
-bridge-budget assertions** compiled in (`emit.BridgeCheck` compiles them out of a
-release build). Both are 122/122; the stress pass has no known-failures list.
+`rv32RejectionTests` runs eleven. Four are `tests/arkham_m/err_*` fixtures judged
+by what RV32 says: the volatile-width rule (identical wording to Cortex-M's — the
+rule is the ROW's, not the target's), a foreign register spelling, and the two
+interrupt fixtures, which on this target cover `rejectForRv32` rather than what
+they cover on Cortex-M.
+
+The other seven are RV32-native, in this directory. They exist because the four
+`err_asm_*` fixtures of `tests/arkham_m/` pin Cortex-M register NAMES, so on RV32
+they are refused by the first arm of the cascade — "`r0` is not a RV32
+general-purpose register" — and never reach the rule they were written to test. A
+fixture that fails for the wrong reason is worse than no fixture: it reports green.
+
+Writing them found that `asmPinReg`'s cascade had a Thumb arm and an AArch64
+`else`, and RV32 fell into the second. That arm answers about a different register
+file: `x16`/`x17` are IP0/IP1 there and the ARGUMENT registers a6/a7 here, `x18` is
+the platform register there and the callee-saved home `s2` here, and the
+link-register message names `x30` in prose while `md.linkReg` is `x1`. Confident
+sentences about the wrong register, every one.
+
+Three of the seven have no Cortex-M counterpart at all, because the register file
+differs rather than the rule: `x0` discards writes, `gp`/`tp` belong to the whole
+program, and `s0` is kept off the file so a debugger's frame walk has somewhere to
+stand. Two Cortex-M rejections have no RV32 counterpart for the same reason —
+there is no "assembler's own scratch" pin to refuse (nifasm's `x31` has no asm-NIF
+tag, so a code generator cannot spell it even by mistake), and no callee-saved
+register outside the prologue's saved set.
 
 ## What the corpus found
 

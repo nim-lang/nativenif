@@ -208,23 +208,20 @@ proc hereTarget*(g: CodeGen): IntrinsicTarget {.inline.} =
   of X86: tgX64
   of Arm64: tgA64
   of ThumbM: tgThumbM
-  of Rv32:
-    # Never reached: every membership test goes through `hasHereLowering`, which
-    # answers for RV32 before asking this. Spelled as a failure rather than a
-    # plausible substitute, because a substitute would silently claim some other
-    # target's lowerings.
-    quit "arkham: hereTarget has no RV32 value (use hasHereLowering)"
+  of Rv32: tgRv32
 
 proc hasHereLowering*(g: CodeGen; targets: set[IntrinsicTarget]): bool {.inline.} =
   ## Whether the intrinsic table claims a lowering for the target being emitted.
   ##
-  ## Always false on RV32, and not because the lowerings are missing: nimony's
-  ## `IntrinsicTarget` has no `tgRv32` member for a row to NAME, so no row can
-  ## claim it. That enum lives in the shared library and adding a member is
-  ## nimony's change to make. Until it does, `{.instruction.}` and `{.intrinsic.}`
-  ## are refused on this target by name — which is the correct answer, and the one
-  ## the call sites already phrase, since each reports `md.targetName`.
-  g.md.arch != Rv32 and g.hereTarget in targets
+  ## An ordinary membership test on every target now. It used to be hardwired
+  ## false for RV32 — not because the lowerings were missing but because
+  ## `IntrinsicTarget` had no `tgRv32` member for a row to NAME, so no row could
+  ## claim it and `hereTarget` had nothing to answer. The member exists, and RV32
+  ## claims exactly the rows whose lowering was checked (today: the two volatile
+  ## rows). Everything else is still refused on this target by name, which is the
+  ## correct answer and the one the call sites already phrase — but it is now the
+  ## TABLE saying so, per row, rather than one target being excluded wholesale.
+  g.hereTarget in targets
 
 proc destructive3(g: CodeGen; op: RiscInst): bool {.inline.} =
   ## Ops with no destructive `D op= S` spelling on this target: Thumb-2's
