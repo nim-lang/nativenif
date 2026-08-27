@@ -278,6 +278,12 @@ type
                                              ## params: what type to re-emit when a binding has
                                              ## to be re-established. Only consumer so far is
                                              ## `restoreBindingsAfterDiverging`.
+    stagingHeld*: set[Reg]                   ## x86-64: staging registers handed out and
+                                             ## not yet given back. The debug-only
+                                             ## `stagingLive` below records WHAT each is
+                                             ## for; this one is the COUNT, and it has to
+                                             ## exist in every build because the budget
+                                             ## checks read it (`core/bridges`).
     when defined(arkhamStagingDbg):
       stagingLive*: seq[(Reg, string)]  ## staging registers handed out and not yet given
                                         ## back, with the label of what asked for each

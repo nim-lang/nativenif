@@ -23,7 +23,7 @@
 import std / [assertions, tables, sets, strformat, strutils]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
-                    stress, context, typeutil, 
+                    stress, context, typeutil, bridges, 
                     mirrors, temps, typenav, regbind, abi]
 import machine_a64 as machine
 from machine_m as machine_m import nil
@@ -1086,151 +1086,38 @@ proc heldBridgeNames*(g: CodeGen): string =
       if result.len > 0: result.add ", "
       result.add $r
 
-const BridgeCheck* = defined(arkhamStress) or defined(arkhamBridgeCheck) or
-                     not defined(release)
-  ## Whether the I1 budget assertions are compiled in. ON in a debug build and in
-  ## every `-d:arkhamStress` binary — the pool-dry pass is exactly where the margin
-  ## is thin — and OFF in a shipped release build, where they would cost a walk of
-  ## three registers per recursive emit call for a property the stress pass has
-  ## already established over the whole corpus.
+export bridges
 
-proc bridgeBudgetFailed(g: CodeGen; what: string; need: int) {.noinline.} =
-  ## Two different failures wear this assertion, and they want different fixes.
-  let head = "arkham " & g.md.targetName & ": I1 bridge budget — " & what &
-             " needs " & $need & " of " & $g.distinctBridges() &
-             " reserved bridges"
-  if need > g.distinctBridges():
-    # Not a composition at all: the step does not fit this machine even alone.
-    raiseAssert head & ", which is more than this target reserves at all, in " &
-      "proc " & g.curProcName & ". Either the machine model is short a bridge " &
-      "(RV32 shipped `[R29, R30, R30]` and had two where it claimed three — see " &
-      "`machinedesc.checkMachine`) or the step must be written to a smaller " &
-      "budget: see design.md, \"Making the reservation a bound instead of a " &
-      "measurement\", I3."
-  raiseAssert head & ", but " & $g.liveBridges() & " (" & g.heldBridgeNames() &
-    ") are already held by an ENCLOSING step, in proc " & g.curProcName &
-    ". A COMPOSITION failure, not pressure: the allocator never owns these " &
-    "registers, so no amount of spilling elsewhere frees one, and the step that " &
-    "fails is not the step that is wrong. The fix belongs to the HOLDER — it " &
-    "must release across the recursion, the way `genNestedAggrField` builds its " &
-    "value into a frame slot BEFORE taking its bridges. See design.md, " &
-    "\"Making the reservation a bound instead of a measurement\", I1."
+# The scope machinery itself is arch-neutral and lives in `core/bridges`. What
+# stays here is the pair of numbers this target answers it with: `bridgeRegs` is
+# reserved outright, so its capacity and its guarantee are the same count.
 
-var tightCompositions*: int = 0
-  ## How many times a step was entered with less than its DECLARED worst case
-  ## free. See `bridgeScopePush`.
+template bridgeStackHeld(g: CodeGen): untyped = g.heldBridgeNames()
 
-var lastResortTakes*: int = 0
-  ## How many times a step took a bridge past its declaration BECAUSE every
-  ## alternative was gone. Counted, never asserted — see `tryTakeBridge`'s
-  ## `lastResort`.
-
-proc bridgeScopePush*(g: var CodeGen; demand: BridgeDemand; what: string) =
-  ## Open a declared bridge scope.
-  ##
-  ## Two conditions, and keeping them apart is the whole content of this proc.
-  ##
-  ##  * **Progress (I1), an ERROR.** A step entered with every bridge already held
-  ##    cannot emit anything at all, whatever it turns out to be. One free is the
-  ##    weakest requirement that rules that out, and it is the one that holds.
-  ##  * **Worst case (I2), a COUNT.** A declaration is static; demand is not. A
-  ##    step that declares two is not obliged to take two on this path, so being
-  ##    entered with only one free is not yet wrong — it is only *unproven*. Made
-  ##    an error, it would reject compositions that provably never bite; ignored,
-  ##    it would hide the ones that eventually will.
-  ##
-  ## The gap between the two is therefore counted, not asserted, and that count is
-  ## the work queue for I3: each one is a place where a fixed reservation stops
-  ## being demonstrably sufficient and starts being merely lucky. Measured on the
-  ## corpus it is reached only under `ARKHAM_STRESS`, and only by `emitLvalue2`
-  ## entered from inside another two-bridge step.
-  if g.liveBridges() + 1 > g.distinctBridges():
-    if g.lastResortBridges == {}:
-      bridgeBudgetFailed(g, what, 1)
-    else:
-      # A step already went past its declaration because it had nothing else. The
-      # emitter is knowingly outside its budget until that bridge comes back, so
-      # this shortfall is the escape working rather than an unaccounted
-      # composition — counted, like a tight one, and not asserted.
-      inc tightCompositions
-  if g.liveBridges() + ord(demand) > g.distinctBridges():
-    inc tightCompositions
-  when defined(arkhamBridgeDbg):
-    if g.liveBridges() > dbgPeakHeldAtRecursion:
-      dbgPeakHeldAtRecursion = g.liveBridges()
-  g.bridgeScopes.add (base: g.liveBridges(), cap: ord(demand), what: what)
-
-proc bridgeScopePop*(g: var CodeGen) =
-  ## Close it, checking the step gave back exactly what it took. A LEAK is not a
-  ## crash here and never would be — the register simply stays bound, and the next
-  ## step silently runs with one fewer, until something far away asserts. This is
-  ## the only place that difference is visible.
-  let sc = g.bridgeScopes.pop()
-  if getCurrentException() != nil:
-    # Unwinding already. A step abandoned mid-way has of course not released its
-    # bridges, so the leak below is a CONSEQUENCE of the failure in flight, and
-    # raising it here would replace the real diagnostic with a derived one — which
-    # is exactly what it did on first use: an under-declared `genAconstr2` reported
-    # itself as a leak in `genStore2` three frames out.
-    return
-  let live = g.liveBridges()
-  if live > sc.base:
-    raiseAssert "arkham " & g.md.targetName & ": I2 bridge leak — " & sc.what &
-      " left " & $(live - sc.base) & " of its " & $sc.cap &
-      " declared bridge(s) still held (" & g.heldBridgeNames() &
-      ") in proc " & g.curProcName &
-      ". Every `takeBridge` needs its `dropBridge` on every path out."
-
-proc bridgeOverDeclared*(g: CodeGen) {.noinline.} =
-  let sc = g.bridgeScopes[^1]
-  raiseAssert "arkham " & g.md.targetName & ": I2 bridge budget — " & sc.what &
-    " declared " & $sc.cap & " bridge(s) and is taking " &
-    $(g.liveBridges() - sc.base + 1) & ", in proc " & g.curProcName &
-    ". Raise the declaration to the matching `BridgeDemand` member if the step " &
-    "really holds that many at once — which forces every machine model to " &
-    "reserve one more (`machinedesc.checkMachine`) and is meant to be a decision, " &
-    "not a default. Otherwise the step is holding a bridge it could have " &
-    "released: see design.md, \"Making the reservation a bound instead of a " &
-    "measurement\", I2."
-
-proc bridgeRaise*(g: var CodeGen; demand: BridgeDemand; what: string) =
-  ## Widen the innermost declaration for the rest of the current step.
-  ##
-  ## For a demand a step only discovers as it runs. `prematLval2` is the case:
-  ## whether an lvalue's address chain needs a second bridge depends on whether
-  ## its base or index turned out to be SPILLED, which the walk that planned the
-  ## lvalue could not say. Raising is not a new scope — the registers are taken by
-  ## `prematLval2` and released by the consumer's `freeLvalTemps2`, a lifetime that
-  ## deliberately spans several procs and belongs to the enclosing step — so it is
-  ## that step's declaration that has to grow, and it reverts when the step's own
-  ## scope pops.
-  when BridgeCheck:
-    if g.bridgeScopes.len > 0 and ord(demand) > g.bridgeScopes[^1].cap:
-      g.bridgeScopes[^1].cap = ord(demand)
-      g.bridgeScopes[^1].what = what
-      if g.bridgeScopes[^1].base + ord(demand) > g.distinctBridges():
-        inc tightCompositions
+proc bridgeRaise*(g: var CodeGen; demand: BridgeDemand; what: string) {.inline.} =
+  bridges.bridgeRaise(g, demand, what, g.distinctBridges())
 
 proc bridgeTakeAllowed*(g: CodeGen): bool {.inline.} =
-  ## Whether one more take fits the innermost declaration.
-  g.bridgeScopes.len == 0 or
-    g.liveBridges() - g.bridgeScopes[^1].base < g.bridgeScopes[^1].cap
+  bridges.bridgeTakeAllowed(g, g.liveBridges())
+
+proc bridgeOverDeclared*(g: CodeGen) {.noinline.} =
+  bridges.bridgeOverDeclared(g, g.liveBridges())
 
 template withBridges*(g: var CodeGen; demand: BridgeDemand; what: string;
                       body: untyped) =
-  ## I2: declare this step's bridge demand around the takes that realise it.
-  ##
+  ## Declare this step's transient demand around the takes that realise it.
   ## `bdTransient` is the DEFAULT — every recursive emit entry opens one — so only
   ## a step that holds two or three at once needs to say so. Placing the
   ## declaration above the first take is the point: the assertion then names the
   ## step and its budget, instead of blaming whichever take happened to be the one
   ## that found nothing left.
   when BridgeCheck:
-    g.bridgeScopePush(demand, what)
+    bridgeScopePush(g, demand, what, g.liveBridges(), g.distinctBridges(),
+                    g.distinctBridges(), g.heldBridgeNames())
     try:
       body
     finally:
-      g.bridgeScopePop()
+      bridgeScopePop(g, g.liveBridges(), g.heldBridgeNames())
   else:
     body
 
@@ -1239,8 +1126,13 @@ template bridgeStep*(g: var CodeGen; what: string; demand = bdTransient) =
   ## `genStore2`, `emitLvalue2`). Scoped to the rest of the enclosing proc via
   ## `defer`, because those procs return from many places.
   when BridgeCheck:
-    g.bridgeScopePush(demand, what)
-    defer: g.bridgeScopePop()
+    bridgeScopePush(g, demand, what, g.liveBridges(), g.distinctBridges(),
+                    g.distinctBridges(), g.heldBridgeNames())
+    defer: bridgeScopePop(g, g.liveBridges(), g.heldBridgeNames())
+  when defined(arkhamBridgeDbg):
+    if g.liveBridges() > dbgPeakHeldAtRecursion:
+      dbgPeakHeldAtRecursion = g.liveBridges()
+
 
 
 when defined(arkhamBridgeDbg):

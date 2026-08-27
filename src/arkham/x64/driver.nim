@@ -174,7 +174,13 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
     block:
       var pc = info.decl; inc pc
       stderr.writeLine "DBG emit proc " & symName(pc)
+  when defined(arkhamBridgeDbg):
+    tightCompositions = 0
+    lastResortTakes = 0
   g.emitProcBody2(info, an.hasCall)
+  when defined(arkhamBridgeDbg):
+    stderr.writeLine "BRIDGE tight=" & $tightCompositions & " lastResort=" &
+                     $lastResortTakes & " " & info.asmName
   when defined(arkhamStagingDbg):
     stderr.writeLine "STAGING proc=" & info.asmName & " peak=" & $g.stagingPeak &
       " leaked=" & $g.stagingLive.len & " at=" & g.stagingPeakWhat

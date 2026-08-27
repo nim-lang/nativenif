@@ -155,6 +155,42 @@ second bridge therefore has to be bought from the callee-saved set — one fewer
 home, plus a push/pop in the procs that use it — and that is a measurement to make,
 not a decision to take from the register file's shape.
 
+**The measurement is now made, and it says do not buy it.** `core/bridges` runs on
+x86-64 too, so every step declares its demand here as well, and
+`tightCompositions` counts the ones that declare more than the single guaranteed
+register. Over `tests/arkham`, unstressed:
+
+| | x86-64 | AArch64 |
+|---|---|---|
+| procs | 345 | 342 |
+| procs containing a step that declares more than the guarantee | **253 (73 %)** | **0** |
+| occurrences | 641 | 0 |
+
+Seventy-three per cent is not a corner. A statically reserved second bridge would
+cost a local home in **every** proc to serve a demand that arises in three
+quarters of them — and `pickStagingScratch`'s callee-saved draw already buys
+exactly that register, from exactly that set, **only in the procs that need it**:
+the body-buffer model finalizes the prologue after the body, so a register named
+in `usedCallee` during emission still gets its push/pop. The dynamic purchase
+dominates the static one on both axes. What the reservation would add is not a
+register but a GUARANTEE, and the honest way to state the guarantee is the
+counter, not a register taken from the allocator in the 27 % of procs that would
+never have used it.
+
+So the asymmetry with the Arm targets stays, and is now quantified rather than
+merely admitted. `stagingCapacity` mirrors all three of `pickStagingScratch`'s
+loops so the progress check knows the backstop exists — counting only
+`StagingCandidates` reported `addr_chain_depth` as having nowhere to go at
+`ARKHAM_STRESS=2` when a take there would have succeeded.
+
+Landing the budget on x86-64 immediately found six under-declared steps that no
+RISC target has (`copyNestedAggrTemp`, `fcvtU2F`, `emitCall2Inner`,
+`genAggrCopyStore`, `produceIntoMem2`, `aggrSrcEnd`), all now declared. And at
+`arkhamStressLevel` — k=2, the level the x86-64 stress pass actually runs — the
+check flags exactly one fixture, `addr_chain_depth`, which is already in
+`arkhamStressKnown`. It agrees with the existing list and names the composition
+instead of the unlucky taker.
+
 Note what that costs on x86-64: those same volatiles are the emitter's
 `StagingCandidates`, so every call-free local homed there is one fewer register the
 emitter can transiently borrow. Under `-d:danger` (SROA + inlining) a hot leaf can

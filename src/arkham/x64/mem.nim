@@ -72,6 +72,8 @@ proc pickStagingSealed*(g: var CodeGen; what: string; slot: AsmSlot; avoid: Reg 
   ## reserved R11 bridge makes that near-impossible). `avoid` keeps the pick off a
   ## register the caller still needs live (e.g. an accumulator that is not a bound
   ## temp, so `pickStagingScratch`'s own filters would not otherwise exclude it).
+  when BridgeCheck:
+    if not g.bridgeTakeAllowed(): bridgeOverDeclared(g)
   result = g.pickStagingScratch(avoid)
   if result == NoReg:
     # Genuinely out of registers: every candidate is `avoid`, sealed, a live local
@@ -997,6 +999,7 @@ proc emLvalElemMem*(g: var CodeGen; lhs: Cursor; idx: int) =
       g.ab.intLit idx
 
 proc fcvtU2F*(g: var CodeGen; d: FReg; s: Reg; bits: int) =
+  g.bridgeStep("an unsigned-to-float conversion", bdTwoInRegs)
   ## UNSIGNED 64-bit → float. `cvtsi2sd` reads its GPR as a SIGNED 64-bit value,
   ## and SSE2 has no unsigned counterpart, so a source with bit 63 set would
   ## convert to a negative double (`float(0xFFFF_FFFF_FFFF_FFFF'u64)` came out
@@ -1101,5 +1104,6 @@ proc emitLvalWalk*(g: var CodeGen; n: var Cursor; globBase: Location; isStore: b
     inc n
 
 proc emitLvalue2*(g: var CodeGen; c: Cursor; globBase = dontCare; isStore = false) =
+  g.bridgeStep("`emitLvalue2`")
   var n = c
   g.emitLvalWalk(n, globBase, isStore)

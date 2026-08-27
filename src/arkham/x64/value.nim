@@ -564,6 +564,7 @@ proc emitBitBuiltin2(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
     raiseAssert "arkham x64n: bit builtin not yet implemented: " & builtin
 
 proc produceIntoMem2*(g: var CodeGen; c: Cursor; dst: Location) =
+  g.bridgeStep("a produce-into-memory", bdTwoInRegs)
   ## Totality bridge of the FUSED core: `dst` is an `(s)` spill slot (`etmpN.0`,
   ## minted when `takeTmp` found the pools dry). Materialize the value into a
   ## transient staging register — the reserved bridge guarantees one is always
@@ -640,6 +641,7 @@ proc emitLeafImm*(g: var CodeGen; dest: var Location; natural: Location) =
     g.giveBack s
 
 proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
+  g.bridgeStep("`emitValue2`")
   ## FUSED decide-and-emit (vmgen dest threading): resolve `dest` — a
   ## constraint (dontCare / needsReg / regOrImm) or a fixed location — against
   ## `c`, emit the code that materializes the value there, and return the
@@ -1428,6 +1430,7 @@ proc aggrDstEnd(g: var CodeGen; loc: Location; staged: var Reg): AggrEnd =
   regEnd(staged)
 
 proc genAggrCopyStore*(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
+  g.bridgeStep("a whole-aggregate copy", bdTwoInRegs)
   ## THE whole-aggregate copy `dst = rhs`: reduce each side to the form the machine can
   ## address it in (`aggrDstEnd`/`aggrSrcEnd`), then `copyAggr`. ONE path for every
   ## (destination form × source form). The working registers come from the emit-time
@@ -1513,6 +1516,7 @@ proc genAggrCopyStore*(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
   g.giveBack srcAddr; g.giveBack dstAddr                         # unbind + unseal (NoReg ⇒ no-op)
 
 proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location) =
+  g.bridgeStep("`genStore2`")
   ## The general destination-passing store of the value core. An aggregate COPY (symbol /
   ## lvalue source) goes through the ONE `genAggrCopyStore` regardless of destination form;
   ## constructors/calls/baseobj PRODUCE into the destination per-form; a scalar/float
@@ -2975,6 +2979,7 @@ proc emitCast2*(g: var CodeGen; c: Cursor; dest: var Location) =
 
 proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false;
                     tail = false) =
+  g.bridgeStep("a call", bdTwoInRegs)
   ## FUSED call. allocCall's placement decisions run inline: each scalar arg
   ## dest-threads straight into its ABI register (or a parked callee-saved
   ## survivor when a later argument's shift/div would clobber it — decided by

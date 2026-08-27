@@ -25,7 +25,7 @@ import std / [assertions, tables, sets]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
                     stress, context, typeutil, 
-                    mirrors, temps, exprpred, regbind, abi]
+                    mirrors, temps, exprpred, regbind, abi, bridges]
 import machine as machine_x64
 
 const FloatRet* = F0    # xmm0: SysV scalar-float return + first float argument
@@ -97,6 +97,28 @@ proc releaseStaleName*(g: var CodeGen; r: Reg)
 
 proc unbindTemp*(g: var CodeGen; r: Reg)
 
+proc liveStaging*(g: CodeGen): int {.inline.} =
+  ## How many transients the emitter is holding right now — this step's and every
+  ## enclosing one's. x86-64's counterpart of the RISC `liveBridges`.
+  card(g.stagingHeld)
+
+const StagingGuaranteed* = 1
+  ## What x86-64 promises REGARDLESS of what the allocator did: R11, kept out of
+  ## `intTempRegs` so it is never a local's home. Everything else in
+  ## `StagingCandidates` is opportunistic.
+  ##
+  ## design.md: "On x86-64, only one of the two is guaranteed... Closing it means
+  ## taking a register from the allocator, and nothing is going spare... that is a
+  ## measurement to make, not a decision to take from the register file's shape."
+  ## `tightCompositions` is that measurement — it counts every step whose declared
+  ## demand exceeded this number.
+
+proc heldStagingNames*(g: CodeGen): string =
+  for r in StagingCandidates:
+    if r in g.stagingHeld:
+      if result.len > 0: result.add ", "
+      result.add x64RegName(r)
+
 proc stagingNote*(g: var CodeGen; r: Reg; what: string) {.inline.} =
   ## Record that a staging register was handed out. The PEAK of this — how many
   ## transients the emitter ever holds AT ONCE — is the number that decides whether
@@ -104,6 +126,7 @@ proc stagingNote*(g: var CodeGen; r: Reg; what: string) {.inline.} =
   ## never fail, and the allocator can only take over that guarantee if it knows how
   ## many to reserve. `design.md` asserts the answer is two, from chibicc; this
   ## measures THIS emitter. Debug-only: the field does not exist otherwise.
+  if r != NoReg: g.stagingHeld.incl r
   when defined(arkhamStagingDbg):
     if r != NoReg:
       g.stagingLive.add (r, what)
@@ -118,6 +141,7 @@ proc stagingNote*(g: var CodeGen; r: Reg; what: string) {.inline.} =
     discard
 
 proc stagingRelease(g: var CodeGen; r: Reg) {.inline.} =
+  g.stagingHeld.excl r
   when defined(arkhamStagingDbg):
     for i in countdown(g.stagingLive.high, 0):
       if g.stagingLive[i][0] == r:
@@ -576,6 +600,67 @@ proc pickStagingScratch*(g: var CodeGen; avoid: Reg = NoReg): Reg =
       return r
   return NoReg
 
+proc stagingCapacity*(g: var CodeGen): int =
+  ## How many transients could be drawn AT THIS MOMENT: the ones already held plus
+  ## the candidates still free. Unlike the RISC targets, where the reservation is
+  ## fixed, x86-64's capacity is DYNAMIC — R11 is reserved outright and the ABI
+  ## volatiles are extra room when the allocator has not filled them. That is the
+  ## whole asymmetry design.md names, and it is why capacity and guarantee are two
+  ## numbers here and one there.
+  ## Mirrors `pickStagingScratch`'s three loops, and must keep mirroring them:
+  ## counting only `StagingCandidates` understates the answer, because that proc
+  ## also falls through to a FREE CALLEE-SAVED register — legal because the
+  ## body-buffer model finalizes the prologue after the body, so a register named
+  ## in `usedCallee` during emission still gets its push/pop. Leaving the backstop
+  ## out reported `addr_chain_depth` as having nowhere to go at `ARKHAM_STRESS=2`
+  ## when a take there would have succeeded.
+  result = card(g.stagingHeld)
+  for r in g.md.intTempRegs:
+    if r notin g.stagingHeld and regFreeForTemp(g, r) and not g.regHoldsLiveLocal(r):
+      inc result
+  for r in StagingCandidates.toOpenArray(0, stressLimit(StagingCandidates.len) - 1):
+    if r notin g.stagingHeld and not g.plan.isSealed(r) and not g.rb.isAccum(r) and
+       not g.rb.isBoundTemp(r) and not g.regHoldsLiveLocal(r) and
+       r notin g.rawHomeRegs:
+      inc result
+  for r in g.md.intCalleeSaved:
+    if r notin g.stagingHeld and regFreeForTemp(g, r) and not g.regHoldsLiveLocal(r):
+      inc result
+
+export bridges
+
+template withBridges*(g: var CodeGen; demand: BridgeDemand; what: string;
+                      body: untyped) =
+  ## Declare this step's transient demand around the takes that realise it — the
+  ## x86-64 twin of the RISC template, answering `core/bridges` with THIS target's
+  ## numbers: a dynamic capacity and a guarantee of one.
+  when BridgeCheck:
+    bridgeScopePush(g, demand, what, g.liveStaging(), g.stagingCapacity(),
+                    StagingGuaranteed, g.heldStagingNames())
+    try:
+      body
+    finally:
+      bridgeScopePop(g, g.liveStaging(), g.heldStagingNames())
+  else:
+    body
+
+template bridgeStep*(g: var CodeGen; what: string; demand = bdTransient) =
+  ## The implicit scope a recursive emit entry opens, `defer`-scoped to the rest
+  ## of the proc because those procs return from many places.
+  when BridgeCheck:
+    bridgeScopePush(g, demand, what, g.liveStaging(), g.stagingCapacity(),
+                    StagingGuaranteed, g.heldStagingNames())
+    defer: bridgeScopePop(g, g.liveStaging(), g.heldStagingNames())
+
+proc bridgeRaise*(g: var CodeGen; demand: BridgeDemand; what: string) {.inline.} =
+  bridges.bridgeRaise(g, demand, what, StagingGuaranteed)
+
+proc bridgeOverDeclared*(g: var CodeGen) {.noinline.} =
+  bridges.bridgeOverDeclared(g, g.liveStaging())
+
+proc bridgeTakeAllowed*(g: var CodeGen): bool {.inline.} =
+  bridges.bridgeTakeAllowed(g, g.liveStaging())
+
 proc stagingCensus*(g: var CodeGen; avoid: Reg): string =
   ## Why every staging candidate was unavailable. "Out of registers" is otherwise
   ## indistinguishable from "a filter is wrong / a seal was never released", and
@@ -622,6 +707,8 @@ proc pickStaging*(g: var CodeGen; what: string; avoid: Reg = NoReg): Reg =
   ## caller MUST `giveBack` the result. NOT total: when the register file is
   ## genuinely full this fails loudly rather than spilling somebody else's value
   ## behind their back.
+  when BridgeCheck:
+    if not g.bridgeTakeAllowed(): bridgeOverDeclared(g)
   result = g.pickStagingScratch(avoid)
   if result == NoReg:
     raiseAssert "arkham x64: no staging register available for " & what &
