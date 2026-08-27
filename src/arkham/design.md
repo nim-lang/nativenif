@@ -441,12 +441,31 @@ finding — the same thing `StagingFloor` says about `k=1` on x86-64 — and the
 is now named: the pools must offer at least `EmitterBridgeDemand` registers, so
 `rv32StressLevel` is 2. Verified at k=2,3,4,6,8 and unstressed, 122/122 at every one.
 
-**Not spent on the Arm targets.** AArch64's third (`x16`) is also its atomic scratch,
-so spending it there means reserving a triple separately first, and AArch64 is not
-short of registers. Cortex-M's (`r8`) is spendable by the same argument as RV32's and
-would matter more there — its `intTempRegs` is empty — but no `qemu-system-arm` on
-this host means the change could only be diffed, never run, and this one changes
-emitted code. Both keep three.
+**Not spendable on either Arm target, and `checkMachine` is what says so.** The
+guess here was that Cortex-M's `r8` would go the same way as RV32's `t3` — and it
+would matter more there, where `intCalleeSaved` is four registers and the file
+calls that "thin, and deliberately so". It does not go the same way. Moving `r8`
+into `intCalleeSaved` is refused before a single instruction is emitted:
+
+    machine Cortex-M allocates R8, which its atomic sequences claim for the
+    whole retry loop
+
+`r8` is the third leg of the `ldrex`/`strex` triple, exactly as `x16` is of
+AArch64's `ldaxr`/`stlxr`. RV32 could spend its third precisely *because* it has
+no load-reserved/store-conditional lowering — `atomicScratch` there is all
+`NoReg`. So the rule is not "the third bridge is slack now that no step holds
+three"; it is **the third register belongs to whichever claim is larger, and on a
+target with LL/SC that claim is the atomic triple, not the emitter's staging.**
+
+Whether an atomic could instead take its third from `intCalleeSaved` and let the
+prologue save it — free in every proc that has no atomics — is a real question
+with an answer already written down two files away: *every one of the dedicated
+registers exists because the emitter needs a register it can ALWAYS take, and a
+"usually free" register is worth nothing to a path that must be total.* That
+trade buys one register and sells the property the whole reservation exists for.
+
+This is what making `atomicScratch` its own field bought, one section up: the
+question stopped needing an argument and became a check.
 
 The emitted code changed, as this kind of fix must: 21 of 814 files, all of them
 Arm/RISC aggregate copies, **327 lines shorter**, with x86-64 byte-identical. The
