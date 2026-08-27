@@ -219,6 +219,17 @@ proc armFlagSupported(g: CodeGen; f: X64Flag): bool {.inline.} =
   ## in the middle of an otherwise valid image.
   if f == NoFlag: false
   elif AllFlagBranches in g.md.caps: f in {ZfO, NzO, CfO, NcO, SfO, NsO, OfO, NoO}
+  elif g.md.arch == Rv32:
+    # FOUR, which is why neither arm above fits and this one exists. RV32 has no
+    # condition flags at all: its selector fuses `(cmp a b)` into the branch that
+    # consumes it, so `zf`/`nz` are equality and `cf`/`nc` are the unsigned
+    # `<`/`>=` a borrow denotes. `sf`/`of` have no equivalent — the sign of a
+    # difference agrees with `<` only when the subtraction did not overflow, which
+    # is why AArch64's `blt` tests `N != V` — and `relOfFlagRv` refuses them by
+    # name. Answering `{ZfO, NzO}` here (the pre-RV32 default) was SAFE but a
+    # subset: it turned `cf` into "this target has no such thing", which is the
+    # wrong sentence about a target whose branches are exactly comparisons.
+    f in {ZfO, NzO, CfO, NcO}
   else: f in {ZfO, NzO}
 
 proc asmStmt*(g: var CodeGen; c: Cursor)
@@ -732,8 +743,18 @@ proc asmStmt*(g: var CodeGen; c: Cursor) =
       case op
       of CpuRelaxOp:
         g.ab.keyword YieldA64      # one spelling, hence one interned tag
+      of SemihostOp:
+        # RISC-V semihosting: nifasm emits the whole `slli x0,x0,0x1f` / `ebreak`
+        # / `srai x0,x0,7` triple from this one keyword. The outer two are
+        # architectural no-ops that exist only so a debug agent recognises the
+        # middle one as a request rather than an ordinary breakpoint, so they are
+        # not separable and there is nothing to give an operand to. a0/a1 were set
+        # by the surrounding `.assembler` body, which is the whole reason a
+        # semihosting call is written in one.
+        g.ab.keyword SemihostRv
       else:
-        lengError c, "`" & IntrinsicNames[op] & "` has no Arm lowering", g.asmInfo
+        lengError c, "`" & IntrinsicNames[op] & "` has no " & g.md.targetName &
+                  " lowering", g.asmInfo
     else:
       lengError c, "an instruction used as a statement must have a destination",
                 g.asmInfo

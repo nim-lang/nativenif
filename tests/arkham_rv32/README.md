@@ -15,18 +15,17 @@ here against `x0`..`x30` — see "Rejections, checked by message" below.
 each fixture's exit code against its `.exitcode` file. The quarantine list lives
 in `tester.nim` beside the pass.
 
-## 126 of 130 pass
+## 126 of 130 shared, plus 2 RV32-native
 
 The pass no longer runs `err_*` fixtures — those must NOT compile, on any target,
-and `rv32RejectionTests` checks them by message instead. Of the four that remain
-quarantined, every one is an explicit REFUSAL. Nothing hangs and nothing computes
-a wrong answer, which is the property worth protecting: a quarantine of refusals
-is a to-do list, and a quarantine of wrong answers is a pile of unfound bugs.
+and `rv32RejectionTests` checks them by message instead. Two of the four still
+quarantined are Cortex-M's telling of a test this directory now has its own of;
+the other two are genuinely absent features.
 
-**Cortex-M-specific by construction (3).** `assembler_m` pins `{.register: "r0".}`,
-`interrupt_pendsv` names a Cortex-M interrupt, `semihost_writec` uses
-`{.instruction: "add".}` and a Thumb `bkpt`. The RV32 equivalents belong here as
-their own files, the way the `err_asm_*` ones now do.
+**Replaced, not missing (2).** `assembler_m` and `semihost_writec` pin Cortex-M
+registers and use a Thumb `bkpt`. `assembler_rv32` and `semihost_writec_rv32`
+here are the same tests told in RV32's register file and instruction set. Both
+targets keep theirs.
 
 **Atomics (1).** `atomics`. RV32's `A` extension has `lr.w`/`sc.w`, so the ISA is
 not the obstacle: arkham has no lowering for them (its two are AArch64's
@@ -34,6 +33,43 @@ not the obstacle: arkham has no lowering for them (its two are AArch64's
 `atomicScratch` triple for one — it spent its third bridge. Whoever lowers RV32
 atomics has to reserve three registers explicitly and say so; `checkMachine`
 refuses a partial triple.
+
+**Interrupts (1).** `interrupt_pendsv`. `rejectForRv32` turns `{.interrupt.}` away
+by name: a RISC-V core reaches its handlers through `mtvec`, which in vectored
+mode holds JUMP INSTRUCTIONS rather than addresses, and the trampoline table that
+builds is outstanding (see `writerv32.nim`). This is the one of the four with no
+fixture to write — the feature has to exist first, and a fixture asserting the
+refusal is already what `rv32Rejections` covers through `err_interrupt_*`.
+
+## The RV32-native positive fixtures
+
+`assembler_rv32` is `assembler_m`'s test of the `{.assembler.}` mode: pinned
+parameters, a callee-saved pin, a `{.stack.}` local, `while`/`break`, `{.naked.}`,
+`(addr g)` of a global — and a `cmp` read through all FOUR conditions RV32 can
+fuse. That last part is why it could not simply be `assembler_m` with the register
+names swapped: RV32 has no condition flags at all. Its selector fuses `(cmp a b)`
+into the branch that consumes it, so `zf`/`nz` are equality and `cf`/`nc` are the
+unsigned `<`/`>=` a borrow denotes, while `sf`/`of` are refused by name — the sign
+of a difference agrees with `<` only when the subtraction did not overflow. The
+intrinsic rows say so now, and `armFlagSupported` grew a third arm for it: the
+`{ZfO, NzO}` default was safe but told `cf` it did not exist, which is the wrong
+sentence about a target whose branches ARE comparisons.
+
+`semihost_writec_rv32` prints through the RISC-V semihosting protocol. It needed a
+`semihost` intrinsic row of its own rather than `bkpt` with another encoding,
+because a semihosting call there is not one instruction but a fixed three —
+`slli x0,x0,0x1f`, `ebreak`, `srai x0,x0,7` — whose outer two are architectural
+no-ops that exist only so a debug agent recognises the middle one as a request.
+`bkpt` takes its magic number as an operand; here the magic IS the surrounding
+instructions, so there is nothing to give an operand to.
+
+Writing it found a nifasm bug: `pass2` resets `clobbered`, `clobberedA64` and
+`clobberedM` at every proc — "each proc is a fresh control flow" — and
+`clobberedRv` was never added to that list. Procs are generated in REACHABILITY
+order, so `main` was emitted first, its calls marked a0 clobbered, and the
+`{.assembler.}` `putc` that followed was told its own parameter's value was gone.
+It needs a callee reached from a caller that clobbers a register the callee pins,
+which is exactly this fixture and nothing in the corpus before it.
 
 ## Rejections, checked by message
 

@@ -142,6 +142,7 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     ctx.clobbered = {}
     ctx.clobberedA64 = {}
     ctx.clobberedM = {}
+    ctx.clobberedRv = {}
     setLenient false
 
     # Add params to scope.

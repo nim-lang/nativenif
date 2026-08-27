@@ -3508,6 +3508,13 @@ proc emitInstr2*(g: var CodeGen; c: Cursor; dest: var Location) =
     # because everything below is written around `argCurs[0]` existing. `dest`
     # stays `Undef`: the node yields no value.
     case tgt.op
+    of SemihostOp:
+      # The three-instruction RISC-V semihosting request. nifasm emits all three
+      # from this one keyword — the outer two are architectural no-ops whose only
+      # job is to make the middle `ebreak` recognisable as a semihosting call, so
+      # they are not separable and there is nothing here to give an operand to.
+      # a0/a1 were set by the `{.assembler.}` body that names them.
+      g.ab.keyword SemihostRv
     of CpuRelaxOp:
       # `yield` is HINT #1: architecturally a NOP, so it needs no feature test,
       # and it writes no register, no flag and no memory. Nothing to tell the

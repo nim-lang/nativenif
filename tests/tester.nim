@@ -1081,7 +1081,16 @@ proc rv32AsmTests() =
 
 
 const rv32Quarantine = [
-    "assembler_m", "atomics", "interrupt_pendsv", "semihost_writec"]
+    # Cortex-M's versions of tests RV32 now has its own of, kept rather than
+    # deleted: each is the other target's telling of the same story, and both
+    # targets should keep theirs. See `tests/arkham_rv32/assembler_rv32` and
+    # `semihost_writec_rv32`.
+    "assembler_m", "semihost_writec",
+    # Genuinely absent, both named in tests/arkham_rv32/README.md: RV32 has no
+    # LL/SC lowering and reserves no `atomicScratch` triple for one, and it
+    # refuses `{.interrupt.}` outright because the `mtvec` trampoline table a
+    # RISC-V core reaches its handlers through is not built yet.
+    "atomics", "interrupt_pendsv"]
 
   ## Fixtures the RV32 pass does not yet run. Every entry is a NAMED gap, grouped
   ## and argued in tests/arkham_rv32/README.md. A list this long is only tolerable
@@ -1210,8 +1219,44 @@ proc rv32CodegenTests() =
     removeFile asmNif
     removeFile elf
     inc passed
+  # RV32-NATIVE positive fixtures, alongside the shared corpus. These are the ones
+  # that cannot be shared because their content IS the machine: a `{.assembler.}`
+  # body naming registers, a semihosting sequence. `tests/arkham_m`'s equivalents
+  # stay quarantined rather than deleted — they are Cortex-M's versions of the same
+  # tests, and both targets should keep theirs.
+  var native = 0
+  for file in walkFiles("tests/arkham_rv32/*.c.nif"):
+    let base = file.extractFilename.changeFileExt("").changeFileExt("")
+    if base.startsWith("err_"): continue          # rejection fixtures; see below
+    inc native
+    let asmNif = "tests" / "arkham_rv32" / (base & ".asm.nif")
+    let elf = "tests" / "arkham_rv32" / (base & ".elf")
+    let (ao, ac) = execCmdEx(quoteShell(arkhamExe) &
+      " --os:embedded --cpu:riscv32 -o:" & quoteShell(asmNif) & " " & quoteShell(file))
+    if ac != 0: quit "FAILURE (RV32 native codegen) " & base & "\n" & ao
+    let (no, nc) = execCmdEx(quoteShell(nifasmExe) & " -o:" & quoteShell(elf) &
+                             " " & quoteShell(asmNif))
+    if nc != 0: quit "FAILURE (RV32 native assemble) " & base & "\n" & no
+    var args: seq[string] = @[]
+    for a in rv32Args: args.add a
+    args.add elf
+    let (output, code) = runProgram(qemu, args)
+    let want = try: parseInt(readFile("tests/arkham_rv32" / (base & ".exitcode")).strip())
+               except CatchableError: 0
+    if code == timeoutExitCode:
+      quit "FAILURE (TIMEOUT) RV32 native " & base & "\n" & output
+    if code != want:
+      quit "FAILURE (RV32 native) " & base & ": exit code " & $code &
+           ", expected " & $want & "\n" & output
+    let outFile = "tests" / "arkham_rv32" / (base & ".output")
+    if fileExists(outFile) and output != readFile(outFile):
+      quit "FAILURE (RV32 native output) " & base & "\ngot:\n" & output &
+           "want:\n" & readFile(outFile)
+    removeFile asmNif
+    removeFile elf
   echo passed, " / ", total, " RV32 codegen tests successful (",
-       rv32Quarantine.len, " quarantined — see tests/arkham_rv32/README.md)"
+       rv32Quarantine.len, " quarantined — see tests/arkham_rv32/README.md), plus ",
+       native, " RV32-native"
 
 
 const rv32StressLevel = 2
