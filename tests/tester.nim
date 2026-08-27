@@ -601,6 +601,26 @@ const arkhamLinuxA64Unsupported: seq[string] = @[
   # opens, then re-emits `(at base idx [scratch])` for nifasm to fold. Add a test's
   # stem here if a new arm64-only TODO is introduced.
 
+proc requiredExe(name, what: string): string =
+  ## `findExe` for a runner a suite needs, with one extra job.
+  ##
+  ## Missing, the suite SKIPS — the right answer on a developer machine that has
+  ## no emulator for some target, and exactly the wrong one in CI, where a skipped
+  ## suite reports success and the coverage is simply gone. That is not
+  ## hypothetical: before this existed, the workflow installed `qemu-system-arm`
+  ## and nothing else, so every RV32 suite, all 219 `linux_arm64` run tests and the
+  ## a64 stress pass skipped on every push, and the run was green.
+  ##
+  ## `NIFASM_REQUIRE_QEMU=1` turns every such skip into a failure. CI sets it, so a
+  ## package rename — `qemu-system-misc` became `qemu-system-riscv` between Ubuntu
+  ## releases — breaks the build instead of quietly emptying it.
+  result = findExe(name)
+  if result.len == 0 and getEnv("NIFASM_REQUIRE_QEMU") == "1":
+    quit "FAILURE: `" & name & "` not found and NIFASM_REQUIRE_QEMU=1, so " &
+         what & " would be SKIPPED. A skipped suite reports success — that is " &
+         "what this guard exists to prevent. Install it, or unset the variable " &
+         "to accept the gap."
+
 proc arkhamQemuTests() =
   ## Cross-validate the AArch64 backend on Linux: emit each `tests/arkham/*.c.nif`
   ## as `linux_arm64` (static ELF, svc syscalls), assemble with nifasm, and run it
@@ -608,7 +628,7 @@ proc arkhamQemuTests() =
   ## native pass uses. This lets the arm64 path be exercised end-to-end on an x86-64
   ## Linux host (the Darwin/Mach-O binaries can only run on macOS). Skipped silently
   ## when qemu is not installed.
-  let qemu = findExe("qemu-aarch64")
+  let qemu = requiredExe("qemu-aarch64", "the linux_arm64 run tests")
   if qemu.len == 0:
     echo "qemu-aarch64 not found — skipping linux_arm64 run tests " &
          "(install: sudo apt-get install qemu-user)"
@@ -963,7 +983,7 @@ proc thumb2SelfTest() =
   ## whatever the backend emits, so "the result is right" checks the encoding at
   ## exactly the level that matters — and it exercises the branch encoders and the
   ## relocation patcher too, which a byte-comparison could not.
-  let qemu = findExe(cortexMQemu)
+  let qemu = requiredExe(cortexMQemu, "the Cortex-M suites")
   if qemu.len == 0:
     echo cortexMQemu, " not found - skipping Thumb-2 encoder self-test " &
          "(install: sudo apt-get install qemu-system-arm)"
@@ -1009,7 +1029,7 @@ proc rv32SelfTest() =
   ## this configuration, but its DECODER is the one that will run whatever the
   ## backend emits. It also covers the branch relaxation and the `auipc`/`lui`
   ## relocation patchers, which a byte-comparison could not reach.
-  let qemu = findExe(rv32Qemu)
+  let qemu = requiredExe(rv32Qemu, "the RV32 suites")
   if qemu.len == 0:
     echo rv32Qemu, " not found - skipping RV32 encoder self-test " &
          "(install: sudo apt-get install qemu-system-misc)"
@@ -1047,7 +1067,7 @@ proc rv32AsmTests() =
   ## a wrong exit code rather than as output that happens to look right. The
   ## branch and float fixtures go further and exit with the NUMBER of sub-checks
   ## that passed, so a failure narrows itself.
-  let qemu = findExe(rv32Qemu)
+  let qemu = requiredExe(rv32Qemu, "the RV32 suites")
   if qemu.len == 0:
     echo rv32Qemu, " not found - skipping RV32 assembler tests"
     return
@@ -1178,7 +1198,7 @@ proc rv32CodegenTests() =
   ## semihosting exit — so a second copy of 138 fixtures would drift from the
   ## first rather than test anything it does not. Same argument the `linux_arm64`
   ## pass makes for reusing `tests/arkham`.
-  let qemu = findExe(rv32Qemu)
+  let qemu = requiredExe(rv32Qemu, "the RV32 suites")
   if qemu.len == 0:
     echo rv32Qemu, " not found - skipping RV32 codegen tests"
     return
@@ -1292,7 +1312,7 @@ proc rv32StressTests() =
   ## codegen bug by construction. That is the half a totality argument cannot
   ## supply: it proves a register is always available, not that the value arriving
   ## in it is the right one.
-  let qemu = findExe(rv32Qemu)
+  let qemu = requiredExe(rv32Qemu, "the RV32 suites")
   if qemu.len == 0:
     echo rv32Qemu, " not found - skipping RV32 stress tests"
     return
@@ -1346,7 +1366,7 @@ proc cortexMAsmTests() =
   ##
   ## Each fixture exits with a value it COMPUTED, so a wrong encoding shows up as
   ## a wrong exit code rather than as output that happens to look right.
-  let qemu = findExe(cortexMQemu)
+  let qemu = requiredExe(cortexMQemu, "the Cortex-M suites")
   if qemu.len == 0:
     echo cortexMQemu, " not found - skipping Cortex-M assembler tests"
     return
@@ -1442,7 +1462,7 @@ proc cortexMLayoutTests() =
   ## two words a cold core reads and the segment addresses back out of the ELF.
   ## Running is not enough on its own: an image that ignored the file entirely
   ## would still exit 42 from its compiled-in defaults.
-  let qemu = findExe(cortexMQemu)
+  let qemu = requiredExe(cortexMQemu, "the Cortex-M suites")
   if qemu.len == 0:
     echo cortexMQemu, " not found - skipping Cortex-M layout tests"
     return
@@ -1644,7 +1664,7 @@ proc cortexMMemMapTests() =
   ##
   ## The board case (an STM32F407) cannot be run — nothing in QEMU has flash at
   ## 0x08000000 — so it is checked by reading the two words a cold core reads.
-  let qemu = findExe(cortexMQemu)
+  let qemu = requiredExe(cortexMQemu, "the Cortex-M suites")
   if qemu.len == 0:
     echo cortexMQemu, " not found - skipping Cortex-M memory-map tests"
     return
@@ -1869,7 +1889,7 @@ proc arkhamCortexM64Tests() =
   ## A fixture in `cortexMUnsupported` may fail; anything else may not, and a
   ## parked fixture that starts passing is reported so the list shrinks with the
   ## backend instead of drifting.
-  let qemu = findExe(cortexMQemu)
+  let qemu = requiredExe(cortexMQemu, "the Cortex-M suites")
   if qemu.len == 0:
     echo cortexMQemu, " not found - skipping the arkham cortex-m 64-bit corpus"
     return
@@ -1933,7 +1953,7 @@ proc arkhamCortexMTests() =
   ## separate: 206 of the 236 originals declare `(i 64)`, which on a 32-bit
   ## target needs the register-pair lowering that is milestone M4. The corpus
   ## grows as features land rather than carrying a skip list the size of itself.
-  let qemu = findExe(cortexMQemu)
+  let qemu = requiredExe(cortexMQemu, "the Cortex-M suites")
   if qemu.len == 0:
     echo cortexMQemu, " not found - skipping arkham Cortex-M tests"
     return
@@ -2040,7 +2060,7 @@ when defined(linux) and defined(arm64):
 
 # The hand-written AArch64 fixture assembled above is a `linux_arm64` ELF: run it.
 when defined(linux):
-  if findExe("qemu-aarch64").len > 0:
+  if requiredExe("qemu-aarch64", "the a64 stress and slot-base-free passes").len > 0:
     let (sbfOut, sbfCode) = runProgram(findExe("qemu-aarch64"),
                                        ["tests" / "a64_slot_base_free"])
     if sbfCode != 0:
@@ -2051,7 +2071,7 @@ when defined(linux):
 
 # The AArch64 backend gets the same starved-pool pass, under qemu.
 when defined(linux) and defined(amd64):
-  if findExe("qemu-aarch64").len > 0:
+  if requiredExe("qemu-aarch64", "the a64 stress and slot-base-free passes").len > 0:
     arkhamStressTests(arch = "linux_arm64", runner = "qemu-aarch64",
                       skip = arkhamLinuxA64Unsupported & arkhamA64Unsupported &
                              arkhamOsxOnly,

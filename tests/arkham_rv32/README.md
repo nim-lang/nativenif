@@ -10,6 +10,13 @@ whose whole content is a register name. A `{.register: "r0".}` pin says nothing
 about RV32 except that `r0` is not one of its registers, so those are written
 here against `x0`..`x30` — see "Rejections, checked by message" below.
 
+All four RV32 suites need `qemu-system-riscv32`, and skip without it — which is
+the right answer locally and the wrong one in CI, where a skipped suite reports
+success. `NIFASM_REQUIRE_QEMU=1` turns every such skip into a failure and the
+workflow sets it on the runner that installs the emulators. Before that existed,
+CI installed `qemu-system-arm` alone: every RV32 suite, all 219 `linux_arm64` run
+tests and the a64 stress pass skipped on every push, and the run was green.
+
 `tester.rv32CodegenTests` runs that corpus through
 `arkham --os:embedded --cpu:riscv32` → `nifasm` → `qemu-system-riscv32`, checking
 each fixture's exit code against its `.exitcode` file. The quarantine list lives
