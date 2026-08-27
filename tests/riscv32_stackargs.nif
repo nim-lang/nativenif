@@ -1,0 +1,105 @@
+(.nif27)
+(stmts
+ (arch riscv32)
+ (proc :sum6.0
+  (params
+   (param :a.0
+    (x10)
+    (i 32))
+   (param :b.0
+    (x11)
+    (i 32))
+   (param :c.0
+    (x12)
+    (i 32))
+   (param :d.0
+    (x13)
+    (i 32))
+   (param :e.0
+    (s)
+    (i 32))
+   (param :f.0
+    (s)
+    (i 32)))
+  (result :ret.0
+   (x10)
+   (i 32))
+  (clobber
+   (x10)
+   (x11)
+   (x12)
+   (x13))
+  (stmts
+   (add3
+    (x10)(x10)(x11))
+   (add3
+    (x10)(x10)(x12))
+   (add3
+    (x10)(x10)(x13))
+   (mov
+    (x11)
+    (mem
+     (sp)e.0))
+   (add3
+    (x10)(x10)(x11))
+   (mov
+    (x11)
+    (mem
+     (sp)f.0))
+   (add3
+    (x10)(x10)(x11))
+   (ret)))
+ (proc :main.0
+  (params)
+  (result :mret.0
+   (x10)
+   (i 32))
+  (stmts
+   (var :acc.0
+    (x18)
+    (i 32))
+   (var :blo.0
+    (s)
+    (i 32))
+   (var :bhi.0
+    (s)
+    (i 32))
+   (mov
+    (sp)2148532224)
+   (sub
+    (sp)(ssize))
+   (prepare sum6.0
+    (mov
+     (arg a.0)1)
+    (mov
+     (arg b.0)2)
+    (mov
+     (arg c.0)3)
+    (mov
+     (arg d.0)4)
+    (mov
+     (x19)15)
+    (mov
+     (mem
+      (sp)
+      (arg e.0))(x19))
+    (mov
+     (x19)17)
+    (mov
+     (mem
+      (sp)
+      (arg f.0))(x19))
+    (call)
+    (mov acc.0
+     (res ret.0)))
+   (mov
+    (x12)131110)
+   (mov blo.0
+    (x12))
+   (mov bhi.0 acc.0)
+   (lea
+    (x11)blo.0)
+   (mov
+    (x10)32)
+   (semihost)
+   (ret))))

@@ -82,27 +82,28 @@ proc tagToAvrReg*(t: TagEnum): AvrReg {.inline.} =
   else:
     NoAvrReg
 
-proc tagToRv32Inst*(t: TagEnum): Rv32Inst {.inline.} =
-  ## Convert TagEnum to Rv32Inst. Returns NoRv32Inst if not a valid Rv32Inst.
-  if rawTagIsRv32Inst(t):
-    cast[Rv32Inst](t)
-  else:
-    NoRv32Inst
-
-proc tagToRv32Reg*(t: TagEnum): Rv32Reg {.inline.} =
-  ## Convert TagEnum to Rv32Reg. Returns NoRv32Reg if not a valid Rv32Reg.
-  ##
-  ## RV32 mints no register spelling of its own — `(x0)`..`(x30)` and `(sp)` are
-  ## AArch64's, reused — so every tag here is a valid `A64Reg` too and `(arch …)`
-  ## is what decides which machine it names.
-  if rawTagIsRv32Reg(t):
-    cast[Rv32Reg](t)
-  else:
-    NoRv32Reg
-
 proc tagToNifasmExpr*(t: TagEnum): NifasmExpr {.inline.} =
   ## Convert TagEnum to NifasmExpr. Returns NoExpr if not a valid NifasmExpr.
   if rawTagIsNifasmExpr(t):
     cast[NifasmExpr](t)
   else:
     NoExpr
+
+proc tagToRvInst*(t: TagEnum): RvInst {.inline.} =
+  ## Convert TagEnum to RvInst (RV32). Returns NoRvInst if not a valid RvInst.
+  if rawTagIsRvInst(t):
+    cast[RvInst](t)
+  else:
+    NoRvInst
+
+proc tagToRvReg*(t: TagEnum): RvReg {.inline.} =
+  ## Convert TagEnum to RvReg (RV32). Returns NoRvReg if not a valid RvReg.
+  ##
+  ## RV32 shares its ENTIRE register file with AArch64 — `(x0)`, `(sp)`, `(d0)`,
+  ## `(s0)` are the same tags on both — so every valid `RvReg` is also a valid
+  ## `A64Reg`. Which machine one names is decided by `(arch …)`, exactly as it is
+  ## for the `(r0)` that Cortex-M and x86-64 share.
+  if rawTagIsRvReg(t):
+    cast[RvReg](t)
+  else:
+    NoRvReg

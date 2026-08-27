@@ -23,7 +23,7 @@
 import std / [tables, sets]
 import nifcore
 import asmslots, machinedesc, planer, programs
-import "../arm/machine_m"                # the Cortex-M machine model
+import "../risc/machine_m"                # the Cortex-M machine model
 import layout                            # Layout: the `--layout:` board file
 import asmbuf
 
@@ -107,6 +107,28 @@ type
                                              ## minted spill slots (`etmpN.0`/`eftmpN.0`/
                                              ## `heldN.0`) — the merged emitter's analogue of
                                              ## the allocator's `tmpSpills`. Reset per proc.
+    lastResortBridges*: set[Reg]             ## bridges taken PAST a step's declaration
+                                             ## because every alternative was gone.
+                                             ## While one is held the emitter is
+                                             ## knowingly past its budget, so the I1
+                                             ## progress check downgrades to a count
+                                             ## rather than asserting: the shortfall
+                                             ## is the escape working, not a
+                                             ## composition nobody accounted for.
+                                             ## Cleared by `unbindTemp`, the single
+                                             ## release point.
+    bridgeScopes*: seq[tuple[base, cap: int; what: string]]
+                                             ## I2: the declared bridge budget of each emitter
+                                             ## step currently on the stack. `base` is how many
+                                             ## reserved bridges were already live when the step
+                                             ## was entered (its ENCLOSING holders), `cap` how
+                                             ## many it declared for itself. `emit.takeBridge`
+                                             ## refuses a take past `base + cap`, so an
+                                             ## over-budget step is caught AT the step that is
+                                             ## wrong rather than at whichever later take found
+                                             ## nothing left. Empty in a release build, where
+                                             ## `emit.BridgeCheck` compiles the whole mechanism
+                                             ## out.
     pickedRegs*: set[Reg]                    ## step-3 value core: GPRs handed out by `takeTmp`/
                                              ## `takeHeld` but not yet BOUND — the reserve→bind
                                              ## gap of the lazy-bind convention (a consumer
@@ -155,6 +177,17 @@ type
     board*: layout.Layout                    ## the `--layout:` board, when one was
                                              ## given. arkham reads it and forwards it;
                                              ## nifasm places segments from the forward.
+    rvStackTop*: int64                       ## RV32 only: the value the reset path
+                                             ## loads into `sp`.
+                                             ##
+                                             ## A number arkham must know at CODEGEN
+                                             ## time, because on this target the
+                                             ## initial stack pointer is an
+                                             ## INSTRUCTION rather than a word the
+                                             ## image writer fills in. Cortex-M gets
+                                             ## its from vector-table slot 0, which
+                                             ## is why nothing like this exists
+                                             ## there.
     thumbM*: bool                            ## the SAME emitter, targeting Cortex-M
                                              ## (ARMv7E-M) instead of AArch64. The two
                                              ## share the asm-NIF vocabulary by design —
@@ -245,11 +278,34 @@ type
                                              ## params: what type to re-emit when a binding has
                                              ## to be re-established. Only consumer so far is
                                              ## `restoreBindingsAfterDiverging`.
+    stagingHeld*: set[Reg]                   ## x86-64: staging registers handed out and
+                                             ## not yet given back. The debug-only
+                                             ## `stagingLive` below records WHAT each is
+                                             ## for; this one is the COUNT, and it has to
+                                             ## exist in every build because the x86-64
+                                             ## budget checks read it (`x64/emit.liveStaging`
+                                             ## feeding `core/bridges`).
     when defined(arkhamStagingDbg):
       stagingLive*: seq[(Reg, string)]  ## staging registers handed out and not yet given
                                         ## back, with the label of what asked for each
       stagingPeak*: int                 ## the most that were ever live AT ONCE in this proc
       stagingPeakWhat*: string          ## and which labels those were — the SHAPE to reserve for
+    rvIrqCauses*: set[uint8]                 ## RV32: the trap causes this module declared
+                                             ## a handler for. The reset path enables
+                                             ## exactly these in `mie` — see
+                                             ## `runtime.emEnableInterruptsRv` for why
+                                             ## declaring the handler IS the enable.
+    isInterrupt*: bool                       ## the proc being emitted is an
+                                             ## `{.interrupt.}` handler. On RV32 that
+                                             ## changes both ends of the frame: nothing
+                                             ## stacks registers for it in hardware, so
+                                             ## everything a CALL would destroy has to be
+                                             ## saved by the handler itself, and it
+                                             ## returns with `mret` rather than `ret`.
+                                             ## Cortex-M needs neither — M-profile stacks
+                                             ## r0-r3/r12/lr/pc and `bx lr` on an
+                                             ## EXC_RETURN value unwinds that — which is
+                                             ## why the flag has no effect there.
     curProcName*: string                     ## the proc currently being emitted. arkham's input
                                              ## carries no line info, so a bare register-pressure
                                              ## or typing assert names nothing actionable; this
@@ -399,6 +455,7 @@ proc newCodeGen*(buf: var TokenBuf; md: MachineDesc): CodeGen =
   ## register renderer, whether immediates may address memory, which target the
   ## `BodyLib` splices are keyed on — is set by the caller, because it IS the
   ## difference between the targets.
+  checkMachine(md)
   CodeGen(ab: initAsmBuf(), buf: addr buf, md: md)
 
 proc adoptProgram*(g: var CodeGen) =

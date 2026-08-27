@@ -75,10 +75,12 @@ type
     ## `scratchDemand`, where it answers like the ARM targets because it has no
     ## store-immediate and no PC-relative data operand either.
     ##
-    ## `Rv32` groups with `Arm64`/`ThumbM` wherever the question is about the ALU
-    ## — it is three-operand and register-rich — and with `X86` at the aggregate
-    ## return, where ilp32 passes a hidden first pointer rather than reserving a
-    ## register for it.
+    ## `Rv32` groups with `Arm64`/`ThumbM` at every one of those branches too: it
+    ## is a three-operand ALU with no fixed division or shift-count register, and
+    ## the questions the planner asks are exactly the ones that separates from
+    ## x86. What differs between it and the two Arm targets is the word size, the
+    ## register file and a handful of capabilities — and all three are already
+    ## values rather than branches.
     X86, Arm64, ThumbM, Avr, Rv32
 
   TargetFeature* = enum
@@ -124,6 +126,27 @@ type
                       ## an otherwise valid image.
     Freestanding      ## no OS: the image owns the machine, so a board layout — not
                       ## a system call — answers where memory is.
+    BitScanOps        ## the assembler has `clz`/`rbit`/`rev`. Arm does; RV32I does
+                      ## NOT — counting and reversing bits is the Zbb extension
+                      ## there, and the baseline has no encoding for any of the
+                      ## three. Asked by the `{.assembler.}` intrinsic lowering,
+                      ## which is the one place they are written down, so a target
+                      ## without them refuses the intrinsic BY NAME rather than
+                      ## emitting a tag its selector will not recognise.
+    FloatConvert      ## a one-instruction convert BETWEEN float precisions
+                      ## (`fcvt`). Reachable only where `Float64` is also present —
+                      ## with one precision there is nothing to convert to — but it
+                      ## is a separate fact: RV32 has both precisions and spells the
+                      ## convert `fcvt.s.d`/`fcvt.d.s`, which is not the `(fcvt …)`
+                      ## row AArch64 uses.
+    SimdVector        ## the 128-bit AdvSIMD vocabulary (`(vfadd …)`, `(vdup …)`,
+                      ## `(fldrq …)`, …). NEON is AArch64's; RV32's vector
+                      ## extension is not baseline and would not share these
+                      ## spellings anyway. The path behind this is staged and inert
+                      ## until the shared intrinsic table carries the rows — which
+                      ## is exactly why the capability goes in NOW: when it wakes
+                      ## up it must wake up for the targets that have it, not for
+                      ## whichever ones were not named in a two-target branch.
 
   FrameStyle* = enum
     ## The SHAPE of the prologue and epilogue, and with it how the caller's
@@ -167,9 +190,11 @@ type
     ThumbExpandImm    ## Thumb-2: a byte replicated across lanes, or an 8-bit value
                       ## with bit 7 set rotated anywhere. A DIFFERENT set
     X86Imm32          ## any 32-bit constant, sign-extended
-    Rv32Imm12         ## a 12-bit SIGNED immediate, and only in the `i`-suffixed
-                      ## forms. Anything wider is `lui`+`addi`, which is two
-                      ## instructions and therefore the code generator's business
+    RvImm12           ## RISC-V: a 12-bit SIGNED field, and the same one in every
+                      ## ALU op and every memory operand. Not a range with a
+                      ## special shape like the other three — which is the point:
+                      ## there is exactly one rule to check, and anything outside
+                      ## ±2048 is `lui`+`addi` into a register.
     AvrImm8           ## an 8-bit constant, and only into r16..r31. Nothing wider
                       ## is an immediate here at all: a 16-bit constant is two
                       ## `ldi`s, and the pair-wide `adiw`/`sbiw` carry six bits
@@ -179,7 +204,15 @@ type
     ## All registers are slots from a *subset* of `Reg`/`FReg` (a narrower ISA
     ## like x86-64 leaves the high slots unused).
     arch*: TargetArch                ## the ISA, for the few arch-specific walk branches
-    intRetReg*: Reg                  ## integer/pointer return register (rax / x0 = R0)
+    intRetReg*: Reg                  ## integer/pointer return register (rax / x0 = R0;
+                                     ## a0 = R10 on RV32, which is what makes reading
+                                     ## it from HERE rather than from a module-level
+                                     ## constant load-bearing — the two Arm targets
+                                     ## and x86-64 all answer R0, so a site that
+                                     ## hardcoded it looked correct on every target
+                                     ## that existed)
+    floatRetReg*: FReg               ## float return register (xmm0 / v0 = F0; fa0 = F10
+                                     ## on RV32). Same reasoning as `intRetReg`.
     divRemReg*: Reg                  ## x86 idiv's clobbered high-half / remainder reg
                                      ## (rdx = R2); `NoReg` on ISAs without the constraint
                                      ## (arm64 sdiv/msub use ordinary scratch)
@@ -233,6 +266,26 @@ type
                                      ## dedicated r8 on Cortex-M, where nifasm has
                                      ## already claimed r12. Always the last entry
                                      ## of `bridgeRegs`.
+    atomicScratch*: array[3, Reg]    ## the three registers an LL/SC atomic sequence
+                                     ## claims for itself — `old`, `new`/`expected`
+                                     ## and the store STATUS — for the whole
+                                     ## `ldaxr`/`stlxr` retry loop.
+                                     ##
+                                     ## Its OWN reservation, not `bridgeRegs[0..2]`,
+                                     ## which is what it used to read. Those are two
+                                     ## unrelated claims that merely coincided while
+                                     ## every RISC target reserved exactly three
+                                     ## bridges: the moment one spent its third, the
+                                     ## atomic lowering indexed off the end of a
+                                     ## two-element seq. This is the rule design.md
+                                     ## states after the `cmpxchg`/rax bug — a
+                                     ## register an emitter CLAIMS must be excluded
+                                     ## where the claim is made, never inferred from
+                                     ## a pool it happens to sit in.
+                                     ##
+                                     ## `NoReg`s mean the target reserves no triple
+                                     ## and therefore has no LL/SC lowering;
+                                     ## `emitAtomicInstr2` refuses by name.
     bridgeRegs*: seq[Reg]            ## every GPR withheld from all allocation
                                      ## pools so the emitter can ALWAYS draw a
                                      ## transient — a folded memory operand a
@@ -246,6 +299,19 @@ type
                                      ## Empty on x86-64, which reserves a single
                                      ## `stagingBridgeReg` instead.
     floatBridgeReg*: FReg            ## the SIMD/FP twin of `produceBridge`.
+    memIntrinScratch*: array[3, Reg] ## three volatiles the inline `memcpy`/`memset`
+                                     ## lowering uses for its loop counter and its
+                                     ## two byte temporaries, on top of the three
+                                     ## argument registers it reads.
+                                     ##
+                                     ## Named here because it was `(R3, R4, R5)` —
+                                     ## AArch64's, written as literal slots. Those
+                                     ## are volatile scratch on Arm and `gp`, `tp`
+                                     ## and `t0` on RISC-V, two of which the ABI
+                                     ## reserves for the whole program. A slot
+                                     ## literal in shared code is only ever right
+                                     ## by coincidence, and this is the second one
+                                     ## found after `intRetReg`.
     abiCalleeSaved*: seq[Reg]        ## the callee-saved registers the ABI
                                      ## DEFINES, as opposed to the ones the
                                      ## allocator draws homes from
@@ -552,3 +618,131 @@ proc memToMemBridgeDemand*(md: MachineDesc; dst, v: Location): ScratchDemand =
       ScratchDemand(gprs: 1, slot: (if md.arch == X86: v.typ else: dst.typ))
     else:
       ScratchDemand()
+
+type BridgeDemand* = enum
+  ## How many reserved bridges one emitter step holds AT ONCE, named by the shape
+  ## that needs them. A step declares its demand with `emit.withBridges` above its
+  ## first take; `emit.takeBridge` refuses a take beyond the declaration.
+  ##
+  ## The ordinal IS the count, and `EmitterBridgeDemand` below is the max over
+  ## this enum — so the number a machine model must reserve is DERIVED from the
+  ## declarations rather than maintained beside them. Adding a member here
+  ## immediately makes `checkMachine` demand another bridge of every target, which
+  ## is the forcing function: a step cannot quietly want a fourth register.
+  bdTransient = 1
+    ## One transient: a folded memory operand a three-operand ALU must load first,
+    ## an immediate too wide for the instruction's field, a global's address, a
+    ## value on its way into a stack slot. The overwhelming majority.
+  bdTwoInRegs = 2
+    ## TWO values that must sit in registers at the same instant while both live
+    ## in memory. Measured, this is one class with several faces: an ADDRESS held
+    ## while a word passes through (`marshalStackAggrArg`, `genAggrCopyStore`, the
+    ## aggregate tail loads), a spilled RESULT staged in one bridge while a spilled
+    ## operand is loaded into another (`emitBin2`, `emitMod2`), a `cmp` whose both
+    ## operands spilled (this ISA has no memory-operand compare), an `(at …)`
+    ## stride scratch live across the index it multiplies, and a demoted memory
+    ## base being reloaded. Every one of them is "no memory operand on this side
+    ## either", which is why x86-64 needs one bridge where the RISC targets need
+    ## two.
+  # There is deliberately NO member with ordinal 3. The only shape that ever held
+  # three was an aggregate copy between two COMPUTED ends — a destination address
+  # and a source address live together while a word passed between them — and
+  # `AggrEnd` removed it: `flatCopyToPtr2`'s source is a NAMED slot, addressed as
+  # `(mem name off)` with the offset folded into the slot's own frame displacement,
+  # which costs no register at all. Adding a `= 3` member back would raise
+  # `EmitterBridgeDemand` and make `checkMachine` demand a third bridge of every
+  # target again; that is the forcing function working, not an obstacle to route
+  # around.
+
+const EmitterBridgeDemand* = ord(high(BridgeDemand))
+  ## The largest number of reserved bridges any single emitter step holds at
+  ## once, and therefore the size a `bridgeRegs` reservation must have.
+  ##
+  ## TWO. It was three until `AggrEnd` tiering reached the RISC emitter: the only
+  ## step that ever held three was an aggregate copy between two COMPUTED ends, and
+  ## `flatCopyToPtr2`'s source is a NAMED slot, so addressing it as `(mem name off)`
+  ## costs no register — and one instruction fewer than the `lea` it replaced.
+  ##
+  ## What makes this a bound and not an average: a bridge is withheld from every
+  ## allocation pool, so bridge demand is a property of the SHAPE of one emitter
+  ## step, never of how much pressure the allocator is under. Starving the pools
+  ## changes how OFTEN a bridge is taken, not how many one step wants — measured,
+  ## the peak does not move between `ARKHAM_STRESS=1` and unstressed, nor between
+  ## aggregate nesting depth 1 and 16.
+  ##
+  ## A step's demand is only half of it, though: a step also inherits whatever an
+  ## ENCLOSING step still holds across the recursion that reached it.
+  ## `emit.bridgeScopePush` checks the sum rather than trusting it. The two Arm
+  ## targets reserve THREE while needing two — one register of slack, which is
+  ## what makes every step reachable with its full declaration free
+  ## (`tightCompositions == 0`); RV32 reserves exactly two and spent the third.
+  ## See design.md, "Making the reservation a bound instead of a measurement" and
+  ## "Spending the third bridge" for why the spend transfers to RV32 and not to
+  ## either Arm target.
+
+proc checkMachine*(md: MachineDesc) =
+  ## Consistency of a machine model against what the shared emitter assumes.
+  ## Cheap, once per target, and each arm is here because its absence cost real
+  ## debugging time — the reservation invariants were all STATED in the field
+  ## docs above and none of them was checked.
+  # The memcpy/memset scratch triple is read by the `risc/` lowering only, and a
+  # slot literal there is right by coincidence (design.md, "Fixed-register roles
+  # must be stated, not assumed"): all three or none, distinct, and each one an
+  # register the allocator hands out — anything else (`gp`/`tp` on RISC-V, rsp/rbp
+  # were x86-64 to read it) is a register the lowering has no right to.
+  if md.memIntrinScratch[0] != NoReg:
+    var mem: set[Reg] = {}
+    for r in md.memIntrinScratch:
+      doAssert r != NoReg,
+        "machine " & md.targetName & " reserves a PARTIAL memIntrinScratch triple"
+      doAssert r notin mem,
+        "machine " & md.targetName & " names the same register twice in `memIntrinScratch`"
+      mem.incl r
+      doAssert r in md.intArgRegs or r in md.intTempRegs or
+               r in md.intLocalTempRegs or r in md.intCalleeSaved,
+        "machine " & md.targetName & " names " & $r & " as memcpy scratch, which is " &
+        "not a register its allocator hands out"
+  if md.bridgeRegs.len == 0:
+    # x86-64 reserves a single `stagingBridgeReg` instead of a bridge list.
+    doAssert md.stagingBridgeReg != NoReg,
+      "machine " & md.targetName & " reserves no emitter scratch at all"
+    return
+  doAssert md.bridgeRegs.len >= EmitterBridgeDemand,
+    "machine " & md.targetName & " reserves " & $md.bridgeRegs.len &
+    " emitter bridges; the shared emitter holds up to " & $EmitterBridgeDemand
+  var seen: set[Reg] = {}
+  for r in md.bridgeRegs:
+    doAssert r != NoReg, "machine " & md.targetName & " has a NoReg bridge"
+    doAssert r notin seen,
+      "machine " & md.targetName & " lists the same register twice in " &
+      "`bridgeRegs`, so it has fewer bridges than it claims — this is how RV32 " &
+      "shipped `[R29, R30, R30]` and asserted on every two-ended aggregate copy"
+    seen.incl r
+  doAssert md.produceBridge == md.bridgeRegs[^1],
+    "machine " & md.targetName & "'s produce bridge is not the last `bridgeRegs` entry"
+  # A bridge the allocator can also hand out is not a reservation.
+  for pool in [md.intArgRegs, md.intTempRegs, md.intLocalTempRegs,
+               md.intCalleeSaved]:
+    for r in pool:
+      doAssert r notin seen,
+        "machine " & md.targetName & " allocates " & $r & ", which it also " &
+        "reserves as an emitter bridge"
+  # The atomic triple, if the target claims one, is subject to the same rule: an
+  # LL/SC loop holds all three across instructions no allocator knows about.
+  if md.atomicScratch[0] != NoReg:
+    var atom: set[Reg] = {}
+    for r in md.atomicScratch:
+      doAssert r != NoReg,
+        "machine " & md.targetName & " reserves a PARTIAL atomic scratch triple; " &
+        "an LL/SC loop needs old, new and status together, or none at all"
+      doAssert r notin atom,
+        "machine " & md.targetName & " names the same register twice in " &
+        "`atomicScratch`, so its `ldaxr`/`stlxr` loop would use one register for " &
+        "two of old/new/status"
+      atom.incl r
+    for pool in [md.intArgRegs, md.intTempRegs, md.intLocalTempRegs,
+                 md.intCalleeSaved]:
+      for r in pool:
+        doAssert r notin atom,
+          "machine " & md.targetName & " allocates " & $r & ", which its atomic " &
+          "sequences claim for the whole retry loop"

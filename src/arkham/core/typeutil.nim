@@ -19,7 +19,7 @@ import std / [assertions, strutils]
 
 import nifcore, nifcdecl
 import asmslots, machinedesc, planer, programs
-import "../arm/machine_m"
+import "../risc/machine_m"
 import asmbuf, typenav, context
 import diag
 

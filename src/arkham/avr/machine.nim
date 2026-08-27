@@ -164,6 +164,10 @@ const
     produceBridge: ProduceBridge,
     bridgeRegs: @BridgeRegs,
     floatBridgeReg: NoFReg,     # no FPU
+    atomicScratch: [NoReg, NoReg, NoReg],    # no LL/SC lowering; `checkMachine`
+                                # reads `R0` (the enum's zero) as a claim otherwise
+    memIntrinScratch: [NoReg, NoReg, NoReg], # the inline memcpy/memset lowering
+                                # is `risc/`-only
     caps: {TwoAddrForms, Freestanding, AllFlagBranches},
                                 # The ALU is destructive and two-operand, which
                                 # is what `TwoAddrForms` says and the whole

@@ -570,6 +570,7 @@ proc produceIntoMem2*(g: var CodeGen; c: Cursor; dst: Location) =
   ## free — then store it to the slot. No `locs` override: the fused
   ## `emitValue2` takes the destination as a parameter, so the recursion simply
   ## passes the bound staging register.
+  g.bridgeStep("a produce-into-memory", bdTwoInRegs)
   block:
     let ti = g.transparentCastInner(c, dst)
     if ti.hit:
@@ -646,6 +647,7 @@ proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## resolved location in `dest` for the consumer. An `Imm` / in-home leaf
   ## stays put (the consumer folds or reads it). Callers route float-typed
   ## values to `emitFValue2`.
+  g.bridgeStep("`emitValue2`")
   if dest.kind == NamedStack and dest.spillTemp:
     g.produceIntoMem2(c, dest)
     return
@@ -1442,6 +1444,7 @@ proc genAggrCopyStore*(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
   ## between two COMPUTED addresses costs three. Three-for-everything was self-inflicted —
   ## the price of "reduce both sides to an address" — and it is what ran the staging pool
   ## dry once `-d:danger` filled every volatile with a call-free local.
+  g.bridgeStep("a whole-aggregate copy", bdTwoInRegs)
   if dst.kind == InRegPair:
     var tn = NoTypeSym
     if not cursorIsNil(dst.typ.typ) and dst.typ.typ.kind == Symbol:
@@ -1517,6 +1520,7 @@ proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location) =
   ## lvalue source) goes through the ONE `genAggrCopyStore` regardless of destination form;
   ## constructors/calls/baseobj PRODUCE into the destination per-form; a scalar/float
   ## destination goes through `storeScalar2`.
+  g.bridgeStep("`genStore2`")
   let (dstAggr, aggrSize) = g.dstAggrInfo(dst)
   if dstAggr and isAggrCopySrc(rhs):                     # the ONE whole-aggregate copy path
     g.genAggrCopyStore(rhs, dst, aggrSize)
@@ -2995,6 +2999,7 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
   ## own frame yet: `usedCallee`/`hasStackVars` are final only after the whole body
   ## is emitted. nifasm has assembled the prologue by the time it reaches the
   ## marker and can simply reverse it.
+  g.bridgeStep("a call", bdTwoInRegs)
   discard hiddenPtr
   var argCurs: seq[Cursor] = @[]
   var fsym = ""

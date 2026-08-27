@@ -1,0 +1,40 @@
+(.nif27)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (gvar :flag.0 .
+  (i 32).)
+ (proc :onSoft.0
+  (params).
+  (pragmas
+   (interrupt "MachineSoftware"))
+  (stmts
+   (asgn flag.0 42)
+   (var :clint.0 .
+    (ptr
+     (i 32))
+    (cast
+     (ptr
+      (i 32))33554432))
+   (asgn
+    (deref clint.0)0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :msip.0 .
+    (ptr
+     (i 32))
+    (cast
+     (ptr
+      (i 32))33554432))
+   (asgn
+    (deref msip.0)1)
+   (call exit.0 flag.0))))

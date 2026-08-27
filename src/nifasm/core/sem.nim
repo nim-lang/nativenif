@@ -93,10 +93,12 @@ type
         ## are spelled the same on both machines; and unlike either, a `(clobber
         ## (rpN))` names a PAIR, which is recorded as both of its halves — the
         ## unit a clobber check asks about is the register a value's half sits in.
-      clobbersRv32*: set[rv32.Register]
-        ## The RV32 half. Overlaps `clobbersA64` for the reason `clobbersM`
-        ## overlaps `clobbers`: `(x0)`..`(x30)` are AArch64 spellings this target
-        ## reuses, so a tag can be valid in both and `(arch …)` decides.
+      clobbersRv*: set[rv32.Register]
+        ## The RV32 half. Overlaps `clobbersA64` for the same reason `clobbersM`
+        ## overlaps `clobbers`: `(x0)` is a valid spelling on AArch64 and on RV32
+        ## both, so the parser records such a tag in BOTH sets and each arch reads
+        ## its own. A declaration only ever targets one arch, so the extra
+        ## membership is never consulted.
       hasClobberDecl*: bool
         ## Whether a `(clobber …)` was present at all. An EMPTY declared list is
         ## meaningful — arkham emits it for a `(attr "noreturn")` callee, whose

@@ -5,107 +5,90 @@
 #    See the file "license.txt", included in this distribution.
 #
 
-## asm-NIF register tags -> RV32 registers.
+## asm-NIF register tags -> RV32 registers, integer and floating-point.
 ##
-## RV32 mints NO register spelling of its own. `(x0)`..`(x30)` and `(sp)` already
-## exist as AArch64's, and `(arch …)` is what decides which machine they name —
-## the same arrangement Cortex-M has with `(r0)`..`(r12)`. That is worth more
-## than it looks: AVR had to mint 48 tags, which pushed them past the 511 that
-## fit NIF's tag field and forced escape handling at every operand site. This
-## target pays none of that, and the only cost is that `x31` stays unmapped.
+## RV32 mints no register spellings: it reuses AArch64's whole file, so every tag
+## here is also a valid `A64Reg` and which machine it names is decided by
+## `(arch …)`. The same arrangement `(r0)` already has between Cortex-M and
+## x86-64, and for the same reason — see `tagToRvReg`.
 ##
-## `x0` is not a register the allocator can use and never appears as a
-## destination the emitter chose: it reads as zero and discards writes. It IS
-## named constantly, though — as the source of a `mv`, the operand of a `neg`, or
-## the second operand of a branch against zero — so it is spellable rather than
-## reserved out of the vocabulary.
+## The mapping is the identity on the integer side (`(x0)`..`(x30)` are RISC-V's
+## `x0`..`x30`) with `(sp)` as a second spelling of `x2`, which RISC-V's ABI
+## names `sp`. `x31` is deliberately unreachable: no tag names it, so it is the
+## one register the SELECTOR can always take as a transient — the RV32 answer to
+## Thumb's `IP` and AArch64's `x16`, but stronger, because it is not merely
+## reserved by convention. Nothing in asm-NIF can even spell it.
+##
+## The float side is where the two ISAs genuinely differ in shape. AArch64's
+## `(d3)` and `(s3)` are two VIEWS of one 128-bit vector register; RISC-V's `f3`
+## is one register whose precision is chosen by the instruction's `fmt` field.
+## Both spellings therefore map to the same `FloatRegister` and differ only in
+## the width they carry, which is exactly what `fmt` wants — so the asm-NIF that
+## AArch64 already emits needs no translation at all.
 
 import nifcore
 import "../core" / [tags, model, tagconv, decls, diagnostics]
 import encoder as rv
 
-proc rawTagIsRv32Gpr*(t: TagEnum): bool {.inline.} =
-  rawTagIsRv32Reg(t)
+const RvScratch* = rv.X31
+  ## `t6`, the register no asm-NIF tag can name (see the module header). The
+  ## selector materializes an out-of-range displacement, a compare's immediate
+  ## operand and a folded index through it. Because arkham cannot spell it, no
+  ## value ever lives here and nothing has to prove that.
 
-proc tagToRegisterRv32*(t: TagEnum; n: Cursor): rv.Register =
-  let regTag = tagToRv32Reg(t)
-  result =
-    case regTag
-    of X0RvR: rv.X0
-    of X1RvR: rv.X1
-    of X2RvR, SpRvR: rv.X2
-    of X3RvR: rv.X3
-    of X4RvR: rv.X4
-    of X5RvR: rv.X5
-    of X6RvR: rv.X6
-    of X7RvR: rv.X7
-    of X8RvR: rv.X8
-    of X9RvR: rv.X9
-    of X10RvR: rv.X10
-    of X11RvR: rv.X11
-    of X12RvR: rv.X12
-    of X13RvR: rv.X13
-    of X14RvR: rv.X14
-    of X15RvR: rv.X15
-    of X16RvR: rv.X16
-    of X17RvR: rv.X17
-    of X18RvR: rv.X18
-    of X19RvR: rv.X19
-    of X20RvR: rv.X20
-    of X21RvR: rv.X21
-    of X22RvR: rv.X22
-    of X23RvR: rv.X23
-    of X24RvR: rv.X24
-    of X25RvR: rv.X25
-    of X26RvR: rv.X26
-    of X27RvR: rv.X27
-    of X28RvR: rv.X28
-    of X29RvR: rv.X29
-    of X30RvR: rv.X30
-    else:
-      error("Expected an RV32 register `(x0)`..`(x30)` or `(sp)`", n)
-      rv.X0
+proc rawTagIsRvFloatReg*(t: TagEnum): bool {.inline.} =
+  ## `(d0)`..`(d31)` and `(s0)`..`(s31)`. Both name the FP file; the tag says
+  ## which PRECISION, not which register bank.
+  (t >= D0TagId and t <= D31TagId) or (t >= S0TagId and t <= S31TagId)
 
-proc parseRegisterRv32*(n: var Cursor): rv.Register =
-  if n.kind != TagLit or not rawTagIsRv32Gpr(n.tag):
-    error("Expected an RV32 register `(x0)`..`(x30)` or `(sp)`", n)
-  result = tagToRegisterRv32(n.tag, n)
-  skip n
+proc rawTagIsRvGpr*(t: TagEnum): bool {.inline.} =
+  ## An INTEGER register. `rawTagIsRvReg` covers the float file too, so every site
+  ## that means "a general-purpose register" has to say so — otherwise `(s3)`
+  ## binds a variable to `x3`, which is `gp`.
+  rawTagIsRvReg(t) and not rawTagIsRvFloatReg(t)
 
-proc regName*(r: rv.Register): string =
-  ## The ABI name where there is one, because that is what a diagnostic should
-  ## say: `a0` and `x10` are the same register and only one of them tells the
-  ## reader what it is for.
-  case r
-  of rv.X0: "zero"
-  of rv.X1: "ra"
-  of rv.X2: "sp"
-  of rv.X3: "gp"
-  of rv.X4: "tp"
-  of rv.X5: "t0"
-  of rv.X6: "t1"
-  of rv.X7: "t2"
-  of rv.X8: "s0"
-  of rv.X9: "s1"
-  of rv.X10: "a0"
-  of rv.X11: "a1"
-  of rv.X12: "a2"
-  of rv.X13: "a3"
-  of rv.X14: "a4"
-  of rv.X15: "a5"
-  of rv.X16: "a6"
-  of rv.X17: "a7"
-  of rv.X18: "s2"
-  of rv.X19: "s3"
-  of rv.X20: "s4"
-  of rv.X21: "s5"
-  of rv.X22: "s6"
-  of rv.X23: "s7"
-  of rv.X24: "s8"
-  of rv.X25: "s9"
-  of rv.X26: "s10"
-  of rv.X27: "s11"
-  of rv.X28: "t3"
-  of rv.X29: "t4"
-  of rv.X30: "t5"
-  of rv.X31: "t6"
+proc rvFloatWidth*(t: TagEnum): rv.FpWidth {.inline.} =
+  ## Which precision the spelling names: `(dN)` double, `(sN)` single. This is the
+  ## `fmt` field of every FP instruction the operand ends up in.
+  if t >= D0TagId and t <= D31TagId: rv.FpD else: rv.FpS
+
+proc tagToFloatRegisterRv*(t: TagEnum; n: Cursor): rv.FloatRegister =
+  if t >= D0TagId and t <= D31TagId:
+    rv.FloatRegister(int(t) - int(D0TagId))
+  elif t >= S0TagId and t <= S31TagId:
+    rv.FloatRegister(int(t) - int(S0TagId))
+  else:
+    error("Expected an RV32 floating-point register", n)
+    rv.F0
+
+proc parseFloatRegisterRv*(n: var Cursor): tuple[reg: rv.FloatRegister; w: rv.FpWidth] =
+  if n.kind != TagLit or not rawTagIsRvFloatReg(n.tag):
+    error("Expected an RV32 floating-point register", n)
+    return (rv.F0, rv.FpD)
+  result = (tagToFloatRegisterRv(n.tag, n), rvFloatWidth(n.tag))
+  inc n
+
+proc tagToRegisterRv*(t: TagEnum; n: Cursor): rv.Register =
+  if rawTagIsRvFloatReg(t):
+    error("Expected an integer register, got a floating-point one", n)
+    return rv.X0
+  let regTag = tagToRvReg(t)
+  if regTag == SpRV: return rv.Sp        # `(sp)`: RISC-V's `x2`, spelled twice
+  if regTag == NoRvReg:
+    error("Expected an RV32 register", n)
+    return rv.X0
+  # `(x0)`..`(x30)` are consecutive tags AND consecutive registers, so the map is
+  # arithmetic rather than a 31-arm case. `x31` is absent on purpose: it is the
+  # selector's scratch and no tag names it.
+  let t2 = TagEnum(ord(regTag))
+  if t2 >= X0TagId and t2 <= X30TagId:
+    rv.Register(int(t2) - int(X0TagId))
+  else:
+    error("Expected an RV32 register", n)
+    rv.X0
+
+proc parseRegisterRv*(n: var Cursor): rv.Register =
+  if n.kind != TagLit or not rawTagIsRvGpr(n.tag):
+    error("Expected an RV32 register", n)
+  result = tagToRegisterRv(n.tag, n)
+  inc n

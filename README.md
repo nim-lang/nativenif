@@ -52,4 +52,4 @@ nim r tests/tester.nim           # builds both and runs the whole corpus
 | [src/arkham/design.md](src/arkham/design.md) | arkham's register strategy |
 | [doc/internals/terms.md](doc/internals/terms.md) | glossary: `bridge`, `home`, `volatile`, `eightbyte`, … |
 | [doc/internals/avr.md](doc/internals/avr.md) | the AVR target: register pairs, ABI, milestones |
-| [doc/internals/rv32.md](doc/internals/rv32.md) | the RISC-V 32 target: no flags, hosted under qemu-riscv32 |
+| [tests/arkham_rv32/README.md](tests/arkham_rv32/README.md) | the RISC-V 32 target: bare-metal RV32IMAFD under qemu-system-riscv32, and what its corpus shares with Cortex-M |

@@ -119,8 +119,9 @@ proc handleInterrupts*(n: var Cursor; ctx: var GenContext) =
   ## reached only through this table — so without that it is dropped by the same
   ## reachability walk that drops any unreferenced proc, and the image gets a
   ## table word pointing at a proc that was never emitted.
-  if ctx.arch != Arch.CortexM:
-    error("(interrupts …) is a Cortex-M declaration", n)
+  if ctx.arch notin {Arch.CortexM, Arch.Rv32}:
+    error("(interrupts …) is a bare-metal declaration; this target has an OS to " &
+          "route traps for it", n)
   # `into`, not a bare `inc`: `hasMore` on an unbounded cursor keeps reading into
   # the declaration's SIBLINGS, so the loop below ran on into the next `(proc …)`.
   n.into:
@@ -134,10 +135,15 @@ proc handleInterrupts*(n: var Cursor; ctx: var GenContext) =
       let slot = int(getInt(e))
       inc e
       if e.kind != Symbol: error("Expected a handler symbol in (irq …)", e)
-      # Slots 0 and 1 are the image writer's: word 0 is the initial MSP, a value
-      # and not a handler, and word 1 is reset, which IS the entry proc. A second
-      # claim on either would be silently overwritten by the writer.
-      if slot < 2:
+      # Slots 0 and 1 are the Cortex-M image writer's: word 0 is the initial MSP,
+      # a value and not a handler, and word 1 is reset, which IS the entry proc. A
+      # second claim on either would be silently overwritten by the writer.
+      #
+      # RV32 has no such reservation, because its table is not read for the reset
+      # vector at all: a RISC-V core resets to a fixed PC and `mtvec` is written
+      # by the code that runs there. The number is a trap CAUSE, and cause 0 is a
+      # real one (a machine software interrupt is 3, but nothing makes 0 special).
+      if ctx.arch == Arch.CortexM and slot < 2:
         error("interrupt slot " & $slot & " is the image writer's (initial MSP, reset)", e)
       let name = getSym(e)
       let sym = lookupWithAutoImport(ctx, ctx.scope, name, e)

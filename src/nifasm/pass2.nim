@@ -37,6 +37,7 @@ import avr/regs as avrregs
 import rv32/instr
 import rv32/regs as rvregs
 import thumb/board
+import rv32/instr
 import pass1                          # `handleArch`: `(arch …)` also appears in pass 2
 
 proc genInst(n: var Cursor; ctx: var GenContext)
@@ -105,14 +106,11 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     # length, e.g. a 2-byte string constant) may immediately precede this proc in
     # the text stream, and AArch64 instructions are fixed 4-byte words — a
     # misaligned body desynchronizes the whole following instruction stream.
-    if ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64, Arch.CortexM}:
+    if ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64, Arch.CortexM, Arch.Rv32}:
       # Cortex-M needs only halfword alignment, but a 32-bit Thumb encoding
       # straddling a word boundary costs a cycle on some cores and nothing here
-      # benefits from the two saved bytes, so it aligns like the others.
-      while (ctx.buf.data.len and 3) != 0: ctx.buf.data.add 0'u8
-    elif ctx.arch == Arch.Rv32:
-      # Every RV32 instruction is a 4-byte word and the PC must stay aligned to
-      # one; a misaligned fetch is an architectural exception, not a slow path.
+      # benefits from the two saved bytes, so it aligns like the others. RV32
+      # without the C extension is fixed 4-byte words, so it needs this outright.
       while (ctx.buf.data.len and 3) != 0: ctx.buf.data.add 0'u8
     elif ctx.arch == Arch.Avr:
       # Two, not four: an AVR instruction IS a 16-bit word and the PC counts
@@ -135,10 +133,11 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
                               start: ctx.buf.data.len, stop: -1)
     ctx.inPrologue = true
     # CFA at entry: on x86-64 the `call` pushed the return address (SP+8); on
-    # AArch64 and Cortex-M it is still in the link register, so the CFA is SP.
-    ctx.cfaOff = if ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64, Arch.CortexM}: 0'i32
+    # AArch64, Cortex-M and RV32 it is still in the link register (`lr`, `ra`),
+    # so the CFA is SP.
+    ctx.cfaOff = if ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64, Arch.CortexM,
+                                 Arch.Rv32}: 0'i32
                  elif ctx.arch == Arch.Avr: 2'i32   # `call` pushed a 2-byte return address
-                 elif ctx.arch == Arch.Rv32: 0'i32  # `jal` leaves it in `ra`, as on AArch64
                  else: 8'i32
 
     # Initialize stack context
@@ -149,7 +148,6 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     ctx.a64RegBindings = initTable[arm64.Register, string]()
     ctx.mRegBindings = initTable[thumb2.Register, string]()
     ctx.avrRegBindings = initTable[avr.Register, string]()
-    ctx.rv32RegBindings = initTable[rv32.Register, string]()
     ctx.xmmBindings = initTable[x86.XmmRegister, string]()
     ctx.a64FRegBindings = initTable[arm64.FloatRegister, string]()
     # Each proc is a fresh control flow: no registers are clobbered on entry.
@@ -158,7 +156,7 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     ctx.clobberedA64 = {}
     ctx.clobberedM = {}
     ctx.clobberedAvr = {}
-    ctx.clobberedRv32 = {}
+    ctx.clobberedRv = {}
     setLenient false
 
     # Add params to scope.
@@ -168,14 +166,15 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     # address is in LR (not on the stack) and the caller leaves SP pointing right
     # at the first stack arg, so incoming stack params are addressed SP-relative
     # from offset 0 (valid before the callee shifts SP).
-    # Cortex-M shares AArch64's frame shape here: the return address is in LR
-    # rather than on the stack, and the caller leaves SP pointing at the first
-    # stack argument, so incoming stack params are SP-relative from offset 0.
-    let isA64Proc = ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64, Arch.CortexM}
+    # Cortex-M and RV32 share AArch64's frame shape here: the return address is
+    # in the link register rather than on the stack, and the caller leaves SP
+    # pointing at the first stack argument, so incoming stack params are
+    # SP-relative from offset 0.
+    let isA64Proc = ctx.arch in {Arch.A64, Arch.WinA64, Arch.LinuxA64, Arch.CortexM,
+                                 Arch.Rv32}
     # …and on Win64 the caller's stack arguments start above the shadow space it also
     # reserved, so the callee's view of them shifts by the same amount.
-    var paramOffset = if ctx.arch in {Arch.Avr, Arch.Rv32}: 0
-                                                  # stack params refused by name on both
+    var paramOffset = if ctx.arch == Arch.Avr: 0  # stack params refused by name
                       elif isA64Proc: 0
                       elif ctx.arch == Arch.WinX64: 16 + WinShadowSpace
                       else: 16
@@ -192,14 +191,7 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
         # (a leaf param stays unnamed in its incoming arg register), so params are NOT
         # tracked there — only A64 register *locals* and `rebind`-bound scratch enter
         # `a64RegBindings`.
-        if ctx.arch == Arch.Rv32:
-          # Like x86-64 and AVR, RV32 spells a register parameter by its NAME in
-          # the body, so a raw `(aN)` use of the register it arrived in is a
-          # code-generator bug and gets tracked.
-          if param.reg != InvalidTagId and not param.viaRegs:
-            ctx.rv32RegBindings[tagToRegisterRv32(param.reg, n)] =
-              ctx.nameOf(param.name)
-        elif ctx.arch == Arch.Avr:
+        if ctx.arch == Arch.Avr:
           # AVR spells a register param by its NAME in the body, like x86-64 and
           # unlike the Arm targets — so a raw use of the register it arrived in
           # is a code-generator bug and gets tracked. Both halves when it is a
@@ -283,24 +275,17 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     let v = uint32(alignedStackSize + pad)
     if pos + 4 > ctx.buf.data.len: continue
     if ctx.arch == Arch.Rv32:
-      # The 12-bit immediate of the `addi` that moves SP, at bits 31:20. The
-      # placeholder's own immediate carries the SIGN — `-1` for a `(sub …)`, 0
-      # for an `(add …)` — because the two are the same instruction here and the
-      # patcher has no other way to tell which one it is looking at.
-      if pos + 4 > ctx.buf.data.len: continue
-      var w = uint32(ctx.buf.data[pos]) or (uint32(ctx.buf.data[pos+1]) shl 8) or
-              (uint32(ctx.buf.data[pos+2]) shl 16) or (uint32(ctx.buf.data[pos+3]) shl 24)
-      let negate = ((w shr 20) and 0xFFF) == 0xFFF
-      let signed = (if negate: -int32(v) else: int32(v))
-      if signed < -2048 or signed > 2047:
-        quit "nifasm: this proc's frame is " & $alignedStackSize &
-             " bytes, past the 12-bit immediate an `addi` carries — a larger " &
-             "frame needs `lui`+`add` (see R5 in doc/internals/rv32.md)"
-      w = (w and 0x000FFFFF'u32) or ((cast[uint32](signed) and 0xFFF) shl 20)
-      ctx.buf.data[pos]   = byte(w and 0xFF)
-      ctx.buf.data[pos+1] = byte((w shr 8) and 0xFF)
-      ctx.buf.data[pos+2] = byte((w shr 16) and 0xFF)
-      ctx.buf.data[pos+3] = byte((w shr 24) and 0xFF)
+      # A `lui`+`addi` pair, always 8 bytes, so no instruction changes length and
+      # no position downstream moves — the same property that lets the Cortex-M
+      # arm below patch in place, and for the same reason it was chosen over a
+      # bare `addi`: `addi` reaches only ±2048, so picking between the forms would
+      # make the instruction's WIDTH depend on a number that is not known until
+      # here. See `operands.emitSsizeRv`.
+      #
+      # Any frame size fits, unlike the 12- or 16-bit immediates the Arm targets
+      # are limited to.
+      if pos + 8 > ctx.buf.data.len: continue
+      ctx.buf.data.patchRvLuiAddiPair(pos, v)
       continue
     if ctx.arch == Arch.Avr:
       # The 6-bit immediate of the `adiw`/`sbiw` at this position: `1001 011x

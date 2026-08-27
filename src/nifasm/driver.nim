@@ -425,6 +425,26 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
       writeMachO(ctx, outfile)
     of Arch.WinX64, Arch.WinA64:
       writeExe(ctx, outfile.changeFileExt("exe"))
+    of Arch.Rv32:
+      # A firmware image, not a hosted executable — but unlike Cortex-M there is
+      # no vector table at its head, so the code starts at the load address and
+      # `absBase` is that address exactly. See `writerv32.nim`.
+      ctx.buf.absBase = Rv32LoadAddr
+      finalize(ctx.buf)
+      var code: seq[byte] = newSeq[byte](ctx.buf.data.len)
+      for i in 0 ..< ctx.buf.data.len: code[i] = ctx.buf.data[i]
+      # The entry is the ENTRY PROC, not the first byte emitted. Those coincide
+      # today only because `pass2` generates `_start`/`main.0` eagerly the moment
+      # it sees one; nothing guarantees it, and a wrong entry starts executing
+      # some other proc's prologue with no diagnostic.
+      var entryOff = 0
+      if ctx.entrySym != nil:
+        let pos = ctx.buf.getLabelPosition(LabelId(ctx.entrySym.offset))
+        if pos < 0:
+          quit "nifasm: entry point '" & ctx.nameOf(ctx.entrySym.name) &
+               "' has no address"
+        entryOff = pos
+      writeFile(outfile, writeRv32Image(ctx, code, entryOff))
     of Arch.CortexM:
       # A firmware image, not a hosted executable: vector table, then code.
       #
@@ -477,33 +497,6 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
                "' has no address"
         entryOff = pos
       writeFile(outfile, writeAvrImage(ctx, code, entryOff))
-    of Arch.Rv32:
-      # A static Linux ELF32. `absBase` is where the CODE lands, because that is
-      # what an `(adr …)` — a `lui`+`addi` pair carrying an absolute address —
-      # resolves against; without it every such pair names a buffer position and
-      # the `jalr` through one jumps into nothing.
-      # The segment count decides the header's size and therefore where the code
-      # lands, so it is settled here — before `finalize` resolves any `(adr …)`
-      # against it — and the writer is handed the same answer.
-      ctx.buf.absBase = rv32CodeVa(if ctx.bssOffset > 0: 2 else: 1)
-      finalize(ctx.buf)
-      var code: seq[byte] = newSeq[byte](ctx.buf.data.len)
-      for i in 0 ..< ctx.buf.data.len: code[i] = ctx.buf.data[i]
-      var entryOff = 0
-      if ctx.entrySym != nil:
-        let pos = ctx.buf.getLabelPosition(LabelId(ctx.entrySym.offset))
-        if pos < 0:
-          quit "nifasm: entry point '" & ctx.nameOf(ctx.entrySym.name) &
-               "' has no address"
-        entryOff = pos
-      writeFile(outfile, writeRv32Image(ctx, code, entryOff))
-      when defined(posix):
-        # A hosted image is EXECUTED rather than loaded by a simulator, so it has
-        # to be marked executable — the bare-metal targets never needed this.
-        setFilePermissions(outfile, {fpUserRead, fpUserWrite, fpUserExec,
-                                     fpGroupRead, fpGroupExec,
-                                     fpOthersRead, fpOthersExec})
-
   # Close all foreign-module readers (the main module has no reader).
   for modname, module in ctx.modules.mpairs:
     if modname != MainModuleName and module.foreign != nil:

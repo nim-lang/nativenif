@@ -451,6 +451,7 @@ proc flatCopyToPtr(g: var CodeGen; srcVar: string; sizeBytes: int; dstPtr, tmp: 
 
 proc copyNestedAggrTemp*(g: var CodeGen; tmpName: string; sizeBytes: int; dstPtr: Reg) =
   ## Copy a `buildNestedAggrTemp` temp into the sub-aggregate at `[dstPtr]`.
+  g.bridgeStep("a nested-aggregate temp copy", bdTwoInRegs)
   let scratch = g.pickStagingSealed("a nested-aggregate-field copy word", AddrSlot)
   g.flatCopyToPtr(tmpName, sizeBytes, dstPtr, scratch)
   g.giveBack scratch

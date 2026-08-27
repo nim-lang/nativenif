@@ -49,6 +49,14 @@ const
     ## `e_flags` naming the avr5 instruction set. `avr-objdump` reads it to pick
     ## a disassembly table, so a wrong value produces plausible-looking nonsense
     ## rather than an error.
+  EF_RISCV_RVC* = 0x0001.Elf32_Word
+    ## the image contains compressed (C-extension) instructions. Not set: the
+    ## baseline here is fixed 32-bit encodings.
+  EF_RISCV_FLOAT_ABI_DOUBLE* = 0x0004.Elf32_Word
+    ## ilp32d — FP arguments and returns travel in `f` registers at double
+    ## precision. The `e_flags` field is where a linker checks that two objects
+    ## agree about that, and disagreeing about it is not a diagnosable mismatch at
+    ## any later point: the caller writes `fa0` and the callee reads `a0`.
 
   Elf32EhdrSize* = 52
   Elf32PhdrSize* = 32

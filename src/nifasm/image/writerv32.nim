@@ -5,103 +5,201 @@
 #    See the file "license.txt", included in this distribution.
 #
 
-## The RV32 image: a static Linux ELF32 for `EM_RISCV`.
+## The bare-metal RV32 firmware image.
 ##
-## This is the only NEW target in the tree that is hosted rather than bare metal,
-## and it shows here as an absence — no vector table, no board file, no
-## initializer image to copy, no startup code. The kernel maps the segments and
-## jumps to `e_entry`; `.bss` is zeroed for us because a segment whose `p_memsz`
-## exceeds its `p_filesz` is zero-filled by definition.
+## A SIBLING of `writecortexm.nim` rather than a flag on it, because the two
+## targets disagree about the one thing that module is organised around. An
+## M-profile core resets by READING a vector table — word 0 the initial MSP, word
+## 1 the reset address — and every offset in the Cortex-M writer is measured from
+## that table. A RISC-V core resets to a fixed PC, establishes no stack pointer of
+## its own, and reaches its handlers through the `mtvec` CSR, which in vectored
+## mode holds JUMP INSTRUCTIONS rather than addresses. There is no table at the
+## load address to measure anything from.
 ##
-## **The two PT_LOADs must not share a page**, and that is the one thing this
-## file exists to get right. Every header field can be correct — the
-## `p_offset ≡ p_vaddr (mod p_align)` congruence included — and the program still
-## dies at its first instruction, because two segments landing in one page have
-## that page's permissions decided by whichever is mapped last. An R+X segment
-## sharing a page with an RW one silently stops being executable, and the symptom
-## is a SIGSEGV at the entry point with nothing in the image wrong.
+## What this writes today is the MINIMUM that makes a computed answer observable:
+## one PT_LOAD segment holding the code, a second declaring the SRAM the globals
+## occupy, and the absolute `lui`+`addi` pairs patched to point into it. Still
+## outstanding, and what makes this "minimal" rather than "done": the
+## `(layout …)` board description — regions come from constants here.
+##
+## The `mtvec` trampoline table is NOT this writer's: arkham builds it in code
+## (`risc/driver.rv32InterruptTable`), so the `(interrupts …)` declaration that
+## `thumb/board` accepts for RV32 only keeps the handlers reachable — nothing
+## here reads `ctx.interrupts`, unlike `writecortexm`.
 
-import std / [strutils]
+import std / [tables]
 
-import "../core" / [context, relocs, buffers]
+import "../core" / [context, sem, relocs, buffers]
 import elf32
 
 const
-  LoadBase* = 0x10000'u32
-    ## Where a static ELF32 conventionally lands. Below the first page, which is
-    ## kept unmapped so a null dereference faults.
-  PageSize = 0x1000
+  Rv32LoadAddr* = 0x8000_0000'u32
+    ## Where QEMU's `virt` board has RAM, and therefore where a `-kernel` image is
+    ## loaded and entered. Not a "flash" address: `virt` has no separate code
+    ## region, which is exactly why the layout file (P3) has to supply both
+    ## regions rather than this constant guessing them.
+  Rv32SramAddr* = 0x8010_0000'u32
+    ## 1 MiB above the image, for the globals. Deliberately a DIFFERENT region
+    ## from the code even though the board makes them the same memory: keeping
+    ## them apart is what will keep the `.data` copy loop honest when it lands,
+    ## the same argument `writeCortexMImage` makes for its file-less SRAM segment.
+  Rv32SramSize* = 0x0010_0000'u32
 
-proc writeRv32Image*(a: var GenContext; code: seq[byte]; entryOff: int): seq[byte] =
+proc writeRv32Image*(a: var GenContext; code: seq[byte];
+                     entryOff: int): seq[byte] =
+  ## The finished firmware: the code at the load address, plus a segment
+  ## declaring the SRAM region the globals occupy at run time.
+  ##
+  ## The SRAM segment carries NO file bytes — `p_filesz` is 0 and only `p_memsz`
+  ## is declared. On a real chip RAM holds nothing at reset and there is no loader
+  ## to ask, so its contents must be established by the image itself. Declaring it
+  ## file-backed would let QEMU place initialized globals for us and a broken
+  ## startup path would then pass every fixture.
   finalize(a.bssBuf)
 
-  var dataImage: seq[byte] = @[]
+  if a.bssOffset.uint32 > Rv32SramSize:
+    quit "nifasm: " & $a.bssOffset & " bytes of globals do not fit the " &
+         $Rv32SramSize & "-byte SRAM region"
+
+  # ── the initializer image ─────────────────────────────────────────────────
+  # A chip's RAM holds nothing at reset and there is no loader to ask, so a
+  # global that starts at 7 has to become a 7 in RAM by some instruction that
+  # actually runs. The bytes travel in the image and the startup code copies
+  # them; this builds the bytes.
+  var bssImage: seq[byte] = @[]
   if a.bssOffset > 0:
-    dataImage = newSeq[byte](a.bssOffset)
+    bssImage = newSeq[byte](a.bssOffset)
     for it in a.bssInits:
       for i in 0 ..< it.size:
-        if it.off.int + i < dataImage.len:
-          dataImage[it.off.int + i] = byte((it.val shr (8 * i)) and 0xFF)
+        if it.off.int + i < bssImage.len:
+          bssImage[it.off.int + i] = byte((it.val shr (8 * i)) and 0xFF)
 
-  if a.bssSymInits.len > 0:
-    quit "nifasm: RV32 globals initialized with another symbol's address are " &
-         "not implemented yet (see R5b in doc/internals/rv32.md)"
-
-  # The header's size depends on how many segments there are, and every address
-  # below is measured from it — so the count has to be settled first. Getting
-  # this backwards breaks the `p_offset ≡ p_vaddr (mod p_align)` congruence by
-  # exactly one program header, and the loader refuses the file outright.
-  let segCount = if dataImage.len > 0: 2 else: 1
-  let off0 = Elf32EhdrSize + Elf32PhdrSize * segCount
-  let codeVa = LoadBase + uint32(off0)
-  let dataOff = (off0 + code.len + 3) and not 3
-  # A whole page above the code, not merely past it — see the module header.
-  let dataVa = LoadBase + uint32(PageSize) + uint32(dataOff)
-
-  # Every `(adr … <gvar>)` is a `lui`+`addi` pair whose value is the global's
-  # address, and that address is only known now: `sym.size` is the global's byte
-  # offset within the data image — the same field the ELF64 and Mach-O writers
-  # read — and `dataVa` is where that image lands.
-  #
-  # The `+0x800` is `addi`'s SIGNED immediate again: a low half above 0x7FF is a
-  # negative addend, so the upper half has to be one higher. Omitting it puts
-  # every second global 0x1000 away from itself.
   var patched = code
+
+  # Bake the address fields of a `const` blob that holds another symbol's address
+  # — a vtable, an RTTI record, a `const` holding `addr other` — now that every
+  # label has a position. The blob lives in the code segment at its own label and
+  # each recorded field is a 4-byte ABSOLUTE address.
+  #
+  # No state bit is OR-ed into a proc's: that is Arm's Thumb marker, and a
+  # function pointer read out of a table here is called through an ordinary
+  # `jalr`, which wants the real (even) address.
+  #
+  # Without this the field stays whatever placeholder arkham reserved — zero —
+  # and dereferencing it reads address 0. On Cortex-M that is the vector table
+  # and the program merely computes nonsense; on a RISC-V `virt` board nothing is
+  # mapped there at all, so it TRAPS into an unset `mtvec` and the image hangs.
+  if a.rodataSymInits.len > 0:
+    var labelPos = initTable[int, int]()
+    for ld in a.buf.labels: labelPos[int(ld.id)] = ld.position
+    for it in a.rodataSymInits:
+      if not labelPos.hasKey(it.labelId): continue
+      let sitePos = labelPos[it.labelId] + it.blobOff
+      var targetVaddr = 0'u32
+      case it.sym.kind
+      of skProc, skRodata:
+        if labelPos.hasKey(it.sym.offset):
+          targetVaddr = Rv32LoadAddr + uint32(labelPos[it.sym.offset])
+      of skGvar:
+        targetVaddr = Rv32SramAddr + uint32(it.sym.size)
+      else: discard
+      for i in 0 ..< it.size:
+        if sitePos + i < patched.len:
+          patched[sitePos + i] = byte((targetVaddr shr (8 * i)) and 0xFF)
+
+  # Every `(adr <global>)` and every global-address operand emitted a `lui`+`addi`
+  # pair with zero immediates and recorded its position. Only now is there an
+  # address to put in them: `sym.size` is the byte offset within .bss, assigned
+  # as the gvar declarations were scanned.
   for (pos, sym) in a.gvarSites:
     if pos + 8 > patched.len: continue
-    let v = dataVa + uint32(sym.size)
-    let hi = (v + 0x800) shr 12
-    let lo = v - (hi shl 12)
-    var w0 = uint32(patched[pos]) or (uint32(patched[pos+1]) shl 8) or
-             (uint32(patched[pos+2]) shl 16) or (uint32(patched[pos+3]) shl 24)
-    w0 = (w0 and 0x00000FFF'u32) or ((hi and 0xFFFFF) shl 12)
-    var w1 = uint32(patched[pos+4]) or (uint32(patched[pos+5]) shl 8) or
-             (uint32(patched[pos+6]) shl 16) or (uint32(patched[pos+7]) shl 24)
-    w1 = (w1 and 0x000FFFFF'u32) or ((lo and 0xFFF) shl 20)
-    for i in 0 ..< 4:
-      patched[pos + i] = byte((w0 shr (8 * i)) and 0xFF)
-      patched[pos + 4 + i] = byte((w1 shr (8 * i)) and 0xFF)
+    var bytes = initBytes()
+    for i in 0 ..< 8: bytes.add patched[pos + i]
+    bytes.patchRvLuiAddiPair(0, Rv32SramAddr + uint32(sym.size))
+    for i in 0 ..< 8: patched[pos + i] = bytes[i]
 
-  var segs = @[elf32.Segment(vaddr: codeVa, data: patched, memSize: patched.len,
-                             flags: elf32.PF_R or elf32.PF_X)]
-  if a.bssOffset > 0:
-    # `p_memsz` is the whole of the globals and `p_filesz` only the part with a
-    # nonzero image: a segment whose memory size exceeds its file size is
-    # zero-filled by definition, which is what makes `.bss` free here. A
-    # freestanding target has to copy and zero it by hand; this one does not.
-    segs.add elf32.Segment(vaddr: dataVa, data: dataImage,
-                           memSize: a.bssOffset,
-                           flags: elf32.PF_R or elf32.PF_W)
+  # A global whose initializer is another symbol's ADDRESS — a function pointer
+  # table, a `const` holding `addr other` — cannot be a literal, because the
+  # address is not known until the layout is. Without this the cell stays zero
+  # and the first indirect call through it branches to address 0: a lockup with
+  # nothing at the crash site to say which global was never filled.
+  #
+  # No state bit is OR-ed into a proc's address here. That is Arm's Thumb marker,
+  # and on RISC-V an odd code address is simply misaligned.
+  if a.bssSymInits.len > 0 and bssImage.len > 0:
+    var labelPos = initTable[int, int]()
+    for ld in a.buf.labels: labelPos[int(ld.id)] = ld.position
+    for it in a.bssSymInits:
+      var targetVaddr = 0'u32
+      case it.sym.kind
+      of skProc, skRodata:
+        if not labelPos.hasKey(it.sym.offset): continue
+        targetVaddr = Rv32LoadAddr + uint32(labelPos[it.sym.offset])
+      of skGvar:
+        targetVaddr = Rv32SramAddr + uint32(it.sym.size)
+      else: continue
+      for i in 0 ..< it.size:
+        if it.off.int + i < bssImage.len:
+          bssImage[it.off.int + i] = byte((targetVaddr shr (8 * i)) and 0xFF)
 
-  # `entryTag = 0`: bit 0 of an ARM code address is the Thumb-state marker, and
-  # here the same bit would name an odd address, which this machine cannot fetch
-  # from at all.
-  result = elf32.writeElf32(segs, entry = codeVa + uint32(entryOff),
-                            machine = elf32.EM_RISCV, flags = 0,
-                            entryTag = 0)
+  # ── the .data / .bss cut ──────────────────────────────────────────────────
+  # The cut is the HIGH-WATER MARK of the initialized bytes, not a partition of
+  # the globals. Offsets were assigned as the gvar decls were scanned and every
+  # `lui`/`addi` pair above has already been patched against them, so re-sorting
+  # here is not available — and the scan order is not the declaration order
+  # either. A zero global that lands between two initialized ones is therefore
+  # COPIED rather than zeroed. That costs image bytes and never correctness: the
+  # byte copied is the zero the image already holds for it.
+  #
+  # A zero-VALUED entry in `bssInits` does not raise the mark: whichever side of
+  # the cut it lands on writes a zero there.
+  var dataHigh = 0
+  for it in a.bssInits:
+    if it.val != 0: dataHigh = max(dataHigh, int(it.off) + it.size)
+  for it in a.bssSymInits:
+    dataHigh = max(dataHigh, int(it.off) + it.size)
+  let ramSize = (a.bssOffset + 3) and not 3
+  let dataInitSize = min((dataHigh + 3) and not 3, ramSize)
+  let bssZeroSize = ramSize - dataInitSize
 
-proc rv32CodeVa*(segCount: int): uint32 =
-  ## Where the code will land. `absBase` needs it before the image is assembled —
-  ## an `(adr …)` is a `lui`+`addi` pair carrying an ABSOLUTE address — so it is
-  ## computed here rather than duplicated at the call site.
-  LoadBase + uint32(Elf32EhdrSize + Elf32PhdrSize * segCount)
+  # The initializer image is parked immediately after the code, word aligned so
+  # the startup copy — which moves whole words — reads aligned on both sides.
+  # There is no separate flash region on this board, so "after the code" is the
+  # whole of the placement decision.
+  let dataLoadOff = (patched.len + 3) and not 3
+  let dataLoadAddr = Rv32LoadAddr + uint32(dataLoadOff)
+
+  # Every number is known now, so fill in the sites the startup code left blank.
+  for (pos, which) in a.mimgSites:
+    if pos + 8 > patched.len: continue
+    let v = case which
+            of mikDataLoad: dataLoadAddr
+            of mikDataVma: Rv32SramAddr
+            of mikDataSize: uint32(dataInitSize)
+            of mikBssSize: uint32(bssZeroSize)
+            of mikHeapStart: Rv32SramAddr + uint32(ramSize)
+            of mikHeapSize: 0'u32
+            of mikNoinitStart: Rv32SramAddr + Rv32SramSize
+            of mikNoinitSize: 0'u32
+    var bytes = initBytes()
+    for i in 0 ..< 8: bytes.add patched[pos + i]
+    bytes.patchRvLuiAddiPair(0, v)
+    for i in 0 ..< 8: patched[pos + i] = bytes[i]
+
+  # The code, then the initializer image at its aligned offset.
+  var image = patched
+  while image.len < dataLoadOff: image.add 0'u8
+  for i in 0 ..< dataInitSize:
+    image.add (if i < bssImage.len: bssImage[i] else: 0'u8)
+
+  let entry = Rv32LoadAddr + uint32(entryOff)
+  var segs = @[Segment(vaddr: Rv32LoadAddr, data: image, memSize: image.len,
+                       flags: PF_R or PF_W or PF_X)]
+  if ramSize > 0:
+    # NO file-backed bytes: `data` is empty and only `memSize` is declared. That
+    # is what makes the copy loop LOAD-BEARING rather than decorative — QEMU's
+    # `-kernel` would otherwise place the initialized globals itself, and a broken
+    # copy would still pass every fixture in the corpus.
+    segs.add Segment(vaddr: Rv32SramAddr, data: @[], memSize: ramSize,
+                     flags: PF_R or PF_W)
+  result = writeElf32(segs, entry, machine = EM_RISCV)

@@ -418,7 +418,7 @@ type
     ClzM = (ord(ClzTagId), "clz")  ## count leading zeros: D = number of leading zero bits of S; `N` is the operand size in bits (32 or 64)
     RbitM = (ord(RbitTagId), "rbit")  ## reverse bit order of S into D (with `clz` this is a count-trailing-zeros); `N` is the operand size in bits
     RevM = (ord(RevTagId), "rev")  ## reverse byte order of S into D; `N` is the operand size in bits (32 or 64)
-    BkptM = (ord(BkptTagId), "bkpt")  ## breakpoint / host trap. On Cortex-M, `(bkpt 171)` is `bkpt #0xAB`, the ARM semihosting entry on M-profile (operation in r0, parameter block in r1, result back in r0). On AVR it is the simulator's `SYSCALL N` — `cpse rN, rN` followed by the invalid opcode `0xFFFF`, i.e. an instruction that ALWAYS skips the word after it. That word is data, never executed, which is why this is still one instruction: `(bkpt 30)` exits with r25:r24 and `(bkpt 29)` prints r24
+    BkptM = (ord(BkptTagId), "bkpt")  ## breakpoint / semihosting call; `(bkpt 171)` is `bkpt #0xAB`, the ARM semihosting entry on M-profile (operation in r0, parameter block in r1, result back in r0)
     LdrexM = (ord(LdrexTagId), "ldrex")  ## ARMv7-M exclusive load: `D` ← the `N`-bit cell at `[S]`, taking the monitor's claim on that address. `N` is 8, 16 or 32 and selects `ldrexb`/`ldrexh`/`ldrex`; there is no 64-bit form on this profile (no `ldrexd`), which is why a 64-bit atomic is refused by name rather than split into halves — two claims are not one atom
     StrexM = (ord(StrexTagId), "strex")  ## ARMv7-M exclusive store: store the `N`-bit `D` into `[S]` if the claim still holds, and put the outcome in `St` (0 = stored, 1 = another agent won the line). `St` must differ from `D` and `S` — the architecture leaves it UNPREDICTABLE otherwise, and since the retry loop branches on `St`, getting it wrong is an infinite loop rather than a wrong value
     BxM = (ord(BxTagId), "bx")  ## branch and exchange to the address in D; `(bx (lr))` is the ordinary Thumb return
@@ -447,6 +447,97 @@ type
 
 proc rawTagIsMInst*(raw: TagEnum): bool {.inline.} =
   raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, AddwTagId, SubwTagId, MulwTagId, Addw3TagId, Subw3TagId, Mulw3TagId, GloadTagId, GstoreTagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, AdrTagId, LdrTagId, StrTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, CbzTagId, CbnzTagId, CselltTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, DmbTagId, ClrexTagId, YieldTagId, FmovTagId, FaddTagId, FsubTagId, FmulTagId, FdivTagId, FnegTagId, FcmpTagId, FldrTagId, FstrTagId, ScvtfTagId, UcvtfTagId, FcvtzsTagId, FcvtzuTagId, LdrbTagId, StrbTagId, RebindTagId, WithregTagId, ScopeTagId, ClzTagId, RbitTagId, RevTagId, BkptTagId, LdrexTagId, StrexTagId, BxTagId, BlxTagId, MvnTagId, Bic3TagId, Adds3TagId, Adcs3TagId, Subs3TagId, Sbcs3TagId, MlsTagId, UmullTagId, SmullTagId, TstTagId, UxtbTagId, SxtbTagId, UxthTagId, SxthTagId, LdrhTagId, StrhTagId, LdrsbTagId, LdrshTagId, WfiTagId, DsbTagId, IsbTagId}
+
+type
+  RvInst* = enum
+    NoRvInst
+    PrepareRv = (ord(PrepareTagId), "prepare")  ## prepare block for function call
+    MovRv = (ord(MovTagId), "mov")  ## move instruction
+    LeaRv = (ord(LeaTagId), "lea")  ## load effective address
+    AddRv = (ord(AddTagId), "add")  ## add instruction
+    SubRv = (ord(SubTagId), "sub")  ## subtract instruction
+    MulRv = (ord(MulTagId), "mul")  ## unsigned multiply
+    SdivRv = (ord(SdivTagId), "sdiv")  ## signed divide
+    UdivRv = (ord(UdivTagId), "udiv")  ## unsigned divide
+    Add3Rv = (ord(Add3TagId), "add3")  ## 3-operand add (D = A + B)
+    Sub3Rv = (ord(Sub3TagId), "sub3")  ## 3-operand subtract (D = A - B)
+    Mul3Rv = (ord(Mul3TagId), "mul3")  ## 3-operand multiply (D = A * B)
+    And3Rv = (ord(And3TagId), "and3")  ## 3-operand bitwise and (D = A and B)
+    Orr3Rv = (ord(Orr3TagId), "orr3")  ## 3-operand bitwise or (D = A or B)
+    Eor3Rv = (ord(Eor3TagId), "eor3")  ## 3-operand bitwise xor (D = A xor B)
+    Lsl3Rv = (ord(Lsl3TagId), "lsl3")  ## 3-operand logical shift left (D = A shl B)
+    Lsr3Rv = (ord(Lsr3TagId), "lsr3")  ## 3-operand logical shift right (D = A shr B)
+    Asr3Rv = (ord(Asr3TagId), "asr3")  ## 3-operand arithmetic shift right (D = A sar B)
+    AddwRv = (ord(AddwTagId), "addw")  ## 32-bit add (W-form, result zero-extended)
+    SubwRv = (ord(SubwTagId), "subw")  ## 32-bit subtract (W-form, result zero-extended)
+    MulwRv = (ord(MulwTagId), "mulw")  ## 32-bit multiply (W-form, result zero-extended)
+    Addw3Rv = (ord(Addw3TagId), "addw3")  ## 32-bit 3-operand add (D = A + B, W-form)
+    Subw3Rv = (ord(Subw3TagId), "subw3")  ## 32-bit 3-operand subtract (D = A - B, W-form)
+    Mulw3Rv = (ord(Mulw3TagId), "mulw3")  ## 32-bit 3-operand multiply (D = A * B, W-form)
+    AndRv = (ord(AndTagId), "and")  ## bitwise and
+    OrrRv = (ord(OrrTagId), "orr")  ## bitwise or
+    EorRv = (ord(EorTagId), "eor")  ## bitwise xor
+    LslRv = (ord(LslTagId), "lsl")  ## logical shift left
+    LsrRv = (ord(LsrTagId), "lsr")  ## logical shift right
+    AsrRv = (ord(AsrTagId), "asr")  ## arithmetic shift right
+    NegRv = (ord(NegTagId), "neg")  ## negate
+    CmpRv = (ord(CmpTagId), "cmp")  ## compare
+    CallRv = (ord(CallTagId), "call")  ## function call marker inside prepare
+    ExtcallRv = (ord(ExtcallTagId), "extcall")  ## external call marker inside prepare
+    RetRv = (ord(RetTagId), "ret")  ## return instruction
+    NopRv = (ord(NopTagId), "nop")  ## no operation
+    AdrRv = (ord(AdrTagId), "adr")  ## load address of label
+    LdrRv = (ord(LdrTagId), "ldr")  ## load register
+    StrRv = (ord(StrTagId), "str")  ## store register
+    BRv = (ord(BTagId), "b")  ## branch (unconditional jump)
+    BlRv = (ord(BlTagId), "bl")  ## branch with link (function call)
+    BeqRv = (ord(BeqTagId), "beq")  ## branch if equal
+    BneRv = (ord(BneTagId), "bne")  ## branch if not equal
+    BltRv = (ord(BltTagId), "blt")  ## branch if less than (signed)
+    BleRv = (ord(BleTagId), "ble")  ## branch if less or equal (signed)
+    BgtRv = (ord(BgtTagId), "bgt")  ## branch if greater than (signed)
+    BgeRv = (ord(BgeTagId), "bge")  ## branch if greater or equal (signed)
+    BloRv = (ord(BloTagId), "blo")  ## branch if lower (unsigned <)
+    BlsRv = (ord(BlsTagId), "bls")  ## branch if lower or same (unsigned <=)
+    BhiRv = (ord(BhiTagId), "bhi")  ## branch if higher (unsigned >)
+    BhsRv = (ord(BhsTagId), "bhs")  ## branch if higher or same (unsigned >=)
+    CbzRv = (ord(CbzTagId), "cbz")  ## branch to L if S is zero (no flags read)
+    CbnzRv = (ord(CbnzTagId), "cbnz")  ## branch to L if S is non-zero (no flags read)
+    LabRv = (ord(LabTagId), "lab")  ## label definition
+    IteRv = (ord(IteTagId), "ite")  ## if-then-else structure
+    LoopRv = (ord(LoopTagId), "loop")  ## loop structure
+    StmtsRv = (ord(StmtsTagId), "stmts")  ## statement block
+    JtrueRv = (ord(JtrueTagId), "jtrue")  ## set control flow variable(s) to true
+    KillRv = (ord(KillTagId), "kill")  ## kill variable
+    DmbRv = (ord(DmbTagId), "dmb")  ## data memory barrier: every access before it is observed before any after it. One row for both Arm profiles because it is one instruction — but it is load-bearing on only one of them: AArch64 folds ordering into `ldaxr`/`stlxr`, while ARMv7-M has no acquire/release form at all, so a Cortex-M atomic is a `dmb`-bracketed `ldrex`/`strex` pair and the barrier is a separate instruction the emitter places
+    YieldRv = (ord(YieldTagId), "yield")  ## spin-wait hint (`hint #1`). One row for both Arm profiles because it is one instruction: `YIELD` is the same architectural hint on AArch64 and on ARMv7-M, and on both it is defined to execute as a `nop` where the implementation has nothing to do with it. That is what makes it safe to emit unconditionally — no feature test, no `when` at the call site
+    FmovRv = (ord(FmovTagId), "fmov")  ## fp move (reg-reg / gpr<->fp bitcast)
+    FaddRv = (ord(FaddTagId), "fadd")  ## fp add (D = D + S)
+    FsubRv = (ord(FsubTagId), "fsub")  ## fp subtract (D = D - S)
+    FmulRv = (ord(FmulTagId), "fmul")  ## fp multiply (D = D * S)
+    FdivRv = (ord(FdivTagId), "fdiv")  ## fp divide (D = D / S)
+    FnegRv = (ord(FnegTagId), "fneg")  ## fp negate (D = -D)
+    FcmpRv = (ord(FcmpTagId), "fcmp")  ## fp compare
+    FldrRv = (ord(FldrTagId), "fldr")  ## fp load register
+    FstrRv = (ord(FstrTagId), "fstr")  ## fp store register
+    ScvtfRv = (ord(ScvtfTagId), "scvtf")  ## signed int -> fp convert
+    UcvtfRv = (ord(UcvtfTagId), "ucvtf")  ## unsigned int -> fp convert
+    FcvtzsRv = (ord(FcvtzsTagId), "fcvtzs")  ## fp -> signed int convert (toward zero)
+    FcvtzuRv = (ord(FcvtzuTagId), "fcvtzu")  ## fp -> unsigned int convert (toward zero)
+    LdrbRv = (ord(LdrbTagId), "ldrb")  ## load byte (zero-extend), register offset [B,I]
+    StrbRv = (ord(StrbTagId), "strb")  ## store low byte, register offset [B,I]
+    RebindRv = (ord(RebindTagId), "rebind")  ## bind a phys reg to a typed name, killing its prior tenant
+    WithregRv = (ord(WithregTagId), "withreg")  ## block-scoped rebind; auto-killed at block end
+    ScopeRv = (ord(ScopeTagId), "scope")  ## statement block with a reclaimable stack-slot arena: `(s)` locals declared inside are freed at scope end so sibling scopes reuse the frame bytes
+    CsrwRv = (ord(CsrwTagId), "csrw")  ## RV32: write control/status register `N` from `S`, discarding its old value (`csrrw x0, N, S`). Needed before the first floating-point instruction and before the first trap: an RV32 core resets with `mstatus.FS` clear, and while it is clear every FP instruction raises an illegal-instruction exception — into an `mtvec` that has not been set either, so the image HANGS rather than faulting
+    CsrsRv = (ord(CsrsTagId), "csrs")  ## RV32: set the bits of `S` in control/status register `N`, leaving the rest alone (`csrrs x0, N, S`). The read-modify-write form, which is what enabling one field of `mstatus` wants
+    MretRv = (ord(MretTagId), "mret")  ## RV32: return from a machine-mode trap — restore the pre-trap privilege from `mstatus.MPP`, re-enable interrupts from `mstatus.MPIE`, and jump to `mepc`. An interrupt handler ends with this and NOT with `(ret)`: `ret` is `jalr x0, 0(ra)`, and `ra` in a handler holds whatever the interrupted code left there, not a return address the trap recorded
+    LrwRv = (ord(LrwTagId), "lrw")  ## RV32: `lr.w D, (S)` — load-reserved word, taking a reservation on the address in `S`. The acquire half of an LL/SC pair; the `aq` bit is set, so the ordering rides along in the instruction as `AcqRelExclusives` promises. Only `.w` exists on RV32: the A extension has no byte or halfword form, which is why an 8- or 16-bit atomic is refused by name here rather than widened
+    ScwRv = (ord(ScwTagId), "scw")  ## RV32: `sc.w St, D, (S)` — store-conditional word, writing `D` to the address in `S` and setting `St` to zero on success, non-zero if the reservation was lost. `St` is the instruction's DESTINATION, which is why it comes first and why it must differ from `D`. Its own row rather than a spelling of `(stlxr …)`: those four A64-only rows would leave the late block the moment a second enum named them, shifting every shared tag id after them and pushing more of the cross-target vocabulary past 511
+    SemihostRv = (ord(SemihostTagId), "semihost")  ## RV32 semihosting call: the `slli x0,x0,0x1f` / `ebreak` / `srai x0,x0,7` triple (operation in `a0`, parameter block in `a1`, result back in `a0`). NOT a spelling of `(bkpt N)`: RISC-V's escape is three instructions rather than one, carries no immediate, and is recognized by its exact bytes — both surrounding words write `x0` and so are architecturally no-ops, which is what distinguishes this `ebreak` from an ordinary breakpoint. Same `SYS_*` numbers as ARM semihosting
+
+proc rawTagIsRvInst*(raw: TagEnum): bool {.inline.} =
+  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, MulTagId, SdivTagId, UdivTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, AddwTagId, SubwTagId, MulwTagId, Addw3TagId, Subw3TagId, Mulw3TagId, AndTagId, OrrTagId, EorTagId, LslTagId, LsrTagId, AsrTagId, NegTagId, CmpTagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, AdrTagId, LdrTagId, StrTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, CbzTagId, CbnzTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, DmbTagId, YieldTagId, FmovTagId, FaddTagId, FsubTagId, FmulTagId, FdivTagId, FnegTagId, FcmpTagId, FldrTagId, FstrTagId, ScvtfTagId, UcvtfTagId, FcvtzsTagId, FcvtzuTagId, LdrbTagId, StrbTagId, RebindTagId, WithregTagId, ScopeTagId, CsrwTagId, CsrsTagId, MretTagId, LrwTagId, ScwTagId, SemihostTagId}
 
 type
   NifasmType* = enum
@@ -492,7 +583,7 @@ type
     CoreD = (ord(CoreTagId), "core")  ## Cortex-M: which stack slot THIS image boots on. One image per core, so the number is a constant the author knows and not something read from a CPUID register — M-profile has no architectural core id
     InterruptsD = (ord(InterruptsTagId), "interrupts")  ## Cortex-M: the interrupt table, as `(irq N S)` children — handler `S` occupies architectural table slot `N`. Slots the module does not name stay zero. Slots 0 and 1 are the image writer's (initial MSP, reset) and may not appear
     IrqD = (ord(IrqTagId), "irq")  ## Cortex-M: one interrupt-table entry — slot number, then the handler symbol. Its address is baked with the Thumb bit, like every other code address on this target
-    ArchD = (ord(ArchTagId), "arch")  ## architecture pragma: `x64`, `linux_arm64`, `arm64`, `win_x64`, `win_arm64`, `cortex_m`
+    ArchD = (ord(ArchTagId), "arch")  ## architecture pragma: `x64`, `linux_arm64`, `arm64`, `win_x64`, `win_arm64`, `cortex_m`, `riscv32`
     CfvarD = (ord(CfvarTagId), "cfvar")  ## control flow variable declaration
     RodataD = (ord(RodataTagId), "rodata")  ## read-only data (string/bytes)
     GvarD = (ord(GvarTagId), "gvar")  ## global variable
@@ -797,6 +888,109 @@ proc rawTagIsMReg*(raw: TagEnum): bool {.inline.} =
   raw in {R8TagId, R9TagId, R10TagId, R11TagId, R12TagId, R0TagId, R1TagId, R2TagId, R3TagId, R4TagId, R5TagId, R6TagId, R7TagId, SpTagId, LrTagId, S0TagId, S1TagId, S2TagId, S3TagId, S4TagId, S5TagId, S6TagId, S7TagId, S8TagId, S9TagId, S10TagId, S11TagId, S12TagId, S13TagId, S14TagId, S15TagId, S16TagId, S17TagId, S18TagId, S19TagId, S20TagId, S21TagId, S22TagId, S23TagId, S24TagId, S25TagId, S26TagId, S27TagId, S28TagId, S29TagId, S30TagId, S31TagId}
 
 type
+  RvReg* = enum
+    NoRvReg
+    X0RV = (ord(X0TagId), "x0")  ## register x0
+    X1RV = (ord(X1TagId), "x1")  ## register x1
+    X2RV = (ord(X2TagId), "x2")  ## register x2
+    X3RV = (ord(X3TagId), "x3")  ## register x3
+    X4RV = (ord(X4TagId), "x4")  ## register x4
+    X5RV = (ord(X5TagId), "x5")  ## register x5
+    X6RV = (ord(X6TagId), "x6")  ## register x6
+    X7RV = (ord(X7TagId), "x7")  ## register x7
+    X8RV = (ord(X8TagId), "x8")  ## register x8
+    X9RV = (ord(X9TagId), "x9")  ## register x9
+    X10RV = (ord(X10TagId), "x10")  ## register x10
+    X11RV = (ord(X11TagId), "x11")  ## register x11
+    X12RV = (ord(X12TagId), "x12")  ## register x12
+    X13RV = (ord(X13TagId), "x13")  ## register x13
+    X14RV = (ord(X14TagId), "x14")  ## register x14
+    X15RV = (ord(X15TagId), "x15")  ## register x15
+    X16RV = (ord(X16TagId), "x16")  ## register x16
+    X17RV = (ord(X17TagId), "x17")  ## register x17
+    X18RV = (ord(X18TagId), "x18")  ## register x18
+    X19RV = (ord(X19TagId), "x19")  ## register x19
+    X20RV = (ord(X20TagId), "x20")  ## register x20
+    X21RV = (ord(X21TagId), "x21")  ## register x21
+    X22RV = (ord(X22TagId), "x22")  ## register x22
+    X23RV = (ord(X23TagId), "x23")  ## register x23
+    X24RV = (ord(X24TagId), "x24")  ## register x24
+    X25RV = (ord(X25TagId), "x25")  ## register x25
+    X26RV = (ord(X26TagId), "x26")  ## register x26
+    X27RV = (ord(X27TagId), "x27")  ## register x27
+    X28RV = (ord(X28TagId), "x28")  ## register x28
+    X29RV = (ord(X29TagId), "x29")  ## register x29
+    X30RV = (ord(X30TagId), "x30")  ## register x30
+    SpRV = (ord(SpTagId), "sp")  ## stack pointer
+    D0RV = (ord(D0TagId), "d0")  ## fp register d0
+    D1RV = (ord(D1TagId), "d1")  ## fp register d1
+    D2RV = (ord(D2TagId), "d2")  ## fp register d2
+    D3RV = (ord(D3TagId), "d3")  ## fp register d3
+    D4RV = (ord(D4TagId), "d4")  ## fp register d4
+    D5RV = (ord(D5TagId), "d5")  ## fp register d5
+    D6RV = (ord(D6TagId), "d6")  ## fp register d6
+    D7RV = (ord(D7TagId), "d7")  ## fp register d7
+    D8RV = (ord(D8TagId), "d8")  ## fp register d8
+    D9RV = (ord(D9TagId), "d9")  ## fp register d9
+    D10RV = (ord(D10TagId), "d10")  ## fp register d10
+    D11RV = (ord(D11TagId), "d11")  ## fp register d11
+    D12RV = (ord(D12TagId), "d12")  ## fp register d12
+    D13RV = (ord(D13TagId), "d13")  ## fp register d13
+    D14RV = (ord(D14TagId), "d14")  ## fp register d14
+    D15RV = (ord(D15TagId), "d15")  ## fp register d15
+    D16RV = (ord(D16TagId), "d16")  ## fp register d16
+    D17RV = (ord(D17TagId), "d17")  ## fp register d17
+    D18RV = (ord(D18TagId), "d18")  ## fp register d18
+    D19RV = (ord(D19TagId), "d19")  ## fp register d19
+    D20RV = (ord(D20TagId), "d20")  ## fp register d20
+    D21RV = (ord(D21TagId), "d21")  ## fp register d21
+    D22RV = (ord(D22TagId), "d22")  ## fp register d22
+    D23RV = (ord(D23TagId), "d23")  ## fp register d23
+    D24RV = (ord(D24TagId), "d24")  ## fp register d24
+    D25RV = (ord(D25TagId), "d25")  ## fp register d25
+    D26RV = (ord(D26TagId), "d26")  ## fp register d26
+    D27RV = (ord(D27TagId), "d27")  ## fp register d27
+    D28RV = (ord(D28TagId), "d28")  ## fp register d28
+    D29RV = (ord(D29TagId), "d29")  ## fp register d29
+    D30RV = (ord(D30TagId), "d30")  ## fp register d30
+    D31RV = (ord(D31TagId), "d31")  ## fp register d31
+    S0RV = (ord(S0TagId), "s0")  ## fp register s0
+    S1RV = (ord(S1TagId), "s1")  ## fp register s1
+    S2RV = (ord(S2TagId), "s2")  ## fp register s2
+    S3RV = (ord(S3TagId), "s3")  ## fp register s3
+    S4RV = (ord(S4TagId), "s4")  ## fp register s4
+    S5RV = (ord(S5TagId), "s5")  ## fp register s5
+    S6RV = (ord(S6TagId), "s6")  ## fp register s6
+    S7RV = (ord(S7TagId), "s7")  ## fp register s7
+    S8RV = (ord(S8TagId), "s8")  ## fp register s8
+    S9RV = (ord(S9TagId), "s9")  ## fp register s9
+    S10RV = (ord(S10TagId), "s10")  ## fp register s10
+    S11RV = (ord(S11TagId), "s11")  ## fp register s11
+    S12RV = (ord(S12TagId), "s12")  ## fp register s12
+    S13RV = (ord(S13TagId), "s13")  ## fp register s13
+    S14RV = (ord(S14TagId), "s14")  ## fp register s14
+    S15RV = (ord(S15TagId), "s15")  ## fp register s15
+    S16RV = (ord(S16TagId), "s16")  ## fp register s16
+    S17RV = (ord(S17TagId), "s17")  ## fp register s17
+    S18RV = (ord(S18TagId), "s18")  ## fp register s18
+    S19RV = (ord(S19TagId), "s19")  ## fp register s19
+    S20RV = (ord(S20TagId), "s20")  ## fp register s20
+    S21RV = (ord(S21TagId), "s21")  ## fp register s21
+    S22RV = (ord(S22TagId), "s22")  ## fp register s22
+    S23RV = (ord(S23TagId), "s23")  ## fp register s23
+    S24RV = (ord(S24TagId), "s24")  ## fp register s24
+    S25RV = (ord(S25TagId), "s25")  ## fp register s25
+    S26RV = (ord(S26TagId), "s26")  ## fp register s26
+    S27RV = (ord(S27TagId), "s27")  ## fp register s27
+    S28RV = (ord(S28TagId), "s28")  ## fp register s28
+    S29RV = (ord(S29TagId), "s29")  ## fp register s29
+    S30RV = (ord(S30TagId), "s30")  ## fp register s30
+    S31RV = (ord(S31TagId), "s31")  ## fp register s31
+
+proc rawTagIsRvReg*(raw: TagEnum): bool {.inline.} =
+  raw in {X0TagId, X1TagId, X2TagId, X3TagId, X4TagId, X5TagId, X6TagId, X7TagId, X8TagId, X9TagId, X10TagId, X11TagId, X12TagId, X13TagId, X14TagId, X15TagId, X16TagId, X17TagId, X18TagId, X19TagId, X20TagId, X21TagId, X22TagId, X23TagId, X24TagId, X25TagId, X26TagId, X27TagId, X28TagId, X29TagId, X30TagId, SpTagId, D0TagId, D1TagId, D2TagId, D3TagId, D4TagId, D5TagId, D6TagId, D7TagId, D8TagId, D9TagId, D10TagId, D11TagId, D12TagId, D13TagId, D14TagId, D15TagId, D16TagId, D17TagId, D18TagId, D19TagId, D20TagId, D21TagId, D22TagId, D23TagId, D24TagId, D25TagId, D26TagId, D27TagId, D28TagId, D29TagId, D30TagId, D31TagId, S0TagId, S1TagId, S2TagId, S3TagId, S4TagId, S5TagId, S6TagId, S7TagId, S8TagId, S9TagId, S10TagId, S11TagId, S12TagId, S13TagId, S14TagId, S15TagId, S16TagId, S17TagId, S18TagId, S19TagId, S20TagId, S21TagId, S22TagId, S23TagId, S24TagId, S25TagId, S26TagId, S27TagId, S28TagId, S29TagId, S30TagId, S31TagId}
+
+type
   AvrInst* = enum
     NoAvrInst
     PrepareAvr = (ord(PrepareTagId), "prepare")  ## prepare block for function call
@@ -841,15 +1035,15 @@ type
     RebindAvr = (ord(RebindTagId), "rebind")  ## bind a phys reg to a typed name, killing its prior tenant
     WithregAvr = (ord(WithregTagId), "withreg")  ## block-scoped rebind; auto-killed at block end
     ScopeAvr = (ord(ScopeTagId), "scope")  ## statement block with a reclaimable stack-slot arena: `(s)` locals declared inside are freed at scope end so sibling scopes reuse the frame bytes
-    BkptAvr = (ord(BkptTagId), "bkpt")  ## breakpoint / host trap. On Cortex-M, `(bkpt 171)` is `bkpt #0xAB`, the ARM semihosting entry on M-profile (operation in r0, parameter block in r1, result back in r0). On AVR it is the simulator's `SYSCALL N` — `cpse rN, rN` followed by the invalid opcode `0xFFFF`, i.e. an instruction that ALWAYS skips the word after it. That word is data, never executed, which is why this is still one instruction: `(bkpt 30)` exits with r25:r24 and `(bkpt 29)` prints r24
-    AndiAvr = (ord(AndiTagId), "andi")  ## AVR: `(andi D K)`, and with an 8-bit immediate, r16..r31 only. RV32: `(andi D A K)`, three-operand with a 12-bit signed immediate. Same spelling, different machine — `(arch …)` decides, exactly as it does for `(r0)` and `(add D S)`
-    OriAvr = (ord(OriTagId), "ori")  ## AVR: `(ori D K)`, or with an 8-bit immediate, r16..r31 only. RV32: `(ori D A K)`, three-operand with a 12-bit signed immediate. See `(andi …)`
+    BkptAvr = (ord(BkptTagId), "bkpt")  ## breakpoint / semihosting call; `(bkpt 171)` is `bkpt #0xAB`, the ARM semihosting entry on M-profile (operation in r0, parameter block in r1, result back in r0)
     LdiAvr = (ord(LdiTagId), "ldi")  ## AVR: load an 8-bit immediate. The only way to materialize a constant, and it reaches r16..r31 only — a constant destined for a low register goes through a high one and `(mov)`/`(movw)`
     MovwAvr = (ord(MovwTagId), "movw")  ## AVR: copy a whole 16-bit PAIR in one instruction. Both operands are pair tags and both must be even. This is what makes a pair cheap enough to be the unit the allocator hands out
     AdcAvr = (ord(AdcTagId), "adc")  ## AVR: add with carry — the HIGH half of a 16-bit add, whose low half is `(add)`. The two are separate tags because they are separate instructions; the carry between them is the reason neither is useful alone
     SbcAvr = (ord(SbcTagId), "sbc")  ## AVR: subtract with borrow — the high half of a 16-bit subtract
     SubiAvr = (ord(SubiTagId), "subi")  ## AVR: subtract an 8-bit immediate, r16..r31 only. There is no `addi` on this machine: adding a constant is subtracting its negation
     SbciAvr = (ord(SbciTagId), "sbci")  ## AVR: subtract an immediate with borrow — the high half of the above, and also the third instruction of a 16-bit negation (`(not)` high, `(neg)` low, `(sbci)` high by -1)
+    AndiAvr = (ord(AndiTagId), "andi")  ## AVR: `(andi D K)`, and with an 8-bit immediate, r16..r31 only. RV32: `(andi D A K)`, three-operand with a 12-bit signed immediate. Same spelling, different machine — `(arch …)` decides, exactly as it does for `(r0)` and `(add D S)`
+    OriAvr = (ord(OriTagId), "ori")  ## AVR: `(ori D K)`, or with an 8-bit immediate, r16..r31 only. RV32: `(ori D A K)`, three-operand with a 12-bit signed immediate. See `(andi …)`
     CpiAvr = (ord(CpiTagId), "cpi")  ## AVR: compare against an 8-bit immediate, r16..r31 only
     CpcAvr = (ord(CpcTagId), "cpc")  ## AVR: compare with carry — the high half of a 16-bit comparison, whose low half is `(cmp)`
     CpseAvr = (ord(CpseTagId), "cpse")  ## AVR: compare and skip the next INSTRUCTION if equal. It counts instructions, not statements: loading a 16-bit constant is two of them, so a `(cpse)` before an `(ldi)` pair skips only the low half
@@ -882,7 +1076,7 @@ type
     LpmpiAvr = (ord(LpmpiTagId), "lpmpi")  ## AVR: read the flash byte at Z and post-increment Z
 
 proc rawTagIsAvrInst*(raw: TagEnum): bool {.inline.} =
-  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, AndTagId, OrTagId, XorTagId, IncTagId, DecTagId, NegTagId, NotTagId, CmpTagId, JmpTagId, CallTagId, ExtcallTagId, RetTagId, PushTagId, PopTagId, NopTagId, AdrTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, RebindTagId, WithregTagId, ScopeTagId, BkptTagId, AndiTagId, OriTagId, LdiTagId, MovwTagId, AdcTagId, SbcTagId, SubiTagId, SbciTagId, CpiTagId, CpcTagId, CpseTagId, AdiwTagId, SbiwTagId, Lsl1TagId, Rol1TagId, Lsr1TagId, Ror1TagId, Asr1TagId, SwapTagId, MulbTagId, MulsbTagId, LdbTagId, StbTagId, LdpiTagId, StpiTagId, InbTagId, OutbTagId, SbrcTagId, SbrsTagId, IcallTagId, IjmpTagId, RetiTagId, SeiTagId, CliTagId, SleepTagId, WdrTagId, LpmTagId, LpmpiTagId}
+  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, AndTagId, OrTagId, XorTagId, IncTagId, DecTagId, NegTagId, NotTagId, CmpTagId, JmpTagId, CallTagId, ExtcallTagId, RetTagId, PushTagId, PopTagId, NopTagId, AdrTagId, BTagId, BlTagId, BeqTagId, BneTagId, BltTagId, BleTagId, BgtTagId, BgeTagId, BloTagId, BlsTagId, BhiTagId, BhsTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, RebindTagId, WithregTagId, ScopeTagId, BkptTagId, LdiTagId, MovwTagId, AdcTagId, SbcTagId, SubiTagId, SbciTagId, AndiTagId, OriTagId, CpiTagId, CpcTagId, CpseTagId, AdiwTagId, SbiwTagId, Lsl1TagId, Rol1TagId, Lsr1TagId, Ror1TagId, Asr1TagId, SwapTagId, MulbTagId, MulsbTagId, LdbTagId, StbTagId, LdpiTagId, StpiTagId, InbTagId, OutbTagId, SbrcTagId, SbrsTagId, IcallTagId, IjmpTagId, RetiTagId, SeiTagId, CliTagId, SleepTagId, WdrTagId, LpmTagId, LpmpiTagId}
 
 type
   AvrReg* = enum
@@ -938,116 +1132,4 @@ type
 
 proc rawTagIsAvrReg*(raw: TagEnum): bool {.inline.} =
   raw in {R8TagId, R9TagId, R10TagId, R11TagId, R12TagId, R13TagId, R14TagId, R15TagId, R0TagId, R1TagId, R2TagId, R3TagId, R4TagId, R5TagId, R6TagId, R7TagId, R16TagId, R17TagId, R18TagId, R19TagId, R20TagId, R21TagId, R22TagId, R23TagId, R24TagId, R25TagId, R26TagId, R27TagId, R28TagId, R29TagId, R30TagId, R31TagId, Rp0TagId, Rp2TagId, Rp4TagId, Rp6TagId, Rp8TagId, Rp10TagId, Rp12TagId, Rp14TagId, Rp16TagId, Rp18TagId, Rp20TagId, Rp22TagId, Rp24TagId, Rp26TagId, Rp28TagId, Rp30TagId}
-
-type
-  Rv32Inst* = enum
-    NoRv32Inst
-    PrepareRv = (ord(PrepareTagId), "prepare")  ## prepare block for function call
-    MovRv = (ord(MovTagId), "mov")  ## move instruction
-    LeaRv = (ord(LeaTagId), "lea")  ## load effective address
-    AddRv = (ord(AddTagId), "add")  ## add instruction
-    SubRv = (ord(SubTagId), "sub")  ## subtract instruction
-    Add3Rv = (ord(Add3TagId), "add3")  ## 3-operand add (D = A + B)
-    Sub3Rv = (ord(Sub3TagId), "sub3")  ## 3-operand subtract (D = A - B)
-    Mul3Rv = (ord(Mul3TagId), "mul3")  ## 3-operand multiply (D = A * B)
-    And3Rv = (ord(And3TagId), "and3")  ## 3-operand bitwise and (D = A and B)
-    Orr3Rv = (ord(Orr3TagId), "orr3")  ## 3-operand bitwise or (D = A or B)
-    Eor3Rv = (ord(Eor3TagId), "eor3")  ## 3-operand bitwise xor (D = A xor B)
-    Lsl3Rv = (ord(Lsl3TagId), "lsl3")  ## 3-operand logical shift left (D = A shl B)
-    Lsr3Rv = (ord(Lsr3TagId), "lsr3")  ## 3-operand logical shift right (D = A shr B)
-    Asr3Rv = (ord(Asr3TagId), "asr3")  ## 3-operand arithmetic shift right (D = A sar B)
-    CallRv = (ord(CallTagId), "call")  ## function call marker inside prepare
-    ExtcallRv = (ord(ExtcallTagId), "extcall")  ## external call marker inside prepare
-    RetRv = (ord(RetTagId), "ret")  ## return instruction
-    NopRv = (ord(NopTagId), "nop")  ## no operation
-    AdrRv = (ord(AdrTagId), "adr")  ## load address of label
-    LdrRv = (ord(LdrTagId), "ldr")  ## load register
-    StrRv = (ord(StrTagId), "str")  ## store register
-    BRv = (ord(BTagId), "b")  ## branch (unconditional jump)
-    BlRv = (ord(BlTagId), "bl")  ## branch with link (function call)
-    LabRv = (ord(LabTagId), "lab")  ## label definition
-    IteRv = (ord(IteTagId), "ite")  ## if-then-else structure
-    LoopRv = (ord(LoopTagId), "loop")  ## loop structure
-    StmtsRv = (ord(StmtsTagId), "stmts")  ## statement block
-    JtrueRv = (ord(JtrueTagId), "jtrue")  ## set control flow variable(s) to true
-    KillRv = (ord(KillTagId), "kill")  ## kill variable
-    RebindRv = (ord(RebindTagId), "rebind")  ## bind a phys reg to a typed name, killing its prior tenant
-    WithregRv = (ord(WithregTagId), "withreg")  ## block-scoped rebind; auto-killed at block end
-    ScopeRv = (ord(ScopeTagId), "scope")  ## statement block with a reclaimable stack-slot arena: `(s)` locals declared inside are freed at scope end so sibling scopes reuse the frame bytes
-    AndiRv = (ord(AndiTagId), "andi")  ## AVR: `(andi D K)`, and with an 8-bit immediate, r16..r31 only. RV32: `(andi D A K)`, three-operand with a 12-bit signed immediate. Same spelling, different machine — `(arch …)` decides, exactly as it does for `(r0)` and `(add D S)`
-    OriRv = (ord(OriTagId), "ori")  ## AVR: `(ori D K)`, or with an 8-bit immediate, r16..r31 only. RV32: `(ori D A K)`, three-operand with a 12-bit signed immediate. See `(andi …)`
-    LuiRv = (ord(LuiTagId), "lui")  ## RV32: load the upper 20 bits, zeroing the low 12. Half of every constant wider than 12 bits and of every absolute address; the other half is an `(addi)` whose SIGNED immediate is why the upper half needs the `+0x800` compensation
-    AuipcRv = (ord(AuipcTagId), "auipc")  ## RV32: add the upper 20 bits to the PC. What a position-independent address is built from, and the reason `(adr)` can stay absolute here while a shared object would need this instead
-    AddiRv = (ord(AddiTagId), "addi")  ## RV32: add a 12-bit SIGNED immediate. Also how a register is copied (`K` = 0) and how the frame pointer is adjusted — there is no separate `mov`
-    SltiRv = (ord(SltiTagId), "slti")  ## RV32: 1 if A < K signed, else 0
-    SltiuRv = (ord(SltiuTagId), "sltiu")  ## RV32: 1 if A < K unsigned, else 0. With `K` = 1 this is `seqz`: a value is unsigned-less-than one exactly when it is zero
-    XoriRv = (ord(XoriTagId), "xori")  ## RV32: exclusive-or with a 12-bit immediate. With `K` = -1 this is a bitwise not
-    SlliRv = (ord(SlliTagId), "slli")  ## RV32: shift left by a constant 0..31
-    SrliRv = (ord(SrliTagId), "srli")  ## RV32: shift right logical by a constant
-    SraiRv = (ord(SraiTagId), "srai")  ## RV32: shift right arithmetic by a constant
-    SltRv = (ord(SltTagId), "slt")  ## RV32: 1 if A < B signed, else 0. This is how a bool EXISTS on this machine — there is no flag for a comparison to leave its answer in
-    SltuRv = (ord(SltuTagId), "sltu")  ## RV32: 1 if A < B unsigned, else 0
-    DivsRv = (ord(DivsTagId), "divs")  ## RV32: signed divide, truncating toward zero (the M extension). Division by zero yields all-ones rather than trapping, which is architectural and not a choice the backend makes
-    Divu3Rv = (ord(Divu3TagId), "divu3")  ## RV32: unsigned divide
-    RemsRv = (ord(RemsTagId), "rems")  ## RV32: signed remainder, taking the DIVIDEND's sign
-    RemuRv = (ord(RemuTagId), "remu")  ## RV32: unsigned remainder
-    BeqrRv = (ord(BeqrTagId), "beqr")  ## RV32: branch to L if A == B. A two-register compare-and-branch, because there is no flag to test — the comparison and the branch are one instruction
-    BnerRv = (ord(BnerTagId), "bner")  ## RV32: branch if A != B
-    BltrRv = (ord(BltrTagId), "bltr")  ## RV32: branch if A < B, SIGNED
-    BgerRv = (ord(BgerTagId), "bger")  ## RV32: branch if A >= B, signed
-    BlturRv = (ord(BlturTagId), "bltur")  ## RV32: branch if A < B, unsigned
-    BgeurRv = (ord(BgeurTagId), "bgeur")  ## RV32: branch if A >= B, unsigned. Note the missing four: there is no `>` and no `<=` on this machine, because each is one of these with the operands exchanged
-    JalrRv = (ord(JalrTagId), "jalr")  ## RV32: jump to A+K and leave the return address in D. The only indirect jump, and with `D` = x0 and `A` = ra it is the return instruction
-    EcallRv = (ord(EcallTagId), "ecall")  ## RV32: the system call. Number in a7, arguments in a0..a5, result in a0 — the asm-generic ABI this target shares with RV64 and AArch64
-    EbreakRv = (ord(EbreakTagId), "ebreak")  ## RV32: the debugger trap
-    LwrRv = (ord(LwrTagId), "lwr")  ## RV32: load a word. `S` is a base register plus a 12-bit signed offset, which is the ENTIRE addressing vocabulary of this machine — no index, no scale, no PC-relative form
-    LhrRv = (ord(LhrTagId), "lhr")  ## RV32: load a halfword, sign-extended
-    LhurRv = (ord(LhurTagId), "lhur")  ## RV32: load a halfword, zero-extended
-    LbrRv = (ord(LbrTagId), "lbr")  ## RV32: load a byte, sign-extended
-    LburRv = (ord(LburTagId), "lbur")  ## RV32: load a byte, zero-extended
-    SwrRv = (ord(SwrTagId), "swr")  ## RV32: store a word
-    Shr32Rv = (ord(Shr32TagId), "shr32")  ## RV32: store a halfword. Spelled with the width because `shr` is already the x86-64 shift
-    SbrRv = (ord(SbrTagId), "sbr")  ## RV32: store a byte
-
-proc rawTagIsRv32Inst*(raw: TagEnum): bool {.inline.} =
-  raw in {PrepareTagId, MovTagId, LeaTagId, AddTagId, SubTagId, Add3TagId, Sub3TagId, Mul3TagId, And3TagId, Orr3TagId, Eor3TagId, Lsl3TagId, Lsr3TagId, Asr3TagId, CallTagId, ExtcallTagId, RetTagId, NopTagId, AdrTagId, LdrTagId, StrTagId, BTagId, BlTagId, LabTagId, IteTagId, LoopTagId, StmtsTagId, JtrueTagId, KillTagId, RebindTagId, WithregTagId, ScopeTagId, AndiTagId, OriTagId, LuiTagId, AuipcTagId, AddiTagId, SltiTagId, SltiuTagId, XoriTagId, SlliTagId, SrliTagId, SraiTagId, SltTagId, SltuTagId, DivsTagId, Divu3TagId, RemsTagId, RemuTagId, BeqrTagId, BnerTagId, BltrTagId, BgerTagId, BlturTagId, BgeurTagId, JalrTagId, EcallTagId, EbreakTagId, LwrTagId, LhrTagId, LhurTagId, LbrTagId, LburTagId, SwrTagId, Shr32TagId, SbrTagId}
-
-type
-  Rv32Reg* = enum
-    NoRv32Reg
-    X0RvR = (ord(X0TagId), "x0")  ## register x0
-    X1RvR = (ord(X1TagId), "x1")  ## register x1
-    X2RvR = (ord(X2TagId), "x2")  ## register x2
-    X3RvR = (ord(X3TagId), "x3")  ## register x3
-    X4RvR = (ord(X4TagId), "x4")  ## register x4
-    X5RvR = (ord(X5TagId), "x5")  ## register x5
-    X6RvR = (ord(X6TagId), "x6")  ## register x6
-    X7RvR = (ord(X7TagId), "x7")  ## register x7
-    X8RvR = (ord(X8TagId), "x8")  ## register x8
-    X9RvR = (ord(X9TagId), "x9")  ## register x9
-    X10RvR = (ord(X10TagId), "x10")  ## register x10
-    X11RvR = (ord(X11TagId), "x11")  ## register x11
-    X12RvR = (ord(X12TagId), "x12")  ## register x12
-    X13RvR = (ord(X13TagId), "x13")  ## register x13
-    X14RvR = (ord(X14TagId), "x14")  ## register x14
-    X15RvR = (ord(X15TagId), "x15")  ## register x15
-    X16RvR = (ord(X16TagId), "x16")  ## register x16
-    X17RvR = (ord(X17TagId), "x17")  ## register x17
-    X18RvR = (ord(X18TagId), "x18")  ## register x18
-    X19RvR = (ord(X19TagId), "x19")  ## register x19
-    X20RvR = (ord(X20TagId), "x20")  ## register x20
-    X21RvR = (ord(X21TagId), "x21")  ## register x21
-    X22RvR = (ord(X22TagId), "x22")  ## register x22
-    X23RvR = (ord(X23TagId), "x23")  ## register x23
-    X24RvR = (ord(X24TagId), "x24")  ## register x24
-    X25RvR = (ord(X25TagId), "x25")  ## register x25
-    X26RvR = (ord(X26TagId), "x26")  ## register x26
-    X27RvR = (ord(X27TagId), "x27")  ## register x27
-    X28RvR = (ord(X28TagId), "x28")  ## register x28
-    X29RvR = (ord(X29TagId), "x29")  ## register x29
-    X30RvR = (ord(X30TagId), "x30")  ## register x30
-    SpRvR = (ord(SpTagId), "sp")  ## stack pointer
-
-proc rawTagIsRv32Reg*(raw: TagEnum): bool {.inline.} =
-  raw >= X0TagId and raw <= SpTagId
 

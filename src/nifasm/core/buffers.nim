@@ -104,3 +104,35 @@ proc patchThumbMovwMovtPair*(buf: var Bytes; at: int; value: uint32) =
     buf[o + 1] = byte((hi shr 8) and 0xFF)
     buf[o + 2] = byte(lo and 0xFF)
     buf[o + 3] = byte((lo shr 8) and 0xFF)
+
+
+proc patchRvLuiAddiPair*(buf: var Bytes; at: int; value: uint32) =
+  ## Rewrite the immediates of a `lui`+`addi` pair at byte offset `at` so the pair
+  ## materializes `value`. The RV32 counterpart of `patchThumbMovwMovtPair`, and
+  ## here for the same reason: `relocs` needs it too, and one copy of a scatter
+  ## this easy to get subtly wrong is the whole point.
+  ##
+  ## `lui` takes the upper 20 bits at [31:12]; `addi` takes the lower 12 at
+  ## [31:20], SIGN-EXTENDED — which is why the upper part is rounded up when bit
+  ## 11 of the lower one is set. Without that round-up the pair is correct for
+  ## every value whose low 12 bits are under 0x800 and off by exactly 4096 for the
+  ## rest. (`rv32/encoder.splitHiLo` states the same rule; this cannot call it,
+  ## because that module imports this one.)
+  ##
+  ## Only the immediate fields are touched: `rd`, `rs1` and both opcodes are
+  ## preserved from whatever is already there, so the pair keeps naming whichever
+  ## register it was emitted for.
+  let hi20 = (value + 0x800'u32) shr 12
+  let lo12 = value - (hi20 shl 12)
+  for half in 0 ..< 2:
+    let o = at + 4 * half
+    var instr = uint32(buf[o]) or (uint32(buf[o + 1]) shl 8) or
+                (uint32(buf[o + 2]) shl 16) or (uint32(buf[o + 3]) shl 24)
+    if half == 0:
+      instr = (instr and 0x0000_0FFF'u32) or ((hi20 and 0xFFFFF'u32) shl 12)
+    else:
+      instr = (instr and 0x000F_FFFF'u32) or ((lo12 and 0xFFF'u32) shl 20)
+    buf[o]     = byte(instr and 0xFF)
+    buf[o + 1] = byte((instr shr 8) and 0xFF)
+    buf[o + 2] = byte((instr shr 16) and 0xFF)
+    buf[o + 3] = byte((instr shr 24) and 0xFF)

@@ -46,8 +46,12 @@ proc longSizeOf(kind: RelocKind): int {.inline.} =
   of rkTMovwMovt, rkTMovwMovtFunc: 8
   of rkAvrRjmp, rkAvrRcall, rkAvrBrcond: 2
   of rkAvrJmp, rkAvrCall, rkAvrLdiAddr: 4
-  of rkRvBranch, rkRvJal: 4
-  of rkRvAbsPair: 8
+  # RV32 sizes, so this stays exhaustive. Nothing here ever RUNS on RV32 —
+  # `isShrinkableX64` names only x86 forms, and the shortener is called from the
+  # x86-64 back end alone — but a `case` that compiles by omission is how the next
+  # size table silently gets one wrong.
+  of rkRvJ, rkRvJal, rkRvBranch: 4
+  of rkRvAuipcAddi, rkRvLuiAddi: 8
 
 proc shortJccOpcode(kind: RelocKind): byte =
   case kind

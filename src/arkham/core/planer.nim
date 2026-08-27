@@ -904,7 +904,7 @@ proc allocVarDecl(b: var Builder; n: var Cursor) =
       # rejects (osproc's `close`, 6 modules of `nimony n` on nimsem). In a call-free
       # proc x0 has no second role, and that is exactly where the payoff is anyway —
       # eliding the trailing `mov` and, with it, the frame.
-      let takeRet = b.md.arch in {Arm64, ThumbM} and name.len > 0 and name == b.returnedVar and
+      let takeRet = b.md.arch in {Arm64, ThumbM, Rv32} and name.len > 0 and name == b.returnedVar and
                     AllRegs in props and not b.an.hasCall and
                     not slot.isFloat and AddrTaken notin props and
                     slot.inRegClass and b.md.intRetReg in b.freeVol
@@ -1299,7 +1299,7 @@ proc seedPools(b: var Builder) =
   # Cortex-M answers like AArch64 — r0 is its return register and is likewise kept
   # out of both temp pools, so the same "drawn only by the returned local" property
   # holds.
-  if b.md.arch in {Arm64, ThumbM} and b.md.intRetReg != NoReg:
+  if b.md.arch in {Arm64, ThumbM, Rv32} and b.md.intRetReg != NoReg:
     b.freeVol.incl b.md.intRetReg
   for r in b.md.intCalleeSaved: b.freeCallee.incl r
   for f in b.md.floatTempRegs: b.freeVolF.incl f

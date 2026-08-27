@@ -138,7 +138,7 @@ register, a pair or a stack slot, every ALU form, the one-bit shifts,
   M6, and it is why a string literal is refused too.
 * **A comparison carries no type child**, unlike `(add T a b)` — and this
   backend read one anyway until the RV32 corpus sweep found the same mistake in
-  its twin. See doc/internals/rv32.md; the fix is shared in shape if not in code.
+  its twin. The RV32 backend (`src/arkham/risc/machine_rv32.nim`) meets the same shape; the fix is shared in shape if not in code.
 * **A narrow local is loaded and stored at its own width.** The two-byte form
   reads `name+1` as the high half, and for an `(i 8)` local that byte belongs to
   whatever the slot manager put next to it. A signed byte is widened with

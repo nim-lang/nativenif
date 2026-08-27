@@ -72,6 +72,8 @@ proc pickStagingSealed*(g: var CodeGen; what: string; slot: AsmSlot; avoid: Reg 
   ## reserved R11 bridge makes that near-impossible). `avoid` keeps the pick off a
   ## register the caller still needs live (e.g. an accumulator that is not a bound
   ## temp, so `pickStagingScratch`'s own filters would not otherwise exclude it).
+  when BridgeCheck:
+    if not g.bridgeTakeAllowed(): bridgeOverDeclared(g)
   result = g.pickStagingScratch(avoid)
   if result == NoReg:
     # Genuinely out of registers: every candidate is `avoid`, sealed, a live local
@@ -1009,6 +1011,7 @@ proc fcvtU2F*(g: var CodeGen; d: FReg; s: Reg; bits: int) =
   ##     a plain `shr` would make e.g. 2^64-1 come out as 2^64 exactly.
   ##
   ## `s` is only READ: it may be a live local's home register.
+  g.bridgeStep("an unsigned-to-float conversion", bdTwoInRegs)
   let lBig = g.freshLabel()
   let lDone = g.freshLabel()
   g.cmpZero s
@@ -1101,5 +1104,6 @@ proc emitLvalWalk*(g: var CodeGen; n: var Cursor; globBase: Location; isStore: b
     inc n
 
 proc emitLvalue2*(g: var CodeGen; c: Cursor; globBase = dontCare; isStore = false) =
+  g.bridgeStep("`emitLvalue2`")
   var n = c
   g.emitLvalWalk(n, globBase, isStore)
