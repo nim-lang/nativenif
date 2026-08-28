@@ -163,7 +163,9 @@ type
                                             ## a nil value, so its register binds to the asm
                                             ## `(nil)` type (not `(i 64)`) and emits `(nil)`.
     intType*: Cursor                        ## synthesized `(i 64)` — type of a bare IntLit
+                                            ## (`(i 32)` on a 4-byte-pointer target)
     uintType*: Cursor                       ## synthesized `(u 64)` — type of a bare UIntLit
+                                            ## (`(u 32)` on a 4-byte-pointer target)
     charType*: Cursor                       ## synthesized `(c 8)`  — type of a bare CharLit
     floatType*: Cursor                      ## synthesized `(f 64)` — type of a bare FloatLit
     boolType*: Cursor                       ## synthesized `(bool)` — type of a `(true)`/`(false)` literal
@@ -405,7 +407,7 @@ proc parsePragmas(c: var Cursor; importcN, exportcN: var string;
   var ignored = false
   parsePragmas(c, importcN, exportcN, intrinsic, ignored)
 
-proc parsePragmas(c: var Cursor; importcN, exportcN: var string) {.inline.} =
+proc parsePragmas*(c: var Cursor; importcN, exportcN: var string) {.inline.} =
   var ignored = NoIntrinsicOp
   parsePragmas(c, importcN, exportcN, ignored)
 
@@ -724,7 +726,8 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
         elif importcN in ["__builtin_ctzll", "__builtin_ctz",
                           "__builtin_clzll", "__builtin_clz",
                           "__builtin_popcountll", "__builtin_popcount",
-                          "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64"]:
+                          "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64",
+                          "__builtin_wasm_memory_size", "__builtin_wasm_memory_grow"]:
           # GCC bit builtin (count-trailing/leading-zeros, popcount, byte-swap):
           # lowered inline to a native bit instruction — no libc/extproc. See
           # genBitBuiltin. (nimony's `firstSetBit`/`countTrailingZeroBits` reach
@@ -866,7 +869,13 @@ proc lookupForeignDecl*(p: var Program; name: string; found: var bool): Cursor =
   ## A resolved decl is recorded in `requestedForeign` so nifasm links it.
   found = false
   let s = splitSymName(name)
-  if s.module.len == 0 or s.module == p.scheme.name: return
+  if s.module == p.scheme.name: return
+  if s.module.len == 0:
+    # A module-less symbol has no owning module to load from and the embedded
+    # index never lists single-dot names. Hexer hoists surviving proc-level
+    # consts to module-suffixed top-level decls, and the C-linkage gvars
+    # resolve through `gvarRefName` — nothing legitimate reaches here.
+    return
   let m = loadModule(p, s.module)
   if not hasDecl(m, name): return
   result = getDecl(m, name, p.tags, p.pool)
@@ -919,7 +928,8 @@ proc foreignCallTarget*(p: var Program; name: string): CallTarget =
   elif importcN in ["__builtin_ctzll", "__builtin_ctz",
                     "__builtin_clzll", "__builtin_clz",
                     "__builtin_popcountll", "__builtin_popcount",
-                    "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64"]:
+                    "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64",
+                    "__builtin_wasm_memory_size", "__builtin_wasm_memory_grow"]:
     result = CallTarget(bitBuiltin: importcN, retType: retType, sigType: sigType)
   elif not p.darwin and not p.windows and importcN.len > 0 and lookupSyscall(importcN).found:
     let (_, x64Nr, a64Nr) = lookupSyscall(importcN)
@@ -1043,6 +1053,9 @@ proc unionSizeAlign(p: var Program; unionc: Cursor): (int, int) =
   ## A `{.union.}`'s children are `(object …)` / `(fld …)` nodes directly; an object
   ## VARIANT's are `(of RANGES BODY)` / `(else BODY)` branches whose body is the
   ## `(object …)` (or `.` when the branch declares no fields, contributing nothing).
+  ## A bare `(fld :name pragmas type)` child — a plain C-style union, e.g. an
+  ## allocator free-list header — is a DECLARATION, not a type, so it is sized by
+  ## its field type rather than handed to `typeSizeAlign` directly.
   var uc = unionc
   var maxSz = 0
   var maxAl = 1
@@ -1050,7 +1063,16 @@ proc unionSizeAlign(p: var Program; unionc: Cursor): (int, int) =
     while uc.hasMore:
       let bodyc = unionBranchBody(uc)
       if bodyc.kind != DotToken:
-        let (bsz, bal) = typeSizeAlign(p, bodyc)
+        var bsz = 0
+        var bal = 1
+        if bodyc.kind == TagLit and bodyc.substructureKind == FldU:
+          var fc = bodyc
+          fc.into:
+            inc fc; skip fc                     # name, field-pragmas
+            (bsz, bal) = typeSizeAlign(p, fc); skip fc
+            while fc.hasMore: skip fc           # trailing extras (offsets etc.)
+        else:
+          (bsz, bal) = typeSizeAlign(p, bodyc)  # an (object …) branch
         if bsz > maxSz: maxSz = bsz
         if bal > maxAl: maxAl = bal
       skip uc
@@ -1297,6 +1319,23 @@ proc fieldType*(p: var Program; objType: Cursor; field: string): Cursor =
   ## The structural type cursor of `field` in a resolved `(object …)` type.
   ## An inherited field (the Leng `(dot base field depth)` selector counts the
   ## base levels) is resolved by recursing into the object's base type.
+  ## Plain C unions (`(union (fld …)+)`, e.g. the input-event union) are
+  ## selected into directly — every member overlays at the union's base.
+  if objType.kind == TagLit and objType.typeKind == UnionT:
+    var uc = objType
+    uc.into:
+      while uc.hasMore:
+        if uc.kind == TagLit and uc.substructureKind == FldU:
+          var fn = ""
+          var fc = uc
+          fc.into:
+            fn = symName(fc); inc fc
+            skip fc                             # field-pragmas
+            result = fc; skip fc
+            while fc.hasMore: skip fc
+          if fn == field: return
+        skip uc
+    raiseAssert "arkham: field '" & field & "' not found in union"
   assert objType.kind == TagLit and objType.typeKind == ObjectT,
     "arkham: field access requires an object type (field " & field &
     ", base resolves to " & toString(objType, includeLineInfo = false) & ")"

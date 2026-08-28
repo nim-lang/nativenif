@@ -342,6 +342,113 @@ proc buildToolchain() =
   ## for, and the fix is to stop having a build be a side effect of a test.
   exec "nim c --hints:off src/arkham/arkham.nim"   # `--outdir: bin` in its nim.cfg
   exec "nim c --hints:off -o:bin/nifasm src/nifasm/nifasm.nim"
+  # `bin/ithaqua` for the same reason, and for one more: ithaqua compiles
+  # against arkham's `core/` program model without living under it, so a rename
+  # or a signature change in `core/` breaks it and NOTHING ELSE in this repo
+  # notices. That is not hypothetical — it is how ithaqua arrived: a merge left
+  # `typeToSlot` calls passing an argument its callee no longer took, and the
+  # backend simply did not compile.
+  exec "nim c --hints:off src/ithaqua/ithaqua.nim"
+
+proc requiredExe(name, what: string): string =
+  ## `findExe` for a runner a suite needs, with one extra job.
+  ##
+  ## Missing, the suite SKIPS — the right answer on a developer machine that has
+  ## no emulator for some target, and exactly the wrong one in CI, where a skipped
+  ## suite reports success and the coverage is simply gone. That is not
+  ## hypothetical: before this existed, the workflow installed `qemu-system-arm`
+  ## and nothing else, so every RV32 suite, all 219 `linux_arm64` run tests and the
+  ## a64 stress pass skipped on every push, and the run was green.
+  ##
+  ## `NIFASM_REQUIRE_QEMU=1` turns every such skip into a failure. CI sets it, so a
+  ## package rename — `qemu-system-misc` became `qemu-system-riscv` between Ubuntu
+  ## releases — breaks the build instead of quietly emptying it.
+  result = findExe(name)
+  if result.len == 0 and getEnv("NIFASM_REQUIRE_QEMU") == "1":
+    quit "FAILURE: `" & name & "` not found and NIFASM_REQUIRE_QEMU=1, so " &
+         what & " would be SKIPPED. A skipped suite reports success — that is " &
+         "what this guard exists to prevent. Install it, or unset the variable " &
+         "to accept the gap."
+
+const ithaquaUnsupported: seq[string] = @[
+  # Fixtures ithaqua is EXPECTED to refuse, checked as refusals so that the
+  # emit pass over the rest can be an unconditional "must succeed".
+  #
+  # 1. Target-pinned `(instr …)` rows. wasm has no flags, no register ties and
+  #    no named machine instructions, so these cannot lower — and ithaqua says
+  #    so by name rather than emitting something plausible.
+  "a64_vec_instr", "assembler_a64", "assembler_x64", "atomic2", "cpurelax",
+  "err_flag_outside_asm", "err_flag_value", "err_inout_dest", "err_inout_value",
+  "err_nonflag_cond", "intrinsics", "intrinsics_x64", "naked_stacktrace_x64",
+  "volatile_access",
+  # 2. Not whole programs. The `mod_*` fixtures are foreign helper MODULES that
+  #    other fixtures import; they declare no `exportc "main"`, and ithaqua is
+  #    whole-program — it starts from an entry proc or it has nothing to do.
+  "mod_clinkage", "mod_glib", "mod_vtab", "mod_xlib",
+  # 3. `ulock_wake` is a Darwin syscall fixture: the syscall has no host import
+  #    to map onto, so the proc has no definition to emit.
+  "ulock_wake",
+  # 4. Genuine gaps, listed so they read as a TODO rather than as a policy.
+  #    Each one aborts loudly today; none of them miscompiles.
+  "aconstr_lvalue_base",      # an `oconstr` used as an lvalue base
+  "const_rodata_reloc_obj",   # const initializer ithaqua cannot fold
+  "float_const_conv",         # ditto, through a float conversion
+  "float_special_values",     # inf/nan bit patterns squeezed through an int32
+  "mul_overflow",             # an `(i 64)` literal wider than int32
+  "overflow_check",           # `keepovf` operand walk hits a non-tag cursor
+]
+
+proc ithaquaTests() =
+  ## ithaqua — the wasm32 back end — over the same hand-written Leng corpus
+  ## arkham runs, plus `wasmenc`'s own encoder tests.
+  ##
+  ## EMIT ONLY: each fixture must produce a file that starts with the wasm
+  ## magic, and the `ithaquaUnsupported` ones must be refused. Nothing here
+  ## RUNS a module. That is deliberate — the differential harness that executes
+  ## wasm against the native backend as its oracle lives in nimony
+  ## (`hastur wasmdiff`, see doc/ithaqua.md), where the front end that produces
+  ## realistic input also lives. What this pass buys is the thing nimony's
+  ## harness cannot see: that ithaqua still COMPILES against, and agrees with,
+  ## the `core/` program model in this repo, over 200-odd fixtures, on every
+  ## platform in the matrix.
+  discard requiredExe("node", "the wasmenc engine (validate + instantiate) checks")
+  # `showProgress`, so `twasmenc`'s own summary line — which says whether the
+  # two engine-judged blocks ran or were skipped for want of node — reaches the
+  # log. Swallowed, the skip it exists to announce would be invisible.
+  exec("nim c -r --hints:off src/ithaqua/twasmenc.nim", showProgress = true)
+
+  let ithaqua = ("bin" / "ithaqua").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham" / "nimcache"
+  createDir workDir
+  const WasmMagic = "\x00asm\x01\x00\x00\x00"
+  var passed = 0
+  var refused = 0
+  var total = 0
+  for file in walkFiles("tests" / "arkham" / "*.c.nif"):
+    let stem = file.extractFilename.changeFileExt("").changeFileExt("")
+    inc total
+    let wasm = workDir / (stem & ".wasm")
+    removeFile wasm
+    let (o, code) = execCmdEx(quoteShell(ithaqua) & " -o:" & quoteShell(wasm) &
+                              " " & quoteShell(file))
+    if stem in ithaquaUnsupported:
+      if code == 0:
+        quit "FAILURE ithaqua: " & file & " is listed in `ithaquaUnsupported` " &
+             "but now compiles. Delete the entry — the list is there to keep " &
+             "the emit pass unconditional, not to hide progress."
+      inc refused
+      continue
+    if code != 0:
+      quit "FAILURE ithaqua (wasm32 codegen) " & file & "\n" & o
+    if not fileExists(wasm):
+      quit "FAILURE ithaqua: " & file & " exited 0 but wrote no module"
+    let bytes = readFile(wasm)
+    if bytes.len < 8 or bytes[0 ..< 8] != WasmMagic:
+      quit "FAILURE ithaqua: " & file & " produced no wasm magic/version header"
+    removeFile wasm
+    inc passed
+  echo passed, " / ", total - refused, " ithaqua wasm32 emit tests successful (",
+       refused, " refused as expected)"
 
 proc arkhamTests() =
   ## Each `tests/arkham/*.c.nif` is hand-written Leng: arkham generates asm-NIF,
@@ -601,25 +708,6 @@ const arkhamLinuxA64Unsupported: seq[string] = @[
   # opens, then re-emits `(at base idx [scratch])` for nifasm to fold. Add a test's
   # stem here if a new arm64-only TODO is introduced.
 
-proc requiredExe(name, what: string): string =
-  ## `findExe` for a runner a suite needs, with one extra job.
-  ##
-  ## Missing, the suite SKIPS — the right answer on a developer machine that has
-  ## no emulator for some target, and exactly the wrong one in CI, where a skipped
-  ## suite reports success and the coverage is simply gone. That is not
-  ## hypothetical: before this existed, the workflow installed `qemu-system-arm`
-  ## and nothing else, so every RV32 suite, all 219 `linux_arm64` run tests and the
-  ## a64 stress pass skipped on every push, and the run was green.
-  ##
-  ## `NIFASM_REQUIRE_QEMU=1` turns every such skip into a failure. CI sets it, so a
-  ## package rename — `qemu-system-misc` became `qemu-system-riscv` between Ubuntu
-  ## releases — breaks the build instead of quietly emptying it.
-  result = findExe(name)
-  if result.len == 0 and getEnv("NIFASM_REQUIRE_QEMU") == "1":
-    quit "FAILURE: `" & name & "` not found and NIFASM_REQUIRE_QEMU=1, so " &
-         what & " would be SKIPPED. A skipped suite reports success — that is " &
-         "what this guard exists to prevent. Install it, or unset the variable " &
-         "to accept the gap."
 
 proc arkhamQemuTests() =
   ## Cross-validate the AArch64 backend on Linux: emit each `tests/arkham/*.c.nif`
@@ -681,6 +769,10 @@ proc arkhamQemuTests() =
 # BEFORE anything that runs them, and unconditionally: a suite that skips still
 # leaves the next one needing these, and not every suite here can skip.
 buildToolchain()
+
+# ithaqua: host-independent (it emits wasm, it does not run it), so it runs
+# everywhere in the matrix rather than only where the output executes.
+ithaquaTests()
 
 when defined(macosx):
   exec "nim c -r src/nifasm/nifasm tests/hello_darwin.nif"
