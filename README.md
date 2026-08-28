@@ -12,7 +12,8 @@ nimony's [doc/leng-spec.md](https://github.com/nim-lang/nimony/blob/master/doc/l
 
 ```
 foo.c.nif  --[ arkham ]-->  foo.asm.nif  --[ nifasm ]-->  foo (executable)
-  Leng                       typed asm-NIF
+  Leng     \                 typed asm-NIF
+            `-[ ithaqua ]->  foo.wasm
 ```
 
 * **`src/arkham`** — the code generator: Leng in, typed asm-NIF out. Simple
@@ -22,8 +23,12 @@ foo.c.nif  --[ arkham ]-->  foo.asm.nif  --[ nifasm ]-->  foo (executable)
 * **`src/nifasm`** — the assembler *and* the linker: it type-checks the asm-NIF,
   encodes it, and writes the finished ELF / Mach-O / PE image itself. See
   [doc/nifasm.md](doc/nifasm.md).
+* **`src/ithaqua`** — the wasm32 code generator: Leng in, one self-contained
+  `.wasm` binary out. Both halves in one tool, because a wasm module *is* the
+  link step. See [doc/ithaqua.md](doc/ithaqua.md).
 
-Targets: `linux/amd64`, `windows/amd64`, `linux/arm64`, `macosx/arm64`.
+Targets: `linux/amd64`, `windows/amd64`, `linux/arm64`, `macosx/arm64`,
+plus the bare-metal `arm32` / `riscv32` / `avr` ones and `wasm32`.
 
 ## Also here
 
@@ -38,7 +43,8 @@ sibling directory (`../nimony`). Then, from the repository root:
 ```sh
 nim c src/arkham/arkham.nim      # -> bin/arkham
 nim c src/nifasm/nifasm.nim      # -> src/nifasm/nifasm
-nim r tests/tester.nim           # builds both and runs the whole corpus
+nim c src/ithaqua/ithaqua.nim    # -> bin/ithaqua
+nim r tests/tester.nim           # builds all three and runs the whole corpus
 ```
 
 ## Documentation
@@ -50,3 +56,7 @@ nim r tests/tester.nim           # builds both and runs the whole corpus
 | [doc/instructions.md](doc/instructions.md) | the complete asm-NIF tag vocabulary (generated from) |
 | [doc/tracetable.md](doc/tracetable.md) | the runtime stack-trace table `getStackTrace()` reads |
 | [src/arkham/design.md](src/arkham/design.md) | arkham's register strategy |
+| [doc/ithaqua.md](doc/ithaqua.md) | the wasm32 back end: lowering model, host ABI, verification |
+| [doc/internals/terms.md](doc/internals/terms.md) | glossary: `bridge`, `home`, `volatile`, `eightbyte`, … |
+| [doc/internals/avr.md](doc/internals/avr.md) | the AVR target: register pairs, ABI, milestones |
+| [tests/arkham_rv32/README.md](tests/arkham_rv32/README.md) | the RISC-V 32 target: bare-metal RV32IMAFD under qemu-system-riscv32, and what its corpus shares with Cortex-M |

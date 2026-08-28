@@ -30,7 +30,7 @@
 
 import std / [tables, sets, assertions, strutils, os, syncio]
 import nifcore, nifcdecl, nifcoreparse
-import slots, programs, typenav
+import "../arkham/core" / [asmslots, programs, typenav]
 import wasmenc
 
 const
@@ -2942,7 +2942,8 @@ proc generateWasm*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                    externsOut: ptr seq[(string, Cursor)] = nil): seq[byte] =
   var g = WasmGen(tags: tags, memTop: NullGuard, nextFunc: uint32(HostImports.len))
   g.collectExterns = collectExterns
-  g.prog = collect(buf, inputPath, tags, ptrSize = WasmPtrSize)
+  setTargetWord Wasm32             # wasm32: 4-byte pointers/platform int, i64/f64 scalars
+  g.prog = collect(buf, inputPath, tags)
   g.callTarget = g.prog.callTarget
   g.globals = g.prog.globals
   g.tvars = g.prog.tvars
@@ -3103,15 +3104,25 @@ proc generateWasm*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   discard g.wm.addGlobal(ValI32, mutable = true, zeroInit.data)  # 1: errv
   discard g.wm.addGlobal(ValI32, mutable = true, zeroInit.data)  # 2: ovf
 
-  # _start: call main(0, nil, nil), drop the exit code
-  # (the entry's C signature is (argc, argv, envp) — see the Leng `main`)
+  # _start: call the entry with a zero for every parameter it declares, and
+  # drop whatever it returns. hexer gives `main` the C `(argc, argv, envp)`
+  # signature, but the shape is READ OFF the decl rather than assumed: a
+  # mismatch here is not a runtime surprise, it is an invalid module — surplus
+  # arguments are still on the stack at `_start`'s `end`, and a missing one
+  # underflows — and the engine reports it as a bare "type mismatch" with no
+  # hint that the entry's arity is what disagreed.
+  let (entryParams, entryResults) = procSigTypes(g, entryDecl, isProctype = false)
   var startBody = ByteBuf()
-  startBody.add OpI32Const; startBody.addI32 0
-  startBody.add OpI32Const; startBody.addI32 0
-  startBody.add OpI32Const; startBody.addI32 0
+  for vt in entryParams:
+    case vt
+    of ValI64: startBody.add OpI64Const; startBody.addI64 0
+    of ValF32: startBody.add OpF32Const; startBody.addF32 0'f32
+    of ValF64: startBody.add OpF64Const; startBody.addF64 0'f64
+    else:      startBody.add OpI32Const; startBody.addI32 0
   startBody.add OpCall
   startBody.addU32 g.funcIdx[g.entrySym]
-  startBody.add OpDrop
+  for _ in entryResults:
+    startBody.add OpDrop
   let startTi = g.wm.addFuncType(newSeq[byte](), newSeq[byte]())
   let startFi = g.wm.addFunction(startTi)
   g.wm.addCode(@[], startBody.data)

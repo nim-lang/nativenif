@@ -6,8 +6,8 @@ from "../../nimony/src/lib/intrinsics" import nil
 # The AArch64 encoders, for the byte-level checks below. Importing the module is
 # what lets a test assert an ENCODING rather than a program's output — the only
 # way to check a sequence whose whole point is that running it changes nothing.
-import "../src/nifasm/arm64"
-import "../src/nifasm/buffers"
+import "../src/nifasm/arm64/encoder"
+import "../src/nifasm/core/buffers"
 
 const
   runTimeoutMs = 30_000
@@ -342,6 +342,113 @@ proc buildToolchain() =
   ## for, and the fix is to stop having a build be a side effect of a test.
   exec "nim c --hints:off src/arkham/arkham.nim"   # `--outdir: bin` in its nim.cfg
   exec "nim c --hints:off -o:bin/nifasm src/nifasm/nifasm.nim"
+  # `bin/ithaqua` for the same reason, and for one more: ithaqua compiles
+  # against arkham's `core/` program model without living under it, so a rename
+  # or a signature change in `core/` breaks it and NOTHING ELSE in this repo
+  # notices. That is not hypothetical — it is how ithaqua arrived: a merge left
+  # `typeToSlot` calls passing an argument its callee no longer took, and the
+  # backend simply did not compile.
+  exec "nim c --hints:off src/ithaqua/ithaqua.nim"
+
+proc requiredExe(name, what: string): string =
+  ## `findExe` for a runner a suite needs, with one extra job.
+  ##
+  ## Missing, the suite SKIPS — the right answer on a developer machine that has
+  ## no emulator for some target, and exactly the wrong one in CI, where a skipped
+  ## suite reports success and the coverage is simply gone. That is not
+  ## hypothetical: before this existed, the workflow installed `qemu-system-arm`
+  ## and nothing else, so every RV32 suite, all 219 `linux_arm64` run tests and the
+  ## a64 stress pass skipped on every push, and the run was green.
+  ##
+  ## `NIFASM_REQUIRE_QEMU=1` turns every such skip into a failure. CI sets it, so a
+  ## package rename — `qemu-system-misc` became `qemu-system-riscv` between Ubuntu
+  ## releases — breaks the build instead of quietly emptying it.
+  result = findExe(name)
+  if result.len == 0 and getEnv("NIFASM_REQUIRE_QEMU") == "1":
+    quit "FAILURE: `" & name & "` not found and NIFASM_REQUIRE_QEMU=1, so " &
+         what & " would be SKIPPED. A skipped suite reports success — that is " &
+         "what this guard exists to prevent. Install it, or unset the variable " &
+         "to accept the gap."
+
+const ithaquaUnsupported: seq[string] = @[
+  # Fixtures ithaqua is EXPECTED to refuse, checked as refusals so that the
+  # emit pass over the rest can be an unconditional "must succeed".
+  #
+  # 1. Target-pinned `(instr …)` rows. wasm has no flags, no register ties and
+  #    no named machine instructions, so these cannot lower — and ithaqua says
+  #    so by name rather than emitting something plausible.
+  "a64_vec_instr", "assembler_a64", "assembler_x64", "atomic2", "cpurelax",
+  "err_flag_outside_asm", "err_flag_value", "err_inout_dest", "err_inout_value",
+  "err_nonflag_cond", "intrinsics", "intrinsics_x64", "naked_stacktrace_x64",
+  "volatile_access",
+  # 2. Not whole programs. The `mod_*` fixtures are foreign helper MODULES that
+  #    other fixtures import; they declare no `exportc "main"`, and ithaqua is
+  #    whole-program — it starts from an entry proc or it has nothing to do.
+  "mod_clinkage", "mod_glib", "mod_vtab", "mod_xlib",
+  # 3. `ulock_wake` is a Darwin syscall fixture: the syscall has no host import
+  #    to map onto, so the proc has no definition to emit.
+  "ulock_wake",
+  # 4. Genuine gaps, listed so they read as a TODO rather than as a policy.
+  #    Each one aborts loudly today; none of them miscompiles.
+  "aconstr_lvalue_base",      # an `oconstr` used as an lvalue base
+  "const_rodata_reloc_obj",   # const initializer ithaqua cannot fold
+  "float_const_conv",         # ditto, through a float conversion
+  "float_special_values",     # inf/nan bit patterns squeezed through an int32
+  "mul_overflow",             # an `(i 64)` literal wider than int32
+  "overflow_check",           # `keepovf` operand walk hits a non-tag cursor
+]
+
+proc ithaquaTests() =
+  ## ithaqua — the wasm32 back end — over the same hand-written Leng corpus
+  ## arkham runs, plus `wasmenc`'s own encoder tests.
+  ##
+  ## EMIT ONLY: each fixture must produce a file that starts with the wasm
+  ## magic, and the `ithaquaUnsupported` ones must be refused. Nothing here
+  ## RUNS a module. That is deliberate — the differential harness that executes
+  ## wasm against the native backend as its oracle lives in nimony
+  ## (`hastur wasmdiff`, see doc/ithaqua.md), where the front end that produces
+  ## realistic input also lives. What this pass buys is the thing nimony's
+  ## harness cannot see: that ithaqua still COMPILES against, and agrees with,
+  ## the `core/` program model in this repo, over 200-odd fixtures, on every
+  ## platform in the matrix.
+  discard requiredExe("node", "the wasmenc engine (validate + instantiate) checks")
+  # `showProgress`, so `twasmenc`'s own summary line — which says whether the
+  # two engine-judged blocks ran or were skipped for want of node — reaches the
+  # log. Swallowed, the skip it exists to announce would be invisible.
+  exec("nim c -r --hints:off src/ithaqua/twasmenc.nim", showProgress = true)
+
+  let ithaqua = ("bin" / "ithaqua").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham" / "nimcache"
+  createDir workDir
+  const WasmMagic = "\x00asm\x01\x00\x00\x00"
+  var passed = 0
+  var refused = 0
+  var total = 0
+  for file in walkFiles("tests" / "arkham" / "*.c.nif"):
+    let stem = file.extractFilename.changeFileExt("").changeFileExt("")
+    inc total
+    let wasm = workDir / (stem & ".wasm")
+    removeFile wasm
+    let (o, code) = execCmdEx(quoteShell(ithaqua) & " -o:" & quoteShell(wasm) &
+                              " " & quoteShell(file))
+    if stem in ithaquaUnsupported:
+      if code == 0:
+        quit "FAILURE ithaqua: " & file & " is listed in `ithaquaUnsupported` " &
+             "but now compiles. Delete the entry — the list is there to keep " &
+             "the emit pass unconditional, not to hide progress."
+      inc refused
+      continue
+    if code != 0:
+      quit "FAILURE ithaqua (wasm32 codegen) " & file & "\n" & o
+    if not fileExists(wasm):
+      quit "FAILURE ithaqua: " & file & " exited 0 but wrote no module"
+    let bytes = readFile(wasm)
+    if bytes.len < 8 or bytes[0 ..< 8] != WasmMagic:
+      quit "FAILURE ithaqua: " & file & " produced no wasm magic/version header"
+    removeFile wasm
+    inc passed
+  echo passed, " / ", total - refused, " ithaqua wasm32 emit tests successful (",
+       refused, " refused as expected)"
 
 proc arkhamTests() =
   ## Each `tests/arkham/*.c.nif` is hand-written Leng: arkham generates asm-NIF,
@@ -601,6 +708,7 @@ const arkhamLinuxA64Unsupported: seq[string] = @[
   # opens, then re-emits `(at base idx [scratch])` for nifasm to fold. Add a test's
   # stem here if a new arm64-only TODO is introduced.
 
+
 proc arkhamQemuTests() =
   ## Cross-validate the AArch64 backend on Linux: emit each `tests/arkham/*.c.nif`
   ## as `linux_arm64` (static ELF, svc syscalls), assemble with nifasm, and run it
@@ -608,7 +716,7 @@ proc arkhamQemuTests() =
   ## native pass uses. This lets the arm64 path be exercised end-to-end on an x86-64
   ## Linux host (the Darwin/Mach-O binaries can only run on macOS). Skipped silently
   ## when qemu is not installed.
-  let qemu = findExe("qemu-aarch64")
+  let qemu = requiredExe("qemu-aarch64", "the linux_arm64 run tests")
   if qemu.len == 0:
     echo "qemu-aarch64 not found — skipping linux_arm64 run tests " &
          "(install: sudo apt-get install qemu-user)"
@@ -661,6 +769,10 @@ proc arkhamQemuTests() =
 # BEFORE anything that runs them, and unconditionally: a suite that skips still
 # leaves the next one needing these, and not every suite here can skip.
 buildToolchain()
+
+# ithaqua: host-independent (it emits wasm, it does not run it), so it runs
+# everywhere in the matrix rather than only where the output executes.
+ithaquaTests()
 
 when defined(macosx):
   exec "nim c -r src/nifasm/nifasm tests/hello_darwin.nif"
@@ -844,6 +956,14 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/mem_slot_offset_range.nif", 
 execExpectFailure("nim c -r src/nifasm/nifasm tests/mem_slot_offset_range_basefree.nif", "offset 16 is outside stack slot 'p.0' (16 bytes)")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_mem_slot_offset_range.nif", "offset 16 is outside stack slot 'p.0' (16 bytes)")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/cortex_m_mem_slot_offset_range.nif", "offset 8 is outside stack slot 'p.0' (8 bytes)")
+# The RV32 compare fusion's invariant, which is what makes it sound rather than
+# merely convenient: a `(cmp …)` emits nothing, so the branch that reads it must
+# still see the registers it named. Both halves are checked — that a compare is
+# there at all, and that nothing emitted code in between.
+execExpectFailure("nim c -r src/nifasm/nifasm tests/riscv32_cmp_not_adjacent.nif",
+                  "instructions were emitted between `(cmp")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/riscv32_cmp_missing.nif",
+                  "this ISA has no condition flags")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/cast_dest_reg.nif", "Expected memory destination")
 # The sub-width width-cast destination is an ALU-only exception: `mov` keeps the
 # strict rule, so the pointer-store protection cannot be casted away.
@@ -955,7 +1075,7 @@ proc thumb2SelfTest() =
   ## whatever the backend emits, so "the result is right" checks the encoding at
   ## exactly the level that matters — and it exercises the branch encoders and the
   ## relocation patcher too, which a byte-comparison could not.
-  let qemu = findExe(cortexMQemu)
+  let qemu = requiredExe(cortexMQemu, "the Cortex-M suites")
   if qemu.len == 0:
     echo cortexMQemu, " not found - skipping Thumb-2 encoder self-test " &
          "(install: sudo apt-get install qemu-system-arm)"
@@ -978,6 +1098,518 @@ proc thumb2SelfTest() =
   echo "Thumb-2 encoder self-test successful (all checks passed)"
 
 
+const avrSim = "bin" / "avrtest"
+
+proc avrSelfTest() =
+  ## Build the AVR encoder's self-checking image and run it. The image computes
+  ## 59 expressions and exits with the 1-based index of the first whose result
+  ## differs from the expected value, so a failure NAMES the broken encoding.
+  ##
+  ## Then the same image is built 59 more times, each with one check's EXPECTED
+  ## value corrupted, and each of those must fail with exactly that index. That
+  ## sweep is what makes the first run mean something: a check whose emitter
+  ## writes no bytes at all, or which compares against a value the harness itself
+  ## left in the pair, passes the plain run and says nothing.
+  ##
+  ## AVRtest is built from source rather than installed — see doc/internals/avr.md.
+  if not fileExists(avrSim):
+    echo avrSim, " not found - skipping AVR encoder self-test ",
+         "(build it: see doc/internals/avr.md)"
+    return
+  let gen = ("bin" / "avr_selftest").addFileExt(ExeExt)
+  exec "nim c --hints:off --warnings:off -o:" & gen & " tests/avr_selftest.nim"
+  let elf = "tests" / "avr_selftest.elf"
+
+  proc runImage(): (string, int) =
+    var args = @["-q", "-mmcu=avr5", "-s", "32k", elf]
+    runProgram(avrSim, args)
+
+  exec quoteShell(gen) & " " & quoteShell(elf)
+  let (output, code) = runImage()
+  if code == timeoutExitCode:
+    quit "FAILURE (TIMEOUT) AVR encoder self-test\n"
+  if code != 0:
+    quit "FAILURE AVR encoder self-test: check #" & $code &
+         " produced the wrong value\n" & output &
+         "\n(run `" & gen & " --list` to name the checks by index)"
+
+  let (listing, listCode) = runProgram(gen, @["--list"])
+  if listCode != 0: quit "FAILURE AVR encoder self-test: --list failed"
+  let total = listing.strip.splitLines.len
+  for i in 1 .. total:
+    exec quoteShell(gen) & " " & quoteShell(elf) & " --mutate:" & $i
+    let (_, mutCode) = runImage()
+    if mutCode != i:
+      quit "FAILURE AVR encoder self-test: check #" & $i &
+           " does not detect its own mutation (exited " & $mutCode &
+           ", expected " & $i & ") — it is passing vacuously"
+  removeFile elf
+  echo "AVR encoder self-test successful (", total,
+       " checks, each verified to detect its own mutation)"
+
+
+proc avrAsmTests() =
+  ## Assemble hand-written AVR asm-NIF with nifasm and run the resulting firmware
+  ## under AVRtest. This is the END-TO-END gate for the instruction selector: the
+  ## encoder self-test proves the ENCODINGS, but only these exercise the operand
+  ## model, the register-binding table, the relocation patching and the ELF32
+  ## image together.
+  ##
+  ## Each fixture exits with a value it COMPUTED, so a wrong encoding shows up as
+  ## a wrong exit code rather than as output that happens to look right.
+  if not fileExists(avrSim):
+    echo avrSim, " not found - skipping AVR assembler tests"
+    return
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  const fixtures = [("hello_avr", 0, "Hello AVR\n"),
+                    ("avr_alu", 158, ""),
+                    ("avr_branch", 42, ""),
+                    ("avr_loop", 45, ""),
+                    ("avr_frame", 42, ""),
+                    ("avr_call", 42, "")]
+  var passed = 0
+  for (stem, wantCode, wantOut) in fixtures:
+    let src = "tests" / (stem & ".nif")
+    let elf = "tests" / (stem & ".elf")
+    exec quoteShell(nifasmExe) & " -o:" & quoteShell(elf) & " " & quoteShell(src)
+    let (output, code) = runProgram(avrSim,
+      @["-q", "-mmcu=avr5", "-s", "32k", elf])
+    if code == timeoutExitCode:
+      quit "FAILURE (TIMEOUT) avr " & stem & "\n"
+    if code != wantCode:
+      quit "FAILURE avr " & stem & ": exit " & $code & ", want " &
+           $wantCode & "\n" & output
+    if output != wantOut:
+      quit "FAILURE avr " & stem & " output\nExpected: " & escape(wantOut) &
+           "\nGot:      " & escape(output)
+    removeFile elf
+    inc passed
+  echo passed, " / ", fixtures.len, " AVR assembler tests successful"
+
+
+const rv32Qemu = "qemu-system-riscv32"
+const rv32Args = ["-M", "virt", "-bios", "none",
+                  "-display", "none", "-serial", "none", "-monitor", "none",
+                  "-semihosting-config", "enable=on,target=native",
+                  "-kernel"]
+  ## The canonical RV32 runner. `-bios none` is load-bearing: without it QEMU
+  ## loads OpenSBI first, which owns M-mode and enters the payload in S-mode —
+  ## where `mstatus`, `mtvec` and the semihosting `ebreak` all behave differently
+  ## from what a bare-metal image assumes.
+  ##
+  ## Unlike the Cortex-M runner this needs no `-chardev` routing, because nothing
+  ## here writes to a semihosting console: each fixture reports by EXIT CODE.
+
+proc rv32SelfTest() =
+  ## Build the RV32 encoder's self-checking image and run it. The image computes
+  ## ~106 expressions and exits with the 1-based index of the first whose result
+  ## differs from the expected value, so a failure NAMES the broken encoding
+  ## rather than just producing a wrong number somewhere.
+  ##
+  ## The same oracle argument as `thumb2SelfTest`: QEMU ships no disassembler in
+  ## this configuration, but its DECODER is the one that will run whatever the
+  ## backend emits. It also covers the branch relaxation and the `auipc`/`lui`
+  ## relocation patchers, which a byte-comparison could not reach.
+  let qemu = requiredExe(rv32Qemu, "the RV32 suites")
+  if qemu.len == 0:
+    echo rv32Qemu, " not found - skipping RV32 encoder self-test " &
+         "(install: sudo apt-get install qemu-system-misc)"
+    return
+  let gen = ("bin" / "rv32_selftest").addFileExt(ExeExt)
+  exec "nim c --hints:off --warnings:off -o:" & gen & " tests/rv32_selftest.nim"
+  let elf = "tests" / "rv32_selftest.elf"
+  exec quoteShell(gen) & " " & quoteShell(elf)
+  var args: seq[string] = @[]
+  for a in rv32Args: args.add a
+  args.add elf
+  let (output, code) = runProgram(qemu, args)
+  if code == timeoutExitCode:
+    quit "FAILURE (TIMEOUT) RV32 encoder self-test\n" & output &
+         "\n(a hang, not a wrong answer: an instruction trapped into an unset " &
+         "`mtvec`. The usual cause is a floating-point instruction reached " &
+         "before `mstatus.FS` was set — see `emitEnableFpu`.)"
+  if code != 0:
+    quit "FAILURE RV32 encoder self-test: check #" & $code &
+         " produced the wrong value\n" & output &
+         "\n(run `" & gen & " x.elf` to list the checks by index, or " &
+         "`" & gen & " x.elf N` to build an image that stops after check N)"
+  removeFile elf
+  echo "RV32 encoder self-test successful (all checks passed)"
+
+
+proc rv32AsmTests() =
+  ## Assemble hand-written RV32 asm-NIF with nifasm and run the resulting firmware
+  ## under QEMU. This is the END-TO-END gate for the instruction selector: the
+  ## encoder self-test above proves the ENCODINGS, but only these exercise the
+  ## operand model, the compare fusion, the register-binding table, the
+  ## relocation patching and the ELF32 image together.
+  ##
+  ## Each fixture exits with a value it COMPUTED, so a wrong encoding shows up as
+  ## a wrong exit code rather than as output that happens to look right. The
+  ## branch and float fixtures go further and exit with the NUMBER of sub-checks
+  ## that passed, so a failure narrows itself.
+  let qemu = requiredExe(rv32Qemu, "the RV32 suites")
+  if qemu.len == 0:
+    echo rv32Qemu, " not found - skipping RV32 assembler tests"
+    return
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  const fixtures = ["riscv32_alu", "riscv32_call", "riscv32_stackargs",
+                    "riscv32_global", "riscv32_branch", "riscv32_float"]
+  var passed = 0
+  for name in fixtures:
+    let src = "tests" / (name & ".nif")
+    let elf = "tests" / (name & ".elf")
+    let (ao, ac) = execCmdEx(quoteShell(nifasmExe) & " -o:" & quoteShell(elf) &
+                             " " & quoteShell(src))
+    if ac != 0:
+      quit "FAILURE (RV32 assemble) " & name & "\n" & ao
+    var args: seq[string] = @[]
+    for a in rv32Args: args.add a
+    args.add elf
+    let (output, code) = runProgram(qemu, args)
+    if code == timeoutExitCode:
+      quit "FAILURE (TIMEOUT) RV32 " & name & "\n" & output &
+           "\n(a hang, not a wrong answer. On this target that usually means an " &
+           "instruction trapped into an unset `mtvec`: a floating-point " &
+           "instruction before `mstatus.FS` was set, or a stack access before " &
+           "`sp` was — a RISC-V core establishes neither at reset.)"
+    if code != 42:
+      quit "FAILURE (RV32) " & name & ": exit code " & $code & ", expected 42\n" &
+           output
+    removeFile elf
+    inc passed
+  echo passed, " / ", fixtures.len, " RV32 assembler tests successful"
+
+
+const rv32Quarantine = [
+    "assembler_m", "semihost_writec", "interrupt_pendsv", "atomics"]
+
+  ## Cortex-M fixtures the RV32 pass does not run, because this directory has its
+  ## own version of each: `assembler_rv32`, `semihost_writec_rv32`,
+  ## `interrupt_msip`, `atomics_rv32`. Every one of the four is a test whose
+  ## content IS the machine — a register name, a breakpoint encoding, a trap
+  ## model, an access width — so a shared fixture could only ever have tested one
+  ## of the two targets. Argued in tests/arkham_rv32/README.md.
+
+const rv32Rejections: seq[(string, string)] = @[
+  # The `err_*` fixtures of `tests/arkham_m/`, judged by what RV32 says rather
+  # than by what Cortex-M says. Four of the eight give an answer that is about
+  # this target; the other four pin Cortex-M register NAMES and so are refused
+  # here for the wrong reason ("`r0` is not a RV32 register"), which tests
+  # nothing. Those want RV32-native fixtures — see `tests/arkham_rv32/README.md`.
+
+  # A volatile access wider than one machine access. Identical reasoning and
+  # identical wording to Cortex-M's: the rule is the ROW's, not the target's, and
+  # this is the fixture that proves RV32 now reaches it at all — until `tgRv32`
+  # existed for a row to claim, the refusal came from "no RV32 lowering" three
+  # steps earlier and said nothing about widths.
+  ("err_volatile_wide", "must be ONE machine access"),
+  # A register spelling from another target. The `{.assembler.}` mode's premise is
+  # that a body names ONE machine, so the useful answer says which names this one
+  # has — and on RV32 those are `x5`..`x7`, `x10`..`x30`.
+  ("err_asm_foreign_reg", "is not a RV32 general-purpose register"),
+]
+
+const rv32OwnRejections: seq[(string, string)] = @[
+  # RV32-NATIVE fixtures, in `tests/arkham_rv32/`. The four `err_asm_*` of
+  # `tests/arkham_m/` that these replace pin Cortex-M register NAMES, so on this
+  # target they are refused by the first arm of the cascade ("`r0` is not a RV32
+  # general-purpose register") and never reach the rule they exist to test. A
+  # fixture that fails for the wrong reason is worse than no fixture: it reports
+  # green.
+  #
+  # Writing them found that `asmPinReg`'s cascade had a Thumb arm and an AArch64
+  # `else`, and RV32 fell into the second — which answers about a different
+  # register file. `x16`/`x17` are IP0/IP1 there and the ARGUMENT registers a6/a7
+  # here; `x18` is the platform register there and the callee-saved home `s2`
+  # here; the link-register message names `x30` in prose while `md.linkReg` is
+  # `x1`. Confident sentences about the wrong register, on every one.
+  ("err_asm_bridge_reg", "one of arkham's two staging bridges"),
+  ("err_asm_param_reg", "is passed in x10 by this target's ABI"),
+  ("err_asm_wide_stack", "a RV32 `.assembler` body moves one 4-byte word"),
+  # Three with no Cortex-M counterpart, because the register file differs rather
+  # than the rule: `x0` discards writes, `gp`/`tp` belong to the whole program,
+  # and `s0` is kept off the file for a debugger's frame walk.
+  ("err_asm_zero_reg", "reads as zero and discards every write"),
+  ("err_asm_abi_reg", "reserved by the RISC-V ABI"),
+  ("err_asm_frame_reg", "is the ABI's frame pointer"),
+  ("err_asm_link_reg", "is the link register (`ra`)"),
+  # The two interrupt rejections, in RV32's own vocabulary. They used to sit in
+  # the list above asserting "is not supported yet" — the whole feature refused by
+  # name — and became these the moment the trampoline table existed, which is
+  # exactly the moment that entry said to revisit them.
+  ("err_interrupt_unknown", "is not an interrupt of this target"),
+  ("err_interrupt_dup", "a table word holds one jump"),
+  # The width RV32 cannot do. `lr.w`/`sc.w` are the whole A extension on this XLEN
+  # — no byte, halfword or doubleword form — so the one refusal this target owes
+  # that the others do not is at the OTHER end of the range from Cortex-M's, which
+  # turns away 64 bits for want of `ldrexd`.
+  ("err_atomic_narrow", "no byte, halfword or doubleword form"),
+]
+
+proc rv32RejectionTests() =
+  ## What RV32 turns away, checked BY MESSAGE. A refusal is behaviour: a
+  ## diagnostic that silently changes wording is a diagnostic nobody is testing,
+  ## and one that starts pointing at the wrong thing is worse than none.
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  for (name, expected) in rv32Rejections:
+    execExpectFailure(quoteShell(arkham) & " --os:embedded --cpu:riscv32 -o:" &
+                      quoteShell("tests" / "arkham_rv32" / (name & ".rej.nif")) &
+                      " " & quoteShell("tests" / "arkham_m" / (name & ".c.nif")),
+                      expected)
+  for (name, expected) in rv32OwnRejections:
+    execExpectFailure(quoteShell(arkham) & " --os:embedded --cpu:riscv32 -o:" &
+                      quoteShell("tests" / "arkham_rv32" / (name & ".rej.nif")) &
+                      " " & quoteShell("tests" / "arkham_rv32" / (name & ".c.nif")),
+                      expected)
+  echo rv32Rejections.len + rv32OwnRejections.len, " / ",
+       rv32Rejections.len + rv32OwnRejections.len,
+       " RV32 rejection tests successful (", rv32OwnRejections.len,
+       " RV32-native)"
+
+proc rv32CodegenTests() =
+  ## The RV32 back end end to end: Leng in, exit code out.
+  ##
+  ## Run against `tests/arkham_m/` rather than a corpus of its own. The two
+  ## targets are the same SHAPE — 32-bit word, `BlockFrame`, bare metal,
+  ## semihosting exit — so a second copy of 138 fixtures would drift from the
+  ## first rather than test anything it does not. Same argument the `linux_arm64`
+  ## pass makes for reusing `tests/arkham`.
+  let qemu = requiredExe(rv32Qemu, "the RV32 suites")
+  if qemu.len == 0:
+    echo rv32Qemu, " not found - skipping RV32 codegen tests"
+    return
+  let arkhamExe = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  var passed = 0
+  var total = 0
+  for file in walkFiles("tests/arkham_m/*.c.nif"):
+    let base = file.extractFilename.changeFileExt("").changeFileExt("")
+    if base.startsWith("err_"): continue   # must NOT compile; see rv32RejectionTests
+    if base in rv32Quarantine: continue
+    inc total
+    let asmNif = "tests" / "arkham_rv32" / (base & ".asm.nif")
+    let elf = "tests" / "arkham_rv32" / (base & ".elf")
+    let (ao, ac) = execCmdEx(quoteShell(arkhamExe) &
+      " --os:embedded --cpu:riscv32 -o:" & quoteShell(asmNif) & " " & quoteShell(file))
+    if ac != 0:
+      quit "FAILURE (RV32 codegen) " & base & "\n" & ao
+    let (no, nc) = execCmdEx(quoteShell(nifasmExe) & " -o:" & quoteShell(elf) &
+                             " " & quoteShell(asmNif))
+    if nc != 0:
+      quit "FAILURE (RV32 assemble) " & base & "\n" & no
+    var args: seq[string] = @[]
+    for a in rv32Args: args.add a
+    args.add elf
+    let (output, code) = runProgram(qemu, args)
+    let want = try: parseInt(readFile("tests/arkham_m" / (base & ".exitcode")).strip())
+               except CatchableError: 0
+    if code == timeoutExitCode:
+      quit "FAILURE (TIMEOUT) RV32 codegen " & base & "\n" & output &
+           "\n(a hang: an instruction trapped into an unset `mtvec`, or the " &
+           "stack pointer the reset path set does not point at real memory.)"
+    if code != want:
+      quit "FAILURE (RV32 codegen) " & base & ": exit code " & $code &
+           ", expected " & $want & "\n" & output
+    removeFile asmNif
+    removeFile elf
+    inc passed
+  # RV32-NATIVE positive fixtures, alongside the shared corpus. These are the ones
+  # that cannot be shared because their content IS the machine: a `{.assembler.}`
+  # body naming registers, a semihosting sequence. `tests/arkham_m`'s equivalents
+  # stay quarantined rather than deleted — they are Cortex-M's versions of the same
+  # tests, and both targets should keep theirs.
+  var native = 0
+  for file in walkFiles("tests/arkham_rv32/*.c.nif"):
+    let base = file.extractFilename.changeFileExt("").changeFileExt("")
+    if base.startsWith("err_"): continue          # rejection fixtures; see below
+    inc native
+    let asmNif = "tests" / "arkham_rv32" / (base & ".asm.nif")
+    let elf = "tests" / "arkham_rv32" / (base & ".elf")
+    let (ao, ac) = execCmdEx(quoteShell(arkhamExe) &
+      " --os:embedded --cpu:riscv32 -o:" & quoteShell(asmNif) & " " & quoteShell(file))
+    if ac != 0: quit "FAILURE (RV32 native codegen) " & base & "\n" & ao
+    let (no, nc) = execCmdEx(quoteShell(nifasmExe) & " -o:" & quoteShell(elf) &
+                             " " & quoteShell(asmNif))
+    if nc != 0: quit "FAILURE (RV32 native assemble) " & base & "\n" & no
+    var args: seq[string] = @[]
+    for a in rv32Args: args.add a
+    args.add elf
+    let (output, code) = runProgram(qemu, args)
+    let want = try: parseInt(readFile("tests/arkham_rv32" / (base & ".exitcode")).strip())
+               except CatchableError: 0
+    if code == timeoutExitCode:
+      quit "FAILURE (TIMEOUT) RV32 native " & base & "\n" & output
+    if code != want:
+      quit "FAILURE (RV32 native) " & base & ": exit code " & $code &
+           ", expected " & $want & "\n" & output
+    let outFile = "tests" / "arkham_rv32" / (base & ".output")
+    if fileExists(outFile) and output != readFile(outFile):
+      quit "FAILURE (RV32 native output) " & base & "\ngot:\n" & output &
+           "want:\n" & readFile(outFile)
+    removeFile asmNif
+    removeFile elf
+  echo passed, " / ", total, " RV32 codegen tests successful (",
+       rv32Quarantine.len, " quarantined — see tests/arkham_rv32/README.md), plus ",
+       native, " RV32-native"
+
+
+const rv32StressLevel = 2
+  ## `ARKHAM_STRESS=k` for the RV32 pass below. TWO, and the number is
+  ## `EmitterBridgeDemand` — the same relation `StagingFloor` states for x86-64.
+  ##
+  ## It was one while RV32 reserved three bridges: the emitter's reserved bridges
+  ## are never shrunk by the stress mode, so a spare one absorbed the case where
+  ## the pools had nothing left for a scratch that could have used either. Spending
+  ## the third (see `machine_rv32.ProduceBridge`) removed that absorber, and `k=1`
+  ## — which leaves ONE temp — then describes a machine below what the emitter is
+  ## written against: `array2d` reaches an `(at …)` whose stride scratch finds no
+  ## pool register, takes a bridge, and leaves an enclosed step with none while
+  ## `produceIntoMem2` holds the other.
+  ##
+  ## That is a demand statement, not a finding, which is exactly what `StagingFloor`
+  ## says about `k=1` on x86-64. `k=2` is the real floor: the pools must be able to
+  ## offer at least as many registers as one emitter step may hold at once.
+  ## Verified at k=2,3,4,6,8 and unstressed — 122/122 at every one.
+
+proc rv32StressTests() =
+  ## The RV32 corpus again with the register file starved, against a
+  ## `-d:arkhamStress` binary of its own so a stray environment variable cannot
+  ## perturb the shipped `bin/arkham`.
+  ##
+  ## This pass is what makes the I1/I2 bridge-budget assertions LIVE. `BridgeCheck`
+  ## compiles them out of a release build, so the shipped binary the codegen pass
+  ## above runs never evaluates one; `-d:arkhamStress` compiles them in, and this
+  ## is the only pass on this host that runs such a binary. Without it the check
+  ## is written down and never executed.
+  ##
+  ## The fixtures' own `.exitcode` files stay the oracle. Fewer registers may cost
+  ## performance or reach a documented out-of-registers refusal, but can never
+  ## legitimately change what a program computes — so a changed answer here is a
+  ## codegen bug by construction. That is the half a totality argument cannot
+  ## supply: it proves a register is always available, not that the value arriving
+  ## in it is the right one.
+  let qemu = requiredExe(rv32Qemu, "the RV32 suites")
+  if qemu.len == 0:
+    echo rv32Qemu, " not found - skipping RV32 stress tests"
+    return
+  exec "nim c --hints:off -d:arkhamStress -o:bin/arkham_stress src/arkham/arkham.nim"
+  let arkhamExe = ("bin" / "arkham_stress").addFileExt(ExeExt)
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  putEnv("ARKHAM_STRESS", $rv32StressLevel)
+  var passed = 0
+  var total = 0
+  for file in walkFiles("tests/arkham_m/*.c.nif"):
+    let base = file.extractFilename.changeFileExt("").changeFileExt("")
+    if base.startsWith("err_"): continue   # must NOT compile
+    if base in rv32Quarantine: continue
+    inc total
+    let asmNif = "tests" / "arkham_rv32" / (base & ".stress.nif")
+    let elf = "tests" / "arkham_rv32" / (base & ".stress.elf")
+    let (ao, ac) = execCmdEx(quoteShell(arkhamExe) &
+      " --os:embedded --cpu:riscv32 -o:" & quoteShell(asmNif) & " " & quoteShell(file))
+    if ac != 0:
+      quit "FAILURE (RV32 stress codegen) " & base & "\n" & ao
+    let (no, nc) = execCmdEx(quoteShell(nifasmExe) & " -o:" & quoteShell(elf) &
+                             " " & quoteShell(asmNif))
+    if nc != 0:
+      quit "FAILURE (RV32 stress assemble) " & base & "\n" & no
+    var args: seq[string] = @[]
+    for a in rv32Args: args.add a
+    args.add elf
+    let (output, code) = runProgram(qemu, args)
+    let want = try: parseInt(readFile("tests/arkham_m" / (base & ".exitcode")).strip())
+               except CatchableError: 0
+    if code == timeoutExitCode:
+      quit "FAILURE (TIMEOUT) RV32 stress " & base & "\n" & output
+    if code != want:
+      quit "FAILURE (RV32 stress) " & base & ": exit code " & $code &
+           ", expected " & $want & " at ARKHAM_STRESS=" & $rv32StressLevel &
+           "\n" & output
+    removeFile asmNif
+    removeFile elf
+    inc passed
+  putEnv("ARKHAM_STRESS", "")
+  echo passed, " / ", total, " RV32 stress tests successful (ARKHAM_STRESS=",
+       rv32StressLevel, ", I1/I2 bridge-budget assertions compiled in)"
+
+
+proc arkhamAvrTests() =
+  ## The AVR Leng corpus: `arkham -a:avr` → `nifasm` → AVRtest, checking each
+  ## fixture's exit code against its `.exitcode` file — the same oracle every
+  ## other target's corpus uses.
+  if not fileExists(avrSim):
+    echo avrSim, " not found - skipping arkham AVR tests"
+    return
+  let arkhamExe = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  var passed = 0
+  var total = 0
+  for file in walkFiles("tests/arkham_avr/*.c.nif"):
+    inc total
+    let stem = file.extractFilename.changeFileExt("").changeFileExt("")
+    let asmFile = "tests" / "arkham_avr" / (stem & ".asm.nif")
+    let elf = "tests" / "arkham_avr" / (stem & ".elf")
+    exec quoteShell(arkhamExe) & " -a:avr -o:" & quoteShell(asmFile) & " " &
+         quoteShell(file)
+    exec quoteShell(nifasmExe) & " -o:" & quoteShell(elf) & " " & quoteShell(asmFile)
+    let (output, code) = runProgram(avrSim, @["-q", "-mmcu=avr5", "-s", "32k", elf])
+    if code == timeoutExitCode:
+      quit "FAILURE (TIMEOUT) arkham avr " & stem & "\n"
+    let want = parseInt(readFile("tests" / "arkham_avr" / (stem & ".exitcode")).strip)
+    if code != want:
+      quit "FAILURE arkham avr " & stem & ": exit " & $code & ", want " & $want &
+           "\n" & output
+    removeFile asmFile
+    removeFile elf
+    inc passed
+  echo passed, " / ", total, " arkham AVR tests successful"
+
+
+proc arkhamAvrRejections() =
+  ## A partial backend is only safe to ship if the gap is a DIAGNOSTIC rather
+  ## than a wrong answer, and this backend's gap is wide. So the diagnostics are
+  ## what these pin: each input names a construct the emitter does not implement,
+  ## and the refusal has to say which one and where to look.
+  let arkhamExe = ("bin" / "arkham").addFileExt(ExeExt)
+  const cases = [
+    # A 32-bit value. The failure a user is most likely to hit, because the
+    # frontend's default `int` is wider than this machine's word — and the one
+    # that must never be silently truncated, since every load and store the
+    # emitter writes moves exactly two bytes.
+    ("tests/arkham_m/leafret.c.nif", "32 bits wide"),
+    # A 32-bit result, in its own file rather than borrowed from another
+    # corpus — the width refusal is the one a user meets first and it should not
+    # depend on what some other target's fixtures happen to contain.
+    ("tests/arkham_avr_reject/wide.c.nif", "32 bits wide"),
+    # A shift by a value rather than a constant. Refused for what the MACHINE is
+    # — there is no variable-shift instruction — not for a missing feature.
+    ("tests/arkham_avr_reject/varshift.c.nif", "variable-shift"),
+    # A syscall. Refused for what it IS rather than as an unimplemented feature:
+    # a firmware image has no OS underneath it, on this target or any other.
+    ("tests/arkham/hello.c.nif", "no OS to call into"),
+    # An AGGREGATE global. Refused because its initial IMAGE would have to ship
+    # in flash and be copied into SRAM at startup — a scalar's initial value is
+    # a store the entry proc emits, and an array's would be hundreds of them.
+    ("tests/arkham_avr_reject/gvar_aggr.c.nif", "is an aggregate"),
+    # An aggregate parameter passed by REFERENCE whose pointer the allocator put
+    # in an ordinary pair. Refused for what the MACHINE is: only X, Y and Z
+    # address memory here, and the staging would have to happen inside a memory
+    # operand — which is not a place instructions can be emitted.
+    ("tests/arkham_avr_reject/aggr_byref_pair.c.nif", "only X, Y and Z")]
+  var passed = 0
+  for (file, want) in cases:
+    let (output, code) = runProgram(arkhamExe,
+      @["-a:avr", "-o:" & (getTempDir() / "avr_reject.asm.nif"), file])
+    if code == 0:
+      quit "FAILURE arkham avr rejection: " & file & " was ACCEPTED"
+    if not output.contains(want):
+      quit "FAILURE arkham avr rejection: " & file & "\nexpected to mention: " &
+           want & "\ngot: " & output
+    inc passed
+  echo passed, " / ", cases.len, " arkham AVR rejection tests successful"
+
+
 proc cortexMAsmTests() =
   ## Assemble hand-written Cortex-M asm-NIF with nifasm and run the resulting
   ## firmware under QEMU. This is the END-TO-END gate for the instruction
@@ -987,7 +1619,7 @@ proc cortexMAsmTests() =
   ##
   ## Each fixture exits with a value it COMPUTED, so a wrong encoding shows up as
   ## a wrong exit code rather than as output that happens to look right.
-  let qemu = findExe(cortexMQemu)
+  let qemu = requiredExe(cortexMQemu, "the Cortex-M suites")
   if qemu.len == 0:
     echo cortexMQemu, " not found - skipping Cortex-M assembler tests"
     return
@@ -1083,7 +1715,7 @@ proc cortexMLayoutTests() =
   ## two words a cold core reads and the segment addresses back out of the ELF.
   ## Running is not enough on its own: an image that ignored the file entirely
   ## would still exit 42 from its compiled-in defaults.
-  let qemu = findExe(cortexMQemu)
+  let qemu = requiredExe(cortexMQemu, "the Cortex-M suites")
   if qemu.len == 0:
     echo cortexMQemu, " not found - skipping Cortex-M layout tests"
     return
@@ -1285,7 +1917,7 @@ proc cortexMMemMapTests() =
   ##
   ## The board case (an STM32F407) cannot be run — nothing in QEMU has flash at
   ## 0x08000000 — so it is checked by reading the two words a cold core reads.
-  let qemu = findExe(cortexMQemu)
+  let qemu = requiredExe(cortexMQemu, "the Cortex-M suites")
   if qemu.len == 0:
     echo cortexMQemu, " not found - skipping Cortex-M memory-map tests"
     return
@@ -1510,7 +2142,7 @@ proc arkhamCortexM64Tests() =
   ## A fixture in `cortexMUnsupported` may fail; anything else may not, and a
   ## parked fixture that starts passing is reported so the list shrinks with the
   ## backend instead of drifting.
-  let qemu = findExe(cortexMQemu)
+  let qemu = requiredExe(cortexMQemu, "the Cortex-M suites")
   if qemu.len == 0:
     echo cortexMQemu, " not found - skipping the arkham cortex-m 64-bit corpus"
     return
@@ -1574,7 +2206,7 @@ proc arkhamCortexMTests() =
   ## separate: 206 of the 236 originals declare `(i 64)`, which on a 32-bit
   ## target needs the register-pair lowering that is milestone M4. The corpus
   ## grows as features land rather than carrying a skip list the size of itself.
-  let qemu = findExe(cortexMQemu)
+  let qemu = requiredExe(cortexMQemu, "the Cortex-M suites")
   if qemu.len == 0:
     echo cortexMQemu, " not found - skipping arkham Cortex-M tests"
     return
@@ -1627,12 +2259,25 @@ vgClientRequestEncodingTests()
 # Cortex-M: encoder-level coverage. Host-independent — it only needs
 # qemu-system-arm, so it runs wherever that is installed.
 thumb2SelfTest()
+rv32SelfTest()
+rv32AsmTests()
+rv32CodegenTests()
+rv32RejectionTests()
+rv32StressTests()
 cortexMAsmTests()
 cortexMMemMapTests()
 cortexMInterruptTests()
 cortexMLayoutTests()
 arkhamCortexMTests()
 arkhamCortexM64Tests()
+
+# AVR: encoder-level coverage, then the selector end to end. Host-independent —
+# both need only `bin/avrtest`.
+avrSelfTest()
+avrAsmTests()
+
+arkhamAvrTests()
+arkhamAvrRejections()
 
 # arkham native-codegen tests: arkham emits the host arch (x86-64 on Linux,
 # AArch64/Darwin on macOS), so we run them only where the binaries execute.
@@ -1676,7 +2321,7 @@ when defined(linux) and defined(arm64):
 
 # The hand-written AArch64 fixture assembled above is a `linux_arm64` ELF: run it.
 when defined(linux):
-  if findExe("qemu-aarch64").len > 0:
+  if requiredExe("qemu-aarch64", "the a64 stress and slot-base-free passes").len > 0:
     let (sbfOut, sbfCode) = runProgram(findExe("qemu-aarch64"),
                                        ["tests" / "a64_slot_base_free"])
     if sbfCode != 0:
@@ -1687,7 +2332,7 @@ when defined(linux):
 
 # The AArch64 backend gets the same starved-pool pass, under qemu.
 when defined(linux) and defined(amd64):
-  if findExe("qemu-aarch64").len > 0:
+  if requiredExe("qemu-aarch64", "the a64 stress and slot-base-free passes").len > 0:
     arkhamStressTests(arch = "linux_arm64", runner = "qemu-aarch64",
                       skip = arkhamLinuxA64Unsupported & arkhamA64Unsupported &
                              arkhamOsxOnly,

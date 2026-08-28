@@ -9,10 +9,10 @@
 ## relocation patcher, which a byte-comparison test could not.
 
 import std / [os]
-import "../src/nifasm/thumb2"
-import "../src/nifasm/buffers"
-import "../src/nifasm/relocs"
-import "../src/nifasm/elf32"
+import "../src/nifasm/thumb/encoder"
+import "../src/nifasm/core/buffers"
+import "../src/nifasm/core/relocs"
+import "../src/nifasm/image/elf32"
 
 type Check = object
   name: string

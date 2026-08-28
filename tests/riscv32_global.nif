@@ -1,0 +1,75 @@
+(.nif27)
+(stmts
+ (arch riscv32)
+ (gvar :counter.0
+  (i 32))
+ (proc :bump.0
+  (params
+   (param :d.0
+    (x10)
+    (i 32)))
+  (result :ret.0
+   (x10)
+   (i 32))
+  (clobber
+   (x10)
+   (x11)
+   (x12))
+  (stmts
+   (adr
+    (x11)counter.0)
+   (mov
+    (x12)
+    (mem
+     (x11)))
+   (add3
+    (x12)(x12)(x10))
+   (mov
+    (mem
+     (x11))(x12))
+   (mov
+    (x10)(x12))
+   (ret)))
+ (proc :main.0
+  (params)
+  (result :mret.0
+   (x10)
+   (i 32))
+  (stmts
+   (var :acc.0
+    (x18)
+    (i 32))
+   (var :blo.0
+    (s)
+    (i 32))
+   (var :bhi.0
+    (s)
+    (i 32))
+   (mov
+    (sp)2148532224)
+   (sub
+    (sp)(ssize))
+   (adr
+    (x11)counter.0)
+   (mov
+    (x12)10)
+   (mov
+    (mem
+     (x11))(x12))
+   (prepare bump.0
+    (mov
+     (arg d.0)32)
+    (call)
+    (mov acc.0
+     (res ret.0)))
+   (mov
+    (x12)131110)
+   (mov blo.0
+    (x12))
+   (mov bhi.0 acc.0)
+   (lea
+    (x11)blo.0)
+   (mov
+    (x10)32)
+   (semihost)
+   (ret))))

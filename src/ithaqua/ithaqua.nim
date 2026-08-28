@@ -12,7 +12,7 @@
 
 import std / [parseopt, syncio, strutils, envvars]
 import nifcoreparse
-import lengdecl
+import "../arkham/core"/lengdecl
 import codegen_wasm
 
 const

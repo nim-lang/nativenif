@@ -1,0 +1,9 @@
+(.nif27)
+(stmts
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (ret 0))))

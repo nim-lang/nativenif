@@ -1,7 +1,7 @@
 
 import std / [parseopt, strutils, os]
-import assembler
-import elf32
+import driver
+import image/elf32
 
 const
   Version = "0.1.0"

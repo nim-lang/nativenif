@@ -21,11 +21,21 @@ nifler → nimsem → hexer → dce ─┬→ arkham → nifasm → ELF/Mach-O/P
 ```
 
 Ithaqua reuses arkham's language-neutral program model — the lazy
-foreign-module loader (`programs.nim`) and the `slots`/`typenav` layout
-queries, with the target pointer/word size parameterized to 4 — plus
-nimony's NIF reader libraries, in the same sibling-repo arrangement arkham
-uses. The driver side (a `nimony w` command that runs the pipeline and
-invokes ithaqua) lives in the nimony repository.
+foreign-module loader (`core/programs.nim`) and the `core/asmslots.nim` /
+`core/typenav.nim` layout queries — plus nimony's NIF reader libraries, in
+the same sibling-repo arrangement arkham uses. The driver side (a `nimony w`
+command that runs the pipeline and invokes ithaqua) lives in the nimony
+repository.
+
+The target's width facts come from arkham's own `setTargetWord`, which
+ithaqua sets to `Wasm32` before anything is parsed — the same one call every
+arkham backend makes. `Wasm32` narrows the pointer and Leng's platform `int`
+to 4 bytes but leaves the scalar and float bounds at 8, because `i64` and
+`f64` are wasm value types a single local holds; a 32-bit CPU, which is what
+`Word32` describes, has neither. Setting it is not a detail: it is what puts
+arkham's layout answers and ithaqua's own `WasmPtrSize` arithmetic on the
+same size for a pointer, and an aggregate laid out under a disagreement is
+not detectably wrong later — it is just a field at the wrong offset.
 
 ## Lowering model
 
@@ -99,6 +109,17 @@ oracle) and through `nimony w`, requiring byte-identical stdout and
 matching exit codes. The harness has also caught pre-existing
 native-backend bugs where the wasm output was correct — the oracle cuts
 both ways.
+
+This repository's own tester adds the half that harness cannot see:
+`ithaquaTests` compiles ithaqua and pushes every `tests/arkham/*.c.nif`
+fixture through it, requiring a wasm module out of each one that is not on
+an explicit refusal list. It runs nothing — it is there so that a rename or
+a signature change in `core/` cannot break the one consumer that lives
+outside it and have nobody notice, which is exactly how ithaqua's first
+merge broke. `src/ithaqua/twasmenc.nim` covers `wasmenc` itself: LEB128
+edge cases and a byte-exact golden module with no dependencies, plus
+validation and instantiation of a richer module under `node` when it is on
+PATH.
 
 ## Non-goals
 

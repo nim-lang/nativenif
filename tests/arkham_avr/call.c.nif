@@ -1,0 +1,21 @@
+(.nif27)
+(stmts
+ (proc :addup.0
+  (params
+   (param :a.0 .
+    (i 16))
+   (param :b.0 .
+    (i 16)))
+  (i 16).
+  (stmts
+   (ret
+    (add
+     (i 16)a.0 b.0))))
+ (proc :main.0
+  (params)
+  (i 16)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (ret
+    (call addup.0 33 9)))))

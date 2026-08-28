@@ -1,0 +1,748 @@
+#
+#           Arkham — shared machine model for the native code generators
+#        (c) Copyright 2026 Andreas Rumpf
+#
+#    See the file "license.txt", included in this distribution.
+#
+
+## Architecture-neutral register slots and the `MachineDesc` the register
+## allocator is parameterized over.
+##
+## `Reg` / `FReg` are an abstract, arch-neutral enumeration of physical
+## registers — numbered slots, not hardware names (every modern ISA numbers its
+## registers, conflates pointers with integers, and keeps the floating-point
+## file separate; that is exactly the GPR `Reg` vs FP `FReg` split here). The
+## enum is sized for the widest target (AArch64: 31 GPRs, 32 FP regs). A backend
+## reuses a *subset* of the slots — x86-64, with 16 GPRs / 16 XMM, simply never
+## allocates `R16..R30` / `F16..F31` — and renders each slot to its own spelling
+## through its own `regName` shim (`R0` → `"x0"` on AArch64, `"rax"` on x86-64).
+##
+## The allocator only ever sees the slots and the `MachineDesc`; it has no
+## knowledge of any concrete ABI. A backend describes its register file and
+## calling convention by populating a `MachineDesc`.
+
+import asmslots
+import nifcore   # `Cursor`: a `Mem` location captures the lvalue subtree to re-emit
+
+const SynthMark* = "`"
+  ## Prefix of every asm-NIF symbol arkham MINTS itself: the positional
+  ## parameters, the result binding, scratch/spill bindings, labels and the
+  ## aggregate homes. Leng symbols are copied into the asm verbatim and nifasm
+  ## scopes them by their full name, so a synthetic name that is spellable as a
+  ## Nim identifier is *shadowed* the moment the body declares a local of that
+  ## name — and every later reference silently resolves to the local instead.
+  ## `formatfloat`'s `mulShift(x: uint64; y: uint64x2)` hit exactly that: its
+  ## locals `p0`/`p1` reach Leng as `p0.0`/`p1.0`, which are also the positional
+  ## names of its own two parameters.
+  ##
+  ## The leading backtick is nimony's marker for "compiler-generated, unspellable
+  ## in Nim source" (hexer mints `` `x.N ``, `` `tc.N ``, `` `cse.N `` …), so it
+  ## rules out any collision with user code. Inside that namespace arkham owns
+  ## the tags `p` `ret` `tmp` `ftmp` `fntmp` `L` `etmp` `eftmp` `held` `aggtmp`
+  ## `nctmp` `botmp` `rettmp`, none of which hexer mints — and all but `ret` and
+  ## `L` carry a counter *in the name*, so even a same-tag hexer symbol (`` `tmp.N ``
+  ## from the duplifier) stays a different string from `` `tmpN.0 ``.
+
+template synth*(tag: string): string = SynthMark & tag
+  ## Spelling of an arkham-minted asm symbol whose name is exactly `tag`.
+
+type
+  Reg* = enum   ## abstract GPR slot; a backend maps it to a hardware register
+    R0, R1, R2, R3, R4, R5, R6, R7, R8, R9, R10, R11, R12, R13, R14, R15,
+    R16, R17, R18, R19, R20, R21, R22, R23, R24, R25, R26, R27, R28, R29, R30,
+    SP, NoReg
+
+  FReg* = enum  ## abstract FP/SIMD slot
+    F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15,
+    F16, F17, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27, F28, F29, F30, F31,
+    NoFReg
+
+  TargetArch* = enum
+    ## Which ISA the `MachineDesc` describes. The register allocator is otherwise
+    ## arch-neutral, but a few instruction-selection quirks (x86's destructive
+    ## 2-operand RMW, `div` clobbering RDX, variable shift via RCX) are handled by
+    ## `if md.arch == X86` branches in the expression walk rather than a callback.
+    ##
+    ## `ThumbM` (Cortex-M) shares AArch64's shape wherever those branches ask —
+    ## 3-operand ALU, no fixed div or shift-count register — so it groups with
+    ## `Arm64` at every one of them. What differs between the two is the word
+    ## size and the register file, and both of those are already values.
+    ##
+    ## `Avr` groups with `X86` at every one of them, and for the reason the user
+    ## of this backend gave: its ALU is destructive and two-operand, so the
+    ## question those branches are really asking — "does the destination have to
+    ## BE one of the sources" — has x86's answer. It parts company only at
+    ## `scratchDemand`, where it answers like the ARM targets because it has no
+    ## store-immediate and no PC-relative data operand either.
+    ##
+    ## `Rv32` groups with `Arm64`/`ThumbM` at every one of those branches too: it
+    ## is a three-operand ALU with no fixed division or shift-count register, and
+    ## the questions the planner asks are exactly the ones that separates from
+    ## x86. What differs between it and the two Arm targets is the word size, the
+    ## register file and a handful of capabilities — and all three are already
+    ## values rather than branches.
+    X86, Arm64, ThumbM, Avr, Rv32
+
+  TargetFeature* = enum
+    ## What this target's asm-NIF vocabulary OFFERS. Read as `X in md.caps` in
+    ## place of the `if g.thumbM` that used to stand for it — the difference
+    ## being that a fourth back end answers a question it was asked, instead of
+    ## inheriting whichever arm of a two-target branch it was not named in.
+    ##
+    ## These are facts about the assembler's vocabulary, not about the silicon.
+    ## AArch64 HAS `sxtb`, but nifasm's a64 selector has no tag for it and lowers
+    ## the extend as a shift pair — so `SubwordExtend` is absent there. What a
+    ## capability answers is "may the emitter write this down", which is the only
+    ## question it ever asks.
+    CondSelect        ## a branchless conditional select (`csel` / `cmov`). Without
+                      ## it a select-diamond lowers to a branch, which is correct
+                      ## everywhere and merely longer.
+    TailCall          ## a call in tail position may become a plain branch
+                      ## (`(tailcall)`/`(popframe)`).
+    Float64           ## the FPU has double precision AT ALL. Absent on Cortex-M4F,
+                      ## whose FPv4-SP has no `.f64` instruction — which is missing
+                      ## hardware, so a `float64` is refused by name rather than
+                      ## lowered through a softfloat library nobody asked for.
+    SubwordExtend     ## a one-instruction sign/zero extend from 8/16 bits
+                      ## (`uxtb`/`sxth`); otherwise a `lsl`+`asr|lsr` pair.
+    RegOffsetMem      ## a load/store takes base and index as two REGISTER operands
+                      ## (`ldrb rt, base, idx`); otherwise the index folds into a
+                      ## memory operand instead.
+    PcRelGlobalFold   ## a global's address folds into the access that uses it
+                      ## (`adrp` + page offset). Cortex-M materializes an address
+                      ## absolutely (movw/movt, patched once .bss is laid out) and
+                      ## has no such instruction, so address and access stay apart.
+    AcqRelExclusives  ## the exclusive pair CARRIES its ordering (`ldaxr`/`stlxr`).
+                      ## Without it an atomic is the LL/SC loop plus explicit
+                      ## barriers on either side (ARMv7-M's `ldrex`/`strex`+`dmb`).
+    TwoAddrForms      ## the assembler accepts a DESTRUCTIVE two-operand spelling
+                      ## (`(neg D)`, `(sdiv D S)`). Without it the destination is
+                      ## repeated as the first source, because the instruction is
+                      ## three-operand and the assembler parses it as such.
+    AllFlagBranches   ## the assembler can turn ANY condition into a branch, not
+                      ## just the zero flag. An `{.assembler.}` body asks before
+                      ## emitting, so an unimplemented condition is a named
+                      ## compile error rather than a nifasm crash halfway through
+                      ## an otherwise valid image.
+    Freestanding      ## no OS: the image owns the machine, so a board layout — not
+                      ## a system call — answers where memory is.
+    BitScanOps        ## the assembler has `clz`/`rbit`/`rev`. Arm does; RV32I does
+                      ## NOT — counting and reversing bits is the Zbb extension
+                      ## there, and the baseline has no encoding for any of the
+                      ## three. Asked by the `{.assembler.}` intrinsic lowering,
+                      ## which is the one place they are written down, so a target
+                      ## without them refuses the intrinsic BY NAME rather than
+                      ## emitting a tag its selector will not recognise.
+    FloatConvert      ## a one-instruction convert BETWEEN float precisions
+                      ## (`fcvt`). Reachable only where `Float64` is also present —
+                      ## with one precision there is nothing to convert to — but it
+                      ## is a separate fact: RV32 has both precisions and spells the
+                      ## convert `fcvt.s.d`/`fcvt.d.s`, which is not the `(fcvt …)`
+                      ## row AArch64 uses.
+    SimdVector        ## the 128-bit AdvSIMD vocabulary (`(vfadd …)`, `(vdup …)`,
+                      ## `(fldrq …)`, …). NEON is AArch64's; RV32's vector
+                      ## extension is not baseline and would not share these
+                      ## spellings anyway. The path behind this is staged and inert
+                      ## until the shared intrinsic table carries the rows — which
+                      ## is exactly why the capability goes in NOW: when it wakes
+                      ## up it must wake up for the targets that have it, not for
+                      ## whichever ones were not named in a two-target branch.
+
+  FrameStyle* = enum
+    ## The SHAPE of the prologue and epilogue, and with it how the caller's
+    ## argument area is reached. Named for the shape rather than for a target,
+    ## because the next 32-bit back end wants `BlockFrame` verbatim: RISC-V has no
+    ## paired store either, and its frame is the same "lower SP once, then one
+    ## store per saved register".
+    PairFrame    ## fp/lr pushed as a PAIR and each callee-saved register in pairs
+                 ## (`stp`/`ldp`, so the saved list is padded to an even count).
+                 ## The frame pointer then addresses the caller's stack arguments
+                 ## for the whole body, at a fixed bias.
+    BlockFrame   ## SP lowered ONCE, then one store per saved register. No frame
+                 ## pointer — a register file this small has none to spare — so
+                 ## the incoming-argument base is RE-DERIVED from SP wherever it
+                 ## is needed, which is only correct after the prologue has
+                 ## finished lowering it. That is why a `BlockFrame` target loads
+                 ## its stack parameters in the prologue and not at the top of
+                 ## the body.
+    PushFrame    ## the `call` instruction pushed the return address; one
+                 ## `push`/`pop` per saved register. `codegen_x64` builds its own
+                 ## prologue and does not consult this yet.
+    AvrFrame     ## `push`/`pop` per saved register like `PushFrame`, but WITH a
+                 ## frame pointer — and not as a convenience. AVR's SP lives in
+                 ## the I/O space and cannot address memory at all, so Y is the
+                 ## only way to reach a stack slot, and establishing it is not
+                 ## optional the way an rbp frame is. Lowering SP is also three
+                 ## instructions rather than one (`in`/`in`, arithmetic,
+                 ## `out`/`out`), which is why the frame is set up once and left
+                 ## alone.
+
+  ImmStyle* = enum
+    ## How this target encodes an ALU immediate, hence which constants may ride
+    ## along in `and`/`orr`/`eor` instead of being materialized into a register
+    ## first. The predicates themselves live with the code that already depends on
+    ## the encoder; naming the STYLE here keeps the machine model free of the
+    ## assembler's byte-emission machinery while still stating the fact. (A proc
+    ## field would need `machine` to import `nifasm/arm64`, and with it `relocs`,
+    ## for one predicate.)
+    A64Bitmask        ## AArch64's replicated bitmask immediate: every bitfield
+                      ## mask is one (0xff, 0x1ff, 0x3fff, …)
+    ThumbExpandImm    ## Thumb-2: a byte replicated across lanes, or an 8-bit value
+                      ## with bit 7 set rotated anywhere. A DIFFERENT set
+    X86Imm32          ## any 32-bit constant, sign-extended
+    RvImm12           ## RISC-V: a 12-bit SIGNED field, and the same one in every
+                      ## ALU op and every memory operand. Not a range with a
+                      ## special shape like the other three — which is the point:
+                      ## there is exactly one rule to check, and anything outside
+                      ## ±2048 is `lui`+`addi` into a register.
+    AvrImm8           ## an 8-bit constant, and only into r16..r31. Nothing wider
+                      ## is an immediate here at all: a 16-bit constant is two
+                      ## `ldi`s, and the pair-wide `adiw`/`sbiw` carry six bits
+
+  MachineDesc* = object
+    ## A target's register file + calling convention, as the allocator needs it.
+    ## All registers are slots from a *subset* of `Reg`/`FReg` (a narrower ISA
+    ## like x86-64 leaves the high slots unused).
+    arch*: TargetArch                ## the ISA, for the few arch-specific walk branches
+    intRetReg*: Reg                  ## integer/pointer return register (rax / x0 = R0;
+                                     ## a0 = R10 on RV32, which is what makes reading
+                                     ## it from HERE rather than from a module-level
+                                     ## constant load-bearing — the two Arm targets
+                                     ## and x86-64 all answer R0, so a site that
+                                     ## hardcoded it looked correct on every target
+                                     ## that existed)
+    floatRetReg*: FReg               ## float return register (xmm0 / v0 = F0; fa0 = F10
+                                     ## on RV32). Same reasoning as `intRetReg`.
+    divRemReg*: Reg                  ## x86 idiv's clobbered high-half / remainder reg
+                                     ## (rdx = R2); `NoReg` on ISAs without the constraint
+                                     ## (arm64 sdiv/msub use ordinary scratch)
+    shiftCountReg*: Reg              ## x86 variable-shift count register (cl ⊂ rcx = R1);
+                                     ## `NoReg` on ISAs where any reg works (arm64)
+    intArgRegs*: seq[Reg]            ## integer/pointer argument registers, ABI order
+    floatArgRegs*: seq[FReg]         ## float argument registers, ABI order
+    intTempRegs*: seq[Reg]           ## caller-saved scratch (call-free locals)
+    stagingBridgeReg*: Reg           ## the volatile kept out of every general pool so a
+                                     ## staging pick can never fail (x86-64: R11).
+                                     ## `callerSaveRescue` is the ONE allocator client
+                                     ## allowed to take it.
+    intLocalTempRegs*: seq[Reg]      ## subset of `intTempRegs` a call-free local may be
+                                     ## *homed* in; the rest of `intTempRegs` stays
+                                     ## reserved as emitter scratch. Empty on x86-64 (its
+                                     ## only temp reg, R10, is the staging scratch — a
+                                     ## local there starves the emitter); the full temp
+                                     ## pool on AArch64 (7 volatile regs, scratch to spare)
+    intCalleeSaved*: seq[Reg]        ## callee-saved (locals live across a call)
+    floatTempRegs*: seq[FReg]        ## caller-saved FP scratch
+    floatCalleeSaved*: seq[FReg]     ## callee-saved FP regs
+    intCalleeSavedSet*: set[Reg]     ## membership form of `intCalleeSaved`
+    floatCalleeSavedSet*: set[FReg]  ## membership form of `floatCalleeSaved`
+    aggrByRefThreshold*: int         ## aggregates larger than this go by reference
+
+    # ── register ROLES ────────────────────────────────────────────────────────
+    # Registers the EMITTER needs BY NAME rather than by drawing them from a
+    # pool. They used to be per-target `const`s reached through
+    # `if g.thumbM: machine_m.X else: X`, and that shape is what let a slot which
+    # is not even MAPPED on the target (`R16` on Cortex-M) reach the output. A
+    # role a target does not have is `NoReg`/`NoFReg`/`@[]`, never a plausible
+    # substitute — every one of these is read unconditionally by code that has
+    # already decided the target has it.
+    linkReg*: Reg                    ## return-address register (x30/lr, r14 on
+                                     ## Cortex-M). `NoReg` where the call
+                                     ## instruction pushes it instead (x86-64).
+    framePtrReg*: Reg                ## frame pointer (x29). `NoReg` where no fp
+                                     ## frame is established — Cortex-M addresses
+                                     ## everything off SP, and arkham never sets
+                                     ## up an rbp frame on x86-64.
+    indirectResultReg*: Reg          ## where a caller leaves `&result` for an
+                                     ## aggregate return too wide for registers
+                                     ## (x8; r9 on Cortex-M — see
+                                     ## `machine_m.IndirectResultReg` for why a
+                                     ## register is taken off the file instead of
+                                     ## shifting the arguments). `NoReg` where it
+                                     ## IS a hidden first argument (x86-64).
+    produceBridge*: Reg              ## the emitter scratch used to stage a value
+                                     ## on its way INTO memory: x16 (the
+                                     ## assembler's own IP0) on AArch64, a
+                                     ## dedicated r8 on Cortex-M, where nifasm has
+                                     ## already claimed r12. Always the last entry
+                                     ## of `bridgeRegs`.
+    atomicScratch*: array[3, Reg]    ## the three registers an LL/SC atomic sequence
+                                     ## claims for itself — `old`, `new`/`expected`
+                                     ## and the store STATUS — for the whole
+                                     ## `ldaxr`/`stlxr` retry loop.
+                                     ##
+                                     ## Its OWN reservation, not `bridgeRegs[0..2]`,
+                                     ## which is what it used to read. Those are two
+                                     ## unrelated claims that merely coincided while
+                                     ## every RISC target reserved exactly three
+                                     ## bridges: the moment one spent its third, the
+                                     ## atomic lowering indexed off the end of a
+                                     ## two-element seq. This is the rule design.md
+                                     ## states after the `cmpxchg`/rax bug — a
+                                     ## register an emitter CLAIMS must be excluded
+                                     ## where the claim is made, never inferred from
+                                     ## a pool it happens to sit in.
+                                     ##
+                                     ## `NoReg`s mean the target reserves no triple
+                                     ## and therefore has no LL/SC lowering;
+                                     ## `emitAtomicInstr2` refuses by name.
+    bridgeRegs*: seq[Reg]            ## every GPR withheld from all allocation
+                                     ## pools so the emitter can ALWAYS draw a
+                                     ## transient — a folded memory operand a
+                                     ## 3-operand ALU must load first, a global's
+                                     ## address, a produce-into-memory spill, and
+                                     ## the three registers an LL/SC atomic takes
+                                     ## for itself. Because no value ever lives
+                                     ## here, an atomic's clobber set cannot
+                                     ## overlap anything the allocator owns and no
+                                     ## analysis has to prove that it doesn't.
+                                     ## Empty on x86-64, which reserves a single
+                                     ## `stagingBridgeReg` instead.
+    floatBridgeReg*: FReg            ## the SIMD/FP twin of `produceBridge`.
+    memIntrinScratch*: array[3, Reg] ## three volatiles the inline `memcpy`/`memset`
+                                     ## lowering uses for its loop counter and its
+                                     ## two byte temporaries, on top of the three
+                                     ## argument registers it reads.
+                                     ##
+                                     ## Named here because it was `(R3, R4, R5)` —
+                                     ## AArch64's, written as literal slots. Those
+                                     ## are volatile scratch on Arm and `gp`, `tp`
+                                     ## and `t0` on RISC-V, two of which the ABI
+                                     ## reserves for the whole program. A slot
+                                     ## literal in shared code is only ever right
+                                     ## by coincidence, and this is the second one
+                                     ## found after `intRetReg`.
+    abiCalleeSaved*: seq[Reg]        ## the callee-saved registers the ABI
+                                     ## DEFINES, as opposed to the ones the
+                                     ## allocator draws homes from
+                                     ## (`intCalleeSaved`). The two are the same
+                                     ## list in a shipped build and differ under
+                                     ## `-d:arkhamStress`, which shrinks the pools
+                                     ## to force spilling: a `.assembler` body
+                                     ## does not allocate at all, so a register it
+                                     ## NAMES has to be legal — and saved —
+                                     ## whatever the pools were cut down to.
+                                     ## `stressed` leaves this field alone.
+    abiFloatCalleeSaved*: seq[FReg]  ## the float twin of `abiCalleeSaved`.
+    caps*: set[TargetFeature]        ## what this target's vocabulary offers
+    frameStyle*: FrameStyle          ## the prologue/epilogue shape
+    immStyle*: ImmStyle              ## which constants are ALU immediates here
+    gprRangeText*: string            ## the general-purpose registers a
+                                     ## `{.register: "…"}` pin may name, spelled
+                                     ## for a diagnostic ("`x0`..`x30`")
+    targetName*: string              ## how a DIAGNOSTIC names this target
+                                     ## ("AArch64", "Cortex-M"), so a rejection
+                                     ## reads as prose rather than as a flag
+    intCallerSavedSet*: set[Reg]     ## every GPR a callee may destroy without
+                                     ## saving. A superset of `convClobbersGpr`
+                                     ## where the ABI reserves volatiles the
+                                     ## convention does not name (AArch64's
+                                     ## x16/x17 veneers).
+    convClobbersGpr*: seq[Reg]       ## the caller-saved GPRs this calling
+                                     ## convention destroys, emitted as a proc's
+                                     ## `(clobber …)` so the ABI is DECLARED at
+                                     ## the signature rather than re-derived at
+                                     ## every call site. Sixteen under AAPCS64,
+                                     ## four under AAPCS32 — which is the whole
+                                     ## reason it is a field.
+
+type
+  LocKind* = enum
+    Undef          ## the dontCare target (fill me in), and the "produces no value"
+                   ## marker for statement positions. NEVER the answer to a symbol
+                   ## lookup — that is `NoLoc`, so a zero-initialized `locs[]` entry
+                   ## or a genuine dont-care can no longer be confused with "this
+                   ## name is not a proc-local" (historically that conflation made
+                   ## module-level globals, thread-locals and emitter-synthesized
+                   ## slots indistinguishable from an absent location).
+    NoLoc          ## a symbol-lookup MISS (`locationOfSym`/`symLoc`): the name is
+                   ## not an allocator-known local/param — a module-level symbol
+                   ## (global / tvar / proc, disambiguated via `lookupSym`) or an
+                   ## emitter-synthesized stack slot (`stackSlots`)
+    NeedsReg       ## a destination *constraint*: the value must end up in a GPR,
+                   ## but the callee chooses which one (allocating lazily, or
+                   ## reusing the register a value already occupies). Like `Undef`,
+                   ## it is filled in (via `var`) with the concrete `InReg` it
+                   ## resolved to. Never produced as a value — only passed as a
+                   ## `gen(…, dest)` target, so value-`case`s need not handle it.
+    RegOrImm       ## a destination *constraint*: the value must end up in a GPR OR
+                   ## a (small) immediate — but NOT a memory operand. This is the
+                   ## operand-B constraint of an ALU op whose destination is memory:
+                   ## x86 allows at most one memory operand, so `b` of `op [mem], b`
+                   ## must be reg/imm (a memory `b` is loaded first). Filled in (via
+                   ## `var`) with the concrete `InReg`/`Imm`. Destination-only.
+    InReg          ## value in a GPR
+    InRegPair      ## ≤16B by-value aggregate in 1–2 GPRs (ABI eightbytes)
+    InFReg         ## value in an FP/SIMD register
+    NamedStack     ## a stack var/slot managed by nifasm, addressed by `name`
+                   ## (aggregate, spilled scalar, or synthetic spill — no cursor).
+                   ## The slot IS the value.
+    StackPtr       ## an 8-byte nifasm slot holding a POINTER to an aggregate: the
+                   ## value lives wherever the pointer points (the caller's buffer,
+                   ## or the incoming stack-arg area), and every access loads the
+                   ## pointer first. A >16B by-ref aggregate param whose pointer found
+                   ## no register home, or (AArch64) a stack-passed by-value aggregate
+                   ## addressed in place.
+                   ##
+                   ## `typ` is the AGGREGATE's slot, not the pointer's, so size/class
+                   ## questions read like any other aggregate location; the one extra
+                   ## load is what this KIND says. Formerly `NamedStack` plus the
+                   ## `spilledByRefPtr` predicate, which re-derived the distinction at
+                   ## ~30 sites from the home's slot shape and a `varType` side table —
+                   ## and a site that forgot to ask silently transferred the pointer's
+                   ## own bytes as if they were the struct.
+    Mem            ## a foldable memory operand: the lvalue subtree `cur`
+                   ## (`(dot …)`/`(at …)`/`(deref …)`) re-emitted on demand so
+                   ## nifasm collapses the access chain to `base+offset`
+    Field          ## a field `field` (of aggregate type `aggrType`) WITHIN an
+                   ## aggregate destination, addressed via `base` (a `FieldBase`
+                   ## variant — register pointer, stack slot, global/tvar or
+                   ## lvalue subtree; each an explicit kind, not a priority
+                   ## ladder of sentinel fields). `typ` is the field's slot, so
+                   ## a store into it dispatches scalar/float/aggregate like any
+                   ## other destination — and a nested aggregate field recurses
+                   ## (a `(dot base field)` re-resolved to a `Field` whose base
+                   ## is the field's address). This is what lets the one
+                   ## `genStore2`/`allocStore` path build an `oconstr`
+                   ## field-by-field with no per-field special-casing.
+    Glob           ## a module-level global addressed by `name` (RIP-relative)
+    Tvar           ## a thread-local addressed by `name` (FS/TLV)
+    Imm            ## a known immediate (constant / target hint)
+
+  FieldBaseKind* = enum
+    FbReg          ## a pointer to the aggregate held in a register
+    FbSlot         ## the aggregate IS the stack slot named `sym`
+    FbGlob         ## a module-level global: its address is RE-DERIVED into a
+                   ## fresh transient at each use (the survivor-spill totality
+                   ## path — a link-time constant needs no register held across
+                   ## the field value's evaluation)
+    FbTvar         ## a thread-local: address re-derived per use, like `FbGlob`
+    FbLval         ## an lvalue subtree whose address is the aggregate (its
+                   ## embedded temps must be pre-materialized)
+
+  FieldBase* = object
+    ## HOW a `Field` location reaches its aggregate — one explicit kind per
+    ## addressing form. (Formerly a priority ladder of four sentinel fields:
+    ## `baseReg != NoReg`, else `baseGlob.len > 0`, else `baseName.len > 0`,
+    ## else `baseLval` — a missing case fell through to the WRONG arm instead
+    ## of failing.)
+    case kind*: FieldBaseKind
+    of FbReg: reg*: Reg
+    of FbSlot, FbGlob, FbTvar: sym*: string
+    of FbLval: lval*: Cursor
+
+  Location* = object
+    ## The one descriptor for "where a value lives, or should go" — long-lived
+    ## storage (the allocator's output) and just-computed values (the codegen's
+    ## dont-care result) share it.
+    typ*: AsmSlot
+    isTemp*: bool     ## REGISTERS ONLY (`InReg`/`InFReg`): the codegen borrowed this
+                      ## register as scratch and must hand it back, vs. a
+                      ## register-resident local (which it must not). Meaningless —
+                      ## and never set — for every other kind; `spillTemp` is the
+                      ## produce-into marker for `NamedStack`.
+    spillTemp*: bool  ## `NamedStack` ONLY: a synthesized `etmp`/`eftmp`/`held` spill
+                      ## slot the emitter must PRODUCE the value into through a
+                      ## staging register (`produceIntoMem2`), as opposed to a
+                      ## symbol's stack home left in place for operand folding.
+                      ## (Formerly overloaded onto `isTemp`, which silently meant
+                      ## two unrelated things depending on the kind.)
+    case kind*: LocKind
+    of Undef, NoLoc, NeedsReg, RegOrImm: discard
+    of InReg:
+      r*: Reg
+    of InRegPair:
+      r0*: Reg            ## eightbyte 0 (offset 0)
+      r1*: Reg            ## eightbyte 1 (offset 8); `NoReg` if the aggregate is 8 bytes
+    of InFReg: f*: FReg
+    of NamedStack, Glob, Tvar: name*: string
+    of StackPtr:
+      ptrName*: string       ## the 8-byte slot holding `&aggregate`
+      pointeeType*: SymId    ## POOL ID of the pointee's nominal type symbol — the
+                             ## identity a `Symbol` token already carries, so nothing
+                             ## materialises a string to compare or store one (the
+                             ## reasoning `noReturnProcs` spells out; the input buffers
+                             ## share one pool, so ids are comparable). Text is minted
+                             ## only at the two boundaries that need it: the name-keyed
+                             ## layout API (`lookupType`) and the asm buffer's own pool.
+                             ## Not `aggrType`: `Field` owns that name, and a variant's
+                             ## branches share one field namespace.
+    of Mem: cur*: Cursor
+    of Field:
+      field*: string         ## the member name
+      aggrType*: SymId       ## POOL ID of the enclosing aggregate's nominal type — the
+                             ## key the layout API takes, like `StackPtr.pointeeType`
+      base*: FieldBase       ## how the aggregate is reached (explicit kind)
+    of Imm: ival*: int64
+
+template noLoc*: Location =
+  ## The symbol-lookup miss: "this name has no allocator location".
+  Location(kind: NoLoc)
+
+template dontCare*: Location =
+  ## The "fill me in" target for the dont-care evaluator. A template (not a
+  ## `const`) because `Location` now embeds a `Cursor`, which has no static
+  ## representation — but `Undef` carries none, so this is a cheap literal.
+  Location(kind: Undef)
+
+proc needsReg*(typ: AsmSlot): Location {.inline.} =
+  ## A "must be a GPR, your choice" destination: the callee resolves it to a
+  ## concrete `InReg` (reusing a register-resident value in place, or allocating
+  ## scratch) and writes that back through `dest`. Lets binary/unary operations
+  ## thread a flexible register constraint instead of pre-committing one via an
+  ## eager `borrowTmp`.
+  Location(kind: NeedsReg, typ: typ)
+
+proc regOrImm*(typ: AsmSlot): Location {.inline.} =
+  ## A "must be a GPR or an immediate, not memory" destination — the operand-B
+  ## constraint for an ALU op with a memory destination (one memory operand max).
+  ## Resolved to a concrete `InReg`/`Imm` and written back through `dest`.
+  Location(kind: RegOrImm, typ: typ)
+
+proc regLoc*(r: Reg; typ: AsmSlot; isTemp = false): Location {.inline.} =
+  Location(kind: InReg, r: r, typ: typ, isTemp: isTemp)
+proc regPairLoc*(r0, r1: Reg; typ: AsmSlot): Location {.inline.} =
+  ## A ≤16B by-value aggregate whose eightbytes live in `r0` and (if 16B) `r1`.
+  Location(kind: InRegPair, r0: r0, r1: r1, typ: typ)
+proc pairWord*(loc: Location; i: int): Reg {.inline.} =
+  assert loc.kind == InRegPair
+  if i == 0: loc.r0 else: loc.r1
+proc fregLoc*(f: FReg; typ: AsmSlot; isTemp = false): Location {.inline.} =
+  Location(kind: InFReg, f: f, typ: typ, isTemp: isTemp)
+proc namedStackLoc*(name: string; typ: AsmSlot; spillTemp = false): Location {.inline.} =
+  ## `spillTemp` marks a *spill-temp* slot (an `etmp`/`eftmp` synthesized when the
+  ## register pool was exhausted) — a value position the emitter must PRODUCE into
+  ## (via a staging register), as opposed to a symbol's stack home left in place for
+  ## folding. The emitter (`produceIntoMem2`) keys on it.
+  Location(kind: NamedStack, name: name, typ: typ, spillTemp: spillTemp)
+proc stackPtrLoc*(name: string; pointeeType: SymId; typ: AsmSlot): Location {.inline.} =
+  ## An 8-byte `(s)` slot holding `&aggregate` — the aggregate itself is elsewhere.
+  ## `typ` is the AGGREGATE's slot (what the location's value IS), `pointeeType` the
+  ## pool id of its nominal type; the pointer's own 8-byte shape is implied by the kind
+  ## and never spelled out, so no consumer can mistake one for the other.
+  ##
+  ## The id comes from the type token itself (`symId`), which is only defined for a
+  ## `Symbol` — so an unnamed inline aggregate type, which has no layout to look up,
+  ## cannot be smuggled in as a plausible-looking empty name.
+  Location(kind: StackPtr, ptrName: name, pointeeType: pointeeType, typ: typ)
+proc globLoc*(name: string; typ: AsmSlot): Location {.inline.} =
+  Location(kind: Glob, name: name, typ: typ)
+proc tvarLoc*(name: string; typ: AsmSlot): Location {.inline.} =
+  Location(kind: Tvar, name: name, typ: typ)
+proc memLoc*(cur: Cursor; typ: AsmSlot): Location {.inline.} =
+  Location(kind: Mem, cur: cur, typ: typ)
+proc fieldLoc*(aggrType: SymId; field, baseName: string; typ: AsmSlot): Location {.inline.} =
+  ## Field `field` of a stack-slot aggregate named `baseName` (the genConstr2 base).
+  Location(kind: Field, aggrType: aggrType, field: field,
+           base: FieldBase(kind: FbSlot, sym: baseName), typ: typ)
+proc fieldLocReg*(aggrType: SymId; field: string; baseReg: Reg; typ: AsmSlot): Location {.inline.} =
+  ## Field `field` of an aggregate whose address is held in `baseReg` (a by-ref
+  ## param / hidden-result buffer / a nested field's computed address).
+  Location(kind: Field, aggrType: aggrType, field: field,
+           base: FieldBase(kind: FbReg, reg: baseReg), typ: typ)
+proc fieldLocGlob*(aggrType: SymId; field, globName: string; typ: AsmSlot;
+                   isTvar = false): Location {.inline.} =
+  ## Field `field` of a module-level aggregate `globName` (a global, or a thread-local
+  ## if `isTvar`), whose address is RE-DERIVED into a fresh transient at each field store
+  ## (`emFieldOperand`/`emFieldAddr`). Used when the allocator's address survivor spilled
+  ## to a slot (`reserveHeldScratch` totality backstop): the address is re-derivable
+  ## (a link-time global, or FS-base+offset tvar), so recomputing it per use needs no
+  ## register held across the (possibly call-containing) field value evaluation.
+  let base = if isTvar: FieldBase(kind: FbTvar, sym: globName)
+             else: FieldBase(kind: FbGlob, sym: globName)
+  Location(kind: Field, aggrType: aggrType, field: field, base: base, typ: typ)
+proc fieldLocLval*(aggrType: SymId; field: string; baseLval: Cursor; typ: AsmSlot): Location {.inline.} =
+  ## Field `field` of an aggregate addressed by the lvalue subtree `baseLval` (the
+  ## genConstrIntoLval2 base — its embedded temps must be pre-materialized).
+  Location(kind: Field, aggrType: aggrType, field: field,
+           base: FieldBase(kind: FbLval, lval: baseLval), typ: typ)
+proc immLoc*(ival: int64; typ: AsmSlot): Location {.inline.} =
+  Location(kind: Imm, ival: ival, typ: typ)
+
+proc sameReg(a, b: Location): bool {.inline.} =
+  ## True if both name the same physical register (for move coalescing).
+  (a.kind == InReg and b.kind == InReg and a.r == b.r) or
+  (a.kind == InFReg and b.kind == InFReg and a.f == b.f)
+
+# ── emitter scratch demand ──────────────────────────────────────────────────
+# A step of emission sometimes needs a transient register that belongs to no
+# value in the program — an x86 store whose source is also in memory has to pass
+# through one, because the ISA has no memory-to-memory move.
+#
+# Today the emitter DECIDES that at emission time and takes the register from a
+# reserved pool (`StagingCandidates`, headed by the one register kept out of the
+# allocator's hands so a pick can never fail). That reservation is why the
+# allocator cannot give a cross-call value a volatile even when six of them are
+# idle: the emitter's claim on the register file is real but not written down,
+# so nobody can prove a volatile is free.
+#
+# The fix is to write the claim down — as a VALUE the allocator can read without
+# emitting anything. These functions are that value. The emitter calls them at
+# the site it used to decide implicitly, so the two can never disagree: there is
+# one function and, for now, one caller.
+
+type
+  ScratchDemand* = object
+    ## What one emission step needs in transient registers.
+    gprs*: int          ## general-purpose scratch registers
+    fregs*: int         ## SIMD scratch registers
+    slot*: AsmSlot      ## the type a GPR scratch must be bound at (nifasm checks it)
+
+proc memToMemBridgeDemand*(md: MachineDesc; dst, v: Location): ScratchDemand =
+  ## Storing `v` into the stack home `dst` when `v` is ITSELF in memory: neither
+  ## ISA has a memory-to-memory move, so the value passes through one register.
+  ##
+  ## The source sets differ by ISA and that is the point of asking the machine
+  ## rather than hardcoding a `case`: AArch64 also has no store-immediate and no
+  ## RIP-relative operand, so an `Imm`, a global and a thread-local each need the
+  ## bridge there and none of them does on x86-64.
+  if dst.kind != NamedStack: return ScratchDemand()
+  if dst.typ.isFloat:
+    let fromMem = (case md.arch
+                   of X86: v.kind in {NamedStack, Mem}
+                   of Arm64, ThumbM, Avr, Rv32: v.kind in {NamedStack, Mem, Glob})
+    if fromMem: ScratchDemand(fregs: 1) else: ScratchDemand()
+  else:
+    let needsBridge = (case md.arch
+                       of X86: v.kind in {NamedStack, Mem}
+                       of Arm64, ThumbM, Avr, Rv32:
+                         v.kind in {NamedStack, Mem, Glob, Tvar, Imm})
+                       # Cortex-M answers like AArch64 and for the same reasons:
+                       # no store-immediate, no PC-relative data operand, so an
+                       # immediate, a global and a thread-local each pass through
+                       # a register on the way to a stack home. AVR is the same
+                       # again — and the ONE branch where it does not follow
+                       # x86-64. RV32 too: `lui`+`addi` is two instructions, so a
+                       # constant does not ride into a store here either.
+    if needsBridge:
+      ScratchDemand(gprs: 1, slot: (if md.arch == X86: v.typ else: dst.typ))
+    else:
+      ScratchDemand()
+
+type BridgeDemand* = enum
+  ## How many reserved bridges one emitter step holds AT ONCE, named by the shape
+  ## that needs them. A step declares its demand with `emit.withBridges` above its
+  ## first take; `emit.takeBridge` refuses a take beyond the declaration.
+  ##
+  ## The ordinal IS the count, and `EmitterBridgeDemand` below is the max over
+  ## this enum — so the number a machine model must reserve is DERIVED from the
+  ## declarations rather than maintained beside them. Adding a member here
+  ## immediately makes `checkMachine` demand another bridge of every target, which
+  ## is the forcing function: a step cannot quietly want a fourth register.
+  bdTransient = 1
+    ## One transient: a folded memory operand a three-operand ALU must load first,
+    ## an immediate too wide for the instruction's field, a global's address, a
+    ## value on its way into a stack slot. The overwhelming majority.
+  bdTwoInRegs = 2
+    ## TWO values that must sit in registers at the same instant while both live
+    ## in memory. Measured, this is one class with several faces: an ADDRESS held
+    ## while a word passes through (`marshalStackAggrArg`, `genAggrCopyStore`, the
+    ## aggregate tail loads), a spilled RESULT staged in one bridge while a spilled
+    ## operand is loaded into another (`emitBin2`, `emitMod2`), a `cmp` whose both
+    ## operands spilled (this ISA has no memory-operand compare), an `(at …)`
+    ## stride scratch live across the index it multiplies, and a demoted memory
+    ## base being reloaded. Every one of them is "no memory operand on this side
+    ## either", which is why x86-64 needs one bridge where the RISC targets need
+    ## two.
+  # There is deliberately NO member with ordinal 3. The only shape that ever held
+  # three was an aggregate copy between two COMPUTED ends — a destination address
+  # and a source address live together while a word passed between them — and
+  # `AggrEnd` removed it: `flatCopyToPtr2`'s source is a NAMED slot, addressed as
+  # `(mem name off)` with the offset folded into the slot's own frame displacement,
+  # which costs no register at all. Adding a `= 3` member back would raise
+  # `EmitterBridgeDemand` and make `checkMachine` demand a third bridge of every
+  # target again; that is the forcing function working, not an obstacle to route
+  # around.
+
+const EmitterBridgeDemand* = ord(high(BridgeDemand))
+  ## The largest number of reserved bridges any single emitter step holds at
+  ## once, and therefore the size a `bridgeRegs` reservation must have.
+  ##
+  ## TWO. It was three until `AggrEnd` tiering reached the RISC emitter: the only
+  ## step that ever held three was an aggregate copy between two COMPUTED ends, and
+  ## `flatCopyToPtr2`'s source is a NAMED slot, so addressing it as `(mem name off)`
+  ## costs no register — and one instruction fewer than the `lea` it replaced.
+  ##
+  ## What makes this a bound and not an average: a bridge is withheld from every
+  ## allocation pool, so bridge demand is a property of the SHAPE of one emitter
+  ## step, never of how much pressure the allocator is under. Starving the pools
+  ## changes how OFTEN a bridge is taken, not how many one step wants — measured,
+  ## the peak does not move between `ARKHAM_STRESS=1` and unstressed, nor between
+  ## aggregate nesting depth 1 and 16.
+  ##
+  ## A step's demand is only half of it, though: a step also inherits whatever an
+  ## ENCLOSING step still holds across the recursion that reached it.
+  ## `emit.bridgeScopePush` checks the sum rather than trusting it. The two Arm
+  ## targets reserve THREE while needing two — one register of slack, which is
+  ## what makes every step reachable with its full declaration free
+  ## (`tightCompositions == 0`); RV32 reserves exactly two and spent the third.
+  ## See design.md, "Making the reservation a bound instead of a measurement" and
+  ## "Spending the third bridge" for why the spend transfers to RV32 and not to
+  ## either Arm target.
+
+proc checkMachine*(md: MachineDesc) =
+  ## Consistency of a machine model against what the shared emitter assumes.
+  ## Cheap, once per target, and each arm is here because its absence cost real
+  ## debugging time — the reservation invariants were all STATED in the field
+  ## docs above and none of them was checked.
+  # The memcpy/memset scratch triple is read by the `risc/` lowering only, and a
+  # slot literal there is right by coincidence (design.md, "Fixed-register roles
+  # must be stated, not assumed"): all three or none, distinct, and each one an
+  # register the allocator hands out — anything else (`gp`/`tp` on RISC-V, rsp/rbp
+  # were x86-64 to read it) is a register the lowering has no right to.
+  if md.memIntrinScratch[0] != NoReg:
+    var mem: set[Reg] = {}
+    for r in md.memIntrinScratch:
+      doAssert r != NoReg,
+        "machine " & md.targetName & " reserves a PARTIAL memIntrinScratch triple"
+      doAssert r notin mem,
+        "machine " & md.targetName & " names the same register twice in `memIntrinScratch`"
+      mem.incl r
+      doAssert r in md.intArgRegs or r in md.intTempRegs or
+               r in md.intLocalTempRegs or r in md.intCalleeSaved,
+        "machine " & md.targetName & " names " & $r & " as memcpy scratch, which is " &
+        "not a register its allocator hands out"
+  if md.bridgeRegs.len == 0:
+    # x86-64 reserves a single `stagingBridgeReg` instead of a bridge list.
+    doAssert md.stagingBridgeReg != NoReg,
+      "machine " & md.targetName & " reserves no emitter scratch at all"
+    return
+  doAssert md.bridgeRegs.len >= EmitterBridgeDemand,
+    "machine " & md.targetName & " reserves " & $md.bridgeRegs.len &
+    " emitter bridges; the shared emitter holds up to " & $EmitterBridgeDemand
+  var seen: set[Reg] = {}
+  for r in md.bridgeRegs:
+    doAssert r != NoReg, "machine " & md.targetName & " has a NoReg bridge"
+    doAssert r notin seen,
+      "machine " & md.targetName & " lists the same register twice in " &
+      "`bridgeRegs`, so it has fewer bridges than it claims — this is how RV32 " &
+      "shipped `[R29, R30, R30]` and asserted on every two-ended aggregate copy"
+    seen.incl r
+  doAssert md.produceBridge == md.bridgeRegs[^1],
+    "machine " & md.targetName & "'s produce bridge is not the last `bridgeRegs` entry"
+  # A bridge the allocator can also hand out is not a reservation.
+  for pool in [md.intArgRegs, md.intTempRegs, md.intLocalTempRegs,
+               md.intCalleeSaved]:
+    for r in pool:
+      doAssert r notin seen,
+        "machine " & md.targetName & " allocates " & $r & ", which it also " &
+        "reserves as an emitter bridge"
+  # The atomic triple, if the target claims one, is subject to the same rule: an
+  # LL/SC loop holds all three across instructions no allocator knows about.
+  if md.atomicScratch[0] != NoReg:
+    var atom: set[Reg] = {}
+    for r in md.atomicScratch:
+      doAssert r != NoReg,
+        "machine " & md.targetName & " reserves a PARTIAL atomic scratch triple; " &
+        "an LL/SC loop needs old, new and status together, or none at all"
+      doAssert r notin atom,
+        "machine " & md.targetName & " names the same register twice in " &
+        "`atomicScratch`, so its `ldaxr`/`stlxr` loop would use one register for " &
+        "two of old/new/status"
+      atom.incl r
+    for pool in [md.intArgRegs, md.intTempRegs, md.intLocalTempRegs,
+                 md.intCalleeSaved]:
+      for r in pool:
+        doAssert r notin atom,
+          "machine " & md.targetName & " allocates " & $r & ", which its atomic " &
+          "sequences claim for the whole retry loop"

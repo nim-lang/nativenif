@@ -1,0 +1,31 @@
+(.nif27)
+(stmts
+ (type :Big.0 .
+  (object .
+   (fld :a.0 .
+    (i 16))
+   (fld :b.0 .
+    (i 16))
+   (fld :c.0 .
+    (i 16))))
+ (proc :take.0
+  (params
+   (param :w.0 . Big.0))
+  (i 16)
+  (pragmas)
+  (stmts
+   (ret
+    (dot w.0 a.0 0))))
+ (proc :main.0
+  (params)
+  (i 16)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :b.0 . Big.0
+    (oconstr Big.0
+     (kv a.0 1)
+     (kv b.0 2)
+     (kv c.0 3)))
+   (ret
+    (call take.0 b.0)))))

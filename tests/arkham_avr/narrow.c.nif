@@ -1,0 +1,37 @@
+(.nif27)
+(stmts
+ (proc :setI8.0
+  (params
+   (param :p.0 .
+    (ptr
+     (i 8))))..
+  (stmts
+   (asgn
+    (deref p.0)-19)))
+ (proc :main.0
+  (params)
+  (i 16)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :a.0 .
+    (i 8)0)
+   (var :b.0 .
+    (u 8)200)
+   (call setI8.0
+    (addr a.0))
+   (if
+    (elif
+     (neq
+      (conv
+       (i 16)a.0)-19)
+     (stmts
+      (ret 11))))
+   (if
+    (elif
+     (neq
+      (conv
+       (i 16)b.0)200)
+     (stmts
+      (ret 12))))
+   (ret 42))))

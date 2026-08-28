@@ -1,0 +1,28 @@
+(.nif27)
+(stmts
+ (proc :fac.0
+  (params
+   (param :n.0 .
+    (i 16)))
+  (i 16).
+  (stmts
+   (if
+    (elif
+     (lt
+      n.0 2)
+     (stmts
+      (ret 1))))
+   (ret
+    (mul
+     (i 16)n.0
+     (call fac.0
+      (sub
+       (i 16)n.0 1))))))
+ (proc :main.0
+  (params)
+  (i 16)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (ret
+    (call fac.0 5)))))

@@ -7,7 +7,14 @@
 
 ## Self-contained tests for `wasmenc`: LEB128 edge cases, a byte-exact golden
 ## module, node validation + instantiation of a richer module, and type dedup.
-## Run: `nim c -r twasmenc.nim` (needs `node` on PATH for the wasm checks).
+## Run: `nim c -r twasmenc.nim`.
+##
+## The encoding checks need nothing but this file. The two checks that make a
+## wasm ENGINE the judge — does the module validate, and does running it produce
+## 42 — need `node` on PATH; without it they are skipped and the skip is
+## reported, so a run on a machine with no node is not silently thinner than it
+## looks. CI installs node, and the tester turns its absence into a failure
+## there (see `ithaquaTests`).
 
 import std / [os, osproc, strutils, sequtils]
 import wasmenc
@@ -34,6 +41,10 @@ proc decodeSleb(bytes: openArray[byte]): int64 =
     if (cur and 0x80'u8) == 0'u8: break
   if shift < 64 and (cur and 0x40'u8) != 0'u8:
     result = result or (not 0'i64 shl shift)
+
+let nodeExe = findExe("node")
+  ## "" when node is absent: the two engine-judged blocks then skip.
+var skipped = 0
 
 proc runNode(scriptSrc, wasmPath: string): tuple[output: string; exitCode: int] =
   ## Writes `scriptSrc` to a temp .js and runs `node script wasmPath`.
@@ -91,6 +102,9 @@ block golden:
     assert false
 
   # instantiate under node and check add2(20,22) == 42
+  if nodeExe.len == 0:
+    inc skipped
+    break golden
   let wasmPath = getTempDir() / "ithaqua_add2_" & $getCurrentProcessId() & ".wasm"
   writeFile(wasmPath, got)
   defer: removeFile(wasmPath)
@@ -139,6 +153,9 @@ block richer:
   m.addCode(noLocals, startBody.data)
 
   let bytes = m.encode()
+  if nodeExe.len == 0:
+    inc skipped
+    break richer
   let wasmPath = getTempDir() / "ithaqua_rich_" & $getCurrentProcessId() & ".wasm"
   writeFile(wasmPath, bytes)
   defer: removeFile(wasmPath)
@@ -164,4 +181,8 @@ block dedup:
   assert c != a, "distinct signature must get a fresh index"
   assert a == 0'u32 and c == 1'u32
 
-echo "twasmenc: all tests passed"
+if skipped > 0:
+  echo "twasmenc: all tests passed (", skipped,
+       " engine-judged blocks SKIPPED - `node` is not on PATH)"
+else:
+  echo "twasmenc: all tests passed"

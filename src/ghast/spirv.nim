@@ -95,9 +95,9 @@ type
     DescriptorSet = "DescriptorSet"
     Binding = "Binding"
 
-template tagId*(op: SpirvOp): TagId = TagId(uint32(op) + 1'u32)
+template tagId(op: SpirvOp): TagId = TagId(uint32(op) + 1'u32)
 
-proc newSpirvModule*(): TokenBuf =
+proc newSpirvModule(): TokenBuf =
   ## A fresh output buffer whose tag pool is the `SpirvOp` enum.
   createTokenBuf(64, nil, createTags[SpirvOp]())
 

@@ -3,3 +3,11 @@ nimblecache/
 htmldocs/
 *.exe
 nimcache_m/
+# `nim c src/arkham/arkham.nim` without -o drops its binary beside the source;
+# two of them reached a commit before this line existed.
+src/arkham/arkham
+src/nifasm/nifasm
+bin/
+
+# Built by `nim c tools/gen_instructions.nim`; the generator, not its output.
+tools/gen_instructions

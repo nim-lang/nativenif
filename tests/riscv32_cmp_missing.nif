@@ -1,0 +1,14 @@
+(.nif27)
+(stmts
+ (arch riscv32)
+ (var :a.0
+  (x18)
+  (i 32))
+ (mov a.0 5)
+ (cfvar :ok.0)
+ (ite
+  (zf)
+  (stmts
+   (mov a.0 1))
+  (stmts
+   (mov a.0 0))))

@@ -1,6 +1,6 @@
 # The runtime stack-trace table
 
-`.eh_frame` (see `src/nifasm/dwarf.nim`) tells a *debugger* how to walk our
+`.eh_frame` (see `src/nifasm/image/dwarf.nim`) tells a *debugger* how to walk our
 stack. This tells the *program itself*. It is what `getStackTrace()` reads —
 nimony's `lib/std/stacktraces`.
 
