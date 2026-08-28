@@ -1,0 +1,41 @@
+(.nif27)
+(stmts
+ (type :Pt.0 .
+  (object .
+   (fld :x.0 .
+    (i 16))
+   (fld :y.0 .
+    (i 16))))
+ (proc :mk.0
+  (params
+   (param :a.0 .
+    (i 16))
+   (param :b.0 .
+    (i 16)))Pt.0 .
+  (stmts
+   (var :r.0 . Pt.0 .)
+   (asgn
+    (dot r.0 x.0 0)a.0)
+   (asgn
+    (dot r.0 y.0 0)b.0)
+   (ret r.0)))
+ (proc :sum.0
+  (params
+   (param :p.0 . Pt.0))
+  (i 16).
+  (stmts
+   (ret
+    (add
+     (i 16)
+     (dot p.0 x.0 0)
+     (dot p.0 y.0 0)))))
+ (proc :main.0
+  (params)
+  (i 16)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :v.0 . Pt.0
+    (call mk.0 40 2))
+   (ret
+    (call sum.0 v.0)))))

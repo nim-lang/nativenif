@@ -36,7 +36,7 @@ proc pass1Proc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: str
     var r = sig.res; procTyp.results = parseResult(r, scope, ctx)
   if sig.hasClobber:
     var cl = sig.clobber
-    procTyp.clobbers = parseClobbers(cl, procTyp.clobbersA64, procTyp.clobbersM, procTyp.clobbersRv)
+    procTyp.clobbers = parseClobbers(cl, procTyp.clobbersA64, procTyp.clobbersM, procTyp.clobbersAvr, procTyp.clobbersRv)
     procTyp.hasClobberDecl = true
 
   let sym = Symbol(name: ctx.symIdOf(name), kind: skProc, typ: procTyp, offset: -1,
@@ -63,7 +63,7 @@ proc pass1Syproc(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: s
     var r = sig.res; procTyp.results = parseResult(r, scope, ctx)
   if sig.hasClobber:
     var cl = sig.clobber
-    procTyp.clobbers = parseClobbers(cl, procTyp.clobbersA64, procTyp.clobbersM, procTyp.clobbersRv)
+    procTyp.clobbers = parseClobbers(cl, procTyp.clobbersA64, procTyp.clobbersM, procTyp.clobbersAvr, procTyp.clobbersRv)
     procTyp.hasClobberDecl = true
 
   if n.kind != IntLit: error("Expected syscall number in syproc", n)
@@ -93,13 +93,16 @@ proc handleArch*(n: var Cursor; ctx: var GenContext) =
     ctx.arch = Arch.WinA64
   elif arch == "cortex_m":
     ctx.arch = Arch.CortexM
+  elif arch == "avr":
+    ctx.arch = Arch.Avr
   elif arch == "riscv32":
     ctx.arch = Arch.Rv32
   else:
     error("Unknown architecture: " & arch, n)
   setAsmWordSize(case ctx.arch
                  of Arch.X64, Arch.LinuxA64, Arch.A64, Arch.WinX64, Arch.WinA64: 8
-                 of Arch.CortexM, Arch.Rv32: 4)
+                 of Arch.CortexM, Arch.Rv32: 4
+                 of Arch.Avr: 2)
   inc n
 
 proc pass1*(n: var Cursor; scope: Scope; ctx: var GenContext; moduleName: string; buf: var TokenBuf) =

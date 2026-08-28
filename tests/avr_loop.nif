@@ -1,0 +1,27 @@
+(.nif27)
+(stmts
+ (arch avr)
+ (proc :main.0
+  (params)
+  (result :mret.0 (rp24) (i 16))
+  (stmts
+   (var :i.0 (rp24) (i 16))
+   (var :sum.0 (rp18) (i 16))
+   (var :lim.0 (rp20) (i 16))
+   (ldi (lo sum.0) 0)
+   (ldi (hi sum.0) 0)
+   (ldi (lo i.0) 0)
+   (ldi (hi i.0) 0)
+   (ldi (lo lim.0) 10)
+   (ldi (hi lim.0) 0)
+   (loop
+    (stmts
+     (cmp (lo i.0) (lo lim.0))
+     (cpc (hi i.0) (hi lim.0))
+     (beq done.0)
+     (add (lo sum.0) (lo i.0))
+     (adc (hi sum.0) (hi i.0))
+     (adiw i.0 1)))
+   (lab :done.0)
+   (movw (rp24) sum.0)
+   (bkpt 30))))

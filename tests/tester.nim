@@ -1006,6 +1006,95 @@ proc thumb2SelfTest() =
   echo "Thumb-2 encoder self-test successful (all checks passed)"
 
 
+const avrSim = "bin" / "avrtest"
+
+proc avrSelfTest() =
+  ## Build the AVR encoder's self-checking image and run it. The image computes
+  ## 59 expressions and exits with the 1-based index of the first whose result
+  ## differs from the expected value, so a failure NAMES the broken encoding.
+  ##
+  ## Then the same image is built 59 more times, each with one check's EXPECTED
+  ## value corrupted, and each of those must fail with exactly that index. That
+  ## sweep is what makes the first run mean something: a check whose emitter
+  ## writes no bytes at all, or which compares against a value the harness itself
+  ## left in the pair, passes the plain run and says nothing.
+  ##
+  ## AVRtest is built from source rather than installed — see doc/internals/avr.md.
+  if not fileExists(avrSim):
+    echo avrSim, " not found - skipping AVR encoder self-test ",
+         "(build it: see doc/internals/avr.md)"
+    return
+  let gen = ("bin" / "avr_selftest").addFileExt(ExeExt)
+  exec "nim c --hints:off --warnings:off -o:" & gen & " tests/avr_selftest.nim"
+  let elf = "tests" / "avr_selftest.elf"
+
+  proc runImage(): (string, int) =
+    var args = @["-q", "-mmcu=avr5", "-s", "32k", elf]
+    runProgram(avrSim, args)
+
+  exec quoteShell(gen) & " " & quoteShell(elf)
+  let (output, code) = runImage()
+  if code == timeoutExitCode:
+    quit "FAILURE (TIMEOUT) AVR encoder self-test\n"
+  if code != 0:
+    quit "FAILURE AVR encoder self-test: check #" & $code &
+         " produced the wrong value\n" & output &
+         "\n(run `" & gen & " --list` to name the checks by index)"
+
+  let (listing, listCode) = runProgram(gen, @["--list"])
+  if listCode != 0: quit "FAILURE AVR encoder self-test: --list failed"
+  let total = listing.strip.splitLines.len
+  for i in 1 .. total:
+    exec quoteShell(gen) & " " & quoteShell(elf) & " --mutate:" & $i
+    let (_, mutCode) = runImage()
+    if mutCode != i:
+      quit "FAILURE AVR encoder self-test: check #" & $i &
+           " does not detect its own mutation (exited " & $mutCode &
+           ", expected " & $i & ") — it is passing vacuously"
+  removeFile elf
+  echo "AVR encoder self-test successful (", total,
+       " checks, each verified to detect its own mutation)"
+
+
+proc avrAsmTests() =
+  ## Assemble hand-written AVR asm-NIF with nifasm and run the resulting firmware
+  ## under AVRtest. This is the END-TO-END gate for the instruction selector: the
+  ## encoder self-test proves the ENCODINGS, but only these exercise the operand
+  ## model, the register-binding table, the relocation patching and the ELF32
+  ## image together.
+  ##
+  ## Each fixture exits with a value it COMPUTED, so a wrong encoding shows up as
+  ## a wrong exit code rather than as output that happens to look right.
+  if not fileExists(avrSim):
+    echo avrSim, " not found - skipping AVR assembler tests"
+    return
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  const fixtures = [("hello_avr", 0, "Hello AVR\n"),
+                    ("avr_alu", 158, ""),
+                    ("avr_branch", 42, ""),
+                    ("avr_loop", 45, ""),
+                    ("avr_frame", 42, ""),
+                    ("avr_call", 42, "")]
+  var passed = 0
+  for (stem, wantCode, wantOut) in fixtures:
+    let src = "tests" / (stem & ".nif")
+    let elf = "tests" / (stem & ".elf")
+    exec quoteShell(nifasmExe) & " -o:" & quoteShell(elf) & " " & quoteShell(src)
+    let (output, code) = runProgram(avrSim,
+      @["-q", "-mmcu=avr5", "-s", "32k", elf])
+    if code == timeoutExitCode:
+      quit "FAILURE (TIMEOUT) avr " & stem & "\n"
+    if code != wantCode:
+      quit "FAILURE avr " & stem & ": exit " & $code & ", want " &
+           $wantCode & "\n" & output
+    if output != wantOut:
+      quit "FAILURE avr " & stem & " output\nExpected: " & escape(wantOut) &
+           "\nGot:      " & escape(output)
+    removeFile elf
+    inc passed
+  echo passed, " / ", fixtures.len, " AVR assembler tests successful"
+
+
 const rv32Qemu = "qemu-system-riscv32"
 const rv32Args = ["-M", "virt", "-bios", "none",
                   "-display", "none", "-serial", "none", "-monitor", "none",
@@ -1351,6 +1440,82 @@ proc rv32StressTests() =
   putEnv("ARKHAM_STRESS", "")
   echo passed, " / ", total, " RV32 stress tests successful (ARKHAM_STRESS=",
        rv32StressLevel, ", I1/I2 bridge-budget assertions compiled in)"
+
+
+proc arkhamAvrTests() =
+  ## The AVR Leng corpus: `arkham -a:avr` → `nifasm` → AVRtest, checking each
+  ## fixture's exit code against its `.exitcode` file — the same oracle every
+  ## other target's corpus uses.
+  if not fileExists(avrSim):
+    echo avrSim, " not found - skipping arkham AVR tests"
+    return
+  let arkhamExe = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasmExe = ("bin" / "nifasm").addFileExt(ExeExt)
+  var passed = 0
+  var total = 0
+  for file in walkFiles("tests/arkham_avr/*.c.nif"):
+    inc total
+    let stem = file.extractFilename.changeFileExt("").changeFileExt("")
+    let asmFile = "tests" / "arkham_avr" / (stem & ".asm.nif")
+    let elf = "tests" / "arkham_avr" / (stem & ".elf")
+    exec quoteShell(arkhamExe) & " -a:avr -o:" & quoteShell(asmFile) & " " &
+         quoteShell(file)
+    exec quoteShell(nifasmExe) & " -o:" & quoteShell(elf) & " " & quoteShell(asmFile)
+    let (output, code) = runProgram(avrSim, @["-q", "-mmcu=avr5", "-s", "32k", elf])
+    if code == timeoutExitCode:
+      quit "FAILURE (TIMEOUT) arkham avr " & stem & "\n"
+    let want = parseInt(readFile("tests" / "arkham_avr" / (stem & ".exitcode")).strip)
+    if code != want:
+      quit "FAILURE arkham avr " & stem & ": exit " & $code & ", want " & $want &
+           "\n" & output
+    removeFile asmFile
+    removeFile elf
+    inc passed
+  echo passed, " / ", total, " arkham AVR tests successful"
+
+
+proc arkhamAvrRejections() =
+  ## A partial backend is only safe to ship if the gap is a DIAGNOSTIC rather
+  ## than a wrong answer, and this backend's gap is wide. So the diagnostics are
+  ## what these pin: each input names a construct the emitter does not implement,
+  ## and the refusal has to say which one and where to look.
+  let arkhamExe = ("bin" / "arkham").addFileExt(ExeExt)
+  const cases = [
+    # A 32-bit value. The failure a user is most likely to hit, because the
+    # frontend's default `int` is wider than this machine's word — and the one
+    # that must never be silently truncated, since every load and store the
+    # emitter writes moves exactly two bytes.
+    ("tests/arkham_m/leafret.c.nif", "32 bits wide"),
+    # A 32-bit result, in its own file rather than borrowed from another
+    # corpus — the width refusal is the one a user meets first and it should not
+    # depend on what some other target's fixtures happen to contain.
+    ("tests/arkham_avr_reject/wide.c.nif", "32 bits wide"),
+    # A shift by a value rather than a constant. Refused for what the MACHINE is
+    # — there is no variable-shift instruction — not for a missing feature.
+    ("tests/arkham_avr_reject/varshift.c.nif", "variable-shift"),
+    # A syscall. Refused for what it IS rather than as an unimplemented feature:
+    # a firmware image has no OS underneath it, on this target or any other.
+    ("tests/arkham/hello.c.nif", "no OS to call into"),
+    # An AGGREGATE global. Refused because its initial IMAGE would have to ship
+    # in flash and be copied into SRAM at startup — a scalar's initial value is
+    # a store the entry proc emits, and an array's would be hundreds of them.
+    ("tests/arkham_avr_reject/gvar_aggr.c.nif", "is an aggregate"),
+    # An aggregate parameter passed by REFERENCE whose pointer the allocator put
+    # in an ordinary pair. Refused for what the MACHINE is: only X, Y and Z
+    # address memory here, and the staging would have to happen inside a memory
+    # operand — which is not a place instructions can be emitted.
+    ("tests/arkham_avr_reject/aggr_byref_pair.c.nif", "only X, Y and Z")]
+  var passed = 0
+  for (file, want) in cases:
+    let (output, code) = runProgram(arkhamExe,
+      @["-a:avr", "-o:" & (getTempDir() / "avr_reject.asm.nif"), file])
+    if code == 0:
+      quit "FAILURE arkham avr rejection: " & file & " was ACCEPTED"
+    if not output.contains(want):
+      quit "FAILURE arkham avr rejection: " & file & "\nexpected to mention: " &
+           want & "\ngot: " & output
+    inc passed
+  echo passed, " / ", cases.len, " arkham AVR rejection tests successful"
 
 
 proc cortexMAsmTests() =
@@ -2013,6 +2178,14 @@ cortexMInterruptTests()
 cortexMLayoutTests()
 arkhamCortexMTests()
 arkhamCortexM64Tests()
+
+# AVR: encoder-level coverage, then the selector end to end. Host-independent —
+# both need only `bin/avrtest`.
+avrSelfTest()
+avrAsmTests()
+
+arkhamAvrTests()
+arkhamAvrRejections()
 
 # arkham native-codegen tests: arkham emits the host arch (x86-64 on Linux,
 # AArch64/Darwin on macOS), so we run them only where the binaries execute.

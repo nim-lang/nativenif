@@ -29,6 +29,29 @@ type
       ## `adr` supplies the PC — so unlike `adrp`+`add` it needs no page arithmetic
       ## and no knowledge of the section's final vaddr, which is why it can live here
       ## and serve Mach-O, ELF and PE alike.
+    rkTB, rkTBL, rkTBcond, rkTADR, rkTMovwMovt, rkTMovwMovtFunc,
+    rkAvrRjmp, rkAvrRcall, rkAvrBrcond, rkAvrJmp, rkAvrCall, rkAvrLdiAddr,
+      ## AVR. Flash is addressed in WORDS and everything `relocs` measures is in
+      ## BYTES, so every displacement here is halved before it is encoded — a
+      ## step with no analogue on the other targets, and one that fails silently
+      ## if omitted, because a branch to half the intended distance still lands
+      ## on a real instruction and runs.
+      ##
+      ## The PC is the NEXT word, so the displacement is `target - (pos + 2)`
+      ## bytes. Reach is short and differs per form: `rkAvrRjmp`/`rkAvrRcall`
+      ## carry 12 signed word bits (±4 KB), and `rkAvrBrcond` carries 7 (±128
+      ## BYTES) — narrow enough that an ordinary loop body can outgrow it, which
+      ## is why the selector must be prepared to invert the condition and branch
+      ## over an `rjmp`. The condition itself is preserved from the word already
+      ## in the buffer, so one kind covers all fourteen.
+      ##
+      ## `rkAvrJmp`/`rkAvrCall` are two words carrying an absolute 22-bit WORD
+      ## address, which reaches all of flash and is therefore the default form.
+      ##
+      ## `rkAvrLdiAddr` is a pair of `ldi`s carrying a label's absolute DATA
+      ## address, low half then high — the twin of `rkTMovwMovt`, fixed-size for
+      ## the same reason: patching must never resize an instruction.
+
     rkRvJ, rkRvJal, rkRvBranch, rkRvAuipcAddi, rkRvLuiAddi
       ## RV32. Every one is a fixed 32-bit little-endian word (no C extension), and
       ## every PC-relative form measures from the instruction's OWN address — like
@@ -55,8 +78,6 @@ type
       ## 0x1000, and the `+ 0x800` is what pre-compensates for it. Dropping that
       ## round-up is the classic RISC-V relocation bug — it is correct for every
       ## address whose low 12 bits are under 0x800 and off by 4096 for the rest.
-
-    rkTB, rkTBL, rkTBcond, rkTADR, rkTMovwMovt, rkTMovwMovtFunc
       ## Thumb-2 (Cortex-M). All four branch forms are 32-bit encodings stored as
       ## two little-endian HALFWORDS, high halfword first.
       ##
@@ -187,10 +208,70 @@ proc calculateRelocDistance(fromPos: int; toPos: int; kind: RelocKind = rkJmp): 
     toPos - (fromPos + 4)   # Thumb: PC reads two halfwords ahead of the instruction
   of rkTMovwMovt, rkTMovwMovtFunc:
     toPos                   # absolute: the patcher wants the target, not a distance
+  of rkAvrRjmp, rkAvrRcall, rkAvrBrcond:
+    toPos - (fromPos + 2)   # AVR: the PC is the next WORD; halved by the patcher
+  of rkAvrJmp, rkAvrCall, rkAvrLdiAddr:
+    toPos                   # absolute, like the Thumb pair above
   of rkRvJ, rkRvJal, rkRvBranch, rkRvAuipcAddi:
     toPos - fromPos         # RV32: PC-relative from the instruction's own address
   of rkRvLuiAddi:
     toPos                   # absolute, like the Thumb MOVW/MOVT pair
+
+proc patchAvrWord(buf: var Buffer; at: int; keep, bits: uint16) =
+  ## Rewrite one AVR word in place, preserving every bit outside `keep`'s
+  ## complement. Reading the word back rather than rebuilding it is what lets a
+  ## single relocation kind serve all fourteen branch conditions and both
+  ## `ldi` halves.
+  let old = uint16(buf.data[at]) or (uint16(buf.data[at + 1]) shl 8)
+  let w = (old and keep) or bits
+  buf.data[at] = byte(w and 0xFF)
+  buf.data[at + 1] = byte((w shr 8) and 0xFF)
+
+proc patchAvrReloc(buf: var Buffer; at: int; kind: RelocKind; distance: int) =
+  ## Every AVR displacement is a WORD count, so the byte distance is halved
+  ## here — the one step that has no analogue on the other targets.
+  case kind
+  of rkAvrRjmp, rkAvrRcall:
+    if (distance and 1) != 0:
+      raise newException(ValueError, "AVR branch to an odd address: " & $distance)
+    let off = distance div 2
+    if off < -2048 or off > 2047:
+      raise newException(ValueError,
+        "AVR rjmp/rcall out of range: " & $distance & " bytes (limit ±4 KB); " &
+        "the two-word `jmp`/`call` reaches all of flash")
+    patchAvrWord(buf, at, 0xF000'u16, uint16(off) and 0x0FFF)
+  of rkAvrBrcond:
+    if (distance and 1) != 0:
+      raise newException(ValueError, "AVR branch to an odd address: " & $distance)
+    let off = distance div 2
+    if off < -64 or off > 63:
+      raise newException(ValueError,
+        "AVR conditional branch out of range: " & $distance &
+        " bytes (limit ±128); invert the condition and branch over an `rjmp`")
+    # bits 9:3 are the displacement; the condition (bits 2:0 and 10) stays.
+    patchAvrWord(buf, at, 0xFC07'u16, (uint16(off) and 0x7F) shl 3)
+  of rkAvrJmp, rkAvrCall:
+    # An absolute 22-bit WORD address, scattered across both words: k21..k17 in
+    # bits 8:4 of the first, k16 in its bit 0, and k15..k0 in the second.
+    let target = distance + int(buf.absBase)
+    if (target and 1) != 0:
+      raise newException(ValueError, "AVR call to an odd address: " & $target)
+    let k = target div 2
+    if k < 0 or k > 0x3FFFFF:
+      raise newException(ValueError, "AVR jmp/call target out of flash: " & $target)
+    patchAvrWord(buf, at, 0xFE0E'u16,
+                 (uint16((k shr 17) and 0x1F) shl 4) or uint16((k shr 16) and 1))
+    patchAvrWord(buf, at + 2, 0x0000'u16, uint16(k and 0xFFFF))
+  of rkAvrLdiAddr:
+    # Two `ldi`s carrying a DATA address: low half, then high. `absBase` is what
+    # the image writer contributes once it knows where the section lands.
+    let value = distance + int(buf.absBase)
+    proc kBits(v: int): uint16 =
+      ((uint16(v) shr 4) and 0xF) shl 8 or (uint16(v) and 0xF)
+    patchAvrWord(buf, at, 0xF0F0'u16, kBits(value and 0xFF))
+    patchAvrWord(buf, at + 2, 0xF0F0'u16, kBits((value shr 8) and 0xFF))
+  else:
+    raise newException(ValueError, "not an AVR relocation: " & $kind)
 
 # Jump optimization functions
 proc updateRelocDisplacements*(buf: var Buffer) =
@@ -226,6 +307,10 @@ proc updateRelocDisplacements*(buf: var Buffer) =
         currentPos + 4  # a 32-bit Thumb-2 encoding: two halfwords
       of rkTMovwMovt, rkTMovwMovtFunc:
         currentPos + 8  # MOVW + MOVT pair
+      of rkAvrRjmp, rkAvrRcall, rkAvrBrcond:
+        currentPos + 2  # one AVR word
+      of rkAvrJmp, rkAvrCall, rkAvrLdiAddr:
+        currentPos + 4  # two words: an absolute branch, or the `ldi` pair
       of rkRvJ, rkRvJal, rkRvBranch:
         currentPos + 4  # one 32-bit RV32 word
       of rkRvAuipcAddi, rkRvLuiAddi:
@@ -450,6 +535,8 @@ proc updateRelocDisplacements*(buf: var Buffer) =
       let thumbBit = if reloc.kind == rkTMovwMovtFunc: 1'u32 else: 0'u32
       buf.data.patchThumbMovwMovtPair(currentPos,
                                       uint32(distance) + buf.absBase + thumbBit)
+    of rkAvrRjmp, rkAvrRcall, rkAvrBrcond, rkAvrJmp, rkAvrCall, rkAvrLdiAddr:
+      patchAvrReloc(buf, currentPos, reloc.kind, distance)
     of rkRvJ, rkRvJal:
       # RV32 J-type `jal rd, label`. The 20-bit field is scattered as
       # imm[20|10:1|11|19:12] and the low bit is IMPLICIT — a target address is

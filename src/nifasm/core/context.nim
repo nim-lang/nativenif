@@ -26,6 +26,7 @@ import "../image/dwarf"                 # ProcUnwind: the per-proc CFI the write
 import "../x64/encoder" as x86
 import "../arm64/encoder" as arm64
 from "../thumb/encoder" as thumb2 import nil
+from "../avr/encoder" as avr import nil
 from "../rv32/encoder" as rv32 import nil
 
 const MainModuleName* = ""  # Special name for main module
@@ -66,6 +67,7 @@ type
     WinX64     # Windows x86-64 (PE)
     WinA64     # Windows ARM64 (PE)
     CortexM    # Bare-metal ARMv7E-M / Cortex-M4 (ELF32 firmware image, no OS)
+    Avr        # Bare-metal AVR / avr5 (ELF32 firmware image, no OS)
     Rv32       # Bare-metal RV32IMAFD / ilp32d (ELF32 firmware image, no OS)
 
   ImportedLib* = object
@@ -209,6 +211,15 @@ type
     mFRegBindings*: Table[thumb2.FloatRegister, string]
                         # The FPv4-SP twin of `mRegBindings`: which s-register hosts a
                         # named float local or scratch temp.
+    avrRegBindings*: Table[avr.Register, string]
+                        # AVR counterpart of `regBindings`, and the one that is keyed
+                        # by a HALF: a 16-bit local occupies a pair, so binding it
+                        # records both r and r+1 under the same name. That is what lets
+                        # a raw 8-bit `(r24)` use of a register the high half of some
+                        # pair-typed local lives in be rejected — the case a table keyed
+                        # by pairs could not see at all.
+    clobberedAvr*: set[avr.Register]
+                        # AVR counterpart of `clobberedM`: caller-saved registers a call
     rvRegBindings*: Table[rv32.Register, string]
                         # RV32 counterpart of `regBindings`: which integer register
                         # currently hosts a named local.

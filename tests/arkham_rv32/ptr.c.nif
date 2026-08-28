@@ -1,0 +1,20 @@
+(.nif27)
+(stmts
+ (proc :main.0
+  (params)
+  (i 16)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :x.0 .
+    (i 16)40)
+   (var :p.0 .
+    (ptr
+     (i 16))
+    (addr x.0))
+   (asgn
+    (deref p.0)
+    (add
+     (i 16)
+     (deref p.0)2))
+   (ret x.0))))

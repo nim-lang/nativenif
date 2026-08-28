@@ -51,3 +51,5 @@ nim r tests/tester.nim           # builds both and runs the whole corpus
 | [doc/tracetable.md](doc/tracetable.md) | the runtime stack-trace table `getStackTrace()` reads |
 | [src/arkham/design.md](src/arkham/design.md) | arkham's register strategy |
 | [doc/internals/terms.md](doc/internals/terms.md) | glossary: `bridge`, `home`, `volatile`, `eightbyte`, … |
+| [doc/internals/avr.md](doc/internals/avr.md) | the AVR target: register pairs, ABI, milestones |
+| [tests/arkham_rv32/README.md](tests/arkham_rv32/README.md) | the RISC-V 32 target: bare-metal RV32IMAFD under qemu-system-riscv32, and what its corpus shares with Cortex-M |

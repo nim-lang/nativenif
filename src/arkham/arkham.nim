@@ -24,6 +24,7 @@ import core/temps                # `dumpTempStats`, under -d:arkhamTempDbg only 
 import risc/driver               # every load/store target: AArch64 (Darwin/Linux),
                                 # Cortex-M, RV32. One emitter, one machine model each.
 import x64/driver                # x86-64 / Linux backend
+import avr/driver                # AVR / avr5, bare metal
 
 const
   Version = "0.1.0"
@@ -36,7 +37,7 @@ Options:
   -o:file, --output:file   output asm-NIF file (default: <input>.asm.nif)
   --os:SYMBOL              target OS: linux | windows | macosx | embedded
                            (default: host)
-  --cpu:SYMBOL             target CPU: amd64 | arm64 | arm32 | riscv32
+  --cpu:SYMBOL             target CPU: amd64 | arm64 | arm32 | avr | riscv32
                            (default: host)
   --layout:FILE            bare-metal targets only: the BOARD — its memory regions, which
                            region each section lives in, the stack slots and
@@ -50,9 +51,10 @@ Options:
 
 Supported --os/--cpu combinations (same symbols as Nimony's flags):
   linux/amd64  windows/amd64  linux/arm64  macosx/arm64  embedded/arm32
-  embedded/riscv32
-  (embedded/arm32 is bare-metal Cortex-M4; see doc/cortex_m.md)
-  (embedded/riscv32 is bare-metal RV32IMAFD)
+  embedded/avr  embedded/riscv32
+  (embedded/arm32 is bare-metal Cortex-M4; see doc/internals/cortex_m.md.
+   embedded/avr is bare-metal avr5; see doc/internals/avr.md.
+   embedded/riscv32 is bare-metal RV32IMAFD)
 """
 
 proc archOf(os, cpu: string): string =
@@ -69,12 +71,13 @@ proc archOf(os, cpu: string): string =
              # table, because next to `arm64` the bare word never says which one
              # it is. `arm` stays accepted for what is already written.
              of "arm32", "arm": "arm32"
+             of "avr": "avr"
              # `riscv32` is nimony's platform spelling. `rv32` is accepted too:
              # it is what the ISA manual, the QEMU machine names and every
              # toolchain triple actually say.
              of "riscv32", "rv32": "riscv32"
              else: quit("arkham: unknown --cpu:" & cpu &
-                        " (supported: amd64, arm64, arm32, riscv32)", QuitFailure)
+                        " (supported: amd64, arm64, arm32, avr, riscv32)", QuitFailure)
   let osC = case osN
             of "linux": "linux"
             of "windows": "windows"
@@ -96,11 +99,12 @@ proc archOf(os, cpu: string): string =
   of "linux/arm64": "linux_arm64"
   of "macosx/arm64": "arm64"
   of "embedded/arm32": "cortex_m"
+  of "embedded/avr": "avr"
   of "embedded/riscv32": "riscv32"
   else:
     quit("arkham: unsupported --os/--cpu combination: " & osC & "/" & cpuC &
          " (supported: linux/amd64, windows/amd64, linux/arm64, macosx/arm64," &
-         " embedded/arm32, embedded/riscv32)",
+         " embedded/arm32, embedded/avr, embedded/riscv32)",
          QuitFailure)
 
 proc run(input, output, arch: string; board: layout.Layout) =
@@ -116,6 +120,7 @@ proc run(input, output, arch: string; board: layout.Layout) =
              of "linux_arm64", "linux_aarch64": generateA64(buf, input, tags, linux = true)
              of "cortex_m", "cortexm", "thumbm":
                generateM(buf, input, tags, board)
+             of "avr": generateAvr(buf, input, tags)
              of "riscv32", "rv32":
                generateRv32(buf, input, tags, board)
              else: quit("arkham: unknown --arch:" & arch, QuitFailure)

@@ -44,6 +44,8 @@ proc longSizeOf(kind: RelocKind): int {.inline.} =
   of rkADRADD: 8
   of rkTB, rkTBL, rkTBcond, rkTADR: 4
   of rkTMovwMovt, rkTMovwMovtFunc: 8
+  of rkAvrRjmp, rkAvrRcall, rkAvrBrcond: 2
+  of rkAvrJmp, rkAvrCall, rkAvrLdiAddr: 4
   # RV32 sizes, so this stays exhaustive. Nothing here ever RUNS on RV32 —
   # `isShrinkableX64` names only x86 forms, and the shortener is called from the
   # x86-64 back end alone — but a `case` that compiles by omission is how the next

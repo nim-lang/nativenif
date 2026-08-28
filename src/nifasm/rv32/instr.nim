@@ -492,15 +492,19 @@ proc aluFlexRv(n: var Cursor; ctx: var GenContext; op: AluOp) =
   ## emits the destructive two-operand spelling, Cortex-M the three-operand one —
   ## and RISC-V's `div rd, rs1, rs2` reads either. Rather than pick one and reject
   ## the other target's asm-NIF, the arity is read off the node.
-  inc n
-  let dst = parseDestRv(n, ctx)
-  let a = parseOperandRv(n, ctx)
-  let d = regOfRv(dst, "destination", n)
-  if n.hasMore:
-    let b = parseOperandRv(n, ctx)
-    emit3Rv(ctx, op, d, a, b, n)
-  else:
-    emitAluRv(ctx, op, d, d, a, n)
+  # The arity is a property of THIS node, so the node's own scope has to be
+  # entered to ask it: outside one, `hasMore` counts what is left of the
+  # enclosing block, and a two-operand `(sdiv q b)` read the following statement
+  # as its third operand.
+  into n:
+    let dst = parseDestRv(n, ctx)
+    let a = parseOperandRv(n, ctx)
+    let d = regOfRv(dst, "destination", n)
+    if n.hasMore:
+      let b = parseOperandRv(n, ctx)
+      emit3Rv(ctx, op, d, a, b, n)
+    else:
+      emitAluRv(ctx, op, d, d, a, n)
 
 # ── the instruction dispatch ────────────────────────────────────────────────
 

@@ -1,0 +1,21 @@
+(.nif27)
+(stmts
+ (arch avr)
+ (var :a.0 (rp18) (i 16))
+ (var :b.0 (rp20) (i 16))
+ (ldi (lo a.0) 100)
+ (ldi (hi a.0) 1)
+ (ldi (lo b.0) 100)
+ (ldi (hi b.0) 1)
+ (cmp (lo a.0) (lo b.0))
+ (cpc (hi a.0) (hi b.0))
+ (ite
+  (zf)
+  (stmts
+   (ldi (lo a.0) 42)
+   (ldi (hi a.0) 0))
+  (stmts
+   (ldi (lo a.0) 99)
+   (ldi (hi a.0) 0)))
+ (movw (rp24) a.0)
+ (bkpt 30))

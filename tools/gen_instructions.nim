@@ -10,7 +10,7 @@ proc toNimName(s: string; suffix: string): string =
 type
   EnumList = enum
     X64Inst, A64Inst, MInst, RvInst, NifasmType, NifasmDecl, NifasmExpr, X64Flag,
-    X64Reg, A64Reg, MReg, RvReg
+    X64Reg, A64Reg, MReg, RvReg, AvrInst, AvrReg
 
 proc toSuffix(e: EnumList): (string, string) =
   case e
@@ -31,6 +31,8 @@ proc toSuffix(e: EnumList): (string, string) =
   # ambiguous. X64Reg and A64Reg get away with sharing "R" only because no tag is
   # in both of them.
   of RvReg: ("RV", "NoRvReg")
+  of AvrInst: ("Avr", "NoAvrInst")
+  of AvrReg: ("AR", "NoAvrReg")
 
 proc shortcutToEnumList(shortcut: string): EnumList =
   try:
@@ -140,8 +142,22 @@ proc extractTagName(s: string): string =
     quit "Cannot extract tag name from: " & s
 
 const
-  LateEnums = {X64Inst, A64Inst, MInst, RvInst}
+  LateEnums = {X64Inst, A64Inst, MInst, RvInst, AvrInst, AvrReg}
     ## Enums whose SINGLE-target members are numbered LAST (see `genTags`).
+    ##
+    ## `Rv32Reg` is deliberately NOT here, unlike `AvrReg`: RISC-V reuses
+    ## `(x0)`..`(x30)` and `(sp)`, which already exist as AArch64 spellings, so
+    ## it mints no register tag at all and costs nothing. `x31` simply stays
+    ## unmapped — at thirty allocatable registers that is free, and it buys the
+    ## whole target out of the escape handling AVR needed at every operand site.
+    ##
+    ## `AvrReg` is the one REGISTER enum in here, and deliberately. Cortex-M
+    ## could reuse the spellings that already existed (`(r0)`..`(r12)` were there
+    ## as x86-64 aliases), so it cost no ids at all. AVR has 32 registers and 16
+    ## pairs, and only half the plain ones exist already — putting the other 48
+    ## up front would push 48 of the CURRENT targets' mnemonics past 511 and make
+    ## them cost two tokens each, which is exactly the invariant `genTags`
+    ## promises below. AVR pays for its own file instead.
 
 proc genTags(inp: File; inputName: string) =
   ## Tag ids are assigned here, and the order matters for one reason: a NIF tag
@@ -223,7 +239,7 @@ proc genTags(inp: File; inputName: string) =
 
   createDir "src/nifasm/core"
   writeTagsFile "src/nifasm/core/tags.nim", tags, inputName, anonHead = true
-  writeModel "src/nifasm/core/model.nim", enumDecls, X64Inst, RvReg, inputName
+  writeModel "src/nifasm/core/model.nim", enumDecls, X64Inst, AvrReg, inputName
 
 proc main(inputName: string) =
   var inp = open(inputName, fmRead)

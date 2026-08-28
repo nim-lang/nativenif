@@ -227,6 +227,11 @@ proc hereTarget*(g: CodeGen): IntrinsicTarget {.inline.} =
   of X86: tgX64
   of Arm64: tgA64
   of ThumbM: tgThumbM
+  of Avr:
+    # Unreachable: AVR has its own emitter. Named rather than folded into an arm
+    # with a plausible substitute — a wrong intrinsic target silently selects a
+    # row written for another machine.
+    raiseAssert "arkham: this target does not reach the load/store intrinsic table"
   of Rv32: tgRv32
 
 proc hasHereLowering*(g: CodeGen; targets: set[IntrinsicTarget]): bool {.inline.} =
@@ -1593,6 +1598,11 @@ proc logicalImmOk*(g: CodeGen; v: int64): bool {.inline.} =
   of ThumbExpandImm: thumbimm.isModifiedImm(v)
   of A64Bitmask: isLogicalImmA64(v)
   of X86Imm32: v >= low(int32) and v <= high(int32)
+  of AvrImm8:
+    # Unreachable: AVR has its own emitter. Named rather than folded in with a
+    # plausible answer — a wrong one here lets a constant ride along in an
+    # instruction that cannot carry it.
+    raiseAssert "arkham: this target does not reach the load/store immediate predicate"
   of RvImm12: v >= -2048 and v <= 2047
 
 proc normalizeUnaryWidth*(g: var CodeGen; resTypeC: Cursor; rD: Reg) =

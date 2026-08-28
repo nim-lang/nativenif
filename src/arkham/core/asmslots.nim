@@ -77,6 +77,15 @@ const
     ## x86-64 and AArch64.
   Word32* = TargetWord(ptrSize: 4, ptrAlign: 4, maxScalar: 4, maxFloat: 4)
     ## ARMv7-M (Cortex-M) and any other 32-bit target.
+  Word16* = TargetWord(ptrSize: 2, ptrAlign: 1, maxScalar: 2, maxFloat: 4)
+    ## AVR. `ptrAlign` is 1 because the machine has no alignment requirement at
+    ## all — every load and store is a byte at a time and there is no unaligned
+    ## trap to avoid, so aligning a pointer field would only waste the RAM.
+    ##
+    ## `maxFloat` is a lie of convenience: AVR has no FPU, and a float is refused
+    ## BY NAME in the backend rather than lowered. The field is left at 4 so that
+    ## `defaultFloatSlot` — which is reached while classifying types, before any
+    ## refusal — yields a well-formed slot rather than a zero-sized one.
 
 var targetWord = Word64
   ## Defaults to 64-bit so a backend that never calls `setTargetWord` behaves

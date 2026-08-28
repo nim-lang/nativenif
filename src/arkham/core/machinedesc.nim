@@ -68,13 +68,20 @@ type
     ## `Arm64` at every one of them. What differs between the two is the word
     ## size and the register file, and both of those are already values.
     ##
+    ## `Avr` groups with `X86` at every one of them, and for the reason the user
+    ## of this backend gave: its ALU is destructive and two-operand, so the
+    ## question those branches are really asking — "does the destination have to
+    ## BE one of the sources" — has x86's answer. It parts company only at
+    ## `scratchDemand`, where it answers like the ARM targets because it has no
+    ## store-immediate and no PC-relative data operand either.
+    ##
     ## `Rv32` groups with `Arm64`/`ThumbM` at every one of those branches too: it
     ## is a three-operand ALU with no fixed division or shift-count register, and
     ## the questions the planner asks are exactly the ones that separates from
     ## x86. What differs between it and the two Arm targets is the word size, the
     ## register file and a handful of capabilities — and all three are already
     ## values rather than branches.
-    X86, Arm64, ThumbM, Rv32
+    X86, Arm64, ThumbM, Avr, Rv32
 
   TargetFeature* = enum
     ## What this target's asm-NIF vocabulary OFFERS. Read as `X in md.caps` in
@@ -161,6 +168,14 @@ type
     PushFrame    ## the `call` instruction pushed the return address; one
                  ## `push`/`pop` per saved register. `codegen_x64` builds its own
                  ## prologue and does not consult this yet.
+    AvrFrame     ## `push`/`pop` per saved register like `PushFrame`, but WITH a
+                 ## frame pointer — and not as a convenience. AVR's SP lives in
+                 ## the I/O space and cannot address memory at all, so Y is the
+                 ## only way to reach a stack slot, and establishing it is not
+                 ## optional the way an rbp frame is. Lowering SP is also three
+                 ## instructions rather than one (`in`/`in`, arithmetic,
+                 ## `out`/`out`), which is why the frame is set up once and left
+                 ## alone.
 
   ImmStyle* = enum
     ## How this target encodes an ALU immediate, hence which constants may ride
@@ -180,6 +195,9 @@ type
                       ## special shape like the other three — which is the point:
                       ## there is exactly one rule to check, and anything outside
                       ## ±2048 is `lui`+`addi` into a register.
+    AvrImm8           ## an 8-bit constant, and only into r16..r31. Nothing wider
+                      ## is an immediate here at all: a 16-bit constant is two
+                      ## `ldi`s, and the pair-wide `adiw`/`sbiw` carry six bits
 
   MachineDesc* = object
     ## A target's register file + calling convention, as the allocator needs it.
@@ -582,16 +600,20 @@ proc memToMemBridgeDemand*(md: MachineDesc; dst, v: Location): ScratchDemand =
   if dst.typ.isFloat:
     let fromMem = (case md.arch
                    of X86: v.kind in {NamedStack, Mem}
-                   of Arm64, ThumbM, Rv32: v.kind in {NamedStack, Mem, Glob})
+                   of Arm64, ThumbM, Avr, Rv32: v.kind in {NamedStack, Mem, Glob})
     if fromMem: ScratchDemand(fregs: 1) else: ScratchDemand()
   else:
     let needsBridge = (case md.arch
                        of X86: v.kind in {NamedStack, Mem}
-                       of Arm64, ThumbM, Rv32: v.kind in {NamedStack, Mem, Glob, Tvar, Imm})
+                       of Arm64, ThumbM, Avr, Rv32:
+                         v.kind in {NamedStack, Mem, Glob, Tvar, Imm})
                        # Cortex-M answers like AArch64 and for the same reasons:
                        # no store-immediate, no PC-relative data operand, so an
                        # immediate, a global and a thread-local each pass through
-                       # a register on the way to a stack home.
+                       # a register on the way to a stack home. AVR is the same
+                       # again — and the ONE branch where it does not follow
+                       # x86-64. RV32 too: `lui`+`addi` is two instructions, so a
+                       # constant does not ride into a store here either.
     if needsBridge:
       ScratchDemand(gprs: 1, slot: (if md.arch == X86: v.typ else: dst.typ))
     else:
