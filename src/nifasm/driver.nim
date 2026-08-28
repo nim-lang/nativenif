@@ -292,6 +292,10 @@ proc setupTls(ctx: var GenContext) =
   ctx.entryStubOffset = ctx.buf.data.len
   let pos = x86.emitLeaRipPlaceholder(ctx.buf, x86.RSI)     # lea rsi, [rip+arkham.tls.0]
   ctx.gvarSites.add (pos, ctx.tlsBlockSym)
+  # The self-pointer at offset 0: the block records where it is, so `&threadvar`
+  # can be computed from FS at run time. The main thread's is filled here; a
+  # thread the runtime creates fills its own (see `std/rawthreads`).
+  x86.emitMov(ctx.buf.data, x86.MemoryOperand(base: x86.RSI), x86.RSI)
   x86.emitMovImmToReg(ctx.buf.data, x86.RDI, ArchSetFs)
   x86.emitMovImmToReg(ctx.buf.data, x86.RAX, ArchPrctlNr)
   x86.emitSyscall(ctx.buf.data)                             # arch_prctl(ARCH_SET_FS, &block)
@@ -358,6 +362,24 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
   scope.define(ctx.traceSym)
   ctx.generatedSymbols.incl TraceInfoSymbol
 
+  # And for the thread-local-block size cell, which is the same arrangement once
+  # more: nifasm owns the bytes, so it owns the symbol, and defining it here is
+  # what lets `lea D, (lab arkham.tlssize.0)` resolve as a label.
+  ctx.tlsSizeSym = Symbol(name: ctx.symIdOf(TlsSizeSymbol), kind: skLabel, offset: -1)
+  scope.define(ctx.tlsSizeSym)
+  ctx.generatedSymbols.incl TlsSizeSymbol
+
+  # The block's self-pointer: an ordinary thread-local at offset 0, pre-allocated
+  # so `allocTlsSlotX64` never hands that slot to a variable. arkham reads it to
+  # get the FS base — `&threadvar` is `FS:[0] + offset`, because x86-64 has a
+  # FS-relative load but no FS-relative `lea`, and the main thread's block
+  # address (which is what a RIP-relative `lea` gives) is the wrong answer on
+  # every other thread.
+  ctx.tlsSelfSym = Symbol(name: ctx.symIdOf(TlsSelfSymbol), kind: skTvar,
+                          typ: Type(kind: UIntT, bits: 64), offset: 0)
+  scope.define(ctx.tlsSelfSym)
+  ctx.generatedSymbols.incl TlsSelfSymbol
+
   var n1 = beginRead(ctx.modules[MainModuleName].buf)
   pass1(n1, scope, ctx, MainModuleName, ctx.modules[MainModuleName].buf)
 
@@ -386,6 +408,8 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
   ctx.bssBuf = initBuffer()
   ctx.traceLabel = ctx.buf.createLabel()
   ctx.traceSym.offset = int(ctx.traceLabel)
+  ctx.tlsSizeLabel = ctx.buf.createLabel()
+  ctx.tlsSizeSym.offset = int(ctx.tlsSizeLabel)
 
   # Generate code for entry point (top-level instructions only)
   # This marks symbols as used via lookupWithAutoImport when they are referenced
@@ -400,6 +424,7 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
   # synthesize the per-target entry stub: the FS base (x86-64), zeroed arguments
   # (Windows), the kernel's argument block (AArch64/Linux). At most one applies.
   appendTraceTable(ctx)
+  appendTlsSize(ctx)
   setupTls(ctx)
   setupWinEntry(ctx)
   setupLinuxA64Entry(ctx)

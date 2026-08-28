@@ -280,6 +280,18 @@ type
     traceSym*: Symbol             # the synthetic `arkham.traceinfo.0` label
     traceLabel*: LabelId          # its label in `buf` — defined where the table lands
     traceUsed*: bool              # something referenced it, so `appendTraceTable` runs
+    tlsSelfSym*: Symbol           # the synthetic `arkham.tls.self.0` thread-local at
+                                  # offset 0: each thread's block holds its OWN address
+                                  # there, which is how `&threadvar` is computed
+                                  # (x86-64 has no FS-relative `lea`). Same idea as
+                                  # the psABI TCB's self-pointer.
+    tlsSizeSym*: Symbol           # the synthetic `arkham.tlssize.0` label: an 8-byte cell
+                                  # holding how many bytes ONE thread's TLS block takes.
+                                  # A thread the runtime creates needs its own block, and
+                                  # only nifasm knows how big it ended up (`tlsOffset` is
+                                  # final after the last module's tvars are allocated).
+    tlsSizeLabel*: LabelId        # its label in `buf`
+    tlsSizeUsed*: bool            # something referenced it, so `appendTlsSize` runs
     entrySym*: Symbol             # the entry proc (`_start`/`main.0`) — prologue jumps here
     entryStubOffset*: int          # .text offset of the synthesized ELF entry stub, or -1.
                                   # x86-64: the FS-setup prologue (setupTls); AArch64:

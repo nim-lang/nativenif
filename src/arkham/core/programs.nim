@@ -276,12 +276,28 @@ const LinuxSyscalls* = {
   "symlinkat":  (266, 36),
   # std/terminal's isatty → ioctl(fd, TCGETS). Same number on both arches.
   "ioctl":      (16,  29),
+  # Threads (`std/rawthreads`). `gettid` is the thread's own kernel id — libc has
+  # no wrapper for it before glibc 2.30, which is why the C backend reaches it
+  # through the generic `syscall()` and a libc-free build needs the name here.
+  # `sched_setaffinity(pid, len, mask)` is the `pinnedToCpu` request; glibc's
+  # `pthread_setaffinity_np` is this syscall plus a handle lookup, and a thread
+  # that pins itself has no lookup to do.
+  "gettid":     (186, 178),
+  "sched_setaffinity": (203, 122),
+  # `sched_getaffinity(pid, len, mask)` is how a libc-free build counts CPUs:
+  # `std/cpuinfo` popcounts the mask, which is what `nproc` reports and what a
+  # thread pool actually wants (the CPUs it MAY run on, not the ones fitted).
+  "sched_getaffinity": (204, 123),
   # `clock_gettime(clk_id, timespec*)` backs `std/monotimes` and `std/times`.
   # libc serves it from the vDSO, which a static libc-free image cannot reach;
   # the syscall has identical semantics, just without the vDSO's saved
   # user/kernel transition. Without this row NOTHING in a `nimony n` build can
   # read a clock — a program cannot even time itself.
   "clock_gettime": (228, 113),
+  # `nanosleep(req, rem)` — how a thread waits without spinning. std/threadpool's
+  # idle poll and every backoff in the pool are written on it, so a libc-free
+  # build that cannot reach it has no way to yield the CPU at all.
+  "nanosleep":  (35,  101),
   # std/os filesystem mutators (mkdir/removeDir/removeFile/moveFile). AArch64's
   # asm-generic ABI replaced all of these with `*at` variants (mkdirat/unlinkat/
   # renameat), so they get -1 there and std/posix uses the rows below.

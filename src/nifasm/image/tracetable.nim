@@ -38,6 +38,12 @@
 ## prologue — which is exactly where every frame but the innermost is, and the
 ## innermost frame's seed comes from a `{.naked.}` proc that has no prologue at
 ## all. See `lib/std/stacktraces.nim` for the walk.
+##
+## The reserved-symbol names below are the module's other job: every name nifasm
+## defines ITSELF rather than reading out of a module lives here, so arkham can
+## import one leaf module to spell them and there is one list to consult before
+## adding another. The thread-local ones are `appendTlsSize`'s and
+## `allocTlsSlotX64`'s, not the table's.
 
 import std / algorithm
 
@@ -49,6 +55,22 @@ const
   TraceInfoSymbol* = "arkham.traceinfo.0"
     ## The reserved label nifasm defines for the table. arkham lowers the
     ## `traceTable` intrinsic to a `lea` against it; nothing else may define it.
+  TlsSizeSymbol* = "arkham.tlssize.0"
+    ## The reserved label for an 8-byte cell holding the size of ONE thread's
+    ## thread-local block. Same shape as `TraceInfoSymbol` and for the same
+    ## reason: arkham lowers the `TlsSize` intrinsic to a `lea` against it,
+    ## because the number is a link-time fact — `ctx.tlsOffset` is only final
+    ## once every module's tvars have been allocated. A runtime that creates a
+    ## thread reads it to size that thread's block; nothing else may define it.
+  TlsSizeCellBytes* = 8
+  TlsSelfSymbol* = "arkham.tls.self.0"
+    ## The thread-local at offset 0 of every thread's block, holding that block's
+    ## own address. x86-64 can read `FS:[0]` but cannot `lea` against FS, so this
+    ## is how `&threadvar` becomes a per-thread address instead of the main
+    ## thread's — the same trick, and the same slot, as the psABI's TCB pointer.
+    ## nifasm owns the symbol; the entry prologue fills it for the main thread and
+    ## whoever creates a thread fills that thread's.
+  TlsSelfSlotBytes* = 8
 
 type
   TraceProc* = object

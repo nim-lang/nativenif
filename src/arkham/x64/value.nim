@@ -1031,11 +1031,10 @@ proc aggrAddrInto*(g: var CodeGen; lv: Cursor; dest: Reg; aslot: AsmSlot; doBind
     let loc = g.asLoc(lc)                                # Glob/Tvar with the global's precise type
     case loc.kind
     of Glob: g.emGlobalAddr(dest, loc.name)             # &global → RIP-relative lea
-    of Tvar:                                            # &threadvar = FS base + offset (folded)
+    of Tvar:                                            # &threadvar = this thread's block + offset
       # A foreign tvar (other module) resolves the same way — nifasm whole-program-links
       # and folds its unified-block FS offset into the lea (see `emTvarAddr`).
-      g.emGlobalAddr(dest, TlsBlockName)
-      g.ab.tree LeaX64: (g.emReg dest; g.emReg dest; g.ab.sym loc.name)
+      g.emTvarAddr(dest, loc.name)
     else: raiseAssert "arkham x64n: &sym resolved to " & $loc.kind
   elif lv.kind == Symbol:                               # a LOCAL aggregate var
     let home = g.plan.locationOfSym(symName(lv), cursorToPosition(g.buf[], lv))

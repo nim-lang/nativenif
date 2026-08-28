@@ -186,16 +186,23 @@ proc emGlobalAddr*(g: var CodeGen; dest: Reg; name: string) =
   g.ab.tree LeaX64: (g.emReg dest; g.ab.sym g.prog.gvarRefName(name))
 
 proc emTvarAddr*(g: var CodeGen; dest: Reg; name: string) =
-  ## `dest ← &threadvar` — the FS base block address plus the tvar's FS offset, folded
-  ## into one `lea` (nifasm resolves the tvar symbol to that offset). x86-64 has no
-  ## FS-relative `lea`, so the address is `&arkham.tls.0 + offset`. Mirror of the Tvar
-  ## arm of `aggrAddrInto`; used to marshal a thread-local aggregate call argument.
+  ## `dest ← &threadvar` — THIS thread's block address plus the tvar's FS offset.
+  ## x86-64 has an FS-relative load but no FS-relative `lea`, so the base has to be
+  ## materialised first, and it is read out of the block itself: nifasm reserves
+  ## offset 0 for a self-pointer (`arkham.tls.self.0`) that every thread's block
+  ## holds — the same arrangement, and the same slot, as the psABI's TCB pointer.
+  ##
+  ## It used to be a RIP-relative `lea` at `arkham.tls.0`, which is the MAIN
+  ## thread's block. With one thread that is the same address; with two it means
+  ## every thread's thread-local arrays, objects and `addr`-taken locals silently
+  ## alias the main thread's — a value read back correctly by whichever thread
+  ## wrote it last.
   ##
   ## `name` may be a FOREIGN tvar (declared in another bundled module — e.g. a closure
   ## environment threadvar): nifasm whole-program-links, so its lea offset resolver
   ## (`lookupWithAutoImport`) imports the foreign `(tvar …)` decl and allocates its FS
   ## offset in the SAME unified `arkham.tls.0` block. Local and foreign emit identically.
-  g.emGlobalAddr(dest, TlsBlockName)                # dest ← FS base block
+  g.ab.tree MovX64: (g.emReg dest; g.ab.sym TlsSelfName)         # dest ← FS:[0], this thread's block
   g.ab.tree LeaX64: (g.emReg dest; g.emReg dest; g.ab.sym name)  # dest += tvar FS offset
 
 proc emSymAddr*(g: var CodeGen; dest: Reg; dst: Location) =
@@ -568,6 +575,15 @@ proc emitIntrinsicOps*(g: var CodeGen; op: IntrinsicOp; argBits: int;
     g.ab.tree LeaX64:
       g.emReg dst
       g.ab.tree LabX64: g.ab.sym TraceInfoSymbol
+  of TlsSizeOp:
+    # The same shape as `TraceTable`, against nifasm's 8-byte thread-local-block
+    # size cell. `lea`, not a `mov` of an immediate: how large that block is
+    # depends on every module's thread-locals together, which no single
+    # compilation unit knows — nifasm settles it and writes the number where this
+    # points. Naming the label is also what makes nifasm lay the cell down.
+    g.ab.tree LeaX64:
+      g.emReg dst
+      g.ab.tree LabX64: g.ab.sym TlsSizeSymbol
   else:
     raiseAssert "arkham x64n: no lowering for intrinsic `" & IntrinsicNames[op] & "`"
 

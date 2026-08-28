@@ -38,6 +38,23 @@ proc appendTraceTable*(ctx: var GenContext) =
   let n = traceTableSize(collectTraceProcs(ctx.unwind, dwarfArchOf(ctx.arch)))
   for i in 0 ..< n: ctx.buf.data.add 0'u8
 
+proc appendTlsSize*(ctx: var GenContext) =
+  ## Lay down the 8-byte thread-local-block size at the end of `.text` and define
+  ## the label that addresses it. Unlike the trace table there is nothing to fill
+  ## in later: the value is `ctx.tlsOffset`, which is final by the time this runs
+  ## (every reachable symbol has been generated, so every tvar has its slot), and
+  ## layout moves the blob without changing what it says.
+  ##
+  ## The size is rounded the way `setupTls` rounds the block it reserves, so what
+  ## the runtime allocates for a new thread and what the main thread got are the
+  ## same number rather than merely close.
+  if not ctx.tlsSizeUsed: return
+  while (ctx.buf.data.len and 7) != 0: ctx.buf.data.add 0'u8
+  ctx.buf.defineLabel(ctx.tlsSizeLabel)
+  let v = uint64((ctx.tlsOffset + 15) and not 15)
+  for i in 0 ..< TlsSizeCellBytes:
+    ctx.buf.data.add byte((v shr (8 * i)) and 0xFF)
+
 proc fillTraceTable*(a: var GenContext) =
   ## Write the reserved table, now that every proc's final code position is known.
   ## Runs after each writer's layout passes and before it copies `a.buf.data` out.

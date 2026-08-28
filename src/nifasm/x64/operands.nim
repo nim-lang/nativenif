@@ -366,6 +366,7 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
       let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
       if sym == nil or sym.kind != skLabel: error("Unknown label: " & name, n)
       if sym == ctx.traceSym: ctx.traceUsed = true   # emit the table (appendTraceTable)
+      if sym == ctx.tlsSizeSym: ctx.tlsSizeUsed = true   # emit the cell (appendTlsSize)
       inc n
       result.reg = RAX
       result.label = LabelId(sym.offset)

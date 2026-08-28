@@ -1693,6 +1693,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       let sym = lookupWithAutoImport(ctx, ctx.scope, name, n)
       if sym == nil or sym.kind != skLabel: error("Unknown label: " & name, n)
       if sym == ctx.traceSym: ctx.traceUsed = true   # emit the table (appendTraceTable)
+      if sym == ctx.tlsSizeSym: ctx.tlsSizeUsed = true   # emit the cell (appendTlsSize)
       inc n
       x86.emitLea(ctx.buf, dest, LabelId(sym.offset))
     elif leaRegBase(n, ctx, baseReg):

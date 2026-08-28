@@ -22,6 +22,7 @@ import "../../../../nimony/src/lib" / foreignmodules   # `hasDecl` on a lazily-o
 import "../../../../nimony/src/lib" / symparser
 import sem, context, diagnostics, cursors, modules
 import tags, model, tagconv, tagpool, decls, stackslots
+from "../image/tracetable" import TlsSelfSlotBytes  # the reserved slot 0
 import "../x64/regs" as x64regs
 import "../arm64/regs" as a64regs
 import "../thumb/regs" as mregs
@@ -217,6 +218,13 @@ proc allocTlsSlotX64*(ctx: var GenContext; sym: Symbol; decl: Cursor) =
   ## LOST — `(tvar :t . (i 64) 7)` then read 0. Three callers allocate an offset
   ## (foreign decl, main-module pre-pass, `generateSymbol`); all three come here so
   ## the initializer cannot be honoured by only some of them.
+  # Offset 0 belongs to the block's SELF-POINTER, never to a variable. x86-64 has
+  # no FS-relative `lea`, so `&threadvar` has to materialise the FS base first,
+  # and the only cheap way to read it is a load from the block's own start — the
+  # arrangement the psABI's TCB uses, for the same reason. Reserving the slot
+  # lazily (here, at the first thread-local) keeps a program with no
+  # thread-locals carrying no block at all.
+  if ctx.tlsOffset == 0: ctx.tlsOffset = TlsSelfSlotBytes
   sym.offset = ctx.tlsOffset
   ctx.tlsOffset += stackslots.alignedSize(sym.typ)
   var dn = decl
