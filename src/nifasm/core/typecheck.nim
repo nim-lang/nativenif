@@ -119,9 +119,14 @@ proc canExchange(t: Type): bool =
   ## Check if a type may be an `xchg` operand: any register-sized scalar — integer
   ## OR pointer. `xchg` swaps 8 bytes irrespective of the logical type, and an atomic
   ## pointer exchange (lock-free list head swap) is a legitimate, common use. Like
-  ## `canCompare`, this is SEPARATE from the arithmetic check (which stays strict);
-  ## unlike it, `bool` is excluded (swapping a bool through a pointer is nonsense).
-  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT,
+  ## `canCompare`, this is SEPARATE from the arithmetic check (which stays strict).
+  ##
+  ## `bool` is included. It was once excluded as "swapping a bool through a
+  ## pointer is nonsense", but an atomic flag byte is the plainest use an atomic
+  ## exchange has — `std/threadpool`'s `stopFlag` is one, and so is every
+  ## test-and-set — and a Leng `bool` is a one-byte unsigned value, which is
+  ## exactly what the byte-width `xchg` operates on.
+  t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.BoolT,
              TypeKind.PtrT, TypeKind.AptrT, TypeKind.RegisterT}
 
 proc checkPtrStore*(dest: Type; srcKind: OperandKind; srcTyp: Type; n: Cursor) =

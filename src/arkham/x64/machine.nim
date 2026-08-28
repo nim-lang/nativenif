@@ -202,6 +202,10 @@ const
     convClobbersGpr: @x64ClobbersGpr)
 
 const TlsBlockName* = "arkham.tls.0"
+const TlsSelfName* = "arkham.tls.self.0"
+  ## The thread-local at offset 0 of every thread's block, holding that block's own
+  ## address. Reading it is how `&threadvar` finds THIS thread's storage — see
+  ## `emTvarAddr`.
   ## The static block FS points at (see `emitTlsSetup`); a tvar lives at
   ## `FS:[offset]`, i.e. `&arkham.tls.0 + offset`. Distinct basename so nifasm's
   ## scope keys it uniquely.

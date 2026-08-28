@@ -1352,6 +1352,13 @@ proc emitNullaryIntrinsicX64*(g: var CodeGen; op: IntrinsicOp) =
     # test, and it clobbers nothing — not a register, not a flag, not memory. The
     # register allocator therefore has nothing to hear about this node.
     g.ab.keyword PauseX64
+  of SyscallOp:
+    # The bare instruction. Unlike a `(syproc …)` call site — where arkham marshals
+    # the arguments into the syscall ABI registers and declares the clobbers — this
+    # says only "trap now": the number, the arguments and the reading of the result
+    # are the surrounding `.assembler` body's, which is the whole point (see the
+    # row's comment in `lib/intrinsics`).
+    g.ab.keyword SyscallX64
   else:
     raiseAssert "arkham x64n: no lowering for the nullary intrinsic `" &
                 IntrinsicNames[op] & "`"
