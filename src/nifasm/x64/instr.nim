@@ -921,7 +921,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
 
     # Type check: add works on integers and pointers
     checkIntegerArithmetic(dest.typ, "add", start)
-    checkIntegerArithmetic(op.typ, "add", start)
+    checkArithOperand(op.typ, "add", start)
     checkArithCompatible(dest.typ, op.typ, "add", start)  # sized ints of any width (64-bit reg)
 
     if dest.kind == okReg and dest.castBits != 0:
@@ -955,7 +955,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
 
     # Type check: sub works on integers and pointers
     checkIntegerArithmetic(dest.typ, "sub", start)
-    checkIntegerArithmetic(op.typ, "sub", start)
+    checkArithOperand(op.typ, "sub", start)
     checkArithCompatible(dest.typ, op.typ, "sub", start)  # sized ints of any width (64-bit reg)
 
     if dest.kind == okReg and dest.castBits != 0:
@@ -2181,7 +2181,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       let dest = parseDest(n, ctx)
       let op = parseOperand(n, ctx)
       checkIntegerArithmetic(dest.typ, "lock add", start)
-      checkIntegerArithmetic(op.typ, "lock add", start)
+      checkArithOperand(op.typ, "lock add", start)
       checkCompatibleTypes(dest.typ, op.typ, "lock add", start)
       if dest.kind != okMem: error("Atomic ADD requires memory destination", n)
       if op.kind == okMem: error("Atomic ADD memory source not supported", n)
@@ -2198,7 +2198,7 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       let dest = parseDest(n, ctx)
       let op = parseOperand(n, ctx)
       checkIntegerArithmetic(dest.typ, "lock sub", start)
-      checkIntegerArithmetic(op.typ, "lock sub", start)
+      checkArithOperand(op.typ, "lock sub", start)
       checkCompatibleTypes(dest.typ, op.typ, "lock sub", start)
       if dest.kind != okMem: error("Atomic SUB requires memory destination", n)
       if op.kind == okMem: error("Atomic SUB memory source not supported", n)
