@@ -1,0 +1,72 @@
+(.nif27)
+(.indexat 1)
+(stmts
+ (type :Pair.0 .
+  (object .
+   (fld :lo.0 .
+    (u 32))
+   (fld :hi.0 .
+    (i 64))))
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :e.0 .
+    (u 32)5)
+   (var :b.0 .
+    (bool)
+    (lt
+     (suf 1u "u32")e.0))
+   (var :s.0 .
+    (u 32)
+    (add
+     (u 32)
+     (sub
+      (u 32)
+      (mul
+       (u 32)
+       (conv
+        (u 32)4)e.0)
+      (conv
+       (u 32)2))
+     (conv
+      (u 32)b.0)))
+   (var :p.0 .
+    Pair.0
+    (oconstr Pair.0
+     (kv lo.0
+      (add
+       (u 32)e.0
+       (conv
+        (u 32)b.0)))
+     (kv hi.0
+      (add
+       (i 64)3 1))))
+   (var :t.0 .
+    (u 32)
+    (dot p.0 lo.0 0))
+   (var :k.0 .
+    (i 32)0)
+   (if
+    (elif b.0
+     (stmts
+      (asgn k.0 100))))
+   (call exit.0
+    (add
+     (i 32)
+     (add
+      (i 32)
+      (conv
+       (i 32)s.0)k.0)
+     (conv
+      (i 32)t.0)))
+   (ret 0))))(.index)

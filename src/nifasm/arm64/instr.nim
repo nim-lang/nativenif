@@ -784,7 +784,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
     checkIntegerArithmetic(dest.typ, "add", start)
-    checkIntegerArithmetic(op.typ, "add", start)
+    checkArithOperand(op.typ, "add", start)
     checkArithCompatible(dest.typ, op.typ, "add", start)  # sized ints of any width (64-bit reg)
     if dest.kind == okMem:
       error("ADD to memory not supported yet for ARM64", n)
@@ -819,7 +819,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
     checkIntegerArithmetic(dest.typ, "sub", start)
-    checkIntegerArithmetic(op.typ, "sub", start)
+    checkArithOperand(op.typ, "sub", start)
     checkArithCompatible(dest.typ, op.typ, "sub", start)  # sized ints of any width (64-bit reg)
     if dest.kind == okMem:
       error("SUB to memory not supported yet for ARM64", n)
@@ -1006,7 +1006,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "add3")
     checkIntegerArithmetic(dstT, "add", start)
-    checkIntegerArithmetic(rm.typ, "add", start)
+    checkArithOperand(rm.typ, "add", start)
     if rm.kind == okImm or rm.kind == okCsize:
       if rm.immVal >= 0 and rm.immVal <= 4095:
         arm64.emitAddImm(ctx.buf.data, rd, rn, uint16(rm.immVal))
@@ -1020,7 +1020,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "sub3")
     checkIntegerArithmetic(dstT, "sub", start)
-    checkIntegerArithmetic(rm.typ, "sub", start)
+    checkArithOperand(rm.typ, "sub", start)
     if rm.kind == okImm or rm.kind == okCsize:
       if rm.immVal >= 0 and rm.immVal <= 4095:
         arm64.emitSubImm(ctx.buf.data, rd, rn, uint16(rm.immVal))
@@ -1115,7 +1115,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
     checkIntegerArithmetic(dest.typ, "addw", start)
-    checkIntegerArithmetic(op.typ, "addw", start)
+    checkArithOperand(op.typ, "addw", start)
     if dest.kind == okMem: error("ADDW to memory not supported", n)
     elif op.kind == okImm or op.kind == okCsize:
       if op.immVal >= 0 and op.immVal <= 4095:
@@ -1131,7 +1131,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     let dest = parseDestA64(n, ctx)
     let op = parseOperandA64(n, ctx)
     checkIntegerArithmetic(dest.typ, "subw", start)
-    checkIntegerArithmetic(op.typ, "subw", start)
+    checkArithOperand(op.typ, "subw", start)
     if dest.kind == okMem: error("SUBW to memory not supported", n)
     elif op.kind == okImm or op.kind == okCsize:
       if op.immVal >= 0 and op.immVal <= 4095:
@@ -1157,7 +1157,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "addw3")
     checkIntegerArithmetic(dstT, "addw", start)
-    checkIntegerArithmetic(rm.typ, "addw", start)
+    checkArithOperand(rm.typ, "addw", start)
     if rm.kind == okImm or rm.kind == okCsize:
       if rm.immVal >= 0 and rm.immVal <= 4095:
         arm64.emitAddImm(ctx.buf.data, rd, rn, uint16(rm.immVal), w = true)
@@ -1171,7 +1171,7 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     inc n
     let (rd, rn, rm, dstT) = parse3OperandsA64(n, ctx, "subw3")
     checkIntegerArithmetic(dstT, "subw", start)
-    checkIntegerArithmetic(rm.typ, "subw", start)
+    checkArithOperand(rm.typ, "subw", start)
     if rm.kind == okImm or rm.kind == okCsize:
       if rm.immVal >= 0 and rm.immVal <= 4095:
         arm64.emitSubImm(ctx.buf.data, rd, rn, uint16(rm.immVal), w = true)

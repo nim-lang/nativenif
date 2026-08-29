@@ -67,6 +67,19 @@ proc movCompatible*(want, got: Type): bool =
     return litFitsWidth(g.litVal, w.bits)
   if w.kind in {IntT, UIntT} and g.kind in {IntT, UIntT}:
     return g.bits <= w.bits
+  if w.kind in {IntT, UIntT} and g.kind == BoolT:
+    # SOURCE `bool` → wider integer: the widening move this proc already sanctions,
+    # spelled for the one integer type whose `TypeKind` is its own. A Leng `bool` is
+    # an 8-bit unsigned 0/1 — `intMemAccess` says exactly that (`of BoolT: (8,
+    # false)`) — and every integer destination is at least 8 bits wide, so the value
+    # always fits. arkham reaches this with `(mov (i 64)tmp boolLocal)`: a widening
+    # `(conv (i 64) someBool)` needs no instruction of its own (the local already
+    # holds a canonical 0 or 1), so the `bool` arrives as its declared type. Same
+    # reading as `canBeArithOperand` below.
+    #
+    # The reverse — an integer into a `bool` destination — is NOT admitted, and must
+    # not be: that is a narrowing store into a name whose type promises 0 or 1.
+    return true
   result = false
 
 proc isIntegerType*(t: Type): bool =
@@ -78,8 +91,11 @@ proc isFloatType(t: Type): bool =
   t.kind == TypeKind.FloatT
 
 proc canDoIntegerArithmetic(t: Type): bool =
-  ## May `t` be an operand of `add`/`sub`/`neg`? Integers, integer literals and raw
-  ## (untyped) registers — no pointer of any kind.
+  ## May `t` be the DESTINATION of `add`/`sub` (or the sole operand of
+  ## `neg`/`inc`/`dec`, which is a destination too)? Integers, integer literals and
+  ## raw (untyped) registers — no pointer of any kind, and no `bool`: a value whose
+  ## declared type says "0 or 1" is not something arithmetic may write into. The
+  ## SOURCE side is `canBeArithOperand` below and is deliberately laxer.
   ##
   ## `(aptr T)` used to be admitted here as "pointer arithmetic". It is not a legal
   ## Leng form: an `add` says nothing about whether the offset counts BYTES or
@@ -91,6 +107,26 @@ proc canDoIntegerArithmetic(t: Type): bool =
   ## (`checkArithResultType`); this is the assembler's own backstop, and it also
   ## covers hand-written asm-NIF.
   t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT, TypeKind.RegisterT}
+
+proc canBeArithOperand(t: Type): bool =
+  ## May `t` be the SOURCE operand of `add`/`sub`? Everything a destination may be,
+  ## plus `bool` — for the same reason `canCompare` and `canDoBitwiseOps` admit it:
+  ## a Leng `bool` is a 0/1 unsigned byte, arkham keeps it canonicalized in a full
+  ## register like every other sub-word scalar, and `add r64, boolreg` is therefore
+  ## the exact encoding `int + ord(b)` wants. `checkArithCompatible` has always
+  ## listed `BoolT` among the "sized ints of any width" that pair with an integer
+  ## destination; until this existed, the strict rule above made that `BoolT`
+  ## member unreachable.
+  ##
+  ## `4 * c - 2 + uint32(lowerBoundaryIsCloser)` in `std/system/formatfloat` is the
+  ## shape that found it: arkham threads a widening `(conv (u 32) boolLocal)` up as
+  ## the local's own home (zero instructions, the value is already 0/1), so the
+  ## `bool` reaches the `add` as its declared type. Requiring a widening copy there
+  ## instead would cost a `mov` on every `int(someBool)` in an expression.
+  ##
+  ## Pointers still stay out on both sides: that is what `checkArithResultType` and
+  ## this backstop exist to catch.
+  canDoIntegerArithmetic(t) or t.kind == TypeKind.BoolT
 
 proc canCompare(t: Type): bool =
   ## Check if a type may be a `cmp` operand. A superset of integer arithmetic:
@@ -219,6 +255,14 @@ proc checkType(want, got: Type; n: Cursor) =
   if lenient(): return
   if not compatible(want, got):
     typeError(want, got, n)
+
+proc checkArithOperand*(t: Type; op: string; n: Cursor) =
+  ## The SOURCE-operand twin of `checkIntegerArithmetic` (see `canBeArithOperand`).
+  if lenient(): return
+  if not canBeArithOperand(t):
+    error("Operation '" & op & "' requires an integer operand, got " & $t &
+          " — Leng has no arithmetic on pointers: offset an array pointer with " &
+          "`(at …)`/`(pat …)`, or cast to an integer, compute, and cast back", n)
 
 proc checkIntegerArithmetic*(t: Type; op: string; n: Cursor) =
   if lenient(): return
