@@ -6,7 +6,7 @@ into a running executable with no external toolchain: no GNU assembler, no
 system linker, no LLVM.
 
 `nimony n` uses it as its all-native code path. Leng itself is specified in
-nimony's [doc/leng-spec.md](https://github.com/nim-lang/nimony/blob/master/doc/leng-spec.md).
+nimony's [doc/leng-spec.md](https://github.com/nim-lang/nimony/blob/master/doc/internals/leng-spec.md).
 
 ## The pipeline
 
