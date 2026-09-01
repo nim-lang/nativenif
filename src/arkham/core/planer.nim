@@ -1223,29 +1223,35 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
             # The 9th integer/pointer parameter onward arrives on the caller's
             # stack (AAPCS64). arkham gives it a callee-saved register home that
             # the prologue loads from the incoming arg slot before SP is lowered
-            # for locals, so it survives the whole proc. Address-taken or
-            # out-of-register stack params aren't supported yet.
-            if AddrTaken in props:
-              raiseAssert "arkham v1: address-taken >8th parameter"
-            var r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
-            if r == NoReg and spillableRegParams.len > 0:
-              # No free callee-saved register: evict an earlier scalar register
-              # param to its stack slot and reuse its register for this stack param.
-              let victim = spillableRegParams.pop()
-              b.recordSym(victim.pos, victim.name,
-                       namedStackLoc(victim.name, victim.effSlot))
-              b.plan.hasStackVars = true
-              r = victim.r                        # already in usedCallee
-            if r == NoReg:
-              # Totality: no callee-saved reg and nothing colder to evict — home this
-              # stack param in its OWN `(s)` slot. The prologue loads it from the incoming
-              # arg area into the slot through a staging bridge (`emitStackParamLoadsX64`),
-              # so no register is held; correct by construction, never a hard fail.
+            # for locals, so it survives the whole proc.
+            if AddrTaken in props and not aggrByRef:
+              # Address taken → the value must live in memory: its own `(s)` slot,
+              # which `emitStackParamLoads` fills from the incoming arg area exactly
+              # as it does for the register-pressure totality case below. (A by-ref
+              # aggregate's "address" is the incoming pointer itself, so that one
+              # keeps a register home like its register-passed twin.)
               loc = memHome()
               b.plan.hasStackVars = true
             else:
-              b.plan.usedCallee.incl r
-              loc = regLoc(r, effSlot)
+              var r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
+              if r == NoReg and spillableRegParams.len > 0:
+                # No free callee-saved register: evict an earlier scalar register
+                # param to its stack slot and reuse its register for this stack param.
+                let victim = spillableRegParams.pop()
+                b.recordSym(victim.pos, victim.name,
+                         namedStackLoc(victim.name, victim.effSlot))
+                b.plan.hasStackVars = true
+                r = victim.r                        # already in usedCallee
+              if r == NoReg:
+                # Totality: no callee-saved reg and nothing colder to evict — home this
+                # stack param in its OWN `(s)` slot. The prologue loads it from the incoming
+                # arg area into the slot through a staging bridge (`emitStackParamLoadsX64`),
+                # so no register is held; correct by construction, never a hard fail.
+                loc = memHome()
+                b.plan.hasStackVars = true
+              else:
+                b.plan.usedCallee.incl r
+                loc = regLoc(r, effSlot)
           if loc.kind in {NamedStack, StackPtr}:
             # An address-taken / spilled param's `(s)` slot: the prologue fills it
             # from the incoming arg register (int or SIMD; see emitParamMoves).
