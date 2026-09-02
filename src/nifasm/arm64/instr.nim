@@ -703,6 +703,14 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
         emitAddOffsetA64(ctx, dest.reg, dest.reg, op.mem.offset, arm64.X17)
     else:
       emitAddOffsetA64(ctx, dest.reg, op.mem.base, op.mem.offset, arm64.X17)
+      if ctx.inPrologue and op.mem.base == arm64.SP:
+        # The frame-pointer setup `add x29, sp, #0`, which AAPCS puts between the
+        # first pair push and the rest of the prologue. It is a prologue form: keep
+        # the run alive, or every `stp` after it and the frame `sub` record no CFI
+        # step — and `(popframe)` then replays a teardown missing the frame `add`
+        # and the callee-saved reloads. The x86-64 twin is the stack-args base
+        # capture in `genMovX64`.
+        ctx.prologueOp = true
 
   of AdrA64:
     inc n

@@ -29,6 +29,11 @@ from "../thumb/encoder" as thumb2 import nil
 from "../avr/encoder" as avr import nil
 from "../rv32/encoder" as rv32 import nil
 
+const
+  NoArgBaseReg* = x86.RSP
+    ## Sentinel for `GenContext.argBaseReg`: rsp is never the destination of the
+    ## incoming stack-args base capture, so it cannot collide with a real one.
+
 const MainModuleName* = ""  # Special name for main module
 
 const
@@ -168,6 +173,15 @@ type
                                   # code and is not one of those (a zero-byte node — a slot
                                   # declaration, a `kill` — is transparent).
     prologueOp*: bool              # the instruction just dispatched recorded a CFI step
+    argBaseReg*: x86.Register      # x64 prologue only: the callee-saved register a
+                                  # `mov <reg>, rsp` is capturing the incoming stack-args
+                                  # base into. That capture and the `add <reg>, imm` that
+                                  # follows it sit BETWEEN the pushes and the frame `sub`
+                                  # (they must: the base is rsp after the pushes), so they
+                                  # are prologue forms too — ending the run on them would
+                                  # drop the frame `sub`'s CFI step and with it the frame
+                                  # `add` that `(popframe)` replays. `NoArgBaseReg` when
+                                  # no capture has been seen in this proc.
     cfaOff*: int32                 # CFA offset in effect at the current point of the prologue
     reservedArgArea*: int          # AArch64 fixed-frame: bytes reserved at the frame bottom
                                   # for the largest outgoing stack-argument area (see
