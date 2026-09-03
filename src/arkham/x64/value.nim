@@ -1525,9 +1525,6 @@ proc genAggrCopyStore*(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
   g.giveBack tmp                                                 # unbinds + unseals the bridge
   g.giveBack srcAddr; g.giveBack dstAddr                         # unbind + unseal (NoReg ⇒ no-op)
 
-let rmwFoldOn = not existsEnv("ARKHAM_NO_RMW")
-  ## Off switch for the read-modify-write fold below, for A/B measurement.
-
 proc rmwMemOp(ek: LengExpr): tuple[op: X64Inst, ok: bool] =
   ## The ALU ops nifasm will encode with a MEMORY destination — see the
   ## `dest.kind == okMem` arms of `x64/instr.nim`. `mul` is absent because x86-64
@@ -1599,7 +1596,6 @@ proc tryRmwStore2*(g: var CodeGen; lhs: Cursor): bool =
   ## not, and `scanCondFusions` only ever fuses a compare across statements that emit
   ## NO machine code — an assignment is not one of those either way, so a fold here
   ## can never be the statement that separates a fused compare from its branch.
-  if not rmwFoldOn: return false
   if not g.isFoldableMemLeaf(lhs): return false     # dot/deref/at/pat, and not a
                                                     # field of a register-homed pair
   var rhs = lhs; skip rhs
@@ -3259,6 +3255,11 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
   if doTail:
     for pl in plan.args:
       if pl.onStack: doTail = false
+  # `(popframe)` gives our slots back BEFORE the `jmp`, and the callee's frame starts
+  # where ours was — so an argument that is the address of one of OUR locals points at
+  # memory the callee is about to overwrite. Declining here is the whole guard, and it
+  # covers the `(ret (call …))` encoding as well as the void statement-call one.
+  if doTail and g.tailCallLeaksFrameE(argCurs): doTail = false
   # Which ABI argument registers does a LATER argument overwrite by ISA fiat?
   var laterClob: seq[set[Reg]] = @[]
   block:

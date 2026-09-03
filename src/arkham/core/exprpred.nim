@@ -187,6 +187,109 @@ proc isFoldableMemLeaf*(g: var CodeGen; n: Cursor): bool {.inline.} =
   ## not exist.
   isMemLeaf(n) and g.pairFieldReg(n) == NoReg
 
+# ── tail-position rewrites: the policy both backends share ──────────────────
+# The two rewrites themselves are per-backend (the tags differ), but WHETHER to
+# take them is one decision and belongs in one place.
+
+proc mayReturnHereE*(g: var CodeGen): bool =
+  ## May a site inside the body RETURN — `(popframe) (ret)` — instead of branching to
+  ## the proc's shared epilogue?
+  ##
+  ## `(popframe)` is what makes it possible at all: the frame's shape (how many
+  ## callee-saved saves, whether a frame `sub` exists) is final only AFTER the body is
+  ## emitted, and nifasm replays the prologue it has already assembled — so nothing is
+  ## guessed and the teardown is identical to the shared one. Hence the `TailCall`
+  ## capability: `doc/instructions.md` gives `(popframe)` to exactly the targets that
+  ## have it (x86-64 and AArch64), and Cortex-M / RV32 have neither yet.
+  ##
+  ## The entry proc has no epilogue to replay — it ends in an exit syscall.
+  if g.isEntryProc: return false
+  TailCall in g.md.caps
+
+proc emitsNoCodeE*(n: Cursor): bool =
+  ## A statement that produces no machine code, and therefore does not end another
+  ## statement's tail position: a `.` hole (what copyprop leaves where it deleted a
+  ## binding) and the empty `(stmts …)`/`(scope …)` wrappers a `when`-compiled-out
+  ## block leaves behind.
+  ##
+  ## Asking this rather than "is it the last child" is not a refinement, it is the
+  ## whole difference: the allocator's `rawDealloc` ends in an empty `(stmts .)` — the
+  ## `vgTracking` block — so its final `deallocBigChunk(a, c)` is the second-to-last
+  ## child and no tail-position test phrased on the child list can see it.
+  if n.kind == DotToken: return true
+  if n.kind != TagLit: return false
+  if n.stmtKind notin {StmtsS, ScopeS}: return false
+  var it = n
+  it.into:
+    while it.hasMore:
+      if not emitsNoCodeE(it): return false
+      skip it
+  true
+
+proc restEmitsNoCodeE*(n: Cursor): bool =
+  ## Is everything from `n` to the end of its statement list code-free? `n` is the
+  ## cursor just past the statement being asked about.
+  var it = n
+  while it.hasMore:
+    if not emitsNoCodeE(it): return false
+    skip it
+  true
+
+proc addrRootIsOursE(g: var CodeGen; n: Cursor): bool =
+  ## Does the address expression `n` bottom out at a symbol THIS proc owns storage
+  ## for — a local or a by-value parameter — rather than at a `deref` of a pointer
+  ## somebody else owns?
+  ##
+  ## Walking the base chain is the whole test: `(dot (deref p) f)` reaches OUR frame
+  ## only through `p`, which is a pointer VALUE, so the `deref` stops the search;
+  ## `(dot x f)` on a local `x` does not. A module-level global has no allocator
+  ## location (`locationOfSym` answers `NoLoc`), which is what tells the two apart.
+  var c = n
+  var guard = 0
+  while c.kind == TagLit and guard < 40:
+    inc guard
+    case c.exprKind
+    of DerefC, PatC: return false          # through a pointer: not our storage
+    of DotC, AtC, ParC, BaseobjC:
+      inc c                                 # → the base
+    of CastC, ConvC:
+      inc c; skip c                         # → past the target type, to the operand
+    else: return false
+  if c.kind != Symbol: return false
+  g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind != NoLoc
+
+proc tailCallLeaksFrameE*(g: var CodeGen; args: openArray[Cursor]): bool =
+  ## Would tail-calling with these arguments hand the callee a pointer into the frame
+  ## we are about to give back?
+  ##
+  ## A tail call is `(popframe)` and then a `jmp`: our slots are released BEFORE the
+  ## callee runs, and the callee's own frame starts where ours was. An argument that is
+  ## the address of one of our locals therefore points at memory the callee immediately
+  ## reuses — the callee writes through it and corrupts its own frame instead. Nothing
+  ## else about a tail call is unsafe, and no other operand shape can carry such an
+  ## address: hexer un-nests, so an argument is a leaf or an address expression.
+  ##
+  ## This is a SYNTACTIC test, and it is not an escape analysis: a pointer laundered
+  ## through a local (`let p = addr x; f(p)`) is not caught here. That shape does not
+  ## occur in a self-hosted nimsem (0 of the 133 `(ret (call …))` sites and 303 of the
+  ## 1,396 void tail-position calls carry a direct one, all of them syntactic), and
+  ## catching it needs the address analysis arkham does not have. Stated so nobody
+  ## reads this as a proof.
+  for a in args:
+    var stack = @[a]
+    while stack.len > 0:
+      let n = stack.pop()
+      if n.kind != TagLit: continue
+      if n.exprKind in {AddrC, HaddrC}:
+        var inner = n; inc inner
+        if inner.hasMore and g.addrRootIsOursE(inner): return true
+      var it = n
+      it.into:
+        while it.hasMore:
+          if it.kind == TagLit: stack.add it
+          skip it
+  false
+
 proc sameTreeE*(a, b: Cursor): bool =
   ## Structural equality of two expression subtrees, ignoring the sparse line-info
   ## suffixes (they are not iterated as children). The nifcore twin of nimony's

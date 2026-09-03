@@ -1,0 +1,63 @@
+(.nif27)
+(.indexat 0)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :bump.0
+  (params
+   (param :p.0 .
+    (ptr
+     (i 64)))
+   (param :n.0 .
+    (i 64))).
+  (pragmas)
+  (stmts
+   (asgn
+    (deref p.0)
+    (add
+     (i 64)
+     (deref p.0)n.0))))
+ (proc :pick.0
+  (params
+   (param :q.0 .
+    (ptr
+     (i 64)))
+   (param :k.0 .
+    (i 64))).
+  (pragmas)
+  (stmts
+   (if
+    (elif
+     (lt 0 k.0)
+     (stmts
+      (call bump.0 q.0 10)))
+    (else
+     (stmts
+      (call bump.0 q.0 1))))))
+ (proc :twice.0
+  (params
+   (param :r.0 .
+    (ptr
+     (i 64)))).
+  (pragmas)
+  (stmts
+   (call pick.0 r.0 1)
+   (call pick.0 r.0 0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :x.0 .
+    (i 64)31)
+   (call twice.0
+    (addr x.0))
+   (call exit.0
+    (cast
+     (i 32)x.0)))))(.index)

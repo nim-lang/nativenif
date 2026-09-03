@@ -157,6 +157,30 @@ type
                                              ## `jmp retLabel2`. Propagated to the last child of a
                                              ## `stmts`/`scope`; reset to false for any nested
                                              ## compound so a mid-body `ret` still jumps.
+    tailPos*: bool                           ## control LEAVES THE PROC after this statement —
+                                             ## possibly by a jump to the epilogue rather than by
+                                             ## falling into it. Weaker than `tailStmt`, and it
+                                             ## propagates through `if`/`case` ARMS, which
+                                             ## `tailStmt` deliberately does not: a `ret` in an arm
+                                             ## still has to jump over its siblings, but a TAIL CALL
+                                             ## never comes back, so the jump it would skip is dead
+                                             ## either way. This is what makes a bare `(call …)` at
+                                             ## the end of a void proc a tail call — the shape
+                                             ## `(ret (call …))` cannot express, since a void proc
+                                             ## has no `ret` to fold the call into.
+    frameIsAddressable*: bool                ## some symbol of the current proc is homed on the
+                                             ## STACK, so an address into this frame can exist and
+                                             ## be handed to a callee. A tail call gives the frame
+                                             ## back BEFORE it jumps, so it must not: see
+                                             ## `tailCallLeaksFrameE` for why the syntactic test
+                                             ## alone is not enough (the address can be laundered
+                                             ## through a local — `rawData(s)` of an SSO string is
+                                             ## exactly that shape, and it silently corrupted
+                                             ## `echo`'s output).
+    retIsVoid*: bool                         ## the current proc has NO result. Only such a proc can
+                                             ## tail-call from a bare `(call …)` statement: with a
+                                             ## result there is still a value to place in the return
+                                             ## register after it.
     loopEnds*: seq[string]                   ## stack of enclosing-loop end labels (for `break`)
     retLabel2*: string                       ## value-core: shared epilogue label a mid-proc `ret` jumps to
     retLabelUsed2*: bool                     ## value-core: a `ret` jumped to retLabel2 ⇒ emit the label

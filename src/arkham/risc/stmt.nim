@@ -15,7 +15,7 @@
 import std / [assertions, tables, strformat]
 import nifcore, nifcdecl
 import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
-                    context, diag, typeutil, constdata,
+                    context, diag, typeutil, constdata, exprpred,
                     mirrors, select]
 import machine_a64 as machine
 from machine_m as machine_m import nil
@@ -109,13 +109,39 @@ proc tryEmitCsel(g: var CodeGen; c: Cursor): bool =
   g.dropBridge rT
   return true
 
+proc emReturnHere(g: var CodeGen): bool =
+  ## Return from HERE — `(popframe) (ret)` — instead of branching to the shared
+  ## epilogue at the proc's tail. The x64 twin, and it answers to the same
+  ## `mayReturnHereE` policy: `(popframe)` exists on AArch64 and nowhere else in this
+  ## backend's three targets, which is what the `TailCall` capability test says.
+  ##
+  ## `framePop`'s kills are NOT replayed here, and must not be: the shared epilogue is
+  ## emitted LAST and may retire every binding, while whatever follows this site still
+  ## reads its own names.
+  if not g.mayReturnHereE(): return false
+  g.ab.keyword PopframeA64
+  g.ab.keyword RetA64
+  true
+
 proc genStmt2*(g: var CodeGen; c: Cursor) =
   if c.kind == DotToken: return
+  # Tail position, as the x64 twin tracks it. `tailStmt` is "falls THROUGH to the
+  # epilogue" and travels only to the last child of a straight-line `stmts`/`scope`;
+  # `tailPos` is the weaker "control LEAVES the proc after this" and travels through
+  # `if`/`case` arms as well, because a return or a tail call there never comes back.
+  let myTail = g.tailStmt
+  let myTailPos = g.tailPos
+  g.tailStmt = false
+  g.tailPos = false
   case c.stmtKind
   of StmtsS:
     var cc = c
     cc.into:
-      while cc.hasMore: (g.genStmt2(cc); skip cc)
+      while cc.hasMore:
+        var nx = cc; skip nx
+        g.tailStmt = myTail and restEmitsNoCodeE(nx)
+        g.tailPos = myTailPos and restEmitsNoCodeE(nx)
+        g.genStmt2(cc); skip cc
   of ScopeS:
     # Leng's scope forwarded as a nifasm `(scope …)` — a reclaimable slot arena,
     # so sibling scopes share frame bytes and the prologue reserves the peak.
@@ -124,12 +150,22 @@ proc genStmt2*(g: var CodeGen; c: Cursor) =
       g.enterScope()
       var cc = c
       cc.into:
-        while cc.hasMore: (g.genStmt2(cc); skip cc)
+        while cc.hasMore:
+          var nx = cc; skip nx
+          g.tailStmt = myTail and restEmitsNoCodeE(nx)
+          g.tailPos = myTailPos and restEmitsNoCodeE(nx)
+          g.genStmt2(cc); skip cc
       g.exitScope()
   of VarS, GvarS, TvarS, ConstS: g.genVarDecl2(c)
   of CallS:
     var d = dontCare                   # a statement call: result unused
-    g.emitCall2(c, d)
+    # A bare call at the END of a void proc is a tail call, and it is the shape the
+    # `(ret (call …))` encoding cannot reach: a void proc has no `ret` for shoggoth's
+    # fold to splice the call into. See the x64 twin for the census that found it and
+    # for why `frameIsAddressable` has to gate it.
+    g.emitCall2(c, d, tail = myTailPos and g.retIsVoid and
+                             not g.frameIsAddressable and
+                             TailCall in g.md.caps)
     g.freeVal(d)
   of InstrS:
     var d = dontCare
@@ -186,13 +222,27 @@ proc genStmt2*(g: var CodeGen; c: Cursor) =
             bc.into:
               let condC = bc; skip bc
               g.emitCondE(condC, lNext, whenTrue = false)
-              while bc.hasMore: (g.genStmt2(bc); skip bc)
-              g.emBr(BA64, lEnd)
+              while bc.hasMore:
+                var nb = bc; skip nb
+                # The arm's LAST statement inherits the `if`'s own tail position: a
+                # `ret` in an arm must still branch over its siblings, but a tail call
+                # never comes back, so that branch is dead either way.
+                g.tailPos = myTailPos and restEmitsNoCodeE(nb)
+                g.genStmt2(bc); skip bc
+              g.tailPos = false
+              # When the `if` ITSELF is in tail position, `lEnd` is the epilogue —
+              # nothing between them emits an instruction — so the arm can RETURN
+              # instead of branching to a branch.
+              if not (myTailPos and g.emReturnHere()): g.emBr(BA64, lEnd)
             g.emLab(lNext)
           of ElseU:
             var bc = cc
             bc.into:
-              while bc.hasMore: (g.genStmt2(bc); skip bc)
+              while bc.hasMore:
+                var nb = bc; skip nb
+                g.tailPos = myTailPos and restEmitsNoCodeE(nb)
+                g.genStmt2(bc); skip bc
+              g.tailPos = false
           else: discard
           skip cc
       g.emLab(lEnd)
@@ -273,10 +323,13 @@ proc genStmt2*(g: var CodeGen; c: Cursor) =
             g.wideRet(cc)                    # 64-bit result: r0:r1, read raw
           else:
             g.genStore2(cc, regLoc(g.md.intRetReg, ScalarSlot))
-        if not tailed:
-          # A tail call has left the proc for good: no branch to the epilogue, and
-          # nothing after it is reachable.
-          g.emBr(BA64, g.retLabel2); g.retLabelUsed2 = true
+        # A tail call has left the proc for good: no branch to the epilogue, and
+        # nothing after it is reachable. A TAIL `ret` falls straight through the
+        # (zero-instruction) scope kills into the epilogue and needs neither a branch
+        # nor a copy of it. Anything else returns here, or branches.
+        if not tailed and not myTail:
+          if not g.emReturnHere():
+            g.emBr(BA64, g.retLabel2); g.retLabelUsed2 = true
       while cc.hasMore: skip cc
   of CaseS:
     let lEnd = g.freshLabel()
@@ -319,13 +372,19 @@ proc genStmt2*(g: var CodeGen; c: Cursor) =
       g.emBr(BA64, lElse)
       for (lBody, bc) in bodies:
         g.emLab(lBody)
+        g.tailPos = myTailPos                             # the arm inherits the case's own
         g.genStmt2(bc)
-        g.emBr(BA64, lEnd)
+        g.tailPos = false
+        if not (myTailPos and g.emReturnHere()): g.emBr(BA64, lEnd)
       if hasElse:
         g.emLab(lElse)
         var e = elseBody
         e.into:
-          while e.hasMore: (g.genStmt2(e); skip e)
+          while e.hasMore:
+            var ne = e; skip ne
+            g.tailPos = myTailPos and restEmitsNoCodeE(ne)
+            g.genStmt2(e); skip e
+          g.tailPos = false
     g.emLab(lEnd)
   of LabS:
     var cc = c
@@ -514,9 +573,19 @@ proc emitProcBody2*(g: var CodeGen; info: ProcInfo; declarative: bool;
   var c = info.decl
   c.into:
     inc c; skip c; skip c; skip c
+    # The whole body is in tail position: after it, control reaches the epilogue. The
+    # entry proc that EXITS never returns, so leave both false there.
+    let bodyTail = not (info.isEntry and g.entryExits)
     if c.stmtKind == StmtsS:
       c.into:
-        while c.hasMore: (g.genStmt2(c); skip c)
+        while c.hasMore:
+          var nx = c; skip nx
+          # Only the LAST statement inherits it — a fresh `bodyTail`, not the running
+          # flag, or the first statement's `false` sticks for the whole walk.
+          let last = bodyTail and restEmitsNoCodeE(nx)
+          g.tailStmt = last
+          g.tailPos = last
+          g.genStmt2(c); skip c
   g.exitScope()
   if g.retLabelUsed2: g.emLab(g.retLabel2)
   if info.isEntry and g.entryExits:              # the entry EXITS (no epilogue)
