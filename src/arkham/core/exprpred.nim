@@ -187,6 +187,38 @@ proc isFoldableMemLeaf*(g: var CodeGen; n: Cursor): bool {.inline.} =
   ## not exist.
   isMemLeaf(n) and g.pairFieldReg(n) == NoReg
 
+proc sameTreeE*(a, b: Cursor): bool =
+  ## Structural equality of two expression subtrees, ignoring the sparse line-info
+  ## suffixes (they are not iterated as children). The nifcore twin of nimony's
+  ## `sameTrees`, which lives in `nimony_model` and is not on arkham's import path.
+  ##
+  ## Used to recognize a read-modify-write: `(asgn L (add T L v))` is one only if the
+  ## `L` under the `add` is the SAME location as the assignment's target, and "same"
+  ## here has to mean same tokens — arkham has no value numbering to appeal to. That
+  ## is sound because hexer un-nests, so an lvalue's embedded values are symbol or
+  ## immediate loads: two identical trees name one location at one program point.
+  if a.hasMore != b.hasMore: return false
+  if not a.hasMore: return true
+  let ka = a.kind
+  if ka != b.kind: return false
+  case ka
+  of TagLit:
+    if cursorTagId(a) != cursorTagId(b): return false
+    var ca = childCursor(a)
+    var cb = childCursor(b)
+    while ca.hasMore and cb.hasMore:
+      if not sameTreeE(ca, cb): return false
+      skip ca
+      skip cb
+    result = ca.hasMore == cb.hasMore
+  of Symbol, SymbolDef: result = symId(a) == symId(b)
+  of IntLit:            result = intVal(a) == intVal(b)
+  of UIntLit:           result = uintVal(a) == uintVal(b)
+  of FloatLit:          result = floatVal(a) == floatVal(b)
+  of StrLit, Ident:     result = strId(a) == strId(b)
+  of CharLit:           result = charLit(a) == charLit(b)
+  else:                 result = true
+
 proc calleeParamSlots*(g: var CodeGen; fsym: string; tgt: CallTarget): seq[AsmSlot] =
   ## The DECLARED parameter slots of a call target, from its `(proctype …)`
   ## signature — empty when the target carries none (an indirect call built

@@ -265,6 +265,22 @@ proc globalDeclType*(g: var CodeGen; name: string): Cursor =
     result = d
     while d.hasMore: skip d
 
+proc globalIsGvarSlot*(g: var CodeGen; name: string): bool =
+  ## True when `name` is a real `.bss`/`.data` gvar (nifasm `GvarD`, carrying a
+  ## page-offset patch site) — the `gload`/`gstore` fold target — rather than a
+  ## read-only `const` blob (`RodataD`), which is a label with no gvar site. Mirrors
+  ## `genGlobal`'s split exactly: rodata iff the decl is a `const` WITH a value.
+  # The fold is an `adrp`+folded-access pair. A target without it materializes a
+  # global's address absolutely (Cortex-M: movw/movt, patched once the .bss
+  # layout is known), so the address and the access stay separate there.
+  if PcRelGlobalFold notin g.md.caps: return false
+  let si = g.lookupSym(name)
+  if si.cat != scGlobal: return false
+  var d = si.decl
+  if d.stmtKind != ConstS: return true                  # a `var`/gvar → GvarD
+  inc d; skip d; skip d                                  # const: name, pragmas, type
+  result = not (d.hasMore and d.kind != DotToken)        # value-less const → gvar slot
+
 proc declType*(g: var CodeGen; typeCur, valueCur: Cursor): Cursor =
   ## The type a local should be DECLARED with. Shoggoth's SROA / cse /
   ## induction-variable passes synthesize `(var :t . . <value>)` with the type

@@ -1,0 +1,57 @@
+(.nif27)
+(.indexat 0)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (gvar :g8.0 .
+  (i 64)0)
+ (gvar :gu4.0 .
+  (u 32)0)
+ (gvar :gi4.0 .
+  (i 32)0)
+ (gvar :gb1.0 .
+  (i 8)0)
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (asgn g8.0 1000)
+   (asgn gu4.0
+    (add
+     (u 32)2000000000 2000000000))
+   (asgn gi4.0 -7)
+   (asgn gb1.0 -3)
+   (var :acc.0 .
+    (i 64)
+    (add
+     (i 64)g8.0
+     (cast
+      (i 64)gu4.0)))
+   (asgn acc.0
+    (add
+     (i 64)acc.0
+     (cast
+      (i 64)gi4.0)))
+   (asgn acc.0
+    (add
+     (i 64)acc.0
+     (cast
+      (i 64)gb1.0)))
+   (asgn g8.0
+    (add
+     (i 64)g8.0 1))
+   (asgn acc.0
+    (add
+     (i 64)acc.0 g8.0))
+   (call exit.0
+    (cast
+     (i 32)
+     (bitand
+      (i 64)acc.0 255))))))(.index)

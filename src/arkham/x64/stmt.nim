@@ -381,8 +381,11 @@ proc genStmt2*(g: var CodeGen; c: Cursor) =
       else:
         # A memory store through a complex lvalue (dot/deref/at).
         let lhsCur = cc
-        var rhsCur = cc; skip rhsCur                        # past the lhs → the rhs value
-        g.genStore2(rhsCur, memLoc(lhsCur, ScalarSlot))   # the one general store path
+        # `x.f = x.f <op> v` first: the read-modify-write folds into ONE
+        # `(op (mem x.f) v)` and skips the load, the temp and the store back.
+        if not g.tryRmwStore2(lhsCur):
+          var rhsCur = cc; skip rhsCur                      # past the lhs → the rhs value
+          g.genStore2(rhsCur, memLoc(lhsCur, ScalarSlot))   # the one general store path
       while cc.hasMore: skip cc
   of WhileS:
     let lEnd = g.freshLabel()

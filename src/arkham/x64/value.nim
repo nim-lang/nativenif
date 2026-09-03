@@ -116,10 +116,11 @@ proc scalarMemMov(g: var CodeGen; loc: Location; reg: Reg; load: bool) =
   ## The one GPR scalar memory move over every lvalue kind, both directions:
   ## `load` → `reg ← <loc>`; else `<loc> ← reg`. Load and store are mirror images
   ## — the value register and the memory operand swap order in the `(mov …)` — apart
-  ## from `Glob`, which has to materialize an address first (x86-64 has no typed
-  ## RIP-relative memory operand): a store must stage that address in a SEPARATE
-  ## register, since `reg` still holds the value being stored, while a load can fall
-  ## back to staging it in `reg` itself. See the branch.
+  ## from `Glob`, which folds its address into the access where it can (`(gload …)`/
+  ## `(gstore …)`, no scratch at all) and otherwise has to materialize the address
+  ## first: a store must stage that address in a SEPARATE register, since `reg` still
+  ## holds the value being stored, while a load can fall back to staging it in `reg`
+  ## itself. See the branch.
   case loc.kind
   of InReg:
     if load: g.movReg(reg, loc.r) else: g.movReg(loc.r, reg)
@@ -128,6 +129,16 @@ proc scalarMemMov(g: var CodeGen; loc: Location; reg: Reg; load: bool) =
       if load: (g.emReg reg; g.ab.sym loc.name)
       else:    (g.ab.sym loc.name; g.emReg reg)
   of Glob:
+    if g.globalFoldsIntoAccess(loc.name):
+      # The address folds INTO the access: one RIP-relative `mov` instead of an
+      # `(lea T &g)` and a `(mov D (mem T))`, and no staging register at all — which
+      # is the half that matters inside an address computation that has already spent
+      # every scratch it has. nifasm sizes and extends the access from the gvar's own
+      # declared type, exactly as the `(mem …)` form did.
+      g.ab.tree (if load: GloadX64 else: GstoreX64):
+        g.emReg reg
+        g.ab.sym g.prog.gvarRefName(loc.name)
+      return
     if load:                                       # &g into a typed staging temp, then deref
       # The address temp is `(ptr <globalType>)` so the `(mem p)` deref yields the
       # global's PRECISE type. Mirror of the store branch below, and the form to prefer:
@@ -1514,6 +1525,136 @@ proc genAggrCopyStore*(g: var CodeGen; rhs: Cursor; dst: Location; size: int) =
   g.giveBack tmp                                                 # unbinds + unseals the bridge
   g.giveBack srcAddr; g.giveBack dstAddr                         # unbind + unseal (NoReg ⇒ no-op)
 
+let rmwFoldOn = not existsEnv("ARKHAM_NO_RMW")
+  ## Off switch for the read-modify-write fold below, for A/B measurement.
+
+proc rmwMemOp(ek: LengExpr): tuple[op: X64Inst, ok: bool] =
+  ## The ALU ops nifasm will encode with a MEMORY destination — see the
+  ## `dest.kind == okMem` arms of `x64/instr.nim`. `mul` is absent because x86-64
+  ## has no `imul m, r`, and the shifts because nifasm refuses one outright
+  ## ("Shift destination cannot be memory": the count would have to be `cl`).
+  case ek
+  of AddC: (AddX64, true)
+  of SubC: (SubX64, true)
+  of BitandC: (AndX64, true)
+  of BitorC: (OrX64, true)
+  of BitxorC: (XorX64, true)
+  else: (AddX64, false)
+
+proc rmwIntOperand(g: var CodeGen; c: Cursor): bool =
+  ## May `c` take part in a folded ALU op — as its memory destination or as its
+  ## source? nifasm's `checkIntegerArithmetic`/`checkArithCompatible` admit exactly
+  ## the SIZED integers: no pointer of any kind (Leng has no pointer arithmetic),
+  ## and no `(c 8)` either — a char is `AUInt` in a slot but its own kind to nifasm,
+  ## so the slot class alone is not the question to ask.
+  if c.kind in {IntLit, UIntLit}: return true      # a literal is typed by where it goes
+  if c.kind == TagLit and c.exprKind in {SufC, ParC}:
+    # `(suf 1 "i32")` is how a front end spells a typed literal, and `exprSlot`
+    # deliberately does NOT honour an integer suffix — it recurses to the bare
+    # literal, whose slot carries no type cursor at all. So ask the literal.
+    var t = c; inc t
+    return g.rmwIntOperand(t)
+  let s = g.exprSlot(c)
+  if s.cls notin {AInt, AUInt} or cursorIsNil(s.typ): return false
+  var t = s.typ
+  result = resolveType(g.prog, t).typeKind in {LengType.IT, LengType.UT}
+
+proc rmwStripConv(g: var CodeGen; c: Cursor; memBits: int): Cursor =
+  ## Peel a `(conv (i W) x)` / `(cast (i W) x)` off an RMW source when `W >= memBits`.
+  ## The folded instruction reads only the DESTINATION's width, and the low `memBits`
+  ## bits of `x` and of `intW(x)` are the same bits — so the conversion is dead, and
+  ## with it the `mov`+`movsx` pair that materializes it. `c.free += int32(size)`
+  ## becomes the one `add %r9d, 0x30(%rcx)` gcc emits, instead of three instructions.
+  ## A NARROWING conversion (`W < memBits`) is not dead: there the truncated value
+  ## would have to be re-extended to the destination's width first.
+  result = c
+  while result.kind == TagLit and result.exprKind in {ConvC, CastC}:
+    var t = result; inc t                          # the target type
+    let tt = resolveType(g.prog, t)
+    if tt.typeKind notin {LengType.IT, LengType.UT}: break
+    if typeBits(tt) < memBits: break
+    var inner = t; skip inner
+    if not inner.hasMore or not g.rmwIntOperand(inner): break
+    result = inner
+
+proc tryRmwStore2*(g: var CodeGen; lhs: Cursor): bool =
+  ## `x.f = x.f <op> v` as ONE instruction — `(add (mem x.f) v)` — instead of the
+  ## load, the ALU op on a temp and the store back that `genStore2` would emit.
+  ##
+  ## Three instructions become one, and the sign extensions go with them: an `(i 32)`
+  ## field read into a 64-bit temp needs a `movsx` in and a truncating `mov` out,
+  ## while the folded form runs at the field's own width (`intMemAccess(dest.typ).bits`).
+  ## In the allocator's `rawDealloc` the three sites `a.occ -= size`,
+  ## `c.free += size` and `inc c.foreignCells` cost 14 instructions unfolded and 3
+  ## folded — 33 % of that proc's hot path.
+  ##
+  ## `lhs` is the assignment target and its sibling is the rhs. Returns false — having
+  ## emitted nothing — for every shape that does not fold, and the caller falls through
+  ## to the general store.
+  ##
+  ## WHAT MAKES IT SOUND. The fold moves the destination's READ from before the rhs
+  ## to the instruction itself, so the rhs must not be able to write that location:
+  ## hence no call in it. It also evaluates the address ONCE instead of twice, which
+  ## is strictly safer. Flags are the other thing an ALU op costs that a `mov` does
+  ## not, and `scanCondFusions` only ever fuses a compare across statements that emit
+  ## NO machine code — an assignment is not one of those either way, so a fold here
+  ## can never be the statement that separates a fused compare from its branch.
+  if not rmwFoldOn: return false
+  if not g.isFoldableMemLeaf(lhs): return false     # dot/deref/at/pat, and not a
+                                                    # field of a register-homed pair
+  var rhs = lhs; skip rhs
+  if rhs.kind != TagLit: return false
+  let (op, ok) = rmwMemOp(rhs.exprKind)
+  if not ok: return false
+  var aC, bC: Cursor
+  block:
+    var cc = rhs
+    cc.into:
+      skip cc                                       # the result type
+      if not cc.hasMore: return false
+      aC = cc; skip cc
+      if not cc.hasMore: return false
+      bC = cc; skip cc
+      if cc.hasMore: return false                   # not the (op T a b) shape
+  # Which operand IS the destination? Position 0 always; position 1 only when the
+  # operator is commutative — `x.f = v - x.f` is not a read-modify-write of `x.f`.
+  var srcC: Cursor
+  if sameTreeE(aC, lhs): srcC = bC
+  elif commutativeExpr(rhs.exprKind) and sameTreeE(bC, lhs): srcC = aC
+  else: return false
+  if subtreeHasCallE(srcC): return false            # see WHAT MAKES IT SOUND
+  if not g.rmwIntOperand(lhs) or not g.rmwIntOperand(srcC): return false
+  srcC = g.rmwStripConv(srcC, g.exprSlot(lhs).size * 8)
+  # The source value FIRST, then the lvalue's address parts — the order (and the
+  # reason for it) that `genStore2`'s scalar arm spells out. `regOrImm` is the
+  # operand-B constraint this instruction shape was written for: x86 allows one
+  # memory operand, so a stack-homed source is loaded rather than folded.
+  var v = regOrImm(ScalarSlot)
+  g.emitValue2(srcC, v)
+  var staging = NoReg
+  if v.kind in {NamedStack, Mem}:                   # demoted (stolen) local → a register
+    staging = g.pickStagingSealed("an rmw source", v.typ)
+    g.emitLoadLoc(v, staging)
+    v = regLoc(staging, v.typ)
+  elif v.kind == Imm and (v.ival < low(int32).int64 or v.ival > high(int32).int64):
+    # nifasm's memory-destination arm encodes the immediate as an `int32`; a wider
+    # one has to travel in a register (`emitBin2` guards its own imm fold the same way).
+    staging = g.pickStagingSealed("an rmw imm64 source", ScalarSlot)
+    g.movImm(staging, v.ival)
+    v = regLoc(staging, ScalarSlot)
+  g.emitLvalue2(lhs, dontCare, isStore = false)
+  g.prematLval2(lhs, foldDisp = true)
+  g.ab.tree op:
+    g.emMemLval2(lhs)
+    case v.kind
+    of Imm: g.emImm(v)
+    of InReg: g.emReg v.r
+    else: raiseAssert "arkham x64n: rmw source " & $v.kind
+  g.freeLvalTemps2(lhs)
+  if staging != NoReg: g.giveBack staging
+  elif v.kind == InReg and v.isTemp: g.unbindTemp(v.r)
+  return true
+
 proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location) =
   ## The general destination-passing store of the value core. An aggregate COPY (symbol /
   ## lvalue source) goes through the ONE `genAggrCopyStore` regardless of destination form;
@@ -1668,6 +1809,11 @@ proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location) =
         g.ab.sym dst.name
         g.emReg v.r
     of Glob:                                             # &g into a transient, then store
+      if g.globalFoldsIntoAccess(dst.name):
+        g.ab.tree GstoreX64: (g.emReg v.r; g.ab.sym g.prog.gvarRefName(dst.name))
+        if glbStaging != NoReg: g.giveBack glbStaging
+        elif v.isTemp: g.unbindTemp(v.r)
+        return
       # Type the address temp as `(ptr <globalType>)` so the `(mem p)` deref carries the
       # global's PRECISE type — a typed-pointer value into a pointer global would
       # otherwise mismatch a generic mem (nifasm is strict; see `scalarMemMov`).

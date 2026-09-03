@@ -1402,22 +1402,6 @@ proc placeImm*(g: var CodeGen; dest: Reg; loc: Location) =
     g.ab.tree MovA64: (g.emReg dest; g.ab.nilValue())
   else: g.movImm(dest, loc.ival)
 
-proc globalIsGvarSlot*(g: var CodeGen; name: string): bool =
-  ## True when `name` is a real `.bss`/`.data` gvar (nifasm `GvarD`, carrying a
-  ## page-offset patch site) — the `gload`/`gstore` fold target — rather than a
-  ## read-only `const` blob (`RodataD`), which is a label with no gvar site. Mirrors
-  ## `genGlobal`'s split exactly: rodata iff the decl is a `const` WITH a value.
-  # The fold is an `adrp`+folded-access pair. A target without it materializes a
-  # global's address absolutely (Cortex-M: movw/movt, patched once the .bss
-  # layout is known), so the address and the access stay separate there.
-  if PcRelGlobalFold notin g.md.caps: return false
-  let si = g.lookupSym(name)
-  if si.cat != scGlobal: return false
-  var d = si.decl
-  if d.stmtKind != ConstS: return true                  # a `var`/gvar → GvarD
-  inc d; skip d; skip d                                  # const: name, pragmas, type
-  result = not (d.hasMore and d.kind != DotToken)        # value-less const → gvar slot
-
 proc globalAddrSlot*(g: var CodeGen; name: string): AsmSlot =
   ## The slot for an address temp about to hold `&global` / `&threadvar`:
   ## `(ptr <its declared type>)`. The `(mem p)` deref built on that temp then carries

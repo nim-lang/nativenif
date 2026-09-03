@@ -2190,6 +2190,31 @@ proc emitLeaRipPlaceholder*(dest: var Buffer; reg: Register): int =
   dest.data.add(encodeModRM(amIndirect, int(reg), 5)) # Mod=00, Reg=reg, RM=101 (RIP-rel)
   dest.data.addt32(0) # placeholder disp32, patched in writeElf
 
+proc emitMovRipPlaceholder*(dest: var Buffer; reg: Register; bits: int;
+                            signed, isLoad: bool): int =
+  ## Emit `mov reg, [RIP + disp32]` (load) or `mov [RIP + disp32], reg` (store) with a
+  ## zero placeholder displacement and NO relocation; returns the instruction's start
+  ## position. The gvar-folding twin of `emitLeaRipPlaceholder`, patched by the very
+  ## same `gvarSites` loop in `writeElf` — which writes the disp32 at `pos + 3` and
+  ## computes it against `pos + 7`.
+  ##
+  ## So this MUST be exactly SEVEN bytes, and that is the whole reason for the shape
+  ## below: a 32-bit access carries a REX prefix (0x40) it does not otherwise need, so
+  ## that it is the same length as the 64-bit form. 8- and 16-bit accesses cannot be
+  ## made to fit — `movzx`/`movsx` take a two-byte opcode and a 16-bit `mov` takes an
+  ## operand-size prefix, both landing at 8 — so the caller refuses them and the
+  ## address-then-deref form covers those.
+  result = dest.data.getCurrentPosition()
+  var rex = RexPrefix(w: bits >= 64 or (isLoad and bits == 32 and signed))
+  if needsRex(reg): rex.r = true
+  dest.data.add(encodeRex(rex))                 # ALWAYS emitted: the 7-byte pad
+  dest.data.add(
+    if not isLoad: 0x89'u8                      # MOV r/m, r   (sized by REX.W)
+    elif bits == 32 and signed: 0x63'u8         # MOVSXD r64, r/m32
+    else: 0x8B'u8)                              # MOV r, r/m
+  dest.data.add(encodeModRM(amIndirect, int(reg), 5)) # Mod=00, RM=101 → RIP-relative
+  dest.data.addt32(0)                           # placeholder disp32, patched in writeElf
+
 proc emitIatCall*(dest: var Buffer; iatSlot: int) =
   ## Emit indirect call through IAT: CALL [rip+disp32] where disp32 points to IAT entry
   ## The displacement will be patched later when IAT address is known

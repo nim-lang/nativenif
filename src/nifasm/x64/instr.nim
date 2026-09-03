@@ -1772,6 +1772,45 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
           x86.emitLea(ctx.buf.data, dest, op.mem)
       else:
         error("lea requires an address expression (base-reg offset, mem, dot, at, or label)", n)
+  of GloadX64, GstoreX64:
+    # `(gload D S)` / `(gstore D S)` — scalar load/store of a `.bss` global `S` with
+    # its address folded into the access: one RIP-relative `mov` instead of the
+    # `(lea T S)` + `(mov D (mem T))` pair, and no scratch register. The x86-64 twin of
+    # the AArch64 `adrp`+folded-ldr arm, and it rides on the SAME `gvarSites` patch:
+    # `emitMovRipPlaceholder` is laid out byte-for-byte like `emitLeaRipPlaceholder`
+    # (disp32 at +3, RIP at +7), so `writeElf` needs no new case.
+    #
+    # That 7-byte budget is what limits the fold to 4- and 8-byte scalars — see
+    # `emitMovRipPlaceholder`. A narrower or float global keeps the address-then-deref
+    # form, which is always legal; a producer may simply not emit this row for one.
+    let isLoad = instTag == GloadX64
+    let what = if isLoad: "gload" else: "gstore"
+    inc n
+    var vreg: x86.Register
+    var vtyp: Type
+    if isLoad:
+      let d = parseDest(n, ctx)
+      if d.kind != okReg: error(what & " destination must be a register", n)
+      vreg = d.reg; vtyp = d.typ
+    else:
+      let v = parseOperand(n, ctx)
+      if v.kind != okReg: error(what & " source must be a register", n)
+      vreg = v.reg; vtyp = v.typ
+    let op = parseOperand(n, ctx)
+    if op.gvarSym == nil: error(what & " target must be a global variable", n)
+    let gtyp = op.gvarSym.typ
+    if isLoad:
+      if not movTypeOk(okReg, vtyp, okMem, gtyp): typeError(vtyp, gtyp, start)
+    else:
+      if not movTypeOk(okMem, gtyp, okReg, vtyp): typeError(gtyp, vtyp, start)
+      checkPtrStore(gtyp, okReg, vtyp, start)
+    let (bits, signed) = intMemAccess(gtyp)
+    if bits notin {32, 64}:
+      error(what & " needs a 4- or 8-byte global (got " & $bits &
+            " bits) — use (lea …) + (mem …) for a narrower one", n)
+    let pos = x86.emitMovRipPlaceholder(ctx.buf, vreg, bits, signed, isLoad)
+    ctx.gvarSites.add (pos, op.gvarSym)
+
   of JmpX64:
     inc n
     if lenient() and n.kind == Symbol:
