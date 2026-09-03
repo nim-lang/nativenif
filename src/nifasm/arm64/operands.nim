@@ -668,6 +668,10 @@ proc parseDestA64*(n: var Cursor; ctx: var GenContext): OperandA64 =
       error("Cannot store directly to thread-local '" & name &
             "'; use (adr (x0) " & name & ") then (mem (x0))", n)
     else:
+      if sym == nil:
+        # See `parseDest` (x64) for why an ended binding surfaces here.
+        error("Unknown variable as destination: '" & name &
+              "' — its binding ended (killed, or its register was rebound)", n)
       error("Expected variable or register as destination", n)
   else:
     error("Expected destination", n)

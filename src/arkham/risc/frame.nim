@@ -157,41 +157,6 @@ proc framePushBytes(g: CodeGen): int =
   elif g.md.frameStyle == BlockFrame: g.framePushBytesBlock
   else: 16 * (1 + g.frameRegs.len div 2 + g.frameFRegs.len div 2)
 
-proc emScalarStackVar*(g: var CodeGen; name: string) =
-  ## Declare a spilled integer/pointer scalar's stack slot `(var :name (s) (i 64))`.
-  ## Always 8-byte wide / 8-aligned (arkham keeps scalars 64-bit in registers and
-  ## nifasm's `ldr`/`str` need an 8-aligned slot), regardless of the logical width.
-  g.plan.hasStackVars = true                   # a `(s)` var exists ⇒ frame sub needed
-  g.ab.open NifasmDecl.VarD
-  g.ab.symDef name
-  g.ab.keyword SO
-  g.ab.intType(wordBits())
-  g.ab.close()
-
-proc emVoidPtrStackVar*(g: var CodeGen; name: string) =
-  ## `(var :name (s) (ptr void))` — the 8-byte cell for a spill temp whose VALUE is a
-  ## bare `nil`.
-  ##
-  ## Not `(s) (nil)`, which is what the value's own Leng type would give. `(nil)` is
-  ## the null-pointer VALUE type: nifasm keeps it deliberately narrow — compatible with
-  ## any pointer, never with a sized integer, so that a `cmp i64reg, ptr` mixup stays an
-  ## error. That is the right rule for a value and the wrong one for STORAGE. An `etmp`
-  ## cell is generic: the value core reuses one across a proc, and `lengcgen`'s
-  ## `trHoistedConst` is where that shows — a cell first holds the `nil` for a seq's
-  ## `owner` field, is read back into a generic `i64` scratch, then holds a real
-  ## `(ptr CursorOwnerObj)`. Declared `(nil)` the middle move is "expected (i 64), got
-  ## (stackoff nil)"; declared `(ptr void)` every one of them is legal for a reason
-  ## nifasm already states — `void` is the universal pointee among POINTERS, and an
-  ## 8-byte address moves to and from a 64-bit register (`addrWidthMove`). The
-  ## int-versus-pointer confusion the narrow rule exists to catch is still caught
-  ## everywhere it is a VALUE.
-  g.plan.hasStackVars = true
-  g.ab.open NifasmDecl.VarD
-  g.ab.symDef name
-  g.ab.keyword SO
-  g.ab.ptrType: g.ab.voidType()
-  g.ab.close()
-
 proc emByRefPtrStackVar*(g: var CodeGen; name: string; typeSym: SymId) =
   ## `(var :name (s) (ptr T))` — the 8-byte slot holding a spilled by-ref
   ## aggregate's incoming pointer.
@@ -200,17 +165,6 @@ proc emByRefPtrStackVar*(g: var CodeGen; name: string; typeSym: SymId) =
   g.ab.symDef name
   g.ab.keyword SO
   g.ab.ptrType: g.emTypeSym(typeSym)
-  g.ab.close()
-
-proc emFloatStackVar*(g: var CodeGen; name: string; bits: int) =
-  ## Declare a spilled float scalar's stack slot `(var :name (s) (f N))`. nifasm
-  ## sizes/aligns the slot and resolves the bare symbol to `[sp,#off]`.
-  g.checkFloatWidth(bits)
-  g.plan.hasStackVars = true                   # a `(s)` var exists ⇒ frame sub needed
-  g.ab.open NifasmDecl.VarD
-  g.ab.symDef name
-  g.ab.keyword SO
-  g.ab.floatType(bits)
   g.ab.close()
 
 proc emitSyprocA64*(g: var CodeGen; sp: SyscallProc) =
@@ -260,12 +214,12 @@ proc emRegLocalVar*(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   ## `(var :name (reg) type)` + bind `r` to `name` for its scope. arkham keeps
   ## scalars 64-bit in registers (width/signedness via explicit extends), so an
   ## int/uint/bool/char local is declared `(i 64)`; a pointer keeps `(ptr T)`.
-  # If `r` still holds an earlier, now-dead local (the allocator early-freed it at
-  # its last use and reassigned the register here), `kill` that binding first —
-  # nifasm forbids binding a still-live register.
-  let dead = g.rb.takeBinding(r)
-  if dead.len > 0:
-    g.ab.tree KillA64: g.ab.sym dead
+  ##
+  ## No prior `(kill …)`: binding a register ENDS whatever binding it had, and a
+  ## register `(var …)` is a binding — the same rule `(rebind …)` follows, which is
+  ## why `emFRegLocalVar` below could always spell itself that way. If `r` still
+  ## holds an earlier, now-dead local (the allocator early-freed it at its last use
+  ## and reassigned the register here), this declaration evicts it.
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
   g.ab.rawReg r
@@ -283,14 +237,16 @@ proc emRegLocalVar*(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   g.rb.bindLocal(r, name, isPtr)
 
 proc emFRegLocalVar*(g: var CodeGen; name: string; f: FReg; bits: int) =
-  ## Declare a float register local: bind v-register `f` to `name` via `(rebind …)` for
-  ## the rest of its scope, so subsequent uses emit the typed name instead of a raw
-  ## `(dN)`/`(sN)`. The SIMD twin of `emRegLocalVar`. `rebind` kills `f`'s prior tenant
-  ## itself, so no manual prior-kill is needed.
-  g.ab.tree RebindA64:
-    g.ab.symDef name
-    g.ab.floatType(bits)
-    g.ab.freg(f, bits)
+  ## Declare a float register local `(var :name (dN|sN) (f B))` and bind v-register
+  ## `f` to `name` for the rest of its scope, so subsequent uses emit the typed name
+  ## instead of a raw `(dN)`/`(sN)`. The SIMD twin of `emRegLocalVar`, and now spelled
+  ## the same way: this used to be a `(rebind …)` purely because a declaration REFUSED
+  ## a still-bound register while a rebind evicted it. Both evict now.
+  g.ab.open NifasmDecl.VarD
+  g.ab.symDef name
+  g.ab.freg(f, bits)
+  g.ab.floatType(bits)
+  g.ab.close()
   g.rb.bindFLocal(f, name)
   g.freeFTmp.excl f                             # a local's home is no longer scratch
 
@@ -870,14 +826,3 @@ proc wideParamToHome(g: var CodeGen; nm: string; firstArg: int) =
   let home = slotWide(nm)
   g.wideStore(home, 0, g.md.intArgRegs[firstArg])
   g.wideStore(home, 1, g.md.intArgRegs[firstArg + 1])
-
-proc emWideStackVar*(g: var CodeGen; name: string) =
-  ## `(var :name (s) (i 64))` — the eight-byte cell of a 64-bit expression temp.
-  ## `emScalarStackVar` declares a slot at the target WORD, which here is four
-  ## bytes: the high half would land on whatever slot the allocator put next.
-  g.plan.hasStackVars = true
-  g.ab.open NifasmDecl.VarD
-  g.ab.symDef name
-  g.ab.keyword SO
-  g.ab.intType(64)
-  g.ab.close()

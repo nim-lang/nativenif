@@ -332,26 +332,20 @@ proc genInstAvr(n: var Cursor; ctx: var GenContext) =
     else:
       error("Expected location", n)
     let baseTyp = parseType(n, ctx.scope, ctx)
-    let sym = Symbol(name: ctx.symIdOf(name), kind: skVar)
-    if onStack:
-      sym.typ = Type(kind: TypeKind.StackOffT, offType: baseTyp)
-      sym.offset = ctx.slots.allocSlotUp(baseTyp, slotAlign)
-    else:
+    if not onStack:
+      # A register `(var …)` binds a register to a typed name, which is precisely
+      # what `(rebind …)` does — so it ends the register's prior binding the same
+      # way, through the same helper (which evicts BOTH halves of a pair). See
+      # `genInstX64` for what the old "kill it first" rejection cost.
       checkRegWidthAvr(baseTyp, "variable '" & name & "'", n)
-      sym.typ = baseTyp
-      sym.reg = regTag
       let isPair = rawTagIsAvrPair(regTag)
       let low = if isPair: lowOf(tagToPairAvr(regTag, n))
                 else: tagToRegisterAvr(regTag, n)
-      if low in ctx.avrRegBindings:
-        error("Register " & regName(low) & " is already bound to variable '" &
-              ctx.avrRegBindings[low] & "', kill it first before reusing", n)
-      if isPair and avr.Register(ord(low) + 1) in ctx.avrRegBindings:
-        error("Register " & regName(avr.Register(ord(low) + 1)) &
-              " is already bound to variable '" &
-              ctx.avrRegBindings[avr.Register(ord(low) + 1)] &
-              "', kill it first before reusing", n)
-      ctx.bindNames(name, low, isPair)
+      bindRegAvr(ctx, name, baseTyp, regTag, low, isPair)
+      return
+    let sym = Symbol(name: ctx.symIdOf(name), kind: skVar)
+    sym.typ = Type(kind: TypeKind.StackOffT, offType: baseTyp)
+    sym.offset = ctx.slots.allocSlotUp(baseTyp, slotAlign)
     ctx.scope.define(sym)
     return
   of NoDecl:

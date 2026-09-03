@@ -891,6 +891,14 @@ proc parseDest*(n: var Cursor; ctx: var GenContext;
        result.typ = sym.typ
        inc n
     else:
+       if sym == nil:
+         # Not in scope — most often because the name's binding ENDED: an explicit
+         # `(kill …)`, or a later `(var …)`/`(rebind …)` that took its register and
+         # evicted it. That eviction is the point: a read of a value wrongly left in
+         # a reused register is an error here rather than a silent clobber at run
+         # time. Say which name, or the diagnostic sends the reader hunting.
+         error("Unknown variable as destination: '" & name &
+               "' — its binding ended (killed, or its register was rebound)", n)
        error("Expected variable or register as destination", n)
   else:
     error("Expected destination", n)

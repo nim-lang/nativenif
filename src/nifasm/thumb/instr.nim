@@ -292,10 +292,7 @@ proc genInstM(n: var Cursor; ctx: var GenContext) =
         inc n
         let ftyp = parseType(n, ctx.scope, ctx)
         checkRegWidthM(ftyp, "variable '" & name & "'", n)
-        if f in ctx.mFRegBindings:
-          error("Register " & $f & " is already bound to variable '" &
-                ctx.mFRegBindings[f] & "', kill it first before reusing", n)
-        bindFRegM(ctx, name, ftyp, locTag, f)
+        bindFRegM(ctx, name, ftyp, locTag, f)   # binding implies a kill — see below
         return
       if rawTagIsMGpr(locTag):
         let r = tagToRegisterM(locTag, n)
@@ -313,20 +310,17 @@ proc genInstM(n: var Cursor; ctx: var GenContext) =
     else:
       error("Expected location", n)
     let baseTyp = parseType(n, ctx.scope, ctx)
-    let sym = Symbol(name: ctx.symIdOf(name), kind: skVar)
-    if onStack:
-      sym.typ = Type(kind: TypeKind.StackOffT, offType: baseTyp)
-      sym.offset = ctx.slots.allocSlotUp(baseTyp, slotAlign)
-    else:
+    if not onStack:
+      # A register `(var …)` binds a register to a typed name, which is precisely
+      # what `(rebind …)` does — so it ends the register's prior binding the same
+      # way, through the same helper. See `genInstX64` for what the old "kill it
+      # first" rejection cost.
       checkRegWidthM(baseTyp, "variable '" & name & "'", n)
-      sym.typ = baseTyp
-      sym.reg = reg
-      let targetReg = tagToRegisterM(reg, n)
-      if targetReg in ctx.mRegBindings:
-        error("Register " & $targetReg & " is already bound to variable '" &
-              ctx.mRegBindings[targetReg] & "', kill it first before reusing", n)
-      ctx.mRegBindings[targetReg] = name
-      ctx.clobberedM.excl(targetReg)
+      bindRegM(ctx, name, baseTyp, reg, tagToRegisterM(reg, n))
+      return
+    let sym = Symbol(name: ctx.symIdOf(name), kind: skVar)
+    sym.typ = Type(kind: TypeKind.StackOffT, offType: baseTyp)
+    sym.offset = ctx.slots.allocSlotUp(baseTyp, slotAlign)
     ctx.scope.define(sym)
     return
   of NoDecl:

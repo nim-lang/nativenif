@@ -176,8 +176,9 @@ tracks it, so reading a register whose binding a call destroyed is an error
 rather than a wrong answer.
 
 **`rebind`** — bind a register to a name and type, ending whatever binding it
-had. **`withreg`** does the same for the extent of a block. **`kill`** ends a
-binding.
+had. **`withreg`** does the same for the extent of a block, and a register
+**`var`** does it for a declaration: binding a register always ends its prior
+tenant, whichever of the three spells it. **`kill`** ends a binding.
 
 **`prepare`** — the block that sets up a call. Arguments are written to
 `(arg <name>)` by name, then a `(call)`, `(tailcall)`, `(extcall)` or

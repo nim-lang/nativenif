@@ -155,12 +155,15 @@ type
                                       ## register. The emitter emits neither a decl nor a store
                                       ## for these (uses auto-cast via the deref handler).
     spillTemps*: seq[tuple[name: string; typ: AsmSlot; isFloat: bool]]
-                                      ## value-core totality: `etmp`/`ftmp` slots the
-                                      ## allocator synthesized when the register pool
-                                      ## was exhausted (reserveTmp/reserveFTmp). The
-                                      ## emitter DECLARES each `(var :etmpN.0 (s) T)`
-                                      ## in the prologue and PRODUCES the spilled value
-                                      ## position into it via a staging register.
+                                      ## The `(s)` slots the PROLOGUE declares, queued
+                                      ## because they are decided before or apart from
+                                      ## the point their `(var …)` may stand: a
+                                      ## caller-saved home's `csave` cell, and the wide
+                                      ## `etmp` of a 32-bit target. See `addSpillTemp`.
+                                      ## The value core's own totality slots
+                                      ## (`etmp`/`eftmp`/`held`, minted at register
+                                      ## exhaustion) are NOT here — `declSpillSlot`
+                                      ## declares each where it is minted.
     sealed*: set[Reg]                 ## registers pinned to an in-flight ABI
                                       ## call (args being marshalled, x8 result,
                                       ## values live through the call): never
@@ -605,17 +608,20 @@ proc coldestVictim(b: var Builder; maxW, ceilLen, thiefDepth: int;
         bestW = vw; bestLen = b.rangeLen(v); result = v
 
 proc addSpillTemp*(plan: var Plan; name: string; typ: AsmSlot; isFloat = false) =
-  ## Register a totality spill slot. `hasStackVars` comes WITH it: a spill temp is a
-  ## nifasm `(s)` slot like any other, and the frame `sub` is emitted from that flag.
+  ## Queue a spill slot for the PROLOGUE to declare. For the planner's own slots
+  ## only — a `csave` cell, and the wide `etmp` of a 32-bit target. The value core
+  ## declares its `etmp`/`eftmp`/`held` where it mints them (`declSpillSlot`), which
+  ## is always a statement position; queueing those too meant a slot whose only
+  ## declaration site was a loop running AFTER `emitFrameSub`, so `hasStackVars` had
+  ## to be set from HERE or the frame `sub` went missing. That is still why the flag
+  ## is set here: a queued slot's own declaration is too late to set it.
   ##
-  ## The prologue is written after the body, and its slot-declaration loop runs AFTER
-  ## `emitFrameSub` — so `emScalarStackVar`'s own `hasStackVars = true` is too late for
-  ## anything declared from `spillTemps`. That was invisible while every spill temp was
-  ## minted under register exhaustion, which no proc reaches without stack vars of its
-  ## own; the caller-saved save slot is the first one a register-only proc can have, and
-  ## it produced a proc with a slot and NO frame — every save writing below `rsp`.
+  ## (What that cost: invisible while every spill temp was minted under register
+  ## exhaustion, which no proc reaches without stack vars of its own; the caller-saved
+  ## save slot is the first one a register-only proc can have, and it produced a proc
+  ## with a slot and NO frame — every save writing below `rsp`.)
   plan.spillTemps.add (name: name, typ: typ, isFloat: isFloat)
-  plan.hasStackVars = true
+  plan.hasStackVars = true                     # see above: the decl is too late to set it
   when defined(arkhamSpillDbg):
     stderr.writeLine "SPILLTEMP proc=" & gArkhamCurProc & " name=" & name &
       " float=" & $isFloat

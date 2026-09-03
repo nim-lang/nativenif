@@ -579,6 +579,62 @@ proc emStackVar*(g: var CodeGen; name: string; typeSym: SymId) =
   g.emTypeSym(typeSym)
   g.ab.close()
 
+proc emScalarStackVar*(g: var CodeGen; name: string) =
+  ## Declare a spilled integer/pointer scalar's stack slot `(var :name (s) (i 64))`.
+  ## Always 8-byte wide / 8-aligned (arkham keeps scalars 64-bit in registers and
+  ## nifasm's `ldr`/`str` need an 8-aligned slot), regardless of the logical width.
+  g.plan.hasStackVars = true                   # a `(s)` var exists ⇒ frame sub needed
+  g.ab.open NifasmDecl.VarD
+  g.ab.symDef name
+  g.ab.keyword SO
+  g.ab.intType(wordBits())
+  g.ab.close()
+
+proc emVoidPtrStackVar*(g: var CodeGen; name: string) =
+  ## `(var :name (s) (ptr void))` — the 8-byte cell for a spill temp whose VALUE is a
+  ## bare `nil`.
+  ##
+  ## Not `(s) (nil)`, which is what the value's own Leng type would give. `(nil)` is
+  ## the null-pointer VALUE type: nifasm keeps it deliberately narrow — compatible with
+  ## any pointer, never with a sized integer, so that a `cmp i64reg, ptr` mixup stays an
+  ## error. That is the right rule for a value and the wrong one for STORAGE. An `etmp`
+  ## cell is generic: the value core reuses one across a proc, and `lengcgen`'s
+  ## `trHoistedConst` is where that shows — a cell first holds the `nil` for a seq's
+  ## `owner` field, is read back into a generic `i64` scratch, then holds a real
+  ## `(ptr CursorOwnerObj)`. Declared `(nil)` the middle move is "expected (i 64), got
+  ## (stackoff nil)"; declared `(ptr void)` every one of them is legal for a reason
+  ## nifasm already states — `void` is the universal pointee among POINTERS, and an
+  ## 8-byte address moves to and from a 64-bit register (`addrWidthMove`). The
+  ## int-versus-pointer confusion the narrow rule exists to catch is still caught
+  ## everywhere it is a VALUE.
+  g.plan.hasStackVars = true
+  g.ab.open NifasmDecl.VarD
+  g.ab.symDef name
+  g.ab.keyword SO
+  g.ab.ptrType: g.ab.voidType()
+  g.ab.close()
+
+proc emFloatStackVar*(g: var CodeGen; name: string; bits: int) =
+  ## Declare a spilled float scalar's stack slot `(var :name (s) (f N))`. nifasm
+  ## sizes/aligns the slot and resolves the bare symbol to `[sp,#off]`.
+  g.checkFloatWidth(bits)
+  g.plan.hasStackVars = true                   # a `(s)` var exists ⇒ frame sub needed
+  g.ab.open NifasmDecl.VarD
+  g.ab.symDef name
+  g.ab.keyword SO
+  g.ab.floatType(bits)
+  g.ab.close()
+
+proc emWideStackVar*(g: var CodeGen; name: string) =
+  ## `(var :name (s) (i 64))` — the eight-byte cell of a 64-bit expression temp.
+  ## `emScalarStackVar` declares a slot at the target WORD, which here is four
+  ## bytes: the high half would land on whatever slot the allocator put next.
+  g.plan.hasStackVars = true
+  g.ab.open NifasmDecl.VarD
+  g.ab.symDef name
+  g.ab.keyword SO
+  g.ab.intType(64)
+  g.ab.close()
 proc emTypedStackVar*(g: var CodeGen; name: string; t: Cursor) =
   ## The ONE local-variable stack-slot emitter — `(var :name (s) <the value's real
   ## Leng type>)`, dispatching on the value class so callers need no per-form ladder.
@@ -611,6 +667,22 @@ proc emTypedStackVar*(g: var CodeGen; name: string; t: Cursor) =
     var tc = t                                # everything else: its own type
     if tc.kind == Symbol: g.ab.sym symName(tc) else: g.genTypeBody(tc)
   g.ab.close()
+
+proc declSpillSlot*(g: var CodeGen; name: string; typ: AsmSlot; isFloat: bool) =
+  ## Declare one totality spill slot — an `etmp`/`eftmp`/`held` the value core minted
+  ## when the register pools ran dry, or a `csave` the planner minted for a
+  ## caller-saved home. THE single place a spill slot is spelled, so the emitter can
+  ## declare one where it mints it and the prologue can declare the planner's from the
+  ## same rule. The x64 twin.
+  when defined(arkhamSpillDbg):
+    stderr.writeLine "SPILLTEMP proc=" & g.curProcName & " name=" & name &
+      " float=" & $isFloat
+  if isFloat: g.emFloatStackVar(name, typ.size * 8)
+  elif g.isWideSlot(typ): g.emWideStackVar(name)
+  elif g.slotIsPointer(typ):
+    if isNilValue(typ.typ): g.emVoidPtrStackVar(name)
+    else: g.emTypedStackVar(name, typ.typ)         # `(ptr T)` slot keeps its type
+  else: g.emScalarStackVar(name)
 
 proc emScalarLoad*(g: var CodeGen; dest: Reg; name: string) =
   ## `dest ← [slot]` — load a spilled scalar (nifasm resolves the `(s)` var to
@@ -1176,7 +1248,7 @@ proc takeTmp*(g: var CodeGen; slot: AsmSlot): Location =
   let r = g.pickTempReg()
   if r == NoReg:
     let nm = g.mintSpillName("etmp")
-    g.plan.addSpillTemp(nm, slot)
+    g.declSpillSlot(nm, slot, isFloat = false)   # HERE: exhaustion is a statement position
     return namedStackLoc(nm, slot, spillTemp = true)
   g.pickedRegs.incl r
   result = regLoc(r, slot, isTemp = true)
@@ -1186,7 +1258,7 @@ proc takeFTmp*(g: var CodeGen; slot: AsmSlot): Location =
   let f = g.pickFTempReg()
   if f == NoFReg:
     let nm = g.mintSpillName("eftmp")
-    g.plan.addSpillTemp(nm, slot, isFloat = true)
+    g.declSpillSlot(nm, slot, isFloat = true)
     return namedStackLoc(nm, slot, spillTemp = true)
   g.pickedFRegs.incl f
   result = fregLoc(f, slot, isTemp = true)
@@ -1212,7 +1284,7 @@ proc takeHeld*(g: var CodeGen; what: string; canSpill = false): Location =
       return regLoc(cs, ScalarSlot, isTemp = true)
   if canSpill:
     let nm = g.mintSpillName("held")
-    g.plan.addSpillTemp(nm, ScalarSlot)
+    g.declSpillSlot(nm, ScalarSlot, isFloat = false)
     return namedStackLoc(nm, ScalarSlot, spillTemp = true)
   raiseAssert "arkham a64n: out of registers for " & what &
               " in proc " & g.curProcName & " (nothing to spill), picked: " &
@@ -2239,8 +2311,10 @@ proc wideStore*(g: var CodeGen; w: WideRef; i: int; s: Reg) =
   g.ab.tree MovA64: (g.emWideWord(w, i); g.emReg s)
 
 proc mintWideSlot*(g: var CodeGen): string =
-  ## A fresh 8-byte `etmp` slot. Declared by the prologue's `spillTemps` loop,
-  ## which sizes it from the slot's own `size` — see `emScalarStackVar`.
+  ## A fresh 8-byte `etmp` slot, declared by the prologue's `spillTemps` loop rather
+  ## than here: unlike `takeTmp`'s exhaustion path this one is reached from the
+  ## 32-bit targets' wide lowerings, which no corpus on this machine runs, so it
+  ## keeps the queue until one can vouch for its emission point.
   result = g.mintSpillName("etmp")
   g.plan.addSpillTemp(result, WideSlot)
 

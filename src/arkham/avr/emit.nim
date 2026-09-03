@@ -567,9 +567,7 @@ proc genTypeBodyAvr*(g: var CodeGen; c: var Cursor) =
 proc emRegPairVar*(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   ## `(var :name (rpN) T)` — declare a local and bind the PAIR to it, so every
   ## later use spells the name and every half spells `(lo name)`/`(hi name)`.
-  let dead = g.rb.takeBinding(r)
-  if dead.len > 0:
-    g.ab.tree KillAvr: g.ab.sym dead
+  ## Evicts the pair's prior tenant — BOTH halves — as every binding does.
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
   g.ab.rawReg r
@@ -587,9 +585,7 @@ proc emRegPtrVar*(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   ## says the object is IN the register — which on no machine here it is. A
   ## by-reference parameter looked like that and every field access through it
   ## was rejected.
-  let dead = g.rb.takeBinding(r)
-  if dead.len > 0:
-    g.ab.tree KillAvr: g.ab.sym dead
+  ## Evicts the pair's prior tenant, as every binding does — see `emRegPairVar`.
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
   g.ab.rawReg r

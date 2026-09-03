@@ -829,6 +829,15 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
     var slotAlign = asmWordSize()
     if n.kind == TagLit:
       let locTag = n.tag
+      if isXmmTag(n):
+        # `(var :name (xmmN) (f B))` — a float register local. Same act as the GPR
+        # form below, and the same eviction rule; the SIMD tables are just separate.
+        # (Before `(var …)` implied a kill, a float local had to spell itself
+        # `(rebind …)` to get one — see the arkham twin `emFRegLocalVar`.)
+        inc n
+        let ftyp = parseType(n, ctx.scope, ctx)
+        bindXmmX64(ctx, name, ftyp, locTag, tagToXmm(locTag))
+        return
       if rawTagIsX64Reg(locTag):
         reg = locTag
         inc n
@@ -841,28 +850,24 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
       error("Expected location", n)
     let baseTyp = parseType(n, ctx.scope, ctx)
 
+    if not onStack:
+      # A register `(var …)` binds a register to a typed name, which is precisely
+      # what `(rebind …)` does — so it ends the register's prior binding the same
+      # way, through the same helper. One act, one rule. This used to REJECT a
+      # still-bound register ("kill it first"), and the asymmetry cost twice: every
+      # producer had to emit a `(kill …)` it could decide nothing useful about, and
+      # a float local spelled itself `rebind` purely to escape the check.
+      bindRegX64(ctx, name, baseTyp, reg, tagToRegister(reg, n))
+      return
     let sym = Symbol(name: ctx.symIdOf(name), kind: skVar)
-    if onStack:
-      sym.typ = Type(kind: StackOffT, offType: baseTyp)
-      # Positive, base-relative offsets (like AArch64): the code generator lowers
-      # rsp by a 16-aligned `sub rsp, (ssize)` so the slots sit ABOVE rsp, where a
-      # `call`'s pushed return address (and any callee pushes) can't reach them. A
-      # red-zone (negative-offset) slot whose address escapes into a call would be
-      # clobbered by that call. No frame pointer is needed.
-      sym.offset = ctx.slots.allocSlotUp(baseTyp, slotAlign)
-    else:
-      sym.typ = baseTyp
-      sym.reg = reg
-      # Check if register is already bound to another variable
-      let targetReg = tagToRegister(reg, n)
-      if targetReg in ctx.regBindings:
-        error("Register " & $targetReg & " is already bound to variable '" &
-              ctx.regBindings[targetReg] & "', kill it first before reusing", n)
-      # Track the register binding
-      ctx.regBindings[targetReg] = name
-
+    sym.typ = Type(kind: StackOffT, offType: baseTyp)
+    # Positive, base-relative offsets (like AArch64): the code generator lowers
+    # rsp by a 16-aligned `sub rsp, (ssize)` so the slots sit ABOVE rsp, where a
+    # `call`'s pushed return address (and any callee pushes) can't reach them. A
+    # red-zone (negative-offset) slot whose address escapes into a call would be
+    # clobbered by that call. No frame pointer is needed.
+    sym.offset = ctx.slots.allocSlotUp(baseTyp, slotAlign)
     ctx.scope.define(sym)
-
     return
   of NoDecl:
     discard "continue with case instTag"

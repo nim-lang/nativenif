@@ -30,24 +30,16 @@ const X64SyscallArgRegs* = [RDI, RSI, RDX, R10, R8, R9]
   ## never has to emit a raw r10 (which its scratch-pool guard forbids).
 
 
-proc emFloatStackVar*(g: var CodeGen; name: string; bits: int) =
-  g.plan.hasStackVars = true                   # a `(s)` var exists ⇒ frame sub needed
-  g.ab.open NifasmDecl.VarD
-  g.ab.symDef name
-  g.ab.keyword SO
-  g.ab.floatType(bits)
-  g.ab.close()
-
 proc emRegLocalVar*(g: var CodeGen; name: string; r: Reg; typeCur: Cursor) =
   ## Declare `(var :name (reg) type)` and bind `r` to `name` for the rest of its
   ## scope, so subsequent uses emit the typed name instead of `(reg)`.
-  # If `r` still holds an earlier, now-dead local (the allocator early-freed it at
-  # its last use and reassigned the register here), `kill` that binding first —
-  # nifasm forbids binding a still-live register. The kill lands at this rebind,
-  # past the dead var's coarse free point, hence on its post-dominating path.
-  let dead = g.rb.takeBinding(r)
-  if dead.len > 0:
-    g.ab.tree KillX64: g.ab.sym dead
+  ##
+  ## No prior `(kill …)`: binding a register ENDS whatever binding it had, and a
+  ## register `(var …)` is a binding — the same rule `(rebind …)` follows. If `r`
+  ## still holds an earlier, now-dead local (the allocator early-freed it at its
+  ## last use and reassigned the register here), this declaration evicts it, at a
+  ## point past the dead var's coarse free point and hence on its post-dominating
+  ## path. `bindLocal` below drops arkham's own record of it.
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
   g.ab.rawReg r                                   # the concrete register (the binding)
@@ -78,9 +70,7 @@ proc emRegAggrPtrVar*(g: var CodeGen; name: string; r: Reg; typeSym: SymId) =
   ## symbol, `rb` could not see the register was occupied and neither could nifasm's
   ## binding checker — the reservation lived only in `regFreeForTemp`'s per-proc
   ## `regHoldsHome` union. Declaring it is what lets the readers name it.
-  let dead = g.rb.takeBinding(r)
-  if dead.len > 0:
-    g.ab.tree KillX64: g.ab.sym dead
+  ## Evicts `r`'s prior tenant, as every binding does — see `emRegLocalVar`.
   g.ab.open NifasmDecl.VarD
   g.ab.symDef name
   g.ab.rawReg r
@@ -90,15 +80,16 @@ proc emRegAggrPtrVar*(g: var CodeGen; name: string; r: Reg; typeSym: SymId) =
   g.nameBindTyp[name] = NameBindTyp(aggrSym: typeSym, isPtr: true)
 
 proc emFRegLocalVar*(g: var CodeGen; name: string; f: FReg; bits: int) =
-  ## Declare a float register local: bind xmm `f` to `name` via `(rebind …)` for the
-  ## rest of its scope, so subsequent uses emit the typed name instead of `(xmmN)`.
-  ## The SIMD twin of `emRegLocalVar`. `rebind` kills `f`'s prior tenant itself (an
-  ## earlier, now-dead local the allocator reassigned the register to), so no manual
-  ## kill is needed first.
-  g.ab.tree RebindX64:
-    g.ab.symDef name
-    g.ab.floatType(bits)
-    g.ab.xmmReg f
+  ## Declare a float register local `(var :name (xmmN) (f B))` and bind xmm `f` to
+  ## `name` for the rest of its scope, so subsequent uses emit the typed name instead
+  ## of `(xmmN)`. The SIMD twin of `emRegLocalVar`, and now spelled the same way: this
+  ## used to be a `(rebind …)` purely because a declaration REFUSED a still-bound
+  ## register while a rebind evicted it. Both evict now.
+  g.ab.open NifasmDecl.VarD
+  g.ab.symDef name
+  g.ab.xmmReg f
+  g.ab.floatType(bits)
+  g.ab.close()
   g.rb.bindFLocal(f, name)
 
 proc enterScope*(g: var CodeGen) =
@@ -123,16 +114,6 @@ proc emStackVar*(g: var CodeGen; name: string; typeSym: SymId) =
   g.ab.symDef name
   g.ab.keyword SO
   g.emTypeSym(typeSym)
-  g.ab.close()
-
-proc emScalarStackVar*(g: var CodeGen; name: string) =
-  ## `(var :name (s) (i 64))` — a spilled/address-taken scalar's 8-byte slot.
-  g.plan.hasStackVars = true                   # a `(s)` var exists ⇒ frame sub needed
-  g.stackSlots.incl name
-  g.ab.open NifasmDecl.VarD
-  g.ab.symDef name
-  g.ab.keyword SO
-  g.ab.intType(64)
   g.ab.close()
 
 proc emByRefPtrStackVar*(g: var CodeGen; name: string; typeSym: SymId) =

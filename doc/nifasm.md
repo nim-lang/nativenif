@@ -287,11 +287,28 @@ Since local variables are described precisely, it is possible to detect code gen
 ```
 
 A local's register binding can also be changed explicitly: `(rebind :tmp.0 (i 64) (x9))`
-binds a physical register to a typed name, killing whatever name it held before,
-`(withreg ...)` does the same for the extent of a block, and `(kill name)` ends a binding
-early. Every read of a register that is currently bound to a name must go through the
-name — naming the register directly is an error, which is what makes an accidental
-clobber a translation-time failure rather than a wrong answer at run time.
+binds a physical register to a typed name, `(withreg ...)` does the same for the extent
+of a block, and `(kill name)` ends a binding early. Every read of a register that is
+currently bound to a name must go through the name — naming the register directly is an
+error, which is what makes an accidental clobber a translation-time failure rather than
+a wrong answer at run time.
+
+**Binding a register ends whatever binding it had.** `(rebind ...)`, `(withreg ...)` and
+a register `(var ...)` are one act under three spellings, so they follow one rule: the
+prior tenant's name is undefined on the spot. A value wrongly left in a reused register
+is then an *unknown variable* error at its next use, rather than a silent clobber:
+
+```
+(var :x.0 (rax) (i 64))
+(mov x.0 10)
+(var :y.0 (rax) (i 64))   # rax is y.0's now; x.0 is gone
+(mov x.0 20)              # error: unknown variable `x.0`
+```
+
+A declaration used to *refuse* a still-bound register instead ("kill it first"), which
+bought nothing — every producer simply emitted the `(kill ...)` in front of it — and cost
+the symmetry: a float local had to spell itself `(rebind ...)` to get the eviction a
+`(var ...)` would not give it.
 
 
 ## Control flow

@@ -79,7 +79,7 @@ a second table anywhere in this file is parsed as vocabulary.)
 | `(param D L T)`        | NifasmDecl                  | parameter declaration |
 | `(result D L T)`       | NifasmDecl                  | result value declaration |
 | `(clobber ...)`        | NifasmDecl                  | clobbered registers list |
-| `(var D L T)`          | NifasmDecl                  | variable declaration |
+| `(var D L T)`          | NifasmDecl                  | variable declaration; a register `L` binds it, killing that register's prior tenant |
 | `(layout ...)`         | NifasmDecl                  | Cortex-M: the board's memory layout, as arkham read it out of the `--layout:` file and forwarded. Children are the `flash`/`sram`/`stacks`/`heap`/`noinit`/`core` rows below. There is no row saying which region a section lives in: code and constants go where the image is, mutable storage goes where nothing is, and a row restating that would only be a chance to write it wrong. Supersedes the memory-map command-line flags |
 | `(flash ...)`          | NifasmDecl                  | Cortex-M: the region the IMAGE SHIPS IN — code, constants, and the initializer image for globals — as a `(startAddress …)` and one size row. Named for the part rather than for a permission: whether the silicon is writable is beside the point (MPS2's region at 0 is ZBT SRAM), what matters is that its contents survive reset |
 | `(sram ...)`           | NifasmDecl                  | Cortex-M: the region that holds NOTHING at reset — globals, stacks, heap — as a `(startAddress …)` and one size row. Everything in it is established by the startup code |

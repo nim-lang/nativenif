@@ -507,6 +507,13 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     var slotAlign = asmWordSize()
     if n.kind == TagLit:
       let locTag = n.tag
+      if isA64FpRegOperand(n):
+        # `(var :name (dN|sN) (f B))` — a float register local. Same act as the GPR
+        # form below, and the same eviction rule. See `genInstX64`'s twin.
+        inc n
+        let ftyp = parseType(n, ctx.scope, ctx)
+        bindFRegA64(ctx, name, ftyp, locTag, tagToFloatRegA64(locTag))
+        return
       if rawTagIsA64Reg(locTag):
         # Check for reserved registers (x16/x17 are reserved for assembler scratch)
         let regTag = tagToA64Reg(locTag)
@@ -524,26 +531,18 @@ proc genInstA64(n: var Cursor; ctx: var GenContext) =
     else:
       error("Expected location", n)
     let baseTyp = parseType(n, ctx.scope, ctx)
+    if not onStack:
+      # A register `(var …)` binds a register to a typed name, which is precisely
+      # what `(rebind …)` does — so it ends the register's prior binding the same
+      # way, through the same helper (which also abandons a prior call's clobber:
+      # a `(var …)` starts a NEW variable's life in the register, so whatever an
+      # earlier call destroyed there is not this variable's value). This used to
+      # REJECT a still-bound register ("kill it first"); see `genInstX64`.
+      bindRegA64(ctx, name, baseTyp, reg, tagToRegisterA64(reg, n))
+      return
     let sym = Symbol(name: ctx.symIdOf(name), kind: skVar)
-    if onStack:
-      sym.typ = Type(kind: StackOffT, offType: baseTyp)
-      sym.offset = ctx.slots.allocSlotUp(baseTyp, slotAlign)
-    else:
-      sym.typ = baseTyp
-      sym.reg = reg
-      # Track the register binding so a raw `(xN)` use is rejected; reject reusing a
-      # register that still hosts a live variable (kill it first).
-      let targetReg = tagToRegisterA64(reg, n)
-      if targetReg in ctx.a64RegBindings:
-        error("Register " & $targetReg & " is already bound to variable '" &
-              ctx.a64RegBindings[targetReg] & "', kill it first before reusing", n)
-      ctx.a64RegBindings[targetReg] = name
-      # A fresh binding abandons a prior call's clobber — the same rule
-      # `bindRegA64` applies to `rebind`. A `(var …)` starts a NEW variable's life
-      # in the register, so whatever an earlier call destroyed there is not this
-      # variable's value. Without this a local declared after a call, in a
-      # caller-saved register, was rejected on its first read.
-      ctx.clobberedA64.excl(targetReg)
+    sym.typ = Type(kind: StackOffT, offType: baseTyp)
+    sym.offset = ctx.slots.allocSlotUp(baseTyp, slotAlign)
     ctx.scope.define(sym)
     return
   of NoDecl:

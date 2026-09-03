@@ -883,19 +883,14 @@ proc emitProcBody2*(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
           g.ab.rawReg g.stackArgBaseReg
           g.ab.intLit g.framePushBytesX64().int64
       g.emitFrameSub()
-      # Declare the totality spill slots (`etmp`/`eftmp`/`held`) — minted INLINE
-      # during body emission (`takeTmp` exhaustion), which is why this loop runs
-      # here, in the prologue that is written AFTER the body. A pointer slot
-      # keeps its precise `(ptr T)` type so a later deref/cmp type-checks; an
-      # integer slot is the generic `(s)(i 64)`.
+      # The PLANNER's spill slots — the `csave` cells of caller-saved homes. They
+      # belong here and not where they are decided: a save slot must not sit inside
+      # the decl's scope, because arkham emits by a textual walk and a sibling branch
+      # saves through the same slot (see `planer.addSpillTemp`). The value core's own
+      # `etmp`/`eftmp`/`held` are NOT in this list: those are declared where they are
+      # minted, which is a statement position in every case.
       for st in g.plan.spillTemps:
-        if st.isFloat:
-          g.emFloatStackVar(st.name, st.typ.size * 8)
-        elif isNilSlot(st.typ) or
-             (not cursorIsNil(st.typ.typ) and isPtrType(resolveType(g.prog, st.typ.typ))):
-          g.emTypedStackVar(st.name, st.typ.typ)   # `(nil)` / `(ptr T)` slot keeps its type
-        else:
-          g.emScalarStackVar(st.name)
+        g.declSpillSlot(st.name, st.typ, st.isFloat)
       g.ab.append side                                 # the body
       if not info.isEntry:
         g.framePop()
