@@ -573,7 +573,7 @@ type
     ParamD = (ord(ParamTagId), "param")  ## parameter declaration
     ResultD = (ord(ResultTagId), "result")  ## result value declaration
     ClobberD = (ord(ClobberTagId), "clobber")  ## clobbered registers list
-    VarD = (ord(VarTagId), "var")  ## variable declaration
+    VarD = (ord(VarTagId), "var")  ## variable declaration; a register `L` binds it, killing that register's prior tenant
     LayoutD = (ord(LayoutTagId), "layout")  ## Cortex-M: the board's memory layout, as arkham read it out of the `--layout:` file and forwarded. Children are the `flash`/`sram`/`stacks`/`heap`/`noinit`/`core` rows below. There is no row saying which region a section lives in: code and constants go where the image is, mutable storage goes where nothing is, and a row restating that would only be a chance to write it wrong. Supersedes the memory-map command-line flags
     FlashD = (ord(FlashTagId), "flash")  ## Cortex-M: the region the IMAGE SHIPS IN — code, constants, and the initializer image for globals — as a `(startAddress …)` and one size row. Named for the part rather than for a permission: whether the silicon is writable is beside the point (MPS2's region at 0 is ZBT SRAM), what matters is that its contents survive reset
     SramD = (ord(SramTagId), "sram")  ## Cortex-M: the region that holds NOTHING at reset — globals, stacks, heap — as a `(startAddress …)` and one size row. Everything in it is established by the startup code
@@ -587,7 +587,7 @@ type
     CfvarD = (ord(CfvarTagId), "cfvar")  ## control flow variable declaration
     RodataD = (ord(RodataTagId), "rodata")  ## read-only data (string/bytes)
     GvarD = (ord(GvarTagId), "gvar")  ## global variable
-    TvarD = (ord(TvarTagId), "tvar")  ## thread local variable. ONE tag, two readings, because both say the same thing at different scales: as a declaration it is one thread-local, and inside a Cortex-M `(stacks …)` it is the bytes reserved for ALL of them at the top of every stack slot, just below where SP starts
+    TvarD = (ord(TvarTagId), "tvar")  ## thread local variable. ONE tag, two readings, because both say the same thing at different scales: as a declaration it is one thread-local, and inside a Cortex-M `(stacks …)` it is the bytes reserved for ALL of them at the top of every stack slot, just below where SP starts. On x86-64 every module's thread-locals share one block reached through FS, and **offset 0 of that block is reserved**: it holds the block's own address (`arkham.tls.self.0`). x86-64 can load through FS but cannot `lea` against it, so `&threadvar` is compiled as `FS:[0] + offset` — the same slot, and the same reason, as the psABI's TCB pointer. Whoever creates a thread fills it; the entry stub fills the main thread's
     ImpD = (ord(ImpTagId), "imp")  ## import dynamic library
     ExtprocD = (ord(ExtprocTagId), "extproc")  ## external proc from imported library
     SyprocD = (ord(SyprocTagId), "syproc")  ## system-call proc declaration (proctype + clobbers + number)
@@ -623,7 +623,7 @@ type
     DotX = (ord(DotTagId), "dot")  ## field access
     AtX = (ord(AtTagId), "at")  ## array index
     MemX = (ord(MemTagId), "mem")  ## memory reference: `(mem base)`, `(mem base disp)`, `(mem base index scale [disp])` (base/index are raw registers or register-homed locals/params), or the no-base scaled form `(mem 0 index scale [disp])` = `[index*scale + disp]` (x64: SIB base=101; the literal `0` base is unambiguous since a real base is never an immediate)
-    TvarX = (ord(TvarTagId), "tvar")  ## thread local variable. ONE tag, two readings, because both say the same thing at different scales: as a declaration it is one thread-local, and inside a Cortex-M `(stacks …)` it is the bytes reserved for ALL of them at the top of every stack slot, just below where SP starts
+    TvarX = (ord(TvarTagId), "tvar")  ## thread local variable. ONE tag, two readings, because both say the same thing at different scales: as a declaration it is one thread-local, and inside a Cortex-M `(stacks …)` it is the bytes reserved for ALL of them at the top of every stack slot, just below where SP starts. On x86-64 every module's thread-locals share one block reached through FS, and **offset 0 of that block is reserved**: it holds the block's own address (`arkham.tls.self.0`). x86-64 can load through FS but cannot `lea` against it, so `&threadvar` is compiled as `FS:[0] + offset` — the same slot, and the same reason, as the psABI's TCB pointer. Whoever creates a thread fills it; the entry stub fills the main thread's
     CastX = (ord(CastTagId), "cast")  ## type cast; over a memory operand it retypes (and thereby sizes) the access; over a REGISTER operand of an x64 ALU instruction (add/sub/and/or/xor/cmp/test/shl/shr/sar/neg/not) an explicit sub-width int type (8/16/32 bits) sizes the OPERATION: 32-bit zero-extends the destination, 8/16-bit preserve its upper bits, flags and shift-count masking follow the width. Never inferred from a symbol's declared type, and `mov` still rejects a cast register destination
     RelocX = (ord(RelocTagId), "reloc")  ## rodata relocation: bake symbol S's address at byte offset O
 

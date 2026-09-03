@@ -892,17 +892,24 @@ when defined(linux) and defined(amd64):
   execRun "tests/call_multi_result"
 
 # Failing tests are not platform specific!
-execExpectFailure("nim c -r src/nifasm/nifasm tests/double_bind.nif", "Register RAX is already bound to variable 'x.0'")
-execExpectFailure("nim c -r src/nifasm/nifasm tests/triple_bind.nif", "Register RAX is already bound to variable 'x.0'")
-execExpectFailure("nim c -r src/nifasm/nifasm tests/quadruple_bind.nif", "Register RAX is already bound to variable 'x.0'")
-execExpectFailure("nim c -r src/nifasm/nifasm tests/kill_use_after_kill.nif", "Expected variable or register as destination")
+# Binding a register EVICTS its prior tenant — `(var …)` and `(rebind …)` share that
+# one rule — so what these four check is the guarantee, not the rejection: `x.0` is
+# gone once a later `(var …)` takes rax, and reading it is an error rather than a
+# silent clobber. (They used to expect a "kill it first before reusing" refusal at the
+# second `(var …)`, which forced every producer to emit a `(kill …)` it could decide
+# nothing useful about — see `genInstX64`'s VarD arm.)
+execExpectFailure("nim c -r src/nifasm/nifasm tests/double_bind.nif", "Unknown variable as destination: 'x.0'")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/triple_bind.nif", "Unknown variable as destination: 'x.0'")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/quadruple_bind.nif", "Unknown variable as destination: 'x.0'")
+execExpectFailure("nim c -r src/nifasm/nifasm tests/kill_use_after_kill.nif", "Unknown variable as destination: 'x.0'")
 # x64 SSE/float register binding: a raw `(xmmN)` use of an xmm register bound to a
 # float variable (via `rebind`/`withreg`) must be rejected — the SIMD twin of the
 # GPR `(reg)` bound-use guard, closing the float silent-clobber hole.
 execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_xmm_raw_bound.nif", "Register XMM8 is bound to variable 'f.0', use the variable name instead")
 # AArch64 register-binding checks (mirror the x64 binding guards above): a second
-# `(var)` on a still-bound x-register, and a raw `(xN)` use of a bound register.
-execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_double_bind.nif", "Register X19 is already bound to variable 'x.0'")
+# `(var)` on a still-bound x-register EVICTS the first — so its name is gone — and a
+# raw `(xN)` use of a bound register is rejected.
+execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_double_bind.nif", "Unknown variable as destination: 'x.0'")
 execExpectFailure("nim c -r src/nifasm/nifasm tests/a64_raw_bound.nif", "Register X19 is bound to variable 'x.0', use the variable name instead")
 # AArch64 SSE/float register binding: a raw `(dN)`/`(sN)` use of a v-register bound to
 # a float variable must be rejected — the SIMD twin of the x64 xmm guard above.

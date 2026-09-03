@@ -403,6 +403,43 @@ proc emTypedStackVar*(g: var CodeGen; name: string; t: Cursor) =
   else: g.genTypeBody(tc)
   g.ab.close()
 
+proc emFloatStackVar*(g: var CodeGen; name: string; bits: int) =
+  g.plan.hasStackVars = true                   # a `(s)` var exists ⇒ frame sub needed
+  g.ab.open NifasmDecl.VarD
+  g.ab.symDef name
+  g.ab.keyword SO
+  g.ab.floatType(bits)
+  g.ab.close()
+
+proc emScalarStackVar*(g: var CodeGen; name: string) =
+  ## `(var :name (s) (i 64))` — a spilled/address-taken scalar's 8-byte slot.
+  g.plan.hasStackVars = true                   # a `(s)` var exists ⇒ frame sub needed
+  g.stackSlots.incl name
+  g.ab.open NifasmDecl.VarD
+  g.ab.symDef name
+  g.ab.keyword SO
+  g.ab.intType(64)
+  g.ab.close()
+
+proc declSpillSlot*(g: var CodeGen; name: string; typ: AsmSlot; isFloat: bool) =
+  ## Declare one totality spill slot — an `etmp`/`eftmp`/`held` the value core minted
+  ## when the register pools ran dry, or a `csave` the planner minted for a
+  ## caller-saved home. A pointer slot keeps its precise `(ptr T)` type so a later
+  ## deref/cmp type-checks; an integer slot is the generic `(s)(i 64)`.
+  ##
+  ## THE single place a spill slot is spelled, so the emitter can declare one where it
+  ## mints it and the prologue can declare the planner's from the same rule.
+  when defined(arkhamSpillDbg):
+    stderr.writeLine "SPILLTEMP proc=" & g.curProcName & " name=" & name &
+      " float=" & $isFloat
+  if isFloat:
+    g.emFloatStackVar(name, typ.size * 8)
+  elif isNilSlot(typ) or
+       (not cursorIsNil(typ.typ) and isPtrType(resolveType(g.prog, typ.typ))):
+    g.emTypedStackVar(name, typ.typ)
+  else:
+    g.emScalarStackVar(name)
+
 proc emBindType*(g: var CodeGen; typ: AsmSlot) =
   ## Emit the Leng type for a scratch binding: the slot's own type when known, else
   ## the generic `(i 64)` (a register/immediate dont-care placeholder carries no
@@ -757,7 +794,7 @@ proc takeTmp*(g: var CodeGen; slot: AsmSlot): Location =
     let nm = g.mintSpillName("etmp")
     when defined(arkhamTempDbg):
       stderr.writeLine "ETMP " & g.curProcName & " " & nm & g.tempCensus()
-    g.plan.addSpillTemp(nm, slot)
+    g.declSpillSlot(nm, slot, isFloat = false)   # HERE: exhaustion is a statement position
     return namedStackLoc(nm, slot, spillTemp = true)
   g.pickedRegs.incl r
   when defined(arkhamBindTrace): dbgRegSite[ord(r)] = getStackTrace()
@@ -768,7 +805,7 @@ proc takeFTmp*(g: var CodeGen; slot: AsmSlot): Location =
   let f = g.pickFTempReg()
   if f == NoFReg:
     let nm = g.mintSpillName("eftmp")
-    g.plan.addSpillTemp(nm, slot, isFloat = true)
+    g.declSpillSlot(nm, slot, isFloat = true)
     return namedStackLoc(nm, slot, spillTemp = true)
   g.pickedFRegs.incl f
   result = fregLoc(f, slot, isTemp = true)
@@ -785,7 +822,7 @@ proc takeHeld*(g: var CodeGen; what: string; canSpill = false): Location =
     return regLoc(r, ScalarSlot, isTemp = true)
   if canSpill:
     let nm = g.mintSpillName("held")
-    g.plan.addSpillTemp(nm, AsmSlot(cls: AInt, size: 8, align: 8))
+    g.declSpillSlot(nm, AsmSlot(cls: AInt, size: 8, align: 8), isFloat = false)
     return namedStackLoc(nm, ScalarSlot, spillTemp = true)
   raiseAssert "arkham x64n: out of registers for " & what &
               " in proc " & g.curProcName & " (nothing to spill)"

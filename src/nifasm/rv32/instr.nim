@@ -665,10 +665,7 @@ proc genInstRv(n: var Cursor; ctx: var GenContext) =
       if rawTagIsRvFloatReg(locTag):
         let (f, _) = parseFloatRegisterRv(n)
         let ftyp = parseType(n, ctx.scope, ctx)
-        if f in ctx.rvFRegBindings:
-          error("Register " & $f & " is already bound to variable '" &
-                ctx.rvFRegBindings[f] & "', kill it first before reusing", n)
-        bindFRegRv(ctx, name, ftyp, locTag, f)
+        bindFRegRv(ctx, name, ftyp, locTag, f)  # binding implies a kill — see below
         return
       if rawTagIsRvGpr(locTag):
         let r = tagToRegisterRv(locTag, n)
@@ -689,20 +686,17 @@ proc genInstRv(n: var Cursor; ctx: var GenContext) =
     else:
       error("Expected location", n)
     let baseTyp = parseType(n, ctx.scope, ctx)
-    let sym = Symbol(name: ctx.symIdOf(name), kind: skVar)
-    if onStack:
-      sym.typ = Type(kind: TypeKind.StackOffT, offType: baseTyp)
-      sym.offset = ctx.slots.allocSlotUp(baseTyp, slotAlign)
-    else:
+    if not onStack:
+      # A register `(var …)` binds a register to a typed name, which is precisely
+      # what `(rebind …)` does — so it ends the register's prior binding the same
+      # way, through the same helper. See `genInstX64` for what the old "kill it
+      # first" rejection cost.
       checkRegWidthRv(baseTyp, "variable '" & name & "'", n)
-      sym.typ = baseTyp
-      sym.reg = reg
-      let targetReg = tagToRegisterRv(reg, n)
-      if targetReg in ctx.rvRegBindings:
-        error("Register " & $targetReg & " is already bound to variable '" &
-              ctx.rvRegBindings[targetReg] & "', kill it first before reusing", n)
-      ctx.rvRegBindings[targetReg] = name
-      ctx.clobberedRv.excl(targetReg)
+      bindRegRv(ctx, name, baseTyp, reg, tagToRegisterRv(reg, n))
+      return
+    let sym = Symbol(name: ctx.symIdOf(name), kind: skVar)
+    sym.typ = Type(kind: TypeKind.StackOffT, offType: baseTyp)
+    sym.offset = ctx.slots.allocSlotUp(baseTyp, slotAlign)
     ctx.scope.define(sym)
     return
   of NoDecl:

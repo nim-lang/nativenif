@@ -117,11 +117,15 @@ proc genStmt2*(g: var CodeGen; c: Cursor) =
     cc.into:
       while cc.hasMore: (g.genStmt2(cc); skip cc)
   of ScopeS:
-    g.enterScope()
-    var cc = c
-    cc.into:
-      while cc.hasMore: (g.genStmt2(cc); skip cc)
-    g.exitScope()
+    # Leng's scope forwarded as a nifasm `(scope …)` — a reclaimable slot arena,
+    # so sibling scopes share frame bytes and the prologue reserves the peak.
+    # See the x64 twin for what the boundary rests on.
+    g.ab.tree ScopeA64:
+      g.enterScope()
+      var cc = c
+      cc.into:
+        while cc.hasMore: (g.genStmt2(cc); skip cc)
+      g.exitScope()
   of VarS, GvarS, TvarS, ConstS: g.genVarDecl2(c)
   of CallS:
     var d = dontCare                   # a statement call: result unused
@@ -558,16 +562,15 @@ proc emitProcBody2*(g: var CodeGen; info: ProcInfo; declarative: bool;
       if g.hasFrame: framePush(g)
       if g.plan.hasStackVars:
         g.ab.tree SubA64: g.ab.rawReg SP; g.ab.keyword SsizeX
-      # etmp/eftmp/held slots minted DURING body emission: their decls must
-      # precede the body's loads/stores, and the set is only known post-body —
-      # so they are declared here, in the prologue, not in the side buffer.
+      # The PLANNER's spill slots — the `csave` cells of caller-saved homes, and the
+      # wide `etmp` of a 32-bit target. They belong here and not where they are
+      # decided: a save slot must not sit inside the decl's scope, because arkham
+      # emits by a textual walk and a sibling branch saves through the same slot
+      # (see `planer.addSpillTemp`). The value core's own `etmp`/`eftmp`/`held` are
+      # NOT in this list: those are declared where they are minted, which is a
+      # statement position in every case.
       for st in g.plan.spillTemps:
-        if st.isFloat: g.emFloatStackVar(st.name, st.typ.size * 8)
-        elif g.isWideSlot(st.typ): g.emWideStackVar(st.name)
-        elif g.slotIsPointer(st.typ):
-          if isNilValue(st.typ.typ): g.emVoidPtrStackVar(st.name)
-          else: g.emTypedStackVar(st.name, st.typ.typ)   # `(ptr T)` slot keeps its type
-        else: g.emScalarStackVar(st.name)
+        g.declSpillSlot(st.name, st.typ, st.isFloat)
       if g.md.frameStyle == BlockFrame:
         g.emitStackParamLoads(info.decl)          # SP is final only here
       g.stagedArgs = outerStaged                  # the prologue is over

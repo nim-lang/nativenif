@@ -1,0 +1,60 @@
+(.nif27)
+(.indexat 0)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :sink.0
+  (params
+   (param :p.0 .
+    (ptr
+     (i 64)))).
+  (pragmas)
+  (stmts
+   (asgn
+    (deref p.0)
+    (add
+     (i 64)
+     (deref p.0)1))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :a1.0 .
+    (i 64)0)
+   (var :a2.0 .
+    (i 64)0)
+   (scope
+    (stmts
+     (var :s1.0 .
+      (i 64)0)
+     (call sink.0
+      (addr s1.0))
+     (asgn a1.0
+      (cast
+       (i 64)
+       (addr s1.0)))))
+   (scope
+    (stmts
+     (var :s2.0 .
+      (i 64)0)
+     (call sink.0
+      (addr s2.0))
+     (asgn a2.0
+      (cast
+       (i 64)
+       (addr s2.0)))))
+   (if
+    (elif
+     (eq a1.0 a2.0)
+     (stmts
+      (call exit.0 7)))
+    (else
+     (stmts
+      (call exit.0 1)))))))(.index)
