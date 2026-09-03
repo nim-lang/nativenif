@@ -408,6 +408,16 @@ proc genMovX64(n: var Cursor; ctx: var GenContext) =
       x86.emitLoadExt(ctx.buf.data, dest.reg, op.mem, bits, signed)
     elif dest.reg != op.reg:
       x86.emitMov(ctx.buf.data, dest.reg, op.reg)
+      if ctx.inPrologue and op.reg == x86.RSP:
+        # The incoming stack-args base capture: rsp AFTER the callee-saved pushes
+        # is where the caller's stack arguments start, so arkham has to take it
+        # here — between the pushes and the frame `sub`, which is the only point
+        # at which rsp has that value. It is a prologue form: keep the run alive
+        # (and remember the register, for the `add` that completes the base), or
+        # the frame `sub` that follows records no CFI step and `(popframe)`
+        # replays a teardown with no frame `add` at all.
+        ctx.prologueOp = true
+        ctx.argBaseReg = dest.reg
     # else: a redundant same-register move — elide it. The declarative-call
     # `(arg …)`/`(res …)` markers resolve to a fixed ABI register, so a value
     # already in that register marshals to `(mov (arg pN) (rN))` == `mov rN,rN`.
@@ -943,6 +953,8 @@ proc genInstX64(n: var Cursor; ctx: var GenContext) =
         x86.emitAddImm(ctx.buf.data, dest.reg, int32(op.immVal))
       elif op.kind == okImm:
         x86.emitAddImm(ctx.buf.data, dest.reg, int32(op.immVal))
+        if ctx.inPrologue and dest.reg == ctx.argBaseReg:
+          ctx.prologueOp = true      # completes the stack-args base — see `genMovX64`
       elif op.kind == okMem:
         x86.emitAdd(ctx.buf.data, dest.reg, op.mem)
       else:

@@ -132,6 +132,7 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
     ctx.unwind.add ProcUnwind(name: ctx.nameOf(getSymId(n)),
                               start: ctx.buf.data.len, stop: -1)
     ctx.inPrologue = true
+    ctx.argBaseReg = NoArgBaseReg
     # CFA at entry: on x86-64 the `call` pushed the return address (SP+8); on
     # AArch64, Cortex-M and RV32 it is still in the link register (`lr`, `ra`),
     # so the CFA is SP.
@@ -370,6 +371,7 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
       ctx.unwind[^1].steps[k].cfaOff += carry
     ctx.unwind[^1].stop = ctx.buf.data.len
   ctx.inPrologue = false
+  ctx.argBaseReg = NoArgBaseReg
 
   ctx.scope = oldScope
 

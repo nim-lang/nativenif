@@ -1,0 +1,101 @@
+(.nif27)
+(.indexat 0)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :bump.0
+  (params
+   (param :p.0 .
+    (ptr
+     (i 64)))).
+  (pragmas)
+  (stmts
+   (asgn
+    (deref p.0)
+    (add
+     (i 64)
+     (deref p.0)1))))
+ (proc :tailee.0
+  (params
+   (param :x.0 .
+    (i 64))
+   (param :y.0 .
+    (i 64)))
+  (i 64)
+  (pragmas)
+  (stmts
+   (ret
+    (add
+     (i 64)x.0 y.0))))
+ (proc :sum10.0
+  (params
+   (param :a.0 .
+    (i 64))
+   (param :b.0 .
+    (i 64))
+   (param :c.0 .
+    (i 64))
+   (param :d.0 .
+    (i 64))
+   (param :e.0 .
+    (i 64))
+   (param :f.0 .
+    (i 64))
+   (param :g.0 .
+    (i 64))
+   (param :h.0 .
+    (i 64))
+   (param :i.0 .
+    (i 64))
+   (param :j.0 .
+    (i 64)))
+  (i 64)
+  (pragmas)
+  (stmts
+   (var :acc.0 .
+    (i 64)0)
+   (call bump.0
+    (addr acc.0))
+   (ret
+    (call tailee.0
+     (add
+      (i 64)
+      (add
+       (i 64)i.0 j.0)acc.0)
+     (add
+      (i 64)
+      (add
+       (i 64)
+       (add
+        (i 64)
+        (add
+         (i 64)
+         (add
+          (i 64)
+          (add
+           (i 64)
+           (add
+            (i 64)a.0 b.0)
+           c.0)
+          d.0)
+         e.0)
+        f.0)
+       g.0)
+      h.0)))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :s.0 .
+    (i 64)
+    (call sum10.0 1 2 3 4 5 6 7 8 9 10))
+   (call exit.0
+    (sub
+     (i 64)s.0 49)))))(.index)
