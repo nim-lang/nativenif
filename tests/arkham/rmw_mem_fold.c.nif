@@ -1,0 +1,109 @@
+(.nif27)
+(.indexat 0)
+(stmts
+ (type :Cell.0 .
+  (object .
+   (fld :big.0 .
+    (i 64))
+   (fld :small.0 .
+    (i 32))
+   (fld :flags.0 .
+    (u 32))))
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :c.0 . Cell.0
+    (oconstr Cell.0
+     (kv big.0 100)
+     (kv small.0 7)
+     (kv flags.0 0)))
+   (var :p.0 .
+    (ptr Cell.0)
+    (addr c.0))
+   (var :n.0 .
+    (i 64)5)
+   (asgn
+    (dot
+     (deref p.0)big.0 0)
+    (add
+     (i 64)
+     (dot
+      (deref p.0)big.0 0)n.0))
+   (asgn
+    (dot
+     (deref p.0)big.0 0)
+    (sub
+     (i 64)
+     (dot
+      (deref p.0)big.0 0)2))
+   (asgn
+    (dot
+     (deref p.0)big.0 0)
+    (add
+     (i 64)n.0
+     (dot
+      (deref p.0)big.0 0)))
+   (asgn
+    (dot
+     (deref p.0)big.0 0)
+    (sub
+     (i 64)200
+     (dot
+      (deref p.0)big.0 0)))
+   (asgn
+    (dot
+     (deref p.0)small.0 0)
+    (add
+     (i 32)
+     (dot
+      (deref p.0)small.0 0)
+     (cast
+      (i 32)n.0)))
+   (asgn
+    (dot
+     (deref p.0)flags.0 0)
+    (bitor
+     (u 32)
+     (dot
+      (deref p.0)flags.0 0)12))
+   (asgn
+    (dot
+     (deref p.0)flags.0 0)
+    (bitxor
+     (u 32)
+     (dot
+      (deref p.0)flags.0 0)5))
+   (asgn
+    (dot
+     (deref p.0)flags.0 0)
+    (bitand
+     (u 32)
+     (dot
+      (deref p.0)flags.0 0)14))
+   (call exit.0
+    (cast
+     (i 32)
+     (add
+      (i 64)
+      (dot
+       (deref p.0)big.0 0)
+      (add
+       (i 64)
+       (cast
+        (i 64)
+        (dot
+         (deref p.0)small.0 0))
+       (cast
+        (i 64)
+        (dot
+         (deref p.0)flags.0 0)))))))))(.index)

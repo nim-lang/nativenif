@@ -575,6 +575,33 @@ Note that `(mem ...)` is required for all memory operations. It can wrap address
 - Memory operations require explicit `(mem ...)` - address expressions are not automatically dereferenced.
 
 
+### Accessing a global
+
+A global's address is PC-relative on every target that has such a mode, so a scalar
+read or write of one need not materialize the address at all:
+
+```
+(gload D G)      # D := G
+(gstore D G)     # G := D
+```
+
+is one instruction where `(lea T G)` + `(mov D (mem T))` is two — and, more to the
+point, it needs no scratch register `T`, which matters inside an address computation
+that has already spent every register it can get. AArch64 and Cortex-M assemble it as
+an `adrp`/`movw`+`movt` with the page offset folded into the `ldr`/`str`; x86-64 as a
+single RIP-relative `mov`.
+
+The rows are for a SCALAR access. x86-64 restricts them further, to a 4- or 8-byte
+integer or pointer global: the folded `mov` has to be exactly the seven bytes the
+gvar relocation assumes, and a byte/halfword load (a `movzx`/`movsx`, or an
+operand-size prefix) does not fit in them.
+
+Everything else — a narrower global, a float one, an aggregate, and any use of the
+address itself — takes `(lea …)` and an ordinary `(mem …)` operand, which is always
+available. An aggregate global's base in particular cannot fold on x86-64: RIP-relative
+addressing and an index register are mutually exclusive there, so `g[i]` computes the
+base into a register first.
+
 ## Instructions
 
 The complete instruction set of every target — mnemonic, operand shape and meaning — is

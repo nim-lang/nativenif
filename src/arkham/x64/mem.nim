@@ -180,10 +180,32 @@ proc cmpZero*(g: var CodeGen; r: Reg) =
 
 proc emGlobalAddr*(g: var CodeGen; dest: Reg; name: string) =
   ## `dest ← &global` — RIP-relative `lea` (nifasm resolves the gvar to a
-  ## `.bss`/`.data` address). x86-64 has no typed RIP-relative memory operand, so
-  ## a global is always accessed by first materializing its address. An importc/
-  ## exportc gvar is referenced by its bare C name (cross-module linkage).
+  ## `.bss`/`.data` address). An importc/exportc gvar is referenced by its bare C name
+  ## (cross-module linkage).
+  ##
+  ## This is the form for taking a global's ADDRESS, and the fallback for accessing
+  ## one whose access does not fold: a scalar 4-/8-byte read or write goes through
+  ## `(gload …)`/`(gstore …)` instead and materializes no address at all (see
+  ## `globalFoldsIntoAccess`). An aggregate base still needs the address in a register,
+  ## because x86-64 cannot combine RIP-relative addressing with an index.
   g.ab.tree LeaX64: (g.emReg dest; g.ab.sym g.prog.gvarRefName(name))
+
+proc globalFoldsIntoAccess*(g: var CodeGen; name: string): bool =
+  ## Does this global's ADDRESS fold into the instruction that accesses it — the
+  ## `(gload …)`/`(gstore …)` rows — instead of needing an `(lea …)` of its own?
+  ##
+  ## Two conditions. It must be a real `.bss`/`.data` gvar rather than a rodata
+  ## `const` label (`globalIsGvarSlot`, shared with the AArch64 fold), and its scalar
+  ## access must be 4 or 8 bytes wide: nifasm encodes the fold as a RIP-relative `mov`
+  ## that has to be exactly the 7 bytes the gvar patcher assumes, and 8-/16-bit loads
+  ## (a `movzx`/`movsx`, or an operand-size prefix) do not fit. A float global does not
+  ## take this path at all — `floatMemMov` owns those.
+  ##
+  ## Everything this refuses keeps the address-then-deref pair, which is always legal.
+  if not g.globalIsGvarSlot(name): return false
+  var t = resolveType(g.prog, g.globalDeclType(name))
+  let s = typeToSlot(t)
+  result = s.cls in {AInt, AUInt} and s.size in {4, 8}
 
 proc emTvarAddr*(g: var CodeGen; dest: Reg; name: string) =
   ## `dest ← &threadvar` — THIS thread's block address plus the tvar's FS offset.

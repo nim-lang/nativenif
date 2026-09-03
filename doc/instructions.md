@@ -144,8 +144,8 @@ a second table anywhere in this file is parsed as vocabulary.)
 | `(addw3 D A B)`        | A64Inst, MInst, RvInst | 32-bit 3-operand add (D = A + B, W-form) |
 | `(subw3 D A B)`        | A64Inst, MInst, RvInst | 32-bit 3-operand subtract (D = A - B, W-form) |
 | `(mulw3 D A B)`        | A64Inst, MInst, RvInst | 32-bit 3-operand multiply (D = A * B, W-form) |
-| `(gload D S)`          | A64Inst, MInst | load scalar from global S: adrp + folded ldr (drops the address `add`) |
-| `(gstore D S)`         | A64Inst, MInst | store scalar D to global S: adrp + folded str |
+| `(gload D S)`          | X64Inst, A64Inst, MInst | load scalar from global S with the address folded into the access: AArch64 `adrp` + folded `ldr` (drops the address `add`), x86-64 a RIP-relative `mov` (drops the `lea`). x86-64 folds only a 4- or 8-byte integer/pointer global, so that the instruction is exactly the 7 bytes the gvar patcher assumes |
+| `(gstore D S)`         | X64Inst, A64Inst, MInst | store scalar D to global S with the address folded into the access: AArch64 `adrp` + folded `str`, x86-64 a RIP-relative `mov`. Same 4-or-8-byte restriction as `(gload …)` |
 | `(addsd D S)`          | X64Inst                  | add scalar double |
 | `(subsd D S)`          | X64Inst                  | subtract scalar double |
 | `(mulsd D S)`          | X64Inst                  | multiply scalar double |
