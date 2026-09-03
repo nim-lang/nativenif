@@ -70,6 +70,15 @@ proc allocSlot(m: var SlotManager; t: Type): int =
     result = -m.stackSize
 
 proc killSlot*(m: var SlotManager; offset: int; t: Type) =
+  ## Return a slot to `freeSlots` — WHICH NOTHING READS. The only consumer is the
+  ## private `allocSlot` above, and every live target allocates through
+  ## `allocSlotUp`, which never consults the list. So `(kill …)` on a stack symbol
+  ## frees no bytes today, and slot REUSE is entirely the `(scope …)` arena:
+  ## `stackSize` is saved at the open and restored at the close, and the prologue
+  ## reserves `max(stackSize, maxStackSize)`. Waking this list is the next lever —
+  ## it would reclaim a slot whose local dies mid-scope — but it needs a producer
+  ## that emits the kill at the last use, and an address that escaped the slot must
+  ## keep it alive. Do not assume the free list works because it is here.
   var s = Slot(offset: offset, size: alignedSize(t))
   var i = 0
   while i < m.freeSlots.len:

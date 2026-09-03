@@ -117,11 +117,15 @@ proc genStmt2*(g: var CodeGen; c: Cursor) =
     cc.into:
       while cc.hasMore: (g.genStmt2(cc); skip cc)
   of ScopeS:
-    g.enterScope()
-    var cc = c
-    cc.into:
-      while cc.hasMore: (g.genStmt2(cc); skip cc)
-    g.exitScope()
+    # Leng's scope forwarded as a nifasm `(scope …)` — a reclaimable slot arena,
+    # so sibling scopes share frame bytes and the prologue reserves the peak.
+    # See the x64 twin for what the boundary rests on.
+    g.ab.tree ScopeA64:
+      g.enterScope()
+      var cc = c
+      cc.into:
+        while cc.hasMore: (g.genStmt2(cc); skip cc)
+      g.exitScope()
   of VarS, GvarS, TvarS, ConstS: g.genVarDecl2(c)
   of CallS:
     var d = dontCare                   # a statement call: result unused

@@ -111,7 +111,11 @@ carry no information: `rsp` is the only base a slot ever has there.
 `(ssize)` is the frame size the assembler computed for the current proc; the prologue and
 epilogue use it (`(sub (rsp) (ssize))` / `(add (rsp) (ssize))`). Slots declared inside a
 `(scope ...)` block are reclaimed at the end of that block, so sibling scopes share frame
-space.
+space, and `(ssize)` is the PEAK reached at any point rather than the sum of every slot
+the proc ever declared. The arena is purely lexical — the slot cursor is saved at the
+open and restored at the close — and it touches no symbol table, so names, labels and
+register bindings are unaffected. What it requires of a producer is that a slot declared
+inside a scope is never read after it.
 
 
 

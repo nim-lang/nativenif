@@ -292,14 +292,30 @@ proc genStmt2*(g: var CodeGen; c: Cursor) =
         g.tailStmt = myTail and not nx.hasMore
         g.genStmt2(cc); skip cc
   of ScopeS:
-    g.enterScope()
-    var cc = c
-    cc.into:
-      while cc.hasMore:
-        var nx = cc; skip nx
-        g.tailStmt = myTail and not nx.hasMore   # kills trail the last stmt but emit no bytes,
-        g.genStmt2(cc); skip cc                  # so tail fall-through into the epilogue survives
-    g.exitScope()
+    # Forward Leng's scope to nifasm as a `(scope …)`: a `(stmts …)` with a
+    # RECLAIMABLE slot arena. Every `(s)` slot declared inside is freed when it
+    # closes, so sibling scopes — the arms of an `ite`, consecutive blocks —
+    # share the same frame bytes and the prologue reserves the PEAK instead of
+    # the sum. Leng's scope is exactly where a local's life ends, so it is the
+    # boundary to forward; without this every slot a proc ever needed lived for
+    # the whole proc.
+    #
+    # nifasm's arena is purely lexical (save `stackSize`, restore it at the
+    # close) and touches no symbol table, so names, labels and bindings are
+    # unaffected — only the offsets are. What the boundary DOES require is that
+    # a slot declared inside is never read after it, which is Leng's own rule
+    # for a local. The one arkham-minted slot that outlives its decl's scope is
+    # the caller-save `csave` cell, and that one is declared in the prologue
+    # for exactly this reason (see `planer.addSpillTemp`).
+    g.ab.tree ScopeX64:
+      g.enterScope()
+      var cc = c
+      cc.into:
+        while cc.hasMore:
+          var nx = cc; skip nx
+          g.tailStmt = myTail and not nx.hasMore # kills trail the last stmt but emit no bytes,
+          g.genStmt2(cc); skip cc                # so tail fall-through into the epilogue survives
+      g.exitScope()
   of VarS, ConstS: g.genVarDecl2(c)    # a local const = an immutable var with a literal init
   of CallS:
     var d = dontCare                   # a statement call: result unused
