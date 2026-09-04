@@ -3281,9 +3281,20 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
   # would make `RetS` skip the epilogue jump.)
   var doTail = tail and not indirect and not tgt.extern and not tgt.syscall and
                not tgt.indirect and not resultByRef and not foreignCall
+  # An aggregate LARGER than `aggrByRefThreshold` is passed indirectly on both x64
+  # ABIs (SysV 16, Win64 8): the caller allocates the copy in its OWN frame and hands
+  # the callee a pointer to it. `(popframe)` gives that frame back before the `jmp`,
+  # and the callee's frame starts exactly where ours was — so it overwrites the
+  # argument it was called with, through the pointer it was handed. Declining is the
+  # only answer: the copy is the ABI's, not an optimization we may skip.
+  #
+  # `frameIsAddressable` does not cover it, and neither does `tailCallLeaksFrame`
+  # below: the first scans `plan.symPos`, the DECLARED symbols, and the second the
+  # argument SYNTAX, while this copy is minted by the marshalling below — a proc whose
+  # only statement is `f(Big(a: …))` has no stack-homed local and no `addr` in sight.
   if doTail:
     for pl in plan.args:
-      if pl.onStack: doTail = false
+      if pl.onStack or (pl.isAgg and pl.byRef): doTail = false
   # `(popframe)` gives our slots back BEFORE the `jmp`, and the callee's frame starts
   # where ours was — so an argument that is the address of one of OUR locals points at
   # memory the callee is about to overwrite. Declining here is the whole guard, and it

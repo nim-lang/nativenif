@@ -2881,9 +2881,10 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
   # called with, through the pointer it was handed. Declining is the only
   # answer here: the copy is the ABI's, not an optimization we may skip.
   #
-  # x86-64 never reaches this. SysV copies such an aggregate into the OUTGOING
-  # stack area, and `onStack` below already declines that — which is why the
-  # x64 twin needs no counterpart and this guard is stated per-backend.
+  # x86-64 reaches this too, and needs the same guard — `abi.planCall` is shared,
+  # so `byRef` above the threshold (SysV 16, Win64 8) is arkham's rule on BOTH
+  # backends and the copy lands in the caller's frame either way. The x64 twin of
+  # this is the `pl.byRef` arm of the `plan.args` loop in `x64/value.nim`.
   #
   # `frameIsAddressable` does not cover it either, on either backend: it scans
   # `plan.symPos`, the DECLARED symbols, while these copies are minted by the
