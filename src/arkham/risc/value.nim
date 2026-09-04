@@ -2113,8 +2113,9 @@ proc emitFBin*(g: var CodeGen; c: Cursor; dest: var Location) =
     if acc.kind != InFReg: acc = g.takeFTmp(fslot)
     if acc.kind == NamedStack and acc.spillTemp:
       g.produceIntoFMem2(c, acc); dest = acc; return
-    let bits = if acc.typ.size == 4: 32 else: 64
+    let bits = if fslot.size == 4: 32 else: 64      # the OP's width, never the temp's
     var rdst = acc
+    rdst.typ = fslot                                  # a literal operand materializes at it
     g.emitFValue2(rhsC, rdst)                          # rhs → the accumulator
     if acc.isTemp and not g.rb.isBoundFTmp(acc.f): g.bindFTmp(acc.f, bits)
     if lHome.kind == InFReg:
@@ -2130,8 +2131,12 @@ proc emitFBin*(g: var CodeGen; c: Cursor; dest: var Location) =
   if dest.kind == NamedStack and dest.spillTemp:
     g.produceIntoFMem2(c, dest); return
   let res = dest
-  let bits = if res.typ.size == 4: 32 else: 64
+  # The width is the operation's, from its result type, not the temp's the
+  # consumer passed (see the x64 twin: a generic 8-byte temp made a float32
+  # multiply a double op over a single-materialized literal).
+  let bits = if fslot.size == 4: 32 else: 64
   var lD = res
+  lD.typ = fslot
   g.emitFValue2(lhsC, lD)                              # a → the result register
   if res.isTemp and not g.rb.isBoundFTmp(res.f): g.bindFTmp(res.f, bits)
   if rhsC.kind == Symbol and g.plan.locationOfSym(symName(rhsC), cursorToPosition(g.buf[], rhsC)).kind == InFReg:

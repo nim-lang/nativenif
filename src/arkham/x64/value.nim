@@ -2830,8 +2830,9 @@ proc emitFBin*(g: var CodeGen; c: Cursor; dest: var Location) =
     if acc.kind != InFReg: acc = g.takeFTmp(fslot)
     if acc.kind == NamedStack and acc.spillTemp:
       g.produceIntoFMem2(c, acc); dest = acc; return
-    let bits = if acc.typ.size == 4: 32 else: 64
+    let bits = if fslot.size == 4: 32 else: 64        # the OP's width, never the temp's
     var rdst = acc
+    rdst.typ = fslot                                    # a literal operand materializes at it
     g.emitFValue2(rhsC, rdst)                            # rhs → the accumulator
     if acc.isTemp and not g.rb.isBoundFTmp(acc.f): g.bindFTmp(acc.f)
     if lHome.kind == InFReg:
@@ -2849,8 +2850,13 @@ proc emitFBin*(g: var CodeGen; c: Cursor; dest: var Location) =
   if dest.kind == NamedStack and dest.spillTemp:
     g.produceIntoFMem2(c, dest); return
   let res = dest
-  let bits = if res.typ.size == 4: 32 else: 64
+  # The width is the operation's, from its result type: `res` is whatever xmm
+  # temp the consumer passed, often a generic 8-byte one, and sizing by it
+  # emitted `mulsd` for a float32 multiply while the literal operand had been
+  # materialized as a single (`y * 2.0'f32` came out 0.0).
+  let bits = if fslot.size == 4: 32 else: 64
   var lD = res
+  lD.typ = fslot
   g.emitFValue2(lhsC, lD)                                # a → the result xmm
   if res.isTemp and not g.rb.isBoundFTmp(res.f): g.bindFTmp(res.f)
   if rhsC.kind == Symbol and g.plan.locationOfSym(symName(rhsC), cursorToPosition(g.buf[], rhsC)).kind == InFReg:
@@ -2871,6 +2877,14 @@ proc emitFBin*(g: var CodeGen; c: Cursor; dest: var Location) =
       g.fbin(op32, op64, res.f, fs2, bits)
       g.rb.unsealF fs2
   dest = res
+
+
+proc isFloatLitTree(c: Cursor): bool =
+  ## A float literal, possibly under `(suf …)`/`(par …)` wrappers — the shape a
+  ## typed literal (`2.0'f32`) arrives in.
+  var cc = c
+  while cc.kind == TagLit and cc.exprKind in {SufC, ParC}: inc cc
+  result = cc.kind == FloatLit
 
 proc emitCast2*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED `(conv|cast Type inner)`. Decisions inline (allocValue CastC/ConvC):
@@ -2906,9 +2920,24 @@ proc emitCast2*(g: var CodeGen; c: Cursor; dest: var Location) =
     let dstBits = if slotOf(g.prog, targetCur).size == 4: 32 else: 64
     if g.isFloatExpr(inner):
       var fv = res                                       # dest-pass into the operand
-      g.emitFValue2(inner, fv)
-      if res.isTemp and not g.rb.isBoundFTmp(res.f): g.bindFTmp(res.f)
-      g.emFcvt(res.f, res.f, dstBits, g.floatBits(inner))
+      if isFloatLitTree(inner):
+        # A literal is materialized straight at the TARGET width — the value
+        # is converted at compile time, as a C compiler folds `(float)2.0` —
+        # and there is nothing left to convert at run time. Doing both was the
+        # bug: the `FloatLit` arm sized the constant by `fv`'s slot (the
+        # target's), so a float64 literal bound for float32 was already a
+        # single when `cvtsd2ss` read it as a double: `let x: float32 = 2.0`
+        # gave 0.0 on this backend.
+        fv.typ = slotOf(g.prog, targetCur)
+        g.emitFValue2(inner, fv)
+        if res.isTemp and not g.rb.isBoundFTmp(res.f): g.bindFTmp(res.f)
+      else:
+        # A computed operand is produced at ITS OWN width, then converted.
+        let srcBits = g.floatBits(inner)
+        fv.typ = AsmSlot(cls: AFloat, size: srcBits div 8, align: srcBits div 8)
+        g.emitFValue2(inner, fv)
+        if res.isTemp and not g.rb.isBoundFTmp(res.f): g.bindFTmp(res.f)
+        g.emFcvt(res.f, res.f, dstBits, srcBits)
     else:
       var iv = needsReg(ScalarSlot)
       g.emitValue2(inner, iv)
