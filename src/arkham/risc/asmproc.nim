@@ -232,7 +232,7 @@ proc armFlagSupported(g: CodeGen; f: X64Flag): bool {.inline.} =
     f in {ZfO, NzO, CfO, NcO}
   else: f in {ZfO, NzO}
 
-proc asmStmt*(g: var CodeGen; c: Cursor)
+proc asmStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {})
 proc asmInstr*(g: var CodeGen; destC: Cursor; dst: Reg; c: Cursor)
 
 proc emAsmSlot(g: var CodeGen; name: string) {.inline.} =
@@ -686,31 +686,27 @@ proc asmIf(g: var CodeGen; c: Cursor) =
         lengError cc, "unsupported `if` shape in an `.assembler` proc", g.asmInfo
       skip cc
 
-proc asmStmt*(g: var CodeGen; c: Cursor) =
+proc asmStmt*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
   if c.kind == DotToken: return
   g.asmNoteInfo(c)
   # Tail position, tracked exactly as `genStmt2` does: only the LAST statement of
   # a straight-line `stmts`/`scope` inherits it. A `ret` there falls through to
   # the epilogue instead of branching to it — in a mode whose premise is
   # one-to-one, a `b` to the very next label is an instruction nobody wrote.
-  let myTail = g.tailStmt
-  g.tailStmt = false
   case c.stmtKind
   of StmtsS:
     var cc = c
     cc.into:
       while cc.hasMore:
-        var nx = cc; skip nx
-        g.tailStmt = myTail and not nx.hasMore
-        g.asmStmt(cc); skip cc
+        var nx = cc; skip nx                     # only the LAST statement stays in tail position
+        g.asmStmt(cc, if not nx.hasMore: flags else: {}); skip cc
   of ScopeS:
     g.enterScope()
     var cc = c
     cc.into:
       while cc.hasMore:
-        var nx = cc; skip nx
-        g.tailStmt = myTail and not nx.hasMore
-        g.asmStmt(cc); skip cc
+        var nx = cc; skip nx                     # only the LAST statement stays in tail position
+        g.asmStmt(cc, if not nx.hasMore: flags else: {}); skip cc
     g.exitScope()
   of VarS: g.asmVarDecl(c)
   of AsgnS: g.asmAsgn(c)
@@ -806,7 +802,7 @@ proc asmStmt*(g: var CodeGen; c: Cursor) =
           g.asmMovReg(g.md.intRetReg, g.asmRegOf(cc))  # a no-op when already pinned there
         skip cc
       while cc.hasMore: skip cc
-    if not myTail:
+    if TailStmt notin flags:
       g.retLabelUsed2 = true
       g.emBr(BA64, g.retLabel2)
   else:
@@ -966,8 +962,8 @@ proc genAsmProc2*(g: var CodeGen; info: ProcInfo) =
       var c = info.decl
       c.into:
         inc c; skip c; skip c; skip c            # name, params, ret, pragmas
-        g.tailStmt = true                        # the whole body is in tail position
-        if c.stmtKind == StmtsS: g.asmStmt(c)
+        # the whole body is in tail position
+        if c.stmtKind == StmtsS: g.asmStmt(c, {TailStmt})
         while c.hasMore: skip c
       # The label FIRST, then the scope kills: every `ret` branches here, so the
       # kills belong on the path that actually reaches the epilogue.

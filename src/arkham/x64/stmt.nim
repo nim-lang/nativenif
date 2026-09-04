@@ -30,7 +30,7 @@ const CaseJmpMinBranches* = 4
   ## Below this the cmp/je chain is at most 3 compares — cheaper than the
   ## dispatch preamble (mov+sub+cmp+ja+imul+lea+add+jmp).
 
-proc genStmt2*(g: var CodeGen; c: Cursor)
+proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {})
 proc condFuseSym(g: CodeGen; c: Cursor): string
 
 proc genVarDecl2*(g: var CodeGen; c: Cursor) =
@@ -289,24 +289,38 @@ proc emReturnHere(g: var CodeGen): bool =
   g.ab.keyword RetX64
   true
 
-proc genStmt2*(g: var CodeGen; c: Cursor) =
+proc listFlags(flags: set[StmtFlag]; rest: Cursor): set[StmtFlag] =
+  ## What one child of a straight-line `stmts`/`scope` inherits from the list itself.
+  ## `rest` is the cursor just PAST that child.
+  ##
+  ## Only the last child inherits anything: control leaves every other one sideways.
+  ## `TailStmt` asks for the syntactically last child — it promises a fall-through into
+  ## the epilogue, and the scope kills between here and there emit no bytes — while
+  ## `TailPos` only asks that nothing after the child emits CODE, which is a weaker
+  ## question and the one that matters for `rawDealloc`'s trailing empty `(stmts .)`.
+  result = {}
+  if TailStmt in flags and not rest.hasMore: result.incl TailStmt
+  if TailPos in flags and restEmitsNoCodeE(rest): result.incl TailPos
+
+proc armFlags(flags: set[StmtFlag]; rest: Cursor): set[StmtFlag] =
+  ## What the last statement of an `if`/`case` ARM inherits from the compound itself.
+  ## `TailStmt` deliberately does not travel here — a `ret` in an arm must still jump
+  ## over the sibling arms — but `TailPos` does: a tail call never comes back, so the
+  ## jump it would skip is dead either way.
+  if TailPos in flags and restEmitsNoCodeE(rest): {TailPos} else: {}
+
+proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
   if c.kind == DotToken: return                 # an empty statement (e.g. `(stmts .)`)
-  # Capture our own tail-position, then default children to non-tail: only the
-  # LAST child of a straight-line `stmts`/`scope` inherits it (control leaves any
-  # other child sideways, and a nested compound gets its own reset below).
-  let myTail = g.tailStmt
-  let myTailPos = g.tailPos
-  g.tailStmt = false
-  g.tailPos = false
+  # `flags` is OUR tail position; children get whatever `listFlags`/`armFlags` says
+  # travels to them, which for every nested compound is nothing at all — so a
+  # mid-body `ret` still jumps.
   case c.stmtKind
   of StmtsS:
     var cc = c
     cc.into:
       while cc.hasMore:
         var nx = cc; skip nx
-        g.tailStmt = myTail and not nx.hasMore
-        g.tailPos = myTailPos and restEmitsNoCodeE(nx)
-        g.genStmt2(cc); skip cc
+        g.genStmt2(cc, listFlags(flags, nx)); skip cc
   of ScopeS:
     # Forward Leng's scope to nifasm as a `(scope …)`: a `(stmts …)` with a
     # RECLAIMABLE slot arena. Every `(s)` slot declared inside is freed when it
@@ -327,11 +341,11 @@ proc genStmt2*(g: var CodeGen; c: Cursor) =
       g.enterScope()
       var cc = c
       cc.into:
+        # A scope's kills trail its last statement but emit no bytes, so a tail
+        # fall-through into the epilogue survives the boundary.
         while cc.hasMore:
           var nx = cc; skip nx
-          g.tailStmt = myTail and not nx.hasMore # kills trail the last stmt but emit no bytes,
-          g.tailPos = myTailPos and restEmitsNoCodeE(nx)
-          g.genStmt2(cc); skip cc                # so tail fall-through into the epilogue survives
+          g.genStmt2(cc, listFlags(flags, nx)); skip cc
       g.exitScope()
   of VarS, ConstS: g.genVarDecl2(c)    # a local const = an immutable var with a literal init
   of CallS:
@@ -346,7 +360,7 @@ proc genStmt2*(g: var CodeGen; c: Cursor) =
     # `emitCall2` still decides — an external target, an outgoing stack argument, an
     # argument holding one of OUR frame's addresses — and emits an ordinary call when it
     # declines, which is why nothing here depends on the answer.
-    g.emitCall2(c, d, tail = myTailPos and g.retIsVoid and
+    g.emitCall2(c, d, tail = TailPos in flags and g.retIsVoid and
                              not g.frameIsAddressable)
     g.freeVal(d)
   of InstrS:
@@ -448,33 +462,27 @@ proc genStmt2*(g: var CodeGen; c: Cursor) =
               while bc.hasMore:
                 var nb = bc; skip nb
                 # The arm's LAST statement inherits the `if`'s own tail position — see
-                # `tailPos`. `tailStmt` deliberately does not travel here (a `ret` in an
-                # arm must still jump over the sibling arms); a tail call never returns,
-                # so that jump is unreachable and costs nothing.
-                g.tailPos = myTailPos and restEmitsNoCodeE(nb)
-                g.genStmt2(bc); skip bc
-              g.tailPos = false
+                # `armFlags` for which half of it travels here.
+                g.genStmt2(bc, armFlags(flags, nb)); skip bc
               # The skip-to-merge jump exists only to hop over later branches; the last
               # branch has none, so it falls through `lNext` (empty) into `lEnd`.
               #
               # When the `if` ITSELF is in tail position, `lEnd` is the epilogue —
-              # nothing between them emits a byte (`tailPos` was computed past exactly
+              # nothing between them emits a byte (`TailPos` was carried past exactly
               # those statements) — so the arm can RETURN instead of branching to a
               # branch. This is the single hottest forward jump in the allocator:
               # `rawDealloc`'s hot arm jumped to the epilogue 768,932 times per run,
               # and gcc emits a `ret` there because it duplicates its epilogue into
               # each arm rather than sharing one.
               if not isLastBranch:
-                if not (myTailPos and g.emReturnHere()): g.emJmp(lEnd)
+                if not (TailPos in flags and g.emReturnHere()): g.emJmp(lEnd)
             g.emLab(lNext)
           of ElseU:
             var bc = cc
             bc.into:
               while bc.hasMore:
                 var nb = bc; skip nb
-                g.tailPos = myTailPos and restEmitsNoCodeE(nb)
-                g.genStmt2(bc); skip bc
-              g.tailPos = false
+                g.genStmt2(bc, armFlags(flags, nb)); skip bc
           else: discard
           skip cc
       g.emLab(lEnd)
@@ -563,7 +571,7 @@ proc genStmt2*(g: var CodeGen; c: Cursor) =
         # through. `framePop`'s `(kill …)`s are NOT replayed here, and must not be: they
         # exist because the shared epilogue is emitted last and can retire every binding,
         # while a sibling arm after this one still reads its own names.
-        if not myTail and not tailed:
+        if TailStmt notin flags and not tailed:
           if not g.emReturnHere():
             g.emJmp(g.retLabel2); g.retLabelUsed2 = true
       while cc.hasMore: skip cc
@@ -623,21 +631,19 @@ proc genStmt2*(g: var CodeGen; c: Cursor) =
       g.emJmp(lElse)
       for idx in 0 ..< bodies.len:
         g.emLab(bodies[idx][0])
-        g.tailPos = myTailPos                             # the arm inherits the case's own
-        g.genStmt2(bodies[idx][1])                        # body (a stmts node)
-        g.tailPos = false
+        # The arm inherits the case's own tail position, whole: its body is the last
+        # thing before `lEnd`, so there is no "rest" to ask about.
+        g.genStmt2(bodies[idx][1], flags * {TailPos})     # body (a stmts node)
         # only the last body may fall through, and only when no else follows it
         if idx < bodies.len - 1 or hasElse:
-          if not (myTailPos and g.emReturnHere()): g.emJmp(lEnd)
+          if not (TailPos in flags and g.emReturnHere()): g.emJmp(lEnd)
       if hasElse:
         g.emLab(lElse)
         var e = elseBody
         e.into:
           while e.hasMore:
             var ne = e; skip ne
-            g.tailPos = myTailPos and restEmitsNoCodeE(ne)
-            g.genStmt2(e); skip e
-          g.tailPos = false
+            g.genStmt2(e, armFlags(flags, ne)); skip e
     g.emLab(lEnd)
   of LabS:                                                # `(lab :name)` — a goto target
     var cc = c
@@ -932,14 +938,14 @@ proc emitProcBody2*(g: var CodeGen; info: ProcInfo; frameHasCall: bool) =
   c.into:
     inc c; skip c; skip c; skip c                    # name, params, ret, pragmas
     # The whole body is in tail position: after it, control reaches the epilogue.
-    # The LINUX entry proc ends in an exit syscall (no epilogue jump), so leave
-    # it false there; the Windows entry returns like any other proc.
-    g.tailStmt = not info.isEntry or g.prog.windows
-    g.tailPos = g.tailStmt
+    # The LINUX entry proc ends in an exit syscall (no epilogue jump), so it gets
+    # no flags at all; the Windows entry returns like any other proc.
+    let bodyFlags: set[StmtFlag] =
+      if info.isEntry and not g.prog.windows: {} else: {TailStmt, TailPos}
     if c.stmtKind == StmtsS:
       g.condFuse.tag.clear()
       g.scanCondFusions(c)
-      g.genStmt2(c)
+      g.genStmt2(c, bodyFlags)
     while c.hasMore: skip c
   g.exitScope()
   if g.retLabelUsed2: g.emLab(g.retLabel2)           # a non-tail `ret` lands here
