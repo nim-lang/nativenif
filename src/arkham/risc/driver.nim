@@ -60,6 +60,7 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   block:
     var rc = info.decl
     inc rc; inc rc; skip rc
+    g.retIsVoid = rc.kind == DotToken            # `(proc :f (params …) . (pragmas …) …)`
     if rc.kind == Symbol and slotOf(g.prog, rc).kind == AMem:
       g.retAggrSym = rc.symId
       # The indirect-result rule stated in WORDS, matching
@@ -110,6 +111,14 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   g.rb.resetProc(); g.aliasToDecl.clear(); g.savedHomes.clear()
   g.noFoldPos = -1
   g.curProcName = info.asmName            # names the proc in this backend's diagnostics
+  # Can an address into THIS frame exist at all? Only a stack-homed symbol has one, and
+  # a tail call gives the frame back BEFORE it branches. The x64 twin in `driver.nim`
+  # spells out why the syntactic `tailCallLeaksFrame` alone is not enough.
+  g.frameIsAddressable = false
+  for pos in g.plan.symPos.values:
+    if g.plan.planned(pos).kind == NamedStack:
+      g.frameIsAddressable = true
+      break
   g.helperCalls = false
   g.isInterrupt = info.irqName.len > 0 and g.md.arch == Rv32
   when defined(arkhamBridgeDbg):

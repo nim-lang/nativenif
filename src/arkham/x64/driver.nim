@@ -85,6 +85,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   block:
     var rc = info.decl
     inc rc; inc rc; skip rc                    # head → name → params, skip → ret type
+    g.retIsVoid = rc.kind == DotToken            # `(proc :f (params …) . (pragmas …) …)`
     if rc.kind == Symbol and slotOf(g.prog, rc).kind == AMem:
       g.retAggrSym = rc.symId
       g.retIndirect = g.aggrByRef(g.retAggrSym)
@@ -112,7 +113,18 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.pickedFRegs = {}
   g.emitTmpSpills = 0
   g.plan = allocateProc(g.buf[], info.decl, an, g.prog, x64MachineA, g.typeCtx, preseal)
-  g.curProcName = info.asmName                # names the proc in this backend's diagnostics
+  g.curProcName = info.asmName
+  # Can an address into THIS frame exist at all? Only a stack-homed symbol has one —
+  # a spilled scalar, an aggregate, an address-taken local (`AddrTaken` spills by
+  # construction). With every value in a register the frame holds nothing the program
+  # can point at, and a tail call's `(popframe)` is then unobservable. This is the
+  # SOUND half of the tail-call guard; `tailCallLeaksFrame` is the syntactic half and
+  # catches the direct `f(addr x)` shape in procs that do have slots.
+  g.frameIsAddressable = false
+  for pos in g.plan.symPos.values:
+    if g.plan.planned(pos).kind == NamedStack:
+      g.frameIsAddressable = true
+      break                # names the proc in this backend's diagnostics
   when defined(arkhamCallerSaveDbg):
     # The ALLOCATOR's side of the caller-save audit: for every value it gave a
     # caller-saved home, the live interval it made that decision on, plus every call

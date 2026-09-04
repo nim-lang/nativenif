@@ -1112,7 +1112,7 @@ proc emitLvalWalk*(g: var CodeGen; n: var Cursor; globBase: Location; isStore: b
         # check) clobbers the volatiles between the base's materialization and
         # its use, so the base subtree must take survivors.
         var idxPeek = n; skip idxPeek
-        let held = heldBase or subtreeHasCallE(idxPeek)
+        let held = heldBase or subtreeHasCall(idxPeek)
         g.emitLvalWalk(n, globBase, isStore, held)   # base (stack array, deref, or global)
         if n.kind in {IntLit, UIntLit}: skip n       # immediate index — folds, no scratch
         else: g.getExpr(n, false, "")                # register index (folds via scale)
@@ -1120,7 +1120,7 @@ proc emitLvalWalk*(g: var CodeGen; n: var Cursor; globBase: Location; isStore: b
     of PatC:
       n.into:
         var idxPeek = n; skip idxPeek                # same base-vs-calling-index hazard
-        let held = heldBase or subtreeHasCallE(idxPeek)
+        let held = heldBase or subtreeHasCall(idxPeek)
         g.getExpr(n, held, "a pat base held across an index call")        # the pointer
         if n.kind in {IntLit, UIntLit}: skip n       # immediate index
         else: g.getExpr(n, false, "")

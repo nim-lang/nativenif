@@ -219,7 +219,7 @@ src/arkham/
                           fmov/fbin/fcvt                                ~430
     staging.nim     NEW   the staging scratch pool + the destination
                           protocol (pickStaging*, take{Tmp,FTmp,Held},
-                          freeVal, resolveDestE, bind/unbindTemp)       ~560
+                          freeVal, resolveDest, bind/unbindTemp)        ~560
     mem.nim         NEW   stack-var declarations, `(mem …)` shapes,
                           emGlobalAddr/emTvarAddr/emSymAddr, binMem     ~430
     cond.nim        NEW   jcc/setcc/cmov tag tables, mirror/invert      ~120
@@ -265,7 +265,7 @@ Two placements are forced by the SCC and should not be argued with later:
 * `scalarMemMov` / `floatMemMov` / `emitLoadLoc` / `emitStoreLoc` *look* like
   `mem.nim` but call `prematLval2` / `emMemLval2`, so they live in `value.nim`.
 * 349 of `codegen_m64.nim`'s 950 lines (`emitWideInto`, `wideShift`,
-  `emitWideCmpE`, `wideCallInto`, `wideRet`, …) are inside the Arm value core.
+  `emitWideCmp`, `wideCallInto`, `wideRet`, …) are inside the Arm value core.
   Only the other ~600 move to `cortexm/wide64.nim`.
 
 ## 7. Why arkham gets `arm/` and not `arm64/` + `thumb/`

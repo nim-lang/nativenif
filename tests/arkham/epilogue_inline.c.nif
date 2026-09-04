@@ -1,0 +1,84 @@
+(.nif27)
+(.indexat 0)
+(stmts
+ (type :Buf4.0 .
+  (array
+   (i 64)4))
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :addup.0
+  (params
+   (param :a.0 .
+    (i 64))
+   (param :b.0 .
+    (i 64)))
+  (i 64)
+  (pragmas)
+  (stmts
+   (ret
+    (add
+     (i 64)a.0 b.0))))
+ (proc :work.0
+  (params
+   (param :p.0 .
+    (ptr
+     (i 64)))
+   (param :k.0 .
+    (i 64))).
+  (pragmas)
+  (stmts
+   (var :buf.0 . Buf4.0
+    (aconstr Buf4.0 1 2 3 4))
+   (var :x.0 .
+    (i 64)
+    (call addup.0 k.0 10))
+   (var :y.0 .
+    (i 64)
+    (call addup.0 k.0 20))
+   (var :z.0 .
+    (i 64)
+    (call addup.0 k.0 30))
+   (asgn
+    (at buf.0 0)x.0)
+   (if
+    (elif
+     (lt 0 k.0)
+     (stmts
+      (asgn
+       (deref p.0)
+       (add
+        (i 64)
+        (at buf.0 0)
+        (add
+         (i 64)y.0 z.0)))))
+    (else
+     (stmts
+      (asgn
+       (deref p.0)
+       (add
+        (i 64)
+        (at buf.0 3)y.0)))))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :r1.0 .
+    (i 64)0)
+   (var :r2.0 .
+    (i 64)0)
+   (call work.0
+    (addr r1.0)1)
+   (call work.0
+    (addr r2.0)0)
+   (call exit.0
+    (cast
+     (i 32)
+     (add
+      (i 64)r1.0 r2.0))))))(.index)

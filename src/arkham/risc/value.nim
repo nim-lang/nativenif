@@ -94,7 +94,7 @@ proc marshalStackAggrArg(g: var CodeGen; a: Cursor; paramNm: string)    # define
 # not one of the call sites below can fire.
 proc emitWideAsLoc(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitWideIntoLoc(g: var CodeGen; c: Cursor; dst: Location)
-proc emitWideCmpE(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
+proc emitWideCmp(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
                   whenTrue: bool): RiscInst
 proc emitWideToNarrow(g: var CodeGen; innerC, targetC: Cursor;
                       dest: var Location)
@@ -195,10 +195,10 @@ proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitFValue2*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitMod2(g: var CodeGen; c: Cursor; dest: var Location)
-proc emitFBinE*(g: var CodeGen; c: Cursor; dest: var Location)
+proc emitFBin*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitCondValue2*(g: var CodeGen; c: Cursor; dest: var Location)
-proc emitCondE*(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool)
-proc emitScalarCmpE*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
+proc emitCond*(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool)
+proc emitScalarCmp*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
                     whenTrue: bool; fuseBranchTo = ""): RiscInst
 proc emitMemLoad2*(g: var CodeGen; c: Cursor; dest: var Location)
 proc emitAddr2*(g: var CodeGen; c: Cursor; dest: var Location)
@@ -280,7 +280,7 @@ proc place2*(g: var CodeGen; src: Location; dest: Reg) =
     # `dest` is written by the load below and nothing else, so as long as the ADDRESS
     # does not read it, it is a legal home for a re-derivable global base the premat
     # would otherwise have no register for (see `lateGlobalBase`).
-    let spare = if g.exprReadsRegE(src.cur, dest): NoReg else: dest
+    let spare = if g.exprReadsReg(src.cur, dest): NoReg else: dest
     let savedSpare = g.lateBaseSpare
     g.lateBaseSpare = spare
     g.prematLval2(src.cur)
@@ -1485,7 +1485,7 @@ proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location) =
     var globScratch = NoReg
     var globHeld = dontCare
     if (rhs.kind == TagLit and rhs.exprKind in {OconstrC, AconstrC}) and
-       g.lvalueGlobalBaseE(lhs):
+       g.lvalueGlobalBase(lhs):
       globHeld = g.takeHeld("a global address")
       globScratch = globHeld.r
     if globScratch != NoReg: g.bindTemp(globScratch, ScalarSlot)
@@ -1600,7 +1600,7 @@ proc emitLeafImm*(g: var CodeGen; dest: var Location; natural: Location) =
   var natural = natural
   if cursorIsNil(natural.typ.typ) and not cursorIsNil(dest.typ.typ):
     natural.typ = dest.typ
-  g.resolveDestE(dest, natural)
+  g.resolveDest(dest, natural)
   if dest.kind == InReg:
     if dest.isTemp and not g.rb.isBoundTemp(dest.r): g.bindTemp(dest.r, dest.typ)
     g.placeImm(dest.r, natural)
@@ -1693,7 +1693,7 @@ proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
     let home = (if dest.kind in {Undef, NeedsReg, RegOrImm}: g.takeForwarded(symHome)
                 else: g.forwardOf(symHome))
     if home.kind != NoLoc:
-      g.resolveDestE(dest, home)
+      g.resolveDest(dest, home)
       if dest.kind == NamedStack and dest.spillTemp:
         g.produceIntoMem2(c, dest); return
       if dest.kind == InReg and dest.isTemp and home.kind == InReg and
@@ -1708,7 +1708,7 @@ proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
           g.bindTemp(dest.r, dest.typ)
         g.place2(home, dest.r)
     else:
-      g.forceRegDestE(dest)
+      g.forceRegDest(dest)
       if dest.kind == NamedStack and dest.spillTemp:
         g.produceIntoMem2(c, dest); return
       let si = g.lookupSym(symName(c))
@@ -1721,7 +1721,7 @@ proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
         if dest.isTemp and not g.rb.isBoundTemp(dest.r): g.bindTemp(dest.r, loc.typ)
         g.place2(loc, dest.r)
   of StrLit:
-    g.forceRegDestE(dest)
+    g.forceRegDest(dest)
     if dest.kind == NamedStack and dest.spillTemp:
       g.produceIntoMem2(c, dest); return
     let nm = "msg." & $g.rodata.len & "." & g.prog.thisModuleSuffix
@@ -1755,7 +1755,7 @@ proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
         if isConst:
           g.emitLeafImm(dest, immLoc(cval, ScalarSlot))
           return
-      g.forceRegDestE(dest)
+      g.forceRegDest(dest)
       if dest.kind == NamedStack and dest.spillTemp:
         g.produceIntoMem2(c, dest); return
       var resType, inner: Cursor
@@ -1788,7 +1788,7 @@ proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
     of TrueC: g.emitLeafImm(dest, immLoc(1, ScalarSlot))
     of FalseC: g.emitLeafImm(dest, immLoc(0, ScalarSlot))
     of NilC:
-      g.resolveDestE(dest, immLoc(0, g.exprSlot(c)))
+      g.resolveDest(dest, immLoc(0, g.exprSlot(c)))
       if dest.kind == NamedStack and dest.spillTemp:
         g.produceIntoMem2(c, dest); return
       if dest.kind == InReg:
@@ -1889,9 +1889,9 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
       return
   let lhsMem = g.isFoldableMemLeaf(lhsC)
   let swap = ek notin {ShlC, ShrC} and (commutativeExpr(ek) or ek == SubC) and
-             (g.isFoldableLeafE(lhsC) or lhsMem) and
-             not (g.isFoldableLeafE(rhsC) or g.isFoldableMemLeaf(rhsC)) and
-             not (dest.kind == InReg and g.symInRegE(lhsC, dest.r))
+             (g.isFoldableLeaf(lhsC) or lhsMem) and
+             not (g.isFoldableLeaf(rhsC) or g.isFoldableMemLeaf(rhsC)) and
+             not (dest.kind == InReg and g.symInReg(lhsC, dest.r))
   if swap:
     var acc = dest
     # The accumulator ends up holding the RESULT, so it is bound at the result's
@@ -1925,9 +1925,9 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
     return
   var lDest = needsReg(g.binResultSlot(resTypeC))
   if dest.kind == InReg and ek notin {ShlC, ShrC} and
-     not g.isFoldableLeafE(lhsC) and
-     (g.isFoldableLeafE(rhsC) or g.isFoldableMemLeaf(rhsC)) and
-     not g.exprReadsRegE(lhsC, dest.r) and not g.exprReadsRegE(rhsC, dest.r):
+     not g.isFoldableLeaf(lhsC) and
+     (g.isFoldableLeaf(rhsC) or g.isFoldableMemLeaf(rhsC)) and
+     not g.exprReadsReg(lhsC, dest.r) and not g.exprReadsReg(rhsC, dest.r):
     lDest = dest                                         # compute lhs straight into dest
   g.emitValue2(lhsC, lDest)
   # The lhs partial is LIVE in `lDest` across the rhs evaluation, which recurses
@@ -2091,7 +2091,7 @@ proc emitMod2(g: var CodeGen; c: Cursor; dest: var Location) =
     g.storeReg2(res, resStaging)
     g.dropBridge resStaging
   dest = res
-proc emitFBinE*(g: var CodeGen; c: Cursor; dest: var Location) =
+proc emitFBin*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED a64 float binary-arith (allocFBin's policy inline).
   let op = fbinA64Op(c.exprKind)
   let ek = c.exprKind
@@ -2105,8 +2105,8 @@ proc emitFBinE*(g: var CodeGen; c: Cursor; dest: var Location) =
       rhsC = cc; skip cc
       while cc.hasMore: skip cc
   let lHome = (if lhsC.kind == Symbol: g.plan.locationOfSym(symName(lhsC), cursorToPosition(g.buf[], lhsC)) else: noLoc)
-  let swap = ek in {AddC, MulC} and g.foldableFloatLeafE(lhsC) and
-             not g.foldableFloatLeafE(rhsC) and
+  let swap = ek in {AddC, MulC} and g.foldableFloatLeaf(lhsC) and
+             not g.foldableFloatLeaf(rhsC) and
              not (dest.kind == InFReg and lHome.kind == InFReg and lHome.f == dest.f)
   if swap:
     var acc = dest
@@ -2200,7 +2200,7 @@ proc emitFValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
       g.placeF2(home, dest.f, bits)
   of TagLit:
     case c.exprKind
-    of AddC, SubC, MulC, DivC: g.emitFBinE(c, dest)
+    of AddC, SubC, MulC, DivC: g.emitFBin(c, dest)
     of NegC:
       if dest.kind != InFReg:
         dest = g.takeFTmp(if dest.typ.kind == AFloat: dest.typ else: f64)
@@ -2262,7 +2262,7 @@ proc emitFValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
       g.emitFValue2(inner, dest)
     else: raiseAssert "arkham a64n: emitFValue2(fused) expr " & $c.exprKind
   else: raiseAssert "arkham a64n: emitFValue2(fused) kind " & $c.kind
-proc emitScalarCmpE*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
+proc emitScalarCmp*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
                     whenTrue: bool; fuseBranchTo = ""): RiscInst =
   ## FUSED integer `cmp`: operands resolve dontCare (a home / immediate stays
   ## put; a computed subtree takes a temp) and the bridges serve everything
@@ -2277,7 +2277,7 @@ proc emitScalarCmpE*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
   var aC = aC0
   var bC = bC0
   if g.isWideExpr(aC) or g.isWideExpr(bC):
-    return g.emitWideCmpE(aC, bC, ek, whenTrue)
+    return g.emitWideCmp(aC, bC, ek, whenTrue)
   let signed = not (g.cmpOperandUnsigned(aC) or g.cmpOperandUnsigned(bC))
   result =
     case ek
@@ -2351,8 +2351,8 @@ proc emitScalarCmpE*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
   else: g.freeVal(aD)
   if fused: result = NoA64Inst
 
-proc emitCondE*(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
-  ## FUSED branch test — the a64 twin of x64's emitCondE.
+proc emitCond*(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
+  ## FUSED branch test — the a64 twin of x64's emitCond.
   if c.kind == TagLit and c.exprKind == OvfC:
     case g.ovfMode
     of OvfSign:
@@ -2380,24 +2380,24 @@ proc emitCondE*(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
         if cc.hasMore: (bC = cc; skip cc)
         while cc.hasMore: skip cc
     case ek
-    of NotC: g.emitCondE(aC, toLabel, not whenTrue)
+    of NotC: g.emitCond(aC, toLabel, not whenTrue)
     of AndC:
       if whenTrue:
         let lSkip = g.freshLabel()
-        g.emitCondE(aC, lSkip, false)
-        g.emitCondE(bC, toLabel, true)
+        g.emitCond(aC, lSkip, false)
+        g.emitCond(bC, toLabel, true)
         g.emLab(lSkip)
       else:
-        g.emitCondE(aC, toLabel, false)
-        g.emitCondE(bC, toLabel, false)
+        g.emitCond(aC, toLabel, false)
+        g.emitCond(bC, toLabel, false)
     else:
       if whenTrue:
-        g.emitCondE(aC, toLabel, true)
-        g.emitCondE(bC, toLabel, true)
+        g.emitCond(aC, toLabel, true)
+        g.emitCond(bC, toLabel, true)
       else:
         let lSkip = g.freshLabel()
-        g.emitCondE(aC, lSkip, true)
-        g.emitCondE(bC, toLabel, false)
+        g.emitCond(aC, lSkip, true)
+        g.emitCond(bC, toLabel, false)
         g.emLab(lSkip)
     return
   if c.kind == TagLit and c.exprKind in {EqC, NeqC, LtC, LeC}:
@@ -2439,7 +2439,7 @@ proc emitCondE*(g: var CodeGen; c: Cursor; toLabel: string; whenTrue: bool) =
       g.freeVal(fb)
       g.freeVal(fa)
       return
-    let tag = g.emitScalarCmpE(aC, bC, ek, whenTrue, fuseBranchTo = toLabel)
+    let tag = g.emitScalarCmp(aC, bC, ek, whenTrue, fuseBranchTo = toLabel)
     if tag != NoA64Inst: g.emBr(tag, toLabel)      # NoA64Inst: fused into a cbz/cbnz
     return
   # A bare truthiness test — `if flag`, `while p` — is a zero test, so it is a
@@ -2469,7 +2469,7 @@ proc emitCondValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
   if res.isTemp and not g.rb.isBoundTemp(res.r): g.bindTemp(res.r, res.typ)
   let lEnd = g.freshLabel()
   g.movImm(res.r, 1)
-  g.emitCondE(c, lEnd, whenTrue = true)
+  g.emitCond(c, lEnd, whenTrue = true)
   g.movImm(res.r, 0)
   g.emLab(lEnd)
   dest = res
@@ -2477,7 +2477,7 @@ proc emitMemLoad2*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED addressing expr in VALUE position → load `[addr]` into a register.
   let wr = g.pairFieldReg(c)
   if wr != NoReg:
-    g.forceRegDestE(dest)
+    g.forceRegDest(dest)
     if dest.kind == NamedStack and dest.spillTemp:
       g.produceIntoMem2(c, dest); return
     let res = dest
@@ -2492,7 +2492,7 @@ proc emitMemLoad2*(g: var CodeGen; c: Cursor; dest: var Location) =
     if res.r != wr: g.movReg(res.r, wr)
     dest = res
     return
-  g.forceRegDestE(dest)
+  g.forceRegDest(dest)
   if dest.kind == NamedStack and dest.spillTemp:
     g.produceIntoMem2(c, dest); return
   let res = dest
@@ -2536,7 +2536,7 @@ proc emitAddr2*(g: var CodeGen; c: Cursor; dest: var Location) =
         if home.kind == InReg:
           dest = home                           # the address IS p's register
           return
-  g.forceRegDestE(dest)
+  g.forceRegDest(dest)
   if dest.kind == NamedStack and dest.spillTemp:
     g.produceIntoMem2(c, dest); return
   let res = dest
@@ -2624,7 +2624,7 @@ proc emitCast2*(g: var CodeGen; c: Cursor; dest: var Location) =
     dest = res
     return
   if g.isFloatExpr(inner):                      # float → int/ptr
-    g.forceRegDestE(dest)
+    g.forceRegDest(dest)
     if dest.kind == NamedStack and dest.spillTemp:
       g.produceIntoMem2(c, dest); return
     let res = dest
@@ -2650,7 +2650,7 @@ proc emitCast2*(g: var CodeGen; c: Cursor; dest: var Location) =
       let sh = g.plan.locationOfSym(symName(inner), cursorToPosition(g.buf[], inner))
       var tgc = targetCur
       if sh.kind in {InReg, NamedStack} and slotOf(g.prog, tgc).size < sh.typ.size:
-        g.forceRegDestE(dest)
+        g.forceRegDest(dest)
       elif sh.kind == InReg and dest.kind in {Undef, NeedsReg, RegOrImm} and
            (isPtrType(tc) or g.slotIsPointer(sh.typ)):
         # A pointer-ness change over a register-homed local, with no destination
@@ -2659,7 +2659,7 @@ proc emitCast2*(g: var CodeGen; c: Cursor; dest: var Location) =
         # that home — retyping the local itself for the rest of its scope. A
         # later use at its declared type then fails the binding checker. The
         # x64 twin carries the measured repro.
-        g.forceRegDestE(dest)
+        g.forceRegDest(dest)
   if dest.kind == NamedStack and dest.spillTemp:
     # The destination is an `(s)` SPILL slot: the pools were dry when the guard above
     # forced a register. Stage the WHOLE node through the produce bridge — that
@@ -3888,9 +3888,9 @@ proc wideShift(g: var CodeGen; dst, a: WideRef; amount: Cursor; ek: LengExpr;
 
 # ── comparison ──────────────────────────────────────────────────────────────
 
-proc emitWideCmpE(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
+proc emitWideCmp(g: var CodeGen; aC, bC: Cursor; ek: LengExpr;
                   whenTrue: bool): RiscInst =
-  ## The 64-bit twin of `emitScalarCmpE`: emit the compare, return the branch
+  ## The 64-bit twin of `emitScalarCmp`: emit the compare, return the branch
   ## that means "the condition holds".
   ##
   ## Equality goes through xor/or rather than the borrow chain, because after a
@@ -4174,7 +4174,7 @@ proc emitWideToNarrow(g: var CodeGen; innerC, targetC: Cursor;
   ## re-normalized to the target's own width so a sub-word result stays
   ## canonically extended in its register.
   let src = g.wideValueSlot(innerC)
-  g.forceRegDestE(dest)
+  g.forceRegDest(dest)
   if dest.kind != InReg:
     # The pools were dry, so `dest` is a produce-into slot. Stage through the
     # produce bridge, which exists for exactly this.

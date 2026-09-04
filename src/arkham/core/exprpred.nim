@@ -37,7 +37,7 @@ proc isMemLeaf(n: Cursor): bool {.inline.} =
   ## register across a sibling — operands are pure, hexer un-nests calls).
   n.kind == TagLit and n.exprKind in {DotC, DerefC, AtC, PatC}
 
-proc isFoldableLeafE*(g: var CodeGen; n: Cursor): bool =
+proc isFoldableLeaf*(g: var CodeGen; n: Cursor): bool =
   ## A value needing NO register held across a sibling subtree: an immediate,
   ## or a function-local symbol read (folds as its reg / stack-home operand).
   case n.kind
@@ -45,14 +45,14 @@ proc isFoldableLeafE*(g: var CodeGen; n: Cursor): bool =
   of Symbol: g.plan.locationOfSym(symName(n), cursorToPosition(g.buf[], n)).kind in {InReg, NamedStack}
   else: false
 
-proc symInRegE*(g: var CodeGen; n: Cursor; reg: Reg): bool {.inline.} =
+proc symInReg*(g: var CodeGen; n: Cursor; reg: Reg): bool {.inline.} =
   ## Is `n` a symbol homed in `reg`? (Forbids a Sethi–Ullman swap whose
   ## rhs-into-dest evaluation would clobber a lhs homed in dest.)
   if n.kind != Symbol: return false
   let h = g.plan.locationOfSym(symName(n), cursorToPosition(g.buf[], n))
   h.kind == InReg and h.r == reg
 
-proc exprReadsRegImplE(g: var CodeGen; n: var Cursor; reg: Reg): bool =
+proc exprReadsRegImpl(g: var CodeGen; n: var Cursor; reg: Reg): bool =
   if n.kind == Symbol:
     let h = g.plan.locationOfSym(symName(n), cursorToPosition(g.buf[], n))
     inc n
@@ -60,18 +60,18 @@ proc exprReadsRegImplE(g: var CodeGen; n: var Cursor; reg: Reg): bool =
   elif n.kind == TagLit:
     n.into:
       while n.hasMore:
-        if g.exprReadsRegImplE(n, reg): return true
+        if g.exprReadsRegImpl(n, reg): return true
   else:
     inc n
   return false
 
-proc exprReadsRegE*(g: var CodeGen; n: Cursor; reg: Reg): bool =
+proc exprReadsReg*(g: var CodeGen; n: Cursor; reg: Reg): bool =
   ## True iff the subtree at `n` reads a symbol homed in `reg` — the guard for
   ## computing a binop's left operand straight into a pinned `dest` register.
   var c = n
-  g.exprReadsRegImplE(c, reg)
+  g.exprReadsRegImpl(c, reg)
 
-proc lvalueGlobalBaseE*(g: var CodeGen; n: Cursor): bool =
+proc lvalueGlobalBase*(g: var CodeGen; n: Cursor): bool =
   ## Does the lvalue chain `n` (a `dot`/`at` over a symbol) bottom out at a
   ## module-level global aggregate? Such a base needs its address materialized
   ## into a scratch register. A `deref`/`pat` base is a pointer VALUE, not a
@@ -85,12 +85,12 @@ proc lvalueGlobalBaseE*(g: var CodeGen; n: Cursor): bool =
     of DotC, AtC:
       var cc = c
       cc.into:
-        result = g.lvalueGlobalBaseE(cc)
+        result = g.lvalueGlobalBase(cc)
         while cc.hasMore: skip cc
     else: result = false
   else: result = false
 
-proc fixedRegsClobberedByE*(g: var CodeGen; n: Cursor): set[Reg] =
+proc fixedRegsClobberedBy*(g: var CodeGen; n: Cursor): set[Reg] =
   ## Registers this expression is FORCED to overwrite because the ISA pins
   ## them: `cl` (rcx) for a runtime shift count, rdx (+rax) for `idiv`. An
   ## already-marshalled call argument sitting in one of them is destroyed with
@@ -122,7 +122,7 @@ proc fixedRegsClobberedByE*(g: var CodeGen; n: Cursor): set[Reg] =
         stack.add ch
         skip ch
 
-proc subtreeHasCallE*(n: Cursor): bool =
+proc subtreeHasCall*(n: Cursor): bool =
   ## Does this expression subtree contain a CALL? Read-only. An `(at base idx)`
   ## whose INDEX calls — a bounds check, say — evaluates the base FIRST and
   ## reads it back AFTER the call, so the base's scratch must be a callee-saved
@@ -133,7 +133,7 @@ proc subtreeHasCallE*(n: Cursor): bool =
   var cc = n
   cc.into:
     while cc.hasMore:
-      if subtreeHasCallE(cc): return true
+      if subtreeHasCall(cc): return true
       skip cc
   return false
 
@@ -187,7 +187,110 @@ proc isFoldableMemLeaf*(g: var CodeGen; n: Cursor): bool {.inline.} =
   ## not exist.
   isMemLeaf(n) and g.pairFieldReg(n) == NoReg
 
-proc sameTreeE*(a, b: Cursor): bool =
+# ── tail-position rewrites: the policy both backends share ──────────────────
+# The two rewrites themselves are per-backend (the tags differ), but WHETHER to
+# take them is one decision and belongs in one place.
+
+proc mayReturnHere*(g: var CodeGen): bool =
+  ## May a site inside the body RETURN — `(popframe) (ret)` — instead of branching to
+  ## the proc's shared epilogue?
+  ##
+  ## `(popframe)` is what makes it possible at all: the frame's shape (how many
+  ## callee-saved saves, whether a frame `sub` exists) is final only AFTER the body is
+  ## emitted, and nifasm replays the prologue it has already assembled — so nothing is
+  ## guessed and the teardown is identical to the shared one. Hence the `TailCall`
+  ## capability: `doc/instructions.md` gives `(popframe)` to exactly the targets that
+  ## have it (x86-64 and AArch64), and Cortex-M / RV32 have neither yet.
+  ##
+  ## The entry proc has no epilogue to replay — it ends in an exit syscall.
+  if g.isEntryProc: return false
+  TailCall in g.md.caps
+
+proc emitsNoCode*(n: Cursor): bool =
+  ## A statement that produces no machine code, and therefore does not end another
+  ## statement's tail position: a `.` hole (what copyprop leaves where it deleted a
+  ## binding) and the empty `(stmts …)`/`(scope …)` wrappers a `when`-compiled-out
+  ## block leaves behind.
+  ##
+  ## Asking this rather than "is it the last child" is not a refinement, it is the
+  ## whole difference: the allocator's `rawDealloc` ends in an empty `(stmts .)` — the
+  ## `vgTracking` block — so its final `deallocBigChunk(a, c)` is the second-to-last
+  ## child and no tail-position test phrased on the child list can see it.
+  if n.kind == DotToken: return true
+  if n.kind != TagLit: return false
+  if n.stmtKind notin {StmtsS, ScopeS}: return false
+  var it = n
+  it.into:
+    while it.hasMore:
+      if not emitsNoCode(it): return false
+      skip it
+  true
+
+proc restEmitsNoCode*(n: Cursor): bool =
+  ## Is everything from `n` to the end of its statement list code-free? `n` is the
+  ## cursor just past the statement being asked about.
+  var it = n
+  while it.hasMore:
+    if not emitsNoCode(it): return false
+    skip it
+  true
+
+proc addrRootIsOurs(g: var CodeGen; n: Cursor): bool =
+  ## Does the address expression `n` bottom out at a symbol THIS proc owns storage
+  ## for — a local or a by-value parameter — rather than at a `deref` of a pointer
+  ## somebody else owns?
+  ##
+  ## Walking the base chain is the whole test: `(dot (deref p) f)` reaches OUR frame
+  ## only through `p`, which is a pointer VALUE, so the `deref` stops the search;
+  ## `(dot x f)` on a local `x` does not. A module-level global has no allocator
+  ## location (`locationOfSym` answers `NoLoc`), which is what tells the two apart.
+  var c = n
+  var guard = 0
+  while c.kind == TagLit and guard < 40:
+    inc guard
+    case c.exprKind
+    of DerefC, PatC: return false          # through a pointer: not our storage
+    of DotC, AtC, ParC, BaseobjC:
+      inc c                                 # → the base
+    of CastC, ConvC:
+      inc c; skip c                         # → past the target type, to the operand
+    else: return false
+  if c.kind != Symbol: return false
+  g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind != NoLoc
+
+proc tailCallLeaksFrame*(g: var CodeGen; args: openArray[Cursor]): bool =
+  ## Would tail-calling with these arguments hand the callee a pointer into the frame
+  ## we are about to give back?
+  ##
+  ## A tail call is `(popframe)` and then a `jmp`: our slots are released BEFORE the
+  ## callee runs, and the callee's own frame starts where ours was. An argument that is
+  ## the address of one of our locals therefore points at memory the callee immediately
+  ## reuses — the callee writes through it and corrupts its own frame instead. Nothing
+  ## else about a tail call is unsafe, and no other operand shape can carry such an
+  ## address: hexer un-nests, so an argument is a leaf or an address expression.
+  ##
+  ## This is a SYNTACTIC test, and it is not an escape analysis: a pointer laundered
+  ## through a local (`let p = addr x; f(p)`) is not caught here. That shape does not
+  ## occur in a self-hosted nimsem (0 of the 133 `(ret (call …))` sites and 303 of the
+  ## 1,396 void tail-position calls carry a direct one, all of them syntactic), and
+  ## catching it needs the address analysis arkham does not have. Stated so nobody
+  ## reads this as a proof.
+  for a in args:
+    var stack = @[a]
+    while stack.len > 0:
+      let n = stack.pop()
+      if n.kind != TagLit: continue
+      if n.exprKind in {AddrC, HaddrC}:
+        var inner = n; inc inner
+        if inner.hasMore and g.addrRootIsOurs(inner): return true
+      var it = n
+      it.into:
+        while it.hasMore:
+          if it.kind == TagLit: stack.add it
+          skip it
+  false
+
+proc sameTree*(a, b: Cursor): bool =
   ## Structural equality of two expression subtrees, ignoring the sparse line-info
   ## suffixes (they are not iterated as children). The nifcore twin of nimony's
   ## `sameTrees`, which lives in `nimony_model` and is not on arkham's import path.
@@ -207,7 +310,7 @@ proc sameTreeE*(a, b: Cursor): bool =
     var ca = childCursor(a)
     var cb = childCursor(b)
     while ca.hasMore and cb.hasMore:
-      if not sameTreeE(ca, cb): return false
+      if not sameTree(ca, cb): return false
       skip ca
       skip cb
     result = ca.hasMore == cb.hasMore

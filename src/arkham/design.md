@@ -229,7 +229,7 @@ usual shape of this argument: the `cmp` emitter gave its LEFT operand a precise 
 when pointer-typed and never did the same for the RIGHT, so a pointer RHS that went
 pool-dry landed in an `etmp` DECLARED `(i 64)` and nifasm rejected the comparison. It
 only ever bit `nifreader`'s `while p < sentinel`, and only once the borrow stopped
-supplying a register. `dontCare` now carries an optional slot that `forceRegDestE`
+supplying a register. `dontCare` now carries an optional slot that `forceRegDest`
 honours, so the register/immediate/memory folds are untouched and only the spilled
 temp is typed.
 
