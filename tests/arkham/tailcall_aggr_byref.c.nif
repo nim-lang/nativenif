@@ -1,0 +1,100 @@
+(.nif27)
+(stmts
+ (type :Big.0 .
+  (object .
+   (fld :a.0 .
+    (i 64))
+   (fld :b.0 .
+    (i 64))
+   (fld :c.0 .
+    (i 64))
+   (fld :d.0 .
+    (i 64))))
+ (type :Buf.0 .
+  (array
+   (i 64)64))
+ (gvar :gsum.0 .
+  (i 64)0)
+ (gvar :gguard.0 .
+  (i 64)0)
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :consume.0
+  (params
+   (param :o.0 . Big.0)).
+  (pragmas)
+  (stmts
+   (var :scratch.0 . Buf.0 .)
+   (var :i.0 .
+    (i 64)0)
+   (while
+    (lt i.0 64)
+    (stmts
+     (asgn
+      (at scratch.0 i.0)7777)
+     (asgn i.0
+      (add
+       (i 64)i.0 1))))
+   (asgn gguard.0
+    (at scratch.0 3))
+   (asgn gsum.0
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (mul
+       (i 64)
+       (dot o.0 a.0)1000)
+      (mul
+       (i 64)
+       (dot o.0 b.0)100))
+     (add
+      (i 64)
+      (mul
+       (i 64)
+       (dot o.0 c.0)10)
+      (dot o.0 d.0))))))
+ (proc :forward.0
+  (params
+   (param :o.0 . Big.0)).
+  (pragmas)
+  (stmts
+   (call consume.0
+    (oconstr Big.0
+     (kv a.0
+      (dot o.0 a.0))
+     (kv b.0
+      (dot o.0 b.0))
+     (kv c.0
+      (dot o.0 c.0))
+     (kv d.0
+      (dot o.0 d.0))))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :v.0 . Big.0
+    (oconstr Big.0
+     (kv a.0 1)
+     (kv b.0 2)
+     (kv c.0 3)
+     (kv d.0 4)))
+   (call forward.0 v.0)
+   (if
+    (elif
+     (neq gsum.0 1234)
+     (stmts
+      (call exit.0 11))))
+   (if
+    (elif
+     (neq gguard.0 7777)
+     (stmts
+      (call exit.0 12))))
+   (call exit.0 42))))
