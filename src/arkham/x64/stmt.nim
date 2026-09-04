@@ -177,12 +177,12 @@ proc tryEmitCmov(g: var CodeGen; c: Cursor): bool =
   # DST — it is overwritten by the ELSE store before the compare — nor calls,
   # which would clobber the volatile staging register holding the THEN value.
   # Both are rare; they simply keep the branch lowering.
-  if subtreeHasCallE(sd.a) or subtreeHasCallE(sd.b): return false
+  if subtreeHasCall(sd.a) or subtreeHasCall(sd.b): return false
   if g.readsReg(sd.a, sd.dst.r) or g.readsReg(sd.b, sd.dst.r): return false
   let rT = g.pickStagingSealed("a cmov then-value", g.selectStagingSlot(sd), avoid = sd.dst.r)
   g.genStore2(sd.thenRhs, regLoc(rT, sd.dst.typ))
   g.genStore2(sd.elseRhs, sd.dst)
-  let ct = cmovTagFor(g.emitScalarCmpE(sd.a, sd.b, sd.ek, whenTrue = true))
+  let ct = cmovTagFor(g.emitScalarCmp(sd.a, sd.b, sd.ek, whenTrue = true))
   g.ab.tree ct: (g.emReg sd.dst.r; g.emReg rT)
   g.giveBack rT
   return true
@@ -278,13 +278,13 @@ proc tryEmitCaseJmp(g: var CodeGen; c: Cursor): bool =
 
 proc emReturnHere(g: var CodeGen): bool =
   ## Return from HERE — `(popframe) (ret)` — instead of branching to the shared
-  ## epilogue at the proc's tail. True when it did; `mayReturnHereE` owns the policy
+  ## epilogue at the proc's tail. True when it did; `mayReturnHere` owns the policy
   ## and `core/exprpred` the knobs, so both backends answer it the same way.
   ##
   ## `framePop`'s `(kill …)`s are NOT replayed here, and must not be: they exist
   ## because the shared epilogue is emitted LAST and may retire every binding, while
   ## whatever follows this site still reads its own names.
-  if not g.mayReturnHereE(): return false
+  if not g.mayReturnHere(): return false
   g.ab.keyword PopframeX64
   g.ab.keyword RetX64
   true
@@ -299,14 +299,14 @@ proc listFlags(flags: set[StmtFlag]; rest: Cursor): set[StmtFlag] =
   ## emits no bytes just as a `TailPos` tail call does, and the shape that makes the
   ## difference is common — `rawDealloc` ends in an empty `(stmts .)` (its compiled-out
   ## `vgTracking` block), which under the syntactic test hid the `ret` before it.
-  if restEmitsNoCodeE(rest): flags else: {}
+  if restEmitsNoCode(rest): flags else: {}
 
 proc armFlags(flags: set[StmtFlag]; rest: Cursor): set[StmtFlag] =
   ## What the last statement of an `if`/`case` ARM inherits from the compound itself.
   ## `TailStmt` deliberately does not travel here — a `ret` in an arm must still jump
   ## over the sibling arms — but `TailPos` does: a tail call never comes back, so the
   ## jump it would skip is dead either way.
-  if TailPos in flags and restEmitsNoCodeE(rest): {TailPos} else: {}
+  if TailPos in flags and restEmitsNoCode(rest): {TailPos} else: {}
 
 proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
   if c.kind == DotToken: return                 # an empty statement (e.g. `(stmts .)`)
@@ -375,7 +375,7 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       let asgnPos = cursorToPosition(g.buf[], c)
       if asgnPos in g.condFuse.cmp:
         # `scanCondFusions` marked this: the bool is read only by the branch that
-        # follows, so emit the COMPARE and stop. `emitCondE` takes the branch off the
+        # follows, so emit the COMPARE and stop. `emitCond` takes the branch off the
         # flags — no `setcc`, no `and $1`, no `test`. Five instructions become two.
         let b = symName(cc); skip cc
         var op = cc
@@ -385,7 +385,7 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
           aC = op; skip op
           bC = op; skip op
           while op.hasMore: skip op
-        g.condFuse.tag[b] = g.emitScalarCmpE(aC, bC, ek, whenTrue = true)
+        g.condFuse.tag[b] = g.emitScalarCmp(aC, bC, ek, whenTrue = true)
         while cc.hasMore: skip cc
         return
       if asgnPos in g.condFuse.link:
@@ -435,13 +435,13 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       var cc = c
       cc.into:
         let condC = cc; skip cc
-        g.emitCondE(condC, lEnd, whenTrue = false)     # forward exit when cond is false
+        g.emitCond(condC, lEnd, whenTrue = false)     # forward exit when cond is false
         while cc.hasMore: (g.genStmt2(cc); skip cc)     # body
     g.emLab(lEnd)
     discard g.loopEnds.pop()
   of IfS:
     # A cond fused by `scanCondFusions` has no materialized bool for `tryEmitCmov` to
-    # select on — the answer is in the flags and only `emitCondE` knows how to spend it.
+    # select on — the answer is in the flags and only `emitCond` knows how to spend it.
     let fusedSym = g.condFuseSym(c)
     let isFused = fusedSym.len > 0 and g.condFuse.tag.hasKey(fusedSym)
     if isFused or not g.tryEmitCmov(c):  # branchless select diamond, else fall through
@@ -457,7 +457,7 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
             var bc = cc
             bc.into:
               let condC = bc; skip bc
-              g.emitCondE(condC, lNext, whenTrue = false)
+              g.emitCond(condC, lNext, whenTrue = false)
               while bc.hasMore:
                 var nb = bc; skip nb
                 # The arm's LAST statement inherits the `if`'s own tail position — see
@@ -705,7 +705,7 @@ proc condFuseSym(g: CodeGen; c: Cursor): string =
       var bc = cc
       bc.into:
         if bc.hasMore:
-          # Peel `(not …)`: `emitCondE` lowers it by flipping `whenTrue` and recursing,
+          # Peel `(not …)`: `emitCond` lowers it by flipping `whenTrue` and recursing,
           # so the symbol underneath still reaches the fused-flags path. Worth peeling —
           # `(if (elif (not b) …))` is where the HOT sites are (`allocatedSize` alone is
           # 17.7 M), because hexer inlines `>`/`>=` as `not (le …)` / `not (lt …)`.
@@ -734,7 +734,7 @@ proc scanCondFusions(g: var CodeGen; body: Cursor) =
   ## nifbench build are exactly this**, and in the finished image all five
   ## instructions are adjacent.
   ##
-  ## Marked here, acted on in `genStmt2`/`emitCondE`. The compare stays exactly where
+  ## Marked here, acted on in `genStmt2`/`emitCond`. The compare stays exactly where
   ## it is — moving it to the branch would name operands whose scope has closed — and
   ## only the ANSWER travels, in the flags. That is sound because `setcc` never writes
   ## flags, and because this pass only fuses when every statement between the two

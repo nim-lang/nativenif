@@ -118,7 +118,7 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   # a spilled scalar, an aggregate, an address-taken local (`AddrTaken` spills by
   # construction). With every value in a register the frame holds nothing the program
   # can point at, and a tail call's `(popframe)` is then unobservable. This is the
-  # SOUND half of the tail-call guard; `tailCallLeaksFrameE` is the syntactic half and
+  # SOUND half of the tail-call guard; `tailCallLeaksFrame` is the syntactic half and
   # catches the direct `f(addr x)` shape in procs that do have slots.
   g.frameIsAddressable = false
   for pos in g.plan.symPos.values:

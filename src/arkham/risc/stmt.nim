@@ -101,7 +101,7 @@ proc tryEmitCsel(g: var CodeGen; c: Cursor): bool =
   # written). THEN is captured into a fresh bridge before ELSE overwrites DST, so
   # `if c: x = x …` style self-reads stay correct; both stores are mov/ldr-only, so
   # the flags survive to the csel.
-  let ct = cselTagFor(g.emitScalarCmpE(sd.a, sd.b, sd.ek, whenTrue = true))
+  let ct = cselTagFor(g.emitScalarCmp(sd.a, sd.b, sd.ek, whenTrue = true))
   let rT = g.takeBridge(g.selectStagingSlot(sd))
   g.genStore2(sd.thenRhs, regLoc(rT, sd.dst.typ))
   g.genStore2(sd.elseRhs, sd.dst)
@@ -112,13 +112,13 @@ proc tryEmitCsel(g: var CodeGen; c: Cursor): bool =
 proc emReturnHere(g: var CodeGen): bool =
   ## Return from HERE — `(popframe) (ret)` — instead of branching to the shared
   ## epilogue at the proc's tail. The x64 twin, and it answers to the same
-  ## `mayReturnHereE` policy: `(popframe)` exists on AArch64 and nowhere else in this
+  ## `mayReturnHere` policy: `(popframe)` exists on AArch64 and nowhere else in this
   ## backend's three targets, which is what the `TailCall` capability test says.
   ##
   ## `framePop`'s kills are NOT replayed here, and must not be: the shared epilogue is
   ## emitted LAST and may retire every binding, while whatever follows this site still
   ## reads its own names.
-  if not g.mayReturnHereE(): return false
+  if not g.mayReturnHere(): return false
   g.ab.keyword PopframeA64
   g.ab.keyword RetA64
   true
@@ -128,14 +128,14 @@ proc listFlags(flags: set[StmtFlag]; rest: Cursor): set[StmtFlag] =
   ## `rest` is the cursor just PAST that child. Only the last one inherits anything —
   ## control leaves every other child sideways — and "last" means "nothing after it
   ## emits an instruction", which is what a trailing empty `(stmts .)` needs.
-  if restEmitsNoCodeE(rest): flags else: {}
+  if restEmitsNoCode(rest): flags else: {}
 
 proc armFlags(flags: set[StmtFlag]; rest: Cursor): set[StmtFlag] =
   ## What the last statement of an `if`/`case` ARM inherits from the compound itself.
   ## `TailStmt` deliberately does not travel here — a `ret` in an arm must still branch
   ## over the sibling arms — but `TailPos` does: a tail call never comes back, so the
   ## branch it would skip is dead either way.
-  if TailPos in flags and restEmitsNoCodeE(rest): {TailPos} else: {}
+  if TailPos in flags and restEmitsNoCode(rest): {TailPos} else: {}
 
 proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
   if c.kind == DotToken: return
@@ -207,7 +207,7 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
       var cc = c
       cc.into:
         let condC = cc; skip cc
-        g.emitCondE(condC, lEnd, whenTrue = false)     # forward exit when cond is false
+        g.emitCond(condC, lEnd, whenTrue = false)     # forward exit when cond is false
         while cc.hasMore: (g.genStmt2(cc); skip cc)     # body
     g.emLab(lEnd)
     discard g.loopEnds.pop()
@@ -227,7 +227,7 @@ proc genStmt2*(g: var CodeGen; c: Cursor; flags: set[StmtFlag] = {}) =
             var bc = cc
             bc.into:
               let condC = bc; skip bc
-              g.emitCondE(condC, lNext, whenTrue = false)
+              g.emitCond(condC, lNext, whenTrue = false)
               while bc.hasMore:
                 var nb = bc; skip nb
                 # The arm's LAST statement inherits the `if`'s own tail position — see

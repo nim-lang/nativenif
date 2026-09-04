@@ -181,7 +181,7 @@ type
                                              ## STACK, so an address into this frame can exist and
                                              ## be handed to a callee. A tail call gives the frame
                                              ## back BEFORE it jumps, so it must not: see
-                                             ## `tailCallLeaksFrameE` for why the syntactic test
+                                             ## `tailCallLeaksFrame` for why the syntactic test
                                              ## alone is not enough (the address can be laundered
                                              ## through a local — `rawData(s)` of an SSO string is
                                              ## exactly that shape, and it silently corrupted

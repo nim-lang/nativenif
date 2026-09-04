@@ -113,7 +113,7 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   g.curProcName = info.asmName            # names the proc in this backend's diagnostics
   # Can an address into THIS frame exist at all? Only a stack-homed symbol has one, and
   # a tail call gives the frame back BEFORE it branches. The x64 twin in `driver.nim`
-  # spells out why the syntactic `tailCallLeaksFrameE` alone is not enough.
+  # spells out why the syntactic `tailCallLeaksFrame` alone is not enough.
   g.frameIsAddressable = false
   for pos in g.plan.symPos.values:
     if g.plan.planned(pos).kind == NamedStack:

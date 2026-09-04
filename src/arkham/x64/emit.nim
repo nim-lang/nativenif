@@ -844,7 +844,7 @@ proc freeVal*(g: var CodeGen; loc: Location) {.inline.} =
     g.pickedFRegs.excl loc.f
     if not g.rb.isFMirror(loc.f): g.unbindFTmp(loc.f)
 
-proc resolveDestE*(g: var CodeGen; dest: var Location; natural: Location) =
+proc resolveDest*(g: var CodeGen; dest: var Location; natural: Location) =
   ## Resolve a LEAF destination constraint against the value's natural
   ## location (an immediate / a symbol's home) — the emit-time twin of the
   ## allocator's `resolveDest`. A fresh temp is bound (caller must not rebind).
@@ -856,7 +856,7 @@ proc resolveDestE*(g: var CodeGen; dest: var Location; natural: Location) =
     dest = (if natural.kind in {InReg, Imm}: natural else: g.takeTmp(natural.typ))
   else: discard                              # fixed InReg/InFReg/NamedStack/…: keep
 
-proc forceRegDestE*(g: var CodeGen; dest: var Location) =
+proc forceRegDest*(g: var CodeGen; dest: var Location) =
   ## Ensure a value's `dest` is a register (or, pool-dry, an etmp slot the
   ## produce-into path serves) — the emit-time twin of `forceRegDest`.
   case dest.kind
@@ -1744,7 +1744,7 @@ proc dstAggrInfo*(g: var CodeGen; dst: Location): (bool, int) =
     (s.kind == AMem, s.size)
   else: (false, 0)
 
-proc foldableFloatLeafE*(g: var CodeGen; c: Cursor): bool =
+proc foldableFloatLeaf*(g: var CodeGen; c: Cursor): bool =
   c.kind == Symbol and g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind in {InFReg, NamedStack}
 
 proc emCallerSaveStore(g: var CodeGen; varName: string) =
@@ -1861,7 +1861,7 @@ proc instrOperandInPlace*(g: var CodeGen; a: Cursor; avoid: set[Reg]): Location 
   if home.kind == InReg and home.r notin avoid:
     result = home
 
-proc atomicValueMayBeImmE*(op: IntrinsicOp; i: int): bool {.inline.} =
+proc atomicValueMayBeImm*(op: IntrinsicOp; i: int): bool {.inline.} =
   ## May an atomic's operand `i` stay a literal on x86-64? (Port of the
   ## allocator's `atomicValueMayBeImm`, x64 half.)
   i == 1 and op in {AtomicStoreOp, AtomicExchangeOp, AtomicFetchAddOp,
@@ -1877,7 +1877,7 @@ proc resolveLvalVal*(g: var CodeGen; c: Cursor; dest: var Location) =
   case c.kind
   of Symbol:
     let home = g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c))
-    if home.kind == NoLoc: g.forceRegDestE(dest)     # a global/tvar value read
+    if home.kind == NoLoc: g.forceRegDest(dest)     # a global/tvar value read
     elif home.kind in {NamedStack, Mem} and dest.kind in {NeedsReg, RegOrImm} and
          g.tempPoolDry():
       # A stack-homed symbol IS its own natural location. Honouring `NeedsReg`
@@ -1897,11 +1897,11 @@ proc resolveLvalVal*(g: var CodeGen; c: Cursor; dest: var Location) =
       # there `takeTmp` gives a real register, the value lands in it, and holding
       # it across the address computation is what we want.
       dest = home
-    else: g.resolveDestE(dest, home)
-  of IntLit: g.resolveDestE(dest, immLoc(intVal(c), ScalarSlot))
-  of UIntLit: g.resolveDestE(dest, immLoc(cast[int64](uintVal(c)), ScalarSlot))
-  of CharLit: g.resolveDestE(dest, immLoc(int64(ord(charLit(c))), ScalarSlot))
-  else: g.forceRegDestE(dest)                        # computed: reserve the result
+    else: g.resolveDest(dest, home)
+  of IntLit: g.resolveDest(dest, immLoc(intVal(c), ScalarSlot))
+  of UIntLit: g.resolveDest(dest, immLoc(cast[int64](uintVal(c)), ScalarSlot))
+  of CharLit: g.resolveDest(dest, immLoc(int64(ord(charLit(c))), ScalarSlot))
+  else: g.forceRegDest(dest)                        # computed: reserve the result
 
 proc getExpr*(g: var CodeGen; n: var Cursor; held: bool; what: string) =
   ## PHASE B acquire: home the lvalue-embedded value at `n` and plan it there,

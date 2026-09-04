@@ -12,7 +12,7 @@
 ## registers permanently out of the allocator's pools, so the emitter always has
 ## somewhere to put a value it is moving; `takeBridge`/`dropBridge` hand them
 ## out. That is what makes the destination protocol (`takeTmp` / `takeHeld` /
-## `resolveDestE`) total — it can always answer, even with every pool dry.
+## `resolveDest`) total — it can always answer, even with every pool dry.
 ##
 ## Also here: the immediate encoders. `add`/`sub` take a 12-bit immediate,
 ## `and`/`orr`/`eor` take a bitmask immediate that is not a range at all, and
@@ -1371,7 +1371,7 @@ proc freeVal*(g: var CodeGen; loc: Location) {.inline.} =
     g.pickedFRegs.excl loc.f
     if not g.rb.isFMirror(loc.f): g.unbindFTmp(loc.f)
 
-proc resolveDestE*(g: var CodeGen; dest: var Location; natural: Location) =
+proc resolveDest*(g: var CodeGen; dest: var Location; natural: Location) =
   ## Resolve a LEAF destination constraint against the value's natural location
   ## — the emit-time twin of the allocator's `resolveDest` (lazy-bound temps).
   case dest.kind
@@ -1382,7 +1382,7 @@ proc resolveDestE*(g: var CodeGen; dest: var Location; natural: Location) =
     dest = (if natural.kind in {InReg, Imm}: natural else: g.takeTmp(natural.typ))
   else: discard                              # fixed InReg/InFReg/NamedStack/…: keep
 
-proc forceRegDestE*(g: var CodeGen; dest: var Location) =
+proc forceRegDest*(g: var CodeGen; dest: var Location) =
   ## Ensure a value's `dest` is a register (or, pool-dry, an etmp slot the
   ## produce-into path serves).
   case dest.kind
@@ -2058,12 +2058,12 @@ proc resolveLvalVal*(g: var CodeGen; c: Cursor; dest: var Location) =
   case c.kind
   of Symbol:
     let home = g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c))
-    if home.kind == NoLoc: g.forceRegDestE(dest)     # a global/tvar value read
-    else: g.resolveDestE(dest, home)
-  of IntLit: g.resolveDestE(dest, immLoc(intVal(c), ScalarSlot))
-  of UIntLit: g.resolveDestE(dest, immLoc(cast[int64](uintVal(c)), ScalarSlot))
-  of CharLit: g.resolveDestE(dest, immLoc(int64(ord(charLit(c))), ScalarSlot))
-  else: g.forceRegDestE(dest)                        # computed: reserve the result
+    if home.kind == NoLoc: g.forceRegDest(dest)     # a global/tvar value read
+    else: g.resolveDest(dest, home)
+  of IntLit: g.resolveDest(dest, immLoc(intVal(c), ScalarSlot))
+  of UIntLit: g.resolveDest(dest, immLoc(cast[int64](uintVal(c)), ScalarSlot))
+  of CharLit: g.resolveDest(dest, immLoc(int64(ord(charLit(c))), ScalarSlot))
+  else: g.forceRegDest(dest)                        # computed: reserve the result
 
 proc reserveStrideScratch*(g: var CodeGen; atPos: int) =
   ## Reserve the `(at/pat base idx scratch)` stride scratch for the access at `atPos`.
@@ -2173,7 +2173,7 @@ proc pow2Log*(g: var CodeGen; c: Cursor): int =
     inc result
   if result < 1 or result > 62: result = -1
 
-proc foldableFloatLeafE*(g: var CodeGen; c: Cursor): bool =
+proc foldableFloatLeaf*(g: var CodeGen; c: Cursor): bool =
   c.kind == Symbol and g.plan.locationOfSym(symName(c), cursorToPosition(g.buf[], c)).kind in {InFReg, NamedStack}
 
 proc mirrorBranch*(t: RiscInst): RiscInst =
