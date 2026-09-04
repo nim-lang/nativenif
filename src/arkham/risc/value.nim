@@ -2869,6 +2869,33 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
                not indirect and not tgt.extern and not tgt.syscall and
                not tgt.indirect and not resultByRef and
                tgt.memIntrin.len == 0 and tgt.bitBuiltin.len == 0
+  # AAPCS64 passes a composite LARGER than `aggrByRefThreshold` indirectly: the
+  # caller allocates the copy in its OWN frame and hands the callee a pointer to
+  # it. `(popframe)` gives that frame back before the branch, and the callee's
+  # frame starts exactly where ours was — so it overwrites the argument it was
+  # called with, through the pointer it was handed. Declining is the only
+  # answer here: the copy is the ABI's, not an optimization we may skip.
+  #
+  # x86-64 never reaches this. SysV copies such an aggregate into the OUTGOING
+  # stack area, and `onStack` below already declines that — which is why the
+  # x64 twin needs no counterpart and this guard is stated per-backend.
+  #
+  # `frameIsAddressable` does not cover it either, on either backend: it scans
+  # `plan.symPos`, the DECLARED symbols, while these copies are minted by the
+  # emitter as it marshals. `programs.publish` is the shape — no stack-homed
+  # local of its own, a 65-byte `sink TokenBuf` argument, and so a tail call
+  # that handed `[]=` a pointer into the frame it had just released.
+  if doTail:
+    for a in argCurs:
+      let s = g.exprSlot(a)
+      if s.kind == AMem and s.size > g.md.aggrByRefThreshold:
+        doTail = false
+        break
+  # The syntactic half of the same question, and the x64 twin of it: an argument
+  # that is LITERALLY the address of one of our locals. `frameIsAddressable` is
+  # the sound half and gates the void statement-call rewrite in `stmt.nim`, but
+  # the `(ret (call …))` encoding reaches here without it.
+  if doTail and g.tailCallLeaksFrame(argCurs): doTail = false
   var heldArgs: seq[Location] = @[]
 
   proc settleCallResult(g: var CodeGen; dest: var Location) =
