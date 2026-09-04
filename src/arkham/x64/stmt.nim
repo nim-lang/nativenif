@@ -290,17 +290,16 @@ proc emReturnHere(g: var CodeGen): bool =
   true
 
 proc listFlags(flags: set[StmtFlag]; rest: Cursor): set[StmtFlag] =
-  ## What one child of a straight-line `stmts`/`scope` inherits from the list itself.
-  ## `rest` is the cursor just PAST that child.
+  ## What one child of a straight-line `stmts`/`scope` inherits from the list itself;
+  ## `rest` is the cursor just PAST that child. The a64 twin, rule for rule.
   ##
-  ## Only the last child inherits anything: control leaves every other one sideways.
-  ## `TailStmt` asks for the syntactically last child — it promises a fall-through into
-  ## the epilogue, and the scope kills between here and there emit no bytes — while
-  ## `TailPos` only asks that nothing after the child emits CODE, which is a weaker
-  ## question and the one that matters for `rawDealloc`'s trailing empty `(stmts .)`.
-  result = {}
-  if TailStmt in flags and not rest.hasMore: result.incl TailStmt
-  if TailPos in flags and restEmitsNoCodeE(rest): result.incl TailPos
+  ## Only the last child inherits anything — control leaves every other one sideways —
+  ## and "last" means "nothing after it emits CODE", not "no sibling follows". BOTH
+  ## flags ask that: a `TailStmt` fall-through into the epilogue survives anything that
+  ## emits no bytes just as a `TailPos` tail call does, and the shape that makes the
+  ## difference is common — `rawDealloc` ends in an empty `(stmts .)` (its compiled-out
+  ## `vgTracking` block), which under the syntactic test hid the `ret` before it.
+  if restEmitsNoCodeE(rest): flags else: {}
 
 proc armFlags(flags: set[StmtFlag]; rest: Cursor): set[StmtFlag] =
   ## What the last statement of an `if`/`case` ARM inherits from the compound itself.

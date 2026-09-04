@@ -1,0 +1,102 @@
+(.nif27)
+(.indexat 1422             )
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :plain.0
+  (params
+   (param :k.0 .
+    (i 64)))
+  (i 64)
+  (pragmas)
+  (stmts
+   (var :t.0 .
+    (i 64)
+    (add
+     (i 64)k.0 7))
+   (ret t.0)
+   (stmts .)))
+ (proc :nested.0
+  (params
+   (param :k.0 .
+    (i 64)))
+  (i 64)
+  (pragmas)
+  (stmts
+   (var :t.0 .
+    (i 64)
+    (mul
+     (i 64)k.0 3))
+   (ret t.0)
+   (stmts
+    (stmts .)
+    (scope .))))
+ (proc :inscope.0
+  (params
+   (param :k.0 .
+    (i 64)))
+  (i 64)
+  (pragmas)
+  (stmts
+   (scope
+    (var :t.0 .
+     (i 64)
+     (sub
+      (i 64)k.0 1))
+    (ret t.0)
+    (stmts .))))
+ (proc :guarded.0
+  (params
+   (param :k.0 .
+    (i 64)))
+  (i 64)
+  (pragmas)
+  (stmts
+   (if
+    (elif
+     (lt 0 k.0)
+     (stmts
+      (ret 10))))
+   (var :t.0 .
+    (i 64)
+    (add
+     (i 64)k.0 40))
+   (ret t.0)
+   (stmts .)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :a.0 .
+    (i 64)
+    (call plain.0 5))
+   (var :b.0 .
+    (i 64)
+    (call nested.0 4))
+   (var :c.0 .
+    (i 64)
+    (call inscope.0 9))
+   (var :d.0 .
+    (i 64)
+    (call guarded.0 1))
+   (var :e.0 .
+    (i 64)
+    (call guarded.0 0))
+   (call exit.0
+    (cast
+     (i 32)
+     (add
+      (i 64)
+      (add
+       (i 64)
+       (add
+        (i 64)
+        (add
+         (i 64)a.0 b.0)c.0)d.0)e.0))))))(.index)
