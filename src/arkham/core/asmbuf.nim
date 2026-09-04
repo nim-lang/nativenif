@@ -18,7 +18,7 @@
 ## Built as a `nifcore` `TokenBuf` (the flexible NIF API) and serialized with
 ## `toString`.
 
-import std / tables
+import std / [tables, sets]
 import nifcore, nifcoreparse
 import "../../nifasm/core" / [model, tagpool]
                              # nifasm: A64Inst/NifasmDecl/NifasmType/NifasmExpr,
@@ -202,6 +202,18 @@ proc append*(a: var AsmBuf; other: var AsmBuf) =
     skip c
   endRead c
 
+proc gprSpellings(a: AsmBuf): HashSet[string] =
+  ## Every spelling this target hands out for a general-purpose register, taken
+  ## from the very shim that WROTE them into the buffer, so the peephole's
+  ## "is this name homed in a register a memory base may use" question is
+  ## answered by the target rather than by a list kept in step with it. `Reg`
+  ## slots the target does not use render as `<noreg>`; the angle bracket is
+  ## what marks them, since no machine spells a register that way.
+  result = initHashSet[string]()
+  for r in low(Reg) .. high(Reg):
+    let nm = a.renderReg(r)
+    if nm.len > 0 and nm[0] != '<': result.incl nm
+
 proc render*(a: var AsmBuf; dottedSuffix = ""): string =
   ## Serialize to a full NIF module for nifasm: `(.nif27)` header, body, and a
   ## trailing embedded `(.index …)` (so nifasm resolves cross-module symbols
@@ -212,5 +224,5 @@ proc render*(a: var AsmBuf; dottedSuffix = ""): string =
   ## emitters produce rather than the intentions behind them (see peephole.nim).
   ## `-d:arkhamNoPeephole` turns it off for a bisect.
   when not defined(arkhamNoPeephole):
-    discard peephole(a.buf, a.immAnyDest)
+    discard peephole(a.buf, a.immAnyDest, a.gprSpellings())
   toModuleString(a.buf, dottedSuffix)
