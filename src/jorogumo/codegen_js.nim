@@ -75,7 +75,10 @@ type
     globals: Table[string, Cursor]        ## name → gvar/const decl (foreign ones cached on use)
     tvars: Table[string, Cursor]
     memTop*: uint32                    ## static-data bump pointer
-    globalAddr*: Table[string, uint32]
+    globalAddr*: Table[string, uint32]   ## CANONICAL name → address (see `globalAddrOf`)
+    canonDecl: Table[string, Cursor]     ## canonical name → the decl to serialize (a C-linkage
+                                         ## pair resolves through whichever name came first)
+    staticsDone: HashSet[string]         ## canonical names whose static init is in `dataSegs`
     rodataAddr: Table[string, uint32]  ## string literal → address (deduped)
     dataSegs*: seq[(uint32, string)]
     allocLog: seq[(uint32, uint32, string)] ## (addr, size, owner) for the overrun check
@@ -129,8 +132,12 @@ proc isPtrType(g: var JsGen; t: Cursor): bool =
 
 proc isAggType(g: var JsGen; t: Cursor): bool =
   ## A DotToken is the ABSENCE of a type — a void result, an elided field type.
-  ## It has no size to ask for, so it is not an aggregate.
+  ## It has no size to ask for, so it is not an aggregate. The spelled `(void)`
+  ## is the same absence (ithaqua's sret test checks `isVoidType` first for
+  ## exactly this reason): a void result returns nothing, it does not sret a
+  ## zero-byte object.
   if t.kind == DotToken: return false
+  if t.kind == TagLit and t.typeKind == VoidT: return false
   scalOf(g, t).kind == skMem
 
 proc byteSize(g: var JsGen; t: Cursor): int =
@@ -193,11 +200,28 @@ proc flexPayloadLen(g: var JsGen; initv: Cursor): int =
           while kv.hasMore: skip kv
       skip t
 
+proc declHasInit(decl: Cursor): bool =
+  ## True when a `(gvar|tvar :name PRAGMAS TYPE INIT?)` carries an initializer.
+  var d = decl
+  result = false
+  d.into:
+    inc d                                      # name
+    skip d                                     # pragmas
+    skip d                                     # type
+    result = d.hasMore and d.kind != DotToken
+    while d.hasMore: skip d
+
 proc globalAddrOf(g: var JsGen; name: string): uint32 =
-  ## The linear-memory address of a gvar/const, assigned on first use.
+  ## The linear-memory address of a gvar/const — foreign ones included, the
+  ## lazy loader resolves their decls and the layout here is whole-program.
+  ## The address is keyed by `gvarRefName`: a C-linkage PAIR (the defining
+  ## `exportc` gvar and a body module's `importc` reference) shares one C
+  ## symbol, so it must share one slot — two names, two addresses, is the
+  ## silent-zero miscompile arkham's `gvarRefName` exists to prevent.
   ## Zero-initialized globals reserve space only; static initializers become
-  ## image segments in `layoutProgram`.
-  if g.globalAddr.hasKey(name): return g.globalAddr[name]
+  ## image segments in `serializeStatics`.
+  let canon = gvarRefName(g.prog, name)
+  if g.globalAddr.hasKey(canon): return g.globalAddr[canon]
   let si = lookupSym(typeCtx(g), name)
   if si.cat notin {scGlobal, scTvar}:          # tvar: single-threaded target → a global
     err g, "not a global: " & name
@@ -217,8 +241,13 @@ proc globalAddrOf(g: var JsGen; name: string): uint32 =
   var (sz, al) = typeSizeAlign(g.prog, typ)
   if hasInit:
     sz += flexPayloadLen(g, initv)
-  result = allocStatic(g, sz, al, tag = name)
-  g.globalAddr[name] = result
+  result = allocStatic(g, sz, al, tag = canon)
+  g.globalAddr[canon] = result
+  # The decl to serialize: prefer one that carries an initializer, so an
+  # `importc` reference seen first cannot hide the defining module's static.
+  if not g.canonDecl.hasKey(canon) or
+      (hasInit and not declHasInit(g.canonDecl[canon])):
+    g.canonDecl[canon] = si.decl
   if si.cat == scGlobal and not g.globals.hasKey(name):
     g.globals[name] = si.decl                  # cache foreign decls for typenav
   elif si.cat == scTvar and not g.tvars.hasKey(name):
@@ -239,6 +268,19 @@ proc tableSlotOf(g: var JsGen; sym: string): uint32 =
   g.tableSlot[sym] = result
   while g.tableEntries.len <= int(result): g.tableEntries.add ""
   g.tableEntries[int(result)] = sym         # bound to its JS name at the end
+
+proc procDeclOf(g: var JsGen; nm: string; found: var bool): Cursor
+proc ensureProc(g: var JsGen; sym: string; decl: Cursor)
+
+proc procValue(g: var JsGen; sym: string): uint32 =
+  ## A proc as a VALUE: its function-table slot, AND a reachability edge —
+  ## ithaqua's `tableSlotOf` resolves through `refProc`, which declares the
+  ## body. A slot for a proc nobody lowered would bind the "unbound extern"
+  ## stub: right for a bodyless import, wrong for a body that was forgotten.
+  result = tableSlotOf(g, sym)
+  var found = false
+  let decl = procDeclOf(g, sym, found)
+  if found: ensureProc(g, sym, decl)
 
 # ── object offsets ───────────────────────────────────────────────────────────
 
@@ -356,7 +398,7 @@ proc constScalarBits(g: var JsGen; v: Cursor; ok: var bool): uint64 =
     let nm = symName(v)
     let si = lookupSym(typeCtx(g), nm)
     case si.cat
-    of scProc: result = uint64(tableSlotOf(g, nm))
+    of scProc: result = uint64(procValue(g, nm))
     of scGlobal, scTvar, scNone:
       ok = false                               # a VALUE copy is a runtime init
       result = 0
@@ -478,6 +520,13 @@ proc serializeConstInto(g: var JsGen; bytes: var string; base: int;
         inc idx
   elif v.kind == TagLit and v.exprKind == NilC:
     putLE(bytes, base, 0, JsPtrSize)
+  elif v.kind == Symbol and isPtrType(g, rt) and
+      lookupSym(typeCtx(g), symName(v)).cat in {scGlobal, scTvar}:
+    # Object-file semantics: a symbol written into POINTER-typed data denotes
+    # its ADDRESS — what arkham's data section relocates to, and what makes
+    # `(gvar p (ptr T) g)` point at `g`. A symbol in non-pointer data is a
+    # VALUE copy, a runtime init the `ini` chain owns.
+    putLE(bytes, base, uint64(globalAddrOf(g, symName(v))), JsPtrSize)
   else:
     let sc = scalOf(g, rt)
     if sc.kind == skMem:
@@ -489,16 +538,14 @@ proc serializeConstInto(g: var JsGen; bytes: var string; base: int;
       bits = uint64(cast[uint32](float32(cast[float64](bits))))
     putLE(bytes, base, bits, max(sc.bits div 8, 1))
 
-proc staticInit(g: var JsGen; nm: string; typ, initv: var Cursor;
+proc staticInit(g: var JsGen; decl: Cursor; typ, initv: var Cursor;
                 hasInit: var bool): bool =
-  ## The initializer of global `nm`, but only when it is genuinely STATIC.
+  ## The initializer of a global DECL, but only when it is genuinely STATIC.
   ## Zero inits need no segment (the buffer starts zeroed) and runtime inits
   ## are the `ini` chain's job — skipping them here must not be an error.
-  let si = lookupSym(typeCtx(g), nm)
   hasInit = false
   result = false
-  if si.cat notin {scGlobal, scTvar}: return
-  var d = si.decl
+  var d = decl
   d.into:
     inc d                                      # name
     skip d                                     # pragmas
@@ -510,9 +557,13 @@ proc staticInit(g: var JsGen; nm: string; typ, initv: var Cursor;
     while d.hasMore: skip d
   if not hasInit: return
   if initv.kind == TagLit and initv.exprKind in {FalseC, NilC}: return
-  if initv.kind == Symbol and
-     lookupSym(typeCtx(g), symName(initv)).cat != scProc:
-    return                                     # a value copy from another global
+  if initv.kind == Symbol:
+    let ic = lookupSym(typeCtx(g), symName(initv)).cat
+    if ic == scProc: discard                   # the function-table slot
+    elif ic in {scGlobal, scTvar} and isPtrType(g, typ): discard
+                                             # a POINTER-typed symbol init is an
+                                             # address fixup, static by nature
+    else: return                               # a value copy from another global
   if initv.kind == TagLit and initv.exprKind in {ConvC, CastC}:
     # Static only when the operand is itself compile-time; a conv of a
     # global's value is the ini chain's job.
@@ -534,30 +585,36 @@ proc staticInit(g: var JsGen; nm: string; typ, initv: var Cursor;
   else:
     result = true
 
-proc layoutProgram*(g: var JsGen) =
-  ## Assign every global an address and turn the static initializers into
-  ## image segments. Runs to a fixpoint: serializing one global can name
-  ## another (`(addr g)`, a method table), which discovers a new address.
-  var names: seq[string] = @[]
-  for n in g.globals.keys: names.add n
-  sort names                                   # a deterministic layout, not Table order
-  for n in names: discard globalAddrOf(g, n)
-
-  var done = initHashSet[string]()
+proc serializeStatics(g: var JsGen) =
+  ## Turn every addressed global's static initializer into image segments.
+  ## Runs to a fixpoint: serializing one global can name another (`(addr g)`,
+  ## a method table), which discovers a new address. `staticsDone` persists
+  ## across calls — codegen addresses foreign globals on demand, and
+  ## `generateJs` drains them after the last body is lowered.
   while true:
     var round: seq[string] = @[]
     for n in g.globalAddr.keys:
-      if not done.containsOrIncl(n): round.add n
-    sort round
+      if not g.staticsDone.containsOrIncl(n): round.add n
+    sort round                                 # a deterministic image, not Table order
     if round.len == 0: break
     for n in round:
       var typ, initv: Cursor
       var hasInit = false
-      if not staticInit(g, n, typ, initv, hasInit): continue
+      if not staticInit(g, g.canonDecl[n], typ, initv, hasInit): continue
       var bytes = ""
       serializeConstInto(g, bytes, 0, typ, initv)
       if bytes.len > 0:
         g.dataSegs.add (g.globalAddr[n], bytes)
+
+proc layoutProgram*(g: var JsGen) =
+  ## Assign every global and thread-local an address and serialize the statics
+  ## known up front; what codegen discovers later is drained before emission.
+  var names: seq[string] = @[]
+  for n in g.globals.keys: names.add n
+  for n in g.tvars.keys: names.add n
+  sort names                                   # a deterministic layout, not Table order
+  for n in names: discard globalAddrOf(g, n)
+  serializeStatics(g)
 
 proc checkSegments(g: var JsGen) =
   ## No segment may write past the allocation it was given: an undersized
@@ -597,6 +654,8 @@ proc createJsGen*(buf: var TokenBuf; inputPath: string; tags: TagPool): JsGen =
   result.globals = initTable[string, Cursor]()
   result.tvars = initTable[string, Cursor]()
   result.globalAddr = initTable[string, uint32]()
+  result.canonDecl = initTable[string, Cursor]()
+  result.staticsDone = initHashSet[string]()
   result.rodataAddr = initTable[string, uint32]()
   result.tableSlot = initTable[string, uint32]()
   result.jsNameOf = initTable[string, string]()
@@ -732,9 +791,9 @@ proc declType(g: var JsGen; nm: string): Cursor =
 
 proc genExpr(g: var JsGen; c: Cursor)
 proc genAddr(g: var JsGen; c: Cursor)
-proc procDeclOf(g: var JsGen; nm: string; found: var bool): Cursor
 proc procResultType(decl: Cursor): Cursor
 proc procBody(decl: Cursor): Cursor
+proc hasBody(decl: Cursor): bool
 
 # ── scalar, pointer, aggregate ───────────────────────────────────────────────
 # What a type IS decides how its value travels. A scalar is a JS local or a
@@ -783,10 +842,8 @@ proc genSymAddr(g: var JsGen; c: Cursor) =
     let si = lookupSym(typeCtx(g), nm)
     case si.cat
     of scGlobal, scTvar:
-      if not g.prog.globals.hasKey(nm) and not g.globals.hasKey(nm):
-        # Another module's data is not laid out here; an address of our own
-        # invention would read zeros silently. Foreign data + the ini chain is M4.
-        err g, "foreign global `" & nm & "` (linking another module's data is M4)"
+      # A foreign global resolves through the lazy loader and is laid out HERE:
+      # the layout is whole-program, so one address per C symbol, no relocation.
       g.outp.numLit int64(globalAddrOf(g, nm))
     else: err g, "not addressable: " & nm
 
@@ -907,10 +964,8 @@ proc genSymValue(g: var JsGen; c: Cursor) =
   else:
     let si = lookupSym(typeCtx(g), nm)
     case si.cat
-    of scProc: g.outp.numLit int64(tableSlotOf(g, nm))   # a proc as a value
+    of scProc: g.outp.numLit int64(procValue(g, nm))     # a proc as a value
     of scGlobal, scTvar:
-      if not g.prog.globals.hasKey(nm) and not g.globals.hasKey(nm):
-        err g, "foreign global `" & nm & "` (linking another module's data is M4)"
       let ty = declType(g, nm)
       if isAggType(g, ty):
         g.outp.numLit int64(globalAddrOf(g, nm))         # the global's address
@@ -1092,20 +1147,44 @@ proc ctorType(g: var JsGen; c: Cursor): Cursor =
     result = t
     while t.hasMore: skip t
 
+proc calleeProctype(g: var JsGen; target: Cursor): Cursor =
+  ## The proctype of a callee expression, or a NIL cursor when there is no
+  ## proctype to speak of — an unresolvable symbol, a non-function value.
+  ## typenav's rule for a call's type is the callee proctype's return child;
+  ## an unknown symbol would trip its `raiseAssert`, so the check that turns
+  ## it into a refusal naming the symbol happens here instead.
+  if target.kind == Symbol:
+    let nm = symName(target)
+    if not g.p.symType.hasKey(nm) and lookupSym(typeCtx(g), nm).cat == scNone:
+      return Cursor()
+  var pt = resolveType(g.prog, lengType(g, target))
+  if pt.kind == TagLit and pt.typeKind != ProctypeT:
+    var inner = pt; inc inner
+    pt = resolveType(g.prog, inner)            # peel `(ptr proctype)`
+  if pt.kind == TagLit and pt.typeKind == ProctypeT: result = pt
+
+proc callResultType(g: var JsGen; c: Cursor): Cursor =
+  ## The result type of a call node — direct or indirect — by typenav's ONE
+  ## rule: the return type of the callee's proctype. `planFrame` and codegen
+  ## must agree on which calls carry an sret destination, and deriving both
+  ## from this one rule is what makes them agree by construction.
+  var t = c
+  t.into:
+    var pt = calleeProctype(g, t)
+    if not pt.cursorIsNil:
+      pt.into:                                 # (proctype NAME PARAMS RET PRAGMAS)
+        skip pt; skip pt
+        result = pt
+        while pt.hasMore: skip pt
+    while t.hasMore: skip t
+
 proc callDestSize(g: var JsGen; c: Cursor): (int, int) =
   ## What the CALLER must reserve for a call's result: (size, align) when the
   ## result is an aggregate (the struct-return slot), (0, 8) otherwise.
   result = (0, 8)
   if c.kind != TagLit or c.exprKind != CallC: return
-  var t = c
-  t.into:
-    if t.kind != Symbol: return              # an indirect call is refused later
-    var found = false
-    let decl = procDeclOf(g, symName(t), found)
-    if not found: return                     # a bodyless import: refused at the call
-    let rt = procResultType(decl)
-    if not rt.cursorIsNil and isAggType(g, rt): result = (byteSize(g, rt), byteAlign(g, rt))
-    while t.hasMore: skip t
+  let rt = callResultType(g, c)
+  if not rt.cursorIsNil and isAggType(g, rt): result = (byteSize(g, rt), byteAlign(g, rt))
 
 type
   FramePlan = object
@@ -1290,6 +1369,15 @@ proc genExpr(g: var JsGen; c: Cursor) =
     of TrueC: g.outp.lit TrueLit
     of FalseC: g.outp.lit FalseLit
     of NilC: g.outp.numLit 0
+    of SizeofC, AlignofC:
+      # A compile-time constant of the natural int type (typenav's rule), and
+      # jorogumo owns the layout that makes it known: `(sizeof T)` is just the
+      # size the loader and the frame plan already agree on.
+      var t = c
+      t.into:
+        let (sz, al) = typeSizeAlign(g.prog, t)
+        g.outp.numLit int64(if c.exprKind == SizeofC: sz else: al)
+        while t.hasMore: skip t
     of NanC: g.outp.lit NanLit
     of InfC: g.outp.lit InfLit
     of NeginfC:
@@ -1405,8 +1493,12 @@ proc genExpr(g: var JsGen; c: Cursor) =
 # ── calls ────────────────────────────────────────────────────────────────────
 
 proc procDeclOf(g: var JsGen; nm: string; found: var bool): Cursor =
-  ## The `(proc …)` decl of a MAIN-module symbol. `lookupSym` answers "is this a
-  ## proc" but hands back no decl, and typenav's view is a signature, not a body.
+  ## The `(proc …)` decl of a symbol: the main module's list, then the lazy
+  ## foreign loader — ithaqua's `refProc` pattern. This is what makes the
+  ## `ini` chain callable: hexer emits `main` calling `ini.0.<module>` for
+  ## every import, and those procs live in the imported modules' files.
+  ## Registering the typenav target on the way out is what classifies the
+  ## name as a proc (and a foreign syscall as a syscall) for every later use.
   result = Cursor()
   found = false
   for pi in g.prog.procs:
@@ -1416,6 +1508,15 @@ proc procDeclOf(g: var JsGen; nm: string; found: var bool): Cursor =
       result = pi.decl
       found = true
       return
+  if isForeignSym(g.prog, nm):
+    let d = lookupForeignDecl(g.prog, nm, found)
+    if found:
+      if d.stmtKind != ProcS:
+        found = false                          # a data symbol is not callable
+      else:
+        if not g.callTarget.hasKey(nm):
+          g.callTarget[nm] = foreignCallTarget(g.prog, nm)
+        result = d
 
 proc procResultType(decl: Cursor): Cursor =
   var d = decl
@@ -1424,8 +1525,6 @@ proc procResultType(decl: Cursor): Cursor =
     skip d                                     # params
     result = d
     while d.hasMore: skip d
-
-proc ensureProc(g: var JsGen; sym: string; decl: Cursor)
 
 proc genSyscall(g: var JsGen; base: string; t: var Cursor; wantValue: bool) =
   ## The runtime floor, the same two entry points ithaqua imports from `env`:
@@ -1450,30 +1549,127 @@ proc genSyscall(g: var JsGen; base: string; t: var Cursor; wantValue: bool) =
   else:
     err g, "syscall `" & base & "` has no JS host binding"
 
+proc genCalleeValue(g: var JsGen; target: Cursor) =
+  ## The function-table index a callee expression denotes. A proc VALUE is
+  ## the slot number (`genSymValue`'s `scProc` case), so a fn-ptr local,
+  ## parameter or global already holds the index — loaded, not called.
+  if target.kind == Symbol:
+    let nm = symName(target)
+    if g.p.locals.hasKey(nm):
+      let s = g.p.locals[nm]
+      case s.kind
+      of lkReg: g.outp.symUse jsName(g, nm)
+      of lkSlot:
+        g.outp.tree HLoad:
+          g.outp.width wU32
+          slotAddr(g, s.off)
+      of lkPtr: g.outp.symUse jsName(g, nm)
+    else:
+      g.outp.tree HLoad:
+        g.outp.width wU32
+        g.outp.numLit int64(globalAddrOf(g, nm))    # a proc-typed gvar/tvar
+  else:
+    genExpr(g, target)                          # a cast or a closure-field load
+
+proc genIndirectCall(g: var JsGen; target: Cursor; t: var Cursor) =
+  ## `(call EXPR ARG*)` dispatching through a fn-ptr VALUE: `FTAB[i](args)`.
+  ## The signature is the callee's PROCTYPE, the same one rule typenav uses
+  ## to type the call — so the sret decision here and `callDestSize`'s plan
+  ## cannot disagree. JS, unlike `call_indirect`, is not signature-strict: a
+  ## closure proctype's trailing env argument lands on a proc that ignores it,
+  ## which is why ithaqua's synthetic thunk needs no twin here.
+  var pt = calleeProctype(g, target)
+  if pt.cursorIsNil:
+    err g, (if target.kind == Symbol: "indirect call through unknown symbol " &
+                                          symName(target)
+            else: "indirect call through a non-proctype value")
+  var retT: Cursor
+  var paramsT: Cursor
+  pt.into:
+    skip pt                                    # the name slot
+    paramsT = pt
+    skip pt
+    retT = pt
+    while pt.hasMore: skip pt
+  let aggRet = not retT.cursorIsNil and isAggType(g, retT)
+  g.outp.openTree Call
+  g.outp.openTree Index
+  g.outp.ident "FTAB"
+  genCalleeValue(g, target)
+  g.outp.closeTag
+  if aggRet: slotAddr(g, takeTemp(g, byteSize(g, retT)))
+  if paramsT.kind == TagLit:
+    paramsT.into:
+      while paramsT.hasMore:
+        var q = paramsT
+        var w = wU32
+        var agg = false
+        q.into:
+          inc q                                # name
+          skip q                               # pragmas
+          agg = isAggType(g, q)
+          if not agg: w = widthOf(g, q)
+          while q.hasMore: skip q
+        skip paramsT
+        if t.hasMore:
+          if agg: genExpr(g, t)
+          else: g.genExprCoerced(t, w)
+          skip t
+  # anything past the declared parameters (a closure's env, a varargs tail)
+  # rides along as-is — JS hands extra arguments to whoever is willing
+  while t.hasMore:
+    genExpr(g, t)
+    skip t
+  g.outp.closeTag
+
 proc genCall(g: var JsGen; c: Cursor; wantValue: bool) =
   var t = c
   t.into:
-    if t.kind != Symbol: err g, "indirect call (M4: the function table)"
-    let nm = symName(t)
-    inc t
+    let target = t
+    var indirect = true
+    var nm = ""
     var ct: CallTarget
     var known = false
-    if g.callTarget.hasKey(nm):
-      ct = g.callTarget[nm]
-      known = true
+    if t.kind == Symbol:
+      nm = symName(t)
+      # classify a foreign callee BEFORE dispatching: the typenav target says
+      # whether it is a syscall, an extern, or an ordinary proc — the same
+      # lazy resolution `getType` performs for the call's type.
+      if not g.callTarget.hasKey(nm) and isForeignSym(g.prog, nm):
+        var fnd = false
+        let fd = lookupForeignDecl(g.prog, nm, fnd)
+        if fnd and fd.stmtKind == ProcS:
+          g.callTarget[nm] = foreignCallTarget(g.prog, nm)
+      if g.callTarget.hasKey(nm):
+        ct = g.callTarget[nm]
+        known = true
+      # a Symbol that is not a proc decl — a local, param or proc-typed
+      # global holding a fn-ptr — dispatches through the table. arkham's
+      # `isIndirectCallTarget` follows the same rule.
+      indirect = lookupSym(typeCtx(g), nm).cat != scProc
+      inc t                                    # a Symbol is one token: now at the args
+    else:
+      skip t                                   # a tree callee: PAST the subtree,
+                                               # `inc` would step into it
     if known and ct.syscall:
       var base = nm
       let dotSys = ct.asmName.find(".sys.")
       if dotSys >= 0: base = ct.asmName[0 ..< dotSys]
       genSyscall(g, base, t, wantValue)
-    elif known and (ct.extern or ct.memIntrin.len > 0 or ct.bitBuiltin.len > 0):
-      err g, "extern `" & nm & "` (the JS bridge is M7)"
+    elif indirect:
+      genIndirectCall(g, target, t)
     else:
       var found = false
       let decl = procDeclOf(g, nm, found)
+      if known and (ct.extern or ct.memIntrin.len > 0 or ct.bitBuiltin.len > 0) and
+          not (found and hasBody(decl)):
+        # an `importc` WITH a body is an ordinary definition — the C compiler
+        # emits bodies for its importcs too; only the bodyless signature
+        # reaches across the M7 bridge.
+        err g, "extern `" & nm & "` (the JS bridge is M7)"
       if not found: err g, "no body to call: " & nm
       ensureProc(g, nm, decl)
-      let rt = procResultType(decl)
+      let rt = callResultType(g, c)
       let aggRet = not rt.cursorIsNil and isAggType(g, rt)
       g.outp.openTree Call
       g.outp.symUse jsName(g, nm)
@@ -2106,15 +2302,22 @@ proc generateJs*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   let entryRet = procResultType(entryDecl)
   g.outp.openTree Top
   ensureProc(g, g.entrySym, entryDecl)
+  # Lowering and static serialization feed each other across module
+  # boundaries: a body addresses a foreign global whose initializer names a
+  # proc nobody has reached yet. Run both to the fixpoint.
   var i = 0
-  while i < g.pending.len:                     # lowering discovers more procs
-    let (sym, decl) = g.pending[i]
-    inc i
-    lowerProc(g, sym, decl)
+  while true:
+    while i < g.pending.len:                   # lowering discovers more procs
+      let (sym, decl) = g.pending[i]
+      inc i
+      lowerProc(g, sym, decl)
+    serializeStatics(g)
+    if i >= g.pending.len: break
   g.outp.closeTag
 
   result = jsPreamble(memBytes, stackBytes, int g.memTop) & dataInitJs(g)
   result.add genJs(g.outp)
+  result.add "FTAB[0] = () => { throw new Error(\"nil function pointer\"); };\n"
   for slot in 1 ..< g.tableEntries.len:
     let sym = g.tableEntries[slot]
     if sym.len > 0:

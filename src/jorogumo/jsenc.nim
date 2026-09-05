@@ -59,6 +59,7 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int): string =
   "      F32 = new Float32Array(JMEM), F64 = new Float64Array(JMEM),\n" &
   "      BI64 = new BigInt64Array(JMEM), BU64 = new BigUint64Array(JMEM);\n" &
   "const EXT = [];  // extern value table: handle -> real JS value (§6)\n" &
+  "const FTAB = []; // function table: slot -> JS function; 0 is the null pointer\n" &
   "let JSP = [null];  // the same table, grown by ewrap\n" &
   "function ewrap(v) {\n" &
   "  if (typeof v === \"number\" || typeof v === \"bigint\") return v;\n" &
