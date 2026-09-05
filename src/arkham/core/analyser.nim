@@ -34,6 +34,12 @@ let birthFilterEnv = getEnv("ARKHAM_BIRTH_FILTER")
   ## debug bisection toggle: "" = birth-point exemption everywhere (normal);
   ## "-" = disabled everywhere; else a comma-separated allowlist of proc names
 
+let deathPointOff = existsEnv("ARKHAM_NO_DEATHPOINT")
+  ## The same switch for the DEATH-POINT exemption (`DiesAtCall`, below), spelled as a
+  ## plain off-switch because it has no per-proc form yet. Set it and every local whose
+  ## last use is a call argument is denied a volatile outright, which is what the
+  ## interval test did before. One run, no rebuild.
+
 type
   VarInfo* = object
     defs*, usages*: int        ## how often the variable is defined / used
@@ -66,6 +72,13 @@ type
                                ## `freeAfter` crosses the range.
     lastUsePos*: int           ## PRECISE last-use position, tracked for ALL vars incl.
                                ## params (whose `freeAfter` is pinned to `high`).
+    deathCallPos*: int         ## token position of the CALL NODE that textually encloses the
+                               ## variable's LAST occurrence — the call that consumes the
+                               ## value — or 0 when the last use is not inside a call, or the
+                               ## loop back-edge extended `freeAfter` past it (then the value
+                               ## is re-read on the next iteration and dies nowhere textual).
+                               ## The outermost enclosing call, so that a nested one cannot be
+                               ## exempted in its stead. Feeds the death-point exemption.
     usedAfterCall*: bool       ## a use occurred while a call had already RETURNED
                                ## (`completedCalls > 0`) → the value must survive that call.
                                ## Disqualifies a param from `ArgResident`.
@@ -169,6 +182,10 @@ type
     arg0Name: string           ## name of the FIRST integer/pointer param (the one homed in
                                ## the return register on AArch64); "" if none / aggregate
     res: ProcAnalysis
+    openCalls: seq[int]        ## positions of the `(call …)` nodes currently being walked,
+                               ## outermost first. A use recorded while this is non-empty is a
+                               ## use INSIDE a call — `openCalls[0]` is that call's position,
+                               ## which is what `deathCallPos` records.
     callPositions: seq[int]    ## token position of every call point (incl. tvar thunk
                                ## accesses) — the points where caller-saved regs die. A
                                ## local may use `AllRegs` iff none of these fall in its
@@ -443,8 +460,20 @@ proc analyse(c: var Context; n: var Cursor) =
       # the end of the OUTERMOST such loop (`loopStack[declLoopDepth]`, ordered
       # outer→inner) so the register stays reserved for the whole carried span.
       var hi = posOf(c, n)
+      var loopExtended = false
       if c.loopStack.len > e.declLoopDepth:
-        hi = max(hi, c.loopStack[e.declLoopDepth].hi)
+        let loopHi = c.loopStack[e.declLoopDepth].hi
+        if loopHi > hi:
+          hi = loopHi
+          loopExtended = true
+      # Record where this value DIES, for the death-point exemption in `analyseProc`.
+      # `hi >= e.freeAfter` keeps only the occurrence that is (so far) the last one, so
+      # after the walk the field describes the textually last use. A loop-extended `hi`
+      # clears it: the back-edge re-reads the value, so no call encloses its real end.
+      # Params never reach the assignment (`freeAfter` is pinned to `high`), which is
+      # right — `ArgResident` is their form of this argument.
+      if hi >= e.freeAfter:
+        e.deathCallPos = if not loopExtended and c.openCalls.len > 0: c.openCalls[0] else: 0
       e.freeAfter = max(e.freeAfter, hi)
       e.lastUsePos = max(e.lastUsePos, hi)   # tracked even for params (freeAfter pinned to high)
       if c.completedCalls > 0: e.usedAfterCall = true  # used after a call returned → must survive it
@@ -633,7 +662,9 @@ proc analyse(c: var Context; n: var Cursor) =
             markArgParamsUnsafe(c, probe, ordinal, cleanCall)
             skip probe
             inc ordinal
+      c.openCalls.add posOf(c, n)       # uses inside the arguments die HERE (see `deathCallPos`)
       analyseChildren(c, n)
+      discard c.openCalls.pop()
       if not noReturnCall or defined(arkhamStrictNoReturn):
         inc c.completedCalls            # this call's args are fully built; it has "returned"
         # A diverging call never returns, so nothing executes "after it returned" —
@@ -845,8 +876,36 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
              else: vi.liveStart
     let hi = if isParam: vi.lastUsePos else: vi.freeAfter
     var crossesCall = false
+    # Death-point exemption. A local whose last use is a call ARGUMENT has that call
+    # INSIDE its own interval: in Leng the `call` tag precedes its arguments, so the
+    # call's position is < the argument's, while `hi` is the argument's. The value is
+    # nevertheless dead the instant the call executes — its home is exactly where the
+    # marshalling wants it — so that one call should not decide where it lives. This
+    # is the birth-point exemption above, run backwards, and it is the common shape:
+    # every destructible local ends in `(call =destroy x)`.
+    #
+    # It grants LESS than `AllRegs`, and the difference is the whole soundness
+    # argument. `AllRegs` opens the argument registers (`IntLocalTempRegsN` on a64)
+    # precisely because no call marshals while such a value is live; here a call DOES
+    # marshal, and a sibling argument staged before this one would overwrite an
+    # argument-register home. `DiesAtCall` therefore opens only the emitter's
+    # non-argument volatile scratch — see `getSym`. `releaseArgDest`'s "dead by
+    # construction" claim is unaffected for the same reason: it kills bindings on
+    # ARGUMENT registers, and no `DiesAtCall` value is ever homed in one.
+    #
+    # Measured over nifbench's 42 modules (AArch64, 682 procs): prologue `stp` pairs
+    # 1310 -> 1187, ~900 local homes moving out of x20–x28 into x9–x11, the framed-proc
+    # count unchanged at 501 — a proc keeps its frame until its LAST pair goes, so the
+    # pairs are what this buys and the frames are what live-range splitting would.
+    # nifbench itself: -0.69 % instructions retired on `walk`, -0.55 % over the whole
+    # suite, checksum unchanged. x86-64 emission is byte-identical — see `getSym`.
+    var onlyDeathCall = vi.deathCallPos > 0 and not deathPointOff
     for p in c.callPositions:
-      if p > lo and p <= hi: (crossesCall = true; break)
+      if p > lo and p <= hi:
+        crossesCall = true
+        if p != vi.deathCallPos:
+          onlyDeathCall = false
+          break
     when defined(arkhamStrictNoReturn):
       # EXPERIMENT: also deny `AllRegs` across a DIVERGING call. Machine-state-wise
       # that is pure pessimism — a call that never returns clobbers nothing anyone can
@@ -855,8 +914,10 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
       # linear and has no notion of "this path is not taken", so the name is gone for
       # the rest of the proc and every later read of that still-live local falls back
       # to a raw `(reg)`.
+      # `onlyDeathCall` falls with it: a diverging call inside the interval is not the
+      # call this value dies at, so the exemption below has nothing to say about it.
       for p in c.noReturnPositions:
-        if p > lo and p <= hi: (crossesCall = true; break)
+        if p > lo and p <= hi: (crossesCall = true; onlyDeathCall = false; break)
     # `usedAfterCall` is the same fact reached by counting completed calls rather
     # than comparing positions. Redundant with the interval test above, kept as the
     # belt-and-braces gate on the param path (it is what `ArgResident` has always
@@ -900,6 +961,11 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
       for s in c.shiftPositions:
         if s.pos > lo and hi >= s.stmtStart: (crossesShift = true; break)
       if not crossesShift: vi.props.incl ShiftRegOk
+    elif onlyDeathCall and not isParam and AddrTaken notin vi.props:
+      # The only call in the interval is the one that consumes the value. No
+      # `DivRegOk`/`ShiftRegOk` here: rdx/rcx are argument registers on x86-64, which
+      # is exactly what this grant may not hand out.
+      vi.props.incl DiesAtCall
   # ArgResident: a PARAM (freeAfter == high) may keep its incoming arg register instead of
   # a callee-saved home iff EVERY use of it executes before ANY call returns
   # (`not usedAfterCall`). Then no call clobbers the arg register while the param is live;

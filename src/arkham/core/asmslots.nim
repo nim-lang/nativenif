@@ -46,6 +46,14 @@ type
                 # the arg reg anyway). It may STAY in its incoming arg register instead of
                 # taking a callee-saved home — no prologue save, and same-position passing
                 # makes the call-site marshal a self-move (elided). See allocParams.
+    DiesAtCall  # the ONLY call in the local's live interval is the one that CONSUMES
+                # its last use (it appears in that call's argument list, or in an
+                # expression marshalled into one). The value is dead the instant the
+                # call executes, so it need not survive it — but a volatile ARGUMENT
+                # register is still wrong (a sibling argument's marshalling would
+                # overwrite it before its own is staged), so this grants only the
+                # emitter's non-argument volatile scratch (`intTempRegs`), never the
+                # `AllRegs` pool. See the death-point exemption in `analyseProc`.
   VarProps* = set[VarProp]
 
 # ── target word ─────────────────────────────────────────────────────────────

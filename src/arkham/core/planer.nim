@@ -480,6 +480,25 @@ proc getSym(b: var Builder; name: string; slot: AsmSlot; props: VarProps): Locat
       r = b.takeReg(b.freeVol, [b.md.shiftCountReg])
     if r == NoReg and DivRegOk in props and b.md.divRemReg != NoReg:
       r = b.takeReg(b.freeVol, [b.md.divRemReg])
+  elif DiesAtCall in props and b.md.arch != X86:
+    # The one call in this value's interval is the call that CONSUMES it (the
+    # death-point exemption in `analyser`), so the value need not survive anything —
+    # but a volatile ARGUMENT register is still wrong: a sibling argument staged
+    # before this one would overwrite it mid-marshalling, and that is the hazard
+    # `AllRegs` exists to exclude. `intTempRegs` is the emitter's own scratch pool,
+    # which by construction holds no argument register (x9–x13 on a64, t0–t3 on
+    # RV32, empty on Cortex-M and AVR, where every volatile IS an argument register
+    # and this grant is correctly a no-op). The call clobbers the register on the
+    # way out, which costs nothing: the value is dead by then.
+    #
+    # x86-64 is excluded, not unsafe-there: its `intTempRegs` is the single register
+    # r10 (r11 being the staging bridge), so the grant would hand the emitter's last
+    # free scratch to a local for the benefit of at most one value per proc.
+    #
+    # Fallback to callee-saved keeps the register COUNT identical to before, so no
+    # local that had a register loses one.
+    r = b.takeReg(b.freeVol, b.md.intTempRegs)
+    if r == NoReg: r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
   else:
     # may be live across a real call → must be callee-saved (or stack)
     r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
