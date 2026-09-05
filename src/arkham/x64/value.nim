@@ -497,6 +497,34 @@ proc aggrArgSource(g: var CodeGen; a: Cursor; tcur: Cursor; tn: SymId):
     g.genStore2(a, namedStackLoc(home, g.exprSlot(a)))
   (home, ptrReg, isTvar)
 
+proc emPairHomeAddr(g: var CodeGen; dest: Reg; a: Cursor; hl: Location;
+                    tcur: Cursor; tn: SymId) =
+  ## `dest <- &a` for an aggregate local/param the allocator homed in a GPR PAIR.
+  ##
+  ## A pair home declares NO `(s)` slot: the eightbytes are the value, and every
+  ## other reader gets at them positionally (`transferAggrWords` returns early on
+  ## `InRegPair` for exactly that reason). Taking the address by name therefore
+  ## emitted `lea dest, <name>` for a slot that was never declared, and nifasm
+  ## rejected it as "Unknown or invalid symbol".
+  ##
+  ## So give the value an address: a slot of its own, written from the pair. The
+  ## shape that reaches here is a pair-homed aggregate marshalled onto the
+  ## OUTGOING STACK — `semos.buildPlugin` handing its `exefile: string` to a call
+  ## that needs seven integer words, so the last argument is passed in memory,
+  ## the one path that wants an address rather than the words.
+  ##
+  ## The words go through `dest` rather than slot-directly: `dest` is the staging
+  ## register being filled anyway, so the `lea` is not extra, and a synthetic slot
+  ## is not an allocator-known name (`homeOfSym` answers `NoLoc` for it) — the
+  ## slot-direct readers key on exactly that. No partial tail to worry about
+  ## either: `canHomeInRegPair` admits only aggregates whose every eightbyte is a
+  ## full 8-byte word.
+  let slot = synth("pairaddr") & $cursorToPosition(g.buf[], a) & ".0"
+  g.emTypedStackVar(slot, tcur)
+  g.emStackAddr(dest, slot)
+  for k in 0 ..< aggrWordCount(g.prog, tn):
+    g.ab.tree MovX64: (g.emWordThroughPtr(dest, k); g.emReg pairWord(hl, k))
+
 proc binFold(g: var CodeGen; op: X64Inst; dest: Reg; loc: Location; opCur: Cursor) =
   ## `dest op= <memory operand>` (a `NamedStack` slot or a `Mem` access chain `opCur`),
   ## EXCEPT a sub-8-byte field: it has no 64-bit ALU memory form (`add r64, m32` doesn't
@@ -3576,7 +3604,11 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
             else:
               srcAddr = g.pickStagingSealed("a stack aggregate-arg address", AddrSlot)
               srcSpilled = true
-              if home.len > 0: g.emAggrHomeAddr(srcAddr, home)
+              let hl = (if home.len > 0 and a.kind == Symbol:
+                          g.plan.locationOfSym(home, cursorToPosition(g.buf[], a))
+                        else: noLoc)
+              if hl.kind == InRegPair: g.emPairHomeAddr(srcAddr, a, hl, tcur, tn)
+              elif home.len > 0: g.emAggrHomeAddr(srcAddr, home)
               elif isTvar: g.emTvarAddr(srcAddr, symName(a))
               else: g.emGlobalAddr(srcAddr, symName(a))
           template outgoingSlot(k: int; indexed: bool) =
