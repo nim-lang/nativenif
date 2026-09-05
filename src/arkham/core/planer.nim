@@ -204,6 +204,13 @@ type
                                       ## the same one the emitter uses, so the allocator no
                                       ## longer hand-rolls per-form type dispatch
     md: MachineDesc                   ## target register file + ABI (arch-neutral driver)
+    entryMd: MachineDesc              ## the convention this proc's PARAMETERS ARRIVE under.
+                                      ## `md` everywhere except a Windows `stdcall` proc
+                                      ## definition, which the OS calls into and therefore
+                                      ## enters with Windows' argument registers (x64
+                                      ## `win64EntryOf`). Only the arrival differs — every
+                                      ## other decision below is about this proc's own
+                                      ## register file and reads `md`.
     freeVol, freeCallee: set[Reg]
     freeVolF: set[FReg]               ## caller-saved SIMD/FP scratch pool (v16–v31)
     freeCalleeF: set[FReg]            ## callee-saved SIMD pool (v8–v15)
@@ -1023,7 +1030,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
   # (rdi) as the hidden result pointer, so real params start at rsi — in lockstep
   # with the signature / emitParamMoves / emitStackParamLoads. AArch64 passes the
   # hidden pointer in x8 (off the arg-register file), so no skip.
-  let plan = planCall(b.md, paramSlots(b.prog[], params),
+  let plan = planCall(b.entryMd, paramSlots(b.prog[], params),
                       retByRef = b.retIndirect and b.md.arch == X86)
   var pIdx = 0
   # Scalar cross-call register params (1..6) that took a callee-saved home, in
@@ -1071,7 +1078,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
           var r1 = NoReg
           if pairOk:
             for k in 0 ..< pl.words:
-              let arg = b.md.gprAt(pl, k)
+              let arg = b.entryMd.gprAt(pl, k)
               let clobbered = (arg == b.md.divRemReg and b.an.clobbersDivReg) or
                               (arg == b.md.shiftCountReg and b.an.clobbersShiftReg) or
                               (arg == b.md.intRetReg and b.an.arg0RetConflict)
@@ -1141,7 +1148,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
                 else:
                   loc = b.spillTo(name, effSlot)
               else:
-                loc = fregLoc(b.md.floatArgRegs[pl.fpIndex], effSlot)
+                loc = fregLoc(b.entryMd.floatArgRegs[pl.fpIndex], effSlot)
             else:
               loc = b.spillTo(name, effSlot)     # >8 float args: stack-passed (TODO)
           elif not effSlot.inRegClass:
@@ -1152,7 +1159,7 @@ proc allocParams(b: var Builder; params: var Cursor; hasCall: bool) =
             # (`aggrStack` is stack-passed by definition — never register-home it,
             # even if an arg register looks free: AAPCS64 stopped filling registers
             # once this composite spilled to the stack.)
-            let arg = b.md.gprAt(pl)
+            let arg = b.entryMd.gprAt(pl)
             # A leaf param would normally stay in its arg register, but if that
             # register is a fixed-instruction scratch the body clobbers (rdx for
             # div/mod, rcx for a variable shift), it must move to a callee-saved
@@ -1338,7 +1345,7 @@ proc findReturnedVar(body: Cursor): string =
   findReturnedVarImpl(c)
 
 proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
-                   prog: var Program; md: MachineDesc; tc: TypeCtx;
+                   prog: var Program; md, entryMd: MachineDesc; tc: TypeCtx;
                    presealed: set[Reg] = {}): Plan =
   ## Allocate storage for the params and locals of `procDecl` in a SINGLE walk
   ## over the tree (the decl-only pre-pass of the fused value core; expression
@@ -1355,10 +1362,15 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
   ##     friends in the backends) and never contend with locals for a register,
   ##     so there is no temp-vs-local collision class to reason about.
   ##
-  ## `md` describes the target register file + ABI. `presealed` registers are
-  ## reserved for the whole proc. `prog` is `var` because resolving a cross-module
-  ## type may load a module.
-  var b = Builder(buf: addr buf, an: addr an, prog: addr prog, tc: tc, md: md)
+  ## `md` describes the target register file + ABI. `entryMd` describes the one this
+  ## proc's PARAMETERS ARRIVE under, which is `md` for everything arkham calls itself
+  ## and Windows' convention for a `stdcall` definition the OS calls into (x64
+  ## `win64EntryOf`); the two are separate because a proc can be entered one way and
+  ## still do all its own work the other. `presealed` registers are reserved for the
+  ## whole proc. `prog` is `var` because resolving a cross-module type may load a
+  ## module.
+  var b = Builder(buf: addr buf, an: addr an, prog: addr prog, tc: tc, md: md,
+                  entryMd: entryMd)
   # `locs` only ever holds positions inside THIS proc's contiguous subtree span, so
   # size it to that span (base = the proc's first token position) rather than the whole
   # module. Sizing to `buf.len` re-allocated+zeroed a module-sized array for every proc
@@ -1412,7 +1424,7 @@ proc allocateProc*(buf: var TokenBuf; procDecl: Cursor; an: ProcAnalysis;
     # base would be `NoReg` (a `(mem (<noreg>) …)` stack-param load). We only need to
     # GUARANTEE one stays free; which one is the emitter's choice (any unused callee-saved).
     block:
-      let plan = planCall(b.md, paramSlots(b.prog[], n), b.retIndirect)
+      let plan = planCall(b.entryMd, paramSlots(b.prog[], n), b.retIndirect)
       b.plan.hasStackParams = plan.hasStackArgs  # single source of truth for the emitter
       if plan.hasStackArgs:
         # Reserve a callee-saved reg the body cannot use, for the emitter's

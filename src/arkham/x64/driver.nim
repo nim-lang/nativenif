@@ -48,7 +48,28 @@ proc recordSymTypes(g: var CodeGen; c: Cursor) =
         g.recordSymTypes(cc)
         skip cc
 
+proc setEntryAbi(g: var CodeGen; decl: Cursor; isNaked: bool) =
+  ## Is this a proc the OS calls INTO? Then its parameters arrive under Windows'
+  ## convention rather than arkham's — the one boundary a proc DEFINITION can have
+  ## (`isWin64AbiProc`). From here on, everything asking "where does parameter i
+  ## arrive" reads `g.entryMd`, and everything asking about this proc's own
+  ## register file goes on reading `g.md`.
+  ##
+  ## Set for EVERY proc, including the `{.assembler.}` ones that leave before the
+  ## allocator: these two fields are per-proc state, and a stale `win64Entry` would
+  ## push rdi/rsi in the prologue of whatever proc followed a callback.
+  let win64 = isWin64AbiProc(g.prog, decl)
+  g.entryMd = if win64: win64EntryOf(x64MachineA) else: g.md
+  if win64: g.checkWin64EntryAbi(decl)
+  # `{.naked.}` is a promise that this proc emits no prologue, and the rdi/rsi
+  # saves ARE prologue. An `.assembler` body that declares itself naked owns every
+  # register it touches — including these two — the same way it already owns rbx
+  # and r12–r15. So it keeps Windows' arrival registers (its parameters really do
+  # come in there, and it reads them by name) and loses only the automatic saves.
+  g.win64Entry = win64 and not isNaked
+
 proc genProc(g: var CodeGen; info: ProcInfo) =
+  g.setEntryAbi(info.decl, info.isNaked)
   if info.isAsm:
     g.genAsmProc(info)
     return
@@ -112,7 +133,8 @@ proc genProc(g: var CodeGen; info: ProcInfo) =
   g.pickedRegs = {}
   g.pickedFRegs = {}
   g.emitTmpSpills = 0
-  g.plan = allocateProc(g.buf[], info.decl, an, g.prog, x64MachineA, g.typeCtx, preseal)
+  g.plan = allocateProc(g.buf[], info.decl, an, g.prog, x64MachineA, g.entryMd,
+                        g.typeCtx, preseal)
   g.curProcName = info.asmName
   # Can an address into THIS frame exist at all? Only a stack-homed symbol has one —
   # a spilled scalar, an aggregate, an address-taken local (`AddrTaken` spills by
@@ -255,9 +277,12 @@ proc generateX64*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   ## The two targets share ONE code generator: the image is self-contained, so the
   ## convention on both sides of every arkham-generated call is arkham's own (SysV,
   ## `x64Machine`) whichever OS it runs on. Only the edges where the OS is the
-  ## other party differ — the calls out to `importc`'d Windows APIs (Win64 ABI, see
-  ## `win64Machine`) and the LINUX entry's exit trap (see `emProcessExit`; the
-  ## Windows entry returns to ntdll's thunk like an ordinary proc).
+  ## other party differ, and there are three: the calls OUT to `importc`'d Windows
+  ## APIs (Win64 ABI, see `win64Machine`), the calls IN to a `{.stdcall.}` proc
+  ## definition the OS was handed a pointer to (`isWin64AbiProc` / `win64EntryOf`
+  ## — a thread start routine, a window procedure), and the LINUX entry's exit trap
+  ## (see `emProcessExit`; the Windows entry returns to ntdll's thunk like an
+  ## ordinary proc).
   ##
   ## `md` is the ALLOCATED-against machine (`x64MachineA`), so the prologue/epilogue's
   ## view of the callee-saved pool matches `allocateProc`'s under `-d:arkhamStress`.

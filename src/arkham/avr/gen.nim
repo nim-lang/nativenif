@@ -1360,7 +1360,7 @@ proc genProcAvr*(g: var CodeGen; info: ProcInfo) =
   g.retLabelUsed2 = false
 
   let an = analyseProc(g.buf[], info.decl)
-  g.plan = allocateProc(g.buf[], info.decl, an, g.prog, avrMachine, g.typeCtx)
+  g.plan = allocateProc(g.buf[], info.decl, an, g.prog, avrMachine, avrMachine, g.typeCtx)
 
   let params = g.collectParams(info.decl)
 

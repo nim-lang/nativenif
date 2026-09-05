@@ -327,6 +327,39 @@ proc arkhamWinTraceTableTests() =
          " (want 7 = magic|below-table|near-table)"
   echo "1 / 1 arkham win64 trace-table tests successful"
 
+proc arkhamWinStdcallTests() =
+  ## The OTHER Win64 boundary: a `{.stdcall.}` proc DEFINITION, which the OS calls
+  ## INTO. `isForeignAbiProctype` had long marshalled a call OUT through a stdcall
+  ## proctype the Windows way; the definition it points at was still generated with
+  ## arkham's own SysV arrival registers, so a callback read its first argument
+  ## from rdi while Windows had put it in rcx. Nothing diagnosed it — a proc
+  ## definition and a proctype are different nodes, and only the latter was asked.
+  ##
+  ## `tests/win_stdcall_callback.c.nif` scores the two ways such a proc is reached
+  ## and exits with the sum:
+  ##   1 — called through a `stdcall` function POINTER from inside the image (the
+  ##       call site already marshalled Win64; this half only says the two agree);
+  ##   2 — called by the OS, as `CreateThread`'s start routine. This is the half
+  ##       that cannot be faked: agreeing with ourselves would still crash here.
+  ## Both increment through the pointer they are handed, so a wrong arrival
+  ## register is a null write, not a wrong number.
+  if findExe("wine").len == 0:
+    echo "0 / 0 arkham win64 stdcall-callback tests (wine not installed)"
+    return
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham" / "nimcache"
+  let asmNif = workDir / "win_stdcall_callback.asm.nif"
+  let exe = workDir / "win_stdcall_callback.exe"
+  exec quoteShell(arkham) & " -a:win_x64 -o:" & quoteShell(asmNif) & " " &
+       quoteShell("tests" / "win_stdcall_callback.c.nif")
+  exec quoteShell(nifasm) & " -o:" & quoteShell(exe) & " " & quoteShell(asmNif)
+  let (_, code) = execCmdEx("wine " & quoteShell(exe) & " 2>/dev/null")
+  if code != 3:
+    quit "FAILURE arkham win64 stdcall callback: exit code " & $code &
+         " (want 3 = fn-pointer call | OS thread callback)"
+  echo "1 / 1 arkham win64 stdcall-callback tests successful"
+
 proc buildToolchain() =
   ## `bin/arkham` and `bin/nifasm`, built ONCE and BEFORE anything that runs them.
   ##
@@ -2311,6 +2344,7 @@ when defined(linux) and defined(amd64):
   arkhamDebugInfoTests()
   arkhamWinUnwindTests()
   arkhamWinTraceTableTests()
+  arkhamWinStdcallTests()
 
 # Additionally exercise the AArch64 backend on an x86-64 Linux host by emitting the
 # `linux_arm64` ELF variant and running it under qemu-aarch64 (no-op if qemu is

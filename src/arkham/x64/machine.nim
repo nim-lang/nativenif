@@ -201,6 +201,33 @@ const
     intCallerSavedSet: {RAX, RDI, RSI, RDX, RCX, R8, R9, R10, R11},
     convClobbersGpr: @x64ClobbersGpr)
 
+proc win64EntryOf*(md: MachineDesc): MachineDesc =
+  ## `md` with WINDOWS' incoming argument registers — the machine a `stdcall` proc
+  ## DEFINITION receives its parameters under (`isWin64AbiProc`).
+  ##
+  ## Only the ARRIVAL registers are replaced. Everything else in `md` — the temp
+  ## pools, the callee-saved set, whatever a stress variant shrank — describes this
+  ## proc's own register use, which stays arkham's throughout: the body is generated
+  ## exactly as it would be on Linux, and only the boundary changes. That is what
+  ## keeps this a two-line ABI difference instead of a second code generator.
+  ##
+  ## The rest of the Win64 boundary is not modelled here and is refused outright
+  ## (`checkWin64EntryAbi`): a float or aggregate parameter, and a 5th parameter —
+  ## which Windows reads from above the 32-byte shadow space, an offset arkham's
+  ## incoming-stack-argument addressing does not carry.
+  result = md
+  result.intArgRegs = win64Machine.intArgRegs
+  result.floatArgRegs = win64Machine.floatArgRegs
+
+const Win64EntrySaved* = [RDI, RSI]
+  ## The registers a `stdcall` proc definition must give back that arkham's own
+  ## convention treats as volatile. Win64's callee-saved set is SysV's plus rdi and
+  ## rsi; the body was generated under SysV, where both are fair game — as homes for
+  ## call-free locals (`intLocalTempRegs`), as outgoing argument registers, and as
+  ## the operands of the `rep movs` an aggregate copy lowers to. So they are saved
+  ## unconditionally in such a proc's prologue rather than only when the allocator
+  ## happens to have named them.
+
 const TlsBlockName* = "arkham.tls.0"
 const TlsSelfName* = "arkham.tls.self.0"
   ## The thread-local at offset 0 of every thread's block, holding that block's own
