@@ -306,6 +306,27 @@ type
                                   # final after the last module's tvars are allocated).
     tlsSizeLabel*: LabelId        # its label in `buf`
     tlsSizeUsed*: bool            # something referenced it, so `appendTlsSize` runs
+    # ── Windows thread-locals ──
+    # The PE target cannot use the FS block above: GS holds the TEB, whose layout
+    # nifasm does not own. It uses the mechanism the loader already provides —
+    # static TLS. `.tls` carries a TEMPLATE of one thread's block; the loader
+    # copies it for every thread the process ever creates (`CreateThread` included)
+    # and leaves a pointer to that copy in
+    # `TEB->ThreadLocalStoragePointer[*AddressOfIndex]`. So `&threadvar` is
+    #     gs:[0x58]  →  [+ arkham.tlsindex.0 * 8]  →  + the tvar's offset
+    # and nothing has to run per thread. See `setupTlsWin`.
+    winTlsTemplate*: seq[byte]    # one thread's block as it starts out: `tlsOffset`
+                                  # bytes with every `tlsInits` literal baked in
+    winTlsIndexSym*: Symbol       # `arkham.tlsindex.0`, the 8-byte `.bss` cell the
+                                  # loader fills with this image's TLS index. Eight
+                                  # and not four so arkham can load it with an
+                                  # ordinary 64-bit `mov`: the loader writes only the
+                                  # low DWORD and the slot starts zeroed, so the high
+                                  # half stays 0 and the value needs no extension.
+    winTebTlsPtrSym*: Symbol      # `arkham.teb.tlsptr.0` — not a variable at all but
+                                  # the fixed TEB field `gs:0x58`, spelled as a tvar
+                                  # so the existing segment-operand path encodes it
+                                  # (`Symbol.gsFixedSlot`).
     entrySym*: Symbol             # the entry proc (`_start`/`main.0`) — prologue jumps here
     entryStubOffset*: int          # .text offset of the synthesized ELF entry stub, or -1.
                                   # x86-64: the FS-setup prologue (setupTls); AArch64:

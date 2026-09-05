@@ -112,6 +112,40 @@ when not defined(arkhamNoNarrowHomes):
 # regbind.nim / codegen_common.nim; these are the two doors the x86-64 emitter
 # uses them through.
 
+proc winTvarPtr(g: var CodeGen; loc: Location; what: string): Reg =
+  ## `&threadvar` in a staging register, typed `(ptr T)` so the `(mem p)` deref
+  ## carries the thread-local's PRECISE type (nifasm is strict — same reason the
+  ## `Glob` arms below type their address temp).
+  ##
+  ## Windows only, and unconditional there: a PE thread-local has no folded
+  ## segment form. The loader puts each thread's block where it likes and records
+  ## the address in the TEB, so every access materialises it (`emTvarAddr`).
+  ## nifasm REFUSES the `fs:[off]` operand on win_x64, so a site that forgets this
+  ## fails to assemble instead of reading an unrelated address.
+  var pSlot = ScalarSlot
+  if not cursorIsNil(loc.typ.typ):
+    pSlot = typeToSlot(g.prog.ptrTypeOf(loc.typ.typ))
+  result = g.pickStagingSealed(what, pSlot)
+  g.emTvarAddr(result, loc.name)
+  # `emTvarAddr` left it bound as a raw address (it does arithmetic on the way to
+  # the block); the deref below wants the thread-local's precise pointee type.
+  g.releaseStaleName(result)
+  g.bindTemp(result, pSlot)
+
+proc winTvarMov(g: var CodeGen; loc: Location; reg: Reg; load: bool) =
+  ## A thread-local GPR scalar access on Windows: address, then deref.
+  let p = g.winTvarPtr(loc, (if load: "a thread-local load address"
+                             else: "a thread-local store address"))
+  if load:
+    g.ab.tree MovX64:
+      g.emReg reg
+      g.ab.tree MemX: g.emReg p
+  else:
+    g.ab.tree MovX64:
+      g.ab.tree MemX: g.emReg p
+      g.emReg reg
+  g.giveBack p
+
 proc scalarMemMov(g: var CodeGen; loc: Location; reg: Reg; load: bool) =
   ## The one GPR scalar memory move over every lvalue kind, both directions:
   ## `load` → `reg ← <loc>`; else `<loc> ← reg`. Load and store are mirror images
@@ -124,10 +158,13 @@ proc scalarMemMov(g: var CodeGen; loc: Location; reg: Reg; load: bool) =
   case loc.kind
   of InReg:
     if load: g.movReg(reg, loc.r) else: g.movReg(loc.r, reg)
-  of Tvar:                                        # nifasm resolves a tvar to FS:[off]
-    g.ab.tree MovX64:
-      if load: (g.emReg reg; g.ab.sym loc.name)
-      else:    (g.ab.sym loc.name; g.emReg reg)
+  of Tvar:
+    if g.prog.windows:                            # no folded form — see `winTvarPtr`
+      g.winTvarMov(loc, reg, load)
+    else:                                         # nifasm resolves a tvar to FS:[off]
+      g.ab.tree MovX64:
+        if load: (g.emReg reg; g.ab.sym loc.name)
+        else:    (g.ab.sym loc.name; g.emReg reg)
   of Glob:
     if g.globalFoldsIntoAccess(loc.name):
       # The address folds INTO the access: one RIP-relative `mov` instead of an
@@ -243,11 +280,23 @@ proc floatMemMov(g: var CodeGen; loc: Location; reg: FReg; bits: int; load: bool
   of NamedStack:
     if load: g.emFloatScalarLoad(reg, loc.name, bits)
     else:    g.emFloatScalarStore(loc.name, reg, bits)
-  of Tvar:                                        # nifasm resolves a tvar to FS:[off]
+  of Tvar:
     let op = if bits == 32: MovssX64 else: MovsdX64
-    g.ab.tree op:
-      if load: (g.emFReg reg; g.ab.sym loc.name)
-      else:    (g.ab.sym loc.name; g.emFReg reg)
+    if g.prog.windows:                            # no folded form — see `winTvarPtr`
+      let p = g.winTvarPtr(loc, "a thread-local float address")
+      if load:
+        g.ab.tree op:
+          g.emFReg reg
+          g.ab.tree MemX: g.emReg p
+      else:
+        g.ab.tree op:
+          g.ab.tree MemX: g.emReg p
+          g.emFReg reg
+      g.giveBack p
+    else:                                         # nifasm resolves a tvar to FS:[off]
+      g.ab.tree op:
+        if load: (g.emFReg reg; g.ab.sym loc.name)
+        else:    (g.ab.sym loc.name; g.emFReg reg)
   of Glob:
     # &g into a typed staging GPR, then movss/movsd through it. The address temp is
     # `(ptr <floatType>)` so the `(mem p)` deref yields the float's precise width.
@@ -1800,10 +1849,13 @@ proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location) =
       v = regLoc(glbStaging, v.typ)
     assert v.kind == InReg, "arkham x64n: global store rhs " & $v.kind
     case dst.kind
-    of Tvar:                                             # nifasm resolves FS:[off]
-      g.ab.tree MovX64:
-        g.ab.sym dst.name
-        g.emReg v.r
+    of Tvar:
+      if g.prog.windows:                                 # no folded form
+        g.winTvarMov(dst, v.r, load = false)
+      else:                                              # nifasm resolves FS:[off]
+        g.ab.tree MovX64:
+          g.ab.sym dst.name
+          g.emReg v.r
     of Glob:                                             # &g into a transient, then store
       if g.globalFoldsIntoAccess(dst.name):
         g.ab.tree GstoreX64: (g.emReg v.r; g.ab.sym g.prog.gvarRefName(dst.name))

@@ -360,6 +360,38 @@ proc arkhamWinStdcallTests() =
          " (want 3 = fn-pointer call | OS thread callback)"
   echo "1 / 1 arkham win64 stdcall-callback tests successful"
 
+proc arkhamWinTlsTests() =
+  ## `{.threadvar.}` on win_x64. It used to be collected as an ORDINARY GLOBAL —
+  ## written down as a deliberate choice, on the premise that "the PE image is
+  ## single-threaded (the native backend spawns no threads)". `std/rawthreads`
+  ## calls `CreateThread`, so what the demotion really did was give every thread
+  ## ONE shared copy of every thread-local, silently: `threadpool.threadIdx`, the
+  ## current exception, and `system/memory.allocator` — one unlocked heap region
+  ## for all threads.
+  ##
+  ## `tests/win_tls.c.nif` scores three things and exits with the sum:
+  ##   1,2 — each of two threads writes its own value, spins long enough that the
+  ##         other has certainly written too, and reads it back;
+  ##   4   — the MAIN thread's value still stands after both have run. This one is
+  ##         not a race: with one shared cell a worker's write always clobbers it.
+  ## Pre-fix this scored 2 (one thread happened to run last); it wants 7.
+  if findExe("wine").len == 0:
+    echo "0 / 0 arkham win64 thread-local tests (wine not installed)"
+    return
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham" / "nimcache"
+  let asmNif = workDir / "win_tls.asm.nif"
+  let exe = workDir / "win_tls.exe"
+  exec quoteShell(arkham) & " -a:win_x64 -o:" & quoteShell(asmNif) & " " &
+       quoteShell("tests" / "win_tls.c.nif")
+  exec quoteShell(nifasm) & " -o:" & quoteShell(exe) & " " & quoteShell(asmNif)
+  let (_, code) = execCmdEx("wine " & quoteShell(exe) & " 2>/dev/null")
+  if code != 7:
+    quit "FAILURE arkham win64 thread-locals: exit code " & $code &
+         " (want 7 = threadA | threadB | main survived)"
+  echo "1 / 1 arkham win64 thread-local tests successful"
+
 proc buildToolchain() =
   ## `bin/arkham` and `bin/nifasm`, built ONCE and BEFORE anything that runs them.
   ##
@@ -2345,6 +2377,7 @@ when defined(linux) and defined(amd64):
   arkhamWinUnwindTests()
   arkhamWinTraceTableTests()
   arkhamWinStdcallTests()
+  arkhamWinTlsTests()
 
 # Additionally exercise the AArch64 backend on an x86-64 Linux host by emitting the
 # `linux_arm64` ELF variant and running it under qemu-aarch64 (no-op if qemu is
