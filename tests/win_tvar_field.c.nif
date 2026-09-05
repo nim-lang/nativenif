@@ -1,0 +1,48 @@
+(.nif27)
+(stmts
+ (type :Seqish.0 .
+  (object .
+   (fld :data.0 .
+    (ptr
+     (i 64)))
+   (fld :len.0 .
+    (i 64))))
+ (proc :ExitProcess.0
+  (params
+   (param :code.0 .
+    (u 32))).
+  (pragmas
+   (importc "ExitProcess")
+   (dynlib "kernel32"))
+  (stmts .))
+ (gvar :cell.0 .
+  (i 64)41)
+ (tvar :tv.0 . Seqish.0 .)
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (asgn
+    (dot tv.0 data.0)
+    (addr cell.0))
+   (var :p.0 .
+    (ptr
+     (i 64))
+    (dot tv.0 data.0))
+   (var :s.0 .
+    (i 64)0)
+   (if
+    (elif
+     (eq p.0
+      (nil))
+     (stmts
+      (asgn s.0 1)))
+    (else
+     (stmts
+      (asgn s.0
+       (deref p.0)))))
+   (call ExitProcess.0
+    (conv
+     (u 32)s.0)))))
