@@ -230,6 +230,16 @@ const Win64EntrySaved* = [RDI, RSI]
 
 const TlsBlockName* = "arkham.tls.0"
 const TlsSelfName* = "arkham.tls.self.0"
+const TlsIndexName* = "arkham.tlsindex.0"
+  ## Windows only. The nifasm-owned 8-byte global the LOADER fills with this
+  ## image's TLS slot number — the index into the per-thread block-pointer array
+  ## the TEB carries. See `emTvarAddr`; nifasm names its address in the PE TLS
+  ## directory (`AddressOfIndex`).
+const TebTlsPtrName* = "arkham.teb.tlsptr.0"
+  ## Windows only, and not a variable: the TEB field `gs:0x58`,
+  ## `ThreadLocalStoragePointer`, spelled as a nifasm-owned thread-local so the
+  ## assembler's segment-operand path encodes it. Reading it yields the head of
+  ## this thread's array of static-TLS block pointers.
   ## The thread-local at offset 0 of every thread's block, holding that block's own
   ## address. Reading it is how `&threadvar` finds THIS thread's storage — see
   ## `emTvarAddr`.

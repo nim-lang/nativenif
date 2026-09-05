@@ -224,6 +224,30 @@ proc emTvarAddr*(g: var CodeGen; dest: Reg; name: string) =
   ## environment threadvar): nifasm whole-program-links, so its lea offset resolver
   ## (`lookupWithAutoImport`) imports the foreign `(tvar …)` decl and allocates its FS
   ## offset in the SAME unified `arkham.tls.0` block. Local and foreign emit identically.
+  if g.prog.windows:
+    # Windows finds the block through the loader instead. A PE image's static
+    # thread-locals live in a block the loader COPIES from the `.tls` template for
+    # every thread it ever creates, and it leaves the copy's address in
+    #     TEB->ThreadLocalStoragePointer[ *arkham.tlsindex.0 ]
+    # with the TEB at GS and that array's head at `gs:0x58`. So there is no
+    # per-thread setup anywhere — a thread has its thread-locals before its first
+    # instruction — at the price of two loads to reach the block. Everything is
+    # staged through `dest` so this needs no scratch register, which is what lets
+    # it be called from inside an address computation that has already spent its
+    # staging budget. (See `nifasm/driver.setupTlsWin` for the other half.)
+    # `dest` carries a raw address while the block is being walked to: the two
+    # loads and the shift are integer arithmetic, and a `dest` still bound as
+    # `(ptr T)` would make nifasm reject the `shl`. The caller rebinds it to the
+    # pointer type it wants once the address is formed (`winTvarPtr`); both
+    # rebinds are zero machine code.
+    g.releaseStaleName(dest)
+    g.bindTemp(dest, AddrSlot)
+    g.ab.tree GloadX64: (g.emReg dest; g.ab.sym TlsIndexName)      # dest ← our TLS index
+    g.binImm(ShlX64, dest, 3)                                      # dest ← index * 8
+    g.ab.tree AddX64: (g.emReg dest; g.ab.sym TebTlsPtrName)       # dest += gs:[0x58]
+    g.ab.tree MovX64: (g.emReg dest; g.ab.tree MemX: g.emReg dest) # dest ← this thread's block
+    g.ab.tree LeaX64: (g.emReg dest; g.emReg dest; g.ab.sym name)  # dest += tvar offset
+    return
   g.ab.tree MovX64: (g.emReg dest; g.ab.sym TlsSelfName)         # dest ← FS:[0], this thread's block
   g.ab.tree LeaX64: (g.emReg dest; g.emReg dest; g.ab.sym name)  # dest += tvar FS offset
 

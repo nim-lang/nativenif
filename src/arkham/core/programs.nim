@@ -677,13 +677,16 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       if c.stmtKind in {GvarS, TvarS, ConstS}:
         let gStart = c
         var gc = c
-        # On Windows a thread-local is collected as an ORDINARY global: the PE image
-        # is single-threaded (the native backend spawns no threads) and Win64 has no
-        # counterpart to the FS-based `arkham.tls.0` block the Linux target points at
-        # — GS holds the TEB, whose layout nifasm does not model. Demoting it here
-        # (rather than at each use) is what keeps every downstream `scTvar` dispatch —
-        # `emTvarAddr`, the `Tvar` location arms, `genTvar` — off the Windows path.
-        let isTvar = c.stmtKind == TvarS and not windows
+        # A thread-local is a thread-local on every target, Windows included.
+        #
+        # It was collected as an ORDINARY GLOBAL here on the premise that "the PE
+        # image is single-threaded (the native backend spawns no threads)". That was
+        # never true — `std/rawthreads` calls `CreateThread` and `std/threadpool`
+        # spawns one worker per core — so what the demotion actually did was give
+        # every thread ONE shared copy of every thread-local, silently. Including
+        # `system/memory.allocator`, i.e. one unlocked heap region for all threads.
+        # See `x64/mem.emTvarAddr` for how Windows reaches the real per-thread block.
+        let isTvar = c.stmtKind == TvarS
         gc.into:
           let nm = symName(gc); inc gc
           if isTvar: result.tvars[nm] = gStart   # thread-local (macOS TLV)

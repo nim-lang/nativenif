@@ -303,8 +303,10 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
     result = Symbol(name: ctx.symIdOf(fullName), kind: skTvar, typ: typ, isForeign: true,
                     moduleName: modname)
     ctx.rootScope.define(result)
-    # x86-64 bakes a thread-local's FS displacement at every *reference* site (no
-    # relocation), so the offset must be fixed BEFORE the first reference. A
+    # x86-64 bakes a thread-local's displacement at every *reference* site (no
+    # relocation) — the FS displacement on Linux, the offset into the loader's
+    # per-thread block on Windows — so the offset must be fixed BEFORE the first
+    # reference. A
     # reference resolves the symbol through here first, so allocate the FS offset
     # eagerly now — exactly like the main-module tvar pre-pass — and mark it
     # generated so `generateSymbol` does not re-allocate (which would advance
@@ -315,7 +317,8 @@ proc resolveForeignSym(ctx: var GenContext; modname, fullName: string; scope: Sc
     # and the real offset into later ones — a size field then aliases what a pointer
     # field should be. (macOS/A64 relocates tvars through descriptors and allocates
     # lazily in `generateSymbol`, so leave that path untouched.)
-    if ctx.arch == Arch.X64 and ctx.nameOf(result.name) notin ctx.generatedSymbols:
+    if ctx.arch in {Arch.X64, Arch.WinX64} and
+       ctx.nameOf(result.name) notin ctx.generatedSymbols:
       allocTlsSlotX64(ctx, result, declStartCur)
       ctx.generatedSymbols.incl ctx.nameOf(result.name)
   of RodataD:

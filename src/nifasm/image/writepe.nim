@@ -118,5 +118,11 @@ proc writeExe*(a: var GenContext; outfile: string) =
   # `.pdata`/`.xdata` from the same per-proc facts the ELF path encodes as
   # `.eh_frame`. Win64 has no frame pointer either, so this is what lets the OS
   # unwind at all — a backtrace, and any future SEH, both hang off it.
+  # Windows thread-locals, if the image has any: the template one thread's block
+  # starts out as, plus where the loader is to write our TLS index (see
+  # `driver.setupTlsWin`). Empty on every other target, and on a Windows image
+  # with no thread-locals at all.
+  let tlsIndexOff = if a.winTlsIndexSym != nil: a.winTlsIndexSym.size else: -1
   writePE(a.buf, dataImage, a.bssOffset, entryOff, machine, outfile, dynlink,
-          absSites, patchAddrs, (if a.debugInfo: a.unwind else: @[]))
+          absSites, patchAddrs, (if a.debugInfo: a.unwind else: @[]),
+          a.winTlsTemplate, tlsIndexOff)
