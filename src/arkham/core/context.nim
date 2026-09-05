@@ -129,7 +129,15 @@ type
     retFloatBits*: int                       ## width (32/64) of the float return type
     rodata*: seq[(string, string)]           ## module-level string literals
     hasFrame*: bool                          ## current proc needs a stack frame
-    frameRegs*: seq[Reg]                     ## callee-saved GPRs to save (even count)
+    frameRegs*: seq[Reg]                     ## callee-saved GPRs the allocator handed out.
+                                             ## BlockFrame stores each at its own offset and
+                                             ## reads this directly; PairFrame pushes them in
+                                             ## pairs and reads `frameSaves` instead
+    frameSaves*: seq[Reg]                    ## PairFrame only: the registers the prologue
+                                             ## actually pushes, two per `stp`, in store
+                                             ## order — `frameRegs` plus lr, optionally fp,
+                                             ## and a pad register when the count is odd.
+                                             ## Empty for BlockFrame.
     frameFRegs*: seq[FReg]                   ## callee-saved SIMD regs to save (even count)
     framePad*: int                           ## x64: extra prologue `sub rsp` for 16-byte call alignment
     stackArgBaseReg*: Reg                     ## x64: callee-saved reg holding the incoming stack-args

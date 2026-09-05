@@ -94,13 +94,20 @@ proc framePopBlock(g: var CodeGen) =
   g.ab.tree AddA64: (g.ab.rawReg SP; g.ab.intLit g.framePushBytesBlock)
 
 proc framePush*(g: var CodeGen) =
-  ## `PairFrame`: push fp/lr, then the used callee-saved GPRs, then the
+  ## `PairFrame`: push the save list two registers at a time, then the
   ## callee-saved SIMD registers — a LIFO stack of pairs.
+  ##
+  ## `frameSaves` already decided what goes in it and in what order
+  ## (`computeFrameSaves`); the only thing this proc still knows is that the
+  ## frame pointer, when there is one, is established right after the pair that
+  ## saved it, which is always the first.
   if g.md.frameStyle == BlockFrame:
     g.framePushBlock()
     return
-  g.emPair(StpA64, g.md.framePtrReg, g.md.linkReg, -16)
-  if g.plan.hasStackParams:
+  var i = 0
+  while i < g.frameSaves.len:
+    g.emPair(StpA64, g.frameSaves[i], g.frameSaves[i+1], -16)
+    i += 2
     # Establish the AAPCS64 frame pointer, and with it the base for the incoming
     # stack arguments: the caller left SP pointing at its first stack argument, and
     # the `stp` above lowered SP by 16, so `fp = sp` here means argument `k` sits at
@@ -112,18 +119,18 @@ proc framePush*(g: var CodeGen) =
     # nothing. Reserving a callee-saved one instead cost exactly the procs that need
     # it — many parameters means high pressure — and pushed `nifcoreparse`'s
     # 11-parameter `emitValueIndexed` off the end of the register file.
-    g.ab.tree LeaA64: (g.ab.rawReg g.md.framePtrReg; g.ab.tree MemX: (g.ab.rawReg SP; g.ab.intLit 0))
-  var i = 0
-  while i < g.frameRegs.len:
-    g.emPair(StpA64, g.frameRegs[i], g.frameRegs[i+1], -16)
-    i += 2
+    #
+    # `computeFrameSaves` guarantees fp/lr IS the first pair whenever there are
+    # stack params, which is what makes "right after pair one" the right site.
+    if i == 2 and g.plan.hasStackParams:
+      g.ab.tree LeaA64: (g.ab.rawReg g.md.framePtrReg; g.ab.tree MemX: (g.ab.rawReg SP; g.ab.intLit 0))
   i = 0
   while i < g.frameFRegs.len:
     g.emFPair(FstpA64, g.frameFRegs[i], g.frameFRegs[i+1], -16)
     i += 2
 
 proc framePop*(g: var CodeGen) =
-  ## Restore in reverse (post-index): SIMD, then callee-saved GPRs, then fp/lr.
+  ## Restore in reverse (post-index): SIMD, then the save list back to front.
   if g.md.frameStyle == BlockFrame:
     g.framePopBlock()
     return
@@ -131,11 +138,10 @@ proc framePop*(g: var CodeGen) =
   while i >= 0:
     g.emFPair(FldpA64, g.frameFRegs[i], g.frameFRegs[i+1], 16)
     i -= 2
-  i = g.frameRegs.len - 2
+  i = g.frameSaves.len - 2
   while i >= 0:
-    g.emPair(LdpA64, g.frameRegs[i], g.frameRegs[i+1], 16)
+    g.emPair(LdpA64, g.frameSaves[i], g.frameSaves[i+1], 16)
     i -= 2
-  g.emPair(LdpA64, g.md.framePtrReg, g.md.linkReg, 16)
 
 proc killFrameRegLocals(g: var CodeGen) =
   ## Before an explicit-`ret` `framePop`, release any register-local bound to a
@@ -144,7 +150,8 @@ proc killFrameRegLocals(g: var CodeGen) =
   ## dropped so the trailing `exitScope` does not double-kill it. (A second `ret`
   ## on another path needing the same callee register bound is the pre-existing
   ## multi-`ret` limitation — out of scope here.)
-  for r in g.frameRegs:
+  for r in (if g.md.frameStyle == PairFrame: g.frameSaves else: g.frameRegs):
+    if r == g.md.linkReg or r == g.md.framePtrReg: continue   # never allocated, never bound
     let dead = g.rb.takeBinding(r)
     if dead.len > 0:
       g.ab.tree KillA64: g.ab.sym dead
@@ -155,7 +162,7 @@ proc framePushBytes(g: CodeGen): int =
   ## relative to SP right after the prologue's pushes (before locals are carved).
   if not g.hasFrame: 0
   elif g.md.frameStyle == BlockFrame: g.framePushBytesBlock
-  else: 16 * (1 + g.frameRegs.len div 2 + g.frameFRegs.len div 2)
+  else: 16 * (g.frameSaves.len div 2 + g.frameFRegs.len div 2)
 
 proc emByRefPtrStackVar*(g: var CodeGen; name: string; typeSym: SymId) =
   ## `(var :name (s) (ptr T))` — the 8-byte slot holding a spilled by-ref
@@ -262,18 +269,87 @@ proc exitScope*(g: var CodeGen) =
   for name in dead.fprs:
     g.ab.tree KillA64: g.ab.sym name
 
-proc computeFrame*(g: var CodeGen; hasCall: bool) =
-  g.frameRegs = @[]
-  for r in g.md.intCalleeSaved:
-    if r in g.plan.usedCallee: g.frameRegs.add r
-  if g.md.frameStyle == PairFrame and g.frameRegs.len mod 2 == 1:   # saved in PAIRS → pad
+proc computeFrameSaves(g: var CodeGen; hasCall: bool) =
+  ## The `PairFrame` save list: what the prologue pushes, two registers per
+  ## `stp`, in store order.
+  ##
+  ## The old shape opened every frame with `stp fp, lr, [sp, #-16]!` and paired
+  ## the callee-saved registers after it. That pair is only half earned: lr has
+  ## to be saved by anything that calls, but **fp is dead weight unless it is
+  ## being made a frame pointer** — which is only when the proc has stack
+  ## parameters. Measured on `nifbench`, 339 of 430 procs pushed x29 and never
+  ## established it, and an odd callee-saved count then took a filler word on top
+  ## of that: prologue+epilogue were 15.5% of all instructions retired, against
+  ## gcc's 9.2%. Letting the first real callee-saved register take x29's slot
+  ## removes one whole pair (an `stp` AND an `ldp`) from every proc with an odd
+  ## number of them, and the entire pair from a leaf that saves any.
+  ##
+  ## Two invariants make that safe, and both are why lr does not simply join the
+  ## end of the list:
+  ##
+  ## * **lr stays at CFA-8.** `cfiStep` puts a pair's second register there, so lr
+  ##   must be the second word of the FIRST push — exactly the slot `stp fp, lr`
+  ##   used to give it. `lib/std/stacktraces.nim` reads a frame's return address
+  ##   from `CFA - 8` with no per-proc indirection, so moving lr anywhere else
+  ##   turns a stack trace into plausible-looking garbage rather than an error.
+  ##   (That walker is `defined(amd64)`-only today; the invariant is free to keep
+  ##   and it is what an arm64 walk would need.)
+  ## * **fp/lr stays the first pair when there IS a frame pointer.** `framePush`
+  ##   points fp at SP right after pair one, and incoming stack arguments are
+  ##   addressed `[fp, #16 + off]` for the whole body.
+  ##
+  ## Darwin is left on the old shape outright: its ABI requires x29 to address a
+  ## valid frame record, and its unwinder walks that chain.
+  g.frameSaves = @[]
+  if g.md.frameStyle != PairFrame or not g.hasFrame: return
+  var first = 0                    # how many of `frameRegs` the head pair consumed
+  if g.plan.hasStackParams or not g.a64Linux:
+    g.frameSaves.add g.md.framePtrReg
+    g.frameSaves.add g.md.linkReg
+  elif hasCall:
+    # No frame pointer to establish, but lr must survive the call — and at CFA-8.
+    # The first word of that pair is a real callee-saved register when there is
+    # one, and x29 as a pure filler when there is not (it is in no allocation
+    # pool, so it can never be holding a live value).
+    if g.frameRegs.len > 0:
+      g.frameSaves.add g.frameRegs[0]
+      first = 1
+    else:
+      g.frameSaves.add g.md.framePtrReg
+    g.frameSaves.add g.md.linkReg
+  for i in first ..< g.frameRegs.len: g.frameSaves.add g.frameRegs[i]
+  if g.frameSaves.len mod 2 == 1:
     # The FILLER comes from the ABI list, not from `intCalleeSaved`: it is a slot
     # in an `stp`, not a home, so it need not be a register the allocator would
     # hand out — and under `-d:arkhamStress` the allocator's pool can be smaller
     # than the set already saved, leaving nothing to pad WITH and `framePush`
     # walking off the end of an odd-length list.
+    #
+    # The ABI list CAN run dry here, which it could not before lr joined the
+    # pairs: a proc that uses all ten callee-saved registers and calls something
+    # has an eleven-word list and no unused callee-saved register left to pad it
+    # with (`spill_produce`, `stress_staging`, `atomic_cas_operand_home` are
+    # exactly that shape). The frame pointer is the guaranteed last resort — it
+    # is in `ReservedRegs`, so no allocation pool can ever have handed it out, and
+    # in this branch it is not already in the list.
+    var filler = NoReg
     for r in g.md.abiCalleeSaved:
-      if r notin g.frameRegs: (g.frameRegs.add r; break)
+      if r notin g.frameSaves: (filler = r; break)
+    if filler == NoReg and g.md.framePtrReg notin g.frameSaves:
+      filler = g.md.framePtrReg
+    assert filler != NoReg, "arkham a64: no register left to pad the frame save list"
+    g.frameSaves.add filler
+  assert g.frameSaves.len mod 2 == 0
+
+proc computeFrame*(g: var CodeGen; hasCall: bool) =
+  g.frameRegs = @[]
+  for r in g.md.intCalleeSaved:
+    if r in g.plan.usedCallee: g.frameRegs.add r
+  # NO padding here for `PairFrame`: `frameRegs` is now the registers the
+  # allocator actually handed out, and the pair-parity that needs a filler is the
+  # SAVE LIST's, which also carries lr (and sometimes fp). `computeFrameSaves`
+  # pads that instead — pad here as well and every odd-length list would take two
+  # filler words instead of one.
   if g.isInterrupt:
     # A trap arrives on top of arbitrary code and NOTHING was stacked for it, so
     # what an ordinary proc may destroy freely is exactly what a handler may not.
@@ -299,6 +375,7 @@ proc computeFrame*(g: var CodeGen; hasCall: bool) =
     # is only true if that `sub sp, (ssize)` was actually emitted. Force it; when
     # the frame is empty it is a `sub sp, #0`.
     g.plan.hasStackVars = true
+  g.computeFrameSaves(hasCall)
 
 proc emIncomingArgBase(g: var CodeGen; dest: Reg) =
   ## `dest ← the SP the caller entered this proc with` — the base nifasm numbers
