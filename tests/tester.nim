@@ -392,6 +392,40 @@ proc arkhamWinTlsTests() =
          " (want 7 = threadA | threadB | main survived)"
   echo "1 / 1 arkham win64 thread-local tests successful"
 
+proc arkhamWinTvarFieldTests() =
+  ## Reading a FIELD of a thread-local aggregate on win_x64 — the half of `{.threadvar.}`
+  ## `win_tls` does not reach, and it scores 7 whether or not this works.
+  ##
+  ## Unlike the ELF arm, the PE block walk (`gload`/`shl`/`add`/`mov`/`lea`) is integer
+  ## arithmetic, so `emTvarAddr` has to retype the register it stages through. It used to
+  ## leave it retyped, and the register the caller handed in is usually one the allocator
+  ## already typed for the value it will HOLD. So the field load landed in a name still
+  ## declared `(i 64)`, and nifasm — which type-checks operands — refused the first use
+  ## that cared:
+  ##     (cmp `tmp3.0 (nil))   Operation 'cmp' requires compatible types, got (i 64) and nil
+  ## `tests/win_tvar_field.c.nif` is that shape at its smallest: a thread-local
+  ## `{data: ptr, len: int}`, its `data` read into a local, compared against `nil`, and
+  ## dereferenced. It exits 41 (the pointee) when the binding survives the walk, and does
+  ## not ASSEMBLE at all when it does not — which is how the real one presented, in
+  ## `std/cmdline.paramStr` (`ownArgv {.threadvar.}: seq[string]`), taking every
+  ## `nimony n -d:release` build on Windows down with it.
+  if findExe("wine").len == 0:
+    echo "0 / 0 arkham win64 thread-local field tests (wine not installed)"
+    return
+  let arkham = ("bin" / "arkham").addFileExt(ExeExt)
+  let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
+  let workDir = "tests" / "arkham" / "nimcache"
+  let asmNif = workDir / "win_tvar_field.asm.nif"
+  let exe = workDir / "win_tvar_field.exe"
+  exec quoteShell(arkham) & " -a:win_x64 -o:" & quoteShell(asmNif) & " " &
+       quoteShell("tests" / "win_tvar_field.c.nif")
+  exec quoteShell(nifasm) & " -o:" & quoteShell(exe) & " " & quoteShell(asmNif)
+  let (_, code) = execCmdEx("wine " & quoteShell(exe) & " 2>/dev/null")
+  if code != 41:
+    quit "FAILURE arkham win64 thread-local field: exit code " & $code &
+         " (want 41 = tv.data survived the block walk and derefed)"
+  echo "1 / 1 arkham win64 thread-local field tests successful"
+
 proc buildToolchain() =
   ## `bin/arkham` and `bin/nifasm`, built ONCE and BEFORE anything that runs them.
   ##
@@ -2378,6 +2412,7 @@ when defined(linux) and defined(amd64):
   arkhamWinTraceTableTests()
   arkhamWinStdcallTests()
   arkhamWinTlsTests()
+  arkhamWinTvarFieldTests()
 
 # Additionally exercise the AArch64 backend on an x86-64 Linux host by emitting the
 # `linux_arm64` ELF variant and running it under qemu-aarch64 (no-op if qemu is

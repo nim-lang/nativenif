@@ -126,11 +126,12 @@ proc winTvarPtr(g: var CodeGen; loc: Location; what: string): Reg =
   if not cursorIsNil(loc.typ.typ):
     pSlot = typeToSlot(g.prog.ptrTypeOf(loc.typ.typ))
   result = g.pickStagingSealed(what, pSlot)
+  # `pSlot` is what the deref below wants, and it is what comes back out:
+  # `emTvarAddr` stages its block walk through this register under a raw-address
+  # type, then restores the binding it was handed. This used to re-establish
+  # `pSlot` itself, which read as "only this caller needs it" — the site that
+  # forgot to is what #157 shipped with.
   g.emTvarAddr(result, loc.name)
-  # `emTvarAddr` left it bound as a raw address (it does arithmetic on the way to
-  # the block); the deref below wants the thread-local's precise pointee type.
-  g.releaseStaleName(result)
-  g.bindTemp(result, pSlot)
 
 proc winTvarMov(g: var CodeGen; loc: Location; reg: Reg; load: bool) =
   ## A thread-local GPR scalar access on Windows: address, then deref.

@@ -237,9 +237,33 @@ proc emTvarAddr*(g: var CodeGen; dest: Reg; name: string) =
     # staging budget. (See `nifasm/driver.setupTlsWin` for the other half.)
     # `dest` carries a raw address while the block is being walked to: the two
     # loads and the shift are integer arithmetic, and a `dest` still bound as
-    # `(ptr T)` would make nifasm reject the `shl`. The caller rebinds it to the
-    # pointer type it wants once the address is formed (`winTvarPtr`); both
-    # rebinds are zero machine code.
+    # `(ptr T)` would make nifasm reject the `shl`. So the staging RETYPES it —
+    # and then puts back whatever binding it found, because that is the contract
+    # the ELF arm below keeps for free (two instructions, no retype), and the one
+    # every caller is written against: the register handed in is already typed for
+    # the value it will HOLD, by the allocator or by the caller's own `bindTemp`.
+    # `prematLval2` says so out loud ("already bound by the caller").
+    #
+    # Leaving the staging type on it instead named the register `(i 64)` while it
+    # carried a pointer, and nifasm — which type-checks operands, not registers —
+    # rejected the first use that cared. On a thread-local `seq` that use is the
+    # emptiness test after the words are loaded back through the address:
+    #     (rebind :`tmp88.0 (i 64) (r12))    ← should still be `(aptr string)`
+    #     … gload/shl/add/mov/lea → r12 = &tvar …
+    #     (mov `tmp88.0 (mem (dot (cast (ptr seq…) `tmp88.0) data.0)))
+    #     (cmp `tmp88.0 (nil))               ← "requires compatible types"
+    # which is the shape `std/cmdline.paramStr` has on Windows (`ownArgv
+    # {.threadvar.}: seq[string]`) — so every `nimony n -d:release` build that
+    # reached it died, `tests/boot` included.
+    #
+    # All three rebinds are naming directives: zero machine code.
+    let heldTemp = g.rb.isBoundTemp(dest)
+    let heldSlot = (if heldTemp and g.tmpBindTyp.hasKey(dest): g.tmpBindTyp[dest]
+                    else: AddrSlot)
+    var heldLocal: seq[tuple[r: Reg, name: string]] = @[]
+    if not heldTemp:
+      let nm = g.rb.boundName(dest)
+      if nm.len > 0 and g.nameBindTyp.hasKey(nm): heldLocal.add (r: dest, name: nm)
     g.releaseStaleName(dest)
     g.bindTemp(dest, AddrSlot)
     g.ab.tree GloadX64: (g.emReg dest; g.ab.sym TlsIndexName)      # dest ← our TLS index
@@ -247,6 +271,9 @@ proc emTvarAddr*(g: var CodeGen; dest: Reg; name: string) =
     g.ab.tree AddX64: (g.emReg dest; g.ab.sym TebTlsPtrName)       # dest += gs:[0x58]
     g.ab.tree MovX64: (g.emReg dest; g.ab.tree MemX: g.emReg dest) # dest ← this thread's block
     g.ab.tree LeaX64: (g.emReg dest; g.emReg dest; g.ab.sym name)  # dest += tvar offset
+    g.releaseStaleName(dest)                                       # drop the staging name
+    if heldLocal.len > 0: g.restoreBindings(heldLocal)             # the allocator's local
+    else: g.bindTemp(dest, heldSlot)                               # the caller's staging type
     return
   g.ab.tree MovX64: (g.emReg dest; g.ab.sym TlsSelfName)         # dest ← FS:[0], this thread's block
   g.ab.tree LeaX64: (g.emReg dest; g.emReg dest; g.ab.sym name)  # dest += tvar FS offset
