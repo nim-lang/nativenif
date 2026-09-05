@@ -134,8 +134,14 @@ proc canCompare(t: Type): bool =
   ## bool is a 0/1 integer and `cmp reg, 0` is the canonical "if bool" test. This is
   ## deliberately SEPARATE from `canDoIntegerArithmetic` (which add/sub share and
   ## must stay strict — adding/subtracting bools is nonsense).
+  ##
+  ## `ProcT` is in for the same reason `PtrT` is, and it is not a theoretical case:
+  ## `if fn != nil` is how every hook, every lazily-bound extension pointer and
+  ## every optional callback is guarded. Leaving it out rejected the guard while
+  ## admitting the call it guards.
   t.kind in {TypeKind.IntT, TypeKind.UIntT, TypeKind.IntLitT,
-             TypeKind.PtrT, TypeKind.AptrT, TypeKind.RegisterT, TypeKind.BoolT,
+             TypeKind.PtrT, TypeKind.AptrT, TypeKind.ProcT,
+             TypeKind.RegisterT, TypeKind.BoolT,
              TypeKind.NilT}  # `cmp ptr, nil` / `cmp nil, ptr` null tests
 
 proc canDoBitwiseOps(t: Type): bool =

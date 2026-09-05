@@ -276,7 +276,11 @@ proc compatible*(want, got: Type): bool =
     # `cmp ptr, nil` / `mov ptr, nil`) and with itself, and adapts from a `0` literal
     # (a materialized nil register `mov nilReg, 0`). NEVER compatible with a sized
     # integer — that is the whole point: a `cmp i64reg, ptr` mixup stays an error.
-    result = got.kind in {NilT, PtrT, AptrT, IntLitT}
+    #
+    # A PROC is one of the pointers this admits. It is an address like any other,
+    # and `nil` is the value a proc-typed name holds before something assigns a
+    # real one — the ProcT arm below is the same rule read the other way round.
+    result = got.kind in {NilT, PtrT, AptrT, ProcT, IntLitT}
   of IntT, UIntT:
     # Same-WIDTH integers are interchangeable regardless of signedness: the bits are
     # identical, and every operation where signedness matters (idiv/div, sar/shr, the
@@ -334,7 +338,14 @@ proc compatible*(want, got: Type): bool =
     # StackOffT is compatible if the underlying types are compatible
     result = got.kind == StackOffT and compatible(want.offType, got.offType)
   of ProcT:
-    # ProcT compatibility: same number of params/results and compatible types
+    # `nil` is a legal proc value — the one every proc-typed variable starts out
+    # holding — so it is compatible with a proc type for the same reason it is
+    # with `(ptr T)`: it is an address, and the null one. Without this, an
+    # initialiser as ordinary as `var fn: SomeProc = nil` is a type error, and
+    # WHICH proc types it hit depended on whether the type resolved at all —
+    # so the same source built or did not build depending on its signature.
+    if got.kind == NilT: return true
+    # Otherwise: same number of params/results and compatible types.
     if got.kind != ProcT: return false
     if want.params.len != got.params.len: return false
     if want.results.len != got.results.len: return false

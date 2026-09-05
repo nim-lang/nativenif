@@ -1,0 +1,94 @@
+(.nif27)
+(stmts
+ (type :Hook.0 .
+  (proctype .
+   (params
+    (param :x.0 .
+     (i 64)))
+   (i 64).))
+ (type :Wide.0 .
+  (proctype .
+   (params
+    (param :a.0 .
+     (i 64))
+    (param :b.0 .
+     (i 64))
+    (param :c.0 .
+     (i 64))
+    (param :d.0 .
+     (i 64))
+    (param :e.0 .
+     (i 64))
+    (param :f.0 .
+     (i 64))
+    (param :g.0 .
+     (i 64)))
+   (i 64).))
+ (gvar :slot.0 . Hook.0
+  (nil))
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :twice.0
+  (params
+   (param :x.0 .
+    (i 64)))
+  (i 64).
+  (stmts
+   (ret
+    (add
+     (i 64)x.0 x.0))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :h.0 . Hook.0
+    (nil))
+   (var :w.0 . Wide.0
+    (nil))
+   (if
+    (elif
+     (neq h.0
+      (nil))
+     (stmts
+      (call exit.0 11))))
+   (if
+    (elif
+     (neq w.0
+      (nil))
+     (stmts
+      (call exit.0 12))))
+   (if
+    (elif
+     (neq slot.0
+      (nil))
+     (stmts
+      (call exit.0 13))))
+   (asgn h.0 twice.0)
+   (if
+    (elif
+     (eq h.0
+      (nil))
+     (stmts
+      (call exit.0 14))))
+   (if
+    (elif
+     (neq
+      (call h.0 20)40)
+     (stmts
+      (call exit.0 15))))
+   (asgn h.0
+    (nil))
+   (if
+    (elif
+     (neq h.0
+      (nil))
+     (stmts
+      (call exit.0 16))))
+   (call exit.0 42))))
