@@ -1,0 +1,45 @@
+(.nif27)
+(stmts@,1,tdata1.nim
+ (type :Str.0.tdata1 .
+  (object .
+   (fld :fullLen.0 .
+    (u 32))
+   (fld :rc.0 .
+    (ptr
+     (i 8)))
+   (fld :data.0 .
+    (flexarray
+     (c 8)))))
+ (type :Words.0.tdata1 .
+  (array
+   (i 32)3))
+ (type :Ptrs.0.tdata1 .
+  (array
+   (ptr
+    (i 8))2))
+ (const :strlit.0.HELLO. .
+  Str.0.tdata1
+  (oconstr Str.0.tdata1
+   (kv fullLen.0 14)
+   (kv data.0 "hello jorogumo")))
+ (const :words.0. .
+  Words.0.tdata1
+  (aconstr Words.0.tdata1 7 8 9))
+ (const :ptrs.0. .
+  Ptrs.0.tdata1
+  (aconstr Ptrs.0.tdata1 helper.0.
+   (nil)))
+ (gvar :guard.0. .
+  (bool).)
+ (gvar :wide.0. .
+  (i 64)4294967296)
+ (gvar :msg.0. .
+  (ptr
+   (c 8))
+  (addr strlit.0.HELLO.))
+ (proc :helper.0.
+  (params)
+  (i 32)
+  (pragmas)
+  (stmts
+   (ret 0))))
