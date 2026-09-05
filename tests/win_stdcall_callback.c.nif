@@ -1,0 +1,126 @@
+(.nif27)
+(stmts
+ (type :Cb.0 .
+  (proctype .
+   (params
+    (param :p.0 .
+     (ptr
+      (void))))
+   (u 32)
+   (pragmas
+    (stdcall))))
+ (proc :CreateThread.0
+  (params
+   (param :attrs.0 .
+    (ptr
+     (void)))
+   (param :stack.0 .
+    (u 64))
+   (param :start.0 . Cb.0)
+   (param :arg.0 .
+    (ptr
+     (void)))
+   (param :flags.0 .
+    (u 32))
+   (param :tid.0 .
+    (ptr
+     (u 32))))
+  (ptr
+   (void))
+  (pragmas
+   (importc "CreateThread")
+   (dynlib "kernel32"))
+  (stmts .))
+ (proc :WaitForSingleObject.0
+  (params
+   (param :h.0 .
+    (ptr
+     (void)))
+   (param :ms.0 .
+    (u 32)))
+  (u 32)
+  (pragmas
+   (importc "WaitForSingleObject")
+   (dynlib "kernel32"))
+  (stmts .))
+ (proc :ExitProcess.0
+  (params
+   (param :code.0 .
+    (u 32))).
+  (pragmas
+   (importc "ExitProcess")
+   (dynlib "kernel32"))
+  (stmts .))
+ (gvar :cell.0 .
+  (i 64)0)
+ (proc :worker.0
+  (params
+   (param :p.0 .
+    (ptr
+     (void))))
+  (u 32)
+  (pragmas
+   (stdcall))
+  (stmts
+   (var :q.0 .
+    (ptr
+     (i 64))
+    (cast
+     (ptr
+      (i 64))p.0))
+   (asgn
+    (deref q.0)
+    (add
+     (i 64)
+     (deref q.0)1))
+   (ret 0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :score.0 .
+    (i 64)0)
+   (var :local.0 .
+    (i 64)10)
+   (var :fp.0 . Cb.0 worker.0)
+   (var :r1.0 .
+    (u 32)
+    (call fp.0
+     (cast
+      (ptr
+       (void))
+      (addr local.0))))
+   (if
+    (elif
+     (eq local.0 11)
+     (stmts
+      (asgn score.0
+       (add
+        (i 64)score.0 1)))))
+   (var :tid.0 .
+    (u 32)0)
+   (var :h.0 .
+    (ptr
+     (void))
+    (call CreateThread.0
+     (nil)0 worker.0
+     (cast
+      (ptr
+       (void))
+      (addr cell.0))0
+     (addr tid.0)))
+   (var :w.0 .
+    (u 32)
+    (call WaitForSingleObject.0 h.0 5000))
+   (if
+    (elif
+     (eq cell.0 1)
+     (stmts
+      (asgn score.0
+       (add
+        (i 64)score.0 2)))))
+   (call ExitProcess.0
+    (conv
+     (u 32)score.0)))))

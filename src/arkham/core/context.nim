@@ -111,6 +111,13 @@ type
     plan*: Plan
     buf*: ptr TokenBuf
     md*: MachineDesc                         ## target register file + ABI
+    entryMd*: MachineDesc                    ## the convention THIS proc's parameters
+                                             ## arrive under — `md`, except in a Windows
+                                             ## `stdcall` proc definition the OS calls
+                                             ## into (x64 `win64EntryOf`). Set per proc.
+    win64Entry*: bool                        ## is this such a proc? Read where the
+                                             ## difference is not just the arrival
+                                             ## registers: the prologue owes rdi/rsi back.
     prog*: Program                           ## the whole program (cross-module type env)
     callTarget*: Table[string, CallTarget]
     globals*: Table[string, Cursor]          ## global var name → its decl cursor
@@ -489,7 +496,9 @@ proc newCodeGen*(buf: var TokenBuf; md: MachineDesc): CodeGen =
   ## `BodyLib` splices are keyed on — is set by the caller, because it IS the
   ## difference between the targets.
   checkMachine(md)
-  CodeGen(ab: initAsmBuf(), buf: addr buf, md: md)
+  # `entryMd` starts as `md`: a proc is entered the way arkham calls it unless a
+  # per-proc setup says otherwise, and every target but Windows/x64 always is.
+  CodeGen(ab: initAsmBuf(), buf: addr buf, md: md, entryMd: md)
 
 proc adoptProgram*(g: var CodeGen) =
   ## Read the loaded program model into the fields the emitter consults directly.

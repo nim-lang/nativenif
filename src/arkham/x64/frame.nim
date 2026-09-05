@@ -17,7 +17,7 @@
 import std / [assertions, tables, sets]
 import nifcore
 import "../core" / [asmslots, machinedesc, planer, programs, asmbuf,
-                    context, typeutil, 
+                    context, diag, typeutil,
                     mirrors, regbind, abi]
 import machine as machine_x64
 import emit, mem, aggr, value
@@ -259,7 +259,49 @@ proc numIncomingArgRegs(g: var CodeGen; decl: Cursor): int =
   inc c; inc c                                # head → name → params
   # Only register-passed integer/aggregate params (and the hidden result pointer)
   # occupy incoming GPRs; a stack-passed param consumes none, a float uses an xmm.
-  result = planCall(g.md, paramSlots(g.prog, c), g.retIndirect).gpUsed
+  result = planCall(g.entryMd, paramSlots(g.prog, c), g.retIndirect).gpUsed
+
+proc checkWin64EntryAbi*(g: var CodeGen; decl: Cursor) =
+  ## What `win64EntryOf` models is the Win64 boundary's INTEGER register half, and
+  ## no more. Everything else about that boundary is refused here rather than
+  ## guessed at, on the same principle `emitWinExtproc` refuses the mirror cases: a
+  ## callback whose arguments arrive somewhere other than where the body reads them
+  ## is a miscompile with no symptom anywhere near the code that caused it.
+  ##
+  ## * A FLOAT parameter. Win64 indexes its SSE argument registers positionally —
+  ##   an xmm slot burns the GPR of the same position — which `planCall` does not
+  ##   implement.
+  ## * An AGGREGATE parameter or result. Win64 passes an aggregate in a register
+  ##   only at size 1/2/4/8 and by reference otherwise, not by `planCall`'s
+  ##   `> threshold` rule.
+  ## * A FIFTH parameter. It arrives above the 32-byte shadow space; while
+  ##   `emitStackParamLoadsX64` does add that base on Windows, nothing has ever
+  ##   ENTERED a proc that way here, so it waits for a test rather than a guess.
+  ##
+  ## Reads the decl rather than `g.retIsFloat` & co. so it can run before the proc
+  ## is classified — an `{.assembler.}` body takes a different path through
+  ## `genProc` and never sets those.
+  const Lead = "a `{.stdcall.}` proc is entered under the Win64 ABI, "
+  var c = decl
+  inc c; inc c                                  # proc head → name → params slot
+  if c.kind == TagLit:                          # `(params (param …) …)`
+    let plan = planCall(g.entryMd, paramSlots(g.prog, c), retByRef = false)
+    for pl in plan.args:
+      if pl.isFloat:
+        lengError decl, Lead & "whose float argument registers arkham does not " &
+                  "model — this callback cannot take a float parameter", g.asmInfo
+      if pl.isAgg:
+        lengError decl, Lead & "whose aggregate passing rules arkham does not " &
+                  "model — this callback cannot take an object parameter", g.asmInfo
+    if plan.hasStackArgs:
+      lengError decl, Lead & "which passes only four arguments in registers — a " &
+                "fifth would arrive above the shadow space, which is untested",
+                g.asmInfo
+  skip c                                        # params → return type
+  if not retIsVoid(c):
+    if slotOf(g.prog, c).kind in {AFloat, AMem}:
+      lengError decl, Lead & "whose float/aggregate RETURN convention arkham does " &
+                "not model — this callback must return a scalar or nothing", g.asmInfo
 
 proc emitSignature*(g: var CodeGen; decl: Cursor) =
   ## Emit `(params …) (result …)? (clobber …)`. A FULL-signature proc (scalar /
@@ -274,9 +316,10 @@ proc emitSignature*(g: var CodeGen; decl: Cursor) =
     var c = decl
     c.into:
       inc c                                 # name → params slot
-      # arkham's own convention (`g.md`): this is a proc arkham GENERATES, so both
-      # sides of every call to it are its own — see `generateX64`.
-      discard g.emitParamsAndResult(c, byRef = false, g.md)  # types inline (concrete proc)
+      # `g.entryMd`: arkham's own convention for everything arkham generates — both
+      # sides of every call to it are its own (see `generateX64`) — and WINDOWS'
+      # for a `stdcall` definition, which the OS enters (see `isWin64AbiProc`).
+      discard g.emitParamsAndResult(c, byRef = false, g.entryMd)  # types inline (concrete proc)
       while c.hasMore: skip c               # pragmas, body
   else:
     g.ab.keyword ParamsD
@@ -292,8 +335,9 @@ proc emitSignature*(g: var CodeGen; decl: Cursor) =
     g.ab.tree ClobberD: discard
   else:
     # `numIncomingArgRegs` (not the param *count*) — it accounts for an aggregate
-    # spanning several GPRs and a float consuming none.
-    g.emitAbiClobber(g.numIncomingArgRegs(decl))
+    # spanning several GPRs and a float consuming none. The registers to spare are
+    # the ones this proc's params ARRIVE in, hence `entryMd`.
+    g.emitAbiClobber(g.numIncomingArgRegs(decl), g.entryMd)
 
 proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
   ## Settle each register-passed parameter into its allocated home. A param the
@@ -310,7 +354,7 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
   if c.kind != TagLit: return                 # no parameters
   # THE plan (see abi.nim): register indices / name ordinals below read it.
   # rdi = hidden result ptr for a >16B return; floats consume xmm0–7, not GPRs.
-  let plan = planCall(g.md, paramSlots(g.prog, c), g.retIndirect)
+  let plan = planCall(g.entryMd, paramSlots(g.prog, c), g.retIndirect)
   var pIdx = 0
   c.into:
     while c.hasMore:
@@ -334,7 +378,7 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
         # the `spilledByRefPtr` predicate: two answers to one question.
         g.varType[nm] = tn
         g.emByRefPtrStackVar(nm, tn)
-        let argReg = g.md.gprAt(pl)
+        let argReg = g.entryMd.gprAt(pl)
         g.ab.tree MovX64:
           g.emStackMem(nm)
           if declarative: g.ab.sym paramName(pl.ord) else: g.ab.rawReg argReg
@@ -344,14 +388,14 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
         # struct, filled from its GPR word(s).
         g.varType[nm] = tn
         g.emStackVar(nm, tn)
-        g.regsToStruct(nm, tn, g.md.intArgRegs[pl.gpFirst ..< pl.gpFirst + pl.words])
+        g.regsToStruct(nm, tn, g.entryMd.intArgRegs[pl.gpFirst ..< pl.gpFirst + pl.words])
       elif tn != NoTypeSym and loc.kind == InRegPair:
         # ≤16B by-value aggregate kept in GPRs (the ABI eightbytes ARE the fields).
         # Relocate each incoming arg word to its home; no stack copy.
         g.varType[nm] = tn
         for k in 0 ..< pl.words:
           let home = pairWord(loc, k)
-          let arg = g.md.gprAt(pl, k)
+          let arg = g.entryMd.gprAt(pl, k)
           if home != arg: g.movReg(home, arg)
           # A pair word is written RAW and read back RAW (`pairFieldReg` hands out
           # the bare register), so `rb` cannot see it and `isBound` answers "free".
@@ -367,12 +411,12 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
         # scalar; field accesses route through it (recorded in varType). A stack-
         # passed pointer (past the regs) is loaded by `emitStackParamLoadsX64`.
         g.varType[nm] = tn
-        g.movReg(loc.r, g.md.gprAt(pl))
+        g.movReg(loc.r, g.entryMd.gprAt(pl))
         # Give the pointer a NAME so every field access can address it by symbol
         # (`emPtrFieldMemSym` / the lvalue base) instead of naming the bare register.
         if arkhamNameAggrBase:
           g.emRegAggrPtrVar(nm, loc.r, tn)
-          if loc.r == g.md.gprAt(pl):
+          if loc.r == g.entryMd.gprAt(pl):
             # The pointer STAYED in its incoming argument register, which is
             # caller-saved. `allocParams` only allows that under `AllRegs` — the
             # analyser's proof that the param's last use precedes the FIRST call — so
@@ -395,16 +439,16 @@ proc emitParamMoves*(g: var CodeGen; decl: Cursor) =
         # Float parameter: in a leaf proc it stays in its incoming xmm{fpIndex}; if
         # the allocator gave it a (callee-saved-equivalent) home, move it there. SysV
         # has no callee-saved xmm, so a float crossing a call instead spills (next branch).
-        g.fmovF(loc.f, g.md.floatArgRegs[pl.fpIndex], loc.typ.size * 8)
+        g.fmovF(loc.f, g.entryMd.floatArgRegs[pl.fpIndex], loc.typ.size * 8)
       elif loc.kind == NamedStack and loc.typ.kind == AFloat:
         # An address-taken / spilled float param: declare its `(s) (f N)` slot and
         # spill the incoming xmm arg register into it so `addr`/loads/stores work.
         assert not pl.onStack, "arkham x64 v0: >8 float params (stack TODO)"
         let bits = loc.typ.size * 8
         g.emFloatStackVar(nm, bits)
-        g.emFloatScalarStore(nm, g.md.floatArgRegs[pl.fpIndex], bits)
+        g.emFloatScalarStore(nm, g.entryMd.floatArgRegs[pl.fpIndex], bits)
       elif not pl.onStack:                      # register-passed scalar parameter
-        let argReg = g.md.gprAt(pl)
+        let argReg = g.entryMd.gprAt(pl)
         if loc.kind == InReg and loc.r == argReg:
           if declarative:
             g.rb.bindParam(argReg, paramName(pl.ord)) # the signature binds it as `pN.0`
@@ -487,6 +531,16 @@ proc computeFrameX64*(g: var CodeGen; isEntry, hasCall: bool) =
     if r in g.plan.usedCallee: g.frameRegs.add r
   if g.stackArgBaseReg != NoReg:
     g.frameRegs.add g.stackArgBaseReg
+  if g.win64Entry:
+    # Win64's callee-saved set is SysV's PLUS rdi and rsi, and this proc's body was
+    # generated under SysV — where both are volatile: a call-free local's home, an
+    # outgoing argument register, the operands of the `rep movs` an aggregate copy
+    # lowers to. Unconditionally, not "when the allocator named them": the last of
+    # those three never goes through the allocator at all, so `usedCallee` cannot
+    # answer the question. Two pushes on a callback is not a cost worth a liveness
+    # analysis to avoid.
+    for r in Win64EntrySaved:
+      if r notin g.frameRegs: g.frameRegs.add r
   # Both ABIs require rsp ≡ 0 (mod 16) at a `call`. A normal callee is entered with
   # rsp ≡ 8 (the caller's pushed return address). The Linux ENTRY is the exception —
   # the kernel jumps to it with rsp ≡ 0 and no return address; the Windows entry is
@@ -590,7 +644,7 @@ proc emitStackParamLoadsX64*(g: var CodeGen; decl: Cursor) =
   # outgoing area (nifasm does this uniformly — see its `WinShadowSpace`), so the
   # incoming stack arguments start that far above the base.
   let argAreaBase = (if g.prog.windows: WinShadowSpace else: 0).int64
-  for i, pl in planCall(g.md, slots, g.retIndirect).args:
+  for i, pl in planCall(g.entryMd, slots, g.retIndirect).args:
     if not pl.onStack: continue
     let nm = nms[i]
     let off = argAreaBase + pl.byteOff.int64

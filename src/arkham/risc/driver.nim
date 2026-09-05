@@ -98,7 +98,7 @@ proc genProc2(g: var CodeGen; info: ProcInfo) =
   # `g.md`, not a constant: this emitter serves AArch64 AND Cortex-M, and handing
   # the allocator the wrong register file is not a compile error — it silently
   # assigns registers the target does not have.
-  g.plan = allocateProc(g.buf[], info.decl, an, g.prog, g.md, g.typeCtx, preseal)
+  g.plan = allocateProc(g.buf[], info.decl, an, g.prog, g.md, g.md, g.typeCtx, preseal)
   if g.retIndirect:
     g.indirectReg = indirectHome
     g.plan.usedCallee.incl indirectHome

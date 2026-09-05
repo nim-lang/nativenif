@@ -502,6 +502,28 @@ proc isForeignAbiProctype*(p: Program; c: Cursor): bool =
     if t.hasMore and hasStdcallPragma(t): return true
     while t.hasMore: skip t
 
+proc isWin64AbiProc*(p: Program; decl: Cursor): bool =
+  ## Does the OS call INTO this `(proc :name Params RetType Pragmas Body)`?
+  ##
+  ## The mirror of `isForeignAbiProctype`, and the half that was missing: that one
+  ## answers "arkham calls OUT through this pointer, so marshal Win64", this one
+  ## answers "something outside the image calls this proc, so RECEIVE Win64". A
+  ## `stdcall` proc DEFINITION is the only shape that can happen — `CreateThread`'s
+  ## start routine, a window procedure, any callback handed to the OS.
+  ##
+  ## Without it such a proc was generated like every other: its parameters read out
+  ## of arkham's own SysV arrival registers while Windows had put them in rcx/rdx/…
+  ## Nothing diagnosed that, because a proc definition and a proctype are different
+  ## nodes and only the latter was asked the question.
+  if not p.windows: return false
+  var c = decl
+  c.into:
+    inc c                                     # the proc's name
+    skip c                                    # params
+    skip c                                    # return type
+    if c.hasMore and hasStdcallPragma(c): return true
+    while c.hasMore: skip c
+
 const FullSigAggrByRefThreshold = 16
   ## The SysV/AAPCS64 by-value aggregate threshold (both targets use 16). Aggregates
   ## larger than this travel by reference. Kept here so `isDeclarativeAbi` (which has
@@ -797,7 +819,13 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           let asmN = if entry: "main.0" else: pname
           result.callTarget[pname] = CallTarget(asmName: asmN, extern: false,
                                                 retFloat: retFloat, retType: retType, sigType: sigType,
-                                                declarative: isDeclarativeAbi(result, procStart))
+                                                declarative: isDeclarativeAbi(result, procStart),
+                                                # A `stdcall` DEFINITION receives Windows'
+                                                # convention (`isWin64AbiProc`), so a call to
+                                                # it from inside the image must send that —
+                                                # the same flag an indirect call through a
+                                                # `stdcall` proctype already sets.
+                                                foreignAbi: isWin64AbiProc(result, procStart))
           result.procs.add ProcInfo(asmName: asmN, decl: procStart, isEntry: entry,
                                     isAsm: asmProc, isNaked: nakedProc, irqName: irqN)
       else:
@@ -948,7 +976,8 @@ proc foreignCallTarget*(p: var Program; name: string): CallTarget =
   else:
     result = CallTarget(asmName: name, extern: false, retFloat: retFloat,
                         retType: retType, sigType: sigType,
-                        declarative: isDeclarativeAbi(p, declCur))
+                        declarative: isDeclarativeAbi(p, declCur),
+                        foreignAbi: isWin64AbiProc(p, declCur))
 
 proc instrTargetOf*(p: var Program; name: string): InstrTarget =
   ## The row an `(instr SYM …)` names, resolving across modules. A same-module
