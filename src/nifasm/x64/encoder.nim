@@ -11,6 +11,17 @@ type
     R8 = 8, R9 = 9, R10 = 10, R11 = 11, R12 = 12, R13 = 13, R14 = 14, R15 = 15
 
   # Addressing modes for ModR/M byte
+  SegOverride* = enum
+    ## A legacy segment-override prefix. `segFs` is how the Linux/ELF target
+    ## reaches arkham's own thread-local block (`FS_base + disp32`); `segGs` is
+    ## how the Windows target reaches a FIXED field of the TEB — the loader's
+    ## `ThreadLocalStoragePointer` at `gs:0x58`, which is where a PE image's
+    ## static thread-locals are found. Both encode identically apart from the
+    ## prefix byte.
+    segNone = 0'u8
+    segFs = 0x64'u8
+    segGs = 0x65'u8
+
   AddressingMode* = enum
     amIndirect = 0b00,        # Indirect memory addressing
     amIndirectDisp8 = 0b01,   # Indirect with 8-bit displacement
@@ -27,7 +38,7 @@ type
     noBase*: bool        # `[index*scale + disp32]` with NO base register (SIB
                          # base=101 under mod=00). `base` must be left RAX so the
                          # emitters' REX.B-from-base computations stay silent.
-    useFsSegment*: bool  # Use FS segment register (for thread-local storage)
+    seg*: SegOverride    # segment-override prefix, if any (thread-local storage)
 
 # REX prefix encoding
 type RexPrefix* = object
@@ -62,19 +73,20 @@ proc encodeSIB(scale: int; index: int; base: int): byte =
   byte((scaleBits shl 6) or ((index and 0x07) shl 3) or (base and 0x07))
 
 proc emitSegPrefix(dest: var Bytes; mem: MemoryOperand) =
-  ## A legacy segment-override prefix (FS = 0x64, for thread-local storage) must
+  ## A legacy segment-override prefix (FS = 0x64 / GS = 0x65, for thread-local
+  ## storage) must
   ## precede the REX prefix and opcode, so it is emitted by the instruction
   ## encoder *before* anything else — NOT inside `emitMem` (which runs last, after
   ## REX+opcode are already in `dest`, where the prefix byte would be misplaced).
-  if mem.useFsSegment:
-    dest.add(0x64)  # FS segment override prefix
+  if mem.seg != segNone:
+    dest.add(byte(mem.seg))
 
 proc emitMem(dest: var Bytes; reg: int; mem: MemoryOperand) =
   # A segment-relative (thread-local) operand is displacement-only: the effective
-  # address is `FS_base + disp32`, with NO base/index register — otherwise a frame
+  # address is `SEG_base + disp32`, with NO base/index register — otherwise a frame
   # pointer or any GPR left in `mem.base` would corrupt the address. Encode it as
   # ModRM mod=00 rm=100 (SIB form) + SIB base=101/index=100 (neither) + disp32.
-  if mem.useFsSegment:
+  if mem.seg != segNone:
     dest.add(encodeModRM(amIndirect, reg, 0b100))   # mod=00, rm=100 → SIB follows
     dest.add(encodeSIB(1, 0b100, 0b101))            # index=none, base=none → [disp32]
     dest.addt32(mem.displacement)
@@ -2236,7 +2248,7 @@ proc emitLea*(dest: var Bytes; reg: Register; mem: MemoryOperand) =
   ## instruction count cannot see the difference; the wall clock can. (No FS
   ## override here: `fs:[0+off]` is a real address, and it always carries a
   ## displacement anyway.)
-  if not mem.hasIndex and mem.displacement == 0 and not mem.useFsSegment:
+  if not mem.hasIndex and mem.displacement == 0 and mem.seg == segNone:
     if reg != mem.base: emitMov(dest, reg, mem.base)
     return
   emitSegPrefix(dest, mem)

@@ -1,0 +1,155 @@
+(.nif27)
+(stmts
+ (type :Cb.0 .
+  (proctype .
+   (params
+    (param :p.0 .
+     (ptr
+      (void))))
+   (u 32)
+   (pragmas
+    (stdcall))))
+ (proc :CreateThread.0
+  (params
+   (param :attrs.0 .
+    (ptr
+     (void)))
+   (param :stack.0 .
+    (u 64))
+   (param :start.0 . Cb.0)
+   (param :arg.0 .
+    (ptr
+     (void)))
+   (param :flags.0 .
+    (u 32))
+   (param :tid.0 .
+    (ptr
+     (u 32))))
+  (ptr
+   (void))
+  (pragmas
+   (importc "CreateThread")
+   (dynlib "kernel32"))
+  (stmts .))
+ (proc :WaitForSingleObject.0
+  (params
+   (param :h.0 .
+    (ptr
+     (void)))
+   (param :ms.0 .
+    (u 32)))
+  (u 32)
+  (pragmas
+   (importc "WaitForSingleObject")
+   (dynlib "kernel32"))
+  (stmts .))
+ (proc :ExitProcess.0
+  (params
+   (param :code.0 .
+    (u 32))).
+  (pragmas
+   (importc "ExitProcess")
+   (dynlib "kernel32"))
+  (stmts .))
+ (tvar :tv.0 .
+  (i 64)0)
+ (gvar :spin.0 .
+  (i 64)0)
+ (gvar :cellA.0 .
+  (i 64)11)
+ (gvar :cellB.0 .
+  (i 64)22)
+ (proc :worker.0
+  (params
+   (param :p.0 .
+    (ptr
+     (void))))
+  (u 32)
+  (pragmas
+   (stdcall))
+  (stmts
+   (var :q.0 .
+    (ptr
+     (i 64))
+    (cast
+     (ptr
+      (i 64))p.0))
+   (asgn tv.0
+    (deref q.0))
+   (var :i.0 .
+    (i 64)0)
+   (while
+    (lt i.0 4000000)
+    (stmts
+     (asgn spin.0
+      (add
+       (i 64)spin.0 1))
+     (asgn i.0
+      (add
+       (i 64)i.0 1))))
+   (asgn
+    (deref q.0)tv.0)
+   (ret 0)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :score.0 .
+    (i 64)0)
+   (asgn tv.0 99)
+   (var :tidA.0 .
+    (u 32)0)
+   (var :tidB.0 .
+    (u 32)0)
+   (var :hA.0 .
+    (ptr
+     (void))
+    (call CreateThread.0
+     (nil)0 worker.0
+     (cast
+      (ptr
+       (void))
+      (addr cellA.0))0
+     (addr tidA.0)))
+   (var :hB.0 .
+    (ptr
+     (void))
+    (call CreateThread.0
+     (nil)0 worker.0
+     (cast
+      (ptr
+       (void))
+      (addr cellB.0))0
+     (addr tidB.0)))
+   (var :wA.0 .
+    (u 32)
+    (call WaitForSingleObject.0 hA.0 20000))
+   (var :wB.0 .
+    (u 32)
+    (call WaitForSingleObject.0 hB.0 20000))
+   (if
+    (elif
+     (eq cellA.0 11)
+     (stmts
+      (asgn score.0
+       (add
+        (i 64)score.0 1)))))
+   (if
+    (elif
+     (eq cellB.0 22)
+     (stmts
+      (asgn score.0
+       (add
+        (i 64)score.0 2)))))
+   (if
+    (elif
+     (eq tv.0 99)
+     (stmts
+      (asgn score.0
+       (add
+        (i 64)score.0 4)))))
+   (call ExitProcess.0
+    (conv
+     (u 32)score.0)))))

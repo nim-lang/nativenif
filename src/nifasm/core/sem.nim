@@ -123,6 +123,12 @@ type
     reg*: TagEnum     # For var/param in register (e.g. RaxTagId)
     offset*: int      # Stack offset, label position, or field offset
     size*: int        # For stack slots
+    gsFixedSlot*: bool ## skTvar only, Windows only: this is not a slot in a block
+                       ## nifasm lays out but a FIXED field of the TEB, reached
+                       ## through GS instead of FS. The one instance is
+                       ## `arkham.teb.tlsptr.0` = `gs:0x58`, the loader's
+                       ## `ThreadLocalStoragePointer`, which is where the PE
+                       ## static-TLS block for this thread is found.
     dataConst*: bool  # skRodata only: this `const` blob has symbol-pointer fields
                       # (`(reloc ...)`), so it must live in writable __DATA and be
                       # rebased by dyld at load (Mach-O). Plain consts stay in __TEXT.

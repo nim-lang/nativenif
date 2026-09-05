@@ -75,7 +75,7 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
       var baseIndex: x86.Register
       var baseScale = 1
       var baseHasIndex = false
-      var useFsSegment = false
+      var seg = segNone
       var fieldName: string
 
       # Check if first arg is a register (explicit stack addressing)
@@ -123,7 +123,7 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
             baseHasIndex = baseOp.mem.hasIndex
             baseIndex = baseOp.mem.index
             baseScale = baseOp.mem.scale
-            useFsSegment = baseOp.mem.useFsSegment
+            seg = baseOp.mem.seg
           else:
             baseReg = baseOp.reg
         elif baseOp.kind == okMem and baseOp.typ.kind in {TypeKind.ObjectT, TypeKind.UnionT}:
@@ -166,7 +166,7 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
         scale: baseScale,
         displacement: baseDisp + int32(fieldOffset),
         hasIndex: baseHasIndex,
-        useFsSegment: useFsSegment
+        seg: seg
       )
       result.typ = Type(kind: TypeKind.PtrT, base: fieldType)
 
@@ -752,16 +752,27 @@ proc parseOperand*(n: var Cursor; ctx: var GenContext): Operand =
       result.typ = Type(kind: UIntT, bits: 64) # Address of gvar
       inc n
     elif sym != nil and sym.kind == skTvar:
-      # Accessing thread local variable via FS segment
-      # On x86-64 Linux, TLS variables are accessed via FS segment
-      # The offset is stored in sym.offset (allocated in pass2)
-      # Use RBP as base register (standard for offset-only addressing)
+      # A thread-local reached through a segment register: `SEG:[sym.offset]`,
+      # with the offset allocated in pass2. That is arkham's own FS block on the
+      # ELF target; on Windows the only such symbol is the fixed TEB field
+      # `arkham.teb.tlsptr.0` (`gs:0x58`), because a PE image's thread-locals
+      # live in a loader-allocated block reached THROUGH that field rather than
+      # at a fixed segment displacement — see `gsFixedSlot`.
+      # RBP as the base is what selects displacement-only addressing.
+      if ctx.arch == Arch.WinX64 and not sym.gsFixedSlot:
+        # A PE thread-local is NOT at a fixed segment displacement: the loader puts
+        # each thread's block wherever it likes and records the address in the TEB,
+        # so the producer has to walk there (arkham's `emTvarAddr`) and deref the
+        # pointer it gets. Encoding this as `fs:[off]` would read an unrelated
+        # address, silently — so it is refused instead of assembled.
+        error("thread-local '" & ctx.nameOf(sym.name) &
+              "' needs an address-then-deref on win_x64, not a segment operand", n)
       result.kind = okMem
       result.mem = x86.MemoryOperand(
         base: x86.RBP,  # RBP allows displacement-only addressing
         displacement: int32(sym.offset),
         hasIndex: false,
-        useFsSegment: true  # Use FS segment register
+        seg: (if sym.gsFixedSlot: x86.segGs else: x86.segFs)
       )
       result.typ = sym.typ
       inc n
@@ -880,13 +891,17 @@ proc parseDest*(n: var Cursor; ctx: var GenContext;
          error("Variable has no location", n)
        inc n
     elif sym != nil and sym.kind == skTvar:
-       # Writing to thread local variable via FS segment
+       # A thread-local written through a segment register — see the read side for
+       # what `gsFixedSlot` selects and why win_x64 refuses the plain form.
+       if ctx.arch == Arch.WinX64 and not sym.gsFixedSlot:
+         error("thread-local '" & ctx.nameOf(sym.name) &
+               "' needs an address-then-deref on win_x64, not a segment operand", n)
        result.kind = okMem
        result.mem = x86.MemoryOperand(
          base: RBP,  # RBP allows displacement-only addressing
          displacement: int32(sym.offset),
          hasIndex: false,
-         useFsSegment: true  # Use FS segment register
+         seg: (if sym.gsFixedSlot: x86.segGs else: x86.segFs)
        )
        result.typ = sym.typ
        inc n

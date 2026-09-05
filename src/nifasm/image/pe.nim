@@ -370,7 +370,9 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
               dynlink: DynLinkInfo = DynLinkInfo();
               absSites: seq[AbsSite] = @[];
               patch: PePatchProc = nil;
-              unwind: seq[ProcUnwind] = @[]) =
+              unwind: seq[ProcUnwind] = @[];
+              tlsTemplate: seq[byte] = @[];
+              tlsIndexDataOff: int = -1) =
   ## Write a PE executable file.
   ##
   ## `dataImage` is the writable data section's initial contents (`bssSize` bytes; a
@@ -379,6 +381,13 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
   ## into `code`/`dataImage` (globals' RIP-relative `lea` displacements, absolute
   ## function pointers). `absSites` lists the absolute 8-byte fields it writes, so
   ## they can be listed in `.reloc` and survive ASLR.
+  ##
+  ## `tlsTemplate`, when non-empty, is one thread's thread-local block as it starts
+  ## out; it gets a `.tls` section and an `IMAGE_TLS_DIRECTORY64`, and the loader
+  ## then copies it for every thread the process creates — `CreateThread`'d ones
+  ## included — recording the copy's address in
+  ## `TEB->ThreadLocalStoragePointer[*AddressOfIndex]`. `tlsIndexDataOff` is the
+  ## byte offset in `dataImage` of the 8-byte cell that index is written into.
   let hasExtProcs = dynlink.extProcs.len > 0
   let dataSize = uint32(bssSize)
   let hasData = dataSize > 0
@@ -410,11 +419,17 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
   # Calculate number of sections. Every `inc` here MUST have a matching section
   # header written below — a count that overshoots makes the loader read the padding
   # after the real headers as one more section descriptor.
+  # `.tls` sits BEFORE `.reloc` on purpose: the four absolute VAs in its directory
+  # need relocation entries, so its RVA has to be settled before the reloc table is
+  # built. Placed after `.reloc` the two would define each other.
+  let hasTls = tlsTemplate.len > 0 and tlsIndexDataOff >= 0
   var numSections = 1'u16  # .text
   if hasExtProcs:
     inc numSections  # .idata for imports
   if hasData:
     inc numSections  # .data: globals (zero-filled unless statically initialized)
+  if hasTls:
+    inc numSections  # .tls: one thread's block template, plus its directory
   inc numSections  # .reloc for ASLR support
   # `.pdata`: the x64 function table plus the `UNWIND_INFO` blobs it points at.
   # One section for both — the exception directory addresses the table by RVA and
@@ -597,6 +612,23 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
     if dataImage.len < bssSize: dataImage.setLen bssSize      # the rest is zero-filled
     elif dataImage.len > bssSize: dataImage.setLen bssSize
 
+  # `.tls`, whose RVA the reloc table below needs. The section holds the DIRECTORY
+  # first (the loader reads it there), then the one-entry NULL callback array it
+  # has to name, then the template the loader copies per thread:
+  #     0x00  IMAGE_TLS_DIRECTORY64            (40 bytes)
+  #     0x28  a single NULL callback pointer   (8 bytes)
+  #     0x40  the template                     (`tlsTemplate.len` bytes)
+  const TlsDirSize = 40'u32
+  const TlsCallbacksOff = 40'u32
+  const TlsTemplateOff = 64'u32
+  var tlsRva = 0'u32
+  var tlsSize = 0'u32
+  if hasTls:
+    tlsRva = if hasData: alignTo(dataRva + dataSize, SECTION_ALIGNMENT)
+             elif hasExtProcs: alignTo(idataRva + idataSize, SECTION_ALIGNMENT)
+             else: alignTo(textRva + textSize, SECTION_ALIGNMENT)
+    tlsSize = TlsTemplateOff + uint32(tlsTemplate.len)
+
   # The layout is settled: let the caller bake its addresses in before anything is
   # written. Everything else nifasm emits is RIP-relative and needed no layout.
   if patch != nil:
@@ -611,11 +643,17 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
   var relocBytes: seq[byte] = @[]
   block:
     var byPage = initOrderedTable[uint32, seq[uint16]]()
-    for s in absSites:
-      let rva = (if s.inData: dataRva else: textRva) + uint32(s.pos)
+    template noteAbs(rva: uint32) =
       let page = rva and not (SECTION_ALIGNMENT - 1)
       byPage.mgetOrPut(page, @[]).add uint16((IMAGE_REL_BASED_DIR64 shl 12) or
                                              uint16(rva - page))
+    for s in absSites:
+      noteAbs((if s.inData: dataRva else: textRva) + uint32(s.pos))
+    if hasTls:
+      # The directory's first four fields are absolute VAs, not RVAs — the one
+      # place in a PE where that is so, and the reason `.tls` needs entries here
+      # at all. Start/End of the template, the index cell, the callback array.
+      for i in 0'u32 ..< 4'u32: noteAbs(tlsRva + i * 8)
     if byPage.len == 0:
       # No absolute fields at all — emit the one empty block the loader tolerates,
       # so the directory is still valid.
@@ -640,6 +678,8 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
     sizeOfImage = idataRva + alignTo(idataSize, SECTION_ALIGNMENT)
   if hasData:
     sizeOfImage = dataRva + alignTo(dataSize, SECTION_ALIGNMENT)
+  if hasTls:
+    sizeOfImage = tlsRva + alignTo(tlsSize, SECTION_ALIGNMENT)
   # Add .reloc section to image size
   let relocRva = sizeOfImage
   sizeOfImage = relocRva + alignTo(relocSize, SECTION_ALIGNMENT)
@@ -684,6 +724,10 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
     optHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size = idataSize
     optHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].VirtualAddress = iatRva
     optHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].Size = iatSize
+
+  if hasTls:
+    optHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress = tlsRva
+    optHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size = TlsDirSize
 
   # Set base relocation directory
   optHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress = relocRva
@@ -738,12 +782,51 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
       IMAGE_SCN_CNT_INITIALIZED_DATA or IMAGE_SCN_MEM_READ or IMAGE_SCN_MEM_WRITE
     )
 
-  # .reloc section (comes after .data / .idata / .text)
+  # .tls section: the directory, the NULL callback array, then the template.
+  var tlsSection: IMAGE_SECTION_HEADER
+  var tlsFileOffset = 0'u32
+  var tlsRawSize = 0'u32
+  var tlsBytes: seq[byte] = @[]
+  if hasTls:
+    tlsFileOffset = if hasData: dataFileOffset + dataRawSize
+                    elif hasExtProcs: idataFileOffset + idataRawSize
+                    else: textFileOffset + textRawSize
+    tlsBytes = newSeq[byte](tlsSize)
+    let base = DEFAULT_IMAGE_BASE
+    template putQ(at: uint32; v: uint64) =
+      for i in 0 ..< 8: tlsBytes[int(at) + i] = byte((v shr (8 * i)) and 0xFF)
+    # StartAddressOfRawData / EndAddressOfRawData delimit the template; the loader
+    # copies exactly those bytes and then zero-fills `SizeOfZeroFill` more (we bake
+    # every initializer into the template instead, so that stays 0).
+    putQ(0, base + uint64(tlsRva + TlsTemplateOff))
+    putQ(8, base + uint64(tlsRva + TlsTemplateOff) + uint64(tlsTemplate.len))
+    # AddressOfIndex: the cell in `.data` the loader writes this image's TLS slot
+    # number into — the index arkham uses against `gs:[0x58]`.
+    putQ(16, base + uint64(dataRva) + uint64(tlsIndexDataOff))
+    # AddressOfCallBacks must name a NULL-terminated array even when there are no
+    # callbacks, so it points at the eight zero bytes reserved above.
+    putQ(24, base + uint64(tlsRva + TlsCallbacksOff))
+    # SizeOfZeroFill (at 32) and Characteristics (at 36) both stay 0.
+    for i in 0 ..< tlsTemplate.len:
+      tlsBytes[int(TlsTemplateOff) + i] = tlsTemplate[i]
+    tlsRawSize = alignTo(tlsSize, FILE_ALIGNMENT)
+    tlsSection = initSectionHeader(
+      ".tls",
+      tlsSize,
+      tlsRva,
+      tlsRawSize,
+      tlsFileOffset,
+      IMAGE_SCN_CNT_INITIALIZED_DATA or IMAGE_SCN_MEM_READ or IMAGE_SCN_MEM_WRITE
+    )
+
+  # .reloc section (comes after .tls / .data / .idata / .text)
   var relocFileOffset = textFileOffset + textRawSize
   if hasExtProcs:
     relocFileOffset = idataFileOffset + idataRawSize
   if hasData:
     relocFileOffset = dataFileOffset + dataRawSize
+  if hasTls:
+    relocFileOffset = tlsFileOffset + tlsRawSize
   var relocSection = initSectionHeader(
     ".reloc",
     relocSize,
@@ -796,6 +879,8 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
     f.writeData(unsafeAddr idataSection, sizeof(idataSection))
   if hasData:
     f.writeData(unsafeAddr dataSection, sizeof(dataSection))
+  if hasTls:
+    f.writeData(unsafeAddr tlsSection, sizeof(tlsSection))
   f.writeData(unsafeAddr relocSection, sizeof(relocSection))
   if hasPdata:
     f.writeData(unsafeAddr pdataSection, sizeof(pdataSection))
@@ -865,6 +950,14 @@ proc writePE*(code: var Buffer; dataImage: var seq[byte]; bssSize: int;
     if dataPadding > 0:
       var zeros = newSeq[byte](dataPadding)
       f.writeData(unsafeAddr zeros[0], dataPadding)
+
+  # .tls section: directory, NULL callback array, template
+  if hasTls:
+    f.writeData(unsafeAddr tlsBytes[0], tlsBytes.len)
+    let tlsPadding = int(tlsRawSize) - tlsBytes.len
+    if tlsPadding > 0:
+      var zeros = newSeq[byte](tlsPadding)
+      f.writeData(unsafeAddr zeros[0], tlsPadding)
 
   # .reloc section
   f.writeData(unsafeAddr relocBytes[0], relocBytes.len)

@@ -316,6 +316,33 @@ proc setupTls(ctx: var GenContext) =
                                                        scale: 8, displacement: 8'i32, hasIndex: true))  # rdx = &envp[0]
   x86.emitJmp(ctx.buf, LabelId(ctx.entrySym.offset))        # → real entry
 
+proc setupTlsWin(ctx: var GenContext) =
+  ## Windows thread-locals. Where `setupTls` reserves one `.bss` block and points
+  ## FS at it per thread, this hands the whole job to the loader: `.tls` carries a
+  ## TEMPLATE of one thread's block, and the loader copies it for every thread the
+  ## process ever creates — `CreateThread`'d ones included — leaving a pointer to
+  ## that copy in `TEB->ThreadLocalStoragePointer[*AddressOfIndex]`. So there is no
+  ## entry prologue here and no per-thread hook anywhere: a thread has its
+  ## thread-locals before it runs its first instruction.
+  ##
+  ## The tvar offsets themselves are the ones `allocTlsSlotX64` already handed out;
+  ## the template is indexed by exactly those, so `arkham.tls.self.0` still owns
+  ## offset 0 (unused here — Windows finds the block through the TEB, not through a
+  ## self-pointer) and every real tvar sits where its `lea` says it does.
+  if ctx.arch != Arch.WinX64 or ctx.tlsOffset == 0: return
+  if ctx.winTlsIndexSym == nil: return
+  ctx.winTlsTemplate = newSeq[byte]((ctx.tlsOffset + 15) and not 15)
+  for it in ctx.tlsInits:
+    for i in 0 ..< it.size:
+      let at = it.off.int + i
+      if at < ctx.winTlsTemplate.len:
+        ctx.winTlsTemplate[at] = byte((it.val shr (8 * i)) and 0xFF)
+  # The index cell is an ordinary writable global; the loader fills it before any
+  # of our code runs. 8-byte aligned so arkham's 64-bit load of it is aligned.
+  ctx.bssOffset = (ctx.bssOffset + 7) and not 7
+  ctx.winTlsIndexSym.size = ctx.bssOffset
+  ctx.bssOffset += TlsIndexCellBytes
+
 proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
                listing = ""; debugInfo = true;
                memMap = elf32.defaultMemoryMap()) =
@@ -380,6 +407,28 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
   scope.define(ctx.tlsSelfSym)
   ctx.generatedSymbols.incl TlsSelfSymbol
 
+  # The Windows pair. Both are defined unconditionally — the architecture is only
+  # known after `pass1` reads the `(arch …)` directive, and both are inert off
+  # Windows: being generated symbols they are skipped by the tvar offset
+  # allocation below, and nothing but arkham's PE path ever references them.
+  #
+  # `arkham.teb.tlsptr.0` is not a variable. It is the TEB field at `gs:0x58`
+  # spelled as a thread-local so the segment-operand path encodes it, with
+  # `gsFixedSlot` telling that path to use GS and to read `offset` as the TEB
+  # displacement rather than a slot in a block nifasm laid out.
+  ctx.winTebTlsPtrSym = Symbol(name: ctx.symIdOf(TebTlsPtrSymbol), kind: skTvar,
+                               typ: Type(kind: UIntT, bits: 64),
+                               offset: TebTlsPtrOffset, gsFixedSlot: true)
+  scope.define(ctx.winTebTlsPtrSym)
+  ctx.generatedSymbols.incl TebTlsPtrSymbol
+  # `arkham.tlsindex.0` is an ordinary `.bss` global; `setupTlsWin` gives it its
+  # slot once the layout is settled, and the PE TLS directory names its address.
+  ctx.winTlsIndexSym = Symbol(name: ctx.symIdOf(TlsIndexSymbol), kind: skGvar,
+                              typ: Type(kind: UIntT, bits: 64),
+                              size: -1, offset: -1)
+  scope.define(ctx.winTlsIndexSym)
+  ctx.generatedSymbols.incl TlsIndexSymbol
+
   var n1 = beginRead(ctx.modules[MainModuleName].buf)
   pass1(n1, scope, ctx, MainModuleName, ctx.modules[MainModuleName].buf)
 
@@ -388,7 +437,7 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
   # offset must be fixed before any code is generated — otherwise a reference
   # compiled before the tvar's lazy `generateSymbol` would capture the default 0.
   # (macOS/A64 resolves tvars through relocated descriptors and allocates lazily.)
-  if ctx.arch == Arch.X64:
+  if ctx.arch in {Arch.X64, Arch.WinX64}:
     var tn = beginRead(ctx.modules[MainModuleName].buf)
     if tn.kind == TagLit and tn.tag == StmtsTagId:
       loopInto tn:
@@ -426,6 +475,7 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
   appendTraceTable(ctx)
   appendTlsSize(ctx)
   setupTls(ctx)
+  setupTlsWin(ctx)
   setupWinEntry(ctx)
   setupLinuxA64Entry(ctx)
 

@@ -71,6 +71,24 @@ const
     ## nifasm owns the symbol; the entry prologue fills it for the main thread and
     ## whoever creates a thread fills that thread's.
   TlsSelfSlotBytes* = 8
+  TlsIndexSymbol* = "arkham.tlsindex.0"
+    ## Windows only. The 8-byte `.bss` cell whose address the PE TLS directory
+    ## names as `AddressOfIndex`; the loader writes this image's TLS slot number
+    ## into it before any of our code runs. arkham reads it to find the block:
+    ## `gs:[0x58]` is an ARRAY of per-thread block pointers, one per module with
+    ## static TLS, and this is our index into it.
+    ##
+    ## Eight bytes for a DWORD so an ordinary 64-bit `mov` can load it: the cell
+    ## starts zeroed and the loader writes only the low half, so the high half
+    ## stays zero and no zero-extension is needed.
+  TlsIndexCellBytes* = 8
+  TebTlsPtrSymbol* = "arkham.teb.tlsptr.0"
+    ## Windows only, and not a variable: the fixed TEB field at `gs:0x58`,
+    ## `ThreadLocalStoragePointer`. It is spelled as a thread-local so the
+    ## existing segment-operand path encodes it, and marked `gsFixedSlot` so that
+    ## path picks GS and treats the offset as the TEB displacement rather than a
+    ## slot in a block nifasm laid out.
+  TebTlsPtrOffset* = 0x58
 
 type
   TraceProc* = object

@@ -61,12 +61,10 @@ proc lookupSym*(tc: TypeCtx; nm: string): SymInfo =
     case d.stmtKind
     of ProcS: return SymInfo(cat: scProc, asmName: nm)   # foreign proc: its fully-qualified NIF name
     of TvarS:
-      # A FOREIGN thread-local must be classified exactly as its OWNING module
-      # classified its own — and on Windows `collect` demotes every thread-local to
-      # an ordinary global, so that module emitted a `(gvar …)` for it. Reading it
-      # back as a thread-local here would address it through an FS block the target
-      # does not have, against a symbol nifasm knows as a global.
-      if tc.prog[].windows: return SymInfo(cat: scGlobal, decl: d)
+      # A FOREIGN thread-local is classified exactly as its OWNING module
+      # classified its own, on every target: `collect` emits a `(tvar …)`
+      # everywhere now, so reading one back as a global here would address the
+      # main thread's copy — the very bug the Windows demotion used to cause.
       return SymInfo(cat: scTvar, decl: d)
     else: return SymInfo(cat: scGlobal, decl: d)
 
