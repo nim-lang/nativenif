@@ -78,6 +78,12 @@ proc aggrWordsToFromRegs(g: var CodeGen; varName: string; typeSym: SymId;
   ## `loadAggrTail` / `storeAggrTail`: exact bytes, no over-read, no over-write.
   g.bridgeStep("an aggregate marshalled word by word", bdTwoInRegs)
   let byteSize = aggrByteSize(g.prog, typeSym)
+  # The ABI words are read/written RAW below. They are argument registers, and the
+  # allocator homes call-free locals in those, so drop any name still bound to one:
+  # it is a dead local's (this transfer is either a call's marshalling or its result)
+  # and `emReg` would spell the ABI word under it. `varName`'s own binding stays —
+  # an `InRegPair` aggregate whose home IS this span reads through it.
+  g.releaseArgSpan(firstArg, aggrWordCount(g.prog, typeSym), varName)
   let loc = g.plan.homeOfSym(varName)
   if loc.kind == InRegPair:
     # The aggregate IS the word registers — no memory round-trip.
@@ -131,6 +137,7 @@ proc globalToRegs*(g: var CodeGen; name: string; typeSym: SymId; firstArg: int; 
   ## through that pointer — a FULL eightbyte as a raw `(u 64)` word (handles packed
   ## fields), a trailing PARTIAL eightbyte through `loadAggrTail`. For a global passed
   ## by value as a call argument (`equalStrings(s, "")` where `s` is a global `string`).
+  g.releaseArgSpan(firstArg, aggrWordCount(g.prog, typeSym), name)   # see `aggrWordsToFromRegs`
   let bridge = g.takeBridge()
   if isTvar: g.genTlvAddr(name, bridge) else: g.emGlobalAddr(bridge, name)
   let byteSize = aggrByteSize(g.prog, typeSym)
@@ -217,6 +224,7 @@ proc regsToStructThroughPtr*(g: var CodeGen; ptrReg: Reg; typeSym: SymId; firstA
   ## (handles packed fields), a trailing PARTIAL eightbyte through `storeAggrTail`. The
   ## through-pointer twin of `regsToStruct` — stores an aggregate call result into a
   ## global.
+  g.releaseArgSpan(firstArg, aggrWordCount(g.prog, typeSym), "")     # see `aggrWordsToFromRegs`
   let byteSize = aggrByteSize(g.prog, typeSym)
   let mw = wordSize()          # the ABI marshalling word (see aggrWordCount)
   for i in 0 ..< aggrWordCount(g.prog, typeSym):
@@ -229,6 +237,7 @@ proc marshalAggrFromAddr*(g: var CodeGen; addrReg: Reg; typeSym: SymId; firstArg
   ## `x{firstArg+i} ← [addrReg]` — load a ≤16B aggregate at `[addrReg]` into the by-value
   ## ABI argument registers (reverse of `regsToStructThroughPtr`); lets an aggregate CALL
   ## ARGUMENT marshal straight from its address (`aggrAddrInto`) with no copy temp.
+  g.releaseArgSpan(firstArg, aggrWordCount(g.prog, typeSym), "")     # see `aggrWordsToFromRegs`
   let byteSize = aggrByteSize(g.prog, typeSym)
   let mw = wordSize()          # the ABI marshalling word (see aggrWordCount)
   for i in 0 ..< aggrWordCount(g.prog, typeSym):
