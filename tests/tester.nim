@@ -501,16 +501,17 @@ proc ithaquaTests() =
   ## ithaqua — the wasm32 back end — over the same hand-written Leng corpus
   ## arkham runs, plus `wasmenc`'s own encoder tests.
   ##
-  ## EMIT ONLY: each fixture must produce a file that starts with the wasm
-  ## magic, and the `ithaquaUnsupported` ones must be refused. Nothing here
-  ## RUNS a module. That is deliberate — the differential harness that executes
+  ## EMIT ONLY — bar one run check at the end, see its comment: each fixture
+  ## must produce a file that starts with the wasm magic, and the
+  ## `ithaquaUnsupported` ones must be refused. Nothing else here RUNS a
+  ## module. That is deliberate — the differential harness that executes
   ## wasm against the native backend as its oracle lives in nimony
   ## (`hastur wasmdiff`, see doc/ithaqua.md), where the front end that produces
   ## realistic input also lives. What this pass buys is the thing nimony's
   ## harness cannot see: that ithaqua still COMPILES against, and agrees with,
   ## the `core/` program model in this repo, over 200-odd fixtures, on every
   ## platform in the matrix.
-  discard requiredExe("node", "the wasmenc engine (validate + instantiate) checks")
+  let node = requiredExe("node", "the wasmenc engine checks and the ithaqua run check")
   # `showProgress`, so `twasmenc`'s own summary line — which says whether the
   # two engine-judged blocks ran or were skipped for want of node — reaches the
   # log. Swallowed, the skip it exists to announce would be invisible.
@@ -548,6 +549,47 @@ proc ithaquaTests() =
     inc passed
   echo passed, " / ", total - refused, " ithaqua wasm32 emit tests successful (",
        refused, " refused as expected)"
+
+  # One RUN-based exception to the emit-only rule, and here is its history:
+  # a C-linkage gvar pair (the `exportc` `gExp` definition, another module's
+  # `importc` `gImp`) must share ONE linear-memory slot. When it got two, the
+  # bug emitted a perfectly valid module — address identity is exactly what an
+  # emit check cannot see — and no nimony `hastur wasmdiff` fixture touched
+  # `cmdCount`, so the divergence from the native oracle (exit 0, not 42) was
+  # found by hand. Fixtures whose failure mode is address identity rather than
+  # encoding cannot be guarded by emit; run those, and extend this list when
+  # the next one is found.
+  const runChecked = @["gvar_clinkage"]
+  if node.len > 0:
+    let runner = workDir / "run_wasm.js"
+    writeFile runner, """const fs = require("fs");
+const b = fs.readFileSync(process.argv[2]);
+let inst;
+const imports = { env: {
+  nim_write: (fd, buf, len) => { const m = Buffer.from(inst.exports.memory.buffer, buf, len); process.stdout.write(m); return len; },
+  nim_exit: (code) => { process.exit(code); }
+}};
+inst = new WebAssembly.Instance(new WebAssembly.Module(b), imports);
+inst.exports._start();
+"""
+    for stem in runChecked:
+      let wasm = workDir / (stem & ".wasm")
+      let (o, code) = execCmdEx(quoteShell(ithaqua) & " -o:" & quoteShell(wasm) &
+                                " " & quoteShell("tests" / "arkham" / (stem & ".c.nif")))
+      if code != 0:
+        quit "FAILURE ithaqua run check (codegen) " & stem & "\n" & o
+      let expected = parseInt(readFile("tests" / "arkham" / (stem & ".exitcode")).strip)
+      let (outp, pc) = execCmdEx(quoteShell(node) & " " & quoteShell(runner) & " " &
+                                 quoteShell(wasm))
+      if pc != expected:
+        quit "FAILURE ithaqua run check: " & stem & " exits " & $pc &
+             " but the native oracle exits " & $expected & "\n" & outp
+      removeFile wasm
+    echo "ithaqua run check: ", runChecked.len,
+         " fixture(s) executed under node agree with the native oracle"
+  else:
+    echo "ithaqua run check: SKIPPED (no node) — ", runChecked.len,
+         " fixture(s) not executed; this run is thinner than it looks"
 
 proc arkhamTests() =
   ## Each `tests/arkham/*.c.nif` is hand-written Leng: arkham generates asm-NIF,
