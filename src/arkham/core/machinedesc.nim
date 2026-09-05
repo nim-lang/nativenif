@@ -225,12 +225,15 @@ type
                                      ## staging pick can never fail (x86-64: R11).
                                      ## `callerSaveRescue` is the ONE allocator client
                                      ## allowed to take it.
-    intLocalTempRegs*: seq[Reg]      ## subset of `intTempRegs` a call-free local may be
-                                     ## *homed* in; the rest of `intTempRegs` stays
-                                     ## reserved as emitter scratch. Empty on x86-64 (its
-                                     ## only temp reg, R10, is the staging scratch — a
-                                     ## local there starves the emitter); the full temp
-                                     ## pool on AArch64 (7 volatile regs, scratch to spare)
+    intLocalTempRegs*: seq[Reg]      ## the volatile registers a call-free local may be
+                                     ## *homed* in, in preference order; `intTempRegs`
+                                     ## minus these stays reserved as emitter scratch.
+                                     ## NOT a subset of `intTempRegs`: on both x86-64
+                                     ## (rdi/rsi/r8/r9) and AArch64 (x1–x7, then x9–x13)
+                                     ## it leads with the ARGUMENT registers, which the
+                                     ## emitter's own scratch pool deliberately excludes.
+                                     ## `AllRegs` is what makes that legal — see
+                                     ## `IntLocalTempRegsN` in `risc/machine_a64.nim`
     intCalleeSaved*: seq[Reg]        ## callee-saved (locals live across a call)
     floatTempRegs*: seq[FReg]        ## caller-saved FP scratch
     floatCalleeSaved*: seq[FReg]     ## callee-saved FP regs

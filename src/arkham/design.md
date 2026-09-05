@@ -87,11 +87,16 @@ locals.
 
 Locals are mapped to **callee-saved** registers so they survive calls inside the
 expression; a local with no live range across a call may instead sit in
-`intLocalTempRegs` — the volatile registers with no fixed instruction role
-(AArch64 x9–x13; x86-64 rdi/rsi/r8/r9, i.e. the argument registers, but never
-r10/r11, which are the emitter's scratch and bridge). When the callee-saved pool
-is exhausted, `reserveHeldScratch`/the steal logic demotes the coldest
-register-homed local to a stack slot and reuses its register.
+`intLocalTempRegs` — the volatile registers with no fixed instruction role, the
+ARGUMENT registers first (x86-64 rdi/rsi/r8/r9; AArch64 x1–x7, then x9–x13) and
+never the emitter's own scratch or bridge (x86-64 r10/r11; AArch64 x14/x15).
+`AllRegs` is what makes an argument register legal: no call point lies in the
+value's live range, so nothing marshals over it — and a local passed AS an
+argument has its last use inside the call node, so the interval test denies it a
+volatile outright. `releaseArgDest` drops the binding a dead local leaves behind
+on such a register, which is the only thing marshalling would trip over. When the
+callee-saved pool is exhausted, `reserveHeldScratch`/the steal logic demotes the
+coldest register-homed local to a stack slot and reuses its register.
 
 ### How many registers the emitter actually needs
 

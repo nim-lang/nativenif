@@ -718,6 +718,8 @@ proc emitMemIntrin2*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
       nUnroll = n
   let nArgs = if unroll: 2 else: min(3, argCurs.len)
   for idx in 0 ..< nArgs:
+    let aSym = if argCurs[idx].kind == Symbol: symName(argCurs[idx]) else: ""
+    g.releaseArgDest(g.md.intArgRegs[idx], aSym)         # a dead local's name, if any
     var aD = regLoc(g.md.intArgRegs[idx], ScalarSlot)
     g.emitValue2(argCurs[idx], aD)                       # → x0 / x1 / x2 directly
     g.unbindTemp(aD.r)                                   # used raw below
@@ -727,6 +729,11 @@ proc emitMemIntrin2*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
   let (dst, src, n) = (g.md.intArgRegs[0], g.md.intArgRegs[1], g.md.intArgRegs[2])
   let (i, b, b2) = (g.md.memIntrinScratch[0], g.md.memIntrinScratch[1],
                     g.md.memIntrinScratch[2])
+  # The loop scratch is written RAW below. These are argument registers, so the
+  # allocator may have homed a call-free local in one; it is dead at this call (the
+  # intrinsic IS a call position), but its binding is not, and `emReg` would spell
+  # the scratch under its name.
+  for r in g.md.memIntrinScratch: g.releaseStaleName(r)
   if unroll:
     if nUnroll > 0:
       g.copyAggr(dst, src, int(nUnroll), i)
@@ -2976,7 +2983,13 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
         let a = argCurs[j]
         let pl = plan.args[j]
         if not pl.onStack and not pl.isFloat:
-          for k in 0 ..< max(pl.words, 1): g.stagedArgs.incl g.md.gprAt(pl, k)
+          # A stale binding on the register is dropped BEFORE the value is built into
+          # it, or `emReg` spells the new value under the dead local's name and its
+          # type does not admit it (`releaseArgDest`).
+          let aSym = if a.kind == Symbol: symName(a) else: ""
+          for k in 0 ..< max(pl.words, 1):
+            g.releaseArgDest(g.md.gprAt(pl, k), aSym)
+            g.stagedArgs.incl g.md.gprAt(pl, k)
         var tn = NoTypeSym
         if pl.isAgg:
           let tcur = g.getType(a)
@@ -3159,6 +3172,10 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
     var varTail: seq[tuple[r: Reg; f: FReg; off: int]] = @[]
     for idx in 0 ..< argCurs.len:
       let a = argCurs[idx]
+      # Every branch below produces this argument INTO its ABI register(s); a name
+      # still bound to one of them is a dead local's and must go first, or `emReg`
+      # spells the value under it (`releaseArgDest`).
+      let argSym = if a.kind == Symbol: symName(a) else: ""
       let isVariadic = variadicFrom >= 0 and idx >= variadicFrom
       if isVariadic:
         let off = varTail.len * 8
@@ -3172,6 +3189,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
           varTail.add (NoReg, g.md.floatArgRegs[fIdx], off)
           inc fIdx
         else:
+          g.releaseArgSpan(intIdx, 1, argSym)
           var aD = regLoc(g.md.intArgRegs[intIdx], ScalarSlot)
           g.emitValue2(a, aD)
           varTail.add (g.md.intArgRegs[intIdx], NoFReg, off)
@@ -3219,9 +3237,10 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
           g.emitLvalue2(a)                   # pick embedded base/index regs
           g.aggrAddrInto(a, srcAddr, addrSlot(), doBind = true)
           if sz > 16:
+            g.releaseArgSpan(intIdx, 1, argSym)
             g.movReg(g.md.intArgRegs[intIdx], srcAddr); inc intIdx
           else:
-            g.marshalAggrFromAddr(srcAddr, tn, intIdx)
+            g.marshalAggrFromAddr(srcAddr, tn, intIdx)   # releases the span itself
             intIdx += aggrWordCount(g.prog, tn)
           if addrBridge != NoReg: g.dropBridge addrBridge
           else: g.unbindTemp(srcAddr)
@@ -3243,6 +3262,7 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
             g.genStore2(a, namedStackLoc(home, g.exprSlot(a)))
           let hh = g.plan.homeOfSym(home)
           if sz > 16:
+            g.releaseArgSpan(intIdx, 1, argSym)   # the pointer arm writes the reg itself
             if isTvar: g.genTlvAddr(symName(a), g.md.intArgRegs[intIdx])
             elif isGlobal: g.emGlobalAddr(g.md.intArgRegs[intIdx], symName(a))
             elif hh.kind == InReg:
@@ -3259,9 +3279,11 @@ proc emitCall2*(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = false
       elif g.isWideExpr(a):
         # Same rule as the declarative path: the value first, the staging after.
         let wnm = g.wideValueIntoTemp(a)
+        g.releaseArgSpan(intIdx, 2, argSym)
         g.wideArgToRegs(wnm, intIdx)
         intIdx += 2                       # no declaration to narrow against here
       else:
+        g.releaseArgSpan(intIdx, 1, argSym)
         var aD = regLoc(g.md.intArgRegs[intIdx], ScalarSlot)
         g.emitValue2(a, aD)                    # → its ABI register directly
         inc intIdx

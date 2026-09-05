@@ -27,11 +27,40 @@ const
   IndirectResultReg* = R8
 
   ## Volatile (caller-saved) scratch usable for temporaries that do not
-  ## need to survive a call. (x0–x7 are also volatile but reserved here for
-  ## arg/return shuffling; x16/x17/x18 are reserved by the platform.)
+  ## need to survive a call. (x0–x7 are also volatile but kept out of the EMITTER's
+  ## scratch, which must stay free across a call's marshalling; a call-free LOCAL may
+  ## still be homed there — see `IntLocalTempRegsN`. x16/x17/x18 are reserved by the
+  ## platform.)
   IntTempRegs* = [R9, R10, R11, R12, R13, R14, R15]
   ## The pure-emit value core reserves the two integer bridges out of the pool.
   IntTempRegsN* = [R9, R10, R11, R12, R13]
+  ## Where a CALL-FREE local may be homed, in preference order: the argument
+  ## registers first, the emitter's own scratch pool only after them.
+  ##
+  ## `AllRegs` — no call point anywhere in the value's live range — is exactly the
+  ## proof that makes an argument register a legal home: nothing marshals into it
+  ## while the value is live, and a local passed AS an argument to a call has its
+  ## last use INSIDE the call node, so the interval test denies it a volatile
+  ## outright. (What lingers is arkham's binding TABLE, which retires a name at its
+  ## scope end rather than at its last use; `releaseArgDest` drops those.)
+  ##
+  ## Withholding x1–x7 cost the frame: the pool was five registers wide, so the sixth
+  ## call-free local in a proc went to callee-saved and bought a `stp`/`ldp` pair —
+  ## in a LEAF, a whole frame for values that could not outlive a call there anyway.
+  ## Measured over nifbench's 42 modules: 464 procs with a frame fell to 437, and
+  ## 1243 prologue pairs to 1139.
+  ##
+  ## The argument registers come FIRST for the reason x86-64 splits the two pools at
+  ## all (`intLocalTempRegs` there is rdi/rsi/r8/r9, never r10/r11): a local in x9–x13
+  ## is a local sitting in the emitter's scratch, which `pickTempReg` then has to
+  ## replace with a held register or a bridge. The order costs nothing either way —
+  ## nifbench retires the same 573.2M instructions under both — but it is what lets
+  ## `atomic_cas_regpressure` and `atomic_cas_operand_home` compile at all under
+  ## `ARKHAM_STRESS=3`, where they used to hit the out-of-registers assert.
+  ##
+  ## x0 stays out: `seedPools` lends it to the RETURNED local alone, which elides the
+  ## trailing `mov x0, result`, and an ordinary local taking it first would spend that.
+  IntLocalTempRegsN* = [R1, R2, R3, R4, R5, R6, R7, R9, R10, R11, R12, R13]
   ## Callee-saved: for values that must survive a call.
   IntCalleeSaved* = [R19, R20, R21, R22, R23, R24, R25, R26, R27, R28]
   ## Caller-saved set clobbered across any call (incl. an extcall).
@@ -145,7 +174,7 @@ const
     floatArgRegs: @FloatArgRegs,
     intTempRegs: @IntTempRegsN,
     stagingBridgeReg: NoReg,
-    intLocalTempRegs: @IntTempRegsN,
+    intLocalTempRegs: @IntLocalTempRegsN,
     intCalleeSaved: @IntCalleeSaved,
     floatTempRegs: @FloatTempRegsN,
     floatCalleeSaved: @FloatCalleeSaved,

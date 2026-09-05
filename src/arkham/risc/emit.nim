@@ -1737,6 +1737,41 @@ proc releaseStaleName*(g: var CodeGen; r: Reg) =
     if dead.len > 0:
       g.ab.tree KillA64: g.ab.sym dead
 
+proc releaseArgDest*(g: var CodeGen; r: Reg; valueSym: string) =
+  ## An argument value is about to be MATERIALIZED into argument register `r`. Any
+  ## name still bound to `r` is stale — the marshalling overwrites the register —
+  ## and `emReg` would then write the new value under that stale name, whose type
+  ## generally does not admit it: `ret_pair_stale_rdx_home` marshalled a `(ptr void)`
+  ## under `x.190`, a dead `(bool)` local still sitting on x1.
+  ##
+  ## The binding is dead here BY CONSTRUCTION, which is what makes killing it safe:
+  ## the allocator homes a local in a caller-saved register only under `AllRegs`, the
+  ## analyser's proof that no call position lies in the local's live range, and a
+  ## local passed AS an argument to this call has its last use INSIDE the call node —
+  ## so its range does contain the call and it never reached a volatile at all. What
+  ## lingers here is only arkham's binding table, which retires a name at its scope
+  ## end rather than at its last use. Skipped when the value IS that symbol, which
+  ## legitimately reads through the name.
+  ##
+  ## The x86-64 twin (`releaseArgDest` in `x64/emit.nim`) is the same proc for the
+  ## same reason; it additionally drops the `ArgResident` bookkeeping, which a64 does
+  ## not keep — its parameters are moved with a raw `mov` and read raw, so they are
+  ## never `rb`-bound in the first place.
+  if r == NoReg: return
+  let bound = g.rb.boundName(r)
+  if bound.len == 0 or bound == valueSym: return
+  if g.rb.isBoundTemp(r):
+    g.unbindTemp(r)                                # kills the name, drops the binding
+  else:
+    g.releaseStaleName(r)                          # a register-homed local, dead at a call
+
+proc releaseArgSpan*(g: var CodeGen; first, words: int; valueSym: string) =
+  ## `releaseArgDest` over the `words` consecutive integer argument registers an
+  ## aggregate / 64-bit scalar occupies, starting at ABI ordinal `first`.
+  for k in 0 ..< words:
+    if first + k < g.md.intArgRegs.len:
+      g.releaseArgDest(g.md.intArgRegs[first + k], valueSym)
+
 proc emitAtomicRmw2*(g: var CodeGen; dst, p, v: Reg; opStr: string;
                     isXchg, returnNew: bool; bits: int) =
   ## `loop: ldaxr old,[p]; new = old op v (or v, for an exchange); stlxr st,new,[p];
