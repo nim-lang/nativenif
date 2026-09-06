@@ -501,16 +501,17 @@ proc ithaquaTests() =
   ## ithaqua — the wasm32 back end — over the same hand-written Leng corpus
   ## arkham runs, plus `wasmenc`'s own encoder tests.
   ##
-  ## EMIT ONLY: each fixture must produce a file that starts with the wasm
-  ## magic, and the `ithaquaUnsupported` ones must be refused. Nothing here
-  ## RUNS a module. That is deliberate — the differential harness that executes
+  ## EMIT ONLY — bar one run check at the end, see its comment: each fixture
+  ## must produce a file that starts with the wasm magic, and the
+  ## `ithaquaUnsupported` ones must be refused. Nothing else here RUNS a
+  ## module. That is deliberate — the differential harness that executes
   ## wasm against the native backend as its oracle lives in nimony
   ## (`hastur wasmdiff`, see doc/ithaqua.md), where the front end that produces
   ## realistic input also lives. What this pass buys is the thing nimony's
   ## harness cannot see: that ithaqua still COMPILES against, and agrees with,
   ## the `core/` program model in this repo, over 200-odd fixtures, on every
   ## platform in the matrix.
-  discard requiredExe("node", "the wasmenc engine (validate + instantiate) checks")
+  let node = requiredExe("node", "the wasmenc engine checks and the ithaqua run check")
   # `showProgress`, so `twasmenc`'s own summary line — which says whether the
   # two engine-judged blocks ran or were skipped for want of node — reaches the
   # log. Swallowed, the skip it exists to announce would be invisible.
