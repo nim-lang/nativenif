@@ -93,7 +93,9 @@ type
     nextFunc: uint32                       ## next function index (imports pre-assigned)
     typeIdxOf: Table[string, uint32]       ## rendered signature key → functype index
     memTop: uint32                         ## static-data bump pointer
-    globalAddr: Table[string, uint32]
+    globalAddr: Table[string, uint32]  # canonical gvar ref name -> linear memory address
+    canonDecl: Table[string, Cursor]   # canonical ref name -> its decl, remembered
+                                       # before the name is canonicalized away
     rodataAddr: Table[string, uint32]      ## string literal → address (deduped)
     dataSegs: seq[(uint32, string)]
     allocLog: seq[(uint32, uint32, string)]    ## (addr, size, owner) for the
@@ -233,11 +235,28 @@ proc flexPayloadLen(g: var WasmGen; initv: Cursor): int =
           while kv.hasMore: skip kv
       skip t
 
+proc declHasInit(decl: Cursor): bool =
+  ## True when a `(gvar|tvar :name PRAGMAS TYPE INIT?)` carries an initializer.
+  var d = decl
+  result = false
+  d.into:
+    inc d                                      # name
+    skip d                                     # pragmas
+    skip d                                     # type
+    result = d.hasMore and d.kind != DotToken
+    while d.hasMore: skip d
+
 proc globalAddrOf(g: var WasmGen; name: string): uint32 =
   ## The linear-memory address of a gvar/const, assigning it on first use.
   ## Zero-initialized globals reserve address space only (wasm memory is
   ## zeroed); constant initializers become data segments at finalize.
-  if g.globalAddr.hasKey(name): return g.globalAddr[name]
+  ##
+  ## The slot is keyed by the canonical ref name: `gvarRefName` unifies the
+  ## exportc/importc pair of a C-linkage gvar (cmdCount, cmdLine, nimEnviron)
+  ## the way the C backend's one C symbol per pair does. Keying by the raw
+  ## NIF name gave `gExp.0` and the foreign `gImp.0` two slots, so a write
+  ## through one name was invisible to a read through the other.
+  let canon = gvarRefName(g.prog, name)
   let si = lookupSym(typeCtx(g), name)
   if si.cat notin {scGlobal, scTvar}:          # tvar: single-threaded target → a global
     err g, "not a global: " & name
@@ -254,11 +273,19 @@ proc globalAddrOf(g: var WasmGen; name: string): uint32 =
       initv = d
       hasInit = true
     while d.hasMore: skip d
+  if g.globalAddr.hasKey(canon):
+    # the slot exists; but the pair's other decl may carry the static
+    # initializer this one lacks, and emitGlobalInit reads the decl from
+    # canonDecl, so upgrade it
+    if hasInit and not declHasInit(g.canonDecl[canon]):
+      g.canonDecl[canon] = si.decl
+    return g.globalAddr[canon]
   var (sz, al) = typeSizeAlign(g.prog, typ)
   if hasInit:
     sz += flexPayloadLen(g, initv)             # flexarray tail data (string consts)
-  result = allocStatic(g, sz, al, tag = name)
-  g.globalAddr[name] = result
+  result = allocStatic(g, sz, al, tag = canon)
+  g.globalAddr[canon] = result
+  g.canonDecl[canon] = si.decl                 # the drain loop cannot re-derive this
   if si.cat == scGlobal and not g.globals.hasKey(name):
     g.globals[name] = si.decl                  # cache foreign decls for typenav
   elif si.cat == scTvar and not g.tvars.hasKey(name):
@@ -2896,9 +2923,11 @@ proc emitGlobalInit(g: var WasmGen; nm: string; addrv: uint32) =
   ## reserve address space only; runtime inits are the ini chain's job. A
   ## Symbol initializer naming a proc is a static fn-ptr default → its
   ## funcref-table slot (this can discover new reachable procs).
-  let si = lookupSym(typeCtx(g), nm)
-  if si.cat notin {scGlobal, scTvar}: return
-  var d = si.decl
+  # `nm` is the canonical ref name globalAddrOf keyed the slot under, which
+  # lookupSym cannot resolve for a C-linkage pair (`cmdCount.0`); the decl
+  # was remembered there for exactly this reason.
+  if not g.canonDecl.hasKey(nm): return
+  var d = g.canonDecl[nm]
   var typ, initv: Cursor
   var hasInit = false
   d.into:
