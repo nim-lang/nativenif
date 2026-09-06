@@ -549,13 +549,18 @@ proc ithaquaTests() =
   echo passed, " / ", total - refused, " ithaqua wasm32 emit tests successful (",
        refused, " refused as expected)"
 
-proc arkhamTests() =
+proc arkhamTests(arch = (when defined(macosx): "arm64" else: "x64");
+                 runner = ""; label = "") =
   ## Each `tests/arkham/*.c.nif` is hand-written Leng: arkham generates asm-NIF,
   ## nifasm assembles+links it to a native executable, and we check the run's exit
   ## code (`<stem>.exitcode`, default 0) and stdout (`<stem>.output`, default
-  ## empty). The target arch follows the host so the binaries actually run here:
+  ## empty). The target arch defaults to the host's so the binaries run here:
   ## x86-64/ELF on Linux, AArch64/Mach-O on macOS.
-  const arch = when defined(macosx): "arm64" else: "x64"
+  ##
+  ## `runner` prefixes the produced executable, the way `arkhamStressTests` takes
+  ## one — that is what lets an AArch64 Linux host emit `x64` and run it under
+  ## `qemu-x86_64`. Without it such a host runs NO x86-64 arkham tests at all, and
+  ## the x86-64 register allocator is the half of arkham it cannot otherwise touch.
   let arkham = ("bin" / "arkham").addFileExt(ExeExt)
   let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
   let workDir = "tests" / "arkham" / "nimcache"
@@ -596,7 +601,9 @@ proc arkhamTests() =
     let (no, nc) = execCmdEx(quoteShell(nifasm) & " -o:" & quoteShell(exe) & " " &
                              quoteShell(asmNif))
     if nc != 0: tolerate("nifasm (assemble/link)", no)
-    let (po, pc) = runProgram(exe)
+    let (po, pc) =
+      if runner.len > 0: runProgram(runner, [exe])   # `qemu-x86_64 <exe>`
+      else: runProgram(exe)
     if pc == timeoutExitCode:
       tolerate("TIMEOUT after " & $(runTimeoutMs div 1000) & "s running", "")
     let ecFile = stem & ".exitcode"
@@ -611,7 +618,7 @@ proc arkhamTests() =
     if known:
       echo "NOTE: ", name, " now passes — remove it from arkhamKnownUnsupported"
     inc passed
-  echo passed, " / ", total - skipped, " arkham tests successful (",
+  echo passed, " / ", total - skipped, " arkham ", label, "tests successful (",
        skipped, " known-unsupported skipped)"
 
 # ── register-pressure stress pass (`-d:arkhamStress`, see src/arkham/stress.nim) ──
@@ -2427,6 +2434,19 @@ when defined(linux) and defined(amd64):
 # provide it as a shell shim that just execs its argument.
 when defined(linux) and defined(arm64):
   arkhamQemuTests()
+
+  # …and the mirror of the amd64 host's qemu pass: emit the corpus for `x64` and run
+  # it under `qemu-x86_64`. x86-64 and AArch64 are different register allocators
+  # sharing one analyser — `intLocalTempRegs` is the ARGUMENT registers on one and
+  # the scratch pool on the other, rax has instruction roles x0 does not — so an
+  # allocator change that is byte-identical on a64 can still be wrong here, and
+  # without this pass an AArch64 developer has no way to find out before CI.
+  let qemuX64 = requiredExe("qemu-x86_64", "the x64 run tests on an arm64 host")
+  if qemuX64.len > 0:
+    arkhamTests(arch = "x64", runner = qemuX64, label = "x64 (qemu) ")
+  else:
+    echo "qemu-x86_64 not found — skipping the x64 run tests " &
+         "(install: sudo apt-get install qemu-user)"
 
 # The hand-written AArch64 fixture assembled above is a `linux_arm64` ELF: run it.
 when defined(linux):
