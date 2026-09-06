@@ -688,30 +688,17 @@ const arkhamStressA64Known: seq[string] = @[
   # out-of-registers error. The planer's early-free now covers `InFReg`
   # homes too, so the dead vector temps hand their registers back in time
   # and the fixture passes even stressed.)
-  # Back on this list at k=3 since the planer gives a call-free local a VOLATILE
-  # register first (see `getSym`). It is the emitter's OWN long-known gap — the
-  # intrinsic-operand pick has no arm that evicts a live local — and not a new one;
-  # what changed is only what used to mask it. Under callee-saved-first, `main.0`'s
-  # `a.0` found no home and spilled, which left one volatile over for the CAS's third
-  # operand register; volatile-first homes `a.0`/`b.0`/`c.0` in x9/x10/x11 instead, so
-  # at the `(instr acx.0 …)` every one of the six registers a k=3 machine has is taken:
-  # three by those live locals, x19/x21 by the two operand temps already reserved, and
-  # x20 sealed as the destination `ok.0`. Wanting a fourth, `takeInstrReg` reaches
-  # `takeHeld`, whose whole point is that demoting a local mid-emission is impossible
-  # in the merged core, and it fails LOUDLY. Verified across k=3..6 and unstressed:
-  # k=3 asserts, every higher k returns the correct 112 — a totality gap, never a
-  # wrong answer. Closing it is the same "evict a live local" arm the x86-64
-  # `aggr_arg_parked` entries above wait on; the fixture needs 7 live registers where
-  # a k=3 machine has 6, so nothing short of that arm makes it fit.
-  "atomic_cas_regpressure",
-  # `instrOperandInPlace` — read a register-homed symbol operand where it lies
-  # instead of copying it into a register the row then cannot find — is x86-64
-  # ONLY, deliberately: that is the machine whose whole emitter budget is two
-  # registers, and every atomic sequence there was read to confirm it writes no
-  # operand. a64 has x9–x13 plus two bridges and passes this fixture unstressed;
-  # porting the rule is a separate change with its own reading of the LDXR/STXR
-  # sequences, not a paste.
-  "atomic_cas_operand_home",
+  # (`atomic_cas_regpressure` and `atomic_cas_operand_home` lived here for the
+  # "intrinsic-operand pick has no arm that evicts a live local" class. Both were
+  # listed when a call-free local took a VOLATILE register first and that meant
+  # x9/x10/x11 — the emitter's own scratch pool — so at the `(instr acx.0 …)` every
+  # register a k=3 machine has was a live local's home or an already-reserved
+  # operand temp, and `takeInstrReg` failed loudly. `IntLocalTempRegsN` then put the
+  # ARGUMENT registers first (x1–x7 before x9–x13), which is what its own doc
+  # comment claims it does for exactly these two fixtures: `a.0`/`b.0`/`c.0` now
+  # home in x1/x2/x3 and the whole scratch pool is still there when the atomic row
+  # asks. Both pass at k=3, with and without the death-point exemption — the entries
+  # were simply never pruned after that reorder.)
   # (`shift_count_clobbers_mask` lived here for the "stackoff into a value slot"
   # class — a spilled `(u 8)` whose slot arkham declared `(i 64)`. Slots now carry
   # their own type, so the class is gone and the fixture passes.)
