@@ -663,6 +663,17 @@ const arkhamStressKnown: seq[string] = @[
   # it means needing fewer live values there — not a second allocator inside the
   # emitter, which is what the removed emergency borrow was.
   "addr_chain_depth",
+  # Rax became a local's home (the death-point exemption, 8b94ff5), and rax was
+  # `StagingCandidates[1]` — the FIRST opportunistic fallback after the one
+  # guaranteed bridge. So this is x86-64's capacity-vs-guarantee gap, named in
+  # design.md and counted by `tightCompositions`, cashing in: the target GUARANTEES
+  # one transient (R11) and this composition needs a second while an enclosing step
+  # holds the first. It was reaching that second one by luck — an ABI volatile that
+  # happened to be free — and the allocator has now spent that luck on a prologue
+  # push it removes. `needs 1 of 0` is the loud form: never a wrong answer, and
+  # unstressed the fixture passes. Closing it means the enclosing step releasing
+  # across the recursion (design.md, I1), not withholding rax.
+  "array2d",
 ]
 
 const arkhamStressA64Known: seq[string] = @[
@@ -2409,13 +2420,24 @@ when (defined(linux) and defined(amd64)) or (defined(macosx) and defined(arm64))
                     level = (when defined(macosx): arkhamStressA64Level
                              else: arkhamStressLevel))
 
-# The `{.assembler.}` rejections are x86-64-only (see `arkhamRejectionTests`).
-when defined(linux) and defined(amd64):
+# The `{.assembler.}` rejections are x86-64-only (see `arkhamRejectionTests`), but
+# they are COMPILE-only — arkham is told `-a:x64` and the expectation is an error
+# message — so they need an x86-64 target, not an x86-64 host.
+when defined(linux):
   arkhamRejectionTests(("bin" / "arkham").addFileExt(ExeExt))
+
+when defined(linux) and defined(amd64):
   # The debug-info check runs on the x86-64 host binaries `arkhamTests` just
   # built; the AArch64 half of the same tables is covered by the qemu pass only
   # as far as "the program still runs" — a host GDB cannot read its registers.
   arkhamDebugInfoTests()
+
+# The Win64 suites ask WINE to be the authority, and wine decides for itself
+# whether it can run an x86-64 PE on this host (it skips with a message when it is
+# absent). An arm64 host that has it gets the coverage: `win64Machine` shares the
+# allocator this work changes — rax is its return register too — so its prologues
+# move with x86-64's, and nothing else here would notice.
+when defined(linux):
   arkhamWinUnwindTests()
   arkhamWinTraceTableTests()
   arkhamWinStdcallTests()
@@ -2445,6 +2467,15 @@ when defined(linux) and defined(arm64):
   let qemuX64 = requiredExe("qemu-x86_64", "the x64 run tests on an arm64 host")
   if qemuX64.len > 0:
     arkhamTests(arch = "x64", runner = qemuX64, label = "x64 (qemu) ")
+    # …and the starved-register-file pass over the same fixtures, at the SAME level
+    # the amd64 host uses. This is the half that actually catches allocator work: an
+    # unstressed corpus never runs a pool dry, so a change that takes a register away
+    # from the emitter shows up only here. The rax death-point home (8b94ff5) passed
+    # every unstressed x64 test and pushed `array2d` into the documented bridge-budget
+    # assert at k=2 — found by CI, not here, until this pass existed.
+    arkhamStressTests(arch = "x64", runner = qemuX64,
+                      skip = arkhamOsxOnly & arkhamX64Unsupported,
+                      known = arkhamStressKnown, level = arkhamStressLevel)
   else:
     echo "qemu-x86_64 not found — skipping the x64 run tests " &
          "(install: sudo apt-get install qemu-user)"
@@ -2460,8 +2491,12 @@ when defined(linux):
   else:
     echo "qemu-aarch64 not found - skipping a64_slot_base_free"
 
-# The AArch64 backend gets the same starved-pool pass, under qemu.
-when defined(linux) and defined(amd64):
+# The AArch64 backend gets the same starved-pool pass, under qemu — and an arm64
+# host needs it just as much: the death-point exemption (a42f158) homes dying locals
+# in x9–x13, which IS the emitter's scratch pool, so this is the pass that says
+# whether the allocator has taken a register the emitter still needed. `qemu-aarch64`
+# is the shim on such a host (see the note above `arkhamQemuTests`).
+when defined(linux) and (defined(amd64) or defined(arm64)):
   if requiredExe("qemu-aarch64", "the a64 stress and slot-base-free passes").len > 0:
     arkhamStressTests(arch = "linux_arm64", runner = "qemu-aarch64",
                       skip = arkhamLinuxA64Unsupported & arkhamA64Unsupported &
