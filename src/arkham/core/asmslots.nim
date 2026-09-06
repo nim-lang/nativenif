@@ -46,6 +46,23 @@ type
                 # the arg reg anyway). It may STAY in its incoming arg register instead of
                 # taking a callee-saved home — no prologue save, and same-position passing
                 # makes the call-site marshal a self-move (elided). See allocParams.
+    DiesAtCall  # the ONLY call in the local's live interval is the one that CONSUMES
+                # its last use (it appears in that call's argument list, or in an
+                # expression marshalled into one). The value is dead the instant the
+                # call executes, so it need not survive it — but a volatile ARGUMENT
+                # register is still wrong (a sibling argument's marshalling would
+                # overwrite it before its own is staged), so this grants only the
+                # emitter's non-argument volatile scratch (`intTempRegs`), never the
+                # `AllRegs` pool. See the death-point exemption in `analyseProc`.
+    RetRegOk    # `DiesAtCall` AND nothing in the live interval claims the RETURN
+                # register's other, non-call roles. On x86-64 rax is the return
+                # register, the `idiv` dividend/quotient, `cmpxchg`'s architectural
+                # comparand and the aggregate-copy transfer register — none of them
+                # a call, so the death-point interval test cannot see them. This is
+                # the per-register interval proof that does, in the shape
+                # `DivRegOk`/`ShiftRegOk` already use for rdx/rcx, and it is what
+                # lets a dying local home in rax (see `getSym`). Meaningless where
+                # the return register is already in the allocator's ordinary pools.
   VarProps* = set[VarProp]
 
 # ── target word ─────────────────────────────────────────────────────────────

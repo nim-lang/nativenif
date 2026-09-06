@@ -550,54 +550,18 @@ proc ithaquaTests() =
   echo passed, " / ", total - refused, " ithaqua wasm32 emit tests successful (",
        refused, " refused as expected)"
 
-  # One RUN-based exception to the emit-only rule, and here is its history:
-  # a C-linkage gvar pair (the `exportc` `gExp` definition, another module's
-  # `importc` `gImp`) must share ONE linear-memory slot. When it got two, the
-  # bug emitted a perfectly valid module — address identity is exactly what an
-  # emit check cannot see — and no nimony `hastur wasmdiff` fixture touched
-  # `cmdCount`, so the divergence from the native oracle (exit 0, not 42) was
-  # found by hand. Fixtures whose failure mode is address identity rather than
-  # encoding cannot be guarded by emit; run those, and extend this list when
-  # the next one is found.
-  const runChecked = @["gvar_clinkage"]
-  if node.len > 0:
-    let runner = workDir / "run_wasm.js"
-    writeFile runner, """const fs = require("fs");
-const b = fs.readFileSync(process.argv[2]);
-let inst;
-const imports = { env: {
-  nim_write: (fd, buf, len) => { const m = Buffer.from(inst.exports.memory.buffer, buf, len); process.stdout.write(m); return len; },
-  nim_exit: (code) => { process.exit(code); }
-}};
-inst = new WebAssembly.Instance(new WebAssembly.Module(b), imports);
-inst.exports._start();
-"""
-    for stem in runChecked:
-      let wasm = workDir / (stem & ".wasm")
-      let (o, code) = execCmdEx(quoteShell(ithaqua) & " -o:" & quoteShell(wasm) &
-                                " " & quoteShell("tests" / "arkham" / (stem & ".c.nif")))
-      if code != 0:
-        quit "FAILURE ithaqua run check (codegen) " & stem & "\n" & o
-      let expected = parseInt(readFile("tests" / "arkham" / (stem & ".exitcode")).strip)
-      let (outp, pc) = execCmdEx(quoteShell(node) & " " & quoteShell(runner) & " " &
-                                 quoteShell(wasm))
-      if pc != expected:
-        quit "FAILURE ithaqua run check: " & stem & " exits " & $pc &
-             " but the native oracle exits " & $expected & "\n" & outp
-      removeFile wasm
-    echo "ithaqua run check: ", runChecked.len,
-         " fixture(s) executed under node agree with the native oracle"
-  else:
-    echo "ithaqua run check: SKIPPED (no node) — ", runChecked.len,
-         " fixture(s) not executed; this run is thinner than it looks"
-
-proc arkhamTests() =
+proc arkhamTests(arch = (when defined(macosx): "arm64" else: "x64");
+                 runner = ""; label = "") =
   ## Each `tests/arkham/*.c.nif` is hand-written Leng: arkham generates asm-NIF,
   ## nifasm assembles+links it to a native executable, and we check the run's exit
   ## code (`<stem>.exitcode`, default 0) and stdout (`<stem>.output`, default
-  ## empty). The target arch follows the host so the binaries actually run here:
+  ## empty). The target arch defaults to the host's so the binaries run here:
   ## x86-64/ELF on Linux, AArch64/Mach-O on macOS.
-  const arch = when defined(macosx): "arm64" else: "x64"
+  ##
+  ## `runner` prefixes the produced executable, the way `arkhamStressTests` takes
+  ## one — that is what lets an AArch64 Linux host emit `x64` and run it under
+  ## `qemu-x86_64`. Without it such a host runs NO x86-64 arkham tests at all, and
+  ## the x86-64 register allocator is the half of arkham it cannot otherwise touch.
   let arkham = ("bin" / "arkham").addFileExt(ExeExt)
   let nifasm = ("bin" / "nifasm").addFileExt(ExeExt)
   let workDir = "tests" / "arkham" / "nimcache"
@@ -638,7 +602,9 @@ proc arkhamTests() =
     let (no, nc) = execCmdEx(quoteShell(nifasm) & " -o:" & quoteShell(exe) & " " &
                              quoteShell(asmNif))
     if nc != 0: tolerate("nifasm (assemble/link)", no)
-    let (po, pc) = runProgram(exe)
+    let (po, pc) =
+      if runner.len > 0: runProgram(runner, [exe])   # `qemu-x86_64 <exe>`
+      else: runProgram(exe)
     if pc == timeoutExitCode:
       tolerate("TIMEOUT after " & $(runTimeoutMs div 1000) & "s running", "")
     let ecFile = stem & ".exitcode"
@@ -653,7 +619,7 @@ proc arkhamTests() =
     if known:
       echo "NOTE: ", name, " now passes — remove it from arkhamKnownUnsupported"
     inc passed
-  echo passed, " / ", total - skipped, " arkham tests successful (",
+  echo passed, " / ", total - skipped, " arkham ", label, "tests successful (",
        skipped, " known-unsupported skipped)"
 
 # ── register-pressure stress pass (`-d:arkhamStress`, see src/arkham/stress.nim) ──
@@ -697,6 +663,17 @@ const arkhamStressKnown: seq[string] = @[
   # it means needing fewer live values there — not a second allocator inside the
   # emitter, which is what the removed emergency borrow was.
   "addr_chain_depth",
+  # Rax became a local's home (the death-point exemption, 8b94ff5), and rax was
+  # `StagingCandidates[1]` — the FIRST opportunistic fallback after the one
+  # guaranteed bridge. So this is x86-64's capacity-vs-guarantee gap, named in
+  # design.md and counted by `tightCompositions`, cashing in: the target GUARANTEES
+  # one transient (R11) and this composition needs a second while an enclosing step
+  # holds the first. It was reaching that second one by luck — an ABI volatile that
+  # happened to be free — and the allocator has now spent that luck on a prologue
+  # push it removes. `needs 1 of 0` is the loud form: never a wrong answer, and
+  # unstressed the fixture passes. Closing it means the enclosing step releasing
+  # across the recursion (design.md, I1), not withholding rax.
+  "array2d",
 ]
 
 const arkhamStressA64Known: seq[string] = @[
@@ -711,30 +688,17 @@ const arkhamStressA64Known: seq[string] = @[
   # out-of-registers error. The planer's early-free now covers `InFReg`
   # homes too, so the dead vector temps hand their registers back in time
   # and the fixture passes even stressed.)
-  # Back on this list at k=3 since the planer gives a call-free local a VOLATILE
-  # register first (see `getSym`). It is the emitter's OWN long-known gap — the
-  # intrinsic-operand pick has no arm that evicts a live local — and not a new one;
-  # what changed is only what used to mask it. Under callee-saved-first, `main.0`'s
-  # `a.0` found no home and spilled, which left one volatile over for the CAS's third
-  # operand register; volatile-first homes `a.0`/`b.0`/`c.0` in x9/x10/x11 instead, so
-  # at the `(instr acx.0 …)` every one of the six registers a k=3 machine has is taken:
-  # three by those live locals, x19/x21 by the two operand temps already reserved, and
-  # x20 sealed as the destination `ok.0`. Wanting a fourth, `takeInstrReg` reaches
-  # `takeHeld`, whose whole point is that demoting a local mid-emission is impossible
-  # in the merged core, and it fails LOUDLY. Verified across k=3..6 and unstressed:
-  # k=3 asserts, every higher k returns the correct 112 — a totality gap, never a
-  # wrong answer. Closing it is the same "evict a live local" arm the x86-64
-  # `aggr_arg_parked` entries above wait on; the fixture needs 7 live registers where
-  # a k=3 machine has 6, so nothing short of that arm makes it fit.
-  "atomic_cas_regpressure",
-  # `instrOperandInPlace` — read a register-homed symbol operand where it lies
-  # instead of copying it into a register the row then cannot find — is x86-64
-  # ONLY, deliberately: that is the machine whose whole emitter budget is two
-  # registers, and every atomic sequence there was read to confirm it writes no
-  # operand. a64 has x9–x13 plus two bridges and passes this fixture unstressed;
-  # porting the rule is a separate change with its own reading of the LDXR/STXR
-  # sequences, not a paste.
-  "atomic_cas_operand_home",
+  # (`atomic_cas_regpressure` and `atomic_cas_operand_home` lived here for the
+  # "intrinsic-operand pick has no arm that evicts a live local" class. Both were
+  # listed when a call-free local took a VOLATILE register first and that meant
+  # x9/x10/x11 — the emitter's own scratch pool — so at the `(instr acx.0 …)` every
+  # register a k=3 machine has was a live local's home or an already-reserved
+  # operand temp, and `takeInstrReg` failed loudly. `IntLocalTempRegsN` then put the
+  # ARGUMENT registers first (x1–x7 before x9–x13), which is what its own doc
+  # comment claims it does for exactly these two fixtures: `a.0`/`b.0`/`c.0` now
+  # home in x1/x2/x3 and the whole scratch pool is still there when the atomic row
+  # asks. Both pass at k=3, with and without the death-point exemption — the entries
+  # were simply never pruned after that reorder.)
   # (`shift_count_clobbers_mask` lived here for the "stackoff into a value slot"
   # class — a spilled `(u 8)` whose slot arkham declared `(i 64)`. Slots now carry
   # their own type, so the class is gone and the fixture passes.)
@@ -2443,13 +2407,24 @@ when (defined(linux) and defined(amd64)) or (defined(macosx) and defined(arm64))
                     level = (when defined(macosx): arkhamStressA64Level
                              else: arkhamStressLevel))
 
-# The `{.assembler.}` rejections are x86-64-only (see `arkhamRejectionTests`).
-when defined(linux) and defined(amd64):
+# The `{.assembler.}` rejections are x86-64-only (see `arkhamRejectionTests`), but
+# they are COMPILE-only — arkham is told `-a:x64` and the expectation is an error
+# message — so they need an x86-64 target, not an x86-64 host.
+when defined(linux):
   arkhamRejectionTests(("bin" / "arkham").addFileExt(ExeExt))
+
+when defined(linux) and defined(amd64):
   # The debug-info check runs on the x86-64 host binaries `arkhamTests` just
   # built; the AArch64 half of the same tables is covered by the qemu pass only
   # as far as "the program still runs" — a host GDB cannot read its registers.
   arkhamDebugInfoTests()
+
+# The Win64 suites ask WINE to be the authority, and wine decides for itself
+# whether it can run an x86-64 PE on this host (it skips with a message when it is
+# absent). An arm64 host that has it gets the coverage: `win64Machine` shares the
+# allocator this work changes — rax is its return register too — so its prologues
+# move with x86-64's, and nothing else here would notice.
+when defined(linux):
   arkhamWinUnwindTests()
   arkhamWinTraceTableTests()
   arkhamWinStdcallTests()
@@ -2470,6 +2445,28 @@ when defined(linux) and defined(amd64):
 when defined(linux) and defined(arm64):
   arkhamQemuTests()
 
+  # …and the mirror of the amd64 host's qemu pass: emit the corpus for `x64` and run
+  # it under `qemu-x86_64`. x86-64 and AArch64 are different register allocators
+  # sharing one analyser — `intLocalTempRegs` is the ARGUMENT registers on one and
+  # the scratch pool on the other, rax has instruction roles x0 does not — so an
+  # allocator change that is byte-identical on a64 can still be wrong here, and
+  # without this pass an AArch64 developer has no way to find out before CI.
+  let qemuX64 = requiredExe("qemu-x86_64", "the x64 run tests on an arm64 host")
+  if qemuX64.len > 0:
+    arkhamTests(arch = "x64", runner = qemuX64, label = "x64 (qemu) ")
+    # …and the starved-register-file pass over the same fixtures, at the SAME level
+    # the amd64 host uses. This is the half that actually catches allocator work: an
+    # unstressed corpus never runs a pool dry, so a change that takes a register away
+    # from the emitter shows up only here. The rax death-point home (8b94ff5) passed
+    # every unstressed x64 test and pushed `array2d` into the documented bridge-budget
+    # assert at k=2 — found by CI, not here, until this pass existed.
+    arkhamStressTests(arch = "x64", runner = qemuX64,
+                      skip = arkhamOsxOnly & arkhamX64Unsupported,
+                      known = arkhamStressKnown, level = arkhamStressLevel)
+  else:
+    echo "qemu-x86_64 not found — skipping the x64 run tests " &
+         "(install: sudo apt-get install qemu-user)"
+
 # The hand-written AArch64 fixture assembled above is a `linux_arm64` ELF: run it.
 when defined(linux):
   if requiredExe("qemu-aarch64", "the a64 stress and slot-base-free passes").len > 0:
@@ -2481,8 +2478,12 @@ when defined(linux):
   else:
     echo "qemu-aarch64 not found - skipping a64_slot_base_free"
 
-# The AArch64 backend gets the same starved-pool pass, under qemu.
-when defined(linux) and defined(amd64):
+# The AArch64 backend gets the same starved-pool pass, under qemu — and an arm64
+# host needs it just as much: the death-point exemption (a42f158) homes dying locals
+# in x9–x13, which IS the emitter's scratch pool, so this is the pass that says
+# whether the allocator has taken a register the emitter still needed. `qemu-aarch64`
+# is the shim on such a host (see the note above `arkhamQemuTests`).
+when defined(linux) and (defined(amd64) or defined(arm64)):
   if requiredExe("qemu-aarch64", "the a64 stress and slot-base-free passes").len > 0:
     arkhamStressTests(arch = "linux_arm64", runner = "qemu-aarch64",
                       skip = arkhamLinuxA64Unsupported & arkhamA64Unsupported &
