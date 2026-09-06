@@ -966,6 +966,23 @@ proc analyseProc*(buf: var TokenBuf; procDecl: Cursor;
       # `DivRegOk`/`ShiftRegOk` here: rdx/rcx are argument registers on x86-64, which
       # is exactly what this grant may not hand out.
       vi.props.incl DiesAtCall
+      # The RETURN register is the only non-argument volatile x86-64 has to offer
+      # (r10/r11 are the emitter's scratch and bridge, which may carry no binding at
+      # all), and it is not free: `idiv` takes rax as dividend and leaves the
+      # quotient there, `cmpxchg` takes it as its architectural comparand, and the
+      # inline aggregate-copy lowering uses it as the transfer register. None of
+      # those is a CALL, so the interval test above cannot see them — this is the
+      # per-register proof that does. The div test is statement-aware for the same
+      # reason `DivRegOk`'s is: a local whose last use precedes the clobber INSIDE
+      # the same statement is still consumed after it executes.
+      # `clobbersBridgeReg` stands in for the atomic and aggregate-copy claims,
+      # which have no position list — any `(instr …)` row sets it, so a body with
+      # one gives the register up wholesale rather than guessing.
+      var claimsRet = c.res.clobbersBridgeReg
+      if not claimsRet:
+        for s in c.divPositions:
+          if s.pos > lo and hi >= s.stmtStart: (claimsRet = true; break)
+      if not claimsRet: vi.props.incl RetRegOk
   # ArgResident: a PARAM (freeAfter == high) may keep its incoming arg register instead of
   # a callee-saved home iff EVERY use of it executes before ANY call returns
   # (`not usedAfterCall`). Then no call clobbers the arg register while the param is live;

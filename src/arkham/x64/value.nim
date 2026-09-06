@@ -3753,8 +3753,29 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
       g.tailCallEmitted = true
     else: g.ab.keyword CallX64
     g.flushArgResidentParams()
+    # `releaseArgDest`, one step later and for the RETURN register — and it runs
+    # after EVERY call, not only the ones with a result. rax is caller-saved: the
+    # call clobbered it, so any name still bound to it is dead here by construction,
+    # exactly as `flushArgResidentParams` argues for the argument registers just
+    # above (and it emits its own `(kill …)`s at this position, so a kill is legal
+    # here). Two things go wrong without it, and only the first needs a result:
+    #
+    #  * the result ANNOUNCEMENT below, `(mov rax (res ret.0))`, is spelled by
+    #    `emReg` under whatever name rax carries — `(mov tmp.2 (res ret.0))`, a
+    #    `(u 32)` local receiving the callee's `(i 64)` result, which nifasm rejects;
+    #  * a later `div`/`idiv` anywhere in the proc: nifasm tracks the BINDING, not
+    #    the value's live range, so a name arkham stopped caring about at its last
+    #    use is still bound at the division and "div clobbers RAX, still bound to
+    #    variable" is refused. A void call left the binding standing.
+    #
+    # The one shape that puts a LOCAL on rax is `RetRegOk` (see `analyser`), whose
+    # whole claim is that the value dies at this very call: its last use was
+    # marshalled into the arguments above, before the `(call)`.
+    if not doTail: g.releaseStaleName(RAX)
     if not doTail and hasResult and not resultByRef and not resultIsFloat and
        resSlot.kind != AMem:
+      # The binding-establishing move. `emReg` now emits the raw `(rax)` tag, which
+      # is what the announcement wants.
       g.ab.tree MovX64:
         g.emReg RAX
         g.ab.tree ResX: g.ab.sym synth("ret.0")

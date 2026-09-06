@@ -480,7 +480,7 @@ proc getSym(b: var Builder; name: string; slot: AsmSlot; props: VarProps): Locat
       r = b.takeReg(b.freeVol, [b.md.shiftCountReg])
     if r == NoReg and DivRegOk in props and b.md.divRemReg != NoReg:
       r = b.takeReg(b.freeVol, [b.md.divRemReg])
-  elif DiesAtCall in props and b.md.arch != X86:
+  elif DiesAtCall in props:
     # The one call in this value's interval is the call that CONSUMES it (the
     # death-point exemption in `analyser`), so the value need not survive anything —
     # but a volatile ARGUMENT register is still wrong: a sibling argument staged
@@ -491,20 +491,22 @@ proc getSym(b: var Builder; name: string; slot: AsmSlot; props: VarProps): Locat
     # and this grant is correctly a no-op). The call clobbers the register on the
     # way out, which costs nothing: the value is dead by then.
     #
-    # x86-64 is excluded because it has no register to give, and the exclusion is
-    # LOAD-BEARING rather than a preference. Its non-argument volatiles are rax (the
-    # return register), r10 and r11 — and r10/r11 are the emitter's scratch and
+    # x86-64 draws from a pool of ONE, and a different one: its non-argument
+    # volatiles are rax, r10 and r11, and r10/r11 are the emitter's scratch and
     # staging bridge, which `mem.nim`'s `emReg` asserts may never carry a named
-    # binding ("every value/address-carrying R10/R11 use must be a typed binding").
-    # Removing the `arch != X86` test and re-emitting the nifbench corpus fails that
-    # assert in 9 of 42 modules. That is also why `intLocalTempRegs` there is
-    # rdi/rsi/r8/r9 — ARGUMENT registers, which only `AllRegs` (no marshalling while
-    # the value is live) can safely hand out, and which this grant may not. The
-    # class this exemption draws from is simply empty on SysV x86-64.
+    # binding at all. That leaves the RETURN register, which the allocator does not
+    # otherwise own — `seedPools` lends it out for this and nothing else, exactly as
+    # it lends rdx/rcx to `DivRegOk`/`ShiftRegOk`. `RetRegOk` is the proof that
+    # rax's non-call roles (idiv, cmpxchg, the aggregate-copy transfer) stay clear
+    # of this value's life, and `releaseRetDest` (x64/value.nim) is what stops the
+    # callee's own result announcement being spelled under the dying local's name.
     #
     # Fallback to callee-saved keeps the register COUNT identical to before, so no
     # local that had a register loses one.
-    r = b.takeReg(b.freeVol, b.md.intTempRegs)
+    if b.md.arch == X86:
+      if RetRegOk in props: r = b.takeReg(b.freeVol, [b.md.intRetReg])
+    else:
+      r = b.takeReg(b.freeVol, b.md.intTempRegs)
     if r == NoReg: r = b.takeReg(b.freeCallee, b.md.intCalleeSaved)
   else:
     # may be live across a real call → must be callee-saved (or stack)
@@ -1344,7 +1346,11 @@ proc seedPools(b: var Builder) =
   # Cortex-M answers like AArch64 — r0 is its return register and is likewise kept
   # out of both temp pools, so the same "drawn only by the returned local" property
   # holds.
-  if b.md.arch in {Arm64, ThumbM, Rv32} and b.md.intRetReg != NoReg:
+  # x86-64 joins them, for a different client: there `RetRegOk` — a value that dies
+  # at its consuming call and whose interval claims none of rax's instruction roles
+  # — is the only thing that draws rax, again by an explicit `[intRetReg]`
+  # candidate. `takeRet` above stays RISC-only.
+  if b.md.intRetReg != NoReg:
     b.freeVol.incl b.md.intRetReg
   for r in b.md.intCalleeSaved: b.freeCallee.incl r
   for f in b.md.floatTempRegs: b.freeVolF.incl f
