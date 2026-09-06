@@ -3531,6 +3531,16 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
         g.tailCallEmitted = true
       else: g.ab.keyword CallX64
     g.flushArgResidentParams()
+    # The RETURN register, released for the same reason and at the same point as on
+    # the declarative path below — see the long note there. It belongs on BOTH paths:
+    # `RetRegOk` (see `analyser`) homes a dying local in rax without knowing how its
+    # consuming call will marshal, and THIS is the path a float parameter or result
+    # takes. `bitabs.rebuildIndex`'s `hash(t.vals[i])` is exactly that shape: the
+    # `(ptr (f 64))` address is the dying local, its last use is the `movsd` that
+    # reads through it into xmm0, and with the binding left standing
+    # `settleCallResult`'s `(mov <dest> rax)` came out as `(mov <dest> x.169)` — a
+    # read of a register the call had just clobbered, which nifasm refuses.
+    if not doTail: g.releaseStaleName(RAX)
     g.rb.unsealAccums(sealedArgs)
     if fnTargetName.len > 0:
       g.ab.tree KillX64: g.ab.sym fnTargetName
