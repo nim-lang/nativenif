@@ -1,0 +1,44 @@
+(.nif27)
+(stmts
+ (gvar :fg.0 .
+  (f 32)21.0)
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :getptr.0
+  (params)
+  (ptr
+   (f 32)).
+  (stmts
+   (ret
+    (addr fg.0))))
+ (proc :twice.0
+  (params
+   (param :x.0 .
+    (f 32)))
+  (i 32).
+  (stmts
+   (ret
+    (conv
+     (i 32)
+     (mul
+      (f 32)x.0 2.0)))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :p.0 .
+    (ptr
+     (f 32))
+    (call getptr.0))
+   (var :h.0 .
+    (i 32)
+    (call twice.0
+     (deref p.0)))
+   (call exit.0 h.0))))
