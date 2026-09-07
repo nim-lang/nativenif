@@ -90,6 +90,79 @@ block div_forms:
       b2.bigIntLit "3"
   expect "i64 div truncates natively", render(b2), "let x = (10n / 3n);"
 
+  var b3 = createTop()
+  b3.tree Let:
+    b3.symDef "x"
+    b3.tree Div:
+      b3.width wF64
+      b3.symUse "a"
+      b3.symUse "b"
+  expect "f64 div must not truncate the quotient", render(b3),
+         "let x = (a / b);"
+
+block mul_forms:
+  # `a * b | 0` rounds the product to a double before the wrap, so a product
+  # above 2^53 has already lost its low bits. `Math.imul` is the hardware
+  # multiply and keeps them.
+  var b = createTop()
+  b.tree Let:
+    b.symDef "x"
+    b.tree Mul:
+      b.width wI32
+      b.symUse "a"
+      b.symUse "b"
+  expect "i32 mul uses Math.imul", render(b), "let x = (Math.imul(a, b) | 0);"
+
+  var b2 = createTop()
+  b2.tree Let:
+    b2.symDef "x"
+    b2.tree Mul:
+      b2.width wU32
+      b2.symUse "a"
+      b2.symUse "b"
+  expect "u32 mul uses Math.imul too", render(b2),
+         "let x = (Math.imul(a, b) >>> 0);"
+
+  var b3 = createTop()
+  b3.tree Let:
+    b3.symDef "x"
+    b3.tree Mul:
+      b3.width wF64
+      b3.symUse "a"
+      b3.symUse "b"
+  expect "f64 mul is the plain product", render(b3), "let x = (a * b);"
+
+block cvt_narrow_forms:
+  # `Number(big)` rounds to the nearest double: the low bits the narrow must
+  # keep are exactly what rounding past 2^53 discards. The narrow happens
+  # inside BigInt, and only then becomes a Number.
+  var b = createTop()
+  b.tree Let:
+    b.symDef "x"
+    b.cvtNode(wI64, wI32):
+      b.bigIntLit "9007199254740997"
+  expect "big to i32 narrows inside BigInt", render(b),
+         "let x = (Number(BigInt.asIntN(32, 9007199254740997n)) | 0);"
+
+  var b2 = createTop()
+  b2.tree Let:
+    b2.symDef "x"
+    b2.cvtNode(wI64, wU16):
+      b2.bigIntLit "65541"
+  expect "big to u16 narrows unsigned", render(b2),
+         "let x = (Number(BigInt.asUintN(16, 65541n)) << 16 >>> 16);"
+
+block neg_forms:
+  # `-` spliced before a negative literal reads as a decrement of it, even
+  # inside outer parens; the operand carries its own.
+  var b = createTop()
+  b.tree Let:
+    b.symDef "x"
+    b.tree Neg:
+      b.width wI32
+      b.numLit -5
+  expect "neg of a negative literal", render(b), "let x = ((-(-5)) | 0);"
+
 block shift_forms:
   var b = createTop()
   b.tree Let:

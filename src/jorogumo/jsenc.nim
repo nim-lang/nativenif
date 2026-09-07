@@ -499,7 +499,15 @@ proc exprText(c: Cursor; indent: int): string =
     let fromFl = fromW in {wF32, wF64}
     let toFl = toW in {wF32, wF64}
     var s = v
-    if fromBig and not toBig: s = "Number(" & s & ")"
+    if fromBig and not toBig:
+      if toW in {wI8, wU8, wI16, wU16, wI32, wU32}:
+        # Narrow INSIDE BigInt first: `Number(big)` rounds to the nearest
+        # double, and the low bits the narrow must keep are exactly what
+        # rounding past 2^53 throws away.
+        let bits = if toW in {wI8, wU8}: 8 elif toW in {wI16, wU16}: 16 else: 32
+        s = (if toW in {wI8, wI16, wI32}: "BigInt.asIntN(" & $bits & ", "
+             else: "BigInt.asUintN(" & $bits & ", ") & s & ")"
+      s = "Number(" & s & ")"
     elif toBig and not fromBig:
       s = (if fromFl: "BigInt(Math.trunc(" & s & "))"
            elif fromW == wU8: "BigInt((" & s & ") & 0xFF)"
@@ -555,13 +563,26 @@ proc exprText(c: Cursor; indent: int): string =
     template bin(op: string): string = wrap("(" & ops[0] & op & ops[1] & ")")
     template cmp(op: string): string =
       "(" & ops[0] & op & ops[1] & ")"  # operands are already canonical
-    template uni(op: string): string = wrap(op & ops[0])
+    template uni(op: string): string =
+      # The OPERAND gets its own parens: `-` before a negative literal splices
+      # `--1` even inside outer parens, and that parses as a decrement of a
+      # literal — a SyntaxError, not a number.
+      wrap("(" & op & "(" & ops[0] & "))")
     result = case jsTagOf(c)
       of Add: bin " + "
       of Sub: bin " - "
-      of Mul: bin " * "
+      of Mul:
+        if w in {wI8, wU8, wI16, wU16, wI32, wU32}:
+          # `a * b | 0` rounds the product to a double first, so a product
+          # above 2^53 has lost its low bits before the wrap. `Math.imul`
+          # keeps them: it IS the hardware multiply.
+          wrap "Math.imul(" & ops[0] & ", " & ops[1] & ")"
+        else: bin " * "                         # BigInt is exact; fp wants no imul
       of Div:
         if is64: "(" & ops[0] & " / " & ops[1] & ")"  # BigInt division truncates
+        elif w in {wF32, wF64}:
+          wrap "(" & ops[0] & " / " & ops[1] & ")"  # fp division: truncating the
+                                                   # quotient would be an integer
         else: wrap "Math.trunc(" & ops[0] & " / " & ops[1] & ")"
       of Mod: bin " % "  # JS and BigInt `%` both follow the dividend, like Nim
       of Shl:
