@@ -79,7 +79,7 @@ block div_forms:
       b.width wI32
       b.numLit 7
       b.numLit 2
-  expect "i32 div truncates", render(b), "let x = (Math.trunc(7 / 2) | 0);"
+  expect "i32 div goes through the trap helper", render(b), "let x = (idiv(7, 2) | 0);"
 
   var b2 = createTop()
   b2.tree Let:
@@ -88,7 +88,7 @@ block div_forms:
       b2.width wI64
       b2.bigIntLit "10"
       b2.bigIntLit "3"
-  expect "i64 div truncates natively", render(b2), "let x = (10n / 3n);"
+  expect "i64 div goes through the trap helper", render(b2), "let x = (idiv64(10n, 3n));"
 
   var b3 = createTop()
   b3.tree Let:
@@ -99,6 +99,60 @@ block div_forms:
       b3.symUse "b"
   expect "f64 div must not truncate the quotient", render(b3),
          "let x = (a / b);"
+
+block f32_rounding:
+  # JS computes every operation in double where the hardware f32 op rounds its
+  # result; Math.fround IS that rounding. Without it an f32 intermediate
+  # diverges from wasm and native — e.g. the product compared at f32.
+  var b = createTop()
+  b.tree Let:
+    b.symDef "x"
+    b.tree Add:
+      b.width wF32
+      b.symUse "a"
+      b.symUse "b"
+  expect "f32 add rounds to f32", render(b), "let x = (Math.fround((a + b)));"
+
+  var b2 = createTop()
+  b2.tree Let:
+    b2.symDef "x"
+    b2.tree Mul:
+      b2.width wF32
+      b2.symUse "a"
+      b2.symUse "b"
+  expect "f32 mul rounds to f32", render(b2), "let x = (Math.fround((a * b)));"
+
+block mod_trap:
+  # Integer division and remainder by zero TRAP natively (SIGFPE, wasm trap);
+  # the preamble helpers throw one named error at both widths. fp `%` is fmod
+  # and answers NaN for `x % 0`, like the hardware, so it stays inline.
+  var b = createTop()
+  b.tree Let:
+    b.symDef "x"
+    b.tree Mod:
+      b.width wI32
+      b.numLit 7
+      b.numLit 2
+  expect "i32 mod goes through the trap helper", render(b), "let x = (imod(7, 2) | 0);"
+
+  var b2 = createTop()
+  b2.tree Let:
+    b2.symDef "x"
+    b2.tree Mod:
+      b2.width wI64
+      b2.bigIntLit "7"
+      b2.bigIntLit "2"
+  expect "i64 mod goes through the trap helper", render(b2),
+         "let x = BigInt.asIntN(64, imod64(7n, 2n));"
+
+  var b3 = createTop()
+  b3.tree Let:
+    b3.symDef "x"
+    b3.tree Mod:
+      b3.width wF64
+      b3.symUse "a"
+      b3.symUse "b"
+  expect "f64 mod stays inline", render(b3), "let x = (a % b);"
 
 block mul_forms:
   # `a * b | 0` rounds the product to a double before the wrap, so a product
@@ -209,7 +263,10 @@ block heap_access:
     b.tree HLoad:
       b.width wI32
       b.numLit 16
-  expect "i32 load scales", render(b), "let x = I32[(16) / 4];"
+  # Width 2+ goes through the DataView: a typed array at a fractional index
+  # reads `undefined` and the store vanishes — silent wrong code, worse than
+  # wasm's trap. The byte widths have no fractional index and stay direct.
+  expect "i32 load uses the DataView", render(b), "let x = DV.getInt32(16, true);"
 
   var b2 = createTop()
   b2.tree ExprStmt:
@@ -217,7 +274,7 @@ block heap_access:
       b2.width wF64
       b2.numLit 24
       b2.floatLit 1.5
-  expect "f64 store scales", render(b2), "(F64[(24) / 8] = 1.5);"
+  expect "f64 store uses the DataView", render(b2), "(DV.setFloat64(24, 1.5, true));"
 
   var b3 = createTop()
   b3.tree Let:
@@ -226,6 +283,14 @@ block heap_access:
       b3.width wU8
       b3.symUse "p"
   expect "u8 load unscaled", render(b3), "let x = U8[p];"
+
+  var b4 = createTop()
+  b4.tree Let:
+    b4.symDef "x"
+    b4.tree HLoad:
+      b4.width wI64
+      b4.symUse "p"
+  expect "i64 load uses the BigInt DataView", render(b4), "let x = DV.getBigInt64(p, true);"
 
 # ── 2. composites and the bridge ────────────────────────────────────────────
 

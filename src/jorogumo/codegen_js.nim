@@ -1194,6 +1194,29 @@ proc callDestSize(g: var JsGen; c: Cursor): (int, int) =
   let rt = callResultType(g, c)
   if not rt.cursorIsNil and isAggType(g, rt): result = (byteSize(g, rt), byteAlign(g, rt))
 
+proc aggArgFresh(t: Cursor): bool =
+  ## Argument roots that ALREADY sit in fresh, node-private storage: a
+  ## constructor materialized into its own temp, and a call's sret
+  ## destination. Everything else must be copied before crossing the call
+  ## boundary.
+  t.kind == TagLit and t.exprKind in {OconstrC, AconstrC, CallC}
+
+proc aggArgDestSize(g: var JsGen; c: Cursor): (int, int) =
+  ## What the CALLER must reserve for an aggregate ARGUMENT: a fresh copy
+  ## `(size, align)`, or `(0, 8)` when the argument rides through as it is —
+  ## not an aggregate, already fresh, or a type that cannot be resolved. The
+  ## unresolvable case must not assert here: the refusal for a bad argument
+  ## comes from codegen, naming the symbol, and the plan may not outrun it.
+  ## `planFrame` and `genCall` both consult THIS one predicate, which is how
+  ## the reserved slot and the taken temp cannot disagree.
+  result = (0, 8)
+  if aggArgFresh(c): return
+  if c.kind == Symbol:
+    let nm = symName(c)
+    if not g.p.symType.hasKey(nm) and lookupSym(typeCtx(g), nm).cat == scNone: return
+  let lt = lengType(g, c)
+  if not lt.cursorIsNil and isAggType(g, lt): result = (byteSize(g, lt), byteAlign(g, lt))
+
 type
   FramePlan = object
     ## The state of the pre-order frame walk: which names must be addressable,
@@ -1247,6 +1270,7 @@ proc planNode(g: var JsGen; pl: var FramePlan; c: Cursor; needsTemp: bool) =
       pl.off += max(dsz, 8)
   var t = c
   t.into:
+    var isArg = false                          # child 0 is the target, not an arg
     while t.hasMore:
       var childTemp = needsTemp
       if not nest and t.kind == TagLit and t.exprKind in {ConvC, CastC, BaseobjC}:
@@ -1254,8 +1278,18 @@ proc planNode(g: var JsGen; pl: var FramePlan; c: Cursor; needsTemp: bool) =
         # REACHES a constructor through a reinterpretation is read as a value and
         # copied — so the constructor behind it needs a temporary of its own.
         childTemp = true
+      if isArg and c.exprKind == CallC:
+        # The aggregate argument's fresh copy is reserved HERE, before the walk
+        # into the argument: `genAggArg` takes it ahead of any temporary the
+        # argument's own subtree needs — the same order, or `takeTemp` refuses.
+        let (csz, cal) = aggArgDestSize(g, t)
+        if csz > 0:
+          pl.off = align(pl.off, cal)
+          g.p.tmpPlan.add TempSlot(off: pl.off, size: csz)
+          pl.off += max(csz, 8)
       planNode(g, pl, t, childTemp)
       skip t
+      isArg = true
 
 proc planFrame(g: var JsGen; body: Cursor; params: seq[(string, Cursor)];
                taken: HashSet[string]) =
@@ -1595,6 +1629,20 @@ proc genCalleeValue(g: var JsGen; target: Cursor) =
   else:
     genExpr(g, target)                          # a cast or a closure-field load
 
+proc genAggArg(g: var JsGen; t: Cursor; sz: int) =
+  ## Pass an aggregate argument BY REFERENCE TO A FRESH COPY — ithaqua's
+  ## `genCallArgs` rule: the callee storing through its parameter must not be
+  ## visible in the caller's object. `copyAgg` returns the destination, so the
+  ## copy IS the argument expression. The temp is taken BEFORE the source is
+  ## walked, exactly the order `planFrame` reserved it in.
+  let dst = takeTemp(g, sz)
+  g.outp.openTree Call
+  g.outp.ident "copyAgg"
+  genExpr(g, t)
+  slotAddr(g, dst)
+  g.outp.numLit int64(sz)
+  g.outp.closeTag
+
 proc genIndirectCall(g: var JsGen; target: Cursor; t: var Cursor) =
   ## `(call EXPR ARG*)` dispatching through a fn-ptr VALUE: `FTAB[i](args)`.
   ## The signature is the callee's PROCTYPE, the same one rule typenav uses
@@ -1636,13 +1684,18 @@ proc genIndirectCall(g: var JsGen; target: Cursor; t: var Cursor) =
           while q.hasMore: skip q
         skip paramsT
         if t.hasMore:
-          if agg: genExpr(g, t)
+          let (csz, _) = aggArgDestSize(g, t)
+          if csz > 0: genAggArg(g, t, csz)
+          elif agg: genExpr(g, t)
           else: g.genExprCoerced(t, w)
           skip t
   # anything past the declared parameters (a closure's env, a varargs tail)
-  # rides along as-is — JS hands extra arguments to whoever is willing
+  # rides along as-is — JS hands extra arguments to whoever is willing, but an
+  # aggregate is still copied: pass-by-value does not depend on the signature
   while t.hasMore:
-    genExpr(g, t)
+    let (csz, _) = aggArgDestSize(g, t)
+    if csz > 0: genAggArg(g, t, csz)
+    else: genExpr(g, t)
     skip t
   g.outp.closeTag
 
@@ -2034,13 +2087,18 @@ proc genCall(g: var JsGen; c: Cursor; wantValue: bool) =
               while q.hasMore: skip q
             skip p
             if t.hasMore:
-              if agg: genExpr(g, t)
+              let (csz, _) = aggArgDestSize(g, t)
+              if csz > 0: genAggArg(g, t, csz)
+              elif agg: genExpr(g, t)
               else: g.genExprCoerced(t, w)
               skip t
         while p.hasMore: skip p                # result type, pragmas, body
-      # anything past the declared parameters (a varargs tail) rides along as-is
+      # anything past the declared parameters (a varargs tail) rides along,
+      # aggregates still copied: pass-by-value does not depend on the signature
       while t.hasMore:
-        genExpr(g, t)
+        let (csz, _) = aggArgDestSize(g, t)
+        if csz > 0: genAggArg(g, t, csz)
+        else: genExpr(g, t)
         skip t
       g.outp.closeTag
 

@@ -29,7 +29,13 @@ Options:
   -h, --help               show this help
 """
 
-const DefaultMemBytes = 64 * 1024 * 1024  # §5: 64 MiB linear memory, host-overridable
+const
+  DefaultMemBytes = 64 * 1024 * 1024  # §5: 64 MiB linear memory, host-overridable
+  MaxMemBytes = 2 * 1024 * 1024 * 1024
+    ## Addresses are Numbers, and the emitted arithmetic stays exact below 2^53
+    ## — but `>>> 0` and the stack/heap boundary checks think in uint32. A
+    ## memory above 2 GiB would silently alias through the 32-bit window, so
+    ## the ceiling is stated, not discovered.
 
 proc generate(input, output: string; memBytes: int) =
   # One Leng tag pool for the input; `generateJs` builds its output in a buffer
@@ -53,6 +59,8 @@ proc main() =
     of cmdEnd: discard
   if input.len == 0: quit(Usage, QuitSuccess)
   if output.len == 0: output = input & ".js"
+  if memBytes <= 0 or memBytes > MaxMemBytes:
+    quit "jorogumo: --memory must be in 1.." & $MaxMemBytes & " bytes (2 GiB)\n", QuitFailure
   try:
     generate(input, output, memBytes)
   except JsGenError as e:

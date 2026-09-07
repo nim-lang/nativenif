@@ -38,6 +38,15 @@ const
     "I8", "U8", "I16", "U16", "I32", "U32", "BI64", "BU64", "F32", "F64"
   ]
     ## Typed-array view names over the one `ArrayBuffer` (§1).
+  dvGet: array[WidthCode, string] = [
+    "getInt8", "getUint8", "getInt16", "getUint16", "getInt32", "getUint32",
+    "getBigInt64", "getBigUint64", "getFloat32", "getFloat64"
+  ]
+  dvSet: array[WidthCode, string] = [
+    "setInt8", "setUint8", "setInt16", "setUint16", "setInt32", "setUint32",
+    "setBigInt64", "setBigUint64", "setFloat32", "setFloat64"
+  ]
+    ## The alignment-free accessors; the byte widths keep their direct view.
 
 proc jsPreamble*(memBytes, stackBytes, dataEnd: int): string =
   ## The host contract, emitted once per file: the linear-memory buffer, the
@@ -61,7 +70,8 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int): string =
   "    I16 = new Int16Array(JMEM), U16 = new Uint16Array(JMEM),\n" &
   "    I32 = new Int32Array(JMEM), U32 = new Uint32Array(JMEM),\n" &
   "    F32 = new Float32Array(JMEM), F64 = new Float64Array(JMEM),\n" &
-  "    BI64 = new BigInt64Array(JMEM), BU64 = new BigUint64Array(JMEM);\n" &
+  "    BI64 = new BigInt64Array(JMEM), BU64 = new BigUint64Array(JMEM),\n" &
+  "    DV = new DataView(JMEM);  // width-2+ heap access: no alignment trap, no vanishing store\n" &
   "const EXT = [];  // extern value table: handle -> real JS value (§6)\n" &
   "const FTAB = []; // function table: slot -> JS function; 0 is the null pointer\n" &
   "let errv = 0, ovf = 0; // the flags register, as two globals (ithaqua's model)\n" &
@@ -96,6 +106,7 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int): string =
   "  I32 = new Int32Array(JMEM); U32 = new Uint32Array(JMEM);\n" &
   "  F32 = new Float32Array(JMEM); F64 = new Float64Array(JMEM);\n" &
   "  BI64 = new BigInt64Array(JMEM); BU64 = new BigUint64Array(JMEM);\n" &
+  "  DV = new DataView(JMEM);\n" &
   "  return old;\n" &
   "}\n" &
   # The static image: the wasm data section's twin. Base64 because the image
@@ -126,8 +137,9 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int): string =
   # a 16-byte array is align 16 in C — lands correctly whatever the frame size.
   "let SP_MIN = " & $(memBytes - stackBytes) & ";\n" &
   "let SP = " & $memBytes & ";\n" &
+  # Modulo, not `& ~15`: a bitwise AND goes through ToInt32 and wraps at 2 GiB.
   "function frame(n) {\n" &
-  "  const f = (SP - n) & ~15;\n" &
+  "  const r = SP - n; const f = r - (r % 16);\n" &
   "  if (f < SP_MIN) throw new Error(\"stack overflow\");\n" &
   "  SP = f; return f;\n" &
   "}\n" &
@@ -165,6 +177,19 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int): string =
   "function ctz64(x) { let u = BigInt.asUintN(64, x); if (u === 0n) return 64; let n = 0; while ((u & 1n) === 0n) { u >>= 1n; ++n; } return n; }\n" &
   "function clz64(x) { let u = BigInt.asUintN(64, x); if (u === 0n) return 64; let n = 0; while ((u & 0x8000000000000000n) === 0n) { u <<= 1n; ++n; } return n; }\n" &
   "function popcnt64(x) { let u = BigInt.asUintN(64, x); let n = 0; while (u !== 0n) { u &= u - 1n; ++n; } return n; }\n" &
+  # Aggregate call arguments pass BY REFERENCE TO A FRESH COPY (ithaqua's
+  # genCallArgs): the callee storing through its parameter must not be visible
+  # in the caller's object. Returning the destination makes the copy itself
+  # the argument expression.
+  "function copyAgg(s, d, n) { U8.copyWithin(d, s, s + n); return d; }\n" &
+  # Division by zero traps natively (SIGFPE) and on wasm; JS would hand back
+  # Infinity->0 or a RangeError with a foreign message. One story for both
+  # widths: a named throw — and the helper form means each operand is
+  # evaluated exactly once, which a `b === 0 ? ...` ternary would not give.
+  "function idiv(a, b) { if (b === 0) throw new Error(\"division by zero\"); return Math.trunc(a / b); }\n" &
+  "function imod(a, b) { if (b === 0) throw new Error(\"division by zero\"); return a % b; }\n" &
+  "function idiv64(a, b) { if (b === 0n) throw new Error(\"division by zero\"); return a / b; }\n" &
+  "function imod64(a, b) { if (b === 0n) throw new Error(\"division by zero\"); return a % b; }\n" &
   "function memcmp(a, b, n) {\n" &
   "  for (let i = 0; i < n; i++) {\n" &
   "    const x = U8[a + i], y = U8[b + i];\n" &
@@ -175,8 +200,10 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int): string =
   # The allocator is the osalloc CONTRACT (§5): the same shape as wasm's, and
   # bounded by SP_MIN so the heap can never walk into the shadow stack.
   "let heapTop = " & $dataEnd & ";\n" &
+  # Modulo, not `& ~15`: a bitwise AND goes through ToInt32 and wraps at 2 GiB.
   "function osalloc(_, n) {\n" &
-  "  const b = (heapTop + 15) & ~15; const r = b + ((n + 15) & ~15);\n" &
+  "  const a = heapTop + 15; const b = a - (a % 16);\n" &
+  "  const m = n + 15; const r = b + (m - (m % 16));\n" &
   "  if (r > SP_MIN) throw new Error(\"out of memory\");\n" &
   "  heapTop = r; return b >>> 0;\n" &
   "}\n"
@@ -274,7 +301,12 @@ proc scaleOf(w: WidthCode): int =
 proc wrapNarrow(text: string; w: WidthCode): string =
   ## Canonicalise a result to its declared width. JS bitwise operators already
   ## land on int32, so `|0`/`>>>0` covers 32-bit; 8/16 use the shift-trick.
-  ## Floats need nothing. Both 64-bit widths DO: BigInt is exact and unbounded,
+  ## f64 needs nothing. f32 DOES: JS computes every operation in double, where
+  ## the hardware f32 op rounds its result — `Math.fround` is that rounding,
+  ## and without it an f32 intermediate diverges from wasm and native. On the
+  ## exact cases (a negation, an already-rounded operand) the fround is a
+  ## no-op, so applying it uniformly through `wrap` costs nothing in meaning.
+  ## Both 64-bit int widths DO: BigInt is exact and unbounded,
   ## so `0u64 - 1` would stay -1 where Leng says 2^64-1, and `maxI64 + 1` would
   ## stay 2^63 where the hardware wraps to minI64. wasm wraps i64 ops in the
   ## ALU; the `asIntN` call is that wrap.
@@ -287,6 +319,7 @@ proc wrapNarrow(text: string; w: WidthCode): string =
   of wU32: "(" & text & " >>> 0)"
   of wI64: "BigInt.asIntN(64, " & text & ")"
   of wU64: "(" & text & " & 0xFFFF_FFFF_FFFF_FFFFn)"
+  of wF32: "(Math.fround(" & text & "))"
   else: text
 
 # ── expressions: pure text, built bottom-up ─────────────────────────────────
@@ -484,7 +517,12 @@ proc exprText(c: Cursor; indent: int): string =
     skip it
     let at = exprText(it, indent)
     let s = scaleOf(w)
-    result = viewNames[w] & "[" & (if s > 1: "(" & at & ") / " & $s else: at) & "]"
+    # Width 2+ goes through the DataView: a typed array at a fractional index
+    # reads `undefined` and the store below vanishes — silent wrong code, the
+    # one outcome worse than wasm's trap. The DataView needs no alignment and
+    # costs nothing extra on aligned access; the byte views stay direct.
+    if s == 1: result = viewNames[w] & "[" & at & "]"
+    else: result = "DV." & dvGet[w] & "(" & at & ", true)"
   of HStore:
     var it = c.firstChild
     let w = opWidth(c)
@@ -492,8 +530,9 @@ proc exprText(c: Cursor; indent: int): string =
     let at = exprText(it, indent)
     skip it
     let s = scaleOf(w)
-    result = "(" & viewNames[w] & "[" & (if s > 1: "(" & at & ") / " & $s else: at) &
-      "] = " & exprText(it, indent) & ")"
+    let val = exprText(it, indent)
+    if s == 1: result = "(" & viewNames[w] & "[" & at & "] = " & val & ")"
+    else: result = "(DV." & dvSet[w] & "(" & at & ", " & val & ", true))"
   # ── extern bridge
   of EWrap: result = "ewrap(" & exprText(c.firstChild, indent) & ")"
   of EUnwrap: result = "eunwrap(" & exprText(c.firstChild, indent) & ")"
@@ -593,12 +632,20 @@ proc exprText(c: Cursor; indent: int): string =
           wrap "Math.imul(" & ops[0] & ", " & ops[1] & ")"
         else: bin " * "                         # BigInt is exact; fp wants no imul
       of Div:
-        if is64: "(" & ops[0] & " / " & ops[1] & ")"  # BigInt division truncates
+        # Integer division by zero TRAPS natively; the preamble helper throws
+        # the same named error at both widths instead of Infinity->0 (Number)
+        # or a foreign RangeError (BigInt).
+        if is64: "(idiv64(" & ops[0] & ", " & ops[1] & "))"  # BigInt division truncates
         elif w in {wF32, wF64}:
           wrap "(" & ops[0] & " / " & ops[1] & ")"  # fp division: truncating the
                                                    # quotient would be an integer
-        else: wrap "Math.trunc(" & ops[0] & " / " & ops[1] & ")"
-      of Mod: bin " % "  # JS and BigInt `%` both follow the dividend, like Nim
+        else: wrap "idiv(" & ops[0] & ", " & ops[1] & ")"
+      of Mod:
+        # fp `%` is fmod and answers NaN for `x % 0`, like the hardware; only
+        # the integer worlds get the trap helper.
+        if is64: wrap "imod64(" & ops[0] & ", " & ops[1] & ")"
+        elif w in {wF32, wF64}: bin " % "
+        else: wrap "imod(" & ops[0] & ", " & ops[1] & ")"
       of Shl:
         if is64: "(" & ops[0] & " << BigInt(" & ops[1] & "))"
         else: wrap "(" & ops[0] & " << " & ops[1] & ")"
