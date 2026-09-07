@@ -55,6 +55,7 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int): string =
   ## grow past `SP_MIN`, so the two cannot collide; appended pages land ABOVE
   ## the stack, exactly as they do in wasm, where the same crowding exists at
   ## exhaustion.
+  "const fs = require(\"fs\");  // for the synchronous nim_write below\n" &
   "let JMEM = new ArrayBuffer(" & $memBytes & ");\n" &
   "let I8 = new Int8Array(JMEM), U8 = new Uint8Array(JMEM),\n" &
   "    I16 = new Int16Array(JMEM), U16 = new Uint16Array(JMEM),\n" &
@@ -107,8 +108,10 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int): string =
   # node-only by nature: a browser has no fd 1 to write to (M8 gives DOM
   # programs a console-backed one).
   "function nim_write(fd, buf, len) {\n" &
-  "  const m = Buffer.from(JMEM, buf, len);\n" &
-  "  (fd === 2 ? process.stderr : process.stdout).write(m);\n" &
+  "  // fs.writeSync, not process.stdout.write: the latter is asynchronous on\n" &
+  "  // pipes (macOS/Windows), and the process.exit a `nim_exit` performs would\n" &
+  "  // cut a pending write. The sync call lands before the exit, everywhere.\n" &
+  "  fs.writeSync(fd === 2 ? 2 : 1, Buffer.from(JMEM, buf, len));\n" &
   "  return len;\n" &
   "}\n" &
   "function nim_exit(code) { process.exit(code); }\n" &

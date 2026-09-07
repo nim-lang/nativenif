@@ -451,11 +451,19 @@ proc constScalarBits(g: var JsGen; v: Cursor; ok: var bool): uint64 =
     of NegC:
       var t = v
       t.into:
-        skip t                                 # the type
+        let ty = t                             # the type child decides the kind
+        skip t                                 #   of negation
         var innerOk = true
         let inner = constScalarBits(g, t, innerOk)
         ok = innerOk
-        result = cast[uint64](0'i64 - cast[int64](inner))
+        let sc = scalOf(g, ty)
+        result = if sc.kind in {skF32, skF64}:
+          # IEEE negation flips the sign bit; subtracting the bit pattern from
+          # zero produces a different number entirely. Floats are held as the
+          # f64 pattern here — serializeConstInto narrows f32 at the write.
+          inner xor (1'u64 shl 63)
+        else:
+          cast[uint64](0'i64 - cast[int64](inner))
         while t.hasMore: skip t
     else:
       ok = false
@@ -2817,12 +2825,14 @@ proc generateJs*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   result.add "FTAB[0] = () => { throw new Error(\"nil function pointer\"); };\n"
   for slot in 1 ..< g.tableEntries.len:
     let sym = g.tableEntries[slot]
-    if sym.len > 0:
+    if sym.len > 0 and g.emitted.contains(sym):
       result.add "FTAB[" & $slot & "] = " & jsName(g, sym) & ";\n"
     else:
-      # A slot taken by a proc with no JS body fails HERE, naming itself, rather
-      # than as a "not a function" TypeError at the call site.
-      result.add "FTAB[" & $slot & "] = () => { throw new Error(\"unbound extern\"); };\n"
+      # A slot taken for a proc that was never lowered — a bodyless `importc`
+      # used as a value — binds HERE, naming itself, rather than turning the
+      # whole file into a ReferenceError at load or a "not a function"
+      # TypeError at a call that may never happen.
+      result.add "FTAB[" & $slot & "] = () => { throw new Error(\"unbound extern: " & sym & "\"); };\n"
   # argc/argv/envp reach the host in M6; the exit code is main's, like native's.
   if entryRet.kind == DotToken or isVoidType(entryRet):
     result.add jsName(g, g.entrySym) & "(0, 0, 0);\n"
