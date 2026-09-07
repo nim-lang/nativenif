@@ -1385,10 +1385,10 @@ proc genInlineCall(g: var WasmGen; c: Cursor; wantValue: bool) =
     elif ct.syscall:
       # The WW3 runtime floor: write goes to the host, exit traps the
       # instance. Everything else traps loudly.
+      # the syscall's C name is encoded in the target's asmName
+      # `` <c>`sys.0.<mod> `` (see programs.syprocAsmName)
       var base = nm
-      # the syscall's C name is encoded in the target's asmName "<c>.sys.<mod>"
-      let dotSys = ct.asmName.find(".sys.")
-      if dotSys >= 0: base = ct.asmName[0 ..< dotSys]
+      if ct.asmName.len > 0: base = cNameOfAsmName(ct.asmName)
       case base
       of "write":
         let fdT = lengType(g, t)

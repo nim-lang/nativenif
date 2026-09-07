@@ -564,6 +564,38 @@ proc isDeclarativeAbi*(p: var Program; decl: Cursor): bool =
     while c.hasMore: skip c                   # return type, pragmas, body
   result = true
 
+proc syprocAsmName*(cname, module: string): string =
+  ## The asm symbol for the syscall syproc wrapping the C function `cname`:
+  ## `` write`sys.0.<module> ``. It must be a proper SELF-MODULE symbol, since
+  ## nifasm resolves cross-module symbols by full module-qualified name (the
+  ## render compresses the suffix to a trailing dot and nifasm completes it
+  ## back) — a basename-only `write.sys` would be unresolvable from another
+  ## bundled module that calls it.
+  ##
+  ## The ROLE goes into the IDENTIFIER, where NIF puts a tag, and the
+  ## disambiguator stays the number the spec says it is (nimony/#2457): a
+  ## `.sys.` segment sat in the disambiguator's place and nothing but the
+  ## convention "nimony's are numeric" kept it apart. The backtick keeps the
+  ## result unspellable, so it still cannot collide with syncio's own
+  ## `write.0.<module>`, and keying on the C name still collapses aliases —
+  ## both `die` and `exit` (`importc "exit"`) give one syproc.
+  result = derivedName(cname & ".0", "sys") & "." & module
+
+proc extprocAsmName*(cname, module: string): string =
+  ## The asm symbol for the extern declaration of the C function `cname`:
+  ## `` write`c.0.<module> ``, mirroring `syprocAsmName` for the same reasons.
+  result = derivedName(cname & ".0", "c") & "." & module
+
+proc cNameOfAsmName*(asmName: string): string =
+  ## The C name back out of either of the two above: everything before the
+  ## backtick that introduces the role tag. Returns `asmName` unchanged when
+  ## there is none.
+  result = asmName
+  for i in 0 ..< asmName.len:
+    if asmName[i] == '`':
+      result = substr(asmName, 0, i-1)
+      break
+
 proc thisModuleSuffix*(p: Program): string =
   ## The main module's NIF symbol suffix (e.g. `sysvq0asl`), used to compress
   ## self-module symbol suffixes when serializing the embedded-index output.
@@ -764,16 +796,10 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
           # and declares the kernel's clobbers; calls go through the declarative
           # `(prepare …)` path with a `(syscall)`/`(svc)` marker. See genCall.
           let (_, x64Nr, a64Nr) = lookupSyscall(importcN)
-          # Name the syproc as a proper SELF-MODULE symbol `<name>.sys.<thisModule>`:
-          # nifasm resolves cross-module symbols by full module-qualified name (the render
-          # compresses the suffix to a trailing dot and nifasm completes it back), so a
-          # basename-only `mmap.sys` would be unresolvable from another bundled module that
-          # calls it. Keying on the C `importcN` (not the proc's own `pname`) also collapses
-          # aliases — e.g. both `die` and `exit` (`importc "exit"`) → one syproc. The `.sys.`
-          # disambiguator is RESERVED: nimony proc disambiguators are always numeric, so a
-          # synthesized syproc can never collide with a real proc of the same base name
-          # (e.g. the `write` syscall syproc vs syncio's own `write.0` proc).
-          let asmN = importcN & ".sys." & thisModuleSuffix(result)
+          # Keying on the C `importcN` (not the proc's own `pname`) collapses aliases —
+          # e.g. both `die` and `exit` (`importc "exit"`) → one syproc. See
+          # `syprocAsmName` for the shape and why it is that shape.
+          let asmN = syprocAsmName(importcN, thisModuleSuffix(result))
           result.callTarget[pname] = CallTarget(asmName: asmN, extern: false,
                                                 syscall: true, sysNr: x64Nr, sysNrA64: a64Nr,
                                                 declarative: true, retType: retType, sigType: sigType)
@@ -785,12 +811,10 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
             result.syscalls.add SyscallProc(asmName: asmN, decl: procStart,
                                             sysNr: x64Nr, sysNrA64: a64Nr)
         elif importcN.len > 0:
-          # Name the extproc as a proper SELF-MODULE symbol `<name>.c.<thisModule>`
-          # (mirroring the `.sys.` syprocs above): a basename-only `write.0` has one
-          # dot, so the render would treat it as module-LOCAL and leave it out of the
-          # `.index` — unresolvable when this module is a foreign module of a bundle.
-          # The `.c.` disambiguator is reserved (nimony proc disambiguators are numeric).
-          let asmN = importcN & ".c." & thisModuleSuffix(result)
+          # A basename-only `write.0` has one dot, so the render would treat it as
+          # module-LOCAL and leave it out of the `.index` — unresolvable when this
+          # module is a foreign module of a bundle. See `extprocAsmName`.
+          let asmN = extprocAsmName(importcN, thisModuleSuffix(result))
           if windows and dllN.len == 0:
             # No implicit import library: a Windows extern must NAME its dll
             # (a `dynlib: "kernel32"` on the Nim decl → `(dynlib …)` in Leng).
@@ -964,16 +988,16 @@ proc foreignCallTarget*(p: var Program; name: string): CallTarget =
     result = CallTarget(bitBuiltin: importcN, retType: retType, sigType: sigType)
   elif not p.darwin and not p.windows and importcN.len > 0 and lookupSyscall(importcN).found:
     let (_, x64Nr, a64Nr) = lookupSyscall(importcN)
-    result = CallTarget(asmName: importcN & ".sys." & s.module, extern: false,
+    result = CallTarget(asmName: syprocAsmName(importcN, s.module), extern: false,
                         syscall: true, sysNr: x64Nr, sysNrA64: a64Nr,
                         declarative: true, retType: retType, sigType: sigType)
   elif importcN.len > 0:
     # A genuine libc extern (the foreign module records it in its own externOrder
     # + needsLibSystem; here we only need the matching call target). The asm name
-    # is the module-qualified `<importc>.c.<that module>` the foreign module's
-    # extern decl uses (see the externOrder naming in `collect`).
+    # is the module-qualified name the foreign module's extern decl uses (see
+    # the externOrder naming in `collect`).
     p.needsLibSystem = true
-    result = CallTarget(asmName: importcN & ".c." & s.module, extern: true, retFloat: retFloat,
+    result = CallTarget(asmName: extprocAsmName(importcN, s.module), extern: true, retFloat: retFloat,
                         declarative: p.windows and isDeclarativeAbi(p, declCur),
                         retType: retType, sigType: sigType)
   else:
