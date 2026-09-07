@@ -1550,8 +1550,20 @@ proc genSyscall(g: var JsGen; base: string; t: var Cursor; wantValue: bool) =
     g.genExprCoerced(t, wI32)
     g.outp.closeTag
     while t.hasMore: skip t
+  of "mmap", "munmap", "mprotect", "futex":
+    # Functional syscalls, not a dying path: a program whose point is to map
+    # memory or wait on a futex CANNOT be served here, and trapping at runtime
+    # would silently change what it does. Refused by name, as planned (M7).
+    err g, "syscall `" & base & "` has no JS host binding (the JS bridge is M7)"
   else:
-    err g, "syscall `" & base & "` has no JS host binding"
+    # ithaqua's ruling, kept: a syscall the target cannot serve is `unreachable`,
+    # a loud runtime trap — not a refusal that strands the whole program, and
+    # never a silent no-op. The abort path (getpid/kill) lands here: the program
+    # is already dying, and a throw is the JS twin of the wasm trap.
+    while t.hasMore: skip t
+    g.outp.openTree Call
+    g.outp.ident "nim_unreachable"
+    g.outp.closeTag
 
 proc genCalleeValue(g: var JsGen; target: Cursor) =
   ## The function-table index a callee expression denotes. A proc VALUE is
@@ -2505,7 +2517,7 @@ proc labelTargets(g: var JsGen; c: Cursor): seq[string] =
           while l.hasMore: skip l
       skip t
 
-proc genStmtList(g: var JsGen; c: var Cursor) =
+proc genStmtList(g: var JsGen; c: Cursor) =
   ## `(stmts …)` / `(scope …)`: a JS block, wrapped in one labeled block per
   ## `(lab L)` the list declares. `jmp L` lowers to `break L`, and a `break`
   ## resumes right after L's block — which is why the `(lab L)` statement itself
@@ -2514,20 +2526,29 @@ proc genStmtList(g: var JsGen; c: var Cursor) =
   ## ordinary order is enough.
   g.outp.openTree Block
   let mark = g.p.labs.len
-  for nm in labelTargets(g, c):
+  # Open in REVERSE appearance order, ithaqua's trick with its positional
+  # `br`: the `(lab L)` end markers appear in appearance order, so the first
+  # label must be the INNERMOST block for the closes to unwind LIFO — and it
+  # is also the right region semantics, because `break L` resumes right after
+  # L's block, which is L's end marker, not the end of every later label's
+  # region too. A named JS break does not care which label nests inside which;
+  # both stay lexically enclosing their `jmp`.
+  let targets = labelTargets(g, c)
+  for i in countdown(targets.len - 1, 0):
+    let nm = targets[i]
     g.outp.openTree Label
     g.outp.ident jsName(g, nm)
     g.p.labs.add nm
   var t = c
   t.into:
-    while t.hasMore: genStmt(g, t)
+    while t.hasMore:
+      genStmt(g, t)
   # A list whose `(lab)` marker never ran into this level (a pad's label, closed
   # by an inner list) leaves nothing to close here; the `>` guard keeps that safe.
   while g.p.labs.len > mark:
     discard g.p.labs.pop()
     g.outp.closeTag
   g.outp.closeTag
-  skip c
 
 proc genStmt(g: var JsGen; c: var Cursor) =
   if c.kind == DotToken:
@@ -2569,7 +2590,7 @@ proc genStmt(g: var JsGen; c: var Cursor) =
     if g.p.labs.len == 0 or g.p.labs[^1] != nm:
       # Closing something else would strand a block that a later `jmp` still
       # needs, so this is a shape the generator does not understand.
-      err g, "`lab` `" & nm & "` is not the innermost open label"
+      err g, "`lab` `" & nm & "` is not the innermost open label (open: " & $g.p.labs & ")"
     discard g.p.labs.pop()
     g.outp.closeTag
   of JmpS:

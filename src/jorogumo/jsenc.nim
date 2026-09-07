@@ -112,6 +112,9 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int): string =
   "  return len;\n" &
   "}\n" &
   "function nim_exit(code) { process.exit(code); }\n" &
+  # ithaqua's ruling for a syscall the target cannot serve: `unreachable`, a
+  # loud trap, not a silent no-op. The throw is the JS twin of that trap.
+  "function nim_unreachable() { throw new Error('unreachable: unsupported syscall'); }\n" &
   # The shadow stack (§2): the top `stackBytes` of the buffer, growing DOWN.
   # frame(n) returns the new base and leave(f) restores it; a frame's locals
   # live at byte offsets from the base in the SAME address space as the heap,
