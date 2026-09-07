@@ -68,7 +68,8 @@ block big_add:
       b.width wI64
       b.bigIntLit "1"
       b.bigIntLit "2"
-  expect "i64 add is BigInt", render(b), "let x = (1n + 2n);"
+  expect "i64 add is BigInt and wraps", render(b),
+         "let x = BigInt.asIntN(64, (1n + 2n));"
 
 block div_forms:
   var b = createTop()
@@ -115,7 +116,8 @@ block shift_forms:
       b3.width wI64
       b3.symUse "v"
       b3.numLit 4
-  expect "i64 shr widens the count", render(b3), "let x = (v >> BigInt(4));"
+  expect "i64 shr widens the count", render(b3),
+         "let x = BigInt.asIntN(64, (v >> BigInt(4)));"
 
 block comparisons:
   var b = createTop()

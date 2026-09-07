@@ -1378,6 +1378,8 @@ proc genExpr(g: var JsGen; c: Cursor) =
         let (sz, al) = typeSizeAlign(g.prog, t)
         g.outp.numLit int64(if c.exprKind == SizeofC: sz else: al)
         while t.hasMore: skip t
+    of OvfC: g.outp.ident "ovf"    # the flags register: two preamble globals,
+    of ErrvC: g.outp.ident "errv"  # never addressable (ithaqua's model)
     of NanC: g.outp.lit NanLit
     of InfC: g.outp.lit InfLit
     of NeginfC:
@@ -1808,6 +1810,15 @@ proc genAsgn(g: var JsGen; c: Cursor) =
   t.into:
     let dst = t
     skip t
+    if dst.kind == TagLit and dst.exprKind in {ErrvC, OvfC}:
+      # errv/ovf as destinations → the flag globals, like ithaqua's
+      g.outp.tree ExprStmt:
+        g.outp.openTree Assign
+        g.outp.ident (if dst.exprKind == OvfC: "ovf" else: "errv")
+        genExpr(g, t)
+        g.outp.closeTag
+      while t.hasMore: skip t
+      return
     g.outp.tree ExprStmt: assignTo(g, dst, t)
     while t.hasMore: skip t
 
@@ -1815,6 +1826,193 @@ proc zeroLit(g: var JsGen; w: WidthCode) =
   ## A zero in the right world: a 64-bit slot holds a BigInt, and mixing the two
   ## is a JS type error, not a truncation.
   if w in {wI64, wU64}: g.outp.bigIntLit "0" else: g.outp.numLit 0
+
+proc storeTempTo(g: var JsGen; dst: Cursor; tmp: string; w: WidthCode) =
+  ## Store a materialized, already-canonical value into an lvalue — the store
+  ## half of `assignTo` for the case where the value is a `let`-bound temp
+  ## rather than a cursor, so no coercion is needed.
+  if dst.kind == Symbol and g.p.locals.hasKey(symName(dst)) and
+      g.p.locals[symName(dst)].kind == lkReg:
+    g.outp.tree Assign:
+      g.outp.symUse jsName(g, symName(dst))
+      g.outp.symUse tmp
+    return
+  let ty = lvalueType(g, dst)
+  if isAggType(g, ty):
+    err g, "keepovf destination is not an integer"
+  g.outp.tree HStore:
+    g.outp.width w
+    genAddr(g, dst)
+    g.outp.symUse tmp
+
+proc ovfTest(g: var JsGen; opKind: LengExpr; sc: Scal; w: WidthCode;
+             av, bv, rv: string) =
+  ## The boolean overflow test over the bound temps: operands `av`, `bv` and
+  ## the already-wrapped result `rv`.
+  if sc.kind == skI32:
+    # ithaqua's ≤32-bit move: compare the wrapped result against the WIDE one.
+    # The wide world is BigInt — exact at these widths — and `cvt` moves the
+    # operands there without loss; `!=` then bridges back by value.
+    let bigW = if sc.signed: wI64 else: wU64
+    let op = case opKind
+             of AddC: Add
+             of SubC: Sub
+             else: Mul
+    template cvtTo(v: string) =
+      g.outp.openTree Cvt
+      g.outp.width w
+      g.outp.width bigW
+      g.outp.symUse v
+      g.outp.closeTag
+    g.outp.openTree Neq
+    g.outp.width w
+    cvtTo rv
+    g.outp.openTree op
+    g.outp.width bigW
+    cvtTo av
+    cvtTo bv
+    g.outp.closeTag
+    g.outp.closeTag
+    return
+  # skI64: the classic identities, in BigInt — the same ones ithaqua emits.
+  case opKind
+  of AddC:
+    if sc.signed:
+      # ovf iff sign(a)==sign(b) and sign(r)!=sign(a): ((a^r)&(b^r)) < 0
+      g.outp.openTree Lt
+      g.outp.width w
+      g.outp.openTree And
+      g.outp.width w
+      g.outp.openTree Xor
+      g.outp.width w
+      g.outp.symUse av
+      g.outp.symUse rv
+      g.outp.closeTag
+      g.outp.openTree Xor
+      g.outp.width w
+      g.outp.symUse bv
+      g.outp.symUse rv
+      g.outp.closeTag
+      g.outp.closeTag
+      g.zeroLit w
+      g.outp.closeTag
+    else:
+      g.outp.openTree Lt                       # carry: r < a
+      g.outp.width w
+      g.outp.symUse rv
+      g.outp.symUse av
+      g.outp.closeTag
+  of SubC:
+    if sc.signed:
+      # ovf iff sign(a)!=sign(b) and sign(r)!=sign(a): ((a^b)&(a^r)) < 0
+      g.outp.openTree Lt
+      g.outp.width w
+      g.outp.openTree And
+      g.outp.width w
+      g.outp.openTree Xor
+      g.outp.width w
+      g.outp.symUse av
+      g.outp.symUse bv
+      g.outp.closeTag
+      g.outp.openTree Xor
+      g.outp.width w
+      g.outp.symUse av
+      g.outp.symUse rv
+      g.outp.closeTag
+      g.outp.closeTag
+      g.zeroLit w
+      g.outp.closeTag
+    else:
+      g.outp.openTree Lt                       # borrow: a < b
+      g.outp.width w
+      g.outp.symUse av
+      g.outp.symUse bv
+      g.outp.closeTag
+  else:
+    # mul: ovf iff a != 0 and r/a != b. ithaqua's `a == -1` guard exists only
+    # because wasm's `div` TRAPS on min/-1; BigInt division is exact — it
+    # hands back 2^63, which is `!= b`, and that is exactly the flag wanted.
+    g.outp.openTree LAnd
+    g.outp.width w
+    g.outp.openTree Neq
+    g.outp.width w
+    g.outp.symUse av
+    g.zeroLit w
+    g.outp.closeTag
+    g.outp.openTree Neq
+    g.outp.width w
+    g.outp.openTree Div
+    g.outp.width w
+    g.outp.symUse rv
+    g.outp.symUse av
+    g.outp.closeTag
+    g.outp.symUse bv
+    g.outp.closeTag
+    g.outp.closeTag
+
+proc genKeepovf(g: var JsGen; c: Cursor) =
+  ## `(keepovf (add|sub|mul Type a b) dst)` — overflow-checked arithmetic:
+  ## `(ovf, dst) = a op b`. JS has no flags register; `ovf` is a preamble
+  ## global, and the wrapped result is the renderer's width-wrap doing what
+  ## the wasm ALU does for free.
+  var t = c
+  t.into:
+    let arith = t
+    skip t
+    let dst = t
+    skip t
+    while t.hasMore: skip t
+    var a = arith
+    var opKind: LengExpr
+    var typ, lhs, rhs: Cursor
+    a.into:
+      opKind = arith.exprKind
+      typ = a
+      skip a
+      lhs = a
+      skip a
+      rhs = a
+      skip a
+      while a.hasMore: skip a
+    if opKind notin {AddC, SubC, MulC}:
+      err g, "keepovf on unsupported op: " & $opKind
+    let sc = scalOf(g, typ)
+    if sc.kind notin {skI32, skI64}:
+      err g, "keepovf on a non-integer type"
+    let w = widthOf(sc)
+    let resOp = case opKind
+                of AddC: Add
+                of SubC: Sub
+                else: Mul
+    # Bind the operands and the wrapped result: the tests read each operand
+    # twice, and the result serves both the test and the store.
+    let av = tmpName(g)
+    let bv = tmpName(g)
+    let rv = tmpName(g)
+    g.outp.tree Let:
+      g.outp.symDef av
+      g.genExprCoerced(lhs, w)
+    g.outp.tree Let:
+      g.outp.symDef bv
+      g.genExprCoerced(rhs, w)
+    g.outp.tree Let:
+      g.outp.symDef rv
+      g.outp.openTree resOp
+      g.outp.width w
+      g.outp.symUse av
+      g.outp.symUse bv
+      g.outp.closeTag
+    g.outp.tree ExprStmt:
+      g.outp.openTree Assign
+      g.outp.ident "ovf"
+      g.outp.openTree Cond
+      ovfTest(g, opKind, sc, w, av, bv, rv)
+      g.outp.numLit 1
+      g.outp.numLit 0
+      g.outp.closeTag
+      g.outp.closeTag
+    g.outp.tree ExprStmt:
+      storeTempTo(g, dst, rv, w)
 
 proc leaveFrame(g: var JsGen) =
   ## Pop the shadow stack. Every `return` leaves first, and the epilogue leaves
@@ -2067,6 +2265,7 @@ proc genStmt(g: var JsGen; c: var Cursor) =
   of StmtsS, ScopeS: genStmtList(g, c)
   of VarS: genVar(g, c)
   of AsgnS: genAsgn(g, c)
+  of KeepovfS: genKeepovf(g, c)
   of RetS: genRet(g, c)
   of IfS: genIf(g, c)
   of WhileS:

@@ -41,25 +41,29 @@ const
 
 proc jsPreamble*(memBytes, stackBytes, dataEnd: int): string =
   ## The host contract, emitted once per file: the linear-memory buffer, the
-  ## views above it, the extern-value table of the bridge (§6). `memoryGrow`
-  ## is a capacity refusal, not a reallocation — the wasm `memory.grow`
-  ## contract on a non-growable buffer (M0 decision: default 64 MiB,
-  ## host-overridable).
+  ## views above it, the extern-value table of the bridge (§6). The buffer
+  ## GROWS (`growMem` is wasm `memory.grow`'s twin: reallocate, copy, rebind
+  ## the views; old pages survive, and so does every pointer, because pointers
+  ## ARE offsets). The M0 refusal — `memoryGrow(_) { return -1; }` — was the
+  ## placeholder for this.
   ##
   ## The buffer is split: static data and the bump heap from 0 upwards, the
   ## SHADOW STACK (§2) in the last `stackBytes`, growing down from the top.
   ## Frames are C-style (`frame`/`leave` strictly nested), and because locals
   ## live at byte offsets in the same space as the heap, `addr` of a local and
   ## `deref` of a pointer need no second address space. `osalloc` refuses to
-  ## grow past `SP_MIN`, so the two cannot collide.
-  "const JMEM = new ArrayBuffer(" & $memBytes & ");\n" &
-  "const I8 = new Int8Array(JMEM), U8 = new Uint8Array(JMEM),\n" &
-  "      I16 = new Int16Array(JMEM), U16 = new Uint16Array(JMEM),\n" &
-  "      I32 = new Int32Array(JMEM), U32 = new Uint32Array(JMEM),\n" &
-  "      F32 = new Float32Array(JMEM), F64 = new Float64Array(JMEM),\n" &
-  "      BI64 = new BigInt64Array(JMEM), BU64 = new BigUint64Array(JMEM);\n" &
+  ## grow past `SP_MIN`, so the two cannot collide; appended pages land ABOVE
+  ## the stack, exactly as they do in wasm, where the same crowding exists at
+  ## exhaustion.
+  "let JMEM = new ArrayBuffer(" & $memBytes & ");\n" &
+  "let I8 = new Int8Array(JMEM), U8 = new Uint8Array(JMEM),\n" &
+  "    I16 = new Int16Array(JMEM), U16 = new Uint16Array(JMEM),\n" &
+  "    I32 = new Int32Array(JMEM), U32 = new Uint32Array(JMEM),\n" &
+  "    F32 = new Float32Array(JMEM), F64 = new Float64Array(JMEM),\n" &
+  "    BI64 = new BigInt64Array(JMEM), BU64 = new BigUint64Array(JMEM);\n" &
   "const EXT = [];  // extern value table: handle -> real JS value (§6)\n" &
   "const FTAB = []; // function table: slot -> JS function; 0 is the null pointer\n" &
+  "let errv = 0, ovf = 0; // the flags register, as two globals (ithaqua's model)\n" &
   "let JSP = [null];  // the same table, grown by ewrap\n" &
   "function ewrap(v) {\n" &
   "  if (typeof v === \"number\" || typeof v === \"bigint\") return v;\n" &
@@ -223,8 +227,10 @@ proc scaleOf(w: WidthCode): int =
 proc wrapNarrow(text: string; w: WidthCode): string =
   ## Canonicalise a result to its declared width. JS bitwise operators already
   ## land on int32, so `|0`/`>>>0` covers 32-bit; 8/16 use the shift-trick.
-  ## Floats need nothing. A `u64` DOES: BigInt is exact and unbounded, so
-  ## `0u64 - 1` would otherwise stay -1 where Leng says 2^64-1.
+  ## Floats need nothing. Both 64-bit widths DO: BigInt is exact and unbounded,
+  ## so `0u64 - 1` would stay -1 where Leng says 2^64-1, and `maxI64 + 1` would
+  ## stay 2^63 where the hardware wraps to minI64. wasm wraps i64 ops in the
+  ## ALU; the `asIntN` call is that wrap.
   case w
   of wI8: "(" & text & " << 24 >> 24)"
   of wU8: "(" & text & " << 24 >>> 24)"
@@ -232,6 +238,7 @@ proc wrapNarrow(text: string; w: WidthCode): string =
   of wU16: "(" & text & " << 16 >>> 16)"
   of wI32: "(" & text & " | 0)"
   of wU32: "(" & text & " >>> 0)"
+  of wI64: "BigInt.asIntN(64, " & text & ")"
   of wU64: "(" & text & " & 0xFFFF_FFFF_FFFF_FFFFn)"
   else: text
 
