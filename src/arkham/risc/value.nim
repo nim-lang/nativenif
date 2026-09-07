@@ -100,6 +100,7 @@ proc emitWideToNarrow(g: var CodeGen; innerC, targetC: Cursor;
                       dest: var Location)
 proc wideRet*(g: var CodeGen; c: Cursor)
 proc wideValueIntoTemp*(g: var CodeGen; valC: Cursor): string
+proc wideValueSlot(g: var CodeGen; c: Cursor): WideRef
 # MODEL: the `pickStaging` action in proofs/arkham_bindings.tla — only ever returns a
 # register with no live owner (the `Free` guard); staging on an occupied reg breaks
 # NoSharedRegister. Change this ⇒ re-check that action.
@@ -721,9 +722,24 @@ proc emitMemIntrin2*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
   for idx in 0 ..< nArgs:
     let aSym = if argCurs[idx].kind == Symbol: symName(argCurs[idx]) else: ""
     g.releaseArgDest(g.md.intArgRegs[idx], aSym)         # a dead local's name, if any
+    if g.isWideExpr(argCurs[idx]):
+      # A 64-bit count on a 32-bit target (Cortex-M): the low word IS the count —
+      # `size_t` is the word there — read the way `(conv (i 32) …)` reads a wide
+      # value. Never fires on the 64-bit targets (`isWideSlot` is false there by
+      # construction). Measured: `memcpy_bulk` passes its `(i 64)` loop counter.
+      g.wideLoad(g.md.intArgRegs[idx], g.wideValueSlot(argCurs[idx]), 0)
+      continue
     var aD = regLoc(g.md.intArgRegs[idx], ScalarSlot)
     g.emitValue2(argCurs[idx], aD)                       # → x0 / x1 / x2 directly
-    g.unbindTemp(aD.r)                                   # used raw below
+    if aD.kind != InReg or aD.r != g.md.intArgRegs[idx]:
+      # A fixed register is a REQUEST the value core may answer with the value's
+      # home instead — a spilled local's stack slot, in particular a 64-bit count
+      # on a 32-bit target (measured: Cortex-M on `memcpy_bulk`, where reading
+      # `.r` off the NamedStack answer was a FieldDefect). The loop below reads the
+      # argument registers raw, so bring the value there the way `emitCall2` does
+      # for a function-pointer target that came back off-register.
+      g.place2(aD, g.md.intArgRegs[idx])
+    g.unbindTemp(g.md.intArgRegs[idx])                   # used raw below
   # The three ARGUMENT registers, read off the machine rather than written as
   # slot literals: `a0`/`a1`/`a2` are `x0`/`x1`/`x2` on Arm and `x10`/`x11`/`x12`
   # on RISC-V, where those literals name `zero`, `ra` and `sp` instead.
