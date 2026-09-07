@@ -115,7 +115,7 @@ type
 
   Symbol* = ref object
     name*: SymId      # interned identity in the main-module pool; render with
-                      # `poolSym(pool, sym.name)` where a string is genuinely needed
+                      # `symString(pool, sym.name)` where a string is genuinely needed
                       # (foreign index lookup, dedup, diagnostics, extern emission).
     kind*: SymKind
     typ*: Type        # For procs, this is ProcT; for vars/params, the data type (StackOffT if on stack)

@@ -84,16 +84,16 @@ proc base(id: string): string =
 
 proc mint(pg: var ProcGen; name: string): SymId =
   ## Intern an id name into the shared pool, yielding its `SymId`.
-  pg.pool.syms.getOrIncl(name)
+  symId(pg.pool, name)
 
 proc stem(pg: ProcGen; id: SymId): string =
   ## The readable stem of an already-minted id — its pooled name minus the NIF
   ## module suffix (`int64.0` -> `int64`), used to name ids derived from it.
-  base(poolSym(pg.pool, id))
+  base(symString(pg.pool, id))
 
 proc freshId(m: var Module; prefix: string): SymId =
   inc m.counter
-  result = m.pool.syms.getOrIncl(prefix & $m.counter & idSuffix)
+  result = symId(m.pool, prefix & $m.counter & idSuffix)
 
 # ── types & constants (emitted into the per-proc `types` buffer) ────────────
 

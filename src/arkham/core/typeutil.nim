@@ -164,9 +164,10 @@ proc emTypeSym*(g: var CodeGen; id: SymId) {.inline.} =
   ##
   ## Everything upstream of this call is keyed by the id: `lookupType` and the
   ## layout API over it, `varType`, `Location.StackPtr.pointeeType` /
-  ## `Location.Field.aggrType`, `retAggrSym`. `pool.syms[]` yields `lent string`, so
-  ## the operand costs no copy.
-  g.ab.sym g.prog.pool.syms[id]
+  ## `Location.Field.aggrType`, `retAggrSym`. `symString` builds the spelling
+  ## from the pool's taken-apart form (nimony#2457), so this is the one place
+  ## that pays for it.
+  g.ab.sym symString(g.prog.pool, id)
 
 proc truncateImm*(v: int64; bits: int; signed: bool): int64 {.inline.} =
   ## Keep the low `bits` of `v`, sign-extending when `signed`. A Leng

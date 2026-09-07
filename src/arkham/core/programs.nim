@@ -894,7 +894,7 @@ proc lookupType*(p: var Program; id: SymId): Cursor =
   ## keyed by text). Foreign decls are interned into `p.pool` (see `getDecl`), so an
   ## id from a foreign type's body is comparable with a main-module one.
   if p.typeDecls.hasKey(id): return p.typeDecls[id]
-  let name = p.pool.syms[id]
+  let name = symString(p.pool, id)
   let s = splitSymName(name)
   if s.module.len == 0:
     raiseAssert "arkham: unknown type " & name
@@ -904,7 +904,7 @@ proc lookupType*(p: var Program; id: SymId): Cursor =
   # module — generic-instance names like `t.0.I….<self>.<self>` are the case.
   if s.module == p.scheme.name:
     let localName = name[0 ..< name.len - s.module.len]
-    let localId = p.pool.syms.getOrIncl(localName)
+    let localId = symId(p.pool, localName)
     if p.typeDecls.hasKey(localId): return p.typeDecls[localId]
     raiseAssert "arkham: unknown local type " & name
   let m = loadModule(p, s.module)
@@ -1536,7 +1536,7 @@ proc aggrLayout*(p: var Program; typeSym: SymId): seq[FieldInfo] =
     # underlying type is named by a `Symbol` token, which already carries its id.
     return aggrLayout(p, body.symId)
   assert body.kind == TagLit and body.typeKind == ObjectT,
-    "arkham: aggregate ABI requires an object type: " & p.pool.syms[typeSym]
+    "arkham: aggregate ABI requires an object type: " & symString(p.pool, typeSym)
   layoutObjBody(p, body, 0, result)
 
 proc canHomeInRegPair*(p: var Program; typeSym: SymId): bool =

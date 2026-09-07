@@ -176,18 +176,18 @@ proc writeMachOObject*(a: var GenContext; outfile: string) =
     case sym.kind
     of skProc:
       if labelPos.hasKey(sym.offset):
-        addDef(machoName(poolSym(mpool, sym.name)), macho.moText, uint64(labelPos[sym.offset]))
+        addDef(machoName(symString(mpool, sym.name)), macho.moText, uint64(labelPos[sym.offset]))
       else: -1
     of skRodata:
       if sym.dataConst:
-        (if sym.size < dataRegionSize: addDef(machoName(poolSym(mpool, sym.name)), macho.moData, uint64(sym.size)) else: -1)
+        (if sym.size < dataRegionSize: addDef(machoName(symString(mpool, sym.name)), macho.moData, uint64(sym.size)) else: -1)
       elif labelPos.hasKey(sym.offset):
-        addDef(machoName(poolSym(mpool, sym.name)), macho.moText, uint64(labelPos[sym.offset]))
+        addDef(machoName(symString(mpool, sym.name)), macho.moText, uint64(labelPos[sym.offset]))
       else: -1
     of skGvar:
       # A data symbol must point inside the emitted `__data` region; a zero-size
       # region (`bssOffset == 0`) emits no `__data` section, so skip it then.
-      if sym.size < dataRegionSize: addDef(machoName(poolSym(mpool, sym.name)), macho.moData, uint64(sym.size))
+      if sym.size < dataRegionSize: addDef(machoName(symString(mpool, sym.name)), macho.moData, uint64(sym.size))
       else: -1
     else: -1
 
