@@ -78,7 +78,25 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int): string =
   # The osalloc contract is wasm's: size in 64 KiB pages, grow returns the old
   # page count or -1. Not bytes — osalloc multiplies by 65536 itself.
   "function memorySize() { return JMEM.byteLength >> 16; }\n" &
-  "function memoryGrow(_) { return -1; }  // non-growable by design (§5)\n" &
+  # wasm `memory.grow`'s twin: append `pages` 64 KiB pages, contents intact,
+  # return the OLD page count or -1. Pointers are offsets, so the copy keeps
+  # every one valid; the views are rebound to the new buffer, and every reader
+  # goes through the live binding.
+  "function memoryGrow(pages) {\n" &
+  "  const old = JMEM.byteLength >> 16;\n" &
+  "  let nb;\n" &
+  "  try {\n" &
+  "    nb = new ArrayBuffer(JMEM.byteLength + pages * 65536);\n" &
+  "    new Uint8Array(nb).set(new Uint8Array(JMEM));\n" &
+  "  } catch (e) { return -1; }\n" &
+  "  JMEM = nb;\n" &
+  "  I8 = new Int8Array(JMEM); U8 = new Uint8Array(JMEM);\n" &
+  "  I16 = new Int16Array(JMEM); U16 = new Uint16Array(JMEM);\n" &
+  "  I32 = new Int32Array(JMEM); U32 = new Uint32Array(JMEM);\n" &
+  "  F32 = new Float32Array(JMEM); F64 = new Float64Array(JMEM);\n" &
+  "  BI64 = new BigInt64Array(JMEM); BU64 = new BigUint64Array(JMEM);\n" &
+  "  return old;\n" &
+  "}\n" &
   # The static image: the wasm data section's twin. Base64 because the image
   # is arbitrary bytes and a JS string literal is not.
   "function D(b64, at) {\n" &
@@ -125,6 +143,18 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int): string =
   # The shadow stack is reused memory, so an uninitialized local would read the
   # previous frame's bytes; the back end zeroes what Leng leaves undefined.
   "function zeroMem(d, n) { U8.fill(0, d, d + n); }\n" &
+  # The mem intrinsics Leng emits: ithaqua lowers them to `memory.fill` and a
+  # synthetic byte loop; these are the same three, over the `U8` view.
+  # `memcmp` follows C: the difference of the first differing UNSIGNED byte
+  # pair, 0 when the first n bytes match.
+  "function fillMem(d, v, n) { U8.fill(v, d, d + n); }\n" &
+  "function memcmp(a, b, n) {\n" &
+  "  for (let i = 0; i < n; i++) {\n" &
+  "    const x = U8[a + i], y = U8[b + i];\n" &
+  "    if (x !== y) return x - y;\n" &
+  "  }\n" &
+  "  return 0;\n" &
+  "}\n" &
   # The allocator is the osalloc CONTRACT (§5): the same shape as wasm's, and
   # bounded by SP_MIN so the heap can never walk into the shadow stack.
   "let heapTop = " & $dataEnd & ";\n" &
@@ -363,7 +393,10 @@ proc exprText(c: Cursor; indent: int): string =
   # ── composites
   of Call:
     var it = c.firstChild
-    let fn = exprText(it, indent)
+    var fn = exprText(it, indent)
+    if jsTagOf(it) == Arrow:
+      fn = "(" & fn & ")"                        # an immediately-invoked arrow
+                                                 # needs grouping: `(() => {…})(…)`
     skip it
     var args: seq[string]
     while it.hasMore:

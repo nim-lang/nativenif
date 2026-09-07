@@ -1343,6 +1343,7 @@ proc genSufLit(g: var JsGen; c: Cursor) =
     genExpr(g, t)
 
 proc genCall(g: var JsGen; c: Cursor; wantValue: bool)
+proc genInstr(g: var JsGen; c: Cursor; wantValue: bool)
 
 proc genExpr(g: var JsGen; c: Cursor) =
   case c.kind
@@ -1386,6 +1387,7 @@ proc genExpr(g: var JsGen; c: Cursor) =
       g.outp.tree Neg:
         g.outp.width wF64
         g.outp.lit InfLit
+    of InstrC: genInstr(g, c, wantValue = true)
     of AddC, SubC, MulC, DivC, ModC, ShlC, ShrC, BitandC, BitorC, BitxorC:
       genTypedBinop(g, c)
     of EqC, NeqC, LtC, LeC: genCmp(g, c)
@@ -1624,6 +1626,255 @@ proc genIndirectCall(g: var JsGen; target: Cursor; t: var Cursor) =
     skip t
   g.outp.closeTag
 
+proc emitMemCall(g: var JsGen; fn: string; t: var Cursor) =
+  ## A preamble mem helper, three arguments, each moved to a Number index —
+  ## the same move ithaqua performs by wrapping an `i64` count to `i32`.
+  g.outp.openTree Call
+  g.outp.ident fn
+  g.genExprCoerced(t, wI32)
+  skip t
+  g.genExprCoerced(t, wI32)
+  skip t
+  g.genExprCoerced(t, wI32)
+  skip t
+  while t.hasMore: skip t
+  g.outp.closeTag
+
+proc genMemIntrin(g: var JsGen; name: string; t: var Cursor; wantValue: bool) =
+  ## `memcpy/memmove(dst, src, n)`, `memset(dst, v, n)`, `memcmp(a, b, n)` —
+  ## the bulk ops ithaqua lowers to wasm `memory.copy`/`memory.fill` and a
+  ## synthetic byte loop. The JS twins are preamble helpers over the `U8`
+  ## view; `copyMem` is `copyWithin`, overlap-safe, so BOTH copies take it —
+  ## exactly why wasm's `memory.copy` serves both too.
+  # The CALLER owns the statement wrapper (`genStmt` wraps a call statement;
+  # an expression context wants a value), so this emits a bare call.
+  case name
+  of "memcpy", "memmove":
+    if wantValue: err g, "memcpy result value not modelled"
+    emitMemCall(g, "copyMem", t)
+  of "memset":
+    if wantValue: err g, "memset result value not modelled"
+    emitMemCall(g, "fillMem", t)
+  of "memcmp":
+    # value-returning (C's sign-of-first-difference), so unlike the copies
+    # the result IS modelled; as a statement the value simply goes unused.
+    emitMemCall(g, "memcmp", t)
+  else:
+    err g, "mem intrinsic not supported yet: " & name
+
+proc genInstr(g: var JsGen; c: Cursor; wantValue: bool) =
+  ## `(instr SYM args…)` — an intrinsic/instruction application (nimony
+  ## #2196/#2211). ithaqua's ruling holds: the ATOMICS collapse to plain
+  ## memory ops on a single-threaded target and the memorders are dropped.
+  ## A compound row — one that reads, modifies, stores and maybe returns the
+  ## old value — becomes an immediately-invoked arrow: that is JS for
+  ## ithaqua's scratch locals, it keeps the operand evaluation order the wasm
+  ## path has, and it drops into statement AND expression position alike.
+  ## Rows that JS cannot express at the operand's width stay refusals.
+  var t = c
+  t.into:
+    let nm = symName(t)
+    let it = instrTargetOf(g.prog, nm)
+    skip t
+    case it.op
+    of AtomicLoadOp:
+      let w = widthOf(scalOf(g, lengType(g, c)))
+      g.outp.tree HLoad:
+        g.outp.width w
+        genExpr(g, t)                            # the pointer
+        while t.hasMore: skip t                  # memorder
+    of AtomicStoreOp:
+      if wantValue: err g, "(instr …) atomic store has no value"
+      var vc = t
+      skip vc
+      let w = widthOf(scalOf(g, lengType(g, vc)))
+      g.outp.tree HStore:
+        g.outp.width w
+        genExpr(g, t)                            # pointer
+        skip t
+        g.genExprCoerced(t, w)                   # value
+        while t.hasMore: skip t                  # memorder
+    of AtomicAddFetchOp, AtomicSubFetchOp:
+      # returns the NEW value: load, op, store.
+      let w = widthOf(scalOf(g, lengType(g, c)))
+      let op = if it.op == AtomicAddFetchOp: Add else: Sub
+      let pv = tmpName(g)
+      let rv = tmpName(g)
+      g.outp.openTree Call
+      g.outp.openTree Arrow
+      g.outp.openTree Params
+      g.outp.closeTag
+      g.outp.tree Let:
+        g.outp.symDef pv
+        genExpr(g, t)                            # pointer
+        skip t
+      g.outp.tree Let:
+        g.outp.symDef rv
+        g.outp.openTree op
+        g.outp.width w
+        g.outp.tree HLoad:
+          g.outp.width w
+          g.outp.symUse pv
+        g.genExprCoerced(t, w)                   # delta
+        while t.hasMore: skip t                  # memorder
+        g.outp.closeTag
+      g.outp.tree ExprStmt:
+        g.outp.tree HStore:
+          g.outp.width w
+          g.outp.symUse pv
+          g.outp.symUse rv
+      if wantValue:
+        g.outp.tree Return: g.outp.symUse rv
+      g.outp.closeTag                            # Arrow
+      g.outp.closeTag                            # Call
+    of AtomicFetchAddOp, AtomicFetchSubOp, AtomicFetchAndOp,
+       AtomicFetchOrOp, AtomicFetchXorOp:
+      # returns the OLD value.
+      let w = widthOf(scalOf(g, lengType(g, c)))
+      let op = case it.op
+               of AtomicFetchAddOp: Add
+               of AtomicFetchSubOp: Sub
+               of AtomicFetchAndOp: And
+               of AtomicFetchOrOp: Or
+               else: Xor
+      let pv = tmpName(g)
+      let dv = tmpName(g)
+      let ov = tmpName(g)
+      g.outp.openTree Call
+      g.outp.openTree Arrow
+      g.outp.openTree Params
+      g.outp.closeTag
+      g.outp.tree Let:
+        g.outp.symDef pv
+        genExpr(g, t)                            # pointer
+        skip t
+      g.outp.tree Let:
+        g.outp.symDef dv
+        g.genExprCoerced(t, w)                   # operand
+        skip t
+      while t.hasMore: skip t                    # memorder
+      g.outp.tree Let:
+        g.outp.symDef ov
+        g.outp.tree HLoad:
+          g.outp.width w
+          g.outp.symUse pv
+      g.outp.tree ExprStmt:
+        g.outp.tree HStore:
+          g.outp.width w
+          g.outp.symUse pv
+          g.outp.openTree op
+          g.outp.width w
+          g.outp.symUse ov
+          g.outp.symUse dv
+          g.outp.closeTag
+      if wantValue:
+        g.outp.tree Return: g.outp.symUse ov
+      g.outp.closeTag                            # Arrow
+      g.outp.closeTag                            # Call
+    of AtomicExchangeOp:
+      # (ptr, val, order) → the old value. A single-threaded swap.
+      var pT = lengType(g, t)
+      let elemT = innerType(g.prog, resolveType(g.prog, pT))
+      let w = widthOf(scalOf(g, elemT))
+      let pv = tmpName(g)
+      let vv = tmpName(g)
+      let ov = tmpName(g)
+      g.outp.openTree Call
+      g.outp.openTree Arrow
+      g.outp.openTree Params
+      g.outp.closeTag
+      g.outp.tree Let:
+        g.outp.symDef pv
+        genExpr(g, t)                            # pointer
+        skip t
+      g.outp.tree Let:
+        g.outp.symDef vv
+        g.genExprCoerced(t, w)                   # value
+        skip t
+      while t.hasMore: skip t                    # memorder
+      g.outp.tree Let:
+        g.outp.symDef ov
+        g.outp.tree HLoad:
+          g.outp.width w
+          g.outp.symUse pv
+      g.outp.tree ExprStmt:
+        g.outp.tree HStore:
+          g.outp.width w
+          g.outp.symUse pv
+          g.outp.symUse vv
+      if wantValue:
+        g.outp.tree Return: g.outp.symUse ov
+      g.outp.closeTag                            # Arrow
+      g.outp.closeTag                            # Call
+    of AtomicCompareExchangeOp:
+      # (ptr, expected_ptr, desired, weak, succ_order, fail_order) → bool.
+      # Single-threaded: if *ptr == *expected { *ptr = desired; true }
+      #                  else { *expected = *ptr; false }
+      var pT = lengType(g, t)
+      let elemT = innerType(g.prog, resolveType(g.prog, pT))
+      let w = widthOf(scalOf(g, elemT))
+      let pv = tmpName(g)
+      let ev = tmpName(g)
+      let dv = tmpName(g)
+      let cv = tmpName(g)
+      let rv = tmpName(g)
+      g.outp.openTree Call
+      g.outp.openTree Arrow
+      g.outp.openTree Params
+      g.outp.closeTag
+      g.outp.tree Let:
+        g.outp.symDef pv
+        genExpr(g, t)                            # ptr
+        skip t
+      g.outp.tree Let:
+        g.outp.symDef ev
+        genExpr(g, t)                            # expected: a POINTER
+        skip t
+      g.outp.tree Let:
+        g.outp.symDef dv
+        g.genExprCoerced(t, w)                   # desired
+        skip t
+      while t.hasMore: skip t                    # weak + memorders
+      g.outp.tree Let:
+        g.outp.symDef cv
+        g.outp.tree HLoad:
+          g.outp.width w
+          g.outp.symUse pv
+      g.outp.tree Let:
+        g.outp.symDef rv
+        g.outp.numLit 0
+      g.outp.openTree If
+      g.outp.openTree Eq
+      g.outp.width w
+      g.outp.symUse cv
+      g.outp.tree HLoad:
+        g.outp.width w
+        g.outp.symUse ev
+      g.outp.closeTag
+      g.outp.tree ExprStmt:
+        g.outp.tree HStore:
+          g.outp.width w
+          g.outp.symUse pv
+          g.outp.symUse dv
+      g.outp.tree ExprStmt:
+        g.outp.tree Assign:
+          g.outp.symUse rv
+          g.outp.numLit 1
+      g.outp.openTree Else
+      g.outp.tree ExprStmt:
+        g.outp.tree HStore:
+          g.outp.width w
+          g.outp.symUse ev
+          g.outp.symUse cv
+      g.outp.closeTag                            # Else
+      g.outp.closeTag                            # If
+      if wantValue:
+        g.outp.tree Return: g.outp.symUse rv
+      g.outp.closeTag                            # Arrow
+      g.outp.closeTag                            # Call
+    else:
+      err g, "(instr …) not lowered by jorogumo: " & $it.op
+
 proc genCall(g: var JsGen; c: Cursor; wantValue: bool) =
   var t = c
   t.into:
@@ -1658,13 +1909,36 @@ proc genCall(g: var JsGen; c: Cursor; wantValue: bool) =
       let dotSys = ct.asmName.find(".sys.")
       if dotSys >= 0: base = ct.asmName[0 ..< dotSys]
       genSyscall(g, base, t, wantValue)
+    elif known and ct.memIntrin.len > 0:
+      genMemIntrin(g, ct.memIntrin, t, wantValue)
+    elif known and ct.bitBuiltin.len > 0:
+      # ithaqua lowers these to wasm opcodes; the page pair maps onto the
+      # preamble's `memorySize`/`memoryGrow`. The bit-count builtins are the
+      # M-next `instr` survey — refused by name, never guessed.
+      case ct.bitBuiltin
+      of "__builtin_wasm_memory_size":
+        # () -> pages: the preamble's `memorySize`, wasm `memory.size`'s twin.
+        g.outp.openTree Call
+        g.outp.ident "memorySize"
+        g.outp.closeTag
+        while t.hasMore: skip t                # zero args, drain defensively
+      of "__builtin_wasm_memory_grow":
+        # (delta pages) -> old page count or -1: the preamble reallocates and
+        # copies; offsets survive the move, so the grow is honest, not a stub.
+        g.outp.openTree Call
+        g.outp.ident "memoryGrow"
+        g.genExprCoerced(t, wI32)
+        skip t
+        while t.hasMore: skip t
+        g.outp.closeTag
+      else:
+        err g, "bit builtin `" & ct.bitBuiltin & "` has no JS lowering"
     elif indirect:
       genIndirectCall(g, target, t)
     else:
       var found = false
       let decl = procDeclOf(g, nm, found)
-      if known and (ct.extern or ct.memIntrin.len > 0 or ct.bitBuiltin.len > 0) and
-          not (found and hasBody(decl)):
+      if known and ct.extern and not (found and hasBody(decl)):
         # an `importc` WITH a body is an ordinary definition — the C compiler
         # emits bodies for its importcs too; only the bodyless signature
         # reaches across the M7 bridge.
@@ -2319,6 +2593,9 @@ proc genStmt(g: var JsGen; c: var Cursor) =
   of CallS:
     g.outp.tree ExprStmt:
       genCall(g, c, wantValue = false)
+  of InstrS:
+    g.outp.tree ExprStmt:
+      genInstr(g, c, wantValue = false)
   else: err g, "unsupported statement: " & $c.stmtKind
   skip c                                   # NOT `inc`: that would enter the tree
 
