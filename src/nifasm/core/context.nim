@@ -439,12 +439,12 @@ proc inCall*(ctx: GenContext): bool {.inline.} =
 template nameOf*(ctx: GenContext; s: SymId): string =
   ## Render a `SymId` back to its qualified name string (for the foreign-index
   ## lookup, dedup keys, diagnostics and extern emission — the genuine string sinks).
-  poolSym(ctx.pool, s)
+  symString(ctx.pool, s)
 
 template symIdOf*(ctx: GenContext; s: string): SymId =
   ## Intern a qualified name into the main pool, yielding its scope key. Cheap for a
   ## name already interned (parsing interned every symbol) — a single hash + probe.
-  ctx.pool.syms.getOrIncl(s)
+  symId(ctx.pool, s)
 
 proc newGenContext*(mainPool: Pool; baseDir, thisModule: string;
                     symMap, emitObj, debugInfo: bool; listing: string): GenContext =
