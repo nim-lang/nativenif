@@ -1,0 +1,146 @@
+(.nif27)
+(.indexat 1)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :memcpy.0
+  (params
+   (param :d.0 .
+    (ptr
+     (u 8)))
+   (param :s.0 .
+    (ptr
+     (u 8)))
+   (param :n.0 .
+    (i 64)))
+  (ptr
+   (u 8))
+  (pragmas
+   (importc "memcpy"))
+  (stmts .))
+ (proc :memmove.0
+  (params
+   (param :d.1 .
+    (ptr
+     (u 8)))
+   (param :s.1 .
+    (ptr
+     (u 8)))
+   (param :n.1 .
+    (i 64)))
+  (ptr
+   (u 8))
+  (pragmas
+   (importc "memmove"))
+  (stmts .))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :src.0 .
+    (array
+     (u 8)160).)
+   (var :dst.0 .
+    (array
+     (u 8)160).)
+   (var :sum.0 .
+    (i 64)0)
+   (var :i.0 .
+    (i 64)0)
+   (while
+    (lt i.0 160)
+    (stmts
+     (asgn
+      (at src.0 i.0)
+      (conv
+       (u 8)
+       (add
+        (i 64)
+        (mul
+         (i 64)i.0 7)3)))
+     (asgn i.0
+      (add
+       (i 64)i.0 1))))
+   (var :n.2 .
+    (i 64)0)
+   (while
+    (lt n.2 130)
+    (stmts
+     (asgn i.0 0)
+     (while
+      (lt i.0 160)
+      (stmts
+       (asgn
+        (at dst.0 i.0)170)
+       (asgn i.0
+        (add
+         (i 64)i.0 1))))
+     (call memcpy.0
+      (addr
+       (at dst.0 0))
+      (addr
+       (at src.0 0))n.2)
+     (asgn i.0 0)
+     (while
+      (lt i.0 n.2)
+      (stmts
+       (asgn sum.0
+        (add
+         (i 64)sum.0
+         (mul
+          (i 64)
+          (conv
+           (i 64)
+           (at dst.0 i.0))
+          (add
+           (i 64)i.0 1))))
+       (asgn i.0
+        (add
+         (i 64)i.0 1))))
+     (if
+      (elif
+       (neq
+        (conv
+         (i 64)
+         (at dst.0 n.2))170)
+       (stmts
+        (asgn sum.0
+         (add
+          (i 64)sum.0 100000)))))
+     (asgn n.2
+      (add
+       (i 64)n.2 1))))
+   (call memmove.0
+    (addr
+     (at src.0 0))
+    (addr
+     (at src.0 3))120)
+   (asgn i.0 0)
+   (while
+    (lt i.0 160)
+    (stmts
+     (asgn sum.0
+      (add
+       (i 64)sum.0
+       (mul
+        (i 64)
+        (conv
+         (i 64)
+         (at src.0 i.0))
+        (add
+         (i 64)i.0 1))))
+     (asgn i.0
+      (add
+       (i 64)i.0 1))))
+   (call exit.0
+    (conv
+     (i 32)
+     (mod
+      (i 64)sum.0 251))))))
