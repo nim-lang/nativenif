@@ -1892,6 +1892,32 @@ proc genInstr(g: var JsGen; c: Cursor; wantValue: bool) =
         g.outp.tree Return: g.outp.symUse rv
       g.outp.closeTag                            # Arrow
       g.outp.closeTag                            # Call
+    of CtzOp, ClzOp, PopcountOp:
+      # The portable bit rows — ithaqua's native wasm opcodes. JS has only
+      # Math.clz32; the preamble helpers are the same counts, spelled as
+      # obvious loops. The count comes back a Number and moves to the
+      # declared return width exactly as ithaqua's wrap/extend does.
+      # `litWidth` is the suffix-aware width: getType on a `suf` literal
+      # reports the inner literal's natural type and would pick the 32-bit
+      # helper for a `(suf … "i64")` operand.
+      let big = widthBits(litWidth(g, t)) >= 64
+      let fn = (case it.op
+                of CtzOp: (if big: "ctz64" else: "ctz32")
+                of ClzOp: (if big: "clz64" else: "clz32")
+                else: (if big: "popcnt64" else: "popcnt32"))
+      let retBig = scalOf(g, lengType(g, c)).kind == skI64
+      if retBig:
+        g.outp.openTree Cvt
+        g.outp.width wI32
+        g.outp.width wI64
+      g.outp.openTree Call
+      g.outp.ident fn
+      g.genExprCoerced(t, if big: wI64 else: wI32)
+      skip t
+      while t.hasMore: skip t                    # a trailing operand, drained
+      g.outp.closeTag                            # Call
+      if retBig:
+        g.outp.closeTag                          # Cvt
     else:
       err g, "(instr …) not lowered by jorogumo: " & $it.op
 
@@ -1933,9 +1959,25 @@ proc genCall(g: var JsGen; c: Cursor; wantValue: bool) =
       genMemIntrin(g, ct.memIntrin, t, wantValue)
     elif known and ct.bitBuiltin.len > 0:
       # ithaqua lowers these to wasm opcodes; the page pair maps onto the
-      # preamble's `memorySize`/`memoryGrow`. The bit-count builtins are the
-      # M-next `instr` survey — refused by name, never guessed.
+      # preamble's `memorySize`/`memoryGrow`, the bit-count builtins onto its
+      # count helpers. Anything else is refused by name, never guessed.
       case ct.bitBuiltin
+      of "__builtin_ctz", "__builtin_clz", "__builtin_popcount",
+         "__builtin_ctzll", "__builtin_clzll", "__builtin_popcountll":
+        # ithaqua lowers these to the same wasm opcodes as the instr rows;
+        # the preamble helpers are the JS twins. GCC returns `int`, so the
+        # helper's Number IS the canonical result — no width move, exactly
+        # like ithaqua's `I32WrapI64` on the ll variants.
+        let ll = ct.bitBuiltin.endsWith("ll")
+        g.outp.openTree Call
+        g.outp.ident (case ct.bitBuiltin
+                      of "__builtin_ctz", "__builtin_ctzll": (if ll: "ctz64" else: "ctz32")
+                      of "__builtin_clz", "__builtin_clzll": (if ll: "clz64" else: "clz32")
+                      else: (if ll: "popcnt64" else: "popcnt32"))
+        g.genExprCoerced(t, if ll: wI64 else: wI32)
+        skip t
+        while t.hasMore: skip t
+        g.outp.closeTag
       of "__builtin_wasm_memory_size":
         # () -> pages: the preamble's `memorySize`, wasm `memory.size`'s twin.
         g.outp.openTree Call

@@ -154,6 +154,17 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int): string =
   # `memcmp` follows C: the difference of the first differing UNSIGNED byte
   # pair, 0 when the first n bytes match.
   "function fillMem(d, v, n) { U8.fill(v, d, d + n); }\n" &
+  # The portable bit rows. wasm has i32.ctz/clz/popcount; JS has Math.clz32
+  # and nothing else, so the rest are loops spelled the obvious way. The
+  # count is a Number (0..64) in both worlds; the zero case answers with the
+  # width, like the wasm opcodes do (C calls it UB; nimony guards, but the
+  # wasm target records 32/64 and so does this).
+  "function ctz32(x) { x |= 0; if (x === 0) return 32; let n = 0; while ((x & 1) === 0) { x >>>= 1; ++n; } return n; }\n" &
+  "function clz32(x) { return Math.clz32(x | 0); }\n" &
+  "function popcnt32(x) { x >>>= 0; let n = 0; while (x !== 0) { x &= x - 1; ++n; } return n; }\n" &
+  "function ctz64(x) { let u = BigInt.asUintN(64, x); if (u === 0n) return 64; let n = 0; while ((u & 1n) === 0n) { u >>= 1n; ++n; } return n; }\n" &
+  "function clz64(x) { let u = BigInt.asUintN(64, x); if (u === 0n) return 64; let n = 0; while ((u & 0x8000000000000000n) === 0n) { u <<= 1n; ++n; } return n; }\n" &
+  "function popcnt64(x) { let u = BigInt.asUintN(64, x); let n = 0; while (u !== 0n) { u &= u - 1n; ++n; } return n; }\n" &
   "function memcmp(a, b, n) {\n" &
   "  for (let i = 0; i < n; i++) {\n" &
   "    const x = U8[a + i], y = U8[b + i];\n" &
