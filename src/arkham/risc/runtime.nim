@@ -241,10 +241,10 @@ proc semiTtyName*(g: CodeGen): string {.inline.} =
   ## where it lives in a real program, because `system` is what imports `write`.
   ## The importer loads the shim, the shim names these two, and nifasm has
   ## nothing to resolve them against: "Unknown symbol: `shwh.0 in proc
-  ## write.sys.sysvq0asl".
+  ## write`sys.0.sysvq0asl".
   ##
   ## So they carry the module suffix, exactly as the syprocs beside them do
-  ## (`<name>.sys.<thisModule>`, see `programs.collect`) and for exactly the same
+  ## (`` <name>`sys.0.<thisModule> ``, see `programs.syprocAsmName`) and for the same
   ## reason. The render compresses the suffix back to a trailing dot for a
   ## same-module reference, so the emitted text is unchanged where it already
   ## worked.
@@ -311,14 +311,8 @@ proc emitSemihostRuntime*(g: var CodeGen; sp: SyscallProc) =
   ## rather than allocator output, so its raw r0–r3 uses are correct by
   ## construction and must not trip `emReg`'s unbound-scratch assertion (which
   ## exists to catch a temp that escaped the binder).
-  # `asmName` is `<cname>.sys.<module>` (see programs.collect); take the C name.
-  var base = sp.asmName
-  block:
-    for i in 0 ..< base.len - 4:
-      if base[i] == '.' and base[i+1] == 's' and base[i+2] == 'y' and
-         base[i+3] == 's' and base[i+4] == '.':
-        base = base.substr(0, i - 1)
-        break
+  # `asmName` is `` <cname>`sys.0.<module> `` (see programs.syprocAsmName).
+  let base = cNameOfAsmName(sp.asmName)
   case base
   of "exit":
     g.emitSemihostExitProc(sp.asmName)
