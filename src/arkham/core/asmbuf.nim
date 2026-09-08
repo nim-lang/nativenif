@@ -20,7 +20,7 @@
 
 import std / tables
 import nifcore, nifcoreparse
-import "../../nifasm/core" / [model, tagpool]
+import "../../nifasm/core" / [model, tagpool, tags]
                              # nifasm: A64Inst/NifasmDecl/NifasmType/NifasmExpr,
                              # and the seeded tag pool (with its escape tag)
 import ../risc/machine_a64 as machine
@@ -202,6 +202,23 @@ proc append*(a: var AsmBuf; other: var AsmBuf) =
     skip c
   endRead c
 
+proc peepholeTarget(a: var AsmBuf): Target =
+  ## What the peephole may assume about this machine.
+  ##
+  ## `gprs` comes from the very shim that WROTE the registers into the buffer,
+  ## so "is this name homed in a register a memory base may use" is answered by
+  ## the target rather than by a list kept in step with it. `Reg` slots the
+  ## target does not use render as `<noreg>`; the angle bracket marks them,
+  ## since no machine spells a register that way. The spellings are turned into
+  ## TAGS here rather than compared as strings later: `registerTag` on the
+  ## seeded pool hands back the id the whole vocabulary was seeded with, and
+  ## from there a set membership is a machine word.
+  result = Target(immAnyDest: a.immAnyDest, logicalSetsFlags: a.arch == "x64")
+  for r in low(Reg) .. high(Reg):
+    let nm = a.renderReg(r)
+    if nm.len > 0 and nm[0] != '<':
+      result.gprs.incl cast[TagEnum](uint32(a.buf.tags.registerTag(nm)))
+
 proc render*(a: var AsmBuf; dottedSuffix = ""): string =
   ## Serialize to a full NIF module for nifasm: `(.nif27)` header, body, and a
   ## trailing embedded `(.index …)` (so nifasm resolves cross-module symbols
@@ -212,5 +229,5 @@ proc render*(a: var AsmBuf; dottedSuffix = ""): string =
   ## emitters produce rather than the intentions behind them (see peephole.nim).
   ## `-d:arkhamNoPeephole` turns it off for a bisect.
   when not defined(arkhamNoPeephole):
-    discard peephole(a.buf, a.immAnyDest)
+    discard peephole(a.buf, a.peepholeTarget())
   toModuleString(a.buf, dottedSuffix)
