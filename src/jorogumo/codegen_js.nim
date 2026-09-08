@@ -3109,6 +3109,29 @@ proc generateJs*(buf: var TokenBuf; inputPath: string; tags: TagPool;
   let entryRet = procResultType(entryDecl)
   g.outp.openTree Top
   ensureProc(g, g.entrySym, entryDecl)
+  # Every other exportc proc in the entry module is an external entry point: a
+  # reachability root (so DCE keeps it) and, at the tail, an export the host
+  # calls — the JS twin of ithaqua's exportRoots. A host-driven module (the sumi
+  # engine frame, the ward brain) exposes its whole surface this way; without
+  # this rooting the procs are dead code and vanish.
+  var exportRoots: seq[(string, string)] = @[]   # (decl symbol, C name)
+  for pi in g.prog.procs:
+    if pi.isEntry: continue
+    var nc = pi.decl
+    inc nc                                       # (proc → name
+    if nc.kind != SymbolDef: continue
+    let sym = symName(nc)
+    var d = pi.decl
+    var importcN, exportcN = ""
+    d.into:
+      inc d                                      # name
+      skip d                                     # params
+      skip d                                     # return type
+      parsePragmas(d, importcN, exportcN)
+      while d.hasMore: skip d
+    if exportcN.len > 0 and importcN.len == 0:
+      exportRoots.add (sym, exportcN)
+      ensureProc(g, sym, pi.decl)
   # Lowering and static serialization feed each other across module
   # boundaries: a body addresses a foreign global whose initializer names a
   # proc nobody has reached yet. Run both to the fixpoint.
@@ -3136,7 +3159,27 @@ proc generateJs*(buf: var TokenBuf; inputPath: string; tags: TagPool;
       # TypeError at a call that may never happen.
       result.add "FTAB[" & $slot & "] = () => { throw new Error(\"unbound extern: " & sym & "\"); };\n"
   # argc/argv/envp reach the host in M6; the exit code is main's, like native's.
-  if entryRet.kind == DotToken or isVoidType(entryRet):
+  if exportRoots.len > 0:
+    # A host-driven library (exportc procs, no meaningful main): run the module
+    # init (main drives the ini chain + top level) so globals are live before
+    # the host calls in, expose the exportc procs under their C names, and DO
+    # NOT exit — the host owns the lifecycle. ithaqua exports `_start` + the
+    # roots and lets the host call `_start`; jorogumo runs the init inline at
+    # load, so the host only ever touches the exports.
+    result.add jsName(g, g.entrySym) & "(0, 0, 0);\n"
+    var ex = "module.exports = {"
+    for (sym, cName) in exportRoots:
+      if g.emitted.contains(sym):
+        ex &= "\n  " & cName & ": " & jsName(g, sym) & ","
+    # The host reads results straight out of linear memory (zero-copy planes,
+    # NUL-terminated strings). `memory.buffer` mirrors the wasm export the host
+    # already uses, so the JS engine is a drop-in for the wasm one; it is a
+    # getter because memoryGrow REPLACES JMEM, and a captured reference would
+    # go stale on the first grow.
+    ex &= "\n  memory: { get buffer(){ return JMEM; } },"
+    ex &= "\n};\n"
+    result.add ex
+  elif entryRet.kind == DotToken or isVoidType(entryRet):
     result.add jsName(g, g.entrySym) & "(0, 0, 0);\n"
   else:
     result.add "nim_exit(Number(" & jsName(g, g.entrySym) & "(0, 0, 0)) | 0);\n"
