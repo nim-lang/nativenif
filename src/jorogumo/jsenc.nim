@@ -130,22 +130,31 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int): string =
   # loud trap, not a silent no-op. The throw is the JS twin of that trap.
   "function nim_unreachable() { throw new Error('unreachable: unsupported syscall'); }\n" &
   # The shadow stack (§2): the top `stackBytes` of the buffer, growing DOWN.
-  # frame(n) returns the new base and leave(f) restores it; a frame's locals
-  # live at byte offsets from the base in the SAME address space as the heap,
-  # which is what lets `addr` of a local and `deref` of a pointer share one
-  # representation. The base is 16-aligned so a slot aligned by its own type —
-  # a 16-byte array is align 16 in C — lands correctly whatever the frame size.
+  # frame(n) returns the new base; a frame's locals live at byte offsets from
+  # the base in the SAME address space as the heap, which is what lets `addr`
+  # of a local and `deref` of a pointer share one representation. The base is
+  # 16-aligned so a slot aligned by its own type — a 16-byte array is align 16
+  # in C — lands correctly whatever the frame size.
+  #
+  # leave restores the CALLER's SP, not this frame's base. Restoring the base
+  # would leave SP short by one frame after every call, so a proc called in a
+  # loop (a seq `[]=` — one frame per write) would creep down and trip
+  # SP_MIN. ithaqua keeps a frame POINTER local and restores `fp + frameSize`
+  # on return; JS has no such local, so the entry SP is parked on a parallel
+  # stack. Frames are strictly nested (one frame()/leave() pair per routine,
+  # callees between them), so LIFO push/pop restores the exact entry SP.
   "let SP_MIN = " & $(memBytes - stackBytes) & ";\n" &
   "let SP = " & $memBytes & ";\n" &
+  "const _SPF = [];  // entry SP of each open frame; strictly nested, so LIFO\n" &
   # Modulo, not `& ~15`: a bitwise AND goes through ToInt32 and wraps at 2 GiB.
   "function frame(n) {\n" &
   "  const r = SP - n; const f = r - (r % 16);\n" &
   "  if (f < SP_MIN) throw new Error(\"stack overflow\");\n" &
-  "  SP = f; return f;\n" &
+  "  _SPF.push(SP); SP = f; return f;\n" &
   "}\n" &
-  # leave takes the frame BASE, not its size: `frame` aligns the base down, so
-  # adding the size back would not restore the caller's SP.
-  "function leave(f) { SP = f; }\n" &
+  # `f` (the frame base) is kept in the signature for the call sites that
+  # still pass it; the value that matters for nesting is the parked entry SP.
+  "function leave(f) { SP = _SPF.pop(); }\n" &
   # Bit-level reinterpretation (`cast` between a float and an integer of the
   # same size). One scratch cell, read back through the other view; the program
   # is single-threaded and each helper completes before it returns.
