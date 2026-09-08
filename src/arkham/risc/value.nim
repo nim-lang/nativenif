@@ -1872,15 +1872,7 @@ proc emitValue2*(g: var CodeGen; c: Cursor; dest: var Location) =
         g.produceIntoMem2(c, dest); return
       if dest.kind == InReg:
         if dest.isTemp and not g.rb.isBoundTemp(dest.r): g.bindTemp(dest.r, dest.typ)
-        if dest.typ.cls == AInt:
-          # The register was typed as a plain integer by its consumer — a deref's
-          # address base (`(deref (nil (ptr T)))`, dead code inlining a proc at its
-          # `f(nil)` call site leaves behind) is emitted into a `ScalarSlot`. nifasm
-          # types `(nil)` only into pointer or `(nil)`-typed registers, so spell
-          # the value as the integer it is there.
-          g.movImm(dest.r, 0)
-        else:
-          g.ab.tree MovA64: (g.emReg dest.r; g.ab.nilValue())
+        g.ab.tree MovA64: (g.emReg dest.r; g.ab.nilValue())
     of SizeofC:
       var t = c; var sz = 0'i64
       t.into:

@@ -1901,7 +1901,15 @@ proc resolveLvalVal*(g: var CodeGen; c: Cursor; dest: var Location) =
   of IntLit: g.resolveDest(dest, immLoc(intVal(c), ScalarSlot))
   of UIntLit: g.resolveDest(dest, immLoc(cast[int64](uintVal(c)), ScalarSlot))
   of CharLit: g.resolveDest(dest, immLoc(int64(ord(charLit(c))), ScalarSlot))
-  else: g.forceRegDest(dest)                        # computed: reserve the result
+  else:
+    if c.kind == TagLit and c.exprKind == NilC and dest.kind in {Undef, NeedsReg, RegOrImm}:
+      # A typed nil base — `(deref (nil (ptr T)))`, dead code that splicing a proc at
+      # its `f(nil)` call site leaves behind — is a POINTER value. Reserve its temp
+      # with the nil slot so it binds as `(nil)`, not as the `(i 64)` scalar every
+      # other computed base gets, which nifasm's type check rightly refuses to
+      # receive a `(nil)` (measured: deref_nil_dead on x64 and Cortex-M).
+      dest = needsReg(g.exprSlot(c))
+    g.forceRegDest(dest)                            # computed: reserve the result
 
 proc getExpr*(g: var CodeGen; n: var Cursor; held: bool; what: string) =
   ## PHASE B acquire: home the lvalue-embedded value at `n` and plan it there,
