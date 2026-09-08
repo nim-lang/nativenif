@@ -104,7 +104,12 @@ proc extprocLib*(ctx: var GenContext; n: var Cursor): int =
   ## no enclosing `(imp …)` is on any stack to consult. The Darwin form omits it and
   ## falls back to the module's single library.
   var libName = ""
-  if n.kind == StrLit:
+  # `hasMore` first: the Darwin form ends right after the extern name, and a
+  # cursor sitting at its scope end still reads the NEXT token's kind — a string
+  # literal there (the following decl's extern name) was taken for a dll operand
+  # and `inc` asserted "advancing past end of scope" (measured: nifasm on every
+  # stage-1 boot tool on macOS, from `resolveForeignSym`'s indexed jump).
+  if n.hasMore and n.kind == StrLit:
     libName = getStr(n)
     inc n
   if libName.len > 0:

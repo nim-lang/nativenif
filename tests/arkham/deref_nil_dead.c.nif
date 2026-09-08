@@ -1,0 +1,34 @@
+(.nif27)
+(stmts
+ (type :Node.0 .
+  (object .
+   (fld :rc.0 .
+    (i 64))
+   (fld :val.0 .
+    (i 64))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :acc.0 .
+    (i 64)42)
+   (if
+    (elif
+     (neq
+      (nil
+       (ptr Node.0))
+      (nil
+       (ptr Node.0)))
+     (stmts
+      (asgn acc.0
+       (add
+        (i 64)acc.0
+        (dot
+         (deref
+          (nil
+           (ptr Node.0)))rc.0 0))))))
+   (ret
+    (conv
+     (i 32)acc.0)))))

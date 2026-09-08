@@ -100,6 +100,7 @@ proc emitWideToNarrow(g: var CodeGen; innerC, targetC: Cursor;
                       dest: var Location)
 proc wideRet*(g: var CodeGen; c: Cursor)
 proc wideValueIntoTemp*(g: var CodeGen; valC: Cursor): string
+proc wideValueSlot(g: var CodeGen; c: Cursor): WideRef
 # MODEL: the `pickStaging` action in proofs/arkham_bindings.tla — only ever returns a
 # register with no live owner (the `Free` guard); staging on an occupied reg breaks
 # NoSharedRegister. Change this ⇒ re-check that action.
@@ -160,10 +161,11 @@ proc wideValueIntoTemp*(g: var CodeGen; valC: Cursor): string
 
 # ── mem* intrinsics: inline copies (no libc) ─────────────────────────────────
 # memcpy/memmove/memset/memcmp masquerade as importc calls (see programs.collect).
-# arkham has no C runtime, so each lowers inline. memcpy/memmove copy 8-byte
-# words then a byte tail (a byte loop of the 1.4 MB token block was the whole
-# bif gap on AArch64). A compile-time memcpy of 0..64 bytes unrolls. Result
-# lands in x0 (memcpy/memmove/memset return dest, memcmp the first byte
+# arkham has no C runtime, so each lowers inline. memcpy/memmove copy 16-byte
+# pairs (`ldp`/`stp`) on AArch64, 8-byte words elsewhere, then a byte tail (a
+# byte loop of the 1.4 MB token block was the whole bif gap on AArch64, and the
+# word loop still 2–3x libc). A compile-time memcpy of 0..64 bytes unrolls.
+# Result lands in x0 (memcpy/memmove/memset return dest, memcmp the first byte
 # difference).
 
 # ── case statement ──────────────────────────────────────────────────────────
@@ -720,9 +722,24 @@ proc emitMemIntrin2*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
   for idx in 0 ..< nArgs:
     let aSym = if argCurs[idx].kind == Symbol: symName(argCurs[idx]) else: ""
     g.releaseArgDest(g.md.intArgRegs[idx], aSym)         # a dead local's name, if any
+    if g.isWideExpr(argCurs[idx]):
+      # A 64-bit count on a 32-bit target (Cortex-M): the low word IS the count —
+      # `size_t` is the word there — read the way `(conv (i 32) …)` reads a wide
+      # value. Never fires on the 64-bit targets (`isWideSlot` is false there by
+      # construction). Measured: `memcpy_bulk` passes its `(i 64)` loop counter.
+      g.wideLoad(g.md.intArgRegs[idx], g.wideValueSlot(argCurs[idx]), 0)
+      continue
     var aD = regLoc(g.md.intArgRegs[idx], ScalarSlot)
     g.emitValue2(argCurs[idx], aD)                       # → x0 / x1 / x2 directly
-    g.unbindTemp(aD.r)                                   # used raw below
+    if aD.kind != InReg or aD.r != g.md.intArgRegs[idx]:
+      # A fixed register is a REQUEST the value core may answer with the value's
+      # home instead — a spilled local's stack slot, in particular a 64-bit count
+      # on a 32-bit target (measured: Cortex-M on `memcpy_bulk`, where reading
+      # `.r` off the NamedStack answer was a FieldDefect). The loop below reads the
+      # argument registers raw, so bring the value there the way `emitCall2` does
+      # for a function-pointer target that came back off-register.
+      g.place2(aD, g.md.intArgRegs[idx])
+    g.unbindTemp(g.md.intArgRegs[idx])                   # used raw below
   # The three ARGUMENT registers, read off the machine rather than written as
   # slot literals: `a0`/`a1`/`a2` are `x0`/`x1`/`x2` on Arm and `x10`/`x11`/`x12`
   # on RISC-V, where those literals name `zero`, `ra` and `sp` instead.
@@ -753,26 +770,81 @@ proc emitMemIntrin2*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
         g.binImm(SubA64, i, 1)
         g.emLdrb(b, src, i); g.emStrb(b, dst, i)
       g.emLab(fwd)
-    # Word bulk + byte tail. `i` counts quadwords, then bytes; `b2` is n div 8.
-    let tail = g.freshLabel()
-    g.movReg(b2, n)
-    g.binImm(LsrA64, b2, 3)                              # quadwords = n div 8
-    g.movImm(i, 0)
-    g.emitLoop:
-      g.ab.tree CmpA64: (g.emReg i; g.emReg b2)
-      g.emBr(BhsA64, tail)
-      g.emLoadQwordAt(b, src, i)
-      g.emStoreQwordAt(dst, i, b)
-      g.binImm(AddA64, i, 1)
-    g.emLab(tail)
-    g.binImm(LslA64, i, 3)                               # i = n and not 7, now bytes
-    g.emitLoop:
-      g.ab.tree CmpA64: (g.emReg i; g.emReg n)
-      g.emBr(BhsA64, done)
-      g.emLdrb(b, src, i); g.emStrb(b, dst, i)
-      g.binImm(AddA64, i, 1)
-    g.emLab(done)
-    g.movReg(g.md.intRetReg, dst)
+    # Forward copy. Safe for `memmove` too: this path is taken only for
+    # dst <= src, so every chunk is read before any write can reach it.
+    if g.md.arch == Arm64:
+      # 16 bytes per iteration through the pair instructions: `ldp` post-indexed,
+      # `stp` pre-indexed — the two forms nifasm has, because they are the ones a
+      # prologue/epilogue needs. `stp b, b2, [dst, #16]!` writes at dst+16 and
+      # then keeps dst there, so `dst` runs biased by -16 through the loop and
+      # is un-biased after it. The pointers themselves advance, `n` counts down,
+      # and `i` keeps the original destination for the return value — that is
+      # the whole register budget (x0–x2 plus the three scratch), with nothing
+      # left for an index. Measured against the 8-byte indexed loop this
+      # replaces: it was 2x libc on `nifbench`'s `clone` (a 1.4 MB token block)
+      # and 3x on `bif-load`, the two phases that are nothing but this copy.
+      let tail = g.freshLabel()
+      let unbias = g.freshLabel()
+      g.movReg(i, dst)                                   # the return value
+      g.ab.tree CmpA64: (g.emReg n; g.ab.intLit 16)
+      g.emBr(BloA64, tail)
+      g.binImm(SubA64, dst, 16)
+      g.emitLoop:
+        g.ab.tree LdpA64: g.emReg b; g.emReg b2; g.emReg src; g.ab.intLit 16
+        g.ab.tree StpA64: g.emReg b; g.emReg b2; g.emReg dst; g.ab.intLit 16
+        g.binImm(SubA64, n, 16)
+        g.ab.tree CmpA64: (g.emReg n; g.ab.intLit 16)
+        g.emBr(BloA64, unbias)
+      g.emLab(unbias)
+      g.binImm(AddA64, dst, 16)
+      g.emLab(tail)
+      # One quadword if 8 or more bytes remain, then the byte tail (< 8 bytes).
+      let bytes = g.freshLabel()
+      g.ab.tree CmpA64: (g.emReg n; g.ab.intLit 8)
+      g.emBr(BloA64, bytes)
+      g.ab.tree LdrA64:
+        g.emReg b
+        g.ab.tree MemX: (g.emReg src; g.ab.intLit 0)
+      g.ab.tree StrA64:
+        g.ab.tree MemX: (g.emReg dst; g.ab.intLit 0)
+        g.emReg b
+      g.binImm(AddA64, src, 8)
+      g.binImm(AddA64, dst, 8)
+      g.binImm(SubA64, n, 8)
+      g.emLab(bytes)
+      g.movImm(b2, 0)
+      g.emitLoop:
+        g.ab.tree CmpA64: (g.emReg b2; g.emReg n)
+        g.emBr(BhsA64, done)
+        g.emLdrb(b, src, b2); g.emStrb(b, dst, b2)
+        g.binImm(AddA64, b2, 1)
+      g.emLab(done)
+      g.movReg(g.md.intRetReg, i)
+    else:
+      # Word bulk + byte tail. `i` counts WORDS, then bytes; `b2` is n div wordsize.
+      # `emLoadQwordAt` moves one target word — 8 bytes on the 64-bit targets, 4 on
+      # Cortex-M — so the shift follows the word (measured: a fixed 3 on Cortex-M
+      # copied half the bulk and resumed the byte tail past the gap, memcpy_bulk).
+      let wshift = (if wordBits() == 64: 3 else: 2)
+      let tail = g.freshLabel()
+      g.movReg(b2, n)
+      g.binImm(LsrA64, b2, wshift)                       # words = n div wordsize
+      g.movImm(i, 0)
+      g.emitLoop:
+        g.ab.tree CmpA64: (g.emReg i; g.emReg b2)
+        g.emBr(BhsA64, tail)
+        g.emLoadQwordAt(b, src, i)
+        g.emStoreQwordAt(dst, i, b)
+        g.binImm(AddA64, i, 1)
+      g.emLab(tail)
+      g.binImm(LslA64, i, wshift)                        # i = words * wordsize, now bytes
+      g.emitLoop:
+        g.ab.tree CmpA64: (g.emReg i; g.emReg n)
+        g.emBr(BhsA64, done)
+        g.emLdrb(b, src, i); g.emStrb(b, dst, i)
+        g.binImm(AddA64, i, 1)
+      g.emLab(done)
+      g.movReg(g.md.intRetReg, dst)
   of "memset":
     let done = g.freshLabel()
     g.movImm(i, 0)

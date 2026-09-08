@@ -584,8 +584,9 @@ proc flushFree(b: var Builder; curpos: int) =
   while i < b.pendingFree.len:
     if b.pendingFree[i].pos <= curpos:
       let name = b.pendingFree[i].name
-      b.freeSym name
-      b.freedSyms.incl name
+      if name notin b.freedSyms:       # `closeScope` may have freed it already
+        b.freeSym name
+        b.freedSyms.incl name
       b.pendingFree.del i              # swap-remove; order is irrelevant
     else: inc i
 
@@ -595,9 +596,20 @@ proc closeScope(b: var Builder) =
   ## so a var that was evicted to the stack (its reg stolen by a hotter one)
   ## frees nothing, and the thief frees the register when its own scope ends.
   ## Already early-freed vars are skipped (their reg may now belong to a reuser).
+  ##
+  ## The freed name is RECORDED, for the same reason in the other direction: a
+  ## loop-body local's `freeAfter` is extended to the end of an inner loop it is
+  ## read in, and that can lie past its own scope's close when the scope is one
+  ## `(scope …)` among several in the loop body. Its `pendingFree` entry then
+  ## fired AFTER this close had already returned the register — freeing it a
+  ## second time, out from under whichever local had taken it in between.
+  ## Measured: `nifbench`'s main homed its `TagPool` ref in x22 for the whole
+  ## proc, an inlined reader's locals were handed x22 after the double free, and
+  ## the final `=destroy` ran on garbage.
   for v in b.scopeVars.pop():
     if v in b.freedSyms: continue
     b.freeSym v
+    b.freedSyms.incl v
 
 proc recordValue(b: var Builder; pos: int; loc: Location) {.inline.} =
   ## Plan the value produced AT `pos` into `loc`. This is the position-keyed
@@ -613,6 +625,11 @@ proc recordSym(b: var Builder; pos: int; name: string; loc: Location) =
   ## a single-point rewrite that every use sees.
   b.recordValue(pos, loc)
   b.plan.symPos[name] = pos
+  when defined(arkhamHomeTrace):
+    let vi = b.an.vars.getOrDefault(name)
+    stderr.writeLine "HOMETRACE home proc=" & gArkhamCurProc & " name=" & name &
+      " loc=" & $loc.kind & "/" & (if loc.kind in {InReg, InFReg}: $loc.r else: "-") & " pos=" & $pos & " freeAfter=" & $vi.freeAfter &
+      " lastUse=" & $vi.lastUsePos & " declLoopDepth=" & $vi.declLoopDepth
   b.plan.homesDirty = true
 
 proc coldestVictim(b: var Builder; maxW, ceilLen, thiefDepth: int;
