@@ -821,10 +821,14 @@ proc emitMemIntrin2*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
       g.emLab(done)
       g.movReg(g.md.intRetReg, i)
     else:
-      # Word bulk + byte tail. `i` counts quadwords, then bytes; `b2` is n div 8.
+      # Word bulk + byte tail. `i` counts WORDS, then bytes; `b2` is n div wordsize.
+      # `emLoadQwordAt` moves one target word — 8 bytes on the 64-bit targets, 4 on
+      # Cortex-M — so the shift follows the word (measured: a fixed 3 on Cortex-M
+      # copied half the bulk and resumed the byte tail past the gap, memcpy_bulk).
+      let wshift = (if wordBits() == 64: 3 else: 2)
       let tail = g.freshLabel()
       g.movReg(b2, n)
-      g.binImm(LsrA64, b2, 3)                            # quadwords = n div 8
+      g.binImm(LsrA64, b2, wshift)                       # words = n div wordsize
       g.movImm(i, 0)
       g.emitLoop:
         g.ab.tree CmpA64: (g.emReg i; g.emReg b2)
@@ -833,7 +837,7 @@ proc emitMemIntrin2*(g: var CodeGen; argCurs: seq[Cursor]; builtin: string) =
         g.emStoreQwordAt(dst, i, b)
         g.binImm(AddA64, i, 1)
       g.emLab(tail)
-      g.binImm(LslA64, i, 3)                             # i = n and not 7, now bytes
+      g.binImm(LslA64, i, wshift)                        # i = words * wordsize, now bytes
       g.emitLoop:
         g.ab.tree CmpA64: (g.emReg i; g.emReg n)
         g.emBr(BhsA64, done)
