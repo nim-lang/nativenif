@@ -40,7 +40,7 @@ import nifcore
 
 when defined(arkhamPeepDbg):
   import std / syncio
-  var dbgCand*, dbgPair*: int
+  var dbgCand*, dbgPair*, dbgTest*: int
 
 type
   Occ = object
@@ -48,6 +48,12 @@ type
     benign: bool     ## a `(kill …)` operand or a definition — i.e. NOT a read
 
   Occs = Table[SymId, seq[Occ]]
+
+  Rules = object
+    ## Which rewrites this target allows. Both are target facts, not tuning:
+    ## see `peephole` for what each one asks of the machine.
+    foldImm: bool
+    deadTest: bool
 
 proc collectOccs(buf: var TokenBuf; c: var Cursor; parentIsKill: bool; occs: var Occs) =
   ## Every mention of every symbol, in token order, tagged with whether it is a
@@ -123,11 +129,49 @@ proc movFromSym(buf: var TokenBuf; c: Cursor; src: SymId; destNode: var Cursor):
   skip b
   result = not b.hasMore
 
+proc logicalToSym(buf: var TokenBuf; c: Cursor; dst: var SymId): bool =
+  ## Is `c` an `(and|or|xor D S)` writing the plain symbol `D`? `S` is not
+  ## inspected — a register, a slot and an immediate all leave the same flags.
+  ##
+  ## `add`/`sub` are deliberately NOT here. They leave OF and CF from the
+  ## arithmetic where `test` clears both, so dropping a `test` after them would
+  ## only be sound if every consumer read ZF/SF/PF alone — which is not readable
+  ## from the node, and `jg`/`jle` after an `add` would read the difference. The
+  ## logical ops need no such argument: their flag result IS `test`'s, for every
+  ## flag, so no consumer can tell.
+  if c.kind != TagLit: return false
+  let nm = buf.tags.tagName(c.cursorTagId)
+  if nm != "and" and nm != "or" and nm != "xor": return false
+  var b = sub(c)
+  if not b.hasMore or b.kind != Symbol: return false
+  dst = b.symId
+  skip b
+  if not b.hasMore: return false
+  skip b
+  result = not b.hasMore            # exactly two operands
+
+proc isKillNode(buf: var TokenBuf; c: Cursor): bool =
+  ## `(kill x)` — bookkeeping, not an instruction. nifasm's `genKill` releases
+  ## the stack slot or the register binding and undefines the name; it emits no
+  ## byte and cannot touch the condition flags, which is what lets the rule
+  ## below look past one to find its partner.
+  c.kind == TagLit and buf.tags.tagName(c.cursorTagId) == "kill"
+
+proc testOfSym(buf: var TokenBuf; c: Cursor; s: SymId): bool =
+  ## Is `c` exactly `(test s s)` — the same symbol on both sides?
+  if c.kind != TagLit or buf.tags.tagName(c.cursorTagId) != "test": return false
+  var b = sub(c)
+  if not b.hasMore or b.kind != Symbol or b.symId != s: return false
+  skip b
+  if not b.hasMore or b.kind != Symbol or b.symId != s: return false
+  skip b
+  result = not b.hasMore
+
 proc trList(buf: var TokenBuf; c: var Cursor; dest: var TokenBuf; occs: Occs;
-            limit: int; folded: var int)
+            limit: int; rules: Rules; folded: var int)
 
 proc trNode(buf: var TokenBuf; c: var Cursor; dest: var TokenBuf; occs: Occs;
-            limit: int; folded: var int) =
+            limit: int; rules: Rules; folded: var int) =
   if c.kind == TagLit:
     # A `(proc …)` head is where the scratch-name counter restarts, so it is
     # also where the liveness question has to stop looking: everything inside
@@ -138,18 +182,49 @@ proc trNode(buf: var TokenBuf; c: var Cursor; dest: var TokenBuf; occs: Occs;
       else: limit
     dest.openTag c.cursorTagId
     c.loopInto:
-      trList(buf, c, dest, occs, inner, folded)
+      trList(buf, c, dest, occs, inner, rules, folded)
     dest.closeTag()
   else:
     dest.addSubtree c
     inc c
 
 proc trList(buf: var TokenBuf; c: var Cursor; dest: var TokenBuf; occs: Occs;
-            limit: int; folded: var int) =
+            limit: int; rules: Rules; folded: var int) =
   ## One step of a sibling walk, with the one-node lookahead the rules need.
+  var aluDst: SymId
+  if rules.deadTest and logicalToSym(buf, c, aluDst):
+    # `(and D S)` + `(test D D)` ⇒ drop the test: on x86 the logical ops leave
+    # exactly the flags it would have set, so no consumer can tell. Measured on
+    # nifbench's `parse`, 4.29 M of executed `test` against gcc's ZERO — the
+    # cheapest instruction-selection defect there.
+    #
+    # The only thing allowed between the two is `(kill …)`, and it is what makes
+    # the rule worth having: the emitters release the AND's source operands
+    # right after it, so
+    #     (and `tmp3.0 `tmp6.0) (kill `tmp6.0) (test `tmp3.0 `tmp3.0)
+    # is the common shape and strict adjacency finds only a quarter of the
+    # sites. Nothing else may intervene — a `(lab …)` is a join where the flags
+    # arriving are some other path's, and anything that emits code could write
+    # them — so "nothing touched the flags in between" stays true by
+    # inspection rather than by analysis.
+    var la = c
+    skip la
+    var kills = 0
+    while la.hasMore and isKillNode(buf, la):
+      skip la
+      inc kills
+    if la.hasMore and testOfSym(buf, la, aluDst):
+      when defined(arkhamPeepDbg): inc dbgTest
+      trNode(buf, c, dest, occs, limit, rules, folded)   # keep the ALU op
+      for _ in 0 ..< kills:                              # keep the kills, in order
+        dest.addSubtree c
+        skip c
+      skip c                                             # drop the test
+      inc folded
+      return
   var dst: SymId
   var immNode: Cursor
-  if movImmDest(buf, c, dst, immNode):
+  if rules.foldImm and movImmDest(buf, c, dst, immNode):
     when defined(arkhamPeepDbg): inc dbgCand
     var la = c
     skip la
@@ -172,9 +247,9 @@ proc trList(buf: var TokenBuf; c: var Cursor; dest: var TokenBuf; occs: Occs;
       skip c                 # the materializing mov
       skip c                 # the consumer
       return
-  trNode(buf, c, dest, occs, limit, folded)
+  trNode(buf, c, dest, occs, limit, rules, folded)
 
-proc peephole*(buf: var TokenBuf; immAnyDest: bool): int =
+proc peephole*(buf: var TokenBuf; immAnyDest: bool; arch: string): int =
   ## Rewrite `buf` in place; returns the number of instructions removed.
   ##
   ## `immAnyDest` states that the target can carry an immediate into ANY `mov`
@@ -184,7 +259,13 @@ proc peephole*(buf: var TokenBuf; immAnyDest: bool): int =
   ## Since a bare-symbol destination is a stack slot or a register home depending
   ## on a `(var …)` far above, the two cannot be told apart HERE; the target
   ## answers for both.
-  if not immAnyDest: return 0
+  ##
+  ## `arch` selects the flag rule. Dropping a `test` after a logical op is an
+  ## x86 fact: there `and`/`or`/`xor` write the condition flags as a side
+  ## effect, while AArch64's plain `and` writes none (that is `ands`), so the
+  ## `test` there is not redundant — it is the only thing setting the flags.
+  let rules = Rules(foldImm: immAnyDest, deadTest: arch == "x64")
+  if not rules.foldImm and not rules.deadTest: return 0
   var occs = initTable[SymId, seq[Occ]]()
   block:
     var c = beginRead(buf)
@@ -196,8 +277,9 @@ proc peephole*(buf: var TokenBuf; immAnyDest: bool): int =
   block:
     var c = beginRead(buf)
     while c.hasMore:
-      trList(buf, c, res, occs, buf.len, result)
+      trList(buf, c, res, occs, buf.len, rules, result)
     endRead c
   buf = ensureMove res
   when defined(arkhamPeepDbg):
-    stderr.writeLine "PEEP cand=" & $dbgCand & " pair=" & $dbgPair & " folded=" & $result
+    stderr.writeLine "PEEP cand=" & $dbgCand & " pair=" & $dbgPair &
+      " deadtest=" & $dbgTest & " folded=" & $result
