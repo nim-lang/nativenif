@@ -1,0 +1,47 @@
+(.nif27)
+(stmts
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :ok.0
+  (params)
+  .
+  .
+  (stmts
+   (asgn (errv) 0)))
+ (proc :failing.0
+  (params)
+  .
+  .
+  (stmts
+   (asgn (errv) 1)))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :x.0 .
+    (i 32)
+    0)
+   (onerr . ok.0)
+   (if
+    (elif (errv)
+     (stmts
+      (asgn x.0 100))))
+   (onerr
+    (jmp pad.0)
+    failing.0)
+   (asgn x.0 1)
+   (jmp done.0)
+   (if
+    (elif (false)
+     (stmts
+      (lab :pad.0)
+      (asgn x.0 42))))
+   (lab :done.0)
+   (call exit.0 x.0))))

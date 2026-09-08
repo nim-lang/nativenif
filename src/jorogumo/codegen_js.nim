@@ -168,6 +168,24 @@ proc flexPayloadLen(g: var JsGen; initv: Cursor): int =
   ## constructor). +1 for a string's NUL so C-string views stay valid.
   result = 0
   if initv.kind != TagLit or initv.exprKind notin {OconstrC, AconstrC}: return
+  if initv.exprKind == AconstrC:
+    # A TOP-LEVEL flexarray/method-table const (`(aconstr T elem…)`): the
+    # whole payload is elements — same element-type convention as the kv
+    # case below / serializeConstInto.
+    var ac = initv
+    ac.into:
+      let arrT = resolveType(g.prog, ac)
+      var esz: int
+      if arrT.kind == TagLit and arrT.typeKind in {PtrT, AptrT}:
+        esz = JsPtrSize
+      else:
+        let elemT = innerType(g.prog, arrT)
+        (esz, _) = typeSizeAlign(g.prog, elemT)
+      skip ac
+      var n = 0
+      while ac.hasMore: (inc n; skip ac)
+      result += n * esz
+    return
   var t = initv
   t.into:
     skip t                                     # the constructed type
@@ -431,6 +449,11 @@ proc constScalarBits(g: var JsGen; v: Cursor; ok: var bool): uint64 =
           else:
             ok = false                         # a runtime value has no bits here
             result = 0
+        elif t.kind == Symbol and lookupSym(typeCtx(g), symName(t)).cat == scProc:
+          # A PROC's address as a static value — an RTTI method-table entry, a
+          # function pointer in a const — is its function-table slot, not a
+          # memory address. ithaqua stores the funcref slot the same way.
+          result = uint64(procValue(g, symName(t)))
         elif t.kind == Symbol and (ptrTarget or isAggregateGlobal(g, symName(t))):
           # The ADDRESS of a global is a layout-time constant here, since
           # jorogumo owns the layout. A conv of a scalar global to a NON-pointer
@@ -582,9 +605,11 @@ proc staticInit(g: var JsGen; decl: Cursor; typ, initv: var Cursor;
       skip t                                   # the conv target type
       staticInner = t.kind in {IntLit, UIntLit, CharLit, FloatLit, StrLit} or
         (t.kind == TagLit and t.exprKind in {TrueC, FalseC, SufC, NegC}) or
-        # a cast to a pointer holds an ADDRESS, which the layout already knows
+        # a cast to a pointer holds an ADDRESS, which the layout already knows;
+        # a cast of a PROC holds its function-table slot, also a static value
         (ptrTarget and t.kind == Symbol and
-         lookupSym(typeCtx(g), symName(t)).cat in {scGlobal, scTvar})
+         lookupSym(typeCtx(g), symName(t)).cat in {scGlobal, scTvar}) or
+        (t.kind == Symbol and lookupSym(typeCtx(g), symName(t)).cat == scProc)
       while t.hasMore: skip t
     result = staticInner
   elif initv.kind == TagLit and
@@ -831,8 +856,13 @@ proc takeTemp(g: var JsGen; size: int): int =
   if g.p.tmpAt >= g.p.tmpPlan.len:
     err g, "internal: unplanned temporary of " & $size & " bytes"
   if g.p.tmpPlan[g.p.tmpAt].size != size:
+    # A short slice of the plan around the divergence names the frame offset
+    # that broke, which is far quicker to trace than the raw index.
+    var dump = ""
+    for q in max(0, g.p.tmpAt - 6) ..< min(g.p.tmpPlan.len, g.p.tmpAt + 3):
+      dump.add ' ' & $q & ':' & $g.p.tmpPlan[q].size
     err g, "internal: temporary plan mismatch (planned " &
-           $g.p.tmpPlan[g.p.tmpAt].size & ", asked " & $size & ")"
+           $g.p.tmpPlan[g.p.tmpAt].size & ", asked " & $size & ")" & dump
   result = g.p.tmpPlan[g.p.tmpAt].off
   inc g.p.tmpAt
 
@@ -1025,6 +1055,15 @@ proc partName(c: Cursor): string =
   inc t
   symName(t)
 
+proc entryIsCtor(kv: Cursor): bool =
+  ## Is the VALUE slot of a `(kv NAME VALUE DEPTH?)` entry itself a constructor?
+  ## Read without entering, as `partName` does: the name is a leaf symbol, so
+  ## two steps from the `kv` tag reach the value.
+  var t = kv
+  inc t                                    # the field name
+  inc t                                    # the value
+  t.kind == TagLit and t.exprKind in {OconstrC, AconstrC}
+
 proc isInheritedPart(g: var JsGen; objTy: Cursor; part: string): bool =
   ## Is `part` one of `objTy`'s bases? Only the base chain says which nested
   ## `oconstr` is the inherited part, and guessing would write it at offset 0 of
@@ -1171,6 +1210,17 @@ proc calleeProctype(g: var JsGen; target: Cursor): Cursor =
     pt = resolveType(g.prog, inner)            # peel `(ptr proctype)`
   if pt.kind == TagLit and pt.typeKind == ProctypeT: result = pt
 
+proc calleeResultType(g: var JsGen; target: Cursor): Cursor =
+  ## The result type from a call TARGET cursor — the same child a call node
+  ## opens with. `(onerr ACTION FN ARGS…)` reaches the call through here
+  ## because its target is not the first child of the node itself.
+  var pt = calleeProctype(g, target)
+  if not pt.cursorIsNil:
+    pt.into:                                   # (proctype NAME PARAMS RET PRAGMAS)
+      skip pt; skip pt
+      result = pt
+      while pt.hasMore: skip pt
+
 proc callResultType(g: var JsGen; c: Cursor): Cursor =
   ## The result type of a call node — direct or indirect — by typenav's ONE
   ## rule: the return type of the callee's proctype. `planFrame` and codegen
@@ -1178,12 +1228,7 @@ proc callResultType(g: var JsGen; c: Cursor): Cursor =
   ## from this one rule is what makes them agree by construction.
   var t = c
   t.into:
-    var pt = calleeProctype(g, t)
-    if not pt.cursorIsNil:
-      pt.into:                                 # (proctype NAME PARAMS RET PRAGMAS)
-        skip pt; skip pt
-        result = pt
-        while pt.hasMore: skip pt
+    result = calleeResultType(g, t)
     while t.hasMore: skip t
 
 proc callDestSize(g: var JsGen; c: Cursor): (int, int) =
@@ -1251,11 +1296,39 @@ proc planNode(g: var JsGen; pl: var FramePlan; c: Cursor; needsTemp: bool) =
       var init = t
       skip init                                # `inc` would ENTER the type, not pass it
       if init.kind == TagLit:
-        planNode(g, pl, init, not (init.exprKind in {OconstrC, AconstrC}))
+        # Mirror `genVar`: a constructor initializer is materialized into a
+        # temporary only when the variable is NOT itself an aggregate (a `seq`
+        # or `ptr` slot takes the literal's address, so the literal needs a
+        # home); an aggregate-typed variable is filled in place and needs none.
+        # Any other initializer keeps `needsTemp` so a call's sret destination
+        # is reserved here, matching `copyToSlot`/`genExpr`.
+        let initNeeds = if init.exprKind in {OconstrC, AconstrC}:
+                          not isAggType(g, typ)
+                        else:
+                          true
+        planNode(g, pl, init, initNeeds)
       while t.hasMore: skip t
     return
+  if c.stmtKind == OnerrS:
+    # `(onerr ACTION FN ARGS…)` performs a CALL, so an aggregate result needs
+    # an sret destination exactly as for `(call …)` — reserved HERE, before
+    # the generic walk below reserves the arguments' fresh copies, because
+    # that is the order `genOnerr` takes the temps in.
+    var t = c
+    t.into:
+      skip t                                   # the action carries no temps
+      let rt = calleeResultType(g, t)
+      if not rt.cursorIsNil and isAggType(g, rt):
+        let sz = byteSize(g, rt)
+        pl.off = align(pl.off, byteAlign(g, rt))
+        g.p.tmpPlan.add TempSlot(off: pl.off, size: sz)
+        pl.off += max(sz, 8)
+      while t.hasMore: skip t                  # the target and args are planned
+                                               # by the generic walk below
+    # fall through: the generic walk plans the action and the argument copies
   var nest = needsTemp
-  if c.exprKind in {OconstrC, AconstrC} and needsTemp:
+  let isCtorNode = c.exprKind in {OconstrC, AconstrC}
+  if isCtorNode and needsTemp:
     let sz = constrSize(g, c)
     let al = byteAlign(g, ctorType(g, c))
     pl.off = align(pl.off, al)
@@ -1270,15 +1343,32 @@ proc planNode(g: var JsGen; pl: var FramePlan; c: Cursor; needsTemp: bool) =
       pl.off += max(dsz, 8)
   var t = c
   t.into:
-    var isArg = false                          # child 0 is the target, not an arg
+    var idx = 0                                # child 0 is the target, not an arg;
+    # an `onerr` spends child 0 on the ACTION, so its args start one later:
+    let argFrom = if c.stmtKind == OnerrS: 2 else: 1
+    let isCallish = c.exprKind == CallC or c.stmtKind == OnerrS
     while t.hasMore:
       var childTemp = needsTemp
-      if not nest and t.kind == TagLit and t.exprKind in {ConvC, CastC, BaseobjC}:
+      if isCtorNode and t.kind == TagLit and t.substructureKind == KvU:
+        # An object constructor entry `(kv NAME VALUE DEPTH?)`: `genCtorInto`
+        # fills the VALUE in place at the field's offset when it is itself a
+        # constructor, and materializes it otherwise (a call needs its sret, a
+        # reinterpretation its own slot). Only the VALUE carries a temporary, so
+        # `needsTemp` follows the value's kind, not the `kv` wrapper's.
+        childTemp = not entryIsCtor(t)
+      elif isCtorNode:
+        # An array element, or the type child: an element that is itself a
+        # constructor fills in place; a reinterpretation reaching one is read
+        # as a value and needs a temporary of its own.
+        childTemp = if t.kind == TagLit and t.exprKind in {OconstrC, AconstrC}: false
+                    elif not nest and t.kind == TagLit and t.exprKind in {ConvC, CastC, BaseobjC}: true
+                    else: needsTemp
+      elif not nest and t.kind == TagLit and t.exprKind in {ConvC, CastC, BaseobjC}:
         # `genCtorInto` fills a child constructor IN PLACE, but a child that only
         # REACHES a constructor through a reinterpretation is read as a value and
         # copied — so the constructor behind it needs a temporary of its own.
         childTemp = true
-      if isArg and c.exprKind == CallC:
+      if idx >= argFrom and isCallish:
         # The aggregate argument's fresh copy is reserved HERE, before the walk
         # into the argument: `genAggArg` takes it ahead of any temporary the
         # argument's own subtree needs — the same order, or `takeTemp` refuses.
@@ -1289,7 +1379,7 @@ proc planNode(g: var JsGen; pl: var FramePlan; c: Cursor; needsTemp: bool) =
           pl.off += max(csz, 8)
       planNode(g, pl, t, childTemp)
       skip t
-      isArg = true
+      inc idx
 
 proc planFrame(g: var JsGen; body: Cursor; params: seq[(string, Cursor)];
                taken: HashSet[string]) =
@@ -1974,133 +2064,140 @@ proc genInstr(g: var JsGen; c: Cursor; wantValue: bool) =
     else:
       err g, "(instr …) not lowered by jorogumo: " & $it.op
 
+proc genCallFrom(g: var JsGen; t: var Cursor; wantValue: bool) =
+  ## The call lowering, entered with `t` AT the target child and the args
+  ## after it; `t` ends past the last argument. `genCall` walks into the call
+  ## node and hands over; `genOnerr` starts here directly, because an `onerr`
+  ## node's call shares its head with the action.
+  let target = t
+  var indirect = true
+  var nm = ""
+  var ct: CallTarget
+  var known = false
+  if t.kind == Symbol:
+    nm = symName(t)
+    # classify a foreign callee BEFORE dispatching: the typenav target says
+    # whether it is a syscall, an extern, or an ordinary proc — the same
+    # lazy resolution `getType` performs for the call's type.
+    if not g.callTarget.hasKey(nm) and isForeignSym(g.prog, nm):
+      var fnd = false
+      let fd = lookupForeignDecl(g.prog, nm, fnd)
+      if fnd and fd.stmtKind == ProcS:
+        g.callTarget[nm] = foreignCallTarget(g.prog, nm)
+    if g.callTarget.hasKey(nm):
+      ct = g.callTarget[nm]
+      known = true
+    # a Symbol that is not a proc decl — a local, param or proc-typed
+    # global holding a fn-ptr — dispatches through the table. arkham's
+    # `isIndirectCallTarget` follows the same rule.
+    indirect = lookupSym(typeCtx(g), nm).cat != scProc
+    inc t                                    # a Symbol is one token: now at the args
+  else:
+    skip t                                   # a tree callee: PAST the subtree,
+                                             # `inc` would step into it
+  if known and ct.syscall:
+    var base = nm
+    let dotSys = ct.asmName.find(".sys.")
+    if dotSys >= 0: base = ct.asmName[0 ..< dotSys]
+    genSyscall(g, base, t, wantValue)
+  elif known and ct.memIntrin.len > 0:
+    genMemIntrin(g, ct.memIntrin, t, wantValue)
+  elif known and ct.bitBuiltin.len > 0:
+    # ithaqua lowers these to wasm opcodes; the page pair maps onto the
+    # preamble's `memorySize`/`memoryGrow`, the bit-count builtins onto its
+    # count helpers. Anything else is refused by name, never guessed.
+    case ct.bitBuiltin
+    of "__builtin_ctz", "__builtin_clz", "__builtin_popcount",
+       "__builtin_ctzll", "__builtin_clzll", "__builtin_popcountll":
+      # ithaqua lowers these to the same wasm opcodes as the instr rows;
+      # the preamble helpers are the JS twins. GCC returns `int`, so the
+      # helper's Number IS the canonical result — no width move, exactly
+      # like ithaqua's `I32WrapI64` on the ll variants.
+      let ll = ct.bitBuiltin.endsWith("ll")
+      g.outp.openTree Call
+      g.outp.ident (case ct.bitBuiltin
+                    of "__builtin_ctz", "__builtin_ctzll": (if ll: "ctz64" else: "ctz32")
+                    of "__builtin_clz", "__builtin_clzll": (if ll: "clz64" else: "clz32")
+                    else: (if ll: "popcnt64" else: "popcnt32"))
+      g.genExprCoerced(t, if ll: wI64 else: wI32)
+      skip t
+      while t.hasMore: skip t
+      g.outp.closeTag
+    of "__builtin_wasm_memory_size":
+      # () -> pages: the preamble's `memorySize`, wasm `memory.size`'s twin.
+      g.outp.openTree Call
+      g.outp.ident "memorySize"
+      g.outp.closeTag
+      while t.hasMore: skip t                # zero args, drain defensively
+    of "__builtin_wasm_memory_grow":
+      # (delta pages) -> old page count or -1: the preamble reallocates and
+      # copies; offsets survive the move, so the grow is honest, not a stub.
+      g.outp.openTree Call
+      g.outp.ident "memoryGrow"
+      g.genExprCoerced(t, wI32)
+      skip t
+      while t.hasMore: skip t
+      g.outp.closeTag
+    else:
+      err g, "bit builtin `" & ct.bitBuiltin & "` has no JS lowering"
+  elif indirect:
+    genIndirectCall(g, target, t)
+  else:
+    var found = false
+    let decl = procDeclOf(g, nm, found)
+    if known and ct.extern and not (found and hasBody(decl)):
+      # an `importc` WITH a body is an ordinary definition — the C compiler
+      # emits bodies for its importcs too; only the bodyless signature
+      # reaches across the M7 bridge.
+      err g, "extern `" & nm & "` (the JS bridge is M7)"
+    if not found: err g, "no body to call: " & nm
+    ensureProc(g, nm, decl)
+    let rt = calleeResultType(g, target)
+    let aggRet = not rt.cursorIsNil and isAggType(g, rt)
+    g.outp.openTree Call
+    g.outp.symUse jsName(g, nm)
+    # The struct-return destination is the CALLER's planned temporary, and it
+    # is reserved before the arguments are walked: `planFrame` reserved it at
+    # the call node, and any temporary an argument needs comes after it.
+    if aggRet: slotAddr(g, takeTemp(g, byteSize(g, rt)))
+    # Each argument is moved to the width the callee's parameter declares, so
+    # a caller holding an `i32` cannot hand a BigInt to an `i64` parameter.
+    # An aggregate parameter needs no coercion: it travels as its address.
+    var p = decl
+    p.into:
+      inc p                                    # name
+      p.into:                                  # params
+        while p.hasMore:
+          var q = p
+          var w = wU32
+          var agg = false
+          q.into:
+            inc q                              # name
+            skip q                             # pragmas
+            agg = isAggType(g, q)
+            if not agg: w = widthOf(g, q)
+            while q.hasMore: skip q
+          skip p
+          if t.hasMore:
+            let (csz, _) = aggArgDestSize(g, t)
+            if csz > 0: genAggArg(g, t, csz)
+            elif agg: genExpr(g, t)
+            else: g.genExprCoerced(t, w)
+            skip t
+      while p.hasMore: skip p                # result type, pragmas, body
+    # anything past the declared parameters (a varargs tail) rides along,
+    # aggregates still copied: pass-by-value does not depend on the signature
+    while t.hasMore:
+      let (csz, _) = aggArgDestSize(g, t)
+      if csz > 0: genAggArg(g, t, csz)
+      else: genExpr(g, t)
+      skip t
+    g.outp.closeTag
+
 proc genCall(g: var JsGen; c: Cursor; wantValue: bool) =
   var t = c
   t.into:
-    let target = t
-    var indirect = true
-    var nm = ""
-    var ct: CallTarget
-    var known = false
-    if t.kind == Symbol:
-      nm = symName(t)
-      # classify a foreign callee BEFORE dispatching: the typenav target says
-      # whether it is a syscall, an extern, or an ordinary proc — the same
-      # lazy resolution `getType` performs for the call's type.
-      if not g.callTarget.hasKey(nm) and isForeignSym(g.prog, nm):
-        var fnd = false
-        let fd = lookupForeignDecl(g.prog, nm, fnd)
-        if fnd and fd.stmtKind == ProcS:
-          g.callTarget[nm] = foreignCallTarget(g.prog, nm)
-      if g.callTarget.hasKey(nm):
-        ct = g.callTarget[nm]
-        known = true
-      # a Symbol that is not a proc decl — a local, param or proc-typed
-      # global holding a fn-ptr — dispatches through the table. arkham's
-      # `isIndirectCallTarget` follows the same rule.
-      indirect = lookupSym(typeCtx(g), nm).cat != scProc
-      inc t                                    # a Symbol is one token: now at the args
-    else:
-      skip t                                   # a tree callee: PAST the subtree,
-                                               # `inc` would step into it
-    if known and ct.syscall:
-      var base = nm
-      let dotSys = ct.asmName.find(".sys.")
-      if dotSys >= 0: base = ct.asmName[0 ..< dotSys]
-      genSyscall(g, base, t, wantValue)
-    elif known and ct.memIntrin.len > 0:
-      genMemIntrin(g, ct.memIntrin, t, wantValue)
-    elif known and ct.bitBuiltin.len > 0:
-      # ithaqua lowers these to wasm opcodes; the page pair maps onto the
-      # preamble's `memorySize`/`memoryGrow`, the bit-count builtins onto its
-      # count helpers. Anything else is refused by name, never guessed.
-      case ct.bitBuiltin
-      of "__builtin_ctz", "__builtin_clz", "__builtin_popcount",
-         "__builtin_ctzll", "__builtin_clzll", "__builtin_popcountll":
-        # ithaqua lowers these to the same wasm opcodes as the instr rows;
-        # the preamble helpers are the JS twins. GCC returns `int`, so the
-        # helper's Number IS the canonical result — no width move, exactly
-        # like ithaqua's `I32WrapI64` on the ll variants.
-        let ll = ct.bitBuiltin.endsWith("ll")
-        g.outp.openTree Call
-        g.outp.ident (case ct.bitBuiltin
-                      of "__builtin_ctz", "__builtin_ctzll": (if ll: "ctz64" else: "ctz32")
-                      of "__builtin_clz", "__builtin_clzll": (if ll: "clz64" else: "clz32")
-                      else: (if ll: "popcnt64" else: "popcnt32"))
-        g.genExprCoerced(t, if ll: wI64 else: wI32)
-        skip t
-        while t.hasMore: skip t
-        g.outp.closeTag
-      of "__builtin_wasm_memory_size":
-        # () -> pages: the preamble's `memorySize`, wasm `memory.size`'s twin.
-        g.outp.openTree Call
-        g.outp.ident "memorySize"
-        g.outp.closeTag
-        while t.hasMore: skip t                # zero args, drain defensively
-      of "__builtin_wasm_memory_grow":
-        # (delta pages) -> old page count or -1: the preamble reallocates and
-        # copies; offsets survive the move, so the grow is honest, not a stub.
-        g.outp.openTree Call
-        g.outp.ident "memoryGrow"
-        g.genExprCoerced(t, wI32)
-        skip t
-        while t.hasMore: skip t
-        g.outp.closeTag
-      else:
-        err g, "bit builtin `" & ct.bitBuiltin & "` has no JS lowering"
-    elif indirect:
-      genIndirectCall(g, target, t)
-    else:
-      var found = false
-      let decl = procDeclOf(g, nm, found)
-      if known and ct.extern and not (found and hasBody(decl)):
-        # an `importc` WITH a body is an ordinary definition — the C compiler
-        # emits bodies for its importcs too; only the bodyless signature
-        # reaches across the M7 bridge.
-        err g, "extern `" & nm & "` (the JS bridge is M7)"
-      if not found: err g, "no body to call: " & nm
-      ensureProc(g, nm, decl)
-      let rt = callResultType(g, c)
-      let aggRet = not rt.cursorIsNil and isAggType(g, rt)
-      g.outp.openTree Call
-      g.outp.symUse jsName(g, nm)
-      # The struct-return destination is the CALLER's planned temporary, and it
-      # is reserved before the arguments are walked: `planFrame` reserved it at
-      # the call node, and any temporary an argument needs comes after it.
-      if aggRet: slotAddr(g, takeTemp(g, byteSize(g, rt)))
-      # Each argument is moved to the width the callee's parameter declares, so
-      # a caller holding an `i32` cannot hand a BigInt to an `i64` parameter.
-      # An aggregate parameter needs no coercion: it travels as its address.
-      var p = decl
-      p.into:
-        inc p                                    # name
-        p.into:                                  # params
-          while p.hasMore:
-            var q = p
-            var w = wU32
-            var agg = false
-            q.into:
-              inc q                              # name
-              skip q                             # pragmas
-              agg = isAggType(g, q)
-              if not agg: w = widthOf(g, q)
-              while q.hasMore: skip q
-            skip p
-            if t.hasMore:
-              let (csz, _) = aggArgDestSize(g, t)
-              if csz > 0: genAggArg(g, t, csz)
-              elif agg: genExpr(g, t)
-              else: g.genExprCoerced(t, w)
-              skip t
-        while p.hasMore: skip p                # result type, pragmas, body
-      # anything past the declared parameters (a varargs tail) rides along,
-      # aggregates still copied: pass-by-value does not depend on the signature
-      while t.hasMore:
-        let (csz, _) = aggArgDestSize(g, t)
-        if csz > 0: genAggArg(g, t, csz)
-        else: genExpr(g, t)
-        skip t
-      g.outp.closeTag
+    genCallFrom(g, t, wantValue)
 
 # ── statements ───────────────────────────────────────────────────────────────
 
@@ -2609,21 +2706,40 @@ proc genIf(g: var JsGen; c: Cursor) =
       g.outp.closeTag
       dec open
 
-proc labelTargets(g: var JsGen; c: Cursor): seq[string] =
-  ## The labels declared by `(lab L)` statements in THIS list and not already
-  ## open. A `jmp L` may sit at any depth inside the list, so L's block has to
-  ## wrap the statements that precede its own marker.
-  result = @[]
+proc landingPadLabel(c: Cursor): string =
+  ## Non-empty iff `c` is hexer's jump-into-guarded-region idiom — the flag
+  ## model's exception landing pad:
+  ##
+  ##   (if (elif (false) (stmts (lab L) …)))
+  ##
+  ## C's `if (0) { L: … }`. The try body `jmp`s INTO the guarded branch, so a
+  ## plain if-lowering could never reach the label; `genStmtList` restructures
+  ## it instead (ithaqua's `landingPadLabel`, ported).
+  result = ""
+  if c.stmtKind != IfS: return
   var t = c
+  var lab = ""
+  var arms = 0
   t.into:
     while t.hasMore:
-      if t.stmtKind == LabS:
-        var l = t
-        l.into:
-          let nm = symName(l)
-          if nm notin g.p.labs: result.add nm
-          while l.hasMore: skip l
+      inc arms
+      if arms == 1 and t.substructureKind == ElifU:
+        var e = t
+        e.into:
+          if e.kind == TagLit and e.exprKind == FalseC:
+            skip e                             # (false)
+            if e.hasMore and e.stmtKind == StmtsS:
+              var s = e
+              s.into:
+                if s.hasMore and s.stmtKind == LabS:
+                  var l = s
+                  l.into:
+                    lab = symName(l)
+                    while l.hasMore: skip l
+                while s.hasMore: skip s
+          while e.hasMore: skip e
       skip t
+  if arms == 1: result = lab
 
 proc genStmtList(g: var JsGen; c: Cursor) =
   ## `(stmts …)` / `(scope …)`: a JS block, wrapped in one labeled block per
@@ -2632,31 +2748,109 @@ proc genStmtList(g: var JsGen; c: Cursor) =
   ## CLOSES that block rather than the end of the list. wasm has to nest these in
   ## reverse close order because `end` is positional; a JS label is named, so
   ## ordinary order is enough.
+  ##
+  ## A landing-pad child `(if (elif (false) (stmts (lab L) …)))` gets the twin
+  ## of ithaqua's restructure: TWO blocks open at the head of the list —
+  ##
+  ##   $join: { $L: { …try children…; break $join }  …guarded body…  }
+  ##
+  ## `jmp L` inside the try children breaks past $L's end — which is the
+  ## `(lab L)` marker inside the guarded child, so it lands on the handler —
+  ## and normal fallthrough breaks to $join, skipping it. The blocks close in
+  ## reverse event order: the `(lab)` markers and pad children appear in the
+  ## order their regions end, so the first event opens innermost.
   g.outp.openTree Block
   let mark = g.p.labs.len
-  # Open in REVERSE appearance order, ithaqua's trick with its positional
-  # `br`: the `(lab L)` end markers appear in appearance order, so the first
-  # label must be the INNERMOST block for the closes to unwind LIFO — and it
-  # is also the right region semantics, because `break L` resumes right after
-  # L's block, which is L's end marker, not the end of every later label's
-  # region too. A named JS break does not care which label nests inside which;
-  # both stay lexically enclosing their `jmp`.
-  let targets = labelTargets(g, c)
-  for i in countdown(targets.len - 1, 0):
-    let nm = targets[i]
+  var events: seq[(bool, string)] = @[]        # (isPad, label) in child order
+  var scan = c
+  scan.into:
+    while scan.hasMore:
+      if scan.stmtKind == LabS:
+        var l = scan
+        l.into:
+          let nm = symName(l)
+          if nm notin g.p.labs: events.add (false, nm)
+          while l.hasMore: skip l
+      else:
+        let pl = landingPadLabel(scan)
+        if pl.len > 0 and pl notin g.p.labs: events.add (true, pl)
+      skip scan
+  var padJoin = initTable[string, string]()    # pad label -> its $join name
+  for i in countdown(events.len - 1, 0):
+    let (isPad, nm) = events[i]
+    if isPad:
+      let join = tmpName(g)
+      padJoin[nm] = join
+      g.outp.openTree Label
+      g.outp.ident join
+      g.p.labs.add join
     g.outp.openTree Label
     g.outp.ident jsName(g, nm)
     g.p.labs.add nm
   var t = c
   t.into:
     while t.hasMore:
-      genStmt(g, t)
+      let pl = landingPadLabel(t)
+      if pl.len > 0 and padJoin.hasKey(pl):
+        # normal fallthrough skips the guarded body:
+        g.outp.openTree Break
+        g.outp.ident padJoin[pl]
+        g.outp.closeTag
+        # Descend into the guarded branch and emit its `(stmts …)` children
+        # INLINE — not through genStmtList, whose own Block would sit between
+        # $L and its `(lab)` marker. The marker closes the $L block opened at
+        # the head of THIS list, so a `break L` from the try children lands
+        # exactly on the handler.
+        var f = t
+        f.into:
+          var e = f
+          e.into:                              # (elif
+            skip e                             # (false)
+            var s = e                          # (stmts (lab L) …)
+            s.into:                            # the CHILDREN, not the node:
+              while s.hasMore: genStmt(g, s)   # a nested Block would shield the
+                                               # `(lab)` marker from closing $L
+            skip e
+            while e.hasMore: skip e
+          skip f
+          while f.hasMore: skip f
+        # The `(lab L)` marker popped $L; $join closes right after the pad,
+        # not at the end of the list — the siblings that follow must run on
+        # the path the fallthrough break skips past the HANDLER only.
+        if g.p.labs.len == 0 or g.p.labs[^1] != padJoin[pl]:
+          err g, "landing pad body did not close its `$L` block"
+        discard g.p.labs.pop()
+        g.outp.closeTag
+        skip t          # the descent consumed the child; `genStmt` would have
+                        # skipped it, and re-lowering the pad would double-close
+      else:
+        genStmt(g, t)
   # A list whose `(lab)` marker never ran into this level (a pad's label, closed
   # by an inner list) leaves nothing to close here; the `>` guard keeps that safe.
   while g.p.labs.len > mark:
     discard g.p.labs.pop()
     g.outp.closeTag
   g.outp.closeTag
+
+proc genOnerr(g: var JsGen; c: Cursor) =
+  ## `(onerr ACTION FN ARGS…)`: perform the call for effect; if the `errv`
+  ## global is set, run the ACTION (typically a `jmp` to the landing pad).
+  ## A `.` action means "propagate by hand later". The call is lowered by
+  ## `genCallFrom` — sret destination, aggregate-argument copies, indirect
+  ## and extern classification and the value plan's reservations all apply
+  ## exactly as for a `(call …)` in statement position.
+  var t = c
+  t.into:
+    var act = t
+    skip t                                     # the action is a statement
+    g.outp.tree ExprStmt:
+      genCallFrom(g, t, wantValue = false)
+    if act.kind != DotToken:
+      g.outp.openTree If
+      g.outp.ident "errv"
+      genStmt(g, act)                          # e.g. `break L`
+      g.outp.closeTag
+  # `genStmt` skips the statement it dispatched; `into` never leaks.
 
 proc genStmt(g: var JsGen; c: var Cursor) =
   if c.kind == DotToken:
@@ -2713,6 +2907,12 @@ proc genStmt(g: var JsGen; c: var Cursor) =
     g.outp.ident jsName(g, nm)
     g.outp.closeTag
   of CaseS: genCase(g, c)
+  of OnerrS: genOnerr(g, c)
+  of TryS, RaiseS:
+    # ithaqua's refusal, kept: `eraiser` lowers every source-level `try` and
+    # catchable `raise` to the flat `lab`/`jmp` form long before Leng, so one
+    # of these in a body means a pass was skipped, not a feature to invent.
+    err g, "C++-mode try/raise cannot appear in JavaScript Leng"
   of DiscardS:
     g.outp.tree ExprStmt:
       var t = c
