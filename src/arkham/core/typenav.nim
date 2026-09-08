@@ -163,7 +163,20 @@ proc getType*(tc: TypeCtx; c: Cursor): Cursor =
       # recorded the declared return type directly.
       var t = c; inc t
       result = instrTargetOf(tc.prog[], symName(t)).retType
-    of NilC: result = tc.prog[].voidPtr       # nil → a generic pointer type
+    of NilC:
+      # `(nil T? X?)`: `T` is the pointer type the nil stands for, and the frontend
+      # types every `ptr`/`ref` nil, so honor it; only a nil a later pass
+      # synthesized is bare and means the generic pointer. Typing every nil as
+      # `(ptr (void))` broke a `(deref (nil (ptr T)))` — dead code, but typed
+      # before it is eliminated — that inlining a proc at its `f(nil)` call site
+      # leaves behind: the field access on the `(void)` base asserted (measured:
+      # tests/nimony/arc/tinheritable).
+      result = tc.prog[].voidPtr
+      var t = c
+      t.into:
+        if t.hasMore and (t.kind == TagLit or t.kind == Symbol):
+          result = t
+        while t.hasMore: skip t
     of InfC, NeginfC, NanC:                    # +inf / -inf / NaN float-value nodes
       result = tc.prog[].floatType
     of TrueC, FalseC,                         # bool literals & bool-valued operators
