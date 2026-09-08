@@ -64,6 +64,16 @@ proc reasonOf(outp: string): string =
 let nodeExe = findExe("node")
 if nodeExe.len == 0: quit "tjsgen: node is required — this harness runs what it emits"
 
+const knownDivergences = {
+  # `scope_slot_reuse` compares the ADDRESSES of two locals declared in sibling
+  # `(scope)` blocks; its oracle (exit 7) is arkham x64 reusing one frame slot
+  # for them. Neither the wasm nor the JS backend reuses it — ithaqua also
+  # exits 1 — so jorogumo matches its twin, not arkham's layout-specific answer.
+  # A distinct slot per address-taken local is a valid frame, and the property
+  # this fixture pins is an allocator detail, not defined behaviour.
+  "scope_slot_reuse": "arkham x64 slot-reuse oracle; ithaqua parity is exit 1",
+}.toTable
+
 let dir = corpusDir()
 let only = onlyFilter()
 let work = getTempDir() / "jorogumo_tjsgen"
@@ -78,6 +88,7 @@ var
   reasons = initOrderedTable[string, int]()
   badRuns: seq[string] = @[]
   errGenerated: seq[string] = @[]
+  knownDiv: seq[string] = @[]
 
 let jorogumo = getAppDir() / ("jorogumo".addFileExt(ExeExt))
 if not fileExists(jorogumo): quit "tjsgen: build bin/jorogumo first"
@@ -123,6 +134,15 @@ for file in walkFiles(dir / "*.c.nif"):
     if only.len > 0: echo "GENERATED AN err_ FIXTURE ", stem, " -> exit ", gotCode
     removeFile jsPath
     continue
+  if knownDivergences.hasKey(stem):
+    # Held out of the agree denominator: a documented, twin-consistent layout
+    # divergence, not a wrong result to fix.
+    dec emitted
+    knownDiv.add stem & ": exit " & gotCode & " (arkham wants " & wantCode &
+                 ") — " & knownDivergences[stem]
+    if only.len > 0: echo "KNOWN DIVERGENCE ", stem, " -> exit ", gotCode
+    removeFile jsPath
+    continue
   if gotOut == wantOut and gotCode == wantCode:
     inc matched
   else:
@@ -142,6 +162,9 @@ if badRuns.len > 0:
 if errGenerated.len > 0:
   echo "--- generated although the native back end rejects them ---"
   for b in errGenerated[0 ..< min(errGenerated.len, 15)]: echo "  ", b
+if knownDiv.len > 0:
+  echo "--- known divergences (twin-consistent, held out of the agree count) ---"
+  for b in knownDiv: echo "  ", b
 if reasons.len > 0:
   echo "--- refusals by cause ---"
   for k, v in reasons: echo "  ", v, "x  ", k

@@ -2096,9 +2096,11 @@ proc genCallFrom(g: var JsGen; t: var Cursor; wantValue: bool) =
     skip t                                   # a tree callee: PAST the subtree,
                                              # `inc` would step into it
   if known and ct.syscall:
+    # The syscall's C name is encoded in the target's asmName as
+    # `` <c>`sys.0.<mod> `` (arkham #165 put the role in the identifier);
+    # `cNameOfAsmName` strips the backtick role tag. ithaqua's twin rule.
     var base = nm
-    let dotSys = ct.asmName.find(".sys.")
-    if dotSys >= 0: base = ct.asmName[0 ..< dotSys]
+    if ct.asmName.len > 0: base = cNameOfAsmName(ct.asmName)
     genSyscall(g, base, t, wantValue)
   elif known and ct.memIntrin.len > 0:
     genMemIntrin(g, ct.memIntrin, t, wantValue)
