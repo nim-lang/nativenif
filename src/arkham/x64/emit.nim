@@ -92,6 +92,8 @@ proc slotEnd*(name: string): AggrEnd {.inline.} = AggrEnd(slot: name, reg: NoReg
 proc regEnd*(r: Reg): AggrEnd {.inline.} = AggrEnd(slot: "", reg: r)
 
 proc genTypeBody*(g: var CodeGen; c: var Cursor)
+proc genUnionBody*(g: var CodeGen; c: var Cursor)
+proc genFldDef*(g: var CodeGen; c: var Cursor)
 
 proc releaseStaleName*(g: var CodeGen; r: Reg)
 
@@ -1276,18 +1278,19 @@ proc genTypeBody*(g: var CodeGen; c: var Cursor) =
               # union is UNTAGGED, so emit only the bodies — the discriminant lives in
               # the `fld` preceding the union, which is emitted as an ordinary field.
               # A body-less branch (`of x: nil`) contributes no member.
-              g.ab.unionType:
-                c.into:
-                  while c.hasMore:
-                    var bodyc = unionBranchBody(c)
-                    if bodyc.kind != DotToken: g.genTypeBody(bodyc)
-                    skip c
+              g.genUnionBody(c)
             else:
-              c.into:                         # (fld :name pragmas type)
-                let fn = symName(c); inc c
-                skip c                        # field pragmas (dropped)
-                g.ab.fldDef(fn):
-                  g.genTypeBody(c)
+              g.genFldDef(c)                  # (fld :name pragmas type)
+    of UnionT:
+      # A *top-level* union: `{.union.} = object` lowers to `(union (fld …)*)`,
+      # not to an object with a union part, so it never reaches the `ObjectT`
+      # arm above. `std/posix/io_uring`'s SQE is nothing but these.
+      #
+      # nifasm has always laid this out (`parseUnionBody` sizes a bare `(fld …)`
+      # member at offset 0, and `typeSizeAlign` sizes it here) — the only thing
+      # missing was emitting the declaration, so every module that so much as
+      # imported `std/ioring` died on "type not supported: union".
+      g.genUnionBody(c)
     of EnumT:                                 # an enum is just its base integer type
       c.into:
         g.genTypeBody(c)                      # (enum <base> (efld …)…) → <base>
@@ -1304,6 +1307,36 @@ proc genTypeBody*(g: var CodeGen; c: var Cursor) =
       raiseAssert "arkham x64 v0: type not supported: " & $c.typeKind
   else:
     raiseAssert "arkham x64 v0: malformed type"
+
+proc genFldDef*(g: var CodeGen; c: var Cursor) =
+  ## One `(fld :name pragmas type)` as an asm-NIF field declaration.
+  c.into:
+    let fn = symName(c); inc c
+    skip c                                    # field pragmas (dropped)
+    g.ab.fldDef(fn):
+      g.genTypeBody(c)
+
+proc genUnionBody*(g: var CodeGen; c: var Cursor) =
+  ## A `(union …)` node, in either of the two shapes that reach here.
+  ##
+  ## A `{.union.}` type's children are bare `(fld …)` declarations, which nifasm
+  ## places at offset 0 and overlaps. An object VARIANT's are `(of RANGES BODY)`
+  ## / `(else BODY)` branches whose BODY is an `(object …)` of sequential
+  ## fields — so only the branches overlap. `unionBranchBody` normalizes the
+  ## second shape to the first's, and a body-less branch (`of x: nil`) yields a
+  ## `.` and contributes no member.
+  ##
+  ## The asm-NIF union is UNTAGGED either way: a variant's discriminant is the
+  ## ordinary `fld` that precedes the union in the enclosing object.
+  g.ab.unionType:
+    c.into:
+      while c.hasMore:
+        var bodyc = unionBranchBody(c)
+        if bodyc.kind == TagLit and bodyc.substructureKind == FldU:
+          g.genFldDef(bodyc)
+        elif bodyc.kind != DotToken:
+          g.genTypeBody(bodyc)
+        skip c
 
 proc emImm*(g: var CodeGen; loc: Location) =
   ## Emit an immediate VALUE operand: `(nil)` for a null pointer, else the integer.

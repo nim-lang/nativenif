@@ -3138,15 +3138,30 @@ proc emitCast2*(g: var CodeGen; c: Cursor; dest: var Location) =
     # cast re-represents (rebind/extend) in a REGISTER. Demand reg-or-imm: a
     # foldable literal stays an Imm (returned above), a memory home loads.
     iv = regOrImm(dest.typ)
+  let stageable = iv.kind in {NeedsReg, RegOrImm} or
+                  (iv.kind == InReg and iv.isTemp and not g.rb.isBoundTemp(iv.r))
   if iv.typ.cls in {ABool, AInt, AUInt} and iv.typ.size < 8 and not isPtrType(tc) and
-     (iv.kind in {NeedsReg, RegOrImm} or
-      (iv.kind == InReg and iv.isTemp and not g.rb.isBoundTemp(iv.r))):
+     stageable:
     # An int↔int re-representation happens IN a register and is FINISHED by the
     # explicit `extendTo` below, so the register that receives the source must be
     # bound at the canonical 64-bit width. Binding it at the TARGET's narrow width
     # instead made `(mov u8tmp 4000)` — a literal that does not fit `(u 8)`, which
     # nifasm rejects, even though the very next `movzx` is what performs the
     # narrowing. Mirrors the a64 twin.
+    iv.typ = ScalarSlot
+  elif isPtrType(tc) and stageable and
+       not isPtrType(resolveType(g.prog, g.getType(inner))):
+    # The same rule for an int→POINTER reinterpret, and for the same reason. The
+    # register receives the INNER — an integer — and only the `kindChange` rebind
+    # below makes it a pointer, so binding it at the target's pointer type up
+    # front produced `(mov ptrtmp -1)`: nifasm admits only `0`/`(nil)` into a
+    # pointer-typed destination, and rightly, since that is what catches a real
+    # integer leaking into a pointer.
+    #
+    # The named-dest path already pre-retypes to the inner's type a few lines
+    # up ("int arithmetic under an int→ptr reinterpret must run int-typed"); a
+    # TEMP destination had no such arm and fell through. `cast[pointer](
+    # 0xffff_ffff_ffff_ffff'u64)` — io_uring's cancel sentinel — is the shape.
     iv.typ = ScalarSlot
   g.emitValue2(inner, iv)
   dest = iv
@@ -3422,6 +3437,33 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
   if not tgt.declarative:
     # ── Manual-marshalling path (empty signature: float params/results, ≤16B
     # by-value aggregate results). Args go straight into raw ABI registers.
+    #
+    # Raw registers are ALL this path can reach. An outgoing stack argument is
+    # placed and sized by nifasm from the callee's declared signature — that is
+    # what `(mem (rsp) (arg pN))` means and what `scanStackArgArea` reserves the
+    # frame region from — and a manual-path target has no signature by
+    # definition, so there is neither a slot to write nor a reservation to write
+    # it in.
+    #
+    # Without this check `gprAt(pl)` read `intArgRegs[gpFirst]` for a
+    # stack-passed place, whose `gpFirst` is still 0: the seventh argument was
+    # marshalled into rdi, on top of the first. `sink7(1,2,3,4,5,6,7, 0.0)` —
+    # seven integers plus one float, the float being what forces this path —
+    # returned 1654327 instead of 7654321. Silently, on linux/amd64, from
+    # ordinary source.
+    #
+    # The real fix is upstream of here: `isDeclarativeAbi` refuses float
+    # params/results because the typed signature cannot yet express them, and
+    # modelling them would put this call back on the declarative path where
+    # stack arguments already work. Until then, refusing is the whole of what
+    # arkham can honestly do — a diagnosis beats a wrong number.
+    if plan.hasStackArgs:
+      quit "arkham x64: call to `" & tgt.asmName & "` needs an outgoing stack " &
+           "argument, but its signature is not declarative (a float parameter " &
+           "or result, or a <=16B by-value aggregate result), so nifasm cannot " &
+           "place one. Pass at most " & $amd.intArgRegs.len &
+           " integer/pointer arguments to such a proc, or group the extra ones " &
+           "into an object."
     var sealedArgs: set[Reg] = {}
     var pendingRestores: seq[tuple[dst, src: Reg]] = @[]
     if resultByRef: (g.rb.sealAccum amd.intArgRegs[0]; sealedArgs.incl amd.intArgRegs[0])
