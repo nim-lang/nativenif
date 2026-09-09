@@ -3251,6 +3251,13 @@ proc generateJs*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     # getter because memoryGrow REPLACES JMEM, and a captured reference would
     # go stale on the first grow.
     ex &= "\n  memory: { get buffer(){ return JMEM; } },"
+    # The host-bridge for handles: a host-driven module that talks to a JS API
+    # (WebGPU, DOM) receives real JS objects — a `GPUDevice`, a canvas context —
+    # which are meaningless as bare ints. `__internExt` pushes one into the host
+    # value table and returns the int32 handle the exported procs take; the
+    # `importjs` splice unwraps it back to the object at the boundary. First cut
+    # never releases (plan §6 liveness).
+    ex &= "\n  __internExt: ewrap,"
     ex &= "\n};\n"
     result.add ex
   elif entryRet.kind == DotToken or isVoidType(entryRet):
