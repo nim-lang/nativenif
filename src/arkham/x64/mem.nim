@@ -104,6 +104,34 @@ proc fcvtF2I*(g: var CodeGen; d: Reg; s: FReg; bits: int) =         # cvttss2si/
   g.ab.tree op: g.emReg d; g.emFReg s
 
 proc movImm*(g: var CodeGen; d: Reg; v: int64) =
+  ## THE immediate→reg move, and `movReg`'s sibling in the one respect that
+  ## matters: where the value and the destination's declared type disagree, the
+  ## move is a REINTERPRETATION and has to say so with a `(cast …)`.
+  ##
+  ## Leng and asm-NIF are type-checked end to end, so a cast cannot simply
+  ## disappear on the way to an instruction. A bare `(mov ptrreg -1)` is
+  ## indistinguishable from a code generator's stale register binding — which is
+  ## precisely the bug class nifasm's `checkPtrStore` exists to catch, and why it
+  ## admits only `0`/`(nil)` into a pointer-typed destination. Spelling the cast
+  ## out is how a DELIBERATE non-zero pointer literal opts out:
+  ## `cast[pointer](0xffff_ffff_ffff_ffff'u64)` — io_uring's cancel sentinel,
+  ## mmap's `MAP_FAILED`.
+  ##
+  ## The a64 twin has done this since 075b051 (`risc/mem.placeImmTyped`); this
+  ## side never got one, so the same source compiled on one target and was
+  ## rejected on the other. It lives here rather than in a typed wrapper because
+  ## `emitValue2`'s literal arm reaches `movImm` directly — a wrapper only the
+  ## callers that remembered it would use.
+  ##
+  ## `0` is left alone: it is a legal pointer value under the rule above, and
+  ## wrapping it would churn every null store in the program.
+  if v != 0:
+    var dt = g.bindTypeOf(d)
+    if not cursorIsNil(dt) and isPtrType(resolveType(g.prog, dt)):
+      g.ab.tree MovX64:
+        g.emReg d
+        g.ab.tree CastX: (g.genTypeBody(dt); g.ab.intLit v)
+      return
   g.ab.tree MovX64: g.emReg d; g.ab.intLit v
 
 proc movReg*(g: var CodeGen; d, s: Reg) =
@@ -542,7 +570,6 @@ proc placeImm*(g: var CodeGen; dest: Reg; loc: Location) =
   if isNilImm(loc):
     g.ab.tree MovX64: (g.emReg dest; g.ab.nilValue())
   else: g.movImm(dest, loc.ival)
-
 proc normalizeBinWidth*(g: var CodeGen; resTypeC: Cursor; rD: Reg; op: X64Inst) =
   ## arkham keeps register values canonically sign/zero-extended to their full
   ## 64-bit form. `add`/`sub`/`mul`/`shl` on a sub-64-bit type can leave nonzero

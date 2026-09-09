@@ -3138,30 +3138,15 @@ proc emitCast2*(g: var CodeGen; c: Cursor; dest: var Location) =
     # cast re-represents (rebind/extend) in a REGISTER. Demand reg-or-imm: a
     # foldable literal stays an Imm (returned above), a memory home loads.
     iv = regOrImm(dest.typ)
-  let stageable = iv.kind in {NeedsReg, RegOrImm} or
-                  (iv.kind == InReg and iv.isTemp and not g.rb.isBoundTemp(iv.r))
   if iv.typ.cls in {ABool, AInt, AUInt} and iv.typ.size < 8 and not isPtrType(tc) and
-     stageable:
+     (iv.kind in {NeedsReg, RegOrImm} or
+      (iv.kind == InReg and iv.isTemp and not g.rb.isBoundTemp(iv.r))):
     # An int↔int re-representation happens IN a register and is FINISHED by the
     # explicit `extendTo` below, so the register that receives the source must be
     # bound at the canonical 64-bit width. Binding it at the TARGET's narrow width
     # instead made `(mov u8tmp 4000)` — a literal that does not fit `(u 8)`, which
     # nifasm rejects, even though the very next `movzx` is what performs the
     # narrowing. Mirrors the a64 twin.
-    iv.typ = ScalarSlot
-  elif isPtrType(tc) and stageable and
-       not isPtrType(resolveType(g.prog, g.getType(inner))):
-    # The same rule for an int→POINTER reinterpret, and for the same reason. The
-    # register receives the INNER — an integer — and only the `kindChange` rebind
-    # below makes it a pointer, so binding it at the target's pointer type up
-    # front produced `(mov ptrtmp -1)`: nifasm admits only `0`/`(nil)` into a
-    # pointer-typed destination, and rightly, since that is what catches a real
-    # integer leaking into a pointer.
-    #
-    # The named-dest path already pre-retypes to the inner's type a few lines
-    # up ("int arithmetic under an int→ptr reinterpret must run int-typed"); a
-    # TEMP destination had no such arm and fell through. `cast[pointer](
-    # 0xffff_ffff_ffff_ffff'u64)` — io_uring's cancel sentinel — is the shape.
     iv.typ = ScalarSlot
   g.emitValue2(inner, iv)
   dest = iv
