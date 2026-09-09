@@ -2067,6 +2067,64 @@ proc genInstr(g: var JsGen; c: Cursor; wantValue: bool) =
 proc isHostDeclaration(decl: Cursor): bool
   ## Forward declaration; defined with `ensureProc`. `genCallFrom` needs it to
   ## refuse a bodyless extern (importc/importcpp/importjs) at the call site.
+proc hasPragma(decl: Cursor; want: LengPragma): bool
+  ## Forward declaration; defined with the pragma helpers. `genCallFrom` needs
+  ## it to route a bodyless `importjs` proc to the splice.
+
+proc importjsTemplate(decl: Cursor): string =
+  ## The `{.importjs: "tpl".}` splice template, carried in the proc's pragma
+  ## list as `(importjs "tpl")`. Only meaningful once the caller has confirmed
+  ## `hasPragma(decl, ImportjsP)`; a genuinely empty template splices to nothing.
+  ## A read-only walk (`sub`, not `into`): nothing here mutates the tree, so it
+  ## must not claim the children `into` would demand be consumed.
+  result = ""
+  var d = sub(decl)                            # the proc's children
+  skip d                                       # name
+  skip d                                       # params
+  skip d                                       # result type
+  if d.kind == TagLit:                         # the pragma list
+    var p = sub(d)
+    while p.hasMore:
+      if p.kind == TagLit and p.pragmaKind == ImportjsP:
+        var a = sub(p)                         # (importjs "tpl")
+        if a.kind == StrLit: result = strVal(a)
+      skip p
+
+proc genCallArgs(g: var JsGen; decl: Cursor; t: var Cursor) =
+  ## Emit each argument from `t`, moved to the width `decl`'s parameter declares
+  ## (aggregates travel as the address of a copy). A varargs tail past the
+  ## declared parameters rides along, still copied. `t` ends past the last
+  ## argument. Shared by the ordinary `Call` and the `importjs` `Raw` splice —
+  ## pass-by-value does not depend on the calling convention.
+  var p = decl
+  p.into:
+    inc p                                    # name
+    p.into:                                  # params
+      while p.hasMore:
+        var q = p
+        var w = wU32
+        var agg = false
+        q.into:
+          inc q                              # name
+          skip q                             # pragmas
+          agg = isAggType(g, q)
+          if not agg: w = widthOf(g, q)
+          while q.hasMore: skip q
+        skip p
+        if t.hasMore:
+          let (csz, _) = aggArgDestSize(g, t)
+          if csz > 0: genAggArg(g, t, csz)
+          elif agg: genExpr(g, t)
+          else: g.genExprCoerced(t, w)
+          skip t
+    while p.hasMore: skip p                # result type, pragmas, body
+  # anything past the declared parameters (a varargs tail) rides along,
+  # aggregates still copied: pass-by-value does not depend on the signature
+  while t.hasMore:
+    let (csz, _) = aggArgDestSize(g, t)
+    if csz > 0: genAggArg(g, t, csz)
+    else: genExpr(g, t)
+    skip t
 
 proc genCallFrom(g: var JsGen; t: var Cursor; wantValue: bool) =
   ## The call lowering, entered with `t` AT the target child and the args
@@ -2151,56 +2209,37 @@ proc genCallFrom(g: var JsGen; t: var Cursor; wantValue: bool) =
   else:
     var found = false
     let decl = procDeclOf(g, nm, found)
-    if (known and ct.extern or found and isHostDeclaration(decl)) and
+    if found and not hasBody(decl) and hasPragma(decl, ImportjsP):
+      # A bodyless `importjs` proc splices its JS template at the call site:
+      # emit `(raw NAME "tpl" ARG…)` and let jsenc substitute the operands. No
+      # function is emitted — the template IS the call, so the NAME is only the
+      # `$1`/`$#` label, never a reference to a lowered proc.
+      g.outp.openTree Raw
+      g.outp.ident nm
+      g.outp.strLit importjsTemplate(decl)
+      genCallArgs(g, decl, t)
+      g.outp.closeTag
+    elif (known and ct.extern or found and isHostDeclaration(decl)) and
         not (found and hasBody(decl)):
-      # an `importc`/`importjs` WITH a body is an ordinary definition — the C
+      # an `importc`/`importcpp` WITH a body is an ordinary definition — the C
       # compiler emits bodies for its importcs too; only the bodyless signature
-      # reaches across the M7 bridge. A bodyless host declaration must be refused
-      # here, not emitted as an empty stub that silently returns undefined.
+      # reaches across the M7 bridge. A bodyless importc/importcpp host
+      # declaration must be refused here, not emitted as an empty stub that
+      # silently returns undefined.
       err g, "extern `" & nm & "` (the JS bridge is M7)"
-    if not found: err g, "no body to call: " & nm
-    ensureProc(g, nm, decl)
-    let rt = calleeResultType(g, target)
-    let aggRet = not rt.cursorIsNil and isAggType(g, rt)
-    g.outp.openTree Call
-    g.outp.symUse jsName(g, nm)
-    # The struct-return destination is the CALLER's planned temporary, and it
-    # is reserved before the arguments are walked: `planFrame` reserved it at
-    # the call node, and any temporary an argument needs comes after it.
-    if aggRet: slotAddr(g, takeTemp(g, byteSize(g, rt)))
-    # Each argument is moved to the width the callee's parameter declares, so
-    # a caller holding an `i32` cannot hand a BigInt to an `i64` parameter.
-    # An aggregate parameter needs no coercion: it travels as its address.
-    var p = decl
-    p.into:
-      inc p                                    # name
-      p.into:                                  # params
-        while p.hasMore:
-          var q = p
-          var w = wU32
-          var agg = false
-          q.into:
-            inc q                              # name
-            skip q                             # pragmas
-            agg = isAggType(g, q)
-            if not agg: w = widthOf(g, q)
-            while q.hasMore: skip q
-          skip p
-          if t.hasMore:
-            let (csz, _) = aggArgDestSize(g, t)
-            if csz > 0: genAggArg(g, t, csz)
-            elif agg: genExpr(g, t)
-            else: g.genExprCoerced(t, w)
-            skip t
-      while p.hasMore: skip p                # result type, pragmas, body
-    # anything past the declared parameters (a varargs tail) rides along,
-    # aggregates still copied: pass-by-value does not depend on the signature
-    while t.hasMore:
-      let (csz, _) = aggArgDestSize(g, t)
-      if csz > 0: genAggArg(g, t, csz)
-      else: genExpr(g, t)
-      skip t
-    g.outp.closeTag
+    else:
+      if not found: err g, "no body to call: " & nm
+      ensureProc(g, nm, decl)
+      let rt = calleeResultType(g, target)
+      let aggRet = not rt.cursorIsNil and isAggType(g, rt)
+      g.outp.openTree Call
+      g.outp.symUse jsName(g, nm)
+      # The struct-return destination is the CALLER's planned temporary, and it
+      # is reserved before the arguments are walked: `planFrame` reserved it at
+      # the call node, and any temporary an argument needs comes after it.
+      if aggRet: slotAddr(g, takeTemp(g, byteSize(g, rt)))
+      genCallArgs(g, decl, t)
+      g.outp.closeTag
 
 proc genCall(g: var JsGen; c: Cursor; wantValue: bool) =
   var t = c
