@@ -91,6 +91,10 @@ type
     usedNames: HashSet[string]
     p: ProcCtx                         ## the proc being lowered
     entrySym*: string
+    browser: bool                      ## emit for a browser (no Node fs/process):
+                                       ## output to a host sink, nim_exit throws, and
+                                       ## the surface lands on globalThis.NIF, not
+                                       ## module.exports. Default false = Node/CommonJS.
 
 type
   JsGenError* = object of CatchableError
@@ -688,9 +692,11 @@ proc dataInitJs*(g: var JsGen): string =
   for (at, s) in g.dataSegs:
     result.add "D(\"" & encode(s) & "\", " & $at & ");\n"
 
-proc createJsGen*(buf: var TokenBuf; inputPath: string; tags: TagPool): JsGen =
+proc createJsGen*(buf: var TokenBuf; inputPath: string; tags: TagPool;
+                  browser = false): JsGen =
   setTargetWord Wasm32               # the linear-memory model: 4-byte pointers
   result.tags = tags
+  result.browser = browser
   result.memTop = NullGuard
   result.nextTableSlot = 1           # slot 0 stays the null function pointer
   result.outp = createTokenBuf(sharedTags = createJsTagPool())
@@ -3166,8 +3172,8 @@ proc ensureProc(g: var JsGen; sym: string; decl: Cursor) =
 
 proc generateJs*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                  memBytes = 64 * 1024 * 1024;
-                 stackBytes = ShadowStackSize): string =
-  var g = createJsGen(buf, inputPath, tags)
+                 stackBytes = ShadowStackSize; browser = false): string =
+  var g = createJsGen(buf, inputPath, tags, browser)
   layoutProgram(g)
   var entryDecl: Cursor
   var haveEntry = false
@@ -3219,7 +3225,7 @@ proc generateJs*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     if i >= g.pending.len: break
   g.outp.closeTag
 
-  result = jsPreamble(memBytes, stackBytes, int g.memTop) & dataInitJs(g)
+  result = jsPreamble(memBytes, stackBytes, int g.memTop, browser) & dataInitJs(g)
   result.add genJs(g.outp)
   result.add "FTAB[0] = () => { throw new Error(\"nil function pointer\"); };\n"
   for slot in 1 ..< g.tableEntries.len:
@@ -3241,7 +3247,10 @@ proc generateJs*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     # roots and lets the host call `_start`; jorogumo runs the init inline at
     # load, so the host only ever touches the exports.
     result.add jsName(g, g.entrySym) & "(0, 0, 0);\n"
-    var ex = "module.exports = {"
+    # node hands the surface to `require`; a browser has no module system in a
+    # classic <script>, so it lands on globalThis.NIF (a module host can read
+    # the same global, or the file can be `import`ed and read it there too).
+    var ex = (if g.browser: "globalThis.NIF = {" else: "module.exports = {")
     for (sym, cName) in exportRoots:
       if g.emitted.contains(sym):
         ex &= "\n  " & cName & ": " & jsName(g, sym) & ","
@@ -3258,6 +3267,9 @@ proc generateJs*(buf: var TokenBuf; inputPath: string; tags: TagPool;
     # `importjs` splice unwraps it back to the object at the boundary. First cut
     # never releases (plan §6 liveness).
     ex &= "\n  __internExt: ewrap,"
+    if g.browser:
+      # no fd to write to: buffered stdout/stderr is drained here after a call.
+      ex &= "\n  __takeOutput,"
     ex &= "\n};\n"
     result.add ex
   elif entryRet.kind == DotToken or isVoidType(entryRet):

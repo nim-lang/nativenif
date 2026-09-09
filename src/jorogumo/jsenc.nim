@@ -48,7 +48,7 @@ const
   ]
     ## The alignment-free accessors; the byte widths keep their direct view.
 
-proc jsPreamble*(memBytes, stackBytes, dataEnd: int): string =
+proc jsPreamble*(memBytes, stackBytes, dataEnd: int; browser = false): string =
   ## The host contract, emitted once per file: the linear-memory buffer, the
   ## views above it, the extern-value table of the bridge (§6). The buffer
   ## GROWS (`growMem` is wasm `memory.grow`'s twin: reallocate, copy, rebind
@@ -64,7 +64,14 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int): string =
   ## grow past `SP_MIN`, so the two cannot collide; appended pages land ABOVE
   ## the stack, exactly as they do in wasm, where the same crowding exists at
   ## exhaustion.
-  "const fs = require(\"fs\");  // for the synchronous nim_write below\n" &
+  # The target face: node writes to fds through `fs`; a browser has neither
+  # `fs` nor a synchronous fd, so output buffers into `__outBuf` for the host
+  # to drain, and `nim_exit` throws instead of killing the tab.
+  (if browser:
+    ("const __outBuf = [];\n" &
+     "function __takeOutput() { const s = __outBuf.join(\"\"); __outBuf.length = 0; return s; }\n")
+   else:
+    "const fs = require(\"fs\");  // for the synchronous nim_write below\n") &
   "let JMEM = new ArrayBuffer(" & $memBytes & ");\n" &
   "let I8 = new Int8Array(JMEM), U8 = new Uint8Array(JMEM),\n" &
   "    I16 = new Int16Array(JMEM), U16 = new Uint16Array(JMEM),\n" &
@@ -115,17 +122,25 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int): string =
   "  const bin = atob(b64);\n" &
   "  for (let i = 0; i < bin.length; ++i) U8[at + i] = bin.charCodeAt(i);\n" &
   "}\n" &
-  # The host face, the same two entry points ithaqua imports from `env`.
-  # node-only by nature: a browser has no fd 1 to write to (M8 gives DOM
-  # programs a console-backed one).
-  "function nim_write(fd, buf, len) {\n" &
-  "  // fs.writeSync, not process.stdout.write: the latter is asynchronous on\n" &
-  "  // pipes (macOS/Windows), and the process.exit a `nim_exit` performs would\n" &
-  "  // cut a pending write. The sync call lands before the exit, everywhere.\n" &
-  "  fs.writeSync(fd === 2 ? 2 : 1, Buffer.from(JMEM, buf, len));\n" &
-  "  return len;\n" &
-  "}\n" &
-  "function nim_exit(code) { process.exit(code); }\n" &
+  # The host face, the same two entry points ithaqua imports from `env`. The
+  # body branches on the target: node writes the fd synchronously; a browser
+  # buffers UTF-8 into __outBuf (drained via __takeOutput) and has no process
+  # to exit, so nim_exit throws and the host's frame call unwinds.
+  (if browser:
+    ("function nim_write(fd, buf, len) {\n" &
+     "  __outBuf.push(new TextDecoder(\"utf-8\").decode(U8.subarray(buf, buf + len)));\n" &
+     "  return len;\n" &
+     "}\n" &
+     "function nim_exit(code) { throw new Error(\"nim_exit(\" + code + \")\"); }\n")
+   else:
+    ("function nim_write(fd, buf, len) {\n" &
+     "  // fs.writeSync, not process.stdout.write: the latter is asynchronous on\n" &
+     "  // pipes (macOS/Windows), and the process.exit a `nim_exit` performs would\n" &
+     "  // cut a pending write. The sync call lands before the exit, everywhere.\n" &
+     "  fs.writeSync(fd === 2 ? 2 : 1, Buffer.from(JMEM, buf, len));\n" &
+     "  return len;\n" &
+     "}\n" &
+     "function nim_exit(code) { process.exit(code); }\n")) &
   # ithaqua's ruling for a syscall the target cannot serve: `unreachable`, a
   # loud trap, not a silent no-op. The throw is the JS twin of that trap.
   "function nim_unreachable() { throw new Error('unreachable: unsupported syscall'); }\n" &

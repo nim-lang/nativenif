@@ -26,6 +26,11 @@ Usage:
 Options:
   -o:file, --output:file   output js file (default: <input>.js)
   -m:N, --memory:N         linear memory in bytes (default: 64 MiB)
+  --target:node|browser    host the output runs on (default: node). `browser`
+                           drops the Node `fs`/`process` face: output buffers
+                           into __takeOutput(), nim_exit throws, and the export
+                           surface lands on globalThis.NIF, not module.exports.
+  --browser                shorthand for --target:browser
   -h, --help               show this help
 """
 
@@ -37,16 +42,17 @@ const
     ## memory above 2 GiB would silently alias through the 32-bit window, so
     ## the ceiling is stated, not discovered.
 
-proc generate(input, output: string; memBytes: int) =
+proc generate(input, output: string; memBytes: int; browser: bool) =
   # One Leng tag pool for the input; `generateJs` builds its output in a buffer
   # with the jsnif pool. A buffer speaks one dialect, never both.
   let tags = lengdecl.createLengTagPool()
   var buf = parseFromFile(input, sharedTags = tags)
-  writeFile output, generateJs(buf, input, tags, memBytes)
+  writeFile output, generateJs(buf, input, tags, memBytes, browser = browser)
 
 proc main() =
   var input, output = ""
   var memBytes = DefaultMemBytes
+  var browser = false
   for kind, key, val in getopt():
     case kind
     of cmdArgument:
@@ -55,6 +61,12 @@ proc main() =
       case key.normalize
       of "output", "o": output = val
       of "memory", "m": memBytes = parseInt(val)
+      of "target":
+        case val.normalize
+        of "node", "": browser = false
+        of "browser": browser = true
+        else: quit "jorogumo: --target must be `node` or `browser`\n", QuitFailure
+      of "browser": browser = true
       of "help", "h": quit(Usage, QuitSuccess)
     of cmdEnd: discard
   if input.len == 0: quit(Usage, QuitSuccess)
@@ -62,7 +74,7 @@ proc main() =
   if memBytes <= 0 or memBytes > MaxMemBytes:
     quit "jorogumo: --memory must be in 1.." & $MaxMemBytes & " bytes (2 GiB)\n", QuitFailure
   try:
-    generate(input, output, memBytes)
+    generate(input, output, memBytes, browser)
   except JsGenError as e:
     # One line, not a stack trace: "this construct is not generated yet" is an
     # ordinary answer, and a caller (hastur, jsdiff) reads the exit code.
