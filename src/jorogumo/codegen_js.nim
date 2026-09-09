@@ -130,6 +130,17 @@ proc isPtrType(g: var JsGen; t: Cursor): bool =
   let r = resolveType(g.prog, t)
   r.kind == TagLit and r.typeKind in {PtrT, AptrT}
 
+proc isJsHandleType(g: var JsGen; t: Cursor): bool =
+  ## A JS handle inside an `importjs` splice: a pointer/reference type is an
+  ## opaque `int32` index into the host value table (`EXT`), NOT a linear-memory
+  ## address. This is the handle model (plan §6): a binding declares a JS object
+  ## (`GPUBuffer`, `DOMObject`, …) as an opaque `ref object`/pointer and only
+  ## touches it through `importjs`, so at the splice boundary it unwraps to the
+  ## real JS value; a pointer result wraps back to a handle. Scalars (int/float)
+  ## splice through untouched. Confined to splices — ordinary Nim pointers are
+  ## still real addresses — because a JS API never takes a linear-memory address.
+  isPtrType(g, t)
+
 proc isAggType(g: var JsGen; t: Cursor): bool =
   ## A DotToken is the ABSENCE of a type — a void result, an elided field type.
   ## It has no size to ask for, so it is not an aggregate. The spelled `(void)`
@@ -2090,12 +2101,16 @@ proc importjsTemplate(decl: Cursor): string =
         if a.kind == StrLit: result = strVal(a)
       skip p
 
-proc genCallArgs(g: var JsGen; decl: Cursor; t: var Cursor) =
+proc genCallArgs(g: var JsGen; decl: Cursor; t: var Cursor; splice = false) =
   ## Emit each argument from `t`, moved to the width `decl`'s parameter declares
   ## (aggregates travel as the address of a copy). A varargs tail past the
   ## declared parameters rides along, still copied. `t` ends past the last
   ## argument. Shared by the ordinary `Call` and the `importjs` `Raw` splice —
   ## pass-by-value does not depend on the calling convention.
+  ##
+  ## `splice` marks the `importjs` case: a pointer-typed (handle) parameter
+  ## unwraps to the real JS value (`eunwrap`) so the template splices the object,
+  ## not its handle. A `Call` never unwraps — there a pointer is a real address.
   var p = decl
   p.into:
     inc p                                    # name
@@ -2104,17 +2119,24 @@ proc genCallArgs(g: var JsGen; decl: Cursor; t: var Cursor) =
         var q = p
         var w = wU32
         var agg = false
+        var handle = false
         q.into:
           inc q                              # name
           skip q                             # pragmas
           agg = isAggType(g, q)
-          if not agg: w = widthOf(g, q)
+          if not agg:
+            handle = isJsHandleType(g, q)
+            w = widthOf(g, q)
           while q.hasMore: skip q
         skip p
         if t.hasMore:
           let (csz, _) = aggArgDestSize(g, t)
           if csz > 0: genAggArg(g, t, csz)
           elif agg: genExpr(g, t)
+          elif splice and handle:
+            g.outp.openTree EUnwrap          # handle -> the JS value it names
+            g.genExprCoerced(t, w)
+            g.outp.closeTag
           else: g.genExprCoerced(t, w)
           skip t
     while p.hasMore: skip p                # result type, pragmas, body
@@ -2213,12 +2235,19 @@ proc genCallFrom(g: var JsGen; t: var Cursor; wantValue: bool) =
       # A bodyless `importjs` proc splices its JS template at the call site:
       # emit `(raw NAME "tpl" ARG…)` and let jsenc substitute the operands. No
       # function is emitted — the template IS the call, so the NAME is only the
-      # `$1`/`$#` label, never a reference to a lowered proc.
+      # `$1`/`$#` label, never a reference to a lowered proc. A pointer (handle)
+      # result is a real JS value the splice produced, so wrap it back into the
+      # host table (`ewrap`) to hand the caller a handle; scalar results pass
+      # through as the splice's own number.
+      let rt = calleeResultType(g, target)
+      let handleRet = not rt.cursorIsNil and isJsHandleType(g, rt)
+      if handleRet: g.outp.openTree EWrap
       g.outp.openTree Raw
       g.outp.ident nm
       g.outp.strLit importjsTemplate(decl)
-      genCallArgs(g, decl, t)
+      genCallArgs(g, decl, t, splice = true)
       g.outp.closeTag
+      if handleRet: g.outp.closeTag
     elif (known and ct.extern or found and isHostDeclaration(decl)) and
         not (found and hasBody(decl)):
       # an `importc`/`importcpp` WITH a body is an ordinary definition — the C
