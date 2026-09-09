@@ -2064,6 +2064,10 @@ proc genInstr(g: var JsGen; c: Cursor; wantValue: bool) =
     else:
       err g, "(instr …) not lowered by jorogumo: " & $it.op
 
+proc isHostDeclaration(decl: Cursor): bool
+  ## Forward declaration; defined with `ensureProc`. `genCallFrom` needs it to
+  ## refuse a bodyless extern (importc/importcpp/importjs) at the call site.
+
 proc genCallFrom(g: var JsGen; t: var Cursor; wantValue: bool) =
   ## The call lowering, entered with `t` AT the target child and the args
   ## after it; `t` ends past the last argument. `genCall` walks into the call
@@ -2147,10 +2151,12 @@ proc genCallFrom(g: var JsGen; t: var Cursor; wantValue: bool) =
   else:
     var found = false
     let decl = procDeclOf(g, nm, found)
-    if known and ct.extern and not (found and hasBody(decl)):
-      # an `importc` WITH a body is an ordinary definition — the C compiler
-      # emits bodies for its importcs too; only the bodyless signature
-      # reaches across the M7 bridge.
+    if (known and ct.extern or found and isHostDeclaration(decl)) and
+        not (found and hasBody(decl)):
+      # an `importc`/`importjs` WITH a body is an ordinary definition — the C
+      # compiler emits bodies for its importcs too; only the bodyless signature
+      # reaches across the M7 bridge. A bodyless host declaration must be refused
+      # here, not emitted as an empty stub that silently returns undefined.
       err g, "extern `" & nm & "` (the JS bridge is M7)"
     if not found: err g, "no body to call: " & nm
     ensureProc(g, nm, decl)
@@ -3075,11 +3081,11 @@ proc lowerProc(g: var JsGen; sym: string; decl: Cursor) =
   g.outp.closeTag
 
 proc isHostDeclaration(decl: Cursor): bool =
-  ## An `importc` proc is a SIGNATURE only: the host implements it. A proc with
-  ## an empty body and no import pragma is a DEFINITION that does nothing, and
-  ## it must still be emitted — a call to it is a call to that empty function,
-  ## not to the host.
-  hasPragma(decl, ImportcP) or hasPragma(decl, ImportcppP)
+  ## An `importc`/`importcpp`/`importjs` proc is a SIGNATURE only: the host
+  ## implements it. A proc with an empty body and no import pragma is a
+  ## DEFINITION that does nothing, and it must still be emitted — a call to it
+  ## is a call to that empty function, not to the host.
+  hasPragma(decl, ImportcP) or hasPragma(decl, ImportcppP) or hasPragma(decl, ImportjsP)
 
 proc ensureProc(g: var JsGen; sym: string; decl: Cursor) =
   ## Schedule a proc for lowering. An `importc` declaration with no body is not
