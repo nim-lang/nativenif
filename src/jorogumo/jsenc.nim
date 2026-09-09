@@ -182,6 +182,51 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int; browser = false): string =
   "function bitsf32(i) { _FI[0] = i | 0; return _FF[0]; }\n" &
   # memcpy over the one buffer: the aggregate-assignment and sret primitives.
   "function copyMem(d, s, n) { U8.copyWithin(d, s, s + n); }\n" &
+  # The string bridge (M7 §6): a Nim `string` crossing an `importjs` splice.
+  # The representation is the SSO string of lib/std/system/stringimpl.nim for
+  # the 4-byte target: byte0 = slen (or the sentinel 254=static / 255=heap);
+  # slen <= PAYLOAD(6) keeps the chars inline at value+1; otherwise `more`
+  # (value+4) points to a LongString { fullLen@0, rc@4, capImpl@8, data@12 }.
+  # These mirror `len`/`rawData` exactly, so short, medium, long and static all
+  # decode correctly. TextEncoder/Decoder exist in both node and the browser.
+  "const __STR_PAYLOAD = 6, __STR_DATAOFF = 12, __STR_STATIC = 254;\n" &
+  "function nimStrToJs(s) {\n" &
+  "  const sl = U8[s];\n" &
+  "  if (sl <= __STR_PAYLOAD)\n" &
+  "    return new TextDecoder(\"utf-8\").decode(U8.subarray(s + 1, s + 1 + sl));\n" &
+  "  const more = DV.getUint32(s + 4, true);\n" &
+  "  const n = DV.getInt32(more, true);\n" &
+  "  return new TextDecoder(\"utf-8\").decode(U8.subarray(more + __STR_DATAOFF, more + __STR_DATAOFF + n));\n" &
+  "}\n" &
+  "function cstrToJs(p) {\n" &
+  "  let e = p; while (U8[e] !== 0) ++e;\n" &
+  "  return new TextDecoder(\"utf-8\").decode(U8.subarray(p, e));\n" &
+  "}\n" &
+  # A JS string back to Nim as a STATIC string (byte0=254, capImpl=0): the GC's
+  # `=destroy` frees only a HeapSlen string, so a bridge result is never freed
+  # and never refcounted — it leaks rather than risk a bad refcount (plan §6
+  # first-cut liveness, matching the never-released handle table). The inline
+  # cache (first 3 chars at value+1) is synced so `==`/`hash` agree with a
+  # compiler literal of the same text.
+  "function jsToNimStr(v) {\n" &
+  "  const enc = new TextEncoder().encode(typeof v === \"string\" ? v : String(v));\n" &
+  "  const n = enc.length;\n" &
+  "  const p = osalloc(0, __STR_DATAOFF + n + 1);\n" &
+  "  DV.setInt32(p + 0, n, true); DV.setInt32(p + 4, 0, true); DV.setInt32(p + 8, 0, true);\n" &
+  "  U8.set(enc, p + __STR_DATAOFF); U8[p + __STR_DATAOFF + n] = 0;\n" &
+  "  const val = osalloc(0, 8);\n" &
+  "  U8[val] = __STR_STATIC;\n" &
+  "  for (let i = 0; i < 3 && i < n; ++i) U8[val + 1 + i] = enc[i];\n" &
+  "  DV.setUint32(val + 4, p, true);\n" &
+  "  return val;\n" &
+  "}\n" &
+  "function jsToCstr(v) {\n" &
+  "  const enc = new TextEncoder().encode(typeof v === \"string\" ? v : String(v));\n" &
+  "  const n = enc.length;\n" &
+  "  const p = osalloc(0, n + 1);\n" &
+  "  U8.set(enc, p); U8[p + n] = 0;\n" &
+  "  return p;\n" &
+  "}\n" &
   # The shadow stack is reused memory, so an uninitialized local would read the
   # previous frame's bytes; the back end zeroes what Leng leaves undefined.
   "function zeroMem(d, n) { U8.fill(0, d, d + n); }\n" &

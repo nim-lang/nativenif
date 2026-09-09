@@ -134,16 +134,37 @@ proc isPtrType(g: var JsGen; t: Cursor): bool =
   let r = resolveType(g.prog, t)
   r.kind == TagLit and r.typeKind in {PtrT, AptrT}
 
-proc isJsHandleType(g: var JsGen; t: Cursor): bool =
-  ## A JS handle inside an `importjs` splice: a pointer/reference type is an
-  ## opaque `int32` index into the host value table (`EXT`), NOT a linear-memory
-  ## address. This is the handle model (plan §6): a binding declares a JS object
-  ## (`GPUBuffer`, `DOMObject`, …) as an opaque `ref object`/pointer and only
-  ## touches it through `importjs`, so at the splice boundary it unwraps to the
-  ## real JS value; a pointer result wraps back to a handle. Scalars (int/float)
-  ## splice through untouched. Confined to splices — ordinary Nim pointers are
-  ## still real addresses — because a JS API never takes a linear-memory address.
-  isPtrType(g, t)
+proc isNimStringType(g: var JsGen; t: Cursor): bool =
+  ## A Nim `string` — the `string.0.<system>` symbol (Leng has no builtin type
+  ## kind for it). Its value is the 8-byte SSO struct; the splice decodes it to
+  ## a JS string (§6). Checked on the type cursor before it is resolved, which
+  ## would fold the symbol to its `(object bytes more)` definition and lose the name.
+  t.kind == Symbol and symName(t).startsWith("string.0.")
+
+proc isCstringType(g: var JsGen; t: Cursor): bool =
+  ## A `cstring` is `(aptr char)` in Leng — a pointer to NUL-terminated bytes,
+  ## NOT a JS handle. It must be recognised before the pointer/handle case,
+  ## which isPtrType would otherwise swallow it into.
+  t.kind == TagLit and t.typeKind == AptrT and
+    (let inner = innerType(g.prog, t); inner.kind == TagLit and inner.typeKind == CT)
+
+type
+  JsBridgeKind = enum jbNone, jbString, jbCstring, jbHandle
+
+proc jsBridgeKind(g: var JsGen; t: Cursor): JsBridgeKind =
+  ## How a type crosses an `importjs` splice boundary, in precedence order: a
+  ## Nim `string` (decode the SSO struct), a `cstring` (NUL-terminated bytes),
+  ## then any other pointer/ref as a JS HANDLE — an opaque int32 index into the
+  ## host value table (plan §6): a binding declares a JS object (`GPUBuffer`, a
+  ## canvas context, …) as an opaque `ref object`/pointer and touches it only
+  ## through `importjs`, so at the splice it unwraps to the real JS value and a
+  ## pointer result wraps back to a handle. Confined to splices — ordinary Nim
+  ## pointers stay real addresses, because a JS API never takes a linear-memory
+  ## address. Scalars and plain aggregates are jbNone and pass through untouched.
+  if isNimStringType(g, t): jbString
+  elif isCstringType(g, t): jbCstring
+  elif isPtrType(g, t): jbHandle
+  else: jbNone
 
 proc isAggType(g: var JsGen; t: Cursor): bool =
   ## A DotToken is the ABSENCE of a type — a void result, an elided field type.
@@ -2125,25 +2146,36 @@ proc genCallArgs(g: var JsGen; decl: Cursor; t: var Cursor; splice = false) =
         var q = p
         var w = wU32
         var agg = false
-        var handle = false
+        var bk = jbNone
         q.into:
           inc q                              # name
           skip q                             # pragmas
           agg = isAggType(g, q)
-          if not agg:
-            handle = isJsHandleType(g, q)
-            w = widthOf(g, q)
+          if splice: bk = jsBridgeKind(g, q)
+          if not agg: w = widthOf(g, q)
           while q.hasMore: skip q
         skip p
         if t.hasMore:
-          let (csz, _) = aggArgDestSize(g, t)
-          if csz > 0: genAggArg(g, t, csz)
-          elif agg: genExpr(g, t)
-          elif splice and handle:
-            g.outp.openTree EUnwrap          # handle -> the JS value it names
+          case bk
+          of jbString:                       # Nim SSO string -> JS string
+            g.outp.openTree Call
+            g.outp.ident "nimStrToJs"
+            genExpr(g, t)                    # an aggregate's value IS its address
+            g.outp.closeTag
+          of jbCstring:                      # NUL-terminated bytes -> JS string
+            g.outp.openTree Call
+            g.outp.ident "cstrToJs"
+            g.genExprCoerced(t, wU32)
+            g.outp.closeTag
+          of jbHandle:                       # handle -> the JS value it names
+            g.outp.openTree EUnwrap
             g.genExprCoerced(t, w)
             g.outp.closeTag
-          else: g.genExprCoerced(t, w)
+          of jbNone:
+            let (csz, _) = aggArgDestSize(g, t)
+            if csz > 0: genAggArg(g, t, csz)
+            elif agg: genExpr(g, t)
+            else: g.genExprCoerced(t, w)
           skip t
     while p.hasMore: skip p                # result type, pragmas, body
   # anything past the declared parameters (a varargs tail) rides along,
@@ -2241,19 +2273,29 @@ proc genCallFrom(g: var JsGen; t: var Cursor; wantValue: bool) =
       # A bodyless `importjs` proc splices its JS template at the call site:
       # emit `(raw NAME "tpl" ARG…)` and let jsenc substitute the operands. No
       # function is emitted — the template IS the call, so the NAME is only the
-      # `$1`/`$#` label, never a reference to a lowered proc. A pointer (handle)
-      # result is a real JS value the splice produced, so wrap it back into the
-      # host table (`ewrap`) to hand the caller a handle; scalar results pass
+      # `$1`/`$#` label, never a reference to a lowered proc. The result is
+      # bridged by kind: a JS string becomes a Nim `string` (`jsToNimStr`) or a
+      # `cstring` (`jsToCstr`); a pointer (handle) is a real JS value the splice
+      # produced, so it wraps back into the host table (`ewrap`); scalars pass
       # through as the splice's own number.
       let rt = calleeResultType(g, target)
-      let handleRet = not rt.cursorIsNil and isJsHandleType(g, rt)
-      if handleRet: g.outp.openTree EWrap
+      let rbk = if not rt.cursorIsNil: jsBridgeKind(g, rt) else: jbNone
+      case rbk
+      of jbString:
+        g.outp.openTree Call
+        g.outp.ident "jsToNimStr"
+      of jbCstring:
+        g.outp.openTree Call
+        g.outp.ident "jsToCstr"
+      of jbHandle:
+        g.outp.openTree EWrap
+      of jbNone: discard
       g.outp.openTree Raw
       g.outp.ident nm
       g.outp.strLit importjsTemplate(decl)
       genCallArgs(g, decl, t, splice = true)
       g.outp.closeTag
-      if handleRet: g.outp.closeTag
+      if rbk != jbNone: g.outp.closeTag
     elif (known and ct.extern or found and isHostDeclaration(decl)) and
         not (found and hasBody(decl)):
       # an `importc`/`importcpp` WITH a body is an ordinary definition — the C
