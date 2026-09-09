@@ -1032,6 +1032,35 @@ proc emWordThroughPtr*(g: var CodeGen; p: Reg; idx: int) =
         g.emReg p
       g.ab.intLit idx.int64
 
+proc emZeroBytesThroughPtr*(g: var CodeGen; p, z: Reg; n: int) =
+  ## Write `n` zero bytes at `[p]`; `z` holds 0.
+  ##
+  ## Straight-line and widest-first (8/4/2/1), with an IMMEDIATE index at each
+  ## width, so it needs no counter register and no loop — the sizes this serves
+  ## are a union's, which are a handful of bytes. Each store types its own
+  ## operand (`(aptr (u W))`), which is what tells nifasm the access width; the
+  ## index is scaled by that width, and the offset is always a multiple of it
+  ## because the wider stores go first.
+  var off = 0
+  var rem = n
+  template zstore(bits, idx: int) =
+    g.ab.tree MovX64:
+      g.ab.tree MemX:
+        g.ab.tree AtX:
+          g.ab.tree CastX:
+            g.ab.aptrType: g.ab.uintType(bits)
+            g.emReg p
+          g.ab.intLit idx.int64
+      g.emReg z
+  while rem >= 8:
+    zstore(64, off div 8); off += 8; rem -= 8
+  if rem >= 4:
+    zstore(32, off div 4); off += 4; rem -= 4
+  if rem >= 2:
+    zstore(16, off div 2); off += 2; rem -= 2
+  if rem >= 1:
+    zstore(8, off); off += 1; rem -= 1
+
 proc emPtrElemMem*(g: var CodeGen; p: Reg; elemTy: Cursor; idx: int) =
   ## `(mem (at (cast (aptr ElemTy) p) idx))` — element `idx` of an array whose first
   ## element is at `[p]`; nifasm scales `idx` by the element size (from ElemTy) and

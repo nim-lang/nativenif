@@ -74,6 +74,7 @@ a second table anywhere in this file is parsed as vocabulary.)
 | `(object ...)`         | NifasmType                  | object type definition |
 | `(union ...)`          | NifasmType                  | union type definition |
 | `(fld D T)`            | NifasmType                  | field definition |
+| `(packed)`             | NifasmType                  | first child of an `(object ...)` / `(union ...)`: lay it out with NO padding — every field at the running byte sum, alignment 1, no tail padding. The C `__attribute__((packed))` / Nim `{.packed.}` layout. Absent means natural alignment |
 | `(proc D ...)`         | NifasmDecl                  | proc declaration |
 | `(params ...)`         | NifasmDecl                  | parameters block |
 | `(param D L T)`        | NifasmDecl                  | parameter declaration |

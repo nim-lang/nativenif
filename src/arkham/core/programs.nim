@@ -316,7 +316,54 @@ const LinuxSyscalls* = {
   # `abort` is a libc function, not a syscall. For now we lower it to the `exit`
   # syscall so a libc-free build links and terminates (it takes no args, so the exit
   # code is whatever is in the syscall's code register — abort is a cold error path).
-  "abort":      (60,  93)}
+  "abort":      (60,  93),
+  # io_uring. Arch-INDEPENDENT numbers: the interface arrived in Linux 5.1, well
+  # after the syscall tables were unified, so x86-64 and AArch64 agree — unlike
+  # every pair above, where they were assigned independently.
+  #
+  # These have no libc wrapper AT ALL (glibc exposes no `io_uring_enter`), which
+  # is why `std/posix/io_uring` reaches them through the `syscall(NR, …)`
+  # multiplexer under the C backend. That multiplexer is unreachable here: it is
+  # variadic, it is libc, and `io_uring_enter` needs six arguments, so calling it
+  # through `syscall` needs SEVEN and the seventh has nowhere to go. Naming them
+  # directly is what lets the freestanding backend trap straight into the kernel.
+  # Sockets. AArch64's numbers are the asm-generic ones; both columns were read
+  # off `asm/unistd_64.h` and `asm-generic/unistd.h` rather than recalled.
+  #
+  # No `recv`/`send`: neither is a Linux syscall. glibc implements them as
+  # `recvfrom(…, NULL, NULL)` / `sendto(…, NULL, 0)`, so a freestanding stdlib
+  # has to spell that out rather than expect a trap keyed on the short name —
+  # which is why they are absent here instead of guessed at.
+  # `__NR_fcntl` is `__NR3264_fcntl` (25) on asm-generic, which on a 64-bit
+  # target IS `fcntl64` — the same call. Its Nim declaration must be FIXED
+  # arity (see `std/ioring`'s): one stub per C name means one arity.
+  "fcntl":       (72,  25),
+  "socket":      (41,  198),
+  "socketpair":  (53,  199),
+  "connect":     (42,  203),
+  "accept":      (43,  202),
+  "accept4":     (288, 242),
+  "sendto":      (44,  206),
+  "recvfrom":    (45,  207),
+  "shutdown":    (48,  210),
+  "bind":        (49,  200),
+  "listen":      (50,  201),
+  "getsockname": (51,  204),
+  "getpeername": (52,  205),
+  "setsockopt":  (54,  208),
+  "getsockopt":  (55,  209),
+  # epoll. `epoll_create` and `epoll_wait` are the LEGACY forms and exist only on
+  # x86-64: the asm-generic ABI AArch64 uses carries just the `1`/`p` variants, so
+  # a freestanding backend there must reach for `epoll_create1`/`epoll_pwait`.
+  "epoll_create":  (213, -1),
+  "epoll_create1": (291, 20),
+  "epoll_ctl":     (233, 21),
+  "epoll_wait":    (232, -1),
+  "epoll_pwait":   (281, 22),
+  "eventfd2":      (290, 19),
+  "io_uring_setup":    (425, 425),
+  "io_uring_enter":    (426, 426),
+  "io_uring_register": (427, 427)}
 
 const CLinkageGvars* = ["cmdCount", "cmdLine", "nimEnviron"]
   ## Runtime gvars that link by their bare C name (`<cName>.0`) across all bundled
@@ -1134,7 +1181,46 @@ proc unionSizeAlign(p: var Program; unionc: Cursor): (int, int) =
       skip uc
   result = (align(maxSz, maxAl), maxAl)
 
-proc objSizeAlign(p: var Program; bodyc: Cursor): (int, int) =
+proc pragmasArePacked*(c: Cursor): bool =
+  ## Whether a type declaration's pragma slot carries `(packed)`.
+  ##
+  ## `{.packed.}` is not decoration: it names the layout the OTHER side of an
+  ## ABI already uses. `struct epoll_event` is 12 bytes on x86-64 (the union is
+  ## 8-byte data at offset 4, deliberately unaligned, for compat with the
+  ## original 32-bit layout) and the kernel writes an ARRAY of them. Laying it
+  ## out naturally gives 16, so entry 0 reads its `data` from the wrong offset
+  ## and entry 1 from the wrong address entirely — which is a hang, not a
+  ## crash, because the fd never matches anything.
+  if c.kind != TagLit: return false        # `.` — the type has no pragmas
+  var pc = c
+  pc.into:
+    while pc.hasMore:
+      if pc.kind == TagLit and pc.pragmaKind == PackedP: return true
+      skip pc
+  result = false
+
+proc typeSymIsUnion*(p: var Program; s: SymId): bool =
+  ## Whether the named type IS a union (`{.union.} = object`), as opposed to an
+  ## object that merely CONTAINS one — `objBodyHasUnion` answers that other
+  ## question. Resolves through a distinct / alias chain, like `aggrLayout`.
+  var d = lookupType(p, s)
+  var body = default(Cursor)
+  d.into:
+    inc d; skip d                             # name, type-pragmas
+    body = d; skip d
+  if body.kind == Symbol: return typeSymIsUnion(p, body.symId)
+  result = body.kind == TagLit and body.typeKind == UnionT
+
+proc typeSymIsPacked*(p: var Program; s: SymId): bool =
+  ## `(type :name <pragmas> <body>)` — the flag lives on the DECLARATION, while
+  ## every layout walk below is handed the BODY. This is the bridge.
+  var d = lookupType(p, s)
+  d.into:
+    inc d                                   # name
+    result = pragmasArePacked(d)
+    while d.hasMore: skip d
+
+proc objSizeAlign(p: var Program; bodyc: Cursor; packed = false): (int, int) =
   var oc = bodyc
   var off = 0
   var maxAl = 1
@@ -1147,16 +1233,20 @@ proc objSizeAlign(p: var Program; bodyc: Cursor): (int, int) =
     while oc.hasMore:
       if oc.kind == TagLit and oc.typeKind == UnionT:   # an object VARIANT's union part
         let (usz, ual) = unionSizeAlign(p, oc)
-        off = align(off, ual) + usz
-        if ual > maxAl: maxAl = ual
+        let ua = if packed: 1 else: ual
+        off = align(off, ua) + usz
+        if ua > maxAl: maxAl = ua
         skip oc
       else:
         oc.into:                              # (fld :name pragmas type)
           inc oc; skip oc                     # name, field-pragmas
           let (fsz, fal) = typeSizeAlign(p, oc)
           skip oc                             # consume the field type
-          off = align(off, fal) + fsz
-          if fal > maxAl: maxAl = fal
+          let fa = if packed: 1 else: fal
+          off = align(off, fa) + fsz
+          if fa > maxAl: maxAl = fa
+  # Packed: every field at the running byte sum, alignment 1, and NO tail
+  # padding — `align(off, 1)` is `off`, so the same expression serves both.
   result = (align(off, maxAl), maxAl)
 
 proc typeSizeAlign*(p: var Program; c: Cursor): (int, int) =
@@ -1165,9 +1255,19 @@ proc typeSizeAlign*(p: var Program; c: Cursor): (int, int) =
   of Symbol:
     var d = lookupType(p, c.symId)
     d.into:
-      inc d; skip d                           # name, type-pragmas
-      let r = typeSizeAlign(p, d); skip d
-      result = r
+      inc d                                   # name
+      let packed = pragmasArePacked(d); skip d
+      # The pragma is on the declaration and the body is what gets walked, so
+      # an object body is dispatched here rather than falling into the generic
+      # `of ObjectT` arm below (which has no declaration in sight and so no way
+      # to know). Same for a `{.union, packed.}`.
+      if d.kind == TagLit and d.typeKind == ObjectT:
+        result = objSizeAlign(p, d, packed)
+      elif d.kind == TagLit and d.typeKind == UnionT:
+        result = unionSizeAlign(p, d)
+      else:
+        result = typeSizeAlign(p, d)
+      skip d
   of TagLit:
     case c.typeKind
     of IT, UT, FT, CT:
@@ -1460,7 +1560,7 @@ proc aggrWordCount*(p: var Program; typeSym: SymId): int =
   (sz + w - 1) div w
 
 proc layoutObjBody(p: var Program; bodyc: Cursor; base: int;
-                   res: var seq[FieldInfo]) =
+                   res: var seq[FieldInfo]; packed = false) =
   ## Append `bodyc`'s fields to `res`, each at `base` plus its offset within the
   ## body. This walk must stay in lockstep with `objSizeAlign`'s — the two answer
   ## "where is field f" and "how big is the object", and a disagreement puts a
@@ -1484,13 +1584,13 @@ proc layoutObjBody(p: var Program; bodyc: Cursor; base: int;
         # `symName` asserted on its first child, an `(object …)` TagLit: any
         # variant type reaching the aggregate-ABI path killed arkham outright.
         let (usz, ual) = unionSizeAlign(p, oc)
-        off = align(off, ual)
+        off = align(off, (if packed: 1 else: ual))
         var u = oc
         u.into:
           while u.hasMore:
             let br = unionBranchBody(u)
             if br.kind != DotToken:           # `.` ⇒ branch declares no fields
-              layoutObjBody(p, br, off, res)
+              layoutObjBody(p, br, off, res, packed)
             skip u
         off += usz
         skip oc
@@ -1500,7 +1600,10 @@ proc layoutObjBody(p: var Program; bodyc: Cursor; base: int;
           skip oc                             # field-pragmas
           let (fsz, fal) = typeSizeAlign(p, oc)
           skip oc
-          off = align(off, fal)
+          # `packed` ⇒ alignment 1, so the field sits at the running byte sum.
+          # This walk and `objSizeAlign`'s must agree or a field's address lands
+          # outside its own object; both consult the same flag.
+          off = align(off, (if packed: 1 else: fal))
           res.add (name: fn, off: off, size: fsz)
           off += fsz
 
@@ -1537,7 +1640,7 @@ proc aggrLayout*(p: var Program; typeSym: SymId): seq[FieldInfo] =
     return aggrLayout(p, body.symId)
   assert body.kind == TagLit and body.typeKind == ObjectT,
     "arkham: aggregate ABI requires an object type: " & symString(p.pool, typeSym)
-  layoutObjBody(p, body, 0, result)
+  layoutObjBody(p, body, 0, result, typeSymIsPacked(p, typeSym))
 
 proc canHomeInRegPair*(p: var Program; typeSym: SymId): bool =
   ## True when every field is a full 8-byte integer/pointer word at an 8-byte

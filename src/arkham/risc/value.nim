@@ -1122,6 +1122,36 @@ proc constrFieldStores*(g: var CodeGen; c: Cursor; base: Location) =
     base = regLoc(loaded, ScalarSlot)
   var tc = c; inc tc                                    # the constructed type symbol
   let typeSym = tc.symId
+  # A UNION constructor is the one that is NOT total — the x64 twin
+  # (`x64/value.constrFieldStores`) carries the full reasoning. In short:
+  # `(oconstr T …)` names every field of an object, which is what lets this back
+  # end store exactly what is listed and zero nothing, but a union's members
+  # share storage so only the ACTIVE one is named — and `defaultvalues` names
+  # none at all for a default. The C back end never noticed; a designated
+  # initializer zeroes what it does not mention.
+  #
+  # `&u` is taken as `&u.<first member>`: a union's members all sit at offset 0,
+  # so that IS the union's address, and `emFieldAddr` already handles every base
+  # form this side has.
+  if typeSymIsUnion(g.prog, typeSym):
+    let un = aggrByteSize(g.prog, typeSym)
+    let ulay = aggrLayout(g.prog, typeSym)
+    if un > 0 and ulay.len > 0:
+      let m0 = ulay[0].name
+      let mSlot = g.fieldSlotByName(typeSym, m0)
+      let udst =
+        case base.kind
+        of NamedStack: fieldLoc(typeSym, m0, base.name, mSlot)
+        of InReg:      fieldLocReg(typeSym, m0, base.r, mSlot)
+        of Mem:        fieldLocLval(typeSym, m0, base.cur, mSlot)
+        else: raiseAssert "arkham a64n: bad union oconstr base " & $base.kind
+      let up = g.takeBridge(ScalarSlot)
+      g.emFieldAddr(udst, up)
+      let uz = g.takeBridge(ScalarSlot, avoid = up)
+      g.movImm(uz, 0)
+      g.emZeroBytesThroughPtr(up, uz, un)
+      g.dropBridge uz
+      g.dropBridge up
   var cc = c
   cc.into:
     skip cc                                             # the constructed type

@@ -142,7 +142,9 @@ proc isWideSlot*(g: CodeGen; s: AsmSlot): bool {.inline.}
 
 proc genPointee*(g: var CodeGen; c: var Cursor)
 
-proc genTypeBody*(g: var CodeGen; c: var Cursor)
+proc genTypeBody*(g: var CodeGen; c: var Cursor; packed = false)
+proc genUnionBody*(g: var CodeGen; c: var Cursor; packed = false)
+proc genFldDef*(g: var CodeGen; c: var Cursor)
 
 proc emReg*(g: var CodeGen; r: Reg) {.inline.} =
   ## A value GPR operand: a register currently hosting a named local / param /
@@ -928,7 +930,7 @@ proc genPointee*(g: var CodeGen; c: var Cursor) =
   else:
     g.genTypeBody(c)
 
-proc genTypeBody*(g: var CodeGen; c: var Cursor) =
+proc genTypeBody*(g: var CodeGen; c: var Cursor; packed = false) =
   ## Translate a Leng type at `c` into asm-NIF, advancing `c` past it. Named
   ## types are inlined (resolved against `typeDecls`); object field pragmas are
   ## dropped. v1: int/uint/bool/ptr scalars and objects.
@@ -937,8 +939,12 @@ proc genTypeBody*(g: var CodeGen; c: var Cursor) =
     var d = lookupType(g.prog, c.symId)  # resolves across modules
     d.into:                                 # (type SymbolDef TypePragmas body)
       inc d                                 # name
+      # See the x64 twin: inlining a named type drops its declaration, so
+      # `{.packed.}` has to be carried across by hand or the inlined copy and
+      # the type's own `(type …)` disagree about its size.
+      let inner = pragmasArePacked(d)
       skip d                                # TypePragmas (one slot: `.` or (pragmas …))
-      g.genTypeBody(d)
+      g.genTypeBody(d, inner)
     inc c
   of TagLit:
     case c.typeKind
@@ -1002,6 +1008,10 @@ proc genTypeBody*(g: var CodeGen; c: var Cursor) =
         if c.kind == Symbol: baseName = symName(c)
         skip c                              # inheritance slot (`.` or base sym)
         g.ab.objectType:
+          # FIRST child, before the base: nifasm reads it off the front and the
+          # base slot is optional, so a flag that had to come after would be
+          # indistinguishable from a missing base.
+          if packed: g.ab.keyword PackedT
           if baseName.len > 0: g.ab.sym baseName
           while c.hasMore:
             if c.kind == TagLit and c.typeKind == UnionT:
@@ -1010,22 +1020,44 @@ proc genTypeBody*(g: var CodeGen; c: var Cursor) =
               # size). The asm-NIF union is UNTAGGED, so emit only the bodies — the
               # discriminant is the `fld` preceding the union. A body-less branch
               # (`of x: nil`) contributes no member.
-              g.ab.unionType:
-                c.into:
-                  while c.hasMore:
-                    var bodyc = unionBranchBody(c)
-                    if bodyc.kind != DotToken: g.genTypeBody(bodyc)
-                    skip c
+              g.genUnionBody(c, packed)
             else:
-              c.into:                       # (fld :name pragmas type)
-                let fn = symName(c); inc c
-                skip c                      # field pragmas (dropped)
-                g.ab.fldDef(fn):
-                  g.genTypeBody(c)          # field type
+              g.genFldDef(c)                # (fld :name pragmas type)
+    of UnionT:
+      # A *top-level* union: `{.union.} = object` lowers to `(union (fld …)*)`,
+      # not to an object with a union part, so it never reaches the `ObjectT`
+      # arm above. The x64 twin was missing this too; nifasm has always laid the
+      # shape out (`parseUnionBody` sizes a bare `(fld …)` member at offset 0),
+      # only the declaration was absent — which took every module that so much
+      # as imported `std/ioring` with it.
+      g.genUnionBody(c, packed)
     else:
       raiseAssert "arkham v1: type not supported: " & $c.typeKind
   else:
     raiseAssert "arkham v1: malformed type"
+
+proc genFldDef*(g: var CodeGen; c: var Cursor) =
+  ## One `(fld :name pragmas type)` as an asm-NIF field declaration.
+  c.into:
+    let fn = symName(c); inc c
+    skip c                                  # field pragmas (dropped)
+    g.ab.fldDef(fn):
+      g.genTypeBody(c)
+
+proc genUnionBody*(g: var CodeGen; c: var Cursor; packed = false) =
+  ## A `(union …)` node in either shape it reaches here in — see the x64 twin
+  ## (`x64/emit.genUnionBody`) for which is which and why the asm-NIF union is
+  ## untagged.
+  g.ab.unionType:
+    if packed: g.ab.keyword PackedT
+    c.into:
+      while c.hasMore:
+        var bodyc = unionBranchBody(c)
+        if bodyc.kind == TagLit and bodyc.substructureKind == FldU:
+          g.genFldDef(bodyc)
+        elif bodyc.kind != DotToken:
+          g.genTypeBody(bodyc)
+        skip c
 
 proc emWordThroughPtr*(g: var CodeGen; p: Reg; idx: int) =
   ## `(mem (at (cast (aptr (u W)) p) idx))` — the `idx`-th raw WORD at `[p]`, typed
@@ -1038,6 +1070,7 @@ proc emWordThroughPtr*(g: var CodeGen; p: Reg; idx: int) =
         g.emReg p
       g.ab.intLit idx
 
+proc emZeroBytesThroughPtr*(g: var CodeGen; p, z: Reg; n: int)
 proc emScalarAtOff*(g: var CodeGen; p: Reg; off, size: int) =
   ## `(mem (cast (aptr (u size·8)) p) off)` — the `size`-byte unsigned scalar at the
   ## RAW byte offset `off` from `[p]`. `(at …)` strides by the element size and so
@@ -1048,6 +1081,25 @@ proc emScalarAtOff*(g: var CodeGen; p: Reg; off, size: int) =
       g.ab.aptrType: g.ab.uintType(size * 8)
       g.emReg p
     g.ab.intLit off
+
+proc emZeroBytesThroughPtr*(g: var CodeGen; p, z: Reg; n: int) =
+  ## Write `n` zero bytes at `[p]`; `z` holds 0. The x64 twin
+  ## (`x64/mem.emZeroBytesThroughPtr`) with `emScalarAtOff` doing the
+  ## byte-offset addressing this side already has.
+  ##
+  ## Straight-line and widest-first, with no counter register and no loop: the
+  ## sizes this serves are a union's, which are a handful of bytes.
+  var off = 0
+  var rem = n
+  let w = wordSize()
+  template zstore(sz: int) =
+    g.ab.tree MovA64:
+      g.emScalarAtOff(p, off, sz)
+      g.emReg z
+  while rem >= w: (zstore(w); off += w; rem -= w)
+  if rem >= 4: (zstore(4); off += 4; rem -= 4)
+  if rem >= 2: (zstore(2); off += 2; rem -= 2)
+  if rem >= 1: (zstore(1); off += 1; rem -= 1)
 
 proc freshLabel*(g: var CodeGen): string =
   # Name must be a NIF *symbol* (needs a '.'), but `extractBasename` strips a

@@ -147,6 +147,20 @@ proc parseObjectBody*(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
   var offset = 0
   var maxAlign = 1  # Track maximum alignment requirement
 
+  # `(object (packed) …)` — the C `__attribute__((packed))` layout: every field
+  # at the running byte sum, alignment 1, no tail padding. It has to be honoured
+  # here and not merely tolerated: `struct epoll_event` is 12 bytes on x86-64
+  # (its 8-byte union sits at offset 4, deliberately unaligned) and the kernel
+  # writes an ARRAY of them, so a naturally-aligned 16 reads every entry from
+  # the wrong place. arkham emits the flag as the body's FIRST child because the
+  # base slot is optional — a flag after it could not be told from a missing base.
+  var packed = false
+  block:
+    var pc = n
+    into pc:
+      if pc.hasMore and atTag(pc, PackedTagId): packed = true
+      while pc.hasMore: skip pc
+
   # Inheritance: a leading base-type Symbol contributes ITS fields first (at
   # their own base offsets) and its full size as the starting offset for this
   # object's own fields. This mirrors Leng's object layout — typenav.typeOfField
@@ -160,6 +174,7 @@ proc parseObjectBody*(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
     # object with no base slot (the base is only present when there IS one), so a
     # fieldless `ref object` is just `(object)` with zero children; without this guard
     # `baseC.kind` reads past the end. A 0-field object is a valid 0-byte type.
+    if packed and baseC.hasMore and atTag(baseC, PackedTagId): skip baseC
     if baseC.hasMore and baseC.kind == Symbol:
       let baseType = parseType(baseC, scope, ctx)
       if baseType.kind != ObjectT:
@@ -170,16 +185,18 @@ proc parseObjectBody*(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
     while baseC.hasMore: skip baseC  # drain the field children (read via `n`)
 
   for fc in fields(n):
+    if atTag(fc, PackedTagId): continue       # the marker read above, not a member
     if atTag(fc, UnionTagId):
       # An object VARIANT's union part: a region of `max(branchSize)` bytes whose
       # branches overlap. Place it at the next aligned offset and rebase the union's
       # (branch-local) field offsets onto it, then advance past the whole region.
       var u = fc
       let ut = parseUnionBody(u, scope, ctx)
-      offset = alignTo(offset, ut.align)
+      offset = alignTo(offset, (if packed: 1 else: ut.align))
       for (fn, ft, foff) in ut.fields:
         flds.add (fn, ft, offset + foff)
-      if ut.align > maxAlign: maxAlign = ut.align
+      let ua = if packed: 1 else: ut.align
+      if ua > maxAlign: maxAlign = ua
       offset += ut.size
       continue
     if not atTag(fc, FldTagId): error("Expected field definition or union", fc)
@@ -193,8 +210,10 @@ proc parseObjectBody*(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
     var typC = fr.typ
     let ftype = parseType(typC, scope, ctx)
 
-    # Align field to its natural alignment, then record its offset.
-    let fieldAlign = asmAlignOf(ftype)
+    # Align field to its natural alignment, then record its offset — unless the
+    # object is packed, where the alignment IS 1 and the offset is the running
+    # byte sum.
+    let fieldAlign = if packed: 1 else: asmAlignOf(ftype)
     offset = alignTo(offset, fieldAlign)
     flds.add (name, ftype, offset)
 
@@ -592,10 +611,14 @@ proc parseUnionBody*(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
   var flds: seq[(string, Type, int)] = @[]
   var maxSize = 0
   var maxAlign = 1  # Track maximum alignment requirement
+  var packed = false
   var c = n
   into c:
     while c.hasMore:
-      if atTag(c, ObjectTagId):                # a variant branch: sequential fields
+      if atTag(c, PackedTagId):                # `(union (packed) …)` — see parseObjectBody
+        packed = true
+        skip c
+      elif atTag(c, ObjectTagId):              # a variant branch: sequential fields
         var b = c
         let bt = parseObjectBody(b, scope, ctx)  # 0-based branch field offsets + size
         for f in bt.fields: flds.add f
@@ -616,7 +639,9 @@ proc parseUnionBody*(n: var Cursor; scope: Scope; ctx: var GenContext): Type =
         error("union member must be an object branch or a field", c)
   skip n # advance past the whole (union …) node
 
-  # Round up size to be a multiple of the union's alignment
+  # Round up size to be a multiple of the union's alignment — a packed one has
+  # alignment 1, so it is exactly the widest member with no tail padding.
+  if packed: maxAlign = 1
   let finalSize = alignTo(maxSize, maxAlign)
   result = Type(kind: UnionT, fields: flds, size: finalSize, align: maxAlign)
 
