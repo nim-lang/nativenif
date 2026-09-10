@@ -28,6 +28,7 @@ proc loadAggrTail*(g: var CodeGen; dst, base: Reg; aggrSize, byteOff: int) =
   ## right-justified in `dst` (the by-value ABI leaves the word's padding bits
   ## unspecified, so the high bytes are free).
   ##
+  ## MODEL: proofs/aggr_marshal.tla, `Algo = "a64tail"`.
   ## Reads NOTHING outside the aggregate. The word a small value ends in may be the
   ## last mapped bytes of a page — a heap `seq` payload, the tail of a `.bss`
   ## section — and a lazy full-word over-read there is a segfault that only shows up

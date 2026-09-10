@@ -544,6 +544,7 @@ proc emSizedThruPtr(g: var CodeGen; p: Reg; bits, idx: int) =
 proc loadPartialThroughPtr*(g: var CodeGen; dst, p: Reg; base, nbytes: int) =
   ## `dst` ← the `nbytes` (1..7) bytes at `[p + base]`, zero-extended and packed
   ## low-to-high, assembled from the widest accesses that stay inside them.
+  ## MODEL: proofs/aggr_marshal.tla, `Algo = "widest"` with `Padded = FALSE`.
   ##
   ## A trailing partial eightbyte used to be read as the FIELD sitting at its
   ## offset, which carries only that field: `{enum; char}` marshalled its `enum`
@@ -582,6 +583,7 @@ proc loadPartialThroughPtr*(g: var CodeGen; dst, p: Reg; base, nbytes: int) =
 
 proc storePartialThroughPtr*(g: var CodeGen; p, src: Reg; base, nbytes: int) =
   ## The `nbytes` (1..7) low bytes of `src` → `[p + base]`, widest access first.
+  ## MODEL: proofs/aggr_marshal.tla, `Algo = "widest"` (the store pass).
   ## The mirror of `loadPartialThroughPtr`, and buggy in the same way before:
   ## storing through the field at the offset wrote one field and left the rest of
   ## the partial eightbyte holding whatever was there. Only `nbytes` bytes are

@@ -1,0 +1,213 @@
+(.nif27)
+(stmts
+ (type :Arr4.0 .
+  (array
+   (i 64)4))
+ (type :Pair.0 .
+  (object .
+   (fld :a.0 .
+    (u 32))
+   (fld :b.0 .
+    (i 32))))
+ (gvar :garr.0 . Arr4.0 .)
+ (gvar :sink.0 .
+  (i 64)0)
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :ident.0
+  (params
+   (param :v.0 .
+    (i 64)))
+  (i 64).
+  (stmts
+   (ret v.0)))
+ (proc :mix.0
+  (params
+   (param :x.0 .
+    (i 64))
+   (param :y.0 .
+    (i 64))
+   (param :n.0 .
+    (i 64)))
+  (i 64).
+  (stmts
+   (var :arr.0 . Arr4.0
+    (aconstr Arr4.0 100 200 300 400))
+   (asgn x.0
+    (add
+     (i 64)y.0
+     (at arr.0 x.0)))
+   (if
+    (elif
+     (neq x.0 210)
+     (stmts
+      (call exit.0 1))))
+   (asgn x.0
+    (sub
+     (i 64)y.0 x.0))
+   (if
+    (elif
+     (neq x.0 -200)
+     (stmts
+      (call exit.0 2))))
+   (asgn x.0
+    (sub
+     (i 64)x.0 y.0))
+   (if
+    (elif
+     (neq x.0 -210)
+     (stmts
+      (call exit.0 3))))
+   (asgn x.0
+    (shl
+     (i 64)1 n.0))
+   (if
+    (elif
+     (neq x.0 8)
+     (stmts
+      (call exit.0 4))))
+   (asgn x.0
+    (shr
+     (i 64)
+     (shl
+      (i 64)y.0 n.0)n.0))
+   (if
+    (elif
+     (neq x.0 10)
+     (stmts
+      (call exit.0 5))))
+   (asgn x.0
+    (sub
+     (i 64)x.0 7))
+   (asgn x.0
+    (add
+     (i 64)
+     (at arr.0 x.0)
+     (mul
+      (i 64)y.0 2)))
+   (if
+    (elif
+     (neq x.0 420)
+     (stmts
+      (call exit.0 13))))
+   (asgn x.0
+    (add
+     (i 64)
+     (at arr.0 n.0)
+     (mul
+      (i 64)x.0 3)))
+   (if
+    (elif
+     (neq x.0 1660)
+     (stmts
+      (call exit.0 6))))
+   (asgn x.0
+    (sub
+     (i 64)
+     (mul
+      (i 64)x.0 2)
+     (at arr.0 1)))
+   (if
+    (elif
+     (neq x.0 3120)
+     (stmts
+      (call exit.0 7))))
+   (asgn x.0
+    (sub
+     (i 64)
+     (at garr.0 2)
+     (add
+      (i 64)x.0 1)))
+   (if
+    (elif
+     (neq x.0 -3091)
+     (stmts
+      (call exit.0 8))))
+   (asgn n.0
+    (sub
+     (i 64)
+     (add
+      (i 64)x.0 y.0)
+     (add
+      (i 64)n.0 x.0)))
+   (if
+    (elif
+     (neq n.0 7)
+     (stmts
+      (call exit.0 9))))
+   (ret
+    (add
+     (i 64)
+     (sub
+      (i 64)x.0 n.0)
+     (shl
+      (i 64)y.0 2)))))
+ (proc :packed.0
+  (params
+   (param :p.0 . Pair.0)
+   (param :k.0 .
+    (i 64)))
+  (i 64).
+  (stmts
+   (ret
+    (sub
+     (i 64)
+     (add
+      (i 64)
+      (conv
+       (i 64)
+       (dot p.0 a.0))
+      (conv
+       (i 64)
+       (dot p.0 b.0)))
+     (mul
+      (i 64)k.0
+      (conv
+       (i 64)
+       (dot p.0 b.0)))))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (asgn
+    (at garr.0 2)30)
+   (var :r.0 .
+    (i 64)
+    (call mix.0 1 10 3))
+   (if
+    (elif
+     (neq r.0 -3058)
+     (stmts
+      (call exit.0 10))))
+   (var :pr.0 . Pair.0
+    (oconstr Pair.0
+     (kv a.0 7)
+     (kv b.0 -5)))
+   (if
+    (elif
+     (neq
+      (call packed.0 pr.0 4)22)
+     (stmts
+      (call exit.0 11))))
+   (var :q.0 .
+    (i 64)
+    (call ident.0 6))
+   (asgn q.0
+    (add
+     (i 64)
+     (call ident.0 q.0)
+     (shl
+      (i 64)q.0 1)))
+   (if
+    (elif
+     (neq q.0 18)
+     (stmts
+      (call exit.0 12))))
+   (call exit.0 42))))

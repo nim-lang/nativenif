@@ -1,0 +1,233 @@
+(stmts#tlanif twin of aggr_marshal.tla — arkham's by-value aggregate marshalling, one
+   memory access per step, for the four partial-word strategies. Read the TLA+ file
+   for the story; this file follows it action for action. Dialect notes:
+   - no division: Align(x, a) picks the first multiple of a in x..x+a from the Mults
+     table, and WordCount / Base are spelled out for MaxWords = 2;
+   - operator parameters are let-bound free symbols (o.0., n.0., k.0. ...);
+   - the configuration is the two (assign ...) lines for Algo.0. and Padded.0. —
+     proofs/run_tlanif.sh rewrites them for the 8 runs.
+   State counts match TLC: widest 1170, a64tail 1268, fullword/slot 1144; the
+   field strategy and fullword/addr fail the invariant.#
+
+  (constants :W.0. :MaxWords.0. :Sizes.0. :Sizes0.0. :Mults.0. :Algos.0. :Algo.0.
+             :Padded.0. :Marks.0. :Phases.0. :MaxSize.0. :Bytes.0. :RegPos.0. :Words.0. :DestIdx.0.)
+  (assign W.0. 8)
+  (assign MaxWords.0. 2)
+  (assign Sizes.0. (set 1 2 4 8))
+  (assign Sizes0.0. (set 0 1 2 4 8))
+  (assign Mults.0.
+    (fun (mapsto 1 (range 0 32))
+         (mapsto 2 (set 0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32))
+         (mapsto 4 (set 0 4 8 12 16 20 24 28 32))
+         (mapsto 8 (set 0 8 16 24 32))))
+  (models Algos.0. :widest.0. :a64tail.0. :field.0. :fullword.0.)
+  (assign Algo.0. widest.0.)
+  (assign Padded.0. (false))
+  (models Marks.0. :Pad.0. :Untouched.0.)
+  (models Phases.0. :load.0. :store.0. :done.0. :stuck.0.)
+  (assign MaxSize.0. (plus W.0. W.0.))
+  (assign Bytes.0. (range 0 (minus MaxSize.0. 1)))
+  (assign RegPos.0. (range 0 (minus W.0. 1)))
+  (assign Words.0. (range 0 (minus MaxWords.0. 1)))
+  (assign DestIdx.0. (range 0 (minus (plus MaxSize.0. W.0.) 1)))
+
+  (variables :fields.0. :size.0. :phase.0. :word.0. :off.0. :regs.0. :dest.0. :reads.0. :writes.0.)
+
+  (def#Align(x.0., a.0.): the smallest multiple of a that is >= x# :Align.0.
+    (choose :m.0 (range x.0. (plus x.0. a.0.)) (in m.0 (apply Mults.0. a.0.))))
+  (def#Range(o.0., n.0.) = o..o+n-1# :Range.0. (range o.0. (minus (plus o.0. n.0.) 1)))
+
+  (def#the layout: 1..4 naturally aligned fields, tail-padded like typeSizeAlign# :Init.0.
+    (exists :f1.0 Sizes.0. (exists :f2.0 Sizes0.0. (exists :f3.0 Sizes0.0. (exists :f4.0 Sizes0.0.
+      (and
+        (implies (eq f2.0 0) (eq f3.0 0))
+        (implies (eq f3.0 0) (eq f4.0 0))
+        (let (bind :e1.0. f1.0)
+        (let (bind :o2.0. (if (eq f2.0 0) e1.0. (let (bind :x.0. e1.0.) (let (bind :a.0. f2.0) Align.0.))))
+        (let (bind :e2.0. (plus o2.0. f2.0))
+        (let (bind :o3.0. (if (eq f3.0 0) e2.0. (let (bind :x.0. e2.0.) (let (bind :a.0. f3.0) Align.0.))))
+        (let (bind :e3.0. (plus o3.0. f3.0))
+        (let (bind :o4.0. (if (eq f4.0 0) e3.0. (let (bind :x.0. e3.0.) (let (bind :a.0. f4.0) Align.0.))))
+        (let (bind :e4.0. (plus o4.0. f4.0))
+        (let (bind :m12.0. (if (ge f1.0 f2.0) f1.0 f2.0))
+        (let (bind :m34.0. (if (ge f3.0 f4.0) f3.0 f4.0))
+        (let (bind :al.0. (if (ge m12.0. m34.0.) m12.0. m34.0.))
+        (let (bind :sz.0. (let (bind :x.0. e4.0.) (let (bind :a.0. al.0.) Align.0.)))
+          (and
+            (le sz.0. MaxSize.0.)
+            (prime fields.0.
+              (union
+                (set (record (kv off.0. 0) (kv size.0. f1.0)))
+                (if (eq f2.0 0) (emptyset) (set (record (kv off.0. o2.0.) (kv size.0. f2.0))))
+                (if (eq f3.0 0) (emptyset) (set (record (kv off.0. o3.0.) (kv size.0. f3.0))))
+                (if (eq f4.0 0) (emptyset) (set (record (kv off.0. o4.0.) (kv size.0. f4.0))))))
+            (prime size.0. sz.0.)
+            (prime phase.0. load.0.)
+            (prime word.0. 0)
+            (prime off.0. 0)
+            (prime regs.0. (funof :w.0 Words.0. (funof :k.0 RegPos.0. Pad.0.)))
+            (prime dest.0. (funof :o.0 DestIdx.0. Untouched.0.))
+            (prime reads.0. (emptyset))
+            (prime writes.0. (emptyset))))))))))))))))))))
+
+  (def#aggrWordCount, for MaxWords = 2# :WordCount.0. (if (le size.0. W.0.) 1 2))
+  (def#the current word's first byte, for MaxWords = 2# :Base.0. (if (eq word.0. 0) 0 W.0.))
+  (def :Rem.0. (minus size.0. Base.0.))
+  (def#the code's `byteSize - i*8 >= 8`# :IsFull.0. (ge Rem.0. W.0.))
+  (def :AlignedSize.0. (let (bind :x.0. size.0.) (let (bind :a.0. W.0.) Align.0.)))
+  (def :Storage.0. (if Padded.0. (range 0 (minus AlignedSize.0. 1)) (range 0 (minus size.0. 1))))
+
+  (def#LOAD n.0. bytes at o.0. into the current word register at position o - Base# :LoadBytes.0.
+    (and
+      (prime regs.0.
+        (except regs.0.
+          (mapsto word.0.
+            (funof :k.0 RegPos.0.
+              (if (in k.0 (let (bind :o.0. (minus o.0. Base.0.)) Range.0.))
+                  (plus Base.0. k.0)
+                  (apply (apply regs.0. word.0.) k.0))))))
+      (prime reads.0. (union reads.0. Range.0.))))
+  (def#STORE n.0. bytes from register position o - Base to o.0.# :StoreBytes.0.
+    (and
+      (prime dest.0.
+        (funof :j.0 DestIdx.0.
+          (if (in j.0 Range.0.)
+              (apply (apply regs.0. word.0.) (minus j.0 Base.0.))
+              (apply dest.0. j.0))))
+      (prime writes.0. (union writes.0. Range.0.))))
+
+  (def :NextWordLoad.0.
+    (and (prime word.0. (plus word.0. 1)) (prime off.0. (if (eq word.0. 0) W.0. (plus W.0. W.0.)))
+         (unchanged fields.0. size.0. phase.0. dest.0. writes.0.)))
+  (def :NextWordStore.0.
+    (and (prime word.0. (plus word.0. 1)) (prime off.0. (if (eq word.0. 0) W.0. (plus W.0. W.0.)))
+         (unchanged fields.0. size.0. phase.0. regs.0. reads.0.)))
+  (def :StayLoad.0. (unchanged fields.0. size.0. phase.0. word.0. dest.0. writes.0.))
+  (def :StayStore.0. (unchanged fields.0. size.0. phase.0. word.0. regs.0. reads.0.))
+
+  (def#x64 step(32) step(16) step(8): the widest access that fits n.0.# :Width.0.
+    (if (ge n.0. 4) 4 (if (ge n.0. 2) 2 1)))
+  (def :Partial.0. (and (lt word.0. WordCount.0.) (not IsFull.0.)))
+  (def :HasFieldAtBase.0. (exists :f.0 fields.0. (eq (field f.0 off.0.) Base.0.)))
+  (def :FieldAtBase.0. (choose :f.0 fields.0. (eq (field f.0 off.0.) Base.0.)))
+
+  (def :LoadFull.0.
+    (and (eq phase.0. load.0.) (lt word.0. WordCount.0.) IsFull.0.
+         (let (bind :o.0. Base.0.) (let (bind :n.0. W.0.) LoadBytes.0.))
+         NextWordLoad.0.))
+  (def :LoadWidest.0.
+    (and (eq phase.0. load.0.) Partial.0. (eq Algo.0. widest.0.)
+         (let (bind :n.0. (minus size.0. off.0.))
+         (let (bind :wd.0. Width.0.)
+           (and
+             (let (bind :o.0. off.0.) (let (bind :n.0. wd.0.) LoadBytes.0.))
+             (if (eq (plus off.0. wd.0.) size.0.)
+                 NextWordLoad.0.
+                 (and (prime off.0. (plus off.0. wd.0.)) StayLoad.0.)))))))
+  (def :LoadA64.0.
+    (and (eq phase.0. load.0.) Partial.0. (eq Algo.0. a64tail.0.)
+         (if (ge Base.0. W.0.)
+             (and#a whole word precedes: read the object's LAST W bytes, shift the tail down#
+               (prime regs.0.
+                 (except regs.0. (mapsto word.0.
+                   (funof :k.0 RegPos.0. (if (lt k.0 Rem.0.) (plus Base.0. k.0) Pad.0.)))))
+               (prime reads.0. (union reads.0. (let (bind :o.0. (minus size.0. W.0.)) (let (bind :n.0. W.0.) Range.0.))))
+               NextWordLoad.0.)
+         (if (in Rem.0. (set 1 2 4))
+             (and (let (bind :o.0. Base.0.) (let (bind :n.0. Rem.0.) LoadBytes.0.)) NextWordLoad.0.)
+             (and#3/5/6/7 bytes with no word to borrow: byte by byte#
+               (let (bind :o.0. off.0.) (let (bind :n.0. 1) LoadBytes.0.))
+               (if (eq (plus off.0. 1) size.0.)
+                   NextWordLoad.0.
+                   (and (prime off.0. (plus off.0. 1)) StayLoad.0.)))))))
+  (def :LoadField.0.
+    (and (eq phase.0. load.0.) Partial.0. (eq Algo.0. field.0.)
+         (if HasFieldAtBase.0.
+             (and#the ONE field at the word's offset — and nothing else in this word#
+               (let (bind :o.0. Base.0.) (let (bind :n.0. (field FieldAtBase.0. size.0.)) LoadBytes.0.))
+               NextWordLoad.0.)
+             (and (prime phase.0. stuck.0.)
+                  (unchanged fields.0. size.0. word.0. off.0. regs.0. dest.0. reads.0. writes.0.)))))
+  (def :LoadFullword.0.
+    (and (eq phase.0. load.0.) Partial.0. (eq Algo.0. fullword.0.)
+         (let (bind :o.0. Base.0.) (let (bind :n.0. W.0.) LoadBytes.0.))
+         NextWordLoad.0.))
+  (def :BeginStore.0.
+    (and (eq phase.0. load.0.) (eq word.0. WordCount.0.)
+         (prime phase.0. store.0.) (prime word.0. 0) (prime off.0. 0)
+         (unchanged fields.0. size.0. regs.0. dest.0. reads.0. writes.0.)))
+
+  (def :StoreFull.0.
+    (and (eq phase.0. store.0.) (lt word.0. WordCount.0.) IsFull.0.
+         (let (bind :o.0. Base.0.) (let (bind :n.0. W.0.) StoreBytes.0.))
+         NextWordStore.0.))
+  (def :StoreWidest.0.
+    (and (eq phase.0. store.0.) Partial.0. (eq Algo.0. widest.0.)
+         (let (bind :n.0. (minus size.0. off.0.))
+         (let (bind :wd.0. Width.0.)
+           (and
+             (let (bind :o.0. off.0.) (let (bind :n.0. wd.0.) StoreBytes.0.))
+             (if (eq (plus off.0. wd.0.) size.0.)
+                 NextWordStore.0.
+                 (and (prime off.0. (plus off.0. wd.0.)) StayStore.0.)))))))
+  (def :StoreA64.0.
+    (and (eq phase.0. store.0.) Partial.0. (eq Algo.0. a64tail.0.)
+         (if (in Rem.0. (set 1 2 4))
+             (and (let (bind :o.0. Base.0.) (let (bind :n.0. Rem.0.) StoreBytes.0.)) NextWordStore.0.)
+             (and#storeAggrTail: byte 0, then bytes 1..n-1 — never a word past the object#
+               (let (bind :o.0. off.0.) (let (bind :n.0. 1) StoreBytes.0.))
+               (if (eq (plus off.0. 1) size.0.)
+                   NextWordStore.0.
+                   (and (prime off.0. (plus off.0. 1)) StayStore.0.))))))
+  (def :StoreField.0.
+    (and (eq phase.0. store.0.) Partial.0. (eq Algo.0. field.0.)
+         (if HasFieldAtBase.0.
+             (and
+               (let (bind :o.0. Base.0.) (let (bind :n.0. (field FieldAtBase.0. size.0.)) StoreBytes.0.))
+               NextWordStore.0.)
+             (and (prime phase.0. stuck.0.)
+                  (unchanged fields.0. size.0. word.0. off.0. regs.0. dest.0. reads.0. writes.0.)))))
+  (def :StoreFullword.0.
+    (and (eq phase.0. store.0.) Partial.0. (eq Algo.0. fullword.0.)
+         (let (bind :o.0. Base.0.) (let (bind :n.0. W.0.) StoreBytes.0.))
+         NextWordStore.0.))
+  (def :Finish.0.
+    (and (eq phase.0. store.0.) (eq word.0. WordCount.0.)
+         (prime phase.0. done.0.)
+         (unchanged fields.0. size.0. word.0. off.0. regs.0. dest.0. reads.0. writes.0.)))
+
+  (def :Next.0.
+    (or LoadFull.0. LoadWidest.0. LoadA64.0. LoadField.0. LoadFullword.0. BeginStore.0.
+        StoreFull.0. StoreWidest.0. StoreA64.0. StoreField.0. StoreFullword.0. Finish.0.))
+
+  (def :TypeOK.0.
+    (and
+      (forall :f.0 fields.0. (and (in (field f.0 off.0.) Bytes.0.) (in (field f.0 size.0.) Sizes.0.)))
+      (in size.0. (range 1 MaxSize.0.))
+      (in phase.0. Phases.0.)
+      (in word.0. (range 0 MaxWords.0.))
+      (eq (domain regs.0.) Words.0.)
+      (forall :w.0 Words.0.
+        (and (eq (domain (apply regs.0. w.0)) RegPos.0.)
+             (forall :k.0 RegPos.0. (in (apply (apply regs.0. w.0) k.0) (union Bytes.0. (set Pad.0.))))))
+      (eq (domain dest.0.) DestIdx.0.)
+      (forall :j.0 DestIdx.0. (in (apply dest.0. j.0) (union Bytes.0. (set Untouched.0.))))))
+
+  (def#nothing outside the object's storage is ever touched# :NoOverRead.0. (subset reads.0. Storage.0.))
+  (def :NoOverWrite.0. (subset writes.0. Storage.0.))
+  (def#after the load pass, word w holds object byte w*W+k at position k# :RegsHoldObject.0.
+    (implies (in phase.0. (set store.0. done.0.))
+      (forall :w.0 Words.0. (forall :k.0 RegPos.0.
+        (let (bind :b.0. (plus (if (eq w.0 0) 0 W.0.) k.0))
+          (implies (lt b.0. size.0.) (eq (apply (apply regs.0. w.0) k.0) b.0.)))))))
+  (def#after the store pass, the destination holds the object byte for byte# :RoundTrip.0.
+    (implies (eq phase.0. done.0.)
+      (forall :o.0 (range 0 (minus size.0. 1)) (eq (apply dest.0. o.0) o.0))))
+  (def :NotStuck.0. (neq phase.0. stuck.0.))
+
+  (def :Inv.0. (and TypeOK.0. NoOverRead.0. NoOverWrite.0. RegsHoldObject.0. RoundTrip.0. NotStuck.0.))
+
+  (spec (always-stutter Init.0. Next.0.
+    (tuple fields.0. size.0. phase.0. word.0. off.0. regs.0. dest.0. reads.0. writes.0.)))
+  (check Inv.0.)
+)

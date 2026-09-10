@@ -1,0 +1,346 @@
+(stmts#tlanif port of arkham_bindings.tla — the Arkham/nifasm register-binding protocol.
+   Same state, same actions, same invariants as the TLA+ original; both are kept and
+   must agree on the distinct-state count (584507 at MaxLog = 5, 3 regs, 2 locals,
+   2 temps, 2 staging values). Differences forced by the dialect:
+   - no operator parameters: `Applicable(e)` and friends read a let-bound `e.0.`,
+     supplied at the call site with (let (bind :e.0. ...) Applicable.0.);
+   - no CASE: nested (if ...) on the event's op;
+   - no [Regs -> Names] / Seq(Event) type sets: TypeOK checks domains and elements;
+   - strings ("plan", "bindLocal") are model values.
+   Do NOT run with --sym: FixedRegs = {r0} and the sentinel/op groups are not symmetric.#
+
+  (constants
+    :Regs.0. :FixedRegs.0. :Locals.0. :Temps.0. :Staging.0.
+    :Sentinels.0. :EvOp.0. :Phases.0. :MaxLog.0.)
+  (models Regs.0. :r0.0. :r1.0. :r2.0.)
+  (assign FixedRegs.0. (set r0.0.))
+  (models Locals.0. :a.0. :b.0.)
+  (models Temps.0. :t0.0. :t1.0.)
+  (models Staging.0. :s0.0. :s1.0.)
+  (models Sentinels.0. :NoName.0. :NoLoc.0. :NoReg.0. :NoTmp.0. :NoStg.0.
+                       :Stack.0. :Pending.0. :Dead.0.)
+  (models EvOp.0. :bindLocal.0. :killLocal.0. :beginInit.0. :finishInit.0.
+                  :borrowTemp.0. :killTemp.0. :steal.0. :pickStaging.0.
+                  :dropStaging.0. :fixedUse.0.)
+  (models Phases.0. :plan.0. :emit.0. :done.0. :stuck.0.)
+  (assign MaxLog.0. 5)
+
+  (variables
+    :binding.0. :loc.0. :valueAt.0. :expected.0. :liveTemp.0. :liveStaging.0.
+    :stagingPin.0. :sealedRegs.0. :initing.0. :initHome.0. :phase.0. :log.0. :logIdx.0.)
+
+  (def :Names.0. (union Locals.0. Temps.0. (set NoName.0.)))
+  (def :ValueLoc.0. (union Regs.0. (set Stack.0. Pending.0. Dead.0.)))
+
+  (def :CleanBinding.0. (funof :r.0 Regs.0. NoName.0.))
+  (def :CleanLoc.0. (funof :l.0 Locals.0. Dead.0.))
+  (def :CleanValueAt.0. (funof :l.0 Locals.0. Dead.0.))
+  (def :CleanStagingPin.0. (funof :s.0 Staging.0. NoReg.0.))
+  (def :CleanInitHome.0. (funof :l.0 Locals.0. NoReg.0.))
+
+  (def :Init.0.
+    (and
+      (prime binding.0. CleanBinding.0.)
+      (prime loc.0. CleanLoc.0.)
+      (prime valueAt.0. CleanValueAt.0.)
+      (prime expected.0. (emptyset))
+      (prime liveTemp.0. (emptyset))
+      (prime liveStaging.0. (emptyset))
+      (prime stagingPin.0. CleanStagingPin.0.)
+      (prime sealedRegs.0. (emptyset))
+      (prime initing.0. (emptyset))
+      (prime initHome.0. CleanInitHome.0.)
+      (prime phase.0. plan.0.)
+      (prime log.0. (emptyseq))
+      (prime logIdx.0. 0)))
+
+  (def#Free(r): nifasm has no binding for r AND no live staging value occupies it. Reads the let-bound r.0. — staging values are raw, so they escape `binding`.# :Free.0.
+    (and
+      (eq (apply binding.0. r.0.) NoName.0.)
+      (not (exists :sv.0 liveStaging.0. (eq (apply stagingPin.0. sv.0) r.0.)))))
+
+  (def#the event under consideration is the let-bound e.0.; its fields# :Op.0. (field e.0. op.0.))
+  (def :EL.0. (field e.0. l.0.))
+  (def :ER.0. (field e.0. r.0.))
+  (def :ET.0. (field e.0. t.0.))
+  (def :ES.0. (field e.0. s.0.))
+  (def :FreeER.0. (let (bind :r.0. ER.0.) Free.0.))
+
+  (def#Applicable(e): may event e be applied against the current state?# :Applicable.0.
+    (if (eq Op.0. bindLocal.0.)   (and (notin EL.0. expected.0.) FreeER.0.)
+    (if (eq Op.0. beginInit.0.)   (and (notin EL.0. expected.0.) FreeER.0.)
+    (if (eq Op.0. finishInit.0.)  (in EL.0. initing.0.)
+    (if (eq Op.0. killLocal.0.)   (and (in EL.0. expected.0.) (notin EL.0. initing.0.))
+    (if (eq Op.0. borrowTemp.0.)  (and (notin ET.0. liveTemp.0.) FreeER.0.)
+    (if (eq Op.0. killTemp.0.)    (in ET.0. liveTemp.0.)
+    (if (eq Op.0. steal.0.)
+      (and
+        (notin ET.0. liveTemp.0.)
+        (in (apply binding.0. ER.0.) Locals.0.#a register-local (never a bound temp)#)
+        (in (apply binding.0. ER.0.) expected.0.)
+        (notin ER.0. sealedRegs.0.#not an in-flight / init home#))
+    (if (eq Op.0. pickStaging.0.) (and (notin ES.0. liveStaging.0.) FreeER.0.)
+    (if (eq Op.0. dropStaging.0.) (in ES.0. liveStaging.0.)
+    (if (eq Op.0. fixedUse.0.)
+      (and
+        (in ER.0. FixedRegs.0.)
+        (notin (apply binding.0. ER.0.) Temps.0.#cannot silently clobber a bound temp#)
+        (notin ER.0. sealedRegs.0.#nor a sealed in-flight / init home#))
+    (false))))))))))))
+
+  (def#ClearBinding(nm) for nm = the event's local / temp# :ClearBindingL.0.
+    (funof :r.0 Regs.0. (if (eq (apply binding.0. r.0) EL.0.) NoName.0. (apply binding.0. r.0))))
+  (def :ClearBindingT.0.
+    (funof :r.0 Regs.0. (if (eq (apply binding.0. r.0) ET.0.) NoName.0. (apply binding.0. r.0))))
+
+  (def#the fixedUse / steal victim: the local currently bound to e.r# :VictimIsLocal.0. (in (apply binding.0. ER.0.) Locals.0.))
+  (def :Victim.0. (apply binding.0. ER.0.))
+
+  (def#SemEffect(e): the effect of applying e, shared by plan and emit# :SemEffect.0.
+    (and
+      (prime binding.0.
+        (if (in Op.0. (set bindLocal.0. beginInit.0.)) (except binding.0. (mapsto ER.0. EL.0.))
+        (if (in Op.0. (set borrowTemp.0. steal.0.))    (except binding.0. (mapsto ER.0. ET.0.))
+        (if (eq Op.0. killLocal.0.) ClearBindingL.0.
+        (if (eq Op.0. killTemp.0.)  ClearBindingT.0.
+        (if (eq Op.0. fixedUse.0.)
+          (if VictimIsLocal.0. (except binding.0. (mapsto ER.0. NoName.0.)) binding.0.)
+        binding.0.))))))
+      (prime loc.0.
+        (if (in Op.0. (set bindLocal.0. beginInit.0.)) (except loc.0. (mapsto EL.0. ER.0.))
+        (if (eq Op.0. killLocal.0.) (except loc.0. (mapsto EL.0. Dead.0.))
+        (if (eq Op.0. steal.0.)     (except loc.0. (mapsto Victim.0. Stack.0.))
+        (if (eq Op.0. fixedUse.0.)
+          (if VictimIsLocal.0. (except loc.0. (mapsto Victim.0. Stack.0.)) loc.0.)
+        loc.0.)))))
+      (prime valueAt.0.
+        (if (eq Op.0. bindLocal.0.)  (except valueAt.0. (mapsto EL.0. ER.0.))
+        (if (eq Op.0. beginInit.0.)  (except valueAt.0. (mapsto EL.0. Pending.0.))
+        (if (eq Op.0. finishInit.0.#write to the CAPTURED home#)
+          (except valueAt.0. (mapsto EL.0. (apply initHome.0. EL.0.)))
+        (if (eq Op.0. killLocal.0.)  (except valueAt.0. (mapsto EL.0. Dead.0.))
+        (if (eq Op.0. steal.0.)      (except valueAt.0. (mapsto Victim.0. Stack.0.))
+        (if (eq Op.0. fixedUse.0.)
+          (if VictimIsLocal.0. (except valueAt.0. (mapsto Victim.0. Stack.0.)) valueAt.0.)
+        valueAt.0.)))))))
+      (prime expected.0.
+        (if (in Op.0. (set bindLocal.0. beginInit.0.)) (union expected.0. (set EL.0.))
+        (if (eq Op.0. killLocal.0.) (setminus expected.0. (set EL.0.))
+        expected.0.)))
+      (prime liveTemp.0.
+        (if (in Op.0. (set borrowTemp.0. steal.0.)) (union liveTemp.0. (set ET.0.))
+        (if (eq Op.0. killTemp.0.) (setminus liveTemp.0. (set ET.0.))
+        liveTemp.0.)))
+      (prime liveStaging.0.
+        (if (eq Op.0. pickStaging.0.) (union liveStaging.0. (set ES.0.))
+        (if (eq Op.0. dropStaging.0.) (setminus liveStaging.0. (set ES.0.))
+        liveStaging.0.)))
+      (prime stagingPin.0.
+        (if (eq Op.0. pickStaging.0.) (except stagingPin.0. (mapsto ES.0. ER.0.))
+        stagingPin.0.))
+      (prime sealedRegs.0.
+        (if (eq Op.0. beginInit.0.)  (union sealedRegs.0. (set ER.0.#THE FIX: seal the init home#))
+        (if (eq Op.0. finishInit.0.) (setminus sealedRegs.0. (set (apply initHome.0. EL.0.)))
+        sealedRegs.0.)))
+      (prime initing.0.
+        (if (eq Op.0. beginInit.0.)  (union initing.0. (set EL.0.))
+        (if (eq Op.0. finishInit.0.) (setminus initing.0. (set EL.0.))
+        initing.0.)))
+      (prime initHome.0.
+        (if (eq Op.0. beginInit.0.) (except initHome.0. (mapsto EL.0. ER.0.))
+        initHome.0.))))
+
+  (def#plan pass: choose an applicable event and record it# :PlanStep.0.
+    (and
+      (eq phase.0. plan.0.)
+      (lt (len log.0.) MaxLog.0.)
+      Applicable.0.
+      SemEffect.0.
+      (prime log.0. (append log.0. e.0.))
+      (unchanged phase.0. logIdx.0.)))
+
+  (def :PlanBindLocal.0.
+    (exists :l.0 Locals.0. (exists :r.0 Regs.0.
+      (let (bind :e.0. (record (kv op.0. bindLocal.0.) (kv l.0. l.0) (kv r.0. r.0) (kv t.0. NoTmp.0.) (kv s.0. NoStg.0.)))
+        PlanStep.0.))))
+  (def :PlanKillLocal.0.
+    (exists :l.0 Locals.0.
+      (let (bind :e.0. (record (kv op.0. killLocal.0.) (kv l.0. l.0) (kv r.0. NoReg.0.) (kv t.0. NoTmp.0.) (kv s.0. NoStg.0.)))
+        PlanStep.0.)))
+  (def :PlanBeginInit.0.
+    (exists :l.0 Locals.0. (exists :r.0 Regs.0.
+      (let (bind :e.0. (record (kv op.0. beginInit.0.) (kv l.0. l.0) (kv r.0. r.0) (kv t.0. NoTmp.0.) (kv s.0. NoStg.0.)))
+        PlanStep.0.))))
+  (def :PlanFinishInit.0.
+    (exists :l.0 Locals.0.
+      (let (bind :e.0. (record (kv op.0. finishInit.0.) (kv l.0. l.0) (kv r.0. NoReg.0.) (kv t.0. NoTmp.0.) (kv s.0. NoStg.0.)))
+        PlanStep.0.)))
+  (def :PlanBorrowTemp.0.
+    (exists :t.0 Temps.0. (exists :r.0 Regs.0.
+      (let (bind :e.0. (record (kv op.0. borrowTemp.0.) (kv l.0. NoLoc.0.) (kv r.0. r.0) (kv t.0. t.0) (kv s.0. NoStg.0.)))
+        PlanStep.0.))))
+  (def :PlanKillTemp.0.
+    (exists :t.0 Temps.0.
+      (let (bind :e.0. (record (kv op.0. killTemp.0.) (kv l.0. NoLoc.0.) (kv r.0. NoReg.0.) (kv t.0. t.0) (kv s.0. NoStg.0.)))
+        PlanStep.0.)))
+  (def :PlanSteal.0.
+    (exists :t.0 Temps.0. (exists :r.0 Regs.0.
+      (let (bind :e.0. (record (kv op.0. steal.0.) (kv l.0. NoLoc.0.) (kv r.0. r.0) (kv t.0. t.0) (kv s.0. NoStg.0.)))
+        PlanStep.0.))))
+  (def :PlanPickStg.0.
+    (exists :s.0 Staging.0. (exists :r.0 Regs.0.
+      (let (bind :e.0. (record (kv op.0. pickStaging.0.) (kv l.0. NoLoc.0.) (kv r.0. r.0) (kv t.0. NoTmp.0.) (kv s.0. s.0)))
+        PlanStep.0.))))
+  (def :PlanDropStg.0.
+    (exists :s.0 Staging.0.
+      (let (bind :e.0. (record (kv op.0. dropStaging.0.) (kv l.0. NoLoc.0.) (kv r.0. NoReg.0.) (kv t.0. NoTmp.0.) (kv s.0. s.0)))
+        PlanStep.0.)))
+  (def :PlanFixedUse.0.
+    (exists :r.0 FixedRegs.0.
+      (let (bind :e.0. (record (kv op.0. fixedUse.0.) (kv l.0. NoLoc.0.) (kv r.0. r.0) (kv t.0. NoTmp.0.) (kv s.0. NoStg.0.)))
+        PlanStep.0.)))
+
+  (def#emit pass: replay the next recorded event exactly. A recorded decision that cannot be applied against the per-proc-reset emit state sends the model to `stuck`, which NotStuck reports.# :EmitStep.0.
+    (and
+      (eq phase.0. emit.0.)
+      (lt logIdx.0. (len log.0.))
+      (let (bind :e.0. (apply log.0. (plus logIdx.0. 1)))
+        (if Applicable.0.
+          (and
+            SemEffect.0.
+            (prime logIdx.0. (plus logIdx.0. 1))
+            (unchanged phase.0. log.0.))
+          (and
+            (prime phase.0. stuck.0.)
+            (unchanged binding.0. loc.0. valueAt.0. expected.0. liveTemp.0. liveStaging.0.
+                       stagingPin.0. sealedRegs.0. initing.0. initHome.0. log.0. logIdx.0.))))))
+
+  (def#end planning; reset the whole per-proc state for the emit pass, keep only the log# :StartEmit.0.
+    (and
+      (eq phase.0. plan.0.)
+      (eq liveTemp.0. (emptyset)) (eq liveStaging.0. (emptyset)) (eq initing.0. (emptyset))
+      (prime binding.0. CleanBinding.0.)
+      (prime loc.0. CleanLoc.0.)
+      (prime valueAt.0. CleanValueAt.0.)
+      (prime expected.0. (emptyset))
+      (prime liveTemp.0. (emptyset))
+      (prime liveStaging.0. (emptyset))
+      (prime stagingPin.0. CleanStagingPin.0.)
+      (prime sealedRegs.0. (emptyset))
+      (prime initing.0. (emptyset))
+      (prime initHome.0. CleanInitHome.0.)
+      (prime phase.0. emit.0.)
+      (prime logIdx.0. 0)
+      (unchanged log.0.)))
+
+  (def :FinishEmit.0.
+    (and
+      (eq phase.0. emit.0.)
+      (eq logIdx.0. (len log.0.))
+      (eq liveTemp.0. (emptyset)) (eq liveStaging.0. (emptyset)) (eq initing.0. (emptyset))
+      (prime phase.0. done.0.)
+      (unchanged binding.0. loc.0. valueAt.0. expected.0. liveTemp.0. liveStaging.0.
+                 stagingPin.0. sealedRegs.0. initing.0. initHome.0. log.0. logIdx.0.)))
+
+  (def :Next.0.
+    (or
+      PlanBindLocal.0. PlanKillLocal.0. PlanBeginInit.0. PlanFinishInit.0.
+      PlanBorrowTemp.0. PlanKillTemp.0. PlanSteal.0.
+      PlanPickStg.0. PlanDropStg.0. PlanFixedUse.0.
+      EmitStep.0. StartEmit.0. FinishEmit.0.))
+
+
+  (def :IsEvent.0.
+    (and
+      (in Op.0. EvOp.0.)
+      (in EL.0. (union Locals.0. (set NoLoc.0.)))
+      (in ER.0. (union Regs.0. (set NoReg.0.)))
+      (in ET.0. (union Temps.0. (set NoTmp.0.)))
+      (in ES.0. (union Staging.0. (set NoStg.0.)))))
+
+  (def :TypeOK.0.
+    (and
+      (eq (domain binding.0.) Regs.0.)
+      (forall :r.0 Regs.0. (in (apply binding.0. r.0) Names.0.))
+      (eq (domain loc.0.) Locals.0.)
+      (forall :l.0 Locals.0. (in (apply loc.0. l.0) (union Regs.0. (set Stack.0. Dead.0.))))
+      (eq (domain valueAt.0.) Locals.0.)
+      (forall :l.0 Locals.0. (in (apply valueAt.0. l.0) ValueLoc.0.))
+      (subset expected.0. Locals.0.)
+      (subset liveTemp.0. Temps.0.)
+      (subset liveStaging.0. Staging.0.)
+      (eq (domain stagingPin.0.) Staging.0.)
+      (forall :s.0 Staging.0. (in (apply stagingPin.0. s.0) (union Regs.0. (set NoReg.0.))))
+      (subset sealedRegs.0. Regs.0.)
+      (subset initing.0. Locals.0.)
+      (eq (domain initHome.0.) Locals.0.)
+      (forall :l.0 Locals.0. (in (apply initHome.0. l.0) (union Regs.0. (set NoReg.0.))))
+      (in phase.0. Phases.0.)
+      (forall :i.0 (range 1 (len log.0.)) (let (bind :e.0. (apply log.0. i.0)) IsEvent.0.))
+      (in logIdx.0. (range 0 (len log.0.)))
+      (le (len log.0.) MaxLog.0.)))
+
+  (def#every live local has a home; a register home is named by nifasm for that local# :LiveLocalsHaveHomes.0.
+    (forall :l.0 expected.0.
+      (and
+        (neq (apply loc.0. l.0) Dead.0.)
+        (implies (in (apply loc.0. l.0) Regs.0.)
+                 (eq (apply binding.0. (apply loc.0. l.0)) l.0)))))
+
+  (def#every local nifasm still has in a register is live and agrees with the allocator# :RegisterBindingsMatchLoc.0.
+    (forall :r.0 Regs.0.
+      (implies (in (apply binding.0. r.0) Locals.0.)
+               (and
+                 (in (apply binding.0. r.0) expected.0.)
+                 (eq (apply loc.0. (apply binding.0. r.0)) r.0)))))
+
+  (def#bound scratch temps are one-to-one with borrowed temps# :TempBindingsMatchBorrows.0.
+    (and
+      (forall :r.0 Regs.0.
+        (implies (in (apply binding.0. r.0) Temps.0.) (in (apply binding.0. r.0) liveTemp.0.)))
+      (forall :t.0 liveTemp.0.
+        (eq (card (setcomp :r.0 Regs.0. (eq (apply binding.0. r.0) t.0))) 1))))
+
+  (def#no two live values share a physical register — the forceReg collision class# :NoSharedRegister.0.
+    (and
+      (forall :sv.0 liveStaging.0.
+        (and
+          (eq (apply binding.0. (apply stagingPin.0. sv.0)) NoName.0.)
+          (forall :sv2.0 liveStaging.0.
+            (implies (neq sv2.0 sv.0) (neq (apply stagingPin.0. sv2.0) (apply stagingPin.0. sv.0))))))
+      (forall :l.0 expected.0.
+        (implies (in (apply loc.0. l.0) Regs.0.)
+                 (not (exists :sv.0 liveStaging.0. (eq (apply stagingPin.0. sv.0) (apply loc.0. l.0))))))))
+
+  (def#a finished local's value is exactly where the allocator says it lives — the genInto dest-steal miscompile breaks this# :ValueConsistency.0.
+    (and
+      (forall :l.0 expected.0.
+        (implies (notin l.0 initing.0.)
+                 (and (eq (apply valueAt.0. l.0) (apply loc.0. l.0))
+                      (neq (apply valueAt.0. l.0) Pending.0.))))
+      (forall :l.0 initing.0. (eq (apply valueAt.0. l.0) Pending.0.))))
+
+  (def :NotStuck.0. (neq phase.0. stuck.0.))
+
+  (def :ReplayComplete.0.
+    (implies (eq phase.0. done.0.)
+             (and (eq logIdx.0. (len log.0.))
+                  (eq liveTemp.0. (emptyset)) (eq liveStaging.0. (emptyset)) (eq initing.0. (emptyset)))))
+
+  (def :Safety.0.
+    (and
+      LiveLocalsHaveHomes.0.
+      RegisterBindingsMatchLoc.0.
+      TempBindingsMatchBorrows.0.
+      NoSharedRegister.0.
+      ValueConsistency.0.
+      NotStuck.0.
+      ReplayComplete.0.))
+
+  (def :Inv.0. (and TypeOK.0. Safety.0.))
+
+  (spec (always-stutter Init.0. Next.0.
+    (tuple binding.0. loc.0. valueAt.0. expected.0. liveTemp.0. liveStaging.0.
+           stagingPin.0. sealedRegs.0. initing.0. initHome.0. phase.0. log.0. logIdx.0.)))
+  (check Inv.0.)
+)

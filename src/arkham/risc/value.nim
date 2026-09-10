@@ -1975,6 +1975,34 @@ proc emitModPow2(g: var CodeGen; c, resTypeC, lhsC: Cursor; k: int;
   g.binImm(AndA64, rD, (1'i64 shl k) - 1)
   dest = acc
 
+# ── emitBin2's / emitScalarCmp's operand-side helpers ────────────────────────
+proc leafLoc(g: var CodeGen; cur: Cursor; isMem, deferOk: bool; deferred: var bool): Location =
+  ## A leaf's location (the x86-64 twin's `leafLoc`). A memory leaf is DEFERRED
+  ## when `deferOk` allows: its embedded base/index values are picked now
+  ## (`emitLvalue2`), the access itself folds through a bridge in the consuming
+  ## instruction, and `freeLvalTemps2` releases the picks after. Otherwise the
+  ## leaf resolves through `emitValue2` with a dont-care destination: an
+  ## immediate stays an `Imm`, a symbol is its home, a memory leaf is loaded.
+  result = dontCare
+  if isMem and deferOk:
+    g.emitLvalue2(cur)
+    result = memLoc(cur, ScalarSlot)
+    deferred = true
+  else:
+    g.emitValue2(cur, result)
+
+proc cmpBridgeSlot(g: var CodeGen; loc: Location; opC: Cursor): AsmSlot =
+  ## The slot a compare operand's bridge is typed at: a pointer operand keeps its
+  ## pointer type (nifasm checks the binding), anything else the location's own.
+  if isPtrType(resolveType(g.prog, g.getType(opC))): g.exprSlot(opC)
+  else: loc.typ
+
+proc placeCmpOperand(g: var CodeGen; loc: Location; opC: Cursor; bridge: Reg) =
+  ## Materialize a compare operand into its bridge; an immediate is typed by the
+  ## operand's own type so a pointer-typed literal binds as a pointer.
+  if loc.kind == Imm: g.placeImmTyped(bridge, loc, g.getType(opC))
+  else: g.place2(loc, bridge)
+
 proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED a64 binary-arith: the shared allocBin policy decided inline
   ## (Sethi–Ullman swap, dest passthrough, rhs recycling, aliasRhs), emitted
@@ -2000,7 +2028,10 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
   let swap = ek notin {ShlC, ShrC} and (commutativeExpr(ek) or ek == SubC) and
              (g.isFoldableLeaf(lhsC) or lhsMem) and
              not (g.isFoldableLeaf(rhsC) or g.isFoldableMemLeaf(rhsC)) and
-             not (dest.kind == InReg and g.symInReg(lhsC, dest.r))
+             # `exprReadsReg`, not `symInReg`: a lhs MEMORY leaf whose base/index is
+             # the dest (`x = a[x] + (y*2)`) reads it too, and the swap computed the
+             # rhs into `x` before indexing with it (tests/arkham/bin_alias_order).
+             not (dest.kind == InReg and g.exprReadsReg(lhsC, dest.r))
   if swap:
     var acc = dest
     # The accumulator ends up holding the RESULT, so it is bound at the result's
@@ -2018,12 +2049,8 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
     # local's home whose declared type is not the type of the value now landing
     # in it (an integer computed into a `(ptr …)` local under an enclosing cast).
     g.retypeBinDest(rD, resTypeC, inheritedOperand = false)
-    var lLoc = dontCare                                  # the leaf lhs: its natural place
-    if lhsMem:
-      g.emitLvalue2(lhsC)                                # pick embedded base/index regs
-      lLoc = memLoc(lhsC, ScalarSlot)
-    else:
-      g.resolveLvalVal(lhsC, lLoc)
+    var lDeferred = false
+    let lLoc = g.leafLoc(lhsC, lhsMem, true, lDeferred)   # the leaf lhs: its natural place
     let foldOp = if op == SubA64: AddA64 else: op
     if op == SubA64:
       g.emNeg(rD)                       # rD := -rhs
@@ -2407,35 +2434,17 @@ proc emitScalarCmp*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
     # lower-bound check paid that materialisation. Exchange and mirror instead.
     swap(aC, bC)
     result = mirrorBranch(result)
-  template cmpBridgeSlot(loc: Location; opC: Cursor): AsmSlot =
-    if isPtrType(resolveType(g.prog, g.getType(opC))): g.exprSlot(opC)
-    else: loc.typ
-  template placeCmpOperand(loc: Location; opC: Cursor; bridge: Reg) =
-    if loc.kind == Imm: g.placeImmTyped(bridge, loc, g.getType(opC))
-    else: g.place2(loc, bridge)
-  var aD = dontCare
   var aMem = false
-  if g.isFoldableMemLeaf(aC):
-    g.emitLvalue2(aC)                                # fold the lhs load via a bridge
-    aD = memLoc(aC, ScalarSlot)
-    aMem = true
-  else:
-    g.emitValue2(aC, aD)
+  let aD = g.leafLoc(aC, g.isFoldableMemLeaf(aC), true, aMem)  # a mem lhs folds via a bridge
   var aReg = NoReg
   var aBridge = NoReg
   if aD.kind == InReg: aReg = aD.r
   else:
-    aBridge = g.takeBridge(cmpBridgeSlot(aD, aC))
-    placeCmpOperand(aD, aC, aBridge)
+    aBridge = g.takeBridge(g.cmpBridgeSlot(aD, aC))
+    g.placeCmpOperand(aD, aC, aBridge)
     aReg = aBridge
-  var bD = dontCare
   var bMem = false
-  if g.isFoldableMemLeaf(bC):
-    g.emitLvalue2(bC)
-    bD = memLoc(bC, ScalarSlot)
-    bMem = true
-  else:
-    g.emitValue2(bC, bD)
+  let bD = g.leafLoc(bC, g.isFoldableMemLeaf(bC), true, bMem)
   var fused = false
   if bD.kind == Imm and bD.ival == 0 and ek in {EqC, NeqC} and fuseBranchTo.len > 0:
     # `x == 0` / `x != 0` against a label: one `cbz`/`cbnz`, no flags involved.
@@ -2453,8 +2462,8 @@ proc emitScalarCmp*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
     var bBridge = NoReg
     if bD.kind == InReg: bReg = bD.r
     else:
-      bBridge = g.takeBridge(cmpBridgeSlot(bD, bC), avoid = aReg)
-      placeCmpOperand(bD, bC, bBridge)
+      bBridge = g.takeBridge(g.cmpBridgeSlot(bD, bC), avoid = aReg)
+      g.placeCmpOperand(bD, bC, bBridge)
       bReg = bBridge
     g.ab.tree CmpA64: (g.emReg aReg; g.emReg bReg)
     if bBridge != NoReg: g.dropBridge bBridge
@@ -3967,6 +3976,22 @@ proc wideValueSlot(g: var CodeGen; c: Cursor): WideRef =
 
 proc emitNarrowValueInto(g: var CodeGen; c: Cursor; dest: Reg) =
   ## Emit a NON-wide expression so its value lands in `dest`.
+  ##
+  ## A LITERAL is produced straight into the pinned register: no temp, no
+  ## `place2`. `dest` is one of the wide lowering's own scratch registers, taken
+  ## and bound by `takeWideRegs`, and with four of them held (`wideShift`) the
+  ## pools are dry: `needsReg` for the literal count `2` in `(shl y 2)` minted an
+  ## etmp SLOT, whose store then wanted a produce bridge — and every bridge was one
+  ## of those four ("every scratch bridge in use", tests/arkham/bin_alias_order on
+  ## the cortex-m 64 corpus). Everything else keeps the temp route: a SYMBOL may
+  ## be a 64-bit slot whose LOW word is what `place2` fetches (`1 shl n` with
+  ## `n: int64` — the pinned route emitted no load at all), and a computed
+  ## operand's own emission may need scratch of its own.
+  let cc = stripParens(c)
+  if cc.kind in {IntLit, UIntLit, CharLit}:
+    var v = regLoc(dest, g.valueSlot(c))
+    g.emitValue2(cc, v)
+    return
   var v = needsReg(g.valueSlot(c))
   g.emitValue2(c, v)
   g.place2(v, dest)

@@ -50,9 +50,12 @@ constant, independent of the expression's size — which is exactly what frees t
 rest of the register file for locals.
 
 A right-nested chain (`b + (c + (d + …))`) would naively need one register per
-level; arkham's value core applies a **Sethi–Ullman swap** in `allocBin`
+level; arkham's value core applies a **Sethi–Ullman swap** in `emitBin2`
 (evaluate the computed operand first, straight into the accumulator, then fold
-the leaf operand), collapsing it back to O(1) live registers.
+the leaf operand), collapsing it back to O(1) live registers. `emitBin2` follows
+vmgen's order in general — operands become locations first, the result register
+is chosen once both exist — so a leaf is never materialized early and no
+half-built value sits unprotected in a home register across a sibling.
 
 ## What the codegen actually does
 

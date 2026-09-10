@@ -2205,8 +2205,7 @@ const cortexMUnsupported: seq[string] = @[
   # reachable from the staging draw. What is left is demand of a different KIND —
   # an ATOMIC's operands, which may not use a bridge at all because the LL/SC loop
   # owns them, and an aggregate whose two ends are both computed.
-  "aconstr_byref_spilled", "aggr_arg_parked_manual",
-  "atomic_cas_operand_home",
+  "aggr_arg_parked_manual", "atomic_cas_operand_home",
 
   # ── WRONG ANSWER, and the second one in this list ───────────────────────────
   # `array2d` used to fail loudly for register pressure. It compiles now, and
