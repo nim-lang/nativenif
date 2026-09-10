@@ -2099,9 +2099,38 @@ proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location) =
 
 # ── fused value core: unconverted-proc stubs (die as each case lands) ────────
 proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
-  ## FUSED binary-arith: allocBin's placement policy (Sethi–Ullman swap,
-  ## destination passthrough, rhs-temp recycling, aliasRhs hazard) decided
-  ## right here, then emitted — one ladder, no replay hints.
+  ## FUSED binary-arith in vmgen's ORDER (compiler/vmgen.nim `genBinaryABC`): the
+  ## operands become LOCATIONS first, the result register is chosen once both
+  ## exist, then ONE placement and the op.
+  ##
+  ## A LEAF operand — an immediate, a symbol's home, a memory access — is never
+  ## materialized early: it is read where it lives, straight into the result
+  ## register (`place2`) or folded as the op's second operand. Only a COMPUTED
+  ## operand occupies a register while its sibling is emitted, and that register
+  ## is either a BOUND temp (the pools and the staging picker stay off it) or the
+  ## pinned destination itself — the latter only when the sibling is a leaf that
+  ## does not read it, and `exprReadsReg` on a LEAF is a bounded check. So no
+  ## half-built value sits unprotected in a home register across a recursive
+  ## emission, and the seal-the-partial defence the previous shape needed (the
+  ## dest-steal and staging-collision miscompiles it defended against) has
+  ## nothing left to defend.
+  ##
+  ## Placement:
+  ##   leaf op computed     the computed side accumulates (pinned dest or a temp),
+  ##                        the leaf folds after it (sub: `neg` first, then add)
+  ##   computed op leaf     the computed side accumulates, the leaf folds
+  ##   computed op computed lhs in a bound temp, rhs wherever, RMW on the lhs temp
+  ##                        — or `mov dest, T` when pinned, which is the peephole's
+  ##                        copy forwarding to take, not this proc's hazard to run
+  ##   leaf op leaf         `mov res, lhs ; op res, rhs` — or `op rhsTemp, lhs`
+  ##                        when the rhs arrived in a dying temp (a forwarded
+  ##                        mirror), with `neg` for sub
+  ## A pinned destination that the rhs LOCATION is (`x = y + x`) takes the
+  ## `op x, y` form; one a deferred rhs MEMORY operand reads (`x = y + a[x]`)
+  ## loads that operand first. A destination the lhs reads through a memory
+  ## operand (`x = a[x] + (y*2)`) is NOT the accumulator: the previous swap asked
+  ## only about a bare symbol and computed `y*2` into `x` before indexing with it
+  ## (tests/arkham/bin_alias_order, exit 13 on the old shape).
   let pos = cursorToPosition(g.buf[], c)
   let (op, isBin) = binArithOp(c)
   assert isBin, "arkham x64n: emitBin2 on a non-bin node"
@@ -2116,21 +2145,68 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
       rhsC = cc; skip cc
       while cc.hasMore: skip cc
   checkArithResultType(g.prog, resTypeC, lengInfo(c))
-  # ── Sethi–Ullman swap: foldable/memory lhs + computed rhs → rhs first, into
-  # the accumulator; the leaf lhs folds after (sub completes with a neg).
-  let lhsMem = g.isFoldableMemLeaf(lhsC)
-  let swap = ek notin {ShlC, ShrC} and (commutativeExpr(ek) or ek == SubC) and
-             (g.isFoldableLeaf(lhsC) or lhsMem) and
-             not (g.isFoldableLeaf(rhsC) or g.isFoldableMemLeaf(rhsC)) and
-             not (dest.kind == InReg and g.symInReg(lhsC, dest.r))
-  if swap:
+  let isShift = ek in {ShlC, ShrC}
+  let varShift = isShift and g.md.shiftCountReg != NoReg and not isConstShiftCount(rhsC)
+  let pinned = dest.kind == InReg
+  # `isFoldableMemLeaf`, not `isMemLeaf`: a field of a register-homed ≤16B aggregate
+  # IS a GPR, so folding it as `[mem]` would address a slot that does not exist.
+  # `isImmLeaf` besides `isFoldableLeaf`: the latter knows BARE literals only, and a
+  # front-end spells a typed one `(suf 511u "u32")`.
+  var lhsMem = g.isFoldableMemLeaf(lhsC)
+  var rhsMem = g.isFoldableMemLeaf(rhsC)
+  let lhsLeaf = lhsMem or g.isFoldableLeaf(lhsC) or isImmLeaf(lhsC)
+  let rhsLeaf = rhsMem or g.isFoldableLeaf(rhsC) or isImmLeaf(rhsC)
+  let resSlot = g.binResultSlot(resTypeC)
+
+  # ── the two operand-side helpers ─────────────────────────────────────────────
+  # `rD op= loc` for a LEAF location; `cur` is its node (a memory fold materializes
+  # its address from it). A 64-bit immediate stages through a register.
+  template foldInto(fop: X64Inst; rD: Reg; loc: Location; cur: Cursor; typ: AsmSlot) =
+    case loc.kind
+    of Imm:
+      if loc.ival < low(int32).int64 or loc.ival > high(int32).int64:
+        let s = g.pickStagingSealed("a bin imm64", typ)
+        g.movImm(s, loc.ival)
+        g.binReg(fop, rD, s)
+        g.giveBack s
+      else: g.binImm(fop, rD, loc.ival)
+    of InReg: g.binReg(fop, rD, loc.r)
+    of NamedStack, Mem: g.binFold(fop, rD, loc, cur)   # sub-width field → load+extend
+    else: raiseAssert "arkham x64n: bin leaf operand " & $loc.kind
+  # A leaf's location. A memory leaf is DEFERRED when `defer` allows: its embedded
+  # base/index values are picked now (`emitLvalue2`), the access itself folds into
+  # the consuming instruction, and `freeLvalTemps2` releases the picks after.
+  # Otherwise the leaf resolves through `emitValue2` with a dont-care destination:
+  # an immediate stays an `Imm`, a symbol is its home (or the register still
+  # mirroring it, taken over), a memory leaf is loaded into a temp.
+  template leafLoc(cur: Cursor; isMem, deferOk: bool; deferred: var bool): Location =
+    block:
+      var lc = dontCare
+      if isMem and deferOk:
+        g.emitLvalue2(cur)
+        lc = memLoc(cur, ScalarSlot)
+        deferred = true
+      else:
+        g.emitValue2(cur, lc)
+      lc
+
+  # ── leaf op computed: the rhs accumulates, the leaf lhs folds after ─────────
+  # (The Sethi–Ullman swap.) Not for shifts. A PINNED dest is the accumulator, so a
+  # lhs that reads it — the symbol homed there (`r = r + (r shl 10)`, the `!&`
+  # idiom) or a memory operand whose base/index is it (`x = a[x] + (y*2)`) —
+  # takes the general path below instead: rhs into a temp, `op dest, T`. A pinned
+  # caller never frees a temp handed back as `dest`, so accumulating beside the
+  # dest is not an option here (it leaked one temp per `!&` and ran hashStrLong
+  # into `etmp` spill slots).
+  if lhsLeaf and not rhsLeaf and not isShift and (commutativeExpr(ek) or ek == SubC) and
+     not (pinned and g.exprReadsReg(lhsC, dest.r)):
     var acc = dest
     # The accumulator receives the RHS first and only becomes the result's type at
     # `normalizeBinWidth` below, so it is minted at the RHS's type and retyped after
     # the normalizer. Minting it at the result type made the rhs fill a narrowing
-    # reg→reg move; same rule as the general path below.
+    # reg→reg move.
     let accIncoming = g.exprSlot(rhsC)
-    if acc.kind != InReg: acc = g.takeTmp(accIncoming)
+    if not pinned: acc = g.takeTmp(accIncoming)
     if acc.kind == NamedStack and acc.spillTemp:
       g.produceIntoMem2(c, acc)                          # pools dry: whole node via staging
       dest = acc
@@ -2139,29 +2215,23 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
     var rdst = acc
     g.emitValue2(rhsC, rdst)                             # rhs → the accumulator
     if acc.isTemp and not g.rb.isBoundTemp(rD): g.bindTemp(rD, acc.typ)
-    var lLoc = dontCare                                  # the leaf lhs: its natural place
-    if lhsMem:
-      g.emitLvalue2(lhsC)                                # pick embedded base/index regs
-      lLoc = memLoc(lhsC, ScalarSlot)
-    else:
-      g.resolveLvalVal(lhsC, lLoc)                       # imm / register / stack home
+    if acc.isTemp and accIncoming.cls notin {AInt, AUInt}:
+      # A BOOL rhs (`r + (eq a 3)`) landed as a bool binding, and nifasm refuses
+      # integer arithmetic on one. The value is a normalized 0/1, so putting the
+      # result's integer type on the register now is a zero-code rebind — unlike
+      # the int→int case, which stays at the incoming type until `normalizeBinWidth`.
+      var rtcB = resTypeC
+      g.bindTemp(rD, slotOf(g.prog, rtcB))
+    var lDeferred = false
+    let lLoc = leafLoc(lhsC, lhsMem, true, lDeferred)    # the leaf lhs: its natural place
     let foldOp = if op == SubX64: AddX64 else: op        # sub folds as add (after neg)
     let rdSeal = not g.plan.isSealed(rD) and not g.rb.isBoundTemp(rD)
-    if rdSeal: g.plan.seal {rD}
+    if rdSeal: g.plan.seal {rD}                          # the fold's staging picks stay off rD
     if op == SubX64:
       g.ab.tree NegX64: g.emReg rD                       # rD := -rhs
-    case lLoc.kind                                       # rD := rD <foldOp> lhs
-    of Imm:
-      if lLoc.ival < low(int32).int64 or lLoc.ival > high(int32).int64:
-        let s = g.pickStagingSealed("a bin imm64", acc.typ)
-        g.movImm(s, lLoc.ival)
-        g.binReg(foldOp, rD, s)
-        g.giveBack s
-      else: g.binImm(foldOp, rD, lLoc.ival)
-    of InReg: g.binReg(foldOp, rD, lLoc.r)
-    of NamedStack, Mem: g.binFold(foldOp, rD, lLoc, lhsC) # sub-width field → load+extend
-    else: raiseAssert "arkham x64n: bin(swapped) lhs " & $lLoc.kind
-    if lhsMem: g.freeLvalTemps2(lhsC)                    # embedded picks die with the fold
+    foldInto(foldOp, rD, lLoc, lhsC, acc.typ)            # rD := rD <foldOp> lhs
+    if lDeferred: g.freeLvalTemps2(lhsC)                 # embedded picks die with the fold
+    else: g.freeVal(lLoc)                                # a forwarded-mirror temp
     if not suppressNorm: g.normalizeBinWidth(resTypeC, rD, op)
     if acc.isTemp and g.rb.isBoundTemp(rD) and
        slotTypeDiffers(g.prog, accIncoming, resTypeC):
@@ -2170,52 +2240,42 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
     if rdSeal: g.plan.unseal {rD}
     dest = acc
     return
-  # ── canonical order: lhs into a register (or straight into a pinned dest
-  # when safe), rhs folds in place.
-  # Mint the lhs temp at the OPERATOR's result type, not a dont-care `(i 64)`.
-  # A Leng literal has no type of its own — `1` in `(or (u 32) 1 x)` is a u32
-  # operand — and `place2` of an `(i 64)` temp into a `(u 32)` named dest is a
-  # narrowing move nifasm rejects (encodeInlineStr: `result = 1 or (uint32(len) shl 1)`).
-  var lDest = needsReg(g.binResultSlot(resTypeC))
-  # A shift is excluded only because a VARIABLE count is pinned to cl below; with
-  # a constant count no fixed register is involved and the passthrough is as safe
-  # as for any other op. Excluding every shift cost a `mov` per shift whose result
-  # has a home: the lhs landed in a fresh temp and the result then had to be moved
-  # out of it. `(asgn x (and (shr y 4) 511))` came out as
-  #     mov y,T ; shr $4,T ; mov T,x ; and $511,x
-  # where three instructions do the work (nifbench: 117 M executions of the
-  # `mov`+const-shift pair, 1.5 % of all instructions).
-  # `isImmLeaf` rather than `isFoldableLeaf` for the rhs: the latter only knows
-  # BARE literals, and a front-end spells a typed one `(suf 511u "u32")` — so the
-  # passthrough was dead for every op with a suffixed operand, which is most of
-  # them. (The swap branch above must keep the narrow test: there the lhs is only
-  # RESOLVED, by `resolveLvalVal`, which materializes bare literals and symbol
-  # homes and nothing else.)
-  # `isFoldableMemLeaf`, not `isMemLeaf`: a field of a register-homed ≤16B
-  # aggregate IS a GPR, so folding it as `[mem]` would address a slot that does
-  # not exist.
-  if dest.kind == InReg and (ek notin {ShlC, ShrC} or isConstShiftCount(rhsC)) and
-     not g.isFoldableLeaf(lhsC) and
-     (g.isFoldableLeaf(rhsC) or isImmLeaf(rhsC) or g.isFoldableMemLeaf(rhsC)) and
-     not g.exprReadsReg(lhsC, dest.r) and not g.exprReadsReg(rhsC, dest.r):
-    lDest = dest                                         # compute lhs straight into dest
-  g.emitValue2(lhsC, lDest)
+
+  # ── every other shape: lhs location, rhs location, THEN the result register ──
+  # Two leaves, one of them a memory access, commutative op: the memory leaf is the
+  # one to PLACE (`mov res, [mem]` is one instruction at any width) and the other
+  # leaf folds. Folding the memory leaf costs a staging load whenever the field is
+  # narrower than 8 bytes (`add r64, m32` does not exist — see `binFold`).
+  if lhsLeaf and rhsLeaf and rhsMem and not lhsMem and commutativeExpr(ek):
+    swap(lhsC, rhsC)
+    swap(lhsMem, rhsMem)
+  var lLoc: Location
+  var lDeferred = false
+  if lhsLeaf:
+    # A deferred lhs memory operand is read at placement time, AFTER the rhs: a
+    # variable shift has moved its count into rcx by then, so an address that reads
+    # rcx is loaded now instead.
+    lLoc = leafLoc(lhsC, lhsMem,
+                   not (varShift and g.exprReadsReg(lhsC, g.md.shiftCountReg)), lDeferred)
+  else:
+    # A computed lhs accumulates: straight into the pinned dest when the rhs is a
+    # leaf that does not read it (and the dest is not the shift-count register a
+    # variable count is about to take); else into a temp minted at the OPERATOR's
+    # result type, not a dont-care `(i 64)` — a Leng literal has no type of its own,
+    # and `place2` of an `(i 64)` temp into a `(u 32)` named dest is a narrowing
+    # move nifasm rejects.
+    lLoc = needsReg(resSlot)
+    if pinned and rhsLeaf and not g.exprReadsReg(rhsC, dest.r) and
+       not (varShift and dest.r == g.md.shiftCountReg):
+      lLoc = dest                                        # compute lhs straight into dest
+    g.emitValue2(lhsC, lLoc)
   # The rhs may be FORCED to overwrite a fixed register — `div`/`idiv` take rax and
-  # rdx, a variable shift takes cl — and the seal below is no defence against that.
-  # A seal keeps the POOLS and the staging picker off a register; it cannot keep the
-  # ISA off one, and `emitDivMod2` writes rax unconditionally. So a live lhs partial
-  # sitting in such a register has to MOVE, before the rhs runs.
-  #
-  # The call marshaller has parked its already-placed arguments off exactly these
-  # registers for as long as `fixedRegsClobberedBy` has existed; this side never
-  # did. Reaching it needs pressure high enough to leave a partial in rax at all:
-  #     (add (div a b) (div c d))       every pool register held by a live local
-  # left the first quotient in rax, and the second `div` overwrote it. The `add` then
-  # added the second quotient to itself. Not silent, but only by luck — the partial
-  # happened to carry a temp binding, so nifasm rejected the `div` ("clobbers RAX,
-  # still bound to `tmp1.0") instead of assembling the wrong answer.
-  if lDest.kind == InReg and lDest.r in g.fixedRegsClobberedBy(rhsC):
-    let old = lDest
+  # rdx, a variable shift takes cl. A live lhs sitting in such a register has to
+  # MOVE before the rhs runs: reaching this needs pressure high enough to leave the
+  # lhs in rax at all — `(add (div a b) (div c d))` with every pool register held
+  # left the first quotient in rax, and the second `div` overwrote it.
+  if lLoc.kind == InReg and lLoc.r in g.fixedRegsClobberedBy(rhsC):
+    let old = lLoc
     var safe = g.takeTmp(old.typ)                        # R10, or an etmp slot when dry
     assert not (safe.kind == InReg and
                 safe.r in g.fixedRegsClobberedBy(rhsC)),
@@ -2226,75 +2286,70 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
     else:
       g.emitStoreLoc(safe, old.r)                        # pools dry: park it in the slot
     g.freeVal(old)                                       # `(kill)`s the binding on rax
-    lDest = safe
-  # The lhs partial is LIVE in `lDest` across the rhs evaluation, and that
-  # evaluation recurses into arbitrary emission. A bound TEMP is already off
-  # limits to a staging pick (`isBoundTemp`); a FIXED destination is not — the
-  # proc's result register carries no binding at all, so nothing stopped
-  # `pickStagingScratch` handing out the rax holding a half-built `(ret …)`
-  # value, and an address temp of the rhs overwrote it (`addr_chain_depth`).
-  # Seal states what the register is doing; `regFreeForTemp` honours it too, so
-  # the allocator's own pool picks stay off it as well.
-  let lSeal = lDest.kind == InReg and not g.plan.isSealed(lDest.r) and
-              not g.rb.isBoundTemp(lDest.r)
-  if lSeal: g.plan.seal {lDest.r}
-  var rDest = dontCare
-  if ek in {ShlC, ShrC} and g.md.shiftCountReg != NoReg and
-     not isConstShiftCount(rhsC):
-    # x86 variable shift: the count must be in cl. A live bound TEMP there is a
-    # real hazard; a (`ShiftRegOk`) HOME is interval-proved dead at every
-    # variable shift, and a committed call argument in rcx was PARKED off it
-    # by the marshaller — so only a temp is asserted.
+    lLoc = safe
+  var rLoc = dontCare
+  var rDeferred = false
+  if varShift:
+    # x86 variable shift: the count must be in cl. A live bound TEMP there is a real
+    # hazard; a (`ShiftRegOk`) HOME is interval-proved dead at every variable shift,
+    # and a committed call argument in rcx was PARKED off it by the marshaller — so
+    # only a temp is asserted. "Dead" is arkham's word: nifasm still sees the NAME
+    # bound to the register and would type the count's store by it, so the binding
+    # is retired first (exactly what the div/mod path does for rdx).
     if g.rb.isBoundTemp(g.md.shiftCountReg):
       raiseAssert "arkham: variable shift while the count register holds a live value"
-    # A `ShiftRegOk` home in rcx is interval-proved DEAD here, but "dead" is arkham's
-    # word: nifasm still sees the NAME bound to the register, so `emitValue2` writes
-    # the count out under that name — at that name's type. `rawLineInfo` homes a
-    # `(ptr (u 32))` there and then shifts by 14: `(mov `cse.1 14)`, rejected as
-    # "cannot store the non-zero integer 14 into the pointer-typed destination".
-    # Retire the binding so the count lands in a raw `(rcx)` instead. Exactly what
-    # the div/mod path does for rdx (see `releaseStaleName` there) — this side was
-    # missing it, and only register pressure high enough to home a local in rcx at
-    # all made the difference visible.
     g.releaseStaleName(g.md.shiftCountReg)
-    rDest = regLoc(g.md.shiftCountReg, ScalarSlot)
-  g.emitValue2(rhsC, rDest)                              # rhs → wherever (may stay imm/home)
-  if lSeal: g.plan.unseal {lDest.r}                        # the partial is consumed below
-  # ── result placement: keep a fixed dest; else in-place RMW on a dead lhs
-  # temp; else recycle the dead rhs temp (aliasRhs); else a fresh temp.
+    rLoc = regLoc(g.md.shiftCountReg, ScalarSlot)
+    g.emitValue2(rhsC, rLoc)
+  elif rhsLeaf:
+    # A deferred rhs memory operand folds into the op, which runs AFTER the lhs is
+    # placed into the result register — so it must not read a pinned dest.
+    rLoc = leafLoc(rhsC, rhsMem, not (pinned and g.exprReadsReg(rhsC, dest.r)), rDeferred)
+  else:
+    g.emitValue2(rhsC, rLoc)                             # computed rhs → a bound temp
+
+  # ── the result register: pinned dest; else RMW on the dead lhs temp; else the
+  # dead rhs temp (aliasRhs); else a fresh temp ─────────────────────────────────
   var res = dest
   case dest.kind
   of Undef, NeedsReg, RegOrImm:
-    if lDest.kind == InReg and lDest.isTemp: res = lDest
-    elif rDest.kind == InReg and rDest.isTemp and lDest.kind == InReg and
-         ek notin {ShlC, ShrC}:
-      res = rDest
-    else: res = g.takeTmp(g.binResultSlot(resTypeC))
+    if lLoc.kind == InReg and lLoc.isTemp: res = lLoc
+    elif rLoc.kind == InReg and rLoc.isTemp and not isShift and
+         lLoc.kind in {InReg, Imm, NamedStack, Mem}:
+      res = rLoc
+    else: res = g.takeTmp(resSlot)
   else: discard
-  let aliasRhs = res.kind == InReg and rDest.kind == InReg and res.r == rDest.r and
-                 not (lDest.kind == InReg and res.kind == InReg and lDest.r == res.r)
-  if aliasRhs and ek in {ShlC, ShrC}:
-    raiseAssert "arkham: variable shift whose destination aliases the count register"
-  # ── emission (the old emitBin2 body over the freshly decided locations).
-  var resStaging = NoReg
   var rD: Reg
+  var resStaging = NoReg
+  var resMoveOut = false                                 # `res` stands in for a pinned dest
   if res.kind in {NamedStack, Mem}:                      # incl. a takeTmp-dry etmp slot
     resStaging = g.pickStagingSealed("a memory bin result", res.typ)
     rD = resStaging
   else:
     assert res.kind == InReg, "arkham x64n: bin result " & $res.kind
     rD = res.r
-  let reusedLhs = lDest.kind == InReg and lDest.r == rD  # in-place RMW on the left temp
-  let reusedRhs = rDest.kind == InReg and rDest.r == rD  # dest recycled the RHS temp
+    if varShift and rD == g.md.shiftCountReg:
+      # The pinned dest IS the count register: compute beside it, move in after.
+      res = g.takeTmp(resSlot)
+      if res.kind != InReg:
+        resStaging = g.pickStagingSealed("a memory bin result", res.typ)
+        rD = resStaging
+      else:
+        rD = res.r
+        resMoveOut = true
+  let aliasRhs = rLoc.kind == InReg and rLoc.r == rD and
+                 not (lLoc.kind == InReg and lLoc.r == rD)
+  if aliasRhs and isShift:
+    raiseAssert "arkham: variable shift whose destination aliases the count register"
+  let reusedLhs = lLoc.kind == InReg and lLoc.r == rD    # in-place RMW on the left temp
+  let reusedRhs = rLoc.kind == InReg and rLoc.r == rD    # dest recycled the RHS temp
   # A TEMP destination is bound at the type of what LANDS IN IT — the lhs `place2`
   # moves in below — not at the result type. The register only becomes the result's
   # type at `normalizeBinWidth` (the `movzx` after the op), and the retype for that
   # happens down there. Binding it at the result type up front made the lhs move
   # narrowing: `(rebind tmp1 (u 32))` then `(mov tmp1 (i 64)tmp0)`, which nifasm
   # rejects — and rightly, since nothing has converted anything yet.
-  # A dont-care lhs slot is not "no information": it is the `(i 64)` its own temp
-  # is bound as, which is precisely what arrives here.
-  let incoming = (if lDest.kind == InReg: lDest.typ else: res.typ)
+  let incoming = (if lLoc.kind == InReg: lLoc.typ else: res.typ)
   if res.kind == InReg and res.isTemp and not g.rb.isBoundTemp(rD):
     g.bindTemp(rD, incoming)
   if not isPtrType(resolveType(g.prog, resTypeC)):
@@ -2306,37 +2361,24 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
     elif nm.len > 0:
       g.rebindLocalAs(nm, rD, resTypeC)
   let rdSeal = not g.plan.isSealed(rD) and not g.rb.isBoundTemp(rD)
-  if rdSeal: g.plan.seal {rD}
+  if rdSeal: g.plan.seal {rD}                            # the fold's staging picks stay off rD
   if aliasRhs:
-    assert lDest.kind == InReg, "arkham x64n: aliasRhs lhs " & $lDest.kind
-    g.binReg(op, rD, lDest.r)                            # dest := rhs op lhs
+    foldInto(op, rD, lLoc, lhsC, res.typ)                # dest := rhs op lhs
     if op == SubX64:
       g.ab.tree NegX64: g.emReg rD                       # dest := lhs - rhs
   else:
     # `rD` may be a NAMED destination whose type is not ours to change (the retype
-    # above put the result type back on it), while the lhs partial sits in a temp
-    # minted at the dont-care `(i 64)`. Retype the TEMP instead — in Leng both
-    # operands of an integer op already have the node's result type, and a rebind
-    # is zero machine code — so the move below is not a narrowing one. Without it
-    # `(or (u 32) 1 …)` into a `(u 32)` result emitted `(mov result.71 `tmp5.0)`
-    # with `tmp5.0` bound `(i 64)`, which nifasm rejects.
-    if lDest.kind == InReg and lDest.isTemp and lDest.r != rD and
-       g.rb.isBoundTemp(lDest.r) and not g.rb.isBoundTemp(rD) and
-       slotTypeDiffers(g.prog, lDest.typ, resTypeC):
+    # above put the result type back on it), while the lhs sits in a temp minted at
+    # the dont-care `(i 64)`. Retype the TEMP instead — in Leng both operands of an
+    # integer op already have the node's result type, and a rebind is zero machine
+    # code — so the move below is not a narrowing one.
+    if lLoc.kind == InReg and lLoc.isTemp and lLoc.r != rD and
+       g.rb.isBoundTemp(lLoc.r) and not g.rb.isBoundTemp(rD) and
+       slotTypeDiffers(g.prog, lLoc.typ, resTypeC):
       var rtcL = resTypeC
-      g.bindTemp(lDest.r, slotOf(g.prog, rtcL))
-    g.place2(lDest, rD)                                  # dest := lhs
-    case rDest.kind                                      # dest op= rhs
-    of Imm:
-      if rDest.ival < low(int32).int64 or rDest.ival > high(int32).int64:
-        let s = g.pickStagingSealed("a bin imm64", res.typ)
-        g.movImm(s, rDest.ival)
-        g.binReg(op, rD, s)
-        g.giveBack s
-      else: g.binImm(op, rD, rDest.ival)
-    of InReg: g.binReg(op, rD, rDest.r)
-    of NamedStack, Mem: g.binFold(op, rD, rDest, rhsC)   # sub-width field → load+extend
-    else: raiseAssert "arkham x64n: bin rhs " & $rDest.kind
+      g.bindTemp(lLoc.r, slotOf(g.prog, rtcL))
+    g.place2(lLoc, rD)                                   # dest := lhs
+    foldInto(op, rD, rLoc, rhsC, res.typ)                # dest op= rhs
   if not suppressNorm: g.normalizeBinWidth(resTypeC, rD, op)
   # The op ran and the width was normalized, so the register now holds the RESULT.
   # Put the result's type on the temp that was bound at the incoming type above.
@@ -2345,11 +2387,17 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
     var rtc2 = resTypeC
     g.bindTemp(rD, slotOf(g.prog, rtc2))
   if rdSeal: g.plan.unseal {rD}
-  if not reusedRhs: g.freeVal(rDest)                     # freeVal frees only temps
-  if not reusedLhs: g.freeVal(lDest)
+  if rDeferred: g.freeLvalTemps2(rhsC)                   # the deferred fold's picks
+  elif not reusedRhs: g.freeVal(rLoc)                    # freeVal frees only temps
+  if lDeferred: g.freeLvalTemps2(lhsC)
+  elif not reusedLhs: g.freeVal(lLoc)
   if resStaging != NoReg:                                # store the result to its memory home
     g.emitStoreLoc(res, resStaging)
     g.giveBack resStaging
+  if resMoveOut:
+    g.movReg(dest.r, rD)
+    g.freeVal(res)
+    res = dest
   dest = res
 proc settleResultReg(g: var CodeGen; dest: var Location; resReg: Reg) =
   ## FUSED result settling: move/store a value produced in the fixed register

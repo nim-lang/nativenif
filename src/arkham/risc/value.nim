@@ -2000,7 +2000,10 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
   let swap = ek notin {ShlC, ShrC} and (commutativeExpr(ek) or ek == SubC) and
              (g.isFoldableLeaf(lhsC) or lhsMem) and
              not (g.isFoldableLeaf(rhsC) or g.isFoldableMemLeaf(rhsC)) and
-             not (dest.kind == InReg and g.symInReg(lhsC, dest.r))
+             # `exprReadsReg`, not `symInReg`: a lhs MEMORY leaf whose base/index is
+             # the dest (`x = a[x] + (y*2)`) reads it too, and the swap computed the
+             # rhs into `x` before indexing with it (tests/arkham/bin_alias_order).
+             not (dest.kind == InReg and g.exprReadsReg(lhsC, dest.r))
   if swap:
     var acc = dest
     # The accumulator ends up holding the RESULT, so it is bound at the result's
