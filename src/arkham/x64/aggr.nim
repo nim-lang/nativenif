@@ -195,6 +195,7 @@ proc transferAggrWords(g: var CodeGen; varName: string; typeSym: SymId;
   ## only the field at the eightbyte boundary and silently drop the rest. It also
   ## subsumes the old pointer-field `(cast (ptr T) reg)` dance.
   ##
+  ## MODEL: proofs/aggr_marshal.tla, `Algo = "fullword"` — passes ONLY with `Padded = TRUE`.
   ## Reading/writing the WHOLE 8 bytes of a trailing partial eightbyte is sound because
   ## the aggregate's storage is always rounded up to a multiple of 8 (`alignedSize`): the
   ## bytes past the partial are this slot's own padding (the register side's extra high
