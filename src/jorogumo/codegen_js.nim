@@ -95,6 +95,9 @@ type
                                        ## output to a host sink, nim_exit throws, and
                                        ## the surface lands on globalThis.NIF, not
                                        ## module.exports. Default false = Node/CommonJS.
+    callbacks: seq[string]             ## JS wrapper functions bridging a JS callback
+                                       ## call to a Nim proc whose args/result need
+                                       ## the handle/string bridge (emitted at the tail)
 
 type
   JsGenError* = object of CatchableError
@@ -148,21 +151,34 @@ proc isCstringType(g: var JsGen; t: Cursor): bool =
   t.kind == TagLit and t.typeKind == AptrT and
     (let inner = innerType(g.prog, t); inner.kind == TagLit and inner.typeKind == CT)
 
+proc isProctypeType(g: var JsGen; t: Cursor): bool =
+  ## A function type — possibly under one `(ptr …)` layer — where a `ref object`
+  ## handle would otherwise catch it. In a splice a proctype operand is a Nim
+  ## proc handed to a JS API as a callback (rAF, setTimeout, a DOM listener).
+  var r = resolveType(g.prog, t)
+  if r.kind == TagLit and r.typeKind in {PtrT, AptrT}:
+    var inner = r
+    inc inner
+    r = resolveType(g.prog, inner)
+  r.kind == TagLit and r.typeKind == ProctypeT
+
 type
-  JsBridgeKind = enum jbNone, jbString, jbCstring, jbHandle
+  JsBridgeKind = enum jbNone, jbString, jbCstring, jbHandle, jbCallback
 
 proc jsBridgeKind(g: var JsGen; t: Cursor): JsBridgeKind =
   ## How a type crosses an `importjs` splice boundary, in precedence order: a
   ## Nim `string` (decode the SSO struct), a `cstring` (NUL-terminated bytes),
-  ## then any other pointer/ref as a JS HANDLE — an opaque int32 index into the
-  ## host value table (plan §6): a binding declares a JS object (`GPUBuffer`, a
-  ## canvas context, …) as an opaque `ref object`/pointer and touches it only
-  ## through `importjs`, so at the splice it unwraps to the real JS value and a
-  ## pointer result wraps back to a handle. Confined to splices — ordinary Nim
-  ## pointers stay real addresses, because a JS API never takes a linear-memory
-  ## address. Scalars and plain aggregates are jbNone and pass through untouched.
+  ## a proctype (a Nim proc used as a JS callback), then any other pointer/ref as
+  ## a JS HANDLE — an opaque int32 index into the host value table (plan §6): a
+  ## binding declares a JS object (`GPUBuffer`, a canvas context, …) as an opaque
+  ## `ref object`/pointer and touches it only through `importjs`, so at the splice
+  ## it unwraps to the real JS value and a pointer result wraps back to a handle.
+  ## Confined to splices — ordinary Nim pointers stay real addresses, because a JS
+  ## API never takes a linear-memory address. Scalars and plain aggregates are
+  ## jbNone and pass through untouched.
   if isNimStringType(g, t): jbString
   elif isCstringType(g, t): jbCstring
+  elif isProctypeType(g, t): jbCallback
   elif isPtrType(g, t): jbHandle
   else: jbNone
 
@@ -2128,6 +2144,93 @@ proc importjsTemplate(decl: Cursor): string =
         if a.kind == StrLit: result = strVal(a)
       skip p
 
+proc proctypeSig(g: var JsGen; pt: Cursor): (seq[Cursor], Cursor) =
+  ## The parameter types and the return type of a `(proctype NAME PARAMS RET …)`.
+  ## Read-only (`sub`): the cursors point into the caller's stable `decl` and are
+  ## classified later, so nothing here may consume the tree.
+  var params: seq[Cursor]
+  var p = sub(pt)
+  skip p                                     # NAME
+  if p.kind == TagLit and p.typeKind == ParamsT:
+    var pp = sub(p)                          # each `(param NAME PRAGMAS TYPE …)`
+    while pp.hasMore:
+      var q = sub(pp)
+      skip q                                 # NAME
+      skip q                                 # PRAGMAS
+      params.add q                           # TYPE
+      skip pp
+  skip p                                     # past PARAMS (a tag or a DotToken)
+  (params, p)                                # p is now the RET child
+
+proc operandProcSym(g: var JsGen; t: Cursor): string =
+  ## The proc symbol a callback operand names: a bare proc Symbol, or one under
+  ## `(addr …)`/`(haddr …)`. Empty when it is not a direct proc reference — a
+  ## stored fn-ptr or a closure literal — which a bridged wrapper cannot target.
+  var c = t
+  while c.kind == TagLit and c.exprKind in {AddrC, HaddrC}:
+    inc c
+  if c.kind == Symbol and lookupSym(typeCtx(g), symName(c)).cat == scProc:
+    result = symName(c)
+
+proc callbackBridge(g: var JsGen; t: Cursor; pt: Cursor) =
+  ## Emit a JS callable for a Nim proc used as an `importjs` callback (rAF,
+  ## setTimeout, a DOM listener). The JS host calls it with plain JS values; we
+  ## bridge each argument and the result by kind and invoke the Nim proc, which
+  ## jorogumo emits as an ordinary JS function taking its declared parameters.
+  ## A proc whose signature is all-scalar with a void/scalar result is already
+  ## JS-callable, so it passes through as the table entry `FTAB[i]`; anything
+  ## needing a handle/string bridge gets a generated wrapper around it.
+  let (ptypes, ret) = proctypeSig(g, pt)
+  var argExprs: seq[string] = @[]
+  var bridged = false
+  for i, pty in ptypes:
+    let a = "a[" & $i & "]"
+    case jsBridgeKind(g, pty)
+    of jbNone:
+      if isAggType(g, pty):
+        err g, "a JS callback parameter cannot be an aggregate struct"
+      argExprs.add a
+    of jbHandle:  argExprs.add "ewrap(" & a & ")"; bridged = true
+    of jbString:  argExprs.add "jsToNimStr(" & a & ")"; bridged = true
+    of jbCstring: argExprs.add "jsToCstr(" & a & ")"; bridged = true
+    of jbCallback: err g, "a JS callback cannot take a Nim callback parameter"
+  var retBridge = ""
+  case jsBridgeKind(g, ret)
+  of jbNone:
+    if not ret.cursorIsNil and ret.kind != DotToken and isAggType(g, ret):
+      err g, "a JS callback cannot return an aggregate struct"
+  of jbHandle:  retBridge = "eunwrap"; bridged = true
+  of jbString:  retBridge = "nimStrToJs"; bridged = true
+  of jbCstring: retBridge = "cstrToJs"; bridged = true
+  of jbCallback: err g, "a JS callback cannot return a Nim callback"
+
+  if not bridged:
+    # Already JS-callable: hand over the function the table holds. Works for a
+    # symbol or a stored fn-ptr — the index is whatever the operand evaluates to.
+    g.outp.openTree Index
+    g.outp.ident "FTAB"
+    genExpr(g, t)
+    g.outp.closeTag
+    return
+  # A wrapper bridges the JS call to the Nim proc. The target must be a named
+  # proc (its slot is baked in); a capturing closure is out of reach because
+  # jorogumo carries no environment.
+  let sym = operandProcSym(g, t)
+  if sym.len == 0:
+    err g, "a bridged JS callback must name a Nim proc directly (a stored fn-ptr " &
+           "or a capturing closure cannot be bridged here)"
+  var found = false
+  let cdecl = procDeclOf(g, sym, found)
+  if not found: err g, "unknown callback proc: " & sym
+  ensureProc(g, sym, cdecl)
+  let w = "__cb" & $g.callbacks.len
+  var call = jsName(g, sym) & "(" & argExprs.join(", ") & ")"
+  if retBridge.len > 0: call = retBridge & "(" & call & ")"
+  # Rest args so the JS host may pass more (rAF's timestamp) than the Nim proc
+  # declares; the extras are simply not forwarded.
+  g.callbacks.add "function " & w & "(...a) { return " & call & "; }\n"
+  g.outp.ident w
+
 proc genCallArgs(g: var JsGen; decl: Cursor; t: var Cursor; splice = false) =
   ## Emit each argument from `t`, moved to the width `decl`'s parameter declares
   ## (aggregates travel as the address of a copy). A varargs tail past the
@@ -2147,11 +2250,22 @@ proc genCallArgs(g: var JsGen; decl: Cursor; t: var Cursor; splice = false) =
         var w = wU32
         var agg = false
         var bk = jbNone
+        var ptq: Cursor                      # the proctype of a callback parameter
         q.into:
           inc q                              # name
           skip q                             # pragmas
           agg = isAggType(g, q)
-          if splice: bk = jsBridgeKind(g, q)
+          if splice:
+            bk = jsBridgeKind(g, q)
+            if bk == jbCallback:
+              # The declared type may be a named alias or a `ptr proctype`;
+              # resolve both layers to the signature itself (calleeProctype's
+              # rule) so `proctypeSig` enters a TagLit.
+              ptq = resolveType(g.prog, q)
+              if ptq.kind == TagLit and ptq.typeKind != ProctypeT:
+                var inner = ptq
+                inc inner
+                ptq = resolveType(g.prog, inner)
           if not agg: w = widthOf(g, q)
           while q.hasMore: skip q
         skip p
@@ -2171,6 +2285,8 @@ proc genCallArgs(g: var JsGen; decl: Cursor; t: var Cursor; splice = false) =
             g.outp.openTree EUnwrap
             g.genExprCoerced(t, w)
             g.outp.closeTag
+          of jbCallback:                     # Nim proc -> a JS callable
+            callbackBridge(g, t, ptq)
           of jbNone:
             let (csz, _) = aggArgDestSize(g, t)
             if csz > 0: genAggArg(g, t, csz)
@@ -2290,6 +2406,11 @@ proc genCallFrom(g: var JsGen; t: var Cursor; wantValue: bool) =
       of jbHandle:
         g.outp.openTree EWrap
       of jbNone: discard
+      of jbCallback:
+        # A splice handing a JS function back to Nim would need the reverse
+        # bridge (a JS callable stored as an FTAB-shaped value); nothing needs
+        # it yet, and a silent no-wrap would miscompile. Refuse, per the rule.
+        err g, "an importjs splice cannot yet return a Nim callback"
       g.outp.openTree Raw
       g.outp.ident nm
       g.outp.strLit importjsTemplate(decl)
@@ -3269,6 +3390,12 @@ proc generateJs*(buf: var TokenBuf; inputPath: string; tags: TagPool;
 
   result = jsPreamble(memBytes, stackBytes, int g.memTop, browser) & dataInitJs(g)
   result.add genJs(g.outp)
+  # JS wrappers bridging Nim procs used as `importjs` callbacks (see
+  # `callbackBridge`); all-scalar procs need none and pass through as FTAB
+  # entries, so this is often empty. Function declarations, hoisted like the
+  # lowered procs they call.
+  for cb in g.callbacks:
+    result.add cb
   result.add "FTAB[0] = () => { throw new Error(\"nil function pointer\"); };\n"
   for slot in 1 ..< g.tableEntries.len:
     let sym = g.tableEntries[slot]
