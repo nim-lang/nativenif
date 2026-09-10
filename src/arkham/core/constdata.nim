@@ -280,6 +280,46 @@ proc constToBytes*(p: var Program; typ, val: Cursor; buf: var string;
           inc fi
           off += fsz
     while (buf.len - startLen) < align(off, maxAl): buf.add '\0'  # tail padding
+  of UnionT:
+    # A union CONSTANT names at most one member — `defaultvalues` skips the
+    # siblings on purpose, because members share storage and a second designated
+    # initializer would zero the first back out. So: emit the named member's
+    # bytes at offset 0 and zero-fill to the union's size.
+    #
+    # Reached by any global of a `{.union.}` type, `std/posix/io_uring`'s `Sqe`
+    # being the case in hand: `var s = default(Sqe)` is a gvar whose initializer
+    # is one of these, and without this arm arkham refused the module outright.
+    let startLen = buf.len
+    let (usz, _) = typeSizeAlign(p, rt)
+    var vals: seq[Cursor] = @[]
+    var vc = val
+    vc.into:
+      skip vc                                # the constructed type
+      while vc.hasMore:
+        vc.into:                             # (kv field value)
+          inc vc                             # skip field name (atom → no pool)
+          vals.add vc
+          while vc.hasMore: skip vc
+    if vals.len > 0:
+      # The member's own type, found positionally like the object arm does. A
+      # union constant that names a LATER member than the first still writes at
+      # offset 0 — members overlap — so only the type has to be the right one.
+      var mc = rt
+      var mi = 0
+      var memberType = default(Cursor)
+      mc.into:
+        while mc.hasMore:
+          if mi == 0 and mc.kind == TagLit and mc.substructureKind == FldU:
+            var f = mc
+            f.into:
+              inc f; skip f                  # name, field pragmas
+              memberType = f
+              while f.hasMore: skip f
+            inc mi
+          skip mc
+      if memberType != default(Cursor):
+        constToBytes(p, memberType, vals[0], buf, relocs)
+    while (buf.len - startLen) < usz: buf.add '\0'
   else:
     raiseAssert "arkham const: unsupported const type " & $rt.typeKind
 

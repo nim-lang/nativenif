@@ -1268,6 +1268,48 @@ proc constrFieldStores*(g: var CodeGen; c: Cursor; base: Location) =
     base = regLoc(loaded, AddrSlot)
   var tc = c; inc tc                                    # the constructed type symbol
   let typeSym = tc.symId
+  # A UNION constructor is the one that is NOT total, and this is where that has
+  # to be paid for.
+  #
+  # `(oconstr T …)` names every field of an object — that is what lets this back
+  # end store exactly what is listed and zero nothing — but a union's members
+  # share storage, so `doc/tags.md` makes it the stated exception: only the
+  # ACTIVE member is named. `hexer/defaultvalues` names NONE for a default, so
+  # `default(T)` left a union holding whatever the storage held. The C back end
+  # never noticed, because a designated initializer zeroes what it does not
+  # mention.
+  #
+  # `std/posix/io_uring`'s SQE is the case that found it: `getSqe` does
+  # `result[] = default(Sqe)`, the `opFlags` union kept stale bytes, and the
+  # kernel answered EINVAL to every submission after the first.
+  #
+  # It goes HERE and not at the field store, even though that is where the union
+  # lands: an aggregate constructor is first built into a temp and then copied,
+  # so zeroing the destination is undone by the copy — the temp is the thing
+  # nobody wrote. `constrFieldStores` is the one routine that builds either.
+  #
+  # The whole extent, not the widest member: members overlap at offset 0, but
+  # the widest is not always a scalar (`InnerSqeCmd`'s is `array[2, uint64]`),
+  # so "store a zero into the biggest one" does not generalize. Whatever member
+  # the constructor names is stored on top, below.
+  if typeSymIsUnion(g.prog, typeSym):
+    let un = aggrByteSize(g.prog, typeSym)
+    if un > 0:
+      let up = g.pickStagingSealed("a union constructor base", AddrSlot)
+      case base.kind
+      of NamedStack: g.emAggrHomeAddr(up, base.name)
+      of InReg:      g.movReg(up, base.r)
+      of Glob, Tvar: g.emSymAddr(up, base)
+      of Mem:
+        g.ab.tree LeaX64:
+          g.emReg up
+          g.ab.tree MemX: g.emLvalAddr2(base.cur)
+      else: raiseAssert "arkham x64n: bad union oconstr base " & $base.kind
+      let uz = g.pickStagingSealed("a union constructor zero", ScalarSlot, avoid = up)
+      g.movImm(uz, 0)
+      g.emZeroBytesThroughPtr(up, uz, un)
+      g.giveBack uz
+      g.giveBack up
   var cc = c
   cc.into:
     skip cc                                             # the constructed type
@@ -2393,6 +2435,24 @@ proc emitDivMod2(g: var CodeGen; c: Cursor; dest: var Location) =
     dvsStaging = g.pickStagingSealed("an idiv divisor", dvsLoc.typ)
     g.emitLoadLoc(dvsLoc, dvsStaging)
     dvsLoc = regLoc(dvsStaging, dvsLoc.typ)
+  # `idiv`/`div` WRITE rdx:rax, and nifasm spells those operands as the RAW
+  # `(rdx)`/`(rax)` tags — it rejects a symbol there. Its `checkFixedRegFree`
+  # then refuses a raw fixed-register operand while a binding is live on it, and
+  # rightly: for any other instruction that clobber would destroy the named
+  # value in silence, which is the bug class the check exists for.
+  #
+  # Here it is not a clobber of something else. The value in rax IS the dividend
+  # and the instruction turns it into the quotient — the same register, the same
+  # live value, renamed by the operation. So surrender the name across the
+  # instruction and let `settleResultReg` re-establish one on the result.
+  #
+  # `(dividend - x) div y` chained off a previous division is the shape that
+  # reaches it: the earlier quotient stays in rax, the subtraction runs in place
+  # there, and the next `idiv` finds its own input still bound.
+  # `std/times.civilFromDays` — five divisions of one running value — is the
+  # case in hand, which is every `Date:` header a server writes.
+  g.dropStaleBinding(g.md.intRetReg)
+  g.dropStaleBinding(g.md.divRemReg)
   let op = if signed: IdivX64 else: DivX64
   g.ab.tree op:
     g.ab.rawReg g.md.divRemReg                             # (rdx): high half / remainder
@@ -3422,6 +3482,33 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
   if not tgt.declarative:
     # ── Manual-marshalling path (empty signature: float params/results, ≤16B
     # by-value aggregate results). Args go straight into raw ABI registers.
+    #
+    # Raw registers are ALL this path can reach. An outgoing stack argument is
+    # placed and sized by nifasm from the callee's declared signature — that is
+    # what `(mem (rsp) (arg pN))` means and what `scanStackArgArea` reserves the
+    # frame region from — and a manual-path target has no signature by
+    # definition, so there is neither a slot to write nor a reservation to write
+    # it in.
+    #
+    # Without this check `gprAt(pl)` read `intArgRegs[gpFirst]` for a
+    # stack-passed place, whose `gpFirst` is still 0: the seventh argument was
+    # marshalled into rdi, on top of the first. `sink7(1,2,3,4,5,6,7, 0.0)` —
+    # seven integers plus one float, the float being what forces this path —
+    # returned 1654327 instead of 7654321. Silently, on linux/amd64, from
+    # ordinary source.
+    #
+    # The real fix is upstream of here: `isDeclarativeAbi` refuses float
+    # params/results because the typed signature cannot yet express them, and
+    # modelling them would put this call back on the declarative path where
+    # stack arguments already work. Until then, refusing is the whole of what
+    # arkham can honestly do — a diagnosis beats a wrong number.
+    if plan.hasStackArgs:
+      quit "arkham x64: call to `" & tgt.asmName & "` needs an outgoing stack " &
+           "argument, but its signature is not declarative (a float parameter " &
+           "or result, or a <=16B by-value aggregate result), so nifasm cannot " &
+           "place one. Pass at most " & $amd.intArgRegs.len &
+           " integer/pointer arguments to such a proc, or group the extra ones " &
+           "into an object."
     var sealedArgs: set[Reg] = {}
     var pendingRestores: seq[tuple[dst, src: Reg]] = @[]
     if resultByRef: (g.rb.sealAccum amd.intArgRegs[0]; sealedArgs.incl amd.intArgRegs[0])

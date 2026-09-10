@@ -139,10 +139,13 @@ proc genType*(g: var CodeGen; name: string; decl: Cursor) =
   var c = decl
   c.into:                                     # (type SymbolDef TypePragmas body)
     inc c                                     # name
+    let packed = pragmasArePacked(c)
     skip c                                    # TypePragmas (one slot: `.` or (pragmas …))
     g.ab.tree TypeD:
       g.ab.symDef name
-      g.genTypeBody(c)
+      # See the x64 twin: `{.packed.}` is on the declaration and nifasm only
+      # sees the body, so it travels as the body's first child.
+      g.genTypeBody(c, packed)
 
 proc genGlobal*(g: var CodeGen; nifName: string; decl: Cursor) =
   ## Emit a top-level `const`/`gvar`. A true `const` with a value becomes a

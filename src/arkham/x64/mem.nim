@@ -104,6 +104,34 @@ proc fcvtF2I*(g: var CodeGen; d: Reg; s: FReg; bits: int) =         # cvttss2si/
   g.ab.tree op: g.emReg d; g.emFReg s
 
 proc movImm*(g: var CodeGen; d: Reg; v: int64) =
+  ## THE immediate→reg move, and `movReg`'s sibling in the one respect that
+  ## matters: where the value and the destination's declared type disagree, the
+  ## move is a REINTERPRETATION and has to say so with a `(cast …)`.
+  ##
+  ## Leng and asm-NIF are type-checked end to end, so a cast cannot simply
+  ## disappear on the way to an instruction. A bare `(mov ptrreg -1)` is
+  ## indistinguishable from a code generator's stale register binding — which is
+  ## precisely the bug class nifasm's `checkPtrStore` exists to catch, and why it
+  ## admits only `0`/`(nil)` into a pointer-typed destination. Spelling the cast
+  ## out is how a DELIBERATE non-zero pointer literal opts out:
+  ## `cast[pointer](0xffff_ffff_ffff_ffff'u64)` — io_uring's cancel sentinel,
+  ## mmap's `MAP_FAILED`.
+  ##
+  ## The a64 twin has done this since 075b051 (`risc/mem.placeImmTyped`); this
+  ## side never got one, so the same source compiled on one target and was
+  ## rejected on the other. It lives here rather than in a typed wrapper because
+  ## `emitValue2`'s literal arm reaches `movImm` directly — a wrapper only the
+  ## callers that remembered it would use.
+  ##
+  ## `0` is left alone: it is a legal pointer value under the rule above, and
+  ## wrapping it would churn every null store in the program.
+  if v != 0:
+    var dt = g.bindTypeOf(d)
+    if not cursorIsNil(dt) and isPtrType(resolveType(g.prog, dt)):
+      g.ab.tree MovX64:
+        g.emReg d
+        g.ab.tree CastX: (g.genTypeBody(dt); g.ab.intLit v)
+      return
   g.ab.tree MovX64: g.emReg d; g.ab.intLit v
 
 proc movReg*(g: var CodeGen; d, s: Reg) =
@@ -542,7 +570,6 @@ proc placeImm*(g: var CodeGen; dest: Reg; loc: Location) =
   if isNilImm(loc):
     g.ab.tree MovX64: (g.emReg dest; g.ab.nilValue())
   else: g.movImm(dest, loc.ival)
-
 proc normalizeBinWidth*(g: var CodeGen; resTypeC: Cursor; rD: Reg; op: X64Inst) =
   ## arkham keeps register values canonically sign/zero-extended to their full
   ## 64-bit form. `add`/`sub`/`mul`/`shl` on a sub-64-bit type can leave nonzero
@@ -1004,6 +1031,35 @@ proc emWordThroughPtr*(g: var CodeGen; p: Reg; idx: int) =
         g.ab.aptrType: g.ab.uintType(64)
         g.emReg p
       g.ab.intLit idx.int64
+
+proc emZeroBytesThroughPtr*(g: var CodeGen; p, z: Reg; n: int) =
+  ## Write `n` zero bytes at `[p]`; `z` holds 0.
+  ##
+  ## Straight-line and widest-first (8/4/2/1), with an IMMEDIATE index at each
+  ## width, so it needs no counter register and no loop — the sizes this serves
+  ## are a union's, which are a handful of bytes. Each store types its own
+  ## operand (`(aptr (u W))`), which is what tells nifasm the access width; the
+  ## index is scaled by that width, and the offset is always a multiple of it
+  ## because the wider stores go first.
+  var off = 0
+  var rem = n
+  template zstore(bits, idx: int) =
+    g.ab.tree MovX64:
+      g.ab.tree MemX:
+        g.ab.tree AtX:
+          g.ab.tree CastX:
+            g.ab.aptrType: g.ab.uintType(bits)
+            g.emReg p
+          g.ab.intLit idx.int64
+      g.emReg z
+  while rem >= 8:
+    zstore(64, off div 8); off += 8; rem -= 8
+  if rem >= 4:
+    zstore(32, off div 4); off += 4; rem -= 4
+  if rem >= 2:
+    zstore(16, off div 2); off += 2; rem -= 2
+  if rem >= 1:
+    zstore(8, off); off += 1; rem -= 1
 
 proc emPtrElemMem*(g: var CodeGen; p: Reg; elemTy: Cursor; idx: int) =
   ## `(mem (at (cast (aptr ElemTy) p) idx))` — element `idx` of an array whose first

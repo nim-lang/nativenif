@@ -244,10 +244,15 @@ proc genType*(g: var CodeGen; name: string; decl: Cursor) =
   var c = decl
   c.into:
     inc c                                     # name
+    let packed = pragmasArePacked(c)
     skip c                                    # type-pragmas
     g.ab.tree TypeD:
       g.ab.symDef name
-      g.genTypeBody(c)
+      # `{.packed.}` rides on the DECLARATION in Leng and has to reach nifasm,
+      # which only ever sees the body — so it is emitted INTO the body, as its
+      # first child. nifasm and arkham then compute one layout from one fact
+      # instead of two from none; see `programs.pragmasArePacked`.
+      g.genTypeBody(c, packed)
 
 proc numIncomingArgRegs(g: var CodeGen; decl: Cursor): int =
   ## How many leading integer arg registers carry incoming values: a hidden

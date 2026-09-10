@@ -555,6 +555,7 @@ type
     ObjectT = (ord(ObjectTagId), "object")  ## object type definition
     UnionT = (ord(UnionTagId), "union")  ## union type definition
     FldT = (ord(FldTagId), "fld")  ## field definition
+    PackedT = (ord(PackedTagId), "packed")  ## first child of an `(object ...)` / `(union ...)`: lay it out with NO padding — every field at the running byte sum, alignment 1, no tail padding. The C `__attribute__((packed))` / Nim `{.packed.}` layout. Absent means natural alignment
     CT = (ord(CTagId), "c")  ## character type of N bits
     VoidT = (ord(VoidTagId), "void")  ## void type
     VarargsT = (ord(VarargsTagId), "varargs")  ## C varargs marker type
@@ -564,7 +565,7 @@ type
     ProctypeT = (ord(ProctypeTagId), "proctype")  ## procedure (function pointer) type
 
 proc rawTagIsNifasmType*(raw: TagEnum): bool {.inline.} =
-  raw in {BoolTagId, NilTagId, ITagId, UTagId, FTagId, PtrTagId, AptrTagId, ArrayTagId, ObjectTagId, UnionTagId, FldTagId, CTagId, VoidTagId, VarargsTagId, FlexarrayTagId, EnumTagId, EfldTagId, ProctypeTagId}
+  raw in {BoolTagId, NilTagId, ITagId, UTagId, FTagId, PtrTagId, AptrTagId, ArrayTagId, ObjectTagId, UnionTagId, FldTagId, PackedTagId, CTagId, VoidTagId, VarargsTagId, FlexarrayTagId, EnumTagId, EfldTagId, ProctypeTagId}
 
 type
   NifasmDecl* = enum
