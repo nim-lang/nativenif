@@ -531,11 +531,89 @@ proc emAggrFieldMem*(g: var CodeGen; base, field: string) =
     if g.varType.hasKey(base): g.emFieldMem(base, field)
     else: raiseAssert "arkham x64 v0: aggregate base neither stack nor pointer: " & base
 
+proc emSizedThruPtr(g: var CodeGen; p: Reg; bits, idx: int) =
+  ## `(mem (at (cast (aptr (u bits)) p) idx))` — a `bits`-wide access at
+  ## `[p + idx*bits/8]`. The sized twin of `emWordThroughPtr`.
+  g.ab.tree MemX:
+    g.ab.tree AtX:
+      g.ab.tree CastX:
+        g.ab.aptrType: g.ab.uintType(bits)
+        g.emReg p
+      g.ab.intLit idx.int64
+
+proc loadPartialThroughPtr*(g: var CodeGen; dst, p: Reg; base, nbytes: int) =
+  ## `dst` ← the `nbytes` (1..7) bytes at `[p + base]`, zero-extended and packed
+  ## low-to-high, assembled from the widest accesses that stay inside them.
+  ##
+  ## A trailing partial eightbyte used to be read as the FIELD sitting at its
+  ## offset, which carries only that field: `{enum; char}` marshalled its `enum`
+  ## and dropped the `char`, so a two-byte object passed by value arrived with a
+  ## garbage second byte. (`transferAggrWords` already learned this lesson — see
+  ## its comment — but it reads a named STACK SLOT, whose storage is padded to a
+  ## multiple of 8, and so may read the whole eightbyte. Here `p` is an arbitrary
+  ## address: the last element of a `seq[Alph]` with `Alph` two bytes wide sits
+  ## two bytes from the end of its allocation, so the read has to stay inside the
+  ## object.)
+  var off = base
+  var rem = nbytes
+  var first = true
+  var scratch = NoReg
+  template step(bits: int) =
+    let width = bits div 8
+    while rem >= width:
+      let shiftBits = int64((off - base) * 8)
+      if first:
+        g.ab.tree MovX64: (g.emReg dst; g.emSizedThruPtr(p, bits, off div width))
+        g.extendTo(dst, bits, signed = false)
+        first = false
+      else:
+        if scratch == NoReg:
+          scratch = g.pickStagingSealed("a partial aggregate word", addrSlot())
+        g.ab.tree MovX64: (g.emReg scratch; g.emSizedThruPtr(p, bits, off div width))
+        g.extendTo(scratch, bits, signed = false)
+        g.binImm(ShlX64, scratch, shiftBits)
+        g.binReg(OrX64, dst, scratch)
+      off += width
+      rem -= width
+  step(32)
+  step(16)
+  step(8)
+  if scratch != NoReg: g.giveBack scratch
+
+proc storePartialThroughPtr*(g: var CodeGen; p, src: Reg; base, nbytes: int) =
+  ## The `nbytes` (1..7) low bytes of `src` → `[p + base]`, widest access first.
+  ## The mirror of `loadPartialThroughPtr`, and buggy in the same way before:
+  ## storing through the field at the offset wrote one field and left the rest of
+  ## the partial eightbyte holding whatever was there. Only `nbytes` bytes are
+  ## written — the object may end there.
+  var off = base
+  var rem = nbytes
+  var scratch = NoReg
+  template step(bits: int) =
+    let width = bits div 8
+    while rem >= width:
+      let shiftBits = int64((off - base) * 8)
+      var srcReg = src
+      if shiftBits != 0:
+        if scratch == NoReg:
+          scratch = g.pickStagingSealed("a partial aggregate word", addrSlot())
+        g.movReg(scratch, src)
+        g.binImm(ShrX64, scratch, shiftBits)
+        srcReg = scratch
+      g.ab.tree MovX64: (g.emSizedThruPtr(p, bits, off div width); g.emReg srcReg)
+      off += width
+      rem -= width
+  step(32)
+  step(16)
+  step(8)
+  if scratch != NoReg: g.giveBack scratch
+
 proc globalToRegs*(g: var CodeGen; name: string; typeSym: SymId; regs: openArray[Reg]) =
   ## Read a GLOBAL aggregate's words into the by-value ABI arg GPRs `regs[i] ← word i`.
   ## The global is RIP-relative (no stack slot), so its address goes into the staging
   ## bridge and each word is read through that pointer — a FULL eightbyte as a raw
-  ## `(u 64)` word (handles packed fields), a trailing PARTIAL eightbyte field-typed.
+  ## `(u 64)` word (handles packed fields), a trailing PARTIAL through
+  ## `loadPartialThroughPtr`.
   ## The read-side twin of `regsToStructThroughPtr`, for a global passed by value as a
   ## call argument (`equalStrings(s, "")` where `s` is a global `string`).
   let p = g.pickStagingSealed("a global aggregate call-arg address", AddrSlot)
@@ -545,8 +623,7 @@ proc globalToRegs*(g: var CodeGen; name: string; typeSym: SymId; regs: openArray
     if byteSize - i * 8 >= 8:
       g.ab.tree MovX64: (g.emReg regs[i]; g.emWordThroughPtr(p, i))
     else:
-      let fn = fieldAtOffset(aggrLayout(g.prog, typeSym), i * 8)
-      g.ab.tree MovX64: (g.emReg regs[i]; g.emPtrFieldMem(p, typeSym, fn))
+      g.loadPartialThroughPtr(regs[i], p, i * 8, byteSize - i * 8)
   g.giveBack p
 
 proc tvarToRegs*(g: var CodeGen; name: string; typeSym: SymId; regs: openArray[Reg]) =
@@ -560,8 +637,7 @@ proc tvarToRegs*(g: var CodeGen; name: string; typeSym: SymId; regs: openArray[R
     if byteSize - i * 8 >= 8:
       g.ab.tree MovX64: (g.emReg regs[i]; g.emWordThroughPtr(p, i))
     else:
-      let fn = fieldAtOffset(aggrLayout(g.prog, typeSym), i * 8)
-      g.ab.tree MovX64: (g.emReg regs[i]; g.emPtrFieldMem(p, typeSym, fn))
+      g.loadPartialThroughPtr(regs[i], p, i * 8, byteSize - i * 8)
   g.giveBack p
 
 proc placeImm*(g: var CodeGen; dest: Reg; loc: Location) =
@@ -1079,8 +1155,8 @@ proc regsToStructThroughPtr*(g: var CodeGen; ptrReg: Reg; typeSym: SymId;
                             regs: openArray[Reg]) =
   ## `[ptrReg] ← regs` — marshal a ≤16B aggregate held in `regs` (the by-value ABI
   ## return registers rax:rdx) into the memory `ptrReg` points at. A FULL eightbyte is
-  ## a raw `(u 64)` word (handles packed fields); a trailing PARTIAL eightbyte (a
-  ## single sub-word field) uses the field-typed access. The through-pointer twin of
+  ## a raw `(u 64)` word (handles packed fields); a trailing PARTIAL eightbyte goes
+  ## through `storePartialThroughPtr`. The through-pointer twin of
   ## `regsToStruct` (which addresses a named stack slot) — used to store an aggregate
   ## call result into a global.
   let byteSize = aggrByteSize(g.prog, typeSym)
@@ -1088,22 +1164,20 @@ proc regsToStructThroughPtr*(g: var CodeGen; ptrReg: Reg; typeSym: SymId;
     if byteSize - i * 8 >= 8:
       g.ab.tree MovX64: (g.emWordThroughPtr(ptrReg, i); g.emReg regs[i])
     else:
-      let fn = fieldAtOffset(aggrLayout(g.prog, typeSym), i * 8)
-      g.ab.tree MovX64: (g.emPtrFieldMem(ptrReg, typeSym, fn); g.emReg regs[i])
+      g.storePartialThroughPtr(ptrReg, regs[i], i * 8, byteSize - i * 8)
 
 proc marshalAggrFromAddr*(g: var CodeGen; addrReg: Reg; typeSym: SymId;
                          regs: openArray[Reg]) =
   ## `regs ← [addrReg]` — load a ≤16B aggregate at `[addrReg]` into the by-value ABI
-  ## argument registers (a FULL eightbyte as a raw `(u 64)` word, a trailing PARTIAL via
-  ## the field-typed access). The reverse of `regsToStructThroughPtr`; lets an aggregate
+  ## argument registers (a FULL eightbyte as a raw `(u 64)` word, a trailing PARTIAL
+  ## through `loadPartialThroughPtr`). The reverse of `regsToStructThroughPtr`; lets an aggregate
   ## CALL ARGUMENT marshal straight from its address (`aggrAddrInto`) with no copy temp.
   let byteSize = aggrByteSize(g.prog, typeSym)
   for i in 0 ..< aggrWordCount(g.prog, typeSym):
     if byteSize - i * 8 >= 8:
       g.ab.tree MovX64: (g.emReg regs[i]; g.emWordThroughPtr(addrReg, i))
     else:
-      let fn = fieldAtOffset(aggrLayout(g.prog, typeSym), i * 8)
-      g.ab.tree MovX64: (g.emReg regs[i]; g.emPtrFieldMem(addrReg, typeSym, fn))
+      g.loadPartialThroughPtr(regs[i], addrReg, i * 8, byteSize - i * 8)
 
 proc emLvalFieldMem*(g: var CodeGen; lhs: Cursor; field: string) =
   ## `(mem (dot <lvalue address> field))` — a field within the aggregate addressed by

@@ -19,6 +19,14 @@
     (u 8))
    (fld :z.0 .
     (u 8))))
+ (type :ThreeArr3.0 .
+  (array Three.0 3))
+ (type :Two.0 .
+  (object .
+   (fld :k.0 .
+    (u 8))
+   (fld :v.0 .
+    (u 8))))
  (gvar :guard.0 .
   (u 64)7777)
  (gvar :gpacked.0 . Packed12.0 .)
@@ -107,6 +115,20 @@
      (kv y.0 5)
      (kv z.0 6)))
    (ret r.0)))
+ (proc :sumTwo.0
+  (params
+   (param :t.0 . Two.0))
+  (i 64).
+  (stmts
+   (ret
+    (add
+     (i 64)
+     (conv
+      (i 64)
+      (dot t.0 k.0))
+     (conv
+      (i 64)
+      (dot t.0 v.0))))))
  (proc :main.0
   (params)
   (i 32)
@@ -153,4 +175,52 @@
      (neq guard.0 7777)
      (stmts
       (call exit.0 15))))
+   (var :tarr.0 . ThreeArr3.0
+    (aconstr ThreeArr3.0
+     (oconstr Three.0
+      (kv x.0 1)
+      (kv y.0 2)
+      (kv z.0 3))
+     (oconstr Three.0
+      (kv x.0 4)
+      (kv y.0 5)
+      (kv z.0 6))
+     (oconstr Three.0
+      (kv x.0 7)
+      (kv y.0 8)
+      (kv z.0 9))))
+   (var :idx.0 .
+    (i 64)2)
+   (if
+    (elif
+     (neq
+      (call sumThree.0
+       (at tarr.0 idx.0))24)
+     (stmts
+      (call exit.0 16))))
+   (var :tp.0 .
+    (ptr Three.0)
+    (addr
+     (at tarr.0 idx.0)))
+   (if
+    (elif
+     (neq
+      (call sumThree.0
+       (deref tp.0))24)
+     (stmts
+      (call exit.0 17))))
+   (var :two.0 . Two.0
+    (oconstr Two.0
+     (kv k.0 30)
+     (kv v.0 12)))
+   (var :twop.0 .
+    (ptr Two.0)
+    (addr two.0))
+   (if
+    (elif
+     (neq
+      (call sumTwo.0
+       (deref twop.0))42)
+     (stmts
+      (call exit.0 18))))
    (call exit.0 42))))
