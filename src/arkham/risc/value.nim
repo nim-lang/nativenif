@@ -1975,6 +1975,34 @@ proc emitModPow2(g: var CodeGen; c, resTypeC, lhsC: Cursor; k: int;
   g.binImm(AndA64, rD, (1'i64 shl k) - 1)
   dest = acc
 
+# ── emitBin2's / emitScalarCmp's operand-side helpers ────────────────────────
+proc leafLoc(g: var CodeGen; cur: Cursor; isMem, deferOk: bool; deferred: var bool): Location =
+  ## A leaf's location (the x86-64 twin's `leafLoc`). A memory leaf is DEFERRED
+  ## when `deferOk` allows: its embedded base/index values are picked now
+  ## (`emitLvalue2`), the access itself folds through a bridge in the consuming
+  ## instruction, and `freeLvalTemps2` releases the picks after. Otherwise the
+  ## leaf resolves through `emitValue2` with a dont-care destination: an
+  ## immediate stays an `Imm`, a symbol is its home, a memory leaf is loaded.
+  result = dontCare
+  if isMem and deferOk:
+    g.emitLvalue2(cur)
+    result = memLoc(cur, ScalarSlot)
+    deferred = true
+  else:
+    g.emitValue2(cur, result)
+
+proc cmpBridgeSlot(g: var CodeGen; loc: Location; opC: Cursor): AsmSlot =
+  ## The slot a compare operand's bridge is typed at: a pointer operand keeps its
+  ## pointer type (nifasm checks the binding), anything else the location's own.
+  if isPtrType(resolveType(g.prog, g.getType(opC))): g.exprSlot(opC)
+  else: loc.typ
+
+proc placeCmpOperand(g: var CodeGen; loc: Location; opC: Cursor; bridge: Reg) =
+  ## Materialize a compare operand into its bridge; an immediate is typed by the
+  ## operand's own type so a pointer-typed literal binds as a pointer.
+  if loc.kind == Imm: g.placeImmTyped(bridge, loc, g.getType(opC))
+  else: g.place2(loc, bridge)
+
 proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED a64 binary-arith: the shared allocBin policy decided inline
   ## (Sethi–Ullman swap, dest passthrough, rhs recycling, aliasRhs), emitted
@@ -2021,12 +2049,8 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
     # local's home whose declared type is not the type of the value now landing
     # in it (an integer computed into a `(ptr …)` local under an enclosing cast).
     g.retypeBinDest(rD, resTypeC, inheritedOperand = false)
-    var lLoc = dontCare                                  # the leaf lhs: its natural place
-    if lhsMem:
-      g.emitLvalue2(lhsC)                                # pick embedded base/index regs
-      lLoc = memLoc(lhsC, ScalarSlot)
-    else:
-      g.resolveLvalVal(lhsC, lLoc)
+    var lDeferred = false
+    let lLoc = g.leafLoc(lhsC, lhsMem, true, lDeferred)   # the leaf lhs: its natural place
     let foldOp = if op == SubA64: AddA64 else: op
     if op == SubA64:
       g.emNeg(rD)                       # rD := -rhs
@@ -2410,35 +2434,17 @@ proc emitScalarCmp*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
     # lower-bound check paid that materialisation. Exchange and mirror instead.
     swap(aC, bC)
     result = mirrorBranch(result)
-  template cmpBridgeSlot(loc: Location; opC: Cursor): AsmSlot =
-    if isPtrType(resolveType(g.prog, g.getType(opC))): g.exprSlot(opC)
-    else: loc.typ
-  template placeCmpOperand(loc: Location; opC: Cursor; bridge: Reg) =
-    if loc.kind == Imm: g.placeImmTyped(bridge, loc, g.getType(opC))
-    else: g.place2(loc, bridge)
-  var aD = dontCare
   var aMem = false
-  if g.isFoldableMemLeaf(aC):
-    g.emitLvalue2(aC)                                # fold the lhs load via a bridge
-    aD = memLoc(aC, ScalarSlot)
-    aMem = true
-  else:
-    g.emitValue2(aC, aD)
+  let aD = g.leafLoc(aC, g.isFoldableMemLeaf(aC), true, aMem)  # a mem lhs folds via a bridge
   var aReg = NoReg
   var aBridge = NoReg
   if aD.kind == InReg: aReg = aD.r
   else:
-    aBridge = g.takeBridge(cmpBridgeSlot(aD, aC))
-    placeCmpOperand(aD, aC, aBridge)
+    aBridge = g.takeBridge(g.cmpBridgeSlot(aD, aC))
+    g.placeCmpOperand(aD, aC, aBridge)
     aReg = aBridge
-  var bD = dontCare
   var bMem = false
-  if g.isFoldableMemLeaf(bC):
-    g.emitLvalue2(bC)
-    bD = memLoc(bC, ScalarSlot)
-    bMem = true
-  else:
-    g.emitValue2(bC, bD)
+  let bD = g.leafLoc(bC, g.isFoldableMemLeaf(bC), true, bMem)
   var fused = false
   if bD.kind == Imm and bD.ival == 0 and ek in {EqC, NeqC} and fuseBranchTo.len > 0:
     # `x == 0` / `x != 0` against a label: one `cbz`/`cbnz`, no flags involved.
@@ -2456,8 +2462,8 @@ proc emitScalarCmp*(g: var CodeGen; aC0, bC0: Cursor; ek: LengExpr;
     var bBridge = NoReg
     if bD.kind == InReg: bReg = bD.r
     else:
-      bBridge = g.takeBridge(cmpBridgeSlot(bD, bC), avoid = aReg)
-      placeCmpOperand(bD, bC, bBridge)
+      bBridge = g.takeBridge(g.cmpBridgeSlot(bD, bC), avoid = aReg)
+      g.placeCmpOperand(bD, bC, bBridge)
       bReg = bBridge
     g.ab.tree CmpA64: (g.emReg aReg; g.emReg bReg)
     if bBridge != NoReg: g.dropBridge bBridge
