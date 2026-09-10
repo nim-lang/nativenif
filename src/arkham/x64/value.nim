@@ -2097,6 +2097,37 @@ proc genStore2*(g: var CodeGen; rhs: Cursor; dst: Location) =
 
 # ── computed-goto case dispatch (issue #32) ──────────────────────────────────
 
+# ── emitBin2's two operand-side helpers ──────────────────────────────────────
+proc foldInto(g: var CodeGen; fop: X64Inst; rD: Reg; loc: Location; cur: Cursor; typ: AsmSlot) =
+  ## `rD op= loc` for a LEAF location; `cur` is its node (a memory fold materializes
+  ## its address from it). A 64-bit immediate stages through a register.
+  case loc.kind
+  of Imm:
+    if loc.ival < low(int32).int64 or loc.ival > high(int32).int64:
+      let s = g.pickStagingSealed("a bin imm64", typ)
+      g.movImm(s, loc.ival)
+      g.binReg(fop, rD, s)
+      g.giveBack s
+    else: g.binImm(fop, rD, loc.ival)
+  of InReg: g.binReg(fop, rD, loc.r)
+  of NamedStack, Mem: g.binFold(fop, rD, loc, cur)   # sub-width field → load+extend
+  else: raiseAssert "arkham x64n: bin leaf operand " & $loc.kind
+
+proc leafLoc(g: var CodeGen; cur: Cursor; isMem, deferOk: bool; deferred: var bool): Location =
+  ## A leaf's location. A memory leaf is DEFERRED when `deferOk` allows: its
+  ## embedded base/index values are picked now (`emitLvalue2`), the access itself
+  ## folds into the consuming instruction, and `freeLvalTemps2` releases the picks
+  ## after. Otherwise the leaf resolves through `emitValue2` with a dont-care
+  ## destination: an immediate stays an `Imm`, a symbol is its home (or the
+  ## register still mirroring it, taken over), a memory leaf is loaded into a temp.
+  result = dontCare
+  if isMem and deferOk:
+    g.emitLvalue2(cur)
+    result = memLoc(cur, ScalarSlot)
+    deferred = true
+  else:
+    g.emitValue2(cur, result)
+
 # ── fused value core: unconverted-proc stubs (die as each case lands) ────────
 proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
   ## FUSED binary-arith in vmgen's ORDER (compiler/vmgen.nim `genBinaryABC`): the
@@ -2158,38 +2189,6 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
   let rhsLeaf = rhsMem or g.isFoldableLeaf(rhsC) or isImmLeaf(rhsC)
   let resSlot = g.binResultSlot(resTypeC)
 
-  # ── the two operand-side helpers ─────────────────────────────────────────────
-  # `rD op= loc` for a LEAF location; `cur` is its node (a memory fold materializes
-  # its address from it). A 64-bit immediate stages through a register.
-  template foldInto(fop: X64Inst; rD: Reg; loc: Location; cur: Cursor; typ: AsmSlot) =
-    case loc.kind
-    of Imm:
-      if loc.ival < low(int32).int64 or loc.ival > high(int32).int64:
-        let s = g.pickStagingSealed("a bin imm64", typ)
-        g.movImm(s, loc.ival)
-        g.binReg(fop, rD, s)
-        g.giveBack s
-      else: g.binImm(fop, rD, loc.ival)
-    of InReg: g.binReg(fop, rD, loc.r)
-    of NamedStack, Mem: g.binFold(fop, rD, loc, cur)   # sub-width field → load+extend
-    else: raiseAssert "arkham x64n: bin leaf operand " & $loc.kind
-  # A leaf's location. A memory leaf is DEFERRED when `defer` allows: its embedded
-  # base/index values are picked now (`emitLvalue2`), the access itself folds into
-  # the consuming instruction, and `freeLvalTemps2` releases the picks after.
-  # Otherwise the leaf resolves through `emitValue2` with a dont-care destination:
-  # an immediate stays an `Imm`, a symbol is its home (or the register still
-  # mirroring it, taken over), a memory leaf is loaded into a temp.
-  template leafLoc(cur: Cursor; isMem, deferOk: bool; deferred: var bool): Location =
-    block:
-      var lc = dontCare
-      if isMem and deferOk:
-        g.emitLvalue2(cur)
-        lc = memLoc(cur, ScalarSlot)
-        deferred = true
-      else:
-        g.emitValue2(cur, lc)
-      lc
-
   # ── leaf op computed: the rhs accumulates, the leaf lhs folds after ─────────
   # (The Sethi–Ullman swap.) Not for shifts. A PINNED dest is the accumulator, so a
   # lhs that reads it — the symbol homed there (`r = r + (r shl 10)`, the `!&`
@@ -2223,13 +2222,13 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
       var rtcB = resTypeC
       g.bindTemp(rD, slotOf(g.prog, rtcB))
     var lDeferred = false
-    let lLoc = leafLoc(lhsC, lhsMem, true, lDeferred)    # the leaf lhs: its natural place
+    let lLoc = g.leafLoc(lhsC, lhsMem, true, lDeferred)    # the leaf lhs: its natural place
     let foldOp = if op == SubX64: AddX64 else: op        # sub folds as add (after neg)
     let rdSeal = not g.plan.isSealed(rD) and not g.rb.isBoundTemp(rD)
     if rdSeal: g.plan.seal {rD}                          # the fold's staging picks stay off rD
     if op == SubX64:
       g.ab.tree NegX64: g.emReg rD                       # rD := -rhs
-    foldInto(foldOp, rD, lLoc, lhsC, acc.typ)            # rD := rD <foldOp> lhs
+    g.foldInto(foldOp, rD, lLoc, lhsC, acc.typ)            # rD := rD <foldOp> lhs
     if lDeferred: g.freeLvalTemps2(lhsC)                 # embedded picks die with the fold
     else: g.freeVal(lLoc)                                # a forwarded-mirror temp
     if not suppressNorm: g.normalizeBinWidth(resTypeC, rD, op)
@@ -2255,7 +2254,7 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
     # A deferred lhs memory operand is read at placement time, AFTER the rhs: a
     # variable shift has moved its count into rcx by then, so an address that reads
     # rcx is loaded now instead.
-    lLoc = leafLoc(lhsC, lhsMem,
+    lLoc = g.leafLoc(lhsC, lhsMem,
                    not (varShift and g.exprReadsReg(lhsC, g.md.shiftCountReg)), lDeferred)
   else:
     # A computed lhs accumulates: straight into the pinned dest when the rhs is a
@@ -2304,7 +2303,7 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
   elif rhsLeaf:
     # A deferred rhs memory operand folds into the op, which runs AFTER the lhs is
     # placed into the result register — so it must not read a pinned dest.
-    rLoc = leafLoc(rhsC, rhsMem, not (pinned and g.exprReadsReg(rhsC, dest.r)), rDeferred)
+    rLoc = g.leafLoc(rhsC, rhsMem, not (pinned and g.exprReadsReg(rhsC, dest.r)), rDeferred)
   else:
     g.emitValue2(rhsC, rLoc)                             # computed rhs → a bound temp
 
@@ -2363,7 +2362,7 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
   let rdSeal = not g.plan.isSealed(rD) and not g.rb.isBoundTemp(rD)
   if rdSeal: g.plan.seal {rD}                            # the fold's staging picks stay off rD
   if aliasRhs:
-    foldInto(op, rD, lLoc, lhsC, res.typ)                # dest := rhs op lhs
+    g.foldInto(op, rD, lLoc, lhsC, res.typ)                # dest := rhs op lhs
     if op == SubX64:
       g.ab.tree NegX64: g.emReg rD                       # dest := lhs - rhs
   else:
@@ -2378,7 +2377,7 @@ proc emitBin2*(g: var CodeGen; c: Cursor; dest: var Location) =
       var rtcL = resTypeC
       g.bindTemp(lLoc.r, slotOf(g.prog, rtcL))
     g.place2(lLoc, rD)                                   # dest := lhs
-    foldInto(op, rD, rLoc, rhsC, res.typ)                # dest op= rhs
+    g.foldInto(op, rD, rLoc, rhsC, res.typ)                # dest op= rhs
   if not suppressNorm: g.normalizeBinWidth(resTypeC, rD, op)
   # The op ran and the width was normalized, so the register now holds the RESULT.
   # Put the result's type on the temp that was bound at the incoming type above.
