@@ -65,11 +65,21 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int; browser = false): string =
   ## the stack, exactly as they do in wasm, where the same crowding exists at
   ## exhaustion.
   # The target face: node writes to fds through `fs`; a browser has neither
-  # `fs` nor a synchronous fd, so output buffers into `__outBuf` for the host
-  # to drain, and `nim_exit` throws instead of killing the tab.
+  # `fs` nor a synchronous fd, so stdout/stderr land on `console.log`/
+  # `console.error` one line at a time (devtools shows engine output live,
+  # no host drain loop), `nim_exit` throws instead of killing the tab, and
+  # `__takeOutput()` still returns whatever has no line ending yet.
   (if browser:
-    ("const __outBuf = [];\n" &
-     "function __takeOutput() { const s = __outBuf.join(\"\"); __outBuf.length = 0; return s; }\n")
+    ("const __outBuf = [];  // writes to fds the console cannot serve\n" &
+     "const __dec = [new TextDecoder(\"utf-8\"), new TextDecoder(\"utf-8\")];\n" &
+     "  // one streaming decoder per console fd: a UTF-8 sequence split across\n" &
+     "  // two flushes must not decode into a replacement char\n" &
+     "let __pend = [\"\", \"\"];  // the unterminated tail of each console fd\n" &
+     "function __takeOutput() {\n" &
+     "  const s = __outBuf.join(\"\") + __pend[0] + __pend[1];\n" &
+     "  __outBuf.length = 0; __pend = [\"\", \"\"];\n" &
+     "  return s;\n" &
+     "}\n")
    else:
     "const fs = require(\"fs\");  // for the synchronous nim_write below\n") &
   "let JMEM = new ArrayBuffer(" & $memBytes & ");\n" &
@@ -128,7 +138,19 @@ proc jsPreamble*(memBytes, stackBytes, dataEnd: int; browser = false): string =
   # to exit, so nim_exit throws and the host's frame call unwinds.
   (if browser:
     ("function nim_write(fd, buf, len) {\n" &
-     "  __outBuf.push(new TextDecoder(\"utf-8\").decode(U8.subarray(buf, buf + len)));\n" &
+     "  if (fd === 1 || fd === 2) {\n" &
+     "    // the console is line-oriented: log every complete line as it forms,\n" &
+     "    // keep the partial tail for the next write (or __takeOutput)\n" &
+     "    const i = fd - 1;\n" &
+     "    __pend[i] += __dec[i].decode(U8.subarray(buf, buf + len), {stream: true});\n" &
+     "    let nl;\n" &
+     "    while ((nl = __pend[i].indexOf(\"\\n\")) >= 0) {\n" &
+     "      (fd === 2 ? console.error : console.log)(__pend[i].slice(0, nl));\n" &
+     "      __pend[i] = __pend[i].slice(nl + 1);\n" &
+     "    }\n" &
+     "  } else {\n" &
+     "    __outBuf.push(new TextDecoder(\"utf-8\").decode(U8.subarray(buf, buf + len)));\n" &
+     "  }\n" &
      "  return len;\n" &
      "}\n" &
      "function nim_exit(code) { throw new Error(\"nim_exit(\" + code + \")\"); }\n")
