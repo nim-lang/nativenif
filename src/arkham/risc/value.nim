@@ -3970,6 +3970,22 @@ proc wideValueSlot(g: var CodeGen; c: Cursor): WideRef =
 
 proc emitNarrowValueInto(g: var CodeGen; c: Cursor; dest: Reg) =
   ## Emit a NON-wide expression so its value lands in `dest`.
+  ##
+  ## A LITERAL is produced straight into the pinned register: no temp, no
+  ## `place2`. `dest` is one of the wide lowering's own scratch registers, taken
+  ## and bound by `takeWideRegs`, and with four of them held (`wideShift`) the
+  ## pools are dry: `needsReg` for the literal count `2` in `(shl y 2)` minted an
+  ## etmp SLOT, whose store then wanted a produce bridge — and every bridge was one
+  ## of those four ("every scratch bridge in use", tests/arkham/bin_alias_order on
+  ## the cortex-m 64 corpus). Everything else keeps the temp route: a SYMBOL may
+  ## be a 64-bit slot whose LOW word is what `place2` fetches (`1 shl n` with
+  ## `n: int64` — the pinned route emitted no load at all), and a computed
+  ## operand's own emission may need scratch of its own.
+  let cc = stripParens(c)
+  if cc.kind in {IntLit, UIntLit, CharLit}:
+    var v = regLoc(dest, g.valueSlot(c))
+    g.emitValue2(cc, v)
+    return
   var v = needsReg(g.valueSlot(c))
   g.emitValue2(c, v)
   g.place2(v, dest)
