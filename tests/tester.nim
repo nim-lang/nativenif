@@ -2205,8 +2205,16 @@ const cortexMUnsupported: seq[string] = @[
   # reachable from the staging draw. What is left is demand of a different KIND —
   # an ATOMIC's operands, which may not use a bridge at all because the LL/SC loop
   # owns them, and an aggregate whose two ends are both computed.
-  "aconstr_byref_spilled", "aggr_arg_parked_manual",
-  "atomic_cas_operand_home",
+  "aggr_arg_parked_manual", "atomic_cas_operand_home",
+  # `bin_alias_order` is a 64-bit binop torture test (`x = a[x] + (y*2)` and the
+  # like, see the fixture). On this 32-bit target every operand is WIDE, and the
+  # `1 shl n` case takes `wideShift` → `emitNarrowValueInto` → `emitLeafImm`, which
+  # asks `takeProduceBridge` for a scratch while the wide value's two halves and
+  # the count already hold every bridge: "every scratch bridge in use in proc
+  # mix.0". The same demand-of-kind as `aggr_arg_parked_manual` above — a wide
+  # shift whose count is a variable AND whose lhs is a literal needs one more
+  # register than the target has. Both 64-bit backends pass the fixture.
+  "bin_alias_order",
 
   # ── WRONG ANSWER, and the second one in this list ───────────────────────────
   # `array2d` used to fail loudly for register pressure. It compiles now, and
