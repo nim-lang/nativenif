@@ -3650,6 +3650,14 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
       else:
         let abiReg = amd.gprAt(pl)
         g.releaseArgDest(abiReg, (if a.kind == Symbol: symName(a) else: ""))
+        # The register is OURS from here on, not only once the value has landed:
+        # the argument's own emission must not stage anything through it. A
+        # `(mul (mem [ep+p]) (mem [ep+q]))` dest-threaded into rsi picked rsi for
+        # the rhs leaf's base copy (`leafLoc` takes the embedded picks BEFORE the
+        # accumulator is placed and sealed), then loaded the lhs over it and
+        # multiplied by `[rsi+q]` — with rsi typed as the pointer, which nifasm
+        # rejected (tests/arkham/cast_ptr_base_arg_mul).
+        g.rb.sealAccum abiReg; sealedArgs.incl abiReg
         var aD = regLoc(abiReg, ScalarSlot)
         g.emitValue2(a, aD)                        # → its GPR arg register
       if not pl.isFloat and not pl.onStack:
@@ -3847,6 +3855,9 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
         elif not pl.onStack:
           let abiReg = amd.gprAt(pl)
           g.releaseArgDest(abiReg, (if a.kind == Symbol: symName(a) else: ""))
+          # Ours from here on, not only once the value has landed — see the
+          # manual path's twin (tests/arkham/cast_ptr_base_arg_mul).
+          g.rb.sealAccum abiReg; sealedArgs.incl abiReg
           aD = regLoc(abiReg, ScalarSlot)
           g.emitValue2(a, aD)
         else:

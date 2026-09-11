@@ -1,0 +1,66 @@
+(.nif27)
+(stmts
+ (type :Env.0 .
+  (object .
+   (fld :q.0 .
+    (i 64))
+   (fld :p.0 .
+    (i 64))))
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :sink.0
+  (params
+   (param :a.0 .
+    (i 64))
+   (param :b.0 .
+    (i 64)))
+  (i 64)
+  (pragmas)
+  (stmts
+   (ret
+    (add
+     (i 64)a.0 b.0))))
+ (proc :shared.0
+  (params)
+  (i 64)
+  (pragmas)
+  (stmts
+   (var :el.0 . Env.0 .)
+   (asgn
+    (dot el.0 p.0 0)3)
+   (asgn
+    (dot el.0 q.0 0)5)
+   (var :ep.0 .
+    (ptr
+     (void))
+    (cast
+     (ptr
+      (void))
+     (addr el.0)))
+   (ret
+    (call sink.0 1
+     (add
+      (i 64)
+      (mul
+       (i 64)
+       (dot
+        (deref
+         (cast
+          (ptr Env.0)ep.0))p.0 0)
+       (dot
+        (deref
+         (cast
+          (ptr Env.0)ep.0))q.0 0))2)))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (call exit.0
+    (call shared.0)))))
