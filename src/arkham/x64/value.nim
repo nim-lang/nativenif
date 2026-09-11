@@ -3386,6 +3386,14 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
         skip q; skip q
         retType = q
         while q.hasMore: skip q
+    if hiddenPtr:
+      # The CALLER already wrote the hidden result pointer into rdi (the
+      # `hiddenPtr = true` sites in the aggregate-store arms). The marshalling
+      # below seals rdi — but the target is evaluated FIRST, and a `(mem …)`
+      # chain like `m.context.hook` stages its intermediate pointer through
+      # whichever volatile is free, rdi included. Seal it now; the seal is
+      # lifted with the argument seals after the call.
+      g.rb.sealAccum g.md.intArgRegs[0]
     fnptrLoc = needsReg(ScalarSlot)
     g.emitValue2(targetCur, fnptrLoc)              # fn-ptr target → a held register
     if fnptrLoc.kind == InReg:
@@ -3676,6 +3684,7 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
     # read of a register the call had just clobbered, which nifasm refuses.
     if not doTail: g.releaseStaleName(RAX)
     g.rb.unsealAccums(sealedArgs)
+    if hiddenPtr: g.rb.unsealAccums {g.md.intArgRegs[0]}  # the early seal (indirect target)
     if fnTargetName.len > 0:
       g.ab.tree KillX64: g.ab.sym fnTargetName
       discard g.rb.takeBinding(fnptrReg)
@@ -3924,6 +3933,7 @@ proc emitCall2Inner(g: var CodeGen; c: Cursor; dest: var Location; hiddenPtr = f
         g.emReg RAX
         g.ab.tree ResX: g.ab.sym synth("ret.0")
   g.rb.unsealAccums(sealedArgs)
+  if hiddenPtr: g.rb.unsealAccums {g.md.intArgRegs[0]}    # the early seal (indirect target)
   if fnTargetName.len > 0:
     g.ab.tree KillX64: g.ab.sym fnTargetName
     discard g.rb.takeBinding(fnptrReg)

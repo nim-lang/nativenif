@@ -1,0 +1,112 @@
+(.nif27)
+(stmts
+ (type :Big.0 .
+  (object .
+   (fld :a.0 .
+    (i 64))
+   (fld :b.0 .
+    (i 64))
+   (fld :c.0 .
+    (i 64))))
+ (type :Ctx.0 .
+  (object .
+   (fld :counter.0 .
+    (i 64))
+   (fld :hook.0 . Hook.0)))
+ (type :Hook.0 .
+  (proctype .
+   (params
+    (param :c.0 .
+     (ptr Ctx.0))
+    (param :x.0 .
+     (i 64)))
+   Big.0 .))
+ (type :Match.0 .
+  (object .
+   (fld :pad.0 .
+    (i 64))
+   (fld :context.0 .
+    (ptr Ctx.0))))
+ (proc :exit.0
+  (params
+   (param :code.0 .
+    (i 32))).
+  (pragmas
+   (importc "exit"))
+  (stmts .))
+ (proc :impl.0
+  (params
+   (param :c.0 .
+    (ptr Ctx.0))
+   (param :x.0 .
+    (i 64)))
+  Big.0
+  (pragmas)
+  (stmts
+   (asgn
+    (dot
+     (deref c.0)counter.0 0)
+    (add
+     (i 64)
+     (dot
+      (deref c.0)counter.0 0)1))
+   (ret
+    (oconstr Big.0
+     (kv a.0 x.0)
+     (kv b.0
+      (dot
+       (deref c.0)counter.0 0))
+     (kv c.0
+      (mul
+       (i 64)x.0 2))))))
+ (proc :probe.0
+  (params
+   (param :m.0 .
+    (ptr Match.0))
+   (param :x.0 .
+    (i 64)))
+  (i 64)
+  (pragmas)
+  (stmts
+   (var :r.0 . Big.0 .)
+   (asgn r.0
+    (call
+     (dot
+      (deref
+       (dot
+        (deref m.0)context.0 0))hook.0 0)
+     (dot
+      (deref m.0)context.0 0)x.0))
+   (ret
+    (add
+     (i 64)
+     (add
+      (i 64)
+      (dot r.0 a.0 0)
+      (dot r.0 b.0 0))
+     (dot r.0 c.0 0)))))
+ (proc :main.0
+  (params)
+  (i 32)
+  (pragmas
+   (exportc "main"))
+  (stmts
+   (var :ctx.0 . Ctx.0
+    (oconstr Ctx.0
+     (kv counter.0 0)
+     (kv hook.0 impl.0)))
+   (var :m.0 . Match.0
+    (oconstr Match.0
+     (kv pad.0 7)
+     (kv context.0
+      (addr ctx.0))))
+   (var :res.0 .
+    (i 64)
+    (call probe.0
+     (addr m.0)10))
+   (call exit.0
+    (add
+     (i 64)res.0
+     (mul
+      (i 64)
+      (dot ctx.0 counter.0 0)100))))))
