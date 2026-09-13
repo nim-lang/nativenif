@@ -918,15 +918,34 @@ proc parseDest*(n: var Cursor; ctx: var GenContext;
   else:
     error("Expected destination", n)
 
+proc xmmCallRef(n: Cursor; ctx: GenContext): TagEnum =
+  ## The xmm register an `(arg name [k])` / `(res name)` inside a prepare block
+  ## resolves to, or `InvalidTagId` when `n` is not such a reference or the
+  ## parameter / result is not float (a GPR one is `parseOperand`'s).
+  result = InvalidTagId
+  if n.kind != TagLit or not ctx.inCall or ctx.callContext.typ == nil: return
+  if n.tag notin {ArgTagId, ResTagId}: return
+  var m = n; inc m
+  if m.kind != Symbol: return
+  let p = (if n.tag == ArgTagId: findParam(ctx.callContext.typ, getSymId(m))
+           else: findResult(ctx.callContext.typ, getSymId(m)))
+  if p != nil and p.reg != InvalidTagId and isXmmTagEnum(p.reg) and
+     not p.typ.isOnStack:
+    result = p.reg
+
 proc isXmmOperand*(n: Cursor; ctx: GenContext): bool =
-  ## True if `n` denotes an xmm register operand — a raw `(xmmN)` tag or a `Symbol`
-  ## naming a float local bound to an xmm register. The float instruction handlers
-  ## dispatch on this (reg form vs memory form / movfq direction) so a bound float
-  ## local, emitted as its name, is recognized as a register operand.
+  ## True if `n` denotes an xmm register operand — a raw `(xmmN)` tag, a `Symbol`
+  ## naming a float local bound to an xmm register, or a prepare block's
+  ## `(arg name)` / `(res name)` whose parameter / result is passed in an xmm. The
+  ## float instruction handlers dispatch on this (reg form vs memory form / movfq
+  ## direction) so a bound float local, emitted as its name, is recognized as a
+  ## register operand.
   if isXmmTag(n): return true
   if n.kind == Symbol:
     let sym = ctx.scope.lookup(getSymId(n))   # float locals are never foreign
     result = sym != nil and sym.reg != InvalidTagId and isXmmTagEnum(sym.reg)
+  else:
+    result = xmmCallRef(n, ctx) != InvalidTagId
 
 proc parseXmmOperand*(n: var Cursor; ctx: var GenContext): x86.XmmRegister =
   ## Parse an SSE register *operand* in a scalar-float instruction. The SIMD twin
@@ -949,6 +968,30 @@ proc parseXmmOperand*(n: var Cursor; ctx: var GenContext): x86.XmmRegister =
       error("Expected float register variable, got: " & getSym(n), n)
     result = tagToXmm(sym.reg)
     inc n
+  elif xmmCallRef(n, ctx) != InvalidTagId:
+    # `(arg name)` — a float argument's xmm, assigned exactly once before the
+    # `(call)`; `(res name)` — a float result's xmm, bound exactly once after it.
+    # The same bookkeeping `parseOperand` keeps for the GPR forms.
+    let refTok = n
+    let isArg = n.tag == ArgTagId
+    result = tagToXmm(xmmCallRef(n, ctx))
+    var name = SymId(0)
+    into n:
+      name = getSymId(n)
+      inc n
+      if n.hasMore and n.kind == IntLit:
+        if getInt(n) != 0: error("a float argument has one register", refTok)
+        inc n
+    if isArg:
+      if name in ctx.callContext.argsSet:
+        error("Argument already set: " & ctx.nameOf(name), refTok)
+      ctx.callContext.argsSet.incl name
+    else:
+      if not ctx.callContext.callEmitted:
+        error("(res ...) can only be used after (call) or (extcall)", refTok)
+      if name in ctx.callContext.resultsSet:
+        error("Result already bound: " & ctx.nameOf(name), refTok)
+      ctx.callContext.resultsSet.incl name
   else:
     error("expected xmm register or float variable", n)
 

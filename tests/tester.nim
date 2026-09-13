@@ -937,6 +937,10 @@ exec "nim c -r src/nifasm/nifasm tests/lenient_port.nif"
 exec "nim c -r src/nifasm/nifasm tests/lenient_xmm.nif"
 exec "nim c -r src/nifasm/nifasm tests/lea_scaled.nif"
 exec "nim c -r src/nifasm/nifasm tests/packed_sse.nif"
+# A float parameter `(xmm0)`, a float result `(xmm0)` and a zero-register `(regs)`
+# parameter in a typed signature: `(movsd (arg p0.0) …)` assigns the argument,
+# `(movsd (xmm0) (res ret.0))` binds the result (elided: same register).
+exec "nim c -r src/nifasm/nifasm tests/x64_float_sig.nif"
 exec "nim c -r src/nifasm/nifasm tests/pointer_field_at.nif"
 exec "nim c -r src/nifasm/nifasm tests/pointer_roundtrip.nif"
 exec "nim c -r src/nifasm/nifasm tests/string_pointer_field.nif"
@@ -996,6 +1000,7 @@ when defined(linux) and defined(amd64):
   # loads+stores, mulpd/addpd on 2 f64 lanes, mulps/addps on 4 f32 lanes,
   # punpcklqdq f64 broadcast and shufps f32 broadcast; checks both lane sums.
   execRun "tests/packed_sse"
+  execRun "tests/x64_float_sig"
   execRun "tests/pointer_field_at"
   execRun "tests/pointer_roundtrip"
   execExpectOutput("tests/string_pointer_field", "Hello\n")
@@ -1019,6 +1024,8 @@ execExpectFailure("nim c -r src/nifasm/nifasm tests/kill_use_after_kill.nif", "U
 # float variable (via `rebind`/`withreg`) must be rejected — the SIMD twin of the
 # GPR `(reg)` bound-use guard, closing the float silent-clobber hole.
 execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_xmm_raw_bound.nif", "Register XMM8 is bound to variable 'f.0', use the variable name instead")
+# A float parameter is checked for assignment like a GPR one.
+execExpectFailure("nim c -r src/nifasm/nifasm tests/x64_float_sig_missing.nif", "Missing argument: p0.0")
 # AArch64 register-binding checks (mirror the x64 binding guards above): a second
 # `(var)` on a still-bound x-register EVICTS the first — so its name is gone — and a
 # raw `(xN)` use of a bound register is rejected.

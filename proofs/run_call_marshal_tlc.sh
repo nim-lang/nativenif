@@ -3,14 +3,12 @@
 # bug injection, comparing every verdict with the expected one. Exit status 0 iff
 # all seven agree.
 #
-#   none          takeParked: survivor / pool-outside-the-call's-claims / memory   pass
+#   none          two phases; parks: survivor / pool-outside-the-claims / memory   pass
 #   survivorOnly  the old takeHeld(canSpill = false)                               FAIL (NotStuck)
-#   noAvoid       a pool park may sit where a later argument lands                 FAIL
-#   noProcGate    rdx/rcx handed out in a proc that divides/shifts                 FAIL
+#   noAvoid       a pool park may sit where a later argument is loaded             FAIL
 #   noBound       the pool ignores what a register holds                           FAIL
-#   lateStash     a memory park stored after the next argument ran                 FAIL
-#   noExpose      laterClob empty: nothing is parked                               FAIL
-
+#   noLaterClob   every computed scalar into its own ABI register                  FAIL
+#   earlyLoad     leaves/aggregates loaded in phase 1 (the old fused loop)         FAIL
 # Two more rows are reachability probes on the correct spec: `NoPoolPark` and
 # `NoMemPark` must FAIL, or the pool / memory tiers were never exercised.
 
@@ -30,8 +28,8 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 cp call_marshal.tla "$TMP/"
 status=0
 for row in none:pass: survivorOnly:FAIL:NotStuck noAvoid:FAIL:ParksIntact \
-           noProcGate:FAIL:ParksIntact noBound:FAIL:ParksIntact lateStash:FAIL:ParksIntact \
-           noExpose:FAIL:MarshalledIntact probe-NoPoolPark:FAIL:NoPoolPark \
+           noBound:FAIL:ParksIntact noLaterClob:FAIL:ParksIntact \
+           earlyLoad:FAIL:LoadedIntact probe-NoPoolPark:FAIL:NoPoolPark \
            probe-NoMemPark:FAIL:NoMemPark; do
   IFS=: read -r bug want wantInv <<<"$row"
   if [[ "$bug" == probe-* ]]; then
@@ -45,7 +43,7 @@ for row in none:pass: survivorOnly:FAIL:NotStuck noAvoid:FAIL:ParksIntact \
   if grep -q "No error has been found" <<<"$out"; then got=pass
   elif grep -q "is violated" <<<"$out"; then got=FAIL
   else got=ERROR; echo "$out" | tail -20; fi
-  states="$(grep -oE '^[0-9]+ distinct states|[0-9]+ distinct states found' <<<"$out" | grep -oE '^[0-9]+' | head -1)"
+  states="$(grep -oE '[0-9,]+ distinct states found' <<<"$out" | tail -1 | tr -d , | grep -oE '^[0-9]+')"
   inv="$(grep -oE 'Invariant [A-Za-z]+ is violated' <<<"$out" | head -1 | awk '{print $2}')"
   mark=ok
   [ "$got" = "$want" ] || mark=MISMATCH

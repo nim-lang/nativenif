@@ -128,6 +128,10 @@ type
                                              ## dependency record; nifasm links them)
     needsLibSystem*: bool
     darwin*: bool                           ## Mach-O target (libc via dyld, no raw syscalls)
+    fullSigs*: bool                         ## every proc boundary is declarative — the typed
+                                            ## signature carries float params/results and
+                                            ## zero-size aggregates too (x86-64; the RISC
+                                            ## backends still marshal those by hand)
     windows*: bool                          ## PE/Win64 target: every `importc` binds through
                                             ## the import table (no Linux syscalls), and the
                                             ## image is single-threaded, so a Nim thread-local
@@ -578,12 +582,15 @@ const FullSigAggrByRefThreshold = 16
 
 proc isDeclarativeAbi*(p: var Program; decl: Cursor): bool =
   ## Whether `decl`'s call boundary uses the FULL typed signature (the declarative
-  ## `(arg pN [k])` / `(res ret.0)` scheme): every parameter is a scalar/pointer OR
-  ## an aggregate (passed by-value in consecutive registers when ≤16B, by a pointer
-  ## otherwise), and the result is void, a scalar, or a >16B by-reference aggregate
-  ## (returned through a hidden result pointer). FLOAT params/results and ≤16B
-  ## by-value aggregate RESULTS are not yet modelled in the typed signature, so those
-  ## procs keep the empty-signature manual-marshalling path.
+  ## `(arg pN [k])` / `(res ret.0)` scheme). With `fullSigs` (x86-64) it always
+  ## does: the signature states float params `(xmmN)`, a float result `(xmm0)` and
+  ## a zero-size aggregate `(regs)` as well, and there is no manual-marshalling
+  ## path left. Without it (the RISC backends) every parameter must be a
+  ## scalar/pointer OR an aggregate (passed by-value in consecutive registers when
+  ## ≤16B, by a pointer otherwise), and the result void, a scalar, or a >16B
+  ## by-reference aggregate (returned through a hidden result pointer); float
+  ## params/results and zero-size aggregates keep the empty-signature path there.
+  if p.fullSigs: return true
   var c = decl
   c.into:
     inc c                                     # name → params slot
@@ -683,7 +690,7 @@ proc procSigType(declStart: Cursor): Cursor =
   result = beginRead(buf)
 
 proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
-              darwin = false; windows = false): Program =
+              darwin = false; windows = false; fullSigs = false): Program =
   ## `darwin` selects the Mach-O target, which links dynamically against
   ## libSystem (dyld + PLT). Unlike the static-ELF Linux target, an `importc`'d
   ## libc name there resolves through the dynamic linker, so it must go through
@@ -706,7 +713,7 @@ proc collect*(buf: var TokenBuf; inputPath: string; tags: TagPool;
                    importcOnlyGvars: initHashSet[string](),
                    scheme: splitModulePath(inputPath), tags: tags,
                    pool: buf.pool,
-                   darwin: darwin, windows: windows)
+                   darwin: darwin, fullSigs: fullSigs, windows: windows)
   block:
     # A standalone `(proctype)` parsed against the shared tag pool; its cursor
     # outlives this buffer (the owner refcount keeps the data alive).

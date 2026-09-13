@@ -206,7 +206,11 @@ proc pass2Proc*(n: var Cursor; ctx: var GenContext) =
               ctx.avrRegBindings[avr.Register(ord(p) + 1)] = nm
             else:
               ctx.avrRegBindings[tagToRegisterAvr(param.reg, n)] = nm
-        elif not isA64Proc and param.reg != InvalidTagId and not param.viaRegs:
+        elif not isA64Proc and param.reg != InvalidTagId and not param.viaRegs and
+             not isXmmTagEnum(param.reg):
+          # A float param `(param :p (xmm0) (f 64))` is ABI-only like a `(regs …)`
+          # aggregate: the body reads its xmm raw (the arg/return xmm registers have
+          # structural raw uses — see arkham's `emFReg`), so it is not bound.
           ctx.regBindings[tagToRegister(param.reg, n)] = ctx.nameOf(param.name)
 
     skip n   # past the proc name

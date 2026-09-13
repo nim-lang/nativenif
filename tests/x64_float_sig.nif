@@ -1,0 +1,70 @@
+(.nif27)
+(stmts
+ (type :Empty.0
+  (object))
+ (proc :main.0
+  (params)
+  (result)
+  (clobber)
+  (stmts
+   (var :status.0
+    (rbx)
+    (i 64))
+   (mov
+    (rdi)4613937818241073152)
+   (movfq
+    (xmm3)
+    (rdi))
+   (prepare twice.0
+    (movsd
+     (arg p0.0)
+     (xmm3))
+    (mov
+     (arg p2.0)7)
+    (call)
+    (movsd
+     (xmm0)
+     (res ret.0)))
+   (cvttsd2si
+    (rax)
+    (xmm0))
+   (mov status.0
+    (rax))
+   (sub status.0 13)
+   (mov
+    (rax)60)
+   (mov
+    (rdi)status.0)
+   (syscall)))
+ (proc :twice.0
+  (params
+   (param :p0.0
+    (xmm0)
+    (f 64))
+   (param :p1.0
+    (regs)Empty.0)
+   (param :p2.0
+    (rdi)
+    (i 64)))
+  (result :ret.0
+   (xmm0)
+   (f 64))
+  (clobber
+   (rax)
+   (rcx)
+   (rdx)
+   (rsi)
+   (r8)
+   (r9)
+   (r10)
+   (r11))
+  (stmts
+   (addsd
+    (xmm0)
+    (xmm0))
+   (cvtsi2sd
+    (xmm1)p2.0)
+   (addsd
+    (xmm0)
+    (xmm1))
+   (ret))))

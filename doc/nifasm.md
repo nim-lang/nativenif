@@ -142,6 +142,20 @@ The four sections are positional and all four are present even when empty:
 body, which is a `(stmts ...)` block. A result that is returned in more than one register
 uses `(regs (rax) (rdx))` in place of the single register.
 
+A parameter passed in several registers (a small aggregate, one register per word)
+uses `(regs (rdi) (rsi))` as its location; `(arg name k)` at a call site selects the
+k-th of them. Such a parameter is ABI-only: it is not bound to its name in the body,
+so the body reads its registers raw. An empty `(regs)` is a parameter passed in no
+register at all — a zero-size aggregate — and a call site assigns nothing for it.
+
+A float parameter is passed in an SSE register, `(param :x.0 (xmm0) (f 64))`, and a
+float result is declared the same way, `(result :ret.0 (xmm0) (f 64))`. Like a
+`(regs …)` parameter it is ABI-only in the body. At a call site the argument is
+assigned with `(movsd (arg x.0) <xmm or float variable>)` (`movss` for an `(f 32)`)
+and the result bound with `(movsd <xmm or float variable> (res ret.0))`; both are
+checked for exactly-once assignment like their GPR counterparts, and a same-register
+move is elided.
+
 ### Stack parameters
 
 Parameters can also be passed on the stack instead of in registers. Use `(s)` or `(s N)` instead of a register name to indicate a stack-passed parameter:

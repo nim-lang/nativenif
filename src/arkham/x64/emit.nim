@@ -829,25 +829,25 @@ proc takeHeld*(g: var CodeGen; what: string; canSpill = false): Location =
   raiseAssert "arkham x64n: out of registers for " & what &
               " in proc " & g.curProcName & " (nothing to spill)"
 
-proc takeParked*(g: var CodeGen; avoid: set[Reg]): Location =
-  ## A PARK: where one word of a call argument waits while the REST of the
-  ## arguments are marshalled, because a later argument's instruction destroys
-  ## the ABI register it belongs in (`fixedRegsClobberedBy`: `cl` for a variable
-  ## shift, rdx/rax for `idiv`). Not a survivor of the call itself — that is
-  ## `takeHeld` — only of the marshalling, which is what makes a VOLATILE a
-  ## sound park here. Total: a callee-saved register, else a pool temp outside
-  ## `avoid`, else a spill slot. The caller passes as `avoid` every register the
-  ## call still has a claim on — its argument registers, marshalled or not, and
-  ## the fixed registers its later arguments clobber — so a pool park can never
-  ## sit where the next argument lands. (A pool temp is otherwise refused only
-  ## once something is BOUND to it, and an argument register is bound by its
-  ## `(arg …)` move, after its value is computed — too late for a park taken
-  ## for an earlier argument.)
+proc takeParked*(g: var CodeGen; avoid: set[Reg]; slot = ScalarSlot): Location =
+  ## A PARK: where a value computed while a call's arguments are evaluated
+  ## waits until every argument has run — a computed scalar argument whose ABI
+  ## register a later argument's instruction destroys (`fixedRegsClobberedBy`:
+  ## `cl` for a variable shift, rdx/rax for `idiv`), or the address of an
+  ## aggregate argument. Not a survivor of the call itself — that is `takeHeld`
+  ## — only of the marshalling, which is what makes a VOLATILE a sound park
+  ## here. Total: a callee-saved register, else a pool temp outside `avoid`,
+  ## else a spill slot. The caller passes as `avoid` every register the call
+  ## still has a claim on — its argument registers, loaded or not, and the fixed
+  ## registers its later arguments clobber — so a pool park can never sit where
+  ## an argument is loaded. (A pool temp is otherwise refused only once
+  ## something is BOUND to it, and an argument register is bound by its
+  ## `(arg …)` move — too late for a park taken for an earlier argument.)
   ##
-  ## A register park is BOUND on hand-out, whoever fills it: a marshalled
-  ## aggregate word has no producer to bind it, and R10/R11 refuse to be named
-  ## raw by `emReg`. A scalar producer (`emitValue2`) leaves an already-bound
-  ## temp alone. `freeVal` releases it after the call.
+  ## A register park is BOUND on hand-out with `slot`'s type, whoever fills it
+  ## (an address is `lea`'d into it raw; R10/R11 refuse to be named raw by
+  ## `emReg`). A scalar producer (`emitValue2`) leaves an already-bound temp
+  ## alone. `freeVal` releases it after the call.
   ##
   ## MODEL: proofs/call_marshal.tla — `ParkReg` (`SurvivorOK` / `PoolOK`) and
   ## `ParkMem`; `ParkStuck` is what `Bug = "survivorOnly"` (the old `takeHeld`)
@@ -860,11 +860,11 @@ proc takeParked*(g: var CodeGen; avoid: set[Reg]): Location =
     g.pickedRegs.incl r
     when defined(arkhamBindTrace): dbgRegSite[ord(r)] = getStackTrace()
     g.releaseStaleName(r)
-    g.bindTemp(r, ScalarSlot)
-    return regLoc(r, ScalarSlot, isTemp = true)
+    g.bindTemp(r, slot)
+    return regLoc(r, slot, isTemp = true)
   let nm = g.mintSpillName("park")             # both pools dry (or `ARKHAM_STRESS_PARK=mem`)
-  g.declSpillSlot(nm, ScalarSlot, isFloat = false)
-  namedStackLoc(nm, ScalarSlot, spillTemp = true)
+  g.declSpillSlot(nm, slot, isFloat = false)
+  namedStackLoc(nm, slot, spillTemp = true)
 
 proc freeVal*(g: var CodeGen; loc: Location) {.inline.} =
   ## Release a reserved/resolved temp — the emit-time `releaseTmp`: clear the
@@ -1150,8 +1150,16 @@ proc emitParamsAndResult*(g: var CodeGen; c: var Cursor; byRef: bool;
             inc c                               # name → positional pN.0
             skip c                              # pragmas
             if pl.isFloat:
-              raiseAssert "arkham x64: float param in signature not yet supported"
-            if pl.isAgg:
+              # A float param travels in an xmm register: `(param :pN.0 (xmmK) (f N))`.
+              # nifasm treats it as ABI-only (not bound), like a `(regs …)` aggregate:
+              # the body reads the xmm raw (`emitParamMoves`), and a call site assigns
+              # it with `(movsd (arg pN) …)`.
+              g.ab.tree ParamD:
+                g.ab.symDef paramName(pl.ord)
+                if not pl.onStack: g.ab.xmmReg amd.floatArgRegs[pl.fpIndex]
+                else: g.ab.keyword SO           # 9th+ float: stack-passed
+                if byRef: g.genPointee(c) else: g.genTypeBody(c)
+            elif pl.isAgg:
               # An aggregate param. Its NAME is `paramName(pl.ord)`; the body never
               # reads it by name (the prologue moves it into a stack home / pointer
               # reg raw), so it is emitted with the `(regs …)` location, which nifasm
@@ -1186,8 +1194,13 @@ proc emitParamsAndResult*(g: var CodeGen; c: var Cursor; byRef: bool;
     else:
       let rs = slotOf(g.prog, c)
       if rs.kind == AFloat:
-        raiseAssert "arkham x64: float result in signature not yet supported"
-      if rs.kind == AMem:
+        # `(result :ret.0 (xmm0) (f N))`: the caller binds it with
+        # `(movsd (xmm0) (res ret.0))` right after the call, the twin of the
+        # rax announcement for a scalar.
+        g.ab.symDef synth("ret.0")
+        g.ab.xmmReg FloatRet
+        if byRef: g.genPointee(c) else: g.genTypeBody(c)
+      elif rs.kind == AMem:
         # A ≤16B by-value aggregate result travels in rax:rdx with an EMPTY result slot
         # (like a >16B by-ref result): the callee marshals it into rax:rdx and the caller
         # reads those raw after the call — no `(res ret.0)` binding to declare here.
@@ -1220,31 +1233,18 @@ proc genProctypeSig*(g: var CodeGen; c: var Cursor) =
   ## Param/result types are emitted BY REFERENCE (`genPointee`) for named types so a
   ## self-referential closure/continuation signature can't recurse forever.
   ##
-  ## The signature mirrors `emitSignature` EXACTLY — including its declarative split.
-  ## A DECLARATIVE proctype (all single-GPR scalar params + scalar/void result) states
-  ## the positional `pN.0`/`ret.0` ABI so an indirect `(prepare …)` is cross-checked
-  ## via `(arg pN)`/`(res ret.0)`. A NON-declarative one (a float/aggregate param or an
-  ## aggregate return — e.g. a CPS continuation `proc(c): Continuation`) emits EMPTY
-  ## `(params)`/`(result)`, exactly as a non-declarative concrete proc does, so nifasm
-  ## requires no per-param bindings and the call site marshals args into raw ABI
-  ## registers itself. Without this, a call through such a fn-ptr fails nifasm's
-  ## "Missing argument: p0.0" check.
-  let declarative = isDeclarativeAbi(g.prog, c)
+  ## The signature mirrors `emitSignature` EXACTLY: the positional `pN.0`/`ret.0`
+  ## ABI, floats and aggregates included, so an indirect `(prepare …)` is
+  ## cross-checked via `(arg pN)`/`(res ret.0)` like a direct call.
   # A `stdcall` proctype points at foreign code, so its signature must state where
   # WINDOWS reads the arguments, not where arkham's own convention puts them.
   let amd = if isForeignAbiProctype(g.prog, c): win64Machine else: g.md
   g.ab.proctypeType:
-    if declarative:
-      c.into:
-        skip c                                  # the Empty slot (a proc has its name here)
-        let numParams = g.emitParamsAndResult(c, byRef = true, amd)
-        while c.hasMore: skip c                  # pragmas
-        g.emitAbiClobber(numParams, amd)        # mirrors `emitSignature`
-    else:
-      g.ab.keyword ParamsD
-      g.ab.keyword ResultD
-      g.emitAbiClobber(0, amd)                  # a call destroys every volatile GPR
-      skip c                                     # advance past the whole proctype node
+    c.into:
+      skip c                                    # the Empty slot (a proc has its name here)
+      let numParams = g.emitParamsAndResult(c, byRef = true, amd)
+      while c.hasMore: skip c                    # pragmas
+      g.emitAbiClobber(numParams, amd)          # mirrors `emitSignature`
 
 proc genTypeBody*(g: var CodeGen; c: var Cursor; packed = false) =
   ## Translate a Leng type at `c` into asm-NIF, advancing past it. Named types
